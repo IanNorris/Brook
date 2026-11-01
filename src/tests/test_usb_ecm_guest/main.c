@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 static unsigned char data[32768],reply[32768],disk[65519];
 struct writer { int fd; unsigned char value; atomic_int* ready; atomic_int* go; int result; };
@@ -36,8 +38,10 @@ static int storage(int fd,unsigned pass){
     return 0;
 }
 int main(int argc,char** argv){
-    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>4)return 2;
-    if((argc>=3 && strcmp(argv[2],"concurrency")) || (argc==4 && strcmp(argv[3],"close-race")))return 2;
+    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>5)return 2;
+    int concurrency=0,close_race=0,user_copy=0;
+    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else return 2;}
+    if(close_race && !concurrency)return 2;
     struct sockaddr_in peer={.sin_family=AF_INET,.sin_port=htons((unsigned short)atoi(argv[1]))};
     inet_pton(AF_INET,"10.0.2.100",&peer.sin_addr);
     int file=open("/media/usb/READTEST.BIN",O_RDONLY);if(file<0)return fail("USB file");
@@ -50,7 +54,22 @@ int main(int argc,char** argv){
         if(exact(tcp,data,sizeof(data),1) || exact(tcp,reply,sizeof(reply),0) || memcmp(data,reply,sizeof(data)))return fail("TCP integrity");
         if(storage(file,pass))return fail("concurrent USB read");
     }
-    if(argc>=3){
+    if(user_copy){
+        struct iovec vector[2]={{(void*)"write",5},{(void*)"v",1}};
+        struct iovec messageVector[2]={{(void*)"multi",5},{(void*)"iov",3}};
+        struct msghdr message={.msg_iov=messageVector,.msg_iovlen=2};
+        char* pages=mmap(NULL,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(pages==MAP_FAILED || mprotect(pages+4096,4096,PROT_NONE))return fail("user copy mapping");
+        memcpy(pages+4093,"bad",3);errno=0;
+        if(send(tcp,pages+4093,6,0)!=-1 || errno!=EFAULT)return fail("cross-page send fault");
+        memset(pages+4096-1200,'X',1200);
+        if(send(tcp,pages+4096-1200,1201,0)!=1200)return fail("partial user send fault");
+        if(munmap(pages,8192))return fail("user copy unmap");
+        if(send(tcp,"send",4,0)!=4 || writev(tcp,vector,2)!=6 || sendmsg(tcp,&message,0)!=8)return fail("user send paths");
+        if(exact(tcp,reply,18,0) || memcmp(reply,"sendwritevmultiiov",18))return fail("user send paths echo");
+        puts("ECM_USER_SEND_PATHS_OK");
+    }
+    if(concurrency){
         atomic_int ready=0,go=0;pthread_t threads[2];
         struct writer writers[2]={{tcp,'A',&ready,&go,-1},{tcp,'B',&ready,&go,-1}};
         for(unsigned n=0;n<2;++n)if(pthread_create(&threads[n],NULL,concurrent_writer,&writers[n]))return fail("writer create");
@@ -62,7 +81,7 @@ int main(int argc,char** argv){
         if(reply[0]==reply[4096] || (reply[0]!='A' && reply[0]!='B') || (reply[4096]!='A' && reply[4096]!='B'))return fail("concurrent values");
         puts("ECM_CONCURRENT_WRITERS_OK");
     }
-    if(argc==4){
+    if(close_race){
         memset(long_write,'C',sizeof(long_write));memset(short_write,'D',sizeof(short_write));
         atomic_int entered1=0,entered2=0;pthread_t first,second;
         struct race_writer one={tcp,long_write,sizeof(long_write),&entered1,-1};

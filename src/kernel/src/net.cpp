@@ -24,6 +24,7 @@
 #include "process.h"
 #include "posix_timer.h"
 #include "sync/kmutex.h"
+#include "user_copy.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
 #include "memory/oom_recovery.h"
@@ -3050,7 +3051,7 @@ public:
     TcpSendOwnership& operator=(const TcpSendOwnership&) = delete;
 };
 
-int SockSend(int sockIdx, const void* buf, uint32_t len)
+static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUser)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
     Process* self = SchedulerCurrentProcess();
@@ -3075,6 +3076,8 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
     const uint8_t* data = static_cast<const uint8_t*>(buf);
     uint32_t sent = 0;
+    uint8_t staged[ETH_MTU];
+    if (!mss || mss > sizeof(staged)) return -22;
 
     // Snapshot the negotiated MSS; never hold the socket lock across network
     // submission or an ACK wait. The optional ceiling is boot-time immutable.
@@ -3084,6 +3087,21 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
         uint32_t chunk = len - sent;
         if (chunk > mss) chunk = mss;
 
+        // Keep the transmitted bytes stable through the ACK/retry cycle.
+        // Stage before reserving sequence space so faults cannot leave a gap.
+        uint64_t source;
+        if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(sent), &source))
+            return sent ? static_cast<int>(sent) : -14;
+        if (fromUser) {
+            if (!CopyFromUser(staged, source, chunk))
+                return sent ? static_cast<int>(sent) : -14;
+        } else {
+            memcpy(staged, reinterpret_cast<const void*>(source), chunk);
+        }
+
+        if (TcpSendInterrupted(self)) return sent ? static_cast<int>(sent) : -4;
+        if (ApicTickCount() >= deadline) return sent ? static_cast<int>(sent) : -110;
+
         SpinLockAcquire(&s.lock);
         if (!TcpCanSendData(s.tcpState)) {
             SpinLockRelease(&s.lock);
@@ -3092,9 +3110,9 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
         uint32_t seq = s.tcpSndNxt;
         s.tcpSndNxt += chunk;
         SpinLockRelease(&s.lock);
-        TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
+        TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, staged, chunk, "data");
 
-        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, data + sent, chunk, deadline);
+        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, staged, chunk, deadline);
         if (ackStatus != 0)
             return sent ? static_cast<int>(sent) : ackStatus;
 
@@ -3112,6 +3130,16 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
     }
 
     return static_cast<int>(sent);
+}
+
+int SockSend(int sockIdx, const void* buf, uint32_t len)
+{
+    return SockSendImpl(sockIdx, buf, len, false);
+}
+
+int SockSendUser(int sockIdx, uint64_t address, uint32_t len)
+{
+    return SockSendImpl(sockIdx, reinterpret_cast<const void*>(address), len, true);
 }
 
 int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)

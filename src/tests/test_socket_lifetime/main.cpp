@@ -16,6 +16,11 @@ std::atomic<bool> pauseOnlyPureAck{false};
 std::atomic<bool> acknowledgeFin{false};
 std::atomic<unsigned> sentFins{0};
 std::atomic<unsigned> acknowledgeDataCount{0};
+std::atomic<unsigned> skipDataAcks{0};
+std::atomic<int> failUserCopyAfter{-1};
+std::atomic<uint8_t*> mutateUserOnSend{nullptr};
+std::atomic<unsigned> stagedPayloadCount{0};
+std::atomic<uint8_t> stagedPayloads[2]{};
 std::atomic<unsigned> capturedDataCount{0};
 std::atomic<uint32_t> capturedDataSeq[2]{};
 std::atomic<int> deadlineAckSocket{-1};
@@ -42,6 +47,12 @@ void* kmalloc(size_t n) {
     return p;
 }
 void kfree(void* p) { if (p) { ++frees; std::free(p); } }
+uint64_t CopyFromUserBytes(void* dst,uint64_t src,uint64_t len) {
+    int remaining=failUserCopyAfter.load();
+    if(remaining==0)return 0;
+    if(remaining>0)--failUserCopyAfter;
+    memcpy(dst,reinterpret_cast<const void*>(src),len);return len;
+}
 uint64_t ApicTickCount() { return ticks.load(); }
 Process* ProcessCurrent() { return currentProcess; }
 Process* SchedulerCurrentProcess() { return currentProcess; }
@@ -81,6 +92,8 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
         const unsigned index=capturedDataCount.fetch_add(1);
         if(index<2)capturedDataSeq[index]=ntohl(tcp->seqNum);
+        uint8_t* mutate=mutateUserOnSend.load();
+        if(mutate){const unsigned n=stagedPayloadCount.fetch_add(1);if(n<2)stagedPayloads[n]=static_cast<const uint8_t*>(data)[sizeof(TcpHeader)];if(n==0)*mutate=9;}
     }
     if (pauseTransmit.load() && (!pauseOnlyPureAck.load() || (tcp->flags==TCP_ACK && len==sizeof(TcpHeader)))) {
         transmitting = true;
@@ -105,7 +118,9 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         ack.dataOff = 5 << 4; ack.flags = TCP_ACK; ack.window = htons(65535);
         HandleTcp(&ip, &ack, sizeof(ack));
     }
-    if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader) && acknowledgeDataCount.load()) {
+    if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader) && skipDataAcks.load()) {
+        --skipDataAcks;
+    } else if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader) && acknowledgeDataCount.load()) {
         --acknowledgeDataCount;
         Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
         TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;
@@ -418,6 +433,23 @@ int main() {
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;acknowledgeDataCount=1;
     {uint8_t data[537]{};assert(SockSend(i,data,sizeof(data))==536);}
     assert(g_sockets[i].tcpState==TcpState::Closed && SockGetConnectError(i)==110);
+    currentProcess=nullptr;SockClose(i);delete waiter;
+    // Faulting user copies never reserve the next sequence range, and a
+    // later fault returns only previously acknowledged bytes.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;failUserCopyAfter=0;
+    {uint8_t data[537]{};assert(SockSendUser(i,reinterpret_cast<uint64_t>(data),sizeof(data))==-14);}
+    assert(g_sockets[i].tcpSndNxt==10 && g_sockets[i].tcpState==TcpState::Established);
+    failUserCopyAfter=1;acknowledgeDataCount=1;
+    {uint8_t data[537]{};assert(SockSendUser(i,reinterpret_cast<uint64_t>(data),sizeof(data))==536);}
+    assert(g_sockets[i].tcpSndNxt==546 && g_sockets[i].tcpState==TcpState::Established);
+    failUserCopyAfter=-1;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A mutation after transmission must not alter a retransmission.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;
+    {uint8_t data=3;stagedPayloadCount=0;mutateUserOnSend=&data;skipDataAcks=1;acknowledgeDataCount=1;
+     assert(SockSendUser(i,reinterpret_cast<uint64_t>(&data),1)==1);
+     assert(data==9 && stagedPayloadCount==2 && stagedPayloads[0]==3 && stagedPayloads[1]==3);mutateUserOnSend=nullptr;}
     currentProcess=nullptr;SockClose(i);delete waiter;
     // Data received before the timeout stays readable before the error.
     waiter=new Process{};waiter->refCount=1;

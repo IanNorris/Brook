@@ -2267,9 +2267,9 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         if (brook::SockIsStream(sockIdx))
         {
-            return brook::SockSend(sockIdx,
-                                   reinterpret_cast<const void*>(bufAddr),
-                                   static_cast<uint32_t>(count));
+            const uint32_t bytes = static_cast<uint32_t>(count > 0x7ffff000ULL ? 0x7ffff000ULL : count);
+            return userSource ? brook::SockSendUser(sockIdx, bufAddr, bytes)
+                              : brook::SockSend(sockIdx, reinterpret_cast<const void*>(bufAddr), bytes);
         }
         // UDP: write() requires a prior connect() so the kernel knows the peer.
         // SockSendTo with dest=nullptr falls back to the cached connect address.
@@ -13916,17 +13916,16 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
             reinterpret_cast<const char*>(bufVal),lenVal,nullptr,0,(flagsVal&0x4000)!=0);
     }
 
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
+    if (!fde->handle) return -EBADF;
+    int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
 
     (void)flagsVal;
 
     // For connected TCP sockets, use SockSend (stream send)
     if (brook::SockIsStream(sockIdx))
     {
-        int ret = brook::SockSend(sockIdx,
-                                   reinterpret_cast<const void*>(bufVal),
-                                   static_cast<uint32_t>(lenVal));
+        const uint32_t bytes = static_cast<uint32_t>(lenVal > 0x7ffff000ULL ? 0x7ffff000ULL : lenVal);
+        int ret = brook::SockSendUser(sockIdx, bufVal, bytes);
         return static_cast<int64_t>(ret);
     }
 
@@ -14852,20 +14851,31 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     return total;
     }
 
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
+    if (fde->type != FdType::Socket || !fde->handle) return -EBADF;
+    int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+    struct SendIovStage {
+        iovec* entries = nullptr;
+        ~SendIovStage() { if (entries) kfree(entries); }
+    } stage;
+    if (msg->msg_iovlen) {
+        const uint64_t bytes = msg->msg_iovlen * sizeof(iovec);
+        stage.entries = static_cast<iovec*>(kmalloc(bytes));
+        if (!stage.entries) return -ENOMEM;
+        if (!CopyFromUser(stage.entries, reinterpret_cast<uint64_t>(msg->msg_iov), bytes)) return -EFAULT;
+    }
 
     if (msg->msg_iovlen == 1) {
-        void* buf = msg->msg_iov[0].iov_base;
-        uint32_t len = static_cast<uint32_t>(msg->msg_iov[0].iov_len);
+        uint64_t buf = stage.entries[0].iov_base;
+        uint32_t len = static_cast<uint32_t>(stage.entries[0].iov_len > 0x7ffff000ULL ? 0x7ffff000ULL : stage.entries[0].iov_len);
         if (!buf || len == 0) return -EINVAL;
-        return sys_sendto(fdVal, reinterpret_cast<uint64_t>(buf), len, flagsVal,
+        if (brook::SockIsStream(sockIdx)) return brook::SockSendUser(sockIdx, buf, len);
+        return sys_sendto(fdVal, buf, len, flagsVal,
                           reinterpret_cast<uint64_t>(msg->msg_name), msg->msg_namelen);
     }
 
     uint64_t totalLen = 0;
     for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-        if (__builtin_add_overflow(totalLen, msg->msg_iov[i].iov_len, &totalLen))
+        if (__builtin_add_overflow(totalLen, stage.entries[i].iov_len, &totalLen))
             return -EINVAL;
     }
     if (totalLen == 0 || totalLen > 65507) return -EINVAL;
@@ -14874,20 +14884,23 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (!tmp) return -ENOMEM;
     uint64_t off = 0;
     for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-        void* base = msg->msg_iov[i].iov_base;
-        uint64_t len = msg->msg_iov[i].iov_len;
+        uint64_t base = stage.entries[i].iov_base;
+        uint64_t len = stage.entries[i].iov_len;
         if (!base && len != 0) {
             kfree(tmp);
             return -EFAULT;
         }
-        auto* src = static_cast<uint8_t*>(base);
-        for (uint64_t j = 0; j < len; j++)
-            tmp[off + j] = src[j];
+        if (len && !CopyFromUser(tmp + off, base, len)) {
+            kfree(tmp);
+            return -EFAULT;
+        }
         off += len;
     }
 
-    int64_t ret = sys_sendto(fdVal, reinterpret_cast<uint64_t>(tmp), totalLen, flagsVal,
-                             reinterpret_cast<uint64_t>(msg->msg_name), msg->msg_namelen);
+    int64_t ret = brook::SockIsStream(sockIdx)
+        ? brook::SockSend(sockIdx, tmp, static_cast<uint32_t>(totalLen))
+        : sys_sendto(fdVal, reinterpret_cast<uint64_t>(tmp), totalLen, flagsVal,
+                     reinterpret_cast<uint64_t>(msg->msg_name), msg->msg_namelen);
     kfree(tmp);
     return ret;
 }

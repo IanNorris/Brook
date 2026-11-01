@@ -14,6 +14,7 @@ ap.add_argument('--tx-depth16',action='store_true',help='Exercise the opt-in six
 ap.add_argument('--tcp-window16',action='store_true',help='Exercise the opt-in 16 KiB TCP receive-window cap')
 ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
 ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
+ap.add_argument('--send-user-copy',action='store_true',help='Also exercise send, writev and multi-iovec sendmsg')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
@@ -35,6 +36,8 @@ def echo_tcp():
    s.settimeout(30);b=exact(s,10);assert b==b'ecm-zlp-ok';s.sendall(b)
    for p in range(8):
     b=exact(s,32768);assert b==bytes((i*13+p*7)%251 for i in range(32768));s.sendall(b)
+   if args.send_user_copy:
+    b=exact(s,1218);assert b==b'X'*1200+b'sendwritevmultiiov';s.sendall(b[1200:])
    if args.send_concurrency:
     b=exact(s,8192);assert b in (b'A'*4096+b'B'*4096,b'B'*4096+b'A'*4096);s.sendall(b)
    if args.send_close_race:
@@ -57,12 +60,13 @@ for thread in threads:thread.start()
 run(os.environ['MUSL_CC'],'-static','-pthread','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_usb_ecm_guest/main.c','-o',base/'ECMTEST.ELF')
 run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600')
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BOOT/ECMTEST.ELF')
-rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}\n')
+rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
 if args.tx_depth16:run('mcopy','-i',initrd,marker,'::ETC/usb-net-tx16')
 if args.tcp_window16:run('mcopy','-i',initrd,marker,'::ETC/tcp-recv-window-16k')
+if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
 with fixture.open('xb') as f:
@@ -108,6 +112,7 @@ try:
   if 'ECM_NETWORK_INTEGRITY_OK' in serial:
    if args.send_concurrency:assert 'ECM_CONCURRENT_WRITERS_OK' in serial,serial[-2500:]
    if args.send_close_race:assert 'ECM_SEND_CLOSE_RACE_OK' in serial,serial[-2500:]
+   if args.send_user_copy:assert 'ECM_USER_SEND_PATHS_OK' in serial,serial[-2500:]
    assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
    assert f'tx_depth={16 if args.tx_depth16 else 8}' in serial, 'Unexpected ECM transmit depth'
    break

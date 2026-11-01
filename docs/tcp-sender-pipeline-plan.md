@@ -63,3 +63,14 @@ contended nonblocking acquisition and pending signals. QEMU USB Ethernet tests
 add guest pthread writer integrity and concurrent close stress; the latter does
 not by itself prove precise overlap. Real scheduler termination during
 contention, the send pipeline, and physical performance remain unverified.
+
+TCP sends now snapshot each MSS into bounded kernel storage before reserving
+its sequence range, then reuse that snapshot for retries. Direct user buffers
+are copied through the fault-aware user-copy path; trusted kernel buffers used
+by `writev` and other internal callers remain explicitly separate. TCP
+multi-iovec `sendmsg` snapshots its vector and payload and uses the retained
+descriptor. QEMU tests cover `send`, `writev`, multi-iovec `sendmsg`, a
+cross-page first-chunk fault, a later-chunk fault with partial progress, and
+continued stream integrity. A hosted retry test mutates the source after the
+first send and confirms that the retransmission keeps the original byte.
+UDP sendmsg identity and generic writev metadata races are not addressed.
