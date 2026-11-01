@@ -302,3 +302,12 @@ state advancement, window reopening, socket retirement and a closed socket.
 The counter covers these paths, not every possible TCP send failure. This does
 not establish that ACK rejection was the Dell's dominant throughput bottleneck;
 physical measurement is still required.
+
+The prepared `ssd-ecm-window-ack-20261101` kernel and initrd booted together
+from a disposable read-only QEMU USB disk. The guest reported the expected
+payload ID, brought up its debug network and reported eight active ECM receive
+slots. After QEMU stopped, both files extracted from the boot disk compared
+byte-for-byte with the prepared payload. This validates packaging and a QEMU
+boot; it does not test the Dell SSD, hardware-specific behavior, or physical
+throughput. The Dell had not returned to its old address after the previous
+checked restart, so the candidate was not installed there.
