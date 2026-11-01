@@ -28,8 +28,9 @@ int main() {
     pci.bar0=0xf7418001;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);pci.bar0=0xf7418004;
     pci.bar1=0xffffffff;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);
     pci.bar1=1;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::Ready && base==0x1f7418000ULL);
-    pci.bar1=0xfffffffe;pci.bar0=0xfffff004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::Ready);
-    pci.bar1=0xffffffff;pci.bar0=0xfffff004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);
+    pci.bar1=0xfffffffe;pci.bar0=0xffffc004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::Ready);
+    pci.bar1=0xffffffff;pci.bar0=0xffffc004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);
+    pci.bar1=0;pci.bar0=0xf7419004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);
     HdaProbeController state{};uint32_t reply=0;
     {auto f=idle();HdaReadOnlyProbe<Fake> probe(f);assert(probe.read(0,0,0xf00,0,reply)==HdaProbeResult::Failed && !f.writes);}
     {auto f=idle();f.set32(8,0);HdaReadOnlyProbe<Fake> probe(f);assert(probe.inspect(state)==HdaProbeResult::ControllerReset && !f.writes);}

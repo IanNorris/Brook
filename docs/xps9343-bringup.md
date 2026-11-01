@@ -1750,6 +1750,16 @@ first page's existing kernel aliases, boot-map classification and current-CPU
 PAT/MTRR observation. It never enables, maps or reads the controller. Its
 snapshots are not atomic, do not establish other CPUs' cache state, BAR extent
 or ownership, and PAT slot 0 applies only to aliases reporting index 0.
+On SSD generation 39, three observations reported BAR `0xf7418000`, boot PCI
+command zero and the first 4 KiB unreported in the UEFI map. Both inspected
+kernel aliases matched the physical page with PAT index 0. Each CPU-0 sample
+reported PAT slot 0 WB, CR0.CD/NW clear and MTRR resolution UC. Assuming these
+separate observations remain unchanged, Intel's PAT/MTRR rules imply UC for
+those aliases on CPU 0; this does not establish other CPUs, other aliases,
+complete aperture ownership or current PCI state. The [Intel 9-series PCH
+datasheet, §17.1.1.12](https://www.intel.com/content/dam/www/public/us/en/documents/datasheets/9-series-chipset-pch-datasheet.pdf)
+specifies a non-prefetchable 64-bit, 16 KiB-aligned HdBAR for D27:F0. No HDA
+register has been read or written in Brook by this observation.
 
 The earlier investigation treated the Broadwell analog path as requiring SST
 DSP, SSP/I²S and the RT286 codec; Brook's existing HDA backend still needs

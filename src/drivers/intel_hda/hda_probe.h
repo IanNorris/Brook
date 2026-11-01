@@ -22,10 +22,11 @@ inline HdaProbeResult HdaProbePciCheck(const HdaProbePci& p,uint64_t& base) {
     if(p.vendor!=0x8086 || p.device!=0x9ca0 || p.subsystemVendor!=0x1028 ||
        p.subsystemDevice!=0x0665 || p.bus!=0 || p.slot!=0x1b || p.function!=0 ||
        p.classCode!=4 || p.subclass!=3)return HdaProbeResult::InvalidIdentity;
-    // This particular PCI function reports a 64-bit, non-I/O MMIO BAR.
-    if((p.bar0&7)!=4 || p.bar0==0xffffffff || p.bar1==0xffffffff)return HdaProbeResult::InvalidBar;
+    // Intel 9-series PCH D27:F0 HdBAR is non-prefetchable, 64-bit and 16 KiB.
+    // This syntactic check still does not establish resource ownership.
+    if((p.bar0&15)!=4 || p.bar0==0xffffffff || p.bar1==0xffffffff)return HdaProbeResult::InvalidBar;
     const uint64_t address=(uint64_t(p.bar1)<<32)|(p.bar0&~uint32_t(15));
-    if(!address || (address&4095) || address>~uint64_t(0)-4096)return HdaProbeResult::InvalidBar;
+    if(!address || (address&16383) || address>~uint64_t(0)-16384)return HdaProbeResult::InvalidBar;
     base=address;return HdaProbeResult::Ready;
 }
 struct HdaProbeController {
