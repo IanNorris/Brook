@@ -130,6 +130,21 @@ with the 256 KiB echo, concurrent-send, close-stress and user-copy checks. Its
 packet capture records the guest's transmission attempt, not proof that the
 dropped packet reached the backend; the echo proves the test stream survived.
 This single controlled drop does not measure general loss handling or fairness.
+
+For investigation only, `/etc/tcp-send-probe` enables aggregate counters
+queried with `bridge tcp send-probe`. They include send-call size buckets,
+submitted and acknowledged bytes, maximum observed outstanding bytes,
+retransmission attempts, local busy returns and wait observations for slot,
+congestion and peer-window limits or call-tail draining. Counts include all
+flight-enabled connections, including bridge traffic. Wait counters count
+observations, not elapsed time, and independently read fields are not an
+atomic snapshot. ACK timing samples exclude retransmitted slots and measure
+to the latest advancing ACK observed when the sender resumes; multiple ACKs
+can therefore inflate the latency and understate resumption delay. They are
+not precise RTT samples. Ticks use the guest clock. Diagnostics are disabled
+by default and are not intended as a permanent congestion-control algorithm.
+Host tests cover full-flight waits, ACK batching and retransmission exclusion;
+the opt-in QEMU loss and concurrent-send run also validates bridge output.
 The release build's eight-slot send function reserves 12,424 stack bytes;
 its caller reserves 1,592, against a 256 KiB kernel stack. These figures are
 individual compiler-generated frames, not a complete worst-case stack bound.

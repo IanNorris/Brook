@@ -44,6 +44,7 @@ std::atomic<uint32_t> capturedDataSeq[8]{};
 std::atomic<int> deadlineAckSocket{-1};
 std::atomic<uint64_t> deadlineAckTick{0};
 std::atomic<uint32_t> deadlineAckValue{0};
+std::atomic<uint32_t> deadlineSecondAckValue{0};
 std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
@@ -96,6 +97,8 @@ void SchedulerBlock(Process* p) {
             ack.seqNum=htonl(socket.tcpRcvNxt);const uint32_t value=deadlineAckValue.exchange(0);
             ack.ackNum=htonl(value?value:socket.tcpSndNxt);
             ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));
+            const uint32_t second=deadlineSecondAckValue.exchange(0);
+            if(second){ticks=ticks.load()+3;ack.ackNum=htonl(second);HandleTcp(&ip,&ack,sizeof(ack));}
         }
     }
     std::this_thread::yield();
@@ -552,6 +555,41 @@ int main() {
     {uint8_t data[536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
     assert(observedRetryCwnd==536 && observedRetryThreshold==1072 && !g_sockets[i].tcpFlightControl.recovering);
     observeFlightControlSocket=-1;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Opt-in diagnostics count real sends and exclude retransmitted segments
+    // from timing samples, without changing their completion semantics.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpSendProbe=true;g_tcpSendProbeStats={};
+    acknowledgeDataCount=1;
+    {uint8_t data[536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_tcpSendProbeStats.calls==1 && g_tcpSendProbeStats.bytes==536 &&
+           g_tcpSendProbeStats.submitted==536 && g_tcpSendProbeStats.acked==536 &&
+           g_tcpSendProbeStats.samples==1 && g_tcpSendProbeStats.retries==0);
+    skipDataAcks=1;acknowledgeDataCount=1;
+    {uint8_t data[536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_tcpSendProbeStats.calls==2 && g_tcpSendProbeStats.samples==1 && g_tcpSendProbeStats.retries==1);
+    g_tcpSendProbe=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Two ACKs before the sender resumes use the latest observed ACK time,
+    // not a claimed first-covering RTT.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpSendProbe=true;g_tcpSendProbeStats={};
+    skipDataAcks=2;deadlineAckTick=21;deadlineAckValue=546;deadlineSecondAckValue=1082;deadlineAckSocket=i;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_tcpSendProbeStats.samples==2 && g_tcpSendProbeStats.rttTicks==46 &&
+           g_tcpSendProbeStats.resumeTicks==0 && g_tcpSendProbeStats.drainWaits>0);
+    g_tcpSendProbe=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A full eight-slot flight counts both slot and congestion waits even
+    // before the ninth segment can be reserved.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpSendProbe=true;g_tcpSendProbeStats={};
+    g_sockets[i].tcpFlightControl.Init(536);g_sockets[i].tcpFlightControl.Ack(6*536,536);
+    skipDataAcks=8;acknowledgeDataCount=1;deadlineAckTick=21;deadlineAckValue=10+8*536;deadlineAckSocket=i;
+    {uint8_t data[9*536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_tcpSendProbeStats.slotWaits>0 && g_tcpSendProbeStats.congestionWaits>0 &&
+           g_tcpSendProbeStats.maxOutstanding==8*536);
+    g_tcpSendProbe=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // A lost middle packet in an adaptive flight must recover the missing
     // range, preserve later submitted bytes, and reduce the congestion window.
     waiter=new Process{};waiter->refCount=1;

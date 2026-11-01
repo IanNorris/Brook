@@ -15,6 +15,7 @@ ap.add_argument('--tcp-window16',action='store_true',help='Exercise the opt-in 1
 ap.add_argument('--tcp-flight2',action='store_true',help='Exercise and capture the experimental two-packet TCP send flight')
 ap.add_argument('--tcp-flight4',action='store_true',help='Exercise and capture the experimental four-packet TCP send flight')
 ap.add_argument('--tcp-adaptive-flight',action='store_true',help='Exercise the bounded adaptive TCP send flight')
+ap.add_argument('--tcp-send-probe',action='store_true',help='Enable and query aggregate TCP sender diagnostics')
 ap.add_argument('--network-delay-us',type=int,default=0,help='Optional QEMU filter-buffer interval in microseconds (maximum 50000)')
 ap.add_argument('--drop-tcp-packet',action='store_true',help='Drop one guest TCP payload through a private QEMU packet relay')
 ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
@@ -76,6 +77,7 @@ if args.tcp_window16:run('mcopy','-i',initrd,marker,'::ETC/tcp-recv-window-16k')
 if args.tcp_flight2:run('mcopy','-i',initrd,marker,'::ETC/tcp-two-packet-flight')
 if args.tcp_flight4:run('mcopy','-i',initrd,marker,'::ETC/tcp-four-packet-flight')
 if args.tcp_adaptive_flight:run('mcopy','-i',initrd,marker,'::ETC/tcp-adaptive-flight')
+if args.tcp_send_probe:run('mcopy','-i',initrd,marker,'::ETC/tcp-send-probe')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -201,6 +203,16 @@ try:
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
   (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')
+  if args.tcp_send_probe:
+   s.sendall(b'@73 bridge tcp send-probe\n');reply=b''
+   while b'BRIDGE_END 73' not in reply and len(reply)<65536:
+    chunk=s.recv(8192)
+    if not chunk:break
+    reply+=chunk
+   assert b'BRIDGE_BEGIN 73' in reply and b'BRIDGE_END 73' in reply,reply
+   probe=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
+   assert probe['enabled'] and probe['calls']>0 and probe['submitted_bytes']>0 and probe['ack_samples']>0,probe
+   (base/'tcp-send-probe.json').write_text(json.dumps(probe,indent=2)+'\n')
  if loss:
   assert not loss['errors'] and loss['dropped']==1 and loss['retransmitted'],loss
  q.call('device_del',{'id':'usbnet'})

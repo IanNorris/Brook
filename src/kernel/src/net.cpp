@@ -136,6 +136,24 @@ static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 // Slot-owned, like Socket::lock: never clear or reinitialise on reuse.
 static KMutex g_tcpSendGates[MAX_SOCKETS];
+// Optional aggregate diagnostics; per-slot ACK stamps are protected by the
+// socket lock and never affect TCP state or the module-visible Socket layout.
+static bool g_tcpSendProbe = false;
+struct TcpSendProbeAck { uint32_t una; uint64_t tick; };
+static TcpSendProbeAck g_tcpSendProbeAck[MAX_SOCKETS]{};
+struct TcpSendProbeStats {
+    uint64_t calls, bytes, smallCalls, mediumCalls, largeCalls;
+    uint64_t submitted, acked, maxOutstanding, retries, busy;
+    uint64_t congestionWaits, peerWindowWaits, slotWaits, drainWaits, samples, rttTicks, resumeTicks;
+};
+static TcpSendProbeStats g_tcpSendProbeStats{};
+static void TcpProbeAdd(uint64_t& value,uint64_t amount=1) {
+    __atomic_fetch_add(&value,amount,__ATOMIC_RELAXED);
+}
+static void TcpProbeMax(uint64_t& value,uint64_t sample) {
+    uint64_t previous=__atomic_load_n(&value,__ATOMIC_RELAXED);
+    while(previous<sample && !__atomic_compare_exchange_n(&value,&previous,sample,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+}
 static bool   g_sockUsed[MAX_SOCKETS];
 static bool   g_sockReserved[MAX_SOCKETS];
 // Slot control survives every payload reset. Callback borrows are independent
@@ -816,6 +834,10 @@ static bool g_tcpAdaptiveFlight = false;
 
 void NetConfigureBoot()
 {
+    if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
+        VfsClose(marker);g_tcpSendProbe = true;
+        KPuts("net: TCP send probe enabled (aggregate diagnostics)\n");
+    }
     if (auto* marker = VfsOpen("/etc/tcp-two-packet-flight")) {
         VfsClose(marker);g_tcpTwoPacketFlight = true;
         KPuts("net: two-packet TCP send flight enabled (experimental)\n");
@@ -2637,6 +2659,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         uint32_t prevRxCount = s.rxCount;
         uint32_t prevSndUna = s.tcpSndUna;
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
+        if (g_tcpSendProbe && s.tcpSndUna != prevSndUna)
+            g_tcpSendProbeAck[i] = {s.tcpSndUna, ApicTickCount()};
 
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
@@ -3083,12 +3107,19 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
     struct Slot {
         uint8_t bytes[ETH_MTU];
         uint32_t seq = 0, len = 0, retries = 0;
-        uint64_t retryAt = 0;
-        bool submitted = false;
+        uint64_t retryAt = 0, firstSendAt = 0;
+        bool submitted = false, wasRetried = false;
     } slots[8];
     unsigned head = 0, count = 0, limit = initialLimit;
     uint32_t reserved = 0, submitted = 0, acknowledged = 0;
     int deferredError = 0;
+    const auto probeIndex=static_cast<uint32_t>(&s-g_sockets);
+    if (g_tcpSendProbe) {
+        TcpProbeAdd(g_tcpSendProbeStats.calls);TcpProbeAdd(g_tcpSendProbeStats.bytes,len);
+        if (len<=mss) TcpProbeAdd(g_tcpSendProbeStats.smallCalls);
+        else if (len<=8*mss) TcpProbeAdd(g_tcpSendProbeStats.mediumCalls);
+        else TcpProbeAdd(g_tcpSendProbeStats.largeCalls);
+    }
     SpinLockAcquire(&s.lock);
     const uint32_t base = s.tcpSndNxt;
     if (adaptive) s.tcpFlightControl.Init(mss);
@@ -3131,9 +3162,18 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         }
         if (delta <= submitted && delta > acknowledged) {
             if (adaptive) s.tcpFlightControl.Ack(delta-acknowledged, mss);
+            if (g_tcpSendProbe) TcpProbeAdd(g_tcpSendProbeStats.acked,delta-acknowledged);
             acknowledged = delta;
         }
         while (count && TcpSeqAcked(una, slots[head].seq + slots[head].len)) {
+            if (g_tcpSendProbe && slots[head].submitted && !slots[head].wasRetried &&
+                g_tcpSendProbeAck[probeIndex].una==una &&
+                g_tcpSendProbeAck[probeIndex].tick>=slots[head].firstSendAt &&
+                now>=g_tcpSendProbeAck[probeIndex].tick) {
+                TcpProbeAdd(g_tcpSendProbeStats.samples);
+                TcpProbeAdd(g_tcpSendProbeStats.rttTicks,g_tcpSendProbeAck[probeIndex].tick-slots[head].firstSendAt);
+                TcpProbeAdd(g_tcpSendProbeStats.resumeTicks,now-g_tcpSendProbeAck[probeIndex].tick);
+            }
             head = (head + 1) % 8;
             --count;
         }
@@ -3176,9 +3216,10 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             const auto snapshot = CaptureTcpTxLocked(s);
             const bool retry = slot.submitted;
             if (retry) {
+                if (g_tcpSendProbe) { slot.wasRetried=true;TcpProbeAdd(g_tcpSendProbeStats.retries); }
                 if (adaptive) s.tcpFlightControl.Loss(mss);
                 else limit = 1;
-            }
+            } else if (g_tcpSendProbe) slot.firstSendAt=now;
             SpinLockRelease(&s.lock);
             const int result = TcpSendSnapshot(s, snapshot, seq, TCP_ACK | TCP_PSH,
                                                slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit");
@@ -3187,9 +3228,18 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
                 if (!retry) submitted += slot.len;
                 else ++slot.retries;
                 slot.submitted = true;
+                if (g_tcpSendProbe && !retry) {
+                    TcpProbeAdd(g_tcpSendProbeStats.submitted,slot.len);
+                    SpinLockAcquire(&s.lock);
+                    const uint32_t probeDelta=s.tcpSndUna-base;
+                    const uint32_t probeAcked=probeDelta<=submitted?probeDelta:acknowledged;
+                    TcpProbeMax(g_tcpSendProbeStats.maxOutstanding,submitted-probeAcked);
+                    SpinLockRelease(&s.lock);
+                }
                 const uint32_t shift = slot.retries < 4 ? slot.retries : 4;
                 slot.retryAt = after + (200ULL << shift);
             } else if (result == -11) {
+                if (g_tcpSendProbe) TcpProbeAdd(g_tcpSendProbeStats.busy);
                 slot.retryAt = after + 10;
             } else return finish(result < 0 ? result : -5);
             continue;
@@ -3236,7 +3286,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             if (chunk > currentCredit) chunk = currentCredit;
             if (!chunk) { SpinLockRelease(&s.lock); continue; }
             slot.seq = s.tcpSndNxt; slot.len = chunk; slot.retries = 0;
-            slot.submitted = false; slot.retryAt = 0;
+            slot.submitted = false; slot.wasRetried = false; slot.retryAt = 0;
             s.tcpSndNxt += chunk;
             reserved += chunk; ++count;
             SpinLockRelease(&s.lock);
@@ -3246,6 +3296,14 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         // Another reader can replace the shared waiter, so do not rely on a
         // window update wakeup alone for forward progress.
         uint64_t wake = now + 20;
+        if (g_tcpSendProbe && unsentIndex<0) {
+            if (reserved==len && count) TcpProbeAdd(g_tcpSendProbeStats.drainWaits);
+            if (reserved<len) {
+                if (count>=limit) TcpProbeAdd(g_tcpSendProbeStats.slotWaits);
+                if (s.tcpSndWnd<=outstanding) TcpProbeAdd(g_tcpSendProbeStats.peerWindowWaits);
+                if (adaptive && s.tcpFlightControl.cwnd<=outstanding) TcpProbeAdd(g_tcpSendProbeStats.congestionWaits);
+            }
+        }
         if (deadline < wake) wake = deadline;
         if (count && slots[head].retryAt > now && slots[head].retryAt < wake) wake = slots[head].retryAt;
         if (unsentIndex >= 0 && slots[unsentIndex].retryAt > now && slots[unsentIndex].retryAt < wake) wake = slots[unsentIndex].retryAt;
@@ -4355,6 +4413,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(result == 0 ? "true" : "false");
         r.text(",\"sync_guarantee\":\"checked_filesystem_and_device_flush\"}\n");
         r.send(); return;
+    }
+    if (NetStrEq(cmd, "bridge tcp send-probe")) {
+        BridgeReply r;r.text("{\"enabled\":");r.text(g_tcpSendProbe?"true":"false");
+        auto field=[&](const char* name,uint64_t& value) {r.text(",");r.field(name,__atomic_load_n(&value,__ATOMIC_RELAXED));};
+        field("calls",g_tcpSendProbeStats.calls);field("bytes",g_tcpSendProbeStats.bytes);
+        field("calls_at_most_mss",g_tcpSendProbeStats.smallCalls);field("calls_at_most_8mss",g_tcpSendProbeStats.mediumCalls);
+        field("calls_over_8mss",g_tcpSendProbeStats.largeCalls);field("submitted_bytes",g_tcpSendProbeStats.submitted);
+        field("acked_bytes",g_tcpSendProbeStats.acked);field("max_observed_outstanding",g_tcpSendProbeStats.maxOutstanding);
+        field("retry_attempts",g_tcpSendProbeStats.retries);field("local_busy",g_tcpSendProbeStats.busy);
+        field("congestion_waits",g_tcpSendProbeStats.congestionWaits);field("peer_window_waits",g_tcpSendProbeStats.peerWindowWaits);
+        field("slot_capacity_waits",g_tcpSendProbeStats.slotWaits);field("call_drain_waits",g_tcpSendProbeStats.drainWaits);
+        field("ack_samples",g_tcpSendProbeStats.samples);field("latest_ack_latency_ticks",g_tcpSendProbeStats.rttTicks);
+        field("resume_since_latest_ack_ticks",g_tcpSendProbeStats.resumeTicks);r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge network")) {
         NetDriverSnapshot s{};
