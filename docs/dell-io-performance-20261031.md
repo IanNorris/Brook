@@ -443,3 +443,15 @@ outbound throughput. Two USB backpressure transitions occurred during the
 three unpaced transfers; no zero-outstanding transitions were observed.
 Host tests cover full-size and reversed wraparound reassembly, stale and
 partially covered entries, shared receive-budget accounting and cleanup.
+
+The same benchmark measured 3.627 s for the reverse 4 MiB transfer; another
+isolated transfer took 3.626 s. Host TCP samples show 1,200-byte receive
+segments with roughly one outgoing ACK per incoming segment and an open host
+receive window. Brook's sender waits for an ACK and yields after each segment.
+An opt-in build skipping that yield, while keeping stop-and-wait, measured
+3.629, 3.633 and 3.678 s, all with matching digests. This excludes a material
+yield benefit in these samples; sender pipelining still needs independent
+correctness work around windows, retransmission, concurrent writes and close.
+The 0.34 Mbps browser upload has not been reproduced in an isolated WAN test.
+The diagnostic switch was removed from source, and the Dell was restored to
+the measured 64-slot build as SSD generation 23; recovery remains in slot B.
