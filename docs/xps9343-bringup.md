@@ -1737,6 +1737,13 @@ and missing optional tools are reported. A bounded host-tested speaker-route
 selector models the captured graph and the distinction between an observed
 selector position and a possible alternative. It is not yet connected to the
 driver, does not inspect mixer enable state, and does not establish playback.
+The first non-playing HDA probe's identity, idle-admission and GET-only
+immediate-command logic is also host-tested with fake registers. It rejects
+active DMA rings, active streams, interrupts, busy transport, unsupported
+devices and SET verbs; timeout disables further commands. It is not wired to
+PCI or MMIO. Before any physical use, BAR extent and memory-type alias safety,
+exclusive ownership, temporary memory decoding and cleanup still need to be
+established; a timeout does not prove a codec command was cancelled.
 
 The earlier investigation treated the Broadwell analog path as requiring SST
 DSP, SSP/I²S and the RT286 codec; Brook's existing HDA backend still needs
