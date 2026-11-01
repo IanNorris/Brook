@@ -1940,13 +1940,23 @@ static void SockFinalize(int sockIdx)
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
 }
 
-void SockRef(int sockIdx)
+// Unlike callback borrows, an owner reference prevents final close itself.
+// A sender will need to know whether it acquired that guarantee before it
+// waits for exclusive send ownership.
+static bool SockTryRef(int sockIdx)
 {
-    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
     const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
-    if (g_sockUsed[sockIdx] && !g_sockClosing[sockIdx])
+    const bool acquired = g_sockUsed[sockIdx] && !g_sockClosing[sockIdx];
+    if (acquired)
         ++g_sockets[sockIdx].refCount;
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    return acquired;
+}
+
+void SockRef(int sockIdx)
+{
+    (void)SockTryRef(sockIdx);
 }
 
 void SockUnref(int sockIdx)

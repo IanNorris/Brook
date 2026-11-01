@@ -149,6 +149,19 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
     HandleTcp(&ip,&tcp,sizeof(tcp));
 }
 int main() {
+    // A caller needing ownership must distinguish a retained socket from a
+    // slot already entering final close; an RX borrow is not that guarantee.
+    assert(!SockTryRef(-1) && !SockTryRef(MAX_SOCKETS));
+    int ownerSocket=create();setupTcp(ownerSocket);
+    assert(SockTryRef(ownerSocket));
+    SockUnref(ownerSocket);assert(published(ownerSocket));
+    SpinLockAcquire(&g_sockets[ownerSocket].lock);
+    std::thread finalOwner([&] { SockUnref(ownerSocket); });
+    await([&] { return closingSlot(ownerSocket); });
+    assert(!SockTryRef(ownerSocket));
+    SpinLockRelease(&g_sockets[ownerSocket].lock);
+    finalOwner.join();assert(!published(ownerSocket));
+    assert(!SockTryRef(ownerSocket));
     // Queued RX ticket must finish before buffer retirement/reset.
     int i = create(); setupTcp(i);
     auto& s = g_sockets[i];
