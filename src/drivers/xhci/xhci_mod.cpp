@@ -598,22 +598,11 @@ static bool XhciPciDetect(XhciController& ctrl)
     }
     ctrl.rtBase = ctrl.capBase + rtsoff;
 
-    // Read page size (PAGESIZE register, bit N means 2^(N+12) bytes)
-    uint32_t psReg = xhci_read32(ctrl.opBase, XHCI_OP_PAGESIZE);
-    if(!(psReg&1)){SerialPuts("xhci: controller lacks 4KiB page support\n");return false;}
-    ctrl.pageSize = 4096; // default
-    for (int i = 0; i < 16; i++) {
-        if (psReg & (1 << i)) {
-            ctrl.pageSize = 1U << (i + 12);
-            break;
-        }
-    }
-
     SerialPrintf("xhci: version %x.%02x, capLen=%u\n",
                  ctrl.hciVersion >> 8, ctrl.hciVersion & 0xFF, ctrl.capLength);
-    SerialPrintf("xhci: maxSlots=%u maxPorts=%u maxIntrs=%u ctx=%uB page=%u scratchpad=%u\n",
+    SerialPrintf("xhci: maxSlots=%u maxPorts=%u maxIntrs=%u ctx=%uB scratchpad=%u\n",
                  ctrl.maxSlots, ctrl.maxPorts, ctrl.maxIntrs,
-                 ctrl.ctx64 ? 64 : 32, ctrl.pageSize, ctrl.scratchpadCount);
+                 ctrl.ctx64 ? 64 : 32, ctrl.scratchpadCount);
 
     return true;
 }
@@ -632,13 +621,24 @@ static bool XhciReset(XhciController& ctrl)
         uint64_t now() { return ApicTickCount(); }
         void pause() { __asm__ volatile("pause"); }
     } io{ctrl};
+    const uint64_t started=ApicTickCount();
     const auto result = XhciResetController(io, ctrl.pciDev.vendorId==0x8086, 10000, 500000000);
     if (result.error != XhciResetError::None) {
-        KPrintf("xhci: reset failed phase=%u error=%u USBCMD=0x%x USBSTS=0x%x\n",
+        // The wait may have sampled only USBCMD; label its last status and
+        // take a fresh status sample after the bounded wait for diagnostics.
+        const bool sampleStatus=result.phase==XhciResetPhase::ExistingReset &&
+                                result.error==XhciResetError::Timeout;
+        const uint32_t statusNow=sampleStatus?io.status():0;
+        KPrintf("xhci: reset failed phase=%u error=%u USBCMD=0x%x USBSTS_last=0x%x USBSTS_now=0x%x valid=%u elapsed=%lu ms\n",
                 static_cast<unsigned>(result.phase),static_cast<unsigned>(result.error),
-                result.command,result.status);
+                result.command,result.status,statusNow,(sampleStatus && statusNow!=0xffffffffu)?1u:0u,ApicTickCount()-started);
         return false;
     }
+    // PAGESIZE is operational state: inspect it only after reset and CNR clear.
+    const uint32_t psReg=xhci_read32(ctrl.opBase,XHCI_OP_PAGESIZE);
+    if(psReg==0xffffffffu || !(psReg&1)){SerialPuts("xhci: page size register unavailable or lacks 4KiB support\n");return false;}
+    ctrl.pageSize=4096;
+    SerialPrintf("xhci: page=%u\n",ctrl.pageSize);
     SerialPuts("xhci: controller reset complete\n");
     return true;
 }
@@ -3192,6 +3192,30 @@ IRQ_NAKED_HANDLER(XhciMsixIsr, XhciMsixIsrInner)
 // Module init / exit
 // ---------------------------------------------------------------------------
 
+static void XhciLogPciState(const PciDevice& dev,const char* stage)
+{
+    const uint16_t command=PciConfigRead16(dev.bus,dev.dev,dev.fn,4);
+    const uint16_t status=PciConfigRead16(dev.bus,dev.dev,dev.fn,6);
+    bool valid=command!=0xffffu && status!=0xffffu;
+    uint8_t cap=valid && (status&(1u<<4))?PciConfigRead8(dev.bus,dev.dev,dev.fn,0x34):0;
+    uint16_t pmcsr=0;bool found=false;uint64_t visited=0;
+    for(unsigned i=0;cap && i<48;++i) {
+        if(cap<0x40 || cap>0xf8 || (cap&3) || (visited&(1ull<<((cap-0x40)/4)))) {valid=false;break;}
+        visited|=1ull<<((cap-0x40)/4);
+        const uint8_t id=PciConfigRead8(dev.bus,dev.dev,dev.fn,cap);
+        if(id==0xff) {valid=false;break;}
+        if(id==1) {
+            pmcsr=PciConfigRead16(dev.bus,dev.dev,dev.fn,cap+4);found=true;
+            if(pmcsr==0xffffu)valid=false;
+            break;
+        }
+        cap=PciConfigRead8(dev.bus,dev.dev,dev.fn,cap+1);
+    }
+    if(cap && !found)valid=false;
+    KPrintf("xhci: pci %s cmd=0x%x status=0x%x caps_valid=%u pm_present=%u pmcsr=0x%x\n",
+            stage,command,status,valid?1u:0u,found?1u:0u,pmcsr);
+}
+
 static int XhciModuleInit()
 {
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
@@ -3210,6 +3234,7 @@ static int XhciModuleInit()
         SerialPuts("xhci: no controller detected, module inactive\n");
         return 0; // not an error — just no hardware present
     }
+    XhciLogPciState(ctrl.pciDev,"before-handoff");
 
     struct OwnershipIo {
         XhciController& ctrl;uint64_t deadline;
@@ -3224,6 +3249,9 @@ static int XhciModuleInit()
         KPuts("xhci: firmware ownership handoff failed; controller untouched\n");return -1;
     }
     KPrintf("xhci: firmware handoff complete legacy=0x%x\n",legacy);
+    if(legacy)KPrintf("xhci: ownership after handoff sem=0x%x ctl=0x%x\n",
+                       ownership.read(legacy),ownership.read(legacy+4));
+    XhciLogPciState(ctrl.pciDev,"after-handoff");
     // Reset only after firmware releases ownership and halt is observed.
     if (!XhciReset(ctrl)) {KPuts("xhci: controller reset failed; USB storage/network unavailable\n");return -1;}
     PciEnableBusMaster(ctrl.pciDev);

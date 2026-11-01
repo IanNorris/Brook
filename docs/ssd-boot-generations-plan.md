@@ -98,4 +98,9 @@ The user confirmed kernel-console keyboard scrolling on that boot. These
 restarts are not proof that the
 intermittent controller failure is fixed; test further and verify persistence
 through a separate cold-power cycle before calling SSD-only operation reliable.
-The `e2fsck` checker is bundled but automatic repair is not yet implemented.
+The subsequent physical SSD-only cold boot reached the desktop but reported
+`phase=8 error=2 USBCMD=0x2 USBSTS=0x11`: the existing-reset wait timed out.
+Brook had not issued its own reset at that point. The reported USBSTS was an
+earlier sample, not a final reading, and does not establish the timeout state.
+The user is trying a full power disconnection. The `e2fsck` checker is bundled
+but automatic repair is not yet implemented.
