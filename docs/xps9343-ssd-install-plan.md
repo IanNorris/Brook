@@ -107,6 +107,11 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   passed a QEMU USB/network roundtrip; the physical-device-bound initrd
   correctly refused QEMU's different SSD identity. USB generation 25 was then
   staged while retaining the previous generation and root recovery.
+  The Dell subsequently booted generation 25 from USB: the expected payload ID
+  was reported, xHCI enumerated the USB devices, Ethernet obtained an address,
+  and the persistent SSD store was ready. One successful physical boot does not
+  prove that the intermittent warm-reset failure has been eliminated; firmware
+  detection after repeated power cycles also remains to be checked.
 
 ## Installation plan and historical engineering gates
 
