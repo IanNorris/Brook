@@ -49,6 +49,15 @@ active-open path. Host tests cover scale absence, bounds and option parsing;
 the kernel builds. Actual receive-path and wire tests are still needed before
 physical deployment. Ordered updates and sender serialization remain open.
 
+In a private QEMU run of this candidate, an active-open curl request downloaded
+4 MiB from a loopback-only host server and exited successfully; the guest then
+completed checked shutdown. Packet capture shows the guest SYN advertising a
+65,535-byte window and scale 3, a SYN-ACK without a scale option, and the
+guest's subsequent ACK advertising an unscaled 65,535-byte window. Evidence:
+`build/hardware/tcp-window-qemu-v3-20261101/network.pcap` and `result.json`.
+This covers an ordinary no-scale handshake, not injected invalid SYN-ACKs or
+the full receive-path matrix; it does not establish any throughput improvement.
+
 A private-QEMU comparison used the same kernel with an experimental boot-only
 switch to remove the post-ACK yield. A single 2,056,443-byte roundtrip took
 0.168 s upload and 0.303 s download with the existing yield, versus 0.201 s
