@@ -42,6 +42,13 @@ not been deployed to the Dell. Receive-path integration tests remain necessary,
 as do ordered established-window updates, correct scale negotiation and sender
 serialization before using the peer window to permit multiple segments.
 
+The next candidate advertises unscaled windows in SYN segments and disables
+both window scales when an accepted active-open SYN-ACK omits scaling. It also
+publishes the debug channel's SYN sequence before sending, matching the normal
+active-open path. Host tests cover scale absence, bounds and option parsing;
+the kernel builds. Actual receive-path and wire tests are still needed before
+physical deployment. Ordered updates and sender serialization remain open.
+
 A private-QEMU comparison used the same kernel with an experimental boot-only
 switch to remove the post-ACK yield. A single 2,056,443-byte roundtrip took
 0.168 s upload and 0.303 s download with the existing yield, versus 0.201 s

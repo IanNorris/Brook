@@ -222,15 +222,16 @@ static uint32_t TcpReceiveFree(const Socket& s);
 
 struct TcpTxSnapshot {
     uint32_t localIp, remoteIp, ack, nextSeq, iss, ownerPid;
-    uint16_t localPort, remotePort, window;
+    uint16_t localPort, remotePort, window, synWindow;
     uint8_t windowScale;
 };
 static TcpTxSnapshot CaptureTcpTxLocked(const Socket& s)
 {
-    uint32_t window = TcpReceiveFree(s) >> s.tcpRcvWndScale;
+    uint32_t free = TcpReceiveFree(s);
     return {s.localIp, s.remoteIp, s.tcpRcvNxt, s.tcpSndNxt, s.tcpSndIss,
             s.ownerPid, s.localPort, s.remotePort,
-            static_cast<uint16_t>(window > 65535u ? 65535u : window), s.tcpRcvWndScale};
+            TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0),
+            TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN), s.tcpRcvWndScale};
 }
 static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
@@ -2334,7 +2335,7 @@ static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t s
     tcp->ackNum   = htonl(snapshot.ack);
     tcp->dataOff  = ((sizeof(TcpHeader) + optLen) / 4) << 4;
     tcp->flags    = flags;
-    tcp->window = htons(snapshot.window);
+    tcp->window = htons((flags & TCP_SYN) ? snapshot.synWindow : snapshot.window);
     tcp->urgentPtr = 0;
 
     if (optLen) memcpy(buf + sizeof(TcpHeader), options, optLen);
@@ -2480,19 +2481,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == (TCP_SYN | TCP_ACK) &&
             s.tcpState == TcpState::SynSent && ack == s.tcpSndNxt) {
             const uint8_t* optPtr = static_cast<const uint8_t*>(payload) + sizeof(TcpHeader);
-            const uint8_t* optEnd = static_cast<const uint8_t*>(payload) + dataOff;
-            s.tcpPeerMss = TcpPeerMss(optPtr, static_cast<uint32_t>(optEnd - optPtr));
-            while (optPtr < optEnd) {
-                uint8_t kind = *optPtr;
-                if (kind == 0) break;
-                if (kind == 1) { optPtr++; continue; }
-                if (optPtr + 1 >= optEnd) break;
-                uint8_t optLength = optPtr[1];
-                if (optLength < 2 || optPtr + optLength > optEnd) break;
-                if (kind == 3 && optLength == 3) // Window Scale
-                    s.tcpSndWndScale = optPtr[2] > 14 ? 14 : optPtr[2];
-                optPtr += optLength;
-            }
+            TcpAcceptActiveSynOptions(s, optPtr, dataOff - sizeof(TcpHeader));
         }
 
         // Update peer's advertised window (apply scale for non-SYN segments)
@@ -3324,7 +3313,9 @@ static void DebugChannelThreadFn(void* /*arg*/)
     }
 
     s.tcpSndIss  = static_cast<uint32_t>(__atomic_load_n(&g_ipId, __ATOMIC_RELAXED)) * 12345 + ntohs(s.localPort) * 67890;
-    s.tcpSndNxt  = s.tcpSndIss;
+    // Publish the SYN's sequence consumption before local delivery can return
+    // the SYN-ACK, as in the normal active-open path.
+    s.tcpSndNxt  = s.tcpSndIss + 1;
     s.tcpSndUna  = s.tcpSndIss;
     s.tcpRcvNxt  = 0;
     s.tcpFinRecv = false;
@@ -3334,8 +3325,7 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpRcvWndScale = 3;
     s.tcpState   = TcpState::SynSent;
 
-    TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-poll");
-    s.tcpSndNxt++;
+    TcpSendSegmentAtSeq(s, s.tcpSndIss, TCP_SYN, nullptr, 0, "connect-poll");
 
     for (int i = 0; i < 200; i++) {
         if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);

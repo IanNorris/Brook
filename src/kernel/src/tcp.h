@@ -45,6 +45,36 @@ inline uint16_t TcpPeerMss(const uint8_t* options, uint32_t length)
     return mss ? mss : 536;
 }
 
+// Window fields in SYN and SYN-ACK are never scaled. Subsequent segments
+// use scaling only when both endpoints offered it during the handshake.
+inline uint16_t TcpAdvertisedWindow(uint32_t freeBytes, uint8_t scale, uint8_t flags)
+{
+    uint32_t window = freeBytes >> ((flags & TCP_SYN) ? 0 : scale);
+    return static_cast<uint16_t>(window > 65535u ? 65535u : window);
+}
+
+// Call only for an accepted active-open SYN-ACK while holding the socket lock.
+inline void TcpAcceptActiveSynOptions(Socket& socket, const uint8_t* options, uint32_t length)
+{
+    socket.tcpPeerMss = TcpPeerMss(options, length);
+    socket.tcpSndWndScale = 0;
+    bool offered = false;
+    for (uint32_t i = 0; i < length;) {
+        const uint8_t kind = options[i];
+        if (kind == 0) break;
+        if (kind == 1) { ++i; continue; }
+        if (i + 1 >= length) break;
+        const uint32_t n = options[i + 1];
+        if (n < 2 || n > length - i) break;
+        if (kind == 3 && n == 3 && !offered) {
+            socket.tcpSndWndScale = options[i + 2] > 14 ? 14 : options[i + 2];
+            offered = true;
+        }
+        i += n;
+    }
+    if (!offered) socket.tcpRcvWndScale = 0;
+}
+
 inline uint16_t TcpEgressLimit(uint16_t peerMss, uint16_t ceiling)
 {
     uint16_t limit = peerMss ? peerMss : 536;
