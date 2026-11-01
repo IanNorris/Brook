@@ -40,3 +40,35 @@ The initial SSD partition is 6 GiB and contains a 3.75 GiB store image, so
 space accounting and an eventual expansion strategy are prerequisites for
 retaining multiple substantial generations. FAT32's per-file size limit also
 remains relevant to the store design.
+
+## Existing Dell migration
+
+The existing SSD EFI executable was independently hashed over the recovery
+bridge and matches the known slot-capable loader. Its current configuration
+uses the legacy direct pair, with no `UPDATES` directory. The system volume
+reported approximately 2,064,096 KiB free; check it again before staging.
+
+To migrate without replacing EFI or the working root pair, an identity-bound
+SSD-specific helper should seed both capacity-sized slots from verified
+SSD-specific kernel/initrd pairs. Flush and reopen/read back each file and
+selector before enabling slots. Only after both records and pairs verify,
+append `UPDATE_SLOTS=1` to the existing configuration and verify its complete
+contents after flush. The root kernel/initrd and USB recovery remain intact.
+If preparation fails or is interrupted, the legacy configuration remains the
+default; after activation the loader tries verified pairs and then root.
+
+This is not a guarantee against arbitrary FAT metadata loss or a hash-valid
+kernel that hangs. The USB recovery remains necessary, and automated trial-boot
+rollback is still a separate feature. Before physical migration, test each
+interrupted stage on a private clone, including filesystem checks and booting,
+then test a full slot update, corrupt-newest fallback and invalid-record root
+fallback. A QEMU process stop does not establish physical power-cut behavior.
+
+The candidate initializer and SSD-specific updater have now been exercised on
+private QEMU SSDs. A new generation with a distinct payload ID booted; corrupting
+it selected the previous generation; invalidating both selectors booted the
+legacy pair. The initializer and updater also ran with the desktop store
+mounted, followed by a clean ext2 check. Eight injected QEMU process stops at
+migration stages were followed by offline FAT checks and successful boots; one
+boot check needed a retry after an unexplained QEMU exit. These are not physical
+power-loss tests. The physical SSD has not yet been migrated.

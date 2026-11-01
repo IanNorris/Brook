@@ -60,6 +60,11 @@ class Tests(unittest.TestCase):
     def test_activation_without_reboot(self):
         result=self.execute();self.assertEqual(result['state'],'activated')
         self.assertFalse(any(call[0]=='power' for call in self.bridge.calls))
+    def test_system_helper_is_explicit(self):
+        result=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+            'original',self.key,self.kernel,self.initrd,True,helper='system')
+        self.assertEqual(result['helper'],'system')
+        self.assertEqual([x for x in self.bridge.calls if x[0]=='run'][0][3][0],'/boot/HWUPSYS.ELF')
     def test_staged_only_does_not_restart(self):
         self.assertEqual(self.execute(False)['state'],'staged_only')
         self.assertFalse(self.receipt()['storage_modified'])

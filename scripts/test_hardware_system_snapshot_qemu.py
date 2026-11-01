@@ -22,6 +22,8 @@ sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge'), str(ROOT / '
 from hardware import Hardware
 from hardware_bulk_protocol import download
 from hardware_bulk_workflow import BulkRun
+from hardware_update_workflow import UpdateRun
+from stage_usb_ssd_recovery import parse as parse_slot_record
 from test_hardware_power import Qmp
 
 
@@ -56,12 +58,42 @@ def main():
                         help='Use an already-prepared recovery initrd unchanged')
     parser.add_argument('--expect-identity-refusal', action='store_true',
                         help='Expect a physical-device-bound initrd to reject the private QEMU disk')
+    parser.add_argument('--ssd-slot-bootstrap', type=Path,
+                        help='Run the candidate SSD slot initializer on this disposable QEMU disk')
+    parser.add_argument('--clean-store', action='store_true',
+                        help='Run slot initialization while the private desktop store is mounted')
+    parser.add_argument('--require-slot-boot', action='store_true',
+                        help='Invalidate the private clone legacy kernel so boot requires an A/B slot')
+    parser.add_argument('--corrupt-newest-slot', action='store_true',
+                        help='Corrupt slot B in a pre-migrated private fixture')
+    parser.add_argument('--invalidate-selectors', action='store_true',
+                        help='Invalidate both selectors to test legacy fallback')
+    parser.add_argument('--system-updater', type=Path,
+                        help='After slot bootstrap, test an SSD-specific inactive-slot update')
+    parser.add_argument('--slot-interrupt', choices=('directory','slot-a-kernel','slot-a','slot-b-kernel','slot-b','selector-a','selectors','activation-written'),
+                        help='Interrupt a test-only slot initializer at a published checkpoint')
+    parser.add_argument('--expected-payload-id', help='Require this HWSTATUS payload ID after boot')
+    parser.add_argument('--forbidden-payload-id', help='Reject this HWSTATUS payload ID after boot')
     a = parser.parse_args()
     if (a.readonly_checker or a.preen_checker) and not a.dirty_classification_kernel:
         parser.error('checker tests require --dirty-classification-kernel')
+    if a.ssd_slot_bootstrap and not a.dirty_classification_kernel:
+        parser.error('SSD slot bootstrap requires dirty classification mode')
+    if a.clean_store and (not a.ssd_slot_bootstrap or a.expect_identity_refusal):
+        parser.error('clean store mode requires the SSD slot bootstrap and admitted disk')
+    if a.system_updater and not a.ssd_slot_bootstrap:
+        parser.error('system updater requires SSD slot bootstrap')
+    if a.slot_interrupt and (not a.ssd_slot_bootstrap or a.system_updater or a.clean_store):
+        parser.error('slot interruption requires an unmounted store and a test-only bootstrap')
+    if a.require_slot_boot and (not a.dirty_classification_kernel or a.ssd_slot_bootstrap):
+        parser.error('slot boot requires dirty mode and a pre-migrated fixture')
+    if a.corrupt_newest_slot and not a.require_slot_boot:
+        parser.error('corrupt newest slot requires an invalid legacy kernel')
+    if a.invalidate_selectors and (not a.dirty_classification_kernel or a.require_slot_boot):
+        parser.error('invalid selectors require a valid legacy kernel')
     if a.readonly_checker and a.preen_checker:
         parser.error('choose one checker mode')
-    if a.candidate_initrd and (not a.dirty_classification_kernel or a.xhci_module or a.recovery_initrd or a.readonly_checker or a.preen_checker):
+    if a.candidate_initrd and (not a.dirty_classification_kernel or a.xhci_module or a.recovery_initrd or a.readonly_checker or a.preen_checker or a.ssd_slot_bootstrap):
         parser.error('candidate initrd requires dirty mode and no initrd modifications')
     if a.expect_identity_refusal and not a.candidate_initrd:
         parser.error('identity refusal requires a candidate initrd')
@@ -76,16 +108,21 @@ def main():
     if a.dirty_classification_kernel:
         dirty_store = out / 'dirty-store.img'
         run('cp', '--reflink=always', a.store, dirty_store)
-        with dirty_store.open('r+b') as f:
-            f.seek(1082); f.write(b'\0\0'); f.flush(); os.fsync(f.fileno())
+        if not a.clean_store:
+            with dirty_store.open('r+b') as f:
+                f.seek(1082); f.write(b'\0\0'); f.flush(); os.fsync(f.fileno())
         run('mcopy', '-o', '-i', media, dirty_store, '::STORE.IMG')
         run('mcopy', '-o', '-i', media, a.dirty_classification_kernel, '::KERNEL/BROOK.ELF')
     else:
         run('mdel', '-i', initrd, '::ETC/writable-desktop')
     if not a.candidate_initrd:
-        run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
+        run('mcopy', '-o', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
     if a.xhci_module:
         run('mcopy', '-o', '-i', initrd, a.xhci_module, '::DRIVERS/XHCI.MOD')
+    if a.ssd_slot_bootstrap:
+        run('mcopy', '-o', '-i', initrd, a.ssd_slot_bootstrap, '::BOOT/SSDSLOT.ELF')
+    if a.system_updater:
+        run('mcopy', '-o', '-i', initrd, a.system_updater, '::BOOT/HWUPSYS.ELF')
     if a.recovery_initrd:
         shell = out / 'busybox'
         run('mcopy', '-i', a.recovery_initrd, '::BOOT/BUSYBOX', shell)
@@ -93,9 +130,35 @@ def main():
     if a.readonly_checker or a.preen_checker:
         run('mcopy', '-i', initrd, a.readonly_checker or a.preen_checker, '::BOOT/E2FSCK.ELF')
     run('mcopy', '-o', '-i', media, initrd, '::INITRD.IMG')
+    if a.require_slot_boot:
+        invalid = out / 'invalid-legacy-kernel'; invalid.write_bytes(b'intentionally invalid private QEMU kernel')
+        run('mcopy', '-o', '-i', media, invalid, '::KERNEL/BROOK.ELF')
+    if a.corrupt_newest_slot:
+        selections = []
+        for n in range(2):
+            p = out / ('source-selector-' + str(n)); run('mcopy', '-i', media, '::UPDATES/SELECT' + str(n) + '.BIN', p)
+            raw = p.read_bytes(); generation, slot, ks, ins = parse_slot_record(raw)
+            name = 'B' if slot else 'A'
+            k, i = out / ('source-kernel-' + name), out / ('source-initrd-' + name)
+            run('mcopy', '-i', media, '::UPDATES/' + name + '/KERNEL.ELF', k)
+            run('mcopy', '-i', media, '::UPDATES/' + name + '/INITRD.IMG', i)
+            assert hashlib.sha256(k.read_bytes()[:ks]).digest() == raw[40:72]
+            assert hashlib.sha256(i.read_bytes()[:ins]).digest() == raw[72:104]
+            selections.append((generation, name, k))
+        selections.sort()
+        assert selections[0][0] != selections[1][0] and selections[0][1] != selections[1][1]
+        newest = selections[-1]; bad_slot = newest[2]
+        (out / 'fallback-expectation.json').write_text(json.dumps({'corrupted_generation': newest[0],
+            'corrupted_slot': newest[1], 'expected_generation': selections[0][0], 'expected_slot': selections[0][1]}, indent=2) + '\n')
+        with bad_slot.open('r+b') as f: f.seek(0); f.write(b'\0')
+        run('mcopy', '-o', '-i', media, bad_slot, '::UPDATES/' + newest[1] + '/KERNEL.ELF')
+    if a.invalidate_selectors:
+        bad_record = out / 'invalid-selector'; bad_record.write_bytes(bytes(128))
+        for name in ('SELECT0.BIN', 'SELECT1.BIN'):
+            run('mcopy', '-o', '-i', media, bad_record, '::UPDATES/' + name)
     variables = out / 'VARS.fd'; shutil.copy2(os.environ['OVMF_VARS'], variables); variables.chmod(0o600)
     ports = []
-    for _ in range(2):
+    for _ in range(3):
         with socket.socket() as s:
             s.bind(('127.0.0.1', 0)); ports.append(s.getsockname()[1])
     argv = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', '4096', '-nodefaults',
@@ -104,7 +167,7 @@ def main():
             '-drive', f'if=none,id=sata,format=raw,file={disk}',
             '-device', 'ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=BROOK-SYSTEM-TEST01',
             '-device', 'qemu-xhci,id=usbc', '-device', 'usb-net,bus=usbc.0,port=2,netdev=network',
-            '-netdev', f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{ports[0]}-:1234,hostfwd=tcp:127.0.0.1:{ports[1]}-:1236',
+            '-netdev', f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{ports[0]}-:1234,hostfwd=tcp:127.0.0.1:{ports[1]}-:1236,hostfwd=tcp:127.0.0.1:{ports[2]}-:1235',
             '-display', 'none', '-serial', 'file:' + str(out / 'serial.log'),
             '-qmp', 'unix:' + str(out / 'qmp.sock') + ',server=on,wait=off', '-no-reboot']
     (out / 'argv.json').write_text(json.dumps(argv, indent=2) + '\n')
@@ -125,15 +188,31 @@ def main():
             else:
                 raise TimeoutError('maintenance boot did not reach debug interface')
             h = Hardware(out / 'registry'); attached = h.attach('127.0.0.1', ports[0]); s = attached['session']
+            if a.expected_payload_id or a.forbidden_payload_id:
+                ident = uuid.uuid4().hex
+                h.guest_run(s, ident, ['/boot/HWSTATUS.ELF'], cwd='/tmp', uid=0, wait_s=2)
+                status = h.job(s, ident, wait_s=20)
+                (out / 'payload-status.json').write_text(json.dumps(status, indent=2) + '\n')
+                if status['state'] != 'completed' or status.get('exit', {}).get('code') != 0:
+                    raise RuntimeError('payload status failed')
+                text = status.get('stdout', {}).get('text', '')
+                if a.expected_payload_id and 'HARDWARE_PAYLOAD_ID ' + a.expected_payload_id + '\n' not in text:
+                    raise RuntimeError('expected payload was not selected')
+                if a.forbidden_payload_id and 'HARDWARE_PAYLOAD_ID ' + a.forbidden_payload_id + '\n' in text:
+                    raise RuntimeError('forbidden payload was selected')
             caps = h.command(s, 'bridge hardware caps')
-            assert not caps['writable_desktop']['ready'] and not caps['writable_desktop']['source_pinned']
-            assert 'writable desktop: ready' not in serial
+            if a.clean_store:
+                assert caps['writable_desktop']['ready'] and caps['writable_desktop']['source_pinned']
+                assert 'writable desktop: ready' in serial
+            else:
+                assert not caps['writable_desktop']['ready'] and not caps['writable_desktop']['source_pinned']
+                assert 'writable desktop: ready' not in serial
             if a.expect_identity_refusal:
                 assert 'ahci system: disk identity or writable state failed' in serial
             else:
                 assert 'ahci system: verified GPT entry' in serial
             if dirty_store:
-                if not a.expect_identity_refusal:
+                if not a.expect_identity_refusal and not a.clean_store:
                     assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
                     assert caps['writable_desktop']['error'] == -117
                 if a.network_roundtrip:
@@ -143,6 +222,45 @@ def main():
                     received = BulkRun(h, out / 'network-download').execute(s, a.key_file, 'get',
                         artifact_id=transfer['transaction_id'], port=ports[1])
                     assert sha(payload) == sha(Path(received['artifact_path']))
+                if a.ssd_slot_bootstrap:
+                    efi = out / 'original-efi.bin'
+                    # Read only the stopped source fixture, not the running disk.
+                    run('mcopy', '-i', str(a.fixture) + '@@1048576', '::EFI/BOOT/BOOTX64.EFI', efi)
+                    ident = uuid.uuid4().hex
+                    env = {'BROOK_TEST_HOLD': a.slot_interrupt} if a.slot_interrupt else None
+                    h.guest_run(s, ident, ['/boot/SSDSLOT.ELF', sha(efi)], cwd='/tmp', uid=0, env=env, wait_s=2)
+                    deadline = time.monotonic() + 600
+                    while True:
+                        job = h.job(s, ident, wait_s=2)
+                        (out / 'slot-bootstrap-job.json').write_text(json.dumps(job, indent=2) + '\n')
+                        if a.slot_interrupt and 'SSD_SLOT_TEST_HOLD ' + a.slot_interrupt in job.get('stdout', {}).get('text', ''):
+                            qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
+                            config = out / 'after-interruption-config'; run('mcopy', '-i', media, '::BROOK.CFG', config)
+                            original = out / 'original-config'; run('mcopy', '-i', str(a.fixture) + '@@1048576', '::BROOK.CFG', original)
+                            after, before = config.read_bytes(), original.read_bytes()
+                            assert after.startswith(before)
+                            suffix = after[len(before):]
+                            if a.slot_interrupt == 'activation-written':
+                                assert b'\nUPDATE_SLOTS=1\n'.startswith(suffix)
+                            else:
+                                assert not suffix
+                            expected = b'UPDATE_SLOTS=1' in suffix
+                            (out / 'result.json').write_text(json.dumps({'passed': True, 'scope': 'QEMU process interruption, not physical power loss',
+                                'stage': a.slot_interrupt, 'activation_visible': expected}, indent=2) + '\n')
+                            print('SSD_SLOT_INTERRUPTION_QEMU_PASS', a.slot_interrupt, flush=True)
+                            return
+                        if job['state'] in ('completed', 'failed', 'lost', 'rejected'): break
+                        if time.monotonic() >= deadline: raise TimeoutError('inspect original bootstrap job ' + ident)
+                    if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
+                        raise RuntimeError('SSD slot bootstrap failed; see slot-bootstrap-job.json')
+                if a.system_updater:
+                    update_initrd = out / 'system-update-initrd.img'; shutil.copyfile(initrd, update_initrd)
+                    update_id = out / 'system-update-payload-id'; update_id.write_text('qemu-ssd-update-generation-3\n')
+                    run('mcopy', '-o', '-i', update_initrd, update_id, '::ETC/hardware-payload-id')
+                    update = UpdateRun(h, out / 'system-update').execute(s, a.key_file,
+                        a.dirty_classification_kernel, update_initrd, activate=True, port=ports[2], helper='system')
+                    if update['state'] != 'activated':
+                        raise RuntimeError('SSD inactive-slot update did not activate')
                 if a.chmod_bootstrap:
                     payload = a.chmod_bootstrap.read_bytes()
                     for offset in range(0, len(payload), 2048):
@@ -185,6 +303,9 @@ def main():
                     time.sleep(.2); state = h.power(s, request, 'status')
                 qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
                 recovered = out / 'after-store.img'; run('mcopy', '-i', media, '::STORE.IMG', recovered)
+                if a.ssd_slot_bootstrap:
+                    config = out / 'after-config'; run('mcopy', '-i', media, '::BROOK.CFG', config)
+                    assert b'UPDATE_SLOTS=1\n' in config.read_bytes()
                 if a.preen_checker:
                     # Host verification is deliberately read-only and occurs after
                     # QEMU has shut down, on the extracted disposable image.
@@ -196,14 +317,21 @@ def main():
                     with recovered.open('rb') as f:
                         f.seek(1082)
                         assert f.read(2) == b'\x01\x00', 'preen did not mark image clean'
-                else:
+                elif not a.clean_store:
                     assert sha(recovered) == sha(dirty_store)
-                (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'identity-refused' if a.expect_identity_refusal else 'needs-filesystem-check',
-                    'store_unmounted': True, 'store_bytes_unchanged': not bool(a.preen_checker),
+                stage = 'identity-refused' if a.expect_identity_refusal else ('ready' if a.clean_store else 'needs-filesystem-check')
+                (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': stage,
+                    'store_unmounted': not a.clean_store, 'store_bytes_unchanged': None if a.clean_store else not bool(a.preen_checker),
                     'checked_shutdown': True, 'readonly_checker_passed': bool(a.readonly_checker),
                     'disposable_preen_passed': bool(a.preen_checker),
                     'chmod_bootstrap_passed': bool(a.chmod_bootstrap),
-                    'network_roundtrip_passed': bool(a.network_roundtrip)}, indent=2) + '\n')
+                    'network_roundtrip_passed': bool(a.network_roundtrip),
+                    'ssd_slot_bootstrap_passed': bool(a.ssd_slot_bootstrap),
+                    'system_update_passed': bool(a.system_updater),
+                    'store_mounted_during_bootstrap': bool(a.clean_store),
+                    'slot_boot_required': bool(a.require_slot_boot),
+                    'corrupt_newest_slot': bool(a.corrupt_newest_slot),
+                    'invalid_selectors': bool(a.invalidate_selectors)}, indent=2) + '\n')
                 print('DIRTY_STORE_CLASSIFICATION_QEMU_PASS', flush=True)
                 return
             tx = uuid.uuid4().hex

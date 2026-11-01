@@ -12,6 +12,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef BROOK_UPDATE_SYSTEM
+#include <sys/statfs.h>
+#endif
 #include <unistd.h>
 #include "../src/shared/update/payload.h"
 #include "../src/shared/update/executable.h"
@@ -152,7 +155,14 @@ done:
 }
 int main(int argc,char** argv) {
     if(argc!=3||!hex32(argv[1])||!hex32(argv[2])){fputs("usage: HWUPDATE.ELF BOOT_ID32 TRANSACTION_ID32\n",stderr);return 2;}
+#if defined(BROOK_UPDATE_SYSTEM) && !defined(BROOK_UPDATE_TEST)
+    if(geteuid()!=0)return 3;
+#endif
+#ifdef BROOK_UPDATE_SYSTEM
+    const char* root="/media/system/UPDATES";const char* keypath="/etc/hardware-update-key";
+#else
     const char* root="/media/usb/UPDATES";const char* keypath="/etc/hardware-update-key";
+#endif
     const char* marker="/etc/hardware-maintenance";const char* lock="/tmp/hardware-update.lock";unsigned port=1235;
 #ifdef BROOK_UPDATE_TEST
     root=getenv("BROOK_UPDATE_TEST_ROOT");keypath=getenv("BROOK_UPDATE_TEST_KEY");marker=keypath;lock=getenv("BROOK_UPDATE_TEST_LOCK");port=(unsigned)atoi(getenv("BROOK_UPDATE_TEST_PORT"));
@@ -167,6 +177,20 @@ int main(int argc,char** argv) {
     if(close(fd))return 4;
     directory=open(root,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);int listener=-1,client=-1,result=5;
     if(directory<0)goto done;
+#ifdef BROOK_UPDATE_SYSTEM
+    /* The system volume is mounted only by the kernel's identity-bound AHCI
+     * admission path. Refuse an unmounted RAM directory or other FS. */
+    struct stat st,parent;struct statfs fs;
+    int selector=open("/etc/ahci-boot-volume",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    int target=open("/etc/ahci-write-target",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if(selector<0 || target<0 || fstat(directory,&st) || stat("/media",&parent) || fstatfs(directory,&fs) ||
+       st.st_dev==parent.st_dev || (uint64_t)fs.f_type!=0x4d44) {
+        if(selector>=0)close(selector);
+        if(target>=0)close(target);
+        goto done;
+    }
+    close(selector);close(target);
+#endif
     listener=socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0);if(listener<0)goto done;
     struct sockaddr_in address={.sin_family=AF_INET,.sin_port=htons((uint16_t)port),.sin_addr={.s_addr=htonl(INADDR_ANY)}};
     if(bind(listener,(struct sockaddr*)&address,sizeof(address))||listen(listener,1))goto done;
