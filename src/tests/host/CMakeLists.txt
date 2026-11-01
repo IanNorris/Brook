@@ -64,6 +64,8 @@ target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
     "${BROOK_ROOT}/src/shared/inc_km" "${BROOK_ROOT}/src/bootloader/src")
 add_host_test(test_usb_ecm_descriptors)
+add_host_test(test_usb_ecm_rx_credits)
+target_compile_options(test_usb_ecm_rx_credits PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_xhci_completion_queue)
 add_host_test(test_partition_bounds)
 add_host_test(test_strict_gpt_inventory)

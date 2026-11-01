@@ -17,6 +17,7 @@
 #include "module_abi.h"
 #include "usb_block_bytes.h"
 #include "usb_ecm_descriptors.h"
+#include "usb_ecm_rx_credits.h"
 #include "net.h"
 #include "xhci_ownership.h"
 #include "xhci_controller_reset.h"
@@ -964,14 +965,14 @@ struct XhciDevice {
     void*    priv;          // driver-private (DMA report buffer for HID)
 };
 
-static constexpr unsigned ECM_RX_PACKETS=32;
-static constexpr unsigned ECM_RX_SLOTS=8;
+static constexpr unsigned ECM_RX_PACKETS=UsbEcmRxCredits::Capacity;
+static constexpr unsigned ECM_RX_SLOTS=UsbEcmRxCredits::Slots;
 struct UsbEcmState {
     NetIf interface;
     XhciController* controller;XhciDevice* device;
     uint8_t* rx;uint64_t rxPhysical;
-    struct Rx {uint64_t token;bool active;} receives[ECM_RX_SLOTS];
-    unsigned rxOutstanding,rxDepth;KMutex dispatchLock;bool earlyDispatch;
+    UsbEcmRxCredits rxCredits;
+    unsigned rxDepth;KMutex dispatchLock;bool earlyDispatch;
     uint8_t* notification;uint64_t notificationPhysical,notificationToken;
     bool linkKnown,linkUp;uint64_t notifications,reportTick;uint32_t notifyHeader[2];
     uint8_t notificationSamples[16][16],notificationLengths[16];uint32_t notificationPrinted;
@@ -2275,11 +2276,11 @@ static uint64_t XhciEcmTrb(XhciDevice& dev,bool input,uint64_t physical,uint32_t
 // the controller may already be running from an earlier doorbell.
 static void XhciEcmReceiveArm(UsbEcmState& net){
     if(net.failed || net.controller->completionFailed)return;
-    for(unsigned i=0;i<net.rxDepth && net.tail-net.head+net.rxOutstanding<ECM_RX_PACKETS;++i){
-        auto& rx=net.receives[i];if(rx.active)continue;
-        rx.token=XhciEcmTrb(*net.device,true,net.rxPhysical+i*2048,2048,false,false);
-        rx.active=true;++net.rxOutstanding;
-        auto& head=net.device->bulkInRing[(rx.token-net.device->bulkInRingPhys)/sizeof(Trb)];
+    for(unsigned i=0;i<net.rxDepth;++i){
+        if(!net.rxCredits.CanArm(i,net.rxDepth,net.tail-net.head))continue;
+        const auto token=XhciEcmTrb(*net.device,true,net.rxPhysical+i*2048,2048,false,false);
+        net.rxCredits.Arm(i,token);
+        auto& head=net.device->bulkInRing[(token-net.device->bulkInRingPhys)/sizeof(Trb)];
         __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         XhciRingDoorbell(*net.controller,net.device->slotId,net.device->bulkInDci);
@@ -2318,10 +2319,9 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     }
     if(dci==dev.bulkInDci){
         if(net.failed)return true;
-        unsigned rxSlot=ECM_RX_SLOTS;
-        for(unsigned i=0;i<ECM_RX_SLOTS;++i)if(net.receives[i].active && net.receives[i].token==event.param){rxSlot=i;break;}
-        if(rxSlot==ECM_RX_SLOTS || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>2048){fail();return true;}
-        net.receives[rxSlot].active=false;--net.rxOutstanding;
+        const int rxSlot=net.rxCredits.Find(event.param);
+        if(rxSlot<0 || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>2048){fail();return true;}
+        net.rxCredits.Complete(static_cast<unsigned>(rxSlot));
         const unsigned bytes=2048-residue;
         if(bytes>=14 && bytes<=1514){
             if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx+rxSlot*2048,bytes);net.lengths[index]=bytes;++net.tail;++net.received;}

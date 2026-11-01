@@ -56,6 +56,13 @@ with outstanding buffers. Compare depth one and eight using the same physical
 payload, controlled transfers and retransmission counters; pacing results alone
 do not prove this queue was the location of the loss.
 
+The receive-credit bookkeeping is now shared with a host test covering full
+reservations, queue drain, malformed queue counts, duplicate/unknown completion
+tokens and 1,024 cycles of slot reuse. It does not simulate hardware Link TRBs,
+interrupt interleavings or a duplicate after a token address has been reused.
+The refactored opt-in driver also passed early DHCP, ARP, a 4 MiB verified
+upload and clean shutdown in `ecm-rx8-qemu-v4-20261101`.
+
 A read-and-SHA256 pass over the installed 230,212,616-byte Firefox libxul
 file took 1.886 s, followed by 1.897 s for a second pass, about 122 MB/s of
 file bytes per second including hashing. Cache state was not controlled and
