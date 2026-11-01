@@ -311,3 +311,23 @@ byte-for-byte with the prepared payload. This validates packaging and a QEMU
 boot; it does not test the Dell SSD, hardware-specific behavior, or physical
 throughput. The Dell had not returned to its old address after the previous
 checked restart, so the candidate was not installed there.
+
+After the Dell returned online, the candidate was first staged without writes;
+the updater selected slot A, preserving the verified recovery image in slot B.
+Generation 11 was then activated and booted with the expected payload identity
+and writable store. Three unpaced 4 MiB RAM uploads took 2.73, 3.77 and 3.01 s;
+three uploads paced at 16 MB/s took 0.34, 0.61 and 1.24 s. Unpaced runs added
+4, 11 and 9 to both USB `tx_busy` and TCP ACK submission failures; paced runs
+added none. All transfers passed their digest checks, and the USB snapshot
+reported no software RX drops. These observations identify local ACK rejection
+under burst load but do not prove it explains all retransmissions or the
+remaining delay. They are binary-transfer timings, not browser benchmarks.
+
+An opt-in `/etc/usb-net-tx16` experiment raises ECM transmit capacity from
+eight to sixteen 2 KiB DMA slots; the default remains eight. Host tests cover
+slot saturation, ordered two-TD/ZLP completions, duplicate/unknown/error
+handling and pinned ownership. Existing transfer-ring wrap tests and QEMU
+TCP/UDP, exact-maxpacket, USB storage and HID coexistence tests passed at
+TX16; the default TX8 path also passed in QEMU. These tests do not prove the
+physical controller's ordering or demonstrate a throughput improvement. The
+experiment has not yet been deployed to the Dell.

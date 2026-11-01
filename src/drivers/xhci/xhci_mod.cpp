@@ -18,6 +18,7 @@
 #include "usb_block_bytes.h"
 #include "usb_ecm_descriptors.h"
 #include "usb_ecm_rx_credits.h"
+#include "usb_ecm_tx_slots.h"
 #include "usb_ecm_trb_ring.h"
 #include "net.h"
 #include "xhci_ownership.h"
@@ -968,17 +969,19 @@ struct XhciDevice {
 
 static constexpr unsigned ECM_RX_PACKETS=UsbEcmRxCredits::Capacity;
 static constexpr unsigned ECM_RX_SLOTS=UsbEcmRxCredits::Slots;
+static constexpr unsigned ECM_TX_SLOTS=UsbEcmTxSlots::Capacity;
+static_assert(ECM_TX_SLOTS*2 < XFER_RING_SIZE-1, "ECM frames and ZLPs must fit the transfer ring");
 struct UsbEcmState {
     NetIf interface;
     XhciController* controller;XhciDevice* device;
     uint8_t* rx;uint64_t rxPhysical;
     UsbEcmRxCredits rxCredits;
-    unsigned rxDepth;KMutex dispatchLock;bool earlyDispatch;
+    unsigned rxDepth,txDepth;KMutex dispatchLock;bool earlyDispatch;
     uint8_t* notification;uint64_t notificationPhysical,notificationToken;
     bool linkKnown,linkUp;uint64_t notifications,reportTick;uint32_t notifyHeader[2];
     uint8_t notificationSamples[16][16],notificationLengths[16];uint32_t notificationPrinted;
     uint8_t* tx;uint64_t txPhysical;
-    struct Tx {uint64_t first,final;uint32_t bytes;bool active,dataDone;} sends[8];
+    UsbEcmTxSlots sends;
     uint8_t packets[ECM_RX_PACKETS][1514];uint16_t lengths[ECM_RX_PACKETS];uint32_t head,tail;
     uint64_t dropped,received,transmitted,txBusy;uint32_t queueHighWater;bool failed;
     uint32_t faultStatus,faultDci;uint64_t faultToken;
@@ -2328,13 +2331,10 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
         return true;
     }
     if(dci==dev.bulkOutDci){
-        for(auto& tx:net.sends)if(tx.active && (event.param==tx.final || event.param==tx.first)){
-            if(cc!=TRB_CC_SUCCESS || residue){fail();return true;}
-            if(tx.first!=tx.final && event.param==tx.first){tx.dataDone=true;return true;}
-            if(tx.first!=tx.final && !tx.dataDone){fail();return true;}
-            tx.active=false;++net.transmitted;return true;
-        }
-        fail();return true;
+        auto result=net.sends.Complete(event.param,cc,residue);
+        if(result==UsbEcmTxSlots::Result::Finished)++net.transmitted;
+        else if(result!=UsbEcmTxSlots::Result::Intermediate)fail();
+        return true;
     }
     return false;
 }
@@ -2343,18 +2343,19 @@ static int XhciEcmTransmit(NetIf* nif,const void* frame,uint32_t bytes){
     auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);auto& dev=*net.device;
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
     if(net.failed || net.controller->completionFailed){IrqSpinLockRelease(&g_eventRingLock,saved);return -5;}
-    for(unsigned i=0;i<8;++i){auto& tx=net.sends[i];if(tx.active)continue;
+    const int freeSlot=net.sends.Free(net.txDepth);
+    if(freeSlot>=0){const auto i=static_cast<unsigned>(freeSlot);
         auto* buffer=net.tx+i*2048;memcpy(buffer,frame,bytes);
         const auto physical=net.txPhysical+i*2048;
         const bool terminate=(bytes%dev.bulkOutMaxPacket)==0;
         // A zero-length TRB chained into the data TD is not a USB ZLP:
         // controllers may merge the TD into one exact-size USB transfer.
         // Termination needs its own zero-length TD and completion ownership.
-        tx.first=XhciEcmTrb(dev,false,physical,bytes,false,!terminate);
-        tx.final=terminate?XhciEcmTrb(dev,false,physical,0,false):tx.first;
-        tx.bytes=bytes;tx.dataDone=false;tx.active=true;
+        const auto first=XhciEcmTrb(dev,false,physical,bytes,false,!terminate);
+        const auto final=terminate?XhciEcmTrb(dev,false,physical,0,false):first;
+        net.sends.Reserve(i,first,final);
         if(terminate){
-            auto& head=dev.bulkOutRing[(tx.first-dev.bulkOutRingPhys)/sizeof(Trb)];
+            auto& head=dev.bulkOutRing[(first-dev.bulkOutRingPhys)/sizeof(Trb)];
             __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
         }
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -2430,8 +2431,10 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     memset(net,0,sizeof(*net));net->controller=&ctrl;net->device=&dev;
     net->rxDepth=1;
     if(Vnode* marker=VfsOpen("/etc/usb-net-rx8",0)){VfsClose(marker);net->rxDepth=ECM_RX_SLOTS;}
+    net->txDepth=8;
+    if(Vnode* marker=VfsOpen("/etc/usb-net-tx16",0)){VfsClose(marker);net->txDepth=ECM_TX_SLOTS;}
     net->rx=static_cast<uint8_t*>(AllocDmaBuffer(4,net->rxPhysical));
-    net->tx=static_cast<uint8_t*>(AllocDmaBuffer(4,net->txPhysical));
+    net->tx=static_cast<uint8_t*>(AllocDmaBuffer((net->txDepth+1)/2,net->txPhysical));
     net->notification=static_cast<uint8_t*>(AllocDmaBuffer(1,net->notificationPhysical));
     uint64_t physical=0;auto* scratch=static_cast<uint8_t*>(AllocDmaBuffer(1,physical));
     if(!net->rx || !net->tx || !net->notification || !scratch)return false;
@@ -2457,7 +2460,7 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     dev.network=net;XhciEcmReceiveArm(*net);XhciEcmNotificationArm(*net);
     IrqSpinLockRelease(&g_eventRingLock,saved);
     NetRegisterIf(&net->interface);
-    SerialPrintf("xhci: CDC-ECM network interface ready slot=%u rx_depth=%u (carrier unverified)\n",dev.slotId,net->rxDepth);
+    SerialPrintf("xhci: CDC-ECM network interface ready slot=%u rx_depth=%u tx_depth=%u (carrier unverified)\n",dev.slotId,net->rxDepth,net->txDepth);
     return true;
 }
 
