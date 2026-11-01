@@ -399,8 +399,8 @@ independently; overlap includes duplicate retransmissions, and clipping is
 recorded before the state-machine decision. Host tests exercise credit
 transitions and actual OOO-full/clipping paths; QEMU USB acceptance passed.
 These counters cannot by themselves prove where an individual packet was lost.
-The snapshot layout requires module ABI 60 and freshly rebuilt modules. This
-diagnostic kernel has not been installed on the Dell.
+The snapshot layout requires module ABI 60 and freshly rebuilt modules.
+This diagnostic kernel was installed on the Dell for the comparison below.
 
 As a prerequisite for a future bounded multi-segment sender, incoming TCP
 window updates now reject invalid ACK bounds, reset/no-ACK packets, stale
@@ -410,5 +410,25 @@ changes wake a registered waiter. Host tests exercise actual `HandleTcp`
 dispatch, handshakes, scaling, zero-window, wraparound, trimming and wakeups;
 QEMU USB Ethernet acceptance passed. Socket layout changes require module ABI
 59 and a fresh set of modules. This does not implement pipelining, complete TCP
-segment validation or advertised-right-edge tracking, and has not been deployed
-to the Dell. The ordering rules follow [RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html).
+segment validation or advertised-right-edge tracking. The diagnostic build
+includes these changes. The ordering rules follow [RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html).
+
+With the receive-window cap disabled, three alternating 4 MiB RAM uploads
+with RX depth 8 and TX depth 16 took 2.267, 3.463 and 2.794 s unpaced;
+each had respectively 282, 463 and 292 new OOO-full rejections. Paced runs
+took 0.346, 0.342 and 0.337 s, without new OOO arrivals. All digests matched.
+There were no new TX-busy or covered ACK-submission failures. Two USB receive
+backpressure transitions occurred during the third unpaced transfer and no
+zero-outstanding transitions were observed; neither fact rules out loss at
+the adapter or in pending completion events. The OOO results identify loss
+amplification in Brook, but do not locate the original missing segment.
+
+An experimental 64-slot queue (up from 16), plus immediate retirement of
+fully covered retained entries, passed host reassembly tests and an exact
+candidate QEMU boot. Its eager data allocation rises from 24,000 to 96,000
+bytes per stream socket, with additional static per-socket metadata, and the
+existing drain algorithm has quadratic worst-case scanning cost. It remains
+an experiment pending physical measurement. It was installed as generation
+19 in slot A, while the independent recovery payload remains in slot B;
+the Dell was unreachable after the checked restart. TCP timeout alone cannot
+distinguish the known xHCI problem from another boot or network failure.
