@@ -41,3 +41,13 @@ integrity checked over the uncompressed bytes; it should be benchmarked
 separately from the underlying transport. The portable installer should run
 on the laptop against the identity-bound SSD rather than requiring a host to
 write a physically connected laptop drive.
+
+On 1 November, the user ran Google's speed test in Chromium on the SSD boot;
+it reported less than 0.5 Mbps in each direction. This is an external
+end-to-end estimate, not a controlled measurement of the Ethernet link alone.
+The same session could load and play a YouTube video. A later 2 MiB synthetic,
+highly repetitive diagnostic sample transferred from Dell RAM in 1.783 s raw
+and 0.086 s with independent zlib chunks; both SHA-256 digests matched. The
+host-to-Dell upload took 3.646 s. The compression comparison is a single
+best-case diagnostic-data sample, not a browser network improvement or a
+claim about throughput for already-compressed data.

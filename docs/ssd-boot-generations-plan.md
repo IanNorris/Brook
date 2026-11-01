@@ -89,7 +89,10 @@ xHCI and Ethernet. A second checked SSD-only warm restart into generation 5
 also reached Ethernet and the persistent store; the existing 8 KiB test file
 passed its cross-page and private-mapping checks. The installed checker uses
 a fixed filename and correctly refused a new exclusive-create attempt because
-that file already exists. These restarts are not proof that the
+that file already exists. A third checked SSD-only warm restart entered
+generation 6, reached Ethernet, and passed the existing file check again.
+The user confirmed kernel-console keyboard scrolling on that boot. These
+restarts are not proof that the
 intermittent controller failure is fixed; test further and verify persistence
 through a separate cold-power cycle before calling SSD-only operation reliable.
 The checker is bundled but
