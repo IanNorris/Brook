@@ -85,7 +85,12 @@ reset reported phase 0, error 4, USBCMD 0x2 and USBSTS 0x11. Disconnecting
 power and USB devices restored the controller. An updated bounded reset-wait
 candidate was then staged as generation 4 in slot B. One clean SSD-only warm
 restart reached that payload, mounted the persistent store and initialized
-xHCI and Ethernet. This is one successful restart, not proof that the
+xHCI and Ethernet. A second checked SSD-only warm restart into generation 5
+also reached Ethernet and the persistent store; the existing 8 KiB test file
+passed its cross-page and private-mapping checks. The installed checker uses
+a fixed filename and correctly refused a new exclusive-create attempt because
+that file already exists. These restarts are not proof that the
 intermittent controller failure is fixed; test further and verify persistence
-before calling SSD-only operation reliable. The checker is bundled but
+through a separate cold-power cycle before calling SSD-only operation reliable.
+The checker is bundled but
 automatic repair is not yet implemented.
