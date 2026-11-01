@@ -341,7 +341,8 @@ target_compile_options(test_tcp PRIVATE
     -DBROOK_HOST_TEST
 )
 
-add_host_test(test_socket_lifetime "${BROOK_ROOT}/src/kernel/src/tcp.cpp")
+add_host_test(test_socket_lifetime "${BROOK_ROOT}/src/kernel/src/tcp.cpp"
+    "${BROOK_ROOT}/src/kernel/src/sync/kmutex.cpp")
 target_compile_options(test_socket_lifetime PRIVATE -DBROOK_HOST_TEST -DBROOK_SOCKET_LIFETIME_TEST
     -ffunction-sections -fdata-sections -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -Wno-attributes -Wno-misleading-indentation
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"

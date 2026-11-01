@@ -4,12 +4,27 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 static unsigned char data[32768],reply[32768],disk[65519];
+struct writer { int fd; unsigned char value; atomic_int* ready; atomic_int* go; int result; };
+struct race_writer { int fd; const unsigned char* bytes; size_t length; atomic_int* entered; int result; };
+static unsigned char long_write[262144],short_write[4096];
+static void* close_race_writer(void* opaque){
+    struct race_writer* w=opaque;atomic_store(w->entered,1);
+    w->result=write(w->fd,w->bytes,w->length)==(ssize_t)w->length?0:-1;return NULL;
+}
+static void* concurrent_writer(void* opaque){
+    struct writer* w=opaque;unsigned char block[4096];memset(block,w->value,sizeof(block));
+    atomic_fetch_add(w->ready,1);while(!atomic_load(w->go))sched_yield();
+    w->result=write(w->fd,block,sizeof(block))==(ssize_t)sizeof(block)?0:-1;return NULL;
+}
 static int fail(const char* why){printf("ECM_TEST_FAIL %s errno=%d\n",why,errno);return 1;}
 static int exact(int fd,void* data,size_t size,int sending){
     size_t done=0;while(done<size){ssize_t n=sending?write(fd,(char*)data+done,size-done):read(fd,(char*)data+done,size-done);if(n<=0)return -1;done+=(size_t)n;}return 0;
@@ -21,7 +36,8 @@ static int storage(int fd,unsigned pass){
     return 0;
 }
 int main(int argc,char** argv){
-    setvbuf(stdout,NULL,_IONBF,0);if(argc!=2)return 2;
+    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>4)return 2;
+    if((argc>=3 && strcmp(argv[2],"concurrency")) || (argc==4 && strcmp(argv[3],"close-race")))return 2;
     struct sockaddr_in peer={.sin_family=AF_INET,.sin_port=htons((unsigned short)atoi(argv[1]))};
     inet_pton(AF_INET,"10.0.2.100",&peer.sin_addr);
     int file=open("/media/usb/READTEST.BIN",O_RDONLY);if(file<0)return fail("USB file");
@@ -34,7 +50,34 @@ int main(int argc,char** argv){
         if(exact(tcp,data,sizeof(data),1) || exact(tcp,reply,sizeof(reply),0) || memcmp(data,reply,sizeof(data)))return fail("TCP integrity");
         if(storage(file,pass))return fail("concurrent USB read");
     }
-    close(tcp);
+    if(argc>=3){
+        atomic_int ready=0,go=0;pthread_t threads[2];
+        struct writer writers[2]={{tcp,'A',&ready,&go,-1},{tcp,'B',&ready,&go,-1}};
+        for(unsigned n=0;n<2;++n)if(pthread_create(&threads[n],NULL,concurrent_writer,&writers[n]))return fail("writer create");
+        while(atomic_load(&ready)!=2)sched_yield();
+        atomic_store(&go,1);
+        for(unsigned n=0;n<2;++n)if(pthread_join(threads[n],NULL) || writers[n].result)return fail("concurrent write");
+        if(exact(tcp,reply,8192,0))return fail("concurrent echo");
+        for(unsigned n=0;n<8192;++n)if(reply[n]!=(n<4096?reply[0]:reply[4096]))return fail("interleaved writes");
+        if(reply[0]==reply[4096] || (reply[0]!='A' && reply[0]!='B') || (reply[4096]!='A' && reply[4096]!='B'))return fail("concurrent values");
+        puts("ECM_CONCURRENT_WRITERS_OK");
+    }
+    if(argc==4){
+        memset(long_write,'C',sizeof(long_write));memset(short_write,'D',sizeof(short_write));
+        atomic_int entered1=0,entered2=0;pthread_t first,second;
+        struct race_writer one={tcp,long_write,sizeof(long_write),&entered1,-1};
+        struct race_writer two={tcp,short_write,sizeof(short_write),&entered2,-1};
+        if(pthread_create(&first,NULL,close_race_writer,&one))return fail("close race first writer");
+        while(!atomic_load(&entered1))sched_yield();
+        char marker;if(read(tcp,&marker,1)!=1 || marker!='R')return fail("close race marker");
+        if(pthread_create(&second,NULL,close_race_writer,&two))return fail("close race second writer");
+        while(!atomic_load(&entered2))sched_yield();
+        usleep(20000); // Allow the second syscall to pin the descriptor and contend.
+        if(close(tcp))return fail("close race close");
+        if(pthread_join(first,NULL) || pthread_join(second,NULL) || one.result || two.result)return fail("close race join");
+        tcp=socket(AF_INET,SOCK_STREAM,0);if(tcp<0 || close(tcp))return fail("socket after close race");
+        puts("ECM_SEND_CLOSE_RACE_OK");
+    }else close(tcp);
     int udp=socket(AF_INET,SOCK_DGRAM,0);if(udp<0)return fail("UDP socket");
     // 14 Ethernet + 20 IPv4 + 8 UDP + 982 data = 1024 (also an SS packet).
     struct sockaddr_in local={.sin_family=AF_INET,.sin_port=peer.sin_port};

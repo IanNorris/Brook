@@ -418,6 +418,7 @@ int  SockSendTo(int sockIdx, const void* buf, uint32_t len,
                 const SockAddrIn* dest);
 int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                   SockAddrIn* src);
+// Sleepable process context only; must not be called from an IRQ handler.
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 // Destination must be resident kernel memory. The receive-ring copy holds a
 // spinlock; syscall callers stage bytes here and fault-aware copy to userspace

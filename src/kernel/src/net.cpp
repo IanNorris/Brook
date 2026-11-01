@@ -22,6 +22,8 @@
 #include "kprintf.h"
 #include "scheduler.h"
 #include "process.h"
+#include "posix_timer.h"
+#include "sync/kmutex.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
 #include "memory/oom_recovery.h"
@@ -131,6 +133,8 @@ static Process* g_arpWaiter = nullptr;
 // RX ring, so the practical limit is bounded by physical RAM anyway.
 static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
+// Slot-owned, like Socket::lock: never clear or reinitialise on reuse.
+static KMutex g_tcpSendGates[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
 static bool   g_sockReserved[MAX_SOCKETS];
 // Slot control survives every payload reset. Callback borrows are independent
@@ -825,6 +829,7 @@ void NetInit()
     g_arpCount = 0;
     memset(g_sockets, 0, sizeof(g_sockets));
     memset(g_sockUsed, 0, sizeof(g_sockUsed));
+    for (uint32_t i = 0; i < MAX_SOCKETS; ++i) KMutexInit(&g_tcpSendGates[i]);
     g_netIf = nullptr;
     for (uint32_t i = 0; i < NET_MAX_IFS; i++) g_netIfs[i] = nullptr;
     g_netIfCount = 0;
@@ -2933,13 +2938,14 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 }
 
 static int TcpWaitForDataAck(Socket& s, int sockIdx,
-                             uint32_t seq, const uint8_t* data, uint32_t len)
+                             uint32_t seq, const uint8_t* data, uint32_t len,
+                             uint64_t operationDeadline = 0)
 {
 
     Process* self = SchedulerCurrentProcess();
     SocketWaitRegistration registration(s, self);
     uint32_t seqEnd = seq + len;
-    uint64_t deadline = ApicTickCount() + 30000;
+    uint64_t deadline = operationDeadline ? operationDeadline : ApicTickCount() + 30000;
     uint64_t nextRetransmit = ApicTickCount() + 200;  // 200ms initial RTO (was 1000ms)
     uint32_t retransmits = 0;
 
@@ -3000,16 +3006,70 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
     }
 }
 
+static bool TcpSendInterrupted(Process* self)
+{
+    const uint64_t pending = ProcessPendingSignals(self) | PosixTimerPending(self);
+    const uint64_t mask = __atomic_load_n(&self->sigMask, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&self->terminalPending, __ATOMIC_ACQUIRE) || (pending & ~mask);
+}
+
+// A temporary owner reference ensures final close cannot reserve FIN while a
+// writer is active or queued. The outer kernel region prevents cancellation
+// between releasing the gate and dropping that reference. KMutex itself is
+// slot-owned and survives socket payload reset and reuse.
+class TcpSendOwnership {
+    int index_;
+    Process* self_;
+    bool referenced_ = false, locked_ = false, region_ = false;
+public:
+    TcpSendOwnership(int index, Process* self) : index_(index), self_(self) {}
+    int Acquire(uint64_t deadline) {
+        if (!self_) return -11; // KMutex is unavailable outside process context
+        SchedulerKernelRegionEnter(self_); region_ = true;
+        if (!SockTryRef(index_)) return -1;
+        referenced_ = true;
+        const bool nonblock = __atomic_load_n(&g_sockets[index_].nonblock, __ATOMIC_ACQUIRE);
+        for (;;) {
+            if (TcpSendInterrupted(self_)) return -4;
+            if (ApicTickCount() >= deadline) return -110;
+            if (KMutexTryLock(&g_tcpSendGates[index_])) { locked_ = true; return 0; }
+            if (nonblock) return -11;
+            // Try-lock polling keeps acquisition finite and interruptible;
+            // no registry or socket spinlock is held while sleeping.
+            uint64_t next = ApicTickCount() + 10;
+            self_->wakeupTick = next < deadline ? next : deadline;
+            SchedulerBlockInterruptible(self_);
+        }
+    }
+    ~TcpSendOwnership() {
+        if (locked_) KMutexUnlock(&g_tcpSendGates[index_]);
+        if (referenced_) SockUnref(index_);
+        if (region_) SchedulerKernelRegionLeave(self_);
+    }
+    TcpSendOwnership(const TcpSendOwnership&) = delete;
+    TcpSendOwnership& operator=(const TcpSendOwnership&) = delete;
+};
+
 int SockSend(int sockIdx, const void* buf, uint32_t len)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
-    if (!g_sockUsed[sockIdx]) return -1;
+    Process* self = SchedulerCurrentProcess();
+    const uint64_t deadline = ApicTickCount() + 30000;
+    TcpSendOwnership ownership(sockIdx, self);
+    const int acquire = ownership.Acquire(deadline);
+    if (acquire) return acquire;
 
     Socket& s = g_sockets[sockIdx];
-    if (s.type != SOCK_STREAM) return -95;
-    if (!TcpCanSendData(s.tcpState)) {
+    SpinLockAcquire(&s.lock);
+    const bool stream = s.type == SOCK_STREAM;
+    const bool canSend = TcpCanSendData(s.tcpState);
+    const auto state = s.tcpState;
+    const uint32_t mss = TcpEgressLimit(s.tcpPeerMss, g_tcpEgressCeiling);
+    SpinLockRelease(&s.lock);
+    if (!stream) return -95;
+    if (!canSend) {
         SerialPrintf("tcp: SockSend refused: state=%d (send direction closed) fd=%d\n",
-                     (int)s.tcpState, sockIdx);
+                     (int)state, sockIdx);
         return -104; // ECONNRESET
     }
 
@@ -3018,19 +3078,23 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
     // Snapshot the negotiated MSS; never hold the socket lock across network
     // submission or an ACK wait. The optional ceiling is boot-time immutable.
-    SpinLockAcquire(&s.lock);
-    const uint32_t mss = TcpEgressLimit(s.tcpPeerMss, g_tcpEgressCeiling);
-    SpinLockRelease(&s.lock);
-
     while (sent < len) {
+        if (TcpSendInterrupted(self)) return sent ? static_cast<int>(sent) : -4;
+        if (ApicTickCount() >= deadline) return sent ? static_cast<int>(sent) : -110;
         uint32_t chunk = len - sent;
         if (chunk > mss) chunk = mss;
 
+        SpinLockAcquire(&s.lock);
+        if (!TcpCanSendData(s.tcpState)) {
+            SpinLockRelease(&s.lock);
+            return sent ? static_cast<int>(sent) : -104;
+        }
         uint32_t seq = s.tcpSndNxt;
         s.tcpSndNxt += chunk;
+        SpinLockRelease(&s.lock);
         TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
 
-        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, data + sent, chunk);
+        int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, data + sent, chunk, deadline);
         if (ackStatus != 0)
             return sent ? static_cast<int>(sent) : ackStatus;
 
@@ -3041,7 +3105,10 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
 
         // An ACKed write stays successful even if the peer's response FIN
         // arrived during the yield. Return accepted bytes on a later reset.
-        if (!TcpCanSendData(s.tcpState)) return static_cast<int>(sent);
+        SpinLockAcquire(&s.lock);
+        const bool stillOpen = TcpCanSendData(s.tcpState);
+        SpinLockRelease(&s.lock);
+        if (!stillOpen) return static_cast<int>(sent);
     }
 
     return static_cast<int>(sent);

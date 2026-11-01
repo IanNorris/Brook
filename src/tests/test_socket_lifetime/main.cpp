@@ -16,8 +16,11 @@ std::atomic<bool> pauseOnlyPureAck{false};
 std::atomic<bool> acknowledgeFin{false};
 std::atomic<unsigned> sentFins{0};
 std::atomic<unsigned> acknowledgeDataCount{0};
+std::atomic<unsigned> capturedDataCount{0};
+std::atomic<uint32_t> capturedDataSeq[2]{};
 std::atomic<int> deadlineAckSocket{-1};
 std::atomic<uint64_t> deadlineAckTick{0};
+std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
 std::atomic<int> updateAckSlot{-1};
@@ -42,6 +45,10 @@ void kfree(void* p) { if (p) { ++frees; std::free(p); } }
 uint64_t ApicTickCount() { return ticks.load(); }
 Process* ProcessCurrent() { return currentProcess; }
 Process* SchedulerCurrentProcess() { return currentProcess; }
+void SchedulerKernelRegionEnter(Process* p) { ProcessRef(p);++p->kernelRegionDepth; }
+void SchedulerKernelRegionLeave(Process* p) { assert(p->kernelRegionDepth);--p->kernelRegionDepth;ProcessUnref(p); }
+uint64_t ProcessPendingSignals(Process* p) { return __atomic_load_n(&p->sigPending,__ATOMIC_ACQUIRE); }
+uint64_t PosixTimerPending(Process*) { return 0; }
 void SchedulerBlock(Process* p) {
     ticks = p ? p->wakeupTick : ticks.load() + 50;
     if (ticks.load() >= deadlineAckTick.load()) {
@@ -55,6 +62,13 @@ void SchedulerBlock(Process* p) {
     }
     std::this_thread::yield();
 }
+void SchedulerBlockInterruptible(Process* p) {
+    if (holdGatePoll.load()) {
+        gatePollWaiting=true;
+        while (!releaseGatePoll.load()) std::this_thread::yield();
+    }
+    SchedulerBlock(p);
+}
 void SchedulerUnblock(Process*) { ++wakes; }
 extern "C" void SchedulerYield() { std::this_thread::yield(); }
 void SerialPuts(const char*) {}
@@ -64,6 +78,10 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
     assert(proto == IP_PROTO_TCP);
     const auto* tcp = static_cast<const TcpHeader*>(data);
     if (tcp->flags & TCP_FIN) ++sentFins;
+    if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
+        const unsigned index=capturedDataCount.fetch_add(1);
+        if(index<2)capturedDataSeq[index]=ntohl(tcp->seqNum);
+    }
     if (pauseTransmit.load() && (!pauseOnlyPureAck.load() || (tcp->flags==TCP_ACK && len==sizeof(TcpHeader)))) {
         transmitting = true;
         while (!releaseTransmit.load()) std::this_thread::yield();
@@ -149,6 +167,7 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
     HandleTcp(&ip,&tcp,sizeof(tcp));
 }
 int main() {
+    for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
     // A caller needing ownership must distinguish a retained socket from a
     // slot already entering final close; an RX borrow is not that guarantee.
     assert(!SockTryRef(-1) && !SockTryRef(MAX_SOCKETS));
@@ -162,6 +181,88 @@ int main() {
     SpinLockRelease(&g_sockets[ownerSocket].lock);
     finalOwner.join();assert(!published(ownerSocket));
     assert(!SockTryRef(ownerSocket));
+    // Real KMutex ownership and retained socket references prevent the last
+    // FD close from racing either the current sender or a queued sender.
+    int gateSocket=create();setupTcp(gateSocket);
+    auto* gateOwner=new Process{};auto* gateWaiter=new Process{};
+    gateOwner->refCount=gateWaiter->refCount=1;gateOwner->pid=101;gateWaiter->pid=102;
+    currentProcess=gateOwner;ticks=1;holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;
+    std::thread queued;
+    {
+        TcpSendOwnership owner(gateSocket,gateOwner);assert(owner.Acquire(30001)==0);
+        queued=std::thread([&] {
+            currentProcess=gateWaiter;
+            { TcpSendOwnership queuedOwner(gateSocket,gateWaiter);assert(queuedOwner.Acquire(30001)==0); }
+            currentProcess=nullptr;
+        });
+        await([] { return gatePollWaiting.load(); });
+        SockClose(gateSocket);assert(published(gateSocket) && !closingSlot(gateSocket));
+        assert(g_sockets[gateSocket].refCount==2);
+        acknowledgeFin=true;
+    }
+    releaseGatePoll=true;queued.join();holdGatePoll=false;acknowledgeFin=false;
+    assert(!published(gateSocket));assert(gateOwner->kernelRegionDepth==0 && gateWaiter->kernelRegionDepth==0);
+    assert(gateOwner->refCount==1 && gateWaiter->refCount==1);
+    currentProcess=nullptr;delete gateOwner;delete gateWaiter;
+    // A timeout or signal while waiting for ownership must not consume TCP
+    // sequence space or close the stream belonging to the active writer.
+    gateSocket=create();setupTcp(gateSocket);gateOwner=new Process{};gateWaiter=new Process{};
+    gateOwner->refCount=gateWaiter->refCount=1;gateOwner->pid=103;gateWaiter->pid=104;
+    currentProcess=gateOwner;ticks=1;
+    {
+        TcpSendOwnership owner(gateSocket,gateOwner);assert(owner.Acquire(30001)==0);
+        currentProcess=gateWaiter;
+        {TcpSendOwnership waiting(gateSocket,gateWaiter);assert(waiting.Acquire(21)==-110);}
+        assert(g_sockets[gateSocket].tcpSndNxt==10 && g_sockets[gateSocket].tcpState==TcpState::Established);
+        SockSetNonblock(gateSocket,true);
+        {const uint8_t data=0;assert(SockSend(gateSocket,&data,1)==-11);}
+        SockSetNonblock(gateSocket,false);
+        gateWaiter->sigPending=1;
+        {TcpSendOwnership waiting(gateSocket,gateWaiter);assert(waiting.Acquire(30001)==-4);}
+        assert(g_sockets[gateSocket].refCount==2 && gateWaiter->kernelRegionDepth==0);
+        currentProcess=gateOwner;
+    }
+    currentProcess=nullptr;SockClose(gateSocket);delete gateOwner;delete gateWaiter;
+    // A signal arriving while a contended writer sleeps unwinds its owner
+    // reference and outer region without disturbing the active writer.
+    gateSocket=create();setupTcp(gateSocket);gateOwner=new Process{};gateWaiter=new Process{};
+    gateOwner->refCount=gateWaiter->refCount=1;gateOwner->pid=107;gateWaiter->pid=108;
+    currentProcess=gateOwner;ticks=1;holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;
+    {
+        TcpSendOwnership owner(gateSocket,gateOwner);assert(owner.Acquire(30001)==0);
+        std::thread interrupted([&]{
+            currentProcess=gateWaiter;
+            {TcpSendOwnership waiting(gateSocket,gateWaiter);assert(waiting.Acquire(30001)==-4);}
+            currentProcess=nullptr;
+        });
+        await([]{return gatePollWaiting.load();});
+        __atomic_store_n(&gateWaiter->sigPending,1,__ATOMIC_RELEASE);
+        releaseGatePoll=true;interrupted.join();holdGatePoll=false;
+        assert(gateWaiter->kernelRegionDepth==0 && gateWaiter->refCount==1);
+        assert(g_sockets[gateSocket].refCount==2 && g_sockets[gateSocket].tcpSndNxt==10);
+    }
+    currentProcess=nullptr;SockClose(gateSocket);delete gateOwner;delete gateWaiter;
+    gateSocket=create();setupTcp(gateSocket);
+    {const uint8_t data=0;assert(SockSend(gateSocket,&data,1)==-11 && g_sockets[gateSocket].tcpSndNxt==10);}
+    SockClose(gateSocket);
+    // Run two actual writers while the first submission is paused. Closing
+    // the FD leaves both operations owned; their sequence ranges do not overlap.
+    gateSocket=create();setupTcp(gateSocket);gateOwner=new Process{};gateWaiter=new Process{};
+    gateOwner->refCount=gateWaiter->refCount=1;gateOwner->pid=105;gateWaiter->pid=106;
+    ticks=1;pauseTransmit=true;transmitting=false;releaseTransmit=false;
+    holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;
+    capturedDataCount=0;acknowledgeDataCount=2;acknowledgeFin=true;
+    std::thread writer1([&]{currentProcess=gateOwner;const uint8_t data=1;assert(SockSend(gateSocket,&data,1)==1);currentProcess=nullptr;});
+    await([]{return transmitting.load();});
+    std::thread writer2([&]{currentProcess=gateWaiter;const uint8_t data=2;assert(SockSend(gateSocket,&data,1)==1);currentProcess=nullptr;});
+    await([]{return gatePollWaiting.load();});
+    assert(capturedDataCount==1 && g_sockets[gateSocket].tcpSndNxt==11);
+    SockClose(gateSocket);assert(published(gateSocket));
+    releaseTransmit=true;writer1.join();releaseGatePoll=true;writer2.join();
+    pauseTransmit=false;holdGatePoll=false;acknowledgeFin=false;
+    assert(capturedDataCount==2 && capturedDataSeq[0]==10 && capturedDataSeq[1]==11);
+    assert(!published(gateSocket) && gateOwner->kernelRegionDepth==0 && gateWaiter->kernelRegionDepth==0);
+    assert(gateOwner->refCount==1 && gateWaiter->refCount==1);delete gateOwner;delete gateWaiter;
     // Queued RX ticket must finish before buffer retirement/reset.
     int i = create(); setupTcp(i);
     auto& s = g_sockets[i];

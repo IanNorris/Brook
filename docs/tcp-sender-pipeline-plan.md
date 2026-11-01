@@ -45,3 +45,21 @@ reset indication, so later reads report `ECONNRESET`, while `SO_ERROR` reports
 retain its half of the connection until its own timeout. Socket lifetime and
 concurrent send serialization remain separate work. Host tests exercise the
 actual send and timeout paths, and QEMU USB Ethernet acceptance passed.
+
+The sender now retains a temporary socket owner reference and uses a
+slot-persistent send mutex. A close cannot finalize the stream until active
+and queued sends drop their references; the gate is released before the last
+reference, with an outer cancellation region covering both operations. Gate
+acquisition polls at 10 ms intervals and the entire call is bounded to 30
+seconds. Contended nonblocking acquisition returns `EAGAIN` before reserving
+sequence space. Uncontended nonblocking sends still use the existing ACK wait.
+Cancellation during an outstanding ACK wait can be deferred until the bounded
+deadline. Only sleepable process-context callers are supported; the current
+process check is not an IRQ-context detector.
+
+Host tests exercise the actual KMutex and actual send/close paths with modeled
+scheduler transitions, including concurrent writers, a queued sender at close,
+contended nonblocking acquisition and pending signals. QEMU USB Ethernet tests
+add guest pthread writer integrity and concurrent close stress; the latter does
+not by itself prove precise overlap. Real scheduler termination during
+contention, the send pipeline, and physical performance remain unverified.

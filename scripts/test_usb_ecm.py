@@ -12,7 +12,10 @@ ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',requi
 ap.add_argument('--rx-depth8',action='store_true',help='Exercise the opt-in eight-request ECM receive path')
 ap.add_argument('--tx-depth16',action='store_true',help='Exercise the opt-in sixteen-frame ECM transmit path')
 ap.add_argument('--tcp-window16',action='store_true',help='Exercise the opt-in 16 KiB TCP receive-window cap')
+ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
+ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
+if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
 tcp=socket.socket();tcp.bind(('127.0.0.1',0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
 udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.bind(('127.0.0.1',port));udp.settimeout(.2)
@@ -32,6 +35,11 @@ def echo_tcp():
    s.settimeout(30);b=exact(s,10);assert b==b'ecm-zlp-ok';s.sendall(b)
    for p in range(8):
     b=exact(s,32768);assert b==bytes((i*13+p*7)%251 for i in range(32768));s.sendall(b)
+   if args.send_concurrency:
+    b=exact(s,8192);assert b in (b'A'*4096+b'B'*4096,b'B'*4096+b'A'*4096);s.sendall(b)
+   if args.send_close_race:
+    b=exact(s,1200);assert b==b'C'*1200;s.sendall(b'R')
+    b+=exact(s,262144-1200+4096);assert b==b'C'*262144+b'D'*4096
   completed.append('tcp')
  except BaseException as e:errors.append(repr(e))
 def echo_udp():
@@ -46,10 +54,10 @@ def echo_udp():
  except BaseException as e:errors.append(repr(e))
 threads=[threading.Thread(target=f,daemon=True) for f in [echo_tcp,echo_udp]]
 for thread in threads:thread.start()
-run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_usb_ecm_guest/main.c','-o',base/'ECMTEST.ELF')
+run(os.environ['MUSL_CC'],'-static','-pthread','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_usb_ecm_guest/main.c','-o',base/'ECMTEST.ELF')
 run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600')
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BOOT/ECMTEST.ELF')
-rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}\n')
+rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
@@ -98,6 +106,8 @@ try:
   assert 'PANIC_HEX:' not in serial and 'ECM_TEST_FAIL' not in serial,serial[-2500:]
   assert not errors,errors
   if 'ECM_NETWORK_INTEGRITY_OK' in serial:
+   if args.send_concurrency:assert 'ECM_CONCURRENT_WRITERS_OK' in serial,serial[-2500:]
+   if args.send_close_race:assert 'ECM_SEND_CLOSE_RACE_OK' in serial,serial[-2500:]
    assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
    assert f'tx_depth={16 if args.tx_depth16 else 8}' in serial, 'Unexpected ECM transmit depth'
    break
