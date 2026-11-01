@@ -811,12 +811,20 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 
 static uint16_t g_tcpEgressCeiling = 1460;
 static bool g_tcpTwoPacketFlight = false;
+static bool g_tcpFourPacketFlight = false;
 
 void NetConfigureBoot()
 {
     if (auto* marker = VfsOpen("/etc/tcp-two-packet-flight")) {
         VfsClose(marker);g_tcpTwoPacketFlight = true;
         KPuts("net: two-packet TCP send flight enabled (experimental)\n");
+    }
+    if (auto* marker = VfsOpen("/etc/tcp-four-packet-flight")) {
+        VfsClose(marker);
+        if (!g_tcpTwoPacketFlight) {
+            g_tcpFourPacketFlight = true;
+            KPuts("net: four-packet TCP send flight enabled (experimental)\n");
+        } else KPuts("net: conflicting flight markers; using two packets\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-recv-window-16k")) {
         VfsClose(marker);g_tcpReceiveWindowCap=16384;
@@ -3059,17 +3067,17 @@ public:
 // Call-local retained flight. Every exit either retires all reservations or
 // closes the stream before their payloads leave scope. The deliberately small
 // limit is an experiment, not a complete congestion-control implementation.
-static int TcpSendTwoPacketFlight(Socket& s, Process* self, const uint8_t* data,
+static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
                                   uint32_t len, bool fromUser, uint32_t mss,
-                                  uint64_t deadline)
+                                  uint64_t deadline, unsigned initialLimit)
 {
     struct Slot {
         uint8_t bytes[ETH_MTU];
         uint32_t seq = 0, len = 0, retries = 0;
         uint64_t retryAt = 0;
         bool submitted = false;
-    } slots[2];
-    unsigned head = 0, count = 0, limit = 2;
+    } slots[4];
+    unsigned head = 0, count = 0, limit = initialLimit;
     uint32_t reserved = 0, submitted = 0, acknowledged = 0;
     int deferredError = 0;
     SpinLockAcquire(&s.lock);
@@ -3113,7 +3121,7 @@ static int TcpSendTwoPacketFlight(Socket& s, Process* self, const uint8_t* data,
         }
         if (delta <= submitted) acknowledged = delta;
         while (count && TcpSeqAcked(una, slots[head].seq + slots[head].len)) {
-            head = (head + 1) % 2;
+            head = (head + 1) % 4;
             --count;
         }
         if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
@@ -3134,7 +3142,7 @@ static int TcpSendTwoPacketFlight(Socket& s, Process* self, const uint8_t* data,
         // sequence range is allocated. On RTO send only the oldest suffix.
         int unsentIndex = -1;
         for (unsigned n=0;n<count;++n) {
-            const unsigned index = (head+n)%2;
+            const unsigned index = (head+n)%4;
             if (!slots[index].submitted) { unsentIndex = static_cast<int>(index); break; }
         }
         int sendIndex = -1;
@@ -3178,7 +3186,7 @@ static int TcpSendTwoPacketFlight(Socket& s, Process* self, const uint8_t* data,
             if (chunk > mss) chunk = mss;
             if (chunk > credit) chunk = credit;
             SpinLockRelease(&s.lock);
-            Slot& slot = slots[(head + count) % 2];
+            Slot& slot = slots[(head + count) % 4];
             uint64_t source;
             if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(reserved), &source)) {
                 if (count) { deferredError = -14; continue; }
@@ -3249,8 +3257,9 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
     uint32_t sent = 0;
     uint8_t staged[ETH_MTU];
     if (!mss || mss > sizeof(staged)) return -22;
-    if (g_tcpTwoPacketFlight && len)
-        return TcpSendTwoPacketFlight(s, self, data, len, fromUser, mss, deadline);
+    if ((g_tcpTwoPacketFlight || g_tcpFourPacketFlight) && len)
+        return TcpSendPacketFlight(s, self, data, len, fromUser, mss, deadline,
+                                   g_tcpFourPacketFlight ? 4 : 2);
 
     // Snapshot the negotiated MSS; never hold the socket lock across network
     // submission or an ACK wait. The optional ceiling is boot-time immutable.

@@ -94,3 +94,15 @@ outstanding. QEMU USB Ethernet acceptance exercises concurrent writers,
 close stress and user-copy faults, and its packet capture confirms successive
 payloads before their ACK. Physical throughput and wider network behavior are
 not yet verified; keep the known-good SSD recovery slot available.
+
+A separate `/etc/tcp-four-packet-flight` marker selects an experimental
+four-entry version of the same queue; conflicting markers select two. It is
+not a congestion-control policy or a default. Host tests exercise every
+local-EAGAIN position, ring reuse, a short last packet and recovery from a
+lost middle packet. Isolated QEMU tests with a 10 ms periodic network buffer
+captured maximum contiguous flights of 1, 2 and 4 for the corresponding modes
+while preserving the tested bytes. Capture is placed on the guest side of
+the delay; the parser proves an observed chain before covering ACKs, not a
+general upper bound or a throughput result. The buffer batches rather than
+guaranteeing per-packet delay. Persistent congestion state, real-network
+loss behavior and physical four-packet performance remain to be tested.

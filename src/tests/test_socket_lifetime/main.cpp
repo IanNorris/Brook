@@ -28,6 +28,8 @@ std::atomic<uint16_t> dataAckWindow{65535};
 std::atomic<bool> signalOnDataSend{false};
 std::atomic<uint64_t> lastDataSubmitTick{0};
 std::atomic<unsigned> flightPartialMode{0},flightPartialCount{0};
+std::atomic<bool> fourLossMode{false};
+std::atomic<unsigned> fourLossCount{0};
 std::atomic<uint32_t> flightRetrySeq{0},flightRetryLen{0};
 std::atomic<int> windowUpdateSocket{-1};
 std::atomic<uint64_t> windowUpdateTick{0};
@@ -36,7 +38,7 @@ std::atomic<uint8_t*> mutateUserOnSend{nullptr};
 std::atomic<unsigned> stagedPayloadCount{0};
 std::atomic<uint8_t> stagedPayloads[2]{};
 std::atomic<unsigned> capturedDataCount{0};
-std::atomic<uint32_t> capturedDataSeq[4]{};
+std::atomic<uint32_t> capturedDataSeq[8]{};
 std::atomic<int> deadlineAckSocket{-1};
 std::atomic<uint64_t> deadlineAckTick{0};
 std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
@@ -113,7 +115,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
         lastDataSubmitTick=ticks.load();
         const unsigned index=capturedDataCount.fetch_add(1);
-        if(index<4)capturedDataSeq[index]=ntohl(tcp->seqNum);
+        if(index<8)capturedDataSeq[index]=ntohl(tcp->seqNum);
         if(index && ntohl(tcp->seqNum)==10)firstDataRetryTick=ticks.load();
         uint8_t* mutate=mutateUserOnSend.load();
         if(mutate){const unsigned n=stagedPayloadCount.fetch_add(1);if(n<2)stagedPayloads[n]=static_cast<const uint8_t*>(data)[sizeof(TcpHeader)];if(n==0)*mutate=9;}
@@ -141,6 +143,14 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                 if(n!=2)ack.ackNum=htonl(ntohl(tcp->seqNum)+10);
                 else {flightRetrySeq=ntohl(tcp->seqNum);flightRetryLen=len-sizeof(TcpHeader);ack.ackNum=htonl(1082);}
                 ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));}
+            return 0;
+        }
+        if(fourLossMode.load()){
+            unsigned n=fourLossCount.fetch_add(1);
+            if(n!=1){Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
+                TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;ack.seqNum=tcp->ackNum;
+                ack.ackNum=htonl(n==4?2154:546);ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);
+                HandleTcp(&ip,&ack,sizeof(ack));}
             return 0;
         }
         if(signalOnDataSend.exchange(false))__atomic_store_n(&currentProcess->sigPending,1,__ATOMIC_RELEASE);
@@ -486,6 +496,34 @@ int main() {
     assert(capturedDataCount==2 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 && ticks==1);
     assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
     g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Four-slot control: cumulative ACK after all four submissions, and local
+    // EAGAIN at each position must retry the same range without a hole.
+    for(unsigned failAt=0;failAt<=4;++failAt){
+        waiter=new Process{};waiter->refCount=1;
+        i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+        g_tcpFourPacketFlight=true;skipDataAcks=3;acknowledgeDataCount=1;capturedDataCount=0;failDataAttempt=failAt;
+        {uint8_t data[2144]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+        assert(capturedDataCount==(failAt?5u:4u) && g_sockets[i].tcpSndUna==2154 && g_sockets[i].tcpSndNxt==2154);
+        if(failAt)assert(capturedDataSeq[failAt-1]==capturedDataSeq[failAt]);
+        g_tcpFourPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    }
+    // Reuse ring slots over a longer stream, including a short final packet.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpFourPacketFlight=true;skipDataAcks=3;acknowledgeDataCount=10;capturedDataCount=0;
+    {uint8_t data[6439]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_sockets[i].tcpSndUna==6449 && g_sockets[i].tcpSndNxt==6449);
+    acknowledgeDataCount=0;g_tcpFourPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Drop the second of four packets; later packets elicit duplicate ACKs
+    // and the timer retransmits the missing middle before completing.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpFourPacketFlight=true;fourLossMode=true;fourLossCount=0;capturedDataCount=0;
+    {uint8_t data[2144]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(fourLossCount==5 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 &&
+           capturedDataSeq[2]==1082 && capturedDataSeq[3]==1618 && capturedDataSeq[4]==546);
+    assert(g_sockets[i].tcpSndUna==2154 && g_sockets[i].tcpSndNxt==2154);
+    fourLossMode=false;g_tcpFourPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // A rejected second submission retries its original range and payload.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
