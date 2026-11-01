@@ -6,6 +6,14 @@ is published, and the system remains in the initrd maintenance environment.
 The user has requested automatic repair; the procedure below is not yet
 implemented.
 
+Dirty-store classification validates the superblock identity and expected
+geometry before returning `needs-filesystem-check`, but deliberately does not
+require group descriptors to be valid. Their condition remains unknown until
+the offline checker reads them. Clean-store admission still validates group
+descriptors before any write or mount. A deliberately dirty private QEMU store
+with an invalid block-bitmap pointer entered maintenance without mounting or
+altering the store; host tests cover the corresponding clean-state rejection.
+
 The repair must happen after the scheduler can run a user process: store
 admission currently runs before ordinary user processes can execute. On the
 verified system-volume path, a boot-only maintenance coordinator should:

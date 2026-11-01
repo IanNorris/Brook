@@ -87,10 +87,14 @@ struct WritableDesktopSession {
         int r=io.read(io.context,1024,sb,sizeof(sb));if(r!=int(sizeof(sb)))return r<0?r:-5;
         const auto header=WritableDesktopClassifyHeader(sb,plan);
         if(header==WritableDesktopHeaderState::Invalid)return -22;
+        // Dirty media needs an offline checker, including when its group
+        // descriptors are damaged. This is classification only: it does not
+        // authorize repair, bypass identity checks, or permit mounting.
+        // Group readability and validity remain unknown until checked.
+        if(header==WritableDesktopHeaderState::NeedsCheck)return -117;
         const uint32_t bytes=((StoreGet32(sb+4)+32767)/32768)*32;
         r=io.read(io.context,4096,gdt,bytes);if(r!=int(bytes))return r<0?r:-5;
         if(!WritableDesktopGroupsValid(sb,gdt,bytes))return -22;
-        if(header==WritableDesktopHeaderState::NeedsCheck)return -117; // EUCLEAN; no write or mount
         const uint8_t state[2]={0,0};
         dirtyAttempted=true;
         r=io.write(io.context,1082,state,2);if(r!=2)return r<0?r:-5;
