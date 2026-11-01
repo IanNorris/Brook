@@ -71,4 +71,15 @@ legacy pair. The initializer and updater also ran with the desktop store
 mounted, followed by a clean ext2 check. Eight injected QEMU process stops at
 migration stages were followed by offline FAT checks and successful boots; one
 boot check needed a retry after an unexplained QEMU exit. These are not physical
-power-loss tests. The physical SSD has not yet been migrated.
+power-loss tests.
+
+The physical Dell was subsequently booted into the verified USB maintenance
+payload. The one-shot workflow checked the exact SSD identity and original EFI,
+kernel and initrd hashes, then initialized both SSD slots. The system updater
+verified and activated the new xHCI/checker payload as generation 3 in slot A.
+After a checked restart, the Dell reported that payload ID, a ready persistent
+store and working Ethernet; the earlier persistence fixture verified again.
+The legacy root pair and USB recovery remain available. The Dell was then
+cleanly shut down for an SSD-only boot test with the USB removed; that final
+observation is pending. The checker is bundled but automatic repair is not yet
+implemented.
