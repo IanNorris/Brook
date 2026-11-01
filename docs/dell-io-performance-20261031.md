@@ -89,6 +89,12 @@ two-slot selector chooses the newest hash-valid generation; it does not
 automatically roll back a kernel that hangs, so recovery availability must be
 established before activation.
 
+While that physical comparison was pending, the five existing Dell audio
+prerequisite host tests were rebuilt and passed in the pinned Nix shell:
+firmware snapshot, I2C identity policy and probe, codec ID transaction, and
+the simulated DesignWare polling adapter. These exercise validation and mocks;
+they do not access the physical codec or provide audio playback.
+
 The real `KMutexTryLock` implementation is now exercised in the cooperative
 scheduler lifetime harness for the ECM dispatch pattern: a recursive poll and
 a competing caller fail without disturbing ownership, a simulated kill is
