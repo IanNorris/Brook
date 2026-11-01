@@ -10,6 +10,7 @@ import json
 import subprocess
 import os
 from pathlib import Path
+from hardware_recovery_fsck import embed_checker
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -24,6 +25,7 @@ def main():
     p.add_argument('--recovery-probe',required=True,type=Path)
     p.add_argument('--maintenance-probe',required=True,type=Path)
     p.add_argument('--waylandd',type=Path)
+    p.add_argument('--e2fsck',type=Path,help='Embed a standalone static x86-64 e2fsck for offline recovery')
     p.add_argument('--display-idle-seconds',type=int,default=300)
     p.add_argument('--tcp-egress-1200',action='store_true',help='Enable a temporary 1200-byte TCP payload ceiling for a known path-MTU problem')
     p.add_argument('--ahci-observe',action='store_true',help='Opt in to the boot-time read-only AHCI register snapshot')
@@ -49,6 +51,7 @@ def main():
     subprocess.run([os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',
         str(ROOT/'scripts/workloads/writable_desktop_check.c'),'-o',str(out/'STOREQA.ELF')],check=True,cwd=ROOT)
     subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(out/'STOREQA.ELF'),'::BOOT/STOREQA.ELF'],check=True,cwd=ROOT)
+    fsck_info=embed_checker(out/'INITRD.IMG',a.e2fsck) if a.e2fsck else None
     record=out/'writable-desktop';record.write_text(f"BRKSTORE1 {m['bytes']} {m['uuid']}\n")
     subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(record),'::ETC/writable-desktop'],check=True,cwd=ROOT)
     if a.tcp_egress_1200:
@@ -81,6 +84,7 @@ def main():
         ahci_observe=a.ahci_observe,ahci_read_only=a.ahci_read_only,ahci_export=a.ahci_export,
         dell_audio_dsdt_sha256=audio_digest,
         dell_i2c_id_probe=a.dell_i2c_id_probe,
+        recovery_e2fsck=fsck_info,
         home_persistence='persistent only after writable-store admission; RAM fallback remains volatile',
         writable_desktop={'source':'/media/usb/STORE.IMG','readiness':'/media/usb/STORE.OK',
             'bytes':m['bytes'],'uuid':m['uuid'],'initial_sha256':m['sha256'],

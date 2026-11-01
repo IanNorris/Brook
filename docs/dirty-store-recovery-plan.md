@@ -13,6 +13,10 @@ marks a clean store dirty, then binds ext2 and publishes `/nix` and home.
 It cannot run a userspace checker at that point, and an error leaves the system
 in maintenance without the applications contained in the store.
 
+`prepare_hardware_writable_desktop.py --e2fsck /path/to/static/e2fsck`
+can embed a validated standalone checker into the initrd and records its hash.
+This opt-in packaging does not itself run it or implement automatic recovery.
+
 The intended recovery path is:
 
 1. Distinguish a structurally recognized store needing a check from an invalid
