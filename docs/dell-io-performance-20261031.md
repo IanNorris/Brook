@@ -39,6 +39,20 @@ not direct wire-speed measurements. Evidence:
 `build/hardware/net-alternating-20261101-results.json` and the six associated
 receipts. The current Dell kernel was unchanged during this comparison.
 
+`scripts/benchmark_hardware_network.py` now runs that comparison with a caller-
+provided stable random file, alternating unpaced and paced uploads and a
+verified download. It retains boot identity and each transaction receipt. A
+two-round physical smoke completed with unpaced times 4.889 and 8.369 seconds
+and paced times 0.583 and 0.342 seconds; the download verified the same hash
+(`network-benchmark-script-20261101`). Timings include the helper, and this
+tool does not identify the packet-loss location or replace network-device
+counters. It takes a bounded private source snapshot, alternates mode order,
+and records the boot ID, build ID and RX depth when available in retained
+logs. Use the same source and settings when comparing boot candidates. The
+previously booted Dell image predates the RX-depth log and records null rather
+than inferring a value. Five rounds of 8 MiB leave up to 80 MiB of upload
+artifacts in guest RAM until reboot; the script does not remove them.
+
 `scripts/hardware_transfer.py` accepts `--pace-bytes-per-second 16000000` for
 an explicitly paced Linux host-to-guest upload. It remains opt-in and applies
 only to this helper's upload socket; it does not improve general downloads or
