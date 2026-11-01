@@ -23,6 +23,7 @@ from hardware import Hardware
 from hardware_bulk_protocol import download
 from hardware_bulk_workflow import BulkRun
 from hardware_update_workflow import UpdateRun
+from hardware_ssd_slots_workflow import SlotRun
 from stage_usb_ssd_recovery import parse as parse_slot_record
 from test_hardware_power import Qmp
 
@@ -62,6 +63,8 @@ def main():
                         help='Run the candidate SSD slot initializer on this disposable QEMU disk')
     parser.add_argument('--clean-store', action='store_true',
                         help='Run slot initialization while the private desktop store is mounted')
+    parser.add_argument('--slot-workflow', action='store_true',
+                        help='Use the boot-pinned host workflow to perform slot initialization')
     parser.add_argument('--require-slot-boot', action='store_true',
                         help='Invalidate the private clone legacy kernel so boot requires an A/B slot')
     parser.add_argument('--corrupt-newest-slot', action='store_true',
@@ -81,6 +84,8 @@ def main():
         parser.error('SSD slot bootstrap requires dirty classification mode')
     if a.clean_store and (not a.ssd_slot_bootstrap or a.expect_identity_refusal):
         parser.error('clean store mode requires the SSD slot bootstrap and admitted disk')
+    if a.slot_workflow and not a.clean_store:
+        parser.error('slot workflow requires a mounted desktop store')
     if a.system_updater and not a.ssd_slot_bootstrap:
         parser.error('system updater requires SSD slot bootstrap')
     if a.slot_interrupt and (not a.ssd_slot_bootstrap or a.system_updater or a.clean_store):
@@ -226,33 +231,44 @@ def main():
                     efi = out / 'original-efi.bin'
                     # Read only the stopped source fixture, not the running disk.
                     run('mcopy', '-i', str(a.fixture) + '@@1048576', '::EFI/BOOT/BOOTX64.EFI', efi)
-                    ident = uuid.uuid4().hex
-                    env = {'BROOK_TEST_HOLD': a.slot_interrupt} if a.slot_interrupt else None
-                    h.guest_run(s, ident, ['/boot/SSDSLOT.ELF', sha(efi)], cwd='/tmp', uid=0, env=env, wait_s=2)
-                    deadline = time.monotonic() + 600
-                    while True:
-                        job = h.job(s, ident, wait_s=2)
-                        (out / 'slot-bootstrap-job.json').write_text(json.dumps(job, indent=2) + '\n')
-                        if a.slot_interrupt and 'SSD_SLOT_TEST_HOLD ' + a.slot_interrupt in job.get('stdout', {}).get('text', ''):
-                            qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
-                            config = out / 'after-interruption-config'; run('mcopy', '-i', media, '::BROOK.CFG', config)
-                            original = out / 'original-config'; run('mcopy', '-i', str(a.fixture) + '@@1048576', '::BROOK.CFG', original)
-                            after, before = config.read_bytes(), original.read_bytes()
-                            assert after.startswith(before)
-                            suffix = after[len(before):]
-                            if a.slot_interrupt == 'activation-written':
-                                assert b'\nUPDATE_SLOTS=1\n'.startswith(suffix)
-                            else:
-                                assert not suffix
-                            expected = b'UPDATE_SLOTS=1' in suffix
-                            (out / 'result.json').write_text(json.dumps({'passed': True, 'scope': 'QEMU process interruption, not physical power loss',
-                                'stage': a.slot_interrupt, 'activation_visible': expected}, indent=2) + '\n')
-                            print('SSD_SLOT_INTERRUPTION_QEMU_PASS', a.slot_interrupt, flush=True)
-                            return
-                        if job['state'] in ('completed', 'failed', 'lost', 'rejected'): break
-                        if time.monotonic() >= deadline: raise TimeoutError('inspect original bootstrap job ' + ident)
-                    if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
-                        raise RuntimeError('SSD slot bootstrap failed; see slot-bootstrap-job.json')
+                    if a.slot_workflow:
+                        disk_info = h.command(s, 'bridge hardware ahci-ro')
+                        assert disk_info['serial'] == 'BROOK-SYSTEM-TEST01' and disk_info['sectors'] == 500118192
+                        identity = {k: disk_info[k] for k in ('port','sectors','logical_sector_bytes','physical_sector_bytes','model','serial')}
+                        payload = subprocess.check_output(['mtype','-i',str(initrd),'::ETC/hardware-payload-id'], text=True).strip()
+                        hashes = {'/media/system/EFI/BOOT/BOOTX64.EFI': sha(efi),
+                                  '/media/system/KERNEL/BROOK.ELF': sha(a.dirty_classification_kernel),
+                                  '/media/system/INITRD.IMG': sha(initrd)}
+                        result = SlotRun(h, out / 'slot-workflow').execute(s, identity, payload, hashes)
+                        assert result['state'] == 'slots_initialized'
+                    else:
+                        ident = uuid.uuid4().hex
+                        env = {'BROOK_TEST_HOLD': a.slot_interrupt} if a.slot_interrupt else None
+                        h.guest_run(s, ident, ['/boot/SSDSLOT.ELF', sha(efi)], cwd='/tmp', uid=0, env=env, wait_s=2)
+                        deadline = time.monotonic() + 600
+                        while True:
+                            job = h.job(s, ident, wait_s=2)
+                            (out / 'slot-bootstrap-job.json').write_text(json.dumps(job, indent=2) + '\n')
+                            if a.slot_interrupt and 'SSD_SLOT_TEST_HOLD ' + a.slot_interrupt in job.get('stdout', {}).get('text', ''):
+                                qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
+                                config = out / 'after-interruption-config'; run('mcopy', '-i', media, '::BROOK.CFG', config)
+                                original = out / 'original-config'; run('mcopy', '-i', str(a.fixture) + '@@1048576', '::BROOK.CFG', original)
+                                after, before = config.read_bytes(), original.read_bytes()
+                                assert after.startswith(before)
+                                suffix = after[len(before):]
+                                if a.slot_interrupt == 'activation-written':
+                                    assert b'\nUPDATE_SLOTS=1\n'.startswith(suffix)
+                                else:
+                                    assert not suffix
+                                expected = b'UPDATE_SLOTS=1' in suffix
+                                (out / 'result.json').write_text(json.dumps({'passed': True, 'scope': 'QEMU process interruption, not physical power loss',
+                                    'stage': a.slot_interrupt, 'activation_visible': expected}, indent=2) + '\n')
+                                print('SSD_SLOT_INTERRUPTION_QEMU_PASS', a.slot_interrupt, flush=True)
+                                return
+                            if job['state'] in ('completed', 'failed', 'lost', 'rejected'): break
+                            if time.monotonic() >= deadline: raise TimeoutError('inspect original bootstrap job ' + ident)
+                        if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
+                            raise RuntimeError('SSD slot bootstrap failed; see slot-bootstrap-job.json')
                 if a.system_updater:
                     update_initrd = out / 'system-update-initrd.img'; shutil.copyfile(initrd, update_initrd)
                     update_id = out / 'system-update-payload-id'; update_id.write_text('qemu-ssd-update-generation-3\n')
