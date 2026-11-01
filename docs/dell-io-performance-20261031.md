@@ -504,3 +504,13 @@ consecutive tests used a different kernel from the fixed-flight tests and are
 not a controlled fairness or loss assessment. They do not establish the
 maximum available Internet throughput. The candidate is opt-in and the
 independently verified recovery payload remains in slot B.
+
+For a longer sample, three 1 MiB uploads on that adaptive boot took 2.097,
+2.486 and 2.232 s, each HTTP 200 (roughly 3.4–4.0 Mbps including setup).
+The same payload uploaded immediately afterward from the host over IPv4 took
+0.208, 0.167 and 0.177 s, also HTTP 200. Cloudflare endpoints and host and
+guest networking may differ, and these measurements are sequential rather
+than randomized; this is a useful control, not a strict link benchmark.
+During the Dell runs the observed RX-drop, TX-busy and ACK-submission-failure
+counters did not increase. The data does not distinguish the eight-MSS cap,
+per-send-call draining, ACK latency, scheduling or an unmeasured bottleneck.
