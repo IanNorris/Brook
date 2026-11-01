@@ -1,14 +1,16 @@
 # SSD boot generations: proposed design
 
-The Dell currently boots a single kernel and initrd from its SSD. Keep the
-independent USB recovery stick usable until an SSD update and recovery path
-has passed physical testing. This is a plan, not an implemented menu.
+The Dell has two verified kernel/initrd slots on its SSD, plus the retained
+legacy root payload and an independent USB recovery stick. Updates and fallback
+between valid pairs have been tested, but an interactive menu and health-based
+rollback are not implemented. Keep the USB recovery path usable.
 
 The existing USB A/B updater and EFI loader already verify paired kernel and
 initrd hashes and select the newest valid record, with a root-payload fallback.
 They do not provide interactive generation selection or recovery from a
-hash-valid kernel that hangs. The installed SSD currently uses the direct
-`KERNEL/BROOK.ELF` boot path, not the USB A/B layout.
+hash-valid kernel that hangs. The installed SSD now uses the same A/B slot
+selection mechanism; the retained direct `KERNEL/BROOK.ELF` pair is its
+fallback when neither slot is valid.
 
 1. Define immutable, bounded generations as paired kernel/initrd files and a
    versioned manifest with generation ID, sizes, hashes and a human-readable
@@ -43,10 +45,11 @@ remains relevant to the store design.
 
 ## Existing Dell migration
 
-The existing SSD EFI executable was independently hashed over the recovery
-bridge and matches the known slot-capable loader. Its current configuration
-uses the legacy direct pair, with no `UPDATES` directory. The system volume
-reported approximately 2,064,096 KiB free; check it again before staging.
+Before migration, the existing SSD EFI executable was independently hashed
+over the recovery bridge and matched the known slot-capable loader. At that
+point the configuration used the legacy direct pair and had no `UPDATES`
+directory. The system volume then reported approximately 2,064,096 KiB free;
+check current space before staging further generations.
 
 To migrate without replacing EFI or the working root pair, an identity-bound
 SSD-specific helper should seed both capacity-sized slots from verified
@@ -87,7 +90,7 @@ candidate was then staged as generation 4 in slot B. One clean SSD-only warm
 restart reached that payload, mounted the persistent store and initialized
 xHCI and Ethernet. A second checked SSD-only warm restart into generation 5
 also reached Ethernet and the persistent store; the existing 8 KiB test file
-passed its cross-page and private-mapping checks. The installed checker uses
+passed its cross-page and private-mapping checks. The installed test helper uses
 a fixed filename and correctly refused a new exclusive-create attempt because
 that file already exists. A third checked SSD-only warm restart entered
 generation 6, reached Ethernet, and passed the existing file check again.
@@ -95,5 +98,4 @@ The user confirmed kernel-console keyboard scrolling on that boot. These
 restarts are not proof that the
 intermittent controller failure is fixed; test further and verify persistence
 through a separate cold-power cycle before calling SSD-only operation reliable.
-The checker is bundled but
-automatic repair is not yet implemented.
+The `e2fsck` checker is bundled but automatic repair is not yet implemented.
