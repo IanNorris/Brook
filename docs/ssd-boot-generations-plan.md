@@ -122,3 +122,16 @@ Brook currently routes only after controller start. A controlled comparison of
 the failing boot's PCI power, ownership and routing state should precede any
 change to that ordering. No blind controller reset or PCI power-cycle recovery
 is established by this observation.
+
+Generation 8 added read-only routing snapshots and was staged after the next
+verified store repair. Its warm boot had PMCSR `0x8` and before-reset routing
+`d0=0x300 d4=0x4ff d8=0 dc=0xf`; the later routing step enabled the allowed
+ports. On the subsequent failed SSD-only cold boot, the user's photograph
+showed the same PCI command/status and PMCSR (`cmd=0x6 status=0x290
+pmcsr=0x8`), released firmware ownership (`sem=0x1000801 ctl=0`), and routing
+already enabled before reset (`d0=0x7ff d4=0x4ff d8=0xf dc=0xf`). HCRST
+remained set after 10,002 ms and both status samples were `0x11`. Thus missing
+port routing is not supported as the immediate explanation for this failure;
+the difference between firmware boot paths remains unresolved. The SSD store
+was mounted in that failed-xHCI boot, so it must be cleanly shut down before
+power is removed.

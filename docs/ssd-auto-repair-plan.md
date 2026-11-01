@@ -49,3 +49,21 @@ offline `e2fsck -fn` verification. A clean result must survive a second boot
 and preserve a known pre-reboot file. QEMU interruption does not establish
 physical power-loss behavior. Keep the accepted physical boot generation and
 USB recovery available through the first Dell test.
+
+## Checker interface probe
+
+The exact bundled static e2fsck 1.47.4 was traced on Linux against a disposable
+64 MiB ext2 fixture, first with `-f -n` and then after marking it unclean with
+`-p`. In the preen run it opened the image with `O_RDWR|O_EXCL`, kept that
+descriptor open, and opened the same pathname again read-only for geometry
+probing. Its image I/O included `pread64`, `pwrite64`, `lseek`, `fstat` and
+`fsync`; block-size/read-only ioctls returned `ENOTTY` for the regular-file
+fixture and it continued. The clean-state repair performed a 4096-byte
+positional write followed by syncs. Therefore the repair endpoint needs
+controlled concurrent read-only opens by the authorized checker in addition
+to its exclusive writable description, and should present regular-file
+semantics rather than assuming one inherited descriptor is enough.
+
+This is evidence for one small Linux-hosted fixture and one repair case, not a
+complete syscall specification or proof that the synthetic endpoint works in
+Brook. More involved repairs and the actual guest checker still need testing.
