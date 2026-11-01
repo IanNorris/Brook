@@ -14,6 +14,10 @@ std::atomic<int> failAllocation{-1};
 std::atomic<bool> pauseTransmit{false}, transmitting{false}, releaseTransmit{false};
 std::atomic<bool> pauseOnlyPureAck{false};
 std::atomic<bool> acknowledgeFin{false};
+std::atomic<unsigned> sentFins{0};
+std::atomic<unsigned> acknowledgeDataCount{0};
+std::atomic<int> deadlineAckSocket{-1};
+std::atomic<uint64_t> deadlineAckTick{0};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
 std::atomic<int> updateAckSlot{-1};
@@ -38,7 +42,19 @@ void kfree(void* p) { if (p) { ++frees; std::free(p); } }
 uint64_t ApicTickCount() { return ticks.load(); }
 Process* ProcessCurrent() { return currentProcess; }
 Process* SchedulerCurrentProcess() { return currentProcess; }
-void SchedulerBlock(Process* p) { ticks = p ? p->wakeupTick : ticks.load() + 50; std::this_thread::yield(); }
+void SchedulerBlock(Process* p) {
+    ticks = p ? p->wakeupTick : ticks.load() + 50;
+    if (ticks.load() >= deadlineAckTick.load()) {
+        int idx=deadlineAckSocket.exchange(-1);
+        if(idx>=0) {
+            auto& socket=g_sockets[idx];Ipv4Header ip{};ip.srcIp=socket.remoteIp;ip.dstIp=socket.localIp;
+            TcpHeader ack{};ack.srcPort=socket.remotePort;ack.dstPort=socket.localPort;
+            ack.seqNum=htonl(socket.tcpRcvNxt);ack.ackNum=htonl(socket.tcpSndNxt);
+            ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));
+        }
+    }
+    std::this_thread::yield();
+}
 void SchedulerUnblock(Process*) { ++wakes; }
 extern "C" void SchedulerYield() { std::this_thread::yield(); }
 void SerialPuts(const char*) {}
@@ -47,6 +63,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                                const void* data, uint32_t len) {
     assert(proto == IP_PROTO_TCP);
     const auto* tcp = static_cast<const TcpHeader*>(data);
+    if (tcp->flags & TCP_FIN) ++sentFins;
     if (pauseTransmit.load() && (!pauseOnlyPureAck.load() || (tcp->flags==TCP_ACK && len==sizeof(TcpHeader)))) {
         transmitting = true;
         while (!releaseTransmit.load()) std::this_thread::yield();
@@ -69,6 +86,13 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         ack.seqNum = tcp->ackNum; ack.ackNum = htonl(ntohl(tcp->seqNum) + 1);
         ack.dataOff = 5 << 4; ack.flags = TCP_ACK; ack.window = htons(65535);
         HandleTcp(&ip, &ack, sizeof(ack));
+    }
+    if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader) && acknowledgeDataCount.load()) {
+        --acknowledgeDataCount;
+        Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
+        TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;
+        ack.seqNum=tcp->ackNum;ack.ackNum=htonl(ntohl(tcp->seqNum)+len-sizeof(TcpHeader));
+        ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));
     }
     assert(len >= sizeof(TcpHeader));
     return 0;
@@ -252,7 +276,43 @@ int main() {
     uint8_t payload = 1;
     assert(TcpWaitForDataAck(g_sockets[i], i, 10, &payload, 1) == -110);
     assert(waiter->refCount == 1 && g_sockets[i].pollWaiter == nullptr);
+    assert(g_sockets[i].tcpState == TcpState::Closed && g_sockets[i].tcpRstRecv);
+    assert(SockGetConnectError(i) == 110 && SockGetConnectError(i) == 0);
     currentProcess = nullptr; SockClose(i); delete waiter;
+    // The full send path may not leave an established stream after the
+    // caller's sole retransmission copy is lost to a timeout.
+    waiter = new Process{}; waiter->refCount = 1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;
+    unsigned finsBefore=sentFins;
+    assert(SockSend(i,&payload,1)==-110);
+    assert(g_sockets[i].tcpState==TcpState::Closed && !g_sockets[i].connected);
+    assert(SockGetConnectError(i)==110 && SockGetConnectError(i)==0);
+    uint8_t recvByte=0;assert(SockRecv(i,&recvByte,1,true)==-104);
+    assert(SockSend(i,&payload,1)==-104);
+    assert(waiter->refCount==1 && !g_sockets[i].pollWaiter);
+    currentProcess=nullptr;SockClose(i);assert(sentFins==finsBefore);delete waiter;
+    // An ACK delivered on the deadline wake wins before the locked timeout decision.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;g_sockets[i].tcpSndNxt=11;ticks=1;
+    deadlineAckTick=30001;deadlineAckSocket=i;
+    assert(TcpWaitForDataAck(g_sockets[i],i,10,&payload,1)==0);
+    assert(deadlineAckSocket==-1 && g_sockets[i].tcpSndUna==11);
+    assert(g_sockets[i].tcpState==TcpState::Established && SockGetConnectError(i)==0);
+    currentProcess=nullptr;SockClose(i);delete waiter;
+    // Previously ACKed chunks are reported even when the next one times out.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;acknowledgeDataCount=1;
+    {uint8_t data[537]{};assert(SockSend(i,data,sizeof(data))==536);}
+    assert(g_sockets[i].tcpState==TcpState::Closed && SockGetConnectError(i)==110);
+    currentProcess=nullptr;SockClose(i);delete waiter;
+    // Data received before the timeout stays readable before the error.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;
+    SpinLockAcquire(&g_sockets[i].lock);TcpEnqueueData(g_sockets[i],&payload,1);SpinLockRelease(&g_sockets[i].lock);
+    assert(SockSend(i,&payload,1)==-110);
+    recvByte=0;assert(SockRecv(i,&recvByte,1,true)==1 && recvByte==payload);
+    assert(SockRecv(i,&recvByte,1,true)==-104);
+    currentProcess=nullptr;SockClose(i);delete waiter;
     // A busy NIC must not lose a cumulative ACK. Exercise actual HandleTcp,
     // real send failure and the production maintenance timer, without any
     // later packet prompting the retry.

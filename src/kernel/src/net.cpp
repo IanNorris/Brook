@@ -2006,8 +2006,10 @@ int SockGetConnectError(int sockIdx)
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return 0;
     if (!g_sockUsed[sockIdx]) return 0;
     Socket& s = g_sockets[sockIdx];
+    SpinLockAcquire(&s.lock);
     int err = s.connectError;
     s.connectError = 0; // consumed
+    SpinLockRelease(&s.lock);
     return err;
 }
 
@@ -2938,11 +2940,30 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
         bool acked = TcpSeqAcked(s.tcpSndUna, seqEnd);
         bool closed = s.tcpRstRecv || !TcpCanSendData(s.tcpState);
         if (acked || closed || now >= deadline) {
+            Process* waiter = nullptr;
+            // Once this call returns, its retransmission bytes are gone. Do
+            // not leave a live stream with an unrecoverable sequence hole.
+            // An ACK observed under the lock always wins the deadline race.
+            if (!acked && !closed) {
+                s.tcpState = TcpState::Closed;
+                s.connected = false;
+                s.tcpRstRecv = true; // report an error, never orderly EOF
+                s.connectError = 110; // ETIMEDOUT, available through SO_ERROR
+                s.tcpUnackedSegs = 0;
+                s.tcpLastDataTick = 0;
+                waiter = TakeSocketWaiterLocked(s);
+            }
+            const uint32_t sndUna = s.tcpSndUna;
             SpinLockRelease(&s.lock);
+            if (waiter) {
+                __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+                SchedulerUnblock(waiter);
+                ProcessUnref(waiter);
+            }
             if (acked) return 0;
             if (closed) return -104; // ECONNRESET
             SerialPrintf("tcp: data ACK timeout fd=%d seq=%u end=%u una=%u retx=%u\n",
-                         sockIdx, seq, seqEnd, s.tcpSndUna, retransmits);
+                         sockIdx, seq, seqEnd, sndUna, retransmits);
             return -110; // ETIMEDOUT
         }
 

@@ -34,3 +34,14 @@ reopening, RST, FIN and full-duplex waits. Use the real mutex and cooperative
 scheduler for the lock-lifetime cases. QEMU packet capture and exact echo
 verify the flight before the same isolated physical benchmark. Keep receive
 depth, receive-window policy and other knobs fixed for comparison.
+
+As a first safety checkpoint, an ACK timeout now atomically closes the local
+stream instead of allowing later writes to proceed beyond data whose
+retransmission copy has been discarded. An ACK observed at the deadline wins;
+earlier fully acknowledged chunks retain their existing partial-write return.
+Buffered incoming data remains readable. The local abort uses the existing
+reset indication, so later reads report `ECONNRESET`, while `SO_ERROR` reports
+`ETIMEDOUT` once. The abort does not currently transmit an RST; the peer may
+retain its half of the connection until its own timeout. Socket lifetime and
+concurrent send serialization remain separate work. Host tests exercise the
+actual send and timeout paths, and QEMU USB Ethernet acceptance passed.
