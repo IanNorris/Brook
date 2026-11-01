@@ -19,7 +19,7 @@
 std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
-bool audioProbePresent=false;
+bool audioProbePresent=false,hdaPciPresent=false;
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
 DellI2cIdResult DellI2cIdProbe(uint32_t& value){value=0;return DellI2cIdResult::Disabled;}
@@ -76,6 +76,9 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
     assert(out && index<2);*out={};out->device.bus=0;out->device.dev=index+2;
     out->device.vendorId=0x8086;out->device.deviceId=0x1616;
     out->device.classCode=3;out->device.bar[0]=0xf0000004;
+    if(hdaPciPresent && index==1){out->device.dev=0x1b;out->device.deviceId=0x9ca0;
+        out->device.classCode=4;out->device.subclass=3;out->device.bar[0]=0xf7418004;
+        out->subsystemVendor=0x1028;out->subsystemDevice=0x0665;}
     out->command=7;return true;
 }
 int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t stride,uint32_t* total,uint32_t* dropped){
@@ -120,6 +123,12 @@ int main(){
     assert(handle("bridge hardware dell-i2c-id start") && reply.find("\"result\":\"disabled\"")!=std::string::npos);
     assert(handle("bridge hardware dell-i2c-id status") && reply.find("\"started\":false")!=std::string::npos);
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
+    assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":false")!=std::string::npos);
+    hdaPciPresent=true;
+    assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":true")!=std::string::npos &&
+           reply.find("\"base\":4148264960")!=std::string::npos && reply.find("\"matches\":true")!=std::string::npos &&
+           reply.find("\"mtrr_type\":0")!=std::string::npos);
+    hdaPciPresent=false;
     audioProbePresent=true;
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"i2c_base0_mmio_declared\":true")!=std::string::npos &&
            reply.find("\"i2c_base1_mmio_declared\":false")!=std::string::npos && reply.find("\"types\":2")!=std::string::npos &&

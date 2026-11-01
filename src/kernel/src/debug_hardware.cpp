@@ -21,6 +21,7 @@
 #include "dell_i2c_probe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
+#include "../../drivers/intel_hda/hda_probe.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -118,6 +119,38 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(status.completed){r.text(",\"result\":");r.quoted(I2cProbeResult(status.result));
             if(status.result==DellI2cIdResult::Identified || status.result==DellI2cIdResult::Unknown){r.text(",");r.field("value",status.value);}}
         r.text(",\"pci_extent_ownership\":\"unresolved\"}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware dell-hda-memory")) {
+        // Fixed identity only, using immutable boot PCI metadata. This reports
+        // mappings and memory types; it never enables, maps or reads the HDA.
+        PciBootEntry found{};uint64_t base=0;bool present=false;
+        for(uint32_t i=0;i<PciBootInventoryCount();++i) {
+            PciBootEntry e{};if(!PciBootInventoryRead(i,&e))continue;
+            const auto& d=e.device;
+            HdaProbePci p{d.vendorId,d.deviceId,e.subsystemVendor,e.subsystemDevice,
+                          d.bus,d.dev,d.fn,d.classCode,d.subclass,d.bar[0],d.bar[1]};
+            uint64_t candidate=0;
+            if(HdaProbePciCheck(p,candidate)==HdaProbeResult::Ready){found=e;base=candidate;present=true;break;}
+        }
+        Reply r;r.text("{\"dell_hda_memory_api\":1,\"present\":");r.text(present?"true":"false");
+        if(present) {
+            r.text(",");r.field("base",base);r.text(",");r.field("boot_command",found.command);
+            BootResourceClassification range{};const bool rangeValid=AcpiClassifyBootRange(base,4096,range);
+            r.text(",\"boot_range\":{\"valid\":");r.text(rangeValid?"true":"false");
+            if(rangeValid){r.text(",");r.field("types",range.types);r.text(",\"unreported\":");r.text(range.unreported?"true":"false");}r.text("}");
+            KernelAliasMapping identity{},direct{};const bool aliasValid=VmmInspectKernelAliases(base,identity,direct);
+            r.text(",\"aliases\":{\"valid\":");r.text(aliasValid?"true":"false");
+            auto emitAlias=[&](const char* name,const KernelAliasMapping& m){r.text(",\"");r.text(name);r.text("\":{\"present\":");r.text(m.present?"true":"false");
+                r.text(",\"matches\":");r.text((m.present && m.physical==base)?"true":"false");r.text(",");r.field("page_shift",m.pageShift);r.text(",");r.field("pat_index",m.patIndex);r.text("}");};
+            if(aliasValid){emitAlias("identity",identity);emitAlias("direct",direct);}r.text("}");
+            CpuMemoryTypeObservation memory{};const bool memoryValid=CpuObserveMemoryTypes(base,base,memory);
+            r.text(",\"current_cpu_memory_type\":{\"valid\":");r.text(memoryValid?"true":"false");
+            if(memoryValid){r.text(",");r.field("cpu",memory.cpu);r.text(",");r.field("pat_slot0",memory.patSlot0);
+                r.text(",\"cr0_cd\":");r.text(memory.cacheDisabled?"true":"false");r.text(",\"cr0_nw\":");r.text(memory.notWriteThrough?"true":"false");
+                r.text(",");r.field("mtrr_type",memory.page0.type);r.text(",");r.field("matched_types",memory.page0.matchedTypes);}
+            r.text("}");
+        }
+        r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-audio-firmware")) {
         DellAudioFirmwareSnapshot s{};const char* reason=nullptr;const bool ok=DellAudioProbeRead(s,reason);

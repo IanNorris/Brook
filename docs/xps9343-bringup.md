@@ -1744,6 +1744,12 @@ devices and SET verbs; timeout disables further commands. It is not wired to
 PCI or MMIO. Before any physical use, BAR extent and memory-type alias safety,
 exclusive ownership, temporary memory decoding and cleanup still need to be
 established; a timeout does not prove a codec command was cancelled.
+`bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
+the exact PCI identity. It reports the boot-inventory command/BAR and the
+first page's existing kernel aliases, boot-map classification and current-CPU
+PAT/MTRR observation. It never enables, maps or reads the controller. Its
+snapshots are not atomic, do not establish other CPUs' cache state, BAR extent
+or ownership, and PAT slot 0 applies only to aliases reporting index 0.
 
 The earlier investigation treated the Broadwell analog path as requiring SST
 DSP, SSP/I²S and the RT286 codec; Brook's existing HDA backend still needs
