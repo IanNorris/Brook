@@ -142,3 +142,11 @@ the recovery USB was unplugged, so this is an SSD-only success, not the planned
 USB-presence comparison. The result confirms that the failure is intermittent;
 it does not establish its cause or a fix. The store was then cleanly synced
 for the next comparison.
+
+The user then booted the SSD with the recovery USB and Ethernet adapter both
+connected. Dell's F12 menu did not list the USB stick, and Brook again logged
+the same phase-8 timeout with HCRST set and USBSTS `0x11`; PCI power, ownership
+and routing matched the earlier failing boot. The store mounted successfully.
+USB presence alone therefore did not prevent the failure. Firmware's failure
+to list the stick is evidence of an earlier USB problem, but does not by itself
+prove when HCRST was asserted or whether that is the sole firmware issue.
