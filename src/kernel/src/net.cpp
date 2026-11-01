@@ -2334,7 +2334,16 @@ static bool TcpDrainOoo(Socket& s)
                 continue;
 
             uint32_t end = slot.seq + slot.len;
-            if (TcpSeqAfter(slot.seq, s.tcpRcvNxt) || !TcpSeqAfter(end, s.tcpRcvNxt))
+            // A retransmission may already have supplied the entire slot.
+            // Release its accounting immediately instead of retaining it
+            // until the OOO reap timeout.
+            if (!TcpSeqAfter(end, s.tcpRcvNxt)) {
+                s.tcpOooBytes = s.tcpOooBytes >= slot.len ? s.tcpOooBytes - slot.len : 0;
+                slot.used = false;
+                slot.len = 0;
+                continue;
+            }
+            if (TcpSeqAfter(slot.seq, s.tcpRcvNxt))
                 continue;
 
             uint32_t offset = s.tcpRcvNxt - slot.seq;

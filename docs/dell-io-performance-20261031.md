@@ -429,6 +429,17 @@ candidate QEMU boot. Its eager data allocation rises from 24,000 to 96,000
 bytes per stream socket, with additional static per-socket metadata, and the
 existing drain algorithm has quadratic worst-case scanning cost. It remains
 an experiment pending physical measurement. It was installed as generation
-19 in slot A, while the independent recovery payload remains in slot B;
-the Dell was unreachable after the checked restart. TCP timeout alone cannot
-distinguish the known xHCI problem from another boot or network failure.
+19 in slot A, while the independent recovery payload remains in slot B. The
+Dell was unreachable after its checked restart, then returned after the user
+intervened; the console failure was not captured.
+
+On the 64-slot candidate, three comparable uncapped unpaced uploads took
+0.393, 0.204 and 0.450 s, with respectively 159, 233 and 219 OOO arrivals,
+all stored and no OOO-full rejections. Paced uploads took 0.346, 0.336 and
+0.343 s; the first two had 43 OOO arrivals each, the last had none. Hashes
+matched. These samples strongly support reducing OOO loss amplification on
+this local path; they neither identify the original loss nor establish WAN or
+outbound throughput. Two USB backpressure transitions occurred during the
+three unpaced transfers; no zero-outstanding transitions were observed.
+Host tests cover full-size and reversed wraparound reassembly, stale and
+partially covered entries, shared receive-budget accounting and cleanup.

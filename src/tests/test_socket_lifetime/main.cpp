@@ -392,6 +392,64 @@ int main() {
      for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT+1;++n){packet.tcp.seqNum=htonl(21+n*2);HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}}
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED)==fullBefore+1);
     SockClose(i);
+    // Future segments must reassemble in order even when inserted backwards
+    // across sequence wrap, and leave no retained accounting behind.
+    i=create();setupTcp(i);g_sockets[i].tcpRcvNxt=0xffffffe0u;
+    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+     struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     for(unsigned n=Socket::TCP_OOO_SLOT_COUNT;n>0;--n){packet.tcp.seqNum=htonl(0xffffffe0u+n);packet.byte=static_cast<uint8_t>(n);HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);}
+     assert(g_sockets[i].tcpOooBytes==Socket::TCP_OOO_SLOT_COUNT);
+     packet.tcp.seqNum=htonl(0xffffffe0u);packet.byte=0;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);}
+    {uint8_t data[Socket::TCP_OOO_SLOT_COUNT+1]{};assert(SockRecv(i,data,sizeof(data),true)==sizeof(data));
+     for(unsigned n=0;n<sizeof(data);++n)assert(data[n]==n);}
+    assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].tcpRcvNxt==0xffffffe0u+Socket::TCP_OOO_SLOT_COUNT+1);
+    for(const auto& slot:g_sockets[i].tcpOooSlots)assert(!slot.used);
+    SockClose(i);
+    // Exercise the byte budget and copying with full-sized retained packets.
+    i=create();setupTcp(i);
+    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+     struct {TcpHeader tcp;uint8_t bytes[Socket::TCP_OOO_SLOT_SIZE];} packet{};
+     packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);packet.tcp.ackNum=htonl(10);
+     packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT;++n){packet.tcp.seqNum=htonl(21+n*Socket::TCP_OOO_SLOT_SIZE);
+       for(auto& b:packet.bytes)b=static_cast<uint8_t>(n);HandleTcp(&ip,&packet,sizeof(packet));}
+     assert(g_sockets[i].tcpOooBytes==Socket::TCP_OOO_SLOT_COUNT*Socket::TCP_OOO_SLOT_SIZE);
+     packet.tcp.seqNum=htonl(20);packet.bytes[0]=255;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);}
+    {uint8_t data[Socket::TCP_OOO_SLOT_SIZE];uint8_t prefix;
+     assert(SockRecv(i,&prefix,1,true)==1 && prefix==255);
+     for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT;++n){assert(SockRecv(i,data,sizeof(data),true)==sizeof(data));for(auto b:data)assert(b==n);}}
+    assert(g_sockets[i].tcpOooBytes==0);SockClose(i);
+    // A retransmission that covers retained future bytes must retire those
+    // entries without delivering them twice.
+    i=create();setupTcp(i);
+    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+     struct {TcpHeader tcp;uint8_t bytes[4];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     packet.tcp.seqNum=htonl(22);packet.bytes[0]=2;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);
+     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<4;++n)packet.bytes[n]=n;HandleTcp(&ip,&packet,sizeof(TcpHeader)+4);}
+    {uint8_t data[4]{};assert(SockRecv(i,data,sizeof(data),true)==4);for(unsigned n=0;n<4;++n)assert(data[n]==n);}
+    assert(g_sockets[i].tcpOooBytes==0);for(const auto& slot:g_sockets[i].tcpOooSlots)assert(!slot.used);
+    SockClose(i);
+    // A partially covered retained segment contributes only its new suffix.
+    i=create();setupTcp(i);
+    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+     struct {TcpHeader tcp;uint8_t bytes[3];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     packet.tcp.seqNum=htonl(22);for(unsigned n=0;n<3;++n)packet.bytes[n]=n+2;HandleTcp(&ip,&packet,sizeof(TcpHeader)+3);
+     packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<3;++n)packet.bytes[n]=n;HandleTcp(&ip,&packet,sizeof(TcpHeader)+3);}
+    {uint8_t data[5]{};assert(SockRecv(i,data,sizeof(data),true)==5);for(unsigned n=0;n<5;++n)assert(data[n]==n);}
+    assert(g_sockets[i].tcpOooBytes==0);SockClose(i);
+    // Retained data shares the RX budget, leaving room for a missing prefix.
+    i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_BUF_SIZE-4;
+    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+     struct {TcpHeader tcp;uint8_t bytes[2];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     packet.tcp.seqNum=htonl(22);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);
+     assert(g_sockets[i].tcpOooBytes==2 && TcpReceiveFree(g_sockets[i])==2);
+     packet.tcp.seqNum=htonl(20);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);}
+    assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].rxCount==Socket::RX_BUF_SIZE && g_sockets[i].tcpRcvNxt==24);
+    SockClose(i);
     assert(allocations == frees);
     std::puts("socket lifetime: PASS");
 }

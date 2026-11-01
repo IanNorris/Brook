@@ -334,7 +334,9 @@ struct Socket {
     uint32_t  rxTail;
     uint32_t  rxCount;     // bytes available
 
-    static constexpr uint32_t TCP_OOO_SLOT_COUNT = 16;
+    // Keep a bounded burst of future packets while a missing segment is
+    // retransmitted. This remains well below the receive buffer budget.
+    static constexpr uint32_t TCP_OOO_SLOT_COUNT = 64;
     static constexpr uint32_t TCP_OOO_SLOT_SIZE = ETH_MTU;
     struct TcpOooSlot {
         uint32_t seq;
