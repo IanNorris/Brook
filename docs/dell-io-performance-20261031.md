@@ -105,11 +105,35 @@ An SSD-specific depth-eight candidate was prepared from the accepted physical
 initrd with a matched new kernel and xHCI module, an explicit marker and a
 distinct payload ID. The Dell's identity-bound system updater received the
 pair in staging-only mode and reported `storage_modified=false`
-(`dell-ecm-rx8-staging-20261101/receipt.json`). It was not activated or
-booted. The previous SSD generation and root recovery remain unchanged. The
+(`dell-ecm-rx8-staging-20261101/receipt.json`). At that point it had not been
+activated or booted. The previous SSD generation and root recovery remained unchanged. The
 two-slot selector chooses the newest hash-valid generation; it does not
 automatically roll back a kernel that hangs, so recovery availability must be
 established before activation.
+
+The SSD-specific RX8 candidate was subsequently activated as generation 9 in
+slot A; generation 8 remains in the other slot and root recovery was not
+changed. The boot-pinned updater observed a new boot and the expected payload
+ID (`dell-ecm-rx8-physical-update-20261101/receipt.json`). Ethernet and the
+persistent store came up, the RX8 marker read back from the running initrd,
+and the existing SSD persistence fixture passed. The QEMU-tested candidate
+contained the RX8 module and marker; the physical kernel log did not expose
+the driver's serial-only depth message, so this is indirect rather than an
+independent runtime observation of the configured depth.
+
+On that boot, three unpaced 4 MiB RAM uploads took 2.276, 3.516 and 2.356
+seconds, and paced uploads took 0.605, 1.556 and 0.345 seconds. A verified
+download took 3.635 seconds (`network-benchmark-rx8-physical-20261101`). The
+earlier unpaced control was 6.194–8.515 seconds, but used a different kernel
+and boot, so this is encouraging, not an isolated RX-depth result. Preserve
+generation 8; installing a second candidate in its slot would overwrite the
+known-good fallback. The physical test has not yet established behavior under
+device failure or confirmed a clean shutdown and subsequent persistence.
+A further unpaced 4 MiB upload took 3.578 seconds; host `ss` sampled over
+874 KiB retransmitted before all bytes were acknowledged
+(`network-rx8-host-ss-20261101.txt`). Significant loss or delayed delivery
+therefore remains; this does not locate it within the adapter, driver, network
+stack or link.
 
 The update workflow also supports the same opt-in Linux pacing cap, with an
 explicit USB or system helper target; activation and restart remain separate
