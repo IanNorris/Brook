@@ -193,7 +193,7 @@ void WmInit();
 int WmCreateWindow(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
                    const char* title, uint8_t upscale = 1,
-                   bool focusable = true);
+                   bool focusable = true, bool focusOnCreate = true);
 
 // Remove a window (process exited or closed).
 void WmDestroyWindow(int idx);

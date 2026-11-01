@@ -785,7 +785,7 @@ void WmSetActive(bool active)
 static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
                    const char* title, uint8_t upscale,
-                   bool focusable)
+                   bool focusable, bool focusOnCreate = true)
 {
     // Find free slot
     int idx = -1;
@@ -854,16 +854,16 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     // keyboard focus on the invoking toplevel. Non-focusable windows (popups,
     // menus) already received the highest z-order above, so they'll render
     // on top of existing windows without stealing keyboard focus.
-    if (w.focusable)
+    if (w.focusable && focusOnCreate)
         FocusWindowLocked(idx);
 
     return idx;
 }
 
 int WmCreateWindow(Process* proc,int16_t x,int16_t y,uint16_t clientW,uint16_t clientH,
-                   const char* title,uint8_t upscale,bool focusable) {
+                   const char* title,uint8_t upscale,bool focusable,bool focusOnCreate) {
     VfbGuard guard;
-    return CreateWindowLocked(proc,x,y,clientW,clientH,title,upscale,focusable);
+    return CreateWindowLocked(proc,x,y,clientW,clientH,title,upscale,focusable,focusOnCreate);
 }
 
 static void DestroyWindowLocked(int idx)

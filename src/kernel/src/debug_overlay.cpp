@@ -237,7 +237,7 @@ static void KernelConsoleThread(void* /*arg*/)
         return;
     }
 
-    // Create WM window (non-focusable — read-only log display). Send it to the
+    // Create a focusable read-only log window without stealing initial focus. Send it to the
     // back so it never occludes focused application windows: the kconsole thread
     // may create this window after apps have already launched, and a passive log
     // pane stealing the top z-order would otherwise hide them.
@@ -246,7 +246,7 @@ static void KernelConsoleThread(void* /*arg*/)
     if(initialH>backingH)initialH=backingH;
     int consoleIdx = WmCreateWindow(self, 20, 60,
                    static_cast<uint16_t>(initialW),
-                   static_cast<uint16_t>(initialH), "Kernel Console", 1, false);
+                   static_cast<uint16_t>(initialH), "Kernel Console", 1, true, false);
     if (consoleIdx >= 0)
         WmSendToBack(consoleIdx);
 
@@ -279,13 +279,23 @@ static void KernelConsoleThread(void* /*arg*/)
         int n=WmInputPopOwned(self,static_cast<uint32_t>(consoleIdx+1),incarnation,events,16);
         if(n<0)return;
         for(int i=0;i<n;++i) {
-            if(events[i].type!=static_cast<uint8_t>(InputEventType::MouseScroll))continue;
-            int dy=static_cast<int8_t>(events[i].scanCode);
-            if(!dy)continue;
+            int lines=0;
+            if(events[i].type==static_cast<uint8_t>(InputEventType::MouseScroll))
+                lines=static_cast<int8_t>(events[i].scanCode)*3;
+            else if(events[i].type==static_cast<uint8_t>(InputEventType::KeyPress)) {
+                int page=visibleLines>1?static_cast<int>(visibleLines)-1:1;
+                if(events[i].scanCode==SC_EXT_PGUP)lines=page;
+                else if(events[i].scanCode==SC_EXT_PGDN)lines=-page;
+                else if(events[i].scanCode==SC_EXT_UP)lines=1;
+                else if(events[i].scanCode==SC_EXT_DOWN)lines=-1;
+                else if(events[i].scanCode==SC_EXT_HOME)lines=RING_LINES;
+                else if(events[i].scanCode==SC_EXT_END)lines=-static_cast<int>(RING_LINES);
+            }
+            if(!lines)continue;
             if(following)viewEnd=nowTotal;
             uint32_t oldest=nowTotal>RING_LINES-1?nowTotal-(RING_LINES-1):0;
             uint32_t minEnd=oldest+((nowTotal-oldest)<visibleLines?(nowTotal-oldest):visibleLines);
-            int64_t end=static_cast<int64_t>(viewEnd)-static_cast<int64_t>(dy)*3;
+            int64_t end=static_cast<int64_t>(viewEnd)-lines;
             if(end<minEnd)end=minEnd;
             if(end>nowTotal)end=nowTotal;
             viewEnd=static_cast<uint32_t>(end);following=viewEnd==nowTotal;scrolled=true;
