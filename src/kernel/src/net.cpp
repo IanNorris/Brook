@@ -810,9 +810,14 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 // ---------------------------------------------------------------------------
 
 static uint16_t g_tcpEgressCeiling = 1460;
+static bool g_tcpTwoPacketFlight = false;
 
 void NetConfigureBoot()
 {
+    if (auto* marker = VfsOpen("/etc/tcp-two-packet-flight")) {
+        VfsClose(marker);g_tcpTwoPacketFlight = true;
+        KPuts("net: two-packet TCP send flight enabled (experimental)\n");
+    }
     if (auto* marker = VfsOpen("/etc/tcp-recv-window-16k")) {
         VfsClose(marker);g_tcpReceiveWindowCap=16384;
         KPuts("net: TCP receive window cap 16384 (boot configuration)\n");
@@ -3051,6 +3056,172 @@ public:
     TcpSendOwnership& operator=(const TcpSendOwnership&) = delete;
 };
 
+// Call-local retained flight. Every exit either retires all reservations or
+// closes the stream before their payloads leave scope. The deliberately small
+// limit is an experiment, not a complete congestion-control implementation.
+static int TcpSendTwoPacketFlight(Socket& s, Process* self, const uint8_t* data,
+                                  uint32_t len, bool fromUser, uint32_t mss,
+                                  uint64_t deadline)
+{
+    struct Slot {
+        uint8_t bytes[ETH_MTU];
+        uint32_t seq = 0, len = 0, retries = 0;
+        uint64_t retryAt = 0;
+        bool submitted = false;
+    } slots[2];
+    unsigned head = 0, count = 0, limit = 2;
+    uint32_t reserved = 0, submitted = 0, acknowledged = 0;
+    int deferredError = 0;
+    SpinLockAcquire(&s.lock);
+    const uint32_t base = s.tcpSndNxt;
+    SpinLockRelease(&s.lock);
+    SocketWaitRegistration registration(s, self);
+
+    const auto finish = [&](int error) -> int {
+        Process* waiter = nullptr;
+        SpinLockAcquire(&s.lock);
+        uint32_t delta = s.tcpSndUna - base;
+        if (delta <= reserved) acknowledged = delta < submitted ? delta : submitted;
+        if (count && (s.tcpSndUna != s.tcpSndNxt || (delta <= reserved && delta > submitted)) &&
+            TcpCanSendData(s.tcpState)) {
+            s.tcpState = TcpState::Closed;
+            s.connected = false;
+            s.tcpRstRecv = true;
+            s.connectError = error < 0 ? -error : 5;
+            s.tcpUnackedSegs = 0;
+            s.tcpLastDataTick = 0;
+            waiter = TakeSocketWaiterLocked(s);
+        }
+        SpinLockRelease(&s.lock);
+        if (waiter) {
+            __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(waiter);
+            ProcessUnref(waiter);
+        }
+        return acknowledged ? static_cast<int>(acknowledged) : error;
+    };
+
+    for (;;) {
+        if (TcpSendInterrupted(self)) return finish(-4);
+        const uint64_t now = ApicTickCount();
+        SpinLockAcquire(&s.lock);
+        const uint32_t una = s.tcpSndUna;
+        uint32_t delta = una - base;
+        if (delta <= reserved && delta > submitted) {
+            SpinLockRelease(&s.lock);
+            return finish(-5); // ACK crossed a reservation rejected locally
+        }
+        if (delta <= submitted) acknowledged = delta;
+        while (count && TcpSeqAcked(una, slots[head].seq + slots[head].len)) {
+            head = (head + 1) % 2;
+            --count;
+        }
+        if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
+            SpinLockRelease(&s.lock);
+            return acknowledged ? static_cast<int>(acknowledged) : -104;
+        }
+        if (deferredError && !count) {
+            SpinLockRelease(&s.lock);
+            return acknowledged ? static_cast<int>(acknowledged) : deferredError;
+        }
+        if (acknowledged == len) { SpinLockRelease(&s.lock); return static_cast<int>(acknowledged); }
+        if (now >= deadline) {
+            SpinLockRelease(&s.lock);
+            return finish(-110);
+        }
+
+        // A reserved-but-unsubmitted entry must be retried before another
+        // sequence range is allocated. On RTO send only the oldest suffix.
+        int unsentIndex = -1;
+        for (unsigned n=0;n<count;++n) {
+            const unsigned index = (head+n)%2;
+            if (!slots[index].submitted) { unsentIndex = static_cast<int>(index); break; }
+        }
+        int sendIndex = -1;
+        // A repeatedly busy local NIC must not starve an older packet's RTO.
+        if (count && slots[head].submitted && now >= slots[head].retryAt)
+            sendIndex = static_cast<int>(head);
+        if (sendIndex < 0 && unsentIndex >= 0 && now >= slots[unsentIndex].retryAt) {
+            const Slot& slot = slots[unsentIndex];
+            const uint32_t before = slot.seq - una;
+            if (before <= s.tcpSndWnd && slot.len <= s.tcpSndWnd-before) sendIndex = unsentIndex;
+        }
+        if (sendIndex >= 0) {
+            Slot& slot = slots[sendIndex];
+            const uint32_t offset = TcpSeqAfter(una, slot.seq) ? una - slot.seq : 0;
+            const uint32_t seq = slot.seq + offset, bytes = slot.len - offset;
+            const auto snapshot = CaptureTcpTxLocked(s);
+            const bool retry = slot.submitted;
+            if (retry) limit = 1;
+            SpinLockRelease(&s.lock);
+            const int result = TcpSendSnapshot(s, snapshot, seq, TCP_ACK | TCP_PSH,
+                                               slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit");
+            const uint64_t after = ApicTickCount();
+            if (!result) {
+                if (!retry) submitted += slot.len;
+                else ++slot.retries;
+                slot.submitted = true;
+                const uint32_t shift = slot.retries < 4 ? slot.retries : 4;
+                slot.retryAt = after + (200ULL << shift);
+            } else if (result == -11) {
+                slot.retryAt = after + 10;
+            } else return finish(result < 0 ? result : -5);
+            continue;
+        }
+
+        const uint32_t outstanding = s.tcpSndNxt - una;
+        const uint32_t credit = s.tcpSndWnd > outstanding ? s.tcpSndWnd - outstanding : 0;
+        // Do not stage another entry while any reservation has not reached
+        // the NIC. In particular, never build a hole behind local EAGAIN.
+        if (!deferredError && reserved < len && count < limit && credit && unsentIndex < 0) {
+            uint32_t chunk = len - reserved;
+            if (chunk > mss) chunk = mss;
+            if (chunk > credit) chunk = credit;
+            SpinLockRelease(&s.lock);
+            Slot& slot = slots[(head + count) % 2];
+            uint64_t source;
+            if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(reserved), &source)) {
+                if (count) { deferredError = -14; continue; }
+                return finish(-14);
+            }
+            if (fromUser) {
+                if (!CopyFromUser(slot.bytes, source, chunk)) {
+                    if (count) { deferredError = -14; continue; }
+                    return finish(-14);
+                }
+            } else memcpy(slot.bytes, reinterpret_cast<const void*>(source), chunk);
+            if (TcpSendInterrupted(self)) return finish(-4);
+            if (ApicTickCount() >= deadline) return finish(-110);
+
+            SpinLockAcquire(&s.lock);
+            if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
+                SpinLockRelease(&s.lock); return finish(-104);
+            }
+            const uint32_t currentOutstanding = s.tcpSndNxt - s.tcpSndUna;
+            const uint32_t currentCredit = s.tcpSndWnd > currentOutstanding ? s.tcpSndWnd-currentOutstanding : 0;
+            if (chunk > currentCredit) chunk = currentCredit;
+            if (!chunk) { SpinLockRelease(&s.lock); continue; }
+            slot.seq = s.tcpSndNxt; slot.len = chunk; slot.retries = 0;
+            slot.submitted = false; slot.retryAt = 0;
+            s.tcpSndNxt += chunk;
+            reserved += chunk; ++count;
+            SpinLockRelease(&s.lock);
+            continue;
+        }
+
+        // Another reader can replace the shared waiter, so do not rely on a
+        // window update wakeup alone for forward progress.
+        uint64_t wake = now + 20;
+        if (deadline < wake) wake = deadline;
+        if (count && slots[head].retryAt > now && slots[head].retryAt < wake) wake = slots[head].retryAt;
+        if (unsentIndex >= 0 && slots[unsentIndex].retryAt > now && slots[unsentIndex].retryAt < wake) wake = slots[unsentIndex].retryAt;
+        SetSocketWaiterLocked(s, self);
+        self->wakeupTick = wake;
+        SpinLockRelease(&s.lock);
+        SchedulerBlockInterruptible(self);
+    }
+}
+
 static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUser)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
@@ -3078,6 +3249,8 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
     uint32_t sent = 0;
     uint8_t staged[ETH_MTU];
     if (!mss || mss > sizeof(staged)) return -22;
+    if (g_tcpTwoPacketFlight && len)
+        return TcpSendTwoPacketFlight(s, self, data, len, fromUser, mss, deadline);
 
     // Snapshot the negotiated MSS; never hold the socket lock across network
     // submission or an ACK wait. The optional ceiling is boot-time immutable.

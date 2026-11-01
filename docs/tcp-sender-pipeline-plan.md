@@ -74,3 +74,23 @@ cross-page first-chunk fault, a later-chunk fault with partial progress, and
 continued stream integrity. A hosted retry test mutates the source after the
 first send and confirms that the retransmission keeps the original byte.
 UDP sendmsg identity and generic writev metadata races are not addressed.
+
+An experimental, boot-opt-in two-packet flight is enabled by
+`/etc/tcp-two-packet-flight`; the default remains the single-packet sender.
+It retains both payloads locally, limits new reservations to peer-window
+credit, retries local `EAGAIN` without reserving a new range, and retransmits
+the oldest missing suffix with a one-packet limit after RTO. It aborts rather
+than abandoning outstanding data on interruption or deadline, and drains
+previously submitted data after a later user-copy fault. It rechecks waiters
+periodically because receive and send share one waiter slot. A zero window
+waits only until the bounded operation deadline; TCP persist probing is not
+implemented. An unsubmitted slot is retried only when its entire length fits
+the reopened window. A fixed two-packet limit is not congestion control.
+
+Hosted actual-code tests cover cumulative and partial ACKs, wraparound,
+local submission failures, rejected-unsent ACKs, shrinking/reopening windows,
+loss and oldest-suffix retransmission, copy faults and interruption with data
+outstanding. QEMU USB Ethernet acceptance exercises concurrent writers,
+close stress and user-copy faults, and its packet capture confirms successive
+payloads before their ACK. Physical throughput and wider network behavior are
+not yet verified; keep the known-good SSD recovery slot available.

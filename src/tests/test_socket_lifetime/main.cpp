@@ -17,12 +17,26 @@ std::atomic<bool> acknowledgeFin{false};
 std::atomic<unsigned> sentFins{0};
 std::atomic<unsigned> acknowledgeDataCount{0};
 std::atomic<unsigned> skipDataAcks{0};
+std::atomic<unsigned> failDataSubmissions{0};
+std::atomic<unsigned> failDataAttempt{0};
+std::atomic<uint32_t> rejectDataSeq{0};
+std::atomic<unsigned> rejectDataRemaining{0};
+std::atomic<uint64_t> firstDataRetryTick{0};
+std::atomic<bool> ackUnsentOnFailure{false},shrinkWindowOnFailure{false};
+std::atomic<uint32_t> failureAckOverride{0};
+std::atomic<uint16_t> dataAckWindow{65535};
+std::atomic<bool> signalOnDataSend{false};
+std::atomic<uint64_t> lastDataSubmitTick{0};
+std::atomic<unsigned> flightPartialMode{0},flightPartialCount{0};
+std::atomic<uint32_t> flightRetrySeq{0},flightRetryLen{0};
+std::atomic<int> windowUpdateSocket{-1};
+std::atomic<uint64_t> windowUpdateTick{0};
 std::atomic<int> failUserCopyAfter{-1};
 std::atomic<uint8_t*> mutateUserOnSend{nullptr};
 std::atomic<unsigned> stagedPayloadCount{0};
 std::atomic<uint8_t> stagedPayloads[2]{};
 std::atomic<unsigned> capturedDataCount{0};
-std::atomic<uint32_t> capturedDataSeq[2]{};
+std::atomic<uint32_t> capturedDataSeq[4]{};
 std::atomic<int> deadlineAckSocket{-1};
 std::atomic<uint64_t> deadlineAckTick{0};
 std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
@@ -62,6 +76,13 @@ uint64_t ProcessPendingSignals(Process* p) { return __atomic_load_n(&p->sigPendi
 uint64_t PosixTimerPending(Process*) { return 0; }
 void SchedulerBlock(Process* p) {
     ticks = p ? p->wakeupTick : ticks.load() + 50;
+    if (windowUpdateSocket.load()>=0 && ticks.load()>=windowUpdateTick.load()) {
+        ticks=windowUpdateTick.load();int idx=windowUpdateSocket.exchange(-1);
+        if(idx>=0){auto& socket=g_sockets[idx];Ipv4Header ip{};ip.srcIp=socket.remoteIp;ip.dstIp=socket.localIp;
+            TcpHeader ack{};ack.srcPort=socket.remotePort;ack.dstPort=socket.localPort;
+            ack.seqNum=htonl(socket.tcpRcvNxt);ack.ackNum=htonl(socket.tcpSndUna);
+            ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));}
+    }
     if (ticks.load() >= deadlineAckTick.load()) {
         int idx=deadlineAckSocket.exchange(-1);
         if(idx>=0) {
@@ -90,10 +111,39 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
     const auto* tcp = static_cast<const TcpHeader*>(data);
     if (tcp->flags & TCP_FIN) ++sentFins;
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
+        lastDataSubmitTick=ticks.load();
         const unsigned index=capturedDataCount.fetch_add(1);
-        if(index<2)capturedDataSeq[index]=ntohl(tcp->seqNum);
+        if(index<4)capturedDataSeq[index]=ntohl(tcp->seqNum);
+        if(index && ntohl(tcp->seqNum)==10)firstDataRetryTick=ticks.load();
         uint8_t* mutate=mutateUserOnSend.load();
         if(mutate){const unsigned n=stagedPayloadCount.fetch_add(1);if(n<2)stagedPayloads[n]=static_cast<const uint8_t*>(data)[sizeof(TcpHeader)];if(n==0)*mutate=9;}
+        if(rejectDataRemaining.load() && ntohl(tcp->seqNum)==rejectDataSeq.load()){
+            --rejectDataRemaining;return -11;
+        }
+        if(failDataSubmissions.load() || (failDataAttempt.load() && index+1==failDataAttempt.load())){
+            if(failDataSubmissions.load())--failDataSubmissions;
+            failDataAttempt=0;
+            if(ackUnsentOnFailure.exchange(false) || shrinkWindowOnFailure.load()){
+                const bool shrink=shrinkWindowOnFailure.exchange(false);
+                Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
+                TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;ack.seqNum=tcp->ackNum;
+                const uint32_t override=failureAckOverride.exchange(0);
+                ack.ackNum=htonl(override?override:ntohl(tcp->seqNum)+(shrink?0:len-sizeof(TcpHeader)));
+                ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(shrink?0:65535);HandleTcp(&ip,&ack,sizeof(ack));
+            }
+            return -11;
+        }
+        if(flightPartialMode.load()){
+            unsigned n=flightPartialCount.fetch_add(1);
+            unsigned mode=flightPartialMode.load();
+            if((mode==1 && n==0) || (mode==2 && n==1) || n==2){Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
+                TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;ack.seqNum=tcp->ackNum;
+                if(n!=2)ack.ackNum=htonl(ntohl(tcp->seqNum)+10);
+                else {flightRetrySeq=ntohl(tcp->seqNum);flightRetryLen=len-sizeof(TcpHeader);ack.ackNum=htonl(1082);}
+                ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));}
+            return 0;
+        }
+        if(signalOnDataSend.exchange(false))__atomic_store_n(&currentProcess->sigPending,1,__ATOMIC_RELEASE);
     }
     if (pauseTransmit.load() && (!pauseOnlyPureAck.load() || (tcp->flags==TCP_ACK && len==sizeof(TcpHeader)))) {
         transmitting = true;
@@ -125,7 +175,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
         TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;
         ack.seqNum=tcp->ackNum;ack.ackNum=htonl(ntohl(tcp->seqNum)+len-sizeof(TcpHeader));
-        ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));
+        ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(dataAckWindow.load());HandleTcp(&ip,&ack,sizeof(ack));
     }
     assert(len >= sizeof(TcpHeader));
     return 0;
@@ -428,6 +478,117 @@ int main() {
     assert(deadlineAckSocket==-1 && g_sockets[i].tcpSndUna==11);
     assert(g_sockets[i].tcpState==TcpState::Established && SockGetConnectError(i)==0);
     currentProcess=nullptr;SockClose(i);delete waiter;
+    // The optional flight emits two segments before the first cumulative ACK.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;skipDataAcks=1;acknowledgeDataCount=1;capturedDataCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==2 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 && ticks==1);
+    assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A rejected second submission retries its original range and payload.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failDataAttempt=2;skipDataAcks=1;acknowledgeDataCount=1;capturedDataCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==3 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 && capturedDataSeq[2]==546);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Sequence arithmetic across wrap still permits two outstanding packets.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_sockets[i].tcpSndNxt=g_sockets[i].tcpSndUna=0xffffff00u;
+    g_tcpTwoPacketFlight=true;skipDataAcks=1;acknowledgeDataCount=1;capturedDataCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_sockets[i].tcpSndUna==0xffffff00u+1072u && capturedDataCount==2);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A failed second copy drains the first outstanding packet and returns
+    // its acknowledged bytes, preserving the stream.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failUserCopyAfter=1;deadlineAckTick=11;deadlineAckSocket=i;
+    {uint8_t data[1072]{};assert(SockSendUser(i,reinterpret_cast<uint64_t>(data),sizeof(data))==536);}
+    assert(deadlineAckSocket==-1 && g_sockets[i].tcpState==TcpState::Established && SockGetConnectError(i)==0);
+    failUserCopyAfter=-1;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A pending signal while bytes are outstanding closes the stream rather
+    // than abandoning retained retransmission data.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;signalOnDataSend=true;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==-4);}
+    assert(g_sockets[i].tcpState==TcpState::Closed && SockGetConnectError(i)==4);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A peer ACK cannot turn an EAGAIN-rejected local reservation into a
+    // successful write. The compromised stream is made terminal.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failDataSubmissions=1;ackUnsentOnFailure=true;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==-5);}
+    assert(g_sockets[i].tcpState==TcpState::Closed && SockGetConnectError(i)==5);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A local retry waits when the peer closes its window after reservation.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failDataSubmissions=1;shrinkWindowOnFailure=true;
+    windowUpdateTick=51;windowUpdateSocket=i;acknowledgeDataCount=1;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==1);}
+    assert(windowUpdateSocket==-1 && lastDataSubmitTick>=51 && g_sockets[i].tcpSndUna==11);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A window-blocked unsent second slot must not suppress retransmission
+    // of a lost first slot. Reopen the window only after that retransmission.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;capturedDataCount=0;skipDataAcks=1;acknowledgeDataCount=2;
+    failDataAttempt=2;shrinkWindowOnFailure=true;failureAckOverride=10;dataAckWindow=0;
+    windowUpdateTick=251;windowUpdateSocket=i;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==4 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 &&
+           capturedDataSeq[2]==10 && capturedDataSeq[3]==546);
+    assert(windowUpdateSocket==-1 && lastDataSubmitTick>=251);
+    dataAckWindow=65535;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Repeated local EAGAIN for the second packet cannot starve the first
+    // packet's retransmission timer.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;capturedDataCount=0;skipDataAcks=1;acknowledgeDataCount=2;
+    rejectDataSeq=546;rejectDataRemaining=25;firstDataRetryTick=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(firstDataRetryTick==201 && rejectDataRemaining==0);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Partial ACK followed by loss retries only the oldest missing suffix.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;flightPartialMode=1;flightPartialCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(flightPartialCount==3 && flightRetrySeq==20 && flightRetryLen==526);
+    assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
+    flightPartialMode=0;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;flightPartialMode=2;flightPartialCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(flightPartialCount==3 && flightRetrySeq==556 && flightRetryLen==526);
+    flightPartialMode=0;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Zero-window wait consumes no sequence space; a later window-only ACK
+    // permits progress, while a persistent zero window ends without aborting.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=0;
+    g_tcpTwoPacketFlight=true;windowUpdateTick=11;windowUpdateSocket=i;acknowledgeDataCount=1;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==1);}
+    assert(windowUpdateSocket==-1 && g_sockets[i].tcpSndNxt==11);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=0;g_tcpTwoPacketFlight=true;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==-110);}
+    assert(g_sockets[i].tcpSndNxt==10 && g_sockets[i].tcpState==TcpState::Established);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Local EAGAIN retries the same sequence rather than reserving a hole.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failDataSubmissions=1;acknowledgeDataCount=2;capturedDataCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==3 && capturedDataSeq[0]==10 && capturedDataSeq[1]==10);
+    assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // Previously ACKed chunks are reported even when the next one times out.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;acknowledgeDataCount=1;
