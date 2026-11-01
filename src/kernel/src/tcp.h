@@ -47,9 +47,9 @@ inline uint16_t TcpPeerMss(const uint8_t* options, uint32_t length)
 
 // Window fields in SYN and SYN-ACK are never scaled. Subsequent segments
 // use scaling only when both endpoints offered it during the handshake.
-inline uint16_t TcpAdvertisedWindow(uint32_t freeBytes, uint8_t scale, uint8_t flags)
+inline uint16_t TcpAdvertisedWindow(uint32_t freeBytes, uint8_t scale, uint8_t flags, uint32_t cap=~uint32_t(0))
 {
-    uint32_t window = freeBytes >> ((flags & TCP_SYN) ? 0 : scale);
+    uint32_t window = (freeBytes<cap?freeBytes:cap) >> ((flags & TCP_SYN) ? 0 : scale);
     return static_cast<uint16_t>(window > 65535u ? 65535u : window);
 }
 

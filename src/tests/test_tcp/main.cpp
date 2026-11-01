@@ -466,6 +466,11 @@ int main()
     ASSERT_EQ(TcpAdvertisedWindow(524288, 3, 0), 65535);
     ASSERT_EQ(TcpAdvertisedWindow(32000, 3, TCP_SYN | TCP_ACK), 32000);
     ASSERT_EQ(TcpAdvertisedWindow(32000, 3, TCP_ACK), 4000);
+    ASSERT_EQ(TcpAdvertisedWindow(524288, 3, TCP_SYN, 16384), 16384);
+    ASSERT_EQ(TcpAdvertisedWindow(524288, 3, TCP_ACK, 16384), 2048);
+    ASSERT_EQ(TcpAdvertisedWindow(16001, 3, TCP_ACK, 16384), 2000);
+    ASSERT_EQ(TcpAdvertisedWindow(0, 0, TCP_ACK, 16384), 0);
+    ASSERT_EQ(TcpAdvertisedWindow(8192, 0, TCP_ACK, 16384), 8192);
     Socket negotiation = MakeSynSentSocket();
     negotiation.tcpRcvWndScale = 3;
     const uint8_t noScale[] = {2, 4, 0x05, 0xb4};

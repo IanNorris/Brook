@@ -330,4 +330,28 @@ handling and pinned ownership. Existing transfer-ring wrap tests and QEMU
 TCP/UDP, exact-maxpacket, USB storage and HID coexistence tests passed at
 TX16; the default TX8 path also passed in QEMU. These tests do not prove the
 physical controller's ordering or demonstrate a throughput improvement. The
-experiment has not yet been deployed to the Dell.
+experiment was not yet deployed to the Dell at that point.
+
+The TX16 candidate was subsequently activated in slot A and booted on the
+Dell, with the verified recovery payload retained in slot B. Its marker and
+payload ID were confirmed. Unpaced 4 MiB transfers took 2.49, 2.98 and 3.05 s;
+paced transfers took 0.346, 0.335 and 0.346 s. All digests matched and both
+`tx_busy` and the covered TCP ACK failure counter stayed at zero. TX8's
+unpaced times were 2.73, 3.77 and 3.01 s and added 24 failures across the three
+runs. TX16 therefore removed the measured local queue-full failures in this
+small sample, but did not produce a clear unpaced throughput improvement.
+An additional unpaced TX16 upload took 1.57 s; host `ss` sampled 399,215 bytes
+retransmitted before completion. That independent transfer and the variability
+in timings prevent treating the two configurations as a precise causal
+comparison. Host pacing is a diagnostic aid, not a general fix for browser
+traffic from arbitrary servers.
+
+A separate opt-in boot marker, `/etc/tcp-recv-window-16k`, caps the TCP
+receive window at 16 KiB before window scaling. SYN fields remain unscaled;
+zero windows and actual receive capacity are retained. This is a burst-control
+experiment, not a claim of loss-free TCP or a bandwidth guarantee. The cap is
+fixed before network initialization and may reduce performance over paths with
+higher RTT. Host TCP tests and QEMU USB networking passed with and without the
+cap; the QEMU packet capture checked the effective negotiated window after
+scaling. They did not establish non-shrinking-window correctness or exercise a
+full zero-window/reopen scenario. Physical testing is still outstanding.

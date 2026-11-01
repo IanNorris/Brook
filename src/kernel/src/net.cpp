@@ -219,6 +219,8 @@ static volatile uint16_t g_ipId = 1;
 static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 
 static uint32_t TcpReceiveFree(const Socket& s);
+// Fixed before networking is configured; never change the cap on live flows.
+static uint32_t g_tcpReceiveWindowCap=~uint32_t(0);
 
 struct TcpTxSnapshot {
     uint32_t localIp, remoteIp, ack, nextSeq, iss, ownerPid;
@@ -230,8 +232,8 @@ static TcpTxSnapshot CaptureTcpTxLocked(const Socket& s)
     uint32_t free = TcpReceiveFree(s);
     return {s.localIp, s.remoteIp, s.tcpRcvNxt, s.tcpSndNxt, s.tcpSndIss,
             s.ownerPid, s.localPort, s.remotePort,
-            TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0),
-            TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN), s.tcpRcvWndScale};
+            TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0, g_tcpReceiveWindowCap),
+            TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN, g_tcpReceiveWindowCap), s.tcpRcvWndScale};
 }
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
@@ -802,6 +804,10 @@ static uint16_t g_tcpEgressCeiling = 1460;
 
 void NetConfigureBoot()
 {
+    if (auto* marker = VfsOpen("/etc/tcp-recv-window-16k")) {
+        VfsClose(marker);g_tcpReceiveWindowCap=16384;
+        KPuts("net: TCP receive window cap 16384 (boot configuration)\n");
+    }
     if (auto* marker = VfsOpen("/etc/tcp-egress-1200")) {
         VfsClose(marker);
         g_tcpEgressCeiling = 1200;
@@ -4013,6 +4019,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
         }
         r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));
+        r.text(",");r.field("tcp_recv_window_cap_bytes",g_tcpReceiveWindowCap==~uint32_t(0)?0:g_tcpReceiveWindowCap);
         r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge stats")) {

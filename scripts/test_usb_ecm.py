@@ -11,6 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',required=True,type=Path)
 ap.add_argument('--rx-depth8',action='store_true',help='Exercise the opt-in eight-request ECM receive path')
 ap.add_argument('--tx-depth16',action='store_true',help='Exercise the opt-in sixteen-frame ECM transmit path')
+ap.add_argument('--tcp-window16',action='store_true',help='Exercise the opt-in 16 KiB TCP receive-window cap')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
 tcp=socket.socket();tcp.bind(('127.0.0.1',0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
@@ -53,6 +54,7 @@ run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
 if args.tx_depth16:run('mcopy','-i',initrd,marker,'::ETC/usb-net-tx16')
+if args.tcp_window16:run('mcopy','-i',initrd,marker,'::ETC/tcp-recv-window-16k')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
 with fixture.open('xb') as f:
@@ -118,6 +120,7 @@ try:
   line=next(line for line in reply.splitlines() if line.startswith(b'{'))
   report=json.loads(line);stats=report['network_driver_snapshot']
   assert report['tcp_ack_submit_failures']>=0,report
+  assert report['tcp_recv_window_cap_bytes']==(16384 if args.tcp_window16 else 0),report
   assert stats['rx_depth']==(8 if args.rx_depth8 else 1),stats
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
@@ -133,14 +136,36 @@ try:
  q.call('quit');assert owner.wait(timeout=15)==0
  for thread in threads:thread.join(2)
  assert not errors and set(completed)=={'tcp','udp'},(errors,completed)
- sizes=[];raw=(base/'wire.pcap').read_bytes();at=24
+ sizes=[];windows=[];scales={};raw=(base/'wire.pcap').read_bytes();at=24
  assert raw[:4]==b'\xd4\xc3\xb2\xa1'
  while at+16<=len(raw):
   _,_,captured,_=struct.unpack_from('<4I',raw,at);at+=16
   packet=raw[at:at+captured];at+=captured
-  if len(packet)>=34 and packet[12:14]==b'\x08\x00' and packet[26:30]==bytes([10,0,2,15]):sizes.append(len(packet))
+  if len(packet)>=34 and packet[12:14]==b'\x08\x00':
+   outbound=packet[26:30]==bytes([10,0,2,15]);inbound=packet[30:34]==bytes([10,0,2,15])
+   if outbound:sizes.append(len(packet))
+   ip_header=(packet[14]&15)*4;tcp_offset=14+ip_header
+   if (outbound or inbound) and packet[23]==6 and len(packet)>=tcp_offset+20:
+    src,dst=struct.unpack_from('!HH',packet,tcp_offset);flags=packet[tcp_offset+13]
+    flow=(src,packet[30:34],dst) if outbound else (dst,packet[26:30],src)
+    if flags&2:
+     hdr_len=(packet[tcp_offset+12]>>4)*4;opts=packet[tcp_offset+20:tcp_offset+hdr_len];i=0;scale=None
+     while i<len(opts):
+      kind=opts[i]
+      if kind==0:break
+      if kind==1:i+=1;continue
+      if i+1>=len(opts) or opts[i+1]<2 or i+opts[i+1]>len(opts):break
+      if kind==3 and opts[i+1]==3:scale=min(opts[i+2],14)
+      i+=opts[i+1]
+     scales.setdefault(flow,{})['guest' if outbound else 'peer']=scale
+    if outbound:windows.append((flow,flags,struct.unpack_from('!H',packet,tcp_offset+14)[0]))
  assert 64 in sizes and 1024 in sizes,sorted(set(sizes))
- result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
+ if args.tcp_window16:
+  assert any(flags&2 for _,flags,_ in windows) and any((flags&16) and not(flags&2) for _,flags,_ in windows),windows
+  for flow,flags,window in windows:
+   pair=scales.get(flow,{});shift=pair.get('guest') if pair.get('guest') is not None and pair.get('peer') is not None else 0
+   assert (window if flags&2 else window<<shift)<=16384,(flow,flags,window,shift)
+ result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
   idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True)
  (base/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('USB_ECM_ACCEPTANCE_PASS',flush=True)
 finally:
