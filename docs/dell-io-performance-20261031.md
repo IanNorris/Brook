@@ -31,6 +31,14 @@ link capacity. Pacing reduces burst-related loss in these observations but
 does not establish whether loss occurs in the adapter, driver, TCP processing
 or another part of the path.
 
+An alternating same-boot repeat (three runs each, 4 MiB random RAM source)
+produced unpaced times of 8.515, 6.194 and 7.790 seconds; interleaved runs
+with a requested 16 MB/s cap took 0.339, 1.038 and 0.345 seconds. Each guest
+receipt reported the expected SHA-256. These are helper binary-phase times,
+not direct wire-speed measurements. Evidence:
+`build/hardware/net-alternating-20261101-results.json` and the six associated
+receipts. The current Dell kernel was unchanged during this comparison.
+
 `scripts/hardware_transfer.py` accepts `--pace-bytes-per-second 16000000` for
 an explicitly paced Linux host-to-guest upload. It remains opt-in and applies
 only to this helper's upload socket; it does not improve general downloads or
