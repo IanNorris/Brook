@@ -221,6 +221,7 @@ int main(int argc,char** argv){
     assert(FatObjectAccess(file,2,false)==-30);
     assert(!FatObjectOpen(file,VFS_O_WRITE,&error) && error==-30);
     assert(!FatObjectCreate(root,"forbidden",VFS_O_WRITE,0600,&error) && error==-30);
+    assert(FatObjectMkdir(root,"forbidden-dir",0755)==-30);
     auto* other=FatObjectOpen(file,VFS_O_STREAM,&error);assert(other && FatFsFileSourceReadOnly(other));closeNode(other);
     VfsObjectRelease(file);VfsObjectRelease(root);
     assert(FatFsUnmount(mount)==-16);closeNode(stream);
@@ -264,6 +265,9 @@ int main(int argc,char** argv){
     assert(!FatRootObject(mount,0,&root));assert(!FatObjectChild(root,"network-storage-image.img",&file));
     assert(!FatObjectOpen(file,VFS_O_READ,&error) && error==-16);
     assert(!FatObjectOpen(file,VFS_O_WRITE|VFS_O_READWRITE,&error) && error==-16);
+    assert(!FatObjectMkdir(root,"slot-dir-while-leased",0755));
+    VfsObject* slotDir=nullptr;assert(!FatObjectChild(root,"slot-dir-while-leased",&slotDir));
+    VfsObjectRelease(slotDir);
     at=0;assert(owner->ops->read(owner,probe,sizeof(probe),&at)==-16);
     assert(owner->ops->write(owner,"bad",3,&at)==-16 && at==0);
     assert(owner->ops->truncate(owner,0)==-16);
@@ -295,7 +299,7 @@ int main(int argc,char** argv){
     assert(diskReads-beforeRandomReads<=36); // retained extent map, not repeated FAT walks
     // Source I/O errors are sticky and never turn into a successful fsync or
     // release. Fork isolates deliberately unreleasable error-state fixtures.
-    for(unsigned fault=0;fault<5;++fault){
+    for(unsigned fault=0;fault<7;++fault){
         const pid_t child=fork();assert(child>=0);
         if(!child){
             if(fault==0){failRead=true;assert(FatFsImageRead(lease,512*500,readback.data(),512)==-5);failRead=false;}
@@ -303,6 +307,12 @@ int main(int argc,char** argv){
             if(fault==2){failSync=true;assert(FatFsImageFlush(lease)==-5);failSync=false;}
             if(fault==3){failSync=true;assert(FatFsSync(mount)==-5);failSync=false;}
             if(fault==4){failSync=true;assert(owner->ops->fsync(owner)==-5);failSync=false;}
+            if(fault==5){VfsObject* rootObj=nullptr;assert(!FatRootObject(mount,0,&rootObj));
+                failSync=true;assert(FatObjectMkdir(rootObj,"mkdir-sync-failure",0755)==-5);failSync=false;
+                VfsObjectRelease(rootObj);}
+            if(fault==6){VfsObject* rootObj=nullptr;assert(!FatRootObject(mount,0,&rootObj));
+                failWrite=true;assert(FatObjectMkdir(rootObj,"mkdir-write-failure",0755)==-5);failWrite=false;
+                VfsObjectRelease(rootObj);}
             assert(FatFsImageFlush(lease)==-5 && FatFsReleaseImageLease(lease)==-5);
             assert(owner->ops->deny_mapping && static_cast<FatOpenFile*>(owner->priv)->imageLease==lease);
             assert(FatFsImageRead(lease,0,readback.data(),512)==-5);

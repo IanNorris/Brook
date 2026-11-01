@@ -41,6 +41,10 @@ int main(int argc,char** argv){
     makeFile("0:/dir/meaningfully-long-name.txt","original");makeFile("0:/dir/empty","");
     FF_OBJECT root{},held{},file{},empty{},after{},parent{};
     assert(f_object_root(&fs,&root)==FR_OK);
+    assert(f_object_mkdir(&root,"retained-root-child")==FR_OK);
+    FF_OBJECT rootChild{},rootAgain{};
+    assert(f_object_lookup(&root,"retained-root-child",&rootChild)==FR_OK);
+    assert(f_object_parent(&rootChild,&rootAgain)==FR_OK && rootAgain.object.sclust==root.object.sclust);
     assert(f_object_lookup(&root,"dir",&held)==FR_OK);
     assert(f_object_lookup(&held,"meaningfully-long-name.txt",&file)==FR_OK);
     assert(f_object_lookup(&held,"empty",&empty)==FR_OK && empty.object.sclust==0);
@@ -81,6 +85,14 @@ int main(int argc,char** argv){
     assert(f_stat("0:/dir/Fresh retained child.txt",nullptr)==FR_NO_FILE);
     assert(f_object_create(&held,"bad/name",&created,FA_WRITE)==FR_INVALID_NAME && !created.obj.fs);
     assert(f_object_create(&held,"empty",&created,FA_WRITE)==FR_EXIST && !created.obj.fs);
+    assert(f_object_mkdir(&held,"New retained directory")==FR_OK);
+    assert(f_stat("0:/parent/moved/New retained directory",nullptr)==FR_OK);
+    assert(f_stat("0:/dir/New retained directory",nullptr)==FR_NO_FILE);
+    assert(f_object_mkdir(&held,"new RETAINED directory")==FR_EXIST);
+    assert(f_object_mkdir(&held,"bad/name")==FR_INVALID_NAME);
+    assert(f_object_mkdir(&file,"child")==FR_NO_PATH);
+    FF_OBJECT made{};assert(f_object_lookup(&held,"New retained directory",&made)==FR_OK);
+    assert(f_object_parent(&made,&after)==FR_OK && after.object.sclust==held.object.sclust);
     assert(f_object_lookup(&file,"child",&after)==FR_NO_PATH && !after.object.fs);
     for(const char* invalid: {".","..","child/name","child\\name","0:name","name\nrest"})assert(f_object_lookup(&held,invalid,&after)==FR_INVALID_NAME && !after.object.fs);
     FF_OBJECT stale=file;--stale.object.id;

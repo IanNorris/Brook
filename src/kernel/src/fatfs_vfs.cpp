@@ -104,12 +104,16 @@ struct FatOpenFile {
 // mount/drive, so directory and mount-wide flush failures can find all affected
 // image owners without performing namespace lookup inside I/O.
 static FatFsMountData* g_imageLeaseMounts[FF_VOLUMES]{};
-static int FlushFatDriveLocked(uint8_t drive)
+static void PoisonFatDriveLocked(uint8_t drive,int error)
 {
-    const int error=FatFsFlushDrive(drive);
     if(error && drive<FF_VOLUMES && g_imageLeaseMounts[drive])
         for(auto* file=g_imageLeaseMounts[drive]->allFiles;file;file=file->allNext)
             if(file->imageLease && !file->imageLease->error)file->imageLease->error=error;
+}
+static int FlushFatDriveLocked(uint8_t drive)
+{
+    const int error=FatFsFlushDrive(drive);
+    PoisonFatDriveLocked(drive,error);
     return error;
 }
 
@@ -1334,6 +1338,18 @@ static Vnode* FatObjectCreate(VfsObject* parent,const char* name,int flags,uint1
     if(*error){kfree(node);kfree(file);kfree(identity);return nullptr;}
     return node;
 }
+static int FatObjectMkdir(VfsObject* parent,const char* name,uint16_t)
+{
+    auto* dir=static_cast<FatPathObject*>(parent->priv);
+    if(!dir->directory)return -20;
+    if(dir->mount->intrinsicReadOnly)return -30;
+    KMutexLock(&g_fatLock);
+    int error=FatFlushWritersLocked(dir->mount);
+    if(!error){FRESULT result=f_object_mkdir(&dir->location,name);
+        if(result!=FR_OK){error=result==FR_EXIST?-17:FrToErrno(result);
+            if(error==-FVFS_EIO)PoisonFatDriveLocked(dir->mount->pdrv,error);}}
+    KMutexUnlock(&g_fatLock);return error;
+}
 // Current-name reporting by cluster identity. The namespace transaction
 // excludes rename; the FAT mutex protects parent scans and the LFN workspace.
 // This string is never used to reopen or mutate a retained directory.
@@ -1424,7 +1440,7 @@ static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
 }
 static const VfsObjectOps g_fatObjectOps={
     .destroy=FatObjectDestroy,.stat=FatObjectStat,.access=FatObjectAccess,
-    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,
+    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,.mkdir=FatObjectMkdir,
     .directory_path=FatObjectDirectoryPath,.object_path=FatObjectPath,.entry_parent=FatObjectEntryParent,
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}

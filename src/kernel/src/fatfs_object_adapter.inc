@@ -239,6 +239,54 @@ FRESULT f_object_create (const FF_OBJECT* parent, const TCHAR* name, FIL* out, B
     return res;
 }
 
+/* Create only beneath the retained parent, under the FAT and namespace locks.
+ * FAT12/16/32 use dot entries; unsupported filesystem formats fail closed. */
+FRESULT f_object_mkdir (const FF_OBJECT* parent, const TCHAR* name)
+{
+    FATFS* fs; FRESULT res; DIR directory; FFOBJID object;
+    const TCHAR* cursor=name; unsigned length=0; DWORD cluster=0, tm;
+    DEF_NAMEBUFF
+    if(!name || !name[0])return FR_INVALID_NAME;
+    for(;name[length];++length)
+        if(IsSeparator(name[length]) || name[length]==':' || (unsigned)name[length]<0x20 || length>=255)return FR_INVALID_NAME;
+    if((name[0]=='.'&&!name[1]) || (name[0]=='.'&&name[1]=='.'&&!name[2]))return FR_INVALID_NAME;
+    res=object_validate(parent,&fs);if(res!=FR_OK)return res;
+    if(!(parent->object.attr&AM_DIR))return FR_NO_PATH;
+    if(fs->fs_type!=FS_FAT12 && fs->fs_type!=FS_FAT16 && fs->fs_type!=FS_FAT32)return FR_DENIED;
+    memset(&directory,0,sizeof directory);directory.obj.fs=fs;directory.obj.sclust=parent->object.sclust;
+    INIT_NAMEBUFF(fs);
+    res=create_name(&directory,&cursor);
+    if(res==FR_OK && !(directory.fn[NSFLAG]&NS_LAST))res=FR_INVALID_NAME;
+    if(res==FR_OK)res=dir_find(&directory);
+    if(res==FR_OK)res=FR_EXIST;
+    else if(res==FR_NO_FILE) {
+        memset(&object,0,sizeof object);object.fs=fs;
+        cluster=create_chain(&object,0);
+        if(cluster==0)res=FR_DENIED;
+        else if(cluster==1)res=FR_INT_ERR;
+        else if(cluster==0xffffffff)res=FR_DISK_ERR;
+        else {
+            res=dir_clear(fs,cluster);tm=GET_FATTIME();
+            if(res==FR_OK) {
+                memset(fs->win+DIR_Name,' ',11);fs->win[DIR_Name]='.';fs->win[DIR_Attr]=AM_DIR;
+                st_32(fs->win+DIR_ModTime,tm);st_clust(fs,fs->win,cluster);
+                memcpy(fs->win+SZDIRE,fs->win,SZDIRE);fs->win[SZDIRE+1]='.';
+                st_clust(fs,fs->win+SZDIRE,directory.obj.sclust);fs->wflag=1;
+                res=dir_register(&directory);
+            }
+            if(res==FR_OK) {
+                st_32(directory.dir+DIR_CrtTime,tm);st_32(directory.dir+DIR_ModTime,tm);
+                st_clust(fs,directory.dir,cluster);directory.dir[DIR_Attr]=AM_DIR;fs->wflag=1;
+                res=sync_fs(fs);
+            } else {
+                FRESULT cleanup=remove_chain(&object,cluster,0);
+                if(res!=FR_DISK_ERR && cleanup!=FR_OK)res=cleanup;
+            }
+        }
+    }
+    FREE_NAMEBUFF();return res;
+}
+
 FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
 {
 #if FF_USE_FASTSEEK
