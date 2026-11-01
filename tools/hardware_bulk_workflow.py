@@ -6,13 +6,13 @@ from hardware_bulk_protocol import identifier,upload,download,disk_download,fram
 
 class BulkRun(UpdateRun):
     def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False,disk_identity=None,max_bytes=None):
-        if action not in ('put','get','frame','disk'):raise ValueError('Expected put/get/frame/disk')
+        if action not in ('put','get','frame','disk','getz','framez'):raise ValueError('Expected put/get/frame/disk/getz/framez')
         if action=='disk' and (disk_identity is None or max_bytes is None):raise ValueError('Disk export requires a pinned identity and explicit maximum size')
         if action!='disk' and (disk_identity is not None or max_bytes is not None):raise ValueError('Disk options require disk action')
-        if not isinstance(keep_raw,bool) or (keep_raw and action!='frame'):raise ValueError('keep_raw is only for frame capture')
+        if not isinstance(keep_raw,bool) or (keep_raw and action not in ('frame','framez')):raise ValueError('keep_raw is only for frame capture')
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid bulk port')
         if (action=='put')!=(source is not None):raise ValueError('Only put takes a host source path')
-        if (action=='get')!=(artifact_id is not None):raise ValueError('Only get takes a guest artifact ID')
+        if (action in ('get','getz'))!=(artifact_id is not None):raise ValueError('Only get takes a guest artifact ID')
         if artifact_id:identifier(artifact_id)
         tx=identifier(request_id) if request_id is not None else uuid.uuid4().hex
         with Path(key_file).open() as key_stream:key=identifier(key_stream.read(33))
@@ -20,7 +20,7 @@ class BulkRun(UpdateRun):
         doctor=self.bridge.doctor(session)
         if not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot is not reachable/matching')
         if doctor.get('guest',{}).get('bulk_helper_api')!=1:raise RuntimeError('Guest has no opted-in binary helper; update its image first')
-        if action=='frame' and doctor.get('guest',{}).get('completed_frame_copy_api')!=1:raise RuntimeError('Guest lacks completed-frame copy API')
+        if action in ('frame','framez') and doctor.get('guest',{}).get('completed_frame_copy_api')!=1:raise RuntimeError('Guest lacks completed-frame copy API')
         if source:
             source=Path(source).resolve(strict=True);info=source.stat()
             if not stat.S_ISREG(info.st_mode) or not 0<=info.st_size<=LIMIT:raise ValueError('Source must be a regular file of at most1GiB')
@@ -28,7 +28,7 @@ class BulkRun(UpdateRun):
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,action=action,
             source=str(source) if source else None,artifact_id=artifact_id)
         try:
-            args=['/boot/HWBULK.ELF',boot,tx,action]+([artifact_id] if artifact_id else [])
+            args=['/boot/HWBULKZ.ELF' if action in ('getz','framez') else '/boot/HWBULK.ELF',boot,tx,action]+([artifact_id] if artifact_id else [])
             self.save(state='receiver_launch_dispatched')
             self.bridge.guest_run(session,tx,args,cwd='/tmp',uid=0,wait_s=2)
             listening=self.wait_job(session,tx,lambda r:'HWBULK_LISTENING' in r.get('stdout',{}).get('text',''))
@@ -47,14 +47,14 @@ class BulkRun(UpdateRun):
             stdout=job.get('stdout',{}).get('text','')
             records=[json.loads(line[len('HWBULK_COMPLETED '):]) for line in stdout.splitlines() if line.startswith('HWBULK_COMPLETED ')]
             if len(records)!=1 or any(records[0].get(k)!=result.get(k) for k in ('state','transaction_id','action','bytes','sha256','guest_path')):raise RuntimeError('Guest job/binary receipt mismatch')
-            if action=='frame':
+            if action in ('frame','framez'):
                 png=frame_png(result['artifact_path'],self.output/'screenshot.png',result['payload'])
                 raw=Path(result.pop('artifact_path'))
                 if not keep_raw:raw.unlink()
                 result['raw_artifact_path']=str(raw) if keep_raw else None
                 with Path(png).open('rb') as image:png_hash=hashlib.file_digest(image,'sha256').hexdigest()
                 self.save(artifact_path=png,artifact_sha256=png_hash,frame=result['payload'],transfer=result)
-            elif action in ('get','disk'):self.save(artifact_path=result['artifact_path'])
+            elif action in ('get','getz','disk'):self.save(artifact_path=result['artifact_path'])
             self.save(state='completed');return self.receipt
         except Exception as error:
             stage=self.receipt.get('state');self.save(state='published_needs_inspection' if stage in ('disk_published','disk_published_durability_uncertain') else 'needs_inspection',last_stage=stage,error=str(error),

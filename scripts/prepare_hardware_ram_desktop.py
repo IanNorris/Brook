@@ -13,6 +13,7 @@ p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--recovery-probe',type=Path,required=True);p.add_argument('--maintenance-probe',type=Path,required=True)
 p.add_argument('--output',type=Path,required=True);p.add_argument('--build',type=Path,default=ROOT/'build/release')
 p.add_argument('--waylandd',type=Path,help='Stage a tested replacement provider in the initrd; its runtime closure must already exist in APPS.BRK')
+p.add_argument('--compressed-helper',type=Path,help='Optionally add the separately built static compressed transfer helper')
 p.add_argument('--display-idle-seconds',type=int,help='Opt in after physical panel/wake acceptance; 0 disables, maximum86400')
 a=p.parse_args();recovery=a.recovery_probe.resolve(strict=True);maintenance=a.maintenance_probe.resolve(strict=True);build=a.build.resolve(strict=True);out=a.output.resolve()
 if not os.environ.get('MUSL_CC'):p.error('Run in nix-shell with MUSL_CC')
@@ -41,6 +42,11 @@ for name in ['xhci','sched_eevdf','virtio_input']:run('mcopy','-o','-i',initrd,b
 for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c'),('HWBULK.ELF','tools/hardware_bulk.c')]:
     run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',out/name)
     run('mcopy','-o','-i',initrd,out/name,'::BOOT/'+name)
+if a.compressed_helper:
+    helper=a.compressed_helper.resolve(strict=True)
+    if not helper.is_file() or helper.read_bytes()[:4]!=b'\x7fELF':p.error('Compressed helper must be an ELF file')
+    run('cp',helper,out/'HWBULKZ.ELF')
+    run('mcopy','-o','-i',initrd,out/'HWBULKZ.ELF','::BOOT/HWBULKZ.ELF')
 musl_cxx=os.environ.get('MUSL_CXX') or os.environ['MUSL_CC'].removesuffix('gcc')+'g++'
 run(musl_cxx,'-static','-std=c++17','-O2','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
     ROOT/'tools/hardware_store_receiver.cpp',ROOT/'tools/hardware_store_transaction.cpp',

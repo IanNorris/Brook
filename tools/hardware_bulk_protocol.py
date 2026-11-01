@@ -1,4 +1,9 @@
-"""Bounded binary data plane. Public results contain metadata and paths only."""
+"""Bounded binary data plane. Public results contain metadata and paths only.
+
+API 1's explicit getz/framez actions select independently compressed 64 KiB
+chunks; get/frame retain their original uncompressed wire format. The digest
+and final receipt always describe the uncompressed payload.
+"""
 import hashlib,json,os,socket,stat,struct,time,zlib
 from pathlib import Path
 
@@ -50,7 +55,7 @@ def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,t
             return completed
 
 def download(host,port,key,boot,transaction,path,action='get',*,max_bytes=LIMIT,timeout=60):
-    if action not in ('get','frame'):raise ValueError('Invalid download action')
+    if action not in ('get','frame','getz','framez'):raise ValueError('Invalid download action')
     path=Path(path).absolute();partial=path.with_name(path.name+'.part')
     # Exclusive temporary creation; final no-replace publication occurs only
     # after payload hash AND the final guest receipt have both been verified.
@@ -62,13 +67,35 @@ def download(host,port,key,boot,transaction,path,action='get',*,max_bytes=LIMIT,
             if meta.get('state')!='payload' or isinstance(count,bool) or not isinstance(count,int) or not 0<=count<=max_bytes:raise ValueError('Invalid binary extent')
             digest=meta.get('sha256')
             if not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):raise ValueError('Invalid payload hash')
-            if action=='frame':
+            if action in ('frame','framez'):
                 w,h=meta.get('width'),meta.get('height')
                 if isinstance(w,bool) or isinstance(h,bool) or not isinstance(w,int) or not isinstance(h,int) or not 0<w<=4096 or not 0<h<=2160 or meta.get('format')!=1 or count!=w*h*4:raise ValueError('Invalid frame geometry')
             remaining=count;hasher=hashlib.sha256()
             while remaining:
-                data=connection.recv(min(65536,remaining))
-                if not data:raise ConnectionError('Truncated binary payload')
+                if action in ('getz','framez'):
+                    def exact(n):
+                        result=bytearray()
+                        while len(result)<n:
+                            piece=connection.recv(n-len(result))
+                            if not piece:raise ConnectionError('Truncated compressed payload')
+                            result.extend(piece)
+                        return bytes(result)
+                    rawlen,storedlen,codec=struct.unpack('<IIB',exact(9))
+                    if rawlen!=min(65536,remaining) or storedlen<=0 or storedlen>rawlen:
+                        raise ValueError('Invalid compressed chunk extent')
+                    encoded=exact(storedlen)
+                    if codec==0:
+                        if storedlen!=rawlen:raise ValueError('Invalid raw chunk length')
+                        data=encoded
+                    elif codec==1:
+                        if storedlen>=rawlen:raise ValueError('Invalid compressed chunk length')
+                        decoder=zlib.decompressobj();data=decoder.decompress(encoded,rawlen+1)
+                        if len(data)!=rawlen or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+                            raise ValueError('Invalid compressed chunk')
+                    else:raise ValueError('Unknown chunk codec')
+                else:
+                    data=connection.recv(min(65536,remaining))
+                    if not data:raise ConnectionError('Truncated binary payload')
                 output.write(data);hasher.update(data);remaining-=len(data)
             if hasher.hexdigest()!=digest:raise ValueError('Payload SHA256 mismatch')
             completed=line(connection)

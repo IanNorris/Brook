@@ -18,6 +18,9 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef BROOK_BULK_ZLIB
+#include <zlib.h>
+#endif
 #include "../src/shared/update/payload.h"
 #include "../src/shared/brook_debug_frame.h"
 #include "../src/shared/brook_ahci_export.h"
@@ -99,6 +102,12 @@ done:
     return result;
 }
 static int serve(int client,int directory,const char* key,const char* boot,const char* tx,const char* action,const char* source){
+    int compressed=0;
+#ifdef BROOK_BULK_ZLIB
+    compressed=!strcmp(action,"getz")||!strcmp(action,"framez");
+#endif
+    const int getAction=!strcmp(action,"get") || (compressed && !strcmp(action,"getz"));
+    const int frameAction=!strcmp(action,"frame") || (compressed && !strcmp(action,"framez"));
 #ifdef BROOK_BULK_SYSTEM_SNAPSHOT
     (void)source;
 #endif
@@ -180,7 +189,7 @@ static int serve(int client,int directory,const char* key,const char* boot,const
 #ifdef BROOK_BULK_TEST
         if(getenv("BROOK_BULK_TEST_PUBLISHED_FAILURE")){result=21;goto done;}
 #endif
-    }else if(!strcmp(action,"get")){
+    }else if(getAction){
 #ifdef BROOK_BULK_SYSTEM_SNAPSHOT
         const char *name="STORE.IMG";
 #else
@@ -209,12 +218,23 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         uint8_t chunk[65536];uint64_t offset=0;
         while(offset<bytes){size_t n=bytes-offset>sizeof(chunk)?sizeof(chunk):(size_t)(bytes-offset);
             void* data=frame?(void*)(frame+offset):(void*)chunk;
-            if((!frame&&io_bytes(fd,chunk,n,0,0))||io_bytes(client,data,n,1,1)){result=26;goto done;}offset+=n;
+            if(!frame&&io_bytes(fd,chunk,n,0,0)){result=26;goto done;}
+#ifdef BROOK_BULK_ZLIB
+            if(compressed){
+                uint8_t encoded[65536+128],head[9];uLongf length=sizeof(encoded);
+                if(compress2(encoded,&length,data,n,Z_BEST_SPEED)!=Z_OK){result=26;goto done;}
+                int useCompressed=length<n;BrookUpdatePut32(head,(uint32_t)n);
+                BrookUpdatePut32(head+4,(uint32_t)(useCompressed?length:n));head[8]=(uint8_t)useCompressed;
+                if(io_bytes(client,head,sizeof(head),1,1)||io_bytes(client,useCompressed?encoded:data,useCompressed?(size_t)length:n,1,1)){result=26;goto done;}
+            }else
+#endif
+            if(io_bytes(client,data,n,1,1)){result=26;goto done;}
+            offset+=n;
         }
     }
     char path[128];
-    if(!strcmp(action,"frame") || !strcmp(action,"disk"))strcpy(path,"null");
-    else if(!strcmp(action,"get"))
+    if(frameAction || !strcmp(action,"disk"))strcpy(path,"null");
+    else if(getAction)
 #ifdef BROOK_BULK_SYSTEM_SNAPSHOT
         snprintf(path,sizeof(path),"\"" BULK_ROOT "/STORE.IMG\"");
 #else
@@ -255,9 +275,13 @@ int main(int argc,char** argv){
         strcmp(argv[4],"INST0002.IMG") && strcmp(argv[4],"INST0003.IMG") &&
         strcmp(argv[4],"INSTHASH.BIN")))return 2;
 #else
-    if((argc!=4&&argc!=5)||!valid_id(argv[1])||!valid_id(argv[2])||
-       (strcmp(argv[3],"put")&&strcmp(argv[3],"get")&&strcmp(argv[3],"frame")&&strcmp(argv[3],"disk"))||
-       (!strcmp(argv[3],"get")?(argc!=5||!valid_id(argv[4])):argc!=4))return 2;
+    if((argc!=4&&argc!=5)||!valid_id(argv[1])||!valid_id(argv[2]))return 2;
+    int get=!strcmp(argv[3],"get"),valid=get||!strcmp(argv[3],"put")||!strcmp(argv[3],"frame")||!strcmp(argv[3],"disk");
+#ifdef BROOK_BULK_ZLIB
+    if(!strcmp(argv[3],"getz")){get=1;valid=1;}
+    if(!strcmp(argv[3],"framez"))valid=1;
+#endif
+    if(!valid || (get?(argc!=5||!valid_id(argv[4])):argc!=4))return 2;
 #endif
     const char *root=BULK_ROOT,*keypath="/etc/hardware-update-key";unsigned port=1236;
 #ifdef BROOK_BULK_INSTALL_MEDIA

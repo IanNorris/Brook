@@ -4,7 +4,7 @@ import argparse,hashlib,json,os,socket,struct,subprocess,sys,time,uuid
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'tools'))
 from hardware_bulk_protocol import authenticate,line,upload,download,frame_png
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--program',required=True,type=Path);p.add_argument('--output',required=True,type=Path)
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--program',required=True,type=Path);p.add_argument('--output',required=True,type=Path);p.add_argument('--compressed',action='store_true')
 a=p.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False);store=out/'stage';store.mkdir(mode=0o755)
 key=uuid.uuid4().hex;boot=uuid.uuid4().hex;(out/'key').write_text(key);(out/'key').chmod(0o600)
 data=bytes(range(251))*(2*1024*1024//251)+b'end';source=out/'source.bin';source.write_bytes(data);digest=hashlib.sha256(data).hexdigest()
@@ -35,6 +35,23 @@ assert (store/(saved+'.bin')).read_bytes()==data
 def get(port,tx):
     r=download('127.0.0.1',port,key,boot,tx,out/'download.bin');assert r['sha256']==digest
 case('get-roundtrip','get',get,artifact=saved);assert (out/'download.bin').read_bytes()==data
+if a.compressed:
+    def get_compressed(port,tx):
+        r=download('127.0.0.1',port,key,boot,tx,out/'download-z.bin','getz');assert r['sha256']==digest and r['bytes']==len(data)
+    case('compressed-roundtrip','getz',get_compressed,artifact=saved)
+    assert (out/'download-z.bin').read_bytes()==data
+    random_id=uuid.uuid4().hex;random_data=os.urandom(130001);(store/(random_id+'.bin')).write_bytes(random_data)
+    def get_random(port,tx):
+        r=download('127.0.0.1',port,key,boot,tx,out/'random-z.bin','getz');assert r['sha256']==hashlib.sha256(random_data).hexdigest()
+    case('compressed-incompressible-fallback','getz',get_random,artifact=random_id)
+    assert (out/'random-z.bin').read_bytes()==random_data
+    for size in (0,65536):
+        boundary_id=uuid.uuid4().hex;boundary_data=b'Z'*size;(store/(boundary_id+'.bin')).write_bytes(boundary_data)
+        def get_boundary(port,tx):
+            r=download('127.0.0.1',port,key,boot,tx,out/f'boundary-{size}.bin','getz')
+            assert r['bytes']==size and r['sha256']==hashlib.sha256(boundary_data).hexdigest()
+        case(f'compressed-boundary-{size}','getz',get_boundary,artifact=boundary_id)
+        assert (out/f'boundary-{size}.bin').read_bytes()==boundary_data
 def fragmented(port,tx):
     with socket.create_connection(('127.0.0.1',port)) as c:
         authenticate(c,key,boot,tx);c.sendall(struct.pack('<Q',len(data))+bytes.fromhex(digest))

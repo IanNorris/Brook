@@ -53,6 +53,8 @@ def main():
                         help='Copy the production recovery shell into the disposable initrd')
     parser.add_argument('--network-roundtrip', action='store_true',
                         help='Also verify a binary RAM-only upload and download')
+    parser.add_argument('--compressed-helper', type=Path,
+                        help='Also install and test the optional compressed transfer helper')
     parser.add_argument('--xhci-module', type=Path,
                         help='Use this xHCI module in the private QEMU boot')
     parser.add_argument('--candidate-initrd', type=Path,
@@ -124,6 +126,8 @@ def main():
         run('mcopy', '-o', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
     if a.xhci_module:
         run('mcopy', '-o', '-i', initrd, a.xhci_module, '::DRIVERS/XHCI.MOD')
+    if a.compressed_helper:
+        run('mcopy', '-o', '-i', initrd, a.compressed_helper, '::BOOT/HWBULKZ.ELF')
     if a.ssd_slot_bootstrap:
         run('mcopy', '-o', '-i', initrd, a.ssd_slot_bootstrap, '::BOOT/SSDSLOT.ELF')
     if a.system_updater:
@@ -227,6 +231,10 @@ def main():
                     received = BulkRun(h, out / 'network-download').execute(s, a.key_file, 'get',
                         artifact_id=transfer['transaction_id'], port=ports[1])
                     assert sha(payload) == sha(Path(received['artifact_path']))
+                    if a.compressed_helper:
+                        compressed = BulkRun(h, out / 'network-compressed').execute(s, a.key_file, 'getz',
+                            artifact_id=transfer['transaction_id'], port=ports[1])
+                        assert sha(payload) == sha(Path(compressed['artifact_path']))
                 if a.ssd_slot_bootstrap:
                     efi = out / 'original-efi.bin'
                     # Read only the stopped source fixture, not the running disk.
