@@ -175,6 +175,7 @@ EXPORT_SYMBOL(SchedulerYield);
 EXPORT_SYMBOL(SchedulerSleepMs);
 EXPORT_SYMBOL(KMutexLock);
 EXPORT_SYMBOL(KMutexUnlock);
+EXPORT_SYMBOL(KMutexTryLock);
 EXPORT_SYMBOL(KvmClockReadStableNs);
 
 // Process
@@ -195,6 +196,7 @@ EXPORT_SYMBOL(ApicSendEoi);
 
 // Network
 EXPORT_SYMBOL(NetRegisterIf);
+EXPORT_SYMBOL(NetEarlyBootPolling);
 EXPORT_SYMBOL(NetReceive);
 EXPORT_SYMBOL(NetWakePollThread);
 

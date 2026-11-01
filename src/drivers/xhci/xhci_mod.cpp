@@ -75,6 +75,8 @@ MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(PmmFreePage);
 MODULE_IMPORT_SYMBOL(KMutexLock);
 MODULE_IMPORT_SYMBOL(KMutexUnlock);
+MODULE_IMPORT_SYMBOL(KMutexTryLock);
+MODULE_IMPORT_SYMBOL(NetEarlyBootPolling);
 MODULE_IMPORT_SYMBOL(VfsOpen);
 MODULE_IMPORT_SYMBOL(VfsClose);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
@@ -963,16 +965,19 @@ struct XhciDevice {
 };
 
 static constexpr unsigned ECM_RX_PACKETS=32;
+static constexpr unsigned ECM_RX_SLOTS=8;
 struct UsbEcmState {
     NetIf interface;
     XhciController* controller;XhciDevice* device;
-    uint8_t* rx;uint64_t rxPhysical,rxToken;
+    uint8_t* rx;uint64_t rxPhysical;
+    struct Rx {uint64_t token;bool active;} receives[ECM_RX_SLOTS];
+    unsigned rxOutstanding,rxDepth;KMutex dispatchLock;bool earlyDispatch;
     uint8_t* notification;uint64_t notificationPhysical,notificationToken;
     bool linkKnown,linkUp;uint64_t notifications,reportTick;uint32_t notifyHeader[2];
     uint8_t notificationSamples[16][16],notificationLengths[16];uint32_t notificationPrinted;
     uint8_t* tx;uint64_t txPhysical;
     struct Tx {uint64_t first,final;uint32_t bytes;bool active,dataDone;} sends[8];
-    uint8_t packets[ECM_RX_PACKETS][1514];uint16_t lengths[ECM_RX_PACKETS];uint32_t head,tail;bool rxArmed;
+    uint8_t packets[ECM_RX_PACKETS][1514];uint16_t lengths[ECM_RX_PACKETS];uint32_t head,tail;
     uint64_t dropped,received,transmitted;bool failed;
     uint32_t faultStatus,faultDci;uint64_t faultToken;
 };
@@ -2264,10 +2269,21 @@ static uint64_t XhciEcmTrb(XhciDevice& dev,bool input,uint64_t physical,uint32_t
     __atomic_store_n(&trb.control,control^(publish?0u:TRB_CYCLE),__ATOMIC_RELEASE);
     ++enqueue;return token;
 }
+// Called under g_eventRingLock. A queued frame or an outstanding TD each
+// reserves one software-queue slot, so simultaneous completions cannot
+// overrun the consumer. Publish each TD only after recording its ownership:
+// the controller may already be running from an earlier doorbell.
 static void XhciEcmReceiveArm(UsbEcmState& net){
-    net.rxToken=XhciEcmTrb(*net.device,true,net.rxPhysical,2048,false);net.rxArmed=true;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    XhciRingDoorbell(*net.controller,net.device->slotId,net.device->bulkInDci);
+    if(net.failed || net.controller->completionFailed)return;
+    for(unsigned i=0;i<net.rxDepth && net.tail-net.head+net.rxOutstanding<ECM_RX_PACKETS;++i){
+        auto& rx=net.receives[i];if(rx.active)continue;
+        rx.token=XhciEcmTrb(*net.device,true,net.rxPhysical+i*2048,2048,false,false);
+        rx.active=true;++net.rxOutstanding;
+        auto& head=net.device->bulkInRing[(rx.token-net.device->bulkInRingPhys)/sizeof(Trb)];
+        __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        XhciRingDoorbell(*net.controller,net.device->slotId,net.device->bulkInDci);
+    }
 }
 static void XhciEcmNotificationArm(UsbEcmState& net){
     auto& dev=*net.device;
@@ -2302,16 +2318,18 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     }
     if(dci==dev.bulkInDci){
         if(net.failed)return true;
-        if(event.param!=net.rxToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>2048){fail();return true;}
-        net.rxArmed=false;
+        unsigned rxSlot=ECM_RX_SLOTS;
+        for(unsigned i=0;i<ECM_RX_SLOTS;++i)if(net.receives[i].active && net.receives[i].token==event.param){rxSlot=i;break;}
+        if(rxSlot==ECM_RX_SLOTS || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>2048){fail();return true;}
+        net.receives[rxSlot].active=false;--net.rxOutstanding;
         const unsigned bytes=2048-residue;
         if(bytes>=14 && bytes<=1514){
-            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx,bytes);net.lengths[index]=bytes;++net.tail;++net.received;}
+            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx+rxSlot*2048,bytes);net.lengths[index]=bytes;++net.tail;++net.received;}
             else ++net.dropped;
         }else if(bytes)++net.dropped;
         // A full software queue backpressures USB instead of discarding a
         // completed packet. The poll consumer rearms after making space.
-        if(net.tail-net.head<ECM_RX_PACKETS)XhciEcmReceiveArm(net);
+        XhciEcmReceiveArm(net);
         return true;
     }
     if(dci==dev.bulkOutDci){
@@ -2379,22 +2397,36 @@ static void XhciEcmPoll(NetIf* nif){
                 index,length,words[0],words[1],words[2],words[3]);
         }
     }
+    // Only one poller may hand frames to the network stack at once. Reentrant
+    // polls can still drain events, but must not reorder frame delivery.
+    // The try-lock also defers process termination until unlock, so a killed
+    // caller cannot strand delivery. Recursive polls do not block.
+    const bool early=NetEarlyBootPolling();
+    if(early){
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        if(net.earlyDispatch){IrqSpinLockRelease(&g_eventRingLock,saved);return;}
+        net.earlyDispatch=true;IrqSpinLockRelease(&g_eventRingLock,saved);
+    }else if(!KMutexTryLock(&net.dispatchLock))return;
     for(unsigned n=0;n<8;++n){
         uint8_t frame[1514];unsigned bytes=0;
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
         if(net.head!=net.tail){const auto index=net.head%ECM_RX_PACKETS;bytes=net.lengths[index];memcpy(frame,net.packets[index],bytes);++net.head;}
-        if(!net.failed && !net.rxArmed && net.tail-net.head<ECM_RX_PACKETS)XhciEcmReceiveArm(net);
+        XhciEcmReceiveArm(net);
         IrqSpinLockRelease(&g_eventRingLock,saved);
         if(!bytes)break;
         // Receive can immediately transmit an ACK. No USB lock is held here.
         NetReceive(nif,frame,bytes);
     }
+    if(early){const auto saved=IrqSpinLockAcquire(&g_eventRingLock);net.earlyDispatch=false;IrqSpinLockRelease(&g_eventRingLock,saved);}
+    else KMutexUnlock(&net.dispatchLock);
 }
 static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     if(Vnode* marker=VfsOpen("/etc/usb-net-probe",0)){VfsClose(marker);g_networkProbe=true;}
     auto* net=static_cast<UsbEcmState*>(kmalloc(sizeof(UsbEcmState)));if(!net)return false;
     memset(net,0,sizeof(*net));net->controller=&ctrl;net->device=&dev;
-    net->rx=static_cast<uint8_t*>(AllocDmaBuffer(1,net->rxPhysical));
+    net->rxDepth=1;
+    if(Vnode* marker=VfsOpen("/etc/usb-net-rx8",0)){VfsClose(marker);net->rxDepth=ECM_RX_SLOTS;}
+    net->rx=static_cast<uint8_t*>(AllocDmaBuffer(4,net->rxPhysical));
     net->tx=static_cast<uint8_t*>(AllocDmaBuffer(4,net->txPhysical));
     net->notification=static_cast<uint8_t*>(AllocDmaBuffer(1,net->notificationPhysical));
     uint64_t physical=0;auto* scratch=static_cast<uint8_t*>(AllocDmaBuffer(1,physical));
@@ -2421,7 +2453,7 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     dev.network=net;XhciEcmReceiveArm(*net);XhciEcmNotificationArm(*net);
     IrqSpinLockRelease(&g_eventRingLock,saved);
     NetRegisterIf(&net->interface);
-    SerialPrintf("xhci: CDC-ECM network interface ready slot=%u (carrier unverified)\n",dev.slotId);
+    SerialPrintf("xhci: CDC-ECM network interface ready slot=%u rx_depth=%u (carrier unverified)\n",dev.slotId,net->rxDepth);
     return true;
 }
 

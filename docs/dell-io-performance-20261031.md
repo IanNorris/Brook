@@ -38,6 +38,24 @@ browser traffic. Evidence includes `network-window-profile-ss-20261101.txt`
 and the `network-pace*m*-20261101` receipts and sampled host socket counters
 under `build/hardware/`.
 
+An experimental xHCI ECM receive path keeps up to eight independently owned
+DMA requests in flight while reserving space in the 32-frame software queue.
+`/etc/usb-net-rx8` opts into depth eight; without it the depth remains one.
+Both modes use the new serialized dispatch path and larger DMA allocation.
+The final private QEMU candidates for both depths acquired DHCP and resolved
+gateway ARP during early boot, passed a hash-verified 4 MiB upload, and shut
+down cleanly. An earlier eight-buffer candidate also passed a 4 MiB roundtrip.
+Evidence: `ecm-rx1-qemu-20261101`, `ecm-rx8-qemu-v3-20261101`, and their
+upload receipts under `build/hardware/`. The first experimental build delayed
+DHCP until after scheduler startup; the final candidates correct that.
+
+This is not yet a physical performance result. Before Dell deployment, test
+full-credit and malformed completion handling, wrap/interleaving, recursive
+dispatch, process termination while dispatching, and disconnect/fatal events
+with outstanding buffers. Compare depth one and eight using the same physical
+payload, controlled transfers and retransmission counters; pacing results alone
+do not prove this queue was the location of the loss.
+
 A read-and-SHA256 pass over the installed 230,212,616-byte Firefox libxul
 file took 1.886 s, followed by 1.897 s for a second pass, about 122 MB/s of
 file bytes per second including hashing. Cache state was not controlled and

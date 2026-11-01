@@ -891,8 +891,13 @@ NetIf* NetIfForDst(uint32_t dstIp)
     return g_netIf;
 }
 
+static bool g_netEarlyBootPolling = true;
+bool NetEarlyBootPolling() { return __atomic_load_n(&g_netEarlyBootPolling, __ATOMIC_ACQUIRE); }
+
 void NetStartPollThread()
 {
+    // Called on the BSP after the synchronous DHCP/ARP boot phase returns.
+    __atomic_store_n(&g_netEarlyBootPolling, false, __ATOMIC_RELEASE);
     if (!g_netIf) return;
 
     // Spawn a background thread to continuously drain the NIC receive ring.

@@ -269,6 +269,8 @@ bool NetApplyStaticConfig(NetIf* nif);
 
 // Start the net_poll background thread. Must be called AFTER SchedulerInit().
 void NetStartPollThread();
+// True only during the single-BSP boot-time network configuration phase.
+bool NetEarlyBootPolling();
 
 // Wake the net_poll thread so it drains the RX ring promptly.
 // Safe to call from ISR context (delegates to SchedulerUnblock, which is
