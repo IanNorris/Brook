@@ -275,6 +275,8 @@ cover distinct slot contents, mismatched identity, same-slot and invalid
 records, generation overflow, and simulated torn-selector and sync failures.
 An uncertain write retains the maintenance lock. The intact selector gives a
 fallback if the new record is damaged; it does not guarantee recovery from
-arbitrary FAT or device failure. This prototype has not been exercised in a
-guest or deployed on the Dell, and a lost activation reply must be inspected
+arbitrary FAT or device failure. A disposable USB QEMU image also completed an
+update, booted the new image, promoted its earlier image, and booted that image
+on a third firmware boot; non-slot files and the FAT check passed. The prototype
+has not been deployed on the Dell, and a lost activation reply must be inspected
 using the same transaction rather than retried automatically.

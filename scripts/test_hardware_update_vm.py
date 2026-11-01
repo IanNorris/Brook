@@ -8,9 +8,11 @@ import argparse,json,os,shutil,socket,subprocess,sys,time,uuid
 from pathlib import Path
 from test_hardware_power import Qmp,Rpc
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'tools'))
-from hardware_update_protocol import upload
+from hardware_update_protocol import upload,promote
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('--probe',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--workflow',action='store_true',help='Exercise durable host orchestration and live guest-triggered reset')
+p.add_argument('--promotion',action='store_true',help='Promote the original slot and verify a third boot')
 a=p.parse_args();probe=a.probe.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
+if a.promotion and a.workflow:p.error('promotion and workflow are separate tests')
 meta=json.loads((probe/'manifest.json').read_text());disk=out/'private.raw'
 subprocess.run(['cp','--reflink=auto',str(probe/'probe.raw'),str(disk)],check=True)
 new_initrd=out/'candidate.img';subprocess.run(['cp','--reflink=auto',str(probe/'maintenance.img'),str(new_initrd)],check=True)
@@ -19,7 +21,7 @@ subprocess.run(['mcopy','-o','-i',str(new_initrd),str(identity_file),'::ETC/hard
 key=Path(meta['update_key_file']).read_text();results=[]
 def free_port():
     with socket.socket() as s:s.bind(('127.0.0.1',0));return s.getsockname()[1]
-for phase in (['upload'] if a.workflow else ['upload','verify']):
+for phase in (['upload'] if a.workflow else ['upload','verify']+(['promoted'] if a.promotion else [])):
     base=out/phase;base.mkdir();variables=base/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
     port=free_port();data_port=free_port()
     argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m','2048','-nodefaults',
@@ -41,7 +43,7 @@ for phase in (['upload'] if a.workflow else ['upload','verify']):
             if 'DEBUG_TCP: listening' in text and 'HARDWARE_NETWORK_READY' in text:break
             time.sleep(.1)
         else:raise TimeoutError(text[-2000:])
-        expected=meta['maintenance_payload_id'] if phase=='upload' else identity
+        expected=meta['maintenance_payload_id'] if phase in ('upload','promoted') else identity
         assert 'HARDWARE_PAYLOAD_ID ' in text and expected in text,text[-2500:]
         assert 'application file ready' not in text and 'physical storage probe is read-only' not in text
         q=Qmp(base/'qmp.sock');rpc=Rpc(base);rpc.request('initialize',{'protocolVersion':'2025-06-18'})
@@ -76,6 +78,23 @@ for phase in (['upload'] if a.workflow else ['upload','verify']):
                     started=rpc.tool('hw_job',{'session':session,'operation_id':tx,'wait_s':2})
                 (base/'job.json').write_text(json.dumps(started,indent=2)+'\n')
                 assert started.get('exit',{}).get('code')==0 and 'HWUPDATE_ACTIVATED generation=2' in started['stdout']['text'],started
+        if phase=='verify' and a.promotion:
+            tx=uuid.uuid4().hex
+            started=rpc.tool('hw_guest_run',{'session':session,'request_id':tx,'argv':['/boot/HWUPDATE.ELF',boot,tx],'cwd':'/tmp','uid':0,'wait_s':2})
+            end=time.monotonic()+30
+            while 'HWUPDATE_LISTENING' not in started.get('stdout',{}).get('text',''):
+                assert started.get('state') not in ['failed','rejected','completed','lost'],started
+                assert time.monotonic()<end,started
+                started=rpc.tool('hw_job',{'session':session,'operation_id':tx,'wait_s':2})
+            result=promote('127.0.0.1',data_port,key,boot,tx,0,(probe/'payload/KERNEL/BROOK.ELF').read_bytes(),(probe/'maintenance.img').read_bytes(),True)
+            assert result['state']=='promoted' and result['generation']==3 and result['slot']==0,result
+            (base/'promotion.json').write_text(json.dumps(result,indent=2)+'\n')
+            end=time.monotonic()+30
+            while started.get('state')!='completed':
+                assert started.get('state') not in ['failed','rejected','lost'],started
+                assert time.monotonic()<end,started
+                started=rpc.tool('hw_job',{'session':session,'operation_id':tx,'wait_s':2})
+            assert started.get('exit',{}).get('code')==0 and 'HWUPDATE_PROMOTED generation=3' in started['stdout']['text'],started
         shutdown=uuid.uuid4().hex
         state=rpc.tool('hw_power',{'session':session,'request_id':shutdown,'operation':'shutdown'})
         end=time.monotonic()+60
@@ -94,5 +113,5 @@ if not a.workflow:assert results[0]['boot_id']!=results[1]['boot_id']
 from hardware_storage_image_check import verify_image
 checks=verify_image(disk,meta);(out/'fat-check.log').write_text(checks.pop('fat_check_log'))
 (out/'result.json').write_text(json.dumps({'passed':True,'scope':'private QEMU USB image','remote_upload_activation':True,
-    'fresh_firmware_boot_of_updated_initrd':True,'live_guarded_reset_workflow':a.workflow,'phases':results,**checks},indent=2)+'\n')
+    'fresh_firmware_boot_of_updated_initrd':True,'promotion_boot_verified':a.promotion,'live_guarded_reset_workflow':a.workflow,'phases':results,**checks},indent=2)+'\n')
 print('HARDWARE_UPDATE_VM_PASS')
