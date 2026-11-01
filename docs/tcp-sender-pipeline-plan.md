@@ -107,6 +107,17 @@ general upper bound or a throughput result. The buffer batches rather than
 guaranteeing per-packet delay. Persistent congestion state, real-network
 loss behavior and physical four-packet performance remain to be tested.
 
+The Dell's sixteen-slot run still observed many call-tail drains. Removing
+them would require a persistent bounded per-socket queue: an application may
+only return successfully after its bytes are owned by the kernel, and those
+bytes must remain available for retransmission until ACK or terminal failure.
+Queue capacity, nonblocking and poll readiness, asynchronous error reporting,
+last-close/FIN ordering, worker lifetime and global memory limits need to be
+designed together. The current call-local flight cannot safely return early.
+First moving retained flight state into a worker while keeping synchronous
+returns would permit testing lifetime and loss handling before opting in to
+buffered returns. These changes are not implemented by the flight experiment.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

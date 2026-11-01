@@ -2413,6 +2413,11 @@ hashed in stored form, with its payload explicitly marked undecoded. A saved
 report can guide resource discovery but does not establish Brook ownership or
 authorize MMIO access. Host fixture tests are in
 `scripts/test_dell_linux_audio_snapshot.py`.
+The collector also records the Broadwell machine-driver device, matching
+RT286 I²C clients and the sound-card-to-device/driver links when present.
+Missing directories, drivers and fields remain explicit; it does not enumerate
+unrelated I²C clients or touch hardware. These relationships will distinguish a
+DSP discovered without its codec or machine driver from a complete audio card.
 
 ### Firefox HTTPS follow-up and lost hardware connection (2026-10-31)
 

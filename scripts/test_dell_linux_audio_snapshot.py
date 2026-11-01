@@ -31,6 +31,23 @@ class AudioReferenceTests(unittest.TestCase):
             (platform / "resource").write_text("0x1000 0x1fff 0x200\n")
             (acpi / "physical_node").symlink_to(platform)
             (platform / "driver").symlink_to("/sys/bus/platform/drivers/catpt")
+            machine = root / "sys/bus/platform/devices/broadwell-audio"
+            machine.mkdir()
+            (machine / "driver").symlink_to("/sys/bus/platform/drivers/broadwell-audio")
+            codec = root / "sys/bus/i2c/devices/i2c-INT343A:00"
+            codec.mkdir(parents=True)
+            (codec / "driver").symlink_to("/sys/bus/i2c/drivers/rt286")
+            (codec / "modalias").write_text("acpi:INT343A:\n")
+            numeric_codec = root / "sys/bus/i2c/devices/2-001c"
+            numeric_codec.mkdir()
+            (numeric_codec / "driver").symlink_to("/sys/bus/i2c/drivers/rt286")
+            unrelated_i2c = root / "sys/bus/i2c/devices/1-0040"
+            unrelated_i2c.mkdir()
+            (unrelated_i2c / "driver").symlink_to("/sys/bus/i2c/drivers/unrelated")
+            card = root / "sys/class/sound/card1"
+            card.mkdir(parents=True)
+            (card / "id").write_text("broadwellrt286\n")
+            (card / "device").symlink_to(machine)
             other = root / "sys/bus/acpi/devices/UNRELATED:00"
             other.mkdir()
             tables = root / "sys/firmware/acpi/tables"
@@ -47,6 +64,10 @@ class AudioReferenceTests(unittest.TestCase):
             self.assertEqual(report["firmware_tables"]["DSDT"]["sha256"], hashlib.sha256(b"test table").hexdigest())
             self.assertEqual(report["kernel_messages"], ["catpt: initialized", "i2c_designware: ready", "snd_soc_rt286: ready"])
             self.assertIn("error", node["irq"])
+            self.assertEqual([d["name"] for d in report["platform"]["devices"]], ["INT3438:00", "broadwell-audio"])
+            self.assertEqual([d["driver"] for d in report["i2c"]["devices"]], ["rt286", "rt286"])
+            self.assertEqual(report["sound_card_devices"]["cards"][0]["device"], "broadwell-audio")
+            self.assertEqual(report["sound_card_devices"]["cards"][0]["driver"], "broadwell-audio")
             self.assertEqual(report["firmware"]["intel/IntcSST2.bin"]["payload_sha256"], hashlib.sha256(b"firmware").hexdigest())
 
     def test_limits_and_truncation_are_visible(self):

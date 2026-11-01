@@ -36,7 +36,7 @@ def link_name(path):
         return None
 
 
-def enumerate_devices(root, relative):
+def enumerate_devices(root, relative, extra_names=(), extra_drivers=()):
     directory = root / relative
     try:
         entries = sorted(directory.iterdir(), key=lambda p: p.name)
@@ -44,9 +44,11 @@ def enumerate_devices(root, relative):
         return {"error": exc.strerror or type(exc).__name__, "devices": []}
     result = []
     for entry in entries:
-        if not any(token in entry.name.upper() for token in IDS):
+        driver = link_name(entry / "driver")
+        if not (any(token in entry.name.upper() for token in IDS) or
+                entry.name.lower() in extra_names or driver in extra_drivers):
             continue
-        record = {"name": entry.name, "driver": link_name(entry / "driver")}
+        record = {"name": entry.name, "driver": driver}
         for field in ("status", "modalias", "hid", "uid", "resource", "irq"):
             record[field] = read(entry / field)
         record["physical_nodes"] = []
@@ -59,14 +61,35 @@ def enumerate_devices(root, relative):
     return {"devices": result}
 
 
+def enumerate_sound_cards(root):
+    directory = root / "sys/class/sound"
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        return {"error": exc.strerror or type(exc).__name__, "cards": []}
+    cards = []
+    for entry in entries:
+        if not re.fullmatch(r"card\d+", entry.name):
+            continue
+        cards.append({"name": entry.name,
+                      "id": read(entry / "id"),
+                      "device": link_name(entry / "device"),
+                      "driver": link_name(entry / "device/driver")})
+    return {"cards": cards}
+
+
 def snapshot(root=Path("/"), dmesg=None):
     result = {
         "schema": 1,
         "kernel_release": read(root / "proc/sys/kernel/osrelease"),
         "acpi": enumerate_devices(root, "sys/bus/acpi/devices"),
-        "platform": enumerate_devices(root, "sys/bus/platform/devices"),
+        "platform": enumerate_devices(root, "sys/bus/platform/devices",
+                                      extra_names=("broadwell-audio",),
+                                      extra_drivers=("broadwell-audio",)),
+        "i2c": enumerate_devices(root, "sys/bus/i2c/devices", extra_drivers=("rt286",)),
         "sound_cards": read(root / "proc/asound/cards"),
         "sound_pcm": read(root / "proc/asound/pcm"),
+        "sound_card_devices": enumerate_sound_cards(root),
         "firmware_tables": {},
         "firmware": {},
     }
