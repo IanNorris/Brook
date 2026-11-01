@@ -492,3 +492,15 @@ so these sequential samples suggest scaling but do not isolate the marker.
 Neither fixed flight is suitable as a general congestion policy yet. The Dell
 was left on the opt-in experimental generation 29, and the separate recovery
 slot was not overwritten.
+
+The opt-in adaptive candidate (generation 31) was subsequently tested with
+the same local payload. Three 4 MiB RAM transfers took 0.488, 0.538 and
+0.491 s, with matching SHA-256 digests. TX-busy, RX-drop and covered
+ACK-submission-failure counters did not increase during these samples. Three
+100,000-byte Cloudflare HTTPS uploads took 0.670, 0.562 and 0.504 s, each
+returning HTTP 200; connection times were 63, 38 and 30 ms. The local times
+include the binary protocol and digest, and HTTPS totals include setup. These
+consecutive tests used a different kernel from the fixed-flight tests and are
+not a controlled fairness or loss assessment. They do not establish the
+maximum available Internet throughput. The candidate is opt-in and the
+independently verified recovery payload remains in slot B.
