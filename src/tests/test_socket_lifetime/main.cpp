@@ -12,6 +12,7 @@ namespace {
 std::atomic<unsigned> allocations{0}, frees{0}, wakes{0};
 std::atomic<int> failAllocation{-1};
 std::atomic<bool> pauseTransmit{false}, transmitting{false}, releaseTransmit{false};
+std::atomic<bool> pauseOnlyPureAck{false};
 std::atomic<bool> acknowledgeFin{false};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
@@ -46,6 +47,10 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                                const void* data, uint32_t len) {
     assert(proto == IP_PROTO_TCP);
     const auto* tcp = static_cast<const TcpHeader*>(data);
+    if (pauseTransmit.load() && (!pauseOnlyPureAck.load() || (tcp->flags==TCP_ACK && len==sizeof(TcpHeader)))) {
+        transmitting = true;
+        while (!releaseTransmit.load()) std::this_thread::yield();
+    }
     if(tcp->flags==TCP_ACK && len==sizeof(TcpHeader)) {
         if(rejectPureAcks.load()) {
             --rejectPureAcks;
@@ -56,10 +61,6 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
             return -11;
         }
         ++acceptedPureAcks;lastAck=ntohl(tcp->ackNum);lastWindow=ntohs(tcp->window);
-    }
-    if (pauseTransmit.load()) {
-        transmitting = true;
-        while (!releaseTransmit.load()) std::this_thread::yield();
     }
     if (acknowledgeFin.load() && (tcp->flags & TCP_FIN)) {
         // Deliver synchronously, just as local RX may reenter the sender.
@@ -94,6 +95,10 @@ static bool closingSlot(int i) {
     auto flags = IrqSpinLockAcquire(&g_socketRegistryLock);
     bool result = g_sockClosing[i];
     IrqSpinLockRelease(&g_socketRegistryLock, flags); return result;
+}
+static bool reservedSlot(int i) {
+    auto flags=IrqSpinLockAcquire(&g_socketRegistryLock);
+    bool result=g_sockReserved[i];IrqSpinLockRelease(&g_socketRegistryLock,flags);return result;
 }
 static void setupTcp(int i) {
     auto& s = g_sockets[i];
@@ -270,6 +275,24 @@ int main() {
     SpinLockAcquire(&g_sockets[i].lock);g_sockets[i].tcpState=TcpState::Closed;SpinLockRelease(&g_sockets[i].lock);
     ticks=341;TcpStatsMaybeFlush();assert(acceptedPureAcks==0 && g_sockets[i].tcpUnackedSegs==0);
     SockClose(i);
+    // Draining a nearly full receive buffer must succeed even when its window
+    // update is rejected; maintenance retries the current window afterward.
+    i=create();setupTcp(i);ticks=400;rejectPureAcks=1;acceptedPureAcks=0;
+    g_sockets[i].rxCount=Socket::RX_BUF_SIZE-100;g_sockets[i].rxTail=0;
+    uint8_t received[2048]{};assert(SockRecv(i,received,sizeof(received),true)==sizeof(received));
+    assert(g_sockets[i].tcpUnackedSegs==1 && acceptedPureAcks==0);
+    const auto reopened=TcpAdvertisedWindow(TcpReceiveFree(g_sockets[i]),g_sockets[i].tcpRcvWndScale,0);
+    ticks=441;TcpStatsMaybeFlush();assert(acceptedPureAcks==1 && lastWindow==reopened && g_sockets[i].tcpUnackedSegs==0);
+    SockClose(i);
+    // The unlocked window-update tail pins its incarnation while close is
+    // pending; no receive storage is reclaimed before that tail returns.
+    i=create();setupTcp(i);ticks=500;rejectPureAcks=1;pauseOnlyPureAck=true;pauseTransmit=true;transmitting=false;releaseTransmit=false;
+    g_sockets[i].rxCount=Socket::RX_BUF_SIZE-100;g_sockets[i].rxTail=0;
+    before=frees;std::thread reader([&]{uint8_t bytes[2048];assert(SockRecv(i,bytes,sizeof(bytes),true)==sizeof(bytes));});
+    await([]{return transmitting.load();});closed=false;
+    std::thread closeDuringWindow([&]{SockClose(i);closed=true;});
+    await([&]{return !published(i);});assert(reservedSlot(i) && !closed && frees==before && g_sockets[i].rxBuf);
+    releaseTransmit=true;reader.join();closeDuringWindow.join();pauseTransmit=false;pauseOnlyPureAck=false;assert(closed);
     assert(allocations == frees);
     std::puts("socket lifetime: PASS");
 }

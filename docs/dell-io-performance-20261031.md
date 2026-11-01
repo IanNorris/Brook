@@ -293,9 +293,12 @@ window update. These two paths now requeue a failed ACK under the socket lock,
 preserve newer pending work, and take a fresh cumulative ACK/window snapshot
 at the next timer tick. Closed sockets discard pending ACK work. A boot-wide
 `tcp_ack_submit_failures` counter is available through `bridge network`.
-The socket-lifetime host test exercises the actual receive and timer code with
-an injected busy NIC, repeated failures, concurrent state advancement and a
-closed socket. This does not fix or count every possible ACK submission path,
-including the separate `SockRecv` window update, and does not establish that
-this was the Dell's dominant throughput bottleneck. Physical measurement is
-still required.
+The separate `SockRecv` window-update path also schedules a retry on rejection,
+without turning an already successful read into an error. Its unlocked send
+tail holds a short socket borrow; the caller must still own the socket during
+the receive operation. The socket-lifetime host test exercises the actual
+receive and timer code with an injected busy NIC, repeated failures, concurrent
+state advancement, window reopening, socket retirement and a closed socket.
+The counter covers these paths, not every possible TCP send failure. This does
+not establish that ACK rejection was the Dell's dominant throughput bottleneck;
+physical measurement is still required.

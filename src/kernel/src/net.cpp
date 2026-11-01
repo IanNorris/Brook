@@ -252,7 +252,7 @@ static void TcpRequeueFailedAck(Socket& s)
 }
 
 // Forward declaration for TCP send (defined below)
-static void TcpSendSegment(Socket& s, uint8_t flags,
+static int TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen,
                            const char* why = "?");
 static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
@@ -2407,14 +2407,14 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
     TcpSendSnapshot(s, snapshot, seq, flags, data, dataLen, why);
 }
 
-static void TcpSendSegment(Socket& s, uint8_t flags,
+static int TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen,
                            const char* why)
 {
     SpinLockAcquire(&s.lock);
     const auto snapshot = CaptureTcpTxLocked(s);
     SpinLockRelease(&s.lock);
-    TcpSendSnapshot(s, snapshot, snapshot.nextSeq, flags, data, dataLen, why);
+    return TcpSendSnapshot(s, snapshot, snapshot.nextSeq, flags, data, dataLen, why);
 }
 
 // Append raw bytes to socket RX ring buffer.
@@ -3054,8 +3054,13 @@ int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
     static constexpr uint32_t MSS = 1460;
     bool wasConstrained = freeBefore < 2 * MSS;
     bool nowOpen        = freeAfter  >= MSS;
-    if (wasConstrained && nowOpen && stateSnap == TcpState::Established)
-        TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-update");
+    if (wasConstrained && nowOpen && stateSnap == TcpState::Established) {
+        // Pin the existing socket only for the unlocked send and its possible
+        // retry scheduling, not for the blocking receive loop above.
+        SocketBorrow borrow(static_cast<uint32_t>(sockIdx));
+        if(borrow && TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-update"))
+            TcpRequeueFailedAck(s);
+    }
 
     return static_cast<int>(copyLen);
 }
