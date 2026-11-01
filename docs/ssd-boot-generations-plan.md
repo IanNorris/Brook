@@ -159,8 +159,11 @@ the intended boot mode. Dell's [USB boot guidance for newer systems](https://www
 recommends Thorough; it is not proof of the 9343's exact settings or of a fix.
 The [9343 service manual](https://downloads.dell.com/manuals/all-products/esuprt_laptop/esuprt_xps_laptop/xps-13-9343-laptop_service%20manual_en-us.pdf)
 does not enumerate Fastboot settings. The next control is a clean shutdown and
-F12 check with the recovery stick connected and the Ethernet adapter removed;
-its result is pending. If firmware can enumerate the recovery stick, compare
+F12 check with the recovery stick connected and the Ethernet adapter removed.
+The user observed that the stick appeared in F12 in that configuration, but
+noted it may have appeared with the adapter connected too; further reproduction
+is needed before attributing the difference to the adapter. If firmware can
+enumerate the recovery stick, compare
 USB and SSD firmware boot paths with matched payloads. Do not
 replace the accepted EFI loader or force a controller reset to obtain this
 comparison.
