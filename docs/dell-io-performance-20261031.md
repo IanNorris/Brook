@@ -455,3 +455,28 @@ correctness work around windows, retransmission, concurrent writes and close.
 The 0.34 Mbps browser upload has not been reproduced in an isolated WAN test.
 The diagnostic switch was removed from source, and the Dell was restored to
 the measured 64-slot build as SSD generation 23; recovery remains in slot B.
+
+## Two-packet sender comparison
+
+The same kernel and settings were booted twice on the Dell, with only the
+`/etc/tcp-two-packet-flight` marker changed. Both used RX depth 8, TX depth
+16, the 1,200-byte egress ceiling and no receive-window cap. With two packets,
+three 4 MiB Dell-to-host RAM transfers took 1.829, 1.877 and 1.876 s; with the
+single-packet control they took 3.633, 3.637 and 3.628 s. All returned the
+same SHA-256 digest; the observed TX-busy, RX-drop and covered ACK-failure
+counters did not increase. These are binary-phase wall times including the
+protocol and digest work, not wire-rate measurements.
+
+Three subsequent 100,000-byte HTTPS uploads to the [Cloudflare speed-test
+upload endpoint](https://github.com/cloudflare/speedtest#api-reference) took
+1.508, 1.536 and 1.538 s with two packets, versus 2.964, 2.791 and 2.740 s
+with one. All returned HTTP 200. Curl's total time includes connection and TLS
+setup; reported connection times ranged 34–74 ms. The tests were consecutive
+across boots, not randomized, and cannot separate network variability from
+the sender effect. The measurements are consistent with RTT dominating a
+small flight, but are not directly comparable to the browser speed test.
+
+The experimental flight remains boot-opt-in; its limits are documented in
+`docs/tcp-sender-pipeline-plan.md`. After the comparison, the Dell is on the
+same-kernel single-packet control as SSD generation 27; the independently
+verified recovery payload remains in slot B. Physical audio remains absent.
