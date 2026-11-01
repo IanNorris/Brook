@@ -2383,10 +2383,14 @@ outbox ranges inside a platform-admitted DSP RAM region. Overlap is rejected
 conservatively. The caller must check notification ownership, serialize access,
 and supply stable resources and callback lifetime. Admission and unavailable-
 resource rejection perform no device reads; fake-aperture host tests cover
-malformed and failing reads. The 4 KiB
-mailbox size limit is a Brook implementation bound, not a hardware claim.
-This component is not wired into discovery or interrupts and cannot transmit
-messages, boot the DSP or play audio. Runtime ownership and the Dell's zero DSP
+malformed and failing reads. A separate, externally serialized transport model
+exercises outbox publication, immediate and delayed replies, acknowledgment
+ordering and terminal failure after a timeout. It requires DONE-before-BUSY
+dispatch and IRQ-safe non-reentrant platform synchronization; reconstructing
+the object is not hardware recovery. The 4 KiB mailbox size limit and contiguous,
+nonoverlapping RAM ranges are conservative Brook bounds, not hardware claims.
+These components are not wired into discovery, interrupts or a real register
+adapter and cannot boot the DSP or play audio. Runtime ownership and the Dell's zero DSP
 resource fields remain unresolved. The format follows Linux's
 [CATPT messages](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/messages.h)
 and [IPC driver](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/ipc.c).
