@@ -2,7 +2,8 @@
 #include <stdint.h>
 
 namespace brook {
-enum class XhciResetPhase { Initial, Halt, IntelQuiet, Reset, Ready, Complete };
+enum class XhciResetPhase { Initial, Halt, IntelQuiet, Reset, Ready, Complete,
+                            InitialQuiet, InitialReady, ExistingReset, ExistingReady };
 enum class XhciResetError { None, Inaccessible, Timeout, ClockStopped, InitiallyNotReady };
 struct XhciResetResult {
     XhciResetPhase phase;
@@ -19,16 +20,6 @@ XhciResetResult XhciResetController(Io& io, bool intel, uint64_t phaseTimeoutMs,
     constexpr uint32_t run = 1u, reset = 2u, interruptEnable = 4u;
     constexpr uint32_t halted = 1u, notReady = 1u << 11;
     XhciResetResult r{XhciResetPhase::Initial, XhciResetError::None, 0, 0};
-    r.status = io.status();
-    if (r.status == ~uint32_t{0}) {
-        r.error = XhciResetError::Inaccessible; return r;
-    }
-    // Do not write operational registers while a firmware reset is active.
-    if (r.status & notReady) { r.error = XhciResetError::InitiallyNotReady; return r; }
-    r.command = io.command();
-    if (r.command == ~uint32_t{0}) { r.error = XhciResetError::Inaccessible; return r; }
-    if (r.command & reset) { r.error = XhciResetError::InitiallyNotReady; return r; }
-    io.writeCommand(r.command & ~(run | interruptEnable));
     auto wait = [&](XhciResetPhase phase, bool checkCommand, uint32_t mask,
                     bool wantSet, uint64_t minimumMs) {
         r.phase = phase;
@@ -50,6 +41,17 @@ XhciResetResult XhciResetController(Io& io, bool intel, uint64_t phaseTimeoutMs,
         }
         r.error = XhciResetError::ClockStopped; return false;
     };
+    // Firmware may have just initiated a reset. Give Intel controllers the
+    // same quiet interval before our first operational-register access.
+    if (intel && !wait(XhciResetPhase::InitialQuiet, false, 0, false, 2)) return r;
+    if (!wait(XhciResetPhase::InitialReady, false, notReady, false, 0)) return r;
+    r.command = io.command();
+    if (r.command == ~uint32_t{0}) { r.error = XhciResetError::Inaccessible; return r; }
+    if (r.command & reset) {
+        if (!wait(XhciResetPhase::ExistingReset, true, reset, false, 0)) return r;
+    }
+    if (!wait(XhciResetPhase::ExistingReady, false, notReady, false, 0)) return r;
+    io.writeCommand(r.command & ~(run | interruptEnable));
     if (!wait(XhciResetPhase::Halt, false, halted, true, 0)) return r;
     io.writeCommand(reset);
     // Two tick boundaries guarantee at least one complete millisecond even

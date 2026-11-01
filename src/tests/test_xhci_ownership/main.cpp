@@ -35,9 +35,10 @@ struct Routing {
 struct ControllerReset {
     uint64_t tick=0, resetAt=0; bool frozen=false, stuckHalt=false, stuckReset=false, stuckReady=false, invalid=false;
     bool invalidAfterReset=false, initialReset=false, initialCnr=false, didReset=false, earlyAccess=false; unsigned writes=0;
-    uint32_t command(){if(didReset && tick-resetAt<2)earlyAccess=true;return (invalid || (didReset && invalidAfterReset))?~0u:((!didReset && initialReset) || (didReset && (stuckReset || tick-resetAt<3))?2u:0u);}
-    uint32_t status(){if(didReset && tick-resetAt<2)earlyAccess=true;return (invalid || (didReset && invalidAfterReset))?~0u:(stuckHalt?0u:(1u | (((!didReset && initialCnr) || (didReset && stuckReady))?(1u<<11):0u)));}
-    void writeCommand(uint32_t v){++writes;if(v&2){assert(!stuckHalt);didReset=true;resetAt=tick;}}
+    uint64_t initialResetUntil=~uint64_t{0}, initialCnrUntil=~uint64_t{0}; bool readinessTransition=false; unsigned statusReads=0;
+    uint32_t command(){if(didReset && tick-resetAt<2)earlyAccess=true;return (invalid || (didReset && invalidAfterReset))?~0u:((!didReset && initialReset && tick<initialResetUntil) || (didReset && (stuckReset || tick-resetAt<3))?2u:0u);}
+    uint32_t status(){++statusReads;if(didReset && tick-resetAt<2)earlyAccess=true;return (invalid || (didReset && invalidAfterReset))?~0u:(stuckHalt?0u:(1u | (((!didReset && ((initialCnr && tick<initialCnrUntil) || (readinessTransition && statusReads>1 && tick<5))) || (didReset && stuckReady))?(1u<<11):0u)));}
+    void writeCommand(uint32_t v){assert(didReset || ((!initialReset || tick>=initialResetUntil) && (!initialCnr || tick>=initialCnrUntil) && (!readinessTransition || tick>=5)));++writes;if(v&2){assert(!stuckHalt);didReset=true;resetAt=tick;}}
     uint64_t now(){return tick;}
     void pause(){if(!frozen)++tick;}
 };
@@ -48,15 +49,21 @@ int main(){
     ControllerReset dead;dead.invalid=true;reset=XhciResetController(dead,true,20,100);
     assert(reset.error==XhciResetError::Inaccessible && dead.writes==0);
     ControllerReset initialCnr;initialCnr.initialCnr=true;reset=XhciResetController(initialCnr,true,20,100);
-    assert(reset.error==XhciResetError::InitiallyNotReady && initialCnr.writes==0);
+    assert(reset.phase==XhciResetPhase::InitialReady && reset.error==XhciResetError::Timeout && initialCnr.writes==0);
     ControllerReset initialReset;initialReset.initialReset=true;reset=XhciResetController(initialReset,true,20,100);
-    assert(reset.error==XhciResetError::InitiallyNotReady && initialReset.writes==0);
+    assert(reset.phase==XhciResetPhase::ExistingReset && reset.error==XhciResetError::Timeout && initialReset.writes==0);
+    ControllerReset recovering;recovering.initialReset=true;recovering.initialResetUntil=5;reset=XhciResetController(recovering,true,20,100);
+    assert(reset.phase==XhciResetPhase::Complete && recovering.writes==2 && !recovering.earlyAccess);
+    ControllerReset readyRecovering;readyRecovering.initialCnr=true;readyRecovering.initialCnrUntil=5;reset=XhciResetController(readyRecovering,true,20,100);
+    assert(reset.phase==XhciResetPhase::Complete && readyRecovering.writes==2);
+    ControllerReset transition;transition.readinessTransition=true;reset=XhciResetController(transition,true,20,100);
+    assert(reset.phase==XhciResetPhase::Complete && transition.writes==2);
     ControllerReset other;reset=XhciResetController(other,false,20,100);
     assert(reset.phase==XhciResetPhase::Complete && reset.error==XhciResetError::None);
     ControllerReset halt;halt.stuckHalt=true;reset=XhciResetController(halt,true,20,100);
     assert(reset.phase==XhciResetPhase::Halt && reset.error==XhciResetError::Timeout && halt.writes==1 && !halt.didReset);
     ControllerReset clock;clock.frozen=true;reset=XhciResetController(clock,true,20,10);
-    assert(reset.phase==XhciResetPhase::IntelQuiet && reset.error==XhciResetError::ClockStopped && !clock.earlyAccess);
+    assert(reset.phase==XhciResetPhase::InitialQuiet && reset.error==XhciResetError::ClockStopped && !clock.earlyAccess);
     ControllerReset stuck;stuck.stuckReset=true;reset=XhciResetController(stuck,true,20,100);
     assert(reset.phase==XhciResetPhase::Reset && reset.error==XhciResetError::Timeout && !stuck.earlyAccess);
     ControllerReset controllerGone;controllerGone.invalidAfterReset=true;reset=XhciResetController(controllerGone,true,20,100);
