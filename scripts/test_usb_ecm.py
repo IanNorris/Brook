@@ -106,6 +106,18 @@ try:
    reply+=chunk
   assert b'BRIDGE_BEGIN 71' in reply and b'BRIDGE_END 71' in reply
   (base/'bridge-reply.bin').write_bytes(reply)
+  s.sendall(b'@72 bridge network\n');reply=b''
+  while b'BRIDGE_END 72' not in reply and len(reply)<65536:
+   chunk=s.recv(8192)
+   if not chunk:break
+   reply+=chunk
+  assert b'BRIDGE_BEGIN 72' in reply and b'BRIDGE_END 72' in reply,reply
+  line=next(line for line in reply.splitlines() if line.startswith(b'{'))
+  stats=json.loads(line)['network_driver_snapshot']
+  assert stats['rx_depth']==(8 if args.rx_depth8 else 1),stats
+  assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
+  assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
+  (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')
  q.call('device_del',{'id':'usbnet'})
  q.call('human-monitor-command',{'command-line':'sendkey a 100'})
  deadline=time.monotonic()+10

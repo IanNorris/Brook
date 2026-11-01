@@ -247,3 +247,18 @@ on the host (about 43 Mbps). This longer sample establishes a gap for this
 request, not a controlled attribution: endpoint routing, caching and client
 behavior may differ. The Dell measurement is still much higher than the
 user's Chromium/Google speed-test estimate.
+
+The USB ECM driver now exposes an on-demand `bridge network` snapshot, with
+receive completions, dropped packets, queue occupancy and boot-wide high-water
+mark, active receive depth, transmit completions and rejected busy sends.
+The counters are synchronized under the controller lock; reading them does not
+continuously log to disk. `benchmark_hardware_network.py --driver-snapshot`
+records snapshots around each upload. The measurement requests themselves use
+the same network and can perturb small transfers. A high-water value is since
+boot, not specific to a single transfer. These counters cannot detect packets
+lost before USB completion or prove the cause of a TCP retransmission.
+
+Both receive depths passed the private QEMU USB Ethernet acceptance with the
+snapshot enabled, including traffic and USB storage/HID checks. This diagnostic
+kernel has not yet been installed on the Dell; preserve the currently accepted
+SSD recovery slot when planning its first physical comparison.

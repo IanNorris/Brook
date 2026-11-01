@@ -3968,6 +3968,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"sync_guarantee\":\"checked_filesystem_and_device_flush\"}\n");
         r.send(); return;
     }
+    if (NetStrEq(cmd, "bridge network")) {
+        NetDriverSnapshot s{};
+        const bool available=g_netIf && g_netIf->snapshot && g_netIf->snapshot(g_netIf,&s);
+        BridgeReply r;r.text("{\"network_driver_snapshot\":");
+        if(!available) r.text("null");
+        else {
+            r.text("{");r.field("rx_completed",s.received);
+            r.text(",");r.field("tx_completed",s.transmitted);
+            r.text(",");r.field("rx_dropped",s.dropped);
+            r.text(",");r.field("tx_busy",s.txBusy);
+            r.text(",");r.field("rx_depth",s.rxDepth);
+            r.text(",");r.field("rx_outstanding",s.rxOutstanding);
+            r.text(",");r.field("rx_queued",s.rxQueued);
+            r.text(",");r.field("rx_queue_high_water",s.rxQueueHighWater);
+            r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
+        }
+        r.text("}\n");r.send();return;
+    }
     if (NetStrEq(cmd, "bridge stats")) {
         uint64_t total = PmmGetRamPageCount(), free = PmmGetFreePageCount();
         uint32_t count=0,running=0;SchedulerGetProcessCounts(count,running);

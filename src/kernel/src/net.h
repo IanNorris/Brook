@@ -161,6 +161,12 @@ static inline uint32_t Ipv4Addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
 // Network interface (NIC abstraction)
 // ---------------------------------------------------------------------------
 
+struct NetDriverSnapshot {
+    uint64_t received, transmitted, dropped, txBusy;
+    uint32_t rxDepth, rxOutstanding, rxQueued, rxQueueHighWater;
+    bool failed;
+};
+
 struct NetIf {
     MacAddr  mac;
     uint32_t ipAddr;      // our IP (big-endian), 0 = unconfigured
@@ -175,6 +181,9 @@ struct NetIf {
     void (*poll)(NetIf* nif);
 
     void* driverPriv;     // driver-specific state
+
+    // Optional read-only snapshot; the driver supplies its own synchronization.
+    bool (*snapshot)(NetIf* nif, NetDriverSnapshot* out);
 
     // Per-interface traffic counters (updated by stack, not driver)
     volatile uint64_t rxBytes;

@@ -14,6 +14,7 @@ def main():
     p.add_argument('--output',type=Path,required=True);p.add_argument('--rounds',type=int,default=3)
     p.add_argument('--pace-bytes-per-second',type=int,default=16000000)
     p.add_argument('--port',type=int,default=1236)
+    p.add_argument('--driver-snapshot',action='store_true',help='Capture USB driver counters around each transfer (requires bridge network support)')
     a=p.parse_args();source=a.source.resolve(strict=True)
     if not 1<=a.rounds<=5:p.error('rounds must be between 1 and 5')
     if not 1<=a.pace_bytes_per_second<=0x7fffffff:p.error('invalid pacing cap')
@@ -44,13 +45,16 @@ def main():
         modes=(('unpaced',None),('paced',a.pace_bytes_per_second))
         if i%2:modes=tuple(reversed(modes))
         for label,pace in modes:
+            before_driver=h.command(a.session,'bridge network')['network_driver_snapshot'] if a.driver_snapshot else None
+            if a.driver_snapshot and before_driver is None:raise RuntimeError('No network driver snapshot available')
             result=BulkRun(h,a.output/f'{i}-{label}').execute(a.session,a.key_file,'put',snapshot,port=a.port,pace_bytes_per_second=pace)
+            after_driver=h.command(a.session,'bridge network')['network_driver_snapshot'] if a.driver_snapshot else None
             transfer=result['transfer']
             if result['guest_boot_id']!=boot:raise RuntimeError('Guest boot changed; inspect receipts')
             if transfer['sha256']!=digest or transfer['bytes']!=size:raise RuntimeError('Source changed or upload digest mismatch; inspect receipts')
             rows.append(dict(round=i,mode=label,requested_pacing_bytes_per_second=pace,
                              bytes=size,sha256=digest,binary_phase_s=result['binary_phase_s'],
-                             transaction_id=result['transaction_id']))
+                             transaction_id=result['transaction_id'],driver_before=before_driver,driver_after=after_driver))
             print(json.dumps(rows[-1]),flush=True)
     artifact=rows[-1]['transaction_id']
     returned=BulkRun(h,a.output/'download').execute(a.session,a.key_file,'get',artifact_id=artifact,port=a.port)

@@ -980,7 +980,7 @@ struct UsbEcmState {
     uint8_t* tx;uint64_t txPhysical;
     struct Tx {uint64_t first,final;uint32_t bytes;bool active,dataDone;} sends[8];
     uint8_t packets[ECM_RX_PACKETS][1514];uint16_t lengths[ECM_RX_PACKETS];uint32_t head,tail;
-    uint64_t dropped,received,transmitted;bool failed;
+    uint64_t dropped,received,transmitted,txBusy;uint32_t queueHighWater;bool failed;
     uint32_t faultStatus,faultDci;uint64_t faultToken;
 };
 static bool g_networkProbe=false;
@@ -2318,7 +2318,8 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
         net.rxCredits.Complete(static_cast<unsigned>(rxSlot));
         const unsigned bytes=2048-residue;
         if(bytes>=14 && bytes<=1514){
-            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx+rxSlot*2048,bytes);net.lengths[index]=bytes;++net.tail;++net.received;}
+            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx+rxSlot*2048,bytes);net.lengths[index]=bytes;++net.tail;++net.received;
+                const auto queued=net.tail-net.head;if(queued>net.queueHighWater)net.queueHighWater=queued;}
             else ++net.dropped;
         }else if(bytes)++net.dropped;
         // A full software queue backpressures USB instead of discarding a
@@ -2360,7 +2361,15 @@ static int XhciEcmTransmit(NetIf* nif,const void* frame,uint32_t bytes){
         XhciRingDoorbell(*net.controller,dev.slotId,dev.bulkOutDci);
         IrqSpinLockRelease(&g_eventRingLock,saved);return 0;
     }
-    IrqSpinLockRelease(&g_eventRingLock,saved);return -11;
+    ++net.txBusy;IrqSpinLockRelease(&g_eventRingLock,saved);return -11;
+}
+static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
+    if(!nif || !out || !nif->driverPriv)return false;
+    auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    *out={net.received,net.transmitted,net.dropped,net.txBusy,net.rxDepth,
+          net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,net.failed};
+    IrqSpinLockRelease(&g_eventRingLock,saved);return true;
 }
 static void XhciEcmPoll(NetIf* nif){
     auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);
@@ -2442,7 +2451,7 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     request={};request.bmRequestType=0x21;request.bRequest=0x43;request.wValue=0x000c;request.wIndex=dev.ecm.control;
 
     if(!XhciControlTransfer(ctrl,dev,request,nullptr,0,0,0))return false;
-    net->interface.driverPriv=net;net->interface.transmit=XhciEcmTransmit;net->interface.poll=XhciEcmPoll;
+    net->interface.driverPriv=net;net->interface.transmit=XhciEcmTransmit;net->interface.poll=XhciEcmPoll;net->interface.snapshot=XhciEcmSnapshot;
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
     dev.network=net;XhciEcmReceiveArm(*net);XhciEcmNotificationArm(*net);
     IrqSpinLockRelease(&g_eventRingLock,saved);
