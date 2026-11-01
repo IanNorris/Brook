@@ -530,3 +530,18 @@ measurements; multiple ACKs can be combined before the sender runs. Together
 the counters support testing a larger bounded flight, while also showing why
 per-call drain behavior deserves attention. The diagnostic build is opt-in,
 with the verified recovery payload retained in slot B.
+
+The separate 16-slot experiment was compared with the eight-slot mode on
+the same kernel, with matching 1,200-byte egress, RX/TX depths and probe
+settings. Three 4 MiB local RAM transfers took 0.491, 0.490 and 0.536 s at
+eight slots, versus 0.345, 0.348 and 0.296 s at sixteen, with matching hashes.
+Three 1 MiB HTTPS uploads took 2.110, 2.425 and 1.936 s at eight slots, versus
+1.250, 1.094 and 1.072 s at sixteen; each returned HTTP 200. The probe's
+boot-wide observed maximum rose from 9,600 to 19,200 bytes. Across the WAN
+intervals, slot-capacity wait observations fell from 121–136 to zero, while
+call-drain observations remained 258–283. No retry attempts, local busy or
+peer-window waits were observed in these intervals. The counters include
+bridge/job activity and count observations rather than elapsed time. These
+sequential runs are not randomized and do not establish fairness or general
+loss behavior. The Dell was left on the opt-in generation 37 sixteen-slot
+candidate; its separately verified recovery payload remains in slot B.
