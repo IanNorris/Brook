@@ -1762,6 +1762,15 @@ transaction, 2 with memory decode enabled, and 0 after restoration. The
 controller reported no active interrupts, rings or streams. This establishes
 neither audible playback nor safe DMA/mixer sequencing; no sound was started.
 Machine-specific Linux and Brook captures remain private under `build/hardware`.
+An extended physical GET-only capture found the selector at input 0 rather than
+Linux's working input 1, DAC `0x03` at its maximum 0 dB setting, and the pin
+and mixer unmuted. The AFG and DAC reported D0/D0 with the settings-reset flag;
+the actual power-error flag was clear. The pin and mixer have mute controls,
+and the DAC reports 127 half-dB gain steps. A first playback test must mute
+and verify the pin before rerouting, attenuate the DAC and use low-amplitude
+PCM; the user has authorized a tone below 25%. A gain register percentage is
+not a measurement of acoustic volume. DMA stop, buffer ownership and mute
+cleanup must be verified before exposing ordinary audio playback.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
