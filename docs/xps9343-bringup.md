@@ -2958,3 +2958,10 @@ confirmed that speaker output remained disabled throughout. The test did not
 apply or persist desktop settings. Recovery generation 112 was selected
 afterward. This verifies the UI-to-kernel control path, not audible gain or
 unmute behavior.
+
+The QEMU volume regression also checks the order of sustained captured PCM
+amplitudes for mute, 25%, 50%, 100%, mute and 25%, in addition to checking
+aggregate sample counts. This guards against controls producing the right
+levels in the wrong phases. The HDA and absent-device cases passed; host-only
+tests also reject swapped phases and short transient levels. This emulated
+capture does not establish the Dell codec's audible gain or speaker quality.

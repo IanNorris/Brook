@@ -7,6 +7,7 @@ user syscall and /dev/dsp paths plus an absent-device boot.
 """
 import os,subprocess,shutil,argparse,json,socket,time,wave,array,collections,tempfile
 from pathlib import Path
+from audio_control_wave import volume_phase_runs, has_ordered_phases
 root=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output',type=Path,required=True,help='New directory for disposable test images and captures')
@@ -70,8 +71,11 @@ for mode in ['hda','no-device']:
    counts=collections.Counter(abs(x) for x in samples)
    for level in [0,2000,4000,8000]:assert counts[level]>50000,(level,counts.most_common(8))
    assert max(counts)<=8000,max(counts)
+   runs=volume_phase_runs(samples)
+   assert has_ordered_phases(runs),('unexpected volume phase order',runs)
    result['amplitude_sample_counts']={str(n):counts[n] for n in [0,2000,4000,8000]}
    result['max_amplitude']=max(counts)
+   result['sustained_amplitude_runs']=runs
   (d/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('VOLUME_QEMU_PASS',mode,flush=True)
  finally:
   if owner.poll() is None:
