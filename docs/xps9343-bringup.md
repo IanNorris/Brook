@@ -3023,3 +3023,15 @@ paths for a local source and browser playback, note the actual playback interval
 and configuration, and compare only matching stream identities and epochs.
 Counter deltas are not an acoustic recording and can include intentional idle.
 The observer does not launch a source or change volume, staging or device state.
+
+During an attended test after the master was set to 25%, a 20-second local ALSA tone completed and
+the user reported no audible issue. Across four active samples its queue did
+not reserve any new later gaps or advance an empty tail. A privately staged
+Quake 2 software-rendered demo then played music track 7; the user reported
+perfect playback. Five active samples likewise showed no increase in those two
+queue counters. These intervals do not establish long-term reliability or
+correct playback for Chromium. On the first Quake run, music tracks 7 and 9
+were absent and the user reported effects audible only after selecting the
+high-quality setting. The missing tracks were staged privately for the second
+run; the low-quality sound issue remains unverified and unresolved. The game
+backend still reported an 11.025 kHz mixer rate with the high-quality option.
