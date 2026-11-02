@@ -29,9 +29,11 @@ static int fixture(const char* path) {
     AhciDataSelector want{};std::memcpy(want.diskGuid,a.diskGuid,16);
     std::memcpy(want.partitionGuid,entries.data()+a.entrySize+16,16);
     want.filesystemUuid[0]=1;want.first=16384;want.count=32768;
-    AhciBootSelection selected{};
-    return AhciDataSelect(want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,selected) &&
-           selected.entry==2 && selected.first==16384 && selected.count==32768 ? 0 : 1;
+    AhciBootSelector boot{};std::memcpy(boot.diskGuid,a.diskGuid,16);
+    std::memcpy(boot.partitionGuid,entries.data()+16,16);boot.first=2048;boot.count=8192;
+    AhciBootSelection selected{}, selectedBoot{};
+    return AhciSelectBootAndData(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,selectedBoot,selected) &&
+           selectedBoot.entry==1 && selected.entry==2 && selected.first==16384 && selected.count==32768 ? 0 : 1;
 }
 int main(int argc,char** argv){
     if(argc==2)return fixture(argv[1]);
@@ -66,6 +68,20 @@ int main(int argc,char** argv){
     refresh();assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));
     entries[272]=4;put64(entries+288,3000);refresh();
     assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));
+    const uint8_t espType[16]={0x28,0x73,0x2a,0xc1,0x1f,0xf8,0xd2,0x11,0xba,0x4b,0,0xa0,0xc9,0x3e,0xc9,0x3b};
+    std::memcpy(entries+256,espType,16);put64(entries+288,5000);put64(entries+296,6000);refresh();
+    AhciBootSelector boot{};boot.diskGuid[0]=1;boot.partitionGuid[0]=4;boot.first=5000;boot.count=1001;
+    AhciBootSelection bootResult{},dataResult{};
+    assert(AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));
+    assert(bootResult.entry==3 && dataResult.entry==2);
+    ++want.count;bootResult.entry=5;dataResult.entry=6;
+    assert(!AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));
+    assert(!bootResult.entry && !dataResult.entry);--want.count;
+    boot.diskGuid[0]=9;
+    assert(!AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));
+    assert(!bootResult.entry && !dataResult.entry);boot.diskGuid[0]=1;
+    ++boot.count;assert(!AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));--boot.count;
+    assert(!AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,bootResult));
     std::memset(entries+256,0,128);refresh();mbr[466]=0x83;
     assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));
 }

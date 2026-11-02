@@ -113,3 +113,9 @@ overlap and duplicate-GUID cases pass, along with a separate two-partition
 `sfdisk` fixture. The selector does not yet verify ATA identity, bind the ESP
 selection to the same snapshot, compare the filesystem UUID with ext2, mount
 anything, or authorize a write; those remain integration requirements.
+An unconnected composition now also requires the ESP and data selectors to
+match the same supplied GPT snapshot before publishing either result. Tests
+cover mismatched identities, failure of the second selection, output aliasing
+and an independently generated two-partition fixture. The caller must still
+pin the disk layout and buffers until mount admission; the helper does not
+enforce that lifetime or exclusivity itself.

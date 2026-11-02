@@ -49,4 +49,23 @@ inline bool AhciDataSelect(const AhciDataSelector& wanted,uint64_t diskSectors,
     }
     return false;
 }
+
+// Both selectors must be verified against the same caller-owned, immutable
+// GPT buffers, after the caller has verified ATA identity. Outputs must not
+// overlap selector objects or GPT buffers. The caller must keep the disk layout
+// stable through mount admission. Does not inspect ext2 or provide ownership,
+// mount or write authority.
+inline bool AhciSelectBootAndData(const AhciBootSelector& boot,const AhciDataSelector& data,
+                                  uint64_t diskSectors,const uint8_t* mbr,const uint8_t* primary,
+                                  const uint8_t* backup,const uint8_t* entries,
+                                  const uint8_t* backupEntries,uint32_t bytes,
+                                  AhciBootSelection& selectedBoot,AhciBootSelection& selectedData) {
+    selectedBoot={};selectedData={};
+    if(&selectedBoot==&selectedData || memcmp(boot.diskGuid,data.diskGuid,16))return false;
+    AhciBootSelection esp{},store{};
+    if(!AhciBootSelect(boot,diskSectors,mbr,primary,backup,entries,backupEntries,bytes,esp) ||
+       !AhciDataSelect(data,diskSectors,mbr,primary,backup,entries,backupEntries,bytes,store) ||
+       esp.entry==store.entry)return false;
+    selectedBoot=esp;selectedData=store;return true;
+}
 }
