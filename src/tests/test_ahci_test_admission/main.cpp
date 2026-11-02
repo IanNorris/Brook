@@ -45,4 +45,13 @@ int main() {
     info.physicalSectorBytes=4096;assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,true));info.physicalSectorBytes=512;
     strcpy(info.model,"SAMSUNG SSD PM851");assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,true));
     strcpy(info.model,"QEMU HARDDISK");info.serial[0]='X';assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,true));
+    info.sectors=12587008;strcpy(info.serial,"BROOK-DATA-TEST06");
+    assert(AhciDisposableLargeDataAdmission(true,false,true,0,info,true));
+    assert(!AhciDisposableLargeDataAdmission(true,true,true,0,info,true));
+    assert(!AhciDisposableLargeDataAdmission(true,false,false,0,info,true));
+    assert(!AhciDisposableLargeDataAdmission(true,false,true,1,info,true));
+    assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,false));
+    info.sectors++;assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,true));
+    info.sectors--;strcpy(info.serial,"BROOK-DATA-TEST01");assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,true));
+    info.sectors=500118192;strcpy(info.serial,"BROOK-DATA-TEST06");assert(!AhciDisposableLargeDataAdmission(true,false,true,0,info,true));
 }

@@ -21,8 +21,10 @@ inline bool AhciDisposableDesktopInstallAdmission(bool marker,bool kvm,uint32_t 
 // conflicting test markers and keep this mode unreachable in production.
 inline bool AhciDisposableLargeDataAdmission(bool marker,bool conflictingMarkers,bool kvm,uint32_t port,
                                               const AtaIdentifyInfo& info,bool flushExt) {
+    const bool fixture=(info.sectors==500118192 && !strcmp(info.serial,"BROOK-DATA-TEST01")) ||
+        (info.sectors==12587008 && !strcmp(info.serial,"BROOK-DATA-TEST06"));
     return marker && !conflictingMarkers && kvm && port==0 &&
-        info.sectors==500118192 && info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
-        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-DATA-TEST01") && flushExt;
+        fixture && info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
+        !strcmp(info.model,"QEMU HARDDISK") && flushExt;
 }
 }
