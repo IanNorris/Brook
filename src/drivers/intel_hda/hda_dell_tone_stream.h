@@ -9,7 +9,7 @@ namespace brook {
 // No PCI, codec, DMA allocation or memory freeing is performed here.
 enum class HdaToneStreamState : uint8_t {Idle,Prepared,Running,Stopped,Unknown};
 template<class Io> class HdaDellToneStream {
-    Io& io_;uint32_t base_=0,detail_=0;uint8_t stage_=0,priority_=0;HdaToneStreamState state_=HdaToneStreamState::Idle;
+    Io& io_;uint32_t base_=0,detail_=0,progressFirst_=0,progressLast_=0;uint8_t stage_=0,priority_=0,progressReason_=0,progressStatus_=0;uint16_t progressControl_=0;HdaToneStreamState state_=HdaToneStreamState::Idle;
     bool waitControl(uint16_t mask,uint16_t value) {
         const auto start=io_.ticks();
         for(unsigned i=0;i<1000000;++i) {
@@ -22,6 +22,8 @@ public:
     explicit HdaDellToneStream(Io& io):io_(io){}
     HdaToneStreamState state()const{return state_;}
     uint8_t stage()const{return stage_;}uint32_t detail()const{return detail_;}
+    uint8_t progressReason()const{return progressReason_;}uint8_t progressStatus()const{return progressStatus_;}
+    uint16_t progressControl()const{return progressControl_;}uint32_t progressFirst()const{return progressFirst_;}uint32_t progressLast()const{return progressLast_;}
     bool prepare(uint16_t gcap,uint64_t bdlPhysical) {
         stage_=1;detail_=gcap;
         if(state_!=HdaToneStreamState::Idle || gcap==0xffff || !((gcap>>12)&15) ||
@@ -60,16 +62,17 @@ public:
         state_=HdaToneStreamState::Running;return true;
     }
     bool progress() {
-        if(state_!=HdaToneStreamState::Running)return false;
-        const uint32_t first=io_.read32(base_+4);if(first>=12288)return false;const auto start=io_.ticks();
+        progressReason_=1;progressStatus_=0;progressControl_=0;if(state_!=HdaToneStreamState::Running)return false;
+        const uint32_t first=io_.read32(base_+4);progressFirst_=progressLast_=first;
+        if(first>=12288){progressReason_=2;return false;}const auto start=io_.ticks();
         for(unsigned i=0;i<2000000;++i) {
-            if(io_.read8(base_+3)&0x18)return false;
-            if(!(io_.read16(base_)&2))return false;
-            const uint32_t current=io_.read32(base_+4);if(current>=12288)return false;
-            if(current!=first)return true;
-            const auto now=io_.ticks();if(now>=start && now-start>=150)break;io_.pause();
+            progressStatus_=io_.read8(base_+3);if(progressStatus_&0x18){progressReason_=3;return false;}
+            progressControl_=io_.read16(base_);if(!(progressControl_&2)){progressReason_=4;return false;}
+            const uint32_t current=io_.read32(base_+4);progressLast_=current;if(current>=12288){progressReason_=5;return false;}
+            if(current!=first){progressReason_=6;return true;}
+            const auto now=io_.ticks();if(now>=start && now-start>=150){progressReason_=7;return false;}io_.pause();
         }
-        return false;
+        progressReason_=8;return false; // bounded-iteration exhaustion
     }
     bool stop() {
         if(state_!=HdaToneStreamState::Running && state_!=HdaToneStreamState::Unknown &&

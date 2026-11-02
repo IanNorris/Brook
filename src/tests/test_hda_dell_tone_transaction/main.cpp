@@ -29,7 +29,7 @@ struct Fake {
 int main(){
     auto s=snapshot();
     {Fake f;assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::Complete);assert(f.events=="MCPSGUTMXDRF");}
-    {Fake f;assert(HdaDellToneTransaction(f,s,false)==HdaToneResult::Complete);assert(f.events=="MCPSGMXDRF");}
+    {Fake f;assert(HdaDellToneTransaction(f,s,false)==HdaToneResult::Complete);assert(f.events=="MCPSGTMXDRF");}
     {Fake f;auto bad=s;bad.vendor=0;assert(HdaDellToneTransaction(f,bad,true)==HdaToneResult::InvalidSnapshot && f.events.empty());}
     {Fake f;f.fail='M';assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::MuteFailed && f.events=="MQ");}
     {Fake f;f.fail='C';assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::ConfigureFailed && f.events=="MCMQ");}

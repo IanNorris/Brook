@@ -13,6 +13,8 @@ struct HdaObservation {
     uint32_t toneAdmission=0;uint64_t tonePage=0;uint8_t tonePageStatus=0;
     uint8_t tonePrepareStage=0,toneStreamStage=0;uint32_t tonePrepareValue=0,toneStreamDetail=0;uint16_t toneCommand=0;
     bool toneIciFailed=false;
+    uint8_t tonePlayReason=0,toneProgressReason=0,toneProgressStatus=0;uint16_t toneProgressControl=0;
+    uint32_t tonePlayLoops=0,tonePlayProgress=0,toneProgressFirst=0,toneProgressLast=0;uint64_t tonePlayElapsed=0;
 };
 // Called once on CPU 0 before AP scheduler activation or driver loading.
 void HdaObserveConfigure(const BootProtocol* boot);

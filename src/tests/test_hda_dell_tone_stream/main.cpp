@@ -34,11 +34,11 @@ int main(){
     {Fake f;f.dropBdl=true;HdaDellToneStream<Fake> s(f);assert(!s.prepare(0x4401,0x1000) && s.state()==HdaToneStreamState::Unknown && !f.published);}
     {Fake f;f.dropRun=true;HdaDellToneStream<Fake> s(f);assert(s.prepare(0x4401,0x1000));assert(!s.start() && s.state()==HdaToneStreamState::Unknown && s.stop());}
     {Fake f;HdaDellToneStream<Fake> s(f);assert(s.prepare(0x4401,0x1000) && s.start());f.noProgress=true;
-     assert(!s.progress());f.stuckStop=true;assert(!s.stop() && s.state()==HdaToneStreamState::Unknown);}
+     assert(!s.progress() && s.progressReason()==7);f.stuckStop=true;assert(!s.stop() && s.state()==HdaToneStreamState::Unknown);}
     {Fake f;HdaDellToneStream<Fake> s(f);assert(s.prepare(0x4401,0x1000) && s.start());f.noProgress=true;
      f.mem[Fake::base+5]=0x30;assert(!s.progress() && s.stop());}
     {Fake f;HdaDellToneStream<Fake> s(f);assert(s.prepare(0x4401,0x1000) && s.start());
-     f.mem[Fake::base+3]=0x10;assert(!s.progress() && s.stop());}
+     f.mem[Fake::base+3]=0x10;assert(!s.progress() && s.progressReason()==3 && s.progressStatus()==0x10 && s.stop());}
     {Fake f;HdaDellToneStream<Fake> s(f);assert(s.prepare(0x4401,0x1000));f.mem[Fake::base+3]=8;
      assert(!s.start() && s.state()==HdaToneStreamState::Unknown && s.stop());}
     {Fake f;HdaDellToneStream<Fake> s(f);assert(s.prepare(0x4401,0x1000) && s.start() && s.stop());

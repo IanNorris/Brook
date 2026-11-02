@@ -17,7 +17,7 @@ template<class Platform> class HdaDellToneAdapter {
     Platform& p_;const HdaSessionReport& saved_;HdaDellToneIci<Platform> ici_;
     HdaDellToneCodec<HdaDellToneIci<Platform>> codec_;HdaDellToneStream<Platform> stream_;
     uint64_t phys_[4]{};void* virt_[4]{};unsigned count_=0;bool quarantined_=false,begun_=false,active_=false,executed_=false;
-    uint8_t prepareStage_=0;uint32_t prepareValue_=0;
+    uint8_t prepareStage_=0,playReason_=0;uint32_t prepareValue_=0,playLoops_=0,playProgress_=0;uint64_t playElapsed_=0;
     void freePages() {while(count_){--count_;bool duplicate=false;for(unsigned i=0;i<count_;++i)if(phys_[i]==phys_[count_])duplicate=true;
         if(!duplicate)p_.freePage(phys_[count_]);phys_[count_]=0;virt_[count_]=nullptr;}}
     bool decoded(){if(!active_ || quarantined_)return false;const auto command=p_.command();return command==2 || command==6;}
@@ -33,6 +33,10 @@ public:
     uint8_t prepareStage()const{return prepareStage_;}uint32_t prepareValue()const{return prepareValue_;}
     uint8_t streamStage()const{return stream_.stage();}uint32_t streamDetail()const{return stream_.detail();}
     bool iciFailed()const{return ici_.failed();}
+    uint8_t playReason()const{return playReason_;}uint32_t playLoops()const{return playLoops_;}uint64_t playElapsed()const{return playElapsed_;}
+    uint32_t playProgress()const{return playProgress_;}
+    uint8_t progressReason()const{return stream_.progressReason();}uint8_t progressStatus()const{return stream_.progressStatus();}
+    uint16_t progressControl()const{return stream_.progressControl();}uint32_t progressFirst()const{return stream_.progressFirst();}uint32_t progressLast()const{return stream_.progressLast();}
     HdaToneResult run(bool audible) {
         if(!active_ || quarantined_ || executed_)return HdaToneResult::InvalidSnapshot;
         executed_=true;return HdaDellToneTransaction(*this,saved_,audible);
@@ -86,12 +90,13 @@ public:
     bool checkProgress(){return active_ && !quarantined_ && p_.command()==6 && stream_.progress();}
     bool unmuteAndVerify(const HdaDellTonePlan& plan){return active_ && !quarantined_ && matches(plan) && p_.command()==6 && codec_.unmuteAndVerify(plan);}
     bool playBounded() {
-        const uint64_t start=p_.ticks();
+        const uint64_t start=p_.ticks();playReason_=1;
         for(unsigned i=0;i<100000;++i) {
-            if(!active_ || quarantined_ || p_.command()!=6 || !stream_.progress())return false;
-            const uint64_t now=p_.ticks();if(now>=start && now-start>=400)return true;
+            playLoops_=i+1;if(!active_ || quarantined_ || p_.command()!=6){playReason_=2;return false;}
+            if(!stream_.progress()){const auto now=p_.ticks();if(now>=start)playElapsed_=now-start;playReason_=3;return false;}++playProgress_;
+            const uint64_t now=p_.ticks();if(now>=start){playElapsed_=now-start;if(playElapsed_>=400){playReason_=4;return true;}}
         }
-        return false; // stalled clock or progress cannot authorize more sound
+        playReason_=5;return false; // stalled clock or progress cannot authorize more sound
     }
     bool stopAndVerify() {
         if(!decoded() || !stream_.stop())return false;

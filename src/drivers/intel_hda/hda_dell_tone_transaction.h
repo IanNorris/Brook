@@ -29,7 +29,7 @@ template<class Io> HdaToneResult HdaDellToneTransaction(Io& io,const HdaSessionR
     if(!io.startDma())result=HdaToneResult::StartFailed;
     else if(!io.checkProgress())result=HdaToneResult::NoProgress;
     else if(audible && !io.unmuteAndVerify(plan))result=HdaToneResult::UnmuteFailed;
-    else if(audible && !io.playBounded())result=HdaToneResult::PlaybackFailed;
+    else if(!io.playBounded())result=HdaToneResult::PlaybackFailed; // exercise the same duration while muted
     const bool muted=io.muteAndVerify(plan);
     const bool stopped=io.stopAndVerify();
     if(!muted || !stopped) {io.quarantine();return HdaToneResult::CleanupFailed;}

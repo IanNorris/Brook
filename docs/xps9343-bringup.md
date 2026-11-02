@@ -1802,6 +1802,14 @@ The test now preserves that bit, flushes every cache line of its four immutable
 device-read-only DMA pages before bus mastering, and completes a second stream
 reset before clearing CBL and descriptor references. Host tests cover these
 operations and failures; they do not establish physical DMA progress.
+The revised muted run on the Dell completed with progress, clean retirement,
+PCI command restored to zero and no quarantined pages. A subsequent 400 ms
+quiet-tone run reached the unmute stage but reported a sustained playback
+failure; the user heard no tone. Cleanup remuted and stopped the stream, and
+the failed test retained its pages. The next diagnostic runs the same sustained
+check while muted and records stream/status/clock failure details. The user
+requested a later two-second test with volume capped at 30%; that remains
+pending until sustained playback succeeds.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

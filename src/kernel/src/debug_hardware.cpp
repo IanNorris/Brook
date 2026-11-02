@@ -150,6 +150,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("prepare_stage",o.tonePrepareStage);r.text(",");r.field("prepare_value",o.tonePrepareValue);
         r.text(",");r.field("stream_stage",o.toneStreamStage);r.text(",");r.field("stream_detail",o.toneStreamDetail);r.text(",");r.field("command",o.toneCommand);
         r.text(",\"ici_failed\":");r.text(o.toneIciFailed?"true":"false");
+        r.text(",");r.field("play_reason",o.tonePlayReason);r.text(",");r.field("play_loops",o.tonePlayLoops);r.text(",");r.field("play_progress",o.tonePlayProgress);r.text(",");r.field("play_elapsed",o.tonePlayElapsed);
+        r.text(",");r.field("progress_reason",o.toneProgressReason);r.text(",");r.field("progress_status",o.toneProgressStatus);
+        r.text(",");r.field("progress_control",o.toneProgressControl);r.text(",");r.field("progress_first",o.toneProgressFirst);r.text(",");r.field("progress_last",o.toneProgressLast);
         r.text(",\"reason\":");r.quoted(o.toneReason);r.text("}}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-memory")) {
