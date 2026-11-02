@@ -17,6 +17,8 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus();
 Device* AhciWriteAdmittedDevice();
 #if defined(BROOK_SSD_INSTALLER)
 Device* AhciPhysicalInstallDevice();
+Device* AhciPhysicalBlockToolsDevice();
+int AhciPhysicalBlockToolsFinalSync();
 #endif
 bool AhciReadOnlyExportInfo(BrookAhciExportInfo& info);
 int AhciReadOnlyExportRead(uint64_t offset,void* output,uint32_t length);

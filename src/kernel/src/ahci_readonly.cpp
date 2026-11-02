@@ -15,6 +15,7 @@
 #include "memory/virtual_memory.h"
 #include "memory/address.h"
 #include "apic.h"
+#include "serial.h"
 #include "string.h"
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 #include "ahci_test_admission.h"
@@ -36,6 +37,7 @@ bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
 #if defined(BROOK_SSD_INSTALLER)
 bool physicalInstallMode=false;
+bool physicalBlockToolsMode=false;
 #endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
@@ -310,17 +312,27 @@ void AhciReadOnlyInit() {
     writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
         selected,info,AtaSupportsFlushExt(dma+dataOffset,512));
 #if defined(BROOK_SSD_INSTALLER)
-    // A physical installer build never exposes a writable general-purpose disk.
-    // Require an exact boot marker and no system-volume selector; the admitted
-    // target is reserved exclusively for the installer, outside the registry.
+    // Require an exact boot marker and no system-volume selector; reserve the
+    // admitted target exclusively for the chosen installer mode, outside the registry.
     auto* installModeMarker=VfsOpen("/etc/ssd-install-mode",VFS_O_STREAM);
     VnodeStat ms{},selector{};char mv[2]{};uint64_t mo=0;
     const bool enabled=installModeMarker && !VfsStat(installModeMarker,&ms) && !ms.isDir && !ms.isSymlink && ms.size==2 &&
         VfsRead(installModeMarker,mv,2,&mo)==2 && mv[0]=='1' && mv[1]=='\n' &&
-        VfsLstatPath("/etc/ahci-boot-volume",&selector)==-2;
+        VfsLstatPath("/etc/ahci-boot-volume",&selector)==-2 &&
+        VfsLstatPath("/etc/ahci-data-volume",&selector)==-2;
     if(installModeMarker)VfsRelease(installModeMarker);
-    physicalInstallMode=enabled && writeEnabled;
-    writeEnabled=physicalInstallMode;
+    VnodeStat toolsStat{};const int toolsResult=VfsLstatPath("/etc/ssd-block-tools",&toolsStat);
+    const bool toolsRequested=toolsResult!=-2;
+    bool toolsValid=false;
+    if(!toolsResult && !toolsStat.isDir && !toolsStat.isSymlink && toolsStat.size==2) {
+        auto* toolsNode=VfsOpen("/etc/ssd-block-tools",VFS_O_STREAM);
+        char value[2]{};uint64_t offset=0;
+        toolsValid=toolsNode && VfsRead(toolsNode,value,2,&offset)==2 && value[0]=='1' && value[1]=='\n';
+        if(toolsNode)VfsRelease(toolsNode);
+    }
+    physicalBlockToolsMode=enabled && writeEnabled && toolsRequested && toolsValid;
+    physicalInstallMode=enabled && writeEnabled && !toolsRequested;
+    writeEnabled=physicalInstallMode || physicalBlockToolsMode;
 #endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     // Test hooks also require the exact disposable QEMU identity. They can be
@@ -354,7 +366,7 @@ void AhciReadOnlyInit() {
 #endif
     KMutexInit(&ioLock);
 #if defined(BROOK_SSD_INSTALLER)
-    if(!physicalInstallMode && !DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
+    if(!physicalInstallMode && !physicalBlockToolsMode && !DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
 #else
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
 #endif
@@ -382,7 +394,7 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus() {
 Device* AhciWriteAdmittedDevice() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
 #if defined(BROOK_SSD_INSTALLER)
-    if(physicalInstallMode)return nullptr;
+    if(physicalInstallMode || physicalBlockToolsMode)return nullptr;
 #endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(testInstallMode || blockToolsMode)return nullptr; // reserve test target from boot mounts
@@ -394,6 +406,17 @@ Device* AhciWriteAdmittedDevice() {
 Device* AhciPhysicalInstallDevice() {
     if(!physicalInstallMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
     KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;
+}
+Device* AhciPhysicalBlockToolsDevice() {
+    if(!physicalBlockToolsMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+    KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;
+}
+int AhciPhysicalBlockToolsFinalSync() {
+    if(!physicalBlockToolsMode)return 0;
+    Device* target=AhciPhysicalBlockToolsDevice();
+    const int result=target ? DeviceFlush(target) : -5;
+    SerialPrintf("ahci: installer block tools final flush result=%d\n",result);
+    return result;
 }
 #endif
 int AhciReadOnlySector(uint64_t lba,void* output) {

@@ -1,7 +1,7 @@
 #include "process_fs.h"
 #include "seek_position.h"
 #include "device.h"
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
 #include "strict_gpt_inventory.h"
 #endif
 #include "kprintf.h"
@@ -2004,9 +2004,9 @@ static constexpr uint64_t AppendStageLimit = 64 * 1024;
 // Backend/VFS byte results are signed int. Bound ordinary writes rather than
 // narrowing a 64-bit request (which can wrap to zero or a negative result).
 static constexpr uint64_t VnodeWriteLimit = 0x7ffff000ULL;
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-// A private test-only descriptor for an unmounted, identity-checked QEMU
-// installer disk. Production builds do not expose it.
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
+// A maintenance-only descriptor for an unmounted, identity-checked target.
+// Normal desktop builds do not expose it.
 struct MaintenanceBlockFd {
     Device* device;
     uint64_t start,bytes,position;
@@ -2014,11 +2014,45 @@ struct MaintenanceBlockFd {
     uint32_t refs;
     KMutex lock;
 };
-static uint32_t maintenanceBlockOpen=0;
-// Published only after range validation, and cleared before exclusive release.
-static uint32_t maintenanceBlockPublished=0;
+// A session reserves one immutable range for one thread group. Separate opens
+// in that group have independent offsets; inherited descriptors retain the
+// reservation, but do not grant a child permission to open the disk again.
+static SpinLock maintenanceBlockLock{};
+static uint32_t maintenanceBlockHolders=0,maintenanceBlockPublished=0;
+static uint16_t maintenanceBlockOwner=0;
+static uint64_t maintenanceBlockOwnerIncarnation=0,maintenanceBlockStart=0,maintenanceBlockBytes=0;
+static bool MaintenanceBlockReserve(Process* proc,uint32_t partition,bool& first,uint64_t& start,uint64_t& bytes) {
+    const uint16_t owner=proc->tgid;
+    const uint64_t incarnation=proc->pid==owner?proc->incarnation:proc->leaderIncarnation;
+    if(!owner || !incarnation)return false;
+    SpinLockAcquire(&maintenanceBlockLock);
+    first=maintenanceBlockHolders==0;
+    const bool allowed=first || (maintenanceBlockPublished==partition+1 &&
+        maintenanceBlockOwner==owner && maintenanceBlockOwnerIncarnation==incarnation);
+    if(allowed) {
+        if(first){maintenanceBlockOwner=owner;maintenanceBlockOwnerIncarnation=incarnation;maintenanceBlockPublished=0;}
+        ++maintenanceBlockHolders;start=maintenanceBlockStart;bytes=maintenanceBlockBytes;
+    }
+    SpinLockRelease(&maintenanceBlockLock);return allowed;
+}
+static void MaintenanceBlockRelease() {
+    SpinLockAcquire(&maintenanceBlockLock);
+    if(--maintenanceBlockHolders==0){maintenanceBlockPublished=0;maintenanceBlockOwner=0;maintenanceBlockOwnerIncarnation=0;}
+    SpinLockRelease(&maintenanceBlockLock);
+}
+static Device* MaintenanceBlockDevice() {
+#if defined(BROOK_SSD_INSTALLER)
+    return AhciPhysicalBlockToolsDevice();
+#else
+    return AhciDisposableQemuBlockToolsDevice();
+#endif
+}
 static bool MaintenanceBlockPath(const char* path,uint32_t& partition) {
+#if defined(BROOK_SSD_INSTALLER)
+    static constexpr char prefix[]="/dev/brook-install-disk";
+#else
     static constexpr char prefix[]="/dev/brook-test-disk";
+#endif
     if(strncmp(path,prefix,sizeof(prefix)-1))return false;
     path+=sizeof(prefix)-1;partition=0;
     if(!*path)return true;
@@ -2113,7 +2147,7 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
 static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                                      uint64_t bufAddr,uint64_t count,bool userSource)
 {
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         if((fde->statusFlags&3)==0)return -EBADF;
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
@@ -2557,7 +2591,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (count > 0 && !UserBufferWritable(bufAddr, count))
         return -EFAULT;
 
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         if((fde->statusFlags&3)==1)return -EBADF;
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
@@ -3478,27 +3512,32 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     const char* lookupPath=hasSyntheticName?resolvedPath:path;
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     uint32_t blockPartition=0;
     if(MaintenanceBlockPath(syntheticPath,blockPartition)) {
         if(proc->euid!=0)return -EPERM;
         if((flags&3)==3 || (flags&(0x40|0x200|0x10000|0x200000)))return -EINVAL;
-        Device* device=AhciDisposableQemuBlockToolsDevice();
+        Device* device=MaintenanceBlockDevice();
         if(!device || !device->ops || !device->ops->read || !device->ops->write)return -ENODEV;
-        if(__atomic_exchange_n(&maintenanceBlockOpen,1,__ATOMIC_ACQ_REL))return -16;
         uint64_t start=0,bytes=0;
-        if(!MaintenanceBlockRange(device,blockPartition,start,bytes)) {
-            __atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -ENODEV;
+        bool first=false;
+        if(!MaintenanceBlockReserve(proc,blockPartition,first,start,bytes))return -16;
+        if(first && !MaintenanceBlockRange(device,blockPartition,start,bytes)) {
+            MaintenanceBlockRelease();return -ENODEV;
         }
         auto* block=static_cast<MaintenanceBlockFd*>(kmalloc(sizeof(MaintenanceBlockFd)));
-        if(!block){__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -ENOMEM;}
+        if(!block){MaintenanceBlockRelease();return -ENOMEM;}
         block->device=device;block->start=start;block->bytes=bytes;block->position=0;
         block->partition=blockPartition;block->refs=1;KMutexInit(&block->lock);
-        __atomic_store_n(&maintenanceBlockPublished,blockPartition+1,__ATOMIC_RELEASE);
+        if(first) {
+            SpinLockAcquire(&maintenanceBlockLock);
+            maintenanceBlockStart=start;maintenanceBlockBytes=bytes;maintenanceBlockPublished=blockPartition+1;
+            SpinLockRelease(&maintenanceBlockLock);
+        }
         FdEntry entry{};entry.type=FdType::BlockDevice;entry.handle=block;
         entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
         const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
-        if(fd<0){kfree(block);__atomic_store_n(&maintenanceBlockPublished,0,__ATOMIC_RELEASE);__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -EMFILE;}
+        if(fd<0){kfree(block);MaintenanceBlockRelease();return -EMFILE;}
         return fd;
     }
 #endif
@@ -3919,12 +3958,11 @@ static int64_t sys_creat(uint64_t path,uint64_t mode,uint64_t,uint64_t,uint64_t,
 void FinalizeClosedFd(const FdClaimResult& c)
 {
     KernelOperationGuard operation(ProcessCurrent());
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(c.type==FdType::BlockDevice && c.handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(c.handle);
         if(__atomic_fetch_sub(&block->refs,1,__ATOMIC_ACQ_REL)==1) {
-            kfree(block);__atomic_store_n(&maintenanceBlockPublished,0,__ATOMIC_RELEASE);
-            __atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);
+            kfree(block);MaintenanceBlockRelease();
         }
     }
 #endif
@@ -4166,7 +4204,7 @@ static void FdBumpRefcount(const FdEntry* fde)
     if (!fde->handle) return;
     switch (fde->type)
     {
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     case FdType::BlockDevice:
         __atomic_fetch_add(&static_cast<MaintenanceBlockFd*>(fde->handle)->refs,1,__ATOMIC_RELAXED);break;
 #endif
@@ -4327,7 +4365,7 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     FdEntry* fde = ref.get();
 
     if(FdPipe(fde))return -29;
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         KMutexLock(&block->lock);
@@ -7173,7 +7211,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdEntry* fde = ref.get();
     if (!fde || fde->type==FdType::Path) return -EBADF;
 
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         if(cmd==0x80081272 || cmd==0x1260) {
@@ -8038,18 +8076,20 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
 // driver being present so we never advertise an unusable node.
 static bool DrmStatFill(const char* path, LinuxStat* st)
 {
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     uint32_t partition=0;
     if(MaintenanceBlockPath(path,partition)) {
-        Device* device=AhciDisposableQemuBlockToolsDevice();
+        Device* device=MaintenanceBlockDevice();
         if(!device)return false;
-        bool valid=false;
-        if(__atomic_exchange_n(&maintenanceBlockOpen,1,__ATOMIC_ACQ_REL)) {
-            valid=__atomic_load_n(&maintenanceBlockPublished,__ATOMIC_ACQUIRE)==partition+1;
-        } else {
+        bool valid=false,temporary=false;
+        SpinLockAcquire(&maintenanceBlockLock);
+        if(maintenanceBlockHolders)valid=maintenanceBlockPublished==partition+1;
+        else {maintenanceBlockHolders=1;maintenanceBlockPublished=0;temporary=true;}
+        SpinLockRelease(&maintenanceBlockLock);
+        if(temporary) {
             uint64_t start=0,bytes=0;
             valid=MaintenanceBlockRange(device,partition,start,bytes);
-            __atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);
+            MaintenanceBlockRelease();
         }
         if(!valid)return false;
         memset(st,0,sizeof(*st));st->st_mode=0060600;st->st_nlink=1;
@@ -8221,7 +8261,7 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
     FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
 
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         memset(st,0,sizeof(*st));st->st_mode=0060600;st->st_nlink=1;
@@ -8552,7 +8592,7 @@ static int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
     FdEntry* fde = ref.get();
     if (!fde || fde->type == FdType::None || fde->type==FdType::Path) return -EBADF;
 
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle)
         return DeviceFlush(static_cast<MaintenanceBlockFd*>(fde->handle)->device);
 #endif
@@ -11505,7 +11545,7 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if(FdPipe(fde))return -29;
     if (!fde || fde->type==FdType::Path) return -EBADF;
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         if((fde->statusFlags&3)==0)return -EBADF;
         if(count && !UserBufferReadable(bufAddr,count))return -EFAULT;
@@ -13099,7 +13139,7 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
     if (count && !UserBufferWritable(bufAddr, count)) return -EFAULT;
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         if((fde->statusFlags&3)==1)return -EBADF;
         return MaintenanceBlockTransfer(static_cast<MaintenanceBlockFd*>(fde->handle),bufAddr,count,&offset,false,true);
