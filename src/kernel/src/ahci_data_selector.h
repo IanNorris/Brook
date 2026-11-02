@@ -38,7 +38,7 @@ inline bool AhciDataSelect(const AhciDataSelector& wanted,uint64_t diskSectors,
        StrictGptCheckHeader(backup,512,diskSectors,true,b)!=StrictGptResult::Ok ||
        StrictGptCheckCopies(a,entries,b,backupEntries,bytes)!=StrictGptResult::Ok ||
        memcmp(wanted.diskGuid,a.diskGuid,16))return false;
-    static constexpr uint8_t linuxFs[16]={0x0f,0xc6,0x3d,0xaf,0x83,0x84,0x72,0x47,
+    static constexpr uint8_t linuxFs[16]={0xaf,0x3d,0xc6,0x0f,0x83,0x84,0x72,0x47,
                                            0x8e,0x79,0x3d,0x69,0xd8,0x47,0x7d,0xe4};
     for(uint32_t i=0;i<a.count;++i) {
         const uint8_t* entry=entries+uint64_t(i)*a.entrySize;

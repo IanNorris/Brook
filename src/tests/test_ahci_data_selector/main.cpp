@@ -37,10 +37,13 @@ static int fixture(const char* path,const char* storePath,uint64_t dataCount) {
        selectedBoot.entry!=1 || selected.entry!=2 || selected.first!=16384 || selected.count!=dataCount)return 1;
     if(!storePath)return 0;
     std::ifstream store(storePath,std::ios::binary);uint8_t sb[1024]{};
-    store.seekg(1024);store.read(reinterpret_cast<char*>(sb),sizeof(sb));if(!store)return 1;
+    // The same path explicitly means the ext2 fixture is embedded in the
+    // GPT-selected partition; a separate path is a standalone store image.
+    const uint64_t base=std::string(path)==storePath ? want.first*512 : 0;
+    store.seekg(base+1024);store.read(reinterpret_cast<char*>(sb),sizeof(sb));if(!store)return 1;
     std::memcpy(want.filesystemUuid,sb+104,16);
     LargeExt2Geometry g{};if(!LargeExt2GeometryMake(LargeExt2Read32(sb+4),g))return 1;
-    std::vector<uint8_t> table(g.descriptorBytes);store.seekg(4096);
+    std::vector<uint8_t> table(g.descriptorBytes);store.seekg(base+4096);
     store.read(reinterpret_cast<char*>(table.data()),table.size());if(!store)return 1;
     auto inspect=[&](const uint8_t* sbuf,const uint8_t* gbuf,uint32_t n,AhciDataInspection& out){
         return AhciInspectBootAndData(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,
@@ -73,7 +76,7 @@ int main(int argc,char** argv){
     bad("BRKDATA1\n01000000000000000000000000000000\n02000000000000000000000000000000\n1,36028797018963968\n03000000000000000000000000000000\n");
     uint8_t mbr[512]{},primary[512]{},backup[512]{},entries[16384]{},copy[16384]{};
     mbr[510]=0x55;mbr[511]=0xaa;mbr[450]=0xee;put32(mbr+454,1);put32(mbr+458,99999);
-    const uint8_t linuxFs[16]={0x0f,0xc6,0x3d,0xaf,0x83,0x84,0x72,0x47,0x8e,0x79,0x3d,0x69,0xd8,0x47,0x7d,0xe4};
+    const uint8_t linuxFs[16]={0xaf,0x3d,0xc6,0x0f,0x83,0x84,0x72,0x47,0x8e,0x79,0x3d,0x69,0xd8,0x47,0x7d,0xe4};
     std::memcpy(entries+128,linuxFs,16);entries[144]=2;put64(entries+160,2048);put64(entries+168,4095);
     auto refresh=[&](){std::memcpy(copy,entries,sizeof(entries));auto crc=StrictCrc32(entries,sizeof(entries));header(primary,false,crc);header(backup,true,crc);};
     refresh();AhciBootSelection selected{};
@@ -87,7 +90,12 @@ int main(int argc,char** argv){
     want.partitionGuid[0]^=1;assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));want.partitionGuid[0]^=1;
     copy[100]^=1;assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));copy[100]^=1;
     entries[128]^=1;refresh();assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));
-    entries[128]^=1;refresh();
+    entries[128]^=1;
+    // The old implementation used the canonical GUID's first word in the
+    // wrong byte order; a checksummed table containing it is not Linux type.
+    entries[128]=0x0f;entries[129]=0xc6;entries[130]=0x3d;entries[131]=0xaf;
+    refresh();assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));
+    std::memcpy(entries+128,linuxFs,16);refresh();
     std::memcpy(entries+256,linuxFs,16);entries[272]=2;put64(entries+288,5000);put64(entries+296,6000);
     refresh();assert(!AhciDataSelect(want,100000,mbr,primary,backup,entries,copy,sizeof(entries),selected));
     entries[272]=4;put64(entries+288,3000);refresh();

@@ -126,3 +126,13 @@ independent 16 MiB and 17 GiB GPT/ext2 fixture pairs pass. These pairs are
 separate files and do not exercise partition-relative reads, disk ownership,
 mounting, recovery or filesystem consistency; the composition remains unused
 by live boot.
+
+The first independent GPT test actually failed: the selector and synthetic
+fixture shared a wrong byte order for the Linux filesystem type GUID. The test
+command's exit status was overlooked. The selector and fixture are corrected;
+the small and 17 GiB separate fixture pairs now pass with exit status checked.
+`scripts/test_ahci_data_selector.sh` creates an independent GPT with `sfdisk`
+and formats ext2 inside its data partition with `mke2fs`, then validates the
+embedded filesystem at partition-relative offsets. The same check also passed
+on a sparse 18 GiB disk with a 17 GiB data partition. These are host-side file
+reads, not AHCI device, mount, filesystem write or durability tests.
