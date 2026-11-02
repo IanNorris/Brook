@@ -12,6 +12,7 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "hda_observe.h"
+#include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include <cassert>
@@ -25,6 +26,8 @@ bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& ou
 namespace brook {
 HdaObservation hdaObservation{};
 const HdaObservation& HdaObserveRead(){return hdaObservation;}
+NativeTscObservation tscObservation{};
+const NativeTscObservation& NativeTscObserveRead(){return tscObservation;}
 DellI2cIdResult DellI2cIdProbe(uint32_t& value){value=0;return DellI2cIdResult::Disabled;}
 DellI2cIdStatus DellI2cIdProbeStatus(){return {};}
 bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
@@ -99,6 +102,9 @@ int main(){
     assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);
     assert(reply.find("\"backlight_api\":1")!=std::string::npos);
     assert(reply.find("\"writable_desktop_api\":1")!=std::string::npos);
+    assert(handle("bridge hardware native-tsc-observe") && reply.find("\"requested\":false")!=std::string::npos);
+    brook::tscObservation.requested=true;brook::tscObservation.samples[2]=123456;
+    assert(handle("bridge hardware native-tsc-observe") && reply.find("\"samples\":[0,0,123456,0,0]")!=std::string::npos);
     brook::ahciStatus.ready=true;std::strcpy(brook::ahciStatus.serial,"serial-123");
     assert(handle("bridge hardware ahci-ro") && reply.find("\"serial\":\"serial-123\"")!=std::string::npos);
     assert(handle("bridge hardware ahci-sector 3") && reply.find("5a5a5a5a")!=std::string::npos);

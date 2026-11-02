@@ -27,6 +27,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "display_power.h"
 #include "ahci_observe.h"
 #include "hda_observe.h"
+#include "native_tsc_observe.h"
 #include "ahci_readonly.h"
 #include "ramdisk.h"
 #include "fatfs_glue.h"
@@ -729,6 +730,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::PciScanPrint();
     // One-shot HDA observation executes on the BSP before AP scheduler entry
     // and before audio modules can claim the controller.
+    brook::NativeTscObserveConfigure();
     brook::HdaObserveConfigure(bootProtocol);
     brook::AhciObserveConfigure(bootProtocol);
     brook::AhciReadOnlyInit();

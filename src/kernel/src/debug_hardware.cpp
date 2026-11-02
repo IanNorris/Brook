@@ -20,6 +20,7 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "hda_observe.h"
+#include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include "../../drivers/intel_hda/hda_probe.h"
@@ -120,6 +121,14 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(status.completed){r.text(",\"result\":");r.quoted(I2cProbeResult(status.result));
             if(status.result==DellI2cIdResult::Identified || status.result==DellI2cIdResult::Unknown){r.text(",");r.field("value",status.value);}}
         r.text(",\"pci_extent_ownership\":\"unresolved\"}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware native-tsc-observe")) {
+        const auto& o=NativeTscObserveRead();Reply r;r.text("{\"native_tsc_observe_api\":1,\"requested\":");r.text(o.requested?"true":"false");
+        r.text(",\"attempted\":");r.text(o.attempted?"true":"false");r.text(",\"capable\":");r.text(o.capable?"true":"false");
+        r.text(",\"measured\":");r.text(o.measured?"true":"false");r.text(",\"consistent\":");r.text(o.consistent?"true":"false");
+        r.text(",");r.field("khz",o.khz);r.text(",");r.field("pit_ticks",o.pitTicks);r.text(",\"samples\":[");
+        for(unsigned i=0;i<5;++i){if(i)r.text(",");r.number(o.samples[i]);}
+        r.text("],\"reason\":");r.quoted(o.reason);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-observe")) {
         const auto& o=HdaObserveRead();const auto& s=o.session;
