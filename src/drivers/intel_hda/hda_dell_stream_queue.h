@@ -98,8 +98,10 @@ public:
         if(!initialized_ || failed_){r.error=-32;return r;}
         if(!service()){r.error=-32;return r;}
         const uint64_t cursor=clock_.RawCompleted();
-        if(cursor>~uint64_t(0)-guard_-2*line_ || cleared_>~uint64_t(0)-Ring){fail();r.error=-32;return r;}
-        const uint64_t minBegin=(cursor+guard_+2*line_-1)&~uint64_t(line_-1);
+        if(cursor>~uint64_t(0)-guard_-maxBurst_-2*line_ || cleared_>~uint64_t(0)-Ring){fail();r.error=-32;return r;}
+        // Leave a whole expected fetch burst between this sample and the
+        // publication guard; the publisher samples again before copying.
+        const uint64_t minBegin=(cursor+guard_+maxBurst_+2*line_-1)&~uint64_t(line_-1);
         uint64_t begin=clock_.submitted;if(begin<minBegin)begin=minBegin;
         const uint64_t clearedThrough=cleared_+Ring;
         if(cursor>~uint64_t(0)-Ring){fail();r.error=-32;return r;}
