@@ -136,6 +136,7 @@ int main(){
     assert(handle("bridge hardware dell-i2c-id status") && reply.find("\"started\":false")!=std::string::npos);
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
     assert(handle("bridge hardware dell-hda-observe") && reply.find("\"requested\":false")!=std::string::npos);
+    assert(handle("bridge hardware dell-hda-stream") && reply.find("\"hda_stream_api\":1")!=std::string::npos && reply.find("\"requested\":false")!=std::string::npos);
     brook::hdaObservation.requested=true;brook::hdaObservation.session.completed=2;
     brook::hdaObservation.session.values[0]=123;brook::hdaObservation.session.values[1]=456;
     assert(handle("bridge hardware dell-hda-observe") && reply.find("\"values\":[123,456]")!=std::string::npos);

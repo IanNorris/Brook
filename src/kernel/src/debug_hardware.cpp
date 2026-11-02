@@ -135,6 +135,14 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("round_trip",c.interval.roundTrip);r.text("}");}
         r.text("],\"reason\":");r.quoted(o.reason);r.text("}\n");r.send();return true;
     }
+    if(!strcmp(command,"bridge hardware dell-hda-stream")) {
+        const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_stream_api\":1,\"requested\":");r.text(o.streamRequested?"true":"false");
+        r.text(",\"attempted\":");r.text(o.streamAttempted?"true":"false");r.text(",\"finished\":");r.text(o.streamFinished?"true":"false");
+        r.text(",\"quarantined\":");r.text(o.streamQuarantined?"true":"false");r.text(",");r.field("submissions",o.streamSubmissions);
+        r.text(",");r.field("accepted",o.streamAccepted);r.text(",");r.field("completed",o.streamCompleted);
+        r.text(",");r.field("elapsed_ns",o.streamElapsedNs);r.text(",");r.field("command",o.streamCommand);
+        r.text(",\"reason\":");r.quoted(o.streamReason);r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware dell-hda-observe")) {
         const auto& o=HdaObserveRead();const auto& s=o.session;
         Reply r;r.text("{\"hda_observe_api\":1,\"requested\":");r.text(o.requested?"true":"false");

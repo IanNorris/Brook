@@ -12,6 +12,10 @@
 #include "../../drivers/intel_hda/hda_dell_tone_adapter.h"
 #include "../../drivers/intel_hda/hda_dell_tone_controller.h"
 #include "../../drivers/intel_hda/hda_dma_publish.h"
+#include "../../drivers/intel_hda/hda_dell_stream_owner.h"
+#include "../../drivers/intel_hda/hda_dell_stream_queue.h"
+#include "native_tsc_observe.h"
+#include "native_tsc_policy.h"
 #include <stddef.h>
 #ifdef BROOK_HOST_TEST
 #include <cstring>
@@ -26,6 +30,8 @@ namespace brook {
 uint8_t HdaObserveTestRead8(uint32_t);uint16_t HdaObserveTestRead16(uint32_t);uint32_t HdaObserveTestRead32(uint32_t);
 void HdaObserveTestWrite8(uint32_t,uint8_t);void HdaObserveTestWrite16(uint32_t,uint16_t);void HdaObserveTestWrite32(uint32_t,uint32_t);
 bool HdaObserveTestFlushInfo(uint32_t&);void HdaObserveTestFlushLine(void*);
+uint64_t HdaObserveTestNowNs();
+void HdaObserveTestBeforeStreamIteration();
 #endif
 namespace {
 HdaObservation observation{};
@@ -190,7 +196,7 @@ struct Io {
 // adapter, the borrowed MMIO mapping and all owned RAM pages until reboot.
 struct TonePlatform {
     Io& io;const HdaSessionReport& snapshot;
-    void* dmaPages[4]{};
+    void* dmaPages[17]{};unsigned expectedPages=4;bool streamMode=false;uint64_t tscOrigin=0;
     bool flushInfo(uint32_t& line){
 #ifdef BROOK_HOST_TEST
         const bool available=HdaObserveTestFlushInfo(line);
@@ -227,6 +233,17 @@ struct TonePlatform {
     uint32_t read32(uint32_t o){return io.read32(o);}void write8(uint32_t o,uint8_t v){io.write8(o,v);}
     void write16(uint32_t o,uint16_t v){io.write16(o,v);}void write32(uint32_t o,uint32_t v){io.write32(o,v);}
     uint64_t ticks(){return io.ticks();}void pause(){io.pause();}
+    uint64_t nowNs(){
+#ifdef BROOK_HOST_TEST
+        return HdaObserveTestNowNs();
+#else
+        if(SmpCurrentCpuIndex()!=0 || !tscOrigin)return 0;
+        const auto& clock=NativeTscObserveRead();if(!clock.consistent || !clock.khz)return 0;
+        uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
+        uint64_t ns=0;if(!NativeTscElapsedNs(tscOrigin,(uint64_t(hi)<<32)|lo,clock.khz,ns) || ns==~uint64_t(0))return 0;
+        return ns+1;
+#endif
+    }
     bool delayUs(unsigned us){
         if(us>1000)return false;uint64_t flags=0;__asm__ volatile("pushfq; popq %0":"=r"(flags));
         if(!(flags&0x200))return false;const auto start=ticks();uint64_t anchor=0;bool haveBoundary=false;
@@ -244,14 +261,54 @@ struct TonePlatform {
         __asm__ volatile("clflush (%0)"::"r"(address):"memory");
 #endif
     }
+    bool fence(){__atomic_thread_fence(__ATOMIC_SEQ_CST);return true;}
     bool publishDma(){
         uint32_t line=0;if(!flushInfo(line))return false;
-        for(void* page:dmaPages)if(!HdaDmaFlushRange(*this,page,4096,0,4096,line))return false;
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);return true;
+        for(unsigned i=0;i<expectedPages;++i)if(!HdaDmaFlushRange(*this,dmaPages[i],4096,0,4096,line))return false;
+        return fence();
     }
-    void quarantine(){observation.toneQuarantined=true;}
+    void quarantine(){if(streamMode)observation.streamQuarantined=true;else observation.toneQuarantined=true;}
 };
 bool Marker(const char* path){auto* node=VfsOpen(path);if(!node)return false;VfsClose(node);return true;}
+void RunStreamProbe(Io& io){
+    observation.streamAttempted=true;
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.consistent || !tsc.khz){observation.streamReason="native clock unavailable";return;}
+    alignas(TonePlatform) static unsigned char platformStorage[sizeof(TonePlatform)];
+    auto* platform=::new(platformStorage) TonePlatform{io,observation.session};platform->expectedPages=17;platform->streamMode=true;
+#ifndef BROOK_HOST_TEST
+    uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
+    platform->tscOrigin=(uint64_t(hi)<<32)|lo;if(!platform->tscOrigin){observation.streamReason="native clock unavailable";return;}
+#endif
+    uint32_t line=0;if(!platform->flushInfo(line) || !platform->delayUs(3)){observation.streamReason="cache or timer unavailable";return;}
+    using Owner=HdaDellStreamOwner<TonePlatform>;using Queue=HdaDellStreamQueue<Owner>;
+    alignas(Owner) static unsigned char ownerStorage[sizeof(Owner)];alignas(Queue) static unsigned char queueStorage[sizeof(Queue)];
+    auto* owner=::new(ownerStorage) Owner(*platform,observation.session,line);
+    if(!owner->prepare()){observation.streamCommand=platform->command();observation.streamReason="owner preparation failed";return;}
+    auto* queue=::new(queueStorage) Queue(*owner,line,4096,1024);
+    if(!queue->start()){observation.streamCommand=platform->command();observation.streamReason="queue start failed";return;}
+    static uint8_t samples[1764];for(unsigned i=0;i<sizeof(samples);++i)samples[i]=uint8_t(i*37);
+    const uint64_t start=platform->nowNs();uint64_t next=start;bool ok=start!=0,complete=false;
+    for(unsigned i=0;ok && i<10000000;++i){
+#ifdef BROOK_HOST_TEST
+        HdaObserveTestBeforeStreamIteration();
+#endif
+        const uint64_t now=platform->nowNs();if(!now || now<start){ok=false;break;}
+        observation.streamElapsedNs=now-start;if(observation.streamElapsedNs>=2000000000ULL){
+            if(!queue->service())ok=false;else complete=true;break;}
+        if(now>=next){const auto receipt=queue->submit(samples,sizeof(samples));
+            if(receipt.error){ok=false;break;}if(receipt.accepted){++observation.streamSubmissions;observation.streamAccepted+=receipt.accepted;}
+            if(now>~uint64_t(0)-10000000ULL){ok=false;break;}next=now+10000000ULL;
+        }else if(!queue->service()){ok=false;break;}
+        platform->pause();
+    }
+    observation.streamCompleted=queue->progress().RawCompleted();
+    if(!queue->failed() && !queue->shutdown())ok=false;
+    if(!queue->failed() && !owner->retire())ok=false;
+    observation.streamCommand=platform->command();
+    observation.streamFinished=ok && complete && observation.streamAccepted && observation.streamCompleted>65536 && !observation.streamQuarantined && observation.streamCommand==0;
+    observation.streamReason=observation.streamFinished?"complete":"stream test failed";
+}
 }
 void HdaObserveConfigure(const BootProtocol* boot) {
     if(observation.attempted)return;
@@ -264,6 +321,12 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
     const bool muted=Marker("/etc/dell-hda-muted-dma"),audible=Marker("/etc/dell-hda-quiet-tone");
     const bool mixerProbe=Marker("/etc/dell-hda-mixer-format-probe");
+    if(Marker("/etc/dell-hda-stream-probe")){
+        observation.streamRequested=true;
+        if(muted || audible || mixerProbe){observation.streamReason="conflicting markers";return;}
+        if(observation.session.result!=HdaSessionResult::Complete || observation.session.after!=0 || !observation.mapped){observation.streamReason="observation incomplete";return;}
+        RunStreamProbe(io);return;
+    }
     if(!muted && !audible)return;
     observation.toneRequested=true;observation.toneAudible=audible;
     if(muted && audible){observation.toneReason="conflicting markers";return;}
