@@ -24,6 +24,7 @@ namespace brook {
 #ifdef BROOK_HOST_TEST
 uint8_t HdaObserveTestRead8(uint32_t);uint16_t HdaObserveTestRead16(uint32_t);uint32_t HdaObserveTestRead32(uint32_t);
 void HdaObserveTestWrite8(uint32_t,uint8_t);void HdaObserveTestWrite16(uint32_t,uint16_t);void HdaObserveTestWrite32(uint32_t,uint32_t);
+bool HdaObserveTestFlushInfo(uint32_t&);void HdaObserveTestFlushLine(void*);
 #endif
 namespace {
 HdaObservation observation{};
@@ -188,6 +189,16 @@ struct Io {
 // adapter, the borrowed MMIO mapping and all owned RAM pages until reboot.
 struct TonePlatform {
     Io& io;const HdaSessionReport& snapshot;
+    void* dmaPages[4]{};
+    bool flushInfo(uint32_t& line){
+#ifdef BROOK_HOST_TEST
+        const bool available=HdaObserveTestFlushInfo(line);
+#else
+        uint32_t a=1,b=0,c=0,d=0;__asm__ volatile("cpuid":"+a"(a),"=b"(b),"=c"(c),"=d"(d));
+        line=((b>>8)&255)*8;const bool available=(d&(1u<<19))!=0;
+#endif
+        return available && line>=16 && line<=4096 && !(line&(line-1)) && !(4096%line);
+    }
     bool identityStable(){
         const bool inventory=HdaDellToneInventoryMatches(),valid=io.valid(),range=SafeBootRange(io.boot,io.base),bars=OtherBarStartsClear(io.base);
         observation.toneAdmission=(observation.toneAdmission&16)|(inventory?1u:0u)|(valid?2u:0u)|(range?4u:0u)|(bars?8u:0u);
@@ -197,7 +208,9 @@ struct TonePlatform {
     bool allocatePage(uint64_t& physical,void*& address){
         const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);
         if(!p){observation.tonePage=0;observation.tonePageStatus=4;return false;}
-        physical=p.raw();address=reinterpret_cast<void*>(PhysToVirt(p).raw());observation.tonePage=physical;return true;}
+        physical=p.raw();address=reinterpret_cast<void*>(PhysToVirt(p).raw());observation.tonePage=physical;
+        for(auto& slot:dmaPages)if(!slot){slot=address;return true;}
+        PmmFreePage(p);physical=0;address=nullptr;return false;}
     bool pageAllowed(uint64_t physical,void* address){
         if(!physical || physical>0xfffff000ULL || (physical&4095) || !address ||
            (reinterpret_cast<uintptr_t>(address)&4095)){observation.tonePageStatus=1;return false;}
@@ -206,7 +219,9 @@ struct TonePlatform {
            !HdaDellToneRamMappingMatches(physical,reinterpret_cast<uint64_t>(address),DIRECT_MAP_BASE,direct)){
             observation.tonePageStatus=2;return false;}
         observation.tonePageStatus=3;return true;}
-    void clearPage(void* p){memset(p,0,4096);}void freePage(uint64_t p){PmmFreePage(PhysicalAddress(p));}
+    void clearPage(void* p){memset(p,0,4096);}void freePage(uint64_t p){
+        void* address=reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(p)).raw());for(auto& slot:dmaPages)if(slot==address)slot=nullptr;
+        PmmFreePage(PhysicalAddress(p));}
     uint8_t read8(uint32_t o){return io.read8(o);}uint16_t read16(uint32_t o){return io.read16(o);}
     uint32_t read32(uint32_t o){return io.read32(o);}void write8(uint32_t o,uint8_t v){io.write8(o,v);}
     void write16(uint32_t o,uint16_t v){io.write16(o,v);}void write32(uint32_t o,uint32_t v){io.write32(o,v);}
@@ -221,7 +236,17 @@ struct TonePlatform {
             else if(haveBoundary && now>=anchor && now-anchor>=2)return true;pause();}
         return false;
     }
-    void publishDma(){__atomic_thread_fence(__ATOMIC_SEQ_CST);}
+    bool publishDma(){
+        uint32_t line=0;if(!flushInfo(line))return false;
+        for(void* page:dmaPages){if(!page)return false;for(unsigned o=0;o<4096;o+=line){
+#ifdef BROOK_HOST_TEST
+            HdaObserveTestFlushLine(static_cast<unsigned char*>(page)+o);
+#else
+            __asm__ volatile("clflush (%0)"::"r"(static_cast<unsigned char*>(page)+o):"memory");
+#endif
+        }}
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);return true;
+    }
     void quarantine(){observation.toneQuarantined=true;}
 };
 bool Marker(const char* path){auto* node=VfsOpen(path);if(!node)return false;VfsClose(node);return true;}
@@ -249,6 +274,7 @@ void HdaObserveConfigure(const BootProtocol* boot) {
     auto* adapter=::new(adapterStorage) ToneAdapter(*platform,observation.session);
     observation.toneAttempted=true;
     HdaDellTonePlan checkPlan{};if(HdaDellMakeTonePlan(observation.session,checkPlan))observation.toneAdmission|=16;
+    uint32_t flushLine=0;if(!platform->flushInfo(flushLine)){observation.toneReason="cache flush unavailable";return;}
     if(!platform->delayUs(3)){observation.toneReason="clock unavailable";return;}
     if(!adapter->allocate()){observation.toneReason="allocation or admission failed";return;}
     if(!adapter->begin()){observation.toneReason="controller admission failed";return;}

@@ -9,7 +9,7 @@ namespace brook {
 // No PCI, codec, DMA allocation or memory freeing is performed here.
 enum class HdaToneStreamState : uint8_t {Idle,Prepared,Running,Stopped,Unknown};
 template<class Io> class HdaDellToneStream {
-    Io& io_;uint32_t base_=0,detail_=0;uint8_t stage_=0;HdaToneStreamState state_=HdaToneStreamState::Idle;
+    Io& io_;uint32_t base_=0,detail_=0;uint8_t stage_=0,priority_=0;HdaToneStreamState state_=HdaToneStreamState::Idle;
     bool waitControl(uint16_t mask,uint16_t value) {
         const auto start=io_.ticks();
         for(unsigned i=0;i<1000000;++i) {
@@ -31,7 +31,8 @@ public:
         base_=0x80+input*0x20;
         // Require an idle descriptor without interrupt enables or a tag.
         stage_=2;const uint16_t initialControl=io_.read16(base_);const uint8_t initialTag=io_.read8(base_+2);
-        detail_=uint32_t(initialControl)|(uint32_t(initialTag)<<16);if(initialControl!=0 || initialTag!=0)return false;
+        detail_=uint32_t(initialControl)|(uint32_t(initialTag)<<16);
+        if(initialControl!=0 || (initialTag&~uint8_t(4)))return false;priority_=initialTag&4;
         stage_=3;io_.write16(base_,1);if(!io_.delayUs(3) || !waitControl(1,1)){detail_=io_.read16(base_);state_=HdaToneStreamState::Unknown;return false;}
         stage_=4;io_.write16(base_,0);if(!io_.delayUs(3) || !waitControl(1,0)){detail_=io_.read16(base_);state_=HdaToneStreamState::Unknown;return false;}
         io_.write8(base_+3,0x1c); // clear only W1C status bits
@@ -39,9 +40,9 @@ public:
         io_.write32(base_+0x18,uint32_t(bdlPhysical));
         io_.write32(base_+0x1c,uint32_t(bdlPhysical>>32));
         io_.write16(base_+0x0c,2);io_.write32(base_+0x08,12288);
-        io_.write8(base_+2,0x10); // stream tag 1; no interrupts
+        io_.write8(base_+2,uint8_t(0x10|priority_)); // tag 1; preserve traffic priority
         stage_=5;detail_=0;
-        if(io_.read16(base_)!=0)detail_|=1;if(io_.read8(base_+2)!=0x10)detail_|=2;
+        if(io_.read16(base_)!=0)detail_|=1;if(io_.read8(base_+2)!=uint8_t(0x10|priority_))detail_|=2;
         if(io_.read16(base_+0x12)!=0x11)detail_|=4;if(io_.read32(base_+0x18)!=uint32_t(bdlPhysical))detail_|=8;
         if(io_.read32(base_+0x1c)!=uint32_t(bdlPhysical>>32))detail_|=16;
         if(io_.read16(base_+0x0c)!=2)detail_|=32;if(io_.read32(base_+0x08)!=12288)detail_|=64;
@@ -52,7 +53,7 @@ public:
     }
     bool start() {
         if(state_!=HdaToneStreamState::Prepared)return false;
-        io_.publishDma(); // adapter supplies the platform DMA publication barrier
+        if(!io_.publishDma())return false; // flush and fence before RUN
         state_=HdaToneStreamState::Unknown; // a failed RUN write can still take effect
         io_.write16(base_,2);
         if(!waitControl(2,2) || (io_.read8(base_+3)&0x18))return false;
@@ -82,9 +83,14 @@ public:
     bool retire() {
         if(state_!=HdaToneStreamState::Stopped)return false;
         if(io_.read16(base_)&3){state_=HdaToneStreamState::Unknown;return false;}
-        io_.write8(base_+2,0);io_.write32(base_+0x18,0);io_.write32(base_+0x1c,0);
+        // PCH requires another completed reset before CBL can be rewritten
+        // after RUN. Leave state unknown and retain pages on any failure.
+        state_=HdaToneStreamState::Unknown;
+        io_.write16(base_,1);if(!io_.delayUs(3) || !waitControl(1,1))return false;
+        io_.write16(base_,0);if(!io_.delayUs(3) || !waitControl(3,0))return false;
+        io_.write8(base_+2,priority_);io_.write32(base_+0x18,0);io_.write32(base_+0x1c,0);
         io_.write32(base_+0x08,0);io_.write16(base_+0x0c,0);
-        if((io_.read16(base_)&3) || io_.read8(base_+2)!=0 || io_.read32(base_+0x18)!=0 ||
+        if((io_.read16(base_)&3) || io_.read8(base_+2)!=priority_ || io_.read32(base_+0x18)!=0 ||
            io_.read32(base_+0x1c)!=0 || io_.read32(base_+0x08)!=0 || io_.read16(base_+0x0c)!=0) {
             state_=HdaToneStreamState::Unknown;return false;
         }

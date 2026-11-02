@@ -1796,6 +1796,12 @@ configured the codec, then failed while preparing the stream. It quarantined
 its four pages and controller; bus mastering/RUN were not started. The next
 diagnostic records which format, converter or stream-preparation check failed
 without relaxing the checks or enabling audible mode.
+That diagnostic showed the stopped output descriptor's upper control byte was
+`0x04`: traffic-priority bit 18, documented as read-only and set on this PCH.
+The test now preserves that bit, flushes every cache line of its four immutable
+device-read-only DMA pages before bus mastering, and completes a second stream
+reset before clearing CBL and descriptor references. Host tests cover these
+operations and failures; they do not establish physical DMA progress.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

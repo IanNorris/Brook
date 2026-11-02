@@ -5,7 +5,7 @@
 using namespace brook;
 struct Chip {
     uint8_t mem[4096]{};uint8_t pin[2]{0,0},dac[2]{127,127},mix[2]{0,0},selection=0,converter=0;
-    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false;
+    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false;
     static constexpr uint32_t base=0x100;
     uint8_t* amp(unsigned node,bool output){if(node==0x14 && output)return pin;if(node==3 && output)return dac;if(node==0x0d && !output)return mix;assert(false);return nullptr;}
     void execute(){
@@ -36,12 +36,14 @@ struct Chip {
     uint16_t read16(uint32_t o){return uint16_t(mem[o])|(uint16_t(mem[o+1])<<8);}
     uint32_t read32(uint32_t o){if(o==0x64)return response;if(o==base+4 && (read16(base)&2)){pos=(pos+192)%12288;return pos;}
         return uint32_t(read16(o))|(uint32_t(read16(o+2))<<16);}
-    void write8(uint32_t o,uint8_t v){if(o==base+3)mem[o]&=~v;else mem[o]=v;}
+    void write8(uint32_t o,uint8_t v){if(o==base+3)mem[o]&=~v;else mem[o]=uint8_t(v|((o==base+2 && roPriority)?4:0));}
     void write16(uint32_t o,uint16_t v){if(o==0x68){if(v==2)mem[o]&=~2;else if(v==1){execute();mem[o]=2;}return;}
         if(dropStop && o==base && v==0 && (read16(base)&2))return;
-        if(o==base && v==2)assert(published && pin[0]==0x80 && pin[1]==0x80);mem[o]=v;mem[o+1]=v>>8;}
-    void write32(uint32_t o,uint32_t v){if(o==0x60){cmd=v;return;}if(dropBdlClear && o==base+0x18 && !v)return;for(unsigned i=0;i<4;++i)mem[o+i]=v>>(8*i);}
-    uint64_t ticks(){return time++;}void pause(){}bool delayUs(unsigned n){return n>=3;}void publishDma(){published=true;}
+        if(o==base && v==1){if(dropRetireReset && needsReset)return;resetAsserted=true;}
+        if(o==base && v==0 && resetAsserted){needsReset=false;resetAsserted=false;}
+        if(o==base && v==2){assert(published && pin[0]==0x80 && pin[1]==0x80);needsReset=true;}mem[o]=v;mem[o+1]=v>>8;}
+    void write32(uint32_t o,uint32_t v){if(o==0x60){cmd=v;return;}if(o==base+8)assert(!needsReset);if(dropBdlClear && o==base+0x18 && !v)return;for(unsigned i=0;i<4;++i)mem[o+i]=v>>(8*i);}
+    uint64_t ticks(){return time++;}void pause(){}bool delayUs(unsigned n){return n>=3;}bool publishDma(){published=true;return true;}
 };
 inline HdaSessionReport makeSnapshot(){
     HdaSessionReport s{};s.result=HdaSessionResult::Complete;s.probe=HdaProbeResult::Ready;s.vendor=0x10ec0288;s.subsystem=0x10280665;

@@ -79,7 +79,7 @@ public:
     }
     bool startDma() {
         if(!active_ || quarantined_ || p_.command()!=2)return false;
-        p_.publishDma(); // all buffer and descriptor stores precede bus mastering
+        if(!p_.publishDma())return false; // flush and fence before bus mastering
         p_.setCommand(6);if(p_.command()!=6)return false;
         return stream_.start();
     }
