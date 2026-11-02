@@ -165,6 +165,7 @@ static void one(int which){
  if(which==42 || which==43){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && o.streamQuarantined && !toneFrees && cmd==2);}
  if(which==44){assert(o.runtimeRequested && o.runtimePrepared && !o.runtimeRegistered && toneAllocations==17 && o.runtimePagesValidated==17 && cmd==2);
   HdaRuntimeRegister();assert(o.runtimeRegistered && registered && registerCalls==1);
+  assert(HdaRuntimeDrainClockAvailable() && HdaRuntimeDrainClockNs()>0);
   unsigned char samples[1764]{};const auto receipt=registered->trySubmit(samples,sizeof(samples));
   assert(receipt.accepted==sizeof(samples) && !receipt.error && !chip.sawQuietUnmute);
   AudioDeviceProgress progress{};assert(registered->progress(&progress));assert(registered->getPosition()<=progress.completed+1764);
@@ -173,6 +174,7 @@ static void one(int which){
   assert(registered->restart(progress.epoch) && o.runtimePagesValidated==34);
   const auto again=registered->trySubmit(samples,sizeof(samples));assert(again.accepted==sizeof(samples) && again.epoch==receipt.epoch+1);
   HdaRuntimeShutdown();assert(toneFrees==17 && cmd==0 && !o.runtimeQuarantined && o.runtimeShutdown && o.runtimeShutdownOk);
+  assert(!HdaRuntimeDrainClockNs());
   assert(!registered->restart(again.epoch) && registered->trySubmit(samples,sizeof(samples)).error);
   HdaRuntimeRegister();assert(registerCalls==1);}
  if(which==45){assert(o.runtimePrepared);HdaRuntimeRegister();assert(!o.runtimePrepared && !o.runtimeRegistered && toneFrees==17 && cmd==0);

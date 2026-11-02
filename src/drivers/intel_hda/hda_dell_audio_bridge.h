@@ -63,6 +63,10 @@ public:
     }
     bool isPlaying(){lock_.lock();Guard guard{lock_};return started_ && !closed_ && !queue_.failed() && queue_.progress().Pending()!=0;}
     uint32_t pending(){lock_.lock();Guard guard{lock_};return closed_?0:queue_.progress().Pending();}
+    // Private clock for the OSS drain watchdog; serialized with DMA sampling.
+    // It does not expose or enable a general-purpose kernel clock.
+    uint64_t drainClockNs(){lock_.lock();Guard guard{lock_};
+        return !terminal_ && !closed_ && !queue_.failed()?owner_.nowNs():0;}
     // A clean close still requires descriptor retirement; uncertain failures
     // are quarantined and cannot be restarted by either specialization.
     bool stop(){

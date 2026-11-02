@@ -2822,3 +2822,17 @@ changes have not yet been tested on the Dell. No unattended audible test was
 performed. A normal stop keeps the speaker pins muted between epochs; final
 retirement restores the firmware snapshot only after the stream is stopped and
 its descriptors are retired.
+
+A separate, user-attended two-second hardware tone was audible from the Dell's
+speakers. This establishes that the physical speaker route can produce sound;
+it does not establish application playback quality or volume accuracy.
+
+An application control test on the muted runtime initially failed its OSS
+drain because that watchdog used the KVM-only clock, unavailable on the Dell.
+The drain now selects the admitted Dell audio clock for this backend, serialized
+with DMA sampling, without changing the system-wide clock. With the audible
+marker absent, the Dell passed all six control and drain phases, including
+volume changes, with no driver quarantine. A QEMU boot and hosted driver tests
+also passed. Recovery generation 92 was selected for the next boot; the test
+kernel's restart reached the shutdown coordinator's ready state. Audible
+application playback and perceived volume still require an attended test.

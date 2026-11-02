@@ -77,6 +77,7 @@
 #include "rtc.h"
 #include "kvmclock.h"
 #include "audio.h"
+#include "hda_observe.h"
 #include "dsp_write_plan.h"
 #include "dsp_producer_timing.h"
 #include "syscall_timing.h"
@@ -7507,7 +7508,12 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                 // A finite paused queue must be started even without another write.
                 AudioMixerSetEnabled(dsp->mixerStreamId, true);
             }
-            uint64_t lastCompleted = 0, lastProgressTime = AudioClockNowNs();
+            // Select one time domain for the whole drain. Dell's admitted HDA
+            // clock is private and serialized by its driver; it is not a
+            // general replacement for the KVM clock or for completion proofs.
+            const bool useDellClock=HdaRuntimeDrainClockAvailable();
+            const auto drainClock=[useDellClock](){return useDellClock?HdaRuntimeDrainClockNs():AudioClockNowNs();};
+            uint64_t lastCompleted = 0, lastProgressTime = drainClock();
             for (;;) {
                 AudioMixerRefresh(); // Never hold the open-description mutex here.
                 uint64_t completed;
@@ -7522,7 +7528,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                     completed = progress.completedFrames;
                 }
                 if (HasReadInterruptSignal()) return -EINTR;
-                const uint64_t now = AudioClockNowNs();
+                const uint64_t now = drainClock();
                 if (!now || !lastProgressTime || now < lastProgressTime) return -EIO;
                 if (completed != lastCompleted) { lastCompleted = completed; lastProgressTime = now; }
                 else if (now - lastProgressTime >= 2000000000ULL) return -EIO;

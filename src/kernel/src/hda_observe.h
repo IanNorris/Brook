@@ -40,4 +40,6 @@ void HdaRuntimeShutdown();
 uint32_t HdaRuntimeFailureStage();
 uint32_t HdaRuntimeStreamFailureStage();
 uint32_t HdaRuntimeStreamFailureDetail();
+bool HdaRuntimeDrainClockAvailable();
+uint64_t HdaRuntimeDrainClockNs();
 }

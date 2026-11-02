@@ -30,10 +30,11 @@ int main(){
     assert(b.play(samples,sizeof(samples),48000,2,16)==-22 && !owner.starts);
     lock.lock();auto busy=b.submit(samples,sizeof(samples));lock.unlock();assert(!busy.accepted && !busy.error && !owner.starts);
     auto r=b.submit(samples,sizeof(samples));assert(!r.error && r.accepted==sizeof(samples) && owner.starts==1 && b.isPlaying());
+    const auto clockBefore=b.drainClockNs();assert(clockBefore && b.drainClockNs()>clockBefore);
     for(unsigned i=0;i<sizeof(samples);++i)assert(owner.device[(r.begin+i)%65536]==0x2d);
     assert(b.progress(&p) && p.epoch==r.epoch && p.submitted>=r.begin+r.accepted && p.running);
     assert(b.stop() && owner.mutes==1 && owner.stops==1 && owner.retires==1 && !owner.quarantines);
-    assert(!b.isPlaying() && b.pending()==0 && b.progress(&p) && p.discontinuity && !b.restart(p.epoch));
+    assert(!b.isPlaying() && b.pending()==0 && !b.drainClockNs() && b.progress(&p) && p.discontinuity && !b.restart(p.epoch));
     auto closed=b.submit(samples,sizeof(samples));assert(!closed.accepted && closed.error);
     Owner noStart;Lock noStartLock;HdaDellAudioBridge<Owner,Lock> idle(noStart,noStartLock,64,4096);
     assert(idle.stop() && !noStart.starts && noStart.mutes==1 && noStart.stops==1 && noStart.retires==1);

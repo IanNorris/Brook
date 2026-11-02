@@ -520,4 +520,6 @@ void HdaRuntimeShutdown(){
 uint32_t HdaRuntimeFailureStage(){return runtimeOwner?runtimeOwner->failureStage():0;}
 uint32_t HdaRuntimeStreamFailureStage(){return runtimeOwner?runtimeOwner->failedStreamStage():0;}
 uint32_t HdaRuntimeStreamFailureDetail(){return runtimeOwner?runtimeOwner->failedStreamDetail():0;}
+bool HdaRuntimeDrainClockAvailable(){return observation.runtimeRegistered && runtimeBridge;}
+uint64_t HdaRuntimeDrainClockNs(){return HdaRuntimeDrainClockAvailable()?runtimeBridge->drainClockNs():0;}
 }
