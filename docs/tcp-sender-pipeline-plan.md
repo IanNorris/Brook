@@ -143,6 +143,16 @@ writev boundary and fault cases; the QEMU USB Ethernet suite passed with the
 close stress and user-copy faults. Astra reviewed the extraction. This is a
 preparatory step toward the bounded pump, not a throughput result.
 
+The caller-driven flight loop now separates a single transport action from
+the outer wait loop, while keeping the same synchronous completion and
+call-local lifetime. Each action stages or submits at most one packet, but it
+is not bounded in wall time: user-memory copying and neighbor resolution can
+sleep. It also still captures caller-owned context. Before a shared worker can
+drive it, those blocking operations and all captured lifetimes must be
+separated. The hosted socket-lifetime suite and the delayed, loss-injected
+16-slot QEMU USB Ethernet suite passed; Astra reviewed the control-flow
+extraction. This does not yet change upload performance.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

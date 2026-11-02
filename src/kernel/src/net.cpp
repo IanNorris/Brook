@@ -3223,15 +3223,21 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         return acknowledged ? static_cast<int>(acknowledged) : error;
     };
 
-    for (;;) {
-        if (TcpSendInterrupted(self)) return finish(-4);
+    // A step performs at most one reservation or packet submission. It may
+    // still sleep during user copying or neighbor resolution, so it is not a
+    // nonblocking worker pump. The caller owns and drives the state until all
+    // bytes are acknowledged or a terminal result is available.
+    enum class FlightAction { Again, Wait, Done };
+    struct FlightStep { FlightAction action; int result; };
+    const auto step = [&]() -> FlightStep {
+        if (TcpSendInterrupted(self)) return {FlightAction::Done,finish(-4)};
         const uint64_t now = ApicTickCount();
         SpinLockAcquire(&s.lock);
         const uint32_t una = s.tcpSndUna;
         uint32_t delta = una - base;
         if (delta <= reserved && delta > submitted) {
             SpinLockRelease(&s.lock);
-            return finish(-5); // ACK crossed a reservation rejected locally
+            return {FlightAction::Done,finish(-5)}; // ACK crossed a locally rejected reservation
         }
         if (delta <= submitted && delta > acknowledged) {
             if (adaptive) s.tcpFlightControl.Ack(delta-acknowledged, mss,initialLimit);
@@ -3252,16 +3258,16 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         }
         if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
             SpinLockRelease(&s.lock);
-            return acknowledged ? static_cast<int>(acknowledged) : -104;
+            return {FlightAction::Done,acknowledged ? static_cast<int>(acknowledged) : -104};
         }
         if (deferredError && !count) {
             SpinLockRelease(&s.lock);
-            return acknowledged ? static_cast<int>(acknowledged) : deferredError;
+            return {FlightAction::Done,acknowledged ? static_cast<int>(acknowledged) : deferredError};
         }
-        if (acknowledged == len) { SpinLockRelease(&s.lock); return static_cast<int>(acknowledged); }
+        if (acknowledged == len) { SpinLockRelease(&s.lock); return {FlightAction::Done,static_cast<int>(acknowledged)}; }
         if (now >= deadline) {
             SpinLockRelease(&s.lock);
-            return finish(-110);
+            return {FlightAction::Done,finish(-110)};
         }
 
         // A reserved-but-unsubmitted entry must be retried before another
@@ -3314,8 +3320,8 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
             } else if (result == -11) {
                 if (g_tcpSendProbe) TcpProbeAdd(g_tcpSendProbeStats.busy);
                 slot.retryAt = after + 10;
-            } else return finish(result < 0 ? result : -5);
-            continue;
+            } else return {FlightAction::Done,finish(result < 0 ? result : -5)};
+            return {FlightAction::Again,0};
         }
 
         const uint32_t outstanding = s.tcpSndNxt - una;
@@ -3333,15 +3339,15 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
             SpinLockRelease(&s.lock);
             Slot& slot = slots[(head + count) % capacity];
             if (!source.Copy(slot.bytes, reserved, chunk)) {
-                if (count) { deferredError = -14; continue; }
-                return finish(-14);
+                if (count) { deferredError = -14; return {FlightAction::Again,0}; }
+                return {FlightAction::Done,finish(-14)};
             }
-            if (TcpSendInterrupted(self)) return finish(-4);
-            if (ApicTickCount() >= deadline) return finish(-110);
+            if (TcpSendInterrupted(self)) return {FlightAction::Done,finish(-4)};
+            if (ApicTickCount() >= deadline) return {FlightAction::Done,finish(-110)};
 
             SpinLockAcquire(&s.lock);
             if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
-                SpinLockRelease(&s.lock); return finish(-104);
+                SpinLockRelease(&s.lock); return {FlightAction::Done,finish(-104)};
             }
             const uint32_t currentOutstanding = s.tcpSndNxt - s.tcpSndUna;
             uint32_t currentCredit = s.tcpSndWnd > currentOutstanding ? s.tcpSndWnd-currentOutstanding : 0;
@@ -3350,13 +3356,13 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
                 if (currentCredit > congestionCredit) currentCredit = congestionCredit;
             }
             if (chunk > currentCredit) chunk = currentCredit;
-            if (!chunk) { SpinLockRelease(&s.lock); continue; }
+            if (!chunk) { SpinLockRelease(&s.lock); return {FlightAction::Again,0}; }
             slot.seq = s.tcpSndNxt; slot.len = chunk; slot.retries = 0;
             slot.submitted = false; slot.wasRetried = false; slot.retryAt = 0;
             s.tcpSndNxt += chunk;
             reserved += chunk; ++count;
             SpinLockRelease(&s.lock);
-            continue;
+            return {FlightAction::Again,0};
         }
 
         // Another reader can replace the shared waiter, so do not rely on a
@@ -3376,7 +3382,12 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         SetSocketWaiterLocked(s, self);
         self->wakeupTick = wake;
         SpinLockRelease(&s.lock);
-        SchedulerBlockInterruptible(self);
+        return {FlightAction::Wait,0};
+    };
+    for (;;) {
+        const FlightStep outcome=step();
+        if (outcome.action==FlightAction::Done) return outcome.result;
+        if (outcome.action==FlightAction::Wait) SchedulerBlockInterruptible(self);
     }
 }
 
