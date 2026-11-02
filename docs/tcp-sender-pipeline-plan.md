@@ -27,9 +27,17 @@ packet, the host received a 1 MiB stream issued as 1,024 separate 1 KiB writes
 in 10.33 seconds synchronously and 4.79 seconds asynchronously; another async
 run took 5.70 seconds. Timing starts after the first receive and ends on the
 last; this is not syscall latency or a Dell/WAN measurement. The matched
-run's median 32 KiB receive-tail time was
-140.6 ms versus 140.0 ms. Neither the worker path nor this benchmark has yet
-been tested on the physical Dell.
+run's median 32 KiB receive-tail time was 140.6 ms versus 140.0 ms.
+
+On the physical Dell, matching speaker-muted kernel/initrd candidates differed
+only by the async marker. Three host-timed 4 MiB LAN transfers using 1 KiB
+`send()` calls took 4.14–4.17 seconds synchronously and 1.39–1.44 seconds
+asynchronously; all six hashes matched. These were grouped runs, not an
+alternating long-duration trial, and do not establish WAN or browser upload
+performance. Two simultaneous async 4 MiB transfers also matched their hashes.
+A separate 256 KiB test closed immediately after accepting all writes; the
+host received the expected bytes and then EOF. The known-good recovery slot
+was preserved and booted afterward. Audio output was disabled throughout.
 
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
