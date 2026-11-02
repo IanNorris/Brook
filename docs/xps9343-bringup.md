@@ -3005,3 +3005,12 @@ tone through the Dell speakers. The image did not have a generic
 `/nix/etc/asound.conf`; this probe used the installed Firefox-specific
 configuration. Browser playback and sustained audible quality require separate
 validation.
+
+In a subsequent attended YouTube test on that boot, the user reported slow,
+stuttering audio and video, with some crackling and a robotic sound. Two live
+audio snapshots showed an active stream with no downstream staging; the HDA
+runtime reported no fault or quarantine. Later-gap reservations increased
+during the sampled interval, while the empty-after counter did not. These
+diagnostics do not establish the audible gap duration or identify whether the
+browser, mixer, publication timing, or codec caused the symptoms. The user's
+playback assessment is not a controlled local-source comparison.
