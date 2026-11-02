@@ -724,6 +724,8 @@ set_tests_properties(test_process_ids PROPERTIES TIMEOUT 15)
 add_host_test(test_write_admission "${BROOK_ROOT}/src/kernel/src/device.cpp")
 add_host_test(test_block_write_leases)
 target_compile_options(test_block_write_leases PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_seek_position)
+target_compile_options(test_seek_position PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_writable_desktop_plan)
 target_compile_options(test_writable_desktop_plan PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_executable(test_writable_desktop "${BROOK_ROOT}/src/tests/test_writable_desktop/main.cpp"

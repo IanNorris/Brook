@@ -1,4 +1,5 @@
 #include "process_fs.h"
+#include "seek_position.h"
 #include "kprintf.h"
 #include "mount_namespace.h"
 #include "tmpfs.h"
@@ -4184,27 +4185,23 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     switch (static_cast<int>(whence))
     {
     case SEEK_SET:
-        fde->seekPos = static_cast<uint64_t>(soff);
+        if(!SeekPosition(0,soff,fde->seekPos))return -EINVAL;
         break;
     case SEEK_CUR:
-        fde->seekPos = static_cast<uint64_t>(static_cast<int64_t>(fde->seekPos) + soff);
+        if(!SeekPosition(fde->seekPos,soff,fde->seekPos))return -EINVAL;
         break;
     case SEEK_END:
     {
         if (fde->type == FdType::MemFd && fde->handle) {
             auto* mfd = static_cast<MemFdData*>(fde->handle);
-            int64_t newPos = static_cast<int64_t>(mfd->size) + soff;
-            if (newPos < 0) return -EINVAL;
-            fde->seekPos = static_cast<uint64_t>(newPos);
+            if(!SeekPosition(mfd->size,soff,fde->seekPos))return -EINVAL;
             break;
         }
         if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
         auto* vn = static_cast<Vnode*>(fde->handle);
         VnodeStat st{};
         if (VfsStat(vn, &st) < 0) return -EINVAL;
-        int64_t newPos = static_cast<int64_t>(st.size) + soff;
-        if (newPos < 0) return -EINVAL;
-        fde->seekPos = static_cast<uint64_t>(newPos);
+        if(!SeekPosition(st.size,soff,fde->seekPos))return -EINVAL;
         break;
     }
     default:
