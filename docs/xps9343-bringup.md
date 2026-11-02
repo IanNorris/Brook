@@ -1862,6 +1862,13 @@ host-tested invariant-TSC admission, multi-window PIT calibration policy and
 bounded channel-2 acquisition are being prepared. They are not wired into the
 kernel clock: PIT ownership, real calibration uncertainty, cross-CPU TSC offsets,
 suspend behavior and physical validation remain required.
+An explicit `native-tsc-observe` boot marker now runs the bounded measurement
+on the BSP after the existing PIT calibration and before driver/scheduler
+activation. It exports observations only and never installs a clock. On the
+Dell, the CPUID gates passed and five 29,829-PIT-tick windows measured
+59,864,307–59,865,642 TSC ticks, yielding a median estimate of 2,394,626 kHz.
+This narrow spread does not rule out common acquisition bias or establish
+cross-core agreement. The known-good recovery boot was reselected afterward.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
