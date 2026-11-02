@@ -206,6 +206,14 @@ second descriptor-table block, not inode allocation in group 128. An earlier
 attempt completed its create phase but its QMP socket path was too long; it
 was not counted as a passing reboot test. Evidence: `build/hardware/ld2`.
 
+A further fresh fixture also preferred group 128 for inode allocation in the
+QEMU-only mode. The test file survived create and verify boots with checked
+shutdowns; offline inspection found inode 8193 with 64 inodes per group and
+all 38 allocated blocks in group 128. The independent payload comparison and
+`e2fsck -fn` passed. This does not cover late-group inode reuse, directory
+counts, full-group fallback or interrupted-write recovery. Evidence:
+`build/hardware/ldi`.
+
 This QEMU-only path does not provide production partition ownership or the
 dirty/clean-session protocol. The helper and marker do not enable this mount
 in a production kernel. No Dell SSD access was performed by these tests.

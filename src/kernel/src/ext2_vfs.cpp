@@ -1014,7 +1014,15 @@ static bool Ext2FreeBlock(Ext2Mount* mnt, uint32_t blockNum)
 // isDir: increment bg_used_dirs_count.
 static uint32_t Ext2AllocInode(Ext2Mount* mnt, bool isDir)
 {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    uint32_t firstGroup = 0;
+    if (mnt->groupCount > 128 && mnt->dev && mnt->dev->name &&
+        !strcmp(mnt->dev->name, "ahci-qemu-large")) firstGroup = 128;
+    for (uint32_t step = 0; step < mnt->groupCount; ++step) {
+        const uint32_t g = (firstGroup + step) % mnt->groupCount;
+#else
     for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+#endif
         if (mnt->bgdt[g].bg_free_inodes_count == 0) continue;
 
         uint8_t* bitmap = Ext2GetInodeBitmap(mnt, g);
