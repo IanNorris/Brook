@@ -34,7 +34,17 @@ submitted bytes; the queue alone does not track submissions, errors, workers,
 or socket lifetime. Copies into and out of the ring must not overlap it.
 Capacity-one, wrap, partial retirement, backpressure and 100,000 randomized
 operations against a reference FIFO pass in the host tests. This primitive is
-not yet attached to socket writes and does not change throughput.
+also exercised by the opt-in `/etc/tcp-queue-stage` experiment: the existing
+call-local flight stages each copied chunk through a bounded ring, reserves it
+in both structures under the socket lock and retires it on validated ACK
+progress. This intentionally duplicates flight storage and retains synchronous
+completion; it is not a socket-owned queue or a throughput improvement. Hosted
+real-sender tests exercise allocation failure, wrap across a larger transfer,
+retry payload integrity, partial ACKs, loss, rejected submissions, sequence
+wrap and copy faults. The USB Ethernet QEMU test passed with delay, dropped
+traffic and concurrent writers. On early terminal return `Finish` may update
+its acknowledged count without retiring the call-local ring; safe destruction
+there does not establish persistent-queue semantics.
 
 The existing flight step is now a separate pump with explicit retained state;
 the caller supplies the observation time and deadline. Its step does not own

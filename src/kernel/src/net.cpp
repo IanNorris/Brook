@@ -14,6 +14,7 @@
 #include "net.h"
 #include "arp_probe_tracker.h"
 #include "arp_reply_validation.h"
+#include "tcp_send_queue.h"
 #include "module.h"
 #include "tcp.h"
 #include "epoll_diagnostics.h"
@@ -897,6 +898,7 @@ static bool g_tcpAdaptiveFlight = false;
 static bool g_tcpAdaptiveFlight16 = false;
 static bool g_tcpAsyncNeighbor = false;
 static bool g_tcpTryTransmit = false;
+static bool g_tcpQueueStage = false;
 static bool g_irqTryLockProbe = false;
 static uint32_t g_irqTryLockProbeState=0,g_irqTryLockProbePassed=0;
 static uint32_t DebugIrqTryLockProbe();
@@ -919,6 +921,10 @@ void NetConfigureBoot()
         VfsClose(marker);
         if(g_tcpAsyncNeighbor){g_tcpTryTransmit=true;KPuts("net: TCP try-transmit experiment enabled\n");}
         else KPuts("net: TCP try-transmit requires async neighbor marker\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-queue-stage")) {
+        VfsClose(marker);g_tcpQueueStage=true;
+        KPuts("net: TCP queue staging experiment enabled\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
         VfsClose(marker);g_tcpSendProbe = true;
@@ -3351,6 +3357,9 @@ struct TcpSendFlightState {
     } inlineSlots[8]{};
     Slot* slots = inlineSlots;
     void* allocation = nullptr;
+    void* queueStorage = nullptr;
+    TcpSendQueue queue{};
+    bool queueEnabled = false;
     bool configured = false;
     unsigned capacity = 8, head = 0, count = 0, limit = 0;
     uint32_t reserved = 0, submitted = 0, acknowledged = 0;
@@ -3368,7 +3377,14 @@ struct TcpSendFlightState {
         for (unsigned n=0;n<capacity;++n) new (&slots[n]) Slot{};
         return true;
     }
-    ~TcpSendFlightState() { if (allocation) kfree(allocation); }
+    bool AllocateQueue() {
+        if(!configured || queueStorage)return false;
+        queueStorage=kmalloc(capacity*ETH_MTU);
+        if(!queueStorage)return false;
+        queueEnabled=queue.Init(static_cast<uint8_t*>(queueStorage),capacity*ETH_MTU);
+        return queueEnabled;
+    }
+    ~TcpSendFlightState() { if (queueStorage) kfree(queueStorage);if (allocation) kfree(allocation); }
     TcpSendFlightState(const TcpSendFlightState&) = delete;
     TcpSendFlightState& operator=(const TcpSendFlightState&) = delete;
 };
@@ -3424,6 +3440,9 @@ struct TcpFlightPump {
             return {FlightAction::Done,Finish(-5)}; // ACK crossed a locally rejected reservation
         }
         if (delta <= submitted && delta > acknowledged) {
+            if(state.queueEnabled && !state.queue.Retire(delta-acknowledged)) {
+                SpinLockRelease(&s.lock);return {FlightAction::Done,Finish(-5)};
+            }
             if (adaptive) s.tcpFlightControl.Ack(delta-acknowledged, mss,initialLimit);
             if (g_tcpSendProbe) TcpProbeAdd(g_tcpSendProbeStats.acked,delta-acknowledged);
             acknowledged = delta;
@@ -3550,6 +3569,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
 {
     TcpSendFlightState state(initialLimit);
     if (!state.Allocate()) return -12;
+    if (g_tcpQueueStage && !state.AllocateQueue()) return -12;
     using Slot = TcpSendFlightState::Slot;
     Slot* const slots=state.slots;
     const unsigned capacity=state.capacity;
@@ -3603,6 +3623,10 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         }
         if (chunk>currentCredit) chunk=currentCredit;
         if (!chunk) { SpinLockRelease(&s.lock); continue; }
+        if(state.queueEnabled && (state.queue.Append(slot.bytes,chunk)!=chunk ||
+                                  state.queue.ReserveCopy(slot.bytes,chunk)!=chunk)) {
+            SpinLockRelease(&s.lock);return pump.Finish(-5);
+        }
         slot.seq=s.tcpSndNxt;slot.len=chunk;slot.retries=0;
         slot.submitted=false;slot.wasRetried=false;slot.retryAt=0;
         s.tcpSndNxt+=chunk;reserved+=chunk;++count;

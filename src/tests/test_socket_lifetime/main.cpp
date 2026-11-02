@@ -63,6 +63,8 @@ uint32_t capturedFrameLength=0;
 int frameTransmitResult=0;
 unsigned frameTransmitCalls=0;
 bool injectReplyDuringTransmit=false,changeConfigDuringTransmit=false,injectTcpAck=false;
+bool verifyQueuePayload=false;
+bool partialFirstQueueAck=false;
 unsigned tryTransmitCalls=0,tryTransmitBusy=0;
 int captureFrame(brook::NetIf* nif,const void* frame,uint32_t length) {
     assert(length<=sizeof(capturedFrame));
@@ -167,6 +169,11 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
     const auto* tcp = static_cast<const TcpHeader*>(data);
     if (tcp->flags & TCP_FIN) { ++sentFins; lastFinSequence=ntohl(tcp->seqNum); }
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
+        if(verifyQueuePayload){
+            const auto* payload=static_cast<const uint8_t*>(data)+sizeof(TcpHeader);
+            const uint32_t offset=ntohl(tcp->seqNum)-10;
+            for(uint32_t n=0;n<len-sizeof(TcpHeader);++n)assert(payload[n]==static_cast<uint8_t>((offset+n)%251));
+        }
         lastDataSubmitTick=ticks.load();
         const unsigned index=capturedDataCount.fetch_add(1);
         if(index<64)capturedDataSeq[index]=ntohl(tcp->seqNum);
@@ -242,7 +249,9 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         --acknowledgeDataCount;
         Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
         TcpHeader ack{};ack.srcPort=tcp->dstPort;ack.dstPort=tcp->srcPort;
-        ack.seqNum=tcp->ackNum;ack.ackNum=htonl(ntohl(tcp->seqNum)+len-sizeof(TcpHeader));
+        const uint32_t ackBytes=partialFirstQueueAck ? 10 : len-sizeof(TcpHeader);
+        partialFirstQueueAck=false;
+        ack.seqNum=tcp->ackNum;ack.ackNum=htonl(ntohl(tcp->seqNum)+ackBytes);
         ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(dataAckWindow.load());HandleTcp(&ip,&ack,sizeof(ack));
     }
     assert(len >= sizeof(TcpHeader));
@@ -1179,6 +1188,24 @@ int main() {
         currentProcess=nullptr;SockClose(i);delete waiter;g_netIfs[0]=nullptr;g_netIfCount=0;
         g_arpAsyncProbe=AsyncArpTracker{};
     }
+    // Run the real flight through queue storage for the following loss,
+    // copy-fault, cancellation, wrap, window and forged-ACK cases.
+    g_tcpQueueStage=true;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failAllocation=0;capturedDataCount=0;
+    {uint8_t data=1;assert(SockSend(i,&data,1)==-12);}
+    assert(g_sockets[i].tcpSndNxt==10 && capturedDataCount==0);
+    failAllocation=-1;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Wrap the byte ring repeatedly in a real send, checking every original
+    // and retried byte against a position-dependent pattern.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;failDataSubmissions=1;acknowledgeDataCount=41;capturedDataCount=0;verifyQueuePayload=true;partialFirstQueueAck=true;
+    {uint8_t data[40*536+17];for(unsigned n=0;n<sizeof(data);++n)data[n]=static_cast<uint8_t>(n%251);
+     assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==42 && g_sockets[i].tcpSndUna==10+40*536+17);
+    verifyQueuePayload=false;partialFirstQueueAck=false;acknowledgeDataCount=0;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // A rejected second submission retries its original range and payload.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
@@ -1281,7 +1308,7 @@ int main() {
     {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
     assert(capturedDataCount==3 && capturedDataSeq[0]==10 && capturedDataSeq[1]==10);
     assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
-    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    g_tcpTwoPacketFlight=false;g_tcpQueueStage=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // Previously ACKed chunks are reported even when the next one times out.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;acknowledgeDataCount=1;
