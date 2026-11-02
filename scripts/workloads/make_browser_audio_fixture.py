@@ -23,9 +23,10 @@ source = base64.b64encode(buffer.getvalue()).decode("ascii")
 html = '''<!doctype html>
 <meta charset="utf-8">
 <title>Brook media: ready</title>
-<style>body { font: 32px sans-serif; margin: 30px; } button { font: 40px sans-serif; padding: 40px; }</style>
+<style>body { font: 32px sans-serif; margin: 30px; } button { display: block; font: 40px sans-serif; padding: 40px; margin-bottom: 20px; }</style>
 <h1>Local media check</h1>
 <button id="play">Start media audio</button>
+<button id="graph">Start Web Audio</button>
 <p id="status">Waiting for click</p>
 <audio id="audio" loop src="data:audio/wav;base64,%s"></audio>
 <script>
@@ -40,6 +41,26 @@ document.querySelector("#play").addEventListener("click", () => {
   phase("clicked");
   audio.play().then(() => phase("playing promise"))
     .catch(error => phase("play error " + error));
+});
+let graph;
+document.querySelector("#graph").addEventListener("click", () => {
+  try {
+    const context = new AudioContext();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.frequency.value = 440;
+    gain.gain.value = 0.05;
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+    graph = {context, oscillator, gain};
+    phase("graph resume " + context.state);
+    context.onstatechange = () => phase("graph state " + context.state);
+    context.resume().then(() => phase("graph resumed " + context.state))
+      .catch(error => phase("graph error " + error));
+  } catch (error) {
+    phase("graph error " + error);
+  }
 });
 </script>
 ''' % source

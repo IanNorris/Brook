@@ -2890,3 +2890,13 @@ media-element delivery to the muted mixer, not audible quality or correct
 timing. The browser's `/proc/PID/environ` was unavailable, so the inherited
 ALSA configuration was not independently confirmed. The Web Audio result
 remains separate and unresolved. Recovery generation 102 was selected.
+
+In one follow-up muted run, the generated media page was extended with a
+separate click-to-start Web Audio oscillator. After the media stream had been
+playing, a second debug click started the graph: Firefox reported `graph state
+running`, and two distinct mixer streams advanced without reported
+discontinuity. The bounded browser job later reached its timeout and left no
+live job tasks or mixer streams. The temporary profile was removed and
+recovery generation 106 selected. This demonstrates a warm-start path; it does
+not prove why the earlier cold graph remained suspended, establish acoustic
+quality, or establish behavior across repeated launches.
