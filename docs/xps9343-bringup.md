@@ -2996,3 +2996,12 @@ showed the expected sustained mute, 25%, 50%, 100%, mute and 25% sequence.
 QEMU wrote to a WAV file without host-speaker output. This checks the generic
 mixer and control path with the updated kernel; it does not validate the Dell
 codec's audible output or perceived volume.
+
+On an attended Dell boot of the experimental audio and fast network candidate,
+the machine started muted. After explicitly setting the master volume to 25%,
+a five-second, 44.1 kHz user-mode ALSA probe completed through the installed
+Firefox ALSA configuration and its OSS backend. The user confirmed hearing the
+tone through the Dell speakers. The image did not have a generic
+`/nix/etc/asound.conf`; this probe used the installed Firefox-specific
+configuration. Browser playback and sustained audible quality require separate
+validation.

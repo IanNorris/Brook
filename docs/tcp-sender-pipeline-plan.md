@@ -223,6 +223,14 @@ bounded host and lossy/backpressure QEMU tests passed, and the Dell returned
 to its known-good boot. The profile is under
 `build/hardware/dell-pwake-fast-sustained-profile-20261102`.
 
+On a later muted Dell boot of the same fast-retry candidate, eight sequential
+64 MiB LAN uploads with 1 KiB writes took 4.09–4.18 seconds each and all
+receiver hashes matched. Aggregate sender counters reported no retransmission
+attempts; between-transfer memory snapshots remained around 269–270 MiB used
+and reported no allocation failures. This is a bounded 512 MiB sequence,
+not a long-duration endurance test or a WAN result. The known-good recovery
+selection was restored and booted afterward.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
