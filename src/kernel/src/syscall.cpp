@@ -1,6 +1,9 @@
 #include "process_fs.h"
 #include "seek_position.h"
 #include "device.h"
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#include "strict_gpt_inventory.h"
+#endif
 #include "kprintf.h"
 #include "mount_namespace.h"
 #include "tmpfs.h"
@@ -2006,11 +2009,58 @@ static constexpr uint64_t VnodeWriteLimit = 0x7ffff000ULL;
 // installer disk. Production builds do not expose it.
 struct MaintenanceBlockFd {
     Device* device;
-    uint64_t bytes,position;
+    uint64_t start,bytes,position;
+    uint32_t partition;
     uint32_t refs;
     KMutex lock;
 };
 static uint32_t maintenanceBlockOpen=0;
+// Published only after range validation, and cleared before exclusive release.
+static uint32_t maintenanceBlockPublished=0;
+static bool MaintenanceBlockPath(const char* path,uint32_t& partition) {
+    static constexpr char prefix[]="/dev/brook-test-disk";
+    if(strncmp(path,prefix,sizeof(prefix)-1))return false;
+    path+=sizeof(prefix)-1;partition=0;
+    if(!*path)return true;
+    if(*path<'1' || *path>'9')return false;
+    while(*path>='0' && *path<='9') {
+        partition=partition*10+uint32_t(*path++-'0');
+        if(partition>128)return false;
+    }
+    return !*path;
+}
+// Caller holds the exclusive maintenance-disk admission, so the layout
+// cannot change between validation and opening the resulting partition.
+static bool MaintenanceBlockRange(Device* device,uint32_t index,uint64_t& start,uint64_t& bytes) {
+    const uint64_t sectors=DeviceBlockCount(device),size=DeviceBlockSize(device);
+    if(size!=512 || sectors<68 || sectors>0x7fffffffffffffffULL/size)return false;
+    start=0;bytes=sectors*size;if(!index)return true;
+    uint8_t mbr[512],primary[512],backup[512];
+    auto read=[&](uint64_t offset,void* buf,uint32_t len) {
+        return device->ops->read(device,offset,buf,len)==int(len);
+    };
+    if(!read(0,mbr,512) || !read(512,primary,512) || !read((sectors-1)*512,backup,512) ||
+       StrictGptProtectiveMbr(mbr,sectors)!=StrictMbrResult::Protective)return false;
+    StrictGptHeader a{},b{};
+    if(StrictGptCheckHeader(primary,512,sectors,false,a)!=StrictGptResult::Ok ||
+       StrictGptCheckHeader(backup,512,sectors,true,b)!=StrictGptResult::Ok ||
+       a.count!=b.count || a.entrySize!=b.entrySize || index>a.count)return false;
+    const uint32_t length=a.count*a.entrySize;
+    auto* entries=static_cast<uint8_t*>(kmalloc(length));
+    auto* copy=static_cast<uint8_t*>(kmalloc(length));
+    if(!entries || !copy) {if(entries)kfree(entries);if(copy)kfree(copy);return false;}
+    const bool valid=read(a.entriesLba*512,entries,length) && read(b.entriesLba*512,copy,length) &&
+        StrictGptCheckCopies(a,entries,b,copy,length)==StrictGptResult::Ok;
+    bool found=false;
+    if(valid) {
+        const auto* entry=entries+uint64_t(index-1)*a.entrySize;
+        if(!StrictAllZero(entry,16)) {
+            const uint64_t first=StrictLe64(entry+32),last=StrictLe64(entry+40);
+            start=first*512;bytes=(last-first+1)*512;found=true;
+        }
+    }
+    kfree(entries);kfree(copy);return found;
+}
 static int64_t MaintenanceBlockTransfer(MaintenanceBlockFd* file,uint64_t address,
                                         uint64_t count,uint64_t* position,
                                         bool write,bool userBuffer) {
@@ -2030,12 +2080,12 @@ static int64_t MaintenanceBlockTransfer(MaintenanceBlockFd* file,uint64_t addres
             if(userBuffer) {
                 if(!CopyFromUser(buffer,address+completed,n)){error=-EFAULT;break;}
             } else memcpy(buffer,reinterpret_cast<const void*>(address+completed),n);
-            const int result=DeviceWrite(file->device,*position,buffer,n);
+            const int result=DeviceWrite(file->device,file->start+*position,buffer,n);
             if(result<=0 || uint64_t(result)>n){error=result<0?result:-EIO;break;}
             *position+=uint64_t(result);completed+=uint64_t(result);
             if(uint64_t(result)!=n)break;
         } else {
-            const int result=file->device->ops->read(file->device,*position,buffer,n);
+            const int result=file->device->ops->read(file->device,file->start+*position,buffer,n);
             if(result<=0 || uint64_t(result)>n){error=result<0?result:-EIO;break;}
             if(!CopyToUser(address+completed,buffer,uint64_t(result))){error=-EFAULT;break;}
             *position+=uint64_t(result);completed+=uint64_t(result);
@@ -3429,21 +3479,26 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    if(StrEq(syntheticPath,"/dev/brook-test-disk")) {
+    uint32_t blockPartition=0;
+    if(MaintenanceBlockPath(syntheticPath,blockPartition)) {
         if(proc->euid!=0)return -EPERM;
         if((flags&3)==3 || (flags&(0x40|0x200|0x10000|0x200000)))return -EINVAL;
         Device* device=AhciDisposableQemuBlockToolsDevice();
         if(!device || !device->ops || !device->ops->read || !device->ops->write)return -ENODEV;
-        const uint64_t sectors=DeviceBlockCount(device),size=DeviceBlockSize(device);
-        if(!size || sectors>0x7fffffffffffffffULL/size)return -EINVAL;
         if(__atomic_exchange_n(&maintenanceBlockOpen,1,__ATOMIC_ACQ_REL))return -16;
+        uint64_t start=0,bytes=0;
+        if(!MaintenanceBlockRange(device,blockPartition,start,bytes)) {
+            __atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -ENODEV;
+        }
         auto* block=static_cast<MaintenanceBlockFd*>(kmalloc(sizeof(MaintenanceBlockFd)));
         if(!block){__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -ENOMEM;}
-        block->device=device;block->bytes=sectors*size;block->position=0;block->refs=1;KMutexInit(&block->lock);
+        block->device=device;block->start=start;block->bytes=bytes;block->position=0;
+        block->partition=blockPartition;block->refs=1;KMutexInit(&block->lock);
+        __atomic_store_n(&maintenanceBlockPublished,blockPartition+1,__ATOMIC_RELEASE);
         FdEntry entry{};entry.type=FdType::BlockDevice;entry.handle=block;
         entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
         const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
-        if(fd<0){kfree(block);__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -EMFILE;}
+        if(fd<0){kfree(block);__atomic_store_n(&maintenanceBlockPublished,0,__ATOMIC_RELEASE);__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -EMFILE;}
         return fd;
     }
 #endif
@@ -3868,7 +3923,8 @@ void FinalizeClosedFd(const FdClaimResult& c)
     if(c.type==FdType::BlockDevice && c.handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(c.handle);
         if(__atomic_fetch_sub(&block->refs,1,__ATOMIC_ACQ_REL)==1) {
-            kfree(block);__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);
+            kfree(block);__atomic_store_n(&maintenanceBlockPublished,0,__ATOMIC_RELEASE);
+            __atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);
         }
     }
 #endif
@@ -7983,11 +8039,21 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
 static bool DrmStatFill(const char* path, LinuxStat* st)
 {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    if(StrEq(path,"/dev/brook-test-disk")) {
+    uint32_t partition=0;
+    if(MaintenanceBlockPath(path,partition)) {
         Device* device=AhciDisposableQemuBlockToolsDevice();
         if(!device)return false;
+        bool valid=false;
+        if(__atomic_exchange_n(&maintenanceBlockOpen,1,__ATOMIC_ACQ_REL)) {
+            valid=__atomic_load_n(&maintenanceBlockPublished,__ATOMIC_ACQUIRE)==partition+1;
+        } else {
+            uint64_t start=0,bytes=0;
+            valid=MaintenanceBlockRange(device,partition,start,bytes);
+            __atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);
+        }
+        if(!valid)return false;
         memset(st,0,sizeof(*st));st->st_mode=0060600;st->st_nlink=1;
-        st->st_ino=1;st->st_rdev=0xf000;st->st_blksize=DeviceBlockSize(device);
+        st->st_ino=1+partition;st->st_rdev=0xf000+partition;st->st_blksize=DeviceBlockSize(device);
         return true;
     }
 #endif
@@ -8159,7 +8225,7 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
     if(fde->type==FdType::BlockDevice && fde->handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         memset(st,0,sizeof(*st));st->st_mode=0060600;st->st_nlink=1;
-        st->st_ino=1;st->st_rdev=0xf000;st->st_blksize=DeviceBlockSize(block->device);
+        st->st_ino=1+block->partition;st->st_rdev=0xf000+block->partition;st->st_blksize=DeviceBlockSize(block->device);
         return 0;
     }
 #endif
