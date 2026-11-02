@@ -62,3 +62,9 @@ check against a 17 GiB sparse `mke2fs` fixture with a two-block descriptor table
 passed, as did `e2fsck -fn`. This establishes geometry only: the helper is not
 wired into boot or a complete bitmap/inode-table validator, and has not been
 tested on the Dell.
+
+The unconnected helper also checks each classic group descriptor's bitmap and
+full 128-byte-inode-table placement and overlap, plus basic counter bounds.
+Synthetic corruption and partial-group tests pass, as does the 17 GiB fixture.
+It does not inspect bitmap contents or reconcile free counts, and it requires
+the superblock's format and feature restrictions to be established separately.

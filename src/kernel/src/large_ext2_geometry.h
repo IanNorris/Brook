@@ -49,4 +49,35 @@ inline bool LargeExt2GroupBounds(const LargeExt2Geometry& geometry, uint32_t gro
     first = begin + (LargeExt2HasBackup(group) ? 1 + geometry.descriptorBlocks : 0);
     return first < end;
 }
+
+// Validate one classic 32-byte group descriptor after separate superblock
+// feature/identity checks, including an inode size of exactly 128 bytes.
+// Bitmap contents and cross-group ownership are not checked; all three
+// metadata structures must be local to this group. Free counters are bounded,
+// not reconciled against metadata or bitmap contents.
+inline bool LargeExt2GroupDescriptorValid(const LargeExt2Geometry& geometry,
+                                           uint32_t group, uint32_t inodesPerGroup,
+                                           const uint8_t* descriptor, uint32_t size) {
+    if (!descriptor || size != 32 || !inodesPerGroup ||
+        inodesPerGroup > 32768 || inodesPerGroup % 32) return false;
+    uint64_t first = 0, end = 0;
+    if (!LargeExt2GroupBounds(geometry, group, first, end)) return false;
+    auto get16 = [](const uint8_t* p) -> uint16_t {
+        return uint16_t(p[0]) | (uint16_t(p[1]) << 8);
+    };
+    auto get32 = [&](const uint8_t* p) -> uint32_t {
+        return uint32_t(get16(p)) | (uint32_t(get16(p + 2)) << 16);
+    };
+    const uint64_t blockMap = get32(descriptor), inodeMap = get32(descriptor + 4);
+    const uint64_t table = get32(descriptor + 8);
+    const uint64_t tableBlocks = (uint64_t(inodesPerGroup) * 128 + 4095) / 4096;
+    if (blockMap < first || blockMap >= end || inodeMap < first || inodeMap >= end ||
+        blockMap == inodeMap || table < first || table >= end || tableBlocks > end - table ||
+        (blockMap >= table && blockMap < table + tableBlocks) ||
+        (inodeMap >= table && inodeMap < table + tableBlocks)) return false;
+    const uint64_t begin = uint64_t(group) * 32768;
+    return get16(descriptor + 12) <= end - begin &&
+           get16(descriptor + 14) <= inodesPerGroup &&
+           get16(descriptor + 16) <= inodesPerGroup;
+}
 }
