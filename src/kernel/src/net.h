@@ -443,6 +443,10 @@ void SockGetRemote(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);
 int  SockAccept(int sockIdx, SockAddrIn* addr);
 bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
+// Optional async-send worker-pool notification for a poll/epoll invocation.
+// A zero token means disabled/full; callers retain their timed fallback.
+uint64_t NetTcpPoolWaitRegister(Process* waiter);
+void NetTcpPoolWaitUnregister(uint64_t token);
 bool SockPollHangup(int sockIdx);
 uint32_t SockRxCount(int sockIdx);
 void SockSetPollWaiter(int sockIdx, Process* waiter);

@@ -3909,7 +3909,8 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
             SpinLockAcquire(&s.lock);
             const bool pending=s.tcpState==TcpState::SynSent || s.tcpState==TcpState::SynRecv || s.tcpState==TcpState::Listen;
             const bool ready=!pending && (!TcpCanSendData(s.tcpState) || s.tcpRstRecv ||
-                (g_tcpAsyncJobs[sockIdx] ? g_tcpAsyncJobs[sockIdx]->queue.Free()>0 : true));
+                (g_tcpAsyncJobs[sockIdx] ? g_tcpAsyncJobs[sockIdx]->queue.Free()>0 :
+                 __atomic_load_n(&g_tcpAsyncWorkers,__ATOMIC_ACQUIRE)<TCP_ASYNC_WORKER_LIMIT));
             SpinLockRelease(&s.lock);return ready;
         }
         if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established)

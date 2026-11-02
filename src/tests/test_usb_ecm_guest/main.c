@@ -11,13 +11,93 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 static unsigned char data[32768],reply[32768],disk[65519];
 struct writer { int fd; unsigned char value; atomic_int* ready; atomic_int* go; int result; };
 struct race_writer { int fd; const unsigned char* bytes; size_t length; atomic_int* entered; int result; };
 static unsigned char long_write[262144],short_write[4096];
+struct pool_drain {int fd;size_t bytes;int result;};
+struct pool_wait {int fd;int epoll;atomic_int* ready;int result;};
+static void* pool_drain_thread(void* opaque){
+    struct pool_drain* d=opaque;unsigned char buffer[8192];size_t n=0;
+    struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)){d->result=-1;return NULL;}
+    uint64_t deadline=(uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000+15000;
+    while(n<d->bytes){
+        if(clock_gettime(CLOCK_MONOTONIC,&ts)){d->result=-1;return NULL;}
+        uint64_t now=(uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;
+        if(now>=deadline){d->result=-1;return NULL;}
+        struct pollfd p={.fd=d->fd,.events=POLLIN};
+        if(poll(&p,1,(int)(deadline-now))<=0){d->result=-1;return NULL;}
+        size_t want=d->bytes-n<sizeof(buffer)?d->bytes-n:sizeof(buffer);
+        ssize_t got=read(d->fd,buffer,want);if(got<=0){d->result=-1;return NULL;}
+        for(ssize_t i=0;i<got;++i)if(buffer[i]!='P'){d->result=-1;return NULL;}
+        n+=(size_t)got;
+    }
+    d->result=0;return NULL;
+}
+static void* pool_wait_thread(void* opaque){
+    struct pool_wait* w=opaque;atomic_fetch_add(w->ready,1);
+    if(w->epoll){struct epoll_event event;w->result=epoll_wait(w->epoll,&event,1,10000);
+        if(w->result==1 && (!(event.events&EPOLLOUT) || (event.events&(EPOLLERR|EPOLLHUP)) || event.data.u64!=1))w->result=-1;}
+    else {struct pollfd p={.fd=w->fd,.events=POLLOUT};w->result=poll(&p,1,10000);
+        if(w->result==1 && (!(p.revents&POLLOUT) || (p.revents&(POLLERR|POLLHUP|POLLNVAL))))w->result=-1;}
+    return NULL;
+}
+static int async_pool_test(void){
+    int listener=-1,senders[9],receivers[9],ep=-1;size_t sent[8]={};
+    for(unsigned i=0;i<9;++i)senders[i]=receivers[i]=-1;
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(49411)};
+    inet_pton(AF_INET,"127.0.0.1",&addr.sin_addr);
+    listener=socket(AF_INET,SOCK_STREAM,0);
+    if(listener<0 || bind(listener,(struct sockaddr*)&addr,sizeof(addr)) || listen(listener,16))goto failure;
+    unsigned char block[4096];memset(block,'P',sizeof(block));
+    for(unsigned i=0;i<9;++i){
+        senders[i]=socket(AF_INET,SOCK_STREAM,0);
+        if(senders[i]<0 || connect(senders[i],(struct sockaddr*)&addr,sizeof(addr)))goto failure;
+        receivers[i]=accept(listener,NULL,NULL);if(receivers[i]<0)goto failure;
+        if(fcntl(senders[i],F_SETFL,O_NONBLOCK))goto failure;
+        if(i==8)break;
+        int blocked=0;
+        while(sent[i]<2*1024*1024){
+            ssize_t n=send(senders[i],block,sizeof(block),MSG_NOSIGNAL);
+            if(n>0){sent[i]+=(size_t)n;continue;}
+            if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK)){
+                struct pollfd p={.fd=senders[i],.events=POLLOUT};
+                int r=poll(&p,1,100);if(r==0){blocked=1;break;}if(r>0)continue;
+            }
+            goto failure;
+        }
+        if(!blocked || !sent[i])goto failure;
+    }
+    {struct pollfd p={.fd=senders[8],.events=POLLOUT};if(poll(&p,1,0)!=0)goto failure;}
+    ep=epoll_create1(0);if(ep<0)goto failure;
+    {struct epoll_event event={.events=EPOLLOUT,.data.u64=1};
+     if(epoll_ctl(ep,EPOLL_CTL_ADD,senders[8],&event) || epoll_wait(ep,&event,1,0)!=0)goto failure;}
+    {
+        atomic_int ready=0;pthread_t poller,epoller,drainer;
+        struct pool_wait p={senders[8],0,&ready,-1},e={senders[8],ep,&ready,-1};
+        struct pool_drain d={receivers[0],sent[0],-1};
+        if(pthread_create(&poller,NULL,pool_wait_thread,&p))goto failure;
+        if(pthread_create(&epoller,NULL,pool_wait_thread,&e)){pthread_join(poller,NULL);goto failure;}
+        while(atomic_load(&ready)!=2)sched_yield();
+        usleep(50000); // allow both waiters to enter their blocking calls
+        if(pthread_create(&drainer,NULL,pool_drain_thread,&d)){pthread_join(poller,NULL);pthread_join(epoller,NULL);goto failure;}
+        if(pthread_join(drainer,NULL) || pthread_join(poller,NULL) || pthread_join(epoller,NULL) || d.result || p.result!=1 || e.result!=1)goto failure;
+    }
+    if(ep>=0)close(ep);
+    if(listener>=0)close(listener);
+    for(unsigned i=0;i<9;++i){if(senders[i]>=0)close(senders[i]);if(receivers[i]>=0)close(receivers[i]);}
+    puts("ECM_ASYNC_POOL_WAIT_OK");return 0;
+failure:
+    if(ep>=0)close(ep);
+    if(listener>=0)close(listener);
+    for(unsigned i=0;i<9;++i){if(senders[i]>=0)close(senders[i]);if(receivers[i]>=0)close(receivers[i]);}
+    return -1;
+}
 static void* close_race_writer(void* opaque){
     struct race_writer* w=opaque;atomic_store(w->entered,1);
     w->result=write(w->fd,w->bytes,w->length)==(ssize_t)w->length?0:-1;return NULL;
@@ -38,9 +118,9 @@ static int storage(int fd,unsigned pass){
     return 0;
 }
 int main(int argc,char** argv){
-    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>7)return 2;
-    int concurrency=0,close_race=0,user_copy=0,async=0,bench_small=0;
-    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else return 2;}
+    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>8)return 2;
+    int concurrency=0,close_race=0,user_copy=0,async=0,bench_small=0,pool_test=0;
+    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else if(!strcmp(argv[i],"pool-test"))pool_test=1;else return 2;}
     if(close_race && !concurrency)return 2;
     struct sockaddr_in peer={.sin_family=AF_INET,.sin_port=htons((unsigned short)atoi(argv[1]))};
     inet_pton(AF_INET,"10.0.2.100",&peer.sin_addr);
@@ -121,7 +201,9 @@ int main(int argc,char** argv){
     if(poll(&wait,1,10000)<=0)return fail("UDP readiness");
     if(recvfrom(udp,reply,sizeof(reply),0,(struct sockaddr*)&peer,&length)!=982 || memcmp(data,reply,982))return fail("1024-byte frame receive");
     if(sendto(udp,reply,982,0,(struct sockaddr*)&peer,length)!=982)return fail("1024-byte ZLP echo");
-    close(udp);puts("ECM_NETWORK_INTEGRITY_OK bytes=262144 zlp_frames=64,1024");
+    close(udp);
+    if(pool_test && async_pool_test())return fail("async pool wait");
+    puts("ECM_NETWORK_INTEGRITY_OK bytes=262144 zlp_frames=64,1024");
     sleep(2);
     for(unsigned pass=0;pass<8;++pass)if(storage(file,pass))return fail("USB after disconnect");
     close(file);puts("ECM_USB_STILL_ALIVE");return 0;

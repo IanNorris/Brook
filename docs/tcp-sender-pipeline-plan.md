@@ -9,10 +9,13 @@ into owned storage before returning; each worker drains batches with the
 existing ACK-synchronous sender, and drops its reference after detach. A full
 queue can return an accepted prefix; an empty queue releases its worker.
 Connection epochs reject stale publication after reconnect. Peer reset now
-latches `ECONNRESET` for one `SO_ERROR` read. When the worker pool is full, a
-socket without a job can report writable and then return `EAGAIN`: repeated
-polling can therefore spin. Internet half-close is still unsupported, and
-this mode is not ready to become the default.
+latches `ECONNRESET` for one `SO_ERROR` read. When the worker pool is full,
+unattached sockets report non-writable. Poll and epoll register independent,
+generation-tagged process waiters, which are notified when a permit becomes
+available. The table is bounded to 64 waiters; exhaustion uses the existing
+50/100 ms timed rescans. Readiness does not reserve a permit, so `EAGAIN` can
+still occur if another sender takes it first. Internet half-close is still
+unsupported, and this mode is not ready to become the default.
 
 Hosted tests cover allocation and thread-creation failure, pool saturation,
 close before drain, queue backpressure, copy fault after an accepted prefix,
@@ -21,6 +24,11 @@ during allocation and after old-job detach, plus one stalled connection while
 another progresses. Disposable QEMU tests covered data integrity, concurrent
 writers, user-copy faults, one dropped packet and close with a 16 KiB accepted
 write. The async close test does not cover a large blocked write.
+Hosted tests also exercise pool waiter token reuse, saturation, concurrent
+unregister/notification and permit reconsumption. A disposable QEMU test
+filled eight loopback receive queues and observed concurrent poll and epoll
+calls regain writable readiness when a receiver drained. Their timed rescans
+mean this guest test alone does not prove notification-driven wakeup.
 
 In one matched QEMU comparison with 10 ms packet buffering and one dropped
 packet, the host received a 1 MiB stream issued as 1,024 separate 1 KiB writes

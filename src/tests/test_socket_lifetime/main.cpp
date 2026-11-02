@@ -628,8 +628,55 @@ int main() {
         assert(!g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers && g_sockets[socket].refCount==1);
         assert(allocations==allocBefore+1 && frees==freeBefore+1);failWorkerCreate=false;
         g_tcpAsyncWorkers=TCP_ASYNC_WORKER_LIMIT;g_sockets[socket].nonblock=true;
-        assert(SockPollReady(socket,false,true) && SockSend(socket,bytes,sizeof(bytes))==-11);
+        assert(!SockPollReady(socket,false,true) && SockSend(socket,bytes,sizeof(bytes))==-11);
+        auto* p1=new Process{};auto* p2=new Process{};p1->refCount=p2->refCount=1;
+        const uint64_t t1=NetTcpPoolWaitRegister(p1),t2=NetTcpPoolWaitRegister(p2);
+        assert(t1 && t2 && t1!=t2 && p1->refCount==2 && p2->refCount==2);
+        const unsigned wakeBefore=wakes;TcpAsyncReleaseWorker();
+        assert(g_tcpAsyncWorkers==TCP_ASYNC_WORKER_LIMIT-1 && wakes==wakeBefore+2 && p1->refCount==1 && p2->refCount==1);
+        NetTcpPoolWaitUnregister(t1);NetTcpPoolWaitUnregister(t2);
+        assert(SockPollReady(socket,false,true));delete p1;delete p2;
+        // Release before registration is observed by the post-registration
+        // readiness check; an immediately reconsumed permit stays blocked
+        // until a later release wakes its fresh registration.
+        auto* poolRace=new Process{};poolRace->refCount=1;
+        uint64_t token=NetTcpPoolWaitRegister(poolRace);
+        assert(token && SockPollReady(socket,false,true));NetTcpPoolWaitUnregister(token);
+        assert(TcpAsyncReserveWorker() && !SockPollReady(socket,false,true));
+        token=NetTcpPoolWaitRegister(poolRace);assert(token && !SockPollReady(socket,false,true));
+        const unsigned beforeRaceWake=wakes;TcpAsyncReleaseWorker();
+        assert(wakes==beforeRaceWake+1 && SockPollReady(socket,false,true));
+        NetTcpPoolWaitUnregister(token);assert(poolRace->refCount==1);
+        // Cleanup racing notification must drop exactly one retained ref.
+        for(unsigned n=0;n<100;++n){
+            g_tcpAsyncWorkers=TCP_ASYNC_WORKER_LIMIT;
+            token=NetTcpPoolWaitRegister(poolRace);assert(token);
+            std::atomic<bool> go{false};
+            std::thread unregister([&]{while(!go.load())std::this_thread::yield();NetTcpPoolWaitUnregister(token);});
+            go=true;TcpAsyncReleaseWorker();unregister.join();
+            assert(poolRace->refCount==1);
+        }
+        delete poolRace;
+        // Attaching a queue makes this socket writable even if it consumes
+        // the last global permit; wake an already installed socket waiter.
+        auto* attachWaiter=new Process{};attachWaiter->refCount=1;
+        g_tcpAsyncWorkers=TCP_ASYNC_WORKER_LIMIT-1;SockSetPollWaiter(socket,attachWaiter);
+        const unsigned beforeAttachWake=wakes;
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        assert(wakes==beforeAttachWake+1 && attachWaiter->refCount==1 && SockPollReady(socket,false,true));
+        acknowledgeDataCount=1;runTestWorker();delete attachWaiter;
         g_tcpAsyncWorkers=0;g_sockets[socket].nonblock=false;SockClose(socket);
+        // Tokens cannot clear a later registration, and a full table falls
+        // back to the ordinary bounded poll/epoll rescan.
+        auto* poolWaiter=new Process{};poolWaiter->refCount=1;
+        uint64_t tokens[TCP_ASYNC_POOL_WAITERS];
+        for(auto& token:tokens){token=NetTcpPoolWaitRegister(poolWaiter);assert(token);}
+        assert(!NetTcpPoolWaitRegister(poolWaiter));
+        const uint64_t stale=tokens[0];NetTcpPoolWaitUnregister(stale);
+        tokens[0]=NetTcpPoolWaitRegister(poolWaiter);assert(tokens[0] && tokens[0]!=stale);
+        NetTcpPoolWaitUnregister(stale);assert(poolWaiter->refCount==TCP_ASYNC_POOL_WAITERS+1);
+        for(auto token:tokens)NetTcpPoolWaitUnregister(token);
+        assert(poolWaiter->refCount==1);delete poolWaiter;
         // A reconnect while an old producer allocates its worker cannot
         // publish old bytes into the new TCP incarnation.
         socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;

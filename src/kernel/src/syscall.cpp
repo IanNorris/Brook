@@ -9139,6 +9139,7 @@ retry_poll:
         // For pipe FDs, register as waiter on the pipe
         uint64_t waiterCap = nfds;
         uint64_t safetyMs = 50;
+        uint64_t tcpPoolWaitToken = 0;
         NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup pipeWaiters;
@@ -9195,6 +9196,8 @@ retry_poll:
             {
                 int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                 brook::SockSetPollWaiter(sockIdx, self);
+                if((fds[i].events & POLLOUT) && !tcpPoolWaitToken)
+                    tcpPoolWaitToken=brook::NetTcpPoolWaitRegister(self);
             }
             if (fde->type == FdType::UnixSocket && fde->handle) {
                 auto* usd = static_cast<UnixSocketData*>(fde->handle);
@@ -9278,6 +9281,7 @@ retry_poll:
         }
 
         // Clean up waiters
+        brook::NetTcpPoolWaitUnregister(tcpPoolWaitToken);
         InputRemoveWaiter(self);
         for (uint64_t i = 0; i < waiterCap; i++)
         {
@@ -9302,7 +9306,7 @@ retry_poll:
             if (fde->type == FdType::Socket && fde->handle)
             {
                 int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-                brook::SockSetPollWaiter(si, nullptr);
+                brook::SockClearPollWaiter(si, self);
             }
         }
 
@@ -10024,6 +10028,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup namedWaiters;bool namedWaitFailed=false;
+        uint64_t tcpPoolWaitToken=0;
         auto registerWaiters = [&]() {
             for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
                 FdEntry* fde = walk->pins[wfd];
@@ -10043,6 +10048,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 } else if (fde->type == FdType::Socket) {
                     int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                     brook::SockSetPollWaiter(si, proc);
+                    if((walk->masks[wfd] & EPOLLOUT) && !tcpPoolWaitToken)
+                        tcpPoolWaitToken=brook::NetTcpPoolWaitRegister(proc);
                 } else if (fde->type == FdType::UnixSocket) {
                     auto* usd = static_cast<UnixSocketData*>(fde->handle);
                     uint32_t events = walk->masks[wfd];
@@ -10059,6 +10066,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             }
         };
         auto unregisterWaiters = [&]() {
+            brook::NetTcpPoolWaitUnregister(tcpPoolWaitToken);tcpPoolWaitToken=0;
             for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
                 FdEntry* fde = walk->pins[wfd];
                 if (!walk->masks[wfd]) continue;
@@ -10071,7 +10079,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                     if (efd->epollWaiter == proc) efd->epollWaiter = nullptr;
                 } else if (fde->type == FdType::Socket) {
                     int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-                    brook::SockSetPollWaiter(si, nullptr);
+                    brook::SockClearPollWaiter(si, proc);
                 } else if (fde->type == FdType::UnixSocket) {
                     auto* usd = static_cast<UnixSocketData*>(fde->handle);
                     if (usd->epollWaiter == proc) usd->epollWaiter = nullptr;

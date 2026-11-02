@@ -4,6 +4,11 @@
 static constexpr uint32_t TCP_ASYNC_WORKER_LIMIT=8;
 static constexpr uint32_t TCP_ASYNC_QUEUE_BYTES=32768;
 static constexpr uint32_t TCP_ASYNC_BATCH_BYTES=16384;
+static constexpr uint32_t TCP_ASYNC_POOL_WAITERS=64;
+struct TcpPoolWaitEntry {Process* process=nullptr;uint64_t token=0;};
+static TcpPoolWaitEntry g_tcpPoolWaiters[TCP_ASYNC_POOL_WAITERS]{};
+static IrqSpinLock g_tcpPoolWaitLock;
+static uint64_t g_tcpPoolNextToken=0;
 struct TcpAsyncJob {
     int index;
     uint64_t epoch;
@@ -21,6 +26,30 @@ static bool TcpAsyncReserveWorker() {
 static void TcpAsyncWake(Process* waiter) {
     if(waiter){__atomic_store_n(&waiter->pendingWakeup,1,__ATOMIC_RELEASE);SchedulerUnblock(waiter);ProcessUnref(waiter);}
 }
+uint64_t NetTcpPoolWaitRegister(Process* process) {
+    if(!g_tcpAsyncSend || !process)return 0;
+    const auto flags=IrqSpinLockAcquire(&g_tcpPoolWaitLock);
+    uint64_t token=0;
+    if(g_tcpPoolNextToken!=~uint64_t(0))for(auto& entry:g_tcpPoolWaiters)if(!entry.process){
+        ProcessRef(process);token=++g_tcpPoolNextToken;entry={process,token};break;
+    }
+    IrqSpinLockRelease(&g_tcpPoolWaitLock,flags);return token;
+}
+void NetTcpPoolWaitUnregister(uint64_t token) {
+    if(!token)return;
+    Process* process=nullptr;const auto flags=IrqSpinLockAcquire(&g_tcpPoolWaitLock);
+    for(auto& entry:g_tcpPoolWaiters)if(entry.token==token){process=entry.process;entry={};break;}
+    IrqSpinLockRelease(&g_tcpPoolWaitLock,flags);if(process)ProcessUnref(process);
+}
+static void TcpAsyncReleaseWorker() {
+    const uint32_t before=__atomic_fetch_sub(&g_tcpAsyncWorkers,1u,__ATOMIC_ACQ_REL);
+    if(before!=TCP_ASYNC_WORKER_LIMIT)return;
+    Process* wake[TCP_ASYNC_POOL_WAITERS];unsigned count=0;
+    const auto flags=IrqSpinLockAcquire(&g_tcpPoolWaitLock);
+    for(auto& entry:g_tcpPoolWaiters)if(entry.process){wake[count++]=entry.process;entry={};}
+    IrqSpinLockRelease(&g_tcpPoolWaitLock,flags);
+    for(unsigned n=0;n<count;++n)TcpAsyncWake(wake[n]);
+}
 static void TcpAsyncWorker(void* argument) {
     auto* job=static_cast<TcpAsyncJob*>(argument);const int index=job->index;Socket& s=g_sockets[index];
     for(;;) {
@@ -37,7 +66,7 @@ static void TcpAsyncWorker(void* argument) {
             TcpAsyncTestDetached(index);
 #endif
             kfree(job);SockUnref(index);
-            __atomic_fetch_sub(&g_tcpAsyncWorkers,1u,__ATOMIC_RELEASE);
+            TcpAsyncReleaseWorker();
             return; // the final unref may have destroyed and reused the slot
         }
         const uint32_t batch=job->queue.ReserveCopy(job->batch,TCP_ASYNC_BATCH_BYTES);
@@ -130,14 +159,14 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
                 }
                 // The producer gate excludes another publisher. A separate
                 // owner pins the socket until the worker detaches its job.
-                if(!SockTryRef(index)) {__atomic_fetch_sub(&g_tcpAsyncWorkers,1u,__ATOMIC_RELEASE);return accepted ? static_cast<int>(accepted) : -1;}
+                if(!SockTryRef(index)) {TcpAsyncReleaseWorker();return accepted ? static_cast<int>(accepted) : -1;}
                 auto* memory=kmalloc(sizeof(TcpAsyncJob));
                 auto* created=memory ? new (memory) TcpAsyncJob{} : nullptr;
                 if(created){created->index=index;created->epoch=epoch;created->queue.Init(created->storage,sizeof(created->storage));}
                 Process* worker=created ? KernelThreadCreate("tcp_async",TcpAsyncWorker,created,2) : nullptr;
                 if(!worker) {
                     if(created)kfree(created);SockUnref(index);
-                    __atomic_fetch_sub(&g_tcpAsyncWorkers,1u,__ATOMIC_RELEASE);
+                    TcpAsyncReleaseWorker();
                     return accepted ? static_cast<int>(accepted) : -12;
                 }
                 SpinLockAcquire(&s.lock);
@@ -148,7 +177,8 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
                 if(attach){g_tcpAsyncJobs[index]=created;
                     accepted+=created->queue.Append(staging,chunk);
                 }
-                SpinLockRelease(&s.lock);SchedulerAddProcess(worker);
+                Process* waiter=attach ? TakeSocketWaiterLocked(s) : nullptr;
+                SpinLockRelease(&s.lock);TcpAsyncWake(waiter);SchedulerAddProcess(worker);
                 if(!attach)return accepted ? static_cast<int>(accepted) : -104;
             }
         }
