@@ -345,18 +345,29 @@ void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
     SpinLockRelease(&g_arpLock);
 }
 
-static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
+enum class ArpCacheResult : uint8_t { Found, Missing, Full };
+
+// Distinguish a miss that can be retained from a full cache. Both the lookup
+// and capacity observation are made under the cache lock; a future async
+// caller must recheck after a reply because another insertion can race it.
+static ArpCacheResult ArpCacheQuery(uint32_t ip, MacAddr* out)
 {
     SpinLockAcquire(&g_arpLock);
     for (uint32_t i = 0; i < g_arpCount; i++) {
         if (g_arpCache[i].ip == ip && g_arpCache[i].valid) {
-            *out = g_arpCache[i].mac;
+            if (out) *out = g_arpCache[i].mac;
             SpinLockRelease(&g_arpLock);
-            return true;
+            return ArpCacheResult::Found;
         }
     }
+    const auto result=g_arpCount<ARP_CACHE_SIZE ? ArpCacheResult::Missing : ArpCacheResult::Full;
     SpinLockRelease(&g_arpLock);
-    return false;
+    return result;
+}
+
+static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
+{
+    return ArpCacheQuery(ip,out)==ArpCacheResult::Found;
 }
 
 // ---------------------------------------------------------------------------

@@ -268,6 +268,17 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 }
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
+    {
+        MacAddr mac={{1,2,3,4,5,6}},updated={{6,5,4,3,2,1}},found{};
+        assert(ArpCacheQuery(1,&found)==ArpCacheResult::Missing);
+        for(uint32_t ip=1;ip<=ARP_CACHE_SIZE;++ip)ArpCacheInsert(ip,mac);
+        assert(ArpCacheQuery(ARP_CACHE_SIZE+1,&found)==ArpCacheResult::Full);
+        ArpCacheInsert(1,updated);
+        assert(ArpCacheQuery(1,&found)==ArpCacheResult::Found && !memcmp(&found,&updated,sizeof(found)));
+        ArpCacheInsert(ARP_CACHE_SIZE+1,mac);
+        assert(ArpCacheQuery(ARP_CACHE_SIZE+1,&found)==ArpCacheResult::Full);
+        memset(g_arpCache,0,sizeof(g_arpCache));g_arpCount=0;
+    }
     assert(NetIpv4PayloadFits(1480) && !NetIpv4PayloadFits(1481) && !NetIpv4PayloadFits(~uint32_t(0)));
     {
         NetIf nif{};nif.transmit=captureFrame;nif.mac={{1,2,3,4,5,6}};

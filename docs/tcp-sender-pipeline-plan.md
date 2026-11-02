@@ -215,6 +215,15 @@ expiry and late completion. Astra reviewed the tracker. It is not instantiated
 in the network runtime and therefore makes no ARP or TCP behavior change;
 cache-full handling, admission and integration remain open.
 
+The existing ARP cache lookup now exposes a locked three-way result: found,
+missing with space, or missing while full. The legacy resolver still treats
+both kinds of miss alike. Hosted tests fill the actual cache, verify full
+reporting and confirm that an existing entry can still be updated; the USB
+Ethernet QEMU loss/concurrency suite passed. Capacity is only a snapshot: a
+future asynchronous resolver must recheck after a reply because another
+insertion can consume the last slot. This does not yet add cache eviction or
+connect the tracker to networking.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;
