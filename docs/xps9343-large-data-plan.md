@@ -182,3 +182,21 @@ physical model and altered identity or geometry. This predicate does not enable
 the existing raw-write or installer tests and does not itself open a disk.
 Integration must compile-gate every caller and reject conflicting markers
 before evaluating any test-mode branch, not just this predicate.
+
+A distinct compile-gated QEMU mode now uses that admission to mount the
+inspected data partition at `/mnt/ahcitest`, without enabling the legacy
+fixed-offset raw-write test. Two snapshot-backed QEMU boots confirmed that a
+wrong disk serial and conflicting markers both leave the disk read-only and
+refuse the old raw-write hook. On a separate writable private clone, a 17 GiB
+ext2 partition mounted through AHCI; the test created, fsynced and renamed a
+150,123-byte file, completed checked shutdown, and verified the file after a
+fresh boot and second checked shutdown. A sparse host extraction passed
+`e2fsck -fn`, and its file content matched an independent host oracle. GPT
+metadata and a selected gap sentinel were unchanged. Evidence is under
+`build/hardware/large-data-write-run-20261102` and the two
+`large-data-negative-*-run-20261102` directories.
+
+This QEMU-only path does not provide production partition ownership or the
+dirty/clean-session protocol and does not test writes into a group beyond 127.
+The helper and marker do not enable this mount in a production kernel. No Dell
+SSD access was performed by these tests.

@@ -4,6 +4,9 @@
 #include "ahci_readonly.h"
 #include "device.h"
 #include "fatfs_glue.h"
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#include "ext2_vfs.h"
+#endif
 #include "memory/heap.h"
 #include "mount_namespace.h"
 #include "vfs.h"
@@ -33,6 +36,28 @@ uint64_t Blocks(Device*) {return range.bytes/512;}
 uint32_t BlockSize(Device*) {return 512;}
 const BlockDeviceOps ops{Read,Write,Control,nullptr,Blocks,BlockSize};
 Device partition{reinterpret_cast<const DeviceOps*>(&ops),"ahci-system",DeviceType::Block,nullptr};
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+AhciDataInspection largeInspection{};bool largeInspectionClean=false;
+Range largeRange{};
+int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
+    if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
+    return largeRange.parent->ops->read(largeRange.parent,largeRange.start+offset,data,length);
+}
+int LargeWrite(Device*,uint64_t offset,const void* data,uint64_t length) {
+    if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
+    return DeviceWrite(largeRange.parent,largeRange.start+offset,data,length);
+}
+int LargeControl(Device*,uint32_t request,void*) {
+    if(!largeRange.parent)return -19;
+    if(request==DEVICE_IOCTL_FLUSH)return DeviceFlush(largeRange.parent);
+    if(request==DEVICE_IOCTL_READ_ONLY)return largeRange.parent->ops->ioctl(largeRange.parent,request,nullptr);
+    return -95;
+}
+uint64_t LargeBlocks(Device*) {return largeRange.bytes/512;}
+uint32_t LargeBlockSize(Device*) {return 512;}
+const BlockDeviceOps largeOps{LargeRead,LargeWrite,LargeControl,nullptr,LargeBlocks,LargeBlockSize};
+Device largePartition{reinterpret_cast<const DeviceOps*>(&largeOps),"ahci-qemu-large",DeviceType::Block,nullptr};
+#endif
 
 AhciSystemBoot Fail(const char* stage) {
     KPrintf("ahci system: %s failed; maintenance only\n",stage);
@@ -94,6 +119,9 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
 }
 
 void AhciSystemDataInspect() {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    largeInspection={};largeInspectionClean=false;
+#endif
     // The marker is a bounded selector, not an instruction to mount or write.
     VnodeStat st{};const int exists=VfsLstatPath("/etc/ahci-data-inspect",&st);
     if(exists==-2)return;
@@ -140,10 +168,34 @@ void AhciSystemDataInspect() {
     const auto state=AhciReadAndInspectBootData(io,boot,data,DeviceBlockCount(disk),entries,backup,
                                                 EntryCapacity,gdt,GdtCapacity,result);
     kfree(entries);kfree(backup);kfree(gdt);
-    if(state==AhciDataInspectionState::Clean)
+    if(state==AhciDataInspectionState::Clean) {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+        if(AhciDisposableLargeDataWritable()){largeInspection=result;largeInspectionClean=true;}
+#endif
         KPrintf("ahci data inspect: format eligible entry=%u groups=%u (read only)\n",result.data.entry,result.geometry.groups);
+    }
     else if(state==AhciDataInspectionState::NeedsCheck)
         KPrintf("ahci data inspect: offline filesystem check required (read only)\n");
     else KPrintf("ahci data inspect: identity or format rejected (read only)\n");
 }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
+    if(!AhciDisposableLargeDataWritable() || !largeInspectionClean || !nextDrive ||
+       !Ext2DriveAvailable(*nextDrive) || DeviceFind(largePartition.name))return false;
+    largeInspectionClean=false; // one-shot; a failed mount requires a fresh inspection
+    Device* disk=AhciWriteAdmittedDevice();if(!disk)return false;
+    VnodeStat st{};
+    if(VfsLstatPath("/mnt/ahcitest",&st) || !st.isDir || st.isSymlink)return false;
+    auto* ns=VfsMountNamespaceInitial();
+    for(uint32_t i=0;i<VfsMountNamespaceCount(ns);++i) {
+        const auto mount=VfsMountNamespaceSnapshotAt(ns,i);
+        if(mount.used && Prefix(mount.mountPoint,"/mnt/ahcitest"))return false;
+    }
+    largeRange={disk,largeInspection.data.first*512,largeInspection.data.count*512};
+    if(!DeviceRegister(&largePartition))return false;
+    if(!Ext2BindDevice(*nextDrive,&largePartition))return false;
+    const uint8_t drive=(*nextDrive)++;
+    return VfsMountConfigured("/mnt/ahcitest","ext2",drive,0);
+}
+#endif
 } // namespace brook

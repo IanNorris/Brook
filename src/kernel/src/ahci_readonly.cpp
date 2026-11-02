@@ -40,6 +40,7 @@ bool physicalInstallMode=false;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
 bool testInstallMode=false;
+bool largeDataTestWritable=false;
 bool TestKvm() {
     uint32_t a,b,c,d;
     __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x40000000u),"c"(0));
@@ -327,11 +328,20 @@ void AhciReadOnlyInit() {
     const bool markerPresent=testMarker!=nullptr;if(testMarker)VfsClose(testMarker);
     auto* installMarker=VfsOpen("/etc/ahci-qemu-install-test");
     const bool installPresent=installMarker!=nullptr;if(installMarker)VfsClose(installMarker);
-    testWritable=AhciDisposableTestAdmission(markerPresent || writeEnabled,TestKvm(),selected,info,
-        AtaSupportsFlushExt(dma+dataOffset,512)) ||
-        AhciDisposableDesktopInstallAdmission(installPresent,TestKvm(),selected,info,
-        AtaSupportsFlushExt(dma+dataOffset,512));
-    writeEnabled=writeEnabled || testWritable;
+    auto* largeMarker=VfsOpen("/etc/ahci-qemu-large-data-test");
+    const bool largePresent=largeMarker!=nullptr;if(largeMarker)VfsClose(largeMarker);
+    const bool conflicting=largePresent && (markerPresent || installPresent);
+    const bool flush=AtaSupportsFlushExt(dma+dataOffset,512);
+    if(largePresent) {
+        largeDataTestWritable=AhciDisposableLargeDataAdmission(true,conflicting,TestKvm(),selected,info,flush);
+        // A present large-test marker never falls back to production or legacy
+        // test admission in this test kernel, even if the identity is wrong.
+        writeEnabled=largeDataTestWritable;
+    } else {
+        testWritable=AhciDisposableTestAdmission(markerPresent || writeEnabled,TestKvm(),selected,info,flush) ||
+            AhciDisposableDesktopInstallAdmission(installPresent,TestKvm(),selected,info,flush);
+        writeEnabled=writeEnabled || testWritable;
+    }
     if(testWritable)testInstallMode=installPresent;
 #endif
     KMutexInit(&ioLock);
@@ -344,6 +354,7 @@ void AhciReadOnlyInit() {
     if(targetPresent)status.reason=writeEnabled?"configured ATA device writable":"ATA write target rejected; device read-only";
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(testWritable)status.reason="disposable QEMU test ATA device writable";
+    if(largeDataTestWritable)status.reason="disposable QEMU large data test ATA device writable";
 #endif
     if(!writeEnabled) {
         auto* exportMarker=VfsOpen("/etc/ahci-export",VFS_O_STREAM);
@@ -405,6 +416,7 @@ int AhciReadOnlyExportRead(uint64_t offset,void* output,uint32_t length) {
 }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool AhciDisposableQemuWritable() { return testWritable && !testInstallMode && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }
+bool AhciDisposableLargeDataWritable() { return largeDataTestWritable && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }
 Device* AhciDisposableQemuInstallDevice() {
     if(!testWritable || !testInstallMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
     KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;

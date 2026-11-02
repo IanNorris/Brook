@@ -899,7 +899,15 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
-    if(systemVolume==brook::AhciSystemBoot::Ready)brook::AhciSystemDataInspect();
+    if(systemVolume==brook::AhciSystemBoot::Ready) {
+        brook::AhciSystemDataInspect();
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+        if(brook::AhciDisposableLargeDataWritable()) {
+            if(brook::AhciSystemQemuLargeDataMount(&nextPdrv))brook::SerialPuts("AHCI_QEMU_LARGE_EXT2_MOUNTED\n");
+            else brook::SerialPuts("AHCI_QEMU_LARGE_EXT2_NOT_MOUNTED\n");
+        }
+#endif
+    }
     const auto writableDesktop=systemVolume==brook::AhciSystemBoot::Maintenance ? brook::WritableDesktopBoot::Maintenance :
         brook::WritableDesktopBootMount(&nextPdrv,systemVolume==brook::AhciSystemBoot::Ready ?
             brook::WritableDesktopSource::System : brook::WritableDesktopSource::Usb);

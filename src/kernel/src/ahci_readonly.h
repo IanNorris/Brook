@@ -26,6 +26,7 @@ int AhciReadOnlySector(uint64_t lba, void* output);
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 int AhciDisposableQemuTest();
 bool AhciDisposableQemuWritable();
+bool AhciDisposableLargeDataWritable();
 Device* AhciDisposableQemuInstallDevice();
 #endif
 } // namespace brook
