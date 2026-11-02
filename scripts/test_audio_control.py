@@ -5,7 +5,7 @@ Creates disposable files only. Captures through QEMU's WAV output backend;
 never emits speaker audio or accesses host USB devices. Exercises the real
 user syscall and /dev/dsp paths plus an absent-device boot.
 """
-import os,subprocess,shutil,argparse,json,socket,time,wave,array,collections
+import os,subprocess,shutil,argparse,json,socket,time,wave,array,collections,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
@@ -31,8 +31,11 @@ class Qmp:
    r=json.loads(self.f.readline())
    if 'return' in r:return r['return']
    if 'error' in r:raise RuntimeError(r)
+ def close(self):
+  self.f.close();self.s.close()
 for mode in ['hda','no-device']:
  d=out/mode;d.mkdir();vars=d/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],vars);vars.chmod(0o600)
+ qmp_dir=tempfile.TemporaryDirectory(prefix='brook-qmp-');qmp_path=Path(qmp_dir.name)/'qmp.sock'
  disk=out/'probe.raw'
  if mode=='no-device':
   disk=d/'probe.raw';subprocess.run(['cp','--reflink=auto',str(out/'probe.raw'),str(disk)],check=True)
@@ -44,14 +47,14 @@ for mode in ['hda','no-device']:
  '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],'-drive','if=pflash,format=raw,file='+str(vars),
  '-device','VGA','-device','qemu-xhci,id=usbc','-drive','if=none,id=stick,format=raw,readonly=on,file='+str(disk),
  '-device','usb-storage,bus=usbc.0,drive=stick,bootindex=1','-display','none','-serial','file:'+str(d/'serial.log'),
- '-qmp','unix:'+str(d/'qmp.sock')+',server=on,wait=off','-no-reboot','-nic','none']
+ '-qmp','unix:'+str(qmp_path)+',server=on,wait=off','-no-reboot','-nic','none']
  if mode=='hda':args+=['-audiodev','wav,id=sound,path='+str(d/'output.wav')+',out.frequency=44100,out.channels=2,out.format=s16','-device','ich9-intel-hda','-device','hda-output,audiodev=sound']
  (d/'argv.json').write_text(json.dumps(args,indent=2));log=(d/'qemu.log').open('x');owner=subprocess.Popen(args,stdout=log,stderr=subprocess.STDOUT);q=None
  try:
   deadline=time.monotonic()+120
   while time.monotonic()<deadline:
    assert owner.poll() is None,'QEMU ended early'
-   if not q and (d/'qmp.sock').exists():q=Qmp(d/'qmp.sock')
+   if not q and qmp_path.exists():q=Qmp(qmp_path)
    serial=(d/'serial.log').read_text(errors='replace') if (d/'serial.log').exists() else ''
    assert 'AUDIO_CONTROL_FAIL' not in serial,serial[-1500:]
    assert 'PANIC_HEX:' not in serial
@@ -76,4 +79,6 @@ for mode in ['hda','no-device']:
     try:q.call('quit');owner.wait(timeout=20)
     except BaseException:owner.terminate();owner.wait(timeout=20)
    else:owner.terminate();owner.wait(timeout=20)
+  if q:q.close()
   log.close()
+  qmp_dir.cleanup()
