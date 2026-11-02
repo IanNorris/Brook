@@ -20,6 +20,8 @@ struct HdaObservation {
     uint16_t streamCommand=0;const char* streamReason="not requested";
     bool runtimeRequested=false,runtimePrepared=false,runtimeRegistered=false,runtimeQuarantined=false;
     const char* runtimeReason="not requested";
+    bool cacheRequested=false,cacheCaptured=false,cacheMatch=false;
+    uint32_t cacheCpuCount=0;uint64_t cachePat=0;
 };
 // Called once on CPU 0 before AP scheduler activation or driver loading.
 void HdaObserveConfigure(const BootProtocol* boot);

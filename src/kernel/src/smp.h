@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "native_tsc_rendezvous.h"
+#include "cpu_cache_snapshot.h"
 
 namespace brook {
 
@@ -42,6 +43,9 @@ uint32_t SmpCurrentCpuIndex();
 // wait. A timeout abandons that AP's static mailbox for the rest of the boot.
 // The result is evidence only; it does not enable a shared clock.
 uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* output,uint32_t capacity);
+// One-shot, BSP-only capture while all accepted APs remain in bootstrap wait.
+// Failure or timeout is terminal for this boot; static mailboxes are retained.
+bool SmpObserveCacheSnapshots(CpuCacheSnapshot* output,uint32_t capacity);
 
 // Immutable AP bootstrap stack bounds (also used by the initial AP idle loop).
 bool SmpBootstrapStackBounds(uint32_t cpu, uint64_t& base, uint64_t& end);

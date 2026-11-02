@@ -40,6 +40,7 @@ void HdaObserveTestBeforeStreamIteration();
 #endif
 namespace {
 HdaObservation observation{};
+CpuCacheSnapshot cacheSnapshots[MAX_CPUS]{};
 volatile uint8_t* registers=nullptr; // borrowed page; intentionally boot-lifetime
 constexpr uint64_t Aperture=16384,Page=4096;
 
@@ -374,6 +375,16 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
     const bool muted=Marker("/etc/dell-hda-muted-dma"),audible=Marker("/etc/dell-hda-quiet-tone");
     const bool mixerProbe=Marker("/etc/dell-hda-mixer-format-probe");
+    if(Marker("/etc/dell-hda-cache-observe")){
+        observation.cacheRequested=true;const auto count=SmpGetCpuCount();
+        if(count && count<=MAX_CPUS && SmpObserveCacheSnapshots(cacheSnapshots,MAX_CPUS)){
+            observation.cacheCaptured=true;observation.cacheCpuCount=count;observation.cachePat=cacheSnapshots[0].pat;
+            observation.cacheMatch=true;for(uint32_t i=0;i<count;++i)
+                if(!CpuCacheSnapshotsMatch(cacheSnapshots[0],cacheSnapshots[i]))observation.cacheMatch=false;
+        }
+        SerialPrintf("HDA_CACHE_OBSERVE captured=%u cpus=%u match=%u pat=0x%lx\n",unsigned(observation.cacheCaptured),
+                     observation.cacheCpuCount,unsigned(observation.cacheMatch),observation.cachePat);
+    }
     if(Marker("/etc/dell-hda-audio")){
         observation.runtimeRequested=true;
         if(muted || audible || mixerProbe || Marker("/etc/dell-hda-stream-probe")){observation.runtimeReason="conflicting markers";return;}

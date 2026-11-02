@@ -31,12 +31,14 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-stream-probe")==0 && (scenario>=38 && scenario<=43))return &marker;
- if(std::strcmp(path,"/etc/dell-hda-audio")==0 && scenario>=44)return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-audio")==0 && scenario>=44 && scenario<=47)return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-cache-observe")==0 && scenario==48)return &marker;
  if(std::strcmp(path,"/etc/audio-muted")==0 && scenario>=44 && scenario!=46)return &marker;
  return nullptr;}
 extern "C" void VfsClose(Vnode*){}
 uint32_t SmpCurrentCpuIndex(){return 0;}
 uint32_t SmpGetCpuCount(){return 1;}
+bool SmpObserveCacheSnapshots(CpuCacheSnapshot* out,uint32_t count){if(count<1)return false;out[0].valid=true;out[0].pat=0x0007040100070406ULL;return true;}
 void KMutexInit(KMutex* m){m->locked=0;}
 void KMutexLock(KMutex* m){assert(!m->locked);m->locked=1;}
 bool KMutexTryLock(KMutex* m){if(m->locked)return false;m->locked=1;return true;}
@@ -163,6 +165,7 @@ static void one(int which){
  if(which==46){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0);HdaRuntimeRegister();assert(!registerCalls);}
  if(which==47){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0 && !std::strcmp(o.runtimeReason,"all-CPU cache admission unavailable"));
   HdaRuntimeRegister();assert(!registerCalls && !chip.published);}
+ if(which==48){assert(o.cacheRequested && o.cacheCaptured && o.cacheMatch && o.cacheCpuCount==1 && o.cachePat==0x0007040100070406ULL);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=47;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=48;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

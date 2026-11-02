@@ -2772,3 +2772,11 @@ proof of safe multicore admission. Before reenabling it, verify all schedulable
 CPUs and the actual MMIO and DMA aliases, and account for CPU hotplug, suspend
 and changes to cache settings. The optional clean-restart bridge remains a
 hosted experiment and does not enable that device path.
+
+An observation-only boot captured full PAT and MTRR snapshots on all four
+Dell CPUs before scheduler activation; the records matched. The observed PAT
+was `0x0007040100070406`. This did not access DMA pages or establish their
+mapping types. A four-CPU QEMU run also captured matching snapshots. The
+mailbox collector has hosted coverage for delayed, failed and late responses;
+the latter cannot publish into the caller's output after timeout. The Dell's
+recovery generation 74 is selected for the next boot. Audio remains gated.

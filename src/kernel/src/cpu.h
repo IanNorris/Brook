@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "mtrr_page_probe.h"
+#include "cpu_cache_snapshot.h"
 
 namespace brook {
 struct CpuMemoryTypeObservation {
@@ -12,6 +13,8 @@ struct CpuMemoryTypeObservation {
 // Read-only diagnostic for two audited pages on the current CPU. This does not
 // establish other CPUs' configuration, alias safety or device ownership.
 bool CpuObserveMemoryTypes(uint64_t page0,uint64_t page1,brook::CpuMemoryTypeObservation& out);
+// Capture on the calling CPU before it becomes schedulable. No GS state needed.
+bool CpuCaptureCacheSnapshot(brook::CpuCacheSnapshot& out);
 
 // CPU feature initialisation — call once very early in kernel boot, after GdtInit().
 //

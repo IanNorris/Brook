@@ -2,6 +2,7 @@
 #include "panic.h"
 #include "smp.h"
 #include "native_tsc_policy.h"
+#include "cache_snapshot_collect.h"
 #include "acpi.h"
 #include "apic.h"
 #include "cpu.h"
@@ -94,6 +95,9 @@ static void InstallPanicNmiHandler();
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
 static NativeTscMailbox g_nativeTscMailbox[MAX_CPUS]{};
 static uint32_t g_nativeTscArmed=0;static bool g_nativeTscAttempted=false;
+static CpuCacheSnapshot g_cacheSnapshots[MAX_CPUS]{};
+static uint32_t g_cacheSnapshotStatus[MAX_CPUS]{},g_cacheSnapshotArmed=0;
+static bool g_cacheSnapshotAttempted=false;
 struct NativeTscExchangeIo {
     bool capable(){return NativeTscCapabilities([](uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
         __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(0));});}
@@ -217,6 +221,11 @@ void ApEntryFunction()
     NativeTscExchangeIo tscIo;
     while (!__atomic_load_n(&g_apActivate[myCpuIndex], __ATOMIC_ACQUIRE)) {
         if(__atomic_load_n(&g_nativeTscArmed,__ATOMIC_ACQUIRE))NativeTscRespond(g_nativeTscMailbox[myCpuIndex],tscIo);
+        if(__atomic_load_n(&g_cacheSnapshotArmed,__ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&g_cacheSnapshotStatus[myCpuIndex],__ATOMIC_RELAXED)) {
+            const bool ok=CpuCaptureCacheSnapshot(g_cacheSnapshots[myCpuIndex]);
+            __atomic_store_n(&g_cacheSnapshotStatus[myCpuIndex],ok?1u:2u,__ATOMIC_RELEASE);
+        }
         __asm__ volatile("pause" ::: "memory");
     }
 
@@ -616,6 +625,23 @@ uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* out,uint32_t capacity)
         }
     }
     __atomic_store_n(&g_nativeTscArmed,0u,__ATOMIC_RELEASE);return count-1;
+}
+
+bool SmpObserveCacheSnapshots(CpuCacheSnapshot* out,uint32_t capacity)
+{
+    if(!out || SmpCurrentCpuIndex()!=0 || g_cacheSnapshotAttempted)return false;
+    const uint32_t count=SmpGetCpuCount();if(!count || count>MAX_CPUS || capacity<count)return false;
+    for(uint32_t cpu=1;cpu<count;++cpu)if(__atomic_load_n(&g_apActivate[cpu],__ATOMIC_ACQUIRE))return false;
+    g_cacheSnapshotAttempted=true;
+    struct Io {
+        bool captureBsp(){return CpuCaptureCacheSnapshot(g_cacheSnapshots[0]);}
+        void arm(){__atomic_store_n(&g_cacheSnapshotArmed,1u,__ATOMIC_RELEASE);}
+        void disarm(){__atomic_store_n(&g_cacheSnapshotArmed,0u,__ATOMIC_RELEASE);}
+        uint32_t status(uint32_t cpu){return __atomic_load_n(&g_cacheSnapshotStatus[cpu],__ATOMIC_ACQUIRE);}
+        void pause(){__asm__ volatile("pause");}
+        const CpuCacheSnapshot& snapshot(uint32_t cpu){return g_cacheSnapshots[cpu];}
+    } io;
+    return CacheSnapshotCollect(io,out,count,capacity,1000000);
 }
 
 const CpuInfo* SmpGetCpu(uint32_t index)

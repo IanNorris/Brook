@@ -135,6 +135,11 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("round_trip",c.interval.roundTrip);r.text("}");}
         r.text("],\"reason\":");r.quoted(o.reason);r.text("}\n");r.send();return true;
     }
+    if(!strcmp(command,"bridge hardware dell-hda-cache")) {
+        const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_cache_api\":1,\"requested\":");r.text(o.cacheRequested?"true":"false");
+        r.text(",\"captured\":");r.text(o.cacheCaptured?"true":"false");r.text(",\"match\":");r.text(o.cacheMatch?"true":"false");
+        r.text(",");r.field("cpus",o.cacheCpuCount);r.text(",");r.field("pat",o.cachePat);r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware dell-hda-runtime")) {
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_runtime_api\":1,\"requested\":");r.text(o.runtimeRequested?"true":"false");
         r.text(",\"prepared\":");r.text(o.runtimePrepared?"true":"false");r.text(",\"registered\":");r.text(o.runtimeRegistered?"true":"false");
