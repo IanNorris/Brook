@@ -5,7 +5,7 @@
 using namespace brook;
 struct Chip {
     uint8_t mem[4096]{};uint8_t pin[2]{0,0},dac[2]{127,127},mix[2]{0,0},selection=0,converter=0;
-    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;unsigned statusReads=0,failStatusAfter=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false;
+    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;unsigned statusReads=0,failStatusAfter=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false,reportEndpoint=false,sawEndpoint=false;
     static constexpr uint32_t base=0x100;
     uint8_t* amp(unsigned node,bool output){if(node==0x14 && output)return pin;if(node==3 && output)return dac;if(node==0x0d && !output)return mix;assert(false);return nullptr;}
     void execute(){
@@ -34,7 +34,7 @@ struct Chip {
     }
     uint8_t read8(uint32_t o){if(o==base+3 && failStatusAfter && ++statusReads>=failStatusAfter)return uint8_t(mem[o]|8);return mem[o];}
     uint16_t read16(uint32_t o){return uint16_t(mem[o])|(uint16_t(mem[o+1])<<8);}
-    uint32_t read32(uint32_t o){if(o==0x64)return response;if(o==base+4 && (read16(base)&2)){pos=(pos+192)%12288;return pos;}
+    uint32_t read32(uint32_t o){if(o==0x64)return response;if(o==base+4 && (read16(base)&2)){pos=(pos+192)%12288;if(!pos && reportEndpoint){sawEndpoint=true;return 12288;}return pos;}
         return uint32_t(read16(o))|(uint32_t(read16(o+2))<<16);}
     void write8(uint32_t o,uint8_t v){if(o==base+3)mem[o]&=~v;else mem[o]=uint8_t(v|((o==base+2 && roPriority)?4:0));}
     void write16(uint32_t o,uint16_t v){if(o==0x68){if(v==2)mem[o]&=~2;else if(v==1){execute();mem[o]=2;}return;}

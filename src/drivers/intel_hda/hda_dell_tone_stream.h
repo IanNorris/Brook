@@ -63,12 +63,14 @@ public:
     }
     bool progress() {
         progressReason_=1;progressStatus_=0;progressControl_=0;if(state_!=HdaToneStreamState::Running)return false;
-        const uint32_t first=io_.read32(base_+4);progressFirst_=progressLast_=first;
-        if(first>=12288){progressReason_=2;return false;}const auto start=io_.ticks();
+        const uint32_t rawFirst=io_.read32(base_+4);progressFirst_=progressLast_=rawFirst;
+        if(rawFirst>12288){progressReason_=2;return false;}
+        const uint32_t first=rawFirst==12288?0:rawFirst;const auto start=io_.ticks();
         for(unsigned i=0;i<2000000;++i) {
             progressStatus_=io_.read8(base_+3);if(progressStatus_&0x18){progressReason_=3;return false;}
             progressControl_=io_.read16(base_);if(!(progressControl_&2)){progressReason_=4;return false;}
-            const uint32_t current=io_.read32(base_+4);progressLast_=current;if(current>=12288){progressReason_=5;return false;}
+            const uint32_t rawCurrent=io_.read32(base_+4);progressLast_=rawCurrent;if(rawCurrent>12288){progressReason_=5;return false;}
+            const uint32_t current=rawCurrent==12288?0:rawCurrent;
             if(current!=first){progressReason_=6;return true;}
             const auto now=io_.ticks();if(now>=start && now-start>=150){progressReason_=7;return false;}io_.pause();
         }
