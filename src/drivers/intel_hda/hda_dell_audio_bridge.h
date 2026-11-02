@@ -3,11 +3,11 @@
 #include "../../kernel/src/audio.h"
 
 namespace brook {
-// Serialized mixer-facing adapter for an already prepared owner. This first
-// version deliberately keeps the speaker muted; faults are terminal and the
-// default specialization also treats STOP as final. The clean-restart variant
-// is for hosted tests until physical admission is implemented. Lock methods must be
-// process-context safe and must not disable interrupts over codec operations.
+// Serialized mixer-facing adapter for an already prepared owner. The default
+// specialization keeps the speaker muted and treats STOP as final; the Dell
+// runtime opts into clean restart and separately gated audible output. Faults
+// are terminal. Lock methods must be process-context safe and must not disable
+// interrupts over codec operations.
 // Admission, AudioRegister() and object lifetime remain the caller's job.
 struct HdaDellOutputRequest {bool authorized=false;uint32_t control=BROOK_AUDIO_MUTED;};
 template<class Owner,class Lock,bool AllowCleanRestart=false,bool AllowAudible=false> class HdaDellAudioBridge {

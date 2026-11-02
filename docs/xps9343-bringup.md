@@ -2937,3 +2937,15 @@ lost-frame message. The cumulative gap before that interval includes the idle
 time between tests and cannot be assigned to active playback. Both applications
 exited, hardware retirement succeeded, and recovery generation 110 was selected.
 The result is one muted run and does not establish continuous audible output.
+
+An attended-review payload was assembled with the tested Dell audio runtime,
+the queue probe, the larger tmpfs inode bound and the 16-slot network
+experiment. It has both `/etc/audio-muted` and the separately gated
+`/etc/dell-hda-audible` marker: it starts muted, and the hardware unmute path
+also requires an explicit output-control transition and accepted audio in the
+current DMA epoch. The installed `brook-settings` package contains the master
+volume and mute controls. The exact kernel/initrd pair booted in a four-CPU
+QEMU without an audio device, and a Dell update dry run reported slot 0 ready
+without storage modification or activation. The Dell remains on its recovery
+boot. This is preparation for an attended test, not proof of the hardware's
+audible behavior or an authorization to play sound unattended.
