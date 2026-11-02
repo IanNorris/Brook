@@ -118,6 +118,21 @@ First moving retained flight state into a worker while keeping synchronous
 returns would permit testing lifetime and loss handling before opting in to
 buffered returns. These changes are not implemented by the flight experiment.
 
+Astra's follow-up review identified a specific close constraint: a callback
+borrow cannot keep queued writes ahead of FIN, because `SockFinalize` reserves
+FIN before it drains callback borrows. A nonempty asynchronous queue would
+need an owner reference held until ACK retirement or terminal abort; dropping
+that reference must happen outside locks in process context. An idle queue
+must not keep the socket alive indefinitely. The transport worker also needs
+bounded per-connection pumping, separate wakeup state, queue-aware writable
+readiness and a latched asynchronous error. `shutdown(SHUT_WR)` requires its
+own FIN ordering audit. The first implementation checkpoint should extract a
+caller-driven bounded pump while retaining synchronous returns, followed by
+worker-driven synchronous testing; neither checkpoint alone improves the
+per-call drain. Tests must include queue-reference versus last-close races,
+slot reuse, stalled peers, worker shutdown, readiness and failure after bytes
+have been accepted from an application.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

@@ -2965,3 +2965,11 @@ aggregate sample counts. This guards against controls producing the right
 levels in the wrong phases. The HDA and absent-device cases passed; host-only
 tests also reject swapped phases and short transient levels. This emulated
 capture does not establish the Dell codec's audible gain or speaker quality.
+
+For a future attended application-audio test, the reviewed audio initrd was
+paired with the later kernel containing the tested TCP `writev` change. The
+exact pair booted in isolated QEMU with no host audio device, and the Dell
+maintenance dry run reported slot 0 ready for generation 117 without writing
+or activating it. The initrd retains both the boot-mute and separately gated
+audible markers; the Dell remains on recovery generation 116. This prepares
+the test but is not evidence of audible application playback.
