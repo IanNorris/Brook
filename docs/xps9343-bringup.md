@@ -2980,3 +2980,12 @@ audible marker. The exact pair booted in isolated QEMU without an audio device;
 a Dell maintenance dry run planned generation 125 in slot 0 with no storage
 modification. The Dell remained on the known-good recovery boot. This is
 preparation only: speaker output and application playback were not enabled.
+
+The attended-review image was refreshed again with the separate TCP worker
+waiter candidate. It retains `/etc/audio-muted` and the gated
+`/etc/dell-hda-audible` marker, and adds `/etc/tcp-worker-waiter`. The exact
+kernel/initrd pair booted in isolated QEMU without a host audio device; a Dell
+maintenance dry run planned generation 137 in slot 0 without modifying
+storage. Recovery generation 136 remained selected. This prepares a later
+attended application-audio and volume check; it is not an audible test, and
+the candidate was not activated on the Dell.
