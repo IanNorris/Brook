@@ -898,6 +898,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    const bool directDesktopRequested=brook::AhciSystemQemuLargeDesktopRequested();
+#endif
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
     if(systemVolume==brook::AhciSystemBoot::Ready) {
         brook::AhciSystemDataInspect();
@@ -908,7 +911,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
 #endif
     }
-    const auto writableDesktop=systemVolume==brook::AhciSystemBoot::Maintenance ? brook::WritableDesktopBoot::Maintenance :
+    const auto writableDesktop=
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+        directDesktopRequested?(brook::AhciSystemQemuLargeDesktopReady()?brook::WritableDesktopBoot::Ready:brook::WritableDesktopBoot::Maintenance):
+#endif
+        systemVolume==brook::AhciSystemBoot::Maintenance ? brook::WritableDesktopBoot::Maintenance :
         brook::WritableDesktopBootMount(&nextPdrv,systemVolume==brook::AhciSystemBoot::Ready ?
             brook::WritableDesktopSource::System : brook::WritableDesktopSource::Usb);
     if(writableDesktop==brook::WritableDesktopBoot::Absent || writableDesktop==brook::WritableDesktopBoot::Fallback)

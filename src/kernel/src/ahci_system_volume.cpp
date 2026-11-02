@@ -8,6 +8,7 @@
 #include "ext2_vfs.h"
 #include "large_data_session.h"
 #include "serial.h"
+#include "writable_desktop.h"
 #endif
 #include "memory/heap.h"
 #include "mount_namespace.h"
@@ -40,6 +41,7 @@ const BlockDeviceOps ops{Read,Write,Control,nullptr,Blocks,BlockSize};
 Device partition{reinterpret_cast<const DeviceOps*>(&ops),"ahci-system",DeviceType::Block,nullptr};
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 AhciDataInspection largeInspection{};bool largeInspectionClean=false;
+bool largeDesktopReady=false;
 uint8_t largeUuid[16]{};LargeDataSession largeSession{};
 Range largeRange{};
 int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
@@ -188,17 +190,28 @@ void AhciSystemDataInspect() {
     else KPrintf("ahci data inspect: identity or format rejected (read only)\n");
 }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+bool AhciSystemQemuLargeDesktopRequested() {
+    VnodeStat st{};
+    // An inaccessible or malformed marker still selects maintenance: do not
+    // silently fall back to a different store after failed admission.
+    return VfsLstatPath("/etc/ahci-qemu-large-desktop-test",&st)!=-2;
+}
 bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
     if(!AhciDisposableLargeDataWritable() || !largeInspectionClean || !nextDrive ||
        !Ext2DriveAvailable(*nextDrive) || DeviceFind(largePartition.name))return false;
     largeInspectionClean=false; // one-shot; a failed mount requires a fresh inspection
     Device* disk=AhciWriteAdmittedDevice();if(!disk)return false;
     VnodeStat st{};
-    if(VfsLstatPath("/mnt/ahcitest",&st) || !st.isDir || st.isSymlink)return false;
+    const int marker=VfsLstatPath("/etc/ahci-qemu-large-desktop-test",&st);
+    const bool desktop=marker!=-2;
+    if(desktop && (marker || st.isDir || st.isSymlink || !st.size || st.size>16))return false;
+    const char* target=desktop?"/nix":"/mnt/ahcitest";
+    if(desktop && !WritableDesktopTestPrepareDirect())return false;
+    if(VfsLstatPath(target,&st) || !st.isDir || st.isSymlink)return false;
     auto* ns=VfsMountNamespaceInitial();
     for(uint32_t i=0;i<VfsMountNamespaceCount(ns);++i) {
         const auto mount=VfsMountNamespaceSnapshotAt(ns,i);
-        if(mount.used && Prefix(mount.mountPoint,"/mnt/ahcitest"))return false;
+        if(mount.used && Prefix(mount.mountPoint,target))return false;
     }
     largeRange={disk,largeInspection.data.first*512,largeInspection.data.count*512};
     constexpr uint32_t GdtCapacity=4096*32;
@@ -209,9 +222,21 @@ bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
     if(!DeviceRegister(&largePartition))return false;
     if(!Ext2BindDevice(*nextDrive,&largePartition))return false;
     const uint8_t drive=(*nextDrive)++;
-    if(!VfsMountConfigured("/mnt/ahcitest","ext2",drive,0))return false;
-    return largeSession.Arm();
+    if(!VfsMountConfigured(target,"ext2",drive,desktop?6:0)) {
+        VfsDrainMountCleanup();
+        if(VfsSync(nullptr) || VfsMountCleanupPending())
+            KPrintf("ahci direct test: backing cleanup pending; maintenance only\n");
+        return false;
+    }
+    if(desktop && !WritableDesktopTestPublishDirect()) {
+        if(!VfsUnmount(target))KPrintf("ahci direct test: unmount failed; maintenance only\n");
+        return false;
+    }
+    if(!largeSession.Arm())__builtin_trap();
+    largeDesktopReady=desktop;
+    return true;
 }
+bool AhciSystemQemuLargeDesktopReady() {return largeDesktopReady;}
 int AhciSystemQemuLargeDataFinalSync() {
     const bool armed=largeSession.armed;
     const int result=largeSession.Finish(LargeIo(),DeviceFinalSyncOwner());

@@ -86,6 +86,15 @@ void DestroyPrivate() {
     if(image && !FatImageDeviceDestroyUnregistered(image)){image=nullptr;info.pinned=false;}
 }
 }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+bool WritableDesktopTestPrepareDirect() {return NamespaceClear() && !PrepareTarget();}
+bool WritableDesktopTestPublishDirect() {
+    if(!PayloadValid())return false;
+    VfsPath root{};int error=VfsPathRoot(&root);
+    if(!error)error=VfsMountNamespaceBindAt(VfsMountNamespaceInitial(),root,root,"/nix/home/brook","/data/home");
+    VfsPathRelease(root);return !error;
+}
+#endif
 WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive,WritableDesktopSource sourceVolume) {
     if(attempted)return info.ready?WritableDesktopBoot::Ready:WritableDesktopBoot::Maintenance;
     attempted=true;
