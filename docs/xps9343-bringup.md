@@ -1854,6 +1854,14 @@ failed STOP, partial pin restore, descriptor retirement and PCI restoration;
 uncertain teardown keeps the pages and attempts to remute. These tests use a
 fake platform: physical controller ownership and application audio remain
 unconnected and unverified.
+An opt-in BSP-only physical streaming probe now uses the observed native TSC
+locally, with the speaker pin muted and a 4 KiB guard. On the Dell it submitted
+200 changing PCM batches (352,800 bytes) over 2.000 s, observed 352,824 bytes
+of DMA progress, and restored PCI command to zero with no quarantined pages.
+The owner retired the BDL and the recovery boot was reselected. This verifies
+controller progress and cleanup for one short guarded run; it does not verify
+that the audio samples were heard or prove the scheduling/prefetch bounds for
+general workloads. It does not register an application audio driver.
 Brook's native audio clock currently uses KVM pvclock and returns unavailable
 on the Dell; delivered LAPIC interrupts are not a trustworthy elapsed-time
 bound. The HDA wall clock is useful for comparison but wraps in about 179 s,
