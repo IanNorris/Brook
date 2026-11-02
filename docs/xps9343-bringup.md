@@ -3014,3 +3014,12 @@ during the sampled interval, while the empty-after counter did not. These
 diagnostics do not establish the audible gap duration or identify whether the
 browser, mixer, publication timing, or codec caused the symptoms. The user's
 playback assessment is not a controlled local-source comparison.
+
+For attended comparisons, `scripts/workloads/dell_audio_observe.py` records
+bounded, read-only HDA runtime and queue, mixer and system snapshots as JSON
+lines. Each group has host monotonic start/end brackets; the commands within
+the group are sequential, not simultaneous. Use separate labels and output
+paths for a local source and browser playback, note the actual playback interval
+and configuration, and compare only matching stream identities and epochs.
+Counter deltas are not an acoustic recording and can include intentional idle.
+The observer does not launch a source or change volume, staging or device state.
