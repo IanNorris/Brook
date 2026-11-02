@@ -36,10 +36,12 @@ int main(){
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> first(retained,64,4096);assert(first.start());
     assert(first.submit(samples,sizeof(samples)).accepted==sizeof(samples));assert(first.shutdown() && retained.retireRetained());
     assert(reused.allocated==17 && reused.freed==0 && reused.pci==2 && !reused.held);
-    assert(retained.prepareRetained() && reused.allocated==17 && reused.freed==0);
-    assert(reused.pos==0);HdaDellStreamQueue<HdaDellStreamOwner<Platform>> second(retained,64,4096);assert(second.start());
+    const auto previousEpoch=first.progress().epoch;assert(retained.prepareRetained() && reused.allocated==17 && reused.freed==0);
+    assert(first.restartAfterCleanStop(previousEpoch) && first.progress().epoch==previousEpoch+1);
+    assert(reused.pos==0 && first.start());
     for(unsigned i=1;i<17;++i)for(unsigned j=0;j<4096;++j)assert(reused.device[i][j]==0);
-    assert(second.submit(samples,sizeof(samples)).accepted==sizeof(samples));assert(second.shutdown() && retained.retire());
+    auto again=first.submit(samples,sizeof(samples));assert(again.accepted==sizeof(samples) && again.epoch==previousEpoch+1);
+    assert(first.shutdown() && retained.retire());
     assert(reused.allocated==17 && reused.freed==17 && reused.pci==0 && !reused.held);
     Platform changed;changed.format=0x31;HdaDellStreamOwner<Platform> pinned(changed,snapshot,64);assert(pinned.prepare());
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> prior(pinned,64,4096);assert(prior.start() && prior.shutdown() && pinned.retireRetained());

@@ -2762,3 +2762,13 @@ its pages, reprepare a zeroed ring, and finally release retained pages. They
 are not yet wired into the runtime bridge: its identity/cache validation is
 currently restricted to the boot CPU, and safe mixer epoch transitions still
 need implementation and testing.
+
+Further review identified that the experimental runtime's original admission
+did not establish PAT, MTRR and DMA-alias compatibility on every CPU that can
+run mixer callbacks. Its real-hardware registration is now fail-closed, even
+when requested; the Dell was returned to the checked recovery generation.
+The previous muted playback observations remain useful evidence but are not a
+proof of safe multicore admission. Before reenabling it, verify all schedulable
+CPUs and the actual MMIO and DMA aliases, and account for CPU hotplug, suspend
+and changes to cache settings. The optional clean-restart bridge remains a
+hosted experiment and does not enable that device path.

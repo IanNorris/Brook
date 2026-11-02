@@ -34,6 +34,7 @@ namespace brook {
 uint8_t HdaObserveTestRead8(uint32_t);uint16_t HdaObserveTestRead16(uint32_t);uint32_t HdaObserveTestRead32(uint32_t);
 void HdaObserveTestWrite8(uint32_t,uint8_t);void HdaObserveTestWrite16(uint32_t,uint16_t);void HdaObserveTestWrite32(uint32_t,uint32_t);
 bool HdaObserveTestFlushInfo(uint32_t&);void HdaObserveTestFlushLine(void*);
+bool HdaObserveTestAllCpuCacheAdmitted();
 uint64_t HdaObserveTestNowNs();
 void HdaObserveTestBeforeStreamIteration();
 #endif
@@ -293,6 +294,16 @@ AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?
 bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
 bool RuntimeRestart(uint64_t epoch){return runtimeBridge && runtimeBridge->restart(epoch);}
 void PrepareRuntime(Io& io){
+    // The boot probe validates the BSP, but mixer callbacks can run on any
+    // schedulable CPU. Full cross-core PAT/MTRR and DMA-alias admission is not
+    // yet available. Do not publish the driver or touch hardware on a real
+    // system until that admission is in place. Hosted tests exercise the
+    // subsequent lifecycle with their own simulated cache model.
+    bool cacheAdmitted=false;
+#ifdef BROOK_HOST_TEST
+    cacheAdmitted=HdaObserveTestAllCpuCacheAdmitted();
+#endif
+    if(!cacheAdmitted){observation.runtimeReason="all-CPU cache admission unavailable";return;}
     const auto& clock=NativeTscObserveRead();if(!clock.consistent || !Marker("/etc/audio-muted")){observation.runtimeReason="native clock or boot mute unavailable";return;}
     alignas(TonePlatform) static unsigned char platformStorage[sizeof(TonePlatform)];
     auto* platform=::new(platformStorage) TonePlatform{io,observation.session};platform->expectedPages=17;platform->runtimeMode=true;

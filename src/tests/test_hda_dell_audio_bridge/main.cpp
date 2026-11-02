@@ -7,7 +7,7 @@ using namespace brook;
 struct Lock {std::atomic<bool> held{false};void lock(){while(held.exchange(true)){};}bool tryLock(){return !held.exchange(true);}void unlock(){held.store(false);}};
 struct Owner {
     uint8_t cpu[65536]{},device[65536]{};uint64_t ns=1000000000;uint32_t pos=0;
-    unsigned starts=0,stops=0,mutes=0,retires=0,quarantines=0;bool running=false,failPosition=false,moveOnPublish=false;
+    unsigned starts=0,stops=0,mutes=0,retires=0,quarantines=0,retained=0,reprepares=0;bool running=false,failPosition=false,moveOnPublish=false,failReprepare=false;
     uint64_t nowNs(){ns+=1000000;return ns;}
     bool position(uint32_t& p,bool& error,bool& run){if(failPosition)return false;pos=(pos+192)%65536;p=pos;error=false;run=running;return true;}
     bool write(uint32_t o,const uint8_t* data,uint32_t n){assert(o<=65536 && n<=65536-o);if(data)std::memcpy(cpu+o,data,n);else std::memset(cpu+o,0,n);return true;}
@@ -16,6 +16,8 @@ struct Owner {
     bool fence(){return true;}bool start(){++starts;running=true;return true;}
     bool mute(){++mutes;return true;}bool stop(){++stops;running=false;return true;}
     bool retire(){++retires;return true;}void quarantine(){++quarantines;}
+    bool retireRetained(){++retained;return true;}
+    bool prepareRetained(){++reprepares;if(failReprepare)return false;pos=0;return true;}
 };
 int main(){
     Owner owner;Lock lock;HdaDellAudioBridge<Owner,Lock> b(owner,lock,64,4096);AudioDeviceProgress p{};
@@ -42,4 +44,20 @@ int main(){
     assert(legacy.play(samples,sizeof(samples),44100,2,16)<0);
     Owner invalidOwner;Lock invalidLock;HdaDellAudioBridge<Owner,Lock> invalidGeometry(invalidOwner,invalidLock,0,4096);
     assert(!invalidGeometry.progress(&p) && !invalidOwner.starts);
+    Owner reusable;Lock reuseLock;HdaDellAudioBridge<Owner,Lock,true> reuse(reusable,reuseLock,64,4096);
+    r=reuse.submit(samples,sizeof(samples));assert(r.accepted==sizeof(samples));const auto oldEpoch=r.epoch;
+    assert(reuse.stop() && reusable.retained==1 && !reusable.retires);
+    assert(reuse.progress(&p) && p.epoch==oldEpoch && p.discontinuity);
+    assert(!reuse.restart(oldEpoch+1) && !reusable.reprepares);
+    assert(reuse.restart(oldEpoch) && reusable.reprepares==1);
+    assert(reuse.progress(&p) && p.epoch==oldEpoch+1 && !p.discontinuity && !p.running);
+    r=reuse.submit(samples,sizeof(samples));assert(r.epoch==oldEpoch+1 && r.accepted==sizeof(samples));
+    assert(reuse.stop() && reuse.restart(oldEpoch+1));
+    Owner stoppedBefore;Lock stoppedBeforeLock;HdaDellAudioBridge<Owner,Lock,true> early(stoppedBefore,stoppedBeforeLock,64,4096);
+    assert(early.stop() && !stoppedBefore.starts && early.restart(1));
+    assert(early.submit(samples,sizeof(samples)).epoch==2);
+    Owner retryFailure;Lock retryLock;HdaDellAudioBridge<Owner,Lock,true> retry(retryFailure,retryLock,64,4096);
+    assert(retry.submit(samples,sizeof(samples)).accepted && retry.stop());retryFailure.failReprepare=true;
+    assert(!retry.restart(1) && retryFailure.quarantines==1 && retry.progress(&p) && p.epoch==1 && p.discontinuity);
+    retryFailure.failReprepare=false;assert(!retry.restart(1) && retryFailure.reprepares==1);
 }

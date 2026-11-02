@@ -4,13 +4,14 @@
 
 namespace brook {
 // Serialized mixer-facing adapter for an already prepared owner. This first
-// version deliberately keeps the speaker muted and treats STOP/fault as final;
-// real-hardware registration is explicitly opt-in. Lock::lock/tryLock/unlock must be
+// version deliberately keeps the speaker muted; faults are terminal and the
+// default specialization also treats STOP as final. The clean-restart variant
+// is for hosted tests until physical admission is implemented. Lock methods must be
 // process-context safe and must not disable interrupts over codec operations.
 // Admission, AudioRegister() and object lifetime remain the caller's job.
-template<class Owner,class Lock> class HdaDellAudioBridge {
+template<class Owner,class Lock,bool AllowCleanRestart=false> class HdaDellAudioBridge {
     Owner& owner_;Lock& lock_;HdaDellStreamQueue<Owner> queue_;uint32_t capacity_;
-    bool started_=false,closed_=false;
+    bool started_=false,closed_=false,retiredClean_=false;
     struct Guard {Lock& lock;~Guard(){lock.unlock();}};
 public:
     HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0):
@@ -40,14 +41,28 @@ public:
     bool isPlaying(){lock_.lock();Guard guard{lock_};return started_ && !closed_ && !queue_.failed() && queue_.progress().Pending()!=0;}
     uint32_t pending(){lock_.lock();Guard guard{lock_};return closed_?0:queue_.progress().Pending();}
     // A clean close still requires descriptor retirement; uncertain failures
-    // are quarantined and cannot be restarted by this one-shot adapter.
+    // are quarantined and cannot be restarted by either specialization.
     bool stop(){
         lock_.lock();Guard guard{lock_};if(closed_)return false;closed_=true;
         if(queue_.failed())return false;
         if(started_){if(!queue_.shutdown())return false;}
         else {const bool muted=owner_.mute(),stopped=owner_.stop();if(!muted || !stopped){owner_.quarantine();return false;}}
-        return owner_.retire();
+        if constexpr(AllowCleanRestart){
+            if(!owner_.retireRetained()){owner_.quarantine();return false;}
+            if(!started_ && !queue_.closeBeforeStart()){owner_.quarantine();return false;}
+            retiredClean_=true;return true;
+        } else return owner_.retire();
     }
-    bool restart(uint64_t){return false;} // terminal until a fresh owner is implemented
+    bool restart(uint64_t expectedEpoch){
+        if constexpr(!AllowCleanRestart){(void)expectedEpoch;return false;}
+        else {
+            lock_.lock();Guard guard{lock_};
+            if(!closed_ || !retiredClean_ || queue_.failed() || expectedEpoch!=queue_.progress().epoch || expectedEpoch==~uint64_t(0))return false;
+            retiredClean_=false; // an attempted reprepare can change hardware; never retry on failure
+            if(!owner_.prepareRetained()){owner_.quarantine();return false;}
+            if(!queue_.restartAfterCleanStop(expectedEpoch)){owner_.quarantine();return false;}
+            started_=closed_=false;return true;
+        }
+    }
 };
 }

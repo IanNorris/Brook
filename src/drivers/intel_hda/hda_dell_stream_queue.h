@@ -93,6 +93,21 @@ public:
         else clock_.running=false;
         return true;
     }
+    // The owner still has to stop and retire its prepared descriptor, even
+    // when no submit ever started this queue. Acknowledge that separately.
+    bool closeBeforeStart(){
+        if(initialized_ || failed_ || closed_)return false;
+        clock_.Fault();closed_=true;return true;
+    }
+    // Call only after a verified clean stop, descriptor retirement and a
+    // successful owner reprepare. Preserve the terminal epoch until this
+    // explicit acknowledgement; uncertain failures may never use this path.
+    bool restartAfterCleanStop(uint64_t expectedEpoch){
+        if(!closed_ || initialized_ || failed_ || expectedEpoch!=clock_.epoch ||
+           expectedEpoch==~uint64_t(0))return false;
+        clock_.Fault();if(!clock_.Restart(expectedEpoch))return false;
+        cleared_=lastMovementNs_=0;closed_=false;return true;
+    }
     HdaDellReceipt submit(const void* samples,uint32_t bytes){
         HdaDellReceipt r{clock_.epoch,clock_.submitted,0,0};
         if(!samples || !bytes || (bytes&3)){r.error=-22;return r;}

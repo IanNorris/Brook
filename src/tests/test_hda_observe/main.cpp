@@ -86,6 +86,7 @@ void HdaObserveTestWrite8(uint32_t o,uint8_t v){if(scenario>=20){assert(cmd&2);c
 void HdaObserveTestWrite16(uint32_t o,uint16_t v){if(scenario>=20){assert(cmd&2);chip.write16(o,v);}else *reinterpret_cast<volatile uint16_t*>(static_cast<uint8_t*>(page)+o)=v;}
 void HdaObserveTestWrite32(uint32_t o,uint32_t v){if(scenario>=20){assert(cmd&2);chip.write32(o,v);}else *reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(page)+o)=v;}
 bool HdaObserveTestFlushInfo(uint32_t& line){line=scenario==33?0:64;return scenario!=31;}
+bool HdaObserveTestAllCpuCacheAdmitted(){return scenario!=47;}
 void HdaObserveTestFlushLine(void* p){const auto address=reinterpret_cast<uintptr_t>(p);bool found=false;
  for(unsigned i=0;i<17;++i){const auto base=reinterpret_cast<uintptr_t>(tonePages[i]);if(base && address>=base && address<base+4096){
   assert(!((address-base)&63));toneFlushMask[i]|=uint64_t(1)<<((address-base)/64);found=true;break;}}
@@ -160,6 +161,8 @@ static void one(int which){
  if(which==45){assert(o.runtimePrepared);HdaRuntimeRegister();assert(!o.runtimePrepared && !o.runtimeRegistered && toneFrees==17 && cmd==0);
   HdaRuntimeRegister();assert(registerCalls==1 && !registered);}
  if(which==46){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0);HdaRuntimeRegister();assert(!registerCalls);}
+ if(which==47){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0 && !std::strcmp(o.runtimeReason,"all-CPU cache admission unavailable"));
+  HdaRuntimeRegister();assert(!registerCalls && !chip.published);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=46;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=47;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

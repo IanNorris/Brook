@@ -57,11 +57,23 @@ int main(){
     assert(!partial.error && partial.accepted>0 && partial.accepted<big.size());
     auto full=bq.submit(samples,sizeof(samples));assert(!full.error && !full.accepted && !bq.failed());
     Fake badGuard;HdaDellStreamQueue<Fake> g(badGuard,64,4096,4096);assert(!g.start() && !badGuard.started);
+    Fake unused;HdaDellStreamQueue<Fake> neverStarted(unused,64,4096);assert(neverStarted.closeBeforeStart());
+    assert(!neverStarted.closeBeforeStart() && neverStarted.progress().discontinuity && !unused.started);
+    assert(neverStarted.restartAfterCleanStop(1) && neverStarted.progress().epoch==2 && neverStarted.start());
+    assert(!neverStarted.closeBeforeStart() && neverStarted.shutdown());
     Fake closing;HdaDellStreamQueue<Fake> shut(closing,64,4096);assert(shut.start());closing.stopFails=true;
     assert(!shut.shutdown() && shut.failed() && closing.mutes==1 && closing.stops==1 && closing.quarantines==1);
     Fake pending;HdaDellStreamQueue<Fake> pq(pending,64,4096);assert(pq.start());
     auto outstanding=pq.submit(samples,sizeof(samples));assert(outstanding.accepted==sizeof(samples) && !outstanding.error);
     assert(pq.shutdown() && pq.progress().discontinuity && !pending.quarantines);
+    const auto oldEpoch=pq.progress().epoch;const auto oldSubmitted=pq.progress().submitted;
+    assert(!pq.restartAfterCleanStop(oldEpoch+1) && pq.progress().epoch==oldEpoch && pq.progress().submitted==oldSubmitted);
+    assert(pq.restartAfterCleanStop(oldEpoch) && pq.progress().epoch==oldEpoch+1 && !pq.progress().discontinuity);
+    assert(!pq.restartAfterCleanStop(oldEpoch) && pq.progress().completed==0 && pq.progress().submitted==0);
+    pending.absolute=0;assert(pq.start());for(auto byte:pending.device)assert(byte==0);
+    auto fresh=pq.submit(samples,sizeof(samples));assert(fresh.accepted==sizeof(samples) && fresh.epoch==oldEpoch+1);
+    assert(pq.shutdown());
+    assert(!b.restartAfterCleanStop(b.progress().epoch) && broken.quarantines==1);
     Fake randomized;HdaDellStreamQueue<Fake> rq(randomized,64,4096);assert(rq.start());
     std::vector<uint8_t> timeline(1800000,0);uint32_t rng=0x38a7;
     for(unsigned step=0;step<1000;++step){
