@@ -120,7 +120,7 @@ static void one(int which){
  if(which==33){assert(o.toneAttempted && !o.toneFinished && !toneAllocations && !toneFlushes && cmd==0 && std::strcmp(o.toneReason,"cache flush unavailable")==0);}
  if(which==34){assert(o.toneAttempted && !o.toneAudible && o.toneQuarantined && o.toneResult==8 &&
   o.tonePlayReason==3 && o.tonePlayLoops==1 && o.tonePlayProgress==0 && o.toneProgressReason==3 && o.toneProgressStatus==8 && cmd==2);}
- if(which==35){assert(o.toneFinished && !o.toneAudible && !o.toneQuarantined && chip.sawEndpoint && o.tonePlayElapsed>=400 && cmd==0);}
+ if(which==35){assert(o.toneFinished && !o.toneAudible && !o.toneQuarantined && chip.sawEndpoint && o.tonePlayElapsed>=2000 && cmd==0);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
 int main(){for(int i=0;i<=35;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

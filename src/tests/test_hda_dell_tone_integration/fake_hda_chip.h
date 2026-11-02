@@ -21,7 +21,7 @@ struct Chip {
         }
         if(shortVerb==3){const bool output=payload&0x8000,left=payload&0x2000,right=payload&0x1000;assert(left!=right);
             if(n!=0x14)assert(pin[0]==0x80 && pin[1]==0x80);
-            if(n==0x14 && uint8_t(payload)==0 && (read16(base)&2)){assert(dac[0]<=31 && dac[1]<=31);sawQuietUnmute=true;}
+            if(n==0x14 && uint8_t(payload)==0 && (read16(base)&2)){assert(dac[0]<=80 && dac[1]<=80);sawQuietUnmute=true;}
             amp(n,output)[left?0:1]=uint8_t(payload);response=0;}
         else if(shortVerb==0xb){const bool output=payload&0x8000,left=payload&0x2000;response=amp(n,output)[left?0:1];}
         else if(shortVerb==2){assert(n==3);format=uint16_t(payload);response=0;}

@@ -91,10 +91,10 @@ public:
     bool unmuteAndVerify(const HdaDellTonePlan& plan){return active_ && !quarantined_ && matches(plan) && p_.command()==6 && codec_.unmuteAndVerify(plan);}
     bool playBounded() {
         const uint64_t start=p_.ticks();playReason_=1;
-        for(unsigned i=0;i<100000;++i) {
+        for(unsigned i=0;i<300000;++i) {
             playLoops_=i+1;if(!active_ || quarantined_ || p_.command()!=6){playReason_=2;return false;}
             if(!stream_.progress()){const auto now=p_.ticks();if(now>=start)playElapsed_=now-start;playReason_=3;return false;}++playProgress_;
-            const uint64_t now=p_.ticks();if(now>=start){playElapsed_=now-start;if(playElapsed_>=400){playReason_=4;return true;}}
+            const uint64_t now=p_.ticks();if(now>=start){playElapsed_=now-start;if(playElapsed_>=2000){playReason_=4;return true;}}
         }
         playReason_=5;return false; // stalled clock or progress cannot authorize more sound
     }

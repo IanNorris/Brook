@@ -12,7 +12,7 @@ inline bool HdaDellBuildToneBuffer(HdaToneBdlEntry* bdl,uint64_t bdlPhys,
                                   int16_t* const* pages,const uint64_t* physical,
                                   bool address64,uint16_t peak) {
     if(!bdl || !pages || !physical || !bdlPhys || (bdlPhys&4095) ||
-       bdlPhys>~uint64_t(0)-4095 || peak>2048)return false;
+       bdlPhys>~uint64_t(0)-4095 || peak>9830)return false;
     // Inputs can themselves reside in output pages: snapshot before writes.
     int16_t* data[HdaTonePages];uint64_t addresses[HdaTonePages];
     for(unsigned i=0;i<HdaTonePages;++i){data[i]=pages[i];addresses[i]=physical[i];}

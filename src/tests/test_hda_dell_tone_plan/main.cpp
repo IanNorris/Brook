@@ -12,7 +12,7 @@ static HdaSessionReport observed() {
 }
 int main(){
     HdaDellTonePlan p{};auto s=observed();assert(HdaDellMakeTonePlan(s,p));
-    assert(p.pin==0x14 && p.mixer==0x0d && p.dac==3 && p.pinSelection==1 && p.dacGain==31 && p.peakSample==2048);
+    assert(p.pin==0x14 && p.mixer==0x0d && p.dac==3 && p.pinSelection==1 && p.dacGain==80 && p.peakSample==9830);
     s=observed();s.stateValues[0]|=0x100;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.stateValues[5]|=0x10;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.stateValues[7]&=~(1u<<6);assert(!HdaDellMakeTonePlan(s,p));

@@ -35,8 +35,8 @@ inline bool HdaDellMakeTonePlan(const HdaSessionReport& s,HdaDellTonePlan& out) 
     const unsigned steps=(p[9]>>8)&0x7f;
     if(!steps)return false;
     out.pin=0x14;out.mixer=0x0d;out.dac=0x03;out.pinSelection=1;
-    out.dacGain=static_cast<uint8_t>(steps/4); // gain 31 is -48 dB for the required capabilities
-    out.peakSample=2048; // 6.25% of signed 16-bit full scale
+    out.dacGain=80; // -23.5 dB on the required codec; matches the Linux reference
+    out.peakSample=9830; // at most 30% of signed 16-bit full scale
     return true;
 }
 }

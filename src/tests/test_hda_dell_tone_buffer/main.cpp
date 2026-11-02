@@ -17,7 +17,9 @@ int main(){
     const auto originalSample=data[0][24];
     phys[2]=phys[1];assert(!HdaDellBuildToneBuffer(bdl,0x1000,pages,phys,false,2048));
     assert(descriptorPage[0]==0x5a && data[0][24]==originalSample);phys[2]=0x4000;
-    assert(!HdaDellBuildToneBuffer(bdl,0x1000,pages,phys,false,2049));
+    assert(!HdaDellBuildToneBuffer(bdl,0x1000,pages,phys,false,9831));
+    assert(HdaDellBuildToneBuffer(bdl,0x1000,pages,phys,false,9830));
+    for(unsigned i=0;i<3;++i)for(unsigned f=0;f<2048;++f)assert(data[i][f]>=-9830 && data[i][f]<=9830);
     phys[0]=0x2001;assert(!HdaDellBuildToneBuffer(bdl,0x1000,pages,phys,false,2048));phys[0]=0x2000;
     assert(!HdaDellBuildToneBuffer(bdl,0x2000,pages,phys,false,2048));
     phys[0]=0x100000000ULL;assert(!HdaDellBuildToneBuffer(bdl,0x1000,pages,phys,false,2048));
