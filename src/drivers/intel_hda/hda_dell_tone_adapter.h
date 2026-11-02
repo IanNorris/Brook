@@ -17,6 +17,7 @@ template<class Platform> class HdaDellToneAdapter {
     Platform& p_;const HdaSessionReport& saved_;HdaDellToneIci<Platform> ici_;
     HdaDellToneCodec<HdaDellToneIci<Platform>> codec_;HdaDellToneStream<Platform> stream_;
     uint64_t phys_[4]{};void* virt_[4]{};unsigned count_=0;bool quarantined_=false,begun_=false,active_=false,executed_=false;
+    uint8_t prepareStage_=0;uint32_t prepareValue_=0;
     void freePages() {while(count_){--count_;bool duplicate=false;for(unsigned i=0;i<count_;++i)if(phys_[i]==phys_[count_])duplicate=true;
         if(!duplicate)p_.freePage(phys_[count_]);phys_[count_]=0;virt_[count_]=nullptr;}}
     bool decoded(){if(!active_ || quarantined_)return false;const auto command=p_.command();return command==2 || command==6;}
@@ -29,6 +30,9 @@ public:
     HdaDellToneAdapter(HdaDellToneAdapter&&)=delete;
     HdaDellToneAdapter& operator=(HdaDellToneAdapter&&)=delete;
     bool quarantined()const{return quarantined_;}
+    uint8_t prepareStage()const{return prepareStage_;}uint32_t prepareValue()const{return prepareValue_;}
+    uint8_t streamStage()const{return stream_.stage();}uint32_t streamDetail()const{return stream_.detail();}
+    bool iciFailed()const{return ici_.failed();}
     HdaToneResult run(bool audible) {
         if(!active_ || quarantined_ || executed_)return HdaToneResult::InvalidSnapshot;
         executed_=true;return HdaDellToneTransaction(*this,saved_,audible);
@@ -64,10 +68,14 @@ public:
     bool muteAndVerify(const HdaDellTonePlan& plan){return decoded() && matches(plan) && codec_.muteAndVerify(plan);}
     bool configureMuted(const HdaDellTonePlan& plan){return active_ && !quarantined_ && matches(plan) && p_.command()==2 && codec_.configureMuted(plan);}
     bool prepareDma(const HdaDellTonePlan& plan) {
-        uint32_t v=0;
-        return active_ && !quarantined_ && matches(plan) && p_.command()==2 && ici_.setFormat(0x11) && ici_.getFormat(v) && v==0x11 &&
-               ici_.set8(3,0x706,0x10) && ici_.get8(3,0xf06,v) && v==0x10 &&
-               stream_.prepare(saved_.controller.gcap,phys_[0]);
+        uint32_t v=0;prepareStage_=1;
+        if(!active_ || quarantined_ || !matches(plan) || p_.command()!=2)return false;
+        prepareStage_=2;if(!ici_.setFormat(0x11))return false;
+        prepareStage_=3;if(!ici_.getFormat(v))return false;prepareValue_=v;if(v!=0x11)return false;
+        prepareStage_=4;if(!ici_.set8(3,0x706,0x10))return false;
+        prepareStage_=5;if(!ici_.get8(3,0xf06,v))return false;prepareValue_=v;if(v!=0x10)return false;
+        prepareStage_=6;if(!stream_.prepare(saved_.controller.gcap,phys_[0]))return false;
+        prepareStage_=7;return true;
     }
     bool startDma() {
         if(!active_ || quarantined_ || p_.command()!=2)return false;

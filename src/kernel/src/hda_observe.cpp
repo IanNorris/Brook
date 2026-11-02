@@ -253,8 +253,11 @@ void HdaObserveConfigure(const BootProtocol* boot) {
     if(!adapter->allocate()){observation.toneReason="allocation or admission failed";return;}
     if(!adapter->begin()){observation.toneReason="controller admission failed";return;}
     const auto result=adapter->run(audible);observation.toneResult=uint8_t(result);
+    observation.tonePrepareStage=adapter->prepareStage();observation.tonePrepareValue=adapter->prepareValue();
+    observation.toneStreamStage=adapter->streamStage();observation.toneStreamDetail=adapter->streamDetail();observation.toneCommand=platform->command();observation.toneIciFailed=adapter->iciFailed();
     if(result!=HdaToneResult::Complete){observation.toneReason="transaction failed";return;}
     observation.toneFinished=adapter->finish();
+    observation.toneCommand=platform->command();
     observation.toneReason=observation.toneFinished?"complete":"decode restore failed";
     SerialPrintf("HDA_TONE mode=%s result=%u finished=%u quarantine=%u reason=%s\n",
         audible?"quiet":"muted",unsigned(observation.toneResult),unsigned(observation.toneFinished),

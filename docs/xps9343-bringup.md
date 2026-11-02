@@ -1791,6 +1791,11 @@ leaves. The check now uses the huge-aware read-only alias walker instead; a
 2 MiB page-table regression and the production-adapter mock exercise that
 case. This fixes a verified code defect, but the physical refusal's exact
 guard was not recorded, so a further Dell test is needed to confirm the cause.
+The subsequent physical run passed the revised page admission, muted and
+configured the codec, then failed while preparing the stream. It quarantined
+its four pages and controller; bus mastering/RUN were not started. The next
+diagnostic records which format, converter or stream-preparation check failed
+without relaxing the checks or enabling audible mode.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

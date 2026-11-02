@@ -23,7 +23,7 @@ bool CpuObserveMemoryTypes(uint64_t,uint64_t,CpuMemoryTypeObservation& out){out=
 namespace brook {
 extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-observe")==0)return scenario==19?nullptr:&marker;
- if(std::strcmp(path,"/etc/dell-hda-muted-dma")==0 && (scenario==16 || scenario==17 || (scenario>=20 && scenario<=25) || scenario==27))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-muted-dma")==0 && (scenario==16 || scenario==17 || (scenario>=20 && scenario<=25) || (scenario>=27 && scenario<=29)))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26))return &marker;
  return nullptr;}
 extern "C" void VfsClose(Vnode*){}
@@ -77,7 +77,8 @@ static void one(int which){
  scenario=which;page=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(page!=MAP_FAILED);
  auto* p=static_cast<unsigned char*>(page);p[1]=0x21;p[3]=1; // valid GCAP and version, GCTL remains reset
  if(which>=20){chip.snapshotMode=true;chip.mem[0]=1;chip.mem[1]=0x44;chip.mem[3]=1;chip.mem[8]=1;chip.mem[0x0e]=1;
-  if(which==21)chip.mem[0x70]=1;if(which==23)chip.dropBdlClear=true;if(which==24)chip.dropStop=true;}
+  if(which==21)chip.mem[0x70]=1;if(which==23)chip.dropBdlClear=true;if(which==24)chip.dropStop=true;
+  if(which==28)chip.mem[Chip::base+2]=0x10;if(which==29)chip.corruptNewFormat=true;}
  BootProtocol boot{};MemoryDescriptor descriptor{};
  if(which==8){descriptor.physicalStart=bar;descriptor.pageCount=1;descriptor.type=MemoryType::Free;boot.memoryMap=&descriptor;boot.memoryMapCount=1;}
  HdaObserveConfigure(&boot);const auto& o=HdaObserveRead();
@@ -102,6 +103,10 @@ static void one(int which){
   toneAllocations==4 && toneFrees==4 && cmd==0 && chip.sawQuietUnmute);}
  if(which==27){assert(o.toneRequested && o.toneAttempted && !o.toneFinished && !o.toneQuarantined &&
   o.toneAdmission==30 && !toneAllocations && !toneFrees && cmd==0 && !chip.published);}
+ if(which==28){assert(o.toneAttempted && o.toneQuarantined && o.toneResult==4 && o.tonePrepareStage==6 &&
+  o.toneStreamStage==2 && o.toneStreamDetail==0x100000 && !o.toneIciFailed && o.toneCommand==2 && !chip.published);}
+ if(which==29){assert(o.toneAttempted && o.toneQuarantined && o.toneResult==4 && o.tonePrepareStage==3 &&
+  o.tonePrepareValue==0x10 && !o.toneIciFailed && o.toneCommand==2 && !chip.published);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=27;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=29;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

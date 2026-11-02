@@ -5,7 +5,7 @@
 using namespace brook;
 struct Chip {
     uint8_t mem[4096]{};uint8_t pin[2]{0,0},dac[2]{127,127},mix[2]{0,0},selection=0,converter=0;
-    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false;
+    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false;
     static constexpr uint32_t base=0x100;
     uint8_t* amp(unsigned node,bool output){if(node==0x14 && output)return pin;if(node==3 && output)return dac;if(node==0x0d && !output)return mix;assert(false);return nullptr;}
     void execute(){
@@ -25,7 +25,7 @@ struct Chip {
             amp(n,output)[left?0:1]=uint8_t(payload);response=0;}
         else if(shortVerb==0xb){const bool output=payload&0x8000,left=payload&0x2000;response=amp(n,output)[left?0:1];}
         else if(shortVerb==2){assert(n==3);format=uint16_t(payload);response=0;}
-        else if(shortVerb==0xa){assert(n==3);response=format;}
+        else if(shortVerb==0xa){assert(n==3);response=corruptNewFormat && format==0x11?0x10:format;}
         else if(verb==0x701){assert(n==0x14 && pin[0]==0x80 && pin[1]==0x80);selection=uint8_t(payload);response=0;}
         else if(verb==0xf01){assert(n==0x14);response=selection;}
         else if(verb==0x706){assert(n==3);converter=uint8_t(payload);response=0;}
