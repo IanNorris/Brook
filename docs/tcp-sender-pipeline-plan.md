@@ -1,5 +1,39 @@
 # Bounded TCP sender work
 
+## Next: socket-owned send queue
+
+The flight state remains local to `SockSendImpl`, so every call drains its
+unacknowledged data before returning. To let applications hand data off sooner,
+the next experiment needs a bounded queue owned by the socket, with a separate
+TX worker and the synchronous sender retained as the default. Queue capacity
+and congestion-controlled flight capacity are separate: enqueued data does not
+reserve TCP sequence space until the worker is ready to submit it. Producers
+must copy user data into owned storage before publishing it and return only
+the accepted prefix on a later copy fault, signal, or full queue. Nonblocking
+writers need `EAGAIN` when no space remains, and write readiness must reflect
+queue space and terminal errors rather than merely `Established` state.
+
+The worker must make bounded progress per socket, retain bytes through ACK or
+terminal failure, and use an independent wakeup with a timed fallback; the
+existing socket waiter is shared with readers and pollers. The NIC callback can
+currently block, so an explicitly nonblocking transmit contract is needed
+before claiming that one stalled connection cannot hold up a shared worker.
+An owner reference must keep the socket alive while accepted data remains.
+However, dropping the final owner invokes `SockFinalize`, whose FIN wait can
+block for up to 500 ms. The shared worker must defer that release to a bounded
+cleanup mechanism or use an incremental finalizer; it must not perform this
+wait while serving other sockets. Timeout, reset, close, and slot reuse need
+explicit tests, and the existing unsupported Internet `shutdown` semantics
+remain unchanged until queue draining and half-close are implemented together.
+
+Before connecting a worker, extract the existing call-local flight step into a
+persistent pump that does not depend on a syscall's `Process*`, user buffer,
+or call deadline. Test it using the existing caller-driven ACK-synchronous
+path first. The actual-code lifetime tests now check that an additional owner
+survives application close, acknowledges data before emitting FIN with the
+next sequence number, and permits clean socket-slot reuse. This tests a
+necessary ownership primitive; it does not demonstrate a queued sender.
+
 The Dell's 4 MiB RAM download to the host takes about 3.6 seconds. Brook's
 current sender waits for each 1,200-byte segment to be acknowledged before
 sending the next; removing its explicit post-ACK yield did not improve the

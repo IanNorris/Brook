@@ -17,6 +17,7 @@ std::atomic<bool> pauseTransmit{false}, transmitting{false}, releaseTransmit{fal
 std::atomic<bool> pauseOnlyPureAck{false};
 std::atomic<bool> acknowledgeFin{false};
 std::atomic<unsigned> sentFins{0};
+std::atomic<uint32_t> lastFinSequence{0};
 std::atomic<unsigned> acknowledgeDataCount{0};
 std::atomic<unsigned> skipDataAcks{0};
 std::atomic<unsigned> failDataSubmissions{0};
@@ -158,7 +159,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                                const void* data, uint32_t len) {
     assert(proto == IP_PROTO_TCP);
     const auto* tcp = static_cast<const TcpHeader*>(data);
-    if (tcp->flags & TCP_FIN) ++sentFins;
+    if (tcp->flags & TCP_FIN) { ++sentFins; lastFinSequence=ntohl(tcp->seqNum); }
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
         lastDataSubmitTick=ticks.load();
         const unsigned index=capturedDataCount.fetch_add(1);
@@ -561,6 +562,26 @@ int main() {
     SpinLockRelease(&g_sockets[ownerSocket].lock);
     finalOwner.join();assert(!published(ownerSocket));
     assert(!SockTryRef(ownerSocket));
+    // A future queued sender must retain an owner after the application's
+    // reference is dropped. Its final release sends FIN only after the last
+    // accepted bytes have actually been acknowledged.
+    {
+        int socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
+        auto* worker=new Process{};worker->refCount=1;worker->pid=110;
+        assert(SockTryRef(socket));
+        const unsigned before=sentFins.load();
+        SockClose(socket);assert(published(socket) && sentFins==before);
+        currentProcess=worker;ticks=1;acknowledgeDataCount=1;
+        g_tcpTwoPacketFlight=true;const uint8_t data[]={1,2,3,4};
+        assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+        assert(sentFins==before && g_sockets[socket].tcpSndUna==14);
+        g_tcpTwoPacketFlight=false;acknowledgeFin=true;
+        SockUnref(socket);
+        assert(sentFins==before+1 && lastFinSequence==14 && !published(socket));
+        acknowledgeFin=false;currentProcess=nullptr;delete worker;
+        const int reused=create();assert(reused==socket && g_sockets[reused].tcpSndNxt==0);
+        SockClose(reused);
+    }
     // Real KMutex ownership and retained socket references prevent the last
     // FD close from racing either the current sender or a queued sender.
     int gateSocket=create();setupTcp(gateSocket);
