@@ -31,7 +31,7 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-stream-probe")==0 && (scenario>=38 && scenario<=43))return &marker;
- if(std::strcmp(path,"/etc/dell-hda-audio")==0 && scenario>=44 && scenario<=47)return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-audio")==0 && ((scenario>=44 && scenario<=47) || (scenario>=53 && scenario<=57)))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-cache-observe")==0 && scenario>=48 && scenario<=52)return &marker;
  if(std::strcmp(path,"/etc/dell-hda-dma-cache-observe")==0 && scenario>=49 && scenario<=52)return &marker;
  if(std::strcmp(path,"/etc/audio-muted")==0 && scenario>=44 && scenario!=46)return &marker;
@@ -39,8 +39,8 @@ extern "C" Vnode* VfsOpen(const char* path,int){
 extern "C" void VfsClose(Vnode*){}
 uint32_t SmpCurrentCpuIndex(){return 0;}
 uint32_t SmpGetCpuCount(){return 1;}
-bool SmpObserveCacheSnapshots(CpuCacheSnapshot* out,uint32_t count){if(count<1)return false;out[0].valid=true;out[0].pat=0x0007040100070406ULL;
- auto& m=out[0].mtrrs;m.capability=(1ull<<10)|1;m.count=1;m.physicalBits=36;m.defaults=(1ull<<11)|6;
+bool SmpObserveCacheSnapshots(CpuCacheSnapshot* out,uint32_t count){if(count<1 || scenario==47)return false;out[0].valid=true;out[0].clflush=scenario!=55;out[0].clflushLine=64;out[0].pat=0x0007040100070406ULL^(scenario==56?1ull<<24:0);
+ auto& m=out[0].mtrrs;m.capability=(1ull<<10)|1;m.count=1;m.physicalBits=36;m.defaults=(1ull<<11)|(scenario==57?0:6);
  m.base[0]=0xf7400000;m.mask[0]=((~((1ull<<21)-1))&((1ull<<36)-1)&~4095ull)|(1ull<<11);return true;}
 void KMutexInit(KMutex* m){m->locked=0;}
 void KMutexLock(KMutex* m){assert(!m->locked);m->locked=1;}
@@ -69,8 +69,8 @@ extern "C" uint8_t PciConfigRead8(uint8_t,uint8_t,uint8_t,uint8_t o){if(o==0x0e)
 extern "C" void PciConfigWrite32(uint8_t,uint8_t,uint8_t,uint8_t o,uint32_t v){assert(o==4 && (v==0 || v==2 || (scenario>=20 && v==6)));++writes;
  if(scenario>=20 && v==6){const unsigned pages=scenario>=38?17:4;assert(toneFlushes>=pages*64);for(unsigned i=0;i<pages;++i)assert(toneFlushMask[i]==~uint64_t(0));chip.published=true;}
  if((v==2 && scenario==3) || (v==0 && scenario==6))return;cmd=uint16_t(v);}
-bool VmmInspectKernelAliases(uint64_t p,KernelAliasMapping& a,KernelAliasMapping& b){a={true,21,0,p};b=a;if(scenario==52 && toneAllocations)b.patIndex=1;return true;}
-bool VmmInspectKernelAddress(uint64_t,KernelAliasMapping& m){m={true,12,uint8_t(scenario==50?0:3),bar};return true;}
+bool VmmInspectKernelAliases(uint64_t p,KernelAliasMapping& a,KernelAliasMapping& b){a={true,21,0,p};b=a;if((scenario==52 || scenario==54) && toneAllocations)b.patIndex=1;return true;}
+bool VmmInspectKernelAddress(uint64_t,KernelAliasMapping& m){m={true,12,uint8_t(scenario==50 || scenario==53?0:3),bar};return true;}
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){assert(n==1);++allocs;if(scenario==4)return VirtualAddress{};return VirtualAddress(reinterpret_cast<uint64_t>(page));}
 uint64_t VmmDetachPage(PageTable,VirtualAddress){return ram|1;}
 PhysicalAddress VmmLeafPhysical(uint64_t){return PhysicalAddress(ram);}
@@ -92,7 +92,6 @@ void HdaObserveTestWrite8(uint32_t o,uint8_t v){if(scenario>=20){assert(cmd&2);c
 void HdaObserveTestWrite16(uint32_t o,uint16_t v){if(scenario>=20){assert(cmd&2);chip.write16(o,v);}else *reinterpret_cast<volatile uint16_t*>(static_cast<uint8_t*>(page)+o)=v;}
 void HdaObserveTestWrite32(uint32_t o,uint32_t v){if(scenario>=20){assert(cmd&2);chip.write32(o,v);}else *reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(page)+o)=v;}
 bool HdaObserveTestFlushInfo(uint32_t& line){line=scenario==33?0:64;return scenario!=31;}
-bool HdaObserveTestAllCpuCacheAdmitted(){return scenario!=47;}
 void HdaObserveTestFlushLine(void* p){const auto address=reinterpret_cast<uintptr_t>(p);bool found=false;
  for(unsigned i=0;i<17;++i){const auto base=reinterpret_cast<uintptr_t>(tonePages[i]);if(base && address>=base && address<base+4096){
   assert(!((address-base)&63));toneFlushMask[i]|=uint64_t(1)<<((address-base)/64);found=true;break;}}
@@ -157,7 +156,7 @@ static void one(int which){
  if(which==40){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && !toneAllocations && cmd==0 && !std::strcmp(o.streamReason,"native clock unavailable"));}
  if(which==41){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && o.streamQuarantined && !toneFrees && cmd==2);}
  if(which==42 || which==43){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && o.streamQuarantined && !toneFrees && cmd==2);}
- if(which==44){assert(o.runtimeRequested && o.runtimePrepared && !o.runtimeRegistered && toneAllocations==17 && cmd==2);
+ if(which==44){assert(o.runtimeRequested && o.runtimePrepared && !o.runtimeRegistered && toneAllocations==17 && o.runtimePagesValidated==17 && cmd==2);
   HdaRuntimeRegister();assert(o.runtimeRegistered && registered && registerCalls==1);
   unsigned char samples[1764]{};const auto receipt=registered->trySubmit(samples,sizeof(samples));
   assert(receipt.accepted==sizeof(samples) && !receipt.error && !chip.sawQuietUnmute);
@@ -174,6 +173,10 @@ static void one(int which){
  if(which==50){assert(o.cachePagesRequested && !o.cacheMmioMapping && !toneAllocations && cmd==0);}
  if(which==51){assert(o.cacheMmioMapping && !o.cacheDmaMappings && o.cachePages==2 && toneFrees==2 && cmd==0);}
  if(which==52){assert(o.cacheMmioMapping && !o.cacheDmaMappings && o.cachePages==1 && toneFrees==1 && cmd==0);}
+ if(which==53){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0 && !std::strcmp(o.runtimeReason,"all-CPU cache admission unavailable"));}
+ if(which==54){assert(o.runtimeRequested && !o.runtimePrepared && toneAllocations==1 && toneFrees==1 && o.tonePageStatus==5 && cmd==0 && !chip.published);}
+ if(which==55 || which==56){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0 && !std::strcmp(o.runtimeReason,"all-CPU cache admission unavailable"));}
+ if(which==57){assert(o.runtimeRequested && !o.runtimePrepared && toneAllocations==1 && toneFrees==1 && o.tonePageStatus==5 && cmd==0 && !chip.published);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=52;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=57;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

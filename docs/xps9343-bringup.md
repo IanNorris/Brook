@@ -2765,8 +2765,8 @@ need implementation and testing.
 
 Further review identified that the experimental runtime's original admission
 did not establish PAT, MTRR and DMA-alias compatibility on every CPU that can
-run mixer callbacks. Its real-hardware registration is now fail-closed, even
-when requested; the Dell was returned to the checked recovery generation.
+run mixer callbacks. Real-hardware registration was made fail-closed while
+those checks were developed; the Dell was returned to the checked recovery generation.
 The previous muted playback observations remain useful evidence but are not a
 proof of safe multicore admission. Before reenabling it, verify all schedulable
 CPUs and the actual MMIO and DMA aliases, and account for CPU hotplug, suspend
@@ -2788,3 +2788,13 @@ aperture pages had UC MTRR type. All temporary pages were released without
 enabling device DMA. These observations do not authorize different pages later
 allocated to the driver or prove that no other aliases exist. Recovery
 generation 76 was selected for the following boot; audio remains gated.
+
+The opt-in runtime now captures and compares all online CPU snapshots, including
+CLFLUSH availability and line size, verifies the actual borrowed MMIO mapping,
+and checks each of its own 17 allocated DMA pages before first access. A Dell
+boot registered the muted driver after validating all 17 pages. An OSS test
+then submitted 176,400 bytes, and a live mixer snapshot recorded 20,747
+completed frames with no discontinuity or quarantine. This is still an
+experimental one-shot, muted path: future CPU hotplug, suspend or cache
+reprogramming must invalidate admission, and unknown aliases are not enumerated.
+Recovery generation 78 is selected for the next boot.

@@ -2,7 +2,7 @@
 #include <cassert>
 using namespace brook;
 int main(){
-    CpuCacheSnapshot s{};s.valid=true;s.pat=0x0007040100070406ULL;
+    CpuCacheSnapshot s{};s.valid=true;s.clflush=true;s.clflushLine=64;s.pat=0x0007040100070406ULL;
     s.mtrrs.capability=(1ull<<10)|1;s.mtrrs.count=1;s.mtrrs.physicalBits=36;s.mtrrs.defaults=(1ull<<11)|6;
     constexpr uint64_t mmio=0xf7400000;
     s.mtrrs.base[0]=mmio;s.mtrrs.mask[0]=((~((1ull<<21)-1))&((1ull<<36)-1)&~4095ull)|(1ull<<11);
@@ -12,6 +12,7 @@ int main(){
     ap=s;ap.pat^=1;assert(!CpuCacheSnapshotsMatch(s,ap) && !CpuCacheHdaPageTypes(ap,mmio,pages,17));
     ap=s;ap.mtrrs.defaults^=4;assert(!CpuCacheSnapshotsMatch(s,ap));
     ap=s;ap.cacheDisabled=true;assert(!CpuCacheSnapshotsMatch(s,ap) && !CpuCacheHdaPageTypes(ap,mmio,pages,17));
+    ap=s;ap.clflushLine=128;assert(!CpuCacheSnapshotsMatch(s,ap));ap=s;ap.clflush=false;assert(!CpuCacheSnapshotsMatch(s,ap));
     ap=s;ap.valid=false;assert(!CpuCacheSnapshotsMatch(s,ap));
     pages[3]=mmio;assert(!CpuCacheHdaPageTypes(s,mmio,pages,17));pages[3]=0x203000;
     assert(!CpuCacheHdaPageTypes(s,mmio,pages,16) && !CpuCacheHdaPageTypes(s,mmio+1,pages,17));

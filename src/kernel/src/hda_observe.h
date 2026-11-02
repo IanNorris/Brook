@@ -19,6 +19,7 @@ struct HdaObservation {
     uint32_t streamSubmissions=0;uint64_t streamAccepted=0,streamCompleted=0,streamElapsedNs=0;
     uint16_t streamCommand=0;const char* streamReason="not requested";
     bool runtimeRequested=false,runtimePrepared=false,runtimeRegistered=false,runtimeQuarantined=false;
+    uint32_t runtimePagesValidated=0;
     const char* runtimeReason="not requested";
     bool cacheRequested=false,cacheCaptured=false,cacheMatch=false;
     uint32_t cacheCpuCount=0;uint64_t cachePat=0;

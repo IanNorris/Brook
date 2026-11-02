@@ -35,7 +35,6 @@ namespace brook {
 uint8_t HdaObserveTestRead8(uint32_t);uint16_t HdaObserveTestRead16(uint32_t);uint32_t HdaObserveTestRead32(uint32_t);
 void HdaObserveTestWrite8(uint32_t,uint8_t);void HdaObserveTestWrite16(uint32_t,uint16_t);void HdaObserveTestWrite32(uint32_t,uint32_t);
 bool HdaObserveTestFlushInfo(uint32_t&);void HdaObserveTestFlushLine(void*);
-bool HdaObserveTestAllCpuCacheAdmitted();
 uint64_t HdaObserveTestNowNs();
 void HdaObserveTestBeforeStreamIteration();
 #endif
@@ -232,6 +231,13 @@ struct TonePlatform {
         if(!VmmInspectKernelAliases(physical,identity,direct) ||
            !HdaDellToneRamMappingMatches(physical,reinterpret_cast<uint64_t>(address),DIRECT_MAP_BASE,direct)){
             observation.tonePageStatus=2;return false;}
+        // Validate the pages actually owned by the runtime, before touching
+        // them or building a descriptor. Temporary probe pages prove nothing
+        // about subsequent PMM allocations.
+        if(runtimeMode && (!observation.cacheMatch || observation.cacheCpuCount!=SmpGetCpuCount() ||
+           !HdaCacheDmaMappings(physical,identity,direct) || !CpuCacheHdaDmaPageType(cacheSnapshots[0],physical))){
+            observation.tonePageStatus=5;return false;}
+        if(runtimeMode)++observation.runtimePagesValidated;
         observation.tonePageStatus=3;return true;}
     void clearPage(void* p){memset(p,0,4096);}void freePage(uint64_t p){
         void* address=reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(p)).raw());for(auto& slot:dmaPages)if(slot==address)slot=nullptr;
@@ -318,16 +324,14 @@ AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?
 bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
 bool RuntimeRestart(uint64_t epoch){return runtimeBridge && runtimeBridge->restart(epoch);}
 void PrepareRuntime(Io& io){
-    // The boot probe validates the BSP, but mixer callbacks can run on any
-    // schedulable CPU. Full cross-core PAT/MTRR and DMA-alias admission is not
-    // yet available. Do not publish the driver or touch hardware on a real
-    // system until that admission is in place. Hosted tests exercise the
-    // subsequent lifecycle with their own simulated cache model.
-    bool cacheAdmitted=false;
-#ifdef BROOK_HOST_TEST
-    cacheAdmitted=HdaObserveTestAllCpuCacheAdmitted();
-#endif
-    if(!cacheAdmitted){observation.runtimeReason="all-CPU cache admission unavailable";return;}
+    // Admission is boot-bound. Hotplug, suspend and cache reprogramming must
+    // invalidate it before any of those features can be used with this driver.
+    KernelAliasMapping mmio{};
+    if(!observation.cacheCaptured || !observation.cacheMatch || !observation.cacheCpuCount ||
+       observation.cacheCpuCount!=SmpGetCpuCount() ||
+       !CpuCacheHdaApertureType(cacheSnapshots[0],io.base) ||
+       !VmmInspectKernelAddress(reinterpret_cast<uint64_t>(registers),mmio) || !HdaCacheMmioMapping(io.base,mmio)){
+        observation.runtimeReason="all-CPU cache admission unavailable";return;}
     const auto& clock=NativeTscObserveRead();if(!clock.consistent || !Marker("/etc/audio-muted")){observation.runtimeReason="native clock or boot mute unavailable";return;}
     alignas(TonePlatform) static unsigned char platformStorage[sizeof(TonePlatform)];
     auto* platform=::new(platformStorage) TonePlatform{io,observation.session};platform->expectedPages=17;platform->runtimeMode=true;
@@ -337,7 +341,7 @@ void PrepareRuntime(Io& io){
     uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");const uint64_t origin=(uint64_t(hi)<<32)|lo;
 #endif
     if(!platform->runtimeClock.init(clock,SmpGetCpuCount(),origin)){observation.runtimeReason="native clock admission failed";return;}
-    uint32_t line=0;if(!platform->flushInfo(line) || !platform->delayUs(3)){observation.runtimeReason="cache or timer unavailable";return;}
+    uint32_t line=0;if(!platform->flushInfo(line) || line!=cacheSnapshots[0].clflushLine || !platform->delayUs(3)){observation.runtimeReason="cache or timer unavailable";return;}
     alignas(RuntimeOwner) static unsigned char ownerStorage[sizeof(RuntimeOwner)];
     runtimeOwner=::new(ownerStorage) RuntimeOwner(*platform,observation.session,line);
     if(!runtimeOwner->prepare()){observation.runtimeReason="owner preparation failed";return;}
@@ -398,7 +402,8 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
     const bool muted=Marker("/etc/dell-hda-muted-dma"),audible=Marker("/etc/dell-hda-quiet-tone");
     const bool mixerProbe=Marker("/etc/dell-hda-mixer-format-probe");
-    if(Marker("/etc/dell-hda-cache-observe")){
+    const bool runtimeRequested=Marker("/etc/dell-hda-audio");
+    if(Marker("/etc/dell-hda-cache-observe") || runtimeRequested){
         observation.cacheRequested=true;const auto count=SmpGetCpuCount();
         if(count && count<=MAX_CPUS && SmpObserveCacheSnapshots(cacheSnapshots,MAX_CPUS)){
             observation.cacheCaptured=true;observation.cacheCpuCount=count;observation.cachePat=cacheSnapshots[0].pat;
@@ -409,7 +414,7 @@ void HdaObserveConfigure(const BootProtocol* boot) {
                      observation.cacheCpuCount,unsigned(observation.cacheMatch),observation.cachePat);
     }
     if(Marker("/etc/dell-hda-dma-cache-observe"))ObserveCachePages(io);
-    if(Marker("/etc/dell-hda-audio")){
+    if(runtimeRequested){
         observation.runtimeRequested=true;
         if(muted || audible || mixerProbe || Marker("/etc/dell-hda-stream-probe")){observation.runtimeReason="conflicting markers";return;}
         if(observation.session.result!=HdaSessionResult::Complete || observation.session.after!=0 || !observation.mapped){observation.runtimeReason="observation incomplete";return;}

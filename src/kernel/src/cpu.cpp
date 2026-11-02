@@ -134,12 +134,14 @@ bool CpuCaptureCacheSnapshot(brook::CpuCacheSnapshot& out)
         InterruptGuard(){__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");}
         ~InterruptGuard(){if(flags&(1ull<<9))__asm__ volatile("sti":::"memory");}} guard;
     brook::FramebufferMtrrs before{},after{};const uint64_t cr0=ReadCr0();
+    uint32_t a,b,c,d;__asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
     if(!ReadFramebufferMtrrs(before))return false;
     const uint64_t pat=ReadMsr(0x277);
     if(!ReadFramebufferMtrrs(after) || !brook::FramebufferMtrrsEqual(before,after) ||
        ((cr0^ReadCr0())&((1ull<<30)|(1ull<<29))) || ReadMsr(0x277)!=pat)return false;
     out.mtrrs=before;out.pat=pat;out.cacheDisabled=(cr0&(1ull<<30))!=0;
-    out.notWriteThrough=(cr0&(1ull<<29))!=0;out.valid=true;return true;
+    out.notWriteThrough=(cr0&(1ull<<29))!=0;out.clflush=(d&(1u<<19))!=0;
+    out.clflushLine=((b>>8)&255)*8;out.valid=true;return true;
 }
 
 bool CpuObserveMemoryTypes(uint64_t page0,uint64_t page1,brook::CpuMemoryTypeObservation& out)
