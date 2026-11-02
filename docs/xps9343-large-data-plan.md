@@ -68,3 +68,12 @@ full 128-byte-inode-table placement and overlap, plus basic counter bounds.
 Synthetic corruption and partial-group tests pass, as does the 17 GiB fixture.
 It does not inspect bitmap contents or reconcile free counts, and it requires
 the superblock's format and feature restrictions to be established separately.
+
+An unconnected header classifier now checks the expected byte length and UUID,
+the constrained ext2 feature and inode geometry, and dirty versus clean state
+before returning the geometry for descriptor inspection. Synthetic invalid and
+dirty cases and the 17 GiB fixture pass. This deliberately retains the existing
+128-byte-inode restriction; that format has timestamp limitations beyond 2038,
+which need a separate design decision before it is chosen for permanent storage.
+The classifier alone neither verifies the partition identity nor proves
+filesystem consistency, and no boot admission uses it yet.

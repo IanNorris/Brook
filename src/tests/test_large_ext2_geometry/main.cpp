@@ -1,11 +1,13 @@
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <vector>
 #include "large_ext2_geometry.h"
 using namespace brook;
 static uint16_t get16(const uint8_t* p) { return uint16_t(p[0]) | (uint16_t(p[1])<<8); }
 static uint32_t get32(const uint8_t* p) { return uint32_t(get16(p)) | (uint32_t(get16(p+2))<<16); }
+static void put16(uint8_t* p, uint16_t v) { p[0]=uint8_t(v); p[1]=uint8_t(v>>8); }
 static void put32(uint8_t* p, uint32_t v) { for (int i=0;i<4;++i) p[i]=uint8_t(v>>(i*8)); }
 
 int main(int argc, char** argv) {
@@ -64,6 +66,32 @@ int main(int argc, char** argv) {
     assert(!LargeExt2GroupBounds(forged,0,first,end));
     assert(!LargeExt2GeometryMake(4096u*32768+1,g));
     assert(!LargeExt2GeometryMake(UINT32_MAX,g));
+    {
+        uint8_t sb[1024]{}, uuid[16]{}; uuid[0]=1; std::memcpy(sb+104,uuid,16);
+        const uint32_t blocks=129u*32768, inodes=129u*64;
+        const uint64_t bytes=uint64_t(blocks)*4096;
+        put32(sb,inodes); put32(sb+4,blocks); put32(sb+12,blocks); put32(sb+16,inodes);
+        put32(sb+24,2); put32(sb+28,2); put32(sb+32,32768); put32(sb+36,32768);
+        put32(sb+40,64); put16(sb+56,0xef53); put16(sb+58,1); put32(sb+76,1);
+        put32(sb+84,11); put16(sb+88,128); put32(sb+96,2); put32(sb+100,3);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Clean && g.groups==129);
+        for (uint16_t state : {0,2,3}) {
+            put16(sb+58,state);
+            assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::NeedsCheck);
+        }
+        put16(sb+58,1);
+        uint8_t zeroUuid[16]{};
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,zeroUuid,g)==LargeExt2HeaderState::Invalid && !g.groups);
+        std::memset(sb+104,0,16);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,zeroUuid,g)==LargeExt2HeaderState::Invalid && !g.groups);
+        std::memcpy(sb+104,uuid,16);
+        put32(sb+16,inodes+1);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Invalid && !g.groups);
+        put32(sb+16,inodes); put32(sb+40,65);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Invalid && !g.groups);
+        put32(sb+40,64); put32(sb+4,UINT32_MAX);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),uint64_t(UINT32_MAX)*4096,uuid,g)==LargeExt2HeaderState::Invalid && !g.groups);
+    }
     if (argc == 2) {
         std::ifstream image(argv[1], std::ios::binary);
         uint8_t sb[1024]{};
@@ -71,6 +99,25 @@ int main(int argc, char** argv) {
         assert(get16(sb+56)==0xef53 && get32(sb+24)==2 && get32(sb+20)==0 && get16(sb+88)==128);
         assert(get32(sb+32)==32768 && get32(sb+92)==0 && get32(sb+96)==2);
         assert(get32(sb+100)==3 && get16(sb+206)==0);
+        uint8_t uuid[16]; std::memcpy(uuid,sb+104,sizeof(uuid));
+        const uint64_t bytes=uint64_t(get32(sb+4))*4096;
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Clean);
+        assert(LargeExt2ClassifyHeader(nullptr,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Invalid);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb)-1,bytes,uuid,g)==LargeExt2HeaderState::Invalid);
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes-4096,uuid,g)==LargeExt2HeaderState::Invalid);
+        uuid[0]^=1;
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Invalid);
+        uuid[0]^=1;
+        sb[58]=0;
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::NeedsCheck);
+        sb[58]=1;
+        const unsigned invalidOffsets[]={20,24,28,32,36,40,56,58,72,76,84,88,90,92,96,100,104,206};
+        for (unsigned offset:invalidOffsets) {
+            sb[offset]^=0x80;
+            assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Invalid);
+            sb[offset]^=0x80;
+        }
+        assert(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,g)==LargeExt2HeaderState::Clean);
         assert(LargeExt2GeometryMake(get32(sb+4),g) && g.descriptorBlocks>1);
         std::vector<uint8_t> table(g.descriptorBytes);
         image.seekg(4096); assert(image.read(reinterpret_cast<char*>(table.data()),table.size()));
