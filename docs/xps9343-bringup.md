@@ -2973,3 +2973,10 @@ maintenance dry run reported slot 0 ready for generation 117 without writing
 or activating it. The initrd retains both the boot-mute and separately gated
 audible markers; the Dell remains on recovery generation 116. This prepares
 the test but is not evidence of audible application playback.
+
+A refreshed attended-review payload includes the async TCP and pool-wait
+changes with matching ABI 63 modules. It retains both boot-mute and the gated
+audible marker. The exact pair booted in isolated QEMU without an audio device;
+a Dell maintenance dry run planned generation 125 in slot 0 with no storage
+modification. The Dell remained on the known-good recovery boot. This is
+preparation only: speaker output and application playback were not enabled.
