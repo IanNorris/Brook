@@ -92,3 +92,15 @@ though regular-file inodes have a high-size field. A large partition must not be
 advertised as safe for files over 4 GiB until read, write, truncate, allocation,
 stat and independent filesystem-check behavior have been audited and tested.
 Those checks are distinct from allowing a filesystem larger than 4 GiB.
+
+An unconnected extended-time codec now implements the signed base, two epoch
+bits and nanoseconds described by the [Linux inode format](https://docs.kernel.org/filesystems/ext4/inodes.html).
+Host tests cover epoch transitions, range rejection and round trips; this does
+not add 256-byte inode support or change the mounted filesystem. An independent
+`debugfs` fixture produced the expected raw base/epoch fields at the 2038 and
+2106 boundaries, and `e2fsck -fn` passed. However, its displayed dates for
+some raw values differ from the documented signed-base interpretation; current
+e2fsprogs' [`ext2fs_inode_xtime_get`](https://github.com/tytso/e2fsprogs/blob/v1.47.4/lib/ext2fs/ext2fs.h)
+passes the unsigned base to its decoder. The actual Linux mount/runtime and
+Brook-to-Linux round trips remain untested; an e2fsck pass does not establish
+timestamp interoperability.
