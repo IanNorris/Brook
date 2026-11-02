@@ -105,6 +105,9 @@ int main(){
     assert(handle("bridge hardware native-tsc-observe") && reply.find("\"requested\":false")!=std::string::npos);
     brook::tscObservation.requested=true;brook::tscObservation.samples[2]=123456;
     assert(handle("bridge hardware native-tsc-observe") && reply.find("\"samples\":[0,0,123456,0,0]")!=std::string::npos);
+    brook::tscObservation.coreCount=1;brook::tscObservation.cores[0].cpu=1;
+    brook::tscObservation.cores[0].interval.lower=-12;brook::tscObservation.cores[0].interval.upper=34;
+    assert(handle("bridge hardware native-tsc-observe") && reply.find("\"lower\":-12,\"upper\":34")!=std::string::npos);
     brook::ahciStatus.ready=true;std::strcpy(brook::ahciStatus.serial,"serial-123");
     assert(handle("bridge hardware ahci-ro") && reply.find("\"serial\":\"serial-123\"")!=std::string::npos);
     assert(handle("bridge hardware ahci-sector 3") && reply.find("5a5a5a5a")!=std::string::npos);

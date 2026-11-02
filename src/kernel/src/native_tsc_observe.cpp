@@ -79,6 +79,8 @@ void NativeTscObserveConfigure(){
     if(!observation.measured){observation.reason="PIT measurement failed";return;}
     observation.consistent=NativeTscCalibrate(observation.samples,observation.pitTicks,observation.khz);
     observation.reason=observation.consistent?"observed only":"samples inconsistent";
+    if(observation.consistent){const uint32_t cpus=SmpGetCpuCount();observation.coreExpected=cpus?cpus-1:0;
+        observation.coreCount=SmpObserveNativeTsc(observation.cores,63);}
     SerialPrintf("NATIVE_TSC_OBSERVE measured=%u consistent=%u khz=%u reason=%s\n",
         unsigned(observation.measured),unsigned(observation.consistent),observation.khz,observation.reason);
 }

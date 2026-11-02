@@ -13,6 +13,10 @@ struct alignas(64) NativeTscMailbox {
 };
 struct NativeTscInterval {int64_t lower=0,upper=0;uint64_t roundTrip=0;};
 enum class NativeTscExchangeResult:uint8_t {Complete,Unavailable,Timeout,Abandoned,Invalid};
+struct NativeTscCpuObservation {
+    uint32_t cpu=0,exchanges=0;NativeTscExchangeResult result=NativeTscExchangeResult::Unavailable;
+    NativeTscInterval interval{};
+};
 inline bool NativeTscDifference(uint64_t x,uint64_t y,int64_t& out){
     constexpr uint64_t Max=uint64_t(~uint64_t(0)>>1);
     if(x>=y){const auto d=x-y;if(d>Max)return false;out=int64_t(d);return true;}

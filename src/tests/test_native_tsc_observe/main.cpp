@@ -11,6 +11,8 @@ namespace brook {
 extern "C" Vnode* VfsOpen(const char* path,int){assert(!std::strcmp(path,"/etc/native-tsc-observe"));return scenario==0?nullptr:&marker;}
 extern "C" void VfsClose(Vnode*){}
 uint32_t SmpCurrentCpuIndex(){return scenario==1?1:0;}
+uint32_t SmpGetCpuCount(){return 2;}
+uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* out,uint32_t n){assert(n>=1);out[0].cpu=1;out[0].exchanges=5;out[0].result=NativeTscExchangeResult::Complete;return 1;}
 void NativeTscTestCpuid(uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
     a=b=c=d=0;switch(leaf){case 0:a=1;break;case 1:d=1u<<4;c=scenario==2?1u<<31:0;break;
     case 0x80000000:a=0x80000007;break;case 0x80000001:d=1u<<27;break;case 0x80000007:d=1u<<8;break;default:assert(false);}}
@@ -28,7 +30,7 @@ int main(){for(int i=0;i<5;++i){const auto pid=fork();assert(pid>=0);if(!pid){sc
     if(i==1)assert(o.requested && o.attempted && !o.capable && !controls && !std::strcmp(o.reason,"not BSP"));
     if(i==2)assert(o.attempted && !o.capable && !controls);
     if(i==3)assert(o.capable && !o.measured && !o.consistent && !o.khz && (gate&~0x20u)==0x13);
-    if(i==4){assert(o.capable && o.measured && o.consistent && o.khz>1999000 && o.khz<2001000 && controls==5);
+    if(i==4){assert(o.capable && o.measured && o.consistent && o.khz>1999000 && o.khz<2001000 && controls==5 && o.coreExpected==1 && o.coreCount==1 && o.cores[0].exchanges==5);
         for(auto sample:o.samples)assert(sample==50000000);}
     const auto before=controls;NativeTscObserveConfigure();assert(controls==before);_exit(0);}
     int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

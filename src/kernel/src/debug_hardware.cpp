@@ -128,6 +128,11 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"measured\":");r.text(o.measured?"true":"false");r.text(",\"consistent\":");r.text(o.consistent?"true":"false");
         r.text(",");r.field("khz",o.khz);r.text(",");r.field("pit_ticks",o.pitTicks);r.text(",\"samples\":[");
         for(unsigned i=0;i<5;++i){if(i)r.text(",");r.number(o.samples[i]);}
+        r.text("],");r.field("cores_expected",o.coreExpected);r.text(",\"cores\":[");for(uint32_t i=0;i<o.coreCount && i<63;++i){if(i)r.text(",");const auto& c=o.cores[i];
+            r.text("{");r.field("cpu",c.cpu);r.text(",");r.field("result",uint8_t(c.result));r.text(",");r.field("exchanges",c.exchanges);
+            r.text(",\"lower\":");if(c.interval.lower<0){r.text("-");r.number(uint64_t(-(c.interval.lower+1))+1);}else r.number(uint64_t(c.interval.lower));
+            r.text(",\"upper\":");if(c.interval.upper<0){r.text("-");r.number(uint64_t(-(c.interval.upper+1))+1);}else r.number(uint64_t(c.interval.upper));
+            r.text(",");r.field("round_trip",c.interval.roundTrip);r.text("}");}
         r.text("],\"reason\":");r.quoted(o.reason);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-observe")) {

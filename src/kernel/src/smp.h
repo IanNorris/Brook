@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "native_tsc_rendezvous.h"
 
 namespace brook {
 
@@ -36,6 +37,11 @@ const CpuInfo* SmpGetCpu(uint32_t index);
 
 // Get the current CPU's index (based on LAPIC ID).
 uint32_t SmpCurrentCpuIndex();
+
+// One-shot, BSP-only observation while admitted APs remain in their bootstrap
+// wait. A timeout abandons that AP's static mailbox for the rest of the boot.
+// The result is evidence only; it does not enable a shared clock.
+uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* output,uint32_t capacity);
 
 // Immutable AP bootstrap stack bounds (also used by the initial AP idle loop).
 bool SmpBootstrapStackBounds(uint32_t cpu, uint64_t& base, uint64_t& end);

@@ -1,6 +1,7 @@
 #include "smp_boot_policy.h"
 #include "panic.h"
 #include "smp.h"
+#include "native_tsc_policy.h"
 #include "acpi.h"
 #include "apic.h"
 #include "cpu.h"
@@ -91,6 +92,15 @@ static void InstallPanicNmiHandler();
 
 // Per-AP activation flag: BSP sets to 1 to tell AP to proceed.
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
+static NativeTscMailbox g_nativeTscMailbox[MAX_CPUS]{};
+static uint32_t g_nativeTscArmed=0;static bool g_nativeTscAttempted=false;
+struct NativeTscExchangeIo {
+    bool capable(){return NativeTscCapabilities([](uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
+        __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(0));});}
+    bool tsc(uint64_t& value){uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
+        value=(uint64_t(hi)<<32)|lo;return true;}
+    void pause(){__asm__ volatile("pause");}
+};
 static bool g_apNmiReady[MAX_CPUS] = {};
 
 // Count of APs that have completed GdtLoadOnAp (including ltr).
@@ -204,8 +214,11 @@ void ApEntryFunction()
     __atomic_store_n(&g_apSignal,myCpuIndex+1,__ATOMIC_RELEASE);
 
     // Spin-wait for activation from BSP.
-    while (!__atomic_load_n(&g_apActivate[myCpuIndex], __ATOMIC_ACQUIRE))
+    NativeTscExchangeIo tscIo;
+    while (!__atomic_load_n(&g_apActivate[myCpuIndex], __ATOMIC_ACQUIRE)) {
+        if(__atomic_load_n(&g_nativeTscArmed,__ATOMIC_ACQUIRE))NativeTscRespond(g_nativeTscMailbox[myCpuIndex],tscIo);
         __asm__ volatile("pause" ::: "memory");
+    }
 
     // ---- Per-CPU init ----
 
@@ -583,6 +596,26 @@ void SmpActivateAPs()
 uint32_t SmpGetCpuCount()
 {
     return g_bootAdmission.Count();
+}
+
+uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* out,uint32_t capacity)
+{
+    if(!out || SmpCurrentCpuIndex()!=0 || g_nativeTscAttempted)return 0;
+    const uint32_t count=SmpGetCpuCount();if(!count || count>MAX_CPUS || capacity<count-1)return 0;
+    for(uint32_t cpu=1;cpu<count;++cpu)if(__atomic_load_n(&g_apActivate[cpu],__ATOMIC_ACQUIRE))return 0;
+    NativeTscExchangeIo io;if(!io.capable())return 0;g_nativeTscAttempted=true;
+    __atomic_store_n(&g_nativeTscArmed,1u,__ATOMIC_RELEASE);
+    for(uint32_t cpu=1;cpu<count;++cpu){
+        auto& item=out[cpu-1];item={};item.cpu=cpu;
+        for(unsigned sample=0;sample<5;++sample){NativeTscInterval current{};
+            item.result=NativeTscExchange(g_nativeTscMailbox[cpu],io,1000000,current);
+            if(item.result!=NativeTscExchangeResult::Complete)break;
+            if(!sample)item.interval=current;
+            else if(!NativeTscIntersect(item.interval,current)){item.result=NativeTscExchangeResult::Invalid;break;}
+            ++item.exchanges;
+        }
+    }
+    __atomic_store_n(&g_nativeTscArmed,0u,__ATOMIC_RELEASE);return count-1;
 }
 
 const CpuInfo* SmpGetCpu(uint32_t index)
