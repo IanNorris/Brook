@@ -123,6 +123,8 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snap
 // Diagnostic only: two kernel-root aliases of one aligned physical page.
 // Does not inspect MTRRs, other address spaces/aliases or access device bytes.
 bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& identity,KernelAliasMapping& direct);
+// Locked diagnostic page-table walk for a kernel virtual address.
+bool VmmInspectKernelAddress(uint64_t address,KernelAliasMapping& mapping);
 // Restricted Dell diagnostic; caller must enforce audited opt-in, firmware,
 // boot-map and PCI preconditions before entering this critical section.
 bool VmmDellI2cIdCriticalRead(uint32_t& value);

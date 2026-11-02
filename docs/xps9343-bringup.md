@@ -2780,3 +2780,11 @@ mapping types. A four-CPU QEMU run also captured matching snapshots. The
 mailbox collector has hosted coverage for delayed, failed and late responses;
 the latter cannot publish into the caller's output after timeout. The Dell's
 recovery generation 74 is selected for the next boot. Audio remains gated.
+
+A subsequent observation-only Dell boot verified that the borrowed HDA MMIO
+mapping used PAT3 and that 17 temporary PMM pages had the expected direct and
+identity aliases and WB MTRR type. The four CPU snapshots matched, and the
+aperture pages had UC MTRR type. All temporary pages were released without
+enabling device DMA. These observations do not authorize different pages later
+allocated to the driver or prove that no other aliases exist. Recovery
+generation 76 was selected for the following boot; audio remains gated.

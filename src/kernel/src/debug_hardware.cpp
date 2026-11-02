@@ -138,7 +138,12 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     if(!strcmp(command,"bridge hardware dell-hda-cache")) {
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_cache_api\":1,\"requested\":");r.text(o.cacheRequested?"true":"false");
         r.text(",\"captured\":");r.text(o.cacheCaptured?"true":"false");r.text(",\"match\":");r.text(o.cacheMatch?"true":"false");
-        r.text(",");r.field("cpus",o.cacheCpuCount);r.text(",");r.field("pat",o.cachePat);r.text("}\n");r.send();return true;
+        r.text(",");r.field("cpus",o.cacheCpuCount);r.text(",");r.field("pat",o.cachePat);
+        r.text(",\"pages_requested\":");r.text(o.cachePagesRequested?"true":"false");
+        r.text(",\"mmio_mapping\":");r.text(o.cacheMmioMapping?"true":"false");
+        r.text(",\"dma_mappings\":");r.text(o.cacheDmaMappings?"true":"false");
+        r.text(",\"page_types\":");r.text(o.cachePageTypes?"true":"false");r.text(",");r.field("pages",o.cachePages);
+        r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-runtime")) {
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_runtime_api\":1,\"requested\":");r.text(o.runtimeRequested?"true":"false");

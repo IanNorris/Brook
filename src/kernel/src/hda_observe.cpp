@@ -1,6 +1,7 @@
 #include "hda_observe.h"
 #include "hda_dell_inventory.h"
 #include "hda_dell_tone_ram.h"
+#include "hda_cache_mapping.h"
 #include "pci.h"
 #include "vfs.h"
 #include "serial.h"
@@ -282,6 +283,28 @@ struct TonePlatform {
     void quarantine(){if(runtimeMode)__atomic_store_n(&observation.runtimeQuarantined,true,__ATOMIC_RELEASE);else if(streamMode)observation.streamQuarantined=true;else observation.toneQuarantined=true;}
 };
 bool Marker(const char* path){auto* node=VfsOpen(path);if(!node)return false;VfsClose(node);return true;}
+// Read-only mapping/type observation of newly owned RAM pages. No BDL is
+// published, BME is not enabled, and none of the pages are dereferenced here.
+void ObserveCachePages(Io& io){
+    observation.cachePagesRequested=true;
+    if(!observation.cacheCaptured || !observation.cacheMatch || !observation.mapped ||
+       observation.session.result!=HdaSessionResult::Complete || io.command()!=0)return;
+    KernelAliasMapping mmio{};
+    observation.cacheMmioMapping=VmmInspectKernelAddress(reinterpret_cast<uint64_t>(registers),mmio) &&
+        HdaCacheMmioMapping(io.base,mmio);
+    if(!observation.cacheMmioMapping)return;
+    uint64_t pages[17]{};unsigned acquired=0;bool valid=true;
+    for(unsigned i=0;i<17;++i){const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);if(!p){valid=false;break;}
+        pages[acquired++]=p.raw();for(unsigned j=0;j<i;++j)if(pages[j]==p.raw())valid=false;
+        KernelAliasMapping identity{},direct{};
+        if(!valid || !VmmInspectKernelAliases(p.raw(),identity,direct) || !HdaCacheDmaMappings(p.raw(),identity,direct)){
+            valid=false;break;}}
+    observation.cachePages=acquired;observation.cacheDmaMappings=valid && acquired==17;
+    if(observation.cacheDmaMappings)observation.cachePageTypes=CpuCacheHdaPageTypes(cacheSnapshots[0],io.base,pages,17);
+    // Defensive duplicate handling: a broken allocator must not double-free.
+    while(acquired){const uint64_t p=pages[--acquired];bool duplicate=false;
+        for(unsigned i=0;i<acquired;++i)if(pages[i]==p)duplicate=true;if(!duplicate)PmmFreePage(PhysicalAddress(p));}
+}
 struct RuntimeLock {KMutex mutex{};void init(){KMutexInit(&mutex);}void lock(){KMutexLock(&mutex);}
     bool tryLock(){return KMutexTryLock(&mutex);}void unlock(){KMutexUnlock(&mutex);}};
 using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock>;
@@ -385,6 +408,7 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         SerialPrintf("HDA_CACHE_OBSERVE captured=%u cpus=%u match=%u pat=0x%lx\n",unsigned(observation.cacheCaptured),
                      observation.cacheCpuCount,unsigned(observation.cacheMatch),observation.cachePat);
     }
+    if(Marker("/etc/dell-hda-dma-cache-observe"))ObserveCachePages(io);
     if(Marker("/etc/dell-hda-audio")){
         observation.runtimeRequested=true;
         if(muted || audible || mixerProbe || Marker("/etc/dell-hda-stream-probe")){observation.runtimeReason="conflicting markers";return;}

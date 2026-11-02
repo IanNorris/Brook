@@ -100,6 +100,7 @@ target_compile_options(test_boot_resource_map PRIVATE "-iquote${BROOK_ROOT}/src/
 add_host_test(test_kernel_alias_probe)
 add_host_test(test_mtrr_page_probe)
 add_host_test(test_cpu_cache_snapshot)
+add_host_test(test_hda_cache_mapping)
 add_host_test(test_cache_snapshot_collect)
 add_host_test(test_dell_i2c_id_policy)
 target_link_libraries(test_dell_i2c_id_policy PRIVATE Threads::Threads)

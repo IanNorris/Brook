@@ -475,6 +475,12 @@ bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& identity,Kern
     IrqSpinLockRelease(&g_kernelPtLock,irq);
     if(!ok){identity={};direct={};}return ok;
 }
+bool VmmInspectKernelAddress(uint64_t address,KernelAliasMapping& mapping) {
+    mapping={};AuditedAliasTables tables;
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
+    const bool ok=InspectKernelAlias(tables,g_kernelCR3.raw(),address,mapping);
+    IrqSpinLockRelease(&g_kernelPtLock,irq);if(!ok)mapping={};return ok;
+}
 bool VmmDellI2cIdCriticalRead(uint32_t& value) {
     value=0;
     struct Io {
