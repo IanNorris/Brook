@@ -153,6 +153,17 @@ separated. The hosted socket-lifetime suite and the delayed, loss-injected
 16-slot QEMU USB Ethernet suite passed; Astra reviewed the control-flow
 extraction. This does not yet change upload performance.
 
+User-source copying is now a separate action carried out by the same syscall
+caller, outside the flight action and socket lock. Sequence reservation still
+follows the copy and rechecks current connection state, peer window and
+congestion credit. Hosted tests inject a window shrink during copying and
+cover both partial credit and a zero window followed by reopening; the delayed,
+loss-injected QEMU USB Ethernet suite also passed. This separation depends on
+single-caller ownership of the flight's tail and source offset. Before a
+concurrent worker is introduced, a pending copy needs an explicit owned slot
+and generation-checked completion, and neighbor resolution must cease blocking
+the shared transport path. No asynchronous writes are enabled.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

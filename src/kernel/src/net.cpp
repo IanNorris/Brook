@@ -3223,12 +3223,11 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         return acknowledged ? static_cast<int>(acknowledged) : error;
     };
 
-    // A step performs at most one reservation or packet submission. It may
-    // still sleep during user copying or neighbor resolution, so it is not a
-    // nonblocking worker pump. The caller owns and drives the state until all
-    // bytes are acknowledged or a terminal result is available.
-    enum class FlightAction { Again, Wait, Done };
-    struct FlightStep { FlightAction action; int result; };
+    // A step performs at most one packet submission or requests a caller-side
+    // copy. Submission may sleep in neighbor resolution, so this is not yet a
+    // nonblocking worker pump. The caller owns the state until completion.
+    enum class FlightAction { Again, Copy, Wait, Done };
+    struct FlightStep { FlightAction action; int result; uint32_t copyLength=0; };
     const auto step = [&]() -> FlightStep {
         if (TcpSendInterrupted(self)) return {FlightAction::Done,finish(-4)};
         const uint64_t now = ApicTickCount();
@@ -3337,32 +3336,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
             if (chunk > mss) chunk = mss;
             if (chunk > credit) chunk = credit;
             SpinLockRelease(&s.lock);
-            Slot& slot = slots[(head + count) % capacity];
-            if (!source.Copy(slot.bytes, reserved, chunk)) {
-                if (count) { deferredError = -14; return {FlightAction::Again,0}; }
-                return {FlightAction::Done,finish(-14)};
-            }
-            if (TcpSendInterrupted(self)) return {FlightAction::Done,finish(-4)};
-            if (ApicTickCount() >= deadline) return {FlightAction::Done,finish(-110)};
-
-            SpinLockAcquire(&s.lock);
-            if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
-                SpinLockRelease(&s.lock); return {FlightAction::Done,finish(-104)};
-            }
-            const uint32_t currentOutstanding = s.tcpSndNxt - s.tcpSndUna;
-            uint32_t currentCredit = s.tcpSndWnd > currentOutstanding ? s.tcpSndWnd-currentOutstanding : 0;
-            if (adaptive) {
-                const uint32_t congestionCredit = s.tcpFlightControl.cwnd > currentOutstanding ? s.tcpFlightControl.cwnd-currentOutstanding : 0;
-                if (currentCredit > congestionCredit) currentCredit = congestionCredit;
-            }
-            if (chunk > currentCredit) chunk = currentCredit;
-            if (!chunk) { SpinLockRelease(&s.lock); return {FlightAction::Again,0}; }
-            slot.seq = s.tcpSndNxt; slot.len = chunk; slot.retries = 0;
-            slot.submitted = false; slot.wasRetried = false; slot.retryAt = 0;
-            s.tcpSndNxt += chunk;
-            reserved += chunk; ++count;
-            SpinLockRelease(&s.lock);
-            return {FlightAction::Again,0};
+            return {FlightAction::Copy,0,chunk};
         }
 
         // Another reader can replace the shared waiter, so do not rely on a
@@ -3388,6 +3362,35 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         const FlightStep outcome=step();
         if (outcome.action==FlightAction::Done) return outcome.result;
         if (outcome.action==FlightAction::Wait) SchedulerBlockInterruptible(self);
+        if (outcome.action!=FlightAction::Copy) continue;
+
+        // The syscall caller owns the source and flight state. Copy before
+        // reserving sequence space; neither the socket lock nor a worker
+        // holds user memory. Recheck peer and congestion credit afterward.
+        uint32_t chunk=outcome.copyLength;
+        Slot& slot=slots[(head+count)%capacity];
+        if (!source.Copy(slot.bytes,reserved,chunk)) {
+            if (count) { deferredError=-14; continue; }
+            return finish(-14);
+        }
+        if (TcpSendInterrupted(self)) return finish(-4);
+        if (ApicTickCount()>=deadline) return finish(-110);
+        SpinLockAcquire(&s.lock);
+        if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
+            SpinLockRelease(&s.lock); return finish(-104);
+        }
+        const uint32_t currentOutstanding=s.tcpSndNxt-s.tcpSndUna;
+        uint32_t currentCredit=s.tcpSndWnd>currentOutstanding ? s.tcpSndWnd-currentOutstanding : 0;
+        if (adaptive) {
+            const uint32_t congestionCredit=s.tcpFlightControl.cwnd>currentOutstanding ? s.tcpFlightControl.cwnd-currentOutstanding : 0;
+            if (currentCredit>congestionCredit) currentCredit=congestionCredit;
+        }
+        if (chunk>currentCredit) chunk=currentCredit;
+        if (!chunk) { SpinLockRelease(&s.lock); continue; }
+        slot.seq=s.tcpSndNxt;slot.len=chunk;slot.retries=0;
+        slot.submitted=false;slot.wasRetried=false;slot.retryAt=0;
+        s.tcpSndNxt+=chunk;reserved+=chunk;++count;
+        SpinLockRelease(&s.lock);
     }
 }
 

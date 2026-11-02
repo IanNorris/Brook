@@ -36,6 +36,8 @@ std::atomic<uint32_t> flightRetrySeq{0},flightRetryLen{0};
 std::atomic<int> windowUpdateSocket{-1};
 std::atomic<uint64_t> windowUpdateTick{0};
 std::atomic<int> failUserCopyAfter{-1};
+std::atomic<int> shrinkWindowOnCopy{-1};
+std::atomic<uint32_t> copyWindowValue{0};
 std::atomic<uint8_t*> mutateUserOnSend{nullptr};
 std::atomic<unsigned> stagedPayloadCount{0};
 std::atomic<uint8_t> stagedPayloads[2]{};
@@ -71,7 +73,10 @@ uint64_t CopyFromUserBytes(void* dst,uint64_t src,uint64_t len) {
     int remaining=failUserCopyAfter.load();
     if(remaining==0)return 0;
     if(remaining>0)--failUserCopyAfter;
-    memcpy(dst,reinterpret_cast<const void*>(src),len);return len;
+    memcpy(dst,reinterpret_cast<const void*>(src),len);
+    const int idx=shrinkWindowOnCopy.exchange(-1);
+    if(idx>=0){auto& s=g_sockets[idx];SpinLockAcquire(&s.lock);s.tcpSndWnd=copyWindowValue.load();SpinLockRelease(&s.lock);}
+    return len;
 }
 uint64_t ApicTickCount() { return ticks.load(); }
 Process* ProcessCurrent() { return currentProcess; }
@@ -562,6 +567,23 @@ int main() {
         assert(value==9 && stagedPayloadCount==2 && stagedPayloads[0]==3 && stagedPayloads[1]==3);
         mutateUserOnSend=nullptr;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     }
+    // A window change during caller-side copy must be observed before any
+    // sequence reservation. Partial credit trims the first packet; zero
+    // credit publishes nothing until a later window update.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;capturedDataCount=0;acknowledgeDataCount=3;
+    shrinkWindowOnCopy=i;copyWindowValue=200;dataAckWindow=200;
+    {uint8_t data[536]{};assert(SockSendUser(i,reinterpret_cast<uint64_t>(data),sizeof(data))==536);}
+    assert(capturedDataCount==3 && capturedDataSeq[0]==10 && capturedDataSeq[1]==210 && capturedDataSeq[2]==410);
+    dataAckWindow=65535;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;capturedDataCount=0;acknowledgeDataCount=1;lastDataSubmitTick=0;
+    shrinkWindowOnCopy=i;copyWindowValue=0;windowUpdateSocket=i;windowUpdateTick=11;
+    {uint8_t data=7;assert(SockSendUser(i,reinterpret_cast<uint64_t>(&data),1)==1);}
+    assert(capturedDataCount==1 && capturedDataSeq[0]==10 && lastDataSubmitTick>=11);
+    g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // A fault after a valid prefix within the same MSS must discard the
     // unfinished slot, without reserving or transmitting any of that prefix.
     for (bool flight : {false,true}) {
