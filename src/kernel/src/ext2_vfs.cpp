@@ -931,7 +931,17 @@ static inline void Ext2BumpMetaOps(Ext2Mount* mnt)
 // Allocate a free block from the bitmap. Returns block number or 0 on failure.
 static uint32_t Ext2AllocBlock(Ext2Mount* mnt)
 {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    uint32_t firstGroup = 0;
+    // The identity-gated disposable fixture deliberately starts allocation in
+    // the second descriptor-table block. Production kernels keep first-fit.
+    if (mnt->groupCount > 128 && mnt->dev && mnt->dev->name &&
+        !strcmp(mnt->dev->name, "ahci-qemu-large")) firstGroup = 128;
+    for (uint32_t step = 0; step < mnt->groupCount; ++step) {
+        const uint32_t g = (firstGroup + step) % mnt->groupCount;
+#else
     for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+#endif
         if (mnt->bgdt[g].bg_free_blocks_count == 0) continue;
 
         uint8_t* bitmap = Ext2GetBlockBitmap(mnt, g);

@@ -196,7 +196,16 @@ metadata and a selected gap sentinel were unchanged. Evidence is under
 `build/hardware/large-data-write-run-20261102` and the two
 `large-data-negative-*-run-20261102` directories.
 
+The QEMU-only allocator was then configured to prefer group 128 for this
+identity-gated test device; the production kernel retains its original
+first-fit loop. A fresh private fixture completed create, checked shutdown,
+reboot verification and a second checked shutdown. Offline extraction passed
+`e2fsck -fn` and the independent file-content oracle; `debugfs` reported all
+38 file blocks in group 128. This exercises block allocation through the
+second descriptor-table block, not inode allocation in group 128. An earlier
+attempt completed its create phase but its QMP socket path was too long; it
+was not counted as a passing reboot test. Evidence: `build/hardware/ld2`.
+
 This QEMU-only path does not provide production partition ownership or the
-dirty/clean-session protocol and does not test writes into a group beyond 127.
-The helper and marker do not enable this mount in a production kernel. No Dell
-SSD access was performed by these tests.
+dirty/clean-session protocol. The helper and marker do not enable this mount
+in a production kernel. No Dell SSD access was performed by these tests.
