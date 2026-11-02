@@ -248,6 +248,16 @@ must verify the received frame, selected interface and current generation,
 and revalidate before use. A delayed or forged reply on the same configuration
 cannot be distinguished cryptographically. The tracker is still inactive.
 
+A separate reply validator now checks the Ethernet and ARP format, sender
+and target IPs, local destination/target MAC, agreement between sender MAC
+fields and a nonzero unicast sender MAC. Its strict diagnostic policy rejects
+broadcast-destination replies. The hosted test covers valid padded and
+unaligned packets, truncation, malformed fields and mismatched addresses. Astra
+reviewed it. It is not yet called by the runtime; integration must use a
+stable receive buffer, bind it to an outstanding request and revalidate the
+selected interface generation. These checks are not authentication and cannot
+prove a matching reply is fresh.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

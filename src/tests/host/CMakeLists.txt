@@ -361,6 +361,11 @@ add_host_test(test_launcher_command)
 
 add_host_test(test_tcp_flight_control)
 target_compile_options(test_tcp_flight_control PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_arp_reply)
+target_compile_options(test_arp_reply PRIVATE
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
 
 add_host_test(test_tcp
     "${BROOK_ROOT}/src/kernel/src/tcp.cpp"
