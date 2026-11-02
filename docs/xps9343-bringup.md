@@ -1832,7 +1832,9 @@ fence before publishing and prove DMA cannot overtake the writes and flush.
 The [Intel HD Audio specification, section 3.3.40](https://www.intel.com/content/dam/www/public/us/en/documents/product-specifications/high-definition-audio-specification.pdf)
 describes the stream FIFO-size register as a format-dependent bound on a
 controller fetch and on data between DMA and the link. The muted probe records
-the raw register after programming the format. This is an input to calculating
+the raw register after programming the format. On the Dell, a 44.1 kHz muted
+run observed raw `SDFIFOS=0x00b0` and completed cleanly; this was one sample,
+not a test of stability or decoding. This is an input to calculating
 a streaming guard, not by itself a bound on scheduler delays or proof that
 post-write overrun detection can undo already fetched samples.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
