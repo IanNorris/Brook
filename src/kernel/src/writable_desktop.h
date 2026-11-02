@@ -3,12 +3,11 @@
 namespace brook {
 enum class WritableDesktopBoot { Absent,Fallback,Ready,Maintenance };
 enum class WritableDesktopSource { Usb,System };
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-// Test-only helpers for validating a directly mounted store with the same
-// namespace and payload checks used by the existing image-backed store.
-bool WritableDesktopTestPrepareDirect();
-bool WritableDesktopTestPublishDirect();
-#endif
+// Direct stores use the same namespace and payload checks as image stores.
+bool WritableDesktopPrepareDirect();
+bool WritableDesktopPublishDirect();
+void WritableDesktopMarkDirectReady(uint8_t drive,uint64_t bytes);
+void WritableDesktopDirectFinalResult(int error,bool attempted);
 struct WritableDesktopInfo {
     const char* stage="disabled";
     bool configured=false,ready=false,pinned=false,dirty=false,clean=false,stateUncertain=false;

@@ -121,8 +121,9 @@ add_executable(test_ahci_system_volume "${BROOK_ROOT}/src/tests/test_ahci_system
     "${BROOK_ROOT}/src/kernel/src/ahci_system_volume.cpp")
 target_include_directories(test_ahci_system_volume PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatfs-object-adapter")
 target_compile_options(test_ahci_system_volume PRIVATE -Wall -Wextra -Werror -O2 -UNDEBUG -DBROOK_HOST_TEST
-    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
-foreach(scenario absent stat-error link open selector-short bad-record missing-dir system-link occupied no-disk short-read alloc bad-gpt wrong-guid duplicate register bind mount ready probe-absent probe-link probe-open probe-malformed probe-alloc1 probe-alloc2 probe-alloc3 probe-readfail probe-dirty probe-clean)
+    -ffunction-sections -fdata-sections "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_ahci_system_volume PRIVATE -Wl,--gc-sections)
+foreach(scenario absent stat-error link open selector-short bad-record missing-dir system-link occupied no-disk short-read alloc bad-gpt wrong-guid duplicate register bind mount ready probe-absent probe-link probe-open probe-malformed probe-alloc1 probe-alloc2 probe-alloc3 probe-readfail probe-dirty probe-clean direct-ready direct-lease-fail direct-malformed direct-bad-gpt direct-wrong-guid)
     add_test(NAME test_ahci_system_volume_${scenario} COMMAND test_ahci_system_volume ${scenario})
 endforeach()
 add_host_test(test_ata_identify)

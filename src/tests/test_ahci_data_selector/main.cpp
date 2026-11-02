@@ -1,4 +1,5 @@
 #include "ahci_data_reader.h"
+#include "ahci_direct_layout.h"
 #include <cassert>
 #include <cstring>
 #include <fstream>
@@ -35,6 +36,11 @@ static int fixture(const char* path,const char* storePath,uint64_t dataCount) {
     AhciBootSelection selected{}, selectedBoot{};
     if(!AhciSelectBootAndData(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,selectedBoot,selected) ||
        selectedBoot.entry!=1 || selected.entry!=2 || selected.first!=16384 || selected.count!=dataCount)return 1;
+    AhciDirectLayout direct{};
+    if(!AhciDirectLayoutSelect(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,direct) ||
+       direct.esp.entry!=selectedBoot.entry || direct.data.entry!=selected.entry ||
+       direct.frontBytes!=a.firstUsable*512 || direct.backStart!=(a.lastUsable+1)*512 ||
+       direct.backBytes!=sectors*512-direct.backStart)return 1;
     if(!storePath)return 0;
     std::ifstream store(storePath,std::ios::binary);uint8_t sb[1024]{};
     // The same path explicitly means the ext2 fixture is embedded in the
@@ -137,6 +143,22 @@ int main(int argc,char** argv){
     AhciBootSelection bootResult{},dataResult{};
     assert(AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));
     assert(bootResult.entry==3 && dataResult.entry==2);
+    AhciDirectLayout layout{};
+    assert(AhciDirectLayoutSelect(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),layout));
+    assert(layout.esp.entry==3 && layout.data.entry==2 && layout.frontBytes==34*512ULL &&
+           layout.backStart==99967*512ULL && layout.backBytes==33*512ULL);
+    BlockWriteLease leases[3]{};
+    assert(AhciDirectLayoutLeases(layout,1,2,leases));
+    BlockWriteLeases protections;assert(protections.Install(leases,3,true));
+    assert(!protections.AllowOrdinary(1,0,512));
+    assert(!protections.AllowOrdinary(1,layout.data.first*512,512));
+    assert(protections.AllowOwner(1,2,layout.data.first*512,512));
+    assert(protections.AllowOrdinary(1,layout.esp.first*512,512));
+    assert(!protections.AllowOrdinary(1,layout.backStart,512));
+    assert(!AhciDirectLayoutLeases(layout,1,1,leases));
+    copy[0]^=1;
+    assert(!AhciDirectLayoutSelect(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),layout));
+    assert(!layout.esp.entry && !layout.data.entry);copy[0]^=1;
     uint8_t sb[1024]{},gdt[32]{};put32(sb,1024);put32(sb+4,256);put32(sb+12,200);put32(sb+16,1000);
     put32(sb+24,2);put32(sb+28,2);put32(sb+32,32768);put32(sb+36,32768);put32(sb+40,1024);
     put16(sb+56,0xef53);put16(sb+58,1);put32(sb+76,1);put32(sb+84,11);put16(sb+88,128);

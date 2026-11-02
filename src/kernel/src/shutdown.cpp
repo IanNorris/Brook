@@ -10,9 +10,7 @@
 #include "memory/file_object.h"
 #include "ext2_vfs.h"
 #include "writable_desktop.h"
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 #include "ahci_system_volume.h"
-#endif
 #include "fw_cfg.h"
 #include "platform_power.h"
 #include "apic.h"
@@ -117,6 +115,7 @@ void Worker(void*) {
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
                 int error=VfsSync(nullptr);
+                if(!error)error=AhciSystemDirectFinalSync();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
                 if(!error)error=AhciSystemQemuLargeDataFinalSync();
 #endif

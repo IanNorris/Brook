@@ -10,7 +10,7 @@ bool terminalSleeps=false,lastRestart=false;
 brook::PlatformPowerPlan powerPlan;
 bool writebackStopped=false;
 int syncError=0;
-int finalError=0;unsigned finalCalls=0;
+int finalError=0,directFinalError=0;unsigned finalCalls=0,directFinalCalls=0;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 unsigned largeFinalCalls=0;
 #endif
@@ -49,6 +49,7 @@ void AudioStop(){}
 void AudioPrepareShutdown(){}
 void HdaRuntimeShutdown(){}
 int VfsSync(Vnode*){++syncs;return syncError;}
+int AhciSystemDirectFinalSync(){assert(writebackStopped && canFreeze && !syncError);++directFinalCalls;return directFinalError;}
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool SsdQemuInstallCloseReady(){return true;}
 int AhciSystemQemuLargeDataFinalSync(){assert(writebackStopped && canFreeze && !syncError);++largeFinalCalls;return 0;}
@@ -87,7 +88,7 @@ step();assert(!signals&&!syncs&&!gate);
     cleanup.liveUserAddressSpaces=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.liveUserAddressSpaces=0;cleanup.activeFinalizers=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.activeFinalizers=0;canFreeze=false;step();assert(freezes==1&&!syncs);
-    canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1 && !finalCalls);
+    canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1 && !finalCalls && !directFinalCalls);
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     assert(!largeFinalCalls); // failed global sync must not mark the large store clean
 #endif
@@ -129,6 +130,13 @@ step();assert(!signals&&!syncs&&!gate);
     for(unsigned i=0;i<10 && operations[current].phase!=Phase::Failed;++i)step();
     command(failedClean,"power_status","failed",-5);const auto calls=finalCalls;step();
     assert(finalCalls==calls && powerWrites==2); // no implicit clean-write retry or reset
+    current=-1;irreversible=false;finalError=0;directFinalError=-5;
+    const char* failedDirect="88888888888888888888888888888888";
+    const auto legacyBefore=finalCalls;
+    command(failedDirect,"restart","closing");ShutdownCompositorPoll();
+    for(unsigned i=0;i<10 && operations[current].phase!=Phase::Failed;++i)step();
+    command(failedDirect,"power_status","failed",-5);const auto directBefore=directFinalCalls;step();
+    assert(directFinalCalls==directBefore && finalCalls==legacyBefore && powerWrites==2);
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

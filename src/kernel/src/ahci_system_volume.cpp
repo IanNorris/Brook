@@ -1,15 +1,14 @@
 #include "ahci_system_volume.h"
 #include "ahci_boot_selector.h"
 #include "ahci_data_reader.h"
+#include "ahci_direct_layout.h"
 #include "ahci_readonly.h"
 #include "device.h"
 #include "fatfs_glue.h"
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 #include "ext2_vfs.h"
 #include "large_data_session.h"
 #include "serial.h"
 #include "writable_desktop.h"
-#endif
 #include "memory/heap.h"
 #include "mount_namespace.h"
 #include "vfs.h"
@@ -42,15 +41,18 @@ Device partition{reinterpret_cast<const DeviceOps*>(&ops),"ahci-system",DeviceTy
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 AhciDataInspection largeInspection{};bool largeInspectionClean=false;
 bool largeDesktopReady=false;
+#endif
+bool directPrepared=false,directLeased=false,directReady=false;
 uint8_t largeUuid[16]{};LargeDataSession largeSession{};
 Range largeRange{};
 int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
     if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
     return largeRange.parent->ops->read(largeRange.parent,largeRange.start+offset,data,length);
 }
-int LargeWrite(Device*,uint64_t offset,const void* data,uint64_t length) {
+int LargeWrite(Device* dev,uint64_t offset,const void* data,uint64_t length) {
     if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
-    return DeviceWrite(largeRange.parent,largeRange.start+offset,data,length);
+    return directLeased?DeviceWriteLeased(largeRange.parent,dev,largeRange.start+offset,data,length):
+        DeviceWrite(largeRange.parent,largeRange.start+offset,data,length);
 }
 int LargeControl(Device*,uint32_t request,void*) {
     if(!largeRange.parent)return -19;
@@ -66,7 +68,6 @@ WritableDesktopIo LargeIo() {return {&largePartition,
     [](void* p,uint64_t at,void* buf,uint32_t n)->int {auto* d=static_cast<Device*>(p);return d->ops->read(d,at,buf,n);},
     [](void* p,uint64_t at,const void* buf,uint32_t n)->int {return DeviceWrite(static_cast<Device*>(p),at,buf,n);},
     [](void* p)->int {return DeviceFlush(static_cast<Device*>(p));}};}
-#endif
 
 AhciSystemBoot Fail(const char* stage) {
     KPrintf("ahci system: %s failed; maintenance only\n",stage);
@@ -102,8 +103,34 @@ bool Select(Device* d,const AhciBootSelector& wanted,AhciBootSelection& selected
         AhciBootSelect(wanted,sectors,mbr,primary,backup,entries,copy,bytes,selected);
     if(entries)kfree(entries);if(copy)kfree(copy);return ok;
 }
+bool SelectDirect(Device* d,const AhciBootSelector& boot,AhciDirectLayout& selected) {
+    VnodeStat st{};
+    if(VfsLstatPath("/etc/ahci-data-volume",&st) || st.isDir || st.isSymlink || !st.size || st.size>160)return false;
+    auto* node=VfsOpen("/etc/ahci-data-volume",VFS_O_STREAM);if(!node)return false;
+    char record[160]{};uint64_t offset=0;
+    const bool read=VfsRead(node,record,st.size,&offset)==int(st.size);VfsRelease(node);
+    AhciDataSelector data{};if(!read || !AhciDataSelectorParse(record,uint32_t(st.size),data))return false;
+    const uint64_t sectors=DeviceBlockCount(d);
+    if(DeviceBlockSize(d)!=512 || sectors<68 || sectors>~uint64_t{0}/512)return false;
+    uint8_t mbr[512],primary[512],backup[512];
+    if(!ReadExact(d,0,mbr,512) || !ReadExact(d,1,primary,512) || !ReadExact(d,sectors-1,backup,512))return false;
+    StrictGptHeader a{},b{};
+    if(StrictGptCheckHeader(primary,512,sectors,false,a)!=StrictGptResult::Ok ||
+       StrictGptCheckHeader(backup,512,sectors,true,b)!=StrictGptResult::Ok ||
+       a.count!=b.count || a.entrySize!=b.entrySize)return false;
+    const uint32_t bytes=a.count*a.entrySize;
+    auto* entries=static_cast<uint8_t*>(kmalloc(bytes));auto* copy=static_cast<uint8_t*>(kmalloc(bytes));
+    const bool ok=entries && copy && ReadExact(d,a.entriesLba,entries,bytes) && ReadExact(d,b.entriesLba,copy,bytes) &&
+        AhciDirectLayoutSelect(boot,data,sectors,mbr,primary,backup,entries,copy,bytes,selected);
+    if(entries)kfree(entries);if(copy)kfree(copy);
+    if(ok)memcpy(largeUuid,data.filesystemUuid,sizeof(largeUuid));
+    return ok;
+}
 }
 
+bool AhciSystemDirectRequested() {
+    VnodeStat st{};return VfsLstatPath("/etc/ahci-data-volume",&st)!=-2;
+}
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(attempted)return Fail("repeated admission");attempted=true;
     VnodeStat st{};const int exists=VfsLstatPath("/etc/ahci-boot-volume",&st);
@@ -115,11 +142,26 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(!read || !AhciBootSelectorParse(bytes,uint32_t(st.size),wanted))return Fail("selector parse");
     if(!nextDrive || !TargetClear())return Fail("mount namespace");
     Device* disk=AhciWriteAdmittedDevice();if(!disk)return Fail("disk identity or writable state");
-    AhciBootSelection selected{};if(!Select(disk,wanted,selected))return Fail("GPT validation or selection");
+    const bool direct=AhciSystemDirectRequested();
+    AhciBootSelection selected{};AhciDirectLayout layout{};
+    if(direct) {
+        if(!SelectDirect(disk,wanted,layout))return Fail("direct GPT validation or selection");
+        selected=layout.esp;
+    } else if(!Select(disk,wanted,selected))return Fail("GPT validation or selection");
     if(DeviceFind(partition.name))return Fail("partition name already registered");
     if(selected.first>~uint64_t{0}/512 || selected.count>~uint64_t{0}/512)return Fail("partition range");
     range={disk,selected.first*512,selected.count*512};
     if(!DeviceRegister(&partition))return Fail("partition registration");
+    if(direct) {
+        largePartition.name="ahci-data";
+        if(DeviceFind(largePartition.name))return Fail("data partition name already registered");
+        largeRange={disk,layout.data.first*512,layout.data.count*512};
+        if(!DeviceRegister(&largePartition))return Fail("data partition registration");
+        BlockWriteLease leases[3]{};
+        if(!AhciDirectLayoutLeases(layout,reinterpret_cast<uintptr_t>(disk),reinterpret_cast<uintptr_t>(&largePartition),leases) ||
+           !DeviceInstallBootWriteLeases(leases,3))return Fail("direct disk ownership");
+        directLeased=true;directPrepared=true;
+    }
     if(!FatFsBindDrive(*nextDrive,&partition))return Fail("FAT binding");
     const uint8_t drive=(*nextDrive)++; // binding remains pinned on failure
     if(!VfsMountConfigured("/media/system","fatfs",drive,0))return Fail("FAT mount");
@@ -189,6 +231,39 @@ void AhciSystemDataInspect() {
         KPrintf("ahci data inspect: offline filesystem check required (read only)\n");
     else KPrintf("ahci data inspect: identity or format rejected (read only)\n");
 }
+bool AhciSystemDirectDesktopMount(uint8_t* nextDrive) {
+    if(!directPrepared || directReady || !nextDrive || !Ext2DriveAvailable(*nextDrive))return false;
+    directPrepared=false; // failed admission is not replayed during this boot
+    if(!WritableDesktopPrepareDirect())return false;
+    VnodeStat st{};if(VfsLstatPath("/nix",&st) || !st.isDir || st.isSymlink)return false;
+    constexpr uint32_t GdtCapacity=4096*32;
+    auto* gdt=static_cast<uint8_t*>(kmalloc(GdtCapacity));if(!gdt)return false;
+    const int begin=largeSession.Begin(LargeIo(),largeRange.bytes,largeUuid,gdt,GdtCapacity);
+    kfree(gdt);
+    if(begin) {KPrintf("ahci direct: filesystem admission failed error=%d; maintenance only\n",begin);return false;}
+    if(!Ext2BindDevice(*nextDrive,&largePartition))return false;
+    const uint8_t drive=(*nextDrive)++;
+    if(!VfsMountConfigured("/nix","ext2",drive,6)) {
+        VfsDrainMountCleanup();
+        if(VfsSync(nullptr) || VfsMountCleanupPending())KPrintf("ahci direct: backing cleanup pending; maintenance only\n");
+        return false;
+    }
+    if(!WritableDesktopPublishDirect()) {
+        if(!VfsUnmount("/nix"))KPrintf("ahci direct: unmount failed; maintenance only\n");
+        return false;
+    }
+    if(!largeSession.Arm())__builtin_trap();
+    directReady=true;WritableDesktopMarkDirectReady(drive,largeRange.bytes);
+    KPrintf("ahci direct: ready bytes=%lu drive=%u home=/data/home (persistent)\n",largeRange.bytes,drive);
+    return true;
+}
+int AhciSystemDirectFinalSync() {
+    if(!directReady)return 0;
+    const int error=largeSession.Finish(LargeIo(),DeviceFinalSyncOwner());
+    WritableDesktopDirectFinalResult(error,largeSession.cleanAttempted);
+    SerialPuts(error?"AHCI_DIRECT_SESSION_CLEAN_FAILED\n":"AHCI_DIRECT_SESSION_CLEAN\n");
+    return error;
+}
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool AhciSystemQemuLargeDesktopRequested() {
     VnodeStat st{};
@@ -206,7 +281,7 @@ bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
     const bool desktop=marker!=-2;
     if(desktop && (marker || st.isDir || st.isSymlink || !st.size || st.size>16))return false;
     const char* target=desktop?"/nix":"/mnt/ahcitest";
-    if(desktop && !WritableDesktopTestPrepareDirect())return false;
+    if(desktop && !WritableDesktopPrepareDirect())return false;
     if(VfsLstatPath(target,&st) || !st.isDir || st.isSymlink)return false;
     auto* ns=VfsMountNamespaceInitial();
     for(uint32_t i=0;i<VfsMountNamespaceCount(ns);++i) {
@@ -228,7 +303,7 @@ bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
             KPrintf("ahci direct test: backing cleanup pending; maintenance only\n");
         return false;
     }
-    if(desktop && !WritableDesktopTestPublishDirect()) {
+    if(desktop && !WritableDesktopPublishDirect()) {
         if(!VfsUnmount(target))KPrintf("ahci direct test: unmount failed; maintenance only\n");
         return false;
     }
@@ -238,6 +313,7 @@ bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
 }
 bool AhciSystemQemuLargeDesktopReady() {return largeDesktopReady;}
 int AhciSystemQemuLargeDataFinalSync() {
+    if(directReady)return 0; // production direct session was finalized above
     const bool armed=largeSession.armed;
     const int result=largeSession.Finish(LargeIo(),DeviceFinalSyncOwner());
     if(armed)SerialPuts(result?"AHCI_QEMU_LARGE_SESSION_CLEAN_FAILED\n":"AHCI_QEMU_LARGE_SESSION_CLEAN\n");

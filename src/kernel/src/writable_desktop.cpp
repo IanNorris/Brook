@@ -15,6 +15,7 @@ Device* image=nullptr;
 int finalError=0;
 bool finalClean=false,finalUncertain=false,attempted=false;
 bool fallbackAllowed=true;
+bool directStore=false;
 int Read(void* p,uint64_t off,void* data,uint32_t n){auto* d=static_cast<Device*>(p);return d->ops->read(d,off,data,n);}
 int Write(void* p,uint64_t off,const void* data,uint32_t n){return DeviceWrite(static_cast<Device*>(p),off,data,n);}
 int Flush(void* p){return DeviceFlush(static_cast<Device*>(p));}
@@ -86,15 +87,22 @@ void DestroyPrivate() {
     if(image && !FatImageDeviceDestroyUnregistered(image)){image=nullptr;info.pinned=false;}
 }
 }
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-bool WritableDesktopTestPrepareDirect() {return NamespaceClear() && !PrepareTarget();}
-bool WritableDesktopTestPublishDirect() {
+bool WritableDesktopPrepareDirect() {return NamespaceClear() && !PrepareTarget();}
+bool WritableDesktopPublishDirect() {
     if(!PayloadValid())return false;
     VfsPath root{};int error=VfsPathRoot(&root);
     if(!error)error=VfsMountNamespaceBindAt(VfsMountNamespaceInitial(),root,root,"/nix/home/brook","/data/home");
     VfsPathRelease(root);return !error;
 }
-#endif
+void WritableDesktopMarkDirectReady(uint8_t drive,uint64_t bytes) {
+    directStore=true;attempted=true;info.configured=true;info.ready=true;info.pinned=true;
+    info.dirty=true;info.drive=drive;info.bytes=bytes;info.stage="ready";
+}
+void WritableDesktopDirectFinalResult(int error,bool writeAttempted) {
+    __atomic_store_n(&finalError,error,__ATOMIC_RELEASE);
+    __atomic_store_n(&finalUncertain,bool(error && writeAttempted),__ATOMIC_RELEASE);
+    if(!error)__atomic_store_n(&finalClean,true,__ATOMIC_RELEASE);
+}
 WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive,WritableDesktopSource sourceVolume) {
     if(attempted)return info.ready?WritableDesktopBoot::Ready:WritableDesktopBoot::Maintenance;
     attempted=true;
@@ -173,6 +181,7 @@ WritableDesktopInfo WritableDesktopRead() {
 }
 int WritableDesktopFinalSync() {
     if(!info.ready)return 0;
+    if(directStore)return 0; // the direct partition owns its own final-sync session
     const int error=session.Finish(Io(),DeviceFinalSyncOwner());
     __atomic_store_n(&finalError,error,__ATOMIC_RELEASE);
     __atomic_store_n(&finalUncertain,bool(error && session.cleanAttempted),__ATOMIC_RELEASE);

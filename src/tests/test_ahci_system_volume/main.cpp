@@ -4,6 +4,7 @@
 #include "vfs.h"
 #include "mount_namespace.h"
 #include "strict_gpt_inventory.h"
+#include "block_write_leases.h"
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -16,9 +17,10 @@ std::string scenario,record="BRKESP1\n01000000000000000000000000000000\n02000000
 std::string dataRecord="BRKDATA1\n01000000000000000000000000000000\n03000000000000000000000000000000\n8192,2048\n04000000000000000000000000000000\n",lastLog;
 uint8_t mbr[512]{},primary[512]{},backup[512]{},entries[16384]{},copy[16384]{};
 uint8_t superblock[1024]{},gdt[32]{};
-Vnode config{},dataConfig{};Device* registered=nullptr;unsigned binds=0,mounts=0,reads=0,writes=0,allocations=0,frees=0,failAllocation=0;
+Vnode config{},dataConfig{};Device* registered=nullptr;Device* dataDevice=nullptr;unsigned binds=0,mounts=0,reads=0,writes=0,allocations=0,frees=0,failAllocation=0,leaseCalls=0;
 bool is(const char* s){return scenario==s;}
 bool probe(){return scenario.rfind("probe-",0)==0;}
+bool direct(){return scenario.rfind("direct-",0)==0;}
 void put16(uint8_t* p,uint16_t v){p[0]=uint8_t(v);p[1]=uint8_t(v>>8);}
 void put32(uint8_t* p,uint32_t v){for(int i=0;i<4;++i)p[i]=uint8_t(v>>(8*i));}
 void put64(uint8_t* p,uint64_t v){put32(p,uint32_t(v));put32(p+4,uint32_t(v>>32));}
@@ -41,11 +43,20 @@ namespace brook {
 extern "C" void* kmalloc(uint64_t n){++allocations;return is("alloc") || allocations==failAllocation?nullptr:std::malloc(n);}
 extern "C" void kfree(void* p){++frees;std::free(p);}
 Device* AhciWriteAdmittedDevice(){return is("no-disk")?nullptr:&disk;}
+bool DeviceInstallBootWriteLeases(const BlockWriteLease* leases,uint32_t n){
+    assert(direct() && n==3 && registered && dataDevice && !binds && !mounts);
+    assert(leases[0].start==0 && leases[0].length==34*512ULL && !leases[0].owner);
+    assert(leases[1].start==8192*512ULL && leases[1].length==2048*512ULL && leases[1].owner==reinterpret_cast<uintptr_t>(dataDevice));
+    assert(leases[2].start==99967*512ULL && leases[2].length==33*512ULL && !leases[2].owner);
+    ++leaseCalls;return !is("direct-lease-fail");}
+int DeviceWriteLeased(Device*,Device*,uint64_t,const void*,uint64_t){return -30;}
 extern "C" int VfsLstatPath(const char* path,VnodeStat* out){*out={};
+    if(!std::strcmp(path,"/etc/ahci-data-volume")){if(!direct())return -2;out->size=dataRecord.size();return 0;}
     if(!std::strcmp(path,"/etc/ahci-data-inspect")){if(!probe() || is("probe-absent"))return -2;out->size=dataRecord.size();out->isSymlink=is("probe-link");return 0;}
     if(!std::strcmp(path,"/etc/ahci-boot-volume")){if(is("absent"))return -2;if(is("stat-error"))return -5;out->size=record.size();out->isSymlink=is("link");return 0;}
     assert(!std::strcmp(path,"/media/system"));if(is("missing-dir"))return -2;out->isDir=true;out->isSymlink=is("system-link");return 0;}
 extern "C" Vnode* VfsOpen(const char* path,int flags){assert(flags==VFS_O_STREAM);
+    if(!std::strcmp(path,"/etc/ahci-data-volume"))return &dataConfig;
     if(!std::strcmp(path,"/etc/ahci-data-inspect"))return is("probe-open")?nullptr:&dataConfig;
     assert(!std::strcmp(path,"/etc/ahci-boot-volume"));return is("open")?nullptr:&config;}
 extern "C" int VfsRead(Vnode* n,void* out,uint64_t size,uint64_t* offset){assert((n==&config || n==&dataConfig) && !*offset);if(is("selector-short"))return 0;
@@ -54,8 +65,8 @@ void VfsRelease(Vnode* n){assert(n==&config || n==&dataConfig);}
 MountNamespace* VfsMountNamespaceInitial(){return reinterpret_cast<MountNamespace*>(1);}
 uint32_t VfsMountNamespaceCount(MountNamespace*){return is("occupied")?1:0;}
 VfsMountSnapshot VfsMountNamespaceSnapshotAt(MountNamespace*,uint32_t){VfsMountSnapshot s{};s.used=true;std::strcpy(s.mountPoint,"/MEDIA/SYSTEM/child");return s;}
-extern "C" Device* DeviceFind(const char* name){assert(!std::strcmp(name,"ahci-system"));return is("duplicate")?&disk:nullptr;}
-extern "C" bool DeviceRegister(Device* d){if(is("register"))return false;registered=d;return true;}
+extern "C" Device* DeviceFind(const char* name){if(!std::strcmp(name,"ahci-data"))return nullptr;assert(!std::strcmp(name,"ahci-system"));return is("duplicate")?&disk:nullptr;}
+extern "C" bool DeviceRegister(Device* d){if(is("register"))return false;if(!registered)registered=d;else dataDevice=d;return true;}
 extern "C" int DeviceWrite(Device* d,uint64_t off,const void* p,uint64_t n){return d->ops->write(d,off,p,n);}
 extern "C" int DeviceFlush(Device* d){return d->ops->ioctl(d,DEVICE_IOCTL_FLUSH,nullptr);}
 bool FatFsBindDrive(uint8_t drive,Device* d){assert(drive==1 && d==registered);++binds;return !is("bind");}
@@ -66,7 +77,7 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
     mbr[510]=0x55;mbr[511]=0xaa;mbr[450]=0xee;put32(mbr+454,1);put32(mbr+458,99999);
     const uint8_t esp[16]={0x28,0x73,0x2a,0xc1,0x1f,0xf8,0xd2,0x11,0xba,0x4b,0,0xa0,0xc9,0x3e,0xc9,0x3b};
     std::memcpy(entries,esp,16);entries[16]=2;put64(entries+32,2048);put64(entries+40,4095);
-    if(probe()){
+    if(probe() || direct()){
         const uint8_t linuxFs[16]={0xaf,0x3d,0xc6,0x0f,0x83,0x84,0x72,0x47,0x8e,0x79,0x3d,0x69,0xd8,0x47,0x7d,0xe4};
         std::memcpy(entries+128,linuxFs,16);entries[144]=3;put64(entries+160,8192);put64(entries+168,10239);
         put32(superblock,1024);put32(superblock+4,256);put32(superblock+12,200);put32(superblock+16,1000);
@@ -74,12 +85,19 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
         put16(superblock+56,0xef53);put16(superblock+58,is("probe-dirty")?0:1);put32(superblock+76,1);put32(superblock+84,11);
         put16(superblock+88,128);put32(superblock+96,2);put32(superblock+100,3);superblock[104]=4;
         put32(gdt,2);put32(gdt+4,3);put32(gdt+8,4);
-        if(is("probe-malformed"))dataRecord[0]='X';
+        if(is("probe-malformed") || is("direct-malformed"))dataRecord[0]='X';
     }
     std::memcpy(copy,entries,sizeof(entries));
     const auto crc=StrictCrc32(entries,sizeof(entries));hdr(primary,false,crc);hdr(backup,true,crc);
-    if(is("bad-gpt"))backup[0]=0;if(is("wrong-guid"))record[8]='f';if(is("bad-record"))record[0]='x';
+    if(is("bad-gpt") || is("direct-bad-gpt"))backup[0]=0;
+    if(is("wrong-guid") || is("direct-wrong-guid"))record[8]='f';if(is("bad-record"))record[0]='x';
     uint8_t next=1;const auto result=AhciSystemVolumeMount(&next);
+    if(direct()) {
+        if(is("direct-ready"))assert(result==AhciSystemBoot::Ready && registered && dataDevice && leaseCalls==1 && binds==1 && mounts==1 && next==2 && !writes);
+        else if(is("direct-lease-fail"))assert(result==AhciSystemBoot::Maintenance && registered && dataDevice && leaseCalls==1 && !binds && !mounts && !writes);
+        else assert(result==AhciSystemBoot::Maintenance && !leaseCalls && !binds && !mounts && !writes);
+        return 0;
+    }
     if(probe()){
         assert(result==AhciSystemBoot::Ready && registered && binds==1 && mounts==1 && next==2 && !writes);
         const unsigned before=reads, freesBefore=frees;

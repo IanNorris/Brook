@@ -898,20 +898,24 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
+    const bool productionDirectRequested=brook::AhciSystemDirectRequested();
+    bool productionDirectReady=false;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     const bool directDesktopRequested=brook::AhciSystemQemuLargeDesktopRequested();
 #endif
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
     if(systemVolume==brook::AhciSystemBoot::Ready) {
-        brook::AhciSystemDataInspect();
+        if(productionDirectRequested)productionDirectReady=brook::AhciSystemDirectDesktopMount(&nextPdrv);
+        else brook::AhciSystemDataInspect();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-        if(brook::AhciDisposableLargeDataWritable()) {
+        if(!productionDirectRequested && brook::AhciDisposableLargeDataWritable()) {
             if(brook::AhciSystemQemuLargeDataMount(&nextPdrv))brook::SerialPuts("AHCI_QEMU_LARGE_EXT2_MOUNTED\n");
             else brook::SerialPuts("AHCI_QEMU_LARGE_EXT2_NOT_MOUNTED\n");
         }
 #endif
     }
     const auto writableDesktop=
+        productionDirectRequested?(productionDirectReady?brook::WritableDesktopBoot::Ready:brook::WritableDesktopBoot::Maintenance):
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
         directDesktopRequested?(brook::AhciSystemQemuLargeDesktopReady()?brook::WritableDesktopBoot::Ready:brook::WritableDesktopBoot::Maintenance):
 #endif
