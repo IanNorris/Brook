@@ -45,6 +45,13 @@ def main():
         assert result['state'] == 'selected_and_verified' and (u / 'SELECT0.BIN').read_bytes() == old
         assert all(digest(u / 'A' / name) == value for name, value in before.items())
         assert verify_pair(u, (u / 'SELECT1.BIN').read_bytes(), a.validator.resolve())[:2] == (24, 1)
+        before = {name: digest(u / 'B' / name) for name in ('KERNEL.ELF', 'INITRD.IMG')}
+        active = (u / 'SELECT1.BIN').read_bytes()
+        result = stage(root, a.payload, a.output / 'backup-reversed', 24, a.validator.resolve())
+        assert result['state'] == 'selected_and_verified' and result['new_slot'] == 0
+        assert (u / 'SELECT1.BIN').read_bytes() == active
+        assert all(digest(u / 'B' / name) == value for name, value in before.items())
+        assert verify_pair(u, (u / 'SELECT0.BIN').read_bytes(), a.validator.resolve())[:2] == (25, 0)
         bad = Path(tmp) / 'bad'; bad.mkdir(); u = fixture(bad, kernel, initrd, malformed=True)
         before = digest(u / 'B/KERNEL.ELF')
         try:

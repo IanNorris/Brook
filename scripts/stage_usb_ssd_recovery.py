@@ -95,7 +95,10 @@ def stage(mount, payload, backup, expected_generation, validator):
     updates = mount / 'UPDATES'
     records = [readfile(updates / f'SELECT{i}.BIN', 128) for i in range(2)]
     pairs = [verify_pair(updates, r, validator) for r in records]
-    if pairs[0][:2] != (expected_generation, 0) or pairs[1][:2] != (expected_generation - 1, 1):
+    active = 0 if pairs[0][0] > pairs[1][0] else 1
+    inactive = 1 - active
+    if (pairs[active][:2] != (expected_generation, active) or
+            pairs[inactive][:2] != (expected_generation - 1, inactive)):
         raise ValueError('unexpected USB slot generations; inspect before staging')
     kernel = readfile(payload / 'kernel.elf'); initrd = readfile(payload / 'INITRD.IMG')
     manifest = json.loads(readfile(payload / 'manifest.json'))
@@ -108,10 +111,10 @@ def stage(mount, payload, backup, expected_generation, validator):
     # Backup must survive removal/failure of the USB volume.
     if os.stat(backup.parent).st_dev == os.stat(mount).st_dev:
         raise ValueError('backup destination must be on a different filesystem')
-    new_record = record(expected_generation + 1, 1, kernel, initrd)
+    new_record = record(expected_generation + 1, inactive, kernel, initrd)
     backup.mkdir(parents=True, exist_ok=False, mode=0o700)
     saved = {'SELECT0.BIN': records[0], 'SELECT1.BIN': records[1],
-             'KERNEL-B.ELF': pairs[1][2], 'INITRD-B.IMG': pairs[1][3]}
+             'KERNEL-INACTIVE.ELF': pairs[inactive][2], 'INITRD-INACTIVE.IMG': pairs[inactive][3]}
     for name, data in saved.items():
         with (backup / name).open('xb') as f:
             f.write(data); f.flush(); os.fsync(f.fileno())
@@ -119,7 +122,8 @@ def stage(mount, payload, backup, expected_generation, validator):
             raise OSError('backup readback mismatch')
     sync_dir(backup); sync_dir(backup.parent)
     receipt = {'state': 'backup_verified', 'current_generation': expected_generation,
-               'new_generation': expected_generation + 1, 'payload_id': manifest['payload_id']}
+               'new_generation': expected_generation + 1, 'active_slot': active,
+               'new_slot': inactive, 'payload_id': manifest['payload_id']}
     def save():
         tmp = backup / 'receipt.tmp'
         with tmp.open('w') as f:
@@ -128,12 +132,13 @@ def stage(mount, payload, backup, expected_generation, validator):
     save()
     try:
         receipt['state'] = 'slot_write_started'; save()
-        overwrite(updates / 'B/KERNEL.ELF', kernel, KERNEL_MAX)
-        overwrite(updates / 'B/INITRD.IMG', initrd, INITRD_MAX)
+        inactive_dir = updates / ('A' if inactive == 0 else 'B')
+        overwrite(inactive_dir / 'KERNEL.ELF', kernel, KERNEL_MAX)
+        overwrite(inactive_dir / 'INITRD.IMG', initrd, INITRD_MAX)
         receipt['state'] = 'slot_verified'; save()
-        overwrite(updates / 'SELECT1.BIN', new_record, 128)
+        overwrite(updates / f'SELECT{inactive}.BIN', new_record, 128)
         sync_dir(updates)
-        if readfile(updates / 'SELECT0.BIN', 128) != records[0]:
+        if readfile(updates / f'SELECT{active}.BIN', 128) != records[active]:
             raise OSError('current selection record unexpectedly changed')
         verify_pair(updates, new_record, validator)
         receipt['state'] = 'selected_and_verified'; save()
