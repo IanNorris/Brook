@@ -1847,6 +1847,13 @@ prototype is not registered with the mixer or connected to real hardware;
 its prefetch guard, service timing, owner locking and physical stop/retirement
 still require validation. No host simulation can undo a fetch that occurred
 before an overrun was detected.
+The injected controller owner now composes that queue with a 16-page, 64 KiB
+BDL, verified codec format and route, publish-before-bus-master ordering, and
+muted STOP/reset/retirement. Host controller tests exercise repeated wraps,
+failed STOP, partial pin restore, descriptor retirement and PCI restoration;
+uncertain teardown keeps the pages and attempts to remute. These tests use a
+fake platform: physical controller ownership and application audio remain
+unconnected and unverified.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

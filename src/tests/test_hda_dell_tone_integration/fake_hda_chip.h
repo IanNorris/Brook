@@ -5,7 +5,7 @@
 using namespace brook;
 struct Chip {
     uint8_t mem[4096]{};uint8_t pin[2]{0,0},dac[2]{127,127},mix[2]{0,0},selection=0,converter=0;
-    uint16_t format=0x4011,runConverterFormat=0,runStreamFormat=0;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;unsigned statusReads=0,failStatusAfter=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false,reportEndpoint=false,sawEndpoint=false;
+    uint16_t format=0x4011,runConverterFormat=0,runStreamFormat=0;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;unsigned statusReads=0,failStatusAfter=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false,reportEndpoint=false,sawEndpoint=false,dropPinRestoreRight=false;
     static constexpr uint32_t base=0x100;
     uint8_t* amp(unsigned node,bool output){if(node==0x14 && output)return pin;if(node==3 && output)return dac;if(node==0x0d && !output)return mix;assert(false);return nullptr;}
     void execute(){
@@ -22,7 +22,10 @@ struct Chip {
         if(shortVerb==3){const bool output=payload&0x8000,left=payload&0x2000,right=payload&0x1000;assert(left!=right);
             if(n!=0x14)assert(pin[0]==0x80 && pin[1]==0x80);
             if(n==0x14 && uint8_t(payload)==0 && (read16(base)&2)){assert(dac[0]<=80 && dac[1]<=80);sawQuietUnmute=true;}
-            amp(n,output)[left?0:1]=uint8_t(payload);response=0;}
+            if(!(dropPinRestoreRight && n==0x14 && output && right && uint8_t(payload)==0 && !(read16(base)&2) && converter==0 && pin[0]==0)) {
+                amp(n,output)[left?0:1]=uint8_t(payload);
+            }
+            response=0;}
         else if(shortVerb==0xb){const bool output=payload&0x8000,left=payload&0x2000;response=amp(n,output)[left?0:1];}
         else if(shortVerb==2){assert(n==3);format=uint16_t(payload);response=0;}
         else if(shortVerb==0xa){assert(n==3);response=corruptNewFormat && format==0x11?0x10:format;}
