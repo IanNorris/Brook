@@ -1854,6 +1854,14 @@ failed STOP, partial pin restore, descriptor retirement and PCI restoration;
 uncertain teardown keeps the pages and attempts to remute. These tests use a
 fake platform: physical controller ownership and application audio remain
 unconnected and unverified.
+Brook's native audio clock currently uses KVM pvclock and returns unavailable
+on the Dell; delivered LAPIC interrupts are not a trustworthy elapsed-time
+bound. The HDA wall clock is useful for comparison but wraps in about 179 s,
+so a missed interval of a whole wrap cannot be detected from it alone. A
+host-tested invariant-TSC admission, multi-window PIT calibration policy and
+bounded channel-2 acquisition are being prepared. They are not wired into the
+kernel clock: PIT ownership, real calibration uncertainty, cross-CPU TSC offsets,
+suspend behavior and physical validation remain required.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

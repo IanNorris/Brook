@@ -730,6 +730,8 @@ add_host_test(test_cpu_memory_type)
 add_host_test(test_cpu_execute_disable)
 target_compile_options(test_cpu_execute_disable PRIVATE -UNDEBUG)
 add_host_test(test_vmware_clock)
+add_host_test(test_native_tsc_policy)
+add_host_test(test_native_tsc_pit)
 target_compile_options(test_vmware_clock PRIVATE -UNDEBUG)
 
 add_host_test(test_gpu_aperture)
