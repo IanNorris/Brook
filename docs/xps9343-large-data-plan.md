@@ -53,3 +53,12 @@ prove the present GPT layout or free space.
 Steam's signed-in images and proprietary game assets stay private and are not
 part of Git or a public distribution. Check space and migration behavior before
 copying them; current live `/nix` had roughly 507 MiB free during the review.
+
+An unconnected geometry helper now calculates bounded group counts, descriptor
+table blocks and sparse-super backup reservations for the proposed 4 KiB ext2
+format. Host tests exercise the single-to-multiple descriptor-block boundary,
+partial groups, forged geometry and the configured group limit. A read-only
+check against a 17 GiB sparse `mke2fs` fixture with a two-block descriptor table
+passed, as did `e2fsck -fn`. This establishes geometry only: the helper is not
+wired into boot or a complete bitmap/inode-table validator, and has not been
+tested on the Dell.
