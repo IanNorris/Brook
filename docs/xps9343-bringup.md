@@ -2900,3 +2900,19 @@ live job tasks or mixer streams. The temporary profile was removed and
 recovery generation 106 selected. This demonstrates a warm-start path; it does
 not prove why the earlier cold graph remained suspended, establish acoustic
 quality, or establish behavior across repeated launches.
+
+The existing opt-in ALSA downstream-staging module was rebuilt with its package
+checks and transferred only to RAM. On the same muted Dell boot, a short
+unprivileged 48 kHz ALSA probe negotiated 4,096 staging frames and drained
+384,000 client frames successfully. One fresh-profile Firefox run using the
+default module and staging off was then followed by one using that optional
+module and staging on, both playing the same generated local WAV. Mixer
+snapshots showed respective 4,416/64/0 and 4,416/64/4,096
+capacity/fragment/staging frame geometry; completed counts across roughly
+14-second host-time brackets advanced at about 44,094 frames/s in both runs.
+Both Firefox logs reported one 4,410-frame loss at startup. Both windows closed
+with exit zero, no remaining mixer streams and no driver quarantine; final
+hardware retirement succeeded. Staging was switched off afterward, and
+recovery generation 108 was selected. These sequential single samples are
+not a randomized comparison or an audible continuity test; they do not show
+that staging fixes the startup loss or justify changing the installed defaults.
