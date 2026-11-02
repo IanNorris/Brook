@@ -545,3 +545,32 @@ bridge/job activity and count observations rather than elapsed time. These
 sequential runs are not randomized and do not establish fairness or general
 loss behavior. The Dell was left on the opt-in generation 37 sixteen-slot
 candidate; its separately verified recovery payload remains in slot B.
+
+## Write-size comparison
+
+On a later muted boot using the same 16-slot, RX-8/TX-16, 1,200-byte egress
+configuration, a static guest sender transferred the same deterministic 4 MiB
+to a host LAN sink using four requested `send()` sizes. The 12 runs were
+interleaved across sizes; each received exactly 4 MiB with the expected SHA-256,
+and the sender reported no partial writes:
+
+| Send size | Host receipt time, seconds (three runs) |
+| --- | --- |
+| 4 KiB | 1.024, 1.025, 1.022 |
+| 16 KiB | 0.258, 0.279, 0.271 |
+| 64 KiB | 0.284, 0.267, 0.276 |
+| 256 KiB | 0.245, 0.244, 0.246 |
+
+The sink measures from its ready byte to the final payload byte, excluding the
+end marker, acknowledgement and job setup; this is not a wire-only metric.
+Each 4 KiB run had 1,089–1,092 additional call-drain wait observations, versus
+339–351 at 16 KiB and 73–74 at 256 KiB. Those counters include incidental
+bridge traffic and count observations, not elapsed time. There were no new
+recorded retries or RX drops, but 64 and 256 KiB runs had one to three
+additional TX-busy events each. This supports a local write-boundary effect;
+it does not quantify WAN performance, ACK-delay effects, loss behavior, or
+fairness. `scripts/workloads/tcp_send_chunks.c` and `tcp_chunk_sink.py` are
+the bounded reproducible test pair. A first probe delivered a hash-matching
+payload but could not complete because TCP `shutdown(SHUT_WR)` is unsupported;
+the successful runs use an explicit end marker instead. No TCP semantics were
+changed by the measurement. Recovery generation 104 was selected afterward.
