@@ -661,6 +661,12 @@ lifetime or network behavior under arbitrary loss. Astra reviewed the diff and
 found no blocking defect; descriptor scanning is linear per staged MSS and
 may warrant profiling with unusually large vector counts.
 
+The QEMU guest syscall test additionally places a valid prefix and a faulting
+second vector within the first MSS. Both sender modes returned `EFAULT`
+without transmitting the prefix; the server's subsequent exact-byte check
+passed. An equivalent Linux loopback TCP check also returned `EFAULT`. This
+complements the separate test of a later fault after an acknowledged MSS.
+
 The comparison uses `tcp_send_chunks.c` with `4096 writev 4` or
 `4096 sendmsg 4`; its existing single-send mode remains available. The host
 loopback smoke check also passed all three modes with matching hashes.

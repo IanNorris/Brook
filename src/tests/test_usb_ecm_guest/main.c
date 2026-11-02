@@ -64,6 +64,8 @@ int main(int argc,char** argv){
         if(send(tcp,pages+4093,6,0)!=-1 || errno!=EFAULT)return fail("cross-page send fault");
         memset(pages+4096-1200,'X',1200);
         if(send(tcp,pages+4096-1200,1201,0)!=1200)return fail("partial user send fault");
+        struct iovec firstFault[2]={{pages+4096-300,300},{pages+4096,1}};
+        errno=0;if(writev(tcp,firstFault,2)!=-1 || errno!=EFAULT)return fail("cross-vector first packet fault");
         memset(pages+4096-1200,'V',1200);
         struct iovec faultVector[3]={{(void*)-1,0},{pages+4096-1200,1200},{pages+4096,1}};
         if(writev(tcp,faultVector,3)!=1200)return fail("partial vectored send fault");
