@@ -616,6 +616,20 @@ this is approximately a fourfold improvement for this specific local
 four-vector workload, not a general browser or WAN claim. The recovery
 generation 116 was selected after the comparison.
 
+As a workload check, the exact Nix curl executable installed on the Dell
+(`curl 8.19.0`, OpenSSL 3.6.1) was run under Linux `strace` for one 1 MiB
+generated-data HTTPS upload to the same Cloudflare endpoint. The upload
+returned HTTP 200. Of 75 observed `sendto` calls, 73 used fd 5 and returned
+a total of about 1.05 MB; 63 returned 16,406 bytes. The trace contained no
+`writev` or `sendmsg` calls.
+These are encrypted TLS record sizes, not plaintext write sizes. This Linux
+reference suggests that the `writev` improvement alone may not help this
+particular curl upload. It does not establish the syscalls issued by curl on
+Brook, whose runtime and networking differ. The earlier Brook sender probe
+observed many calls larger than eight MSS, but did not attribute them to
+particular syscalls or processes. A clock-independent, process-scoped census
+would be needed to verify the guest path without relying on physical serial.
+
 Hosted tests exercised cross-vector copying, zero-length entries, address
 overflow, and faults before and after a completed MSS in both sender modes.
 The QEMU USB Ethernet suite passed for the default sender and for the 16-slot
