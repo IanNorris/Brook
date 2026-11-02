@@ -110,7 +110,7 @@ int main() {
     // disabling the interface. Repeated sends cannot touch the pending frame.
     initialize();mode=NoCompletion;
     uint8_t pendingPayload[256];memset(pendingPayload,1,sizeof(pendingPayload));expectedId=1;
-    CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+    CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
     CHECK(g_txPending && !g_txFaulted);
     uint8_t pendingSnapshot[RX_BUF_SIZE];memcpy(pendingSnapshot,dma,sizeof(dma));
     memset(pendingPayload,2,sizeof(pendingPayload));
@@ -125,7 +125,7 @@ int main() {
     for(Mode failure:{BadId,BadAdvance}) {
         initialize();mode=NoCompletion;expectedId=1;
         memset(pendingPayload,1,sizeof(pendingPayload));
-        CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+        CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
         completions[0].id=failure==BadId?1:0;used=failure==BadAdvance?2:1;
         CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-1);
         CHECK(g_txFaulted && notifications==1);

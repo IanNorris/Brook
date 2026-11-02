@@ -405,10 +405,11 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
     while (*g_txq.usedIdx == g_txq.usedIdxShadow) {
         __asm__ volatile("pause");
         if (++spins > waitBudget) {
-            // A bounded wait is not proof of device failure. Leave the DMA
-            // buffer pending, and let the next send check for late completion.
+            // The descriptor was already published: the frame was accepted
+            // even though its completion is late. Retain DMA ownership and
+            // let the next send check completion before reusing the buffer.
             SerialPuts("virtio_net: TX wait expired; completion pending\n");
-            return -11;
+            return 0;
         }
     }
     return ReapTxCompletion();

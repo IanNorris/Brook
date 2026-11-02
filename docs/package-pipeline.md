@@ -58,9 +58,12 @@ wakes the poll thread, and TX callers run in process or early-boot context.
 Adding an IRQ-context TX caller would require rechecking this contract.
 
 An invalid completion ID/index advance quarantines the queue: shared DMA
-storage remains untouched and later sends fail. A polling timeout instead
-keeps descriptor zero pending and returns EAGAIN. Subsequent sends first check
-for its valid completion, without modifying or republishing the pending frame.
+storage remains untouched and later sends fail. If polling times out after a
+descriptor has been published, the driver reports local acceptance and keeps
+descriptor zero pending. Subsequent sends first check for its valid completion
+and return EAGAIN if it is still pending, without modifying or republishing
+the pending frame. Reporting EAGAIN for the original published frame would
+incorrectly imply that TCP may retry it as unsubmitted.
 Only after that completion can a new frame reuse the DMA storage. Driver reset
 for a permanently unresponsive or corrupt device remains unimplemented.
 Releasing the software lock is not evidence that the device released a timed-out
@@ -76,6 +79,15 @@ restoring it passes. The host fixture uses a shorter spin budget to exercise
 timeout ownership, not to establish real-device timeout latency. All 39 hosted
 suites, the supported compiled entry audit and nine bootstrap observer tests
 pass. This does not validate a physical NIC or add IRQ-context TX support.
+
+The accepted-on-publication fix was checked in the actual-driver host fixture
+with delayed completion, repeated busy returns, late completion, corrupt
+completion, concurrent producers and ring wrap. A disposable QEMU guest also
+transferred a checksum-verified 4 MiB through virtio-net with the changed
+driver. The QEMU run did not deliberately delay a device completion or prove
+the ACK-before-completion race; the host fixture tests the driver ownership
+side of that condition. The polling wait remains and this change does not make
+virtio transmission a nonblocking shared-worker operation.
 
 ## Reproduction and evidence
 
