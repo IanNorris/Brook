@@ -26,6 +26,16 @@ wait while serving other sockets. Timeout, reset, close, and slot reuse need
 explicit tests, and the existing unsupported Internet `shutdown` semantics
 remain unchanged until queue draining and half-close are implemented together.
 
+`TcpSendQueue` provides the bounded byte-storage primitive for that work. It
+distinguishes published bytes from the portion copied into flight storage and
+only frees a newly acknowledged prefix. The caller must serialize it, publish
+flight and TCP sequence reservations together, and validate ACKs against
+submitted bytes; the queue alone does not track submissions, errors, workers,
+or socket lifetime. Copies into and out of the ring must not overlap it.
+Capacity-one, wrap, partial retirement, backpressure and 100,000 randomized
+operations against a reference FIFO pass in the host tests. This primitive is
+not yet attached to socket writes and does not change throughput.
+
 The existing flight step is now a separate pump with explicit retained state;
 the caller supplies the observation time and deadline. Its step does not own
 a syscall process or user buffer. A `WaitLocked` result transfers the socket
