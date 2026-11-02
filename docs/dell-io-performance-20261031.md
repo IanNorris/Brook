@@ -604,6 +604,18 @@ but also used a different kernel and call shape. Real application impact,
 WAN behavior and fairness remain unmeasured. Generation 114 recovery was
 selected after the test; the physical speaker output was disabled throughout.
 
+A subsequent control boot used the previous kernel with the exact same
+initrd, benchmark binary and adaptive 16-slot settings as the candidate.
+In three interleaved runs each, control `writev` took 1.025, 1.025 and
+1.018 seconds, while control `sendmsg` took 0.258, 0.260 and 0.257 seconds.
+The candidate's earlier matched `writev` runs were 0.258, 0.257 and 0.259
+seconds, and its `sendmsg` runs were 0.265, 0.280 and 0.261 seconds. All
+transfers delivered 4 MiB with matching hashes and no partial returns. The
+candidate and control were run in separate, sequential boots, not randomized;
+this is approximately a fourfold improvement for this specific local
+four-vector workload, not a general browser or WAN claim. The recovery
+generation 116 was selected after the comparison.
+
 Hosted tests exercised cross-vector copying, zero-length entries, address
 overflow, and faults before and after a completed MSS in both sender modes.
 The QEMU USB Ethernet suite passed for the default sender and for the 16-slot
