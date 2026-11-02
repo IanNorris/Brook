@@ -24,7 +24,7 @@ struct Fake {
     bool disconnectAndVerify(const HdaDellTonePlan&){return step('D');}
     bool restoreAndVerify(const HdaDellTonePlan&,const HdaSessionReport&){return step('R');}
     void quarantine(){events+='Q';quarantined=true;}
-    void releaseStoppedDma(){assert(!dmaActive && !quarantined);events+='F';}
+    bool releaseStoppedDma(){assert(!dmaActive && !quarantined);return step('F');}
 };
 int main(){
     auto s=snapshot();
@@ -42,4 +42,5 @@ int main(){
     {Fake f;f.failCleanupMute=true;assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::CleanupFailed && f.events=="MCPSGUTMXQ");}
     {Fake f;f.fail='D';assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::CleanupFailed && f.events=="MCPSGUTMXDMQ");}
     {Fake f;f.fail='R';assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::CleanupFailed && f.events=="MCPSGUTMXDRMQ");}
+    {Fake f;f.fail='F';assert(HdaDellToneTransaction(f,s,true)==HdaToneResult::CleanupFailed && f.events=="MCPSGUTMXDRFMQ");}
 }

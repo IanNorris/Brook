@@ -40,6 +40,7 @@ template<class Io> HdaToneResult HdaDellToneTransaction(Io& io,const HdaSessionR
     if(!io.disconnectAndVerify(plan) || !io.restoreAndVerify(plan,snapshot)) {
         io.muteAndVerify(plan);io.quarantine();return HdaToneResult::CleanupFailed;
     }
-    io.releaseStoppedDma();return HdaToneResult::Complete;
+    if(!io.releaseStoppedDma()){io.muteAndVerify(plan);io.quarantine();return HdaToneResult::CleanupFailed;}
+    return HdaToneResult::Complete;
 }
 }

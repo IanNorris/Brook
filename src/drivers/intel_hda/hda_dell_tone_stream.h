@@ -4,9 +4,10 @@
 namespace brook {
 // Polling-only HDA output stream control. Io supplies bounded register
 // accesses to the already-owned controller, a monotonic millisecond clock and
-// a bounded delayUs() that waits at least the requested microseconds.
+// a bounded delayUs() that returns false unless it waited at least the requested
+// microseconds; a stalled or unavailable clock must never be treated as success.
 // No PCI, codec, DMA allocation or memory freeing is performed here.
-enum class HdaToneStreamState : uint8_t {Idle,Prepared,Running,Unknown};
+enum class HdaToneStreamState : uint8_t {Idle,Prepared,Running,Stopped,Unknown};
 template<class Io> class HdaDellToneStream {
     Io& io_;uint32_t base_=0;HdaToneStreamState state_=HdaToneStreamState::Idle;
     bool waitControl(uint16_t mask,uint16_t value) {
@@ -28,8 +29,8 @@ public:
         base_=0x80+input*0x20;
         // Require an idle descriptor without interrupt enables or a tag.
         if(io_.read16(base_)!=0 || io_.read8(base_+2)!=0)return false;
-        io_.write16(base_,1);io_.delayUs(3);if(!waitControl(1,1)){state_=HdaToneStreamState::Unknown;return false;}
-        io_.write16(base_,0);io_.delayUs(3);if(!waitControl(1,0)){state_=HdaToneStreamState::Unknown;return false;}
+        io_.write16(base_,1);if(!io_.delayUs(3) || !waitControl(1,1)){state_=HdaToneStreamState::Unknown;return false;}
+        io_.write16(base_,0);if(!io_.delayUs(3) || !waitControl(1,0)){state_=HdaToneStreamState::Unknown;return false;}
         io_.write8(base_+3,0x1c); // clear only W1C status bits
         io_.write16(base_+0x12,0x11); // 48 kHz, 16-bit stereo
         io_.write32(base_+0x18,uint32_t(bdlPhysical));
@@ -69,6 +70,19 @@ public:
            state_!=HdaToneStreamState::Prepared)return false;
         state_=HdaToneStreamState::Unknown;io_.write16(base_,0);
         if(!waitControl(3,0))return false;
+        state_=HdaToneStreamState::Stopped;return true;
+    }
+    // RUN-clear alone does not retire the controller's descriptor references.
+    // Call only with exclusive ownership, before releasing any DMA pages.
+    bool retire() {
+        if(state_!=HdaToneStreamState::Stopped)return false;
+        if(io_.read16(base_)&3){state_=HdaToneStreamState::Unknown;return false;}
+        io_.write8(base_+2,0);io_.write32(base_+0x18,0);io_.write32(base_+0x1c,0);
+        io_.write32(base_+0x08,0);io_.write16(base_+0x0c,0);
+        if((io_.read16(base_)&3) || io_.read8(base_+2)!=0 || io_.read32(base_+0x18)!=0 ||
+           io_.read32(base_+0x1c)!=0 || io_.read32(base_+0x08)!=0 || io_.read16(base_+0x0c)!=0) {
+            state_=HdaToneStreamState::Unknown;return false;
+        }
         state_=HdaToneStreamState::Idle;return true;
     }
 };
