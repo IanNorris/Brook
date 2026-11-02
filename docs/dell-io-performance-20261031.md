@@ -574,3 +574,22 @@ the bounded reproducible test pair. A first probe delivered a hash-matching
 payload but could not complete because TCP `shutdown(SHUT_WR)` is unsupported;
 the successful runs use an explicit end marker instead. No TCP semantics were
 changed by the measurement. Recovery generation 104 was selected afterward.
+
+## Vectored-write comparison on the recovery kernel
+
+On the later generation 112 recovery boot, the same benchmark sent four
+4,096-byte vectors per call, alternating `writev`, `sendmsg`, `sendmsg`,
+`writev`. Each transfer delivered the same 4 MiB with the expected hash and
+no partial returns. Host receipt times were 4.079 and 4.082 seconds for
+`writev`, and 3.574 and 3.581 seconds for `sendmsg`. The host timer includes
+protocol and scheduling overhead; the runs are not independent WAN results.
+Brook currently drains each `writev` vector separately, whereas its `sendmsg`
+path combines these vectors. This makes the gap a useful lead, not proof that
+all of it is caused by draining. The recovery kernel uses the older single-
+packet sender; the result must not be projected onto the experimental
+adaptive flight or workloads that use separate writes. Profiling real
+applications' vector sizes is needed before prioritizing a kernel change.
+
+The comparison uses `tcp_send_chunks.c` with `4096 writev 4` or
+`4096 sendmsg 4`; its existing single-send mode remains available. The host
+loopback smoke check also passed all three modes with matching hashes.
