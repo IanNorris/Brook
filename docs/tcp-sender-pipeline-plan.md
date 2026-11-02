@@ -101,6 +101,13 @@ These were grouped WAN runs rather than interleaved trials and include other
 connections, so they support the hypothesis but do not establish a stable
 throughput figure. The known-good boot was restored after the test.
 
+On a later boot of the same muted Dell candidate, three 4 MiB LAN transfers
+using 1 KiB writes completed in 1.29–1.36 seconds with matching hashes. Two
+simultaneous 4 MiB transfers also matched, each taking about 1.36 seconds.
+In a separate close-after-acceptance case the receiver verified 256 KiB and
+EOF. These are bounded checks, not a complete half-close or prolonged
+backpressure test. The recovery selection was restored and booted afterward.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
