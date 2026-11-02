@@ -283,7 +283,7 @@ static TcpTxSnapshot CaptureTcpTxLocked(const Socket& s)
 }
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
-                            const char* why);
+                            const char* why, bool asyncNeighbor=false);
 
 // The caller retains a SocketBorrow across submission and retry scheduling.
 // Preserve any newer pending ACK and its earlier timer.
@@ -893,12 +893,18 @@ static bool g_tcpTwoPacketFlight = false;
 static bool g_tcpFourPacketFlight = false;
 static bool g_tcpAdaptiveFlight = false;
 static bool g_tcpAdaptiveFlight16 = false;
+static bool g_tcpAsyncNeighbor = false;
 
 void NetConfigureBoot()
 {
     if (auto* marker=VfsOpen("/etc/arp-async-probe")) {
         VfsClose(marker);g_arpAsyncProbeEnabled=true;
         KPuts("net: isolated asynchronous ARP probe enabled\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-async-neighbor")) {
+        VfsClose(marker);
+        if(g_arpAsyncProbeEnabled){g_tcpAsyncNeighbor=true;KPuts("net: TCP async neighbor experiment enabled\n");}
+        else KPuts("net: TCP async neighbor requires ARP probe marker\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
         VfsClose(marker);g_tcpSendProbe = true;
@@ -1001,13 +1007,16 @@ static bool NetReadSingleInterface(NetSingleInterfaceSnapshot* out)
 }
 
 using AsyncArpTracker=ArpProbeTracker<16>;
-// Diagnostic only: a request is bounded, single-interface and on-link. The
-// caller drives Service explicitly; no TCP or background-worker path uses it.
-static AsyncArpTracker::Result ArpAsyncProbeQuery(uint32_t target)
+// A request is bounded, single-interface and on-link. The diagnostic and the
+// opt-in synchronous TCP experiment drive Service explicitly; no background
+// worker or asynchronous write uses it.
+static AsyncArpTracker::Result ArpAsyncProbeQuery(uint32_t target,uint64_t* generation=nullptr)
 {
+    if(generation)*generation=0;
     if(!g_arpAsyncProbeEnabled)return {AsyncArpTracker::Status::Invalid,-95};
     NetSingleInterfaceSnapshot view{};
     if(!NetReadSingleInterface(&view))return {AsyncArpTracker::Status::Invalid,-95};
+    if(generation)*generation=view.generation;
     const uint32_t hostMask=~view.netmask;
     const uint32_t firstOctet=ntohl(target)>>24;
     if(!target || !hostMask || !firstOctet || firstOctet==127 || firstOctet>=224 || target==view.ip ||
@@ -1056,6 +1065,33 @@ static void ArpAsyncProbeReceive(NetIf* nif,const void* frame,uint32_t length)
     const auto flags=IrqSpinLockAcquire(&g_arpAsyncProbeLock);
     (void)g_arpAsyncProbe.Reply(view.generation,arp->spa,mac,now,30000);
     IrqSpinLockRelease(&g_arpAsyncProbeLock,flags);
+}
+
+// Opt-in synchronous-flight experiment. Pending neighbor work is returned
+// as local busy, retaining the TCP slot for retry; success means the NIC has
+// accepted the frame. No shared worker or asynchronous write is enabled.
+static int NetSendIpv4AsyncNeighbor(uint32_t source,uint32_t destination,uint8_t protocol,
+                                   const void* payload,uint32_t length)
+{
+    if(Ipv4IsLoopback(destination))
+        return NetSendIpv4From(source,destination,protocol,payload,length);
+    NetSingleInterfaceSnapshot view{},current{};
+    if(!NetReadSingleInterface(&view))return -95;
+    if(destination==view.ip)
+        return NetSendIpv4From(source,destination,protocol,payload,length);
+    if(source!=view.ip)return -99;
+    const uint32_t nextHop=(destination&view.netmask)==(view.ip&view.netmask)?destination:view.gateway;
+    if(!nextHop)return -113;
+    uint64_t generation=0;
+    const auto result=ArpAsyncProbeQuery(nextHop,&generation);
+    if(generation!=view.generation)return -11;
+    if(result.status==AsyncArpTracker::Status::Pending){ArpAsyncProbeService();return -11;}
+    if(result.status==AsyncArpTracker::Status::Full){ArpAsyncProbeService();return -11;}
+    if(result.status!=AsyncArpTracker::Status::Resolved)return result.error ? result.error : -113;
+    if(!NetReadSingleInterface(&current) || current.interface!=view.interface ||
+       current.generation!=view.generation)return -11;
+    MacAddr mac{};for(unsigned i=0;i<6;++i)mac.b[i]=static_cast<uint8_t>(result.mac>>(8*i));
+    return NetSendIpv4Resolved(view.interface,mac,source,destination,protocol,payload,length);
 }
 
 SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid)
@@ -2580,7 +2616,7 @@ static bool TcpDrainOoo(Socket& s)
 
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
-                                const char* why)
+                                const char* why,bool asyncNeighbor)
 {
     uint8_t options[8];
     uint32_t optLen = TcpWriteSynOptions(flags, snapshot.windowScale, options);
@@ -2606,9 +2642,10 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
     tcp->checksum = 0;
     tcp->checksum = TcpChecksum(snapshot.localIp, snapshot.remoteIp, buf, tcpLen);
 
-    int sendResult = NetSendIpv4From(snapshot.localIp, snapshot.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    int sendResult = asyncNeighbor ? NetSendIpv4AsyncNeighbor(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen)
+                                   : NetSendIpv4From(snapshot.localIp, snapshot.remoteIp, IP_PROTO_TCP, buf, tcpLen);
     if (sendResult != 0) {
-        SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
+        if(!asyncNeighbor || sendResult!=-11)SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
         SpinLockAcquire(&s.lock);
         const uint32_t packetCount = ++s.txPktCount;
@@ -3440,7 +3477,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
             } else if (g_tcpSendProbe) slot.firstSendAt=now;
             SpinLockRelease(&s.lock);
             const int result = TcpSendSnapshot(s, snapshot, seq, TCP_ACK | TCP_PSH,
-                                               slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit");
+                                               slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit",g_tcpAsyncNeighbor);
             const uint64_t after = ApicTickCount();
             if (!result) {
                 if (!retry) submitted += slot.len;

@@ -282,6 +282,26 @@ The verified recovery payload was selected as generation 118 and booted
 afterward. This is one successful local neighbor lookup, not a test of
 hardware timeout, configuration races, TCP integration or throughput.
 
+An additional `/etc/tcp-async-neighbor` marker, together with
+`/etc/arp-async-probe` and an enabled TCP flight mode, lets the synchronous
+TCP data-flight path use this isolated tracker. While a neighbor is pending,
+the flight retains its unsent sequence range and retries it; a successful
+write still waits for acknowledgement. Control packets use the existing path.
+The experiment only admits a single interface, validates its source address,
+and resolves the gateway for off-link traffic. Loopback keeps its existing
+path. Interface configuration can still change after the final check, and a
+device transmit callback can block: this is not a nonblocking sender or a
+production neighbor service.
+
+Hosted tests cover routing, pending resolution followed by acknowledged data,
+payload preservation, and resolution timeout without data submission. The
+USB Ethernet QEMU test passed with delay, packet loss and concurrent writers.
+On the Dell, six 4 MiB LAN transfers completed with matching hashes in
+0.257–0.285 seconds each, comparable to the prior local test; this does not
+show a throughput improvement or establish behavior under arbitrary traffic.
+The speaker-disabled candidate was tested and the verified recovery generation
+was selected afterward.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

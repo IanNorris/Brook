@@ -8,6 +8,7 @@
 #include <chrono>
 #include "../../kernel/src/net.cpp"
 #include "../../kernel/src/arp_probe_tracker.h"
+namespace brook { int SocketLifetimeTestTransmit(uint32_t,uint32_t,uint8_t,const void*,uint32_t); }
 
 namespace {
 std::atomic<unsigned> allocations{0}, frees{0}, wakes{0};
@@ -59,7 +60,7 @@ uint8_t capturedFrame[brook::ETH_FRAME_MAX]{};
 uint32_t capturedFrameLength=0;
 int frameTransmitResult=0;
 unsigned frameTransmitCalls=0;
-bool injectReplyDuringTransmit=false,changeConfigDuringTransmit=false;
+bool injectReplyDuringTransmit=false,changeConfigDuringTransmit=false,injectTcpAck=false;
 int captureFrame(brook::NetIf* nif,const void* frame,uint32_t length) {
     assert(length<=sizeof(capturedFrame));
     memcpy(capturedFrame,frame,length);capturedFrameLength=length;++frameTransmitCalls;
@@ -76,6 +77,15 @@ int captureFrame(brook::NetIf* nif,const void* frame,uint32_t length) {
         arp->htype=brook::htons(1);arp->ptype=brook::htons(brook::ETH_TYPE_IPV4);arp->hlen=6;arp->plen=4;
         arp->oper=brook::htons(brook::ARP_OP_REPLY);arp->sha=peer;arp->spa=request->tpa;arp->tha=nif->mac;arp->tpa=request->spa;
         brook::HandleArp(nif,reply,sizeof(reply));
+    }
+    if(injectTcpAck && length>=sizeof(brook::EthHeader)+sizeof(brook::Ipv4Header)+sizeof(brook::TcpHeader)){
+        const auto* eth=reinterpret_cast<const brook::EthHeader*>(frame);
+        if(brook::ntohs(eth->etherType)==brook::ETH_TYPE_IPV4){
+            const auto* ip=reinterpret_cast<const brook::Ipv4Header*>(static_cast<const uint8_t*>(frame)+sizeof(brook::EthHeader));
+            return brook::SocketLifetimeTestTransmit(ip->srcIp,ip->dstIp,ip->protocol,
+                static_cast<const uint8_t*>(frame)+sizeof(brook::EthHeader)+sizeof(brook::Ipv4Header),
+                length-sizeof(brook::EthHeader)-sizeof(brook::Ipv4Header));
+        }
     }
     return frameTransmitResult;
 }
@@ -285,6 +295,10 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
     {
+        TcpHeader empty{};const auto loopback=htonl(0x7f000001);
+        assert(NetSendIpv4AsyncNeighbor(loopback,loopback,IP_PROTO_TCP,&empty,sizeof(empty))==0);
+    }
+    {
         NetIf nif{};nif.transmit=captureFrame;nif.ipAddr=1;nif.netmask=2;nif.gateway=3;
         NetSingleInterfaceSnapshot first{},changed{},restored{};
         assert(!NetReadSingleInterface(&first));
@@ -388,6 +402,32 @@ int main() {
         assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
         changeConfigDuringTransmit=true;injectReplyDuringTransmit=true;ArpAsyncProbeService();
         assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        // The experimental IPv4 submission retains its unsent packet while
+        // resolution runs, then submits exactly that packet to the learned MAC.
+        g_arpAsyncProbe=AsyncArpTracker{};ticks=1;frameTransmitCalls=0;
+        uint8_t payload[]={0xa1,0xb2,0xc3};injectReplyDuringTransmit=true;
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        assert(frameTransmitCalls==1);
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==0);
+        assert(frameTransmitCalls==2 && capturedFrameLength==sizeof(EthHeader)+sizeof(Ipv4Header)+sizeof(payload));
+        const auto* sentEth=reinterpret_cast<const EthHeader*>(capturedFrame);
+        assert(!memcmp(&sentEth->dst,&peer,sizeof(peer)) &&
+               !memcmp(capturedFrame+sizeof(EthHeader)+sizeof(Ipv4Header),payload,sizeof(payload)));
+        frameTransmitResult=-11;
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        frameTransmitResult=0;
+        assert(NetSendIpv4AsyncNeighbor(htonl(0x0a000204),target,IP_PROTO_TCP,payload,sizeof(payload))==-99);
+        // Off-link traffic resolves the gateway but keeps the final IPv4
+        // destination. A missing gateway fails without transmitting.
+        const uint32_t remote=htonl(0x08080808);frameTransmitCalls=0;
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,remote,IP_PROTO_TCP,payload,sizeof(payload))==-113);
+        assert(frameTransmitCalls==0);
+        nif.gateway=target;NetInterfaceChangedLocked();g_arpAsyncProbe=AsyncArpTracker{};
+        injectReplyDuringTransmit=true;
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,remote,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,remote,IP_PROTO_TCP,payload,sizeof(payload))==0);
+        const auto* routed=reinterpret_cast<const Ipv4Header*>(capturedFrame+sizeof(EthHeader));
+        assert(routed->dstIp==remote && !memcmp(&reinterpret_cast<const EthHeader*>(capturedFrame)->dst,&peer,sizeof(peer)));
         g_arpAsyncProbeEnabled=false;g_arpAsyncProbe=AsyncArpTracker{};
         g_netIfs[0]=nullptr;g_netIfCount=0;g_interfaceGeneration=1;
         memset(g_arpCache,0,sizeof(g_arpCache));g_arpCount=0;
@@ -1017,6 +1057,44 @@ int main() {
      assert(SockConnect(i,&address)==-115);}
     assert(g_sockets[i].tcpFlightControl.cwnd==0 && !g_sockets[i].tcpFlightControl.recovering);
     SockClose(i);
+    // The opt-in neighbor path retains the reserved range while ARP resolves,
+    // then sends it once and completes only after the peer acknowledges it.
+    {
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{2,3,4,5,6,7}};
+        nif.ipAddr=htonl(0x0a000201);nif.netmask=htonl(0xffffff00);
+        g_netIfs[0]=&nif;g_netIfCount=1;++g_interfaceGeneration;
+        g_arpAsyncProbe=AsyncArpTracker{};g_arpAsyncProbeEnabled=true;
+        g_tcpAsyncNeighbor=true;g_tcpTwoPacketFlight=true;
+        waiter=new Process{};waiter->refCount=1;i=create();setupTcp(i);currentProcess=waiter;ticks=1;
+        g_sockets[i].localIp=nif.ipAddr;g_sockets[i].remoteIp=htonl(0x0a000202);g_sockets[i].tcpSndWnd=65535;
+        injectReplyDuringTransmit=true;injectTcpAck=true;acknowledgeDataCount=1;capturedDataCount=0;frameTransmitCalls=0;
+        uint8_t data[64];for(unsigned n=0;n<sizeof(data);++n)data[n]=static_cast<uint8_t>(n+1);
+        assert(SockSend(i,data,sizeof(data))==sizeof(data));
+        assert(capturedDataCount==1 && capturedDataSeq[0]==10 && g_sockets[i].tcpSndUna==74);
+        assert(frameTransmitCalls>=2);
+        assert(capturedFrameLength>=sizeof(EthHeader)+sizeof(Ipv4Header)+sizeof(TcpHeader)+sizeof(data));
+        assert(memcmp(capturedFrame+sizeof(EthHeader)+sizeof(Ipv4Header)+sizeof(TcpHeader),data,sizeof(data))==0);
+        injectTcpAck=false;g_tcpAsyncNeighbor=false;g_tcpTwoPacketFlight=false;g_arpAsyncProbeEnabled=false;
+        currentProcess=nullptr;SockClose(i);delete waiter;g_netIfs[0]=nullptr;g_netIfCount=0;
+        g_arpAsyncProbe=AsyncArpTracker{};
+    }
+    // An unresolved neighbor times out without publishing the reserved data.
+    {
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{2,3,4,5,6,7}};
+        nif.ipAddr=htonl(0x0a000201);nif.netmask=htonl(0xffffff00);
+        g_netIfs[0]=&nif;g_netIfCount=1;++g_interfaceGeneration;
+        g_arpAsyncProbe=AsyncArpTracker{};g_arpAsyncProbeEnabled=true;
+        g_tcpAsyncNeighbor=true;g_tcpTwoPacketFlight=true;
+        waiter=new Process{};waiter->refCount=1;i=create();setupTcp(i);currentProcess=waiter;ticks=1;
+        g_sockets[i].localIp=nif.ipAddr;g_sockets[i].remoteIp=htonl(0x0a000202);g_sockets[i].tcpSndWnd=65535;
+        injectReplyDuringTransmit=false;injectTcpAck=true;capturedDataCount=0;frameTransmitCalls=0;
+        uint8_t data[64]{};assert(SockSend(i,data,sizeof(data))==-110);
+        assert(capturedDataCount==0 && g_sockets[i].tcpState==TcpState::Closed && SockGetConnectError(i)==110);
+        assert(frameTransmitCalls==3 && ticks.load()>=1501 && ticks.load()<=3001);
+        injectTcpAck=false;g_tcpAsyncNeighbor=false;g_tcpTwoPacketFlight=false;g_arpAsyncProbeEnabled=false;
+        currentProcess=nullptr;SockClose(i);delete waiter;g_netIfs[0]=nullptr;g_netIfCount=0;
+        g_arpAsyncProbe=AsyncArpTracker{};
+    }
     // A rejected second submission retries its original range and payload.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;

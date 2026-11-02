@@ -23,8 +23,10 @@ ap.add_argument('--send-concurrency',action='store_true',help='Also verify two g
 ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
 ap.add_argument('--send-user-copy',action='store_true',help='Also exercise send, writev and multi-iovec sendmsg')
 ap.add_argument('--arp-async-probe',action='store_true',help='Exercise the opt-in single-interface ARP diagnostic')
+ap.add_argument('--tcp-async-neighbor',action='store_true',help='Use the experimental ARP path for TCP flight data')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
+if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))):ap.error('--tcp-async-neighbor requires --arp-async-probe and a TCP flight mode')
 if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))>1:ap.error('choose only one flight mode')
 if not 0<=args.network_delay_us<=50000:ap.error('network delay must be between 0 and 50000 microseconds')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
@@ -82,6 +84,7 @@ if args.tcp_adaptive_flight:run('mcopy','-i',initrd,marker,'::ETC/tcp-adaptive-f
 if args.tcp_adaptive_flight16:run('mcopy','-i',initrd,marker,'::ETC/tcp-adaptive-flight16')
 if args.tcp_send_probe:run('mcopy','-i',initrd,marker,'::ETC/tcp-send-probe')
 if args.arp_async_probe:run('mcopy','-i',initrd,marker,'::ETC/arp-async-probe')
+if args.tcp_async_neighbor:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-neighbor')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -180,6 +183,7 @@ try:
    if args.tcp_flight4:assert 'four-packet TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_adaptive_flight:assert 'bounded adaptive TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_adaptive_flight16:assert 'bounded adaptive 16-slot TCP send flight enabled' in serial,serial[-2500:]
+   if args.tcp_async_neighbor:assert 'TCP async neighbor experiment enabled' in serial,serial[-2500:]
    assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
    assert f'tx_depth={16 if args.tx_depth16 else 8}' in serial, 'Unexpected ECM transmit depth'
    break
@@ -270,6 +274,7 @@ try:
    assert b'BRIDGE_BEGIN 73' in reply and b'BRIDGE_END 73' in reply,reply
    probe=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
    assert probe['enabled'] and probe['calls']>0 and probe['submitted_bytes']>0 and probe['ack_samples']>0,probe
+   if args.tcp_async_neighbor:assert probe['local_busy']>0,probe
    (base/'tcp-send-probe.json').write_text(json.dumps(probe,indent=2)+'\n')
  if loss:
   assert not loss['errors'] and loss['dropped']==1 and loss['retransmitted'],loss
