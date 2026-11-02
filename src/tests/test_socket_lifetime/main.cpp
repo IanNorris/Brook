@@ -346,9 +346,12 @@ int main() {
         assert(tracker.Next(2,&other) && other.ip==b);
         assert(tracker.Complete(other,ArpSendRequestOn(&nif,b),2));
         assert(!tracker.Next(11,&retry) && tracker.Next(12,&retry) && retry.ip==a);
-        // A reply arriving during transmit releases the slot; late completion
-        // cannot resurrect it or overwrite a new occupant.
-        tracker.Resolved(interfaceId,a);
+        // A reply during transmit resolves the slot. A later request can
+        // evict the resolved value, but stale completion cannot alter it.
+        const uint64_t learned=0x060504030202ULL;
+        assert(tracker.Reply(interfaceId,a,learned,12,100));
+        auto resolved=tracker.Request(interfaceId,a,12,2000);
+        assert(resolved.status==Tracker::Status::Resolved && resolved.mac==learned);
         assert(tracker.Request(interfaceId,c,12,2000).status==Tracker::Status::Pending);
         assert(!tracker.Complete(retry,0,12));
         assert(tracker.Next(12,&retry) && retry.ip==c);
@@ -394,6 +397,38 @@ int main() {
         assert(tracker.Complete(replacement,-11,21));
         assert(!tracker.Complete(first,0,21));
         assert(tracker.Request(1,1,21,20).status==Tracker::Status::Failed);
+    }
+    {
+        using Tracker=ArpProbeTracker<2>;Tracker tracker;Tracker::Ticket ticket{};
+        const uint64_t mac=0x060504030202ULL;
+        assert(tracker.Request(1,42,1,1000).status==Tracker::Status::Pending);
+        assert(!tracker.Reply(1,42,mac,1,100)); // no probe submitted or in flight
+        assert(tracker.Next(1,&ticket));
+        assert(!tracker.Reply(2,42,mac,1,100)); // another configuration
+        assert(!tracker.Reply(1,42,1,1,100)); // multicast MAC
+        assert(tracker.Reply(1,42,mac,1,100)); // reply during submission
+        assert(!tracker.Complete(ticket,-11,1));
+        assert(tracker.Request(1,42,2,1000).status==Tracker::Status::Resolved);
+        assert(tracker.Request(2,42,2,1000).status==Tracker::Status::Pending);
+        assert(tracker.Request(1,42,101,1000).status==Tracker::Status::Pending); // expired
+    }
+    {
+        using Tracker=ArpProbeTracker<2>;Tracker tracker;Tracker::Ticket a{},b{};
+        const uint64_t macA=0x060504030202ULL,macB=0x060504030204ULL;
+        assert(tracker.Request(10,1,1,1000).status==Tracker::Status::Pending);
+        assert(tracker.Request(10,2,1,1000).status==Tracker::Status::Pending);
+        assert(tracker.Next(1,&a) && tracker.Complete(a,0,1));
+        assert(tracker.Next(1,&b) && tracker.Complete(b,0,1));
+        assert(tracker.Reply(10,1,macA,2,100));
+        assert(tracker.Reply(10,2,macB,2,50));
+        assert(tracker.Request(10,3,3,1000).status==Tracker::Status::Pending);
+        auto kept=tracker.Request(10,1,3,1000);
+        assert(kept.status==Tracker::Status::Resolved && kept.mac==macA);
+        assert(tracker.Request(10,2,3,1000).status==Tracker::Status::Pending); // earliest expiry was evicted
+        Tracker expired;assert(expired.Request(10,1,1,20).status==Tracker::Status::Pending);
+        assert(expired.Next(1,&a) && expired.Complete(a,0,1));
+        assert(!expired.Reply(10,1,macA,21,100));
+        assert(expired.Request(10,1,21,20).status==Tracker::Status::Failed);
     }
     {
         TcpSendFlightState invalid(17);assert(!invalid.Allocate());

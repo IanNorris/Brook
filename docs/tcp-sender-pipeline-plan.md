@@ -207,9 +207,8 @@ An inactive `ArpProbeTracker` now implements the bounded request state: it
 deduplicates by caller-supplied interface lifetime and IP, separates busy
 retries from submitted attempts, imposes an absolute deadline, uses
 round-robin dispatch, and rejects stale completion tickets. Its caller must
-serialize operations, provide monotonic millisecond ticks, pin interface
-lifetime during transmit and only mark a request resolved after retaining a
-usable cache entry. Hosted tests exercise those transitions alongside the
+serialize operations, provide monotonic millisecond ticks and pin interface
+lifetime during transmit. Hosted tests exercise those transitions alongside the
 actual ARP request-frame builder, including table exhaustion, NIC busy,
 expiry and late completion. Astra reviewed the tracker. It is not instantiated
 in the network runtime and therefore makes no ARP or TCP behavior change;
@@ -237,6 +236,17 @@ the configuration-writer inventory and the cache-capacity extraction. This
 token does not pin driver storage, serialize transmit with configuration
 changes, or make old IP-only ARP entries valid for the current generation.
 `NetInit` remains a boot-only initialization.
+
+The inactive tracker now retains bounded, expiring resolved MAC values keyed
+by the caller's configuration token and IP, separate from the legacy ARP
+cache. It accepts a result only for a pending request after submission starts,
+rejects invalid unicast encodings, protects a synchronous reply from a late
+completion, and evicts resolved values before active requests. Hosted tests
+cover separate configuration tokens, expiry, reply timing and earliest-expiry
+replacement. This is not packet validation or authenticated ARP: integration
+must verify the received frame, selected interface and current generation,
+and revalidate before use. A delayed or forged reply on the same configuration
+cannot be distinguished cryptographically. The tracker is still inactive.
 
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
