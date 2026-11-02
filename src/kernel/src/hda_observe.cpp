@@ -14,8 +14,12 @@
 #include "../../drivers/intel_hda/hda_dma_publish.h"
 #include "../../drivers/intel_hda/hda_dell_stream_owner.h"
 #include "../../drivers/intel_hda/hda_dell_stream_queue.h"
+#include "../../drivers/intel_hda/hda_dell_audio_bridge.h"
 #include "native_tsc_observe.h"
 #include "native_tsc_policy.h"
+#include "native_tsc_audio_clock.h"
+#include "audio.h"
+#include "sync/kmutex.h"
 #include <stddef.h>
 #ifdef BROOK_HOST_TEST
 #include <cstring>
@@ -196,7 +200,7 @@ struct Io {
 // adapter, the borrowed MMIO mapping and all owned RAM pages until reboot.
 struct TonePlatform {
     Io& io;const HdaSessionReport& snapshot;
-    void* dmaPages[17]{};unsigned expectedPages=4;bool streamMode=false;uint64_t tscOrigin=0;
+    void* dmaPages[17]{};unsigned expectedPages=4;bool streamMode=false,runtimeMode=false;uint64_t tscOrigin=0;NativeTscAudioClock runtimeClock{};
     bool flushInfo(uint32_t& line){
 #ifdef BROOK_HOST_TEST
         const bool available=HdaObserveTestFlushInfo(line);
@@ -237,10 +241,16 @@ struct TonePlatform {
 #ifdef BROOK_HOST_TEST
         return HdaObserveTestNowNs();
 #else
-        if(SmpCurrentCpuIndex()!=0 || !tscOrigin)return 0;
         const auto& clock=NativeTscObserveRead();if(!clock.consistent || !clock.khz)return 0;
-        uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
-        uint64_t ns=0;if(!NativeTscElapsedNs(tscOrigin,(uint64_t(hi)<<32)|lo,clock.khz,ns) || ns==~uint64_t(0))return 0;
+        // Keep the CPU index and TSC sample on the same CPU, including against
+        // an A->B->A migration. Restore the caller's original interrupt state.
+        uint64_t flags;__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
+        const auto cpu=SmpCurrentCpuIndex();uint32_t lo,hi,aux;
+        __asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
+        __asm__ volatile("pushq %0; popfq"::"r"(flags):"memory","cc");
+        if(!runtimeMode && cpu!=0)return 0;const uint64_t ticks=(uint64_t(hi)<<32)|lo;
+        uint64_t ns=0;if(runtimeMode){if(SmpGetCpuCount()!=clock.coreExpected+1 || !runtimeClock.read(cpu,ticks,ns))return 0;return ns;}
+        if(!tscOrigin || !NativeTscElapsedNs(tscOrigin,ticks,clock.khz,ns) || ns==~uint64_t(0))return 0;
         return ns+1;
 #endif
     }
@@ -267,9 +277,41 @@ struct TonePlatform {
         for(unsigned i=0;i<expectedPages;++i)if(!HdaDmaFlushRange(*this,dmaPages[i],4096,0,4096,line))return false;
         return fence();
     }
-    void quarantine(){if(streamMode)observation.streamQuarantined=true;else observation.toneQuarantined=true;}
+    void quarantine(){if(runtimeMode)__atomic_store_n(&observation.runtimeQuarantined,true,__ATOMIC_RELEASE);else if(streamMode)observation.streamQuarantined=true;else observation.toneQuarantined=true;}
 };
 bool Marker(const char* path){auto* node=VfsOpen(path);if(!node)return false;VfsClose(node);return true;}
+struct RuntimeLock {KMutex mutex{};void init(){KMutexInit(&mutex);}void lock(){KMutexLock(&mutex);}
+    bool tryLock(){return KMutexTryLock(&mutex);}void unlock(){KMutexUnlock(&mutex);}};
+using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock>;
+RuntimeOwner* runtimeOwner=nullptr;RuntimeBridge* runtimeBridge=nullptr;
+int RuntimePlay(const void* p,uint32_t n,uint32_t hz,uint8_t ch,uint8_t bits,bool){return runtimeBridge?runtimeBridge->play(p,n,hz,ch,bits):-19;}
+void RuntimeStop(){if(runtimeBridge)runtimeBridge->stop();}
+bool RuntimePlaying(){return runtimeBridge && runtimeBridge->isPlaying();}
+uint32_t RuntimePosition(){AudioDeviceProgress p{};return runtimeBridge && runtimeBridge->progress(&p)?uint32_t(p.completed):0;}
+void RuntimeService(){if(runtimeBridge)runtimeBridge->service();}
+AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?runtimeBridge->submit(p,n):AudioSubmitReceipt{0,0,0,-19};}
+bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
+bool RuntimeRestart(uint64_t epoch){return runtimeBridge && runtimeBridge->restart(epoch);}
+void PrepareRuntime(Io& io){
+    const auto& clock=NativeTscObserveRead();if(!clock.consistent || !Marker("/etc/audio-muted")){observation.runtimeReason="native clock or boot mute unavailable";return;}
+    alignas(TonePlatform) static unsigned char platformStorage[sizeof(TonePlatform)];
+    auto* platform=::new(platformStorage) TonePlatform{io,observation.session};platform->expectedPages=17;platform->runtimeMode=true;
+#ifdef BROOK_HOST_TEST
+    const uint64_t origin=1;
+#else
+    uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");const uint64_t origin=(uint64_t(hi)<<32)|lo;
+#endif
+    if(!platform->runtimeClock.init(clock,SmpGetCpuCount(),origin)){observation.runtimeReason="native clock admission failed";return;}
+    uint32_t line=0;if(!platform->flushInfo(line) || !platform->delayUs(3)){observation.runtimeReason="cache or timer unavailable";return;}
+    alignas(RuntimeOwner) static unsigned char ownerStorage[sizeof(RuntimeOwner)];
+    runtimeOwner=::new(ownerStorage) RuntimeOwner(*platform,observation.session,line);
+    if(!runtimeOwner->prepare()){observation.runtimeReason="owner preparation failed";return;}
+    static RuntimeLock lock;lock.init();alignas(RuntimeBridge) static unsigned char bridgeStorage[sizeof(RuntimeBridge)];
+    // Two admitted CPUs may differ by up to 20 us. This covers the observed
+    // offset bound, not systematic PIT calibration error or future drift.
+    runtimeBridge=::new(bridgeStorage) RuntimeBridge(*runtimeOwner,lock,line,4096,1024,20000);
+    observation.runtimePrepared=true;observation.runtimeReason="prepared muted";
+}
 void RunStreamProbe(Io& io){
     observation.streamAttempted=true;
     const auto& tsc=NativeTscObserveRead();
@@ -321,6 +363,12 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
     const bool muted=Marker("/etc/dell-hda-muted-dma"),audible=Marker("/etc/dell-hda-quiet-tone");
     const bool mixerProbe=Marker("/etc/dell-hda-mixer-format-probe");
+    if(Marker("/etc/dell-hda-audio")){
+        observation.runtimeRequested=true;
+        if(muted || audible || mixerProbe || Marker("/etc/dell-hda-stream-probe")){observation.runtimeReason="conflicting markers";return;}
+        if(observation.session.result!=HdaSessionResult::Complete || observation.session.after!=0 || !observation.mapped){observation.runtimeReason="observation incomplete";return;}
+        PrepareRuntime(io);return;
+    }
     if(Marker("/etc/dell-hda-stream-probe")){
         observation.streamRequested=true;
         if(muted || audible || mixerProbe){observation.streamReason="conflicting markers";return;}
@@ -361,4 +409,18 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         unsigned(observation.toneQuarantined),observation.toneReason);
 }
 const HdaObservation& HdaObserveRead(){return observation;}
+void HdaRuntimeRegister(){
+    static bool attempted=false;
+    if(attempted || !observation.runtimePrepared || !runtimeOwner || !runtimeBridge)return;
+    attempted=true;
+    static const AudioDriver driver{"dell_hda",RuntimePlay,RuntimeStop,RuntimePlaying,RuntimePosition,RuntimeService,RuntimeSubmit,RuntimeProgress,RuntimeRestart};
+    if(!AudioRegister(&driver)){
+        const bool muted=runtimeOwner->mute(),stopped=runtimeOwner->stop();
+        if(!muted || !stopped || !runtimeOwner->retire())runtimeOwner->quarantine();
+        observation.runtimePrepared=false;observation.runtimeReason="audio registration rejected";
+        SerialPrintf("HDA_RUNTIME registration rejected quarantined=%u\n",unsigned(__atomic_load_n(&observation.runtimeQuarantined,__ATOMIC_ACQUIRE)));return;
+    }
+    observation.runtimeRegistered=true;observation.runtimeReason="registered muted (experimental)";
+    SerialPrintf("HDA_RUNTIME registered muted experimental\n");
+}
 }

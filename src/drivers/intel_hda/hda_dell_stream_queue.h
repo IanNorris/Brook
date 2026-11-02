@@ -3,7 +3,7 @@
 #include "../../kernel/src/audio_dma_clock.h"
 
 namespace brook {
-// Injected streaming core; not yet registered as an AudioDriver. The owner
+// Injected streaming core. The owner
 // serializes all calls and owns the controller and all ring pages. Io methods:
 // nowNs(), position(raw,error,running), write(offset,src,n), publish(offset,n),
 // fence(), start(), mute(), stop(), quarantine(). write(nullptr) writes silence.
@@ -16,7 +16,7 @@ namespace brook {
 struct HdaDellReceipt {uint64_t epoch=0,begin=0;uint32_t accepted=0;int error=0;};
 template<class Io> class HdaDellStreamQueue {
     static constexpr uint32_t Ring=AudioDmaClock::RingBytes;
-    Io& io_;AudioDmaClock clock_{};uint64_t cleared_=0,lastMovementNs_=0;uint32_t line_,guard_,maxBurst_;
+    Io& io_;AudioDmaClock clock_{};uint64_t cleared_=0,lastMovementNs_=0,clockUncertaintyNs_;uint32_t line_,guard_,maxBurst_;
     bool initialized_=false,failed_=false,closed_=false;
     struct Publisher {
         HdaDellStreamQueue& q;
@@ -34,12 +34,13 @@ template<class Io> class HdaDellStreamQueue {
         if(!before || !io_.position(position,error,running) || !running)return false;
         const uint64_t after=io_.nowNs();
         const uint64_t previous=clock_.RawCompleted();
-        if(position>Ring || after<clock_.SampleBeforeNs() ||
-           after-clock_.SampleBeforeNs()>=AudioDmaClock::MaxSampleNs)return false;
+        if(position>Ring || after<clock_.SampleBeforeNs())return false;
+        const uint64_t elapsed=after-clock_.SampleBeforeNs();
+        if(clockUncertaintyNs_>=AudioDmaClock::MaxSampleNs ||
+           elapsed>=AudioDmaClock::MaxSampleNs-clockUncertaintyNs_)return false;
         const uint32_t normalized=position==Ring?0:position;
         const uint32_t delta=(normalized+Ring-clock_.Position())%Ring;
-        const uint64_t elapsed=after-clock_.SampleBeforeNs();
-        const uint64_t allowed=elapsed*AudioDmaClock::BytesPerSecond/1000000000ULL+maxBurst_;
+        const uint64_t allowed=(elapsed+clockUncertaintyNs_)*AudioDmaClock::BytesPerSecond/1000000000ULL+maxBurst_;
         if(delta>allowed)return false; // impossible jump or unobserved lap
         if(!clock_.Observe(normalized,before,after,error))return false;
         raw=clock_.RawCompleted();
@@ -63,7 +64,7 @@ template<class Io> class HdaDellStreamQueue {
         cleared_=end;return true;
     }
 public:
-    HdaDellStreamQueue(Io& io,uint32_t line,uint32_t guard,uint32_t maxBurst=1024):io_(io),line_(line),guard_(guard),maxBurst_(maxBurst){}
+    HdaDellStreamQueue(Io& io,uint32_t line,uint32_t guard,uint32_t maxBurst=1024,uint64_t clockUncertaintyNs=0):io_(io),clockUncertaintyNs_(clockUncertaintyNs),line_(line),guard_(guard),maxBurst_(maxBurst){}
     HdaDellStreamQueue(const HdaDellStreamQueue&)=delete;
     HdaDellStreamQueue& operator=(const HdaDellStreamQueue&)=delete;
     HdaDellStreamQueue(HdaDellStreamQueue&&)=delete;

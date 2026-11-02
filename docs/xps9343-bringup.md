@@ -2730,3 +2730,28 @@ streaming sender, boot/identity binding, disconnect handling, destination space
 checks, and an independent full-backup readback. This primitive alone is not a
 backup tool, does not provide an atomic disk snapshot, and does not establish
 that a physical backup is complete or restorable.
+
+### Experimental muted Dell mixer backend (2026-11-02)
+
+An explicitly enabled Dell-only HDA backend now connects the streaming owner
+to the Brook mixer. It requires the hardware observation, native-TSC
+observation, `/etc/dell-hda-audio`, and `/etc/audio-muted` boot markers; it
+leaves the speaker pin muted. Its private clock rejects missing per-core
+admission, migration during sampling, backward readings and CPU-count changes.
+The queue includes a 20 microsecond bound for observed cross-core offset; this
+does not establish a bound on systematic calibration error or later drift.
+It is not a general-purpose kernel clock.
+
+On the Dell, the separate two-second diagnostic tone was heard by the user.
+In a later unattended, muted boot the backend registered and an OSS test
+accepted 176,400 bytes with short writes and no reported quarantine; the mixer
+reported clocked operation. This does not independently prove that every byte
+reached the speaker or establish long-term audio stability. A QEMU boot of the
+exact candidate and hosted queue, mixer, registration and failure tests also
+passed. Recovery generation 72 was selected for the next boot after the test.
+
+The backend is a one-shot experiment: a stop or timing fault is terminal,
+and it does not unmute speakers or provide normal application playback yet.
+Regular idle service is necessary after DMA starts even if no application is
+writing. Verified drain, reinitialization, safe volume controls and audible
+application testing remain to be implemented before enabling it by default.

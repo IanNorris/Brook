@@ -18,8 +18,12 @@ struct HdaObservation {
     bool streamRequested=false,streamAttempted=false,streamFinished=false,streamQuarantined=false;
     uint32_t streamSubmissions=0;uint64_t streamAccepted=0,streamCompleted=0,streamElapsedNs=0;
     uint16_t streamCommand=0;const char* streamReason="not requested";
+    bool runtimeRequested=false,runtimePrepared=false,runtimeRegistered=false,runtimeQuarantined=false;
+    const char* runtimeReason="not requested";
 };
 // Called once on CPU 0 before AP scheduler activation or driver loading.
 void HdaObserveConfigure(const BootProtocol* boot);
 const HdaObservation& HdaObserveRead();
+// Called on the BSP after AudioMixerInit/ConfigureBoot and before modules.
+void HdaRuntimeRegister();
 }

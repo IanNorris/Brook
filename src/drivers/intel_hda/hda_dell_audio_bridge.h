@@ -5,7 +5,7 @@
 namespace brook {
 // Serialized mixer-facing adapter for an already prepared owner. This first
 // version deliberately keeps the speaker muted and treats STOP/fault as final;
-// it is not registered on real hardware. Lock::lock/tryLock/unlock must be
+// real-hardware registration is explicitly opt-in. Lock::lock/tryLock/unlock must be
 // process-context safe and must not disable interrupts over codec operations.
 // Admission, AudioRegister() and object lifetime remain the caller's job.
 template<class Owner,class Lock> class HdaDellAudioBridge {
@@ -13,8 +13,8 @@ template<class Owner,class Lock> class HdaDellAudioBridge {
     bool started_=false,closed_=false;
     struct Guard {Lock& lock;~Guard(){lock.unlock();}};
 public:
-    HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024):
-        owner_(owner),lock_(lock),queue_(owner,line,guard,burst),
+    HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0):
+        owner_(owner),lock_(lock),queue_(owner,line,guard,burst,clockUncertaintyNs),
         capacity_(line>=16 && line<=4096 && !(line&(line-1)) && !(4096%line) && burst &&
             burst<=guard && guard-burst>=line && guard<AudioDmaClock::RingBytes/4?AudioDmaClock::RingBytes:0){}
     HdaDellAudioBridge(const HdaDellAudioBridge&)=delete;

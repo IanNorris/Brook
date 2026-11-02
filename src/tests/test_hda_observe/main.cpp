@@ -1,6 +1,8 @@
 #include "hda_observe.h"
 #include "hda_dell_inventory.h"
 #include "native_tsc_observe.h"
+#include "audio.h"
+#include "sync/kmutex.h"
 #include "vfs.h"
 #include "pci.h"
 #include "cpu.h"
@@ -19,6 +21,7 @@ int scenario=0;uint16_t cmd=0;unsigned writes=0,allocs=0,frees=0,pmmFrees=0;
 void* page=nullptr;Vnode marker{};
 Chip chip{};unsigned toneAllocations=0,toneFrees=0,toneFlushes=0;uint64_t fakeTicks=0,fakeNs=1000000000,toneFlushMask[17]{};void* tonePages[17]{};bool clockInjected=false;
 constexpr uint64_t bar=0xf7418000,ram=0x12345000;
+const AudioDriver* registered=nullptr;unsigned registerCalls=0;
 }
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;return scenario!=7;}
 namespace brook {
@@ -28,9 +31,17 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-stream-probe")==0 && (scenario>=38 && scenario<=43))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-audio")==0 && scenario>=44)return &marker;
+ if(std::strcmp(path,"/etc/audio-muted")==0 && scenario>=44 && scenario!=46)return &marker;
  return nullptr;}
 extern "C" void VfsClose(Vnode*){}
 uint32_t SmpCurrentCpuIndex(){return 0;}
+uint32_t SmpGetCpuCount(){return 1;}
+void KMutexInit(KMutex* m){m->locked=0;}
+void KMutexLock(KMutex* m){assert(!m->locked);m->locked=1;}
+bool KMutexTryLock(KMutex* m){if(m->locked)return false;m->locked=1;return true;}
+void KMutexUnlock(KMutex* m){assert(m->locked);m->locked=0;}
+extern "C" bool AudioRegister(const AudioDriver* d){++registerCalls;if(scenario==45)return false;registered=d;return true;}
 uint32_t PciBootInventoryCount(){return scenario>=20?16:scenario>=9 && scenario<=15?2:1;}
 uint32_t PciBootInventorySeen(){return PciBootInventoryCount()+(scenario==15?1:0);}
 bool PciBootInventoryRead(uint32_t i,PciBootEntry* out){if(i>=PciBootInventoryCount())return false;*out={};auto& d=out->device;
@@ -82,7 +93,7 @@ void HdaObserveTestFlushLine(void* p){const auto address=reinterpret_cast<uintpt
 uint64_t HdaObserveTestNowNs(){return fakeNs+=1000000;}
 void HdaObserveTestBeforeStreamIteration(){if(scenario==41 && fakeNs>=2900000000ULL && fakeNs<3100000000ULL)fakeNs+=300000000ULL;
  if(scenario==43 && !clockInjected && fakeNs>=1500000000ULL){fakeNs-=100000000ULL;clockInjected=true;}}
-const NativeTscObservation& NativeTscObserveRead(){static NativeTscObservation t{};t.capable=true;t.consistent=scenario!=40;t.khz=2394600;return t;}
+const NativeTscObservation& NativeTscObserveRead(){static NativeTscObservation t{};t.capable=true;t.measured=true;t.consistent=scenario!=40;t.khz=2394600;return t;}
 extern "C" void SerialPrintf(const char*,...){}
 }
 static void one(int which){
@@ -139,6 +150,16 @@ static void one(int which){
  if(which==40){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && !toneAllocations && cmd==0 && !std::strcmp(o.streamReason,"native clock unavailable"));}
  if(which==41){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && o.streamQuarantined && !toneFrees && cmd==2);}
  if(which==42 || which==43){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && o.streamQuarantined && !toneFrees && cmd==2);}
+ if(which==44){assert(o.runtimeRequested && o.runtimePrepared && !o.runtimeRegistered && toneAllocations==17 && cmd==2);
+  HdaRuntimeRegister();assert(o.runtimeRegistered && registered && registerCalls==1);
+  unsigned char samples[1764]{};const auto receipt=registered->trySubmit(samples,sizeof(samples));
+  assert(receipt.accepted==sizeof(samples) && !receipt.error && !chip.sawQuietUnmute);
+  AudioDeviceProgress progress{};assert(registered->progress(&progress));assert(registered->getPosition()<=progress.completed+1764);
+  registered->stop();assert(toneFrees==17 && cmd==0 && !o.runtimeQuarantined);
+  HdaRuntimeRegister();assert(registerCalls==1);}
+ if(which==45){assert(o.runtimePrepared);HdaRuntimeRegister();assert(!o.runtimePrepared && !o.runtimeRegistered && toneFrees==17 && cmd==0);
+  HdaRuntimeRegister();assert(registerCalls==1 && !registered);}
+ if(which==46){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0);HdaRuntimeRegister();assert(!registerCalls);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=43;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=46;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

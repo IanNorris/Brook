@@ -820,6 +820,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Initialise the audio mixer before modules so HDA can register.
     brook::AudioMixerInit();
     brook::AudioMixerConfigureBoot();
+    brook::HdaRuntimeRegister();
 
     // Phase 1: load early modules from embedded ramdisk (mounted at "/").
     //   These run before virtio, so they can't access /boot yet.

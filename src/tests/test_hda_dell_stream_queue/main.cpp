@@ -42,6 +42,8 @@ int main(){
     bad=b.submit(samples,sizeof(samples));assert(bad.error && b.failed() && broken.stops==1 && broken.quarantines==1);
     Fake clock;HdaDellStreamQueue<Fake> c(clock,64,4096);assert(c.start());clock.now+=AudioDmaClock::MaxSampleNs;
     assert(!c.service() && c.failed() && clock.quarantines==1);
+    Fake skew;HdaDellStreamQueue<Fake> skewed(skew,64,4096,1024,20000);assert(skewed.start());
+    skew.now+=AudioDmaClock::MaxSampleNs-20000;assert(!skewed.service() && skew.quarantines==1);
     Fake halted;HdaDellStreamQueue<Fake> h(halted,64,4096);assert(h.start());halted.running=false;halted.stopFails=true;
     assert(!h.service() && h.failed() && halted.mutes==1 && halted.stops==1 && halted.quarantines==1);
     Fake stalled;HdaDellStreamQueue<Fake> st(stalled,64,4096);assert(st.start());stalled.now+=150000000;
