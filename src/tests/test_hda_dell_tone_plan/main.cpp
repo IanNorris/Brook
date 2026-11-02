@@ -13,6 +13,10 @@ static HdaSessionReport observed() {
 int main(){
     HdaDellTonePlan p{};auto s=observed();assert(HdaDellMakeTonePlan(s,p));
     assert(p.pin==0x14 && p.mixer==0x0d && p.dac==3 && p.pinSelection==1 && p.dacGain==80 && p.peakSample==9830);
+    uint16_t format=0;assert(HdaDellMixerFormat(s,format) && format==0x4011);
+    s=observed();s.stateValues[7]&=~(1u<<5);assert(!HdaDellMixerFormat(s,format) && !format);
+    s=observed();s.stateValues[7]&=~(1u<<17);assert(!HdaDellMixerFormat(s,format) && !format);
+    s=observed();s.stateValues[8]&=~1u;assert(!HdaDellMixerFormat(s,format) && !format);
     s=observed();s.stateValues[0]|=0x100;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.stateValues[5]|=0x10;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.stateValues[7]&=~(1u<<6);assert(!HdaDellMakeTonePlan(s,p));

@@ -11,6 +11,7 @@
 #include "memory/physical_memory.h"
 #include "../../drivers/intel_hda/hda_dell_tone_adapter.h"
 #include "../../drivers/intel_hda/hda_dell_tone_controller.h"
+#include "../../drivers/intel_hda/hda_dma_publish.h"
 #include <stddef.h>
 #ifdef BROOK_HOST_TEST
 #include <cstring>
@@ -236,15 +237,16 @@ struct TonePlatform {
             else if(haveBoundary && now>=anchor && now-anchor>=2)return true;pause();}
         return false;
     }
+    void line(void* address){
+#ifdef BROOK_HOST_TEST
+        HdaObserveTestFlushLine(address);
+#else
+        __asm__ volatile("clflush (%0)"::"r"(address):"memory");
+#endif
+    }
     bool publishDma(){
         uint32_t line=0;if(!flushInfo(line))return false;
-        for(void* page:dmaPages){if(!page)return false;for(unsigned o=0;o<4096;o+=line){
-#ifdef BROOK_HOST_TEST
-            HdaObserveTestFlushLine(static_cast<unsigned char*>(page)+o);
-#else
-            __asm__ volatile("clflush (%0)"::"r"(static_cast<unsigned char*>(page)+o):"memory");
-#endif
-        }}
+        for(void* page:dmaPages)if(!HdaDmaFlushRange(*this,page,4096,0,4096,line))return false;
         __atomic_thread_fence(__ATOMIC_SEQ_CST);return true;
     }
     void quarantine(){observation.toneQuarantined=true;}

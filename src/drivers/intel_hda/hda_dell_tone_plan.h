@@ -39,4 +39,15 @@ inline bool HdaDellMakeTonePlan(const HdaSessionReport& s,HdaDellTonePlan& out) 
     out.peakSample=9830; // at most 30% of signed 16-bit full scale
     return true;
 }
+
+// The normal Brook mixer produces 44.1 kHz stereo signed 16-bit PCM. The
+// hardware tone used 48 kHz; don't treat its success as proof of this format.
+// This is admission only: the caller must set and read back both converter
+// and stream formats while it owns the controller and the speaker is muted.
+inline bool HdaDellMixerFormat(const HdaSessionReport& s,uint16_t& format) {
+    format=0;HdaDellTonePlan route{};
+    if(!HdaDellMakeTonePlan(s,route) || !(s.stateValues[7]&(1u<<5)))return false;
+    format=0x4011; // 44.1 kHz, 16-bit, 2 channels
+    return true;
+}
 }
