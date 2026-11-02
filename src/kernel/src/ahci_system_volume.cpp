@@ -1,5 +1,6 @@
 #include "ahci_system_volume.h"
 #include "ahci_boot_selector.h"
+#include "ahci_data_reader.h"
 #include "ahci_readonly.h"
 #include "device.h"
 #include "fatfs_glue.h"
@@ -90,5 +91,59 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(!VfsMountConfigured("/media/system","fatfs",drive,0))return Fail("FAT mount");
     KPrintf("ahci system: verified GPT entry %u mounted at /media/system\n",selected.entry);
     return AhciSystemBoot::Ready;
+}
+
+void AhciSystemDataInspect() {
+    // The marker is a bounded selector, not an instruction to mount or write.
+    VnodeStat st{};const int exists=VfsLstatPath("/etc/ahci-data-inspect",&st);
+    if(exists==-2)return;
+    if(exists || st.isDir || st.isSymlink || !st.size || st.size>160) {
+        KPrintf("ahci data inspect: invalid selector metadata\n");return;
+    }
+    auto* node=VfsOpen("/etc/ahci-data-inspect",VFS_O_STREAM);
+    if(!node){KPrintf("ahci data inspect: selector open failed\n");return;}
+    char dataRecord[160]{};uint64_t offset=0;
+    const bool dataRead=VfsRead(node,dataRecord,st.size,&offset)==int(st.size);
+    VfsRelease(node);AhciDataSelector data{};
+    if(!dataRead || !AhciDataSelectorParse(dataRecord,uint32_t(st.size),data)) {
+        KPrintf("ahci data inspect: selector parse failed\n");return;
+    }
+    if(VfsLstatPath("/etc/ahci-boot-volume",&st) || st.isDir || st.isSymlink || !st.size || st.size>128) {
+        KPrintf("ahci data inspect: boot selector metadata failed\n");return;
+    }
+    node=VfsOpen("/etc/ahci-boot-volume",VFS_O_STREAM);
+    if(!node){KPrintf("ahci data inspect: boot selector open failed\n");return;}
+    char bootRecord[128]{};offset=0;
+    const bool bootRead=VfsRead(node,bootRecord,st.size,&offset)==int(st.size);
+    VfsRelease(node);AhciBootSelector boot{};
+    if(!bootRead || !AhciBootSelectorParse(bootRecord,uint32_t(st.size),boot)) {
+        KPrintf("ahci data inspect: boot selector parse failed\n");return;
+    }
+    Device* disk=AhciWriteAdmittedDevice();
+    if(!disk || !disk->ops || !disk->ops->read || DeviceBlockSize(disk)!=512) {
+        KPrintf("ahci data inspect: admitted disk unavailable\n");return;
+    }
+    // Header validation bounds entry arrays to 1 MiB; the large ext2 helper
+    // bounds descriptor bytes to 128 KiB. All scratch is private to boot.
+    constexpr uint32_t EntryCapacity=1024*1024, GdtCapacity=4096*32;
+    auto* entries=static_cast<uint8_t*>(kmalloc(EntryCapacity));
+    auto* backup=static_cast<uint8_t*>(kmalloc(EntryCapacity));
+    auto* gdt=static_cast<uint8_t*>(kmalloc(GdtCapacity));
+    if(!entries || !backup || !gdt) {
+        if(entries)kfree(entries);if(backup)kfree(backup);if(gdt)kfree(gdt);
+        KPrintf("ahci data inspect: scratch allocation failed\n");return;
+    }
+    const AhciDataReadIo io{disk,[](void* context,uint64_t at,void* buffer,uint32_t length)->int {
+        auto* dev=static_cast<Device*>(context);return dev->ops->read(dev,at,buffer,length);
+    }};
+    AhciDataInspection result{};
+    const auto state=AhciReadAndInspectBootData(io,boot,data,DeviceBlockCount(disk),entries,backup,
+                                                EntryCapacity,gdt,GdtCapacity,result);
+    kfree(entries);kfree(backup);kfree(gdt);
+    if(state==AhciDataInspectionState::Clean)
+        KPrintf("ahci data inspect: format eligible entry=%u groups=%u (read only)\n",result.data.entry,result.geometry.groups);
+    else if(state==AhciDataInspectionState::NeedsCheck)
+        KPrintf("ahci data inspect: offline filesystem check required (read only)\n");
+    else KPrintf("ahci data inspect: identity or format rejected (read only)\n");
 }
 } // namespace brook

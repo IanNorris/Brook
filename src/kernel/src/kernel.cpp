@@ -899,6 +899,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
+    if(systemVolume==brook::AhciSystemBoot::Ready)brook::AhciSystemDataInspect();
     const auto writableDesktop=systemVolume==brook::AhciSystemBoot::Maintenance ? brook::WritableDesktopBoot::Maintenance :
         brook::WritableDesktopBootMount(&nextPdrv,systemVolume==brook::AhciSystemBoot::Ready ?
             brook::WritableDesktopSource::System : brook::WritableDesktopSource::Usb);

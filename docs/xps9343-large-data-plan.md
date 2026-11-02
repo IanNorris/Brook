@@ -149,3 +149,14 @@ read steps, and an injected dirty header returns an offline-check candidate
 without reading the descriptor table. The caller must still pin disk identity,
 layout and contents; these host-file callbacks do not test an AHCI controller,
 exclusive ownership, mounting or writes.
+
+An opt-in boot diagnostic now invokes that reader only after the existing
+system-volume admission succeeds and `/etc/ahci-data-inspect` supplies a valid
+selector. It reports a format-eligible header, offline-check requirement or
+rejection; it does not mount the data store or change the desktop fallback
+decision. The ordinary boot has no such marker. Host tests cover absent and
+invalid selectors, each scratch-allocation failure, a device-read failure,
+dirty and valid fixtures, with no writes or additional mounts. The kernel
+builds, but this wiring has not been boot-tested in QEMU or deployed to the
+Dell. A failed hardware read can still quarantine the existing AHCI device,
+so read-only inspection is not necessarily operationally harmless.
