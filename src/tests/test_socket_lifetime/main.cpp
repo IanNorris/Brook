@@ -537,6 +537,21 @@ int main() {
         TcpSendFlightState normal(8);assert(normal.Allocate() && !normal.Allocate());
         TcpSendFlightState wide(16);assert(wide.Allocate() && !wide.Allocate());
     }
+    // The pump itself does not need a current process. Its waiting result
+    // transfers the held socket lock so a caller can arm a wakeup atomically.
+    {
+        int socket=create();setupTcp(socket);auto& s=g_sockets[socket];
+        TcpSendFlightState flight(2);assert(flight.Allocate());
+        TcpFlightPump pump{s,flight,10,4,536,static_cast<uint32_t>(socket),2,false};
+        assert(currentProcess==nullptr);s.tcpSndWnd=0;
+        const auto wait=pump.Step(1,100);
+        assert(wait.action==FlightAction::WaitLocked && wait.wakeTick==21);
+        SpinLockRelease(&s.lock);
+        s.tcpSndWnd=65535;
+        const auto copy=pump.Step(2,100);
+        assert(copy.action==FlightAction::Copy && copy.copyLength==4);
+        SockClose(socket);
+    }
     {
         const char a[]="abc",b[]="defgh";
         TcpSendVector vectors[]={{reinterpret_cast<uint64_t>(a),3},{~uint64_t(0),0},

@@ -26,10 +26,16 @@ wait while serving other sockets. Timeout, reset, close, and slot reuse need
 explicit tests, and the existing unsupported Internet `shutdown` semantics
 remain unchanged until queue draining and half-close are implemented together.
 
-Before connecting a worker, extract the existing call-local flight step into a
-persistent pump that does not depend on a syscall's `Process*`, user buffer,
-or call deadline. Test it using the existing caller-driven ACK-synchronous
-path first. The actual-code lifetime tests now check that an additional owner
+The existing flight step is now a separate pump with explicit retained state;
+the caller supplies the observation time and deadline. Its step does not own
+a syscall process or user buffer. A `WaitLocked` result transfers the socket
+lock to the caller so it can install a waiter before releasing it; all other
+results leave the lock released. The caller still owns the state and executes
+the ACK-synchronous loop. This preserves the wakeup ordering, but does not
+make the pump safe for a shared worker: state mutation needs exclusive
+ownership, transmission may block, and completion accounting is call-based.
+Hosted sender tests and the USB Ethernet QEMU loss/concurrency test pass with
+the extracted step. The actual-code lifetime tests also check that an additional owner
 survives application close, acknowledges data before emitting FIN with the
 next sequence number, and permits clean socket-slot reuse. This tests a
 necessary ownership primitive; it does not demonstrate a queued sender.
