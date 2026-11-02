@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <thread>
 #include <chrono>
+#include <initializer_list>
 #include "../../kernel/src/net.cpp"
 #include "../../kernel/src/arp_probe_tracker.h"
 namespace brook { int SocketLifetimeTestTransmit(uint32_t,uint32_t,uint8_t,const void*,uint32_t); }
@@ -62,6 +63,7 @@ uint32_t capturedFrameLength=0;
 int frameTransmitResult=0;
 unsigned frameTransmitCalls=0;
 bool injectReplyDuringTransmit=false,changeConfigDuringTransmit=false,injectTcpAck=false;
+unsigned tryTransmitCalls=0,tryTransmitBusy=0;
 int captureFrame(brook::NetIf* nif,const void* frame,uint32_t length) {
     assert(length<=sizeof(capturedFrame));
     memcpy(capturedFrame,frame,length);capturedFrameLength=length;++frameTransmitCalls;
@@ -89,6 +91,10 @@ int captureFrame(brook::NetIf* nif,const void* frame,uint32_t length) {
         }
     }
     return frameTransmitResult;
+}
+int tryCaptureFrame(brook::NetIf* nif,const void* frame,uint32_t length){
+    ++tryTransmitCalls;if(tryTransmitBusy){--tryTransmitBusy;return -11;}
+    return captureFrame(nif,frame,length);
 }
 }
 namespace brook {
@@ -429,6 +435,25 @@ int main() {
         assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,remote,IP_PROTO_TCP,payload,sizeof(payload))==0);
         const auto* routed=reinterpret_cast<const Ipv4Header*>(capturedFrame+sizeof(EthHeader));
         assert(routed->dstIp==remote && !memcmp(&reinterpret_cast<const EthHeader*>(capturedFrame)->dst,&peer,sizeof(peer)));
+        // Try-only mode never falls back to the blocking callback. Both the
+        // ARP request and TCP data use the optional immediate callback.
+        g_arpAsyncProbe=AsyncArpTracker{};ticks=1;frameTransmitCalls=0;tryTransmitCalls=0;
+        g_tcpTryTransmit=true;nif.gateway=0;NetInterfaceChangedLocked();
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        assert(frameTransmitCalls==0); // no callback: fail closed, no legacy transmit
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-95);
+        g_arpAsyncProbe=AsyncArpTracker{};ticks=1;nif.tryTransmit=tryCaptureFrame;
+        tryTransmitBusy=1;injectReplyDuringTransmit=true;
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        assert(tryTransmitCalls==1 && frameTransmitCalls==0);
+        ticks=11;assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        assert(tryTransmitCalls==2 && frameTransmitCalls==1);
+        tryTransmitBusy=1;
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==-11);
+        assert(frameTransmitCalls==1);
+        assert(NetSendIpv4AsyncNeighbor(nif.ipAddr,target,IP_PROTO_TCP,payload,sizeof(payload))==0);
+        assert(tryTransmitCalls==4 && frameTransmitCalls==2);
+        g_tcpTryTransmit=false;nif.tryTransmit=nullptr;
         g_arpAsyncProbeEnabled=false;g_arpAsyncProbe=AsyncArpTracker{};
         g_netIfs[0]=nullptr;g_netIfCount=0;g_interfaceGeneration=1;
         memset(g_arpCache,0,sizeof(g_arpCache));g_arpCount=0;
@@ -536,6 +561,20 @@ int main() {
         TcpSendFlightState empty(0);assert(!empty.Allocate());
         TcpSendFlightState normal(8);assert(normal.Allocate() && !normal.Allocate());
         TcpSendFlightState wide(16);assert(wide.Allocate() && !wide.Allocate());
+    }
+    {
+        IrqSpinLock lock{};uint64_t flags=123;
+        assert(IrqSpinLockTryAcquire(&lock,&flags));
+        const auto next=lock.next,serving=lock.serving;uint64_t untouched=456;
+        assert(!IrqSpinLockTryAcquire(&lock,&untouched));
+        assert(untouched==456 && lock.next==next && lock.serving==serving);
+        IrqSpinLockRelease(&lock,flags);
+        lock.next=2;lock.serving=1; // queued ticket, even without a holder
+        assert(!IrqSpinLockTryAcquire(&lock,&untouched) && lock.next==2 && lock.serving==1);
+        lock.serving=2;assert(IrqSpinLockTryAcquire(&lock,&flags));IrqSpinLockRelease(&lock,flags);
+        lock.next=lock.serving=~uint32_t(0);
+        assert(IrqSpinLockTryAcquire(&lock,&flags) && lock.next==0);
+        IrqSpinLockRelease(&lock,flags);assert(lock.serving==0);
     }
     // The pump itself does not need a current process. Its waiting result
     // transfers the held socket lock so a caller can arm a wakeup atomically.

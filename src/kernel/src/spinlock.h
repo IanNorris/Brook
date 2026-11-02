@@ -110,6 +110,37 @@ static inline uint64_t IrqSpinLockAcquireImpl(IrqSpinLock* lock,
     return flags;
 }
 
+// Claim a completely idle IRQ lock without joining its ticket queue. On
+// failure restore the caller's interrupt state and do not change *savedFlags.
+static inline bool IrqSpinLockTryAcquireImpl(IrqSpinLock* lock, uint64_t* savedFlags,
+                                             const char* file, uint32_t line)
+{
+    uint64_t flags=0;
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+#endif
+    uint32_t serving=__atomic_load_n(&lock->serving,__ATOMIC_ACQUIRE);
+    uint32_t next=__atomic_load_n(&lock->next,__ATOMIC_RELAXED);
+    const bool acquired=next==serving && __atomic_compare_exchange_n(
+        &lock->next,&next,next+1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED);
+    if (!acquired) {
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
+        if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+#endif
+        return false;
+    }
+#ifdef __BROOK_KERNEL__
+    uint32_t cpu;
+    __asm__ volatile("movl %%gs:176, %0" : "=r"(cpu));
+    if(cpu<64){g_lockDiag[cpu].file=file;g_lockDiag[cpu].line=line;
+        __atomic_store_n(&g_lockDiag[cpu].held,1u,__ATOMIC_RELEASE);}
+#else
+    (void)file;(void)line;
+#endif
+    *savedFlags=flags;
+    return true;
+}
+
 static inline void IrqSpinLockRelease(IrqSpinLock* lock, uint64_t savedFlags)
 {
 #ifdef __BROOK_KERNEL__
@@ -131,5 +162,6 @@ static inline void IrqSpinLockRelease(IrqSpinLock* lock, uint64_t savedFlags)
 }
 
 #define IrqSpinLockAcquire(lock) IrqSpinLockAcquireImpl((lock), __FILE__, __LINE__)
+#define IrqSpinLockTryAcquire(lock, flags) IrqSpinLockTryAcquireImpl((lock), (flags), __FILE__, __LINE__)
 
 } // namespace brook

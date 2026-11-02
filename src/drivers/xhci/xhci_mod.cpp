@@ -2342,10 +2342,12 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     }
     return false;
 }
-static int XhciEcmTransmit(NetIf* nif,const void* frame,uint32_t bytes){
+static int XhciEcmTransmitImpl(NetIf* nif,const void* frame,uint32_t bytes,bool tryOnly){
     if(!frame || bytes<14 || bytes>1514)return -22;
     auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);auto& dev=*net.device;
-    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    uint64_t saved;
+    if(tryOnly){if(!IrqSpinLockTryAcquire(&g_eventRingLock,&saved))return -11;}
+    else saved=IrqSpinLockAcquire(&g_eventRingLock);
     if(net.failed || net.controller->completionFailed){IrqSpinLockRelease(&g_eventRingLock,saved);return -5;}
     const int freeSlot=net.sends.Free(net.txDepth);
     if(freeSlot>=0){const auto i=static_cast<unsigned>(freeSlot);
@@ -2367,6 +2369,12 @@ static int XhciEcmTransmit(NetIf* nif,const void* frame,uint32_t bytes){
         IrqSpinLockRelease(&g_eventRingLock,saved);return 0;
     }
     ++net.txBusy;IrqSpinLockRelease(&g_eventRingLock,saved);return -11;
+}
+static int XhciEcmTransmit(NetIf* nif,const void* frame,uint32_t bytes){
+    return XhciEcmTransmitImpl(nif,frame,bytes,false);
+}
+static int XhciEcmTryTransmit(NetIf* nif,const void* frame,uint32_t bytes){
+    return XhciEcmTransmitImpl(nif,frame,bytes,true);
 }
 static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
     if(!nif || !out || !nif->driverPriv)return false;
@@ -2462,7 +2470,7 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     request={};request.bmRequestType=0x21;request.bRequest=0x43;request.wValue=0x000c;request.wIndex=dev.ecm.control;
 
     if(!XhciControlTransfer(ctrl,dev,request,nullptr,0,0,0))return false;
-    net->interface.driverPriv=net;net->interface.transmit=XhciEcmTransmit;net->interface.poll=XhciEcmPoll;net->interface.snapshot=XhciEcmSnapshot;
+    net->interface.driverPriv=net;net->interface.transmit=XhciEcmTransmit;net->interface.tryTransmit=XhciEcmTryTransmit;net->interface.poll=XhciEcmPoll;net->interface.snapshot=XhciEcmSnapshot;
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
     dev.network=net;XhciEcmReceiveArm(*net);XhciEcmNotificationArm(*net);
     IrqSpinLockRelease(&g_eventRingLock,saved);

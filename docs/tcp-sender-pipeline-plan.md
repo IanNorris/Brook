@@ -45,6 +45,28 @@ current sender waits for each 1,200-byte segment to be acknowledged before
 sending the next; removing its explicit post-ACK yield did not improve the
 measurement. This is a local-path result, not a diagnosis of every WAN upload.
 
+The experimental `/etc/tcp-try-transmit` marker requires the existing async
+neighbor and TCP flight markers. It selects an optional immediate driver
+callback for both neighbor requests and off-host TCP data. Missing support
+fails rather than falling back to a blocking callback. xHCI ECM tries the
+event-ring lock once: contention returns `EAGAIN` before publishing anything;
+success copies the frame into a driver-owned DMA slot. The ordinary callback
+is unchanged. This extends `NetIf` and requires kernel/module ABI 63.
+The test remains synchronous and disabled by default. Loopback, local delivery
+and TCP control packets still use their existing paths. Bounded software work
+does not guarantee bounded MMIO latency, and interface lifetime/configuration
+still needs attention before a shared worker uses this interface.
+
+Hosted tests exercise ticket-lock contention, queued tickets and wraparound;
+the actual ECM driver path is tested with fake DMA/ring/doorbell memory for
+contention, invalid input, controller failure, full slots, success and a ZLP
+across ring wrap. The wrap test injects completions directly; it does not test
+hardware consumer ordering or completion-event dispatch. QEMU USB Ethernet
+passed with the marker, loss and concurrent writers, and also in the default
+configuration. Hosted builds omit privileged CLI/STI, so these tests do not
+prove interrupt-state restoration. This candidate has not been tested on the
+physical Dell and makes no throughput claim.
+
 Before adding a two-segment flight, establish single-writer ownership and
 sequence reservation using the actual socket lifetime machinery. A persistent
 per-slot sleeping send lock must survive payload resets. A sender needs a

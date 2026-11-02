@@ -193,6 +193,10 @@ struct NetIf {
     volatile uint64_t txBytes;
     volatile uint32_t rxPackets;
     volatile uint32_t txPackets;
+
+    // Optional immediate submission: EAGAIN means no frame was published;
+    // success means the entire frame was copied into driver-owned storage.
+    int (*tryTransmit)(NetIf* nif, const void* frame, uint32_t len);
 };
 
 // ---------------------------------------------------------------------------

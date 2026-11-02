@@ -95,6 +95,12 @@ add_test(NAME catpt_mailbox COMMAND test_catpt_mailbox)
 add_executable(test_usb_ecm_tx_slots "${BROOK_ROOT}/src/tests/test_usb_ecm_tx_slots/main.cpp")
 target_compile_options(test_usb_ecm_tx_slots PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci" -UNDEBUG)
 add_test(NAME usb_ecm_tx_slots COMMAND test_usb_ecm_tx_slots)
+add_executable(test_xhci_try_transmit "${BROOK_ROOT}/src/tests/test_xhci_try_transmit/main.cpp")
+target_compile_options(test_xhci_try_transmit PRIVATE -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    -include initializer_list "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km" "-iquote${BROOK_ROOT}/src/drivers/xhci")
+target_link_options(test_xhci_try_transmit PRIVATE -Wl,--gc-sections)
+add_test(NAME xhci_try_transmit COMMAND test_xhci_try_transmit)
 add_host_test(test_boot_resource_map)
 target_compile_options(test_boot_resource_map PRIVATE "-iquote${BROOK_ROOT}/src/shared")
 add_host_test(test_kernel_alias_probe)

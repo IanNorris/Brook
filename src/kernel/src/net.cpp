@@ -397,7 +397,7 @@ static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 
 // Use the caller's selected interface and report local enqueue failure. The
 // legacy resolver below still selects its interface and ignores this result.
-static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,uint32_t targetIp)
+static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,uint32_t targetIp,bool tryOnly=false)
 {
     if (!nif) return -1;
 
@@ -420,6 +420,7 @@ static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,u
     memset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
+    if(tryOnly)return nif->tryTransmit ? nif->tryTransmit(nif,frame,42) : -95;
     return nif->transmit(nif, frame, 42);
 }
 
@@ -638,9 +639,10 @@ static bool NetIpv4PayloadFits(uint32_t payloadLen)
 // for use by a shared worker.
 static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
                                uint32_t source, uint32_t dstIp, uint8_t proto,
-                               const void* payload, uint32_t payloadLen)
+                               const void* payload, uint32_t payloadLen,bool tryOnly=false)
 {
     if (!NetIpv4PayloadFits(payloadLen)) return -3;
+    if (tryOnly && !nif->tryTransmit) return -95;
     uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
     uint32_t frameLen = sizeof(EthHeader) + ipLen;
     if (frameLen > ETH_FRAME_MAX) return -3;
@@ -668,7 +670,7 @@ static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
 
     nif->txPackets++;
     nif->txBytes += frameLen;
-    return nif->transmit(nif, frame, frameLen);
+    return tryOnly ? nif->tryTransmit(nif,frame,frameLen) : nif->transmit(nif,frame,frameLen);
 }
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
                           const void* payload, uint32_t payloadLen)
@@ -894,6 +896,7 @@ static bool g_tcpFourPacketFlight = false;
 static bool g_tcpAdaptiveFlight = false;
 static bool g_tcpAdaptiveFlight16 = false;
 static bool g_tcpAsyncNeighbor = false;
+static bool g_tcpTryTransmit = false;
 
 void NetConfigureBoot()
 {
@@ -905,6 +908,11 @@ void NetConfigureBoot()
         VfsClose(marker);
         if(g_arpAsyncProbeEnabled){g_tcpAsyncNeighbor=true;KPuts("net: TCP async neighbor experiment enabled\n");}
         else KPuts("net: TCP async neighbor requires ARP probe marker\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-try-transmit")) {
+        VfsClose(marker);
+        if(g_tcpAsyncNeighbor){g_tcpTryTransmit=true;KPuts("net: TCP try-transmit experiment enabled\n");}
+        else KPuts("net: TCP try-transmit requires async neighbor marker\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
         VfsClose(marker);g_tcpSendProbe = true;
@@ -963,10 +971,11 @@ void NetInit()
 void NetRegisterIf(NetIf* nif)
 {
     if(!nif || !nif->transmit)return;
-    uintptr_t callbacks[3];uint32_t callbackCount=0;
+    uintptr_t callbacks[4];uint32_t callbackCount=0;
     callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->transmit);
     if(nif->poll)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->poll);
     if(nif->snapshot)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->snapshot);
+    if(nif->tryTransmit)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->tryTransmit);
     if(!ModuleRetainAddresses(callbacks,callbackCount)){
         SerialPuts("net: interface callback provider unavailable\n");return;
     }
@@ -1046,7 +1055,7 @@ static void ArpAsyncProbeService()
     int result=-116; // ESTALE
     if(ticket.interfaceId==view.generation && NetReadSingleInterface(&current) &&
        current.interface==view.interface && current.generation==view.generation)
-        result=ArpSendRequestFrom(view.interface,view.mac,view.ip,ticket.ip);
+        result=ArpSendRequestFrom(view.interface,view.mac,view.ip,ticket.ip,g_tcpTryTransmit);
     flags=IrqSpinLockAcquire(&g_arpAsyncProbeLock);
     (void)g_arpAsyncProbe.Complete(ticket,result,ApicTickCount());
     IrqSpinLockRelease(&g_arpAsyncProbeLock,flags);
@@ -1091,7 +1100,7 @@ static int NetSendIpv4AsyncNeighbor(uint32_t source,uint32_t destination,uint8_t
     if(!NetReadSingleInterface(&current) || current.interface!=view.interface ||
        current.generation!=view.generation)return -11;
     MacAddr mac{};for(unsigned i=0;i<6;++i)mac.b[i]=static_cast<uint8_t>(result.mac>>(8*i));
-    return NetSendIpv4Resolved(view.interface,mac,source,destination,protocol,payload,length);
+    return NetSendIpv4Resolved(view.interface,mac,source,destination,protocol,payload,length,g_tcpTryTransmit);
 }
 
 SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid)
