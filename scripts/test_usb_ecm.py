@@ -30,6 +30,7 @@ ap.add_argument('--tcp-queue-stage',action='store_true',help='Stage synchronous 
 ap.add_argument('--tcp-async-send',action='store_true',help='Exercise bounded asynchronous per-connection TCP workers')
 ap.add_argument('--tcp-worker-waiter',action='store_true',help='Give TCP sender workers a separate ACK waiter')
 ap.add_argument('--tcp-producer-wake',action='store_true',help='Wake blocked TCP producers when send capacity returns')
+ap.add_argument('--tcp-async-retry-1ms',action='store_true',help='Use the experimental shorter local-busy retry interval')
 ap.add_argument('--small-write-benchmark',action='store_true',help='Measure a 1 MiB stream of 1 KiB writes')
 ap.add_argument('--async-pool-test',action='store_true',help='Exercise poll/epoll while the async TCP worker pool is saturated')
 ap.add_argument('--async-blocked-close',action='store_true',help='Exercise close while an async writer is blocked by backpressure')
@@ -42,6 +43,7 @@ if args.async_pool_test and not args.tcp_async_send:ap.error('--async-pool-test 
 if args.async_blocked_close and not args.tcp_async_send:ap.error('--async-blocked-close requires --tcp-async-send')
 if args.tcp_worker_waiter and not args.tcp_async_send:ap.error('--tcp-worker-waiter requires --tcp-async-send')
 if args.tcp_producer_wake and not args.tcp_async_send:ap.error('--tcp-producer-wake requires --tcp-async-send')
+if args.tcp_async_retry_1ms and not args.tcp_producer_wake:ap.error('--tcp-async-retry-1ms requires --tcp-producer-wake')
 if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))>1:ap.error('choose only one flight mode')
 if not 0<=args.network_delay_us<=50000:ap.error('network delay must be between 0 and 50000 microseconds')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
@@ -115,6 +117,7 @@ if args.tcp_queue_stage:run('mcopy','-i',initrd,marker,'::ETC/tcp-queue-stage')
 if args.tcp_async_send:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-send')
 if args.tcp_worker_waiter:run('mcopy','-i',initrd,marker,'::ETC/tcp-worker-waiter')
 if args.tcp_producer_wake:run('mcopy','-i',initrd,marker,'::ETC/tcp-producer-wake')
+if args.tcp_async_retry_1ms:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-retry-1ms')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -339,6 +342,8 @@ try:
   assert 'dedicated TCP worker waiter enabled' in serial,'dedicated worker waiter was not enabled'
  if args.tcp_producer_wake:
   assert 'TCP producer capacity wake enabled' in serial,'producer capacity wake was not enabled'
+ if args.tcp_async_retry_1ms:
+  assert 'TCP async 1ms local retry enabled' in serial,'fast local retry was not enabled'
  q.call('quit');assert owner.wait(timeout=15)==0
  if loss_thread:
   loss_thread.join(5);assert not loss_thread.is_alive(),'Packet relay did not stop'

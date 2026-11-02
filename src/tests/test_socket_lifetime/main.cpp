@@ -1674,6 +1674,14 @@ int main() {
     {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
     assert(firstDataRetryTick==201 && rejectDataRemaining==0);
     g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Short local retries must not starve an older unacknowledged packet's RTO.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;g_tcpAsyncFastLocalRetry=true;capturedDataCount=0;skipDataAcks=1;acknowledgeDataCount=2;
+    rejectDataSeq=546;rejectDataRemaining=250;firstDataRetryTick=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(firstDataRetryTick==201 && rejectDataRemaining==0);
+    g_tcpAsyncFastLocalRetry=false;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // Partial ACK followed by loss retries only the oldest missing suffix.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
@@ -1709,6 +1717,20 @@ int main() {
     assert(capturedDataCount==3 && capturedDataSeq[0]==10 && capturedDataSeq[1]==10);
     assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
     g_tcpTwoPacketFlight=false;g_tcpQueueStage=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Local retry preserves the reservation and is bounded even if busy persists.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;g_tcpAsyncFastLocalRetry=true;failDataSubmissions=1;acknowledgeDataCount=2;capturedDataCount=0;firstDataRetryTick=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==3 && capturedDataSeq[0]==10 && capturedDataSeq[1]==10 && firstDataRetryTick==2);
+    assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
+    g_tcpAsyncFastLocalRetry=false;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpTwoPacketFlight=true;g_tcpAsyncFastLocalRetry=true;rejectDataSeq=10;rejectDataRemaining=100000;capturedDataCount=0;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==-110);}
+    assert(g_sockets[i].tcpState==TcpState::Closed && SockGetConnectError(i)==110);
+    rejectDataRemaining=0;g_tcpAsyncFastLocalRetry=false;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // Previously ACKed chunks are reported even when the next one times out.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;acknowledgeDataCount=1;

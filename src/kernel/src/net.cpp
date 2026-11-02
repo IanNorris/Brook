@@ -946,6 +946,7 @@ static bool g_tcpTryTransmit = false;
 static bool g_tcpQueueStage = false;
 static bool g_tcpAsyncSend = false;
 static bool g_tcpProducerWake = false;
+static bool g_tcpAsyncFastLocalRetry = false;
 static bool g_irqTryLockProbe = false;
 static uint32_t g_irqTryLockProbeState=0,g_irqTryLockProbePassed=0;
 static uint32_t DebugIrqTryLockProbe();
@@ -981,6 +982,11 @@ void NetConfigureBoot()
         VfsClose(marker);
         if(g_tcpAsyncSend){g_tcpProducerWake=true;KPuts("net: TCP producer capacity wake enabled (experimental)\n");}
         else KPuts("net: TCP producer capacity wake requires async sender\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-async-retry-1ms")) {
+        VfsClose(marker);
+        if(g_tcpProducerWake){g_tcpAsyncFastLocalRetry=true;KPuts("net: TCP async 1ms local retry enabled (experimental)\n");}
+        else KPuts("net: TCP async fast retry requires producer wake\n");
     }
     if (auto* marker=VfsOpen("/etc/tcp-worker-waiter")) {
         VfsClose(marker);
@@ -3612,7 +3618,7 @@ struct TcpFlightPump {
                 slot.retryAt = after + (200ULL << shift);
             } else if (result == -11) {
                 if (g_tcpSendProbe) TcpProbeAdd(g_tcpSendProbeStats.busy);
-                slot.retryAt = after + 10;
+                slot.retryAt = after + (g_tcpAsyncFastLocalRetry ? 1 : 10);
             } else return {FlightAction::Done,Finish(result < 0 ? result : -5)};
             return {FlightAction::Again,0};
         }

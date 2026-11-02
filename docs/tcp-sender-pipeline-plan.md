@@ -199,6 +199,30 @@ The additional diagnostics can add overhead and these samples are not
 directly comparable to the earlier 2.88–2.90-second runs. The known-good boot
 was restored afterward.
 
+The 1 ms local-`EAGAIN` retry was revisited with producer wakeups enabled,
+using the same kernel and settings in both Dell images. It changes only the
+local busy retry for flight sends on that boot; the network RTO, congestion
+policy, overall deadline and producer fallback stay unchanged. The interval is
+one APIC tick, not a separately calibrated wall-clock guarantee. Two 32 MiB LAN uploads took 2.96 and
+3.07 seconds with the original 10 ms retry, versus 2.11 and 2.05 seconds
+with 1 ms; all receiver hashes matched and no retransmission attempts were
+recorded. Three 1 MiB HTTPS checks took 1.14–1.20 seconds and 1.06–1.13
+seconds respectively, all HTTP 200. These are short grouped runs, not an
+alternating WAN or long-duration stability comparison.
+
+In a further instrumented upload, Astra compared active windows from the
+earlier producer-wakeup profile and the 1 ms profile. The old profile showed
+105 producer waits of exactly 10 ticks; the fast profile showed none, with
+almost all its waits one tick. The fast run had about 33% more context
+switches per second over equal 2.057-second windows, but fewer total switches
+to finish its shorter transfer. Non-idle CPU samples were sparse; IRQ-masked
+work and same-tick ordering are not fully represented. This supports the
+retry-delay hypothesis without correlating individual busy events to waits.
+The fast option remains experimental and requires the producer-wakeup marker;
+bounded host and lossy/backpressure QEMU tests passed, and the Dell returned
+to its known-good boot. The profile is under
+`build/hardware/dell-pwake-fast-sustained-profile-20261102`.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
