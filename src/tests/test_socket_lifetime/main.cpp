@@ -575,6 +575,15 @@ int main() {
         lock.next=lock.serving=~uint32_t(0);
         assert(IrqSpinLockTryAcquire(&lock,&flags) && lock.next==0);
         IrqSpinLockRelease(&lock,flags);assert(lock.serving==0);
+        unsigned protectedCount=0;
+        std::thread blocking([&]{for(unsigned n=0;n<10000;++n){
+            auto held=IrqSpinLockAcquire(&lock);++protectedCount;IrqSpinLockRelease(&lock,held);
+        }});
+        std::thread trying([&]{for(unsigned n=0;n<10000;++n){
+            uint64_t held;while(!IrqSpinLockTryAcquire(&lock,&held))std::this_thread::yield();
+            ++protectedCount;IrqSpinLockRelease(&lock,held);
+        }});
+        blocking.join();trying.join();assert(protectedCount==20000 && lock.next==lock.serving);
     }
     // The pump itself does not need a current process. Its waiting result
     // transfers the held socket lock so a caller can arm a wakeup atomically.

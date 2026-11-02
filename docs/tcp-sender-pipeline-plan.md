@@ -63,9 +63,12 @@ contention, invalid input, controller failure, full slots, success and a ZLP
 across ring wrap. The wrap test injects completions directly; it does not test
 hardware consumer ordering or completion-event dispatch. QEMU USB Ethernet
 passed with the marker, loss and concurrent writers, and also in the default
-configuration. Hosted builds omit privileged CLI/STI, so these tests do not
-prove interrupt-state restoration. This candidate has not been tested on the
-physical Dell and makes no throughput claim.
+configuration. An opt-in dedicated kernel-thread probe also passed in QEMU
+for successful and busy try-lock operations with IF initially set and clear,
+checking that both paths restore the original state. This verifies local
+interrupt-state behavior in that VM, not inter-CPU fairness or hardware
+latency. This candidate has not been tested on the physical Dell and makes
+no throughput claim.
 
 Before adding a two-segment flight, establish single-writer ownership and
 sequence reservation using the actual socket lifetime machinery. A persistent

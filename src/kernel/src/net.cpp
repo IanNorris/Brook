@@ -897,9 +897,15 @@ static bool g_tcpAdaptiveFlight = false;
 static bool g_tcpAdaptiveFlight16 = false;
 static bool g_tcpAsyncNeighbor = false;
 static bool g_tcpTryTransmit = false;
+static bool g_irqTryLockProbe = false;
+static uint32_t g_irqTryLockProbeState=0,g_irqTryLockProbePassed=0;
+static uint32_t DebugIrqTryLockProbe();
 
 void NetConfigureBoot()
 {
+    if (auto* marker=VfsOpen("/etc/irq-trylock-probe")) {
+        VfsClose(marker);g_irqTryLockProbe=true;
+    }
     if (auto* marker=VfsOpen("/etc/arp-async-probe")) {
         VfsClose(marker);g_arpAsyncProbeEnabled=true;
         KPuts("net: isolated asynchronous ARP probe enabled\n");
@@ -1168,6 +1174,16 @@ void NetStartPollThread()
     // Called on the BSP after the synchronous DHCP/ARP boot phase returns.
     __atomic_store_n(&g_netEarlyBootPolling, false, __ATOMIC_RELEASE);
     if (!g_netIf) return;
+    uint32_t notStarted=0;
+    if(g_irqTryLockProbe && __atomic_compare_exchange_n(&g_irqTryLockProbeState,&notStarted,3u,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+        Process* test=KernelThreadCreate("irq_try_test",[](void*){
+            const auto result=DebugIrqTryLockProbe();
+            __atomic_store_n(&g_irqTryLockProbePassed,result,__ATOMIC_RELAXED);
+            __atomic_store_n(&g_irqTryLockProbeState,1u,__ATOMIC_RELEASE);
+        },nullptr,2);
+        if(test)SchedulerAddProcess(test);
+        else __atomic_store_n(&g_irqTryLockProbeState,2u,__ATOMIC_RELEASE);
+    }
 
     // Spawn a background thread to continuously drain the NIC receive ring.
     // This is needed because SockRecv/Connect block via SchedulerBlock rather
@@ -4631,6 +4647,38 @@ static void DebugMemoryCensus()
     footer.text(",\"excludes\":\"construction,staging,cache-only,kernel,page-tables,queued-teardown,quarantine\"}\n");footer.send();
 }
 
+// Explicitly enabled diagnostic; call only in a scheduled kernel thread with
+// interrupts enabled and no locks held. The temporary lock is private to this
+// invocation. No I/O or scheduler call is made while interrupts are disabled.
+static uint32_t DebugIrqTryLockProbe()
+{
+    uint64_t original;
+    __asm__ volatile("pushfq; pop %0" : "=r"(original) :: "memory");
+    if(!(original&0x200) || !ProcessCurrent() || !ProcessCurrent()->isKernelThread)return 0;
+    uint32_t passed=0;
+    for(unsigned enabled=0;enabled<2;++enabled) {
+        IrqSpinLock lock{};uint64_t saved=~uint64_t(0),during=0,after=0;
+        if(enabled)__asm__ volatile("sti" ::: "memory");
+        else __asm__ volatile("cli" ::: "memory");
+        const bool acquired=IrqSpinLockTryAcquire(&lock,&saved);
+        __asm__ volatile("pushfq; pop %0" : "=r"(during) :: "memory");
+        if(acquired)IrqSpinLockRelease(&lock,saved);
+        __asm__ volatile("pushfq; pop %0" : "=r"(after) :: "memory");
+        if(acquired && !(during&0x200) && bool(saved&0x200)==bool(enabled) &&
+           bool(after&0x200)==bool(enabled) && lock.next==lock.serving)passed|=1u<<(enabled*2);
+        // Simulate a held ticket without involving another CPU or touching
+        // diagnostic ownership. Failure must not alter the caller's flags.
+        lock.next=1;lock.serving=0;saved=~uint64_t(0);
+        const bool busy=IrqSpinLockTryAcquire(&lock,&saved);
+        __asm__ volatile("pushfq; pop %0" : "=r"(after) :: "memory");
+        if(!busy && saved==~uint64_t(0) && bool(after&0x200)==bool(enabled) &&
+           lock.next==1 && lock.serving==0)passed|=2u<<(enabled*2);
+        if(busy)IrqSpinLockRelease(&lock,saved);
+    }
+    __asm__ volatile("sti" ::: "memory"); // original IF was checked above
+    return passed;
+}
+
 void DebugHandleCommand(const char* cmd, uint32_t len)
 {
     (void)len;
@@ -4689,6 +4737,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(result == 0 ? "true" : "false");
         r.text(",\"sync_guarantee\":\"checked_filesystem_and_device_flush\"}\n");
         r.send(); return;
+    }
+    if (NetStrEq(cmd, "bridge irq-trylock-probe")) {
+        const auto status=__atomic_load_n(&g_irqTryLockProbeState,__ATOMIC_ACQUIRE);
+        const auto passed=__atomic_load_n(&g_irqTryLockProbePassed,__ATOMIC_RELAXED);
+        BridgeReply r;r.text("{\"enabled\":");r.text(g_irqTryLockProbe?"true":"false");
+        r.text(",");r.field("state",status);r.text(",");r.field("passed_mask",passed);r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge tcp send-probe")) {
         BridgeReply r;r.text("{\"enabled\":");r.text(g_tcpSendProbe?"true":"false");

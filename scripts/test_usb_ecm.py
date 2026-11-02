@@ -25,6 +25,7 @@ ap.add_argument('--send-user-copy',action='store_true',help='Also exercise send,
 ap.add_argument('--arp-async-probe',action='store_true',help='Exercise the opt-in single-interface ARP diagnostic')
 ap.add_argument('--tcp-async-neighbor',action='store_true',help='Use the experimental ARP path for TCP flight data')
 ap.add_argument('--tcp-try-transmit',action='store_true',help='Use the immediate ECM callback for experimental neighbor and TCP data')
+ap.add_argument('--irq-trylock-probe',action='store_true',help='Test IRQ try-lock IF restoration inside the guest kernel')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))):ap.error('--tcp-async-neighbor requires --arp-async-probe and a TCP flight mode')
@@ -88,6 +89,7 @@ if args.tcp_send_probe:run('mcopy','-i',initrd,marker,'::ETC/tcp-send-probe')
 if args.arp_async_probe:run('mcopy','-i',initrd,marker,'::ETC/arp-async-probe')
 if args.tcp_async_neighbor:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-neighbor')
 if args.tcp_try_transmit:run('mcopy','-i',initrd,marker,'::ETC/tcp-try-transmit')
+if args.irq_trylock_probe:run('mcopy','-i',initrd,marker,'::ETC/irq-trylock-probe')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -201,6 +203,16 @@ try:
    reply+=chunk
   assert b'BRIDGE_BEGIN 71' in reply and b'BRIDGE_END 71' in reply
   (base/'bridge-reply.bin').write_bytes(reply)
+  if args.irq_trylock_probe:
+   s.sendall(b'@70 bridge irq-trylock-probe\n');reply=b''
+   while b'BRIDGE_END 70' not in reply and len(reply)<65536:
+    chunk=s.recv(8192)
+    if not chunk:break
+    reply+=chunk
+   assert b'BRIDGE_BEGIN 70' in reply and b'BRIDGE_END 70' in reply,reply
+   result=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
+   assert result['enabled'] and result['state']==1 and result['passed_mask']==15,result
+   (base/'irq-trylock-probe.json').write_text(json.dumps(result,indent=2)+'\n')
   s.sendall(b'@72 bridge network\n');reply=b''
   while b'BRIDGE_END 72' not in reply and len(reply)<65536:
    chunk=s.recv(8192)
