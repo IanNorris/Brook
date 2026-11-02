@@ -89,6 +89,13 @@ extern "C" bool DeviceIsRegistered(Device* dev);
 extern "C" int DeviceFlush(Device* dev);
 // All filesystem and partition block writes enter here, including modules.
 extern "C" int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t len);
+struct BlockWriteLease;
+// Internal boot-only interface. The caller must establish that no cache can
+// hold pending writes to these devices before installing the permanent leases.
+// The caller validates ranges against device capacity. All aliases must use
+// DeviceWrite; a driver's direct ops->write bypasses these reservations.
+bool DeviceInstallBootWriteLeases(const BlockWriteLease* leases,uint32_t count);
+int DeviceWriteLeased(Device* parent,Device* owner,uint64_t offset,const void* data,uint64_t len);
 // Final-sync worker only; failed closure has no side effects. No sleeping I/O
 // or driver callback is executed under the admission lock.
 bool DeviceCloseWrites();

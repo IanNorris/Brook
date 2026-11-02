@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "write_admission.h"
+#include "block_write_leases.h"
 #include "process.h"
 #include "module.h"
 namespace brook { __attribute__((weak)) Process* ProcessCurrent(); }
@@ -10,13 +11,24 @@ namespace brook {
 
 static SpinLock g_writeLock;
 static WriteAdmission g_writes;
+static BlockWriteLeases g_blockLeases;
 static uintptr_t WriteCaller() {return ProcessCurrent?reinterpret_cast<uintptr_t>(ProcessCurrent()):0;}
 int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t len) {
     if(!dev || dev->type!=DeviceType::Block || !dev->ops || !dev->ops->write)return -19;
     const auto caller=WriteCaller();
-    SpinLockAcquire(&g_writeLock);const bool admitted=g_writes.Enter(caller);SpinLockRelease(&g_writeLock);
+    SpinLockAcquire(&g_writeLock);const bool admitted=g_blockLeases.AllowOrdinary(reinterpret_cast<uintptr_t>(dev),offset,len) && g_writes.Enter(caller);SpinLockRelease(&g_writeLock);
     if(!admitted)return -30;
     const int result=dev->ops->write(dev,offset,data,len);
+    SpinLockAcquire(&g_writeLock);g_writes.Leave();SpinLockRelease(&g_writeLock);return result;
+}
+int DeviceWriteLeased(Device* parent,Device* owner,uint64_t offset,const void* data,uint64_t len) {
+    if(!parent || parent->type!=DeviceType::Block || !parent->ops || !parent->ops->write)return -19;
+    const auto caller=WriteCaller();
+    SpinLockAcquire(&g_writeLock);
+    const bool admitted=g_blockLeases.AllowOwner(reinterpret_cast<uintptr_t>(parent),reinterpret_cast<uintptr_t>(owner),offset,len) && g_writes.Enter(caller);
+    SpinLockRelease(&g_writeLock);
+    if(!admitted)return -30;
+    const int result=parent->ops->write(parent,offset,data,len);
     SpinLockAcquire(&g_writeLock);g_writes.Leave();SpinLockRelease(&g_writeLock);return result;
 }
 bool DeviceCloseWrites() {
@@ -40,6 +52,28 @@ static Device* g_devices[DEVICE_MAX];
 static uint32_t g_deviceCount = 0;
 static uint32_t g_deviceCanaryPost = DEVICE_CANARY;
 static SpinLock g_deviceLock;
+
+// Boot-only: caller must have ensured no filesystem or cache can hold pending
+// writes to these devices. Leases remain in force until reboot.
+bool DeviceInstallBootWriteLeases(const BlockWriteLease* leases,uint32_t count) {
+    if(!leases || !count || count>BlockWriteLeases::Capacity)return false;
+    SpinLockAcquire(&g_deviceLock);
+    bool registered=true;
+    for(uint32_t i=0;i<count && registered;++i) {
+        bool parent=false,owner=leases[i].owner==0;
+        for(uint32_t j=0;j<g_deviceCount;++j) {
+            const auto id=reinterpret_cast<uintptr_t>(g_devices[j]);
+            if(id==leases[i].parent)parent=true;
+            if(id==leases[i].owner)owner=true;
+        }
+        registered=parent && owner;
+    }
+    SpinLockAcquire(&g_writeLock);
+    const bool result=registered && !g_writes.Closed() && !g_writes.Active() && g_blockLeases.Install(leases,count,true);
+    SpinLockRelease(&g_writeLock);
+    SpinLockRelease(&g_deviceLock);
+    return result;
+}
 
 // Rolling checksum of the g_devices[] array + count.  Updated on every
 // Register/Unregister.  Verified periodically from the timer tick to
@@ -162,6 +196,11 @@ bool DeviceUnregister(Device* dev)
     if (!dev) return false;
 
     SpinLockAcquire(&g_deviceLock);
+
+    SpinLockAcquire(&g_writeLock);
+    const bool leased=g_blockLeases.References(reinterpret_cast<uintptr_t>(dev));
+    SpinLockRelease(&g_writeLock);
+    if(leased) { SpinLockRelease(&g_deviceLock);return false; }
 
     for (uint32_t i = 0; i < g_deviceCount; ++i)
     {
