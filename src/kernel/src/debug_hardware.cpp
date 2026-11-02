@@ -134,6 +134,10 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("vendor",s.vendor);r.text(",");r.field("revision",s.revision);r.text(",");r.field("subsystem",s.subsystem);
         r.text(",");r.field("completed",s.completed);r.text(",\"values\":[");
         for(unsigned i=0;i<s.completed && i<12;++i){if(i)r.text(",");r.number(s.values[i]);}
+        r.text("],\"state_completed\":");r.number(s.stateCompleted);r.text(",\"state_values\":[");
+        for(unsigned i=0;i<s.stateCompleted && i<13;++i){if(i)r.text(",");r.number(s.stateValues[i]);}
+        r.text("],\"amp_completed\":");r.number(s.ampCompleted);r.text(",\"amp_values\":[");
+        for(unsigned i=0;i<s.ampCompleted && i<6;++i){if(i)r.text(",");r.number(s.ampValues[i]);}
         r.text("]}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-memory")) {

@@ -57,7 +57,7 @@ inline bool HdaProbeAllowedGet(uint16_t verb,uint8_t payload) {
         switch(payload) {case 0:case 1:case 2:case 4:case 5:case 8:case 9:case 10:case 11:
                          case 12:case 13:case 14:case 15:case 17:case 18:return true;default:return false;}
     }
-    switch(verb) {case 0xf01:case 0xf02:case 0xf05:case 0xf07:case 0xf0c:
+    switch(verb) {case 0xf01:case 0xf02:case 0xf05:case 0xf06:case 0xf07:case 0xf0c:
                   case 0xf15:case 0xf16:case 0xf17:case 0xf1c:case 0xf20:return true;default:return false;}
 }
 // Immediate transport, valid only after Ready inspection and ownership.
@@ -75,6 +75,15 @@ template<class Io> class HdaReadOnlyProbe {
         }
         return false;
     }
+    HdaProbeResult issue(uint32_t command,uint32_t& response) {
+        if(!wait(1,0)){failed_=true;return HdaProbeResult::Timeout;}
+        io_.write16(0x68,2); // response-valid is write-one-to-clear
+        if(!wait(3,0)){failed_=true;return HdaProbeResult::Timeout;}
+        io_.write32(0x60,command);
+        io_.write16(0x68,1);
+        if(!wait(3,2)){failed_=true;return HdaProbeResult::Timeout;}
+        response=io_.read32(0x64);return HdaProbeResult::Ready;
+    }
 public:
     explicit HdaReadOnlyProbe(Io& io):io_(io) {}
     HdaProbeResult inspect(HdaProbeController& snapshot) {
@@ -87,13 +96,15 @@ public:
     HdaProbeResult read(uint8_t codec,uint8_t nid,uint16_t verb,uint8_t payload,uint32_t& response) {
         if(failed_ || !admitted_)return HdaProbeResult::Failed;
         if(codec>=15 || nid>0x7f || !HdaProbeAllowedGet(verb,payload))return HdaProbeResult::DisallowedVerb;
-        if(!wait(1,0)){failed_=true;return HdaProbeResult::Timeout;}
-        io_.write16(0x68,2); // response-valid is write-one-to-clear
-        if(!wait(3,0)){failed_=true;return HdaProbeResult::Timeout;}
-        io_.write32(0x60,(uint32_t(codec)<<28)|(uint32_t(nid)<<20)|(uint32_t(verb)<<8)|payload);
-        io_.write16(0x68,1);
-        if(!wait(3,2)){failed_=true;return HdaProbeResult::Timeout;}
-        response=io_.read32(0x64);return HdaProbeResult::Ready;
+        return issue((uint32_t(codec)<<28)|(uint32_t(nid)<<20)|(uint32_t(verb)<<8)|payload,response);
+    }
+    // GET amplifier gain/mute uses a four-bit verb and a 16-bit payload.
+    // Only construct this GET verb; no caller-supplied verb or reserved bits.
+    HdaProbeResult readAmp(uint8_t codec,uint8_t nid,bool output,bool left,uint8_t index,uint32_t& response) {
+        if(failed_ || !admitted_)return HdaProbeResult::Failed;
+        if(codec>=15 || nid>0x7f || index>15)return HdaProbeResult::DisallowedVerb;
+        const uint16_t payload=(output?0x8000:0)|(left?0x2000:0)|index;
+        return issue((uint32_t(codec)<<28)|(uint32_t(nid)<<20)|(uint32_t(0x0b)<<16)|payload,response);
     }
 };
 }

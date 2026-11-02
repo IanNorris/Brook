@@ -1741,17 +1741,27 @@ The first non-playing HDA probe's identity, idle-admission and GET-only
 immediate-command logic is also host-tested with fake registers. It rejects
 active DMA rings, active streams, interrupts, busy transport, unsupported
 devices and SET verbs; timeout disables further commands. An opt-in boot-time
-session now wires this probe to PCI and MMIO, but has only been exercised with
-host fixtures and an unsupported-device QEMU boot. Before any physical use,
-BAR extent and memory-type alias safety,
-exclusive ownership, temporary memory decoding and cleanup still need to be
-established; a timeout does not prove a codec command was cancelled.
+session now wires this probe to PCI and MMIO and has been exercised with host
+fixtures, an unsupported-device QEMU boot and the physical Dell. Before its
+physical run, the BAR extent, memory-type aliases and PCI ownership were checked
+against the available evidence. A timeout does not prove a codec command was
+cancelled.
 The opt-in session rejects incomplete PCI inventory, malformed BAR metadata,
 active controller state and known BAR bases inside the HDA aperture. This
 base-only scan cannot detect a resource beginning below the aperture and
-extending into it, so physical execution remains gated on checking complete
-resource extents and the matching live inventory. A fresh QEMU boot rejected
+extending into it, so physical execution requires checking complete resource
+extents and the matching live inventory. A fresh QEMU boot rejected
 its unrelated virtual device before mapping; it does not validate Dell MMIO.
+On 2026-11-02, a Linux live-boot resource capture showed the HDA BAR at
+`0xf7418000–0xf741bfff` without overlapping PCI resources. All 16 BDFs,
+identities and raw BARs matched a prior Brook inventory and the current Brook
+boot; this is evidence for this configuration, not a general ownership check.
+The opt-in physical probe subsequently completed all 12 GET queries, reporting
+codec `10ec:0288` and subsystem `1028:0665`. PCI command was 0 before the
+transaction, 2 with memory decode enabled, and 0 after restoration. The
+controller reported no active interrupts, rings or streams. This establishes
+neither audible playback nor safe DMA/mixer sequencing; no sound was started.
+Machine-specific Linux and Brook captures remain private under `build/hardware`.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

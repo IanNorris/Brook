@@ -17,6 +17,7 @@ struct HdaSessionReport {
     uint16_t before=0, enabled=0, after=0;
     uint32_t vendor=0, revision=0, subsystem=0;
     uint32_t values[12]{};uint8_t completed=0;
+    uint32_t stateValues[13]{},ampValues[6]{};uint8_t stateCompleted=0,ampCompleted=0;
 };
 struct HdaProbeQuery {uint8_t nid;uint16_t verb;uint8_t payload;};
 static constexpr HdaProbeQuery HdaDellSpeakerQueries[] = {
@@ -27,6 +28,14 @@ static constexpr HdaProbeQuery HdaDellSpeakerQueries[] = {
 };
 static_assert(sizeof(HdaDellSpeakerQueries)/sizeof(HdaDellSpeakerQueries[0]) ==
               sizeof(HdaSessionReport::values)/sizeof(uint32_t), "HDA query/report capacity mismatch");
+static constexpr HdaProbeQuery HdaDellStateQueries[] = {
+    {0x01,0xf05,0},{0x01,0xf00,0x0a},{0x01,0xf00,0x0b},
+    {0x01,0xf00,0x0d},{0x01,0xf00,0x12},
+    {0x03,0xf05,0},{0x03,0xf06,0},{0x03,0xf00,0x0a},{0x03,0xf00,0x0b},
+    {0x03,0xf00,0x12},{0x0d,0xf00,0x0d},{0x14,0xf05,0},{0x14,0xf00,0x12}
+};
+static_assert(sizeof(HdaDellStateQueries)/sizeof(HdaDellStateQueries[0]) ==
+              sizeof(HdaSessionReport::stateValues)/sizeof(uint32_t), "HDA state capacity mismatch");
 template<class Io> HdaSessionReport HdaProbeDellSession(Io& io) {
     HdaSessionReport r{};
     if(!io.prepare() || !io.valid())return r;
@@ -52,6 +61,19 @@ template<class Io> HdaSessionReport HdaProbeDellSession(Io& io) {
                             r.result=HdaSessionResult::CodecQueryFailed;break;
                         }
                         ++r.completed;
+                    }
+                    if(r.result==HdaSessionResult::Complete)for(const auto& q:HdaDellStateQueries) {
+                        r.probe=probe.read(0,q.nid,q.verb,q.payload,r.stateValues[r.stateCompleted]);
+                        if(r.probe!=HdaProbeResult::Ready){r.result=HdaSessionResult::CodecQueryFailed;break;}
+                        ++r.stateCompleted;
+                    }
+                    if(r.result==HdaSessionResult::Complete) {
+                        constexpr uint8_t nodes[]={0x03,0x03,0x0d,0x0d,0x14,0x14};
+                        for(unsigned i=0;i<6;++i) {
+                            r.probe=probe.readAmp(0,nodes[i],i<2 || i>=4,(i&1)==0,0,r.ampValues[i]);
+                            if(r.probe!=HdaProbeResult::Ready){r.result=HdaSessionResult::CodecQueryFailed;break;}
+                            ++r.ampCompleted;
+                        }
                     }
                 }
             }
