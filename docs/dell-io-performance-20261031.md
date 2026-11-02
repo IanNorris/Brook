@@ -630,6 +630,28 @@ observed many calls larger than eight MSS, but did not attribute them to
 particular syscalls or processes. A clock-independent, process-scoped census
 would be needed to verify the guest path without relying on physical serial.
 
+For a narrower physical check without kernel instrumentation, an optional
+`LD_PRELOAD` census counted calls to five libc wrappers, grouped by descriptor,
+without inspecting payloads, paths, endpoints or vector contents. It invokes
+the corresponding Linux syscall directly and is a diagnostic, not a
+production library. On Linux, strace of the same instrumented curl upload
+observed 73 `sendto` calls on the bulk descriptor while the library counted
+70 `send` wrapper calls; at least three calls bypassed its interposition.
+Counts from this tool are therefore lower bounds on wrapper activity, not a
+complete syscall census, and its substitution can affect scheduling or
+cancellation behavior.
+
+On the Dell's generation 116 recovery boot, one 1 MiB generated-data HTTPS
+upload with the census returned HTTP 200 in 11.474 seconds. It reported 68
+`send` calls on fd 6 carrying 1,051,842 bytes, and no intercepted `writev`,
+`sendmsg` or `sendto` calls. It also observed one eight-byte `write` on fd 5.
+Because interposition is incomplete, this does not prove no other syscalls
+were used; it does establish that the intercepted `send` calls carried roughly
+the whole encrypted upload. This run used the recovery sender, not the 16-slot
+experiment, and does not measure an optimization speedup. The optional source
+is `scripts/workloads/tcp_libc_census.c`; it must be compiled as a shared
+library and used only for an explicitly selected diagnostic process.
+
 Hosted tests exercised cross-vector copying, zero-length entries, address
 overflow, and faults before and after a completed MSS in both sender modes.
 The QEMU USB Ethernet suite passed for the default sender and for the 16-slot
