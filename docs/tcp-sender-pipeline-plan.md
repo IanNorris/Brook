@@ -112,6 +112,15 @@ In a separate close-after-acceptance case the receiver verified 256 KiB and
 EOF. These are bounded checks, not a complete half-close or prolonged
 backpressure test. The recovery selection was restored and booted afterward.
 
+The variable-length LAN workload then sent two 32 MiB streams using 1 KiB
+writes with the same dedicated-waiter candidate. Each took about 10.60 seconds
+(25.3 decimal Mbps), and both receiver hashes matched. This is a sustained
+single-stream LAN result, not a WAN measurement or a link-capacity benchmark.
+An initial attempt was invalid because its temporary driver treated a queued
+guest job as complete and closed the receiver; the same job was observed to
+finish with connection refused before the corrected runs started. The checked
+recovery boot was restored afterward.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate

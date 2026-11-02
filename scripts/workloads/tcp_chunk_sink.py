@@ -7,16 +7,24 @@ import socket
 import time
 from pathlib import Path
 
-TOTAL = 4 * 1024 * 1024
-EXPECTED = hashlib.sha256(bytes((i * 17 + 3) & 255 for i in range(TOTAL))).hexdigest()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--bind", required=True, help="Explicit local IPv4 address")
 parser.add_argument("--port", required=True, type=int)
 parser.add_argument("--connections", required=True, type=int)
 parser.add_argument("--output", required=True, type=Path)
+parser.add_argument("--bytes", type=int, default=4 * 1024 * 1024, help="Payload length (1 through 64 MiB)")
 args = parser.parse_args()
 if not 1 <= args.port <= 65535 or not 1 <= args.connections <= 32:
     parser.error("port must be 1..65535 and connections 1..32")
+if not 1 <= args.bytes <= 64 * 1024 * 1024:
+    parser.error("bytes must be 1..67108864")
+TOTAL = args.bytes
+pattern = bytes((i * 17 + 3) & 255 for i in range(256))
+expected = hashlib.sha256()
+for _ in range(TOTAL // 256):
+    expected.update(pattern)
+expected.update(pattern[:TOTAL % 256])
+EXPECTED = expected.hexdigest()
 
 records = []
 with args.output.open("x", encoding="utf-8") as result:
