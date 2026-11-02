@@ -130,6 +130,22 @@ single ordered comparison suggests application write count is not the main
 limit for this workload, but does not identify the transport bottleneck or
 exclude a different application pattern. Recovery was restored afterward.
 
+An eight-second CPU/context-switch profile overlapped one muted Dell 32 MiB
+upload (10.84 seconds with instrumentation; receiver hash matched). The
+profile has 3,200 samples, 25,442 context-switch records and no reported
+drops; 2,988 samples landed in idle. Astra's exact-kernel-symbolized review
+found 593 switch-outs from the producer inside `TcpSendAsync`, with 592
+completed off-CPU intervals of 10 ticks, and 1,783 flight-wait switch-outs
+across 574 distinct worker PIDs. This is consistent with the existing
+full-queue path sleeping for 10 ms without a capacity notification and with
+frequent worker turnover. It is a targeted lead, not proof that every wait
+adds directly to transfer time. IRQ-masked work is underrepresented, profiler
+output itself writes to `/boot`, and the capture covers only part of the
+transfer. Next investigate a separately owned producer-capacity waiter with
+atomic registration and wake on queue retirement; keep the current timeout as
+a fallback until its races and sustained throughput are tested. The profile
+and receipt are under `build/hardware/dell-sustained-profile-20261102`.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
