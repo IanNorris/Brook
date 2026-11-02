@@ -24,10 +24,10 @@ public:
     uint8_t stage()const{return stage_;}uint32_t detail()const{return detail_;}
     uint8_t progressReason()const{return progressReason_;}uint8_t progressStatus()const{return progressStatus_;}
     uint16_t progressControl()const{return progressControl_;}uint32_t progressFirst()const{return progressFirst_;}uint32_t progressLast()const{return progressLast_;}
-    bool prepare(uint16_t gcap,uint64_t bdlPhysical) {
+    bool prepare(uint16_t gcap,uint64_t bdlPhysical,uint16_t format=0x11) {
         stage_=1;detail_=gcap;
         if(state_!=HdaToneStreamState::Idle || gcap==0xffff || !((gcap>>12)&15) ||
-           !bdlPhysical || (bdlPhysical&127) || (!(gcap&1) && bdlPhysical>0xffffffffULL))return false;
+           (format!=0x11 && format!=0x4011) || !bdlPhysical || (bdlPhysical&127) || (!(gcap&1) && bdlPhysical>0xffffffffULL))return false;
         const unsigned input=(gcap>>8)&15;const unsigned total=input+((gcap>>12)&15)+((gcap>>3)&31);
         if(total>30)return false;
         base_=0x80+input*0x20;
@@ -38,14 +38,14 @@ public:
         stage_=3;io_.write16(base_,1);if(!io_.delayUs(3) || !waitControl(1,1)){detail_=io_.read16(base_);state_=HdaToneStreamState::Unknown;return false;}
         stage_=4;io_.write16(base_,0);if(!io_.delayUs(3) || !waitControl(1,0)){detail_=io_.read16(base_);state_=HdaToneStreamState::Unknown;return false;}
         io_.write8(base_+3,0x1c); // clear only W1C status bits
-        io_.write16(base_+0x12,0x11); // 48 kHz, 16-bit stereo
+        io_.write16(base_+0x12,format);
         io_.write32(base_+0x18,uint32_t(bdlPhysical));
         io_.write32(base_+0x1c,uint32_t(bdlPhysical>>32));
         io_.write16(base_+0x0c,2);io_.write32(base_+0x08,12288);
         io_.write8(base_+2,uint8_t(0x10|priority_)); // tag 1; preserve traffic priority
         stage_=5;detail_=0;
         if(io_.read16(base_)!=0)detail_|=1;if(io_.read8(base_+2)!=uint8_t(0x10|priority_))detail_|=2;
-        if(io_.read16(base_+0x12)!=0x11)detail_|=4;if(io_.read32(base_+0x18)!=uint32_t(bdlPhysical))detail_|=8;
+        if(io_.read16(base_+0x12)!=format)detail_|=4;if(io_.read32(base_+0x18)!=uint32_t(bdlPhysical))detail_|=8;
         if(io_.read32(base_+0x1c)!=uint32_t(bdlPhysical>>32))detail_|=16;
         if(io_.read16(base_+0x0c)!=2)detail_|=32;if(io_.read32(base_+0x08)!=12288)detail_|=64;
         if(detail_) {

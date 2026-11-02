@@ -23,8 +23,9 @@ bool CpuObserveMemoryTypes(uint64_t,uint64_t,CpuMemoryTypeObservation& out){out=
 namespace brook {
 extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-observe")==0)return scenario==19?nullptr:&marker;
- if(std::strcmp(path,"/etc/dell-hda-muted-dma")==0 && (scenario==16 || scenario==17 || (scenario>=20 && scenario<=25) || (scenario>=27 && scenario<=35)))return &marker;
- if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-muted-dma")==0 && (scenario==16 || scenario==17 || (scenario>=20 && scenario<=25) || (scenario>=27 && scenario<=36)))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26 || scenario==37))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  return nullptr;}
 extern "C" void VfsClose(Vnode*){}
 uint32_t SmpCurrentCpuIndex(){return 0;}
@@ -85,7 +86,7 @@ static void one(int which){
   if(which==21)chip.mem[0x70]=1;if(which==23)chip.dropBdlClear=true;if(which==24)chip.dropStop=true;
   if(which==28)chip.mem[Chip::base+2]=0x10;if(which==29)chip.corruptNewFormat=true;
   if(which==30 || which==32){chip.roPriority=true;chip.mem[Chip::base+2]=4;}if(which==32)chip.dropRetireReset=true;
-  if(which==34)chip.failStatusAfter=3;if(which==35)chip.reportEndpoint=true;}
+  if(which==34)chip.failStatusAfter=3;if(which==35)chip.reportEndpoint=true;if(which==36)chip.format=0x31;}
  BootProtocol boot{};MemoryDescriptor descriptor{};
  if(which==8){descriptor.physicalStart=bar;descriptor.pageCount=1;descriptor.type=MemoryType::Free;boot.memoryMap=&descriptor;boot.memoryMapCount=1;}
  HdaObserveConfigure(&boot);const auto& o=HdaObserveRead();
@@ -121,6 +122,10 @@ static void one(int which){
  if(which==34){assert(o.toneAttempted && !o.toneAudible && o.toneQuarantined && o.toneResult==8 &&
   o.tonePlayReason==3 && o.tonePlayLoops==1 && o.tonePlayProgress==0 && o.toneProgressReason==3 && o.toneProgressStatus==8 && cmd==2);}
  if(which==35){assert(o.toneFinished && !o.toneAudible && !o.toneQuarantined && chip.sawEndpoint && o.tonePlayElapsed>=2000 && cmd==0);}
+ if(which==36){assert(o.toneFinished && !o.toneAudible && !o.toneQuarantined && o.tonePlayElapsed>=2000 && cmd==0 &&
+  chip.runConverterFormat==0x4011 && chip.runStreamFormat==0x4011 && chip.format==0x31 && !chip.sawQuietUnmute);}
+ if(which==37){assert(o.toneRequested && !o.toneAttempted && !chip.published && cmd==0 &&
+  std::strcmp(o.toneReason,"mixer format probe requires mute")==0);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=35;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=37;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

@@ -5,7 +5,7 @@
 using namespace brook;
 struct Chip {
     uint8_t mem[4096]{};uint8_t pin[2]{0,0},dac[2]{127,127},mix[2]{0,0},selection=0,converter=0;
-    uint16_t format=0x4011;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;unsigned statusReads=0,failStatusAfter=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false,reportEndpoint=false,sawEndpoint=false;
+    uint16_t format=0x4011,runConverterFormat=0,runStreamFormat=0;uint64_t time=0;uint32_t cmd=0,response=0,pos=0;unsigned statusReads=0,failStatusAfter=0;bool published=false,quarantined=false,released=false,dropBdlClear=false,sawQuietUnmute=false,snapshotMode=false,dropStop=false,corruptNewFormat=false,roPriority=false,needsReset=false,resetAsserted=false,dropRetireReset=false,reportEndpoint=false,sawEndpoint=false;
     static constexpr uint32_t base=0x100;
     uint8_t* amp(unsigned node,bool output){if(node==0x14 && output)return pin;if(node==3 && output)return dac;if(node==0x0d && !output)return mix;assert(false);return nullptr;}
     void execute(){
@@ -41,7 +41,7 @@ struct Chip {
         if(dropStop && o==base && v==0 && (read16(base)&2))return;
         if(o==base && v==1){if(dropRetireReset && needsReset)return;resetAsserted=true;}
         if(o==base && v==0 && resetAsserted){needsReset=false;resetAsserted=false;}
-        if(o==base && v==2){assert(published && pin[0]==0x80 && pin[1]==0x80);needsReset=true;}mem[o]=v;mem[o+1]=v>>8;}
+        if(o==base && v==2){assert(published && pin[0]==0x80 && pin[1]==0x80);runConverterFormat=format;runStreamFormat=read16(base+0x12);needsReset=true;}mem[o]=v;mem[o+1]=v>>8;}
     void write32(uint32_t o,uint32_t v){if(o==0x60){cmd=v;return;}if(o==base+8)assert(!needsReset);if(dropBdlClear && o==base+0x18 && !v)return;for(unsigned i=0;i<4;++i)mem[o+i]=v>>(8*i);}
     uint64_t ticks(){return time++;}void pause(){}bool delayUs(unsigned n){return n>=3;}bool publishDma(){published=true;return true;}
 };

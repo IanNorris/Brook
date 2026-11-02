@@ -263,9 +263,11 @@ void HdaObserveConfigure(const BootProtocol* boot) {
         unsigned(observation.session.result),unsigned(observation.session.probe),unsigned(observation.session.before),
         unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
     const bool muted=Marker("/etc/dell-hda-muted-dma"),audible=Marker("/etc/dell-hda-quiet-tone");
+    const bool mixerProbe=Marker("/etc/dell-hda-mixer-format-probe");
     if(!muted && !audible)return;
     observation.toneRequested=true;observation.toneAudible=audible;
     if(muted && audible){observation.toneReason="conflicting markers";return;}
+    if(mixerProbe && (!muted || audible)){observation.toneReason="mixer format probe requires mute";return;}
     if(observation.session.result!=HdaSessionResult::Complete || observation.session.after!=0 || !observation.mapped){
         observation.toneReason="observation incomplete";return;}
     // Explicit placement storage avoids destructing quarantined ownership.
@@ -273,7 +275,7 @@ void HdaObserveConfigure(const BootProtocol* boot) {
     using ToneAdapter=HdaDellToneAdapter<TonePlatform>;
     alignas(ToneAdapter) static unsigned char adapterStorage[sizeof(ToneAdapter)];
     auto* platform=::new(platformStorage) TonePlatform{io,observation.session};
-    auto* adapter=::new(adapterStorage) ToneAdapter(*platform,observation.session);
+    auto* adapter=::new(adapterStorage) ToneAdapter(*platform,observation.session,mixerProbe);
     observation.toneAttempted=true;
     HdaDellTonePlan checkPlan{};if(HdaDellMakeTonePlan(observation.session,checkPlan))observation.toneAdmission|=16;
     uint32_t flushLine=0;if(!platform->flushInfo(flushLine)){observation.toneReason="cache flush unavailable";return;}

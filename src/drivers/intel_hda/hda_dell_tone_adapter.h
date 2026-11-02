@@ -16,7 +16,7 @@ namespace brook {
 template<class Platform> class HdaDellToneAdapter {
     Platform& p_;const HdaSessionReport& saved_;HdaDellToneIci<Platform> ici_;
     HdaDellToneCodec<HdaDellToneIci<Platform>> codec_;HdaDellToneStream<Platform> stream_;
-    uint64_t phys_[4]{};void* virt_[4]{};unsigned count_=0;bool quarantined_=false,begun_=false,active_=false,executed_=false;
+    uint64_t phys_[4]{};void* virt_[4]{};unsigned count_=0;bool quarantined_=false,begun_=false,active_=false,executed_=false;const bool mixerProbe_;
     uint8_t prepareStage_=0,playReason_=0;uint32_t prepareValue_=0,playLoops_=0,playProgress_=0;uint64_t playElapsed_=0;
     void freePages() {while(count_){--count_;bool duplicate=false;for(unsigned i=0;i<count_;++i)if(phys_[i]==phys_[count_])duplicate=true;
         if(!duplicate)p_.freePage(phys_[count_]);phys_[count_]=0;virt_[count_]=nullptr;}}
@@ -24,7 +24,7 @@ template<class Platform> class HdaDellToneAdapter {
     bool matches(const HdaDellTonePlan& x){HdaDellTonePlan p{};return HdaDellMakeTonePlan(saved_,p) &&
         x.pin==p.pin && x.mixer==p.mixer && x.dac==p.dac && x.pinSelection==p.pinSelection && x.dacGain==p.dacGain && x.peakSample==p.peakSample;}
 public:
-    HdaDellToneAdapter(Platform& p,const HdaSessionReport& s):p_(p),saved_(s),ici_(p,uint16_t(s.converterFormat)),codec_(ici_),stream_(p){}
+    HdaDellToneAdapter(Platform& p,const HdaSessionReport& s,bool mixerProbe=false):p_(p),saved_(s),ici_(p,uint16_t(s.converterFormat),mixerProbe),codec_(ici_),stream_(p),mixerProbe_(mixerProbe){}
     HdaDellToneAdapter(const HdaDellToneAdapter&)=delete;
     HdaDellToneAdapter& operator=(const HdaDellToneAdapter&)=delete;
     HdaDellToneAdapter(HdaDellToneAdapter&&)=delete;
@@ -38,13 +38,14 @@ public:
     uint8_t progressReason()const{return stream_.progressReason();}uint8_t progressStatus()const{return stream_.progressStatus();}
     uint16_t progressControl()const{return stream_.progressControl();}uint32_t progressFirst()const{return stream_.progressFirst();}uint32_t progressLast()const{return stream_.progressLast();}
     HdaToneResult run(bool audible) {
-        if(!active_ || quarantined_ || executed_)return HdaToneResult::InvalidSnapshot;
+        if(!active_ || quarantined_ || executed_ || (mixerProbe_ && audible))return HdaToneResult::InvalidSnapshot;
         executed_=true;return HdaDellToneTransaction(*this,saved_,audible);
     }
     // Call before enabling memory decode or touching the codec. A failed
     // allocation is safe to release because no descriptor has been published.
     bool allocate() {
-        HdaDellTonePlan plan{};if(count_ || begun_ || quarantined_ || !HdaDellMakeTonePlan(saved_,plan) || !p_.identityStable() || p_.command()!=0)return false;
+        HdaDellTonePlan plan{};uint16_t format=0;if(count_ || begun_ || quarantined_ || !HdaDellMakeTonePlan(saved_,plan) ||
+            (mixerProbe_ && !HdaDellMixerFormat(saved_,format)) || !p_.identityStable() || p_.command()!=0)return false;
         for(unsigned i=0;i<4;++i) {
             if(!p_.allocatePage(phys_[i],virt_[i])){freePages();return false;}
             ++count_;
@@ -74,11 +75,12 @@ public:
     bool prepareDma(const HdaDellTonePlan& plan) {
         uint32_t v=0;prepareStage_=1;
         if(!active_ || quarantined_ || !matches(plan) || p_.command()!=2)return false;
-        prepareStage_=2;if(!ici_.setFormat(0x11))return false;
-        prepareStage_=3;if(!ici_.getFormat(v))return false;prepareValue_=v;if(v!=0x11)return false;
+        const uint16_t format=mixerProbe_?0x4011:0x11;
+        prepareStage_=2;if(!ici_.setFormat(format))return false;
+        prepareStage_=3;if(!ici_.getFormat(v))return false;prepareValue_=v;if(v!=format)return false;
         prepareStage_=4;if(!ici_.set8(3,0x706,0x10))return false;
         prepareStage_=5;if(!ici_.get8(3,0xf06,v))return false;prepareValue_=v;if(v!=0x10)return false;
-        prepareStage_=6;if(!stream_.prepare(saved_.controller.gcap,phys_[0]))return false;
+        prepareStage_=6;if(!stream_.prepare(saved_.controller.gcap,phys_[0],format))return false;
         prepareStage_=7;return true;
     }
     bool startDma() {

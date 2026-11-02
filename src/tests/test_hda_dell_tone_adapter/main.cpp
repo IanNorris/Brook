@@ -27,6 +27,11 @@ int main(){
      assert(p.freed==4 && p.pci==0 && !p.quarantined && p.sawQuietUnmute && p.pin[0]==0 && p.pin[1]==0);}
     {Platform p;HdaDellToneAdapter<Platform> a(p,s);assert(a.allocate() && a.begin());
      assert(a.run(false)==HdaToneResult::Complete && a.finish() && !p.sawQuietUnmute && p.freed==4);}
+    {auto old=s;old.converterFormat=0x31;Platform p;p.format=0x31;HdaDellToneAdapter<Platform> a(p,old,true);assert(a.allocate() && a.begin());
+     assert(a.run(false)==HdaToneResult::Complete && a.finish() && !p.sawQuietUnmute && p.freed==4);
+     assert(p.runConverterFormat==0x4011 && p.runStreamFormat==0x4011 && p.format==0x31 && a.playElapsed()>=2000);}
+    {auto unsupported=s;unsupported.stateValues[7]&=~(1u<<5);Platform p;HdaDellToneAdapter<Platform> a(p,unsupported,true);
+     assert(!a.allocate() && !p.allocated && p.pci==0);}
     for(int fail=0;fail<4;++fail){Platform p;p.failAllocation=fail;HdaDellToneAdapter<Platform> a(p,s);
      assert(!a.allocate() && p.freed==unsigned(fail) && p.pci==0);}
     {Platform p;HdaDellToneAdapter<Platform> a(p,s);assert(a.allocate());p.identity=false;

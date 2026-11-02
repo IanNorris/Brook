@@ -8,7 +8,7 @@ namespace brook {
 // old format must come from that same fresh snapshot. On timeout this is terminal:
 // even cleanup must not issue another ICI command on an unresolved transport.
 template<class Io> class HdaDellToneIci {
-    Io& io_;uint16_t oldFormat_;bool failed_=false;
+    Io& io_;uint16_t oldFormat_;bool failed_=false;const bool allowMixerFormat_;
     bool wait(uint16_t mask,uint16_t expected) {
         const auto start=io_.ticks();
         for(unsigned i=0;i<100000;++i) {
@@ -27,7 +27,7 @@ template<class Io> class HdaDellToneIci {
         response=io_.read32(0x64);return true;
     }
 public:
-    HdaDellToneIci(Io& io,uint16_t oldFormat):io_(io),oldFormat_(oldFormat){}
+    HdaDellToneIci(Io& io,uint16_t oldFormat,bool allowMixerFormat=false):io_(io),oldFormat_(oldFormat),allowMixerFormat_(allowMixerFormat){}
     bool failed()const{return failed_;}
     bool set8(uint8_t nid,uint16_t verb,uint8_t payload) {
         if(!((nid==0x14 && verb==0x701 && payload<=1) ||
@@ -51,7 +51,7 @@ public:
         return issue((uint32_t(nid)<<20)|(uint32_t(0x0b)<<16)|payload,response);
     }
     bool setFormat(uint16_t value) {
-        if(value!=0x11 && value!=oldFormat_)return false;
+        if(value!=0x11 && value!=oldFormat_ && !(allowMixerFormat_ && value==0x4011))return false;
         uint32_t response=0;return issue((uint32_t(3)<<20)|(uint32_t(2)<<16)|value,response);
     }
     bool getFormat(uint32_t& response) {return issue((uint32_t(3)<<20)|(uint32_t(0x0a)<<16),response);}
