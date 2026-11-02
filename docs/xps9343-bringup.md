@@ -1819,6 +1819,16 @@ peak was capped at 30% of digital full scale, with a further -23.5 dB DAC
 attenuation; this is not a calibrated acoustic-volume percentage. The normal
 recovery boot was selected afterward. This one-shot test does not yet provide
 normal application audio, mixer controls, or evidence of long-running playback.
+The mixer uses 44.1 kHz stereo S16, unlike the 48 kHz tone. A separately
+gated `dell-hda-mixer-format-probe` must be paired with
+`dell-hda-muted-dma`; it refuses an audible run. On the Dell, its two-second
+muted test set and read back 44.1 kHz on both converter and stream, observed
+DMA progress, restored the previous converter format, retired the DMA and
+restored PCI command to zero. The checked recovery boot was reselected. This
+confirms a format and cleanup, not application playback or streaming cache
+coherency. The reusable cache-line publication helper is tested with separate
+CPU and device views, but callers still must own whole touched cache lines,
+fence before publishing and prove DMA cannot overtake the writes and flush.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
