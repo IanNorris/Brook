@@ -203,6 +203,18 @@ restricted single-interface admission and explicit capacity failure. Route
 changes, synchronous replies during transmit, table exhaustion and stale
 completions require actual-path tests before the tracker drives TCP.
 
+An inactive `ArpProbeTracker` now implements the bounded request state: it
+deduplicates by caller-supplied interface lifetime and IP, separates busy
+retries from submitted attempts, imposes an absolute deadline, uses
+round-robin dispatch, and rejects stale completion tickets. Its caller must
+serialize operations, provide monotonic millisecond ticks, pin interface
+lifetime during transmit and only mark a request resolved after retaining a
+usable cache entry. Hosted tests exercise those transitions alongside the
+actual ARP request-frame builder, including table exhaustion, NIC busy,
+expiry and late completion. Astra reviewed the tracker. It is not instantiated
+in the network runtime and therefore makes no ARP or TCP behavior change;
+cache-full handling, admission and integration remain open.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include "../../kernel/src/net.cpp"
+#include "../../kernel/src/arp_probe_tracker.h"
 
 namespace {
 std::atomic<unsigned> allocations{0}, frees{0}, wakes{0};
@@ -305,6 +306,69 @@ int main() {
                arp->spa==nif.ipAddr && arp->tpa==target && !memcmp(&arp->sha,&nif.mac,sizeof(MacAddr)) &&
                !memcmp(&arp->tha,&zero,sizeof(MacAddr)));
         frameTransmitResult=-11;assert(ArpSendRequestOn(&nif,target)==-11);frameTransmitResult=0;
+    }
+    {
+        using Tracker=ArpProbeTracker<2>;Tracker tracker;Tracker::Ticket first{},other{},retry{};
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{1,2,3,4,5,6}};nif.ipAddr=htonl(0x0a000201);
+        const uint64_t interfaceId=reinterpret_cast<uint64_t>(&nif);
+        const uint32_t a=htonl(0x0a000202),b=htonl(0x0a000203),c=htonl(0x0a000204);
+        assert(tracker.Request(interfaceId,a,1,2000).status==Tracker::Status::Pending);
+        assert(tracker.Request(interfaceId,a,2,2000).status==Tracker::Status::Pending);
+        assert(tracker.Request(interfaceId,b,2,2000).status==Tracker::Status::Pending);
+        assert(tracker.Request(interfaceId,c,2,2000).status==Tracker::Status::Full);
+        assert(tracker.Next(2,&first) && first.ip==a);
+        frameTransmitResult=-11;assert(tracker.Complete(first,ArpSendRequestOn(&nif,a),2));frameTransmitResult=0;
+        assert(tracker.Next(2,&other) && other.ip==b);
+        assert(tracker.Complete(other,ArpSendRequestOn(&nif,b),2));
+        assert(!tracker.Next(11,&retry) && tracker.Next(12,&retry) && retry.ip==a);
+        // A reply arriving during transmit releases the slot; late completion
+        // cannot resurrect it or overwrite a new occupant.
+        tracker.Resolved(interfaceId,a);
+        assert(tracker.Request(interfaceId,c,12,2000).status==Tracker::Status::Pending);
+        assert(!tracker.Complete(retry,0,12));
+        assert(tracker.Next(12,&retry) && retry.ip==c);
+        assert(tracker.Complete(retry,-5,12));
+        assert(tracker.Request(interfaceId,c,13,2000).status==Tracker::Status::Failed);
+        assert(tracker.Request(interfaceId,c,512,2000).status==Tracker::Status::Pending);
+    }
+    {
+        using Tracker=ArpProbeTracker<1>;Tracker tracker;Tracker::Ticket ticket{};
+        assert(tracker.Request(1,1,1,1200).status==Tracker::Status::Pending);
+        for(uint64_t now : {1ULL,501ULL,1001ULL}){
+            assert(tracker.Next(now,&ticket));assert(tracker.Complete(ticket,0,now));
+        }
+        assert(!tracker.Next(1201,&ticket));
+        assert(tracker.Request(1,1,1201,1200).status==Tracker::Status::Failed);
+        assert(tracker.Request(1,1,1701,1200).status==Tracker::Status::Pending);
+    }
+    {
+        using Tracker=ArpProbeTracker<1>;Tracker tracker;Tracker::Ticket ticket{};
+        assert(tracker.Request(1,2,1,5000).status==Tracker::Status::Pending);
+        for(uint64_t now : {1ULL,501ULL,1001ULL}){
+            assert(tracker.Next(now,&ticket));assert(tracker.Complete(ticket,0,now));
+        }
+        assert(!tracker.Next(1501,&ticket));
+        assert(tracker.Request(1,2,1501,5000).status==Tracker::Status::Failed);
+        Tracker busy;assert(busy.Request(1,3,1,25).status==Tracker::Status::Pending);
+        for(uint64_t now : {1ULL,11ULL,21ULL}){
+            assert(busy.Next(now,&ticket));assert(busy.Complete(ticket,-11,now));
+        }
+        assert(!busy.Next(26,&ticket));
+        assert(busy.Request(1,3,26,25).status==Tracker::Status::Failed);
+    }
+    {
+        using Tracker=ArpProbeTracker<2>;Tracker tracker;Tracker::Ticket first{},second{},replacement{};
+        assert(tracker.Request(1,1,1,20).status==Tracker::Status::Pending);
+        assert(tracker.Request(1,2,1,1000).status==Tracker::Status::Pending);
+        assert(tracker.Next(1,&first) && first.ip==1);
+        assert(tracker.Next(1,&second) && second.ip==2);
+        assert(tracker.Complete(second,-11,1));
+        assert(tracker.Next(11,&second) && second.ip==2);
+        assert(tracker.Complete(second,-11,11));
+        assert(tracker.Next(21,&replacement) && replacement.ip==2);
+        assert(tracker.Complete(replacement,-11,21));
+        assert(!tracker.Complete(first,0,21));
+        assert(tracker.Request(1,1,21,20).status==Tracker::Status::Failed);
     }
     {
         TcpSendFlightState invalid(17);assert(!invalid.Allocate());
