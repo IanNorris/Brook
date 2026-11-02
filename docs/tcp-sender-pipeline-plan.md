@@ -47,6 +47,30 @@ A separate 256 KiB test closed immediately after accepting all writes; the
 host received the expected bytes and then EOF. The known-good recovery slot
 was preserved and booted afterward. Audio output was disabled throughout.
 
+The faster LAN result did not carry over to a subsequent matched HTTPS test
+against the previously used Cloudflare speed-test upload endpoint. Three
+1 MiB `curl` uploads on the Dell completed in 1.12–1.16 seconds synchronously
+and 2.28–2.43 seconds asynchronously, all reporting HTTP 200. The grouped
+runs used the same random payload and kernel, with the async boot flag as the
+intended difference; WAN and server conditions were not controlled or
+alternated. Aggregate flight counters showed 11–18 local busy observations in
+the control and 54–62 in async runs, with zero retransmission attempts. The
+sum of sampled ACK-to-resume ticks was also higher in async runs, but samples
+can overlap and must not be subtracted from wall time. Transmit contention and
+the shared socket waiter are separate leads; these counters do not establish
+either as the cause. Keep async disabled by default.
+
+A further default-off experiment shortened only the asynchronous sender's
+local `EAGAIN` retry interval from 10 ms to 1 ms. Host tests covered reservation
+continuity, retransmission priority and the deadline under persistent local
+backpressure; an isolated USB-Ethernet QEMU test passed with delay and one
+dropped packet. On the Dell, the same three HTTPS uploads took 2.34–2.50
+seconds, with 36–41 aggregate local-busy observations per run. The earlier
+10 ms runs took 2.28–2.43 seconds with 54–62 busy observations. These grouped
+WAN tests are not an alternating or controlled network comparison, but provide
+no evidence that the shorter retry improves this workload. The experimental
+option was discarded. ACK waiter ownership remains a separate untested lead.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
