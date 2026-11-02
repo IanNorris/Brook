@@ -1837,6 +1837,16 @@ run observed raw `SDFIFOS=0x00b0` and completed cleanly; this was one sample,
 not a test of stability or decoding. This is an input to calculating
 a streaming guard, not by itself a bound on scheduler delays or proof that
 post-write overrun detection can undo already fetched samples.
+An injected streaming queue prototype now accounts for reserved silence and
+submitted PCM, zeros consumed regions before the next ring lap, and treats
+uncertain publication, a stopped or stalled controller, implausible position
+jumps and ambiguous sampling intervals as terminal faults. Host simulations
+use separate CPU and DMA views and compare expected samples and silence over
+multiple wraps, including partial cache lines and bounded backpressure. The
+prototype is not registered with the mixer or connected to real hardware;
+its prefetch guard, service timing, owner locking and physical stop/retirement
+still require validation. No host simulation can undo a fetch that occurred
+before an overrun was detected.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
