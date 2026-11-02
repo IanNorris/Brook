@@ -1,4 +1,5 @@
 #include "../../kernel/src/memory/kernel_alias_probe.h"
+#include "../../kernel/src/hda_dell_tone_ram.h"
 #include <cassert>
 #include <cstdint>
 using namespace brook;
@@ -28,6 +29,12 @@ int main(){
     }
     t.data[0][256]=0x2003;t.data[2][(va>>21)&511]=0x4003;t.data[3][pt]=0x56789003;
     assert(InspectKernelAlias(t,0x1000,0xffff800012345000ull,out) && out.present && out.physical==0x56789000);
+    // A real 2 MiB HHDM leaf maps this page even though the separate 4 KiB
+    // VmmVirtToPhys walker cannot translate it.
+    t.data[2][(va>>21)&511]=(va&~uint64_t(0x1fffff))|0x83;
+    assert(InspectKernelAlias(t,0x1000,0xffff800012345000ull,out) && out.pageShift==21 &&
+           HdaDellToneRamMappingMatches(va,0xffff800012345000ull,0xffff800000000000ull,out));
+    assert(!HdaDellToneRamMappingMatches(va+4096,0xffff800012345000ull,0xffff800000000000ull,out));
     t.data[2][(va>>21)&511]=0;assert(InspectKernelAlias(t,0x1000,va,out) && !out.present);
     t.data[2][(va>>21)&511]=0x40002083;assert(!InspectKernelAlias(t,0x1000,va,out));
     t.data[1][0]=0x5003;assert(!InspectKernelAlias(t,0x1000,va,out));

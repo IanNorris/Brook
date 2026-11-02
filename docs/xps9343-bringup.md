@@ -1785,6 +1785,12 @@ position-buffer DMA enable, inactive clock, changed inventory or busy device
 refuses admission. Host tests exercise the actual boot adapter with a mock
 controller, including retained pages on unconfirmed stop/retirement. The
 muted and audible paths still require physical acceptance.
+The first physical muted-DMA candidate refused admission before enabling DMA:
+its RAM check used a translator that cannot walk the kernel's huge direct-map
+leaves. The check now uses the huge-aware read-only alias walker instead; a
+2 MiB page-table regression and the production-adapter mock exercise that
+case. This fixes a verified code defect, but the physical refusal's exact
+guard was not recorded, so a further Dell test is needed to confirm the cause.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

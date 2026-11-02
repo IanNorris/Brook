@@ -10,6 +10,7 @@ struct HdaObservation {
     bool toneRequested=false,toneAttempted=false,toneAudible=false,toneFinished=false,toneQuarantined=false;
     uint8_t toneResult=0xff;
     const char* toneReason="not requested";
+    uint32_t toneAdmission=0;uint64_t tonePage=0;uint8_t tonePageStatus=0;
 };
 // Called once on CPU 0 before AP scheduler activation or driver loading.
 void HdaObserveConfigure(const BootProtocol* boot);

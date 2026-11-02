@@ -59,7 +59,8 @@ void PmmFreePage(PhysicalAddress p){if(p.raw()==ram){++pmmFrees;return;}assert(s
  assert(munmap(reinterpret_cast<void*>(p.raw()),4096)==0);++toneFrees;}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t){if(scenario<20 || (scenario==22 && toneAllocations==2))return PhysicalAddress{};
  void* p=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,-1,0);assert(p!=MAP_FAILED);++toneAllocations;return PhysicalAddress(reinterpret_cast<uint64_t>(p));}
-PhysicalAddress VmmVirtToPhys(PageTable,VirtualAddress p){return PhysicalAddress(p.raw());}
+// Mirrors the real 4 KiB-only translator's failure on a huge direct-map leaf.
+PhysicalAddress VmmVirtToPhys(PageTable,VirtualAddress){return PhysicalAddress{};}
 bool VmmMapPage(PageTable,VirtualAddress,PhysicalAddress p,uint64_t,MemTag,uint16_t){assert(p.raw()==bar);if(scenario==2)return false;
  if(scenario==3)assert(mprotect(page,4096,PROT_NONE)==0);return true;}
 void VmmFreePages(VirtualAddress,uint64_t){++frees;}
@@ -91,16 +92,16 @@ static void one(int which){
  if(which>=16 && which<=18){assert(o.toneRequested && !o.toneAttempted && writes==2 && cmd==0);
   assert(o.toneAudible==(which==17 || which==18));assert(std::strcmp(o.toneReason,which==17?"conflicting markers":"observation incomplete")==0);}
  if(which==20){assert(o.toneRequested && o.toneAttempted && !o.toneAudible && o.toneFinished && !o.toneQuarantined &&
-  toneAllocations==4 && toneFrees==4 && cmd==0 && !chip.sawQuietUnmute && chip.selection==0 && chip.format==0x4011);}
+  toneAllocations==4 && toneFrees==4 && o.toneAdmission==31 && o.tonePageStatus==3 && cmd==0 && !chip.sawQuietUnmute && chip.selection==0 && chip.format==0x4011);}
  if(which==21){assert(o.toneAttempted && !o.toneFinished && !o.toneQuarantined && toneAllocations==4 && toneFrees==4 && cmd==0 && !chip.published);}
- if(which==22){assert(o.toneAttempted && !o.toneFinished && !o.toneQuarantined && toneAllocations==2 && toneFrees==2 && cmd==0);}
+ if(which==22){assert(o.toneAttempted && !o.toneFinished && !o.toneQuarantined && toneAllocations==2 && toneFrees==2 && o.tonePageStatus==4 && !o.tonePage && cmd==0);}
  if(which==23){assert(o.toneAttempted && !o.toneFinished && o.toneQuarantined && toneAllocations==4 && !toneFrees && cmd==2 && chip.pin[0]==0x80 && chip.pin[1]==0x80);}
  if(which==24){assert(o.toneAttempted && !o.toneFinished && o.toneQuarantined && toneAllocations==4 && !toneFrees && cmd==6 && chip.pin[0]==0x80 && chip.pin[1]==0x80);}
  if(which==25){assert(o.toneAttempted && !o.toneFinished && !o.toneQuarantined && !toneAllocations && cmd==0 && std::strcmp(o.toneReason,"clock unavailable")==0);}
  if(which==26){assert(o.toneRequested && o.toneAttempted && o.toneAudible && o.toneFinished && !o.toneQuarantined &&
   toneAllocations==4 && toneFrees==4 && cmd==0 && chip.sawQuietUnmute);}
  if(which==27){assert(o.toneRequested && o.toneAttempted && !o.toneFinished && !o.toneQuarantined &&
-  !toneAllocations && !toneFrees && cmd==0 && !chip.published);}
+  o.toneAdmission==30 && !toneAllocations && !toneFrees && cmd==0 && !chip.published);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
 int main(){for(int i=0;i<=27;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

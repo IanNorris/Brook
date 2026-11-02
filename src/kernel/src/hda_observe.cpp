@@ -1,5 +1,6 @@
 #include "hda_observe.h"
 #include "hda_dell_inventory.h"
+#include "hda_dell_tone_ram.h"
 #include "pci.h"
 #include "vfs.h"
 #include "serial.h"
@@ -187,16 +188,24 @@ struct Io {
 // adapter, the borrowed MMIO mapping and all owned RAM pages until reboot.
 struct TonePlatform {
     Io& io;const HdaSessionReport& snapshot;
-    bool identityStable(){return HdaDellToneInventoryMatches() && io.valid() && SafeBootRange(io.boot,io.base) && OtherBarStartsClear(io.base);}
+    bool identityStable(){
+        const bool inventory=HdaDellToneInventoryMatches(),valid=io.valid(),range=SafeBootRange(io.boot,io.base),bars=OtherBarStartsClear(io.base);
+        observation.toneAdmission=(observation.toneAdmission&16)|(inventory?1u:0u)|(valid?2u:0u)|(range?4u:0u)|(bars?8u:0u);
+        return inventory && valid && range && bars;}
     uint16_t command(){return io.command();}void setCommand(uint16_t v){io.setCommand(v);}
     bool controllerIdle(){return HdaDellToneControllerIdle(*this,snapshot);}
     bool allocatePage(uint64_t& physical,void*& address){
-        const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);if(!p)return false;
-        physical=p.raw();address=reinterpret_cast<void*>(PhysToVirt(p).raw());return true;}
+        const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);
+        if(!p){observation.tonePage=0;observation.tonePageStatus=4;return false;}
+        physical=p.raw();address=reinterpret_cast<void*>(PhysToVirt(p).raw());observation.tonePage=physical;return true;}
     bool pageAllowed(uint64_t physical,void* address){
         if(!physical || physical>0xfffff000ULL || (physical&4095) || !address ||
-           (reinterpret_cast<uintptr_t>(address)&4095))return false;
-        return VmmVirtToPhys(KernelPageTable,VirtualAddress(reinterpret_cast<uint64_t>(address))).raw()==physical;}
+           (reinterpret_cast<uintptr_t>(address)&4095)){observation.tonePageStatus=1;return false;}
+        KernelAliasMapping identity{},direct{};
+        if(!VmmInspectKernelAliases(physical,identity,direct) ||
+           !HdaDellToneRamMappingMatches(physical,reinterpret_cast<uint64_t>(address),DIRECT_MAP_BASE,direct)){
+            observation.tonePageStatus=2;return false;}
+        observation.tonePageStatus=3;return true;}
     void clearPage(void* p){memset(p,0,4096);}void freePage(uint64_t p){PmmFreePage(PhysicalAddress(p));}
     uint8_t read8(uint32_t o){return io.read8(o);}uint16_t read16(uint32_t o){return io.read16(o);}
     uint32_t read32(uint32_t o){return io.read32(o);}void write8(uint32_t o,uint8_t v){io.write8(o,v);}
@@ -239,6 +248,7 @@ void HdaObserveConfigure(const BootProtocol* boot) {
     auto* platform=::new(platformStorage) TonePlatform{io,observation.session};
     auto* adapter=::new(adapterStorage) ToneAdapter(*platform,observation.session);
     observation.toneAttempted=true;
+    HdaDellTonePlan checkPlan{};if(HdaDellMakeTonePlan(observation.session,checkPlan))observation.toneAdmission|=16;
     if(!platform->delayUs(3)){observation.toneReason="clock unavailable";return;}
     if(!adapter->allocate()){observation.toneReason="allocation or admission failed";return;}
     if(!adapter->begin()){observation.toneReason="controller admission failed";return;}
