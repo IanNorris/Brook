@@ -677,6 +677,32 @@ int main() {
         NetTcpPoolWaitUnregister(stale);assert(poolWaiter->refCount==TCP_ASYNC_POOL_WAITERS+1);
         for(auto token:tokens)NetTcpPoolWaitUnregister(token);
         assert(poolWaiter->refCount==1);delete poolWaiter;
+        // Capacity registrations retain all producers separately and cannot
+        // consume another socket/epoch's registration or a newer token.
+        g_tcpProducerWake=true;auto* capacityWaiter=new Process{};capacityWaiter->refCount=1;
+        uint64_t capacityTokens[TCP_CAPACITY_WAITERS];
+        for(auto& entry:capacityTokens){entry=TcpCapacityWaitRegister(socket,7,capacityWaiter);assert(entry);}
+        assert(!TcpCapacityWaitRegister(socket,7,capacityWaiter));
+        const auto staleCapacity=capacityTokens[0];TcpCapacityWaitUnregister(staleCapacity);
+        capacityTokens[0]=TcpCapacityWaitRegister(socket,8,capacityWaiter);assert(capacityTokens[0]!=staleCapacity);
+        TcpCapacityWaitUnregister(staleCapacity);
+        Process* capacityWake[TCP_CAPACITY_WAITERS];
+        assert(!TcpCapacityWaitTake(socket+1,7,capacityWake));
+        unsigned capacityCount=TcpCapacityWaitTake(socket,7,capacityWake);
+        assert(capacityCount==TCP_CAPACITY_WAITERS-1);
+        for(unsigned n=0;n<capacityCount;++n)TcpAsyncWake(capacityWake[n]);
+        assert(capacityWaiter->refCount==2 && capacityWaiter->pendingWakeup);
+        TcpCapacityWaitUnregister(capacityTokens[0]);assert(capacityWaiter->refCount==1);
+        const auto savedCapacityToken=g_tcpCapacityNextToken;g_tcpCapacityNextToken=~uint64_t(0);
+        assert(!TcpCapacityWaitRegister(socket,7,capacityWaiter));g_tcpCapacityNextToken=savedCapacityToken;
+        for(unsigned n=0;n<100;++n){
+            const auto t=TcpCapacityWaitRegister(socket,7,capacityWaiter);assert(t);
+            std::atomic<bool> go{false};std::thread unregister([&]{while(!go.load())std::this_thread::yield();TcpCapacityWaitUnregister(t);});
+            go=true;capacityCount=TcpCapacityWaitTake(socket,7,capacityWake);
+            for(unsigned j=0;j<capacityCount;++j)TcpAsyncWake(capacityWake[j]);
+            unregister.join();assert(capacityWaiter->refCount==1);
+        }
+        g_tcpProducerWake=false;delete capacityWaiter;
         // A reconnect while an old producer allocates its worker cannot
         // publish old bytes into the new TCP incarnation.
         socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
@@ -791,6 +817,48 @@ int main() {
         acknowledgeDataCount=62;runTestWorker();
         assert(SockPollReady(socket,false,true) && g_tcpAsyncWorkers==0);
         acknowledgeDataCount=0;SockClose(socket);
+        // A full queue arms a producer before dropping the gate; the worker
+        // can wake it before it actually blocks and all refs are retired.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
+        g_tcpProducerWake=true;ticks=1;
+        assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+        auto* blockedProducer=new Process{};blockedProducer->refCount=1;blockedProducer->pid=192;
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;int blockedResult=0;
+        std::thread blocked([&]{currentProcess=blockedProducer;blockedResult=SockSend(socket,bytes,1);currentProcess=nullptr;});
+        await([]{return gatePollWaiting.load();});
+        assert(blockedProducer->refCount>=2 && !blockedProducer->pendingWakeup);
+        assert(KMutexTryLock(&g_tcpAsyncProducerGates[socket]));KMutexUnlock(&g_tcpAsyncProducerGates[socket]);
+        acknowledgeDataCount=62;runTestWorker();assert(blockedProducer->pendingWakeup);
+        releaseGatePoll=true;blocked.join();holdGatePoll=false;
+        assert(blockedResult==1 && blockedProducer->refCount==1);
+        acknowledgeDataCount=1;runTestWorker();assert(!g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers);
+        g_tcpProducerWake=false;acknowledgeDataCount=0;SockClose(socket);delete blockedProducer;
+        // A signal during the registered wait drops the token and socket
+        // reference before the queued worker later drains.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;g_tcpProducerWake=true;ticks=1;
+        assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+        blockedProducer=new Process{};blockedProducer->refCount=1;blockedProducer->pid=193;
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;blockedResult=0;
+        std::thread interruptedProducer([&]{currentProcess=blockedProducer;blockedResult=SockSend(socket,bytes,1);currentProcess=nullptr;});
+        await([]{return gatePollWaiting.load();});assert(blockedProducer->refCount>=2);
+        __atomic_store_n(&blockedProducer->sigPending,1,__ATOMIC_RELEASE);
+        releaseGatePoll=true;interruptedProducer.join();holdGatePoll=false;
+        assert(blockedResult==-4 && blockedProducer->refCount==1);
+        Process* leftover[TCP_CAPACITY_WAITERS];assert(!TcpCapacityWaitTake(socket,g_tcpAsyncEpoch[socket],leftover));
+        acknowledgeDataCount=62;runTestWorker();assert(!g_tcpAsyncJobs[socket]);
+        g_tcpProducerWake=false;acknowledgeDataCount=0;SockClose(socket);delete blockedProducer;
+        // A terminal peer reset causes attached-job teardown to notify an
+        // already registered producer, which sees the reset on retry.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;g_tcpProducerWake=true;ticks=1;
+        assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+        blockedProducer=new Process{};blockedProducer->refCount=1;blockedProducer->pid=194;
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;blockedResult=0;
+        std::thread resetProducer([&]{currentProcess=blockedProducer;blockedResult=SockSend(socket,bytes,1);currentProcess=nullptr;});
+        await([]{return gatePollWaiting.load();});deliverControl(socket,20,10,TCP_RST,0);
+        runTestWorker();assert(blockedProducer->pendingWakeup);
+        releaseGatePoll=true;resetProducer.join();holdGatePoll=false;
+        assert(blockedResult==-104 && blockedProducer->refCount==1 && !g_tcpAsyncJobs[socket]);
+        g_tcpProducerWake=false;SockClose(socket);delete blockedProducer;
         g_tcpAsyncSend=false;g_tcpTwoPacketFlight=false;currentProcess=nullptr;delete caller;
     }
     {

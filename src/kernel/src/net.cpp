@@ -943,6 +943,7 @@ static bool g_tcpAsyncNeighbor = false;
 static bool g_tcpTryTransmit = false;
 static bool g_tcpQueueStage = false;
 static bool g_tcpAsyncSend = false;
+static bool g_tcpProducerWake = false;
 static bool g_irqTryLockProbe = false;
 static uint32_t g_irqTryLockProbeState=0,g_irqTryLockProbePassed=0;
 static uint32_t DebugIrqTryLockProbe();
@@ -973,6 +974,11 @@ void NetConfigureBoot()
     if (auto* marker=VfsOpen("/etc/tcp-async-send")) {
         VfsClose(marker);g_tcpAsyncSend=true;
         KPuts("net: bounded asynchronous TCP sender enabled (experimental)\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-producer-wake")) {
+        VfsClose(marker);
+        if(g_tcpAsyncSend){g_tcpProducerWake=true;KPuts("net: TCP producer capacity wake enabled (experimental)\n");}
+        else KPuts("net: TCP producer capacity wake requires async sender\n");
     }
     if (auto* marker=VfsOpen("/etc/tcp-worker-waiter")) {
         VfsClose(marker);

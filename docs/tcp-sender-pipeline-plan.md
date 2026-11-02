@@ -146,6 +146,27 @@ atomic registration and wake on queue retirement; keep the current timeout as
 a fallback until its races and sustained throughput are tested. The profile
 and receipt are under `build/hardware/dell-sustained-profile-20261102`.
 
+An opt-in `/etc/tcp-producer-wake` candidate adds a bounded, tokenized
+producer wait table. Registration happens under the socket lock while the
+queue is full; a full-to-non-full retirement or attached-job teardown takes
+matching epoch-scoped references and wakes them outside the locks. A 10 ms
+timeout remains the fallback for table exhaustion, pool exhaustion or missed
+terminal notifications. Hosted tests cover wake before blocking, gate release,
+table/token exhaustion, epoch isolation, concurrent unregister versus wake,
+signal cleanup and peer reset. Delayed, lossy USB-Ethernet QEMU acceptance
+passed with concurrent writes, worker-pool pressure and close under
+backpressure. This remains experimental and is disabled by default.
+
+With the candidate on the physical Dell, two 32 MiB LAN uploads using 1 KiB
+writes took 2.900 and 2.881 seconds (about 92.6 and 93.2 decimal Mbps),
+versus the earlier 10.60-second dedicated-worker-waiter baseline. Every
+receiver hash matched. Three 1 MiB HTTPS uploads returned HTTP 200 in
+1.17–1.31 seconds; two concurrent 4 MiB LAN transfers and a 256 KiB
+close-after-acceptance check also passed integrity checks. These are grouped,
+short experiments rather than alternating or long-duration acceptance; the
+HTTPS endpoint and network conditions were not controlled. Recovery was
+selected and booted after testing, and Dell speaker output stayed disabled.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate

@@ -9,6 +9,11 @@ struct TcpPoolWaitEntry {Process* process=nullptr;uint64_t token=0;};
 static TcpPoolWaitEntry g_tcpPoolWaiters[TCP_ASYNC_POOL_WAITERS]{};
 static IrqSpinLock g_tcpPoolWaitLock;
 static uint64_t g_tcpPoolNextToken=0;
+static constexpr uint32_t TCP_CAPACITY_WAITERS=64;
+struct TcpCapacityWaitEntry {Process* process=nullptr;uint64_t token=0;int index=-1;uint64_t epoch=0;};
+static TcpCapacityWaitEntry g_tcpCapacityWaiters[TCP_CAPACITY_WAITERS]{};
+static IrqSpinLock g_tcpCapacityWaitLock;
+static uint64_t g_tcpCapacityNextToken=0;
 struct TcpAsyncJob {
     int index;
     uint64_t epoch;
@@ -25,6 +30,41 @@ static bool TcpAsyncReserveWorker() {
 }
 static void TcpAsyncWake(Process* waiter) {
     if(waiter){__atomic_store_n(&waiter->pendingWakeup,1,__ATOMIC_RELEASE);SchedulerUnblock(waiter);ProcessUnref(waiter);}
+}
+// Registration is made while the caller holds the socket lock and observes a
+// full queue. Lock order is socket -> capacity table; no table holder takes a
+// socket lock. A zero token means bounded polling remains the fallback.
+static uint64_t TcpCapacityWaitRegister(int index,uint64_t epoch,Process* process) {
+    if(!g_tcpProducerWake || !process)return 0;
+    const auto flags=IrqSpinLockAcquire(&g_tcpCapacityWaitLock);uint64_t token=0;
+    if(g_tcpCapacityNextToken!=~uint64_t(0))for(auto& entry:g_tcpCapacityWaiters)if(!entry.process){
+        ProcessRef(process);token=++g_tcpCapacityNextToken;entry={process,token,index,epoch};break;
+    }
+    IrqSpinLockRelease(&g_tcpCapacityWaitLock,flags);return token;
+}
+static void TcpCapacityWaitUnregister(uint64_t token) {
+    if(!token)return;
+    Process* process=nullptr;const auto flags=IrqSpinLockAcquire(&g_tcpCapacityWaitLock);
+    for(auto& entry:g_tcpCapacityWaiters)if(entry.token==token){process=entry.process;entry={};break;}
+    IrqSpinLockRelease(&g_tcpCapacityWaitLock,flags);ProcessUnref(process);
+}
+class TcpCapacityWait {
+    uint64_t token_=0;
+public:
+    ~TcpCapacityWait(){TcpCapacityWaitUnregister(token_);}
+    void Register(int index,uint64_t epoch,Process* process){if(!token_)token_=TcpCapacityWaitRegister(index,epoch,process);}
+    TcpCapacityWait(const TcpCapacityWait&)=delete;
+    TcpCapacityWait& operator=(const TcpCapacityWait&)=delete;
+    TcpCapacityWait()=default;
+};
+// The caller holds the socket lock; transferred references are woken only
+// after it is released, avoiding socket/scheduler lock nesting.
+static unsigned TcpCapacityWaitTake(int index,uint64_t epoch,Process** wake) {
+    unsigned count=0;const auto flags=IrqSpinLockAcquire(&g_tcpCapacityWaitLock);
+    for(auto& entry:g_tcpCapacityWaiters)if(entry.process && entry.index==index && entry.epoch==epoch){
+        wake[count++]=entry.process;entry={};
+    }
+    IrqSpinLockRelease(&g_tcpCapacityWaitLock,flags);return count;
 }
 uint64_t NetTcpPoolWaitRegister(Process* process) {
     if(!g_tcpAsyncSend || !process)return 0;
@@ -70,7 +110,10 @@ static void TcpAsyncWorker(void* argument) {
                 g_tcpProbeWorkerDisplaced[index]=false;
             }
             Process* waiter=attached ? TakeSocketWaiterLocked(s) : nullptr;
+            Process* capacity[TCP_CAPACITY_WAITERS];
+            const unsigned count=attached && g_tcpProducerWake ? TcpCapacityWaitTake(index,job->epoch,capacity) : 0;
             SpinLockRelease(&s.lock);TcpAsyncWake(waiter);
+            for(unsigned n=0;n<count;++n)TcpAsyncWake(capacity[n]);
 #ifdef BROOK_SOCKET_LIFETIME_TEST
             extern void TcpAsyncTestDetached(int);
             TcpAsyncTestDetached(index);
@@ -85,6 +128,7 @@ static void TcpAsyncWorker(void* argument) {
         // existing sender retains its own flight copy and returns ACKed bytes.
         const int result=batch ? SockSendImpl(index,{job->batch,false,nullptr,0},batch) : -5;
         SpinLockAcquire(&s.lock);
+        const bool wasFull=!job->queue.Free();
         const uint32_t acked=result>0 ? static_cast<uint32_t>(result) : 0;
         const bool valid=acked<=batch && job->queue.Retire(acked);
         if(!valid || result!=static_cast<int>(batch)) {
@@ -94,7 +138,11 @@ static void TcpAsyncWorker(void* argument) {
             }
         }
         Process* waiter=TakeSocketWaiterLocked(s);
+        Process* capacity[TCP_CAPACITY_WAITERS];
+        const unsigned count=g_tcpProducerWake && g_tcpAsyncJobs[index]==job && ((wasFull && job->queue.Free()) || !valid || result!=static_cast<int>(batch))
+            ? TcpCapacityWaitTake(index,job->epoch,capacity) : 0;
         SpinLockRelease(&s.lock);TcpAsyncWake(waiter);
+        for(unsigned n=0;n<count;++n)TcpAsyncWake(capacity[n]);
     }
 }
 
@@ -117,7 +165,7 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
     const uint64_t deadline=ApicTickCount()+30000;uint32_t accepted=0;uint64_t epoch=0;bool haveEpoch=false;
     uint8_t staging[ETH_MTU];
     for(;;) {
-        bool wait=false;
+        bool wait=false;TcpCapacityWait capacityWait;
         {
             TcpSendOwnership producer(index,self,&g_tcpAsyncProducerGates[index]);
             int acquired=producer.Acquire(deadline);
@@ -140,6 +188,7 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
                 const bool nonblock=__atomic_load_n(&s.nonblock,__ATOMIC_ACQUIRE);
                 const uint32_t mss=TcpEgressLimit(s.tcpPeerMss,g_tcpEgressCeiling);
                 if(job && !job->queue.Free()) {
+                    if(!accepted && !nonblock)capacityWait.Register(index,epoch,self);
                     SpinLockRelease(&s.lock);
                     if(accepted)return static_cast<int>(accepted);
                     if(nonblock)return -11;
