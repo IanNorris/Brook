@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Brook audio stages: ready</title>
+<!-- Local diagnostic fixture; output volume and routing are controlled externally. -->
+<style>body { font: 32px sans-serif; margin: 30px; } button { font: 40px sans-serif; padding: 40px; }</style>
+<h1>Local audio check</h1>
+<button id="play">Start test audio</button>
+<p id="status">Waiting for click</p>
+<script>
+function phase(s) {
+  document.title = "Brook audio stages: " + s;
+  document.querySelector("#status").textContent = s;
+}
+document.querySelector("#play").addEventListener("click", () => {
+  try {
+    phase("construct context");
+    const ctx = new AudioContext();
+    phase("construct oscillator");
+    const osc = ctx.createOscillator();
+    phase("construct gain");
+    const gain = ctx.createGain();
+    osc.frequency.value = 440;
+    gain.gain.value = 0.05;
+    phase("connect");
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    phase("start");
+    osc.start();
+    phase("resume " + ctx.state);
+    ctx.onstatechange = () => phase("state " + ctx.state);
+    ctx.resume().then(() => phase("resumed " + ctx.state))
+      .catch(e => phase("resume error " + e));
+  } catch (e) {
+    phase("error " + e);
+  }
+});
+</script>

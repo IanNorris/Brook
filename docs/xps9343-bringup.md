@@ -2861,3 +2861,17 @@ exit; removing that test profile brought usage down to 11. This does not prove
 that every application fits or that large flat directories are fast: tmpfs
 directory lookup and enumeration still have linear traversal costs. Recovery
 generation 98 was selected and the candidate restart was requested.
+
+A subsequent muted Firefox test used the local
+`scripts/workloads/browser_audio_gesture.html` page and a fresh temporary
+profile. A boot-guarded debug click reached the page and its Web Audio graph
+reached `resume suspended`, but the observed mixer snapshots contained no
+stream. Cubeb logging showed audio IPC starting; it did not establish why the
+resume promise did not resolve during the observations or whether the browser
+actually inherited the intended ALSA backend. A comparison setting
+`media.cubeb.sandbox=false` in a separate disposable profile was inconclusive:
+Firefox logged that it forced audio sandboxing back on because its content
+sandbox was enabled. No system or persistent browser sandbox setting was
+changed. The fixture profiles were removed after their processes exited, and
+recovery generation 100 was selected. A media-element comparison and a check
+of the live browser's effective audio environment are still needed.
