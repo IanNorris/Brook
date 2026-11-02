@@ -157,6 +157,19 @@ rejection; it does not mount the data store or change the desktop fallback
 decision. The ordinary boot has no such marker. Host tests cover absent and
 invalid selectors, each scratch-allocation failure, a device-read failure,
 dirty and valid fixtures, with no writes or additional mounts. The kernel
-builds, but this wiring has not been boot-tested in QEMU or deployed to the
-Dell. A failed hardware read can still quarantine the existing AHCI device,
+builds. A failed hardware read can still quarantine the existing AHCI device,
 so read-only inspection is not necessarily operationally harmless.
+
+The diagnostic was subsequently boot-tested in private QEMU on a cloned,
+snapshot-backed Dell-capacity disk: a 6 GiB ESP retained the existing store,
+and a separately formatted 17 GiB ext2 data partition was identified as entry
+2 with 136 groups. The existing store, network and desktop also started; a
+checked shutdown passed. A second boot with a deliberately mismatched data
+filesystem UUID reported rejection while the existing store and desktop still
+started and shutdown passed. These tests did not mount or modify the data
+partition and do not establish AHCI ownership, writable behavior or Dell
+hardware compatibility. The first rehearsal used obsolete module ABI 57 with
+kernel ABI 63, so networking failed and that VM was stopped; matching modules
+were used in both successful boots. Results and serial logs are in
+`build/hardware/data-probe-qemu-run2-20261102` and
+`build/hardware/data-probe-qemu-reject-run-20261102`.
