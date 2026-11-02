@@ -1774,9 +1774,17 @@ cleanup must be verified before exposing ordinary audio playback.
 The next opt-in diagnostic is under construction: host-tested pieces now
 model a fresh converter-format snapshot, restricted codec commands, explicit
 mute/restore sequencing, a bounded-amplitude stereo tone and polling stream
-control with error/quarantine paths. These pieces are not yet connected to a
-physical playback adapter. Mock tests do not prove DMA quiescence or that the
-tone is audible, and no tone has yet been played on the Dell.
+control with error/quarantine paths. Mock tests do not prove DMA quiescence or
+that the tone is audible, and no tone has yet been played on the Dell.
+The boot-only adapter is now connected behind two mutually exclusive initrd
+markers: `dell-hda-muted-dma` runs with the speaker pin muted throughout;
+`dell-hda-quiet-tone` permits the bounded attenuated tone. Both also require
+`dell-hda-observe`, a complete fresh codec snapshot and an exact match to the
+16-device PCI inventory whose resource ranges were checked on Linux. A
+position-buffer DMA enable, inactive clock, changed inventory or busy device
+refuses admission. Host tests exercise the actual boot adapter with a mock
+controller, including retained pages on unconfirmed stop/retirement. The
+muted and audible paths still require physical acceptance.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

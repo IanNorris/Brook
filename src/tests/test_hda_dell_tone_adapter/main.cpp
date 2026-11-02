@@ -5,12 +5,12 @@
 using namespace brook;
 struct Platform:Chip {
     alignas(4096) uint8_t pages[4][4096]{};unsigned allocated=0,freed=0;uint16_t pci=0;
-    int failAllocation=-1;bool identity=true,denyDecode=false,denyMaster=false,denyDisable=false,denyFinish=false,stuckStop=false,stallPlaybackClock=false,badIdle=false;
+    int failAllocation=-1;bool identity=true,denyDecode=false,denyMaster=false,denyDisable=false,denyFinish=false,stuckStop=false,stallPlaybackClock=false,badIdle=false,everMaster=false;
     bool identityStable(){return identity;}uint16_t command(){return pci;}
-    void setCommand(uint16_t c){if(c==6)assert(published);if((c==2 && pci==0 && denyDecode) || (c==6 && denyMaster) ||
+    void setCommand(uint16_t c){if(c==6){assert(published);everMaster=true;}if((c==2 && pci==0 && denyDecode) || (c==6 && denyMaster) ||
         (c==2 && pci==6 && denyDisable) || (c==0 && pci==2 && denyFinish))return;
         pci=c;}
-    bool controllerIdle(){return !badIdle && read16(base)==0;}
+    bool controllerIdle(){return !badIdle && !(read32(0x70)&1) && read16(base)==0;}
     bool allocatePage(uint64_t& physical,void*& virt){if(int(allocated)==failAllocation)return false;
         assert(allocated<4);physical=0x1000+allocated*4096;virt=pages[allocated++];return true;}
     bool pageAllowed(uint64_t physical,void* virt){return physical && virt && !(physical&4095) && !(reinterpret_cast<uintptr_t>(virt)&4095);}
@@ -35,6 +35,8 @@ int main(){
      assert(!a.begin() && p.freed==4 && p.pci==0);}
     {Platform p;p.badIdle=true;p.denyFinish=true;HdaDellToneAdapter<Platform> a(p,s);assert(a.allocate());
      assert(!a.begin() && p.quarantined && p.freed==0 && p.pci==2);}
+    {Platform p;p.mem[0x70]=1;HdaDellToneAdapter<Platform> a(p,s);assert(a.allocate());
+     assert(!a.begin() && p.freed==4 && p.pci==0 && !p.everMaster && !(p.read16(Platform::base)&2));}
     {Platform p;HdaDellToneAdapter<Platform> a(p,s);HdaDellTonePlan plan{};
      assert(HdaDellMakeTonePlan(s,plan) && a.allocate() && a.begin() && a.muteAndVerify(plan) && a.configureMuted(plan) && a.prepareDma(plan));
      assert(!a.begin() && p.freed==0 && p.pci==2);}

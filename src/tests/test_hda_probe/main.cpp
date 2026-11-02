@@ -4,6 +4,7 @@
 #include <initializer_list>
 #include "../../drivers/intel_hda/hda_probe.h"
 #include "../../drivers/intel_hda/hda_probe_session.h"
+#include "../../drivers/intel_hda/hda_dell_tone_controller.h"
 using namespace brook;
 struct Fake {
     uint8_t mem[4096]{};unsigned writes=0, pauses=0;bool timeout=false,staleStuck=false,clockAdvances=false;uint64_t clock=0;
@@ -52,6 +53,8 @@ int main() {
     pci.bar1=0xffffffff;pci.bar0=0xffffc004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);
     pci.bar1=0;pci.bar0=0xf7419004;assert(HdaProbePciCheck(pci,base)==HdaProbeResult::InvalidBar);
     HdaProbeController state{};uint32_t reply=0;
+    {auto f=idle();f.set16(0x0e,1);HdaSessionReport s{};s.controller.gcap=0x2100;
+     assert(HdaDellToneControllerIdle(f,s));f.set32(0x70,1);assert(!HdaDellToneControllerIdle(f,s));}
     {auto f=idle();HdaReadOnlyProbe<Fake> probe(f);assert(probe.read(0,0,0xf00,0,reply)==HdaProbeResult::Failed && !f.writes);
      assert(probe.readAmp(0,0x14,true,true,0,reply)==HdaProbeResult::Failed && !f.writes);}
     {auto f=idle();f.set32(8,0);HdaReadOnlyProbe<Fake> probe(f);assert(probe.inspect(state)==HdaProbeResult::ControllerReset && !f.writes);}

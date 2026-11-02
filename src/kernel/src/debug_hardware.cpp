@@ -139,7 +139,13 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text("],\"amp_completed\":");r.number(s.ampCompleted);r.text(",\"amp_values\":[");
         for(unsigned i=0;i<s.ampCompleted && i<6;++i){if(i)r.text(",");r.number(s.ampValues[i]);}
         r.text("],\"format_completed\":");r.text(s.formatCompleted?"true":"false");
-        r.text(",");r.field("converter_format",s.converterFormat);r.text("}\n");r.send();return true;
+        r.text(",");r.field("converter_format",s.converterFormat);
+        r.text(",\"tone\":{\"requested\":");r.text(o.toneRequested?"true":"false");
+        r.text(",\"attempted\":");r.text(o.toneAttempted?"true":"false");
+        r.text(",\"audible\":");r.text(o.toneAudible?"true":"false");
+        r.text(",\"finished\":");r.text(o.toneFinished?"true":"false");
+        r.text(",\"quarantined\":");r.text(o.toneQuarantined?"true":"false");
+        r.text(",");r.field("result",o.toneResult);r.text(",\"reason\":");r.quoted(o.toneReason);r.text("}}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-memory")) {
         // Fixed identity only, using immutable boot PCI metadata. This reports

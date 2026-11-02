@@ -1,4 +1,5 @@
 #include "hda_observe.h"
+#include "hda_dell_inventory.h"
 #include "pci.h"
 #include "vfs.h"
 #include "serial.h"
@@ -7,8 +8,22 @@
 #include "apic.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "../../drivers/intel_hda/hda_dell_tone_adapter.h"
+#include "../../drivers/intel_hda/hda_dell_tone_controller.h"
+#include <stddef.h>
+#ifdef BROOK_HOST_TEST
+#include <cstring>
+#include <new>
+#else
+#include "string.h"
+inline void* operator new(size_t,void* storage) noexcept {return storage;}
+#endif
 
 namespace brook {
+#ifdef BROOK_HOST_TEST
+uint8_t HdaObserveTestRead8(uint32_t);uint16_t HdaObserveTestRead16(uint32_t);uint32_t HdaObserveTestRead32(uint32_t);
+void HdaObserveTestWrite8(uint32_t,uint8_t);void HdaObserveTestWrite16(uint32_t,uint16_t);void HdaObserveTestWrite32(uint32_t,uint32_t);
+#endif
 namespace {
 HdaObservation observation{};
 volatile uint8_t* registers=nullptr; // borrowed page; intentionally boot-lifetime
@@ -123,24 +138,117 @@ struct Io {
     bool valid(){return SmpCurrentCpuIndex()==0 && liveIdentity() && CacheCompatible(base);}
     uint16_t command(){return PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4);}
     void setCommand(uint16_t value){PciConfigWrite32(entry.device.bus,entry.device.dev,entry.device.fn,4,value);}
-    uint8_t read8(uint32_t offset){return *reinterpret_cast<volatile uint8_t*>(registers+offset);}
-    uint16_t read16(uint32_t offset){return *reinterpret_cast<volatile uint16_t*>(registers+offset);}
-    uint32_t read32(uint32_t offset){return *reinterpret_cast<volatile uint32_t*>(registers+offset);}
-    void write16(uint32_t offset,uint16_t value){*reinterpret_cast<volatile uint16_t*>(registers+offset)=value;}
-    void write32(uint32_t offset,uint32_t value){*reinterpret_cast<volatile uint32_t*>(registers+offset)=value;}
+    uint8_t read8(uint32_t offset){
+#ifdef BROOK_HOST_TEST
+        return HdaObserveTestRead8(offset);
+#else
+        return *reinterpret_cast<volatile uint8_t*>(registers+offset);
+#endif
+    }
+    uint16_t read16(uint32_t offset){
+#ifdef BROOK_HOST_TEST
+        return HdaObserveTestRead16(offset);
+#else
+        return *reinterpret_cast<volatile uint16_t*>(registers+offset);
+#endif
+    }
+    uint32_t read32(uint32_t offset){
+#ifdef BROOK_HOST_TEST
+        return HdaObserveTestRead32(offset);
+#else
+        return *reinterpret_cast<volatile uint32_t*>(registers+offset);
+#endif
+    }
+    void write8(uint32_t offset,uint8_t value){
+#ifdef BROOK_HOST_TEST
+        HdaObserveTestWrite8(offset,value);
+#else
+        *reinterpret_cast<volatile uint8_t*>(registers+offset)=value;
+#endif
+    }
+    void write16(uint32_t offset,uint16_t value){
+#ifdef BROOK_HOST_TEST
+        HdaObserveTestWrite16(offset,value);
+#else
+        *reinterpret_cast<volatile uint16_t*>(registers+offset)=value;
+#endif
+    }
+    void write32(uint32_t offset,uint32_t value){
+#ifdef BROOK_HOST_TEST
+        HdaObserveTestWrite32(offset,value);
+#else
+        *reinterpret_cast<volatile uint32_t*>(registers+offset)=value;
+#endif
+    }
     uint64_t ticks(){return ApicTickCount();}
     void pause(){__asm__ volatile("pause");}
 };
+// BSP-only, opt-in boot diagnostic. Quarantine retains this platform, the
+// adapter, the borrowed MMIO mapping and all owned RAM pages until reboot.
+struct TonePlatform {
+    Io& io;const HdaSessionReport& snapshot;
+    bool identityStable(){return HdaDellToneInventoryMatches() && io.valid() && SafeBootRange(io.boot,io.base) && OtherBarStartsClear(io.base);}
+    uint16_t command(){return io.command();}void setCommand(uint16_t v){io.setCommand(v);}
+    bool controllerIdle(){return HdaDellToneControllerIdle(*this,snapshot);}
+    bool allocatePage(uint64_t& physical,void*& address){
+        const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);if(!p)return false;
+        physical=p.raw();address=reinterpret_cast<void*>(PhysToVirt(p).raw());return true;}
+    bool pageAllowed(uint64_t physical,void* address){
+        if(!physical || physical>0xfffff000ULL || (physical&4095) || !address ||
+           (reinterpret_cast<uintptr_t>(address)&4095))return false;
+        return VmmVirtToPhys(KernelPageTable,VirtualAddress(reinterpret_cast<uint64_t>(address))).raw()==physical;}
+    void clearPage(void* p){memset(p,0,4096);}void freePage(uint64_t p){PmmFreePage(PhysicalAddress(p));}
+    uint8_t read8(uint32_t o){return io.read8(o);}uint16_t read16(uint32_t o){return io.read16(o);}
+    uint32_t read32(uint32_t o){return io.read32(o);}void write8(uint32_t o,uint8_t v){io.write8(o,v);}
+    void write16(uint32_t o,uint16_t v){io.write16(o,v);}void write32(uint32_t o,uint32_t v){io.write32(o,v);}
+    uint64_t ticks(){return io.ticks();}void pause(){io.pause();}
+    bool delayUs(unsigned us){
+        if(us>1000)return false;uint64_t flags=0;__asm__ volatile("pushfq; popq %0":"=r"(flags));
+        if(!(flags&0x200))return false;const auto start=ticks();uint64_t anchor=0;bool haveBoundary=false;
+        // Discard the first delivered IRQ (which could already be pending),
+        // then require two further boundaries on the BSP millisecond clock.
+        for(unsigned i=0;i<10000000;++i){const auto now=ticks();
+            if(!haveBoundary && now>start){anchor=now;haveBoundary=true;}
+            else if(haveBoundary && now>=anchor && now-anchor>=2)return true;pause();}
+        return false;
+    }
+    void publishDma(){__atomic_thread_fence(__ATOMIC_SEQ_CST);}
+    void quarantine(){observation.toneQuarantined=true;}
+};
+bool Marker(const char* path){auto* node=VfsOpen(path);if(!node)return false;VfsClose(node);return true;}
 }
 void HdaObserveConfigure(const BootProtocol* boot) {
     if(observation.attempted)return;
     auto* marker=VfsOpen("/etc/dell-hda-observe");if(!marker)return;VfsClose(marker);
     observation.requested=true;observation.attempted=true;observation.reason="prepared";
-    Io io{boot};observation.session=HdaProbeDellSession(io);
+    static Io io{nullptr};io.boot=boot;observation.session=HdaProbeDellSession(io);
     if(observation.session.result!=HdaSessionResult::Unprepared)observation.reason="transaction attempted";
     SerialPrintf("HDA_OBSERVE result=%u probe=%u before=0x%x enabled=0x%x after=0x%x reason=%s\n",
         unsigned(observation.session.result),unsigned(observation.session.probe),unsigned(observation.session.before),
         unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
+    const bool muted=Marker("/etc/dell-hda-muted-dma"),audible=Marker("/etc/dell-hda-quiet-tone");
+    if(!muted && !audible)return;
+    observation.toneRequested=true;observation.toneAudible=audible;
+    if(muted && audible){observation.toneReason="conflicting markers";return;}
+    if(observation.session.result!=HdaSessionResult::Complete || observation.session.after!=0 || !observation.mapped){
+        observation.toneReason="observation incomplete";return;}
+    // Explicit placement storage avoids destructing quarantined ownership.
+    alignas(TonePlatform) static unsigned char platformStorage[sizeof(TonePlatform)];
+    using ToneAdapter=HdaDellToneAdapter<TonePlatform>;
+    alignas(ToneAdapter) static unsigned char adapterStorage[sizeof(ToneAdapter)];
+    auto* platform=::new(platformStorage) TonePlatform{io,observation.session};
+    auto* adapter=::new(adapterStorage) ToneAdapter(*platform,observation.session);
+    observation.toneAttempted=true;
+    if(!platform->delayUs(3)){observation.toneReason="clock unavailable";return;}
+    if(!adapter->allocate()){observation.toneReason="allocation or admission failed";return;}
+    if(!adapter->begin()){observation.toneReason="controller admission failed";return;}
+    const auto result=adapter->run(audible);observation.toneResult=uint8_t(result);
+    if(result!=HdaToneResult::Complete){observation.toneReason="transaction failed";return;}
+    observation.toneFinished=adapter->finish();
+    observation.toneReason=observation.toneFinished?"complete":"decode restore failed";
+    SerialPrintf("HDA_TONE mode=%s result=%u finished=%u quarantine=%u reason=%s\n",
+        audible?"quiet":"muted",unsigned(observation.toneResult),unsigned(observation.toneFinished),
+        unsigned(observation.toneQuarantined),observation.toneReason);
 }
 const HdaObservation& HdaObserveRead(){return observation;}
 }
