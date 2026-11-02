@@ -94,6 +94,13 @@ uint32_t AudioGetPosition();
 bool     AudioAvailable();
 uint32_t AudioOutputControl();
 bool     AudioSetOutputControl(uint32_t control);
+// User-facing control entry point; internal settings restoration must use the
+// ordinary setter so it cannot authorize an initially muted hardware output.
+bool     AudioSetUserOutputControl(uint32_t control,bool explicitUnmute=false);
+bool     AudioUserUnmuteRequested();
+// One atomic snapshot: control in low bits, explicit user authorization bit.
+static constexpr uint32_t AudioUserUnmuteBit=1u<<16;
+uint32_t AudioOutputControlSnapshot();
 
 // --- Mixer API ---
 // All samples must be 44100 Hz, stereo, 16-bit signed LE before submission.

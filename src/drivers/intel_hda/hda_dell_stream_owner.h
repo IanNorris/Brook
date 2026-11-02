@@ -76,6 +76,12 @@ public:
     }
     bool mute(){stage(9);if(!active_ || held_ || (p_.command()!=2 && p_.command()!=6)){noteFailure(9);return false;}
         muted_=codec_.muteAndVerify(plan_);if(!muted_)noteFailure(9);return muted_;}
+    // A failed SET may have unmuted one channel. Mark the state uncertain
+    // before issuing it; the caller must stop and quarantine on failure.
+    bool unmute(){
+        if(!active_ || !prepared_ || held_ || stopped_ || !muted_ || p_.command()!=6)return false;
+        stage(40);muted_=false;if(!codec_.unmuteAndVerify(plan_)){noteFailure(40);return false;}return true;
+    }
     bool stop(){
         stage(10);
         if(!prepared_ || held_ || (p_.command()!=2 && p_.command()!=6) || !stream_.stop())return false;
@@ -90,8 +96,8 @@ public:
         if(!mute())return hold();stage(12);uint32_t value=0;
         if(!ici_.set8(3,0x706,0) || !ici_.get8(3,0xf06,value) || value!=0 ||
            !ici_.setFormat(uint16_t(saved_.converterFormat)) || !ici_.getFormat(value) || value!=saved_.converterFormat)return hold();
-        muted_=false; // restore can partially unmute before reporting failure
-        stage(13);if(!codec_.restoreAndVerify(plan_,saved_))return hold();
+        // Keep both speaker pins muted while ownership and pages are retained.
+        // The original firmware state is restored only on final retirement.
         stage(14);if(!stream_.retire())return hold();
         prepared_=false;retained_=true;stage(15);return true;
     }
@@ -107,6 +113,8 @@ public:
     bool retire(){
         if(!retained_ && !retireRetained())return false;
         if(held_ || !active_)return false;if(p_.command()!=2)return hold();
+        muted_=false; // restore can partially unmute before reporting failure
+        stage(13);if(!codec_.restoreAndVerify(plan_,saved_))return hold();
         p_.setCommand(0);if(p_.command()!=0)return hold();
         if(!memory_.release(true))return hold();active_=retained_=false;return true;
     }

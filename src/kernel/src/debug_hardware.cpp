@@ -148,6 +148,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     if(!strcmp(command,"bridge hardware dell-hda-runtime")) {
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_runtime_api\":1,\"requested\":");r.text(o.runtimeRequested?"true":"false");
         r.text(",\"prepared\":");r.text(o.runtimePrepared?"true":"false");r.text(",\"registered\":");r.text(o.runtimeRegistered?"true":"false");
+        r.text(",\"audible_enabled\":");r.text(o.runtimeAudibleEnabled?"true":"false");
         r.text(",\"quarantined\":");r.text(__atomic_load_n(&o.runtimeQuarantined,__ATOMIC_ACQUIRE)?"true":"false");
         r.text(",");r.field("pages_validated",__atomic_load_n(&o.runtimePagesValidated,__ATOMIC_RELAXED));
         r.text(",");r.field("page_rejections",__atomic_load_n(&o.runtimePageRejections,__ATOMIC_RELAXED));

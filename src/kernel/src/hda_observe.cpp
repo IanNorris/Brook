@@ -341,15 +341,18 @@ void ObserveCachePages(Io& io){
 }
 struct RuntimeLock {KMutex mutex{};void init(){KMutexInit(&mutex);}void lock(){KMutexLock(&mutex);}
     bool tryLock(){return KMutexTryLock(&mutex);}void unlock(){KMutexUnlock(&mutex);}};
-using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock,true>;
+using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock,true,true>;
 RuntimeOwner* runtimeOwner=nullptr;RuntimeBridge* runtimeBridge=nullptr;
+bool runtimeAudibleEnabled=false;
 int RuntimePlay(const void* p,uint32_t n,uint32_t hz,uint8_t ch,uint8_t bits,bool){return runtimeBridge?runtimeBridge->play(p,n,hz,ch,bits):-19;}
 void RuntimeStop(){if(runtimeBridge){const bool ok=runtimeBridge->stop();
     __atomic_fetch_add(&observation.runtimeStops,1u,__ATOMIC_RELAXED);
     if(!ok)__atomic_fetch_add(&observation.runtimeStopFailures,1u,__ATOMIC_RELAXED);}}
 bool RuntimePlaying(){return runtimeBridge && runtimeBridge->isPlaying();}
 uint32_t RuntimePosition(){AudioDeviceProgress p{};return runtimeBridge && runtimeBridge->progress(&p)?uint32_t(p.completed):0;}
-void RuntimeService(){if(runtimeBridge)runtimeBridge->service();}
+void RuntimeService(){if(runtimeBridge){runtimeBridge->service();
+    if(runtimeAudibleEnabled)runtimeBridge->reconcileOutput([]{const auto value=AudioOutputControlSnapshot();
+        return HdaDellOutputRequest{(value&AudioUserUnmuteBit)!=0,value&~AudioUserUnmuteBit};});}}
 AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?runtimeBridge->submit(p,n):AudioSubmitReceipt{0,0,0,-19};}
 bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
 bool RuntimeRestart(uint64_t epoch){if(!runtimeBridge)return false;const bool ok=runtimeBridge->restart(epoch);
@@ -381,6 +384,8 @@ void PrepareRuntime(Io& io){
     // Two admitted CPUs may differ by up to 20 us. This covers the observed
     // offset bound, not systematic PIT calibration error or future drift.
     runtimeBridge=::new(bridgeStorage) RuntimeBridge(*runtimeOwner,lock,line,4096,1024,20000);
+    runtimeAudibleEnabled=Marker("/etc/dell-hda-audible");
+    observation.runtimeAudibleEnabled=runtimeAudibleEnabled;
     observation.runtimePrepared=true;observation.runtimeReason="prepared muted";
 }
 void RunStreamProbe(Io& io){

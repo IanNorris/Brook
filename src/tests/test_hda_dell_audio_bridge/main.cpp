@@ -8,14 +8,16 @@ using namespace brook;
 struct Lock {std::atomic<bool> held{false};void lock(){while(held.exchange(true)){};}bool tryLock(){return !held.exchange(true);}void unlock(){held.store(false);}};
 struct Owner {
     uint8_t cpu[65536]{},device[65536]{};uint64_t ns=1000000000;uint32_t pos=0;
-    unsigned starts=0,stops=0,mutes=0,retires=0,quarantines=0,retained=0,reprepares=0;bool running=false,failPosition=false,moveOnPublish=false,failReprepare=false;
+    unsigned starts=0,stops=0,mutes=0,unmutes=0,retires=0,quarantines=0,retained=0,reprepares=0;
+    bool running=false,failPosition=false,moveOnPublish=false,failReprepare=false,failUnmute=false,pinMuted=true;
     uint64_t nowNs(){ns+=1000000;return ns;}
     bool position(uint32_t& p,bool& error,bool& run){if(failPosition)return false;pos=(pos+192)%65536;p=pos;error=false;run=running;return true;}
     bool write(uint32_t o,const uint8_t* data,uint32_t n){assert(o<=65536 && n<=65536-o);if(data)std::memcpy(cpu+o,data,n);else std::memset(cpu+o,0,n);return true;}
     bool publish(uint32_t o,uint32_t n){assert(o<=65536 && n<=65536-o);if(n){const auto begin=o&~63u,end=(o+n+63)&~63u;std::memcpy(device+begin,cpu+begin,end-begin);}
         if(moveOnPublish){pos=(pos+8192)%65536;ns+=47000000;moveOnPublish=false;}return true;}
     bool fence(){return true;}bool start(){++starts;running=true;return true;}
-    bool mute(){++mutes;return true;}bool stop(){++stops;running=false;return true;}
+    bool mute(){++mutes;pinMuted=true;return true;}bool unmute(){++unmutes;pinMuted=false;return !failUnmute;}
+    bool stop(){++stops;running=false;return true;}
     bool retire(){++retires;return true;}void quarantine(){++quarantines;}
     bool retireRetained(){++retained;return true;}
     bool prepareRetained(){++reprepares;if(failReprepare)return false;pos=0;return true;}
@@ -63,6 +65,25 @@ int main(){
     assert(retry.submit(samples,sizeof(samples)).accepted && retry.stop());retryFailure.failReprepare=true;
     assert(!retry.restart(1) && retryFailure.quarantines==1 && retry.progress(&p) && p.epoch==1 && p.discontinuity);
     retryFailure.failReprepare=false;assert(!retry.restart(1) && retryFailure.reprepares==1);
+    Owner output;Lock outputLock;HdaDellAudioBridge<Owner,Lock,true,true> controllable(output,outputLock,64,4096);
+    HdaDellOutputRequest req{false,20};auto read=[&]{return req;};
+    assert(controllable.reconcileOutput(read) && output.pinMuted && !output.unmutes);
+    assert(controllable.submit(samples,sizeof(samples)).accepted && controllable.reconcileOutput(read) && output.pinMuted);
+    req.authorized=true;assert(controllable.reconcileOutput(read) && !output.pinMuted && output.unmutes==1);
+    req.control=BROOK_AUDIO_MUTED|20;assert(controllable.reconcileOutput(read) && output.pinMuted);
+    req.control=20;assert(controllable.reconcileOutput(read) && !output.pinMuted && output.unmutes==2);
+    assert(controllable.stop() && output.pinMuted && controllable.restart(1));
+    assert(controllable.reconcileOutput(read) && output.pinMuted); // never unmute before new RUN
+    assert(controllable.submit(samples,sizeof(samples)).accepted && controllable.reconcileOutput(read) && !output.pinMuted);
+    assert(controllable.shutdown() && output.pinMuted && !controllable.reconcileOutput(read));
+    Owner racing;Lock racingLock;HdaDellAudioBridge<Owner,Lock,true,true> race(racing,racingLock,64,4096);
+    assert(race.submit(samples,sizeof(samples)).accepted);unsigned reads=0;
+    auto racingControl=[&]{++reads;return HdaDellOutputRequest{true,reads==1?20u:uint32_t(BROOK_AUDIO_MUTED|20)};};
+    assert(race.reconcileOutput(racingControl) && reads==2 && racing.unmutes==1 && racing.pinMuted && racing.mutes==1);
+    Owner partialUnmute;Lock partialLock;HdaDellAudioBridge<Owner,Lock,true,true> partialBridge(partialUnmute,partialLock,64,4096);
+    assert(partialBridge.submit(samples,sizeof(samples)).accepted);partialUnmute.failUnmute=true;
+    assert(!partialBridge.reconcileOutput(read) && partialUnmute.pinMuted && !partialUnmute.running && partialUnmute.quarantines==1);
+    assert(partialBridge.progress(&p) && p.discontinuity && !partialBridge.restart(p.epoch));
     for(unsigned i=0;i<32;++i){
         Owner concurrent;Lock concurrentLock;HdaDellAudioBridge<Owner,Lock,true> cycle(concurrent,concurrentLock,64,4096);
         assert(cycle.submit(samples,sizeof(samples)).accepted && cycle.stop());std::atomic<bool> go{false};

@@ -12164,7 +12164,7 @@ static int64_t sys_brook_audio_control(uint64_t op,uint64_t value,uint64_t,uint6
     if(op==0)return brook::AudioOutputControl();
     if(op==2)return brook::AudioAvailable()?1:0;
     if(op!=1||value>0xffffffffULL)return -EINVAL;
-    return brook::AudioSetOutputControl(static_cast<uint32_t>(value))?0:-EINVAL;
+    return brook::AudioSetUserOutputControl(static_cast<uint32_t>(value))?0:-EINVAL;
 }
 
 // 0xB0C: independently selectable taskbar telemetry widgets.

@@ -2807,3 +2807,18 @@ later final-shutdown test reported successful retirement with no further mixer
 restart attempts over a one-second observation. This does not prove sustained
 audio quality or audible playback. Recovery generation 88 was selected and
 booted after testing.
+
+An experimental output-control path is available only when the separate
+`/etc/dell-hda-audible` marker is present. The hardware still starts muted;
+settings restoration alone cannot authorize unmute, and a user-facing unmute
+request plus accepted audio in the current epoch is required before the pin is
+unmuted. This is an operational control, not proof that a human initiated a
+syscall. Master volume remains software PCM scaling. Reconciliation runs in
+the mixer service, so a mute may take until the next service opportunity, and
+already queued samples retain their old gain if quickly unmuted again. Failed
+codec operations stop and quarantine the stream. Hosted tests cover these
+paths and a partial-channel unmute failure; audible app playback and volume
+changes have not yet been tested on the Dell. No unattended audible test was
+performed. A normal stop keeps the speaker pins muted between epochs; final
+retirement restores the firmware snapshot only after the stream is stopped and
+its descriptors are retired.

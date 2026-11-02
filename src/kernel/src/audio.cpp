@@ -89,12 +89,26 @@ extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEven
 
 static const AudioDriver* g_audioDriver = nullptr;
 static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
-uint32_t AudioOutputControl() { return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE); }
+uint32_t AudioOutputControlSnapshot(){return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE);}
+uint32_t AudioOutputControl() { return AudioOutputControlSnapshot() & ~AudioUserUnmuteBit; }
 bool AudioSetOutputControl(uint32_t control) {
     if (!brook_audio_control_valid(control)) return false;
     __atomic_store_n(&g_outputControl,control,__ATOMIC_RELEASE);
     return true;
 }
+bool AudioSetUserOutputControl(uint32_t control,bool explicitUnmute) {
+    if(!brook_audio_control_valid(control))return false;
+    uint32_t previous=__atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE),desired;
+    do {
+        // A mute revokes authorization; an explicit unmute grants it. Volume
+        // changes retain authorization only while the user keeps it unmuted.
+        const bool authorized=!(control&BROOK_AUDIO_MUTED) &&
+            (explicitUnmute || (previous&BROOK_AUDIO_MUTED) || (previous&AudioUserUnmuteBit));
+        desired=control|(authorized?AudioUserUnmuteBit:0u);
+    } while(!__atomic_compare_exchange_n(&g_outputControl,&previous,desired,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    return true;
+}
+bool AudioUserUnmuteRequested(){return (AudioOutputControlSnapshot()&AudioUserUnmuteBit)!=0;}
 static SpinLock g_mixerLock;
 static SpinLock g_audioTimingLock;
 static AudioServiceTimingModel g_audioTiming;

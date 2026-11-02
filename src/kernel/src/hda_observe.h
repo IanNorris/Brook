@@ -19,6 +19,7 @@ struct HdaObservation {
     uint32_t streamSubmissions=0;uint64_t streamAccepted=0,streamCompleted=0,streamElapsedNs=0;
     uint16_t streamCommand=0;const char* streamReason="not requested";
     bool runtimeRequested=false,runtimePrepared=false,runtimeRegistered=false,runtimeQuarantined=false;
+    bool runtimeAudibleEnabled=false;
     uint32_t runtimePagesValidated=0,runtimePageRejections=0;
     bool runtimeShutdown=false,runtimeShutdownOk=false;
     uint32_t runtimeStops=0,runtimeStopFailures=0,runtimeRestarts=0,runtimeRestartFailures=0;

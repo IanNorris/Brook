@@ -23,6 +23,7 @@ Chip chip{};unsigned toneAllocations=0,toneFrees=0,toneFlushes=0;uint64_t fakeTi
 constexpr uint64_t bar=0xf7418000,ram=0x12345000;
 const AudioDriver* registered=nullptr;unsigned registerCalls=0;
 uint32_t fakeCpu=0;bool rejectRetainedMapping=false;
+uint32_t fakeOutput=BROOK_AUDIO_PROBE_DEFAULT;bool fakeAuthorized=false;
 }
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;return scenario!=7;}
 namespace brook {
@@ -32,7 +33,8 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-quiet-tone")==0 && (scenario==17 || scenario==18 || scenario==26 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-stream-probe")==0 && (scenario>=38 && scenario<=43))return &marker;
- if(std::strcmp(path,"/etc/dell-hda-audio")==0 && ((scenario>=44 && scenario<=47) || (scenario>=53 && scenario<=59)))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-audio")==0 && ((scenario>=44 && scenario<=47) || (scenario>=53 && scenario<=61)))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-audible")==0 && (scenario==60 || scenario==61))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-cache-observe")==0 && scenario>=48 && scenario<=52)return &marker;
  if(std::strcmp(path,"/etc/dell-hda-dma-cache-observe")==0 && scenario>=49 && scenario<=52)return &marker;
  if(std::strcmp(path,"/etc/audio-muted")==0 && scenario>=44 && scenario!=46)return &marker;
@@ -48,6 +50,9 @@ void KMutexLock(KMutex* m){assert(!m->locked);m->locked=1;}
 bool KMutexTryLock(KMutex* m){if(m->locked)return false;m->locked=1;return true;}
 void KMutexUnlock(KMutex* m){assert(m->locked);m->locked=0;}
 extern "C" bool AudioRegister(const AudioDriver* d){++registerCalls;if(scenario==45)return false;registered=d;return true;}
+uint32_t AudioOutputControl(){return fakeOutput;}
+bool AudioUserUnmuteRequested(){return fakeAuthorized;}
+uint32_t AudioOutputControlSnapshot(){return fakeOutput|(fakeAuthorized?AudioUserUnmuteBit:0u);}
 uint32_t PciBootInventoryCount(){return scenario>=20?16:scenario>=9 && scenario<=15?2:1;}
 uint32_t PciBootInventorySeen(){return PciBootInventoryCount()+(scenario==15?1:0);}
 bool PciBootInventoryRead(uint32_t i,PciBootEntry* out){if(i>=PciBootInventoryCount())return false;*out={};auto& d=out->device;
@@ -192,6 +197,21 @@ static void one(int which){
    assert(second.accepted==sizeof(samples) && second.epoch==first.epoch+1 && !o.runtimeQuarantined);}
   else {assert(!registered->restart(terminal.epoch) && o.runtimeQuarantined && HdaRuntimeFailureStage()==21 && !toneFrees && cmd==2);rejectRetainedMapping=false;
    assert(!registered->restart(terminal.epoch));}}
+ if(which==60){assert(o.runtimePrepared && o.runtimeAudibleEnabled);HdaRuntimeRegister();assert(registered);
+  unsigned char samples[128]{};fakeOutput=20;registered->service();assert(!chip.sawQuietUnmute);
+  assert(registered->trySubmit(samples,sizeof(samples)).accepted==sizeof(samples));registered->service();assert(!chip.sawQuietUnmute);
+  fakeAuthorized=true;registered->service();assert(chip.sawQuietUnmute && chip.pin[0]==0 && chip.pin[1]==0);
+  fakeOutput=BROOK_AUDIO_MUTED|20;registered->service();assert(chip.pin[0]==0x80 && chip.pin[1]==0x80);
+  registered->stop();assert(chip.pin[0]==0x80 && chip.pin[1]==0x80);AudioDeviceProgress stopped{};
+  assert(registered->progress(&stopped) && registered->restart(stopped.epoch));fakeOutput=20;registered->service();
+  assert(chip.pin[0]==0x80 && chip.pin[1]==0x80);assert(registered->trySubmit(samples,sizeof(samples)).accepted==sizeof(samples));
+  registered->service();assert(chip.pin[0]==0 && chip.pin[1]==0);
+  HdaRuntimeShutdown();assert(!o.runtimeQuarantined && toneFrees==17 && cmd==0);}
+ if(which==61){assert(o.runtimePrepared && o.runtimeAudibleEnabled);HdaRuntimeRegister();assert(registered);
+  unsigned char samples[128]{};assert(registered->trySubmit(samples,sizeof(samples)).accepted==sizeof(samples));
+  fakeOutput=20;fakeAuthorized=true;chip.dropPinUnmuteRight=true;registered->service();
+  assert(o.runtimeQuarantined && !toneFrees && cmd==2 && chip.pin[0]==0x80 && chip.pin[1]==0x80 && HdaRuntimeFailureStage()==40);
+  AudioDeviceProgress fault{};assert(registered->progress(&fault) && fault.discontinuity && !registered->restart(fault.epoch));}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);
 }
-int main(){for(int i=0;i<=59;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}
+int main(){for(int i=0;i<=61;++i){pid_t pid=fork();assert(pid>=0);if(!pid){one(i);_exit(0);}int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}return 0;}

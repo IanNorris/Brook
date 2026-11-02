@@ -9,9 +9,10 @@ namespace brook {
 // is for hosted tests until physical admission is implemented. Lock methods must be
 // process-context safe and must not disable interrupts over codec operations.
 // Admission, AudioRegister() and object lifetime remain the caller's job.
-template<class Owner,class Lock,bool AllowCleanRestart=false> class HdaDellAudioBridge {
+struct HdaDellOutputRequest {bool authorized=false;uint32_t control=BROOK_AUDIO_MUTED;};
+template<class Owner,class Lock,bool AllowCleanRestart=false,bool AllowAudible=false> class HdaDellAudioBridge {
     Owner& owner_;Lock& lock_;HdaDellStreamQueue<Owner> queue_;uint32_t capacity_;
-    bool started_=false,closed_=false,retiredClean_=false,terminal_=false;
+    bool started_=false,closed_=false,retiredClean_=false,terminal_=false,hardwareMuted_=true,epochHasData_=false;
     struct Guard {Lock& lock;~Guard(){lock.unlock();}};
 public:
     HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0):
@@ -25,7 +26,8 @@ public:
         if(!lock_.tryLock())return {};
         Guard guard{lock_};if(closed_ || !capacity_)return {queue_.progress().epoch,queue_.progress().submitted,0,-32};
         if(!started_){if(!queue_.start()){owner_.quarantine();closed_=true;return {queue_.progress().epoch,queue_.progress().submitted,0,-5};}started_=true;}
-        const auto r=queue_.submit(data,bytes);return {r.epoch,r.begin,r.accepted,r.error};
+        const auto r=queue_.submit(data,bytes);if(r.accepted && !r.error)epochHasData_=true;
+        return {r.epoch,r.begin,r.accepted,r.error};
     }
     int play(const void* data,uint32_t bytes,uint32_t rate,uint8_t channels,uint8_t bits){
         if(rate!=44100 || channels!=2 || bits!=16)return -22;
@@ -38,6 +40,27 @@ public:
         return capacity_!=0;
     }
     void service(){lock_.lock();Guard guard{lock_};if(started_ && !closed_ && !queue_.failed())queue_.service();}
+    // The reader runs after taking the bridge lock so a stale queued control
+    // snapshot cannot be applied after a stop/restart. Hardware changes are
+    // deferred to process context; master volume remains software gain.
+    template<class Read> bool reconcileOutput(Read read){
+        if constexpr(!AllowAudible){(void)read;return false;}
+        else {
+            lock_.lock();Guard guard{lock_};if(closed_ || terminal_ || queue_.failed())return false;
+            const auto wantsOutput=[](const HdaDellOutputRequest& request){return request.authorized &&
+                !(request.control&BROOK_AUDIO_MUTED) && brook_audio_volume(request.control)!=0;};
+            const bool audible=wantsOutput(read());
+            if(!audible && !hardwareMuted_){if(!owner_.mute()){queue_.abort();closed_=true;return false;}hardwareMuted_=true;}
+            else if(audible && started_ && epochHasData_ && queue_.progress().running && hardwareMuted_){
+                if(!owner_.unmute()){queue_.abort();closed_=true;return false;}hardwareMuted_=false;
+                // If a mute raced with the codec writes, apply it before
+                // releasing the bridge lock. Later changes are reconciled at
+                // the next service opportunity.
+                if(!wantsOutput(read())){if(!owner_.mute()){queue_.abort();closed_=true;return false;}hardwareMuted_=true;}
+            }
+            return true;
+        }
+    }
     bool isPlaying(){lock_.lock();Guard guard{lock_};return started_ && !closed_ && !queue_.failed() && queue_.progress().Pending()!=0;}
     uint32_t pending(){lock_.lock();Guard guard{lock_};return closed_?0:queue_.progress().Pending();}
     // A clean close still requires descriptor retirement; uncertain failures
@@ -61,7 +84,7 @@ public:
             retiredClean_=false; // an attempted reprepare can change hardware; never retry on failure
             if(!owner_.prepareRetained()){owner_.quarantine();return false;}
             if(!queue_.restartAfterCleanStop(expectedEpoch)){owner_.quarantine();return false;}
-            started_=closed_=false;return true;
+            started_=closed_=false;hardwareMuted_=true;epochHasData_=false;return true;
         }
     }
     // Irreversible shutdown shares the same lock as restart and submit. Even

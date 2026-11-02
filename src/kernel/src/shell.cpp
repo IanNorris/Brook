@@ -1448,7 +1448,7 @@ static int ExecCommand(int argc, const char* const* argv)
                 if(*p||!digits||value>100){KPrintf("Usage: volume [0..100|mute|unmute]\n");return -1;}
                 control=(control&BROOK_AUDIO_MUTED)|value;
             }
-            AudioSetOutputControl(control);
+            AudioSetUserOutputControl(control,StrEq(argv[1],"unmute"));
         }
         KPrintf("Volume: %u%% %s (%s)\n",brook_audio_volume(control),
             control&BROOK_AUDIO_MUTED?"muted":"unmuted",AudioAvailable()?"device ready":"no audio device");

@@ -82,6 +82,9 @@ public:
         if(!initialized_ || failed_)return false;
         uint64_t cursor=0;if(!sample(cursor) || !reclaim(cursor))return fail();return true;
     }
+    // Terminal fault, including uncertain external codec writes. This first
+    // attempts to mute and stop the controller, then quarantines its resources.
+    bool abort(){return fail();}
     // RUN/BME stop is not descriptor retirement. The owner must still reset
     // and retire the stream before freeing pages or relinquishing ownership.
     bool shutdown(){

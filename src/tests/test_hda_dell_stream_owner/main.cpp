@@ -35,7 +35,7 @@ int main(){
     Platform reused;reused.format=0x31;HdaDellStreamOwner<Platform> retained(reused,snapshot,64);assert(retained.prepare());
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> first(retained,64,4096);assert(first.start());
     assert(first.submit(samples,sizeof(samples)).accepted==sizeof(samples));assert(first.shutdown() && retained.retireRetained());
-    assert(reused.allocated==17 && reused.freed==0 && reused.pci==2 && !reused.held);
+    assert(reused.allocated==17 && reused.freed==0 && reused.pci==2 && !reused.held && reused.pin[0]==0x80 && reused.pin[1]==0x80);
     const auto previousEpoch=first.progress().epoch;assert(retained.prepareRetained() && reused.allocated==17 && reused.freed==0);
     assert(first.restartAfterCleanStop(previousEpoch) && first.progress().epoch==previousEpoch+1);
     assert(reused.pos==0 && first.start());

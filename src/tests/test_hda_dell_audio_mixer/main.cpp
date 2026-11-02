@@ -31,6 +31,16 @@ static void service(){bridge.service();}static AudioSubmitReceipt submit(const v
 static bool progress(AudioDeviceProgress* p){++progressCalls;return bridge.progress(p);}static bool restart(uint64_t e){return bridge.restart(e);}
 int main(){
     AudioMixerInit();const AudioDriver driver{"dell_hda_test",play,stop,playing,pending,service,submit,progress,restart};assert(AudioRegister(&driver));
+    assert(AudioSetOutputControl(BROOK_AUDIO_MUTED|20) && !AudioUserUnmuteRequested());
+    assert(AudioSetOutputControl(20) && !AudioUserUnmuteRequested()); // boot/settings do not authorize output
+    assert(AudioSetUserOutputControl(BROOK_AUDIO_MUTED|20) && !AudioUserUnmuteRequested());
+    assert(!AudioSetUserOutputControl(101) && !AudioUserUnmuteRequested());
+    assert(AudioSetUserOutputControl(20) && AudioUserUnmuteRequested());
+    assert(AudioSetUserOutputControl(BROOK_AUDIO_MUTED|20) && !AudioUserUnmuteRequested());
+    assert(AudioSetOutputControl(20) && !AudioUserUnmuteRequested());
+    assert(AudioSetUserOutputControl(30) && !AudioUserUnmuteRequested()); // not an explicit mute->unmute
+    assert(AudioSetUserOutputControl(30,true) && AudioUserUnmuteRequested());
+    assert(AudioSetUserOutputControl(BROOK_AUDIO_MUTED|30) && AudioSetUserOutputControl(30) && AudioUserUnmuteRequested());
     const auto a=AudioMixerOpen(),b=AudioMixerOpen();assert(a && b);
     int16_t samples[128];for(auto& s:samples)s=1000;
     assert(AudioSetOutputControl(BROOK_AUDIO_MUTED|20));assert(AudioMixerSubmit(samples,64,a)==64);AudioMixerFlush();
