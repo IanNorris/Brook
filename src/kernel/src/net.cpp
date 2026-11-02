@@ -186,6 +186,8 @@ struct TcpSendProbeStats {
     uint64_t submitted, acked, maxOutstanding, retries, busy;
     uint64_t congestionWaits, peerWindowWaits, slotWaits, drainWaits, samples, rttTicks, resumeTicks;
     uint64_t workerWaits, workerDisplacements, ackWhileWorkerDisplaced, workerDeadlineWakeups;
+    uint64_t producerGateWaits, producerGateDeadline, producerQueueWaits, producerQueueNoToken, producerQueueDeadline;
+    uint64_t producerPoolWaits, producerPoolDeadline;
 };
 static TcpSendProbeStats g_tcpSendProbeStats{};
 static void TcpProbeAdd(uint64_t& value,uint64_t amount=1) {
@@ -3387,7 +3389,11 @@ public:
             // no registry or socket spinlock is held while sleeping.
             uint64_t next = ApicTickCount() + 10;
             self_->wakeupTick = next < deadline ? next : deadline;
+            const bool producerProbe=g_tcpSendProbe && gate_==&g_tcpAsyncProducerGates[index_];
+            const uint64_t wakeTick=self_->wakeupTick;
+            if(producerProbe)TcpProbeAdd(g_tcpSendProbeStats.producerGateWaits);
             SchedulerBlockInterruptible(self_);
+            if(producerProbe && ApicTickCount()>=wakeTick)TcpProbeAdd(g_tcpSendProbeStats.producerGateDeadline);
         }
     }
     ~TcpSendOwnership() {
@@ -4898,7 +4904,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         field("resume_since_latest_ack_ticks",g_tcpSendProbeStats.resumeTicks);
         field("worker_waits",g_tcpSendProbeStats.workerWaits);field("worker_waiter_displacements",g_tcpSendProbeStats.workerDisplacements);
         field("acks_while_worker_displaced",g_tcpSendProbeStats.ackWhileWorkerDisplaced);
-        field("worker_at_or_after_wait_deadline",g_tcpSendProbeStats.workerDeadlineWakeups);r.text("}\n");r.send();return;
+        field("worker_at_or_after_wait_deadline",g_tcpSendProbeStats.workerDeadlineWakeups);
+        field("producer_gate_waits",g_tcpSendProbeStats.producerGateWaits);field("producer_gate_at_or_after_deadline",g_tcpSendProbeStats.producerGateDeadline);
+        field("producer_queue_waits",g_tcpSendProbeStats.producerQueueWaits);field("producer_queue_without_token",g_tcpSendProbeStats.producerQueueNoToken);
+        field("producer_queue_at_or_after_deadline",g_tcpSendProbeStats.producerQueueDeadline);
+        field("producer_pool_waits",g_tcpSendProbeStats.producerPoolWaits);field("producer_pool_at_or_after_deadline",g_tcpSendProbeStats.producerPoolDeadline);
+        r.text("}\n");r.send();return;
     }
     if (StrStartsWith(cmd,"bridge arp-probe ")) {
         const char* address=cmd+sizeof("bridge arp-probe ")-1;

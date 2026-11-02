@@ -181,6 +181,24 @@ also limit interpretation. The second profile and receipt are under
 was restored afterward. Hosted lifetime coverage now also checks two
 producers waiting on the same full queue and receiving the capacity wake.
 
+Optional send-probe counters now distinguish producer-gate, full-queue and
+worker-pool blocking attempts. They also report whether a wait returned at
+or after its scheduled deadline and whether a queue wait obtained a token;
+these observations do not prove which event caused a wake. Hosted tests cover
+gate and pool attribution, a no-token fallback, and early versus deadline return.
+The delayed, lossy QEMU acceptance also passed with the counters enabled.
+
+On a later diagnostic Dell boot, two 32 MiB uploads took 3.40 and 3.32
+seconds with matching hashes. The aggregate deltas showed 2,180 and 2,170
+queue-wait attempts, no queue waits without a token, and zero producer-gate
+or worker-pool wait attempts. Queue returns at or after deadline were 133
+and 123; the respective local-transmit-busy and worker-at-or-after-deadline
+counts were also 133 and 123. Other connections can contribute and the
+counters are not event-correlated, so equality does not prove causation.
+The additional diagnostics can add overhead and these samples are not
+directly comparable to the earlier 2.88–2.90-second runs. The known-good boot
+was restored afterward.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate

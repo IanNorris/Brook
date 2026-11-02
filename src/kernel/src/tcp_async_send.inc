@@ -53,6 +53,7 @@ class TcpCapacityWait {
 public:
     ~TcpCapacityWait(){TcpCapacityWaitUnregister(token_);}
     void Register(int index,uint64_t epoch,Process* process){if(!token_)token_=TcpCapacityWaitRegister(index,epoch,process);}
+    bool Registered() const{return token_!=0;}
     TcpCapacityWait(const TcpCapacityWait&)=delete;
     TcpCapacityWait& operator=(const TcpCapacityWait&)=delete;
     TcpCapacityWait()=default;
@@ -165,7 +166,7 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
     const uint64_t deadline=ApicTickCount()+30000;uint32_t accepted=0;uint64_t epoch=0;bool haveEpoch=false;
     uint8_t staging[ETH_MTU];
     for(;;) {
-        bool wait=false;TcpCapacityWait capacityWait;
+        bool wait=false,queueWait=false;TcpCapacityWait capacityWait;
         {
             TcpSendOwnership producer(index,self,&g_tcpAsyncProducerGates[index]);
             int acquired=producer.Acquire(deadline);
@@ -192,7 +193,7 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
                     SpinLockRelease(&s.lock);
                     if(accepted)return static_cast<int>(accepted);
                     if(nonblock)return -11;
-                    wait=true;break;
+                    wait=true;queueWait=true;break;
                 }
                 SpinLockRelease(&s.lock);
                 if(!mss || mss>sizeof(staging))return accepted ? static_cast<int>(accepted) : -22;
@@ -241,6 +242,16 @@ static int TcpSendAsync(int index,const TcpSendSource& source,uint32_t len) {
                 if(!attach)return accepted ? static_cast<int>(accepted) : -104;
             }
         }
-        if(wait){self->wakeupTick=ApicTickCount()+10;SchedulerBlockInterruptible(self);}
+        if(wait){
+            self->wakeupTick=ApicTickCount()+10;const uint64_t wakeTick=self->wakeupTick;
+            if(g_tcpSendProbe) {
+                if(queueWait){TcpProbeAdd(g_tcpSendProbeStats.producerQueueWaits);
+                    if(!capacityWait.Registered())TcpProbeAdd(g_tcpSendProbeStats.producerQueueNoToken);}
+                else TcpProbeAdd(g_tcpSendProbeStats.producerPoolWaits);
+            }
+            SchedulerBlockInterruptible(self);
+            if(g_tcpSendProbe && ApicTickCount()>=wakeTick)
+                TcpProbeAdd(queueWait?g_tcpSendProbeStats.producerQueueDeadline:g_tcpSendProbeStats.producerPoolDeadline);
+        }
     }
 }

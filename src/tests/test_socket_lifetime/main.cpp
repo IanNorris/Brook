@@ -53,6 +53,7 @@ std::atomic<uint64_t> deadlineAckTick{0};
 std::atomic<uint32_t> deadlineAckValue{0};
 std::atomic<uint32_t> deadlineSecondAckValue{0};
 std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
+std::atomic<bool> earlySchedulerBlock{false};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
 std::atomic<int> updateAckSlot{-1};
@@ -149,6 +150,7 @@ void SchedulerKernelRegionLeave(Process* p) { assert(p->kernelRegionDepth);--p->
 uint64_t ProcessPendingSignals(Process* p) { return __atomic_load_n(&p->sigPending,__ATOMIC_ACQUIRE); }
 uint64_t PosixTimerPending(Process*) { return 0; }
 void SchedulerBlock(Process* p) {
+    if(earlySchedulerBlock.exchange(false))return;
     ticks = p ? p->wakeupTick : ticks.load() + 50;
     if (windowUpdateSocket.load()>=0 && ticks.load()>=windowUpdateTick.load()) {
         ticks=windowUpdateTick.load();int idx=windowUpdateSocket.exchange(-1);
@@ -820,7 +822,9 @@ int main() {
         // A full queue arms a producer before dropping the gate; the worker
         // can wake it before it actually blocks and all refs are retired.
         socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
-        g_tcpProducerWake=true;ticks=1;
+        g_tcpProducerWake=true;g_tcpSendProbe=true;ticks=1;
+        const auto queueWaitsBefore=g_tcpSendProbeStats.producerQueueWaits;
+        const auto queueNoTokenBefore=g_tcpSendProbeStats.producerQueueNoToken;
         assert(SockSend(socket,data,sizeof(data))==sizeof(data));
         auto* blockedProducer=new Process{};blockedProducer->refCount=1;blockedProducer->pid=192;
         holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;int blockedResult=0;
@@ -831,8 +835,10 @@ int main() {
         acknowledgeDataCount=62;runTestWorker();assert(blockedProducer->pendingWakeup);
         releaseGatePoll=true;blocked.join();holdGatePoll=false;
         assert(blockedResult==1 && blockedProducer->refCount==1);
+        assert(g_tcpSendProbeStats.producerQueueWaits==queueWaitsBefore+1 &&
+               g_tcpSendProbeStats.producerQueueNoToken==queueNoTokenBefore);
         acknowledgeDataCount=1;runTestWorker();assert(!g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers);
-        g_tcpProducerWake=false;acknowledgeDataCount=0;SockClose(socket);delete blockedProducer;
+        g_tcpProducerWake=false;g_tcpSendProbe=false;acknowledgeDataCount=0;SockClose(socket);delete blockedProducer;
         // Two independent blocked producers must both be notified when one
         // retirement makes capacity available, without retaining either ref.
         socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;g_tcpProducerWake=true;ticks=1;
@@ -879,6 +885,54 @@ int main() {
         releaseGatePoll=true;resetProducer.join();holdGatePoll=false;
         assert(blockedResult==-104 && blockedProducer->refCount==1 && !g_tcpAsyncJobs[socket]);
         g_tcpProducerWake=false;SockClose(socket);delete blockedProducer;
+        // Classify queue fallback and worker-pool waits independently. The
+        // fake scheduler advances to each deadline before returning.
+        for(int mode=0;mode<3;++mode){
+            socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;ticks=1;
+            g_tcpProducerWake=false;g_tcpSendProbe=true;
+            if(mode!=1)assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+            else g_tcpAsyncWorkers=TCP_ASYNC_WORKER_LIMIT;
+            const auto queueBefore=g_tcpSendProbeStats.producerQueueWaits;
+            const auto noTokenBefore=g_tcpSendProbeStats.producerQueueNoToken;
+            const auto queueDeadlineBefore=g_tcpSendProbeStats.producerQueueDeadline;
+            const auto poolBefore=g_tcpSendProbeStats.producerPoolWaits;
+            const auto poolDeadlineBefore=g_tcpSendProbeStats.producerPoolDeadline;
+            blockedProducer=new Process{};blockedProducer->refCount=1;blockedProducer->pid=197+mode;
+            holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;blockedResult=0;
+            std::thread reasonProducer([&]{currentProcess=blockedProducer;blockedResult=SockSend(socket,bytes,1);currentProcess=nullptr;});
+            await([]{return gatePollWaiting.load();});
+            __atomic_store_n(&blockedProducer->sigPending,1,__ATOMIC_RELEASE);
+            if(mode==2)earlySchedulerBlock=true;
+            releaseGatePoll=true;reasonProducer.join();holdGatePoll=false;
+            assert(blockedResult==-4 && blockedProducer->refCount==1);
+            if(mode!=1){
+                assert(g_tcpSendProbeStats.producerQueueWaits==queueBefore+1 && g_tcpSendProbeStats.producerQueueNoToken==noTokenBefore+1);
+                assert(g_tcpSendProbeStats.producerQueueDeadline==queueDeadlineBefore+(mode==2?0:1) && g_tcpSendProbeStats.producerPoolWaits==poolBefore);
+                acknowledgeDataCount=62;runTestWorker();acknowledgeDataCount=0;
+            }else{
+                assert(g_tcpSendProbeStats.producerPoolWaits==poolBefore+1 && g_tcpSendProbeStats.producerPoolDeadline==poolDeadlineBefore+1);
+                assert(g_tcpSendProbeStats.producerQueueWaits==queueBefore);g_tcpAsyncWorkers=0;
+            }
+            g_tcpSendProbe=false;SockClose(socket);delete blockedProducer;
+        }
+        // A separate producer-gate wait is attributed to the gate, not the
+        // send queue or worker pool.
+        socket=create();setupTcp(socket);g_tcpSendProbe=true;ticks=1;
+        const auto gateBefore=g_tcpSendProbeStats.producerGateWaits;
+        const auto gateDeadlineBefore=g_tcpSendProbeStats.producerGateDeadline;
+        const auto gateQueueBefore=g_tcpSendProbeStats.producerQueueWaits;
+        const auto gatePoolBefore=g_tcpSendProbeStats.producerPoolWaits;
+        assert(KMutexTryLock(&g_tcpAsyncProducerGates[socket]));
+        blockedProducer=new Process{};blockedProducer->refCount=1;blockedProducer->pid=199;
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;blockedResult=0;
+        std::thread gateProducer([&]{currentProcess=blockedProducer;blockedResult=SockSend(socket,bytes,1);currentProcess=nullptr;});
+        await([]{return gatePollWaiting.load();});
+        __atomic_store_n(&blockedProducer->sigPending,1,__ATOMIC_RELEASE);
+        releaseGatePoll=true;gateProducer.join();holdGatePoll=false;
+        assert(blockedResult==-4 && g_tcpSendProbeStats.producerGateWaits==gateBefore+1 &&
+               g_tcpSendProbeStats.producerGateDeadline==gateDeadlineBefore+1);
+        assert(g_tcpSendProbeStats.producerQueueWaits==gateQueueBefore && g_tcpSendProbeStats.producerPoolWaits==gatePoolBefore);
+        KMutexUnlock(&g_tcpAsyncProducerGates[socket]);g_tcpSendProbe=false;SockClose(socket);delete blockedProducer;
         g_tcpAsyncSend=false;g_tcpTwoPacketFlight=false;currentProcess=nullptr;delete caller;
     }
     {
