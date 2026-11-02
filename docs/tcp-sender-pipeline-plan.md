@@ -121,6 +121,15 @@ guest job as complete and closed the receiver; the same job was observed to
 finish with connection refused before the corrected runs started. The checked
 recovery boot was restored afterward.
 
+On a subsequent muted boot, four 32 MiB LAN uploads on the same candidate
+used 1 KiB, 16 KiB, 64 KiB and 1 KiB writes in that order. Receiver times
+were 10.592, 10.752, 10.762 and 10.634 seconds, respectively; every hash
+matched. The guest reported 32,768, 2,060, 1,031 and 32,768 send calls.
+Aggregate flight counters remained near 3,145–3,150 batches per run. This
+single ordered comparison suggests application write count is not the main
+limit for this workload, but does not identify the transport bottleneck or
+exclude a different application pattern. Recovery was restored afterward.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
