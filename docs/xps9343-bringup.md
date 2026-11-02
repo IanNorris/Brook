@@ -2875,3 +2875,18 @@ sandbox was enabled. No system or persistent browser sandbox setting was
 changed. The fixture profiles were removed after their processes exited, and
 recovery generation 100 was selected. A media-element comparison and a check
 of the live browser's effective audio environment are still needed.
+
+On the recovery boot, `unix_recv_flags.py` passed all four Unix socket and
+descriptor-passing cases as UID 1000. A later muted candidate boot used a fresh
+Firefox profile selecting the ALSA backend and a local, generated WAV media
+element. After one debug click, Firefox reported an AudioIPC stream started at
+44.1 kHz; mixer snapshots showed completed frames increasing from 25,583 to
+1,035,552, with no reported stream discontinuity or driver quarantine.
+Firefox logged one 4,410-frame loss message and the page later reported a
+`stalled` event while mixer frames continued to advance. Closing the window
+exited the test job with no remaining tasks or mixer streams; final HDA
+retirement succeeded. The physical speaker stayed disabled. This establishes
+media-element delivery to the muted mixer, not audible quality or correct
+timing. The browser's `/proc/PID/environ` was unavailable, so the inherited
+ALSA configuration was not independently confirmed. The Web Audio result
+remains separate and unresolved. Recovery generation 102 was selected.
