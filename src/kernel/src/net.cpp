@@ -87,6 +87,16 @@ namespace brook {
 static NetIf* g_netIfs[NET_MAX_IFS] = {};
 static uint32_t g_netIfCount = 0;
 static IrqSpinLock g_interfaceViewLock;
+// Protected by g_interfaceViewLock. Zero permanently disables snapshots if
+// the counter exhausts; it must not wrap and validate an old identity.
+static uint64_t g_interfaceGeneration = 1;
+static void NetInterfaceChangedLocked()
+{
+    if (g_interfaceGeneration) {
+        if (g_interfaceGeneration==~uint64_t(0)) g_interfaceGeneration=0;
+        else ++g_interfaceGeneration;
+    }
+}
 // Back-compat alias used by legacy single-NIC code paths below. Points at
 // g_netIfs[0] (the primary / default-route interface).
 static NetIf* g_netIf = nullptr;
@@ -918,6 +928,7 @@ void NetInit()
     g_netIf = nullptr;
     for (uint32_t i = 0; i < NET_MAX_IFS; i++) g_netIfs[i] = nullptr;
     g_netIfCount = 0;
+    g_interfaceGeneration = 1; // NetInit is a boot-time initialization.
     SerialPuts("net: initialised\n");
 }
 
@@ -941,6 +952,7 @@ void NetRegisterIf(NetIf* nif)
     g_netIfs[idx] = nif;
     if (idx == 0) g_netIf = nif;
     __atomic_store_n(&g_netIfCount,idx+1,__ATOMIC_RELEASE);
+    NetInterfaceChangedLocked();
     IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
     SerialPrintf("net: interface %u registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
                  idx,
@@ -950,6 +962,25 @@ void NetRegisterIf(NetIf* nif)
 
 uint32_t NetIfCount() { return __atomic_load_n(&g_netIfCount,__ATOMIC_ACQUIRE); }
 NetIf* NetIfAt(uint32_t idx) { return (idx < NetIfCount()) ? g_netIfs[idx] : nullptr; }
+
+// Narrow snapshot for a future single-interface async resolver. The token
+// detects configuration changes but does not pin interface/driver lifetime or
+// make the existing IP-only ARP cache safe across configuration changes.
+struct NetSingleInterfaceSnapshot {
+    NetIf* interface=nullptr;uint64_t generation=0;
+    uint32_t ip=0,netmask=0,gateway=0;MacAddr mac{};
+};
+static bool NetReadSingleInterface(NetSingleInterfaceSnapshot* out)
+{
+    if (!out) return false;
+    *out={};
+    const auto flags=IrqSpinLockAcquire(&g_interfaceViewLock);
+    NetIf* nif=g_netIfCount==1 ? g_netIfs[0] : nullptr;
+    const bool valid=nif && nif->transmit && nif->ipAddr && nif->netmask && g_interfaceGeneration;
+    if (valid) *out={nif,g_interfaceGeneration,nif->ipAddr,nif->netmask,nif->gateway,nif->mac};
+    IrqSpinLockRelease(&g_interfaceViewLock,flags);
+    return valid;
+}
 
 SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid)
 {return {g_socketInodes.allocate(),uid,gid};}
@@ -1240,6 +1271,7 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
         g_netIf->netmask = subnetMask;
         g_netIf->gateway = router;
         g_netIf->dns     = dns;
+        NetInterfaceChangedLocked();
         IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
 
         SerialPrintf("net: DHCP ACK — IP %d.%d.%d.%d mask %d.%d.%d.%d gw %d.%d.%d.%d\n",
@@ -1377,6 +1409,7 @@ bool NetApplyStaticConfig(NetIf* nif)
     nif->netmask = mask;
     nif->gateway = gw;
     nif->dns     = dns;
+    NetInterfaceChangedLocked();
     IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
 
     SerialPrintf("net: static config %u.%u.%u.%u/%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
@@ -4536,6 +4569,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     if (NetStrEq(cmd, "bridge network")) {
         NetDriverSnapshot s{};
+        NetSingleInterfaceSnapshot interface{};
+        const bool singleInterface=NetReadSingleInterface(&interface);
         const bool available=g_netIf && g_netIf->snapshot && g_netIf->snapshot(g_netIf,&s);
         BridgeReply r;r.text("{\"network_driver_snapshot\":");
         if(!available) r.text("null");
@@ -4555,6 +4590,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
         }
         r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));
+        r.text(",");r.field("single_interface_generation",singleInterface?interface.generation:0);
         r.text(",");r.field("tcp_recv_window_cap_bytes",g_tcpReceiveWindowCap==~uint32_t(0)?0:g_tcpReceiveWindowCap);
         r.text(",\"tcp_receive\":{");r.field("ooo_arrivals",__atomic_load_n(&g_tcpReceiveDiagnostics.oooArrivals,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_stored",__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED));

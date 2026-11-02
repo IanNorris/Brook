@@ -269,6 +269,20 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
     {
+        NetIf nif{};nif.transmit=captureFrame;nif.ipAddr=1;nif.netmask=2;nif.gateway=3;
+        NetSingleInterfaceSnapshot first{},changed{},restored{};
+        assert(!NetReadSingleInterface(&first));
+        g_netIfs[0]=&nif;g_netIfCount=1;NetInterfaceChangedLocked();
+        assert(NetReadSingleInterface(&first) && first.interface==&nif && first.ip==1 && first.gateway==3);
+        nif.gateway=4;NetInterfaceChangedLocked();assert(NetReadSingleInterface(&changed));
+        nif.gateway=3;NetInterfaceChangedLocked();assert(NetReadSingleInterface(&restored));
+        assert(first.generation!=changed.generation && first.generation!=restored.generation && restored.gateway==first.gateway);
+        g_netIfCount=2;assert(!NetReadSingleInterface(&changed) && changed.generation==0 && !changed.interface);g_netIfCount=1;
+        g_interfaceGeneration=~uint64_t(0);NetInterfaceChangedLocked();
+        assert(!NetReadSingleInterface(&changed));NetInterfaceChangedLocked();assert(g_interfaceGeneration==0);
+        g_netIfs[0]=nullptr;g_netIfCount=0;g_interfaceGeneration=1;
+    }
+    {
         MacAddr mac={{1,2,3,4,5,6}},updated={{6,5,4,3,2,1}},found{};
         assert(ArpCacheQuery(1,&found)==ArpCacheResult::Missing);
         for(uint32_t ip=1;ip<=ARP_CACHE_SIZE;++ip)ArpCacheInsert(ip,mac);

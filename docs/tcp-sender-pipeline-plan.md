@@ -224,6 +224,20 @@ future asynchronous resolver must recheck after a reply because another
 insertion can consume the last slot. This does not yet add cache eviction or
 connect the tracker to networking.
 
+The network stack now maintains a configuration generation under its
+interface-view lock, advancing it on interface registration and DHCP/static
+configuration. A single-interface snapshot includes the generation, selected
+interface and copied addressing information; it fails closed for multiple or
+unconfigured interfaces and clears its output on failure. Exhaustion disables
+new snapshots instead of wrapping. `bridge network` reports the generation, or
+zero if no single-interface snapshot is available. Hosted tests cover
+change-away-and-back, multiple interfaces and exhaustion; the QEMU USB
+Ethernet regression confirmed a nonzero generation after DHCP. Astra reviewed
+the configuration-writer inventory and the cache-capacity extraction. This
+token does not pin driver storage, serialize transmit with configuration
+changes, or make old IP-only ARP entries valid for the current generation.
+`NetInit` remains a boot-only initialization.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

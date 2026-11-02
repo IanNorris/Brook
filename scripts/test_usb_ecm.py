@@ -200,6 +200,7 @@ try:
   line=next(line for line in reply.splitlines() if line.startswith(b'{'))
   report=json.loads(line);stats=report['network_driver_snapshot']
   assert report['tcp_ack_submit_failures']>=0,report
+  assert report['single_interface_generation']>=3,report
   assert report['tcp_recv_window_cap_bytes']==(16384 if args.tcp_window16 else 0),report
   assert stats['rx_depth']==(8 if args.rx_depth8 else 1),stats
   assert stats['tx_depth']==(16 if args.tx_depth16 else 8),stats
