@@ -273,6 +273,15 @@ callbacks are not generally guaranteed nonblocking. Rejected diagnostic
 replies still pass through the unchanged legacy ARP-learning path. This is a
 bounded diagnostic, not a production resolver or a throughput improvement.
 
+The exact speaker-disabled Dell diagnostic kernel and initrd also booted in
+isolated QEMU before physical deployment. On the Dell, the opt-in probe
+resolved the local host in two queries; its returned MAC matched the host
+interface selected by the host route to the Dell. An off-link address was
+rejected. The hardware runtime reported physical speaker output disabled.
+The verified recovery payload was selected as generation 118 and booted
+afterward. This is one successful local neighbor lookup, not a test of
+hardware timeout, configuration races, TCP integration or throughput.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;
