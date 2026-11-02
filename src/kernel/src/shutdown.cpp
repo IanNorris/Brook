@@ -1,4 +1,5 @@
 #include "shutdown.h"
+#include "hda_observe.h"
 #include "window.h"
 #include "debug_jobs.h"
 #include "scheduler.h"
@@ -111,7 +112,7 @@ void Worker(void*) {
                 FileObjectStopWriteback();
                 Ext2StopWriteback();
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
-                SetPhase(selected,Phase::Syncing);AudioStop();
+                SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
                 int error=VfsSync(nullptr);
                 if(!error)error=WritableDesktopFinalSync();
                 SetPhase(selected,error?Phase::Failed:Phase::Ready,error);

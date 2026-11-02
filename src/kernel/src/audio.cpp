@@ -149,6 +149,7 @@ struct MixerStream {
 static MixerStream g_streams[MIXER_MAX_STREAMS];
 static uint64_t g_nextStreamIdentity = 1;
 static bool g_mixerReady = false;
+static uint32_t g_audioShutdown=0;
 static bool g_stagingEnabled = false;
 static uint32_t g_stagingFrameLimit = 1024;
 static int16_t* g_flushBuf = nullptr;
@@ -711,8 +712,9 @@ static void RefreshDevice(uint64_t epoch, AudioDeviceProgress* fresh = nullptr)
 }
 void AudioMixerRefresh()
 {
+    if(__atomic_load_n(&g_audioShutdown,__ATOMIC_ACQUIRE))return;
     if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;
-    RefreshDevice(__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE));
+    if(!__atomic_load_n(&g_audioShutdown,__ATOMIC_ACQUIRE))RefreshDevice(__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE));
     __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE);
 }
 bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
@@ -809,8 +811,10 @@ static bool CoalesceRefill(const AudioDeviceProgress& device, uint64_t sampledBe
 }
 void AudioMixerFlush()
 {
+    if(__atomic_load_n(&g_audioShutdown,__ATOMIC_ACQUIRE))return;
     if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;
     struct FlushOwner { ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); } } owner;
+    if(__atomic_load_n(&g_audioShutdown,__ATOMIC_ACQUIRE))return;
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
     // Default-off avoids any additional clock reads on the normal path.
     bool controlled = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE) ||
@@ -919,9 +923,9 @@ void AudioMixerFlush()
 
 void AudioMixerTick()
 {
-    if (!g_mixerReady) return;
+    if (!g_mixerReady || __atomic_load_n(&g_audioShutdown,__ATOMIC_ACQUIRE)) return;
     AudioMixerFlush();
-    if (g_audioDriver && g_audioDriver->service)
+    if (!__atomic_load_n(&g_audioShutdown,__ATOMIC_ACQUIRE) && g_audioDriver && g_audioDriver->service)
         g_audioDriver->service();
 }
 
@@ -986,6 +990,7 @@ void AudioStop()
     ResetAllStreams();
     __atomic_fetch_add(&g_deliveryEpoch, 1ULL, __ATOMIC_ACQ_REL);
 }
+void AudioPrepareShutdown(){__atomic_store_n(&g_audioShutdown,1u,__ATOMIC_RELEASE);}
 
 bool AudioIsPlaying()
 {

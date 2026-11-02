@@ -23,18 +23,24 @@ template<class Platform> class HdaDellStreamOwner {
         bool delayUs(unsigned n){return o.p_.delayUs(n);}bool publishDma(){return o.memory_.publishAll();}
     } streamIo_;
     HdaDellToneStream<StreamIo> stream_;HdaDellTonePlan plan_{};
-    uint32_t base_=0;bool active_=false,prepared_=false,stopped_=false,retained_=false,held_=false,codecTouched_=false,muted_=false;
+    uint32_t base_=0,stage_=0,failureStage_=0,failedStreamStage_=0,failedStreamDetail_=0;bool active_=false,prepared_=false,stopped_=false,retained_=false,held_=false,codecTouched_=false,muted_=false;
+    void stage(uint32_t n){__atomic_store_n(&stage_,n,__ATOMIC_RELAXED);}
+    void noteFailure(uint32_t n){uint32_t empty=0;__atomic_compare_exchange_n(&failureStage_,&empty,n,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);}
     bool hold(){if(!held_){
+        noteFailure(__atomic_load_n(&stage_,__ATOMIC_RELAXED));
+        if(__atomic_load_n(&stage_,__ATOMIC_RELAXED)==14){__atomic_store_n(&failedStreamDetail_,stream_.detail(),__ATOMIC_RELAXED);
+            __atomic_store_n(&failedStreamStage_,stream_.stage(),__ATOMIC_RELEASE);}
         const uint16_t command=p_.command();
         if(codecTouched_ && !muted_ && !ici_.failed() && (command==2 || command==6))muted_=codec_.muteAndVerify(plan_);
         held_=true;memory_.quarantine();p_.quarantine();}return false;}
     bool configure(){
-        uint16_t format=0;if(!HdaDellMixerFormat(saved_,format) || !p_.controllerIdle())return hold();
-        uint32_t value=0;codecTouched_=true;if(!codec_.muteAndVerify(plan_))return hold();muted_=true;
+        stage(30);uint16_t format=0;if(!HdaDellMixerFormat(saved_,format) || !p_.controllerIdle())return hold();
+        stage(31);uint32_t value=0;codecTouched_=true;if(!codec_.muteAndVerify(plan_))return hold();muted_=true;
+        stage(32);
         if(!codec_.configureMuted(plan_) || !ici_.setFormat(format) || !ici_.getFormat(value) || value!=format ||
            !ici_.set8(3,0x706,0x10) || !ici_.get8(3,0xf06,value) || value!=0x10 ||
            !stream_.prepare(saved_.controller.gcap,memory_.bdlPhysical(),format,65536))return hold();
-        base_=0x80+((saved_.controller.gcap>>8)&15)*0x20;prepared_=true;stopped_=retained_=false;return true;
+        base_=0x80+((saved_.controller.gcap>>8)&15)*0x20;prepared_=true;stopped_=retained_=false;stage(33);return true;
     }
 public:
     HdaDellStreamOwner(Platform& p,const HdaSessionReport& saved,uint32_t line):p_(p),saved_(saved),memory_(p,line),
@@ -43,6 +49,9 @@ public:
     HdaDellStreamOwner& operator=(const HdaDellStreamOwner&)=delete;
     HdaDellStreamOwner(HdaDellStreamOwner&&)=delete;
     HdaDellStreamOwner& operator=(HdaDellStreamOwner&&)=delete;
+    uint32_t failureStage()const{return __atomic_load_n(&failureStage_,__ATOMIC_ACQUIRE);}
+    uint32_t failedStreamStage()const{return __atomic_load_n(&failedStreamStage_,__ATOMIC_ACQUIRE);}
+    uint32_t failedStreamDetail()const{return __atomic_load_n(&failedStreamDetail_,__ATOMIC_RELAXED);}
     bool prepare(){
         uint16_t format=0;
         if(active_ || held_ || !HdaDellMakeTonePlan(saved_,plan_) || !HdaDellMixerFormat(saved_,format) ||
@@ -65,9 +74,10 @@ public:
         p_.setCommand(6);if(p_.command()!=6)return false;
         return stream_.start();
     }
-    bool mute(){if(!active_ || held_ || (p_.command()!=2 && p_.command()!=6))return false;
-        muted_=codec_.muteAndVerify(plan_);return muted_;}
+    bool mute(){stage(9);if(!active_ || held_ || (p_.command()!=2 && p_.command()!=6)){noteFailure(9);return false;}
+        muted_=codec_.muteAndVerify(plan_);if(!muted_)noteFailure(9);return muted_;}
     bool stop(){
+        stage(10);
         if(!prepared_ || held_ || (p_.command()!=2 && p_.command()!=6) || !stream_.stop())return false;
         p_.setCommand(2);if(p_.command()!=2)return false;stopped_=true;return true;
     }
@@ -75,20 +85,23 @@ public:
     // Call only after the queue has successfully muted and stopped. A failure
     // may have changed hardware state: never retry or release pages.
     bool retireRetained(){
+        stage(11);
         if(!prepared_ || held_ || !stopped_)return false;if(p_.command()!=2)return hold();
-        if(!mute())return hold();uint32_t value=0;
+        if(!mute())return hold();stage(12);uint32_t value=0;
         if(!ici_.set8(3,0x706,0) || !ici_.get8(3,0xf06,value) || value!=0 ||
            !ici_.setFormat(uint16_t(saved_.converterFormat)) || !ici_.getFormat(value) || value!=saved_.converterFormat)return hold();
         muted_=false; // restore can partially unmute before reporting failure
-        if(!codec_.restoreAndVerify(plan_,saved_) || !stream_.retire())return hold();
-        prepared_=false;retained_=true;return true;
+        stage(13);if(!codec_.restoreAndVerify(plan_,saved_))return hold();
+        stage(14);if(!stream_.retire())return hold();
+        prepared_=false;retained_=true;stage(15);return true;
     }
-    // The production platform currently permits identity/cache validation on
-    // the boot CPU only. The caller must arrange that context before using
-    // this experimental primitive; the runtime bridge does not use it yet.
+    // The caller serializes all access and supplies a platform that validates
+    // the executing CPU as well as the retained page mappings.
     bool prepareRetained(){
+        stage(20);
         if(!active_ || !retained_ || held_)return false;
         if(!p_.identityStable() || p_.command()!=2)return hold();
+        stage(21);if(!memory_.revalidate())return hold();
         return configure();
     }
     bool retire(){

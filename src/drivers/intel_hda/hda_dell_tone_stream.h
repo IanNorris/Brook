@@ -92,20 +92,25 @@ public:
     // RUN-clear alone does not retire the controller's descriptor references.
     // Call only with exclusive ownership, before releasing any DMA pages.
     bool retire() {
+        stage_=7;detail_=0;
         if(state_!=HdaToneStreamState::Stopped)return false;
-        if(io_.read16(base_)&3){state_=HdaToneStreamState::Unknown;return false;}
+        if(io_.read16(base_)&3){detail_=io_.read16(base_);state_=HdaToneStreamState::Unknown;return false;}
         // PCH requires another completed reset before CBL can be rewritten
         // after RUN. Leave state unknown and retain pages on any failure.
         state_=HdaToneStreamState::Unknown;
-        io_.write16(base_,1);if(!io_.delayUs(3) || !waitControl(1,1))return false;
-        io_.write16(base_,0);if(!io_.delayUs(3) || !waitControl(3,0))return false;
+        stage_=8;io_.write16(base_,1);if(!io_.delayUs(3)){detail_=0x10000|io_.read16(base_);return false;}
+        if(!waitControl(1,1)){detail_=io_.read16(base_);return false;}
+        stage_=9;io_.write16(base_,0);if(!io_.delayUs(3)){detail_=0x10000|io_.read16(base_);return false;}
+        if(!waitControl(3,0)){detail_=io_.read16(base_);return false;}
         io_.write8(base_+2,priority_);io_.write32(base_+0x18,0);io_.write32(base_+0x1c,0);
         io_.write32(base_+0x08,0);io_.write16(base_+0x0c,0);
-        if((io_.read16(base_)&3) || io_.read8(base_+2)!=priority_ || io_.read32(base_+0x18)!=0 ||
-           io_.read32(base_+0x1c)!=0 || io_.read32(base_+0x08)!=0 || io_.read16(base_+0x0c)!=0) {
+        stage_=10;detail_=0;if(io_.read16(base_)&3)detail_|=1;if(io_.read8(base_+2)!=priority_)detail_|=2;
+        if(io_.read32(base_+0x18)!=0)detail_|=4;if(io_.read32(base_+0x1c)!=0)detail_|=8;
+        if(io_.read32(base_+0x08)!=0)detail_|=16;if(io_.read16(base_+0x0c)!=0)detail_|=32;
+        if(detail_) {
             state_=HdaToneStreamState::Unknown;return false;
         }
-        state_=HdaToneStreamState::Idle;return true;
+        stage_=11;state_=HdaToneStreamState::Idle;return true;
     }
 };
 }

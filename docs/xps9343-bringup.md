@@ -2752,16 +2752,14 @@ prove that every byte reached the speaker or establish long-term audio stability
 exact candidate and hosted queue, mixer, registration and failure tests also
 passed. Recovery generation 72 was selected for the next boot after the test.
 
-The backend is a one-shot experiment: a stop or timing fault is terminal,
-and it does not unmute speakers or provide normal application playback yet.
+The backend is an experimental muted path: a timing fault is terminal,
+and it does not unmute speakers or provide audible application playback yet.
 Regular idle service is necessary after DMA starts even if no application is
 writing. Verified drain, reinitialization, safe volume controls and audible
 application testing remain to be implemented before enabling it by default.
-The owner has hosted-tested primitives to retire descriptors while retaining
-its pages, reprepare a zeroed ring, and finally release retained pages. They
-are not yet wired into the runtime bridge: its identity/cache validation is
-currently restricted to the boot CPU, and safe mixer epoch transitions still
-need implementation and testing.
+The runtime can retire descriptors while retaining its pages, revalidate those
+pages, and prepare a zeroed ring under a fresh mixer epoch. Final shutdown
+retires and releases the pages and cannot be reversed by a mixer refresh.
 
 Further review identified that the experimental runtime's original admission
 did not establish PAT, MTRR and DMA-alias compatibility on every CPU that can
@@ -2770,8 +2768,8 @@ those checks were developed; the Dell was returned to the checked recovery gener
 The previous muted playback observations remain useful evidence but are not a
 proof of safe multicore admission. Before reenabling it, verify all schedulable
 CPUs and the actual MMIO and DMA aliases, and account for CPU hotplug, suspend
-and changes to cache settings. The optional clean-restart bridge remains a
-hosted experiment and does not enable that device path.
+and changes to cache settings. Clean restart was subsequently enabled only for
+the explicitly requested muted device path.
 
 An observation-only boot captured full PAT and MTRR snapshots on all four
 Dell CPUs before scheduler activation; the records matched. The observed PAT
@@ -2795,6 +2793,17 @@ and checks each of its own 17 allocated DMA pages before first access. A Dell
 boot registered the muted driver after validating all 17 pages. An OSS test
 then submitted 176,400 bytes, and a live mixer snapshot recorded 20,747
 completed frames with no discontinuity or quarantine. This is still an
-experimental one-shot, muted path: future CPU hotplug, suspend or cache
+experimental muted path: future CPU hotplug, suspend or cache
 reprogramming must invalidate admission, and unknown aliases are not enumerated.
 Recovery generation 78 is selected for the next boot.
+
+The first physical stop-before-playback attempts quarantined the controller
+at descriptor reset because the old delay required interrupt delivery. A
+runtime-only bounded TSC delay fixed the observed failure; it preserves the
+caller's interrupt state and its timing margin remains conditional on TSC
+calibration accuracy. The Dell then completed two muted OSS streams, each
+showing mixer completion, with a clean stop and fresh epoch between them. A
+later final-shutdown test reported successful retirement with no further mixer
+restart attempts over a one-second observation. This does not prove sustained
+audio quality or audible playback. Recovery generation 88 was selected and
+booted after testing.

@@ -87,6 +87,8 @@ int      AudioPlay(const void* samples, uint32_t byteCount,
                    uint32_t sampleRate, uint8_t channels, uint8_t bitsPerSample,
                    bool nonblock = false);
 void     AudioStop();
+// Irreversible shutdown gate: stop future mixer polling/restart requests.
+void     AudioPrepareShutdown();
 bool     AudioIsPlaying();
 uint32_t AudioGetPosition();
 bool     AudioAvailable();

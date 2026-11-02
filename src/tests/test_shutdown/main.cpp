@@ -43,6 +43,8 @@ const PlatformPowerPlan& PlatformPowerGetPlan(){return powerPlan;}
 bool PlatformPowerIssue(bool restart){assert(writebackStopped && gate && syncError==0);++powerWrites;lastRestart=restart;return true;}
 bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
+void AudioPrepareShutdown(){}
+void HdaRuntimeShutdown(){}
 int VfsSync(Vnode*){++syncs;return syncError;}
 int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncError);++finalCalls;return finalError;}
 void CompositorMarkDirty(){}

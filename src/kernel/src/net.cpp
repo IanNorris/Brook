@@ -4568,6 +4568,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  audio stop - stop output and invalidate active mixer streams\n"
             "  audio staging on|off|1024|4096|status - prospective native downstream budget (default off)\n"
             "  sched decision watch PID INC | off | reset | status - MLFQ decisions (default off)\n"
             "  sched syscall watch PID INC | off | reset | status - thread syscall brackets (default off)\n"
@@ -5228,6 +5229,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
+    }
+    else if (NetStrEq(cmd, "audio stop")) {
+        AudioStop();DebugChannelSend("{\"stop_requested\":true}\n");
     }
     else if (NetStrEq(cmd, "sched policy status") ||
              NetStrEq(cmd, "sched policy rr") || NetStrEq(cmd, "sched policy mlfq") || NetStrEq(cmd, "sched policy eevdf")) {

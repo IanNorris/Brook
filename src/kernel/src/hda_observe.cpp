@@ -13,6 +13,7 @@
 #include "../../drivers/intel_hda/hda_dell_tone_adapter.h"
 #include "../../drivers/intel_hda/hda_dell_tone_controller.h"
 #include "../../drivers/intel_hda/hda_dma_publish.h"
+#include "../../drivers/intel_hda/hda_tsc_delay.h"
 #include "../../drivers/intel_hda/hda_dell_stream_owner.h"
 #include "../../drivers/intel_hda/hda_dell_stream_queue.h"
 #include "../../drivers/intel_hda/hda_dell_audio_bridge.h"
@@ -151,6 +152,15 @@ struct Io {
         observation.mapped=true;return true;
     }
     bool valid(){return SmpCurrentCpuIndex()==0 && liveIdentity() && CacheCompatible(base);}
+    bool runtimeValid(){
+        const uint32_t cpu=SmpCurrentCpuIndex(),count=SmpGetCpuCount();
+        if(!observation.cacheCaptured || !observation.cacheMatch || !count ||
+           count!=observation.cacheCpuCount || cpu>=count ||
+           !CpuCacheSnapshotsMatch(cacheSnapshots[0],cacheSnapshots[cpu]) ||
+           !CpuCacheHdaApertureType(cacheSnapshots[0],base) || !liveIdentity())return false;
+        KernelAliasMapping mmio{};
+        return VmmInspectKernelAddress(reinterpret_cast<uint64_t>(registers),mmio) && HdaCacheMmioMapping(base,mmio);
+    }
     uint16_t command(){return PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4);}
     void setCommand(uint16_t value){PciConfigWrite32(entry.device.bus,entry.device.dev,entry.device.fn,4,value);}
     uint8_t read8(uint32_t offset){
@@ -213,8 +223,8 @@ struct TonePlatform {
         return available && line>=16 && line<=4096 && !(line&(line-1)) && !(4096%line);
     }
     bool identityStable(){
-        const bool inventory=HdaDellToneInventoryMatches(),valid=io.valid(),range=SafeBootRange(io.boot,io.base),bars=OtherBarStartsClear(io.base);
-        observation.toneAdmission=(observation.toneAdmission&16)|(inventory?1u:0u)|(valid?2u:0u)|(range?4u:0u)|(bars?8u:0u);
+        const bool inventory=HdaDellToneInventoryMatches(),valid=runtimeMode?io.runtimeValid():io.valid(),range=SafeBootRange(io.boot,io.base),bars=OtherBarStartsClear(io.base);
+        if(!runtimeMode)observation.toneAdmission=(observation.toneAdmission&16)|(inventory?1u:0u)|(valid?2u:0u)|(range?4u:0u)|(bars?8u:0u);
         return inventory && valid && range && bars;}
     uint16_t command(){return io.command();}void setCommand(uint16_t v){io.setCommand(v);}
     bool controllerIdle(){return HdaDellToneControllerIdle(*this,snapshot);}
@@ -226,19 +236,20 @@ struct TonePlatform {
         PmmFreePage(p);physical=0;address=nullptr;return false;}
     bool pageAllowed(uint64_t physical,void* address){
         if(!physical || physical>0xfffff000ULL || (physical&4095) || !address ||
-           (reinterpret_cast<uintptr_t>(address)&4095)){observation.tonePageStatus=1;return false;}
+           (reinterpret_cast<uintptr_t>(address)&4095)){
+            if(runtimeMode)__atomic_fetch_add(&observation.runtimePageRejections,1u,__ATOMIC_RELAXED);else observation.tonePageStatus=1;return false;}
         KernelAliasMapping identity{},direct{};
         if(!VmmInspectKernelAliases(physical,identity,direct) ||
            !HdaDellToneRamMappingMatches(physical,reinterpret_cast<uint64_t>(address),DIRECT_MAP_BASE,direct)){
-            observation.tonePageStatus=2;return false;}
+            if(runtimeMode)__atomic_fetch_add(&observation.runtimePageRejections,1u,__ATOMIC_RELAXED);else observation.tonePageStatus=2;return false;}
         // Validate the pages actually owned by the runtime, before touching
         // them or building a descriptor. Temporary probe pages prove nothing
         // about subsequent PMM allocations.
         if(runtimeMode && (!observation.cacheMatch || observation.cacheCpuCount!=SmpGetCpuCount() ||
            !HdaCacheDmaMappings(physical,identity,direct) || !CpuCacheHdaDmaPageType(cacheSnapshots[0],physical))){
-            observation.tonePageStatus=5;return false;}
-        if(runtimeMode)++observation.runtimePagesValidated;
-        observation.tonePageStatus=3;return true;}
+            __atomic_fetch_add(&observation.runtimePageRejections,1u,__ATOMIC_RELAXED);return false;}
+        if(runtimeMode)__atomic_fetch_add(&observation.runtimePagesValidated,1u,__ATOMIC_RELAXED);
+        else observation.tonePageStatus=3;return true;}
     void clearPage(void* p){memset(p,0,4096);}void freePage(uint64_t p){
         void* address=reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(p)).raw());for(auto& slot:dmaPages)if(slot==address)slot=nullptr;
         PmmFreePage(PhysicalAddress(p));}
@@ -246,6 +257,22 @@ struct TonePlatform {
     uint32_t read32(uint32_t o){return io.read32(o);}void write8(uint32_t o,uint8_t v){io.write8(o,v);}
     void write16(uint32_t o,uint16_t v){io.write16(o,v);}void write32(uint32_t o,uint32_t v){io.write32(o,v);}
     uint64_t ticks(){return io.ticks();}void pause(){io.pause();}
+    uint32_t cpu(){return SmpCurrentCpuIndex();}
+    uint64_t disableInterrupts(){
+#ifdef BROOK_HOST_TEST
+        return 0x200;
+#else
+        uint64_t flags;__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
+        if(runtimeMode && !(flags&0x200))__atomic_fetch_add(&observation.runtimeDelayInterruptsOff,1u,__ATOMIC_RELAXED);return flags;
+#endif
+    }
+    void restoreInterrupts(uint64_t flags){
+#ifdef BROOK_HOST_TEST
+        (void)flags;
+#else
+        if(flags&0x200)__asm__ volatile("sti":::"memory");
+#endif
+    }
     uint64_t nowNs(){
 #ifdef BROOK_HOST_TEST
         return HdaObserveTestNowNs();
@@ -264,6 +291,7 @@ struct TonePlatform {
 #endif
     }
     bool delayUs(unsigned us){
+        if(runtimeMode)return HdaTscDelay(*this,us);
         if(us>1000)return false;uint64_t flags=0;__asm__ volatile("pushfq; popq %0":"=r"(flags));
         if(!(flags&0x200))return false;const auto start=ticks();uint64_t anchor=0;bool haveBoundary=false;
         // Discard the first delivered IRQ (which could already be pending),
@@ -313,16 +341,20 @@ void ObserveCachePages(Io& io){
 }
 struct RuntimeLock {KMutex mutex{};void init(){KMutexInit(&mutex);}void lock(){KMutexLock(&mutex);}
     bool tryLock(){return KMutexTryLock(&mutex);}void unlock(){KMutexUnlock(&mutex);}};
-using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock>;
+using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock,true>;
 RuntimeOwner* runtimeOwner=nullptr;RuntimeBridge* runtimeBridge=nullptr;
 int RuntimePlay(const void* p,uint32_t n,uint32_t hz,uint8_t ch,uint8_t bits,bool){return runtimeBridge?runtimeBridge->play(p,n,hz,ch,bits):-19;}
-void RuntimeStop(){if(runtimeBridge)runtimeBridge->stop();}
+void RuntimeStop(){if(runtimeBridge){const bool ok=runtimeBridge->stop();
+    __atomic_fetch_add(&observation.runtimeStops,1u,__ATOMIC_RELAXED);
+    if(!ok)__atomic_fetch_add(&observation.runtimeStopFailures,1u,__ATOMIC_RELAXED);}}
 bool RuntimePlaying(){return runtimeBridge && runtimeBridge->isPlaying();}
 uint32_t RuntimePosition(){AudioDeviceProgress p{};return runtimeBridge && runtimeBridge->progress(&p)?uint32_t(p.completed):0;}
 void RuntimeService(){if(runtimeBridge)runtimeBridge->service();}
 AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?runtimeBridge->submit(p,n):AudioSubmitReceipt{0,0,0,-19};}
 bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
-bool RuntimeRestart(uint64_t epoch){return runtimeBridge && runtimeBridge->restart(epoch);}
+bool RuntimeRestart(uint64_t epoch){if(!runtimeBridge)return false;const bool ok=runtimeBridge->restart(epoch);
+    __atomic_fetch_add(&observation.runtimeRestarts,1u,__ATOMIC_RELAXED);
+    if(!ok)__atomic_fetch_add(&observation.runtimeRestartFailures,1u,__ATOMIC_RELAXED);return ok;}
 void PrepareRuntime(Io& io){
     // Admission is boot-bound. Hotplug, suspend and cache reprogramming must
     // invalidate it before any of those features can be used with this driver.
@@ -474,4 +506,13 @@ void HdaRuntimeRegister(){
     observation.runtimeRegistered=true;observation.runtimeReason="registered muted (experimental)";
     SerialPrintf("HDA_RUNTIME registered muted experimental\n");
 }
+void HdaRuntimeShutdown(){
+    if(!runtimeBridge || !observation.runtimeRegistered)return;
+    const bool ok=runtimeBridge->shutdown();
+    __atomic_store_n(&observation.runtimeShutdownOk,ok,__ATOMIC_RELAXED);
+    __atomic_store_n(&observation.runtimeShutdown,true,__ATOMIC_RELEASE);
+}
+uint32_t HdaRuntimeFailureStage(){return runtimeOwner?runtimeOwner->failureStage():0;}
+uint32_t HdaRuntimeStreamFailureStage(){return runtimeOwner?runtimeOwner->failedStreamStage():0;}
+uint32_t HdaRuntimeStreamFailureDetail(){return runtimeOwner?runtimeOwner->failedStreamDetail():0;}
 }

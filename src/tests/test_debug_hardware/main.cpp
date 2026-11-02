@@ -38,6 +38,9 @@ bool AcpiMmioMapValid(){return true;}
 bool AcpiMmioContains(uint64_t address,uint32_t bytes){return address==0xfe103000 && bytes==4096;}
 bool AcpiClassifyBootRange(uint64_t,uint32_t,BootResourceClassification& result){result={2,false};return true;}
 bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& a,KernelAliasMapping& b){a={true,21,0,physical};b=a;return true;}
+uint32_t HdaRuntimeFailureStage(){return 0;}
+uint32_t HdaRuntimeStreamFailureStage(){return 0;}
+uint32_t HdaRuntimeStreamFailureDetail(){return 0;}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
     if(index || offset>1024 || bytes>1024-offset)return false;
     h={};h.length=1024;if(bytes)std::memset(out,0xab,bytes);return true;

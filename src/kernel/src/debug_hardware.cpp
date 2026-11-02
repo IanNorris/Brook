@@ -149,7 +149,20 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_runtime_api\":1,\"requested\":");r.text(o.runtimeRequested?"true":"false");
         r.text(",\"prepared\":");r.text(o.runtimePrepared?"true":"false");r.text(",\"registered\":");r.text(o.runtimeRegistered?"true":"false");
         r.text(",\"quarantined\":");r.text(__atomic_load_n(&o.runtimeQuarantined,__ATOMIC_ACQUIRE)?"true":"false");
-        r.text(",");r.field("pages_validated",o.runtimePagesValidated);r.text(",\"reason\":");r.quoted(o.runtimeReason);r.text("}\n");r.send();return true;
+        r.text(",");r.field("pages_validated",__atomic_load_n(&o.runtimePagesValidated,__ATOMIC_RELAXED));
+        r.text(",");r.field("page_rejections",__atomic_load_n(&o.runtimePageRejections,__ATOMIC_RELAXED));
+        r.text(",");r.field("stops",__atomic_load_n(&o.runtimeStops,__ATOMIC_RELAXED));
+        r.text(",");r.field("stop_failures",__atomic_load_n(&o.runtimeStopFailures,__ATOMIC_RELAXED));
+        r.text(",");r.field("restarts",__atomic_load_n(&o.runtimeRestarts,__ATOMIC_RELAXED));
+        r.text(",");r.field("restart_failures",__atomic_load_n(&o.runtimeRestartFailures,__ATOMIC_RELAXED));
+        r.text(",");r.field("failure_stage",HdaRuntimeFailureStage());
+        r.text(",");r.field("stream_failure_stage",HdaRuntimeStreamFailureStage());
+        r.text(",");r.field("stream_failure_detail",HdaRuntimeStreamFailureDetail());
+        r.text(",");r.field("delay_interrupts_off",__atomic_load_n(&o.runtimeDelayInterruptsOff,__ATOMIC_RELAXED));
+        const bool shutdown=__atomic_load_n(&o.runtimeShutdown,__ATOMIC_ACQUIRE);
+        r.text(",\"shutdown\":");r.text(shutdown?"true":"false");
+        r.text(",\"shutdown_ok\":");r.text(shutdown && __atomic_load_n(&o.runtimeShutdownOk,__ATOMIC_RELAXED)?"true":"false");
+        r.text(",\"reason\":");r.quoted(o.runtimeReason);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-stream")) {
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_stream_api\":1,\"requested\":");r.text(o.streamRequested?"true":"false");

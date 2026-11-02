@@ -43,7 +43,7 @@ struct Chip {
     void write8(uint32_t o,uint8_t v){if(o==base+3)mem[o]&=~v;else mem[o]=uint8_t(v|((o==base+2 && roPriority)?4:0));}
     void write16(uint32_t o,uint16_t v){if(o==0x68){if(v==2)mem[o]&=~2;else if(v==1){execute();mem[o]=2;}return;}
         if(dropStop && o==base && v==0 && (read16(base)&2))return;
-        if(o==base && v==1){if(dropRetireReset && needsReset)return;resetAsserted=true;}
+        if(o==base && v==1){if(dropRetireReset && needsReset)return;resetAsserted=true;pos=0;}
         if(o==base && v==0 && resetAsserted){needsReset=false;resetAsserted=false;}
         if(o==base && v==2){assert(published && pin[0]==0x80 && pin[1]==0x80);runConverterFormat=format;runStreamFormat=read16(base+0x12);needsReset=true;}mem[o]=v;mem[o+1]=v>>8;}
     void write32(uint32_t o,uint32_t v){if(o==0x60){cmd=v;return;}if(o==base+8)assert(!needsReset);if(dropBdlClear && o==base+0x18 && !v)return;for(unsigned i=0;i<4;++i)mem[o+i]=v>>(8*i);}

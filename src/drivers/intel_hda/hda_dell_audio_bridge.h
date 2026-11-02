@@ -11,7 +11,7 @@ namespace brook {
 // Admission, AudioRegister() and object lifetime remain the caller's job.
 template<class Owner,class Lock,bool AllowCleanRestart=false> class HdaDellAudioBridge {
     Owner& owner_;Lock& lock_;HdaDellStreamQueue<Owner> queue_;uint32_t capacity_;
-    bool started_=false,closed_=false,retiredClean_=false;
+    bool started_=false,closed_=false,retiredClean_=false,terminal_=false;
     struct Guard {Lock& lock;~Guard(){lock.unlock();}};
 public:
     HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0):
@@ -57,12 +57,22 @@ public:
         if constexpr(!AllowCleanRestart){(void)expectedEpoch;return false;}
         else {
             lock_.lock();Guard guard{lock_};
-            if(!closed_ || !retiredClean_ || queue_.failed() || expectedEpoch!=queue_.progress().epoch || expectedEpoch==~uint64_t(0))return false;
+            if(terminal_ || !closed_ || !retiredClean_ || queue_.failed() || expectedEpoch!=queue_.progress().epoch || expectedEpoch==~uint64_t(0))return false;
             retiredClean_=false; // an attempted reprepare can change hardware; never retry on failure
             if(!owner_.prepareRetained()){owner_.quarantine();return false;}
             if(!queue_.restartAfterCleanStop(expectedEpoch)){owner_.quarantine();return false;}
             started_=closed_=false;return true;
         }
+    }
+    // Irreversible shutdown shares the same lock as restart and submit. Even
+    // a restart that raced with shutdown cannot reopen the controller later.
+    bool shutdown(){
+        lock_.lock();Guard guard{lock_};if(terminal_)return false;terminal_=true;
+        if(closed_){if(!retiredClean_ || queue_.failed())return false;retiredClean_=false;return owner_.retire();}
+        closed_=true;if(queue_.failed())return false;
+        if(started_){if(!queue_.shutdown())return false;}
+        else {const bool muted=owner_.mute(),stopped=owner_.stop();if(!muted || !stopped){owner_.quarantine();return false;}}
+        return owner_.retire();
     }
 };
 }

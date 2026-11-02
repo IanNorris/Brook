@@ -38,6 +38,13 @@ public:
         ready_=true;return true;
     }
     uint64_t bdlPhysical()const{return ready_?physical_[0]:0;}
+    // Pages remain owned while stopped. Recheck their mappings before any
+    // descriptor or sample access in a new hardware epoch.
+    bool revalidate(){
+        if(!ready_ || quarantined_ || retired_ || count_!=17)return false;
+        for(unsigned i=0;i<17;++i)if(!p_.pageAllowed(physical_[i],pages_[i]))return false;
+        return true;
+    }
     bool publishAll(){
         if(!ready_ || quarantined_)return false;
         for(void* page:pages_)if(!HdaDmaFlushRange(p_,page,4096,0,4096,line_))return false;

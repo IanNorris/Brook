@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include "../../drivers/intel_hda/hda_dell_audio_bridge.h"
 using namespace brook;
 struct Lock {std::atomic<bool> held{false};void lock(){while(held.exchange(true)){};}bool tryLock(){return !held.exchange(true);}void unlock(){held.store(false);}};
@@ -53,11 +54,24 @@ int main(){
     assert(reuse.progress(&p) && p.epoch==oldEpoch+1 && !p.discontinuity && !p.running);
     r=reuse.submit(samples,sizeof(samples));assert(r.epoch==oldEpoch+1 && r.accepted==sizeof(samples));
     assert(reuse.stop() && reuse.restart(oldEpoch+1));
+    assert(reuse.shutdown() && reusable.retires==1);assert(!reuse.restart(oldEpoch+2));
     Owner stoppedBefore;Lock stoppedBeforeLock;HdaDellAudioBridge<Owner,Lock,true> early(stoppedBefore,stoppedBeforeLock,64,4096);
     assert(early.stop() && !stoppedBefore.starts && early.restart(1));
     assert(early.submit(samples,sizeof(samples)).epoch==2);
+    assert(early.stop() && early.shutdown() && stoppedBefore.retires==1 && !early.restart(2));
     Owner retryFailure;Lock retryLock;HdaDellAudioBridge<Owner,Lock,true> retry(retryFailure,retryLock,64,4096);
     assert(retry.submit(samples,sizeof(samples)).accepted && retry.stop());retryFailure.failReprepare=true;
     assert(!retry.restart(1) && retryFailure.quarantines==1 && retry.progress(&p) && p.epoch==1 && p.discontinuity);
     retryFailure.failReprepare=false;assert(!retry.restart(1) && retryFailure.reprepares==1);
+    for(unsigned i=0;i<32;++i){
+        Owner concurrent;Lock concurrentLock;HdaDellAudioBridge<Owner,Lock,true> cycle(concurrent,concurrentLock,64,4096);
+        assert(cycle.submit(samples,sizeof(samples)).accepted && cycle.stop());std::atomic<bool> go{false};
+        std::thread restartThread([&]{while(!go.load()){}cycle.restart(1);});
+        std::thread shutdownThread([&]{while(!go.load()){}assert(cycle.shutdown());});
+        go.store(true);restartThread.join();shutdownThread.join();
+        const unsigned starts=concurrent.starts,reprepares=concurrent.reprepares;
+        assert(!cycle.restart(1) && !cycle.restart(2) && cycle.submit(samples,sizeof(samples)).error);
+        assert(!concurrent.running && concurrent.retires==1 && !concurrent.quarantines &&
+               concurrent.starts==starts && concurrent.reprepares==reprepares);
+    }
 }

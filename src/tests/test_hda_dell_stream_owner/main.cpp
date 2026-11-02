@@ -60,6 +60,7 @@ int main(){
     Platform retire;retire.format=0x31;HdaDellStreamOwner<Platform> stuck(retire,snapshot,64);assert(stuck.prepare());
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> retiring(stuck,64,4096);assert(retiring.start() && retiring.shutdown());
     retire.dropBdlClear=true;assert(!stuck.retire() && retire.held && !retire.freed && retire.pci==2 && retire.pin[0]==0x80 && retire.pin[1]==0x80);
+    assert(stuck.failureStage()==14 && stuck.failedStreamStage()==10 && (stuck.failedStreamDetail()&4));
     Platform partial;partial.format=0x31;HdaDellStreamOwner<Platform> pinFailure(partial,snapshot,64);assert(pinFailure.prepare());
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> pins(pinFailure,64,4096);assert(pins.start() && pins.shutdown());
     partial.dropPinRestoreRight=true;assert(!pinFailure.retire() && partial.held && !partial.freed && partial.pin[0]==0x80 && partial.pin[1]==0x80);

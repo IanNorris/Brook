@@ -19,7 +19,10 @@ struct HdaObservation {
     uint32_t streamSubmissions=0;uint64_t streamAccepted=0,streamCompleted=0,streamElapsedNs=0;
     uint16_t streamCommand=0;const char* streamReason="not requested";
     bool runtimeRequested=false,runtimePrepared=false,runtimeRegistered=false,runtimeQuarantined=false;
-    uint32_t runtimePagesValidated=0;
+    uint32_t runtimePagesValidated=0,runtimePageRejections=0;
+    bool runtimeShutdown=false,runtimeShutdownOk=false;
+    uint32_t runtimeStops=0,runtimeStopFailures=0,runtimeRestarts=0,runtimeRestartFailures=0;
+    uint32_t runtimeDelayInterruptsOff=0;
     const char* runtimeReason="not requested";
     bool cacheRequested=false,cacheCaptured=false,cacheMatch=false;
     uint32_t cacheCpuCount=0;uint64_t cachePat=0;
@@ -31,4 +34,9 @@ void HdaObserveConfigure(const BootProtocol* boot);
 const HdaObservation& HdaObserveRead();
 // Called on the BSP after AudioMixerInit/ConfigureBoot and before modules.
 void HdaRuntimeRegister();
+// Final teardown; unlike ordinary AudioStop, cannot be restarted afterward.
+void HdaRuntimeShutdown();
+uint32_t HdaRuntimeFailureStage();
+uint32_t HdaRuntimeStreamFailureStage();
+uint32_t HdaRuntimeStreamFailureDetail();
 }
