@@ -54,6 +54,14 @@ std::atomic<int> updateAckSlot{-1};
 std::atomic<bool> pauseAllocation{false}, allocating{false}, releaseAllocation{false};
 std::atomic<uint64_t> ticks{1};
 thread_local brook::Process* currentProcess = nullptr;
+uint8_t capturedFrame[brook::ETH_FRAME_MAX]{};
+uint32_t capturedFrameLength=0;
+int frameTransmitResult=0;
+int captureFrame(brook::NetIf*,const void* frame,uint32_t length) {
+    assert(length<=sizeof(capturedFrame));
+    memcpy(capturedFrame,frame,length);capturedFrameLength=length;
+    return frameTransmitResult;
+}
 }
 namespace brook {
 void* kmalloc(size_t n) {
@@ -260,6 +268,29 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
     assert(NetIpv4PayloadFits(1480) && !NetIpv4PayloadFits(1481) && !NetIpv4PayloadFits(~uint32_t(0)));
+    {
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{1,2,3,4,5,6}};
+        const MacAddr destination={{7,8,9,10,11,12}};
+        uint8_t payload[1480];for(unsigned n=0;n<sizeof(payload);++n)payload[n]=static_cast<uint8_t>(n);
+        const uint32_t src=htonl(0x0a000201),dst=htonl(0x0a000202);
+        assert(NetSendIpv4Resolved(&nif,destination,src,dst,IP_PROTO_TCP,payload,sizeof(payload))==0);
+        assert(capturedFrameLength==ETH_FRAME_MAX && nif.txPackets==1 && nif.txBytes==ETH_FRAME_MAX);
+        const auto* eth=reinterpret_cast<const EthHeader*>(capturedFrame);
+        const auto* ip=reinterpret_cast<const Ipv4Header*>(capturedFrame+sizeof(EthHeader));
+        assert(!memcmp(&eth->src,&nif.mac,sizeof(MacAddr)) && !memcmp(&eth->dst,&destination,sizeof(MacAddr)));
+        assert(ntohs(eth->etherType)==ETH_TYPE_IPV4 && ip->verIhl==0x45 && ip->ttl==64 &&
+               ntohs(ip->flagsFrag)==0x4000 && ntohs(ip->totalLen)==1500 &&
+               ip->protocol==IP_PROTO_TCP && ip->srcIp==src && ip->dstIp==dst && InetChecksum(ip,sizeof(*ip))==0);
+        assert(!memcmp(capturedFrame+sizeof(EthHeader)+sizeof(Ipv4Header),payload,sizeof(payload)));
+        capturedFrameLength=0;const auto nextId=__atomic_load_n(&g_ipId,__ATOMIC_RELAXED);
+        assert(NetSendIpv4Resolved(&nif,destination,src,dst,IP_PROTO_TCP,payload,1481)==-3);
+        assert(NetSendIpv4Resolved(&nif,destination,src,dst,IP_PROTO_TCP,payload,~uint32_t(0))==-3);
+        assert(capturedFrameLength==0 && nif.txPackets==1 && nif.txBytes==ETH_FRAME_MAX &&
+               __atomic_load_n(&g_ipId,__ATOMIC_RELAXED)==nextId);
+        frameTransmitResult=-11;
+        assert(NetSendIpv4Resolved(&nif,destination,src,dst,IP_PROTO_TCP,payload,1)==-11);
+        frameTransmitResult=0;
+    }
     {
         TcpSendFlightState invalid(17);assert(!invalid.Allocate());
         TcpSendFlightState empty(0);assert(!empty.Allocate());

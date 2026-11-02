@@ -177,6 +177,13 @@ the USB Ethernet QEMU loss and concurrency suite passed with normal traffic.
 Actual ARP miss scheduling, interface identity, retry and driver-lifetime
 behavior still need their own design and tests.
 
+The hosted socket suite now calls the actual resolved-frame builder with a
+capturing NIC. It checks Ethernet addresses, IPv4 fields and checksum, a
+maximum-sized payload, rejection of oversized and overflowing lengths before
+transmit or ID/counter changes, and propagation of a busy NIC result. The
+ordinary hosted sender path still uses its separate transmit stub. This does
+not establish driver DMA lifetime or nonblocking behavior.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

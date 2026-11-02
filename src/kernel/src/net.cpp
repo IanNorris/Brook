@@ -587,7 +587,6 @@ static bool NetIpv4PayloadFits(uint32_t payloadLen)
     return payloadLen <= ETH_FRAME_MAX - sizeof(EthHeader) - sizeof(Ipv4Header);
 }
 
-#ifndef BROOK_SOCKET_LIFETIME_TEST
 // Submit to an already selected interface and neighbor. This does not resolve
 // addresses or wait for an ARP reply. It retains the existing synchronous
 // NetIf::transmit contract; not every driver or loopback path has been audited
@@ -626,8 +625,6 @@ static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
     nif->txBytes += frameLen;
     return nif->transmit(nif, frame, frameLen);
 }
-#endif
-
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
                           const void* payload, uint32_t payloadLen)
 {
