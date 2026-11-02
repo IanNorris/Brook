@@ -55,7 +55,8 @@ public:
             }
         }
         lastArrival_=now;lastSteal_=steal;lastHasSteal_=hasSteal;
-        if(t.gapNs>data_.maxGapNs)data_.maxGapNs=t.gapNs;return t;
+        if(t.gapNs>data_.maxGapNs)data_.maxGapNs=t.gapNs;
+        return t;
     }
     bool Complete(const TimerWakeToken& t,uint64_t scheduler,uint64_t runtime,
                   uint64_t scan,uint64_t end,uint32_t candidates,

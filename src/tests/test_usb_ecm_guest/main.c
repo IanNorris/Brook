@@ -38,9 +38,9 @@ static int storage(int fd,unsigned pass){
     return 0;
 }
 int main(int argc,char** argv){
-    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>5)return 2;
-    int concurrency=0,close_race=0,user_copy=0;
-    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else return 2;}
+    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>7)return 2;
+    int concurrency=0,close_race=0,user_copy=0,async=0,bench_small=0;
+    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else return 2;}
     if(close_race && !concurrency)return 2;
     struct sockaddr_in peer={.sin_family=AF_INET,.sin_port=htons((unsigned short)atoi(argv[1]))};
     inet_pton(AF_INET,"10.0.2.100",&peer.sin_addr);
@@ -53,6 +53,13 @@ int main(int argc,char** argv){
         for(unsigned i=0;i<sizeof(data);++i)data[i]=(unsigned char)((i*13+pass*7)%251);
         if(exact(tcp,data,sizeof(data),1) || exact(tcp,reply,sizeof(reply),0) || memcmp(data,reply,sizeof(data)))return fail("TCP integrity");
         if(storage(file,pass))return fail("concurrent USB read");
+    }
+    if(bench_small){
+        memset(data,'T',1024);
+        for(unsigned n=0;n<1024;++n)if(exact(tcp,data,1024,1))return fail("small write benchmark");
+        char done;if(exact(tcp,&done,1,0) || done!='S')return fail("small write benchmark reply");
+        for(unsigned i=0;i<sizeof(data);++i)data[i]=(unsigned char)((i*13+7*7)%251);
+        puts("ECM_SMALL_WRITES_OK bytes=1048576 calls=1024");
     }
     if(user_copy){
         struct iovec vector[2]={{(void*)"write",5},{(void*)"v",1}};
@@ -91,7 +98,9 @@ int main(int argc,char** argv){
     if(close_race){
         memset(long_write,'C',sizeof(long_write));memset(short_write,'D',sizeof(short_write));
         atomic_int entered1=0,entered2=0;pthread_t first,second;
-        struct race_writer one={tcp,long_write,sizeof(long_write),&entered1,-1};
+        // Async writes may legally return a partial prefix on a full queue.
+        // Keep this close test within the queue; the host verifies all bytes.
+        struct race_writer one={tcp,long_write,async?16384:sizeof(long_write),&entered1,-1};
         struct race_writer two={tcp,short_write,sizeof(short_write),&entered2,-1};
         if(pthread_create(&first,NULL,close_race_writer,&one))return fail("close race first writer");
         while(!atomic_load(&entered1))sched_yield();

@@ -22,6 +22,7 @@ std::atomic<uint32_t> lastFinSequence{0};
 std::atomic<unsigned> acknowledgeDataCount{0};
 std::atomic<unsigned> skipDataAcks{0};
 std::atomic<unsigned> failDataSubmissions{0};
+std::atomic<bool> resetOnDataSend{false};
 std::atomic<unsigned> failDataAttempt{0};
 std::atomic<uint32_t> rejectDataSeq{0};
 std::atomic<unsigned> rejectDataRemaining{0};
@@ -58,6 +59,10 @@ std::atomic<int> updateAckSlot{-1};
 std::atomic<bool> pauseAllocation{false}, allocating{false}, releaseAllocation{false};
 std::atomic<uint64_t> ticks{1};
 thread_local brook::Process* currentProcess = nullptr;
+struct TestWorker {brook::Process* process=nullptr;brook::KernelThreadFn fn=nullptr;void* arg=nullptr;bool scheduled=false;};
+TestWorker testWorkers[16]{};bool failWorkerCreate=false;
+std::atomic<bool> pauseWorkerCreate{false},workerCreating{false},releaseWorkerCreate{false};
+std::atomic<bool> pauseWorkerDetach{false},workerDetached{false},releaseWorkerDetach{false};
 uint8_t capturedFrame[brook::ETH_FRAME_MAX]{};
 uint32_t capturedFrameLength=0;
 int frameTransmitResult=0;
@@ -125,6 +130,20 @@ uint64_t CopyFromUserBytes(void* dst,uint64_t src,uint64_t len) {
 uint64_t ApicTickCount() { return ticks.load(); }
 Process* ProcessCurrent() { return currentProcess; }
 Process* SchedulerCurrentProcess() { return currentProcess; }
+Process* KernelThreadCreate(const char*,KernelThreadFn fn,void* arg,uint8_t) {
+    if(failWorkerCreate)return nullptr;
+    for(auto& w:testWorkers)if(!w.process){w.process=new Process{};w.process->refCount=1;w.process->isKernelThread=true;w.fn=fn;w.arg=arg;
+        if(pauseWorkerCreate){workerCreating=true;while(!releaseWorkerCreate)std::this_thread::yield();}
+        return w.process;}
+    return nullptr;
+}
+void SchedulerAddProcess(Process* process) {
+    for(auto& w:testWorkers)if(w.process==process){w.scheduled=true;return;}
+    assert(false);
+}
+void TcpAsyncTestDetached(int) {
+    if(pauseWorkerDetach){workerDetached=true;while(!releaseWorkerDetach)std::this_thread::yield();}
+}
 void SchedulerKernelRegionEnter(Process* p) { ProcessRef(p);++p->kernelRegionDepth; }
 void SchedulerKernelRegionLeave(Process* p) { assert(p->kernelRegionDepth);--p->kernelRegionDepth;ProcessUnref(p); }
 uint64_t ProcessPendingSignals(Process* p) { return __atomic_load_n(&p->sigPending,__ATOMIC_ACQUIRE); }
@@ -177,6 +196,12 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         lastDataSubmitTick=ticks.load();
         const unsigned index=capturedDataCount.fetch_add(1);
         if(index<64)capturedDataSeq[index]=ntohl(tcp->seqNum);
+        if(resetOnDataSend.exchange(false)){
+            Ipv4Header ip{};ip.srcIp=dst;ip.dstIp=src;
+            TcpHeader rst{};rst.srcPort=tcp->dstPort;rst.dstPort=tcp->srcPort;
+            rst.seqNum=tcp->ackNum;rst.flags=TCP_RST;rst.dataOff=5<<4;
+            HandleTcp(&ip,&rst,sizeof(rst));return 0;
+        }
         if(index && ntohl(tcp->seqNum)==10)firstDataRetryTick=ticks.load();
         if(index && observeFlightControlSocket.load()>=0){
             const auto& control=g_sockets[observeFlightControlSocket.load()].tcpFlightControl;
@@ -259,6 +284,14 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
 }
 }
 using namespace brook;
+static void runTestWorker() {
+    for(auto& w:testWorkers)if(w.scheduled){
+        auto* process=w.process;auto fn=w.fn;void* arg=w.arg;w={};
+        Process* previous=currentProcess;currentProcess=process;fn(arg);currentProcess=previous;
+        assert(process->refCount==1 && process->kernelRegionDepth==0);delete process;return;
+    }
+    assert(false);
+}
 template<class F> void await(F predicate) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (!predicate()) {
@@ -570,6 +603,120 @@ int main() {
         TcpSendFlightState empty(0);assert(!empty.Allocate());
         TcpSendFlightState normal(8);assert(normal.Allocate() && !normal.Allocate());
         TcpSendFlightState wide(16);assert(wide.Allocate() && !wide.Allocate());
+    }
+    {
+        g_tcpAsyncSend=true;g_tcpTwoPacketFlight=true;
+        auto* caller=new Process{};caller->refCount=1;caller->pid=190;currentProcess=caller;ticks=1;
+        int socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
+        g_sockets[socket].tcpState=TcpState::SynSent;
+        assert(!SockPollReady(socket,false,true));
+        g_sockets[socket].tcpState=TcpState::Established;
+        const uint8_t bytes[]={1,2,3,4};const unsigned fins=sentFins.load();capturedDataCount=0;
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        assert(capturedDataCount==0 && g_tcpAsyncJobs[socket] && g_tcpAsyncWorkers==1);
+        SockClose(socket);assert(published(socket) && sentFins==fins);
+        acknowledgeDataCount=1;acknowledgeFin=true;runTestWorker();acknowledgeFin=false;
+        assert(!published(socket) && sentFins==fins+1 && lastFinSequence==14 && g_tcpAsyncWorkers==0);
+        const int reused=create();assert(reused==socket);SockClose(reused);
+        // Pool and creation failures accept no bytes and leak no work owner.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
+        failAllocation=0;
+        assert(SockSend(socket,bytes,sizeof(bytes))==-12 && !g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers && g_sockets[socket].refCount==1);
+        failAllocation=-1;
+        failWorkerCreate=true;const auto allocBefore=allocations.load(),freeBefore=frees.load();
+        assert(SockSend(socket,bytes,sizeof(bytes))==-12);
+        assert(!g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers && g_sockets[socket].refCount==1);
+        assert(allocations==allocBefore+1 && frees==freeBefore+1);failWorkerCreate=false;
+        g_tcpAsyncWorkers=TCP_ASYNC_WORKER_LIMIT;g_sockets[socket].nonblock=true;
+        assert(SockPollReady(socket,false,true) && SockSend(socket,bytes,sizeof(bytes))==-11);
+        g_tcpAsyncWorkers=0;g_sockets[socket].nonblock=false;SockClose(socket);
+        // A reconnect while an old producer allocates its worker cannot
+        // publish old bytes into the new TCP incarnation.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
+        auto* racing=new Process{};racing->refCount=1;racing->pid=191;
+        pauseWorkerCreate=true;workerCreating=false;releaseWorkerCreate=false;capturedDataCount=0;
+        int raceResult=0;std::thread producer([&]{currentProcess=racing;raceResult=SockSend(socket,bytes,sizeof(bytes));currentProcess=nullptr;});
+        while(!workerCreating)std::this_thread::yield();
+        SpinLockAcquire(&g_sockets[socket].lock);g_sockets[socket].tcpState=TcpState::Closed;SpinLockRelease(&g_sockets[socket].lock);
+        SockSetNonblock(socket,true);SockAddrIn newPeer{};newPeer.sin_family=AF_INET;newPeer.sin_addr=3;newPeer.sin_port=htons(300);
+        assert(SockConnect(socket,&newPeer)==-115);
+        SpinLockAcquire(&g_sockets[socket].lock);g_sockets[socket].tcpState=TcpState::Established;SpinLockRelease(&g_sockets[socket].lock);
+        releaseWorkerCreate=true;producer.join();pauseWorkerCreate=false;
+        assert(raceResult==-104 && !g_tcpAsyncJobs[socket] && capturedDataCount==0);
+        runTestWorker();assert(g_tcpAsyncWorkers==0 && capturedDataCount==0);
+        acknowledgeFin=true;SockClose(socket);acknowledgeFin=false;delete racing;
+        // Detach an empty old job, reconnect, and publish a new job before
+        // the old worker releases its owner. Its cleanup must not detach or
+        // send FIN for the new incarnation.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;
+        capturedDataCount=0;acknowledgeDataCount=2;
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        pauseWorkerDetach=true;workerDetached=false;releaseWorkerDetach=false;
+        std::thread oldWorker([]{runTestWorker();});
+        while(!workerDetached)std::this_thread::yield();
+        assert(!g_tcpAsyncJobs[socket] && g_tcpAsyncWorkers==1);
+        SpinLockAcquire(&g_sockets[socket].lock);g_sockets[socket].tcpState=TcpState::Closed;SpinLockRelease(&g_sockets[socket].lock);
+        SockSetNonblock(socket,true);assert(SockConnect(socket,&newPeer)==-115);
+        SpinLockAcquire(&g_sockets[socket].lock);
+        g_sockets[socket].tcpState=TcpState::Established;g_sockets[socket].tcpSndUna=g_sockets[socket].tcpSndNxt;
+        const uint32_t newSequence=g_sockets[socket].tcpSndNxt;SpinLockRelease(&g_sockets[socket].lock);
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        auto* newJob=g_tcpAsyncJobs[socket];assert(newJob && g_tcpAsyncWorkers==2);
+        releaseWorkerDetach=true;oldWorker.join();pauseWorkerDetach=false;
+        assert(g_tcpAsyncJobs[socket]==newJob && g_tcpAsyncWorkers==1);
+        runTestWorker();assert(capturedDataCount==2 && capturedDataSeq[0]==10 && capturedDataSeq[1]==newSequence);
+        assert(g_tcpAsyncWorkers==0 && !g_tcpAsyncJobs[socket]);
+        acknowledgeFin=true;SockClose(socket);acknowledgeFin=false;
+        // An ACKed prefix followed by timeout must not resend or silently
+        // treat the unsent suffix as delivered after publication.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;ticks=1;
+        uint8_t terminal[1072]{};capturedDataCount=0;acknowledgeDataCount=1;
+        assert(SockSend(socket,terminal,sizeof(terminal))==sizeof(terminal));
+        runTestWorker();assert(g_sockets[socket].tcpState==TcpState::Closed && SockGetConnectError(socket)==110);
+        assert(g_sockets[socket].tcpSndUna==546 && g_tcpAsyncWorkers==0 && !g_tcpAsyncJobs[socket]);
+        SockClose(socket);
+        // A peer RST reports ECONNRESET exactly once, whether it precedes
+        // worker execution or arrives synchronously inside submission.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;ticks=1;
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        deliverControl(socket,20,10,TCP_RST,0);
+        assert(SockGetConnectError(socket)==104 && SockGetConnectError(socket)==0);
+        runTestWorker();assert(SockGetConnectError(socket)==0 && !g_tcpAsyncJobs[socket]);SockClose(socket);
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;ticks=1;
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        resetOnDataSend=true;runTestWorker();
+        assert(SockGetConnectError(socket)==104 && SockGetConnectError(socket)==0 && !g_tcpAsyncJobs[socket]);
+        SockClose(socket);
+        // A later user-copy fault returns the accepted prefix, which still
+        // drains after the producer has returned.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;ticks=1;
+        failUserCopyAfter=1;acknowledgeDataCount=1;
+        assert(SockSendUser(socket,reinterpret_cast<uint64_t>(terminal),sizeof(terminal))==536);
+        failUserCopyAfter=-1;runTestWorker();assert(g_sockets[socket].tcpSndUna==546);
+        SockClose(socket);
+        // A blocked worker must not stop an admitted worker on another TCP
+        // connection from delivering its bytes.
+        const int stalled=create();setupTcp(stalled);g_sockets[stalled].tcpSndWnd=0;
+        const int flowing=create();setupTcp(flowing);g_sockets[flowing].localPort=htons(101);g_sockets[flowing].tcpSndWnd=65535;
+        assert(SockSend(stalled,bytes,sizeof(bytes))==sizeof(bytes));
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;ticks=1;
+        std::thread stalledWorker([]{runTestWorker();});
+        while(!gatePollWaiting)std::this_thread::yield();
+        acknowledgeDataCount=1;assert(SockSend(flowing,bytes,sizeof(bytes))==sizeof(bytes));
+        runTestWorker();assert(g_sockets[flowing].tcpSndUna==14 && !g_tcpAsyncJobs[flowing]);
+        releaseGatePoll=true;stalledWorker.join();holdGatePoll=false;
+        assert(g_tcpAsyncWorkers==0 && SockGetConnectError(stalled)==110);
+        SockClose(stalled);SockClose(flowing);
+        // A full queue reports backpressure and becomes writable once the
+        // worker has delivered and retired its contents.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;g_sockets[socket].nonblock=true;
+        uint8_t data[TCP_ASYNC_QUEUE_BYTES]{};
+        assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+        assert(!SockPollReady(socket,false,true) && SockSend(socket,bytes,1)==-11);
+        acknowledgeDataCount=62;runTestWorker();
+        assert(SockPollReady(socket,false,true) && g_tcpAsyncWorkers==0);
+        acknowledgeDataCount=0;SockClose(socket);
+        g_tcpAsyncSend=false;g_tcpTwoPacketFlight=false;currentProcess=nullptr;delete caller;
     }
     {
         IrqSpinLock lock{};uint64_t flags=123;

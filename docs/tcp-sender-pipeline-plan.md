@@ -2,6 +2,35 @@
 
 ## Next: socket-owned send queue
 
+`/etc/tcp-async-send` enables an initial per-connection worker experiment;
+the default sender remains synchronous. A job owns a 32 KiB queue, a 16 KiB
+batch and a socket reference, with at most eight active jobs. Producers copy
+into owned storage before returning; each worker drains batches with the
+existing ACK-synchronous sender, and drops its reference after detach. A full
+queue can return an accepted prefix; an empty queue releases its worker.
+Connection epochs reject stale publication after reconnect. Peer reset now
+latches `ECONNRESET` for one `SO_ERROR` read. When the worker pool is full, a
+socket without a job can report writable and then return `EAGAIN`: repeated
+polling can therefore spin. Internet half-close is still unsupported, and
+this mode is not ready to become the default.
+
+Hosted tests cover allocation and thread-creation failure, pool saturation,
+close before drain, queue backpressure, copy fault after an accepted prefix,
+timeout after partial delivery, RST and one-shot error consumption, reconnect
+during allocation and after old-job detach, plus one stalled connection while
+another progresses. Disposable QEMU tests covered data integrity, concurrent
+writers, user-copy faults, one dropped packet and close with a 16 KiB accepted
+write. The async close test does not cover a large blocked write.
+
+In one matched QEMU comparison with 10 ms packet buffering and one dropped
+packet, the host received a 1 MiB stream issued as 1,024 separate 1 KiB writes
+in 10.33 seconds synchronously and 4.79 seconds asynchronously; another async
+run took 5.70 seconds. Timing starts after the first receive and ends on the
+last; this is not syscall latency or a Dell/WAN measurement. The matched
+run's median 32 KiB receive-tail time was
+140.6 ms versus 140.0 ms. Neither the worker path nor this benchmark has yet
+been tested on the physical Dell.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate

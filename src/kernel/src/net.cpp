@@ -160,6 +160,13 @@ static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 // Slot-owned, like Socket::lock: never clear or reinitialise on reuse.
 static KMutex g_tcpSendGates[MAX_SOCKETS];
+static KMutex g_tcpAsyncProducerGates[MAX_SOCKETS];
+struct TcpAsyncJob;
+// Protected by the corresponding socket lock. Each live job holds an owner
+// reference to that socket until it is detached and destroyed.
+static TcpAsyncJob* g_tcpAsyncJobs[MAX_SOCKETS]{};
+static uint64_t g_tcpAsyncEpoch[MAX_SOCKETS]{};
+static uint32_t g_tcpAsyncWorkers=0;
 // Optional aggregate diagnostics; per-slot ACK stamps are protected by the
 // socket lock and never affect TCP state or the module-visible Socket layout.
 static bool g_tcpSendProbe = false;
@@ -899,6 +906,7 @@ static bool g_tcpAdaptiveFlight16 = false;
 static bool g_tcpAsyncNeighbor = false;
 static bool g_tcpTryTransmit = false;
 static bool g_tcpQueueStage = false;
+static bool g_tcpAsyncSend = false;
 static bool g_irqTryLockProbe = false;
 static uint32_t g_irqTryLockProbeState=0,g_irqTryLockProbePassed=0;
 static uint32_t DebugIrqTryLockProbe();
@@ -925,6 +933,10 @@ void NetConfigureBoot()
     if (auto* marker=VfsOpen("/etc/tcp-queue-stage")) {
         VfsClose(marker);g_tcpQueueStage=true;
         KPuts("net: TCP queue staging experiment enabled\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-async-send")) {
+        VfsClose(marker);g_tcpAsyncSend=true;
+        KPuts("net: bounded asynchronous TCP sender enabled (experimental)\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
         VfsClose(marker);g_tcpSendProbe = true;
@@ -972,7 +984,9 @@ void NetInit()
     g_arpCount = 0;
     memset(g_sockets, 0, sizeof(g_sockets));
     memset(g_sockUsed, 0, sizeof(g_sockUsed));
-    for (uint32_t i = 0; i < MAX_SOCKETS; ++i) KMutexInit(&g_tcpSendGates[i]);
+    for (uint32_t i = 0; i < MAX_SOCKETS; ++i) {
+        KMutexInit(&g_tcpSendGates[i]);KMutexInit(&g_tcpAsyncProducerGates[i]);
+    }
     g_netIf = nullptr;
     for (uint32_t i = 0; i < NET_MAX_IFS; i++) g_netIfs[i] = nullptr;
     g_netIfCount = 0;
@@ -3112,10 +3126,19 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 
     if (s.type != SOCK_STREAM) return -95; // -EOPNOTSUPP
 
+    // Serialize stream incarnation changes with async-job publication.
+    SpinLockAcquire(&s.lock);
+    if (g_tcpAsyncSend && g_tcpAsyncJobs[sockIdx]) {SpinLockRelease(&s.lock);return -114;}
     // Already connecting (nonblocking connect in progress)
-    if (s.tcpState == TcpState::SynSent) return -114; // EALREADY
-    // Already connected
-    if (s.tcpState == TcpState::Established) return -106; // EISCONN
+    if (s.tcpState == TcpState::SynSent) {SpinLockRelease(&s.lock);return -114;}
+    // A half-closed stream is still the same live connection.
+    if (s.tcpState == TcpState::Established || (g_tcpAsyncSend && s.tcpState==TcpState::CloseWait)) {
+        SpinLockRelease(&s.lock);return -106;
+    }
+    if(g_tcpAsyncSend){
+        if(g_tcpAsyncEpoch[sockIdx]==~uint64_t(0)){SpinLockRelease(&s.lock);return -75;}
+        ++g_tcpAsyncEpoch[sockIdx];
+    }
 
     s.remoteIp   = addr->sin_addr;
     s.remotePort = addr->sin_port; // already big-endian
@@ -3148,6 +3171,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     // Window scale: RX_BUF_SIZE=512KB needs shift 3 (÷8) to fit in uint16_t
     s.tcpRcvWndScale = 3;
     s.tcpState = TcpState::SynSent;
+    SpinLockRelease(&s.lock);
 
     // Send SYN
     // Publish the consumed SYN before local delivery can return its ACK.
@@ -3285,9 +3309,12 @@ static bool TcpSendInterrupted(Process* self)
 class TcpSendOwnership {
     int index_;
     Process* self_;
+    KMutex* gate_;
     bool referenced_ = false, locked_ = false, region_ = false;
 public:
-    TcpSendOwnership(int index, Process* self) : index_(index), self_(self) {}
+    TcpSendOwnership(int index, Process* self, KMutex* gate=nullptr)
+        : index_(index), self_(self), gate_(gate ? gate :
+            (index>=0 && index<static_cast<int>(MAX_SOCKETS) ? &g_tcpSendGates[index] : nullptr)) {}
     int Acquire(uint64_t deadline) {
         if (!self_) return -11; // KMutex is unavailable outside process context
         SchedulerKernelRegionEnter(self_); region_ = true;
@@ -3297,7 +3324,7 @@ public:
         for (;;) {
             if (TcpSendInterrupted(self_)) return -4;
             if (ApicTickCount() >= deadline) return -110;
-            if (KMutexTryLock(&g_tcpSendGates[index_])) { locked_ = true; return 0; }
+            if (KMutexTryLock(gate_)) { locked_ = true; return 0; }
             if (nonblock) return -11;
             // Try-lock polling keeps acquisition finite and interruptible;
             // no registry or socket spinlock is held while sleeping.
@@ -3307,7 +3334,7 @@ public:
         }
     }
     ~TcpSendOwnership() {
-        if (locked_) KMutexUnlock(&g_tcpSendGates[index_]);
+        if (locked_) KMutexUnlock(gate_);
         if (referenced_) SockUnref(index_);
         if (region_) SchedulerKernelRegionLeave(self_);
     }
@@ -3710,19 +3737,24 @@ static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len)
     return static_cast<int>(sent);
 }
 
+#include "tcp_async_send.inc"
+
 int SockSend(int sockIdx, const void* buf, uint32_t len)
 {
-    return SockSendImpl(sockIdx, {static_cast<const uint8_t*>(buf), false, nullptr, 0}, len);
+    const TcpSendSource source{static_cast<const uint8_t*>(buf), false, nullptr, 0};
+    return g_tcpAsyncSend ? TcpSendAsync(sockIdx,source,len) : SockSendImpl(sockIdx,source,len);
 }
 
 int SockSendUser(int sockIdx, uint64_t address, uint32_t len)
 {
-    return SockSendImpl(sockIdx, {reinterpret_cast<const uint8_t*>(address), true, nullptr, 0}, len);
+    const TcpSendSource source{reinterpret_cast<const uint8_t*>(address), true, nullptr, 0};
+    return g_tcpAsyncSend ? TcpSendAsync(sockIdx,source,len) : SockSendImpl(sockIdx,source,len);
 }
 
 int SockSendUserVector(int sockIdx, const TcpSendVector* vectors, unsigned count, uint32_t len)
 {
-    return SockSendImpl(sockIdx, {nullptr, true, vectors, count}, len);
+    const TcpSendSource source{nullptr, true, vectors, count};
+    return g_tcpAsyncSend ? TcpSendAsync(sockIdx,source,len) : SockSendImpl(sockIdx,source,len);
 }
 
 int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
@@ -3873,6 +3905,13 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
     }
     if (checkWrite) {
         if (s.type == SOCK_DGRAM) return true; // UDP always writable
+        if (g_tcpAsyncSend && s.type==SOCK_STREAM) {
+            SpinLockAcquire(&s.lock);
+            const bool pending=s.tcpState==TcpState::SynSent || s.tcpState==TcpState::SynRecv || s.tcpState==TcpState::Listen;
+            const bool ready=!pending && (!TcpCanSendData(s.tcpState) || s.tcpRstRecv ||
+                (g_tcpAsyncJobs[sockIdx] ? g_tcpAsyncJobs[sockIdx]->queue.Free()>0 : true));
+            SpinLockRelease(&s.lock);return ready;
+        }
         if (s.type == SOCK_STREAM && s.tcpState == TcpState::Established)
             return true;
     }

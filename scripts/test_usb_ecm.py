@@ -27,6 +27,8 @@ ap.add_argument('--tcp-async-neighbor',action='store_true',help='Use the experim
 ap.add_argument('--tcp-try-transmit',action='store_true',help='Use the immediate ECM callback for experimental neighbor and TCP data')
 ap.add_argument('--irq-trylock-probe',action='store_true',help='Test IRQ try-lock IF restoration inside the guest kernel')
 ap.add_argument('--tcp-queue-stage',action='store_true',help='Stage synchronous flight bytes through bounded queue storage')
+ap.add_argument('--tcp-async-send',action='store_true',help='Exercise bounded asynchronous per-connection TCP workers')
+ap.add_argument('--small-write-benchmark',action='store_true',help='Measure a 1 MiB stream of 1 KiB writes')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))):ap.error('--tcp-async-neighbor requires --arp-async-probe and a TCP flight mode')
@@ -38,7 +40,7 @@ def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
 tcp=socket.socket();tcp.bind(('127.0.0.1',0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
 udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.bind(('127.0.0.1',port));udp.settimeout(.2)
 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:s.bind(('127.0.0.1',0));udp_forward=s.getsockname()[1]
-errors=[];completed=[]
+errors=[];completed=[];tcp_tail_receive_ns=[];small_write_receive_ns=[]
 def exact(s,n):
  b=b''
  while len(b)<n:
@@ -52,14 +54,23 @@ def echo_tcp():
   with s:
    s.settimeout(30);b=exact(s,10);assert b==b'ecm-zlp-ok';s.sendall(b)
    for p in range(8):
-    b=exact(s,32768);assert b==bytes((i*13+p*7)%251 for i in range(32768));s.sendall(b)
+    b=s.recv(32768)
+    if not b:raise RuntimeError('Incomplete guest upload')
+    started=time.monotonic_ns();b+=exact(s,32768-len(b));tcp_tail_receive_ns.append(time.monotonic_ns()-started)
+    assert b==bytes((i*13+p*7)%251 for i in range(32768));s.sendall(b)
+   if args.small_write_benchmark:
+    b=s.recv(1024)
+    if not b:raise RuntimeError('Incomplete small-write upload')
+    started=time.monotonic_ns();b+=exact(s,1048576-len(b));small_write_receive_ns.append(time.monotonic_ns()-started)
+    assert b==b'T'*1048576;s.sendall(b'S')
    if args.send_user_copy:
     b=exact(s,2418);assert b==b'X'*1200+b'V'*1200+b'sendwritevmultiiov';s.sendall(b[2400:])
    if args.send_concurrency:
     b=exact(s,8192);assert b in (b'A'*4096+b'B'*4096,b'B'*4096+b'A'*4096);s.sendall(b)
    if args.send_close_race:
     b=exact(s,1200);assert b==b'C'*1200;s.sendall(b'R')
-    b+=exact(s,262144-1200+4096);assert b==b'C'*262144+b'D'*4096
+    length=16384 if args.tcp_async_send else 262144
+    b+=exact(s,length-1200+4096);assert b==b'C'*length+b'D'*4096
   completed.append('tcp')
  except BaseException as e:errors.append(repr(e))
 def echo_udp():
@@ -77,7 +88,7 @@ for thread in threads:thread.start()
 run(os.environ['MUSL_CC'],'-static','-pthread','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_usb_ecm_guest/main.c','-o',base/'ECMTEST.ELF')
 run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600')
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BOOT/ECMTEST.ELF')
-rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}\n')
+rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}{" async" if args.tcp_async_send else ""}{" bench-small" if args.small_write_benchmark else ""}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
@@ -93,6 +104,7 @@ if args.tcp_async_neighbor:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-neigh
 if args.tcp_try_transmit:run('mcopy','-i',initrd,marker,'::ETC/tcp-try-transmit')
 if args.irq_trylock_probe:run('mcopy','-i',initrd,marker,'::ETC/irq-trylock-probe')
 if args.tcp_queue_stage:run('mcopy','-i',initrd,marker,'::ETC/tcp-queue-stage')
+if args.tcp_async_send:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-send')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -187,6 +199,7 @@ try:
    if args.send_concurrency:assert 'ECM_CONCURRENT_WRITERS_OK' in serial,serial[-2500:]
    if args.send_close_race:assert 'ECM_SEND_CLOSE_RACE_OK' in serial,serial[-2500:]
    if args.send_user_copy:assert 'ECM_USER_SEND_PATHS_OK' in serial,serial[-2500:]
+   if args.small_write_benchmark:assert 'ECM_SMALL_WRITES_OK' in serial,serial[-2500:]
    if args.tcp_flight2:assert 'two-packet TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_flight4:assert 'four-packet TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_adaptive_flight:assert 'bounded adaptive TCP send flight enabled' in serial,serial[-2500:]
@@ -194,6 +207,7 @@ try:
    if args.tcp_async_neighbor:assert 'TCP async neighbor experiment enabled' in serial,serial[-2500:]
    if args.tcp_try_transmit:assert 'TCP try-transmit experiment enabled' in serial,serial[-2500:]
    if args.tcp_queue_stage:assert 'TCP queue staging experiment enabled' in serial,serial[-2500:]
+   if args.tcp_async_send:assert 'bounded asynchronous TCP sender enabled' in serial,serial[-2500:]
    assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
    assert f'tx_depth={16 if args.tx_depth16 else 8}' in serial, 'Unexpected ECM transmit depth'
    break
@@ -357,14 +371,19 @@ try:
  if args.tcp_flight2:assert max_flight>=2,'capture did not observe two successive payload segments before their ACK'
  if args.tcp_flight4:assert max_flight>=4,'capture did not observe four successive payload segments before their ACK'
  if args.tcp_adaptive_flight:assert max_flight>=4,'capture did not observe adaptive flight growth'
- if args.tcp_adaptive_flight16:assert max_flight>8,'capture did not observe flight growth beyond eight'
+ # The async worker drains bounded batches and may emit fewer contiguous
+ # packets per batch. Preserve the wider-flight gate for its original
+ # synchronous workload; record the observed async depth separately.
+ if args.tcp_adaptive_flight16 and not args.tcp_async_send:assert max_flight>8,'capture did not observe flight growth beyond eight'
+ if args.tcp_adaptive_flight16 and args.tcp_async_send:assert max_flight>=2,'async capture did not observe a multi-packet flight'
  if args.tcp_window16:
   assert any(flags&2 for _,flags,_ in windows) and any((flags&16) and not(flags&2) for _,flags,_ in windows),windows
   for flow,flags,window in windows:
    pair=scales.get(flow,{});shift=pair.get('guest') if pair.get('guest') is not None and pair.get('peer') is not None else 0
    assert (window if flags&2 else window<<shift)<=16384,(flow,flags,window,shift)
- result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,tcp_adaptive_flight16=args.tcp_adaptive_flight16,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
-  dropped_tcp_packet=bool(args.drop_tcp_packet),idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True)
+ result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,tcp_adaptive_flight16=args.tcp_adaptive_flight16,tcp_async_send=args.tcp_async_send,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
+  dropped_tcp_packet=bool(args.drop_tcp_packet),idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True,
+  tcp_tail_receive_ns=tcp_tail_receive_ns,small_write_receive_ns=small_write_receive_ns)
  (base/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('USB_ECM_ACCEPTANCE_PASS',flush=True)
 finally:
  loss_stop.set()

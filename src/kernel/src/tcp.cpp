@@ -134,6 +134,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpState   = TcpState::Closed;
             s.connected  = false;
             s.tcpRstRecv = true; // RST ≠ FIN: report as ECONNRESET, not EOF
+            if (!s.connectError) s.connectError = 104; // ECONNRESET, consumed by SO_ERROR
             return act;
         }
 
@@ -254,6 +255,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpState = TcpState::Closed;
             s.connected = false;
             s.tcpRstRecv = true;
+            if (!s.connectError) s.connectError = 104;
             return act;
         }
         if (flags & TCP_ACK)
