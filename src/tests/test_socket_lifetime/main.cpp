@@ -690,7 +690,18 @@ int main() {
         SpinLockAcquire(&g_sockets[socket].lock);g_sockets[socket].tcpState=TcpState::Established;SpinLockRelease(&g_sockets[socket].lock);
         releaseWorkerCreate=true;producer.join();pauseWorkerCreate=false;
         assert(raceResult==-104 && !g_tcpAsyncJobs[socket] && capturedDataCount==0);
-        runTestWorker();assert(g_tcpAsyncWorkers==0 && capturedDataCount==0);
+        // A stale cleanup worker must not overwrite the probe identity or
+        // waiting flags belonging to the newly attached worker.
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        auto* probeNewWorker=new Process{};probeNewWorker->refCount=1;
+        g_tcpSendProbe=true;g_tcpProbeWorker[socket]=probeNewWorker;
+        g_tcpProbeWorkerWaiting[socket]=true;g_tcpProbeWorkerDisplaced[socket]=true;
+        runTestWorker();
+        assert(g_tcpAsyncWorkers==1 && capturedDataCount==0 && g_tcpProbeWorker[socket]==probeNewWorker);
+        assert(g_tcpProbeWorkerWaiting[socket] && g_tcpProbeWorkerDisplaced[socket]);
+        g_tcpProbeWorker[socket]=nullptr;g_tcpProbeWorkerWaiting[socket]=false;g_tcpProbeWorkerDisplaced[socket]=false;
+        g_tcpSendProbe=false;delete probeNewWorker;acknowledgeDataCount=1;
+        runTestWorker();assert(g_tcpAsyncWorkers==0 && capturedDataCount==1);
         acknowledgeFin=true;SockClose(socket);acknowledgeFin=false;delete racing;
         // Detach an empty old job, reconnect, and publish a new job before
         // the old worker releases its owner. Its cleanup must not detach or
@@ -1035,6 +1046,26 @@ int main() {
     assert(waiter->refCount == 1);
     SockSetPollWaiter(i, waiter); SockClose(i);
     assert(waiter->refCount == 1); delete waiter;
+    // The sender diagnostic records a real ACK after an application poller
+    // replaces the worker's waiter; it does not rely on a timeout estimate.
+    i=create();setupTcp(i);g_sockets[i].tcpSndNxt=11;
+    Process* workerProbe=new Process{};workerProbe->refCount=1;
+    Process* appProbe=new Process{};appProbe->refCount=1;
+    g_tcpSendProbe=true;g_tcpProbeWorker[i]=workerProbe;
+    g_tcpProbeWorkerWaiting[i]=true;g_tcpProbeWorkerDisplaced[i]=false;
+    const auto displacedBefore=g_tcpSendProbeStats.workerDisplacements;
+    const auto ackBefore=g_tcpSendProbeStats.ackWhileWorkerDisplaced;
+    SockSetPollWaiter(i,workerProbe);SockSetPollWaiter(i,appProbe);
+    assert(g_tcpSendProbeStats.workerDisplacements==displacedBefore+1 && g_tcpProbeWorkerDisplaced[i]);
+    Ipv4Header probeIp{};probeIp.srcIp=2;probeIp.dstIp=1;
+    TcpHeader probeAck{};probeAck.srcPort=htons(200);probeAck.dstPort=htons(100);
+    probeAck.seqNum=htonl(20);probeAck.ackNum=htonl(11);probeAck.flags=TCP_ACK;
+    probeAck.dataOff=5<<4;probeAck.window=htons(65535);HandleTcp(&probeIp,&probeAck,sizeof(probeAck));
+    assert(g_tcpSendProbeStats.ackWhileWorkerDisplaced==ackBefore+1);
+    assert(workerProbe->pendingWakeup==0 && appProbe->pendingWakeup==1);
+    assert(workerProbe->refCount==1 && appProbe->refCount==1);
+    g_tcpProbeWorker[i]=nullptr;g_tcpProbeWorkerWaiting[i]=false;g_tcpProbeWorkerDisplaced[i]=false;g_tcpSendProbe=false;
+    SockClose(i);delete workerProbe;delete appProbe;
     // Blocking timeouts release waiter refs without relying on socket close.
     // Another FD owner outlives the waiting thread, as with dup/fork.
     waiter = new Process{}; waiter->refCount = 1;

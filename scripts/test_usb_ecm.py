@@ -311,6 +311,8 @@ try:
    assert b'BRIDGE_BEGIN 73' in reply and b'BRIDGE_END 73' in reply,reply
    probe=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
    assert probe['enabled'] and probe['calls']>0 and probe['submitted_bytes']>0 and probe['ack_samples']>0,probe
+   if args.tcp_async_send:
+    assert probe['worker_waits']>0 and 'acks_while_worker_displaced' in probe,probe
    if args.tcp_async_neighbor:assert probe['local_busy']>0,probe
    (base/'tcp-send-probe.json').write_text(json.dumps(probe,indent=2)+'\n')
  if loss:

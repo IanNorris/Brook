@@ -167,6 +167,11 @@ struct TcpAsyncJob;
 static TcpAsyncJob* g_tcpAsyncJobs[MAX_SOCKETS]{};
 static uint64_t g_tcpAsyncEpoch[MAX_SOCKETS]{};
 static uint32_t g_tcpAsyncWorkers=0;
+// Probe-only identities are valid while the worker runs and are protected by
+// the corresponding socket lock. They do not own an additional process ref.
+static Process* g_tcpProbeWorker[MAX_SOCKETS]{};
+static bool g_tcpProbeWorkerWaiting[MAX_SOCKETS]{};
+static bool g_tcpProbeWorkerDisplaced[MAX_SOCKETS]{};
 // Optional aggregate diagnostics; per-slot ACK stamps are protected by the
 // socket lock and never affect TCP state or the module-visible Socket layout.
 static bool g_tcpSendProbe = false;
@@ -176,6 +181,7 @@ struct TcpSendProbeStats {
     uint64_t calls, bytes, smallCalls, mediumCalls, largeCalls;
     uint64_t submitted, acked, maxOutstanding, retries, busy;
     uint64_t congestionWaits, peerWindowWaits, slotWaits, drainWaits, samples, rttTicks, resumeTicks;
+    uint64_t workerWaits, workerDisplacements, ackWhileWorkerDisplaced, workerDeadlineWakeups;
 };
 static TcpSendProbeStats g_tcpSendProbeStats{};
 static void TcpProbeAdd(uint64_t& value,uint64_t amount=1) {
@@ -237,6 +243,12 @@ static void ResetSocketPayload(Socket& socket)
 static void SetSocketWaiterLocked(Socket& socket, Process* waiter)
 {
     if (socket.pollWaiter == waiter) return;
+    const auto index=static_cast<uint32_t>(&socket-g_sockets);
+    if (g_tcpSendProbe && index<MAX_SOCKETS && g_tcpProbeWorkerWaiting[index] &&
+        socket.pollWaiter==g_tcpProbeWorker[index] && waiter!=socket.pollWaiter) {
+        g_tcpProbeWorkerDisplaced[index]=true;
+        TcpProbeAdd(g_tcpSendProbeStats.workerDisplacements);
+    }
     ProcessRef(waiter);
     Process* old = socket.pollWaiter;
     socket.pollWaiter = waiter;
@@ -2891,6 +2903,9 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         uint32_t prevRxCount = s.rxCount;
         uint32_t prevSndUna = s.tcpSndUna;
         TcpAction act = TcpProcessSegment(s, seq, ack, flags, tcpData, dataLen);
+        if (g_tcpSendProbe && s.tcpSndUna!=prevSndUna && g_tcpProbeWorkerWaiting[i] &&
+            g_tcpProbeWorkerDisplaced[i])
+            TcpProbeAdd(g_tcpSendProbeStats.ackWhileWorkerDisplaced);
         if (g_tcpSendProbe && s.tcpSndUna != prevSndUna)
             g_tcpSendProbeAck[i] = {s.tcpSndUna, ApicTickCount()};
 
@@ -3622,8 +3637,21 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
         const FlightStep outcome=pump.Step(ApicTickCount(),deadline);
         if (outcome.action==FlightAction::Done) return outcome.result;
         if (outcome.action==FlightAction::WaitLocked) {
+            const bool workerProbe=g_tcpSendProbe && g_tcpProbeWorker[probeIndex]==self;
+            if(workerProbe) {
+                g_tcpProbeWorkerWaiting[probeIndex]=true;
+                g_tcpProbeWorkerDisplaced[probeIndex]=false;
+                TcpProbeAdd(g_tcpSendProbeStats.workerWaits);
+            }
             SetSocketWaiterLocked(s,self);self->wakeupTick=outcome.wakeTick;
             SpinLockRelease(&s.lock);SchedulerBlockInterruptible(self);
+            if(workerProbe) {
+                if(ApicTickCount()>=outcome.wakeTick)TcpProbeAdd(g_tcpSendProbeStats.workerDeadlineWakeups);
+                SpinLockAcquire(&s.lock);
+                g_tcpProbeWorkerWaiting[probeIndex]=false;
+                g_tcpProbeWorkerDisplaced[probeIndex]=false;
+                SpinLockRelease(&s.lock);
+            }
         }
         if (outcome.action!=FlightAction::Copy) continue;
 
@@ -4819,7 +4847,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         field("congestion_waits",g_tcpSendProbeStats.congestionWaits);field("peer_window_waits",g_tcpSendProbeStats.peerWindowWaits);
         field("slot_capacity_waits",g_tcpSendProbeStats.slotWaits);field("call_drain_waits",g_tcpSendProbeStats.drainWaits);
         field("ack_samples",g_tcpSendProbeStats.samples);field("latest_ack_latency_ticks",g_tcpSendProbeStats.rttTicks);
-        field("resume_since_latest_ack_ticks",g_tcpSendProbeStats.resumeTicks);r.text("}\n");r.send();return;
+        field("resume_since_latest_ack_ticks",g_tcpSendProbeStats.resumeTicks);
+        field("worker_waits",g_tcpSendProbeStats.workerWaits);field("worker_waiter_displacements",g_tcpSendProbeStats.workerDisplacements);
+        field("acks_while_worker_displaced",g_tcpSendProbeStats.ackWhileWorkerDisplaced);
+        field("worker_at_or_after_wait_deadline",g_tcpSendProbeStats.workerDeadlineWakeups);r.text("}\n");r.send();return;
     }
     if (StrStartsWith(cmd,"bridge arp-probe ")) {
         const char* address=cmd+sizeof("bridge arp-probe ")-1;

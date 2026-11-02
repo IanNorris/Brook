@@ -69,7 +69,19 @@ seconds, with 36–41 aggregate local-busy observations per run. The earlier
 10 ms runs took 2.28–2.43 seconds with 54–62 busy observations. These grouped
 WAN tests are not an alternating or controlled network comparison, but provide
 no evidence that the shorter retry improves this workload. The experimental
-option was discarded. ACK waiter ownership remains a separate untested lead.
+option was discarded. ACK waiter ownership was a separate lead.
+
+An opt-in aggregate diagnostic subsequently confirmed that waiter replacement
+occurs on the Dell during the same 1 MiB HTTPS upload. Three runs took
+2.35–2.45 seconds and recorded 68–69 sender-waiter displacements and 97–171
+advancing ACKs after displacement in each run. Counts include concurrent
+connections, and the displacement flag stays set for the wait interval; they
+do not establish the current waiter at every ACK or quantify the delay caused.
+A host test verifies that an application poller can replace a sender waiter
+and receive the ACK wake instead. A delayed, lossy QEMU run also exercised the
+new counters. The next candidate should give the worker an independent waiter
+and compare it under the same workloads; the diagnostic itself changes no
+wake behavior.
 
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
