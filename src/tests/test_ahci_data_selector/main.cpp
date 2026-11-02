@@ -1,4 +1,4 @@
-#include "ahci_data_inspection.h"
+#include "ahci_data_reader.h"
 #include <cassert>
 #include <cstring>
 #include <fstream>
@@ -59,6 +59,37 @@ static int fixture(const char* path,const char* storePath,uint64_t dataCount) {
     assert(inspect(sb,table.data(),table.size()-1,out)==AhciDataInspectionState::Invalid && !out.data.entry);
     table[0]=0;
     assert(inspect(sb,table.data(),table.size(),out)==AhciDataInspectionState::Invalid && !out.data.entry);
+    if(base) {
+        struct Reader { std::ifstream disk; int reads=0, failAt=0; bool shortRead=false, dirty=false; uint64_t bytes=0; } reader;
+        reader.disk.open(path,std::ios::binary);
+        reader.bytes=sectors*512;
+        AhciDataReadIo io{&reader,[](void* context,uint64_t offset,void* buffer,uint32_t n)->int {
+            auto& r=*static_cast<Reader*>(context);++r.reads;
+            assert(offset<=r.bytes && n<=r.bytes-offset);
+            if(r.reads==r.failAt)return r.shortRead ? int(n-1) : -5;
+            r.disk.clear();r.disk.seekg(offset);r.disk.read(static_cast<char*>(buffer),n);
+            if(r.disk && r.dirty && r.reads==6)static_cast<uint8_t*>(buffer)[58]=0;
+            return r.disk ? int(n) : -5;
+        }};
+        std::vector<uint8_t> scratchEntries(1024*1024),scratchBackup(1024*1024),scratchGdt(4096*32);
+        auto readInspect=[&](){return AhciReadAndInspectBootData(io,boot,want,sectors,scratchEntries.data(),
+            scratchBackup.data(),scratchEntries.size(),scratchGdt.data(),scratchGdt.size(),out);};
+        assert(readInspect()==AhciDataInspectionState::Clean && out.data.entry==2 && reader.reads==7);
+        for(int failure=1;failure<=7;++failure)for(bool shortRead:{false,true}) {
+            reader.reads=0;reader.failAt=failure;reader.shortRead=shortRead;out.data.entry=99;
+            assert(readInspect()==AhciDataInspectionState::Invalid && !out.data.entry);
+        }
+        reader.reads=reader.failAt=0;
+        assert(AhciReadAndInspectBootData(io,boot,want,sectors,scratchEntries.data(),scratchBackup.data(),1,
+               scratchGdt.data(),scratchGdt.size(),out)==AhciDataInspectionState::Invalid && !out.data.entry);
+        reader.reads=0;
+        assert(AhciReadAndInspectBootData(io,boot,want,sectors,scratchEntries.data(),scratchBackup.data(),
+               scratchEntries.size(),scratchGdt.data(),1,out)==AhciDataInspectionState::Invalid && !out.data.entry);
+        reader.reads=0;reader.dirty=true;
+        assert(AhciReadAndInspectBootData(io,boot,want,sectors,scratchEntries.data(),scratchBackup.data(),
+               scratchEntries.size(),scratchGdt.data(),1,out)==AhciDataInspectionState::NeedsCheck &&
+               out.data.entry==2 && reader.reads==6);
+    }
     return 0;
 }
 int main(int argc,char** argv){

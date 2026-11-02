@@ -140,3 +140,12 @@ and formats ext2 inside its data partition with `mke2fs`, then validates the
 embedded filesystem at partition-relative offsets. The same check also passed
 on a sparse 18 GiB disk with a 17 GiB data partition. These are host-side file
 reads, not AHCI device, mount, filesystem write or durability tests.
+
+An unconnected exact-read adapter now obtains both GPT copies and, after
+selection, reads the superblock and descriptor table relative to the chosen
+partition. The embedded fixtures exercise the adapter as well as the pure
+inspection: injected errors and short reads fail closed at each of seven clean
+read steps, and an injected dirty header returns an offline-check candidate
+without reading the descriptor table. The caller must still pin disk identity,
+layout and contents; these host-file callbacks do not test an AHCI controller,
+exclusive ownership, mounting or writes.
