@@ -164,6 +164,19 @@ concurrent worker is introduced, a pending copy needs an explicit owned slot
 and generation-checked completion, and neighbor resolution must cease blocking
 the shared transport path. No asynchronous writes are enabled.
 
+IPv4 frame construction and submission for an already selected interface and
+MAC are now separated from route selection and blocking ARP resolution. The
+existing caller still performs ARP first, so this does not yet provide
+nonblocking resolution or alter traffic behavior. The helper requires a live
+interface and retains the existing synchronous driver transmit contract; it
+is not certified as a shared-worker operation. The review also identified an
+existing length-addition overflow in both NIC and loopback frame builders;
+both now reject payloads exceeding the Ethernet frame budget before adding
+header sizes. Hosted boundary checks cover 1,480, 1,481 and `UINT32_MAX`;
+the USB Ethernet QEMU loss and concurrency suite passed with normal traffic.
+Actual ARP miss scheduling, interface identity, retry and driver-lifetime
+behavior still need their own design and tests.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;

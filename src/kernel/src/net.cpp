@@ -582,6 +582,52 @@ static void NetSendStackWatermark(uint32_t dstIp, uint8_t proto, uint32_t payloa
     }
 }
 
+static bool NetIpv4PayloadFits(uint32_t payloadLen)
+{
+    return payloadLen <= ETH_FRAME_MAX - sizeof(EthHeader) - sizeof(Ipv4Header);
+}
+
+#ifndef BROOK_SOCKET_LIFETIME_TEST
+// Submit to an already selected interface and neighbor. This does not resolve
+// addresses or wait for an ARP reply. It retains the existing synchronous
+// NetIf::transmit contract; not every driver or loopback path has been audited
+// for use by a shared worker.
+static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
+                               uint32_t source, uint32_t dstIp, uint8_t proto,
+                               const void* payload, uint32_t payloadLen)
+{
+    if (!NetIpv4PayloadFits(payloadLen)) return -3;
+    uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
+    uint32_t frameLen = sizeof(EthHeader) + ipLen;
+    if (frameLen > ETH_FRAME_MAX) return -3;
+
+    alignas(16) uint8_t frame[ETH_FRAME_MAX];
+    memset(frame, 0, frameLen);
+    auto* eth = reinterpret_cast<EthHeader*>(frame);
+    eth->dst = dstMac;
+    eth->src = nif->mac;
+    eth->etherType = htons(ETH_TYPE_IPV4);
+
+    auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
+    ip->verIhl = 0x45;
+    ip->tos = 0;
+    ip->totalLen = htons(static_cast<uint16_t>(ipLen));
+    ip->id = htons(__atomic_fetch_add(&g_ipId, 1, __ATOMIC_RELAXED));
+    ip->flagsFrag = htons(0x4000);
+    ip->ttl = 64;
+    ip->protocol = proto;
+    ip->srcIp = source;
+    ip->dstIp = dstIp;
+    ip->checksum = 0;
+    ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
+    memcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
+
+    nif->txPackets++;
+    nif->txBytes += frameLen;
+    return nif->transmit(nif, frame, frameLen);
+}
+#endif
+
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
                           const void* payload, uint32_t payloadLen)
 {
@@ -600,6 +646,7 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
     // Connections to our physical interface address are delivered locally too.
     if (loopback || dstIp == nif->ipAddr)
     {
+        if (!NetIpv4PayloadFits(payloadLen)) return -3;
         uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
         uint32_t frameLen = sizeof(EthHeader) + ipLen;
         if (frameLen > ETH_FRAME_MAX) return -3;
@@ -650,37 +697,7 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
     if (!ArpResolve(nextHop, &dstMac))
         return -2; // ARP failed
 
-    // Build frame
-    uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
-    uint32_t frameLen = sizeof(EthHeader) + ipLen;
-    if (frameLen > ETH_FRAME_MAX) return -3;
-
-    alignas(16) uint8_t frame[ETH_FRAME_MAX];
-    memset(frame, 0, frameLen);
-
-    auto* eth = reinterpret_cast<EthHeader*>(frame);
-    eth->dst = dstMac;
-    eth->src = nif->mac;
-    eth->etherType = htons(ETH_TYPE_IPV4);
-
-    auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
-    ip->verIhl   = 0x45;
-    ip->tos      = 0;
-    ip->totalLen = htons(static_cast<uint16_t>(ipLen));
-    ip->id       = htons(__atomic_fetch_add(&g_ipId, 1, __ATOMIC_RELAXED));
-    ip->flagsFrag = htons(0x4000);
-    ip->ttl      = 64;
-    ip->protocol = proto;
-    ip->srcIp    = source;
-    ip->dstIp    = dstIp;
-    ip->checksum = 0;
-    ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
-
-    memcpy(frame + sizeof(EthHeader) + sizeof(Ipv4Header), payload, payloadLen);
-
-    nif->txPackets++;
-    nif->txBytes += frameLen;
-    return nif->transmit(nif, frame, frameLen);
+    return NetSendIpv4Resolved(nif,dstMac,source,dstIp,proto,payload,payloadLen);
 #endif
 }
 

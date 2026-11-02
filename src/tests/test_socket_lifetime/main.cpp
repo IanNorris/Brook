@@ -259,6 +259,7 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 }
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
+    assert(NetIpv4PayloadFits(1480) && !NetIpv4PayloadFits(1481) && !NetIpv4PayloadFits(~uint32_t(0)));
     {
         TcpSendFlightState invalid(17);assert(!invalid.Allocate());
         TcpSendFlightState empty(0);assert(!empty.Allocate());
