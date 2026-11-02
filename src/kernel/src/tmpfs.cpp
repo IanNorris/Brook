@@ -20,7 +20,10 @@ namespace brook
 namespace
 {
 uint64_t GlobalBytes = 256ULL * 1024 * 1024;
-constexpr uint64_t InstanceInodes = 1024, GlobalInodes = 16384, GlobalMounts = 128;
+// Metadata remains lazily allocated and charged against both byte budgets.
+// Allow ordinary application profiles more entries while keeping the global
+// inode bound and a per-mount ceiling on directory traversal work.
+constexpr uint64_t InstanceInodes = 4096, GlobalInodes = 16384, GlobalMounts = 128;
 constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, Socket = 0140000, TypeMask = 0170000;
 struct Node;
 struct Entry
@@ -706,7 +709,9 @@ int Space(Vnode *vn, VfsSpace *out)
     out->freeBlocks = out->availableBlocks =
         (instanceFree<aggregateFree?instanceFree:aggregateFree)/4096;
     out->files = InstanceInodes;
-    out->freeFiles = InstanceInodes - fs->inodes;
+    const uint64_t instanceFreeInodes=InstanceInodes-fs->inodes;
+    const uint64_t aggregateFreeInodes=GlobalInodes-globalUsage.inodes;
+    out->freeFiles = instanceFreeInodes<aggregateFreeInodes?instanceFreeInodes:aggregateFreeInodes;
     out->identity = fs->device;
     out->maxName = 255;
     out->flags = fs->flags;

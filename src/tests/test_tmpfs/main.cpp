@@ -626,15 +626,24 @@ int main()
     // Per-instance inode quota and exact reclamation.
     fs = make();
     r = root(fs);
-    for (unsigned i = 0; i < 1023; ++i)
+    Vnode* retained=nullptr;
+    for (unsigned i = 0; i < InstanceInodes - 1; ++i)
     {
         char name[24];
         snprintf(name, sizeof(name), "f%u", i);
         auto *v = create(r, name);
-        VfsClose(v);
+        if (!i) retained=v; else VfsClose(v);
     }
     int e = 0;
     assert(!r->ops->create(r, "full", VFS_O_WRITE, 0600, &e) && e == -28);
+    VfsSpace inodeSpace{};
+    assert(!Space(retained,&inodeSpace) && inodeSpace.files==InstanceInodes && !inodeSpace.freeFiles);
+    assert(!r->ops->remove(r,"f0",false));
+    assert(!Space(retained,&inodeSpace) && !inodeSpace.freeFiles);
+    VfsClose(retained);
+    auto *reused=create(r,"reused");
+    assert(!Space(reused,&inodeSpace) && !inodeSpace.freeFiles);
+    VfsClose(reused);
     VfsObjectRelease(r);
     assert(!TmpfsDestroy(fs));
     clean();
@@ -713,6 +722,8 @@ int main()
     aggregate.clear();
     for (unsigned i = 0; i < 17; ++i)
         aggregate.push_back(make());
+    auto *globalRoot=root(aggregate[0]);
+    auto *globalFile=create(globalRoot,"space-probe");
     std::vector<Node *> prepared;
     full = false;
     for (unsigned i = 0; i < 17000; ++i)
@@ -728,8 +739,13 @@ int main()
         prepared.push_back(n);
     }
     assert(full);
+    VfsSpace globalSpace{};
+    assert(!Space(globalFile,&globalSpace) && !globalSpace.freeFiles);
     for (auto *n : prepared)
         Drop(n);
+    assert(!Space(globalFile,&globalSpace) && globalSpace.freeFiles);
+    VfsClose(globalFile);
+    VfsObjectRelease(globalRoot);
     for (auto *f : aggregate)
         assert(!TmpfsDestroy(f));
     clean();

@@ -2846,3 +2846,18 @@ disabled and no driver fault was reported. Shutdown then stopped and retired
 the stream successfully, and recovery generation 94 was selected. These are
 functional short-stream checks, not proof of browser behavior, acoustic quality,
 long-duration continuity, or accurate volume.
+
+An isolated Firefox Web Audio attempt reached a suspended context and submitted
+no mixer frames; it therefore did not establish browser playback. Repeated
+temporary profiles exhausted `/tmp`'s 1,024-inode instance cap even with free
+bytes remaining, which also prevented the maintenance helper from creating its
+lock. Removing only the test profiles restored the slots. The per-instance cap
+is now 4,096, with the existing global inode and byte limits retained;
+`statfs` reports the lesser of instance and aggregate free inode counts.
+Hosted quota and retained-unlink tests passed. A QEMU guest and the Dell each
+created and removed 1,500 files, recovering the initial free inode count.
+On the Dell, a fresh Firefox profile used 449 inodes while open and 650 after
+exit; removing that test profile brought usage down to 11. This does not prove
+that every application fits or that large flat directories are fast: tmpfs
+directory lookup and enumeration still have linear traversal costs. Recovery
+generation 98 was selected and the candidate restart was requested.
