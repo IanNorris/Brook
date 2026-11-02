@@ -1809,7 +1809,16 @@ failure; the user heard no tone. Cleanup remuted and stopped the stream, and
 the failed test retained its pages. The next diagnostic runs the same sustained
 check while muted and records stream/status/clock failure details. The user
 requested a later two-second test with volume capped at 30%; that remains
-pending until sustained playback succeeds.
+pending until sustained playback succeeds. **Update 2026-11-02:** The
+sustained muted test exposed an LPIB value equal to the cyclic buffer length,
+which is valid at wraparound. After accepting that endpoint as position zero
+for comparisons, a physical 400 ms muted run completed with DMA retired and
+PCI command restored to zero. The subsequent two-second audible run also
+completed and the user heard it from the Dell's built-in speakers. Its PCM
+peak was capped at 30% of digital full scale, with a further -23.5 dB DAC
+attenuation; this is not a calibrated acoustic-volume percentage. The normal
+recovery boot was selected afterward. This one-shot test does not yet provide
+normal application audio, mixer controls, or evidence of long-running playback.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
