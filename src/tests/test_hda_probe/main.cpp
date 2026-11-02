@@ -3,6 +3,7 @@
 #include <cstring>
 #include <initializer_list>
 #include "../../drivers/intel_hda/hda_probe.h"
+#include "../../drivers/intel_hda/hda_probe_session.h"
 using namespace brook;
 struct Fake {
     uint8_t mem[4096]{};unsigned writes=0, pauses=0;bool timeout=false,staleStuck=false,clockAdvances=false;uint64_t clock=0;
@@ -21,6 +22,25 @@ struct Fake {
     void pause() {++pauses;}
 };
 static Fake idle() {Fake f{};f.set16(0,0x2100);f.mem[3]=1;f.set32(8,1);return f;}
+struct SessionFake:Fake {
+    bool prepareOk=true,validOk=true,denyEnable=false,denyRestore=false,mismatch=false,subsystemMismatch=false;
+    uint16_t pciCommand=0;unsigned commandWrites=0,unsafeCommandWrites=0;
+    unsigned issued=0,timeoutAt=0;
+    bool prepare(){return prepareOk;}bool valid(){return validOk;}
+    uint16_t command(){return pciCommand;}
+    void setCommand(uint16_t value){++commandWrites;if(value!=0 && value!=2)++unsafeCommandWrites;
+        if((value==2 && !denyEnable) || (value==0 && !denyRestore))pciCommand=value;}
+    void write16(unsigned o,uint16_t v){
+        if(o==0x68 && v==1){const auto command=read32(0x60);const unsigned verb=(command>>8)&0xfff;
+            const unsigned nid=(command>>20)&0x7f,param=command&0xff;
+            if(++issued==timeoutAt)timeout=true;
+            if(verb==0xf00 && nid==0 && param==0)set32(0x64,mismatch?0x12345678:0x10ec0288);
+            else if(verb==0xf20 && nid==1)set32(0x64,subsystemMismatch?0x10280000:0x10280665);
+            else set32(0x64,0x1234);}
+        Fake::write16(o,v);
+    }
+};
+static SessionFake sessionIdle(){SessionFake f{};f.set16(0,0x2100);f.mem[3]=1;f.set32(8,1);return f;}
 int main() {
     uint64_t base=0;HdaProbePci pci{0x8086,0x9ca0,0x1028,0x0665,0,0x1b,0,4,3,0xf7418004,0};
     assert(HdaProbePciCheck(pci,base)==HdaProbeResult::Ready && base==0xf7418000);
@@ -58,5 +78,17 @@ int main() {
      assert(probe.read(0,0,0xf00,0,reply)==HdaProbeResult::Timeout && f.pauses<100 && f.clock>=50);}
     {auto f=idle();f.set16(0x68,2);f.staleStuck=true;HdaReadOnlyProbe<Fake> probe(f);assert(probe.inspect(state)==HdaProbeResult::Ready);
      assert(probe.read(0,0,0xf00,0,reply)==HdaProbeResult::Timeout && f.writes==1);}
+    {auto f=sessionIdle();f.prepareOk=false;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::Unprepared && !f.commandWrites && !f.writes);}
+    {auto f=sessionIdle();f.validOk=false;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::Unprepared && !f.commandWrites && !f.writes);}
+    {auto f=sessionIdle();f.pciCommand=4;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CommandNotIdle && !f.commandWrites && !f.writes);}
+    {auto f=sessionIdle();f.pciCommand=0xffff;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CommandNotIdle && !f.commandWrites && !f.writes);}
+    {auto f=sessionIdle();f.denyEnable=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::DecodeEnableFailed && f.commandWrites==2 && !f.writes && !f.unsafeCommandWrites);}
+    {auto f=sessionIdle();f.set32(8,0);auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::InspectionFailed && r.probe==HdaProbeResult::ControllerReset && f.pciCommand==0 && !f.writes);}
+    {auto f=sessionIdle();f.mismatch=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecMismatch && r.completed==0 && f.pciCommand==0);}
+    {auto f=sessionIdle();f.subsystemMismatch=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecMismatch && r.completed==0 && f.pciCommand==0);}
+    {auto f=sessionIdle();auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::Complete && r.completed==12 && f.pciCommand==0 && f.commandWrites==2 && !f.unsafeCommandWrites);}
+    {auto f=sessionIdle();f.timeout=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.probe==HdaProbeResult::Timeout && f.pciCommand==0);}
+    {auto f=sessionIdle();f.timeoutAt=6;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.completed==2 && f.issued==6 && f.pciCommand==0);}
+    {auto f=sessionIdle();f.denyRestore=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::RestoreFailed && f.pciCommand==2);}
     std::puts("HDA probe: PASS");
 }

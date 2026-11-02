@@ -1740,10 +1740,18 @@ driver, does not inspect mixer enable state, and does not establish playback.
 The first non-playing HDA probe's identity, idle-admission and GET-only
 immediate-command logic is also host-tested with fake registers. It rejects
 active DMA rings, active streams, interrupts, busy transport, unsupported
-devices and SET verbs; timeout disables further commands. It is not wired to
-PCI or MMIO. Before any physical use, BAR extent and memory-type alias safety,
+devices and SET verbs; timeout disables further commands. An opt-in boot-time
+session now wires this probe to PCI and MMIO, but has only been exercised with
+host fixtures and an unsupported-device QEMU boot. Before any physical use,
+BAR extent and memory-type alias safety,
 exclusive ownership, temporary memory decoding and cleanup still need to be
 established; a timeout does not prove a codec command was cancelled.
+The opt-in session rejects incomplete PCI inventory, malformed BAR metadata,
+active controller state and known BAR bases inside the HDA aperture. This
+base-only scan cannot detect a resource beginning below the aperture and
+extending into it, so physical execution remains gated on checking complete
+resource extents and the matching live inventory. A fresh QEMU boot rejected
+its unrelated virtual device before mapping; it does not validate Dell MMIO.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

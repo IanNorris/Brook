@@ -19,6 +19,7 @@
 #include "acpi.h"
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
+#include "hda_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include "../../drivers/intel_hda/hda_probe.h"
@@ -119,6 +120,21 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(status.completed){r.text(",\"result\":");r.quoted(I2cProbeResult(status.result));
             if(status.result==DellI2cIdResult::Identified || status.result==DellI2cIdResult::Unknown){r.text(",");r.field("value",status.value);}}
         r.text(",\"pci_extent_ownership\":\"unresolved\"}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware dell-hda-observe")) {
+        const auto& o=HdaObserveRead();const auto& s=o.session;
+        Reply r;r.text("{\"hda_observe_api\":1,\"requested\":");r.text(o.requested?"true":"false");
+        r.text(",\"attempted\":");r.text(o.attempted?"true":"false");r.text(",\"mapped\":");r.text(o.mapped?"true":"false");
+        r.text(",\"reason\":");r.quoted(o.reason);r.text(",");r.field("base",o.base);
+        r.text(",");r.field("result",uint8_t(s.result));r.text(",");r.field("probe",uint8_t(s.probe));
+        r.text(",");r.field("command_before",s.before);r.text(",");r.field("command_enabled",s.enabled);r.text(",");r.field("command_after",s.after);
+        r.text(",");r.field("gcap",s.controller.gcap);r.text(",");r.field("gctl",s.controller.gctl);r.text(",");r.field("interrupts",s.controller.interrupts);
+        r.text(",");r.field("state",s.controller.state);r.text(",");r.field("corb",s.controller.corb);r.text(",");r.field("rirb",s.controller.rirb);
+        r.text(",");r.field("immediate",s.controller.immediate);r.text(",");r.field("streams",s.controller.streams);
+        r.text(",");r.field("vendor",s.vendor);r.text(",");r.field("revision",s.revision);r.text(",");r.field("subsystem",s.subsystem);
+        r.text(",");r.field("completed",s.completed);r.text(",\"values\":[");
+        for(unsigned i=0;i<s.completed && i<12;++i){if(i)r.text(",");r.number(s.values[i]);}
+        r.text("]}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-memory")) {
         // Fixed identity only, using immutable boot PCI metadata. This reports

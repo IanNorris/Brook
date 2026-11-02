@@ -11,6 +11,7 @@
 #include "acpi.h"
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
+#include "hda_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include <cassert>
@@ -22,6 +23,8 @@ unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 bool audioProbePresent=false,hdaPciPresent=false;
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
+HdaObservation hdaObservation{};
+const HdaObservation& HdaObserveRead(){return hdaObservation;}
 DellI2cIdResult DellI2cIdProbe(uint32_t& value){value=0;return DellI2cIdResult::Disabled;}
 DellI2cIdStatus DellI2cIdProbeStatus(){return {};}
 bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
@@ -123,6 +126,10 @@ int main(){
     assert(handle("bridge hardware dell-i2c-id start") && reply.find("\"result\":\"disabled\"")!=std::string::npos);
     assert(handle("bridge hardware dell-i2c-id status") && reply.find("\"started\":false")!=std::string::npos);
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
+    assert(handle("bridge hardware dell-hda-observe") && reply.find("\"requested\":false")!=std::string::npos);
+    brook::hdaObservation.requested=true;brook::hdaObservation.session.completed=2;
+    brook::hdaObservation.session.values[0]=123;brook::hdaObservation.session.values[1]=456;
+    assert(handle("bridge hardware dell-hda-observe") && reply.find("\"values\":[123,456]")!=std::string::npos);
     assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":false")!=std::string::npos);
     hdaPciPresent=true;
     assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":true")!=std::string::npos &&

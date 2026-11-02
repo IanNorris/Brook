@@ -271,6 +271,7 @@ add_executable(kernel
     src/display.cpp
     src/display_power.cpp
     src/ahci_observe.cpp
+    src/hda_observe.cpp
     src/ahci_readonly.cpp
     src/ahci_system_volume.cpp
     src/ssd_install_qemu.cpp

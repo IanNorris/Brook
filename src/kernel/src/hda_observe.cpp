@@ -1,0 +1,146 @@
+#include "hda_observe.h"
+#include "pci.h"
+#include "vfs.h"
+#include "serial.h"
+#include "cpu.h"
+#include "smp.h"
+#include "apic.h"
+#include "memory/virtual_memory.h"
+#include "memory/physical_memory.h"
+
+namespace brook {
+namespace {
+HdaObservation observation{};
+volatile uint8_t* registers=nullptr; // borrowed page; intentionally boot-lifetime
+constexpr uint64_t Aperture=16384,Page=4096;
+
+bool SafeBootRange(const BootProtocol* boot,uint64_t base) {
+    if(!boot || (boot->memoryMapCount && !boot->memoryMap) || boot->memoryMapCount>4096 ||
+       !base || (base&(Aperture-1)) || base>~uint64_t{0}-Aperture)return false;
+    for(uint32_t i=0;i<boot->memoryMapCount;++i) {
+        const auto& d=boot->memoryMap[i];
+        if(d.pageCount>(~uint64_t{0}-d.physicalStart)/Page)return false;
+        const uint64_t end=d.physicalStart+d.pageCount*Page;
+        if(d.physicalStart>=base+Aperture || end<=base)continue;
+        if(d.type!=MemoryType::Mmio && d.type!=MemoryType::Reserved)return false;
+    }
+    return true;
+}
+bool OtherBarStartsClear(uint64_t base) {
+    if(PciBootInventorySeen()!=PciBootInventoryCount())return false;
+    for(uint32_t i=0;i<PciBootInventoryCount();++i) {
+        PciBootEntry e{};if(!PciBootInventoryRead(i,&e))return false;
+        const auto& d=e.device;
+        if(d.bus==0 && d.dev==0x1b && d.fn==0)continue;
+        const uint8_t header=e.headerType&0x7f;
+        // Type 1 bridge BARs are real resources too; the remaining header
+        // registers describe bridge windows, not BARs. Reject unknown types.
+        const unsigned bars=header==0?6:header==1?2:header==2?1:0;
+        if(!bars)return false;
+        for(unsigned n=0;n<bars;++n) {
+            const uint32_t bar=d.bar[n];
+            if(bar==0xffffffff)return false;
+            if(!bar || (bar&1))continue;
+            if((bar&6)==6)return false;
+            uint64_t address=bar&~uint32_t(15);
+            if((bar&6)==4) {
+                if(n+1>=bars || d.bar[n+1]==0xffffffff)return false;
+                address|=uint64_t(d.bar[++n])<<32;
+            }
+            if(address>=base && address<base+Aperture)return false;
+        }
+    }
+    // BAR sizes of other devices are not available here; this is only a
+    // known-base conflict check, not a complete PCI resource allocator.
+    return true;
+}
+bool CacheCompatible(uint64_t base) {
+    if(SmpCurrentCpuIndex()!=0)return false;
+    for(unsigned i=0;i<4;++i) {
+        const uint64_t page=base+i*Page;
+        KernelAliasMapping identity{},direct{};
+        if(!VmmInspectKernelAliases(page,identity,direct) || !identity.present || !direct.present ||
+           identity.physical!=page || direct.physical!=page || identity.patIndex!=0 || direct.patIndex!=0)return false;
+        CpuMemoryTypeObservation type{};
+        if(!CpuObserveMemoryTypes(page,page,type) || type.cpu!=0 || type.patSlot0!=6 ||
+           type.cacheDisabled || type.notWriteThrough || type.page0.type!=0)return false;
+    }
+    return true;
+}
+bool PowerD0(const PciDevice& d) {
+    if(!(PciConfigRead16(d.bus,d.dev,d.fn,6)&0x10))return false;
+    uint8_t cap=PciConfigRead8(d.bus,d.dev,d.fn,0x34);uint64_t seen=0;
+    for(unsigned n=0;n<48 && cap;++n) {
+        if(cap<0x40 || (cap&3) || cap>0xf8)return false;
+        const uint64_t bit=uint64_t(1)<<(cap/4);if(seen&bit)return false;seen|=bit;
+        const uint8_t id=PciConfigRead8(d.bus,d.dev,d.fn,cap);
+        if(id==1)return (PciConfigRead16(d.bus,d.dev,d.fn,cap+4)&3)==0;
+        cap=PciConfigRead8(d.bus,d.dev,d.fn,cap+1);
+    }
+    return false;
+}
+volatile uint8_t* MapBorrowed(uint64_t physical) {
+    const auto address=VmmAllocPages(1,VMM_WRITABLE|VMM_NO_EXEC,MemTag::Device,KernelPid);
+    if(!address)return nullptr;
+    const uint64_t leaf=VmmDetachPage(KernelPageTable,address);
+    if(!leaf){VmmFreePages(address,1);return nullptr;}
+    PmmFreePage(VmmLeafPhysical(leaf)); // fresh, unpublished RAM leaf only
+    if(!VmmMapPage(KernelPageTable,address,PhysicalAddress(physical),
+                   VMM_WRITABLE|VMM_NO_EXEC|VMM_CACHE_DISABLE|VMM_WRITE_THRU,MemTag::Device,KernelPid)) {
+        VmmFreePages(address,1);return nullptr;
+    }
+    // Never free this VA with VmmFreePages: its leaf is borrowed device MMIO.
+    return reinterpret_cast<volatile uint8_t*>(address.raw());
+}
+struct Io {
+    const BootProtocol* boot;PciBootEntry entry{};uint64_t base=0;
+    bool liveIdentity() {
+        const auto& d=entry.device;
+        const uint32_t classRevision=PciConfigRead32(d.bus,d.dev,d.fn,8);
+        if(PciConfigRead32(d.bus,d.dev,d.fn,0)!=0x9ca08086 ||
+           PciConfigRead32(d.bus,d.dev,d.fn,0x2c)!=0x06651028 ||
+           (classRevision>>16)!=0x0403 ||
+           (PciConfigRead8(d.bus,d.dev,d.fn,0x0e)&0x7f)!=0 ||
+           PciConfigRead32(d.bus,d.dev,d.fn,0x10)!=d.bar[0] ||
+           PciConfigRead32(d.bus,d.dev,d.fn,0x14)!=d.bar[1])return false;
+        return PowerD0(d);
+    }
+    bool prepare() {
+        if(SmpCurrentCpuIndex()!=0){observation.reason="not boot CPU";return false;}
+        bool found=false;
+        for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};if(!PciBootInventoryRead(i,&e))continue;
+            const auto& d=e.device;HdaProbePci p{d.vendorId,d.deviceId,e.subsystemVendor,e.subsystemDevice,
+                d.bus,d.dev,d.fn,d.classCode,d.subclass,d.bar[0],d.bar[1]};uint64_t b=0;
+            if((e.headerType&0x7f)==0 && HdaProbePciCheck(p,b)==HdaProbeResult::Ready){entry=e;base=b;found=true;break;}}
+        if(!found){observation.reason="target absent";return false;}
+        observation.base=base;
+        if(!SafeBootRange(boot,base) || !OtherBarStartsClear(base)){observation.reason="unsafe aperture";return false;}
+        if(!liveIdentity() || command()!=0){observation.reason="PCI identity, power or command changed";return false;}
+        if(!CacheCompatible(base)){observation.reason="cache aliases not verified";return false;}
+        registers=MapBorrowed(base);if(!registers){observation.reason="mapping failed";return false;}
+        observation.mapped=true;return true;
+    }
+    bool valid(){return SmpCurrentCpuIndex()==0 && liveIdentity() && CacheCompatible(base);}
+    uint16_t command(){return PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4);}
+    void setCommand(uint16_t value){PciConfigWrite32(entry.device.bus,entry.device.dev,entry.device.fn,4,value);}
+    uint8_t read8(uint32_t offset){return *reinterpret_cast<volatile uint8_t*>(registers+offset);}
+    uint16_t read16(uint32_t offset){return *reinterpret_cast<volatile uint16_t*>(registers+offset);}
+    uint32_t read32(uint32_t offset){return *reinterpret_cast<volatile uint32_t*>(registers+offset);}
+    void write16(uint32_t offset,uint16_t value){*reinterpret_cast<volatile uint16_t*>(registers+offset)=value;}
+    void write32(uint32_t offset,uint32_t value){*reinterpret_cast<volatile uint32_t*>(registers+offset)=value;}
+    uint64_t ticks(){return ApicTickCount();}
+    void pause(){__asm__ volatile("pause");}
+};
+}
+void HdaObserveConfigure(const BootProtocol* boot) {
+    if(observation.attempted)return;
+    auto* marker=VfsOpen("/etc/dell-hda-observe");if(!marker)return;VfsClose(marker);
+    observation.requested=true;observation.attempted=true;observation.reason="prepared";
+    Io io{boot};observation.session=HdaProbeDellSession(io);
+    if(observation.session.result!=HdaSessionResult::Unprepared)observation.reason="transaction attempted";
+    SerialPrintf("HDA_OBSERVE result=%u probe=%u before=0x%x enabled=0x%x after=0x%x reason=%s\n",
+        unsigned(observation.session.result),unsigned(observation.session.probe),unsigned(observation.session.before),
+        unsigned(observation.session.enabled),unsigned(observation.session.after),observation.reason);
+}
+const HdaObservation& HdaObserveRead(){return observation;}
+}
