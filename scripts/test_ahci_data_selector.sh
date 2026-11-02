@@ -11,9 +11,13 @@ printf 'label: gpt\nunit: sectors\n\nstart=2048,size=8192,type=uefi\nstart=16384
 # Partition starts at 8 MiB and contains 16 MiB / 4096 = 4096 blocks.
 mke2fs -q -t ext2 -F -b 4096 -I 128 -N 1024 -m 0 \
     -O none,filetype,sparse_super,large_file -E offset=8388608 "$disk" 4096
+# Check the filesystem independently of Brook's parser. e2fsck accepts a
+# filesystem image but not an offset, so copy only this small test partition.
+dd if="$disk" of="$tmp/data.img" bs=4096 skip=2048 count=4096 status=none
+e2fsck -fn "$tmp/data.img" > "$tmp/e2fsck.log" 2>&1
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -iquote "$root/src/kernel/src" \
     "$root/src/tests/test_ahci_data_selector/main.cpp" -o "$tmp/test"
 "$tmp/test"
 "$tmp/test" "$disk" "$disk"
 sfdisk --verify "$disk" > "$tmp/verify.log"
-echo 'AHCI data selector synthetic and embedded GPT/ext2 fixtures passed'
+echo 'AHCI data selector and independently checked GPT/ext2 fixture passed'
