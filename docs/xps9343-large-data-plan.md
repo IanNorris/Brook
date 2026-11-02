@@ -63,6 +63,10 @@ passed, as did `e2fsck -fn`. This establishes geometry only: the helper is not
 wired into boot or a complete bitmap/inode-table validator, and has not been
 tested on the Dell.
 
+`bash scripts/test_large_ext2_helpers.sh` recreates the sparse 17 GiB fixture,
+runs the geometry/header and timestamp host tests, and checks the fixture with
+`e2fsck -fn`. It deletes only its own temporary files on exit.
+
 The unconnected helper also checks each classic group descriptor's bitmap and
 full 128-byte-inode-table placement and overlap, plus basic counter bounds.
 Synthetic corruption and partial-group tests pass, as does the 17 GiB fixture.
