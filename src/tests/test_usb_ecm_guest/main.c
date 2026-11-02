@@ -64,6 +64,11 @@ int main(int argc,char** argv){
         if(send(tcp,pages+4093,6,0)!=-1 || errno!=EFAULT)return fail("cross-page send fault");
         memset(pages+4096-1200,'X',1200);
         if(send(tcp,pages+4096-1200,1201,0)!=1200)return fail("partial user send fault");
+        memset(pages+4096-1200,'V',1200);
+        struct iovec faultVector[3]={{(void*)-1,0},{pages+4096-1200,1200},{pages+4096,1}};
+        if(writev(tcp,faultVector,3)!=1200)return fail("partial vectored send fault");
+        struct iovec overflowVector[2]={{pages,(size_t)0x7fffffffffffffffULL},{pages,1}};
+        errno=0;if(writev(tcp,overflowVector,2)!=-1 || errno!=EINVAL)return fail("vectored length overflow");
         if(munmap(pages,8192))return fail("user copy unmap");
         if(send(tcp,"send",4,0)!=4 || writev(tcp,vector,2)!=6 || sendmsg(tcp,&message,0)!=8)return fail("user send paths");
         if(exact(tcp,reply,18,0) || memcmp(reply,"sendwritevmultiiov",18))return fail("user send paths echo");

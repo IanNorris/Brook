@@ -46,7 +46,7 @@ def echo_tcp():
    for p in range(8):
     b=exact(s,32768);assert b==bytes((i*13+p*7)%251 for i in range(32768));s.sendall(b)
    if args.send_user_copy:
-    b=exact(s,1218);assert b==b'X'*1200+b'sendwritevmultiiov';s.sendall(b[1200:])
+    b=exact(s,2418);assert b==b'X'*1200+b'V'*1200+b'sendwritevmultiiov';s.sendall(b[2400:])
    if args.send_concurrency:
     b=exact(s,8192);assert b in (b'A'*4096+b'B'*4096,b'B'*4096+b'A'*4096);s.sendall(b)
    if args.send_close_race:

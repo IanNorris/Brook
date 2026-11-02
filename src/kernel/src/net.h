@@ -424,6 +424,9 @@ int  SockRecvFrom(int sockIdx, void* buf, uint32_t len,
 // SockSend accepts a trusted kernel buffer; SockSendUser stages user memory.
 int  SockSend(int sockIdx, const void* buf, uint32_t len);
 int  SockSendUser(int sockIdx, uint64_t address, uint32_t len);
+struct TcpSendVector { uint64_t base, length; };
+// Descriptors are a stable kernel snapshot; payload pointers address user memory.
+int  SockSendUserVector(int sockIdx, const TcpSendVector* vectors, unsigned count, uint32_t len);
 // Destination must be resident kernel memory. The receive-ring copy holds a
 // spinlock; syscall callers stage bytes here and fault-aware copy to userspace
 // only after return.

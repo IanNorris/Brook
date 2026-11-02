@@ -4772,6 +4772,24 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
         return UnixRecordVectorIo(entry,iovAddr,iovcnt,true);
     if(entry->type==FdType::UnixSocket && static_cast<UnixSocketData*>(entry->handle)->socketType==1)
         return UnixStreamWriteVector(entry,iovAddr,iovcnt);
+    if(entry->type==FdType::Socket && entry->handle) {
+        const int sockIdx=static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle))-1;
+        if(brook::SockIsStream(sockIdx)) {
+            static_assert(sizeof(brook::TcpSendVector)==sizeof(iovec), "iovec ABI mismatch");
+            auto* vectors=static_cast<brook::TcpSendVector*>(kmalloc(iovcnt ? iovcnt*sizeof(brook::TcpSendVector) : 1));
+            if(!vectors)return -ENOMEM;
+            if(iovcnt && !CopyFromUser(vectors,iovAddr,iovcnt*sizeof(*vectors))) { kfree(vectors);return -EFAULT; }
+            uint64_t total=0;
+            for(uint64_t i=0;i<iovcnt;++i) {
+                if(vectors[i].length>0x7fffffffffffffffULL-total) { kfree(vectors);return -EINVAL; }
+                total+=vectors[i].length;
+            }
+            const uint32_t bytes=static_cast<uint32_t>(total>0x7ffff000ULL ? 0x7ffff000ULL : total);
+            const int result=bytes ? brook::SockSendUserVector(sockIdx,vectors,static_cast<unsigned>(iovcnt),bytes) : 0;
+            kfree(vectors);
+            return result;
+        }
+    }
     if(FdPipe(entry) && (entry->statusFlags&0x4000))
         return PipeVectorIo(proc,entry,fd,iovAddr,iovcnt,true);
     if (entry->type == FdType::Vnode && entry->handle && (entry->statusFlags & 0x400)) {

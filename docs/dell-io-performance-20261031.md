@@ -590,6 +590,29 @@ packet sender; the result must not be projected onto the experimental
 adaptive flight or workloads that use separate writes. Profiling real
 applications' vector sizes is needed before prioritizing a kernel change.
 
+A candidate changes TCP `writev` to snapshot the descriptors and use one
+existing sender operation across them. Its retained MSS buffers are still
+copied before sequence reservation and retained until acknowledged; it does
+not introduce asynchronous returns. On the Dell with the opt-in adaptive
+16-slot sender, RX-8/TX-16 and 1,200-byte egress, three interleaved 4 MiB
+`writev` runs took 0.258, 0.257 and 0.259 seconds; three `sendmsg` runs took
+0.265, 0.280 and 0.261 seconds. All six hashes matched and no calls returned
+short. The earlier 4.08-second recovery runs used a different kernel and
+sender mode, so their ratio is not a controlled speedup. Previously measured
+4 KiB scalar writes on a similar 16-slot configuration took about 1.02 seconds,
+but also used a different kernel and call shape. Real application impact,
+WAN behavior and fairness remain unmeasured. Generation 114 recovery was
+selected after the test; the physical speaker output was disabled throughout.
+
+Hosted tests exercised cross-vector copying, zero-length entries, address
+overflow, and faults before and after a completed MSS in both sender modes.
+The QEMU USB Ethernet suite passed for the default sender and for the 16-slot
+candidate with a 10 ms buffer, a controlled packet drop, concurrent writers,
+close stress and user-copy faults. That is not an exhaustive proof of socket
+lifetime or network behavior under arbitrary loss. Astra reviewed the diff and
+found no blocking defect; descriptor scanning is linear per staged MSS and
+may warrant profiling with unusually large vector counts.
+
 The comparison uses `tcp_send_chunks.c` with `4096 writev 4` or
 `4096 sendmsg 4`; its existing single-send mode remains available. The host
 loopback smoke check also passed all three modes with matching hashes.

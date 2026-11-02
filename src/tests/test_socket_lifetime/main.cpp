@@ -254,6 +254,18 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 }
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
+    {
+        const char a[]="abc",b[]="defgh";
+        TcpSendVector vectors[]={{reinterpret_cast<uint64_t>(a),3},{~uint64_t(0),0},
+                                 {reinterpret_cast<uint64_t>(b),5}};
+        TcpSendSource source{nullptr,true,vectors,3};char out[8]{};
+        assert(source.Copy(reinterpret_cast<uint8_t*>(out),1,6));
+        assert(!memcmp(out,"bcdefg",6));
+        assert(!source.Copy(reinterpret_cast<uint8_t*>(out),7,2));
+        TcpSendVector bad[]={{~uint64_t(0),2}};
+        TcpSendSource badSource{nullptr,true,bad,1};
+        assert(!badSource.Copy(reinterpret_cast<uint8_t*>(out),1,1));
+    }
     // A caller needing ownership must distinguish a retained socket from a
     // slot already entering final close; an RX borrow is not that guarantee.
     assert(!SockTryRef(-1) && !SockTryRef(MAX_SOCKETS));
@@ -507,6 +519,56 @@ int main() {
     assert(capturedDataCount==2 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 && ticks==1);
     assert(g_sockets[i].tcpSndUna==1082 && g_sockets[i].tcpSndNxt==1082);
     g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // One vectored send fills MSS slots across boundaries in both sender
+    // modes. An empty vector may have an invalid base without being read.
+    for (bool flight : {false,true}) {
+        waiter=new Process{};waiter->refCount=1;
+        i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+        g_tcpTwoPacketFlight=flight;acknowledgeDataCount=2;capturedDataCount=0;
+        uint8_t a[300]{},b[772]{};
+        TcpSendVector v[]={{reinterpret_cast<uint64_t>(a),sizeof(a)},{~uint64_t(0),0},
+                           {reinterpret_cast<uint64_t>(b),sizeof(b)}};
+        assert(SockSendUserVector(i,v,3,1072)==1072);
+        assert(capturedDataCount==2 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546);
+        g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    }
+    // A failure in the next vector cannot reserve its slot; the preceding
+    // acknowledged slot is returned as partial progress.
+    for (bool flight : {false,true}) {
+        waiter=new Process{};waiter->refCount=1;
+        i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+        g_tcpTwoPacketFlight=flight;acknowledgeDataCount=1;failUserCopyAfter=1;
+        uint8_t a[536]{},b[536]{};
+        TcpSendVector v[]={{reinterpret_cast<uint64_t>(a),sizeof(a)},
+                           {reinterpret_cast<uint64_t>(b),sizeof(b)}};
+        assert(SockSendUserVector(i,v,2,1072)==536);
+        assert(g_sockets[i].tcpSndNxt==546);
+        failUserCopyAfter=-1;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    }
+    // A retry uses the retained vector bytes, not the modified user source.
+    for (bool flight : {false,true}) {
+        waiter=new Process{};waiter->refCount=1;
+        i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+        g_tcpTwoPacketFlight=flight;uint8_t value=3;stagedPayloadCount=0;
+        mutateUserOnSend=&value;skipDataAcks=1;acknowledgeDataCount=1;
+        TcpSendVector v[]={{reinterpret_cast<uint64_t>(&value),1}};
+        assert(SockSendUserVector(i,v,1,1)==1);
+        assert(value==9 && stagedPayloadCount==2 && stagedPayloads[0]==3 && stagedPayloads[1]==3);
+        mutateUserOnSend=nullptr;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    }
+    // A fault after a valid prefix within the same MSS must discard the
+    // unfinished slot, without reserving or transmitting any of that prefix.
+    for (bool flight : {false,true}) {
+        waiter=new Process{};waiter->refCount=1;
+        i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+        g_tcpTwoPacketFlight=flight;capturedDataCount=0;failUserCopyAfter=1;
+        uint8_t a[300]{},b[236]{};
+        TcpSendVector v[]={{reinterpret_cast<uint64_t>(a),sizeof(a)},
+                           {reinterpret_cast<uint64_t>(b),sizeof(b)}};
+        assert(SockSendUserVector(i,v,2,536)==-14);
+        assert(capturedDataCount==0 && g_sockets[i].tcpSndNxt==10);
+        failUserCopyAfter=-1;g_tcpTwoPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    }
     // Four-slot control: cumulative ACK after all four submissions, and local
     // EAGAIN at each position must retry the same range without a hole.
     for(unsigned failAt=0;failAt<=4;++failAt){

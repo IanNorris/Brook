@@ -3107,11 +3107,41 @@ public:
     TcpSendOwnership& operator=(const TcpSendOwnership&) = delete;
 };
 
+struct TcpSendSource {
+    const uint8_t* data;
+    bool fromUser;
+    const TcpSendVector* vectors;
+    unsigned count;
+
+    bool Copy(uint8_t* destination, uint32_t offset, uint32_t length) const {
+        if (!vectors) {
+            uint64_t address;
+            if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(offset), &address)) return false;
+            if (fromUser) return CopyFromUser(destination, address, length);
+            memcpy(destination, reinterpret_cast<const void*>(address), length);
+            return true;
+        }
+        uint64_t skip = offset;
+        for (unsigned i = 0; i < count && length; ++i) {
+            if (skip >= vectors[i].length) { skip -= vectors[i].length; continue; }
+            const uint64_t available = vectors[i].length - skip;
+            const uint32_t part = available < length ? static_cast<uint32_t>(available) : length;
+            uint64_t address;
+            if (__builtin_add_overflow(vectors[i].base, skip, &address) ||
+                !CopyFromUser(destination, address, part)) return false;
+            destination += part;
+            length -= part;
+            skip = 0;
+        }
+        return length == 0;
+    }
+};
+
 // Call-local retained flight. Every exit either retires all reservations or
 // closes the stream before their payloads leave scope. The deliberately small
 // limit is an experiment, not a complete congestion-control implementation.
-static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
-                                  uint32_t len, bool fromUser, uint32_t mss,
+static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& source,
+                                  uint32_t len, uint32_t mss,
                                   uint64_t deadline, unsigned initialLimit, bool adaptive)
 {
     struct Slot {
@@ -3281,17 +3311,10 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             if (chunk > credit) chunk = credit;
             SpinLockRelease(&s.lock);
             Slot& slot = slots[(head + count) % capacity];
-            uint64_t source;
-            if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(reserved), &source)) {
+            if (!source.Copy(slot.bytes, reserved, chunk)) {
                 if (count) { deferredError = -14; continue; }
                 return finish(-14);
             }
-            if (fromUser) {
-                if (!CopyFromUser(slot.bytes, source, chunk)) {
-                    if (count) { deferredError = -14; continue; }
-                    return finish(-14);
-                }
-            } else memcpy(slot.bytes, reinterpret_cast<const void*>(source), chunk);
             if (TcpSendInterrupted(self)) return finish(-4);
             if (ApicTickCount() >= deadline) return finish(-110);
 
@@ -3336,7 +3359,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
     }
 }
 
-static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUser)
+static int SockSendImpl(int sockIdx, const TcpSendSource& source, uint32_t len)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
     Process* self = SchedulerCurrentProcess();
@@ -3359,12 +3382,11 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
         return -104; // ECONNRESET
     }
 
-    const uint8_t* data = static_cast<const uint8_t*>(buf);
     uint32_t sent = 0;
     uint8_t staged[ETH_MTU];
     if (!mss || mss > sizeof(staged)) return -22;
     if ((g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
-        return TcpSendPacketFlight(s, self, data, len, fromUser, mss, deadline,
+        return TcpSendPacketFlight(s, self, source, len, mss, deadline,
                                    g_tcpAdaptiveFlight ? (g_tcpAdaptiveFlight16?16:8) : g_tcpFourPacketFlight ? 4 : 2,
                                    g_tcpAdaptiveFlight);
 
@@ -3378,15 +3400,7 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
 
         // Keep the transmitted bytes stable through the ACK/retry cycle.
         // Stage before reserving sequence space so faults cannot leave a gap.
-        uint64_t source;
-        if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(sent), &source))
-            return sent ? static_cast<int>(sent) : -14;
-        if (fromUser) {
-            if (!CopyFromUser(staged, source, chunk))
-                return sent ? static_cast<int>(sent) : -14;
-        } else {
-            memcpy(staged, reinterpret_cast<const void*>(source), chunk);
-        }
+        if (!source.Copy(staged, sent, chunk)) return sent ? static_cast<int>(sent) : -14;
 
         if (TcpSendInterrupted(self)) return sent ? static_cast<int>(sent) : -4;
         if (ApicTickCount() >= deadline) return sent ? static_cast<int>(sent) : -110;
@@ -3423,12 +3437,17 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
 
 int SockSend(int sockIdx, const void* buf, uint32_t len)
 {
-    return SockSendImpl(sockIdx, buf, len, false);
+    return SockSendImpl(sockIdx, {static_cast<const uint8_t*>(buf), false, nullptr, 0}, len);
 }
 
 int SockSendUser(int sockIdx, uint64_t address, uint32_t len)
 {
-    return SockSendImpl(sockIdx, reinterpret_cast<const void*>(address), len, true);
+    return SockSendImpl(sockIdx, {reinterpret_cast<const uint8_t*>(address), true, nullptr, 0}, len);
+}
+
+int SockSendUserVector(int sockIdx, const TcpSendVector* vectors, unsigned count, uint32_t len)
+{
+    return SockSendImpl(sockIdx, {nullptr, true, vectors, count}, len);
 }
 
 int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
