@@ -3137,34 +3137,55 @@ struct TcpSendSource {
     }
 };
 
-// Call-local retained flight. Every exit either retires all reservations or
-// closes the stream before their payloads leave scope. The deliberately small
-// limit is an experiment, not a complete congestion-control implementation.
-static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& source,
-                                  uint32_t len, uint32_t mss,
-                                  uint64_t deadline, unsigned initialLimit, bool adaptive)
-{
+// Explicitly owned flight state. This object is still strictly call-local:
+// it must not outlive the sender, and no worker can refer to its storage.
+// The inline allocation keeps the ordinary eight-slot path allocation-free.
+struct TcpSendFlightState {
     struct Slot {
         uint8_t bytes[ETH_MTU];
         uint32_t seq = 0, len = 0, retries = 0;
         uint64_t retryAt = 0, firstSendAt = 0;
         bool submitted = false, wasRetried = false;
-    } localSlots[8]{};
-    const unsigned capacity=initialLimit>8?16:8;
-    struct FlightAllocation {
-        void* storage=nullptr;
-        ~FlightAllocation() { if (storage) kfree(storage); }
-    } allocation;
-    Slot* slots=localSlots;
-    if (capacity>8) {
-        allocation.storage=kmalloc(sizeof(Slot)*capacity);
-        if (!allocation.storage) return -12;
-        slots=static_cast<Slot*>(allocation.storage);
-        for(unsigned n=0;n<capacity;++n) new (&slots[n]) Slot{};
-    }
-    unsigned head = 0, count = 0, limit = initialLimit;
+    } inlineSlots[8]{};
+    Slot* slots = inlineSlots;
+    void* allocation = nullptr;
+    bool configured = false;
+    unsigned capacity = 8, head = 0, count = 0, limit = 0;
     uint32_t reserved = 0, submitted = 0, acknowledged = 0;
     int deferredError = 0;
+
+    explicit TcpSendFlightState(unsigned initialLimit) : limit(initialLimit) {}
+    bool Allocate() {
+        if (configured || !limit || limit > 16) return false;
+        configured = true;
+        if (limit <= 8) return true;
+        capacity = 16;
+        allocation = kmalloc(sizeof(Slot)*capacity);
+        if (!allocation) return false;
+        slots = static_cast<Slot*>(allocation);
+        for (unsigned n=0;n<capacity;++n) new (&slots[n]) Slot{};
+        return true;
+    }
+    ~TcpSendFlightState() { if (allocation) kfree(allocation); }
+    TcpSendFlightState(const TcpSendFlightState&) = delete;
+    TcpSendFlightState& operator=(const TcpSendFlightState&) = delete;
+};
+
+// Every exit either retires all reservations or closes the stream before
+// the call-local state is destroyed. The limit is an experiment, not a
+// complete congestion-control implementation.
+static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& source,
+                                  uint32_t len, uint32_t mss,
+                                  uint64_t deadline, unsigned initialLimit, bool adaptive)
+{
+    TcpSendFlightState state(initialLimit);
+    if (!state.Allocate()) return -12;
+    using Slot = TcpSendFlightState::Slot;
+    Slot* const slots=state.slots;
+    const unsigned capacity=state.capacity;
+    auto& head=state.head;auto& count=state.count;auto& limit=state.limit;
+    auto& reserved=state.reserved;auto& submitted=state.submitted;auto& acknowledged=state.acknowledged;
+    auto& deferredError=state.deferredError;
     const auto probeIndex=static_cast<uint32_t>(&s-g_sockets);
     if (g_tcpSendProbe) {
         TcpProbeAdd(g_tcpSendProbeStats.calls);TcpProbeAdd(g_tcpSendProbeStats.bytes,len);

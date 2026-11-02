@@ -255,6 +255,12 @@ static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_
 int main() {
     for(unsigned n=0;n<MAX_SOCKETS;++n)KMutexInit(&g_tcpSendGates[n]);
     {
+        TcpSendFlightState invalid(17);assert(!invalid.Allocate());
+        TcpSendFlightState empty(0);assert(!empty.Allocate());
+        TcpSendFlightState normal(8);assert(normal.Allocate() && !normal.Allocate());
+        TcpSendFlightState wide(16);assert(wide.Allocate() && !wide.Allocate());
+    }
+    {
         const char a[]="abc",b[]="defgh";
         TcpSendVector vectors[]={{reinterpret_cast<uint64_t>(a),3},{~uint64_t(0),0},
                                  {reinterpret_cast<uint64_t>(b),5}};

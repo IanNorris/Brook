@@ -133,6 +133,16 @@ per-call drain. Tests must include queue-reference versus last-close races,
 slot reuse, stalled peers, worker shutdown, readiness and failure after bytes
 have been accepted from an application.
 
+The flight's slots, allocation and progress counters now have an explicit
+call-local owner. Allocation is one-shot and rejects unsupported flight
+limits. The sender remains synchronous; no persistent queue, worker or
+application-visible buffering is introduced by this extraction. The hosted
+socket-lifetime suite passed with `BROOK_HOST_TEST` enabled, including the
+writev boundary and fault cases; the QEMU USB Ethernet suite passed with the
+16-slot experiment, delayed traffic, one controlled drop, concurrent writers,
+close stress and user-copy faults. Astra reviewed the extraction. This is a
+preparatory step toward the bounded pump, not a throughput result.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;
