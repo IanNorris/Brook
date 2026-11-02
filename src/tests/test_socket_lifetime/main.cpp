@@ -833,6 +833,26 @@ int main() {
         assert(blockedResult==1 && blockedProducer->refCount==1);
         acknowledgeDataCount=1;runTestWorker();assert(!g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers);
         g_tcpProducerWake=false;acknowledgeDataCount=0;SockClose(socket);delete blockedProducer;
+        // Two independent blocked producers must both be notified when one
+        // retirement makes capacity available, without retaining either ref.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;g_tcpProducerWake=true;ticks=1;
+        assert(SockSend(socket,data,sizeof(data))==sizeof(data));
+        auto* producerA=new Process{};auto* producerB=new Process{};
+        producerA->refCount=producerB->refCount=1;producerA->pid=195;producerB->pid=196;
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;int resultA=0,resultB=0;
+        auto registrations=[&]{unsigned count=0;auto flags=IrqSpinLockAcquire(&g_tcpCapacityWaitLock);
+            for(const auto& entry:g_tcpCapacityWaiters)if(entry.process && entry.index==socket)++count;
+            IrqSpinLockRelease(&g_tcpCapacityWaitLock,flags);return count;};
+        std::thread producerThreadA([&]{currentProcess=producerA;resultA=SockSend(socket,bytes,1);currentProcess=nullptr;});
+        await([&]{return registrations()==1;});
+        std::thread producerThreadB([&]{currentProcess=producerB;resultB=SockSend(socket,bytes,1);currentProcess=nullptr;});
+        await([&]{return registrations()==2;});
+        acknowledgeDataCount=62;runTestWorker();
+        assert(producerA->pendingWakeup && producerB->pendingWakeup && registrations()==0);
+        releaseGatePoll=true;producerThreadA.join();producerThreadB.join();holdGatePoll=false;
+        assert(resultA==1 && resultB==1 && producerA->refCount==1 && producerB->refCount==1);
+        acknowledgeDataCount=1;runTestWorker();assert(!g_tcpAsyncJobs[socket] && !g_tcpAsyncWorkers);
+        g_tcpProducerWake=false;acknowledgeDataCount=0;SockClose(socket);delete producerA;delete producerB;
         // A signal during the registered wait drops the token and socket
         // reference before the queued worker later drains.
         socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;g_tcpProducerWake=true;ticks=1;

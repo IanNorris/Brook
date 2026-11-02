@@ -167,6 +167,20 @@ short experiments rather than alternating or long-duration acceptance; the
 HTTPS endpoint and network conditions were not controlled. Recovery was
 selected and booted after testing, and Dell speaker output stayed disabled.
 
+A second eight-second profile covered a producer-wakeup upload that completed
+in 3.13 seconds with a matching hash. After sorting context switches across
+CPUs, Astra compared equal 3.13-second active windows: the earlier build had
+312 completed producer waits of exactly 10 ticks and 302 worker PIDs observed
+in flight stacks; the candidate had 105 such waits, 2,013 one-tick waits and
+10 worker PIDs. More short waits can reflect quicker producer progress. The
+candidate finishes within its window while the earlier upload continues, so
+these are equal-time, not equal-byte comparisons. The remaining 10-tick waits
+are not yet classified by cause; IRQ-masked time and profiler perturbation
+also limit interpretation. The second profile and receipt are under
+`build/hardware/dell-producer-sustained-profile-20261102`. The recovery boot
+was restored afterward. Hosted lifetime coverage now also checks two
+producers waiting on the same full queue and receiving the capacity wake.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
