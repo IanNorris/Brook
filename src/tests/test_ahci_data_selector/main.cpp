@@ -1,4 +1,4 @@
-#include "ahci_data_selector.h"
+#include "ahci_data_inspection.h"
 #include <cassert>
 #include <cstring>
 #include <fstream>
@@ -6,6 +6,7 @@
 #include <vector>
 using namespace brook;
 static void put32(uint8_t* p,uint32_t v){for(int i=0;i<4;++i)p[i]=uint8_t(v>>(8*i));}
+static void put16(uint8_t* p,uint16_t v){p[0]=uint8_t(v);p[1]=uint8_t(v>>8);}
 static void put64(uint8_t* p,uint64_t v){put32(p,uint32_t(v));put32(p+4,uint32_t(v>>32));}
 static void header(uint8_t* h,bool backup,uint32_t crc){
     std::memset(h,0,512);std::memcpy(h,"EFI PART",8);put32(h+8,0x10000);put32(h+12,92);
@@ -13,7 +14,7 @@ static void header(uint8_t* h,bool backup,uint32_t crc){
     h[56]=1;put64(h+72,backup?99967:2);put32(h+80,128);put32(h+84,128);
     put32(h+88,crc);put32(h+16,StrictCrc32(h,92,true));
 }
-static int fixture(const char* path) {
+static int fixture(const char* path,const char* storePath,uint64_t dataCount) {
     std::ifstream f(path,std::ios::binary);if(!f)return 1;
     f.seekg(0,std::ios::end);auto length=f.tellg();if(length<0 || uint64_t(length)%512)return 1;
     const uint64_t sectors=uint64_t(length)/512;if(sectors<68)return 1;
@@ -28,15 +29,38 @@ static int fixture(const char* path) {
     f.seekg(b.entriesLba*512);f.read(reinterpret_cast<char*>(copy.data()),bytes);if(!f)return 1;
     AhciDataSelector want{};std::memcpy(want.diskGuid,a.diskGuid,16);
     std::memcpy(want.partitionGuid,entries.data()+a.entrySize+16,16);
-    want.filesystemUuid[0]=1;want.first=16384;want.count=32768;
+    want.filesystemUuid[0]=1;want.first=16384;want.count=dataCount;
     AhciBootSelector boot{};std::memcpy(boot.diskGuid,a.diskGuid,16);
     std::memcpy(boot.partitionGuid,entries.data()+16,16);boot.first=2048;boot.count=8192;
     AhciBootSelection selected{}, selectedBoot{};
-    return AhciSelectBootAndData(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,selectedBoot,selected) &&
-           selectedBoot.entry==1 && selected.entry==2 && selected.first==16384 && selected.count==32768 ? 0 : 1;
+    if(!AhciSelectBootAndData(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,selectedBoot,selected) ||
+       selectedBoot.entry!=1 || selected.entry!=2 || selected.first!=16384 || selected.count!=dataCount)return 1;
+    if(!storePath)return 0;
+    std::ifstream store(storePath,std::ios::binary);uint8_t sb[1024]{};
+    store.seekg(1024);store.read(reinterpret_cast<char*>(sb),sizeof(sb));if(!store)return 1;
+    std::memcpy(want.filesystemUuid,sb+104,16);
+    LargeExt2Geometry g{};if(!LargeExt2GeometryMake(LargeExt2Read32(sb+4),g))return 1;
+    std::vector<uint8_t> table(g.descriptorBytes);store.seekg(4096);
+    store.read(reinterpret_cast<char*>(table.data()),table.size());if(!store)return 1;
+    auto inspect=[&](const uint8_t* sbuf,const uint8_t* gbuf,uint32_t n,AhciDataInspection& out){
+        return AhciInspectBootAndData(boot,want,sectors,mbr,primary,backup,entries.data(),copy.data(),bytes,
+                                      sbuf,1024,gbuf,n,out);
+    };
+    AhciDataInspection out{};
+    assert(inspect(sb,table.data(),table.size(),out)==AhciDataInspectionState::Clean && out.data.entry==2);
+    want.filesystemUuid[0]^=1;
+    assert(inspect(sb,table.data(),table.size(),out)==AhciDataInspectionState::Invalid && !out.data.entry);
+    want.filesystemUuid[0]^=1;sb[58]=0;
+    assert(inspect(sb,nullptr,0,out)==AhciDataInspectionState::NeedsCheck && out.data.entry==2);
+    sb[58]=1;
+    assert(inspect(sb,table.data(),table.size()-1,out)==AhciDataInspectionState::Invalid && !out.data.entry);
+    table[0]=0;
+    assert(inspect(sb,table.data(),table.size(),out)==AhciDataInspectionState::Invalid && !out.data.entry);
+    return 0;
 }
 int main(int argc,char** argv){
-    if(argc==2)return fixture(argv[1]);
+    if(argc==2 || argc==3 || argc==4)
+        return fixture(argv[1],argc>=3?argv[2]:nullptr,argc==4?std::stoull(argv[3]):32768);
     assert(argc==1);
     const std::string text="BRKDATA1\n01000000000000000000000000000000\n"
         "02000000000000000000000000000000\n2048,2048\n03000000000000000000000000000000\n";
@@ -74,6 +98,16 @@ int main(int argc,char** argv){
     AhciBootSelection bootResult{},dataResult{};
     assert(AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));
     assert(bootResult.entry==3 && dataResult.entry==2);
+    uint8_t sb[1024]{},gdt[32]{};put32(sb,1024);put32(sb+4,256);put32(sb+12,200);put32(sb+16,1000);
+    put32(sb+24,2);put32(sb+28,2);put32(sb+32,32768);put32(sb+36,32768);put32(sb+40,1024);
+    put16(sb+56,0xef53);put16(sb+58,1);put32(sb+76,1);put32(sb+84,11);put16(sb+88,128);
+    put32(sb+96,2);put32(sb+100,3);sb[104]=3;put32(gdt,2);put32(gdt+4,3);put32(gdt+8,4);
+    AhciDataInspection inspected{};
+    auto inspect=[&](){return AhciInspectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),sb,sizeof(sb),gdt,sizeof(gdt),inspected);};
+    assert(inspect()==AhciDataInspectionState::Clean && inspected.esp.entry==3 && inspected.data.entry==2);
+    sb[104]^=1;assert(inspect()==AhciDataInspectionState::Invalid && !inspected.data.entry);sb[104]^=1;
+    put16(sb+58,0);assert(inspect()==AhciDataInspectionState::NeedsCheck);put16(sb+58,1);
+    put32(gdt,1);assert(inspect()==AhciDataInspectionState::Invalid && !inspected.data.entry);put32(gdt,2);
     ++want.count;bootResult.entry=5;dataResult.entry=6;
     assert(!AhciSelectBootAndData(boot,want,100000,mbr,primary,backup,entries,copy,sizeof(entries),bootResult,dataResult));
     assert(!bootResult.entry && !dataResult.entry);--want.count;

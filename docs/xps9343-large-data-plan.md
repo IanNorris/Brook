@@ -119,3 +119,10 @@ cover mismatched identities, failure of the second selection, output aliasing
 and an independently generated two-partition fixture. The caller must still
 pin the disk layout and buffers until mount admission; the helper does not
 enforce that lifetime or exclusivity itself.
+An offline inspection composition additionally matches the selected span to
+the ext2 byte length and UUID, distinguishes dirty headers, and validates all
+group descriptors before reporting a clean format. Host synthetic cases and
+independent 16 MiB and 17 GiB GPT/ext2 fixture pairs pass. These pairs are
+separate files and do not exercise partition-relative reads, disk ownership,
+mounting, recovery or filesystem consistency; the composition remains unused
+by live boot.
