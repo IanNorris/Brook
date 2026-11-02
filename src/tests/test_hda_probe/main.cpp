@@ -81,6 +81,9 @@ int main() {
      assert(probe.readAmp(0,0x80,true,true,0,reply)==HdaProbeResult::DisallowedVerb && !f.writes);
      assert(probe.readAmp(0,0x14,true,true,0,reply)==HdaProbeResult::Ready && f.read32(0x60)==0x014ba000);
      assert(probe.readAmp(0,0x0d,false,false,3,reply)==HdaProbeResult::Ready && f.read32(0x60)==0x00db0003);}
+    {auto f=idle();HdaReadOnlyProbe<Fake> probe(f);assert(probe.inspect(state)==HdaProbeResult::Ready);
+     assert(probe.readFormat(15,3,reply)==HdaProbeResult::DisallowedVerb && !f.writes);
+     assert(probe.readFormat(0,3,reply)==HdaProbeResult::Ready && f.read32(0x60)==0x003a0000);}
     {auto f=idle();f.timeout=true;HdaReadOnlyProbe<Fake> probe(f);assert(probe.inspect(state)==HdaProbeResult::Ready);
      assert(probe.readAmp(0,0x14,true,true,0,reply)==HdaProbeResult::Timeout);
      const auto writes=f.writes;assert(probe.readAmp(0,0x14,true,true,0,reply)==HdaProbeResult::Failed && f.writes==writes);
@@ -97,11 +100,12 @@ int main() {
     {auto f=sessionIdle();f.set32(8,0);auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::InspectionFailed && r.probe==HdaProbeResult::ControllerReset && f.pciCommand==0 && !f.writes);}
     {auto f=sessionIdle();f.mismatch=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecMismatch && r.completed==0 && f.pciCommand==0);}
     {auto f=sessionIdle();f.subsystemMismatch=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecMismatch && r.completed==0 && f.pciCommand==0);}
-    {auto f=sessionIdle();auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::Complete && r.completed==12 && r.stateCompleted==13 && r.ampCompleted==6 && f.pciCommand==0 && f.commandWrites==2 && !f.unsafeCommandWrites);}
+    {auto f=sessionIdle();auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::Complete && r.completed==12 && r.stateCompleted==13 && r.ampCompleted==6 && r.formatCompleted && f.pciCommand==0 && f.commandWrites==2 && !f.unsafeCommandWrites);}
     {auto f=sessionIdle();f.timeout=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.probe==HdaProbeResult::Timeout && f.pciCommand==0);}
     {auto f=sessionIdle();f.timeoutAt=6;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.completed==2 && f.issued==6 && f.pciCommand==0);}
     {auto f=sessionIdle();f.timeoutAt=18;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.completed==12 && r.stateCompleted==2 && r.ampCompleted==0 && f.pciCommand==0);}
     {auto f=sessionIdle();f.timeoutAt=30;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.stateCompleted==13 && r.ampCompleted==1 && f.pciCommand==0);}
+    {auto f=sessionIdle();f.timeoutAt=35;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::CodecQueryFailed && r.ampCompleted==6 && !r.formatCompleted && f.pciCommand==0);}
     {auto f=sessionIdle();f.denyRestore=true;auto r=HdaProbeDellSession(f);assert(r.result==HdaSessionResult::RestoreFailed && f.pciCommand==2);}
     std::puts("HDA probe: PASS");
 }

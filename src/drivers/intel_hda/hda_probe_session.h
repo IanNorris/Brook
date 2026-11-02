@@ -18,6 +18,7 @@ struct HdaSessionReport {
     uint32_t vendor=0, revision=0, subsystem=0;
     uint32_t values[12]{};uint8_t completed=0;
     uint32_t stateValues[13]{},ampValues[6]{};uint8_t stateCompleted=0,ampCompleted=0;
+    uint32_t converterFormat=0;bool formatCompleted=false;
 };
 struct HdaProbeQuery {uint8_t nid;uint16_t verb;uint8_t payload;};
 static constexpr HdaProbeQuery HdaDellSpeakerQueries[] = {
@@ -74,6 +75,11 @@ template<class Io> HdaSessionReport HdaProbeDellSession(Io& io) {
                             if(r.probe!=HdaProbeResult::Ready){r.result=HdaSessionResult::CodecQueryFailed;break;}
                             ++r.ampCompleted;
                         }
+                    }
+                    if(r.result==HdaSessionResult::Complete) {
+                        r.probe=probe.readFormat(0,0x03,r.converterFormat);
+                        if(r.probe!=HdaProbeResult::Ready)r.result=HdaSessionResult::CodecQueryFailed;
+                        else r.formatCompleted=true;
                     }
                 }
             }

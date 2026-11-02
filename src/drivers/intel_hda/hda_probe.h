@@ -106,5 +106,11 @@ public:
         const uint16_t payload=(output?0x8000:0)|(left?0x2000:0)|index;
         return issue((uint32_t(codec)<<28)|(uint32_t(nid)<<20)|(uint32_t(0x0b)<<16)|payload,response);
     }
+    // GET converter stream format is a four-bit verb with zero payload.
+    HdaProbeResult readFormat(uint8_t codec,uint8_t nid,uint32_t& response) {
+        if(failed_ || !admitted_)return HdaProbeResult::Failed;
+        if(codec>=15 || nid>0x7f)return HdaProbeResult::DisallowedVerb;
+        return issue((uint32_t(codec)<<28)|(uint32_t(nid)<<20)|(uint32_t(0x0a)<<16),response);
+    }
 };
 }

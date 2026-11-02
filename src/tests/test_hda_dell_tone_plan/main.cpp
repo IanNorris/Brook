@@ -3,7 +3,7 @@
 using namespace brook;
 static HdaSessionReport observed() {
     HdaSessionReport s{};s.result=HdaSessionResult::Complete;s.probe=HdaProbeResult::Ready;
-    s.vendor=0x10ec0288;s.subsystem=0x10280665;s.completed=12;s.stateCompleted=13;s.ampCompleted=6;
+    s.vendor=0x10ec0288;s.subsystem=0x10280665;s.completed=12;s.stateCompleted=13;s.ampCompleted=6;s.formatCompleted=true;
     const uint32_t values[]={0x40050d,0x10010,0x90170110,2,0x0d0c,0,0x40,2,0x20010b,1,3,0x41d};
     const uint32_t states[]={0x400,0xe0060,1,0,0,0x400,0,0xe0060,1,0x17f7f,0x80000000,0,0x80000000};
     for(unsigned i=0;i<12;++i)s.values[i]=values[i];for(unsigned i=0;i<13;++i)s.stateValues[i]=states[i];
@@ -25,6 +25,8 @@ int main(){
     s=observed();s.values[8]&=~8u;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.values[4]=0x0c0d;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.ampCompleted=5;assert(!HdaDellMakeTonePlan(s,p));
+    s=observed();s.formatCompleted=false;assert(!HdaDellMakeTonePlan(s,p));
+    s=observed();s.stateValues[6]=0x10;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.ampValues[2]=1;assert(!HdaDellMakeTonePlan(s,p));
     s=observed();s.subsystem++;assert(!HdaDellMakeTonePlan(s,p));
 }

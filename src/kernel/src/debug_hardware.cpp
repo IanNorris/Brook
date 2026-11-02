@@ -138,7 +138,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         for(unsigned i=0;i<s.stateCompleted && i<13;++i){if(i)r.text(",");r.number(s.stateValues[i]);}
         r.text("],\"amp_completed\":");r.number(s.ampCompleted);r.text(",\"amp_values\":[");
         for(unsigned i=0;i<s.ampCompleted && i<6;++i){if(i)r.text(",");r.number(s.ampValues[i]);}
-        r.text("]}\n");r.send();return true;
+        r.text("],\"format_completed\":");r.text(s.formatCompleted?"true":"false");
+        r.text(",");r.field("converter_format",s.converterFormat);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware dell-hda-memory")) {
         // Fixed identity only, using immutable boot PCI metadata. This reports

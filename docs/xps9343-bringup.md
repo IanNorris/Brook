@@ -1771,6 +1771,12 @@ and verify the pin before rerouting, attenuate the DAC and use low-amplitude
 PCM; the user has authorized a tone below 25%. A gain register percentage is
 not a measurement of acoustic volume. DMA stop, buffer ownership and mute
 cleanup must be verified before exposing ordinary audio playback.
+The next opt-in diagnostic is under construction: host-tested pieces now
+model a fresh converter-format snapshot, restricted codec commands, explicit
+mute/restore sequencing, a bounded-amplitude stereo tone and polling stream
+control with error/quarantine paths. These pieces are not yet connected to a
+physical playback adapter. Mock tests do not prove DMA quiescence or that the
+tone is audible, and no tone has yet been played on the Dell.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
