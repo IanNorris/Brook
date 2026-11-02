@@ -18,6 +18,8 @@ int main(void) {
     const char *path=BROOK_TEST_BLOCK_PATH;
     struct stat st;
     CHECK(stat(path,&st)==0 && S_ISBLK(st.st_mode));
+    CHECK(open(path,O_RDWR|O_CREAT|O_EXCL,0600)<0 && errno==EEXIST);
+    int created=open(path,O_RDWR|O_CREAT,0600);CHECK(created>=0 && close(created)==0);
     int fd=open(path,O_RDWR|O_EXCL);
     CHECK(fd>=0 && fstat(fd,&st)==0 && S_ISBLK(st.st_mode));
     int other=open(path,O_RDWR);

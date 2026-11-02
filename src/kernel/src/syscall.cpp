@@ -3516,7 +3516,10 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     uint32_t blockPartition=0;
     if(MaintenanceBlockPath(syntheticPath,blockPartition)) {
         if(proc->euid!=0)return -EPERM;
-        if((flags&3)==3 || (flags&(0x40|0x200|0x10000|0x200000)))return -EINVAL;
+        // O_CREAT is harmless for this already-existing synthetic block node;
+        // standard tools such as dd pass it when opening an output device.
+        if((flags&3)==3 || (flags&(0x200|0x10000|0x200000)))return -EINVAL;
+        if((flags&0xc0)==0xc0)return -EEXIST;
         Device* device=MaintenanceBlockDevice();
         if(!device || !device->ops || !device->ops->read || !device->ops->write)return -ENODEV;
         uint64_t start=0,bytes=0;
