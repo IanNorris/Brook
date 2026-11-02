@@ -173,3 +173,12 @@ kernel ABI 63, so networking failed and that VM was stopped; matching modules
 were used in both successful boots. Results and serial logs are in
 `build/hardware/data-probe-qemu-run2-20261102` and
 `build/hardware/data-probe-qemu-reject-run-20261102`.
+
+The proposed large-data writable QEMU test has a separate, currently
+unconnected admission predicate. It requires KVM, an explicit marker, no
+conflicting test markers, an exact QEMU model/serial/capacity, 512-byte logical
+and physical sectors, and flush support. Host negative tests reject the Dell's
+physical model and altered identity or geometry. This predicate does not enable
+the existing raw-write or installer tests and does not itself open a disk.
+Integration must compile-gate every caller and reject conflicting markers
+before evaluating any test-mode branch, not just this predicate.

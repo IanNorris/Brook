@@ -17,4 +17,12 @@ inline bool AhciDisposableDesktopInstallAdmission(bool marker,bool kvm,uint32_t 
         (info.sectors==500118192 && !strcmp(info.serial,"BROOK-AHCI-DELL256"));
     return marker && kvm && port==0 && fixture && !strcmp(info.model,"QEMU HARDDISK") && flushExt;
 }
+// Separate from both raw-write and installer tests. The caller must reject
+// conflicting test markers and keep this mode unreachable in production.
+inline bool AhciDisposableLargeDataAdmission(bool marker,bool conflictingMarkers,bool kvm,uint32_t port,
+                                              const AtaIdentifyInfo& info,bool flushExt) {
+    return marker && !conflictingMarkers && kvm && port==0 &&
+        info.sectors==500118192 && info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
+        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-DATA-TEST01") && flushExt;
+}
 }
