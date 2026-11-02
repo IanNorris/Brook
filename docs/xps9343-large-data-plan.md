@@ -77,3 +77,18 @@ dirty cases and the 17 GiB fixture pass. This deliberately retains the existing
 which need a separate design decision before it is chosen for permanent storage.
 The classifier alone neither verifies the partition identity nor proves
 filesystem consistency, and no boot admission uses it yet.
+
+The current ext2 driver calculates inode offsets using the on-disk inode size,
+but reads and writes only the first 128 bytes. Its timestamp implementation
+uses unsigned whole seconds, saturating at `0xffffffff`; that does not establish
+Linux-compatible timestamps past 2038. A 256-byte inode alone is insufficient:
+the driver would have to initialize, read, preserve and update extended timestamp
+fields correctly, including on inode reuse, and validate their presence. Test
+Brook/Linux round trips around 2038 and 2106, negative times and nanoseconds
+before admitting that format. The legacy-format classifier stays restrictive.
+
+Separately, `Ext2InodeSize` currently returns only the lower 32 size bits, even
+though regular-file inodes have a high-size field. A large partition must not be
+advertised as safe for files over 4 GiB until read, write, truncate, allocation,
+stat and independent filesystem-check behavior have been audited and tested.
+Those checks are distinct from allowing a filesystem larger than 4 GiB.
