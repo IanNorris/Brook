@@ -167,9 +167,13 @@ struct TcpAsyncJob;
 static TcpAsyncJob* g_tcpAsyncJobs[MAX_SOCKETS]{};
 static uint64_t g_tcpAsyncEpoch[MAX_SOCKETS]{};
 static uint32_t g_tcpAsyncWorkers=0;
-// Probe-only identities are valid while the worker runs and are protected by
-// the corresponding socket lock. They do not own an additional process ref.
+// Worker identities are valid while the worker runs and are protected by the
+// corresponding socket lock. They do not own an additional process ref.
 static Process* g_tcpProbeWorker[MAX_SOCKETS]{};
+// Dedicated ACK waiter for the experimental asynchronous sender. The slot
+// owns a process reference; access and transfer happen under socket.lock.
+static Process* g_tcpWorkerWaiter[MAX_SOCKETS]{};
+static bool g_tcpSeparateWorkerWaiter=false;
 static bool g_tcpProbeWorkerWaiting[MAX_SOCKETS]{};
 static bool g_tcpProbeWorkerDisplaced[MAX_SOCKETS]{};
 // Optional aggregate diagnostics; per-slot ACK stamps are protected by the
@@ -262,17 +266,37 @@ static Process* TakeSocketWaiterLocked(Socket& socket)
     return waiter; // transfer the stored liveness ref to the caller
 }
 
+static void SetTcpWorkerWaiterLocked(uint32_t index, Process* waiter)
+{
+    if (g_tcpWorkerWaiter[index]==waiter) return;
+    ProcessRef(waiter);
+    Process* old=g_tcpWorkerWaiter[index];
+    g_tcpWorkerWaiter[index]=waiter;
+    ProcessUnref(old);
+}
+
+static Process* TakeTcpWorkerWaiterLocked(uint32_t index)
+{
+    Process* waiter=g_tcpWorkerWaiter[index];
+    g_tcpWorkerWaiter[index]=nullptr;
+    return waiter;
+}
+
 // Each blocking operation removes its own registration on every return path.
 // Another waiter may replace it meanwhile; never clear that newer owner.
 class SocketWaitRegistration {
     Socket& socket_;
     Process* waiter_;
+    bool worker_;
 public:
-    SocketWaitRegistration(Socket& socket, Process* waiter) : socket_(socket), waiter_(waiter) {}
+    SocketWaitRegistration(Socket& socket, Process* waiter, bool worker=false) : socket_(socket), waiter_(waiter), worker_(worker) {}
     ~SocketWaitRegistration() {
         if (!waiter_) return;
         SpinLockAcquire(&socket_.lock);
-        if (socket_.pollWaiter == waiter_) SetSocketWaiterLocked(socket_, nullptr);
+        if (worker_) {
+            const auto index=static_cast<uint32_t>(&socket_-g_sockets);
+            if(g_tcpWorkerWaiter[index]==waiter_) SetTcpWorkerWaiterLocked(index,nullptr);
+        } else if (socket_.pollWaiter == waiter_) SetSocketWaiterLocked(socket_, nullptr);
         SpinLockRelease(&socket_.lock);
     }
     SocketWaitRegistration(const SocketWaitRegistration&) = delete;
@@ -949,6 +973,11 @@ void NetConfigureBoot()
     if (auto* marker=VfsOpen("/etc/tcp-async-send")) {
         VfsClose(marker);g_tcpAsyncSend=true;
         KPuts("net: bounded asynchronous TCP sender enabled (experimental)\n");
+    }
+    if (auto* marker=VfsOpen("/etc/tcp-worker-waiter")) {
+        VfsClose(marker);
+        if(g_tcpAsyncSend){g_tcpSeparateWorkerWaiter=true;KPuts("net: dedicated TCP worker waiter enabled (experimental)\n");}
+        else KPuts("net: TCP worker waiter requires async sender\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
         VfsClose(marker);g_tcpSendProbe = true;
@@ -2931,10 +2960,12 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
                            || s.tcpRstRecv
                            || s.tcpFinRecv || act.justConnected || windowChanged;
         Process* waiter = nullptr;
+        Process* workerWaiter = nullptr;
         if (s.pollWaiter && shouldWake)
         {
             waiter = TakeSocketWaiterLocked(s);
         }
+        if(shouldWake && g_tcpWorkerWaiter[i]) workerWaiter=TakeTcpWorkerWaiterLocked(i);
 
         bool sendAck = false;
 
@@ -2980,6 +3011,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(waiter);
             ProcessUnref(waiter);
+        }
+        if(workerWaiter) {
+            __atomic_store_n(&workerWaiter->pendingWakeup,1,__ATOMIC_RELEASE);
+            SchedulerUnblock(workerWaiter);
+            ProcessUnref(workerWaiter);
         }
 
         return; // handled
@@ -3627,9 +3663,10 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
     }
     SpinLockAcquire(&s.lock);
     const uint32_t base = s.tcpSndNxt;
+    const bool workerSeparate=g_tcpSeparateWorkerWaiter && self && g_tcpProbeWorker[probeIndex]==self;
     if (adaptive) s.tcpFlightControl.Init(mss,initialLimit);
     SpinLockRelease(&s.lock);
-    SocketWaitRegistration registration(s, self);
+    SocketWaitRegistration registration(s, self,workerSeparate);
 
     TcpFlightPump pump{s,state,base,len,mss,probeIndex,initialLimit,adaptive};
     for (;;) {
@@ -3643,13 +3680,18 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const TcpSendSource& so
                 g_tcpProbeWorkerDisplaced[probeIndex]=false;
                 TcpProbeAdd(g_tcpSendProbeStats.workerWaits);
             }
-            SetSocketWaiterLocked(s,self);self->wakeupTick=outcome.wakeTick;
+            if(workerSeparate)SetTcpWorkerWaiterLocked(probeIndex,self);
+            else SetSocketWaiterLocked(s,self);
+            self->wakeupTick=outcome.wakeTick;
             SpinLockRelease(&s.lock);SchedulerBlockInterruptible(self);
-            if(workerProbe) {
-                if(ApicTickCount()>=outcome.wakeTick)TcpProbeAdd(g_tcpSendProbeStats.workerDeadlineWakeups);
+            if(workerProbe || workerSeparate) {
+                if(workerProbe && ApicTickCount()>=outcome.wakeTick)TcpProbeAdd(g_tcpSendProbeStats.workerDeadlineWakeups);
                 SpinLockAcquire(&s.lock);
-                g_tcpProbeWorkerWaiting[probeIndex]=false;
-                g_tcpProbeWorkerDisplaced[probeIndex]=false;
+                if(workerSeparate && g_tcpWorkerWaiter[probeIndex]==self)SetTcpWorkerWaiterLocked(probeIndex,nullptr);
+                if(workerProbe) {
+                    g_tcpProbeWorkerWaiting[probeIndex]=false;
+                    g_tcpProbeWorkerDisplaced[probeIndex]=false;
+                }
                 SpinLockRelease(&s.lock);
             }
         }

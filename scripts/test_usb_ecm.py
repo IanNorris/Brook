@@ -28,6 +28,7 @@ ap.add_argument('--tcp-try-transmit',action='store_true',help='Use the immediate
 ap.add_argument('--irq-trylock-probe',action='store_true',help='Test IRQ try-lock IF restoration inside the guest kernel')
 ap.add_argument('--tcp-queue-stage',action='store_true',help='Stage synchronous flight bytes through bounded queue storage')
 ap.add_argument('--tcp-async-send',action='store_true',help='Exercise bounded asynchronous per-connection TCP workers')
+ap.add_argument('--tcp-worker-waiter',action='store_true',help='Give TCP sender workers a separate ACK waiter')
 ap.add_argument('--small-write-benchmark',action='store_true',help='Measure a 1 MiB stream of 1 KiB writes')
 ap.add_argument('--async-pool-test',action='store_true',help='Exercise poll/epoll while the async TCP worker pool is saturated')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
@@ -36,6 +37,7 @@ if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_fl
 if args.tcp_try_transmit and not args.tcp_async_neighbor:ap.error('--tcp-try-transmit requires --tcp-async-neighbor')
 if args.tcp_queue_stage and not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16)):ap.error('--tcp-queue-stage requires a TCP flight mode')
 if args.async_pool_test and not args.tcp_async_send:ap.error('--async-pool-test requires --tcp-async-send')
+if args.tcp_worker_waiter and not args.tcp_async_send:ap.error('--tcp-worker-waiter requires --tcp-async-send')
 if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))>1:ap.error('choose only one flight mode')
 if not 0<=args.network_delay_us<=50000:ap.error('network delay must be between 0 and 50000 microseconds')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
@@ -107,6 +109,7 @@ if args.tcp_try_transmit:run('mcopy','-i',initrd,marker,'::ETC/tcp-try-transmit'
 if args.irq_trylock_probe:run('mcopy','-i',initrd,marker,'::ETC/irq-trylock-probe')
 if args.tcp_queue_stage:run('mcopy','-i',initrd,marker,'::ETC/tcp-queue-stage')
 if args.tcp_async_send:run('mcopy','-i',initrd,marker,'::ETC/tcp-async-send')
+if args.tcp_worker_waiter:run('mcopy','-i',initrd,marker,'::ETC/tcp-worker-waiter')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -326,6 +329,8 @@ try:
   time.sleep(.05)
  else:raise TimeoutError('USB/HID did not remain responsive after NIC removal')
  loss_stop.set()
+ if args.tcp_worker_waiter:
+  assert 'dedicated TCP worker waiter enabled' in serial,'dedicated worker waiter was not enabled'
  q.call('quit');assert owner.wait(timeout=15)==0
  if loss_thread:
   loss_thread.join(5);assert not loss_thread.is_alive(),'Packet relay did not stop'

@@ -54,7 +54,7 @@ static void TcpAsyncWorker(void* argument) {
     auto* job=static_cast<TcpAsyncJob*>(argument);const int index=job->index;Socket& s=g_sockets[index];
     Process* const probeSelf=SchedulerCurrentProcess();
     SpinLockAcquire(&s.lock);
-    if(g_tcpSendProbe && g_tcpAsyncJobs[index]==job && g_tcpAsyncEpoch[index]==job->epoch)
+    if((g_tcpSendProbe || g_tcpSeparateWorkerWaiter) && g_tcpAsyncJobs[index]==job && g_tcpAsyncEpoch[index]==job->epoch)
         g_tcpProbeWorker[index]=probeSelf;
     SpinLockRelease(&s.lock);
     for(;;) {
@@ -64,7 +64,7 @@ static void TcpAsyncWorker(void* argument) {
             // releasing the worker reference or allowing another job to start.
             const bool attached=g_tcpAsyncJobs[index]==job;
             if(attached)g_tcpAsyncJobs[index]=nullptr;
-            if(g_tcpSendProbe && g_tcpProbeWorker[index]==probeSelf) {
+            if((g_tcpSendProbe || g_tcpSeparateWorkerWaiter) && g_tcpProbeWorker[index]==probeSelf) {
                 g_tcpProbeWorker[index]=nullptr;
                 g_tcpProbeWorkerWaiting[index]=false;
                 g_tcpProbeWorkerDisplaced[index]=false;

@@ -752,6 +752,23 @@ int main() {
         assert(SockSendUser(socket,reinterpret_cast<uint64_t>(terminal),sizeof(terminal))==536);
         failUserCopyAfter=-1;runTestWorker();assert(g_sockets[socket].tcpSndUna==546);
         SockClose(socket);
+        // Exercise real worker selection with diagnostics disabled: the
+        // application waiter and sender must both be woken by the same ACK.
+        socket=create();setupTcp(socket);g_sockets[socket].tcpSndWnd=65535;ticks=1;
+        g_tcpSendProbe=false;g_tcpSeparateWorkerWaiter=true;
+        assert(SockSend(socket,bytes,sizeof(bytes))==sizeof(bytes));
+        holdGatePoll=true;gatePollWaiting=false;releaseGatePoll=false;
+        std::thread separateWorker([]{runTestWorker();});
+        await([]{return gatePollWaiting.load();});
+        auto* applicationWaiter=new Process{};applicationWaiter->refCount=1;
+        SpinLockAcquire(&g_sockets[socket].lock);Process* senderWaiter=g_tcpWorkerWaiter[socket];
+        assert(senderWaiter && senderWaiter==g_tcpProbeWorker[socket]);SpinLockRelease(&g_sockets[socket].lock);
+        SockSetPollWaiter(socket,applicationWaiter);deliverControl(socket,20,14,TCP_ACK,65535);
+        assert(senderWaiter->pendingWakeup && applicationWaiter->pendingWakeup);
+        assert(!g_tcpWorkerWaiter[socket] && applicationWaiter->refCount==1);
+        releaseGatePoll=true;separateWorker.join();holdGatePoll=false;
+        assert(!g_tcpAsyncJobs[socket] && !g_tcpProbeWorker[socket] && !g_tcpWorkerWaiter[socket]);
+        g_tcpSeparateWorkerWaiter=false;delete applicationWaiter;SockClose(socket);
         // A blocked worker must not stop an admitted worker on another TCP
         // connection from delivering its bytes.
         const int stalled=create();setupTcp(stalled);g_sockets[stalled].tcpSndWnd=0;
@@ -1066,6 +1083,22 @@ int main() {
     assert(workerProbe->refCount==1 && appProbe->refCount==1);
     g_tcpProbeWorker[i]=nullptr;g_tcpProbeWorkerWaiting[i]=false;g_tcpProbeWorkerDisplaced[i]=false;g_tcpSendProbe=false;
     SockClose(i);delete workerProbe;delete appProbe;
+    // A dedicated sender registration and an application poll registration
+    // both receive an ACK wake, and each transferred ref is dropped once.
+    i=create();setupTcp(i);g_sockets[i].tcpSndNxt=11;
+    workerProbe=new Process{};workerProbe->refCount=1;
+    appProbe=new Process{};appProbe->refCount=1;
+    SpinLockAcquire(&g_sockets[i].lock);SetTcpWorkerWaiterLocked(i,workerProbe);SpinLockRelease(&g_sockets[i].lock);
+    SockSetPollWaiter(i,appProbe);assert(workerProbe->refCount==2 && appProbe->refCount==2);
+    HandleTcp(&probeIp,&probeAck,sizeof(probeAck));
+    assert(workerProbe->pendingWakeup==1 && appProbe->pendingWakeup==1);
+    assert(workerProbe->refCount==1 && appProbe->refCount==1 && !g_tcpWorkerWaiter[i]);
+    // A timeout or interruption removes only the registration owned by it.
+    {SocketWaitRegistration registration(g_sockets[i],workerProbe,true);
+     SpinLockAcquire(&g_sockets[i].lock);SetTcpWorkerWaiterLocked(i,workerProbe);SpinLockRelease(&g_sockets[i].lock);
+     SockSetPollWaiter(i,appProbe);}
+    assert(workerProbe->refCount==1 && appProbe->refCount==2 && !g_tcpWorkerWaiter[i]);
+    SockClearPollWaiter(i,appProbe);SockClose(i);delete workerProbe;delete appProbe;
     // Blocking timeouts release waiter refs without relying on socket close.
     // Another FD owner outlives the waiting thread, as with dup/fork.
     waiter = new Process{}; waiter->refCount = 1;

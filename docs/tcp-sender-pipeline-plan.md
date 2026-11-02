@@ -83,6 +83,24 @@ new counters. The next candidate should give the worker an independent waiter
 and compare it under the same workloads; the diagnostic itself changes no
 wake behavior.
 
+An opt-in `/etc/tcp-worker-waiter` candidate gives the asynchronous flight
+sender a separate, reference-owned waiter. TCP state changes wake both that
+waiter and the application waiter. The option requires `/etc/tcp-async-send`
+and affects the flight sender; legacy single-packet sending retains its
+existing waiter. Host tests exercise an actual worker and competing poller
+with diagnostics disabled, ACK delivery, cleanup and stale-worker handling.
+Delayed and lossy USB Ethernet QEMU acceptance passed. Astra reviewed the
+locking and lifetime approach; the feature remains experimental and off by
+default.
+
+On the Dell, three 1 MiB HTTPS uploads with the candidate took 1.17–1.29
+seconds, compared with 2.35–2.45 seconds for the earlier shared-waiter runs.
+The candidate recorded zero displaced-worker ACKs and 15–27 worker wakeups
+at or after the wait deadline per run, versus 106–109 in the earlier runs.
+These were grouped WAN runs rather than interleaved trials and include other
+connections, so they support the hypothesis but do not establish a stable
+throughput figure. The known-good boot was restored after the test.
+
 The flight state remains local to `SockSendImpl`, so every call drains its
 unacknowledged data before returning. To let applications hand data off sooner,
 the next experiment needs a bounded queue owned by the socket, with a separate
