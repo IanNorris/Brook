@@ -2989,3 +2989,10 @@ maintenance dry run planned generation 137 in slot 0 without modifying
 storage. Recovery generation 136 remained selected. This prepares a later
 attended application-audio and volume check; it is not an audible test, and
 the candidate was not activated on the Dell.
+
+After the separate TCP waiter change, the current kernel also passed the
+generic QEMU HDA volume regression and its absent-device boot. Captured PCM
+showed the expected sustained mute, 25%, 50%, 100%, mute and 25% sequence.
+QEMU wrote to a WAV file without host-speaker output. This checks the generic
+mixer and control path with the updated kernel; it does not validate the Dell
+codec's audible output or perceived volume.
