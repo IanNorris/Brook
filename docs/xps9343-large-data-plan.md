@@ -104,3 +104,12 @@ e2fsprogs' [`ext2fs_inode_xtime_get`](https://github.com/tytso/e2fsprogs/blob/v1
 passes the unsigned base to its decoder. The actual Linux mount/runtime and
 Brook-to-Linux round trips remain untested; an e2fsck pass does not establish
 timestamp interoperability.
+
+An unconnected direct-data selector parses a bounded record for the disk,
+partition, span and expected filesystem UUID. Its read-only GPT selection
+requires matching validated primary and backup tables, Linux filesystem type,
+disk and partition GUIDs, and exact start and length. Synthetic malformed,
+overlap and duplicate-GUID cases pass, along with a separate two-partition
+`sfdisk` fixture. The selector does not yet verify ATA identity, bind the ESP
+selection to the same snapshot, compare the filesystem UUID with ext2, mount
+anything, or authorize a write; those remain integration requirements.
