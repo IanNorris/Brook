@@ -1,9 +1,42 @@
 # Dell XPS 13 9343 hardware bring-up
 
-Work branch: `hardware/xps9343-uefi-probe`. Wi-Fi is excluded. Networking and
-host diagnostics take priority over internal audio and native Intel graphics.
-Keep known-good payloads and their exact symbol files in private build outputs;
-never repartition the user's FAT32 stick to run these probes.
+## Current checkpoint: 2 November
+
+The active work branch is `hardware/xps9343-desktop-audio`. Wi-Fi and native
+Intel graphics remain unsupported. The Dell desktop uses the firmware
+framebuffer; Chromium video has been slow and its audio has stuttered on this
+path. The xHCI controller occasionally fails reset on startup, taking the USB
+Ethernet adapter offline; in some cases only a full power removal restored it.
+An ordinary reboot is therefore not yet a reliable recovery for networking.
+
+The user heard the Dell speakers after enabling the native HDA path. A local
+20-second tone and a Quake II software-rendered demo sounded good in attended
+tests; Chromium YouTube was slow, stuttered and sounded distorted. Settings'
+master volume and mute controls have been exercised, but these observations do
+not establish browser playback quality or a calibrated loudness percentage.
+The Quake low-quality mixer fix still needs a physical recheck. Copyrighted
+game files and music are private test inputs and are not repository assets.
+
+The user reported a public speed test of 27 Mbps download and 73 Mbps upload
+against a 900/108 Mbps connection. Another test reported 112 Mbps download
+and 0.34 Mbps upload, possibly while another test was running. These are
+different runs, not a controlled bidirectional benchmark; throughput and
+restart reliability still need work.
+
+The SSD was subsequently repartitioned using standard tools running in a
+dedicated Brook maintenance boot. Its verified data partition covers about
+238 GiB, with a separate 256 MiB EFI partition. The copied store was checked
+and expanded, and all EFI files were read back and hashed. The first boot of
+this new layout without USB is still pending. The staged store is the prepared
+30 October snapshot; applications or settings added only to the previous SSD
+installation must be installed or configured again. The new EFI configuration
+does not yet enable the generation-selection menu. Direct-partition dirty
+recovery is not automatic: the maintenance build can run `e2fsck`, but the
+installed boot refuses a dirty store pending repair.
+
+The original probes began on `hardware/xps9343-uefi-probe`. Keep known-good
+payloads and their exact symbol files in private build outputs; never
+repartition the user's FAT32 stick to run these probes.
 
 ## Verified on the Dell
 

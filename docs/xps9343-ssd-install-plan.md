@@ -1,5 +1,25 @@
 # Dell XPS 13 9343: internal SSD installation preparation
 
+## Latest physical installation: 2 November
+
+The previously installed layout has been replaced with a 256 MiB EFI partition
+and a data partition using the rest of the SSD. Brook's maintenance build ran
+`sfdisk`, `mkfs.fat`, `dd`, `resize2fs`, `e2fsck` and mtools through the guest
+bridge. The 3.75 GiB source copied from USB at 23.8 MB/s, its SSD readback
+matched the source hash, the expanded ext2 check was clean, and the four EFI
+files matched their staged hashes. The maintenance shutdown reached a safe
+state and flushed the raw SSD; physical power-off is required because the
+maintenance boot reported no supported power-off method. First boot of this
+layout without USB has not yet been verified.
+
+The recovery USB's root boot files and previous active slot were retained;
+the new maintenance payload was written to its inactive slot. The installed
+store is the prepared 30 October snapshot, not a preservation of the former
+SSD's later changes. The new boot configuration has generation selection off,
+and automatic repair of a dirty direct data partition remains outstanding.
+The detailed earlier plan below describes prior approaches and should be read
+as historical context where it conflicts with this checkpoint.
+
 The user has explicitly
 authorized wiping the old Ubuntu contents and installing Brook on this Dell's
 internal SSD. Physical writes still require an implementation that targets the
