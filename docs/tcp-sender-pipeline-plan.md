@@ -23,7 +23,11 @@ timeout after partial delivery, RST and one-shot error consumption, reconnect
 during allocation and after old-job detach, plus one stalled connection while
 another progresses. Disposable QEMU tests covered data integrity, concurrent
 writers, user-copy faults, one dropped packet and close with a 16 KiB accepted
-write. The async close test does not cover a large blocked write.
+write. A separate QEMU loopback test fills the receive side and sender queue,
+starts an unfinished blocking write, closes the descriptor, and verifies the
+two distinct accepted byte ranges followed by EOF after draining. The test
+does not prove exactly where the writer was descheduled when close occurred;
+internet half-close and prolonged physical-device backpressure remain open.
 Hosted tests also exercise pool waiter token reuse, saturation, concurrent
 unregister/notification and permit reconsumption. A disposable QEMU test
 filled eight loopback receive queues and observed concurrent poll and epoll

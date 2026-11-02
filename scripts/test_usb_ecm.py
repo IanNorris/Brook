@@ -31,12 +31,14 @@ ap.add_argument('--tcp-async-send',action='store_true',help='Exercise bounded as
 ap.add_argument('--tcp-worker-waiter',action='store_true',help='Give TCP sender workers a separate ACK waiter')
 ap.add_argument('--small-write-benchmark',action='store_true',help='Measure a 1 MiB stream of 1 KiB writes')
 ap.add_argument('--async-pool-test',action='store_true',help='Exercise poll/epoll while the async TCP worker pool is saturated')
+ap.add_argument('--async-blocked-close',action='store_true',help='Exercise close while an async writer is blocked by backpressure')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))):ap.error('--tcp-async-neighbor requires --arp-async-probe and a TCP flight mode')
 if args.tcp_try_transmit and not args.tcp_async_neighbor:ap.error('--tcp-try-transmit requires --tcp-async-neighbor')
 if args.tcp_queue_stage and not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16)):ap.error('--tcp-queue-stage requires a TCP flight mode')
 if args.async_pool_test and not args.tcp_async_send:ap.error('--async-pool-test requires --tcp-async-send')
+if args.async_blocked_close and not args.tcp_async_send:ap.error('--async-blocked-close requires --tcp-async-send')
 if args.tcp_worker_waiter and not args.tcp_async_send:ap.error('--tcp-worker-waiter requires --tcp-async-send')
 if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))>1:ap.error('choose only one flight mode')
 if not 0<=args.network_delay_us<=50000:ap.error('network delay must be between 0 and 50000 microseconds')
@@ -92,7 +94,7 @@ for thread in threads:thread.start()
 run(os.environ['MUSL_CC'],'-static','-pthread','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_usb_ecm_guest/main.c','-o',base/'ECMTEST.ELF')
 run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600')
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BOOT/ECMTEST.ELF')
-rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}{" async" if args.tcp_async_send else ""}{" bench-small" if args.small_write_benchmark else ""}{" pool-test" if args.async_pool_test else ""}\n')
+rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}{" async" if args.tcp_async_send else ""}{" bench-small" if args.small_write_benchmark else ""}{" pool-test" if args.async_pool_test else ""}{" blocked-close" if args.async_blocked_close else ""}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
@@ -206,6 +208,7 @@ try:
    if args.send_user_copy:assert 'ECM_USER_SEND_PATHS_OK' in serial,serial[-2500:]
    if args.small_write_benchmark:assert 'ECM_SMALL_WRITES_OK' in serial,serial[-2500:]
    if args.async_pool_test:assert 'ECM_ASYNC_POOL_WAIT_OK' in serial,serial[-2500:]
+   if args.async_blocked_close:assert 'ECM_ASYNC_BLOCKED_CLOSE_OK' in serial,serial[-2500:]
    if args.tcp_flight2:assert 'two-packet TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_flight4:assert 'four-packet TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_adaptive_flight:assert 'bounded adaptive TCP send flight enabled' in serial,serial[-2500:]

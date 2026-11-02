@@ -22,6 +22,67 @@ struct race_writer { int fd; const unsigned char* bytes; size_t length; atomic_i
 static unsigned char long_write[262144],short_write[4096];
 struct pool_drain {int fd;size_t bytes;int result;};
 struct pool_wait {int fd;int epoll;atomic_int* ready;int result;};
+struct blocked_close_writer {int fd;atomic_int entered,done;ssize_t result;};
+static void* blocked_close_write(void* opaque){
+    struct blocked_close_writer* w=opaque;unsigned char block[4096];memset(block,'Q',sizeof(block));
+    atomic_store(&w->entered,1);w->result=write(w->fd,block,sizeof(block));atomic_store(&w->done,1);return NULL;
+}
+// Stop the receiver until the stream has applied backpressure. Start another
+// write and close while it is unfinished, then resume the receiver and verify
+// the entire accepted prefix and EOF, including the racing write.
+static int async_blocked_close_test(void){
+    int listener=-1,sender=-1,receiver=-1,started=0,result=-1;size_t accepted=0,received=0;pthread_t writer;
+    struct blocked_close_writer w={.fd=-1,.entered=0,.done=0,.result=-1};
+    unsigned char block[4096];memset(block,'P',sizeof(block));
+    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(49412)};
+    if(inet_pton(AF_INET,"127.0.0.1",&addr.sin_addr)!=1)return -1;
+    listener=socket(AF_INET,SOCK_STREAM,0);
+    if(listener<0 || bind(listener,(struct sockaddr*)&addr,sizeof(addr)) || listen(listener,1))goto fail;
+    sender=socket(AF_INET,SOCK_STREAM,0);
+    if(sender<0 || connect(sender,(struct sockaddr*)&addr,sizeof(addr)))goto fail;
+    receiver=accept(listener,NULL,NULL);if(receiver<0 || fcntl(sender,F_SETFL,O_NONBLOCK))goto fail;
+    int blocked=0;
+    while(accepted<2*1024*1024){
+        ssize_t n=send(sender,block,sizeof(block),MSG_NOSIGNAL);
+        if(n>0){accepted+=(size_t)n;continue;}
+        if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK)){
+            struct pollfd p={.fd=sender,.events=POLLOUT};int r=poll(&p,1,100);
+            if(!r){blocked=1;break;}if(r>0)continue;
+        }
+        goto fail;
+    }
+    if(!blocked || !accepted || fcntl(sender,F_SETFL,0))goto fail;
+    w.fd=sender;
+    if(pthread_create(&writer,NULL,blocked_close_write,&w))goto fail;
+    started=1;
+    while(!atomic_load(&w.entered))sched_yield();
+    usleep(100000);
+    if(atomic_load(&w.done) || close(sender))goto fail;
+    sender=-1;
+    struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts))goto fail;
+    const uint64_t deadline=(uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000+15000;
+    for(;;){
+        if(clock_gettime(CLOCK_MONOTONIC,&ts))goto fail;
+        uint64_t now=(uint64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;if(now>=deadline)goto fail;
+        struct pollfd p={.fd=receiver,.events=POLLIN};if(poll(&p,1,(int)(deadline-now))<=0)goto fail;
+        ssize_t n=read(receiver,block,sizeof(block));if(n<0)goto fail;if(!n)break;
+        for(ssize_t i=0;i<n;++i)if(block[i]!=(received+(size_t)i<accepted?'P':'Q'))goto fail;
+        received+=(size_t)n;
+        if(received>accepted+4096)goto fail;
+    }
+    if(pthread_join(writer,NULL))goto fail;
+    started=0;
+    if(w.result<=0 || received!=accepted+(size_t)w.result)goto fail;
+    puts("ECM_ASYNC_BLOCKED_CLOSE_OK");result=0;
+fail:
+    if(receiver>=0)close(receiver);
+    if(sender>=0)close(sender);
+    // Closing the peer makes a still-running writer terminate before its
+    // stack-owned arguments go out of scope; the outer harness has a timeout.
+    if(started)pthread_join(writer,NULL);
+    if(listener>=0)close(listener);
+    return result;
+}
 static void* pool_drain_thread(void* opaque){
     struct pool_drain* d=opaque;unsigned char buffer[8192];size_t n=0;
     struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)){d->result=-1;return NULL;}
@@ -118,9 +179,9 @@ static int storage(int fd,unsigned pass){
     return 0;
 }
 int main(int argc,char** argv){
-    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>8)return 2;
-    int concurrency=0,close_race=0,user_copy=0,async=0,bench_small=0,pool_test=0;
-    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else if(!strcmp(argv[i],"pool-test"))pool_test=1;else return 2;}
+    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>9)return 2;
+    int concurrency=0,close_race=0,user_copy=0,async=0,bench_small=0,pool_test=0,blocked_close=0;
+    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else if(!strcmp(argv[i],"pool-test"))pool_test=1;else if(!strcmp(argv[i],"blocked-close"))blocked_close=1;else return 2;}
     if(close_race && !concurrency)return 2;
     struct sockaddr_in peer={.sin_family=AF_INET,.sin_port=htons((unsigned short)atoi(argv[1]))};
     inet_pton(AF_INET,"10.0.2.100",&peer.sin_addr);
@@ -203,6 +264,7 @@ int main(int argc,char** argv){
     if(sendto(udp,reply,982,0,(struct sockaddr*)&peer,length)!=982)return fail("1024-byte ZLP echo");
     close(udp);
     if(pool_test && async_pool_test())return fail("async pool wait");
+    if(blocked_close && async_blocked_close_test())return fail("async blocked close");
     puts("ECM_NETWORK_INTEGRITY_OK bytes=262144 zlp_frames=64,1024");
     sleep(2);
     for(unsigned pass=0;pass<8;++pass)if(storage(file,pass))return fail("USB after disconnect");
