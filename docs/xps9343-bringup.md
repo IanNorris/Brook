@@ -2836,3 +2836,13 @@ volume changes, with no driver quarantine. A QEMU boot and hosted driver tests
 also passed. Recovery generation 92 was selected for the next boot; the test
 kernel's restart reached the shutdown coordinator's ready state. Audible
 application playback and perceived volume still require an attended test.
+
+The muted Dell runtime was also exercised through the installed Firefox ALSA
+configuration and its real OSS plugin, using `scripts/workloads/alsa_native_probe.c`.
+Five-second 44.1 kHz and 48 kHz stereo streams each wrote all requested frames,
+reported a nonnegative delay and drained successfully; the 48 kHz run used the
+configuration's conversion to the 44.1 kHz OSS device. Speaker output remained
+disabled and no driver fault was reported. Shutdown then stopped and retired
+the stream successfully, and recovery generation 94 was selected. These are
+functional short-stream checks, not proof of browser behavior, acoustic quality,
+long-duration continuity, or accurate volume.
