@@ -2949,3 +2949,12 @@ QEMU without an audio device, and a Dell update dry run reported slot 0 ready
 without storage modification or activation. The Dell remains on its recovery
 boot. This is preparation for an attended test, not proof of the hardware's
 audible behavior or an authorization to play sound unattended.
+
+On a separate speaker-disabled Dell boot, the installed Settings application
+was exercised against the live audio-control syscall. Moving the volume slider
+changed the reported level from 20 to 25; the mute checkbox changed the
+reported mute bit from set to clear and back to set. Hardware diagnostics
+confirmed that speaker output remained disabled throughout. The test did not
+apply or persist desktop settings. Recovery generation 112 was selected
+afterward. This verifies the UI-to-kernel control path, not audible gain or
+unmute behavior.
