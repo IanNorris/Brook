@@ -6,6 +6,8 @@
 #include "fatfs_glue.h"
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 #include "ext2_vfs.h"
+#include "large_data_session.h"
+#include "serial.h"
 #endif
 #include "memory/heap.h"
 #include "mount_namespace.h"
@@ -38,6 +40,7 @@ const BlockDeviceOps ops{Read,Write,Control,nullptr,Blocks,BlockSize};
 Device partition{reinterpret_cast<const DeviceOps*>(&ops),"ahci-system",DeviceType::Block,nullptr};
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 AhciDataInspection largeInspection{};bool largeInspectionClean=false;
+uint8_t largeUuid[16]{};LargeDataSession largeSession{};
 Range largeRange{};
 int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
     if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
@@ -57,6 +60,10 @@ uint64_t LargeBlocks(Device*) {return largeRange.bytes/512;}
 uint32_t LargeBlockSize(Device*) {return 512;}
 const BlockDeviceOps largeOps{LargeRead,LargeWrite,LargeControl,nullptr,LargeBlocks,LargeBlockSize};
 Device largePartition{reinterpret_cast<const DeviceOps*>(&largeOps),"ahci-qemu-large",DeviceType::Block,nullptr};
+WritableDesktopIo LargeIo() {return {&largePartition,
+    [](void* p,uint64_t at,void* buf,uint32_t n)->int {auto* d=static_cast<Device*>(p);return d->ops->read(d,at,buf,n);},
+    [](void* p,uint64_t at,const void* buf,uint32_t n)->int {return DeviceWrite(static_cast<Device*>(p),at,buf,n);},
+    [](void* p)->int {return DeviceFlush(static_cast<Device*>(p));}};}
 #endif
 
 AhciSystemBoot Fail(const char* stage) {
@@ -170,7 +177,9 @@ void AhciSystemDataInspect() {
     kfree(entries);kfree(backup);kfree(gdt);
     if(state==AhciDataInspectionState::Clean) {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-        if(AhciDisposableLargeDataWritable()){largeInspection=result;largeInspectionClean=true;}
+        if(AhciDisposableLargeDataWritable()){
+            largeInspection=result;memcpy(largeUuid,data.filesystemUuid,sizeof(largeUuid));largeInspectionClean=true;
+        }
 #endif
         KPrintf("ahci data inspect: format eligible entry=%u groups=%u (read only)\n",result.data.entry,result.geometry.groups);
     }
@@ -192,10 +201,22 @@ bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive) {
         if(mount.used && Prefix(mount.mountPoint,"/mnt/ahcitest"))return false;
     }
     largeRange={disk,largeInspection.data.first*512,largeInspection.data.count*512};
+    constexpr uint32_t GdtCapacity=4096*32;
+    auto* gdt=static_cast<uint8_t*>(kmalloc(GdtCapacity));if(!gdt)return false;
+    const int begin=largeSession.Begin(LargeIo(),largeRange.bytes,largeUuid,gdt,GdtCapacity);
+    kfree(gdt);if(begin)return false;
+    SerialPuts("AHCI_QEMU_LARGE_SESSION_DIRTY\n");
     if(!DeviceRegister(&largePartition))return false;
     if(!Ext2BindDevice(*nextDrive,&largePartition))return false;
     const uint8_t drive=(*nextDrive)++;
-    return VfsMountConfigured("/mnt/ahcitest","ext2",drive,0);
+    if(!VfsMountConfigured("/mnt/ahcitest","ext2",drive,0))return false;
+    return largeSession.Arm();
+}
+int AhciSystemQemuLargeDataFinalSync() {
+    const bool armed=largeSession.armed;
+    const int result=largeSession.Finish(LargeIo(),DeviceFinalSyncOwner());
+    if(armed)SerialPuts(result?"AHCI_QEMU_LARGE_SESSION_CLEAN_FAILED\n":"AHCI_QEMU_LARGE_SESSION_CLEAN\n");
+    return result;
 }
 #endif
 } // namespace brook

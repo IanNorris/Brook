@@ -9,5 +9,6 @@ void AhciSystemDataInspect();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 // Disposable, identity-gated QEMU fixture only; never part of production boot.
 bool AhciSystemQemuLargeDataMount(uint8_t* nextDrive);
+int AhciSystemQemuLargeDataFinalSync();
 #endif
 }

@@ -16,4 +16,7 @@ e2fsck -fn "$image" > "$tmp/fsck.log" 2>&1
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -iquote "$root/src/kernel/src" \
     "$root/src/tests/test_ext2_extended_time/main.cpp" -o "$tmp/time"
 "$tmp/time"
-echo 'Large ext2 geometry, header and extended time host checks passed'
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -Wno-misleading-indentation -iquote "$root/src/kernel/src" \
+    "$root/src/tests/test_large_data_session/main.cpp" -o "$tmp/session"
+"$tmp/session"
+echo 'Large ext2 geometry, header, session and extended time host checks passed'

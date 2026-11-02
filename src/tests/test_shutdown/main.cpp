@@ -11,6 +11,9 @@ brook::PlatformPowerPlan powerPlan;
 bool writebackStopped=false;
 int syncError=0;
 int finalError=0;unsigned finalCalls=0;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+unsigned largeFinalCalls=0;
+#endif
 brook::ProcessCleanupStatus cleanup{};
 brook::Process serviceTasks[2]{};unsigned signalPid=0;
 brook::DebugTaskSnapshot census[4]{};unsigned censusCount=0;
@@ -46,6 +49,10 @@ void AudioStop(){}
 void AudioPrepareShutdown(){}
 void HdaRuntimeShutdown(){}
 int VfsSync(Vnode*){++syncs;return syncError;}
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+bool SsdQemuInstallCloseReady(){return true;}
+int AhciSystemQemuLargeDataFinalSync(){assert(writebackStopped && canFreeze && !syncError);++largeFinalCalls;return 0;}
+#endif
 int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncError);++finalCalls;return finalError;}
 void CompositorMarkDirty(){}
 void CompositorWake(){}
@@ -81,6 +88,9 @@ step();assert(!signals&&!syncs&&!gate);
     cleanup.liveUserAddressSpaces=0;cleanup.activeFinalizers=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.activeFinalizers=0;canFreeze=false;step();assert(freezes==1&&!syncs);
     canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1 && !finalCalls);
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    assert(!largeFinalCalls); // failed global sync must not mark the large store clean
+#endif
     step();assert(syncs==1);command(second,"shutdown","failed",-5);
     // A fresh explicit attempt may retry a failed flush; no implicit retry.
     const char* third="33333333333333333333333333333333";
@@ -90,6 +100,9 @@ step();assert(!signals&&!syncs&&!gate);
     current=-1;irreversible=false;
     command(third,"shutdown","closing");ShutdownCompositorPoll();step();step();syncError=0;step();
     command(third,"power_status","ready");assert(syncs==2&&gate && finalCalls==1);
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    assert(largeFinalCalls==1);
+#endif
     command(third,"cancel","too_late",-16);
     command(third,"commit","ready");assert(operations[current].commit);
     // Mocked hardware writes are reached only after successful sync, once.

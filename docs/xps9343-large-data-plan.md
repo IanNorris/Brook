@@ -214,6 +214,18 @@ all 38 allocated blocks in group 128. The independent payload comparison and
 counts, full-group fallback or interrupted-write recovery. Evidence:
 `build/hardware/ldi`.
 
-This QEMU-only path does not provide production partition ownership or the
-dirty/clean-session protocol. The helper and marker do not enable this mount
-in a production kernel. No Dell SSD access was performed by these tests.
+The QEMU-only path now rechecks the large store and marks it dirty with a
+completed flush before mounting. Following successful global VFS sync with
+write admission closed, its shutdown hook marks the store clean and flushes.
+Both create and verify boots reported the dirty and clean transitions; the
+extracted filesystem passed `e2fsck -fn` and an independent content check
+(`build/hardware/lds2`). A separate deliberately dirty clone was refused before
+the test mount while the existing desktop store started (`build/hardware/lddirty`).
+Host tests cover read, partial-write and flush failures and confirm that failed
+global sync skips clean finalization. A failed clean flush can leave an
+uncertain on-disk clean state; it is reported as failure and not retried, not
+guaranteed to be detected dirty on the next boot.
+
+This path still does not provide production partition ownership or a production
+mount. Its marker does not enable this mount in a production kernel. No Dell
+SSD access was performed by these tests.

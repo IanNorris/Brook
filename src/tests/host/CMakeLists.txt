@@ -739,6 +739,12 @@ target_compile_options(test_shutdown PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffuncti
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_shutdown PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_shutdown PROPERTIES TIMEOUT 15)
+add_executable(test_shutdown_large_data "${BROOK_ROOT}/src/tests/test_shutdown/main.cpp")
+target_compile_options(test_shutdown_large_data PRIVATE -UNDEBUG -DBROOK_HOST_TEST -DBROOK_AHCI_WRITE_TEST_HOOKS
+    -ffunction-sections -fdata-sections "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_shutdown_large_data PRIVATE -Wl,--gc-sections)
+add_test(NAME test_shutdown_large_data COMMAND test_shutdown_large_data)
+set_tests_properties(test_shutdown_large_data PROPERTIES TIMEOUT 15)
 
 add_host_test(test_gpu_scene)
 target_sources(test_gpu_scene PRIVATE ../test_gpu_scene/versions.cpp)
