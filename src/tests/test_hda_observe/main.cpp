@@ -34,6 +34,7 @@ extern "C" Vnode* VfsOpen(const char* path,int){
  if(std::strcmp(path,"/etc/dell-hda-mixer-format-probe")==0 && (scenario==36 || scenario==37))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-stream-probe")==0 && (scenario>=38 && scenario<=43))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-audio")==0 && ((scenario>=44 && scenario<=47) || (scenario>=53 && scenario<=61)))return &marker;
+ if(std::strcmp(path,"/etc/dell-hda-queue-probe")==0 && scenario==44)return &marker;
  if(std::strcmp(path,"/etc/dell-hda-audible")==0 && (scenario==60 || scenario==61))return &marker;
  if(std::strcmp(path,"/etc/dell-hda-cache-observe")==0 && scenario>=48 && scenario<=52)return &marker;
  if(std::strcmp(path,"/etc/dell-hda-dma-cache-observe")==0 && scenario>=49 && scenario<=52)return &marker;
@@ -168,6 +169,7 @@ static void one(int which){
   assert(HdaRuntimeDrainClockAvailable() && HdaRuntimeDrainClockNs()>0);
   unsigned char samples[1764]{};const auto receipt=registered->trySubmit(samples,sizeof(samples));
   assert(receipt.accepted==sizeof(samples) && !receipt.error && !chip.sawQuietUnmute);
+  {const auto q=HdaRuntimeQueueDiagnostics();assert(q.enabled && q.starts==1 && q.publishedBytes==sizeof(samples));}
   AudioDeviceProgress progress{};assert(registered->progress(&progress));assert(registered->getPosition()<=progress.completed+1764);
   registered->stop();assert(toneFrees==0 && cmd==2 && !o.runtimeQuarantined);
   assert(registered->progress(&progress) && progress.discontinuity && progress.epoch==receipt.epoch);

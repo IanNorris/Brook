@@ -1,5 +1,6 @@
 #pragma once
 #include "hda_dell_stream_publish.h"
+#include "hda_dell_queue_diagnostics.h"
 #include "../../kernel/src/audio_dma_clock.h"
 
 namespace brook {
@@ -18,6 +19,11 @@ template<class Io> class HdaDellStreamQueue {
     static constexpr uint32_t Ring=AudioDmaClock::RingBytes;
     Io& io_;AudioDmaClock clock_{};uint64_t cleared_=0,lastMovementNs_=0,clockUncertaintyNs_;uint32_t line_,guard_,maxBurst_;
     bool initialized_=false,failed_=false,closed_=false;
+    bool hasPublished_=false;HdaDellQueueDiagnostics diagnostics_{};
+    void add(uint64_t& value,uint64_t amount=1){
+        if(amount>~uint64_t(0)-value){value=~uint64_t(0);diagnostics_.saturated=true;}
+        else value+=amount;
+    }
     struct Publisher {
         HdaDellStreamQueue& q;
         bool sample(uint64_t& c){return q.sample(c);}
@@ -26,7 +32,7 @@ template<class Io> class HdaDellStreamQueue {
         bool fence(){return q.io_.fence();}
     };
     bool fail(){
-        if(!failed_){failed_=true;clock_.Fault();io_.mute();io_.stop();io_.quarantine();}
+        if(!failed_){if(diagnostics_.enabled)add(diagnostics_.faults);failed_=true;clock_.Fault();io_.mute();io_.stop();io_.quarantine();}
         return false;
     }
     bool sample(uint64_t& raw){
@@ -44,6 +50,10 @@ template<class Io> class HdaDellStreamQueue {
         if(delta>allowed)return false; // impossible jump or unobserved lap
         if(!clock_.Observe(normalized,before,after,error))return false;
         raw=clock_.RawCompleted();
+        if(diagnostics_.enabled && raw>previous && raw>clock_.submitted){
+            const uint64_t floor=previous>clock_.submitted?previous:clock_.submitted;
+            add(hasPublished_?diagnostics_.emptyAfterBytes:diagnostics_.emptyBeforeBytes,raw-floor);
+        }
         if(raw!=previous)lastMovementNs_=after;
         else if(after<lastMovementNs_ || after-lastMovementNs_>=150000000ULL)return false;
         return true;
@@ -64,7 +74,7 @@ template<class Io> class HdaDellStreamQueue {
         cleared_=end;return true;
     }
 public:
-    HdaDellStreamQueue(Io& io,uint32_t line,uint32_t guard,uint32_t maxBurst=1024,uint64_t clockUncertaintyNs=0):io_(io),clockUncertaintyNs_(clockUncertaintyNs),line_(line),guard_(guard),maxBurst_(maxBurst){}
+    HdaDellStreamQueue(Io& io,uint32_t line,uint32_t guard,uint32_t maxBurst=1024,uint64_t clockUncertaintyNs=0,bool diagnostics=false):io_(io),clockUncertaintyNs_(clockUncertaintyNs),line_(line),guard_(guard),maxBurst_(maxBurst){diagnostics_.enabled=diagnostics;}
     HdaDellStreamQueue(const HdaDellStreamQueue&)=delete;
     HdaDellStreamQueue& operator=(const HdaDellStreamQueue&)=delete;
     HdaDellStreamQueue(HdaDellStreamQueue&&)=delete;
@@ -76,7 +86,7 @@ public:
         // initialization can register or expose an active driver.
         if(!io_.write(0,nullptr,Ring) || !io_.publish(0,Ring) || !io_.fence())return fail();
         const uint64_t now=io_.nowNs();if(!clock_.Start(0,now))return fail();lastMovementNs_=now;
-        if(!io_.start())return fail();initialized_=true;return true;
+        if(!io_.start())return fail();initialized_=true;if(diagnostics_.enabled)add(diagnostics_.starts);return true;
     }
     bool service(){
         if(!initialized_ || failed_)return false;
@@ -90,8 +100,8 @@ public:
     bool shutdown(){
         if(!initialized_ || failed_ || closed_)return false;
         const bool muted=io_.mute(),stopped=io_.stop();
-        if(!muted || !stopped){failed_=true;clock_.Fault();io_.quarantine();return false;}
-        initialized_=false;closed_=true;
+        if(!muted || !stopped){if(diagnostics_.enabled)add(diagnostics_.faults);failed_=true;clock_.Fault();io_.quarantine();return false;}
+        initialized_=false;closed_=true;if(diagnostics_.enabled)add(diagnostics_.stops);
         if(clock_.Pending())clock_.Fault(); // outstanding receipts were cancelled
         else clock_.running=false;
         return true;
@@ -109,7 +119,7 @@ public:
         if(!closed_ || initialized_ || failed_ || expectedEpoch!=clock_.epoch ||
            expectedEpoch==~uint64_t(0))return false;
         clock_.Fault();if(!clock_.Restart(expectedEpoch))return false;
-        cleared_=lastMovementNs_=0;closed_=false;return true;
+        cleared_=lastMovementNs_=0;hasPublished_=false;closed_=false;return true;
     }
     HdaDellReceipt submit(const void* samples,uint32_t bytes){
         HdaDellReceipt r{clock_.epoch,clock_.submitted,0,0};
@@ -125,23 +135,30 @@ public:
         const uint64_t clearedThrough=cleared_+Ring;
         if(cursor>~uint64_t(0)-Ring){fail();r.error=-32;return r;}
         uint64_t limit=cursor+Ring-guard_-line_;if(limit>clearedThrough)limit=clearedThrough;
-        if(begin>=limit){r.begin=begin;return r;} // ordinary backpressure
+        if(begin>=limit){if(diagnostics_.enabled)add(diagnostics_.backpressure);r.begin=begin;return r;} // ordinary backpressure
         uint64_t available=(limit-begin)&~uint64_t(3);if(bytes>available)bytes=uint32_t(available);
-        if(!bytes){r.begin=begin;return r;}
-        if(begin!=clock_.submitted && !clock_.ReserveGap(begin)){fail();r.error=-32;return r;}
+        if(!bytes){if(diagnostics_.enabled)add(diagnostics_.backpressure);r.begin=begin;return r;}
+        if(begin!=clock_.submitted){
+            const uint64_t gap=begin-clock_.submitted;
+            if(!clock_.ReserveGap(begin)){fail();r.error=-32;return r;}
+            if(diagnostics_.enabled){if(hasPublished_){add(diagnostics_.laterGapEvents);add(diagnostics_.laterGapBytes,gap);}
+                else add(diagnostics_.startupGapBytes,gap);}
+        }
         r.begin=begin;Publisher p{*this};
         // Reserve before writes so an uncertain exposure stays represented in
         // the terminal epoch even if DMA passes it during publication.
         if(!clock_.Accept(bytes)){fail();r.error=-32;return r;}
         const auto published=HdaStreamPublish(p,0,begin,samples,bytes,Ring,line_,guard_);
         if(published!=HdaStreamPublishResult::Published){
+            if(diagnostics_.enabled)add(diagnostics_.publicationFailures);
             // An uncertain publication may already have reached the device.
             // Callers must not transparently retry it as if never exposed.
             if(published==HdaStreamPublishResult::Uncertain)r.accepted=bytes;
             fail();r.error=-32;return r;}
-        r.accepted=bytes;return r;
+        r.accepted=bytes;if(diagnostics_.enabled)add(diagnostics_.publishedBytes,bytes);hasPublished_=true;return r;
     }
     const AudioDmaClock& progress()const{return clock_;}
     bool failed()const{return failed_;}
+    HdaDellQueueDiagnostics diagnostics()const{return diagnostics_;}
 };
 }

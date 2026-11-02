@@ -145,6 +145,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"page_types\":");r.text(o.cachePageTypes?"true":"false");r.text(",");r.field("pages",o.cachePages);
         r.text("}\n");r.send();return true;
     }
+    if(!strcmp(command,"bridge hardware dell-hda-queue")) {
+        const auto q=HdaRuntimeQueueDiagnostics();Reply r;
+        r.text("{\"hda_queue_api\":1,\"enabled\":");r.text(q.enabled?"true":"false");
+        r.text(",\"saturated\":");r.text(q.saturated?"true":"false");
+        r.text(",");r.field("starts",q.starts);r.text(",");r.field("stops",q.stops);
+        r.text(",");r.field("faults",q.faults);r.text(",");r.field("startup_gap_bytes",q.startupGapBytes);
+        r.text(",");r.field("later_gap_events",q.laterGapEvents);r.text(",");r.field("later_gap_bytes",q.laterGapBytes);
+        r.text(",");r.field("empty_before_bytes",q.emptyBeforeBytes);r.text(",");r.field("empty_after_bytes",q.emptyAfterBytes);
+        r.text(",");r.field("published_bytes",q.publishedBytes);r.text(",");r.field("backpressure",q.backpressure);
+        r.text(",");r.field("publication_failures",q.publicationFailures);
+        r.text(",\"scope\":\"boot-opt-in queue observations under the driver lock; reserved gaps include future guard space and overlap empty-tail advances; neither proves source starvation or audible loss; counters persist across epochs\"}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware dell-hda-runtime")) {
         const auto& o=HdaObserveRead();Reply r;r.text("{\"hda_runtime_api\":1,\"requested\":");r.text(o.runtimeRequested?"true":"false");
         r.text(",\"prepared\":");r.text(o.runtimePrepared?"true":"false");r.text(",\"registered\":");r.text(o.runtimeRegistered?"true":"false");

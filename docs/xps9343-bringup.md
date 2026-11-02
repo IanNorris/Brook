@@ -2916,3 +2916,24 @@ hardware retirement succeeded. Staging was switched off afterward, and
 recovery generation 108 was selected. These sequential single samples are
 not a randomized comparison or an audible continuity test; they do not show
 that staging fixes the startup loss or justify changing the installed defaults.
+
+For physical queue investigation, `/etc/dell-hda-queue-probe` enables
+boot-fixed counters read with `bridge hardware dell-hda-queue`. They use
+existing samples under the driver lock, with no additional MMIO, clock reads,
+or PCM capture. Startup and later reserved gaps include forward guard space;
+empty-tail advances can overlap those reservations and include intentional idle
+after an app closes. Neither is an audible-drop or producer-starvation count.
+Counters persist across stream epochs, saturate rather than wrap, count only
+successful queue shutdowns as stops, and combine unsafe and uncertain
+publication failures. A failed first publication may still have reserved its
+startup gap.
+
+On an opt-in muted Dell boot, an eight-second ALSA probe drained normally. Its
+active snapshots had no later reservations or empty-tail advances; after it
+closed, empty-tail counts rose during deliberate idle. A subsequent local
+Firefox media run advanced its mixer stream over a roughly 14-second sampled
+interval without an increase in either counter; its captured log contained no
+lost-frame message. The cumulative gap before that interval includes the idle
+time between tests and cannot be assigned to active playback. Both applications
+exited, hardware retirement succeeded, and recovery generation 110 was selected.
+The result is one muted run and does not establish continuous audible output.

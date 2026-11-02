@@ -15,8 +15,8 @@ template<class Owner,class Lock,bool AllowCleanRestart=false,bool AllowAudible=f
     bool started_=false,closed_=false,retiredClean_=false,terminal_=false,hardwareMuted_=true,epochHasData_=false;
     struct Guard {Lock& lock;~Guard(){lock.unlock();}};
 public:
-    HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0):
-        owner_(owner),lock_(lock),queue_(owner,line,guard,burst,clockUncertaintyNs),
+    HdaDellAudioBridge(Owner& owner,Lock& lock,uint32_t line,uint32_t guard,uint32_t burst=1024,uint64_t clockUncertaintyNs=0,bool diagnostics=false):
+        owner_(owner),lock_(lock),queue_(owner,line,guard,burst,clockUncertaintyNs,diagnostics),
         capacity_(line>=16 && line<=4096 && !(line&(line-1)) && !(4096%line) && burst &&
             burst<=guard && guard-burst>=line && guard<AudioDmaClock::RingBytes/4?AudioDmaClock::RingBytes:0){}
     HdaDellAudioBridge(const HdaDellAudioBridge&)=delete;
@@ -67,6 +67,7 @@ public:
     // It does not expose or enable a general-purpose kernel clock.
     uint64_t drainClockNs(){lock_.lock();Guard guard{lock_};
         return !terminal_ && !closed_ && !queue_.failed()?owner_.nowNs():0;}
+    HdaDellQueueDiagnostics diagnostics(){lock_.lock();Guard guard{lock_};return queue_.diagnostics();}
     // A clean close still requires descriptor retirement; uncertain failures
     // are quarantined and cannot be restarted by either specialization.
     bool stop(){

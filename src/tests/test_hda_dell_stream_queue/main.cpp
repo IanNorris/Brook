@@ -85,4 +85,38 @@ int main(){
         randomized.advance(n,timeline);assert(rq.service());
     }
     assert(randomized.absolute>10*Fake::Ring && !rq.failed() && rq.shutdown());
+
+    // Boot-opt-in counters observe the already-sampled DMA timeline. Startup
+    // guard reservations and later empty-tail movement are distinct and may
+    // overlap, so neither is asserted to be audible loss.
+    Fake trace;HdaDellStreamQueue<Fake> observed(trace,64,4096,1024,0,true);assert(observed.start());
+    std::vector<uint8_t> observedTimeline(200000,0);
+    trace.advance(1024,observedTimeline);assert(observed.service());
+    auto stats=observed.diagnostics();assert(stats.enabled && stats.starts==1 && stats.emptyBeforeBytes==1024 && !stats.emptyAfterBytes);
+    std::memset(samples,0x47,sizeof(samples));auto first=observed.submit(samples,sizeof(samples));
+    assert(first.accepted==sizeof(samples) && !first.error);
+    std::memcpy(observedTimeline.data()+first.begin,samples,first.accepted);
+    stats=observed.diagnostics();assert(stats.startupGapBytes==first.begin && stats.publishedBytes==sizeof(samples) && !stats.laterGapEvents);
+    trace.advance(uint32_t(first.begin+sizeof(samples)),observedTimeline);assert(observed.service());
+    stats=observed.diagnostics();assert(stats.emptyAfterBytes==1024);
+    auto second=observed.submit(samples,sizeof(samples));assert(second.accepted==sizeof(samples) && !second.error);
+    stats=observed.diagnostics();assert(stats.laterGapEvents==1 && stats.laterGapBytes==second.begin-(first.begin+first.accepted));
+    assert(stats.publishedBytes==2*sizeof(samples) && !stats.faults && !stats.publicationFailures);
+    auto contiguous=observed.submit(samples,sizeof(samples));assert(contiguous.accepted==sizeof(samples));
+    assert(observed.diagnostics().laterGapEvents==1); // no new gap while the tail remains ahead
+    assert(observed.shutdown() && observed.restartAfterCleanStop(observed.progress().epoch));
+    trace.absolute=0;assert(observed.start());trace.advance(1024,observedTimeline);assert(observed.service());
+    stats=observed.diagnostics();assert(stats.starts==2 && stats.stops==1 && stats.emptyBeforeBytes==2048);
+    assert(observed.shutdown());
+    assert(!q.diagnostics().enabled && !q.diagnostics().starts && !q.diagnostics().publishedBytes);
+    Fake tracedFailure;HdaDellStreamQueue<Fake> failedTrace(tracedFailure,64,4096,1024,0,true);assert(failedTrace.start());
+    tracedFailure.failFlush=true;assert(failedTrace.submit(samples,sizeof(samples)).error);
+    stats=failedTrace.diagnostics();assert(stats.faults==1 && stats.publicationFailures==1 && !stats.publishedBytes);
+    Fake tracedFull;HdaDellStreamQueue<Fake> fullTrace(tracedFull,64,4096,1024,0,true);assert(fullTrace.start());
+    assert(fullTrace.submit(big.data(),big.size()).accepted);
+    assert(!fullTrace.submit(samples,sizeof(samples)).accepted && fullTrace.diagnostics().backpressure==1);
+    Fake tracedUncertain;HdaDellStreamQueue<Fake> uncertainTrace(tracedUncertain,64,4096,1024,0,true);assert(uncertainTrace.start());
+    tracedUncertain.moveOnFlush=true;auto uncertain=uncertainTrace.submit(samples,sizeof(samples));
+    assert(uncertain.error && uncertain.accepted==sizeof(samples));
+    stats=uncertainTrace.diagnostics();assert(stats.publicationFailures==1 && stats.faults==1 && !stats.publishedBytes);
 }

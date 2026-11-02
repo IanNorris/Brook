@@ -383,7 +383,7 @@ void PrepareRuntime(Io& io){
     static RuntimeLock lock;lock.init();alignas(RuntimeBridge) static unsigned char bridgeStorage[sizeof(RuntimeBridge)];
     // Two admitted CPUs may differ by up to 20 us. This covers the observed
     // offset bound, not systematic PIT calibration error or future drift.
-    runtimeBridge=::new(bridgeStorage) RuntimeBridge(*runtimeOwner,lock,line,4096,1024,20000);
+    runtimeBridge=::new(bridgeStorage) RuntimeBridge(*runtimeOwner,lock,line,4096,1024,20000,Marker("/etc/dell-hda-queue-probe"));
     runtimeAudibleEnabled=Marker("/etc/dell-hda-audible");
     observation.runtimeAudibleEnabled=runtimeAudibleEnabled;
     observation.runtimePrepared=true;observation.runtimeReason="prepared muted";
@@ -522,4 +522,5 @@ uint32_t HdaRuntimeStreamFailureStage(){return runtimeOwner?runtimeOwner->failed
 uint32_t HdaRuntimeStreamFailureDetail(){return runtimeOwner?runtimeOwner->failedStreamDetail():0;}
 bool HdaRuntimeDrainClockAvailable(){return observation.runtimeRegistered && runtimeBridge;}
 uint64_t HdaRuntimeDrainClockNs(){return HdaRuntimeDrainClockAvailable()?runtimeBridge->drainClockNs():0;}
+HdaDellQueueDiagnostics HdaRuntimeQueueDiagnostics(){return runtimeBridge?runtimeBridge->diagnostics():HdaDellQueueDiagnostics{};}
 }

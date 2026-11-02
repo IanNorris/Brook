@@ -41,6 +41,8 @@ bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& a,KernelAlias
 uint32_t HdaRuntimeFailureStage(){return 0;}
 uint32_t HdaRuntimeStreamFailureStage(){return 0;}
 uint32_t HdaRuntimeStreamFailureDetail(){return 0;}
+HdaDellQueueDiagnostics queueDiagnostics{};
+HdaDellQueueDiagnostics HdaRuntimeQueueDiagnostics(){return queueDiagnostics;}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
     if(index || offset>1024 || bytes>1024-offset)return false;
     h={};h.length=1024;if(bytes)std::memset(out,0xab,bytes);return true;
@@ -143,6 +145,12 @@ int main(){
     brook::hdaObservation.requested=true;brook::hdaObservation.session.completed=2;
     brook::hdaObservation.session.values[0]=123;brook::hdaObservation.session.values[1]=456;
     assert(handle("bridge hardware dell-hda-observe") && reply.find("\"values\":[123,456]")!=std::string::npos);
+    brook::queueDiagnostics.enabled=true;brook::queueDiagnostics.startupGapBytes=5184;
+    brook::queueDiagnostics.emptyAfterBytes=1200;brook::queueDiagnostics.publishedBytes=4096;
+    assert(handle("bridge hardware dell-hda-queue") && reply.find("\"enabled\":true")!=std::string::npos &&
+           reply.find("\"startup_gap_bytes\":5184")!=std::string::npos &&
+           reply.find("\"empty_after_bytes\":1200")!=std::string::npos &&
+           reply.find("\"published_bytes\":4096")!=std::string::npos);
     assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":false")!=std::string::npos);
     hdaPciPresent=true;
     assert(handle("bridge hardware dell-hda-memory") && reply.find("\"present\":true")!=std::string::npos &&
