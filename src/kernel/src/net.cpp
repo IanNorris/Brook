@@ -363,10 +363,11 @@ static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 // ARP send/receive
 // ---------------------------------------------------------------------------
 
-static void ArpSendRequest(uint32_t targetIp)
+// Use the caller's selected interface and report local enqueue failure. The
+// legacy resolver below still selects its interface and ignores this result.
+static int ArpSendRequestOn(NetIf* nif, uint32_t targetIp)
 {
-    NetIf* nif = NetIfForDst(targetIp);
-    if (!nif) return;
+    if (!nif) return -1;
 
     uint8_t frame[42]; // 14 eth + 28 arp
     memset(frame, 0, sizeof(frame));
@@ -387,7 +388,12 @@ static void ArpSendRequest(uint32_t targetIp)
     memset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
-    nif->transmit(nif, frame, 42);
+    return nif->transmit(nif, frame, 42);
+}
+
+static void ArpSendRequest(uint32_t targetIp)
+{
+    (void)ArpSendRequestOn(NetIfForDst(targetIp),targetIp);
 }
 
 static void ArpSendReply(NetIf* nif, const MacAddr& dstMac, uint32_t dstIp)

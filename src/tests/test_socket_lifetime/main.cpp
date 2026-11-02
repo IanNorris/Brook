@@ -292,6 +292,21 @@ int main() {
         frameTransmitResult=0;
     }
     {
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{1,2,3,4,5,6}};
+        nif.ipAddr=htonl(0x0a000201);const uint32_t target=htonl(0x0a000202);
+        capturedFrameLength=0;assert(ArpSendRequestOn(nullptr,target)==-1 && capturedFrameLength==0);
+        assert(ArpSendRequestOn(&nif,target)==0 && capturedFrameLength==42);
+        const auto* eth=reinterpret_cast<const EthHeader*>(capturedFrame);
+        const auto* arp=reinterpret_cast<const ArpPacket*>(capturedFrame+sizeof(EthHeader));
+        const MacAddr broadcast={{255,255,255,255,255,255}},zero={};
+        assert(!memcmp(&eth->dst,&broadcast,sizeof(broadcast)) && !memcmp(&eth->src,&nif.mac,sizeof(MacAddr)));
+        assert(ntohs(eth->etherType)==ETH_TYPE_ARP && ntohs(arp->htype)==1 &&
+               ntohs(arp->ptype)==ETH_TYPE_IPV4 && arp->hlen==6 && arp->plen==4 && ntohs(arp->oper)==ARP_OP_REQUEST &&
+               arp->spa==nif.ipAddr && arp->tpa==target && !memcmp(&arp->sha,&nif.mac,sizeof(MacAddr)) &&
+               !memcmp(&arp->tha,&zero,sizeof(MacAddr)));
+        frameTransmitResult=-11;assert(ArpSendRequestOn(&nif,target)==-11);frameTransmitResult=0;
+    }
+    {
         TcpSendFlightState invalid(17);assert(!invalid.Allocate());
         TcpSendFlightState empty(0);assert(!empty.Allocate());
         TcpSendFlightState normal(8);assert(normal.Allocate() && !normal.Allocate());

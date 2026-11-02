@@ -184,6 +184,25 @@ transmit or ID/counter changes, and propagation of a busy NIC result. The
 ordinary hosted sender path still uses its separate transmit stub. This does
 not establish driver DMA lifetime or nonblocking behavior.
 
+ARP request construction now accepts the already selected interface and
+returns its transmit result. The existing blocking resolver keeps its old
+interface selection and still ignores that result. Hosted tests check the
+actual request frame, null-interface failure and propagation of NIC busy; the
+USB Ethernet QEMU loss/concurrency suite passed. This enables a future tracker
+to distinguish a submitted request from local backpressure, but does not yet
+coordinate asynchronous resolution.
+
+Astra's proposed tracker is a fixed, bounded table of neighbor requests with
+generation-checked completion, an absolute deadline and separate retry delays
+for a submitted unanswered request versus a busy NIC. It should deduplicate
+requests without holding its lock across transmit, never reuse the existing
+global ARP reply waiter, and allow unrelated neighbors to progress. The
+current ARP cache is keyed only by IP and cannot insert when full, so an
+initial asynchronous path needs either safe cache changes or a clearly
+restricted single-interface admission and explicit capacity failure. Route
+changes, synchronous replies during transmit, table exhaustion and stale
+completions require actual-path tests before the tracker drives TCP.
+
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes
 to at most eight MSS. Retransmission timeout reduces the window to one MSS;
