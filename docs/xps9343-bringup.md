@@ -1869,6 +1869,16 @@ Dell, the CPUID gates passed and five 29,829-PIT-tick windows measured
 59,864,307–59,865,642 TSC ticks, yielding a median estimate of 2,394,626 kHz.
 This narrow spread does not rule out common acquisition bias or establish
 cross-core agreement. The known-good recovery boot was reselected afterward.
+The subsequent boot added five bounded BSP/AP rendezvous exchanges per admitted
+core while the APs were still in their bootstrap wait. On the Dell, all three
+APs completed; the intersected AP-minus-BSP intervals, in TSC ticks, were
+`[-198,1173]`, `[-141,1119]` and `[-204,1194]`. At that boot's approximate
+2,394,598 kHz this bounds the observed offsets to about 0.5 microseconds.
+Normal KVM rejected the diagnostic; a private QEMU run configured with an
+explicit invariant virtual TSC exercised all three positive AP paths and
+continued to the desktop. These are short boot-time observations, not proof of
+cross-core stability under load, idle transitions or suspend, nor clock
+admission. Recovery was reselected after the physical run.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU
