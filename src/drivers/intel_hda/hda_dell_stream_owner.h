@@ -6,8 +6,7 @@
 
 namespace brook {
 // Exclusively owns one Dell controller and its 64 KiB streaming ring. This is
-// an injected integration layer, not yet wired to AudioDriver or a physical
-// platform. The platform establishes the verified identity, full PCI resource
+// an injected integration layer. The platform establishes the verified identity, full PCI resource
 // ownership, correct uncached MMIO mapping, a monotonic clock and safe WB DMA
 // pages. No concurrent controller owner or codec transport is permitted.
 // Every call must be serialized, including service, submit and shutdown.
@@ -24,11 +23,19 @@ template<class Platform> class HdaDellStreamOwner {
         bool delayUs(unsigned n){return o.p_.delayUs(n);}bool publishDma(){return o.memory_.publishAll();}
     } streamIo_;
     HdaDellToneStream<StreamIo> stream_;HdaDellTonePlan plan_{};
-    uint32_t base_=0;bool active_=false,prepared_=false,stopped_=false,held_=false,codecTouched_=false,muted_=false;
+    uint32_t base_=0;bool active_=false,prepared_=false,stopped_=false,retained_=false,held_=false,codecTouched_=false,muted_=false;
     bool hold(){if(!held_){
         const uint16_t command=p_.command();
         if(codecTouched_ && !muted_ && !ici_.failed() && (command==2 || command==6))muted_=codec_.muteAndVerify(plan_);
         held_=true;memory_.quarantine();p_.quarantine();}return false;}
+    bool configure(){
+        uint16_t format=0;if(!HdaDellMixerFormat(saved_,format) || !p_.controllerIdle())return hold();
+        uint32_t value=0;codecTouched_=true;if(!codec_.muteAndVerify(plan_))return hold();muted_=true;
+        if(!codec_.configureMuted(plan_) || !ici_.setFormat(format) || !ici_.getFormat(value) || value!=format ||
+           !ici_.set8(3,0x706,0x10) || !ici_.get8(3,0xf06,value) || value!=0x10 ||
+           !stream_.prepare(saved_.controller.gcap,memory_.bdlPhysical(),format,65536))return hold();
+        base_=0x80+((saved_.controller.gcap>>8)&15)*0x20;prepared_=true;stopped_=retained_=false;return true;
+    }
 public:
     HdaDellStreamOwner(Platform& p,const HdaSessionReport& saved,uint32_t line):p_(p),saved_(saved),memory_(p,line),
         ici_(p,uint16_t(saved.converterFormat),true),codec_(ici_),streamIo_{*this},stream_(streamIo_){}
@@ -42,14 +49,7 @@ public:
            !p_.identityStable() || p_.command()!=0 || !memory_.allocate((saved_.controller.gcap&1)!=0))return false;
         p_.setCommand(2);
         if(p_.command()!=2){if(p_.command()==0)memory_.release(false);else hold();return false;}
-        active_=true;
-        if(!p_.controllerIdle())return hold();
-        uint32_t value=0;
-        codecTouched_=true;if(!codec_.muteAndVerify(plan_))return hold();muted_=true;
-        if(!codec_.configureMuted(plan_) || !ici_.setFormat(format) || !ici_.getFormat(value) || value!=format ||
-           !ici_.set8(3,0x706,0x10) || !ici_.get8(3,0xf06,value) || value!=0x10 ||
-           !stream_.prepare(saved_.controller.gcap,memory_.bdlPhysical(),format,65536))return hold();
-        base_=0x80+((saved_.controller.gcap>>8)&15)*0x20;prepared_=true;return true;
+        active_=true;return configure();
     }
     uint64_t nowNs(){return p_.nowNs();}
     bool position(uint32_t& raw,bool& error,bool& running){
@@ -74,15 +74,28 @@ public:
     void quarantine(){hold();}
     // Call only after the queue has successfully muted and stopped. A failure
     // may have changed hardware state: never retry or release pages.
-    bool retire(){
-        if(!prepared_ || held_ || !stopped_ || p_.command()!=2)return false;
+    bool retireRetained(){
+        if(!prepared_ || held_ || !stopped_)return false;if(p_.command()!=2)return hold();
         if(!mute())return hold();uint32_t value=0;
         if(!ici_.set8(3,0x706,0) || !ici_.get8(3,0xf06,value) || value!=0 ||
            !ici_.setFormat(uint16_t(saved_.converterFormat)) || !ici_.getFormat(value) || value!=saved_.converterFormat)return hold();
         muted_=false; // restore can partially unmute before reporting failure
         if(!codec_.restoreAndVerify(plan_,saved_) || !stream_.retire())return hold();
+        prepared_=false;retained_=true;return true;
+    }
+    // The production platform currently permits identity/cache validation on
+    // the boot CPU only. The caller must arrange that context before using
+    // this experimental primitive; the runtime bridge does not use it yet.
+    bool prepareRetained(){
+        if(!active_ || !retained_ || held_)return false;
+        if(!p_.identityStable() || p_.command()!=2)return hold();
+        return configure();
+    }
+    bool retire(){
+        if(!retained_ && !retireRetained())return false;
+        if(held_ || !active_)return false;if(p_.command()!=2)return hold();
         p_.setCommand(0);if(p_.command()!=0)return hold();
-        if(!memory_.release(true))return hold();active_=prepared_=false;return true;
+        if(!memory_.release(true))return hold();active_=retained_=false;return true;
     }
 };
 }

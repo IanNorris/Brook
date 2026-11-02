@@ -2745,8 +2745,10 @@ It is not a general-purpose kernel clock.
 On the Dell, the separate two-second diagnostic tone was heard by the user.
 In a later unattended, muted boot the backend registered and an OSS test
 accepted 176,400 bytes with short writes and no reported quarantine; the mixer
-reported clocked operation. This does not independently prove that every byte
-reached the speaker or establish long-term audio stability. A QEMU boot of the
+reported clocked operation. A subsequent run captured 20,750 completed frames
+out of 37,134 submitted while its stream remained open, with no discontinuity;
+the driver also remained unquarantined after an idle period. This does not
+prove that every byte reached the speaker or establish long-term audio stability. A QEMU boot of the
 exact candidate and hosted queue, mixer, registration and failure tests also
 passed. Recovery generation 72 was selected for the next boot after the test.
 
@@ -2755,3 +2757,8 @@ and it does not unmute speakers or provide normal application playback yet.
 Regular idle service is necessary after DMA starts even if no application is
 writing. Verified drain, reinitialization, safe volume controls and audible
 application testing remain to be implemented before enabling it by default.
+The owner has hosted-tested primitives to retire descriptors while retaining
+its pages, reprepare a zeroed ring, and finally release retained pages. They
+are not yet wired into the runtime bridge: its identity/cache validation is
+currently restricted to the boot CPU, and safe mixer epoch transitions still
+need implementation and testing.

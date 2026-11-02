@@ -19,6 +19,7 @@ struct Platform:Chip {
         if(a>=b && a<b+4096){assert(!((a-b)&63));std::memcpy(device[i]+a-b,cpu[i]+a-b,64);return;}}assert(false);}
     bool fence(){published=true;return true;}
     uint64_t nowNs(){ns+=1000000;return ns;}
+    void write16(uint32_t o,uint16_t v){Chip::write16(o,v);if(o==base && v==1 && (Chip::read16(o)&1))pos=0;}
     uint32_t read32(uint32_t o){if(o==base+4 && (read16(base)&2)){pos=(pos+192)%65536;return pos;}return Chip::read32(o);}
     void quarantine(){held=true;}
 };
@@ -31,6 +32,21 @@ int main(){
     for(unsigned i=0;i<900;++i)assert(q.service());
     assert(q.progress().RawCompleted()>2*65536 && q.shutdown() && p.pci==2 && owner.retire());
     assert(p.pci==0 && p.freed==17 && !p.held && p.format==0x31 && p.converter==0);
+    Platform reused;reused.format=0x31;HdaDellStreamOwner<Platform> retained(reused,snapshot,64);assert(retained.prepare());
+    HdaDellStreamQueue<HdaDellStreamOwner<Platform>> first(retained,64,4096);assert(first.start());
+    assert(first.submit(samples,sizeof(samples)).accepted==sizeof(samples));assert(first.shutdown() && retained.retireRetained());
+    assert(reused.allocated==17 && reused.freed==0 && reused.pci==2 && !reused.held);
+    assert(retained.prepareRetained() && reused.allocated==17 && reused.freed==0);
+    assert(reused.pos==0);HdaDellStreamQueue<HdaDellStreamOwner<Platform>> second(retained,64,4096);assert(second.start());
+    for(unsigned i=1;i<17;++i)for(unsigned j=0;j<4096;++j)assert(reused.device[i][j]==0);
+    assert(second.submit(samples,sizeof(samples)).accepted==sizeof(samples));assert(second.shutdown() && retained.retire());
+    assert(reused.allocated==17 && reused.freed==17 && reused.pci==0 && !reused.held);
+    Platform changed;changed.format=0x31;HdaDellStreamOwner<Platform> pinned(changed,snapshot,64);assert(pinned.prepare());
+    HdaDellStreamQueue<HdaDellStreamOwner<Platform>> prior(pinned,64,4096);assert(prior.start() && prior.shutdown() && pinned.retireRetained());
+    changed.identity=false;assert(!pinned.prepareRetained() && changed.held && changed.freed==0 && changed.pci==2);
+    Platform release;release.format=0x31;HdaDellStreamOwner<Platform> released(release,snapshot,64);assert(released.prepare());
+    HdaDellStreamQueue<HdaDellStreamOwner<Platform>> stopped(released,64,4096);assert(stopped.start() && stopped.shutdown() && released.retireRetained());
+    assert(released.retire() && release.freed==17 && release.pci==0 && !release.held);
     Platform broken;broken.format=0x31;HdaDellStreamOwner<Platform> other(broken,snapshot,64);assert(other.prepare());
     HdaDellStreamQueue<HdaDellStreamOwner<Platform>> bad(other,64,4096);assert(bad.start());broken.dropStop=true;
     assert(!bad.shutdown() && broken.held && broken.freed==0 && broken.pci==6 && !other.retire());
