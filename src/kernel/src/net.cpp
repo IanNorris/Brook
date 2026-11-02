@@ -12,6 +12,8 @@
 // Single-NIC, single-threaded receive path.
 
 #include "net.h"
+#include "arp_probe_tracker.h"
+#include "arp_reply_validation.h"
 #include "module.h"
 #include "tcp.h"
 #include "epoll_diagnostics.h"
@@ -97,6 +99,15 @@ static void NetInterfaceChangedLocked()
         else ++g_interfaceGeneration;
     }
 }
+struct NetSingleInterfaceSnapshot {
+    NetIf* interface=nullptr;uint64_t generation=0;
+    uint32_t ip=0,netmask=0,gateway=0;MacAddr mac{};
+};
+static bool NetReadSingleInterface(NetSingleInterfaceSnapshot* out);
+static bool g_arpAsyncProbeEnabled=false;
+static IrqSpinLock g_arpAsyncProbeLock;
+static ArpProbeTracker<16> g_arpAsyncProbe;
+static void ArpAsyncProbeReceive(NetIf* nif,const void* frame,uint32_t length);
 // Back-compat alias used by legacy single-NIC code paths below. Points at
 // g_netIfs[0] (the primary / default-route interface).
 static NetIf* g_netIf = nullptr;
@@ -386,7 +397,7 @@ static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 
 // Use the caller's selected interface and report local enqueue failure. The
 // legacy resolver below still selects its interface and ignores this result.
-static int ArpSendRequestOn(NetIf* nif, uint32_t targetIp)
+static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,uint32_t targetIp)
 {
     if (!nif) return -1;
 
@@ -395,7 +406,7 @@ static int ArpSendRequestOn(NetIf* nif, uint32_t targetIp)
 
     auto* eth = reinterpret_cast<EthHeader*>(frame);
     memset(eth->dst.b, 0xFF, 6); // broadcast
-    eth->src = nif->mac;
+    eth->src = mac;
     eth->etherType = htons(ETH_TYPE_ARP);
 
     auto* arp = reinterpret_cast<ArpPacket*>(frame + sizeof(EthHeader));
@@ -404,12 +415,18 @@ static int ArpSendRequestOn(NetIf* nif, uint32_t targetIp)
     arp->hlen  = 6;
     arp->plen  = 4;
     arp->oper  = htons(ARP_OP_REQUEST);
-    arp->sha   = nif->mac;
-    arp->spa   = nif->ipAddr;
+    arp->sha   = mac;
+    arp->spa   = sourceIp;
     memset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
     return nif->transmit(nif, frame, 42);
+}
+
+static int ArpSendRequestOn(NetIf* nif, uint32_t targetIp)
+{
+    if (!nif) return -1;
+    return ArpSendRequestFrom(nif,nif->mac,nif->ipAddr,targetIp);
 }
 
 static void ArpSendRequest(uint32_t targetIp)
@@ -446,6 +463,7 @@ static void ArpSendReply(NetIf* nif, const MacAddr& dstMac, uint32_t dstIp)
 static void HandleArp(NetIf* nif, const uint8_t* frame, uint32_t len)
 {
     if (len < sizeof(EthHeader) + sizeof(ArpPacket)) return;
+    if (g_arpAsyncProbeEnabled) ArpAsyncProbeReceive(nif,frame,len);
 
     auto* arp = reinterpret_cast<const ArpPacket*>(frame + sizeof(EthHeader));
     uint16_t op = ntohs(arp->oper);
@@ -878,6 +896,10 @@ static bool g_tcpAdaptiveFlight16 = false;
 
 void NetConfigureBoot()
 {
+    if (auto* marker=VfsOpen("/etc/arp-async-probe")) {
+        VfsClose(marker);g_arpAsyncProbeEnabled=true;
+        KPuts("net: isolated asynchronous ARP probe enabled\n");
+    }
     if (auto* marker = VfsOpen("/etc/tcp-send-probe")) {
         VfsClose(marker);g_tcpSendProbe = true;
         KPuts("net: TCP send probe enabled (aggregate diagnostics)\n");
@@ -966,10 +988,6 @@ NetIf* NetIfAt(uint32_t idx) { return (idx < NetIfCount()) ? g_netIfs[idx] : nul
 // Narrow snapshot for a future single-interface async resolver. The token
 // detects configuration changes but does not pin interface/driver lifetime or
 // make the existing IP-only ARP cache safe across configuration changes.
-struct NetSingleInterfaceSnapshot {
-    NetIf* interface=nullptr;uint64_t generation=0;
-    uint32_t ip=0,netmask=0,gateway=0;MacAddr mac{};
-};
 static bool NetReadSingleInterface(NetSingleInterfaceSnapshot* out)
 {
     if (!out) return false;
@@ -980,6 +998,64 @@ static bool NetReadSingleInterface(NetSingleInterfaceSnapshot* out)
     if (valid) *out={nif,g_interfaceGeneration,nif->ipAddr,nif->netmask,nif->gateway,nif->mac};
     IrqSpinLockRelease(&g_interfaceViewLock,flags);
     return valid;
+}
+
+using AsyncArpTracker=ArpProbeTracker<16>;
+// Diagnostic only: a request is bounded, single-interface and on-link. The
+// caller drives Service explicitly; no TCP or background-worker path uses it.
+static AsyncArpTracker::Result ArpAsyncProbeQuery(uint32_t target)
+{
+    if(!g_arpAsyncProbeEnabled)return {AsyncArpTracker::Status::Invalid,-95};
+    NetSingleInterfaceSnapshot view{};
+    if(!NetReadSingleInterface(&view))return {AsyncArpTracker::Status::Invalid,-95};
+    const uint32_t hostMask=~view.netmask;
+    const uint32_t firstOctet=ntohl(target)>>24;
+    if(!target || !hostMask || !firstOctet || firstOctet==127 || firstOctet>=224 || target==view.ip ||
+       (target&view.netmask)!=(view.ip&view.netmask) ||
+       !(target&hostMask) || (target&hostMask)==hostMask)
+        return {AsyncArpTracker::Status::Invalid,-22};
+    const auto now=ApicTickCount();
+    const auto flags=IrqSpinLockAcquire(&g_arpAsyncProbeLock);
+    const auto result=g_arpAsyncProbe.Request(view.generation,target,now,2500);
+    IrqSpinLockRelease(&g_arpAsyncProbeLock,flags);
+    return result;
+}
+
+static void ArpAsyncProbeService()
+{
+    if(!g_arpAsyncProbeEnabled)return;
+    NetSingleInterfaceSnapshot view{};
+    if(!NetReadSingleInterface(&view))return;
+    AsyncArpTracker::Ticket ticket{};
+    auto flags=IrqSpinLockAcquire(&g_arpAsyncProbeLock);
+    const bool due=g_arpAsyncProbe.Next(ApicTickCount(),&ticket);
+    IrqSpinLockRelease(&g_arpAsyncProbeLock,flags);
+    if(!due)return;
+    NetSingleInterfaceSnapshot current{};
+    // Recheck catches earlier changes; configuration can still change after
+    // this check and before transmit. The request uses copied addressing.
+    int result=-116; // ESTALE
+    if(ticket.interfaceId==view.generation && NetReadSingleInterface(&current) &&
+       current.interface==view.interface && current.generation==view.generation)
+        result=ArpSendRequestFrom(view.interface,view.mac,view.ip,ticket.ip);
+    flags=IrqSpinLockAcquire(&g_arpAsyncProbeLock);
+    (void)g_arpAsyncProbe.Complete(ticket,result,ApicTickCount());
+    IrqSpinLockRelease(&g_arpAsyncProbeLock,flags);
+}
+
+static void ArpAsyncProbeReceive(NetIf* nif,const void* frame,uint32_t length)
+{
+    if(!g_arpAsyncProbeEnabled || length<sizeof(EthHeader)+sizeof(ArpPacket))return;
+    NetSingleInterfaceSnapshot view{},current{};
+    if(!NetReadSingleInterface(&view) || view.interface!=nif)return;
+    const auto* arp=reinterpret_cast<const ArpPacket*>(static_cast<const uint8_t*>(frame)+sizeof(EthHeader));
+    uint64_t mac=0;
+    if(!ArpReplyMatches(frame,length,view.mac,view.ip,arp->spa,&mac))return;
+    if(!NetReadSingleInterface(&current) || current.interface!=nif || current.generation!=view.generation)return;
+    const auto now=ApicTickCount();
+    const auto flags=IrqSpinLockAcquire(&g_arpAsyncProbeLock);
+    (void)g_arpAsyncProbe.Reply(view.generation,arp->spa,mac,now,30000);
+    IrqSpinLockRelease(&g_arpAsyncProbeLock,flags);
 }
 
 SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid)
@@ -4566,6 +4642,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         field("slot_capacity_waits",g_tcpSendProbeStats.slotWaits);field("call_drain_waits",g_tcpSendProbeStats.drainWaits);
         field("ack_samples",g_tcpSendProbeStats.samples);field("latest_ack_latency_ticks",g_tcpSendProbeStats.rttTicks);
         field("resume_since_latest_ack_ticks",g_tcpSendProbeStats.resumeTicks);r.text("}\n");r.send();return;
+    }
+    if (StrStartsWith(cmd,"bridge arp-probe ")) {
+        const char* address=cmd+sizeof("bridge arp-probe ")-1;
+        uint32_t ip=0;uint32_t n=0;while(address[n])++n;
+        if(!ParseDottedQuad(address,n,&ip)) { DebugChannelSend("{\"arp_probe_error\":\"invalid address\"}\n");return; }
+        auto result=ArpAsyncProbeQuery(ip);
+        if(result.status==AsyncArpTracker::Status::Pending){ArpAsyncProbeService();result=ArpAsyncProbeQuery(ip);}
+        const char* status=result.status==AsyncArpTracker::Status::Pending?"pending":
+            result.status==AsyncArpTracker::Status::Resolved?"resolved":
+            result.status==AsyncArpTracker::Status::Failed?"failed":
+            result.status==AsyncArpTracker::Status::Full?"full":"invalid";
+        BridgeReply r;r.text("{\"arp_probe_api\":1,\"status\":\"");r.text(status);
+        r.text("\",\"errno\":");r.number(result.error<0?static_cast<uint64_t>(-static_cast<int64_t>(result.error)):0);
+        r.text(",");r.field("mac",result.mac);r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge network")) {
         NetDriverSnapshot s{};

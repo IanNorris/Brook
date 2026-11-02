@@ -58,9 +58,25 @@ thread_local brook::Process* currentProcess = nullptr;
 uint8_t capturedFrame[brook::ETH_FRAME_MAX]{};
 uint32_t capturedFrameLength=0;
 int frameTransmitResult=0;
-int captureFrame(brook::NetIf*,const void* frame,uint32_t length) {
+unsigned frameTransmitCalls=0;
+bool injectReplyDuringTransmit=false,changeConfigDuringTransmit=false;
+int captureFrame(brook::NetIf* nif,const void* frame,uint32_t length) {
     assert(length<=sizeof(capturedFrame));
-    memcpy(capturedFrame,frame,length);capturedFrameLength=length;
+    memcpy(capturedFrame,frame,length);capturedFrameLength=length;++frameTransmitCalls;
+    if(changeConfigDuringTransmit){
+        changeConfigDuringTransmit=false;const auto flags=brook::IrqSpinLockAcquire(&brook::g_interfaceViewLock);
+        brook::NetInterfaceChangedLocked();brook::IrqSpinLockRelease(&brook::g_interfaceViewLock,flags);
+    }
+    if(injectReplyDuringTransmit && nif && length==42){
+        injectReplyDuringTransmit=false;uint8_t reply[42]{};
+        const auto* request=reinterpret_cast<const brook::ArpPacket*>(capturedFrame+sizeof(brook::EthHeader));
+        auto* eth=reinterpret_cast<brook::EthHeader*>(reply);auto* arp=reinterpret_cast<brook::ArpPacket*>(reply+sizeof(brook::EthHeader));
+        const brook::MacAddr peer={{8,9,10,11,12,13}};
+        eth->dst=nif->mac;eth->src=peer;eth->etherType=brook::htons(brook::ETH_TYPE_ARP);
+        arp->htype=brook::htons(1);arp->ptype=brook::htons(brook::ETH_TYPE_IPV4);arp->hlen=6;arp->plen=4;
+        arp->oper=brook::htons(brook::ARP_OP_REPLY);arp->sha=peer;arp->spa=request->tpa;arp->tha=nif->mac;arp->tpa=request->spa;
+        brook::HandleArp(nif,reply,sizeof(reply));
+    }
     return frameTransmitResult;
 }
 }
@@ -331,6 +347,50 @@ int main() {
                arp->spa==nif.ipAddr && arp->tpa==target && !memcmp(&arp->sha,&nif.mac,sizeof(MacAddr)) &&
                !memcmp(&arp->tha,&zero,sizeof(MacAddr)));
         frameTransmitResult=-11;assert(ArpSendRequestOn(&nif,target)==-11);frameTransmitResult=0;
+    }
+    {
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{2,3,4,5,6,7}};
+        nif.ipAddr=htonl(0x0a000201);nif.netmask=htonl(0xffffff00);
+        const uint32_t target=htonl(0x0a000202);const MacAddr peer={{8,9,10,11,12,13}};
+        g_netIfs[0]=&nif;g_netIfCount=1;g_interfaceGeneration=40;ticks=1;
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Invalid);
+        g_arpAsyncProbeEnabled=true;
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        assert(ArpAsyncProbeQuery(htonl(0x0a000301)).status==AsyncArpTracker::Status::Invalid);
+        ArpAsyncProbeService();assert(capturedFrameLength==42);
+        uint8_t reply[42]{};auto* eth=reinterpret_cast<EthHeader*>(reply);
+        auto* arp=reinterpret_cast<ArpPacket*>(reply+sizeof(EthHeader));
+        eth->dst=nif.mac;eth->src=peer;eth->etherType=htons(ETH_TYPE_ARP);
+        arp->htype=htons(1);arp->ptype=htons(ETH_TYPE_IPV4);arp->hlen=6;arp->plen=4;
+        arp->oper=htons(ARP_OP_REPLY);arp->sha=peer;arp->spa=target;arp->tha=nif.mac;arp->tpa=nif.ipAddr;
+        arp->tha.b[0]^=2;HandleArp(&nif,reply,sizeof(reply));
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        arp->tha=nif.mac;HandleArp(&nif,reply,sizeof(reply));
+        auto result=ArpAsyncProbeQuery(target);
+        assert(result.status==AsyncArpTracker::Status::Resolved && result.mac==0x0d0c0b0a0908ULL);
+        NetInterfaceChangedLocked();
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        HandleArp(&nif,reply,sizeof(reply)); // old reply before a new submission
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        // A synchronous reply wins over the subsequent busy completion.
+        g_arpAsyncProbe=AsyncArpTracker{};ticks=1;
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        injectReplyDuringTransmit=true;frameTransmitResult=-11;ArpAsyncProbeService();frameTransmitResult=0;
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Resolved);
+        // Repeated NIC busy is rate limited and expires rather than spinning.
+        g_arpAsyncProbe=AsyncArpTracker{};ticks=1;frameTransmitCalls=0;
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        frameTransmitResult=-11;ArpAsyncProbeService();ticks=2;ArpAsyncProbeService();
+        assert(frameTransmitCalls==1);ticks=11;ArpAsyncProbeService();assert(frameTransmitCalls==2);
+        ticks=2501;assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Failed);frameTransmitResult=0;
+        // A generation change during transmit cannot resolve the new request.
+        g_arpAsyncProbe=AsyncArpTracker{};ticks=1;
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        changeConfigDuringTransmit=true;injectReplyDuringTransmit=true;ArpAsyncProbeService();
+        assert(ArpAsyncProbeQuery(target).status==AsyncArpTracker::Status::Pending);
+        g_arpAsyncProbeEnabled=false;g_arpAsyncProbe=AsyncArpTracker{};
+        g_netIfs[0]=nullptr;g_netIfCount=0;g_interfaceGeneration=1;
+        memset(g_arpCache,0,sizeof(g_arpCache));g_arpCount=0;
     }
     {
         using Tracker=ArpProbeTracker<2>;Tracker tracker;Tracker::Ticket first{},other{},retry{};

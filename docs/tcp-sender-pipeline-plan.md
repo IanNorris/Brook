@@ -203,16 +203,16 @@ restricted single-interface admission and explicit capacity failure. Route
 changes, synchronous replies during transmit, table exhaustion and stale
 completions require actual-path tests before the tracker drives TCP.
 
-An inactive `ArpProbeTracker` now implements the bounded request state: it
+`ArpProbeTracker` implements the bounded request state: it
 deduplicates by caller-supplied interface lifetime and IP, separates busy
 retries from submitted attempts, imposes an absolute deadline, uses
 round-robin dispatch, and rejects stale completion tickets. Its caller must
 serialize operations, provide monotonic millisecond ticks and pin interface
 lifetime during transmit. Hosted tests exercise those transitions alongside the
 actual ARP request-frame builder, including table exhaustion, NIC busy,
-expiry and late completion. Astra reviewed the tracker. It is not instantiated
-in the network runtime and therefore makes no ARP or TCP behavior change;
-cache-full handling, admission and integration remain open.
+expiry and late completion. Astra reviewed the tracker. It was initially
+host-only; the opt-in diagnostic integration described below does not drive
+TCP or replace the legacy resolver.
 
 The existing ARP cache lookup now exposes a locked three-way result: found,
 missing with space, or missing while full. The legacy resolver still treats
@@ -237,7 +237,7 @@ token does not pin driver storage, serialize transmit with configuration
 changes, or make old IP-only ARP entries valid for the current generation.
 `NetInit` remains a boot-only initialization.
 
-The inactive tracker now retains bounded, expiring resolved MAC values keyed
+The tracker retains bounded, expiring resolved MAC values keyed
 by the caller's configuration token and IP, separate from the legacy ARP
 cache. It accepts a result only for a pending request after submission starts,
 rejects invalid unicast encodings, protects a synchronous reply from a late
@@ -246,17 +246,32 @@ cover separate configuration tokens, expiry, reply timing and earliest-expiry
 replacement. This is not packet validation or authenticated ARP: integration
 must verify the received frame, selected interface and current generation,
 and revalidate before use. A delayed or forged reply on the same configuration
-cannot be distinguished cryptographically. The tracker is still inactive.
+cannot be distinguished cryptographically.
 
 A separate reply validator now checks the Ethernet and ARP format, sender
 and target IPs, local destination/target MAC, agreement between sender MAC
 fields and a nonzero unicast sender MAC. Its strict diagnostic policy rejects
 broadcast-destination replies. The hosted test covers valid padded and
 unaligned packets, truncation, malformed fields and mismatched addresses. Astra
-reviewed it. It is not yet called by the runtime; integration must use a
-stable receive buffer, bind it to an outstanding request and revalidate the
-selected interface generation. These checks are not authentication and cannot
-prove a matching reply is fresh.
+reviewed it. These checks are not authentication and cannot prove a matching
+reply is fresh.
+
+An isolated diagnostic path now combines the tracker and validator when the
+boot marker `/etc/arp-async-probe` is present. `bridge arp-probe <IPv4>`
+queries an on-link unicast neighbor and drives at most one due request per
+invocation. It accepts a validated reply only against an outstanding request
+and a matching single-interface configuration generation; it does not consume
+the legacy IP-only cache or drive TCP. QEMU USB Ethernet tests resolved the
+virtual gateway, rejected an off-link target, timed out an unanswered target,
+and kept the bridge responsive; a second boot verified the command is disabled
+without the marker. Hosted actual-path tests cover a synchronous reply during
+transmit, NIC busy/retry/expiry and configuration change during transmit.
+Astra reviewed the integration. The response is not linearized against a
+configuration change after its snapshot, and one request can still be sent
+with copied old configuration if that change races the last check. NIC
+callbacks are not generally guaranteed nonblocking. Rejected diagnostic
+replies still pass through the unchanged legacy ARP-learning path. This is a
+bounded diagnostic, not a production resolver or a throughput improvement.
 
 An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
 state per connection, starts at two MSS and grows on newly acknowledged bytes

@@ -22,6 +22,7 @@ ap.add_argument('--drop-tcp-packet',action='store_true',help='Drop one guest TCP
 ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
 ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
 ap.add_argument('--send-user-copy',action='store_true',help='Also exercise send, writev and multi-iovec sendmsg')
+ap.add_argument('--arp-async-probe',action='store_true',help='Exercise the opt-in single-interface ARP diagnostic')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))>1:ap.error('choose only one flight mode')
@@ -80,6 +81,7 @@ if args.tcp_flight4:run('mcopy','-i',initrd,marker,'::ETC/tcp-four-packet-flight
 if args.tcp_adaptive_flight:run('mcopy','-i',initrd,marker,'::ETC/tcp-adaptive-flight')
 if args.tcp_adaptive_flight16:run('mcopy','-i',initrd,marker,'::ETC/tcp-adaptive-flight16')
 if args.tcp_send_probe:run('mcopy','-i',initrd,marker,'::ETC/tcp-send-probe')
+if args.arp_async_probe:run('mcopy','-i',initrd,marker,'::ETC/arp-async-probe')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -207,6 +209,58 @@ try:
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
   (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')
+  if args.arp_async_probe:
+   deadline=time.monotonic()+5;probe=None
+   while time.monotonic()<deadline:
+    s.sendall(b'@74 bridge arp-probe 10.0.2.2\n');reply=b''
+    while b'BRIDGE_END 74' not in reply and len(reply)<65536:
+     chunk=s.recv(8192)
+     if not chunk:break
+     reply+=chunk
+    assert b'BRIDGE_BEGIN 74' in reply and b'BRIDGE_END 74' in reply,reply
+    probe=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
+    if probe['status']=='resolved':break
+    assert probe['status']=='pending',probe
+    time.sleep(.05)
+   assert probe and probe['status']=='resolved' and probe['mac'] and not (probe['mac']&1),probe
+   (base/'arp-async-probe.json').write_text(json.dumps(probe,indent=2)+'\n')
+   for tag,address,expected in [(75,'10.0.3.1','invalid'),(76,'10.0.2.199','pending')]:
+    s.sendall(f'@{tag} bridge arp-probe {address}\n'.encode());reply=b''
+    while f'BRIDGE_END {tag}'.encode() not in reply and len(reply)<65536:
+     chunk=s.recv(8192)
+     if not chunk:break
+     reply+=chunk
+    assert f'BRIDGE_BEGIN {tag}'.encode() in reply and f'BRIDGE_END {tag}'.encode() in reply,reply
+    result=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
+    assert result['status']==expected,result
+   s.sendall(b'@77 bridge network\n');reply=b''
+   while b'BRIDGE_END 77' not in reply and len(reply)<65536:
+    chunk=s.recv(8192)
+    if not chunk:break
+    reply+=chunk
+   assert b'BRIDGE_BEGIN 77' in reply and b'BRIDGE_END 77' in reply,reply
+   deadline=time.monotonic()+6;unresolved=None
+   while time.monotonic()<deadline:
+    s.sendall(b'@78 bridge arp-probe 10.0.2.199\n');reply=b''
+    while b'BRIDGE_END 78' not in reply and len(reply)<65536:
+     chunk=s.recv(8192)
+     if not chunk:break
+     reply+=chunk
+    assert b'BRIDGE_BEGIN 78' in reply and b'BRIDGE_END 78' in reply,reply
+    unresolved=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
+    if unresolved['status']=='failed':break
+    assert unresolved['status']=='pending',unresolved
+    time.sleep(.25)
+   assert unresolved and unresolved['status']=='failed' and unresolved['errno']==110,unresolved
+  else:
+   s.sendall(b'@79 bridge arp-probe 10.0.2.2\n');reply=b''
+   while b'BRIDGE_END 79' not in reply and len(reply)<65536:
+    chunk=s.recv(8192)
+    if not chunk:break
+    reply+=chunk
+   assert b'BRIDGE_BEGIN 79' in reply and b'BRIDGE_END 79' in reply,reply
+   disabled=json.loads(next(line for line in reply.splitlines() if line.startswith(b'{')))
+   assert disabled['status']=='invalid' and disabled['errno']==95,disabled
   if args.tcp_send_probe:
    s.sendall(b'@73 bridge tcp send-probe\n');reply=b''
    while b'BRIDGE_END 73' not in reply and len(reply)<65536:
