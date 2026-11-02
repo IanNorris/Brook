@@ -28,5 +28,6 @@ int AhciDisposableQemuTest();
 bool AhciDisposableQemuWritable();
 bool AhciDisposableLargeDataWritable();
 Device* AhciDisposableQemuInstallDevice();
+Device* AhciDisposableQemuBlockToolsDevice();
 #endif
 } // namespace brook

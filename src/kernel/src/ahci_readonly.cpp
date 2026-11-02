@@ -40,6 +40,7 @@ bool physicalInstallMode=false;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
 bool testInstallMode=false;
+bool blockToolsMode=false;
 bool largeDataTestWritable=false;
 bool TestKvm() {
     uint32_t a,b,c,d;
@@ -330,9 +331,16 @@ void AhciReadOnlyInit() {
     const bool installPresent=installMarker!=nullptr;if(installMarker)VfsClose(installMarker);
     auto* largeMarker=VfsOpen("/etc/ahci-qemu-large-data-test");
     const bool largePresent=largeMarker!=nullptr;if(largeMarker)VfsClose(largeMarker);
-    const bool conflicting=largePresent && (markerPresent || installPresent);
+    auto* toolsMarker=VfsOpen("/etc/ahci-qemu-block-tools-test");
+    const bool toolsPresent=toolsMarker!=nullptr;if(toolsMarker)VfsClose(toolsMarker);
+    const bool conflicting=largePresent && (markerPresent || installPresent || toolsPresent);
     const bool flush=AtaSupportsFlushExt(dma+dataOffset,512);
-    if(largePresent) {
+    if(toolsPresent) {
+        blockToolsMode=!markerPresent && !installPresent && !largePresent &&
+            (AhciDisposableTestAdmission(true,TestKvm(),selected,info,flush) ||
+             AhciDisposableDesktopInstallAdmission(true,TestKvm(),selected,info,flush));
+        writeEnabled=blockToolsMode;
+    } else if(largePresent) {
         largeDataTestWritable=AhciDisposableLargeDataAdmission(true,conflicting,TestKvm(),selected,info,flush);
         // A present large-test marker never falls back to production or legacy
         // test admission in this test kernel, even if the identity is wrong.
@@ -377,7 +385,7 @@ Device* AhciWriteAdmittedDevice() {
     if(physicalInstallMode)return nullptr;
 #endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    if(testInstallMode)return nullptr; // reserve the test target from boot mounts
+    if(testInstallMode || blockToolsMode)return nullptr; // reserve test target from boot mounts
 #endif
     KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);
     return result;
@@ -419,6 +427,10 @@ bool AhciDisposableQemuWritable() { return testWritable && !testInstallMode && _
 bool AhciDisposableLargeDataWritable() { return largeDataTestWritable && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }
 Device* AhciDisposableQemuInstallDevice() {
     if(!testWritable || !testInstallMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+    KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;
+}
+Device* AhciDisposableQemuBlockToolsDevice() {
+    if(!blockToolsMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
     KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;
 }
 int AhciDisposableQemuTest() {

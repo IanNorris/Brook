@@ -1,5 +1,6 @@
 #include "process_fs.h"
 #include "seek_position.h"
+#include "device.h"
 #include "kprintf.h"
 #include "mount_namespace.h"
 #include "tmpfs.h"
@@ -2000,6 +2001,50 @@ static constexpr uint64_t AppendStageLimit = 64 * 1024;
 // Backend/VFS byte results are signed int. Bound ordinary writes rather than
 // narrowing a 64-bit request (which can wrap to zero or a negative result).
 static constexpr uint64_t VnodeWriteLimit = 0x7ffff000ULL;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+// A private test-only descriptor for an unmounted, identity-checked QEMU
+// installer disk. Production builds do not expose it.
+struct MaintenanceBlockFd {
+    Device* device;
+    uint64_t bytes,position;
+    uint32_t refs;
+    KMutex lock;
+};
+static uint32_t maintenanceBlockOpen=0;
+static int64_t MaintenanceBlockTransfer(MaintenanceBlockFd* file,uint64_t address,
+                                        uint64_t count,uint64_t* position,
+                                        bool write,bool userBuffer) {
+    if(!file || !position)return -EBADF;
+    if(*position>=file->bytes)return write && count ? -28 : 0;
+    if(count>file->bytes-*position)count=file->bytes-*position;
+    if(count>VnodeWriteLimit)count=VnodeWriteLimit;
+    if(!count)return 0;
+    constexpr uint64_t chunkSize=16384;
+    auto* buffer=static_cast<uint8_t*>(kmalloc(chunkSize));
+    if(!buffer)return -ENOMEM;
+    uint64_t completed=0;
+    int error=0;
+    while(completed<count) {
+        const uint64_t n=count-completed<chunkSize?count-completed:chunkSize;
+        if(write) {
+            if(userBuffer) {
+                if(!CopyFromUser(buffer,address+completed,n)){error=-EFAULT;break;}
+            } else memcpy(buffer,reinterpret_cast<const void*>(address+completed),n);
+            const int result=DeviceWrite(file->device,*position,buffer,n);
+            if(result<=0 || uint64_t(result)>n){error=result<0?result:-EIO;break;}
+            *position+=uint64_t(result);completed+=uint64_t(result);
+            if(uint64_t(result)!=n)break;
+        } else {
+            const int result=file->device->ops->read(file->device,*position,buffer,n);
+            if(result<=0 || uint64_t(result)>n){error=result<0?result:-EIO;break;}
+            if(!CopyToUser(address+completed,buffer,uint64_t(result))){error=-EFAULT;break;}
+            *position+=uint64_t(result);completed+=uint64_t(result);
+            if(uint64_t(result)!=n)break;
+        }
+    }
+    kfree(buffer);return completed?int64_t(completed):error;
+}
+#endif
 static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uint64_t* offset)
 {
     if (!count) return 0;
@@ -2018,6 +2063,16 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
 static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                                      uint64_t bufAddr,uint64_t count,bool userSource)
 {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        if((fde->statusFlags&3)==0)return -EBADF;
+        auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
+        KMutexLock(&block->lock);
+        int64_t result=MaintenanceBlockTransfer(block,bufAddr,count,&block->position,true,userSource);
+        if(result>0 && (fde->statusFlags&0x1000)) {const int error=DeviceFlush(block->device);if(error)result=error;}
+        KMutexUnlock(&block->lock);return result;
+    }
+#endif
     if(fde->type==FdType::NetlinkSocket)
         return NetlinkSend(static_cast<NetlinkSocket*>(fde->handle),bufAddr,count,0,0,0,userSource);
     // Debug serial writes directly, bypassing the async ring buffer.
@@ -2452,6 +2507,15 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (count > 0 && !UserBufferWritable(bufAddr, count))
         return -EFAULT;
 
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        if((fde->statusFlags&3)==1)return -EBADF;
+        auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
+        KMutexLock(&block->lock);
+        const int64_t result=MaintenanceBlockTransfer(block,bufAddr,count,&block->position,false,true);
+        KMutexUnlock(&block->lock);return result;
+    }
+#endif
     if (fde->type == FdType::Vnode && fde->handle && !FdNamedFifo(fde))
     {
         auto* vn = static_cast<Vnode*>(fde->handle);
@@ -3364,6 +3428,26 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     const char* lookupPath=hasSyntheticName?resolvedPath:path;
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(StrEq(syntheticPath,"/dev/brook-test-disk")) {
+        if(proc->euid!=0)return -EPERM;
+        if((flags&3)==3 || (flags&(0x40|0x200|0x10000|0x200000)))return -EINVAL;
+        Device* device=AhciDisposableQemuBlockToolsDevice();
+        if(!device || !device->ops || !device->ops->read || !device->ops->write)return -ENODEV;
+        const uint64_t sectors=DeviceBlockCount(device),size=DeviceBlockSize(device);
+        if(!size || sectors>0x7fffffffffffffffULL/size)return -EINVAL;
+        if(__atomic_exchange_n(&maintenanceBlockOpen,1,__ATOMIC_ACQ_REL))return -16;
+        auto* block=static_cast<MaintenanceBlockFd*>(kmalloc(sizeof(MaintenanceBlockFd)));
+        if(!block){__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -ENOMEM;}
+        block->device=device;block->bytes=sectors*size;block->position=0;block->refs=1;KMutexInit(&block->lock);
+        FdEntry entry{};entry.type=FdType::BlockDevice;entry.handle=block;
+        entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
+        const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        if(fd<0){kfree(block);__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);return -EMFILE;}
+        return fd;
+    }
+#endif
+
     if(flags&0x200000) { // O_PATH: retained metadata, never synthetic data I/O.
         const uint64_t normalized=flags&(0x200000u|0x10000u|0x20000u);
         int error=0;
@@ -3780,6 +3864,14 @@ static int64_t sys_creat(uint64_t path,uint64_t mode,uint64_t,uint64_t,uint64_t,
 void FinalizeClosedFd(const FdClaimResult& c)
 {
     KernelOperationGuard operation(ProcessCurrent());
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(c.type==FdType::BlockDevice && c.handle) {
+        auto* block=static_cast<MaintenanceBlockFd*>(c.handle);
+        if(__atomic_fetch_sub(&block->refs,1,__ATOMIC_ACQ_REL)==1) {
+            kfree(block);__atomic_store_n(&maintenanceBlockOpen,0,__ATOMIC_RELEASE);
+        }
+    }
+#endif
     if ((c.type == FdType::Vnode || c.type == FdType::Path) && c.handle)
     {
         auto* vn = static_cast<Vnode*>(c.handle);
@@ -4018,6 +4110,10 @@ static void FdBumpRefcount(const FdEntry* fde)
     if (!fde->handle) return;
     switch (fde->type)
     {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    case FdType::BlockDevice:
+        __atomic_fetch_add(&static_cast<MaintenanceBlockFd*>(fde->handle)->refs,1,__ATOMIC_RELAXED);break;
+#endif
     case FdType::Pipe: {
         auto* pipe = static_cast<PipeBuffer*>(fde->handle);
         if (fde->flags & 1)
@@ -4175,6 +4271,17 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     FdEntry* fde = ref.get();
 
     if(FdPipe(fde))return -29;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
+        KMutexLock(&block->lock);
+        uint64_t base=whence==0?0:whence==1?block->position:block->bytes;
+        uint64_t result=0;
+        const bool ok=whence<=2 && SeekPosition(base,static_cast<int64_t>(offset),result);
+        if(ok)block->position=result;
+        KMutexUnlock(&block->lock);return ok?int64_t(result):-EINVAL;
+    }
+#endif
     if(fde->type==FdType::SignalFd)return whence<=4?0:-EINVAL; // Linux noop_llseek
     if(fde->type==FdType::SyncFile)return -29; // ESPIPE
 
@@ -7010,6 +7117,22 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdEntry* fde = ref.get();
     if (!fde || fde->type==FdType::Path) return -EBADF;
 
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
+        if(cmd==0x80081272 || cmd==0x1260) {
+            const uint64_t value=cmd==0x1260?block->bytes/512:block->bytes;
+            return CopyToUser(arg,&value,sizeof(value))?0:-EFAULT;
+        }
+        if(cmd==0x125e || cmd==0x1268 || cmd==0x127b) {
+            const uint32_t value=cmd==0x125e?0:cmd==0x127b?
+                AhciReadOnlyGetStatus().physicalSectorBytes:DeviceBlockSize(block->device);
+            return CopyToUser(arg,&value,sizeof(value))?0:-EFAULT;
+        }
+        return -25;
+    }
+#endif
+
     if((fde->type==FdType::Socket || fde->type==FdType::UnixSocket || fde->type==FdType::NetlinkSocket) && ((cmd>=0x8910 && cmd<=0x891b) || cmd==0x8921 || cmd==0x8927 || cmd==0x8933))
         return NetlinkInterfaceIoctl(cmd,arg);
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)
@@ -7859,6 +7982,15 @@ static bool BusyboxStatFallback(const char* path, VnodeStat* vs)
 // driver being present so we never advertise an unusable node.
 static bool DrmStatFill(const char* path, LinuxStat* st)
 {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(StrEq(path,"/dev/brook-test-disk")) {
+        Device* device=AhciDisposableQemuBlockToolsDevice();
+        if(!device)return false;
+        memset(st,0,sizeof(*st));st->st_mode=0060600;st->st_nlink=1;
+        st->st_ino=1;st->st_rdev=0xf000;st->st_blksize=DeviceBlockSize(device);
+        return true;
+    }
+#endif
     if (!brook::GpuAppGet()) return false;
     if (StrEq(path, "/dev/dri/renderD128"))
     {
@@ -8022,6 +8154,15 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
+
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
+        memset(st,0,sizeof(*st));st->st_mode=0060600;st->st_nlink=1;
+        st->st_ino=1;st->st_rdev=0xf000;st->st_blksize=DeviceBlockSize(block->device);
+        return 0;
+    }
+#endif
 
     if (IsTerminalFd(fde)) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
@@ -8344,6 +8485,11 @@ static int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
     if (!fde || fde->type == FdType::None || fde->type==FdType::Path) return -EBADF;
+
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle)
+        return DeviceFlush(static_cast<MaintenanceBlockFd*>(fde->handle)->device);
+#endif
 
     if (fde->type == FdType::Vnode && fde->handle)
         return VfsFsync(static_cast<Vnode*>(fde->handle));
@@ -11293,6 +11439,16 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if(FdPipe(fde))return -29;
     if (!fde || fde->type==FdType::Path) return -EBADF;
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        if((fde->statusFlags&3)==0)return -EBADF;
+        if(count && !UserBufferReadable(bufAddr,count))return -EFAULT;
+        auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
+        int64_t result=MaintenanceBlockTransfer(block,bufAddr,count,&offset,true,true);
+        if(result>0 && (fde->statusFlags&0x1000)) {const int error=DeviceFlush(block->device);if(error)result=error;}
+        return result;
+    }
+#endif
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 0) return -EBADF;
         if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
@@ -12877,6 +13033,12 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
     if (count && !UserBufferWritable(bufAddr, count)) return -EFAULT;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(fde->type==FdType::BlockDevice && fde->handle) {
+        if((fde->statusFlags&3)==1)return -EBADF;
+        return MaintenanceBlockTransfer(static_cast<MaintenanceBlockFd*>(fde->handle),bufAddr,count,&offset,false,true);
+    }
+#endif
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 1) return -EBADF;
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
