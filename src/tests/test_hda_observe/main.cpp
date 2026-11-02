@@ -86,7 +86,7 @@ static void one(int which){
   if(which==21)chip.mem[0x70]=1;if(which==23)chip.dropBdlClear=true;if(which==24)chip.dropStop=true;
   if(which==28)chip.mem[Chip::base+2]=0x10;if(which==29)chip.corruptNewFormat=true;
   if(which==30 || which==32){chip.roPriority=true;chip.mem[Chip::base+2]=4;}if(which==32)chip.dropRetireReset=true;
-  if(which==34)chip.failStatusAfter=3;if(which==35)chip.reportEndpoint=true;if(which==36)chip.format=0x31;}
+  if(which==34)chip.failStatusAfter=3;if(which==35)chip.reportEndpoint=true;if(which==36){chip.format=0x31;chip.mem[Chip::base+0x10]=0xc0;}}
  BootProtocol boot{};MemoryDescriptor descriptor{};
  if(which==8){descriptor.physicalStart=bar;descriptor.pageCount=1;descriptor.type=MemoryType::Free;boot.memoryMap=&descriptor;boot.memoryMapCount=1;}
  HdaObserveConfigure(&boot);const auto& o=HdaObserveRead();
@@ -123,7 +123,7 @@ static void one(int which){
   o.tonePlayReason==3 && o.tonePlayLoops==1 && o.tonePlayProgress==0 && o.toneProgressReason==3 && o.toneProgressStatus==8 && cmd==2);}
  if(which==35){assert(o.toneFinished && !o.toneAudible && !o.toneQuarantined && chip.sawEndpoint && o.tonePlayElapsed>=2000 && cmd==0);}
  if(which==36){assert(o.toneFinished && !o.toneAudible && !o.toneQuarantined && o.tonePlayElapsed>=2000 && cmd==0 &&
-  chip.runConverterFormat==0x4011 && chip.runStreamFormat==0x4011 && chip.format==0x31 && !chip.sawQuietUnmute);}
+  chip.runConverterFormat==0x4011 && chip.runStreamFormat==0x4011 && chip.format==0x31 && o.toneFifoSampled && o.toneFifoSize==0xc0 && !chip.sawQuietUnmute);}
  if(which==37){assert(o.toneRequested && !o.toneAttempted && !chip.published && cmd==0 &&
   std::strcmp(o.toneReason,"mixer format probe requires mute")==0);}
  const auto oldWrites=writes;HdaObserveConfigure(&boot);assert(writes==oldWrites);munmap(page,4096);

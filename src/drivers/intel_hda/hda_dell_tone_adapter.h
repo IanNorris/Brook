@@ -32,6 +32,8 @@ public:
     bool quarantined()const{return quarantined_;}
     uint8_t prepareStage()const{return prepareStage_;}uint32_t prepareValue()const{return prepareValue_;}
     uint8_t streamStage()const{return stream_.stage();}uint32_t streamDetail()const{return stream_.detail();}
+    uint16_t streamFifoSize()const{return stream_.fifoSize();}
+    bool streamFifoSampled()const{return stream_.fifoSampled();}
     bool iciFailed()const{return ici_.failed();}
     uint8_t playReason()const{return playReason_;}uint32_t playLoops()const{return playLoops_;}uint64_t playElapsed()const{return playElapsed_;}
     uint32_t playProgress()const{return playProgress_;}

@@ -285,6 +285,7 @@ void HdaObserveConfigure(const BootProtocol* boot) {
     const auto result=adapter->run(audible);observation.toneResult=uint8_t(result);
     observation.tonePrepareStage=adapter->prepareStage();observation.tonePrepareValue=adapter->prepareValue();
     observation.toneStreamStage=adapter->streamStage();observation.toneStreamDetail=adapter->streamDetail();observation.toneCommand=platform->command();observation.toneIciFailed=adapter->iciFailed();
+    observation.toneFifoSize=adapter->streamFifoSize();observation.toneFifoSampled=adapter->streamFifoSampled();
     observation.tonePlayReason=adapter->playReason();observation.tonePlayLoops=adapter->playLoops();observation.tonePlayProgress=adapter->playProgress();observation.tonePlayElapsed=adapter->playElapsed();
     observation.toneProgressReason=adapter->progressReason();observation.toneProgressStatus=adapter->progressStatus();observation.toneProgressControl=adapter->progressControl();
     observation.toneProgressFirst=adapter->progressFirst();observation.toneProgressLast=adapter->progressLast();

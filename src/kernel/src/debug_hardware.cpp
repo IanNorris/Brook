@@ -147,7 +147,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"quarantined\":");r.text(o.toneQuarantined?"true":"false");
         r.text(",");r.field("result",o.toneResult);r.text(",");r.field("admission",o.toneAdmission);
         r.text(",");r.field("page",o.tonePage);r.text(",");r.field("page_status",o.tonePageStatus);
-        r.text(",");r.field("prepare_stage",o.tonePrepareStage);r.text(",");r.field("prepare_value",o.tonePrepareValue);
+        r.text(",");r.field("prepare_stage",o.tonePrepareStage);r.text(",");r.field("prepare_value",o.tonePrepareValue);r.text(",\"fifo_sampled\":");r.text(o.toneFifoSampled?"true":"false");r.text(",");r.field("fifo_size_raw",o.toneFifoSize);
         r.text(",");r.field("stream_stage",o.toneStreamStage);r.text(",");r.field("stream_detail",o.toneStreamDetail);r.text(",");r.field("command",o.toneCommand);
         r.text(",\"ici_failed\":");r.text(o.toneIciFailed?"true":"false");
         r.text(",");r.field("play_reason",o.tonePlayReason);r.text(",");r.field("play_loops",o.tonePlayLoops);r.text(",");r.field("play_progress",o.tonePlayProgress);r.text(",");r.field("play_elapsed",o.tonePlayElapsed);

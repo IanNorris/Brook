@@ -1829,6 +1829,12 @@ confirms a format and cleanup, not application playback or streaming cache
 coherency. The reusable cache-line publication helper is tested with separate
 CPU and device views, but callers still must own whole touched cache lines,
 fence before publishing and prove DMA cannot overtake the writes and flush.
+The [Intel HD Audio specification, section 3.3.40](https://www.intel.com/content/dam/www/public/us/en/documents/product-specifications/high-definition-audio-specification.pdf)
+describes the stream FIFO-size register as a format-dependent bound on a
+controller fetch and on data between DMA and the link. The muted probe records
+the raw register after programming the format. This is an input to calculating
+a streaming guard, not by itself a bound on scheduler delays or proof that
+post-write overrun detection can undo already fetched samples.
 `bridge hardware dell-hda-memory` is a read-only preparatory diagnostic for
 the exact PCI identity. It reports the boot-inventory command/BAR and the
 first page's existing kernel aliases, boot-map classification and current-CPU

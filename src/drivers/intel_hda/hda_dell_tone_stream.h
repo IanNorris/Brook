@@ -9,7 +9,7 @@ namespace brook {
 // No PCI, codec, DMA allocation or memory freeing is performed here.
 enum class HdaToneStreamState : uint8_t {Idle,Prepared,Running,Stopped,Unknown};
 template<class Io> class HdaDellToneStream {
-    Io& io_;uint32_t base_=0,detail_=0,progressFirst_=0,progressLast_=0;uint8_t stage_=0,priority_=0,progressReason_=0,progressStatus_=0;uint16_t progressControl_=0;HdaToneStreamState state_=HdaToneStreamState::Idle;
+    Io& io_;uint32_t base_=0,detail_=0,progressFirst_=0,progressLast_=0;uint8_t stage_=0,priority_=0,progressReason_=0,progressStatus_=0;uint16_t progressControl_=0,fifoSize_=0;bool fifoSampled_=false;HdaToneStreamState state_=HdaToneStreamState::Idle;
     bool waitControl(uint16_t mask,uint16_t value) {
         const auto start=io_.ticks();
         for(unsigned i=0;i<1000000;++i) {
@@ -24,6 +24,8 @@ public:
     uint8_t stage()const{return stage_;}uint32_t detail()const{return detail_;}
     uint8_t progressReason()const{return progressReason_;}uint8_t progressStatus()const{return progressStatus_;}
     uint16_t progressControl()const{return progressControl_;}uint32_t progressFirst()const{return progressFirst_;}uint32_t progressLast()const{return progressLast_;}
+    uint16_t fifoSize()const{return fifoSize_;}
+    bool fifoSampled()const{return fifoSampled_;}
     bool prepare(uint16_t gcap,uint64_t bdlPhysical,uint16_t format=0x11) {
         stage_=1;detail_=gcap;
         if(state_!=HdaToneStreamState::Idle || gcap==0xffff || !((gcap>>12)&15) ||
@@ -39,6 +41,7 @@ public:
         stage_=4;io_.write16(base_,0);if(!io_.delayUs(3) || !waitControl(1,0)){detail_=io_.read16(base_);state_=HdaToneStreamState::Unknown;return false;}
         io_.write8(base_+3,0x1c); // clear only W1C status bits
         io_.write16(base_+0x12,format);
+        fifoSize_=io_.read16(base_+0x10);fifoSampled_=true; // raw format-dependent FIFO, diagnostic only
         io_.write32(base_+0x18,uint32_t(bdlPhysical));
         io_.write32(base_+0x1c,uint32_t(bdlPhysical>>32));
         io_.write16(base_+0x0c,2);io_.write32(base_+0x08,12288);
