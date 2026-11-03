@@ -2,8 +2,10 @@
 """Exercise normal and F5 boot on a disposable, pre-provisioned EFI image.
 
 The image must have RECOVERY_MENU enabled and contain distinct normal and
-recovery payloads. The recovery payload must emit the supplied marker on
-serial; it must not emit the normal boot marker. The source is never written.
+recovery payloads. The recovery payload must emit the supplied recovery
+marker on serial; the normal payload must emit the normal marker. Use a
+normal marker that uniquely identifies the normal payload when available.
+The source image is never written.
 """
 import argparse
 import shutil
