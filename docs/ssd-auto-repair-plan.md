@@ -211,6 +211,14 @@ ESP across checking and mounting, enforce a read-only checker interface, accept
 only a completed exit 0, and constrain FAT geometry/interpretation. Further
 fixtures and physical validation remain necessary.
 
+Unintegrated bootloader helpers now validate a bounded GPT hard-drive device
+path, an exact whole-disk parent-path match, matching primary and backup GPTs,
+the ESP and data partition identities and bounds, and the ext2 header state.
+Host tests exercise malformed paths and partition metadata. These pure helpers
+perform no firmware I/O, are not part of the boot decision, and cannot grant
+repair authority. Firmware handle selection, alignment and media-change
+handling, independent identity binding, and real automatic dispatch remain.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.

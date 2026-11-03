@@ -1,4 +1,6 @@
 #include "../../kernel/src/strict_gpt_inventory.h"
+#include "../../bootloader/src/recovery_disk_gate.h"
+#include "../../bootloader/src/recovery_device_path.h"
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -52,6 +54,74 @@ int main(int argc,char** argv) {
     CHECK(StrictGptCheckHeader(primary,512,100000,false,a)==StrictGptResult::Ok);
     CHECK(StrictGptCheckHeader(backup,512,100000,true,b)==StrictGptResult::Ok);
     CHECK(StrictGptCheckCopies(a,entries,b,backupEntries,sizeof(entries))==StrictGptResult::Ok);
+    {
+        using namespace brook::bootloader;
+        uint8_t path[52]{};path[0]=1;path[1]=1;path[2]=6; // PCI device node
+        path[6]=4;path[7]=1;path[8]=42;put32(path+10,1);put64(path+14,2048);
+        put64(path+22,2048);path[30]=42;path[46]=2;path[47]=2;
+        path[48]=0x7f;path[49]=0xff;path[50]=4;
+        uint8_t parent[10]={1,1,6,0,0,0,0x7f,0xff,4,0};RecoveryEspPath parsed{};
+        CHECK(RecoveryParseEspPath(path,sizeof(path),parsed) && parsed.partitionNumber==1 &&
+              parsed.first==2048 && parsed.sectors==2048 && parsed.guid[0]==42);
+        CHECK(RecoveryParentPathMatches(path,sizeof(path),parsed,parent,sizeof(parent)));
+        RecoveryEspPath forged=parsed;forged.parentPrefixBytes=~uint32_t{0}-3;
+        CHECK(!RecoveryParentPathMatches(path,sizeof(path),forged,parent,0));
+        forged.parentPrefixBytes=0;CHECK(!RecoveryParentPathMatches(path,sizeof(path),forged,parent+6,4));
+        CHECK(!RecoveryParentPathMatches(path,sizeof(path),parsed,parent,sizeof(parent)-1));
+        parent[1]^=1;CHECK(!RecoveryParentPathMatches(path,sizeof(path),parsed,parent,sizeof(parent)));parent[1]^=1;
+        parent[7]=1;CHECK(!RecoveryParentPathMatches(path,sizeof(path),parsed,parent,sizeof(parent)));parent[7]=0xff;
+        path[47]=1;CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));path[47]=2;
+        path[2]=0;CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));path[2]=6;
+        path[49]=1;CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));path[49]=0xff;
+        path[0]=4;CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));path[0]=1;
+        put32(path+10,0);CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));put32(path+10,1);
+        put64(path+22,0);CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));put64(path+22,2048);
+        path[30]=0;CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));path[30]=42;
+        CHECK(!RecoveryParseEspPath(path,sizeof(path)-1,parsed));
+        put64(path+14,~uint64_t{0});CHECK(!RecoveryParseEspPath(path,sizeof(path),parsed));
+    }
+    {
+        using namespace brook::bootloader;
+        const uint8_t espType[16]={0x28,0x73,0x2a,0xc1,0x1f,0xf8,0xd2,0x11,0xba,0x4b,0,0xa0,0xc9,0x3e,0xc9,0x3b};
+        uint8_t ae[16384]{},be[16384]{},ph[512]{},bh[512]{},protective[512]{};
+        partition(ae,1,2048,4095);partition(ae+128,2,4096,8191);
+        std::memcpy(ae,espType,16);
+        // GPT encoding of canonical Linux type 0fc63daf-8483-4772-8e79-3d69d8477de4.
+        put32(ae+128,0x0fc63daf);ae[132]=0x83;ae[133]=0x84;ae[134]=0x72;ae[135]=0x47;
+        const uint8_t tail[8]={0x8e,0x79,0x3d,0x69,0xd8,0x47,0x7d,0xe4};std::memcpy(ae+136,tail,8);
+        std::memcpy(be,ae,sizeof(ae));const uint32_t sum=StrictCrc32(ae,sizeof(ae));
+        header(ph,false,sum);header(bh,true,sum);
+        protective[510]=0x55;protective[511]=0xaa;protective[450]=0xee;
+        put32(protective+454,1);put32(protective+458,99999);
+        RecoveryDiskIdentity id{};id.diskGuid[0]=1;id.espGuid[0]=1;id.dataGuid[0]=2;id.fsUuid[0]=3;
+        id.espFirst=2048;id.espLast=4095;id.espPartitionNumber=1;id.dataFirst=4096;id.dataSectors=4096;
+        RecoveryDataPartition data{};
+        auto locate=[&]{return RecoveryLocateData(protective,ph,bh,ae,be,sizeof(ae),100000,id,data);};
+        CHECK(locate() && data.first==4096 && data.sectors==4096);
+        uint8_t sb[1024]{};put32(sb,64);put32(sb+4,512);put32(sb+12,512);put32(sb+16,64);
+        put32(sb+24,2);put32(sb+28,2);put32(sb+32,32768);put32(sb+36,32768);
+        put32(sb+40,64);sb[56]=0x53;sb[57]=0xef;sb[58]=1;put32(sb+76,1);
+        put32(sb+84,11);sb[88]=128;put32(sb+96,2);put32(sb+100,3);sb[104]=3;
+        CHECK(RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));
+        sb[58]=0;CHECK(!RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));sb[58]=1;
+        sb[104]^=1;CHECK(!RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));sb[104]^=1;
+        id.espPartitionNumber=2;CHECK(!locate());id.espPartitionNumber=1;
+        id.espFirst++;CHECK(!locate());id.espFirst--;
+        id.dataFirst++;CHECK(!locate());id.dataFirst--;
+        id.dataSectors--;CHECK(!locate() && data.first==0 && data.sectors==0);id.dataSectors++;
+        id.dataSectors=3;put64(ae+128+40,4098);std::memcpy(be,ae,sizeof(ae));
+        header(ph,false,StrictCrc32(ae,sizeof(ae)));header(bh,true,StrictCrc32(ae,sizeof(ae)));
+        CHECK(!locate());
+        id.dataSectors=4096;put64(ae+128+40,8191);std::memcpy(be,ae,sizeof(ae));
+        header(ph,false,StrictCrc32(ae,sizeof(ae)));header(bh,true,StrictCrc32(ae,sizeof(ae)));
+        id.diskGuid[0]^=1;CHECK(!locate());id.diskGuid[0]^=1;
+        id.dataGuid[0]^=4;CHECK(!locate());id.dataGuid[0]^=4;
+        be[200]^=1;CHECK(!locate());be[200]^=1;
+        ae[128]^=1;std::memcpy(be,ae,sizeof(ae));
+        header(ph,false,StrictCrc32(ae,sizeof(ae)));header(bh,true,StrictCrc32(ae,sizeof(ae)));
+        CHECK(!locate());
+        protective[450]=0;CHECK(!locate());
+    }
     CHECK(StrictGptCheckHeader(primary,4096,100000,false,a)==StrictGptResult::UnsupportedGeometry);
     primary[56]^=1;CHECK(StrictGptCheckHeader(primary,512,100000,false,a)==StrictGptResult::HeaderChecksum);primary[56]^=1;
     put64(primary+72,33);checksum(primary);CHECK(StrictGptCheckHeader(primary,512,100000,false,a)==StrictGptResult::InvalidLayout);
