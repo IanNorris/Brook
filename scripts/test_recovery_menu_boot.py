@@ -16,7 +16,8 @@ import time
 from pathlib import Path
 
 
-def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True):
+def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
+         hold_after_marker=0):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -63,6 +64,13 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                 if forbidden and forbidden.encode() in data:
                     raise RuntimeError(f'unexpected boot marker {forbidden!r}')
                 if marker.encode() in data:
+                    until = time.monotonic() + hold_after_marker
+                    while time.monotonic() < until:
+                        if process.poll() is not None:
+                            raise RuntimeError('QEMU exited after the expected boot marker')
+                        if forbidden and forbidden.encode() in serial.read_bytes():
+                            raise RuntimeError(f'unexpected boot marker {forbidden!r}')
+                        time.sleep(0.1)
                     return
                 time.sleep(0.2)
             raise RuntimeError(f'timed out waiting for {marker!r}; serial tail: {data[-1500:]!r}')

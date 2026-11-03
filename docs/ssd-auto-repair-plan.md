@@ -23,9 +23,11 @@ recovery, including when the configuration file was absent. These checks used
 the legacy normal payload. Follow-up tests exercised a corrupt newest slot
 with a usable older slot and invalid selectors with a usable legacy payload;
 clean guards allowed the respective fallback, while pending guards selected
-recovery. Each denied case ran on a writable private copy and left its full
-disk hash unchanged. Invalid recovery and interruption across durable writes
-still need acceptance tests. The guard has no writer and
+recovery. With a pending record and either a missing recovery initrd or a
+corrupt recovery selection, the loader reached its fatal recovery message
+without a normal kernel marker. Each denied case ran on a writable private
+copy and left its full disk hash unchanged. Interruption across durable writes
+still needs acceptance tests. The guard has no writer and
 does not itself validate the physical disk or filesystem. It is not installed
 on the Dell. Before any physical deployment, inventory every firmware-reachable
 EFI entrypoint: an older EFI loader can bypass this guard even though old

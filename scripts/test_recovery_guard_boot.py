@@ -36,6 +36,7 @@ def main():
         root = Path(tmp)
         for scenario in ('clean', 'pending', 'mismatch', 'missing', 'truncated',
                          'corrupt', 'wrong-identity', 'pending-no-config',
+                         'missing-recovery', 'corrupt-recovery',
                          'fallback-clean', 'fallback-pending', 'legacy-clean', 'legacy-pending'):
             work = root / scenario; work.mkdir()
             disk = work / 'disk.raw'; shutil.copyfile(source, disk)
@@ -81,9 +82,10 @@ def main():
                     del record[-1:]
                 path = work / name; path.write_bytes(record)
                 subprocess.run(['mcopy', '-o', '-i', media, str(path), '::/RECOVERY/' + name], check=True)
-            guard(2 if 'pending' in scenario else 1, 'GUARD0.BIN')
+            requires_recovery = 'pending' in scenario or scenario in ('missing-recovery', 'corrupt-recovery')
+            guard(2 if requires_recovery else 1, 'GUARD0.BIN')
             if scenario != 'missing':
-                guard(2 if 'pending' in scenario or scenario == 'mismatch' else 1, 'GUARD1.BIN')
+                guard(2 if requires_recovery or scenario == 'mismatch' else 1, 'GUARD1.BIN')
             else:
                 subprocess.run(['mdel', '-i', media, '::/RECOVERY/GUARD1.BIN'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -92,12 +94,23 @@ def main():
                     raise RuntimeError('missing-record fixture still contains guard 1')
             if scenario == 'pending-no-config':
                 subprocess.run(['mdel', '-i', media, '::/BROOK.CFG'], check=True)
+            if scenario == 'missing-recovery':
+                subprocess.run(['mdel', '-i', media, '::/RECOVERY/INITRD.IMG'], check=True)
+            if scenario == 'corrupt-recovery':
+                selection = bytearray(subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/SELECT.BIN']))
+                selection[124] ^= 1
+                path = work / 'corrupt-recovery.bin'; path.write_bytes(selection)
+                subprocess.run(['mcopy', '-o', '-i', media, str(path), '::/RECOVERY/SELECT.BIN'], check=True)
             with disk.open('rb') as stream:
                 before = hashlib.file_digest(stream, 'sha256').digest()
             normal = scenario == 'clean' or scenario.endswith('-clean')
+            recovery_broken = scenario in ('missing-recovery', 'corrupt-recovery')
+            marker = ('Recovery required but payload invalid or missing.' if recovery_broken else
+                      a.normal_marker if normal else a.recovery_marker)
             boot(disk, firmware, work, False,
-                 a.normal_marker if normal else a.recovery_marker, 90, True,
-                 a.recovery_marker if normal else a.normal_marker, sata_snapshot=normal)
+                 marker, 90, True,
+                 a.recovery_marker if normal else a.normal_marker, sata_snapshot=normal,
+                 hold_after_marker=2 if recovery_broken else 0)
             with disk.open('rb') as stream:
                 if hashlib.file_digest(stream, 'sha256').digest() != before:
                     raise RuntimeError('guard test changed its source disk')
