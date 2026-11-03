@@ -15,8 +15,12 @@ struct SyscallTimingSnapshot {
     bool active=false,saturated=false,coarseClock=false;
     uint64_t sequence=0,activeNumber=0,activeArg0=0,activeBeginNs=0;
     SyscallTimingPhase activePhase=SyscallTimingPhase::Dispatch;
-    unsigned kinds=0,retained=0;
+    unsigned kinds=0,retained=0,failures=0;
+    uint64_t overflowFailures=0;
     struct Kind {uint64_t number=0,calls=0,sumNs=0,maxNs=0,negativeResults=0;SyscallTimingPhase phase=SyscallTimingPhase::Dispatch;} kind[16]{};
+    // First 16 distinct dispatch failures; arg0 is the most recent occurrence,
+    // and may be an address rather than an fd depending on the syscall.
+    struct Failure {uint64_t number=0,arg0=0,count=0;int64_t result=0;} failure[16]{};
     SyscallTimingEvent events[16]{};
 };
 // Caller serializes observations; one explicitly selected thread incarnation.
@@ -70,6 +74,12 @@ public:
         if(at==data_.kinds && at<16){data_.kind[at].number=e.number;data_.kind[at].phase=e.phase;++data_.kinds;}
         if(at==16)Add(data_.overflowKinds);
         else {auto& k=data_.kind[at];Add(k.calls);Add(k.sumNs,duration);if(duration>k.maxNs)k.maxNs=duration;if(result<0)Add(k.negativeResults);}
+        if(result<0 && e.phase==SyscallTimingPhase::Dispatch){
+            unsigned f=0;while(f<data_.failures && (data_.failure[f].number!=e.number || data_.failure[f].result!=result))++f;
+            if(f==data_.failures && f<16){data_.failure[f].number=e.number;data_.failure[f].result=result;++data_.failures;}
+            if(f==16)Add(data_.overflowFailures);
+            else {data_.failure[f].arg0=e.arg0;Add(data_.failure[f].count);}
+        }
         if(Score(e)<20000000)return true;
         Add(data_.slow);at=0;while(at<data_.retained && Score(data_.events[at])>=Score(e))++at;
         if(data_.retained==16)Add(data_.excluded);if(at==16)return true;

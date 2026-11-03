@@ -75,6 +75,15 @@ static void CheckSyscalls(){
     snap=m.Snapshot();CHECK(snap.completed==2 && snap.kinds==2 && snap.maxCallNs==300000000 && snap.maxGapNs==50000000);
     CHECK(snap.events[0].number==202 && snap.events[0].result==-11 && snap.events[0].arg0==123 && snap.events[0].hasGap);
     CHECK(snap.kind[0].calls==1 && snap.kind[0].sumNs==50000000 && snap.kind[1].negativeResults==1);
+    CHECK(snap.failures==1 && snap.failure[0].number==202 && snap.failure[0].result==-11 && snap.failure[0].arg0==123 && snap.failure[0].count==1);
+    {SyscallTimingModel errors;errors.Watch(3,4);auto token=errors.Token();uint64_t t=1;
+     for(unsigned i=0;i<18;++i){auto call=errors.Begin(token,3,4,47,i,t++);CHECK(errors.End(call,t++,-11));}
+     {auto call=errors.Begin(token,3,4,47,88,t++);CHECK(errors.End(call,t++,-5));}
+     for(unsigned i=0;i<16;++i){auto call=errors.Begin(token,3,4,100+i,0,t++);CHECK(errors.End(call,t++,-5));}
+     {auto call=errors.Begin(token,3,4,47,77,t++);CHECK(errors.End(call,t++,-11));}
+     auto ret=errors.Begin(token,3,4,47,99,t++,SyscallTimingPhase::ReturnCheck);CHECK(errors.End(ret,t++,-11));
+     auto e=errors.Snapshot();CHECK(e.failures==16 && e.failure[0].count==19 && e.failure[0].arg0==77 && e.failure[1].result==-5 && e.overflowFailures==2);
+     errors.Reset();CHECK(errors.Snapshot().failures==0 && errors.Snapshot().overflowFailures==0);}
     // Missing completion is explicit; a later entry must not fabricate a gap.
     auto abandoned=m.Begin(epoch,22,100,7,0,600000000);auto replacement=m.Begin(epoch,22,100,1,7,700000000);
     CHECK(!m.End(abandoned,800000000,1) && m.Snapshot().active);CHECK(m.End(replacement,800000000,1));

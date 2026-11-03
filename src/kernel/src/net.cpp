@@ -5436,7 +5436,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply h;h.text("{");h.field("epoch",s.epoch);h.text(",");h.field("pid",s.pid);h.text(",");h.field("incarnation",s.incarnation);
         h.text(",\"enabled\":");h.text((s.epoch&1)?"true":"false");
         h.text(",\"clock_source\":\"");h.text(!s.pid?"unselected":s.coarseClock?"lapic_delivered_ticks":"kvm_stable");h.text("\"");
-        h.text(",\"scope\":\"selected PID/incarnation, not liveness query; dispatch and return_check spans, counts are spans not user syscall count; raw C results before or after signal checks; elapsed spans include scheduling, no CPU/steal apportionment; LAPIC fallback has 1ms granularity and can undercount stalls or drift; gap covers recorded phase boundaries plus recorder/asm/user/interrupt time; drops invalidate continuity; unmatched entry may be exit or dropped completion; top 16 events and 16 syscall kinds; contention since boot\"");
+        h.text(",\"scope\":\"selected PID/incarnation, not liveness query; dispatch and return_check spans, counts are spans not user syscall count; raw C results before or after signal checks; elapsed spans include scheduling, no CPU/steal apportionment; LAPIC fallback has 1ms granularity and can undercount stalls or drift; gap covers recorded phase boundaries plus recorder/asm/user/interrupt time; drops invalidate continuity; unmatched entry may be exit or dropped completion; top 16 events and 16 syscall kinds; failures are first 16 distinct syscall/result pairs from negative dispatch results, last_arg0 may be a pointer, overflow counts omitted occurrences; contention since boot\"");
         h.text(",");h.field("entries",s.entries);
         h.text(",");h.field("completed",s.completed);
         h.text(",");h.field("invalid",s.invalid);
@@ -5454,7 +5454,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         h.text(",\"unmatched_entry\":");h.text(s.active?"true":"false");h.text(",\"active_phase\":\"");h.text(s.activePhase==SyscallTimingPhase::ReturnCheck?"return_check":"dispatch");h.text("\"");h.text(",\"saturated\":");h.text(s.saturated?"true":"false");h.text(",\"kinds\":[");h.send();
         for(unsigned i=0;i<s.kinds;++i){const auto& k=s.kind[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("number",k.number);r.text(",\"phase\":\"");r.text(k.phase==SyscallTimingPhase::ReturnCheck?"return_check":"dispatch");r.text("\"");
             r.text(",");r.field("calls",k.calls);r.text(",");r.field("sum_ns",k.sumNs);r.text(",");r.field("max_ns",k.maxNs);r.text(",");r.field("negative_results",k.negativeResults);r.text("}");r.send();}
-        DebugChannelSend("],\"events\":[");
+        DebugChannelSend("],\"failures\":[");
+        for(unsigned i=0;i<s.failures;++i){const auto& f=s.failure[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("number",f.number);r.text(",");r.field("last_arg0",f.arg0);r.text(",");r.field("count",f.count);r.text(",\"result\":-");r.number(uint64_t(0)-uint64_t(f.result));r.text("}");r.send();}
+        {BridgeReply r;r.text("],");r.field("overflow_failures",s.overflowFailures);r.text(",\"events\":[");r.send();}
         for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("number",e.number);r.text(",\"phase\":\"");r.text(e.phase==SyscallTimingPhase::ReturnCheck?"return_check":"dispatch");r.text("\"");
             r.text(",");r.field("arg0",e.arg0);r.text(",");r.field("begin_ns",e.beginNs);r.text(",");r.field("end_ns",e.endNs);r.text(",");r.field("call_ns",e.endNs-e.beginNs);
             r.text(",");r.field("gap_ns",e.gapNs);r.text(",\"has_gap\":");r.text(e.hasGap?"true":"false");r.text(",\"result\":");

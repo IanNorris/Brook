@@ -297,3 +297,24 @@ likelihood that the fallback timer alone explains the Dell failure, but does
 not rule out hardware-specific timing, USB, storage, or other driver interactions.
 The disposable disk copies were removed after shutdown; private diagnostic
 captures remain under `build/reviews/steam-dell-fallback-20261103`.
+
+### Post-authentication observation
+
+The user authenticated on the Dell, but the client remained at the loading
+screen. In a subsequent recovery-boot retry, the same software display and
+null audio setup remained responsive and peaked at 176 of 256 job tasks, with
+no denied births. A point-in-time sample showed 119 descriptors for the main
+client and 179 for its browser helper. These samples do not establish the
+resource state of the prior failed session or rule out a later spike.
+
+The physical LAPIC-based syscall timing probe passed a controlled sleep test
+with no invalid spans. During the retry the main process continued polling;
+the browser helper repeatedly made short `recvmsg` calls returning negative
+results. This alone does not distinguish expected nonblocking retries from an
+error. The new opt-in failure summary captures the first 16 distinct negative
+dispatch syscall/result pairs with the latest first argument and an explicit
+overflow count. It is bounded and disabled until a thread is selected. Raw
+results can include internal restart codes; the first argument can be a
+pointer, and samples do not prove peer progress. Host model tests and a kernel
+build pass; the extended response and physical Steam behavior still require
+runtime verification. Account details and screenshots remain private.
