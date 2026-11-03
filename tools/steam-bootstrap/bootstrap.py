@@ -179,6 +179,15 @@ def main():
                 path.write_bytes(b'#!/nix/profile/bin/bash\n' + data[len(first):])
     if not (client / 'steamrt64/steam').is_file():
         raise ValueError('Steam client executable is absent')
+    # These two scripts execute on Brook before SteamRT creates its own
+    # filesystem, where /bin/sh is available. Leave container scripts alone.
+    runtime = client / 'steamrt64/pv-runtime/steam-runtime-steamrt'
+    for relative in ('run', 'pressure-vessel/bin/pressure-vessel-unruntime'):
+        path = runtime / relative
+        if path.is_file() and not path.is_symlink():
+            data = path.read_bytes()
+            if data.startswith(b'#!/bin/sh\n'):
+                path.write_bytes(b'#!/nix/profile/bin/sh\n' + data[len(b'#!/bin/sh\n'):])
     hostlibs = client / 'hostlibs'; hostlibs.mkdir(exist_ok=True)
     exports = Path('/nix/profile/lib')
     if exports.is_dir():
