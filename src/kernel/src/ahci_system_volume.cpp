@@ -21,6 +21,27 @@ namespace brook {
 namespace {
 struct Range { Device* parent=nullptr;uint64_t start=0,bytes=0; } range;
 bool attempted=false;
+Range guardRange{};bool guardReady=false;
+int GuardRead(Device*,uint64_t offset,void* data,uint64_t length) {
+    if(!guardReady || !guardRange.parent)return -19;
+    if(offset>guardRange.bytes || length>guardRange.bytes-offset)return -22;
+    return guardRange.parent->ops->read(guardRange.parent,guardRange.start+offset,data,length);
+}
+int GuardWrite(Device* owner,uint64_t offset,const void* data,uint64_t length) {
+    if(!guardReady || !guardRange.parent)return -19;
+    if(offset>guardRange.bytes || length>guardRange.bytes-offset)return -22;
+    return DeviceWriteLeased(guardRange.parent,owner,guardRange.start+offset,data,length);
+}
+int GuardControl(Device*,uint32_t request,void*) {
+    if(!guardReady || !guardRange.parent)return -19;
+    if(request==DEVICE_IOCTL_FLUSH)return DeviceFlush(guardRange.parent);
+    if(request==DEVICE_IOCTL_READ_ONLY)return guardRange.parent->ops->ioctl(guardRange.parent,request,nullptr);
+    return -95;
+}
+uint64_t GuardBlocks(Device*) {return guardReady?guardRange.bytes/512:0;}
+uint32_t GuardBlockSize(Device*) {return 512;}
+const BlockDeviceOps guardOps{GuardRead,GuardWrite,GuardControl,nullptr,GuardBlocks,GuardBlockSize};
+Device guardPartition{reinterpret_cast<const DeviceOps*>(&guardOps),"ahci-guard-esp",DeviceType::Block,nullptr};
 int Read(Device*,uint64_t offset,void* data,uint64_t length) {
     if(offset>range.bytes || length>range.bytes-offset)return -22;
     return range.parent->ops->read(range.parent,range.start+offset,data,length);
@@ -130,6 +151,26 @@ bool SelectDirect(Device* d,const AhciBootSelector& boot,AhciDirectLayout& selec
 
 bool AhciSystemDirectRequested() {
     VnodeStat st{};return VfsLstatPath("/etc/ahci-data-volume",&st)!=-2;
+}
+Device* AhciSystemGuardPrepare() {
+    if(attempted)return nullptr;
+    attempted=true;
+    VnodeStat st{};
+    if(VfsLstatPath("/etc/ahci-boot-volume",&st) || st.isDir || st.isSymlink || !st.size || st.size>128)return nullptr;
+    auto* node=VfsOpen("/etc/ahci-boot-volume",VFS_O_STREAM);if(!node)return nullptr;
+    char bytes[128]{};uint64_t offset=0;
+    const bool read=VfsRead(node,bytes,st.size,&offset)==int(st.size);VfsRelease(node);
+    AhciBootSelector wanted{};if(!read || !AhciBootSelectorParse(bytes,uint32_t(st.size),wanted))return nullptr;
+    Device* disk=AhciWriteAdmittedDevice();AhciDirectLayout layout{};
+    if(!disk || !SelectDirect(disk,wanted,layout) || DeviceFind(guardPartition.name))return nullptr;
+    guardRange={disk,layout.esp.first*512,layout.esp.count*512};
+    // Registered callbacks reject I/O until the complete batch is installed.
+    if(!DeviceRegister(&guardPartition))return nullptr;
+    BlockWriteLease leases[4]{};
+    if(!AhciDirectGuardLeases(layout,reinterpret_cast<uintptr_t>(disk),0,
+                              reinterpret_cast<uintptr_t>(&guardPartition),leases) ||
+       !DeviceInstallBootWriteLeases(leases,4))return nullptr;
+    guardReady=true;return &guardPartition;
 }
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(attempted)return Fail("repeated admission");attempted=true;

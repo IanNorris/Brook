@@ -62,6 +62,15 @@ backend writes to a memory-backed disk without modelling volatile SSD caches
 or physical power loss. Its exclusive fixture is not a production ESP
 ownership mechanism.
 
+An experimental boot-only preparation path can validate the selected GPT
+layout and reserve the ESP for a dedicated block adapter while denying data
+partition and GPT metadata writes. It is not called by boot, mounts no FAT
+filesystem and does not run a repair. Host tests exercise owner routing,
+bounds, failure and repeated admission. This protects block ranges only: a
+future private FAT mount still needs to prevent additional bindings and
+unrelated writers, and must address crosslinks to third files. The path must
+not be activated after any disk-backed filesystem or cache has been started.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.

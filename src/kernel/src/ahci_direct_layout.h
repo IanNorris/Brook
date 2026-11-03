@@ -39,4 +39,27 @@ inline bool AhciDirectLayoutLeases(const AhciDirectLayout& layout,uintptr_t pare
     leases[2]={parent,0,layout.backStart,layout.backBytes};
     return true;
 }
+
+// Experimental boot-only maintenance layout. No leases are installed here:
+// callers must establish quiescence, pin both distinct adapter identities,
+// install the whole batch atomically, and route writes through their owners.
+inline bool AhciDirectGuardLeases(const AhciDirectLayout& layout,uintptr_t parent,
+                                 uintptr_t dataOwner,uintptr_t espOwner,
+                                 BlockWriteLease (&out)[4]) {
+    if(!espOwner || espOwner==parent || espOwner==dataOwner ||
+       !layout.esp.count || layout.esp.first>~uint64_t{0}/512 ||
+       layout.esp.count>~uint64_t{0}/512)return false;
+    BlockWriteLease data[3]{},candidate[4]{};
+    if(!AhciDirectLayoutLeases(layout,parent,dataOwner?dataOwner:espOwner,data))return false;
+    data[1].owner=dataOwner; // zero reserves the data partition without a writer
+    const uint64_t espStart=layout.esp.first*512,espBytes=layout.esp.count*512;
+    if(espStart<layout.frontBytes || espStart>layout.backStart ||
+       espBytes>layout.backStart-espStart)return false;
+    for(unsigned i=0;i<3;++i)candidate[i]=data[i];
+    candidate[3]={parent,espOwner,espStart,espBytes};
+    BlockWriteLeases check;
+    if(!check.Install(candidate,4,true))return false;
+    for(unsigned i=0;i<4;++i)out[i]=candidate[i];
+    return true;
+}
 }
