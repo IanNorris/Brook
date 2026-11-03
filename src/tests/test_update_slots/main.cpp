@@ -6,6 +6,7 @@
 #include <vector>
 #undef NULL
 #include "update_slots.h"
+#include "config.h"
 #include "fs.h"
 #include "memory.h"
 #include "elf.h"
@@ -84,6 +85,17 @@ int main() {
     bad=kernel();((Elf64Header*)bad.data())->phOffset=~uint64_t{0};provision(0,8,bad);
     files[u"RECOVERY\\SELECT.BIN"]=files[u"UPDATES\\SELECT0.BIN"];
     files[u"RECOVERY\\KERNEL.ELF"]=bad;expectRecovery(false);
+    // Every interrupted prefix of the append must leave the loader on either
+    // the original disabled setting or the complete, prepared slot setting.
+    const std::string oldConfig="TARGET=KERNEL\\BROOK.ELF\nUPDATE_SLOTS=0\n";
+    const std::string activation="\nUPDATE_SLOTS=1\n";
+    for(size_t n=0;n<=activation.size();++n) {
+        const auto config=oldConfig+activation.substr(0,n);
+        files[u"BROOK.CFG"]=Bytes(config.begin(),config.end());
+        brook::bootloader::LoadConfig(nullptr,nullptr);
+        assert(brook::bootloader::g_bootConfig.updateSlots == (config.find("UPDATE_SLOTS=1")!=std::string::npos));
+        assert(allocations.empty());
+    }
     provision(0,2);provision(1,2);expect(false); // ambiguous selection fails closed
     provision(1,3);expect(true);
     files[u"UPDATES\\B\\KERNEL.ELF"].resize(BROOK_UPDATE_KERNEL_MAX+1);expect(true); // older A only

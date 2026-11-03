@@ -73,6 +73,22 @@ static void make_record(uint8_t *r,uint64_t generation,uint32_t slot,
     BrookUpdatePut64(r+24,kb);BrookUpdatePut64(r+32,ib);BrookUpdateHash(kernel,kb,r+40);BrookUpdateHash(initrd,ib,r+72);
     BrookUpdatePut32(r+124,BrookUpdateCrc(r,124));
 }
+/* The bootloader applies configuration entries in order. Accept one exact
+ * disabled setting, since the final appended setting enables the slots. Any
+ * other occurrence is ambiguous and must be inspected before mutation. */
+static int config_allows_activation(const uint8_t *config,size_t length) {
+    static const char key[]="UPDATE_SLOTS", disabled[]="UPDATE_SLOTS=0";
+    size_t seen=0;
+    for(size_t at=0;at+sizeof(key)-1<=length;++at) {
+        if(memcmp(config+at,key,sizeof(key)-1))continue;
+        if(++seen>1 || (at && config[at-1]!='\n') ||
+           at+sizeof(disabled)-1>length || memcmp(config+at,disabled,sizeof(disabled)-1))return 0;
+        size_t end=at+sizeof(disabled)-1;
+        if(end<length && config[end]=='\r')++end;
+        if(end<length && config[end]!='\n')return 0;
+    }
+    return 1;
+}
 static int setup(int root,const uint8_t expectedEfi[32]) {
     int result=1,updates=-1,a=-1,b=-1,configfd=-1;uint8_t *kernel=NULL,*initrd=NULL,*config=NULL,*efi=NULL;
     size_t kb=0,ib=0,cb=0,eb=0;uint8_t records[2][128],efiHash[32];struct statvfs freeSpace;
@@ -88,7 +104,7 @@ static int setup(int root,const uint8_t expectedEfi[32]) {
     /* Reject existing or ambiguous configuration rather than changing an
      * already configured installation. The buffer is NUL-terminated here. */
     for(size_t i=0;i<cb;++i)if(!config[i])goto done;
-    if(cb>4096-(sizeof(activation)-1) || memmem(config,cb,"UPDATE_SLOTS",12))goto done;
+    if(cb>4096-(sizeof(activation)-1) || !config_allows_activation(config,cb))goto done;
     make_record(records[0],1,0,kernel,kb,initrd,ib);make_record(records[1],2,1,kernel,kb,initrd,ib);
     if(!BrookUpdateRecordValid(records[0])||!BrookUpdateRecordValid(records[1]))goto done;
     mutated=1;

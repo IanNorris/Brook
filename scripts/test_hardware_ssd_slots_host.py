@@ -21,6 +21,7 @@ def main():
         tmp = Path(tmp)
         executable = tmp / 'test'
         subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(ROOT / 'src/tests/test_ssd_slots/host_wrapper.c'), '-o', str(executable)], check=True)
+        subprocess.run([executable, '--policy-selftest'], check=True)
         def fixture(name):
             root = tmp / name
             (root / 'KERNEL').mkdir(parents=True); (root / 'EFI/BOOT').mkdir(parents=True)
@@ -38,6 +39,12 @@ def main():
         large = fixture('large'); (large / 'BROOK.CFG').write_bytes(b'x' * 4090)
         assert subprocess.run([executable, large, expected]).returncode != 0
         assert not (large / 'UPDATES').exists()
+        for index, content in enumerate((b'UPDATE_SLOTS=1\n', b'UPDATE_SLOTS=0\nUPDATE_SLOTS=0\n',
+                                         b'UPDATE_SLOTS=0extra\n', b'#UPDATE_SLOTS=0\n',
+                                         b'UPDATE_SLOTS =0\n')):
+            bad = fixture('ambiguous-' + str(index)); (bad / 'BROOK.CFG').write_bytes(content)
+            assert subprocess.run([executable, bad, expected]).returncode != 0
+            assert not (bad / 'UPDATES').exists()
         for stage in ('directory', 'slot-a-kernel', 'slot-a', 'slot-b-kernel', 'slot-b', 'selector-a', 'selectors', 'activation-written'):
             root = fixture('interrupted-' + stage)
             env = dict(os.environ, BROOK_TEST_STOP=stage)
@@ -62,6 +69,15 @@ def main():
                 path = base / name; assert path.stat().st_size == capacity
                 with path.open('rb') as f: assert f.read(len(data)) == data
             assert (root / 'UPDATES' / f'SELECT{index}.BIN').read_bytes() == record(index + 1, index, kernel, initrd)
+        disabled = fixture('disabled')
+        before = b'TARGET=KERNEL\\BROOK.ELF\nUPDATE_SLOTS=0\n'
+        (disabled / 'BROOK.CFG').write_bytes(before)
+        subprocess.run([executable, disabled, expected], check=True)
+        assert (disabled / 'BROOK.CFG').read_bytes() == before + b'\nUPDATE_SLOTS=1\n'
+        assert (disabled / 'KERNEL/BROOK.ELF').read_bytes() == kernel
+        assert (disabled / 'INITRD.IMG').read_bytes() == initrd
+        for index in range(2):
+            assert (disabled / 'UPDATES' / f'SELECT{index}.BIN').read_bytes() == record(index + 1, index, kernel, initrd)
         print('SSD_SLOT_HOST_PASS')
 
 
