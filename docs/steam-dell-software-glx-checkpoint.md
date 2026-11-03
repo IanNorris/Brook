@@ -92,3 +92,24 @@ ANGLE/Vulkan initialization errors, and unavailable desktop services. These
 are leads rather than a diagnosis, and the older QEMU Steam image is not an
 exact reproduction of the Dell. The VM subsequently completed a checked flush
 and shutdown.
+
+### Nested software GLX and shared-pool controls
+
+On a fresh software QEMU boot, `glx_check.py` targeted nested Xephyr :8 with
+llvmpipe. It successfully created a GLX context, made it current and read
+`[255, 0, 0, 255]` from a red clear without X or GL errors. The same check
+also passed inside the SteamRT client container. The probe explicitly loads
+Brook's Nix GL libraries; it does not test CEF's EGL/ANGLE implementation or
+establish that the actual login window rendered. The SteamRT wrapper emitted
+warnings about unsupported i386 helpers and missing ancillary utilities; the
+64-bit probe itself exited zero.
+
+The existing static synthetic shared-pool benchmark also exited zero both in
+the guest and inside that SteamRT container. In the container's single run,
+two simultaneously live 26,214,416-byte pools took approximately 96 ms and
+326 ms for their respective cold writes. These are individual, non-normalized
+measurements on the QEMU guest; they do not measure the Dell or prove that
+Steam's parent obtained both pools before its inferred handshake deadline. The
+benchmark binary had SHA-256
+`c3fc9d68f4da202470e174063000363fb4720e491ddb3d627a78b04bdac200e4`.
+The test VM was stopped with a checked guest and device flush.

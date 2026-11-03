@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Guest-only bounded GLX visual, window-context and pixel-readback check on :0."""
+"""Guest-only bounded GLX visual, window-context and pixel-readback check."""
 import ctypes as c,json,os,signal
 signal.alarm(30)
 from pathlib import Path
-os.environ['DISPLAY']=':0'
+display = os.environ.get('DISPLAY', ':0')
+os.environ['DISPLAY']=display
 os.environ['__GLX_VENDOR_LIBRARY_NAME']='mesa'
 X=c.CDLL(str(Path('/nix/profile/lib/libX11.so.6').resolve(strict=True)),mode=c.RTLD_GLOBAL)
 M=c.CDLL(str(Path('/nix/profile/lib/libGLX_mesa.so.0').resolve(strict=True)),mode=c.RTLD_GLOBAL)
@@ -22,7 +23,7 @@ errors=[]
 def onerror(d,e):
  errors.append(dict(error=e.contents.error,request=e.contents.request,minor=e.contents.minor));return 0
 api(X,'XSetErrorHandler',P,[P])(c.cast(onerror,P))
-d=openD(b':0');assert d,'XOpenDisplay';result=dict(display=':0',errors=errors)
+d=openD(display.encode());assert d,'XOpenDisplay';result=dict(display=display,errors=errors)
 try:
  e=I();v=I();result['extension']=bool(api(G,'glXQueryExtension',I,[P,c.POINTER(I),c.POINTER(I)])(d,c.byref(e),c.byref(v)))
  major=I();minor=I();result['version_ok']=bool(api(G,'glXQueryVersion',I,[P,c.POINTER(I),c.POINTER(I)])(d,c.byref(major),c.byref(minor)));result['version']=[major.value,minor.value]
