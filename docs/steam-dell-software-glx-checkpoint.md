@@ -256,3 +256,20 @@ at 18 ms. That makes a gradual buildup in those observed queues or compositor
 intervals less apparent, but does not rule out a sudden lockup. The exact-kernel
 panic scanner is running; physical screen and
 possible panic evidence are pending. Raw diagnostic samples remain private.
+
+### Timer-fallback comparison
+
+A new reflinked software QEMU clone used the same ABI 64 kernel, four virtual
+CPUs, a fresh Valve client and a new unsigned-in home. QEMU's KVM CPU identity
+was hidden; the serial log explicitly reported `APIC: elapsed clock delivered
+IRQ fallback` rather than pvclock. The updated bootstrap completed without
+manually adding its opt-in or crypto links. With software Xephyr and a verified
+Pulse null sink, Steam displayed its QR login and the guest remained responsive
+until a host QMP capture at 120 seconds. The job peaked at 160 of 256 reserved
+tasks with no observed refusals; the client and test services were then stopped
+and the guest completed a checked shutdown. This tests more than a clock switch:
+hiding KVM changes guest-visible hypervisor features as well. It reduces the
+likelihood that the fallback timer alone explains the Dell failure, but does
+not rule out hardware-specific timing, USB, storage, or other driver interactions.
+The disposable disk copies were removed after shutdown; private diagnostic
+captures remain under `build/reviews/steam-dell-fallback-20261103`.
