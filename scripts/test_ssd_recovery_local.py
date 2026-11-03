@@ -76,12 +76,18 @@ def main():
                    help='Inject a failure at a specific pending transaction operation')
     p.add_argument('--guarded-efi', type=Path,
                    help='Verify a fixture-bound EFI loader accepts clean guards and rejects pending')
+    p.add_argument('--guard-ext2-test', action='store_true',
+                   help='Run guarded ext2 repair and verification on the private data partition')
+    p.add_argument('--guard-ext2-bad-checker', action='store_true',
+                   help='Alter the private ext2 checker to test digest rejection')
+    p.add_argument('--guard-ext2-missing-checker', action='store_true',
+                   help='Remove the private ext2 checker to test missing-tool handling')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
     if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build or a.fat_checker):
         p.error('prepared pair is an independent identity rejection scenario')
-    if a.fat_checker and (a.dirty or a.missing_checker):
+    if a.fat_checker and ((a.dirty and not a.guard_ext2_test) or a.missing_checker):
         p.error('FAT checker uses a clean fixture')
     if a.fat_crosslink and not a.fat_checker:
         p.error('--fat-crosslink requires --fat-checker')
@@ -106,6 +112,12 @@ def main():
     if a.guarded_efi and (not a.guard_pending_test or a.guard_records!='valid' or
                           a.guard_pending_no_marker or a.guard_pending_wrong_serial):
         p.error('guarded EFI test requires the successful pending scenario')
+    if a.guard_ext2_test and (not a.guard_pending_test or not a.guarded_efi or a.guard_records!='valid'):
+        p.error('guarded ext2 test requires the successful guarded pending fixture')
+    if (a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) and (not a.guard_ext2_test or a.guard_pending_fail_at):
+        p.error('ext2 checker failure requires an uninjected guarded ext2 run')
+    if a.guard_ext2_bad_checker and a.guard_ext2_missing_checker:
+        p.error('choose one ext2 checker failure')
     if a.guard_reservation and (not (a.guard_open_probe or a.guard_real_checker) or not a.kernel_build):
         p.error('guard reservation requires a guard-only kernel and a checker or open probe')
     if a.guard_real_checker and not a.guard_reservation:
@@ -129,22 +141,36 @@ def main():
         work = Path(directory)
         disk = work / 'disk.raw'
         shutil.copyfile(image, disk)
-        if a.dirty:
+        if a.dirty or a.guard_ext2_test:
             partition = work / 'partition.img'
             subprocess.run(['dd', f'if={disk}', f'of={partition}', 'bs=512',
                             'skip=133120', 'count=126976', 'status=none'], check=True)
-            for command in ('setb 10000', 'set_super_value state 0'):
-                subprocess.run(['debugfs', '-w', '-R', command, str(partition)], check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            result = subprocess.run(['e2fsck', '-f', '-n', str(partition)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            if result.returncode != 4 or b'bitmap differences' not in result.stdout.lower():
-                raise RuntimeError('fixture did not develop the expected bitmap inconsistency')
+            if a.guard_ext2_test:
+                known=work/'known.txt';known.write_bytes(b'Brook guarded recovery fixture\n')
+                subprocess.run(['debugfs','-w','-R',f'write {known} /brook-recovery-known',str(partition)],
+                               check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                actual=subprocess.check_output(['debugfs','-R','cat /brook-recovery-known',str(partition)],stderr=subprocess.DEVNULL)
+                if actual!=known.read_bytes():raise RuntimeError('known file was not created')
+            if a.dirty:
+                for command in ('setb 10000', 'set_super_value state 0'):
+                    subprocess.run(['debugfs', '-w', '-R', command, str(partition)], check=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                result = subprocess.run(['e2fsck', '-f', '-n', str(partition)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if result.returncode != 4 or b'bitmap differences' not in result.stdout.lower():
+                    raise RuntimeError('fixture did not develop the expected bitmap inconsistency')
             subprocess.run(['dd', f'if={partition}', f'of={disk}', 'bs=512',
                             'seek=133120', 'conv=notrunc', 'status=none'], check=True)
         media = str(disk) + '@@1048576'
         initrd = work / 'initrd.img'
         subprocess.run(['mcopy', '-i', media, '::/RECOVERY/INITRD.IMG', str(initrd)], check=True)
+        if a.guard_ext2_missing_checker:
+            subprocess.run(['mdel','-i',str(initrd),'::/BOOT/E2FSCK.ELF'],check=True)
+        if a.guard_ext2_bad_checker:
+            checker_file=work/'bad-e2fsck.elf'
+            data=bytearray(subprocess.check_output(['mtype','-i',str(initrd),'::/BOOT/E2FSCK.ELF']))
+            data[-1]^=1;checker_file.write_bytes(data)
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(checker_file),'::/BOOT/E2FSCK.ELF'],check=True)
         if a.missing_checker:
             subprocess.run(['mdel', '-i', str(initrd), '::/BOOT/E2FSCK.ELF'], check=True)
         kernel = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/KERNEL.ELF'])
@@ -338,6 +364,9 @@ def main():
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited before local check completed')
                     text = serial.read_text(errors='replace') if serial.exists() else ''
+                    if (a.guard_reservation=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial) and
+                            'SSD_GUARD_RESERVATION_FAILED' in text):
+                        raise RuntimeError('guard reservation failed: '+text[-4000:])
                     if ((a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or
                          a.guard_pending_no_marker or a.guard_pending_wrong_serial) and
                             'SSD guard reservation failed; no recovery access permitted' in text and
@@ -349,7 +378,10 @@ def main():
                         selected = True
                         stop.set()
                     pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
-                    expected = ((f'GUARD_PENDING_TEST_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
+                    ext2_checker_failed=a.guard_ext2_bad_checker or a.guard_ext2_missing_checker
+                    expected = ('GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
+                                'GUARD_EXT2_VERIFIED_PENDING' if a.guard_ext2_test and not a.guard_pending_fail_at else
+                                (f'GUARD_PENDING_TEST_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
                                  'GUARD_PENDING_TEST_INCOMPLETE records=0' if a.guard_records in ('mismatch','wrong-identity') else
                                  'GUARD_PENDING_TEST_INCOMPLETE records=-2' if a.guard_records=='missing' else
                                  'GUARD_PENDING_TEST_INCOMPLETE records=-22') if a.guard_pending_test else
@@ -366,6 +398,8 @@ def main():
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
                     complete_lines = [line.rstrip('\r') for line in text.split('\n')[:-1]]
+                    if a.guard_ext2_test and any(line.startswith('GUARD_EXT2_INCOMPLETE ') and line!=expected for line in complete_lines):
+                        raise RuntimeError('guarded ext2 repair failed: '+text[-4000:])
                     checker_expected='GUARD_CHECK_RESULT exit=0' if a.guard_records else expected
                     if a.guard_real_checker and any(
                             line.startswith(('GUARD_CHECK_RESULT ', 'GUARD_CHECK_INCOMPLETE ')) and line != checker_expected
@@ -381,6 +415,15 @@ def main():
                         raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
                     matched = expected in complete_lines if a.fat_checker else expected in text
                     if selected and matched:
+                        if a.guard_ext2_test and not a.guard_pending_fail_at:
+                            preen=('GUARD_EXT2_PREEN exit=-8' if a.guard_ext2_bad_checker else
+                                   'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
+                                   'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
+                            required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_TEST_RESULT outcome=2',preen,expected]
+                            if not all(line in complete_lines for line in required):
+                                raise RuntimeError('guarded repair milestones missing')
+                            indices=[complete_lines.index(line) for line in required]
+                            if indices!=sorted(indices):raise RuntimeError('guarded repair milestones out of order')
                         if a.guard_records and ('GUARD_CHECK_RESULT exit=0' not in complete_lines or
                                                 complete_lines.index('GUARD_CHECK_RESULT exit=0')>=complete_lines.index(expected)):
                             raise RuntimeError('guard record result did not follow a successful checker')
@@ -486,6 +529,8 @@ def main():
             if not a.guard_pending_fail_at and actual_records[0]!=actual_records[1]:
                 raise RuntimeError('pending records differ')
             changes=0;pos=0
+            if a.guard_ext2_test and not (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker):
+                allowed.append((parts[1]['start']*512,(parts[1]['start']+parts[1]['size'])*512))
             with baseline.open('rb') as old,disk.open('rb') as new:
                 while True:
                     left=old.read(1024*1024);right=new.read(1024*1024)
@@ -501,6 +546,20 @@ def main():
                                     raise RuntimeError('guard attributes changed beyond the archive bit')
                     pos+=len(left)
             if not changes and not a.guard_pending_fail_at:raise RuntimeError('pending transaction changed no bytes')
+            if a.guard_ext2_test and not (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker):
+                partition=work/'verify-data.img'
+                subprocess.run(['dd',f'if={disk}',f'of={partition}','bs=512',
+                                f'skip={parts[1]["start"]}',f'count={parts[1]["size"]}','status=none'],check=True)
+                checked=subprocess.run(['e2fsck','-f','-n',str(partition)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                if checked.returncode:raise RuntimeError('independent host e2fsck failed: '+checked.stdout.decode(errors='replace')[-3000:])
+                content=subprocess.check_output(['debugfs','-R','cat /brook-recovery-known',str(partition)],stderr=subprocess.DEVNULL)
+                if content!=b'Brook guarded recovery fixture\n':raise RuntimeError('known file changed during recovery')
+                with partition.open('rb') as stream:
+                    stream.seek(1024+104)
+                    if stream.read(16)!=filesystem_uuid:raise RuntimeError('filesystem identity changed during recovery')
+            if a.guard_ext2_test and a.guard_pending_fail_at:
+                final=serial.read_text(errors='replace')
+                if 'GUARD_EXT2_PREEN' in final:raise RuntimeError('preen started after pending failure')
             if a.guarded_efi:
                 guard_boot=work/'pending-boot';guard_boot.mkdir();pending_hash=sha(disk)
                 clean=expected_records[0]==record_data and expected_records[1]==record_data
@@ -515,7 +574,9 @@ def main():
             raise RuntimeError('read-only check changed the disposable disk')
         if poison and sha(poison) != poison_before:
             raise RuntimeError('guard boot changed the overmount fixture')
-        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker or a.guard_pending_no_marker or a.guard_pending_wrong_serial else
+        print('RECOVERY_GUEST_GUARD_EXT2_REJECT_PASS' if a.guard_ext2_test and (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) else
+              'RECOVERY_GUEST_GUARD_EXT2_PASS' if a.guard_ext2_test else
+              'RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker or a.guard_pending_no_marker or a.guard_pending_wrong_serial else
               'RECOVERY_GUEST_GUARD_PENDING_PASS' if a.guard_pending_test else
               'RECOVERY_GUEST_GUARD_CHECK_PASS' if a.guard_real_checker else
               'RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else

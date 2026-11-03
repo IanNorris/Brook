@@ -7,6 +7,9 @@
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
 #endif
+#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+#include "guard_repair_session.h"
+#endif
 #include "process.h"
 #include "scheduler.h"
 #include "kprintf.h"
@@ -24,6 +27,57 @@ constexpr uint8_t checkerHash[32]={
     0x4a,0xad,0x4c,0x64,0xbf,0xdc,0x43,0xea,0x83,0xa0,0x16,0xc8,0xfe,0xe9,0xd5,0xe3};
 constexpr const char* checkerPath="/boot/FATFSCK.ELF";
 constexpr uint64_t checkerMax=4*1024*1024;
+#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+constexpr uint8_t ext2Hash[32]={
+    0xac,0xc6,0xde,0xe6,0xfb,0x21,0xaf,0xd6,0x70,0xd0,0x52,0x61,0x7b,0x66,0x55,0x88,
+    0x07,0x0d,0x53,0x6e,0x2e,0x73,0xb5,0xc4,0xf9,0x5d,0xb1,0x1f,0x98,0x92,0x22,0x68};
+int RunExt2Checker(Device* device,bool writable) {
+    constexpr const char* path="/boot/E2FSCK.ELF";
+    Vnode* node=nullptr;char resolved[256]{};ExecutableImage image{};VnodeStat stat{};
+    int error=VfsOpenExecutable(path,&node,resolved,sizeof(resolved));
+    if(!error)error=VfsStat(node,&stat);
+    if(!error && (stat.isDir || stat.isSymlink || !stat.size || stat.size>checkerMax))error=-8;
+    if(!error)error=ReadExecutableImage(node,&image);
+    if(node)VfsRelease(node);
+    uint8_t hash[32]{};char interpreter[256]{};
+    if(!error) {
+        BrookUpdateHash(image.data,image.size,hash);
+        if(!BrookUpdateEqual(hash,ext2Hash,sizeof(hash)) ||
+           !ElfMainInterpreter(image.data,image.size,interpreter,sizeof(interpreter)) || interpreter[0])error=-8;
+    }
+    if(error) {FreeExecutableImage(&image);return error;}
+    const char* preen[]={path,"-p","/dev/brook-guard-data",nullptr};
+    const char* verify[]={path,"-f","-n","/dev/brook-guard-data",nullptr};
+    const char* env[]={"PATH=/boot","LANG=C",nullptr};
+    FdEntry fds[3]{};fds[0].type=FdType::DevNull;fds[1].type=fds[2].type=FdType::DebugConsole;
+    fds[1].statusFlags=fds[2].statusFlags=1;
+    Process* child=ProcessCreateExecutable(image,writable?3:4,writable?preen:verify,2,env,fds,0,0);
+    FreeExecutableImage(&image);
+    if(!child)return -12;
+    child->parentPid=ProcessCurrent()->tgid;child->fds[3]={};
+    const uint16_t pid=child->pid;const uint64_t incarnation=child->incarnation;
+    if(!GuardRepairBegin(device,child,writable)) {ProcessDiscardUnpublished(child);return -13;}
+    SchedulerAddProcess(child);child=nullptr;
+    ChildWaitSnapshot result{};int waited=0;
+    for(unsigned i=0;i<12000 && !waited;++i) {
+        waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+        if(!waited)SchedulerSleepMs(10);
+    }
+    bool drained=false;
+    if(waited==1)drained=GuardRepairEnd();else GuardRepairAbort();
+    if(waited!=1) {
+        auto* process=SchedulerFindProcessReference(pid);
+        if(process) {if(process->incarnation==incarnation)SchedulerRequestFatalSignal(process,9);ProcessUnref(process);}
+        for(unsigned i=0;i<3000 && waited==0;++i) {
+            SchedulerSleepMs(10);waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+        }
+        return GuardRepairQuiescent()?-110:-115;
+    }
+    if(!drained)return -115;
+    if(result.code!=1)return -5;
+    return result.status>>8;
+}
+#endif
 void Worker(void* arg) {
     KPuts("brook-ssd-recovery-readonly-v1\n");
     auto* device=static_cast<Device*>(arg);
@@ -120,7 +174,24 @@ void Worker(void* arg) {
     if(FatFsPrivateRecoveryTestPending(mount,identity,failAt)!=0) {
         KPuts("GUARD_PENDING_TEST_INCOMPLETE repeated\n");return;
     }
-    KPrintf("GUARD_PENDING_TEST_RESULT outcome=%d\n",pending);return;
+    KPrintf("GUARD_PENDING_TEST_RESULT outcome=%d\n",pending);
+#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+    if(pending!=2)return;
+    auto* data=AhciSystemGuardTestDataArm(adapter,pending);
+    if(!data) {KPuts("GUARD_EXT2_INCOMPLETE data-admission\n");return;}
+    const int preen=RunExt2Checker(data,true);
+    KPrintf("GUARD_EXT2_PREEN exit=%d\n",preen);
+    if((preen!=0 && preen!=1) || !AhciSystemGuardTestDataVerify(data)) {
+        if(preen!=-115)AhciSystemGuardTestDataFinish(data);
+        KPuts("GUARD_EXT2_INCOMPLETE preen\n");return;
+    }
+    const int verification=RunExt2Checker(data,false);
+    const bool identityOk=verification==0 && AhciSystemGuardTestDataIdentityValid(data);
+    if(verification!=-115)AhciSystemGuardTestDataFinish(data);
+    if(verification!=0 || !identityOk) {KPrintf("GUARD_EXT2_INCOMPLETE verify=%d identity=%u\n",verification,identityOk?1u:0u);return;}
+    KPuts("GUARD_EXT2_VERIFIED_PENDING\n");
+#endif
+    return;
 #else
     const int inspection=FatFsGuardInspectReadOnly(1,device,profile,records);
     if(inspection) {KPrintf("GUARD_RECORDS_INCOMPLETE read=%d\n",inspection);return;}

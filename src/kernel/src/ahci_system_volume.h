@@ -26,6 +26,11 @@ bool AhciSystemGuardIdentity(char (&out)[97]);
 Device* AhciSystemGuardTestPrepare(Device* reserved);
 bool AhciSystemGuardTestBeginWrites(Device* adapter);
 void AhciSystemGuardTestFinish(Device* adapter);
+Device* AhciSystemGuardTestDataArm(Device* adapter,int pendingOutcome);
+bool AhciSystemGuardTestDataVerify(Device* adapter);
+bool AhciSystemGuardTestDataIdentityValid(Device* adapter);
+void AhciSystemGuardTestDataFinish(Device* adapter);
+bool AhciSystemGuardIsTestData(Device* adapter);
 #endif
 // Optional, read-only boot diagnostic. Does not mount or change the disk.
 void AhciSystemDataInspect();

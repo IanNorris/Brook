@@ -69,6 +69,32 @@ uint64_t GuardTestBlocks(Device*) {return guardReady?guardRange.bytes/512:0;}
 uint32_t GuardTestBlockSize(Device*) {return 512;}
 const BlockDeviceOps guardTestOps{GuardTestRead,GuardTestWrite,GuardTestControl,nullptr,GuardTestBlocks,GuardTestBlockSize};
 Device guardTestPartition{reinterpret_cast<const DeviceOps*>(&guardTestOps),"ahci-guard-test",DeviceType::Block,nullptr};
+enum class GuardDataPhase : uint8_t {Disabled,Repair,Verify,Finished,Failed};
+GuardDataPhase guardDataPhase=GuardDataPhase::Disabled;
+Range guardDataRange{};
+int GuardDataRead(Device*,uint64_t offset,void* data,uint64_t length) {
+    if(guardDataPhase!=GuardDataPhase::Repair && guardDataPhase!=GuardDataPhase::Verify)return -19;
+    if(offset>guardDataRange.bytes || length>guardDataRange.bytes-offset)return -22;
+    return guardDataRange.parent->ops->read(guardDataRange.parent,guardDataRange.start+offset,data,length);
+}
+int GuardDataWrite(Device* adapter,uint64_t offset,const void* data,uint64_t length) {
+    if(guardDataPhase!=GuardDataPhase::Repair)return -30;
+    if(offset>guardDataRange.bytes || length>guardDataRange.bytes-offset) {guardDataPhase=GuardDataPhase::Failed;return -22;}
+    const int result=DeviceWriteLeased(guardDataRange.parent,adapter,guardDataRange.start+offset,data,length);
+    if(result<0 || uint64_t(result)!=length)guardDataPhase=GuardDataPhase::Failed;
+    return result;
+}
+int GuardDataControl(Device*,uint32_t request,void*) {
+    if(request==DEVICE_IOCTL_READ_ONLY)return 0;
+    if(request==DEVICE_IOCTL_FLUSH && (guardDataPhase==GuardDataPhase::Repair || guardDataPhase==GuardDataPhase::Verify)) {
+        const int error=DeviceFlush(guardDataRange.parent);if(error)guardDataPhase=GuardDataPhase::Failed;return error;
+    }
+    return -95;
+}
+uint64_t GuardDataBlocks(Device*) {return guardReady?guardDataRange.bytes/512:0;}
+uint32_t GuardDataBlockSize(Device*) {return 512;}
+const BlockDeviceOps guardDataOps{GuardDataRead,GuardDataWrite,GuardDataControl,nullptr,GuardDataBlocks,GuardDataBlockSize};
+Device guardDataPartition{reinterpret_cast<const DeviceOps*>(&guardDataOps),"ahci-guard-data-test",DeviceType::Block,nullptr};
 #endif
 int Read(Device*,uint64_t offset,void* data,uint64_t length) {
     if(offset>range.bytes || length>range.bytes-offset)return -22;
@@ -204,10 +230,21 @@ Device* AhciSystemGuardPrepare() {
     if(!ReadExact(disk,layout.data.first+2,superblock,sizeof(superblock)) ||
        superblock[56]!=0x53 || superblock[57]!=0xef || memcmp(superblock+104,largeUuid,16))return nullptr;
     guardRange={disk,layout.esp.first*512,layout.esp.count*512};
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    guardDataRange={disk,layout.data.first*512,layout.data.count*512};
+#endif
     // Registered callbacks reject I/O until the complete batch is installed.
     if(!DeviceRegister(&guardPartition))return nullptr;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    if(!DeviceRegister(&guardDataPartition))return nullptr;
+#endif
     BlockWriteLease leases[4]{};
-    if(!AhciDirectGuardLeases(layout,reinterpret_cast<uintptr_t>(disk),0,
+    if(!AhciDirectGuardLeases(layout,reinterpret_cast<uintptr_t>(disk),
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+                              reinterpret_cast<uintptr_t>(&guardDataPartition),
+#else
+                              0,
+#endif
                               reinterpret_cast<uintptr_t>(&guardPartition),leases) ||
        !DeviceInstallBootWriteLeases(leases,4))return nullptr;
     guardReady=true;
@@ -238,6 +275,25 @@ bool AhciSystemGuardTestBeginWrites(Device* adapter) {
 void AhciSystemGuardTestFinish(Device* adapter) {
     if(adapter==&guardTestPartition && guardTestPhase!=GuardTestPhase::Failed)guardTestPhase=GuardTestPhase::Finished;
 }
+Device* AhciSystemGuardTestDataArm(Device* adapter,int pendingOutcome) {
+    if(adapter!=&guardTestPartition || guardTestPhase!=GuardTestPhase::Finished ||
+       pendingOutcome!=2 || guardDataPhase!=GuardDataPhase::Disabled || !guardReady)return nullptr;
+    guardDataPhase=GuardDataPhase::Repair;return &guardDataPartition;
+}
+bool AhciSystemGuardTestDataVerify(Device* adapter) {
+    if(adapter!=&guardDataPartition || guardDataPhase!=GuardDataPhase::Repair || DeviceFlush(adapter))return false;
+    guardDataPhase=GuardDataPhase::Verify;return true;
+}
+bool AhciSystemGuardTestDataIdentityValid(Device* adapter) {
+    if(adapter!=&guardDataPartition || guardDataPhase!=GuardDataPhase::Verify)return false;
+    uint8_t superblock[1024]{};
+    return adapter->ops->read(adapter,1024,superblock,sizeof(superblock))==int(sizeof(superblock)) &&
+        superblock[56]==0x53 && superblock[57]==0xef && !memcmp(superblock+104,largeUuid,16);
+}
+void AhciSystemGuardTestDataFinish(Device* adapter) {
+    if(adapter==&guardDataPartition && guardDataPhase!=GuardDataPhase::Failed)guardDataPhase=GuardDataPhase::Finished;
+}
+bool AhciSystemGuardIsTestData(Device* adapter) {return adapter==&guardDataPartition && guardReady;}
 #endif
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(attempted)return Fail("repeated admission");attempted=true;

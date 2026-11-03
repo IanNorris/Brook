@@ -1,6 +1,9 @@
 #include "process_fs.h"
 #include "seek_position.h"
 #include "guard_checker_session.h"
+#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+#include "guard_repair_session.h"
+#endif
 #include "device.h"
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
 #include "strict_gpt_inventory.h"
@@ -3528,6 +3531,18 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     const char* lookupPath=hasSyntheticName?resolvedPath:path;
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
+#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+    if(StrEq(path,"/dev/brook-guard-data") && !hasSyntheticName)return -13;
+    if(StrEq(syntheticPath,"/dev/brook-guard-data")) {
+        int error=0;Vnode* node=GuardRepairOpenLinux(flags,&error);
+        if(!node)return error?error:-13;
+        FdEntry entry{};entry.type=FdType::Vnode;entry.handle=node;
+        entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
+        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        if(fd<0) {VfsRelease(node);return -EMFILE;}
+        return fd;
+    }
+#endif
     // Reserved exclusively for the boot-owned, read-only recovery checker.
     // Never fall back to a filesystem node if admission is denied.
     if(StrEq(path,"/dev/brook-guard-esp") && !hasSyntheticName)return -13;

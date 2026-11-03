@@ -149,6 +149,22 @@ choice. These are logical failure tests in QEMU, not physical power-cut or
 controller-cache durability evidence. The test adapter and its safety checks
 must not be mistaken for a production writable recovery handoff.
 
+A further default-off `BROOK_SSD_GUARD_EXT2_TEST` build extends that disposable
+path: after the pending records are durable, it grants the authenticated static
+e2fsck process access to a separately reserved data-partition adapter. Preen
+and verification use distinct, process-bound sessions; the verification session
+rejects writes. A clean fixture and a deliberately dirty bitmap fixture passed
+preen and a separate `-f -n` check; the latter reported preen exit 1. After
+QEMU stopped, an independent host `e2fsck -f -n` passed, a known file and UUID
+were intact, changes outside the data partition and permitted guard bytes were
+rejected, and the guarded EFI boot selected recovery. Pending failure and
+missing or altered checker tests left the data partition unchanged. Host tests
+cover authorization, bounded I/O, separate verifier permissions, and blocked
+write/flush cancellation. If a cancelled checker does not drain, the test does
+not advance the adapter or verification. Records deliberately remain pending;
+clearing them, booting the repaired store, production admission and physical
+power-loss behavior are not implemented or proven.
+
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and
 metadata changes, handles short/error reads, and is covered by host tests. It
