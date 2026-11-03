@@ -84,9 +84,13 @@ disk-backed filesystem or cache has been started.
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and
 metadata changes, handles short/error reads, and is covered by host tests. It
-has no user-space path or checker authorization: a process-identity and
-lifetime gate must be implemented before exposing it or treating checker
-completion as authority to mount. Closing the view does not authorize repair.
+has no user-space path. An unpublished one-shot checker session now restricts
+opens and reads to a root-started process group and leader incarnation, and
+counts outstanding views and reads. Abort rejects new access while admitted
+reads finish; it does not authorize a mount or repair. Host tests cover races
+and retained references with a stubbed VFS. Trusted executable and exec-lifetime
+checks, actual checker launch and exit authentication, and an ownership handoff
+remain necessary before this can be exposed or used to authorize a mount.
 
 The pinned Nix environment produced a static musl dosfstools 4.2 checker
 (SHA-256 `99cc8160e7a076ecd9cb04e13bdbe71c4aad4c64bfdc43ea83a016c8fee9d5e3`).

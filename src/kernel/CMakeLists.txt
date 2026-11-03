@@ -301,6 +301,7 @@ add_executable(kernel
     src/fs_context.cpp
     src/fatfs_vfs.cpp
     src/guard_readonly_view.cpp
+    src/guard_checker_session.cpp
     src/ext2_vfs.cpp
     src/ext4_vfs.cpp
     src/procfs.cpp

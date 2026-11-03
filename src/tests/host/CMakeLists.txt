@@ -63,6 +63,8 @@ add_host_test(test_recovery_guard)
 add_host_test(test_recovery_guard_transaction)
 add_host_test(test_guard_readonly_view "${BROOK_ROOT}/src/kernel/src/guard_readonly_view.cpp")
 target_compile_options(test_guard_readonly_view PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+add_host_test(test_guard_checker_session "${BROOK_ROOT}/src/kernel/src/guard_checker_session.cpp" "${BROOK_ROOT}/src/kernel/src/guard_readonly_view.cpp")
+target_compile_options(test_guard_checker_session PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp")
 target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
