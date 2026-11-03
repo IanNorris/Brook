@@ -211,21 +211,35 @@ ESP across checking and mounting, enforce a read-only checker interface, accept
 only a completed exit 0, and constrain FAT geometry/interpretation. Further
 fixtures and physical validation remain necessary.
 
-Unintegrated bootloader helpers now validate a bounded GPT hard-drive device
+Bootloader helpers validate a bounded GPT hard-drive device
 path, an exact whole-disk parent-path match, matching primary and backup GPTs,
 the ESP and data partition identities and bounds, and the ext2 header state.
 Host tests exercise malformed paths, partition metadata, read failures and a
 media change after reading. A bounded reader sequences both GPT copies and
 the ext2 superblock through a caller-provided read interface. These helpers
-perform no firmware I/O, are not part of the boot decision, and cannot grant
-repair authority. A bounded, read-only Block I/O adapter now compiles against
-the actual UEFI ABI. A separate uncalled firmware inspector discovers the
+perform no firmware I/O themselves and cannot grant repair authority. A
+bounded, read-only Block I/O adapter now compiles against the actual UEFI ABI.
+A firmware inspector discovers the
 unique whole-disk parent of the loaded ESP, retains and rechecks its media and
 device-path identity, and reads the GPT and ext2 header. Host UEFI fakes test
 clean and dirty filesystems, ambiguous disks, malformed paths, changing media,
-and read failures. This code is not invoked by the boot decision. Actual
-firmware I/O validation, independent identity provisioning, and automatic
-dispatch remain.
+and read failures. An opt-in guarded EFI variant can invoke the inspector
+before any normal slot or legacy payload and select the independently verified
+recovery pair if the data header is dirty or invalid. In disposable OVMF tests
+the inspector classified clean, dirty and wrong-UUID volumes and selected the
+boot disk even when a second disk had identical GUIDs but a different dirty
+state. The guarded boot test selected normal on clean data and recovery on
+dirty data, a wrong UUID or pending guard records without F5. With valid A/B
+slots, clean data selected a verified slot and dirty data still selected
+recovery; a missing or corrupt recovery pair halted rather than booting a
+normal payload. Ordinary probe
+overlays remained unchanged. After a deliberately damaged backup GPT was
+presented, the final overlay had been restored and the inspector reported clean;
+the precise restoration timing is unknown and that corruption case did not
+test inspector rejection.
+This option is off by default and has not been deployed to the Dell; production
+identity provisioning, physical firmware validation and repair authorization
+remain.
 
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`

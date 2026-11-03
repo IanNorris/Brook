@@ -11,6 +11,20 @@
 #include "update_slots.h"
 #include "paging.h"
 #include "boot_protocol/boot_protocol.h"
+#if defined(BROOK_GUARD_CHECK_DATA)
+#include "recovery_firmware_discovery.h"
+static bool ConfiguredDataIsClean(EFI_HANDLE image,EFI_BOOT_SERVICES* services) {
+    brook::bootloader::RecoveryDiskIdentity id{};
+    const char* input=BROOK_GUARD_IDENTITY;uint8_t* fields[]={id.diskGuid,id.dataGuid,id.fsUuid};
+    for(unsigned field=0;field<3;++field)for(unsigned i=0;i<16;++i) {
+        unsigned value=0;
+        for(unsigned j=0;j<2;++j) {const char c=*input++;value=value*16+(c<='9'?c-'0':c-'a'+10);}
+        fields[field][i]=static_cast<uint8_t>(value);
+    }
+    id.dataFirst=BROOK_GUARD_DATA_FIRST;id.dataSectors=BROOK_GUARD_DATA_SECTORS;
+    return brook::bootloader::RecoveryInspectFirmwareDisk(image,services,id)==brook::bootloader::RecoveryDiskState::Clean;
+}
+#endif
 
 extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
 {
@@ -58,7 +72,10 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     // This build variant always checks before considering any normal A/B or
     // legacy payload, regardless of BROOK.CFG. A failed check can only enter
     // the independently verified recovery pair.
-    const bool guardDenied = !RecoveryGuardAllowsNormal(imageHandle,systemTable->BootServices,BROOK_GUARD_IDENTITY);
+    bool guardDenied = !RecoveryGuardAllowsNormal(imageHandle,systemTable->BootServices,BROOK_GUARD_IDENTITY);
+#if defined(BROOK_GUARD_CHECK_DATA)
+    if(!guardDenied)guardDenied=!ConfiguredDataIsClean(imageHandle,systemTable->BootServices);
+#endif
     if (guardDenied) recoveryRequested = true;
 #endif
     if (!recoveryRequested && g_bootConfig.recoveryMenu && systemTable->ConIn) {

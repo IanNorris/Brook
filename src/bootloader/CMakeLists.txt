@@ -67,6 +67,10 @@ target_link_options(bootloader PRIVATE
 # enabling this build option. Deployment requires every firmware-reachable EFI
 # entrypoint to be inventoried and migrated independently.
 option(BROOK_BUILD_GUARDED_BOOTLOADER "Build a mandatory recovery-guard EFI variant" OFF)
+option(BROOK_GUARD_CHECK_DATA "Experimental: select verified recovery for dirty or invalid data" OFF)
+if(BROOK_GUARD_CHECK_DATA AND NOT BROOK_BUILD_GUARDED_BOOTLOADER)
+    message(FATAL_ERROR "Data inspection requires the guarded bootloader")
+endif()
 if(BROOK_BUILD_GUARDED_BOOTLOADER)
     set(BROOK_GUARD_IDENTITY "" CACHE STRING "96 lowercase hex digits: disk GUID, partition GUID, ext2 UUID (on-disk byte order)")
     string(LENGTH "${BROOK_GUARD_IDENTITY}" BROOK_GUARD_IDENTITY_LENGTH)
@@ -81,8 +85,38 @@ if(BROOK_BUILD_GUARDED_BOOTLOADER)
         -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter)
     target_compile_definitions(bootloader_guarded PRIVATE BROOK_RECOVERY_GUARD_REQUIRED=1
         BROOK_GUARD_IDENTITY="${BROOK_GUARD_IDENTITY}")
+    if(BROOK_GUARD_CHECK_DATA)
+        set(BROOK_GUARD_DATA_FIRST "" CACHE STRING "Expected data partition first LBA")
+        set(BROOK_GUARD_DATA_SECTORS "" CACHE STRING "Expected data partition sector count")
+        if(NOT BROOK_GUARD_DATA_FIRST MATCHES "^[1-9][0-9]*$" OR NOT BROOK_GUARD_DATA_SECTORS MATCHES "^[1-9][0-9]*$")
+            message(FATAL_ERROR "Guarded data inspection requires positive decimal partition bounds")
+        endif()
+        target_compile_definitions(bootloader_guarded PRIVATE BROOK_GUARD_CHECK_DATA=1
+            BROOK_GUARD_DATA_FIRST=${BROOK_GUARD_DATA_FIRST} BROOK_GUARD_DATA_SECTORS=${BROOK_GUARD_DATA_SECTORS})
+    endif()
     target_link_options(bootloader_guarded PRIVATE "/entry:EfiMain")
     set_target_properties(bootloader_guarded PROPERTIES OUTPUT_NAME "BROOKGUARD" SUFFIX ".efi")
+endif()
+
+# Private QEMU-only probe. It writes its result to QEMU's debugcon and halts;
+# it is never installed as a normal or recovery bootloader.
+option(BROOK_BUILD_RECOVERY_PROBE "Build private OVMF disk-inspection probe" OFF)
+if(BROOK_BUILD_RECOVERY_PROBE)
+    set(BROOK_RECOVERY_PROBE_IDENTITY "" CACHE STRING "96 lowercase hex identity digits")
+    set(BROOK_RECOVERY_PROBE_FIRST "" CACHE STRING "Expected data partition first LBA")
+    set(BROOK_RECOVERY_PROBE_SECTORS "" CACHE STRING "Expected data partition sector count")
+    string(LENGTH "${BROOK_RECOVERY_PROBE_IDENTITY}" BROOK_RECOVERY_PROBE_IDENTITY_LENGTH)
+    if(NOT BROOK_RECOVERY_PROBE_IDENTITY_LENGTH EQUAL 96 OR BROOK_RECOVERY_PROBE_IDENTITY MATCHES "[^0-9a-f]" OR
+       NOT BROOK_RECOVERY_PROBE_FIRST MATCHES "^[1-9][0-9]*$" OR NOT BROOK_RECOVERY_PROBE_SECTORS MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR "Probe requires a 96-digit identity and positive decimal data geometry")
+    endif()
+    add_executable(recovery_probe src/recovery_probe_main.cpp src/recovery_firmware_discovery.cpp src/runtime.cpp)
+    target_include_directories(recovery_probe PRIVATE ${UEFI_INCLUDE_DIRS} ${SHARED_INCLUDE_DIRS} src)
+    target_compile_options(recovery_probe PRIVATE -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter)
+    target_compile_definitions(recovery_probe PRIVATE BROOK_RECOVERY_PROBE_IDENTITY="${BROOK_RECOVERY_PROBE_IDENTITY}"
+        BROOK_RECOVERY_PROBE_FIRST=${BROOK_RECOVERY_PROBE_FIRST} BROOK_RECOVERY_PROBE_SECTORS=${BROOK_RECOVERY_PROBE_SECTORS})
+    target_link_options(recovery_probe PRIVATE "/entry:EfiMain")
+    set_target_properties(recovery_probe PROPERTIES OUTPUT_NAME "BROOKPROBE" SUFFIX ".efi")
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
