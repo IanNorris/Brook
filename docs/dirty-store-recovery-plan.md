@@ -86,5 +86,23 @@ The checker and a small chmod bootstrap were staged into RAM in the USB
 recovery environment. The same checker and staging approach were exercised on
 a disposable QEMU image first; no checker executable was written to the SSD.
 
+## Offline diagnostic prototype, 2026-11-03
+
+An optional recovery initrd can start a local, root-owned supervisor that
+runs the bundled static checker with `-f -n` against the unmounted maintenance
+device and reports the result on the console. It does not request repair or
+restart and does not need network access. Its payload identity is checked
+before starting the checker. This is a diagnostic only: the maintenance
+device itself is still writable, so the read-only property relies on the
+trusted checker and its fixed arguments, not a kernel-enforced capability.
+
+On disposable QEMU SATA images, both a clean filesystem and deliberately
+damaged allocation bitmap produced the expected result with no USB controller
+or network; the entire disk hash was unchanged in each test. Console geometry
+was adjusted so the result remains visible after display scaling. These tests
+do not establish physical Dell behavior. This prototype has not been installed
+on the Dell, and automatic repair and cross-boot recovery admission are not yet
+implemented.
+
 References: [Linux ext2 filesystem checking](https://docs.kernel.org/7.0/filesystems/ext2.html),
 [e2fsck manual and exit codes](https://man7.org/linux/man-pages/man8/e2fsck.8.html).

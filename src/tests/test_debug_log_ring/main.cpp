@@ -4,6 +4,16 @@
 #include <cstdio>
 #include <cstring>
 int main(){
+    auto small=brook::ConsoleFitInitial(800,556,800,500,2,28);
+    assert(small.x+small.width+4<=800 && small.y+small.height+32<=556);
+    assert(small.x==20 && small.y==60 && small.width==776 && small.height==464);
+    auto large=brook::ConsoleFitInitial(3200,1712,1600,1000,4,56);
+    assert(large.x==20 && large.y==60 && large.width==1600 && large.height==1000);
+    auto tiny=brook::ConsoleFitInitial(4,4,800,500,2,28);
+    assert(tiny.width==0 && tiny.height==0);
+    assert(brook::ConsoleVisibleHeight(98,464,512)==414);
+    assert(brook::ConsoleVisibleHeight(-20,464,512)==464);
+    assert(brook::ConsoleVisibleHeight(600,464,512)==0);
     // Follow, hold a historical position during writes, recover when that
     // history wraps, and resume following at the newest line.
     brook::ConsoleViewport view;uint32_t start=0,count=0;

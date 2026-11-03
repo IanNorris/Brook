@@ -3,8 +3,8 @@
 
 The source is an already reviewed physical maintenance pair. The resulting
 image keeps its identity-bound writable SSD access but removes desktop-store
-mounts and applications. It provides a static checker for an operator; this
-preparer does not automatically repair, reboot, or write any physical disk.
+mounts and applications. An optional static supervisor starts a read-only
+check locally. This preparer does not repair, reboot, or write a physical disk.
 """
 import argparse
 import hashlib
@@ -19,11 +19,13 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from hardware_update_protocol import INITRD_MAX, KERNEL_MAX, record
-from hardware_recovery_fsck import embed_checker
+from hardware_recovery_fsck import embed_checker, validate_checker
 
 INIT = (b'set wm\nset vfb none\nsched eevdf\nkconsole\n'
         b'run --console --uid 1000 /boot/HWSTATUS.ELF\n')
 PAYLOAD_ID = b'brook-ssd-recovery-manual-v1\n'
+AUTO_CHECK_INIT = b'set wm\nset vfb none\nsched eevdf\nkconsole\nrun --console --uid 0 /boot/RECCHECK.ELF\n'
+AUTO_CHECK_PAYLOAD_ID = b'brook-ssd-recovery-readonly-v1\n'
 
 
 def sha(data):
@@ -44,7 +46,7 @@ def read_regular(path, maximum):
         os.close(fd)
 
 
-def prepare(source, checker, validator, out):
+def prepare(source, checker, validator, out, check_program=None):
     manifest_data = read_regular(source / 'manifest.json', 1024 * 1024)
     manifest = json.loads(manifest_data)
     inputs = {}
@@ -80,18 +82,28 @@ def prepare(source, checker, validator, out):
         for name in ('boot-app-snapshot', 'writable-desktop'):
             subprocess.run(['mdel', '-i', str(image), '::ETC/' + name], check=True)
         init = out / 'INIT.RC'
-        init.write_bytes(INIT)
+        init_data = AUTO_CHECK_INIT if check_program is not None else INIT
+        init.write_bytes(init_data)
         subprocess.run(['mcopy', '-o', '-i', str(image), str(init), '::BOOT/INIT.RC'], check=True)
-        if subprocess.check_output(['mtype', '-i', str(image), '::BOOT/INIT.RC']) != INIT:
+        if subprocess.check_output(['mtype', '-i', str(image), '::BOOT/INIT.RC']) != init_data:
             raise RuntimeError('recovery init script readback mismatch')
         identity = out / 'hardware-payload-id'
-        identity.write_bytes(PAYLOAD_ID)
+        payload_id = AUTO_CHECK_PAYLOAD_ID if check_program is not None else PAYLOAD_ID
+        identity.write_bytes(payload_id)
         subprocess.run(['mcopy', '-o', '-i', str(image), str(identity),
                         '::ETC/hardware-payload-id'], check=True)
-        if fat('ETC/hardware-payload-id').stdout != PAYLOAD_ID:
+        if fat('ETC/hardware-payload-id').stdout != payload_id:
             raise RuntimeError('recovery payload identity readback mismatch')
         identity.unlink()
         checker_info = embed_checker(image, checker)
+        check_info = None
+        if check_program is not None:
+            check_info = validate_checker(check_program)
+            subprocess.run(['mcopy', '-o', '-i', str(image), str(check_program),
+                            '::BOOT/RECCHECK.ELF'], check=True)
+            copied = fat('BOOT/RECCHECK.ELF')
+            if copied.returncode or len(copied.stdout) != check_info['bytes'] or sha(copied.stdout) != check_info['sha256']:
+                raise RuntimeError('local check supervisor readback mismatch')
         for name, expected in policy.items():
             read = fat('ETC/' + name)
             if read.returncode or read.stdout != expected:
@@ -101,10 +113,10 @@ def prepare(source, checker, validator, out):
         initrd = image.read_bytes()
         selection = record(1, 0, kernel, initrd)
         (out / 'SELECT.BIN').write_bytes(selection)
-        receipt = {'scope': 'prepared manual recovery only; not installed or boot tested',
+        receipt = {'scope': 'prepared recovery only; not installed or boot tested',
                    'source_payload_id': manifest['payload_id'],
                    'source_manifest_sha256': sha(manifest_data),
-                   'checker': checker_info,
+                   'checker': checker_info, 'local_check_supervisor': check_info,
                    'files': {name: {'bytes': len(data), 'sha256': sha(data)}
                              for name, data in (('KERNEL.ELF', kernel), ('INITRD.IMG', initrd),
                                                 ('SELECT.BIN', selection))}}
@@ -121,9 +133,12 @@ def main():
     p.add_argument('--checker', required=True, type=Path)
     p.add_argument('--elf-validator', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
+    p.add_argument('--check-program', type=Path,
+                   help='Optional trusted static supervisor to start as root for the local read-only check')
     a = p.parse_args()
     print(json.dumps(prepare(a.source.resolve(strict=True), a.checker,
-                             a.elf_validator.resolve(strict=True), a.output.absolute()), indent=2))
+                             a.elf_validator.resolve(strict=True), a.output.absolute(),
+                             a.check_program), indent=2))
 
 
 if __name__ == '__main__':

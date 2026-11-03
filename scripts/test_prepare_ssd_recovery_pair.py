@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-from prepare_ssd_recovery_pair import INIT, prepare
+from prepare_ssd_recovery_pair import INIT, AUTO_CHECK_INIT, AUTO_CHECK_PAYLOAD_ID, prepare
 from test_hardware_recovery_fsck import elf
 
 
@@ -81,6 +81,23 @@ class RecoveryPairTest(unittest.TestCase):
         self.checker.write_bytes(b'not an ELF')
         with self.assertRaisesRegex(ValueError, 'checker size'):
             prepare(self.source, self.checker, Path('/bin/true'), output)
+        self.assertFalse(output.exists())
+
+    def test_optional_local_check_is_bundled_and_enabled(self):
+        output = self.root / 'out'
+        result = prepare(self.source, self.checker, Path('/bin/true'), output, self.checker)
+        self.assertEqual(result['local_check_supervisor']['sha256'], hashlib.sha256(self.checker.read_bytes()).hexdigest())
+        for name, expected in (('BOOT/INIT.RC', AUTO_CHECK_INIT),
+                               ('BOOT/RECCHECK.ELF', self.checker.read_bytes()),
+                               ('ETC/hardware-payload-id', AUTO_CHECK_PAYLOAD_ID)):
+            self.assertEqual(subprocess.check_output(['mtype', '-i', str(output / 'INITRD.IMG'),
+                                                       '::' + name]), expected)
+
+    def test_invalid_local_supervisor_removes_partial_output(self):
+        output = self.root / 'out'
+        bad = self.root / 'bad-supervisor'; bad.write_bytes(b'not an ELF')
+        with self.assertRaises(ValueError):
+            prepare(self.source, self.checker, Path('/bin/true'), output, bad)
         self.assertFalse(output.exists())
 
     def test_rejects_wrong_validator_and_conflicting_selector(self):

@@ -245,9 +245,12 @@ static void KernelConsoleThread(void* /*arg*/)
     uint32_t initialW=WmMetric(CONSOLE_W), initialH=WmMetric(CONSOLE_H);
     if(initialW>backingW)initialW=backingW;
     if(initialH>backingH)initialH=backingH;
-    int consoleIdx = WmCreateWindow(self, 20, 60,
-                   static_cast<uint16_t>(initialW),
-                   static_cast<uint16_t>(initialH), "Kernel Console", 1, true, false);
+    const auto initial=ConsoleFitInitial(backingW,WmDesktopHeight(backingH),initialW,initialH,
+                                         WmMetric(WM_BORDER_WIDTH),WmMetric(WM_TITLE_BAR_HEIGHT));
+    if(!initial.width || !initial.height) { SerialPuts("KCONSOLE: display too small\n"); return; }
+    int consoleIdx = WmCreateWindow(self, static_cast<int16_t>(initial.x), static_cast<int16_t>(initial.y),
+                   static_cast<uint16_t>(initial.width),
+                   static_cast<uint16_t>(initial.height), "Kernel Console", 1, true, false);
     if (consoleIdx >= 0)
         WmSendToBack(consoleIdx);
 
@@ -259,6 +262,7 @@ static void KernelConsoleThread(void* /*arg*/)
     uint32_t dispCount = 0;
     uint32_t lastTotal = 0;
     uint32_t lastScale = 0;
+    uint32_t lastVisibleHeight = 0;
     uint64_t incarnation = 0;
     ConsoleViewport view;
 
@@ -273,7 +277,11 @@ static void KernelConsoleThread(void* /*arg*/)
         uint32_t scale=WmGetAppliedScale();
         const FontAtlas& fa=WmDesktopFont();
         uint32_t lineH=fa.lineHeight>0?static_cast<uint32_t>(fa.lineHeight):16;
-        uint32_t visibleLines=nextH>4?(nextH-4)/lineH:0;
+        // The WM preserves client geometry when the desktop scale changes;
+        // the larger taskbar may cover its lower rows. Keep the full client
+        // buffer geometry but place the newest lines in the visible part.
+        uint32_t visibleHeight=ConsoleVisibleHeight(geometry.client_y,nextH,WmDesktopHeight(backingH));
+        uint32_t visibleLines=visibleHeight>4?(visibleHeight-4)/lineH:0;
         if(visibleLines>64)visibleLines=64;
         bool scrolled=false;
         Window::WmInputEvent events[16];
@@ -296,7 +304,8 @@ static void KernelConsoleThread(void* /*arg*/)
             view.Scroll(lines,nowTotal,RING_LINES-1,visibleLines);
             scrolled=true;
         }
-        if (nowTotal != lastTotal || width!=nextW || height!=nextH || scale!=lastScale || scrolled)
+        if (nowTotal != lastTotal || width!=nextW || height!=nextH || scale!=lastScale ||
+            visibleHeight!=lastVisibleHeight || scrolled)
         {
             width=nextW;height=nextH;
             // New content available — re-render the VFB.
@@ -323,6 +332,7 @@ static void KernelConsoleThread(void* /*arg*/)
             SpinLockRelease(&g_ringLock);
             lastTotal = nowTotal;
             lastScale = scale;
+            lastVisibleHeight = visibleHeight;
 
             // Clear VFB to background
             uint32_t* vfb = self->fbVirtual;
