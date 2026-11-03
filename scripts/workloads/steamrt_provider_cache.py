@@ -5,6 +5,8 @@ Run in the guest. This does not modify the exports, library symlinks or /etc.
 Publish the resulting cache as /etc/ld.so.cache separately during provisioning.
 The optional copied loader uses that same cache location; its installed Nix
 source is unchanged, and exact source/output hashes describe the adaptation.
+Cache validation confirms target provenance and loader-libc presence; it does
+not prove which candidate a runtime loader will select when names repeat.
 """
 import argparse
 import hashlib
@@ -66,6 +68,12 @@ def relocate_loader_cache(data, original, destination='/etc/ld.so.cache'):
                         output_sha256=hashlib.sha256(result).hexdigest(), build_id_unchanged=True)
 
 
+def record_cache_target(targets, variants, label, target):
+    """Retain every validated target even when ldconfig repeats a SONAME."""
+    targets[label] = target  # preserve the existing manifest's per-label view
+    variants.add(target)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ldconfig', type=Path, required=True)
@@ -125,6 +133,7 @@ def main():
     listing = subprocess.run([str(tool), '-p', '-C', str(cache)], capture_output=True, check=True)
     (args.output / 'cache-list.txt').write_bytes(listing.stdout)
     targets = {}
+    variants = set()
     for line in listing.stdout.decode().splitlines():
         if ' => ' not in line:
             continue
@@ -133,13 +142,13 @@ def main():
         target = path.resolve(strict=True)
         if not target.is_file() or not any(target.is_relative_to(directory) for directory in directories):
             raise RuntimeError(f'Cache target outside installed manifest: {path} -> {target}')
-        targets[label] = str(target)
+        record_cache_target(targets, variants, label, str(target))
     if not targets:
         raise RuntimeError('Generated cache is empty')
     manifest = dict(command=command, tool=str(tool),
                     tool_sha256=hashlib.sha256(tool.read_bytes()).hexdigest(),
                     exports=libraries, directories=sorted(map(str, directories)),
-                    targets=targets, cache=str(cache),
+                    targets=targets, target_variants=sorted(variants), cache=str(cache),
                     cache_sha256=hashlib.sha256(cache.read_bytes()).hexdigest())
     manifest['config_sha256'] = hashlib.sha256(config.read_bytes()).hexdigest()
     if args.loader:
@@ -149,7 +158,7 @@ def main():
                 or data[18:20] != b'\x3e\x00'):
             raise RuntimeError('Expected an installed x86-64 ELF host loader')
         libc = (loader.parent / 'libc.so.6').resolve(strict=True)
-        if str(libc) not in targets.values():
+        if str(libc) not in variants:
             raise RuntimeError('Loader libc is absent from the validated provider cache')
         data, relocation = relocate_loader_cache(data, str(loader.parent.parent / 'etc/ld.so.cache'))
         (args.output / 'ld-linux-x86-64.so.2').write_bytes(data)

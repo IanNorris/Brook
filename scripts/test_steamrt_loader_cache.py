@@ -7,7 +7,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent / 'workloads'))
-from steamrt_provider_cache import relocate_loader_cache
+from steamrt_provider_cache import relocate_loader_cache, record_cache_target
 
 OLD = '/nix/store/aaaaaaaa-glibc-2.42/etc/ld.so.cache'
 
@@ -26,6 +26,14 @@ def fixture():
 
 
 class LoaderCache(unittest.TestCase):
+    def test_duplicate_sonames_preserve_all_validated_targets(self):
+        targets, variants = {}, set()
+        label = 'libc.so.6 (libc6,x86-64)'
+        record_cache_target(targets, variants, label, '/nix/store/a/lib/libc.so.6')
+        record_cache_target(targets, variants, label, '/nix/store/b/lib/libc.so.6')
+        self.assertEqual(targets[label], '/nix/store/b/lib/libc.so.6')
+        self.assertEqual(variants, {'/nix/store/a/lib/libc.so.6', '/nix/store/b/lib/libc.so.6'})
+
     def test_only_standalone_readonly_literal_changes(self):
         before = fixture()
         after, manifest = relocate_loader_cache(before, OLD)
