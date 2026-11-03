@@ -1,5 +1,15 @@
 # Recovery and VM-control backlog
 
+### Hardware debug jobs and Steam helper cleanup (3 November 2026)
+
+On the Dell, several failed SteamRT diagnostics left their job leaders exited
+but descendants alive, exhausting the eight active debug-job slots and blocking
+frame capture during a later updater run. Investigate descendant ownership and
+reaping, and add a boot-bound, identity-checked cancellation/cleanup path that
+does not kill unrelated applications or discard output. Track the separate
+near-limit process count observed during Steam verification; completed-process
+counters alone are cumulative and do not establish a cleanup backlog.
+
 ### Near-term: SSD TRIM and discard (3 November 2026)
 
 Add a bounded, batched `fstrim`-style pass for the Dell's ext2 data volume so
