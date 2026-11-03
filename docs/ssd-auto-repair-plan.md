@@ -42,10 +42,14 @@ partial writes and early persistence at every operation. This is not yet a
 working disk transaction. A dedicated fixed-record FAT lease now accepts an
 existing 128-byte guard while retaining the image API's sector-alignment
 requirements. Host FAT16/FAT32 tests cover sole ownership, aliases, fixed-size
-writes and sticky flush failure. A retained FatFs file buffer is not independent
-media readback; uncached verification and rejection of two distinct records
-sharing an allocation cluster must be implemented and tested before wiring this
-primitive to a checker or deploying it.
+writes and sticky flush failure. A guard-specific sync/readback operation now
+reads the retained file's mapped sector through diskio instead of the FatFs
+file buffer. Host tests cover stale file-cache data, failures, malformed maps,
+sector-tail preservation and a nonzero partition offset. This verifies the
+Brook/FatFs cache boundary; it does not prove SSD controller cache or physical
+power-loss behavior. The transaction still needs exclusive ESP ownership and
+rejection of two distinct records sharing an allocation cluster before it can
+be wired to a checker or deployed.
 
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`

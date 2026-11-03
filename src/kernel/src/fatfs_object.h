@@ -28,6 +28,9 @@ FRESULT f_object_mkdir(const FF_OBJECT*,const TCHAR* name);
 // Fixed-image CLMT: bounded by file length and caller capacity, with strict
 // chain validation. Unlike upstream CREATE_LINKMAP, cycles cannot hang it.
 FRESULT f_object_image_map(FIL*,DWORD* table,UINT entries);
+// Caller holds the FAT mutex and owns a synced, mapped 128-byte fixed file.
+// Reads its first sector through diskio, bypassing the FIL and FAT windows.
+FRESULT f_object_guard_readback(FIL*,BYTE out[128]);
 
 #ifdef __cplusplus
 }

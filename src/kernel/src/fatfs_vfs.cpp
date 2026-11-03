@@ -74,6 +74,7 @@ struct FatImageLease {
     uint64_t bytes, identity;
     int error;
     DWORD* linkMap;
+    bool guard;
 };
 struct FatFsMountData {
     FATFS fs;
@@ -1483,7 +1484,7 @@ static int FatFsAcquireFixedLease(Vnode* node,uint64_t bytes,FatImageLease** out
         }
     }
     if(!error) {
-        lease->owner=node;lease->bytes=bytes;lease->identity=identity.ino;
+        lease->owner=node;lease->bytes=bytes;lease->identity=identity.ino;lease->guard=guard;
         VfsRetain(node);node->ops=&g_fatImageOwnerOps;file->imageLease=lease;
         g_imageLeaseMounts[file->mount->pdrv]=file->mount;
         *out=lease;
@@ -1537,6 +1538,24 @@ int FatFsImageFlush(FatImageLease* lease)
     }
     KMutexUnlock(&g_fatLock);
     return error;
+}
+int FatFsGuardFlushReadback(FatImageLease* lease,void* out)
+{
+    if(!lease || !out || !lease->guard)return -22;
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
+    int error=lease->error;
+    if(!error && file->imageLease!=lease)error=-22;
+    if(!error) {
+        auto result=CheckedFatSync(&file->fil,false);
+        error=result==FR_OK?FlushFatDriveLocked(file->mount->pdrv):FrToErrno(result);
+        if(!error) {
+            result=f_object_guard_readback(&file->fil,static_cast<BYTE*>(out));
+            if(result!=FR_OK)error=FrToErrno(result);
+        }
+    }
+    if(error)lease->error=error;
+    KMutexUnlock(&g_fatLock);return error;
 }
 Device* FatFsImageLeaseDevice(FatImageLease* lease)
 {

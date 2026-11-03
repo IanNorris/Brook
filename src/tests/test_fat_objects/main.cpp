@@ -16,12 +16,14 @@
 #include <unistd.h>
 #include <sys/wait.h>
 static std::vector<unsigned char> disk;
-static bool failRead=false, failWrite=false, failSync=false, intrinsicReadOnly=false, driveAcquired=false;
+static bool failRead=false, failWrite=false, failSync=false, failDriveFlush=false, intrinsicReadOnly=false, driveAcquired=false;
 static unsigned diskReads=0;
+static LBA_t lastReadSector=0;
 extern "C" DSTATUS disk_initialize(BYTE drive){return drive?STA_NOINIT:0;}
 extern "C" DSTATUS disk_status(BYTE drive){return drive?STA_NOINIT:0;}
 extern "C" DRESULT disk_read(BYTE drive,BYTE* out,LBA_t sector,UINT count){
     ++diskReads;
+    lastReadSector=sector;
     uint64_t offset=uint64_t(sector)*512,bytes=uint64_t(count)*512;
     if(drive || failRead || offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
     std::memcpy(out,disk.data()+offset,bytes);return RES_OK;
@@ -65,7 +67,7 @@ VirtualAddress VmmAllocPages(uint64_t count,uint64_t,MemTag,uint16_t){
 void VmmFreePages(VirtualAddress address,uint64_t){
     void* p=reinterpret_cast<void*>(address.raw());{std::lock_guard<std::mutex> lock(allocationMutex);assert(pages.erase(p)==1);}std::free(p);
 }
-int FatFsFlushDrive(uint8_t){return failSync?-5:0;}
+int FatFsFlushDrive(uint8_t){return failSync||failDriveFlush?-5:0;}
 void VfsRelease(Vnode* node){if(__atomic_fetch_sub(&node->refCount,1,__ATOMIC_ACQ_REL)==1)::closeNode(node);}
 bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive || driveAcquired)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
 void FatFsReleaseDrive(uint8_t){assert(driveAcquired);driveAcquired=false;}
@@ -254,15 +256,49 @@ int main(int argc,char** argv){
         uint8_t got[128]{};assert(FatFsImageRead(fixed,0,got,sizeof(got))==128 && got[0]==17);
         record[1]=33;assert(FatFsImageWrite(fixed,0,record,sizeof(record))==128);
         assert(FatFsImageWrite(fixed,127,record,2)==-22);
-        assert(!FatFsImageFlush(fixed));
+        const unsigned reads=diskReads;
+        assert(!FatFsGuardFlushReadback(fixed,got) && !std::memcmp(got,record,128));
+        assert(diskReads>reads);const LBA_t guardSector=lastReadSector;
+        assert(uint64_t(guardSector)*512+512<=disk.size());
+        uint8_t tail[384];std::memcpy(tail,disk.data()+uint64_t(guardSector)*512+128,sizeof(tail));
+        record[3]=55;assert(FatFsImageWrite(fixed,0,record,sizeof(record))==128);
+        assert(!FatFsGuardFlushReadback(fixed,got) && !std::memcmp(got,record,128));
+        assert(!std::memcmp(tail,disk.data()+uint64_t(guardSector)*512+128,sizeof(tail)));
+        // A retained FIL buffer may be stale. The readback must see the
+        // changed underlying sector, not return its cached 128 bytes.
+        disk[uint64_t(guardSector)*512+10]=99;
+        assert(FatFsImageRead(fixed,0,got,sizeof(got))==128 && got[10]==0);
+        assert(!FatFsGuardFlushReadback(fixed,got) && got[10]==99);
+        disk[uint64_t(guardSector)*512+10]=0;
+        assert(FatFsGuardFlushReadback(fixed,nullptr)==-22);
         const pid_t child=fork();assert(child>=0);
         if(!child) {
             record[2]=44;assert(FatFsImageWrite(fixed,0,record,sizeof(record))==128);
-            failSync=true;assert(FatFsImageFlush(fixed)==-5);failSync=false;
+            failSync=true;assert(FatFsGuardFlushReadback(fixed,got)==-5);failSync=false;
             assert(FatFsImageFlush(fixed)==-5 && FatFsReleaseImageLease(fixed)==-5);
             assert(!FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM));_exit(0);
         }
         int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+        const pid_t flushChild=fork();assert(flushChild>=0);
+        if(!flushChild) {
+            failDriveFlush=true;assert(FatFsGuardFlushReadback(fixed,got)==-5);failDriveFlush=false;
+            assert(FatFsGuardFlushReadback(fixed,got)==-5 && FatFsReleaseImageLease(fixed)==-5);_exit(0);
+        }
+        status=0;assert(waitpid(flushChild,&status,0)==flushChild && WIFEXITED(status) && !WEXITSTATUS(status));
+        const pid_t readChild=fork();assert(readChild>=0);
+        if(!readChild) {
+            failRead=true;assert(FatFsGuardFlushReadback(fixed,got)==-5);failRead=false;
+            assert(FatFsGuardFlushReadback(fixed,got)==-5 && FatFsReleaseImageLease(fixed)==-5);
+            assert(!FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM));_exit(0);
+        }
+        status=0;assert(waitpid(readChild,&status,0)==readChild && WIFEXITED(status) && !WEXITSTATUS(status));
+        const pid_t mapChild=fork();assert(mapChild>=0);
+        if(!mapChild) {
+            fixed->linkMap[2]^=1;assert(FatFsGuardFlushReadback(fixed,got)==-22);
+            fixed->linkMap[2]^=1;
+            assert(FatFsGuardFlushReadback(fixed,got)==-22 && FatFsReleaseImageLease(fixed)==-22);_exit(0);
+        }
+        status=0;assert(waitpid(mapChild,&status,0)==mapChild && WIFEXITED(status) && !WEXITSTATUS(status));
         assert(!FatFsReleaseImageLease(fixed));closeNode(guard);
         guard=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_WRITE|VFS_O_READWRITE);assert(guard);
         assert(FatFsAcquireGuardLease(guard,&fixed)==0);
@@ -291,6 +327,7 @@ int main(int argc,char** argv){
     failSync=true;assert(FatFsAcquireImageLease(owner,1024*1024,&lease)==-5 && !lease);failSync=false;
     assert(owner->ops==&g_fatFileOps && owner->refCount==1);
     assert(!FatFsAcquireImageLease(owner,1024*1024,&lease) && lease && owner->ops->deny_mapping);
+    uint8_t guardProbe[128]{};assert(FatFsGuardFlushReadback(lease,guardProbe)==-22);
     assert(owner->refCount==2 && static_cast<FatOpenFile*>(owner->priv)->fil.cltbl && pages.empty());
     assert(!FatFsOpen(mount,0,image,VFS_O_READ));
     assert(!FatFsOpen(mount,0,image,VFS_O_METADATA));

@@ -21,6 +21,9 @@ int FatFsAcquireImageLease(Vnode* node, uint64_t bytes, FatImageLease** out);
 // Same exclusive retained ownership for one pre-existing 128-byte recovery
 // guard. The image API's sector alignment requirements remain unchanged.
 int FatFsAcquireGuardLease(Vnode* node, FatImageLease** out);
+// Atomically sync the retained guard and read its 128 bytes through diskio,
+// bypassing FatFs file/windows. Errors poison the lease and retain ownership.
+int FatFsGuardFlushReadback(FatImageLease* lease, void* out);
 int FatFsImageRead(FatImageLease* lease, uint64_t offset, void* out, uint32_t bytes);
 int FatFsImageWrite(FatImageLease* lease, uint64_t offset, const void* in, uint32_t bytes);
 int FatFsImageFlush(FatImageLease* lease);
