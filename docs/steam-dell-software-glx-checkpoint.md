@@ -190,3 +190,23 @@ fresh QR sign-in or Dell stability is implied. The screenshots and account
 state remain private. Both candidate VMs completed checked guest and device
 flushes before stopping. The final ABI 64 kernel SHA-256 is
 `942500681ee1b8111d4694e7a99f40c74a6e90c4f2361320e4bd6cb21125496a`.
+
+### Dell candidate packaging
+
+A private Dell kernel/initrd candidate is prepared from the last deployed
+initrd with the ABI 64 kernel and all three drivers present in that initrd
+replaced from the matched build. `prepare_hardware_kernel_pair.py` pins the
+chosen kernel hash, enumerates visible and hidden initrd drivers, verifies
+module ABI metadata and checks the copied bytes. It preserves the other
+initrd configuration and does not touch a device. The requested module ABI is
+not independently extracted from the kernel: compatibility is established for
+this candidate by a separate exact-pair QEMU boot, not by the packager alone.
+
+The exact final packaged kernel/initrd booted in QEMU and exposed the expected
+hardware debug network and payload identity. The kernel hash remains
+`942500681ee1b8111d4694e7a99f40c74a6e90c4f2361320e4bd6cb21125496a`;
+the packaged initrd hash is
+`f3bc21ef5c8b11eb78f8cdf3edc1354de2d8bc9e022679f720cdd05ab281e3d9`.
+The packager's six host tests include hidden modules, ABI mismatch, a missing
+module, an unexpected kernel and real ELF metadata parsing. This candidate
+has not been installed or booted on the Dell, which remains unreachable.
