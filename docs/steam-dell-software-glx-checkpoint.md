@@ -318,3 +318,22 @@ results can include internal restart codes; the first argument can be a
 pointer, and samples do not prove peer progress. Host model tests and a kernel
 build pass; the extended response and physical Steam behavior still require
 runtime verification. Account details and screenshots remain private.
+
+The failure summary was subsequently checked end to end in a disposable VM:
+repeated `close(-1)` calls appeared as syscall 3, result `-EBADF`, with the
+expected argument and no overflow. The matched Dell kernel/initrd also booted
+in a separate QEMU fixture before physical deployment; that does not test the
+physical SSD or xHCI hardware. On the Dell, the web helper's repeated
+`recvmsg` failures were `-EAGAIN` on a Unix descriptor, consistent with a
+nonblocking read with no data. The Steam connection log recorded successful
+authentication, but its browser log then reported `/dev/shm` ENOSPC. A live
+sample reported 3,792,896 bytes available from a 495,853,568-byte mount;
+after the Steam job drained, 482,508,800 bytes were available. This points to
+live shared-memory pressure, while leaving open whether a larger quota alone
+will produce a usable client or whether usage would continue growing.
+
+A first attempt to test an 800 MiB tmpfs in an unprivileged nested namespace
+failed with EPERM; a root bubblewrap attempt stopped earlier at its unsupported
+`capget` syscall. Neither experiment changed the desktop's `/dev/shm` mount.
+The next comparison needs a verified private mount or a separately tested,
+boot-derived budget candidate; preserving aggregate memory headroom matters.
