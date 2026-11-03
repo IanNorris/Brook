@@ -12,6 +12,38 @@ spec.loader.exec_module(bootstrap)
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_runtime_opt_in_requires_the_staged_64_bit_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = Path(tmp)
+            with self.assertRaises(ValueError):
+                bootstrap.enable_steamrt64(client)
+            runtime = client / 'steamrt64'; runtime.mkdir()
+            (runtime / 'steam').write_bytes(b'fixture')
+            bootstrap.enable_steamrt64(client)
+            self.assertEqual((client / '.steam-enable-steamrt64-client').read_bytes(), b'')
+
+    def test_gnutls_uses_matching_nettle_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); libs = root / 'hostlibs'; libs.mkdir()
+            dependency = root / 'nettle'; dependency.mkdir()
+            profile = root / 'profile'; profile.mkdir()
+            first = root / 'gnutls-first'; first.write_bytes(b'fixture')
+            second = root / 'gnutls-second'; second.write_bytes(b'fixture2')
+            (profile / 'libgnutls.so.30').symlink_to(first)
+            (libs / 'libgnutls.so.30').symlink_to(profile / 'libgnutls.so.30')
+            for name in ('libhogweed.so.6', 'libnettle.so.8'):
+                (dependency / name).write_bytes(b'matching')
+            with mock.patch.object(bootstrap.subprocess, 'check_output', return_value=str(dependency)):
+                bootstrap.pair_gnutls_dependencies(libs, '/bin/patchelf')
+                for name in ('libhogweed.so.6', 'libnettle.so.8'):
+                    self.assertEqual((libs / name).resolve(), dependency / name)
+                (profile / 'libgnutls.so.30').unlink()
+                (profile / 'libgnutls.so.30').symlink_to(second)
+                self.assertEqual((libs / 'libgnutls.so.30').resolve(), first)
+                (dependency / 'libnettle.so.8').unlink()
+                with self.assertRaises(ValueError):
+                    bootstrap.pair_gnutls_dependencies(libs, '/bin/patchelf')
+
     def test_manifest_requires_safe_hashed_64_bit_packages(self):
         text = '"steam_steamrt64" { "file" "steam.zip.123" "size" "12" "sha2" "' + 'a' * 64 + '" }'
         self.assertEqual(bootstrap.parse_manifest(text)[0][1:3], ('steam.zip.123', 12))

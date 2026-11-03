@@ -5,6 +5,10 @@ the official update service. It verifies each package against the downloaded
 manifest, extracts it into a new private home and adapts ELF interpreters to
 an installed Brook-compatible Nix loader. It does not download games, copy an
 existing account, authenticate, or start the client.
+The staged client is opted into Steam's 64-bit runtime so a direct launch does
+not fall back to the unsupported 32-bit client. When the profile exposes
+GnuTLS, its Nettle and Hogweed dependencies are resolved from the same runtime
+search path to avoid mixing incompatible host and SteamRT libraries.
 
 Run it as the desktop user with a full Python 3 installation (including zlib,
 ctypes and zipfile), curl, patchelf and the intended 64-bit dynamic loader:

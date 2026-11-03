@@ -133,6 +133,42 @@ def publish(stage, home):
         raise OSError(error, os.strerror(error), str(home))
 
 
+def pair_gnutls_dependencies(hostlibs, patchelf):
+    """Keep GnuTLS and its Nettle ABI together ahead of runtime libraries."""
+    gnutls = hostlibs / 'libgnutls.so.30'
+    if not gnutls.exists():
+        return
+    if not gnutls.is_symlink():
+        raise ValueError('unexpected regular GnuTLS file in Steam host library directory')
+    resolved_gnutls = gnutls.resolve(strict=True)
+    rpath = subprocess.check_output([str(patchelf), '--print-rpath', str(resolved_gnutls)], text=True).strip()
+    directories = [Path(item) for item in rpath.split(':') if item.startswith('/')]
+    names = ('libhogweed.so.6', 'libnettle.so.8')
+    # Both libraries must come from one dependency directory, rather than
+    # independently picking similarly named but incompatible versions.
+    directory = next((d for d in directories if all((d / n).is_file() for n in names)), None)
+    if directory is None:
+        raise ValueError('GnuTLS dependency path does not contain its matching Nettle libraries')
+    gnutls.unlink()
+    gnutls.symlink_to(resolved_gnutls)
+    for name in names:
+        target = hostlibs / name
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists():
+            raise ValueError('unexpected regular file in Steam host library directory: ' + name)
+        target.symlink_to(directory / name)
+
+
+def enable_steamrt64(client):
+    if not (client / 'steamrt64/steam').is_file():
+        raise ValueError('Steam client executable is absent')
+    # Direct steamrt64/steam launches bypass steam.sh, which normally creates
+    # this marker. Without it Steam falls back to the 32-bit scout client.
+    with (client / '.steam-enable-steamrt64-client').open('xb'):
+        pass
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--home', type=Path, default=Path('/data/home/steam-20261022'))
@@ -177,8 +213,7 @@ def main():
             if first.rstrip(b'\r\n') in (b'#!/bin/bash', b'#!/usr/bin/env bash'):
                 data = path.read_bytes()
                 path.write_bytes(b'#!/nix/profile/bin/bash\n' + data[len(first):])
-    if not (client / 'steamrt64/steam').is_file():
-        raise ValueError('Steam client executable is absent')
+    enable_steamrt64(client)
     # These two scripts execute on Brook before SteamRT creates its own
     # filesystem, where /bin/sh is available. Leave container scripts alone.
     runtime = client / 'steamrt64/pv-runtime/steam-runtime-steamrt'
@@ -196,6 +231,7 @@ def main():
                 target = hostlibs / path.name
                 if not target.exists() and not target.is_symlink():
                     target.symlink_to(path)
+    pair_gnutls_dependencies(hostlibs, args.patchelf)
     publish(stage, home)
     print('STEAM_BOOTSTRAP_READY', home, 'packages', len(packages), 'patched', patched, flush=True)
 

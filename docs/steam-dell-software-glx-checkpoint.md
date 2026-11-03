@@ -209,4 +209,26 @@ the packaged initrd hash is
 `f3bc21ef5c8b11eb78f8cdf3edc1354de2d8bc9e022679f720cdd05ab281e3d9`.
 The packager's six host tests include hidden modules, ABI mismatch, a missing
 module, an unexpected kernel and real ELF metadata parsing. This candidate
-has not been installed or booted on the Dell, which remains unreachable.
+has not been installed or booted on the Dell.
+
+### Fresh-client software VM follow-up
+
+After the Dell SSD was manually repaired, a reflinked private QEMU clone used
+the matched ABI 64 kernel, software Xephyr and a separately verified PulseAudio
+null sink. A new client was downloaded from Valve into a new guest home; no
+signed-in profile was copied into that home. The download manifest identified
+version 1792618285, matching the retained comparison client's manifest.
+
+The first direct launch exited 42 because the bootstrap had not created
+Steam's `.steam-enable-steamrt64-client` marker. After adding it, the web helper
+repeatedly failed on an incompatible Hogweed symbol: the profile's GnuTLS was
+being mixed with the runtime's older Nettle libraries. Pairing Nettle and
+Hogweed from GnuTLS's own RPATH eliminated those symbol errors. On the next
+launch after Steam had recorded its installed manifest, the login UI and QR
+code appeared; a test string typed into the account field was visible, and a
+clear command was sent without signing in. No credentials were used. The 60-second
+bounded run peaked at 163 of 256 reserved job tasks and recorded no denied
+births; a QMP capture was taken, and the client was subsequently terminated
+and its tracked job drained. The comparison's screenshots and client data are
+private build artifacts. It demonstrates this VM login path, not Dell stability
+or physical graphics support; the Dell's prior hard freeze remains unexplained.
