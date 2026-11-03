@@ -20,9 +20,12 @@ loader halts. The decision does not depend on `BROOK.CFG`.
 On a private QEMU SATA fixture, the clean case booted normally and pending,
 mismatched, missing, truncated, corrupt and wrong-identity records selected
 recovery, including when the configuration file was absent. These checks used
-the legacy normal payload. Each denied case ran on a writable private copy
-and left its full disk hash unchanged. A/B fallback, invalid recovery and interruption
-across durable writes still need acceptance tests. The guard has no writer and
+the legacy normal payload. Follow-up tests exercised a corrupt newest slot
+with a usable older slot and invalid selectors with a usable legacy payload;
+clean guards allowed the respective fallback, while pending guards selected
+recovery. Each denied case ran on a writable private copy and left its full
+disk hash unchanged. Invalid recovery and interruption across durable writes
+still need acceptance tests. The guard has no writer and
 does not itself validate the physical disk or filesystem. It is not installed
 on the Dell. Before any physical deployment, inventory every firmware-reachable
 EFI entrypoint: an older EFI loader can bypass this guard even though old
