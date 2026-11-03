@@ -326,6 +326,20 @@ and preserve a known pre-reboot file. QEMU interruption does not establish
 physical power-loss behavior. Keep the accepted physical boot generation and
 USB recovery available through the first Dell test.
 
+The disposable ext2 test now uses a tracked completion gate for both checker
+phases. The gate binds the device, kernel controller and child incarnations,
+consumes the scheduler-observed child event, and requires all views and I/O to
+drain before a one-shot phase-specific completion can be claimed. Preen accepts
+normal exits 0 or 1; the separate verifier accepts only exit 0. A rejected but
+drained result is distinguished from outstanding I/O so that the test runner
+can disable its adapter in both cases without treating failure as success.
+Host tests cover identity and result mismatches, retained views, reuse and
+poll/abort races. A dirty private QEMU fixture passed the pending transition,
+preen, read-only verification and completion, with independent host e2fsck and
+the harness's write-range checks. This remains a test-only path: adapter
+ownership, production handoff, firmware coverage and durability are not yet
+established, and the Dell was not touched for this test.
+
 ## Checker interface probe
 
 The exact bundled static e2fsck 1.47.4 was traced on Linux against a disposable

@@ -3,14 +3,20 @@
 #include "device.h"
 #include "memory/heap.h"
 #include "process.h"
+#include "scheduler.h"
 #include "spinlock.h"
 #include "vfs.h"
 
 namespace brook {
 namespace {
-enum class Phase:uint8_t {Unused,Repair,Between,Verify,Ended};
+enum class Phase:uint8_t {Unused,Repair,RepairDone,Between,Verify,VerifyDone,Ended};
 SpinLock lock{};Phase phase=Phase::Unused;Device* target=nullptr;
 uint16_t group=0;uint64_t incarnation=0,bytes=0;uint32_t views=0,operations=0,writers=0;
+uint16_t controllerGroup=0;uint64_t controllerIncarnation=0;bool tracked=false,polling=false;
+bool Controller(const Process* p) {
+    return p && p->isKernelThread && p->pid==p->tgid && p->tgid==controllerGroup &&
+        p->incarnation==controllerIncarnation && p->incarnation;
+}
 struct View {bool writable;};
 bool Match(const Process* p) {
     if(!p || p->tgid!=group)return false;
@@ -74,8 +80,51 @@ bool GuardRepairBegin(Device* device,const Process* child,bool writable) {
     if(!birth || !block->block_count || !block->block_size || DeviceBlockSize(device)!=512)return false;
     const uint64_t blocks=DeviceBlockCount(device);if(!blocks || blocks>~uint64_t{0}/512)return false;
     SpinLockAcquire(&lock);
-    const bool ok=!views && !operations && ((writable && phase==Phase::Unused) || (!writable && phase==Phase::Between));
+    const bool ok=!tracked && !views && !operations && ((writable && phase==Phase::Unused) || (!writable && phase==Phase::Between && target==device));
     if(ok) {target=device;group=id;incarnation=birth;bytes=blocks*512;phase=writable?Phase::Repair:Phase::Verify;}
+    SpinLockRelease(&lock);return ok;
+}
+bool GuardRepairBeginTracked(Device* device,const Process* child,bool writable) {
+    auto* current=ProcessCurrent();
+    if(!current || !current->isKernelThread || current->pid!=current->tgid || !current->incarnation ||
+       !child || child->pid!=child->tgid || !child->tgid || !child->incarnation || child->parentPid!=current->tgid ||
+       ProcessReadIds(const_cast<Process*>(child),false).effective!=0 || !device || !AhciSystemGuardIsTestData(device) ||
+       !DeviceIsRegistered(device) || !device->ops || !device->ops->read || !device->ops->write)return false;
+    const auto* block=reinterpret_cast<const BlockDeviceOps*>(device->ops);
+    if(!block->block_count || !block->block_size || DeviceBlockSize(device)!=512)return false;
+    const uint64_t blocks=DeviceBlockCount(device);if(!blocks || blocks>~uint64_t{0}/512)return false;
+    SpinLockAcquire(&lock);
+    const bool fresh=writable && phase==Phase::Unused;
+    const bool next=!writable && tracked && phase==Phase::Between && target==device && Controller(current);
+    const bool ok=!polling && !views && !operations && (fresh || next);
+    if(ok) {target=device;group=child->tgid;incarnation=child->incarnation;bytes=blocks*512;
+        if(fresh){tracked=true;controllerGroup=current->tgid;controllerIncarnation=current->incarnation;}
+        phase=writable?Phase::Repair:Phase::Verify;}
+    SpinLockRelease(&lock);return ok;
+}
+int GuardRepairPollTracked(Device* device,uint16_t pid,uint64_t birth,ChildWaitSnapshot* result) {
+    auto* current=ProcessCurrent();if(!result)return -13;
+    SpinLockAcquire(&lock);
+    const bool admitted=tracked && (phase==Phase::Repair || phase==Phase::Verify) && Controller(current) &&
+        device==target && pid==group && birth==incarnation && !polling;
+    if(admitted)polling=true;
+    SpinLockRelease(&lock);if(!admitted)return -13;
+    ChildWaitSnapshot observed{};const int waited=SchedulerWaitChild(current,1,pid,4,&observed);
+    SpinLockAcquire(&lock);polling=false;
+    if(phase!=Phase::Repair && phase!=Phase::Verify) {SpinLockRelease(&lock);return -125;}
+    if(waited==1) {
+        const bool preen=phase==Phase::Repair;
+        const bool ok=observed.pid==pid && observed.incarnation==birth && observed.code==1 &&
+            (observed.status==0 || (preen && observed.status==256)) && !views && !operations;
+        phase=ok?(preen?Phase::RepairDone:Phase::VerifyDone):Phase::Ended;*result=observed;
+    } else if(waited<0)phase=Phase::Ended;
+    SpinLockRelease(&lock);return waited;
+}
+bool GuardRepairConsumeCompletion(Device* device,bool writable) {
+    auto* current=ProcessCurrent();SpinLockAcquire(&lock);
+    const bool ok=tracked && Controller(current) && device==target && !polling && !views && !operations &&
+        phase==(writable?Phase::RepairDone:Phase::VerifyDone);
+    if(ok)phase=writable?Phase::Between:Phase::Ended;
     SpinLockRelease(&lock);return ok;
 }
 Vnode* GuardRepairOpenLinux(uint64_t flags,int* error) {
@@ -107,13 +156,13 @@ Vnode* GuardRepairOpenLinux(uint64_t flags,int* error) {
 }
 bool GuardRepairEnd() {
     SpinLockAcquire(&lock);
-    const bool clean=(phase==Phase::Repair || phase==Phase::Verify) && !views && !operations;
+    const bool clean=!tracked && (phase==Phase::Repair || phase==Phase::Verify) && !views && !operations;
     phase=clean && phase==Phase::Repair?Phase::Between:Phase::Ended;
     SpinLockRelease(&lock);return clean;
 }
 void GuardRepairAbort() {SpinLockAcquire(&lock);phase=Phase::Ended;SpinLockRelease(&lock);}
 bool GuardRepairQuiescent() {
-    SpinLockAcquire(&lock);const bool quiet=phase==Phase::Ended && !views && !operations;
+    SpinLockAcquire(&lock);const bool quiet=phase==Phase::Ended && !polling && !views && !operations;
     SpinLockRelease(&lock);return quiet;
 }
 }

@@ -56,15 +56,15 @@ int RunExt2Checker(Device* device,bool writable) {
     if(!child)return -12;
     child->parentPid=ProcessCurrent()->tgid;child->fds[3]={};
     const uint16_t pid=child->pid;const uint64_t incarnation=child->incarnation;
-    if(!GuardRepairBegin(device,child,writable)) {ProcessDiscardUnpublished(child);return -13;}
+    if(!GuardRepairBeginTracked(device,child,writable)) {ProcessDiscardUnpublished(child);return -13;}
     SchedulerAddProcess(child);child=nullptr;
     ChildWaitSnapshot result{};int waited=0;
     for(unsigned i=0;i<12000 && !waited;++i) {
-        waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+        waited=GuardRepairPollTracked(device,pid,incarnation,&result);
         if(!waited)SchedulerSleepMs(10);
     }
     bool drained=false;
-    if(waited==1)drained=GuardRepairEnd();else GuardRepairAbort();
+    if(waited==1)drained=GuardRepairConsumeCompletion(device,writable);else GuardRepairAbort();
     if(waited!=1) {
         auto* process=SchedulerFindProcessReference(pid);
         if(process) {if(process->incarnation==incarnation)SchedulerRequestFatalSignal(process,9);ProcessUnref(process);}
@@ -73,7 +73,7 @@ int RunExt2Checker(Device* device,bool writable) {
         }
         return GuardRepairQuiescent()?-110:-115;
     }
-    if(!drained)return -115;
+    if(!drained)return GuardRepairRejectedOutcome(GuardRepairQuiescent());
     if(result.code!=1)return -5;
     return result.status>>8;
 }
