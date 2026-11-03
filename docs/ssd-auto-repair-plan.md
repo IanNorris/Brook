@@ -66,8 +66,9 @@ An experimental boot-only preparation path can validate the selected GPT
 layout and reserve the ESP for a dedicated block adapter while denying data
 partition and GPT metadata writes. The adapter itself currently rejects all
 writes, and the private FAT mount rejects this reserved device until a
-checker-completion and ownership-handoff gate exists. It is not called by boot, mounts no FAT
-filesystem and does not run a repair. Host tests exercise read-only routing,
+checker-completion and ownership-handoff gate exists. It is called only by the
+isolated check-only boot, mounts no FAT filesystem and does not run a repair.
+Host tests exercise read-only routing,
 bounds, failure and repeated admission. A separate one-shot, boot-lifetime FAT
 binding now prevents the same device pointer from being bound or mounted via
 another FAT slot; host tests cover competing binders, release and sticky write
@@ -80,6 +81,13 @@ prevent trusted kernel code from using diskio directly, prevent different
 adapter identities from overlapping the same blocks, or detect guard files
 cross-linked to a third file. The path must not be activated after any
 disk-backed filesystem or cache has been started.
+
+Guard preparation also reads the selected partition's primary ext-family superblock
+and requires its magic and UUID to match the configured data identity before
+installing the reservation. A dirty state is allowed; an unreadable, damaged
+or mismatched primary identity is rejected for manual recovery. This is an
+identity check, not a filesystem integrity check, feature/geometry validation,
+an ext2-versus-ext4 distinction, or backup-superblock repair.
 
 An opt-in `BROOK_SSD_GUARD_CHECK` kernel now calls that reservation immediately
 after AHCI initialization, before other storage consumers. This dedicated

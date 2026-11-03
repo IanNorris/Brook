@@ -54,7 +54,7 @@ def main():
                    help='Crosslink two new files in the private FAT fixture before boot')
     p.add_argument('--guard-open-probe', action='store_true',
                    help='Use a guard-open probe as supervisor on the private fixture')
-    p.add_argument('--guard-reservation', choices=('valid', 'wrong-guid'),
+    p.add_argument('--guard-reservation', choices=('valid', 'wrong-guid', 'wrong-fs-uuid'),
                    help='Configure the disposable guard-only kernel reservation fixture')
     p.add_argument('--guard-poison-boot', action='store_true',
                    help='Attach a disposable virtio disk requesting an overmount of /boot')
@@ -152,6 +152,8 @@ def main():
                 ext2_uuid = stream.read(16)
             if len(ext2_uuid) != 16 or not any(ext2_uuid):
                 raise RuntimeError('fixture ext2 UUID is absent')
+            if a.guard_reservation == 'wrong-fs-uuid':
+                ext2_uuid = bytes([ext2_uuid[0] ^ 1]) + ext2_uuid[1:]
             disk_guid = uuid.UUID(table['id']).bytes_le.hex()
             esp_guid = uuid.UUID(parts[0]['uuid']).bytes_le.hex()
             if a.guard_reservation == 'wrong-guid':
@@ -267,7 +269,7 @@ def main():
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited before local check completed')
                     text = serial.read_text(errors='replace') if serial.exists() else ''
-                    if (a.guard_reservation == 'wrong-guid' and
+                    if (a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') and
                             'SSD guard reservation failed; no recovery access permitted' in text and
                             'System halted.' in text):
                         if 'SSD_GUARD_RESERVATION_READY' in text or 'ahci system: verified GPT entry' in text:
@@ -342,7 +344,7 @@ def main():
                 if a.serial_output and serial.exists():
                     with a.serial_output.open('xb') as output:
                         output.write(serial.read_bytes())
-        if a.guard_reservation == 'wrong-guid':
+        if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid'):
             final = serial.read_text(errors='replace')
             if (final.count('SSD_GUARD_RESERVATION_FAILED') != 1 or
                     'SSD guard reservation failed; no recovery access permitted' not in final or
@@ -355,7 +357,7 @@ def main():
             raise RuntimeError('read-only check changed the disposable disk')
         if poison and sha(poison) != poison_before:
             raise RuntimeError('guard boot changed the overmount fixture')
-        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation == 'wrong-guid' or a.guard_bad_checker else
+        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker else
               'RECOVERY_GUEST_GUARD_CHECK_PASS' if a.guard_real_checker else
               'RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else
               'RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else

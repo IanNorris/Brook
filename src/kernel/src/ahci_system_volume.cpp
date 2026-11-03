@@ -165,6 +165,13 @@ Device* AhciSystemGuardPrepare() {
     AhciBootSelector wanted{};if(!read || !AhciBootSelectorParse(bytes,uint32_t(st.size),wanted))return nullptr;
     Device* disk=AhciWriteAdmittedDevice();AhciDirectLayout layout{};
     if(!disk || !SelectDirect(disk,wanted,layout) || DeviceFind(guardPartition.name))return nullptr;
+    // GPT and the configured UUID alone do not identify the filesystem now
+    // occupying the partition. Bind the recovery target to its actual primary
+    // ext2 superblock before reserving anything or authorizing a checker.
+    if(layout.data.count<4 || layout.data.first>~uint64_t{0}-2)return nullptr;
+    uint8_t superblock[1024]{};
+    if(!ReadExact(disk,layout.data.first+2,superblock,sizeof(superblock)) ||
+       superblock[56]!=0x53 || superblock[57]!=0xef || memcmp(superblock+104,largeUuid,16))return nullptr;
     guardRange={disk,layout.esp.first*512,layout.esp.count*512};
     // Registered callbacks reject I/O until the complete batch is installed.
     if(!DeviceRegister(&guardPartition))return nullptr;

@@ -31,7 +31,8 @@ void hdr(uint8_t* h,bool back,uint32_t crc){std::memcpy(h,"EFI PART",8);put32(h+
     put64(h+72,back?99967:2);put32(h+80,128);put32(h+84,128);put32(h+88,crc);put32(h+16,StrictCrc32(h,92,true));}
 int DiskRead(Device*,uint64_t off,void* dst,uint64_t n){++reads;if(is("short-read") && off==512)return 0;
     if(guard() && off==2048ull*512+3) {if(is("guard-read-error"))return -5;std::memset(dst,0x42,n);return int(n);}
-    if(is("probe-readfail") && off==8192ull*512+1024)return -5;
+    if((is("probe-readfail") || is("guard-super-readfail")) && off==8192ull*512+1024)return -5;
+    if(is("guard-super-short") && off==8192ull*512+1024)return int(n)-1;
     if(off==8192ull*512+1024){assert(n==sizeof(superblock));std::memcpy(dst,superblock,n);return int(n);}
     if(off==8192ull*512+4096){assert(n==sizeof(gdt));std::memcpy(dst,gdt,n);return int(n);}
     const uint8_t* src=off==0?mbr:off==512?primary:off==99999ull*512?backup:off==2*512?entries:off==99967ull*512?copy:nullptr;
@@ -96,8 +97,11 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
         std::memcpy(entries+128,linuxFs,16);entries[144]=3;put64(entries+160,8192);put64(entries+168,10239);
         put32(superblock,1024);put32(superblock+4,256);put32(superblock+12,200);put32(superblock+16,1000);
         put32(superblock+24,2);put32(superblock+28,2);put32(superblock+32,32768);put32(superblock+36,32768);put32(superblock+40,1024);
-        put16(superblock+56,0xef53);put16(superblock+58,is("probe-dirty")?0:1);put32(superblock+76,1);put32(superblock+84,11);
+        put16(superblock+56,0xef53);put16(superblock+58,(is("probe-dirty") || is("guard-super-dirty"))?0:1);put32(superblock+76,1);put32(superblock+84,11);
         put16(superblock+88,128);put32(superblock+96,2);put32(superblock+100,3);superblock[104]=4;
+        if(is("guard-super-uuid"))superblock[104]^=1;
+        if(is("guard-super-magic"))superblock[56]=0;
+        if(is("guard-super-geometry"))put32(superblock+24,0xffffffffu);
         put32(gdt,2);put32(gdt+4,3);put32(gdt+8,4);
         if(is("probe-malformed") || is("direct-malformed") || is("guard-malformed"))dataRecord[0]='X';
     }
@@ -114,7 +118,7 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
         assert(!AhciSystemGuardPrepare());
         uint8_t next=1;assert(AhciSystemVolumeMount(&next)==AhciSystemBoot::Maintenance);
         assert(!binds && !mounts && !writes && next==1);
-        const bool ready=is("guard-ready") || is("guard-read-error") || is("guard-flush-error");
+        const bool ready=is("guard-ready") || is("guard-super-dirty") || is("guard-super-geometry") || is("guard-read-error") || is("guard-flush-error");
         if(ready) {
             assert(esp && esp==registered && leaseCalls==1);
             uint8_t bytes[2]{};
