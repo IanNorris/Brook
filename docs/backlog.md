@@ -1,5 +1,17 @@
 # Recovery and VM-control backlog
 
+### Near-term: SSD TRIM and discard (3 November 2026)
+
+Add a bounded, batched `fstrim`-style pass for the Dell's ext2 data volume so
+the SSD can reclaim free blocks. Detect ATA DATA SET MANAGEMENT/TRIM support,
+validate and translate ranges through partition boundaries, and coordinate
+discard with allocation, cached writes and crash recovery so a block cannot be
+trimmed after reuse. Check device limits and propagate failures. Exercise the
+command and filesystem integration on disposable QEMU images, including races
+and unsupported devices, before enabling it on the Dell. Follow up with an
+idle-time schedule, other filesystems and VM discard once the manual path is
+proven. Do not equate TRIM support with immediate measurable wear reduction.
+
 ### `syncfs` compatibility (3 November 2026)
 
 On the Dell, GNU `sync -f FILE` failed with `ENOSYS` because it uses `syncfs`.
