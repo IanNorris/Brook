@@ -246,6 +246,8 @@ uint64_t SyscallGetTableAddress();
 // child without double-freeing the underlying buffer on close.
 void MemFdHandleRef(void* handle);
 void MemFdHandleUnref(void* handle);
+struct VnodeStat;
+void MemFdHandleStat(void* handle, VnodeStat* out);
 void EventFdHandleRef(void* handle);
 void EpollFdHandleRef(void* handle);
 void TimerFdHandleRef(void* handle);

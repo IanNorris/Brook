@@ -130,6 +130,11 @@ struct VnodeStat {
     VnodeTime ctime{};
     uint32_t nlink = 1;
     uint64_t dev = 1;    // Linux-encoded filesystem device identity
+    // Optional exact descriptor metadata for ephemeral proc FD stat targets;
+    // when set, uid/gid are already in the caller's reported ID namespace.
+    uint64_t blocks = 0;
+    uint64_t rdev = 0;
+    bool exactDescriptorMetadata = false;
 };
 
 // ---- VFS open flags ----

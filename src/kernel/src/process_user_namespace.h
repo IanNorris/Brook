@@ -10,8 +10,12 @@ int ProcessUserNamespaceCreate(Process* unpublishedChild);
 bool ProcessCapable(Process* process,UserNamespace* target,unsigned capability);
 // Scalar socket metadata only; grants no memory, directory, or FD-open capability.
 struct SocketIdentity;
+struct VnodeStat;
 // 1: copied socket; 0: another FD kind; negative: denied/missing.
 int ProcessReadSocketMetadata(Process* viewer,Process* target,uint32_t fd,SocketIdentity* out);
+// Capture same-thread-group anonymous descriptor metadata for one stat walk.
+// 1: snapshot; 0: unsupported kind; negative: denied/missing.
+int ProcessReadAnonymousFdMetadata(Process* viewer,Process* target,uint32_t fd,VnodeStat* out);
 uint32_t ProcessReportId(Process* viewer,bool group,uint32_t canonical);
 uint32_t ProcessResolveId(Process* actor,bool group,uint32_t visible);
 // Canonical IDs remain available through ProcessReadIds for internal checks.

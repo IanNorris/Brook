@@ -94,6 +94,8 @@ struct ProcessOperationGuard {
 #include "process_credentials.inc"
 #include "process_socket_metadata.inc"
 
+#include "process_anonymous_metadata.inc"
+
 // Exclude independently synchronized state from the raw process snapshot.
 // NNP is inherited under the credentials lock below; other credentials are
 // refreshed there using the existing path. The FS pointer is acquired separately

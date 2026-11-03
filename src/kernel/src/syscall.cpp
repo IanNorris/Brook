@@ -854,6 +854,21 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode);
 // External wrappers for fork() in process.cpp, which doesn't see MemFdData.
 void MemFdHandleRef(void* handle) { MemFdRef(static_cast<MemFdData*>(handle)); }
 void MemFdHandleUnref(void* handle) { MemFdUnref(static_cast<MemFdData*>(handle)); }
+void MemFdHandleStat(void* handle, VnodeStat* out)
+{
+    auto* mfd = static_cast<MemFdData*>(handle);
+    *out = {};
+    MfdLock(mfd);
+    out->size = mfd->size;
+    for (uint64_t index = 0; index < mfd->pageMapCount; ++index)
+        if (mfd->pageMap[index]) out->blocks += 4096 / 512;
+    out->ino = mfd->inode;
+    MfdUnlock(mfd);
+    out->dev = 0x01000000;
+    out->nlink = 0;
+    out->mode = 0100666;
+    out->exactDescriptorMetadata = true;
+}
 
 static inline void EventFdRef(EventFdData* efd)
 {
@@ -7995,7 +8010,7 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
     uint64_t ino = vs.ino;
     if (!ino && vn && vn->cacheId)
         ino = vn->cacheId;
-    if (ino) {
+    if (ino || vs.exactDescriptorMetadata) {
         st->st_ino = ino;
     } else {
         // Fallback for filesystems without stable inode numbers (FATFS, procfs)
@@ -8003,12 +8018,13 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
         st->st_ino = __atomic_fetch_add(&s_nextIno, 1, __ATOMIC_RELAXED);
     }
     st->st_dev = vs.dev;
+    st->st_rdev = vs.rdev;
     st->st_nlink = vs.nlink;
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);
-    st->st_blocks = (st->st_size + 511) / 512;
-    st->st_uid = ProcessReportId(ProcessCurrent(),false,vs.uid);
-    st->st_gid = ProcessReportId(ProcessCurrent(),true,vs.gid);
+    st->st_blocks = vs.exactDescriptorMetadata ? static_cast<int64_t>(vs.blocks) : (st->st_size + 511) / 512;
+    st->st_uid = vs.exactDescriptorMetadata ? vs.uid : ProcessReportId(ProcessCurrent(),false,vs.uid);
+    st->st_gid = vs.exactDescriptorMetadata ? vs.gid : ProcessReportId(ProcessCurrent(),true,vs.gid);
     st->st_atime_sec = vs.atime.sec;
     st->st_atime_nsec = vs.atime.nsec;
     st->st_mtime_sec = vs.mtime.sec;
@@ -8396,23 +8412,9 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
     }
 
     if (fde->type == FdType::MemFd && fde->handle) {
-        auto* mfd = static_cast<MemFdData*>(fde->handle);
-        MfdLock(mfd);
-        uint64_t logicalSize = mfd->size;
-        uint64_t allocatedBlocks = 0;
-        for (uint64_t index = 0; index < mfd->pageMapCount; ++index)
-            if (mfd->pageMap[index]) allocatedBlocks += 4096 / 512;
-        MfdUnlock(mfd);
-        // Snapshot construction stays outside the backing lock.
-        auto* raw = reinterpret_cast<uint8_t*>(st);
-        memset(raw, 0, sizeof(LinuxStat));
-        st->st_dev = 0x01000000; // anonymous shmem namespace, distinct from disk mounts
-        st->st_ino = mfd->inode;
-        st->st_nlink = 0;
-        st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
-        st->st_size = static_cast<int64_t>(logicalSize);
-        st->st_blksize = 4096;
-        st->st_blocks  = static_cast<int64_t>(allocatedBlocks);
+        VnodeStat metadata{};
+        MemFdHandleStat(fde->handle, &metadata);
+        FillStat(st, metadata);
         return 0;
     }
 

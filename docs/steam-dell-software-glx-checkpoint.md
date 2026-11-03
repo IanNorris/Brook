@@ -155,3 +155,38 @@ directories as ordinary files. The regression is deliberately left failing
 until those contracts are implemented and tested; a fabricated stat snapshot
 is not a general proc FD implementation. The test binary SHA-256 was
 `2572fe52818a283d1b20b36c8d1e3c61ef2c8802dc414b56f13c9ae509f90ed0`.
+
+### Anonymous descriptor stat candidate
+
+The kernel now follows selected same-thread-group anonymous proc FD links to
+an ephemeral stat-only snapshot. It captures a memfd reference under the FD
+lock, snapshots its size and allocated blocks after releasing that lock, and
+then drops the reference. Pipe and other selected descriptors use copied scalar
+metadata; no reader/writer endpoint is retained. The snapshot object rejects
+all opens, including `O_PATH`, so it does not claim persistent proc FD reopen
+semantics. Other unsupported descriptor kinds, including the synthetic DRM
+directory and render-device descriptors, remain separate work. Namespace,
+incarnation and existing filesystem authority checks are preserved.
+
+`VnodeStat` carries optional exact descriptor blocks, device and already-
+reported IDs; its layout change raises the kernel module ABI to 64. The
+matched release kernel and all 13 modules were rebuilt and staged together.
+Three focused hosted tests pass, including reference acquisition, a simulated
+close/reuse, group-incarnation denial and terminal-pipe classification. The
+native static proc FD test passes on Linux and on the final ABI 64 QEMU kernel
+for a normal process and a `CLONE_NEWUSER` child, including sparse memfd
+size, blocks and ownership comparisons. A four-thread close/stat stress test
+also passes 300 iterations per worker. The earlier `unshare`-based fixture
+failed with ENOSYS; the passing namespace fixture uses clone instead.
+
+With the earlier source-equivalent ABI 63 candidate, an authenticated private
+VM profile rendered the Steam client instead of the black screen; its Store
+reported a content-load failure. The rebuilt, matched ABI 64 kernel repeated
+the bounded software-Xephyr/Pulse run and rendered the client and Store
+artwork. During that captured interval there were no `proc_util.cc(97)` or
+GPU-process fatal messages, though EGL initialization warnings remained.
+The profile, client build and virtual hardware differ from the Dell, and no
+fresh QR sign-in or Dell stability is implied. The screenshots and account
+state remain private. Both candidate VMs completed checked guest and device
+flushes before stopping. The final ABI 64 kernel SHA-256 is
+`942500681ee1b8111d4694e7a99f40c74a6e90c4f2361320e4bd6cb21125496a`.

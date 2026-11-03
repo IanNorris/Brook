@@ -372,6 +372,36 @@ static int ProcSocketPath(const VfsPath& source, const SocketIdentity& identity,
     VfsPathRetain(*out); VfsObjectRelease(&target->object); return 1;
 }
 
+// An anonymous descriptor's pointer-free metadata is valid for this walk
+// only. Never create a persistent O_PATH/open handle from a frozen snapshot.
+struct ProcAnonStatTarget { VfsObject object; VnodeStat metadata; };
+static void ProcAnonStatDestroy(VfsObject* object) { kfree(object->priv); }
+static int ProcAnonStat(VfsObject* object, VnodeStat* out) {
+    if (!out) return -22;
+    *out = static_cast<ProcAnonStatTarget*>(object->priv)->metadata;
+    return 0;
+}
+static int ProcAnonAccess(VfsObject* object, uint8_t required, bool realIds) {
+    auto& m = static_cast<ProcAnonStatTarget*>(object->priv)->metadata;
+    return ProcessCheckFileAccess(ProcessCurrent(), m.uid, m.gid, m.mode, required, realIds);
+}
+static Vnode* ProcAnonOpen(VfsObject*, int, int* error) { *error = -95; return nullptr; }
+static const VfsObjectOps g_procAnonStatOps = {
+    .destroy=ProcAnonStatDestroy, .stat=ProcAnonStat, .access=ProcAnonAccess,
+    .lookup=nullptr, .parent=nullptr, .readlink=nullptr, .open=ProcAnonOpen,
+};
+static int ProcAnonStatPath(const VfsPath& source, const VnodeStat& metadata, VfsPath* out) {
+    auto* target = static_cast<ProcAnonStatTarget*>(kmalloc(sizeof(ProcAnonStatTarget)));
+    if (!target) return -12;
+    static uint64_t nextIdentity = 1;
+    const uint64_t identity = __atomic_fetch_add(&nextIdentity, 1, __ATOMIC_RELAXED);
+    if (!identity || identity == ~uint64_t{0}) __builtin_trap();
+    *target = {}; target->metadata = metadata;
+    target->object = {&g_procAnonStatOps, target, identity, 1};
+    *out = {source.attachment, &target->object};
+    VfsPathRetain(*out); VfsObjectRelease(&target->object); return 1;
+}
+
 static int ProcAcquireSocketMetadata(const ProcObject* value, SocketIdentity* out) {
     auto* live = SchedulerFindProcessReference(value->pid);
     if (!live) return -2;
@@ -401,6 +431,16 @@ static int ProcObjectFollow(const VfsPath& source,VfsPath* out)
         // jump, never a reopen of its reported pathname or a mount follow-down.
         FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);
         FsSnapshotRelease(&fs);if(error)return error;
+        auto* live=SchedulerFindProcessReference(value->pid);
+        if(!live)return -2;
+        VnodeStat metadata{};
+        int anon=-2;
+        if(live->incarnation==value->incarnation && live->tgid==value->tgid &&
+           (live->isThread?live->leaderIncarnation:live->incarnation)==value->group)
+            anon=ProcessReadAnonymousFdMetadata(ProcessCurrent(),live,value->index,&metadata);
+        ProcessUnref(live);
+        if(anon<0)return anon;
+        if(anon==1)return ProcAnonStatPath(source,metadata,out);
         error=ProcAcquireVnodeFdPath(value,out);
         return error==1?-95:error?error:1;
     }
