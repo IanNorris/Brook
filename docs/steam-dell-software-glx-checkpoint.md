@@ -348,3 +348,20 @@ profile remains the default, and the pre-existing unbounded diagnostic option
 takes precedence. Limits are ceilings, not reserved physical memory or a
 substitute for memory-pressure handling. This comparison is not evidence that
 the larger quota is a sufficient long-term policy.
+
+The exact pair booted in a disposable 2 GiB QEMU guest and reported the larger
+profile active with a 496,619,520-byte aggregate ceiling. After a checked
+Dell reboot the canonical mount reported 991,711,232 bytes total. With the
+same signed-in Steam profile, nested Xephyr and null audio server, the friends
+window appeared and the Steam store subsequently rendered. Eighteen five-second
+shared-memory samples ranged from 256,348,160 to 867,627,008 bytes available;
+usage fluctuated rather than exhausting the mount throughout that interval.
+The bounded Steam job peaked at 198 of 256 tasks, with no denied births in the
+observed sample. The CEF log's shared-memory ENOSPC entries were from the prior
+smaller-quota run; no later such entries were seen at the time checked.
+
+This is a positive physical comparison, not a long-duration stability or input
+acceptance test. The nested virtual X desktop and its sizing remain limitations,
+and increasing the quota has not established an optimal default or resolved
+the double-charged mapping representation. Private screenshots and client data
+remain outside the repository.
