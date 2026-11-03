@@ -241,6 +241,22 @@ This option is off by default and has not been deployed to the Dell; production
 identity provisioning, physical firmware validation and repair authorization
 remain.
 
+`prepare_guard_check_pair.py` now constructs a separate, minimal check-only
+RAM initrd from reviewed controller, ATA and partition-selector inputs. It
+checks the requested kernel hash and build evidence, pins the static FAT
+checker, and reads each embedded policy back. A private QEMU identity profile
+cannot be passed off as the physical profile. These hashes and local build
+records are consistency evidence, not executable attestation.
+
+An OVMF test embedded the exact prepared QEMU pair as verified recovery and
+booted it automatically without F5. For dirty data with clean guard records,
+the kernel reserved the intended disk, ran the pinned FAT checker successfully
+and matched both records; the entire private disk hash remained unchanged.
+Pending records were refused, wrong filesystem or ATA identities failed before
+reservation, and a modified checker was rejected after reservation. The check
+does not repair ext2 or permit normal boot, and these results do not establish
+physical-device durability or authorize deployment to the Dell.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.
