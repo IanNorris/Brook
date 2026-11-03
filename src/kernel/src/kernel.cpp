@@ -238,7 +238,7 @@ static void PrepareDesktopHome()
 // and mount at the specified path.  Returns true if mounted.
 // When allowDefer is true, devices that fail to mount or find BROOK.MNT are
 // queued for re-probe after module loading.
-static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv,
+[[maybe_unused]] static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv,
                                 bool allowDefer = true)
 {
     const bool fatBound = brook::FatFsBindDrive(pdrv, dev);
@@ -734,8 +734,18 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::HdaObserveConfigure(bootProtocol);
     brook::AhciObserveConfigure(bootProtocol);
     brook::AhciReadOnlyInit();
+#if defined(BROOK_SSD_GUARD_CHECK)
+    // This dedicated check-only build must reserve the selected physical
+    // disk ranges before any other storage consumer can bind or cache them.
+    // Failure remains maintenance-only; it must not fall back to a mount.
+    brook::Device* guardEsp=brook::AhciSystemGuardPrepare();
+    brook::SerialPrintf("SSD_GUARD_RESERVATION_%s\n",guardEsp?"READY":"FAILED");
+    if(!guardEsp)KernelPanic("SSD guard reservation failed; no recovery access permitted");
+#endif
     brook::DisplayPowerConfigure(bootProtocol);
+#if !defined(BROOK_SSD_GUARD_CHECK)
     uint32_t vioCount = brook::VirtioBlkInitAll();
+#endif
     // Shared pdrv counter: 0 = ramdisk, 1+ = everything else.
     uint8_t nextPdrv = 1;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
@@ -760,6 +770,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         } else brook::SerialPrintf("AHCI_QEMU_EXT2_NOT_MOUNTED path=%d parts=%u part=%u bound=%u\n",result,parts,part?1u:0u,bound?1u:0u);
     }
 #endif
+#if !defined(BROOK_SSD_GUARD_CHECK)
     if (vioCount > 0)
     {
         brook::KPrintf("virtio: found %u device(s)\n", vioCount);
@@ -804,6 +815,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             }
         }
     }
+#endif
 
     // ---- Module loader ----
     brook::BootLogoProgress(65, "Modules");
@@ -836,12 +848,17 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Phase 2: load late modules from /boot/drivers (virtio disk).
     //   ps2_kbd.mod and virtio_blk.mod live here.
     brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
+#if !defined(BROOK_SSD_GUARD_CHECK)
     brook::ModuleDiscoverAndLoad("/boot/drivers");
+#endif
     brook::SerialPuts("module: Phase 2 — done\n");
+#if !defined(BROOK_SSD_GUARD_CHECK)
     brook::PageStoreBootProbe();
     brook::PageableMemoryBootInit();
+#endif
 
     // ---- Re-probe deferred devices (e.g. ext4 now registered) ----
+#if !defined(BROOK_SSD_GUARD_CHECK)
     if (g_deferredCount > 0) {
         brook::SerialPrintf("module: re-probing %u deferred device(s)\n", g_deferredCount);
         for (uint32_t i = 0; i < g_deferredCount; ++i) {
@@ -850,12 +867,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
         g_deferredCount = 0;
     }
+#endif
 
     // ---- USB block devices: probe after xHCI module has loaded ----
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
     // First scan each for GPT partition tables; then probe all resulting
     // partition sub-devices (usb0p1, usb0p2, ...) for filesystems.
     brook::KLog("BOOT stage: USB filesystem probing begin");
+#if !defined(BROOK_SSD_GUARD_CHECK)
     for (uint32_t i = 0; i < 4; ++i)
     {
         char name[8] = "usb";
@@ -895,6 +914,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             ProbeAndMountDevice(label, ud, nextPdrv++);
         }
     }
+#endif
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
@@ -903,7 +923,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     const bool directDesktopRequested=brook::AhciSystemQemuLargeDesktopRequested();
 #endif
+#if defined(BROOK_SSD_GUARD_CHECK)
+    const auto systemVolume=brook::AhciSystemBoot::Maintenance;
+#else
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
+#endif
     if(systemVolume==brook::AhciSystemBoot::Ready) {
         if(productionDirectRequested)productionDirectReady=brook::AhciSystemDirectDesktopMount(&nextPdrv);
         else brook::AhciSystemDataInspect();

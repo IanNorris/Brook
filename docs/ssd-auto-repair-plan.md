@@ -81,6 +81,18 @@ adapter identities from overlapping the same blocks, or detect guard files
 cross-linked to a third file. The path must not be activated after any
 disk-backed filesystem or cache has been started.
 
+An opt-in `BROOK_SSD_GUARD_CHECK` kernel now calls that reservation immediately
+after AHCI initialization, before other storage consumers. This dedicated
+build skips storage auto-mounts, deferred probing, page stores, late modules
+and normal system/data mounts; reservation failure halts the boot. It cannot
+be combined with installer or writable-test hooks. On disposable QEMU SATA
+fixtures, the expected identity reserved successfully and an incorrect ESP
+GUID was rejected; full disk hashes were unchanged. A second virtio disk
+requesting a `/boot` mount did not replace the RAM initrd or change either
+disk. The mode still does not launch an authorized checker or repair a disk,
+and matching physical targets are not kernel-restricted to QEMU. It is not
+installed on the Dell.
+
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and
 metadata changes, handles short/error reads, and is covered by host tests. It

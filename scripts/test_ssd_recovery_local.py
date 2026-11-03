@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -53,6 +54,10 @@ def main():
                    help='Crosslink two new files in the private FAT fixture before boot')
     p.add_argument('--guard-open-probe', action='store_true',
                    help='Use a guard-open probe as supervisor on the private fixture')
+    p.add_argument('--guard-reservation', choices=('valid', 'wrong-guid'),
+                   help='Configure the disposable guard-only kernel reservation fixture')
+    p.add_argument('--guard-poison-boot', action='store_true',
+                   help='Attach a disposable virtio disk requesting an overmount of /boot')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
@@ -64,6 +69,10 @@ def main():
         p.error('--fat-crosslink requires --fat-checker')
     if a.guard_open_probe and (a.dirty or a.missing_checker or a.fat_checker or a.prepared_pair):
         p.error('guard open probe is an independent scenario')
+    if a.guard_reservation and (not a.guard_open_probe or not a.kernel_build):
+        p.error('guard reservation requires a guard-only kernel and guard-open probe')
+    if a.guard_poison_boot and a.guard_reservation != 'valid':
+        p.error('guard poison disk requires the valid reservation fixture')
     image = a.image.resolve(strict=True)
     if not image.is_file() or image.stat().st_size != 128 * 1024 * 1024:
         p.error('expected the 128 MiB disposable SATA recovery fixture')
@@ -126,6 +135,32 @@ def main():
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(module), '::/DRIVERS/' + name], check=True)
                 if subprocess.check_output(['mtype', '-i', str(initrd), '::/DRIVERS/' + name]) != data:
                     raise RuntimeError('recovery module readback mismatch')
+        if a.guard_reservation:
+            # Private disk identity and selectors; never copy these into a real image.
+            with disk.open('rb') as stream:
+                stream.seek(parts[1]['start'] * 512 + 1024 + 104)
+                ext2_uuid = stream.read(16)
+            if len(ext2_uuid) != 16 or not any(ext2_uuid):
+                raise RuntimeError('fixture ext2 UUID is absent')
+            disk_guid = uuid.UUID(table['id']).bytes_le.hex()
+            esp_guid = uuid.UUID(parts[0]['uuid']).bytes_le.hex()
+            if a.guard_reservation == 'wrong-guid':
+                esp_guid = ('0' if esp_guid[0] != '0' else '1') + esp_guid[1:]
+            data_guid = uuid.UUID(parts[1]['uuid']).bytes_le.hex()
+            records = {
+                'ahci-write-target': 'BRKAHCI1\n32902,10530,0,31,2,0,262144,512,512\nQEMU HARDDISK\nBROOK-RECOVERY-QA\n',
+                'ahci-boot-volume': f'BRKESP1\n{disk_guid}\n{esp_guid}\n2048,131072\n',
+                'ahci-data-volume': f'BRKDATA1\n{disk_guid}\n{data_guid}\n133120,126976\n{ext2_uuid.hex()}\n',
+            }
+            for name in ('ssd-install-mode', 'ssd-block-tools', 'boot-app-image', 'boot-app-snapshot', 'writable-desktop'):
+                subprocess.run(['mdel', '-i', str(initrd), '::ETC/' + name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for name, content in records.items():
+                record_file = work / name
+                record_file.write_text(content)
+                subprocess.run(['mcopy', '-o', '-i', str(initrd), str(record_file), '::ETC/' + name], check=True)
+                if subprocess.check_output(['mtype', '-i', str(initrd), '::ETC/' + name]) != content.encode():
+                    raise RuntimeError('guard reservation record readback mismatch: ' + name)
         init = work / 'INIT.RC'; init.write_bytes(AUTO_CHECK_INIT)
         ident = work / 'hardware-payload-id'; ident.write_bytes(AUTO_CHECK_PAYLOAD_ID)
         if not a.prepared_pair:
@@ -172,6 +207,15 @@ def main():
                 for offset in (20,26):entries[a1+offset:a1+offset+2]=entries[a0+offset:a0+offset+2]
                 stream.seek(1048576+root*512);stream.write(entries)
         before = sha(disk)
+        poison = None
+        if a.guard_poison_boot:
+            poison = work / 'poison.raw'
+            with poison.open('xb') as stream:
+                stream.truncate(16 * 1024 * 1024)
+            subprocess.run(['mkfs.fat', str(poison)], stdout=subprocess.DEVNULL, check=True)
+            mount = work / 'BROOK.MNT'; mount.write_text('/boot')
+            subprocess.run(['mcopy', '-i', str(poison), str(mount), '::BROOK.MNT'], check=True)
+            poison_before = sha(poison)
         firmware = a.firmware.resolve(strict=True)
         shutil.copyfile(firmware / 'OVMF_VARS.fd', work / 'vars.fd')
         monitor = work / 'monitor.sock'; serial = work / 'serial.log'
@@ -183,6 +227,9 @@ def main():
                    '-device', 'ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=BROOK-RECOVERY-QA',
                    '-display', 'none', '-serial', f'file:{serial}',
                    '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot']
+        if poison:
+            command += ['-drive', f'if=none,id=poison,format=raw,file={poison}',
+                        '-device', 'virtio-blk-pci,drive=poison']
         with (work / 'qemu.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             stop = threading.Event()
@@ -204,6 +251,12 @@ def main():
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited before local check completed')
                     text = serial.read_text(errors='replace') if serial.exists() else ''
+                    if (a.guard_reservation == 'wrong-guid' and
+                            'SSD guard reservation failed; no recovery access permitted' in text and
+                            'System halted.' in text):
+                        if 'SSD_GUARD_RESERVATION_READY' in text or 'ahci system: verified GPT entry' in text:
+                            raise RuntimeError('failed guard reservation admitted storage: ' + text[-5000:])
+                        break
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
@@ -224,6 +277,10 @@ def main():
                         raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
                     matched = expected in complete_lines if a.fat_checker else expected in text
                     if selected and matched:
+                        if a.guard_reservation:
+                            reservation = 'SSD_GUARD_RESERVATION_READY' if a.guard_reservation == 'valid' else 'SSD_GUARD_RESERVATION_FAILED'
+                            if reservation not in text or 'ahci system: verified GPT entry' in text or 'writable desktop: ready' in text:
+                                raise RuntimeError('guard reservation or maintenance-only boot failed: ' + text[-5000:])
                         if a.prepared_pair and ('Pass 1' in text or
                                                 'No such device while trying to open /dev/brook-install-disk2' not in text):
                             raise RuntimeError('physical recovery pair did not reject the wrong disk as expected')
@@ -261,9 +318,21 @@ def main():
                 if a.serial_output and serial.exists():
                     with a.serial_output.open('xb') as output:
                         output.write(serial.read_bytes())
+        if a.guard_reservation == 'wrong-guid':
+            final = serial.read_text(errors='replace')
+            if (final.count('SSD_GUARD_RESERVATION_FAILED') != 1 or
+                    'SSD guard reservation failed; no recovery access permitted' not in final or
+                    'System halted.' not in final or
+                    any(marker in final for marker in ('GUARD_OPEN_PROBE_', 'RECOVERY_READONLY_CHECK_',
+                                                       'BOOT: 65% Modules', 'SSD_GUARD_RESERVATION_READY',
+                                                       'ahci system: verified GPT entry', 'writable desktop: ready'))):
+                raise RuntimeError('guard failure did not halt before later boot stages: ' + final[-5000:])
         if sha(disk) != before:
             raise RuntimeError('read-only check changed the disposable disk')
-        print('RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else
+        if poison and sha(poison) != poison_before:
+            raise RuntimeError('guard boot changed the overmount fixture')
+        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation == 'wrong-guid' else
+              'RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else
               'RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else
               'RECOVERY_GUEST_FAT_CHECK_PASS' if a.fat_checker else
               'RECOVERY_PHYSICAL_PAIR_REJECTS_QEMU_DISK_PASS' if a.prepared_pair else
