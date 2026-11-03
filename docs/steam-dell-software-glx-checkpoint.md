@@ -263,6 +263,15 @@ mechanism. A candidate moves those operations outside the spinlock; a host
 regression gates concurrent misses and checks failures and eviction. Physical
 Steam validation remains outstanding. Raw diagnostic samples remain private.
 
+After offline e2fsck repair and a separate clean read-only check, the candidate
+was tested in private QEMU and staged to the Dell's alternate SSD boot slot.
+The preserved previous slot remains available. With the same isolated software
+Xephyr, null audio sink and 256-task cap, the physical Dell stayed responsive
+past the earlier failure and displayed the Steam QR sign-in screen. The
+attended frame and logs are private; no login success is claimed until the
+user verifies it. This successful run supports the lock-scope diagnosis but
+does not prove every possible hang is fixed.
+
 ### Emulated USB network comparison
 
 A separate four-CPU software QEMU run used the same kernel and timer fallback,
