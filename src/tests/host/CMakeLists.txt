@@ -73,6 +73,10 @@ add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.c
 target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
     "${BROOK_ROOT}/src/shared/inc_km" "${BROOK_ROOT}/src/bootloader/src")
+add_host_test(test_recovery_firmware_discovery "${BROOK_ROOT}/src/bootloader/src/recovery_firmware_discovery.cpp")
+target_include_directories(test_recovery_firmware_discovery PRIVATE
+    "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
+    "${BROOK_ROOT}/src/bootloader/src")
 add_host_test(test_usb_ecm_descriptors)
 add_host_test(test_usb_ecm_rx_credits)
 target_compile_options(test_usb_ecm_rx_credits PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
