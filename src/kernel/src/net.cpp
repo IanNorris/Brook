@@ -4486,13 +4486,22 @@ static void DebugSchedulerLockTrace()
 static void DebugEpollDiagnostics()
 {
     struct Row { unsigned pid; EpollDiagSnapshot data; } top[8]{};
+    // Keep rare ctl failures visible even when long-lived servers have orders
+    // of magnitude more epoll_wait calls. Compare fields lexicographically,
+    // rather than summing unbounded counters which can wrap.
+    auto ahead=[](const EpollDiagSnapshot& a,const EpollDiagSnapshot& b) {
+        const EpollDiagCounter fields[]={EpCtlAddChangedTarget,EpCtlAddExists,EpCalls};
+        for(auto field : fields) {
+            if(a.counters[field]!=b.counters[field])return a.counters[field]>b.counters[field];
+        }
+        return false;
+    };
     for (unsigned pid = 0; pid < MAX_PROCESSES; ++pid) {
         EpollDiagSnapshot snapshot{};
         if (!EpollDiagRead(pid, &snapshot) ||
             (!snapshot.counters[EpCalls] && !snapshot.counters[EpCtlAddExists])) continue;
         for (unsigned slot = 0; slot < 8; ++slot) {
-            if (snapshot.counters[EpCalls] + snapshot.counters[EpCtlAddExists] <=
-                top[slot].data.counters[EpCalls] + top[slot].data.counters[EpCtlAddExists]) continue;
+            if (!ahead(snapshot,top[slot].data)) continue;
             for (unsigned next = 7; next > slot; --next) top[next] = top[next - 1];
             top[slot] = {pid, snapshot}; break;
         }

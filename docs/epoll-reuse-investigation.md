@@ -20,15 +20,33 @@ whose current representation differs from the recorded ADD/MOD representation.
 This comparison is diagnostic: different wrappers can represent the same
 description, and reused addresses can conceal a different one. No handle values
 are exposed, and registrations made before enabling the diagnostic have no
-comparison baseline. Rows are bounded to the eight most active tasks and can
-omit a low-volume helper.
+comparison baseline. Rows are bounded to eight tasks and prioritize changed
+representations, then ADD failures, then wait activity; more than eight such
+tasks can still hide lower-ranked rows.
 
 With disposable QEMU kernels, the diagnostic fixture made one ordinary
 duplicate ADD and one ADD after a cross-type descriptor replacement. With the
 option on, counters reported `exists=2`, `changed_target=1`; with it off, they
 reported `exists=2`, `changed_target=0`, with comparison unavailable. These
-checks do not fix or change epoll behavior, and no diagnostic kernel has been
-deployed to the Dell for this investigation.
+checks do not fix or change epoll behavior.
+
+Subsequently the exact optional-diagnostic pair booted in disposable QEMU and
+was installed in the Dell's update slots; its previous boot slot was retained.
+With a software GLX smoke test passing, a nested Xephyr display, silent Pulse
+sink, and a 256-task limit, Steam remained on its loading screen. Its job peaked
+at 183 tasks with zero denied births, and a responsive Dell reported two
+browser-helper timeouts and no `epoll_ctl EEXIST` assertions in the completed
+client log. Those observations do not exclude other resource limits or prior
+run failures, but make the reproduced epoll defect insufficient on its own to
+explain this particular stall. A TERM request to the Steam client completed and
+its tracked descendants drained. The diagnostic is not a fix.
+
+The initial diagnostic sorted rows by wait-call volume, which could hide the
+rare failures of interest. The current version ranks changed representations
+and ADD failures first; a disposable QEMU test with nine higher-volume tasks
+confirmed that a lower-volume failure remained visible. The Dell run above
+used the earlier ranking, so its top-eight output cannot prove the absence of
+kernel-side errors outside those rows.
 
 A full fix must retain open-description identity across dup, fork and queued
 SCM_RIGHTS, resolve readiness against the watched description rather than the
