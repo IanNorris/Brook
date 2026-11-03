@@ -67,6 +67,7 @@ bool largeDesktopReady=false;
 #endif
 bool directPrepared=false,directLeased=false,directReady=false;
 uint8_t largeUuid[16]{};LargeDataSession largeSession{};
+uint8_t selectedDataDiskGuid[16]{},selectedDataPartGuid[16]{};
 Range largeRange{};
 int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
     if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
@@ -146,7 +147,11 @@ bool SelectDirect(Device* d,const AhciBootSelector& boot,AhciDirectLayout& selec
     const bool ok=entries && copy && ReadExact(d,a.entriesLba,entries,bytes) && ReadExact(d,b.entriesLba,copy,bytes) &&
         AhciDirectLayoutSelect(boot,data,sectors,mbr,primary,backup,entries,copy,bytes,selected);
     if(entries)kfree(entries);if(copy)kfree(copy);
-    if(ok)memcpy(largeUuid,data.filesystemUuid,sizeof(largeUuid));
+    if(ok) {
+        memcpy(largeUuid,data.filesystemUuid,sizeof(largeUuid));
+        memcpy(selectedDataDiskGuid,data.diskGuid,sizeof(selectedDataDiskGuid));
+        memcpy(selectedDataPartGuid,data.partitionGuid,sizeof(selectedDataPartGuid));
+    }
     return ok;
 }
 }
@@ -182,6 +187,15 @@ Device* AhciSystemGuardPrepare() {
     guardReady=true;return &guardPartition;
 }
 bool AhciSystemGuardIsReservedDevice(Device* device) {return device==&guardPartition;}
+bool AhciSystemGuardIdentity(char (&out)[97]) {
+    out[0]=0;if(!guardReady)return false;
+    const uint8_t* fields[]={selectedDataDiskGuid,selectedDataPartGuid,largeUuid};
+    constexpr char digits[]="0123456789abcdef";unsigned at=0;
+    for(const auto* field:fields)for(unsigned i=0;i<16;++i) {
+        out[at++]=digits[field[i]>>4];out[at++]=digits[field[i]&15];
+    }
+    out[at]=0;return true;
+}
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(attempted)return Fail("repeated admission");attempted=true;
     VnodeStat st{};const int exists=VfsLstatPath("/etc/ahci-boot-volume",&st);

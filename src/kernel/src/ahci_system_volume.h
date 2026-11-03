@@ -17,6 +17,9 @@ Device* AhciSystemGuardPrepare();
 // Until a checker-completion gate exists, this adapter is never eligible for
 // a writable private FAT mount.
 bool AhciSystemGuardIsReservedDevice(Device* device);
+// Expected disk GUID, data-partition GUID and verified primary UUID as
+// lowercase hex. Available only after the reserved guard device is ready.
+bool AhciSystemGuardIdentity(char (&out)[97]);
 // Optional, read-only boot diagnostic. Does not mount or change the disk.
 void AhciSystemDataInspect();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)

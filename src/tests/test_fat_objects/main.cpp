@@ -18,29 +18,32 @@
 #include <unistd.h>
 #include <sys/wait.h>
 static std::vector<unsigned char> disk;
+static bool guardDrive=false;
+static uint64_t failReadSector=~uint64_t{0};
 static bool failRead=false, failWrite=false, failSync=false, failDriveFlush=false, intrinsicReadOnly=false, driveAcquired=false;
 static brook::Device* exclusiveBound=nullptr;
 static brook::Device* reservedRecoveryDevice=nullptr;
 static unsigned diskReads=0,diskWrites=0;
 static int driveFlushes=0,failDriveFlushAt=-1;
 static LBA_t lastReadSector=0;
-extern "C" DSTATUS disk_initialize(BYTE drive){return drive?STA_NOINIT:0;}
-extern "C" DSTATUS disk_status(BYTE drive){return drive?STA_NOINIT:0;}
+extern "C" DSTATUS disk_initialize(BYTE drive){return drive!=(guardDrive?1:0)?STA_NOINIT:0;}
+extern "C" DSTATUS disk_status(BYTE drive){return drive!=(guardDrive?1:0)?STA_NOINIT:0;}
 extern "C" DRESULT disk_read(BYTE drive,BYTE* out,LBA_t sector,UINT count){
     ++diskReads;
     lastReadSector=sector;
     uint64_t offset=uint64_t(sector)*512,bytes=uint64_t(count)*512;
-    if(drive || failRead || offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
+    if(drive!=(guardDrive?1:0) || failRead || (sector<=failReadSector && failReadSector-sector<count) ||
+       offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
     std::memcpy(out,disk.data()+offset,bytes);return RES_OK;
 }
 extern "C" DRESULT disk_write(BYTE drive,const BYTE* in,LBA_t sector,UINT count){
     ++diskWrites;
     uint64_t offset=uint64_t(sector)*512,bytes=uint64_t(count)*512;
-    if(drive || failWrite || offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
+    if(drive!=(guardDrive?1:0) || failWrite || offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
     std::memcpy(disk.data()+offset,in,bytes);return RES_OK;
 }
 extern "C" DRESULT disk_ioctl(BYTE drive,BYTE command,void* out){
-    if(drive)return RES_PARERR;
+    if(drive!=(guardDrive?1:0))return RES_PARERR;
     if(command==CTRL_SYNC)return failSync?RES_ERROR:RES_OK;
     if(command==GET_SECTOR_COUNT){*static_cast<LBA_t*>(out)=disk.size()/512;return RES_OK;}
     if(command==GET_SECTOR_SIZE){*static_cast<WORD*>(out)=512;return RES_OK;}
@@ -77,8 +80,8 @@ void VmmFreePages(VirtualAddress address,uint64_t){
 int FatFsFlushDrive(uint8_t){++driveFlushes;return failSync||failDriveFlush||driveFlushes==failDriveFlushAt?-5:0;}
 void VfsRelease(Vnode* node){if(__atomic_fetch_sub(&node->refCount,1,__ATOMIC_ACQ_REL)==1)::closeNode(node);}
 bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive || driveAcquired || exclusiveBound)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
-bool FatFsBindExclusiveDrive(uint8_t drive,Device* device){if(drive || !device || driveAcquired || exclusiveBound)return false;exclusiveBound=device;return true;}
-bool FatFsAcquireExclusiveDrive(uint8_t drive,Device* expected,bool* ro){if(drive || !ro || driveAcquired || !exclusiveBound || expected!=exclusiveBound)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
+bool FatFsBindExclusiveDrive(uint8_t drive,Device* device){if(drive!=(guardDrive?1:0) || !device || driveAcquired || exclusiveBound)return false;exclusiveBound=device;return true;}
+bool FatFsAcquireExclusiveDrive(uint8_t drive,Device* expected,bool* ro){if(drive!=(guardDrive?1:0) || !ro || driveAcquired || !exclusiveBound || expected!=exclusiveBound)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
 void FatFsReleaseDrive(uint8_t){assert(driveAcquired);if(!exclusiveBound)driveAcquired=false;}
 bool FatFsDriveReadOnly(uint8_t){return intrinsicReadOnly;}
 extern "C" void SerialPrintf(const char*,...){}
@@ -626,6 +629,41 @@ int main(int argc,char** argv){
         assert(file->ops->write(file,bytes,sizeof(bytes),&position)==128);closeNode(file);
     }
     assert(!FatFsUnmount(mount));assert(allocations.empty() && pages.empty() && !driveAcquired);
+    if(profile.total)for(unsigned mode=0;mode<5;++mode) {
+        const pid_t child=fork();assert(child>=0);
+        if(!child) {
+            if(mode==2) {
+                void* temporary=nullptr;assert(FatFsMount(0,&temporary));
+                assert(!FatFsUnlink(temporary,0,"/RECOVERY/GUARD1.BIN"));assert(!FatFsUnmount(temporary));
+            }
+            uint64_t secondSector=~uint64_t{0};
+            if(mode==4) {
+                void* temporary=nullptr;assert(FatFsMount(0,&temporary));
+                auto* file=FatFsOpen(temporary,0,"/RECOVERY/GUARD1.BIN",VFS_O_STREAM);assert(file);
+                const auto* fil=static_cast<const FIL*>(file->priv);assert(fil->obj.sclust>=2);
+                secondSector=profile.dataStart+uint64_t(profile.sectorsPerCluster)*(fil->obj.sclust-2);
+                closeNode(file);assert(!FatFsUnmount(temporary));
+            }
+            BlockDeviceOps block{};
+            block.ioctl=[](Device*,uint32_t op,void*) {return op==DEVICE_IOCTL_READ_ONLY?1:-95;};
+            block.block_size=[](Device*)->uint32_t{return 512;};
+            block.block_count=[](Device*)->uint64_t{return disk.size()/512;};
+            Device reserved{reinterpret_cast<const DeviceOps*>(&block),"reserved",DeviceType::Block,nullptr};
+            registeredImage=reservedRecoveryDevice=&reserved;guardDrive=true;intrinsicReadOnly=true;
+            GuardFatProfile candidate=profile;if(mode==1)++candidate.dataStart;
+            if(mode==3)failRead=true;
+            if(mode==4)failReadSector=secondSector;
+            const auto writesBefore=diskWrites;uint8_t records[2][128];std::memset(records,0xaa,sizeof(records));
+            const int result=FatFsGuardInspectReadOnly(1,&reserved,candidate,records);failRead=false;failReadSector=~uint64_t{0};
+            assert((result==0)==(mode==0));assert(diskWrites==writesBefore);
+            if(mode==0)assert(records[0][0]==50 && records[1][0]==51);
+            else for(const auto& record:records)for(uint8_t byte:record)assert(!byte);
+            std::memset(records,0xaa,sizeof(records));assert(FatFsGuardInspectReadOnly(1,&reserved,profile,records)==-22);
+            for(const auto& record:records)for(uint8_t byte:record)assert(!byte);
+            _exit(0);
+        }
+        int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    }
     for(unsigned mode=0;mode<9;++mode) {
         const pid_t privateChild=fork();assert(privateChild>=0);
         if(!privateChild) {

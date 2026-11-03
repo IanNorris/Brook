@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -62,6 +63,8 @@ def main():
                    help='Run the kernel-started, pinned FAT checker on the reserved ESP')
     p.add_argument('--guard-bad-checker', action='store_true',
                    help='Corrupt one byte of the private checker to test digest rejection')
+    p.add_argument('--guard-records', choices=('valid', 'mismatch', 'wrong-identity', 'missing', 'oversized'),
+                   help='Exercise read-only private guard record inspection')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
@@ -77,6 +80,9 @@ def main():
         p.error('guard real checker requires --fat-checker and excludes the open probe')
     if a.guard_bad_checker and (not a.guard_real_checker or a.fat_crosslink):
         p.error('bad checker test requires a real checker and excludes crosslink')
+    if a.guard_records and (not a.guard_real_checker or a.guard_reservation != 'valid' or
+                            a.guard_bad_checker or a.fat_crosslink):
+        p.error('guard record test requires the clean checker and valid reservation')
     if a.guard_reservation and (not (a.guard_open_probe or a.guard_real_checker) or not a.kernel_build):
         p.error('guard reservation requires a guard-only kernel and a checker or open probe')
     if a.guard_real_checker and not a.guard_reservation:
@@ -224,6 +230,26 @@ def main():
                     raise RuntimeError('FAT crosslink source files were not distinct')
                 for offset in (20,26):entries[a1+offset:a1+offset+2]=entries[a0+offset:a0+offset+2]
                 stream.seek(1048576+root*512);stream.write(entries)
+        if a.guard_records:
+            with disk.open('rb') as stream:
+                stream.seek(parts[1]['start']*512+1024+104); filesystem_uuid=stream.read(16)
+            record_data=bytearray(128);record_data[:8]=b'BRKRCV01'
+            struct.pack_into('<QI',record_data,8,1,1)
+            record_data[24:40]=uuid.UUID(table['id']).bytes_le
+            record_data[40:56]=uuid.UUID(parts[1]['uuid']).bytes_le
+            record_data[56:72]=filesystem_uuid
+            struct.pack_into('<I',record_data,124,zlib.crc32(record_data[:124]))
+            for index in range(2):
+                target=f'::/RECOVERY/GUARD{index}.BIN'
+                if a.guard_records=='missing' and index==1:
+                    subprocess.run(['mdel','-i',media,target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    continue
+                contents=bytearray(record_data)
+                if (a.guard_records=='mismatch' and index==1) or a.guard_records=='wrong-identity':
+                    contents[40]^=1;struct.pack_into('<I',contents,124,zlib.crc32(contents[:124]))
+                if a.guard_records=='oversized' and index==1:contents+=b'X'
+                record_file=work/f'guard{index}.bin';record_file.write_bytes(contents)
+                subprocess.run(['mcopy','-o','-i',media,str(record_file),target],check=True)
         before = sha(disk)
         poison = None
         if a.guard_poison_boot:
@@ -278,7 +304,11 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = ('GUARD_CHECK_INCOMPLETE load=-8' if a.guard_bad_checker else
+                    expected = (('GUARD_RECORDS_MATCH' if a.guard_records=='valid' else
+                                 'GUARD_RECORDS_INCOMPLETE mismatch' if a.guard_records in ('mismatch','wrong-identity') else
+                                 'GUARD_RECORDS_INCOMPLETE read=-2' if a.guard_records=='missing' else
+                                 'GUARD_RECORDS_INCOMPLETE read=-22') if a.guard_records else
+                                'GUARD_CHECK_INCOMPLETE load=-8' if a.guard_bad_checker else
                                 ('GUARD_CHECK_RESULT exit=1' if a.fat_crosslink else 'GUARD_CHECK_RESULT exit=0') if a.guard_real_checker else
                                 'GUARD_OPEN_PROBE_PASS' if a.guard_open_probe else
                                 ('FAT_CHECK_RESULT exit=1' if a.fat_crosslink else 'FAT_CHECK_RESULT exit=0') if a.fat_checker else
@@ -287,8 +317,9 @@ def main():
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
                     complete_lines = [line.rstrip('\r') for line in text.split('\n')[:-1]]
+                    checker_expected='GUARD_CHECK_RESULT exit=0' if a.guard_records else expected
                     if a.guard_real_checker and any(
-                            line.startswith(('GUARD_CHECK_RESULT ', 'GUARD_CHECK_INCOMPLETE ')) and line != expected
+                            line.startswith(('GUARD_CHECK_RESULT ', 'GUARD_CHECK_INCOMPLETE ')) and line != checker_expected
                             for line in complete_lines):
                         raise RuntimeError('unexpected guard checker result: ' + text[-3000:])
                     if a.guard_open_probe and 'GUARD_OPEN_PROBE_FAILED' in text:
@@ -301,6 +332,9 @@ def main():
                         raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
                     matched = expected in complete_lines if a.fat_checker else expected in text
                     if selected and matched:
+                        if a.guard_records and ('GUARD_CHECK_RESULT exit=0' not in complete_lines or
+                                                complete_lines.index('GUARD_CHECK_RESULT exit=0')>=complete_lines.index(expected)):
+                            raise RuntimeError('guard record result did not follow a successful checker')
                         if a.guard_bad_checker and 'GUARD_CHECK_RESULT' in text:
                             raise RuntimeError('bad checker unexpectedly produced a result')
                         if a.guard_reservation:

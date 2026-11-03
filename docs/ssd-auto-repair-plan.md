@@ -65,9 +65,10 @@ ownership mechanism.
 An experimental boot-only preparation path can validate the selected GPT
 layout and reserve the ESP for a dedicated block adapter while denying data
 partition and GPT metadata writes. The adapter itself currently rejects all
-writes, and the private FAT mount rejects this reserved device until a
-checker-completion and ownership-handoff gate exists. It is called only by the
-isolated check-only boot, mounts no FAT filesystem and does not run a repair.
+writes, and the writable private FAT mount rejects this reserved device until a
+checker-completion and ownership-handoff gate exists. Preparation itself is called
+only by the isolated check-only boot; it mounts no FAT filesystem and does not
+run a repair. A later read-only diagnostic mount is described below.
 Host tests exercise read-only routing,
 bounds, failure and repeated admission. A separate one-shot, boot-lifetime FAT
 binding now prevents the same device pointer from being bound or mounted via
@@ -118,8 +119,14 @@ The profile excludes the cluster-count boundaries on which the bundled
 FatFs and checker disagree. Host tests compare accepted real FAT16/FAT32
 fixture geometry with FatFs's mounted geometry and reject a nested MBR volume;
 the check-only QEMU boot passes on its FAT16 fixture. This is not yet an
-authorization to mount, and a future private mount must compare its actual
-FatFs geometry with the retained profile before permitting any write.
+authorization to write. A diagnostic-only private read-only FatFs mount now
+compares its actual geometry with the profile and reads both guard records,
+checking them against the disk/data GUIDs and verified filesystem UUID. It
+never publishes a namespace or makes the adapter writable. QEMU tests cover
+matching, mismatched, missing and oversized records with unchanged disk hashes;
+host FAT16/FAT32 tests cover read failures, incorrect mounted geometry,
+one-shot behavior and cleared output. This binding remains read-only until
+reboot and cannot serve as the later writable transaction handoff.
 
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and

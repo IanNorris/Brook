@@ -1,4 +1,7 @@
 #include "fatfs_vfs.h"
+#if defined(BROOK_SSD_GUARD_CHECK)
+#include "guard_fat_profile.h"
+#endif
 #include "vfs.h"
 #include "vfs_object.h"
 #include "fatfs_object.h"
@@ -728,6 +731,58 @@ bool FatFsMountPrivateRecovery(uint8_t pdrv,Device* expected,FatPrivateMount** o
     if(result!=FR_OK) {kfree(data);kfree(session);return false;}
     session->mount=data;*out=session;return true;
 }
+
+#if defined(BROOK_SSD_GUARD_CHECK)
+int FatFsGuardInspectReadOnly(uint8_t pdrv,Device* device,const GuardFatProfile& profile,
+                              uint8_t (&records)[2][128])
+{
+    __builtin_memset(records,0,sizeof(records));
+    static bool attempted=false;
+    if(__atomic_exchange_n(&attempted,true,__ATOMIC_ACQ_REL) || pdrv!=1 ||
+       (profile.type!=16 && profile.type!=32) || !device ||
+       !AhciSystemGuardIsReservedDevice(device) || !DeviceIsRegistered(device) ||
+       device->type!=DeviceType::Block || !device->ops || !device->ops->ioctl ||
+       device->ops->ioctl(device,DEVICE_IOCTL_READ_ONLY,nullptr)!=1 ||
+       DeviceBlockSize(device)!=512 || DeviceBlockCount(device)!=profile.total)return -22;
+    EnsureLock();
+    auto* data=static_cast<FatFsMountData*>(kmalloc(sizeof(FatFsMountData)));
+    if(!data)return -12;
+    __builtin_memset(data,0,sizeof(FatFsMountData));data->pdrv=pdrv;
+    if(!FatFsBindExclusiveDrive(pdrv,device) ||
+       !FatFsAcquireExclusiveDrive(pdrv,device,&data->intrinsicReadOnly) || !data->intrinsicReadOnly) {
+        kfree(data);return -16;
+    }
+    char drive[3]={static_cast<char>('0'+pdrv),':',0};
+    uint8_t scratch[2][128]{};FIL files[2]{};bool opened[2]{};int error=0;
+    KMutexLock(&g_fatLock);
+    FRESULT result=f_mount(&data->fs,drive,1);
+    if(result!=FR_OK)error=FrToErrno(result);
+    const auto& fs=data->fs;
+    if(!error && (fs.fs_type!=(profile.type==16?FS_FAT16:FS_FAT32) || fs.volbase!=0 ||
+        fs.fatbase!=profile.fatStart || fs.fsize!=profile.fatSectors || fs.database!=profile.dataStart ||
+        fs.csize!=profile.sectorsPerCluster || fs.n_fatent!=profile.clusters+2 ||
+        fs.n_rootdir!=profile.rootEntries || fs.n_fats!=2 ||
+        fs.dirbase!=(profile.type==32?profile.rootCluster:profile.fatStart+2*profile.fatSectors)))error=-22;
+    const char* paths[2]={"1:/RECOVERY/GUARD0.BIN","1:/RECOVERY/GUARD1.BIN"};
+    for(unsigned i=0;!error && i<2;++i) {
+        result=f_open(&files[i],paths[i],FA_READ);
+        if(result!=FR_OK) {error=FrToErrno(result);break;}
+        opened[i]=true;
+        if(f_size(&files[i])!=128) {error=-22;break;}
+        UINT count=0;result=f_read(&files[i],scratch[i],128,&count);
+        if(result!=FR_OK || count!=128)error=result!=FR_OK?FrToErrno(result):-5;
+    }
+    if(!error && (files[0].obj.sclust<2 || files[0].obj.sclust==files[1].obj.sclust))error=-22;
+    for(unsigned i=0;i<2;++i)if(opened[i] && f_close(&files[i])!=FR_OK && !error)error=-5;
+    if(result!=FR_OK && !data->fs.fs_type)f_mount(nullptr,drive,0);
+    KMutexUnlock(&g_fatLock);
+    // A successful f_mount retains &data->fs. Keep it pinned for this boot,
+    // including later inspection errors; otherwise unregister before free.
+    if(!data->fs.fs_type)kfree(data);
+    if(!error)__builtin_memcpy(records,scratch,sizeof(scratch));
+    return error;
+}
+#endif
 
 static bool FatFsMount(uint8_t pdrv, void** mountPriv)
 {

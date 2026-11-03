@@ -695,7 +695,7 @@ add_executable(test_fat_objects
     "${BROOK_ROOT}/src/kernel/src/fat_image_device.cpp"
     "${FATFS_OBJECT_HOST_DIR}/ff.c" "${FATFS_OBJECT_HOST_DIR}/ffunicode.c")
 target_include_directories(test_fat_objects PRIVATE "${FATFS_OBJECT_HOST_DIR}")
-target_compile_options(test_fat_objects PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections)
+target_compile_options(test_fat_objects PRIVATE -UNDEBUG -DBROOK_HOST_TEST -DBROOK_SSD_GUARD_CHECK -ffunction-sections -fdata-sections)
 target_compile_options(test_fat_objects PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-Wno-unused-function;-Wno-unused-parameter;-Wno-attributes>")
 target_compile_options(test_fat_objects PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")

@@ -1,13 +1,16 @@
 #include "guard_checker_runner.h"
 #include "guard_checker_session.h"
 #include "guard_fat_profile.h"
+#include "ahci_system_volume.h"
 #include "exec_image.h"
+#include "fatfs_vfs.h"
 #include "process.h"
 #include "scheduler.h"
 #include "kprintf.h"
 #include "string.h"
 #include "vfs.h"
 #include "../../shared/update/payload.h"
+#include "../../shared/update/recovery_guard.h"
 
 namespace brook {
 namespace {
@@ -77,11 +80,22 @@ void Worker(void* arg) {
         KPrintf("GUARD_CHECK_INCOMPLETE drain views=%u reads=%u\n",status.views,status.reads);return;
     }
     if(result.code!=1) {KPrintf("GUARD_CHECK_INCOMPLETE signal status=%d\n",result.status);return;}
-    if(result.status==0) {
-        GuardFatProfile profile{};
-        if(!GuardFatCheckDevice(device,profile)) {KPuts("GUARD_CHECK_INCOMPLETE fat-profile\n");return;}
+    if(result.status!=0) {
+        KPrintf("GUARD_CHECK_RESULT exit=%u\n",static_cast<unsigned>(result.status>>8));return;
     }
-    KPrintf("GUARD_CHECK_RESULT exit=%u\n",static_cast<unsigned>(result.status>>8));
+    GuardFatProfile profile{};
+    if(!GuardFatCheckDevice(device,profile)) {KPuts("GUARD_CHECK_INCOMPLETE fat-profile\n");return;}
+    KPuts("GUARD_CHECK_RESULT exit=0\n");
+    uint8_t records[2][128]{};char identity[97]{};
+    if(!AhciSystemGuardIdentity(identity)) {KPuts("GUARD_RECORDS_INCOMPLETE identity\n");return;}
+    const int inspection=FatFsGuardInspectReadOnly(1,device,profile,records);
+    if(inspection) {KPrintf("GUARD_RECORDS_INCOMPLETE read=%d\n",inspection);return;}
+    if(!BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
+        KPuts("GUARD_RECORDS_INCOMPLETE mismatch\n");return;
+    }
+    // This is diagnostic evidence only. It grants neither repair nor normal
+    // boot admission; the read-only binding remains held until reboot.
+    KPuts("GUARD_RECORDS_MATCH\n");
 }
 }
 bool GuardCheckerStart(Device* device) {

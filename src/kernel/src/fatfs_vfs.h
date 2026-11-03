@@ -10,6 +10,14 @@ struct Vnode;
 struct FatImageLease;
 struct FatPrivateMount;
 struct Device;
+#if defined(BROOK_SSD_GUARD_CHECK)
+struct GuardFatProfile;
+// Diagnostic only: reserves an exclusive read-only FAT slot for this boot,
+// verifies mounted geometry and reads both fixed records without publishing
+// a mount or granting recovery/write authority. Outputs are cleared on error.
+int FatFsGuardInspectReadOnly(uint8_t pdrv, Device* device, const GuardFatProfile& profile,
+                              uint8_t (&records)[2][128]);
+#endif
 void FatFsVfsRegister();
 // Boot-only, one-shot mount on a pinned exclusive binding. It is not inserted
 // in a VFS namespace and, once bound, remains reserved until reboot even if
