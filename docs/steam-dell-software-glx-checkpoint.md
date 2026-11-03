@@ -365,3 +365,15 @@ acceptance test. The nested virtual X desktop and its sizing remain limitations,
 and increasing the quota has not established an optimal default or resolved
 the double-charged mapping representation. Private screenshots and client data
 remain outside the repository.
+
+During an attended later session, Steam installed Stardew Valley but its
+tracked launch wrapper exited 127. The launch chain named Steam's i386 reaper;
+the independent native64 reaper package passed both orphan-lifetime controls
+on this Dell as an unprivileged user. The original i386 helper was saved and
+read back before its private Steam copy was replaced with the verified native64
+binary; Steam itself was not restarted. A successful game launch has not yet
+been established. This long-running Steam job also reached its deliberately
+imposed 256-task diagnostic budget and reported denied births, which can
+confound a retry. It is a job-specific cap, not evidence that the global PID
+pool was exhausted. The X session still uses a nested virtual desktop without
+an X window manager; resizing the main X window did not resolve all clipping.
