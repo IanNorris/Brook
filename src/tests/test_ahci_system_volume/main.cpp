@@ -36,9 +36,7 @@ int DiskRead(Device*,uint64_t off,void* dst,uint64_t n){++reads;if(is("short-rea
     if(off==8192ull*512+4096){assert(n==sizeof(gdt));std::memcpy(dst,gdt,n);return int(n);}
     const uint8_t* src=off==0?mbr:off==512?primary:off==99999ull*512?backup:off==2*512?entries:off==99967ull*512?copy:nullptr;
     if(src){std::memcpy(dst,src,n);return int(n);}return -5;}
-int DiskWrite(Device*,uint64_t off,const void*,uint64_t n){++writes;
-    if(guard())assert(off==2048ull*512+3);
-    if(is("guard-io-error"))return -5;if(is("guard-short-write"))return int(n-1);return int(n);}
+int DiskWrite(Device*,uint64_t,const void*,uint64_t n){++writes;return int(n);}
 int DiskIoctl(Device*,uint32_t request,void*){return request==DEVICE_IOCTL_READ_ONLY?0:request==DEVICE_IOCTL_FLUSH?(is("guard-flush-error")?-5:0):-95;}
 uint64_t DiskBlocks(Device*){return 100000;}uint32_t DiskSize(Device*){return 512;}
 BlockDeviceOps diskOps{DiskRead,DiskWrite,DiskIoctl,nullptr,DiskBlocks,DiskSize};
@@ -116,7 +114,7 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
         assert(!AhciSystemGuardPrepare());
         uint8_t next=1;assert(AhciSystemVolumeMount(&next)==AhciSystemBoot::Maintenance);
         assert(!binds && !mounts && !writes && next==1);
-        const bool ready=is("guard-ready") || is("guard-short-write") || is("guard-io-error") || is("guard-read-error") || is("guard-flush-error");
+        const bool ready=is("guard-ready") || is("guard-read-error") || is("guard-flush-error");
         if(ready) {
             assert(esp && esp==registered && leaseCalls==1);
             uint8_t bytes[2]{};
@@ -126,13 +124,15 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
             assert(DeviceWrite(&disk,99999ull*512,bytes,1)==-30 && !writes);
             auto* block=reinterpret_cast<const BlockDeviceOps*>(esp->ops);
             assert(block->block_count(esp)==2048 && block->block_size(esp)==512);
+            assert(esp->ops->ioctl(esp,DEVICE_IOCTL_READ_ONLY,nullptr)==1);
+            assert(AhciSystemGuardIsReservedDevice(esp) && !AhciSystemGuardIsReservedDevice(&disk));
             const int read=esp->ops->read(esp,3,bytes,2);
             assert(read==(is("guard-read-error")?-5:2));if(read==2)assert(bytes[0]==0x42);
             assert(esp->ops->read(esp,2048ull*512-1,bytes,2)==-22);
             assert(esp->ops->ioctl(esp,DEVICE_IOCTL_FLUSH,nullptr)==(is("guard-flush-error")?-5:0));
             assert(esp->ops->write(esp,2048ull*512-1,bytes,2)==-22 && !writes);
             const int result=esp->ops->write(esp,3,bytes,2);
-            assert(result==(is("guard-io-error")?-5:is("guard-short-write")?1:2) && writes==1);
+            assert(result==-30 && !writes);
         } else {
             assert(!esp && !writes);
             if(is("guard-lease-fail")) {

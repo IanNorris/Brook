@@ -28,14 +28,16 @@ int GuardRead(Device*,uint64_t offset,void* data,uint64_t length) {
     return guardRange.parent->ops->read(guardRange.parent,guardRange.start+offset,data,length);
 }
 int GuardWrite(Device* owner,uint64_t offset,const void* data,uint64_t length) {
+    (void)owner;(void)data;
     if(!guardReady || !guardRange.parent)return -19;
     if(offset>guardRange.bytes || length>guardRange.bytes-offset)return -22;
-    return DeviceWriteLeased(guardRange.parent,owner,guardRange.start+offset,data,length);
+    // Checker completion and ownership handoff are not implemented yet.
+    return -30;
 }
 int GuardControl(Device*,uint32_t request,void*) {
     if(!guardReady || !guardRange.parent)return -19;
     if(request==DEVICE_IOCTL_FLUSH)return DeviceFlush(guardRange.parent);
-    if(request==DEVICE_IOCTL_READ_ONLY)return guardRange.parent->ops->ioctl(guardRange.parent,request,nullptr);
+    if(request==DEVICE_IOCTL_READ_ONLY)return 1;
     return -95;
 }
 uint64_t GuardBlocks(Device*) {return guardReady?guardRange.bytes/512:0;}
@@ -172,6 +174,7 @@ Device* AhciSystemGuardPrepare() {
        !DeviceInstallBootWriteLeases(leases,4))return nullptr;
     guardReady=true;return &guardPartition;
 }
+bool AhciSystemGuardIsReservedDevice(Device* device) {return device==&guardPartition;}
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(attempted)return Fail("repeated admission");attempted=true;
     VnodeStat st{};const int exists=VfsLstatPath("/etc/ahci-boot-volume",&st);

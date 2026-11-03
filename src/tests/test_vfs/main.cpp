@@ -16,6 +16,7 @@
 // Scheduler stubs for KMutex — test_vfs is single-threaded so these are trivial.
 static brook::Process g_stubProcess = {};
 namespace brook {
+    bool AhciSystemGuardIsReservedDevice(Device*) { return false; }
     Process* SchedulerCurrentProcess() { return &g_stubProcess; }
     void SchedulerBlock(Process*) {}
     void SchedulerKernelRegionEnter(Process*) {}

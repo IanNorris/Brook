@@ -19,6 +19,7 @@
 static std::vector<unsigned char> disk;
 static bool failRead=false, failWrite=false, failSync=false, failDriveFlush=false, intrinsicReadOnly=false, driveAcquired=false;
 static brook::Device* exclusiveBound=nullptr;
+static brook::Device* reservedRecoveryDevice=nullptr;
 static unsigned diskReads=0,diskWrites=0;
 static int driveFlushes=0,failDriveFlushAt=-1;
 static LBA_t lastReadSector=0;
@@ -55,6 +56,7 @@ thread_local long failAllocation=-1;
 }
 namespace brook {
 Device* registeredImage=nullptr;
+bool AhciSystemGuardIsReservedDevice(Device* device){return device && device==reservedRecoveryDevice;}
 extern "C" bool DeviceIsRegistered(Device* device){return device==registeredImage;}
 extern "C" void* kmalloc(uint64_t bytes){
     if(failAllocation==0){failAllocation=-1;return nullptr;}if(failAllocation>0)--failAllocation;
@@ -614,6 +616,8 @@ int main(int argc,char** argv){
         const pid_t privateChild=fork();assert(privateChild>=0);
         if(!privateChild) {
             Device dummy{};FatPrivateMount* privateGuard=nullptr;
+            Device reserved{};reservedRecoveryDevice=&reserved;
+            assert(!FatFsMountPrivateRecovery(0,&reserved,&privateGuard) && !exclusiveBound && !driveAcquired);
             if(mode==2) {
                 void* temporary=nullptr;assert(FatFsMount(0,&temporary));
                 assert(!FatFsUnlink(temporary,0,"/RECOVERY/GUARD1.BIN"));assert(!FatFsUnmount(temporary));

@@ -64,8 +64,10 @@ ownership mechanism.
 
 An experimental boot-only preparation path can validate the selected GPT
 layout and reserve the ESP for a dedicated block adapter while denying data
-partition and GPT metadata writes. It is not called by boot, mounts no FAT
-filesystem and does not run a repair. Host tests exercise owner routing,
+partition and GPT metadata writes. The adapter itself currently rejects all
+writes, and the private FAT mount rejects this reserved device until a
+checker-completion and ownership-handoff gate exists. It is not called by boot, mounts no FAT
+filesystem and does not run a repair. Host tests exercise read-only routing,
 bounds, failure and repeated admission. A separate one-shot, boot-lifetime FAT
 binding now prevents the same device pointer from being bound or mounted via
 another FAT slot; host tests cover competing binders, release and sticky write

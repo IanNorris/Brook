@@ -14,6 +14,9 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive);
 // adapter and denies data/GPT writes. Does not mount or expose filesystems.
 // Only call before any filesystem, caches or user processes can access disk.
 Device* AhciSystemGuardPrepare();
+// Until a checker-completion gate exists, this adapter is never eligible for
+// a writable private FAT mount.
+bool AhciSystemGuardIsReservedDevice(Device* device);
 // Optional, read-only boot diagnostic. Does not mount or change the disk.
 void AhciSystemDataInspect();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)

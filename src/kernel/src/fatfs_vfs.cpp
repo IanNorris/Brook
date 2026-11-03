@@ -4,6 +4,7 @@
 #include "fatfs_object.h"
 #include "process.h"
 #include "fatfs_glue.h"
+#include "ahci_system_volume.h"
 #include "memory/heap.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
@@ -705,7 +706,9 @@ bool FatFsMountPrivateRecovery(uint8_t pdrv,Device* expected,FatPrivateMount** o
 {
     if(!out)return false;
     *out=nullptr;
-    if(!expected)return false;
+    // The prepared checker device has no authenticated completion/handoff
+    // protocol yet. A raw pointer must not grant private-mount authority.
+    if(!expected || AhciSystemGuardIsReservedDevice(expected))return false;
     EnsureLock();
     auto* session=static_cast<FatPrivateMount*>(kmalloc(sizeof(FatPrivateMount)));
     if(!session)return false;
