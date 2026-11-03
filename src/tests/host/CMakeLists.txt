@@ -59,6 +59,7 @@ target_include_directories(test_ramdisk PRIVATE "${BROOK_ROOT}/src/shared/inc_km
 add_host_test(test_usb_bot_recovery)
 add_host_test(test_usb_scsi_cache)
 add_host_test(test_update_payload)
+add_host_test(test_recovery_guard)
 add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp")
 target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"

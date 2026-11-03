@@ -54,7 +54,14 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     uint8_t* initrdData = nullptr;
     UINTN initrdFileSize = 0;
     bool recoveryRequested = false;
-    if (g_bootConfig.recoveryMenu && systemTable->ConIn) {
+#if defined(BROOK_RECOVERY_GUARD_REQUIRED)
+    // This build variant always checks before considering any normal A/B or
+    // legacy payload, regardless of BROOK.CFG. A failed check can only enter
+    // the independently verified recovery pair.
+    const bool guardDenied = !RecoveryGuardAllowsNormal(imageHandle,systemTable->BootServices,BROOK_GUARD_IDENTITY);
+    if (guardDenied) recoveryRequested = true;
+#endif
+    if (!recoveryRequested && g_bootConfig.recoveryMenu && systemTable->ConIn) {
         ConsoleSetQuiet(false);
         ConsolePrintLine(u"Press F5 for Brook recovery; normal boot continues in 2 seconds.");
         ConsoleSetQuiet(!g_bootConfig.debugText);
@@ -69,6 +76,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     }
     if (recoveryRequested) {
         ConsoleSetQuiet(false);
+#if defined(BROOK_RECOVERY_GUARD_REQUIRED)
+        if (guardDenied) ConsolePrintLine(u"Recovery required; normal boot blocked.");
+#endif
         ConsolePrintLine(u"Recovery selected; verifying payload.");
         ConsoleSetQuiet(!g_bootConfig.debugText);
     }
@@ -81,6 +91,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     }
     if (recoveryRequested && !updatePair) {
         ConsoleSetQuiet(false);
+#if defined(BROOK_RECOVERY_GUARD_REQUIRED)
+        if (guardDenied) Halt(EFI_NOT_FOUND, u"Recovery required but payload invalid or missing.");
+#endif
         Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; restart to boot normally.");
     }
     if (!updatePair) updatePair = g_bootConfig.updateSlots && LoadUpdatePair(imageHandle,

@@ -1,5 +1,33 @@
 # SSD store automatic repair
 
+**Current Dell layout:** the installation now uses a direct ext2 data
+partition. The earlier FAT-backed image design below describes the older
+layout and is not an implementation plan for the current SSD. The same
+durability and exclusive-ownership requirements apply, but identities must
+bind the physical disk, GPT disk and partition GUIDs, partition bounds and
+ext2 UUID. No automatic writer or recovery admission is implemented yet.
+
+## Experimental boot guard
+
+An opt-in build produces a separate `BROOKGUARD.efi`; the normal
+`BOOTX64.efi` is unchanged. The guarded binary embeds its expected disk GUID,
+data partition GUID and ext2 UUID and requires two identical, valid, clean
+records on the EFI system partition before trying any normal A/B or legacy
+payload. An absent, interrupted, inconsistent or wrong-identity record enters
+the independently verified recovery pair; if that pair is unavailable, the
+loader halts. The decision does not depend on `BROOK.CFG`.
+
+On a private QEMU SATA fixture, the clean case booted normally and pending,
+mismatched, missing, truncated, corrupt and wrong-identity records selected
+recovery, including when the configuration file was absent. These checks used
+the legacy normal payload. Each denied case ran on a writable private copy
+and left its full disk hash unchanged. A/B fallback, invalid recovery and interruption
+across durable writes still need acceptance tests. The guard has no writer and
+does not itself validate the physical disk or filesystem. It is not installed
+on the Dell. Before any physical deployment, inventory every firmware-reachable
+EFI entrypoint: an older EFI loader can bypass this guard even though old
+kernel generations loaded through the guarded EFI cannot.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.

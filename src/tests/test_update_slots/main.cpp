@@ -11,6 +11,7 @@
 #include "memory.h"
 #include "elf.h"
 #include "../../shared/update/payload.h"
+#include "../../shared/update/recovery_guard.h"
 using Bytes=std::vector<uint8_t>;
 static std::map<std::u16string,Bytes> files;
 static std::map<void*,UINTN> allocations;
@@ -59,6 +60,24 @@ static void expectRecovery(bool success) {
     assert(allocations.empty());
 }
 int main() {
+    const char* identity="01000000000000000000000000000000"
+                         "02000000000000000000000000000000"
+                         "03000000000000000000000000000000";
+    auto guard=[&](bool expected) {
+        assert(brook::bootloader::RecoveryGuardAllowsNormal(nullptr,nullptr,identity)==expected);
+        assert(allocations.empty());
+    };
+    guard(false);
+    Bytes g(128);memcpy(g.data(),"BRKRCV01",8);BrookUpdatePut64(g.data()+8,1);
+    BrookUpdatePut32(g.data()+16,BROOK_RECOVERY_GUARD_CLEAN);
+    g[24]=1;g[40]=2;g[56]=3;BrookUpdatePut32(g.data()+124,BrookUpdateCrc(g.data(),124));
+    files[u"RECOVERY\\GUARD0.BIN"]=g;guard(false);
+    files[u"RECOVERY\\GUARD1.BIN"]=g;guard(true);
+    files[u"RECOVERY\\GUARD1.BIN"].resize(127);guard(false);
+    files[u"RECOVERY\\GUARD1.BIN"]=g;files[u"RECOVERY\\GUARD1.BIN"][125]^=1;guard(false);
+    files[u"RECOVERY\\GUARD1.BIN"]=g;
+    BrookUpdatePut32(g.data()+16,BROOK_RECOVERY_GUARD_PENDING);BrookUpdatePut32(g.data()+124,BrookUpdateCrc(g.data(),124));
+    files[u"RECOVERY\\GUARD0.BIN"]=g;files[u"RECOVERY\\GUARD1.BIN"]=g;guard(false);
     expect(false);provision(0,1);expect(true);provision(1,2);expect(true);
     files.erase(u"UPDATES\\B\\INITRD.IMG");expect(true); // no mixed root/A initrd
     files.erase(u"UPDATES\\A\\INITRD.IMG");expect(false);

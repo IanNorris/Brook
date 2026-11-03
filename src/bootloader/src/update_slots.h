@@ -9,4 +9,6 @@ bool LoadUpdatePair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
 // Independently verified, explicitly requested SSD-resident recovery pair.
 bool LoadRecoveryPair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
     uint8_t*& kernel, UINTN& kernelBytes, uint8_t*& initrd, UINTN& initrdBytes);
+// Missing, malformed, pending or inconsistent guard records deny normal boot.
+bool RecoveryGuardAllowsNormal(EFI_HANDLE image, EFI_BOOT_SERVICES* services, const char* identity);
 }}

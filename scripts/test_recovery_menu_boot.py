@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 
-def boot(image, firmware, work, recovery, marker, timeout, sata):
+def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -29,7 +29,7 @@ def boot(image, firmware, work, recovery, marker, timeout, sata):
     ]
     if sata:
         command += [
-            '-drive', f'if=none,id=stick,format=raw,snapshot=on,file={image}',
+            '-drive', f'if=none,id=stick,format=raw,snapshot={"on" if sata_snapshot else "off"},file={image}',
             '-device', 'ide-hd,drive=stick,bus=ide.0,bootindex=1',
         ]
     else:
@@ -60,6 +60,8 @@ def boot(image, firmware, work, recovery, marker, timeout, sata):
                     except OSError:
                         pass
                 data = serial.read_bytes() if serial.exists() else b''
+                if forbidden and forbidden.encode() in data:
+                    raise RuntimeError(f'unexpected boot marker {forbidden!r}')
                 if marker.encode() in data:
                     return
                 time.sleep(0.2)

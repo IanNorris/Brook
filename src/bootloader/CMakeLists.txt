@@ -61,4 +61,26 @@ target_link_options(bootloader PRIVATE
     "/entry:EfiMain"
 )
 
+# Separate experimental binary: never replace the generic EFI target by
+# enabling this build option. Deployment requires every firmware-reachable EFI
+# entrypoint to be inventoried and migrated independently.
+option(BROOK_BUILD_GUARDED_BOOTLOADER "Build a mandatory recovery-guard EFI variant" OFF)
+if(BROOK_BUILD_GUARDED_BOOTLOADER)
+    set(BROOK_GUARD_IDENTITY "" CACHE STRING "96 lowercase hex digits: disk GUID, partition GUID, ext2 UUID (on-disk byte order)")
+    string(LENGTH "${BROOK_GUARD_IDENTITY}" BROOK_GUARD_IDENTITY_LENGTH)
+    if(NOT BROOK_GUARD_IDENTITY_LENGTH EQUAL 96 OR BROOK_GUARD_IDENTITY MATCHES "[^0-9a-f]")
+        message(FATAL_ERROR "BROOK_GUARD_IDENTITY must contain exactly 96 lowercase hexadecimal digits")
+    endif()
+    get_target_property(BOOTLOADER_SOURCES bootloader SOURCES)
+    add_executable(bootloader_guarded ${BOOTLOADER_SOURCES})
+    target_include_directories(bootloader_guarded PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}" ${UEFI_INCLUDE_DIRS} ${SHARED_INCLUDE_DIRS} src)
+    target_compile_options(bootloader_guarded PRIVATE
+        -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter)
+    target_compile_definitions(bootloader_guarded PRIVATE BROOK_RECOVERY_GUARD_REQUIRED=1
+        BROOK_GUARD_IDENTITY="${BROOK_GUARD_IDENTITY}")
+    target_link_options(bootloader_guarded PRIVATE "/entry:EfiMain")
+    set_target_properties(bootloader_guarded PROPERTIES OUTPUT_NAME "BROOKGUARD" SUFFIX ".efi")
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)

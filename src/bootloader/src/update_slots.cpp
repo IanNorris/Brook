@@ -4,7 +4,17 @@
 #include "console.h"
 #include "../../shared/update/payload.h"
 #include "../../shared/update/executable.h"
+#include "../../shared/update/recovery_guard.h"
 namespace brook { namespace bootloader {
+bool RecoveryGuardAllowsNormal(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const char* identity) {
+    UINTN an=0,bn=0;
+    auto* a=ReadFile(image,bs,u"RECOVERY\\GUARD0.BIN",&an,BROOK_RECOVERY_GUARD_SIZE);
+    auto* b=ReadFile(image,bs,u"RECOVERY\\GUARD1.BIN",&bn,BROOK_RECOVERY_GUARD_SIZE);
+    const bool allowed=BrookRecoveryGuardAllowsNormal(a,an,b,bn,identity);
+    if(a)FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(a),an);
+    if(b)FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(b),bn);
+    return allowed;
+}
 static bool Pair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const uint8_t* r,
                  uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib,bool recovery=false) {
     bool b=BrookUpdateGet32(r+16)!=0;
