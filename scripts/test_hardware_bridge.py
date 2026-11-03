@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',required=True,type=Path);args=ap.parse_args()
 base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 def run(*cmd):subprocess.run(list(map(str,cmd)),cwd=ROOT,check=True)
-run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_hardware_bridge_guest/main.c','-o',base/'HWTEST.ELF')
+run(os.environ['MUSL_CC'],'-static','-pthread','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_hardware_bridge_guest/main.c','-o',base/'HWTEST.ELF')
 run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--driver','xhci','--usb-read-only','--partition-table','mbr','--display-width','800','--display-height','600')
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'HWTEST.ELF','::BOOT/HWTEST.ELF')
 run('mcopy','-o','-i',str(out/'probe.raw')+'@@1048576',initrd,'::INITRD.IMG')
@@ -83,6 +83,14 @@ try:
  assert 'hello world' in job['stdout']['text'] and '✓' in job['stdout']['text'],job
  assert 'separate stderr' in job['stderr']['text'],job
  replay=rpc.tool('hw_guest_run',arguments);assert replay['exit']==job['exit'] and replay['operation_id']==job['operation_id']
+ bounded=uuid.uuid4().hex
+ job=rpc.tool('hw_guest_run',{'session':session,'request_id':bounded,'argv':['/boot/HWTEST.ELF','budget'],'cwd':'/','task_limit':4,'wait_s':3})
+ deadline=time.monotonic()+30
+ while job.get('state') not in {'completed','failed'} and time.monotonic()<deadline:
+  job=rpc.tool('hw_job',{'session':session,'operation_id':bounded,'wait_s':2})
+ assert job.get('exit',{}).get('code')==0 and 'DEBUG_JOB_BUDGET_PASS' in job['stdout']['text'],job
+ assert job['guest']['task_limit']==4 and job['guest']['peak_reserved_tasks']==4 and job['guest']['denied_births']>=3,job
+ assert job['guest']['reserved_tasks']==0,job
  rpc.tool('hw_guest_run',{'session':session,'request_id':uuid.uuid4().hex,'argv':['/boot/HWTEST.ELF','window'],'cwd':'/','wait_s':0})
  deadline=time.monotonic()+8;reference=None
  while time.monotonic()<deadline:

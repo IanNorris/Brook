@@ -19,7 +19,7 @@ class GuestJobError(RuntimeError):
     pass
 
 
-def request_bytes(argv, cwd='/data/home', env=None, uid=1000):
+def request_bytes(argv, cwd='/data/home', env=None, uid=1000, task_limit=None):
     env = {} if env is None else env
     if not isinstance(argv, list) or not 1 <= len(argv) <= 64:
         raise ValueError('argv must contain 1–64 strings')
@@ -29,6 +29,9 @@ def request_bytes(argv, cwd='/data/home', env=None, uid=1000):
         raise ValueError('env must contain at most 64 overrides')
     if isinstance(uid, bool) or not isinstance(uid, int) or uid not in (0, 1000):
         raise ValueError('uid must be 1000 (desktop) or explicit maintenance uid 0')
+    if task_limit is not None and (isinstance(task_limit, bool) or not isinstance(task_limit, int)
+                                   or not 1 <= task_limit <= 1023):
+        raise ValueError('task_limit must be an integer from 1 to 1023')
     strings = []
     for value in argv + [cwd]:
         if not isinstance(value, str) or '\0' in value:
@@ -44,7 +47,9 @@ def request_bytes(argv, cwd='/data/home', env=None, uid=1000):
         if not isinstance(value, str) or '\0' in value:
             raise ValueError('Environment values must be NUL-free strings')
         strings.append(key + '=' + value)
-    result = b'BJ01' + struct.pack('<III', uid, len(argv), len(env))
+    result = (b'BJ01' if task_limit is None else b'BJ02') + struct.pack('<III', uid, len(argv), len(env))
+    if task_limit is not None:
+        result += struct.pack('<I', task_limit)
     result += b''.join(value.encode('utf-8') + b'\0' for value in strings)
     if len(result) > 32768:
         raise ValueError('Structured request exceeds 32768 bytes')
@@ -154,12 +159,15 @@ class Jobs:
         return token
 
     def submit(self, session, request_id, argv, cwd='/data/home', env=None, uid=1000,
-               wait_s=0, cancel=None):
+               wait_s=0, cancel=None, task_limit=None):
         deadline=time.monotonic()+20
-        payload = request_bytes(argv, cwd, env, uid)
+        payload = request_bytes(argv, cwd, env, uid, task_limit)
         self.validate_wait(wait_s)
         path = self.path(session, request_id)
         data,caps = self.capabilities(session,deadline)
+        if task_limit is not None and (caps.get('task_budget_version') != 1 or
+                                       caps.get('max_task_limit', 0) < task_limit):
+            raise RuntimeError('Guest does not support the requested debug job task limit')
         generation = data['generation']
         boot_id = caps['boot_id']
         fingerprint = hashlib.sha256(generation.encode() + b'\0' + boot_id.encode() + b'\0' + payload).hexdigest()

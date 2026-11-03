@@ -2792,15 +2792,31 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum)
     return static_cast<int>(count);
 }
 
-static uint16_t AllocatePid(bool user)
+static uint16_t AllocatePid(bool user,uint64_t tag=0)
 {
     uint64_t flags=SchedLockAcquire(g_pidLock);
-    uint16_t pid=g_processIds.Allocate(user);
+    uint16_t pid=g_processIds.Allocate(user,tag);
     SchedLockRelease(g_pidLock,flags);
     return pid; // Exhaustion is an allocation failure, never a kernel panic.
 }
 uint16_t SchedulerAllocPid() { return AllocatePid(false); }
 uint16_t SchedulerAllocUserPid() { return AllocatePid(true); }
+uint16_t SchedulerAllocDebugUserPid(uint64_t tag) { return AllocatePid(true,tag); }
+bool SchedulerRegisterDebugJobBudget(uint64_t tag,uint32_t limit)
+{
+    uint64_t flags=SchedLockAcquire(g_pidLock);
+    bool ok=g_processIds.RegisterJob(tag,limit);
+    SchedLockRelease(g_pidLock,flags);return ok;
+}
+bool SchedulerDebugJobBudgetSnapshot(uint64_t tag,DebugJobBudgetSnapshot& out)
+{
+    ProcessIdPool<MAX_PROCESSES>::BudgetSnapshot snapshot{};
+    uint64_t flags=SchedLockAcquire(g_pidLock);
+    bool ok=g_processIds.JobSnapshot(tag,snapshot);
+    SchedLockRelease(g_pidLock,flags);
+    if(ok)out={snapshot.limit,snapshot.reserved,snapshot.peak,snapshot.denied};
+    return ok;
+}
 
 uint32_t SchedulerSetUserBirthClosed(bool closed)
 {

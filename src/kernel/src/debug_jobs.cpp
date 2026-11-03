@@ -15,6 +15,7 @@ namespace {
 // At most 32 MiB retained output + 8 MiB request bodies per boot. IDs remain
 // reserved until reboot so an old commit can never execute a second process.
 constexpr uint32_t MaxJobs=256,MaxActive=8,Retain=65536;
+static_assert(DebugJobMaxTaskLimit<MAX_PROCESSES,"debug budget must fit the PID pool");
 enum class State { Uploading,Queued,Running,Complete,Failed };
 struct Output { char* bytes;uint64_t total,fullWaits;bool eof; };
 struct Job {
@@ -62,6 +63,11 @@ void Status(const Job& job) {
     Send(",\"stderr_eof\":");Send(job.output[1].eof?"true":"false");
     Field("stdout_bytes",job.output[0].total);Field("stderr_bytes",job.output[1].total);
     Field("stdout_full_waits",job.output[0].fullWaits);Field("stderr_full_waits",job.output[1].fullWaits);
+    DebugJobBudgetSnapshot budget{};
+    if(SchedulerDebugJobBudgetSnapshot(job.tag,budget)) {
+        Field("task_limit",budget.limit);Field("reserved_tasks",budget.reserved);
+        Field("peak_reserved_tasks",budget.peak);Field("denied_births",budget.denied);
+    }
     if (job.error) {Send(",\"error\":\"");Send(job.error);Send("\"");}
     Send("}\n");
 }
@@ -111,12 +117,12 @@ void Worker(void* argument) {
     fds[1].flags=fds[2].flags=1;fds[1].statusFlags=fds[2].statusFlags=1;
     fds[1].handle=out;fds[2].handle=err;
     auto* child=ShellCreateDebugJob(request.argc,request.argv,request.cwd,
-                                  request.envc,request.env,request.uid,fds);
+                                  request.envc,request.env,request.uid,fds,job.tag);
     if (!child) {
         PipeBufferDestroy(out);PipeBufferDestroy(err);
         Guard guard;job.error="Executable, cwd or process creation failed";job.state=State::Failed;return;
     }
-    child->parentPid=ProcessCurrent()->tgid;child->debugJobId=job.tag;
+    child->parentPid=ProcessCurrent()->tgid;
     {Guard guard;job.pid=child->pid;job.incarnation=child->incarnation;job.tasks=1;job.groupTasks=1;job.state=State::Running;}
     SchedulerAddProcess(child);
     for (;;) {
@@ -166,7 +172,7 @@ bool DebugJobHandleCommand(const char* command) {
     }
     if(*at || !count) {Error("Invalid fields");return true;}
     if(count==1 && !strcmp(args[0],"caps")) {
-        char boot[33];DebugEpochCopy(boot);Send("{\"boot_id\":\"");Send(boot);Send("\",\"job_api\":2,\"max_request_bytes\":32768,\"max_jobs\":256,\"max_active\":8,\"retained_stream_bytes\":65536,\"dedup_retention\":\"until_reboot\",\"stdin\":\"null\",\"auto_window\":false}\n");return true;
+        char boot[33];DebugEpochCopy(boot);Send("{\"boot_id\":\"");Send(boot);Send("\",\"job_api\":2,\"task_budget_version\":1,\"max_task_limit\":1023,\"max_request_bytes\":32768,\"max_jobs\":256,\"max_active\":8,\"retained_stream_bytes\":65536,\"dedup_retention\":\"until_reboot\",\"stdin\":\"null\",\"auto_window\":false}\n");return true;
     }
     if(count<3 || !DebugEpochMatches(args[count-1])) {Error("Stale guest boot");return true;}
     --count; // All operation reads and writes carry the expected boot epoch.
@@ -214,6 +220,7 @@ bool DebugJobHandleCommand(const char* command) {
         if(job->received!=job->size) {Error("Incomplete request");return true;}
         DebugJobRequest request{};
         if(!DebugJobDecode(job->request,job->size,&request)) {Error("Invalid structured request");return true;}
+        if(!SchedulerRegisterDebugJobBudget(job->tag,request.taskLimit)) {Error("Invalid task budget");return true;}
         auto* out=static_cast<char*>(kmalloc(Retain));auto* err=static_cast<char*>(kmalloc(Retain));
         if(!out || !err) {kfree(out);kfree(err);Error("Output allocation failed");return true;}
         auto* worker=KernelThreadCreate("debug_job",Worker,job);

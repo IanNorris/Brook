@@ -21,6 +21,7 @@ class JobTests(unittest.TestCase):
         self.calls=[];self.payload=bytearray();self.commits=0
         self.state='uploading';self.stdout=b'hello\n';self.stderr=b'warning\n';self.complete=True
         self.fail_commit=False;self.begun=False;self.fail_put=False;self.fail_begin=False
+        self.budget_supported=False
         @contextlib.contextmanager
         def lock(session,timeout=10):yield self.data
         self.client=Jobs(self.root,lambda *args,**kw:self.data,lock,self.guest,write_json)
@@ -38,7 +39,7 @@ class JobTests(unittest.TestCase):
             if len(args)>2 and self.boot=='0'*32:self.boot=args[3]
             return {'boot_id':self.boot}
         action=args[2]
-        if action=='caps':return {'job_api':2,'boot_id':self.boot}
+        if action=='caps':return {'job_api':2,'boot_id':self.boot,**({'task_budget_version':1,'max_task_limit':1023} if self.budget_supported else {})}
         if args[-1]!=self.boot:return {'job_error':'Stale guest boot'}
         args=args[:-1]
         if action=='begin':
@@ -91,6 +92,24 @@ class JobTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'different arguments'):
             self.client.submit(self.session,self.ident,['/bin/other'])
         self.assertEqual(self.commits,1)
+
+    def test_opt_in_task_budget_requires_capability_and_is_deduplicated(self):
+        with self.assertRaisesRegex(RuntimeError,'does not support'):
+            self.submit(task_limit=256)
+        self.assertFalse(self.begun)
+        self.budget_supported=True
+        self.submit(task_limit=256)
+        self.assertEqual(self.payload[:4],b'BJ02')
+        self.assertEqual(struct.unpack('<I',self.payload[16:20])[0],256)
+        self.submit(task_limit=256)
+        with self.assertRaisesRegex(ValueError,'different arguments'):
+            self.submit(task_limit=128)
+        self.assertEqual(self.commits,1)
+
+    def test_invalid_task_budget(self):
+        for limit in (0,1024,-1,True,1.5,'2'):
+            with self.subTest(limit=limit),self.assertRaises(ValueError):
+                request_bytes(['/bin/test'],task_limit=limit)
 
     def test_unknown_commit_is_inspected_without_retry(self):
         self.fail_commit=True

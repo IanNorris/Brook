@@ -485,11 +485,11 @@ def job_status(session,operation_id,stdout_offset=0,stderr_offset=0,output_limit
 
 
 def guest_run(session, command=None, argv=None, cwd="/data/home", env=None, uid=1000,
-              request_id=None, wait_s=0, _cancel=None, **_):
+              request_id=None, wait_s=0, _cancel=None, task_limit=None, **_):
     if argv is not None:
         if command is not None:raise ValueError("Choose structured argv or legacy command, not both")
-        return command_jobs().submit(session,request_id,argv,cwd,env,uid,wait_s,_cancel)
-    if request_id is not None or env is not None or cwd!="/data/home" or uid!=1000 or wait_s!=0:
+        return command_jobs().submit(session,request_id,argv,cwd,env,uid,wait_s,_cancel,task_limit)
+    if request_id is not None or env is not None or cwd!="/data/home" or uid!=1000 or wait_s!=0 or task_limit is not None:
         raise ValueError("Job options require structured argv")
     # This is explicitly the Brook run-command grammar, not host shell code.
     if not isinstance(command, str) or not command.startswith("run "):
@@ -967,7 +967,7 @@ register("hw_stats",hardware.stats,"Memory, processes and compositor intervals f
 register("hw_logs",hardware.logs,"Boot-pinned bounded kernel log lines with retention loss and a next cursor",{**SESSION,"cursor":INT,"limit":INT},["session"],True)
 register("hw_power",hardware.power,"Request, observe, cancel or commit graceful hardware shutdown/reset using a boot-pinned request identity; inspect power capabilities first",{**SESSION,"request_id":STR,"operation":{"type":"string","enum":["shutdown","restart","status","cancel","commit"]}},["session","request_id","operation"])
 register("hw_command",hardware.command,"Run one kernel debug command on the pinned hardware boot; no host shell, no automatic retry after uncertain delivery",{**SESSION,"command":STR},["session","command"])
-register("hw_guest_run",hardware.guest_run,"Structured guest argv with durable request identity and separate output; uses the same guarded jobs as VMs",{**SESSION,"request_id":STR,"argv":{"type":"array","items":STR},"cwd":STR,"env":{"type":"object"},"uid":INT,"wait_s":NUM},["session","request_id","argv"])
+register("hw_guest_run",hardware.guest_run,"Structured guest argv with durable request identity and separate output; uses the same guarded jobs as VMs",{**SESSION,"request_id":STR,"argv":{"type":"array","items":STR},"cwd":STR,"env":{"type":"object"},"uid":INT,"wait_s":NUM,"task_limit":INT},["session","request_id","argv"])
 register("hw_job",hardware.job,"Recover or observe an existing hardware job without replaying it",{**SESSION,"operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
 register("hw_windows",hardware.windows,"Semantic windows on the pinned physical guest; no screenshot or host desktop access",SESSION,["session"],True)
 register("hw_window",hardware.window,"Apply one semantic window action on the pinned physical guest; recover uncertain delivery through hw_ui",{**SESSION,"window":{"type":"object"},"action":{"type":"string","enum":["focus","minimize","maximize","restore","close"]},"request_id":STR,"restore_target":STR,"wait_for":STR,"wait_s":NUM},["session","window","action","request_id"])
@@ -994,7 +994,7 @@ register("vm_stats",stats,"OS memory/process counts and compositor intervals; op
 register("vm_guest_run",guest_run,"Run structured guest argv with separate output and real exit status; requires request_id. Legacy command uses Brook run syntax and returns launch ACK only",{**SESSION,"command":STR,
     "argv":{"type":"array","items":STR,"minItems":1,"maxItems":64},"cwd":STR,
     "env":{"type":"object","additionalProperties":STR,"maxProperties":64},"uid":INT,
-    "request_id":STR,"wait_s":NUM},["session"])
+    "request_id":STR,"wait_s":NUM,"task_limit":INT},["session"])
 register("vm_job",job_status,"Recover/wait for a guest operation by ID; return exit, descendants, separate byte-cursor output and EOF; never repeats execution",{**SESSION,
     "operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
 WINDOW_REF=schema({"window_id":INT,"incarnation":STR,"session_generation":STR,"guest_boot_id":STR},["window_id","incarnation","session_generation","guest_boot_id"])

@@ -690,7 +690,7 @@ static uint64_t LoadInterpreter(Process* proc,const ExecutableImage* prepared=nu
 static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
                        int envc, const char* const* envp,
-                       const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid, const ExecutableImage* owned)
+                       const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid, const ExecutableImage* owned,uint64_t jobTag=0)
 {
     if (!ExecArgumentsFit(argc, argv, envc, envp)) return nullptr;
     auto* proc = static_cast<Process*>(kmalloc(sizeof(Process)));
@@ -705,6 +705,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->uid = proc->euid = proc->suid = launchUid;
     proc->gid = proc->egid = proc->sgid = launchGid;
     proc->leaderIncarnation = 0;
+    proc->debugJobId = jobTag;
 
     // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
     // on the first context switch to this process.
@@ -715,7 +716,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->fxsave.data[24] = 0x80;
     proc->fxsave.data[25] = 0x1F;
 
-    proc->pid = SchedulerAllocUserPid();
+    proc->pid = jobTag ? SchedulerAllocDebugUserPid(jobTag) : SchedulerAllocUserPid();
     if (!proc->pid) {
         FreeProcessStruct(proc);
         return nullptr;
@@ -966,6 +967,12 @@ Process* ProcessCreateExecutable(const ExecutableImage& image, int argc, const c
 {
     return ProcessCreateImpl(image.data,image.size,argc,argv,envc,envp,stdFds,launchUid,launchGid,&image);
 }
+Process* ProcessCreateDebugExecutable(const ExecutableImage& image,int argc,const char* const* argv,
+    int envc,const char* const* envp,const FdEntry* stdFds,uint32_t launchUid,uint32_t launchGid,uint64_t jobTag)
+{
+    if(!jobTag)return nullptr;
+    return ProcessCreateImpl(image.data,image.size,argc,argv,envc,envp,stdFds,launchUid,launchGid,&image,jobTag);
+}
 
 Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
                             uint8_t priority)
@@ -1128,7 +1135,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->leaderIncarnation = 0;   // a fork child is its own leader
 
     // Allocate new PID
-    child->pid = SchedulerAllocUserPid();
+    child->pid = parent->debugJobId ? SchedulerAllocDebugUserPid(parent->debugJobId) : SchedulerAllocUserPid();
     child->parentPid = parent->tgid;
     child->pgid = parent->pgid;      // Inherit process group from parent
     child->sid = parent->sid;         // Inherit session from parent
@@ -1329,7 +1336,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->magic = PROCESS_MAGIC;
     thread->incarnation = NextIncarnation();
     // Allocate TID (threads get unique PIDs but share tgid)
-    thread->pid = SchedulerAllocUserPid();
+    thread->pid = parent->debugJobId ? SchedulerAllocDebugUserPid(parent->debugJobId) : SchedulerAllocUserPid();
     if (thread->pid == 0)
     {
         FreeProcessStruct(thread);

@@ -41,7 +41,7 @@ struct FdEntry;
 // Unpublished process for the debug job supervisor. Structured argv is never
 // parsed as shell source. Merge environment overrides with desktop defaults.
 Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
-    int envc, const char* const* env, uint32_t uid, const FdEntry* standardFds);
+    int envc, const char* const* env, uint32_t uid, const FdEntry* standardFds,uint64_t jobTag);
 
 // Enter the interactive shell.  Reads from the keyboard, executes commands.
 // Never returns (runs until shutdown/reboot).

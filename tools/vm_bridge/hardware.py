@@ -162,8 +162,8 @@ class Hardware:
         if 'logs_error' in reply:raise RuntimeError(reply['logs_error'])
         return {'session':session,'guest_boot_id':data['guest_boot_id'],**reply}
 
-    def guest_run(self,session,request_id,argv,cwd='/data/home',env=None,uid=1000,wait_s=0,_cancel=None,**_):
-        return self.jobs.submit(session,request_id,argv,cwd,env,uid,wait_s,_cancel)
+    def guest_run(self,session,request_id,argv,cwd='/data/home',env=None,uid=1000,wait_s=0,_cancel=None,task_limit=None,**_):
+        return self.jobs.submit(session,request_id,argv,cwd,env,uid,wait_s,_cancel,task_limit)
 
     def job(self,session,operation_id,stdout_offset=0,stderr_offset=0,output_limit=4096,wait_s=0,_cancel=None,**_):
         return self.jobs.status(session,operation_id,stdout_offset,stderr_offset,output_limit,wait_s,_cancel)

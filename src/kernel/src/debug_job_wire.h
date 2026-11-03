@@ -3,24 +3,32 @@
 
 namespace brook {
 inline constexpr uint32_t DebugJobMaxRequest=32768;
+inline constexpr uint32_t DebugJobMaxTaskLimit=1023;
 struct DebugJobRequest {
-    uint32_t uid,argc,envc;
+    uint32_t uid,argc,envc,taskLimit;
     const char* argv[64];
     const char* env[64];
     const char* cwd;
 };
-// BJ01, little-endian uid/argc/envc, then NUL-terminated argv, cwd, env.
+// BJ01: uid/argc/envc; BJ02 adds an opt-in task limit, all little-endian.
+// Both are followed by NUL-terminated argv, cwd, env.
 // No implicit truncation, shell parsing, or pointers into an unbounded buffer.
 inline bool DebugJobDecode(const uint8_t* bytes,uint32_t size,DebugJobRequest* out) {
     if (size<16 || size>DebugJobMaxRequest || bytes[0]!='B' || bytes[1]!='J' ||
-        bytes[2]!='0' || bytes[3]!='1') return false;
+        bytes[2]!='0' || (bytes[3]!='1' && bytes[3]!='2')) return false;
     auto word=[&](uint32_t p) {
         return uint32_t(bytes[p]) | uint32_t(bytes[p+1])<<8 |
                uint32_t(bytes[p+2])<<16 | uint32_t(bytes[p+3])<<24;
     };
     out->uid=word(4);out->argc=word(8);out->envc=word(12);
+    out->taskLimit=0;
+    if(bytes[3]=='2') {
+        if(size<20)return false;
+        out->taskLimit=word(16);
+        if(!out->taskLimit || out->taskLimit>DebugJobMaxTaskLimit)return false;
+    }
     if ((out->uid!=0 && out->uid!=1000) || !out->argc || out->argc>64 || out->envc>64) return false;
-    uint32_t pos=16;
+    uint32_t pos=bytes[3]=='2'?20:16;
     auto string=[&](const char** value) {
         if (pos>=size) return false;
         uint32_t start=pos;while (pos<size && bytes[pos]) ++pos;

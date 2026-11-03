@@ -1810,7 +1810,7 @@ int ShellLaunchCommand(const char* command)
 }
 
 Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
-    int envc, const char* const* env, uint32_t uid, const FdEntry* standardFds)
+    int envc, const char* const* env, uint32_t uid, const FdEntry* standardFds,uint64_t jobTag)
 {
     ShellDispatchGuard dispatch;
     if (argc<1 || argc>64 || envc<0 || envc>64 || argv[0][0]!='/' ||
@@ -1859,8 +1859,8 @@ Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
     if (!result) result=ReadExecutableImage(vnode,&image);
     if (vnode) VfsClose(vnode);
     if (result) return nullptr;
-    Process* proc=ProcessCreateExecutable(image,count,effective,n,launchEnv,standardFds,
-                                         uid,LaunchPrimaryGroup(uid));
+    Process* proc=ProcessCreateDebugExecutable(image,count,effective,n,launchEnv,standardFds,
+                                         uid,LaunchPrimaryGroup(uid),jobTag);
     FreeExecutableImage(&image);
     if (!proc) return nullptr;
     StrCopy(proc->exePath,executable,sizeof(proc->exePath));

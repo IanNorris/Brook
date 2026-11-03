@@ -638,6 +638,9 @@ struct ExecutableImage;
 Process* ProcessCreateExecutable(const ExecutableImage& image,
     int argc, const char* const* argv, int envc, const char* const* envp,
     const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid);
+Process* ProcessCreateDebugExecutable(const ExecutableImage& image,
+    int argc, const char* const* argv, int envc, const char* const* envp,
+    const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid,uint64_t jobTag);
 uint64_t ProcessExecExecutable(Process* proc, const ExecutableImage& image,
     int argc, const char* const* argv, int envc, const char* const* envp,
     uint64_t* outStackPtr);

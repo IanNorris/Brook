@@ -10,6 +10,53 @@ int failures=0;
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"PROCESS_IDS FAIL %d: %s\n",__LINE__,#x);++failures;}}while(0)
 }
 int main() {
+    // Debug job limits count reservations through publication and are only
+    // released with the PID, including failed construction and zombies.
+    brook::ProcessIdPool<8> limited;
+    brook::ProcessIdPool<8>::BudgetSnapshot snapshot{};
+    CHECK(!limited.RegisterJob(0,2));CHECK(!limited.RegisterJob(257,2));
+    CHECK(!limited.RegisterJob(1,8));CHECK(limited.RegisterJob(1,2));
+    CHECK(limited.RegisterJob(1,2));CHECK(!limited.RegisterJob(1,3));
+    CHECK(!limited.Allocate(true,2));CHECK(!limited.Allocate(false,1));
+    auto one=limited.Allocate(true,1),two=limited.Allocate(true,1);
+    CHECK(one&&two);CHECK(limited.Publish(one));CHECK(!limited.Allocate(true,1));
+    CHECK(limited.JobSnapshot(1,snapshot));
+    CHECK(snapshot.limit==2&&snapshot.reserved==2&&snapshot.peak==2&&snapshot.denied==1);
+    CHECK(limited.RegisterJob(2,1));auto other=limited.Allocate(true,2);CHECK(other);
+    auto untagged=limited.Allocate(true);CHECK(untagged);
+    CHECK(limited.Release(two));CHECK(!limited.Release(two));
+    CHECK(limited.JobSnapshot(1,snapshot)&&snapshot.reserved==1);
+    auto replacement=limited.Allocate(true,1);CHECK(replacement);
+    CHECK(limited.Release(one));CHECK(limited.Release(replacement));
+    CHECK(limited.JobSnapshot(1,snapshot)&&snapshot.reserved==0&&snapshot.peak==2);
+    CHECK(limited.Release(other));CHECK(limited.Release(untagged));
+    brook::ProcessIdPool<32> budgetRace;std::mutex budgetMutex;
+    CHECK(budgetRace.RegisterJob(7,8));
+    std::vector<uint16_t> held;std::vector<std::thread> budgetThreads;
+    for(unsigned i=0;i<32;++i)budgetThreads.emplace_back([&]{
+        std::lock_guard<std::mutex> lock(budgetMutex);
+        auto id=budgetRace.Allocate(true,7);if(id)held.push_back(id);
+    });
+    for(auto& thread:budgetThreads)thread.join();
+    CHECK(held.size()==8);
+    brook::ProcessIdPool<32>::BudgetSnapshot raced{};
+    CHECK(budgetRace.JobSnapshot(7,raced)&&raced.reserved==8&&raced.denied==24);
+    for(auto id:held)CHECK(budgetRace.Release(id));
+    CHECK(budgetRace.JobSnapshot(7,raced)&&!raced.reserved&&raced.peak==8);
+    brook::ProcessIdPool<4> recycled;
+    CHECK(recycled.RegisterJob(1,0));CHECK(recycled.RegisterJob(2,1));
+    auto original=recycled.Allocate(true,1);CHECK(original==1);
+    CHECK(recycled.Allocate(false)==2);CHECK(recycled.Allocate(false)==3);
+    CHECK(!recycled.Allocate(true,1));
+    brook::ProcessIdPool<4>::BudgetSnapshot first{},second{};
+    CHECK(recycled.JobSnapshot(1,first)&&first.reserved==1&&first.denied==0);
+    CHECK(recycled.Release(original));CHECK(recycled.Allocate(true,2)==original);
+    CHECK(recycled.JobSnapshot(1,first)&&first.reserved==0);
+    CHECK(recycled.JobSnapshot(2,second)&&second.reserved==1);
+    CHECK(recycled.Release(original));CHECK(!recycled.Release(original));
+    CHECK(recycled.Allocate(true)==original);CHECK(recycled.Release(original));
+    CHECK(recycled.JobSnapshot(2,second)&&second.reserved==0&&second.peak==1);
+
     brook::ProcessIdPool<1024> pool;
     std::set<uint16_t> ids;
     for(unsigned i=1;i<1024;++i){auto id=pool.Allocate(true);CHECK(id==i);CHECK(ids.insert(id).second);}

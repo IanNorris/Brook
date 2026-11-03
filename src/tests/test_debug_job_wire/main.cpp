@@ -11,7 +11,7 @@ int main() {
     }
     brook::DebugJobRequest request{};
     assert(brook::DebugJobDecode(bytes.data(),bytes.size(),&request));
-    assert(request.uid==1000 && request.argc==2 && request.envc==1);
+    assert(request.uid==1000 && request.argc==2 && request.envc==1 && request.taskLimit==0);
     assert(std::string(request.argv[1])=="quotes ' \" ; $()\n");
     assert(std::string(request.cwd)=="/data/home");
     assert(std::string(request.env[0])=="CUSTOM=hello\nworld");
@@ -26,4 +26,11 @@ int main() {
     malformed=bytes;
     malformed[malformed.size()-std::string("CUSTOM=hello\nworld").size()-1]='=';
     assert(!brook::DebugJobDecode(malformed.data(),malformed.size(),&request));
+    auto bounded=bytes;bounded[3]='2';bounded.insert(bounded.begin()+16,{0,1,0,0});
+    assert(brook::DebugJobDecode(bounded.data(),bounded.size(),&request)&&request.taskLimit==256);
+    for(uint32_t size=0;size<bounded.size();++size)
+        assert(!brook::DebugJobDecode(bounded.data(),size,&request));
+    malformed=bounded;malformed[17]=0;assert(!brook::DebugJobDecode(malformed.data(),malformed.size(),&request));
+    malformed=bounded;malformed[17]=4;assert(!brook::DebugJobDecode(malformed.data(),malformed.size(),&request));
+    malformed=bounded;malformed.push_back(0);assert(!brook::DebugJobDecode(malformed.data(),malformed.size(),&request));
 }

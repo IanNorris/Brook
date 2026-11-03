@@ -118,6 +118,10 @@ uint32_t SchedulerReadyCount();
 // Allocate a unique PID.
 uint16_t SchedulerAllocPid(); // Kernel/internal allocation; returns zero on exhaustion.
 uint16_t SchedulerAllocUserPid(); // Holds a birth lease until publish or free.
+uint16_t SchedulerAllocDebugUserPid(uint64_t tag);
+bool SchedulerRegisterDebugJobBudget(uint64_t tag,uint32_t limit);
+struct DebugJobBudgetSnapshot { uint32_t limit,reserved,peak,denied; };
+bool SchedulerDebugJobBudgetSnapshot(uint64_t tag,DebugJobBudgetSnapshot& snapshot);
 // Lifecycle coordinator only: close after app-save/close handling, before the
 // final user-task census. pending==0 alone does NOT imply users have exited.
 uint32_t SchedulerSetUserBirthClosed(bool closed);

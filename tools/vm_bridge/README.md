@@ -444,6 +444,16 @@ identities per boot, permits eight active/uploading jobs, and retains the last
 reused. Worst-case retained output/request storage is about 40 MiB, plus active
 pipes and process overhead. The capability handshake reports these limits.
 
+An optional `task_limit` (1–1023) applies only to a structured job and its
+forked and threaded descendants, including the initial process. It counts PID
+reservations until release, so in-progress births and unreaped children remain
+charged; `exec` and session changes do not reset the count. Job status reports
+`task_limit`, `reserved_tasks`, `peak_reserved_tasks` and `denied_births`; the
+last counts only refusals by this budget. The bridge rejects the request if
+the guest lacks this capability. This is a diagnostic containment tool, not a
+memory limit, runtime deadline or protection from a kernel hang. The same
+option is available on `hw_guest_run`.
+
 The returned `operation_id` is the request ID. Its host record binds the ID
 to session generation, guest boot epoch and an argument fingerprint before any mutation. An
 identical resubmission returns the existing job. Changed arguments or a new
