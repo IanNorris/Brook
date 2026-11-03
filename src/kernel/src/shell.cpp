@@ -136,6 +136,7 @@ static constexpr const char* g_defaultEnvp[] = {
     "TZ=UTC0",
     "NETSURFRES=/nix/store/gmnvrjdanknxjyp3ccjch8jybi126ayy-netsurf-brook-3.11-brook/share/netsurf/",
     "WAYLAND_DISPLAY=wayland-0",
+    "DISPLAY=:0",
     "XDG_RUNTIME_DIR=/tmp",
     "TMPDIR=/tmp",
     "XCURSOR_PATH=/nix/store/aaipci08wnfa7d64lmd5vyn9l2bkihg5-brook-cursor-theme-0.1/share/icons",
