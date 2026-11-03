@@ -18,6 +18,9 @@ bool FatFsFileSourceReadOnly(Vnode* node);
 // rejects all other open handles. The source cannot be reopened, mapped,
 // resized or renamed while leased. No path resolution occurs during I/O.
 int FatFsAcquireImageLease(Vnode* node, uint64_t bytes, FatImageLease** out);
+// Same exclusive retained ownership for one pre-existing 128-byte recovery
+// guard. The image API's sector alignment requirements remain unchanged.
+int FatFsAcquireGuardLease(Vnode* node, FatImageLease** out);
 int FatFsImageRead(FatImageLease* lease, uint64_t offset, void* out, uint32_t bytes);
 int FatFsImageWrite(FatImageLease* lease, uint64_t offset, const void* in, uint32_t bytes);
 int FatFsImageFlush(FatImageLease* lease);

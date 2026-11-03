@@ -1445,14 +1445,14 @@ static const VfsObjectOps g_fatObjectOps={
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}
 
-int FatFsAcquireImageLease(Vnode* node,uint64_t bytes,FatImageLease** out)
+static int FatFsAcquireFixedLease(Vnode* node,uint64_t bytes,FatImageLease** out,bool guard)
 {
     if(!out)return -22;
     *out=nullptr;
     // Do not admit cached snapshots, directories or the read-only streaming
     // source API. The boot caller opens this RW vnode privately, never as an FD.
     if(!node || node->type!=VnodeType::File || node->ops!=&g_fatFileOps ||
-       !node->priv || bytes<512 || (bytes&511) || bytes>0xfffffe00ULL)return -22;
+       !node->priv || (guard ? bytes!=128 : (bytes<512 || (bytes&511) || bytes>0xfffffe00ULL)))return -22;
     auto* lease=static_cast<FatImageLease*>(kmalloc(sizeof(FatImageLease)));
     if(!lease)return -12;
     *lease={};
@@ -1492,6 +1492,11 @@ int FatFsAcquireImageLease(Vnode* node,uint64_t bytes,FatImageLease** out)
     if(error){kfree(lease->linkMap);kfree(lease);}
     return error;
 }
+
+int FatFsAcquireImageLease(Vnode* node,uint64_t bytes,FatImageLease** out)
+{return FatFsAcquireFixedLease(node,bytes,out,false);}
+int FatFsAcquireGuardLease(Vnode* node,FatImageLease** out)
+{return FatFsAcquireFixedLease(node,128,out,true);}
 
 // All mutable FIL cursor state is serialized, but offsets belong to each
 // caller. Limit each FAT critical section to64KiB. FatFs owns the partial-sector

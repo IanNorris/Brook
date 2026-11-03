@@ -39,11 +39,13 @@ independently read back a higher-generation pending record in each slot. It
 authorizes a checker only after both records have been verified; any failure
 after a write attempt is treated as uncertain. Host fault tests model failures,
 partial writes and early persistence at every operation. This is not yet a
-working disk transaction. In particular, the current FAT image lease accepts
-only sector-aligned files, whereas these records are 128 bytes, and a retained
-FatFs file buffer is not independent media readback. A bounded fixed-record
-lease and uncached verification must be implemented and tested before wiring
-this primitive to a checker or deploying it.
+working disk transaction. A dedicated fixed-record FAT lease now accepts an
+existing 128-byte guard while retaining the image API's sector-alignment
+requirements. Host FAT16/FAT32 tests cover sole ownership, aliases, fixed-size
+writes and sticky flush failure. A retained FatFs file buffer is not independent
+media readback; uncached verification and rejection of two distinct records
+sharing an allocation cluster must be implemented and tested before wiring this
+primitive to a checker or deploying it.
 
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`

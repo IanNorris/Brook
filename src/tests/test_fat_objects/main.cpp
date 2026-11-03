@@ -236,6 +236,44 @@ int main(int argc,char** argv){
     assert(allocations.empty() && pages.empty() && !driveAcquired);
     // A writable fixed-size image must have one exclusive, uncached owner.
     assert(FatFsMount(0,&privateMount));mount=static_cast<FatFsMountData*>(privateMount);
+    {
+        Vnode* guard=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_CREATE|VFS_O_WRITE|VFS_O_READWRITE);assert(guard);
+        uint8_t record[128]{};record[0]=17;uint64_t position=0;
+        assert(guard->ops->write(guard,record,sizeof(record),&position)==128);
+        FatImageLease* fixed=nullptr;
+        assert(FatFsAcquireImageLease(guard,128,&fixed)==-22 && !fixed);
+        Vnode* alias=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM);assert(alias);
+        assert(FatFsAcquireGuardLease(guard,&fixed)==-16 && !fixed);closeNode(alias);
+        assert(!FatFsAcquireGuardLease(guard,&fixed) && fixed && guard->ops->deny_mapping);
+        assert(!FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM));
+        FILINFO info{};assert(f_stat("0:/recovery-guard.bin",&info)==FR_OK && info.altname[0]);
+        std::string aliasName="/"+std::string(info.altname);
+        assert(!FatFsOpen(mount,0,aliasName.c_str(),VFS_O_STREAM));
+        assert(FatFsRename(mount,0,"/recovery-guard.bin","/changed.bin")==-16);
+        assert(FatFsUnlink(mount,0,"/recovery-guard.bin")==-16);
+        uint8_t got[128]{};assert(FatFsImageRead(fixed,0,got,sizeof(got))==128 && got[0]==17);
+        record[1]=33;assert(FatFsImageWrite(fixed,0,record,sizeof(record))==128);
+        assert(FatFsImageWrite(fixed,127,record,2)==-22);
+        assert(!FatFsImageFlush(fixed));
+        const pid_t child=fork();assert(child>=0);
+        if(!child) {
+            record[2]=44;assert(FatFsImageWrite(fixed,0,record,sizeof(record))==128);
+            failSync=true;assert(FatFsImageFlush(fixed)==-5);failSync=false;
+            assert(FatFsImageFlush(fixed)==-5 && FatFsReleaseImageLease(fixed)==-5);
+            assert(!FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM));_exit(0);
+        }
+        int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+        assert(!FatFsReleaseImageLease(fixed));closeNode(guard);
+        guard=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_WRITE|VFS_O_READWRITE);assert(guard);
+        assert(FatFsAcquireGuardLease(guard,&fixed)==0);
+        assert(FatFsImageRead(fixed,0,got,sizeof(got))==128 && !std::memcmp(got,record,128));
+        assert(!FatFsReleaseImageLease(fixed));closeNode(guard);
+        for(unsigned size:{127u,129u,512u}) {
+            guard=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_WRITE|VFS_O_READWRITE|VFS_O_TRUNC);assert(guard);
+            uint8_t bytes[512]{};position=0;assert(guard->ops->write(guard,bytes,size,&position)==int(size));
+            assert(FatFsAcquireGuardLease(guard,&fixed)==-22 && !fixed);closeNode(guard);
+        }
+    }
     assert(!FatFsRename(mount,0,"/image.brk","/network-storage-image.img"));
     const char* image="/network-storage-image.img";
     auto* owner=FatFsOpen(mount,0,image,VFS_O_WRITE|VFS_O_READWRITE);assert(owner);
