@@ -50,6 +50,13 @@ static void expect(bool success) {
     else assert(!k&&!i);
     assert(allocations.empty());
 }
+static void expectRecovery(bool success) {
+    uint8_t *k=nullptr,*i=nullptr;UINTN kb=0,ib=0;
+    assert(brook::bootloader::LoadRecoveryPair(nullptr,nullptr,k,kb,i,ib)==success);
+    if(success){assert(k&&i&&kb==4096&&ib==512);brook::bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)k,kb);brook::bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)i,ib);}
+    else assert(!k&&!i);
+    assert(allocations.empty());
+}
 int main() {
     expect(false);provision(0,1);expect(true);provision(1,2);expect(true);
     files.erase(u"UPDATES\\B\\INITRD.IMG");expect(true); // no mixed root/A initrd
@@ -58,6 +65,25 @@ int main() {
     // Correct hash does not excuse an out-of-range ELF program-header table.
     Bytes bad=kernel();((Elf64Header*)bad.data())->phOffset=~uint64_t{0};provision(1,2,bad);expect(true);
     files.erase(u"UPDATES\\A\\KERNEL.ELF");expect(false);
+    expectRecovery(false);
+    provision(0,7);
+    files[u"RECOVERY\\SELECT.BIN"]=files[u"UPDATES\\SELECT0.BIN"];
+    files[u"RECOVERY\\KERNEL.ELF"]=files[u"UPDATES\\A\\KERNEL.ELF"];
+    files[u"RECOVERY\\INITRD.IMG"]=files[u"UPDATES\\A\\INITRD.IMG"];
+    expectRecovery(true);
+    files[u"RECOVERY\\INITRD.IMG"][0]^=1;expectRecovery(false);
+    files[u"RECOVERY\\INITRD.IMG"]=files[u"UPDATES\\A\\INITRD.IMG"];
+    files[u"RECOVERY\\SELECT.BIN"][124]^=1;expectRecovery(false);
+    files[u"RECOVERY\\SELECT.BIN"]=files[u"UPDATES\\SELECT0.BIN"];
+    files.erase(u"RECOVERY\\KERNEL.ELF");expectRecovery(false);
+    files[u"RECOVERY\\KERNEL.ELF"]=files[u"UPDATES\\A\\KERNEL.ELF"];
+    files.erase(u"RECOVERY\\INITRD.IMG");expectRecovery(false);
+    files[u"RECOVERY\\INITRD.IMG"]=files[u"UPDATES\\A\\INITRD.IMG"];
+    files[u"RECOVERY\\INITRD.IMG"].resize(511);expectRecovery(false);
+    files[u"RECOVERY\\INITRD.IMG"]=files[u"UPDATES\\A\\INITRD.IMG"];
+    bad=kernel();((Elf64Header*)bad.data())->phOffset=~uint64_t{0};provision(0,8,bad);
+    files[u"RECOVERY\\SELECT.BIN"]=files[u"UPDATES\\SELECT0.BIN"];
+    files[u"RECOVERY\\KERNEL.ELF"]=bad;expectRecovery(false);
     provision(0,2);provision(1,2);expect(false); // ambiguous selection fails closed
     provision(1,3);expect(true);
     files[u"UPDATES\\B\\KERNEL.ELF"].resize(BROOK_UPDATE_KERNEL_MAX+1);expect(true); // older A only

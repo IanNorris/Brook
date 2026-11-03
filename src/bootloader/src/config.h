@@ -10,6 +10,7 @@ struct BootConfig {
     uint32_t displayWidth;  // preferred GOP bounds; both must be set
     uint32_t displayHeight;
     bool updateSlots;      // opt-in paired A/B maintenance payloads
+    bool recoveryMenu;     // opt-in F5 selection of an SSD recovery pair
     bool debugText;
     bool logMemory;
     bool logInterrupts;

@@ -53,7 +53,37 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     uint8_t* kernelData = nullptr;
     uint8_t* initrdData = nullptr;
     UINTN initrdFileSize = 0;
-    bool updatePair = g_bootConfig.updateSlots && LoadUpdatePair(imageHandle,
+    bool recoveryRequested = false;
+    if (g_bootConfig.recoveryMenu && systemTable->ConIn) {
+        ConsoleSetQuiet(false);
+        ConsolePrintLine(u"Press F5 for Brook recovery; normal boot continues in 2 seconds.");
+        ConsoleSetQuiet(!g_bootConfig.debugText);
+        for (unsigned n=0;n<40;++n) {
+            EFI_INPUT_KEY key{};
+            EFI_STATUS status=systemTable->ConIn->ReadKeyStroke(systemTable->ConIn,&key);
+            if (!EFI_ERROR(status) && key.ScanCode==SCAN_F5) {
+                recoveryRequested=true;break;
+            }
+            systemTable->BootServices->Stall(50000);
+        }
+    }
+    if (recoveryRequested) {
+        ConsoleSetQuiet(false);
+        ConsolePrintLine(u"Recovery selected; verifying payload.");
+        ConsoleSetQuiet(!g_bootConfig.debugText);
+    }
+    bool updatePair = recoveryRequested && LoadRecoveryPair(imageHandle,
+        systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
+    if (updatePair) {
+        ConsoleSetQuiet(false);
+        ConsolePrintLine(u"Brook SSD recovery payload verified");
+        ConsoleSetQuiet(!g_bootConfig.debugText);
+    }
+    if (recoveryRequested && !updatePair) {
+        ConsoleSetQuiet(false);
+        Halt(EFI_NOT_FOUND, u"Recovery payload invalid or missing; restart to boot normally.");
+    }
+    if (!updatePair) updatePair = g_bootConfig.updateSlots && LoadUpdatePair(imageHandle,
         systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
     if (!updatePair) kernelData = ReadFile(imageHandle, systemTable->BootServices,
         g_bootConfig.target, &kernelFileSize);

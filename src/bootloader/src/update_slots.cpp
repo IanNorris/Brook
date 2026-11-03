@@ -6,18 +6,29 @@
 #include "../../shared/update/executable.h"
 namespace brook { namespace bootloader {
 static bool Pair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,const uint8_t* r,
-                 uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib) {
+                 uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib,bool recovery=false) {
     bool b=BrookUpdateGet32(r+16)!=0;
     kb=BrookUpdateGet64(r+24);ib=BrookUpdateGet64(r+32);
-    kernel=ReadFile(image,bs,b?u"UPDATES\\B\\KERNEL.ELF":u"UPDATES\\A\\KERNEL.ELF",&kb,BROOK_UPDATE_KERNEL_MAX,kb);
+    kernel=ReadFile(image,bs,recovery?u"RECOVERY\\KERNEL.ELF":b?u"UPDATES\\B\\KERNEL.ELF":u"UPDATES\\A\\KERNEL.ELF",&kb,BROOK_UPDATE_KERNEL_MAX,kb);
     if(!kernel)return false;
-    initrd=ReadFile(image,bs,b?u"UPDATES\\B\\INITRD.IMG":u"UPDATES\\A\\INITRD.IMG",&ib,BROOK_UPDATE_INITRD_MAX,ib);
+    initrd=ReadFile(image,bs,recovery?u"RECOVERY\\INITRD.IMG":b?u"UPDATES\\B\\INITRD.IMG":u"UPDATES\\A\\INITRD.IMG",&ib,BROOK_UPDATE_INITRD_MAX,ib);
     uint8_t kh[32],ih[32];BrookUpdateHash(kernel,kb,kh);
     if(initrd)BrookUpdateHash(initrd,ib,ih);
     if(initrd&&BrookUpdateEqual(kh,r+40,32)&&BrookUpdateEqual(ih,r+72,32)&&BrookUpdateExecutable(kernel,kb))return true;
     if(initrd)FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(initrd),ib);
     FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernel),kb);
     kernel=nullptr;initrd=nullptr;return false;
+}
+bool LoadRecoveryPair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
+                      uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib) {
+    kernel=nullptr;initrd=nullptr;kb=0;ib=0;
+    UINTN n=0;
+    auto* record=ReadFile(image,bs,u"RECOVERY\\SELECT.BIN",&n,128);
+    if(!record)return false;
+    const bool valid=n==128 && BrookUpdateRecordValid(record);
+    const bool result=valid && Pair(image,bs,record,kernel,kb,initrd,ib,true);
+    FreePages(bs,reinterpret_cast<EFI_PHYSICAL_ADDRESS>(record),n);
+    return result;
 }
 bool LoadUpdatePair(EFI_HANDLE image,EFI_BOOT_SERVICES* bs,
                     uint8_t*& kernel,UINTN& kb,uint8_t*& initrd,UINTN& ib) {

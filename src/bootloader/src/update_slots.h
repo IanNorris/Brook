@@ -6,4 +6,7 @@ namespace brook { namespace bootloader {
 // recovery. Buffers contain the declared bytes, never slot padding.
 bool LoadUpdatePair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
     uint8_t*& kernel, UINTN& kernelBytes, uint8_t*& initrd, UINTN& initrdBytes);
+// Independently verified, explicitly requested SSD-resident recovery pair.
+bool LoadRecoveryPair(EFI_HANDLE image, EFI_BOOT_SERVICES* services,
+    uint8_t*& kernel, UINTN& kernelBytes, uint8_t*& initrd, UINTN& initrdBytes);
 }}
