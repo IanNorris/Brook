@@ -33,6 +33,18 @@ on the Dell. Before any physical deployment, inventory every firmware-reachable
 EFI entrypoint: an older EFI loader can bypass this guard even though old
 kernel generations loaded through the guarded EFI cannot.
 
+An unintegrated transaction primitive now specifies the first repair step:
+validate both clean records and the expected identity, then write, sync and
+independently read back a higher-generation pending record in each slot. It
+authorizes a checker only after both records have been verified; any failure
+after a write attempt is treated as uncertain. Host fault tests model failures,
+partial writes and early persistence at every operation. This is not yet a
+working disk transaction. In particular, the current FAT image lease accepts
+only sector-aligned files, whereas these records are 128 bytes, and a retained
+FatFs file buffer is not independent media readback. A bounded fixed-record
+lease and uncached verification must be implemented and tested before wiring
+this primitive to a checker or deploying it.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.
