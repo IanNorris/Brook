@@ -25,6 +25,7 @@ static constexpr uint8_t FATFS_MAX_DRIVES = FF_VOLUMES;
 static Device* g_fatfsDrives[FATFS_MAX_DRIVES] = {};
 static bool g_driveReadOnly[FATFS_MAX_DRIVES] = {};
 static bool g_driveMounted[FATFS_MAX_DRIVES] = {};
+static bool g_driveExclusive[FATFS_MAX_DRIVES] = {};
 static IrqSpinLock g_driveLock;
 // FatFS ignores some secondary-FAT/FSInfo write results. Report any such
 // failure at every checked sync until drive rebind: successful later I/O
@@ -86,7 +87,7 @@ Device* FatFsBoundDevice(uint8_t pdrv)
     return result;
 }
 
-bool FatFsBindDrive(uint8_t pdrv, Device* dev)
+static bool BindDrive(uint8_t pdrv, Device* dev, bool exclusive)
 {
     bool registered = DeviceIsRegistered(dev);
     const BlockDeviceOps* ops = (registered && KernelPtrLooksCanonical(dev->ops))
@@ -99,38 +100,57 @@ bool FatFsBindDrive(uint8_t pdrv, Device* dev)
         SerialPrintf("FatFS: refusing invalid drive %u dev=%p\n", pdrv, dev);
         return false;
     }
-    const bool readOnly = dev->ops->ioctl && dev->ops->ioctl(dev, DEVICE_IOCTL_READ_ONLY, nullptr) == 1;
+    const int roResult=dev->ops->ioctl ? dev->ops->ioctl(dev,DEVICE_IOCTL_READ_ONLY,nullptr) : -95;
+    if(exclusive && roResult!=0 && roResult!=1)return false;
+    const bool readOnly=roResult==1;
     const auto flags = IrqSpinLockAcquire(&g_driveLock);
-    if (g_fatfsDrives[pdrv] == dev) {
+    if (g_fatfsDrives[pdrv] == dev && !exclusive && !g_driveExclusive[pdrv]) {
         IrqSpinLockRelease(&g_driveLock, flags);
         return true; // Never erase a live drive's error latch.
     }
-    if (g_driveMounted[pdrv]) {
+    if (g_driveMounted[pdrv] || g_driveExclusive[pdrv] ||
+        (exclusive && g_fatfsDrives[pdrv])) {
         IrqSpinLockRelease(&g_driveLock, flags);
         return false;
     }
+    for(uint8_t i=0;i<FATFS_MAX_DRIVES;++i) {
+        if(g_fatfsDrives[i]==dev && (exclusive || g_driveExclusive[i])) {
+            IrqSpinLockRelease(&g_driveLock,flags);return false;
+        }
+    }
     g_fatfsDrives[pdrv] = dev;
     g_driveReadOnly[pdrv] = readOnly;
+    g_driveExclusive[pdrv] = exclusive;
     __atomic_store_n(&g_fatfsWriteErrors[pdrv], 0, __ATOMIC_RELAXED);
     IrqSpinLockRelease(&g_driveLock, flags);
     SerialPrintf("FatFS: drive %u → '%s'\n", pdrv, dev->name);
     return true;
 }
+bool FatFsBindDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,false);}
+bool FatFsBindExclusiveDrive(uint8_t pdrv, Device* dev) {return BindDrive(pdrv,dev,true);}
 
 bool FatFsAcquireDrive(uint8_t pdrv, bool* readOnly)
 {
     if (pdrv >= FATFS_MAX_DRIVES || !readOnly) return false;
     const auto flags = IrqSpinLockAcquire(&g_driveLock);
-    const bool valid = g_fatfsDrives[pdrv] && !g_driveMounted[pdrv];
+    const bool valid = g_fatfsDrives[pdrv] && !g_driveMounted[pdrv] && !g_driveExclusive[pdrv];
     if (valid) { g_driveMounted[pdrv] = true; *readOnly = g_driveReadOnly[pdrv]; }
     IrqSpinLockRelease(&g_driveLock, flags);
     return valid;
+}
+bool FatFsAcquireExclusiveDrive(uint8_t pdrv,Device* expected,bool* readOnly)
+{
+    if(pdrv>=FATFS_MAX_DRIVES || !expected || !readOnly)return false;
+    const auto flags=IrqSpinLockAcquire(&g_driveLock);
+    const bool valid=g_driveExclusive[pdrv] && g_fatfsDrives[pdrv]==expected && !g_driveMounted[pdrv];
+    if(valid) {g_driveMounted[pdrv]=true;*readOnly=g_driveReadOnly[pdrv];}
+    IrqSpinLockRelease(&g_driveLock,flags);return valid;
 }
 void FatFsReleaseDrive(uint8_t pdrv)
 {
     if (pdrv >= FATFS_MAX_DRIVES) return;
     const auto flags = IrqSpinLockAcquire(&g_driveLock);
-    g_driveMounted[pdrv] = false;
+    if(!g_driveExclusive[pdrv])g_driveMounted[pdrv] = false;
     IrqSpinLockRelease(&g_driveLock, flags);
 }
 bool FatFsDriveReadOnly(uint8_t pdrv)
