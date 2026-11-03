@@ -41,10 +41,9 @@ static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU
 
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //
-// QR_PIXELS_PER_MODULE: 3 works well on high-DPI displays.
-//   Use 9 for low-DPI devices like Surface Go where the camera can't resolve
-//   small modules. These are preferred sizes; layout reduces them to fit
-//   complete codes, including quiet borders, on small framebuffers.
+// QR_PIXELS_PER_MODULE is a preferred size; the layout reduces it as needed
+// to fit complete codes, including quiet borders, on small framebuffers.
+// A larger target also makes dense crash reports readable on high-DPI panels.
 //
 // QR_CONTRAST: reduces white from 0xFFFFFF to avoid camera bloom on screens.
 //   2 → white = 0xDDDDDD (slightly off-white, good for most screens)
@@ -52,9 +51,7 @@ static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU
 //
 // QR_INVERT_MODULES: when true, draws white modules on black background.
 //   Can improve readability on some displays (especially OLED).
-static constexpr uint32_t QR_PIXELS_PER_MODULE_HIDPI = 3;
-static constexpr uint32_t QR_PIXELS_PER_MODULE_LODPI = 9;
-static constexpr uint32_t QR_LODPI_THRESHOLD         = 1280; // fb width <= this uses LODPI
+static constexpr uint32_t QR_PIXELS_PER_MODULE = 9;
 static constexpr uint32_t QR_START_X                 = 50;
 static constexpr uint32_t QR_START_Y                 = 50;
 static constexpr int      QR_BORDER_WIDTH            = 2;

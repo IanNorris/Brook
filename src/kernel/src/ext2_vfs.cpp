@@ -1900,7 +1900,7 @@ static uint64_t Ext2InodeSize(const Ext2Inode* ino)
 }
 
 // Read a 4-byte block-pointer from an indirect block, using a per-mount
-// one-slot cache to avoid re-reading the same indirect block during
+// multi-slot cache to avoid re-reading the same indirect block during
 // sequential file scans (BlockMap is called per file-block).
 static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t idx)
 {
@@ -1918,30 +1918,39 @@ static uint32_t Ext2ReadIndPointer(Ext2Mount* mnt, uint32_t indBlock, uint32_t i
         }
     }
 
-    // Cache miss — pick eviction slot (round-robin)
-    uint32_t victim = mnt->indCacheLru % Ext2Mount::IND_CACHE_SLOTS;
-    mnt->indCacheLru++;
+    SpinLockRelease(&mnt->indCacheLock);
+    // Allocation and device I/O may block. Never hold a spinlock while
+    // performing either: other CPUs could spin while the owner waits to run.
+    auto* candidate = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if (!candidate) {
+        uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
+        if (!Ext2DevRead(mnt, off, &entry, 4)) return 0;
+        return entry;
+    }
+    uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
+    if (!Ext2DevRead(mnt, blockOff, candidate, mnt->blockSize)) {
+        kfree(candidate);
+        return 0;
+    }
 
-    if (!mnt->indCacheData[victim]) {
-        mnt->indCacheData[victim] = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-        if (!mnt->indCacheData[victim]) {
+    // Callers hold g_ext2Lock for reading or writing, excluding block
+    // mutation during the unlocked fill. Another reader may have filled it.
+    SpinLockAcquire(&mnt->indCacheLock);
+    for (uint32_t s = 0; s < Ext2Mount::IND_CACHE_SLOTS; ++s) {
+        if (mnt->indCacheBlockNum[s] == indBlock && mnt->indCacheData[s]) {
+            entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[s] + idx * 4);
             SpinLockRelease(&mnt->indCacheLock);
-            // Fall back to direct read
-            uint64_t off = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx * 4;
-            if (!Ext2DevRead(mnt, off, &entry, 4)) return 0;
+            kfree(candidate);
             return entry;
         }
     }
-
-    uint64_t blockOff = static_cast<uint64_t>(indBlock) << mnt->blockShift;
-    if (!Ext2DevRead(mnt, blockOff, mnt->indCacheData[victim], mnt->blockSize)) {
-        mnt->indCacheBlockNum[victim] = 0;
-        SpinLockRelease(&mnt->indCacheLock);
-        return 0;
-    }
+    uint32_t victim = mnt->indCacheLru++ % Ext2Mount::IND_CACHE_SLOTS;
+    uint8_t* evicted = mnt->indCacheData[victim];
+    mnt->indCacheData[victim] = candidate;
     mnt->indCacheBlockNum[victim] = indBlock;
-    entry = *reinterpret_cast<uint32_t*>(mnt->indCacheData[victim] + idx * 4);
+    entry = *reinterpret_cast<uint32_t*>(candidate + idx * 4);
     SpinLockRelease(&mnt->indCacheLock);
+    if (evicted) kfree(evicted);
     return entry;
 }
 

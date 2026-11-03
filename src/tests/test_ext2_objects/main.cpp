@@ -40,10 +40,29 @@ bool writeFailureInjected=false;
 unsigned injectedWriteFailures=0;
 uint64_t shortWriteOffset=~uint64_t{0};
 int readDisk(brook::Device* device,uint64_t offset,void* out,uint64_t bytes){
+    extern brook::SpinLock* indirectCheckLock;
+    extern std::atomic<unsigned> indirectReaders;
+    extern std::atomic<bool> indirectGate;
+    extern bool indirectCheckSingle;
+    extern bool indirectFailRead;
+    if (indirectCheckLock) {
+        if (indirectCheckSingle) {
+            assert(brook::SpinLockTryAcquire(indirectCheckLock));
+            brook::SpinLockRelease(indirectCheckLock);
+        }
+        ++indirectReaders;
+        while (indirectGate.load(std::memory_order_acquire)) std::this_thread::yield();
+        if (indirectFailRead) return -5;
+    }
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
     if(offset>storage.size() || bytes>storage.size()-offset)return -5;
     std::memcpy(out,storage.data()+offset,bytes);return bytes;
 }
+brook::SpinLock* indirectCheckLock=nullptr;
+std::atomic<unsigned> indirectReaders{0};
+std::atomic<bool> indirectGate{false};
+bool indirectCheckSingle=false;
+bool indirectFailRead=false;
 int writeDisk(brook::Device* device,uint64_t offset,const void* in,uint64_t bytes){
     if(offset==failWriteOffset){failWriteOffset=nextFailWriteOffset;nextFailWriteOffset=~uint64_t{0};writeFailureInjected=true;++injectedWriteFailures;return -5;}
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
@@ -134,6 +153,36 @@ int main(int argc,char** argv){
     using namespace brook;
     process.uid=process.euid=process.suid=1000;process.gid=process.egid=process.sgid=1000;legacyTestMask=022;
     Device device{&diskOps,"host-ext2-object-fixture",DeviceType::Block,nullptr};
+    // Exercise the production indirect cache with a blocking device. A cold
+    // miss must never hold its spinlock while invoking the backend.
+    {
+        std::vector<unsigned char> blocks(8*4096);
+        for (unsigned i=1;i<8;++i) {
+            uint32_t value=1000+i;
+            std::memcpy(blocks.data()+i*4096+4,&value,sizeof(value));
+        }
+        Device source{&diskOps,"indirect-cache-test",DeviceType::Block,&blocks};
+        Ext2Mount fixture{};fixture.dev=&source;fixture.blockSize=4096;
+        fixture.blockShift=12;fixture.totalBlocks=8;
+        indirectCheckLock=&fixture.indCacheLock;indirectCheckSingle=true;
+        assert(Ext2ReadIndPointer(&fixture,1,1)==1001);
+        indirectCheckSingle=false;indirectReaders=0;indirectGate=true;
+        uint32_t first=0,second=0;
+        std::thread a([&]{first=Ext2ReadIndPointer(&fixture,2,1);});
+        std::thread b([&]{second=Ext2ReadIndPointer(&fixture,2,1);});
+        while(indirectReaders.load()<2)std::this_thread::yield();
+        indirectGate.store(false,std::memory_order_release);a.join();b.join();
+        assert(first==1002 && second==1002);
+        unsigned copies=0;for(auto block:fixture.indCacheBlockNum)copies+=block==2;
+        assert(copies==1);
+        indirectFailRead=true;assert(Ext2ReadIndPointer(&fixture,3,1)==0);
+        indirectFailRead=false;assert(Ext2ReadIndPointer(&fixture,2,1)==1002);
+        failAllocation=0;assert(Ext2ReadIndPointer(&fixture,3,1)==1003 && failTriggered);
+        failTriggered=false;
+        for(unsigned i=3;i<8;++i)assert(Ext2ReadIndPointer(&fixture,i,1)==1000+i);
+        indirectCheckLock=nullptr;
+        for(auto* buffer:fixture.indCacheData)if(buffer)kfree(buffer);
+    }
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);

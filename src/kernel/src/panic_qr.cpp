@@ -250,12 +250,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicStackDump* stackDump,
                    const PanicCpuList* cpuList)
 {
-    // Auto-select pixels per module based on display resolution
-    // Low-DPI devices (e.g. Surface Go at 1024x768) need larger modules
-    const uint32_t QR_PIXELS_PER_MODULE = (fbWidth <= QR_LODPI_THRESHOLD)
-                                          ? QR_PIXELS_PER_MODULE_LODPI
-                                          : QR_PIXELS_PER_MODULE_HIDPI;
-    SerialPrintf("PANIC QR: %ux%u fb, using %u px/module\n",
+    SerialPrintf("PANIC QR: %ux%u fb, preferred %u px/module\n",
                  fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
 
     // Step 1: Build binary TLV payload (no header yet — added per page)
