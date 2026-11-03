@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools/vm_bridge'))
 from hardware import Hardware
 from prepare_ssd_recovery_pair import PAYLOAD_ID
+from test_recovery_menu_boot import boot as menu_boot
 
 START = 133120 * 512
 LENGTH = 126976 * 512
@@ -49,6 +50,8 @@ def main():
     parser.add_argument('--firmware', required=True, type=Path)
     parser.add_argument('--repair', action='store_true',
                         help='Corrupt and repair a temporary image copy, then verify it on the host')
+    parser.add_argument('--normal-marker', default='AUDIO_CONTROL_FAIL',
+                        help='Serial marker unique to the fixture normal payload after repair')
     args = parser.parse_args()
     image = args.image.resolve(strict=True)
     firmware = args.firmware.resolve(strict=True)
@@ -199,6 +202,10 @@ def main():
             if outside_partition(image) != original_outside:
                 raise RuntimeError('Recovery unexpectedly changed bytes outside partition 2')
             print('RECOVERY_SATA_REPAIR_HOST_VERIFY_PASS', flush=True)
+            normal = work / 'normal-after-repair'
+            normal.mkdir()
+            menu_boot(image, firmware, normal, False, args.normal_marker, 60, True)
+            print('RECOVERY_SATA_NORMAL_BOOT_PASS', flush=True)
 
 
 if __name__ == '__main__':
