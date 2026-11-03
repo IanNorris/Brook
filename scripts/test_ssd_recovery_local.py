@@ -58,6 +58,10 @@ def main():
                    help='Configure the disposable guard-only kernel reservation fixture')
     p.add_argument('--guard-poison-boot', action='store_true',
                    help='Attach a disposable virtio disk requesting an overmount of /boot')
+    p.add_argument('--guard-real-checker', action='store_true',
+                   help='Run the kernel-started, pinned FAT checker on the reserved ESP')
+    p.add_argument('--guard-bad-checker', action='store_true',
+                   help='Corrupt one byte of the private checker to test digest rejection')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
@@ -69,8 +73,14 @@ def main():
         p.error('--fat-crosslink requires --fat-checker')
     if a.guard_open_probe and (a.dirty or a.missing_checker or a.fat_checker or a.prepared_pair):
         p.error('guard open probe is an independent scenario')
-    if a.guard_reservation and (not a.guard_open_probe or not a.kernel_build):
-        p.error('guard reservation requires a guard-only kernel and guard-open probe')
+    if a.guard_real_checker and (not a.fat_checker or a.guard_open_probe):
+        p.error('guard real checker requires --fat-checker and excludes the open probe')
+    if a.guard_bad_checker and (not a.guard_real_checker or a.fat_crosslink):
+        p.error('bad checker test requires a real checker and excludes crosslink')
+    if a.guard_reservation and (not (a.guard_open_probe or a.guard_real_checker) or not a.kernel_build):
+        p.error('guard reservation requires a guard-only kernel and a checker or open probe')
+    if a.guard_real_checker and not a.guard_reservation:
+        p.error('guard real checker requires a guard reservation')
     if a.guard_poison_boot and a.guard_reservation != 'valid':
         p.error('guard poison disk requires the valid reservation fixture')
     image = a.image.resolve(strict=True)
@@ -169,9 +179,15 @@ def main():
                                    (a.supervisor, '::/BOOT/RECCHECK.ELF')):
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(source), target], check=True)
             if a.fat_checker:
-                subprocess.run(['mcopy', '-o', '-i', str(initrd), str(a.fat_checker), '::/BOOT/FATFSCK.ELF'], check=True)
+                checker = a.fat_checker
+                if a.guard_bad_checker:
+                    checker = work / 'bad-checker.elf'
+                    data = bytearray(a.fat_checker.read_bytes()); data[-1] ^= 1
+                    checker.write_bytes(data)
+                subprocess.run(['mcopy', '-o', '-i', str(initrd), str(checker), '::/BOOT/FATFSCK.ELF'], check=True)
                 copied=subprocess.check_output(['mtype','-i',str(initrd),'::/BOOT/FATFSCK.ELF'])
-                if len(copied)!=fat_info['bytes'] or hashlib.sha256(copied).hexdigest()!=fat_info['sha256']:
+                expected_hash = sha(checker) if a.guard_bad_checker else fat_info['sha256']
+                if len(copied)!=fat_info['bytes'] or hashlib.sha256(copied).hexdigest()!=expected_hash:
                     raise RuntimeError('guest FAT checker readback mismatch')
         selection = work / 'SELECT.BIN'; selection.write_bytes(record(1, 0, kernel, initrd.read_bytes()))
         if a.prepared_pair and selection.read_bytes() != (pair / 'SELECT.BIN').read_bytes():
@@ -260,16 +276,22 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = ('GUARD_OPEN_PROBE_PASS' if a.guard_open_probe else
+                    expected = ('GUARD_CHECK_INCOMPLETE load=-8' if a.guard_bad_checker else
+                                ('GUARD_CHECK_RESULT exit=1' if a.fat_crosslink else 'GUARD_CHECK_RESULT exit=0') if a.guard_real_checker else
+                                'GUARD_OPEN_PROBE_PASS' if a.guard_open_probe else
                                 ('FAT_CHECK_RESULT exit=1' if a.fat_crosslink else 'FAT_CHECK_RESULT exit=0') if a.fat_checker else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=8;' if a.prepared_pair else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=127;' if a.missing_checker else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
                     complete_lines = [line.rstrip('\r') for line in text.split('\n')[:-1]]
+                    if a.guard_real_checker and any(
+                            line.startswith(('GUARD_CHECK_RESULT ', 'GUARD_CHECK_INCOMPLETE ')) and line != expected
+                            for line in complete_lines):
+                        raise RuntimeError('unexpected guard checker result: ' + text[-3000:])
                     if a.guard_open_probe and 'GUARD_OPEN_PROBE_FAILED' in text:
                         raise RuntimeError('guest guard open probe failed: ' + text[-3000:])
-                    if a.fat_checker and any(
+                    if a.fat_checker and not a.guard_real_checker and any(
                             line.startswith(('FAT_CHECK_FORK_FAILED', 'FAT_CHECK_EXEC_FAILED',
                                              'FAT_CHECK_WAIT_FAILED', 'FAT_CHECK_INTERRUPTED')) or
                             (line.startswith('FAT_CHECK_RESULT exit=') and line != expected)
@@ -277,6 +299,8 @@ def main():
                         raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
                     matched = expected in complete_lines if a.fat_checker else expected in text
                     if selected and matched:
+                        if a.guard_bad_checker and 'GUARD_CHECK_RESULT' in text:
+                            raise RuntimeError('bad checker unexpectedly produced a result')
                         if a.guard_reservation:
                             reservation = 'SSD_GUARD_RESERVATION_READY' if a.guard_reservation == 'valid' else 'SSD_GUARD_RESERVATION_FAILED'
                             if reservation not in text or 'ahci system: verified GPT entry' in text or 'writable desktop: ready' in text:
@@ -331,7 +355,8 @@ def main():
             raise RuntimeError('read-only check changed the disposable disk')
         if poison and sha(poison) != poison_before:
             raise RuntimeError('guard boot changed the overmount fixture')
-        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation == 'wrong-guid' else
+        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation == 'wrong-guid' or a.guard_bad_checker else
+              'RECOVERY_GUEST_GUARD_CHECK_PASS' if a.guard_real_checker else
               'RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else
               'RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else
               'RECOVERY_GUEST_FAT_CHECK_PASS' if a.fat_checker else

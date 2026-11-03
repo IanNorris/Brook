@@ -89,9 +89,19 @@ be combined with installer or writable-test hooks. On disposable QEMU SATA
 fixtures, the expected identity reserved successfully and an incorrect ESP
 GUID was rejected; full disk hashes were unchanged. A second virtio disk
 requesting a `/boot` mount did not replace the RAM initrd or change either
-disk. The mode still does not launch an authorized checker or repair a disk,
-and matching physical targets are not kernel-restricted to QEMU. It is not
-installed on the Dell.
+disk. The mode cannot repair a disk, and matching physical targets are not
+kernel-restricted to QEMU. It is not installed on the Dell.
+
+The dedicated kernel now starts a checker controller instead of the ordinary
+boot script. It hashes the exact loaded static FAT checker against a pinned
+digest, rejects an interpreter, binds the read-only session before scheduling
+the checker, and reports its kernel-observed exit after revoking access. The
+debug channel is disabled during this boot. On disposable QEMU disks the
+checker returned 0 for a clean ESP and 1 for crosslinked files; a modified
+checker was rejected, with disk hashes unchanged. This is diagnostic only:
+it does not mount the ESP, repair ext2, authorize a normal boot, or establish
+physical power-loss safety. If a checker times out and cannot be reaped, the
+session stays revoked and recovery remains incomplete.
 
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and

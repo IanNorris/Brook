@@ -38,6 +38,9 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "virtio_blk.h"
 #include "gpt.h"
 #include "ahci_system_volume.h"
+#if defined(BROOK_SSD_GUARD_CHECK)
+#include "guard_checker_runner.h"
+#endif
 #include "syscall.h"
 #include "process.h"
 #include "scheduler.h"
@@ -1012,8 +1015,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::LifecycleChannelStart();
 
         // Start the NIC polling thread now that the scheduler is initialised.
+#if !defined(BROOK_SSD_GUARD_CHECK)
         if (brook::NetGetIf())
             brook::NetStartPollThread();
+#endif
 
         // BRO-179: start the PMM quarantine drain thread (scheduler is up).
         // It returns freed frames to the allocator only after an all-CPU TLB
@@ -1079,7 +1084,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Execute the boot script if present.
         // This may call ProfilerStart() via the "profile" command,
         // so the profiler thread must already exist.
+#if defined(BROOK_SSD_GUARD_CHECK)
+        if(!brook::GuardCheckerStart(guardEsp))KernelPanic("guard checker controller could not start");
+#else
         brook::ShellExecScript("/boot/INIT.RC");
+#endif
 
         // Start the compositor kernel thread (blits VFBs to physical FB).
         brook::CompositorStartThread();
@@ -1088,7 +1097,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::AudioMixerThreadStart();
 
         // Start debug channel kernel thread (connects asynchronously).
+#if !defined(BROOK_SSD_GUARD_CHECK)
         brook::DebugChannelInit();
+#endif
 
         // Activate APs now — BSP is about to enter the scheduler.
         brook::SmpActivateAPs();
