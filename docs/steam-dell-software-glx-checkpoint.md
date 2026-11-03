@@ -254,8 +254,23 @@ the freeze. In the last eight live seconds completed-process and address-space
 counts increased while cleanup queues remained empty, and compositor p95 stayed
 at 18 ms. That makes a gradual buildup in those observed queues or compositor
 intervals less apparent, but does not rule out a sudden lockup. The exact-kernel
-panic scanner is running; physical screen and
-possible panic evidence are pending. Raw diagnostic samples remain private.
+panic scanner was pinned to the deployed kernel. The user confirmed the hang
+and triggered a manual panic; the resulting capture shows three other CPUs
+spinning while acquiring the indirect-block cache lock. It does not identify
+the lock owner or prove a common mount. The cache previously held that lock
+across allocation and potentially blocking disk reads, a credible starvation
+mechanism. A candidate moves those operations outside the spinlock; a host
+regression gates concurrent misses and checks failures and eviction. Physical
+Steam validation remains outstanding. Raw diagnostic samples remain private.
+
+### Emulated USB network comparison
+
+A separate four-CPU software QEMU run used the same kernel and timer fallback,
+but replaced virtio networking with emulated xHCI and USB ECM. A fresh Valve
+client reached the QR sign-in screen and remained reachable through the
+120-second capture. This exercises Brook's USB network path but not the Dell's
+Intel xHCI, Ethernet adapter or physical SSD. After a checked guest sync and
+QEMU exit its disposable disk copies were removed.
 
 ### Timer-fallback comparison
 

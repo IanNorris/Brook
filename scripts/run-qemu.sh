@@ -221,6 +221,7 @@ fi
 #   BROOK_SKIP_UPDATE_DISK=1   — skip syncing files to disk
 #   BROOK_USB_KBD=1            — attach USB keyboard (off by default; PS/2 is primary)
 #   BROOK_USB_MOUSE=1          — attach USB mouse (off by default; virtio-tablet is primary)
+#   BROOK_NET_DEVICE=usb-ecm    — use QEMU USB Ethernet instead of virtio-net
 DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
 if [ ! -f "${DISK_IMG}" ]; then
     echo "Creating persistent disk image..."
@@ -608,6 +609,12 @@ fi
 if [ "${BROOK_USB_MOUSE:-0}" = "1" ]; then
     USB_INPUT_OPTS+=(-device usb-mouse,bus=xhci.0)
 fi
+NET_DEVICE_OPTS=()
+case "${BROOK_NET_DEVICE:-virtio}" in
+    virtio) NET_DEVICE_OPTS=(-device "virtio-net-pci,netdev=net0${NIC_MAC_ARG}") ;;
+    usb-ecm) NET_DEVICE_OPTS=(-device "usb-net,bus=xhci.0,netdev=net0${NIC_MAC_ARG}") ;;
+    *) echo "BROOK_NET_DEVICE must be virtio or usb-ecm" >&2; exit 2 ;;
+esac
 
 QEMU_COMMAND=("${QEMU_BIN:-qemu-system-x86_64}")
 if [ "${VM_BRIDGE}" = "1" ]; then
@@ -646,8 +653,8 @@ esac
     "${POINTER_INPUT_OPTS[@]}" \
     ${GPU_OPTS} \
     -device virtio-rng-pci \
-    -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \
     -device qemu-xhci,id=xhci \
+    "${NET_DEVICE_OPTS[@]}" \
     "${USB_INPUT_OPTS[@]}" \
     -drive if=none,id=usbdisk,file="${USB_TEST_IMG}",format=raw,file.locking=off \
     -device usb-storage,bus=xhci.0,drive=usbdisk \

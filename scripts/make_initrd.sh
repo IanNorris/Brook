@@ -114,6 +114,20 @@ echo "0-7" | mcopy -i "${INITRD_IMG}.tmp" - "::SYS/DEVICES/SYSTEM/CPU/ONLINE"
 # autolaunch. A deterministic ID is sufficient for Brook's single-VM
 # development images and avoids toolkit startup stalls.
 mmd -i "${INITRD_IMG}.tmp" "::ETC" 2>/dev/null || true
+# Opt-in boot markers for isolated hardware-driver experiments. These are
+# existence-based flags, never a way to replace existing initrd files.
+if [ -n "${BROOK_INITRD_MARKERS:-}" ]; then
+    IFS=',' read -r -a markers <<< "${BROOK_INITRD_MARKERS}"
+    for marker in "${markers[@]}"; do
+        if [[ ! "${marker}" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "Invalid initrd marker: ${marker}" >&2; exit 1
+        fi
+        if mdir -i "${INITRD_IMG}.tmp" "::ETC/${marker}" >/dev/null 2>&1; then
+            echo "Initrd marker already exists: ${marker}" >&2; exit 1
+        fi
+        printf '1\n' | mcopy -i "${INITRD_IMG}.tmp" - "::ETC/${marker}"
+    done
+fi
 # Resolver configuration must be a real retained file: container runtimes use
 # O_PATH and bind mounts, which cannot retain syscall-only synthetic contents.
 # The kernel replaces this RAM-backed seed after DHCP/static configuration.
