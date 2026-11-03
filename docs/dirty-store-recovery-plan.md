@@ -100,7 +100,9 @@ On disposable QEMU SATA images, both a clean filesystem and deliberately
 damaged allocation bitmap produced the expected result with no USB controller
 or network; the entire disk hash was unchanged in each test. Console geometry
 was adjusted so the result remains visible after display scaling. These tests
-do not establish physical Dell behavior. This prototype has not been installed
+also verify that a missing checker is reported as an incomplete check and
+leaves the complete disk unchanged. They do not establish physical Dell
+behavior. This prototype has not been installed
 on the Dell, and automatic repair and cross-boot recovery admission are not yet
 implemented.
 

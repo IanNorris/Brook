@@ -36,6 +36,8 @@ def main():
     p.add_argument('--firmware', required=True, type=Path)
     p.add_argument('--dirty', action='store_true',
                    help='Introduce a bitmap inconsistency only in the private fixture copy')
+    p.add_argument('--missing-checker', action='store_true',
+                   help='Remove the checker from the private initrd to test failure handling')
     p.add_argument('--frame-output', type=Path,
                    help='Optionally save the final QEMU frame as a new PPM file')
     p.add_argument('--serial-output', type=Path,
@@ -43,6 +45,8 @@ def main():
     p.add_argument('--kernel-build', type=Path,
                    help='Optionally stage a private installer kernel and matching ABI 64 modules')
     a = p.parse_args()
+    if a.dirty and a.missing_checker:
+        p.error('choose one failure scenario')
     image = a.image.resolve(strict=True)
     if not image.is_file() or image.stat().st_size != 128 * 1024 * 1024:
         p.error('expected the 128 MiB disposable SATA recovery fixture')
@@ -73,6 +77,8 @@ def main():
         media = str(disk) + '@@1048576'
         initrd = work / 'initrd.img'
         subprocess.run(['mcopy', '-i', media, '::/RECOVERY/INITRD.IMG', str(initrd)], check=True)
+        if a.missing_checker:
+            subprocess.run(['mdel', '-i', str(initrd), '::/BOOT/E2FSCK.ELF'], check=True)
         kernel = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/KERNEL.ELF'])
         if a.kernel_build:
             build = a.kernel_build.resolve(strict=True)
@@ -140,10 +146,11 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = ('RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
+                    expected = ('RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=127;' if a.missing_checker else
+                                'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
                     if selected and expected in text:
-                        if 'Pass 5' not in text:
+                        if not a.missing_checker and 'Pass 5' not in text:
                             raise RuntimeError('check did not report all filesystem passes')
                         if a.frame_output:
                             frame = a.frame_output.absolute()
@@ -163,8 +170,9 @@ def main():
                         break
                     complete_lines = text.split('\n')[:-1]
                     if any((line.startswith('RECOVERY_READONLY_CHECK_INCOMPLETE:') and
-                            not (a.dirty and 'e2fsck exit=4;' in line)) or
-                           line.startswith('RECOVERY_READONLY_CHECK_EXEC_FAILED') for line in complete_lines):
+                            expected not in line) or
+                           (line.startswith('RECOVERY_READONLY_CHECK_EXEC_FAILED') and
+                            not a.missing_checker) for line in complete_lines):
                         raise RuntimeError('local checker failed: ' + text[-3000:])
                     time.sleep(.2)
                 else:
@@ -177,7 +185,8 @@ def main():
                         output.write(serial.read_bytes())
         if sha(disk) != before:
             raise RuntimeError('read-only check changed the disposable disk')
-        print('RECOVERY_LOCAL_NO_NETWORK_DIRTY_READONLY_PASS' if a.dirty else
+        print('RECOVERY_LOCAL_NO_NETWORK_MISSING_CHECKER_PASS' if a.missing_checker else
+              'RECOVERY_LOCAL_NO_NETWORK_DIRTY_READONLY_PASS' if a.dirty else
               'RECOVERY_LOCAL_NO_NETWORK_READONLY_PASS')
 
 
