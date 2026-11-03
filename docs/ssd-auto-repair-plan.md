@@ -218,8 +218,11 @@ Host tests exercise malformed paths, partition metadata, read failures and a
 media change after reading. A bounded reader sequences both GPT copies and
 the ext2 superblock through a caller-provided read interface. These helpers
 perform no firmware I/O, are not part of the boot decision, and cannot grant
-repair authority. Firmware handle selection, alignment and media-change
-handling, independent identity binding, and real automatic dispatch remain.
+repair authority. A bounded, read-only Block I/O adapter now compiles against
+the actual UEFI ABI; host fakes exercise alignment, changed media, errors and
+the complete GPT-to-superblock sequence. It is not invoked at boot. Firmware
+handle selection, real firmware I/O validation, independent identity binding,
+and automatic dispatch remain.
 
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`

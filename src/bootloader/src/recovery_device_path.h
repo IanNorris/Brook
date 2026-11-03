@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-namespace brook::bootloader {
+namespace brook { namespace bootloader {
 struct RecoveryEspPath {
     uint32_t partitionNumber = 0;
     uint64_t first = 0, sectors = 0;
@@ -53,4 +53,4 @@ inline bool RecoveryParentPathMatches(const uint8_t* esp,uint32_t espBytes,
     const uint32_t n=parsed.parentPrefixBytes;
     return parent[n]==0x7f && parent[n+1]==0xff && parent[n+2]==4 && parent[n+3]==0;
 }
-} // namespace brook::bootloader
+}} // namespace brook::bootloader

@@ -2,6 +2,7 @@
 #include "../../bootloader/src/recovery_disk_gate.h"
 #include "../../bootloader/src/recovery_device_path.h"
 #include "../../bootloader/src/recovery_disk_read.h"
+#include "../../bootloader/src/recovery_firmware_reader.h"
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -21,6 +22,21 @@ static void header(uint8_t* h, bool backup, uint32_t crc) {
 }
 static void partition(uint8_t* e,uint8_t id,uint64_t first,uint64_t last) {
     e[0]=0xaf;e[16]=id;put64(e+32,first);put64(e+40,last);
+}
+struct MockMedia { bool MediaPresent=true,LogicalPartition=false; uint32_t MediaId=17,BlockSize=512,IoAlign=16; uint64_t LastBlock=99999; };
+struct MockBlock {
+    MockMedia* Media;uint64_t (*ReadBlocks)(MockBlock*,uint32_t,uint64_t,uint64_t,void*);
+    bool fail=false,change=false;unsigned calls=0;
+    const uint8_t* mapped[6]{};
+};
+static uint64_t mockRead(MockBlock* b,uint32_t id,uint64_t lba,uint64_t size,void* out) {
+    ++b->calls;if(b->fail || id!=b->Media->MediaId)return 1;
+    if(b->mapped[0]) {
+        const unsigned index=lba==0?0:lba==1?1:lba==99999?2:lba==2?3:lba==99967?4:lba==4098?5:6;
+        if(index==6 || size!=(index==3 || index==4?16384:index==5?1024:512))return 1;
+        std::memcpy(out,b->mapped[index],size);
+    } else std::memset(out,int(lba&255),size);
+    if(b->change)++b->Media->MediaId;return 0;
 }
 static int CheckImage(const char* path) {
     std::ifstream f(path,std::ios::binary);if(!f)return 1;
@@ -44,6 +60,31 @@ int main(int argc,char** argv) {
     if(argc==2)return CheckImage(argv[1]);
     if(argc!=1)return 1;
     CHECK(StrictCrc32(reinterpret_cast<const uint8_t*>("123456789"),9)==0xcbf43926u);
+    {
+        using namespace brook::bootloader;
+        MockMedia media{};MockBlock block{&media,mockRead};alignas(16) uint8_t bounce[1024]{},out[1024]{};
+        RecoveryFirmwareReader<MockBlock> reader(&block,bounce,sizeof(bounce));
+        CHECK(reader.Stable() && reader.Sectors()==100000 && reader.Read(5,2,out));
+        CHECK(block.calls==1 && out[0]==5 && out[1023]==5);
+        CHECK(!reader.Read(99999,2,out) && !reader.Read(0,0,out) && !reader.Read(0,3,out));
+        CHECK(!reader.Read(1,1,bounce) && block.calls==1);
+        std::memset(out,0x6d,sizeof(out));
+        block.fail=true;CHECK(!reader.Read(1,1,out) && out[0]==0x6d);block.fail=false;
+        block.change=true;CHECK(!reader.Read(1,1,out) && out[0]==0x6d);block.change=false;
+        CHECK(!reader.Stable());
+        media.MediaId=17;media.IoAlign=3;RecoveryFirmwareReader<MockBlock> badAlign(&block,bounce,sizeof(bounce));
+        CHECK(!badAlign.Stable());media.IoAlign=16;
+        media.LogicalPartition=true;RecoveryFirmwareReader<MockBlock> partitionReader(&block,bounce,sizeof(bounce));
+        CHECK(!partitionReader.Stable());media.LogicalPartition=false;
+        RecoveryFirmwareReader<MockBlock> unaligned(&block,bounce+1,sizeof(bounce)-1);
+        CHECK(!unaligned.Stable());
+        media.IoAlign=0;RecoveryFirmwareReader<MockBlock> alignZero(&block,bounce,sizeof(bounce));CHECK(alignZero.Stable());
+        media.IoAlign=1;RecoveryFirmwareReader<MockBlock> alignOne(&block,bounce,sizeof(bounce));CHECK(alignOne.Stable());
+        alignas(4096) uint8_t page[4096]{};media.IoAlign=4096;
+        RecoveryFirmwareReader<MockBlock> alignPage(&block,page,sizeof(page));CHECK(alignPage.Stable());
+        media.LastBlock--;CHECK(!alignPage.Stable());media.LastBlock++;
+        MockBlock noRead{&media,nullptr};RecoveryFirmwareReader<MockBlock> missingRead(&noRead,page,sizeof(page));CHECK(!missingRead.Stable());
+    }
     uint8_t mbr[512]={};mbr[510]=0x55;mbr[511]=0xaa;mbr[446+4]=0xee;put32(mbr+446+8,1);put32(mbr+446+12,99999);
     CHECK(StrictGptProtectiveMbr(mbr,100000)==StrictMbrResult::Protective);
     mbr[462+4]=0x83;CHECK(StrictGptProtectiveMbr(mbr,100000)==StrictMbrResult::Hybrid);mbr[462+4]=0;
@@ -104,6 +145,18 @@ int main(int argc,char** argv) {
         put32(sb+40,64);sb[56]=0x53;sb[57]=0xef;sb[58]=1;put32(sb+76,1);
         put32(sb+84,11);sb[88]=128;put32(sb+96,2);put32(sb+100,3);sb[104]=3;
         CHECK(RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));
+        {
+            MockMedia media{};MockBlock block{&media,mockRead};
+            const uint8_t* sources[]={protective,ph,bh,ae,be,sb};
+            for(unsigned i=0;i<6;++i)block.mapped[i]=sources[i];
+            alignas(16) uint8_t bounce[16384]{},first[16384]{},last[16384]{};
+            RecoveryFirmwareReader<MockBlock> firmware(&block,bounce,sizeof(bounce));
+            CHECK(RecoveryReadDiskState(firmware,firmware.Sectors(),id,first,last,sizeof(first))==RecoveryDiskState::Clean);
+            sb[58]=0;
+            CHECK(RecoveryReadDiskState(firmware,firmware.Sectors(),id,first,last,sizeof(first))==RecoveryDiskState::NeedsCheck);
+            sb[58]=1;block.change=true;
+            CHECK(RecoveryReadDiskState(firmware,firmware.Sectors(),id,first,last,sizeof(first))==RecoveryDiskState::Invalid);
+        }
         struct FakeReader {
             uint8_t *mbr,*ph,*bh,*ae,*be,*sb;unsigned calls=0,failAt=0,stableCalls=0;bool stable=true,changeAfterRead=false;
             bool Stable(){++stableCalls;return stable && !(changeAfterRead && stableCalls>1);}

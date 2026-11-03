@@ -3,7 +3,7 @@
 #include "../../kernel/src/strict_gpt_inventory.h"
 #include "../../kernel/src/large_ext2_geometry.h"
 
-namespace brook::bootloader {
+namespace brook { namespace bootloader {
 
 // Pure validation only: the caller must read both GPT copies and the data
 // superblock from the physical parent of the firmware-loaded ESP. A successful
@@ -68,4 +68,4 @@ inline bool RecoveryDataHeaderIsClean(const uint8_t* superblock,uint32_t size,
         ==LargeExt2HeaderState::Clean;
 }
 
-} // namespace brook::bootloader
+}} // namespace brook::bootloader

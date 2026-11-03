@@ -31,6 +31,7 @@ add_executable(bootloader
     src/memory.cpp
     src/acpi.cpp
     src/update_slots.cpp
+    src/recovery_firmware_reader.cpp
     src/fs.cpp
     src/elf_loader.cpp
     src/paging.cpp

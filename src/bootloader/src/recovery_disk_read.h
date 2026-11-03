@@ -1,7 +1,7 @@
 #pragma once
 #include "recovery_disk_gate.h"
 
-namespace brook::bootloader {
+namespace brook { namespace bootloader {
 enum class RecoveryDiskState { Invalid, NeedsCheck, Clean };
 
 // Reader must provide Read(lba, sectorCount, destination), and Stable(),
@@ -13,7 +13,7 @@ enum class RecoveryDiskState { Invalid, NeedsCheck, Clean };
 // write, disk selection or repair authority occurs here. Stable metadata is
 // not proof that firmware bypassed a physical-media cache.
 inline bool RecoveryRangesOverlap(uintptr_t a,uintptr_t as,uintptr_t b,uintptr_t bs) {
-    if(a>UINTPTR_MAX-as || b>UINTPTR_MAX-bs)return true;
+    if(a>~uintptr_t{0}-as || b>~uintptr_t{0}-bs)return true;
     return a<b+bs && b<a+as;
 }
 template<class Reader>
@@ -22,8 +22,8 @@ RecoveryDiskState RecoveryReadDiskState(Reader& io, uint64_t sectors,
         uint8_t* lastEntries, uint32_t capacity) {
     const uintptr_t first=reinterpret_cast<uintptr_t>(firstEntries);
     const uintptr_t last=reinterpret_cast<uintptr_t>(lastEntries);
-    if (!firstEntries || !lastEntries || !capacity || first>UINTPTR_MAX-capacity ||
-        last>UINTPTR_MAX-capacity || RecoveryRangesOverlap(first,capacity,last,capacity) ||
+    if (!firstEntries || !lastEntries || !capacity || first>~uintptr_t{0}-capacity ||
+        last>~uintptr_t{0}-capacity || RecoveryRangesOverlap(first,capacity,last,capacity) ||
         RecoveryRangesOverlap(first,capacity,reinterpret_cast<uintptr_t>(&id),sizeof(id)) ||
         RecoveryRangesOverlap(last,capacity,reinterpret_cast<uintptr_t>(&id),sizeof(id)) ||
         RecoveryRangesOverlap(first,capacity,reinterpret_cast<uintptr_t>(&io),sizeof(io)) ||
@@ -54,4 +54,4 @@ RecoveryDiskState RecoveryReadDiskState(Reader& io, uint64_t sectors,
     if(state==LargeExt2HeaderState::NeedsCheck)return RecoveryDiskState::NeedsCheck;
     return RecoveryDiskState::Invalid;
 }
-} // namespace brook::bootloader
+}} // namespace brook::bootloader
