@@ -1743,6 +1743,11 @@ void ApicInitTimerOnAp()
     LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);  // 1ms period
 }
 
+uint64_t ApicRawBspIrqCount()
+{
+    return __atomic_load_n(&g_lapicRawTickCount,__ATOMIC_RELAXED);
+}
+
 uint64_t ApicTickCount()
 {
     const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);

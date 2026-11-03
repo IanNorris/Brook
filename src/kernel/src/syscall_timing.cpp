@@ -1,11 +1,18 @@
 #include "syscall_timing.h"
 #include "audio.h"
+#include "apic.h"
+#include "kvmclock.h"
 #include "process.h"
 namespace brook {
 namespace {
 SyscallTimingModel model;
 uint32_t guardWord=0;
 uint64_t publishedEpoch=0,targetPid=0,targetIncarnation=0,contention=0,seenDrops=0;
+bool targetCoarseClock=false;
+uint64_t TimingNowNs(){
+    return __atomic_load_n(&targetCoarseClock,__ATOMIC_RELAXED)
+        ?SyscallTimingTickNs(ApicRawBspIrqCount()):AudioClockNowNs();
+}
 // Short atomic-flag sections: no ticket reservation, no waiting, no callbacks.
 // Mask local IRQs so asynchronous terminal dispatch cannot strand the guard.
 struct Guard {
@@ -37,7 +44,10 @@ void Publish(){
 bool SyscallTimingWatch(uint64_t pid,uint64_t incarnation,SyscallTimingSnapshot* output){
     if(!pid || pid>65535 || !incarnation)return false;
     Guard guard;if(!guard.held)return false;
-    __atomic_store_n(&publishedEpoch,0,__ATOMIC_RELEASE);model.Watch(pid,incarnation);seenDrops=__atomic_load_n(&contention,__ATOMIC_RELAXED);Publish();Copy(output);return true;
+    __atomic_store_n(&publishedEpoch,0,__ATOMIC_RELEASE);
+    const bool coarse=!KvmClockStableAvailable();
+    __atomic_store_n(&targetCoarseClock,coarse,__ATOMIC_RELAXED);
+    model.Watch(pid,incarnation,coarse);seenDrops=__atomic_load_n(&contention,__ATOMIC_RELAXED);Publish();Copy(output);return true;
 }
 bool SyscallTimingOff(SyscallTimingSnapshot* output){
     Guard guard;if(!guard.held)return false;
@@ -55,12 +65,12 @@ SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_
     const auto epoch=__atomic_load_n(&publishedEpoch,__ATOMIC_ACQUIRE);
     if(!(epoch&1) || pid!=__atomic_load_n(&targetPid,__ATOMIC_RELAXED) ||
         incarnation!=__atomic_load_n(&targetIncarnation,__ATOMIC_RELAXED))return {};
-    const auto now=AudioClockNowNs();Guard guard;if(!guard.held){Drop();return {};}
+    const auto now=TimingNowNs();Guard guard;if(!guard.held){Drop();return {};}
     SyncDrops();return model.Begin(epoch,pid,incarnation,number,arg0,now,phase);
 }
 void SyscallTimingLeave(SyscallTimingTicket ticket,int64_t result,bool hasResult){
     Process* proc=ProcessCurrent();if(!proc)return;
-    const auto now=AudioClockNowNs();Guard guard;if(!guard.held){Drop();return;}
+    const auto now=TimingNowNs();Guard guard;if(!guard.held){Drop();return;}
     SyncDrops();if(model.Matches(proc->pid,proc->incarnation))model.End(ticket,now,result,hasResult);
 }
 }

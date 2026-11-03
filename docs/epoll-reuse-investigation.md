@@ -65,6 +65,17 @@ partial capture. A disposable QEMU test confirmed a successful short capture
 and an explicit failure after filling its boot filesystem. A readable footer
 alone does not establish that a failed sync was durable.
 
+The per-thread syscall timing diagnostic originally depended exclusively on
+stable KVM pvclock. On the physical Dell it produced invalid timestamps, so it
+could not identify the blocked syscall. It now selects a source at watch time:
+stable KVM time when available, otherwise the raw BSP LAPIC interrupt counter.
+The latter is explicitly reported as `lapic_delivered_ticks`: it has nominal
+1 ms granularity and can drift or undercount interrupt stalls, so it is not a
+reliable bound on wall-clock latency. Audio's separate clock is unchanged.
+A non-KVM QEMU test of a repeated 10 ms sleep reported thousands of completed
+syscalls, zero invalid timestamps and the expected coarse-source label. Physical
+Dell behavior and the actual Steam wait remain to be verified.
+
 A full fix must retain open-description identity across dup, fork and queued
 SCM_RIGHTS, resolve readiness against the watched description rather than the
 waiting process's numeric descriptor table, remove watches after the final

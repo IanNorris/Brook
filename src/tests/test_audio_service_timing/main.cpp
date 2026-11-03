@@ -46,6 +46,11 @@ static void CheckDecisions(){
     m.Watch(23,101);e.epoch=m.Snapshot().epoch;e.generation=1;CHECK(!m.Observe(e));
 }
 static void CheckSyscalls(){
+    CHECK(brook::SyscallTimingTickNs(0)==0);
+    CHECK(brook::SyscallTimingTickNs(123)==123000000ULL);
+    CHECK(brook::SyscallTimingTickNs(~uint64_t(0))==0);
+    { brook::SyscallTimingModel coarse; coarse.Watch(2,3,true);
+      CHECK(coarse.Snapshot().coarseClock); coarse.Reset(); CHECK(coarse.Snapshot().coarseClock); }
     using namespace brook;
     {SyscallTimingCall call(22,100,1,7);CHECK(call.Result(-11)==-11);}
     CHECK(!syscallClockReads && !syscallProbe.Snapshot().entries);

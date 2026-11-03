@@ -5435,7 +5435,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(!ok){DebugChannelSend("{\"error\":\"diagnostic busy; no control effect\",\"applied\":false}\n");return;}
         BridgeReply h;h.text("{");h.field("epoch",s.epoch);h.text(",");h.field("pid",s.pid);h.text(",");h.field("incarnation",s.incarnation);
         h.text(",\"enabled\":");h.text((s.epoch&1)?"true":"false");
-        h.text(",\"scope\":\"selected PID/incarnation, not liveness query; dispatch and return_check spans, counts are spans not user syscall count; raw C results before or after signal checks; elapsed KVM wall time includes host/scheduling, no CPU/steal apportionment; gap covers recorded phase boundaries plus recorder/asm/user/interrupt time; drops invalidate continuity; unmatched entry may be exit or dropped completion; top 16 events and 16 syscall kinds; contention since boot\"");
+        h.text(",\"clock_source\":\"");h.text(!s.pid?"unselected":s.coarseClock?"lapic_delivered_ticks":"kvm_stable");h.text("\"");
+        h.text(",\"scope\":\"selected PID/incarnation, not liveness query; dispatch and return_check spans, counts are spans not user syscall count; raw C results before or after signal checks; elapsed spans include scheduling, no CPU/steal apportionment; LAPIC fallback has 1ms granularity and can undercount stalls or drift; gap covers recorded phase boundaries plus recorder/asm/user/interrupt time; drops invalidate continuity; unmatched entry may be exit or dropped completion; top 16 events and 16 syscall kinds; contention since boot\"");
         h.text(",");h.field("entries",s.entries);
         h.text(",");h.field("completed",s.completed);
         h.text(",");h.field("invalid",s.invalid);

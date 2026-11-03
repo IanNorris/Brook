@@ -1,13 +1,18 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
+// Delivered-tick fallback is coarse and can undercount stalls; zero means the
+// source has not advanced or cannot be represented, not a valid timestamp.
+inline uint64_t SyscallTimingTickNs(uint64_t ticks) {
+    return ticks && ticks<=~uint64_t(0)/1000000ULL?ticks*1000000ULL:0;
+}
 enum class SyscallTimingPhase : uint8_t { Dispatch,ReturnCheck };
 struct SyscallTimingTicket {uint64_t epoch=0,sequence=0;};
 struct SyscallTimingEvent {uint64_t number=0,arg0=0,beginNs=0,endNs=0,gapNs=0;int64_t result=0;bool hasGap=false;SyscallTimingPhase phase=SyscallTimingPhase::Dispatch;};
 struct SyscallTimingSnapshot {
     uint64_t epoch=0,pid=0,incarnation=0,entries=0,completed=0,invalid=0,incomplete=0,overflowKinds=0;
     uint64_t contended=0,continuityBreaks=0,maxCallNs=0,maxGapNs=0,slow=0,excluded=0;
-    bool active=false,saturated=false;
+    bool active=false,saturated=false,coarseClock=false;
     uint64_t sequence=0,activeNumber=0,activeArg0=0,activeBeginNs=0;
     SyscallTimingPhase activePhase=SyscallTimingPhase::Dispatch;
     unsigned kinds=0,retained=0;
@@ -33,14 +38,14 @@ public:
     uint64_t Token()const{return data_.epoch;}
     bool Matches(uint64_t pid,uint64_t incarnation)const{return (data_.epoch&1) && data_.pid==pid && data_.incarnation==incarnation;}
     SyscallTimingSnapshot Snapshot()const{return data_;}
-    void Watch(uint64_t pid,uint64_t incarnation){
-        auto epoch=data_.epoch;data_={};data_.epoch=epoch;data_.pid=pid;data_.incarnation=incarnation;Advance(pid && incarnation);
+    void Watch(uint64_t pid,uint64_t incarnation,bool coarseClock=false){
+        auto epoch=data_.epoch;data_={};data_.epoch=epoch;data_.pid=pid;data_.incarnation=incarnation;data_.coarseClock=coarseClock;Advance(pid && incarnation);
     }
     void BreakContinuity(bool exhausted=false){
         lastEnd_=0;activeGap_=0;activeHasGap_=false;Add(data_.continuityBreaks);if(exhausted)data_.saturated=true;
     }
     void Off(){Advance(false);}
-    void Reset(){auto old=data_;data_={};data_.epoch=old.epoch;data_.pid=old.pid;data_.incarnation=old.incarnation;Advance(old.epoch&1);}
+    void Reset(){auto old=data_;data_={};data_.epoch=old.epoch;data_.pid=old.pid;data_.incarnation=old.incarnation;data_.coarseClock=old.coarseClock;Advance(old.epoch&1);}
     SyscallTimingTicket Begin(uint64_t token,uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,uint64_t now,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch){
         if(!(token&1) || token!=Token() || pid!=data_.pid || incarnation!=data_.incarnation)return {};
         if(data_.active){
