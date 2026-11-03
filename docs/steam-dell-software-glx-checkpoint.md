@@ -29,3 +29,20 @@ This nested setup is a diagnostic path, not a finished desktop integration.
 It uses software rendering, a separate X desktop and incomplete audio/session
 integration. The ordinary Xwayland/GLX path and Steam's long-term launcher
 still need proper fixes.
+
+## Bounded retry
+
+The Dell's original SSD boot pair was preserved while A/B slots were
+initialized. A QEMU-tested kernel with opt-in debug-job task budgets then
+booted from the new slot. On the Dell, the four-task acceptance probe passed
+fork, unreaped-child, `exec`, `setsid`, thread and reclamation checks.
+
+A single new Steam attempt used a 256-task budget. The last prompt live
+sample, 14.6 seconds after launch, showed 35 reservations, a peak of 35,
+zero budget refusals, 59 system processes and about 7.55 GB free. Subsequent
+statistics requests timed out and the Dell stopped answering ARP. These are
+the last observed values, not proof of the state at the eventual hang: a
+resource spike or another failure could have occurred between samples. No
+further Steam retries should be made until there is a way to capture or
+recover from the failure. A task budget does not constrain memory or protect
+against a kernel or device deadlock.
