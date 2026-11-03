@@ -18,7 +18,9 @@
 #include <sys/wait.h>
 static std::vector<unsigned char> disk;
 static bool failRead=false, failWrite=false, failSync=false, failDriveFlush=false, intrinsicReadOnly=false, driveAcquired=false;
-static unsigned diskReads=0;
+static brook::Device* exclusiveBound=nullptr;
+static unsigned diskReads=0,diskWrites=0;
+static int driveFlushes=0,failDriveFlushAt=-1;
 static LBA_t lastReadSector=0;
 extern "C" DSTATUS disk_initialize(BYTE drive){return drive?STA_NOINIT:0;}
 extern "C" DSTATUS disk_status(BYTE drive){return drive?STA_NOINIT:0;}
@@ -30,6 +32,7 @@ extern "C" DRESULT disk_read(BYTE drive,BYTE* out,LBA_t sector,UINT count){
     std::memcpy(out,disk.data()+offset,bytes);return RES_OK;
 }
 extern "C" DRESULT disk_write(BYTE drive,const BYTE* in,LBA_t sector,UINT count){
+    ++diskWrites;
     uint64_t offset=uint64_t(sector)*512,bytes=uint64_t(count)*512;
     if(drive || failWrite || offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
     std::memcpy(disk.data()+offset,in,bytes);return RES_OK;
@@ -68,10 +71,12 @@ VirtualAddress VmmAllocPages(uint64_t count,uint64_t,MemTag,uint16_t){
 void VmmFreePages(VirtualAddress address,uint64_t){
     void* p=reinterpret_cast<void*>(address.raw());{std::lock_guard<std::mutex> lock(allocationMutex);assert(pages.erase(p)==1);}std::free(p);
 }
-int FatFsFlushDrive(uint8_t){return failSync||failDriveFlush?-5:0;}
+int FatFsFlushDrive(uint8_t){++driveFlushes;return failSync||failDriveFlush||driveFlushes==failDriveFlushAt?-5:0;}
 void VfsRelease(Vnode* node){if(__atomic_fetch_sub(&node->refCount,1,__ATOMIC_ACQ_REL)==1)::closeNode(node);}
-bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive || driveAcquired)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
-void FatFsReleaseDrive(uint8_t){assert(driveAcquired);driveAcquired=false;}
+bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive || driveAcquired || exclusiveBound)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
+bool FatFsBindExclusiveDrive(uint8_t drive,Device* device){if(drive || !device || driveAcquired || exclusiveBound)return false;exclusiveBound=device;return true;}
+bool FatFsAcquireExclusiveDrive(uint8_t drive,Device* expected,bool* ro){if(drive || !ro || driveAcquired || !exclusiveBound || expected!=exclusiveBound)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
+void FatFsReleaseDrive(uint8_t){assert(driveAcquired);if(!exclusiveBound)driveAcquired=false;}
 bool FatFsDriveReadOnly(uint8_t){return intrinsicReadOnly;}
 extern "C" void SerialPrintf(const char*,...){}
 extern "C" void SerialPuts(const char*){}
@@ -597,7 +602,66 @@ int main(int argc,char** argv){
     int deviceStatus=0;assert(waitpid(failedDevice,&deviceStatus,0)==failedDevice && WIFEXITED(deviceStatus) && !WEXITSTATUS(deviceStatus));
     assert(!FatImageDeviceDestroyUnregistered(device) && !g_imageLeaseMounts[0]);
     alias=FatFsOpen(mount,0,image,VFS_O_STREAM);assert(alias);closeNode(alias);
+    assert(!FatFsMkdir(mount,0,"/RECOVERY",0755));
+    for(unsigned i=0;i<3;++i) {
+        const char* path=i==0?"/RECOVERY/GUARD0.BIN":i==1?"/RECOVERY/GUARD1.BIN":"/RECOVERY/THIRD.BIN";
+        Vnode* file=FatFsOpen(mount,0,path,VFS_O_CREATE|VFS_O_WRITE);assert(file);
+        uint8_t bytes[128]{};bytes[0]=uint8_t(50+i);uint64_t position=0;
+        assert(file->ops->write(file,bytes,sizeof(bytes),&position)==128);closeNode(file);
+    }
     assert(!FatFsUnmount(mount));assert(allocations.empty() && pages.empty() && !driveAcquired);
+    for(unsigned mode=0;mode<9;++mode) {
+        const pid_t privateChild=fork();assert(privateChild>=0);
+        if(!privateChild) {
+            Device dummy{};FatPrivateMount* privateGuard=nullptr;
+            if(mode==2) {
+                void* temporary=nullptr;assert(FatFsMount(0,&temporary));
+                assert(!FatFsUnlink(temporary,0,"/RECOVERY/GUARD1.BIN"));assert(!FatFsUnmount(temporary));
+            }
+            if(mode==3 || mode==4) {
+                void* temporary=nullptr;assert(FatFsMount(0,&temporary));
+                auto* tempMount=static_cast<FatFsMountData*>(temporary);
+                Vnode* first=FatFsOpen(temporary,0,"/RECOVERY/GUARD0.BIN",VFS_O_STREAM);assert(first);
+                Vnode* other=FatFsOpen(temporary,0,mode==3?"/RECOVERY/GUARD1.BIN":"/RECOVERY/THIRD.BIN",VFS_O_STREAM);assert(other);
+                const auto cluster=static_cast<FatOpenFile*>(first->priv)->fil.obj.sclust;
+                const auto* otherFile=static_cast<FatOpenFile*>(other->priv);
+                const auto sector=otherFile->fil.dir_sect;const auto offset=otherFile->fil.dir_ptr-tempMount->fs.win;
+                assert(offset>=0 && offset+32<=512 && uint64_t(sector)*512+offset+32<=disk.size());
+                closeNode(first);closeNode(other);assert(!FatFsUnmount(temporary));
+                auto* entry=disk.data()+uint64_t(sector)*512+offset;
+                entry[20]=uint8_t(cluster>>16);entry[21]=uint8_t(cluster>>24);
+                entry[26]=uint8_t(cluster);entry[27]=uint8_t(cluster>>8);
+            }
+            if(mode==5) {
+                void* temporary=nullptr;assert(FatFsMount(0,&temporary));
+                Vnode* file=FatFsOpen(temporary,0,"/RECOVERY/GUARD1.BIN",VFS_O_WRITE|VFS_O_TRUNC);assert(file);
+                uint8_t bytes[127]{};uint64_t position=0;
+                assert(file->ops->write(file,bytes,sizeof(bytes),&position)==127);closeNode(file);assert(!FatFsUnmount(temporary));
+            }
+            const auto before=disk;const auto writesBefore=diskWrites;
+            if(mode==1)failRead=true;
+            const bool ok=FatFsMountPrivateRecovery(0,&dummy,&privateGuard);failRead=false;
+            assert(ok!=(mode==1) && (privateGuard!=nullptr)==ok);
+            assert(exclusiveBound==&dummy && driveAcquired);
+            if(ok) {
+                uint8_t a[128]{},b[128]{};
+                assert(FatFsPrivateRecoveryInspect(privateGuard,a,a)==-22);
+                if(mode>=6)failDriveFlushAt=driveFlushes+int(mode)-5;
+                const int result=FatFsPrivateRecoveryInspect(privateGuard,a,b);
+                failDriveFlushAt=-1;
+                assert(result==(mode>=6?-5:mode==2?-2:mode==3 || mode==5?-22:0));
+                if(mode==0 || mode==4)assert(a[0]==50 && b[0]==51);
+                assert(FatFsPrivateRecoveryInspect(privateGuard,a,b)==-22);
+                assert(privateGuard->nodes[0]);
+                if(mode!=6)assert(privateGuard->leases[0] && !FatFsOpen(privateGuard->mount,0,"/RECOVERY/GUARD0.BIN",VFS_O_STREAM));
+                if(mode==7 || mode==8)assert(FatFsImageFlush(privateGuard->leases[0])==-5);
+            }
+            assert(!FatFsMountPrivateRecovery(0,&dummy,&privateGuard) && !privateGuard);
+            void* ordinary=nullptr;assert(!FatFsMount(0,&ordinary) && !ordinary);
+            assert(disk==before && diskWrites==writesBefore);_exit(0);
+        }
+        int privateStatus=0;assert(waitpid(privateChild,&privateStatus,0)==privateChild && WIFEXITED(privateStatus) && !WEXITSTATUS(privateStatus));
+    }
     std::ofstream output(argv[1],std::ios::binary|std::ios::trunc);output.write(reinterpret_cast<char*>(disk.data()),disk.size());assert(output);output.close();
     std::puts("FAT_OBJECTS_PASS production-backend directory-pins/file-slot-pins/rename/independent-opens/fsync/rollback/final-release");
 }

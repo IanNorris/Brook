@@ -85,6 +85,12 @@ struct FatFsMountData {
     int deferredCloseError;
     bool intrinsicReadOnly;
 };
+struct FatPrivateMount {
+    FatFsMountData* mount;
+    Vnode* nodes[2];
+    FatImageLease* leases[2];
+    bool inspected;
+};
 
 // FIL stays first so existing vnode/cache users can retain their FIL pointer.
 // Writable records are linked under g_fatLock until close has succeeded.
@@ -694,6 +700,31 @@ bool FatFsFileSourceReadOnly(Vnode* node)
 }
 
 // ---- VfsFsOps callbacks ----
+
+bool FatFsMountPrivateRecovery(uint8_t pdrv,Device* expected,FatPrivateMount** out)
+{
+    if(!out)return false;
+    *out=nullptr;
+    if(!expected)return false;
+    EnsureLock();
+    auto* session=static_cast<FatPrivateMount*>(kmalloc(sizeof(FatPrivateMount)));
+    if(!session)return false;
+    *session={};
+    auto* data=static_cast<FatFsMountData*>(kmalloc(sizeof(FatFsMountData)));
+    if(!data) {kfree(session);return false;}
+    __builtin_memset(data,0,sizeof(FatFsMountData));data->pdrv=pdrv;
+    if(!FatFsBindExclusiveDrive(pdrv,expected) ||
+       !FatFsAcquireExclusiveDrive(pdrv,expected,&data->intrinsicReadOnly)) {
+        kfree(data);kfree(session);return false;
+    }
+    char path[3]={static_cast<char>('0'+pdrv),':',0};
+    KMutexLock(&g_fatLock);
+    const FRESULT result=f_mount(&data->fs,path,1);
+    if(result!=FR_OK)f_mount(nullptr,path,0);
+    KMutexUnlock(&g_fatLock);
+    if(result!=FR_OK) {kfree(data);kfree(session);return false;}
+    session->mount=data;*out=session;return true;
+}
 
 static bool FatFsMount(uint8_t pdrv, void** mountPriv)
 {
@@ -1579,6 +1610,24 @@ int FatFsGuardPairValidate(FatImageLease* first,FatImageLease* second)
     }
     if(!error && as==bs)error=-22;
     KMutexUnlock(&g_fatLock);return error;
+}
+int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* second128)
+{
+    const uintptr_t first=reinterpret_cast<uintptr_t>(first128),second=reinterpret_cast<uintptr_t>(second128);
+    if(!session || !session->mount || !first || !second || first>~uintptr_t{0}-128 ||
+       second>~uintptr_t{0}-128 || (first<second+128 && second<first+128) ||
+       __atomic_exchange_n(&session->inspected,true,__ATOMIC_ACQ_REL))return -22;
+    const char* paths[2]={"/RECOVERY/GUARD0.BIN","/RECOVERY/GUARD1.BIN"};
+    void* buffers[2]={first128,second128};
+    for(unsigned i=0;i<2;++i) {
+        session->nodes[i]=FatFsOpen(session->mount,session->mount->pdrv,paths[i],VFS_O_WRITE|VFS_O_READWRITE);
+        if(!session->nodes[i])return -2;
+        const int error=FatFsAcquireGuardLease(session->nodes[i],&session->leases[i]);
+        if(error)return error;
+    }
+    int error=FatFsGuardPairValidate(session->leases[0],session->leases[1]);
+    for(unsigned i=0;!error && i<2;++i)error=FatFsGuardFlushReadback(session->leases[i],buffers[i]);
+    return error;
 }
 Device* FatFsImageLeaseDevice(FatImageLease* lease)
 {

@@ -69,7 +69,11 @@ filesystem and does not run a repair. Host tests exercise owner routing,
 bounds, failure and repeated admission. A separate one-shot, boot-lifetime FAT
 binding now prevents the same device pointer from being bound or mounted via
 another FAT slot; host tests cover competing binders, release and sticky write
-errors. It is not yet connected to a private mount. These primitives do not
+errors. An unwired private mount prototype uses that binding to retain and
+inspect only the two existing guard files, without publishing a VFS namespace
+or exposing writes. FAT fixture tests use a stubbed binding layer, verify no
+sector writes, and cover partial failure and mutual crosslinks. They also
+demonstrate that a third file crosslinked to a guard is not detected. These primitives do not
 prevent trusted kernel code from using diskio directly, prevent different
 adapter identities from overlapping the same blocks, or detect guard files
 cross-linked to a third file. The path must not be activated after any

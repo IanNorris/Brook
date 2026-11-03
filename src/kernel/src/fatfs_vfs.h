@@ -8,8 +8,19 @@ namespace brook {
 
 struct Vnode;
 struct FatImageLease;
+struct FatPrivateMount;
 struct Device;
 void FatFsVfsRegister();
+// Boot-only, one-shot mount on a pinned exclusive binding. It is not inserted
+// in a VFS namespace and, once bound, remains reserved until reboot even if
+// mounting fails.
+// This does not by itself authorize recovery writes.
+bool FatFsMountPrivateRecovery(uint8_t pdrv, Device* expected, FatPrivateMount** out);
+// One-shot, read-only inspection of the two fixed guard files. Successful or
+// failed partial preparation remains pinned for the boot; output buffers may
+// be partially filled on failure. No write authority or namespace entry is
+// exposed. Success does not validate record contents or third-file crosslinks.
+int FatFsPrivateRecoveryInspect(FatPrivateMount* mount, void* first128, void* second128);
 // True only for a streaming regular FIL whose retained drive binding is immutable.
 bool FatFsFileSourceReadOnly(Vnode* node);
 
