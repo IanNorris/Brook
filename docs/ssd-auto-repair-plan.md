@@ -53,6 +53,15 @@ fixtures. This only compares the two guards: it does not detect links to a
 third file or establish exclusive ownership of the ESP. Those remain necessary
 before the transaction can be wired to a checker or deployed.
 
+A host-only adapter now exercises the pending transition against the real
+FatFs lease, pair check and direct readback on FAT16, FAT32 and an offset FAT16
+fixture. It verifies matching pending records after reopen, EFI guard denial,
+and sticky lease failures after injected writes, syncs and reads on either
+record, plus failure of the final drive flush. The host
+backend writes to a memory-backed disk without modelling volatile SSD caches
+or physical power loss. Its exclusive fixture is not a production ESP
+ownership mechanism.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.

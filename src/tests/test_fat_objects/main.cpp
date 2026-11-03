@@ -13,6 +13,7 @@
 #include "fatfs_object.h"
 #include "fat_image_device.h"
 #include "diskio.h"
+#include "../../shared/update/recovery_guard_transaction.h"
 #include <unistd.h>
 #include <sys/wait.h>
 static std::vector<unsigned char> disk;
@@ -345,6 +346,72 @@ int main(int argc,char** argv){
             guard=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_WRITE|VFS_O_READWRITE|VFS_O_TRUNC);assert(guard);
             uint8_t bytes[512]{};position=0;assert(guard->ops->write(guard,bytes,size,&position)==int(size));
             assert(FatFsAcquireGuardLease(guard,&fixed)==-22 && !fixed);closeNode(guard);
+        }
+    }
+    {
+        // Exercise the actual transaction primitive through retained FAT
+        // records. The isolated host fixture supplies exclusive ownership;
+        // this does not provide a production ESP exclusion mechanism.
+        const char* names[2]={"/guard-transaction-0.bin","/guard-transaction-1.bin"};
+        const char* identity="01000000000000000000000000000000"
+                             "02000000000000000000000000000000"
+                             "03000000000000000000000000000000";
+        uint8_t record[128]{};std::memcpy(record,"BRKRCV01",8);BrookUpdatePut64(record+8,1);
+        BrookUpdatePut32(record+16,BROOK_RECOVERY_GUARD_CLEAN);
+        record[24]=1;record[40]=2;record[56]=3;BrookUpdatePut32(record+124,BrookUpdateCrc(record,124));
+        Vnode* nodes[2]{};FatImageLease* leases[2]{};
+        for(unsigned i=0;i<2;++i) {
+            nodes[i]=FatFsOpen(mount,0,names[i],VFS_O_CREATE|VFS_O_WRITE|VFS_O_READWRITE);assert(nodes[i]);
+            uint64_t pos=0;assert(nodes[i]->ops->write(nodes[i],record,128,&pos)==128);
+            assert(!FatFsAcquireGuardLease(nodes[i],&leases[i]));
+        }
+        assert(!FatFsGuardPairValidate(leases[0],leases[1]));
+        struct GuardIo {
+            FatImageLease** leases;FatFsMountData* mount;
+            int failAfterWrite=-1,failWriteOnSync=-1,failReadAt=-1,reads=0;bool failFinal=false;
+            bool Read(unsigned i,uint8_t* out,unsigned size) {
+                if(++reads==failReadAt)failRead=true;
+                const bool ok=i<2 && size==128 && !FatFsGuardFlushReadback(leases[i],out);
+                failRead=false;return ok;
+            }
+            bool Write(unsigned i,const uint8_t* data,unsigned size) {
+                return i<2 && size==128 && FatFsImageWrite(leases[i],0,data,size)==128;
+            }
+            bool Sync(unsigned i) {
+                if(int(i)==failAfterWrite)failSync=true;
+                if(int(i)==failWriteOnSync)failWrite=true;
+                const bool ok=i<2 && !FatFsImageFlush(leases[i]);failSync=false;failWrite=false;return ok;
+            }
+            bool Flush() {if(failFinal)failDriveFlush=true;const bool ok=!FatFsSync(mount);failDriveFlush=false;return ok;}
+        } io{leases,mount};
+        for(unsigned mode=0;mode<7;++mode) {
+            const pid_t failed=fork();assert(failed>=0);
+            if(!failed) {
+                const unsigned slot=mode/3;
+                if(mode<6 && mode%3==0)io.failAfterWrite=int(slot);
+                if(mode<6 && mode%3==1)io.failWriteOnSync=int(slot);
+                if(mode<6 && mode%3==2)io.failReadAt=3+int(slot);
+                if(mode==6)io.failFinal=true;
+                assert(BrookGuardBeginRepair(io,identity)==BrookGuardBeginResult::Uncertain);
+                if(mode<6)assert(FatFsImageFlush(leases[slot])==-5 && FatFsReleaseImageLease(leases[slot])==-5);
+                if(mode==6)for(auto* lease:leases)
+                    assert(FatFsImageFlush(lease)==-5 && FatFsReleaseImageLease(lease)==-5);
+                _exit(0);
+            }
+            int failureStatus=0;assert(waitpid(failed,&failureStatus,0)==failed && WIFEXITED(failureStatus) && !WEXITSTATUS(failureStatus));
+        }
+        assert(BrookGuardBeginRepair(io,identity)==BrookGuardBeginResult::PendingDurable);
+        uint8_t a[128]{},b[128]{};assert(io.Read(0,a,128) && io.Read(1,b,128));
+        assert(BrookRecoveryGuardValid(a,128) && BrookRecoveryGuardValid(b,128));
+        assert(BrookUpdateEqual(a,b,128) && BrookUpdateGet64(a+8)==2 &&
+               BrookUpdateGet32(a+16)==BROOK_RECOVERY_GUARD_PENDING);
+        assert(!BrookRecoveryGuardAllowsNormal(a,128,b,128,identity));
+        for(unsigned i=0;i<2;++i) {assert(!FatFsReleaseImageLease(leases[i]));closeNode(nodes[i]);}
+        for(unsigned i=0;i<2;++i) {
+            Vnode* verify=FatFsOpen(mount,0,names[i],VFS_O_STREAM);assert(verify);
+            uint8_t actual[128]{};uint64_t pos=0;
+            assert(verify->ops->read(verify,actual,128,&pos)==128 && BrookUpdateEqual(actual,a,128));
+            closeNode(verify);
         }
     }
     assert(!FatFsRename(mount,0,"/image.brk","/network-storage-image.img"));
