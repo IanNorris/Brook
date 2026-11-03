@@ -47,9 +47,11 @@ reads the retained file's mapped sector through diskio instead of the FatFs
 file buffer. Host tests cover stale file-cache data, failures, malformed maps,
 sector-tail preservation and a nonzero partition offset. This verifies the
 Brook/FatFs cache boundary; it does not prove SSD controller cache or physical
-power-loss behavior. The transaction still needs exclusive ESP ownership and
-rejection of two distinct records sharing an allocation cluster before it can
-be wired to a checker or deployed.
+power-loss behavior. A retained-pair validation also rejects distinct guard
+entries that share a cluster, tested with cross-linked on-disk FAT16/FAT32
+fixtures. This only compares the two guards: it does not detect links to a
+third file or establish exclusive ownership of the ESP. Those remain necessary
+before the transaction can be wired to a checker or deployed.
 
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`

@@ -247,6 +247,43 @@ int main(int argc,char** argv){
         Vnode* alias=FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM);assert(alias);
         assert(FatFsAcquireGuardLease(guard,&fixed)==-16 && !fixed);closeNode(alias);
         assert(!FatFsAcquireGuardLease(guard,&fixed) && fixed && guard->ops->deny_mapping);
+        Vnode* guard2=FatFsOpen(mount,0,"/recovery-guard-two.bin",VFS_O_CREATE|VFS_O_WRITE|VFS_O_READWRITE);assert(guard2);
+        position=0;assert(guard2->ops->write(guard2,record,sizeof(record),&position)==128);closeNode(guard2);
+        const pid_t crossChild=fork();assert(crossChild>=0);
+        if(!crossChild) {
+            // Corrupt the second on-disk directory entry to point at the
+            // first file's EOC cluster; the names and identities stay distinct.
+            Vnode* other=FatFsOpen(mount,0,"/recovery-guard-two.bin",VFS_O_WRITE|VFS_O_READWRITE);assert(other);
+            auto* otherFile=static_cast<FatOpenFile*>(other->priv);
+            const auto sector=otherFile->fil.dir_sect;
+            const auto offset=otherFile->fil.dir_ptr-mount->fs.win;
+            const auto cluster=static_cast<FatOpenFile*>(guard->priv)->fil.obj.sclust;
+            assert(offset>=0 && offset+32<=512 && uint64_t(sector)*512+offset+32<=disk.size());
+            closeNode(other);
+            auto* entry=disk.data()+uint64_t(sector)*512+offset;
+            entry[20]=uint8_t(cluster>>16);entry[21]=uint8_t(cluster>>24);
+            entry[26]=uint8_t(cluster);entry[27]=uint8_t(cluster>>8);
+            mount->fs.winsect=~LBA_t{0};
+            other=FatFsOpen(mount,0,"/recovery-guard-two.bin",VFS_O_WRITE|VFS_O_READWRITE);assert(other);
+            FatImageLease* overlap=nullptr;assert(!FatFsAcquireGuardLease(other,&overlap));
+            assert(FatFsGuardPairValidate(fixed,overlap)==-22);_exit(0);
+        }
+        int crossStatus=0;assert(waitpid(crossChild,&crossStatus,0)==crossChild && WIFEXITED(crossStatus) && !WEXITSTATUS(crossStatus));
+        guard2=FatFsOpen(mount,0,"/recovery-guard-two.bin",VFS_O_WRITE|VFS_O_READWRITE);assert(guard2);
+        FatImageLease* fixed2=nullptr;assert(!FatFsAcquireGuardLease(guard2,&fixed2));
+        assert(!FatFsGuardPairValidate(fixed,fixed2) && !FatFsGuardPairValidate(fixed2,fixed));
+        assert(FatFsGuardPairValidate(fixed,fixed)==-22);
+        record[4]=66;assert(FatFsImageWrite(fixed,0,record,sizeof(record))==128);
+        assert(!FatFsGuardPairValidate(fixed,fixed2));
+        uint8_t pairRead[128]{};assert(!FatFsGuardFlushReadback(fixed,pairRead));
+        const pid_t pairChild=fork();assert(pairChild>=0);
+        if(!pairChild) {
+            fixed2->linkMap[1]=2;assert(FatFsGuardPairValidate(fixed,fixed2)==-22);
+            fixed2->linkMap[1]=1;
+            assert(FatFsGuardPairValidate(fixed,fixed2)==-22 && FatFsReleaseImageLease(fixed2)==-22);_exit(0);
+        }
+        int pairStatus=0;assert(waitpid(pairChild,&pairStatus,0)==pairChild && WIFEXITED(pairStatus) && !WEXITSTATUS(pairStatus));
+        assert(!FatFsReleaseImageLease(fixed2));closeNode(guard2);
         assert(!FatFsOpen(mount,0,"/recovery-guard.bin",VFS_O_STREAM));
         FILINFO info{};assert(f_stat("0:/recovery-guard.bin",&info)==FR_OK && info.altname[0]);
         std::string aliasName="/"+std::string(info.altname);

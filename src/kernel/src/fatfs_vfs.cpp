@@ -1545,7 +1545,7 @@ int FatFsGuardFlushReadback(FatImageLease* lease,void* out)
     KMutexLock(&g_fatLock);
     auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
     int error=lease->error;
-    if(!error && file->imageLease!=lease)error=-22;
+    if(!error && (file->imageLease!=lease || file->fil.cltbl!=lease->linkMap))error=-22;
     if(!error) {
         auto result=CheckedFatSync(&file->fil,false);
         error=result==FR_OK?FlushFatDriveLocked(file->mount->pdrv):FrToErrno(result);
@@ -1555,6 +1555,29 @@ int FatFsGuardFlushReadback(FatImageLease* lease,void* out)
         }
     }
     if(error)lease->error=error;
+    KMutexUnlock(&g_fatLock);return error;
+}
+int FatFsGuardPairValidate(FatImageLease* first,FatImageLease* second)
+{
+    if(!first || !second || first==second || !first->guard || !second->guard)return -22;
+    KMutexLock(&g_fatLock);
+    auto* a=static_cast<FatOpenFile*>(first->owner->priv);
+    auto* b=static_cast<FatOpenFile*>(second->owner->priv);
+    int error=first->error ? first->error : second->error;
+    if(!error && (a->imageLease!=first || b->imageLease!=second ||
+                  a->fil.cltbl!=first->linkMap || b->fil.cltbl!=second->linkMap ||
+                  a->mount!=b->mount || a->fil.obj.fs!=b->fil.obj.fs ||
+                  first->identity==second->identity))error=-22;
+    LBA_t as=0,bs=0;
+    if(!error) {
+        const auto result=f_object_guard_sector(&a->fil,&as);
+        if(result!=FR_OK) {error=FrToErrno(result);first->error=error;}
+    }
+    if(!error) {
+        const auto result=f_object_guard_sector(&b->fil,&bs);
+        if(result!=FR_OK) {error=FrToErrno(result);second->error=error;}
+    }
+    if(!error && as==bs)error=-22;
     KMutexUnlock(&g_fatLock);return error;
 }
 Device* FatFsImageLeaseDevice(FatImageLease* lease)

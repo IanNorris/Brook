@@ -24,6 +24,10 @@ int FatFsAcquireGuardLease(Vnode* node, FatImageLease** out);
 // Atomically sync the retained guard and read its 128 bytes through diskio,
 // bypassing FatFs file/windows. Errors poison the lease and retain ownership.
 int FatFsGuardFlushReadback(FatImageLease* lease, void* out);
+// Both live leases must be retained without concurrent release. Checks that
+// their identities and one-cluster allocations differ on the same FAT mount;
+// does not establish exclusive ownership of the rest of the mount.
+int FatFsGuardPairValidate(FatImageLease* first, FatImageLease* second);
 int FatFsImageRead(FatImageLease* lease, uint64_t offset, void* out, uint32_t bytes);
 int FatFsImageWrite(FatImageLease* lease, uint64_t offset, const void* in, uint32_t bytes);
 int FatFsImageFlush(FatImageLease* lease);

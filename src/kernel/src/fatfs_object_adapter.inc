@@ -337,24 +337,34 @@ FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
 #endif
 }
 
-FRESULT f_object_guard_readback (FIL* fp, BYTE out[128])
+FRESULT f_object_guard_sector (FIL* fp, LBA_t* out)
 {
     FATFS* fs;
     if (!fp || !out || !fp->cltbl || fp->obj.objsize != 128) return FR_INVALID_PARAMETER;
+    *out = 0;
     FRESULT result = validate(&fp->obj, &fs);
     if (result != FR_OK) return result;
     if (fp->err) return (FRESULT)fp->err;
     if ((fs->fs_type != FS_FAT16 && fs->fs_type != FS_FAT32) || SS(fs) != 512 ||
         !fs->csize || fp->obj.sclust < 2 || fp->obj.sclust >= fs->n_fatent ||
         fp->cltbl[0] != 4 || fp->cltbl[1] != 1 ||
-        fp->cltbl[2] != fp->obj.sclust || fp->cltbl[3] != 0 ||
-        (fp->flag & FA_MODIFIED)) return FR_INVALID_PARAMETER;
+        fp->cltbl[2] != fp->obj.sclust || fp->cltbl[3] != 0) return FR_INVALID_PARAMETER;
     uint64_t expected = (uint64_t)fs->database + (uint64_t)fs->csize * (fp->obj.sclust - 2);
     if (expected > (uint64_t)((LBA_t)-1)) return FR_INT_ERR;
     LBA_t sector = clst2sect(fs, fp->obj.sclust);
     if (!sector || sector < fs->database || sector != expected) return FR_INT_ERR;
+    *out = sector;
+    return FR_OK;
+}
+
+FRESULT f_object_guard_readback (FIL* fp, BYTE out[128])
+{
+    if (!fp || !out || (fp->flag & FA_MODIFIED)) return FR_INVALID_PARAMETER;
+    LBA_t sector;
+    FRESULT result = f_object_guard_sector(fp, &sector);
+    if (result != FR_OK) return result;
     BYTE scratch[512];
-    if (disk_read(fs->pdrv, scratch, sector, 1) != RES_OK) return FR_DISK_ERR;
+    if (disk_read(fp->obj.fs->pdrv, scratch, sector, 1) != RES_OK) return FR_DISK_ERR;
     memcpy(out, scratch, 128);
     return FR_OK;
 }
