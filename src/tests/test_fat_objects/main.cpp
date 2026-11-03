@@ -12,6 +12,7 @@
 #include "../../kernel/src/fatfs_vfs.cpp"
 #include "fatfs_object.h"
 #include "fat_image_device.h"
+#include "guard_fat_profile.h"
 #include "diskio.h"
 #include "../../shared/update/recovery_guard_transaction.h"
 #include <unistd.h>
@@ -92,6 +93,19 @@ int main(int argc,char** argv){
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
     using namespace brook;
     void* privateMount=nullptr;assert(FatFsMount(0,&privateMount));auto* mount=static_cast<FatFsMountData*>(privateMount);
+    GuardFatProfile profile{};
+    if(mount->fs.volbase==0) {
+        assert(GuardFatParse(disk.data(),disk.size(),disk.size()/512,profile));
+        assert(mount->fs.fs_type==(profile.type==16?FS_FAT16:FS_FAT32));
+        assert(mount->fs.fatbase==profile.fatStart && mount->fs.fsize==profile.fatSectors);
+        assert(mount->fs.database==profile.dataStart && mount->fs.csize==profile.sectorsPerCluster);
+        assert(mount->fs.n_fatent==profile.clusters+2 && mount->fs.n_rootdir==profile.rootEntries && mount->fs.n_fats==2);
+        assert(mount->fs.dirbase==(profile.type==32?profile.rootCluster:profile.fatStart+2*profile.fatSectors));
+    } else {
+        // A nested MBR volume may be mountable generally but is never a
+        // valid reserved-ESP recovery target.
+        assert(!GuardFatParse(disk.data(),disk.size(),disk.size()/512,profile));
+    }
     auto create=[&](const char* path,const char* contents){
         Vnode* node=FatFsOpen(mount,0,path,VFS_O_CREATE|VFS_O_WRITE);assert(node);
         uint64_t offset=0;assert(node->ops->write(node,contents,std::strlen(contents),&offset)==int(std::strlen(contents)));closeNode(node);

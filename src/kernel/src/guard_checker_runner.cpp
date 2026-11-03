@@ -1,5 +1,6 @@
 #include "guard_checker_runner.h"
 #include "guard_checker_session.h"
+#include "guard_fat_profile.h"
 #include "exec_image.h"
 #include "process.h"
 #include "scheduler.h"
@@ -76,6 +77,10 @@ void Worker(void* arg) {
         KPrintf("GUARD_CHECK_INCOMPLETE drain views=%u reads=%u\n",status.views,status.reads);return;
     }
     if(result.code!=1) {KPrintf("GUARD_CHECK_INCOMPLETE signal status=%d\n",result.status);return;}
+    if(result.status==0) {
+        GuardFatProfile profile{};
+        if(!GuardFatCheckDevice(device,profile)) {KPuts("GUARD_CHECK_INCOMPLETE fat-profile\n");return;}
+    }
     KPrintf("GUARD_CHECK_RESULT exit=%u\n",static_cast<unsigned>(result.status>>8));
 }
 }

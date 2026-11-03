@@ -111,6 +111,16 @@ it does not mount the ESP, repair ext2, authorize a normal boot, or establish
 physical power-loss safety. If a checker times out and cannot be reaped, the
 session stays revoked and recovery remains incomplete.
 
+After a clean checker result, the diagnostic now also checks a deliberately
+restricted FAT16/FAT32 geometry, both complete FAT copies, FAT32 FSInfo bounds
+and the backup boot sector while the same reserved adapter remains pinned.
+The profile excludes the cluster-count boundaries on which the bundled
+FatFs and checker disagree. Host tests compare accepted real FAT16/FAT32
+fixture geometry with FatFs's mounted geometry and reject a nested MBR volume;
+the check-only QEMU boot passes on its FAT16 fixture. This is not yet an
+authorization to mount, and a future private mount must compare its actual
+FatFs geometry with the retained profile before permitting any write.
+
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and
 metadata changes, handles short/error reads, and is covered by host tests. It
