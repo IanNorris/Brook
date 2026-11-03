@@ -214,7 +214,9 @@ fixtures and physical validation remain necessary.
 Unintegrated bootloader helpers now validate a bounded GPT hard-drive device
 path, an exact whole-disk parent-path match, matching primary and backup GPTs,
 the ESP and data partition identities and bounds, and the ext2 header state.
-Host tests exercise malformed paths and partition metadata. These pure helpers
+Host tests exercise malformed paths, partition metadata, read failures and a
+media change after reading. A bounded reader sequences both GPT copies and
+the ext2 superblock through a caller-provided read interface. These helpers
 perform no firmware I/O, are not part of the boot decision, and cannot grant
 repair authority. Firmware handle selection, alignment and media-change
 handling, independent identity binding, and real automatic dispatch remain.

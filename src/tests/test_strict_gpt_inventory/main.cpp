@@ -1,6 +1,7 @@
 #include "../../kernel/src/strict_gpt_inventory.h"
 #include "../../bootloader/src/recovery_disk_gate.h"
 #include "../../bootloader/src/recovery_device_path.h"
+#include "../../bootloader/src/recovery_disk_read.h"
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -103,6 +104,35 @@ int main(int argc,char** argv) {
         put32(sb+40,64);sb[56]=0x53;sb[57]=0xef;sb[58]=1;put32(sb+76,1);
         put32(sb+84,11);sb[88]=128;put32(sb+96,2);put32(sb+100,3);sb[104]=3;
         CHECK(RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));
+        struct FakeReader {
+            uint8_t *mbr,*ph,*bh,*ae,*be,*sb;unsigned calls=0,failAt=0,stableCalls=0;bool stable=true,changeAfterRead=false;
+            bool Stable(){++stableCalls;return stable && !(changeAfterRead && stableCalls>1);}
+            bool Read(uint64_t lba,uint32_t count,void* out) {
+                if(++calls==failAt)return false;
+                const uint8_t* source=nullptr;
+                if(lba==0 && count==1)source=mbr;
+                else if(lba==1 && count==1)source=ph;
+                else if(lba==99999 && count==1)source=bh;
+                else if(lba==2 && count==32)source=ae;
+                else if(lba==99967 && count==32)source=be;
+                else if(lba==4098 && count==2)source=sb;
+                if(!source)return false;
+                std::memcpy(out,source,count*512);return true;
+            }
+        } reader{protective,ph,bh,ae,be,sb};
+        uint8_t scratchA[16384]{},scratchB[16384]{};
+        auto readState=[&]{return RecoveryReadDiskState(reader,100000,id,scratchA,scratchB,sizeof(scratchA));};
+        CHECK(readState()==RecoveryDiskState::Clean);
+        sb[58]=0;CHECK(readState()==RecoveryDiskState::NeedsCheck);sb[58]=1;
+        for(unsigned fail=1;fail<=6;++fail) {
+            reader.calls=0;reader.failAt=fail;CHECK(readState()==RecoveryDiskState::Invalid);
+        }
+        reader.failAt=0;reader.stable=false;CHECK(readState()==RecoveryDiskState::Invalid);reader.stable=true;
+        reader.stableCalls=0;reader.changeAfterRead=true;
+        CHECK(readState()==RecoveryDiskState::Invalid && reader.stableCalls==2);reader.changeAfterRead=false;
+        CHECK(RecoveryReadDiskState(reader,100000,id,scratchA,scratchA,sizeof(scratchA))==RecoveryDiskState::Invalid);
+        CHECK(RecoveryReadDiskState(reader,100000,id,reinterpret_cast<uint8_t*>(&id),scratchB,sizeof(scratchB))==RecoveryDiskState::Invalid);
+        CHECK(RecoveryReadDiskState(reader,100000,id,scratchA,scratchB,512)==RecoveryDiskState::Invalid);
         sb[58]=0;CHECK(!RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));sb[58]=1;
         sb[104]^=1;CHECK(!RecoveryDataHeaderIsClean(sb,sizeof(sb),id,data));sb[104]^=1;
         id.espPartitionNumber=2;CHECK(!locate());id.espPartitionNumber=1;
