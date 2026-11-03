@@ -113,3 +113,11 @@ Steam's parent obtained both pools before its inferred handshake deadline. The
 benchmark binary had SHA-256
 `c3fc9d68f4da202470e174063000363fb4720e491ddb3d627a78b04bdac200e4`.
 The test VM was stopped with a checked guest and device flush.
+
+`process_fd_summary.py` is a bounded guest-side follow-up for a known PID. It
+reports counts by descriptor class without printing link targets, and reports
+unreadable or raced entries rather than treating them as zero. Its snapshots
+are non-atomic and a PID can be reused between samples; the caller must bind a
+result to an independently observed process incarnation. A controlled Brook VM
+process opened three memfds and the helper observed three; after closure the
+count fell by three. The test VM completed a checked flush and shutdown.
