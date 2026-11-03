@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,21 +47,32 @@ def main():
                    help='Optionally stage a private installer kernel and matching ABI 64 modules')
     p.add_argument('--prepared-pair', type=Path,
                    help='Boot this exact physical recovery pair and verify it refuses the QEMU disk')
+    p.add_argument('--fat-checker', type=Path,
+                   help='Use a static FAT checker and matching diagnostic supervisor on the private ESP')
+    p.add_argument('--fat-crosslink', action='store_true',
+                   help='Crosslink two new files in the private FAT fixture before boot')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
-    if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build):
+    if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build or a.fat_checker):
         p.error('prepared pair is an independent identity rejection scenario')
+    if a.fat_checker and (a.dirty or a.missing_checker):
+        p.error('FAT checker uses a clean fixture')
+    if a.fat_crosslink and not a.fat_checker:
+        p.error('--fat-crosslink requires --fat-checker')
     image = a.image.resolve(strict=True)
     if not image.is_file() or image.stat().st_size != 128 * 1024 * 1024:
         p.error('expected the 128 MiB disposable SATA recovery fixture')
     table = json.loads(subprocess.check_output(['sfdisk', '--json', str(image)]))['partitiontable']
     parts = table.get('partitions', [])
     if (table.get('label') != 'gpt' or table.get('sectorsize') != 512 or len(parts) != 2 or
+            parts[0].get('start') != 2048 or parts[0].get('size') != 131072 or
+            parts[0].get('type', '').lower() != 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' or
             parts[1].get('start') != 133120 or parts[1].get('size') != 126976 or
             parts[1].get('type', '').lower() != '0fc63daf-8483-4772-8e79-3d69d8477de4'):
         p.error('unexpected fixture partition geometry')
     validate_checker(a.supervisor)
+    fat_info=validate_checker(a.fat_checker) if a.fat_checker else None
     with tempfile.TemporaryDirectory(prefix='brook-recovery-local-') as directory:
         work = Path(directory)
         disk = work / 'disk.raw'
@@ -117,6 +129,11 @@ def main():
                                    (ident, '::/ETC/hardware-payload-id'),
                                    (a.supervisor, '::/BOOT/RECCHECK.ELF')):
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(source), target], check=True)
+            if a.fat_checker:
+                subprocess.run(['mcopy', '-o', '-i', str(initrd), str(a.fat_checker), '::/BOOT/FATFSCK.ELF'], check=True)
+                copied=subprocess.check_output(['mtype','-i',str(initrd),'::/BOOT/FATFSCK.ELF'])
+                if len(copied)!=fat_info['bytes'] or hashlib.sha256(copied).hexdigest()!=fat_info['sha256']:
+                    raise RuntimeError('guest FAT checker readback mismatch')
         selection = work / 'SELECT.BIN'; selection.write_bytes(record(1, 0, kernel, initrd.read_bytes()))
         if a.prepared_pair and selection.read_bytes() != (pair / 'SELECT.BIN').read_bytes():
             raise RuntimeError('prepared recovery selection does not match its exact pair')
@@ -128,6 +145,28 @@ def main():
                 staged = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/' + name])
                 if staged != (pair / name).read_bytes():
                     raise RuntimeError('prepared recovery pair readback mismatch: ' + name)
+        if a.fat_crosslink:
+            payload=work/'fat-crosslink.bin';payload.write_bytes(bytes(range(128)))
+            for name in ('QA0.BIN','QA1.BIN'):
+                subprocess.run(['mcopy','-i',media,str(payload),'::/'+name],check=True)
+            with disk.open('r+b') as stream:
+                stream.seek(1048576);header=stream.read(512)
+                sector=struct.unpack_from('<H',header,11)[0];reserved=struct.unpack_from('<H',header,14)[0]
+                fats=header[16];root_count=struct.unpack_from('<H',header,17)[0]
+                fat_size=struct.unpack_from('<H',header,22)[0] or struct.unpack_from('<I',header,36)[0]
+                if sector!=512 or not reserved or not fats or not fat_size:
+                    raise RuntimeError('unexpected FAT crosslink fixture geometry')
+                data=reserved+fats*fat_size+(root_count*32+511)//512
+                root=(reserved+fats*fat_size if root_count else
+                      data+(struct.unpack_from('<I',header,44)[0]-2)*header[13])
+                stream.seek(1048576+root*512);entries=bytearray(stream.read(512))
+                a0=next(i for i in range(0,len(entries),32) if entries[i:i+11]==b'QA0     BIN')
+                a1=next(i for i in range(0,len(entries),32) if entries[i:i+11]==b'QA1     BIN')
+                cluster=lambda i: struct.unpack_from('<H',entries,i+26)[0] | (struct.unpack_from('<H',entries,i+20)[0]<<16)
+                if cluster(a0)<2 or cluster(a1)<2 or cluster(a0)==cluster(a1):
+                    raise RuntimeError('FAT crosslink source files were not distinct')
+                for offset in (20,26):entries[a1+offset:a1+offset+2]=entries[a0+offset:a0+offset+2]
+                stream.seek(1048576+root*512);stream.write(entries)
         before = sha(disk)
         firmware = a.firmware.resolve(strict=True)
         shutil.copyfile(firmware / 'OVMF_VARS.fd', work / 'vars.fd')
@@ -164,15 +203,26 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = ('RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=8;' if a.prepared_pair else
+                    expected = (('FAT_CHECK_RESULT exit=1' if a.fat_crosslink else 'FAT_CHECK_RESULT exit=0') if a.fat_checker else
+                                'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=8;' if a.prepared_pair else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=127;' if a.missing_checker else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
-                    if selected and expected in text:
+                    complete_lines = [line.rstrip('\r') for line in text.split('\n')[:-1]]
+                    if a.fat_checker and any(
+                            line.startswith(('FAT_CHECK_FORK_FAILED', 'FAT_CHECK_EXEC_FAILED',
+                                             'FAT_CHECK_WAIT_FAILED', 'FAT_CHECK_INTERRUPTED')) or
+                            (line.startswith('FAT_CHECK_RESULT exit=') and line != expected)
+                            for line in complete_lines):
+                        raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
+                    matched = expected in complete_lines if a.fat_checker else expected in text
+                    if selected and matched:
                         if a.prepared_pair and ('Pass 1' in text or
                                                 'No such device while trying to open /dev/brook-install-disk2' not in text):
                             raise RuntimeError('physical recovery pair did not reject the wrong disk as expected')
-                        if not (a.missing_checker or a.prepared_pair) and 'Pass 5' not in text:
+                        if a.fat_crosslink and not all(s in text.lower() for s in ('/qa0.bin', '/qa1.bin', 'share clusters')):
+                            raise RuntimeError('guest FAT checker did not report the crosslink')
+                        if not (a.missing_checker or a.prepared_pair or a.fat_checker) and 'Pass 5' not in text:
                             raise RuntimeError('check did not report all filesystem passes')
                         if a.frame_output:
                             frame = a.frame_output.absolute()
@@ -190,7 +240,6 @@ def main():
                             if not frame.exists() or not frame.stat().st_size:
                                 raise RuntimeError('QEMU did not write a frame')
                         break
-                    complete_lines = text.split('\n')[:-1]
                     if any((not a.prepared_pair and line.startswith('RECOVERY_READONLY_CHECK_INCOMPLETE:') and
                             expected not in line) or
                            (line.startswith('RECOVERY_READONLY_CHECK_EXEC_FAILED') and
@@ -207,7 +256,9 @@ def main():
                         output.write(serial.read_bytes())
         if sha(disk) != before:
             raise RuntimeError('read-only check changed the disposable disk')
-        print('RECOVERY_PHYSICAL_PAIR_REJECTS_QEMU_DISK_PASS' if a.prepared_pair else
+        print('RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else
+              'RECOVERY_GUEST_FAT_CHECK_PASS' if a.fat_checker else
+              'RECOVERY_PHYSICAL_PAIR_REJECTS_QEMU_DISK_PASS' if a.prepared_pair else
               'RECOVERY_LOCAL_NO_NETWORK_MISSING_CHECKER_PASS' if a.missing_checker else
               'RECOVERY_LOCAL_NO_NETWORK_DIRTY_READONLY_PASS' if a.dirty else
               'RECOVERY_LOCAL_NO_NETWORK_READONLY_PASS')

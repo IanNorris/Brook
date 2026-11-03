@@ -79,6 +79,22 @@ adapter identities from overlapping the same blocks, or detect guard files
 cross-linked to a third file. The path must not be activated after any
 disk-backed filesystem or cache has been started.
 
+The pinned Nix environment produced a static musl dosfstools 4.2 checker
+(SHA-256 `99cc8160e7a076ecd9cb04e13bdbe71c4aad4c64bfdc43ea83a016c8fee9d5e3`).
+It can be rebuilt with `nix-build --no-out-link -E 'let pkgs = import
+./nix/nixpkgs.nix {}; in pkgs.pkgsStatic.dosfstools'` from the repository root.
+On disposable host FAT16 and FAT32 filesystems, `fsck.fat -n
+--variant=standard` exited zero for clean images and nonzero for a file
+crosslink, divergent FAT copies and truncation, without changing the images.
+In a private Brook/QEMU installer fixture the same static checker exited zero
+on a clean ESP and reported the shared clusters with exit 1 on a deliberately
+crosslinked ESP; full disk hashes were unchanged. The QEMU checker uses the
+installer's writable-capable block interface and is diagnostic only, not an
+admission gate. A production gate must retain exclusive ownership of the exact
+ESP across checking and mounting, enforce a read-only checker interface, accept
+only a completed exit 0, and constrain FAT geometry/interpretation. Further
+fixtures and physical validation remain necessary.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.
