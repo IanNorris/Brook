@@ -55,6 +55,14 @@ does not yet enable the generation-selection menu. Direct-partition dirty
 recovery is not automatic: the maintenance build can run `e2fsck`, but the
 installed boot refuses a dirty store pending repair.
 
+After a later hard freeze, the Dell booted from its recovery USB. A full
+read-only check of the unmounted internal SSD reported block and inode bitmap
+inconsistencies. The previously validated static `e2fsck -p` corrected them
+(exit 1); a separate `e2fsck -f -n` completed all five passes with exit 0. A
+checked restart selected the internal SSD and the hardware bridge reported the
+255,791,009,792-byte persistent desktop ready. This manual USB recovery does
+not establish automatic SSD recovery or resolve the original freeze.
+
 The original probes began on `hardware/xps9343-uefi-probe`. Keep known-good
 payloads and their exact symbol files in private build outputs; never
 repartition the user's FAT32 stick to run these probes.
