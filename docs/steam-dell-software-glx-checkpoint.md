@@ -72,3 +72,23 @@ these messages do not establish whether the process hit that ceiling, leaked
 descriptors, or encountered another FD allocation limit. Capture per-process
 FD usage and allocation failures before choosing a fix. This run does not
 establish the cause of the Dell's lost network or prove that the login works.
+
+### PulseAudio control
+
+A subsequent private-VM run inspected `/proc/<pid>/fd` after Steam's audio
+errors. Its `steam` process had 1,024 open descriptors, with descriptors
+sampled at 100–109, 400–409 and 1000–1023 all reported as `memfd`. This is
+consistent with the earlier PulseAudio investigation in
+`steam-pulse-shm-checkpoint.md`; it does not establish a general memfd leak.
+
+In a fresh boot of the same private VM, an authenticated PulseAudio 17 null
+sink was checked with `pactl info` before launching the same Steam client.
+The Steam process had 91, 94, 93 and 93 open descriptors across four samples
+about five seconds apart. This supports using the existing explicit audio
+server for further Steam diagnostics rather than merely raising the descriptor
+limit. A bounded 60-second run remained responsive, but the nested X display
+was black and no login was shown. Its log included shared-memory corruption,
+ANGLE/Vulkan initialization errors, and unavailable desktop services. These
+are leads rather than a diagnosis, and the older QEMU Steam image is not an
+exact reproduction of the Dell. The VM subsequently completed a checked flush
+and shutdown.
