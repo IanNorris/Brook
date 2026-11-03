@@ -9,6 +9,11 @@ reaping, and add a boot-bound, identity-checked cancellation/cleanup path that
 does not kill unrelated applications or discard output. Track the separate
 near-limit process count observed during Steam verification; completed-process
 counters alone are cumulative and do not establish a cleanup backlog.
+Audit the global 1,024-entry process/thread limit for browser and game
+workloads, including fixed-size tables, allocation cost, PID handling and
+scheduler scans. Raise or remove the limit with mixed-workload and exhaustion
+tests; separately fix zombie collection so more slots do not merely postpone
+the failure.
 
 ### Near-term: SSD TRIM and discard (3 November 2026)
 
