@@ -46,3 +46,29 @@ resource spike or another failure could have occurred between samples. No
 further Steam retries should be made until there is a way to capture or
 recover from the failure. A task budget does not constrain memory or protect
 against a kernel or device deadlock.
+
+## Software-rendered QEMU comparison
+
+A private clone of an older, previously clean Steam review image was booted
+with the same kernel as the Dell task-budget candidate, four virtual CPUs and
+software rendering. The Steam client/profile and device environment were not
+identical to the Dell. The first attempt stopped before launching because the
+clone had less than the launcher's required 1 GiB of unreserved space; after a
+checked shutdown, the private data filesystem was enlarged offline.
+
+A second attempt reached the client and web helper through a nested GLX-capable
+Xephyr display. It was limited to 256 job tasks and paused deliberately at a
+30-second host deadline for a QMP register capture. At the last successful
+sample, 28.6 seconds in, it had 51 reserved tasks, a peak of 117, and no budget
+refusals; the guest was still responding. The captured CPU instruction
+pointers all resolved to the scheduler idle loop, a point-in-time observation
+rather than evidence of a stall. The VM was resumed and later shut down with
+its checked filesystem and device flush.
+
+The client logs include repeated ANGLE/Vulkan initialization failures and,
+after further runtime, repeated `Too many open files` errors from attempts to
+set up PulseAudio. Brook currently reports an RLIMIT_NOFILE ceiling of 1024;
+these messages do not establish whether the process hit that ceiling, leaked
+descriptors, or encountered another FD allocation limit. Capture per-process
+FD usage and allocation failures before choosing a fix. This run does not
+establish the cause of the Dell's lost network or prove that the login works.
