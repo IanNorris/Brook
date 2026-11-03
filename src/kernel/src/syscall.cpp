@@ -576,6 +576,14 @@ struct EpollEntry {
     uint64_t eventFdIdentity = 0; // zero means initial/MOD delivery is pending
     uint64_t inGeneration = 0;
     uint64_t outGeneration = 0;
+#if defined(BROOK_EPOLL_TARGET_DIAGNOSTICS)
+    // Diagnostic only: a changed type/handle proves a representation mismatch,
+    // not necessarily close/reuse (aliases may have distinct wrappers).
+    // Equality does not prove identity: handles can themselves be reused.
+    void* diagHandle = nullptr;
+    FdType diagType = FdType::None;
+    bool diagTargetValid = false;
+#endif
 };
 
 struct EpollInstance {
@@ -10121,6 +10129,13 @@ static bool g_epollDiagEnabled = false;
 static EpollDiagSnapshot g_epollDiag[MAX_PROCESSES]{};
 void EpollDiagEnable(bool enabled) { __atomic_store_n(&g_epollDiagEnabled, enabled, __ATOMIC_RELEASE); }
 bool EpollDiagEnabled() { return __atomic_load_n(&g_epollDiagEnabled, __ATOMIC_ACQUIRE); }
+bool EpollDiagTargetAvailable() {
+#if defined(BROOK_EPOLL_TARGET_DIAGNOSTICS)
+    return true;
+#else
+    return false;
+#endif
+}
 bool EpollDiagRead(unsigned pid, EpollDiagSnapshot* output) {
     if (pid >= MAX_PROCESSES || !output) return false;
     const auto& row = g_epollDiag[pid];
@@ -10268,12 +10283,29 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
         return 0;
     }
     if (op == EPOLL_CTL_MOD && existing < 0) return -ENOENT;
-    if (op == EPOLL_CTL_ADD && existing >= 0) return -EEXIST;
+    if (op == EPOLL_CTL_ADD && existing >= 0) {
+        auto* diag=EpollDiagFor(proc);
+        EpollDiagAdd(diag,EpCtlAddExists);
+#if defined(BROOK_EPOLL_TARGET_DIAGNOSTICS)
+        const auto& previous=ep->entries[existing];
+        if(diag && previous.diagTargetValid &&
+           (previous.diagHandle!=watchref->handle || previous.diagType!=watchref->type))
+            EpollDiagAdd(diag,EpCtlAddChangedTarget);
+#endif
+        return -EEXIST;
+    }
     int slot = op == EPOLL_CTL_MOD ? existing : free;
     if (slot < 0) return -ENOMEM;
     const int oldCount = ep->count;
     const auto old = ep->entries[slot];
     ep->entries[slot] = {static_cast<int>(watchfd), ev.events, ev.data.u64};
+#if defined(BROOK_EPOLL_TARGET_DIAGNOSTICS)
+    if(EpollDiagEnabled()) {
+        ep->entries[slot].diagHandle=watchref->handle;
+        ep->entries[slot].diagType=watchref->type;
+        ep->entries[slot].diagTargetValid=true;
+    }
+#endif
     if (slot >= ep->count) ep->count = slot + 1;
     if (op == EPOLL_CTL_ADD && watchref->type == FdType::EpollFd) {
         // Include ancestors: adding at the bottom can also exceed the limit.

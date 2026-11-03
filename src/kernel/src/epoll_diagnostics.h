@@ -6,7 +6,8 @@ enum EpollDiagCounter : unsigned {
     EpCalls, EpZeroTimeout, EpIterations, EpInitialReady, EpLaterReady,
     EpTimeouts, EpInterrupts, EpBlocks, EpScanRead, EpScanWrite, EpScanHup,
     EpScanError, EpScanEdge, EpScanOneShot, EpLastFd, EpLastType,
-    EpLastRequested, EpLastReturned, EpDiagCount
+    EpLastRequested, EpLastReturned, EpCtlAddExists, EpCtlAddChangedTarget,
+    EpDiagCount
 };
 struct EpollDiagSnapshot {
     uint64_t incarnation;
@@ -14,6 +15,7 @@ struct EpollDiagSnapshot {
 };
 void EpollDiagEnable(bool enabled);
 bool EpollDiagEnabled();
+bool EpollDiagTargetAvailable();
 // Rolling atomic counters. Reject a snapshot spanning numeric PID reuse.
 bool EpollDiagRead(unsigned pid, EpollDiagSnapshot* output);
 } // namespace brook

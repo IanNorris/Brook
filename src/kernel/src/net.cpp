@@ -4488,9 +4488,11 @@ static void DebugEpollDiagnostics()
     struct Row { unsigned pid; EpollDiagSnapshot data; } top[8]{};
     for (unsigned pid = 0; pid < MAX_PROCESSES; ++pid) {
         EpollDiagSnapshot snapshot{};
-        if (!EpollDiagRead(pid, &snapshot) || !snapshot.counters[EpCalls]) continue;
+        if (!EpollDiagRead(pid, &snapshot) ||
+            (!snapshot.counters[EpCalls] && !snapshot.counters[EpCtlAddExists])) continue;
         for (unsigned slot = 0; slot < 8; ++slot) {
-            if (snapshot.counters[EpCalls] <= top[slot].data.counters[EpCalls]) continue;
+            if (snapshot.counters[EpCalls] + snapshot.counters[EpCtlAddExists] <=
+                top[slot].data.counters[EpCalls] + top[slot].data.counters[EpCtlAddExists]) continue;
             for (unsigned next = 7; next > slot; --next) top[next] = top[next - 1];
             top[slot] = {pid, snapshot}; break;
         }
@@ -4499,15 +4501,17 @@ static void DebugEpollDiagnostics()
         "calls", "zero_timeout", "iterations", "initial_ready", "later_ready",
         "timeouts", "interrupts", "block_attempts", "scan_read", "scan_write", "scan_hup",
         "scan_error", "scan_edge", "scan_oneshot", "last_fd", "last_type",
-        "last_requested", "last_returned"
+        "last_requested", "last_returned", "ctl_add_exists", "ctl_add_changed_target"
     };
     BridgeReply header;
     header.text("{\"enabled\":"); header.text(EpollDiagEnabled() ? "true" : "false");
-    header.text(",\"scope\":\"rolling counters for calls started while enabled; PID incarnation guards reuse; scans are not deliveries\",\"top\":[");
+    header.text(",\"target_comparison_available\":");
+    header.text(EpollDiagTargetAvailable() ? "true" : "false");
+    header.text(",\"scope\":\"rolling counters for calls started while enabled; changed target indicates a representation mismatch, not necessarily fd reuse; unchanged does not prove identity; PID incarnation guards reuse; scans are not deliveries\",\"top\":[");
     header.send();
     bool first = true;
     for (const auto& row : top) {
-        if (!row.data.counters[EpCalls]) break;
+        if (!row.data.counters[EpCalls] && !row.data.counters[EpCtlAddExists]) break;
         BridgeReply reply;
         if (!first) reply.text(",");
         first = false;
