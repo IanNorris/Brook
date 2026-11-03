@@ -1,5 +1,13 @@
 # Recovery and VM-control backlog
 
+### `syncfs` compatibility (3 November 2026)
+
+On the Dell, GNU `sync -f FILE` failed with `ENOSYS` because it uses `syncfs`.
+File-level `sync -d FILE` succeeded and its test file survived a checked
+restart. Implement filesystem-scoped synchronization and error propagation for
+`syncfs`, including invalid descriptors and filesystems with pending writes;
+do not report success when a flush fails.
+
 ### Retained FAT rename support (31 October 2026)
 
 Object-relative FAT `renameat` and `renameat2(RENAME_NOREPLACE)` remain

@@ -1,6 +1,6 @@
 # Dell XPS 13 9343: internal SSD installation preparation
 
-## Latest physical installation: 2 November
+## Latest physical installation: 3 November
 
 The previously installed layout has been replaced with a 256 MiB EFI partition
 and a data partition using the rest of the SSD. Brook's maintenance build ran
@@ -9,8 +9,10 @@ bridge. The 3.75 GiB source copied from USB at 23.8 MB/s, its SSD readback
 matched the source hash, the expanded ext2 check was clean, and the four EFI
 files matched their staged hashes. The maintenance shutdown reached a safe
 state and flushed the raw SSD; physical power-off is required because the
-maintenance boot reported no supported power-off method. First boot of this
-layout without USB has not yet been verified.
+maintenance boot reported no supported power-off method. The user confirmed the
+first SSD-only boot. After network recovery, the data volume was ready and an
+ordinary-user file survived a checked restart; networking returned after that
+restart. This does not prove recovery from unexpected power loss.
 
 The recovery USB's root boot files and previous active slot were retained;
 the new maintenance payload was written to its inactive slot. The installed

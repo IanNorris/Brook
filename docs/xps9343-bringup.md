@@ -1,6 +1,6 @@
 # Dell XPS 13 9343 hardware bring-up
 
-## Current checkpoint: 2 November
+## Current checkpoint: 3 November
 
 The active work branch is `hardware/xps9343-desktop-audio`. Wi-Fi and native
 Intel graphics remain unsupported. The Dell desktop uses the firmware
@@ -14,20 +14,29 @@ The user heard the Dell speakers after enabling the native HDA path. A local
 tests; Chromium YouTube was slow, stuttered and sounded distorted. Settings'
 master volume and mute controls have been exercised, but these observations do
 not establish browser playback quality or a calibrated loudness percentage.
-The Quake low-quality mixer fix still needs a physical recheck. Copyrighted
-game files and music are private test inputs and are not repository assets.
+After the SSD move, the user heard clear Quake II effects with low-quality
+8-bit mixing enabled, and then confirmed that both effects and music sounded
+good with the privately staged soundtrack. Copyrighted game files and music
+are private test inputs and are not repository assets.
 
 The user reported a public speed test of 27 Mbps download and 73 Mbps upload
 against a 900/108 Mbps connection. Another test reported 112 Mbps download
 and 0.34 Mbps upload, possibly while another test was running. These are
 different runs, not a controlled bidirectional benchmark; throughput and
-restart reliability still need work.
+restart reliability still need work. After the new SSD boot, two 4 MiB
+RAM-only host-to-Dell transfers measured 139 and 177 Mbps unpaced; two paced
+transfers measured 97 and 104 Mbps, and one Dell-to-host transfer measured
+105 Mbps. These are short binary-phase measurements including protocol and
+hashing, not wire or internet speeds. Driver counters reported no dropped RX
+packets during the upload samples; one RX backpressure entry was recorded.
 
 The SSD was subsequently repartitioned using standard tools running in a
 dedicated Brook maintenance boot. Its verified data partition covers about
 238 GiB, with a separate 256 MiB EFI partition. The copied store was checked
-and expanded, and all EFI files were read back and hashed. The first boot of
-this new layout without USB is still pending. The staged store is the prepared
+and expanded, and all EFI files were read back and hashed. The user confirmed
+the first boot without USB; after networking returned, Brook reported the full
+data volume ready. An ordinary-user file was written and file-synced, then
+read successfully after a checked restart and network reacquisition. The staged store is the prepared
 30 October snapshot; applications or settings added only to the previous SSD
 installation must be installed or configured again. The new EFI configuration
 does not yet enable the generation-selection menu. Direct-partition dirty
