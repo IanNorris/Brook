@@ -44,6 +44,8 @@ bool testWritable=false;
 bool testInstallMode=false;
 bool blockToolsMode=false;
 bool largeDataTestWritable=false;
+#endif
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_GUARD_PENDING_TEST)
 bool TestKvm() {
     uint32_t a,b,c,d;
     __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x40000000u),"c"(0));
@@ -311,6 +313,20 @@ void AhciReadOnlyInit() {
     const bool parsed=ReadWriteTarget(target,targetPresent);
     writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
         selected,info,AtaSupportsFlushExt(dma+dataOffset,512));
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    // Never fall back to production admission in this test binary. The
+    // harness additionally uses only a fresh regular-file copy as the disk.
+    auto* pendingMarker=VfsOpen("/etc/guard-pending-test",VFS_O_STREAM);
+    VnodeStat pendingStat{};char pendingValue[2]{};uint64_t pendingOffset=0;
+    const bool pendingEnabled=pendingMarker && !VfsStat(pendingMarker,&pendingStat) &&
+        !pendingStat.isDir && !pendingStat.isSymlink && pendingStat.size==2 &&
+        VfsRead(pendingMarker,pendingValue,2,&pendingOffset)==2 && pendingValue[0]=='1' && pendingValue[1]=='\n';
+    if(pendingMarker)VfsRelease(pendingMarker);
+    writeEnabled=writeEnabled && pendingEnabled && TestKvm() && pci.vendorId==0x8086 && pci.deviceId==0x2922 &&
+        pci.bus==0 && pci.dev==31 && pci.fn==2 && selected==0 && info.sectors==262144 &&
+        info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
+        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-RECOVERY-QA");
+#endif
 #if defined(BROOK_SSD_INSTALLER)
     // Require an exact boot marker and no system-volume selector; reserve the
     // admitted target exclusively for the chosen installer mode, outside the registry.

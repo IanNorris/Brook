@@ -20,6 +20,13 @@ bool AhciSystemGuardIsReservedDevice(Device* device);
 // Expected disk GUID, data-partition GUID and verified primary UUID as
 // lowercase hex. Available only after the reserved guard device is ready.
 bool AhciSystemGuardIdentity(char (&out)[97]);
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+// Disposable QEMU test build only. The separate adapter advertises stable
+// writable capability but denies writes until the one-shot test transaction.
+Device* AhciSystemGuardTestPrepare(Device* reserved);
+bool AhciSystemGuardTestBeginWrites(Device* adapter);
+void AhciSystemGuardTestFinish(Device* adapter);
+#endif
 // Optional, read-only boot diagnostic. Does not mount or change the disk.
 void AhciSystemDataInspect();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)

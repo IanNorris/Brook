@@ -128,6 +128,27 @@ host FAT16/FAT32 tests cover read failures, incorrect mounted geometry,
 one-shot behavior and cleared output. This binding remains read-only until
 reboot and cannot serve as the later writable transaction handoff.
 
+Separately, a default-off `BROOK_SSD_GUARD_PENDING_TEST` build exercises the
+pending-record transaction end to end on a disposable QEMU SATA fixture. Its
+driver requires KVM, a dedicated marker, exact QEMU controller/disk identity,
+geometry and flush support in addition to the existing write-target check; the
+host harness attaches only a new regular-file copy. A second private adapter
+keeps writes disabled during checker execution and FAT preparation, enables
+only owner-routed ESP writes during the one-shot transaction, then permanently
+disables itself. GPT and data-partition writes remain reserved. This is not
+compiled into the ordinary recovery kernel and cannot authorize ext2 repair.
+
+The test boots the real checker, validates the FAT profile and both records,
+writes and independently reads back the pending pair, and compares the full
+disk against its original with differences restricted to the two guard data
+areas and permitted directory timestamps/archive bits. A fixture-bound EFI
+loader accepts the original clean records and selects verified recovery after
+the pending transaction. Injected failures before each transaction operation
+are checked against the exact expected record states and the subsequent EFI
+choice. These are logical failure tests in QEMU, not physical power-cut or
+controller-cache durability evidence. The test adapter and its safety checks
+must not be mistaken for a production writable recovery handoff.
+
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and
 metadata changes, handles short/error reads, and is covered by host tests. It

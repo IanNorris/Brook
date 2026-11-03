@@ -4,6 +4,9 @@
 #include "ahci_system_volume.h"
 #include "exec_image.h"
 #include "fatfs_vfs.h"
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#include "fw_cfg.h"
+#endif
 #include "process.h"
 #include "scheduler.h"
 #include "kprintf.h"
@@ -88,6 +91,37 @@ void Worker(void* arg) {
     KPuts("GUARD_CHECK_RESULT exit=0\n");
     uint8_t records[2][128]{};char identity[97]{};
     if(!AhciSystemGuardIdentity(identity)) {KPuts("GUARD_RECORDS_INCOMPLETE identity\n");return;}
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    auto* adapter=AhciSystemGuardTestPrepare(device);
+    FatPrivateMount* mount=nullptr;
+    if(!adapter || !FatFsMountPrivateRecovery(1,adapter,&mount) ||
+       !FatFsPrivateRecoveryGeometryMatches(mount,profile)) {
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_TEST_INCOMPLETE mount\n");return;
+    }
+    const int inspection=FatFsPrivateRecoveryInspect(mount,records[0],records[1]);
+    if(inspection || !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
+        AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_TEST_INCOMPLETE records=%d\n",inspection);return;
+    }
+    if(!AhciSystemGuardTestBeginWrites(adapter)) {
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_TEST_INCOMPLETE authorization\n");return;
+    }
+    char injection[3]{};const uint32_t rawLength=FwCfgReadFile("opt/guard-pending-fail",injection,sizeof(injection));
+    const uint32_t length=rawLength && rawLength<=sizeof(injection) && !injection[rawLength-1]?rawLength-1:rawLength;
+    uint32_t failAt=0;
+    for(uint32_t i=0;i<length && i<sizeof(injection);++i) {
+        if(injection[i]<'0' || injection[i]>'9') {failAt=99;break;}
+        failAt=failAt*10+uint32_t(injection[i]-'0');
+    }
+    if(rawLength>sizeof(injection) || length>2 || failAt>11 || (rawLength && !failAt)) {
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_TEST_INCOMPLETE injection\n");return;
+    }
+    const int pending=FatFsPrivateRecoveryTestPending(mount,identity,failAt);
+    AhciSystemGuardTestFinish(adapter);
+    if(FatFsPrivateRecoveryTestPending(mount,identity,failAt)!=0) {
+        KPuts("GUARD_PENDING_TEST_INCOMPLETE repeated\n");return;
+    }
+    KPrintf("GUARD_PENDING_TEST_RESULT outcome=%d\n",pending);return;
+#else
     const int inspection=FatFsGuardInspectReadOnly(1,device,profile,records);
     if(inspection) {KPrintf("GUARD_RECORDS_INCOMPLETE read=%d\n",inspection);return;}
     if(!BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
@@ -96,6 +130,7 @@ void Worker(void* arg) {
     // This is diagnostic evidence only. It grants neither repair nor normal
     // boot admission; the read-only binding remains held until reboot.
     KPuts("GUARD_RECORDS_MATCH\n");
+#endif
 }
 }
 bool GuardCheckerStart(Device* device) {

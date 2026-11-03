@@ -44,6 +44,32 @@ uint64_t GuardBlocks(Device*) {return guardReady?guardRange.bytes/512:0;}
 uint32_t GuardBlockSize(Device*) {return 512;}
 const BlockDeviceOps guardOps{GuardRead,GuardWrite,GuardControl,nullptr,GuardBlocks,GuardBlockSize};
 Device guardPartition{reinterpret_cast<const DeviceOps*>(&guardOps),"ahci-guard-esp",DeviceType::Block,nullptr};
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+enum class GuardTestPhase : uint8_t {Disabled,Preparation,Writing,Finished,Failed};
+GuardTestPhase guardTestPhase=GuardTestPhase::Disabled;
+int GuardTestRead(Device*,uint64_t offset,void* data,uint64_t length) {
+    if(guardTestPhase!=GuardTestPhase::Preparation && guardTestPhase!=GuardTestPhase::Writing)return -19;
+    return GuardRead(nullptr,offset,data,length);
+}
+int GuardTestWrite(Device*,uint64_t offset,const void* data,uint64_t length) {
+    if(guardTestPhase!=GuardTestPhase::Writing) {guardTestPhase=GuardTestPhase::Failed;return -30;}
+    if(offset>guardRange.bytes || length>guardRange.bytes-offset) {guardTestPhase=GuardTestPhase::Failed;return -22;}
+    const int result=DeviceWriteLeased(guardRange.parent,&guardPartition,guardRange.start+offset,data,length);
+    if(result<0 || uint64_t(result)!=length)guardTestPhase=GuardTestPhase::Failed;
+    return result;
+}
+int GuardTestControl(Device*,uint32_t request,void*) {
+    if(request==DEVICE_IOCTL_READ_ONLY)return 0;
+    if(request==DEVICE_IOCTL_FLUSH && (guardTestPhase==GuardTestPhase::Preparation || guardTestPhase==GuardTestPhase::Writing)) {
+        const int error=DeviceFlush(guardRange.parent);if(error)guardTestPhase=GuardTestPhase::Failed;return error;
+    }
+    return -95;
+}
+uint64_t GuardTestBlocks(Device*) {return guardReady?guardRange.bytes/512:0;}
+uint32_t GuardTestBlockSize(Device*) {return 512;}
+const BlockDeviceOps guardTestOps{GuardTestRead,GuardTestWrite,GuardTestControl,nullptr,GuardTestBlocks,GuardTestBlockSize};
+Device guardTestPartition{reinterpret_cast<const DeviceOps*>(&guardTestOps),"ahci-guard-test",DeviceType::Block,nullptr};
+#endif
 int Read(Device*,uint64_t offset,void* data,uint64_t length) {
     if(offset>range.bytes || length>range.bytes-offset)return -22;
     return range.parent->ops->read(range.parent,range.start+offset,data,length);
@@ -184,7 +210,11 @@ Device* AhciSystemGuardPrepare() {
     if(!AhciDirectGuardLeases(layout,reinterpret_cast<uintptr_t>(disk),0,
                               reinterpret_cast<uintptr_t>(&guardPartition),leases) ||
        !DeviceInstallBootWriteLeases(leases,4))return nullptr;
-    guardReady=true;return &guardPartition;
+    guardReady=true;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    if(!DeviceRegister(&guardTestPartition)) {guardReady=false;return nullptr;}
+#endif
+    return &guardPartition;
 }
 bool AhciSystemGuardIsReservedDevice(Device* device) {return device==&guardPartition;}
 bool AhciSystemGuardIdentity(char (&out)[97]) {
@@ -196,6 +226,19 @@ bool AhciSystemGuardIdentity(char (&out)[97]) {
     }
     out[at]=0;return true;
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+Device* AhciSystemGuardTestPrepare(Device* reserved) {
+    if(reserved!=&guardPartition || !guardReady || guardTestPhase!=GuardTestPhase::Disabled)return nullptr;
+    guardTestPhase=GuardTestPhase::Preparation;return &guardTestPartition;
+}
+bool AhciSystemGuardTestBeginWrites(Device* adapter) {
+    if(adapter!=&guardTestPartition || guardTestPhase!=GuardTestPhase::Preparation)return false;
+    guardTestPhase=GuardTestPhase::Writing;return true;
+}
+void AhciSystemGuardTestFinish(Device* adapter) {
+    if(adapter==&guardTestPartition && guardTestPhase!=GuardTestPhase::Failed)guardTestPhase=GuardTestPhase::Finished;
+}
+#endif
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     if(attempted)return Fail("repeated admission");attempted=true;
     VnodeStat st{};const int exists=VfsLstatPath("/etc/ahci-boot-volume",&st);

@@ -25,6 +25,7 @@ from hardware_update_protocol import record
 from hardware_recovery_fsck import validate_checker
 from prepare_hardware_kernel_pair import module_version
 from prepare_ssd_recovery_pair import AUTO_CHECK_INIT, AUTO_CHECK_PAYLOAD_ID
+from test_recovery_menu_boot import boot as boot_menu_fixture
 
 
 def sha(path):
@@ -65,6 +66,16 @@ def main():
                    help='Corrupt one byte of the private checker to test digest rejection')
     p.add_argument('--guard-records', choices=('valid', 'mismatch', 'wrong-identity', 'missing', 'oversized'),
                    help='Exercise read-only private guard record inspection')
+    p.add_argument('--guard-pending-test', action='store_true',
+                   help='Run a writable pending transaction only on this private QEMU disk')
+    p.add_argument('--guard-pending-no-marker', action='store_true',
+                   help='Verify the pending test refuses its disk without the test marker')
+    p.add_argument('--guard-pending-wrong-serial', action='store_true',
+                   help='Verify the pending test refuses a differently identified disk')
+    p.add_argument('--guard-pending-fail-at', type=int, choices=range(1,12),
+                   help='Inject a failure at a specific pending transaction operation')
+    p.add_argument('--guarded-efi', type=Path,
+                   help='Verify a fixture-bound EFI loader accepts clean guards and rejects pending')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
@@ -83,6 +94,18 @@ def main():
     if a.guard_records and (not a.guard_real_checker or a.guard_reservation != 'valid' or
                             a.guard_bad_checker or a.fat_crosslink):
         p.error('guard record test requires the clean checker and valid reservation')
+    if a.guard_pending_test and not a.guard_records:
+        p.error('pending transaction test requires private guard records')
+    if (a.guard_pending_no_marker or a.guard_pending_wrong_serial) and not a.guard_pending_test:
+        p.error('pending test refusal cases require --guard-pending-test')
+    if a.guard_pending_no_marker and a.guard_pending_wrong_serial:
+        p.error('choose one pending test admission failure')
+    if a.guard_pending_fail_at and (not a.guard_pending_test or a.guard_records!='valid' or
+                                    a.guard_pending_no_marker or a.guard_pending_wrong_serial):
+        p.error('pending fault injection requires the admitted valid-record case')
+    if a.guarded_efi and (not a.guard_pending_test or a.guard_records!='valid' or
+                          a.guard_pending_no_marker or a.guard_pending_wrong_serial):
+        p.error('guarded EFI test requires the successful pending scenario')
     if a.guard_reservation and (not (a.guard_open_probe or a.guard_real_checker) or not a.kernel_build):
         p.error('guard reservation requires a guard-only kernel and a checker or open probe')
     if a.guard_real_checker and not a.guard_reservation:
@@ -166,7 +189,8 @@ def main():
                 esp_guid = ('0' if esp_guid[0] != '0' else '1') + esp_guid[1:]
             data_guid = uuid.UUID(parts[1]['uuid']).bytes_le.hex()
             records = {
-                'ahci-write-target': 'BRKAHCI1\n32902,10530,0,31,2,0,262144,512,512\nQEMU HARDDISK\nBROOK-RECOVERY-QA\n',
+                'ahci-write-target': 'BRKAHCI1\n32902,10530,0,31,2,0,262144,512,512\nQEMU HARDDISK\n' +
+                                     ('BROOK-WRONG-ID\n' if a.guard_pending_wrong_serial else 'BROOK-RECOVERY-QA\n'),
                 'ahci-boot-volume': f'BRKESP1\n{disk_guid}\n{esp_guid}\n2048,131072\n',
                 'ahci-data-volume': f'BRKDATA1\n{disk_guid}\n{data_guid}\n133120,126976\n{ext2_uuid.hex()}\n',
             }
@@ -179,6 +203,13 @@ def main():
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(record_file), '::ETC/' + name], check=True)
                 if subprocess.check_output(['mtype', '-i', str(initrd), '::ETC/' + name]) != content.encode():
                     raise RuntimeError('guard reservation record readback mismatch: ' + name)
+            if a.guard_pending_test and not a.guard_pending_no_marker:
+                marker=work/'guard-pending-test';marker.write_bytes(b'1\n')
+                subprocess.run(['mcopy','-o','-i',str(initrd),str(marker),'::ETC/guard-pending-test'],check=True)
+            elif a.guard_pending_no_marker:
+                subprocess.run(['mdel','-i',str(initrd),'::ETC/guard-pending-test'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                if subprocess.run(['mtype','-i',str(initrd),'::ETC/guard-pending-test'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0:
+                    raise RuntimeError('pending marker unexpectedly present')
         init = work / 'INIT.RC'; init.write_bytes(AUTO_CHECK_INIT)
         ident = work / 'hardware-payload-id'; ident.write_bytes(AUTO_CHECK_PAYLOAD_ID)
         if not a.prepared_pair:
@@ -250,7 +281,16 @@ def main():
                 if a.guard_records=='oversized' and index==1:contents+=b'X'
                 record_file=work/f'guard{index}.bin';record_file.write_bytes(contents)
                 subprocess.run(['mcopy','-o','-i',media,str(record_file),target],check=True)
+        if a.guarded_efi:
+            efi=a.guarded_efi.resolve(strict=True)
+            subprocess.run(['mcopy','-o','-i',media,str(efi),'::/EFI/BOOT/BOOTX64.EFI'],check=True)
+            normal=work/'normal-boot';normal.mkdir()
+            boot_menu_fixture(disk,a.firmware.resolve(strict=True),normal,False,'BOOT: complete',90,True,
+                              'Recovery required; normal boot blocked.',sata_snapshot=True)
         before = sha(disk)
+        baseline=None
+        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial):
+            baseline=work/'baseline.raw';shutil.copyfile(disk,baseline)
         poison = None
         if a.guard_poison_boot:
             poison = work / 'poison.raw'
@@ -268,12 +308,15 @@ def main():
                    '-drive', f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE.fd"}',
                    '-drive', f'if=pflash,format=raw,file={work / "vars.fd"}', '-device', 'VGA',
                    '-drive', f'if=none,id=sata,format=raw,file={disk}',
-                   '-device', 'ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=BROOK-RECOVERY-QA',
+                   '-device', 'ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=' +
+                              ('BROOK-WRONG-ID' if a.guard_pending_wrong_serial else 'BROOK-RECOVERY-QA'),
                    '-display', 'none', '-serial', f'file:{serial}',
                    '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot']
         if poison:
             command += ['-drive', f'if=none,id=poison,format=raw,file={poison}',
                         '-device', 'virtio-blk-pci,drive=poison']
+        if a.guard_pending_fail_at:
+            command += ['-fw_cfg', f'name=opt/guard-pending-fail,string={a.guard_pending_fail_at}']
         with (work / 'qemu.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             stop = threading.Event()
@@ -295,7 +338,8 @@ def main():
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited before local check completed')
                     text = serial.read_text(errors='replace') if serial.exists() else ''
-                    if (a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') and
+                    if ((a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or
+                         a.guard_pending_no_marker or a.guard_pending_wrong_serial) and
                             'SSD guard reservation failed; no recovery access permitted' in text and
                             'System halted.' in text):
                         if 'SSD_GUARD_RESERVATION_READY' in text or 'ahci system: verified GPT entry' in text:
@@ -304,7 +348,12 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = (('GUARD_RECORDS_MATCH' if a.guard_records=='valid' else
+                    pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
+                    expected = ((f'GUARD_PENDING_TEST_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
+                                 'GUARD_PENDING_TEST_INCOMPLETE records=0' if a.guard_records in ('mismatch','wrong-identity') else
+                                 'GUARD_PENDING_TEST_INCOMPLETE records=-2' if a.guard_records=='missing' else
+                                 'GUARD_PENDING_TEST_INCOMPLETE records=-22') if a.guard_pending_test else
+                                ('GUARD_RECORDS_MATCH' if a.guard_records=='valid' else
                                  'GUARD_RECORDS_INCOMPLETE mismatch' if a.guard_records in ('mismatch','wrong-identity') else
                                  'GUARD_RECORDS_INCOMPLETE read=-2' if a.guard_records=='missing' else
                                  'GUARD_RECORDS_INCOMPLETE read=-22') if a.guard_records else
@@ -378,7 +427,7 @@ def main():
                 if a.serial_output and serial.exists():
                     with a.serial_output.open('xb') as output:
                         output.write(serial.read_bytes())
-        if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid'):
+        if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_pending_no_marker or a.guard_pending_wrong_serial:
             final = serial.read_text(errors='replace')
             if (final.count('SSD_GUARD_RESERVATION_FAILED') != 1 or
                     'SSD guard reservation failed; no recovery access permitted' not in final or
@@ -387,11 +436,87 @@ def main():
                                                        'BOOT: 65% Modules', 'SSD_GUARD_RESERVATION_READY',
                                                        'ahci system: verified GPT entry', 'writable desktop: ready'))):
                 raise RuntimeError('guard failure did not halt before later boot stages: ' + final[-5000:])
-        if sha(disk) != before:
+        if baseline:
+            # Ensure only the fixed guard data and their directory entries
+            # changed; GPT, data partition, FAT tables and boot code are not
+            # allowed to change. This is a logical-write test, not a power cut.
+            offset=2048*512;length=131072*512
+            with baseline.open('rb') as source:
+                source.seek(offset);esp=source.read(length)
+            if len(esp)!=length:raise RuntimeError('short baseline ESP')
+            reserved=struct.unpack_from('<H',esp,14)[0];nfats=esp[16]
+            fat=struct.unpack_from('<H',esp,22)[0] or struct.unpack_from('<I',esp,36)[0]
+            root=struct.unpack_from('<H',esp,17)[0];csize=esp[13]
+            data_start=reserved+nfats*fat+(root+15)//16
+            if nfats!=2 or not fat or not csize:raise RuntimeError('invalid baseline FAT geometry')
+            allowed=[]
+            expected_pending=bytearray(record_data)
+            struct.pack_into('<QI',expected_pending,8,2,2)
+            struct.pack_into('<I',expected_pending,124,zlib.crc32(expected_pending[:124]))
+            if not a.guard_pending_fail_at:
+                expected_records=[expected_pending,expected_pending]
+            elif a.guard_pending_fail_at<=4:
+                expected_records=[record_data,record_data]
+            elif a.guard_pending_fail_at<=7:
+                expected_records=[expected_pending,record_data]
+            else:
+                expected_records=[expected_pending,expected_pending]
+            attribute_offsets=[]
+            actual_records=[]
+            for index in range(2):
+                name=(f'GUARD{index}  BIN').encode();positions=[];at=0
+                while True:
+                    at=esp.find(name,at)
+                    if at<0:break
+                    if at%32==0 and not (esp[at+11]&0x18):positions.append(at)
+                    at+=1
+                if len(positions)!=1:raise RuntimeError('guard directory entry not unique')
+                at=positions[0];cluster=struct.unpack_from('<H',esp,at+26)[0] | (struct.unpack_from('<H',esp,at+20)[0]<<16)
+                if cluster<2 or struct.unpack_from('<I',esp,at+28)[0]!=128:raise RuntimeError('invalid guard directory entry')
+                guard_offset=(data_start+(cluster-2)*csize)*512
+                # FatFs may update the archive bit, access date and modified
+                # timestamp. Names, cluster pointers and sizes must not change.
+                allowed += [(offset+at+11,offset+at+12),(offset+at+18,offset+at+20),
+                            (offset+at+22,offset+at+26),(offset+guard_offset,offset+guard_offset+128)]
+                attribute_offsets.append(offset+at+11)
+                actual=subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])
+                if actual!=expected_records[index]:
+                    raise RuntimeError('pending record readback failed')
+                actual_records.append(actual)
+            if not a.guard_pending_fail_at and actual_records[0]!=actual_records[1]:
+                raise RuntimeError('pending records differ')
+            changes=0;pos=0
+            with baseline.open('rb') as old,disk.open('rb') as new:
+                while True:
+                    left=old.read(1024*1024);right=new.read(1024*1024)
+                    if len(left)!=len(right):raise RuntimeError('disk size changed')
+                    if not left:break
+                    if left!=right:
+                        for i,(a_byte,b_byte) in enumerate(zip(left,right)):
+                            if a_byte!=b_byte:
+                                absolute=pos+i;changes+=1
+                                if not any(start<=absolute<end for start,end in allowed):
+                                    raise RuntimeError(f'unexpected disk write at byte {absolute}')
+                                if absolute in attribute_offsets and ((a_byte^b_byte)&~0x20):
+                                    raise RuntimeError('guard attributes changed beyond the archive bit')
+                    pos+=len(left)
+            if not changes and not a.guard_pending_fail_at:raise RuntimeError('pending transaction changed no bytes')
+            if a.guarded_efi:
+                guard_boot=work/'pending-boot';guard_boot.mkdir();pending_hash=sha(disk)
+                clean=expected_records[0]==record_data and expected_records[1]==record_data
+                marker='BOOT: complete' if clean else 'Brook SSD recovery payload verified'
+                boot_menu_fixture(disk,a.firmware.resolve(strict=True),guard_boot,False,marker,90,True,
+                                  'Recovery required; normal boot blocked.' if clean else None,sata_snapshot=True)
+                guard_log=(guard_boot/'serial.log').read_text(errors='replace')
+                if not clean and 'Recovery required; normal boot blocked.' not in guard_log:
+                    raise RuntimeError('guarded EFI did not block normal boot for pending records')
+                if sha(disk)!=pending_hash:raise RuntimeError('guarded reboot changed the source disk')
+        elif sha(disk) != before:
             raise RuntimeError('read-only check changed the disposable disk')
         if poison and sha(poison) != poison_before:
             raise RuntimeError('guard boot changed the overmount fixture')
-        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker else
+        print('RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker or a.guard_pending_no_marker or a.guard_pending_wrong_serial else
+              'RECOVERY_GUEST_GUARD_PENDING_PASS' if a.guard_pending_test else
               'RECOVERY_GUEST_GUARD_CHECK_PASS' if a.guard_real_checker else
               'RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else
               'RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else

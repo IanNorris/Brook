@@ -2,6 +2,9 @@
 #if defined(BROOK_SSD_GUARD_CHECK)
 #include "guard_fat_profile.h"
 #endif
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#include "../../shared/update/recovery_guard_transaction.h"
+#endif
 #include "vfs.h"
 #include "vfs_object.h"
 #include "fatfs_object.h"
@@ -94,6 +97,9 @@ struct FatPrivateMount {
     Vnode* nodes[2];
     FatImageLease* leases[2];
     bool inspected;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    bool pendingAttempted;
+#endif
 };
 
 // FIL stays first so existing vnode/cache users can retain their FIL pointer.
@@ -1687,6 +1693,35 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* se
     for(unsigned i=0;!error && i<2;++i)error=FatFsGuardFlushReadback(session->leases[i],buffers[i]);
     return error;
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* session,const GuardFatProfile& p) {
+    if(!session || !session->mount || (p.type!=16 && p.type!=32))return false;
+    const auto& fs=session->mount->fs;
+    return fs.fs_type==(p.type==16?FS_FAT16:FS_FAT32) && fs.volbase==0 &&
+        fs.fatbase==p.fatStart && fs.fsize==p.fatSectors && fs.database==p.dataStart &&
+        fs.csize==p.sectorsPerCluster && fs.n_fatent==p.clusters+2 &&
+        fs.n_rootdir==p.rootEntries && fs.n_fats==2 &&
+        fs.dirbase==(p.type==32?p.rootCluster:p.fatStart+2*p.fatSectors);
+}
+int FatFsPrivateRecoveryTestPending(FatPrivateMount* session,const char* identity,uint32_t failAt) {
+    if(!session || !session->mount || !session->inspected || !session->leases[0] || !session->leases[1] ||
+       __atomic_exchange_n(&session->pendingAttempted,true,__ATOMIC_ACQ_REL))return 0;
+    struct Io {
+        FatPrivateMount* session;uint32_t failAt,operation=0;
+        bool Step() {return ++operation!=failAt;}
+        bool Read(unsigned i,uint8_t* out,unsigned size) {
+            return Step() && i<2 && size==128 && !FatFsGuardFlushReadback(session->leases[i],out);
+        }
+        bool Write(unsigned i,const uint8_t* bytes,unsigned size) {
+            return Step() && i<2 && size==128 && FatFsImageWrite(session->leases[i],0,bytes,size)==128;
+        }
+        bool Sync(unsigned i) {return Step() && i<2 && !FatFsImageFlush(session->leases[i]);}
+        bool Flush() {return Step() && !FatFsSync(session->mount);}
+    } io{session,failAt};
+    const auto result=BrookGuardBeginRepair(io,identity);
+    return result==BrookGuardBeginResult::PendingDurable?2:result==BrookGuardBeginResult::Uncertain?1:0;
+}
+#endif
 Device* FatFsImageLeaseDevice(FatImageLease* lease)
 {
     if(!lease)return nullptr;

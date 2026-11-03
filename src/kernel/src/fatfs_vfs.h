@@ -17,6 +17,12 @@ struct GuardFatProfile;
 // a mount or granting recovery/write authority. Outputs are cleared on error.
 int FatFsGuardInspectReadOnly(uint8_t pdrv, Device* device, const GuardFatProfile& profile,
                               uint8_t (&records)[2][128]);
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* mount,const GuardFatProfile& profile);
+// 0 rejected, 1 uncertain, 2 pending records durably verified. One shot;
+// never grants data-partition or normal boot authority.
+int FatFsPrivateRecoveryTestPending(FatPrivateMount* mount,const char* identity,uint32_t failAt);
+#endif
 #endif
 void FatFsVfsRegister();
 // Boot-only, one-shot mount on a pinned exclusive binding. It is not inserted
