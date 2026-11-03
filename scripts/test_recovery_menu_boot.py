@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
-         hold_after_marker=0):
+         hold_after_marker=0, sata_serial=None, failure_marker=None):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -31,7 +31,8 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
     if sata:
         command += [
             '-drive', f'if=none,id=stick,format=raw,snapshot={"on" if sata_snapshot else "off"},file={image}',
-            '-device', 'ide-hd,drive=stick,bus=ide.0,bootindex=1',
+            '-device', 'ide-hd,drive=stick,bus=ide.0,bootindex=1' +
+                       (f',serial={sata_serial}' if sata_serial else ''),
         ]
     else:
         command += [
@@ -61,6 +62,8 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                     except OSError:
                         pass
                 data = serial.read_bytes() if serial.exists() else b''
+                if failure_marker and failure_marker.encode() in data:
+                    raise RuntimeError(f'boot reported {failure_marker!r}; serial tail: {data[-10000:]!r}')
                 if forbidden and forbidden.encode() in data:
                     raise RuntimeError(f'unexpected boot marker {forbidden!r}')
                 if marker.encode() in data:
@@ -73,7 +76,7 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                         time.sleep(0.1)
                     return
                 time.sleep(0.2)
-            raise RuntimeError(f'timed out waiting for {marker!r}; serial tail: {data[-1500:]!r}')
+            raise RuntimeError(f'timed out waiting for {marker!r}; serial tail: {data[-10000:]!r}')
         finally:
             process.terminate()
             try:

@@ -82,6 +82,10 @@ def main():
                    help='Complete verified recovery on the private QEMU disk')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
                    help='Inject a failure in the guard completion transaction')
+    p.add_argument('--guard-desktop-kernel-build', type=Path,
+                   help='Also boot a normal kernel and read the repaired filesystem')
+    p.add_argument('--guard-desktop-probe', type=Path,
+                   help='Static recovery_mount_check workload for normal boot')
     p.add_argument('--guard-ext2-bad-checker', action='store_true',
                    help='Alter the private ext2 checker to test digest rejection')
     p.add_argument('--guard-ext2-missing-checker', action='store_true',
@@ -123,6 +127,9 @@ def main():
         p.error('completion requires an uninjected guarded ext2 repair')
     if a.guard_complete_fail_at and not a.guard_complete_test:
         p.error('completion fault injection requires the completion test')
+    if bool(a.guard_desktop_kernel_build)!=bool(a.guard_desktop_probe) or (
+            a.guard_desktop_kernel_build and (not a.guard_complete_test or a.guard_complete_fail_at)):
+        p.error('desktop verification needs a normal kernel, probe and uninjected completion')
     if (a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) and (not a.guard_ext2_test or a.guard_pending_fail_at):
         p.error('ext2 checker failure requires an uninjected guarded ext2 run')
     if a.guard_ext2_bad_checker and a.guard_ext2_missing_checker:
@@ -154,12 +161,40 @@ def main():
             partition = work / 'partition.img'
             subprocess.run(['dd', f'if={disk}', f'of={partition}', 'bs=512',
                             'skip=133120', 'count=126976', 'status=none'], check=True)
+            if a.guard_desktop_kernel_build:
+                with partition.open('rb') as stream:
+                    stream.seek(1024+104); original_uuid=stream.read(16)
+                if len(original_uuid)!=16 or not any(original_uuid):
+                    raise RuntimeError('normal-mount fixture lacks its original UUID')
+                subprocess.run(['mke2fs','-q','-F','-t','ext2','-b','4096','-I','128','-N','1024',
+                                '-m','0','-O','none,filetype,sparse_super,large_file',
+                                '-U',str(uuid.UUID(bytes=original_uuid)),str(partition)],check=True,
+                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             if a.guard_ext2_test:
                 known=work/'known.txt';known.write_bytes(b'Brook guarded recovery fixture\n')
                 subprocess.run(['debugfs','-w','-R',f'write {known} /brook-recovery-known',str(partition)],
                                check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 actual=subprocess.check_output(['debugfs','-R','cat /brook-recovery-known',str(partition)],stderr=subprocess.DEVNULL)
                 if actual!=known.read_bytes():raise RuntimeError('known file was not created')
+            if a.guard_desktop_kernel_build:
+                # Minimal, explicitly synthetic desktop tree on the private
+                # ext2 image. The normal kernel still runs real admission.
+                dirs=('store','profile','profile/bin','profile/lib','profile/share',
+                      'profile/share/applications','home','home/brook','var','var/cache',
+                      'var/cache/narinfo','share','share/applications','index','bin')
+                for name in dirs:
+                    for command in (f'mkdir /{name}', f'set_inode_field /{name} uid 1000',
+                                    f'set_inode_field /{name} gid 1000'):
+                        subprocess.run(['debugfs','-w','-R',command,str(partition)],check=True,
+                                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                for name in ('profile/manifest.tsv','index/packages.idx','share/applications/applications.idx',
+                             'bin/nix','bin/nix-fetch','bin/nar-unpack','profile/bin/brook-firefox',
+                             'profile/bin/brook-chromium','profile/bin/brook-gallery'):
+                    subprocess.run(['debugfs','-w','-R',f'write {known} /{name}',str(partition)],check=True,
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    if name.startswith(('bin/','profile/bin/')):
+                        subprocess.run(['debugfs','-w','-R',f'set_inode_field /{name} mode 0100755',str(partition)],
+                                       check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             if a.dirty:
                 for command in ('setb 10000', 'set_super_value state 0'):
                     subprocess.run(['debugfs', '-w', '-R', command, str(partition)], check=True,
@@ -238,6 +273,36 @@ def main():
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(record_file), '::ETC/' + name], check=True)
                 if subprocess.check_output(['mtype', '-i', str(initrd), '::ETC/' + name]) != content.encode():
                     raise RuntimeError('guard reservation record readback mismatch: ' + name)
+            if a.guard_desktop_kernel_build:
+                normal_initrd=work/'normal-initrd.img'
+                subprocess.run(['mcopy','-i',media,'::/INITRD.IMG',str(normal_initrd)],check=True)
+                for directory in ('MEDIA','MEDIA/SYSTEM','NIX','DATA'):
+                    subprocess.run(['mmd','-i',str(normal_initrd),'::/'+directory],
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    subprocess.run(['mdir','-i',str(normal_initrd),'::/'+directory],check=True,
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                for marker in ('ahci-observe','ahci-read-only','volatile-desktop'):
+                    ahci_marker=work/('normal-'+marker);ahci_marker.write_bytes(b'1\n')
+                    subprocess.run(['mcopy','-o','-i',str(normal_initrd),str(ahci_marker),'::ETC/'+marker],check=True)
+                for name,content in records.items():
+                    item=work/('normal-'+name);item.write_text(content)
+                    subprocess.run(['mcopy','-o','-i',str(normal_initrd),str(item),'::ETC/'+name],check=True)
+                normal_init=work/'normal-init.rc'
+                normal_init.write_bytes(b'set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/RCVMOUNT.ELF\n')
+                subprocess.run(['mcopy','-o','-i',str(normal_initrd),str(normal_init),'::BOOT/INIT.RC'],check=True)
+                subprocess.run(['mcopy','-o','-i',str(normal_initrd),str(a.guard_desktop_probe.resolve(strict=True)),
+                                '::BOOT/RCVMOUNT.ELF'],check=True)
+                normal_build=a.guard_desktop_kernel_build.resolve(strict=True)
+                listing=subprocess.check_output(['mdir','-a','-b','-i',str(normal_initrd),'::/DRIVERS/*'],text=True)
+                for line in listing.splitlines():
+                    name=line.rsplit('/',1)[-1]
+                    if not name.lower().endswith('.mod') or '/' in name or '..' in name:
+                        raise RuntimeError('unexpected normal module name')
+                    module=normal_build/'drivers'/name.lower()
+                    if module_version(module.read_bytes())!=64:raise RuntimeError('unexpected normal module ABI')
+                    subprocess.run(['mcopy','-o','-i',str(normal_initrd),str(module),'::DRIVERS/'+name],check=True)
+                subprocess.run(['mcopy','-o','-i',media,str(normal_initrd),'::/INITRD.IMG'],check=True)
+                subprocess.run(['mcopy','-o','-i',media,str(normal_build/'BROOK.elf'),'::/KERNEL/BROOK.ELF'],check=True)
             if a.guard_pending_test and not a.guard_pending_no_marker:
                 marker=work/'guard-pending-test';marker.write_bytes(b'1\n')
                 subprocess.run(['mcopy','-o','-i',str(initrd),str(marker),'::ETC/guard-pending-test'],check=True)
@@ -585,10 +650,18 @@ def main():
             if a.guarded_efi:
                 guard_boot=work/'pending-boot';guard_boot.mkdir();pending_hash=sha(disk)
                 clean=(expected_records[0]==expected_records[1] and struct.unpack_from('<I',expected_records[0],16)[0]==1)
-                marker='BOOT: complete' if clean else 'Brook SSD recovery payload verified'
+                marker=('RECOVERY_NORMAL_DATA_READ_PASS' if clean and a.guard_desktop_kernel_build else
+                        'BOOT: complete' if clean else 'Brook SSD recovery payload verified')
                 boot_menu_fixture(disk,a.firmware.resolve(strict=True),guard_boot,False,marker,90,True,
-                                  'Recovery required; normal boot blocked.' if clean else None,sata_snapshot=True)
+                                  'Recovery required; normal boot blocked.' if clean else None,sata_snapshot=True,
+                                  sata_serial='BROOK-RECOVERY-QA' if a.guard_desktop_kernel_build else None,
+                                  failure_marker='recovery mount open' if a.guard_desktop_kernel_build and clean else None)
                 guard_log=(guard_boot/'serial.log').read_text(errors='replace')
+                if clean and a.guard_desktop_kernel_build:
+                    direct=guard_log.find('ahci direct: ready ')
+                    probe=guard_log.find('RECOVERY_NORMAL_DATA_READ_PASS')
+                    if direct<0 or probe<=direct:
+                        raise RuntimeError('normal boot did not admit and read the repaired data partition')
                 if not clean and 'Recovery required; normal boot blocked.' not in guard_log:
                     raise RuntimeError('guarded EFI did not block normal boot for pending records')
                 if sha(disk)!=pending_hash:raise RuntimeError('guarded reboot changed the source disk')

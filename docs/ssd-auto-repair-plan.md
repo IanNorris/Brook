@@ -172,8 +172,12 @@ verification and subsequent guarded EFI normal-boot selection. Completion
 failure injection checks the exact record pair and EFI selection; an
 uncertain late failure can still leave a clean pair, after verification has
 already finished. These are logical fault tests, not physical power cuts. The
-normal-boot marker does not yet prove Brook mounted the repaired data, and
-production admission and hardware durability are not implemented or proven.
+normal boot was also tested with a compatible 4 KiB ext2 fixture and an
+otherwise normal kernel: after an intentionally dirty filesystem was repaired,
+the kernel admitted the direct data partition and a fresh process read the
+known file through `/nix`. The fixture's application tree contains placeholders,
+so this does not establish full desktop application behavior. Production
+admission and hardware durability are not implemented or proven.
 
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and
