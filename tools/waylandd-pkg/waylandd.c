@@ -2744,10 +2744,11 @@ int main(int argc, char **argv)
 {
     fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
     output_scale_init();
-    int run_seconds = 0;
+    int run_seconds = 0, no_xwayland = 0;
     const char *xwayland_server=NULL,*xwm_helper=NULL,*xdisplay=":0";
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--trace-frames")) g_trace_frames = 1;
+        if (!strcmp(argv[i], "--no-xwayland")) no_xwayland = 1;
         if (!strcmp(argv[i],"--xwayland") && i+1<argc) xwayland_server=argv[++i];
         if (!strcmp(argv[i],"--xwm") && i+1<argc) xwm_helper=argv[++i];
         if (!strcmp(argv[i],"--xdisplay") && i+1<argc) xdisplay=argv[++i];
@@ -2757,6 +2758,13 @@ int main(int argc, char **argv)
     }
     if (!!xwayland_server!=!!xwm_helper || xdisplay[0]!=':' || !xdisplay[1] ||
         strspn(xdisplay+1,"0123456789")!=strlen(xdisplay+1) || strlen(xdisplay)>3 || atoi(xdisplay+1)>63) return 2;
+    if (no_xwayland && xwayland_server) return 2;
+    if (!no_xwayland && !xwayland_server &&
+        access("/nix/profile/bin/Xwayland", X_OK) == 0 &&
+        access("/nix/profile/bin/brook-xwm", X_OK) == 0) {
+        xwayland_server = "/nix/profile/bin/Xwayland";
+        xwm_helper = "/nix/profile/bin/brook-xwm";
+    }
 
     g_display = wl_display_create();
     if (!g_display) {

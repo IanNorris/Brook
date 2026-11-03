@@ -30,6 +30,18 @@ transfers measured 97 and 104 Mbps, and one Dell-to-host transfer measured
 hashing, not wire or internet speeds. Driver counters reported no dropped RX
 packets during the upload samples; one RX backpressure entry was recorded.
 
+A later 10-second CPU profile captured while Steam's direct download and a
+Gallery package install were both active contained 3,998 samples with none
+reported dropped. Approximately 89% landed in idle; among 437 non-idle
+samples, 276 ended in the AHCI command path beneath a device flush, 61 in
+AHCI writes and 35 in reads. During the approximately 14-second interval
+bracketing the profile, TCP reported 1,497 out-of-order arrivals and 1,177
+out-of-order queue-full events; USB RX drop counters did not increase. These
+are CPU samples and cumulative counter deltas across concurrent workloads, not
+elapsed I/O attribution or proof that queue pressure caused the observed low
+download rate. The profile and snapshots are private build artifacts at
+`build/hardware/dell-steam-gallery-profile-20261103`.
+
 The SSD was subsequently repartitioned using standard tools running in a
 dedicated Brook maintenance boot. Its verified data partition covers about
 238 GiB, with a separate 256 MiB EFI partition. The copied store was checked

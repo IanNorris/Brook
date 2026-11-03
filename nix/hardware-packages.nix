@@ -14,7 +14,7 @@ let
     cat > $out/bin/brook-run <<'SCRIPT'
     #!${pkgs.bash}/bin/bash
     export PATH=/nix/profile/bin:/boot/BIN
-    export HOME=/data/home XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0
+    export HOME=/data/home XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 DISPLAY=:0
     export GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
     export FONTCONFIG_FILE=${fonts}/etc/fonts/fonts.conf FONTCONFIG_PATH=${fonts}/etc/fonts
     export XCURSOR_PATH=${cursors}/share/icons XCURSOR_THEME=default
@@ -59,7 +59,7 @@ let
   '';
   packages = [
     pkgs.bashInteractive pkgs.coreutils pkgs.curl.bin pkgs.cacert pkgs.gnutar
-    pkgs.unzip pkgs.vim pkgs.xfce.mousepad pkgs.tzdata
+    pkgs.unzip pkgs.vim pkgs.xfce.mousepad pkgs.tzdata pkgs.xwayland
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.shared-mime-info
     fonts cursors launchers
   ] ++ native;
