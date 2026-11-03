@@ -106,5 +106,14 @@ behavior. This prototype has not been installed
 on the Dell, and automatic repair and cross-boot recovery admission are not yet
 implemented.
 
+A Dell-identity-bound recovery pair has been prepared locally at
+`build/hardware/dell-offline-recovery-pair-20261103/`. Its exact kernel,
+initrd and selection record booted through F5 in QEMU with no networking or
+USB. The different QEMU disk was rejected: the checker received `No such
+device`, reported an incomplete check, and the entire test disk hash remained
+unchanged. This confirms rejection of that wrong-disk configuration; it does
+not establish correct admission of the physical SSD or a successful physical
+boot. No recovery pair has been deployed to the Dell from this test.
+
 References: [Linux ext2 filesystem checking](https://docs.kernel.org/7.0/filesystems/ext2.html),
 [e2fsck manual and exit codes](https://man7.org/linux/man-pages/man8/e2fsck.8.html).

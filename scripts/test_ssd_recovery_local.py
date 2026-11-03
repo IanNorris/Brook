@@ -44,9 +44,13 @@ def main():
                    help='Optionally retain the test serial log as a new file')
     p.add_argument('--kernel-build', type=Path,
                    help='Optionally stage a private installer kernel and matching ABI 64 modules')
+    p.add_argument('--prepared-pair', type=Path,
+                   help='Boot this exact physical recovery pair and verify it refuses the QEMU disk')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
+    if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build):
+        p.error('prepared pair is an independent identity rejection scenario')
     image = a.image.resolve(strict=True)
     if not image.is_file() or image.stat().st_size != 128 * 1024 * 1024:
         p.error('expected the 128 MiB disposable SATA recovery fixture')
@@ -80,6 +84,12 @@ def main():
         if a.missing_checker:
             subprocess.run(['mdel', '-i', str(initrd), '::/BOOT/E2FSCK.ELF'], check=True)
         kernel = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/KERNEL.ELF'])
+        if a.prepared_pair:
+            pair = a.prepared_pair.resolve(strict=True)
+            kernel = (pair / 'KERNEL.ELF').read_bytes()
+            initrd.write_bytes((pair / 'INITRD.IMG').read_bytes())
+            kernel_file = work / 'KERNEL.ELF'; kernel_file.write_bytes(kernel)
+            subprocess.run(['mcopy', '-o', '-i', media, str(kernel_file), '::/RECOVERY/KERNEL.ELF'], check=True)
         if a.kernel_build:
             build = a.kernel_build.resolve(strict=True)
             kernel = (build / 'BROOK.elf').read_bytes()
@@ -102,14 +112,22 @@ def main():
                     raise RuntimeError('recovery module readback mismatch')
         init = work / 'INIT.RC'; init.write_bytes(AUTO_CHECK_INIT)
         ident = work / 'hardware-payload-id'; ident.write_bytes(AUTO_CHECK_PAYLOAD_ID)
-        for source, target in ((init, '::/BOOT/INIT.RC'),
-                               (ident, '::/ETC/hardware-payload-id'),
-                               (a.supervisor, '::/BOOT/RECCHECK.ELF')):
-            subprocess.run(['mcopy', '-o', '-i', str(initrd), str(source), target], check=True)
+        if not a.prepared_pair:
+            for source, target in ((init, '::/BOOT/INIT.RC'),
+                                   (ident, '::/ETC/hardware-payload-id'),
+                                   (a.supervisor, '::/BOOT/RECCHECK.ELF')):
+                subprocess.run(['mcopy', '-o', '-i', str(initrd), str(source), target], check=True)
         selection = work / 'SELECT.BIN'; selection.write_bytes(record(1, 0, kernel, initrd.read_bytes()))
+        if a.prepared_pair and selection.read_bytes() != (pair / 'SELECT.BIN').read_bytes():
+            raise RuntimeError('prepared recovery selection does not match its exact pair')
         for source, target in ((initrd, '::/RECOVERY/INITRD.IMG'),
                                (selection, '::/RECOVERY/SELECT.BIN')):
             subprocess.run(['mcopy', '-o', '-i', media, str(source), target], check=True)
+        if a.prepared_pair:
+            for name in ('KERNEL.ELF', 'INITRD.IMG', 'SELECT.BIN'):
+                staged = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/' + name])
+                if staged != (pair / name).read_bytes():
+                    raise RuntimeError('prepared recovery pair readback mismatch: ' + name)
         before = sha(disk)
         firmware = a.firmware.resolve(strict=True)
         shutil.copyfile(firmware / 'OVMF_VARS.fd', work / 'vars.fd')
@@ -146,11 +164,15 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = ('RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=127;' if a.missing_checker else
+                    expected = ('RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=8;' if a.prepared_pair else
+                                'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=127;' if a.missing_checker else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
                     if selected and expected in text:
-                        if not a.missing_checker and 'Pass 5' not in text:
+                        if a.prepared_pair and ('Pass 1' in text or
+                                                'No such device while trying to open /dev/brook-install-disk2' not in text):
+                            raise RuntimeError('physical recovery pair did not reject the wrong disk as expected')
+                        if not (a.missing_checker or a.prepared_pair) and 'Pass 5' not in text:
                             raise RuntimeError('check did not report all filesystem passes')
                         if a.frame_output:
                             frame = a.frame_output.absolute()
@@ -169,7 +191,7 @@ def main():
                                 raise RuntimeError('QEMU did not write a frame')
                         break
                     complete_lines = text.split('\n')[:-1]
-                    if any((line.startswith('RECOVERY_READONLY_CHECK_INCOMPLETE:') and
+                    if any((not a.prepared_pair and line.startswith('RECOVERY_READONLY_CHECK_INCOMPLETE:') and
                             expected not in line) or
                            (line.startswith('RECOVERY_READONLY_CHECK_EXEC_FAILED') and
                             not a.missing_checker) for line in complete_lines):
@@ -185,7 +207,8 @@ def main():
                         output.write(serial.read_bytes())
         if sha(disk) != before:
             raise RuntimeError('read-only check changed the disposable disk')
-        print('RECOVERY_LOCAL_NO_NETWORK_MISSING_CHECKER_PASS' if a.missing_checker else
+        print('RECOVERY_PHYSICAL_PAIR_REJECTS_QEMU_DISK_PASS' if a.prepared_pair else
+              'RECOVERY_LOCAL_NO_NETWORK_MISSING_CHECKER_PASS' if a.missing_checker else
               'RECOVERY_LOCAL_NO_NETWORK_DIRTY_READONLY_PASS' if a.dirty else
               'RECOVERY_LOCAL_NO_NETWORK_READONLY_PASS')
 
