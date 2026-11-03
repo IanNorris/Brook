@@ -11,6 +11,7 @@ Usage:
     --disk <path>     Extract latest profile + KSYM_ADDR.TXT from a brook disk image
     --folded          Output folded stacks format instead of speedscope JSON
                       (compatible with flamegraph.pl and speedscope's import)
+    --allow-partial   Explicitly allow an incomplete capture, with a warning
 
 The serial log contains lines like:
     PROF_BEGIN <cpuCount> <startTick>
@@ -165,7 +166,7 @@ SAMPLE_RE = re.compile(r'^P (\d+) ([0-9a-fA-F]{1,4}) (\d+) (\d) (.+)$')
 CS_RE = re.compile(r'^CS (\d+) (\d+) ([0-9a-fA-F]{1,4}) ([0-9a-fA-F]{1,4})(?: (.+))?$')
 
 
-def parse_serial_log(path):
+def parse_serial_log(path, allow_partial=False):
     """Parse profiler lines from serial log."""
     cpuCount = 0
     startTick = 0
@@ -173,6 +174,7 @@ def parse_serial_log(path):
     context_switches = []  # (tick, cpu, old_pid, new_pid)
     dropped = 0
     in_profile = False
+    incomplete = False
 
     with open(path, 'rb') as f:
         for raw_line in f:
@@ -182,6 +184,8 @@ def parse_serial_log(path):
                 continue
 
             if line.startswith('PROF_BEGIN'):
+                if in_profile:
+                    incomplete = True
                 parts = line.split()
                 if len(parts) >= 3:
                     cpuCount = int(parts[1])
@@ -190,10 +194,10 @@ def parse_serial_log(path):
                 continue
 
             if line.startswith('PROF_END'):
-                parts = line.split()
-                if len(parts) >= 3:
-                    dropped = int(parts[2])
-                in_profile = False
+                match = re.fullmatch(r'PROF_END ([0-9]+) ([0-9]+)', line)
+                if in_profile and match and raw_line.endswith(b'\n'):
+                    dropped = int(match.group(2))
+                    in_profile = False
                 continue
 
             if in_profile:
@@ -219,6 +223,10 @@ def parse_serial_log(path):
                     cs_stack = [int(r, 16) for r in rip_str.split(';') if r] if rip_str else []
                     context_switches.append((tick, cpu, old_pid, new_pid, cs_stack))
 
+    if in_profile or incomplete:
+        if not allow_partial:
+            raise ValueError('profile is incomplete: a PROF_END record is missing')
+        print('Warning: incomplete profile; results cover only recorded events', file=sys.stderr)
     return cpuCount, startTick, samples, context_switches, dropped
 
 
@@ -288,6 +296,7 @@ def main():
     elf_path = None
     disk_path = None
     folded = False
+    allow_partial = False
 
     i = 1
     while i < len(sys.argv):
@@ -305,6 +314,9 @@ def main():
             i += 2
         elif sys.argv[i] == '--folded':
             folded = True
+            i += 1
+        elif sys.argv[i] == '--allow-partial':
+            allow_partial = True
             i += 1
         elif not sys.argv[i].startswith('--'):
             if inpath is None:
@@ -380,7 +392,11 @@ def main():
         syms = load_symmap(symmap_path)
     sorted_addrs = sorted(syms.keys()) if syms else []
 
-    cpuCount, startTick, samples, context_switches, dropped = parse_serial_log(inpath)
+    try:
+        cpuCount, startTick, samples, context_switches, dropped = parse_serial_log(inpath, allow_partial)
+    except ValueError as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(1)
 
     if not samples and not context_switches:
         print("No profiler events found in log. Look for PROF_BEGIN/P/CS/PROF_END lines.")

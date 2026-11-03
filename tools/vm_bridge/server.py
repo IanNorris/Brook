@@ -547,6 +547,15 @@ def latest_profile_path(serial_log, generation_offset=0):
     raise RuntimeError("No recorded profile output path in this guest generation")
 
 
+def require_profile_export_ready(reply):
+    if "RUNNING" in reply:
+        raise RuntimeError("Profiler recording/flushing: export after status reports IDLE")
+    if "output failed" in reply:
+        raise RuntimeError("Profiler output failed; the capture is incomplete or not durably synced")
+    if "Profiler: IDLE" not in reply:
+        raise RuntimeError("Unrecognized profiler status; refusing to export")
+
+
 def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
     if action not in {"start", "stop", "status", "export"} or not 100 <= duration_ms <= 30000:
         raise ValueError("Invalid profile action/duration")
@@ -559,8 +568,7 @@ def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
             command = f"prof start {duration_ms}" if action == "start" else "prof " + action
             return query(command)
         state = query("prof status")
-        if "RUNNING" in state.get("reply", ""):
-            raise RuntimeError("Profiler recording/flushing: export after status reports IDLE")
+        require_profile_export_ready(state.get("reply", ""))
         recorded_path = latest_profile_path(data["serial_log"], data.get("generation_log_offset", 0))
         source = "::" + Path(recorded_path).name
         path = artifact(session, ".profile")

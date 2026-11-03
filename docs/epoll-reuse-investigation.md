@@ -48,6 +48,23 @@ confirmed that a lower-volume failure remained visible. The Dell run above
 used the earlier ranking, so its top-eight output cannot prove the absence of
 kernel-side errors outside those rows.
 
+A subsequent bounded Dell run again reached the loading stall, with a peak of
+177 tasks and no denied births. A completed three-second CPU capture reported
+1,200 timer samples, 15,589 context switches and no producer drops. Of the
+timer samples, 1,126 landed in the idle loop; this is evidence against simple
+CPU saturation during that interval, not a measurement of time in every wait
+or proof of the cause. Context-switch stacks for the Steam and helper threads
+included poll and `recvmsg` waits. The client and its descendants were stopped
+and drained after capture.
+
+A prior capture on the same run filled the small RAM boot filesystem: the
+profiler reported idle despite a truncated file. The writer now checks short
+writes and sync failures, and reports failed output; the profile converter
+rejects missing or truncated end records unless explicitly asked to accept a
+partial capture. A disposable QEMU test confirmed a successful short capture
+and an explicit failure after filling its boot filesystem. A readable footer
+alone does not establish that a failed sync was durable.
+
 A full fix must retain open-description identity across dup, fork and queued
 SCM_RIGHTS, resolve readiness against the watched description rather than the
 waiting process's numeric descriptor table, remove watches after the final

@@ -66,6 +66,8 @@ target_compile_options(test_guard_readonly_view PRIVATE "-iquote${BROOK_ROOT}/sr
 add_host_test(test_guard_checker_session "${BROOK_ROOT}/src/kernel/src/guard_checker_session.cpp" "${BROOK_ROOT}/src/kernel/src/guard_readonly_view.cpp")
 target_compile_options(test_guard_checker_session PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_guard_fat_profile "${BROOK_ROOT}/src/kernel/src/guard_fat_profile.cpp")
+add_host_test(test_profiler_write_all)
+target_compile_options(test_profiler_write_all PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_guard_fat_profile PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_guard_repair_session "${BROOK_ROOT}/src/kernel/src/guard_repair_session.cpp")
 target_compile_options(test_guard_repair_session PRIVATE -DBROOK_SSD_GUARD_PENDING_TEST "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")

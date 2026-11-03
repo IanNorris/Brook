@@ -30,6 +30,8 @@ void ProfilerStop();
 
 // Is the profiler currently sampling?
 bool ProfilerIsRunning();
+// First output error for the most recently started capture, or zero.
+int ProfilerLastError();
 
 // Called from the LAPIC timer ISR on every CPU.
 // interruptedRip: the RIP from the interrupt frame.

@@ -6203,6 +6203,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     else if (NetStrEq(cmd, "prof status")) {
         if (ProfilerIsRunning()) {
             DebugChannelSend("Profiler: RUNNING\n");
+        } else if(ProfilerLastError()) {
+            DebugChannelSend("Profiler: IDLE (last capture output failed)\n");
         } else {
             DebugChannelSend("Profiler: IDLE\n");
         }

@@ -16,6 +16,7 @@
 // the serial log and converts to Speedscope JSON.
 
 #include "profiler.h"
+#include "profiler_write_all.h"
 #include "profiler_stack_walk.h"
 #include "gdt.h"
 #include "memory/virtual_memory.h"
@@ -116,6 +117,7 @@ static volatile uint64_t g_profilerStartTick = 0;
 static volatile uint64_t g_profilerEndTick   = 0;  // 0 = no auto-stop
 static volatile bool     g_profilerFlushReq  = false;
 static volatile bool     g_profilerFlushing  = false; // true while drain/close in progress
+static volatile int      g_profilerLastError = 0;
 static Process*          g_profilerThread    = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -438,12 +440,15 @@ struct ProfileWriter {
     uint64_t fileOff;
     uint32_t bufPos;
     uint32_t written;   // total sample lines written so far
+    int      error;
 };
 
 static void ProfileWriterFlush(ProfileWriter& pw)
 {
-    if (pw.bufPos > 0) {
-        VfsWrite(pw.file, pw.buf, pw.bufPos, &pw.fileOff);
+    if (pw.bufPos > 0 && !pw.error) {
+        pw.error=ProfilerWriteAll([&pw](const char* data,uint32_t length) {
+            return VfsWrite(pw.file,data,length,&pw.fileOff);
+        },pw.buf,pw.bufPos);
         pw.bufPos = 0;
     }
 }
@@ -451,8 +456,9 @@ static void ProfileWriterFlush(ProfileWriter& pw)
 static void ProfileWriterAppend(ProfileWriter& pw, const char* src, uint32_t len)
 {
     while (len > 0) {
+        if(pw.error)return;
         uint32_t avail = kProfBufSize - pw.bufPos;
-        if (avail == 0) { ProfileWriterFlush(pw); avail = kProfBufSize; }
+        if (avail == 0) { ProfileWriterFlush(pw); if(pw.error)return; avail = kProfBufSize; }
         uint32_t n = len < avail ? len : avail;
         __builtin_memcpy(pw.buf + pw.bufPos, src, n);
         pw.bufPos += n;
@@ -471,8 +477,10 @@ static bool ProfileWriterOpen(ProfileWriter& pw)
     pw.fileOff  = 0;
     pw.bufPos   = 0;
     pw.written  = 0;
+    pw.error    = 0;
 
     if (!pw.file) {
+        pw.error=-5;
         SerialPrintf("PROFILER: failed to create %s\n", profPath);
         return false;
     }
@@ -480,6 +488,7 @@ static bool ProfileWriterOpen(ProfileWriter& pw)
 
     pw.buf = static_cast<char*>(kmalloc(kProfBufSize));
     if (!pw.buf) {
+        pw.error=-12;
         SerialPrintf("PROFILER: kmalloc failed for write buffer\n");
         VfsClose(pw.file);
         pw.file = nullptr;
@@ -500,7 +509,7 @@ static bool ProfileWriterOpen(ProfileWriter& pw)
 // Drain all CPU ring buffers into the open file. Safe to call repeatedly.
 static void ProfileWriterDrain(ProfileWriter& pw)
 {
-    if (!pw.file) return;
+    if (!pw.file || pw.error) return;
     uint32_t cpuCount = SmpGetCpuCount();
     char lineBuf[300];
     for (uint32_t c = 0; c < cpuCount; c++) {
@@ -510,6 +519,7 @@ static void ProfileWriterDrain(ProfileWriter& pw)
         while (ri != wi) {
             uint32_t len = FormatEvent(buf.samples[ri], lineBuf);
             ProfileWriterAppend(pw, lineBuf, len);
+            if(pw.error)return;
             ri = (ri + 1) % SAMPLES_PER_CPU;
             pw.written++;
         }
@@ -529,7 +539,7 @@ static void ProfileWriterSync(ProfileWriter& pw)
 {
     if (!pw.file) return;
     ProfileWriterFlush(pw);
-    VfsFsync(pw.file);
+    if(!pw.error)pw.error=VfsFsync(pw.file);
 }
 
 // Write PROF_END, flush and close the file.
@@ -550,6 +560,7 @@ static void ProfileWriterClose(ProfileWriter& pw)
     ProfileWriterAppend(pw, ftr, p);
 
     ProfileWriterFlush(pw);
+    if(!pw.error)pw.error=VfsFsync(pw.file);
     kfree(pw.buf);
     VfsClose(pw.file);
     pw.file = nullptr;
@@ -586,6 +597,11 @@ static void ProfilerThreadFn(void* /*arg*/)
             // overflowing during long recordings.
             ProfileWriter pw;
             bool fileOk = ProfileWriterOpen(pw);
+            if(!fileOk) {
+                __atomic_store_n(&g_profilerLastError,pw.error,__ATOMIC_RELEASE);
+                __atomic_store_n(&g_profilerFlushReq,true,__ATOMIC_RELEASE);
+                __atomic_store_n(&g_profilerEnabled,false,__ATOMIC_RELEASE);
+            }
 
             uint32_t cpuCount = SmpGetCpuCount();
             uint32_t drainsSinceSync = 0;
@@ -611,6 +627,10 @@ static void ProfilerThreadFn(void* /*arg*/)
                         ProfileWriterSync(pw);
                         drainsSinceSync = 0;
                     }
+                    if(pw.error) {
+                        __atomic_store_n(&g_profilerFlushReq,true,__ATOMIC_RELEASE);
+                        __atomic_store_n(&g_profilerEnabled,false,__ATOMIC_RELEASE);
+                    }
                 }
             }
 
@@ -626,8 +646,11 @@ static void ProfilerThreadFn(void* /*arg*/)
 
             if (fileOk) {
                 ProfileWriterClose(pw);
-                SerialPrintf("PROFILER: done — %u samples, %u dropped\n",
-                             pw.written, totalDropped);
+                if(pw.error) {
+                    __atomic_store_n(&g_profilerLastError,pw.error,__ATOMIC_RELEASE);
+                    SerialPrintf("PROFILER: incomplete — output error %d\n",pw.error);
+                } else SerialPrintf("PROFILER: done — %u samples, %u dropped\n",
+                                    pw.written, totalDropped);
             } else {
                 SerialPrintf("PROFILER: done — file open failed, %u dropped\n",
                              totalDropped);
@@ -683,6 +706,7 @@ void ProfilerStart(uint32_t durationMs)
     }
 
     g_profilerStartTick = ApicTickCount();
+    __atomic_store_n(&g_profilerLastError,0,__ATOMIC_RELEASE);
     g_profilerEndTick   = durationMs > 0 ? (g_profilerStartTick + durationMs) : 0;
     g_profilerFlushReq  = false;
 
@@ -713,5 +737,7 @@ bool ProfilerIsRunning()
         __atomic_load_n(&g_profilerFlushReq,__ATOMIC_ACQUIRE) ||
         __atomic_load_n(&g_profilerFlushing,__ATOMIC_ACQUIRE);
 }
+
+int ProfilerLastError() { return __atomic_load_n(&g_profilerLastError,__ATOMIC_ACQUIRE); }
 
 } // namespace brook

@@ -17,6 +17,12 @@ import server
 
 
 class ProfileLossTests(unittest.TestCase):
+    def test_export_refuses_failed_or_running_producer(self):
+        server.require_profile_export_ready('Profiler: IDLE\n')
+        for status in ('Profiler: RUNNING\n', 'Profiler: IDLE (last capture output failed)\n', ''):
+            with self.subTest(status=status), self.assertRaises(RuntimeError):
+                server.require_profile_export_ready(status)
+
     def test_producer_drops_are_visible_despite_complete_export(self):
         result = server.profile_event_summary(
             'PROF_BEGIN 8 100\nP 0 1 0 0 ffff\nCS 1 0 1 2\nPROF_END 2 725094\n')
