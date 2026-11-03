@@ -337,3 +337,14 @@ failed with EPERM; a root bubblewrap attempt stopped earlier at its unsupported
 `capget` syscall. Neither experiment changed the desktop's `/dev/shm` mount.
 The next comparison needs a verified private mount or a separately tested,
 boot-derived budget candidate; preserving aggregate memory headroom matters.
+
+For a controlled comparison, an initrd may contain
+`/etc/tmpfs-desktop-large`. This boot-only marker changes the aggregate lazy
+tmpfs quota from one eighth to one quarter of boot-free RAM; the canonical
+desktop shared-memory quota remains half of that aggregate. Ordinary tmpfs
+mount defaults are unchanged, while volatile-desktop `/tmp` and `/data`
+quotas also increase because they derive from the desktop quota. The standard
+profile remains the default, and the pre-existing unbounded diagnostic option
+takes precedence. Limits are ceilings, not reserved physical memory or a
+substitute for memory-pressure handling. This comparison is not evidence that
+the larger quota is a sufficient long-term policy.

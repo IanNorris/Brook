@@ -646,6 +646,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     const uint32_t tmpfsOption=brook::FwCfgReadFile("opt/tmpfs-unbounded",tmpfsUnbounded,sizeof(tmpfsUnbounded));
     const bool unboundedTmpfs=tmpfsUnbounded[0]=='1' &&
         (tmpfsOption==1 || (tmpfsOption==2 && !tmpfsUnbounded[1]));
+    brook::VnodeStat largerTmpfsMarker{};
+    const bool largerTmpfs=brook::VfsStatPath("/etc/tmpfs-desktop-large",&largerTmpfsMarker)==0;
     // Charge tmpfs lazily, within a boot-available-RAM aggregate ceiling. The
     // desktop gets half that budget; ordinary container mounts retain their
     // smaller default unless the caller requests an explicit size.
@@ -653,7 +655,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // Diagnostic opt-in removes byte quotas, not physical allocation limits.
     // Keep the signed-offset, page-aligned maximum so statfs remains valid.
     const uint64_t tmpfsBudget=unboundedTmpfs ? 0x7ffffffffffff000ULL :
-        (brook::PmmGetFreePageCount()*4096/8)&~uint64_t{4095};
+        brook::TmpfsBootBudget(brook::PmmGetFreePageCount(),largerTmpfs);
     if(brook::TmpfsConfigureByteBudget(tmpfsBudget))KernelPanic("tmpfs memory budget initialization failed");
     const uint64_t desktopShmBytes=unboundedTmpfs ? tmpfsBudget : tmpfsBudget/2 & ~uint64_t{4095};
     // A real retained filesystem must survive directory binds into containers;
@@ -680,7 +682,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
         brook::VfsPathRelease(target);brook::VfsPathRelease(root);
         if(error)KernelPanic("canonical /dev/shm tmpfs mount failed: %d",error);
-        brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget);
+        // Report marker presence; the separate unbounded diagnostic option,
+        // when set, takes precedence over either bounded profile.
+        brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,larger=%u,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget,largerTmpfs?1u:0u);
     }
 
     // Optional read-only-media desktop: keep runtime sockets and user settings

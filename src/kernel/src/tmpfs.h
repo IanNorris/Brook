@@ -7,6 +7,15 @@ struct UserNamespace;
 // The prepared instance remains caller-owned until MountFresh succeeds.
 struct Tmpfs;
 inline constexpr uint64_t TmpfsDefaultBytes = 16ULL * 1024 * 1024;
+// Boot-only, lazy-allocation aggregate limit. The larger profile is an opt-in
+// comparison, not a promise that this memory is reserved or reclaimable.
+inline uint64_t TmpfsBootBudget(uint64_t freePages, bool largerProfile)
+{
+    uint64_t pages = freePages / (largerProfile ? 4 : 8);
+    constexpr uint64_t maxPages = 0x7ffffffffffff000ULL / 4096;
+    if (pages > maxPages) pages = maxPages;
+    return pages * 4096;
+}
 // Boot-time aggregate charged-memory budget. Configuration is rejected while
 // any instance exists; allocation remains lazy and each mount has its own quota.
 int TmpfsConfigureByteBudget(uint64_t bytes);

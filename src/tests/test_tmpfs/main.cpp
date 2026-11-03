@@ -302,6 +302,18 @@ static void indexedMappedQuota()
 }
 int main()
 {
+    // Profiles are lazy aggregate ceilings derived from boot-available pages;
+    // exercise small machines, page rounding and representable upper bound.
+    assert(TmpfsBootBudget(65536, false) == 32ULL * 1024 * 1024);
+    assert(TmpfsBootBudget(65536, true) == 64ULL * 1024 * 1024);
+    assert(TmpfsBootBudget(2097152, false) == 1024ULL * 1024 * 1024);
+    assert(TmpfsBootBudget(2097152, true) == 2ULL * 1024 * 1024 * 1024);
+    assert(TmpfsBootBudget(32767, false) < TmpfsDefaultBytes);
+    assert(TmpfsBootBudget(32768, false) == TmpfsDefaultBytes);
+    assert(TmpfsBootBudget(16383, true) < TmpfsDefaultBytes);
+    assert(TmpfsBootBudget(16384, true) == TmpfsDefaultBytes);
+    assert(TmpfsBootBudget(11, true) == 8192);
+    assert(TmpfsBootBudget(~uint64_t{0}, true) == 0x7ffffffffffff000ULL);
     identity(1000);
     clean();
     mappedQuota();
