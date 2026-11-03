@@ -514,6 +514,18 @@ int64_t UserMappingSync(Process* actor,AddressSpaceState* space,uint64_t address
     }
     return firstError;
 }
+int64_t UserMappingAdviseFree(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length) {
+    uint64_t end;
+    if (!actor || !space || (address & 4095)) return -22;
+    if (!length) return 0;
+    if (!UserInterval(address, length, end)) return -22;
+    MappingTransaction operation(actor, space);
+    const int error = operation.LockAnonymousInterval(address, end);
+    // Reclamation is optional for MADV_FREE; retain the data until Brook
+    // implements lazy reclaim. Validate the entire private anonymous range.
+    return error == -95 ? -22 : error;
+}
+
 int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length) {
     uint64_t end;
     if (!actor || !space || (address & 4095)) return -22;
