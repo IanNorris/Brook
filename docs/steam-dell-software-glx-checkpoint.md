@@ -121,3 +121,37 @@ are non-atomic and a PID can be reused between samples; the caller must bind a
 result to an independently observed process incarnation. A controlled Brook VM
 process opened three memfds and the helper observed three; after closure the
 count fell by three. The test VM completed a checked flush and shutdown.
+
+### Handoff and proc-descriptor stat
+
+A 60-second, metadata-instrumented QEMU run used the verified private Pulse
+server and software Xephyr. The main Steam process mapped 18 distinct
+26,214,416-byte objects; nine helper processes each mapped two of the same
+objects as the main process. The trace had 1,180 rows, maximum per-process
+sequence 574 of its 1,024-row cap, and no reported mapping-tracker miss. This
+shows matching objects were mapped; it does not by itself prove their contents
+were consumed successfully or that the deadline was met. Steam's main
+process was sent SIGTERM after observation, its debug job drained, and the
+original helper wrapper was restored and hash-checked before guest flush.
+
+The trace's CEF stderr had repeated EGL initialization failures and fatal
+`proc_util.cc(97)` diagnostics with EOPNOTSUPP. Chromium's published sandbox
+implementation follows entries under `/proc/self/fd` with `fstatat` while
+checking open directories, though the precise source revision corresponding
+to this shipped CEF is not established. The new `procfdstatcheck.c` native
+control passes directory, memfd, both pipe ends, Unix socket and eventfd cases
+on Linux. On the Dell-candidate kernel under QEMU the directory case passes,
+while the other five fail the followed-stat operation with errno 95. This is a
+real compatibility defect and a plausible cause of the CEF failures, not yet
+proof that fixing it alone produces a login window.
+
+Following proc FD links currently creates retained targets for socket metadata
+and selected vnode-backed descriptors, while other descriptors return
+EOPNOTSUPP. A complete fix must respect process/descriptor lifetime,
+authorization, dynamic memfd metadata, anonymous inode identity, pipe
+reader/writer lifetime and O_PATH semantics. It must also handle the actual
+FD classes encountered by CEF without incorrectly treating synthetic
+directories as ordinary files. The regression is deliberately left failing
+until those contracts are implemented and tested; a fabricated stat snapshot
+is not a general proc FD implementation. The test binary SHA-256 was
+`2572fe52818a283d1b20b36c8d1e3c61ef2c8802dc414b56f13c9ae509f90ed0`.
