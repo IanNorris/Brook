@@ -293,6 +293,16 @@ bool AhciSystemGuardTestDataIdentityValid(Device* adapter) {
 void AhciSystemGuardTestDataFinish(Device* adapter) {
     if(adapter==&guardDataPartition && guardDataPhase!=GuardDataPhase::Failed)guardDataPhase=GuardDataPhase::Finished;
 }
+#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+bool AhciSystemGuardTestBeginCompletion(Device* adapter,bool verified) {
+    static bool completionAttempted=false;
+    if(completionAttempted)return false;
+    completionAttempted=true;
+    if(adapter!=&guardTestPartition || guardTestPhase!=GuardTestPhase::Finished ||
+       guardDataPhase!=GuardDataPhase::Finished || !verified)return false;
+    guardTestPhase=GuardTestPhase::Writing;return true;
+}
+#endif
 bool AhciSystemGuardIsTestData(Device* adapter) {return adapter==&guardDataPartition && guardReady;}
 #endif
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {

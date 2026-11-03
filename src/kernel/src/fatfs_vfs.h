@@ -22,6 +22,9 @@ bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* mount,const GuardFatPr
 // 0 rejected, 1 uncertain, 2 pending records durably verified. One shot;
 // never grants data-partition or normal boot authority.
 int FatFsPrivateRecoveryTestPending(FatPrivateMount* mount,const char* identity,uint32_t failAt);
+#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+int FatFsPrivateRecoveryTestComplete(FatPrivateMount* mount,const char* identity,const uint8_t* pending,uint32_t failAt);
+#endif
 #endif
 #endif
 void FatFsVfsRegister();

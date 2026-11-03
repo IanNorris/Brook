@@ -10,6 +10,7 @@
 // session after Uncertain, retain ownership, and forbid automatic retries;
 // this stateless function cannot enforce those requirements across calls.
 enum class BrookGuardBeginResult { Rejected, Uncertain, PendingDurable };
+enum class BrookGuardCompleteResult { Rejected, Uncertain, CleanDurable };
 
 template<typename IO>
 BrookGuardBeginResult BrookGuardBeginRepair(IO& io,const char* identity) {
@@ -33,4 +34,33 @@ BrookGuardBeginResult BrookGuardBeginRepair(IO& io,const char* identity) {
        !io.Read(1,b,sizeof(b)) || !BrookUpdateEqual(a,b,sizeof(a)))
         return BrookGuardBeginResult::Uncertain;
     return BrookGuardBeginResult::PendingDurable;
+}
+
+// The caller must first have durably completed and independently verified the
+// repair, drained every checker and permanently disabled data writes. Expected
+// is the exact pending record retained from this repair attempt, not a record
+// freshly trusted from disk. An uncertain outcome must never be retried.
+template<typename IO>
+BrookGuardCompleteResult BrookGuardCompleteRepair(IO& io,const char* identity,
+                                                   const uint8_t* expected) {
+    if(!expected)return BrookGuardCompleteResult::Rejected;
+    uint8_t clean[BROOK_RECOVERY_GUARD_SIZE],a[BROOK_RECOVERY_GUARD_SIZE],b[BROOK_RECOVERY_GUARD_SIZE];
+    for(unsigned i=0;i<sizeof(clean);++i)clean[i]=expected[i];
+    if(BrookUpdateGet32(clean+16)!=BROOK_RECOVERY_GUARD_PENDING ||
+       BrookUpdateGet32(clean+124)!=BrookUpdateCrc(clean,124))return BrookGuardCompleteResult::Rejected;
+    BrookUpdatePut32(clean+16,BROOK_RECOVERY_GUARD_CLEAN);
+    BrookUpdatePut32(clean+124,BrookUpdateCrc(clean,124));
+    if(!BrookRecoveryGuardAllowsNormal(clean,sizeof(clean),clean,sizeof(clean),identity) ||
+       !io.Read(0,a,sizeof(a)) || !io.Read(1,b,sizeof(b)) ||
+       !BrookUpdateEqual(a,expected,sizeof(a)) || !BrookUpdateEqual(b,expected,sizeof(b)))
+        return BrookGuardCompleteResult::Rejected;
+    for(unsigned slot=0;slot<2;++slot) {
+        if(!io.Write(slot,clean,sizeof(clean)) || !io.Sync(slot) ||
+           !io.Read(slot,b,sizeof(b)) || !BrookUpdateEqual(clean,b,sizeof(b)))
+            return BrookGuardCompleteResult::Uncertain;
+    }
+    if(!io.Flush() || !io.Read(0,b,sizeof(b)) || !BrookUpdateEqual(clean,b,sizeof(b)) ||
+       !io.Read(1,b,sizeof(b)) || !BrookUpdateEqual(clean,b,sizeof(b)))
+        return BrookGuardCompleteResult::Uncertain;
+    return BrookGuardCompleteResult::CleanDurable;
 }

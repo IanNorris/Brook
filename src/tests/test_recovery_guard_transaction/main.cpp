@@ -63,4 +63,47 @@ int main() {
     }
     Io overflow=Initial();for(auto& r:overflow.visible) {BrookUpdatePut64(r+8,~uint64_t{0});BrookUpdatePut32(r+124,BrookUpdateCrc(r,124));}
     assert(BrookGuardBeginRepair(overflow,identity)==BrookGuardBeginResult::Rejected);
+
+    Io pending=Initial();
+    assert(BrookGuardBeginRepair(pending,identity)==BrookGuardBeginResult::PendingDurable);
+    uint8_t expected[128];memcpy(expected,pending.stable[0],128);
+    pending.operation=0;
+    assert(BrookGuardCompleteRepair(pending,identity,expected)==BrookGuardCompleteResult::CleanDurable);
+    assert(pending.operation==11);
+    pending.Crash();
+    assert(BrookRecoveryGuardAllowsNormal(pending.visible[0],128,pending.visible[1],128,identity));
+    assert(BrookUpdateGet64(pending.visible[0]+8)==42);
+    uint8_t cleanExpected[128];memcpy(cleanExpected,pending.visible[0],128);
+    assert(BrookGuardCompleteRepair(pending,identity,expected)==BrookGuardCompleteResult::Rejected);
+    for(int failure=1;failure<=11;++failure)for(bool partial:{false,true})for(bool early:{false,true}) {
+        Io io=Initial();assert(BrookGuardBeginRepair(io,identity)==BrookGuardBeginResult::PendingDurable);
+        io.operation=0;io.fail=failure;io.partial=partial;io.early=early;
+        const auto result=BrookGuardCompleteRepair(io,identity,expected);
+        assert(result==(failure<=2?BrookGuardCompleteResult::Rejected:BrookGuardCompleteResult::Uncertain));
+        io.Crash();
+        if(!partial && !early) {
+            assert(BrookUpdateEqual(io.visible[0],failure<=4?expected:cleanExpected,128));
+            assert(BrookUpdateEqual(io.visible[1],failure<=7?expected:cleanExpected,128));
+        }
+        if(BrookRecoveryGuardAllowsNormal(io.visible[0],128,io.visible[1],128,identity))
+            assert(BrookUpdateGet64(io.visible[0]+8)==42);
+    }
+    Io stale=Initial();assert(BrookGuardBeginRepair(stale,identity)==BrookGuardBeginResult::PendingDurable);
+    uint8_t unchanged[2][128];memcpy(unchanged,stale.stable,sizeof(unchanged));
+    uint8_t badExpected[128];memcpy(badExpected,expected,128);
+    BrookUpdatePut64(badExpected+8,43);BrookUpdatePut32(badExpected+124,BrookUpdateCrc(badExpected,124));
+    assert(BrookGuardCompleteRepair(stale,identity,badExpected)==BrookGuardCompleteResult::Rejected);
+    assert(!memcmp(unchanged,stale.stable,sizeof(unchanged)));
+    assert(BrookGuardCompleteRepair(stale,"bad",expected)==BrookGuardCompleteResult::Rejected);
+    assert(!memcmp(unchanged,stale.stable,sizeof(unchanged)));
+    badExpected[124]^=1;
+    assert(BrookGuardCompleteRepair(stale,identity,badExpected)==BrookGuardCompleteResult::Rejected);
+    assert(!memcmp(unchanged,stale.stable,sizeof(unchanged)));
+    stale.visible[1][40]^=1;
+    assert(BrookGuardCompleteRepair(stale,identity,expected)==BrookGuardCompleteResult::Rejected);
+    for(int slot=0;slot<2;++slot) {
+        Io dropped=Initial();assert(BrookGuardBeginRepair(dropped,identity)==BrookGuardBeginResult::PendingDurable);
+        dropped.operation=0;dropped.drop=slot;
+        assert(BrookGuardCompleteRepair(dropped,identity,expected)==BrookGuardCompleteResult::Uncertain);
+    }
 }

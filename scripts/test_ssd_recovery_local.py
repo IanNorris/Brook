@@ -78,6 +78,10 @@ def main():
                    help='Verify a fixture-bound EFI loader accepts clean guards and rejects pending')
     p.add_argument('--guard-ext2-test', action='store_true',
                    help='Run guarded ext2 repair and verification on the private data partition')
+    p.add_argument('--guard-complete-test', action='store_true',
+                   help='Complete verified recovery on the private QEMU disk')
+    p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
+                   help='Inject a failure in the guard completion transaction')
     p.add_argument('--guard-ext2-bad-checker', action='store_true',
                    help='Alter the private ext2 checker to test digest rejection')
     p.add_argument('--guard-ext2-missing-checker', action='store_true',
@@ -114,6 +118,11 @@ def main():
         p.error('guarded EFI test requires the successful pending scenario')
     if a.guard_ext2_test and (not a.guard_pending_test or not a.guarded_efi or a.guard_records!='valid'):
         p.error('guarded ext2 test requires the successful guarded pending fixture')
+    if a.guard_complete_test and (not a.guard_ext2_test or a.guard_pending_fail_at or
+                                   a.guard_ext2_bad_checker or a.guard_ext2_missing_checker):
+        p.error('completion requires an uninjected guarded ext2 repair')
+    if a.guard_complete_fail_at and not a.guard_complete_test:
+        p.error('completion fault injection requires the completion test')
     if (a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) and (not a.guard_ext2_test or a.guard_pending_fail_at):
         p.error('ext2 checker failure requires an uninjected guarded ext2 run')
     if a.guard_ext2_bad_checker and a.guard_ext2_missing_checker:
@@ -343,6 +352,8 @@ def main():
                         '-device', 'virtio-blk-pci,drive=poison']
         if a.guard_pending_fail_at:
             command += ['-fw_cfg', f'name=opt/guard-pending-fail,string={a.guard_pending_fail_at}']
+        if a.guard_complete_fail_at:
+            command += ['-fw_cfg', f'name=opt/guard-complete-fail,string={a.guard_complete_fail_at}']
         with (work / 'qemu.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             stop = threading.Event()
@@ -379,7 +390,9 @@ def main():
                         stop.set()
                     pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
                     ext2_checker_failed=a.guard_ext2_bad_checker or a.guard_ext2_missing_checker
-                    expected = ('GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
+                    complete_expected=(0 if a.guard_complete_fail_at in (1,2) else 1 if a.guard_complete_fail_at else 2)
+                    expected = (f'GUARD_COMPLETE_TEST_RESULT outcome={complete_expected}' if a.guard_complete_test else
+                                'GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
                                 'GUARD_EXT2_VERIFIED_PENDING' if a.guard_ext2_test and not a.guard_pending_fail_at else
                                 (f'GUARD_PENDING_TEST_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
                                  'GUARD_PENDING_TEST_INCOMPLETE records=0' if a.guard_records in ('mismatch','wrong-identity') else
@@ -420,6 +433,7 @@ def main():
                                    'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
                             required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_TEST_RESULT outcome=2',preen,expected]
+                            if a.guard_complete_test:required.insert(-1,'GUARD_EXT2_VERIFIED_PENDING')
                             if not all(line in complete_lines for line in required):
                                 raise RuntimeError('guarded repair milestones missing')
                             indices=[complete_lines.index(line) for line in required]
@@ -504,6 +518,14 @@ def main():
                 expected_records=[expected_pending,record_data]
             else:
                 expected_records=[expected_pending,expected_pending]
+            if a.guard_complete_test:
+                expected_clean=bytearray(expected_pending)
+                struct.pack_into('<I',expected_clean,16,1)
+                struct.pack_into('<I',expected_clean,124,zlib.crc32(expected_clean[:124]))
+                if not a.guard_complete_fail_at or a.guard_complete_fail_at>=8:
+                    expected_records=[expected_clean,expected_clean]
+                elif a.guard_complete_fail_at>=5:
+                    expected_records=[expected_clean,expected_pending]
             attribute_offsets=[]
             actual_records=[]
             for index in range(2):
@@ -526,7 +548,7 @@ def main():
                 if actual!=expected_records[index]:
                     raise RuntimeError('pending record readback failed')
                 actual_records.append(actual)
-            if not a.guard_pending_fail_at and actual_records[0]!=actual_records[1]:
+            if not a.guard_pending_fail_at and not a.guard_complete_fail_at and actual_records[0]!=actual_records[1]:
                 raise RuntimeError('pending records differ')
             changes=0;pos=0
             if a.guard_ext2_test and not (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker):
@@ -562,7 +584,7 @@ def main():
                 if 'GUARD_EXT2_PREEN' in final:raise RuntimeError('preen started after pending failure')
             if a.guarded_efi:
                 guard_boot=work/'pending-boot';guard_boot.mkdir();pending_hash=sha(disk)
-                clean=expected_records[0]==record_data and expected_records[1]==record_data
+                clean=(expected_records[0]==expected_records[1] and struct.unpack_from('<I',expected_records[0],16)[0]==1)
                 marker='BOOT: complete' if clean else 'Brook SSD recovery payload verified'
                 boot_menu_fixture(disk,a.firmware.resolve(strict=True),guard_boot,False,marker,90,True,
                                   'Recovery required; normal boot blocked.' if clean else None,sata_snapshot=True)

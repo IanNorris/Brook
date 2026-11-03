@@ -30,6 +30,9 @@ Device* AhciSystemGuardTestDataArm(Device* adapter,int pendingOutcome);
 bool AhciSystemGuardTestDataVerify(Device* adapter);
 bool AhciSystemGuardTestDataIdentityValid(Device* adapter);
 void AhciSystemGuardTestDataFinish(Device* adapter);
+#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+bool AhciSystemGuardTestBeginCompletion(Device* adapter,bool verified);
+#endif
 bool AhciSystemGuardIsTestData(Device* adapter);
 #endif
 // Optional, read-only boot diagnostic. Does not mount or change the disk.

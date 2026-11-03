@@ -161,9 +161,19 @@ rejected, and the guarded EFI boot selected recovery. Pending failure and
 missing or altered checker tests left the data partition unchanged. Host tests
 cover authorization, bounded I/O, separate verifier permissions, and blocked
 write/flush cancellation. If a cancelled checker does not drain, the test does
-not advance the adapter or verification. Records deliberately remain pending;
-clearing them, booting the repaired store, production admission and physical
-power-loss behavior are not implemented or proven.
+not advance the adapter or verification. In this test records remain pending.
+
+The separate, default-off `BROOK_SSD_GUARD_COMPLETE_TEST` adds a one-shot
+completion after the checker is drained, the repaired data is flushed and
+verified, and its adapter is permanently disabled. It requires both records to
+match the exact pending record for this attempt before writing either clean
+record. A deliberately dirty private QEMU disk passed repair, independent host
+verification and subsequent guarded EFI normal-boot selection. Completion
+failure injection checks the exact record pair and EFI selection; an
+uncertain late failure can still leave a clean pair, after verification has
+already finished. These are logical fault tests, not physical power cuts. The
+normal-boot marker does not yet prove Brook mounted the repaired data, and
+production admission and hardware durability are not implemented or proven.
 
 An unpublished kernel-only vnode can now present the prepared adapter as a
 bounded, uncached, non-mappable regular file. Its backend rejects writes and

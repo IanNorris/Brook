@@ -190,6 +190,31 @@ void Worker(void* arg) {
     if(verification!=-115)AhciSystemGuardTestDataFinish(data);
     if(verification!=0 || !identityOk) {KPrintf("GUARD_EXT2_INCOMPLETE verify=%d identity=%u\n",verification,identityOk?1u:0u);return;}
     KPuts("GUARD_EXT2_VERIFIED_PENDING\n");
+#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+    // Derive the exact pending record from the pair admitted before repair.
+    // The repair generation identifies the attempt across both transitions.
+    BrookUpdatePut64(records[0]+8,BrookUpdateGet64(records[0]+8)+1);
+    BrookUpdatePut32(records[0]+16,BROOK_RECOVERY_GUARD_PENDING);
+    BrookUpdatePut32(records[0]+124,BrookUpdateCrc(records[0],124));
+    char completeInjection[3]{};
+    const uint32_t completeRaw=FwCfgReadFile("opt/guard-complete-fail",completeInjection,sizeof(completeInjection));
+    const uint32_t completeLength=completeRaw && completeRaw<=sizeof(completeInjection) && !completeInjection[completeRaw-1]?completeRaw-1:completeRaw;
+    uint32_t completeFail=0;
+    for(uint32_t i=0;i<completeLength && i<sizeof(completeInjection);++i) {
+        if(completeInjection[i]<'0' || completeInjection[i]>'9') {completeFail=99;break;}
+        completeFail=completeFail*10+uint32_t(completeInjection[i]-'0');
+    }
+    if(completeRaw>sizeof(completeInjection) || completeLength>2 || completeFail>11 || (completeRaw && !completeFail) ||
+       !AhciSystemGuardTestBeginCompletion(adapter,identityOk)) {
+        KPuts("GUARD_COMPLETE_TEST_INCOMPLETE authorization\n");return;
+    }
+    const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
+    AhciSystemGuardTestFinish(adapter);
+    if(FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail)!=0) {
+        KPuts("GUARD_COMPLETE_TEST_INCOMPLETE repeated\n");return;
+    }
+    KPrintf("GUARD_COMPLETE_TEST_RESULT outcome=%d\n",complete);
+#endif
 #endif
     return;
 #else
