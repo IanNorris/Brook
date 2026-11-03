@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 
-def boot(image, firmware, work, recovery, marker, timeout):
+def boot(image, firmware, work, recovery, marker, timeout, sata):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -26,9 +26,19 @@ def boot(image, firmware, work, recovery, marker, timeout):
         '-smp', '2', '-m', '1024', '-nodefaults',
         '-drive', f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE.fd"}',
         '-drive', f'if=pflash,format=raw,file={variables}', '-device', 'VGA',
+    ]
+    if sata:
+        command += [
+            '-drive', f'if=none,id=stick,format=raw,snapshot=on,file={image}',
+            '-device', 'ide-hd,drive=stick,bus=ide.0,bootindex=1',
+        ]
+    else:
+        command += [
         '-device', 'qemu-xhci,id=usbc',
         '-drive', f'if=none,id=stick,format=raw,readonly=on,file={image}',
         '-device', 'usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1',
+        ]
+    command += [
         '-display', 'none', '-serial', f'file:{serial}',
         '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot',
     ]
@@ -39,7 +49,8 @@ def boot(image, firmware, work, recovery, marker, timeout):
             send_until = time.monotonic() + 12
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    raise RuntimeError('QEMU exited before the expected boot marker')
+                    raise RuntimeError('QEMU exited before the expected boot marker: ' +
+                                       (work / 'qemu.log').read_text(errors='replace')[-2000:])
                 if recovery and monitor.exists() and time.monotonic() < send_until:
                     try:
                         with socket.socket(socket.AF_UNIX) as connection:
@@ -68,6 +79,8 @@ def main():
     parser.add_argument('--firmware', type=Path, required=True)
     parser.add_argument('--normal-marker', default='BOOT: complete')
     parser.add_argument('--recovery-marker', required=True)
+    parser.add_argument('--sata', action='store_true',
+                        help='Boot via SATA with no USB storage device')
     parser.add_argument('--timeout', type=int, default=60)
     args = parser.parse_args()
     image, firmware = args.image.resolve(strict=True), args.firmware.resolve(strict=True)
@@ -77,7 +90,7 @@ def main():
         for recovery, marker in ((False, args.normal_marker), (True, args.recovery_marker)):
             work = Path(temp) / ('recovery' if recovery else 'normal')
             work.mkdir()
-            boot(image, firmware, work, recovery, marker, args.timeout)
+            boot(image, firmware, work, recovery, marker, args.timeout, args.sata)
             print(('RECOVERY' if recovery else 'NORMAL') + '_BOOT_PASS', flush=True)
 
 
