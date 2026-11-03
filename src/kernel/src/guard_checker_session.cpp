@@ -98,6 +98,13 @@ Vnode* GuardCheckerOpen(int flags,int* error) {
     if(error)*error=0;
     return node;
 }
+Vnode* GuardCheckerOpenLinux(uint64_t flags,int* error) {
+    // O_LARGEFILE, O_NONBLOCK, O_NOFOLLOW and O_CLOEXEC do not grant write
+    // access. Reject every other bit, including O_PATH and unknown flags.
+    constexpr uint64_t allowed=0x8000u|0x800u|0x20000u|0x80000u;
+    if(flags&~allowed) {if(error)*error=-30;return nullptr;}
+    return GuardCheckerOpen(VFS_O_READ,error);
+}
 void GuardCheckerAbort() {SpinLockAcquire(&lock);phase=Phase::Aborted;SpinLockRelease(&lock);}
 GuardCheckerStatus GuardCheckerGetStatus() {
     SpinLockAcquire(&lock);const GuardCheckerStatus status{phase==Phase::Active,views,reads};

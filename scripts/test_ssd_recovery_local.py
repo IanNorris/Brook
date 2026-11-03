@@ -51,6 +51,8 @@ def main():
                    help='Use a static FAT checker and matching diagnostic supervisor on the private ESP')
     p.add_argument('--fat-crosslink', action='store_true',
                    help='Crosslink two new files in the private FAT fixture before boot')
+    p.add_argument('--guard-open-probe', action='store_true',
+                   help='Use a guard-open probe as supervisor on the private fixture')
     a = p.parse_args()
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
@@ -60,6 +62,8 @@ def main():
         p.error('FAT checker uses a clean fixture')
     if a.fat_crosslink and not a.fat_checker:
         p.error('--fat-crosslink requires --fat-checker')
+    if a.guard_open_probe and (a.dirty or a.missing_checker or a.fat_checker or a.prepared_pair):
+        p.error('guard open probe is an independent scenario')
     image = a.image.resolve(strict=True)
     if not image.is_file() or image.stat().st_size != 128 * 1024 * 1024:
         p.error('expected the 128 MiB disposable SATA recovery fixture')
@@ -203,12 +207,15 @@ def main():
                     if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
                         selected = True
                         stop.set()
-                    expected = (('FAT_CHECK_RESULT exit=1' if a.fat_crosslink else 'FAT_CHECK_RESULT exit=0') if a.fat_checker else
+                    expected = ('GUARD_OPEN_PROBE_PASS' if a.guard_open_probe else
+                                ('FAT_CHECK_RESULT exit=1' if a.fat_crosslink else 'FAT_CHECK_RESULT exit=0') if a.fat_checker else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=8;' if a.prepared_pair else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=127;' if a.missing_checker else
                                 'RECOVERY_READONLY_CHECK_INCOMPLETE: e2fsck exit=4;' if a.dirty else
                                 'RECOVERY_READONLY_CHECK_CLEAN:')
                     complete_lines = [line.rstrip('\r') for line in text.split('\n')[:-1]]
+                    if a.guard_open_probe and 'GUARD_OPEN_PROBE_FAILED' in text:
+                        raise RuntimeError('guest guard open probe failed: ' + text[-3000:])
                     if a.fat_checker and any(
                             line.startswith(('FAT_CHECK_FORK_FAILED', 'FAT_CHECK_EXEC_FAILED',
                                              'FAT_CHECK_WAIT_FAILED', 'FAT_CHECK_INTERRUPTED')) or
@@ -222,7 +229,7 @@ def main():
                             raise RuntimeError('physical recovery pair did not reject the wrong disk as expected')
                         if a.fat_crosslink and not all(s in text.lower() for s in ('/qa0.bin', '/qa1.bin', 'share clusters')):
                             raise RuntimeError('guest FAT checker did not report the crosslink')
-                        if not (a.missing_checker or a.prepared_pair or a.fat_checker) and 'Pass 5' not in text:
+                        if not (a.missing_checker or a.prepared_pair or a.fat_checker or a.guard_open_probe) and 'Pass 5' not in text:
                             raise RuntimeError('check did not report all filesystem passes')
                         if a.frame_output:
                             frame = a.frame_output.absolute()
@@ -256,7 +263,8 @@ def main():
                         output.write(serial.read_bytes())
         if sha(disk) != before:
             raise RuntimeError('read-only check changed the disposable disk')
-        print('RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else
+        print('RECOVERY_GUEST_GUARD_OPEN_PASS' if a.guard_open_probe else
+              'RECOVERY_GUEST_FAT_CROSSLINK_PASS' if a.fat_crosslink else
               'RECOVERY_GUEST_FAT_CHECK_PASS' if a.fat_checker else
               'RECOVERY_PHYSICAL_PAIR_REJECTS_QEMU_DISK_PASS' if a.prepared_pair else
               'RECOVERY_LOCAL_NO_NETWORK_MISSING_CHECKER_PASS' if a.missing_checker else

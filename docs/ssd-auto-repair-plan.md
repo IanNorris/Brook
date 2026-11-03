@@ -90,7 +90,12 @@ counts outstanding views and reads. Abort rejects new access while admitted
 reads finish; it does not authorize a mount or repair. Host tests cover races
 and retained references with a stubbed VFS. Trusted executable and exec-lifetime
 checks, actual checker launch and exit authentication, and an ownership handoff
-remain necessary before this can be exposed or used to authorize a mount.
+remain necessary before this can be used to authorize a mount. A reserved
+`/dev/brook-guard-esp` open route connects that gate to normal file descriptors;
+it denies access while no session is active and rejects write, creation and
+unknown open flags. A disposable QEMU recovery boot exercised denied opens and
+verified that the full disk hash was unchanged. This does not test an
+authorized checker, path aliases or a substituted node in another namespace.
 
 The pinned Nix environment produced a static musl dosfstools 4.2 checker
 (SHA-256 `99cc8160e7a076ecd9cb04e13bdbe71c4aad4c64bfdc43ea83a016c8fee9d5e3`).

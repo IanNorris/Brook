@@ -119,7 +119,17 @@ int main() {
     assert(GuardCheckerBegin(&device,&owner));assert(!GuardCheckerBegin(&device,&owner));
     for(int i=0;i<4;++i){failAlloc=i;assert(!GuardCheckerOpen(VFS_O_READ,&error) && error==-12);assert(!GuardCheckerGetStatus().views && !live);}
     failAlloc=-1;
-    current=&other;assert(!GuardCheckerOpen(VFS_O_READ,&error));current=&reused;assert(!GuardCheckerOpen(VFS_O_READ,&error));
+    current=&owner;
+    const uint64_t deniedFlags[]={1,2,0x40,0x80,0x200,0x400,0x10000,0x200000,uint64_t{1}<<40};
+    for(uint64_t flags : deniedFlags) {
+        assert(!GuardCheckerOpenLinux(flags,&error) && error==-30);
+        assert(!GuardCheckerGetStatus().views && !live);
+    }
+    Vnode* linuxNode=GuardCheckerOpenLinux(0x8000|0x800|0x20000|0x80000,&error);
+    assert(linuxNode && !error && GuardCheckerGetStatus().views==1);
+    VfsRelease(linuxNode);assert(!GuardCheckerGetStatus().views && !live);
+    current=&other;assert(!GuardCheckerOpenLinux(0,&error) && error==-13);
+    assert(!GuardCheckerOpen(VFS_O_READ,&error));current=&reused;assert(!GuardCheckerOpen(VFS_O_READ,&error));
     current=&sibling;Vnode* node=GuardCheckerOpen(VFS_O_READ,&error);assert(node && !error);
     assert(node->ops->deny_mapping && !node->ops->file_object && !node->cacheId);
     uint8_t byte=0;uint64_t at=0;current=&other;assert(node->ops->read(node,&byte,1,&at)==-13);
