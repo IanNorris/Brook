@@ -15,6 +15,7 @@
 #include "guard_checker_session.h"
 #include "device.h"
 #include "process.h"
+#include "scheduler.h"
 #include "vfs.h"
 
 using namespace brook;
@@ -22,9 +23,11 @@ namespace {
 Device* reserved=nullptr;thread_local Process* current=nullptr;
 std::atomic<int> live{0};int failAlloc=-1;
 std::mutex allocationMutex,ioMutex,beginMutex;std::condition_variable allocationCv,ioCv,beginCv;
+std::mutex waitMutex;std::condition_variable waitCv;
 bool blockAllocation=false,allocationEntered=false,allocationReleased=false;
 bool blockRead=false,readEntered=false,readReleased=false;
 bool blockBegin=false,beginEntered=false,beginReleased=false;
+bool blockWait=false,waitEntered=false,waitReleased=false;int fakeWaitOutcome=1;ChildWaitSnapshot fakeEvent{};
 unsigned writes=0,flushes=0;int readError=0;
 int Read(Device*,uint64_t,void* out,uint64_t size) {
     std::unique_lock<std::mutex> guard(ioMutex);
@@ -46,6 +49,11 @@ uint64_t Blocks(Device*) {return 8;}uint32_t BlockSize(Device*) {return 512;}
 }
 namespace brook {
 Process* ProcessCurrent(){return current;}
+int SchedulerWaitChild(Process*,int,uint32_t,uint32_t,ChildWaitSnapshot* result) {
+    std::unique_lock<std::mutex> guard(waitMutex);
+    if(blockWait) {waitEntered=true;waitCv.notify_all();waitCv.wait(guard,[]{return waitReleased;});}
+    if(fakeWaitOutcome==1)*result=fakeEvent;return fakeWaitOutcome;
+}
 CredentialIds ProcessReadIds(Process* p,bool){return {p->uid,p->euid,p->suid};}
 bool AhciSystemGuardIsReservedDevice(Device* p){return p==reserved;}
 extern "C" bool DeviceIsRegistered(Device* p){return p==reserved;}
@@ -68,6 +76,73 @@ int main() {
     Device device{reinterpret_cast<const DeviceOps*>(&block),"guard",DeviceType::Block,nullptr};reserved=&device;
     Process owner=process(5,5,77,0),sibling=process(6,5,78,77),other=process(8,8,88,0),reused=process(5,5,99,0);
     int error=0;current=&owner;assert(!GuardCheckerOpen(VFS_O_READ,&error));
+    const pid_t trackedSuccess=fork();assert(trackedSuccess>=0);
+    if(!trackedSuccess) {
+        Process controller=process(10,10,100,0),replacement=process(10,10,101,0);
+        controller.isKernelThread=replacement.isKernelThread=true;owner.parentPid=10;current=&controller;
+        ChildWaitSnapshot result{};fakeEvent.pid=5;fakeEvent.code=1;fakeEvent.status=0;fakeEvent.incarnation=77;
+        assert(GuardCheckerBeginTracked(&device,&owner));
+        assert(GuardCheckerPollTracked(&device,5,99,&result)<0);
+        current=&replacement;assert(GuardCheckerPollTracked(&device,5,77,&result)<0);current=&controller;
+        assert(GuardCheckerPollTracked(nullptr,5,77,&result)<0);
+        fakeWaitOutcome=0;assert(GuardCheckerPollTracked(&device,5,77,&result)==0 && !GuardCheckerCompletionAvailable(&device));
+        fakeWaitOutcome=1;assert(GuardCheckerPollTracked(&device,5,77,&result)==1 && GuardCheckerCompletionAvailable(&device));
+        assert(GuardCheckerPollTracked(&device,5,77,&result)<0);
+        current=&replacement;assert(!GuardCheckerConsumeCompletion(&device));current=&controller;
+        assert(!GuardCheckerConsumeCompletion(nullptr));assert(GuardCheckerConsumeCompletion(&device));
+        assert(!GuardCheckerConsumeCompletion(&device));_exit(0);
+    }
+    childDone(trackedSuccess);
+    const pid_t trackedFailure=fork();assert(trackedFailure>=0);
+    if(!trackedFailure) {
+        Process controller=process(10,10,100,0);controller.isKernelThread=true;owner.parentPid=10;current=&controller;
+        ChildWaitSnapshot result{};fakeEvent.pid=5;fakeEvent.code=1;fakeEvent.status=256;fakeEvent.incarnation=77;
+        assert(GuardCheckerBeginTracked(&device,&owner));assert(GuardCheckerPollTracked(&device,5,77,&result)==1);
+        fakeEvent.status=0;assert(GuardCheckerPollTracked(&device,5,77,&result)<0);assert(!GuardCheckerConsumeCompletion(&device));_exit(0);
+    }
+    childDone(trackedFailure);
+    const pid_t trackedOutstanding=fork();assert(trackedOutstanding>=0);
+    if(!trackedOutstanding) {
+        Process controller=process(10,10,100,0);controller.isKernelThread=true;owner.parentPid=10;current=&controller;
+        ChildWaitSnapshot result{};fakeEvent.pid=5;fakeEvent.code=1;fakeEvent.incarnation=77;
+        assert(GuardCheckerBeginTracked(&device,&owner));current=&owner;
+        Vnode* node=GuardCheckerOpen(VFS_O_READ,&error);assert(node);current=&controller;
+        assert(GuardCheckerPollTracked(&device,5,77,&result)==1 && !GuardCheckerCompletionAvailable(&device));VfsRelease(node);
+        assert(GuardCheckerPollTracked(&device,5,77,&result)<0 && !GuardCheckerConsumeCompletion(&device));_exit(0);
+    }
+    childDone(trackedOutstanding);
+    const pid_t trackedReusedChild=fork();assert(trackedReusedChild>=0);
+    if(!trackedReusedChild) {
+        Process controller=process(10,10,100,0);controller.isKernelThread=true;owner.parentPid=10;current=&controller;
+        ChildWaitSnapshot result{};fakeEvent.pid=5;fakeEvent.code=1;fakeEvent.incarnation=99;
+        assert(GuardCheckerBeginTracked(&device,&owner));
+        assert(GuardCheckerPollTracked(&device,5,77,&result)==1 && !GuardCheckerCompletionAvailable(&device));
+        assert(!GuardCheckerConsumeCompletion(&device));_exit(0);
+    }
+    childDone(trackedReusedChild);
+    const pid_t trackedOpenRace=fork();assert(trackedOpenRace>=0);
+    if(!trackedOpenRace) {
+        Process controller=process(10,10,100,0);controller.isKernelThread=true;owner.parentPid=10;current=&controller;
+        fakeEvent.pid=5;fakeEvent.code=1;fakeEvent.incarnation=77;ChildWaitSnapshot result{};
+        assert(GuardCheckerBeginTracked(&device,&owner));blockAllocation=true;Vnode* node=nullptr;
+        std::thread opener([&]{current=&owner;node=GuardCheckerOpen(VFS_O_READ,&error);});
+        {std::unique_lock<std::mutex> g(allocationMutex);allocationCv.wait(g,[]{return allocationEntered;});}
+        assert(GuardCheckerPollTracked(&device,5,77,&result)==1 && !GuardCheckerCompletionAvailable(&device));
+        {std::lock_guard<std::mutex> g(allocationMutex);allocationReleased=true;}allocationCv.notify_all();opener.join();
+        assert(!node && !GuardCheckerConsumeCompletion(&device) && !live);_exit(0);
+    }
+    childDone(trackedOpenRace);
+    const pid_t trackedAbortRace=fork();assert(trackedAbortRace>=0);
+    if(!trackedAbortRace) {
+        Process controller=process(10,10,100,0);controller.isKernelThread=true;owner.parentPid=10;current=&controller;
+        fakeEvent.pid=5;fakeEvent.code=1;fakeEvent.incarnation=77;fakeWaitOutcome=0;blockWait=true;int outcome=0;
+        assert(GuardCheckerBeginTracked(&device,&owner));
+        std::thread poller([&]{current=&controller;ChildWaitSnapshot event{};outcome=GuardCheckerPollTracked(&device,5,77,&event);});
+        {std::unique_lock<std::mutex> g(waitMutex);waitCv.wait(g,[]{return waitEntered;});}
+        GuardCheckerAbort();{std::lock_guard<std::mutex> g(waitMutex);waitReleased=true;}waitCv.notify_all();poller.join();
+        assert(outcome==-125 && !GuardCheckerConsumeCompletion(&device));_exit(0);
+    }
+    childDone(trackedAbortRace);
     const pid_t abortFirst=fork();assert(abortFirst>=0);
     if(!abortFirst) {GuardCheckerAbort();assert(!GuardCheckerBegin(&device,&owner));_exit(0);}
     childDone(abortFirst);

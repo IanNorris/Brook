@@ -257,6 +257,17 @@ reservation, and a modified checker was rejected after reservation. The check
 does not repair ext2 or permit normal boot, and these results do not establish
 physical-device durability or authorize deployment to the Dell.
 
+The check-only worker now obtains checker completion from the scheduler itself,
+bound to the reserved device and to the controller's and child's process
+incarnations. A successful result is one-shot and requires the checker to have
+exited successfully and its open views and reads to have drained; stale
+identities, failures and cancellation cannot authorize completion. Host tests
+exercise these cases. The automatic OVMF recovery-dispatch tests were repeated
+with this path: the dirty-store case passed, while pending records, wrong disk
+or filesystem identity, and an altered checker were refused. The private disk
+remained unchanged. This completion signal grants no write or mount authority;
+the handoff for repair and physical-device testing remain future work.
+
 The Dell boot image already contains a static `e2fsck`, but the normal boot
 does not invoke it. A dirty store is rejected before `/nix` or `/data/home`
 is published, and the system remains in the initrd maintenance environment.

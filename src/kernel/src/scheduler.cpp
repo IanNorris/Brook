@@ -3094,7 +3094,7 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
             code = 6;
         }
         if (!code) continue;
-        *result = {p->pid, status, code, p->uid, p->userTicks, p->sysTicks};
+        *result = {p->pid, status, code, p->uid, p->userTicks, p->sysTicks, p->incarnation};
         if (!(options & 0x01000000)) { // WNOWAIT observes without consuming.
             if (exiting) {
                 g_allProcesses[i] = g_allProcesses[--g_processCount];

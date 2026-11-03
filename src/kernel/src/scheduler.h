@@ -135,6 +135,7 @@ struct ChildWaitSnapshot {
     int32_t pid, status, code;
     uint32_t uid;
     uint64_t userTicks, sysTicks;
+    uint64_t incarnation;
 };
 int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
                        uint32_t options, ChildWaitSnapshot* result);

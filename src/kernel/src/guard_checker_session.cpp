@@ -4,14 +4,16 @@
 #include "device.h"
 #include "memory/heap.h"
 #include "process.h"
+#include "scheduler.h"
 #include "spinlock.h"
 #include "vfs.h"
 
 namespace brook {
 namespace {
-enum class Phase : uint8_t {Unused,Active,Aborted};
+enum class Phase : uint8_t {Unused,Active,Aborted,Completed,Claimed};
 struct Key {uint16_t group;uint64_t incarnation;};
 SpinLock lock{};Phase phase=Phase::Unused;Device* target=nullptr;Key owner{};
+Key controller{};bool tracked=false,polling=false;
 uint32_t views=0,reads=0;
 bool ProcessKey(const Process* p,Key& key) {
     if(!p || !p->tgid)return false;
@@ -69,6 +71,57 @@ bool GuardCheckerBegin(Device* device,const Process* checker) {
        device->ops->ioctl(device,DEVICE_IOCTL_READ_ONLY,nullptr)!=1)return false;
     SpinLockAcquire(&lock);const bool ok=phase==Phase::Unused;
     if(ok) {target=device;owner=key;phase=Phase::Active;}
+    SpinLockRelease(&lock);return ok;
+}
+bool GuardCheckerBeginTracked(Device* device,const Process* checker) {
+    Process* current=ProcessCurrent();Key child{},parent{};
+    if(!current || !current->isKernelThread || current->pid!=current->tgid || !ProcessKey(current,parent) ||
+       !checker || checker->pid!=checker->tgid || checker->parentPid!=current->tgid ||
+       !ProcessKey(checker,child) || ProcessReadIds(const_cast<Process*>(checker),false).effective!=0 ||
+       !device || !AhciSystemGuardIsReservedDevice(device) || !DeviceIsRegistered(device) ||
+       !device->ops || !device->ops->ioctl || device->ops->ioctl(device,DEVICE_IOCTL_READ_ONLY,nullptr)!=1)
+        return false;
+    SpinLockAcquire(&lock);const bool ok=phase==Phase::Unused;
+    if(ok) {target=device;owner=child;controller=parent;tracked=true;phase=Phase::Active;}
+    SpinLockRelease(&lock);return ok;
+}
+int GuardCheckerPollTracked(Device* device,uint16_t pid,uint64_t incarnation,ChildWaitSnapshot* result) {
+    Process* current=ProcessCurrent();Key caller{};
+    if(!result || !current || !current->isKernelThread || current->pid!=current->tgid || !ProcessKey(current,caller))return -13;
+    SpinLockAcquire(&lock);
+    const bool admitted=tracked && phase==Phase::Active && device==target &&
+        caller.group==controller.group && caller.incarnation==controller.incarnation &&
+        pid==owner.group && incarnation==owner.incarnation && !polling;
+    if(admitted)polling=true;
+    SpinLockRelease(&lock);
+    if(!admitted)return -13;
+    ChildWaitSnapshot observed{};
+    const int waited=SchedulerWaitChild(current,1,pid,4,&observed);
+    SpinLockAcquire(&lock);polling=false;
+    if(phase!=Phase::Active) {SpinLockRelease(&lock);return -125;}
+    if(waited==1) {
+        const bool ok=observed.pid==pid && observed.incarnation==incarnation &&
+            observed.code==1 && observed.status==0 && !views && !reads;
+        phase=ok?Phase::Completed:Phase::Aborted;
+        *result=observed;
+    } else if(waited<0)phase=Phase::Aborted;
+    SpinLockRelease(&lock);return waited;
+}
+bool GuardCheckerCompletionAvailable(Device* device) {
+    Process* current=ProcessCurrent();Key caller{};
+    if(!current || !current->isKernelThread || current->pid!=current->tgid || !ProcessKey(current,caller))return false;
+    SpinLockAcquire(&lock);
+    const bool ok=tracked && phase==Phase::Completed && device==target && !polling && !views && !reads &&
+        caller.group==controller.group && caller.incarnation==controller.incarnation;
+    SpinLockRelease(&lock);return ok;
+}
+bool GuardCheckerConsumeCompletion(Device* device) {
+    Process* current=ProcessCurrent();Key caller{};
+    if(!current || !current->isKernelThread || current->pid!=current->tgid || !ProcessKey(current,caller))return false;
+    SpinLockAcquire(&lock);
+    const bool ok=tracked && phase==Phase::Completed && device==target && !polling && !views && !reads &&
+        caller.group==controller.group && caller.incarnation==controller.incarnation;
+    if(ok)phase=Phase::Claimed;
     SpinLockRelease(&lock);return ok;
 }
 Vnode* GuardCheckerOpen(int flags,int* error) {

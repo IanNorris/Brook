@@ -109,29 +109,32 @@ void Worker(void* arg) {
     child->parentPid=ProcessCurrent()->tgid;
     child->fds[3]={};
     const uint16_t pid=child->pid;const uint64_t incarnation=child->incarnation;
-    if(!GuardCheckerBegin(device,child)) {
+    if(!GuardCheckerBeginTracked(device,child)) {
         GuardCheckerAbort();ProcessDiscardUnpublished(child);
         KPuts("GUARD_CHECK_INCOMPLETE session\n");return;
     }
     SchedulerAddProcess(child);child=nullptr;
     ChildWaitSnapshot result{};int waited=0;
     for(unsigned i=0;i<12000 && !waited;++i) {
-        waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+        waited=GuardCheckerPollTracked(device,pid,incarnation,&result);
         if(!waited)SchedulerSleepMs(10);
     }
-    GuardCheckerAbort();
     if(waited!=1) {
+        GuardCheckerAbort();
+        const int failure=waited;
         auto* target=SchedulerFindProcessReference(pid);
         if(target) {
             if(target->incarnation==incarnation)SchedulerRequestFatalSignal(target,9);
             ProcessUnref(target);
         }
-        for(unsigned i=0;i<3000 && waited==0;++i) {
+        int cleanupWait=0;
+        for(unsigned i=0;i<3000 && cleanupWait==0;++i) {
             SchedulerSleepMs(10);
-            waited=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
+            cleanupWait=SchedulerWaitChild(ProcessCurrent(),1,pid,4,&result);
         }
-        KPrintf("GUARD_CHECK_INCOMPLETE wait=%d\n",waited);return;
+        KPrintf("GUARD_CHECK_INCOMPLETE wait=%d cleanup=%d\n",failure,cleanupWait);return;
     }
+    const bool completed=GuardCheckerCompletionAvailable(device);
     const auto status=GuardCheckerGetStatus();
     if(status.active || status.views || status.reads) {
         KPrintf("GUARD_CHECK_INCOMPLETE drain views=%u reads=%u\n",status.views,status.reads);return;
@@ -140,6 +143,7 @@ void Worker(void* arg) {
     if(result.status!=0) {
         KPrintf("GUARD_CHECK_RESULT exit=%u\n",static_cast<unsigned>(result.status>>8));return;
     }
+    if(!completed) {GuardCheckerAbort();KPuts("GUARD_CHECK_INCOMPLETE completion\n");return;}
     GuardFatProfile profile{};
     if(!GuardFatCheckDevice(device,profile)) {KPuts("GUARD_CHECK_INCOMPLETE fat-profile\n");return;}
     KPuts("GUARD_CHECK_RESULT exit=0\n");
