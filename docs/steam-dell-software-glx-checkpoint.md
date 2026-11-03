@@ -237,3 +237,22 @@ births; a QMP capture was taken, and the client was subsequently terminated
 and its tracked job drained. The comparison's screenshots and client data are
 private build artifacts. It demonstrates this VM login path, not Dell stability
 or physical graphics support; the Dell's prior hard freeze remains unexplained.
+
+### Attended Dell retry
+
+With the ABI 64 candidate running on the Dell, a private PulseAudio null sink
+passed an authenticated connection check. A nested software Xephyr display
+using the Dell's installed Mesa exposed GLX 1.4; an unprivileged probe created
+a llvmpipe context and read back a red pixel with no reported GL or X error.
+The Steam job was then started with a 256-task limit while a host collector
+recorded kernel logs and memory/process statistics. The Dell stopped answering
+the network approximately 22 seconds after dispatch. The last live sample
+reported 72 processes, 7,499,501,568 bytes free and an idle OOM state. No new
+kernel log lines were captured immediately before contact was lost. These
+figures are not observations of the eventual failure state and do not explain
+the freeze. In the last eight live seconds completed-process and address-space
+counts increased while cleanup queues remained empty, and compositor p95 stayed
+at 18 ms. That makes a gradual buildup in those observed queues or compositor
+intervals less apparent, but does not rule out a sudden lockup. The exact-kernel
+panic scanner is running; physical screen and
+possible panic evidence are pending. Raw diagnostic samples remain private.
