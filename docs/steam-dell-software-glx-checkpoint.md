@@ -208,8 +208,13 @@ hardware debug network and payload identity. The kernel hash remains
 the packaged initrd hash is
 `f3bc21ef5c8b11eb78f8cdf3edc1354de2d8bc9e022679f720cdd05ab281e3d9`.
 The packager's six host tests include hidden modules, ABI mismatch, a missing
-module, an unexpected kernel and real ELF metadata parsing. This candidate
-has not been installed or booted on the Dell.
+module, an unexpected kernel and real ELF metadata parsing. The candidate was
+subsequently activated in SSD slot B (generation 4) after a separate upload-only
+check, retaining the prior slot. A checked restart reached the expected payload,
+Ethernet and the 255,791,009,792-byte persistent desktop. On the physical Dell,
+the unprivileged, bounded native proc-FD probe exited zero and passed directory,
+memfd, pipe-read, pipe-write, socket, eventfd and sparse-memfd cases. This
+verifies those cases on the candidate kernel, not the cause of the Steam freeze.
 
 ### Fresh-client software VM follow-up
 
