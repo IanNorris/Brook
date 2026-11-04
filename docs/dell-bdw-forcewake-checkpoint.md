@@ -116,6 +116,13 @@ stopped ring and unavailable status ownership; each rejects before publication,
 GGTT, HWS or ELSP writes, after which the caller releases prepared pages. The test backend supplies
 these answers; no physical readiness reader or mode transition is implemented.
 
+`BdwExeclistObservationReady` provides the observation portion of that future
+gate: it checks a successful stable, quiescent two-sample observation for
+run-list enable and a clear STOP_RING bit, and requires a separate CSB ownership
+assertion. The [Linux engine register definitions](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/gt/intel_engine_regs.h)
+identify those bits. The helper does not establish the supplied ownership or
+prevent a later submission, and no real execution backend consumes it yet.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).

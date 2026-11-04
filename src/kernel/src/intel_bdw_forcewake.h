@@ -28,6 +28,15 @@ template<class Io> BdwEngineObservation BdwObserveEngine(Io& io,uint32_t base) {
     r.submissionQuiescent=r.idle && !(r.first.control&1u) && (!listMode || !(r.first.execlistLo&busy));
     return r;
 }
+// Necessary but not sufficient submission evidence. Caller must obtain this
+// observation from BCS and retain exclusive engine and CSB ownership through
+// submission; neither the sample nor the CSB Boolean establishes ownership.
+inline bool BdwExeclistObservationReady(const BdwEngineObservation& r,bool csbOwned) {
+    constexpr uint32_t runList=1u<<15,stopRing=1u<<8;
+    return csbOwned && r.sampled && r.idle && r.submissionQuiescent &&
+        (r.first.submissionMode&runList) && (r.second.submissionMode&runList) &&
+        !(r.first.mode&stopRing) && !(r.second.mode&stopRing);
+}
 // Io must hold exclusive ownership of request bit 0, provide verified UC
 // mappings, and a verified monotonic millisecond clock. A successful clear
 // write must drain all earlier potentially posted writes, including failed
