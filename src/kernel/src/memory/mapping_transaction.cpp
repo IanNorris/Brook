@@ -336,7 +336,8 @@ bool MappingTransaction::ValidateRange(const MappingFaultSnapshot& snapshot, uin
     return access && !(access & ~snapshot.range.protection) && ValidateMapping(snapshot,address);
 }
 MappingFaultCommit MappingTransaction::PublishFault(const MappingFaultSnapshot& snapshot, uint64_t index,
-                                                    VirtualAddress address, uint32_t access, bool copyOnWrite) {
+                                                    VirtualAddress address, uint32_t access, bool copyOnWrite,
+                                                    const uint16_t* ownerOverride) {
     if (!ValidateRange(snapshot,address.raw(),access)) return MappingFaultCommit::Stale;
     if (snapshot.range.backing && snapshot.range.backing->file && snapshot.range.backing->file->mappingError)
         return MappingFaultCommit::Failed;
@@ -348,7 +349,7 @@ MappingFaultCommit MappingTransaction::PublishFault(const MappingFaultSnapshot& 
     const bool borrowed = snapshot.range.leafOwnership == MappingLeafOwnership::Borrowed;
     if (index >= freshCapacity_ || fresh_[index].managed == borrowed) return MappingFaultCommit::Failed;
     MemTag tag = borrowed && snapshot.range.kind == MappingKind::Device ? MemTag::Device : MemTag::User;
-    auto result = Publish(index,address,flags,tag,space_->allocationPid);
+    auto result = Publish(index,address,flags,tag,ownerOverride?*ownerOverride:space_->allocationPid);
     if (result == VmmMapResult::Mapped) return MappingFaultCommit::Mapped;
     if (result != VmmMapResult::Occupied) return MappingFaultCommit::Failed;
     const uint64_t leaf = VmmReadLeaf(space_->pageTable,address);

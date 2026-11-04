@@ -157,7 +157,7 @@ uint64_t forkFailureSpace=0;
 unsigned growthFailure=0;
 uint64_t growthFailureSpace=0;
 enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero, Discarded };
-struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
+struct Entry { uint64_t slot;PhysicalAddress recovery;State state;uint16_t owner; };
 struct Region { uint64_t pages,heldFrames;bool accountingVisited;Entry entries[1]; };
 struct Frame {
     PhysicalAddress physical;
@@ -253,7 +253,10 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bo
         PmmRefPage(physical);frame.physical=physical;
         backing.value=range->backing;MappingBackingRef(backing.value);
         entry.slot=token;entry.state=State::Evicting;
-        if(!op.Detach(VirtualAddress(page))){entry.slot=0;entry.state=State::Resident;return -12;}
+        VmmOwnedLeaf detached{};
+        if(!op.Detach(VirtualAddress(page),&detached)){entry.slot=0;entry.state=State::Resident;return -12;}
+        if(!detached.raw || VmmLeafPhysical(detached.raw)!=physical)KernelPanic("paging: detached leaf changed");
+        entry.owner=detached.owner;
         slot.token=0; // region now owns the slot; local backing pin keeps it live
     } // successful detach's destructor has completed the full-AS TLB ACK
     if(detachmentAcknowledged)*detachmentAcknowledged=true;
@@ -278,7 +281,7 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bo
     }
     slot.token=entry.slot;entry.slot=0;
     if(!rejectRollback && VmmTryMapPage(space->pageTable,VirtualAddress(page),frame.physical,Flags(*range),
-                    MemTag::User,space->allocationPid,range->protection!=0)==VmmMapResult::Mapped)
+                    MemTag::User,entry.owner,range->protection!=0)==VmmMapResult::Mapped)
         entry.state=State::Resident;
     else {
         // A failed rollback still retains the only good bytes. A later fault
@@ -493,7 +496,7 @@ void PageableMemoryGrowth::TransferLocked(const MappingRange& range) {
             if(!old->heldFrames)KernelPanic("paging: growth held-frame underflow");
             --old->heldFrames;++next->heldFrames;
         }
-        entry={0,{},State::Discarded};
+        entry={0,{},State::Discarded,0};
     }
 }
 bool PageableMemoryGrowth::DestinationDisjointLocked(const MappingRange& source,uint64_t begin,uint64_t end) const {
@@ -591,7 +594,7 @@ bool PageableMemoryFork::PrepareUnlocked(uint16_t childPid,AddressSpaceState* de
         memset(child,0,bytes);child->pages=record.pages;
         record.child=MappingBackingCreate(child,ReleaseRegion);if(!record.child){kfree(child);return false;}
         for(uint64_t i=0;i<record.pages;++i) {
-            const auto& original=record.snapshot[i];auto& entry=child->entries[i];entry.state=original.state;
+            const auto& original=record.snapshot[i];auto& entry=child->entries[i];entry.state=original.state;entry.owner=childPid;
             if(original.state==State::Stored) {
                 {StoreGuard guard;if(!store.Retain(original.slot))return false;entry.slot=original.slot;}
                 if(failure_==2)return false;
@@ -612,7 +615,7 @@ bool PageableMemoryFork::ValidateLocked() const {
         if(region->pages!=record.pages)return false;
         for(uint64_t i=0;i<record.pages;++i) {
             const auto& current=region->entries[i];const auto& original=record.snapshot[i];
-            if(current.state!=original.state || current.slot!=original.slot || current.recovery!=original.recovery)return false;
+            if(current.state!=original.state || current.slot!=original.slot || current.recovery!=original.recovery || current.owner!=original.owner)return false;
         }
     }
     return true;
@@ -683,7 +686,7 @@ void PageableMemoryRetirement::Commit(bool resetToZero) {
             if(!region->heldFrames)KernelPanic("paging: retirement held-frame underflow");
             --region->heldFrames;
         }
-        *page.entry={0,{},resetToZero?State::Zero:State::Discarded};
+        *page.entry={0,{},resetToZero?State::Zero:State::Discarded,0};
     }
     committed_=true;
 }
@@ -765,6 +768,16 @@ void PageableMemoryBootInit() {
     }
     SerialPrintf("paging experiment: backing=%s slots=%lu single-task admission\n",name,h.slots);
 }
+#ifdef BROOK_HOST_TEST
+// A private, explicit fixture: no firmware/device configuration or guest ABI.
+bool PageableHostInitialize(const PageStoreHeader& header,uint64_t bytes,PageStoreSlot* slots,uint64_t count,PageStoreIo io) {
+    if(ready || !store.Initialize(header,bytes,slots,count,io))return false;
+    KMutexInit(&storeLock);ready=true;return true;
+}
+int64_t PageableHostMap(Process* actor,uint64_t bytes){return Map(actor,bytes);}
+int64_t PageableHostPageOut(Process* actor,uint64_t address){PhysicalAddress retired;auto result=PageOut(actor,address,&retired);if(retired)PmmUnrefPage(retired);return result;}
+void PageableHostFailRollback(bool enabled){injectedFailure=enabled?6:0;}
+#endif
 PageableBackingStatus PageableMemoryBackingStatus() {
     PageableBackingStatus status{};status.configured=ready;
     if(!ready || !KMutexTryLock(&storeLock))return status;
@@ -873,6 +886,7 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     if(index>=region->pages)return MappingFaultResult::Unhandled;
     auto& entry=region->entries[index];token=entry.slot;
     const auto initialState=entry.state;
+    const uint16_t mappingOwner=initialState==State::Zero?space->allocationPid:entry.owner;
     if(initialState==State::Recovery){recovery.physical=entry.recovery;PmmRefPage(recovery.physical);}
     else if(initialState!=State::Stored && initialState!=State::Zero)return MappingFaultResult::Unhandled;
     const uint64_t observedHeld=(space->pagingResidentTarget || space->pagingApplication)?HeldFrames(space):0;
@@ -915,7 +929,7 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
         if(!op.CaptureRange(page,access,refreshed) ||
            refreshed.range.identity!=snapshot.range.identity ||
            !Match(&refreshed.range,backing.value,page,index) ||
-           entry.state!=initialState || entry.slot!=token)return MappingFaultResult::Unhandled;
+           entry.state!=initialState || entry.slot!=token || (initialState!=State::Zero && entry.owner!=mappingOwner))return MappingFaultResult::Unhandled;
         snapshot=refreshed;op.Unlock();
         if(!physical && reserve.Take(space->allocationPid)) {
             physical=reserve.physical;PmmRefPage(physical);
@@ -933,9 +947,10 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     bool rejectPublication=false;
     {StoreGuard guard;if(injectedFailure==7){rejectPublication=true;injectedFailure=0;}}
     if(!op.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
-    if(!op.ValidateRange(snapshot,page,access) || entry.slot!=token)return MappingFaultResult::Unhandled;
+    if(!op.ValidateRange(snapshot,page,access) || entry.state!=initialState || entry.slot!=token ||
+       (initialState!=State::Zero && entry.owner!=mappingOwner))return MappingFaultResult::Unhandled;
     if(rejectPublication)return MappingFaultResult::Unhandled;
-    if(op.PublishFault(snapshot,0,VirtualAddress(page),access,false)!=MappingFaultCommit::Mapped)return MappingFaultResult::Unhandled;
+    if(op.PublishFault(snapshot,0,VirtualAddress(page),access,false,&mappingOwner)!=MappingFaultCommit::Mapped)return MappingFaultResult::Unhandled;
     reserve.published=true;
     // Release backing-owned recovery/slot only after leaving the AS gate.
     recovery.physical=entry.recovery;entry.recovery={};entry.slot=0;entry.state=State::Resident;

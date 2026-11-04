@@ -84,7 +84,8 @@ public:
     bool ValidateMapping(const MappingFaultSnapshot& snapshot, uint64_t address) const;
     bool ValidateRange(const MappingFaultSnapshot& snapshot, uint64_t address, uint32_t access) const;
     MappingFaultCommit PublishFault(const MappingFaultSnapshot& snapshot, uint64_t index,
-                                    VirtualAddress address, uint32_t access, bool copyOnWrite);
+                                    VirtualAddress address, uint32_t access, bool copyOnWrite,
+                                    const uint16_t* ownerOverride = nullptr);
     AddressSpaceState* Space() const { return space_; }
 
 private:

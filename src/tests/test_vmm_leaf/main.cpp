@@ -19,6 +19,8 @@
 #include "memory/file_mapping_registry.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "memory/pageable_memory.h"
+#include "memory/page_store.h"
 #include "acpi.h"
 #include "serial.h"
 #include "memory/address_space.h"
@@ -29,6 +31,12 @@
 
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::abort(); } } while (0)
 using namespace brook;
+namespace brook {
+bool PageableHostInitialize(const PageStoreHeader&,uint64_t,PageStoreSlot*,uint64_t,PageStoreIo);
+int64_t PageableHostMap(Process*,uint64_t);
+int64_t PageableHostPageOut(Process*,uint64_t);
+void PageableHostFailRollback(bool);
+}
 namespace {
 constexpr size_t pageSize = 4096, pageCount = 4096;
 alignas(pageSize) unsigned char frames[pageCount][pageSize];
@@ -1486,7 +1494,9 @@ static void addressFileGateScope() {
         operation.Unlock();CHECK(operation.Prepare(0,1,1));
         CHECK(operation.PrepareZeroed(MemTag::User,52));
         CHECK(operation.LockFaultRange(va.raw()));CHECK(operation.ValidateRange(snapshot,va.raw(),1));
-        CHECK(operation.PublishFault(snapshot,0,va,1,false)==MappingFaultCommit::Mapped);
+        const uint16_t restoredOwner=777;
+        CHECK(operation.PublishFault(snapshot,0,va,1,false,&restoredOwner)==MappingFaultCommit::Mapped);
+        CHECK(VmmGetPagePid(space->pageTable,va)==restoredOwner);
         CHECK(operation.PublishFault(snapshot,0,va+4*pageSize,1,false)==MappingFaultCommit::Stale);
     }
     CHECK(VmmReadLeaf(space->pageTable,va)&VMM_PRESENT);
@@ -2353,6 +2363,102 @@ static void kernelAliasInspection() {
     aliasTestDeny=true;CHECK(!VmmInspectKernelAliases(target,identity,direct) && !identity.present && !direct.present);
     aliasTestDeny=false;VmmHostSetKernelRoot({});aliasTestBase=0;CHECK(!munmap(region,4*pageSize));
 }
+namespace brook {
+uint64_t PmmGetFreePageCount() {
+    std::lock_guard<std::mutex> lock(frameLock);
+    unsigned n = 0;
+    for (auto &rec : records)
+        if (!rec.refs)
+            ++n;
+    return n;
+}
+bool PmmReclassifyPrivateFrame(PhysicalAddress, MemTag, MemTag, uint16_t) {
+    CHECK(false);
+    return false;
+}
+extern "C" void SchedulerYield() { CHECK(false); }
+} // namespace brook
+
+static unsigned char probeDisk[5 * 4096]{};
+static bool badWrite = false;
+int ReadProbe(void *, uint64_t offset, void *data, uint64_t len) {
+    CHECK(offset <= sizeof(probeDisk) && len <= sizeof(probeDisk) - offset);
+    memcpy(data, probeDisk + offset, len);
+    return (int)len;
+}
+int WriteProbe(void *, uint64_t offset, const void *data, uint64_t len) {
+    if (badWrite)
+        return -5;
+    CHECK(offset <= sizeof(probeDisk) && len <= sizeof(probeDisk) - offset);
+    memcpy(probeDisk + offset, data, len);
+    return (int)len;
+}
+static void pageableOwnerRoundTrip() {
+    PageStoreHeader h{PAGE_STORE_MAGIC, 1, 4096, 4, 4096, {1}, 0};
+    h.checksum = PageStoreChecksum(&h, 48);
+    static PageStoreSlot rec[4];
+    CHECK(PageableHostInitialize(h, sizeof(probeDisk), rec, 4, {nullptr, ReadProbe, WriteProbe}));
+    auto root = table();
+    VmmHostSetKernelRoot(root);
+    auto *as = AddressSpaceCreate(38);
+    CHECK(as);
+    Process p{};
+    p.addressSpace = as;
+    int64_t allocated = PageableHostMap(&p, 4096);
+    CHECK(allocated > 0);
+    auto address = VirtualAddress(allocated);
+    auto leaf = VmmDetachOwnedPage(as->pageTable, address);
+    CHECK(leaf.raw);
+    auto phys = VmmLeafPhysical(leaf.raw);
+    CHECK(VmmTryMapPage(as->pageTable, address, phys, flags, MemTag::User, 777) ==
+          VmmMapResult::Mapped);
+    auto frameBytes = [](PhysicalAddress frame) {
+        return reinterpret_cast<unsigned char *>(PhysToVirt(frame).raw());
+    };
+    for(unsigned i=0;i<pageSize;++i)frameBytes(phys)[i]=static_cast<unsigned char>((i*31)^(i>>8));
+    auto checkBytes = [&](PhysicalAddress frame) {
+        for(unsigned i=0;i<pageSize;++i)
+            CHECK(frameBytes(frame)[i]==static_cast<unsigned char>((i*31)^(i>>8)));
+    };
+    auto checkFork = [&] {
+        auto *dest = AddressSpaceCreate(53);
+        CHECK(dest);
+        CHECK(UserMappingClone(&p, as, dest, 53));
+        Process child{};
+        child.addressSpace = dest;
+        CHECK(PageableMemoryFault(&child, dest, allocated, 1, false) ==
+              MappingFaultResult::Resolved);
+        CHECK(VmmGetPagePid(dest->pageTable, address) == 53);
+        checkBytes(VmmLeafPhysical(VmmReadLeaf(dest->pageTable, address)));
+        AddressSpaceUnref(dest);
+        CHECK(ProcessCleanupStep());
+    };
+    CHECK(PageableHostPageOut(&p, allocated) == 4096);
+    checkFork();
+    CHECK(!VmmReadLeaf(as->pageTable, address));
+    CHECK(PageableMemoryFault(&p, as, allocated, 1, false) == MappingFaultResult::Resolved);
+    CHECK(VmmGetPagePid(as->pageTable, address) == 777);
+    checkBytes(VmmLeafPhysical(VmmReadLeaf(as->pageTable, address)));
+    badWrite = true;
+    CHECK(PageableHostPageOut(&p, allocated) == -5 && VmmGetPagePid(as->pageTable, address) == 777);
+    checkBytes(VmmLeafPhysical(VmmReadLeaf(as->pageTable, address)));
+    PageableHostFailRollback(true);
+    CHECK(PageableHostPageOut(&p, allocated) == -5 && !VmmReadLeaf(as->pageTable, address));
+    PageableHostFailRollback(false);
+    badWrite = false;
+    checkFork();
+    CHECK(PageableMemoryFault(&p, as, allocated, 1, false) == MappingFaultResult::Resolved);
+    CHECK(VmmGetPagePid(as->pageTable, address) == 777);
+    checkBytes(VmmLeafPhysical(VmmReadLeaf(as->pageTable, address)));
+    AddressSpaceUnref(as);
+    CHECK(ProcessCleanupStep());
+    for(const auto& slot:rec)CHECK(slot.state==PageSlotState::Free && !slot.references);
+    PmmFreePage(root.pml4);
+    VmmHostSetKernelRoot({});
+    empty();
+    CHECK(heapAllocations == 0);
+}
+
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     kernelAliasInspection();robustExitQueue();low32Mappings();pageableTableSkeleton();
@@ -2365,6 +2471,6 @@ int main(int argc,char** argv) {
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
-    vmallocIntegration();
+    pageableOwnerRoundTrip();vmallocIntegration();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

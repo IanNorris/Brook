@@ -43,6 +43,9 @@ restoration; owners are still read from the existing inline bits. A standalone
 sidecar directory now supports per-table storage, but the live VMM does not yet
 use it. The mapping transaction's optional snapshot is an observation, not an
 additional frame reference.
-Normalizing
-kernel aliases to a single locking domain and proving failure rollback are
-prerequisites.
+The pageable-memory experiment retains the detached owner across eviction,
+failed-write rollback and fault-in; fork assigns the child owner to its stored
+or recovery entry. The hosted VMM fixture exercises those paths with a mapping
+owner different from the address-space owner.
+Normalizing kernel aliases to a single locking domain and proving failure
+rollback are prerequisites for sidecar integration.
