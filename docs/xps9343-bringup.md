@@ -1532,6 +1532,15 @@ the Dell geometry, one-shot behavior and failures including second-page RAM
 overlap, unavailable PCI reads and changed BARs. This diagnostic is not a
 GGTT allocator or evidence that a mapping is unused.
 
+The exact candidate refused the Dell-only probe in private QEMU, then booted
+on the Dell after a clean restart with the previous slot retained. The probe
+passed its D0, boot-map and cache gates and read raw endpoint entries
+`0x00000000dd800001` and `0x00000000dedf8001`. Both have present bit 0 set;
+their candidate backing pages `0xdd800000` and `0xdedf8000` lie inside the
+GPU-scoped RMRR. This confirms the endpoint calculation for this boot, not
+contiguity between them or ownership of any other GGTT entry. No PTEs were
+written and the desktop, persistent SSD and network remained available.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
