@@ -812,6 +812,7 @@ add_executable(test_tmpfs "${BROOK_ROOT}/src/tests/test_tmpfs/main.cpp"
 target_link_libraries(test_tmpfs PRIVATE Threads::Threads)
 target_compile_options(test_tmpfs PRIVATE -Wall -Wextra -Werror -Wno-unused-function -UNDEBUG -DBROOK_HOST_TEST
     -ffunction-sections -fdata-sections -Wno-unused-parameter -Wno-attributes
+    $<$<CXX_COMPILER_ID:GNU>:-Wno-subobject-linkage>
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_tmpfs PRIVATE -Wl,--gc-sections)

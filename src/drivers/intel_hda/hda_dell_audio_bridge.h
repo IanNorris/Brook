@@ -34,7 +34,8 @@ public:
         const auto r=submit(data,bytes);return r.accepted?int(r.accepted):r.error;
     }
     bool progress(AudioDeviceProgress* result){
-        if(!result)return false;lock_.lock();Guard guard{lock_};
+        if(!result)return false;
+        lock_.lock();Guard guard{lock_};
         if(started_ && !closed_ && !queue_.failed())queue_.service();
         const auto& c=queue_.progress();*result={c.epoch,c.submitted,c.completed,capacity_,c.running,c.discontinuity || closed_};
         return capacity_!=0;

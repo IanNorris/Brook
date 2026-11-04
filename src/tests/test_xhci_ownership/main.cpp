@@ -20,7 +20,8 @@ struct RootPort {
     uint32_t read(){return inaccessible?0xffffffffu:value;}
     uint64_t now(){return tick;}
     bool wait(){++tick;if(disconnect && tick==10)value&=~1u;
-        if(!stuck && tick==completeAt && (value&1))value=(value&~(1u<<4))|2u|(1u<<21);return true;}
+        if(!stuck && tick==completeAt && (value&1))value=(value&~(1u<<4))|2u|(1u<<21);
+        return true;}
     void write(uint32_t v){writes.push_back(v);
         assert(!(v&2)); // writing PED=1 would disable the port
         value=(value&~((15u<<5)|(1u<<9)|(3u<<14)|(7u<<25)))|brook::XhciPortPersistent(v);

@@ -191,7 +191,8 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     }
     constexpr uint64_t charge=4096+sizeof(FileObjectPage);
     if(object->reservePageBytes && !object->reservePageBytes(object->pageBudgetContext,charge)) {
-        if(error)*error=-28;return PhysicalAddress{};
+        if(error)*error=-28;
+        return PhysicalAddress{};
     }
     auto rollback=[&] {if(object->releasePageBytes)object->releasePageBytes(object->pageBudgetContext,charge);};
     auto* page=static_cast<FileObjectPage*>(kmalloc(sizeof(FileObjectPage)));

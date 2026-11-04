@@ -86,7 +86,8 @@ public:
         // initialization can register or expose an active driver.
         if(!io_.write(0,nullptr,Ring) || !io_.publish(0,Ring) || !io_.fence())return fail();
         const uint64_t now=io_.nowNs();if(!clock_.Start(0,now))return fail();lastMovementNs_=now;
-        if(!io_.start())return fail();initialized_=true;if(diagnostics_.enabled)add(diagnostics_.starts);return true;
+        if(!io_.start())return fail();
+        initialized_=true;if(diagnostics_.enabled)add(diagnostics_.starts);return true;
     }
     bool service(){
         if(!initialized_ || failed_)return false;

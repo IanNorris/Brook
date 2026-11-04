@@ -46,4 +46,3 @@ int ProcessReadAnonymousFdMetadata(Process* viewer, Process* target, uint32_t fd
     }
     return 1;
 }
-
