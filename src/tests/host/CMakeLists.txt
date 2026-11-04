@@ -854,7 +854,7 @@ target_compile_options(test_acpi_tables PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/s
 
 add_host_test(test_platform_power "${BROOK_ROOT}/src/kernel/src/platform_power.cpp")
 target_compile_options(test_platform_power PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
-    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_platform_power PRIVATE -Wl,--gc-sections)
 
 add_host_test(test_mouse_motion)

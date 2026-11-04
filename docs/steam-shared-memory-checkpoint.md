@@ -194,6 +194,8 @@ backend data writes. Four focused host tests passed. Astra reviewed the frame
 lifetime and locking.
 
 The Dell is offline after the preceding checked reboot; the new kernel has not
-been deployed there. The host-wide test build also encountered an existing
-platform-power test include-path error; this is separate from the passing
-focused tests.
+been deployed there. After fixing the platform-power test's missing include
+path, the complete host suite built. It passed 304 of 306 tests in parallel; the
+scheduler-lock and audio-delivery timeouts passed individually on rerun. The
+tmpfs and file-object tests also passed GCC ASan/UBSan with leak detection
+disabled.
