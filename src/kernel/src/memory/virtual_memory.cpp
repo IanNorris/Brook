@@ -9,6 +9,7 @@
 #include "acpi.h"
 #include "dell_i2c_id_policy.h"
 #include "intel_vtd_probe_policy.h"
+#include "intel_bdw_gtt_probe.h"
 
 namespace brook {
 
@@ -539,6 +540,32 @@ bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status) {
     } io;
     const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
     const bool ok=DellGpuVtdCritical(io,status);
+    IrqSpinLockRelease(&g_kernelPtLock,irq);return ok;
+}
+
+bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& result) {
+    struct Io {
+        AuditedAliasTables tables;
+        bool evidence(uint64_t page,DellI2cCriticalEvidence& e) {
+            KernelAliasMapping identity{},direct{},current{};
+            const uint64_t root=g_kernelCR3.raw(),active=ReadCR3()&PHYS_MASK;
+            e.aliasesValid=active==root && InspectKernelAlias(tables,root,page,identity) &&
+                InspectKernelAlias(tables,root,DIRECT_MAP_BASE+page,direct) &&
+                InspectKernelAlias(tables,active,DIRECT_MAP_BASE+page,current);
+            e.identityPresent=identity.present;e.identityMatches=identity.physical==page;e.identityPat=identity.patIndex;
+            e.directPresent=direct.present;e.directMatches=direct.physical==page;e.directPat=direct.patIndex;
+            e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==page;e.currentDirectPat=current.patIndex;
+            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(page,page,cpu) && cpu.cpu==0;
+            e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
+            return true;
+        }
+        bool read(uint64_t address,uint64_t& value) {
+            __asm__ volatile("lfence":::"memory");
+            value=*reinterpret_cast<const volatile uint64_t*>(DIRECT_MAP_BASE+address);return true;
+        }
+    } io;
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
+    const bool ok=BdwGopPtesCritical(plan,io,result);
     IrqSpinLockRelease(&g_kernelPtLock,irq);return ok;
 }
 

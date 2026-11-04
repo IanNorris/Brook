@@ -1,10 +1,32 @@
 #include "intel_bdw_scanout.h"
 #include "hda_dell_inventory.h"
 #include "boot_protocol/boot_protocol.h"
+#include "intel_bdw_gtt_probe.h"
+#include "acpi.h"
+#include "vfs.h"
 #include <cassert>
+#include <cstring>
+#include <sys/wait.h>
+#include <unistd.h>
 using namespace brook;
-static unsigned scenario=0;
+static unsigned scenario=0,reads=0,pageChecks=0;static Vnode marker;
 namespace brook {
+extern "C" void SerialPuts(const char*){}
+extern "C" void SerialPrintf(const char*,...){}
+extern "C" Vnode* VfsOpen(const char*,int){return scenario>=4?&marker:nullptr;}
+void VfsRelease(Vnode*){}
+int VfsStat(Vnode*,VnodeStat* s){*s={};s->size=2;return 0;}
+extern "C" int VfsRead(Vnode*,void* out,uint64_t n,uint64_t*){if(n!=2)return -1;std::memcpy(out,"1\n",2);return 2;}
+uint32_t SmpCurrentCpuIndex(){return scenario==7?1:0;}
+extern "C" uint8_t PciConfigRead8(uint8_t,uint8_t,uint8_t,uint8_t o){return o==0x34?0x40:o==0x40 || o==0x62?1:0;}
+extern "C" uint16_t PciConfigRead16(uint8_t,uint8_t,uint8_t,uint8_t o){return o==6?(scenario==13?0xffff:0x10):o==4?(scenario==12?0xffff:2):o==0x50?0x01c1:o==0x42?(scenario==9?0:1):o==0x44 && scenario==5?3:0;}
+extern "C" uint32_t PciConfigRead32(uint8_t,uint8_t,uint8_t,uint8_t o){
+    if(o==0)return 0x16168086;if(o==0x2c)return 0x06651028;if(o==8)return 9;
+    if(o>=0x10 && o<0x20)return HdaDellPciReferenceEntries[1].bars[(o-0x10)/4]^(scenario==10 && o==0x10?0x1000000:0);
+    return 0;
+}
+bool AcpiClassifyBootRange(uint64_t page,uint32_t bytes,BootResourceClassification& c){++pageChecks;assert(bytes==4096 && page==(pageChecks==1?0xf6800000ull:0xf680a000ull));c={scenario==11 && pageChecks==2?3u:2u,false};return scenario!=6;}
+bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& p){assert(plan.firstIndex==0 && plan.lastIndex==5624 && plan.firstAddress==0xf6800000ull && plan.lastAddress==0xf680afc0ull);++reads;if(scenario==8)return false;p={5,6};return true;}
 uint32_t PciBootInventoryCount(){return 16;}
 uint32_t PciBootInventorySeen(){return scenario==1?17:16;}
 bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
@@ -18,9 +40,15 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
 }
 }
 int main(){
-    BootProtocol boot{};boot.framebuffer.physicalBase=0xe0001000;boot.framebuffer.width=16;
-    boot.framebuffer.height=4;boot.framebuffer.stride=128;
-    BdwGopObserveConfigure(&boot);assert(BdwGopObserveRead().planned && BdwGopObserveRead().plan.firstIndex==1);
+    BootProtocol boot{};boot.framebuffer.physicalBase=0xe0000000;boot.framebuffer.width=3200;
+    boot.framebuffer.height=1800;boot.framebuffer.stride=12800;
+    BdwGopObserveConfigure(&boot);assert(BdwGopObserveRead().planned && BdwGopObserveRead().plan.firstIndex==0);
     for(scenario=1;scenario<=3;++scenario){BdwGopObserveConfigure(&boot);assert(!BdwGopObserveRead().planned);}
     BdwGopObserveConfigure(nullptr);assert(!BdwGopObserveRead().planned);
+    for(unsigned n=4;n<=13;++n){pid_t child=fork();assert(child>=0);if(!child){scenario=n;reads=0;pageChecks=0;BdwGopObserveConfigure(&boot);
+        const auto& r=BdwGopObserveRead();assert(r.probeRequested && r.planned);
+        if(n==4)assert(r.sampled && reads==1 && r.firstPte==5 && r.lastPte==6);
+        else assert(!r.sampled && reads==(n==8?1u:0u));
+        BdwGopObserveConfigure(&boot);assert(reads==(n==4 || n==8?1u:0u));_exit(0);}
+        int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
 }

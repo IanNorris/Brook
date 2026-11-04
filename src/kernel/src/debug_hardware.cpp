@@ -306,6 +306,11 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"planned\":");r.text(s.planned?"true":"false");
         if(s.planned){r.text(",");r.field("first_index",s.plan.firstIndex);r.text(",");r.field("last_index",s.plan.lastIndex);
             r.text(",");r.field("first_pte_address",s.plan.firstAddress);r.text(",");r.field("last_pte_address",s.plan.lastAddress);}
+        r.text(",\"probe_requested\":");r.text(s.probeRequested?"true":"false");
+        r.text(",\"power_d0\":");r.text(s.powerD0?"true":"false");
+        r.text(",\"pages_admitted\":");r.text(s.pagesAdmitted?"true":"false");
+        r.text(",\"sampled\":");r.text(s.sampled?"true":"false");
+        if(s.sampled){r.text(",");r.field("first_pte_raw",s.firstPte);r.text(",");r.field("last_pte_raw",s.lastPte);}
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware gpu-vtd")) {

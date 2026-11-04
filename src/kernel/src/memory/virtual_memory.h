@@ -133,6 +133,9 @@ struct DellGpuVtdStatus;
 // audited DMAR for this boot, no conflicting resources across the register
 // page, and an opted-in single BSP attempt. Output is unchanged on failure.
 bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status);
+struct BdwGopPtePlan;struct BdwGopPtes;
+// Caller proves audited Dell/GOP identity, BAR extents, GPU D0 and opt-in.
+bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& result);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.

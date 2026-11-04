@@ -1523,6 +1523,15 @@ planner reported GOP indices `0..5624`, with endpoint PTE addresses
 `0xf6800000` and `0xf680afc0`. These are planned addresses only; neither PTE
 has been read and no unused GGTT range has been established.
 
+An opt-in `/etc/dell-gpu-gtt-probe` observer is prepared to sample only those
+two endpoint entries. It checks the current GPU identity, BARs, GGC/MSAC,
+memory decode, PCI power capability and D0 state; both register pages must
+pass boot-map and locked UC alias checks before either 64-bit load. The
+snapshot is published only after both loads complete. Host tests exercise
+the Dell geometry, one-shot behavior and failures including second-page RAM
+overlap, unavailable PCI reads and changed BARs. This diagnostic is not a
+GGTT allocator or evidence that a mapping is unused.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.

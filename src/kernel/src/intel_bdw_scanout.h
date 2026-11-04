@@ -3,7 +3,10 @@
 namespace brook {
 struct BdwGopPtePlan { uint64_t firstIndex=0,lastIndex=0,firstAddress=0,lastAddress=0; };
 struct BootProtocol;
-struct BdwGopObservation { bool inventory=false,planned=false;BdwGopPtePlan plan{}; };
+struct BdwGopObservation {
+    bool inventory=false,planned=false,probeRequested=false,powerD0=false,pagesAdmitted=false,sampled=false;
+    BdwGopPtePlan plan{};uint64_t firstPte=0,lastPte=0;
+};
 void BdwGopObserveConfigure(const BootProtocol* boot);
 const BdwGopObservation& BdwGopObserveRead();
 // The extents supplied here must be independently verified by the caller.
