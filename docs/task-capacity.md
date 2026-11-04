@@ -39,9 +39,10 @@ retirement. Detach/restore, move, fork, COW and pageable eviction must carry the
 full owner as part of the transaction; copying the raw PTE alone is insufficient.
 The range-detach callback and single-page detach API carry a typed
 raw-leaf/owner snapshot, and file invalidation saves the captured owner for
-restoration; owners are still read from the existing inline bits. The sidecar
-itself is not implemented. The mapping transaction's optional snapshot is an
-observation, not an additional frame reference.
+restoration; owners are still read from the existing inline bits. A standalone
+sidecar directory now supports per-table storage, but the live VMM does not yet
+use it. The mapping transaction's optional snapshot is an observation, not an
+additional frame reference.
 Normalizing
 kernel aliases to a single locking domain and proving failure rollback are
 prerequisites.
