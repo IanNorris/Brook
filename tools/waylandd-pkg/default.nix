@@ -116,8 +116,14 @@ stdenv.mkDerivation {
     ./xwm-wire-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${libxcb.dev}/include xwm-helper-test.c \
         -L${libxcb}/lib -lxcb -o xwm-helper-test
-    python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
+    BROOK_XWM_EXPECT_SYNTHETIC_REJECTION=1 python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
         --helper "$PWD/brook-xwm" --fixture "$PWD/xwm-helper-test"
+    # Xvfb cannot generate Xwayland's direct serial event. The fixture-only
+    # helper accepts SendEvent to exercise the remaining association lifecycle.
+    $CC -O2 -UNDEBUG -Wall -Wextra -DBROOK_XWM_TEST_SYNTHETIC_SERIAL -I${libxcb.dev}/include xwm-helper.c \
+        -L${libxcb}/lib -lxcb -lxcb-composite -o xwm-helper-fixture
+    python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
+        --helper "$PWD/xwm-helper-fixture" --fixture "$PWD/xwm-helper-test"
   '';
 
   buildPhase = ''

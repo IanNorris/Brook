@@ -75,16 +75,45 @@ int main(int argc,char **argv) {
     struct bxwm_message initial=receive(control,BXWM_WINDOW,id,0,320,200);
     xcb_client_message_event_t association={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=id,.type=serial};
     association.data.data32[0]=123;
+    if(getenv("BROOK_XWM_EXPECT_SYNTHETIC_REJECTION")) {
+        xcb_void_cookie_t sent=xcb_send_event_checked(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&association);
+        assert(!xcb_request_check(c,sent));
+        initial.width=321;send_command(control,initial,BXWM_CONFIGURE);
+        struct bxwm_message unchanged=receive(control,BXWM_WINDOW,id,0,321,200);
+        assert(!unchanged.serial && unchanged.identity==initial.identity);
+        send_command(control,unchanged,BXWM_FOCUS);assert(wait_protocol(c,protocols,focus));
+        xcb_disconnect(c);puts("XWM_SYNTHETIC_SERIAL_REJECT_PASS");return 0;
+    }
     xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&association);
     xcb_flush(c);struct bxwm_message mapped=receive(control,BXWM_WINDOW,id,123,0,0);
     assert(mapped.identity==initial.identity && !(mapped.flags&BXWM_CLIENT_CHROME));
+    // Stale, zero and duplicate events must not retire the session or unpair.
+    const uint32_t stale[]={0,122,123};
+    for(size_t i=0;i<sizeof(stale)/sizeof(stale[0]);++i) {
+        association.data.data32[0]=stale[i];
+        xcb_void_cookie_t sent=xcb_send_event_checked(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&association);
+        assert(!xcb_request_check(c,sent));
+    }
+    xcb_void_cookie_t visibility=xcb_unmap_window_checked(c,id);assert(!xcb_request_check(c,visibility));
+    visibility=xcb_map_window_checked(c,id);assert(!xcb_request_check(c,visibility));
+    struct bxwm_message remapped=receive(control,BXWM_WINDOW,id,0,320,200);
+    assert(remapped.identity==mapped.identity && !remapped.serial);
+    association.data.data32[0]=123;
+    xcb_void_cookie_t replay=xcb_send_event_checked(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&association);
+    assert(!xcb_request_check(c,replay));
+    remapped.width=321;send_command(control,remapped,BXWM_CONFIGURE);
+    remapped=receive(control,BXWM_WINDOW,id,0,321,200);assert(!remapped.serial);
+    association.data.data32[0]=124;
+    replay=xcb_send_event_checked(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&association);
+    assert(!xcb_request_check(c,replay));
+    mapped=receive(control,BXWM_WINDOW,id,124,321,200);assert(mapped.identity==initial.identity);
     xcb_get_geometry_reply_t *border=xcb_get_geometry_reply(c,xcb_get_geometry(c,id),NULL);
     assert(border && !border->border_width);free(border);
     uint32_t requested_border=4;
     xcb_configure_window(c,id,XCB_CONFIG_WINDOW_BORDER_WIDTH,&requested_border);xcb_flush(c);
     mapped.x=40;mapped.y=50;mapped.width=640;mapped.height=360;
     send_command(control,mapped,BXWM_CONFIGURE);
-    struct bxwm_message configured=receive(control,BXWM_WINDOW,id,123,640,360);
+    struct bxwm_message configured=receive(control,BXWM_WINDOW,id,124,640,360);
     assert(configured.x==40 && configured.y==50);
     border=xcb_get_geometry_reply(c,xcb_get_geometry(c,id),NULL);assert(border && !border->border_width);free(border);
     send_command(control,configured,BXWM_FOCUS);assert(wait_protocol(c,protocols,focus));
@@ -135,7 +164,7 @@ int main(int argc,char **argv) {
     assert(!xcb_request_check(c,property_cookie));
     struct bxwm_message native_state=configured;native_state.flags|=BXWM_MAXIMIZED|BXWM_MINIMIZED;
     send_command(control,native_state,BXWM_CONFIGURE);
-    native_state=receive(control,BXWM_WINDOW,id,123,640,360);
+    native_state=receive(control,BXWM_WINDOW,id,124,640,360);
     assert((native_state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED))==(BXWM_MAXIMIZED|BXWM_MINIMIZED));
     xcb_get_property_reply_t *state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4),NULL);
     assert(state_reply && state_reply->format==32 && xcb_get_property_value_length(state_reply)==12);
@@ -143,7 +172,7 @@ int main(int argc,char **argv) {
         ((xcb_atom_t *)xcb_get_property_value(state_reply))[1]==max_h &&
         ((xcb_atom_t *)xcb_get_property_value(state_reply))[2]==max_v);free(state_reply);
     send_command(control,configured,BXWM_CONFIGURE);
-    native_state=receive(control,BXWM_WINDOW,id,123,640,360);
+    native_state=receive(control,BXWM_WINDOW,id,124,640,360);
     assert(!(native_state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED)));
     state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4),NULL);
     assert(state_reply && state_reply->format==32 && xcb_get_property_value_length(state_reply)==4 &&
@@ -152,30 +181,30 @@ int main(int argc,char **argv) {
     property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_STRING,8,sizeof(malformed_state),malformed_state);
     assert(!xcb_request_check(c,property_cookie));
     native_state=configured;native_state.flags|=BXWM_MAXIMIZED;
-    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,124,640,360);
     state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_GET_PROPERTY_TYPE_ANY,0,8),NULL);
     assert(state_reply && state_reply->type==XCB_ATOM_STRING && state_reply->format==8 &&
         xcb_get_property_value_length(state_reply)==sizeof(malformed_state) &&
         !memcmp(xcb_get_property_value(state_reply),malformed_state,sizeof(malformed_state)));free(state_reply);
-    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,124,640,360);
     xcb_atom_t axis_state[]={foreign,max_h};
     property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_ATOM,32,2,axis_state);
     assert(!xcb_request_check(c,property_cookie));
     native_state=configured;native_state.flags|=BXWM_MINIMIZED;
-    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,124,640,360);
     state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4),NULL);
     assert(state_reply && xcb_get_property_value_length(state_reply)==8 &&
         !memcmp(xcb_get_property_value(state_reply),axis_state,sizeof(axis_state)));free(state_reply);
-    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,124,640,360);
     xcb_atom_t many[4095];for(size_t i=0;i<4095;++i)many[i]=foreign;
     property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_ATOM,32,4095,many);
     assert(!xcb_request_check(c,property_cookie));
     native_state=configured;native_state.flags|=BXWM_MAXIMIZED;
-    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,124,640,360);
     state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4096),NULL);
     assert(state_reply && !state_reply->bytes_after && xcb_get_property_value_length(state_reply)==sizeof(many) &&
         !memcmp(xcb_get_property_value(state_reply),many,sizeof(many)));free(state_reply);
-    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,124,640,360);
     // Reparenting away retires the native identity. Returning creates a new one.
     xcb_reparent_window(c,global,id,0,0);xcb_flush(c);
     struct bxwm_message retired=receive(control,BXWM_DESTROY,global,0,0,0);assert(retired.identity==active.identity);

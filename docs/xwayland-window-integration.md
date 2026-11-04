@@ -80,6 +80,14 @@ properties are left intact. An isolated X server fixture covers these cases;
 concurrent direct property writers and fresh Steam/Dell acceptance remain
 outside that test.
 
+The XWM now drops synthetic X11 surface-serial events and ignores zero,
+duplicate and stale serials without retiring the entire session. Its per-window
+high-water mark survives an unmap. The isolated Xvfb tests exercise rejection
+with the production helper and lifecycle handling with a test-only helper;
+Xvfb cannot generate Xwayland's direct server-originated event. The change
+still needs a real Xwayland association/remap run with the packaged version
+before being deployed to the Dell.
+
 The first live Steam review exposed a Friends input defect: native presentation
 put Friends above the main window, while the X root stack put the main window
 above Friends. Native activation now raises the matching X window as well as

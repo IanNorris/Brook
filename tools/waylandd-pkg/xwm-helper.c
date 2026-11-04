@@ -16,6 +16,7 @@
 struct window {
     struct window *next;
     struct bxwm_message state,last;
+    uint64_t serial_high_water;
 };
 struct xwm {
     xcb_connection_t *xcb;
@@ -278,11 +279,16 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
     case XCB_CLIENT_MESSAGE: {
         xcb_client_message_event_t *e=(void *)generic;
         if (e->format!=32) return 1;
+#ifndef BROOK_XWM_TEST_SYNTHETIC_SERIAL
+        // Xwayland delivers association events directly. XSendEvent sets the
+        // high bit; ordinary X clients must not impersonate that association.
+        if(e->type==wm->serial && (generic->response_type&0x80))return 1;
+#endif
         w=track(wm,e->window);
         if (w && e->type==wm->serial) {
             uint64_t serial=(uint64_t)e->data.data32[0]|((uint64_t)e->data.data32[1]<<32);
-            if (!serial || (w->state.serial && serial<=w->state.serial)) return 0;
-            w->state.serial=serial;
+            if (!serial || serial<=w->serial_high_water) return 1;
+            w->state.serial=serial;w->serial_high_water=serial;
         } else if (w && !(w->state.flags&BXWM_OVERRIDE) && (w->state.flags&BXWM_MAPPED)) {
             struct bxwm_message request=w->state;
             if (e->type==wm->moveresize && e->data.data32[3]==1 && e->data.data32[2]<=8) {
