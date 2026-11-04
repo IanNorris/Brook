@@ -375,5 +375,9 @@ binary; Steam itself was not restarted. A successful game launch has not yet
 been established. This long-running Steam job also reached its deliberately
 imposed 256-task diagnostic budget and reported denied births, which can
 confound a retry. It is a job-specific cap, not evidence that the global PID
-pool was exhausted. The X session still uses a nested virtual desktop without
-an X window manager; resizing the main X window did not resolve all clipping.
+pool was exhausted. After replacing the reaper, another launch still exited
+127; the runtime supervisor's log identified `/bin/sh` missing in the private
+outer namespace. A new diagnostic launch adds explicit `/bin/sh` and
+`/bin/bash` bindings and uses a 512-task budget. Game-launch acceptance remains
+pending. The X session still uses a nested virtual desktop without an X window
+manager; resizing the main X window did not resolve all clipping.
