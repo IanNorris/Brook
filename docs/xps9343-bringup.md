@@ -1502,10 +1502,13 @@ The Dell reached its desktop with persistent SSD and networking available.
 The follow-up Dell boot showed `boot_map_classified=true`, `types=0`, and
 `unreported=true`: the entire page is a firmware memory-map hole. The probe
 still performed no register reads. The firmware DMAR identifies this unit,
-but the gap is not itself a RAM or MMIO descriptor. The reviewed exception
-has not yet been tried on the Dell. A valid TES observation would be only a
-point-in-time remapping status, not
-authorization to bind or release GPU-visible pages.
+but the gap is not itself a RAM or MMIO descriptor. With the reviewed
+exception, the Dell subsequently passed all gates and sampled VER `0x10` and
+GSTS `0`: translation was disabled for the dedicated GPU unit at that instant.
+The exact image first booted in private QEMU, which refused the Dell-only read.
+The physical Dell then restarted cleanly with its previous slot retained and
+its persistent SSD and network available. This is a point-in-time observation,
+not authorization to bind or release GPU-visible pages.
 
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
