@@ -1468,6 +1468,16 @@ whether translation is active, nor that a physical page is a usable GPU DMA
 address. The table must be decoded and live remapping state checked before GPU
 page-table entries can refer to Brook-owned memory.
 
+On the Dell, the validated DMAR table is 212 bytes with a zero checksum. Its
+segment-zero DRHD at `0xfed90000` explicitly scopes GPU `00:02.0`; another
+DRHD at `0xfed91000` has the include-all flag. A GPU-scoped RMRR is
+`[0xdd000000,0xdf800000)`, containing the complete decoded stolen-data range
+`[0xdd800000,0xdf800000)`. These are firmware topology observations, not a
+runtime translation-state check or a license to modify either region. The
+diagnostic pair reached the desktop in private QEMU and on the Dell after a
+clean restart; the prior SSD slot was retained. Device registers were not
+read as part of the table capture.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
