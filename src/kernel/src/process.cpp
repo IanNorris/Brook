@@ -1878,6 +1878,7 @@ extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp) {
     }
     FinishIrqSignalProbe(proc);
     if(!copied) {
+        SerialPrintf("SIGNAL: inaccessible IRQ signal frame pid=%u signal=%d rsp=%lx\n",proc->pid,signum,userRsp);
         __asm__ volatile("sti":::"memory");
         SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);SchedulerExitCurrentProcess(128+11,11);
     }

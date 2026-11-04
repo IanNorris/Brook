@@ -213,6 +213,10 @@ The static `signal_irq_registers.c` fixture passed on Linux and an opt-in
 two-CPU QEMU/TCG guest: it checks RAX/RCX/R11, carry, a red-zone sentinel,
 YMM15 round-trip, normal and alternate stacks, and an edited return RIP. This
 does not inspect the exported FP image, cover all registers, or prove which IRQ
-wrapper delivered the signal. Copy-fault, concurrent termination, SMP and
-explicit reschedule-IPI coverage remain. The option defaults off and has not
-been deployed to Dell.
+wrapper delivered the signal. A separate static fixture passed on Linux and
+opt-in QEMU for private alternate-stack write isolation across fork and an
+unwritable alternate stack; the guest logged the IRQ frame copy failure, the
+child died with SIGSEGV and the parent survived. The userspace isolation check
+alone does not distinguish COW from eager copying. Concurrent termination, SMP
+and explicit reschedule-IPI coverage remain. The option defaults off and has
+not been deployed to Dell.
