@@ -235,6 +235,18 @@ static void ownedRangeRetirement() {
         CHECK(VmmGetPagePid(pt,va+i*pageSize)==old.owner);}
     VmmDestroyUserPageTable(pt);empty();
 }
+static void ownedSingleRetirement() {
+    auto pt=table();auto page=PmmAllocPage(),other=PmmAllocPage();CHECK(page && other);
+    CHECK(VmmTryMapPage(pt,va,page,flags,MemTag::User,1001,false)==VmmMapResult::Mapped);
+    const auto raw=VmmReadLeaf(pt,va);CHECK(raw&PTE_HIDDEN_BIT);
+    auto mismatch=VmmDetachOwnedPageIfMatches(pt,va,other);
+    CHECK(!mismatch.raw && !mismatch.owner && VmmReadLeaf(pt,va)==raw && maps(page)==1);
+    auto saved=VmmDetachOwnedPageIfMatches(pt,va,page);
+    CHECK(saved.raw==raw && saved.owner==1001 && !VmmReadLeaf(pt,va) && maps(page)==0);
+    CHECK(VmmTryMapPage(pt,va,page,flags,MemTag::User,saved.owner,false)==VmmMapResult::Mapped);
+    saved=VmmDetachOwnedPage(pt,va);CHECK(saved.raw==raw && saved.owner==1001 && maps(page)==0);
+    PmmUnrefPage(page);PmmFreePage(other);VmmDestroyUserPageTable(pt);empty();
+}
 static void detachReinstall() {
     auto pt=table();auto old=PmmAllocPage();CHECK(VmmTryMapPage(pt,va,old,flags)==VmmMapResult::Mapped);
     auto token=VmmDetachPage(pt,va);CHECK(VmmLeafPhysical(token)==old);
@@ -480,12 +492,18 @@ static void releaseTransactionBacking(void* opaque) {
 static void mappingTransactions() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto* space=AddressSpaceCreate(25);CHECK(space);Process actor{};actor.addressSpace=space;
-    auto original=PmmAllocPage();CHECK(VmmTryMapPage(space->pageTable,va,original,flags)==VmmMapResult::Mapped);
+    auto original=PmmAllocPage();CHECK(VmmTryMapPage(space->pageTable,va,original,flags,MemTag::User,25)==VmmMapResult::Mapped);
+    {
+        MappingTransaction operation(&actor,space);CHECK(operation.Prepare(0,0));CHECK(operation.Lock());
+        VmmOwnedLeaf captured{42,42};CHECK(!operation.Detach(va,&captured));
+        CHECK(!captured.raw && !captured.owner && VmmVirtToPhys(space->pageTable,va)==original);
+    }
     uint64_t generation=space->generation;
     Gate ack;pendingAcknowledgement=&ack;
     std::thread remover([&]{
         MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,0));
-        operation.Lock();CHECK(operation.Detach(va));
+        operation.Lock();VmmOwnedLeaf captured{};CHECK(operation.Detach(va,&captured));
+        CHECK(captured.owner==25 && VmmLeafPhysical(captured.raw)==original);
         CHECK(actor.kernelRegionDepth&&space->references==2);
     });
     ack.wait(1);
@@ -2338,7 +2356,7 @@ static void kernelAliasInspection() {
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     kernelAliasInspection();robustExitQueue();low32Mappings();pageableTableSkeleton();
-    accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();ownedRangeRetirement();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
+    accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();ownedRangeRetirement();ownedSingleRetirement();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();

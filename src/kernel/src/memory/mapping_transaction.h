@@ -38,7 +38,11 @@ public:
     void Changed(bool requiresShootdown = true);
     // Capture ownership while old metadata is still present; detach before
     // removing or splitting the corresponding memfd metadata.
-    bool Detach(VirtualAddress address);
+    // The optional snapshot is metadata only: this transaction retains and
+    // retires the mapping's frame reference. A caller restoring the page or
+    // retaining it past transaction destruction must acquire a separate pin.
+    // The output is zeroed when no leaf is detached or capacity is exhausted.
+    bool Detach(VirtualAddress address, VmmOwnedLeaf* captured = nullptr);
     VmmMapResult Publish(uint64_t index, VirtualAddress address, uint64_t flags,
                          MemTag tag, uint16_t pid, bool accessible = true);
     // Roll back while continuously holding the publication lock. Physical

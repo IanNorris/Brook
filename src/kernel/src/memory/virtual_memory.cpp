@@ -922,7 +922,7 @@ bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protec
     IrqSpinLockRelease(&g_userPtLock,irq); return result;
 }
 
-uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr)
+VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr)
 {
     IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
     uint64_t saved = IrqSpinLockAcquire(&lock);
@@ -934,10 +934,10 @@ uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr)
         Invlpg(virtAddr);
     }
     IrqSpinLockRelease(&lock, saved);
-    return old;
+    return {old,static_cast<uint16_t>((old&PTE_PID_MASK)>>PTE_PID_SHIFT)};
 }
 
-uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected)
+VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected)
 {
     IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
     uint64_t saved = IrqSpinLockAcquire(&lock);
@@ -949,7 +949,12 @@ uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalA
         Invlpg(virtAddr);
     }
     IrqSpinLockRelease(&lock, saved);
-    return old;
+    return {old,static_cast<uint16_t>((old&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+}
+
+uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr) { return VmmDetachOwnedPage(pt,virtAddr).raw; }
+uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected) {
+    return VmmDetachOwnedPageIfMatches(pt,virtAddr,expected).raw;
 }
 
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)

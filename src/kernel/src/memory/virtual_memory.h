@@ -108,6 +108,7 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
 // owned by pt, but does not promote existing ancestor permissions.
 // Borrowed device frames remain borrowed; no physical refcount is acquired.
 enum class VmmMapResult { Mapped, Occupied, OutOfMemory, InvalidAddress };
+struct VmmOwnedLeaf { uint64_t raw; uint16_t owner; };
 VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
                            PhysicalAddress physAddr, uint64_t flags,
                            MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid,
@@ -121,6 +122,10 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
 // Conditional detach for rollback; a replacement frame is left untouched.
 uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
+// Capture owner and raw PTE together under the page-table lock. The raw-only
+// wrappers above are for callers that never restore the detached mapping.
+VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr);
+VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
 uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snapshot, including hidden leaves
 // Diagnostic only: two kernel-root aliases of one aligned physical page.
@@ -156,7 +161,6 @@ bool VmmClearAccessedIfMatches(PageTable,VirtualAddress,PhysicalAddress expected
 // reentry into VMM/AS locks. References are released by caller after shootdown.
 // Owner is captured under the same lock as the raw leaf. Consumers that may
 // restore a detached mapping must retain both, rather than decode raw later.
-struct VmmOwnedLeaf { uint64_t raw; uint16_t owner; };
 using VmmRetireLeaf = void (*)(VirtualAddress, VmmOwnedLeaf leaf, void* context);
 struct VmmRangeStats {
     uint64_t backedPages = 0, hiddenPages = 0, cowPages = 0, writablePages = 0;

@@ -125,10 +125,13 @@ bool MappingTransaction::Borrowed(VirtualAddress address, uint64_t) const {
         return range->leafOwnership == MappingLeafOwnership::Borrowed;
     return false;
 }
-bool MappingTransaction::Detach(VirtualAddress address) {
+bool MappingTransaction::Detach(VirtualAddress address,VmmOwnedLeaf* captured) {
     if (!locked_ || !FaultScopeContains(address.raw())) KernelPanic("mapping: detach outside locked scope");
+    if(captured)*captured={};
     if (retiredCount_ == retiredCapacity_) return false;
-    uint64_t old = VmmDetachPage(space_->pageTable, address);
+    const auto owned=VmmDetachOwnedPage(space_->pageTable, address);
+    const auto old=owned.raw;
+    if(captured)*captured=owned;
     if (old) {
         retired_[retiredCount_++] = {old, !Borrowed(address, old)};
         Changed();
@@ -171,7 +174,7 @@ void MappingTransaction::RollbackPublished() {
         if (fresh_[i].publicationEpoch != lockEpoch_)
             KernelPanic("mapping: rollback after dropping the publication lock");
         if (retiredCount_ == retiredCapacity_) KernelPanic("mapping: rollback capacity");
-        auto old = VmmDetachPageIfMatches(space_->pageTable, fresh_[i].publishedAt, fresh_[i].physical);
+        auto old = VmmDetachOwnedPageIfMatches(space_->pageTable, fresh_[i].publishedAt, fresh_[i].physical).raw;
         if (old) {
             retired_[retiredCount_++] = {old, fresh_[i].managed};
             Changed();
