@@ -1517,6 +1517,11 @@ MSAC/GGTT geometry, disjoint BARs and a complete framebuffer span inside the
 256 MiB aperture. `planned` only confirms address arithmetic; it does not read
 the entries, claim a GGTT range or establish power/cache safety for MMIO. The
 16 MiB BAR0 and 256 MiB BAR2 extents were independently recorded under Linux.
+The exact pair reached the desktop in private QEMU, then booted cleanly on the
+Dell with the prior slot retained. On that Dell boot MSAC was `1` and the
+planner reported GOP indices `0..5624`, with endpoint PTE addresses
+`0xf6800000` and `0xf680afc0`. These are planned addresses only; neither PTE
+has been read and no unused GGTT range has been established.
 
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
