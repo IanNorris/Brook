@@ -203,6 +203,17 @@ a stale window incarnation was rejected. This establishes the X11 control path
 in that VM, not Steam close behavior or Dell acceptance. The top-level bare-metal
 test build separately failed to link existing fixture dependencies including
 ModuleRetainAddresses and CPU memory-type helpers; the kernel itself compiled.
+Those standalone test dependencies were subsequently repaired, and the five
+affected bare-metal fixtures passed in QEMU.
+
+A subsequent private software-rendered VM run exercised this close action on
+the rootless Steam window with a null-output PulseAudio server. The cooperative
+request completed and the window disappeared; Steam continued running, so
+window close was not treated as application exit. A separate normal Steam
+shutdown request completed with exit 0, and the original client job drained
+with exit 0. A fresh xeyes window then opened on the still-running compositor.
+The guest stopped after a checked filesystem and device flush. This does not
+establish Steam shutdown behavior on the Dell or audible playback.
 
 ## Xwayland interval-timer lead
 
