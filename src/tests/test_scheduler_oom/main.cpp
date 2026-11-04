@@ -22,6 +22,7 @@ static bool RequestFatalSignalImpl(Process*,int,AddressSpaceState*,uint64_t);
 void ProcessSignalInfoToUser(Process*,SignalInfo*) {}
 uint64_t PosixTimerPending(Process*){return 0;}
 bool PosixTimerDequeue(Process*,uint64_t,SignalInfo*){return false;}
+KernelSigaction ReadSignalAction(uint16_t,uint32_t){return {};}
 #include "../../kernel/src/signal_pending.inc"
 std::mutex g_readyLock;
 uint32_t ThisCpu(){return 0;}

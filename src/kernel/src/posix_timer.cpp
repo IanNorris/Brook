@@ -208,14 +208,16 @@ uint64_t PosixTimerPending(Process* p)
     IrqSpinLockRelease(&timerLock, flags);
     return result;
 }
-int PosixTimerDequeue(Process* p, uint64_t mask, SignalInfo* info)
+static Timer* FindPending(Process* p,uint64_t mask)
 {
-    uint64_t flags = IrqSpinLockAcquire(&timerLock);
     Timer* chosen = nullptr;
     for (auto& t : timers)
         if (t.pending && Recipient(t, p) && (mask & (1ULL << (t.signo - 1))) &&
             (!chosen || t.signo < chosen->signo ||
              (t.signo == chosen->signo && t.queuedAt < chosen->queuedAt))) chosen = &t;
+    return chosen;
+}
+static int DequeueTimerLocked(Timer* chosen,SignalInfo* info) {
     int result = 0;
     if (chosen) {
         auto& t = *chosen;
@@ -231,8 +233,25 @@ int PosixTimerDequeue(Process* p, uint64_t mask, SignalInfo* info)
         __atomic_sub_fetch(&pendingCount, 1U, __ATOMIC_RELEASE);
         result = t.signo;
     }
-    IrqSpinLockRelease(&timerLock, flags);
     return result;
+}
+int PosixTimerDequeue(Process* p, uint64_t mask, SignalInfo* info)
+{
+    uint64_t flags=IrqSpinLockAcquire(&timerLock);
+    const int result=DequeueTimerLocked(FindPending(p,mask),info);
+    IrqSpinLockRelease(&timerLock,flags);return result;
+}
+bool PosixTimerClaimCaught(Process* p,int signum,SignalInfo* info,KernelSigaction* action)
+{
+    if(!p || signum<1 || signum>64 || !info || !action)return false;
+    const uint64_t flags=IrqSpinLockAcquire(&timerLock);
+    auto* chosen=FindPending(p,1ULL<<(signum-1));
+    bool consumed=false;
+    if(chosen) {
+        const auto snapshot=ReadSignalAction(p->tgid,signum-1);
+        if(snapshot.handler>1) {*action=snapshot;consumed=DequeueTimerLocked(chosen,info)!=0;}
+    }
+    IrqSpinLockRelease(&timerLock,flags);return consumed;
 }
 void PosixTimersTickLocked(Process* const* processes, uint32_t count)
 {

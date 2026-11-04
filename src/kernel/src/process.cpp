@@ -1853,10 +1853,8 @@ extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp) {
     SchedulerKernelRegionEnter(proc);
     pending=(ProcessPendingSignals(proc)|PosixTimerPending(proc))&~proc->sigMask;
     if(!(pending&(1ULL<<(signum-1)))) {FinishIrqSignalProbe(proc);return;}
-    action=ReadSignalAction(proc->tgid,signum-1);
-    if(action.handler<=1){FinishIrqSignalProbe(proc);return;}
     SignalInfo info{};
-    if(!PosixTimerDequeue(proc,1ULL<<(signum-1),&info) && !ProcessDequeueSignal(proc,signum,&info)) {
+    if(!PosixTimerClaimCaught(proc,signum,&info,&action) && !ProcessClaimCaughtSignal(proc,signum,&info,&action)) {
         FinishIrqSignalProbe(proc);return;
     }
     const uint64_t savedMask=proc->sigMask;

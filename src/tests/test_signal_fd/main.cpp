@@ -15,6 +15,10 @@ namespace brook {
 constexpr unsigned MAX_PROCESSES=1024;
 enum class ProcessState {Running,Stopped,Terminated};
 struct SignalInfo {int32_t si_signo,si_errno,si_code,pad;uint8_t _data[112];};
+struct KernelSigaction {uint64_t handler,flags,restorer,mask;};
+static std::atomic<uint64_t> caughtHandler{0};
+static std::function<void()> actionReadHook;
+static KernelSigaction ReadSignalAction(uint16_t,uint32_t){if(actionReadHook)actionReadHook();return {caughtHandler.load(),0,0,0};}
 struct Process {
     uint32_t pid,tgid,uid=1000;uint16_t parentPid=0;bool isThread=false;uint64_t leaderIncarnation=1;uint64_t incarnation=1,sigPending=0,sigMask=0,wakeupTick=0;
     bool terminalPending=false,continuedPending=false,tgidExiting=false;int waitStatus=0,stopSignal=0;
@@ -96,6 +100,37 @@ int main(){
         g_processCount=0;releasedMembership=0;
     }
     Process parent(1),child(2);parent.sigMask=~uint64_t{0};child.sigMask=parent.sigMask;
+    {
+        SignalInfo claimed{};KernelSigaction action{};
+        send(parent,12,88);caughtHandler=1;
+        CHECK(!ProcessClaimCaughtSignal(&parent,12,&claimed,&action));
+        CHECK(ProcessPendingSignals(&parent)&(1ULL<<11));
+        caughtHandler=0x1234;
+        CHECK(ProcessClaimCaughtSignal(&parent,12,&claimed,&action) && action.handler==0x1234);
+        int sender=0;std::memcpy(&sender,claimed._data,4);
+        CHECK(sender==88 && !(ProcessPendingSignals(&parent)&(1ULL<<11)));
+        CHECK(!ProcessClaimCaughtSignal(&parent,12,&claimed,&action));caughtHandler=0;
+    }
+    {
+        SignalInfo first{};first.si_signo=12;int firstSender=71;std::memcpy(first._data,&firstSender,4);
+        QueueSignal(&parent,12,&first);caughtHandler=0x1234;
+        std::atomic<bool> entered{false},competing{false};bool stole=true;
+        actionReadHook=[&]{CHECK(__atomic_load_n(&g_signalSenderLock.next,__ATOMIC_ACQUIRE)==
+                                 __atomic_load_n(&g_signalSenderLock.serving,__ATOMIC_ACQUIRE)+1);
+            entered=true;while(!competing.load())std::this_thread::yield();
+            while(__atomic_load_n(&g_signalSenderLock.next,__ATOMIC_ACQUIRE)==
+                  __atomic_load_n(&g_signalSenderLock.serving,__ATOMIC_ACQUIRE)+1)std::this_thread::yield();};
+        std::thread other([&]{while(!entered.load())std::this_thread::yield();caughtHandler=0x5678;competing=true;
+            SignalInfo discarded{};stole=ProcessDequeueSignal(&parent,12,&discarded);
+            SignalInfo second{};second.si_signo=12;int secondSender=72;std::memcpy(second._data,&secondSender,4);
+            QueueSignal(&parent,12,&second);});
+        SignalInfo selected{};KernelSigaction action{};
+        CHECK(ProcessClaimCaughtSignal(&parent,12,&selected,&action));other.join();actionReadHook={};
+        int sender=0;std::memcpy(&sender,selected._data,4);
+        CHECK(!stole && sender==71 && action.handler==0x5678);
+        CHECK(ProcessDequeueSignal(&parent,12,&selected));std::memcpy(&sender,selected._data,4);CHECK(sender==72);
+        caughtHandler=0;
+    }
     auto* fd=SignalFdCreate(~uint64_t{0});CHECK(fd && !(fd->mask&(1ULL<<8)) && !(fd->mask&(1ULL<<18)));
     SignalFdInfo info[2]{};CHECK(read(parent,fd,info)==-11);CHECK(SignalFdRead(&parent,fd,0,127,true)==-22);
     send(parent,10);CHECK(SignalFdReady(&parent,fd,5)==1 && !SignalFdReady(&child,fd,5));

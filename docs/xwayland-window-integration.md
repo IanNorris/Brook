@@ -205,8 +205,9 @@ A QEMU-only `opt/irq-signal-probe=1` experiment now tries caught-signal
 delivery at LAPIC timer and reschedule-IPI return. On a disposable two-CPU TCG
 guest, the no-syscall-loop fixture passed with the option and failed on the same
 kernel without it. The existing 11-case signal-return guest fixture also passed
-with the option enabled. This is not production acceptance:
-disposition selection and notification dequeue are not yet atomic against
-concurrent handler changes, and default dispositions remain on their existing
-path. Register, floating-point, alternate-stack, copy-fault and SMP/IPI coverage
-are still required. The option defaults off and has not been deployed to Dell.
+with the option enabled. Caught-only claims now select the handler while holding
+the source notification lock; hosted contention tests cover both ordinary and
+POSIX timer sources. The IRQ fixture passed again with that change. This is not
+production acceptance: default dispositions remain on their existing path, and
+register, floating-point, alternate-stack, copy-fault and SMP/IPI coverage are
+still required. The option defaults off and has not been deployed to Dell.

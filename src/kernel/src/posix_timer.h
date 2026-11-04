@@ -5,6 +5,7 @@
 namespace brook {
 struct Process;
 struct SignalInfo;
+struct KernelSigaction;
 // Linux x86-64 syscall ABI, independent of libc's opaque timer_t.
 struct PosixSigevent {
     uint64_t value;
@@ -29,6 +30,8 @@ int PosixTimerOverrun(Process*, int32_t id);
 int PosixTimerDelete(Process*, int32_t id);
 uint64_t PosixTimerPending(Process*);
 int PosixTimerDequeue(Process*, uint64_t mask, SignalInfo*);
+// Caller must select an unblocked signal for the current task.
+bool PosixTimerClaimCaught(Process*,int signum,SignalInfo*,KernelSigaction*);
 // Caller holds scheduler process-list lock. Never acquires scheduler locks.
 void PosixTimersTickLocked(Process* const* processes, uint32_t count);
 // exec=true removes the old group's timers at exec commitment. Otherwise

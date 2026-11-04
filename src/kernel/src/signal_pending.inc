@@ -61,9 +61,8 @@ static void QueueSignal(Process* proc, int signum, const SignalInfo* info)
     IrqSpinLockRelease(&g_signalSenderLock, flags);
 }
 
-bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
+static bool ProcessDequeueSignalLocked(Process* proc, int signum, SignalInfo* info)
 {
-    uint64_t flags = IrqSpinLockAcquire(&g_signalSenderLock);
     uint64_t bit = 1ULL << (signum - 1);
     uint64_t previous = __atomic_fetch_and(&proc->sigPending, ~bit, __ATOMIC_ACQ_REL);
     auto& sender = proc->sigSenders[signum - 1];
@@ -82,8 +81,26 @@ bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
     if(!consumed && signum==17)if(auto* shared=SharedChildSignal(proc)) {
         if(info)*info=shared->info;shared->pending=false;consumed=true;
     }
-    IrqSpinLockRelease(&g_signalSenderLock, flags);
     return consumed;
+}
+bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
+{
+    const auto flags=IrqSpinLockAcquire(&g_signalSenderLock);
+    const bool consumed=ProcessDequeueSignalLocked(proc,signum,info);
+    IrqSpinLockRelease(&g_signalSenderLock,flags);return consumed;
+}
+// Caller must select an unblocked signal for the current task.
+[[maybe_unused]] static bool ProcessClaimCaughtSignal(Process* proc,int signum,SignalInfo* info,KernelSigaction* action) {
+    const auto flags=IrqSpinLockAcquire(&g_signalSenderLock);
+    const uint64_t bit=1ULL<<(signum-1);
+    const bool pending=(__atomic_load_n(&proc->sigPending,__ATOMIC_ACQUIRE)&bit) ||
+        (signum==17 && SharedChildSignal(proc));
+    bool consumed=false;
+    if(pending) {
+        const auto snapshot=ReadSignalAction(proc->tgid,signum-1);
+        if(snapshot.handler>1) {*action=snapshot;consumed=ProcessDequeueSignalLocked(proc,signum,info);}
+    }
+    IrqSpinLockRelease(&g_signalSenderLock,flags);return consumed;
 }
 
 void ProcessQueueChildSignal(Process* parent,Process* child)

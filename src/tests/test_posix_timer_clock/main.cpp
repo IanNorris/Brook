@@ -2,13 +2,16 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include "../../kernel/src/posix_timer.cpp"
 
 namespace {
 uint64_t monotonicNs = 9750000000ULL;
 uint64_t realtimeNs = 1700000000250000000ULL;
 bool pvclock = true;
-uint64_t signalHandler = 0x1234;
+std::atomic<uint64_t> signalHandler{0x1234};
+std::function<void()> actionReadHook;
 brook::Process* timerTarget = nullptr;
 unsigned failures = 0;
 #define CHECK(x) do { if (!(x)) { \
@@ -24,6 +27,7 @@ uint64_t KvmClockReadNs() { return monotonicNs; }
 uint64_t RtcNowNs() { return realtimeNs; }
 uint64_t RtcNow() { return realtimeNs / 1000000000ULL; }
 KernelSigaction ReadSignalAction(uint16_t,uint32_t) {
+    if(actionReadHook)actionReadHook();
     KernelSigaction action{}; action.handler=signalHandler; return action;
 }
 bool SchedulerTimerTargetIncarnation(Process* owner,int32_t tid,uint64_t* incarnation) {
@@ -248,6 +252,27 @@ int main() {
     timerAdmission();
     timerDomainsAndOwnership();
     timerLifecycle();
+    {
+        Process p{};init(p);const auto id=arm(p);expire(p);SignalInfo info{};KernelSigaction action{};
+        signalHandler=1;CHECK(!PosixTimerClaimCaught(&p,10,&info,&action) && pendingCount==1);
+        signalHandler=0x5678;CHECK(PosixTimerClaimCaught(&p,10,&info,&action));
+        CHECK(action.handler==0x5678 && info.si_signo==10 && info.si_code==-2 && !pendingCount);
+        CHECK(!PosixTimerClaimCaught(&p,10,&info,&action));CHECK(!PosixTimerDelete(&p,id));
+    }
+    {
+        Process p{};init(p);const auto id=arm(p);expire(p);SignalInfo info{};KernelSigaction action{};
+        std::atomic<bool> entered{false},competing{false};int stolen=-1;
+        actionReadHook=[&]{CHECK(__atomic_load_n(&timerLock.next,__ATOMIC_ACQUIRE)==
+                                 __atomic_load_n(&timerLock.serving,__ATOMIC_ACQUIRE)+1);
+            entered=true;while(!competing.load())std::this_thread::yield();
+            while(__atomic_load_n(&timerLock.next,__ATOMIC_ACQUIRE)==
+                  __atomic_load_n(&timerLock.serving,__ATOMIC_ACQUIRE)+1)std::this_thread::yield();};
+        std::thread other([&]{while(!entered.load())std::this_thread::yield();signalHandler=0x5678;competing=true;
+            SignalInfo discarded{};stolen=PosixTimerDequeue(&p,1ULL<<9,&discarded);});
+        CHECK(PosixTimerClaimCaught(&p,10,&info,&action));other.join();actionReadHook={};
+        CHECK(!stolen && action.handler==0x5678 && info.si_signo==10 && info.si_code==-2);
+        CHECK(!PosixTimerDelete(&p,id));
+    }
     std::printf("POSIX timer clock: %u failures\n", failures);
     return failures ? 1 : 0;
 }
