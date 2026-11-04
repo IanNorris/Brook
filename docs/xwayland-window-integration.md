@@ -156,6 +156,10 @@ game compatibility or prove the cause of the error. The VM was stopped after a
 checked filesystem and device flush. Original review disks were not modified.
 The option restricts the script's QEMU user-network adapter; caller-supplied
 extra network devices are outside its scope. VDE is rejected with this option.
+The private stderr contains repeated WebSocket connection failures, socket
+creation failures reporting unsupported address family, and failed minidump
+writes. These observations do not distinguish an offline authentication failure
+from an internal runtime failure. No Stardew window was observed.
 
 Known gaps and remaining gates:
 
