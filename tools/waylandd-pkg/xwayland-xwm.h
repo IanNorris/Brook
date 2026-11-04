@@ -312,6 +312,13 @@ static int xwayland_start(const char *server,const char *helper,const char *disp
         setenv("WAYLAND_SOCKET",wayland_fd,1);
         // -displayfd supplies readiness and avoids Xserver's root-only -nolock
         // option, so the owned server can run as the ordinary desktop user.
+        // Diagnostic A/B for Xwayland's smart scheduler: Brook currently lacks
+        // ITIMER_REAL. Keep the usual scheduler unless explicitly requested.
+        const char *dumb_sched=getenv("BROOK_XWAYLAND_DUMB_SCHED");
+        if (dumb_sched && !strcmp(dumb_sched,"1")) {
+            execl(server,server,display,"-rootless","-wm",wm_fd,"-displayfd",display_fd,"-nolisten","tcp","-noreset","-ac","-glamor","gl","-dumbSched",(char *)NULL);
+            _exit(127);
+        }
         execl(server,server,display,"-rootless","-wm",wm_fd,"-displayfd",display_fd,"-nolisten","tcp","-noreset","-ac","-glamor","gl",(char *)NULL);
         _exit(127);
     }

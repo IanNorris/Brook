@@ -183,7 +183,13 @@ substituted. VIRTUAL and PROF need separate CPU accounting.
 
 Upstream's [smart-scheduling timer](https://raw.githubusercontent.com/XQuartz/xorg-server/master/os/utils.c)
 explains the repeated REAL timer calls. Whether a `-dumbSched` diagnostic A/B
-improves this particular workload remains untested.
+improves this particular workload remains untested. For that comparison, start
+the compositor with `BROOK_XWAYLAND_DUMB_SCHED=1`; it passes `-dumbSched` to its
+owned Xwayland, while leaving the default invocation unchanged. Xwayland 24.1.14
+disables both smart-scheduling timer signals and threaded input for that option,
+so any performance change cannot be attributed to the timer alone. Rebuilding
+the compositor and its host suite passed; a guest A/B and Steam acceptance are
+still required. This diagnostic does not implement `setitimer`.
 
 The fixture also checks caught and default `SIGALRM` delivery to a child
 spinning without syscalls; these checks pass on Linux. Brook's current caught
