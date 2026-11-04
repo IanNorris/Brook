@@ -39,6 +39,7 @@
 #include "ksym_addrs.h"
 #include "user_copy.h"
 #include "signal_frame_layout.h"
+#include "signal_context.h"
 #include "signal_altstack.h"
 #include "signal_fp_user.h"
 #include "vdso.h"
@@ -2002,26 +2003,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 
     // Save all registers into mcontext
     SignalMcontext& mc = sf->uc.uc_mcontext;
-    mc.rax    = static_cast<uint64_t>(syscallResult);
-    mc.rbx    = frame->rbx;
-    mc.rcx    = frame->rcx;     // user RIP
-    mc.rdx    = frame->rdx;
-    mc.rsi    = frame->rsi;
-    mc.rdi    = frame->rdi;
-    mc.rbp    = frame->rbp;
-    mc.rsp    = frame->rsp;
-    mc.r8     = frame->r8;
-    mc.r9     = frame->r9;
-    mc.r10    = frame->r10;
-    mc.r11    = frame->r11;
-    mc.r12    = frame->r12;
-    mc.r13    = frame->r13;
-    mc.r14    = frame->r14;
-    mc.r15    = frame->r15;
-    mc.rip    = frame->rcx;     // user RIP (stored in RCX by syscall)
-    mc.eflags = frame->rflags;
-    mc.cs     = GDT_USER_CODE;
-    mc.ss     = GDT_USER_DATA;
+    SignalContextFromSyscall(mc,*frame,static_cast<uint64_t>(syscallResult),GDT_USER_CODE,GDT_USER_DATA);
 
     // Linux restarts selected interrupted syscalls after a signal handler
     // returns when the handler was installed with SA_RESTART. Bash relies on

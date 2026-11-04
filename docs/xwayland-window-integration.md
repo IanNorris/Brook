@@ -192,3 +192,11 @@ until IRQ return can deliver it too. An isolated `RealIntervalTimer` state
 machine models pending, periodic phase and reprogramming; it is not connected
 to the syscall or production alarm. Group identity, locking, signal disposition,
 lifecycle and IRQ integration remain.
+
+An independent `scripts/workloads/signal_irq_delivery.c` isolates caught
+signal delivery from timers: a masked sibling sends `tgkill` after the target
+enters a userspace-only loop. It passes on Linux and fails in a disposable
+two-CPU Brook QEMU/TCG guest, confirming that the return-path gap is real.
+The IRQ register-layout adapter is not connected to the wrappers yet. Its
+host tests check the distinct syscall and IRQ register mappings; the existing
+11-case guest signal-return suite passed after extracting the syscall mapping.
