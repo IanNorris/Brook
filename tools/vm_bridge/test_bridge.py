@@ -16,6 +16,32 @@ import common
 import server
 
 
+class SessionDiscoveryTests(unittest.TestCase):
+    def test_live_default_and_paginated_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            ids=[f'{i:032x}' for i in range(1,5)]
+            for session in ids:
+                (root/session).mkdir()
+                (root/session/'session.json').write_text('{}')
+            def load(session,live=True):
+                if live and session!=ids[2]: raise ValueError('stopped')
+                return {'session':session,'state':'running' if session==ids[2] else 'stopped',
+                        'scenario':'test','large_private_field':'x'*10000}
+            with patch.object(server,'REGISTRY',root),patch.object(server,'load_session',side_effect=load):
+                self.assertEqual([r['session'] for r in server.sessions()['sessions']],[ids[2]])
+                first=server.sessions(include_stopped=True,limit=2)
+                self.assertEqual([r['session'] for r in first['sessions']],ids[:2])
+                self.assertEqual(first['next_cursor'],ids[1])
+                second=server.sessions(include_stopped=True,limit=2,after=first['next_cursor'])
+                self.assertEqual([r['session'] for r in second['sessions']],ids[2:])
+                self.assertIsNone(second['next_cursor'])
+                self.assertTrue(second['sessions'][0]['attachable'])
+                self.assertNotIn('large_private_field',second['sessions'][0])
+                for kwargs in ({'limit':0},{'limit':101},{'limit':True},{'after':'invalid'}):
+                    with self.assertRaises(ValueError):server.sessions(**kwargs)
+
+
 class ProfileLossTests(unittest.TestCase):
     def test_export_refuses_failed_or_running_producer(self):
         server.require_profile_export_ready('Profiler: IDLE\n')

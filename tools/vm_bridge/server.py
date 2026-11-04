@@ -198,20 +198,32 @@ def frame_view(session,frame_id,crop=None,max_width=None,size='full',overlay=Fal
     return result
 
 
-def sessions(**_):
+def sessions(include_stopped=False, limit=25, after=None, **_):
+    if not isinstance(include_stopped,bool) or isinstance(limit,bool) or not isinstance(limit,int) or not 1<=limit<=100:
+        raise ValueError('limit must be between 1 and 100')
+    if after is not None and (not isinstance(after,str) or len(after)!=32 or any(c not in '0123456789abcdef' for c in after)):
+        raise ValueError('Invalid session cursor')
     rows = []
     for p in sorted(REGISTRY.glob("*/session.json")):
+        if after is not None and p.parent.name<=after:
+            continue
         try:
-            data = json.loads(p.read_text())
-            load_session(data["session"])
-            data["attachable"] = True
-        except (OSError, ValueError, KeyError):
+            data = load_session(p.parent.name,live=False)
             try:
-                data = json.loads(p.read_text()); data["attachable"] = False
-            except (OSError, ValueError):
+                load_session(p.parent.name)
+                attachable=True
+            except (OSError, ValueError, KeyError):
+                attachable=False
+            if not attachable and not include_stopped:
                 continue
-        rows.append(data)
-    return {"sessions": rows}
+            if len(rows)==limit:
+                return {"sessions":rows,"next_cursor":rows[-1]["session"]}
+            row={k:data[k] for k in ("session","generation","state","created_at","provenance","scenario","gpu") if k in data}
+            row["attachable"]=attachable
+            rows.append(row)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return {"sessions": rows,"next_cursor":None}
 
 
 def doctor(session, **_):
@@ -982,7 +994,7 @@ register("hw_window",hardware.window,"Apply one semantic window action on the pi
 register("hw_ui",hardware.ui_status,"Observe or recover an existing hardware UI request without redispatch",{**SESSION,"operation_id":STR,"wait_s":NUM,"wait_for":STR},["session","operation_id"],True)
 register("hw_apps",hardware.apps,"Read the physical guest's installed application catalog",SESSION,["session"],True)
 register("hw_launch",hardware.launch,"Launch an exact installed-app reference through the hardware guest's UI launcher once; recover via hw_ui without replay",{**SESSION,"app":{"type":"object"},"request_id":STR,"wait_for":{"type":"string","enum":["admitted","dispatched","window"]},"wait_s":NUM},["session","app","request_id"])
-register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no desktop discovery",readonly=True)
+register("vm_sessions",sessions,"List attachable VM sessions; opt in to stopped history and use next_cursor to page",{"include_stopped":{"type":"boolean","default":False},"limit":{"type":"integer","minimum":1,"maximum":100,"default":25},"after":STR},readonly=True)
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync; reset verifies a different guest boot, never infer restart from QMP acknowledgement; force explicitly permits unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"},"wait_s":NUM},["session","action"])

@@ -77,6 +77,10 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_audio_analyze` | Session WAV waveform PNG, RMS and silent bins. PCM silence alone does not identify stutter. |
 | `vm_artifacts` | Describe scoped ignored artifacts by absolute path, MIME, bytes and checksum, including after VM exit. `include_image: true` opts in to a PNG preview. Binary exports are never embedded in JSON. |
 
+`vm_sessions` returns compact, currently attachable sessions by default. Set
+`include_stopped: true` to include historical runs; follow `next_cursor` using
+`after` to page through them. Pages default to 25 entries and are capped at 100.
+
 Structured command uploads group up to eight existing 64-byte PUTs on one TCP
 connection. Every line retains its frame token and guest boot identity; every
 PUT acknowledgement is checked before commit. Interrupted uploads still replay
