@@ -49,8 +49,17 @@ static IrqSpinLock g_userPtLock;
 
 // The kernel's PML4 physical address, captured at init time.
 static PhysicalAddress g_kernelCR3{};
+// User PML4s share their upper half with the kernel. An explicit kernel CR3
+// and a shared upper-half leaf must use the same lock as KernelPageTable.
+// Use the PML4 index rather than a canonical-address comparison: the walker
+// indexes bit 47 even for noncanonical values.
+static IrqSpinLock& PageTableLock(PageTable pt,VirtualAddress address) {
+    return !pt || pt.pml4==g_kernelCR3 || ((address.raw()>>47)&1)
+        ? g_kernelPtLock : g_userPtLock;
+}
 #ifdef BROOK_HOST_TEST
 void VmmHostSetKernelRoot(PageTable root) { g_kernelCR3 = root.pml4; }
+bool VmmHostUsesKernelPtLock(PageTable root,VirtualAddress address) {return &PageTableLock(root,address)==&g_kernelPtLock;}
 #endif
 
 // Module-space bump allocator
@@ -371,8 +380,7 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
     // Protect page table walks from concurrent modification. Both kernel
     // and user paths can race when create=true allocates intermediate
     // levels (PML4 → PDPT → PD → PT pages).
-    bool isKernel = !pt;
-    IrqSpinLock& ptLock = isKernel ? g_kernelPtLock : g_userPtLock;
+    IrqSpinLock& ptLock = PageTableLock(pt,virtAddr);
     uint64_t ptFlags = IrqSpinLockAcquire(&ptLock);
 
     uint64_t* pte = WalkToPtr(pt, virtAddr, /*create=*/true, flags);
@@ -414,7 +422,7 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
     if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
         return VmmMapResult::InvalidAddress;
     flags &= ~VMM_FORCE_MAP;
-    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     bool large = false;
     // An occupied result must not even promote ancestor USER permissions.
@@ -455,7 +463,7 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 
 PhysicalAddress VmmLeafPhysical(uint64_t leaf) { return PhysicalAddress(leaf & PHYS_MASK); }
 uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {
-    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    IrqSpinLock& lock = PageTableLock(pt,address);
     uint64_t irq = IrqSpinLockAcquire(&lock);
     bool large = false;
     auto* entry = WalkToPtr(pt,address,false,0,&large);
@@ -643,7 +651,7 @@ void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,
 }
 
 bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {
-    if(!pt || (address.raw()&4095) || !expected)return false;
+    if(!pt || pt.pml4==g_kernelCR3 || address.raw()>=0x0000800000000000ULL || (address.raw()&4095) || !expected)return false;
     uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
     bool large=false;auto* entry=WalkToPtr(pt,address,false,0,&large);bool changed=false;
     if(entry && !large) {
@@ -696,7 +704,7 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
     return true;
 }
 static bool ValidLeafRange(PageTable pt, uint64_t begin, uint64_t end) {
-    return pt && begin < end && end <= 0x0000800000000000ULL && !(begin & 4095) && !(end & 4095);
+    return pt && pt.pml4!=g_kernelCR3 && begin < end && end <= 0x0000800000000000ULL && !(begin & 4095) && !(end & 4095);
 }
 bool VmmPrepareRange(PageTable pt, uint64_t begin, uint64_t end) {
     if (!ValidLeafRange(pt,begin,end)) return false;
@@ -924,7 +932,7 @@ bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protec
 
 VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr)
 {
-    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
     uint64_t old = pte && VmmLeafBacked(*pte) ? *pte : 0;
@@ -939,7 +947,7 @@ VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr)
 
 VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected)
 {
-    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
     uint64_t old = pte && VmmLeafBacked(*pte) && VmmLeafPhysical(*pte) == expected ? *pte : 0;
@@ -1065,13 +1073,8 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
             for (uint64_t j = 0; j < i; j++)
             {
                 VirtualAddress v(virtBase + j * PAGE_SIZE);
-                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-                    *pte = 0;
-                    Invlpg(v);
-                }
+                const auto leaf=VmmDetachPage(KernelPageTable,v);
+                if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
             }
             g_moduleNext = virtBase;
             IrqSpinLockRelease(&g_vmmLock, vmmFlags);
@@ -1084,13 +1087,8 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
             for (uint64_t j = 0; j < i; j++)
             {
                 VirtualAddress v(virtBase + j * PAGE_SIZE);
-                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-                    *pte = 0;
-                    Invlpg(v);
-                }
+                const auto leaf=VmmDetachPage(KernelPageTable,v);
+                if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
             }
             g_moduleNext = virtBase;
             IrqSpinLockRelease(&g_vmmLock, vmmFlags);
@@ -1184,6 +1182,8 @@ extern "C" int PmmDumpFreeLog(uint64_t phys);
 VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
 {
     if (pid >= PTE_PID_CAPACITY) return {VmmCowResult::InvalidOwner,{}};
+    if (!pt || pt.pml4==g_kernelCR3 || faultAddr.raw()>=0x0000800000000000ULL)
+        return {VmmCowResult::NotCow,{}};
     PhysicalAddress retired;
     VirtualAddress pageAddr(faultAddr.raw() & ~(PAGE_SIZE - 1));
 
@@ -1397,8 +1397,10 @@ PageTable VmmCreateUserPageTable()
     uint64_t* newPml4  = reinterpret_cast<uint64_t*>(PhysToVirt(pml4Phys).raw());
     uint64_t* kernPml4 = reinterpret_cast<uint64_t*>(PhysToVirt(g_kernelCR3).raw());
 
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
     for (uint64_t i = 256; i < 512; i++)
         newPml4[i] = kernPml4[i];
+    IrqSpinLockRelease(&g_kernelPtLock,irq);
 
     return PageTable(pml4Phys);
 }

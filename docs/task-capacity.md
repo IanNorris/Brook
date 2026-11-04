@@ -47,5 +47,10 @@ The pageable-memory experiment retains the detached owner across eviction,
 failed-write rollback and fault-in; fork assigns the child owner to its stored
 or recovery entry. The hosted VMM fixture exercises those paths with a mapping
 owner different from the address-space owner.
-Normalizing kernel aliases to a single locking domain and proving failure
-rollback are prerequisites for sidecar integration.
+The direct map, try-map, `VmmReadLeaf` and detach paths now select the kernel
+page-table lock for the kernel sentinel, explicit kernel root and shared upper-half slots;
+user-only range operations reject the explicit kernel root. Host tests race the
+sentinel against the explicit root and a kernel root against a user-root upper
+alias, and check independent lower-half user roots. A disposable two-vCPU TCG
+boot reached the scheduler and compositor and passed its TLB tests. Sidecar
+integration still needs the remaining owner-transfer and failure rollback work.

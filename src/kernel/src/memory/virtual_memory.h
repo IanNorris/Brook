@@ -88,6 +88,7 @@ bool VmmFramebufferCacheFlags(uint64_t physical,uint64_t bytes,uint64_t& flags);
 uint64_t VmmFramebufferMapping(uint64_t physical, uint64_t bytes);
 #ifdef BROOK_HOST_TEST
 void VmmHostSetKernelRoot(PageTable root);
+bool VmmHostUsesKernelPtLock(PageTable root,VirtualAddress address);
 #endif
 
 // ---------------------------------------------------------------------------
