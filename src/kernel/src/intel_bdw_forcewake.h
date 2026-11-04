@@ -1,9 +1,9 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
-struct BdwBcsSample {uint32_t head=0,tail=0,mode=0,start=0,control=0,execlistLo=0,execlistHi=0;};
+struct BdwBcsSample {uint32_t head=0,tail=0,mode=0,start=0,control=0,execlistLo=0,execlistHi=0,submissionMode=0;};
 struct BdwForcewakeResult {
-    bool requested=false,acquired=false,threadReady=false,sampled=false,idle=false,released=false;
+    bool requested=false,acquired=false,threadReady=false,sampled=false,idle=false,submissionQuiescent=false,released=false;
     BdwBcsSample first{},second{};
 };
 // Io must hold exclusive ownership of request bit 0, provide verified UC
@@ -14,7 +14,7 @@ struct BdwForcewakeResult {
 // further GT use. This operation does not hand off engines or grant GGTT slots.
 template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io) {
     constexpr uint32_t request=0xa188,ack=0x130044,thread=0x13805c;
-    constexpr uint32_t head=0x22034,tail=0x22030,mode=0x2209c,start=0x22038,control=0x2203c,execlistLo=0x22234,execlistHi=0x22238;
+    constexpr uint32_t head=0x22034,tail=0x22030,mode=0x2209c,start=0x22038,control=0x2203c,execlistLo=0x22234,execlistHi=0x22238,submissionMode=0x2229c;
     BdwForcewakeResult result{};uint32_t value=0;
     // ACK is always-on. REQ is not used to establish ownership: a pre-wake
     // request-register read is not evidence that another actor cannot use it.
@@ -39,8 +39,8 @@ template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io) {
         result.acquired=true;
         if(wait(thread,7,0,5)) {
             result.threadReady=true;
-            auto sample=[&](BdwBcsSample& s){return io.read(head,s.head) && io.read(tail,s.tail) && io.read(mode,s.mode) && io.read(start,s.start) && io.read(control,s.control) && io.read(execlistLo,s.execlistLo) && io.read(execlistHi,s.execlistHi) &&
-                s.head!=0xffffffffu && s.tail!=0xffffffffu && s.mode!=0xffffffffu && s.start!=0xffffffffu && s.control!=0xffffffffu && s.execlistLo!=0xffffffffu && s.execlistHi!=0xffffffffu;};
+            auto sample=[&](BdwBcsSample& s){return io.read(head,s.head) && io.read(tail,s.tail) && io.read(mode,s.mode) && io.read(start,s.start) && io.read(control,s.control) && io.read(execlistLo,s.execlistLo) && io.read(execlistHi,s.execlistHi) && io.read(submissionMode,s.submissionMode) &&
+                s.head!=0xffffffffu && s.tail!=0xffffffffu && s.mode!=0xffffffffu && s.start!=0xffffffffu && s.control!=0xffffffffu && s.execlistLo!=0xffffffffu && s.execlistHi!=0xffffffffu && s.submissionMode!=0xffffffffu;};
             if(sample(result.first) && sample(result.second)) {
                 result.sampled=true;
                 const auto idle=[](const BdwBcsSample& s){return (s.head&0x001ffffcu)==(s.tail&0x001ffff8u) && (s.mode&(1u<<9));};
@@ -48,7 +48,16 @@ template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io) {
                 // the execution-list ports are empty or ownership transferred.
                 result.idle=idle(result.first) && idle(result.second) &&
                     result.first.head==result.second.head && result.first.tail==result.second.tail && result.first.mode==result.second.mode && result.first.start==result.second.start && result.first.control==result.second.control && result.first.execlistLo==result.second.execlistLo &&
-                    result.first.execlistHi==result.second.execlistHi;
+                    result.first.execlistHi==result.second.execlistHi && result.first.submissionMode==result.second.submissionMode;
+                // On Gen8 the low status DWORD has queue-full, list-valid,
+                // active-element and active-list indications. Current-list
+                // pointer bit 0 is not evidence of a submitted context.
+                constexpr uint32_t busy=(1u<<2)|(3u<<3)|(3u<<14)|(3u<<17);
+                const bool listMode=(result.first.submissionMode&(1u<<15))!=0;
+                // These samples alone cannot establish submission exclusion,
+                // other engine/display ownership or a GGTT allocation lease.
+                result.submissionQuiescent=result.idle && !(result.first.control&1u) &&
+                    (!listMode || !(result.first.execlistLo&busy));
             }
         }
     }

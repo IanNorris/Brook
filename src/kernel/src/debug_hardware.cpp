@@ -324,6 +324,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"wake_thread_ready\":");r.text(s.wake.threadReady?"true":"false");
         r.text(",\"wake_sampled\":");r.text(s.wake.sampled?"true":"false");
         r.text(",\"wake_idle\":");r.text(s.wake.idle?"true":"false");
+        r.text(",\"wake_submission_quiescent\":");r.text(s.wake.submissionQuiescent?"true":"false");
         r.text(",\"wake_clear_delivered\":");r.text(s.wakeClearDelivered?"true":"false");
         r.text(",\"wake_released\":");r.text(s.wake.released?"true":"false");
         if(s.wake.sampled){r.text(",");r.field("bcs_head",s.wake.first.head);r.text(",");r.field("bcs_tail",s.wake.first.tail);r.text(",");r.field("bcs_mode",s.wake.first.mode);
@@ -331,7 +332,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("bcs_start",s.wake.first.start);r.text(",");r.field("bcs_control",s.wake.first.control);
             r.text(",");r.field("bcs_start2",s.wake.second.start);r.text(",");r.field("bcs_control2",s.wake.second.control);
             r.text(",");r.field("bcs_execlist_lo",s.wake.first.execlistLo);r.text(",");r.field("bcs_execlist_hi",s.wake.first.execlistHi);
-            r.text(",");r.field("bcs_execlist_lo2",s.wake.second.execlistLo);r.text(",");r.field("bcs_execlist_hi2",s.wake.second.execlistHi);}
+            r.text(",");r.field("bcs_execlist_lo2",s.wake.second.execlistLo);r.text(",");r.field("bcs_execlist_hi2",s.wake.second.execlistHi);
+            r.text(",");r.field("bcs_submission_mode",s.wake.first.submissionMode);r.text(",");r.field("bcs_submission_mode2",s.wake.second.submissionMode);}
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware gpu-vtd")) {

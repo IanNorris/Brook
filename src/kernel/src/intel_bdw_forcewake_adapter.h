@@ -27,7 +27,7 @@ template<class Backend> BdwForcewakeAdapterResult BdwDellForcewakeCritical(Backe
         Backend& b;uint32_t khz;uint64_t origin;bool& clearDelivered;
         bool owned(){return b.owned();}
         bool read(uint32_t offset,uint32_t& value){
-            if(offset!=0x130044 && offset!=0x13805c && offset!=0x22034 && offset!=0x22030 && offset!=0x2209c && offset!=0x22038 && offset!=0x2203c && offset!=0x22234 && offset!=0x22238)return false;
+            if(offset!=0x130044 && offset!=0x13805c && offset!=0x22034 && offset!=0x22030 && offset!=0x2209c && offset!=0x22038 && offset!=0x2203c && offset!=0x22234 && offset!=0x22238 && offset!=0x2229c)return false;
             return b.read32(BdwDellBar0+offset,value);
         }
         bool write(uint32_t offset,uint32_t value){

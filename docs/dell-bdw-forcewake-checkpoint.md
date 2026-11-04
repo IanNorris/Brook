@@ -48,3 +48,22 @@ observation. The register addresses follow the [Linux i915 engine register
 definitions](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_engine_regs.h.html#178).
 The matched image reached the desktop in a disposable QEMU/OVMF boot before
 the Dell run; the four affected host tests passed.
+
+## Submission-mode check
+
+A follow-up boot (`c23a72f70fab42e28d59be1df44d3629`) sampled the BCS
+submission-mode register twice as zero, i.e. legacy rather than execlist mode
+at that instant. Both samples again reported head, tail, start and control zero,
+mode `0x200`, and execlist status low `0x1`, high `0`. Broadwell documents
+bit 0 as the current-list pointer, not a pending-work flag; the low status
+value is the documented default. The decoded result is a quiescent-looking
+BCS submission sample, not an exclusive handoff or GGTT lease. Other engines,
+display allocations and future submissions remain to be accounted for.
+
+The matched image passed a disposable QEMU boot and four focused host tests,
+including changed context, valid-ring and nonempty-execlist cases; Astra
+reviewed the register offsets and predicate. The Dell returned online with its
+SSD desktop ready and forcewake released. The [Broadwell register
+reference](https://www.x.org/docs/intel/BDW/intel-gfx-prm-osrc-bdw-vol02c-commandreference-registers_0.pdf)
+and [Linux i915 definitions](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_engine_regs.h.html#192)
+identify the decoded fields.
