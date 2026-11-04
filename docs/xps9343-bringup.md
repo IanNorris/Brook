@@ -1494,7 +1494,10 @@ It is connected to a boot-only BSP observer gated by the explicit
 full-page Reserved/MMIO boot-map coverage. The PCI resource extents were
 checked independently on the earlier Linux boot; matching raw BARs does not
 prove that every possible chipset decode is unchanged. The observer has not
-yet been run on the Dell. Even
+subsequently ran once on the Dell: topology and PCI inventory matched, but the
+boot-map coverage gate refused the read, so no VT-d registers were sampled.
+The Dell reached its desktop with persistent SSD and networking available.
+The exact reason for the boot-map refusal needs further telemetry. Even
 a valid TES observation would be only a point-in-time remapping status, not
 authorization to bind or release GPU-visible pages.
 

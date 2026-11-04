@@ -36,6 +36,8 @@ bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& s){++reads;if(scenario==7)retur
 static void run(int n){scenario=n;DellGpuVtdObserveConfigure();const auto& r=DellGpuVtdObserveRead();
     if(n==0 || n==9){assert(r.requested && r.topology && r.inventory && r.bootMap && r.sampled && reads==1 && r.status.version==0x10);}
     else {assert(!r.sampled && reads==(n==7?1u:0u));}
+    if(n==5)assert(r.bootMapClassified && r.bootMapUnreported && r.bootMapTypes==2);
+    if(n==8)assert(r.bootMapClassified && !r.bootMapUnreported && r.bootMapTypes==3);
     DellGpuVtdObserveConfigure();assert(reads==(n==0 || n==7 || n==9?1u:0u));
 }
 int main(){for(int n=0;n<=9;++n){pid_t p=fork();assert(p>=0);if(!p){run(n);_exit(0);}int status=0;assert(waitpid(p,&status,0)==p && WIFEXITED(status) && WEXITSTATUS(status)==0);}}

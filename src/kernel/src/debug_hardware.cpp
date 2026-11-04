@@ -306,6 +306,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"topology\":");r.text(s.topology?"true":"false");
         r.text(",\"inventory\":");r.text(s.inventory?"true":"false");
         r.text(",\"boot_map\":");r.text(s.bootMap?"true":"false");
+        r.text(",\"boot_map_classified\":");r.text(s.bootMapClassified?"true":"false");
+        if(s.bootMapClassified){r.text(",");r.field("boot_map_types",s.bootMapTypes);
+            r.text(",\"boot_map_unreported\":");r.text(s.bootMapUnreported?"true":"false");}
         r.text(",\"sampled\":");r.text(s.sampled?"true":"false");
         if(s.sampled){r.text(",");r.field("version",s.status.version);r.text(",");r.field("global_status",s.status.globalStatus);
             r.text(",\"translation_enabled\":");r.text((s.status.globalStatus&(1u<<31))?"true":"false");}

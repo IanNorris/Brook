@@ -41,7 +41,9 @@ void DellGpuVtdObserveConfigure() {
     observation.inventory=HdaDellToneInventoryMatches() && ExactIdentity();
     BootResourceClassification map{};
     constexpr uint32_t allowed=(1u<<uint32_t(MemoryType::Reserved))|(1u<<uint32_t(MemoryType::Mmio));
-    observation.bootMap=AcpiClassifyBootRange(DellGpuVtdPage,4096,map) && !map.unreported && map.types && !(map.types&~allowed);
+    observation.bootMapClassified=AcpiClassifyBootRange(DellGpuVtdPage,4096,map);
+    observation.bootMapTypes=map.types;observation.bootMapUnreported=map.unreported;
+    observation.bootMap=observation.bootMapClassified && !map.unreported && map.types && !(map.types&~allowed);
     if(observation.topology && observation.inventory && observation.bootMap) {
         SerialPuts("gpu-vtd: admitted; sampling version and status\n");
         observation.sampled=VmmDellGpuVtdCriticalRead(observation.status);
