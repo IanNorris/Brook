@@ -44,6 +44,11 @@ static unsigned owned(uint16_t pid) {
 }
 int main() {
     PageDescriptor descriptors[2048]{}; PmmHostTestInit(descriptors,2048);
+    const auto freeBefore=PmmGetFreePageCount();
+    CHECK(!PmmAllocPage(MemTag::User,PMM_MAX_PIDS));
+    CHECK(!PmmAllocPages(2,MemTag::User,PMM_MAX_PIDS));
+    PmmKillPid(PMM_MAX_PIDS);PmmFreeByTag(PMM_MAX_PIDS,MemTag::User);
+    CHECK(owned(PMM_MAX_PIDS)==0 && PmmGetFreePageCount()==freeBefore);
     auto page=PmmAllocPage(MemTag::User,7); CHECK(page); describe(page,1,0,1);
     constexpr unsigned aliases=70000;
     for(unsigned i=0;i<aliases;++i) {

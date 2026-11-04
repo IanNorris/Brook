@@ -208,6 +208,19 @@ static void competingInstallAndDetach() {
         VmmDestroyUserPageTable(pt);empty();
     }
 }
+static void rejectUnrepresentableOwner() {
+    auto pt=table();auto page=PmmAllocPage();CHECK(page);
+    CHECK(!VmmMapPage(pt,va,page,flags,MemTag::User,PTE_PID_CAPACITY));
+    CHECK(!VmmReadLeaf(pt,va) && maps(page)==0);
+    CHECK(VmmTryMapPage(pt,va,page,flags,MemTag::User,PTE_PID_CAPACITY)==VmmMapResult::InvalidAddress);
+    CHECK(!VmmReadLeaf(pt,va) && maps(page)==0);
+    CHECK(VmmTryMapPage(pt,va,page,flags,MemTag::User,PTE_PID_CAPACITY-1)==VmmMapResult::Mapped);
+    CHECK(VmmGetPagePid(pt,va)==PTE_PID_CAPACITY-1 && maps(page)==1);
+    cow(pt);const auto before=leaf(pt);
+    CHECK(VmmCowResolveWrite(pt,va,PTE_PID_CAPACITY).result==VmmCowResult::InvalidOwner);
+    CHECK(leaf(pt)==before && maps(page)==1);
+    VmmDestroyUserPageTable(pt);empty();
+}
 static void detachReinstall() {
     auto pt=table();auto old=PmmAllocPage();CHECK(VmmTryMapPage(pt,va,old,flags)==VmmMapResult::Mapped);
     auto token=VmmDetachPage(pt,va);CHECK(VmmLeafPhysical(token)==old);
@@ -2311,7 +2324,7 @@ static void kernelAliasInspection() {
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     kernelAliasInspection();robustExitQueue();low32Mappings();pageableTableSkeleton();
-    accessedLeafAging();competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
+    accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();

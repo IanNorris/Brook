@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "address.h"
 #include "mem_tag.h"
+#include "../task_capacity.h"
 
 namespace brook {
 //
@@ -43,6 +44,8 @@ static constexpr uint64_t PTE_HIDDEN_BIT = (1ULL << 8);
 inline bool VmmLeafBacked(uint64_t leaf) { return (leaf & (VMM_PRESENT | PTE_HIDDEN_BIT)) != 0; }
 static constexpr uint64_t PTE_PID_SHIFT  = 53;
 static constexpr uint64_t PTE_PID_MASK   = (0x3FFULL << PTE_PID_SHIFT); // 10 bits = max 1024 PIDs
+static constexpr uint64_t PTE_PID_CAPACITY = (PTE_PID_MASK >> PTE_PID_SHIFT) + 1;
+static_assert(TaskIdCapacity<=PTE_PID_CAPACITY, "Task IDs do not fit PTE ownership metadata");
 
 // Base of the VMALLOC virtual address region.
 static constexpr uint64_t VMALLOC_BASE  = 0xFFFFC00000000000ULL;
@@ -221,6 +224,7 @@ enum class VmmCowResult {
     NotCow,        // PTE absent or not a COW page — caller handles otherwise.
     Resolved,      // PTE made writable (copied if shared); caller must TLB-flush.
     OutOfMemory,   // shared page needed a copy but no page was free.
+    InvalidOwner,  // PID cannot be represented in the PTE owner field.
 };
 
 // Resolve a write fault on a COW page for `pid`'s address space. Performs the

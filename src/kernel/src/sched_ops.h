@@ -16,11 +16,12 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "task_capacity.h"
 
 namespace brook {
 
 // Maximum PIDs the policy must support (must match kernel MAX_PROCESSES).
-static constexpr uint32_t SCHED_MAX_PIDS = 1024;
+static constexpr uint32_t SCHED_MAX_PIDS = TaskIdCapacity;
 
 // Shared kernel/module storage contract. Policy fixtures must fit the same
 // storage used by the kernel, rather than allocating unbounded host memory.

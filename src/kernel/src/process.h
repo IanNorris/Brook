@@ -9,6 +9,7 @@
 #include "credential_ids.h"
 #include "user_namespace.h"
 #include "signal_return.h"
+#include "task_capacity.h"
 
 namespace brook {
 
@@ -29,7 +30,7 @@ void FdReleaseOwnedEntry(const FdEntry& entry);
 // host-side unit testing — see BRO-156).
 
 // Maximum concurrent processes.
-static constexpr uint32_t MAX_PROCESSES = 1024;
+static constexpr uint32_t MAX_PROCESSES = TaskIdCapacity;
 
 // Program break limit (max brk heap size per process). Browser/WebContent
 // workloads can exceed 64 MB through many small allocator requests before

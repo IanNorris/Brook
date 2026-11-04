@@ -357,6 +357,8 @@ void VmmInitFramebufferMemory(const BootProtocol* boot)
 bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
                 uint64_t flags, MemTag tag, uint16_t pid)
 {
+    // Never silently alias a mapping owner if a caller exceeds the PTE format.
+    if (pid >= PTE_PID_CAPACITY) return false;
     if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
     {
         SerialPrintf("VMM: rejected mapping at 0x%p (below null guard)\n",
@@ -406,6 +408,7 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
                            PhysicalAddress physAddr, uint64_t flags,
                            MemTag tag, uint16_t pid, bool accessible)
 {
+    if (pid >= PTE_PID_CAPACITY) return VmmMapResult::InvalidAddress;
     if ((flags & (PTE_COW_BIT | VMM_WRITABLE)) == (PTE_COW_BIT | VMM_WRITABLE))
         return VmmMapResult::InvalidAddress;
     if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
@@ -1174,6 +1177,7 @@ extern "C" int PmmDumpFreeLog(uint64_t phys);
 
 VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
 {
+    if (pid >= PTE_PID_CAPACITY) return {VmmCowResult::InvalidOwner,{}};
     PhysicalAddress retired;
     VirtualAddress pageAddr(faultAddr.raw() & ~(PAGE_SIZE - 1));
 

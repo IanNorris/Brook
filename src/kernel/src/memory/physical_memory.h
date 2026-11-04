@@ -4,6 +4,7 @@
 #include "address.h"
 #include "boot_protocol/boot_protocol.h"
 #include "mem_tag.h"
+#include "../task_capacity.h"
 
 namespace brook {
 
@@ -21,7 +22,7 @@ namespace brook {
 static constexpr uint32_t PMM_NULL_PAGE = 0xFFFFFFFFu;
 
 // Maximum number of PIDs tracked simultaneously.
-static constexpr uint32_t PMM_MAX_PIDS  = 1024;
+static constexpr uint32_t PMM_MAX_PIDS  = TaskIdCapacity;
 
 // Per-page ownership record. 20 bytes, doubly-linked within its PID's list.
 struct PageDescriptor

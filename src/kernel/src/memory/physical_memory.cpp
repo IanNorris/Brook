@@ -709,6 +709,7 @@ static void ReportAllocationFailure(uint64_t count,uint64_t free,bool contiguous
 
 PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
+    if (pid >= PMM_MAX_PIDS) return PhysicalAddress{};
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
     // Preserve a small physical floor for kernel cleanup/control resources.
@@ -759,6 +760,7 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 
 PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
 {
+    if (pid >= PMM_MAX_PIDS) return PhysicalAddress{};
     if (count == 0) return PhysicalAddress{};
     if (count == 1) return PmmAllocPage(tag, pid);
 
@@ -1387,7 +1389,7 @@ extern "C" bool PmmDecodePoisonNoLock(uint64_t qword)
 
 void PmmKillPid(uint16_t pid)
 {
-    if (!g_pageDescs) return;
+    if (!g_pageDescs || pid >= PMM_MAX_PIDS) return;
     if (pid == KernelPid) return;  // never kill kernel pages
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
@@ -1441,7 +1443,7 @@ void PmmKillPid(uint16_t pid)
 
 void PmmFreeByTag(uint16_t pid, MemTag tag)
 {
-    if (!g_pageDescs) return;
+    if (!g_pageDescs || pid >= PMM_MAX_PIDS) return;
     if (pid == KernelPid) return;
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
@@ -1488,7 +1490,7 @@ void PmmEnumeratePid(uint16_t pid,
                      bool (*callback)(PhysicalAddress physAddr, MemTag tag, void* ctx),
                      void* ctx)
 {
-    if (!g_pageDescs) return;
+    if (!g_pageDescs || pid >= PMM_MAX_PIDS || !callback) return;
 
     uint32_t idx = g_pidLists[pid].head;
     while (idx != PMM_NULL_PAGE)
