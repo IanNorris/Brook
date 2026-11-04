@@ -163,3 +163,24 @@ Known gaps and remaining gates:
   from untrusted X properties to bypass this limitation.
 - Steam authenticated evidence, profiles and downloaded software remain private.
   The previous SDL3 host crash review disks are preserved independently.
+
+## Xwayland interval-timer lead
+
+The serial log of the earlier rootless Steam run reports over 50,000
+`ENOSYS` entries for syscall 38 from Xwayland. X server smart scheduling uses
+`setitimer(ITIMER_REAL)`; this is a concrete missing interface, but the log
+alone does not establish that it caused a freeze or quantify performance.
+`scripts/workloads/itimer_real_check.c` provides an externally time-bounded
+Linux oracle for shared-thread cancellation, fork, exec, alarm interoperability
+and blocked periodic delivery. It passed ten runs on the Linux host, and its
+statically linked musl build also passed there. The same static executable in a
+disposable two-CPU QEMU/TCG guest failed its first `setitimer` call with
+`ENOSYS`; Brook does not yet implement the interface. A correct implementation
+must share the process-wide alarm, preserve it across exec (including nonleader
+exec), avoid inheriting it on fork, and handle pending signals and periodic
+rearming. Ordinary POSIX timers have different semantics and cannot simply be
+substituted. VIRTUAL and PROF need separate CPU accounting.
+
+Upstream's [smart-scheduling timer](https://raw.githubusercontent.com/XQuartz/xorg-server/master/os/utils.c)
+explains the repeated REAL timer calls. Whether a `-dumbSched` diagnostic A/B
+improves this particular workload remains untested.
