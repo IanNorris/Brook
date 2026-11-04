@@ -57,13 +57,13 @@ public:
         lease_={};lease_.token=token;lease_.count=8;
         for(unsigned i=0;i<8;++i){lease_.index[i]=firstIndex+i;lease_.dma[i]=pages_[i].dma;lease_.expected[i]=0;}
         const uint64_t ggtt=uint64_t(firstIndex)*4096;
-        BdwBcsSubmission s{{ggtt,ggtt+8192,pages_[Pml4].dma,16384,40,1},
+        BdwBcsSubmission s{{ggtt,ggtt+8192,pages_[Pml4].dma,16384,56,1},
             {{0x11000,4096,64},{0x12000,4096,64},16,4},0x10000,ggtt+7*4096,nonce};
-        uint32_t batch[12]{},ring[10]{};
+        uint32_t batch[12]{},ring[14]{};
         if(!BdwBuildBcsSubmission(s,staging,batch,ring,descriptor_)){ReleasePages(io);state_=BdwOneShotState::Released;return false;}
         for(unsigned i=0;i<1024;++i){Store32(pages_[Ctx0],i*4,staging[i]);Store32(pages_[Ctx1],i*4,staging[1024+i]);}
         for(unsigned i=0;i<12;++i)Store32(pages_[Batch],i*4,batch[i]);
-        for(unsigned i=0;i<10;++i)Store32(pages_[Ring0],i*4,ring[i]);
+        for(unsigned i=0;i<14;++i)Store32(pages_[Ring0],i*4,ring[i]);
         nonce_=nonce;state_=BdwOneShotState::Prepared;return true;
     }
     template<class Io> bool ReleasePrepared(Io& io) {

@@ -12,9 +12,9 @@ struct BdwBcsSubmission {
     uint32_t nonce=0;
 };
 inline bool BdwBuildBcsSubmission(const BdwBcsSubmission& s,uint32_t (&context)[2048],
-                                  uint32_t (&batch)[12],uint32_t (&ring)[10],uint64_t& descriptor) {
+                                  uint32_t (&batch)[12],uint32_t (&ring)[14],uint64_t& descriptor) {
     constexpr uint64_t limit=uint64_t{1}<<32;
-    if(s.context.tailBytes!=40 || !s.nonce || (s.batchPpgtt&7) || s.batchPpgtt>limit-48 ||
+    if(s.context.tailBytes!=56 || !s.nonce || (s.batchPpgtt&7) || s.batchPpgtt>limit-48 ||
        (s.completionGgtt&0x27) || s.completionGgtt>limit-8 || !s.completionGgtt)return false;
     uint32_t blit[10]{};if(!BdwEncodeLinearCopy(s.copy,blit))return false;
     const auto bounded=[&](uint64_t address,uint64_t size){return size && address<limit && size<=limit-address;};
@@ -32,9 +32,12 @@ inline bool BdwBuildBcsSubmission(const BdwBcsSubmission& s,uint32_t (&context)[
     batch[10]=0x05000000;batch[11]=0;
     // The GGTT completion store must be in the privileged ring, not in the
     // nonprivileged batch; bit 5 of its address is prohibited on Gen8.
-    const uint32_t commands[10]={0x04000000,0x18800101,uint32_t(s.batchPpgtt),uint32_t(s.batchPpgtt>>32),
+    // Gen8 XCS invalidates translation before fetching a batch in the new
+    // PPGTT. STORE_INDEX addresses scratch in this context's HWSP, not GGTT.
+    const uint32_t commands[14]={0x13244002,0xd0,0,0,0x04000000,
+        0x18800101,uint32_t(s.batchPpgtt),uint32_t(s.batchPpgtt>>32),
         0x13004002,uint32_t(s.completionGgtt)|4,0,s.nonce,0,0x04000001};
-    for(unsigned i=0;i<10;++i)ring[i]=commands[i];
+    for(unsigned i=0;i<14;++i)ring[i]=commands[i];
     descriptor=builtDescriptor;return true;
 }
 }

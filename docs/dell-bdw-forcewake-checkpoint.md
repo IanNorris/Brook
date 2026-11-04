@@ -129,6 +129,14 @@ matching the [i915 reset convention](https://raw.githubusercontent.com/torvalds/
 A host test checks every page byte. This is a RAM image only: the hardware
 status pointer, ownership, cache publication and retirement are not handled.
 
+The private BCS ring image now emits a Gen8 TLB invalidate using the context
+HWSP scratch slot before disabling arbitration and starting its PPGTT batch.
+Its tail covers 56 bytes, including the distinct post-copy GGTT completion
+write. This follows the [i915 XCS flush sequence](https://raw.githubusercontent.com/torvalds/linux/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c)
+and [request setup](https://raw.githubusercontent.com/torvalds/linux/v6.8/drivers/gpu/drm/i915/gt/intel_execlists_submission.c).
+Host tests verify the words, ordering and resulting simulated copy; they do not
+emulate GPU cache invalidation or establish physical execution.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).

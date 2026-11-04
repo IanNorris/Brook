@@ -41,8 +41,10 @@ struct Fake {
     bool waitCompletion(uint32_t nonce){if(!complete)return false;
         assert(portWrites==4 && elsp[0]==0 && elsp[1]==0 && elsp[2]==1 && elsp[3]==0x1000013d);
         auto* context=ggtt((elsp[3]&~4095u)+4096);uint64_t pml4=(uint64_t(read32(context,49))<<32)|read32(context,51);
-        auto* ring=ggtt(read32(context,9));assert(read32(context,7)==40 && read32(ring,1)==0x18800101 && read32(ring,4)==0x13004002);
-        auto* batch=translate(pml4,uint64_t(read32(ring,2))|(uint64_t(read32(ring,3))<<32),false);
+        auto* ring=ggtt(read32(context,9));assert(read32(context,7)==56 && read32(ring,0)==0x13244002 &&
+            read32(ring,1)==0xd0 && read32(ring,2)==0 && read32(ring,3)==0 && read32(ring,4)==0x04000000 &&
+            read32(ring,5)==0x18800101 && read32(ring,8)==0x13004002);
+        auto* batch=translate(pml4,uint64_t(read32(ring,6))|(uint64_t(read32(ring,7))<<32),false);
         assert(read32(batch,0)==0x54f00008 && read32(batch,10)==0x05000000);
         if(corruptSource){uint32_t changed=read32(batch,8)+256;std::memcpy(batch+32,&changed,4);}
         uint64_t src=uint64_t(read32(batch,8))|(uint64_t(read32(batch,9))<<32);
@@ -50,7 +52,7 @@ struct Fake {
         unsigned width=(read32(batch,3)&0xffff)*4,height=read32(batch,3)>>16;
         for(unsigned row=0;row<height;++row)
             std::memcpy(translate(pml4,dst+row*(read32(batch,1)&0xffff),true),translate(pml4,src+row*read32(batch,7),false),width);
-        auto* done=ggtt(read32(ring,5)&~7u);uint32_t written=read32(ring,7);assert(written==nonce);std::memcpy(done,&written,4);return true;}
+        auto* done=ggtt(read32(ring,9)&~7u);uint32_t written=read32(ring,11);assert(written==nonce);std::memcpy(done,&written,4);return true;}
     bool cpuVisible(BdwOwnedPage*,unsigned n){return n==19;}
 };
 int main(){
