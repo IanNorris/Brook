@@ -669,6 +669,8 @@ add_host_test(test_intel_dmar_gpu)
 target_compile_options(test_intel_dmar_gpu PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_vtd_probe)
 target_compile_options(test_intel_vtd_probe PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_vtd_observe "${BROOK_ROOT}/src/kernel/src/intel_vtd_observe.cpp")
+target_compile_options(test_intel_vtd_observe PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_compile_options(test_debug_hardware PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"

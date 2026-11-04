@@ -1485,13 +1485,16 @@ The helper must operate on one private immutable copy; a future caller must
 also verify a unique DMAR and the Dell PCI identity. It is not connected to
 hardware access and does not establish whether translation is enabled.
 
-The unconnected VT-d status reader now checks the active kernel root, both
+The VT-d status reader checks the active kernel root, both
 existing aliases and the current CPU's effective cache configuration under the
 page-table lock before issuing 32-bit reads of VER and GSTS. It refuses an
 implausible version or all-ones status and leaves output unchanged on failure.
-It has not been called on the Dell. Its eventual caller must additionally
-verify exact PCI and unique audited DMAR identity, exclude conflicting resources
-over the entire page, and restrict the probe to one opted-in BSP attempt. Even
+It is connected to a boot-only BSP observer gated by the explicit
+`/etc/dell-gpu-vtd-probe` marker, unique audited DMAR, exact PCI inventory and
+full-page Reserved/MMIO boot-map coverage. The PCI resource extents were
+checked independently on the earlier Linux boot; matching raw BARs does not
+prove that every possible chipset decode is unchanged. The observer has not
+yet been run on the Dell. Even
 a valid TES observation would be only a point-in-time remapping status, not
 authorization to bind or release GPU-visible pages.
 

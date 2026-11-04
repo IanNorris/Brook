@@ -19,6 +19,7 @@
 #include "acpi.h"
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
+#include "intel_vtd_observe.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
@@ -297,6 +298,17 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             }
             r.text("}");
         }
+        r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-vtd")) {
+        const auto& s=DellGpuVtdObserveRead();Reply r;
+        r.text("{\"gpu_vtd_api\":1,\"requested\":");r.text(s.requested?"true":"false");
+        r.text(",\"topology\":");r.text(s.topology?"true":"false");
+        r.text(",\"inventory\":");r.text(s.inventory?"true":"false");
+        r.text(",\"boot_map\":");r.text(s.bootMap?"true":"false");
+        r.text(",\"sampled\":");r.text(s.sampled?"true":"false");
+        if(s.sampled){r.text(",");r.field("version",s.status.version);r.text(",");r.field("global_status",s.status.globalStatus);
+            r.text(",\"translation_enabled\":");r.text((s.status.globalStatus&(1u<<31))?"true":"false");}
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware acpi-info")) {

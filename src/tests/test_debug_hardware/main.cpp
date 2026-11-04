@@ -11,6 +11,7 @@
 #include "acpi.h"
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
+#include "intel_vtd_observe.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
@@ -24,6 +25,8 @@ unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 bool audioProbePresent=false,hdaPciPresent=false;
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
+DellGpuVtdObservation gpuVtd{};
+const DellGpuVtdObservation& DellGpuVtdObserveRead(){return gpuVtd;}
 HdaObservation hdaObservation{};
 const HdaObservation& HdaObserveRead(){return hdaObservation;}
 NativeTscObservation tscObservation{};
@@ -104,6 +107,9 @@ int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t str
 bool handle(const std::string& command){reply.clear();dispatched.clear();return brook::DebugHardwareHandleCommand(command.c_str(),command.size());}
 int main(){
     assert(!handle("bridge unrelated"));
+    assert(handle("bridge hardware gpu-vtd") && reply.find("\"sampled\":false")!=std::string::npos && reply.find("global_status")==std::string::npos);
+    brook::gpuVtd.sampled=true;brook::gpuVtd.status={0x10,0x80000000};
+    assert(handle("bridge hardware gpu-vtd") && reply.find("\"translation_enabled\":true")!=std::string::npos);
     assert(handle("bridge hardware caps") && reply.find("\"hardware_api\":1")!=std::string::npos);
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
     assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);

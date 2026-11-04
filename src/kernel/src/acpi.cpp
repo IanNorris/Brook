@@ -184,6 +184,19 @@ bool AcpiNvsRead(uint64_t address,void* out,uint32_t bytes) {
     for(uint32_t i=0;i<bytes;++i)target[i]=source[i];return true;
 }
 uint32_t AcpiInventoryCount(){return g_tables.Initialized()?g_tables.RootEntryCount()+1:0;}
+bool AcpiUniqueDmarCopy(void* out,uint32_t capacity,uint32_t& bytes) {
+    bytes=0;if(!out || !capacity || !g_tables.Initialized())return false;
+    uint64_t found=0;AcpiSdtHeader selected{};
+    for(uint32_t i=0;i<g_tables.RootEntryCount();++i) {
+        AcpiSdtHeader h{};const uint64_t address=g_tables.RootEntry(i,&h);
+        if(!address)return false;
+        if(h.signature[0]=='D' && h.signature[1]=='M' && h.signature[2]=='A' && h.signature[3]=='R') {
+            if(found)return false;found=address;selected=h;
+        }
+    }
+    if(!found || selected.length>capacity || !g_tables.CopyTable(found,0,out,selected.length))return false;
+    bytes=selected.length;return true;
+}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& header) {
     if(index>=AcpiInventoryCount() || bytes>512 || (bytes && !out))return false;
     const uint64_t address=index?g_tables.RootEntry(index-1,&header):g_tables.Dsdt(&header);

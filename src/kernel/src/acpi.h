@@ -57,5 +57,8 @@ bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassific
 // validated SSDT or DMAR entries. No caller-supplied physical addresses.
 uint32_t AcpiInventoryCount();
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& header);
+// Copy exactly one checksum-validated DMAR into caller-owned memory. Rejects
+// duplicate or unreadable root entries and never follows addresses in DMAR.
+bool AcpiUniqueDmarCopy(void* out,uint32_t capacity,uint32_t& bytes);
 
 } // namespace brook

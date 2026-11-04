@@ -295,6 +295,7 @@ add_executable(kernel
     src/ssd_install_qemu.cpp
     src/dell_audio_probe.cpp
     src/dell_i2c_probe.cpp
+    src/intel_vtd_observe.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

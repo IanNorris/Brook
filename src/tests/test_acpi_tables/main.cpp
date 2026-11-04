@@ -62,7 +62,13 @@ int main(){
         std::memcpy(f.fadt,"MSDM",4);f.fadtCrc();assert(!AcpiInventoryRead(1,0,copy,4,table));
         std::memcpy(f.fadt,"SSDT",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"SSDT",4));
         std::memcpy(f.fadt,"DMAR",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"DMAR",4));
+        uint8_t dmar[300]{};uint32_t dmarBytes=0;
+        assert(AcpiUniqueDmarCopy(dmar,sizeof(dmar),dmarBytes) && dmarBytes==276 && !std::memcmp(dmar,"DMAR",4));
+        assert(!AcpiUniqueDmarCopy(dmar,100,dmarBytes) && dmarBytes==0);
+        std::memcpy(f.madt,"DMAR",4);f.madtCrc();assert(!AcpiUniqueDmarCopy(dmar,sizeof(dmar),dmarBytes) && !dmarBytes);
+        std::memcpy(f.madt,"APIC",4);f.madtCrc();
         f.fadt[9]++;assert(!AcpiInventoryRead(1,0,copy,4,table)); // checksum still required
+        assert(!AcpiUniqueDmarCopy(dmar,sizeof(dmar),dmarBytes) && !dmarBytes);
         std::memcpy(f.fadt,"FACP",4);f.fadtCrc();
         assert(!AcpiInventoryRead(3,0,copy,1,table) && !AcpiInventoryRead(0,60,copy,8,table));
         assert(!AcpiInventoryRead(0,0,copy,513,table) && !AcpiInventoryRead(0,0,nullptr,1,table));

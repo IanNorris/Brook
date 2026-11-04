@@ -25,6 +25,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "device.h"
 #include "pci.h"
 #include "display_power.h"
+#include "intel_vtd_observe.h"
 #include "ahci_observe.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
@@ -737,6 +738,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // If found, the drive is mounted at that path automatically.
     // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
+    brook::DellGpuVtdObserveConfigure();
     // One-shot HDA observation executes on the BSP before AP scheduler entry
     // and before audio modules can claim the controller.
     brook::NativeTscObserveConfigure();
