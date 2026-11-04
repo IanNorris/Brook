@@ -1540,6 +1540,15 @@ invalidation must drain earlier posted writes as well as invalidate translations
 There is no production backend or firmware-to-driver GGTT ownership handoff
 yet; this code has not written a PTE on the Dell.
 
+The next GT-control building block is a host-tested forcewake/BCS observation
+sequence: it requests only bit 0, bounds ACK and thread-ready polling, samples
+the blitter twice, and clears its request even after a possibly delivered failed
+write. An uncertain release must quarantine GT use. It is not connected to a
+hardware backend: Brook must first establish continuous exclusive ownership of
+the request bit, provide UC register access and ensure its clear drains earlier
+posted writes. ACK clear alone does not prove ownership; an idle sample alone
+does not establish an engine handoff or permit GGTT mutation.
+
 The exact candidate refused the Dell-only probe in private QEMU, then booted
 on the Dell after a clean restart with the previous slot retained. The probe
 passed its D0, boot-map and cache gates and read raw endpoint entries
