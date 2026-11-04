@@ -87,3 +87,27 @@ handoff is claimed. Astra reviewed the register whitelist and failure path.
 The [Linux Broadwell forcewake selection](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/intel_uncore.c.html#2228)
 and [engine register definitions](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_engine_regs.h.html)
 provide the implementation references.
+
+## Context and first-copy preparation
+
+Brook can now construct a fresh Broadwell BCS 64-bit logical-context image,
+a first-level PPGTT copy batch and a privileged-ring GGTT completion write.
+The command words and descriptor were checked against Linux i915's Gen8
+context layout and emission routines. The completion address checks the Gen8
+alignment and bit-5 restriction; the descriptor is published only after all
+other output is built, including when the caller aliases it with an input.
+
+The GGTT binding transaction now accepts up to 16 pages, enough for a context,
+multi-page ring, status page and initial buffers. Host tests cover all 16
+write-failure positions with delayed writes, restoration, duplicate mappings,
+context image fields, complete batch/ring words, bad ranges and output aliasing.
+A composed test derives the context and ring addresses from one reserved GGTT
+lease and uses a separate PML4 DMA address. Astra reviewed the encodings and
+failure tests. These helpers remain unconnected to a physical submission path:
+GPU/firmware ownership, display accounting, engine HWS/CSB handoff, page-table
+publication, physical backing isolation and safe retirement are still required.
+A completion write alone does not permit freeing the context or ring.
+
+References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
+[batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
+and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).

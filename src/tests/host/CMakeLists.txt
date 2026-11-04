@@ -878,3 +878,7 @@ set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)
 
 add_host_test(test_intel_bdw_forcewake_adapter)
 target_compile_options(test_intel_bdw_forcewake_adapter PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_context)
+target_compile_options(test_intel_bdw_context PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_submission)
+target_compile_options(test_intel_bdw_submission PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
