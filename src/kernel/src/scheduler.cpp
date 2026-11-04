@@ -1475,13 +1475,17 @@ Process* SchedulerCurrentProcess()
 
 // Check blocked processes for timed wakeups (called with NO locks held).
 static WakeScanHandoff g_wakeScanHandoff;
+// Only TryBlockedWakeScan calls CheckBlockedWakeups, and its handoff token is
+// held across the complete snapshot, wake and reference-release sequence.
+// Keeping the candidate array here avoids a task-capacity-sized allocation on
+// the timer interrupt stack; the handoff also excludes AP/BSP overlap.
+static Process* g_wakeScanCandidates[MAX_PROCESSES];
 bool SchedulerWakeScanControl(int mode,bool reset){return g_wakeScanHandoff.Control(mode,reset);}
 WakeScanSnapshot SchedulerWakeScanRead(){return g_wakeScanHandoff.Snapshot();}
 
 static uint32_t CheckBlockedWakeups()
 {
     uint64_t now = ApicTickCount();
-    Process* toUnblock[MAX_PROCESSES];
     uint32_t unblockCount = 0;
 
     uint64_t alf3 = SchedLockAcquire(g_allProcLock);
@@ -1501,15 +1505,17 @@ static uint32_t CheckBlockedWakeups()
         {
             if (unblockCount < MAX_PROCESSES) {
                 ProcessRef(p);
-                toUnblock[unblockCount++] = p;
+                g_wakeScanCandidates[unblockCount++] = p;
             }
         }
     }
     SchedLockRelease(g_allProcLock, alf3);
 
     for (uint32_t i = 0; i < unblockCount; ++i) {
-        SchedulerUnblock(toUnblock[i]);
-        ReleaseSchedulerReference(toUnblock[i], false);
+        auto* process=g_wakeScanCandidates[i];
+        g_wakeScanCandidates[i]=nullptr;
+        SchedulerUnblock(process);
+        ReleaseSchedulerReference(process, false);
     }
     return unblockCount;
 }
