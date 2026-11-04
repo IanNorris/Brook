@@ -61,6 +61,8 @@ int main(){
         assert(!AcpiInventoryRead(1,0,copy,0,table)); // FADT is not an AML table
         std::memcpy(f.fadt,"MSDM",4);f.fadtCrc();assert(!AcpiInventoryRead(1,0,copy,4,table));
         std::memcpy(f.fadt,"SSDT",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"SSDT",4));
+        std::memcpy(f.fadt,"DMAR",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"DMAR",4));
+        f.fadt[9]++;assert(!AcpiInventoryRead(1,0,copy,4,table)); // checksum still required
         std::memcpy(f.fadt,"FACP",4);f.fadtCrc();
         assert(!AcpiInventoryRead(3,0,copy,1,table) && !AcpiInventoryRead(0,60,copy,8,table));
         assert(!AcpiInventoryRead(0,0,copy,513,table) && !AcpiInventoryRead(0,0,nullptr,1,table));

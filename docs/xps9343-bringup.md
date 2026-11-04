@@ -1459,6 +1459,15 @@ firmware scanout, pinned and non-aliasing backing pages, and a post-copy
 completion fence. A timeout must retain GPU-visible memory until the engine
 is known to be quiescent. No accelerated rendering is claimed by this test.
 
+The ACPI diagnostic inventory also admits the checksum-validated DMAR table
+through its existing bounded indexed reader. DMAR can describe remapping-unit
+register bases, PCI scopes and reserved regions; it is hardware topology data
+available to the private diagnostic bridge. Other non-AML tables, including
+MSDM, remain excluded. Presence or absence of this table alone does not prove
+whether translation is active, nor that a physical page is a usable GPU DMA
+address. The table must be decoded and live remapping state checked before GPU
+page-table entries can refer to Brook-owned memory.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
