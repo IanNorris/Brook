@@ -17,7 +17,7 @@ struct Fake {
         if(a==BdwDellBar0+0x130044){if(failSetPost && writes==1){failSetPost=false;return false;}v=awake?1:0;return true;}
         if(a==BdwDellBar0+0x13805c){v=c0?0:1;return true;}
         if(a==BdwDellBar0+0x2209c){v=1u<<9;return true;}
-        assert(a==BdwDellBar0+0x22034 || a==BdwDellBar0+0x22030);v=0;return true;}
+        assert(a==BdwDellBar0+0x22034 || a==BdwDellBar0+0x22030 || a==BdwDellBar0+0x22038 || a==BdwDellBar0+0x2203c || a==BdwDellBar0+0x22234 || a==BdwDellBar0+0x22238);v=0;return true;}
 };
 int main(){
     {Fake f;auto r=BdwDellForcewakeCritical(f,1000);assert(r.aliases && r.clock && r.sequence.acquired && r.sequence.sampled && r.sequence.idle && r.clearDelivered && r.sequence.released);assert(f.values==std::vector<uint32_t>({0x10001,0x10000}));}

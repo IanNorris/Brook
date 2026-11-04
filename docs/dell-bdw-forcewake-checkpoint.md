@@ -30,3 +30,21 @@ The kernel built, six targeted host tests passed, including admission, denied
 fourth page, clock failure, D3, posting failure, cleanup, and mapping
 permissions. A private QEMU/OVMF fixture reached the desktop with the same
 kernel/initrd pair and did not enter the Dell-specific access path.
+
+## Ring and execution-list observation
+
+A subsequent clean boot of `dell-bcs-context-20261104` (guest boot
+`828215fae71c471fb411c875bad2e17f`) repeated the guarded forcewake operation
+and also sampled BCS ring start, ring control, and the low and high
+execution-list status DWORDs. Both samples matched: ring start `0`, control
+`0`, head and tail `0`, mode `0x200`, status low `0x1`, status high `0`.
+The wake request was released and the SSD desktop returned online.
+
+These are individual register reads, not an atomic 64-bit snapshot. A stable
+ring-idle sample does not establish an empty execution queue; status bits need
+separate interpretation. In particular, no inference about ownership of the
+engine, display allocations, other engines or GGTT slots follows from this
+observation. The register addresses follow the [Linux i915 engine register
+definitions](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_engine_regs.h.html#178).
+The matched image reached the desktop in a disposable QEMU/OVMF boot before
+the Dell run; the four affected host tests passed.
