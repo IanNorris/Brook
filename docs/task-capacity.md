@@ -53,8 +53,13 @@ reuse. COW's fixture frames use a valid kernel PMM owner; extended task IDs are
 not yet valid PMM owners. The fixture rejects overwrite and clone and is
 never attached to a process. Production kernels cannot create this root; those unsupported paths and their
 rollback semantics must be implemented before enabling extended owners.
-Move and protection validation in the fixture does not model hardware setting
-accessed or dirty bits concurrently; those paths need further work before live use.
+Protection changes now retry their atomic PTE update if hardware sets accessed or
+dirty bits concurrently; hosted tests inject both updates for inline and escaped
+owners. This does not by itself settle stale-TLB accounting around mapping moves.
+Moves now atomically take the source
+entry and preserve the access/dirty bits observed at that exchange; the existing
+transaction waits for remote TLB acknowledgment. A hosted test injects updates
+at the handoff, but it cannot verify concurrent accesses on real CPUs.
 The pageable-memory experiment retains the detached owner across eviction,
 failed-write rollback and fault-in; fork assigns the child owner to its stored
 or recovery entry. The hosted VMM fixture exercises those paths with a mapping

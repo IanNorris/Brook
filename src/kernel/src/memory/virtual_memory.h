@@ -94,6 +94,7 @@ bool VmmHostUsesKernelPtLock(PageTable root,VirtualAddress address);
 PageTable VmmHostCreateOwnerExperiment();
 bool VmmHostOwnerExperimentActive(PageTable root);
 bool VmmHostOwnerSlotPresent(PageTable root,VirtualAddress address);
+void VmmHostInjectMoveAccessBits(uint64_t bits);
 #endif
 #endif
 

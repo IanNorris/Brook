@@ -737,7 +737,7 @@ using LeafUpdate = uint64_t (*)(VirtualAddress,VmmOwnedLeaf,void*);
 static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                            uint64_t begin, uint64_t end, bool detach,
                            VmmRetireLeaf retire, void* context, uint64_t& count,
-                           LeafUpdate update = nullptr,bool extended=false,bool atomicUpdate=false)
+                           LeafUpdate update = nullptr,bool extended=false,bool atomicUpdate=false,bool updateOwnsStore=false)
 {
     const unsigned shift = 12 + 9 * (level - 1);
     const uint64_t size = uint64_t{1} << shift;
@@ -753,7 +753,7 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
             auto* child = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw());
             const uint64_t low = begin > address ? begin : address;
             const uint64_t high = end < address+size ? end : address+size;
-            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update,extended,atomicUpdate)) return false;
+            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update,extended,atomicUpdate,updateOwnsStore)) return false;
         } else {
             ++count;
             const auto captured=CaptureOwnedLeaf(&table[i],leaf,extended);
@@ -778,7 +778,7 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                     }
                 } else {
                     const uint64_t updated=update(VirtualAddress(address),captured,context);
-                    if (updated!=leaf) { table[i]=updated;Invlpg(VirtualAddress(address)); }
+                    if (updated!=leaf && !updateOwnsStore) { table[i]=updated;Invlpg(VirtualAddress(address)); }
                 }
             }
         }
@@ -810,8 +810,12 @@ bool VmmPrepareOwnerSidecar(PageTable pt,VirtualAddress address) {
     IrqSpinLockRelease(&g_userPtLock,irq);return ok;
 }
 struct MoveLeaves { PageTable table;uint64_t source,destination;bool prepare,occupied,move,failed,extended; };
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+static thread_local uint64_t g_hostMoveAccessBits;
+void VmmHostInjectMoveAccessBits(uint64_t bits) {g_hostMoveAccessBits=bits&(VMM_ACCESSED|VMM_DIRTY);}
+#endif
 static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque) {
-    const auto leaf=owned.raw;
+    auto leaf=owned.raw;
     auto& context=*static_cast<MoveLeaves*>(opaque);
     if (context.failed) return leaf;
     // Extended-owner transfers need destination metadata preflight. Until
@@ -827,12 +831,22 @@ static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque)
         } else if(!g_userOwnerSidecars.Find(OwnerTable(target))) {context.failed=true;return leaf;}
     }
     if (!context.move) return leaf;
+    auto* source=WalkToPtr(context.table,address,false);
+    if(!source)__builtin_trap();
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+    if(g_hostMoveAccessBits) {
+        __atomic_fetch_or(source,g_hostMoveAccessBits,__ATOMIC_RELAXED);g_hostMoveAccessBits=0;
+    }
+#endif
+    // Take the actual PTE once, including A/D updates made since the walk.
+    // Remote stale translations remain subject to the transaction shootdown.
+    const auto taken=__atomic_exchange_n(source,uint64_t{0},__ATOMIC_ACQ_REL);
+    if(((taken^leaf)&~(VMM_ACCESSED|VMM_DIRTY))!=0)__builtin_trap();
+    leaf=taken;owned.raw=taken;
     if(context.extended) {
         if(owned.owner>=PteOwnerSidecars::Escape) {
             if(!g_userOwnerSidecars.Set(OwnerTable(target),OwnerSlot(target),owned.owner))__builtin_trap();
         } else g_userOwnerSidecars.Clear(OwnerTable(target),OwnerSlot(target));
-        auto* source=WalkToPtr(context.table,address,false);
-        if(!source || *source!=leaf)__builtin_trap();
         ClearExtendedOwner(source,owned,true);
     }
     const auto inlineOwner=context.extended && owned.owner>=PteOwnerSidecars::Escape?PteOwnerSidecars::Escape:owned.owner;
@@ -842,7 +856,7 @@ static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque)
         const uint64_t indices[]={Pml4Index(destination.raw()),PdptIndex(destination.raw()),PdIndex(destination.raw())};
         for (uint64_t index:indices) { table[index]|=VMM_USER;table=reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(table[index])).raw()); }
     }
-    Invlpg(destination);return 0; // transfer the PTE-owned reference, no ref/map-count change
+    Invlpg(address);Invlpg(destination);return 0; // transfer the PTE-owned reference, no ref/map-count change
 }
 static bool MoveLeafRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination,
                            bool prepare,bool occupied,bool move) {
@@ -864,7 +878,7 @@ static bool MoveLeafRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t dest
     }
     if (result && move) {
         context.move=true;count=0;
-        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&context,count,MoveLeaf,extended) || context.failed) __builtin_trap();
+        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&context,count,MoveLeaf,extended,false,true) || context.failed) __builtin_trap();
     }
     IrqSpinLockRelease(&g_userPtLock,irq);return result;
 }

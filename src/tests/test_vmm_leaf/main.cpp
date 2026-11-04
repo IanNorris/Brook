@@ -2567,7 +2567,10 @@ static void extendedOwnerMoveExperiment() {
     CHECK(!VmmMoveRange(pt,source,source+span,target));
     CHECK(VmmReadOwnedLeaf(pt,VirtualAddress(source+0x200000)).owner==5119);
     CHECK(VmmDetachOwnedPage(pt,VirtualAddress(target+3*pageSize)).owner==5119);PmmUnrefPage(hole);
+    // Hardware can update the first source PTE after the walker captured it.
+    VmmHostInjectMoveAccessBits(VMM_ACCESSED|VMM_DIRTY);
     failFrameAfter=0;CHECK(VmmMoveRange(pt,source,source+span,target));CHECK(failFrameAfter.load()==0);failFrameAfter=-1;
+    raw[0]|=VMM_ACCESSED|VMM_DIRTY;
     for(unsigned i=0;i<4;++i){const auto moved=VmmReadOwnedLeaf(pt,VirtualAddress(target+offsets[i]));
         CHECK(!VmmReadOwnedLeaf(pt,VirtualAddress(source+offsets[i])).raw && moved.raw==raw[i] && moved.owner==owners[i]);
         CHECK(!VmmHostOwnerSlotPresent(pt,VirtualAddress(source+offsets[i])));
@@ -2607,6 +2610,13 @@ static void protectPreservesConcurrentHardwareBits(bool extended) {
     const auto leaf=VmmReadOwnedLeaf(pt,va);
     CHECK(race.calls==3 && leaf.owner==owner && VmmLeafPhysical(leaf.raw)==page);
     CHECK((leaf.raw&(VMM_ACCESSED|VMM_DIRTY|VMM_WRITABLE))==(VMM_ACCESSED|VMM_DIRTY|VMM_WRITABLE));
+    constexpr uint64_t destination=0x70000000;
+    CHECK(VmmPrepareMove(pt,va.raw(),va.raw()+pageSize,destination));
+    __atomic_fetch_and(pte,~uint64_t(VMM_ACCESSED|VMM_DIRTY),__ATOMIC_RELAXED);
+    VmmHostInjectMoveAccessBits(VMM_DIRTY);
+    CHECK(VmmMoveRange(pt,va.raw(),va.raw()+pageSize,destination));
+    const auto moved=VmmReadOwnedLeaf(pt,VirtualAddress(destination));
+    CHECK(moved.raw==((leaf.raw&~VMM_ACCESSED)|VMM_DIRTY) && moved.owner==owner && !VmmReadOwnedLeaf(pt,va).raw && maps(page)==1);
     VmmDestroyUserPageTable(pt);PmmFreePage(kernel.pml4);VmmHostSetKernelRoot({});empty();
 }
 static void extendedOwnerProtectionExperiment() {
