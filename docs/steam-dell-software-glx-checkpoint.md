@@ -445,8 +445,12 @@ the user's installed library. The game process remained live and a private
 guest framebuffer capture showed its title screen. The game window was clipped
 by the nested X desktop. Moving its X window to the origin and maximizing the
 outer Xwayland window exposed the full title menu as a manual workaround; this
-is not automatic desktop integration. No interaction, gameplay or audio
-acceptance is claimed. Steam's web helper reported shared-memory ENOSPC
+is not automatic desktop integration. A held synthetic mouse click opened the
+new-character screen. Initial typing attempts missed the field because the
+nested pointer coordinates were offset; after correcting the click location,
+a held synthetic key produced text. The test returned to the title menu
+without creating a save. Gameplay and audio remain unverified. Steam's
+web helper reported shared-memory ENOSPC
 and an unresponsive browser during the run. The Dell still used the previously
 accepted kernel, not the QEMU-tested tmpfs candidate. Captures and account
 details remain private, outside version control.
