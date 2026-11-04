@@ -366,6 +366,10 @@ int main()
     assert(TmpfsBootBudget(16384, true) == TmpfsDefaultBytes);
     assert(TmpfsBootBudget(11, true) == 8192);
     assert(TmpfsBootBudget(~uint64_t{0}, true) == 0x7ffffffffffff000ULL);
+    assert(TmpfsDesktopBudget(2ULL*1024*1024*1024, false) == 1024ULL*1024*1024);
+    assert(TmpfsDesktopBudget(2ULL*1024*1024*1024, true) == 1536ULL*1024*1024);
+    assert(TmpfsDesktopBudget(5*4096, true) == 4*4096);
+    assert(TmpfsDesktopBudget(0x7ffffffffffff000ULL, true) <= 0x7ffffffffffff000ULL);
     identity(1000);
     clean();
     mappedQuota();

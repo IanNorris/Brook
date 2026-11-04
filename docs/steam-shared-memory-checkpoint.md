@@ -26,6 +26,15 @@ The earlier and candidate kernel SHA-256 values were respectively
 `1baa34fedd117d44c941393770d8cb9994455383fad66b7d2a83e3c80c03e89a` and
 `c7e83ceebaa1ac20fc17f9152bd71939e14309717ea9ca5a6441bd1b7d9f2119`.
 
+For a controlled quota comparison, `/etc/tmpfs-shm-wide` optionally allows
+the desktop shared-memory mount to use three quarters of the existing global
+tmpfs budget, instead of half. It does not reserve memory or increase that
+global budget, and it leaves the default and the separate QEMU-only unbounded
+mode unchanged. This is an experiment, not a remedy for stale objects or a
+claim about Steam's freeze. With the separate larger-budget marker also set,
+an offline 2-GiB QEMU guest reported a 372,465,664-byte desktop quota and a
+496,619,520-byte global quota and passed the 480-case full-unlink probe.
+
 This checkpoint gives `/dev/shm` a real tmpfs mount, enables quota-accounted
 tmpfs file mappings, and makes shared FileObject futexes match across processes.
 It removes the observed controller IPC and shared-memory initialization errors.

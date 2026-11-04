@@ -648,6 +648,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         (tmpfsOption==1 || (tmpfsOption==2 && !tmpfsUnbounded[1]));
     brook::VnodeStat largerTmpfsMarker{};
     const bool largerTmpfs=brook::VfsStatPath("/etc/tmpfs-desktop-large",&largerTmpfsMarker)==0;
+    brook::VnodeStat widerShmMarker{};
+    const bool widerShm=brook::VfsStatPath("/etc/tmpfs-shm-wide",&widerShmMarker)==0;
     // Charge tmpfs lazily, within a boot-available-RAM aggregate ceiling. The
     // desktop gets half that budget; ordinary container mounts retain their
     // smaller default unless the caller requests an explicit size.
@@ -657,7 +659,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     const uint64_t tmpfsBudget=unboundedTmpfs ? 0x7ffffffffffff000ULL :
         brook::TmpfsBootBudget(brook::PmmGetFreePageCount(),largerTmpfs);
     if(brook::TmpfsConfigureByteBudget(tmpfsBudget))KernelPanic("tmpfs memory budget initialization failed");
-    const uint64_t desktopShmBytes=unboundedTmpfs ? tmpfsBudget : tmpfsBudget/2 & ~uint64_t{4095};
+    const uint64_t desktopShmBytes=unboundedTmpfs ? tmpfsBudget : brook::TmpfsDesktopBudget(tmpfsBudget,widerShm);
     // A real retained filesystem must survive directory binds into containers;
     // the historical pathname-only shm broker cannot serve those namespaces.
     {
@@ -684,7 +686,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         if(error)KernelPanic("canonical /dev/shm tmpfs mount failed: %d",error);
         // Report marker presence; the separate unbounded diagnostic option,
         // when set, takes precedence over either bounded profile.
-        brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,larger=%u,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget,largerTmpfs?1u:0u);
+        brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,larger=%u,wide=%u,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget,largerTmpfs?1u:0u,widerShm?1u:0u);
     }
 
     // Optional read-only-media desktop: keep runtime sockets and user settings

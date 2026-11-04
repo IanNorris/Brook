@@ -16,6 +16,14 @@ inline uint64_t TmpfsBootBudget(uint64_t freePages, bool largerProfile)
     if (pages > maxPages) pages = maxPages;
     return pages * 4096;
 }
+// Diagnostic opt-in can devote more of the existing aggregate budget to the
+// desktop mount. This changes no reservation and never enlarges the aggregate.
+inline uint64_t TmpfsDesktopBudget(uint64_t aggregateBytes, bool widerDesktop)
+{
+    const uint64_t pages = aggregateBytes / 4096;
+    const uint64_t desktopPages = widerDesktop ? pages - pages / 4 : pages / 2;
+    return desktopPages * 4096;
+}
 // Boot-time aggregate charged-memory budget. Configuration is rejected while
 // any instance exists; allocation remains lazy and each mount has its own quota.
 int TmpfsConfigureByteBudget(uint64_t bytes);
