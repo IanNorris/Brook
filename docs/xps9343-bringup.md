@@ -1424,7 +1424,14 @@ snapshot does not size BARs, claim graphics memory, or provide acceleration.
 Linux's [early graphics memory discovery](https://gbmc.googlesource.com/linux/+/refs/heads/linux-rolling-stable/arch/x86/kernel/early-quirks.c)
 and [i915 stolen-memory code](https://kernel.googlesource.com/pub/scm/linux/kernel/git/tj/cgroup/+/5e6c94a999f67f120c6bbba71bbee840dfee6338/drivers/gpu/drm/i915/i915_gem_stolen.c)
 describe the register roles. Host tests cover the identity gate and bridge
-serialization; Dell capture and interpretation remain to be verified.
+serialization. The exact kernel/initrd pair also reached the desktop in an
+offline QEMU boot. A clean restart into the Dell's inactive A/B slot reported
+payload `dell-intel-inventory-20261104` and build `29a291be`; the earlier slot
+was retained. The Dell reported graphics control `0x01c1` and stolen-base raw
+value `0xdd800001`. These are raw observations, not a validated allocation or
+permission to use the region. The SSD mounted, Ethernet acquired its address,
+and the existing backlight API remained available and on. Range interpretation
+and graphics execution remain to be validated.
 
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
