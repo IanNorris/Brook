@@ -1510,6 +1510,14 @@ The physical Dell then restarted cleanly with its previous slot retained and
 its persistent SSD and network available. This is a point-in-time observation,
 not authorization to bind or release GPU-visible pages.
 
+The boot PCI snapshot now includes Broadwell MSAC, and a separate read-only
+planner derives the first and last GGTT entry addresses covering the firmware
+framebuffer. It requires the audited Dell inventory, memory decode, expected
+MSAC/GGTT geometry, disjoint BARs and a complete framebuffer span inside the
+256 MiB aperture. `planned` only confirms address arithmetic; it does not read
+the entries, claim a GGTT range or establish power/cache safety for MMIO. The
+16 MiB BAR0 and 256 MiB BAR2 extents were independently recorded under Linux.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.

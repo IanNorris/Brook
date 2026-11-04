@@ -7,6 +7,7 @@ struct BdwFirmwareGraphics {
     bool captured;
     uint16_t graphicsControl;
     uint32_t stolenBase;
+    uint8_t apertureControl=0;
 };
 
 // A descriptive firmware range only: this does not reserve memory, validate
@@ -27,14 +28,14 @@ inline BdwStolenRange BdwDecodeStolenRange(const BdwFirmwareGraphics& raw) {
     return {true, base, size, base + size};
 }
 
-template<class Read16, class Read32>
+template<class Read16, class Read32, class Read8>
 BdwFirmwareGraphics BdwCaptureFirmwareGraphics(
     uint8_t bus, uint8_t dev, uint8_t fn, uint16_t vendor, uint16_t device,
     uint8_t revision, uint16_t subsystemVendor, uint16_t subsystemDevice,
-    Read16 read16, Read32 read32) {
+    Read16 read16, Read32 read32, Read8 read8) {
     if (bus != 0 || dev != 2 || fn != 0 || vendor != 0x8086 || device != 0x1616 ||
         revision != 9 || subsystemVendor != 0x1028 || subsystemDevice != 0x0665)
         return {};
-    return {true, read16(0x50), read32(0x5c)};
+    return {true, read16(0x50), read32(0x5c), read8(0x62)};
 }
 }

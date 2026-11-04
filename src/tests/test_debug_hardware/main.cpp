@@ -12,6 +12,7 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
+#include "intel_bdw_scanout.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
@@ -27,6 +28,8 @@ bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& ou
 namespace brook {
 DellGpuVtdObservation gpuVtd{};
 const DellGpuVtdObservation& DellGpuVtdObserveRead(){return gpuVtd;}
+BdwGopObservation gpuGop{};
+const BdwGopObservation& BdwGopObserveRead(){return gpuGop;}
 HdaObservation hdaObservation{};
 const HdaObservation& HdaObserveRead(){return hdaObservation;}
 NativeTscObservation tscObservation{};
@@ -107,6 +110,7 @@ int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t str
 bool handle(const std::string& command){reply.clear();dispatched.clear();return brook::DebugHardwareHandleCommand(command.c_str(),command.size());}
 int main(){
     assert(!handle("bridge unrelated"));
+    assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"planned\":false")!=std::string::npos && reply.find("first_index")==std::string::npos);
     assert(handle("bridge hardware gpu-vtd") && reply.find("\"sampled\":false")!=std::string::npos && reply.find("global_status")==std::string::npos);
     brook::gpuVtd.sampled=true;brook::gpuVtd.status={0x10,0x80000000};
     assert(handle("bridge hardware gpu-vtd") && reply.find("\"translation_enabled\":true")!=std::string::npos);
@@ -138,7 +142,7 @@ int main(){
     assert(reply.find("\"source\":\"boot_snapshot\"")!=std::string::npos);
     assert(reply.find("\"vendor_id\":32902")!=std::string::npos);
     assert(reply.find("\"raw_bars\":[4026531844,0,0,0,0,0]")!=std::string::npos);
-    assert(reply.find("\"bdw_firmware_graphics\":{\"graphics_control_raw\":449,\"stolen_base_raw\":3716153345}")!=std::string::npos);
+    assert(reply.find("\"bdw_firmware_graphics\":{\"graphics_control_raw\":449,\"stolen_base_raw\":3716153345,\"aperture_control_raw\":0}")!=std::string::npos);
     assert(reply.find("\"bdw_stolen_range\":{\"valid\":true,\"base\":3716153344,\"size\":33554432,\"end_exclusive\":3749707776")!=std::string::npos);
     assert(brook::classifiedAddress==0xdd800000ull && brook::classifiedBytes==33554432);
     assert(reply.find("\"boot_map_classified\":true,\"boot_map_types\":2,\"boot_map_unreported\":false")!=std::string::npos);

@@ -20,6 +20,7 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
+#include "intel_bdw_scanout.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
@@ -300,6 +301,13 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         }
         r.text("}\n");r.send();return true;
     }
+    if(!strcmp(command,"bridge hardware gpu-gop-plan")) {
+        const auto& s=BdwGopObserveRead();Reply r;r.text("{\"gpu_gop_plan_api\":1,\"inventory\":");r.text(s.inventory?"true":"false");
+        r.text(",\"planned\":");r.text(s.planned?"true":"false");
+        if(s.planned){r.text(",");r.field("first_index",s.plan.firstIndex);r.text(",");r.field("last_index",s.plan.lastIndex);
+            r.text(",");r.field("first_pte_address",s.plan.firstAddress);r.text(",");r.field("last_pte_address",s.plan.lastAddress);}
+        r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware gpu-vtd")) {
         const auto& s=DellGpuVtdObserveRead();Reply r;
         r.text("{\"gpu_vtd_api\":1,\"requested\":");r.text(s.requested?"true":"false");
@@ -472,7 +480,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             for(unsigned b=0;b<6;++b){if(b)r.text(",");r.number(d.bar[b]);}r.text("]");
             if(entry.bdwGraphics.captured){
                 r.text(",\"bdw_firmware_graphics\":{");r.field("graphics_control_raw",entry.bdwGraphics.graphicsControl);
-                r.text(",");r.field("stolen_base_raw",entry.bdwGraphics.stolenBase);r.text("}");
+                r.text(",");r.field("stolen_base_raw",entry.bdwGraphics.stolenBase);
+                r.text(",");r.field("aperture_control_raw",entry.bdwGraphics.apertureControl);r.text("}");
                 const auto range=BdwDecodeStolenRange(entry.bdwGraphics);
                 r.text(",\"bdw_stolen_range\":{\"valid\":");r.text(range.valid?"true":"false");
                 r.text(",");r.field("base",range.base);r.text(",");r.field("size",range.size);
