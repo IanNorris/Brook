@@ -3251,3 +3251,13 @@ were absent and the user reported effects audible only after selecting the
 high-quality setting. The missing tracks were staged privately for the second
 run; the low-quality sound issue remains unverified and unresolved. The game
 backend still reported an 11.025 kHz mixer rate with the high-quality option.
+
+The optional `/etc/dell-gpu-prepare-only` marker containing `1\n` exercises
+the Broadwell BCS command-image builder using nineteen kernel-owned pages on the
+matched Dell boot. It releases those pages without reserving GGTT space or
+submitting work to the GPU. The serial log and `gpu_gop_plan_api` report the
+result. Host tests cover allocation failure, page alias rejection and simulated
+submission failures; this preparation is not a working GPU driver or a
+physical submission test. Hardware submission remains gated on independently
+establishing GPU ownership, usable DMA mappings, GPU PAT and engine status-page
+handoff, and retaining resources until the engine is safely retired.

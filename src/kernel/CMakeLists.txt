@@ -297,6 +297,7 @@ add_executable(kernel
     src/dell_i2c_probe.cpp
     src/intel_vtd_observe.cpp
     src/intel_bdw_scanout.cpp
+    src/intel_bdw_prepare.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

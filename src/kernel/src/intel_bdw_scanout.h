@@ -2,9 +2,12 @@
 #include <stdint.h>
 #include "intel_bdw_forcewake.h"
 namespace brook {
+// Builds and releases private command images only; does not access hardware.
+bool BdwPreparePrivateImages();
 struct BdwGopPtePlan { uint64_t firstIndex=0,lastIndex=0,firstAddress=0,lastAddress=0; };
 struct BootProtocol;
 struct BdwGopObservation {
+    bool prepareRequested=false,prepareBuilt=false;
     bool inventory=false,planned=false,probeRequested=false,powerD0=false,pagesAdmitted=false,sampled=false;
     BdwGopPtePlan plan{};uint64_t firstPte=0,lastPte=0;
     bool ackRequested=false,ackPageAdmitted=false,ackSampled=false;uint32_t ackRaw=0;

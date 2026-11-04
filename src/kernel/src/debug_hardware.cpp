@@ -302,7 +302,8 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware gpu-gop-plan")) {
-        const auto& s=BdwGopObserveRead();Reply r;r.text("{\"gpu_gop_plan_api\":1,\"inventory\":");r.text(s.inventory?"true":"false");
+        const auto& s=BdwGopObserveRead();Reply r;r.text("{\"gpu_gop_plan_api\":1,\"prepare_requested\":");r.text(s.prepareRequested?"true":"false");
+        r.text(",\"prepare_built\":");r.text(s.prepareBuilt?"true":"false");r.text(",\"inventory\":");r.text(s.inventory?"true":"false");
         r.text(",\"planned\":");r.text(s.planned?"true":"false");
         if(s.planned){r.text(",");r.field("first_index",s.plan.firstIndex);r.text(",");r.field("last_index",s.plan.lastIndex);
             r.text(",");r.field("first_pte_address",s.plan.firstAddress);r.text(",");r.field("last_pte_address",s.plan.lastAddress);}

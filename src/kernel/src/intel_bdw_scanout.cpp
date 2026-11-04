@@ -68,9 +68,15 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");
         observation.otherEnginesRequested=OptedIn("/etc/dell-gpu-engines-run");
         observation.wakeRequested=observation.otherEnginesRequested || OptedIn("/etc/dell-gpu-forcewake-run");
-        if(!observation.probeRequested && !observation.ackRequested && !observation.wakeRequested)return;
+        observation.prepareRequested=OptedIn("/etc/dell-gpu-prepare-only");
+        if(!observation.probeRequested && !observation.ackRequested && !observation.wakeRequested && !observation.prepareRequested)return;
         probeAttempted=true;
         if(!observation.planned || SmpCurrentCpuIndex()!=0)return;
+        if(observation.prepareRequested){
+            observation.prepareBuilt=BdwPreparePrivateImages();
+            SerialPrintf("gpu-bcs: private preparation %s; no hardware submission\n",observation.prepareBuilt?"ok":"failed");
+        }
+        if(!observation.probeRequested && !observation.ackRequested && !observation.wakeRequested)return;
         observation.powerD0=LiveGpuMatches(e) && PowerD0(d);
         if(observation.probeRequested)observation.pagesAdmitted=PageAdmitted(observation.plan.firstAddress&~4095ull) &&
             PageAdmitted(observation.plan.lastAddress&~4095ull);

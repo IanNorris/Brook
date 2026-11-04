@@ -28,11 +28,13 @@ inline bool BdwBuildBcsSubmission(const BdwBcsSubmission& s,uint32_t (&context)[
        overlaps(s.completionGgtt,8,s.context.ringGgtt,s.context.ringBytes))return false;
     uint64_t builtDescriptor=0;
     if(!BdwBuildBcsContext64(s.context,context,builtDescriptor))return false;
-    for(unsigned i=0;i<10;++i)batch[i]=blit[i];batch[10]=0x05000000;batch[11]=0;
+    for(unsigned i=0;i<10;++i)batch[i]=blit[i];
+    batch[10]=0x05000000;batch[11]=0;
     // The GGTT completion store must be in the privileged ring, not in the
     // nonprivileged batch; bit 5 of its address is prohibited on Gen8.
     const uint32_t commands[10]={0x04000000,0x18800101,uint32_t(s.batchPpgtt),uint32_t(s.batchPpgtt>>32),
         0x13004002,uint32_t(s.completionGgtt)|4,0,s.nonce,0,0x04000001};
-    for(unsigned i=0;i<10;++i)ring[i]=commands[i];descriptor=builtDescriptor;return true;
+    for(unsigned i=0;i<10;++i)ring[i]=commands[i];
+    descriptor=builtDescriptor;return true;
 }
 }

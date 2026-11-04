@@ -11,11 +11,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 using namespace brook;
-static unsigned scenario=0,reads=0,ackReads=0,pageChecks=0,wakeRuns=0;static Vnode marker;
+static unsigned scenario=0,reads=0,ackReads=0,pageChecks=0,wakeRuns=0,prepares=0;static Vnode marker;
 namespace brook {
+bool BdwPreparePrivateImages(){++prepares;return scenario!=28;}
 extern "C" void SerialPuts(const char*){}
 extern "C" void SerialPrintf(const char*,...){}
-extern "C" Vnode* VfsOpen(const char* p,int){return ((scenario>=4 && scenario<=13 && !std::strcmp(p,"/etc/dell-gpu-gtt-probe")) || (scenario>=14 && scenario<=18 && !std::strcmp(p,"/etc/dell-gpu-forcewake-ack")) || (scenario>=19 && scenario<=22 && !std::strcmp(p,"/etc/dell-gpu-forcewake-run")) || (scenario>=23 && !std::strcmp(p,"/etc/dell-gpu-engines-run")))?&marker:nullptr;}
+extern "C" Vnode* VfsOpen(const char* p,int){return ((scenario>=4 && scenario<=13 && !std::strcmp(p,"/etc/dell-gpu-gtt-probe")) || (scenario>=14 && scenario<=18 && !std::strcmp(p,"/etc/dell-gpu-forcewake-ack")) || (scenario>=19 && scenario<=22 && !std::strcmp(p,"/etc/dell-gpu-forcewake-run")) || (scenario>=23 && scenario<=26 && !std::strcmp(p,"/etc/dell-gpu-engines-run")) || (scenario>=27 && !std::strcmp(p,"/etc/dell-gpu-prepare-only")))?&marker:nullptr;}
 void VfsRelease(Vnode*){}
 int VfsStat(Vnode*,VnodeStat* s){*s={};s->size=2;return 0;}
 extern "C" int VfsRead(Vnode*,void* out,uint64_t n,uint64_t*){if(n!=2)return -1;std::memcpy(out,"1\n",2);return 2;}
@@ -71,5 +72,9 @@ int main(){
     for(unsigned n=23;n<=26;++n){pid_t child=fork();assert(child>=0);if(!child){scenario=n;wakeRuns=0;pageChecks=0;BdwGopObserveConfigure(&boot);
         const auto& r=BdwGopObserveRead();assert(r.wakeRequested && r.otherEnginesRequested && pageChecks==7);
         assert(wakeRuns==(n==23?1u:0u));BdwGopObserveConfigure(&boot);assert(wakeRuns==(n==23?1u:0u));_exit(0);}
+        int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
+    for(unsigned n=27;n<=28;++n){pid_t child=fork();assert(child>=0);if(!child){scenario=n;prepares=0;pageChecks=0;BdwGopObserveConfigure(&boot);
+        const auto& r=BdwGopObserveRead();assert(r.prepareRequested && r.prepareBuilt==(n==27) && prepares==1 && pageChecks==0);
+        BdwGopObserveConfigure(&boot);assert(prepares==1);_exit(0);}
         int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
 }
