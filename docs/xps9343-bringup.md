@@ -1485,6 +1485,16 @@ The helper must operate on one private immutable copy; a future caller must
 also verify a unique DMAR and the Dell PCI identity. It is not connected to
 hardware access and does not establish whether translation is enabled.
 
+The unconnected VT-d status reader now checks the active kernel root, both
+existing aliases and the current CPU's effective cache configuration under the
+page-table lock before issuing 32-bit reads of VER and GSTS. It refuses an
+implausible version or all-ones status and leaves output unchanged on failure.
+It has not been called on the Dell. Its eventual caller must additionally
+verify exact PCI and unique audited DMAR identity, exclude conflicting resources
+over the entire page, and restrict the probe to one opted-in BSP attempt. Even
+a valid TES observation would be only a point-in-time remapping status, not
+authorization to bind or release GPU-visible pages.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.

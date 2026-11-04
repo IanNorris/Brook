@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "acpi.h"
 #include "dell_i2c_id_policy.h"
+#include "intel_vtd_probe_policy.h"
 
 namespace brook {
 
@@ -508,6 +509,36 @@ bool VmmDellI2cIdCriticalRead(uint32_t& value) {
     } io;
     const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
     const bool ok=DellI2cIdCritical(io,value);
+    IrqSpinLockRelease(&g_kernelPtLock,irq);return ok;
+}
+
+bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status) {
+    struct Io {
+        AuditedAliasTables tables;
+        bool evidence(DellI2cCriticalEvidence& e) {
+            KernelAliasMapping identity{},direct{},current{};
+            const uint64_t root=g_kernelCR3.raw(),active=ReadCR3()&PHYS_MASK;
+            e.aliasesValid=active==root && InspectKernelAlias(tables,root,DellGpuVtdPage,identity) &&
+                InspectKernelAlias(tables,root,DIRECT_MAP_BASE+DellGpuVtdPage,direct) &&
+                InspectKernelAlias(tables,active,DIRECT_MAP_BASE+DellGpuVtdPage,current);
+            e.identityPresent=identity.present;e.identityMatches=identity.physical==DellGpuVtdPage;e.identityPat=identity.patIndex;
+            e.directPresent=direct.present;e.directMatches=direct.physical==DellGpuVtdPage;e.directPat=direct.patIndex;
+            e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==DellGpuVtdPage;e.currentDirectPat=current.patIndex;
+            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(DellGpuVtdPage,DellGpuVtdPage,cpu);
+            e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
+            return true;
+        }
+        bool readVersion(uint32_t& v) {
+            __asm__ volatile("lfence":::"memory");
+            v=*reinterpret_cast<const volatile uint32_t*>(DIRECT_MAP_BASE+DellGpuVtdPage);return true;
+        }
+        bool readStatus(uint32_t& v) {
+            __asm__ volatile("lfence":::"memory");
+            v=*reinterpret_cast<const volatile uint32_t*>(DIRECT_MAP_BASE+DellGpuVtdPage+0x1c);return true;
+        }
+    } io;
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
+    const bool ok=DellGpuVtdCritical(io,status);
     IrqSpinLockRelease(&g_kernelPtLock,irq);return ok;
 }
 

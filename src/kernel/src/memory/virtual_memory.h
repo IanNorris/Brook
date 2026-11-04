@@ -128,6 +128,11 @@ bool VmmInspectKernelAddress(uint64_t address,KernelAliasMapping& mapping);
 // Restricted Dell diagnostic; caller must enforce audited opt-in, firmware,
 // boot-map and PCI preconditions before entering this critical section.
 bool VmmDellI2cIdCriticalRead(uint32_t& value);
+struct DellGpuVtdStatus;
+// Internal diagnostic only. Caller must prove exact PCI identity, one unique
+// audited DMAR for this boot, no conflicting resources across the register
+// page, and an opted-in single BSP attempt. Output is unchanged on failure.
+bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.
