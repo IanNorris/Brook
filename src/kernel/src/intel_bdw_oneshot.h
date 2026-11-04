@@ -70,6 +70,13 @@ public:
         if(owner_!=static_cast<const void*>(&io) || state_!=BdwOneShotState::Prepared || !bind_.SafeToRelease())return false;
         state_=BdwOneShotState::Released;ReleasePages(io);return true;
     }
+    // Private CPU writeback only; no GGTT binding or GPU submission.
+    template<class Io> bool PublishPrepared(Io& io) {
+        if(owner_!=static_cast<const void*>(&io) || state_!=BdwOneShotState::Prepared)return false;
+        state_=BdwOneShotState::Executing;
+        const bool ok=io.publish(pages_,Count);
+        state_=BdwOneShotState::Prepared;return ok;
+    }
     // A bounded one-shot: no engine write before all backend handoff proofs,
     // publication and binding. HWS may be consumed even if its write reports
     // failure, so retain all pages from the first attempted engine write on.

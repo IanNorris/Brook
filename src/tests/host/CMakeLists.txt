@@ -891,5 +891,7 @@ target_compile_options(test_intel_bdw_oneshot PRIVATE -UNDEBUG "-iquote${BROOK_R
 add_host_test(test_intel_bdw_prepare "${BROOK_ROOT}/src/kernel/src/intel_bdw_prepare.cpp")
 target_compile_definitions(test_intel_bdw_prepare PRIVATE BROOK_HOST_TEST)
 target_compile_options(test_intel_bdw_prepare PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+add_host_test(test_intel_bdw_publish)
+target_compile_options(test_intel_bdw_publish PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_pte_owner_sidecars)
 target_compile_options(test_pte_owner_sidecars PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")

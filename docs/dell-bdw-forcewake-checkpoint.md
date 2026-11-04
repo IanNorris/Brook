@@ -137,6 +137,16 @@ and [request setup](https://raw.githubusercontent.com/torvalds/linux/v6.8/driver
 Host tests verify the words, ordering and resulting simulated copy; they do not
 emulate GPU cache invalidation or establish physical execution.
 
+The opt-in private-page preparation path now performs CPU-side CLFLUSH
+writeback over its 19 owned pages, with a barrier before and after. It checks
+the executing CPU's capability and line size and frees the pages after the
+final barrier; a missing capability makes the diagnostic fail cleanly. Host
+tests verify every selected line, invalid inputs before any flush, an injected
+missing-capability cleanup, and real CLFLUSH on guarded private mappings.
+This is a bounded boot diagnostic with interrupts disabled during writeback;
+it does not establish GPU DMA mapping, device visibility or ownership and is
+not a runtime rendering path.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).
