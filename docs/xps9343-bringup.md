@@ -1490,19 +1490,21 @@ existing aliases and the current CPU's effective cache configuration under the
 page-table lock before issuing 32-bit reads of VER and GSTS. It refuses an
 implausible version or all-ones status and leaves output unchanged on failure.
 It is connected to a boot-only BSP observer gated by the explicit
-`/etc/dell-gpu-vtd-probe` marker, unique audited DMAR, exact PCI inventory and
-full-page Reserved/MMIO boot-map coverage. The PCI resource extents were
+`/etc/dell-gpu-vtd-probe` marker, unique audited DMAR and exact PCI inventory.
+It accepts full-page Reserved/MMIO coverage or a wholly unreported page
+positively identified by that exact DMAR and inventory; partial coverage and
+RAM overlaps remain rejected. The PCI resource extents were
 checked independently on the earlier Linux boot; matching raw BARs does not
-prove that every possible chipset decode is unchanged. The observer has not
-subsequently ran once on the Dell: topology and PCI inventory matched, but the
+prove that every possible chipset decode is unchanged. The observer initially
+ran on the Dell: topology and PCI inventory matched, but the
 boot-map coverage gate refused the read, so no VT-d registers were sampled.
 The Dell reached its desktop with persistent SSD and networking available.
 The follow-up Dell boot showed `boot_map_classified=true`, `types=0`, and
 `unreported=true`: the entire page is a firmware memory-map hole. The probe
 still performed no register reads. The firmware DMAR identifies this unit,
-but the gap is not itself a RAM or MMIO descriptor and requires separate
-admission analysis. Even
-a valid TES observation would be only a point-in-time remapping status, not
+but the gap is not itself a RAM or MMIO descriptor. The reviewed exception
+has not yet been tried on the Dell. A valid TES observation would be only a
+point-in-time remapping status, not
 authorization to bind or release GPU-visible pages.
 
 Next display gate: read only the documented Broadwell/LPT backlight register

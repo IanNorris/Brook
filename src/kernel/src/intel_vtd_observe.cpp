@@ -43,7 +43,12 @@ void DellGpuVtdObserveConfigure() {
     constexpr uint32_t allowed=(1u<<uint32_t(MemoryType::Reserved))|(1u<<uint32_t(MemoryType::Mmio));
     observation.bootMapClassified=AcpiClassifyBootRange(DellGpuVtdPage,4096,map);
     observation.bootMapTypes=map.types;observation.bootMapUnreported=map.unreported;
-    observation.bootMap=observation.bootMapClassified && !map.unreported && map.types && !(map.types&~allowed);
+    // A wholly undescribed page is accepted only for this exact, reviewed
+    // DMAR topology and PCI inventory. Partial coverage and any RAM are not.
+    observation.auditedDmarHole=observation.bootMapClassified && !map.types && map.unreported &&
+        observation.topology && observation.inventory;
+    observation.bootMap=observation.auditedDmarHole ||
+        (observation.bootMapClassified && !map.unreported && map.types && !(map.types&~allowed));
     if(observation.topology && observation.inventory && observation.bootMap) {
         SerialPuts("gpu-vtd: admitted; sampling version and status\n");
         observation.sampled=VmmDellGpuVtdCriticalRead(observation.status);
