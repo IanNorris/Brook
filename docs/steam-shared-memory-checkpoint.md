@@ -214,3 +214,10 @@ kernel. The earlier kernel charged 52,879,360 bytes; the new kernel charged
 then intentionally failed the new single-copy threshold; the new probe passed
 its subsequent coherence, fork and private-COW checks. This compares quota
 accounting in the synthetic guest, not Steam startup time or Dell behavior.
+
+The existing 480-trial full-quota unlink probe was rerun on the shared-frame
+kernel in a disposable QEMU guest, using its required `--disposable-vm` flag.
+It reported both `TMPFS_FULL_UNLINK_PASS trials=480` and the parent pass. The
+kernel SHA-256 was `22b5c2cb0542d3f280dc8821994a6ca6c299ff0f18cf8448dad9120703af4f8e`.
+An initial invocation without that flag exited 2 without running the test; it
+is not counted as acceptance. The Dell remains untested for this change.
