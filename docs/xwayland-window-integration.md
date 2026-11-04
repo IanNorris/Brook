@@ -188,8 +188,15 @@ the compositor with `BROOK_XWAYLAND_DUMB_SCHED=1`; it passes `-dumbSched` to its
 owned Xwayland, while leaving the default invocation unchanged. Xwayland 24.1.14
 disables both smart-scheduling timer signals and threaded input for that option,
 so any performance change cannot be attributed to the timer alone. Rebuilding
-the compositor and its host suite passed; a guest A/B and Steam acceptance are
-still required. This diagnostic does not implement `setitimer`.
+the compositor and its host suite passed. A private software-rendered VM clone
+of the Xwayland-capable review was booted once in each mode with the same
+compositor binary. In both, a 240x140 xeyes client appeared as an individual
+rootless window. The normal run's sampled serial log reached at least 256
+unimplemented syscall-38 calls from Xwayland; the diagnostic run showed none
+through the xeyes check. The runs were not duration-matched benchmarks, and
+this does not establish input correctness, performance or Steam stability.
+Steam A/B and hardware acceptance are still required. This diagnostic does not
+implement `setitimer`.
 
 The fixture also checks caught and default `SIGALRM` delivery to a child
 spinning without syscalls; these checks pass on Linux. Brook's current caught
