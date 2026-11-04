@@ -185,6 +185,12 @@ unchanged. Host checks cover actual fork/exec arguments and environment, includi
 restart with the optional dumb scheduler; the physical run above used the
 equivalent temporary wrapper, not this newly built binary. Indirect GLX is enabled
 in this opt-in mode; whether direct software GLX works without it remains open.
+The newly built option was then booted in a private software-rendered QEMU
+guest: the GLX control created a current llvmpipe context and read a red pixel
+without X or GL errors. After terminating the owned Xwayland server, the
+compositor restarted it and the same GLX control passed again. The guest was
+stopped after a checked filesystem and device flush; the packaged option still
+requires a Dell run.
 
 Known gaps and remaining gates:
 
