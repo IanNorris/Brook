@@ -1497,7 +1497,11 @@ prove that every possible chipset decode is unchanged. The observer has not
 subsequently ran once on the Dell: topology and PCI inventory matched, but the
 boot-map coverage gate refused the read, so no VT-d registers were sampled.
 The Dell reached its desktop with persistent SSD and networking available.
-The exact reason for the boot-map refusal needs further telemetry. Even
+The follow-up Dell boot showed `boot_map_classified=true`, `types=0`, and
+`unreported=true`: the entire page is a firmware memory-map hole. The probe
+still performed no register reads. The firmware DMAR identifies this unit,
+but the gap is not itself a RAM or MMIO descriptor and requires separate
+admission analysis. Even
 a valid TES observation would be only a point-in-time remapping status, not
 authorization to bind or release GPU-visible pages.
 
