@@ -1478,6 +1478,13 @@ diagnostic pair reached the desktop in private QEMU and on the Dell after a
 clean restart; the prior SSD slot was retained. Device registers were not
 read as part of the table capture.
 
+A host-tested admission helper now checks the SHA-256 of the exact reviewed
+212-byte Dell table before returning its explicitly scoped GPU remapping-unit
+base. Changed firmware fails closed, even when its table is structurally valid.
+The helper must operate on one private immutable copy; a future caller must
+also verify a unique DMAR and the Dell PCI identity. It is not connected to
+hardware access and does not establish whether translation is enabled.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.

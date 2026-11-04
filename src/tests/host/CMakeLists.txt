@@ -665,6 +665,8 @@ add_host_test(test_intel_bdw_inventory)
 target_compile_options(test_intel_bdw_inventory PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_blitter)
 target_compile_options(test_intel_bdw_blitter PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_dmar_gpu)
+target_compile_options(test_intel_dmar_gpu PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_debug_hardware PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"
