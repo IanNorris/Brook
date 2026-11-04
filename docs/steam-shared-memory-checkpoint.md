@@ -1,5 +1,31 @@
 # Steam shared-memory checkpoint — 23 October 2026
 
+## Full-quota unlink regression — 4 November
+
+Steam's later Dell session left little free space in `/dev/shm`, and its web
+helper reported shared-memory corruption and stopped responding. This does not
+establish that unlink failure caused the Steam failure. A separate regression
+was nevertheless reproduced: with a full tmpfs, VFS pathname lookup allocated
+an object against the same quota and could return `ENOMEM` before unlink could
+release any space. Tmpfs now retains an inode-owned, quota-accounted object
+instead of allocating a new one for every lookup.
+
+The hosted test exhausts both the instance and aggregate budgets, checks a
+retained file after unlink, and races lookup against unlink and recreation.
+The release kernel builds, and the hosted suite passes under GCC and under
+ASan/UBSan (leak sanitizer disabled in the restricted host environment; the
+fixture separately tracks allocations). Astra reviewed the lifetime design.
+
+The static `tmpfsfullunlink.c` probe ran in a private mount namespace on a
+disposable, offline QEMU guest. It varies metadata consumption across 480
+64-KiB tmpfs instances and verifies `unlinkat`, link count, and continued reads
+from the held descriptor. The earlier Dell candidate kernel failed at trial
+155 with `ENOMEM` and link count 1; the candidate passed all 480 trials. These
+are QEMU tests; no Dell activation or Steam recovery claim follows from them.
+The earlier and candidate kernel SHA-256 values were respectively
+`1baa34fedd117d44c941393770d8cb9994455383fad66b7d2a83e3c80c03e89a` and
+`c7e83ceebaa1ac20fc17f9152bd71939e14309717ea9ca5a6441bd1b7d9f2119`.
+
 This checkpoint gives `/dev/shm` a real tmpfs mount, enables quota-accounted
 tmpfs file mappings, and makes shared FileObject futexes match across processes.
 It removes the observed controller IPC and shared-memory initialization errors.
