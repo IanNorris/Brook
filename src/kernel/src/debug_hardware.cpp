@@ -457,6 +457,17 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             if(entry.bdwGraphics.captured){
                 r.text(",\"bdw_firmware_graphics\":{");r.field("graphics_control_raw",entry.bdwGraphics.graphicsControl);
                 r.text(",");r.field("stolen_base_raw",entry.bdwGraphics.stolenBase);r.text("}");
+                const auto range=BdwDecodeStolenRange(entry.bdwGraphics);
+                r.text(",\"bdw_stolen_range\":{\"valid\":");r.text(range.valid?"true":"false");
+                r.text(",");r.field("base",range.base);r.text(",");r.field("size",range.size);
+                r.text(",");r.field("end_exclusive",range.end);
+                BootResourceClassification classification{};
+                const bool classified=range.valid && range.size<=0xffffffffu &&
+                    AcpiClassifyBootRange(range.base,static_cast<uint32_t>(range.size),classification);
+                r.text(",\"boot_map_classified\":");r.text(classified?"true":"false");
+                if(classified){r.text(",");r.field("boot_map_types",classification.types);
+                    r.text(",\"boot_map_unreported\":");r.text(classification.unreported?"true":"false");}
+                r.text("}");
             }
             r.text("}");
         }

@@ -1431,7 +1431,13 @@ was retained. The Dell reported graphics control `0x01c1` and stolen-base raw
 value `0xdd800001`. These are raw observations, not a validated allocation or
 permission to use the region. The SSD mounted, Ethernet acquired its address,
 and the existing backlight API remained available and on. Range interpretation
-and graphics execution remain to be validated.
+using the [Broadwell Linux definitions](https://kernel.googlesource.com/pub/scm/linux/kernel/git/krzk/linux/+/refs/heads/master/include/drm/intel/i915_drm.h)
+and [i915's generation-8 calculation](https://kernel.googlesource.com/pub/scm/linux/kernel/git/pjw/tegra-pending/+/21f122f47205258e166479e1223898941c6aa6a1/drivers/gpu/drm/i915/i915_gem_gtt.c)
+gives a 32 MiB candidate at `[0xdd800000,0xdf800000)` and 8 MiB of GGTT
+storage. The firmware memory map must be checked across the entire data range;
+neither range is available for driver allocations merely because it decodes.
+In particular, firmware scanout and reserved subregions must be preserved.
+Graphics execution remains to be implemented and validated.
 
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another

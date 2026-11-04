@@ -36,7 +36,8 @@ bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
 uint32_t AcpiInventoryCount(){return 1;}
 bool AcpiMmioMapValid(){return true;}
 bool AcpiMmioContains(uint64_t address,uint32_t bytes){return address==0xfe103000 && bytes==4096;}
-bool AcpiClassifyBootRange(uint64_t,uint32_t,BootResourceClassification& result){result={2,false};return true;}
+uint64_t classifiedAddress=0;uint32_t classifiedBytes=0;
+bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassification& result){classifiedAddress=address;classifiedBytes=bytes;result={2,false};return true;}
 bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& a,KernelAliasMapping& b){a={true,21,0,physical};b=a;return true;}
 uint32_t HdaRuntimeFailureStage(){return 0;}
 uint32_t HdaRuntimeStreamFailureStage(){return 0;}
@@ -87,7 +88,7 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
     assert(out && index<2);*out={};out->device.bus=0;out->device.dev=index+2;
     out->device.vendorId=0x8086;out->device.deviceId=0x1616;
     out->device.classCode=3;out->device.bar[0]=0xf0000004;
-    if(index==0)out->bdwGraphics={true,0x0840,0xabc00000};
+    if(index==0)out->bdwGraphics={true,0x01c1,0xdd800001};
     if(hdaPciPresent && index==1){out->device.dev=0x1b;out->device.deviceId=0x9ca0;
         out->device.classCode=4;out->device.subclass=3;out->device.bar[0]=0xf7418004;
         out->subsystemVendor=0x1028;out->subsystemDevice=0x0665;}
@@ -131,7 +132,10 @@ int main(){
     assert(reply.find("\"source\":\"boot_snapshot\"")!=std::string::npos);
     assert(reply.find("\"vendor_id\":32902")!=std::string::npos);
     assert(reply.find("\"raw_bars\":[4026531844,0,0,0,0,0]")!=std::string::npos);
-    assert(reply.find("\"bdw_firmware_graphics\":{\"graphics_control_raw\":2112,\"stolen_base_raw\":2881486848}")!=std::string::npos);
+    assert(reply.find("\"bdw_firmware_graphics\":{\"graphics_control_raw\":449,\"stolen_base_raw\":3716153345}")!=std::string::npos);
+    assert(reply.find("\"bdw_stolen_range\":{\"valid\":true,\"base\":3716153344,\"size\":33554432,\"end_exclusive\":3749707776")!=std::string::npos);
+    assert(brook::classifiedAddress==0xdd800000ull && brook::classifiedBytes==33554432);
+    assert(reply.find("\"boot_map_classified\":true,\"boot_map_types\":2,\"boot_map_unreported\":false")!=std::string::npos);
     assert(reply.find("\"next_cursor\":1")!=std::string::npos && reply.find("\"more\":true")!=std::string::npos);
     assert(handle("bridge hardware pci 1 16") && reply.find("\"device\":3")!=std::string::npos && reply.find("\"more\":false")!=std::string::npos);
     assert(reply.find("bdw_firmware_graphics")==std::string::npos);

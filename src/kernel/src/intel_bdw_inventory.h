@@ -9,6 +9,24 @@ struct BdwFirmwareGraphics {
     uint32_t stolenBase;
 };
 
+// A descriptive firmware range only: this does not reserve memory, validate
+// ownership, or authorize allocation. End is exclusive and calculated in 64 bits.
+struct BdwStolenRange {
+    bool valid;
+    uint64_t base, size, end;
+};
+inline BdwStolenRange BdwDecodeStolenRange(const BdwFirmwareGraphics& raw) {
+    if (!raw.captured || raw.graphicsControl == 0xffff || raw.stolenBase == 0xffffffff)
+        return {};
+    const uint32_t gms = raw.graphicsControl >> 8;
+    // Mobile fifth-generation Core GMS encodings above 0x3f are reserved.
+    if (gms > 0x3f) return {};
+    const uint64_t size = uint64_t(gms) << 25;
+    const uint64_t base = uint64_t(raw.stolenBase & 0xfff00000u);
+    if (!size || !base || base + size > (uint64_t{1} << 32)) return {};
+    return {true, base, size, base + size};
+}
+
 template<class Read16, class Read32>
 BdwFirmwareGraphics BdwCaptureFirmwareGraphics(
     uint8_t bus, uint8_t dev, uint8_t fn, uint16_t vendor, uint16_t device,

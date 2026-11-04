@@ -24,4 +24,12 @@ int main() {
     const auto unavailable=BdwCaptureFirmwareGraphics(0,2,0,0x8086,0x1616,9,0x1028,0x0665,
         [](uint8_t) -> uint16_t { return 0xffff; }, [](uint8_t) -> uint32_t { return 0xffffffff; });
     assert(unavailable.captured && unavailable.graphicsControl==0xffff && unavailable.stolenBase==0xffffffff);
+    assert(!BdwDecodeStolenRange(unavailable).valid);
+    assert(!BdwDecodeStolenRange({false,0x01c1,0xdd800001}).valid);
+    const auto dell=BdwDecodeStolenRange({true,0x01c1,0xdd800001});
+    assert(dell.valid && dell.base==0xdd800000ull && dell.size==32ull*1024*1024 && dell.end==0xdf800000ull);
+    assert(!BdwDecodeStolenRange({true,0x00c1,0xdd800001}).valid);
+    assert(!BdwDecodeStolenRange({true,0x01c1,0x00000001}).valid);
+    assert(!BdwDecodeStolenRange({true,0xffc1,0xfff00001}).valid);
+    assert(!BdwDecodeStolenRange({true,0x40c1,0x40000001}).valid);
 }
