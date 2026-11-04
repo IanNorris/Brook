@@ -40,6 +40,7 @@
 #include "user_copy.h"
 #include "signal_frame_layout.h"
 #include "signal_context.h"
+#include "fw_cfg.h"
 #include "signal_altstack.h"
 #include "signal_fp_user.h"
 #include "vdso.h"
@@ -1817,6 +1818,76 @@ static constexpr int SIGKILL = 9;
 using namespace brook;
 
 extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original);
+
+namespace brook {
+static bool irqSignalProbeEnabled;
+void ProcessConfigureIrqSignalProbe() {
+    char value[2]{};const auto n=FwCfgReadFile("opt/irq-signal-probe",value,sizeof(value));
+    irqSignalProbeEnabled=value[0]=='1' && (n==1 || (n==2 && !value[1]));
+}
+static void FinishIrqSignalProbe(Process* proc) {
+    SchedulerKernelRegionLeave(proc);
+    if(SchedulerKernelOperationBoundary()) {SchedulerYield();__builtin_trap();}
+}
+}
+
+// Experimental QEMU-only path for caught signals. Default and ignored signal
+// dispositions remain on their existing paths while this probe is validated.
+extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp) {
+    using namespace brook;
+    if(!irqSignalProbeEnabled)return;
+    auto& frame=*static_cast<IrqSignalFrame*>(raw);
+    if((frame.cs&3)!=3)return;
+    Process* proc=ProcessCurrent();if(!proc || proc->isKernelThread)return;
+    uint64_t pending=(ProcessPendingSignals(proc)|PosixTimerPending(proc))&~proc->sigMask;
+    if(!pending)return;
+    int signum=0;KernelSigaction action{};
+    while(pending) {
+        const int candidate=__builtin_ctzll(pending)+1;
+        action=ReadSignalAction(proc->tgid,candidate-1);
+        if(action.handler>1){signum=candidate;break;}
+        if(action.handler==0 && DefaultSignalAction(candidate)!=SignalDefault::Ignore)return;
+        pending&=pending-1;
+    }
+    if(!signum)return;
+    SchedulerKernelRegionEnter(proc);
+    pending=(ProcessPendingSignals(proc)|PosixTimerPending(proc))&~proc->sigMask;
+    if(!(pending&(1ULL<<(signum-1)))) {FinishIrqSignalProbe(proc);return;}
+    action=ReadSignalAction(proc->tgid,signum-1);
+    if(action.handler<=1){FinishIrqSignalProbe(proc);return;}
+    SignalInfo info{};
+    if(!PosixTimerDequeue(proc,1ULL<<(signum-1),&info) && !ProcessDequeueSignal(proc,signum,&info)) {
+        FinishIrqSignalProbe(proc);return;
+    }
+    const uint64_t savedMask=proc->sigMask;
+    const uint64_t handlerMask=(savedMask|action.mask|((action.flags&SA_NODEFER)?0:(1ULL<<(signum-1)))) & ~((1ULL<<8)|(1ULL<<18));
+    const int previousStackFlags=SignalAltstackFlags(proc->sigAltstackSp,proc->sigAltstackSize,proc->sigAltstackFlags,frame.rsp);
+    const bool useAlt=(action.flags&SA_ONSTACK) && previousStackFlags==0;
+    uint64_t userRsp=0;
+    const bool valid=UserReturnAddress(action.handler) && PlaceSignalFrame(frame.rsp,proc->sigAltstackSp,
+        proc->sigAltstackSize,useAlt,sizeof(SignalFrame)+SIGNAL_FP_EXTRA,&userRsp,previousStackFlags==1);
+    SignalFrame signal{};signal.pretcode=action.restorer;signal.uc.uc_sigmask=savedMask;
+    signal.uc.uc_flags=1;signal.uc.uc_mcontext.fpstate=SignalFpUserAddress(userRsp,sizeof(signal));
+    signal.uc.uc_stack.ss_sp=proc->sigAltstackSp;signal.uc.uc_stack.ss_size=proc->sigAltstackSize;
+    signal.uc.uc_stack.ss_flags=proc->sigAltstackSize?proc->sigAltstackFlags:2;
+    (void)SignalContextFromIrq(signal.uc.uc_mcontext,frame);
+    ProcessSignalInfoToUser(proc,&info);signal.info=info;
+    bool copied=false;
+    if(valid) {
+        __asm__ volatile("sti":::"memory");
+        copied=SignalFpSaveToUser(signal.uc.uc_mcontext.fpstate,entryFp->data) && CopyToUser(userRsp,&signal,sizeof(signal));
+        __asm__ volatile("cli":::"memory");
+    }
+    FinishIrqSignalProbe(proc);
+    if(!copied) {
+        __asm__ volatile("sti":::"memory");
+        SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);SchedulerExitCurrentProcess(128+11,11);
+    }
+    SignalFpReset(entryFp->data);proc->sigSavedMask=savedMask;proc->sigMask=handlerMask;
+    proc->inSignalHandler=true;if(useAlt)proc->inSignalHandlerOnAltStack=true;
+    frame.rip=action.handler;frame.rsp=userRsp;frame.rflags&=~uint64_t{0x10500};frame.rax=0;frame.rdi=signum;
+    if(action.flags&SA_SIGINFO) {frame.rsi=userRsp+__builtin_offsetof(SignalFrame,info);frame.rdx=userRsp+__builtin_offsetof(SignalFrame,uc);}
+}
 
 extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResult,
                                       FxsaveArea* entryFp)

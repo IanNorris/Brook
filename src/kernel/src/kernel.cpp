@@ -643,6 +643,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     if(drmAnchor)KernelPanic("canonical DRM sysfs anchor failed (rebuild initrd): %d",drmAnchor);
     // Read boot options before creating the first tmpfs instance.
     brook::FwCfgInit();
+    brook::ProcessConfigureIrqSignalProbe();
     brook::Ext2ConfigureAutoSync();
     char tmpfsUnbounded[2]{};
     const uint32_t tmpfsOption=brook::FwCfgReadFile("opt/tmpfs-unbounded",tmpfsUnbounded,sizeof(tmpfsUnbounded));

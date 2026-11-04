@@ -200,3 +200,13 @@ two-CPU Brook QEMU/TCG guest, confirming that the return-path gap is real.
 The IRQ register-layout adapter is not connected to the wrappers yet. Its
 host tests check the distinct syscall and IRQ register mappings; the existing
 11-case guest signal-return suite passed after extracting the syscall mapping.
+
+A QEMU-only `opt/irq-signal-probe=1` experiment now tries caught-signal
+delivery at LAPIC timer and reschedule-IPI return. On a disposable two-CPU TCG
+guest, the no-syscall-loop fixture passed with the option and failed on the same
+kernel without it. The existing 11-case signal-return guest fixture also passed
+with the option enabled. This is not production acceptance:
+disposition selection and notification dequeue are not yet atomic against
+concurrent handler changes, and default dispositions remain on their existing
+path. Register, floating-point, alternate-stack, copy-fault and SMP/IPI coverage
+are still required. The option defaults off and has not been deployed to Dell.

@@ -17,6 +17,7 @@
 #include "tick_clock.h"
 #include "runtime_accounting.h"
 #include "timer_irq_arrivals.h"
+#include "process.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
@@ -541,6 +542,10 @@ static void LapicTimerHandler(void)
         "cld\n\t"
         "call LapicTimerHandlerInner\n\t"
 
+        "movq %%r14, %%rdi\n\t"
+        "movq %%r15, %%rsi\n\t"
+        "call IrqSignalProbe\n\t"
+
         // Validate iret frame before restoring GPRs.
         // The frame is at r14+120 (15 pushed regs × 8 bytes from the GPR base).
         "leaq 120(%%r14), %%rdi\n\t"
@@ -885,6 +890,10 @@ static void ReschedIpiHandler(void)
 
         "cld\n\t"
         "call ReschedIpiHandlerInner\n\t"
+
+        "movq %%r14, %%rdi\n\t"
+        "movq %%r15, %%rsi\n\t"
+        "call IrqSignalProbe\n\t"
 
         BROOK_FPU_RESTORE_IRQ
 
