@@ -215,7 +215,8 @@ uint64_t* VmmGetPte(PageTable pt, VirtualAddress virtAddr);
 // Extract the MemTag encoded in a mapped page's PTE available bits.
 MemTag VmmGetPageTag(PageTable pt, VirtualAddress virtAddr);
 
-// Extract the PID encoded in a mapped page's PTE available bits.
+// Extract the PID encoded in a mapped page's PTE available bits. Takes the
+// page-table lock; never call from a callback already holding that lock.
 uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr);
 
 // ---------------------------------------------------------------------------

@@ -998,8 +998,8 @@ static void sparseLiveRemap() {
         MappingTransaction operation(&actor,space);CHECK(operation.Prepare(0,2));
         CHECK(operation.PrepareZeroed(MemTag::User,38));
         first=operation.PreparedPage(0);last=operation.PreparedPage(1);operation.Lock();
-        CHECK(operation.Publish(0,VirtualAddress(begin),VMM_USER|VMM_NO_EXEC,MemTag::User,38,false)==VmmMapResult::Mapped);
-        CHECK(operation.Publish(1,VirtualAddress(begin+length-pageSize),VMM_USER|VMM_NO_EXEC,MemTag::User,38,false)==VmmMapResult::Mapped);
+        CHECK(operation.Publish(0,VirtualAddress(begin),VMM_USER|VMM_NO_EXEC,MemTag::User,777,false)==VmmMapResult::Mapped);
+        CHECK(operation.Publish(1,VirtualAddress(begin+length-pageSize),VMM_USER|VMM_NO_EXEC,MemTag::User,1023,false)==VmmMapResult::Mapped);
     }
     request.range=rangeRecord(0,pageSize,nullptr);request.hint=target;request.length=pageSize;
     request.preparedPages=1;request.prepare=prepareMappingPages;
@@ -1016,6 +1016,8 @@ static void sparseLiveRemap() {
     CHECK(VmmLeafPhysical(VmmReadLeaf(space->pageTable,VirtualAddress(target)))==first);
     CHECK(VmmLeafPhysical(VmmReadLeaf(space->pageTable,VirtualAddress(target+length-pageSize)))==last);
     CHECK(VmmReadLeaf(space->pageTable,VirtualAddress(target))&PTE_HIDDEN_BIT);
+    CHECK(((VmmReadLeaf(space->pageTable,VirtualAddress(target))&PTE_PID_MASK)>>PTE_PID_SHIFT)==777);
+    CHECK(((VmmReadLeaf(space->pageTable,VirtualAddress(target+length-pageSize))&PTE_PID_MASK)>>PTE_PID_SHIFT)==1023);
     CHECK(PmmGetRefCount(first)==1&&maps(first)==1&&PmmGetRefCount(last)==1&&maps(last)==1);
     CHECK(!PmmGetRefCount(displaced)&&!maps(displaced));
     AddressSpaceUnref(space);CHECK(ProcessCleanupStep());

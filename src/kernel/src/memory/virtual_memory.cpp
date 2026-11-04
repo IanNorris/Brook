@@ -667,7 +667,7 @@ bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddre
     IrqSpinLockRelease(&g_userPtLock,irq);return changed;
 }
 
-using LeafUpdate = uint64_t (*)(VirtualAddress,uint64_t,void*);
+using LeafUpdate = uint64_t (*)(VirtualAddress,VmmOwnedLeaf,void*);
 static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                            uint64_t begin, uint64_t end, bool detach,
                            VmmRetireLeaf retire, void* context, uint64_t& count,
@@ -690,13 +690,13 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
             if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update)) return false;
         } else {
             ++count;
+            const VmmOwnedLeaf captured{leaf,static_cast<uint16_t>((leaf&PTE_PID_MASK)>>PTE_PID_SHIFT)};
             if (detach) {
-                const VmmOwnedLeaf captured{leaf,static_cast<uint16_t>((leaf&PTE_PID_MASK)>>PTE_PID_SHIFT)};
                 retire(VirtualAddress(address),captured,context);
                 if (leaf & VMM_USER) PmmMapDec(VmmLeafPhysical(leaf));
                 table[i] = 0; Invlpg(VirtualAddress(address));
             } else if (update) {
-                const uint64_t updated=update(VirtualAddress(address),leaf,context);
+                const uint64_t updated=update(VirtualAddress(address),captured,context);
                 if (updated!=leaf) { table[i]=updated;Invlpg(VirtualAddress(address)); }
             }
         }
@@ -719,15 +719,21 @@ bool VmmPrepareRange(PageTable pt, uint64_t begin, uint64_t end) {
     IrqSpinLockRelease(&g_userPtLock,irq); return result;
 }
 struct MoveLeaves { PageTable table;uint64_t source,destination;bool prepare,occupied,move,failed; };
-static uint64_t MoveLeaf(VirtualAddress address,uint64_t leaf,void* opaque) {
+static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque) {
+    const auto leaf=owned.raw;
     auto& context=*static_cast<MoveLeaves*>(opaque);
     if (context.failed) return leaf;
+    // Extended-owner transfers need destination metadata preflight. Until
+    // that exists, reject during the non-mutating pass rather than truncate.
+    if (owned.owner>=PTE_PID_CAPACITY) {context.failed=true;return leaf;}
     const VirtualAddress destination(context.destination+address.raw()-context.source);
     bool large=false;auto* target=WalkToPtr(context.table,destination,false,0,&large);
     if (!large && !target && context.prepare) target=WalkToPtr(context.table,destination,true,0);
     if (large || !target || (!context.occupied && VmmLeafBacked(*target))) { context.failed=true;return leaf; }
     if (!context.move) return leaf;
-    *target=leaf;
+    // Owner is a separate part of the transfer even while the current format
+    // keeps it inline. Future extended owners must be installed here too.
+    *target=(leaf&~PTE_PID_MASK)|(uint64_t(owned.owner)<<PTE_PID_SHIFT);
     if (leaf & VMM_USER) {
         auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(context.table.pml4).raw());
         const uint64_t indices[]={Pml4Index(destination.raw()),PdptIndex(destination.raw()),PdIndex(destination.raw())};
@@ -864,10 +870,10 @@ bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* c
     return result;
 }
 struct CollectAddresses { uint64_t* addresses; uint64_t count; };
-static uint64_t CollectAddress(VirtualAddress address, uint64_t leaf, void* opaque) {
+static uint64_t CollectAddress(VirtualAddress address, VmmOwnedLeaf leaf, void* opaque) {
     auto& collected = *static_cast<CollectAddresses*>(opaque);
     collected.addresses[collected.count++] = address.raw();
-    return leaf;
+    return leaf.raw;
 }
 bool VmmCollectRangeAddresses(PageTable pt, uint64_t begin, uint64_t end,
                               uint64_t* addresses, uint64_t capacity, uint64_t* count) {
@@ -903,7 +909,8 @@ bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacit
     return result;
 }
 struct ProtectLeaves { uint32_t protection; VmmPrivateLeafQuery query; void* context; };
-static uint64_t ProtectLeaf(VirtualAddress address, uint64_t leaf, void* opaque) {
+static uint64_t ProtectLeaf(VirtualAddress address, VmmOwnedLeaf owned, void* opaque) {
+    const auto leaf=owned.raw;
     auto& update = *static_cast<ProtectLeaves*>(opaque);
     if (!update.protection) return (leaf & ~VMM_PRESENT) | PTE_HIDDEN_BIT;
     uint64_t result = (leaf & ~(PTE_HIDDEN_BIT | VMM_WRITABLE | VMM_NO_EXEC | PTE_COW_BIT)) | VMM_PRESENT;
@@ -1171,9 +1178,9 @@ MemTag VmmGetPageTag(PageTable pt, VirtualAddress virtAddr)
 
 uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr)
 {
-    uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    if (!pte || !(*pte & VMM_PRESENT)) return KernelPid;
-    return static_cast<uint16_t>((*pte & PTE_PID_MASK) >> PTE_PID_SHIFT);
+    const auto leaf=VmmReadLeaf(pt,virtAddr);
+    if (!(leaf & VMM_PRESENT)) return KernelPid;
+    return static_cast<uint16_t>((leaf & PTE_PID_MASK) >> PTE_PID_SHIFT);
 }
 
 // BRO-176 diag: dump a physical page's ref/unref history ring (physical_memory.cpp).
