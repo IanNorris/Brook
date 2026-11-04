@@ -8,13 +8,15 @@ namespace brook {
 // provided here and preparation alone never publishes a GPU address.
 struct BdwOwnedPage {uint64_t dma=0;uint8_t* cpu=nullptr;};
 // Caller must serialize all operations; intermediate states reject reentrant callbacks.
-enum class BdwOneShotState : uint8_t {Fresh,Preparing,Prepared,Executing,CompleteRetained,Quarantined,Released};
+enum class BdwOneShotState : uint8_t {Fresh,Preparing,Prepared,Executing,CompleteRetained,Polling,ContextCompleteRetained,Quarantined,Released};
+enum class BdwCsbPoll : uint8_t {Pending,Complete,Fault};
 class BdwBcsOneShot {
     enum : unsigned {Ctx0,Ctx1,Ring0,Ring1,Ring2,Ring3,Hws,Completion,Batch,Source,Destination,
         Pml4,Pdpt,Pd,Pt,ScratchData,ScratchPt,ScratchPd,ScratchPdpt,Count};
     BdwOwnedPage pages_[Count]{};unsigned allocated_=0;
     BdwOneShotState state_=BdwOneShotState::Fresh;const void* owner_=nullptr;
     BdwGgttLease lease_{};BdwGgttBind bind_{};uint64_t descriptor_=0;uint32_t nonce_=0;bool attempted_=false;
+    uint8_t csbHead_=5;bool csbActivated_=false;
     template<class Io> void ReleasePages(Io& io){while(allocated_)io.free(pages_[--allocated_]);}
     static void Zero(BdwOwnedPage& p){for(unsigned i=0;i<4096;++i)p.cpu[i]=0;}
     static void Store32(BdwOwnedPage& p,unsigned offset,uint32_t v){for(unsigned i=0;i<4;++i)p.cpu[offset+i]=uint8_t(v>>(8*i));}
@@ -106,6 +108,43 @@ public:
         // A breadcrumb precedes arbitration re-enable and context save. No
         // retirement proof exists yet: retain all mappings even on success.
         state_=BdwOneShotState::CompleteRetained;return true;
+    }
+    // One exclusive descriptor from an initially idle six-slot CSB. The
+    // backend must have synchronized the hardware/software cursors at five,
+    // retain ownership, and provide ordered device-to-CPU reads and pointer
+    // acknowledgements. A poison record is left pending for a later retry;
+    // callers must impose their own deadline. Even successful context switch
+    // completion does not release the HWS, GGTT bindings or pages.
+    template<class Io> BdwCsbPoll PollContextSwitch(Io& io) {
+        if(owner_!=static_cast<const void*>(&io))return BdwCsbPoll::Fault;
+        if(state_==BdwOneShotState::ContextCompleteRetained)return BdwCsbPoll::Complete;
+        if(state_!=BdwOneShotState::CompleteRetained)return BdwCsbPoll::Fault;
+        state_=BdwOneShotState::Polling;
+        uint32_t tail=0;
+        if(!io.csbReadTail(pages_[Hws],tail) || tail>=6){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+        while(csbHead_!=tail) {
+            const uint8_t next=(csbHead_+1)%6;uint64_t event=0;
+            if(!io.csbReadEntry(pages_[Hws],next,event)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+            if(event==~uint64_t{0}){state_=BdwOneShotState::CompleteRetained;return BdwCsbPoll::Pending;}
+            bool terminal=false;
+            if(!csbActivated_) {
+                // Idle-to-active makes every other bit, including ID, invalid.
+                if(!(event&1)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+                csbActivated_=true;
+            } else {
+                // Bits 11..15 only have meaning for other switch reasons.
+                if((uint32_t(event)&0xffff07ffu)!=0x18 || uint32_t(event>>32)!=uint32_t(descriptor_>>32) || next!=tail) {
+                    state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;
+                }
+                terminal=true;
+            }
+            if(!io.csbAcknowledge(next)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+            csbHead_=next;
+            if(terminal) {
+                state_=BdwOneShotState::ContextCompleteRetained;return BdwCsbPoll::Complete;
+            }
+        }
+        state_=BdwOneShotState::CompleteRetained;return BdwCsbPoll::Pending;
     }
 };
 }

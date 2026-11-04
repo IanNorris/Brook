@@ -8,6 +8,7 @@ using namespace brook;
 struct Fake {
     std::vector<BdwOwnedPage> live;uint64_t slots[8]{};uint32_t elsp[4]{};
     unsigned allocations=0,frees=0,engineWrites=0,portWrites=0,ggttWrites=0,invalidates=0,failAlloc=0,failPort=0;
+    unsigned csbAcks=0,csbAckSlots[6]{};bool csbFailAck=false,csbFailTail=false,csbFailEntry=false;
     bool handoff=true,execlist=true,modeReadable=true,modeStable=true,ringRunning=true,csbReady=true;
     bool admitted=true,pat=true,published=false,failHws=false,complete=true,idle=true,corruptSource=false;
     BdwBcsOneShot* reentrant=nullptr;unsigned aliasAt=0,aliasKind=0;
@@ -54,6 +55,12 @@ struct Fake {
             std::memcpy(translate(pml4,dst+row*(read32(batch,1)&0xffff),true),translate(pml4,src+row*read32(batch,7),false),width);
         auto* done=ggtt(read32(ring,9)&~7u);uint32_t written=read32(ring,11);assert(written==nonce);std::memcpy(done,&written,4);return true;}
     bool cpuVisible(BdwOwnedPage*,unsigned n){return n==19;}
+    bool csbReadTail(BdwOwnedPage& hws,uint32_t& tail){if(reentrant)assert(reentrant->PollContextSwitch(*this)==BdwCsbPoll::Fault);
+        tail=read32(hws.cpu,0x7c/4);return !csbFailTail;}
+    bool csbReadEntry(BdwOwnedPage& hws,unsigned i,uint64_t& event){event=read64(hws.cpu,0x40/8+i);return !csbFailEntry;}
+    bool csbAcknowledge(unsigned slot){assert(csbAcks<6);csbAckSlots[csbAcks++]=slot;return !csbFailAck;}
+    void event(unsigned index,uint64_t value){assert(index<6 && live.size()==19);std::memcpy(live[6].cpu+0x40+8*index,&value,8);}
+    void tail(uint32_t value){assert(live.size()==19);std::memcpy(live[6].cpu+0x7c,&value,4);}
 };
 int main(){
     uint32_t staging[2048]{};
@@ -91,5 +98,23 @@ int main(){
         assert(!x.Execute(f) && x.State()==BdwOneShotState::Quarantined && f.live.size()==19);}
     {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));assert(x.Execute(f));
         assert(x.State()==BdwOneShotState::CompleteRetained && f.live.size()==19 && !x.ReleasePrepared(f));
+        f.reentrant=&x;assert(x.PollContextSwitch(f)==BdwCsbPoll::Pending && !f.csbAcks);
+        f.tail(0);assert(x.PollContextSwitch(f)==BdwCsbPoll::Pending && !f.csbAcks); // slot still poison
+        f.event(0,0xdeadbeef00008001ull);assert(x.PollContextSwitch(f)==BdwCsbPoll::Pending && f.csbAcks==1);
+        f.event(1,0x000000010000f818ull);f.tail(1);assert(x.PollContextSwitch(f)==BdwCsbPoll::Complete && f.csbAcks==2);
+        assert(f.csbAckSlots[0]==0 && f.csbAckSlots[1]==1 && x.PollContextSwitch(f)==BdwCsbPoll::Complete && f.csbAcks==2);
+        assert(x.State()==BdwOneShotState::ContextCompleteRetained && f.live.size()==19 && !x.ReleasePrepared(f));
         f.fromDma(f.slots[6])[0]=0x5a;f.fromDma(f.slots[1])[0]=0x6b;}
+    {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging) && x.Execute(f));
+        f.event(0,1);f.event(1,0x0000000100000018ull);f.tail(1);
+        assert(x.PollContextSwitch(f)==BdwCsbPoll::Complete && f.csbAcks==2 && f.live.size()==19);}
+    for(unsigned failure=0;failure<9;++failure){Fake f;BdwBcsOneShot x;
+        assert(x.Prepare(f,65536,99,0x1234,staging) && x.Execute(f));
+        if(failure==0)f.tail(6);
+        else {f.event(0,1);f.event(1,failure==1?0x0000000200000018ull:failure==2?0x000000010000000aull:
+             failure==7?0x0000000100000218ull:failure==8?0x0000000100010018ull:0x0000000100000018ull);f.tail(failure==6?2:1);}
+        if(failure==3)f.csbFailAck=true;
+        if(failure==4)f.csbFailTail=true;
+        if(failure==5)f.csbFailEntry=true;
+        assert(x.PollContextSwitch(f)==BdwCsbPoll::Fault && x.State()==BdwOneShotState::Quarantined && f.live.size()==19);}
 }

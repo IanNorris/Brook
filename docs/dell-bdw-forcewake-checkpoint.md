@@ -147,6 +147,17 @@ This is a bounded boot diagnostic with interrupts disabled during writeback;
 it does not establish GPU DMA mapping, device visibility or ownership and is
 not a runtime rendering path.
 
+The one-shot owner can now consume a bounded, single-descriptor CSB sequence
+after its copy breadcrumb: an idle-to-active record followed by a matching
+complete-to-idle record. It retains the cursor across polls, waits on a poison
+slot, quarantines bad records and failed reads/acknowledgements, and keeps all
+pages and GGTT mappings retained even after context completion. Host fixtures
+cover delayed and coalesced events, conditional status bits, invalid IDs and
+reasons, reentrancy and exact acknowledgement order. This uses a simulated
+backend: real device-to-CPU visibility, status-pointer MMIO ordering, deadlines,
+engine ownership and safe retirement are still unimplemented. Context completion
+is not proof that the HWS or any GPU-visible allocation can be freed.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).
