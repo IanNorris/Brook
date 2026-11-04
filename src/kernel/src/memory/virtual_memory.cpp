@@ -243,6 +243,18 @@ static uint64_t* WalkToPtr(PageTable pageTable, VirtualAddress virtAddr,
     return &pt[PtIndex(va)];
 }
 
+// Called while the appropriate page-table lock is held. Keeping the leaf
+// pointer in this interface lets an extended owner be associated with its L1
+// frame and slot; raw-only callers must not reconstruct extended owners.
+static VmmOwnedLeaf CaptureOwnedLeaf(const uint64_t* entry,uint64_t raw) {
+    (void)entry;
+    return {raw,static_cast<uint16_t>((raw&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+}
+static uint64_t WithInlineOwner(uint64_t raw,uint16_t owner) {
+    if(owner>=PTE_PID_CAPACITY)__builtin_trap();
+    return (raw&~PTE_PID_MASK)|(uint64_t(owner)<<PTE_PID_SHIFT);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -396,12 +408,11 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
     if (VmmLeafBacked(oldPte) && (oldPte & VMM_USER))
         PmmMapDec(PhysicalAddress(oldPte & PHYS_MASK));
 
-    *pte = (physAddr.raw() & PHYS_MASK)
+    *pte = WithInlineOwner((physAddr.raw() & PHYS_MASK)
          | VMM_PRESENT
          | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC | PTE_HIDDEN_BIT))
          | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
-         | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
-         | (flags & VMM_NO_EXEC);
+         | (flags & VMM_NO_EXEC),pid);
     Invlpg(virtAddr);
 
     // A new present USER PTE now maps this frame — count it.
@@ -438,11 +449,10 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
     VmmMapResult result;
     if (!pte) result = VmmMapResult::OutOfMemory;
     else {
-        *pte = (physAddr.raw() & PHYS_MASK) | (accessible ? VMM_PRESENT : PTE_HIDDEN_BIT)
+        *pte = WithInlineOwner((physAddr.raw() & PHYS_MASK) | (accessible ? VMM_PRESENT : PTE_HIDDEN_BIT)
              | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_PID_MASK | VMM_NO_EXEC | PTE_HIDDEN_BIT))
              | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
-             | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
-             | (flags & VMM_NO_EXEC);
+             | (flags & VMM_NO_EXEC),pid);
         if (flags & VMM_USER) {
             PmmMapInc(physAddr);
             // All three intermediate tables now exist. Promote only after a
@@ -462,14 +472,15 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 }
 
 PhysicalAddress VmmLeafPhysical(uint64_t leaf) { return PhysicalAddress(leaf & PHYS_MASK); }
-uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {
+VmmOwnedLeaf VmmReadOwnedLeaf(PageTable pt, VirtualAddress address) {
     IrqSpinLock& lock = PageTableLock(pt,address);
     uint64_t irq = IrqSpinLockAcquire(&lock);
     bool large = false;
     auto* entry = WalkToPtr(pt,address,false,0,&large);
-    uint64_t leaf = !large && entry ? *entry : 0;
+    auto leaf = !large && entry ? CaptureOwnedLeaf(entry,*entry) : VmmOwnedLeaf{};
     IrqSpinLockRelease(&lock,irq); return leaf;
 }
+uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {return VmmReadOwnedLeaf(pt,address).raw;}
 
 struct AuditedAliasTables {
     bool readEntry(uint64_t page,uint16_t index,uint64_t& value) {
@@ -690,7 +701,7 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
             if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update)) return false;
         } else {
             ++count;
-            const VmmOwnedLeaf captured{leaf,static_cast<uint16_t>((leaf&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+            const auto captured=CaptureOwnedLeaf(&table[i],leaf);
             if (detach) {
                 retire(VirtualAddress(address),captured,context);
                 if (leaf & VMM_USER) PmmMapDec(VmmLeafPhysical(leaf));
@@ -733,7 +744,7 @@ static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque)
     if (!context.move) return leaf;
     // Owner is a separate part of the transfer even while the current format
     // keeps it inline. Future extended owners must be installed here too.
-    *target=(leaf&~PTE_PID_MASK)|(uint64_t(owned.owner)<<PTE_PID_SHIFT);
+    *target=WithInlineOwner(leaf,owned.owner);
     if (leaf & VMM_USER) {
         auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(context.table.pml4).raw());
         const uint64_t indices[]={Pml4Index(destination.raw()),PdptIndex(destination.raw()),PdIndex(destination.raw())};
@@ -942,14 +953,15 @@ VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr)
     IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    uint64_t old = pte && VmmLeafBacked(*pte) ? *pte : 0;
+    const auto captured=pte && VmmLeafBacked(*pte)?CaptureOwnedLeaf(pte,*pte):VmmOwnedLeaf{};
+    const auto old=captured.raw;
     if (old) {
         if (old & VMM_USER) PmmMapDec(VmmLeafPhysical(old));
         *pte = 0;
         Invlpg(virtAddr);
     }
     IrqSpinLockRelease(&lock, saved);
-    return {old,static_cast<uint16_t>((old&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+    return captured;
 }
 
 VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected)
@@ -957,14 +969,15 @@ VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, 
     IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    uint64_t old = pte && VmmLeafBacked(*pte) && VmmLeafPhysical(*pte) == expected ? *pte : 0;
+    const auto captured=pte && VmmLeafBacked(*pte) && VmmLeafPhysical(*pte)==expected?CaptureOwnedLeaf(pte,*pte):VmmOwnedLeaf{};
+    const auto old=captured.raw;
     if (old) {
         if (old & VMM_USER) PmmMapDec(expected);
         *pte = 0;
         Invlpg(virtAddr);
     }
     IrqSpinLockRelease(&lock, saved);
-    return {old,static_cast<uint16_t>((old&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+    return captured;
 }
 
 uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr) { return VmmDetachOwnedPage(pt,virtAddr).raw; }
@@ -1178,9 +1191,8 @@ MemTag VmmGetPageTag(PageTable pt, VirtualAddress virtAddr)
 
 uint16_t VmmGetPagePid(PageTable pt, VirtualAddress virtAddr)
 {
-    const auto leaf=VmmReadLeaf(pt,virtAddr);
-    if (!(leaf & VMM_PRESENT)) return KernelPid;
-    return static_cast<uint16_t>((leaf & PTE_PID_MASK) >> PTE_PID_SHIFT);
+    const auto leaf=VmmReadOwnedLeaf(pt,virtAddr);
+    return leaf.raw & VMM_PRESENT ? leaf.owner : KernelPid;
 }
 
 // BRO-176 diag: dump a physical page's ref/unref history ring (physical_memory.cpp).
@@ -1278,8 +1290,7 @@ VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint
         uint64_t newPte = (newPhys.raw() & PHYS_MASK)
                         | ((*pte) & ~(PHYS_MASK | PTE_COW_BIT))
                         | VMM_WRITABLE;
-        newPte = (newPte & ~PTE_PID_MASK)
-               | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT);
+        newPte = WithInlineOwner(newPte,pid);
         *pte = newPte;
 
         // BRO-176 map accounting: this PTE was repointed from the shared frame

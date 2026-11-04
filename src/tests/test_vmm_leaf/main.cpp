@@ -247,10 +247,12 @@ static void ownedSingleRetirement() {
     auto pt=table();auto page=PmmAllocPage(),other=PmmAllocPage();CHECK(page && other);
     CHECK(VmmTryMapPage(pt,va,page,flags,MemTag::User,1001,false)==VmmMapResult::Mapped);
     const auto raw=VmmReadLeaf(pt,va);CHECK(raw&PTE_HIDDEN_BIT);
+    const auto snapshot=VmmReadOwnedLeaf(pt,va);CHECK(snapshot.raw==raw && snapshot.owner==1001);
     auto mismatch=VmmDetachOwnedPageIfMatches(pt,va,other);
     CHECK(!mismatch.raw && !mismatch.owner && VmmReadLeaf(pt,va)==raw && maps(page)==1);
     auto saved=VmmDetachOwnedPageIfMatches(pt,va,page);
     CHECK(saved.raw==raw && saved.owner==1001 && !VmmReadLeaf(pt,va) && maps(page)==0);
+    CHECK(!VmmReadOwnedLeaf(pt,va).raw && !VmmReadOwnedLeaf(pt,va).owner);
     CHECK(VmmTryMapPage(pt,va,page,flags,MemTag::User,saved.owner,false)==VmmMapResult::Mapped);
     saved=VmmDetachOwnedPage(pt,va);CHECK(saved.raw==raw && saved.owner==1001 && maps(page)==0);
     PmmUnrefPage(page);PmmFreePage(other);VmmDestroyUserPageTable(pt);empty();

@@ -128,6 +128,8 @@ uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalA
 VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr);
 VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
+// Atomic raw/owner snapshot, including hidden leaves. Does not pin the frame.
+VmmOwnedLeaf VmmReadOwnedLeaf(PageTable pt, VirtualAddress address);
 uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snapshot, including hidden leaves
 // Diagnostic only: two kernel-root aliases of one aligned physical page.
 // Does not inspect MTRRs, other address spaces/aliases or access device bytes.

@@ -40,8 +40,9 @@ full owner as part of the transaction; copying the raw PTE alone is insufficient
 The range-detach callback and single-page detach API carry a typed
 raw-leaf/owner snapshot, and file invalidation saves the captured owner for
 restoration. Range move and protection walkers also carry the typed snapshot;
-move preflight rejects owners that cannot yet be encoded inline. Owners are
-still read from the existing inline bits. A standalone
+move preflight rejects owners that cannot yet be encoded inline. The locked
+VMM capture helper now receives the leaf-table slot as well as its raw value;
+owners are still read from the existing inline bits. A standalone
 sidecar directory now supports per-table storage, but the live VMM does not yet
 use it. The mapping transaction's optional snapshot is an observation, not an
 additional frame reference.
