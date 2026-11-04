@@ -158,6 +158,16 @@ backend: real device-to-CPU visibility, status-pointer MMIO ordering, deadlines,
 engine ownership and safe retirement are still unimplemented. Context completion
 is not proof that the HWS or any GPU-visible allocation can be freed.
 
+The status consumer's host fixture now uses the actual x86 HWS read primitive:
+one aligned producer DWORD load, an LFENCE, and one aligned QWORD per status
+record. Guarded-page tests cover all six slots and reject invalid inputs. The
+caller must pin the CPU and exact page, exclude CPU writers, and establish
+device-to-CPU visibility before sampling; an LFENCE alone cannot make
+noncoherent DMA visible. No physical backend or register acknowledgement is
+implemented by these reads. Only the producer DWORD's low byte is interpreted;
+invalid low-byte values are rejected by the consumer, while reserved upper
+bytes are ignored.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).

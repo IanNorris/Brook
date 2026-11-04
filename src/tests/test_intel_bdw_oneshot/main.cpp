@@ -1,4 +1,5 @@
 #include "intel_bdw_oneshot.h"
+#include "intel_bdw_csb.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstdint>
@@ -56,8 +57,8 @@ struct Fake {
         auto* done=ggtt(read32(ring,9)&~7u);uint32_t written=read32(ring,11);assert(written==nonce);std::memcpy(done,&written,4);return true;}
     bool cpuVisible(BdwOwnedPage*,unsigned n){return n==19;}
     bool csbReadTail(BdwOwnedPage& hws,uint32_t& tail){if(reentrant)assert(reentrant->PollContextSwitch(*this)==BdwCsbPoll::Fault);
-        tail=read32(hws.cpu,0x7c/4);return !csbFailTail;}
-    bool csbReadEntry(BdwOwnedPage& hws,unsigned i,uint64_t& event){event=read64(hws.cpu,0x40/8+i);return !csbFailEntry;}
+        return !csbFailTail && BdwCsbReadProducer(hws.cpu,tail);}
+    bool csbReadEntry(BdwOwnedPage& hws,unsigned i,uint64_t& event){return !csbFailEntry && BdwCsbReadRecord(hws.cpu,i,event);}
     bool csbAcknowledge(unsigned slot){assert(csbAcks<6);csbAckSlots[csbAcks++]=slot;return !csbFailAck;}
     void event(unsigned index,uint64_t value){assert(index<6 && live.size()==19);std::memcpy(live[6].cpu+0x40+8*index,&value,8);}
     void tail(uint32_t value){assert(live.size()==19);std::memcpy(live[6].cpu+0x7c,&value,4);}
@@ -108,9 +109,9 @@ int main(){
     {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging) && x.Execute(f));
         f.event(0,1);f.event(1,0x0000000100000018ull);f.tail(1);
         assert(x.PollContextSwitch(f)==BdwCsbPoll::Complete && f.csbAcks==2 && f.live.size()==19);}
-    for(unsigned failure=0;failure<9;++failure){Fake f;BdwBcsOneShot x;
+    for(unsigned failure=0;failure<11;++failure){Fake f;BdwBcsOneShot x;
         assert(x.Prepare(f,65536,99,0x1234,staging) && x.Execute(f));
-        if(failure==0)f.tail(6);
+        if(failure==0 || failure==9 || failure==10)f.tail(failure==0?6:failure==9?7:0x81);
         else {f.event(0,1);f.event(1,failure==1?0x0000000200000018ull:failure==2?0x000000010000000aull:
              failure==7?0x0000000100000218ull:failure==8?0x0000000100010018ull:0x0000000100000018ull);f.tail(failure==6?2:1);}
         if(failure==3)f.csbFailAck=true;
