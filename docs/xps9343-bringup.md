@@ -1532,6 +1532,14 @@ the Dell geometry, one-shot behavior and failures including second-page RAM
 overlap, unavailable PCI reads and changed BARs. This diagnostic is not a
 GGTT allocator or evidence that a mapping is unused.
 
+A host-tested two-entry bind transaction now models save, write, invalidate,
+verify and restore. It requires a backend-validated exclusive lease and pinned
+DMA pages, excludes the CPU-visible aperture and GPU RMRR, and quarantines
+resources on uncertain restoration or lost ownership. A successful backend
+invalidation must drain earlier posted writes as well as invalidate translations.
+There is no production backend or firmware-to-driver GGTT ownership handoff
+yet; this code has not written a PTE on the Dell.
+
 The exact candidate refused the Dell-only probe in private QEMU, then booted
 on the Dell after a clean restart with the previous slot retained. The probe
 passed its D0, boot-map and cache gates and read raw endpoint entries
