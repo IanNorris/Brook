@@ -151,7 +151,7 @@ Known gaps and remaining gates:
 - Finish Steam dialogs/navigation, input-alignment and a small-download
   acceptance run through the rootless path. Initial authenticated Store,
   Library, Friends and independent movement are verified.
-- Exercise replacement-server startup after the verified native Xwayland retirement.
+- Validate replacement-server behavior under real Steam load and on the Dell.
 - Transient identities currently affect initial placement; later parent motion,
   minimize and stacking need broader policy/acceptance. Existing native popup
   raising also groups by provider, which can include unrelated Wayland clients.
@@ -163,6 +163,16 @@ Known gaps and remaining gates:
   from untrusted X properties to bypass this limitation.
 - Steam authenticated evidence, profiles and downloaded software remain private.
   The previous SDL3 host crash review disks are preserved independently.
+
+The compositor now retries an owned Xwayland generation after server or worker
+loss, with capped exponential backoff. It waits for both retired children to
+be reaped, escalating a stuck child after a grace period, and avoids spawning
+during shutdown. The host fixture covers a stopped worker and preservation of
+an unrelated native surface. In a private software-rendered VM, terminating
+the real server and then the replacement worker each produced a new generation;
+a fresh xeyes window opened after each. That VM run preceded the final bounded
+shutdown-cleanup adjustment, which has host-test coverage. Existing X clients
+disconnected as expected. This is not a Steam-load or Dell stability result.
 
 ## Xwayland interval-timer lead
 

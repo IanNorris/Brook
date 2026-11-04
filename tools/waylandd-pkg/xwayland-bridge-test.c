@@ -87,7 +87,11 @@ static struct bxwm_message command_from_peer(int fd,struct bxwm_stream *stream,u
     struct bxwm_message message;assert(bxwm_receive(fd,stream,&message)==1);
     assert(message.type==type && bxwm_valid(&message,g_xwayland_generation,0));return message;
 }
-int main(void) {
+int main(int argc,char **argv) {
+    (void)argv;
+    // This executable also serves as a long-lived fake server and helper for
+    // the restart test. Parent termination uses the normal SIGTERM action.
+    if(argc>1)for(;;)pause();
     g_display=wl_display_create();assert(g_display && xwayland_shell_init(g_display));
     int peer,wayland_peer,other_peer;int control[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,control));
     g_xwm_fd=control[0];peer=control[1];struct bxwm_stream rx={0};
@@ -189,6 +193,34 @@ int main(void) {
     assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0 && destroyed==4);
     assert(g_surfaces==unrelated && unrelated->wm_id==native_id);
     assert(native[native_id].incarnation==native_incarnation && surface_repaint(unrelated));
+    // Exercise real fork/exec retirement and replacement while the unrelated
+    // native surface remains mapped. No replacement while either child lives.
+    xwayland_restart_configure("/proc/self/exe","/proc/self/exe",":0");
+    assert(xwayland_start(g_xrestart_server,g_xrestart_helper,g_xrestart_display));
+    assert(g_xwayland_pid>0 && g_xwm_pid>0 && g_xwayland_client);
+    uint64_t old_generation=g_xwayland_generation;
+    // A stopped child cannot act on SIGTERM; it must not pin recovery forever.
+    assert(!kill(g_xwm_pid,SIGSTOP));int stopped=0;
+    assert(waitpid(g_xwm_pid,&stopped,WUNTRACED)==g_xwm_pid && WIFSTOPPED(stopped));
+    xwayland_generation_lost();assert(g_xrestart_pending);
+    g_xrestart_at=g_now_ms();
+    xwayland_pump();assert(g_xwayland_generation==old_generation && g_xwm_pid>0);
+    g_xretire_started=g_now_ms()-3000;g_shutdown=1;
+    for(unsigned tries=0;tries<300 && (g_xwayland_pid || g_xwm_pid);++tries) {
+        xwayland_pump();usleep(10000);
+    }
+    assert(!g_xwayland_pid && !g_xwm_pid && g_xwayland_generation==old_generation);
+    g_shutdown=0;
+    for(unsigned tries=0;tries<300 && g_xwayland_generation==old_generation;++tries) {
+        xwayland_pump();usleep(10000);
+    }
+    assert(g_xwayland_generation==old_generation+1 && g_xwayland_pid>0 && g_xwm_pid>0);
+    assert(unrelated->wm_id==native_id && native[native_id].incarnation==native_incarnation);
+    assert(!kill(g_xwm_pid,SIGSTOP));
+    assert(waitpid(g_xwm_pid,&stopped,WUNTRACED)==g_xwm_pid && WIFSTOPPED(stopped));
+    uint64_t last_generation=g_xwayland_generation;assert(xwayland_shutdown());
+    assert(!g_xwayland_pid && !g_xwm_pid && !g_xrestart_pending);
+    xwayland_pump();assert(g_xwayland_generation==last_generation);
     wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==5);
     wl_display_destroy(g_display);
     puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival and generation reuse");

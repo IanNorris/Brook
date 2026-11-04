@@ -16,9 +16,23 @@ static int g_xwm_fd=-1,g_xwm_failed,g_xwm_retiring,g_xwm_ready;
 static pid_t g_xwayland_pid,g_xwm_pid;
 static uint32_t g_xwm_last_sync;
 static uint32_t g_xwm_started_ms;
+static const char *g_xrestart_server,*g_xrestart_helper,*g_xrestart_display;
+static uint32_t g_xrestart_at,g_xrestart_delay=1000;
+static int g_xrestart_pending;
+static uint32_t g_xretire_started;
+static int g_xretire_active,g_xretire_killed;
 static int g_xdisplay_fd=-1,g_xdisplay_number,g_xdisplay_ready;
 static char g_xdisplay_reply[16];
 static size_t g_xdisplay_received;
+static int xwayland_start(const char *server,const char *helper,const char *display);
+static void xwayland_restart_configure(const char *server,const char *helper,const char *display) {
+    g_xrestart_server=server;g_xrestart_helper=helper;g_xrestart_display=display;
+}
+static void xwayland_schedule_restart(void) {
+    if(!g_xrestart_server || g_xrestart_pending || g_shutdown)return;
+    g_xrestart_pending=1;g_xrestart_at=g_now_ms()+g_xrestart_delay;
+    if(g_xrestart_delay<30000)g_xrestart_delay=g_xrestart_delay>15000?30000:g_xrestart_delay*2;
+}
 
 static struct brook_xwindow *xwayland_window(uint32_t xid,uint64_t identity) {
     for (struct brook_xwindow *w=g_xwindows;w;w=w->next)
@@ -67,8 +81,12 @@ static void xwayland_generation_lost(void) {
     memset(&g_xwm_stream,0,sizeof(g_xwm_stream));
     if (g_xwayland_pid>0) kill(g_xwayland_pid,SIGTERM);
     if (g_xwm_pid>0) kill(g_xwm_pid,SIGTERM);
+    if(g_xwayland_pid>0 || g_xwm_pid>0) {
+        g_xretire_active=1;g_xretire_killed=0;g_xretire_started=g_now_ms();
+    }
     // This callback can also be entered from the client's destroy listener.
     if (g_xwayland_client) wl_client_destroy(g_xwayland_client);
+    xwayland_schedule_restart();
     g_xwm_retiring=0;
 }
 static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindowState *geometry) {
@@ -256,8 +274,42 @@ static void xwayland_reap(pid_t *pid) {
     int status;pid_t done=waitpid(*pid,&status,WNOHANG);
     if (done==*pid || (done<0 && errno==ECHILD)) { *pid=0;if (g_xwm_fd>=0) g_xwm_failed=1; }
 }
+static int xwayland_shutdown(void) {
+    // Final teardown has no subsequent event-loop pump. Prevent a replacement
+    // and stop even a child that is stopped or ignores SIGTERM.
+    g_xrestart_server=NULL;g_xrestart_pending=0;
+    xwayland_generation_lost();
+    // Give healthy children a short opportunity to remove their X sockets.
+    for(unsigned i=0;i<20 && (g_xwayland_pid || g_xwm_pid);++i) {
+        xwayland_reap(&g_xwayland_pid);xwayland_reap(&g_xwm_pid);
+        if(g_xwayland_pid || g_xwm_pid)usleep(10000);
+    }
+    xwayland_reap(&g_xwayland_pid);xwayland_reap(&g_xwm_pid);
+    if(g_xwayland_pid>0)kill(g_xwayland_pid,SIGKILL);
+    if(g_xwm_pid>0)kill(g_xwm_pid,SIGKILL);
+    for(unsigned i=0;i<80 && (g_xwayland_pid || g_xwm_pid);++i) {
+        xwayland_reap(&g_xwayland_pid);xwayland_reap(&g_xwm_pid);
+        if(g_xwayland_pid || g_xwm_pid)usleep(10000);
+    }
+    xwayland_reap(&g_xwayland_pid);xwayland_reap(&g_xwm_pid);
+    if(g_xwayland_pid || g_xwm_pid) {
+        fprintf(stderr,"[waylandd] Xwayland children did not reap before shutdown deadline\n");
+        return 0;
+    }
+    return 1;
+}
 static void xwayland_pump(void) {
     xwayland_reap(&g_xwayland_pid);xwayland_reap(&g_xwm_pid);
+    if(g_xretire_active) {
+        if(!g_xwayland_pid && !g_xwm_pid)g_xretire_active=0;
+        else if(!g_xretire_killed && (uint32_t)(g_now_ms()-g_xretire_started)>=3000) {
+            // Children remain ours until waitpid reaps them. Never signal an
+            // already reaped PID; escalate once, then continue waiting.
+            if(g_xwayland_pid>0)kill(g_xwayland_pid,SIGKILL);
+            if(g_xwm_pid>0)kill(g_xwm_pid,SIGKILL);
+            g_xretire_killed=1;
+        }
+    }
     if (g_xdisplay_fd>=0 && !g_xdisplay_ready) {
         ssize_t n=recv(g_xdisplay_fd,g_xdisplay_reply+g_xdisplay_received,
             sizeof(g_xdisplay_reply)-1-g_xdisplay_received,MSG_DONTWAIT);
@@ -279,6 +331,16 @@ static void xwayland_pump(void) {
         xwayland_generation_lost();g_xwm_failed=0;return;
     }
     uint32_t now=g_now_ms();
+    // Never start a new owner until both old children have been reaped. Keep
+    // native Wayland alive while retrying; do not remove stale X socket files.
+    if(!g_shutdown && g_xrestart_pending && !g_xwayland_pid && !g_xwm_pid && !g_xwayland_client && g_xwm_fd<0 &&
+       (int32_t)(now-g_xrestart_at)>=0) {
+        g_xrestart_pending=0;
+        if(!xwayland_start(g_xrestart_server,g_xrestart_helper,g_xrestart_display))
+            xwayland_schedule_restart();
+    }
+    if(g_xwm_fd>=0 && g_xwm_ready && g_xdisplay_ready && (uint32_t)(now-g_xwm_started_ms)>=30000)
+        g_xrestart_delay=1000;
     if ((uint32_t)(now-g_xwm_last_sync)<50) return;
     g_xwm_last_sync=now;
     for (struct brook_xwindow *w=g_xwindows;w;w=w->next) if (w->surface) xwayland_native_sync(w->surface,0);

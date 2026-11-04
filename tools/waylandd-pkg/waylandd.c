@@ -2852,6 +2852,7 @@ int main(int argc, char **argv)
     g_frame_timer = wl_event_loop_add_timer(loop, frame_clock_tick, NULL);
     if (!g_frame_timer) return 1;
     wl_event_source_timer_update(g_frame_timer, 16);
+    if (xwayland_server) xwayland_restart_configure(xwayland_server,xwm_helper,xdisplay);
     if (xwayland_server && !xwayland_start(xwayland_server,xwm_helper,xdisplay)) {
         fprintf(stderr,"[waylandd] owned Xwayland launch failed; native Wayland remains available\n");
     }
@@ -2887,8 +2888,9 @@ int main(int argc, char **argv)
     }
 done:
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
-    xwayland_generation_lost();
+    int xwayland_stopped=xwayland_shutdown();
     wl_display_destroy(g_display);
+    if (!xwayland_stopped) return 1;
     fprintf(stderr, "[waylandd] PASS\n");
     return 0;
 }
