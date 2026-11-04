@@ -400,3 +400,16 @@ pages separately, so the sizes are consistent with substantial retained
 usage but do not establish the exact allocation. Do not remove these objects
 as a presumed fix: compare successful and abnormal lifecycles, including
 unlink result and identity, on disposable fixtures first.
+
+After the user requested a checked reboot, the SSD desktop mounted and the
+canonical shared-memory mount returned to an empty, nearly 992 MB baseline;
+the tested native64 reaper and its saved i386 original persisted. A new
+512-task Steam job queued Stardew from this clean boot. The game launch still
+exited 1 before a usable window; no task births were denied in the observed
+sample. During a 150-second series of five-second `/dev/shm` samples, available
+space fell to 1,228,800 bytes before recovering and remaining near 41,963,520
+bytes. Thus the reboot removed previously retained objects but did not prevent
+the fresh startup from reaching severe shared-memory pressure. The observation
+does not identify the allocation owner or prove the game's failure has the same
+cause. The desktop's recovery USB was not needed for this clean boot; automatic
+SSD repair remains unimplemented.
