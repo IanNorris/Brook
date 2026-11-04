@@ -198,6 +198,15 @@ this does not establish input correctness, performance or Steam stability.
 Steam A/B and hardware acceptance are still required. This diagnostic does not
 implement `setitimer`.
 
+An initial Steam attempt in that private clone was invalid because it omitted
+the earlier review's validated provider-loader payload. With the current
+kernel, matching modules and the original payload restored, SteamRT progressed
+and launched approximately 90 tasks, but no Steam window appeared. The private
+runtime log reported repeated `Too many open files` errors; no matching kernel
+FD-exhaustion diagnostic was observed, so the source and whether it is an
+actual per-process descriptor limit or a propagated error remain unconfirmed.
+The VM was synced and stopped. This is not a matched Steam A/B result.
+
 The fixture also checks caught and default `SIGALRM` delivery to a child
 spinning without syscalls; these checks pass on Linux. Brook's current caught
 signal delivery occurs at syscall return, so the timer must remain disabled

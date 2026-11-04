@@ -68,7 +68,9 @@ def main():
     verified = review/'staged-driver-verification'
     if temporary.exists() or verified.exists():
         raise RuntimeError('Previous staging evidence exists; inspect it instead of replacing it')
-    subprocess.run(['cp','--reflink=auto','--sparse=always',str(boot),str(temporary)],check=True)
+    # GNU cp rejects --sparse=always with reflink; auto preserves holes when
+    # copying is necessary and keeps a copy-on-write clone when supported.
+    subprocess.run(['cp','--reflink=auto','--sparse=auto',str(boot),str(temporary)],check=True)
     subprocess.run(['mdel','-i',str(temporary),'::/DRIVERS/*.MOD'],check=True)
     subprocess.run(['mcopy','-o','-i',str(temporary),*[str(p) for p in modules],'::/DRIVERS/'],check=True)
     verified.mkdir()
