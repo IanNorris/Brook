@@ -69,8 +69,10 @@ class Hardware:
         if command.startswith(('bridge job ','bridge ui ')) and command.endswith(' '+boot):return command
         return 'bridge guard '+boot+' '+command
 
-    def guest_batch(self,data,commands,timeout=8):
-        replies=exchange(data['host'],data['port'],[self.guarded(data,c) for c in commands],timeout)
+    def guest_batch(self,data,commands,timeout=8,progress=None,on_reply=None):
+        arguments=(data['host'],data['port'],[self.guarded(data,c) for c in commands],timeout)
+        if progress is not None or on_reply is not None:replies=exchange(*arguments,progress=progress,on_reply=on_reply)
+        else:replies=exchange(*arguments)
         for reply in replies:
             if 'boot_error' in reply:raise HardwareBootChanged('Stale guest boot')
         return replies
@@ -105,10 +107,35 @@ class Hardware:
         data=self.load_session(session)
         caps={'qmp':False,'host_desktop':False,'pause':False,'force_stop':False,'registers':False,
               'raw_memory':False,'frame_capture':False,'panic_transport':False,'raw_input':False}
-        result={'session':session,'transport':'guest_tcp','guest_boot_id':data['guest_boot_id'],'capabilities':caps}
+        result={'session':session,'transport':'guest_tcp','guest_boot_id':data['guest_boot_id'],'capabilities':caps,
+                'reachable':None,'identity_matches':None,'probe_stage':'local_lock','completed_frames':0}
+        def progress(stage,frames):
+            result['probe_stage']=stage
+            result['completed_frames']=frames
+        def hardware_reply(index,reply):
+            if 'boot_error' in reply:
+                result['identity_matches']=False
+                return
+            if index!=1:return
+            boot=reply.get('boot_id')
+            try:validate_id(boot)
+            except (ValueError,TypeError):return
+            if boot=='0'*32 or type(reply.get('hardware_api')) is not int or reply['hardware_api']!=1 or reply.get('boot_guard') is not True:return
+            result['identity_matches']=boot==data['guest_boot_id']
         try:
             with self.session_lock(session) as data:
-                hardware,jobs,ui=self.guest_batch(data,['bridge hardware caps','bridge job caps','bridge ui caps'],5)
+                hardware,jobs,ui=self.guest_batch(data,['bridge hardware caps','bridge job caps','bridge ui caps'],5,progress=progress,on_reply=hardware_reply)
+            if result['identity_matches'] is None:
+                result.update(reachable=True,identity_matches=None,probe_stage='invalid_capabilities',
+                              error='Hardware capability response did not establish a boot identity')
+                return result
+            if result['identity_matches'] is False:
+                result.update(reachable=True,identity_matches=False,error='Guest boot identity changed')
+                return result
+            if not isinstance(jobs,dict) or not isinstance(ui,dict) or any('boot_id' in part and part['boot_id']!=data['guest_boot_id'] for part in (jobs,ui)):
+                result.update(reachable=True,probe_stage='invalid_capabilities',
+                              error='Invalid job or UI capability response')
+                return result
             caps.update(ram_application_snapshot=hardware.get('app_snapshot_api')==1,diagnostics=True,logs=hardware.get('logs_api')==1,stats=True,
                 writable_desktop=hardware.get('writable_desktop_api')==1,
                 completed_frame_copy=hardware.get('completed_frame_copy_api')==1,
@@ -119,11 +146,17 @@ class Hardware:
                     if hardware.get('bulk_helper_api')==1 else None),
                 hardware_power=hardware.get('power_api')==1,power=hardware.get('power',{}),
                 command_jobs=jobs.get('job_api')==2,semantic_windows=ui.get('ui_api')==1,semantic_launch=ui.get('launch_api')==1,app_catalog=ui.get('apps_api')==1)
-            result.update(reachable=True,identity_matches=True,guest=hardware,jobs=jobs,ui=ui)
+            result.update(reachable=True,identity_matches=True,guest=hardware,jobs=jobs,ui=ui,probe_stage='verified')
         except HardwareBootChanged as error:
             result.update(reachable=True,identity_matches=False,error=str(error),note='Attach explicitly again to target the new guest boot.')
         except (OSError,RuntimeError,ValueError) as error:
-            result.update(reachable=False,error=str(error),note='TCP failure does not distinguish reboot, panic, link loss or an unreachable host.')
+            stage=result['probe_stage']
+            # A local lock timeout sends nothing. A completed TCP handshake is
+            # evidence of endpoint reachability, not guest or RPC health.
+            reachable=None if stage=='local_lock' else False if stage=='connecting' else True
+            result.update(reachable=reachable,error=str(error),
+                note='A connection or protocol failure does not distinguish reboot, panic, link loss or a guest hang.')
+            if isinstance(error,OSError) and error.errno is not None:result['errno']=error.errno
         return result
 
     def command(self,session,command,**_):

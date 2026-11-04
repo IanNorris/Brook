@@ -389,6 +389,9 @@ void KernelConsoleSpawn()
 static constexpr uint16_t DEBUG_TCP_PORT = 1234;
 static constexpr uint32_t TCP_LINE_LEN   = 160;
 static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch
+// A partial framed command must not monopolize the single debug listener.
+// Legacy passive log viewers and idle framed clients are unaffected.
+static constexpr uint64_t TCP_PARTIAL_FRAME_TIMEOUT_MS = 10000;
 
 static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length)
 {
@@ -462,6 +465,7 @@ static void DebugTcpThread(void* /*arg*/)
         int  cmdLen = 0;
         bool framedClient=false,classifiedClient=false;
         const uint64_t classifyDeadline=ApicTickCount()+50;
+        uint64_t partialDeadline=0;
 
         for (;;)
         {
@@ -472,7 +476,12 @@ static void DebugTcpThread(void* /*arg*/)
                 if (n <= 0) goto client_done; // disconnect or error
                 // Accumulate into cmdBuf, dispatch on newline
                 for (int i = 0; i < n; i++) {
+                    if (framedClient && cmdLen > 0 && partialDeadline && ApicTickCount() >= partialDeadline) {
+                        SerialPuts("DEBUG_TCP: incomplete framed command timed out\n");
+                        goto client_done;
+                    }
                     char c = tmp[i];
+                    if (cmdLen == 0 && c == '@') framedClient = true;
                     if(!classifiedClient && c!='\n' && c!='\r') {
                         classifiedClient=true;framedClient=c=='@';
                     }
@@ -484,11 +493,19 @@ static void DebugTcpThread(void* /*arg*/)
                             DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
                             DebugChannelClearReplySock();
                             cmdLen = 0;
+                            partialDeadline = 0;
                         }
                     } else if (cmdLen < static_cast<int>(sizeof(cmdBuf)) - 1) {
+                        if (framedClient && cmdLen == 0)
+                            partialDeadline = ApicTickCount() + TCP_PARTIAL_FRAME_TIMEOUT_MS;
                         cmdBuf[cmdLen++] = c;
                     }
                 }
+            }
+
+            if (framedClient && cmdLen > 0 && partialDeadline && ApicTickCount() >= partialDeadline) {
+                SerialPuts("DEBUG_TCP: incomplete framed command timed out\n");
+                goto client_done;
             }
 
             // Framed bridge RPCs carry their own replies and read serial logs

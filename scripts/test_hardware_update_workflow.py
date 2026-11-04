@@ -17,7 +17,7 @@ class Bridge:
         self.calls=[];self.tx=None;self.newboot=False;self.activated=False;self.job_polls=0
         self.reset=True;self.stale=False;self.boot_changes=True;self.payload='candidate';self.mismatch=False;self.missing_commit=False
     def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'192.0.2.1','port':1234}
-    def doctor(self,session):return {'reachable':True,'identity_matches':not (self.stale or self.newboot),
+    def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':not (self.stale or self.newboot),
         'capabilities':{'power':{'reset':self.reset}}}
     def guest_run(self,session,ident,argv,**kwargs):
         self.calls.append(('run',session,ident,argv))
@@ -62,6 +62,10 @@ class Tests(unittest.TestCase):
     def test_activation_without_reboot(self):
         result=self.execute();self.assertEqual(result['state'],'activated')
         self.assertFalse(any(call[0]=='power' for call in self.bridge.calls))
+    def test_partial_doctor_result_prevents_mutation(self):
+        with patch.object(self.bridge,'doctor',return_value={'reachable':True,'identity_matches':True,'probe_stage':'frame_complete','error':'connection lost'}):
+            with self.assertRaisesRegex(RuntimeError,'probe is incomplete'):self.execute()
+        self.assertEqual(self.bridge.calls,[])
     def test_system_helper_is_explicit(self):
         result=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
             'original',self.key,self.kernel,self.initrd,True,helper='system')

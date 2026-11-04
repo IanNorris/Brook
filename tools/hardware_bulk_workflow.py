@@ -20,7 +20,7 @@ class BulkRun(UpdateRun):
         with Path(key_file).open() as key_stream:key=identifier(key_stream.read(33))
         data=self.bridge.load_session(session);boot=data['guest_boot_id']
         doctor=self.bridge.doctor(session)
-        if not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot is not reachable/matching')
+        if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot probe is incomplete or not reachable/matching')
         if doctor.get('guest',{}).get('bulk_helper_api')!=1:raise RuntimeError('Guest has no opted-in binary helper; update its image first')
         if action in ('frame','framez') and doctor.get('guest',{}).get('completed_frame_copy_api')!=1:raise RuntimeError('Guest lacks completed-frame copy API')
         if source:

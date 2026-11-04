@@ -9,7 +9,7 @@ from hardware_bulk_protocol import upload
 class Bridge:
     def __init__(self):self.launches=[];self.done=False;self.result={};self.matches=True;self.bulk=1;self.capture=1
     def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'127.0.0.1'}
-    def doctor(self,session):return {'reachable':True,'identity_matches':self.matches,'guest':{'bulk_helper_api':self.bulk,'completed_frame_copy_api':self.capture}}
+    def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':self.matches,'guest':{'bulk_helper_api':self.bulk,'completed_frame_copy_api':self.capture}}
     def guest_run(self,session,request,argv,**kwargs):self.launches.append((request,argv))
     def job(self,session,request,**kwargs):
         assert request==self.launches[0][0]

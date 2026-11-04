@@ -13,7 +13,7 @@ class StoreRun(UpdateRun):
         with Path(key_file).open() as f:key=identifier(f.read(33))
         prepared=prepare_source(image,record,sha256)
         data=self.bridge.load_session(session);boot=identifier(data['guest_boot_id']);doctor=self.bridge.doctor(session)
-        if not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot is not reachable/matching')
+        if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Pinned guest boot probe is incomplete or not reachable/matching')
         tx=uuid.uuid4().hex;self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,image=str(image),record=record.decode('ascii'),sha256=sha256,helper=helper)
         try:

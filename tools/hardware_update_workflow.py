@@ -48,7 +48,7 @@ class UpdateRun:
         if not re.fullmatch(r'[0-9a-f]{32}',key):raise ValueError('Expected provisioned 32-character key without a newline')
         data=self.bridge.load_session(session);boot=data['guest_boot_id']
         doctor=self.bridge.doctor(session)
-        if not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Original guest boot is not reachable/matching')
+        if doctor.get('probe_stage')!='verified' or not doctor.get('reachable') or not doctor.get('identity_matches'):raise RuntimeError('Original guest boot probe is incomplete or not reachable/matching')
         if restart and not doctor.get('capabilities',{}).get('power',{}).get('reset'):raise RuntimeError('Guest does not advertise a supported restart')
         # An existing output directory is never reused, even after lost replies.
         self.output.mkdir(parents=True,exist_ok=False,mode=0o700)

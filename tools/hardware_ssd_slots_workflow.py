@@ -44,7 +44,7 @@ class SlotRun:
             raise ValueError('invalid SSD identity types')
         data = self.bridge.load_session(session)
         doctor = self.bridge.doctor(session)
-        if doctor.get('reachable') is not True or doctor.get('identity_matches') is not True: raise RuntimeError('boot identity unavailable')
+        if doctor.get('probe_stage')!='verified' or doctor.get('reachable') is not True or doctor.get('identity_matches') is not True: raise RuntimeError('complete boot identity probe unavailable')
         state = doctor['guest']['writable_desktop']
         if state.get('ready') is not True or state.get('source_pinned') is not True or state.get('state_uncertain') is not False:
             raise RuntimeError('persistent desktop store is not safely admitted')

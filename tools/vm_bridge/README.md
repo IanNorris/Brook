@@ -733,6 +733,17 @@ A stale-identity response is distinct from TCP unreachability. This development
 protocol assumes a trusted LAN; the boot token prevents stale targeting and is
 not authentication.
 
+`hw_doctor` reports `probe_stage` and `completed_frames` to locate an incomplete
+probe. `reachable` is null if the local session lock could not be acquired,
+false if the TCP connection failed, and true once a connection was established;
+it does not establish that the guest is healthy. `identity_matches` remains null
+until a valid hardware capability response establishes the boot identity, and
+is false for a known mismatch. An OS error number is included when available.
+Neither failed probes nor commands of unknown delivery are automatically replayed.
+The kernel closes a connection that leaves a framed command incomplete for
+10 seconds, so it cannot indefinitely block the single debug listener. This
+does not make the listener concurrent or recover it from a blocked command.
+
 `hw_stats`, `hw_logs`, `hw_apps` and `hw_windows` provide bounded observations.
 Log cursors count completed lines, report dropped retained lines, and exclude
 the current partial line. A line is capped at 160 columns. Pass `next_cursor`

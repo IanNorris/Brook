@@ -15,7 +15,7 @@ IDENTITY = dict(port=3, sectors=500118192, logical_sector_bytes=512, physical_se
 class Bridge:
     def __init__(self): self.calls=[]; self.args={}; self.fail_stage=None; self.stale=False; self.ahci={'ready':True,'quarantined':False,**IDENTITY}
     def load_session(self, session): return {'guest_boot_id':'a'*32}
-    def doctor(self, session): return {'reachable':True,'identity_matches':not self.stale,'guest':{'writable_desktop':{'ready':True,'source_pinned':True,'state_uncertain':False}}}
+    def doctor(self, session): return {'probe_stage':'verified','reachable':True,'identity_matches':not self.stale,'guest':{'writable_desktop':{'ready':True,'source_pinned':True,'state_uncertain':False}}}
     def command(self, session, command): return self.ahci
     def guest_run(self, session, ident, argv, **kwargs):
         self.calls.append(argv); self.args[ident]=argv

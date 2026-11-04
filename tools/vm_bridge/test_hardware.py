@@ -1,4 +1,6 @@
 import json
+import errno
+from contextlib import contextmanager
 from pathlib import Path
 import socket
 import tempfile
@@ -35,10 +37,16 @@ class Endpoint:
                             if self.epoch=='0'*32:self.epoch=command.split()[-1]
                             result={'boot_id':self.epoch}
                         elif command=='bridge hardware caps':
+                            if getattr(self,'drop_before_caps',False):break
+                            if hasattr(self,'partial_caps'):
+                                c.sendall(f'BRIDGE_BEGIN {token}\n{self.partial_caps}'.encode());break
                             result={'hardware_api':1,'boot_guard':True,'logs_api':1,'boot_id':self.epoch,'power_api':1,'power':{'graceful_quiescence':True,'reset':True,'power_off':False}}
                             if hasattr(self,'snapshot'):
                                 result.update(app_snapshot_api=1,app_snapshot=self.snapshot)
-                        elif command=='bridge job caps':result={'job_api':2}
+                            if hasattr(self,'caps_override'):result=self.caps_override
+                        elif command=='bridge job caps':
+                            if getattr(self,'drop_before_jobs',False):break
+                            result={'job_api':2}
                         elif command=='bridge ui caps':result={'ui_api':1,'apps_api':1,'boot_id':self.epoch}
                         elif command=='bridge stats':result={'process_count':7}
                         elif command.startswith('bridge hardware power '):
@@ -83,6 +91,54 @@ class HardwareTests(unittest.TestCase):
         self.endpoint.snapshot={'configured':True,'ready':True,'source_closed':True,'bytes':262602752,'error':0,'source':'/media/usb/APPS.BRK'}
         doctor=self.hardware.doctor(session)
         self.assertEqual(doctor['guest']['app_snapshot'],self.endpoint.snapshot)
+
+    def test_doctor_distinguishes_local_lock_and_connect_failure(self):
+        session=self.attach();count=len(self.endpoint.commands)
+        @contextmanager
+        def locked(_session):
+            raise TimeoutError('local lock busy')
+            yield
+        with patch.object(self.hardware,'session_lock',locked):
+            result=self.hardware.doctor(session)
+        self.assertIsNone(result['reachable']);self.assertIsNone(result['identity_matches'])
+        self.assertEqual(result['probe_stage'],'local_lock');self.assertEqual(len(self.endpoint.commands),count)
+        with patch('guest_transport.socket.create_connection',side_effect=OSError(errno.EHOSTUNREACH,'unreachable')):
+            result=self.hardware.doctor(session)
+        self.assertFalse(result['reachable']);self.assertIsNone(result['identity_matches'])
+        self.assertEqual(result['probe_stage'],'connecting');self.assertEqual(result['errno'],errno.EHOSTUNREACH)
+
+    def test_doctor_rejects_unverified_capabilities(self):
+        session=self.attach()
+        for caps in ({'reply':'unsupported'}, {'hardware_api':1,'boot_guard':False,'boot_id':self.endpoint.epoch},
+                     *({'hardware_api':1,'boot_guard':True,'boot_id':boot} for boot in ('','junk','0'*32,'A'*32)),
+                     {'hardware_api':True,'boot_guard':True,'boot_id':self.endpoint.epoch}):
+            with self.subTest(caps=caps):
+                self.endpoint.caps_override=caps
+                result=self.hardware.doctor(session)
+                self.assertTrue(result['reachable']);self.assertIsNone(result['identity_matches'])
+                self.assertEqual(result['probe_stage'],'invalid_capabilities')
+        self.endpoint.caps_override={'hardware_api':1,'boot_guard':True,'boot_id':'b'*32}
+        result=self.hardware.doctor(session)
+        self.assertTrue(result['reachable']);self.assertFalse(result['identity_matches'])
+
+    def test_doctor_keeps_identity_evidence_when_later_frame_is_lost(self):
+        session=self.attach();self.endpoint.drop_before_jobs=True
+        result=self.hardware.doctor(session)
+        self.assertTrue(result['reachable']);self.assertTrue(result['identity_matches'])
+        self.assertEqual(result['completed_frames'],1);self.assertEqual(result['probe_stage'],'frame_complete')
+        self.endpoint.caps_override={'hardware_api':1,'boot_guard':True,'boot_id':'b'*32}
+        result=self.hardware.doctor(session)
+        self.assertTrue(result['reachable']);self.assertFalse(result['identity_matches'])
+        self.endpoint.drop_before_jobs=False;self.endpoint.drop_before_caps=True
+        result=self.hardware.doctor(session)
+        self.assertTrue(result['reachable']);self.assertIsNone(result['identity_matches'])
+        self.assertEqual(result['completed_frames'],0)
+
+    def test_doctor_reports_incomplete_frame(self):
+        session=self.attach();self.endpoint.partial_caps='{"hardware_api":1'
+        result=self.hardware.doctor(session)
+        self.assertTrue(result['reachable']);self.assertIsNone(result['identity_matches'])
+        self.assertEqual(result['probe_stage'],'frame_started');self.assertEqual(result['completed_frames'],0)
 
     def test_reboot_blocks_commands_and_preserves_old_session(self):
         session=self.attach();old=self.hardware.load_session(session)['guest_boot_id'];self.endpoint.epoch='b'*32

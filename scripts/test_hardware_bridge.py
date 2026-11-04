@@ -67,6 +67,23 @@ try:
    time.sleep(.05)
   raise TimeoutError(serial[-2000:])
  boot();q=Qmp();rpc=Rpc();rpc.request('initialize',{'protocolVersion':'2025-06-18'})
+ # An abandoned partial framed request must release the single listener. Keep
+ # the first connection open while a second request waits in the accept queue.
+ with socket.create_connection(('127.0.0.1',port),timeout=5) as abandoned:
+  abandoned.settimeout(10);banner=b''
+  while b'Brook OS Debug Console' not in banner:
+   chunk=abandoned.recv(1024)
+   assert chunk,'First connection closed before debug banner'
+   banner+=chunk
+  abandoned.sendall(b'@314 incomplete')
+  with socket.create_connection(('127.0.0.1',port),timeout=5) as follower:
+   follower.settimeout(20);follower.sendall(b'@315 mem\n');reply=b''
+   while b'BRIDGE_END 315\n' not in reply and len(reply)<65536:
+    chunk=follower.recv(8192)
+    if not chunk:break
+    reply+=chunk
+   assert b'BRIDGE_BEGIN 315\n' in reply and b'BRIDGE_END 315\n' in reply,reply
+  assert 'DEBUG_TCP: incomplete framed command timed out' in (base/'serial.log').read_text(errors='replace')
  tools=rpc.request('tools/list')['tools'];assert {'hw_attach','hw_doctor','hw_guest_run','hw_logs'}<={t['name'] for t in tools}
  attached=rpc.tool('hw_attach',{'host':'127.0.0.1','port':port});session=attached['session']
  doctor=rpc.tool('hw_doctor',{'session':session});assert doctor['reachable'] and doctor['identity_matches'] and not doctor['capabilities']['qmp']

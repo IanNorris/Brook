@@ -28,13 +28,16 @@ def validate_commands(commands):
             raise ValueError("Guest command must fit one 220-byte protocol line")
 
 
-def exchange(host,port,commands,timeout=8):
+def exchange(host,port,commands,timeout=8,progress=None,on_reply=None):
     """Bounded framed RPCs on one connection; never retry unknown delivery."""
     validate_commands(commands)
     frames=[(str(int(uuid.uuid4().hex[:12],16)),command) for command in commands]
     deadline = time.monotonic() + timeout
+    if progress:progress('connecting',0)
     with socket.create_connection((host, port), timeout=timeout) as s:
+        if progress:progress('connected',0)
         s.sendall(''.join(f'@{token} {command}\n' for token,command in frames).encode())
+        if progress:progress('request_sent',0)
         buffer = bytearray()
         results=[]
         received=0
@@ -53,9 +56,12 @@ def exchange(host,port,commands,timeout=8):
                 token=frames[len(results)][0]
                 begin,end=f'BRIDGE_BEGIN {token}\n'.encode(),f'BRIDGE_END {token}\n'.encode()
                 start=buffer.find(begin)
+                if start>=0 and progress:progress('frame_started',len(results))
                 finish=buffer.find(end,start+len(begin)) if start>=0 else -1
                 if finish<0:break
+                if progress:progress('frame_complete',len(results)+1)
                 results.append(parse_guest_reply(buffer[start+len(begin):finish].decode(errors='replace')))
+                if on_reply:on_reply(len(results),results[-1])
                 del buffer[:finish+len(end)]
             if len(results)==len(frames):return results
     raise TimeoutError("No complete guest response; delivery/completion is unknown (not retried)")
