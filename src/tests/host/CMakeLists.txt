@@ -661,6 +661,8 @@ target_compile_options(test_debug_log_ring PRIVATE -UNDEBUG -DBROOK_HOST_TEST -D
 add_host_test(test_debug_hardware "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp")
 add_host_test(test_display_power)
 target_compile_options(test_display_power PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_inventory)
+target_compile_options(test_intel_bdw_inventory PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_debug_hardware PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"

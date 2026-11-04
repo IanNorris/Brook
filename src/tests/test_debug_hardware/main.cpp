@@ -87,6 +87,7 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
     assert(out && index<2);*out={};out->device.bus=0;out->device.dev=index+2;
     out->device.vendorId=0x8086;out->device.deviceId=0x1616;
     out->device.classCode=3;out->device.bar[0]=0xf0000004;
+    if(index==0)out->bdwGraphics={true,0x0840,0xabc00000};
     if(hdaPciPresent && index==1){out->device.dev=0x1b;out->device.deviceId=0x9ca0;
         out->device.classCode=4;out->device.subclass=3;out->device.bar[0]=0xf7418004;
         out->subsystemVendor=0x1028;out->subsystemDevice=0x0665;}
@@ -130,8 +131,10 @@ int main(){
     assert(reply.find("\"source\":\"boot_snapshot\"")!=std::string::npos);
     assert(reply.find("\"vendor_id\":32902")!=std::string::npos);
     assert(reply.find("\"raw_bars\":[4026531844,0,0,0,0,0]")!=std::string::npos);
+    assert(reply.find("\"bdw_firmware_graphics\":{\"graphics_control_raw\":2112,\"stolen_base_raw\":2881486848}")!=std::string::npos);
     assert(reply.find("\"next_cursor\":1")!=std::string::npos && reply.find("\"more\":true")!=std::string::npos);
     assert(handle("bridge hardware pci 1 16") && reply.find("\"device\":3")!=std::string::npos && reply.find("\"more\":false")!=std::string::npos);
+    assert(reply.find("bdw_firmware_graphics")==std::string::npos);
     assert(handle("bridge hardware pci 2 16") && reply.find("\"devices\":[]")!=std::string::npos);
     for(const auto* bad:{"0 0","0 17","3 1","4294967296 1","0 1 more","0 -1"}){
         assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "intel_bdw_inventory.h"
 
 // Minimal PCI configuration space access via port I/O (x86 CF8/CFC mechanism).
 // Supports legacy PCI (type 1) bus/device/function enumeration.
@@ -72,6 +73,7 @@ struct PciBootEntry {
     uint16_t command;
     uint16_t subsystemVendor, subsystemDevice;
     uint8_t revision, headerType;
+    BdwFirmwareGraphics bdwGraphics;
 };
 uint32_t PciBootInventoryCount();
 uint32_t PciBootInventorySeen();

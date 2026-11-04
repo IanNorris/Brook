@@ -188,6 +188,11 @@ void PciScanPrint()
                         if ((entry.headerType & 0x7f) == 0) {
                             entry.subsystemVendor = PciConfigRead16(bus, dev, fn, 0x2c);
                             entry.subsystemDevice = PciConfigRead16(bus, dev, fn, 0x2e);
+                            entry.bdwGraphics = BdwCaptureFirmwareGraphics(bus, dev, fn,
+                                entry.device.vendorId, entry.device.deviceId, entry.revision,
+                                entry.subsystemVendor, entry.subsystemDevice,
+                                [=](uint8_t offset) { return PciConfigRead16(bus, dev, fn, offset); },
+                                [=](uint8_t offset) { return PciConfigRead32(bus, dev, fn, offset); });
                         }
                     }
                 }

@@ -453,7 +453,12 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("revision",entry.revision);r.text(",");r.field("header_type",entry.headerType);
             r.text(",");r.field("command",entry.command);r.text(",");r.field("subsystem_vendor",entry.subsystemVendor);
             r.text(",");r.field("subsystem_device",entry.subsystemDevice);r.text(",\"raw_bars\":[");
-            for(unsigned b=0;b<6;++b){if(b)r.text(",");r.number(d.bar[b]);}r.text("]}");
+            for(unsigned b=0;b<6;++b){if(b)r.text(",");r.number(d.bar[b]);}r.text("]");
+            if(entry.bdwGraphics.captured){
+                r.text(",\"bdw_firmware_graphics\":{");r.field("graphics_control_raw",entry.bdwGraphics.graphicsControl);
+                r.text(",");r.field("stolen_base_raw",entry.bdwGraphics.stolenBase);r.text("}");
+            }
+            r.text("}");
         }
         r.text("],\"more\":");r.text(end<count?"true":"false");r.text("}\n");r.send();return true;
     }

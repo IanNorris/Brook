@@ -1414,6 +1414,18 @@ Actual relevant PCI functions (no controller reconfiguration):
 - SATA00:1f.2 Intel8086:9c83, class01:06/prog-if01, BAR5 0xf7422000;
   no disk sectors or partition tables were read/written by this inventory.
 
+The next graphics inventory checkpoint captures the raw graphics control word
+at PCI configuration offset `0x50` and stolen-memory base register at `0x5c`,
+only on the exact Dell Broadwell function identified above. These are boot-time
+configuration reads; the bridge reports the saved snapshot and never reads GPU
+MMIO. `captured` means the reads were issued, not that the values are valid:
+in particular, all-ones results must be rejected before deriving ranges. The
+snapshot does not size BARs, claim graphics memory, or provide acceleration.
+Linux's [early graphics memory discovery](https://gbmc.googlesource.com/linux/+/refs/heads/linux-rolling-stable/arch/x86/kernel/early-quirks.c)
+and [i915 stolen-memory code](https://kernel.googlesource.com/pub/scm/linux/kernel/git/tj/cgroup/+/5e6c94a999f67f120c6bbba71bbee840dfee6338/drivers/gpu/drm/i915/i915_gem_stolen.c)
+describe the register roles. Host tests cover the identity gate and bridge
+serialization; Dell capture and interpretation remain to be verified.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
