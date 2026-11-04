@@ -437,3 +437,15 @@ command reported the wrapper version and exited zero. The provider-cache
 generator now creates its loader copy with explicit executable permissions.
 This establishes that prerequisite, not a successful game or stable UI.
 Steam also reported shared-memory `ENOSPC` in the same run.
+
+Following another checked restart, the installed `getopt` remained available
+and the private loader retained mode 0755. A bounded fresh Steam launch on the
+Dell, with software Xephyr and a silent PulseAudio sink, started Stardew from
+the user's installed library. The game process remained live and a private
+guest framebuffer capture showed its title screen. The game window was clipped
+by the nested X desktop; moving its X window to the origin exposed more of the
+title screen but did not fix scaling/clipping. No interaction, gameplay or
+audio acceptance is claimed. Steam's web helper reported shared-memory ENOSPC
+and an unresponsive browser during the run. The Dell still used the previously
+accepted kernel, not the QEMU-tested tmpfs candidate. Captures and account
+details remain private, outside version control.
