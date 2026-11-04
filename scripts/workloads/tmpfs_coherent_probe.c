@@ -17,7 +17,9 @@ int main(void) {
     unsigned char* p=mmap(NULL,len,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);CHECK(p!=MAP_FAILED);
     for(size_t i=0;i<len;i+=4096)p[i]=(unsigned char)(i/4096);
     uint64_t after=free_bytes();CHECK(after && before>after);
-    uint64_t used=before-after;CHECK(used>=len && used<len+len/5+131072);
+    uint64_t used=before-after;
+    printf("TMPFS_COHERENT_CHARGE used=%llu bytes file=%llu bytes\n",(unsigned long long)used,(unsigned long long)len);
+    fflush(stdout);CHECK(used>=len && used<len+len/5+131072);
     CHECK(pwrite(fd,"abc",3,100)==3 && !memcmp(p+100,"abc",3));
     p[101]='Z';CHECK(!msync(p,len,MS_SYNC));char data[3];CHECK(pread(fd,data,3,100)==3 && !memcmp(data,"aZc",3));
     pid_t child=fork();CHECK(child>=0);

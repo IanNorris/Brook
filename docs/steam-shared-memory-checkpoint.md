@@ -206,3 +206,11 @@ flush, including a mixed disk/tmpfs queue; disk writeback remains queued while
 tmpfs retires. Both affected tests pass ASan/UBSan. The native Steam-sized
 coherence probe also passed on the updated kernel in private QEMU. The Dell
 remains offline, so these results do not establish real Steam behavior.
+
+A controlled QEMU comparison used the same 26,214,416-byte probe, VM memory,
+and guest configuration on the earlier two-copy kernel and the new coherent
+kernel. The earlier kernel charged 52,879,360 bytes; the new kernel charged
+26,865,664 bytes, a reduction of 26,013,696 bytes (49.2%). The earlier probe
+then intentionally failed the new single-copy threshold; the new probe passed
+its subsequent coherence, fork and private-COW checks. This compares quota
+accounting in the synthetic guest, not Steam startup time or Dell behavior.
