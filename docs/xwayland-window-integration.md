@@ -206,6 +206,13 @@ ModuleRetainAddresses and CPU memory-type helpers; the kernel itself compiled.
 Those standalone test dependencies were subsequently repaired, and the five
 affected bare-metal fixtures passed in QEMU.
 
+`python3 tools/vm_bridge/accept_x11_close.py --session SESSION` repeats the close
+control on two pre-launched disposable xeyes windows. It verifies close-event
+delivery, survival of the sibling sharing the provider, and rejection of the
+closed window's reference before closing the second window. The script passed
+against the private software-rendered VM; it intentionally closes both windows
+and does not verify either client process exits.
+
 A subsequent private software-rendered VM run exercised this close action on
 the rootless Steam window with a null-output PulseAudio server. The cooperative
 request completed and the window disappeared; Steam continued running, so
