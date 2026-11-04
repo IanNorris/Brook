@@ -161,6 +161,31 @@ creation failures reporting unsupported address family, and failed minidump
 writes. These observations do not distinguish an offline authentication failure
 from an internal runtime failure. No Stardew window was observed.
 
+On the Dell's 3200x1800 software desktop, the VM-tested compositor and XWM
+were staged in RAM and launched with the installed Xwayland 24.1.11. Two xeyes
+windows appeared independently; native maximize and restore returned the first
+to its prior size, and closing it through native chrome left the other open.
+The default Xwayland configuration had no GLX extension. A temporary wrapper
+using `-shm +extension GLX +iglx`, with `LIBGL_DRIVERS_PATH` pointing at the
+installed Mesa DRI directory and `LIBGL_ALWAYS_SOFTWARE=1`, exposed GLX 1.4.
+The GLX control obtained a current llvmpipe context and read back a red pixel
+with no X or GL errors. This is software rendering, not Intel acceleration.
+
+The first Steam retry exited because this SSD boot lacked the SteamRT provider
+cache. A cache generated and validated from the installed profile, plus its
+matching loader, were installed only in the RAM initrd. With a private null
+PulseAudio sink and the temporary Xwayland wrapper, the next bounded Steam run
+opened separate Steam and Friends List windows. Samples reported no denied task
+births and over 5 GB free; these observations do not establish input correctness,
+long-term stability or game launch. Account screenshots and logs remain private.
+
+The compositor now offers the opt-in `BROOK_XWAYLAND_SOFTWARE_GLX=1` launch
+mode with the same flags and child-only Mesa environment. The default launch is
+unchanged. Host checks cover actual fork/exec arguments and environment, including
+restart with the optional dumb scheduler; the physical run above used the
+equivalent temporary wrapper, not this newly built binary. Indirect GLX is enabled
+in this opt-in mode; whether direct software GLX works without it remains open.
+
 Known gaps and remaining gates:
 
 - Finish Steam dialogs/navigation, input-alignment and a small-download

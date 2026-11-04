@@ -2,6 +2,7 @@
  * This is not a proof of the real GPU or native kernel paths (VM gates remain). */
 #define _GNU_SOURCE
 #include <assert.h>
+#include <poll.h>
 #include <stdarg.h>
 #include "wm-window-state.h"
 static long bridge_syscall(long number,...);
@@ -91,7 +92,27 @@ int main(int argc,char **argv) {
     (void)argv;
     // This executable also serves as a long-lived fake server and helper for
     // the restart test. Parent termination uses the normal SIGTERM action.
-    if(argc>1)for(;;)pause();
+    if(argc>1) {
+        const char *report=getenv("BROOK_TEST_XWAYLAND_REPORT_FD");
+        if(report && !strcmp(argv[1],":0")) {
+            int shm=0,glamor=0,extension=0,iglx=0,dumb=0;
+            for(int i=2;i<argc;++i) {
+                if(!strcmp(argv[i],"-shm"))shm=1;
+                if(!strcmp(argv[i],"-glamor") && i+1<argc && !strcmp(argv[i+1],"gl"))glamor=1;
+                if(!strcmp(argv[i],"+extension") && i+1<argc && !strcmp(argv[i+1],"GLX"))extension=1;
+                if(!strcmp(argv[i],"+iglx"))iglx=1;
+                if(!strcmp(argv[i],"-dumbSched"))dumb=1;
+            }
+            const char *mode=getenv("BROOK_XWAYLAND_SOFTWARE_GLX");
+            int software=mode && !strcmp(mode,"1");
+            const char *drivers=getenv("LIBGL_DRIVERS_PATH"),*always=getenv("LIBGL_ALWAYS_SOFTWARE");
+            char result=software ? (shm && !glamor && extension && iglx && dumb && drivers &&
+                !strcmp(drivers,"/nix/profile/lib/dri") && always && !strcmp(always,"1")?'S':'X') :
+                (!shm && glamor && !extension && !iglx && !dumb?'D':'X');
+            if(write(atoi(report),&result,1)!=1)_exit(2);
+        }
+        for(;;)pause();
+    }
     g_display=wl_display_create();assert(g_display && xwayland_shell_init(g_display));
     int peer,wayland_peer,other_peer;int control[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,control));
     g_xwm_fd=control[0];peer=control[1];struct bxwm_stream rx={0};
@@ -195,9 +216,15 @@ int main(int argc,char **argv) {
     assert(native[native_id].incarnation==native_incarnation && surface_repaint(unrelated));
     // Exercise real fork/exec retirement and replacement while the unrelated
     // native surface remains mapped. No replacement while either child lives.
+    int report[2];assert(!pipe(report));char report_fd[24];
+    snprintf(report_fd,sizeof(report_fd),"%d",report[1]);
+    assert(!setenv("BROOK_TEST_XWAYLAND_REPORT_FD",report_fd,1));
+    unsetenv("BROOK_XWAYLAND_SOFTWARE_GLX");unsetenv("BROOK_XWAYLAND_DUMB_SCHED");
     xwayland_restart_configure("/proc/self/exe","/proc/self/exe",":0");
     assert(xwayland_start(g_xrestart_server,g_xrestart_helper,g_xrestart_display));
     assert(g_xwayland_pid>0 && g_xwm_pid>0 && g_xwayland_client);
+    struct pollfd ready={.fd=report[0],.events=POLLIN};char launch=0;
+    assert(poll(&ready,1,3000)==1 && read(report[0],&launch,1)==1 && launch=='D');
     uint64_t old_generation=g_xwayland_generation;
     // A stopped child cannot act on SIGTERM; it must not pin recovery forever.
     assert(!kill(g_xwm_pid,SIGSTOP));int stopped=0;
@@ -210,17 +237,23 @@ int main(int argc,char **argv) {
         xwayland_pump();usleep(10000);
     }
     assert(!g_xwayland_pid && !g_xwm_pid && g_xwayland_generation==old_generation);
+    assert(!setenv("BROOK_XWAYLAND_SOFTWARE_GLX","1",1));
+    assert(!setenv("BROOK_XWAYLAND_DUMB_SCHED","1",1));
     g_shutdown=0;
     for(unsigned tries=0;tries<300 && g_xwayland_generation==old_generation;++tries) {
         xwayland_pump();usleep(10000);
     }
     assert(g_xwayland_generation==old_generation+1 && g_xwayland_pid>0 && g_xwm_pid>0);
+    ready.revents=0;launch=0;
+    assert(poll(&ready,1,3000)==1 && read(report[0],&launch,1)==1 && launch=='S');
     assert(unrelated->wm_id==native_id && native[native_id].incarnation==native_incarnation);
     assert(!kill(g_xwm_pid,SIGSTOP));
     assert(waitpid(g_xwm_pid,&stopped,WUNTRACED)==g_xwm_pid && WIFSTOPPED(stopped));
     uint64_t last_generation=g_xwayland_generation;assert(xwayland_shutdown());
     assert(!g_xwayland_pid && !g_xwm_pid && !g_xrestart_pending);
     xwayland_pump();assert(g_xwayland_generation==last_generation);
+    close(report[0]);close(report[1]);unsetenv("BROOK_TEST_XWAYLAND_REPORT_FD");
+    unsetenv("BROOK_XWAYLAND_SOFTWARE_GLX");unsetenv("BROOK_XWAYLAND_DUMB_SCHED");
     wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==5);
     wl_display_destroy(g_display);
     puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival and generation reuse");

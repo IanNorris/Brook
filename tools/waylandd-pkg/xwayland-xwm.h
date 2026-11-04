@@ -377,11 +377,20 @@ static int xwayland_start(const char *server,const char *helper,const char *disp
         // Diagnostic A/B for Xwayland's smart scheduler: Brook currently lacks
         // ITIMER_REAL. Keep the usual scheduler unless explicitly requested.
         const char *dumb_sched=getenv("BROOK_XWAYLAND_DUMB_SCHED");
-        if (dumb_sched && !strcmp(dumb_sched,"1")) {
-            execl(server,server,display,"-rootless","-wm",wm_fd,"-displayfd",display_fd,"-nolisten","tcp","-noreset","-ac","-glamor","gl","-dumbSched",(char *)NULL);
-            _exit(127);
-        }
-        execl(server,server,display,"-rootless","-wm",wm_fd,"-displayfd",display_fd,"-nolisten","tcp","-noreset","-ac","-glamor","gl",(char *)NULL);
+        int dumb=dumb_sched && !strcmp(dumb_sched,"1");
+        const char *software_glx=getenv("BROOK_XWAYLAND_SOFTWARE_GLX");
+        int software=software_glx && !strcmp(software_glx,"1");
+        if (software && (setenv("LIBGL_DRIVERS_PATH","/nix/profile/lib/dri",1) ||
+                         setenv("LIBGL_ALWAYS_SOFTWARE","1",1))) _exit(126);
+        char *args[24];unsigned n=0;
+        args[n++]=(char *)server;args[n++]=(char *)display;args[n++]="-rootless";
+        args[n++]="-wm";args[n++]=wm_fd;args[n++]="-displayfd";args[n++]=display_fd;
+        args[n++]="-nolisten";args[n++]="tcp";args[n++]="-noreset";args[n++]="-ac";
+        if (software) { args[n++]="-shm";args[n++]="+extension";args[n++]="GLX";args[n++]="+iglx"; }
+        else { args[n++]="-glamor";args[n++]="gl"; }
+        if (dumb) args[n++]="-dumbSched";
+        args[n]=NULL;
+        execv(server,args);
         _exit(127);
     }
     g_xwayland_pid=child;
