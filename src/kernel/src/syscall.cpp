@@ -36,6 +36,7 @@
 #include "gpu_reservation.h"
 #include "busybox_applets.h"
 #include "cpu.h"
+#include "fw_cfg.h"
 #include "gdt.h"
 #include "serial.h"
 #include "panic.h"
@@ -10617,6 +10618,16 @@ static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
 // Wayland uses memfd for shared memory buffers (wl_shm).
 // We implement it as a SyntheticMem fd backed by a heap allocation.
 
+// Disposable-QEMU diagnostic. Samples are globally bounded, never enabled on
+// real hardware by default, and may contain application-supplied names.
+static bool memfdTraceEnabled;
+static uint32_t memfdTraceSequence;
+void SyscallConfigureMemfdTrace() {
+    char value[2]{};
+    const auto n=FwCfgReadFile("opt/memfd-trace",value,sizeof(value));
+    memfdTraceEnabled=value[0]=='1' && (n==1 || (n==2 && !value[1]));
+}
+
 static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
                                   uint64_t, uint64_t, uint64_t, uint64_t)
 {
@@ -10626,13 +10637,6 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     if (!proc) return -EMFILE;
 
     KernelOperationGuard operation(proc);
-
-    // Name is just for debugging; we don't enforce it
-    char name[64] = "<memfd>";
-    if (nameAddr >= 0x1000) {
-        const char* src = reinterpret_cast<const char*>(nameAddr);
-        for (int i = 0; i < (int)(sizeof(name) - 1) && src[i]; i++) name[i] = src[i], name[i+1] = 0;
-    }
 
     auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
     if (!mfd) return -ENOMEM;
@@ -10648,6 +10652,22 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
 
     int fd = MemFdInstall(proc, mfd, 2u | ((flags & MFD_CLOEXEC) ? 0x80000u : 0));
     if (fd < 0) kfree(mfd);
+
+    if (memfdTraceEnabled) {
+        uint32_t previous=__atomic_load_n(&memfdTraceSequence,__ATOMIC_RELAXED);
+        while (previous<4096 && !__atomic_compare_exchange_n(&memfdTraceSequence,
+               &previous,previous+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+        const auto sample=previous<4096?previous+1:0;
+        if (sample && (sample<=32 || !(sample%32))) {
+            char name[64]{};
+            UserAccessScope access(proc);
+            if (!CopyUserCString(nameAddr,name,sizeof(name)))
+                memcpy(name,"<unavailable>",sizeof("<unavailable>"));
+            for (char& ch:name) if (ch && (ch<' ' || ch>'~')) ch='?';
+            SerialPrintf("MEMFD_TRACE n=%u pid=%u tgid=%u fd=%d rip=%lx name=%s\n",
+                         sample,proc->pid,proc->tgid,fd,proc->syscallUserRip,name);
+        }
+    }
 
     return fd;
 }

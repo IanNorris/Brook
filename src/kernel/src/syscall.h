@@ -5,6 +5,7 @@
 namespace brook {
 
 struct Process;
+void SyscallConfigureMemfdTrace();
 
 // Maximum number of syscalls. Must match the dispatcher bounds check.
 // Brook implements the Linux x86-64 ABI (0..~460) plus Brook-specific syscalls.

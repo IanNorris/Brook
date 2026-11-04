@@ -213,6 +213,16 @@ were not captured. No matching kernel FD-exhaustion diagnostic was observed;
 several descriptor installation paths return EMFILE without that log. The VM
 was synced and stopped. This is not a matched Steam A/B or Dell result.
 
+An opt-in, globally bounded `opt/memfd-trace=1` diagnostic then identified the
+repeated allocations as Steam-created `pulseaudio` memfds when no Pulse server
+was configured. With a private null-output Pulse server and its cookie passed
+into SteamRT, the runaway stopped and a rootless Steam sign-in window appeared.
+That establishes a provisioning problem in this clone, not the cause of the
+Dell freeze or evidence that scheduler mode improved stability. The trace can
+include application-provided names and is disabled by default. A two-CPU VM
+exercise checked invalid and kernel-space names, enabled/disabled behavior,
+and the 159-line lifetime cap after 4,100 creations.
+
 The fixture also checks caught and default `SIGALRM` delivery to a child
 spinning without syscalls; these checks pass on Linux. Brook's current caught
 signal delivery occurs at syscall return, so the timer must remain disabled
