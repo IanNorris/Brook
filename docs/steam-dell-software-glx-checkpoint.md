@@ -426,3 +426,14 @@ profile on PATH. This confirms a missing prerequisite and its availability, not
 that the existing frozen Steam session can launch Stardew; that needs a fresh
 end-to-end run. The QEMU tmpfs full-quota regression is documented separately in
 `steam-shared-memory-checkpoint.md` and has not yet been deployed to the Dell.
+
+After a checked restart, `getopt` was still available and the same Steam launch
+advanced beyond its previous missing-command error. The game then failed to
+execute Soldier's `pressure-vessel-wrap` with `EACCES`. Its binary was mode
+0755, but the private host-loader copy bound at `/lib64/ld-linux-x86-64.so.2`
+was mode 0644. An isolated reproduction of that exact execution returned
+permission denied; after changing the owned private loader to 0755, the same
+command reported the wrapper version and exited zero. The provider-cache
+generator now creates its loader copy with explicit executable permissions.
+This establishes that prerequisite, not a successful game or stable UI.
+Steam also reported shared-memory `ENOSPC` in the same run.

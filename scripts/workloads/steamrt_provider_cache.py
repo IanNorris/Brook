@@ -11,9 +11,18 @@ not prove which candidate a runtime loader will select when names repeat.
 import argparse
 import hashlib
 import json
+import os
 import struct
 from pathlib import Path
 import subprocess
+
+
+def write_loader(path, data):
+    # This copy is bound as /lib64's ELF interpreter. The kernel requires
+    # execute permission even though applications never invoke it directly.
+    with path.open('xb') as stream:
+        stream.write(data)
+        os.fchmod(stream.fileno(), 0o755)
 
 
 def relocate_loader_cache(data, original, destination='/etc/ld.so.cache'):
@@ -161,7 +170,7 @@ def main():
         if str(libc) not in variants:
             raise RuntimeError('Loader libc is absent from the validated provider cache')
         data, relocation = relocate_loader_cache(data, str(loader.parent.parent / 'etc/ld.so.cache'))
-        (args.output / 'ld-linux-x86-64.so.2').write_bytes(data)
+        write_loader(args.output / 'ld-linux-x86-64.so.2', data)
         manifest['loader'] = dict(source=str(loader), libc=str(libc),
                                   sha256=hashlib.sha256(data).hexdigest(),
                                   cache_relocation=relocation)

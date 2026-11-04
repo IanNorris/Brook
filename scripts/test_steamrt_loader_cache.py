@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """The compatibility copy changes one bounded data literal, never ELF code."""
 import hashlib
+import os
 from pathlib import Path
+import stat
 import struct
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent / 'workloads'))
-from steamrt_provider_cache import relocate_loader_cache, record_cache_target
+from steamrt_provider_cache import relocate_loader_cache, record_cache_target, write_loader
 
 OLD = '/nix/store/aaaaaaaa-glibc-2.42/etc/ld.so.cache'
 
@@ -26,6 +29,20 @@ def fixture():
 
 
 class LoaderCache(unittest.TestCase):
+    def test_private_loader_is_executable_even_with_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ld-linux-x86-64.so.2'
+            old = os.umask(0o077)
+            try:
+                write_loader(path, b'loader fixture')
+            finally:
+                os.umask(old)
+            self.assertEqual(path.read_bytes(), b'loader fixture')
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+            with self.assertRaises(FileExistsError):
+                write_loader(path, b'overwrite')
+            self.assertEqual(path.read_bytes(), b'loader fixture')
+
     def test_duplicate_sonames_preserve_all_validated_targets(self):
         targets, variants = {}, set()
         label = 'libc.so.6 (libc6,x86-64)'
