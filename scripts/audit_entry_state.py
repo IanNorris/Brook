@@ -30,7 +30,7 @@ class Invalid(ValueError):
     pass
 
 
-def audit(instructions, error_vector=None, profile="irq"):
+def audit(instructions, error_vector=None, profile="irq", probe_target=None, targets=None):
     """Recognize the entire template, including branch targets, not a checklist.
 
     A mismatch fails for explicitly nominated full-exception stubs. Other return
@@ -92,11 +92,24 @@ def audit(instructions, error_vector=None, profile="irq"):
     call = take("call")
     if len(call.operands) != 1 or call.operands[0].type != X86_OP_IMM:
         raise Invalid("unmodeled indirect C call")
+    if profile in {"timer", "resched"} and (targets is None or
+       call.operands[0].imm & mask != targets[profile]):
+        raise Invalid("IRQ inner handler target changed")
+    if profile in {"timer", "resched"}:
+        take("mov", "rdi, r14")
+        take("mov", "rsi, r15")
+        if profile == "timer": take("xor", "edx, edx")
+        else: take("mov", "edx, 1")
+        probe=take("call")
+        if len(probe.operands)!=1 or probe.operands[0].type!=X86_OP_IMM or \
+           (probe_target is not None and probe.operands[0].imm&mask!=probe_target):
+            raise Invalid("IRQ signal probe target changed")
     if profile == "timer":
         take("lea", "rdi, [r14 + 0x78]")
         validate = take("call")
-        if len(validate.operands) != 1 or validate.operands[0].type != X86_OP_IMM:
-            raise Invalid("unmodeled timer validator call")
+        if len(validate.operands) != 1 or validate.operands[0].type != X86_OP_IMM or \
+           targets is None or validate.operands[0].imm & mask != targets["validator"]:
+            raise Invalid("timer validator target changed")
     if vector_save:
         take("mov", "eax, 7")
         take("xor", "edx, edx")
@@ -127,9 +140,9 @@ def audit(instructions, error_vector=None, profile="irq"):
     else:
         checks += ["RSP-balanced-pushes-pops", "C-call-alignment-from-hardware-IRQ-frame"]
     if profile == "timer":
-        checks += ["interrupted-RIP-CS-RBP-slot-offsets", "validator-before-vector-restore"]
+        checks += ["interrupted-RIP-CS-RBP-slot-offsets", "validator-before-vector-restore", "IRQ-signal-frame-FP-source"]
     if profile == "resched":
-        checks += ["interrupted-CS-slot-offset"]
+        checks += ["interrupted-CS-slot-offset", "IRQ-signal-frame-FP-source"]
     return {"contract": "full-exception" if error_vector else profile,
             "error_slot_bytes": 8 if error_vector else 0,
             "call_target": hex(call.operands[0].imm & ((1 << 64) - 1)),
@@ -227,7 +240,7 @@ def scalar_leaf(path, address, mutation=None):
                 "proof": "bounded scalar leaf; no calls, external branches or FPU/vector instructions"}
 
 
-def mutation_checks(name, data, instructions, vector, profile="irq"):
+def mutation_checks(name, data, instructions, vector, profile="irq", probe_target=None, targets=None):
     """Decode mutated machine bytes and require the audit to reject them."""
     results = []
     cases = [
@@ -243,6 +256,27 @@ def mutation_checks(name, data, instructions, vector, profile="irq"):
     if profile == "resched":
         ins = next(x for x in instructions if x.mnemonic == "mov" and x.op_str == "rdi, qword ptr [r14 + 0x80]")
         cases.append(("wrong-interrupted-CS-slot", ins, bytes(ins.bytes[:-4]) + b"\x78\0\0\0"))
+    if profile in {"timer","resched"}:
+        for label, target in [("wrong-IRQ-inner-target",targets[profile])] + \
+                             ([("wrong-validator-target",targets["validator"])] if profile=="timer" else []):
+            call=next(x for x in instructions if x.mnemonic=="call" and x.operands[0].type==X86_OP_IMM and
+                      x.operands[0].imm&((1<<64)-1)==target)
+            changed=bytearray(call.bytes);changed[-1]^=1
+            cases.append((label,call,bytes(changed)))
+        frame=next(x for x in instructions if x.mnemonic=="mov" and x.op_str=="rdi, r14")
+        changed=bytearray(frame.bytes);changed[-1]^=8
+        cases.append(("wrong-IRQ-signal-frame-argument",frame,bytes(changed)))
+        argument=next(x for x in instructions if x.mnemonic=="mov" and x.op_str=="rsi, r15")
+        changed=bytearray(argument.bytes);changed[-1]^=8
+        cases.append(("wrong-IRQ-signal-FP-argument",argument,bytes(changed)))
+        source=next(x for x in instructions if (x.mnemonic,x.op_str)==
+                    (("xor","edx, edx") if profile=="timer" else ("mov","edx, 1")) and
+                    x.address>argument.address)
+        cases.append(("missing-IRQ-signal-source",source,None))
+        probe=next(x for x in instructions if x.mnemonic=="call" and x.operands[0].type==X86_OP_IMM and
+                   x.operands[0].imm&((1<<64)-1)==probe_target)
+        changed=bytearray(probe.bytes);changed[-1]^=1
+        cases.append(("wrong-IRQ-signal-target",probe,bytes(changed)))
     if vector is not None:
         argument=next(x for x in instructions if x.mnemonic=="mov" and x.op_str=="rdx, r15")
         cases.append(("missing-FP-image-argument",argument,None))
@@ -260,7 +294,7 @@ def mutation_checks(name, data, instructions, vector, profile="irq"):
         offset = ins.address - instructions[0].address
         mutated = data[:offset] + replacement + data[offset + ins.size:]
         try:
-            audit(list(DECODER.disasm(mutated, instructions[0].address)), vector, profile)
+            audit(list(DECODER.disasm(mutated, instructions[0].address)), vector, profile, probe_target, targets)
         except Invalid:
             results.append({"function": name, "mutation": label, "rejected": True})
         else:
@@ -308,8 +342,16 @@ def main():
     seen = set()
     with args.elf.open("rb") as stream:
         elf=ELFFile(stream)
-        signal_check=next(s["st_value"] for s in elf.get_section_by_name(".symtab").iter_symbols()
-                          if s.name=="SyscallCheckSignals")
+        symbols={s.name:s["st_value"] for s in elf.get_section_by_name(".symtab").iter_symbols()}
+        required={"SyscallCheckSignals", "IrqSignalProbe", "LapicTimerHandlerInner",
+                  "ReschedIpiHandlerInner", "ValidateIretFrame"}
+        missing=required-symbols.keys()
+        if missing:
+            parser.error("missing required symbols: " + ", ".join(sorted(missing)))
+        signal_check=symbols["SyscallCheckSignals"]
+        irq_signal_probe=symbols["IrqSignalProbe"]
+        targets={"timer":symbols["LapicTimerHandlerInner"], "resched":symbols["ReschedIpiHandlerInner"],
+                 "validator":symbols["ValidateIretFrame"]}
     for name, data, ins in functions(args.elf):
         seen.add(name)
         if name=="BrookSyscallDispatcher":
@@ -335,12 +377,12 @@ def main():
             report["unsupported"].append(name)
             continue
         try:
-            result = audit(ins, vector, profile)
+            result = audit(ins, vector, profile, irq_signal_probe, targets)
             if profile == "tlb":
                 result["scalar_callee"] = scalar_leaf(args.elf, int(result["call_target"], 16))
             report["checked"].append({"function": name, **result})
             if args.mutations:
-                report["mutations"].extend(mutation_checks(name, data, ins, vector, profile))
+                report["mutations"].extend(mutation_checks(name, data, ins, vector, profile, irq_signal_probe, targets))
                 if profile == "tlb":
                     for mutation in ("vector-clobber", "callee-call", "external-branch", "missing-return"):
                         try:

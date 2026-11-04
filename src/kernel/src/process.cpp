@@ -1820,10 +1820,11 @@ using namespace brook;
 extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original);
 
 namespace brook {
-static bool irqSignalProbeEnabled;
+static unsigned irqSignalProbeMode;
 void ProcessConfigureIrqSignalProbe() {
     char value[2]{};const auto n=FwCfgReadFile("opt/irq-signal-probe",value,sizeof(value));
-    irqSignalProbeEnabled=value[0]=='1' && (n==1 || (n==2 && !value[1]));
+    if((n==1 || (n==2 && !value[1])) && (value[0]=='1' || value[0]=='2'))
+        irqSignalProbeMode=unsigned(value[0]-'0');
 }
 static void FinishIrqSignalProbe(Process* proc) {
     SchedulerKernelRegionLeave(proc);
@@ -1833,9 +1834,9 @@ static void FinishIrqSignalProbe(Process* proc) {
 
 // Experimental QEMU-only path for caught signals. Default and ignored signal
 // dispositions remain on their existing paths while this probe is validated.
-extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp) {
+extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp,unsigned source) {
     using namespace brook;
-    if(!irqSignalProbeEnabled)return;
+    if(!irqSignalProbeMode || (irqSignalProbeMode==2 && source!=1))return;
     auto& frame=*static_cast<IrqSignalFrame*>(raw);
     if((frame.cs&3)!=3)return;
     Process* proc=ProcessCurrent();if(!proc || proc->isKernelThread)return;
@@ -1857,6 +1858,7 @@ extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp) {
     if(!PosixTimerClaimCaught(proc,signum,&info,&action) && !ProcessClaimCaughtSignal(proc,signum,&info,&action)) {
         FinishIrqSignalProbe(proc);return;
     }
+    if(irqSignalProbeMode==2)SerialPrintf("SIGNAL_IRQ_PROBE source=ipi pid=%u signal=%d\n",proc->pid,signum);
     const uint64_t savedMask=proc->sigMask;
     const uint64_t handlerMask=(savedMask|action.mask|((action.flags&SA_NODEFER)?0:(1ULL<<(signum-1)))) & ~((1ULL<<8)|(1ULL<<18));
     const int previousStackFlags=SignalAltstackFlags(proc->sigAltstackSp,proc->sigAltstackSize,proc->sigAltstackFlags,frame.rsp);

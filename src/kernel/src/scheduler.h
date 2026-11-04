@@ -93,6 +93,9 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+#ifdef BROOK_REGISTER_TEST_HOOKS
+bool SchedulerTestTargetApic(Process* actor,uint16_t pid,uint8_t* apic);
+#endif
 // Recovery worker only. Successful enumeration owns both refs; caller drops
 // them with ProcessUnref/AddressSpaceUnref. Selection performs no allocation.
 bool SchedulerNextOomCandidate(uint16_t after,Process**,AddressSpaceState**);

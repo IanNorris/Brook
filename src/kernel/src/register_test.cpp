@@ -83,8 +83,14 @@ bool RegisterTestException(FullExceptionFrame* frame,uint64_t vector,uint64_t ad
     return true;
 }
 
-int64_t RegisterTestControl(uint64_t action,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {
+int64_t RegisterTestControl(uint64_t action,uint64_t target,uint64_t,uint64_t,uint64_t,uint64_t) {
     auto* actor=ProcessCurrent();if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
+    if(action==1) {
+        if(!target || target>=MAX_PROCESSES)return -22;
+        uint8_t apic=0;
+        return SchedulerTestTargetApic(actor,static_cast<uint16_t>(target),&apic) &&
+            ApicTestTryRescheduleIpi(apic)?0:-11;
+    }
     if(action)return -22;
     SchedulerKernelRegionEnter(actor);
     uint32_t expected=0;

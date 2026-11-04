@@ -800,5 +800,5 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum);
 // Returns the value that should be in RAX on return to userspace.
 extern "C" int64_t SyscallCheckSignals(brook::SyscallFrame* frame, int64_t syscallResult,
                                      brook::FxsaveArea* entryFp);
-extern "C" void IrqSignalProbe(void* irqFrame, brook::FxsaveArea* entryFp);
+extern "C" void IrqSignalProbe(void* irqFrame, brook::FxsaveArea* entryFp, unsigned source);
 namespace brook { void ProcessConfigureIrqSignalProbe(); }

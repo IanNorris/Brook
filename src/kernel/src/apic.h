@@ -135,6 +135,9 @@ static constexpr uint8_t LAPIC_RESCHED_VECTOR = 0xFE;
 
 // Send a reschedule IPI to the specified CPU (by LAPIC ID).
 void ApicSendRescheduleIpi(uint8_t targetApicId);
+#ifdef BROOK_REGISTER_TEST_HOOKS
+bool ApicTestTryRescheduleIpi(uint8_t targetApicId);
+#endif
 
 // Register the reschedule IPI handler in the IDT. Called once during init.
 void ApicInitReschedIpi();

@@ -2700,6 +2700,23 @@ Process* SchedulerFindProcessReference(uint16_t pid)
     SchedLockRelease(g_allProcLock, flags);
     return found;
 }
+#ifdef BROOK_REGISTER_TEST_HOOKS
+bool SchedulerTestTargetApic(Process* actor,uint16_t pid,uint8_t* apic)
+{
+    const auto flags=SchedLockAcquire(g_allProcLock);bool found=false;
+    const uint64_t identity=actor->isThread?actor->leaderIncarnation:actor->incarnation;
+    for(uint32_t i=0;i<g_processCount;++i) {
+        auto* peer=g_allProcesses[i];if(peer->pid!=pid)continue;
+        const uint64_t group=peer->isThread?peer->leaderIncarnation:peer->incarnation;
+        const int32_t cpu=__atomic_load_n(&peer->runningOnCpu,__ATOMIC_ACQUIRE);
+        const CpuInfo* ci=cpu>=0 && static_cast<uint32_t>(cpu)<SmpGetCpuCount()?SmpGetCpu(cpu):nullptr;
+        if(peer->tgid==actor->tgid && group==identity && ci && ci->online &&
+           static_cast<uint32_t>(cpu)!=SmpCurrentCpuIndex()) {*apic=ci->apicId;found=true;}
+        break;
+    }
+    SchedLockRelease(g_allProcLock,flags);return found;
+}
+#endif
 
 AddressSpaceState* SchedulerReferenceProcessAddressSpace(uint16_t pid, uint64_t incarnation, bool* exists)
 {

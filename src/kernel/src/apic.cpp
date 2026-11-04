@@ -544,6 +544,7 @@ static void LapicTimerHandler(void)
 
         "movq %%r14, %%rdi\n\t"
         "movq %%r15, %%rsi\n\t"
+        "xorl %%edx, %%edx\n\t"
         "call IrqSignalProbe\n\t"
 
         // Validate iret frame before restoring GPRs.
@@ -893,6 +894,7 @@ static void ReschedIpiHandler(void)
 
         "movq %%r14, %%rdi\n\t"
         "movq %%r15, %%rsi\n\t"
+        "movl $1, %%edx\n\t"
         "call IrqSignalProbe\n\t"
 
         BROOK_FPU_RESTORE_IRQ
@@ -933,6 +935,23 @@ void ApicSendRescheduleIpi(uint8_t targetApicId)
     // Delivery mode = fixed (0), level assert, vector = LAPIC_RESCHED_VECTOR
     LapicWrite(LapicReg::ICR_LO, LAPIC_RESCHED_VECTOR | (1u << 14));
 }
+#ifdef BROOK_REGISTER_TEST_HOOKS
+bool ApicTestTryRescheduleIpi(uint8_t targetApicId)
+{
+    uint64_t flags;__asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
+    bool idle=false;
+    for(unsigned i=0;i<100000;++i) {
+        if(!(LapicRead(LapicReg::ICR_LO)&(1u<<12))){idle=true;break;}
+        __asm__ volatile("pause");
+    }
+    if(idle) {
+        LapicWrite(LapicReg::ICR_HI,static_cast<uint32_t>(targetApicId)<<24);
+        LapicWrite(LapicReg::ICR_LO,LAPIC_RESCHED_VECTOR|(1u<<14));
+    }
+    if(flags&512)__asm__ volatile("sti":::"memory");
+    return idle;
+}
+#endif
 
 void ApicInitReschedIpi()
 {
