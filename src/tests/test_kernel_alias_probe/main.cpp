@@ -14,6 +14,12 @@ int main(){
     Tables t;KernelAliasMapping out{};constexpr uint64_t va=0x12345000;
     t.data[0][0]=0x2003;t.data[1][0]=0x3003;t.data[2][(va>>21)&511]=0x4003;
     const unsigned pt=(va>>12)&511;
+    t.data[3][pt]=0x56789003;
+    assert(InspectKernelAlias(t,0x1000,va,out) && out.writable);
+    t.data[1][0]=0x3001;assert(InspectKernelAlias(t,0x1000,va,out) && out.present && !out.writable);
+    t.data[1][0]=0x3003;t.data[3][pt]=0x56789001;
+    assert(InspectKernelAlias(t,0x1000,va,out) && out.present && !out.writable);
+    t.data[3][pt]=0x56789003;
     for(unsigned pat=0;pat<8;++pat){
         uint64_t flags=3|uint64_t(pat&1)<<3|uint64_t((pat>>1)&1)<<4|uint64_t((pat>>2)&1)<<7;
         t.data[3][pt]=0x56789000|flags;

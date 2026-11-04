@@ -875,3 +875,6 @@ target_link_options(test_fat_image_ext2 PRIVATE -Wl,--gc-sections)
 target_link_libraries(test_fat_image_ext2 PRIVATE Threads::Threads)
 add_test(NAME test_fat_image_ext2 COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_image_ext2/run.py" "$<TARGET_FILE:test_fat_image_ext2>")
 set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)
+
+add_host_test(test_intel_bdw_forcewake_adapter)
+target_compile_options(test_intel_bdw_forcewake_adapter PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")

@@ -739,11 +739,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // If found, the drive is mounted at that path automatically.
     // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
-    brook::BdwGopObserveConfigure(bootProtocol);
     brook::DellGpuVtdObserveConfigure();
     // One-shot HDA observation executes on the BSP before AP scheduler entry
     // and before audio modules can claim the controller.
     brook::NativeTscObserveConfigure();
+    brook::BdwGopObserveConfigure(bootProtocol);
     brook::HdaObserveConfigure(bootProtocol);
     brook::AhciObserveConfigure(bootProtocol);
     brook::AhciReadOnlyInit();

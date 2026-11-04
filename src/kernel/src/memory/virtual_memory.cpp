@@ -11,6 +11,7 @@
 #include "intel_vtd_probe_policy.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_forcewake_ack.h"
+#include "intel_bdw_forcewake_adapter.h"
 
 namespace brook {
 
@@ -595,6 +596,47 @@ bool VmmDellForcewakeAckCriticalRead(uint32_t& result) {
     const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
     const bool ok=BdwForcewakeAckCritical(io,result);
     IrqSpinLockRelease(&g_kernelPtLock,irq);return ok;
+}
+
+// Single boot-lifetime owner; no retries after an uncertain release. Holding
+// the kernel page-table lock also prevents mapping changes throughout cleanup.
+void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result) {
+    static bool claimed=false;result={};
+    if(__atomic_exchange_n(&claimed,true,__ATOMIC_ACQ_REL))return;
+    struct Io {
+        AuditedAliasTables tables;
+        bool owned(){return true;}
+        bool evidence(uint64_t page,DellI2cCriticalEvidence& e){
+            KernelAliasMapping identity{},direct{},current{};
+            const uint64_t root=g_kernelCR3.raw(),active=ReadCR3()&PHYS_MASK;
+            e.aliasesValid=active==root && InspectKernelAlias(tables,root,page,identity) &&
+                InspectKernelAlias(tables,root,DIRECT_MAP_BASE+page,direct) &&
+                InspectKernelAlias(tables,active,DIRECT_MAP_BASE+page,current);
+            if(page==BdwForcewakePages[0] && !current.writable)e.aliasesValid=false;
+            e.identityPresent=identity.present;e.identityMatches=identity.physical==page;e.identityPat=identity.patIndex;
+            e.directPresent=direct.present;e.directMatches=direct.physical==page;e.directPat=direct.patIndex;
+            e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==page;e.currentDirectPat=current.patIndex;
+            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(page,page,cpu) && cpu.cpu==0;
+            e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
+            return true;
+        }
+        bool read32(uint64_t address,uint32_t& value){
+            __asm__ volatile("lfence":::"memory");
+            value=*reinterpret_cast<const volatile uint32_t*>(DIRECT_MAP_BASE+address);
+            __asm__ volatile("lfence":::"memory");return true;
+        }
+        bool write32(uint64_t address,uint32_t value){
+            *reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+address)=value;
+            __asm__ volatile("mfence":::"memory");return true;
+        }
+        bool tsc(uint64_t& value){uint32_t lo,hi,aux;
+            __asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
+            value=(uint64_t(hi)<<32)|lo;return true;}
+        void relax(){__asm__ volatile("pause");}
+    } io;
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
+    result=BdwDellForcewakeCritical(io,khz);
+    IrqSpinLockRelease(&g_kernelPtLock,irq);
 }
 
 bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {

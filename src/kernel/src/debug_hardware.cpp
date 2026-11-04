@@ -315,6 +315,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"ack_page_admitted\":");r.text(s.ackPageAdmitted?"true":"false");
         r.text(",\"ack_sampled\":");r.text(s.ackSampled?"true":"false");
         if(s.ackSampled){r.text(",");r.field("ack_raw",s.ackRaw);}
+        r.text(",\"wake_requested\":");r.text(s.wakeRequested?"true":"false");
+        r.text(",\"wake_pages_admitted\":");r.text(s.wakePagesAdmitted?"true":"false");
+        r.text(",\"wake_clock_ready\":");r.text(s.wakeClockReady?"true":"false");
+        r.text(",\"wake_aliases\":");r.text(s.wakeAliases?"true":"false");
+        r.text(",\"wake_clock\":");r.text(s.wakeClock?"true":"false");
+        r.text(",\"wake_acquired\":");r.text(s.wake.acquired?"true":"false");
+        r.text(",\"wake_thread_ready\":");r.text(s.wake.threadReady?"true":"false");
+        r.text(",\"wake_sampled\":");r.text(s.wake.sampled?"true":"false");
+        r.text(",\"wake_idle\":");r.text(s.wake.idle?"true":"false");
+        r.text(",\"wake_clear_delivered\":");r.text(s.wakeClearDelivered?"true":"false");
+        r.text(",\"wake_released\":");r.text(s.wake.released?"true":"false");
+        if(s.wake.sampled){r.text(",");r.field("bcs_head",s.wake.first.head);r.text(",");r.field("bcs_tail",s.wake.first.tail);r.text(",");r.field("bcs_mode",s.wake.first.mode);
+            r.text(",");r.field("bcs_head2",s.wake.second.head);r.text(",");r.field("bcs_tail2",s.wake.second.tail);r.text(",");r.field("bcs_mode2",s.wake.second.mode);}
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware gpu-vtd")) {
