@@ -71,7 +71,12 @@ public:
         attempted_=true;state_=BdwOneShotState::Executing;
         // Admission must establish pinned, distinct usable RAM, DMA translation
         // and exclusion of all firmware and device-owned regions for all pages.
-        if(!io.exclusiveHandoff() || !io.admitPages(pages_,Count) || !io.gpuPatVerified() || !io.publish(pages_,Count)) {
+        // Idle alone does not imply execlist mode: the Dell has been observed
+        // with BCS idle in legacy submission mode. The backend must establish
+        // both the mode and a usable, owned context-status buffer before any
+        // GGTT or engine writes; this class does not switch the engine mode.
+        if(!io.exclusiveHandoff() || !io.execlistReady() || !io.admitPages(pages_,Count) ||
+           !io.gpuPatVerified() || !io.publish(pages_,Count)) {
             state_=BdwOneShotState::Prepared;return false;
         }
         if(!bind_.Bind(lease_,io)) {state_=bind_.SafeToRelease()?BdwOneShotState::Prepared:BdwOneShotState::Quarantined;return false;}

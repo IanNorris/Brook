@@ -108,6 +108,14 @@ GPU/firmware ownership, display accounting, engine HWS/CSB handoff, page-table
 publication, physical backing isolation and safe retirement are still required.
 A completion write alone does not permit freeing the context or ring.
 
+The one-shot execution interface now also requires the backend to establish
+execlist mode, an unstopped ring and owned context-status readiness before
+publishing or binding GPU-visible pages. The Dell's observed legacy mode must
+fail this gate. Host tests simulate legacy, unreadable or unstable mode, a
+stopped ring and unavailable status ownership; each rejects before publication,
+GGTT, HWS or ELSP writes, after which the caller releases prepared pages. The test backend supplies
+these answers; no physical readiness reader or mode transition is implemented.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).

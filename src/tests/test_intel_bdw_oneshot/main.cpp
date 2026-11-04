@@ -7,8 +7,9 @@
 using namespace brook;
 struct Fake {
     std::vector<BdwOwnedPage> live;uint64_t slots[8]{};uint32_t elsp[4]{};
-    unsigned allocations=0,frees=0,engineWrites=0,portWrites=0,invalidates=0,failAlloc=0,failPort=0;
-    bool handoff=true,admitted=true,pat=true,published=false,failHws=false,complete=true,idle=true,corruptSource=false;
+    unsigned allocations=0,frees=0,engineWrites=0,portWrites=0,ggttWrites=0,invalidates=0,failAlloc=0,failPort=0;
+    bool handoff=true,execlist=true,modeReadable=true,modeStable=true,ringRunning=true,csbReady=true;
+    bool admitted=true,pat=true,published=false,failHws=false,complete=true,idle=true,corruptSource=false;
     BdwBcsOneShot* reentrant=nullptr;unsigned aliasAt=0,aliasKind=0;
     ~Fake(){for(auto p:live)std::free(p.cpu);}
     bool alloc(BdwOwnedPage& out){if(++allocations==failAlloc)return false;void* p=nullptr;assert(!posix_memalign(&p,4096,4096));
@@ -18,13 +19,15 @@ struct Fake {
         return true;}
     void free(BdwOwnedPage p){if(reentrant){assert(!reentrant->ReleasePrepared(*this));assert(!reentrant->Execute(*this));}
         for(auto i=live.begin();i!=live.end();++i)if(i->cpu==p.cpu){std::free(i->cpu);live.erase(i);++frees;return;}assert(false);}
-    bool exclusiveHandoff(){return handoff;}bool gpuPatVerified(){return pat;}
+    bool exclusiveHandoff(){return handoff;}
+    bool execlistReady(){return modeReadable && modeStable && execlist && ringRunning && csbReady;}
+    bool gpuPatVerified(){return pat;}
     bool admitPages(BdwOwnedPage*,unsigned n){assert(n==19);return admitted;}
     bool publish(BdwOwnedPage*,unsigned n){assert(n==19);if(reentrant)assert(!reentrant->ReleasePrepared(*this));published=true;return true;}
     bool validateLease(const BdwGgttLease& l){return handoff && l.token==99 && l.count==8;}
     bool quiescent(){return idle;}
     bool read(uint32_t i,uint64_t& v){assert(i>=65536 && i<65544);v=slots[i-65536];return true;}
-    bool write(uint32_t i,uint64_t v){assert(i>=65536 && i<65544);slots[i-65536]=v;return true;}
+    bool write(uint32_t i,uint64_t v){assert(i>=65536 && i<65544);++ggttWrites;slots[i-65536]=v;return true;}
     bool invalidate(){++invalidates;return true;}
     bool programHws(uint64_t addr){++engineWrites;assert(published && addr==0x10006000);return !failHws;}
     bool submitDword(uint32_t v){assert(portWrites<4);elsp[portWrites++]=v;return portWrites!=failPort;}
@@ -61,6 +64,12 @@ int main(){
         assert(!x.Execute(f) && !f.engineWrites && x.ReleasePrepared(f));}
     {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));f.handoff=false;
         assert(!x.Execute(f) && !f.engineWrites && x.ReleasePrepared(f) && f.live.empty());}
+    for(unsigned failure=0;failure<5;++failure){Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));
+        if(failure==0)f.execlist=false;else if(failure==1)f.modeReadable=false;else if(failure==2)f.modeStable=false;
+        else if(failure==3)f.ringRunning=false;else f.csbReady=false;
+        assert(!x.Execute(f) && !f.published && !f.engineWrites && !f.portWrites && !f.ggttWrites && !f.invalidates);
+        for(auto slot:f.slots)assert(!slot);
+        assert(x.ReleasePrepared(f) && f.live.empty());}
     {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));f.pat=false;
         assert(!x.Execute(f) && !f.engineWrites && x.ReleasePrepared(f));}
     for(unsigned i=0;i<=4;++i){Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));
