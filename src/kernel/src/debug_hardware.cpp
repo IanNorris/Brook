@@ -311,6 +311,10 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"pages_admitted\":");r.text(s.pagesAdmitted?"true":"false");
         r.text(",\"sampled\":");r.text(s.sampled?"true":"false");
         if(s.sampled){r.text(",");r.field("first_pte_raw",s.firstPte);r.text(",");r.field("last_pte_raw",s.lastPte);}
+        r.text(",\"ack_requested\":");r.text(s.ackRequested?"true":"false");
+        r.text(",\"ack_page_admitted\":");r.text(s.ackPageAdmitted?"true":"false");
+        r.text(",\"ack_sampled\":");r.text(s.ackSampled?"true":"false");
+        if(s.ackSampled){r.text(",");r.field("ack_raw",s.ackRaw);}
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware gpu-vtd")) {

@@ -2,6 +2,7 @@
 #include "hda_dell_inventory.h"
 #include "boot_protocol/boot_protocol.h"
 #include "intel_bdw_gtt_probe.h"
+#include "intel_bdw_forcewake_ack.h"
 #include "memory/virtual_memory.h"
 #include "acpi.h"
 #include "smp.h"
@@ -11,7 +12,7 @@ namespace brook {
 namespace {
 BdwGopObservation observation{};
 bool probeAttempted=false;
-bool OptedIn(){auto* f=VfsOpen("/etc/dell-gpu-gtt-probe",VFS_O_STREAM);if(!f)return false;
+bool OptedIn(const char* path){auto* f=VfsOpen(path,VFS_O_STREAM);if(!f)return false;
     VnodeStat s{};uint64_t offset=0;char t[2]{};bool ok=!VfsStat(f,&s) && !s.isDir && !s.isSymlink && s.size==2 &&
         VfsRead(f,t,2,&offset)==2 && t[0]=='1' && t[1]=='\n';VfsRelease(f);return ok;}
 bool PowerD0(const PciDevice& d){
@@ -61,17 +62,25 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         const auto& f=boot->framebuffer;
         observation.planned=BdwPlanGopPtes(bar0,16ull<<20,bar2,256ull<<20,e.bdwGraphics.apertureControl,
             e.bdwGraphics.graphicsControl,f.physicalBase,f.width,f.height,f.stride,observation.plan);
-        observation.probeRequested=OptedIn();
-        if(!observation.probeRequested)return;
+        observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
+        observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");
+        if(!observation.probeRequested && !observation.ackRequested)return;
         probeAttempted=true;
         if(!observation.planned || SmpCurrentCpuIndex()!=0)return;
         observation.powerD0=LiveGpuMatches(e) && PowerD0(d);
-        observation.pagesAdmitted=PageAdmitted(observation.plan.firstAddress&~4095ull) &&
+        if(observation.probeRequested)observation.pagesAdmitted=PageAdmitted(observation.plan.firstAddress&~4095ull) &&
             PageAdmitted(observation.plan.lastAddress&~4095ull);
-        if(observation.powerD0 && observation.pagesAdmitted){
+        if(observation.probeRequested && observation.powerD0 && observation.pagesAdmitted){
             SerialPuts("gpu-gtt: admitted; sampling GOP endpoint entries\n");BdwGopPtes p{};
             observation.sampled=VmmDellGopPtesCriticalRead(observation.plan,p);
             if(observation.sampled){observation.firstPte=p.first;observation.lastPte=p.last;}
+        }
+        if(observation.ackRequested){
+            observation.ackPageAdmitted=PageAdmitted(DellForcewakeAckPage);
+            if(observation.powerD0 && observation.ackPageAdmitted){
+                SerialPuts("gpu-forcewake: admitted; sampling ACK only\n");
+                observation.ackSampled=VmmDellForcewakeAckCriticalRead(observation.ackRaw);
+            }
         }
         SerialPrintf("gpu-gtt: power=%u pages=%u sampled=%u\n",observation.powerD0,observation.pagesAdmitted,observation.sampled);
         return;

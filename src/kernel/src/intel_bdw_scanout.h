@@ -6,6 +6,7 @@ struct BootProtocol;
 struct BdwGopObservation {
     bool inventory=false,planned=false,probeRequested=false,powerD0=false,pagesAdmitted=false,sampled=false;
     BdwGopPtePlan plan{};uint64_t firstPte=0,lastPte=0;
+    bool ackRequested=false,ackPageAdmitted=false,ackSampled=false;uint32_t ackRaw=0;
 };
 void BdwGopObserveConfigure(const BootProtocol* boot);
 const BdwGopObservation& BdwGopObserveRead();

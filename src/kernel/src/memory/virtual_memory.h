@@ -136,6 +136,8 @@ bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status);
 struct BdwGopPtePlan;struct BdwGopPtes;
 // Caller proves audited Dell/GOP identity, BAR extents, GPU D0 and opt-in.
 bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& result);
+// Caller proves audited Dell identity, BAR extent, D0 and opt-in.
+bool VmmDellForcewakeAckCriticalRead(uint32_t& value);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.

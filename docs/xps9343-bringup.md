@@ -1549,6 +1549,12 @@ the request bit, provide UC register access and ensure its clear drains earlier
 posted writes. ACK clear alone does not prove ownership; an idle sample alone
 does not establish an engine handoff or permit GGTT mutation.
 
+An opt-in ACK-only observer is also available under
+`/etc/dell-gpu-forcewake-ack`. It checks the audited Dell identity, live PCI
+state, D0, boot-map admission and UC aliases before a single read of the
+always-on ACK register. It never writes the forcewake request. A clear ACK is
+a point-in-time observation and does not prove ownership of request bit 0.
+
 The exact candidate refused the Dell-only probe in private QEMU, then booted
 on the Dell after a clean restart with the previous slot retained. The probe
 passed its D0, boot-map and cache gates and read raw endpoint entries
