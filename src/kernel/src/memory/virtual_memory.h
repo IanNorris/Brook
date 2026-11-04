@@ -93,6 +93,7 @@ bool VmmHostUsesKernelPtLock(PageTable root,VirtualAddress address);
 // A private test-only root: never attach to a process or switch CR3 to it.
 PageTable VmmHostCreateOwnerExperiment();
 bool VmmHostOwnerExperimentActive(PageTable root);
+bool VmmHostOwnerSlotPresent(PageTable root,VirtualAddress address);
 #endif
 #endif
 

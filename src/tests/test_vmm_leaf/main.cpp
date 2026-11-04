@@ -2438,7 +2438,7 @@ static void extendedOwnerExperiment() {
     CHECK(VmmTryMapPage(experiment,va,pages[1],flags,MemTag::User,5119)==VmmMapResult::Occupied);
     CHECK(!VmmMapPage(experiment,va,pages[1],flags,MemTag::User,1));
     CHECK(!VmmGetPte(experiment,va));
-    CHECK(!VmmMoveRange(experiment,va.raw(),va.raw()+pageSize,va.raw()+8*pageSize));
+    CHECK(!VmmMoveRange(experiment,va.raw(),va.raw()+pageSize,va.raw()+pageSize));
     CHECK(!VmmProtectRange(experiment,va.raw(),va.raw()+pageSize,1,nullptr,nullptr));
     CHECK(VmmCowResolveWrite(experiment,va,1).result==VmmCowResult::NotCow);
     CHECK(!VmmDetachPage(experiment,va));
@@ -2534,6 +2534,57 @@ static void extendedOwnerCowExperiment() {
     CHECK(result.owner==(a.result==VmmCowResult::Resolved?1024:5119));
     checkBytes(VmmLeafPhysical(result.raw));
     auto retired=a.retired?a.retired:b.retired;CHECK(retired==raced);PmmUnrefPage(retired);PmmUnrefPage(raced);
+    VmmDestroyUserPageTable(pt);PmmFreePage(kernel.pml4);VmmHostSetKernelRoot({});empty();
+}
+static void extendedOwnerMoveExperiment() {
+    auto kernel=table();VmmHostSetKernelRoot(kernel);auto pt=VmmHostCreateOwnerExperiment();CHECK(pt);
+    constexpr uint64_t source=0x40000000,target=0x60000000,span=0x201000;
+    constexpr uint64_t offsets[]={0,pageSize,2*pageSize,0x200000};
+    const uint16_t owners[]={1022,1023,1024,5119};PhysicalAddress pages[4];uint64_t raw[4];
+    CHECK(VmmPrepareRange(pt,source,source+span) && VmmPrepareRange(pt,target,target+span));
+    for(unsigned i=0;i<4;++i){pages[i]=PmmAllocPage();CHECK(pages[i]);
+        const auto bits=i==3?((flags&~VMM_WRITABLE)|PTE_COW_BIT):flags;
+        CHECK(VmmTryMapPage(pt,VirtualAddress(source+offsets[i]),pages[i],bits,MemTag::User,owners[i],i!=2)==VmmMapResult::Mapped);
+        raw[i]=VmmReadOwnedLeaf(pt,VirtualAddress(source+offsets[i])).raw;
+    }
+    // Source spans two L1 tables. Reserve one destination sidecar then fail
+    // the second; neither source nor destination may change.
+    failFrameAfter=1;CHECK(!VmmPrepareMove(pt,source,source+span,target));CHECK(failFrameAfter.load()==-1);
+    CHECK(!VmmReadOwnedLeaf(pt,VirtualAddress(target)).raw);
+    for(unsigned i=0;i<4;++i)CHECK(VmmReadOwnedLeaf(pt,VirtualAddress(source+offsets[i])).raw==raw[i] && maps(pages[i])==1);
+    CHECK(!VmmCanMoveRange(pt,source,source+span,target,true));
+    auto displaced=PmmAllocPage();CHECK(displaced);
+    CHECK(VmmTryMapPage(pt,VirtualAddress(target),displaced,flags,MemTag::User,4096)==VmmMapResult::Mapped);
+    const auto displacedRaw=VmmReadOwnedLeaf(pt,VirtualAddress(target));
+    CHECK(VmmPrepareMove(pt,source,source+span,target));CHECK(VmmCanMoveRange(pt,source,source+span,target,true));
+    CHECK(!VmmMoveRange(pt,source,source+span,target));
+    CHECK(VmmReadOwnedLeaf(pt,VirtualAddress(target)).raw==displacedRaw.raw && VmmReadOwnedLeaf(pt,VirtualAddress(target)).owner==4096);
+    auto removed=VmmDetachOwnedPage(pt,VirtualAddress(target));CHECK(removed.owner==4096 && VmmLeafPhysical(removed.raw)==displaced);
+    PmmUnrefPage(displaced);
+    // An occupied destination opposite a source hole must reject the entire move.
+    auto hole=PmmAllocPage();CHECK(hole);
+    CHECK(VmmTryMapPage(pt,VirtualAddress(target+3*pageSize),hole,flags,MemTag::User,5119)==VmmMapResult::Mapped);
+    CHECK(!VmmMoveRange(pt,source,source+span,target));
+    CHECK(VmmReadOwnedLeaf(pt,VirtualAddress(source+0x200000)).owner==5119);
+    CHECK(VmmDetachOwnedPage(pt,VirtualAddress(target+3*pageSize)).owner==5119);PmmUnrefPage(hole);
+    failFrameAfter=0;CHECK(VmmMoveRange(pt,source,source+span,target));CHECK(failFrameAfter.load()==0);failFrameAfter=-1;
+    for(unsigned i=0;i<4;++i){const auto moved=VmmReadOwnedLeaf(pt,VirtualAddress(target+offsets[i]));
+        CHECK(!VmmReadOwnedLeaf(pt,VirtualAddress(source+offsets[i])).raw && moved.raw==raw[i] && moved.owner==owners[i]);
+        CHECK(!VmmHostOwnerSlotPresent(pt,VirtualAddress(source+offsets[i])));
+        CHECK(VmmHostOwnerSlotPresent(pt,VirtualAddress(target+offsets[i]))==(owners[i]>=1023));
+        CHECK(PmmGetRefCount(pages[i])==1 && maps(pages[i])==1);
+    }
+    // Transfer three mixed owners within the same L1, including a hidden leaf.
+    CHECK(VmmPrepareMove(pt,target,target+3*pageSize,target+8*pageSize));
+    CHECK(VmmMoveRange(pt,target,target+3*pageSize,target+8*pageSize));
+    for(unsigned i=0;i<3;++i){const auto moved=VmmReadOwnedLeaf(pt,VirtualAddress(target+(8+i)*pageSize));
+        CHECK(moved.raw==raw[i] && moved.owner==owners[i] && maps(pages[i])==1);
+        CHECK(!VmmHostOwnerSlotPresent(pt,VirtualAddress(target+i*pageSize)));
+        CHECK(VmmHostOwnerSlotPresent(pt,VirtualAddress(target+(8+i)*pageSize))==(owners[i]>=1023));
+    }
+    auto reused=PmmAllocPage();CHECK(reused);
+    CHECK(VmmTryMapPage(pt,VirtualAddress(target),reused,flags,MemTag::User,5119)==VmmMapResult::Mapped);
+    CHECK(VmmReadOwnedLeaf(pt,VirtualAddress(target)).owner==5119);
     VmmDestroyUserPageTable(pt);PmmFreePage(kernel.pml4);VmmHostSetKernelRoot({});empty();
 }
 static void vmallocIntegration() {
@@ -2709,6 +2760,6 @@ int main(int argc,char** argv) {
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
-    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();extendedOwnerCowExperiment();vmallocIntegration();
+    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();extendedOwnerCowExperiment();extendedOwnerMoveExperiment();vmallocIntegration();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }
