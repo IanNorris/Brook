@@ -7,8 +7,10 @@ the remaining observation/event conveniences are still pending. Reload the MCP p
 its previously loaded tool schema does not acquire new tools automatically.
 
 The kernel and the rebuilt `waylandd` package are both required for Wayland
-connection-origin metadata. An older server leaves origins unknown and close
-unsupported, rather than attributing a client window to the shared server.
+connection-origin metadata. At this historical checkpoint, an older server
+left origins unknown and close unsupported. Later kernels permit cooperative
+close of unknown-origin API windows without attributing them to the shared
+server; client-group exit remains unobservable without a verified origin.
 
 ## Environment and evidence
 

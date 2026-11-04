@@ -374,8 +374,11 @@ resize and close paths. `completed` confirms WM state applied or graceful close
 enqueued, not a client configure acknowledgement, completed redraw or process
 exit. Native close sends SIGHUP to a terminal or SIGTERM to another native
 provider; Wayland close sends the ordinary close event, never a signal to the
-shared Wayland server. Unknown client ownership and kernel-service close are
-unsupported. A full notification queue rejects the semantic action explicitly.
+shared Wayland server. An API window with unknown client ownership can receive
+the same cooperative event, but its client-group exit cannot be confirmed.
+Unknown clients without an API event queue and kernel-service close remain
+unsupported; the bridge never signals an unknown provider as a fallback. A
+full notification queue rejects the semantic action explicitly.
 
 The response includes a fresh windows observation, with its host capture
 interval and guest sample tick. The WM values are captured under one lock;

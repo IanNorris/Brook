@@ -1573,7 +1573,11 @@ int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
         if(restoreTarget && (w.state==WindowState::Maximized)!=(restoreTarget==2))return -12;
         RestoreWindowLocked(idx);break;
     case WmDebugAction::Close:
-        if(w.clientOrigin==WmClientOrigin::Unknown || w.proc->isKernelThread)return -95;
+        // An API window receives a cooperative close event through its own
+        // queue, even when a compositor cannot identify its client.  Never
+        // use the signal fallback for an unknown client: w.proc is then the
+        // provider and may own many unrelated windows.
+        if(w.proc->isKernelThread || (w.clientOrigin==WmClientOrigin::Unknown && !w.vfb))return -95;
         if(!RequestCloseLocked(idx,closeMethod))return -11;
         break;
     }

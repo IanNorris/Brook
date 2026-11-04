@@ -160,9 +160,10 @@ Known gaps and remaining gates:
 - XShape bounding-region clipping is not implemented. Shaped xeyes buffers can
   expose undefined pixels outside the eye shapes; do not treat these captures as
   proof of clean shaped-window rendering.
-- MCP semantic close rejects X windows with unknown client-origin metadata.
-  Native chrome close dispatch works. Do not invent PID-based signal authority
-  from untrusted X properties to bypass this limitation.
+- MCP semantic close can dispatch a cooperative event to an API window even
+  when its client origin is unknown. It does not infer an X client PID or
+  provide client-group exit confirmation without a verified origin; it never
+  signals the provider as a fallback for an unknown client.
 - Steam authenticated evidence, profiles and downloaded software remain private.
   The previous SDL3 host crash review disks are preserved independently.
 
@@ -193,6 +194,15 @@ Launching the same client again reached a new Steam window. This establishes a
 window-level relaunch in that test, not automatic app recovery, interaction
 with the relaunched client, audible audio, or Dell acceptance. The VM stopped
 after a checked filesystem and device flush.
+
+With the cooperative-close kernel change in a private VM, xeyes reported an
+unknown client origin and advertised close. A bridge close completed by event
+delivery, the window disappeared and the xeyes job exited 0. Closing one of
+two xeyes windows left the other and their shared compositor provider alive;
+a stale window incarnation was rejected. This establishes the X11 control path
+in that VM, not Steam close behavior or Dell acceptance. The top-level bare-metal
+test build separately failed to link existing fixture dependencies including
+ModuleRetainAddresses and CPU memory-type helpers; the kernel itself compiled.
 
 ## Xwayland interval-timer lead
 

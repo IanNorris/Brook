@@ -100,7 +100,7 @@ void SerializeWindow(Json& json,const WmDebugWindow& window) {
     json.text(",\"supports\":[");
     if(window.focusable) {
         json.text("\"focus\",\"minimize\",\"maximize\",\"restore\"");
-        if(window.clientOrigin!=WmClientOrigin::Unknown&&!window.providerKernel)json.text(",\"close\"");
+        if(!window.providerKernel && (window.clientOrigin!=WmClientOrigin::Unknown || window.apiWindow))json.text(",\"close\"");
     }json.text("]}");
 }
 const char* PhaseName(Phase phase) {

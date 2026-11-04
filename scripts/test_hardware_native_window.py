@@ -33,9 +33,18 @@ try:
         else:raise TimeoutError('Window missing')
         w=windows[0];result[label+'_window']=w;save()
         if label=='relay':
-            assert w['client_origin']=='unknown' and w['client'] is None and 'close' not in w['supports'],w
-            run('stop-relay',['/nix/profile/bin/bash','-c','kill -TERM "$1"','native-test',str(pid)])
-            result['relay_exit']=wait(i);save()
+            assert w['client_origin']=='unknown' and w['client'] is None and w['api_window'] and 'close' in w['supports'],w
+            close=uuid.uuid4().hex;result['relay_close_request']=close;save()
+            c=h.window(s,w['reference'],'close',close,wait_for='closed',wait_s=2)
+            end=time.monotonic()+30
+            while not c.get('wait_condition_met') and time.monotonic()<end:
+                assert c.get('state') not in ('failed','rejected','lost'),c
+                c=h.ui_status(s,close,wait_for='closed',wait_s=2)
+            assert c.get('wait_condition_met'),c
+            assert c.get('guest',{}).get('close_method')==1,c
+            result['relay_close']=c;result['relay_exit']=wait(i);save()
+            assert result['relay_exit'].get('exit',{}).get('code')==0,result['relay_exit']
+            assert 'NATIVE_WINDOW_CLOSED' in result['relay_exit'].get('stdout',{}).get('text','')
         else:
             assert w['client_origin']=='native_process' and w['client']['pid']==pid and 'close' in w['supports'],w
             close=uuid.uuid4().hex;result['close_request']=close;save()
