@@ -144,3 +144,25 @@ keeping the real shared-memory and GLX checks as regressions.
 The following [robust-futex checkpoint](steam-robust-futex-checkpoint.md)
 identifies and removes that exit-139 assertion, with a separate later startup
 failure still under investigation.
+
+## Dell wider shared-memory comparison, 2026-11-04
+
+An opt-in `/etc/tmpfs-shm-wide` marker changes the desktop shared-memory share
+from one half to three quarters of the existing aggregate tmpfs budget; it does
+not enlarge that budget. The default is unchanged. The exact Dell kernel and
+initrd were first booted in QEMU, and the previous Dell boot slot was retained.
+
+On the Dell, the resulting `/dev/shm` quota was 1,487,568,896 bytes. Thirty
+samples five seconds apart found a minimum of 231,550,976 bytes free. An earlier
+run with a 991,711,232-byte quota reached approximately 1 MiB free and logged
+an out-of-space error. These runs were not synchronized and application traffic
+can vary, so this is evidence of improved headroom, not a controlled proof of
+the cause of the Steam freeze.
+
+In the wider run, the Steam log contained no out-of-space, corruption or
+unresponsive messages when checked after sampling, and Stardew reached its
+title screen. The game was clipped inside the nested X server; neither this
+observation nor the absence of log messages proves sustained interaction or
+production readiness. Steam's tracked job later peaked at 243 of its 512-task
+allowance with no denied task births. Its silent diagnostic audio setup was
+unchanged. The quota experiment remains opt-in pending broader validation.
