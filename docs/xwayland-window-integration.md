@@ -202,10 +202,16 @@ An initial Steam attempt in that private clone was invalid because it omitted
 the earlier review's validated provider-loader payload. With the current
 kernel, matching modules and the original payload restored, SteamRT progressed
 and launched approximately 90 tasks, but no Steam window appeared. The private
-runtime log reported repeated `Too many open files` errors; no matching kernel
-FD-exhaustion diagnostic was observed, so the source and whether it is an
-actual per-process descriptor limit or a propagated error remain unconfirmed.
-The VM was synced and stopped. This is not a matched Steam A/B result.
+runtime log reported repeated `Too many open files` errors. A later run on the
+same private configuration showed Steam's shared descriptor table at the
+kernel's 1,024-entry capacity: `/proc/89/fd` contained 945 `memfd` descriptors,
+39 paths and 40 other descriptors. Several Steam threads exposed the same full
+table. The log also reported repeated software Vulkan/EGL initialization
+failures; this host has no available render node, so a failure/retry loop is a
+plausible lead, not an established cause. Descriptor names and allocation stacks
+were not captured. No matching kernel FD-exhaustion diagnostic was observed;
+several descriptor installation paths return EMFILE without that log. The VM
+was synced and stopped. This is not a matched Steam A/B or Dell result.
 
 The fixture also checks caught and default `SIGALRM` delivery to a child
 spinning without syscalls; these checks pass on Linux. Brook's current caught
