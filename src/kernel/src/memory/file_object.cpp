@@ -185,10 +185,9 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     VnodeStat stat{};int result=0;
     if(knownStat)stat=*knownStat;else result=vnode->ops->stat(vnode,&stat);
     if(result || index*4096>=stat.size) { if(error)*error=result?result:-6;return PhysicalAddress{}; }
-    if(object->prepareBackingPage) {
-        int prepared=object->prepareBackingPage(object->pageBudgetContext,index);
-        if(prepared) {if(error)*error=prepared;return PhysicalAddress{};}
-    }
+    // Reserve and allocate the canonical page before materializing backend
+    // storage. Under a full quota, a failed canonical allocation must not
+    // leave an otherwise unused sparse backend page charged to the inode.
     constexpr uint64_t charge=4096+sizeof(FileObjectPage);
     if(object->reservePageBytes && !object->reservePageBytes(object->pageBudgetContext,charge)) {
         if(error)*error=-28;
@@ -199,6 +198,13 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     if(!page) { rollback();if(error)*error=-12;return PhysicalAddress{}; }
     auto physical=PmmAllocPage(MemTag::User,KernelPid);
     if(!physical) { kfree(page);rollback();if(error)*error=-12;return PhysicalAddress{}; }
+    if(object->prepareBackingPage) {
+        int prepared=object->prepareBackingPage(object->pageBudgetContext,index);
+        if(prepared) {
+            PmmUnrefPage(physical);kfree(page);rollback();
+            if(error)*error=prepared;return PhysicalAddress{};
+        }
+    }
     auto* bytes=reinterpret_cast<void*>(PhysToVirt(physical).raw());memset(bytes,0,4096);
     uint64_t offset=index*4096;
     uint64_t required=stat.size-offset;if(required>4096)required=4096;

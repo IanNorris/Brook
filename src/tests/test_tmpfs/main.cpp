@@ -257,10 +257,12 @@ static void mappedQuota()
     for(int fail=-1;fail<3;++fail) {
         auto* fs=make();auto* r=root(fs);auto* f=create(r,"sparse");auto* object=f->ops->file_object(f);
         assert(!FileObjectTruncateUnmapped(object,f,8192));
+        const uint64_t before=fs->bytes;
         failAllocation=fail;failFrame=fail==2;
         int error=0;auto page=FileObjectGetPage(object,f,0,true,&error);
         failAllocation=-1;failFrame=false;
-        if(fail>=0)assert(!page && (error==-12 || error==-28));
+        if(fail>=0)assert(!page && (error==-12 || error==-28) && fs->bytes==before &&
+                           !FindPage(VnodeNode(f),0) && frames.empty());
         else {
             assert(page && !error && frames.size()==1);
             auto charged=fs->bytes;
@@ -269,6 +271,18 @@ static void mappedQuota()
             assert(!FileObjectTruncateUnmapped(object,f,0) && frames.empty());
         }
         assert(!r->ops->remove(r,"sparse",false));VfsClose(f);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
+    }
+    // Enough quota for either a backend page or a canonical page, but not
+    // both: a failed sparse fault must not retain the backend allocation.
+    {
+        auto* tight=make();auto* dir=root(tight);auto* file=create(dir,"pressure");
+        auto* cache=file->ops->file_object(file);assert(!FileObjectTruncateUnmapped(cache,file,4096));
+        const auto reserved=TmpfsDefaultBytes-tight->bytes-5000;assert(Reserve(tight,reserved));
+        const auto before=tight->bytes;int pressureError=0;
+        assert(!FileObjectGetPage(cache,file,0,true,&pressureError) && pressureError==-28);
+        assert(tight->bytes==before && !FindPage(VnodeNode(file),0) && frames.empty());
+        Unreserve(tight,reserved);assert(!dir->ops->remove(dir,"pressure",false));
+        VfsClose(file);VfsObjectRelease(dir);assert(!TmpfsDestroy(tight));clean();
     }
     auto* fs=make();auto* r=root(fs);auto* f=create(r,"sparse");auto* object=f->ops->file_object(f);
     assert(!FileObjectTruncateUnmapped(object,f,8192));
@@ -337,15 +351,16 @@ static void indexedMappedQuota()
     auto* fs=make();auto* r=root(fs);auto* f=create(r,"indexed-mapped");auto* node=VnodeNode(f);
     assert(!f->ops->truncate(f,32*4096));
     for(unsigned i=0;i<31;++i)assert(!PrepareBackingPage(node,i));
-    // Leave exactly enough for backing page 32 and the first bucket table,
-    // but no canonical-frame quota. Metadata is honestly charged; this fault
-    // must fail without publishing a canonical page or losing the backend.
+    // Leave enough for the backing page and index, but not both it and the
+    // canonical frame. The failed fault must not materialize either object.
     const uint64_t backend=sizeof(Page)+sizeof(Allocation)+64*sizeof(Page*)+sizeof(Allocation);
     const uint64_t spare=fs->byteLimit-fs->bytes-backend;assert(Reserve(fs,spare));
+    const uint64_t before=fs->bytes;
     int error=0;auto* object=f->ops->file_object(f);auto page=FileObjectGetPage(object,f,31,true,&error);
-    assert(!page && error==-28 && fs->bytes==fs->byteLimit && frames.empty());
+    assert(!page && error==-28 && fs->bytes==before && frames.empty());
+    assert(!FindPage(node,31) && !node->pageBuckets);
     unsigned char byte=0x5a;uint64_t offset=31*4096+17;
-    assert(f->ops->write(f,&byte,1,&offset)==1); // Existing indexed page: no allocation.
+    assert(f->ops->write(f,&byte,1,&offset)==1); // Explicit write can materialize the page and index.
     Unreserve(fs,spare);
     page=FileObjectGetPage(object,f,31,true,&error);assert(page && !error);
     assert(reinterpret_cast<unsigned char*>(page.raw())[17]==0x5a);PmmUnrefPage(page);

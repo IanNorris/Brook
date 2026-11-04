@@ -77,9 +77,10 @@ Callbacks use a retained inode context; final quota release is non-sleeping.
 Module ABI is 48, requiring a matched kernel and all modules.
 
 Sparse backing is materialized before publishing a canonical page, so later
-writable exposure cannot exhaust the capacity needed for writeback. A later
-canonical allocation failure may leave a charged zero backend page; it does not
-extend EOF, and inode teardown reclaims it. Backend and canonical storage are
+writable exposure cannot exhaust the capacity needed for writeback. Canonical
+allocation and its quota reservation now happen before backend materialization, so a failure at those stages leaves no charged sparse backend
+page. A later backend read failure may still leave a charged zero page; it does
+not extend EOF, and inode teardown reclaims it. Backend and canonical storage are
 both charged honestly. Defaults remain 16 MiB per instance and 256 MiB globally;
 this is not whole-process/private-COW memory accounting.
 
@@ -166,3 +167,20 @@ observation nor the absence of log messages proves sustained interaction or
 production readiness. Steam's tracked job later peaked at 243 of its 512-task
 allowance with no denied task births. Its silent diagnostic audio setup was
 unchanged. The quota experiment remains opt-in pending broader validation.
+
+## Sparse-fault quota rollback
+
+A failed mapped fault under quota or physical-frame pressure no longer leaves
+a newly materialized, unused backing page charged to tmpfs. Canonical quota,
+metadata and frame are obtained first; backend preparation failure releases all
+three. This preserves pre-materialization before the page is exposed. A later
+backend read error can still leave a backing page; this change does not unify
+the two physical copies or prove a cause of Steam's freeze.
+
+The tmpfs, file-object, mapping-pin and mapping-range host tests pass, including
+a constrained-quota case that would formerly retain a backing page and index.
+The matched kernel and initrd reached the desktop in a private QEMU boot. A Dell
+clean restart into the staged candidate was requested, but the debug link did
+not return; hardware acceptance remains pending. Astra reviewed the ordering
+and rollback; it noted that concurrent quota and PMM exhaustion may now return
+ENOMEM first.

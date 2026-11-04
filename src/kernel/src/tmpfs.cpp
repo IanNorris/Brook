@@ -537,9 +537,9 @@ int PrepareBackingPage(void* context,uint64_t index)
     Guard held(n->fs);
     if(FindPage(n,index))return 0;
     // Materialize sparse storage before exposing a canonical page. Writeback
-    // then needs no persistent allocation, even at quota exhaustion. This can
-    // leave a charged zero page if a later canonical allocation fails; it does
-    // not extend EOF and ordinary inode teardown reclaims it.
+    // then needs no persistent allocation, even at quota exhaustion. The
+    // canonical frame and metadata have already been allocated. A subsequent
+    // backend read error can leave a charged zero page, reclaimed at teardown.
     auto* page=static_cast<Page*>(Allocate(n->fs,sizeof(Page)));
     if(!page)return -28;
     page->index=index;InsertPage(n,page);
