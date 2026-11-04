@@ -877,6 +877,7 @@ add_test(NAME test_fat_image_ext2 COMMAND python3 "${BROOK_ROOT}/src/tests/test_
 set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)
 
 add_host_test(test_intel_bdw_forcewake_adapter)
+add_host_test(test_real_interval_timer)
 target_compile_options(test_intel_bdw_forcewake_adapter PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_context)
 target_compile_options(test_intel_bdw_context PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")

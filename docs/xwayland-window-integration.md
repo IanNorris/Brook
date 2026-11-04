@@ -184,3 +184,11 @@ substituted. VIRTUAL and PROF need separate CPU accounting.
 Upstream's [smart-scheduling timer](https://raw.githubusercontent.com/XQuartz/xorg-server/master/os/utils.c)
 explains the repeated REAL timer calls. Whether a `-dumbSched` diagnostic A/B
 improves this particular workload remains untested.
+
+The fixture also checks caught and default `SIGALRM` delivery to a child
+spinning without syscalls; these checks pass on Linux. Brook's current caught
+signal delivery occurs at syscall return, so the timer must remain disabled
+until IRQ return can deliver it too. An isolated `RealIntervalTimer` state
+machine models pending, periodic phase and reprogramming; it is not connected
+to the syscall or production alarm. Group identity, locking, signal disposition,
+lifecycle and IRQ integration remain.
