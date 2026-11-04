@@ -89,6 +89,11 @@ uint64_t VmmFramebufferMapping(uint64_t physical, uint64_t bytes);
 #ifdef BROOK_HOST_TEST
 void VmmHostSetKernelRoot(PageTable root);
 bool VmmHostUsesKernelPtLock(PageTable root,VirtualAddress address);
+#ifndef BROOK_STANDALONE_TEST
+// A private test-only root: never attach to a process or switch CR3 to it.
+PageTable VmmHostCreateOwnerExperiment();
+bool VmmHostOwnerExperimentActive(PageTable root);
+#endif
 #endif
 
 // ---------------------------------------------------------------------------

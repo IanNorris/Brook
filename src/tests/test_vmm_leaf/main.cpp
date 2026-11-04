@@ -2402,6 +2402,80 @@ static void ownerSidecarLifetime() {
     const auto fresh=live();CHECK(VmmPrepareOwnerSidecar(next,va) && live()==fresh+1);
     VmmDestroyUserPageTable(next);PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
 }
+static void extendedOwnerExperiment() {
+    auto kernel=table();VmmHostSetKernelRoot(kernel);
+    const VirtualAddress high(0xffffc10000000000ULL);
+    auto shared=PmmAllocPage();CHECK(shared);
+    CHECK(VmmTryMapPage(kernel,high,shared,flags)==VmmMapResult::Mapped);
+    auto experiment=VmmHostCreateOwnerExperiment();CHECK(experiment);
+    CHECK(!VmmHostCreateOwnerExperiment());
+    auto ordinary=VmmCreateUserPageTable();CHECK(ordinary);
+    const auto sharedRaw=VmmReadLeaf(kernel,high);
+    CHECK(VmmTryMapPage(experiment,high,shared,flags,MemTag::User,5119)==VmmMapResult::InvalidAddress);
+    CHECK(!VmmDetachOwnedPage(experiment,high).raw && !VmmReadOwnedLeaf(experiment,high).raw);
+    CHECK(VmmReadLeaf(kernel,high)==sharedRaw && maps(shared)==1);
+    AddressSpaceState src{},dst{};src.pageTable=experiment;dst.pageTable=ordinary;Process actor{};
+    CHECK(!UserMappingClone(&actor,&src,&dst,7));
+    src.pageTable=ordinary;dst.pageTable=experiment;CHECK(!UserMappingClone(&actor,&src,&dst,7));
+    CHECK(VmmPrepareRange(experiment,va.raw(),va.raw()+4*pageSize));
+    PhysicalAddress pages[4];for(auto& page:pages){page=PmmAllocPage();CHECK(page);}
+    failFrameAfter=0;
+    CHECK(VmmTryMapPage(experiment,va,pages[0],flags,MemTag::User,1023)==VmmMapResult::OutOfMemory);
+    CHECK(failFrameAfter.load()==-1 && !VmmReadLeaf(experiment,va) && !maps(pages[0]));
+    const uint16_t owners[]={1022,1023,1024,5119};
+    for(unsigned i=0;i<4;++i){const auto address=va+i*pageSize;
+        CHECK(VmmTryMapPage(experiment,address,pages[i],flags,MemTag::User,owners[i],i!=3)==VmmMapResult::Mapped);
+        const auto owned=VmmReadOwnedLeaf(experiment,address);CHECK(owned.owner==owners[i] && VmmLeafPhysical(owned.raw)==pages[i]);
+        CHECK(maps(pages[i])==1);
+    }
+    CHECK((VmmReadLeaf(experiment,va+3*pageSize)&PTE_HIDDEN_BIT)!=0);
+    auto ordinaryPage=PmmAllocPage();CHECK(ordinaryPage);
+    CHECK(VmmTryMapPage(ordinary,va,ordinaryPage,flags,MemTag::User,1023)==VmmMapResult::Mapped);
+    CHECK(VmmReadOwnedLeaf(ordinary,va).owner==1023);
+    CHECK(((VmmReadLeaf(experiment,va+3*pageSize)&PTE_PID_MASK)>>PTE_PID_SHIFT)==1023);
+    CHECK(VmmTryMapPage(experiment,va+4*pageSize,pages[0],flags,MemTag::User,5120)==VmmMapResult::InvalidAddress);
+    CHECK(VmmTryMapPage(experiment,va,pages[1],flags,MemTag::User,5119)==VmmMapResult::Occupied);
+    CHECK(!VmmMapPage(experiment,va,pages[1],flags,MemTag::User,1));
+    CHECK(!VmmGetPte(experiment,va));
+    CHECK(!VmmMoveRange(experiment,va.raw(),va.raw()+pageSize,va.raw()+8*pageSize));
+    CHECK(!VmmProtectRange(experiment,va.raw(),va.raw()+pageSize,1,nullptr,nullptr));
+    CHECK(VmmCowResolveWrite(experiment,va,1).result==VmmCowResult::InvalidOwner);
+    CHECK(!VmmDetachPage(experiment,va));
+    CHECK(!VmmDetachOwnedPageIfMatches(experiment,va+2*pageSize,pages[0]).raw);
+    CHECK(VmmReadOwnedLeaf(experiment,va+2*pageSize).owner==1024);
+    auto old=VmmDetachOwnedPage(experiment,va+2*pageSize);CHECK(old.owner==1024 && VmmLeafPhysical(old.raw)==pages[2]);
+    CHECK(VmmTryMapPage(experiment,va+2*pageSize,pages[2],flags,MemTag::User,19)==VmmMapResult::Mapped);
+    CHECK(VmmReadOwnedLeaf(experiment,va+2*pageSize).owner==19);
+    struct Captures {VmmOwnedLeaf leaf[4]{};unsigned n=0;} captured;
+    auto save=[](VirtualAddress,VmmOwnedLeaf leaf,void* p){auto* c=static_cast<Captures*>(p);CHECK(c->n<4);c->leaf[c->n++]=leaf;};
+    uint64_t count=99;CHECK(!VmmDetachRange(experiment,va.raw(),va.raw()+4*pageSize,3,save,&captured,&count));
+    CHECK(!count && !captured.n && VmmReadOwnedLeaf(experiment,va+3*pageSize).owner==5119);
+    CHECK(VmmDetachRange(experiment,va.raw(),va.raw()+4*pageSize,4,save,&captured,&count));
+    const uint16_t expected[]={1022,1023,19,5119};CHECK(count==4 && captured.n==4);
+    for(unsigned i=0;i<4;++i)CHECK(captured.leaf[i].owner==expected[i] && !maps(pages[i]));
+    // Detach retains the sidecar: restoring to the same L1 needs no allocator.
+    failFrameAfter=0;
+    CHECK(VmmTryMapPage(experiment,va,pages[0],flags,MemTag::User,5119)==VmmMapResult::Mapped);
+    CHECK(failFrameAfter.load()==0 && VmmReadOwnedLeaf(experiment,va).owner==5119);
+    failFrameAfter=-1;CHECK(VmmDetachOwnedPage(experiment,va).owner==5119);
+    for(auto page:pages)PmmUnrefPage(page);
+    const auto oldRoot=experiment.pml4;VmmDestroyUserPageTable(experiment);
+    auto reused=VmmCreateUserPageTable();CHECK(reused && reused.pml4==oldRoot);
+    auto reusedPage=PmmAllocPage();CHECK(reusedPage);
+    CHECK(VmmTryMapPage(reused,va,reusedPage,flags,MemTag::User,1023)==VmmMapResult::Mapped);
+    CHECK(VmmReadOwnedLeaf(reused,va).owner==1023 && VmmReadOwnedLeaf(ordinary,va).owner==1023);
+    VmmDestroyUserPageTable(reused);
+    std::atomic<bool> running{true};std::atomic<unsigned> reads{0};
+    std::thread reader([&]{while(running.load()){
+        CHECK(VmmReadOwnedLeaf(ordinary,va).owner==1023);++reads;
+    }});
+    while(!reads.load())std::this_thread::yield();
+    for(unsigned i=0;i<32;++i){auto transient=VmmHostCreateOwnerExperiment();CHECK(transient);VmmDestroyUserPageTable(transient);}
+    running=false;reader.join();CHECK(reads.load());
+    VmmDestroyUserPageTable(ordinary);
+    CHECK(VmmLeafPhysical(VmmDetachPage(kernel,high))==shared);PmmUnrefPage(shared);
+    freeEmptyKernelTables(kernel.pml4,4);VmmHostSetKernelRoot({});empty();
+}
 static void vmallocIntegration() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto warm=VmmAllocPages(2);CHECK(warm);
@@ -2575,6 +2649,6 @@ int main(int argc,char** argv) {
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
-    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();vmallocIntegration();
+    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();vmallocIntegration();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

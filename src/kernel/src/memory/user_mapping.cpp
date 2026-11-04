@@ -74,6 +74,9 @@ static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destin
 bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceState* destination, uint16_t pid) {
     if (!actor || !source || !destination || source->kernel || destination->kernel ||
         source==destination || destination->ranges.head) return false;
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+    if(VmmHostOwnerExperimentActive(source->pageTable) || VmmHostOwnerExperimentActive(destination->pageTable))return false;
+#endif
     for (;;) {
         PageableMemoryFork paging(actor,source);
         MappingTransaction operation(actor,source);

@@ -50,6 +50,14 @@ static IrqSpinLock g_userPtLock;
 // Registry keyed by user L1 frame; protected by g_userPtLock. Entries remain
 // alive across empty slots and are retired with the containing L1 table.
 static PteOwnerSidecars g_userOwnerSidecars;
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+static uint64_t g_hostOwnerExperimentRoot=0;
+static bool HostOwnerExperiment(PageTable pt) {
+    return pt && pt.pml4.raw()==__atomic_load_n(&g_hostOwnerExperimentRoot,__ATOMIC_ACQUIRE);
+}
+#else
+static bool HostOwnerExperiment(PageTable) {return false;}
+#endif
 
 // The kernel's PML4 physical address, captured at init time.
 static PhysicalAddress g_kernelCR3{};
@@ -64,6 +72,9 @@ static IrqSpinLock& PageTableLock(PageTable pt,VirtualAddress address) {
 #ifdef BROOK_HOST_TEST
 void VmmHostSetKernelRoot(PageTable root) { g_kernelCR3 = root.pml4; }
 bool VmmHostUsesKernelPtLock(PageTable root,VirtualAddress address) {return &PageTableLock(root,address)==&g_kernelPtLock;}
+#ifndef BROOK_STANDALONE_TEST
+bool VmmHostOwnerExperimentActive(PageTable root) {return HostOwnerExperiment(root);}
+#endif
 #endif
 
 // Module-space bump allocator
@@ -250,9 +261,30 @@ static uint64_t* WalkToPtr(PageTable pageTable, VirtualAddress virtAddr,
 // Called while the appropriate page-table lock is held. Keeping the leaf
 // pointer in this interface lets an extended owner be associated with its L1
 // frame and slot; raw-only callers must not reconstruct extended owners.
-static VmmOwnedLeaf CaptureOwnedLeaf(const uint64_t* entry,uint64_t raw) {
-    (void)entry;
-    return {raw,static_cast<uint16_t>((raw&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+static uint64_t OwnerTable(const uint64_t* entry) {
+    return VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(entry)&~uint64_t(4095))).raw();
+}
+static unsigned OwnerSlot(const uint64_t* entry) {return unsigned((reinterpret_cast<uint64_t>(entry)&4095)/8);}
+static VmmOwnedLeaf CaptureOwnedLeaf(const uint64_t* entry,uint64_t raw,bool extended=false) {
+    auto owner=static_cast<uint16_t>((raw&PTE_PID_MASK)>>PTE_PID_SHIFT);
+    if(extended && VmmLeafBacked(raw) && owner==PteOwnerSidecars::Escape &&
+       !g_userOwnerSidecars.Read(OwnerTable(entry),OwnerSlot(entry),owner))__builtin_trap();
+    return {raw,owner};
+}
+// Caller holds g_userPtLock. Empty sidecars survive failed publication and
+// are reclaimed with their leaf table, so rollback never allocates.
+static bool PrepareOwnerSidecarLocked(uint64_t* entry) {
+    const auto table=OwnerTable(entry);
+    if(g_userOwnerSidecars.Find(table))return true;
+    const auto physical=PmmAllocPage(MemTag::PageTable,KernelPid);if(!physical)return false;
+    auto* page=reinterpret_cast<PteOwnerSidecars::Page*>(PhysToVirt(physical).raw());
+    const bool installed=g_userOwnerSidecars.Install(table,page);
+    if(!installed)PmmFreePage(physical);
+    return installed;
+}
+static void ClearExtendedOwner(uint64_t* entry,VmmOwnedLeaf owned,bool extended) {
+    if(extended && owned.owner>=PteOwnerSidecars::Escape)
+        g_userOwnerSidecars.Clear(OwnerTable(entry),OwnerSlot(entry));
 }
 static uint64_t WithInlineOwner(uint64_t raw,uint16_t owner) {
     if(owner>=PTE_PID_CAPACITY)__builtin_trap();
@@ -382,6 +414,7 @@ void VmmInitFramebufferMemory(const BootProtocol* boot)
 bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
                 uint64_t flags, MemTag tag, uint16_t pid)
 {
+    if(HostOwnerExperiment(pt))return false;
     // Never silently alias a mapping owner if a caller exceeds the PTE format.
     if (pid >= PTE_PID_CAPACITY) return false;
     if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
@@ -431,7 +464,11 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
                            PhysicalAddress physAddr, uint64_t flags,
                            MemTag tag, uint16_t pid, bool accessible)
 {
-    if (pid >= PTE_PID_CAPACITY) return VmmMapResult::InvalidAddress;
+    const bool extended=HostOwnerExperiment(pt);
+    if(extended) {
+        if(pid>=5120 || !(flags&VMM_USER) || virtAddr.raw()>=0x0000800000000000ULL || (virtAddr.raw()&4095))
+            return VmmMapResult::InvalidAddress;
+    } else if (pid >= PTE_PID_CAPACITY) return VmmMapResult::InvalidAddress;
     if ((flags & (PTE_COW_BIT | VMM_WRITABLE)) == (PTE_COW_BIT | VMM_WRITABLE))
         return VmmMapResult::InvalidAddress;
     if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
@@ -452,11 +489,14 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
     if (!pte) pte = WalkToPtr(pt, virtAddr, true, 0);
     VmmMapResult result;
     if (!pte) result = VmmMapResult::OutOfMemory;
+    else if(extended && pid>=PteOwnerSidecars::Escape && !PrepareOwnerSidecarLocked(pte))result=VmmMapResult::OutOfMemory;
     else {
+        if(extended && pid>=PteOwnerSidecars::Escape && !g_userOwnerSidecars.Set(OwnerTable(pte),OwnerSlot(pte),pid))__builtin_trap();
+        const auto inlineOwner=extended && pid>=PteOwnerSidecars::Escape?PteOwnerSidecars::Escape:pid;
         *pte = WithInlineOwner((physAddr.raw() & PHYS_MASK) | (accessible ? VMM_PRESENT : PTE_HIDDEN_BIT)
              | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_PID_MASK | VMM_NO_EXEC | PTE_HIDDEN_BIT))
              | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
-             | (flags & VMM_NO_EXEC),pid);
+             | (flags & VMM_NO_EXEC),inlineOwner);
         if (flags & VMM_USER) {
             PmmMapInc(physAddr);
             // All three intermediate tables now exist. Promote only after a
@@ -477,11 +517,12 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 
 PhysicalAddress VmmLeafPhysical(uint64_t leaf) { return PhysicalAddress(leaf & PHYS_MASK); }
 VmmOwnedLeaf VmmReadOwnedLeaf(PageTable pt, VirtualAddress address) {
+    if(HostOwnerExperiment(pt) && address.raw()>=0x0000800000000000ULL)return {};
     IrqSpinLock& lock = PageTableLock(pt,address);
     uint64_t irq = IrqSpinLockAcquire(&lock);
     bool large = false;
     auto* entry = WalkToPtr(pt,address,false,0,&large);
-    auto leaf = !large && entry ? CaptureOwnedLeaf(entry,*entry) : VmmOwnedLeaf{};
+    auto leaf = !large && entry ? CaptureOwnedLeaf(entry,*entry,HostOwnerExperiment(pt) && address.raw()<0x0000800000000000ULL) : VmmOwnedLeaf{};
     IrqSpinLockRelease(&lock,irq); return leaf;
 }
 uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {return VmmReadOwnedLeaf(pt,address).raw;}
@@ -666,6 +707,7 @@ void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,
 }
 
 bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {
+    if(HostOwnerExperiment(pt))return false;
     if(!pt || pt.pml4==g_kernelCR3 || address.raw()>=0x0000800000000000ULL || (address.raw()&4095) || !expected)return false;
     uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
     bool large=false;auto* entry=WalkToPtr(pt,address,false,0,&large);bool changed=false;
@@ -686,7 +728,7 @@ using LeafUpdate = uint64_t (*)(VirtualAddress,VmmOwnedLeaf,void*);
 static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                            uint64_t begin, uint64_t end, bool detach,
                            VmmRetireLeaf retire, void* context, uint64_t& count,
-                           LeafUpdate update = nullptr)
+                           LeafUpdate update = nullptr,bool extended=false)
 {
     const unsigned shift = 12 + 9 * (level - 1);
     const uint64_t size = uint64_t{1} << shift;
@@ -702,13 +744,14 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
             auto* child = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw());
             const uint64_t low = begin > address ? begin : address;
             const uint64_t high = end < address+size ? end : address+size;
-            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update)) return false;
+            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update,extended)) return false;
         } else {
             ++count;
-            const auto captured=CaptureOwnedLeaf(&table[i],leaf);
+            const auto captured=CaptureOwnedLeaf(&table[i],leaf,extended);
             if (detach) {
                 retire(VirtualAddress(address),captured,context);
                 if (leaf & VMM_USER) PmmMapDec(VmmLeafPhysical(leaf));
+                ClearExtendedOwner(&table[i],captured,extended);
                 table[i] = 0; Invlpg(VirtualAddress(address));
             } else if (update) {
                 const uint64_t updated=update(VirtualAddress(address),captured,context);
@@ -739,19 +782,7 @@ bool VmmPrepareOwnerSidecar(PageTable pt,VirtualAddress address) {
     bool large=false;
     auto* leaf=WalkToPtr(pt,address,false,0,&large);
     if(!large && !leaf)leaf=WalkToPtr(pt,address,true,0,&large);
-    bool ok=false;
-    if(!large && leaf) {
-        const auto table=VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(leaf)&~uint64_t(4095))).raw();
-        if(g_userOwnerSidecars.Find(table))ok=true;
-        else {
-            const auto physical=PmmAllocPage(MemTag::PageTable,KernelPid);
-            if(physical) {
-                auto* page=reinterpret_cast<PteOwnerSidecars::Page*>(PhysToVirt(physical).raw());
-                ok=g_userOwnerSidecars.Install(table,page);
-                if(!ok)PmmFreePage(physical);
-            }
-        }
-    }
+    const bool ok=!large && leaf && PrepareOwnerSidecarLocked(leaf);
     IrqSpinLockRelease(&g_userPtLock,irq);return ok;
 }
 struct MoveLeaves { PageTable table;uint64_t source,destination;bool prepare,occupied,move,failed; };
@@ -779,6 +810,7 @@ static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque)
 }
 static bool MoveLeafRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination,
                            bool prepare,bool occupied,bool move) {
+    if(HostOwnerExperiment(pt))return false;
     if (!ValidLeafRange(pt,begin,end) || !ValidLeafRange(pt,destination,destination+(end-begin)) ||
         (destination<end && begin<destination+(end-begin))) return false;
     uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
@@ -918,10 +950,10 @@ bool VmmCollectRangeAddresses(PageTable pt, uint64_t begin, uint64_t end,
     uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
     auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
     uint64_t required = 0;
-    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,required) && required <= capacity;
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,required,nullptr,HostOwnerExperiment(pt)) && required <= capacity;
     if (result && required) {
         CollectAddresses collected{addresses,0};
-        result = WalkLeafRange(table,4,0,begin,end,false,nullptr,&collected,*count,CollectAddress);
+        result = WalkLeafRange(table,4,0,begin,end,false,nullptr,&collected,*count,CollectAddress,HostOwnerExperiment(pt));
     }
     IrqSpinLockRelease(&g_userPtLock,irq);
     return result;
@@ -934,9 +966,9 @@ bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacit
     uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
     auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
     uint64_t required = 0;
-    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,required) && required <= capacity;
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,required,nullptr,HostOwnerExperiment(pt)) && required <= capacity;
     if (result) {
-        if (!WalkLeafRange(table,4,0,begin,end,true,retire,context,*count)) {
+        if (!WalkLeafRange(table,4,0,begin,end,true,retire,context,*count,nullptr,HostOwnerExperiment(pt))) {
             SerialPuts("VMM: range walk changed under page-table lock\n");
             __builtin_trap();
         }
@@ -961,6 +993,7 @@ static uint64_t ProtectLeaf(VirtualAddress address, VmmOwnedLeaf owned, void* op
 }
 bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protection,
                      VmmPrivateLeafQuery query, void* context) {
+    if(HostOwnerExperiment(pt))return false;
     if ((protection & ~7u) || !ValidLeafRange(pt,begin,end)) return false;
     uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
     auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
@@ -975,13 +1008,16 @@ bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protec
 
 VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr)
 {
+    if(HostOwnerExperiment(pt) && virtAddr.raw()>=0x0000800000000000ULL)return {};
     IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    const auto captured=pte && VmmLeafBacked(*pte)?CaptureOwnedLeaf(pte,*pte):VmmOwnedLeaf{};
+    const bool extended=HostOwnerExperiment(pt) && virtAddr.raw()<0x0000800000000000ULL;
+    const auto captured=pte && VmmLeafBacked(*pte)?CaptureOwnedLeaf(pte,*pte,extended):VmmOwnedLeaf{};
     const auto old=captured.raw;
     if (old) {
         if (old & VMM_USER) PmmMapDec(VmmLeafPhysical(old));
+        ClearExtendedOwner(pte,captured,extended);
         *pte = 0;
         Invlpg(virtAddr);
     }
@@ -991,13 +1027,16 @@ VmmOwnedLeaf VmmDetachOwnedPage(PageTable pt, VirtualAddress virtAddr)
 
 VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected)
 {
+    if(HostOwnerExperiment(pt) && virtAddr.raw()>=0x0000800000000000ULL)return {};
     IrqSpinLock& lock = PageTableLock(pt,virtAddr);
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    const auto captured=pte && VmmLeafBacked(*pte) && VmmLeafPhysical(*pte)==expected?CaptureOwnedLeaf(pte,*pte):VmmOwnedLeaf{};
+    const bool extended=HostOwnerExperiment(pt) && virtAddr.raw()<0x0000800000000000ULL;
+    const auto captured=pte && VmmLeafBacked(*pte) && VmmLeafPhysical(*pte)==expected?CaptureOwnedLeaf(pte,*pte,extended):VmmOwnedLeaf{};
     const auto old=captured.raw;
     if (old) {
         if (old & VMM_USER) PmmMapDec(expected);
+        ClearExtendedOwner(pte,captured,extended);
         *pte = 0;
         Invlpg(virtAddr);
     }
@@ -1005,9 +1044,9 @@ VmmOwnedLeaf VmmDetachOwnedPageIfMatches(PageTable pt, VirtualAddress virtAddr, 
     return captured;
 }
 
-uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr) { return VmmDetachOwnedPage(pt,virtAddr).raw; }
+uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr) { return HostOwnerExperiment(pt)?0:VmmDetachOwnedPage(pt,virtAddr).raw; }
 uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected) {
-    return VmmDetachOwnedPageIfMatches(pt,virtAddr,expected).raw;
+    return HostOwnerExperiment(pt)?0:VmmDetachOwnedPageIfMatches(pt,virtAddr,expected).raw;
 }
 
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
@@ -1190,6 +1229,7 @@ PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr)
 
 uint64_t* VmmGetPte(PageTable pt, VirtualAddress virtAddr)
 {
+    if(HostOwnerExperiment(pt))return nullptr;
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
     if (!pte || !(*pte & VMM_PRESENT)) return nullptr;
     return pte;
@@ -1225,6 +1265,7 @@ extern "C" int PmmDumpFreeLog(uint64_t phys);
 
 VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
 {
+    if(HostOwnerExperiment(pt))return {VmmCowResult::InvalidOwner,{}};
     if (pid >= PTE_PID_CAPACITY) return {VmmCowResult::InvalidOwner,{}};
     if (!pt || pt.pml4==g_kernelCR3 || faultAddr.raw()>=0x0000800000000000ULL)
         return {VmmCowResult::NotCow,{}};
@@ -1448,6 +1489,18 @@ PageTable VmmCreateUserPageTable()
     return PageTable(pml4Phys);
 }
 
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+PageTable VmmHostCreateOwnerExperiment() {
+    auto root=VmmCreateUserPageTable();if(!root)return {};
+    const auto irq=IrqSpinLockAcquire(&g_userPtLock);
+    const bool available=!__atomic_load_n(&g_hostOwnerExperimentRoot,__ATOMIC_RELAXED);
+    if(available)__atomic_store_n(&g_hostOwnerExperimentRoot,root.pml4.raw(),__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_userPtLock,irq);
+    if(!available){VmmDestroyUserPageTable(root);return {};}
+    return root;
+}
+#endif
+
 static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBorrowedDevices,
                            uint64_t base, VmmBorrowedLeafQuery query, void* context)
 {
@@ -1503,6 +1556,14 @@ void VmmDestroyUserPageTable(PageTable pt, bool preserveBorrowedDevices,
                        i << 39, query, context);
     }
 
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+    // Fixture owners must join all accessors before destruction. Clear the
+    // experiment identity before the root frame can be allocated again.
+    const auto irq=IrqSpinLockAcquire(&g_userPtLock);
+    if(pt.pml4.raw()==__atomic_load_n(&g_hostOwnerExperimentRoot,__ATOMIC_RELAXED))
+        __atomic_store_n(&g_hostOwnerExperimentRoot,0,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_userPtLock,irq);
+#endif
     PmmFreePage(pt.pml4);
 }
 
