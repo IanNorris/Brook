@@ -1448,6 +1448,17 @@ the Dell restarted cleanly with the prior slot retained and its persistent SSD
 and network available. Host tests cover reserved encodings, bounds and the
 full-range classification request.
 
+The first execution building block is a host-tested Gen8 linear 32-bpp
+`XY_SRC_COPY_BLT` encoder. It bounds two non-overlapping GPU-address ranges,
+pitches and rectangle extents and emits no packet on rejection. The format is
+checked against the [Intel Gen8 references](https://www.intel.com/content/www/us/en/docs/graphics-for-linux/developer-reference/1-0/broadwell.html)
+and [IGT's batch emitter](https://android.googlesource.com/platform/external/igt-gpu-tools/+/refs/tags/android-13.0.0_r40/lib/intel_batchbuffer.c).
+This is not yet connected to hardware. A safe executor still needs exclusive
+BCS ownership, forcewake, a valid context and ring, GPU mappings that preserve
+firmware scanout, pinned and non-aliasing backing pages, and a post-copy
+completion fence. A timeout must retain GPU-visible memory until the engine
+is known to be quiescent. No accelerated rendering is claimed by this test.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
