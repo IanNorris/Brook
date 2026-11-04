@@ -744,6 +744,15 @@ The kernel closes a connection that leaves a framed command incomplete for
 10 seconds, so it cannot indefinitely block the single debug listener. This
 does not make the listener concurrent or recover it from a blocked command.
 
+For a minimal host-side check before attaching, run
+`python3 scripts/probe_hardware_link.py 192.168.85.106 --count 5`. Substitute
+the address shown on the target. Each JSON-line sample reports the host route,
+neighbour entry, ping, and the stage and duration of one read-only hardware
+capabilities request. A zero boot ID is possible before the first attach and
+is not a pinned identity. A missing ping alone does not prove a bridge failure;
+the listener processes one connection at a time, so probing can briefly delay
+other bridge traffic. This diagnostic does not use discovery or reboot the target.
+
 `hw_stats`, `hw_logs`, `hw_apps` and `hw_windows` provide bounded observations.
 Log cursors count completed lines, report dropped retained lines, and exclude
 the current partial line. A line is capped at 160 columns. Pass `next_cursor`
