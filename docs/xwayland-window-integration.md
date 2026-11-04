@@ -152,8 +152,8 @@ Known gaps and remaining gates:
 - Finish Steam dialogs/navigation, input-alignment and a small-download
   acceptance run through the rootless path. Initial authenticated Store,
   Library, Friends and independent movement are verified.
-- Validate replacement-server behavior on the Dell and test Steam relaunch
-  after a server loss. A private VM test with Steam open is described below.
+- Validate replacement-server behavior and Steam relaunch after server loss
+  on the Dell. Private VM results are described below.
 - Transient identities currently affect initial placement; later parent motion,
   minimize and stacking need broader policy/acceptance. Existing native popup
   raising also groups by provider, which can include unrelated Wayland clients.
@@ -184,6 +184,15 @@ server and worker appeared, and a fresh xeyes window opened through them. The
 guest was stopped after a checked filesystem and device flush. Existing X
 clients disconnect on server loss; this test does not show Steam automatically
 reconnecting, establish long-term Steam stability, or validate the Dell.
+
+A further private software-rendered VM run exercised a manual Steam relaunch
+after server loss. Steam first opened a window using the same null-output
+PulseAudio server; after terminating the owned Xwayland process, the compositor
+created a new server and worker and the original Steam job drained (exit 1).
+Launching the same client again reached a new Steam window. This establishes a
+window-level relaunch in that test, not automatic app recovery, interaction
+with the relaunched client, audible audio, or Dell acceptance. The VM stopped
+after a checked filesystem and device flush.
 
 ## Xwayland interval-timer lead
 
