@@ -223,6 +223,15 @@ include application-provided names and is disabled by default. A two-CPU VM
 exercise checked invalid and kernel-space names, enabled/disabled behavior,
 and the 159-line lifetime cap after 4,100 creations.
 
+The same private clone was subsequently booted with Xwayland's default scheduler
+and a fresh null-output Pulse server. Steam reached a rootless main window;
+one Steam process held 119 descriptors, including two memfds, at inspection.
+Xwayland's sampled unimplemented syscall-38 count reached at least 14,848,
+while the diagnostic-scheduler run logged none. The sequential runs reused a
+writable clone and differed in persisted runtime state, so neither timing nor
+window differences establish a scheduler performance effect. Neither run
+establishes long-term Steam stability or reproduces the Dell freeze.
+
 The fixture also checks caught and default `SIGALRM` delivery to a child
 spinning without syscalls; these checks pass on Linux. Brook's current caught
 signal delivery occurs at syscall return, so the timer must remain disabled
