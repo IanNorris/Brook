@@ -161,7 +161,8 @@ void TlbShootdownFull(uint64_t,uint64_t) { if(pendingAcknowledgement)pendingAckn
 void MemFdHandleUnref(void* handle) { ++droppedMemfds;PmmFreePage(static_cast<BorrowedBacking*>(handle)->page); }
 void VfsFileMapUnpin(Vnode*) { ++unpinnedVnodes; }
 extern "C" void VfsClose(Vnode* vn) { CHECK(!vn->refCount);++closedVnodes; }
-PhysicalAddress PmmAllocPage(MemTag,uint16_t) {
+PhysicalAddress PmmAllocPage(MemTag,uint16_t pid) {
+    CHECK(pid<PMM_MAX_PIDS);
     if(failAllocation.exchange(false))return {};
     int countdown=failFrameAfter.load();
     if(countdown>=0) { if(!countdown){failFrameAfter=-1;return {};}--failFrameAfter; }
@@ -2439,7 +2440,7 @@ static void extendedOwnerExperiment() {
     CHECK(!VmmGetPte(experiment,va));
     CHECK(!VmmMoveRange(experiment,va.raw(),va.raw()+pageSize,va.raw()+8*pageSize));
     CHECK(!VmmProtectRange(experiment,va.raw(),va.raw()+pageSize,1,nullptr,nullptr));
-    CHECK(VmmCowResolveWrite(experiment,va,1).result==VmmCowResult::InvalidOwner);
+    CHECK(VmmCowResolveWrite(experiment,va,1).result==VmmCowResult::NotCow);
     CHECK(!VmmDetachPage(experiment,va));
     CHECK(!VmmDetachOwnedPageIfMatches(experiment,va+2*pageSize,pages[0]).raw);
     CHECK(VmmReadOwnedLeaf(experiment,va+2*pageSize).owner==1024);
@@ -2475,6 +2476,65 @@ static void extendedOwnerExperiment() {
     VmmDestroyUserPageTable(ordinary);
     CHECK(VmmLeafPhysical(VmmDetachPage(kernel,high))==shared);PmmUnrefPage(shared);
     freeEmptyKernelTables(kernel.pml4,4);VmmHostSetKernelRoot({});empty();
+}
+static void extendedOwnerCowExperiment() {
+    auto kernel=table();VmmHostSetKernelRoot(kernel);
+    auto pt=VmmHostCreateOwnerExperiment();CHECK(pt);
+    const auto cowFlags=(flags&~VMM_WRITABLE)|PTE_COW_BIT;
+    const auto create=[&](VirtualAddress address,uint16_t owner) {
+        auto frame=PmmAllocPage();CHECK(frame);
+        for(unsigned i=0;i<pageSize;++i)frames[indexOf(frame)][i]=static_cast<unsigned char>((i*31)^(i>>8));
+        CHECK(VmmTryMapPage(pt,address,frame,cowFlags,MemTag::User,owner)==VmmMapResult::Mapped);
+        return frame;
+    };
+    const auto checkBytes=[&](PhysicalAddress frame) {
+        for(unsigned i=0;i<pageSize;++i)CHECK(frames[indexOf(frame)][i]==static_cast<unsigned char>((i*31)^(i>>8)));
+    };
+    auto source=create(va,777);PmmRefPage(source);const auto before=VmmReadOwnedLeaf(pt,va);
+    CHECK(VmmCowResolveWrite(pt,va,5120).result==VmmCowResult::InvalidOwner);
+    failFrameAfter=0;auto denied=VmmCowResolveWrite(pt,va,5119);
+    CHECK(denied.result==VmmCowResult::OutOfMemory && !denied.retired && failFrameAfter.load()==-1);
+    CHECK(VmmReadOwnedLeaf(pt,va).raw==before.raw && VmmReadOwnedLeaf(pt,va).owner==777);
+    CHECK(PmmGetRefCount(source)==2 && maps(source)==1);checkBytes(source);
+    // Sidecar succeeds, data-frame allocation fails: original remains intact.
+    failFrameAfter=1;denied=VmmCowResolveWrite(pt,va,5119);
+    CHECK(denied.result==VmmCowResult::OutOfMemory && !denied.retired && failFrameAfter.load()==-1);
+    CHECK(VmmReadOwnedLeaf(pt,va).raw==before.raw && VmmReadOwnedLeaf(pt,va).owner==777);
+    auto copied=VmmCowResolveWrite(pt,va,5119);CHECK(copied.result==VmmCowResult::Resolved && copied.retired==source);
+    auto result=VmmReadOwnedLeaf(pt,va);CHECK(result.owner==5119 && VmmLeafPhysical(result.raw)!=source);
+    CHECK((result.raw&VMM_WRITABLE) && !(result.raw&PTE_COW_BIT) && maps(source)==0);checkBytes(VmmLeafPhysical(result.raw));
+    CHECK(PmmGetRefCount(source)==2);PmmUnrefPage(copied.retired);PmmUnrefPage(source);
+    auto sole=create(va+pageSize,1023);failFrameAfter=0;
+    auto upgraded=VmmCowResolveWrite(pt,va+pageSize,4096);
+    CHECK(upgraded.result==VmmCowResult::Resolved && !upgraded.retired && failFrameAfter.load()==0);
+    failFrameAfter=-1;result=VmmReadOwnedLeaf(pt,va+pageSize);
+    CHECK(result.owner==1023 && VmmLeafPhysical(result.raw)==sole && (result.raw&VMM_WRITABLE));
+    auto high=create(va+2*pageSize,4096);PmmRefPage(high);
+    copied=VmmCowResolveWrite(pt,va+2*pageSize,9);
+    CHECK(copied.result==VmmCowResult::Resolved && copied.retired==high);
+    result=VmmReadOwnedLeaf(pt,va+2*pageSize);CHECK(result.owner==9);checkBytes(VmmLeafPhysical(result.raw));
+    PmmUnrefPage(copied.retired);PmmUnrefPage(high);
+    auto highAgain=create(va+4*pageSize,5119);PmmRefPage(highAgain);
+    copied=VmmCowResolveWrite(pt,va+4*pageSize,1023);
+    CHECK(copied.result==VmmCowResult::Resolved && copied.retired==highAgain);
+    result=VmmReadOwnedLeaf(pt,va+4*pageSize);CHECK(result.owner==1023);checkBytes(VmmLeafPhysical(result.raw));
+    PmmUnrefPage(copied.retired);PmmUnrefPage(highAgain);
+    auto hidden=PmmAllocPage();CHECK(hidden);
+    CHECK(VmmTryMapPage(pt,va+5*pageSize,hidden,cowFlags,MemTag::User,1024,false)==VmmMapResult::Mapped);
+    const auto hiddenBefore=VmmReadOwnedLeaf(pt,va+5*pageSize);
+    CHECK(VmmCowResolveWrite(pt,va+5*pageSize,5119).result==VmmCowResult::NotCow);
+    CHECK(VmmReadOwnedLeaf(pt,va+5*pageSize).raw==hiddenBefore.raw && VmmReadOwnedLeaf(pt,va+5*pageSize).owner==1024);
+    auto raced=create(va+3*pageSize,1023);PmmRefPage(raced);Gate gate;VmmCowResolution a{},b{};
+    std::thread t1([&]{gate.park();a=VmmCowResolveWrite(pt,va+3*pageSize,1024);});
+    std::thread t2([&]{gate.park();b=VmmCowResolveWrite(pt,va+3*pageSize,5119);});
+    gate.wait(2);gate.release();t1.join();t2.join();
+    CHECK((a.result==VmmCowResult::Resolved && b.result==VmmCowResult::NotCow) ||
+          (b.result==VmmCowResult::Resolved && a.result==VmmCowResult::NotCow));
+    result=VmmReadOwnedLeaf(pt,va+3*pageSize);
+    CHECK(result.owner==(a.result==VmmCowResult::Resolved?1024:5119));
+    checkBytes(VmmLeafPhysical(result.raw));
+    auto retired=a.retired?a.retired:b.retired;CHECK(retired==raced);PmmUnrefPage(retired);PmmUnrefPage(raced);
+    VmmDestroyUserPageTable(pt);PmmFreePage(kernel.pml4);VmmHostSetKernelRoot({});empty();
 }
 static void vmallocIntegration() {
     auto root=table();VmmHostSetKernelRoot(root);
@@ -2649,6 +2709,6 @@ int main(int argc,char** argv) {
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
-    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();vmallocIntegration();
+    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();extendedOwnerCowExperiment();vmallocIntegration();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

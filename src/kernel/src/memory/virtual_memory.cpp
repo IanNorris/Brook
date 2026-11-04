@@ -1265,8 +1265,8 @@ extern "C" int PmmDumpFreeLog(uint64_t phys);
 
 VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint16_t pid)
 {
-    if(HostOwnerExperiment(pt))return {VmmCowResult::InvalidOwner,{}};
-    if (pid >= PTE_PID_CAPACITY) return {VmmCowResult::InvalidOwner,{}};
+    const bool extended=HostOwnerExperiment(pt);
+    if (pid >= (extended?5120:PTE_PID_CAPACITY)) return {VmmCowResult::InvalidOwner,{}};
     if (!pt || pt.pml4==g_kernelCR3 || faultAddr.raw()>=0x0000800000000000ULL)
         return {VmmCowResult::NotCow,{}};
     PhysicalAddress retired;
@@ -1291,6 +1291,7 @@ VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint
     }
 
     PhysicalAddress oldPhys(*pte & PHYS_MASK);
+    const auto oldOwned=CaptureOwnedLeaf(pte,*pte,extended);
 
     // BRO-176 red-handed detector: this PTE is Present + COW (checked above), so
     // oldPhys MUST still be referenced (refcount >= 1) — a COW-mapped frame is by
@@ -1313,8 +1314,13 @@ VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint
 
     if (oldRc > 1 || oldRc == 0)
     {
+        if(extended && pid>=PteOwnerSidecars::Escape && !PrepareOwnerSidecarLocked(pte)) {
+            IrqSpinLockRelease(&g_userPtLock,ptFlags);return {VmmCowResult::OutOfMemory,{}};
+        }
         // Shared page: copy to a fresh page and drop our ref on the shared one.
-        PhysicalAddress newPhys = PmmAllocPage(MemTag::User, pid);
+        // Host-only fixture IDs are not PMM owners. Real high-PID support must
+        // widen PMM ownership before the experiment can become production.
+        PhysicalAddress newPhys = PmmAllocPage(MemTag::User, extended?KernelPid:pid);
         if (!newPhys)
         {
             IrqSpinLockRelease(&g_userPtLock, ptFlags);
@@ -1356,7 +1362,12 @@ VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint
         uint64_t newPte = (newPhys.raw() & PHYS_MASK)
                         | ((*pte) & ~(PHYS_MASK | PTE_COW_BIT))
                         | VMM_WRITABLE;
-        newPte = WithInlineOwner(newPte,pid);
+        if(extended) {
+            ClearExtendedOwner(pte,oldOwned,true);
+            if(pid>=PteOwnerSidecars::Escape && !g_userOwnerSidecars.Set(OwnerTable(pte),OwnerSlot(pte),pid))__builtin_trap();
+        }
+        const auto inlineOwner=extended && pid>=PteOwnerSidecars::Escape?PteOwnerSidecars::Escape:pid;
+        newPte = WithInlineOwner(newPte,inlineOwner);
         *pte = newPte;
 
         // BRO-176 map accounting: this PTE was repointed from the shared frame

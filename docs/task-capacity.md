@@ -47,9 +47,10 @@ for user leaf tables and free them at table retirement; it does not yet use them
 for owner encoding. The mapping transaction's optional snapshot is an observation, not an
 additional frame reference.
 An isolated host-only root now exercises escaped owners 1023–5119 through real
-VMM try-map, typed read and detach operations, including OOM and sidecar reuse.
-It rejects overwrite, move, COW and clone and is never attached to a process.
-Production kernels cannot create this root; those unsupported paths and their
+VMM try-map, typed read, detach and COW operations, including OOM and sidecar
+reuse. COW's fixture frames use a valid kernel PMM owner; extended task IDs are
+not yet valid PMM owners. The fixture rejects overwrite, move and clone and is
+never attached to a process. Production kernels cannot create this root; those unsupported paths and their
 rollback semantics must be implemented before enabling extended owners.
 The pageable-memory experiment retains the detached owner across eviction,
 failed-write rollback and fault-in; fork assigns the child owner to its stored
