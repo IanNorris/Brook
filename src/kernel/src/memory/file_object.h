@@ -40,6 +40,11 @@ struct FileObject {
     // Under inode gate, before canonical allocation/exposure. Backends may
     // materialize sparse storage so later shared writeback cannot need quota.
     int (*prepareBackingPage)(void*,uint64_t);
+    // Optional coherent backend frame. Returns a cache-owned frame reference
+    // and a separately retained non-sleeping backing token on success.
+    PhysicalAddress (*pinCoherentPage)(void*,uint64_t,void**,int*);
+    void (*releaseCoherentPage)(void*);
+    int (*flushCoherent)(Vnode*);
     // Optional, audited strict-growth callback. It must preserve all bytes
     // below old EOF, including on an error, and never
     // shrink the file. Installed before publication; called under inode gate.

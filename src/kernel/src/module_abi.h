@@ -83,7 +83,7 @@ namespace brook {
 // ABI 57 appends the proven backdrop-blur capability query.
 // ABI 64 extends VnodeStat for exact descriptor metadata. Rebuild modules:
 // callers compiled with the smaller structure must not pass it to this kernel.
-static constexpr uint32_t MODULE_ABI_VERSION = 64;
+static constexpr uint32_t MODULE_ABI_VERSION = 65;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

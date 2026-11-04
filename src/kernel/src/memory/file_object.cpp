@@ -22,6 +22,7 @@ struct FileObjectPage {
     PhysicalAddress physical;
     FileObjectPage* next;
     bool writeExposed;
+    void* backingToken;
 };
 namespace {
 IrqSpinLock writebackLock;
@@ -64,8 +65,11 @@ FileObjectPage* Find(FileObject* object,uint64_t index) {
 }
 void Release(FileObject* object,FileObjectPage* page) {
     while(page) {
-        auto* next=page->next;PmmUnrefPage(page->physical);kfree(page);
-        if(object->releasePageBytes)object->releasePageBytes(object->pageBudgetContext,4096+sizeof(FileObjectPage));
+        auto* next=page->next;auto* token=page->backingToken;
+        PmmUnrefPage(page->physical);kfree(page);
+        if(token)object->releaseCoherentPage(token);
+        if(object->releasePageBytes)object->releasePageBytes(object->pageBudgetContext,
+            (object->pinCoherentPage?0:4096)+sizeof(FileObjectPage));
         page=next;
     }
 }
@@ -117,7 +121,7 @@ int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,ui
     if(!length)return 0;
     if(object->mappingError)return object->mappingError;
     int result=vnode->ops->read(vnode,buffer,length,offset);
-    if(result>0)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
+    if(result>0 && !object->pinCoherentPage)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
     return result;
 }
 int WriteLocked(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
@@ -138,9 +142,9 @@ int WriteLocked(FileObject* object,Vnode* vnode,const void* buffer,uint64_t leng
         // Stores into the old partial-page EOF tail are not valid file data.
         // A later extending pwrite must not turn them into file contents when
         // canonical pages overlay reads or are eventually written back.
-        if(resident && begin+static_cast<uint64_t>(result)>before.size)
+        if(!object->pinCoherentPage && resident && begin+static_cast<uint64_t>(result)>before.size)
             ZeroResidentGap(object,before.size,begin+static_cast<uint64_t>(result));
-        Overlay(object,begin,const_cast<void*>(buffer),static_cast<uint64_t>(result),true);
+        if(!object->pinCoherentPage)Overlay(object,begin,const_cast<void*>(buffer),static_cast<uint64_t>(result),true);
         ++object->generation;
     }
     return result;
@@ -164,7 +168,8 @@ void FileObjectInit(FileObject* object) {
     object->mappings=nullptr;
     object->mappingRegistrations=0;object->writebackVnode=nullptr;object->writebackNext=nullptr;
     object->pageBudgetContext=nullptr;object->reservePageBytes=nullptr;object->releasePageBytes=nullptr;
-    object->prepareBackingPage=nullptr;
+    object->prepareBackingPage=nullptr;object->pinCoherentPage=nullptr;
+    object->releaseCoherentPage=nullptr;object->flushCoherent=nullptr;
     object->growMappedBacking=nullptr;
     for(auto& bucket:object->pages)bucket=nullptr;
 }
@@ -188,7 +193,7 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     // Reserve and allocate the canonical page before materializing backend
     // storage. Under a full quota, a failed canonical allocation must not
     // leave an otherwise unused sparse backend page charged to the inode.
-    constexpr uint64_t charge=4096+sizeof(FileObjectPage);
+    const uint64_t charge=(object->pinCoherentPage?0:4096)+sizeof(FileObjectPage);
     if(object->reservePageBytes && !object->reservePageBytes(object->pageBudgetContext,charge)) {
         if(error)*error=-28;
         return PhysicalAddress{};
@@ -196,6 +201,15 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     auto rollback=[&] {if(object->releasePageBytes)object->releasePageBytes(object->pageBudgetContext,charge);};
     auto* page=static_cast<FileObjectPage*>(kmalloc(sizeof(FileObjectPage)));
     if(!page) { rollback();if(error)*error=-12;return PhysicalAddress{}; }
+    if(object->pinCoherentPage) {
+        if(!object->releaseCoherentPage || !object->flushCoherent) {kfree(page);rollback();if(error)*error=-5;return PhysicalAddress{};}
+        void* token=nullptr;int pinError=0;
+        auto physical=object->pinCoherentPage(object->pageBudgetContext,index,&token,&pinError);
+        if(!physical || !token) {if(physical)PmmUnrefPage(physical);if(token)object->releaseCoherentPage(token);
+            kfree(page);rollback();if(error)*error=pinError?pinError:-5;return PhysicalAddress{};}
+        *page={index,physical,object->pages[index%64],false,token};object->pages[index%64]=page;
+        PmmRefPage(physical);if(loaded)*loaded=true;return physical;
+    }
     auto physical=PmmAllocPage(MemTag::User,KernelPid);
     if(!physical) { kfree(page);rollback();if(error)*error=-12;return PhysicalAddress{}; }
     if(object->prepareBackingPage) {
@@ -220,7 +234,7 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     }
     // Loading is serialized by this inode's gate; no partially read page is
     // published and competing faults retain this same completed frame.
-    *page={index,physical,object->pages[index%64],false};object->pages[index%64]=page;
+    *page={index,physical,object->pages[index%64],false,nullptr};object->pages[index%64]=page;
     PmmRefPage(physical);if(loaded)*loaded=true;return physical;
 }
 PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
@@ -391,6 +405,14 @@ static int WritebackLocked(FileObject* object,Vnode* vnode,uint64_t begin,uint64
     if(object->mappingError)return object->mappingError;
     int result=0;
     VnodeStat stat{};result=vnode->ops->stat(vnode,&stat);
+    if(!result && object->pinCoherentPage) {
+        for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next) {
+            const uint64_t offset=page->index*4096;
+            if(page->writeExposed && offset<stat.size && offset<end && (offset>=begin || begin-offset<4096))
+                return object->flushCoherent(vnode);
+        }
+        return 0;
+    }
     if(!result)for(auto* bucket:object->pages) {
         for(auto* page=bucket;page;page=page->next) {
             const uint64_t offset=page->index*4096;
@@ -530,7 +552,7 @@ int FileObjectGrowMapped(FileObject* object,Vnode* vnode,uint64_t length) {
     // into shrink.
     if(length<=before.size)return -16;
     result=object->growMappedBacking(vnode,length);
-    if(before.size&4095) {
+    if((before.size&4095) && !object->pinCoherentPage) {
         uint64_t visible=length;
         if(result) {
             VnodeStat after{};

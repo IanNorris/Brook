@@ -1,6 +1,8 @@
 #include "tmpfs.h"
 
 #include "memory/file_object.h"
+#include "memory/physical_memory.h"
+#include "memory/virtual_memory.h"
 #include "memory/heap.h"
 #include "process.h"
 #include "process_user_namespace.h"
@@ -37,7 +39,9 @@ struct Page
     Page *next;
     Page *hashNext;
     uint64_t index;
-    uint8_t bytes[4096];
+    Tmpfs* fs;
+    PhysicalAddress physical;
+    uint32_t owners;
 };
 IrqSpinLock budgetLock;
 TmpfsUsage globalUsage{};
@@ -77,7 +81,9 @@ struct Node
     char name[256];
     FileObject file;
 };
-int PrepareBackingPage(void* context,uint64_t index);
+PhysicalAddress PinCoherentPage(void* context,uint64_t index,void** token,int* error);
+void ReleaseCoherentPage(void* token);
+int FlushCoherent(Vnode* vnode);
 const VfsObjectOps *ObjectOperations();
 struct Guard
 {
@@ -158,6 +164,25 @@ void Free(Tmpfs *fs, void *pointer)
     globalUsage.bytes -= charge;
     IrqSpinLockRelease(&budgetLock, irq);
 }
+// The inode index and each retained canonical record hold independent owner
+// references. Final release is safe in an IRQ close path and never takes the
+// tmpfs mutex; quota stays charged until the last owner drops the frame.
+void DropPage(Page* page) {
+    const uint32_t previous=__atomic_fetch_sub(&page->owners,1,__ATOMIC_ACQ_REL);
+    if(!previous)__builtin_trap();
+    if(previous!=1)return;
+    auto* fs=page->fs;PmmUnrefPage(page->physical);Unreserve(fs,4096);Free(fs,page);
+}
+uint8_t* PageBytes(Page* page) {return reinterpret_cast<uint8_t*>(PhysToVirt(page->physical).raw());}
+Page* NewPage(Tmpfs* fs,uint64_t index,int* error) {
+    auto* p=static_cast<Page*>(Allocate(fs,sizeof(Page)));
+    if(!p){if(error)*error=-28;return nullptr;}
+    if(!Reserve(fs,4096)){Free(fs,p);if(error)*error=-28;return nullptr;}
+    auto frame=PmmAllocPage(MemTag::User,KernelPid);
+    if(!frame){Unreserve(fs,4096);Free(fs,p);if(error)*error=-12;return nullptr;}
+    p->fs=fs;p->physical=frame;p->owners=1;p->index=index;
+    memset(PageBytes(p),0,4096);return p;
+}
 void Hold(Node *n)
 {
     if (n) VfsObjectRetain(&n->object);
@@ -176,7 +201,7 @@ void DestroyNode(Node *n)
         {
             auto *p = n->pages;
             n->pages = p->next;
-            Free(fs, p);
+            DropPage(p);
         }
         Free(fs, n->pageBuckets);
         Free(fs, n->target);
@@ -237,7 +262,9 @@ Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
     n->file.pageBudgetContext=n;
     n->file.reservePageBytes=[](void* context,uint64_t bytes) {return Reserve(static_cast<Node*>(context)->fs,bytes);};
     n->file.releasePageBytes=[](void* context,uint64_t bytes) {Unreserve(static_cast<Node*>(context)->fs,bytes);};
-    n->file.prepareBackingPage=PrepareBackingPage;
+    n->file.pinCoherentPage=PinCoherentPage;
+    n->file.releaseCoherentPage=ReleaseCoherentPage;
+    n->file.flushCoherent=FlushCoherent;
     return n;
 }
 // Capture process authority before the backend mutex. Group lists are immutable.
@@ -531,20 +558,21 @@ void RebuildPageIndex(Node* n)
         p->hashNext=n->pageBuckets[slot];n->pageBuckets[slot]=p;
     }
 }
-int PrepareBackingPage(void* context,uint64_t index)
+PhysicalAddress PinCoherentPage(void* context,uint64_t index,void** token,int* error)
 {
-    auto* n=static_cast<Node*>(context);
-    Guard held(n->fs);
-    if(FindPage(n,index))return 0;
-    // Materialize sparse storage before exposing a canonical page. Writeback
-    // then needs no persistent allocation, even at quota exhaustion. The
-    // canonical frame and metadata have already been allocated. A subsequent
-    // backend read error can leave a charged zero page, reclaimed at teardown.
-    auto* page=static_cast<Page*>(Allocate(n->fs,sizeof(Page)));
-    if(!page)return -28;
-    page->index=index;InsertPage(n,page);
-    return 0;
+    auto* n=static_cast<Node*>(context);Guard held(n->fs);
+    auto* page=FindPage(n,index);
+    if(!page){page=NewPage(n->fs,index,error);if(!page)return {};InsertPage(n,page);}
+    const uint32_t previous=__atomic_fetch_add(&page->owners,1,__ATOMIC_RELAXED);
+    if(!previous || previous==~uint32_t{0})__builtin_trap();
+    PmmRefPage(page->physical);*token=page;return page->physical;
 }
+void ReleaseCoherentPage(void* token) {DropPage(static_cast<Page*>(token));}
+int FlushCoherent(Vnode* vn) {
+    auto* n=VnodeNode(vn);Guard held(n->fs);
+    n->mode &= ~06000;n->mtime=n->ctime=Now();return 0;
+}
+
 int Read(Vnode *vn, void *buffer, uint64_t length, uint64_t *offset)
 {
     auto *n = VnodeNode(vn);
@@ -565,7 +593,7 @@ int Read(Vnode *vn, void *buffer, uint64_t length, uint64_t *offset)
             part = length - done;
         auto *p = FindPage(n, at / 4096);
         if (p)
-            memcpy(static_cast<uint8_t *>(buffer) + done, p->bytes + (at & 4095), part);
+            memcpy(static_cast<uint8_t *>(buffer) + done, PageBytes(p) + (at & 4095), part);
         else
             memset(static_cast<uint8_t *>(buffer) + done, 0, part);
         done += part;
@@ -581,7 +609,7 @@ int Write(Vnode *vn, const void *buffer, uint64_t length, uint64_t *offset)
         return -27;
     if (length > 0x7fffffff)
         length = 0x7fffffff;
-    uint64_t done = 0;
+    uint64_t done = 0;int allocationError=-28;
     while (done < length)
     {
         uint64_t at = *offset + done, part = 4096 - (at & 4095);
@@ -590,17 +618,22 @@ int Write(Vnode *vn, const void *buffer, uint64_t length, uint64_t *offset)
         auto *p = FindPage(n, at / 4096);
         if (!p)
         {
-            p = static_cast<Page *>(Allocate(n->fs, sizeof(Page)));
-            if (!p)
-                break;
-            p->index = at / 4096;
+            int error=0;p=NewPage(n->fs,at/4096,&error);
+            if (!p){allocationError=error;break;}
             InsertPage(n,p);
         }
-        memcpy(p->bytes + (at & 4095), static_cast<const uint8_t *>(buffer) + done, part);
+        // A prior shared mapping may have touched bytes past partial EOF.
+        // Clear that old tail only when an extending write can make progress.
+        if(!done && at>n->size && (n->size&4095)) {
+            auto* tail=FindPage(n,n->size/4096);
+            if(tail){uint64_t end=at-(n->size&~uint64_t(4095));if(end>4096)end=4096;
+                memset(PageBytes(tail)+(n->size&4095),0,end-(n->size&4095));}
+        }
+        memcpy(PageBytes(p) + (at & 4095), static_cast<const uint8_t *>(buffer) + done, part);
         done += part;
     }
     if (!done && length)
-        return -28;
+        return allocationError;
     *offset += done;
     if (*offset > n->size)
         n->size = *offset;
@@ -617,6 +650,10 @@ int Truncate(Vnode *vn, uint64_t size)
     Guard g(n->fs);
     if (size > 0x7fffffffffffffffULL)
         return -27;
+    if(size>n->size && (n->size&4095)) {
+        if(auto* tail=FindPage(n,n->size/4096))
+            memset(PageBytes(tail)+(n->size&4095),0,4096-(n->size&4095));
+    }
     bool removed=false;
     auto **link = &n->pages;
     while (*link)
@@ -626,12 +663,12 @@ int Truncate(Vnode *vn, uint64_t size)
         {
             *link = p->next;
             --n->pageCount;removed=true;
-            Free(n->fs, p);
+            DropPage(p);
         }
         else
         {
             if (size % 4096 && p->index == size / 4096)
-                memset(p->bytes + size % 4096, 0, 4096 - size % 4096);
+                memset(PageBytes(p) + size % 4096, 0, 4096 - size % 4096);
             link = &p->next;
         }
     }

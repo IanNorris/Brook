@@ -70,25 +70,21 @@ writeback remain coherent. Private mappings preserve COW. Mapped truncate stays
 EBUSY, consistent with the existing VFS contract. This does not implement mapped
 resize, general tmpfs execution acceptance or arbitrary mount options.
 
-Optional immutable FileObject callbacks charge canonical frame and metadata
-storage against the owning tmpfs quota before allocation. Allocation failures
-unwind that charge, and every canonical-cache retirement path releases it.
-Callbacks use a retained inode context; final quota release is non-sleeping.
-Module ABI is 48, requiring a matched kernel and all modules.
+Tmpfs backing pages and canonical mappings now share one PMM frame. The inode
+index and canonical cache retain independent page tokens, and the payload quota
+is retained until the last token is released. Cache metadata remains separately
+charged. Private mappings preserve copy-on-write. Since mapped stores already
+update the backing frame, tmpfs writeback updates metadata without replaying a
+snapshot that could overwrite a newer mapped store. Other backends retain their
+existing snapshot writeback. Module ABI is 65; the kernel and all modules must
+be rebuilt and deployed as a matching set.
 
-Sparse backing is materialized before publishing a canonical page, so later
-writable exposure cannot exhaust the capacity needed for writeback. Canonical
-allocation and its quota reservation now happen before backend materialization, so a failure at those stages leaves no charged sparse backend
-page. A later backend read failure may still leave a charged zero page; it does
-not extend EOF, and inode teardown reclaims it. Backend and canonical storage are
-both charged honestly. Defaults remain 16 MiB per instance and 256 MiB globally;
-this is not whole-process/private-COW memory accounting.
-
-This preparation avoids a concrete retention cycle: otherwise canonical pages
-could consume all quota, shared stores could require another backend page on
-writeback, and ENOSPC could retain an unlinked inode through the writeback queue.
-The hosted and native tests explicitly exercise full-quota writeback followed
-by unlink, close, unmap, sync and reclamation.
+A sparse page is allocated before publication, so writeback requires no extra
+persistent quota. Allocation failure unwinds the frame, page metadata and
+quota. Defaults remain 16 MiB per instance and 256 MiB globally; the quota does
+not account for private COW memory. The generic writeback worker still allocates
+a temporary snapshot even for a coherent tmpfs-only flush, so physical heap
+exhaustion can still cause a flush to fail.
 
 Non-private shared FileObject mappings use a separate tagged object-ID/offset
 futex domain. Both FileObject and memfd identities stop before the tag boundary
@@ -184,3 +180,20 @@ clean restart into the staged candidate was requested, but the debug link did
 not return; hardware acceptance remains pending. Astra reviewed the ordering
 and rollback; it noted that concurrent quota and PMM exhaustion may now return
 ENOMEM first.
+
+## Shared-frame implementation, 4 November
+
+A private QEMU guest booted the matched ABI-65 kernel and modules and ran
+`scripts/workloads/tmpfs_coherent_probe.c`. A touched 26,214,416-byte pool
+charged 26,865,664 bytes including metadata. The probe passed shared mapping
+and file I/O coherence, msync, ordered cross-process visibility, private COW
+and unlink/close. It does not establish real Steam stability or measure final
+reclamation. Host tests cover low quota, retained page-token accounting, failed
+first allocation, EOF extension, and both explicit and global flush without
+backend data writes. Four focused host tests passed. Astra reviewed the frame
+lifetime and locking.
+
+The Dell is offline after the preceding checked reboot; the new kernel has not
+been deployed there. The host-wide test build also encountered an existing
+platform-power test include-path error; this is separate from the passing
+focused tests.

@@ -22,6 +22,8 @@ thread_local long failAllocation = -1;
 thread_local brook::Process process{};
 uint64_t rtcSeconds = 1792707600;
 bool mappingTest = false,failFrame = false;
+unsigned coherentBackendWrites=0,coherentFlushes=0;
+int (*realCoherentFlush)(brook::Vnode*)=nullptr;
 std::unordered_map<uint64_t,unsigned> frames;
 } // namespace
 extern "C" [[noreturn]] void KernelPanic(const char *, ...)
@@ -138,9 +140,10 @@ uint64_t RtcNow()
 {
     return rtcSeconds;
 }
-PhysicalAddress PmmAllocPage(MemTag, uint16_t)
+PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
-    assert(mappingTest && "tmpfs ordinary I/O must not allocate canonical pages");
+    assert(tag==MemTag::User && pid==KernelPid);
+    // Tmpfs backing and mapped pages both use ordinary PMM frames.
     if(failFrame)return {};
     void* memory=nullptr;assert(!posix_memalign(&memory,4096,4096));
     auto address=reinterpret_cast<uint64_t>(memory);
@@ -272,15 +275,16 @@ static void mappedQuota()
         }
         assert(!r->ops->remove(r,"sparse",false));VfsClose(f);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
     }
-    // Enough quota for either a backend page or a canonical page, but not
-    // both: a failed sparse fault must not retain the backend allocation.
+    // This headroom fits one shared frame plus metadata, but not the former
+    // pair of 4 KiB pages. The fault must succeed without a second copy.
     {
         auto* tight=make();auto* dir=root(tight);auto* file=create(dir,"pressure");
         auto* cache=file->ops->file_object(file);assert(!FileObjectTruncateUnmapped(cache,file,4096));
         const auto reserved=TmpfsDefaultBytes-tight->bytes-5000;assert(Reserve(tight,reserved));
         const auto before=tight->bytes;int pressureError=0;
-        assert(!FileObjectGetPage(cache,file,0,true,&pressureError) && pressureError==-28);
-        assert(tight->bytes==before && !FindPage(VnodeNode(file),0) && frames.empty());
+        auto physical=FileObjectGetPage(cache,file,0,true,&pressureError);
+        assert(physical && !pressureError && FindPage(VnodeNode(file),0)->physical==physical);
+        assert(tight->bytes-before<5000 && frames.size()==1);PmmUnrefPage(physical);
         Unreserve(tight,reserved);assert(!dir->ops->remove(dir,"pressure",false));
         VfsClose(file);VfsObjectRelease(dir);assert(!TmpfsDestroy(tight));clean();
     }
@@ -302,6 +306,54 @@ static void mappedQuota()
     assert(!FileObjectWritebackAll() && frames.empty());
     Unreserve(fs,spare);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
     mappingTest=false;
+}
+static void coherentFrameBehavior()
+{
+    auto* fs=make();auto* r=root(fs);auto* f=create(r,"coherent");auto* object=f->ops->file_object(f);
+    uint64_t offset=0;assert(FileObjectWrite(object,f,"abc",3,&offset)==3);
+    int error=0;auto frame=FileObjectGetPage(object,f,0,true,&error);
+    assert(frame && !error && FindPage(VnodeNode(f),0)->physical==frame && frames.size()==1);
+    auto* bytes=reinterpret_cast<unsigned char*>(frame.raw());bytes[8]=0xa5;
+    offset=10;assert(FileObjectWrite(object,f,"Z",1,&offset)==1);
+    assert(bytes[0]=='a' && bytes[2]=='c' && bytes[8]==0 && bytes[10]=='Z');
+    // A mapped extension within the old partial page clears the old tail,
+    // even if a client dirtied it through the original page mapping.
+    bytes[17]=0xa5;assert(!FileObjectGrowMapped(object,f,20));
+    assert(bytes[0]=='a' && bytes[10]=='Z' && bytes[17]==0);
+    KMutexLock(&object->gate);assert(FileObjectExposeWritableLocked(object,f,0,frame));KMutexUnlock(&object->gate);
+    // A coherent flush must never replay a copied snapshot to backend data:
+    // it could overwrite a mapped store made after that snapshot was taken.
+    auto* originalOps=f->ops;VnodeOps traced=*originalOps;
+    traced.write=[](Vnode*,const void*,uint64_t,uint64_t*){++coherentBackendWrites;return -5;};
+    f->ops=&traced;realCoherentFlush=object->flushCoherent;
+    object->flushCoherent=[](Vnode* v){++coherentFlushes;return realCoherentFlush(v);};
+    bytes[12]=0x7b;coherentBackendWrites=coherentFlushes=0;
+    assert(!FileObjectWriteback(object,f,0,4096));assert(!FileObjectWritebackAll());
+    assert(bytes[12]==0x7b && coherentBackendWrites==0 && coherentFlushes==2);
+    object->flushCoherent=realCoherentFlush;f->ops=originalOps;
+    VnodeStat stat{};assert(!f->ops->stat(f,&stat) && stat.size==20);
+    const auto charged=fs->bytes;failFrame=true;offset=4096;
+    assert(FileObjectWrite(object,f,"Q",1,&offset)==-12 && offset==4096);
+    failFrame=false;assert(!f->ops->stat(f,&stat) && stat.size==20 && bytes[0]=='a' && fs->bytes==charged);
+    PmmUnrefPage(frame);
+    assert(!r->ops->remove(r,"coherent",false));VfsClose(f);VfsObjectRelease(r);
+    assert(!TmpfsDestroy(fs));clean();
+}
+static void coherentTokenLifetime()
+{
+    auto* fs=make();auto* r=root(fs);auto* f=create(r,"token");auto* object=f->ops->file_object(f);
+    uint64_t offset=0;assert(FileObjectWrite(object,f,"x",1,&offset)==1);
+    const auto charged=fs->bytes;void* token=nullptr;int error=0;
+    auto frame=object->pinCoherentPage(object->pageBudgetContext,0,&token,&error);
+    assert(frame && token && !error && frames.size()==1);
+    assert(!f->ops->truncate(f,0) && !FindPage(VnodeNode(f),0));
+    // The detached token retains both frame and quota even after the inode
+    // removes its page. A subsequent allocation cannot reuse that charge.
+    assert(fs->bytes==charged && frames.size()==1);
+    PmmUnrefPage(frame);object->releaseCoherentPage(token);
+    assert(fs->bytes<charged && frames.empty());
+    assert(!r->ops->remove(r,"token",false));VfsClose(f);VfsObjectRelease(r);
+    assert(!TmpfsDestroy(fs));clean();
 }
 static void indexedSparsePages()
 {
@@ -350,15 +402,13 @@ static void indexedMappedQuota()
     mappingTest=true;
     auto* fs=make();auto* r=root(fs);auto* f=create(r,"indexed-mapped");auto* node=VnodeNode(f);
     assert(!f->ops->truncate(f,32*4096));
-    for(unsigned i=0;i<31;++i)assert(!PrepareBackingPage(node,i));
-    // Leave enough for the backing page and index, but not both it and the
-    // canonical frame. The failed fault must not materialize either object.
-    const uint64_t backend=sizeof(Page)+sizeof(Allocation)+64*sizeof(Page*)+sizeof(Allocation);
+    for(unsigned i=0;i<31;++i){int error=0;auto* page=NewPage(fs,i,&error);assert(page && !error);InsertPage(node,page);}
+    // Sparse indexing is optional: a fault must still work when the new
+    // shared page fits but the index table may not.
+    const uint64_t backend=4096+sizeof(Page)+sizeof(Allocation)+64*sizeof(Page*)+sizeof(Allocation);
     const uint64_t spare=fs->byteLimit-fs->bytes-backend;assert(Reserve(fs,spare));
-    const uint64_t before=fs->bytes;
     int error=0;auto* object=f->ops->file_object(f);auto page=FileObjectGetPage(object,f,31,true,&error);
-    assert(!page && error==-28 && fs->bytes==before && frames.empty());
-    assert(!FindPage(node,31) && !node->pageBuckets);
+    assert(page && !error && frames.size()==32 && FindPage(node,31));PmmUnrefPage(page);
     unsigned char byte=0x5a;uint64_t offset=31*4096+17;
     assert(f->ops->write(f,&byte,1,&offset)==1); // Explicit write can materialize the page and index.
     Unreserve(fs,spare);
@@ -388,6 +438,8 @@ int main()
     identity(1000);
     clean();
     mappedQuota();
+    coherentFrameBehavior();
+    coherentTokenLifetime();
     lookupAtFullQuota(false);
     lookupAtFullQuota(true);
     lookupUnlinkRace();
