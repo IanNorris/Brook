@@ -716,7 +716,6 @@ void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,
 }
 
 bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {
-    if(HostOwnerExperiment(pt))return false;
     if(!pt || pt.pml4==g_kernelCR3 || address.raw()>=0x0000800000000000ULL || (address.raw()&4095) || !expected)return false;
     uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
     bool large=false;auto* entry=WalkToPtr(pt,address,false,0,&large);bool changed=false;
@@ -724,6 +723,7 @@ bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddre
         uint64_t old=__atomic_load_n(entry,__ATOMIC_RELAXED);
         while((old&(VMM_PRESENT|VMM_USER|VMM_ACCESSED))==(VMM_PRESENT|VMM_USER|VMM_ACCESSED) &&
               !(old&PTE_COW_BIT) && VmmLeafPhysical(old)==expected) {
+            (void)CaptureOwnedLeaf(entry,old,HostOwnerExperiment(pt));
             const uint64_t aged=old&~VMM_ACCESSED;
             if(__atomic_compare_exchange_n(entry,&old,aged,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) {
                 changed=true;break;
@@ -1014,15 +1014,15 @@ static uint64_t ProtectLeaf(VirtualAddress address, VmmOwnedLeaf owned, void* op
 }
 bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protection,
                      VmmPrivateLeafQuery query, void* context) {
-    if(HostOwnerExperiment(pt))return false;
     if ((protection & ~7u) || !ValidLeafRange(pt,begin,end)) return false;
     uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
     auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
     uint64_t count = 0; ProtectLeaves update{protection,query,context};
-    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,count);
+    const bool extended=HostOwnerExperiment(pt);
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,count,nullptr,extended);
     if (result) {
         count = 0;
-        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&update,count,ProtectLeaf)) __builtin_trap();
+        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&update,count,ProtectLeaf,extended)) __builtin_trap();
     }
     IrqSpinLockRelease(&g_userPtLock,irq); return result;
 }
