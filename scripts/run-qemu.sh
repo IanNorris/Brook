@@ -82,6 +82,15 @@ if (( INSTANCE_EXPLICIT )); then
     fi
 fi
 
+case "${BROOK_NET_RESTRICT-0}" in
+    0|1) ;;
+    *) echo "BROOK_NET_RESTRICT must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${BROOK_NET_RESTRICT-0}" = 1 ] && [ -n "$VDE_SOCK" ]; then
+    echo "BROOK_NET_RESTRICT requires QEMU user networking, not VDE" >&2
+    exit 2
+fi
+
 if [ "${VM_BRIDGE}" = "1" ]; then
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"
 fi
@@ -354,6 +363,10 @@ else
         HOSTFWD_BASE=$((11237 + INSTANCE * 100))
     fi
     NETDEV_OPT="-netdev user,id=net0,hostfwd=tcp:127.0.0.1:${HOSTFWD_BASE}-:1234"
+    if [ "${BROOK_NET_RESTRICT-0}" = 1 ]; then
+        NETDEV_OPT+=",restrict=on"
+        echo "  Net:  restricted user networking with local debug forward"
+    fi
 fi
 
 # Per-instance QEMU monitor socket and audio disable

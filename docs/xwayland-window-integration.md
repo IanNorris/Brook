@@ -147,6 +147,16 @@ dialogs, successful installation or long-term stability. Friends' own client
 close button is verified after the focus/stack correction; the later Q review
 adds client-driven movement and resizing controls.
 
+A later private copy of the Stardew review was attempted with
+`BROOK_NET_RESTRICT=1` and silent audio to avoid contacting the Steam service
+or changing cloud saves. The local debug forward remained usable and a guest
+TCP connection to 1.1.1.1:80 timed out. Steam reached an “Unexpected Transport
+Error” window and did not launch Stardew; this offline control does not assess
+game compatibility or prove the cause of the error. The VM was stopped after a
+checked filesystem and device flush. Original review disks were not modified.
+The option restricts the script's QEMU user-network adapter; caller-supplied
+extra network devices are outside its scope. VDE is rejected with this option.
+
 Known gaps and remaining gates:
 
 - Finish Steam dialogs/navigation, input-alignment and a small-download
