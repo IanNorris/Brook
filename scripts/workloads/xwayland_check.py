@@ -14,6 +14,8 @@ def main():
     parser.add_argument('--display', type=int, default=0)
     parser.add_argument('--glamor', choices=['gl', 'es', 'off'], default='gl')
     parser.add_argument('--software', action='store_true', help='Request Mesa software rendering')
+    parser.add_argument('--dumb-sched', action='store_true',
+                        help='Diagnostic: disable smart scheduling and threaded input')
     args = parser.parse_args()
     if not 0 <= args.display <= 63:
         parser.error('display must be between 0 and 63')
@@ -21,6 +23,8 @@ def main():
     os.environ.update(HOME='/data/home', XDG_RUNTIME_DIR='/tmp', WAYLAND_DISPLAY='wayland-0')
     command = ['Xwayland', f':{args.display}', '-ac', '-nolisten', 'tcp', '-nolock',
                '-noreset', '-geometry', '800x600']
+    if args.dumb_sched:
+        command.append('-dumbSched')
     if args.glamor == 'off':
         os.environ['XWAYLAND_NO_GLAMOR'] = '1'
         command.append('-shm')
