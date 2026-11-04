@@ -402,6 +402,29 @@ static void WritebackLifetime() {
     FileObjectDispose(&second.object);CHECK(refs.empty()&&heapBlocks==0);
     CHECK(FileObjectWritebackAll()==0);
 }
+// A failed snapshot allocation for an earlier disk object must not prevent a
+// later coherent object from flushing and retiring its queue entry.
+static void MixedWritebackAllocationFailure() {
+    CHECK(refs.empty() && heapBlocks==0);
+    Backend disk{},coherent{};FileObjectInit(&disk.object);FileObjectInit(&coherent.object);
+    disk.bytes.resize(4096,0x41);coherent.bytes.resize(4096,0x42);
+    coherent.object.pinCoherentPage=[](void*,uint64_t,void** token,int* error) {
+        *token=reinterpret_cast<void*>(1);*error=0;return PmmAllocPage(MemTag::User,KernelPid);
+    };
+    coherent.object.releaseCoherentPage=[](void*){};
+    coherent.object.flushCoherent=[](Vnode* vnode){++static_cast<Backend*>(vnode->priv)->writes;return 0;};
+    Vnode a{&operations,VnodeType::File,&disk,1,0},b{&operations,VnodeType::File,&coherent,1,0};
+    int error=0;auto p=FileObjectGetPage(&disk.object,&a,0,true,&error);CHECK(p && !error);
+    auto q=FileObjectGetPage(&coherent.object,&b,0,true,&error);CHECK(q && !error);
+    KMutexLock(&disk.object.gate);CHECK(FileObjectExposeWritableLocked(&disk.object,&a,0,p));KMutexUnlock(&disk.object.gate);
+    KMutexLock(&coherent.object.gate);CHECK(FileObjectExposeWritableLocked(&coherent.object,&b,0,q));KMutexUnlock(&coherent.object.gate);
+    failHeap=true;CHECK(FileObjectWritebackAll()==-12);failHeap=false;
+    CHECK(disk.object.writebackVnode==&a && a.refCount==2 && disk.writes==0);
+    CHECK(!coherent.object.writebackVnode && b.refCount==1 && coherent.writes==1);
+    CHECK(!FileObjectWritebackAll() && !disk.object.writebackVnode && a.refCount==1);
+    PmmUnrefPage(p);PmmUnrefPage(q);FileObjectDispose(&disk.object);FileObjectDispose(&coherent.object);
+    CHECK(refs.empty() && heapBlocks==0);
+}
 static void BatchPages() {
     CHECK(refs.empty()&&heapBlocks==0);
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(16*4096,0x57);
@@ -659,6 +682,7 @@ int main() {
     BatchPages();
     WritebackPages();
     WritebackLifetime();
+    MixedWritebackAllocationFailure();
     ExtendingWriteClearsMappedTail();
     AppendTransactions();
     FaultPages();

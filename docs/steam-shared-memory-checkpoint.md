@@ -82,9 +82,9 @@ be rebuilt and deployed as a matching set.
 A sparse page is allocated before publication, so writeback requires no extra
 persistent quota. Allocation failure unwinds the frame, page metadata and
 quota. Defaults remain 16 MiB per instance and 256 MiB globally; the quota does
-not account for private COW memory. The generic writeback worker still allocates
-a temporary snapshot even for a coherent tmpfs-only flush, so physical heap
-exhaustion can still cause a flush to fail.
+not account for private COW memory. Coherent tmpfs flushes no longer allocate a
+snapshot; a mixed writeback pass can flush tmpfs even if allocation for a disk
+backend fails, while leaving the latter queued for retry.
 
 Non-private shared FileObject mappings use a separate tagged object-ID/offset
 futex domain. Both FileObject and memfd identities stop before the tag boundary
@@ -199,3 +199,10 @@ path, the complete host suite built. It passed 304 of 306 tests in parallel; the
 scheduler-lock and audio-delivery timeouts passed individually on rerun. The
 tmpfs and file-object tests also passed GCC ASan/UBSan with leak detection
 disabled.
+
+A subsequent change removed the unused heap snapshot from coherent tmpfs
+flushes. Host tests inject heap allocation failure for both direct and global
+flush, including a mixed disk/tmpfs queue; disk writeback remains queued while
+tmpfs retires. Both affected tests pass ASan/UBSan. The native Steam-sized
+coherence probe also passed on the updated kernel in private QEMU. The Dell
+remains offline, so these results do not establish real Steam behavior.

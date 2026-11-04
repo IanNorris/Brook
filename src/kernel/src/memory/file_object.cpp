@@ -443,7 +443,14 @@ int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t 
     if(begin>end)return -22;
     if(begin==end)return 0;
     if(!vnode || !vnode->ops || !vnode->ops->stat || !vnode->ops->write)return -95;
-    { Gate held(object);if(object->mappingError)return object->mappingError;if(!object->writebackVnode)return 0; }
+    {
+        Gate held(object);
+        if(object->mappingError)return object->mappingError;
+        if(!object->writebackVnode)return 0;
+        // Coherent backends already own the frame: no data snapshot or heap
+        // allocation is needed to flush metadata.
+        if(object->pinCoherentPage)return WritebackLocked(object,vnode,begin,end,nullptr);
+    }
     // Allocate before taking the file gate. The backend never sees live mapped
     // memory: a concurrent user store can change it during filesystem I/O.
     auto* snapshot=static_cast<uint8_t*>(kmalloc(4096));if(!snapshot)return -12;
@@ -459,7 +466,7 @@ int FileObjectWritebackAll() {
         if(object->orderId>ceiling)ceiling=object->orderId;
     IrqSpinLockRelease(&writebackLock,flags);
     if(!ceiling)return 0;
-    auto* snapshot=static_cast<uint8_t*>(kmalloc(4096));if(!snapshot)return -12;
+    uint8_t* snapshot=nullptr;
     int result=0;uint64_t cursor=0;
     for(;;) {
         FileObject* object=nullptr;Vnode* vnode=nullptr;
@@ -470,6 +477,13 @@ int FileObjectWritebackAll() {
         if(object) { vnode=object->writebackVnode;VfsRetain(vnode);cursor=object->orderId; }
         IrqSpinLockRelease(&writebackLock,flags);
         if(!object)break;
+        // The vnode pin retains the inode while allocation happens outside
+        // every filesystem lock. One allocation serves all snapshot backends;
+        // coherent tmpfs objects continue to flush even when it fails.
+        if(!object->pinCoherentPage && !snapshot) {
+            snapshot=static_cast<uint8_t*>(kmalloc(4096));
+            if(!snapshot){if(!result)result=-12;DropVnode(vnode);continue;}
+        }
         Vnode* retired=nullptr;
         {
             Gate held(object);

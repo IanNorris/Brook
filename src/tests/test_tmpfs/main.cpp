@@ -327,8 +327,9 @@ static void coherentFrameBehavior()
     traced.write=[](Vnode*,const void*,uint64_t,uint64_t*){++coherentBackendWrites;return -5;};
     f->ops=&traced;realCoherentFlush=object->flushCoherent;
     object->flushCoherent=[](Vnode* v){++coherentFlushes;return realCoherentFlush(v);};
-    bytes[12]=0x7b;coherentBackendWrites=coherentFlushes=0;
-    assert(!FileObjectWriteback(object,f,0,4096));assert(!FileObjectWritebackAll());
+    bytes[12]=0x7b;coherentBackendWrites=coherentFlushes=0;failAllocation=0;
+    assert(!FileObjectWriteback(object,f,0,4096));assert(failAllocation==0);
+    assert(!FileObjectWritebackAll());assert(failAllocation==0);failAllocation=-1;
     assert(bytes[12]==0x7b && coherentBackendWrites==0 && coherentFlushes==2);
     object->flushCoherent=realCoherentFlush;f->ops=originalOps;
     VnodeStat stat{};assert(!f->ops->stat(f,&stat) && stat.size==20);
