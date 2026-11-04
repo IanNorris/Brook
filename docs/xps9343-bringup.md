@@ -1554,6 +1554,10 @@ An opt-in ACK-only observer is also available under
 state, D0, boot-map admission and UC aliases before a single read of the
 always-on ACK register. It never writes the forcewake request. A clear ACK is
 a point-in-time observation and does not prove ownership of request bit 0.
+The exact ACK-only pair booted in private QEMU and on the Dell with the prior
+slot retained. On the Dell, the observer passed its gates and returned ACK
+`0x00000000`; the SSD, network and desktop remained available. The release
+object was checked for a single 32-bit load at `0xf6130044`.
 
 The exact candidate refused the Dell-only probe in private QEMU, then booted
 on the Dell after a clean restart with the previous slot retained. The probe
