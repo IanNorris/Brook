@@ -412,3 +412,17 @@ bytes. Thus the reboot removed previously retained objects but did not prevent
 the fresh startup from reaching severe shared-memory pressure. The observation
 does not identify the allocation owner or prove the game's failure has the same
 cause. Automatic SSD repair remains unimplemented.
+
+## Stardew runtime dependency
+
+The saved log from that launch records `getopt: command not found` in the
+installed Soldier `_v2-entry-point` before its game process exits. The Dell's
+profile did not contain `getopt`. Installing `util-linux-minimal` with Brook's
+package manager provided it; the installed executable parsed representative
+long options successfully, and the same runtime entry point's `--help` exited
+successfully with the profile on PATH. The hardware base profile now includes
+the package, and the diagnostic client launcher explicitly includes the
+profile on PATH. This confirms a missing prerequisite and its availability, not
+that the existing frozen Steam session can launch Stardew; that needs a fresh
+end-to-end run. The QEMU tmpfs full-quota regression is documented separately in
+`steam-shared-memory-checkpoint.md` and has not yet been deployed to the Dell.
