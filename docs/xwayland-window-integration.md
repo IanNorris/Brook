@@ -118,6 +118,7 @@ reuse XIDs/serials while rejecting delayed messages from the retired generation.
 Native review N additionally terminates the owned Xwayland server: its X
 windows disappear while the same native Mousepad window retains its identity,
 receives focus and accepts newly typed text. Replacement-server acceptance
+was subsequently exercised with Steam open as described below; Dell acceptance
 remains open.
 A fresh headless Xvfb control additionally exercises the real XCB
 worker: InputOnly maps, border suppression, serial association, configure,
@@ -151,7 +152,8 @@ Known gaps and remaining gates:
 - Finish Steam dialogs/navigation, input-alignment and a small-download
   acceptance run through the rootless path. Initial authenticated Store,
   Library, Friends and independent movement are verified.
-- Validate replacement-server behavior under real Steam load and on the Dell.
+- Validate replacement-server behavior on the Dell and test Steam relaunch
+  after a server loss. A private VM test with Steam open is described below.
 - Transient identities currently affect initial placement; later parent motion,
   minimize and stacking need broader policy/acceptance. Existing native popup
   raising also groups by provider, which can include unrelated Wayland clients.
