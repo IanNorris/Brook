@@ -144,6 +144,24 @@ static void protocol_message(struct xwm *wm,xcb_window_t window,xcb_atom_t proto
     event.data.data32[0]=protocol;event.data.data32[1]=timestamp;
     xcb_send_event(wm->xcb,0,window,XCB_EVENT_MASK_NO_EVENT,(const char *)&event);
 }
+static int update_maximized_state(struct xwm *wm,xcb_window_t window,int maximized) {
+    // Preserve states owned by the client or other policies. Refuse to rewrite
+    // a malformed or truncated property rather than silently discarding it.
+    xcb_get_property_reply_t *reply=property(wm,window,wm->net_state,4096);
+    // A client may have destroyed the X window while its configure was queued.
+    if(!reply)return !xcb_connection_has_error(wm->xcb);
+    if(reply->bytes_after || (reply->type!=XCB_ATOM_NONE &&
+       (reply->type!=XCB_ATOM_ATOM || reply->format!=32))) {free(reply);return 1;}
+    const size_t count=(size_t)xcb_get_property_value_length(reply)/sizeof(xcb_atom_t);
+    xcb_atom_t *states=malloc((count+2)*sizeof(*states));
+    if(!states){free(reply);return 0;}
+    const xcb_atom_t *old=xcb_get_property_value(reply);size_t used=0;
+    for(size_t i=0;i<count;++i)if(old[i]!=wm->max_h && old[i]!=wm->max_v)states[used++]=old[i];
+    if(maximized && used>4094){free(states);free(reply);return 1;}
+    if(maximized){states[used++]=wm->max_h;states[used++]=wm->max_v;}
+    xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,window,wm->net_state,XCB_ATOM_ATOM,32,(uint32_t)used,states);
+    free(states);free(reply);return 1;
+}
 static int command(struct xwm *wm,const struct bxwm_message *message) {
     if (!bxwm_valid(message,wm->generation,0)) return 0;
     struct window *w=find(wm,message->window);
@@ -153,11 +171,10 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
     case BXWM_CONFIGURE: {
         w->state.configure_serial=message->configure_serial;
         unsigned state_mask=BXWM_MAXIMIZED|BXWM_MINIMIZED;
-        if ((w->state.flags^message->flags)&state_mask) {
+        unsigned changed=(w->state.flags^message->flags)&state_mask;
+        if (changed) {
             w->state.flags=(w->state.flags&~state_mask)|(message->flags&state_mask);
-            xcb_atom_t states[]={wm->max_h,wm->max_v};
-            xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,message->window,wm->net_state,
-                XCB_ATOM_ATOM,32,(message->flags&BXWM_MAXIMIZED)?2:0,states);
+            if((changed&BXWM_MAXIMIZED) && !update_maximized_state(wm,message->window,(message->flags&BXWM_MAXIMIZED)!=0))return 0;
             uint32_t state[]={(message->flags&BXWM_MINIMIZED)?3:1,XCB_WINDOW_NONE};
             xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,message->window,wm->wm_state,wm->wm_state,32,2,state);
         }

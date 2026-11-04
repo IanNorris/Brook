@@ -74,6 +74,12 @@ ordinary X client-close fallback. Reparenting away from the root retires the
 native association; returning creates a fresh identity. Generation retirement
 removes owned X windows without disconnecting native Wayland clients.
 
+Native maximize/restore preserves unrelated `_NET_WM_STATE` atoms, and a
+minimize-only update does not rewrite that property. Malformed or oversized
+properties are left intact. An isolated X server fixture covers these cases;
+concurrent direct property writers and fresh Steam/Dell acceptance remain
+outside that test.
+
 The first live Steam review exposed a Friends input defect: native presentation
 put Friends above the main window, while the X root stack put the main window
 above Friends. Native activation now raises the matching X window as well as

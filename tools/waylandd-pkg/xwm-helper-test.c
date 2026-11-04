@@ -129,17 +129,53 @@ int main(int argc,char **argv) {
     request.type=atom(c,"WM_CHANGE_STATE");memset(&request.data,0,sizeof(request.data));request.data.data32[0]=3;
     xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&request);
     xcb_flush(c);action=receive(control,BXWM_MINIMIZE,id,0,0,0);assert(action.identity==configured.identity);
+    // Native window-state changes must retain unrelated EWMH state atoms.
+    xcb_atom_t foreign=atom(c,"_NET_WM_STATE_ABOVE");
+    xcb_void_cookie_t property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_ATOM,32,1,&foreign);
+    assert(!xcb_request_check(c,property_cookie));
     struct bxwm_message native_state=configured;native_state.flags|=BXWM_MAXIMIZED|BXWM_MINIMIZED;
     send_command(control,native_state,BXWM_CONFIGURE);
     native_state=receive(control,BXWM_WINDOW,id,123,640,360);
     assert((native_state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED))==(BXWM_MAXIMIZED|BXWM_MINIMIZED));
-    xcb_get_property_reply_t *state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,2),NULL);
-    assert(state_reply && state_reply->format==32 && xcb_get_property_value_length(state_reply)==8);
-    assert(((xcb_atom_t *)xcb_get_property_value(state_reply))[0]==max_h &&
-        ((xcb_atom_t *)xcb_get_property_value(state_reply))[1]==max_v);free(state_reply);
+    xcb_get_property_reply_t *state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4),NULL);
+    assert(state_reply && state_reply->format==32 && xcb_get_property_value_length(state_reply)==12);
+    assert(((xcb_atom_t *)xcb_get_property_value(state_reply))[0]==foreign &&
+        ((xcb_atom_t *)xcb_get_property_value(state_reply))[1]==max_h &&
+        ((xcb_atom_t *)xcb_get_property_value(state_reply))[2]==max_v);free(state_reply);
     send_command(control,configured,BXWM_CONFIGURE);
     native_state=receive(control,BXWM_WINDOW,id,123,640,360);
     assert(!(native_state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED)));
+    state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4),NULL);
+    assert(state_reply && state_reply->format==32 && xcb_get_property_value_length(state_reply)==4 &&
+        ((xcb_atom_t *)xcb_get_property_value(state_reply))[0]==foreign);free(state_reply);
+    const char malformed_state[]="client-data";
+    property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_STRING,8,sizeof(malformed_state),malformed_state);
+    assert(!xcb_request_check(c,property_cookie));
+    native_state=configured;native_state.flags|=BXWM_MAXIMIZED;
+    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_GET_PROPERTY_TYPE_ANY,0,8),NULL);
+    assert(state_reply && state_reply->type==XCB_ATOM_STRING && state_reply->format==8 &&
+        xcb_get_property_value_length(state_reply)==sizeof(malformed_state) &&
+        !memcmp(xcb_get_property_value(state_reply),malformed_state,sizeof(malformed_state)));free(state_reply);
+    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    xcb_atom_t axis_state[]={foreign,max_h};
+    property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_ATOM,32,2,axis_state);
+    assert(!xcb_request_check(c,property_cookie));
+    native_state=configured;native_state.flags|=BXWM_MINIMIZED;
+    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4),NULL);
+    assert(state_reply && xcb_get_property_value_length(state_reply)==8 &&
+        !memcmp(xcb_get_property_value(state_reply),axis_state,sizeof(axis_state)));free(state_reply);
+    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    xcb_atom_t many[4095];for(size_t i=0;i<4095;++i)many[i]=foreign;
+    property_cookie=xcb_change_property_checked(c,XCB_PROP_MODE_REPLACE,id,net_state,XCB_ATOM_ATOM,32,4095,many);
+    assert(!xcb_request_check(c,property_cookie));
+    native_state=configured;native_state.flags|=BXWM_MAXIMIZED;
+    send_command(control,native_state,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
+    state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,4096),NULL);
+    assert(state_reply && !state_reply->bytes_after && xcb_get_property_value_length(state_reply)==sizeof(many) &&
+        !memcmp(xcb_get_property_value(state_reply),many,sizeof(many)));free(state_reply);
+    send_command(control,configured,BXWM_CONFIGURE);receive(control,BXWM_WINDOW,id,123,640,360);
     // Reparenting away retires the native identity. Returning creates a new one.
     xcb_reparent_window(c,global,id,0,0);xcb_flush(c);
     struct bxwm_message retired=receive(control,BXWM_DESTROY,global,0,0,0);assert(retired.identity==active.identity);
