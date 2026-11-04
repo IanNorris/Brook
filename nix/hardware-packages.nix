@@ -60,6 +60,9 @@ let
   packages = [
     pkgs.bashInteractive pkgs.coreutils pkgs.curl.bin pkgs.cacert pkgs.gnutar
     pkgs.unzip pkgs.vim pkgs.xfce.mousepad pkgs.tzdata pkgs.xwayland
+    # Steam's game-runtime entry point uses util-linux getopt before entering
+    # its container; ship it in the profile rather than relying on /usr/bin.
+    (pkgs.lib.getBin pkgs.util-linuxMinimal)
     pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.shared-mime-info
     fonts cursors launchers
   ] ++ native;

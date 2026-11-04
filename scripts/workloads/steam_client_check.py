@@ -93,7 +93,7 @@ def main():
                XDG_DATA_HOME=str(home / '.local/share'), XDG_RUNTIME_DIR='/tmp',
                WAYLAND_DISPLAY=args.wayland_display, SDL_VIDEODRIVER='x11', STEAM_RUNTIME_LOGGER='0',
                STEAM_COMPAT_CLIENT_INSTALL_PATH=str(client),
-               PATH=str(corebin) + ':' + os.environ.get('PATH', ''),
+               PATH=str(corebin) + ':/nix/profile/bin:' + os.environ.get('PATH', ''),
                LD_LIBRARY_PATH=host_libraries)
     for key in ['STEAM_RUNTIME', 'STEAM_RUNTIME_STEAMRT', 'PRESSURE_VESSEL_PREFIX', 'LD_PRELOAD']:
         env.pop(key, None)
