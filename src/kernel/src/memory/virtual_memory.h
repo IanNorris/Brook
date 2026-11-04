@@ -199,6 +199,11 @@ bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protec
 // Prepare intermediate tables without changing leaves. Empty tables left by
 // failure remain AS-owned. Used before a destructive fixed replacement commit.
 bool VmmPrepareRange(PageTable pt, uint64_t begin, uint64_t end);
+// Reserve future extended-owner storage for one user L1 page table. The caller
+// pins the address space. Failure leaves existing leaves intact; empty
+// intermediate tables may remain owned by the address space until teardown.
+// This does not enable or encode extended owners.
+bool VmmPrepareOwnerSidecar(PageTable pt,VirtualAddress address);
 bool VmmPrepareMove(PageTable pt, uint64_t begin, uint64_t end, uint64_t destination);
 bool VmmCanMoveRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t destination, bool occupiedDestination);
 bool VmmMoveRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t destination);

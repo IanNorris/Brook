@@ -1,5 +1,6 @@
 #include "virtual_memory.h"
 #include "physical_memory.h"
+#include "pte_owner_sidecars.h"
 #include "serial.h"
 #include "spinlock.h"
 #include "vmalloc_arena.h"
@@ -46,6 +47,9 @@ static IrqSpinLock g_kernelPtLock;
 // sub-optimal for SMP scaling but is correct; per-tgid locking is a
 // future optimisation. (BRO-003 root cause.)
 static IrqSpinLock g_userPtLock;
+// Registry keyed by user L1 frame; protected by g_userPtLock. Entries remain
+// alive across empty slots and are retired with the containing L1 table.
+static PteOwnerSidecars g_userOwnerSidecars;
 
 // The kernel's PML4 physical address, captured at init time.
 static PhysicalAddress g_kernelCR3{};
@@ -728,6 +732,27 @@ bool VmmPrepareRange(PageTable pt, uint64_t begin, uint64_t end) {
         address = (address | uint64_t{0x1fffff}) + 1;
     }
     IrqSpinLockRelease(&g_userPtLock,irq); return result;
+}
+bool VmmPrepareOwnerSidecar(PageTable pt,VirtualAddress address) {
+    if (!ValidLeafRange(pt,address.raw(),address.raw()+4096) || (address.raw()&4095)) return false;
+    const auto irq=IrqSpinLockAcquire(&g_userPtLock);
+    bool large=false;
+    auto* leaf=WalkToPtr(pt,address,false,0,&large);
+    if(!large && !leaf)leaf=WalkToPtr(pt,address,true,0,&large);
+    bool ok=false;
+    if(!large && leaf) {
+        const auto table=VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(leaf)&~uint64_t(4095))).raw();
+        if(g_userOwnerSidecars.Find(table))ok=true;
+        else {
+            const auto physical=PmmAllocPage(MemTag::PageTable,KernelPid);
+            if(physical) {
+                auto* page=reinterpret_cast<PteOwnerSidecars::Page*>(PhysToVirt(physical).raw());
+                ok=g_userOwnerSidecars.Install(table,page);
+                if(!ok)PmmFreePage(physical);
+            }
+        }
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq);return ok;
 }
 struct MoveLeaves { PageTable table;uint64_t source,destination;bool prepare,occupied,move,failed; };
 static uint64_t MoveLeaf(VirtualAddress address,VmmOwnedLeaf owned,void* opaque) {
@@ -1454,6 +1479,12 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBo
                     static_cast<uint64_t>(MemTag::Device);
             if (!borrowed) PmmUnrefPage(pagePhys);
         }
+        // Teardown owns this address space exclusively after its final TLB
+        // acknowledgement. Unlink before its L1 frame can be recycled.
+        const auto irq=IrqSpinLockAcquire(&g_userPtLock);
+        auto* sidecar=g_userOwnerSidecars.Remove(tablePhys.raw());
+        IrqSpinLockRelease(&g_userPtLock,irq);
+        if(sidecar)PmmFreePage(VirtToPhys(VirtualAddress(reinterpret_cast<uint64_t>(sidecar))));
     }
     PmmFreePage(tablePhys);
 }
