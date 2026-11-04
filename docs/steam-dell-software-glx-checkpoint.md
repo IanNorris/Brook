@@ -381,3 +381,22 @@ outer namespace. A new diagnostic launch adds explicit `/bin/sh` and
 `/bin/bash` bindings and uses a 512-task budget. Game-launch acceptance remains
 pending. The X session still uses a nested virtual desktop without an X window
 manager; resizing the main X window did not resolve all clipping.
+
+After restart with the shell bindings and a 512-task budget, the client
+displayed its main window but its page remained unresponsive; one browser
+reported being killed as unresponsive. A subsequent startup with a queued
+Stardew request advanced past the former immediate missing-shell report, but
+the game did not reach a usable window. CEF then reported `/dev/shm` ENOSPC
+and shared-memory corruption; the Steam job exited 135. Its peak was 205 of
+512 tasks with zero denied births. This is not a successful game launch or
+proof that the shared-memory error caused every failure.
+
+After the job drained, the canonical mount reported about 774 MB free of
+992 MB, below its nearly empty-boot baseline. Five linked 26,214,416-byte
+`u1000-Shm_` objects remained. Static inspection associates this naming
+pattern with Valve IPC, but does not identify which process created each
+object or show whether it attempted unlink. Tmpfs charges backing and mapped
+pages separately, so the sizes are consistent with substantial retained
+usage but do not establish the exact allocation. Do not remove these objects
+as a presumed fix: compare successful and abnormal lifecycles, including
+unlink result and identity, on disposable fixtures first.
