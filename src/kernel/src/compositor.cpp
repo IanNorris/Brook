@@ -1293,29 +1293,19 @@ static void BlitWindowVfb(const uint32_t* src,
     uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
-    uint32_t startDy = 0, startDx = 0;
-    if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
-    if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
+    const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,srcW,srcH,1,
+                                           g_physFbWidth,g_physFbHeight);
+    if (clip.empty()) return;
+    const uint32_t sourceX=static_cast<uint32_t>(clip.left-static_cast<int64_t>(dstX0));
+    const uint32_t rowLen=static_cast<uint32_t>(clip.right-clip.left);
+    MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
 
-    uint32_t endDy = srcH;
-    uint32_t endDx = srcW;
-    if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
-        endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
-    if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
-        endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
-
-    if (endDy <= startDy || endDx <= startDx) return;
-
-    MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
-                  static_cast<uint32_t>(dstY0) + endDy);
-
-    for (uint32_t dy = startDy; dy < endDy; ++dy)
+    for (int64_t y=clip.top; y<clip.bottom; ++y)
     {
-        const uint32_t* srcRow = src + dy * srcStride + startDx;
+        const uint32_t sourceY=static_cast<uint32_t>(y-static_cast<int64_t>(dstY0));
+        const uint32_t* srcRow = src + static_cast<uint64_t>(sourceY) * srcStride + sourceX;
         uint32_t* dstRow = dstBase +
-            static_cast<uint32_t>(dstY0 + dy) * dstStride +
-            static_cast<uint32_t>(dstX0 + startDx);
-        const uint32_t rowLen = endDx - startDx;
+            static_cast<uint64_t>(y) * dstStride + static_cast<uint32_t>(clip.left);
 
         // Fast path: if both the first and last pixel are fully opaque,
         // the row is almost certainly all opaque — use memcpy.  This is

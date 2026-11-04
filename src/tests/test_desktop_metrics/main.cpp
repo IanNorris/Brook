@@ -33,6 +33,11 @@ static void checkSceneDamage() {
     native=SceneClientBlitRect(-10,-20,320,200,100,80,1,1920,1080);
     CHECK(native.left==0 && native.top==0 && native.right==90 && native.bottom==60);
     CHECK(SceneClientBlitRect(2000,0,320,200,100,80,1,1920,1080).empty());
+    CHECK(SceneClientBlitRect(0,1081,320,200,320,200,1,1920,1080).empty());
+    CHECK(SceneClientBlitRect(1920,0,320,200,320,200,1,1920,1080).empty());
+    CHECK(SceneClientBlitRect(-400,0,320,200,320,200,1,1920,1080).empty());
+    native=SceneClientBlitRect(1900,1070,320,200,320,200,1,1920,1080);
+    CHECK(native.left==1900 && native.top==1070 && native.right==1920 && native.bottom==1080);
     // Deliberately reverse the overlap chain: a single pass misses layer 0.
     SceneRect layers[]={{0,0,4,4},{3,0,7,4},{6,0,10,4},{12,0,16,4}};
     SceneRect result=SceneDamageClosure(layers[2],layers,4);
