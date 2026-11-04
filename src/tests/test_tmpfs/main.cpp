@@ -1,4 +1,5 @@
 #include <cassert>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -199,6 +200,57 @@ static void clean()
     auto s = TmpfsGlobalUsage();
     assert(!s.bytes && !s.inodes && !s.mounts && allocations.empty() && frames.empty());
 }
+// Lookup must not require fresh quota: unlink needs a retained target even
+// when the filesystem has no space left. The held file survives unlink.
+static void lookupAtFullQuota(bool aggregate)
+{
+    if (aggregate) assert(!TmpfsConfigureByteBudget(TmpfsDefaultBytes));
+    auto* fs=make();auto* r=root(fs);auto* f=create(r,"held");
+    uint64_t off=0;const char value='Q';
+    assert(f->ops->write(f,&value,1,&off)==1);
+    auto* other=aggregate?make():nullptr;
+    auto* reserveFs=other?other:fs;
+    const uint64_t spare=aggregate?TmpfsMaximumBytes()-TmpfsGlobalUsage().bytes:fs->byteLimit-fs->bytes;
+    assert(Reserve(reserveFs,spare));
+    const auto before=TmpfsGlobalUsage().bytes;
+    failAllocation=0;VfsObject* target=nullptr;
+    assert(!r->ops->lookup(r,"held",&target,false) && target);
+    assert(failAllocation==0 && TmpfsGlobalUsage().bytes==before);
+    failAllocation=-1;
+    assert(!r->ops->remove(r,"held",false));
+    VfsObject* missing=nullptr;assert(r->ops->lookup(r,"held",&missing,false)==-2 && !missing);
+    VnodeStat stat{};assert(!target->ops->stat(target,&stat) && !stat.nlink);
+    char read=0;off=0;assert(f->ops->read(f,&read,1,&off)==1 && read==value);
+    Unreserve(reserveFs,spare);
+    VfsObjectRelease(target);VfsClose(f);VfsObjectRelease(r);
+    assert(!TmpfsDestroy(fs));if(other)assert(!TmpfsDestroy(other));clean();
+    if (aggregate) assert(!TmpfsConfigureByteBudget(256ULL*1024*1024));
+}
+static void lookupUnlinkRace()
+{
+    auto* fs=make();auto* r=root(fs);auto* original=create(r,"race");
+    uint64_t off=0;assert(original->ops->write(original,"A",1,&off)==1);
+    auto* old=child(r,"race");const uint64_t oldIdentity=old->identity;
+    std::atomic<bool> done{false};
+    std::thread observer([&] {
+        while(!done.load(std::memory_order_acquire)) {
+            VfsObject* seen=nullptr;int e=r->ops->lookup(r,"race",&seen,false);
+            assert(e==0 || e==-2);
+            if(seen) {VnodeStat s{};assert(!seen->ops->stat(seen,&s) && s.ino==seen->identity);VfsObjectRelease(seen);}
+        }
+    });
+    for(unsigned i=0;i<500;++i) {
+        assert(!r->ops->remove(r,"race",false));
+        auto* replacement=create(r,"race");VfsClose(replacement);
+    }
+    done.store(true,std::memory_order_release);observer.join();
+    auto* current=child(r,"race");assert(current->identity!=oldIdentity);
+    VnodeStat stat{};assert(!old->ops->stat(old,&stat) && stat.ino==oldIdentity && !stat.nlink);
+    char value=0;off=0;assert(original->ops->read(original,&value,1,&off)==1 && value=='A');
+    assert(!r->ops->remove(r,"race",false));
+    VfsObjectRelease(current);VfsObjectRelease(old);VfsClose(original);VfsObjectRelease(r);
+    assert(!TmpfsDestroy(fs));clean();
+}
 static void mappedQuota()
 {
     mappingTest=true;
@@ -317,6 +369,9 @@ int main()
     identity(1000);
     clean();
     mappedQuota();
+    lookupAtFullQuota(false);
+    lookupAtFullQuota(true);
+    lookupUnlinkRace();
     indexedSparsePages();
     indexedMappedQuota();
     {

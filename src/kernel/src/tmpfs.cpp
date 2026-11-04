@@ -61,7 +61,7 @@ namespace
 struct Node
 {
     Tmpfs *fs;
-    uint32_t references;
+    VfsObject object;
     uint32_t uid, gid, nlink;
     uint16_t mode;
     bool linked;
@@ -78,6 +78,7 @@ struct Node
     FileObject file;
 };
 int PrepareBackingPage(void* context,uint64_t index);
+const VfsObjectOps *ObjectOperations();
 struct Guard
 {
     Tmpfs *fs;
@@ -159,22 +160,14 @@ void Free(Tmpfs *fs, void *pointer)
 }
 void Hold(Node *n)
 {
-    if (!n)
-        return;
-    auto old = __atomic_fetch_add(&n->references, 1, __ATOMIC_RELAXED);
-    if (!old || old == ~uint32_t{0})
-        __builtin_trap();
+    if (n) VfsObjectRetain(&n->object);
 }
-// No sleeping locks, FileObject gate or recursion on final object release.
-void Drop(Node *n)
+// Called after the first reference reached zero. Retire directory-parent
+// references iteratively so a deep unlinked tree cannot exhaust the stack.
+void DestroyNode(Node *n)
 {
     while (n)
     {
-        auto old = __atomic_fetch_sub(&n->references, 1, __ATOMIC_ACQ_REL);
-        if (!old)
-            __builtin_trap();
-        if (old != 1)
-            return;
         if (n->entries)
             __builtin_trap();
         auto *fs = n->fs;
@@ -193,8 +186,16 @@ void Drop(Node *n)
         --fs->inodes;
         --globalUsage.inodes;
         IrqSpinLockRelease(&budgetLock, irq);
+        if (!parent) return;
+        auto old = __atomic_fetch_sub(&parent->object.references, 1, __ATOMIC_ACQ_REL);
+        if (!old) __builtin_trap();
+        if (old != 1) return;
         n = parent;
     }
+}
+void Drop(Node *n)
+{
+    if (n) VfsObjectRelease(&n->object);
 }
 int Truncate(Vnode *vn, uint64_t size);
 Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
@@ -219,7 +220,7 @@ Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
         return nullptr;
     }
     n->fs = fs;
-    n->references = 1;
+    n->object = {ObjectOperations(), n, 0, 1};
     n->uid = uid;
     n->gid = gid;
     n->mode = mode;
@@ -227,6 +228,7 @@ Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
     if (fs->nextInode == ~uint64_t{0})
         __builtin_trap();
     n->ino = fs->nextInode++;
+    n->object.identity = n->ino;
     n->linked = true;
     n->atime = n->mtime = n->ctime = Now();
     FileObjectInit(&n->file);
@@ -350,23 +352,15 @@ void Fill(Node *n, VnodeStat *out)
     out->mtime = n->mtime;
     out->ctime = n->ctime;
 }
-const VfsObjectOps *ObjectOperations();
 int MakeObject(Node *n, VfsObject **out)
 {
-    *out = nullptr;
-    auto *o = static_cast<VfsObject *>(Allocate(n->fs, sizeof(VfsObject)));
-    if (!o)
-        return -12;
     Hold(n);
-    *o = {ObjectOperations(), n, n->ino, 1};
-    *out = o;
+    *out = &n->object;
     return 0;
 }
 void DestroyObject(VfsObject *o)
 {
-    auto *n = Object(o);
-    Free(n->fs, o);
-    Drop(n);
+    DestroyNode(Object(o));
 }
 int StatObject(VfsObject *o, VnodeStat *out)
 {
