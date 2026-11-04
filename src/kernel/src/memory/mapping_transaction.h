@@ -95,7 +95,7 @@ private:
     bool FaultScopeContains(uint64_t address) const;
     bool Borrowed(VirtualAddress address, uint64_t leaf) const;
     bool HoldBacking(void* backing, void (*release)(void*));
-    static void CaptureDetachedLeaf(VirtualAddress address, uint64_t leaf, void* context);
+    static void CaptureDetachedLeaf(VirtualAddress address, VmmOwnedLeaf leaf, void* context);
     static bool PrivateLeaf(VirtualAddress address, uint64_t leaf, void* context);
     Process* actor_;
     AddressSpaceState* space_;
@@ -157,10 +157,11 @@ public:
 private:
     struct Leaf {
         uint64_t address,offset,raw;
+        uint16_t owner;
         bool managed,privateData;
     };
     bool Restore(bool all,uint64_t validPrefix,bool quarantine=false);
-    static void Capture(VirtualAddress address, uint64_t raw, void* context);
+    static void Capture(VirtualAddress address, VmmOwnedLeaf leaf, void* context);
     void RequireTargetGate() const;
     Process* actor_;
     AddressSpaceState* space_;

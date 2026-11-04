@@ -226,9 +226,9 @@ bool MappingTransaction::CanReplaceRange(uint64_t begin, uint64_t end, const Map
     if(!pageableRetirementPrepared && !MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
     return ranges_.CanReplace(space_->ranges,begin,end,replacement);
 }
-void MappingTransaction::CaptureDetachedLeaf(VirtualAddress address, uint64_t leaf, void* context) {
+void MappingTransaction::CaptureDetachedLeaf(VirtualAddress address, VmmOwnedLeaf leaf, void* context) {
     auto* operation = static_cast<MappingTransaction*>(context);
-    operation->retired_[operation->retiredCount_++] = {leaf,!operation->Borrowed(address,leaf)};
+    operation->retired_[operation->retiredCount_++] = {leaf.raw,!operation->Borrowed(address,leaf.raw)};
 }
 bool MappingTransaction::RangeLeafCount(uint64_t begin, uint64_t end, uint64_t& count) const {
     if (!locked_) KernelPanic("mapping: range count without lock");
@@ -457,7 +457,8 @@ bool FileMappingInvalidation::Count(uint64_t begin,uint64_t end,uint64_t& count)
     }
     return true;
 }
-void FileMappingInvalidation::Capture(VirtualAddress address,uint64_t raw,void* opaque) {
+void FileMappingInvalidation::Capture(VirtualAddress address,VmmOwnedLeaf leaf,void* opaque) {
+    const auto raw=leaf.raw;
     auto* job=static_cast<FileMappingInvalidation*>(opaque);
     const auto* range=MappingRangeFind(job->space_->ranges,address.raw());
     if (!range || !range->backing || range->backing->file!=job->backing_->file || job->count_==job->capacity_)
@@ -466,7 +467,7 @@ void FileMappingInvalidation::Capture(VirtualAddress address,uint64_t raw,void* 
     const bool managed=range->leafOwnership==MappingLeafOwnership::Managed;
     const bool privateData=managed && range->sharing==MappingSharing::Private &&
         !FileObjectIsCanonicalLocked(job->backing_->file,offset/4096,VmmLeafPhysical(raw));
-    job->leaves_[job->count_++]={address.raw(),offset,raw,managed,privateData};
+    job->leaves_[job->count_++]={address.raw(),offset,raw,leaf.owner,managed,privateData};
 }
 bool FileMappingInvalidation::Detach(uint64_t begin,uint64_t end) {
     uint64_t needed=0;
@@ -527,12 +528,11 @@ bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix,bool quarant
         }
         const uint64_t flags=leaf.raw&(0xffULL|VMM_NO_EXEC|PTE_COW_BIT);
         const auto tag=static_cast<MemTag>((leaf.raw&PTE_TAG_MASK)>>PTE_TAG_SHIFT);
-        const auto pid=static_cast<uint16_t>((leaf.raw&PTE_PID_MASK)>>PTE_PID_SHIFT);
         // Quarantine hides an otherwise accessible private leaf. Metadata still
         // distinguishes true PROT_NONE from those temporarily hidden leaves.
         const auto* range=MappingRangeFind(space_->ranges,leaf.address);
         const bool accessible=!quarantine && (recovering?range->protection!=0:(leaf.raw&VMM_PRESENT)!=0);
-        if (VmmTryMapPage(space_->pageTable,VirtualAddress(leaf.address),physical,flags,tag,pid,
+        if (VmmTryMapPage(space_->pageTable,VirtualAddress(leaf.address),physical,flags,tag,leaf.owner,
                          accessible)!=VmmMapResult::Mapped)
             KernelPanic("mapping: prepared private restore failed");
         if (copy) boundaries_[boundary++]=PhysicalAddress{};

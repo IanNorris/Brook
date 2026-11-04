@@ -221,6 +221,20 @@ static void rejectUnrepresentableOwner() {
     CHECK(leaf(pt)==before && maps(page)==1);
     VmmDestroyUserPageTable(pt);empty();
 }
+static void ownedRangeRetirement() {
+    auto pt=table();auto first=PmmAllocPage(),second=PmmAllocPage();CHECK(first && second);
+    CHECK(VmmTryMapPage(pt,va,first,flags,MemTag::User,17)==VmmMapResult::Mapped);
+    CHECK(VmmTryMapPage(pt,va+pageSize,second,flags,MemTag::User,1023)==VmmMapResult::Mapped);
+    struct Captured { VmmOwnedLeaf leaves[2]{};unsigned count=0; } captured;
+    auto retire=[](VirtualAddress,VmmOwnedLeaf leaf,void* opaque){auto* c=static_cast<Captured*>(opaque);CHECK(c->count<2);c->leaves[c->count++]=leaf;};
+    uint64_t count=0;CHECK(VmmDetachRange(pt,va.raw(),va.raw()+2*pageSize,2,retire,&captured,&count));
+    CHECK(count==2 && captured.count==2 && captured.leaves[0].owner==17 && captured.leaves[1].owner==1023);
+    CHECK(maps(first)==0 && maps(second)==0);
+    for(unsigned i=0;i<2;++i){auto& old=captured.leaves[i];
+        CHECK(VmmTryMapPage(pt,va+i*pageSize,VmmLeafPhysical(old.raw),flags,MemTag::User,old.owner)==VmmMapResult::Mapped);
+        CHECK(VmmGetPagePid(pt,va+i*pageSize)==old.owner);}
+    VmmDestroyUserPageTable(pt);empty();
+}
 static void detachReinstall() {
     auto pt=table();auto old=PmmAllocPage();CHECK(VmmTryMapPage(pt,va,old,flags)==VmmMapResult::Mapped);
     auto token=VmmDetachPage(pt,va);CHECK(VmmLeafPhysical(token)==old);
@@ -291,7 +305,7 @@ static void largeLeafAndBorrowedFrame() {
         auto earlier=PmmAllocPage();const VirtualAddress early(0x200000);
         CHECK(VmmTryMapPage(pt,early,earlier,flags)==VmmMapResult::Mapped);
         unsigned callbacks=0;uint64_t count=0;
-        auto retire=[](VirtualAddress,uint64_t,void* context){++*static_cast<unsigned*>(context);};
+        auto retire=[](VirtualAddress,VmmOwnedLeaf,void* context){++*static_cast<unsigned*>(context);};
         CHECK(!VmmDetachRange(pt,early.raw(),va.raw()+pageSize,2,retire,&callbacks,&count));
         CHECK(!callbacks&&!count&&VmmVirtToPhys(pt,early)==earlier&&maps(earlier)==1);
         CHECK(*large==saved);
@@ -2324,7 +2338,7 @@ static void kernelAliasInspection() {
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     kernelAliasInspection();robustExitQueue();low32Mappings();pageableTableSkeleton();
-    accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
+    accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();ownedRangeRetirement();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();

@@ -37,6 +37,9 @@ page. The sidecar must be admitted before publishing a leaf, keyed to the leaf
 table rather than to a shared data frame, and reclaimed only after table
 retirement. Detach/restore, move, fork, COW and pageable eviction must carry the
 full owner as part of the transaction; copying the raw PTE alone is insufficient.
-The candidate is a design direction, not implemented or validated. Normalizing
+The range-detach callback now carries a typed raw-leaf/owner snapshot, and file
+invalidation saves the captured owner for restoration; owners are still read
+from the existing inline bits. The sidecar itself is not implemented.
+Normalizing
 kernel aliases to a single locking domain and proving failure rollback are
 prerequisites.

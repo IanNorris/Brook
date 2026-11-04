@@ -233,7 +233,8 @@ struct BufferRetirementGuard {
     }
 };
 struct BufferRetirementContext { AddressSpaceState* space;BufferMapping* buffer;MappingBacking* descriptor; };
-static void RetireBufferLeaf(VirtualAddress address,uint64_t raw,void* opaque) {
+static void RetireBufferLeaf(VirtualAddress address,VmmOwnedLeaf leaf,void* opaque) {
+    const auto raw=leaf.raw;
     auto& context=*static_cast<BufferRetirementContext*>(opaque);
     const auto* range=MappingRangeFind(context.space->ranges,address.raw());
     if (!range || range->backing!=context.descriptor) KernelPanic("mapping: buffer retirement range changed");

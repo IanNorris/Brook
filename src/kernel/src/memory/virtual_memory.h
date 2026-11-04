@@ -154,7 +154,10 @@ bool VmmClearAccessedIfMatches(PageTable,VirtualAddress,PhysicalAddress expected
 // PT lock as the removal, then calls retire once per leaf before clearing it.
 // retire must only store tokens/inspect locked metadata: no allocation/I/O or
 // reentry into VMM/AS locks. References are released by caller after shootdown.
-using VmmRetireLeaf = void (*)(VirtualAddress, uint64_t leaf, void* context);
+// Owner is captured under the same lock as the raw leaf. Consumers that may
+// restore a detached mapping must retain both, rather than decode raw later.
+struct VmmOwnedLeaf { uint64_t raw; uint16_t owner; };
+using VmmRetireLeaf = void (*)(VirtualAddress, VmmOwnedLeaf leaf, void* context);
 struct VmmRangeStats {
     uint64_t backedPages = 0, hiddenPages = 0, cowPages = 0, writablePages = 0;
     uint64_t multiplyMappedPages = 0, unknownMapCountPages = 0;

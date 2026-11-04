@@ -683,7 +683,8 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
         } else {
             ++count;
             if (detach) {
-                retire(VirtualAddress(address),leaf,context);
+                const VmmOwnedLeaf captured{leaf,static_cast<uint16_t>((leaf&PTE_PID_MASK)>>PTE_PID_SHIFT)};
+                retire(VirtualAddress(address),captured,context);
                 if (leaf & VMM_USER) PmmMapDec(VmmLeafPhysical(leaf));
                 table[i] = 0; Invlpg(VirtualAddress(address));
             } else if (update) {
