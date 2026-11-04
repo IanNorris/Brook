@@ -1439,6 +1439,15 @@ neither range is available for driver allocations merely because it decodes.
 In particular, firmware scanout and reserved subregions must be preserved.
 Graphics execution remains to be implemented and validated.
 
+On the physical Dell, the subsequent `dell-intel-range-20261104` boot
+classified the complete 32 MiB range against the frozen boot map: type mask
+`0x2` (`Reserved` only), with no unreported gaps. It therefore was not
+described as `Free` in that map. This is not proof that any part of the region
+is free for graphics allocations. The exact pair first booted in private QEMU;
+the Dell restarted cleanly with the prior slot retained and its persistent SSD
+and network available. Host tests cover reserved encodings, bounds and the
+full-range classification request.
+
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
