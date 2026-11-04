@@ -123,6 +123,12 @@ assertion. The [Linux engine register definitions](https://github.com/torvalds/l
 identify those bits. The helper does not establish the supplied ownership or
 prevent a later submission, and no real execution backend consumes it yet.
 
+The prepared private engine status page now marks all six Broadwell context
+status entries unused and initializes the producer index to the last slot,
+matching the [i915 reset convention](https://raw.githubusercontent.com/torvalds/linux/v6.8/drivers/gpu/drm/i915/gt/intel_execlists_submission.c).
+A host test checks every page byte. This is a RAM image only: the hardware
+status pointer, ownership, cache publication and retirement are not handled.
+
 References: [Linux Gen8 XCS context layout](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_lrc.c.html#108),
 [batch-start emission](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.c#L509-L565),
 and [completion write restrictions](https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/i915/gt/gen8_engine_cs.h#L108-L130).

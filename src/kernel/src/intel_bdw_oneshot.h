@@ -38,6 +38,13 @@ public:
             for(unsigned j=0;j<i;++j)if(p.dma==pages_[j].dma || p.cpu==pages_[j].cpu){state_=BdwOneShotState::Quarantined;return false;}
         }
         for(auto& p:pages_)Zero(p);
+        // Gen8 HWS uses six 64-bit CSB records at dword 0x10 and the
+        // producer index at dword 0x1f. Mark records unused and point to
+        // the last slot so the first produced status is consumed at zero.
+        // This prepares private RAM only: hardware pointers, cache
+        // publication and engine/CSB ownership still require a backend.
+        for(unsigned i=0x40;i<0x70;++i)pages_[Hws].cpu[i]=0xff;
+        Store32(pages_[Hws],0x7c,5);
         // Linux-equivalent Gen8 cached PTE encoding. Execute must independently
         // verify the GPU's private PAT and memory/cache publication policy.
         for(unsigned i=0;i<512;++i){Entry(pages_[ScratchPt],i,pages_[ScratchData].dma|0x81);

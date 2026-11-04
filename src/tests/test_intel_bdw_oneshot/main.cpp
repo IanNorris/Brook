@@ -59,6 +59,13 @@ int main(){
     for(unsigned kind=1;kind<=2;++kind){Fake f;f.aliasAt=2;f.aliasKind=kind;BdwBcsOneShot x;
         assert(!x.Prepare(f,65536,99,0x1234,staging));assert(x.State()==BdwOneShotState::Quarantined && f.frees==0 && !x.ReleasePrepared(f));}
     {Fake f;BdwBcsOneShot x;f.reentrant=&x;assert(x.Prepare(f,65536,99,0x1234,staging));assert(x.Execute(f));}
+    {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));
+        assert(f.live.size()==19);auto* status=f.live[6].cpu;
+        for(unsigned i=0;i<4096;++i) {
+            const uint8_t expected=(i>=0x40 && i<0x70)?0xff:(i==0x7c?5:0);
+            assert(status[i]==expected);
+        }
+        assert(x.ReleasePrepared(f) && f.live.empty());}
     {Fake f;BdwBcsOneShot x;f.reentrant=&x;assert(x.Prepare(f,65536,99,0x1234,staging));assert(x.ReleasePrepared(f) && f.live.empty());}
     {Fake f;BdwBcsOneShot x;assert(x.Prepare(f,65536,99,0x1234,staging));f.admitted=false;
         assert(!x.Execute(f) && !f.engineWrites && x.ReleasePrepared(f));}
