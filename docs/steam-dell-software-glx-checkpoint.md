@@ -411,5 +411,4 @@ space fell to 1,228,800 bytes before recovering and remaining near 41,963,520
 bytes. Thus the reboot removed previously retained objects but did not prevent
 the fresh startup from reaching severe shared-memory pressure. The observation
 does not identify the allocation owner or prove the game's failure has the same
-cause. The desktop's recovery USB was not needed for this clean boot; automatic
-SSD repair remains unimplemented.
+cause. Automatic SSD repair remains unimplemented.
