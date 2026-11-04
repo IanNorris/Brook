@@ -2587,6 +2587,28 @@ static void extendedOwnerMoveExperiment() {
     CHECK(VmmReadOwnedLeaf(pt,VirtualAddress(target)).owner==5119);
     VmmDestroyUserPageTable(pt);PmmFreePage(kernel.pml4);VmmHostSetKernelRoot({});empty();
 }
+static void protectPreservesConcurrentHardwareBits(bool extended) {
+    auto kernel=table();VmmHostSetKernelRoot(kernel);
+    auto pt=extended?VmmHostCreateOwnerExperiment():VmmCreateUserPageTable();CHECK(pt);
+    auto page=PmmAllocPage();CHECK(page);
+    const uint16_t owner=extended?5119:7;
+    CHECK(VmmTryMapPage(pt,va,page,flags&~(VMM_WRITABLE|VMM_ACCESSED|VMM_DIRTY),MemTag::User,owner)==VmmMapResult::Mapped);
+    auto* entries=reinterpret_cast<uint64_t*>(pt.pml4.raw());
+    for(unsigned shift: {39u,30u,21u})
+        entries=reinterpret_cast<uint64_t*>(VmmLeafPhysical(entries[(va.raw()>>shift)&511]).raw());
+    auto* pte=&entries[(va.raw()>>12)&511];
+    struct Race { uint64_t* entry;unsigned calls; } race{pte,0};
+    auto hardwareBits=[](VirtualAddress,uint64_t,void* opaque) {
+        auto& state=*static_cast<Race*>(opaque);
+        if(state.calls<2) __atomic_fetch_or(state.entry,state.calls==0?VMM_ACCESSED:VMM_DIRTY,__ATOMIC_RELAXED);
+        ++state.calls;return false;
+    };
+    CHECK(VmmProtectRange(pt,va.raw(),va.raw()+pageSize,3,hardwareBits,&race));
+    const auto leaf=VmmReadOwnedLeaf(pt,va);
+    CHECK(race.calls==3 && leaf.owner==owner && VmmLeafPhysical(leaf.raw)==page);
+    CHECK((leaf.raw&(VMM_ACCESSED|VMM_DIRTY|VMM_WRITABLE))==(VMM_ACCESSED|VMM_DIRTY|VMM_WRITABLE));
+    VmmDestroyUserPageTable(pt);PmmFreePage(kernel.pml4);VmmHostSetKernelRoot({});empty();
+}
 static void extendedOwnerProtectionExperiment() {
     auto kernel=table();VmmHostSetKernelRoot(kernel);auto pt=VmmHostCreateOwnerExperiment();CHECK(pt);
     constexpr uint64_t offsets[]={0,pageSize,2*pageSize,3*pageSize,0x200000};
@@ -2811,6 +2833,6 @@ int main(int argc,char** argv) {
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
-    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();extendedOwnerCowExperiment();extendedOwnerMoveExperiment();extendedOwnerProtectionExperiment();vmallocIntegration();
+    pageableOwnerRoundTrip();moduleAllocationRollback();kernelAliasLocking();ownerSidecarLifetime();extendedOwnerExperiment();extendedOwnerCowExperiment();extendedOwnerMoveExperiment();protectPreservesConcurrentHardwareBits(false);protectPreservesConcurrentHardwareBits(true);extendedOwnerProtectionExperiment();vmallocIntegration();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

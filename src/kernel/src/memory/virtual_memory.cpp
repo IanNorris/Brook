@@ -737,7 +737,7 @@ using LeafUpdate = uint64_t (*)(VirtualAddress,VmmOwnedLeaf,void*);
 static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                            uint64_t begin, uint64_t end, bool detach,
                            VmmRetireLeaf retire, void* context, uint64_t& count,
-                           LeafUpdate update = nullptr,bool extended=false)
+                           LeafUpdate update = nullptr,bool extended=false,bool atomicUpdate=false)
 {
     const unsigned shift = 12 + 9 * (level - 1);
     const uint64_t size = uint64_t{1} << shift;
@@ -745,7 +745,7 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
     uint64_t last = (end-1-base) >> shift;
     if (last > 511) last = 511;
     for (uint64_t i = first; i <= last; ++i) {
-        uint64_t leaf = table[i];
+        uint64_t leaf = __atomic_load_n(&table[i],__ATOMIC_RELAXED);
         if (level == 1 ? !VmmLeafBacked(leaf) : !(leaf & VMM_PRESENT)) continue;
         uint64_t address = base + i*size;
         if (level > 1) {
@@ -753,7 +753,7 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
             auto* child = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw());
             const uint64_t low = begin > address ? begin : address;
             const uint64_t high = end < address+size ? end : address+size;
-            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update,extended)) return false;
+            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update,extended,atomicUpdate)) return false;
         } else {
             ++count;
             const auto captured=CaptureOwnedLeaf(&table[i],leaf,extended);
@@ -763,8 +763,23 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                 ClearExtendedOwner(&table[i],captured,extended);
                 table[i] = 0; Invlpg(VirtualAddress(address));
             } else if (update) {
-                const uint64_t updated=update(VirtualAddress(address),captured,context);
-                if (updated!=leaf) { table[i]=updated;Invlpg(VirtualAddress(address)); }
+                if (atomicUpdate) {
+                    // Hardware may set A/D while the software page-table lock is held.
+                    // Recompute from the latest word rather than losing those updates.
+                    uint64_t expected=leaf;
+                    for (;;) {
+                        if (((expected^leaf)&~(VMM_ACCESSED|VMM_DIRTY))!=0) __builtin_trap();
+                        const auto current=CaptureOwnedLeaf(&table[i],expected,extended);
+                        const uint64_t updated=update(VirtualAddress(address),current,context);
+                        if (updated==expected) break;
+                        if (__atomic_compare_exchange_n(&table[i],&expected,updated,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) {
+                            Invlpg(VirtualAddress(address));break;
+                        }
+                    }
+                } else {
+                    const uint64_t updated=update(VirtualAddress(address),captured,context);
+                    if (updated!=leaf) { table[i]=updated;Invlpg(VirtualAddress(address)); }
+                }
             }
         }
     }
@@ -1022,7 +1037,7 @@ bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protec
     bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,count,nullptr,extended);
     if (result) {
         count = 0;
-        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&update,count,ProtectLeaf,extended)) __builtin_trap();
+        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&update,count,ProtectLeaf,extended,true)) __builtin_trap();
     }
     IrqSpinLockRelease(&g_userPtLock,irq); return result;
 }
