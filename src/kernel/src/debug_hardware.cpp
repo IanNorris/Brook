@@ -316,6 +316,24 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"ack_sampled\":");r.text(s.ackSampled?"true":"false");
         if(s.ackSampled){r.text(",");r.field("ack_raw",s.ackRaw);}
         r.text(",\"wake_requested\":");r.text(s.wakeRequested?"true":"false");
+        r.text(",\"other_engines_requested\":");r.text(s.otherEnginesRequested?"true":"false");
+        r.text(",\"other_engine_pages_admitted\":");r.text(s.otherEnginePagesAdmitted?"true":"false");
+        r.text(",\"other_engines_sampled\":");r.text(s.wake.otherEnginesSampled?"true":"false");
+        r.text(",\"other_engines_quiescent\":");r.text(s.wake.otherEnginesQuiescent?"true":"false");
+        if(s.otherEnginesRequested){r.text(",\"engines\":[");
+            constexpr const char* names[]={"rcs0","vcs0","vecs0"};
+            for(unsigned i=0;i<3;++i){if(i)r.text(",");const auto& e=s.wake.other[i];
+                r.text("{\"name\":\"");r.text(names[i]);r.text("\",\"sampled\":");r.text(e.sampled?"true":"false");
+                r.text(",\"quiescent\":");r.text(e.submissionQuiescent?"true":"false");
+                if(e.sampled){r.text(",");r.field("head",e.first.head);r.text(",");r.field("tail",e.first.tail);
+                    r.text(",");r.field("mode",e.first.mode);r.text(",");r.field("start",e.first.start);
+                    r.text(",");r.field("control",e.first.control);r.text(",");r.field("execlist_lo",e.first.execlistLo);
+                    r.text(",");r.field("execlist_hi",e.first.execlistHi);r.text(",");r.field("submission_mode",e.first.submissionMode);
+                    r.text(",");r.field("head2",e.second.head);r.text(",");r.field("tail2",e.second.tail);
+                    r.text(",");r.field("mode2",e.second.mode);r.text(",");r.field("start2",e.second.start);
+                    r.text(",");r.field("control2",e.second.control);r.text(",");r.field("execlist_lo2",e.second.execlistLo);
+                    r.text(",");r.field("execlist_hi2",e.second.execlistHi);r.text(",");r.field("submission_mode2",e.second.submissionMode);}
+                r.text("}");}r.text("]");}
         r.text(",\"wake_pages_admitted\":");r.text(s.wakePagesAdmitted?"true":"false");
         r.text(",\"wake_clock_ready\":");r.text(s.wakeClockReady?"true":"false");
         r.text(",\"wake_aliases\":");r.text(s.wakeAliases?"true":"false");

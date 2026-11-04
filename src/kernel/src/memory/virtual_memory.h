@@ -139,7 +139,7 @@ bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& result);
 // Caller proves audited Dell identity, BAR extent, D0 and opt-in.
 bool VmmDellForcewakeAckCriticalRead(uint32_t& value);
 struct BdwForcewakeAdapterResult;
-void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result);
+void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines=false);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.

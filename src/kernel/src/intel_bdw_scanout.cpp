@@ -66,7 +66,8 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
             e.bdwGraphics.graphicsControl,f.physicalBase,f.width,f.height,f.stride,observation.plan);
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");
-        observation.wakeRequested=OptedIn("/etc/dell-gpu-forcewake-run");
+        observation.otherEnginesRequested=OptedIn("/etc/dell-gpu-engines-run");
+        observation.wakeRequested=observation.otherEnginesRequested || OptedIn("/etc/dell-gpu-forcewake-run");
         if(!observation.probeRequested && !observation.ackRequested && !observation.wakeRequested)return;
         probeAttempted=true;
         if(!observation.planned || SmpCurrentCpuIndex()!=0)return;
@@ -88,11 +89,16 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         if(observation.wakeRequested){
             observation.wakePagesAdmitted=true;
             for(auto page:BdwForcewakePages)if(!PageAdmitted(page))observation.wakePagesAdmitted=false;
+            if(observation.otherEnginesRequested) {
+                observation.otherEnginePagesAdmitted=true;
+                for(auto page:BdwOtherEnginePages)
+                    if(!PageAdmitted(page))observation.otherEnginePagesAdmitted=false;
+            }
             const auto& tsc=NativeTscObserveRead();
             observation.wakeClockReady=tsc.capable && tsc.measured && tsc.consistent && tsc.khz;
-            if(observation.powerD0 && observation.wakePagesAdmitted && observation.wakeClockReady){
+            if(observation.powerD0 && observation.wakePagesAdmitted && (!observation.otherEnginesRequested || observation.otherEnginePagesAdmitted) && observation.wakeClockReady){
                 SerialPuts("gpu-forcewake: opt-in experiment; firmware/SMM bit ownership assumed\n");
-                BdwForcewakeAdapterResult r{};VmmDellForcewakeCriticalRun(tsc.khz,r);
+                BdwForcewakeAdapterResult r{};VmmDellForcewakeCriticalRun(tsc.khz,r,observation.otherEnginesRequested);
                 observation.wakeAliases=r.aliases;observation.wakeClock=r.clock;
                 observation.wakeClearDelivered=r.clearDelivered;observation.wake=r.sequence;
                 SerialPrintf("gpu-forcewake: requested=%u acquired=%u c0=%u sampled=%u idle=%u clear=%u released=%u\n",

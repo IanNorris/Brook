@@ -67,3 +67,23 @@ SSD desktop ready and forcewake released. The [Broadwell register
 reference](https://www.x.org/docs/intel/BDW/intel-gfx-prm-osrc-bdw-vol02c-commandreference-registers_0.pdf)
 and [Linux i915 definitions](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_engine_regs.h.html#192)
 identify the decoded fields.
+
+## Four-engine candidate
+
+The opt-in `/etc/dell-gpu-engines-run` path extends the guarded wake
+observation to the Broadwell GT2 render, video and video-enhancement engines,
+using the same forcewake acquisition as BCS. It requires all seven register
+pages to pass resource and mapping checks before the first write. Each sampled
+engine reports both raw register sets; a failed or all-ones read stops further
+engine reads and proceeds to release. A successful set of sequential samples
+is not an exclusive handoff and cannot establish that all engines were idle at
+one instant or that display allocations are accounted for.
+
+The four targeted host tests passed, including last-page rejection before any
+MMIO write, pending video work, read failure and all-ones cleanup, opt-in gates,
+and bridge serialization. The exact matched ABI-65 image booted to the desktop
+in private QEMU; the Dell was offline, so no physical multi-engine read or
+handoff is claimed. Astra reviewed the register whitelist and failure path.
+The [Linux Broadwell forcewake selection](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/intel_uncore.c.html#2228)
+and [engine register definitions](https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_engine_regs.h.html)
+provide the implementation references.

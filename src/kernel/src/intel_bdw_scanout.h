@@ -8,7 +8,7 @@ struct BdwGopObservation {
     bool inventory=false,planned=false,probeRequested=false,powerD0=false,pagesAdmitted=false,sampled=false;
     BdwGopPtePlan plan{};uint64_t firstPte=0,lastPte=0;
     bool ackRequested=false,ackPageAdmitted=false,ackSampled=false;uint32_t ackRaw=0;
-    bool wakeRequested=false,wakePagesAdmitted=false,wakeClockReady=false,wakeAliases=false,wakeClock=false,wakeClearDelivered=false;
+    bool wakeRequested=false,otherEnginesRequested=false,otherEnginePagesAdmitted=false,wakePagesAdmitted=false,wakeClockReady=false,wakeAliases=false,wakeClock=false,wakeClearDelivered=false;
     BdwForcewakeResult wake{};
 };
 void BdwGopObserveConfigure(const BootProtocol* boot);

@@ -2,20 +2,41 @@
 #include <stdint.h>
 namespace brook {
 struct BdwBcsSample {uint32_t head=0,tail=0,mode=0,start=0,control=0,execlistLo=0,execlistHi=0,submissionMode=0;};
+struct BdwEngineObservation {bool sampled=false,idle=false,submissionQuiescent=false;BdwBcsSample first{},second{};};
 struct BdwForcewakeResult {
     bool requested=false,acquired=false,threadReady=false,sampled=false,idle=false,submissionQuiescent=false,released=false;
-    BdwBcsSample first{},second{};
+    bool otherEnginesRequested=false,otherEnginesSampled=false,otherEnginesQuiescent=false;
+    BdwBcsSample first{},second{};BdwEngineObservation other[3]{};
 };
+// A point-in-time sample only. The caller must separately exclude future
+// submissions and account for display consumers before claiming the GGTT.
+template<class Io> BdwEngineObservation BdwObserveEngine(Io& io,uint32_t base) {
+    BdwEngineObservation r{};
+    auto read=[&](uint32_t offset,uint32_t& value){return io.read(offset,value) && value!=0xffffffffu;};
+    auto sample=[&](BdwBcsSample& s){return read(base+0x34,s.head) && read(base+0x30,s.tail) &&
+        read(base+0x9c,s.mode) && read(base+0x38,s.start) && read(base+0x3c,s.control) &&
+        read(base+0x234,s.execlistLo) && read(base+0x238,s.execlistHi) && read(base+0x29c,s.submissionMode);};
+    if(!sample(r.first) || !sample(r.second))return r;
+    r.sampled=true;
+    const auto idle=[](const BdwBcsSample& s){return (s.head&0x001ffffcu)==(s.tail&0x001ffff8u) && (s.mode&(1u<<9));};
+    r.idle=idle(r.first) && idle(r.second) && r.first.head==r.second.head && r.first.tail==r.second.tail &&
+        r.first.mode==r.second.mode && r.first.start==r.second.start && r.first.control==r.second.control &&
+        r.first.execlistLo==r.second.execlistLo && r.first.execlistHi==r.second.execlistHi &&
+        r.first.submissionMode==r.second.submissionMode;
+    constexpr uint32_t busy=(1u<<2)|(3u<<3)|(3u<<14)|(3u<<17);
+    const bool listMode=(r.first.submissionMode&(1u<<15))!=0;
+    r.submissionQuiescent=r.idle && !(r.first.control&1u) && (!listMode || !(r.first.execlistLo&busy));
+    return r;
+}
 // Io must hold exclusive ownership of request bit 0, provide verified UC
 // mappings, and a verified monotonic millisecond clock. A successful clear
 // write must drain all earlier potentially posted writes, including failed
 // writes, before ACK is sampled. A successful
 // release requires an ACK-clear observation; uncertain cleanup must quarantine
 // further GT use. This operation does not hand off engines or grant GGTT slots.
-template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io) {
+template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io,bool otherEngines=false) {
     constexpr uint32_t request=0xa188,ack=0x130044,thread=0x13805c;
-    constexpr uint32_t head=0x22034,tail=0x22030,mode=0x2209c,start=0x22038,control=0x2203c,execlistLo=0x22234,execlistHi=0x22238,submissionMode=0x2229c;
-    BdwForcewakeResult result{};uint32_t value=0;
+    BdwForcewakeResult result{};result.otherEnginesRequested=otherEngines;uint32_t value=0;
     // ACK is always-on. REQ is not used to establish ownership: a pre-wake
     // request-register read is not evidence that another actor cannot use it.
     if(!io.owned())return result;
@@ -39,25 +60,19 @@ template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io) {
         result.acquired=true;
         if(wait(thread,7,0,5)) {
             result.threadReady=true;
-            auto sample=[&](BdwBcsSample& s){return io.read(head,s.head) && io.read(tail,s.tail) && io.read(mode,s.mode) && io.read(start,s.start) && io.read(control,s.control) && io.read(execlistLo,s.execlistLo) && io.read(execlistHi,s.execlistHi) && io.read(submissionMode,s.submissionMode) &&
-                s.head!=0xffffffffu && s.tail!=0xffffffffu && s.mode!=0xffffffffu && s.start!=0xffffffffu && s.control!=0xffffffffu && s.execlistLo!=0xffffffffu && s.execlistHi!=0xffffffffu && s.submissionMode!=0xffffffffu;};
-            if(sample(result.first) && sample(result.second)) {
-                result.sampled=true;
-                const auto idle=[](const BdwBcsSample& s){return (s.head&0x001ffffcu)==(s.tail&0x001ffff8u) && (s.mode&(1u<<9));};
-                // Ring idle and unchanged is only a sample, not proof that
-                // the execution-list ports are empty or ownership transferred.
-                result.idle=idle(result.first) && idle(result.second) &&
-                    result.first.head==result.second.head && result.first.tail==result.second.tail && result.first.mode==result.second.mode && result.first.start==result.second.start && result.first.control==result.second.control && result.first.execlistLo==result.second.execlistLo &&
-                    result.first.execlistHi==result.second.execlistHi && result.first.submissionMode==result.second.submissionMode;
-                // On Gen8 the low status DWORD has queue-full, list-valid,
-                // active-element and active-list indications. Current-list
-                // pointer bit 0 is not evidence of a submitted context.
-                constexpr uint32_t busy=(1u<<2)|(3u<<3)|(3u<<14)|(3u<<17);
-                const bool listMode=(result.first.submissionMode&(1u<<15))!=0;
-                // These samples alone cannot establish submission exclusion,
-                // other engine/display ownership or a GGTT allocation lease.
-                result.submissionQuiescent=result.idle && !(result.first.control&1u) &&
-                    (!listMode || !(result.first.execlistLo&busy));
+            const auto bcs=BdwObserveEngine(io,0x22000);
+            result.first=bcs.first;result.second=bcs.second;result.sampled=bcs.sampled;
+            result.idle=bcs.idle;result.submissionQuiescent=bcs.submissionQuiescent;
+            if(otherEngines && bcs.sampled) {
+                // Broadwell GT2 has RCS0, VCS0 and VECS0 in addition to BCS0.
+                constexpr uint32_t bases[]={0x2000,0x12000,0x1a000};
+                result.otherEnginesSampled=true;result.otherEnginesQuiescent=true;
+                for(unsigned i=0;i<3;++i) {
+                    result.other[i]=BdwObserveEngine(io,bases[i]);
+                    result.otherEnginesSampled &= result.other[i].sampled;
+                    result.otherEnginesQuiescent &= result.other[i].submissionQuiescent;
+                    if(!result.other[i].sampled)break;
+                }
             }
         }
     }

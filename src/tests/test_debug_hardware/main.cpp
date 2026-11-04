@@ -111,6 +111,12 @@ bool handle(const std::string& command){reply.clear();dispatched.clear();return 
 int main(){
     assert(!handle("bridge unrelated"));
     assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"planned\":false")!=std::string::npos && reply.find("first_index")==std::string::npos);
+    brook::gpuGop.otherEnginesRequested=true;brook::gpuGop.wake.otherEnginesSampled=true;
+    for(unsigned i=0;i<3;++i){brook::gpuGop.wake.other[i].sampled=true;brook::gpuGop.wake.other[i].first.head=i+10;}
+    assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"other_engines_sampled\":true")!=std::string::npos &&
+        reply.find("\"name\":\"rcs0\"")!=std::string::npos && reply.find("\"name\":\"vcs0\"")!=std::string::npos &&
+        reply.find("\"name\":\"vecs0\"")!=std::string::npos && reply.find("\"head\":12")!=std::string::npos && reply.back()=='\n');
+    brook::gpuGop={};
     assert(handle("bridge hardware gpu-vtd") && reply.find("\"sampled\":false")!=std::string::npos && reply.find("global_status")==std::string::npos);
     brook::gpuVtd.sampled=true;brook::gpuVtd.status={0x10,0x80000000};
     assert(handle("bridge hardware gpu-vtd") && reply.find("\"translation_enabled\":true")!=std::string::npos);

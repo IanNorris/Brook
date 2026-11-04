@@ -600,7 +600,7 @@ bool VmmDellForcewakeAckCriticalRead(uint32_t& result) {
 
 // Single boot-lifetime owner; no retries after an uncertain release. Holding
 // the kernel page-table lock also prevents mapping changes throughout cleanup.
-void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result) {
+void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines) {
     static bool claimed=false;result={};
     if(__atomic_exchange_n(&claimed,true,__ATOMIC_ACQ_REL))return;
     struct Io {
@@ -635,7 +635,7 @@ void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result)
         void relax(){__asm__ volatile("pause");}
     } io;
     const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
-    result=BdwDellForcewakeCritical(io,khz);
+    result=BdwDellForcewakeCritical(io,khz,otherEngines);
     IrqSpinLockRelease(&g_kernelPtLock,irq);
 }
 

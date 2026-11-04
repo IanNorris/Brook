@@ -15,24 +15,24 @@ static unsigned scenario=0,reads=0,ackReads=0,pageChecks=0,wakeRuns=0;static Vno
 namespace brook {
 extern "C" void SerialPuts(const char*){}
 extern "C" void SerialPrintf(const char*,...){}
-extern "C" Vnode* VfsOpen(const char* p,int){return ((scenario>=4 && scenario<=13 && !std::strcmp(p,"/etc/dell-gpu-gtt-probe")) || (scenario>=14 && scenario<=18 && !std::strcmp(p,"/etc/dell-gpu-forcewake-ack")) || (scenario>=19 && !std::strcmp(p,"/etc/dell-gpu-forcewake-run")))?&marker:nullptr;}
+extern "C" Vnode* VfsOpen(const char* p,int){return ((scenario>=4 && scenario<=13 && !std::strcmp(p,"/etc/dell-gpu-gtt-probe")) || (scenario>=14 && scenario<=18 && !std::strcmp(p,"/etc/dell-gpu-forcewake-ack")) || (scenario>=19 && scenario<=22 && !std::strcmp(p,"/etc/dell-gpu-forcewake-run")) || (scenario>=23 && !std::strcmp(p,"/etc/dell-gpu-engines-run")))?&marker:nullptr;}
 void VfsRelease(Vnode*){}
 int VfsStat(Vnode*,VnodeStat* s){*s={};s->size=2;return 0;}
 extern "C" int VfsRead(Vnode*,void* out,uint64_t n,uint64_t*){if(n!=2)return -1;std::memcpy(out,"1\n",2);return 2;}
 uint32_t SmpCurrentCpuIndex(){return scenario==7 || scenario==16?1:0;}
 extern "C" uint8_t PciConfigRead8(uint8_t,uint8_t,uint8_t,uint8_t o){return o==0x34?0x40:o==0x40 || o==0x62?1:0;}
-extern "C" uint16_t PciConfigRead16(uint8_t,uint8_t,uint8_t,uint8_t o){return o==6?(scenario==13?0xffff:0x10):o==4?(scenario==12 || scenario==18?0xffff:2):o==0x50?0x01c1:o==0x42?(scenario==9?0:1):o==0x44 && (scenario==5 || scenario==22)?3:0;}
+extern "C" uint16_t PciConfigRead16(uint8_t,uint8_t,uint8_t,uint8_t o){return o==6?(scenario==13?0xffff:0x10):o==4?(scenario==12 || scenario==18?0xffff:2):o==0x50?0x01c1:o==0x42?(scenario==9?0:1):o==0x44 && (scenario==5 || scenario==22 || scenario==26)?3:0;}
 extern "C" uint32_t PciConfigRead32(uint8_t,uint8_t,uint8_t,uint8_t o){
     if(o==0)return 0x16168086;if(o==0x2c)return 0x06651028;if(o==8)return 9;
     if(o>=0x10 && o<0x20)return HdaDellPciReferenceEntries[1].bars[(o-0x10)/4]^(scenario==10 && o==0x10?0x1000000:0);
     return 0;
 }
 bool AcpiClassifyBootRange(uint64_t page,uint32_t bytes,BootResourceClassification& c){++pageChecks;
-    assert(bytes==4096 && page==(scenario>=19?BdwForcewakePages[pageChecks-1]:scenario>=14?0xf6130000ull:pageChecks==1?0xf6800000ull:0xf680a000ull));
-    c={scenario==11 && pageChecks==2?3u:2u,false};return scenario!=6 && scenario!=15 && !(scenario==20 && pageChecks==4);}
+    assert(bytes==4096 && page==(scenario>=19?(pageChecks<=4?BdwForcewakePages[pageChecks-1]:BdwOtherEnginePages[pageChecks-5]):scenario>=14?0xf6130000ull:pageChecks==1?0xf6800000ull:0xf680a000ull));
+    c={scenario==11 && pageChecks==2?3u:2u,false};return scenario!=6 && scenario!=15 && !(scenario==20 && pageChecks==4) && !(scenario==24 && pageChecks==7);}
 bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& p){assert(plan.firstIndex==0 && plan.lastIndex==5624 && plan.firstAddress==0xf6800000ull && plan.lastAddress==0xf680afc0ull);++reads;if(scenario==8)return false;p={5,6};return true;}
-const NativeTscObservation& NativeTscObserveRead(){static NativeTscObservation o{};o.capable=o.measured=o.consistent=scenario!=21;o.khz=1000;return o;}
-void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& r) {assert(khz==1000);++wakeRuns;r.aliases=r.clock=true;r.sequence.acquired=r.sequence.released=true;}
+const NativeTscObservation& NativeTscObserveRead(){static NativeTscObservation o{};o.capable=o.measured=o.consistent=scenario!=21 && scenario!=25;o.khz=1000;return o;}
+void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& r,bool other) {assert(khz==1000 && other==(scenario>=23));++wakeRuns;r.aliases=r.clock=true;r.sequence.acquired=r.sequence.released=true;}
 bool VmmDellForcewakeAckCriticalRead(uint32_t& value){++ackReads;if(scenario==17)return false;value=0;return true;}
 uint32_t PciBootInventoryCount(){return 16;}
 uint32_t PciBootInventorySeen(){return scenario==1?17:16;}
@@ -64,8 +64,12 @@ int main(){
         BdwGopObserveConfigure(&boot);assert(ackReads==(n==14 || n==17?1u:0u));_exit(0);}
         int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
     for(unsigned n=19;n<=22;++n){pid_t child=fork();assert(child>=0);if(!child){scenario=n;wakeRuns=0;pageChecks=0;BdwGopObserveConfigure(&boot);
-        const auto& r=BdwGopObserveRead();assert(r.wakeRequested && !r.ackRequested && !r.probeRequested);
+        const auto& r=BdwGopObserveRead();assert(r.wakeRequested && !r.ackRequested && !r.probeRequested && !r.otherEnginePagesAdmitted);
         assert(wakeRuns==(n==19?1u:0u));if(n==19)assert(r.wake.acquired && r.wake.released);
         BdwGopObserveConfigure(&boot);assert(wakeRuns==(n==19?1u:0u));_exit(0);}
+        int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
+    for(unsigned n=23;n<=26;++n){pid_t child=fork();assert(child>=0);if(!child){scenario=n;wakeRuns=0;pageChecks=0;BdwGopObserveConfigure(&boot);
+        const auto& r=BdwGopObserveRead();assert(r.wakeRequested && r.otherEnginesRequested && pageChecks==7);
+        assert(wakeRuns==(n==23?1u:0u));BdwGopObserveConfigure(&boot);assert(wakeRuns==(n==23?1u:0u));_exit(0);}
         int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
 }
