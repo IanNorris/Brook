@@ -221,13 +221,14 @@ TEST_MAIN("vfs", {
 
     ASSERT_TRUE(brook::VfsRegisterFs("retained-fixture",&g_retainedFsOps));
     ASSERT_TRUE(brook::VfsMount("/","retained-fixture",0));
-    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",0));
+    // Distinct devices give these attachments independent backing lifetimes.
+    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",1));
     // Failed opens must not leave an orphan mount hold.
     g_retainedFailOpen=true;
     ASSERT_TRUE(brook::VfsOpen("/pin/failed")==nullptr);
     g_retainedFailOpen=false;
     ASSERT_TRUE(brook::VfsUnmount("/pin"));
-    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",0));
+    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",1));
     g_retainedUnmounted=0;
     // An opened directory rejected as an executable or O_TRUNC must release
     // its already-attached mount hold through the ordinary error unwind.
@@ -240,7 +241,7 @@ TEST_MAIN("vfs", {
     ASSERT_EQ(openError,-21);
     ASSERT_EQ(g_retainedClosed,2u);
     ASSERT_TRUE(brook::VfsUnmount("/pin"));
-    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",0));
+    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",1));
     g_retainedClosed=g_retainedUnmounted=0;
     auto* retained=brook::VfsOpen("/pin/held");
     ASSERT_TRUE(retained!=nullptr);
@@ -248,7 +249,7 @@ TEST_MAIN("vfs", {
     ASSERT_EQ(g_retainedUnmounted,0u);
     // Cover the old bug: rediscovering the owner from /pin/held selected this
     // new overmount instead of the original mount containing the held inode.
-    ASSERT_TRUE(brook::VfsMount("/pin/held","retained-fixture",1));
+    ASSERT_TRUE(brook::VfsMount("/pin/held","retained-fixture",2));
     char retainedName[64];
     ASSERT_EQ(brook::VfsDirectoryPath(retained,retainedName,sizeof(retainedName)),0);
     const char expectedName[]="/pin/moved";
@@ -310,9 +311,11 @@ TEST_MAIN("vfs", {
     ASSERT_TRUE(brook::VfsUnmount("/MOVED"));
     char currentCwd[32]{};ASSERT_EQ(brook::VfsPathDirectoryPath(cwdPath,currentCwd,sizeof(currentCwd)),0);
     const char expectedCwd[]="/MOVED";for(unsigned i=0;i<sizeof(expectedCwd);++i)ASSERT_EQ(currentCwd[i],expectedCwd[i]);
-    // Mutable FAT parent operations are explicitly unsupported by the new
-    // interface until implemented; never fall back to the opening pathname.
-    ASSERT_EQ(brook::VfsMkdirAt(rootPath,cwdPath,"unimplemented",0755,0),-95);
+    // Create relative to the retained parent after rename, not its old path.
+    ASSERT_EQ(brook::VfsMkdirAt(rootPath,cwdPath,"CREATED",0755,0),0);
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,rootPath,"/MOVED/CREATED",&aliasPath),0);
+    brook::VfsPathRelease(aliasPath);
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,rootPath,"/TEST/CREATED",&aliasPath),-2);
     int retainedError=0;auto* exact=brook::VfsOpenAt(rootPath,cwdPath,"HELLO.TXT",brook::VFS_O_READ,0,0,&retainedError);
     ASSERT_TRUE(exact!=nullptr);ASSERT_EQ(retainedError,0);
     char hello[32]{};uint64_t helloOffset=0;

@@ -64,11 +64,15 @@ add_brook_test(test_heap
 target_compile_definitions(test_pmm  PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
 target_compile_definitions(test_vmm  PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
 target_compile_definitions(test_heap PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
+foreach(target test_pmm test_vmm test_heap)
+    target_sources(${target} PRIVATE "${BROOK_ROOT}/src/tests/common/standalone_dependencies.cpp")
+endforeach()
 
 add_brook_test(test_string)
 
 add_brook_test(test_device_registry
     "${BROOK_ROOT}/src/kernel/src/device.cpp"
+    "${BROOK_ROOT}/src/tests/common/standalone_dependencies.cpp"
 )
 
 # FatFS build-directory copy for tests (same approach as kernel — see kernel CMakeLists)
@@ -94,6 +98,7 @@ target_include_directories(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}"
 )
 target_compile_definitions(test_vfs PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
+target_sources(test_vfs PRIVATE "${BROOK_ROOT}/src/tests/common/standalone_dependencies.cpp")
 set(VFS_TEST_FAT_IMAGE "${CMAKE_CURRENT_BINARY_DIR}/vfs_test_image.cpp")
 add_custom_command(OUTPUT "${VFS_TEST_FAT_IMAGE}"
     COMMAND python3 "${BROOK_ROOT}/scripts/make_fat_image.py" "${VFS_TEST_FAT_IMAGE}" 360
