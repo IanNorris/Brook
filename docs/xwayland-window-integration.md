@@ -174,6 +174,15 @@ a fresh xeyes window opened after each. That VM run preceded the final bounded
 shutdown-cleanup adjustment, which has host-test coverage. Existing X clients
 disconnected as expected. This is not a Steam-load or Dell stability result.
 
+The final compositor build was subsequently exercised in a private,
+software-rendered VM with a null-output PulseAudio server. Steam reached its
+rootless main window, and compositor maximize and restore actions completed.
+Terminating Xwayland while Steam was open left the compositor running; a new
+server and worker appeared, and a fresh xeyes window opened through them. The
+guest was stopped after a checked filesystem and device flush. Existing X
+clients disconnect on server loss; this test does not show Steam automatically
+reconnecting, establish long-term Steam stability, or validate the Dell.
+
 ## Xwayland interval-timer lead
 
 The serial log of the earlier rootless Steam run reports over 50,000
