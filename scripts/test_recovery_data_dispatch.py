@@ -294,6 +294,9 @@ def main():
                 if scenario.startswith('journal-publish'):required+=['GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_EARLY_ARM status=-22']
                 if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed'):required+=['SSD_GUARD_RESERVATION_READY','GUARD_CHECK_RESULT exit=0','GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_EARLY_ARM status=-22']
                 if scenario=='journal-desktop-panic':required+=['GUARD_JOURNAL_DESKTOP_PASS']
+                if scenario in ('journal-desktop','journal-desktop-panic'):
+                    required.insert(required.index('GUARD_JOURNAL_DESKTOP_PASS') if scenario=='journal-desktop-panic' else len(required),
+                                    'GUARD_JOURNAL_DESKTOP_LEGACY status=0 stat=0 open=0 read=2')
                 if scenario.startswith('journal-publish') and scenario!='journal-publish-failed':required+=['GUARD_JOURNAL_PUBLISH_UNLINK status=-16','GUARD_JOURNAL_PUBLISH_REMOVE open=-16 closed=0','GUARD_JOURNAL_PUBLISH_RENAME status=-16','GUARD_JOURNAL_PUBLISH_MOVE open=-16 journal_target=-16 closed=0']
                 if scenario=='journal-publish-panic':required+=['GUARD_JOURNAL_PUBLISH_RESULT status=0','GUARD_JOURNAL_PANIC_ARM status=0']
                 required+=[expect]

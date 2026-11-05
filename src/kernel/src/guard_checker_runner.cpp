@@ -276,6 +276,18 @@ void Worker(void* arg) {
                 if(!mounted) {
                     KPrintf("GUARD_JOURNAL_DESKTOP_FAIL arm=%d\n",armed);return;
                 }
+                // Kernel callers still use legacy absolute path lookup. Check
+                // that it sees this same retained FAT instance after handoff.
+                int legacyError=0;VnodeStat legacyStat{};
+                const int legacyStatError=VfsLstatPath("/media/system/EFI/BOOT/BOOTX64.EFI",&legacyStat);
+                auto* legacy=VfsOpenModeChecked("/media/system/EFI/BOOT/BOOTX64.EFI",VFS_O_STREAM,0666,&legacyError);
+                char magic[2]{};uint64_t legacyOffset=0;
+                const int legacyRead=legacy?VfsRead(legacy,magic,sizeof(magic),&legacyOffset):-1;
+                const bool legacyOk=legacy && legacyRead==int(sizeof(magic)) &&
+                    !memcmp(magic,"MZ",sizeof(magic));
+                if(legacy)VfsRelease(legacy);
+                KPrintf("GUARD_JOURNAL_DESKTOP_LEGACY status=%d stat=%d open=%d read=%d\n",legacyOk?0:-5,legacyStatError,legacyError,legacyRead);
+                if(!legacyOk){KPuts("GUARD_JOURNAL_DESKTOP_FAIL legacy\n");return;}
                 VfsPath root{};int error=VfsPathRoot(&root);
                 int openError=0;auto* file=!error?VfsOpenAt(root,root,"/data/home/GUARD.TXT",VFS_O_WRITE|VFS_O_CREATE,0644,0,&openError):nullptr;
                 constexpr char witness[]="guarded desktop handoff\n";uint64_t offset=0;

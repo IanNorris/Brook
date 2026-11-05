@@ -222,6 +222,9 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
     assert(published && freshUnmounts==1);
     assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0));
     assert(!VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0));
+    // ASCII-folded reporting labels must not introduce aliases when the
+    // covering filesystem's own lookup remains case-sensitive.
+    assert(FindMount("/ns-target",nullptr)!=FindMount("/NS-TARGET",nullptr));
     assert(!VfsUnmount("/ns-target")); // retained fresh root requires namespace detach
     auto held=resolve(root,root,"/ns-target"),otherHeld=resolve(root,root,"/ns-a");
     VnodeStat a{},b{};assert(!VfsPathStat(held,&a) && !VfsPathStat(otherHeld,&b));

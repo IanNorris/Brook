@@ -416,6 +416,7 @@ static MountEntry* VfsLegacyMountPathLocked(MountEntry* mount,const char* suffix
 
 // Find the best (longest-prefix) mount for a given absolute path.
 // Returns the mount entry and sets *relPath to the path within the mount.
+static bool VfsLegacyMountAliasMatchesLocked(const char* path,uint32_t length,MountEntry* mount);
 static MountEntry* FindMount(const char* absPath, const char** relPath,char* physical=nullptr)
 {
     MountEntry* best      = nullptr;
@@ -430,7 +431,23 @@ static MountEntry* FindMount(const char* absPath, const char** relPath,char* phy
                 if(!VfsMountPublished(mount) || !mount.linked || mount.covered.attachment!=best)continue;
                 const uint32_t length=StrLen(mount.mountPoint);bool match=true;
                 for(uint32_t i=0;i<length;++i)if(absPath[i]!=mount.mountPoint[i]) { match=false;break; }
-                if(!match || (absPath[length] && absPath[length]!='/'))continue;
+                if(!match) {
+                    // The label is only a report from the underlying backend.
+                    // FAT may report an uppercase short name for an originally
+                    // lowercase mountpoint. Confirm any ASCII case alias by
+                    // walking actual object identities, never by folding paths
+                    // on a case-sensitive filesystem.
+                    bool folded=true;
+                    for(uint32_t i=0;i<length;++i) {
+                        char a=absPath[i],b=mount.mountPoint[i];
+                        if(!a) {folded=false;break;}
+                        if(a>='A' && a<='Z')a+=32;
+                        if(b>='A' && b<='Z')b+=32;
+                        if(a!=b) {folded=false;break;}
+                    }
+                    if(!folded || (absPath[length] && absPath[length]!='/') ||
+                       !VfsLegacyMountAliasMatchesLocked(absPath,length,&mount))continue;
+                } else if(absPath[length] && absPath[length]!='/')continue;
                 if(length<nextLength) { next=&mount;nextLength=length; }
             }
             if(!next)break;
@@ -545,6 +562,18 @@ static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf);
 
 // Object traversal shares the namespace transaction used by legacy mutations.
 #include "vfs_retained.inc"
+
+static bool VfsLegacyMountAliasMatchesLocked(const char* path,uint32_t length,MountEntry* mount)
+{
+    if(!g_rootMount || length>=512)return false;
+    char prefix[512];for(uint32_t i=0;i<length;++i)prefix[i]=path[i];prefix[length]=0;
+    VfsPath root{};if(VfsMountRootLocked(g_rootMount,&root))return false;
+    VfsRetainedProvider provider;RetainedWalkResult<VfsPath> result{};
+    const int error=WalkRetainedPath(root,root,prefix,&result,provider);
+    const bool matches=!error && result.object.attachment==mount;
+    VfsPathRelease(result.parent);VfsPathRelease(result.object);VfsPathRelease(root);
+    return matches;
+}
 
 // ---- Public API ----
 
