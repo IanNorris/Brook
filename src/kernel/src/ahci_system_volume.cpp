@@ -13,6 +13,10 @@
 #include "mount_namespace.h"
 #include "vfs.h"
 #include "kprintf.h"
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#include "guard_checker_session.h"
+#include "guard_fat_profile.h"
+#endif
 #if defined(BROOK_AHCI_PANIC_TEST)
 #include "fatfs_vfs.h"
 #include "panic_journal.h"
@@ -272,6 +276,15 @@ bool AhciSystemGuardIdentity(char (&out)[97]) {
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 Device* AhciSystemGuardTestPrepare(Device* reserved) {
     if(reserved!=&guardPartition || !guardReady || guardTestPhase!=GuardTestPhase::Disabled)return nullptr;
+    // The same boot-lifetime reservation used by the checker remains in
+    // force. Consume its drained, clean completion only from its original
+    // controller, and repeat the common FAT geometry/copy profile before
+    // making the preparation adapter available. A failure is final for this
+    // boot; a raw reserved-device pointer alone grants no handoff.
+    GuardFatProfile profile{};
+    if(!GuardCheckerConsumeCompletion(reserved) || !GuardFatCheckDevice(reserved,profile)) {
+        guardTestPhase=GuardTestPhase::Failed;return nullptr;
+    }
     guardTestPhase=GuardTestPhase::Preparation;return &guardTestPartition;
 }
 bool AhciSystemGuardTestBeginWrites(Device* adapter) {

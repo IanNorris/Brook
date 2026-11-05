@@ -438,7 +438,8 @@ def main():
                 selected = False
                 while time.monotonic() < deadline:
                     if process.poll() is not None:
-                        raise RuntimeError('QEMU exited before local check completed')
+                        detail = (work / 'qemu.log').read_text(errors='replace')[-4000:]
+                        raise RuntimeError('QEMU exited before local check completed: ' + detail)
                     text = serial.read_text(errors='replace') if serial.exists() else ''
                     if (a.guard_reservation=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial) and
                             'SSD_GUARD_RESERVATION_FAILED' in text):
