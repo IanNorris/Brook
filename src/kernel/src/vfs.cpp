@@ -567,7 +567,10 @@ void VfsInit()
 bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 { return VfsMountConfigured(mountPoint,fsName,pdrv,0); }
 bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes)
+{ return VfsMountConfiguredWithPublication(mountPoint,fsName,pdrv,attributes,nullptr); }
+bool VfsMountConfiguredWithPublication(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
 {
+    if(publication)*publication=0;
     if(attributes&~uint64_t{7})return false;
     FileMutationGuard mutation;
     if (!mountPoint || mountPoint[0]!='/' || !fsName ||
@@ -637,6 +640,7 @@ bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,u
     slot->used=true;
     g_mounts.Publish(slot);
     if(isRoot)g_rootMount=slot;
+    if(publication)*publication=slot->publication;
 
     DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
     return true;

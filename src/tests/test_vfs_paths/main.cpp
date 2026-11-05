@@ -941,7 +941,10 @@ int main(){
     using namespace brook;
     VfsInit();rejectProvider=true;assert(!VfsRegisterFs("rejected",&fsOps));rejectProvider=false;
     assert(VfsRegisterFs("objects",&fsOps));assert(providerCalls==3);assert(VfsRegisterFs("unsupported",&unsupportedOps));
-    assert(VfsMount("/","objects",0));assert(!VfsMount("/","objects",1));
+    uint64_t publication=0;
+    assert(VfsMountConfiguredWithPublication("/","objects",0,0,&publication));assert(publication!=0);
+    uint64_t rejected=123;
+    assert(!VfsMountConfiguredWithPublication("/","objects",1,0,&rejected));assert(rejected==0);
     Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"}, namespaceTarget{&mounts[0],900,true,&mounts[0].root,{},{}};
     mounts[0].root.children={{"dir",&directory},{"file",&file},{"namespace-target",&namespaceTarget}};directory.children={{"marker",&marker},{"absolute",&link}};
     VfsPath root{},held{};assert(!VfsPathRoot(&root));held=resolve(root,root,"/dir");
