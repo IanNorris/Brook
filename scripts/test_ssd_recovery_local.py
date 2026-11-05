@@ -22,6 +22,7 @@ import time
 import uuid
 import zlib
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from hardware_update_protocol import record
@@ -109,6 +110,8 @@ def main():
                    help='Inject before pending state and verify no automatic reset')
     p.add_argument('--guard-panic-pm-fallback', action='store_true',
                    help='Force PIT failure in the disposable debugger and test the ACPI timer')
+    p.add_argument('--guard-panic-timerless-reset', action='store_true',
+                   help='Also force ACPI timer failure and require the armed last-resort reset')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-watchdog-duration', action='store_true',
@@ -165,6 +168,8 @@ def main():
         p.error('unarmed panic requires the pre-pending injection')
     if a.guard_panic_pm_fallback and not a.guard_panic_after_pending:
         p.error('PM fallback requires the post-pending panic fixture')
+    if a.guard_panic_timerless_reset and not a.guard_panic_pm_fallback:
+        p.error('timerless reset requires the PM fallback fixture')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
@@ -555,6 +560,7 @@ def main():
                 panic=symbol('KernelPanic')
                 scratch=symbol('_ZN5brookL8g_kbdBufE') # disposable guest, no keyboard input
                 pit=symbol('_ZN5brook13PanicPitDelayEj') if a.guard_panic_pm_fallback else 0
+                pm=symbol('_ZN5brook12PanicPmDelayEjt') if a.guard_panic_timerless_reset else 0
                 commands=work/'panic.gdb'
                 prefix=('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                         f'target remote {work / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n')
@@ -616,6 +622,7 @@ def main():
                     body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +
                           (f'hbreak *{pit:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pit else '') +
+                          (f'hbreak *{pm:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pm else '') +
                           'detach\nquit\n')
                 commands.write_text(prefix+body)
                 for _ in range(100):
@@ -645,7 +652,7 @@ def main():
                         raise RuntimeError('panic injection debugger failed: '+(work/'qemu.log').read_text(errors='replace')[-3000:])
                     if process.poll() is not None:
                         if a.guard_panic_inject and process.returncode==0:
-                            if a.guard_panic_after_pending and (reset_wait_since is None or time.monotonic()-reset_wait_since<4):
+                            if a.guard_panic_after_pending and not a.guard_panic_timerless_reset and (reset_wait_since is None or time.monotonic()-reset_wait_since<4):
                                 raise RuntimeError('automatic panic reset occurred before the expected delay')
                             break
                         detail = (work / 'qemu.log').read_text(errors='replace')[-4000:]
@@ -818,6 +825,8 @@ def main():
                 raise RuntimeError('automatic recovery panic injection failed: '+text[-5000:])
             if a.guard_panic_pm_fallback and 'PANIC_RESET_PM_FALLBACK' not in text:
                 raise RuntimeError('ACPI PM fallback did not run')
+            if a.guard_panic_timerless_reset and 'PANIC_RECOVERY_RESET_TIMERLESS_ATTEMPT' not in text:
+                raise RuntimeError('armed timerless reset did not run')
             packet=next((line[10:] for line in text.splitlines() if line.startswith('PANIC_HEX:')),None)
             if not packet:raise RuntimeError('panic packet missing')
             decoded_output=StringIO()

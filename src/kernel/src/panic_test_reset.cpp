@@ -38,6 +38,9 @@ struct PmTimer {
 __attribute__((noinline)) PanicResetResult PanicPitDelay(uint32_t intervals) {
     Pit pit;return PanicResetAfterIntervals(pit,intervals,10000000);
 }
+__attribute__((noinline)) PanicResetResult PanicPmDelay(uint32_t intervals,uint16_t port) {
+    PmTimer timer{port};return PanicResetAfterPmIntervals(timer,intervals,10000000);
+}
 void PanicTestResetConfigure() {
     // Both settings come only from QEMU fw_cfg, read before scheduling starts.
     // The ordinary physical firmware reset register cannot enable this path.
@@ -61,10 +64,21 @@ void PanicTestResetAfterDump() {
     auto result=PanicPitDelay(enabled?20:100);
     if(result==PanicResetResult::TimerFailed && AcpiGetPmTimerInfo().available) {
         PanicRaw("PANIC_RESET_PM_FALLBACK\n");
-        PmTimer timer{AcpiGetPmTimerInfo().port};
-        result=PanicResetAfterPmIntervals(timer,enabled?20:100,10000000);
+        result=PanicPmDelay(enabled?20:100,AcpiGetPmTimerInfo().port);
     }
-    if(result==PanicResetResult::TimerFailed) PanicRaw(enabled?"PANIC_TEST_RESET_TIMER_FAILED\n":"PANIC_RECOVERY_RESET_TIMER_FAILED\n");
+    if(result==PanicResetResult::TimerFailed) {
+        PanicRaw(enabled?"PANIC_TEST_RESET_TIMER_FAILED\n":"PANIC_RECOVERY_RESET_TIMER_FAILED\n");
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // Crash capture has been attempted and recovery has explicitly armed reset.
+        // The bounded polling loops failed, so no clock remains to enforce the
+        // display delay. Attempt the authorized reset rather than halt forever.
+        if(recovery && !enabled) {
+            PanicRaw("PANIC_RECOVERY_RESET_TIMERLESS_ATTEMPT\n");
+            (void)PlatformPowerIssue(true);
+            PanicRaw("PANIC_RECOVERY_RESET_RETURNED\n");
+        }
+#endif
+    }
     else if(result==PanicResetResult::ResetReturned) PanicRaw(enabled?"PANIC_TEST_RESET_RETURNED\n":"PANIC_RECOVERY_RESET_RETURNED\n");
 }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
