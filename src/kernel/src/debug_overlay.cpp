@@ -171,6 +171,38 @@ int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t maxLines,uint32_t 
     SpinLockRelease(&g_ringLock);return count;
 }
 
+int DebugOverlayTryPanicSnapshot(char* out,uint32_t capacity)
+{
+    if(!out || !capacity)return -22;
+    if(!SpinLockTryAcquire(&g_ringLock))return -16;
+    const uint32_t available=g_totalLines<RING_LINES-1?g_totalLines:RING_LINES-1;
+    uint32_t selected=0,bytes=0;
+    while(selected<available) {
+        const uint32_t index=(g_writeHead+RING_LINES-1-selected)%RING_LINES;
+        uint32_t length=0;
+        while(length<RING_COLS && g_ring[index][length])++length;
+        if(length+1>capacity-bytes)break;
+        bytes+=length+1;++selected;
+    }
+    uint32_t pos=0;
+    for(uint32_t n=selected;n>0;--n) {
+        const uint32_t index=(g_writeHead+RING_LINES-n)%RING_LINES;
+        for(uint32_t j=0;j<RING_COLS && g_ring[index][j];++j)out[pos++]=g_ring[index][j];
+        out[pos++]='\n';
+    }
+    SpinLockRelease(&g_ringLock);
+    return static_cast<int>(pos);
+}
+#ifdef BROOK_DEBUG_RING_TEST
+int DebugOverlayTestPanicSnapshotBusy(char* out,uint32_t capacity)
+{
+    SpinLockAcquire(&g_ringLock);
+    const int result=DebugOverlayTryPanicSnapshot(out,capacity);
+    SpinLockRelease(&g_ringLock);
+    return result;
+}
+#endif
+
 #ifndef BROOK_DEBUG_RING_TEST
 // --- Kernel console window thread ------------------------------------------
 

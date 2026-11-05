@@ -29,6 +29,10 @@ uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, ui
 int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t maxLines,uint32_t lineLen,
                           uint32_t* total,uint32_t* skipped);
 
+// Panic context: copy the newest complete lines, in order, without waiting
+// for a lock that may be held by a halted CPU. Returns bytes or -16 if busy.
+int DebugOverlayTryPanicSnapshot(char* out,uint32_t capacity);
+
 // Spawn the kernel console WM window.
 // Must be called after CompositorInit + WmInit + SchedulerInit.
 void KernelConsoleSpawn();

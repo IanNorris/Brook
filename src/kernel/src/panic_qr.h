@@ -39,7 +39,9 @@ static constexpr uint32_t QR_PACKET_TYPE_STACK_DUMP     = 0xA3000006;
 static constexpr uint32_t QR_PACKET_TYPE_PROCESS_EXT    = 0xA3000007; // BRO-176 reap gates
 static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU RIP/CR3/pid
 static constexpr uint32_t QR_PACKET_TYPE_MESSAGE        = 0xA3000009; // bounded panic reason bytes
+static constexpr uint32_t QR_PACKET_TYPE_LOG_TAIL       = 0xA300000A; // status byte + completed log lines
 static constexpr uint32_t PANIC_MESSAGE_MAX_BYTES       = 511;
+static constexpr uint32_t PANIC_LOG_MAX_BYTES           = 1024;
 
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //

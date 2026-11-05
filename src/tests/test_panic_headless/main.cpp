@@ -12,6 +12,12 @@ namespace brook {
 extern "C" void SerialPuts(const char* s) {output += s;}
 extern "C" void SerialPutChar(char c) {output += c;}
 extern "C" void SerialPrintf(const char*, ...) {}
+int DebugOverlayTryPanicSnapshot(char* out,uint32_t capacity) {
+    const char text[]="recent log\n";
+    if(capacity<brook::PANIC_LOG_MAX_BYTES)return -22;
+    std::memset(out,'L',brook::PANIC_LOG_MAX_BYTES);
+    std::memcpy(out,text,sizeof(text)-1);return brook::PANIC_LOG_MAX_BYTES;
+}
 }
 struct Disk {
     std::vector<uint8_t> sectors=std::vector<uint8_t>(brook::PanicJournalSectors*brook::PanicJournalSector);
@@ -23,9 +29,14 @@ int main() {
     const uint8_t* captured=nullptr;uint32_t capturedBytes=0;
     assert(!brook::PanicCapturedPacket(&captured,&capturedBytes));
     brook::PanicCPURegs regs{}; regs.rip=0x12345678; regs.rsp=0x87654321;
-    brook::PanicStackTrace trace{};trace.depth=1;trace.rip[0]=0x12345678;
+    brook::PanicStackTrace trace{};trace.depth=brook::PANIC_MAX_STACK_DEPTH;trace.rip[0]=0x12345678;
+    brook::PanicExceptionInfo exception{};
+    brook::PanicProcessList processes{};processes.count=brook::PANIC_MAX_PROCESSES;
+    brook::PanicSystemInfo system{};
+    brook::PanicStackDump stack{};stack.length=brook::PANIC_STACK_DUMP_BYTES;
+    brook::PanicCpuList cpus{};cpus.count=brook::PANIC_MAX_CPUS_DUMP;
     char message[520];std::memset(message,'X',sizeof(message));
-    brook::PanicRenderQR(nullptr,0,0,0,&regs,&trace,nullptr,nullptr,nullptr,nullptr,nullptr,message);
+    brook::PanicRenderQR(nullptr,0,0,0,&regs,&trace,&exception,&processes,&system,&stack,&cpus,message);
     const auto pos=output.find("PANIC_HEX:"); assert(pos!=std::string::npos);
     const auto end=output.find('\n',pos);assert(end!=std::string::npos);
     std::vector<unsigned char> bytes;
@@ -49,7 +60,7 @@ int main() {
     assert(header.type==brook::QR_PACKET_TYPE_CPU_REGS && header.size==sizeof(regs));
     brook::PanicCPURegs decoded{};memcpy(&decoded,raw.data()+sizeof(header),sizeof(decoded));
     assert(decoded.rip==regs.rip && decoded.rsp==regs.rsp);
-    size_t at=0;bool found=false;
+    size_t at=0;bool found=false,foundLog=false;
     while(at+sizeof(header)<=raw.size()) {
         std::memcpy(&header,raw.data()+at,sizeof(header));at+=sizeof(header);
         assert(header.size<=raw.size()-at);
@@ -58,8 +69,14 @@ int main() {
             for(size_t i=0;i<header.size;i++)assert(raw[at+i]=='X');
             found=true;
         }
+        if(header.type==brook::QR_PACKET_TYPE_LOG_TAIL) {
+            const char expected[]="\0recent log\n";
+            assert(!foundLog && header.size==1+brook::PANIC_LOG_MAX_BYTES);
+            assert(std::memcmp(raw.data()+at,expected,sizeof(expected)-1)==0);
+            foundLog=true;
+        }
         at+=header.size;
     }
-    assert(found && at==raw.size());
+    assert(found && foundLog && at==raw.size());
     puts("headless panic packet: PASS");
 }

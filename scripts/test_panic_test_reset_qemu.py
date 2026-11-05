@@ -22,8 +22,12 @@ def check_reason(serial, expected):
     with redirect_stdout(output):
         crash_decoder.decode_crash(packet,None,False,True)
     rendered=output.getvalue()
-    actual=json.loads(rendered[rendered.index('{'):]).get('message')
+    decoded=json.loads(rendered[rendered.index('{'):])
+    actual=decoded.get('message')
     if actual!=expected:raise RuntimeError(f'panic reason differs: {actual!r}')
+    log=decoded.get('log_tail')
+    if not log or not log['available'] or 'BOOT' not in log['text']:
+        raise RuntimeError('panic packet lacks available recent boot log')
 
 
 def run_case(root, image, kernel, firmware, command, armed, timeout, verify_reboot=False):

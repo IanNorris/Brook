@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+namespace brook { int DebugOverlayTestPanicSnapshotBusy(char*,uint32_t); }
 int main(){
     auto small=brook::ConsoleFitInitial(800,556,800,500,2,28);
     assert(small.x+small.width+4<=800 && small.y+small.height+32<=556);
@@ -29,6 +30,10 @@ int main(){
     brook::DebugOverlayInit();
     for(unsigned i=0;i<530;++i){char line[32];std::snprintf(line,sizeof(line),"L%03u\n",i);brook::DebugOverlayPuts(line);}
     brook::DebugOverlayPuts("PARTIAL");
+    char tail[12]{};
+    assert(brook::DebugOverlayTryPanicSnapshot(tail,sizeof(tail))==10);
+    assert(!std::memcmp(tail,"L528\nL529\n",10));
+    assert(brook::DebugOverlayTestPanicSnapshotBusy(tail,sizeof(tail))==-16);
     char lines[64][161]{};uint32_t cursor=0,total=0,skipped=0;unsigned expected=19;
     do{
         int n=brook::DebugOverlayReadRange(&cursor,&lines[0][0],64,161,&total,&skipped);

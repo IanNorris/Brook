@@ -9,6 +9,7 @@
 #include "panic_qr.h"
 #include "panic_qr_layout.h"
 #include "base45.h"
+#include "debug_overlay.h"
 #include "serial.h"
 #include "string.h"
 
@@ -51,7 +52,8 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                                   const PanicSystemInfo* sysInfo,
                                   const PanicStackDump* stackDump,
                                   const PanicCpuList* cpuList,
-                                  const char* message)
+                                  const char* message,
+                                  const uint8_t* log, uint32_t logBytes)
 {
     uint32_t messageLen=0;
     if(message) while(messageLen<PANIC_MESSAGE_MAX_BYTES && message[messageLen]) ++messageLen;
@@ -69,6 +71,7 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                          + cpuList->count * sizeof(PanicCpuEntry);
     if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackDump->length;
     if (messageLen) needed += sizeof(PanicPacketHeader) + messageLen;
+    needed += sizeof(PanicPacketHeader) + logBytes;
 
     if (bufLen < needed) return 0;
 
@@ -175,6 +178,10 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         appendRaw(&ph, sizeof(ph));
         appendRaw(message, messageLen);
     }
+    ph.type = QR_PACKET_TYPE_LOG_TAIL;
+    ph.size = logBytes;
+    appendRaw(&ph,sizeof(ph));
+    appendRaw(log,logBytes);
     return off;
 }
 
@@ -279,9 +286,13 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 
     // Step 1: Build binary TLV payload (no header yet — added per page)
     static uint8_t payloadBuf[4096];
+    static uint8_t logBuf[1+PANIC_LOG_MAX_BYTES];
+    const int logBytes=DebugOverlayTryPanicSnapshot(reinterpret_cast<char*>(logBuf+1),PANIC_LOG_MAX_BYTES);
+    logBuf[0]=logBytes<0?1:0;
+    const uint32_t logSize=1+(logBytes<0?0:static_cast<uint32_t>(logBytes));
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
                                             regs, trace, excInfo, procList,
-                                            sysInfo, stackDump, cpuList, message);
+                                            sysInfo, stackDump, cpuList, message, logBuf, logSize);
     if (payloadLen == 0)
     {
         SerialPuts("PANIC QR: payload build failed\n");

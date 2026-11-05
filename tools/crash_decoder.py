@@ -60,6 +60,7 @@ PKT_STACK_DUMP     = 0xA3000006
 PKT_PROCESS_EXT    = 0xA3000007  # BRO-176 reap-gate fields, merged onto PROCESS_LIST by pid
 PKT_CPU_STATE      = 0xA3000008  # per-CPU RIP/CR3/pid
 PKT_MESSAGE        = 0xA3000009  # bounded panic reason, UTF-8 bytes
+PKT_LOG_TAIL       = 0xA300000A  # one-byte snapshot status, followed by log text
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -598,7 +599,8 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
                  sys_info: SystemInfo | None = None,
                  stack_dump: StackDump | None = None,
                  cpu_list: "CpuList | None" = None,
-                 message: str | None = None):
+                 message: str | None = None,
+                 log_tail: dict | None = None):
     bar = "═" * (W + 4)
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
@@ -614,6 +616,14 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
     if message is not None:
         safe_message = json.dumps(message, ensure_ascii=True)[1:-1]
         print(f"  {C.RED}{C.BOLD}Panic reason:{C.RESET} {safe_message}\n")
+    if log_tail is not None:
+        print(f"  {C.CYAN}{C.BOLD}Recent kernel log:{C.RESET}")
+        if log_tail['available']:
+            for line in log_tail['text'].splitlines():
+                print('    ' + json.dumps(line, ensure_ascii=True)[1:-1])
+        else:
+            print('    unavailable (log ring busy or snapshot failed)')
+        print()
 
     # System info
     if sys_info:
@@ -776,7 +786,8 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                sys_info: SystemInfo | None = None,
                stack_dump: StackDump | None = None,
                cpu_list: "CpuList | None" = None,
-               message: str | None = None) -> dict:
+               message: str | None = None,
+               log_tail: dict | None = None) -> dict:
     out: dict = {
         "header": {
             "magic": f"0x{hdr.magic:02X}",
@@ -788,6 +799,8 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
     }
     if message is not None:
         out["message"] = message
+    if log_tail is not None:
+        out["log_tail"] = log_tail
     if exc_info:
         out["exception"] = {
             "vector": exc_info.vector,
@@ -956,6 +969,7 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     cpu_list = None
     proc_ext_data = None  # buffered until after the loop (may precede PROCESS_LIST)
     message = None
+    log_tail = None
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -988,6 +1002,12 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             stack_dump = StackDump(pkt_data)
         elif pkt.type == PKT_MESSAGE:
             message = pkt_data.decode('utf-8', errors='replace')
+        elif pkt.type == PKT_LOG_TAIL:
+            if not pkt_data or pkt_data[0] not in (0, 1) or (pkt_data[0] and len(pkt_data)!=1):
+                print('[warn] Invalid panic log snapshot', file=sys.stderr)
+            else:
+                log_tail={'available':pkt_data[0]==0,
+                          'text':pkt_data[1:].decode('utf-8',errors='replace')}
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -1011,12 +1031,12 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
         print(json.dumps(build_json(hdr, regs, trace, sym,
                                     exc_info=exc_info, proc_list=proc_list,
                                     sys_info=sys_info, stack_dump=stack_dump,
-                                    cpu_list=cpu_list, message=message), indent=2))
+                                    cpu_list=cpu_list, message=message, log_tail=log_tail), indent=2))
     else:
         print_report(hdr, regs, trace, sym, data, show_raw,
                      exc_info=exc_info, proc_list=proc_list,
                      sys_info=sys_info, stack_dump=stack_dump,
-                     cpu_list=cpu_list, message=message)
+                     cpu_list=cpu_list, message=message, log_tail=log_tail)
 
 
 def parse_serial_log(path: str) -> bytes:
