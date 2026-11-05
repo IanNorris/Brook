@@ -35,6 +35,8 @@ def main():
     p.add_argument('--desktop',required=True,type=Path)
     p.add_argument('--recovery',required=True,type=Path)
     p.add_argument('--output',required=True,type=Path)
+    p.add_argument('--check-watchdog-refusal',action='store_true',
+                   help='Require the physical-PCH watchdog probe to refuse this QEMU guest')
     a=p.parse_args();desktop=a.desktop.resolve(strict=True);recovery=a.recovery.resolve(strict=True)
     out=a.output.absolute();out.mkdir(parents=True,exist_ok=False)
     manifest=json.loads((desktop/'manifest.json').read_text())
@@ -76,6 +78,11 @@ def main():
                 time.sleep(.2)
             else:raise TimeoutError(serial[-4000:])
             h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port);s=attached['session']
+            if a.check_watchdog_refusal:
+                watchdog=h.command(s,'bridge hardware pch-watchdog-status')
+                if watchdog.get('pch_watchdog_error')!='status admission failed':
+                    raise RuntimeError('physical watchdog probe did not refuse the QEMU guest: '+str(watchdog))
+                (out/'watchdog-refusal.json').write_text(json.dumps(watchdog,indent=2)+'\n')
             status=h.command(s,'bridge hardware ahci-ro')
             observer=h.command(s,'bridge hardware ahci')
             (out/'ahci.json').write_text(json.dumps({'status':status,'observer':observer},indent=2)+'\n')
