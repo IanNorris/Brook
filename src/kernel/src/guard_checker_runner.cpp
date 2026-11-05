@@ -13,6 +13,7 @@
 #include "fw_cfg.h"
 #include "panic.h"
 #include "shutdown.h"
+#include "shell.h"
 #endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
 #include "platform_power.h"
@@ -245,7 +246,8 @@ void Worker(void* arg) {
         const bool desktopFailed=journalSize==6 && !memcmp(journalMode,"test-8",6);
         const bool desktopShutdown=journalSize==6 && !memcmp(journalMode,"test-9",6);
         const bool desktopDenied=journalSize==6 && !memcmp(journalMode,"test-a",6);
-        const bool desktop=desktopPanic || desktopFailed || desktopShutdown || desktopDenied || (journalSize==6 && !memcmp(journalMode,"test-6",6));
+        const bool desktopScript=journalSize==6 && !memcmp(journalMode,"test-b",6);
+        const bool desktop=desktopPanic || desktopFailed || desktopShutdown || desktopDenied || desktopScript || (journalSize==6 && !memcmp(journalMode,"test-6",6));
         const bool publish=capture || denyCapture || failedPublish || desktop || (journalSize==6 && !memcmp(journalMode,"test-2",6));
         if(!pinOnly && !publish) {
             AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
@@ -322,6 +324,10 @@ void Worker(void* arg) {
                 if(file)VfsClose(file);VfsPathRelease(root);
                 if(error){KPrintf("GUARD_JOURNAL_DESKTOP_FAIL write=%d open=%d\n",error,openError);return;}
                 KPuts("GUARD_JOURNAL_DESKTOP_PASS\n");
+                if(desktopScript) {
+                    const int scriptResult=ShellExecScript("/boot/INIT.RC");
+                    KPrintf("GUARD_JOURNAL_NORMAL_SCRIPT status=%d\n",scriptResult);
+                }
                 if(desktopPanic)KernelPanic("guarded desktop handoff panic");
                 if(desktopShutdown) {
                     char state[24]{};int shutdownError=0;
