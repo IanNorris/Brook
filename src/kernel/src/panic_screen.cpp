@@ -139,6 +139,11 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
 {
     if (!fb || fbW == 0 || fbH == 0) return;
 
+    // Capture before even the background fill: a broken framebuffer must not
+    // discard a panic packet that could have been saved to the journal.
+    PanicPreparePacket(info->regs,info->trace,info->excInfo,info->procList,
+                       info->sysInfo,info->stackDump,info->cpuList,info->message);
+
     // fbStride comes from TtyGetFramebuffer which returns bytes — convert to pixels
     uint32_t stride = fbStride / sizeof(uint32_t);
 
@@ -301,9 +306,7 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
     }
 
     // 6. Render QR code in the right column
-    PanicRenderQR(fb, fbW, fbH, fbStride, info->regs, info->trace,
-                  info->excInfo, info->procList, info->sysInfo, info->stackDump,
-                  info->cpuList, info->message);
+    PanicRenderPreparedQR(fb,fbW,fbH,fbStride);
 
     // 7. "System halted" at bottom
     DrawString(fb, stride, fbW, fbH, leftMargin,

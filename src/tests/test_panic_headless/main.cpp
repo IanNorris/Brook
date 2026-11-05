@@ -45,6 +45,16 @@ int main() {
     for(size_t i=pos+10;i<end;i+=2) {unsigned x=0;assert(sscanf(output.substr(i,2).c_str(),"%2x",&x)==1);bytes.push_back(x);}
     assert(brook::PanicCapturedPacket(&captured,&capturedBytes));
     assert(capturedBytes==bytes.size() && std::memcmp(captured,bytes.data(),bytes.size())==0);
+    // The display path must render the already-captured packet without
+    // rebuilding it or emitting a second independent PANIC_HEX record.
+    std::vector<uint32_t> framebuffer(1920*1080,0);
+    const size_t beforeRender=output.size();
+    brook::PanicRenderPreparedQR(framebuffer.data(),1920,1080,1920*4);
+    assert(output.find("PANIC_B45_P0:",beforeRender)!=std::string::npos);
+    assert(output.find("PANIC_HEX:",beforeRender)==std::string::npos);
+    bool drew=false;for(auto pixel:framebuffer)if(pixel){drew=true;break;}
+    assert(drew && brook::PanicCapturedPacket(&captured,&capturedBytes));
+    assert(capturedBytes==bytes.size() && std::memcmp(captured,bytes.data(),bytes.size())==0);
     Disk disk;
     assert(brook::PanicJournalWrite(disk,captured,capturedBytes)==brook::PanicJournalResult::Ok);
     std::vector<uint8_t> recovered(brook::PanicJournalPayloadMax);

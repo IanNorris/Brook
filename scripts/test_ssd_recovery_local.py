@@ -122,6 +122,8 @@ def main():
                    help='Cause a processor double fault using a deliberately invalid #PF gate')
     p.add_argument('--guard-panic-render-stall', action='store_true',
                    help='Stall QR rendering after the panic packet is captured')
+    p.add_argument('--guard-panic-screen-stall', action='store_true',
+                   help='Stall immediately after packet preparation, before the screen background')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-watchdog-duration', action='store_true',
@@ -194,6 +196,8 @@ def main():
     if a.guard_panic_render_stall and (not a.guard_panic_after_pending or a.guard_panic_double_fault or
                                        a.guard_panic_rsvd or a.guard_watchdog_inject or a.guard_panic_pm_fallback or a.guard_panic_network):
         p.error('renderer stall requires post-pending panic without other injections or network retrieval')
+    if a.guard_panic_screen_stall and not a.guard_panic_render_stall:
+        p.error('screen stall requires the renderer stall fixture')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
@@ -710,8 +714,10 @@ def main():
                                     at=segment.data().find(b'\xeb\xfe')
                                     if at>=0:spin=segment['p_vaddr']+at;break
                         if spin is None:raise RuntimeError('no executable loop for renderer stall fixture')
-                        render=symbol('qrcodegen_encodeText')
-                        renderer=(f'hbreak *{render:#x}\ncontinue\nset $rip={spin:#x}\n'
+                        render=symbol('_ZN5brook18PanicPreparePacketEPKNS_12PanicCPURegsEPKNS_15PanicStackTraceEPKNS_18PanicExceptionInfoEPKNS_16PanicProcessListEPKNS_15PanicSystemInfoEPKNS_14PanicStackDumpEPKNS_12PanicCpuListEPKc' if a.guard_panic_screen_stall else 'qrcodegen_encodeText')
+                        after_prepare=('set $return_address=*(unsigned long long*)$rsp\ndelete breakpoints\n'
+                                       'hbreak *$return_address\ncontinue\n' if a.guard_panic_screen_stall else '')
+                        renderer=(f'hbreak *{render:#x}\ncontinue\n' + after_prepare + f'set $rip={spin:#x}\n'
                                   'printf "PANIC_RENDERER_STALLED\\n"\ndelete breakpoints\n')
                     body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +

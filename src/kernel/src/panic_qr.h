@@ -211,6 +211,14 @@ struct __attribute__((packed)) PanicStackDump {
 // is built. It is not itself durable and conveys no disk-write authority.
 bool PanicCapturedPacket(const uint8_t** data, uint32_t* bytes);
 
+// Build and persist the packet before touching the framebuffer. The separate
+// drawing step consumes that exact published packet without writing it again.
+void PanicPreparePacket(const PanicCPURegs* regs, const PanicStackTrace* trace,
+                        const PanicExceptionInfo* excInfo, const PanicProcessList* procList,
+                        const PanicSystemInfo* sysInfo, const PanicStackDump* stackDump,
+                        const PanicCpuList* cpuList, const char* message);
+void PanicRenderPreparedQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight, uint32_t fbStride);
+
 // Render a QR code containing CPU state + stack trace to the framebuffer.
 // Called from KernelPanic after capturing registers.
 // fbBase: physical address of framebuffer

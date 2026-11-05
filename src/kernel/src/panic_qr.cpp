@@ -273,8 +273,7 @@ static void RenderQRToFramebuffer(uint32_t* fb, uint32_t fbWidth, uint32_t fbHei
     }
 }
 
-void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
-                   uint32_t fbStride, const PanicCPURegs* regs,
+void PanicPreparePacket(const PanicCPURegs* regs,
                    const PanicStackTrace* trace,
                    const PanicExceptionInfo* excInfo,
                    const PanicProcessList* procList,
@@ -284,9 +283,6 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const char* message)
 {
     __atomic_store_n(&g_capturedPacketBytes, 0, __ATOMIC_RELEASE);
-    SerialPrintf("PANIC QR: %ux%u fb, preferred %u px/module\n",
-                 fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
-
     // Step 1: Build binary TLV payload (no header yet — added per page)
     static uint8_t payloadBuf[4096];
     static uint8_t logBuf[1+PANIC_LOG_MAX_BYTES];
@@ -354,6 +350,17 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // either can fault or stall after the serial record is already available.
     AhciPanicTestCapture();
 #endif
+}
+
+void PanicRenderPreparedQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
+                           uint32_t fbStride)
+{
+    const uint8_t* packet=nullptr;
+    uint32_t packetBytes=0;
+    if (!PanicCapturedPacket(&packet,&packetBytes) || packetBytes<=sizeof(PanicHeader)) return;
+    const auto* hdr=reinterpret_cast<const PanicHeader*>(packet);
+    const uint8_t* dataToEncode=packet+sizeof(PanicHeader);
+    const uint32_t dataLen=packetBytes-sizeof(PanicHeader);
 
     // The serial crash record must also be available on headless systems or
     // when the framebuffer could not be initialized. No drawing is possible.
@@ -403,7 +410,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     static uint8_t tempBuf[qrcodegen_BUFFER_LEN_MAX];
 
     // Use v2 (compressed) or v1 (raw) version in QR headers
-    uint8_t qrVersion = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
+    uint8_t qrVersion = hdr->version;
 
     for (uint8_t page = 0; page < pageCount; page++)
     {
@@ -462,6 +469,17 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     }
 
     SerialPanicPuts("PANIC QR: rendered to framebuffer\n");
+}
+
+void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
+                   uint32_t fbStride, const PanicCPURegs* regs,
+                   const PanicStackTrace* trace, const PanicExceptionInfo* excInfo,
+                   const PanicProcessList* procList, const PanicSystemInfo* sysInfo,
+                   const PanicStackDump* stackDump, const PanicCpuList* cpuList,
+                   const char* message)
+{
+    PanicPreparePacket(regs,trace,excInfo,procList,sysInfo,stackDump,cpuList,message);
+    PanicRenderPreparedQR(fbBase,fbWidth,fbHeight,fbStride);
 }
 
 } // namespace brook
