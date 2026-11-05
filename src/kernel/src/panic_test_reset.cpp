@@ -11,7 +11,7 @@ namespace {
 bool enabled = false;
 void PanicRaw(const char* text) {
     // Exception handling intentionally suppresses normal SerialPuts.
-    while (*text) SerialPutChar(*text++);
+    while (*text) SerialPanicPutChar(*text++);
 }
 struct Pit {
     uint8_t readGate() { return inb(0x61); }

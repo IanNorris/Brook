@@ -9,6 +9,10 @@ namespace brook {
 extern "C" void SerialInit();
 extern "C" void SerialPutChar(char c);
 extern "C" void SerialPuts(const char* str);
+// Nonblocking with respect to the serial lock and bounded on a stuck UART.
+void SerialPanicBegin();
+void SerialPanicPutChar(char c);
+void SerialPanicPuts(const char* str);
 // Minimal printf-like: supports %s %d %u %x %lu %lx %ld %p %c %%
 extern "C" void SerialPrintf(const char* fmt, ...);
 extern "C" void SerialVPrintf(const char* fmt, __builtin_va_list args);

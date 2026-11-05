@@ -191,14 +191,14 @@ static void DumpPacketToSerial(const uint8_t* data, uint32_t len)
     // The exception handler suppresses ordinary serial writers while it owns
     // the crash dump. Emit directly: taking its reserved ticket lock here
     // would either suppress the structured packet or deadlock the handler.
-    for (const char* p = "PANIC_HEX:"; *p; ++p) SerialPutChar(*p);
+    for (const char* p = "PANIC_HEX:"; *p; ++p) SerialPanicPutChar(*p);
     static const char hex[] = "0123456789ABCDEF";
     for (uint32_t i = 0; i < len; i++)
     {
-        SerialPutChar(hex[data[i] >> 4]);
-        SerialPutChar(hex[data[i] & 0x0F]);
+        SerialPanicPutChar(hex[data[i] >> 4]);
+        SerialPanicPutChar(hex[data[i] & 0x0F]);
     }
-    SerialPutChar('\n');
+    SerialPanicPutChar('\n');
 }
 
 // Build a page buffer: PanicHeader + chunk of payload, then Base45-encode it.
@@ -224,7 +224,7 @@ static uint32_t BuildBase45Page(char* b45Buf, uint32_t b45BufLen,
     int result = Base45Encode(b45Buf, b45BufLen, pageBuf, pageDataLen);
     if (result < 0)
     {
-        SerialPuts("PANIC QR: Base45 encode failed\n");
+        SerialPanicPuts("PANIC QR: Base45 encode failed\n");
         return 0;
     }
     return static_cast<uint32_t>(result);
@@ -295,7 +295,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                                             sysInfo, stackDump, cpuList, message, logBuf, logSize);
     if (payloadLen == 0)
     {
-        SerialPuts("PANIC QR: payload build failed\n");
+        SerialPanicPuts("PANIC QR: payload build failed\n");
         return;
     }
 
@@ -384,7 +384,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                                       placement.x,placement.y,placement.scale);
                 urlBandH=placement.y+placement.side+16;
             }
-            SerialPuts("PANIC QR: ingest URL QR rendered (" PANIC_INGEST_URL ")\n");
+            SerialPanicPuts("PANIC QR: ingest URL QR rendered (" PANIC_INGEST_URL ")\n");
         }
     }
 
@@ -416,14 +416,14 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                      page, chunkLen, b45Len);
 
         // Also dump the Base45 text to serial for phone-scan-equivalent testing
-        SerialPuts("PANIC_B45_P");
+        SerialPanicPuts("PANIC_B45_P");
         {
             char pageStr[2] = { static_cast<char>('0' + page), '\0' };
-            SerialPuts(pageStr);
+            SerialPanicPuts(pageStr);
         }
-        SerialPuts(":");
-        SerialPuts(b45Buf);
-        SerialPuts("\n");
+        SerialPanicPuts(":");
+        SerialPanicPuts(b45Buf);
+        SerialPanicPuts("\n");
 
         // Generate QR code using alphanumeric mode (encodeText auto-selects)
         bool ok = qrcodegen_encodeText(b45Buf, tempBuf, qrBuf,
@@ -452,7 +452,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
 
     }
 
-    SerialPuts("PANIC QR: rendered to framebuffer\n");
+    SerialPanicPuts("PANIC QR: rendered to framebuffer\n");
 }
 
 } // namespace brook

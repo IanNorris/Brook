@@ -142,11 +142,11 @@ static void CaptureStackTrace(brook::PanicStackTrace& trace, uint64_t rbp, uint6
 // ---- Minimal hex printer (no va_list needed) --------------------------------
 static void SerialPutHex64(uint64_t v)
 {
-    brook::SerialPuts("0x");
+    brook::SerialPanicPuts("0x");
     for (int shift = 60; shift >= 0; shift -= 4)
     {
         int nib = static_cast<int>((v >> shift) & 0xF);
-        brook::SerialPutChar(static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10));
+        brook::SerialPanicPutChar(static_cast<char>(nib < 10 ? '0' + nib : 'a' + nib - 10));
     }
 }
 
@@ -290,12 +290,13 @@ static volatile int g_panicNesting = 0;
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
+    brook::SerialPanicBegin();
 
     int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
     if (depth > 1)
     {
         // Nested panic — the handler itself faulted.  Serial-only, minimal output.
-        brook::SerialPuts("\n*** DOUBLE PANIC (handler faulted) ***\n");
+        brook::SerialPanicPuts("\n*** DOUBLE PANIC (handler faulted) ***\n");
         for (;;) { __asm__ volatile("hlt"); }
     }
 
@@ -320,61 +321,61 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     // -- Serial output FIRST (before SmpHaltAllAPs) --------------------------
     // Print diagnostic info to serial before halting other CPUs.  If the
     // NMI broadcast crashes (BRO-109), the panic reason is still captured.
-    brook::SerialPuts("\n*** KERNEL PANIC ***\n");
-    brook::SerialPuts("Brook OS "); brook::SerialPuts(brook::BuildDate());
-    brook::SerialPuts(" ("); brook::SerialPuts(brook::BuildGitBranch());
-    brook::SerialPuts("/"); brook::SerialPuts(brook::BuildGitHash());
-    brook::SerialPuts(")\n");
-    brook::SerialPuts(g_panicBuf);
-    brook::SerialPuts("RIP "); SerialPutHex64(regs.rip);
+    brook::SerialPanicPuts("\n*** KERNEL PANIC ***\n");
+    brook::SerialPanicPuts("Brook OS "); brook::SerialPanicPuts(brook::BuildDate());
+    brook::SerialPanicPuts(" ("); brook::SerialPanicPuts(brook::BuildGitBranch());
+    brook::SerialPanicPuts("/"); brook::SerialPanicPuts(brook::BuildGitHash());
+    brook::SerialPanicPuts(")\n");
+    brook::SerialPanicPuts(g_panicBuf);
+    brook::SerialPanicPuts("RIP "); SerialPutHex64(regs.rip);
     // Symbolicate RIP
     {
         const char* symName = nullptr;
         uint64_t symOff = 0;
         if (brook::KsymFindByAddr(regs.rip, &symName, &symOff))
         {
-            brook::SerialPuts("  ");
-            brook::SerialPuts(symName);
-            brook::SerialPuts("+0x");
+            brook::SerialPanicPuts("  ");
+            brook::SerialPanicPuts(symName);
+            brook::SerialPanicPuts("+0x");
             SerialPutHex64(symOff);
         }
     }
-    brook::SerialPuts("\nRSP "); SerialPutHex64(regs.rsp);
-    brook::SerialPuts("\nCR2 "); SerialPutHex64(regs.cr2);
-    brook::SerialPuts("  CR3 "); SerialPutHex64(regs.cr3);
+    brook::SerialPanicPuts("\nRSP "); SerialPutHex64(regs.rsp);
+    brook::SerialPanicPuts("\nCR2 "); SerialPutHex64(regs.cr2);
+    brook::SerialPanicPuts("  CR3 "); SerialPutHex64(regs.cr3);
 
     // Stack trace with symbols
-    brook::SerialPuts("\nStack trace (");
+    brook::SerialPanicPuts("\nStack trace (");
     {
         char depthStr[4];
         int ds = 0;
         if (trace.depth >= 10) depthStr[ds++] = '0' + (trace.depth / 10);
         depthStr[ds++] = '0' + (trace.depth % 10);
         depthStr[ds] = '\0';
-        brook::SerialPuts(depthStr);
+        brook::SerialPanicPuts(depthStr);
     }
-    brook::SerialPuts(" frames):\n");
+    brook::SerialPanicPuts(" frames):\n");
     for (uint8_t i = 0; i < trace.depth; i++) {
-        brook::SerialPuts("  [");
+        brook::SerialPanicPuts("  [");
         char idxStr[4];
         int is = 0;
         if (i >= 10) idxStr[is++] = '0' + (i / 10);
         idxStr[is++] = '0' + (i % 10);
         idxStr[is] = '\0';
-        brook::SerialPuts(idxStr);
-        brook::SerialPuts("] ");
+        brook::SerialPanicPuts(idxStr);
+        brook::SerialPanicPuts("] ");
         SerialPutHex64(trace.rip[i]);
         // Symbolicate
         const char* symName = nullptr;
         uint64_t symOff = 0;
         if (brook::KsymFindByAddr(trace.rip[i], &symName, &symOff))
         {
-            brook::SerialPuts("  ");
-            brook::SerialPuts(symName);
+            brook::SerialPanicPuts("  ");
+            brook::SerialPanicPuts(symName);
         }
-        brook::SerialPuts("\n");
+        brook::SerialPanicPuts("\n");
     }
-    brook::SerialPuts("System halted.\n");
+    brook::SerialPanicPuts("System halted.\n");
 
     // Halt other CPUs AFTER serial output — if the NMI broadcast crashes,
     // we've already printed the full diagnostic to serial.
@@ -392,49 +393,49 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     {
         uint32_t nCpus = brook::SmpGetCpuCount();
         if (nCpus > brook::MAX_CPUS) nCpus = brook::MAX_CPUS;
-        brook::SerialPuts("\n--- per-CPU live state (NMI-captured) ---\n");
+        brook::SerialPanicPuts("\n--- per-CPU live state (NMI-captured) ---\n");
         for (uint32_t c = 0; c < nCpus; ++c)
         {
             const brook::CpuHaltedState* hs = brook::SmpGetHaltedState(c);
             brook::Process* p = brook::SchedulerGetCpuProcess(c);
-            brook::SerialPuts("  CPU");
+            brook::SerialPanicPuts("  CPU");
             char cbuf[4]; int ci2 = 0;
             if (c >= 10) cbuf[ci2++] = '0' + (c / 10);
             cbuf[ci2++] = '0' + (c % 10);
             cbuf[ci2] = '\0';
-            brook::SerialPuts(cbuf);
+            brook::SerialPanicPuts(cbuf);
             uint64_t pv = reinterpret_cast<uint64_t>(p);
             bool pOk = pv >= 0xFFFF800000000000ULL && (pv & 0x7) == 0
                        && p->magic == brook::PROCESS_MAGIC;
-            brook::SerialPuts(" pid=");
+            brook::SerialPanicPuts(" pid=");
             SerialPutHex64(pOk ? p->pid : 0);
             if (hs && hs->halted && hs->rip)
             {
-                brook::SerialPuts(" LIVE rip=");
+                brook::SerialPanicPuts(" LIVE rip=");
                 SerialPutHex64(hs->rip);
                 const char* sym = nullptr; uint64_t off = 0;
                 if (brook::KsymFindByAddr(hs->rip, &sym, &off))
                 {
-                    brook::SerialPuts("  ");
-                    brook::SerialPuts(sym);
+                    brook::SerialPanicPuts("  ");
+                    brook::SerialPanicPuts(sym);
                 }
             }
             else if (pOk)
             {
-                brook::SerialPuts(" sched rip=");
+                brook::SerialPanicPuts(" sched rip=");
                 SerialPutHex64(p->savedCtx.rip);
                 const char* sym = nullptr; uint64_t off = 0;
                 if (brook::KsymFindByAddr(p->savedCtx.rip, &sym, &off))
                 {
-                    brook::SerialPuts("  ");
-                    brook::SerialPuts(sym);
+                    brook::SerialPanicPuts("  ");
+                    brook::SerialPanicPuts(sym);
                 }
             }
             else
             {
-                brook::SerialPuts(" (idle/none)");
+                brook::SerialPanicPuts(" (idle/none)");
             }
-            brook::SerialPuts("\n");
+            brook::SerialPanicPuts("\n");
         }
     }
 

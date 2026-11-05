@@ -113,33 +113,14 @@ static const char* const g_excNames[32] = {
 // Output may interleave with other CPUs but will always make progress.
 // ---------------------------------------------------------------------------
 
-static inline void ExcOutb(uint16_t port, uint8_t val)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t ExcInb(uint16_t port)
-{
-    uint8_t ret;
-    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-
-// Atomic spinlock to prevent exception output from interleaving with
-// normal serial writes from other CPUs.  Force-resets the normal serial
-// ticket lock so the exception handler can write without deadlock.
 extern "C" void ExcForceSerialLock();
 extern "C" bool ExcPanicLockTry(uint32_t cpuId);
 extern "C" bool ExcPanicLockHeldBy(uint32_t cpuId);
 
+// Exception output bypasses the serial lock and gives up on a stuck UART.
 static void ExcPutCharRaw(char c)
 {
-    if (c == '\n') {
-        while ((ExcInb(0x3FD) & 0x20) == 0) {}
-        ExcOutb(0x3F8, '\r');
-    }
-    while ((ExcInb(0x3FD) & 0x20) == 0) {}
-    ExcOutb(0x3F8, static_cast<uint8_t>(c));
+    brook::SerialPanicPutChar(c);
 }
 
 static void ExcPutsRaw(const char* s)

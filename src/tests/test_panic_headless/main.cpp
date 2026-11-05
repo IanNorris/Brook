@@ -12,6 +12,8 @@ namespace brook {
 extern "C" void SerialPuts(const char* s) {output += s;}
 extern "C" void SerialPutChar(char c) {output += c;}
 extern "C" void SerialPrintf(const char*, ...) {}
+void SerialPanicPutChar(char c) {output += c;}
+void SerialPanicPuts(const char* s) {output += s;}
 int DebugOverlayTryPanicSnapshot(char* out,uint32_t capacity) {
     const char text[]="recent log\n";
     if(capacity<brook::PANIC_LOG_MAX_BYTES)return -22;

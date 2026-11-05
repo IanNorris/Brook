@@ -1,4 +1,5 @@
 #include "serial.h"
+#include "panic_serial.h"
 
 namespace brook {
 
@@ -100,6 +101,19 @@ void SerialPutChar(char c)
 // interleaving their SCHED/CLOSE/etc. messages into the panic register
 // dump and rendering it unreadable on the serial log.
 static volatile uint32_t g_panicInProgress = 0;
+static PanicSerialState g_panicSerialState;
+void SerialPanicBegin() { __atomic_store_n(&g_panicInProgress,1,__ATOMIC_RELEASE); }
+void SerialPanicPutChar(char c) {
+    struct Port {
+        bool ready() {return (inb(COM1_LSR)&0x20)!=0;}
+        void write(uint8_t b) {outb(COM1_DATA,b);}
+        void pause() {__asm__ volatile("pause" ::: "memory");}
+    } port;
+    PanicSerialWrite(g_panicSerialState,port,c,100000);
+}
+void SerialPanicPuts(const char* text) {
+    if(text)while(*text)SerialPanicPutChar(*text++);
+}
 
 // BRO-179 stress-test toggle (see serial.h). Default false = verbose.
 volatile bool g_hotLogQuiet = false;
