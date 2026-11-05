@@ -15,4 +15,12 @@ int main() {
     assert(reads==0);
     auto result=capture(0,31,0,0x8086,0x9cc3);
     assert(result.captured && result.pci40==0x4040 && result.pci44==0x4444 && reads==2);
+    brook::PchWatchdogInventory live{};unsigned n=0;
+    auto stable=[&](uint8_t offset) {++n;return offset==0?0x9cc38086u:offset==0x40?0x1801u:0x80u;};
+    assert(!brook::PchWatchdogReadStable(brook::PchWatchdogInventory{},stable,live) && n==0);
+    assert(brook::PchWatchdogReadStable(result,stable,live) && n==6 && live.pci40==0x1801 && live.pci44==0x80);
+    n=0;auto changing=[&](uint8_t offset) {++n;return offset==0?0x9cc38086u:offset==0x40?n:0x80u;};
+    assert(!brook::PchWatchdogReadStable(result,changing,live) && !live.captured);
+    auto missing=[](uint8_t) {return 0xffffffffu;};
+    assert(!brook::PchWatchdogReadStable(result,missing,live));
 }

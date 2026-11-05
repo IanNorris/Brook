@@ -27,6 +27,7 @@ std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 bool audioProbePresent=false,hdaPciPresent=false;
+bool pchPresent=false;
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -107,10 +108,14 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
     out->device.classCode=3;out->device.bar[0]=0xf0000004;
     if(index==0)out->bdwGraphics={true,0x01c1,0xdd800001};
     if(index==1)out->pchWatchdog={true,0x1801,0x80};
+    if(index==1 && pchPresent){out->device.dev=31;out->device.fn=0;out->device.deviceId=0x9cc3;}
     if(hdaPciPresent && index==1){out->device.dev=0x1b;out->device.deviceId=0x9ca0;
         out->device.classCode=4;out->device.subclass=3;out->device.bar[0]=0xf7418004;
         out->subsystemVendor=0x1028;out->subsystemDevice=0x0665;}
     out->command=7;return true;
+}
+extern "C" uint32_t PciConfigRead32(uint8_t bus,uint8_t dev,uint8_t fn,uint8_t offset){
+    assert(bus==0 && dev==31 && fn==0);return offset==0?0x9cc38086u:offset==0x40?0x1801u:0x80u;
 }
 int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t stride,uint32_t* total,uint32_t* dropped){
     *total=2;*dropped=0;if(*cursor>2)return -22;
@@ -177,6 +182,10 @@ int main(){
     assert(handle("bridge hardware pci 1 16") && reply.find("\"device\":3")!=std::string::npos && reply.find("\"more\":false")!=std::string::npos);
     assert(reply.find("bdw_firmware_graphics")==std::string::npos);
     assert(reply.find("\"pch_watchdog_pci\":{\"raw_40\":6145,\"raw_44\":128}")!=std::string::npos);
+    assert(handle("bridge hardware pch-watchdog-pci") && reply.find("pch_watchdog_error")!=std::string::npos);
+    pchPresent=true;
+    assert(handle("bridge hardware pch-watchdog-pci") && reply.find("\"live_raw_40\":6145,\"live_raw_44\":128,\"changed\":false")!=std::string::npos);
+    pchPresent=false;
     assert(handle("bridge hardware pci 2 16") && reply.find("\"devices\":[]")!=std::string::npos);
     for(const auto* bad:{"0 0","0 17","3 1","4294967296 1","0 1 more","0 -1"}){
         assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);

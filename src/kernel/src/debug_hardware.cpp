@@ -540,6 +540,26 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"boot_registers\":");registers(status.original);r.text(",\"current_registers\":");registers(status.current);
         r.text(",\"scope\":\"backlight PWM only; panel link and system remain running\"}\n");r.send();return true;
     }
+    if(!strcmp(command,"bridge hardware pch-watchdog-pci")) {
+        const uint32_t count=PciBootInventoryCount();
+        PciBootEntry match{};unsigned found=0;
+        if(PciBootInventorySeen()!=count){DebugChannelSend("{\"pch_watchdog_error\":\"incomplete boot inventory\"}\n");return true;}
+        for(uint32_t i=0;i<count;++i) {
+            PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry)){DebugChannelSend("{\"pch_watchdog_error\":\"inventory unavailable\"}\n");return true;}
+            if(entry.device.bus==0 && entry.device.dev==31 && entry.device.fn==0 &&
+               entry.device.vendorId==0x8086 && entry.device.deviceId==0x9cc3 && entry.pchWatchdog.captured) {match=entry;++found;}
+        }
+        PchWatchdogInventory live{};
+        if(found!=1 || !PchWatchdogReadStable(match.pchWatchdog,
+                [](uint8_t offset){return PciConfigRead32(0,31,0,offset);},live)) {
+            DebugChannelSend("{\"pch_watchdog_error\":\"identity or stable configuration unavailable\"}\n");return true;
+        }
+        Reply r;r.text("{\"pch_watchdog_pci_api\":1,");r.field("boot_raw_40",match.pchWatchdog.pci40);
+        r.text(",");r.field("boot_raw_44",match.pchWatchdog.pci44);
+        r.text(",");r.field("live_raw_40",live.pci40);r.text(",");r.field("live_raw_44",live.pci44);
+        r.text(",\"changed\":");r.text((live.pci40!=match.pchWatchdog.pci40 || live.pci44!=match.pchWatchdog.pci44)?"true":"false");
+        r.text("}\n");r.send();return true;
+    }
     if(Prefix(command,pciPrefix)){
         const char* p=command+sizeof(pciPrefix)-1;uint32_t cursor=0,limit=0;
         const uint32_t count=PciBootInventoryCount();
