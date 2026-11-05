@@ -68,6 +68,7 @@ def main():
     parser.add_argument('--auto-desktop-shutdown',action='store_true',help='Perform checked shutdown through the desktop bridge')
     parser.add_argument('--auto-desktop-dell-initrd',action='store_true',help='Exercise the Dell initrd and startup script using synthetic QEMU services')
     parser.add_argument('--auto-desktop-real-provider',type=Path,help='Use this extracted Dell Wayland provider with its pinned local runtime')
+    parser.add_argument('--auto-desktop-wayland-client',action='store_true',help='Run a Wayland protocol client against the real provider')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -105,6 +106,8 @@ def main():
         parser.error('Dell initrd fixture requires a non-panic auto desktop')
     if a.auto_desktop_real_provider and not a.auto_desktop_dell_initrd:
         parser.error('real provider requires the Dell initrd fixture')
+    if a.auto_desktop_wayland_client and not a.auto_desktop_real_provider:
+        parser.error('Wayland client requires the real provider fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -141,6 +144,10 @@ def main():
         service=work/'GDSVC.ELF';script=work/'INIT.RC';defaults=work/'defaults.ini'
         subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
                         str(ROOT/'scripts/workloads/guard_handoff_service.c'),'-o',str(service)],check=True)
+        client=work/'WAYCLIENT.ELF'
+        if a.auto_desktop_wayland_client:
+            subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2','-Wall','-Wextra','-Werror',
+                            str(ROOT/'scripts/workloads/guard_wayland_client.c'),'-o',str(client)],check=True)
         script.write_text('set wm\nset vfb none\nsched eevdf\nkconsole\nrun --service --once --console --uid 1000 /boot/GDSVC.ELF\n' +
                           ('shutdown\n' if a.auto_desktop_shutdown_panic else '') +
                           ('run --console /boot/DOES_NOT_EXIST.ELF\n' if a.auto_desktop_script_fail else ''))
@@ -173,7 +180,8 @@ def main():
         if a.auto_desktop_dell_initrd:
             for name in ('waylandd','hardware-dbus','hardware-message'):
                 target='/profile/bin/'+name
-                binary=a.auto_desktop_real_provider.resolve(strict=True) if name=='waylandd' and a.auto_desktop_real_provider else service
+                binary=(a.auto_desktop_real_provider.resolve(strict=True) if name=='waylandd' and a.auto_desktop_real_provider else
+                        client if name=='hardware-message' and a.auto_desktop_wayland_client else service)
                 subprocess.run(['debugfs','-w','-R',f'write {binary} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 subprocess.run(['debugfs','-w','-R',f'set_inode_field {target} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             if a.auto_desktop_real_provider:
@@ -502,6 +510,8 @@ def main():
                     raise RuntimeError('Dell startup did not launch '+executable)
             if a.auto_desktop_real_provider and '[waylandd] listening on WAYLAND_DISPLAY=' not in serial:
                 raise RuntimeError('real Wayland provider did not report listening')
+            if a.auto_desktop_wayland_client and ('GUARD_WAYLAND_CLIENT_PASS' not in serial or 'GUARD_WAYLAND_CLIENT_FAIL' in serial):
+                raise RuntimeError('Wayland client did not complete its registry and sync exchange')
         if ((not a.auto_desktop_panic and 'GUARD_DESKTOP_SERVICE_PASS' not in serial) or (not a.auto_desktop and 'brook-ssd-recovery-automatic-v1' in serial) or
             'Recovery required; normal boot blocked.' in serial):
             raise RuntimeError('guarded desktop service did not start after repair')
