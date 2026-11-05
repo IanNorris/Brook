@@ -73,7 +73,7 @@ let
     chmod +x $out/bin/*
   '';
 in {
-  inherit yquake yquakeSoft openal player waylandd calc;
+  inherit yquake yquakeSoft openal player waylandd calc launchers;
   profile = pkgs.buildEnv {
     name = "brook-experiment-profile";
     paths = [
