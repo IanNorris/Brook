@@ -274,6 +274,18 @@ bool AhciSystemGuardIdentity(char (&out)[97]) {
     out[at]=0;return true;
 }
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
+AhciGuardDataState AhciSystemGuardDataState(Device* reserved) {
+    if(reserved!=&guardPartition || !guardReady || !guardDataRange.parent || guardDataRange.bytes<2048)
+        return AhciGuardDataState::Invalid;
+    uint8_t superblock[1024]{};
+    if(guardDataRange.parent->ops->read(guardDataRange.parent,guardDataRange.start+1024,
+                                       superblock,sizeof(superblock))!=int(sizeof(superblock)))
+        return AhciGuardDataState::Invalid;
+    LargeExt2Geometry geometry{};
+    const auto result=LargeExt2ClassifyHeader(superblock,sizeof(superblock),guardDataRange.bytes,largeUuid,geometry);
+    return result==LargeExt2HeaderState::NeedsCheck?AhciGuardDataState::NeedsCheck:
+        result==LargeExt2HeaderState::Clean?AhciGuardDataState::Clean:AhciGuardDataState::Invalid;
+}
 Device* AhciSystemGuardTestPrepare(Device* reserved) {
     if(reserved!=&guardPartition || !guardReady || guardTestPhase!=GuardTestPhase::Disabled)return nullptr;
     // The same boot-lifetime reservation used by the checker remains in

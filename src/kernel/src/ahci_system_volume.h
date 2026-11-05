@@ -29,6 +29,10 @@ bool AhciSystemGuardIsReservedDevice(Device* device);
 // lowercase hex. Available only after the reserved guard device is ready.
 bool AhciSystemGuardIdentity(char (&out)[97]);
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
+enum class AhciGuardDataState { Invalid, Clean, NeedsCheck };
+// Read the identity-bound data superblock while the boot reservation holds.
+// This classification grants no repair or normal-boot authority by itself.
+AhciGuardDataState AhciSystemGuardDataState(Device* reserved);
 // Disposable QEMU test build only. The separate adapter advertises stable
 // writable capability but denies writes until the one-shot test transaction.
 Device* AhciSystemGuardTestPrepare(Device* reserved);

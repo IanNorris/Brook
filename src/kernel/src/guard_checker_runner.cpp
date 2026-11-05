@@ -153,6 +153,17 @@ void Worker(void* arg) {
     uint8_t records[2][128]{};char identity[97]{};
     if(!AhciSystemGuardIdentity(identity)) {KPuts("GUARD_RECORDS_INCOMPLETE identity\n");return;}
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    // The optional automatic fixture must classify the same reserved data
+    // partition itself; an F5 boot or a loader hint cannot authorize repair.
+    char autoMode[8]{};
+    const auto autoSize=FwCfgReadFile("opt/guard-auto-condition",autoMode,sizeof(autoMode));
+    if(autoSize) {
+        if(autoSize!=6 || memcmp(autoMode,"test-1",6)) {KPuts("GUARD_AUTO_INVALID\n");return;}
+        const auto state=AhciSystemGuardDataState(device);
+        if(state==AhciGuardDataState::Clean) {KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
+        if(state!=AhciGuardDataState::NeedsCheck) {KPuts("GUARD_AUTO_INVALID\n");return;}
+        KPuts("GUARD_AUTO_NEEDS_CHECK\n");
+    }
     auto* adapter=AhciSystemGuardTestPrepare(device);
     FatPrivateMount* mount=nullptr;
     if(!adapter || !FatFsMountPrivateRecovery(1,adapter,&mount) ||

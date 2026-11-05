@@ -82,6 +82,10 @@ def main():
                    help='Complete verified recovery on the private QEMU disk')
     p.add_argument('--guard-auto-restart', action='store_true',
                    help='Exercise a guest-initiated restart after verified completion')
+    p.add_argument('--guard-auto-condition', action='store_true',
+                   help='Only repair if the reserved data filesystem is dirty')
+    p.add_argument('--guard-auto-unsupported', action='store_true',
+                   help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
                    help='Inject a failure in the guard completion transaction')
     p.add_argument('--guard-desktop-kernel-build', type=Path,
@@ -95,6 +99,10 @@ def main():
     a = p.parse_args()
     if a.guard_auto_restart and not a.guard_complete_test:
         p.error('automatic restart requires the completion fixture')
+    if a.guard_auto_condition and not a.guard_ext2_test:
+        p.error('automatic repair condition requires the ext2 fixture')
+    if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
+        p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
     if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build or a.fat_checker):
@@ -165,7 +173,7 @@ def main():
             partition = work / 'partition.img'
             subprocess.run(['dd', f'if={disk}', f'of={partition}', 'bs=512',
                             'skip=133120', 'count=126976', 'status=none'], check=True)
-            if a.guard_desktop_kernel_build:
+            if a.guard_desktop_kernel_build or (a.guard_auto_condition and not a.guard_auto_unsupported):
                 with partition.open('rb') as stream:
                     stream.seek(1024+104); original_uuid=stream.read(16)
                 if len(original_uuid)!=16 or not any(original_uuid):
@@ -393,7 +401,8 @@ def main():
                               'Recovery required; normal boot blocked.',sata_snapshot=True)
         before = sha(disk)
         baseline=None
-        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial):
+        auto_clean=a.guard_auto_condition and not a.dirty
+        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean):
             baseline=work/'baseline.raw';shutil.copyfile(disk,baseline)
         poison = None
         if a.guard_poison_boot:
@@ -427,6 +436,8 @@ def main():
             command += ['-fw_cfg', f'name=opt/guard-pending-fail,string={a.guard_pending_fail_at}']
         if a.guard_complete_fail_at:
             command += ['-fw_cfg', f'name=opt/guard-complete-fail,string={a.guard_complete_fail_at}']
+        if a.guard_auto_condition:
+            command += ['-fw_cfg', 'name=opt/guard-auto-condition,string=test-1']
         with (work / 'qemu.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             stop = threading.Event()
@@ -465,7 +476,8 @@ def main():
                     pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
                     ext2_checker_failed=a.guard_ext2_bad_checker or a.guard_ext2_missing_checker
                     complete_expected=(0 if a.guard_complete_fail_at in (1,2) else 1 if a.guard_complete_fail_at else 2)
-                    expected = (f'GUARD_COMPLETE_TEST_RESULT outcome={complete_expected}' if a.guard_complete_test else
+                    expected = (('GUARD_AUTO_INVALID' if a.guard_auto_unsupported else 'GUARD_AUTO_NO_REPAIR') if auto_clean else
+                                f'GUARD_COMPLETE_TEST_RESULT outcome={complete_expected}' if a.guard_complete_test else
                                 'GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
                                 'GUARD_EXT2_VERIFIED_PENDING' if a.guard_ext2_test and not a.guard_pending_fail_at else
                                 (f'GUARD_PENDING_TEST_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
@@ -501,7 +513,13 @@ def main():
                             for line in complete_lines):
                         raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
                     matched = expected in complete_lines if a.fat_checker else expected in text
-                    if a.guard_auto_restart and matched:
+                    if auto_clean and matched:
+                        time.sleep(2)
+                        final=serial.read_text(errors='replace')
+                        if any(marker in final for marker in ('GUARD_PENDING_TEST_RESULT', 'GUARD_EXT2_PREEN',
+                                                              'GUARD_COMPLETE_TEST_RESTART')):
+                            raise RuntimeError('clean filesystem unexpectedly entered repair')
+                    if a.guard_auto_restart and matched and not auto_clean:
                         if complete_expected!=2:
                             time.sleep(2)
                             if 'GUARD_COMPLETE_TEST_RESTART' in serial.read_text(errors='replace'):
@@ -517,11 +535,12 @@ def main():
                             if after.count('GUARD_COMPLETE_TEST_RESTART')!=1 or 'SSD_GUARD_RESERVATION_READY' in after:
                                 raise RuntimeError('guest re-entered recovery after completion')
                     if selected and matched:
-                        if a.guard_ext2_test and not a.guard_pending_fail_at:
+                        if a.guard_ext2_test and not a.guard_pending_fail_at and not auto_clean:
                             preen=('GUARD_EXT2_PREEN exit=-8' if a.guard_ext2_bad_checker else
                                    'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
                             required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_TEST_RESULT outcome=2',preen,expected]
+                            if a.guard_auto_condition:required.insert(1,'GUARD_AUTO_NEEDS_CHECK')
                             if a.guard_complete_test:required.insert(-1,'GUARD_EXT2_VERIFIED_PENDING')
                             if not all(line in complete_lines for line in required):
                                 raise RuntimeError('guarded repair milestones missing')
