@@ -69,6 +69,7 @@ def main():
     parser.add_argument('--auto-desktop-dell-initrd',action='store_true',help='Exercise the Dell initrd and startup script using synthetic QEMU services')
     parser.add_argument('--auto-desktop-real-provider',type=Path,help='Use this extracted Dell Wayland provider with its pinned local runtime')
     parser.add_argument('--auto-desktop-wayland-client',action='store_true',help='Run a Wayland protocol client against the real provider')
+    parser.add_argument('--auto-desktop-dell-shutdown-module',type=Path,help='Use this matching virtio-net module for checked Dell-script shutdown')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -108,6 +109,8 @@ def main():
         parser.error('real provider requires the Dell initrd fixture')
     if a.auto_desktop_wayland_client and not a.auto_desktop_real_provider:
         parser.error('Wayland client requires the real provider fixture')
+    if a.auto_desktop_dell_shutdown_module and (not a.auto_desktop_wayland_client or a.auto_desktop_shutdown):
+        parser.error('Dell shutdown requires the real provider and client fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -135,6 +138,12 @@ def main():
             if startup!=subprocess.check_output(['mtype','-i',str(a.desktop_pair/'INITRD.IMG'),'::/BOOT/INIT.RC']):
                 raise RuntimeError('Dell startup script changed during compaction')
             (a.output/'dell-startup-script.sha256').write_text(hashlib.sha256(startup).hexdigest()+'\n')
+            if a.auto_desktop_dell_shutdown_module:
+                # Dell's opt-in asynchronous TCP stack is tailored to its USB
+                # NIC; the synthetic virtio NIC uses the ordinary TCP path.
+                for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
+                             'tcp-producer-wake','tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
+                    subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if a.auto_desktop:
             for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
                 if subprocess.run(['mdir','-i',str(normal),'::/'+directory],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
@@ -155,10 +164,10 @@ def main():
         payloads=((service,'::/BOOT/GDSVC.ELF'),) if a.auto_desktop_dell_initrd else ((service,'::/BOOT/GDSVC.ELF'),(script,'::/BOOT/INIT.RC'),(defaults,'::/ETC/desktop-defaults.ini'))
         for src,target in payloads:
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
-        if a.normal_kernel or a.auto_desktop_network_module:
+        if a.normal_kernel or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module:
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
-            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module),'::/DRIVERS/virtio_net.mod'],check=True)
+            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module),'::/DRIVERS/virtio_net.mod'],check=True)
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
         for src,target in ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
                            (normal,'::/INITRD.IMG'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
@@ -494,6 +503,41 @@ def main():
                  network_port=network_port,intermediate_marker='GUARD_DESKTOP_BRIDGE_TEST_WINDOW',
                  on_intermediate=bridge_before,on_marker=bridge_after,
                  extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-bridge-window,string=test-1'])
+        elif a.auto_desktop_dell_shutdown_module:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
+            def shutdown_real_provider():
+                deadline=time.monotonic()+20
+                while 'GUARD_WAYLAND_CLIENT_PASS' not in (second/'serial.log').read_text(errors='replace'):
+                    if time.monotonic()>=deadline:raise RuntimeError('Wayland client did not complete before shutdown')
+                    time.sleep(.1)
+                sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                from hardware import Hardware
+                bridge=Hardware(work/'dell-desktop-registry');deadline=time.monotonic()+20
+                while True:
+                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    except (OSError,RuntimeError):
+                        if time.monotonic()>=deadline:raise
+                        time.sleep(.2)
+                doctor=bridge.doctor(session)
+                if not doctor.get('identity_matches') or not doctor['capabilities'].get('hardware_power'):
+                    raise RuntimeError('guarded desktop bridge is not ready for shutdown')
+                request=uuid.uuid4().hex;state=bridge.power(session,request,'shutdown');deadline=time.monotonic()+60
+                while state.get('state')!='ready':
+                    if state.get('state')=='failed' or time.monotonic()>=deadline:
+                        raise RuntimeError('real-provider shutdown did not reach ready: '+str(state))
+                    time.sleep(.2);state=bridge.power(session,request,'status')
+                final=bridge.doctor(session)['guest']['writable_desktop']
+                if not final.get('clean_finalized') or final.get('dirty_session') or final.get('state_uncertain') or final.get('final_error'):
+                    raise RuntimeError('real-provider shutdown did not finalize cleanly: '+str(final))
+                (a.output/'dell-provider-shutdown.json').write_text(json.dumps({'shutdown':state,'final_desktop':final},indent=2)+'\n')
+            try:
+                boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
+                     hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                     network_port=network_port,on_marker=shutdown_real_provider)
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
         elif a.auto_desktop:
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
@@ -504,6 +548,8 @@ def main():
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
         if a.auto_desktop_dell_initrd:
+            if a.auto_desktop_dell_shutdown_module and serial.count('DEBUG_TCP: spawned pid=')!=1:
+                raise RuntimeError('guarded handoff spawned duplicate debug listeners')
             for executable in ('/nix/profile/bin/waylandd','/nix/profile/bin/hardware-dbus',
                                '/nix/profile/bin/hardware-message','/boot/HWSTATUS.ELF'):
                 if 'ELF HASH: '+executable+' ' not in serial:
@@ -590,11 +636,13 @@ def main():
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
                 raise RuntimeError('desktop panic recovery changed the journal')
         with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
-        if a.auto_desktop_shutdown:
+        if a.auto_desktop_shutdown or a.auto_desktop_dell_shutdown_module:
             with partition.open('rb') as source:
                 source.seek(1024+58)
                 if source.read(2)!=b'\x01\x00':raise RuntimeError('checked shutdown did not persist the clean marker')
             if 'AHCI_DIRECT_SESSION_CLEAN' not in serial:raise RuntimeError('checked shutdown did not complete direct sync')
+            if a.auto_desktop_dell_shutdown_module and ('[waylandd] shutting down' not in serial or '[waylandd] PASS' not in serial):
+                raise RuntimeError('real Wayland provider did not shut down cleanly')
         subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if not a.auto_desktop_panic:
             content=subprocess.check_output(['debugfs','-R','cat /home/brook/SERVICE.TXT',str(partition)],stderr=subprocess.DEVNULL)
@@ -602,7 +650,7 @@ def main():
         fat=work/'esp.img'
         with disk.open('rb') as src,fat.open('wb') as dst:src.seek(2048*512);dst.write(src.read(131072*512))
         subprocess.run(['fsck.fat','-n',str(fat)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        if a.auto_desktop_shutdown:
+        if a.auto_desktop_shutdown or a.auto_desktop_dell_shutdown_module:
             # Boot the same clean disk through a QEMU snapshot so this final
             # check cannot modify the already-verified source image.
             digest=hashlib.sha256(disk.read_bytes()).hexdigest()
@@ -613,10 +661,14 @@ def main():
             if ('GUARD_CHECK_RESULT exit=0' not in third_text or 'GUARD_DESKTOP_HANDOFF_SCRIPT status=0' not in third_text or
                 'Recovery required; normal boot blocked.' in third_text):
                 raise RuntimeError('checked desktop did not return after clean shutdown')
+            if a.auto_desktop_dell_shutdown_module and ('[waylandd] listening on WAYLAND_DISPLAY=' not in third_text or
+                                                         'GUARD_WAYLAND_CLIENT_PASS' not in third_text):
+                raise RuntimeError('Wayland provider and client did not return on the next boot')
             if hashlib.sha256(disk.read_bytes()).hexdigest()!=digest:
                 raise RuntimeError('snapshot reboot modified the verified source disk')
             shutil.copyfile(third/'serial.log',a.output/'checked-reboot-serial.log')
-        print('GUARD_DESKTOP_SHUTDOWN_PANIC_INHIBITED_PASS' if a.auto_desktop_shutdown_panic else
+        print('GUARD_DELL_PROVIDER_SHUTDOWN_REBOOT_PASS' if a.auto_desktop_dell_shutdown_module else
+              'GUARD_DESKTOP_SHUTDOWN_PANIC_INHIBITED_PASS' if a.auto_desktop_shutdown_panic else
               'GUARD_DESKTOP_PANIC_RESET_PASS' if a.auto_desktop_reset else
               'GUARD_DESKTOP_PANIC_CAPTURE_PASS' if a.auto_desktop_panic else 'GUARD_REPAIR_TO_DESKTOP_PASS')
 

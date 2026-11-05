@@ -424,6 +424,9 @@ static constexpr uint32_t TCP_BATCH      = 32; // lines per send batch
 // A partial framed command must not monopolize the single debug listener.
 // Legacy passive log viewers and idle framed clients are unaffected.
 static constexpr uint64_t TCP_PARTIAL_FRAME_TIMEOUT_MS = 10000;
+// Recovery starts this before desktop handoff; the desktop script may request
+// it again. Keep one listener, including during concurrent spawn attempts.
+static uint32_t g_debugTcpSpawned = 0;
 
 static bool DebugTcpSendAll(int socket, const char* bytes, uint32_t length)
 {
@@ -443,6 +446,7 @@ static void DebugTcpThread(void* /*arg*/)
     if (listenSock < 0)
     {
         SerialPuts("DEBUG_TCP: failed to create socket\n");
+        __atomic_store_n(&g_debugTcpSpawned,0,__ATOMIC_RELEASE);
         return;
     }
 
@@ -455,6 +459,7 @@ static void DebugTcpThread(void* /*arg*/)
     {
         SerialPuts("DEBUG_TCP: bind failed\n");
         SockClose(listenSock);
+        __atomic_store_n(&g_debugTcpSpawned,0,__ATOMIC_RELEASE);
         return;
     }
 
@@ -462,6 +467,7 @@ static void DebugTcpThread(void* /*arg*/)
     {
         SerialPuts("DEBUG_TCP: listen failed\n");
         SockClose(listenSock);
+        __atomic_store_n(&g_debugTcpSpawned,0,__ATOMIC_RELEASE);
         return;
     }
 
@@ -583,10 +589,13 @@ static void DebugTcpThread(void* /*arg*/)
 
 void DebugTcpSpawn()
 {
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&g_debugTcpSpawned,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
     Process* thread = KernelThreadCreate("debug_tcp", DebugTcpThread, nullptr);
     if (!thread)
     {
         SerialPuts("DEBUG_TCP: failed to create thread\n");
+        __atomic_store_n(&g_debugTcpSpawned,0,__ATOMIC_RELEASE);
         return;
     }
     SchedulerAddProcess(thread);
