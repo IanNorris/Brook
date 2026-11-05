@@ -8,6 +8,7 @@
 #include "spinlock.h"
 #include "user_copy.h"
 #ifndef BROOK_HOST_TEST
+#include "fatfs_vfs.h"
 #include "process.h"
 #include "scheduler.h"
 #include "serial.h"
@@ -531,7 +532,9 @@ void WritebackWorker(void*) {
             IrqSpinLockRelease(&writebackLock,flags);
             // Canonical snapshots precede filesystem/device durability. Empty
             // queues do not trigger periodic flushes of unrelated mounts.
-            const int error=pending?VfsSync(nullptr):0;
+            int error=pending?VfsSync(nullptr):0;
+            const int fatError=FatFsBackgroundSync();
+            if(!error)error=fatError;
             if(error && error!=lastError)SerialPrintf("file-writeback: periodic sync failed: %d; backing retained for retry\n",error);
             lastError=error;
         }

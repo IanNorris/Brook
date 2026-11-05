@@ -93,7 +93,11 @@ struct FatFsMountData {
     FatPathObject* objects;
     int deferredCloseError;
     bool intrinsicReadOnly;
+    bool backgroundDirty;
 };
+// Ordinary mounts only. Protected by g_fatLock through removal and sync;
+// private recovery mounts retain their separate boot-time ownership rules.
+static FatFsMountData* g_fatBackgroundMounts[FF_VOLUMES]{};
 struct FatPrivateMount {
     FatFsMountData* mount;
     Vnode* nodes[2];
@@ -361,6 +365,9 @@ static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* of
     }
     UINT bw = 0;
     FRESULT res = f_write(fil, buf, static_cast<UINT>(len), &bw);
+    // Even a partial or failed write can have changed FAT buffers. A later
+    // idle pass must retry both the file metadata and the device flush.
+    file->mount->backgroundDirty = true;
     // Only alias sharing requires an immediate flush. Keep the normal
     // single-writer path buffered; open() flushes pending writers below.
     bool aliases = false;
@@ -406,6 +413,7 @@ static FRESULT CheckedFatSync(FIL* fil, bool closing)
     FRESULT result = closing ? f_close(fil) : f_sync(fil);
     if (result != FR_OK) {
         fil->flag |= flags;
+        file->mount->backgroundDirty = true;
         if(file->imageLease && !file->imageLease->error)file->imageLease->error=FrToErrno(result);
     }
     return result;
@@ -813,6 +821,8 @@ static bool FatFsMount(uint8_t pdrv, void** mountPriv)
     FRESULT res = f_mount(&data->fs, fatPath, 1);
     if (res != FR_OK)
         f_mount(nullptr, fatPath, 0);
+    else if (pdrv < FF_VOLUMES)
+        g_fatBackgroundMounts[pdrv] = data;
     KMutexUnlock(&g_fatLock);
 
     if (res != FR_OK) {
@@ -847,7 +857,24 @@ static int FatFsSyncLocked(FatFsMountData* data)
         }
     }
     int error = FlushFatDriveLocked(data->pdrv);
-    return result ? result : error;
+    result = result ? result : error;
+    if (!result) data->backgroundDirty = false;
+    return result;
+}
+
+int FatFsBackgroundSync()
+{
+    EnsureLock();
+    KMutexLock(&g_fatLock);
+    int result = 0;
+    for (auto* data : g_fatBackgroundMounts) {
+        if (!data || data->intrinsicReadOnly ||
+            (!data->backgroundDirty && !data->deferredCloseError)) continue;
+        const int error = FatFsSyncLocked(data);
+        if (error) { data->backgroundDirty = true; if (!result) result = error; }
+    }
+    KMutexUnlock(&g_fatLock);
+    return result;
 }
 
 static int FatFsSync(void* mountPriv)
@@ -875,6 +902,8 @@ static int FatFsUnmount(void* mountPriv)
     if (!result) {
         FRESULT error = f_mount(nullptr, fatPath, 0);
         if (error != FR_OK) result = FrToErrno(error);
+        else if (data->pdrv < FF_VOLUMES && g_fatBackgroundMounts[data->pdrv] == data)
+            g_fatBackgroundMounts[data->pdrv] = nullptr;
     }
     KMutexUnlock(&g_fatLock);
     if (result) return result;
@@ -963,6 +992,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         KMutexUnlock(&g_fatLock);
     }
     if (res == FR_OK) {
+        if (mode & (FA_CREATE_ALWAYS | FA_OPEN_ALWAYS)) mount->backgroundDirty = true;
         file->allNext = file->mount->allFiles;
         file->mount->allFiles = file;
         if (mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS)) {
@@ -1418,6 +1448,7 @@ static Vnode* FatObjectCreate(VfsObject* parent,const char* name,int flags,uint1
         FRESULT result=f_object_create(&dir->location,name,&file->fil,mode);
         if(result!=FR_OK)*error=result==FR_EXIST?-17:FrToErrno(result);
         else {
+            dir->mount->backgroundDirty=true;
             FF_OBJECT location{};result=f_object_from_file(&file->fil,&location);
             if(result!=FR_OK){*error=FrToErrno(result);f_close(&file->fil);}
             else {

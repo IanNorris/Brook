@@ -256,6 +256,25 @@ int main(int argc,char** argv){
     assert(!FatFsUnmount(mount) && !driveAcquired);
     assert(disk==diskBefore && allocations.empty() && pages.empty());
     intrinsicReadOnly=false;
+    // An open, otherwise idle writer must reach disk without fsync or close.
+    assert(FatFsMount(0,&privateMount));mount=static_cast<FatFsMountData*>(privateMount);
+    assert(!FatFsBackgroundSync());const auto idleFlushes=driveFlushes;
+    assert(!FatFsBackgroundSync() && driveFlushes==idleFlushes);
+    auto* idleWriter=FatFsOpen(mount,0,"/IDLE.BIN",VFS_O_CREATE|VFS_O_WRITE);assert(idleWriter);
+    uint64_t idleAt=0;assert(idleWriter->ops->write(idleWriter,"persist",7,&idleAt)==7);
+    failDriveFlush=true;assert(FatFsBackgroundSync()==-5 && mount->backgroundDirty);
+    failDriveFlush=false;assert(!FatFsBackgroundSync() && !mount->backgroundDirty);
+    const auto flushed=driveFlushes;assert(!FatFsBackgroundSync() && driveFlushes==flushed);
+    // Fresh FatFs directory lookup observes the updated size while the writer
+    // remains open, rather than relying on its in-memory FIL.
+    FILINFO idleInfo{};assert(f_stat("0:/IDLE.BIN",&idleInfo)==FR_OK && idleInfo.fsize==7);
+    closeNode(idleWriter);
+    VfsObject* idleRoot=nullptr;assert(!FatRootObject(mount,0,&idleRoot));
+    int idleError=0;auto* emptyCreated=FatObjectCreate(idleRoot,"idle-empty",VFS_O_READ,0600,&idleError);
+    assert(emptyCreated && !idleError && mount->backgroundDirty);
+    assert(!FatFsBackgroundSync() && !mount->backgroundDirty);
+    closeNode(emptyCreated);VfsObjectRelease(idleRoot);assert(!FatFsUnmount(mount));
+    assert(!FatFsBackgroundSync() && allocations.empty() && pages.empty());
     // Ordinary readers can still populate a cache, but streaming must bypass it.
     assert(FatFsMount(0,&privateMount));mount=static_cast<FatFsMountData*>(privateMount);
     auto* cached=FatFsOpen(mount,0,"/image.brk",VFS_O_READ);assert(cached && cached->ops==&g_cachedFileOps);

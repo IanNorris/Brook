@@ -28,6 +28,8 @@ int FatFsPrivateRecoveryTestComplete(FatPrivateMount* mount,const char* identity
 #endif
 #endif
 void FatFsVfsRegister();
+// Flush dirty ordinary FAT mounts, retaining failures for the next pass.
+int FatFsBackgroundSync();
 // Boot-only, one-shot mount on a pinned exclusive binding. It is not inserted
 // in a VFS namespace and, once bound, remains reserved until reboot even if
 // mounting fails.
