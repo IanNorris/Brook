@@ -10,6 +10,9 @@ namespace brook {
 namespace {
 bool enabled = false;
 bool headless = false;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool recoveryArmed = false;
+#endif
 void PanicRaw(const char* text) {
     // Exception handling intentionally suppresses normal SerialPuts.
     while (*text) SerialPanicPutChar(*text++);
@@ -37,13 +40,23 @@ void PanicTestResetConfigure() {
     if(enabled) SerialPuts("PANIC_TEST_RESET_ARMED 1s disposable QEMU only\n");
 }
 void PanicTestResetAfterDump() {
-    if(!enabled)return;
-    PanicRaw("PANIC_TEST_RESET_WAIT\n");
+    bool recovery=false;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    recovery=__atomic_load_n(&recoveryArmed,__ATOMIC_ACQUIRE);
+#endif
+    if(!enabled && !recovery)return;
+    PanicRaw(enabled?"PANIC_TEST_RESET_WAIT\n":"PANIC_RECOVERY_RESET_WAIT\n");
     Pit pit;
-    const auto result=PanicResetAfterIntervals(pit,20,10000000);
-    if(result==PanicResetResult::TimerFailed) PanicRaw("PANIC_TEST_RESET_TIMER_FAILED\n");
-    else if(result==PanicResetResult::ResetReturned) PanicRaw("PANIC_TEST_RESET_RETURNED\n");
+    const auto result=PanicResetAfterIntervals(pit,enabled?20:100,10000000);
+    if(result==PanicResetResult::TimerFailed) PanicRaw(enabled?"PANIC_TEST_RESET_TIMER_FAILED\n":"PANIC_RECOVERY_RESET_TIMER_FAILED\n");
+    else if(result==PanicResetResult::ResetReturned) PanicRaw(enabled?"PANIC_TEST_RESET_RETURNED\n":"PANIC_RECOVERY_RESET_RETURNED\n");
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool PanicRecoveryResetArm() {
+    if(!PlatformPowerGetPlan().CanReset())return false;
+    __atomic_store_n(&recoveryArmed,true,__ATOMIC_RELEASE);return true;
+}
+#endif
 bool PanicTestResetEnabled() {return enabled;}
 bool PanicTestHeadlessEnabled() {return headless;}
 }

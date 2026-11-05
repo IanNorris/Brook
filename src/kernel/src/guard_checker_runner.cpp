@@ -4,6 +4,9 @@
 #include "ahci_system_volume.h"
 #include "exec_image.h"
 #include "fatfs_vfs.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "panic_test_reset.h"
+#endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
 #include "panic.h"
@@ -311,6 +314,9 @@ void Worker(void* arg) {
     KPrintf("GUARD_PENDING_RESULT outcome=%d\n",pending);
 #if defined(BROOK_SSD_GUARD_REPAIR)
     if(pending!=2)return;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    KPrintf("GUARD_PANIC_RESET armed=%u\n",PanicRecoveryResetArm()?1u:0u);
+#endif
     auto* data=AhciSystemGuardTestDataArm(adapter,pending);
     if(!data) {KPuts("GUARD_EXT2_INCOMPLETE data-admission\n");return;}
     const int preen=RunExt2Checker(data,true);

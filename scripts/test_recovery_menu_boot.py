@@ -54,7 +54,8 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError('QEMU exited before the expected boot marker: ' +
-                                       (work / 'qemu.log').read_text(errors='replace')[-2000:])
+                                       (work / 'qemu.log').read_text(errors='replace')[-2000:] +
+                                       '\nserial tail: ' + (serial.read_text(errors='replace')[-3000:] if serial.exists() else ''))
                 if recovery and monitor.exists() and time.monotonic() < send_until:
                     try:
                         with socket.socket(socket.AF_UNIX) as connection:

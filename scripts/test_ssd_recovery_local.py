@@ -29,6 +29,7 @@ from prepare_hardware_kernel_pair import module_version
 from prepare_ssd_recovery_pair import AUTO_CHECK_INIT, AUTO_CHECK_PAYLOAD_ID
 from test_recovery_menu_boot import boot as boot_menu_fixture
 from test_panic_fat_qemu import file_sectors, outside_digest, verify_record
+from test_recovery_data_dispatch import outside_esp_hash
 import crash_decoder
 
 
@@ -101,6 +102,10 @@ def main():
                    help='Provision a disposable crash journal and require automatic recovery to arm it')
     p.add_argument('--guard-panic-inject', action='store_true',
                    help='Inject a panic at the pending-repair entry using QEMU GDB')
+    p.add_argument('--guard-panic-after-pending', action='store_true',
+                   help='Inject after durable pending state and require the automatic reset')
+    p.add_argument('--guard-panic-unarmed', action='store_true',
+                   help='Inject before pending state and verify no automatic reset')
     p.add_argument('--guard-auto-unsupported', action='store_true',
                    help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
@@ -128,6 +133,10 @@ def main():
         p.error('journal arming requires the dirty automatic recovery fixture')
     if a.guard_panic_inject and (not a.guard_panic_journal or not a.auto_prepared_pair or a.guard_auto_restart):
         p.error('panic injection requires the automatic pair and journal, with no automatic-restart test')
+    if a.guard_panic_after_pending and not a.guard_panic_inject:
+        p.error('post-pending panic requires --guard-panic-inject')
+    if a.guard_panic_unarmed and (not a.guard_panic_inject or a.guard_panic_after_pending):
+        p.error('unarmed panic requires the pre-pending injection')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
         p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
@@ -437,7 +446,7 @@ def main():
                                   'Recovery required; normal boot blocked.',sata_snapshot=True)
         before = sha(disk)
         journal_sectors=file_sectors(disk,2048,'::/PANIC.BIN') if a.guard_panic_inject else None
-        journal_outside=outside_digest(disk,journal_sectors) if journal_sectors else None
+        journal_outside=(outside_esp_hash(disk) if a.guard_panic_after_pending else outside_digest(disk,journal_sectors)) if journal_sectors else None
         baseline=None
         auto_clean=a.guard_auto_condition and not a.dirty
         if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean):
@@ -478,9 +487,10 @@ def main():
             command += ['-fw_cfg', 'name=opt/guard-auto-condition,string=test-1']
         if a.guard_panic_inject:
             command += ['-S','-gdb',f'unix:{work / "gdb.sock"},server=on,wait=off',
-                        '-fw_cfg','name=opt/brook/power,string=q35-reset',
-                        '-fw_cfg','name=opt/brook/panic-test-reset,string=test-1s',
-                        '-fw_cfg','name=opt/brook/panic-test-headless,string=yes']
+                        '-fw_cfg','name=opt/brook/power,string=q35-reset']
+            if not (a.guard_panic_after_pending or a.guard_panic_unarmed):
+                command += ['-fw_cfg','name=opt/brook/panic-test-reset,string=test-1s',
+                            '-fw_cfg','name=opt/brook/panic-test-headless,string=yes']
         with (work / 'qemu.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             debugger=None
@@ -490,7 +500,8 @@ def main():
                     matches=[int(line.split()[0],16) for line in symbols.splitlines() if line.split()[-1:]==[name]]
                     if len(matches)!=1:raise RuntimeError('missing exact panic injection symbol '+name)
                     return matches[0]
-                pending=symbol('_ZN5brook31FatFsPrivateRecoveryTestPendingEPNS_15FatPrivateMountEPKcj')
+                pending=symbol('_ZN5brook12_GLOBAL__N_114RunExt2CheckerEPNS_6DeviceEb' if a.guard_panic_after_pending else
+                               '_ZN5brook31FatFsPrivateRecoveryTestPendingEPNS_15FatPrivateMountEPKcj')
                 panic=symbol('KernelPanic')
                 scratch=symbol('_ZN5brookL8g_kbdBufE') # disposable guest, no keyboard input
                 commands=work/'panic.gdb'
@@ -518,15 +529,24 @@ def main():
             try:
                 deadline = time.monotonic() + 120
                 selected = False
+                reset_wait_since=None
                 while time.monotonic() < deadline:
                     if debugger and debugger.poll() not in (None,0):
                         raise RuntimeError('panic injection debugger failed: '+(work/'qemu.log').read_text(errors='replace')[-3000:])
                     if process.poll() is not None:
                         if a.guard_panic_inject and process.returncode==0:
+                            if a.guard_panic_after_pending and (reset_wait_since is None or time.monotonic()-reset_wait_since<4):
+                                raise RuntimeError('automatic panic reset occurred before the expected delay')
                             break
                         detail = (work / 'qemu.log').read_text(errors='replace')[-4000:]
                         raise RuntimeError('QEMU exited before local check completed: ' + detail)
                     text = serial.read_text(errors='replace') if serial.exists() else ''
+                    if a.guard_panic_after_pending and reset_wait_since is None and 'PANIC_RECOVERY_RESET_WAIT' in text:
+                        reset_wait_since=time.monotonic()
+                    if a.guard_panic_unarmed and 'PANIC_DISK_CAPTURE_OK' in text:
+                        time.sleep(7)
+                        if process.poll() is not None:raise RuntimeError('unarmed panic unexpectedly reset')
+                        break
                     if (a.auto_physical_reject and
                             'SSD guard reservation failed; no recovery access permitted' in text and
                             'System halted.' in text):
@@ -668,9 +688,11 @@ def main():
                         output.write(serial.read_bytes())
         if a.guard_panic_inject:
             text=serial.read_text(errors='replace')
+            reset_marker='PANIC_RECOVERY_RESET_WAIT' if a.guard_panic_after_pending else 'PANIC_TEST_RESET_WAIT'
+            pending_ok=('GUARD_PENDING_RESULT outcome=2' in text and 'GUARD_PANIC_RESET armed=1' in text) if a.guard_panic_after_pending else 'GUARD_PENDING_RESULT' not in text
             if debugger.returncode!=0 or 'GUARD_PANIC_JOURNAL pin=0 arm=0' not in text or \
-               'PANIC_DISK_CAPTURE_OK' not in text or 'PANIC_TEST_RESET_WAIT' not in text or \
-               'GUARD_PENDING_RESULT' in text:
+               'PANIC_DISK_CAPTURE_OK' not in text or (not a.guard_panic_unarmed and reset_marker not in text) or \
+               (a.guard_panic_unarmed and ('PANIC_RECOVERY_RESET_WAIT' in text or 'PANIC_TEST_RESET_WAIT' in text)) or not pending_ok:
                 raise RuntimeError('automatic recovery panic injection failed: '+text[-5000:])
             packet=next((line[10:] for line in text.splitlines() if line.startswith('PANIC_HEX:')),None)
             if not packet:raise RuntimeError('panic packet missing')
@@ -681,14 +703,22 @@ def main():
                 raise RuntimeError('panic packet lacks the injected reason or recent log')
             contents=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
             verify_record(contents,0,1,bytes.fromhex(packet))
-            if outside_digest(disk,journal_sectors)!=journal_outside:
+            after_outside=outside_esp_hash(disk) if a.guard_panic_after_pending else outside_digest(disk,journal_sectors)
+            if after_outside!=journal_outside:
                 raise RuntimeError('panic wrote outside the preallocated journal')
+            if a.guard_panic_after_pending:
+                expected_pending=bytearray(record_data);struct.pack_into('<QI',expected_pending,8,2,2)
+                struct.pack_into('<I',expected_pending,124,zlib.crc32(expected_pending[:124]))
+                for index in range(2):
+                    actual=subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])
+                    if actual!=expected_pending:raise RuntimeError('pending guard not preserved after panic')
             esp=work/'panic-esp.img'
             with disk.open('rb') as source,esp.open('wb') as target:
                 source.seek(2048*512);target.write(source.read(131072*512))
             subprocess.run(['fsck.fat','-n',str(esp)],check=True,stdout=subprocess.DEVNULL,timeout=30)
             reboot=work/'panic-reboot';reboot.mkdir()
-            boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,'GUARD_PANIC_JOURNAL pin=0 arm=0',
+            reboot_marker='GUARD_PENDING_INCOMPLETE records=0' if a.guard_panic_after_pending else 'GUARD_PANIC_JOURNAL pin=0 arm=0'
+            boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,reboot_marker,
                               90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA')
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=contents:
                 raise RuntimeError('captured journal changed after the next boot')
