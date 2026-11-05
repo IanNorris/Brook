@@ -1,148 +1,33 @@
 ---
 name: brook-vm
-description: Inspect and control opted-in Brook QEMU VMs or boot-pinned physical guests. VM tools include input, images, logs, profiling and post-panic inspection; hardware tools use explicit guest TCP connections. Never targets the host desktop.
+description: Operate the Brook debug bridge MCP for opted-in QEMU VMs and explicitly selected physical Brook machines. Use for guest inspection, command jobs, application and window control, capture, transfers, bridge diagnostics, and guest lifecycle operations. Does not control the host desktop.
 ---
 
-Start with vm_sessions and vm_doctor; select an explicit live session. Attach
-to user-started runs without restarting them. vm_start makes new disk clones.
-Keep speaker playback off unless the user requests it.
+# Brook debug bridge
 
-Use vm_observe to get a full-resolution completed-frame image and frame_id.
-Media delivery defaults to local artifact references with absolute path, MIME,
-size and checksum. Inspect `previews.tiny` first for layout and `previews.medium` for more detail.
-Use vm_frame with the saved frame_id and native x/y/width/height crop for readable
-text without another capture. Optional overlay=true draws a ruler/grid labelled
-in native coordinates. Keep it off for detail checks. Crop coordinates always
-refer to the original display, including when starting from a preview. Saved
-views work after stop; reading them never makes an old capture current for input.
-Pass the viewed derivative frame_id into coordinate input for correct mapping. Set include_image:
-true on vm_observe, vm_audio_analyze or vm_artifacts only when a native MCP
-image preview is useful. Never serialize a preview-bearing MCP envelope into
-text: image transport contains base64 even though JSON metadata does not.
-vm_artifacts returns references for binary exports too, including after exit.
-The same adapter handles nested media and retains coordinate provenance.
-Normal capture requires the updated kernel and bridge (capture API 2); reload
-an older running MCP process after source updates. Captures lease a snapshot
-and briefly pause QEMU; do not loop this tool as a video recorder. Coordinate input
-must reference that frame. vm_input supports ordered key/mouse actions,
-US-ASCII text and bounded waits; holds last only within a batch. An injection
-acknowledgement does not prove the guest reacted: observe again or check logs.
-Respect takeover. Never substitute host mouse/keyboard/clipboard APIs.
+Use the connected `brook-vm` MCP server. Tools are normally named `mcp__brook_vm__vm_*` and `mcp__brook_vm__hw_*`; discover their current schemas before forming calls. Select the physical or virtual family explicitly. A session ID from one registry is not interchangeable with the other.
 
-Use vm_observe include=[frame,windows,processes,launches,errors] for a bundle, or
-omit frame to avoid its copy/PNG/QEMU-pause cost. It returns per-component states,
-intervals and boot-bound references. Snapshots are not atomic and frame/window
-correspondence is unverified; inspect stale/partial states and identity_error.
-Pass errors.next_cursor back as since_event_cursor for incremental diagnostics.
-Serial pattern scanning is best-effort, not a lossless event stream; check dropped
-bytes, rotation/reset, more and pending-line fields. Task snapshots are bounded
-and report truncation. Panic frame geometry may be from an earlier guest boot and
-is explicitly unverified; no ordinary guest metadata is available after panic.
+This skill covers operating the bridge. It does not start a test campaign or grant permission for a deployment, reboot, filesystem repair or unrelated guest work. During read-only handover onboarding, inspect local documentation, configuration and existing records; do not launch a VM, probe the Dell, or run acceptance tests just to establish that the skill works.
 
-Prefer vm_guest_run with argv, request_id (fresh 32-character lowercase hex),
-optional cwd/env and wait_s. It defaults to Brook UID 1000, cwd/home /data/home,
-and null stdin. Use real absolute executable paths. Retrieve longer operations
-with vm_job and its operation_id. Preserve stdout/stderr next_offset separately;
-check truncation, UTF-8 tails, read errors and EOF. Leader exit is distinct from
-descendant exit and output EOF. Reconnect preserves operation identity. After
-unknown delivery, inspect first; explicit identical resubmission can recover
-verified unfinished staging, while vm_job itself never launches or resumes.
-Changed arguments need a fresh request ID. Stop/reset invalidates active jobs;
-retrieve useful output before shutdown. A cancelled wait leaves the job running.
-These jobs do not exercise launcher UI or add automatic framebuffer windows.
+## Find the intended guest
 
-Use vm_apps for installed-app/shortcut discovery without taking a screenshot.
-Its app reference binds the published catalog generation, session and guest boot;
-app IDs are distinct from a window's desktop app_id. Availability is validated at
-catalog build, not freshly probed by each read. Use vm_launch with the exact app
-reference and fresh request_id to exercise normal launcher admission/worker and
-feedback. Wait for admitted, dispatched or window (default); a window proves
-presence, not readiness. Check raw dispatch result and correlation: app_id_presence
-can be an existing single-instance window and does not confirm activation. Recover
-through vm_ui with the original operation ID; never retry with a new ID after an
-uncertain reply. Real menu clicks remain necessary to test hitboxes; command jobs
-are a separate execution path.
+- **Physical machine:** `hw_sessions` lists existing opted-in attachments without network probing. Select the intended record. For an explicit current IPv4 endpoint, `hw_attach` pins the boot; `hw_doctor` checks identity and advertised capabilities. Reattach explicitly after a reboot or identity mismatch. Read [hardware.md](references/hardware.md) for diagnostics, transfers or power operations.
+- **QEMU:** `vm_sessions` lists currently attachable runs; follow pagination if needed. `vm_doctor` checks the selected transport and guest. Attach to an existing user run without restarting it. `vm_start` creates new experiment disk clones and is appropriate when the task calls for a new disposable run. Read [vm.md](references/vm.md) for observation, input, profiling, panic inspection or lifecycle operations.
 
-Prefer vm_windows and vm_window for semantic UI control. Pass the exact returned
-window reference, action and fresh request_id; restore also requires an explicit
-restore_target (previous, normal or maximized). Each action returns window state.
-Add include=[frame,windows,processes,errors] to vm_launch/vm_window/vm_ui when
-a post-wait bundle is useful. Its separate post_action_observation can fail without
-invalidating action evidence; it samples later and does not prove client readiness.
-Use vm_ui to recover an uncertain result; never repeat a mutation with a new ID
-just because its reply was lost. Check wait_condition_met, observation_error and
-current_window. Close dispatch is separate from disappearance and exact client
-origin-group exit; select wait_for closed or client_group_exit when needed.
-A Wayland provider is shared; connection-origin metadata is not permission to
-signal it. Unknown ownership stays unknown. Host generation, guest boot epoch
-and window incarnation must all match. Takeover cancels queued UI work but cannot
-recall already-dispatched events or terminate started applications. Queued launches
-shared with the user are preserved. Guest reboot invalidates launch history;
-stopped-session replies retain cached dispatch facts without a current window.
+Keep the returned session generation and guest boot identity with operation records. Fetch fresh app/window references after a boot change. An old frame, process ID, directory path or screenshot cannot establish current target identity.
 
-The legacy command form still uses Brook syntax, e.g. run --uid 1000 /nix/profile/bin/brook-run
-/nix/bin/brook-player --autoexit /data/videos/big-buck-bunny-720p.mov (one line).
-That form returns a PID, not process exit status or isolated stdout/stderr.
-vm_guest lists windows/processes. vm_stats reports RAM and recent compositor
-intervals, not GPU draw time or physical display refresh.
+## Choose the smallest useful operation
 
-vm_profile start captures CPU samples and context switches. Wait for status
-IDLE, then export the complete profile and Speedscope artifact. Use the run's
-saved kernel ELF. vm_audio_capture records bounded PCM with speaker output
-disabled; vm_audio_analyze returns a waveform. Silence alone is not proof of
-an underrun; sample-arrival and guest queue telemetry are not yet available.
+Use `*_apps` and `*_windows` for catalog/window discovery, `*_stats` for bounded metrics, and incremental `*_logs` for a specific diagnostic. Screenshots and full observation bundles are optional costs. Prefer semantic launch/window actions for ordinary application control; use structured guest jobs for command execution.
 
-After panic, use vm_logs, vm_debug and cached-frame vm_observe. Current vCPU
-registers differ from original fault registers in crash logs. Normal guest
-commands/input are unavailable after panic. Reset only when requested; it
-destroys crash state. Memory export is bounded and excludes MMIO; full dumps
-and the recalled kernel panic pipe are not implemented. Keep all game data,
-captures, dumps and profiles under ignored build directories.
+Read [jobs.md](references/jobs.md) before the first command job or when recovering uncertain job/UI delivery. Persist a fresh 32-character lowercase hexadecimal request ID before each new action. A timeout is an observation outcome: inspect the same operation with `*_job`, `*_ui`, lifecycle status or reset status. Do not create a new request ID to recover a lost reply.
 
-When loading a copied plugin package, set BROOK_ROOT to the Brook checkout;
-direct source registration infers it from server.py's location. This plugin
-does not install desktop automation backends.
+Request success, a visible window, process exit, drained descendants and checked device flush establish different facts. Verify the one needed for the current task. Poll within the supported wait budget and use returned cursors; avoid rapid duplicate polling or repeated full logs. Stop after the relevant result unless changed evidence requires another check.
 
-Use vm_record start/status/stop for continuous VM-only video/audio, not repeated
-vm_observe calls. Prepare build/vm-recording-runtime with recording-runtime.nix
-before launching the VM. Start is asynchronous: poll until completed or failed.
-Use BROOK_AUDIODEV=none to retain guest sound capture without speaker output.
-Keep masters and timelines under ignored build directories. Timing is observed
-at host transport arrival; upstream drops and exact source A/V timing are unknown.
+## Source and installation
 
-For reset, quiesce writers first. vm_control action=reset checked-syncs, sends one
-reset and polls a new boot identity; a QMP ACK alone is insufficient. Inspect
-reset_delivery, restart_verified, guest_ready, vm and reboot_policy_restored
-separately. Use vm_reset_status after timeout/pending/uncertain delivery; never
-repeat reset just to recover a reply. Historical verification survives later
-pause/exit. Missing old epoch yields running_unverified, not a verified change.
-Older/custom launches without a known restoration policy refuse reset. Force
-allows unsynced reset only when explicitly authorized for that disposable run.
+On Ian's current host, the registered stdio command is `python3 /data/Programming/Codex/Brook/tools/vm_bridge/server.py`, with `BROOK_ROOT=/data/Programming/Codex/Brook` and VM registry `build/vm-bridge`. The physical default registry is `build/hardware-bridge`. Resolve paths from the active checkout/configuration when working elsewhere.
 
+This skill adapts the existing repository skill at `tools/vm_bridge/skills/brook-vm/SKILL.md`. Current tool schemas, `server.py`, `hardware.py` and the implementation override stale capability claims in old notes. The maintained API guide is `tools/vm_bridge/README.md`; use its relevant section, not the whole historical test inventory. No bridge implementation or registration is bundled here.
 
-For physical hardware, use the separate hw_* tools. Start with hw_sessions or
-hw_attach for a user-supplied literal IP, then hw_doctor; do not scan the LAN.
-Check identity_matches and capabilities. hw_attach pins one boot; explicitly
-reattach after reboot, preserving old operation IDs as historical evidence.
-Use hw_stats and hw_logs (line cursors with retention-loss reporting), hw_apps,
-hw_windows, hw_window and hw_ui without screenshots. hw_guest_run/hw_job use
-the same durable request semantics as their VM counterparts; select a real
-working directory on minimal images. hw_command sends one boot-guarded kernel
-debug command and never retries uncertain delivery. Hardware sessions have no
-QMP, host-desktop input, raw frame transfer, registers, raw memory or panic
-transport. TCP loss can mean reboot, panic or link failure; do not label it a
-panic without evidence. Keep the optical scanner available for real hardware.
-
-For physical power control, inspect hw_doctor's separate graceful-quiescence,
-reset and power_off capabilities. Use hw_power with a new request_id and
-operation=shutdown or restart, then operation=status on that same ID. Resolve
-save dialogs before proceeding. Cancel is supported only before the service/
-write-barrier stage. Commit is allowed only once the request is ready and the
-chosen hardware transition is supported. A machine without automatic power-off
-can still quiesce and report "Safe to power off manually"; do not claim its power
-has been removed. Never replay an uncertain mutation to recover a reply: query
-the same request ID. A reset ends the pinned boot; attach explicitly again.
-
-Use hw_apps references with hw_launch to exercise the normal installed-app UI
-launcher. Wait conditions distinguish admission, dispatch and a visible window;
-none claims application readiness. Recover the same request through hw_ui.
+If MCP discovery is unavailable, inspect the existing registration first. The same implementation supports `python3 tools/vm_bridge/server.py --call TOOL --arguments 'JSON'` from the checkout. It has the same operation side effects and authorization boundaries as MCP. Do not re-register servers or change host configuration merely to inspect a guest.

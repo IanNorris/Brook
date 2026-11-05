@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brook Debug Bridge"
+  short_description: "Operate Brook VM and physical debug bridges"
+  default_prompt: "Use $brook-vm to inspect the selected Brook guest and recover existing operations safely."
