@@ -202,6 +202,11 @@ struct __attribute__((packed)) PanicStackDump {
     uint8_t  data[PANIC_STACK_DUMP_BYTES];  // raw memory from [RSP, RSP+length)
 };
 
+// The latest structured packet is published before serial/QR output. The
+// pointer is boot-lifetime static memory and valid until another panic packet
+// is built. It is not itself durable and conveys no disk-write authority.
+bool PanicCapturedPacket(const uint8_t** data, uint32_t* bytes);
+
 // Render a QR code containing CPU state + stack trace to the framebuffer.
 // Called from KernelPanic after capturing registers.
 // fbBase: physical address of framebuffer

@@ -19,6 +19,18 @@ extern "C" {
 
 namespace brook {
 
+static uint8_t g_capturedPacket[sizeof(PanicHeader) + 4096];
+static uint32_t g_capturedPacketBytes = 0;
+
+bool PanicCapturedPacket(const uint8_t** data, uint32_t* bytes)
+{
+    if (!data || !bytes) return false;
+    const uint32_t length = __atomic_load_n(&g_capturedPacketBytes, __ATOMIC_ACQUIRE);
+    *data = length ? g_capturedPacket : nullptr;
+    *bytes = length;
+    return length != 0;
+}
+
 // Maximum Base45 chars that fit in a single QR (Version 25, Low ECC, alphanumeric)
 // Version 25 = 117 modules → very scannable at 3px/module on a 1024x768 screen.
 // Alphanumeric capacity at Low ECC: 3057 chars.
@@ -250,6 +262,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicStackDump* stackDump,
                    const PanicCpuList* cpuList)
 {
+    __atomic_store_n(&g_capturedPacketBytes, 0, __ATOMIC_RELEASE);
     SerialPrintf("PANIC QR: %ux%u fb, preferred %u px/module\n",
                  fbWidth, fbHeight, QR_PIXELS_PER_MODULE);
 
@@ -299,16 +312,16 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Also dump hex to serial for host-side capture (works with crash_decoder.py --hex)
     // Use compressed data with v2 header
     {
-        static uint8_t serialBuf[sizeof(PanicHeader) + sizeof(payloadBuf)];
         PanicHeader hdr;
         hdr.magic     = QR_MAGIC_BYTE;
         hdr.version   = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
         hdr.page      = 0;
         hdr.pageCount = 1;
         hdr.pad       = QR_HEADER_PAD;
-        memcpy(serialBuf, &hdr, sizeof(hdr));
-        memcpy(serialBuf + sizeof(hdr), dataToEncode, dataLen);
-        DumpPacketToSerial(serialBuf, sizeof(hdr) + dataLen);
+        memcpy(g_capturedPacket, &hdr, sizeof(hdr));
+        memcpy(g_capturedPacket + sizeof(hdr), dataToEncode, dataLen);
+        __atomic_store_n(&g_capturedPacketBytes, sizeof(hdr) + dataLen, __ATOMIC_RELEASE);
+        DumpPacketToSerial(g_capturedPacket, sizeof(hdr) + dataLen);
     }
 
     // The serial crash record must also be available on headless systems or
