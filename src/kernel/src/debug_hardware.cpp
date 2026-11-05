@@ -31,6 +31,7 @@
 namespace brook {
 #if defined(BROOK_HOST_TEST)
 uint16_t PchWatchdogTestRead16(uint16_t port);
+uint32_t PchWatchdogTestRead32(uint16_t port);
 #endif
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -562,12 +563,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 #else
                     return inw(port);
 #endif
+                },[](uint16_t port){
+#if defined(BROOK_HOST_TEST)
+                    return PchWatchdogTestRead32(port);
+#else
+                    return inl(port);
+#endif
                 },status)) {
             DebugChannelSend("{\"pch_watchdog_error\":\"status admission failed\"}\n");return true;
         }
         Reply r;r.text("{\"pch_watchdog_status_api\":1,");r.field("pmbase",status.base);
         r.text(",");r.field("control",status.control);r.text(",");r.field("status2",status.status2);
-        r.text(",");r.field("timer",status.timer);r.text("}\n");r.send();return true;
+        r.text(",");r.field("timer",status.timer);r.text(",");r.field("smi_enable",status.smiEnable);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware pch-watchdog-pci")) {
         const uint32_t count=PciBootInventoryCount();

@@ -27,9 +27,11 @@ unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 bool audioProbePresent=false,hdaPciPresent=false;
 bool pchPresent=false;
 unsigned pchPortReads=0;
+unsigned pchSmiReads=0;
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
 uint16_t PchWatchdogTestRead16(uint16_t port){++pchPortReads;return port;}
+uint32_t PchWatchdogTestRead32(uint16_t port){++pchSmiReads;assert(port==0x1830);return 0x2001;}
 const AcpiPmTimerInfo& AcpiGetPmTimerInfo(){static const AcpiPmTimerInfo value{true,0x1808,false};return value;}
 bool recoveryPanicAvailable=false;
 uint8_t recoveryPanicBytes[]={0x00,0xab,0xff};
@@ -180,10 +182,10 @@ int main(){
     assert(reply.find("bdw_firmware_graphics")==std::string::npos);
     assert(reply.find("\"pch_watchdog_pci\":{\"raw_40\":6145,\"raw_44\":128}")!=std::string::npos);
     assert(handle("bridge hardware pch-watchdog-pci") && reply.find("pch_watchdog_error")!=std::string::npos);
-    assert(handle("bridge hardware pch-watchdog-status") && reply.find("pch_watchdog_error")!=std::string::npos && pchPortReads==0);
+    assert(handle("bridge hardware pch-watchdog-status") && reply.find("pch_watchdog_error")!=std::string::npos && pchPortReads==0 && pchSmiReads==0);
     pchPresent=true;
     assert(handle("bridge hardware pch-watchdog-pci") && reply.find("\"live_raw_40\":6145,\"live_raw_44\":128,\"changed\":false")!=std::string::npos);
-    assert(handle("bridge hardware pch-watchdog-status") && reply.find("\"pmbase\":6144,\"control\":6248,\"status2\":6246,\"timer\":6258")!=std::string::npos && pchPortReads==3);
+    assert(handle("bridge hardware pch-watchdog-status") && reply.find("\"pmbase\":6144,\"control\":6248,\"status2\":6246,\"timer\":6258,\"smi_enable\":8193")!=std::string::npos && pchPortReads==3 && pchSmiReads==2);
     pchPresent=false;
     assert(handle("bridge hardware pci 2 16") && reply.find("\"devices\":[]")!=std::string::npos);
     for(const auto* bad:{"0 0","0 17","3 1","4294967296 1","0 1 more","0 -1"}){
