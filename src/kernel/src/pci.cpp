@@ -194,6 +194,8 @@ void PciScanPrint()
                                 [=](uint8_t offset) { return PciConfigRead16(bus, dev, fn, offset); },
                                 [=](uint8_t offset) { return PciConfigRead32(bus, dev, fn, offset); },
                                 [=](uint8_t offset) { return PciConfigRead8(bus, dev, fn, offset); });
+                            entry.pchWatchdog = PchWatchdogCapture(bus,dev,fn,entry.device.vendorId,entry.device.deviceId,
+                                [=](uint8_t offset) { return PciConfigRead32(bus,dev,fn,offset); });
                         }
                     }
                 }

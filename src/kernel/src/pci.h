@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "intel_bdw_inventory.h"
+#include "intel_pch_watchdog_inventory.h"
 
 // Minimal PCI configuration space access via port I/O (x86 CF8/CFC mechanism).
 // Supports legacy PCI (type 1) bus/device/function enumeration.
@@ -74,6 +75,7 @@ struct PciBootEntry {
     uint16_t subsystemVendor, subsystemDevice;
     uint8_t revision, headerType;
     BdwFirmwareGraphics bdwGraphics;
+    PchWatchdogInventory pchWatchdog;
 };
 uint32_t PciBootInventoryCount();
 uint32_t PciBootInventorySeen();
