@@ -154,7 +154,26 @@ int main(int argc,char** argv){
     assert(!FatObjectCreate(held,"NEW RETAINED.TXT",VFS_O_WRITE,0600,&error) && error==-17);
     assert(!FatObjectChild(held,"new retained.txt",&after));VnodeStat madeStat{};
     assert(!FatObjectStat(after,&madeStat) && madeStat.size==2);VfsObjectRelease(after);after=nullptr;
-    assert(!FatFsUnlink(mount,0,"/parent/moved/new retained.txt"));
+    // Model the VFS mutation's owned target reference, then an extra pin.
+    assert(!FatObjectChild(held,"new retained.txt",&after));
+    VfsObjectRetain(after);
+    assert(FatObjectRemove(held,"new retained.txt",false)==-16);
+    VfsObjectRelease(after);
+    assert(FatObjectRemove(held,"new retained.txt",true)==-20);
+    assert(!FatObjectRemove(held,"new retained.txt",false));
+    VfsObjectRelease(after);after=nullptr;
+    assert(FatObjectChild(held,"new retained.txt",&after)==-2);
+    assert(!FatObjectMkdir(held,"remove-dir",0755));
+    assert(!FatObjectChild(held,"remove-dir",&after));
+    Vnode* nested=FatObjectCreate(after,"child",VFS_O_WRITE,0600,&error);
+    assert(nested && !error);closeNode(nested);VfsObjectRelease(after);after=nullptr;
+    assert(!FatObjectChild(held,"remove-dir",&after));
+    assert(FatObjectRemove(held,"remove-dir",true)==-39);
+    VfsObject* nestedObject=nullptr;assert(!FatObjectChild(after,"child",&nestedObject));
+    assert(!FatObjectRemove(after,"child",false));VfsObjectRelease(nestedObject);
+    VfsObjectRelease(after);after=nullptr;
+    assert(!FatObjectChild(held,"remove-dir",&after));
+    assert(!FatObjectRemove(held,"remove-dir",true));VfsObjectRelease(after);after=nullptr;
     Vnode* readCreator=FatObjectCreate(held,"readonly-create",VFS_O_READ,0600,&error);
     assert(readCreator && !error);VfsObject* createdObject=readCreator->backendObject;
     Vnode* writer=FatObjectOpen(createdObject,VFS_O_WRITE|VFS_O_READWRITE,&error);assert(writer && !error);

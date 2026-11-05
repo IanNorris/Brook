@@ -1494,6 +1494,41 @@ static int FatObjectMkdir(VfsObject* parent,const char* name,uint16_t)
             if(error==-FVFS_EIO)PoisonFatDriveLocked(dir->mount->pdrv,error);}}
     KMutexUnlock(&g_fatLock);return error;
 }
+// VfsRemoveAt holds exactly one reference to the target while it calls us.
+// Any other retained reference or FIL must keep the FAT directory slot alive.
+static bool FatMutationBusyLocked(FatFsMountData* mount,uint64_t identity)
+{
+    for(auto* object=mount->objects;object;object=object->next) {
+        if(object->object.identity!=identity)continue;
+        if(__atomic_load_n(&object->object.references,__ATOMIC_ACQUIRE)!=1)return true;
+    }
+    for(auto* file=mount->allFiles;file;file=file->allNext) {
+        VnodeStat stat{};
+        if(!FatFileIdentity(&file->fil,&stat) || stat.ino==identity)return true;
+    }
+    return false;
+}
+static int FatObjectRemove(VfsObject* parent,const char* name,bool directory)
+{
+    auto* dir=static_cast<FatPathObject*>(parent->priv);
+    if(!dir->directory)return -20;
+    if(dir->mount->intrinsicReadOnly)return -30;
+    KMutexLock(&g_fatLock);
+    int error=FatFlushWritersLocked(dir->mount);
+    FF_OBJECT child{};
+    if(!error) {
+        FRESULT result=f_object_lookup(&dir->location,name,&child);
+        if(result!=FR_OK)error=FrToErrno(result);
+        else if(bool(child.object.attr&AM_DIR)!=directory)error=directory?-20:-21;
+        else if(FatMutationBusyLocked(dir->mount,FatObjectIdentity(child)))error=-16;
+        else {
+            result=f_object_unlink(&dir->location,name);
+            if(result!=FR_OK)error=result==FR_DENIED && directory && !(child.object.attr&AM_RDO)?-39:FrToErrno(result);
+        }
+        if(error==-FVFS_EIO)PoisonFatDriveLocked(dir->mount->pdrv,error);
+    }
+    KMutexUnlock(&g_fatLock);return error;
+}
 // Current-name reporting by cluster identity. The namespace transaction
 // excludes rename; the FAT mutex protects parent scans and the LFN workspace.
 // This string is never used to reopen or mutate a retained directory.
@@ -1584,7 +1619,7 @@ static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
 }
 static const VfsObjectOps g_fatObjectOps={
     .destroy=FatObjectDestroy,.stat=FatObjectStat,.access=FatObjectAccess,
-    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,.mkdir=FatObjectMkdir,
+    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,.mkdir=FatObjectMkdir,.remove=FatObjectRemove,
     .directory_path=FatObjectDirectoryPath,.object_path=FatObjectPath,.entry_parent=FatObjectEntryParent,
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}

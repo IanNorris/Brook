@@ -287,6 +287,44 @@ FRESULT f_object_mkdir (const FF_OBJECT* parent, const TCHAR* name)
     FREE_NAMEBUFF();return res;
 }
 
+/* Remove by retained parent, never by a reconstructed absolute path. The VFS
+ * owns alias and type checks; FatFs still validates the entry and emptiness. */
+FRESULT f_object_unlink (const FF_OBJECT* parent, const TCHAR* name)
+{
+    FATFS* fs; FRESULT res; DIR directory, child; DWORD cluster;
+    const TCHAR* cursor=name; unsigned length=0;
+    DEF_NAMEBUFF
+    if(!name || !name[0])return FR_INVALID_NAME;
+    for(;name[length];++length)
+        if(IsSeparator(name[length]) || name[length]==':' || (unsigned)name[length]<0x20 || length>=255)return FR_INVALID_NAME;
+    if((name[0]=='.'&&!name[1]) || (name[0]=='.'&&name[1]=='.'&&!name[2]))return FR_INVALID_NAME;
+    res=object_validate(parent,&fs);if(res!=FR_OK)return res;
+    if(!(parent->object.attr&AM_DIR))return FR_NO_PATH;
+    if(fs->fs_type!=FS_FAT12 && fs->fs_type!=FS_FAT16 && fs->fs_type!=FS_FAT32)return FR_DENIED;
+    memset(&directory,0,sizeof directory);directory.obj.fs=fs;directory.obj.sclust=parent->object.sclust;
+    INIT_NAMEBUFF(fs);
+    res=create_name(&directory,&cursor);
+    if(res==FR_OK && !(directory.fn[NSFLAG]&NS_LAST))res=FR_INVALID_NAME;
+    if(res==FR_OK)res=dir_find(&directory);
+    if(res==FR_OK && (directory.obj.attr&AM_RDO))res=FR_DENIED;
+    if(res==FR_OK) {
+        cluster=ld_clust(fs,directory.dir);
+        if(directory.obj.attr&AM_DIR) {
+            memset(&child,0,sizeof child);child.obj.fs=fs;child.obj.sclust=cluster;
+            res=dir_sdi(&child,0);
+            if(res==FR_OK) {
+                res=DIR_READ_FILE(&child);
+                if(res==FR_OK)res=FR_DENIED;
+                else if(res==FR_NO_FILE)res=FR_OK;
+            }
+        }
+        if(res==FR_OK)res=dir_remove(&directory);
+        if(res==FR_OK && cluster)res=remove_chain(&directory.obj,cluster,0);
+        if(res==FR_OK)res=sync_fs(fs);
+    }
+    FREE_NAMEBUFF();return res;
+}
+
 FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
 {
 #if FF_USE_FASTSEEK

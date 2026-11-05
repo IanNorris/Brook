@@ -213,7 +213,19 @@ void Worker(void* arg) {
                 if(!publishResult) {
                     const int unlinkResult=VfsRemoveAt(root,root,"/media/system/PANIC.BIN",false);
                     KPrintf("GUARD_JOURNAL_PUBLISH_UNLINK status=%d\n",unlinkResult);
-                    if(unlinkResult!=-16 && unlinkResult!=-95)publishResult=-16;
+                    if(unlinkResult!=-16)publishResult=-16;
+                }
+                if(!publishResult) {
+                    int openError=0;
+                    auto* temporary=VfsOpenAt(root,root,"/media/system/PINDEL.TXT",VFS_O_WRITE|VFS_O_CREATE,0644,0,&openError);
+                    if(!temporary)publishResult=-5;
+                    else {
+                        const int whileOpen=VfsRemoveAt(root,root,"/media/system/PINDEL.TXT",false);
+                        VfsClose(temporary);
+                        const int afterClose=VfsRemoveAt(root,root,"/media/system/PINDEL.TXT",false);
+                        KPrintf("GUARD_JOURNAL_PUBLISH_REMOVE open=%d closed=%d\n",whileOpen,afterClose);
+                        if(whileOpen!=-16 || afterClose)publishResult=-5;
+                    }
                 }
                 if(!publishResult) {
                     const int renameResult=VfsRenameAt(root,root,"/media/system/PANIC.BIN",root,"/media/system/PANIC2.BIN");

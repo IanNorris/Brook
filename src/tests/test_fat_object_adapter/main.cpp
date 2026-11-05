@@ -93,6 +93,12 @@ int main(int argc,char** argv){
     assert(f_object_mkdir(&file,"child")==FR_NO_PATH);
     FF_OBJECT made{};assert(f_object_lookup(&held,"New retained directory",&made)==FR_OK);
     assert(f_object_parent(&made,&after)==FR_OK && after.object.sclust==held.object.sclust);
+    assert(f_object_unlink(&held,"FRESH retained CHILD.TXT")==FR_OK);
+    assert(f_stat("0:/parent/moved/Fresh retained child.txt",nullptr)==FR_NO_FILE);
+    assert(f_object_unlink(&root,"parent")==FR_DENIED); // nonempty directory
+    assert(f_object_unlink(&held,"New retained directory")==FR_OK);
+    assert(f_object_unlink(&held,"bad/name")==FR_INVALID_NAME);
+    assert(f_object_unlink(&file,"child")==FR_NO_PATH);
     assert(f_object_lookup(&file,"child",&after)==FR_NO_PATH && !after.object.fs);
     for(const char* invalid: {".","..","child/name","child\\name","0:name","name\nrest"})assert(f_object_lookup(&held,invalid,&after)==FR_INVALID_NAME && !after.object.fs);
     FF_OBJECT stale=file;--stale.object.id;
