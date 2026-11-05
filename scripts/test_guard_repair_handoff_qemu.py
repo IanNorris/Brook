@@ -67,6 +67,7 @@ def main():
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
     parser.add_argument('--auto-desktop-shutdown',action='store_true',help='Perform checked shutdown through the desktop bridge')
     parser.add_argument('--auto-desktop-dell-initrd',action='store_true',help='Exercise the Dell initrd and startup script using synthetic QEMU services')
+    parser.add_argument('--auto-desktop-real-provider',type=Path,help='Use this extracted Dell Wayland provider with its pinned local runtime')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -102,6 +103,8 @@ def main():
         parser.error('checked shutdown requires a successful desktop bridge fixture')
     if a.auto_desktop_dell_initrd and (not a.auto_desktop or a.auto_desktop_panic or a.auto_desktop_network_module or a.inject_panic):
         parser.error('Dell initrd fixture requires a non-panic auto desktop')
+    if a.auto_desktop_real_provider and not a.auto_desktop_dell_initrd:
+        parser.error('real provider requires the Dell initrd fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -170,8 +173,31 @@ def main():
         if a.auto_desktop_dell_initrd:
             for name in ('waylandd','hardware-dbus','hardware-message'):
                 target='/profile/bin/'+name
-                subprocess.run(['debugfs','-w','-R',f'write {service} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                binary=a.auto_desktop_real_provider.resolve(strict=True) if name=='waylandd' and a.auto_desktop_real_provider else service
+                subprocess.run(['debugfs','-w','-R',f'write {binary} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 subprocess.run(['debugfs','-w','-R',f'set_inode_field {target} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            if a.auto_desktop_real_provider:
+                provider=a.auto_desktop_real_provider.resolve(strict=True)
+                description=subprocess.check_output(['readelf','-l','-d',str(provider)],text=True)
+                if ('/nix/store/fjkx1l5cnskzrqacf08z7i8z17256w0j-glibc-2.42-61/lib/ld-linux-x86-64.so.2' not in description or
+                    '/nix/store/ysbyz6zabjcg078ssp4l58mhgbr57pbz-wayland-1.24.0/lib' not in description or
+                    'libwayland-server.so.0' not in description):
+                    raise RuntimeError('provider does not match the pinned fixture runtime')
+                libraries={
+                    'fjkx1l5cnskzrqacf08z7i8z17256w0j-glibc-2.42-61':('ld-linux-x86-64.so.2','libc.so.6'),
+                    'ysbyz6zabjcg078ssp4l58mhgbr57pbz-wayland-1.24.0':('libwayland-server.so.0',),
+                    'hyai3q7gvdfppw4ky7s2mvhxvfyp5bh7-libffi-3.5.2':('libffi.so.8',)}
+                evidence={'provider_sha256':hashlib.sha256(provider.read_bytes()).hexdigest(),'libraries':{}}
+                for package,filenames in libraries.items():
+                    for directory in ('/store/'+package,'/store/'+package+'/lib'):
+                        subprocess.run(['debugfs','-w','-R',f'mkdir {directory}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    for name in filenames:
+                        source=(Path('/nix/store')/package/'lib'/name).resolve(strict=True)
+                        target='/store/'+package+'/lib/'+name
+                        subprocess.run(['debugfs','-w','-R',f'write {source} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        subprocess.run(['debugfs','-w','-R',f'set_inode_field {target} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        evidence['libraries'][target]=hashlib.sha256(source.read_bytes()).hexdigest()
+                (a.output/'provider-runtime.json').write_text(json.dumps(evidence,indent=2)+'\n')
         with disk.open('r+b') as dst,partition.open('rb') as src:
             dst.seek(133120*512);shutil.copyfileobj(src,dst);dst.seek(133120*512+1024+58);dst.write(b'\0\0')
         guard=bytearray(128);guard[:8]=b'BRKRCV01';struct.pack_into('<QI',guard,8,1,1)
@@ -474,6 +500,8 @@ def main():
                                '/nix/profile/bin/hardware-message','/boot/HWSTATUS.ELF'):
                 if 'ELF HASH: '+executable+' ' not in serial:
                     raise RuntimeError('Dell startup did not launch '+executable)
+            if a.auto_desktop_real_provider and '[waylandd] listening on WAYLAND_DISPLAY=' not in serial:
+                raise RuntimeError('real Wayland provider did not report listening')
         if ((not a.auto_desktop_panic and 'GUARD_DESKTOP_SERVICE_PASS' not in serial) or (not a.auto_desktop and 'brook-ssd-recovery-automatic-v1' in serial) or
             'Recovery required; normal boot blocked.' in serial):
             raise RuntimeError('guarded desktop service did not start after repair')
