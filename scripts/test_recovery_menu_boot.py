@@ -18,7 +18,7 @@ from pathlib import Path
 
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
-         network_port=None,on_marker=None):
+         network_port=None,on_marker=None,network_usb=False):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -46,8 +46,10 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot',
     ]
     if network_port is not None:
-        command += ['-netdev',f'user,id=recovery-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234',
-                    '-device','virtio-net-pci,netdev=recovery-net']
+        command += ['-netdev',f'user,id=recovery-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234']
+        command += (['-device','qemu-xhci,id=recovery-xhci',
+                     '-device','usb-net,bus=recovery-xhci.0,port=2,netdev=recovery-net'] if network_usb else
+                    ['-device','virtio-net-pci,netdev=recovery-net'])
     for item in extra_fw_cfg or ():
         command += ['-fw_cfg',item]
     with (work / 'qemu.log').open('wb') as errors:

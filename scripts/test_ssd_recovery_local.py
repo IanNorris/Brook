@@ -110,6 +110,8 @@ def main():
                    help='Force PIT failure in the disposable debugger and test the ACPI timer')
     p.add_argument('--guard-panic-network', action='store_true',
                    help='Retrieve the previous panic via the restricted recovery debug listener')
+    p.add_argument('--guard-network-usb', action='store_true',
+                   help='Use emulated xHCI/USB Ethernet for the recovery listener')
     p.add_argument('--guard-auto-unsupported', action='store_true',
                    help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
@@ -145,6 +147,8 @@ def main():
         p.error('PM fallback requires the post-pending panic fixture')
     if a.guard_panic_network and not a.guard_panic_after_pending:
         p.error('network retrieval requires the post-pending panic fixture')
+    if a.guard_network_usb and not a.guard_panic_network:
+        p.error('USB network requires the recovery network test')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
         p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
@@ -755,7 +759,7 @@ def main():
                         raise RuntimeError('recovery bridge capabilities are inconsistent')
                 on_marker=retrieve_snapshot
             boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,reboot_marker,
-                              90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=on_marker)
+                              90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=on_marker,network_usb=a.guard_network_usb)
             reboot_text=(reboot/'serial.log').read_text(errors='replace')
             raw_packet=bytes.fromhex(packet)
             prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(raw_packet)} crc={zlib.crc32(raw_packet):x}'

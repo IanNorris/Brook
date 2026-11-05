@@ -46,6 +46,11 @@ int main(){
     Firmware::put32(f.fadt+112,(1u<<10)|(1u<<8));f.fadt[208]=1;f.fadt[209]=32;f.fadt[211]=3;
     Firmware::put64(f.fadt+212,0x508);f.fadtCrc();assert(f.init());
     assert(AcpiGetPmTimerInfo().available && AcpiGetPmTimerInfo().port==0x508 && AcpiGetPmTimerInfo().wide);
+    // Same System-I/O GAS layout as the previously captured Dell FADT.
+    Firmware::put32(f.fadt+76,0x1808);Firmware::put32(f.fadt+112,0x386a5);
+    Firmware::put64(f.fadt+212,0x1808);f.fadtCrc();assert(f.init());
+    assert(AcpiGetPmTimerInfo().available && AcpiGetPmTimerInfo().port==0x1808 && !AcpiGetPmTimerInfo().wide);
+    Firmware::put32(f.fadt+76,0x408);
     f.fadt[208]=0;f.fadtCrc();assert(f.init() && AcpiGetPmTimerInfo().port==0x408);
     f.fadt[91]=3;f.fadtCrc();assert(f.init() && !AcpiGetPmTimerInfo().available);
     f.reset();assert(f.init());
