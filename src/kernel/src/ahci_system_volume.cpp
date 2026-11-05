@@ -354,6 +354,11 @@ bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory) {
         VfsVnodeIsPublishedRoot(retainedDirectory,systemVolumePublication,systemVolumeDrive);
 }
 
+bool AhciSystemVolumeOwnsMember(Vnode* retainedDirectory) {
+    return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==&partition &&
+        VfsVnodeIsPublishedMember(retainedDirectory,systemVolumePublication,systemVolumeDrive);
+}
+
 void AhciSystemDataInspect() {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     largeInspection={};largeInspectionClean=false;

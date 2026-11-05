@@ -7270,11 +7270,12 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdEntry* fde = ref.get();
     if (!fde || fde->type==FdType::Path) return -EBADF;
 
-    if(cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT) {
+    if(cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT || cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER) {
         if(fde->type!=FdType::Vnode || !fde->handle)return -25; // ENOTTY
         auto* node=static_cast<Vnode*>(fde->handle);
         if(node->type!=VnodeType::Dir)return -25; // ENOTTY
-        return AhciSystemVolumeOwnsRoot(node)?0:-ENODEV;
+        return (cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT ? AhciSystemVolumeOwnsRoot(node) :
+                AhciSystemVolumeOwnsMember(node))?0:-ENODEV;
     }
 
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)

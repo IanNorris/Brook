@@ -103,6 +103,7 @@ struct Vnode {
 int VfsDirectoryPath(Vnode* vn, char* out, uint32_t capacity);
 // Check the retained vnode is the root of this still-published initial mount.
 bool VfsVnodeIsPublishedRoot(Vnode* vn,uint64_t publication,uint8_t pdrv);
+bool VfsVnodeIsPublishedMember(Vnode* vn,uint64_t publication,uint8_t pdrv);
 extern "C" bool VfsMountReadOnly(const Vnode* vn);
 
 // Retention is not safe acquisition from an unprotected raw pointer.
