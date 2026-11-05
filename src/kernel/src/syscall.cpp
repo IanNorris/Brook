@@ -5,6 +5,8 @@
 #include "guard_repair_session.h"
 #endif
 #include "device.h"
+#include "ahci_system_volume.h"
+#include "../../shared/brook_system_esp.h"
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
 #include "strict_gpt_inventory.h"
 #endif
@@ -7267,6 +7269,13 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
     if (!fde || fde->type==FdType::Path) return -EBADF;
+
+    if(cmd==BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT) {
+        if(fde->type!=FdType::Vnode || !fde->handle)return -25; // ENOTTY
+        auto* node=static_cast<Vnode*>(fde->handle);
+        if(node->type!=VnodeType::Dir)return -25; // ENOTTY
+        return AhciSystemVolumeOwnsRoot(node)?0:-ENODEV;
+    }
 
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {

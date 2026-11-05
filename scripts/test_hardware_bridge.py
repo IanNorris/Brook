@@ -88,6 +88,12 @@ try:
  attached=rpc.tool('hw_attach',{'host':'127.0.0.1','port':port});session=attached['session']
  doctor=rpc.tool('hw_doctor',{'session':session});assert doctor['reachable'] and doctor['identity_matches'] and not doctor['capabilities']['qmp']
  stats=rpc.tool('hw_stats',{'session':session});assert stats['process_count']>0
+ negative=uuid.uuid4().hex
+ job=rpc.tool('hw_guest_run',{'session':session,'request_id':negative,'argv':['/boot/HWTEST.ELF','esp-negative'],'cwd':'/','wait_s':5})
+ deadline=time.monotonic()+15
+ while job.get('state') not in {'completed','failed'} and time.monotonic()<deadline:
+  job=rpc.tool('hw_job',{'session':session,'operation_id':negative,'wait_s':2})
+ assert job.get('exit',{}).get('code')==0 and 'ESP_IOCTL_NEGATIVE_PASS' in job['stdout']['text'],job
  logs=rpc.tool('hw_logs',{'session':session,'limit':64});assert logs['logs_api']==1 and isinstance(logs['lines'],list)
  cursor=logs['next_cursor'];more=rpc.tool('hw_logs',{'session':session,'cursor':cursor,'limit':64});assert more['next_cursor']>=cursor
  bad=rpc.tool('hw_logs',{'session':session,'cursor':0xffffffff},error=True);assert 'cursor' in bad.lower()

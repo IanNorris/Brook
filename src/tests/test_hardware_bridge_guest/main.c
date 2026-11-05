@@ -9,6 +9,9 @@
 #include <sys/wait.h>
 #include <pthread.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include "../../shared/brook_system_esp.h"
 static void* budget_thread(void* argument){
     int fd=*(int*)argument;char byte;return (void*)(uintptr_t)(read(fd,&byte,1)==1?0:1);
 }
@@ -17,6 +20,17 @@ int main(int argc,char** argv){
         char byte;int fd=atoi(argv[2]);return read(fd,&byte,1)==1?0:90;
     }
     if(argc!=2 || getuid()!=1000)return 99;
+    if(!strcmp(argv[1],"esp-negative")){
+        int root=open("/",O_RDONLY|O_DIRECTORY),file=open("/boot/INIT.RC",O_RDONLY);
+        if(root<0 || file<0)return 60;
+        errno=0;if(ioctl(root,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)!=-1 || errno!=ENODEV)return 61;
+        errno=0;if(ioctl(file,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)!=-1 || errno!=ENOTTY)return 62;
+        errno=0;if(ioctl(-1,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)!=-1 || errno!=EBADF)return 63;
+        int path=open("/",O_PATH|O_DIRECTORY);if(path<0)return 64;
+        errno=0;if(ioctl(path,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)!=-1 || errno!=EBADF)return 65;
+        close(path);
+        close(root);close(file);puts("ESP_IOCTL_NEGATIVE_PASS");return 0;
+    }
     if(!strcmp(argv[1],"budget")){
         int release[3];pid_t children[3];
         for(int i=0;i<3;i++){
