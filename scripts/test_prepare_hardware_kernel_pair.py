@@ -93,6 +93,17 @@ class PreparePair(unittest.TestCase):
                 pair.prepare(self.image,self.build,64,'test',self.root/'bad',pair.digest(b'kernel'),exporter)
         self.assertFalse((self.root/'bad').exists())
 
+    def test_optional_fat_checker_requires_pin_and_is_read_back(self):
+        checker=self.root/'fat-checker';checker.write_bytes(elf())
+        with patch.object(pair,'module_version',return_value=64), patch.object(pair,'FAT_CHECKER_SHA256',pair.digest(checker.read_bytes())):
+            result=pair.prepare(self.image,self.build,64,'test',self.root/'with-fat',pair.digest(b'kernel'),fat_checker=checker)
+        self.assertEqual(result['fat_checker']['sha256'],pair.digest(checker.read_bytes()))
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(self.root/'with-fat/INITRD.IMG'),'::/BOOT/FATFSCK.ELF']),checker.read_bytes())
+        with patch.object(pair,'module_version',return_value=64):
+            with self.assertRaisesRegex(ValueError,'does not match'):
+                pair.prepare(self.image,self.build,64,'test',self.root/'wrong-fat',pair.digest(b'kernel'),fat_checker=checker)
+        self.assertFalse((self.root/'wrong-fat').exists())
+
     @unittest.skipUnless(shutil.which('cc'), 'requires a C compiler')
     def test_real_elf_module_metadata(self):
         source = self.root / 'module.c'

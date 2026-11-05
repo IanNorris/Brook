@@ -26,6 +26,7 @@ from hardware_recovery_fsck import validate_checker
 MAGIC = 0x4B524F42
 KERNEL_MAX = 8 * 1024 * 1024
 INITRD_MAX = 64 * 1024 * 1024
+FAT_CHECKER_SHA256 = '99cc8160e7a076ecd9cb04e13bdbe71c4aad4c64bfdc43ea83a016c8fee9d5e3'
 
 
 def regular(path, maximum):
@@ -54,7 +55,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, panic_exporter=None):
+def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, panic_exporter=None, fat_checker=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,95}', payload_id):
         raise ValueError('invalid payload ID')
     kernel = regular(build / 'BROOK.elf', KERNEL_MAX)
@@ -96,6 +97,15 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
             copied = subprocess.check_output(['mtype', '-i', str(image), '::/BOOT/PANICLOG.ELF'])
             if len(copied) != export_info['bytes'] or digest(copied) != export_info['sha256']:
                 raise RuntimeError('panic exporter readback mismatch')
+        fat_info = None
+        if fat_checker is not None:
+            fat_info = validate_checker(fat_checker)
+            if fat_info['sha256'] != FAT_CHECKER_SHA256:
+                raise ValueError('FAT checker does not match the recovery kernel pin')
+            subprocess.run(['mcopy', '-o', '-i', str(image), str(fat_checker), '::/BOOT/FATFSCK.ELF'], check=True)
+            copied = subprocess.check_output(['mtype', '-i', str(image), '::/BOOT/FATFSCK.ELF'])
+            if len(copied) != fat_info['bytes'] or digest(copied) != fat_info['sha256']:
+                raise RuntimeError('FAT checker readback mismatch')
         for name, _, expected in inventory:
             data = subprocess.check_output(['mtype', '-i', str(image), '::/DRIVERS/' + name])
             if digest(data) != expected:
@@ -108,6 +118,7 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
                   'kernel_sha256': digest(kernel), 'initrd_sha256': digest(image.read_bytes()),
                   'modules': {name: sha for name, _, sha in inventory}}
         if export_info is not None: result['panic_journal_exporter'] = export_info
+        if fat_info is not None: result['fat_checker'] = fat_info
         (output / 'manifest.json').write_text(json.dumps(result, indent=2) + '\n')
         return result
     except BaseException:
@@ -124,9 +135,10 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--expected-kernel-sha256', required=True)
     p.add_argument('--panic-exporter', type=Path, help='Embed the static panic journal export utility')
+    p.add_argument('--fat-checker', type=Path, help='Embed the pinned static recovery FAT checker')
     a = p.parse_args()
     print(json.dumps(prepare(a.source_initrd, a.build, a.abi, a.payload_id, a.output,
-                             a.expected_kernel_sha256, a.panic_exporter), indent=2))
+                             a.expected_kernel_sha256, a.panic_exporter, a.fat_checker), indent=2))
 
 
 if __name__ == '__main__':
