@@ -565,6 +565,15 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         // back to the 2D framebuffer. No-op for direct-mapped linear FBs.
         brook::DisplayPanicPresent();
     }
+    else
+    {
+        // The structured serial record is useful even when no display exists.
+        // CPU state is captured after the NMI halt, just as for the visual QR.
+        static brook::PanicCpuList cpuList;
+        brook::PanicCaptureCpuList(&cpuList);
+        brook::PanicRenderQR(nullptr, 0, 0, 0, &fullRegs, &trace,
+                             nullptr, nullptr, nullptr, nullptr, &cpuList);
+    }
 
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)
     for (;;) { __asm__ volatile("pause"); }

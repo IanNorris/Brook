@@ -6,16 +6,21 @@ The original Brook goal was paused at 01:19:47 UTC on 5 November 2026, and its l
 
 ## Current goal update, 5 November 2026
 
+Ian authorized unattended work on the Dell tonight: prioritize reliable recovery after failures and collecting failure evidence, then implement physical Intel HD accelerated 3D and prove it using existing yquake2 GL and Vulkan tests. If the Dell is offline and blocks further useful work, pause for Ian to reboot it. The former chat remains paused.
+
 Ian expanded the recovery goal: make the recovery tooling available in the normal boot, automate recovery wherever feasible, enlarge boot text without undue complexity, and add timed hang/panic recovery. Capture panic details through the bridge where feasible and in a preallocated disk area that does not require filesystem metadata changes at failure time. Keep the separate recovery and USB paths as fallbacks. This request supersedes the earlier opt-in-only watchdog direction as a product goal; its safe arming, inhibition and loop prevention still need a design appropriate to automatic operation. A fully wedged kernel cannot be guaranteed to run a software handler.
 
 Physical results: Ian created a persistent firmware entry for BROOKF5.EFI and selected F5. Recovery boot `cb5b56e1a4e04858bd7c280c8af2d045` advertised build b4210c41 with the writable desktop disabled; its automatic read-only SSD check completed cleanly. Both diagnostic shortcuts appeared in the launcher catalog. Remote NETCHECK completed with exit 0 and a framed local bridge reply. Ian reported keyboard and touchpad unresponsive on this recovery boot, so local launcher interaction remains unverified. Earlier both inputs worked again after checked shutdown and a full power pull. The pre-F5 normal boot had reached the desktop; independent original-default and USB fallback checks remain to be assessed.
+
+Current implementation progress: KernelPanic now emits the structured serial panic packet without a framebuffer, and the serial staging buffer accommodates its header. Host regression decodes the headless packet and kernel objects compile. This is not deployed or boot-tested, does not cover the separate exception path, and does not implement disk capture, panic network transport or reboot.
 
 Current todo:
 1. Investigate input failures across warm restart and recovery; restore reliable local interaction.
 2. Integrate normal-boot diagnostics with ownership-aware filesystem checks and verify remotely and locally.
 3. Implement automatic, identity-bound repair/recovery with bounded retries and preserved fallback paths; existing guarded repair machinery is experimental, not production-ready.
 4. Design and implement timed hang and panic recovery, panic transport and preallocated durable crash records, with bounded failure handling and update/repair inhibition.
-5. Improve boot text readability and validate the complete behavior on disposable media and then the Dell. Record limits and stop once the expanded goal is verified.
+5. Improve boot text readability and validate recovery behavior on disposable media and then the Dell.
+6. Implement physical Intel HD 3D acceleration and validate with existing yquake2 GL and Vulkan tests; distinguish real hardware execution from VM and simulation evidence. Record limits and stop once the full goal is verified.
 
 ## Project and working relationship
 

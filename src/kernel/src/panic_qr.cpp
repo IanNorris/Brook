@@ -299,7 +299,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Also dump hex to serial for host-side capture (works with crash_decoder.py --hex)
     // Use compressed data with v2 header
     {
-        static uint8_t serialBuf[4096];
+        static uint8_t serialBuf[sizeof(PanicHeader) + sizeof(payloadBuf)];
         PanicHeader hdr;
         hdr.magic     = QR_MAGIC_BYTE;
         hdr.version   = (dataToEncode == compressedBuf) ? QR_VERSION : QR_VERSION_RAW;
@@ -310,6 +310,11 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         memcpy(serialBuf + sizeof(hdr), dataToEncode, dataLen);
         DumpPacketToSerial(serialBuf, sizeof(hdr) + dataLen);
     }
+
+    // The serial crash record must also be available on headless systems or
+    // when the framebuffer could not be initialized. No drawing is possible.
+    if (!fbBase || !fbWidth || !fbHeight || fbStride / 4 < fbWidth)
+        return;
 
     // Step 2: Calculate pagination
     uint32_t maxPerPage = QR_MAX_PAYLOAD_BYTES_PER_PAGE;
