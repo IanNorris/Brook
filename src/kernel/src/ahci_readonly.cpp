@@ -5,6 +5,7 @@
 #include "ahci_firmware_handoff.h"
 #include "ahci_write_plan.h"
 #include "ahci_byte_write.h"
+#include "ahci_panic_gate.h"
 #include "ahci_write_target.h"
 #include "ata_identify.h"
 #include "pci.h"
@@ -32,6 +33,14 @@ uint64_t dmaPhys=0;
 bool dma64=false;
 PciDevice pci{};
 KMutex ioLock{};
+AhciPanicGate panicGate{};
+// A failed gate admission is possible after panic ownership. Never wait for
+// that owner or touch the shared DMA buffer in this case.
+struct NormalIoGuard {
+    bool admitted;
+    NormalIoGuard() { KMutexLock(&ioLock); admitted=panicGate.EnterNormal(); }
+    ~NormalIoGuard() { if(admitted)panicGate.LeaveNormal(); KMutexUnlock(&ioLock); }
+};
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
@@ -156,10 +165,10 @@ int Read(Device*,uint64_t offset,void* output,uint64_t length) {
     if(!output && length)return -22;
     if(length>0x7fffffffu)return -22;
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return -5;
-    KMutexLock(&ioLock);
-    if(!status.ready){KMutexUnlock(&ioLock);return -5;}
+    NormalIoGuard guard;
+    if(!guard.admitted || !status.ready)return -5;
     const uint64_t capacity=status.sectors*512;
-    if(offset>=capacity){KMutexUnlock(&ioLock);return 0;}
+    if(offset>=capacity)return 0;
     if(length>capacity-offset)length=capacity-offset;
     auto* dst=static_cast<uint8_t*>(output);uint64_t done=0;
     while(done<length) {
@@ -170,7 +179,6 @@ int Read(Device*,uint64_t offset,void* output,uint64_t length) {
         uint64_t bytes=uint64_t(blocks)*512-in;if(bytes>remaining)bytes=remaining;
         memcpy(dst+done,dma+dataOffset+in,bytes);done+=bytes;
     }
-    KMutexUnlock(&ioLock);
     return done?int(done):(length?-5:0);
 }
 struct AhciByteIo {
@@ -181,18 +189,19 @@ struct AhciByteIo {
 };
 int Write(Device*,uint64_t offset,const void* data,uint64_t len) {
     if(writeEnabled && __atomic_load_n(&published,__ATOMIC_ACQUIRE)) {
-        KMutexLock(&ioLock);AhciByteIo bytes;
-        const int result=status.ready ? AhciByteWrite(bytes,offset,data,len,status.sectors,dma+dataOffset) : -5;
-        KMutexUnlock(&ioLock);return result;
+        NormalIoGuard guard;if(!guard.admitted)return -5;
+        AhciByteIo bytes;
+        return status.ready ? AhciByteWrite(bytes,offset,data,len,status.sectors,dma+dataOffset) : -5;
     }
     return -30;
 }
 int Ioctl(Device*,uint32_t request,void*) {
     if(request==DEVICE_IOCTL_READ_ONLY)return writeEnabled?0:1;
     if(request==DEVICE_IOCTL_FLUSH && writeEnabled) {
-        KMutexLock(&ioLock);AhciReadPlan plan{};
+        NormalIoGuard guard;if(!guard.admitted)return -5;
+        AhciReadPlan plan{};
         const bool ok=status.ready && AhciPlanFlush(plan,true) && Run(plan,0);
-        KMutexUnlock(&ioLock);return ok?0:-5;
+        return ok?0:-5;
     }
     if(request==DEVICE_IOCTL_FLUSH)return 0;
     return -95;
@@ -437,10 +446,11 @@ int AhciPhysicalBlockToolsFinalSync() {
 #endif
 int AhciReadOnlySector(uint64_t lba,void* output) {
     if(!output || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return -22;
-    KMutexLock(&ioLock);
-    if(!status.ready || lba>=status.sectors){KMutexUnlock(&ioLock);return -22;}
+    NormalIoGuard guard;
+    if(!guard.admitted)return -5;
+    if(!status.ready || lba>=status.sectors)return -22;
     const bool ok=ReadBlocks(lba,1);
-    if(ok)memcpy(output,dma+dataOffset,512);KMutexUnlock(&ioLock);
+    if(ok)memcpy(output,dma+dataOffset,512);
     return ok?512:-5;
 }
 bool AhciReadOnlyExportInfo(BrookAhciExportInfo& info) {
