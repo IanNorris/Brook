@@ -1,6 +1,7 @@
 // panic.cpp — compiled with -mgeneral-regs-only so it is safe to call from
 // interrupt context.  No SSE/FPU registers are touched here.
 #include "panic.h"
+#include "panic_test_reset.h"
 #include "serial.h"
 #include "tty.h"
 #include "panic_qr.h"
@@ -574,6 +575,8 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         brook::PanicRenderQR(nullptr, 0, 0, 0, &fullRegs, &trace,
                              nullptr, nullptr, nullptr, nullptr, &cpuList);
     }
+
+    brook::PanicTestResetAfterDump();
 
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)
     for (;;) { __asm__ volatile("pause"); }

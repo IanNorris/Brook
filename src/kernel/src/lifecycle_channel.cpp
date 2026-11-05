@@ -1,5 +1,6 @@
 #include "lifecycle_channel.h"
 #include "shutdown.h"
+#include "panic_test_reset.h"
 #include "debug_epoch.h"
 #include "fw_cfg.h"
 #include "portio.h"
@@ -53,6 +54,7 @@ void Worker(void*) {
 // shared with other fw_cfg readers, which are not a runtime transport.
 void LifecycleChannelConfigure() {
     ShutdownConfigure();
+    PanicTestResetConfigure();
     const auto n=FwCfgReadFile("opt/brook/lifecycle",configuredCookie,sizeof(configuredCookie));
     if(n!=32){configuredCookie[0]=0;return;}
     configuredCookie[32]=0;

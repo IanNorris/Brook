@@ -1,3 +1,4 @@
+#include "panic_test_reset.h"
 #include "idt.h"
 #include "gdt.h"
 #include "serial.h"
@@ -1317,6 +1318,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                 brook::DisplayPanicPresent();
             }
         }
+
+        // This path already owns the panic print lock. HandleException below
+        // deliberately halts a second lock claimant, so the opt-in test reset
+        // must run after the visual dump but before that fallback.
+        brook::PanicTestResetAfterDump();
 
         InterruptFrame ifrm;
         ifrm.ip    = ef->rip;

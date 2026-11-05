@@ -9,6 +9,7 @@
 static std::string output;
 namespace brook {
 extern "C" void SerialPuts(const char* s) {output += s;}
+extern "C" void SerialPutChar(char c) {output += c;}
 extern "C" void SerialPrintf(const char*, ...) {}
 }
 int main() {

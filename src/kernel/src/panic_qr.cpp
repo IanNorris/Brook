@@ -159,17 +159,17 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
 // Emit the binary packet as hex to serial for host-side capture.
 static void DumpPacketToSerial(const uint8_t* data, uint32_t len)
 {
-    SerialPuts("PANIC_HEX:");
+    // The exception handler suppresses ordinary serial writers while it owns
+    // the crash dump. Emit directly: taking its reserved ticket lock here
+    // would either suppress the structured packet or deadlock the handler.
+    for (const char* p = "PANIC_HEX:"; *p; ++p) SerialPutChar(*p);
     static const char hex[] = "0123456789ABCDEF";
     for (uint32_t i = 0; i < len; i++)
     {
-        char buf[3];
-        buf[0] = hex[data[i] >> 4];
-        buf[1] = hex[data[i] & 0x0F];
-        buf[2] = '\0';
-        SerialPuts(buf);
+        SerialPutChar(hex[data[i] >> 4]);
+        SerialPutChar(hex[data[i] & 0x0F]);
     }
-    SerialPuts("\n");
+    SerialPutChar('\n');
 }
 
 // Build a page buffer: PanicHeader + chunk of payload, then Base45-encode it.

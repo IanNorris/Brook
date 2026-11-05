@@ -239,6 +239,7 @@ add_executable(kernel
     src/ksymtab.cpp
     src/module.cpp
     src/panic.cpp
+    src/panic_test_reset.cpp
     src/panic_qr.cpp
     src/base45.cpp
     src/pci.cpp
@@ -466,6 +467,7 @@ set_source_files_properties(
     src/keyboard.cpp
     src/mouse.cpp
     src/panic.cpp
+    src/panic_test_reset.cpp
     src/panic_screen.cpp
     src/panic_qr.cpp
     src/exception_info.cpp
