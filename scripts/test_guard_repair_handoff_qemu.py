@@ -55,6 +55,7 @@ def main():
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
     parser.add_argument('--auto-desktop-hard-stall',action='store_true',help='Stall a real vCPU and require watchdog capture and reset')
+    parser.add_argument('--auto-desktop-headless-panic',action='store_true',help='Force the panic framebuffer lookup to fail and check diagnostic sections')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -72,6 +73,8 @@ def main():
         parser.error('shutdown panic requires the armed desktop reset fixture')
     if a.auto_desktop_hard_stall and (not a.auto_desktop_reset or a.auto_desktop_shutdown_panic):
         parser.error('hard stall requires desktop reset and excludes shutdown panic')
+    if a.auto_desktop_headless_panic and (not a.auto_desktop_panic or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic):
+        parser.error('headless panic requires desktop panic and excludes stall and shutdown fixtures')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
@@ -239,7 +242,12 @@ def main():
             else:
                 panic=desktop_symbol('KernelPanic');scratch=desktop_symbol('_ZN5brookL8g_kbdBufE')
                 body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
-                      f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\ndetach\nquit\n')
+                      f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n')
+                if a.auto_desktop_headless_panic:
+                    fb=desktop_symbol('_ZN5brook19CompositorGetPhysFbEPj')
+                    body+=(f'hbreak *{fb:#x}\ncontinue\nset $rax=0\nset $rip=*(unsigned long long*)$rsp\n'
+                           'set $rsp=$rsp+8\necho PANIC_FRAMEBUFFER_FORCED_NULL\\n\ndelete breakpoints\n')
+                body+='detach\nquit\n'
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                            f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'+body)
             capture_seen=[]
@@ -339,6 +347,19 @@ def main():
                     not decoded.get('log_tail',{}).get('available')):
                     raise RuntimeError('watchdog packet did not retain its reason and log')
                 (a.output/'desktop-watchdog-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
+            if a.auto_desktop_headless_panic:
+                debugger_log=(second/'qemu.log').read_text(errors='replace')
+                (a.output/'desktop-headless-gdb.log').write_text(debugger_log)
+                if 'PANIC_FRAMEBUFFER_FORCED_NULL' not in debugger_log:
+                    raise RuntimeError('headless panic framebuffer override did not run')
+                packet_file=a.output/'desktop-headless-panic.bin';packet_file.write_bytes(bytes.fromhex(packet))
+                decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
+                                   '--packet',str(packet_file),'--json'],stderr=subprocess.DEVNULL))
+                if (decoded.get('message')!='GDBTEST' or not decoded.get('system_info') or
+                    not decoded.get('processes') or not decoded.get('stack_dump') or
+                    not decoded.get('cpus') or not decoded.get('log_tail',{}).get('available')):
+                    raise RuntimeError('headless packet is missing diagnostic sections')
+                (a.output/'desktop-headless-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
         if a.normal_kernel and f'NORMAL_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}' not in serial:
             raise RuntimeError('normal boot did not validate the captured panic packet')
         if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal unexpectedly changed')

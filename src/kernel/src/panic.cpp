@@ -458,7 +458,6 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     volatile uint32_t* physFb = brook::CompositorGetPhysFb(&physStride);
     uint32_t fbW = 0, fbH = 0;
     brook::CompositorGetPhysDims(&fbW, &fbH);
-    if (physFb && fbW && fbH)
     {
         // Snapshot running processes (all CPUs halted, no lock needed)
         static brook::PanicProcessList procList;
@@ -569,23 +568,19 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         psi.cpuList   = &cpuList;
         psi.vector    = 0;
         psi.errorCode = 0;
-        brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
+        if (physFb && fbW && fbH)
+        {
+            brook::PanicScreenRender(const_cast<uint32_t*>(physFb), fbW, fbH, fbStride, &psi);
 
-        // Push the rendered panic screen to the actual scanout. Required for
-        // transfer-based displays (virtio-gpu): the compositor present path is
-        // halted, so nothing else flushes the framebuffer backing — and under
-        // GPU composition the scanout must be reverted from the 3D render target
-        // back to the 2D framebuffer. No-op for direct-mapped linear FBs.
-        brook::DisplayPanicPresent();
-    }
-    else
-    {
-        // The structured serial record is useful even when no display exists.
-        // CPU state is captured after the NMI halt, just as for the visual QR.
-        static brook::PanicCpuList cpuList;
-        brook::PanicCaptureCpuList(&cpuList);
-        brook::PanicRenderQR(nullptr, 0, 0, 0, &fullRegs, &trace,
-                             nullptr, nullptr, nullptr, nullptr, &cpuList, g_panicBuf);
+            // Transfer-based displays need an explicit panic presentation.
+            brook::DisplayPanicPresent();
+        }
+        else
+        {
+            // Preserve the same structured evidence without a framebuffer.
+            brook::PanicRenderQR(nullptr, 0, 0, 0, &fullRegs, &trace,
+                                 nullptr, &procList, &sysInfo, &stackDump, &cpuList, g_panicBuf);
+        }
     }
 
     brook::PanicTestResetAfterDump();
