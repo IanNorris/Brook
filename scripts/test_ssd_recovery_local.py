@@ -118,6 +118,8 @@ def main():
                    help='Also inject a held PMM lock and a direct-map fault address')
     p.add_argument('--guard-panic-double-fault', action='store_true',
                    help='Invoke the double-fault handler with a synthetic frame')
+    p.add_argument('--guard-panic-real-double-fault', action='store_true',
+                   help='Cause a processor double fault using a deliberately invalid #PF gate')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-watchdog-duration', action='store_true',
@@ -185,6 +187,8 @@ def main():
     if a.guard_panic_double_fault and (not (a.guard_panic_after_pending or a.guard_panic_unarmed) or a.guard_panic_rsvd or
                                        a.guard_panic_pm_fallback or a.guard_watchdog_inject or a.guard_panic_network):
         p.error('double-fault fixture requires an armed or unarmed panic without other injections or network retrieval')
+    if a.guard_panic_real_double_fault and not a.guard_panic_double_fault:
+        p.error('real double fault requires the double-fault fixture')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
@@ -579,7 +583,32 @@ def main():
                 commands=work/'panic.gdb'
                 prefix=('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                         f'target remote {work / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n')
-                if a.guard_panic_double_fault:
+                if a.guard_panic_real_double_fault:
+                    from elftools.elf.elffile import ELFFile
+                    gadget=None
+                    with (pair/'KERNEL.ELF').open('rb') as executable:
+                        elf=ELFFile(executable)
+                        for segment in elf.iter_segments():
+                            if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                                at=segment.data().find(b'\x48\x8b\x00') # mov (%rax),%rax
+                                if at>=0:gadget=segment['p_vaddr']+at;break
+                        table=elf.get_section_by_name('.symtab')
+                        stacks=[s for s in table.iter_symbols() if s.name=='_ZL10g_dfStacks']
+                        if len(stacks)!=1 or not stacks[0]['st_size']:
+                            raise RuntimeError('double-fault stack bounds unavailable')
+                        df_start=stacks[0]['st_value'];df_end=df_start+stacks[0]['st_size']
+                    if gadget is None:raise RuntimeError('no faulting load instruction for double-fault fixture')
+                    gate=symbol('_ZL5g_idt')+14*16+5
+                    handler=symbol('_ZL17ExceptionHandler8P14InterruptFramem')
+                    # A #PF whose gate is not present faults during exception
+                    # delivery, causing the CPU to enter #DF through IST1.
+                    body=(f'delete breakpoints\nset {{unsigned char}}{gate:#x}=*(unsigned char*){gate:#x} & 0x7f\n'
+                          f'set $rax=0\nset $rip={gadget:#x}\nhbreak *{handler:#x}\ncontinue\n'
+                          f'if $rsp < {df_start:#x} || $rsp >= {df_end:#x}\n'
+                          'echo DOUBLE_FAULT_WRONG_STACK\\n\nquit 1\nend\n'
+                          'printf "REAL_DOUBLE_FAULT_IST_ENTERED\\n"\n'
+                          'delete breakpoints\ndetach\nquit\n')
+                elif a.guard_panic_double_fault:
                     handler=symbol('_ZL17HandleDoubleFaultP14InterruptFramem')
                     # Invoke the handler directly with a synthetic frame; this
                     # exercises its policy, not the processor's real #DF/IST path.
@@ -874,6 +903,8 @@ def main():
                 raise RuntimeError('reserved-bit fault path did not run')
             if a.guard_panic_double_fault and 'Vector: 008 (#DF Double Fault)' not in text:
                 raise RuntimeError('double-fault handler did not run')
+            if a.guard_panic_real_double_fault and 'REAL_DOUBLE_FAULT_IST_ENTERED' not in (work/'qemu.log').read_text(errors='replace'):
+                raise RuntimeError('processor double fault did not enter the dedicated exception stack')
             if a.guard_panic_rsvd_pmm_held and not all(marker in text for marker in
                     ('PMM history unavailable: lock busy', 'unsafe page-table scan skipped for armed recovery')):
                 raise RuntimeError('held PMM lock or armed scan policy was not observed')
@@ -987,6 +1018,9 @@ def main():
             if a.serial_output:
                 with a.serial_output.with_suffix('.reboot.log').open('xb') as output:
                     output.write((reboot/'serial.log').read_bytes())
+                if a.guard_panic_real_double_fault:
+                    with a.serial_output.with_suffix('.gdb.log').open('xb') as output:
+                        output.write((work/'qemu.log').read_bytes())
             print('RECOVERY_AUTO_DOUBLE_FAULT_UNARMED_HALT_PASS' if a.guard_panic_double_fault and a.guard_panic_unarmed else
                   'RECOVERY_AUTO_DOUBLE_FAULT_RESET_PASS' if a.guard_panic_double_fault else
                   'RECOVERY_AUTO_RSVD_RESET_PASS' if a.guard_panic_rsvd else 'RECOVERY_AUTO_PANIC_CAPTURE_PASS');return
