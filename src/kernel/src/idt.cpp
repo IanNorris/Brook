@@ -1,4 +1,5 @@
 #include "panic_test_reset.h"
+#include "panic_stack.h"
 #if defined(BROOK_AHCI_PANIC_TEST)
 #include "ahci_readonly.h"
 #endif
@@ -149,18 +150,13 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
 {
     ExcPutsRaw(tag); ExcPutsRaw("  --- stack trace ---\n");
     auto* fp = reinterpret_cast<StackFrame*>(rbp);
-    StackFrame* prev = nullptr;
+    const auto stack=brook::PanicCurrentStackBounds();
 
     for (int i = 0; i < maxFrames; ++i)
     {
-        if (fp == nullptr || fp == prev || fp->rip == 0)
-            break;
-
-        // Only follow pointers in kernel space; user-mode RBP values
-        // could reference corrupted page tables and trigger nested faults.
         auto addr = reinterpret_cast<uint64_t>(fp);
-        if (addr < 0xFFFF800000000000ULL)
-            break;
+        if ((addr&7) || !stack.Contains(addr,sizeof(StackFrame))) break;
+        if (fp->rip == 0) break;
 
         ExcPutsRaw(tag); ExcPutsRaw("  #");
         ExcPutCharRaw(static_cast<char>('0' + (i / 10) % 10));
@@ -189,8 +185,9 @@ static void ExcStackWalk(uint64_t rbp, int maxFrames, const char* tag)
         }
         ExcPutsRaw("\n");
 
-        prev = fp;
-        fp = fp->rbp;
+        auto* next=fp->rbp;
+        if(reinterpret_cast<uint64_t>(next)<=addr)break;
+        fp=next;
     }
     ExcPutsRaw(tag); ExcPutsRaw("  --- end trace ---\n");
 }
@@ -1190,15 +1187,18 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                 // Walk stack for trace
                 brook::PanicStackTrace ptrace = {};
                 uint64_t* rbpPtr = reinterpret_cast<uint64_t*>(ef->rbp);
+                const auto stackBounds=brook::PanicCurrentStackBounds();
                 ptrace.rip[0] = ef->rip;
                 ptrace.depth = 1;
                 for (uint8_t d = 1; d < brook::PANIC_MAX_STACK_DEPTH; d++)
                 {
                     uint64_t addr = reinterpret_cast<uint64_t>(rbpPtr);
-                    if (addr < 0xFFFF800000000000ULL || addr == 0) break;
+                    if ((addr&7) || !stackBounds.Contains(addr,16)) break;
                     ptrace.rip[d] = rbpPtr[1];
                     ptrace.depth = d + 1;
-                    rbpPtr = reinterpret_cast<uint64_t*>(rbpPtr[0]);
+                    const uint64_t next=rbpPtr[0];
+                    if(next<=addr)break;
+                    rbpPtr = reinterpret_cast<uint64_t*>(next);
                 }
 
                 // Exception info
@@ -1272,9 +1272,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                     stackDump.rsp = ef->rsp;
                     stackDump.length = 0;
                     const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(ef->rsp);
-                    if (ef->rsp >= 0xFFFF800000000000ULL && ef->rsp != 0)
+                    const uint32_t bytes=stackBounds.Available(ef->rsp,brook::PANIC_STACK_DUMP_BYTES);
+                    if (bytes)
                     {
-                        for (uint16_t i = 0; i < brook::PANIC_STACK_DUMP_BYTES; i++)
+                        for (uint16_t i = 0; i < bytes; i++)
                         {
                             stackDump.data[i] = rspPtr[i];
                             stackDump.length = i + 1;

@@ -9,6 +9,7 @@
 #include "tty.h"
 #include "panic_qr.h"
 #include "panic_screen.h"
+#include "panic_stack.h"
 #include "compositor.h"
 #include "display.h"
 #include "display_power.h"
@@ -108,12 +109,23 @@ static void CaptureFullRegs(brook::PanicCPURegs& r)
 }
 
 // ---- Stack trace capture (RBP frame walking) --------------------------------
+brook::PanicStackBounds brook::PanicCurrentStackBounds()
+{
+    Process* process=ProcessCurrent();
+    const uint64_t address=reinterpret_cast<uint64_t>(process);
+    if(address<0xffff800000000000ULL || (address&7) || process->magic!=PROCESS_MAGIC)return {};
+    const uint64_t base=process->kernelStackBase,top=process->kernelStackTop;
+    if(base<0xffff800000000000ULL || top<=base || top-base>KERNEL_STACK_SIZE)return {};
+    return {base,top};
+}
+
 static void CaptureStackTrace(brook::PanicStackTrace& trace, uint64_t rbp, uint64_t rip)
 {
     constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
     constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
 
     trace.depth = 0;
+    const auto stack=brook::PanicCurrentStackBounds();
 
     // Frame 0: the RIP at panic time
     if (rip >= KERNEL_BASE && rip < KERNEL_END)
@@ -123,7 +135,7 @@ static void CaptureStackTrace(brook::PanicStackTrace& trace, uint64_t rbp, uint6
     while (trace.depth < brook::PANIC_MAX_STACK_DEPTH && rbp != 0)
     {
         // Validate RBP is in kernel range and aligned
-        if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
+        if ((rbp & 7) != 0 || !stack.Contains(rbp,16))
             break;
 
         const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
@@ -535,10 +547,9 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             stackDump.length = 0;
             const uint8_t* rspPtr = reinterpret_cast<const uint8_t*>(regs.rsp);
             uint64_t rspAddr = regs.rsp;
-            // Only read if RSP is in kernel-half canonical range
-            if (rspAddr >= 0xFFFF800000000000ULL && rspAddr != 0)
+            const uint16_t maxBytes=static_cast<uint16_t>(brook::PanicCurrentStackBounds().Available(rspAddr,brook::PANIC_STACK_DUMP_BYTES));
+            if (maxBytes)
             {
-                uint16_t maxBytes = brook::PANIC_STACK_DUMP_BYTES;
                 for (uint16_t i = 0; i < maxBytes; i++)
                 {
                     stackDump.data[i] = rspPtr[i];

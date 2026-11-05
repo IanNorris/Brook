@@ -1306,6 +1306,12 @@ static int ExecCommand(int argc, const char* const* argv)
             SerialLock();
             KernelPanic("crashtest: panic while serial lock held");
         }
+        else if (StrEq(mode, "badrbp"))
+        {
+            if(!PanicTestResetEnabled()) {SerialPuts("crashtest: badrbp requires QEMU reset test\n");return -1;}
+            __asm__ volatile("movabs $0xffff800000000000, %%rbp; ud2" ::: "memory");
+            __builtin_unreachable();
+        }
         else if (StrEq(mode, "nullptr"))
         {
             // Write to an unmapped kernel-space address — guaranteed to fault.

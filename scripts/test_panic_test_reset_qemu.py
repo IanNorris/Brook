@@ -152,6 +152,13 @@ def main():
         if decoded.get('exception',{}).get('vector')!=6 or 'RIP' not in decoded.get('registers',{}) or not decoded.get('system_info',{}).get('git_hash'):
             raise RuntimeError('headless exception packet missing vector, RIP or build identity')
         print('headless exception packet and reboot: PASS', flush=True)
+        root = Path(temp) / 'bad-rbp'
+        root.mkdir()
+        run_case(root, image, kernel, firmware, 'crashtest badrbp', True, args.timeout, verify_reboot=True)
+        decoded=check_reason(root/'serial.log', 'Unrecoverable kernel exception')
+        if decoded.get('exception',{}).get('vector')!=6 or decoded.get('registers',{}).get('RBP')!='0xFFFF800000000000':
+            raise RuntimeError('corrupt frame pointer was not retained in the exception record')
+        print('bad frame pointer exception and reboot: PASS', flush=True)
 
 
 if __name__ == '__main__':
