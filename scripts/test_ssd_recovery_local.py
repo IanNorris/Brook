@@ -51,6 +51,8 @@ def main():
     p.add_argument('--module-abi', type=int, default=64, help='Expected ABI of staged guest modules')
     p.add_argument('--prepared-pair', type=Path,
                    help='Boot this exact physical recovery pair and verify it refuses the QEMU disk')
+    p.add_argument('--auto-prepared-pair', type=Path,
+                   help='Boot an exact automatic recovery pair prepared for the QEMU fixture')
     p.add_argument('--fat-checker', type=Path,
                    help='Use a static FAT checker and matching diagnostic supervisor on the private ESP')
     p.add_argument('--fat-crosslink', action='store_true',
@@ -118,6 +120,9 @@ def main():
         p.error('choose one failure scenario')
     if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build or a.fat_checker):
         p.error('prepared pair is an independent identity rejection scenario')
+    if a.auto_prepared_pair and (a.prepared_pair or a.kernel_build or not a.guard_auto_kernel or
+                                  not a.guard_auto_dispatch or a.guard_desktop_kernel_build):
+        p.error('automatic prepared pair requires the standalone automatic dispatch fixture')
     if a.fat_checker and ((a.dirty and not a.guard_ext2_test) or a.missing_checker):
         p.error('FAT checker uses a clean fixture')
     if a.fat_crosslink and not a.fat_checker:
@@ -157,7 +162,7 @@ def main():
         p.error('ext2 checker failure requires an uninjected guarded ext2 run')
     if a.guard_ext2_bad_checker and a.guard_ext2_missing_checker:
         p.error('choose one ext2 checker failure')
-    if a.guard_reservation and (not (a.guard_open_probe or a.guard_real_checker) or not a.kernel_build):
+    if a.guard_reservation and (not (a.guard_open_probe or a.guard_real_checker) or not (a.kernel_build or a.auto_prepared_pair)):
         p.error('guard reservation requires a guard-only kernel and a checker or open probe')
     if a.guard_real_checker and not a.guard_reservation:
         p.error('guard real checker requires a guard reservation')
@@ -241,8 +246,8 @@ def main():
         if a.missing_checker:
             subprocess.run(['mdel', '-i', str(initrd), '::/BOOT/E2FSCK.ELF'], check=True)
         kernel = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/KERNEL.ELF'])
-        if a.prepared_pair:
-            pair = a.prepared_pair.resolve(strict=True)
+        if a.prepared_pair or a.auto_prepared_pair:
+            pair = (a.prepared_pair or a.auto_prepared_pair).resolve(strict=True)
             kernel = (pair / 'KERNEL.ELF').read_bytes()
             initrd.write_bytes((pair / 'INITRD.IMG').read_bytes())
             kernel_file = work / 'KERNEL.ELF'; kernel_file.write_bytes(kernel)
@@ -267,7 +272,7 @@ def main():
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(module), '::/DRIVERS/' + name], check=True)
                 if subprocess.check_output(['mtype', '-i', str(initrd), '::/DRIVERS/' + name]) != data:
                     raise RuntimeError('recovery module readback mismatch')
-        if a.guard_reservation:
+        if a.guard_reservation and not a.auto_prepared_pair:
             # Private disk identity and selectors; never copy these into a real image.
             with disk.open('rb') as stream:
                 stream.seek(parts[1]['start'] * 512 + 1024 + 104)
@@ -335,7 +340,7 @@ def main():
                     raise RuntimeError('pending marker unexpectedly present')
         init = work / 'INIT.RC'; init.write_bytes(AUTO_CHECK_INIT)
         ident = work / 'hardware-payload-id'; ident.write_bytes(AUTO_CHECK_PAYLOAD_ID)
-        if not a.prepared_pair:
+        if not (a.prepared_pair or a.auto_prepared_pair):
             for source, target in ((init, '::/BOOT/INIT.RC'),
                                    (ident, '::/ETC/hardware-payload-id'),
                                    (a.supervisor, '::/BOOT/RECCHECK.ELF')):
@@ -352,12 +357,12 @@ def main():
                 if len(copied)!=fat_info['bytes'] or hashlib.sha256(copied).hexdigest()!=expected_hash:
                     raise RuntimeError('guest FAT checker readback mismatch')
         selection = work / 'SELECT.BIN'; selection.write_bytes(record(1, 0, kernel, initrd.read_bytes()))
-        if a.prepared_pair and selection.read_bytes() != (pair / 'SELECT.BIN').read_bytes():
+        if (a.prepared_pair or a.auto_prepared_pair) and selection.read_bytes() != (pair / 'SELECT.BIN').read_bytes():
             raise RuntimeError('prepared recovery selection does not match its exact pair')
         for source, target in ((initrd, '::/RECOVERY/INITRD.IMG'),
                                (selection, '::/RECOVERY/SELECT.BIN')):
             subprocess.run(['mcopy', '-o', '-i', media, str(source), target], check=True)
-        if a.prepared_pair:
+        if a.prepared_pair or a.auto_prepared_pair:
             for name in ('KERNEL.ELF', 'INITRD.IMG', 'SELECT.BIN'):
                 staged = subprocess.check_output(['mtype', '-i', media, '::/RECOVERY/' + name])
                 if staged != (pair / name).read_bytes():

@@ -74,5 +74,26 @@ class GuardPairTest(unittest.TestCase):
                            self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output)
         self.assertFalse(self.output.exists())
 
+    def test_automatic_pair_requires_matching_build_and_both_pinned_checkers(self):
+        required=dict(target.REQUIRED);required['BROOK_SSD_AUTO_RECOVERY']='ON'
+        (self.build/'CMakeCache.txt').write_text(''.join(f'{k}:BOOL={v}\n' for k,v in required.items()))
+        flags=' -DBROOK_SSD_AUTO_RECOVERY=1 -DBROOK_SSD_GUARD_TRANSACTION=1 -DBROOK_SSD_GUARD_REPAIR=1 -DBROOK_SSD_GUARD_COMPLETION=1'
+        for command in self.commands:command['command']+=flags
+        (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
+        digest=hashlib.sha256(self.checker.read_bytes()).hexdigest()
+        with mock.patch.object(target,'CHECKER_SHA',digest),mock.patch.object(target,'E2FSCK_SHA',digest):
+            result=target.prepare(self.build,hashlib.sha256(self.kernel).hexdigest(),self.checker,Path('/bin/true'),
+                self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output,True,self.checker)
+        self.assertEqual(result['ext2_checker_sha256'],digest)
+        self.assertIn('automatic',result['scope'])
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(self.output/'INITRD.IMG'),'::BOOT/E2FSCK.ELF']),self.checker.read_bytes())
+        self.output.rename(self.root/'completed')
+        self.commands[0]['command']+=' -DBROOK_SSD_GUARD_PENDING_TEST=1'
+        (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
+        with self.assertRaisesRegex(ValueError,'unsafe compile flags'):
+            target.prepare(self.build,hashlib.sha256(self.kernel).hexdigest(),self.checker,Path('/bin/true'),
+                self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output,True,self.checker)
+        self.assertFalse(self.output.exists())
+
 
 if __name__=='__main__':unittest.main()
