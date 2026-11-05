@@ -12,6 +12,7 @@ Automatically finds BROOK.elf for symbolication if not specified.
 import argparse
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -903,18 +904,17 @@ def find_brook_elf(git_hash: str | None = None) -> str | None:
     script_dir = Path(__file__).parent.parent
     symbols_dir = script_dir / "symbols"
 
-    # A "+" suffix marks a dirty (uncommitted) build: no archive can match it, so
-    # symbolization MUST use the exact local build ELF that produced the running
-    # kernel. Warn loudly because if that ELF has since been rebuilt, addresses
-    # will be shifted and symbols will be wrong.
-    dirty = bool(git_hash) and git_hash.endswith("+")
-    if dirty:
-        print(f"  [warn] Dirty build ({git_hash}) — symbolizing against the LOCAL "
-              f"build ELF. Ensure it is the EXACT kernel you booted, or symbols "
-              f"will be wrong.")
+    # Dirty build IDs are <commit>+<diff digest>, not a trailing '+'. Neither
+    # the current ELF nor a clean commit archive identifies that exact build.
+    if git_hash and '+' in git_hash:
+        print(f"[warn] Dirty build ({git_hash}); supply the exact kernel with --elf for symbols", file=sys.stderr)
+        return None
+    if git_hash and not re.fullmatch(r'[0-9a-f]{7,19}',git_hash):
+        print('[warn] Invalid or unavailable kernel build ID; symbols not selected',file=sys.stderr)
+        return None
 
     # If we have a clean git hash, try to extract from the symbol archive first
-    if git_hash and not dirty and symbols_dir.is_dir():
+    if git_hash and symbols_dir.is_dir():
         archive = symbols_dir / f"{git_hash}.tar.xz"
         if archive.exists():
             extract_dir = symbols_dir / f".extract_{git_hash}"
@@ -927,9 +927,14 @@ def find_brook_elf(git_hash: str | None = None) -> str | None:
                     sp.run(["tar", "-xJf", str(archive), "-C", str(extract_dir)],
                            check=True, capture_output=True)
                 except Exception as e:
-                    print(f"  [warn] Failed to extract symbol archive: {e}")
+                    print(f"[warn] Failed to extract symbol archive: {e}",file=sys.stderr)
             if elf_path.exists():
+                print('[warn] Symbols selected by commit only; build configuration may differ',file=sys.stderr)
                 return str(elf_path)
+
+    if git_hash:
+        print(f"[warn] No symbol archive for {git_hash}; supply the exact kernel with --elf",file=sys.stderr)
+        return None
 
     # Fallback: current build directory
     candidates = [
@@ -940,8 +945,6 @@ def find_brook_elf(git_hash: str | None = None) -> str | None:
     ]
     for p in candidates:
         if p.exists():
-            if git_hash:
-                print(f"  [warn] No symbol archive for {git_hash}, using current build ELF")
             return str(p)
     return None
 

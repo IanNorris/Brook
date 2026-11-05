@@ -21,8 +21,7 @@ def check_reason(serial, expected):
     output=StringIO()
     with redirect_stdout(output):
         crash_decoder.decode_crash(packet,None,False,True)
-    rendered=output.getvalue()
-    decoded=json.loads(rendered[rendered.index('{'):])
+    decoded=json.loads(output.getvalue())
     actual=decoded.get('message')
     if actual!=expected:raise RuntimeError(f'panic reason differs: {actual!r}')
     log=decoded.get('log_tail')

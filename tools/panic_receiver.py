@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,6 +30,20 @@ CRASH_DECODER = SCRIPT_DIR / "crash_decoder.py"
 WORKSPACE = Path(os.environ.get("BROOK_WORKSPACE", SCRIPT_DIR.parent))
 REPORTS_DIR = WORKSPACE / "crash_reports"
 DECODER_ELF = None
+
+def save_raw_crash(directory: Path, hex_data: str) -> Path:
+    """Reserve a distinct report name before writing any decoded artifacts."""
+    directory.mkdir(parents=True,exist_ok=True)
+    for _ in range(8):
+        stamp=datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        path=directory / f'crash_{stamp}_{uuid.uuid4().hex}.hex'
+        try:
+            with path.open('x') as output:
+                output.write(hex_data)
+            return path
+        except FileExistsError:
+            continue
+    raise FileExistsError('cannot reserve unique crash report name')
 
 def decoder_command(*args):
     command = [sys.executable, str(CRASH_DECODER), *args]
@@ -205,15 +220,12 @@ class PanicReceiverHandler(http.server.BaseHTTPRequestHandler):
             print(f"  Decoded: {len(raw)} bytes")
 
             # Step 2: Save raw hex to file
-            REPORTS_DIR.mkdir(exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            hex_path = REPORTS_DIR / f"crash_{ts}.hex"
-            hex_path.write_text(hex_data)
+            hex_path = save_raw_crash(REPORTS_DIR,hex_data)
             print(f"  Raw hex: {hex_path}")
 
             # Step 3: Run crash_decoder.py
-            report_path = REPORTS_DIR / f"crash_{ts}.txt"
-            json_path = REPORTS_DIR / f"crash_{ts}.json"
+            report_path = hex_path.with_suffix('.txt')
+            json_path = hex_path.with_suffix('.json')
 
             # Generate text report
             try:
