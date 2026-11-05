@@ -1,8 +1,21 @@
 # Brook project handover
 
-Continuation update, 5 November 2026: read-only onboarding was completed and Ian confirmed it. Repository documentation and the bridge skill are being installed. Ian has not yet confirmed the physical Dell test; keep the old chat paused and available. The branch and hardware observations below describe the transfer snapshot unless explicitly updated.
+Continuation update, 5 November 2026: read-only onboarding and documentation installation are complete. Ian authorized physical recovery testing; keep the old chat paused and available. After a graceful restart the keyboard and touchpad failed in Brook, but both worked again after a checked shutdown and full power pull. The cause is unconfirmed. On the subsequent boot Brook reports the SSD recovery files and both loaders present, with loader/configuration hashes matching the transfer snapshot. Ian reported that the EFI shell listed only BOOTX64.EFI in EFI/BOOT on both visible filesystems; the identity of those shell mappings versus Brook’s /media/system and the discrepancy remain unresolved. F5 recovery boot remains unverified. The branch and other hardware observations below describe the transfer snapshot unless explicitly updated.
 
 The original Brook goal was paused at 01:19:47 UTC on 5 November 2026, and its last turn completed at 01:19:56. Ian stopped it at a safe point for transfer. [evidence/snapshot.json](/data/Programming/DSHScratch/brook-handoff/evidence/snapshot.json) records the final repository state; [evidence/final-state.json](/data/Programming/DSHScratch/brook-handoff/evidence/final-state.json) preserves final messages and completed operation results. Keep the old chat paused and available through the transition; do not archive or delete it. Wait for Ian before the physical recovery boot test.
+
+## Current goal update, 5 November 2026
+
+Ian expanded the recovery goal: make the recovery tooling available in the normal boot, automate recovery wherever feasible, enlarge boot text without undue complexity, and add timed hang/panic recovery. Capture panic details through the bridge where feasible and in a preallocated disk area that does not require filesystem metadata changes at failure time. Keep the separate recovery and USB paths as fallbacks. This request supersedes the earlier opt-in-only watchdog direction as a product goal; its safe arming, inhibition and loop prevention still need a design appropriate to automatic operation. A fully wedged kernel cannot be guaranteed to run a software handler.
+
+Physical results: Ian created a persistent firmware entry for BROOKF5.EFI and selected F5. Recovery boot `cb5b56e1a4e04858bd7c280c8af2d045` advertised build b4210c41 with the writable desktop disabled; its automatic read-only SSD check completed cleanly. Both diagnostic shortcuts appeared in the launcher catalog. Remote NETCHECK completed with exit 0 and a framed local bridge reply. Ian reported keyboard and touchpad unresponsive on this recovery boot, so local launcher interaction remains unverified. Earlier both inputs worked again after checked shutdown and a full power pull. The pre-F5 normal boot had reached the desktop; independent original-default and USB fallback checks remain to be assessed.
+
+Current todo:
+1. Investigate input failures across warm restart and recovery; restore reliable local interaction.
+2. Integrate normal-boot diagnostics with ownership-aware filesystem checks and verify remotely and locally.
+3. Implement automatic, identity-bound repair/recovery with bounded retries and preserved fallback paths; existing guarded repair machinery is experimental, not production-ready.
+4. Design and implement timed hang and panic recovery, panic transport and preallocated durable crash records, with bounded failure handling and update/repair inhibition.
+5. Improve boot text readability and validate the complete behavior on disposable media and then the Dell. Record limits and stop once the expanded goal is verified.
 
 ## Project and working relationship
 
@@ -93,7 +106,7 @@ The watchdog is a separate follow-up unless Ian changes the milestone. Its curre
 
 ## Onboarding and remaining todo list
 
-Read-only onboarding compared the branch, HEAD and worktree with the final snapshot and reviewed the recorded operations. Ian confirmed the onboarding and requested repository housekeeping; wait for his confirmation before starting the physical test. No fresh build, test run, deployment or reboot was performed for onboarding.
+The original onboarding and recovery acceptance list below is retained as historical context. The current expanded todo is at the top of this document.
 
 1. With Ian available, determine whether the Dell's F12 firmware menu can select the separate `EFI/BOOT/BROOKF5.EFI` loader. Its availability through F12 is not yet proven; do not silently replace the default loader to bypass that question.
 2. Boot that loader and verify the F5 recovery path on the physical Dell using the already staged pair.

@@ -328,6 +328,7 @@ void MouseInit()
 
     if (selfTest != 0xAA) {
         SerialPuts("MOUSE: self-test failed, aborting\n");
+        KPrintf("MOUSE: self-test failed (response=0x%x); mouse unavailable\n", selfTest);
         return;
     }
 
