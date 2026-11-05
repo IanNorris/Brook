@@ -281,9 +281,9 @@ void Worker(void* arg) {
 #endif
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-    // Give a connected recovery bridge a bounded opportunity to retrieve the
-    // retained crash before a successful retry restarts the machine again.
-    if(resumePending && __atomic_load_n(&g_recoveryPanicReady,__ATOMIC_ACQUIRE) && NetGetIf() && NetGetIf()->ipAddr) {
+    // Both interrupted repair and a dirty desktop crash may have a retained
+    // packet. Offer a bounded retrieval window before either repair restarts.
+    if(__atomic_load_n(&g_recoveryPanicReady,__ATOMIC_ACQUIRE) && NetGetIf() && NetGetIf()->ipAddr) {
         KPuts("GUARD_PANIC_RETRIEVAL_WINDOW 10s\n");SchedulerSleepMs(10000);
     }
 #endif

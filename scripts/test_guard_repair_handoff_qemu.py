@@ -62,6 +62,7 @@ def main():
     parser.add_argument('--auto-desktop-nested-panic',action='store_true',help='Re-enter KernelPanic on the panic owner after disk capture')
     parser.add_argument('--auto-desktop-peer-panic',action='store_true',help='Model an existing owner and verify another CPU parks')
     parser.add_argument('--auto-desktop-early-nested-panic',action='store_true',help='Re-enter panic before the initial peer halt')
+    parser.add_argument('--auto-desktop-usb-panic-retrieval',action='store_true',help='Retrieve a desktop panic during recovery over emulated USB Ethernet')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -99,13 +100,15 @@ def main():
         parser.error('peer panic requires desktop reset and excludes other fixtures')
     if a.auto_desktop_early_nested_panic and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or a.auto_desktop_peer_panic):
         parser.error('early nested panic requires desktop reset and excludes other fixtures')
+    if a.auto_desktop_usb_panic_retrieval and (not a.auto_desktop_production_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or a.auto_desktop_peer_panic or a.auto_desktop_early_nested_panic):
+        parser.error('USB panic retrieval requires the ordinary guarded desktop reset fixture')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
         parser.error('startup-script failure requires the desktop bridge fixture')
     if a.auto_desktop_shutdown and (not a.auto_desktop_network_module or a.auto_desktop_script_fail):
         parser.error('checked shutdown requires a successful desktop bridge fixture')
-    if a.auto_desktop_dell_initrd and (not a.auto_desktop or a.auto_desktop_panic or a.auto_desktop_network_module or a.inject_panic):
+    if a.auto_desktop_dell_initrd and (not a.auto_desktop or (a.auto_desktop_panic and not a.auto_desktop_usb_panic_retrieval) or a.auto_desktop_network_module or a.inject_panic):
         parser.error('Dell initrd fixture requires a non-panic auto desktop')
     if a.auto_desktop_real_provider and not a.auto_desktop_dell_initrd:
         parser.error('real provider requires the Dell initrd fixture')
@@ -636,15 +639,41 @@ def main():
             # must select recovery, retain the
             # panic packet, repair the dirty data volume and request reset.
             retry=work/'desktop-panic-recovery';retry.mkdir()
+            recovery_port=None;retrieve=None
+            if a.auto_desktop_usb_panic_retrieval:
+                with socket.socket() as probe:
+                    probe.bind(('127.0.0.1',0));recovery_port=probe.getsockname()[1]
+                def retrieve():
+                    sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                    from hardware import Hardware
+                    bridge=Hardware(work/'desktop-panic-recovery-registry');deadline=time.monotonic()+8
+                    while True:
+                        try:session=bridge.attach('127.0.0.1',recovery_port)['session'];break
+                        except (OSError,RuntimeError):
+                            if time.monotonic()>=deadline:raise
+                            time.sleep(.1)
+                    report=bridge.recovery_panic(session,str(a.output/'desktop-recovered-panic.bin'))
+                    raw=bytes.fromhex(packet)
+                    if Path(report['artifact_path']).read_bytes()!=raw or report['sequence']!=1 or report['crc32']!=f'{zlib.crc32(raw):08x}':
+                        raise RuntimeError('USB recovery bridge returned a different panic packet')
+                    doctor=bridge.doctor(session)
+                    if not doctor.get('identity_matches') or not doctor['capabilities'].get('recovery_panic') or doctor['capabilities'].get('command_jobs'):
+                        raise RuntimeError('USB recovery bridge policy mismatch')
+                    (a.output/'desktop-recovery-bridge.json').write_text(json.dumps({'report':report,'doctor':doctor},indent=2)+'\n')
             boot(disk,a.firmware,retry,False,'GUARD_COMPLETE_RESTART',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='GUARD_COMPLETE_RESTART',
-                 failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'])
+                 failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'],
+                 network_port=recovery_port,network_usb=a.auto_desktop_usb_panic_retrieval,
+                 intermediate_marker='GUARD_PANIC_RETRIEVAL_WINDOW 10s' if retrieve else None,on_intermediate=retrieve)
             shutil.copyfile(retry/'serial.log',a.output/'desktop-panic-recovery.log')
             retry_text=(retry/'serial.log').read_text(errors='replace')
             packet_bytes=bytes.fromhex(packet)
             prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}'
             if prior not in retry_text or 'GUARD_EXT2_VERIFIED_PENDING' not in retry_text:
                 raise RuntimeError('desktop panic recovery lost the packet or did not verify repair')
+            if retrieve and ('GUARD_ATTEMPT_NUMBER 1' not in retry_text or
+                             retry_text.index('GUARD_PANIC_RETRIEVAL_WINDOW 10s')>retry_text.index('GUARD_ATTEMPT_NUMBER 1')):
+                raise RuntimeError('fresh desktop panic retrieval did not precede the first repair attempt')
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
                 raise RuntimeError('desktop panic recovery changed the journal')
         with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
