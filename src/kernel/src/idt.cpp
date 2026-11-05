@@ -859,6 +859,15 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
     }
 
     ExcPutsRaw(cpuTag); ExcPutsRaw("=== HALTED ===\n");
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    if (brook::PanicRecoveryResetArmed()) {
+        // #DF may interrupt another panic before it stopped peers. Ask them to
+        // halt before the reset; never attempt filesystem or journal writes on
+        // this fragile exception stack. The serial dump above is best effort.
+        brook::SmpHaltAllAPs();
+        brook::PanicTestResetAfterDump();
+    }
+#endif
     for (;;) { __asm__ volatile("cli; hlt"); }
 }
 

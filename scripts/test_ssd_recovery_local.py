@@ -116,6 +116,8 @@ def main():
                    help='Inject an exception frame classified as a reserved-bit page fault')
     p.add_argument('--guard-panic-rsvd-pmm-held', action='store_true',
                    help='Also inject a held PMM lock and a direct-map fault address')
+    p.add_argument('--guard-panic-double-fault', action='store_true',
+                   help='Invoke the double-fault handler with a synthetic frame')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-watchdog-duration', action='store_true',
@@ -149,6 +151,7 @@ def main():
     p.add_argument('--guard-ext2-missing-checker', action='store_true',
                    help='Remove the private ext2 checker to test missing-tool handling')
     a = p.parse_args()
+    raw_fault = a.guard_panic_rsvd or a.guard_panic_double_fault
     if a.module_abi < 1:
         p.error('module ABI must be positive')
     if a.guard_auto_restart and not a.guard_complete_test:
@@ -179,6 +182,9 @@ def main():
         p.error('reserved-bit fixture requires post-pending panic without other injections or network retrieval')
     if a.guard_panic_rsvd_pmm_held and not a.guard_panic_rsvd:
         p.error('held PMM lock requires the reserved-bit fixture')
+    if a.guard_panic_double_fault and (not (a.guard_panic_after_pending or a.guard_panic_unarmed) or a.guard_panic_rsvd or
+                                       a.guard_panic_pm_fallback or a.guard_watchdog_inject or a.guard_panic_network):
+        p.error('double-fault fixture requires an armed or unarmed panic without other injections or network retrieval')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
@@ -573,7 +579,18 @@ def main():
                 commands=work/'panic.gdb'
                 prefix=('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                         f'target remote {work / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n')
-                if a.guard_panic_rsvd:
+                if a.guard_panic_double_fault:
+                    handler=symbol('_ZL17HandleDoubleFaultP14InterruptFramem')
+                    # Invoke the handler directly with a synthetic frame; this
+                    # exercises its policy, not the processor's real #DF/IST path.
+                    body=(f'set {{unsigned long long}}{scratch:#x}=0x12345678\n'
+                          f'set {{unsigned long long}}{scratch+8:#x}=8\n'
+                          f'set {{unsigned long long}}{scratch+16:#x}=2\n'
+                          f'set {{unsigned long long}}{scratch+24:#x}=0\n'
+                          f'set {{unsigned long long}}{scratch+32:#x}=0x10\n'
+                          f'set $rdi={scratch:#x}\nset $rsi=0\nset $cr2=0\n'
+                          f'set $rip={handler:#x}\ndelete breakpoints\ndetach\nquit\n')
+                elif a.guard_panic_rsvd:
                     from elftools.elf.elffile import ELFFile
                     trap=None
                     with (pair/'KERNEL.ELF').open('rb') as executable:
@@ -694,7 +711,7 @@ def main():
                         reset_wait_since=time.monotonic()
                         if a.guard_watchdog_hard_stall and (hard_stall_since is None or reset_wait_since-hard_stall_since<25):
                             raise RuntimeError('hard-stall watchdog reset occurred too early')
-                    if a.guard_panic_unarmed and 'PANIC_DISK_CAPTURE_OK' in text:
+                    if a.guard_panic_unarmed and ('Vector: 008 (#DF Double Fault)' if a.guard_panic_double_fault else 'PANIC_DISK_CAPTURE_OK') in text:
                         time.sleep(7)
                         if process.poll() is not None:raise RuntimeError('unarmed panic unexpectedly reset')
                         break
@@ -850,11 +867,13 @@ def main():
             reset_marker='PANIC_RECOVERY_RESET_WAIT' if a.guard_panic_after_pending else 'PANIC_TEST_RESET_WAIT'
             pending_ok=('GUARD_PENDING_RESULT outcome=2' in text and 'GUARD_PANIC_RESET armed=1' in text) if a.guard_panic_after_pending else 'GUARD_PENDING_RESULT' not in text
             if debugger.returncode!=0 or 'GUARD_PANIC_JOURNAL pin=0 arm=0' not in text or \
-               (not a.guard_panic_rsvd and 'PANIC_DISK_CAPTURE_OK' not in text) or (not a.guard_panic_unarmed and reset_marker not in text) or \
+               (not raw_fault and 'PANIC_DISK_CAPTURE_OK' not in text) or (not a.guard_panic_unarmed and reset_marker not in text) or \
                (a.guard_panic_unarmed and ('PANIC_RECOVERY_RESET_WAIT' in text or 'PANIC_TEST_RESET_WAIT' in text)) or not pending_ok:
                 raise RuntimeError('automatic recovery panic injection failed: '+text[-5000:])
             if a.guard_panic_rsvd and 'RSVD-corrupt-table: halting' not in text:
                 raise RuntimeError('reserved-bit fault path did not run')
+            if a.guard_panic_double_fault and 'Vector: 008 (#DF Double Fault)' not in text:
+                raise RuntimeError('double-fault handler did not run')
             if a.guard_panic_rsvd_pmm_held and not all(marker in text for marker in
                     ('PMM history unavailable: lock busy', 'unsafe page-table scan skipped for armed recovery')):
                 raise RuntimeError('held PMM lock or armed scan policy was not observed')
@@ -863,7 +882,7 @@ def main():
             if a.guard_panic_timerless_reset and 'PANIC_RECOVERY_RESET_TIMERLESS_ATTEMPT' not in text:
                 raise RuntimeError('armed timerless reset did not run')
             packet=next((line[10:] for line in text.splitlines() if line.startswith('PANIC_HEX:')),None)
-            if not packet and not a.guard_panic_rsvd:raise RuntimeError('panic packet missing')
+            if not packet and not raw_fault:raise RuntimeError('panic packet missing')
             decoded={}
             if packet:
                 decoded_output=StringIO()
@@ -875,11 +894,11 @@ def main():
             if a.guard_watchdog_held_serial and f'WATCHDOG: CPU{cpu} timer accounting unchanged for 3 checks' not in text:
                 raise RuntimeError('watchdog warning was lost while the serial lock was held')
             expected_message=(f'Recovery watchdog: CPU{cpu} timer accounting stalled for 30 checks' if a.guard_watchdog_inject else 'GDBTEST')
-            if not a.guard_panic_rsvd and (decoded.get('message')!=expected_message or not decoded.get('log_tail',{}).get('available')):
+            if not raw_fault and (decoded.get('message')!=expected_message or not decoded.get('log_tail',{}).get('available')):
                 raise RuntimeError('panic packet lacks the injected reason or recent log')
             contents=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
-            if a.guard_panic_rsvd:
-                if packet or any(contents):raise RuntimeError('reserved-bit path unexpectedly wrote a panic packet')
+            if raw_fault:
+                if packet or any(contents):raise RuntimeError('raw fault path unexpectedly wrote a panic packet')
             else:
                 verify_record(contents,0,1,bytes.fromhex(packet))
             after_outside=outside_esp_hash(disk) if a.guard_panic_after_pending else outside_digest(disk,journal_sectors)
@@ -968,7 +987,9 @@ def main():
             if a.serial_output:
                 with a.serial_output.with_suffix('.reboot.log').open('xb') as output:
                     output.write((reboot/'serial.log').read_bytes())
-            print('RECOVERY_AUTO_RSVD_RESET_PASS' if a.guard_panic_rsvd else 'RECOVERY_AUTO_PANIC_CAPTURE_PASS');return
+            print('RECOVERY_AUTO_DOUBLE_FAULT_UNARMED_HALT_PASS' if a.guard_panic_double_fault and a.guard_panic_unarmed else
+                  'RECOVERY_AUTO_DOUBLE_FAULT_RESET_PASS' if a.guard_panic_double_fault else
+                  'RECOVERY_AUTO_RSVD_RESET_PASS' if a.guard_panic_rsvd else 'RECOVERY_AUTO_PANIC_CAPTURE_PASS');return
         if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_pending_no_marker or a.guard_pending_wrong_serial:
             final = serial.read_text(errors='replace')
             if (final.count('SSD_GUARD_RESERVATION_FAILED') != 1 or
