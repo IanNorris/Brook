@@ -1154,6 +1154,12 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
             // CPUs were already halted by SmpHaltAllAPs() above.
             ExcPutsRaw("  [RSVD-corrupt-table: halting; serial dump above is the record]\n");
             brook::DisplayPowerPanicRestore();
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+            // Do not attempt the QR renderer or journal on corrupt page tables.
+            // If recovery has already armed reset, the bounded panic delay can
+            // still give the serial diagnostic time to reach the receiver.
+            brook::PanicTestResetAfterDump();
+#endif
             for (;;) __asm__ volatile("cli; hlt");
         }
 

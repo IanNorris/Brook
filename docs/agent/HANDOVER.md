@@ -6,6 +6,8 @@ The original Brook goal was paused at 01:19:47 UTC on 5 November 2026, and its l
 
 ## Current goal update, 5 November 2026
 
+The automatic-recovery reserved-bit page-fault branch now invokes the already-armed panic reset after its serial diagnostics rather than always halting. It still deliberately avoids QR rendering and a disk-journal write because page tables may be corrupt. A disposable QEMU test used GDB to classify a #UD frame as a supervisor reserved-bit page fault without actually corrupting the page tables; it verified serial output, the timed reset, an untouched blank panic journal, and guarded repair on the following boot. Evidence is `build/hardware/guard-auto-rsvd-reset-20261105.log` and its `.reboot.log`. This is undeployed, and existing earlier diagnostics can still fault or block before the reset path; it does not prove recovery from real page-table corruption.
+
 The normal kernel watchdog warning now uses bounded emergency serial output, so a stalled CPU holding the ordinary serial ticket lock cannot block the monitoring CPU while it tries to report the stall. A disposable TCG/QEMU normal boot test injected a held serial ticket and a stagnant CPU sample with GDB, then observed the CPU1 warning; this is not a physical hang test. The automatic-recovery kernel also builds. This change is not deployed to the Dell. The watchdog still needs a running monitoring CPU and scheduler, and normal boot does not yet automatically reset on this warning.
 
 
