@@ -548,6 +548,9 @@ static bool FatImageIdentityLeased(FatFsMountData* mount, uint64_t identity)
 // outside this mutex. Unknown I/O errors fail closed.
 static int FatImagePathAllowedLocked(FatFsMountData* mount,const char* path)
 {
+    // FatFs f_stat does not accept the volume root, which cannot be a
+    // leased file. Permit the subsequent directory-open path to handle it.
+    if(path && path[0]==char('0'+mount->pdrv) && path[1]==':' && path[2]=='/' && !path[3])return 0;
     bool any=false;
     for(auto* file=mount->allFiles;file;file=file->allNext)if(file->imageLease){any=true;break;}
     if(!any)return 0;
@@ -2060,8 +2063,9 @@ static const VfsFsOps g_fatFsOps = {
 };
 
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
-int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missingTarget)
+int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missingTarget,uint64_t* publication)
 {
+    if(publication)*publication=0;
     if(!session || !session->mount || !session->inspectionSucceeded || !session->journalReady || !session->journalLease ||
        __atomic_exchange_n(&session->journalPublishAttempted,true,__ATOMIC_ACQ_REL))return -22;
     auto* data=session->mount;
@@ -2072,7 +2076,7 @@ int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missing
     VfsPath root{},target{};
     int error=VfsPathRoot(&root);
     if(!error)error=VfsPathResolve(root,root,missingTarget?"/media/brook-missing-test-target":"/media/system",&target);
-    if(!error)error=VfsMountNamespaceMountFresh(VfsMountNamespaceInitial(),target,"fatfs",&g_fatFsOps,data,data->pdrv,0);
+    if(!error)error=VfsMountNamespaceMountFresh(VfsMountNamespaceInitial(),target,"fatfs",&g_fatFsOps,data,data->pdrv,0,publication);
     VfsPathRelease(target);VfsPathRelease(root);
     if(error)return error;
     KMutexLock(&g_fatLock);

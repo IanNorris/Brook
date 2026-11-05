@@ -295,8 +295,9 @@ int VfsMountNamespacePublishContext(MountNamespace* ns,const VfsPath& root,void 
     publish(argument);return 0;
 }
 int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
-    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes)
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv,uint64_t attributes,uint64_t* publication)
 {
+    if(publication)*publication=0;
     if(!ns || !inputTarget.object || !inputTarget.attachment || !fsName || !ops || !privateData)return -22;
     FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
@@ -333,7 +334,9 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     mount->rootDevice=stat.dev;mount->attributes=attributes;StrCopy(mount->physicalRoot,"/",sizeof(mount->physicalRoot));
     mount->covered=target;VfsPathRetain(target);mount->used=true;mount->linked=true;
     mount->publication=++g_mountPublication;StrCopy(mount->fsType,fsName,sizeof(mount->fsType));
-    backing->next=g_backings;g_backings=backing;g_mounts.Publish(mount);return 0;
+    backing->next=g_backings;g_backings=backing;g_mounts.Publish(mount);
+    if(publication)*publication=mount->publication;
+    return 0;
 }
 // Test exact retained ancestry, never reporting-label prefixes. The first edge
 // on the source attachment determines whether the entire child mount belongs

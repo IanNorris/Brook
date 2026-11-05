@@ -244,7 +244,8 @@ void Worker(void* arg) {
         const bool desktopPanic=journalSize==6 && !memcmp(journalMode,"test-7",6);
         const bool desktopFailed=journalSize==6 && !memcmp(journalMode,"test-8",6);
         const bool desktopShutdown=journalSize==6 && !memcmp(journalMode,"test-9",6);
-        const bool desktop=desktopPanic || desktopFailed || desktopShutdown || (journalSize==6 && !memcmp(journalMode,"test-6",6));
+        const bool desktopDenied=journalSize==6 && !memcmp(journalMode,"test-a",6);
+        const bool desktop=desktopPanic || desktopFailed || desktopShutdown || desktopDenied || (journalSize==6 && !memcmp(journalMode,"test-6",6));
         const bool publish=capture || denyCapture || failedPublish || desktop || (journalSize==6 && !memcmp(journalMode,"test-2",6));
         if(!pinOnly && !publish) {
             AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
@@ -263,11 +264,35 @@ void Worker(void* arg) {
                 KPrintf("GUARD_JOURNAL_PUBLISH_FAILED status=%d retry=%d arm=%d\n",failed,retried,arm);
                 return;
             }
-            int publishResult=FatFsPrivateRecoveryPublishJournalTest(mount);
+            uint64_t publication=0;
+            int publishResult=FatFsPrivateRecoveryPublishJournalTest(mount,false,&publication);
             KPrintf("GUARD_JOURNAL_PUBLISH_MOUNT status=%d\n",publishResult);
             if(!publishResult && FatFsPrivateRecoveryPublishJournalTest(mount)!=-22)publishResult=-5;
             if(!publishResult && !AhciSystemGuardTestBeginWrites(adapter))publishResult=-13;
             if(desktop && !publishResult) {
+                if(desktopDenied) {
+                    const bool forged=AhciSystemGuardTestAdoptSystemMount(adapter,1,publication+1);
+                    const bool retry=AhciSystemGuardTestAdoptSystemMount(adapter,1,publication);
+                    KPrintf("GUARD_JOURNAL_DESKTOP_IDENTITY_DENIED forged=%u retry=%u publication=%lu\n",
+                            forged?1u:0u,retry?1u:0u,AhciSystemVolumePublication());
+                    return;
+                }
+                if(!AhciSystemGuardTestAdoptSystemMount(adapter,1,publication)) {
+                    KPuts("GUARD_JOURNAL_DESKTOP_FAIL system-adoption\n");return;
+                }
+                VfsPath identityRoot{};int identityError=VfsPathRoot(&identityRoot);
+                auto* rootNode=!identityError?VfsOpenAt(identityRoot,identityRoot,"/media/system",VFS_O_METADATA,0,0,nullptr):nullptr;
+                auto* legacyRoot=VfsOpen("/media/system",VFS_O_METADATA);
+                auto* memberNode=VfsOpen("/media/system/EFI/BOOT/BOOTX64.EFI",VFS_O_STREAM);
+                auto* foreignNode=VfsOpen("/boot/FATFSCK.ELF",VFS_O_STREAM);
+                const bool owns=rootNode && legacyRoot && memberNode && foreignNode && AhciSystemVolumeOwnsRoot(rootNode) &&
+                    AhciSystemVolumeOwnsRoot(legacyRoot) &&
+                    AhciSystemVolumeOwnsMember(memberNode) && !AhciSystemVolumeOwnsRoot(memberNode) &&
+                    !AhciSystemVolumeOwnsMember(foreignNode);
+                if(rootNode)VfsRelease(rootNode);if(legacyRoot)VfsRelease(legacyRoot);if(memberNode)VfsRelease(memberNode);if(foreignNode)VfsRelease(foreignNode);
+                VfsPathRelease(identityRoot);
+                KPrintf("GUARD_JOURNAL_DESKTOP_SYSTEM_IDENTITY status=%d\n",owns?0:-5);
+                if(!owns){KPuts("GUARD_JOURNAL_DESKTOP_FAIL system-identity\n");return;}
                 const int armed=FatFsPrivateRecoveryArmJournalTest(mount);
                 uint8_t drive=2;
                 const bool mounted=!armed && AhciSystemGuardTestMountDesktop(adapter,&drive);

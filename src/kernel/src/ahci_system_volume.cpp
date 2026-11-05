@@ -12,6 +12,7 @@
 #include "memory/heap.h"
 #include "mount_namespace.h"
 #include "vfs.h"
+#include "vfs_path.h"
 #include "kprintf.h"
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
 #include "guard_checker_session.h"
@@ -31,6 +32,9 @@ struct Range { Device* parent=nullptr;uint64_t start=0,bytes=0; } range;
 bool attempted=false;
 uint64_t systemVolumePublication=0;
 uint8_t systemVolumeDrive=0;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+Device* guardSystemVolumeDevice=nullptr;
+#endif
 Range guardRange{};bool guardReady=false;
 int GuardRead(Device*,uint64_t offset,void* data,uint64_t length) {
     if(!guardReady || !guardRange.parent)return -19;
@@ -415,12 +419,20 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
 
 uint64_t AhciSystemVolumePublication() { return systemVolumePublication; }
 bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory) {
-    return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==&partition &&
+    Device* expected=&partition;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    if(guardSystemVolumeDevice)expected=guardSystemVolumeDevice;
+#endif
+    return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==expected &&
         VfsVnodeIsPublishedRoot(retainedDirectory,systemVolumePublication,systemVolumeDrive);
 }
 
 bool AhciSystemVolumeOwnsMember(Vnode* retainedDirectory) {
-    return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==&partition &&
+    Device* expected=&partition;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    if(guardSystemVolumeDevice)expected=guardSystemVolumeDevice;
+#endif
+    return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==expected &&
         VfsVnodeIsPublishedMember(retainedDirectory,systemVolumePublication,systemVolumeDrive);
 }
 
@@ -541,6 +553,20 @@ bool AhciSystemDirectDesktopMount(uint8_t* nextDrive) {
     return true;
 }
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
+bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t publication) {
+    static bool attemptedAdoption=false;
+    if(__atomic_exchange_n(&attemptedAdoption,true,__ATOMIC_ACQ_REL) || adapter!=&guardTestPartition ||
+       !guardReady || guardTestPhase!=GuardTestPhase::Writing || systemVolumePublication || !publication ||
+       FatFsBoundDevice(drive)!=adapter)return false;
+    VfsPath namespaceRoot{};
+    const int status=VfsPathRoot(&namespaceRoot);
+    auto* root=!status?VfsOpenAt(namespaceRoot,namespaceRoot,"/media/system",VFS_O_METADATA,0,0,nullptr):nullptr;
+    const bool valid=root && VfsVnodeIsPublishedRoot(root,publication,drive);
+    if(root)VfsRelease(root);VfsPathRelease(namespaceRoot);
+    if(!valid)return false;
+    guardSystemVolumeDevice=adapter;systemVolumeDrive=drive;systemVolumePublication=publication;
+    return true;
+}
 bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive) {
     static bool desktopAttempted=false;
     if(__atomic_exchange_n(&desktopAttempted,true,__ATOMIC_ACQ_REL) || adapter!=&guardTestPartition ||

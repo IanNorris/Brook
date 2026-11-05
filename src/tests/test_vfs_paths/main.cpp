@@ -198,7 +198,8 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
     assert(VfsMountNamespaceMountFresh(ns,target,"missing",&freshOps,&rollback)==-95);
     assert(VfsMountNamespaceMountFresh(ns,target,"objects",&freshOps,&rollback)==-95);
     freshRejectRoot=true;
-    assert(VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback)==-5);
+    uint64_t publication=99;
+    assert(VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback,0,0,&publication)==-5 && !publication);
     freshRejectRoot=false;assert(rollback.alive && !rollback.live && !freshUnmounts);
     freshFailAfterRoot=true;
     assert(VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback)==-5);
@@ -220,7 +221,7 @@ static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root
         if(published)break;
     }
     assert(published && freshUnmounts==1);
-    assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0));
+    assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0,0,&publication) && publication);
     assert(!VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0));
     // ASCII-folded reporting labels must not introduce aliases when the
     // covering filesystem's own lookup remains case-sensitive.

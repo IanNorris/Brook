@@ -28,7 +28,7 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
 // driver mount callback or (driver,pdrv) backing coalescing occurs. Bind/copy
 // retain the resulting backing normally. Authorization/options are caller work.
 int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
-    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv=0,uint64_t attributes=0);
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv=0,uint64_t attributes=0,uint64_t* publication=nullptr);
 // Owned copied metadata; no backend callbacks or nested VFS lock acquisition.
 // Caller holds namespace/root leases. Rows are ordered parent before child.
 struct VfsMountInfo {
