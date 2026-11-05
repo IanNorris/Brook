@@ -33,6 +33,12 @@ def main():
     assert parsed['missing_or_unparsed_referenced_entries'] == ['Boot0001', 'Boot0002']
     rejected(parse_option, option(file_node('x\0y\0'.encode('utf-16-le')) + end))
     rejected(parse_option, option(b'\x04\x04\x02\x00' + end))
+    rejected(parse_option, option(b'\x7f\x01\x04\x00' + end))
+    rejected(parse_option, option(file_node('x\0'.encode('utf-16-le')) + b'\x7f\x01\x04\x00' + end))
+    first=file_node('first\0'.encode('utf-16-le'))
+    second=file_node('second\0'.encode('utf-16-le'))
+    parsed_option=parse_option(option(first+b'\x7f\x01\x04\x00'+second+end))
+    assert [instance['files'] for instance in parsed_option['instances']]==[['first'],['second']]
     rejected(parse_option, option(end[:-1]))
     rejected(parse_inventory, report([('BootOrder', b'\0\0\0\0')]))
     print('Firmware inventory parser: PASS')

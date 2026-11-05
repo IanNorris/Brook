@@ -18,11 +18,12 @@ def parse_option(data):
     description=data[6:end].decode('utf-16-le',errors='strict')
     at=end+2
     if path_bytes>len(data)-at:raise ValueError('device path exceeds load option')
-    limit=at+path_bytes;nodes=[];files=[];partitions=[];ended=False
+    limit=at+path_bytes;nodes=[];files=[];partitions=[];instances=[];ended=False
     while at<limit:
         if limit-at<4:raise ValueError('short device path header')
         typ,subtype,size=struct.unpack_from('<BBH',data,at)
         if size<4 or size>limit-at:raise ValueError('invalid device path node')
+        if typ==0x7f and subtype not in (0x01,0xff):raise ValueError('unsupported device path end node')
         node=data[at:at+size];nodes.append({'type':typ,'subtype':subtype})
         if typ==4 and subtype==1:
             if size!=42:raise ValueError('invalid hard drive node')
@@ -35,12 +36,18 @@ def parse_option(data):
             if '\x00' in path:raise ValueError('embedded NUL in file path')
             files.append(path)
         at+=size
-        if typ==0x7f and subtype==0xff:
-            if size!=4 or at!=limit:raise ValueError('invalid end node')
-            ended=True
+        if typ==0x7f:
+            if size!=4:raise ValueError('invalid end node')
+            if subtype==0x01 and (len(nodes)==1 or at==limit):raise ValueError('empty device path instance')
+            if subtype==0xff and instances and len(nodes)==1:raise ValueError('empty device path instance')
+            instances.append({'nodes':nodes,'partitions':partitions,'files':files})
+            nodes=[];partitions=[];files=[]
+            if subtype==0xff:
+                if at!=limit:raise ValueError('invalid end node')
+                ended=True
     if not ended:raise ValueError('device path lacks end node')
     return {'active':bool(attributes&1),'attributes':attributes,'description':description,
-            'nodes':nodes,'partitions':partitions,'files':files,
+            'instances':instances,
             'optional_data_bytes':len(data)-limit}
 
 
