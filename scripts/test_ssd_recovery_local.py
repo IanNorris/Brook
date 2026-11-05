@@ -120,6 +120,8 @@ def main():
                    help='Invoke the double-fault handler with a synthetic frame')
     p.add_argument('--guard-panic-real-double-fault', action='store_true',
                    help='Cause a processor double fault using a deliberately invalid #PF gate')
+    p.add_argument('--guard-panic-render-stall', action='store_true',
+                   help='Stall QR rendering after the panic packet is captured')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-watchdog-duration', action='store_true',
@@ -189,6 +191,9 @@ def main():
         p.error('double-fault fixture requires an armed or unarmed panic without other injections or network retrieval')
     if a.guard_panic_real_double_fault and not a.guard_panic_double_fault:
         p.error('real double fault requires the double-fault fixture')
+    if a.guard_panic_render_stall and (not a.guard_panic_after_pending or a.guard_panic_double_fault or
+                                       a.guard_panic_rsvd or a.guard_watchdog_inject or a.guard_panic_pm_fallback or a.guard_panic_network):
+        p.error('renderer stall requires post-pending panic without other injections or network retrieval')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
@@ -695,10 +700,24 @@ def main():
                                f'set *(unsigned char*){progress+12:#x}=1\n'
                                'delete breakpoints\ndetach\nquit\n')
                 else:
+                    renderer=''
+                    if a.guard_panic_render_stall:
+                        from elftools.elf.elffile import ELFFile
+                        spin=None
+                        with (pair/'KERNEL.ELF').open('rb') as executable:
+                            for segment in ELFFile(executable).iter_segments():
+                                if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                                    at=segment.data().find(b'\xeb\xfe')
+                                    if at>=0:spin=segment['p_vaddr']+at;break
+                        if spin is None:raise RuntimeError('no executable loop for renderer stall fixture')
+                        render=symbol('qrcodegen_encodeText')
+                        renderer=(f'hbreak *{render:#x}\ncontinue\nset $rip={spin:#x}\n'
+                                  'printf "PANIC_RENDERER_STALLED\\n"\ndelete breakpoints\n')
                     body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +
                           (f'hbreak *{pit:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pit else '') +
                           (f'hbreak *{pm:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pm else '') +
+                          renderer +
                           'detach\nquit\n')
                 commands.write_text(prefix+body)
                 for _ in range(100):
@@ -743,6 +762,12 @@ def main():
                     if a.guard_panic_unarmed and ('Vector: 008 (#DF Double Fault)' if a.guard_panic_double_fault else 'PANIC_DISK_CAPTURE_OK') in text:
                         time.sleep(7)
                         if process.poll() is not None:raise RuntimeError('unarmed panic unexpectedly reset')
+                        break
+                    if a.guard_panic_render_stall and 'PANIC_RENDERER_STALLED' in (work/'qemu.log').read_text(errors='replace'):
+                        if 'PANIC_DISK_CAPTURE_OK' not in text:
+                            raise RuntimeError('renderer stalled before panic disk capture')
+                        time.sleep(1)
+                        if process.poll() is not None:raise RuntimeError('stalled renderer unexpectedly exited')
                         break
                     if (a.auto_physical_reject and
                             'SSD guard reservation failed; no recovery access permitted' in text and
@@ -896,7 +921,7 @@ def main():
             reset_marker='PANIC_RECOVERY_RESET_WAIT' if a.guard_panic_after_pending else 'PANIC_TEST_RESET_WAIT'
             pending_ok=('GUARD_PENDING_RESULT outcome=2' in text and 'GUARD_PANIC_RESET armed=1' in text) if a.guard_panic_after_pending else 'GUARD_PENDING_RESULT' not in text
             if debugger.returncode!=0 or 'GUARD_PANIC_JOURNAL pin=0 arm=0' not in text or \
-               (not raw_fault and 'PANIC_DISK_CAPTURE_OK' not in text) or (not a.guard_panic_unarmed and reset_marker not in text) or \
+               (not raw_fault and 'PANIC_DISK_CAPTURE_OK' not in text) or (not a.guard_panic_unarmed and not a.guard_panic_render_stall and reset_marker not in text) or \
                (a.guard_panic_unarmed and ('PANIC_RECOVERY_RESET_WAIT' in text or 'PANIC_TEST_RESET_WAIT' in text)) or not pending_ok:
                 raise RuntimeError('automatic recovery panic injection failed: '+text[-5000:])
             if a.guard_panic_rsvd and 'RSVD-corrupt-table: halting' not in text:
@@ -1021,7 +1046,8 @@ def main():
                 if a.guard_panic_real_double_fault:
                     with a.serial_output.with_suffix('.gdb.log').open('xb') as output:
                         output.write((work/'qemu.log').read_bytes())
-            print('RECOVERY_AUTO_DOUBLE_FAULT_UNARMED_HALT_PASS' if a.guard_panic_double_fault and a.guard_panic_unarmed else
+            print('RECOVERY_PANIC_CAPTURE_BEFORE_RENDER_STALL_PASS' if a.guard_panic_render_stall else
+                  'RECOVERY_AUTO_DOUBLE_FAULT_UNARMED_HALT_PASS' if a.guard_panic_double_fault and a.guard_panic_unarmed else
                   'RECOVERY_AUTO_DOUBLE_FAULT_RESET_PASS' if a.guard_panic_double_fault else
                   'RECOVERY_AUTO_RSVD_RESET_PASS' if a.guard_panic_rsvd else 'RECOVERY_AUTO_PANIC_CAPTURE_PASS');return
         if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_pending_no_marker or a.guard_pending_wrong_serial:

@@ -12,6 +12,9 @@
 #include "debug_overlay.h"
 #include "serial.h"
 #include "string.h"
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+#include "ahci_readonly.h"
+#endif
 
 extern "C" {
 #include "qrcodegen.h"
@@ -345,6 +348,12 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         __atomic_store_n(&g_capturedPacketBytes, sizeof(hdr) + dataLen, __ATOMIC_RELEASE);
         DumpPacketToSerial(g_capturedPacket, sizeof(hdr) + dataLen);
     }
+
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+    // Persist the completed packet before QR generation or display transfer:
+    // either can fault or stall after the serial record is already available.
+    AhciPanicTestCapture();
+#endif
 
     // The serial crash record must also be available on headless systems or
     // when the framebuffer could not be initialized. No drawing is possible.

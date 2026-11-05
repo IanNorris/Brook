@@ -2,9 +2,6 @@
 // interrupt context.  No SSE/FPU registers are touched here.
 #include "panic.h"
 #include "panic_test_reset.h"
-#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
-#include "ahci_readonly.h"
-#endif
 #include "serial.h"
 #include "tty.h"
 #include "panic_qr.h"
@@ -591,9 +588,6 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
                              nullptr, nullptr, nullptr, nullptr, &cpuList, g_panicBuf);
     }
 
-#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
-    brook::AhciPanicTestCapture();
-#endif
     brook::PanicTestResetAfterDump();
 
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)
