@@ -41,6 +41,7 @@
 #include "debug_overlay.h"
 #include "sync/kmutex.h"
 #include "gpu_app.h"
+#include "desktop_gpu_environment.h"
 #include "gpu_presentation_policy.h"
 
 // Strace control (defined in syscall.cpp)
@@ -181,9 +182,9 @@ static constexpr const char* g_defaultEnvp[] = {
     // deployed mesa store path so any GL app (gltron, SuperTuxKart, glxgears)
     // gets a working EGL display REGARDLESS of how it's launched (launcher,
     // terminal, or .rc script) — not just via the per-app play wrappers.
-    // MESA_LOADER_DRIVER_OVERRIDE forces the virtio_gpu DRI driver (correct on
-    // a virgl-only guest); it is read only by the Mesa loader, so non-GL and
-    // software-rendered apps (doom, quake2) ignore it. NB: audio-nulling
+    // The virtio-specific overrides below are retained only when the virtio
+    // app backend is registered. Other machines let Mesa select its driver.
+    // NB: audio-nulling
     // (ALSOFT_DRIVERS/SDL_AUDIODRIVER=dummy) and writable HOME/XDG redirection
     // stay in the per-app wrappers — globalising those would silence all audio
     // and collide app state. Mesa hash matches the play wrappers; bump both if
@@ -205,21 +206,14 @@ static constexpr const char* g_defaultEnvp[] = {
     nullptr
 };
 
-// Both alternatives are immutable. Concurrent launches never modify a shared
+// All alternatives are immutable. Concurrent launches never modify a shared
 // environment array or inherit a partially updated presentation policy.
-struct DesktopEnvironment {const char* entries[sizeof(g_defaultEnvp)/sizeof(g_defaultEnvp[0])+2];};
-static constexpr DesktopEnvironment VulkanEnvironment(bool direct) {
-    DesktopEnvironment env{};
-    constexpr uint32_t n=sizeof(g_defaultEnvp)/sizeof(g_defaultEnvp[0])-1;
-    for(uint32_t i=0;i<n;++i)env.entries[i]=g_defaultEnvp[i];
-    env.entries[n]=direct?"MESA_VK_WSI_DEBUG=":"MESA_VK_WSI_DEBUG=sw,noshm";
-    env.entries[n+1]=direct?"BROOK_VULKAN_PRESENTATION=direct":"BROOK_VULKAN_PRESENTATION=staged";
-    return env;
-}
-static constexpr auto g_directEnvironment=VulkanEnvironment(true);
-static constexpr auto g_stagedEnvironment=VulkanEnvironment(false);
+static constexpr auto g_directEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,true,true);
+static constexpr auto g_stagedEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,true,false);
+static constexpr auto g_nonVirtioEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,false,false);
 const char* const* ShellGetDefaultEnvp() {
     const auto* app=GpuAppGet();
+    if(!app)return g_nonVirtioEnvironment.entries;
     const auto caps=app && app->Capabilities?app->Capabilities():GpuAppCapabilities{};
     return GpuVulkanDirectPresentation(CompositorGpuActive(),caps,app && app->PrepareBlobImage)?
         g_directEnvironment.entries:g_stagedEnvironment.entries;

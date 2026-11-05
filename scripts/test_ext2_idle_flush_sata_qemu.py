@@ -47,11 +47,13 @@ def main():
     parser.add_argument('--snapshot-serial-input',type=Path,
                         help='Seed a captured PANIC_HEX packet and decode it after bridge retrieval')
     parser.add_argument('--snapshot-packet-output',type=Path,help='Save the retrieved panic packet to a new file')
+    parser.add_argument('--graphics-environment-test',action='store_true',
+                        help='Check the launched environment when no virtio GPU is present')
     parser.add_argument('--serial-output',type=Path,help='Save the guest serial log to a new file')
     parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
-    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test))>1:
+    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test,args.graphics_environment_test))>1:
         parser.error('Choose only one provisioning test')
     if args.efi_inventory_stage_test and not args.inventory_efi:
         parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
@@ -130,7 +132,9 @@ def main():
             subprocess.run(['mcopy', '-o', '-i', str(initrd), str(item), '::/ETC/' + name], check=True)
         init = d / 'INIT.RC'
         identity = disk_guid + uuid.UUID(data_part['uuid']).bytes_le.hex() + fs_uuid.hex()
-        if args.panic_snapshot_test:
+        if args.graphics_environment_test:
+            init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 1000 /boot/GFXENV.ELF\n')
+        elif args.panic_snapshot_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\n')
         elif args.panic_journal_provision_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/PANICPROV.ELF ' + identity + '\n')
@@ -147,7 +151,12 @@ def main():
             if subprocess.run(['mdir','-i',str(initrd),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(initrd),'::/DRIVERS'],check=True)
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.snapshot_network_module.resolve(strict=True)),'::/DRIVERS/virtio_net.mod'],check=True)
-        if args.panic_snapshot_test:
+        if args.graphics_environment_test:
+            probe=d/'GFXENV.ELF'
+            subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
+                            str(ROOT/'scripts/workloads/graphics_environment_probe.c'),'-o',str(probe)],check=True)
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(probe),'::/BOOT/GFXENV.ELF'],check=True)
+        elif args.panic_snapshot_test:
             pass
         elif args.panic_journal_provision_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.panic_journal_provision_test.resolve(strict=True)),'::/BOOT/PANICPROV.ELF'],check=True)
@@ -186,7 +195,8 @@ def main():
                 deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
                     output = serial.read_text(errors='replace') if serial.exists() else ''
-                    success = ('SHELL: script \'/boot/INIT.RC\' finished' if args.panic_snapshot_test else
+                    success = ('GPU_ENV_NONVIRTIO_PASS' if args.graphics_environment_test else
+                               'SHELL: script \'/boot/INIT.RC\' finished' if args.panic_snapshot_test else
                                'PANIC_JOURNAL_PROVISION_OK' if args.panic_journal_provision_test else
                                'EFI_INVENTORY_STAGE_OK' if args.efi_inventory_stage_test else
                                'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK')
@@ -222,7 +232,7 @@ def main():
                             with args.serial_output.open('x') as saved:saved.write(serial.read_text(errors='replace'))
                         print('\n'.join(line for line in output.splitlines() if 'IDLE_' in line), flush=True)
                         break
-                    if any(x in output for x in ('IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'EFI_INVENTORY_STAGE_FAILED', 'PANIC_JOURNAL_PROVISION_FAILED', 'PANIC_JOURNAL_IDENTITY_MISMATCH')):
+                    if any(x in output for x in ('GPU_ENV_NONVIRTIO_FAIL','IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'EFI_INVENTORY_STAGE_FAILED', 'PANIC_JOURNAL_PROVISION_FAILED', 'PANIC_JOURNAL_IDENTITY_MISMATCH')):
                         raise RuntimeError(output[-4500:])
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited: ' + output[-4500:])
@@ -233,6 +243,9 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+        if args.graphics_environment_test:
+            print('non-virtio graphics launch environment: PASS')
+            return
         if args.panic_snapshot_test:
             actual=subprocess.check_output(['mtype','-i',str(sata)+'@@1048576','::/PANIC.BIN'])
             if actual!=contents:raise RuntimeError('normal boot modified the panic journal')
