@@ -107,6 +107,7 @@ struct FatPrivateMount {
     Vnode* nodes[2];
     FatImageLease* leases[2];
     bool inspected;
+    bool inspectionSucceeded;
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     Vnode* journalNode;
     FatImageLease* journalLease;
@@ -1841,12 +1842,13 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* se
     }
     int error=FatFsGuardPairValidate(session->leases[0],session->leases[1]);
     for(unsigned i=0;!error && i<2;++i)error=FatFsGuardFlushReadback(session->leases[i],buffers[i]);
+    session->inspectionSucceeded=!error;
     return error;
 }
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
 {
-    if(!session || !session->mount || !session->inspected || !session->leases[0] || !session->leases[1] ||
+    if(!session || !session->mount || !session->inspected ||
        __atomic_exchange_n(&session->journalAttempted,true,__ATOMIC_ACQ_REL))return -22;
     session->journalNode=FatFsOpen(session->mount,session->mount->pdrv,"/PANIC.BIN",VFS_O_WRITE|VFS_O_READWRITE);
     if(!session->journalNode)return -2;
@@ -1878,7 +1880,7 @@ int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
 {
-    if(!session || !session->mount || !session->journalReady ||
+    if(!session || !session->mount || !session->inspectionSucceeded || !session->journalReady ||
        !__atomic_load_n(&session->journalPublished,__ATOMIC_ACQUIRE) || !session->journalLease)return -22;
     Device* device=FatFsImageLeaseDevice(session->journalLease);
     uint64_t sectors[PanicJournalSectors]{};
@@ -1904,7 +1906,7 @@ int FatFsPrivateRecoveryReadPanic(FatPrivateMount* session,uint8_t* out,uint32_t
 }
 int FatFsPrivateRecoveryArmJournal(FatPrivateMount* session)
 {
-    if(!session || !session->mount || !session->journalReady || !session->journalLease)return -22;
+    if(!session || !session->mount || !session->inspectionSucceeded || !session->journalReady || !session->journalLease)return -22;
     Device* device=FatFsImageLeaseDevice(session->journalLease);
     uint64_t sectors[PanicJournalSectors]{};
     if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
@@ -2060,7 +2062,7 @@ static const VfsFsOps g_fatFsOps = {
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missingTarget)
 {
-    if(!session || !session->mount || !session->journalReady || !session->journalLease ||
+    if(!session || !session->mount || !session->inspectionSucceeded || !session->journalReady || !session->journalLease ||
        __atomic_exchange_n(&session->journalPublishAttempted,true,__ATOMIC_ACQ_REL))return -22;
     auto* data=session->mount;
     KMutexLock(&g_fatLock);

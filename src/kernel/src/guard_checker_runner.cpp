@@ -203,7 +203,7 @@ void Worker(void* arg) {
     }
     const int inspection=FatFsPrivateRecoveryInspect(mount,records[0],records[1]);
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-    int journalPin=inspection?inspection:FatFsPrivateRecoveryPinJournal(mount);
+    int journalPin=FatFsPrivateRecoveryPinJournal(mount);
     if(!journalPin) {
         uint64_t sequence=0;uint32_t bytes=0,crc=0;
         const int read=FatFsPrivateRecoveryReadPanic(mount,g_recoveryPanicPacket,sizeof(g_recoveryPanicPacket),&sequence,&bytes,&crc);

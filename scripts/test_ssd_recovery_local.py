@@ -112,6 +112,8 @@ def main():
                    help='Retrieve the previous panic via the restricted recovery debug listener')
     p.add_argument('--guard-panic-invalid-data', action='store_true',
                    help='Damage data filesystem classification after panic and retrieve the retained packet')
+    p.add_argument('--guard-panic-missing-guard', action='store_true',
+                   help='Remove one guard after panic and retrieve the retained packet')
     p.add_argument('--guard-attempt-exhausted',action='store_true',
                    help='Start with both retry slots consumed and verify maintenance without writes')
     p.add_argument('--guard-pending-clean',action='store_true',
@@ -156,8 +158,10 @@ def main():
         p.error('PM fallback requires the post-pending panic fixture')
     if a.guard_panic_network and not a.guard_panic_after_pending:
         p.error('network retrieval requires the post-pending panic fixture')
-    if a.guard_panic_invalid_data and not (a.guard_panic_after_pending and a.guard_panic_network):
-        p.error('invalid-data panic retrieval requires post-pending panic and network')
+    if (a.guard_panic_invalid_data or a.guard_panic_missing_guard) and not (a.guard_panic_after_pending and a.guard_panic_network):
+        p.error('damaged recovery fixture requires post-pending panic and network')
+    if a.guard_panic_invalid_data and a.guard_panic_missing_guard:
+        p.error('choose one damaged recovery fixture')
     if a.guard_attempt_exhausted and (not a.auto_prepared_pair or not a.guard_auto_dispatch or a.guard_panic_inject):
         p.error('exhaustion requires an automatic dispatch fixture without panic injection')
     if a.guard_network_usb and not a.guard_panic_network:
@@ -764,7 +768,11 @@ def main():
                     features=struct.unpack('<I',damaged.read(4))[0]
                     damaged.seek(-4,1);damaged.write(struct.pack('<I',features|0x80000000))
                 invalid_before=sha(disk)
-            reboot_marker=('GUARD_AUTO_INVALID' if a.guard_panic_invalid_data else
+            if a.guard_panic_missing_guard:
+                subprocess.run(['mdel','-i',media,'::/RECOVERY/GUARD1.BIN'],check=True)
+                invalid_before=sha(disk)
+            reboot_marker=('GUARD_PENDING_INCOMPLETE records=-2' if a.guard_panic_missing_guard else
+                           'GUARD_AUTO_INVALID' if a.guard_panic_invalid_data else
                            'GUARD_COMPLETE_RESULT outcome=2' if a.guard_panic_after_pending else 'GUARD_PANIC_JOURNAL pin=0 arm=0')
             network_port=None;on_marker=None
             if a.guard_panic_network:
@@ -791,13 +799,13 @@ def main():
                 on_marker=retrieve_snapshot
             boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,reboot_marker,
                               90,True,sata_snapshot=not a.guard_panic_after_pending,sata_serial='BROOK-RECOVERY-QA',network_port=network_port,
-                              intermediate_marker=('GUARD_PANIC_PRIOR' if a.guard_panic_invalid_data else 'GUARD_PANIC_RETRIEVAL_WINDOW 10s') if on_marker else None,
+                              intermediate_marker=('GUARD_PANIC_PRIOR' if (a.guard_panic_invalid_data or a.guard_panic_missing_guard) else 'GUARD_PANIC_RETRIEVAL_WINDOW 10s') if on_marker else None,
                               on_intermediate=on_marker,network_usb=a.guard_network_usb)
             reboot_text=(reboot/'serial.log').read_text(errors='replace')
             raw_packet=bytes.fromhex(packet)
             prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(raw_packet)} crc={zlib.crc32(raw_packet):x}'
             if prior not in reboot_text:raise RuntimeError('next boot did not recover the captured panic snapshot')
-            if a.guard_panic_invalid_data:
+            if a.guard_panic_invalid_data or a.guard_panic_missing_guard:
                 if sha(disk)!=invalid_before or any(marker in reboot_text for marker in
                         ('GUARD_ATTEMPT_RESULT','GUARD_EXT2_PREEN','GUARD_COMPLETE_RESTART')):
                     raise RuntimeError('invalid data filesystem authorized recovery writes')
