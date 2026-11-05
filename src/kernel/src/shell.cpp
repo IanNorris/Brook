@@ -211,9 +211,29 @@ static constexpr const char* g_defaultEnvp[] = {
 static constexpr auto g_directEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,true,true);
 static constexpr auto g_stagedEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,true,false);
 static constexpr auto g_nonVirtioEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,false,false);
+// The Dell's staged Mesa closure differs from the QEMU image's closure. Only
+// select it after its actual loader components can be opened on this boot.
+static constexpr DesktopMesaPaths g_dellMesaPaths{
+    "LIBGL_DRIVERS_PATH=/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/lib/dri",
+    "GBM_BACKENDS_PATH=/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/lib/gbm",
+    "__EGL_VENDOR_LIBRARY_DIRS=/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/share/glvnd/egl_vendor.d"};
+static constexpr auto g_dellMesaEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,false,false,&g_dellMesaPaths);
+static bool DellMesaAvailable() {
+    const char* paths[]={
+        "/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/lib/dri/iris_dri.so",
+        "/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/lib/gbm/dri_gbm.so",
+        "/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/share/glvnd/egl_vendor.d/50_mesa.json"};
+    for(const char* path:paths) {
+        Vnode* file=VfsOpen(path,VFS_O_STREAM);
+        if(!file)return false;
+        VnodeStat st{};const bool ok=!VfsStat(file,&st) && !st.isDir && !st.isSymlink;
+        VfsClose(file);if(!ok)return false;
+    }
+    return true;
+}
 const char* const* ShellGetDefaultEnvp() {
     const auto* app=GpuAppGet();
-    if(!app)return g_nonVirtioEnvironment.entries;
+    if(!app)return DellMesaAvailable()?g_dellMesaEnvironment.entries:g_nonVirtioEnvironment.entries;
     const auto caps=app && app->Capabilities?app->Capabilities():GpuAppCapabilities{};
     return GpuVulkanDirectPresentation(CompositorGpuActive(),caps,app && app->PrepareBlobImage)?
         g_directEnvironment.entries:g_stagedEnvironment.entries;

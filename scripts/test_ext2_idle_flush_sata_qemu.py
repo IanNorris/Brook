@@ -50,12 +50,20 @@ def main():
     parser.add_argument('--snapshot-packet-output',type=Path,help='Save the retrieved panic packet to a new file')
     parser.add_argument('--graphics-environment-test',action='store_true',
                         help='Check the launched environment when no virtio GPU is present')
+    parser.add_argument('--graphics-mesa-fixture',action='store_true',
+                        help='Provision a synthetic alternate Mesa closure for the environment test')
+    parser.add_argument('--graphics-mesa-incomplete',action='store_true',
+                        help='Omit the GBM file to check fallback from an incomplete closure')
     parser.add_argument('--watchdog-held-serial-test',action='store_true',
                         help='Inject a held serial lock and a stagnant watchdog sample using GDB')
     parser.add_argument('--serial-output',type=Path,help='Save the guest serial log to a new file')
     parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
+    if args.graphics_mesa_fixture and not args.graphics_environment_test:
+        parser.error('alternate Mesa fixture requires graphics environment test')
+    if args.graphics_mesa_incomplete and not args.graphics_mesa_fixture:
+        parser.error('incomplete Mesa fixture requires the alternate Mesa fixture')
     if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test,args.graphics_environment_test,args.watchdog_held_serial_test))>1:
         parser.error('Choose only one provisioning test')
     if args.efi_inventory_stage_test and not args.inventory_efi:
@@ -90,6 +98,12 @@ def main():
             file = tree / name
             file.write_text('synthetic fixture\n')
             file.chmod(0o755)
+        if args.graphics_mesa_fixture:
+            mesa=tree/'store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6'
+            for name in ('lib/dri/libdril_dri.so','lib/gbm/dri_gbm.so','share/glvnd/egl_vendor.d/50_mesa.json'):
+                item=mesa/name;item.parent.mkdir(parents=True,exist_ok=True);item.write_text('synthetic fixture\n')
+            (mesa/'lib/dri/iris_dri.so').symlink_to('libdril_dri.so')
+            if args.graphics_mesa_incomplete:(mesa/'lib/gbm/dri_gbm.so').unlink()
         part = d / 'data.img'
         with part.open('wb') as stream:
             stream.truncate(data_part['size'] * 512)
@@ -157,6 +171,7 @@ def main():
         if args.graphics_environment_test:
             probe=d/'GFXENV.ELF'
             subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
+                            *(['-DEXPECT_ALTERNATE_MESA'] if args.graphics_mesa_fixture and not args.graphics_mesa_incomplete else []),
                             str(ROOT/'scripts/workloads/graphics_environment_probe.c'),'-o',str(probe)],check=True)
             subprocess.run(['mcopy','-o','-i',str(initrd),str(probe),'::/BOOT/GFXENV.ELF'],check=True)
         elif args.panic_snapshot_test or args.watchdog_held_serial_test:
