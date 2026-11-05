@@ -51,6 +51,8 @@ def main():
     p.add_argument('--module-abi', type=int, default=64, help='Expected ABI of staged guest modules')
     p.add_argument('--prepared-pair', type=Path,
                    help='Boot this exact physical recovery pair and verify it refuses the QEMU disk')
+    p.add_argument('--auto-physical-reject', action='store_true',
+                   help='Expect an automatic physical pair to halt on the QEMU disk')
     p.add_argument('--auto-prepared-pair', type=Path,
                    help='Boot an exact automatic recovery pair prepared for the QEMU fixture')
     p.add_argument('--fat-checker', type=Path,
@@ -120,6 +122,8 @@ def main():
         p.error('choose one failure scenario')
     if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build or a.fat_checker):
         p.error('prepared pair is an independent identity rejection scenario')
+    if a.auto_physical_reject and not a.prepared_pair:
+        p.error('automatic physical rejection requires a prepared pair')
     if a.auto_prepared_pair and (a.prepared_pair or a.kernel_build or not a.guard_auto_kernel or
                                   not a.guard_auto_dispatch or a.guard_desktop_kernel_build):
         p.error('automatic prepared pair requires the standalone automatic dispatch fixture')
@@ -478,6 +482,10 @@ def main():
                         detail = (work / 'qemu.log').read_text(errors='replace')[-4000:]
                         raise RuntimeError('QEMU exited before local check completed: ' + detail)
                     text = serial.read_text(errors='replace') if serial.exists() else ''
+                    if (a.auto_physical_reject and
+                            'SSD guard reservation failed; no recovery access permitted' in text and
+                            'System halted.' in text):
+                        break
                     if (a.guard_reservation=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial) and
                             'SSD_GUARD_RESERVATION_FAILED' in text):
                         raise RuntimeError('guard reservation failed: '+text[-4000:])
@@ -620,6 +628,12 @@ def main():
                                                        'BOOT: 65% Modules', 'SSD_GUARD_RESERVATION_READY',
                                                        'ahci system: verified GPT entry', 'writable desktop: ready'))):
                 raise RuntimeError('guard failure did not halt before later boot stages: ' + final[-5000:])
+        if a.auto_physical_reject:
+            final=serial.read_text(errors='replace')
+            if ('SSD_GUARD_RESERVATION_FAILED' not in final or
+                    any(marker in final for marker in ('SSD_GUARD_RESERVATION_READY','GUARD_CHECK_RESULT',
+                                                       'GUARD_PENDING_RESULT','GUARD_EXT2_PREEN'))):
+                raise RuntimeError('physical automatic pair did not refuse the fixture before recovery')
         if baseline:
             # Ensure only the fixed guard data and their directory entries
             # changed; GPT, data partition, FAT tables and boot code are not
@@ -731,7 +745,8 @@ def main():
             raise RuntimeError('read-only check changed the disposable disk')
         if poison and sha(poison) != poison_before:
             raise RuntimeError('guard boot changed the overmount fixture')
-        print('RECOVERY_GUEST_GUARD_EXT2_REJECT_PASS' if a.guard_ext2_test and (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) else
+        print('RECOVERY_PHYSICAL_AUTO_REJECTS_QEMU_DISK_PASS' if a.auto_physical_reject else
+              'RECOVERY_GUEST_GUARD_EXT2_REJECT_PASS' if a.guard_ext2_test and (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) else
               'RECOVERY_GUEST_GUARD_EXT2_PASS' if a.guard_ext2_test else
               'RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker or a.guard_pending_no_marker or a.guard_pending_wrong_serial else
               'RECOVERY_GUEST_GUARD_PENDING_PASS' if a.guard_pending_test else
