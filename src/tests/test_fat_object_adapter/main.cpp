@@ -93,10 +93,19 @@ int main(int argc,char** argv){
     assert(f_object_mkdir(&file,"child")==FR_NO_PATH);
     FF_OBJECT made{};assert(f_object_lookup(&held,"New retained directory",&made)==FR_OK);
     assert(f_object_parent(&made,&after)==FR_OK && after.object.sclust==held.object.sclust);
+    assert(f_object_rename(&held,"Fresh retained child.txt",&rootChild,"A renamed child.txt")==FR_OK);
+    assert(f_stat("0:/retained-root-child/A renamed child.txt",nullptr)==FR_OK);
+    assert(f_object_rename(&rootChild,"A renamed child.txt",&held,"empty")==FR_EXIST);
+    assert(f_object_rename(&rootChild,"A renamed child.txt",&held,"Fresh retained child.txt")==FR_OK);
     assert(f_object_unlink(&held,"FRESH retained CHILD.TXT")==FR_OK);
     assert(f_stat("0:/parent/moved/Fresh retained child.txt",nullptr)==FR_NO_FILE);
     assert(f_object_unlink(&root,"parent")==FR_DENIED); // nonempty directory
     assert(f_object_unlink(&held,"New retained directory")==FR_OK);
+    assert(f_object_mkdir(&held,"move directory")==FR_OK);
+    assert(f_object_rename(&held,"move directory",&rootChild,"moved directory")==FR_OK);
+    assert(f_object_lookup(&rootChild,"moved directory",&made)==FR_OK);
+    assert(f_object_parent(&made,&after)==FR_OK && after.object.sclust==rootChild.object.sclust);
+    assert(f_object_unlink(&rootChild,"moved directory")==FR_OK);
     assert(f_object_unlink(&held,"bad/name")==FR_INVALID_NAME);
     assert(f_object_unlink(&file,"child")==FR_NO_PATH);
     assert(f_object_lookup(&file,"child",&after)==FR_NO_PATH && !after.object.fs);

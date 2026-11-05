@@ -230,17 +230,22 @@ void Worker(void* arg) {
                 if(!publishResult) {
                     const int renameResult=VfsRenameAt(root,root,"/media/system/PANIC.BIN",root,"/media/system/PANIC2.BIN");
                     KPrintf("GUARD_JOURNAL_PUBLISH_RENAME status=%d\n",renameResult);
-                    if(renameResult!=-16 && renameResult!=-95)publishResult=-16;
+                    if(renameResult!=-16)publishResult=-16;
                 }
                 if(!publishResult) {
                     constexpr char witness[]="checked journal remains pinned\n";
                     int openError=0;
-                    auto* file=VfsOpenAt(root,root,"/media/system/PINTST.TXT",VFS_O_WRITE|VFS_O_CREATE,0644,0,&openError);
+                    auto* file=VfsOpenAt(root,root,"/media/system/PINTMP.TXT",VFS_O_WRITE|VFS_O_CREATE,0644,0,&openError);
                     uint64_t offset=0;
                     if(!file)publishResult=-5;
                     else {
                         if(VfsWrite(file,witness,sizeof(witness)-1,&offset)!=int(sizeof(witness)-1) || VfsFsync(file))publishResult=-5;
+                        const int whileOpen=VfsRenameAt(root,root,"/media/system/PINTMP.TXT",root,"/media/system/PINTST.TXT");
                         VfsClose(file);
+                        const int journalTarget=VfsRenameAt(root,root,"/media/system/PINTMP.TXT",root,"/media/system/PANIC.BIN");
+                        const int afterClose=VfsRenameAt(root,root,"/media/system/PINTMP.TXT",root,"/media/system/PINTST.TXT");
+                        KPrintf("GUARD_JOURNAL_PUBLISH_MOVE open=%d journal_target=%d closed=%d\n",whileOpen,journalTarget,afterClose);
+                        if(whileOpen!=-16 || journalTarget!=-16 || afterClose)publishResult=-5;
                     }
                     if(!publishResult && VfsSync(nullptr))publishResult=-5;
                 }

@@ -1529,6 +1529,51 @@ static int FatObjectRemove(VfsObject* parent,const char* name,bool directory)
     }
     KMutexUnlock(&g_fatLock);return error;
 }
+static int FatObjectRename(VfsObject* oldParent,const char* oldName,VfsObject* newParent,const char* newName)
+{
+    auto* from=static_cast<FatPathObject*>(oldParent->priv);
+    auto* to=static_cast<FatPathObject*>(newParent->priv);
+    if(!from->directory || !to->directory)return -20;
+    if(from->mount!=to->mount)return -18;
+    if(from->mount->intrinsicReadOnly)return -30;
+    KMutexLock(&g_fatLock);
+    int error=FatFlushWritersLocked(from->mount);
+    FF_OBJECT source{},target{};
+    if(!error) {
+        FRESULT result=f_object_lookup(&from->location,oldName,&source);
+        if(result!=FR_OK)error=FrToErrno(result);
+    }
+    if(!error) {
+        FRESULT result=f_object_lookup(&to->location,newName,&target);
+        if(result==FR_OK) {
+            if(FatObjectIdentity(source)==FatObjectIdentity(target)) {
+                KMutexUnlock(&g_fatLock);return 0;
+            }
+            // Never delete an existing target: FAT cannot provide an atomic
+            // replace here, and it may be the leased crash journal.
+            error=FatMutationBusyLocked(from->mount,FatObjectIdentity(target))?-16:-95;
+        } else if(result!=FR_NO_FILE)error=FrToErrno(result);
+    }
+    if(!error && FatMutationBusyLocked(from->mount,FatObjectIdentity(source)))error=-16;
+    if(!error && (source.object.attr&AM_DIR)) {
+        FF_OBJECT ancestor=to->location;
+        unsigned depth=0;
+        for(;depth<1024;++depth) {
+            if(FatObjectIdentity(ancestor)==FatObjectIdentity(source)){error=-22;break;}
+            if(!ancestor.object.sclust)break;
+            FF_OBJECT parent{};FRESULT result=f_object_parent(&ancestor,&parent);
+            if(result!=FR_OK){error=FrToErrno(result);break;}
+            ancestor=parent;
+        }
+        if(!error && depth==1024)error=-40;
+    }
+    if(!error) {
+        FRESULT result=f_object_rename(&from->location,oldName,&to->location,newName);
+        if(result!=FR_OK)error=result==FR_EXIST?-17:FrToErrno(result);
+    }
+    if(error==-FVFS_EIO)PoisonFatDriveLocked(from->mount->pdrv,error);
+    KMutexUnlock(&g_fatLock);return error;
+}
 // Current-name reporting by cluster identity. The namespace transaction
 // excludes rename; the FAT mutex protects parent scans and the LFN workspace.
 // This string is never used to reopen or mutate a retained directory.
@@ -1619,7 +1664,7 @@ static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
 }
 static const VfsObjectOps g_fatObjectOps={
     .destroy=FatObjectDestroy,.stat=FatObjectStat,.access=FatObjectAccess,
-    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,.mkdir=FatObjectMkdir,.remove=FatObjectRemove,
+    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,.mkdir=FatObjectMkdir,.remove=FatObjectRemove,.rename=FatObjectRename,
     .directory_path=FatObjectDirectoryPath,.object_path=FatObjectPath,.entry_parent=FatObjectEntryParent,
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}

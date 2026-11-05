@@ -154,6 +154,16 @@ int main(int argc,char** argv){
     assert(!FatObjectCreate(held,"NEW RETAINED.TXT",VFS_O_WRITE,0600,&error) && error==-17);
     assert(!FatObjectChild(held,"new retained.txt",&after));VnodeStat madeStat{};
     assert(!FatObjectStat(after,&madeStat) && madeStat.size==2);VfsObjectRelease(after);after=nullptr;
+    assert(!FatObjectChild(held,"new retained.txt",&after));
+    VfsObjectRetain(after);
+    assert(FatObjectRename(held,"new retained.txt",held,"renamed.txt")==-16);
+    VfsObjectRelease(after);
+    assert(FatObjectRename(held,"new retained.txt",held,"empty")==-95);
+    assert(!FatObjectRename(held,"new retained.txt",held,"renamed.txt"));
+    VfsObjectRelease(after);after=nullptr;
+    assert(!FatObjectChild(held,"renamed.txt",&after));
+    assert(!FatObjectRename(held,"renamed.txt",held,"new retained.txt"));
+    VfsObjectRelease(after);after=nullptr;
     // Model the VFS mutation's owned target reference, then an extra pin.
     assert(!FatObjectChild(held,"new retained.txt",&after));
     VfsObjectRetain(after);
@@ -174,6 +184,14 @@ int main(int argc,char** argv){
     VfsObjectRelease(after);after=nullptr;
     assert(!FatObjectChild(held,"remove-dir",&after));
     assert(!FatObjectRemove(held,"remove-dir",true));VfsObjectRelease(after);after=nullptr;
+    assert(!FatObjectMkdir(held,"cycle-a",0755));
+    assert(!FatObjectChild(held,"cycle-a",&after));
+    assert(FatObjectRename(held,"cycle-a",after,"inside")==-22);
+    assert(!FatObjectMkdir(after,"cycle-b",0755));
+    VfsObject* descendant=nullptr;assert(!FatObjectChild(after,"cycle-b",&descendant));
+    assert(FatObjectRename(held,"cycle-a",descendant,"inside")==-22);
+    assert(!FatObjectRemove(after,"cycle-b",true));VfsObjectRelease(descendant);
+    assert(!FatObjectRemove(held,"cycle-a",true));VfsObjectRelease(after);after=nullptr;
     Vnode* readCreator=FatObjectCreate(held,"readonly-create",VFS_O_READ,0600,&error);
     assert(readCreator && !error);VfsObject* createdObject=readCreator->backendObject;
     Vnode* writer=FatObjectOpen(createdObject,VFS_O_WRITE|VFS_O_READWRITE,&error);assert(writer && !error);

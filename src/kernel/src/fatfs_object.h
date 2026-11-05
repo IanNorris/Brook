@@ -27,6 +27,8 @@ FRESULT f_object_create(const FF_OBJECT*,const TCHAR* name,FIL*,BYTE mode);
 FRESULT f_object_mkdir(const FF_OBJECT*,const TCHAR* name);
 /* Remove one child of the retained directory. Caller excludes live aliases. */
 FRESULT f_object_unlink(const FF_OBJECT*,const TCHAR* name);
+/* Move to an absent child name; callers enforce alias and cycle checks. */
+FRESULT f_object_rename(const FF_OBJECT*,const TCHAR*,const FF_OBJECT*,const TCHAR*);
 // Fixed-image CLMT: bounded by file length and caller capacity, with strict
 // chain validation. Unlike upstream CREATE_LINKMAP, cycles cannot hang it.
 FRESULT f_object_image_map(FIL*,DWORD* table,UINT entries);

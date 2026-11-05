@@ -325,6 +325,68 @@ FRESULT f_object_unlink (const FF_OBJECT* parent, const TCHAR* name)
     FREE_NAMEBUFF();return res;
 }
 
+/* Same-volume move to an absent name, using FatFs' ordinary FAT rename order.
+ * This is not power-fail atomic; the checker must run after an unclean boot. */
+FRESULT f_object_rename (const FF_OBJECT* old_parent, const TCHAR* old_name,
+                         const FF_OBJECT* new_parent, const TCHAR* new_name)
+{
+    FATFS *fs, *new_fs; FRESULT res; DIR source, destination;
+    const TCHAR *cursor; unsigned length; BYTE entry[SZDIRE], *dir;
+    DEF_NAMEBUFF
+    if(!old_name || !new_name || !old_name[0] || !new_name[0])return FR_INVALID_NAME;
+    for(unsigned which=0;which<2;++which) {
+        const TCHAR* name=which?new_name:old_name;
+        for(length=0;name[length];++length)
+            if(IsSeparator(name[length]) || name[length]==':' || (unsigned)name[length]<0x20 || length>=255)return FR_INVALID_NAME;
+        if((name[0]=='.'&&!name[1]) || (name[0]=='.'&&name[1]=='.'&&!name[2]))return FR_INVALID_NAME;
+    }
+    res=object_validate(old_parent,&fs);if(res!=FR_OK)return res;
+    res=object_validate(new_parent,&new_fs);if(res!=FR_OK)return res;
+    if(fs!=new_fs)return FR_INVALID_DRIVE;
+    if(!(old_parent->object.attr&AM_DIR) || !(new_parent->object.attr&AM_DIR))return FR_NO_PATH;
+    if(fs->fs_type!=FS_FAT12 && fs->fs_type!=FS_FAT16 && fs->fs_type!=FS_FAT32)return FR_DENIED;
+    memset(&source,0,sizeof source);source.obj.fs=fs;source.obj.sclust=old_parent->object.sclust;
+    memset(&destination,0,sizeof destination);destination.obj.fs=fs;destination.obj.sclust=new_parent->object.sclust;
+    INIT_NAMEBUFF(fs);
+    cursor=old_name;res=create_name(&source,&cursor);
+    if(res==FR_OK && !(source.fn[NSFLAG]&NS_LAST))res=FR_INVALID_NAME;
+    if(res==FR_OK)res=dir_find(&source);
+    if(res==FR_OK)memcpy(entry,source.dir,SZDIRE);
+    /* Reject a damaged dot-dot entry before publishing another name. */
+    if(res==FR_OK && (entry[DIR_Attr]&AM_DIR) && old_parent->object.sclust!=new_parent->object.sclust) {
+        LBA_t sector=clst2sect(fs,ld_clust(fs,entry));
+        if(!sector)res=FR_INT_ERR;
+        else {
+            res=move_window(fs,sector);dir=fs->win+SZDIRE;
+            if(res==FR_OK && (dir[0]!='.' || dir[1]!='.' || !(dir[DIR_Attr]&AM_DIR)))res=FR_INT_ERR;
+        }
+    }
+    if(res==FR_OK) {
+        cursor=new_name;res=create_name(&destination,&cursor);
+        if(res==FR_OK && !(destination.fn[NSFLAG]&NS_LAST))res=FR_INVALID_NAME;
+        if(res==FR_OK)res=dir_find(&destination);
+        if(res==FR_OK)res=FR_EXIST;
+        else if(res==FR_NO_FILE)res=dir_register(&destination);
+    }
+    if(res==FR_OK) {
+        dir=destination.dir;memcpy(dir+13,entry+13,SZDIRE-13);
+        dir[DIR_Attr]=entry[DIR_Attr];if(!(dir[DIR_Attr]&AM_DIR))dir[DIR_Attr]|=AM_ARC;
+        fs->wflag=1;
+        if((dir[DIR_Attr]&AM_DIR) && source.obj.sclust!=destination.obj.sclust) {
+            LBA_t sector=clst2sect(fs,ld_clust(fs,dir));
+            if(!sector)res=FR_INT_ERR;
+            else {
+                res=move_window(fs,sector);dir=fs->win+SZDIRE;
+                if(res==FR_OK && (dir[0]!='.' || dir[1]!='.' || !(dir[DIR_Attr]&AM_DIR)))res=FR_INT_ERR;
+                if(res==FR_OK){st_clust(fs,dir,destination.obj.sclust);fs->wflag=1;}
+            }
+        }
+        if(res==FR_OK)res=dir_remove(&source);
+        if(res==FR_OK)res=sync_fs(fs);
+    }
+    FREE_NAMEBUFF();return res;
+}
+
 FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
 {
 #if FF_USE_FASTSEEK
