@@ -1,6 +1,8 @@
 #include "pci.h"
 #include "portio.h"
 #include "serial.h"
+#include "spinlock.h"
+#include "pci_config_access.h"
 
 namespace brook {
 
@@ -19,22 +21,22 @@ bool PciBootInventoryRead(uint32_t index, PciBootEntry* out)
 
 // ---- PCI config space via CF8/CFC ----
 
-static constexpr uint16_t PCI_CONFIG_ADDR = 0xCF8;
-static constexpr uint16_t PCI_CONFIG_DATA = 0xCFC;
-
-static uint32_t MakeAddress(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset)
-{
-    return (1u << 31)
-        | (static_cast<uint32_t>(bus) << 16)
-        | (static_cast<uint32_t>(dev & 0x1F) << 11)
-        | (static_cast<uint32_t>(fn  & 0x07) <<  8)
-        | (offset & 0xFC);
+namespace {
+IrqSpinLock pciConfigLock;
+struct ConfigLock {
+    uint64_t Acquire(){return IrqSpinLockAcquire(&pciConfigLock);}
+    void Release(uint64_t flags){IrqSpinLockRelease(&pciConfigLock,flags);}
+} configLock;
+struct ConfigIo {
+    void out32(uint16_t port,uint32_t value){outl(port,value);}
+    uint32_t in32(uint16_t port){return inl(port);}
+    void out16(uint16_t port,uint16_t value){outw(port,value);}
+} configIo;
 }
 
 uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset)
 {
-    outl(PCI_CONFIG_ADDR, MakeAddress(bus, dev, fn, offset));
-    return inl(PCI_CONFIG_DATA);
+    return PciConfigAccess<ConfigLock,ConfigIo>(configLock,configIo).Read32(bus,dev,fn,offset);
 }
 
 uint16_t PciConfigRead16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset)
@@ -51,16 +53,12 @@ uint8_t PciConfigRead8(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset)
 
 void PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset, uint32_t val)
 {
-    outl(PCI_CONFIG_ADDR, MakeAddress(bus, dev, fn, offset));
-    outl(PCI_CONFIG_DATA, val);
+    PciConfigAccess<ConfigLock,ConfigIo>(configLock,configIo).Write32(bus,dev,fn,offset,val);
 }
 
 void PciConfigWrite16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t offset, uint16_t val)
 {
-    uint32_t cur = PciConfigRead32(bus, dev, fn, offset & ~3u);
-    uint32_t shift = (offset & 2) * 8;
-    cur = (cur & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(val) << shift);
-    PciConfigWrite32(bus, dev, fn, offset & ~3u, cur);
+    PciConfigAccess<ConfigLock,ConfigIo>(configLock,configIo).Write16(bus,dev,fn,offset,val);
 }
 
 // ---- Device scan helpers ----
