@@ -15,6 +15,9 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive);
 uint64_t AhciSystemVolumePublication();
 bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory);
 bool AhciSystemVolumeOwnsMember(Vnode* retainedDirectory);
+#if defined(BROOK_AHCI_PANIC_TEST)
+void AhciPanicTestPrepareFat();
+#endif
 // Boot-only experimental preparation. Reserves the ESP for the returned
 // adapter and denies data/GPT writes. Does not mount or expose filesystems.
 // Only call before any filesystem, caches or user processes can access disk.

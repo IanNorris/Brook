@@ -13,6 +13,10 @@
 #include "mount_namespace.h"
 #include "vfs.h"
 #include "kprintf.h"
+#if defined(BROOK_AHCI_PANIC_TEST)
+#include "fatfs_vfs.h"
+#include "panic_journal.h"
+#endif
 #if !defined(BROOK_HOST_TEST)
 #include "string.h"
 #endif
@@ -358,6 +362,34 @@ bool AhciSystemVolumeOwnsMember(Vnode* retainedDirectory) {
     return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==&partition &&
         VfsVnodeIsPublishedMember(retainedDirectory,systemVolumePublication,systemVolumeDrive);
 }
+
+#if defined(BROOK_AHCI_PANIC_TEST)
+void AhciPanicTestPrepareFat() {
+    if(!AhciPanicTestFatCandidate())return;
+    static FatImageLease* retained=nullptr;
+    static bool journalAttempted=false;
+    if(journalAttempted || retained)return;journalAttempted=true;
+    auto* node=VfsOpen("/media/system/PANIC.BIN",VFS_O_WRITE|VFS_O_READWRITE);
+    if(!node || !AhciSystemVolumeOwnsMember(node) || range.parent!=AhciWriteAdmittedDevice() ||
+       (range.start&511) || (range.bytes&511)) {
+        if(node)VfsRelease(node);SerialPuts("PANIC_TEST_FAT_REJECTED\n");return;
+    }
+    FatImageLease* lease=nullptr;
+    const int opened=FatFsAcquireImageLease(node,uint64_t(PanicJournalSectors)*512,&lease);
+    if(opened || !lease) {VfsRelease(node);SerialPuts("PANIC_TEST_FAT_REJECTED\n");return;}
+    uint64_t sectors[PanicJournalSectors]{};
+    const bool ready=FatFsImageLeaseDevice(lease)==&partition &&
+        !FatFsJournalSectorMap(lease,sectors,PanicJournalSectors) &&
+        AhciPanicTestMapSectors(sectors,PanicJournalSectors,range.start/512,range.bytes/512);
+    if(!ready) {
+        // Failure may poison a lease; retain it if checked release fails.
+        if(FatFsReleaseImageLease(lease))retained=lease;
+        VfsRelease(node);SerialPuts("PANIC_TEST_FAT_REJECTED\n");return;
+    }
+    retained=lease;VfsRelease(node);
+    SerialPuts("PANIC_TEST_FAT_READY\n");
+}
+#endif
 
 void AhciSystemDataInspect() {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)

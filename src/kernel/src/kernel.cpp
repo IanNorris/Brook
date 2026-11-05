@@ -944,6 +944,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
 #endif
     if(systemVolume==brook::AhciSystemBoot::Ready) {
+#if defined(BROOK_AHCI_PANIC_TEST)
+        brook::AhciPanicTestPrepareFat();
+#endif
         if(productionDirectRequested)productionDirectReady=brook::AhciSystemDirectDesktopMount(&nextPdrv);
         else brook::AhciSystemDataInspect();
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)

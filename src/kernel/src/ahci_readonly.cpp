@@ -50,8 +50,9 @@ bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
 #if defined(BROOK_AHCI_PANIC_TEST)
-bool panicTestReady=false,panicTestCandidate=false,panicIoMode=false;
+bool panicTestReady=false,panicTestCandidate=false,panicTestFat=false,panicIoMode=false;
 constexpr uint64_t panicTestStart=4096;
+uint64_t panicTestMap[PanicJournalSectors]{};
 #endif
 #if defined(BROOK_SSD_INSTALLER)
 bool physicalInstallMode=false;
@@ -346,10 +347,14 @@ void AhciReadOnlyInit() {
     // explicit QEMU fw_cfg marker and a separate exact-identity scratch disk.
     char testMarker[16]{};
     const auto markerBytes=FwCfgReadFile("opt/brook/panic-test-disk",testMarker,sizeof(testMarker));
-    panicTestCandidate=writeEnabled && markerBytes==9 && !memcmp(testMarker,"journal-1",9) &&
+    const bool q35=writeEnabled &&
         pci.vendorId==0x8086 && pci.deviceId==0x2922 && pci.bus==0 && pci.dev==31 && pci.fn==2 &&
-        selected==0 && info.sectors==131072 && info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
-        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-PANIC-QA");
+        selected==0 && info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
+        !strcmp(info.model,"QEMU HARDDISK");
+    panicTestFat=q35 && markerBytes==13 && !memcmp(testMarker,"journal-fat-1",13) &&
+        info.sectors==262144 && !strcmp(info.serial,"BROOK-PANIC-FAT");
+    panicTestCandidate=panicTestFat || (q35 && markerBytes==9 && !memcmp(testMarker,"journal-1",9) &&
+        info.sectors==131072 && !strcmp(info.serial,"BROOK-PANIC-QA"));
     writeEnabled=panicTestCandidate;
 #endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
@@ -427,7 +432,7 @@ void AhciReadOnlyInit() {
 #endif
     status.ready=true;status.reason="read-only ATA device ready";
 #if defined(BROOK_AHCI_PANIC_TEST)
-    if(panicTestCandidate) {
+    if(panicTestCandidate && !panicTestFat) {
         // A separate 64 MiB unpartitioned disk is required. Accept an empty
         // journal or a previously valid test capture, never unknown contents.
         bool safe=ReadBlocks(0,1);
@@ -509,6 +514,35 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     return ok?512:-5;
 }
 #if defined(BROOK_AHCI_PANIC_TEST)
+bool AhciPanicTestFatCandidate() {
+    return panicTestFat && __atomic_load_n(&published,__ATOMIC_ACQUIRE);
+}
+bool AhciPanicTestMapSectors(const uint64_t* sectors,uint32_t count,uint64_t first,uint64_t length) {
+    if(!panicTestFat || panicTestReady || !sectors || count!=PanicJournalSectors ||
+       !__atomic_load_n(&published,__ATOMIC_ACQUIRE) || !length ||
+       first>=status.sectors || length>status.sectors-first)return false;
+    NormalIoGuard guard;if(!guard.admitted || !status.ready)return false;
+    uint64_t mapped[PanicJournalSectors]{};
+    for(uint32_t i=0;i<count;++i) {
+        if(sectors[i]>=length)return false;
+        mapped[i]=first+sectors[i];
+        for(uint32_t j=0;j<i;++j)if(mapped[i]==mapped[j])return false;
+    }
+    struct MapRead {
+        const uint64_t* map;
+        bool read(uint32_t sector,uint8_t* output) {
+            if(sector>=PanicJournalSectors || !ReadBlocks(map[sector],1))return false;
+            memcpy(output,dma+dataOffset,512);return true;
+        }
+    } reader{mapped};
+    PanicJournalRecord a{},b{};
+    if(PanicJournalInspect(reader,0,a)!=PanicJournalResult::Ok ||
+       PanicJournalInspect(reader,1,b)!=PanicJournalResult::Ok ||
+       !((a.blank && b.blank) || a.valid || b.valid) ||
+       (a.valid && b.valid && a.sequence==b.sequence))return false;
+    for(uint32_t i=0;i<count;++i)panicTestMap[i]=mapped[i];
+    panicTestReady=true;return true;
+}
 void AhciPanicTestCapture() {
     const uint8_t* packet=nullptr;uint32_t bytes=0;
     if(!panicTestReady || !PanicCapturedPacket(&packet,&bytes))return;
@@ -520,13 +554,14 @@ void AhciPanicTestCapture() {
     panicIoMode=true;
     struct PanicIo {
         bool read(uint32_t sector,uint8_t* output) {
-            if(sector>=PanicJournalSectors || !ReadBlocks(panicTestStart+sector,1))return false;
+            if(sector>=PanicJournalSectors || !ReadBlocks(panicTestFat?panicTestMap[sector]:panicTestStart+sector,1))return false;
             memcpy(output,dma+dataOffset,512);return true;
         }
         bool write(uint32_t sector,const uint8_t* input) {
             if(sector>=PanicJournalSectors)return false;
             memcpy(dma+dataOffset,input,512);AhciReadPlan plan{};
-            return AhciPlanWrite(plan,panicTestStart+sector,1,status.sectors,dmaPhys+dataOffset,dma64) && Run(plan,512);
+            const uint64_t lba=panicTestFat?panicTestMap[sector]:panicTestStart+sector;
+            return AhciPlanWrite(plan,lba,1,status.sectors,dmaPhys+dataOffset,dma64) && Run(plan,512);
         }
         bool flush() {
             AhciReadPlan plan{};return AhciPlanFlush(plan,true) && Run(plan,0);
