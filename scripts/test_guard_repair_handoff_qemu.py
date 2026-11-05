@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--auto-desktop',action='store_true',help='Use an automatic guard kernel with checked desktop handoff')
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
+    parser.add_argument('--auto-desktop-production-reset',action='store_true',help='Use guarded desktop reset without the QEMU-only test selector')
     parser.add_argument('--auto-desktop-no-test-request',action='store_true',help='Request the QEMU reset hook on a build that must not contain it')
     parser.add_argument('--auto-desktop-hard-stall',action='store_true',help='Stall a real vCPU and require watchdog capture and reset')
     parser.add_argument('--auto-desktop-headless-panic',action='store_true',help='Force the panic framebuffer lookup to fail and check diagnostic sections')
@@ -74,6 +75,8 @@ def main():
         parser.error('desktop panic requires auto desktop and excludes repair panic')
     if a.auto_desktop_reset and not a.auto_desktop_panic:
         parser.error('desktop reset requires desktop panic injection')
+    if a.auto_desktop_production_reset and not a.auto_desktop_reset:
+        parser.error('guarded desktop reset requires the reset fixture')
     if a.auto_desktop_no_test_request and (not a.auto_desktop_panic or a.auto_desktop_reset):
         parser.error('disabled-hook request requires an unarmed desktop panic fixture')
     if a.auto_desktop_shutdown_panic and not a.auto_desktop_reset:
@@ -103,6 +106,10 @@ def main():
         parser.error('automatic desktop pair lacks the guarded desktop build option')
     if a.auto_desktop_no_test_request and json.loads((a.desktop_pair/'manifest.json').read_text()).get('kernel_build_flags',{}).get('BROOK_SSD_GUARDED_DESKTOP_RESET_TEST')!='OFF':
         parser.error('disabled-hook request requires a build with desktop reset test off')
+    if a.auto_desktop_production_reset:
+        flags=json.loads((a.desktop_pair/'manifest.json').read_text()).get('kernel_build_flags',{})
+        if flags.get('BROOK_SSD_GUARDED_DESKTOP_RESET')!='ON' or flags.get('BROOK_SSD_GUARDED_DESKTOP_RESET_TEST')!='OFF':
+            parser.error('guarded desktop reset requires its build option and no QEMU test hook')
     a.output.mkdir(parents=True,exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
@@ -363,13 +370,19 @@ def main():
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                            f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'+body)
             capture_seen=[]
-            boot(disk,a.firmware,second,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
-                 sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
-                 expect_reset=a.auto_desktop_reset and not (a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall),
-                 hold_after_marker=7 if a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall or not a.auto_desktop_reset else 0,reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',
-                 on_marker=lambda:capture_seen.append(time.monotonic()),
-                 smp=4 if a.auto_desktop_hard_stall else 2,
-                 extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-desktop-panic-reset,string=test-1'] if a.auto_desktop_reset or a.auto_desktop_no_test_request else None)
+            try:
+                boot(disk,a.firmware,second,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
+                     sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                     expect_reset=a.auto_desktop_reset and not (a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall),
+                     hold_after_marker=7 if a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall or not a.auto_desktop_reset else 0,reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',
+                     on_marker=lambda:capture_seen.append(time.monotonic()),
+                     smp=4 if a.auto_desktop_hard_stall else 2,
+                     extra_fw_cfg=(['name=opt/brook/power,string=q35-reset']+
+                         ([] if a.auto_desktop_production_reset else ['name=opt/guard-desktop-panic-reset,string=test-1'])
+                         if a.auto_desktop_reset or a.auto_desktop_no_test_request else None))
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
             if a.auto_desktop_hard_stall:
                 debugger_log=(second/'qemu.log').read_text(errors='replace')
                 (a.output/'desktop-stall-gdb.log').write_text(debugger_log)

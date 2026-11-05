@@ -72,6 +72,18 @@ class GuardPairTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'unsafe compile flags'):self.prepare()
         self.assertFalse(self.output.exists())
 
+    def test_rejects_desktop_reset_option_and_define(self):
+        cache=self.build/'CMakeCache.txt'
+        cache.write_text(cache.read_text().replace('BROOK_SSD_GUARDED_DESKTOP_RESET:BOOL=OFF',
+                                                   'BROOK_SSD_GUARDED_DESKTOP_RESET:BOOL=ON'))
+        with self.assertRaisesRegex(ValueError,'unsafe kernel build option'):self.prepare()
+        cache.write_text(cache.read_text().replace('BROOK_SSD_GUARDED_DESKTOP_RESET:BOOL=ON',
+                                                   'BROOK_SSD_GUARDED_DESKTOP_RESET:BOOL=OFF'))
+        self.commands[0]['command']+=' -DBROOK_SSD_GUARDED_DESKTOP_RESET=1'
+        (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
+        with self.assertRaisesRegex(ValueError,'unsafe compile flags'):self.prepare()
+        self.assertFalse(self.output.exists())
+
     def test_rejects_split_define_and_guard_undef(self):
         for extra in ('-D BROOK_SSD_INSTALLER=1','-UBROOK_SSD_GUARD_CHECK','-U BROOK_SSD_GUARD_CHECK','@flags.rsp'):
             with self.subTest(extra=extra):

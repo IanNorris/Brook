@@ -250,6 +250,11 @@ void Worker(void* arg) {
         uint8_t drive=2;
         if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive))handoff=-5;
         if(handoff) {KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d\n",handoff);return;}
+#if defined(BROOK_SSD_GUARDED_DESKTOP_RESET)
+        // All guard, journal and dirty-session admission checks have passed.
+        // Reset is opt-in and still requires a supported platform reset plan.
+        KPrintf("GUARD_DESKTOP_PANIC_RESET armed=%u\n",PanicRecoveryResetArm()?1u:0u);
+#endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
         // Only the disposable QEMU fixture supplies both explicit requests.
         // Physical enablement additionally requires verified firmware paths.
