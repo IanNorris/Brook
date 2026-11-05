@@ -383,6 +383,21 @@ int VfsPathFromVnode(Vnode* node,VfsPath* out)
 {
     FileMutationGuard lookup(false);return VfsPathFromVnodeLocked(node,out);
 }
+bool VfsVnodeIsPublishedRoot(Vnode* node,uint64_t publication,uint8_t pdrv)
+{
+    if(!node || !publication)return false;
+    FileMutationGuard lookup(false);
+    VfsPath path{};
+    if(VfsPathFromVnodeLocked(node,&path))return false;
+    auto* mount=static_cast<MountEntry*>(path.attachment);
+    const bool matches=mount && mount->used && mount->linked &&
+        mount->owner==&g_initialNamespace && mount->publication==publication &&
+        mount->backing && mount->backing->pdrv==pdrv && mount->rootIdentityKnown &&
+        path.object->ops==mount->rootObjectOps && path.object->identity==mount->rootIdentity &&
+        !(__atomic_load_n(&mount->referenceState,__ATOMIC_ACQUIRE)&MOUNT_DETACHED);
+    VfsPathRelease(path);
+    return matches;
+}
 int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,VfsPath* out,bool followFinal,bool realIds)
 {
     if(!out)return -22;

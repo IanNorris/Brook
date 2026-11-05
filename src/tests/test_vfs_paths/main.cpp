@@ -947,7 +947,23 @@ int main(){
     assert(!VfsMountConfiguredWithPublication("/","objects",1,0,&rejected));assert(rejected==0);
     Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"}, namespaceTarget{&mounts[0],900,true,&mounts[0].root,{},{}};
     mounts[0].root.children={{"dir",&directory},{"file",&file},{"namespace-target",&namespaceTarget}};directory.children={{"marker",&marker},{"absolute",&link}};
+    auto* rootNode=VfsOpen("/");auto* childNode=VfsOpen("/dir");
+    assert(rootNode && childNode && VfsVnodeIsPublishedRoot(rootNode,publication,0));
+    assert(!VfsVnodeIsPublishedRoot(childNode,publication,0));
+    assert(!VfsVnodeIsPublishedRoot(rootNode,publication+1,0));
+    assert(!VfsVnodeIsPublishedRoot(rootNode,publication,1));
+    VfsClose(childNode);VfsClose(rootNode);
     VfsPath root{},held{};assert(!VfsPathRoot(&root));held=resolve(root,root,"/dir");
+    {
+        uint64_t childPublication=0;
+        assert(VfsMountConfiguredWithPublication("/dir","objects",0,0,&childPublication));
+        auto* mountedNode=VfsOpen("/dir");assert(mountedNode);
+        assert(VfsVnodeIsPublishedRoot(mountedNode,childPublication,0));
+        auto mountedPath=resolve(root,root,"/dir");
+        assert(!VfsMountNamespaceDetach(&g_initialNamespace,mountedPath));
+        assert(!VfsVnodeIsPublishedRoot(mountedNode,childPublication,0));
+        VfsPathRelease(mountedPath);VfsClose(mountedNode);VfsDrainMountCleanup();
+    }
     testProcessContexts(root,held);
     auto original=resolve(root,held,"marker");expect(root,held,"absolute",original);
     // The actual namespace lock stabilizes lookup against a hostile rename.
