@@ -16,7 +16,8 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools'))
 from hardware_update_protocol import record
 from test_recovery_menu_boot import boot
-from test_recovery_data_dispatch import metadata_hash
+from test_recovery_data_dispatch import metadata_hash,outside_esp_hash
+from test_panic_fat_qemu import verify_record
 from test_ext2_idle_flush_sata_qemu import DIRS,FILES
 
 
@@ -46,6 +47,7 @@ def main():
     for name in ('image','efi','firmware','desktop-pair','recovery-pair','output'):
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--identity',required=True)
+    parser.add_argument('--inject-panic',action='store_true',help='Interrupt the first repair attempt after pending state using GDB')
     a=parser.parse_args()
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
@@ -91,12 +93,45 @@ def main():
         journal=work/'PANIC.BIN';journal.write_bytes(bytes(258*512))
         subprocess.run(['mcopy','-o','-i',media,str(journal),'::/PANIC.BIN'],check=True)
         metadata=metadata_hash(disk)
+        journal_after=journal.read_bytes()
+        if a.inject_panic:
+            before_data=outside_esp_hash(disk)
+            symbols=subprocess.check_output(['nm',str(a.recovery_pair/'KERNEL.ELF')],text=True)
+            def symbol(name):
+                matches=[int(line.split()[0],16) for line in symbols.splitlines() if line.split()[-1:]==[name]]
+                if len(matches)!=1:raise RuntimeError('missing exact panic injection symbol '+name)
+                return matches[0]
+            pending=symbol('_ZN5brook12_GLOBAL__N_114RunExt2CheckerEPNS_6DeviceEb')
+            panic=symbol('KernelPanic');scratch=symbol('_ZN5brookL8g_kbdBufE')
+            interrupted=work/'interrupted';interrupted.mkdir()
+            gdb=interrupted/'panic.gdb'
+            gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
+                           f'target remote {interrupted / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n'
+                           f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
+                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\ndetach\nquit\n')
+            boot(disk,a.firmware,interrupted,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',
+                 extra_fw_cfg=['name=opt/brook/power,string=q35-reset'],gdb_script=gdb)
+            shutil.copyfile(interrupted/'serial.log',a.output/'interrupted-serial.log')
+            failed=(interrupted/'serial.log').read_text(errors='replace')
+            if 'GUARD_ATTEMPT_NUMBER 1' not in failed or 'GUARD_PANIC_RESET armed=1' not in failed:
+                raise RuntimeError('injected panic occurred before repair authorization')
+            packet=next((line[10:] for line in failed.splitlines() if line.startswith('PANIC_HEX:')),None)
+            if not packet:raise RuntimeError('injected panic packet missing')
+            packet_bytes=bytes.fromhex(packet)
+            journal_after=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
+            verify_record(journal_after,0,1,packet_bytes)
+            if outside_esp_hash(disk)!=before_data:raise RuntimeError('interrupted repair changed disk outside ESP')
         first=work/'repair';first.mkdir()
         boot(disk,a.firmware,first,False,'GUARD_COMPLETE_RESTART',120,True,sata_snapshot=False,
              sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='GUARD_COMPLETE_RESTART',
              failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'])
         shutil.copyfile(first/'serial.log',a.output/'repair-serial.log')
         serial=(first/'serial.log').read_text(errors='replace')
+        if a.inject_panic:
+            prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}'
+            if prior not in serial or 'GUARD_ATTEMPT_NUMBER 2' not in serial:
+                raise RuntimeError('retry did not recover the exact panic and consume attempt two')
         for marker in ('Recovery required; normal boot blocked.','brook-ssd-recovery-automatic-v1','GUARD_AUTO_NEEDS_CHECK','GUARD_EXT2_VERIFIED_PENDING','GUARD_COMPLETE_RESULT outcome=2'):
             if marker not in serial:raise RuntimeError('automatic repair did not reach '+marker)
         guards=[subprocess.check_output(['mtype','-i',media,'::/RECOVERY/'+name]) for name in ('GUARD0.BIN','GUARD1.BIN')]
@@ -117,7 +152,7 @@ def main():
         if ('GUARD_DESKTOP_SERVICE_PASS' not in serial or 'brook-ssd-recovery-automatic-v1' in serial or
             'Recovery required; normal boot blocked.' in serial):
             raise RuntimeError('guarded desktop service did not start after repair')
-        if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal.read_bytes():raise RuntimeError('journal unexpectedly changed')
+        if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal unexpectedly changed')
         for index in range(2):
             if subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])!=guards[index]:
                 raise RuntimeError('desktop changed verified clean guard records')

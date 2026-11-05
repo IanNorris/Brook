@@ -19,7 +19,7 @@ from pathlib import Path
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
          network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
-         reset_evidence_marker='PANIC_TEST_RESET_WAIT'):
+         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -53,13 +53,24 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                     ['-device','virtio-net-pci,netdev=recovery-net'])
     for item in extra_fw_cfg or ():
         command += ['-fw_cfg',item]
+    if gdb_script is not None:
+        command += ['-S','-gdb',f'unix:{work / "gdb.sock"},server=on,wait=off']
     with (work / 'qemu.log').open('wb') as errors:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
+        debugger=None
         try:
+            if gdb_script is not None:
+                socket_deadline=time.monotonic()+10
+                while not (work/'gdb.sock').exists() and process.poll() is None and time.monotonic()<socket_deadline:
+                    time.sleep(.05)
+                if not (work/'gdb.sock').exists():raise RuntimeError('QEMU debugger socket unavailable')
+                debugger=subprocess.Popen(['gdb','-q','-batch','-x',str(gdb_script)],stdout=errors,stderr=subprocess.STDOUT)
             deadline = time.monotonic() + timeout
             send_until = time.monotonic() + 12
             intermediate_done=False
             while time.monotonic() < deadline:
+                if debugger and debugger.poll() not in (None,0):
+                    raise RuntimeError('QEMU debugger failed: '+(work/'qemu.log').read_text(errors='replace')[-2000:])
                 if recovery and monitor.exists() and time.monotonic() < send_until:
                     try:
                         with socket.socket(socket.AF_UNIX) as connection:
@@ -100,6 +111,10 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                 time.sleep(0.2)
             raise RuntimeError(f'timed out waiting for {marker!r}; serial tail: {data[-10000:]!r}')
         finally:
+            if debugger and debugger.poll() is None:
+                debugger.terminate()
+                try:debugger.wait(timeout=5)
+                except subprocess.TimeoutExpired:debugger.kill();debugger.wait()
             process.terminate()
             try:
                 process.wait(timeout=5)
