@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 import zlib
 from test_recovery_menu_boot import boot
+from test_panic_fat_qemu import verify_record
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 from hardware_update_protocol import record as slot_record
 
@@ -74,7 +75,7 @@ def main():
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):p.error('invalid identity')
     a.output.mkdir(parents=True,exist_ok=False)
     scenarios=('dirty','pending','wrong-uuid','wrong-ata','checker-corrupt','journal-crosslink',
-               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
+               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing','journal-publish-panic') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
     if a.case:
         if a.case not in scenarios:p.error('invalid scenario for this mode')
         scenarios=(a.case,)
@@ -144,7 +145,7 @@ def main():
             if scenario=='journal-crosslink' or scenario.startswith(('journal-pin','journal-publish')):
                 contents=bytearray((257 if scenario=='journal-pin-short' else 258)*512)
                 if scenario=='journal-pin-corrupt':contents[0]=0xff
-                if scenario in ('journal-pin-existing','journal-publish-existing'):
+                if scenario in ('journal-pin-existing','journal-publish-existing','journal-publish-panic'):
                     payload=b'previous panic evidence';contents[:8]=b'BRKPAN01'
                     struct.pack_into('<IIQI',contents,8,1,len(payload),7,zlib.crc32(payload))
                     struct.pack_into('<I',contents,28,zlib.crc32(contents[:512]));contents[512:512+len(payload)]=payload
@@ -170,6 +171,7 @@ def main():
                         'GUARD_RECORDS_INCOMPLETE mismatch' if scenario=='pending' else
                         'GUARD_CHECK_INCOMPLETE load=-8' if scenario=='checker-corrupt' else
                         'GUARD_CHECK_RESULT exit=1' if scenario in ('journal-crosslink','journal-pin-crosslink') else
+                        'PANIC_TEST_DISK_CAPTURE_OK' if scenario=='journal-publish-panic' else
                         'GUARD_JOURNAL_PUBLISH_RESULT status=0' if scenario.startswith('journal-publish') else
                         'GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22' if scenario in ('journal-pin','journal-pin-existing') else
                         'GUARD_JOURNAL_PIN_RESULT status=-22 repeated=-22' if scenario in ('journal-pin-short','journal-pin-corrupt') else 'SSD_GUARD_RESERVATION_FAILED')
@@ -181,10 +183,19 @@ def main():
                  sata_serial=('BROOK-WRONG-DEVICE' if scenario=='wrong-ata' else 'BROOK-RECOVERY-QA') if pair else None,
                  failure_marker=('GUARD_JOURNAL_PUBLISH_RESULT status=-' if scenario.startswith('journal-publish') else
                                  'SSD_GUARD_RESERVATION_FAILED' if scenario.startswith('journal-pin') else None),
-                 extra_fw_cfg=['name=opt/guard-journal-pin,string=test-2' if scenario.startswith('journal-publish') else 'name=opt/guard-journal-pin,string=test-1'] if scenario.startswith(('journal-pin','journal-publish')) else None)
+                 extra_fw_cfg=(['name=opt/guard-journal-pin,string=test-3','name=opt/guard-panic-capture,string=test-1','name=opt/brook/power,string=q35-reset','name=opt/brook/panic-test-reset,string=test-1s','name=opt/brook/panic-test-headless,string=yes'] if scenario=='journal-publish-panic' else
+                               ['name=opt/guard-journal-pin,string=test-2' if scenario.startswith('journal-publish') else 'name=opt/guard-journal-pin,string=test-1'] if scenario.startswith(('journal-pin','journal-publish')) else None),
+                 expect_reset=scenario=='journal-publish-panic')
             if scenario.startswith('journal-publish'):
                 if outside_esp_hash(disk)!=outside:raise RuntimeError('write outside the ESP')
-                if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=contents:raise RuntimeError('published journal changed')
+                current=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
+                if scenario=='journal-publish-panic':
+                    serial=(work/'serial.log').read_text(errors='replace')
+                    packet=next((line[10:] for line in serial.splitlines() if line.startswith('PANIC_HEX:')),None)
+                    if not packet:raise RuntimeError('panic packet absent from serial')
+                    if current[:129*512]!=contents[:129*512]:raise RuntimeError('previous panic record changed')
+                    verify_record(current,1,8,bytes.fromhex(packet))
+                elif current!=contents:raise RuntimeError('published journal changed')
                 if subprocess.check_output(['mtype','-i',media,'::/PINTST.TXT'])!=b'checked journal remains pinned\n':raise RuntimeError('ordinary FAT witness differs')
                 fat=work/'fat.img'
                 with disk.open('rb') as inp, fat.open('wb') as out:
@@ -194,6 +205,18 @@ def main():
                         if not block:raise RuntimeError('short FAT partition read')
                         out.write(block);remaining-=len(block)
                 subprocess.run(['fsck.fat','-n',str(fat)],check=True,stdout=subprocess.DEVNULL,timeout=30)
+                if scenario=='journal-publish-panic':
+                    reboot=work/'reboot';reboot.mkdir()
+                    boot(disk,a.firmware,reboot,False,'GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22',90,True,forbid,
+                         sata_snapshot=False,hold_after_marker=2,sata_serial='BROOK-RECOVERY-QA',
+                         failure_marker='GUARD_JOURNAL_PIN_RESULT status=-',
+                         extra_fw_cfg=['name=opt/guard-journal-pin,string=test-1'])
+                    if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=current:
+                        raise RuntimeError('panic journal changed on the subsequent boot')
+                    reboot_serial=(reboot/'serial.log').read_text(errors='replace')
+                    if 'GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22' not in reboot_serial:
+                        raise RuntimeError('subsequent boot did not read and pin the captured journal')
+                    shutil.copyfile(reboot/'serial.log',a.output/'journal-publish-panic-reboot-serial.log')
             elif sha(disk)!=before:raise RuntimeError('source fixture changed')
             if pair:
                 serial=(work/'serial.log').read_text(errors='replace')
@@ -202,6 +225,7 @@ def main():
                 if scenario in ('dirty','pending','checker-corrupt','journal-crosslink') or scenario.startswith(('journal-pin','journal-publish')):required+=['SSD_GUARD_RESERVATION_READY']
                 if scenario in ('dirty','pending','journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt') or scenario.startswith('journal-publish'):required+=['GUARD_CHECK_RESULT exit=0']
                 if scenario.startswith('journal-publish'):required+=['GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_UNLINK status=-16','GUARD_JOURNAL_PUBLISH_REMOVE open=-16 closed=0','GUARD_JOURNAL_PUBLISH_RENAME status=-16','GUARD_JOURNAL_PUBLISH_MOVE open=-16 journal_target=-16 closed=0']
+                if scenario=='journal-publish-panic':required+=['GUARD_JOURNAL_PUBLISH_RESULT status=0','GUARD_JOURNAL_PANIC_ARM status=0']
                 required+=[expect]
                 if any(lines.count(marker)!=1 for marker in required) or [lines.index(marker) for marker in required]!=sorted(lines.index(marker) for marker in required):
                     raise RuntimeError('missing, repeated or reordered guard outcome')

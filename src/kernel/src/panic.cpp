@@ -2,7 +2,7 @@
 // interrupt context.  No SSE/FPU registers are touched here.
 #include "panic.h"
 #include "panic_test_reset.h"
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "ahci_readonly.h"
 #endif
 #include "serial.h"
@@ -591,7 +591,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
                              nullptr, nullptr, nullptr, nullptr, &cpuList, g_panicBuf);
     }
 
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
     brook::AhciPanicTestCapture();
 #endif
     brook::PanicTestResetAfterDump();

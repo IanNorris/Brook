@@ -6,6 +6,7 @@
 #include "fatfs_vfs.h"
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
+#include "panic.h"
 #endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
 #include "platform_power.h"
@@ -192,7 +193,8 @@ void Worker(void* arg) {
     const auto journalSize=FwCfgReadFile("opt/guard-journal-pin",journalMode,sizeof(journalMode));
     if(journalSize) {
         const bool pinOnly=journalSize==6 && !memcmp(journalMode,"test-1",6);
-        const bool publish=journalSize==6 && !memcmp(journalMode,"test-2",6);
+        const bool capture=journalSize==6 && !memcmp(journalMode,"test-3",6);
+        const bool publish=capture || (journalSize==6 && !memcmp(journalMode,"test-2",6));
         if(!pinOnly && !publish) {
             AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
         }
@@ -252,6 +254,11 @@ void Worker(void* arg) {
                 VfsPathRelease(root);
             }
             KPrintf("GUARD_JOURNAL_PUBLISH_RESULT status=%d\n",publishResult);
+            if(capture && !publishResult) {
+                const int armed=FatFsPrivateRecoveryArmJournalTest(mount);
+                KPrintf("GUARD_JOURNAL_PANIC_ARM status=%d\n",armed);
+                if(!armed)KernelPanic("checked journal publication panic test");
+            }
         }
         // Keep the reservation, mount and leases for the rest of this boot.
         return;

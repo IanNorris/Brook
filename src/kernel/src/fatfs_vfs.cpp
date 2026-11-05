@@ -1869,6 +1869,14 @@ int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
     session->journalReady=true;
     return 0;
 }
+int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
+{
+    if(!session || !session->mount || !session->journalReady || !session->journalPublished || !session->journalLease)return -22;
+    Device* device=FatFsImageLeaseDevice(session->journalLease);
+    uint64_t sectors[PanicJournalSectors]{};
+    if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
+    return AhciSystemGuardPanicTestArm(device,sectors,PanicJournalSectors)?0:-13;
+}
 #endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
 bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* session,const GuardFatProfile& p) {

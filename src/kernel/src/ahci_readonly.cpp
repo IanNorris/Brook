@@ -18,7 +18,7 @@
 #include "apic.h"
 #include "serial.h"
 #include "string.h"
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
 #include "panic_journal.h"
 #include "panic_qr.h"
@@ -49,8 +49,11 @@ struct NormalIoGuard {
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
+bool panicTestReady=false,panicTestFat=false,panicIoMode=false;
 #if defined(BROOK_AHCI_PANIC_TEST)
-bool panicTestReady=false,panicTestCandidate=false,panicTestFat=false,panicIoMode=false;
+bool panicTestCandidate=false;
+#endif
 constexpr uint64_t panicTestStart=4096;
 uint64_t panicTestMap[PanicJournalSectors]{};
 #endif
@@ -94,7 +97,7 @@ struct PortIo {
     bool waitClear(uint32_t offset,uint32_t mask) {
         const uint64_t start=ApicTickCount();
         const uint32_t limit=
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
             panicIoMode?10000000u:
 #endif
             100000000u;
@@ -111,7 +114,7 @@ struct PortIo {
     bool waitClearFlush(uint32_t offset,uint32_t mask) {
         const uint64_t start=ApicTickCount();
         const uint64_t limit=
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
             panicIoMode?10000000ull:
 #endif
             2000000000ull;
@@ -513,7 +516,7 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     if(ok)memcpy(output,dma+dataOffset,512);
     return ok?512:-5;
 }
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
 bool AhciPanicTestFatCandidate() {
     return panicTestFat && __atomic_load_n(&published,__ATOMIC_ACQUIRE);
 }
@@ -543,12 +546,24 @@ bool AhciPanicTestMapSectors(const uint64_t* sectors,uint32_t count,uint64_t fir
     for(uint32_t i=0;i<count;++i)panicTestMap[i]=mapped[i];
     panicTestReady=true;return true;
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+bool AhciGuardPanicTestMapSectors(const uint64_t* sectors,uint32_t count,uint64_t first,uint64_t length) {
+    // The guard test binary already admits only the exact disposable KVM disk.
+    // A second explicit selector is required before arming panic writes.
+    char marker[8]{};
+    if(!writeEnabled || !TestKvm() || FwCfgReadFile("opt/guard-panic-capture",marker,sizeof(marker))!=6 ||
+       memcmp(marker,"test-1",6) || panicTestFat || panicTestReady)return false;
+    panicTestFat=true;
+    if(AhciPanicTestMapSectors(sectors,count,first,length))return true;
+    panicTestFat=false;return false;
+}
+#endif
 void AhciPanicTestCapture() {
     const uint8_t* packet=nullptr;uint32_t bytes=0;
     if(!panicTestReady || !PanicCapturedPacket(&packet,&bytes))return;
     if(!panicGate.EnterPanic()) {
         const char* message="PANIC_TEST_DISK_BUSY\n";
-        while(*message)SerialPutChar(*message++);
+        while(*message)SerialPanicPutChar(*message++);
         return;
     }
     panicIoMode=true;
@@ -569,7 +584,7 @@ void AhciPanicTestCapture() {
     } panicIo;
     const auto result=PanicJournalWrite(panicIo,packet,bytes);
     const char* message=result==PanicJournalResult::Ok?"PANIC_TEST_DISK_CAPTURE_OK\n":"PANIC_TEST_DISK_CAPTURE_FAILED\n";
-    while(*message)SerialPutChar(*message++);
+    while(*message)SerialPanicPutChar(*message++);
     // Never release panic ownership: other CPUs may not actually have halted.
 }
 #endif

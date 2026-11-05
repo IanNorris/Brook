@@ -1,6 +1,6 @@
 #include "panic_test_reset.h"
 #include "panic_stack.h"
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "ahci_readonly.h"
 #endif
 #include "idt.h"
@@ -1344,7 +1344,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         // This path already owns the panic print lock. HandleException below
         // deliberately halts a second lock claimant, so the opt-in test reset
         // must run after the visual dump but before that fallback.
-#if defined(BROOK_AHCI_PANIC_TEST)
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST)
         brook::AhciPanicTestCapture();
 #endif
         brook::PanicTestResetAfterDump();
