@@ -186,6 +186,34 @@ int main(int argc,char** argv){
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
+    // A low-volume mutation must not depend on reaching the operation-count
+    // threshold. A safety pass flushes it, and idle passes do not flush again.
+    assert(!Ext2FsSync(m));m->syncProbe.autoOps=4096;
+    auto periodicBlock=Ext2AllocBlock(m);assert(periodicBlock && m->pendingMetaOps);
+    auto periodicFlushes=flushCalls;auto backgrounds=m->syncProbe.backgroundCount;
+    assert(!Ext2BackgroundMaybeSync(m,0,false) && flushCalls==periodicFlushes);
+    assert(!Ext2BackgroundMaybeSync(m,0,true));
+    assert(flushCalls==periodicFlushes+1 && !m->pendingMetaOps && !m->backingDirty);
+    assert(m->syncProbe.backgroundCount==backgrounds+1);
+    assert(!Ext2BackgroundMaybeSync(m,0,true) && flushCalls==periodicFlushes+1);
+    assert(Ext2FreeBlock(m,periodicBlock));assert(!Ext2FsSync(m));
+    // Even a direct write with no allocation metadata must cause a flush;
+    // a failed flush remains dirty and is retried while its error is retained.
+    uint8_t stableBytes[512];std::memcpy(stableBytes,disk.data()+4096,sizeof(stableBytes));
+    Ext2RawBackend periodicIo{m};
+    assert(periodicIo.Write(4096,stableBytes,sizeof(stableBytes)) && m->backingDirty && !m->pendingMetaOps);
+    failFlush=true;assert(Ext2BackgroundMaybeSync(m,0,true)==-5 && m->backingDirty);
+    assert(m->deferredSyncError==-5);failFlush=false;
+    assert(!Ext2BackgroundMaybeSync(m,0,true) && !m->backingDirty);
+    assert(Ext2FsSync(m)==-5); // report the earlier failed flush once
+    // If the worker cannot start, successful writes flush synchronously.
+    g_ext2SynchronousFallback=true;periodicFlushes=flushCalls;
+    assert(periodicIo.Write(4096,stableBytes,sizeof(stableBytes)) && !m->backingDirty);
+    assert(flushCalls==periodicFlushes+1);
+    failFlush=true;assert(!periodicIo.Write(4096,stableBytes,sizeof(stableBytes)) && m->backingDirty);
+    assert(m->deferredSyncError==-5);failFlush=false;g_ext2SynchronousFallback=false;
+    assert(Ext2FsSync(m)==-5 && !m->backingDirty);
+    m->syncProbe.errors=0;
     // Real allocation/free batching, forced durability and retry semantics.
     assert(Ext2ParseAutoSyncOps("4096",4)==4096);
     for(const char* bad:{"0","65537","-1","1x","999999",""})
@@ -245,6 +273,14 @@ int main(int argc,char** argv){
         assert(Ext2FsUnmount(cm)==-5 && g_ext2Mounts[1]==cm && cm->writeback.count);
         failFlush=false;assert(file->ops->fsync(file)==-5); // report deferred failed admission once
         assert(!file->ops->fsync(file));assert(!cm->writeback.count);
+        // Queued writes still drain at their own shorter age deadline.
+        const uint8_t backgroundPatch=0x73;position=50;expected[position]=backgroundPatch;
+        assert(file->ops->write(file,&backgroundPatch,1,&position)==1 && cm->writeback.count);
+        const uint64_t queuedAt=cm->writeback.oldestNs;
+        const auto drained=cm->syncProbe.backgroundCount;
+        assert(!Ext2BackgroundMaybeSync(cm,queuedAt,false) && cm->writeback.count);
+        assert(!Ext2BackgroundMaybeSync(cm,queuedAt+uint64_t(g_ext2WritebackMs)*1000000,false));
+        assert(!cm->writeback.count && cm->syncProbe.backgroundCount==drained+1 && !cm->backingDirty);
         // A short OUT is sticky even after ordered replay repairs the bytes.
         const uint8_t patch=0xab;position=321;expected[position]=patch;
         assert(file->ops->write(file,&patch,1,&position)==1 && cm->writeback.count);

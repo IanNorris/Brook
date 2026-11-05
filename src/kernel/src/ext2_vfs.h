@@ -12,6 +12,8 @@ struct Device;
 struct Ext2SyncProbe {
     uint64_t autoCount, fsyncCount, mountCount, errors, waitNs, autoNs, fsyncNs, mountNs;
     uint32_t autoOps, pendingOps;
+    uint64_t backgroundCount, backgroundNs;
+    bool backingDirty, writeFailed, syncErrorPending;
 };
 bool Ext2GetSyncProbe(uint8_t pdrv, Ext2SyncProbe& out);
 struct Ext2WritebackProbe {

@@ -28,6 +28,7 @@
 #include "spinlock.h"
 #include "rtc.h"
 #ifndef BROOK_HOST_TEST
+#include "apic.h"
 #include "fw_cfg.h"
 #include "scheduler.h"
 #endif
@@ -231,6 +232,7 @@ struct Ext2Mount {
     Ext2SyncProbe syncProbe;
     WriteBehindQueue writeback;
     uint32_t  pendingMetaOps;     // ops since last auto-sync
+    bool      backingDirty;       // device writes not followed by checked flush
     int       deferredSyncError;  // an automatic sync failure not yet reported
     // A failed data/pointer/inode write may have been partially committed or
     // ignored by a legacy caller. No retry ledger exists for those writes:
@@ -316,6 +318,7 @@ static uint32_t g_ext2AutoSyncOps = 256;
 static uint32_t g_ext2WritebackMiB = 0; // opt-in until native acceptance
 static uint32_t g_ext2WritebackMs = 1000;
 static bool g_ext2QueueAvailable = true;
+static bool g_ext2SynchronousFallback = false;
 static uint32_t Ext2ParseBounded(const char* value,uint32_t length,
                                 uint32_t low,uint32_t high,uint32_t fallback) {
     if(!length || length>5)return fallback;
@@ -534,7 +537,14 @@ struct Ext2RawBackend {
         return mnt->dev->ops->read(mnt->dev,offset,buffer,length)==static_cast<int>(length);
     }
     bool Write(uint64_t offset,const void* buffer,uint64_t length) {
-        if(DeviceWrite(mnt->dev,offset,buffer,length)==static_cast<int>(length))return true;
+        if(length)mnt->backingDirty=true; // even a failed write can be partial
+        if(DeviceWrite(mnt->dev,offset,buffer,length)==static_cast<int>(length)) {
+            if(length && g_ext2SynchronousFallback) {
+                if(DeviceFlush(mnt->dev)!=0){mnt->deferredSyncError=-5;return false;}
+                mnt->backingDirty=false;
+            }
+            return true;
+        }
         // Preserve the existing permanent error for incomplete data/pointer/
         // inode writes. A flush-only failure instead remains retryable.
         mnt->writeError=-5;return false;
@@ -858,6 +868,7 @@ static int Ext2Sync(Ext2Mount* mnt, Ext2SyncReason reason=Ext2SyncReason::Mount)
     const uint64_t began=RtcNowNs();
     if(reason==Ext2SyncReason::Auto)++mnt->syncProbe.autoCount;
     else if(reason==Ext2SyncReason::Fsync)++mnt->syncProbe.fsyncCount;
+    else if(reason==Ext2SyncReason::Background)++mnt->syncProbe.backgroundCount;
     else ++mnt->syncProbe.mountCount;
     int result = 0;
     bool bgdtWasDirty = mnt->bgdtDirty;
@@ -903,6 +914,7 @@ static int Ext2Sync(Ext2Mount* mnt, Ext2SyncReason reason=Ext2SyncReason::Mount)
             mnt->inodeBitmapDirty[g] = false;
         }
         mnt->pendingMetaOps = 0;
+        mnt->backingDirty = false;
     }
     if(result)++mnt->syncProbe.errors;
     const uint64_t ended=RtcNowNs();
@@ -910,6 +922,7 @@ static int Ext2Sync(Ext2Mount* mnt, Ext2SyncReason reason=Ext2SyncReason::Mount)
         const auto elapsed=ended-began;mnt->syncProbe.waitNs+=elapsed;
         if(reason==Ext2SyncReason::Auto)mnt->syncProbe.autoNs+=elapsed;
         else if(reason==Ext2SyncReason::Fsync)mnt->syncProbe.fsyncNs+=elapsed;
+        else if(reason==Ext2SyncReason::Background)mnt->syncProbe.backgroundNs+=elapsed;
         else mnt->syncProbe.mountNs+=elapsed;
     }
     return result;
@@ -3205,7 +3218,10 @@ bool Ext2GetSyncProbe(uint8_t pdrv,Ext2SyncProbe& out) {
     if(pdrv>=EXT2_MAX_MOUNTS)return false;
     KRwLockReadLock(&g_ext2Lock);
     auto* mnt=g_ext2Mounts[pdrv];
-    if(mnt) {out=mnt->syncProbe;out.pendingOps=mnt->pendingMetaOps;}
+    if(mnt) {
+        out=mnt->syncProbe;out.pendingOps=mnt->pendingMetaOps;out.backingDirty=mnt->backingDirty;
+        out.writeFailed=mnt->writeError!=0;out.syncErrorPending=mnt->deferredSyncError!=0;
+    }
     KRwLockReadUnlock(&g_ext2Lock);
     return mnt!=nullptr;
 }
@@ -4703,32 +4719,47 @@ void Ext2ConfigureAutoSync() {
 #endif
 }
 
+// Caller holds the ext2 write lock. The safety pass is independent of the
+// optional write-behind queue and only flushes mounts with pending work.
+static int Ext2BackgroundMaybeSync(Ext2Mount* mnt,uint64_t now,bool safetyPass) {
+    if(!mnt)return 0;
+    const bool queued=mnt->writeback.count || mnt->writeback.retry;
+    const uint64_t age=now>=mnt->writeback.oldestNs?now-mnt->writeback.oldestNs:0;
+    const bool queueDue=queued && age>=static_cast<uint64_t>(g_ext2WritebackMs)*1000000;
+    if(!queueDue && !(safetyPass && (queued || mnt->pendingMetaOps || mnt->backingDirty)))return 0;
+    const int error=Ext2Sync(mnt,Ext2SyncReason::Background);
+    if(error)mnt->deferredSyncError=error;
+    return error;
+}
+
 #ifndef BROOK_HOST_TEST
 static bool g_ext2WritebackEnabled=false;
 static bool g_ext2WritebackStarted=false;
 static void Ext2WritebackWorker(void*) {
+    uint64_t lastSafety=ApicTickCount();
     for(;;) {
         SchedulerSleepMs(250);
         KRwLockWriteLock(&g_ext2Lock);
         if(g_ext2WritebackEnabled) {
             const uint64_t now=RtcNowNs();
+            const uint64_t tick=ApicTickCount();
+            const bool safety=tick<lastSafety || tick-lastSafety>=5000;
+            if(safety)lastSafety=tick;
             for(uint32_t i=0;i<EXT2_MAX_MOUNTS;++i) {
-                auto* mnt=g_ext2Mounts[i];if(!mnt || (!mnt->writeback.count && !mnt->writeback.retry))continue;
-                const auto age=now>=mnt->writeback.oldestNs?now-mnt->writeback.oldestNs:0;
-                if(age<static_cast<uint64_t>(g_ext2WritebackMs)*1000000)continue;
-                const int error=Ext2Sync(mnt,Ext2SyncReason::Background);
-                if(error)mnt->deferredSyncError=error;
+                (void)Ext2BackgroundMaybeSync(g_ext2Mounts[i],now,safety);
             }
         }
         KRwLockWriteUnlock(&g_ext2Lock);
     }
 }
 void Ext2StartWriteback() {
-    if(!g_ext2WritebackMiB || g_ext2WritebackStarted)return;
+    if(g_ext2WritebackStarted)return;
     auto* worker=KernelThreadCreate("ext2-writeback",Ext2WritebackWorker,nullptr,3);
     if(!worker) {
         KRwLockWriteLock(&g_ext2Lock);g_ext2QueueAvailable=false;
+        g_ext2SynchronousFallback=true;g_ext2AutoSyncOps=1;
         for(uint32_t i=0;i<EXT2_MAX_MOUNTS;++i)if(auto* mnt=g_ext2Mounts[i]) {
+            mnt->syncProbe.autoOps=1;
             const int error=Ext2Sync(mnt);if(error)mnt->deferredSyncError=error;
         }
         KRwLockWriteUnlock(&g_ext2Lock);

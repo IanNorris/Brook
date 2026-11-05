@@ -1353,14 +1353,15 @@ static Vnode* GenBlkprobe()
 // (sync(), periodic shared-mapping writeback and unmount all use the latter).
 static Vnode* GenExt2probe() {
     auto* buf=static_cast<char*>(kmalloc(4096));if(!buf)return nullptr;
-    char* p=AppendStr(buf,"pdrv autoOps pendingOps autoSync fsync mountSync errors syncNs autoNs fsyncNs mountNs\n");
+    char* p=AppendStr(buf,"pdrv autoOps pendingOps autoSync fsync mountSync errors syncNs autoNs fsyncNs mountNs backgroundSync backgroundNs backingDirty writeFailed syncErrorPending\n");
     for(uint8_t i=0;i<16;++i) {
         Ext2SyncProbe probe{};if(!Ext2GetSyncProbe(i,probe))continue;
         if(p-buf+256>=4096)break;
         p=AppendU64(p,i);
         const uint64_t values[]={probe.autoOps,probe.pendingOps,probe.autoCount,
             probe.fsyncCount,probe.mountCount,probe.errors,probe.waitNs,
-            probe.autoNs,probe.fsyncNs,probe.mountNs};
+            probe.autoNs,probe.fsyncNs,probe.mountNs,probe.backgroundCount,probe.backgroundNs,
+            probe.backingDirty?1u:0u,probe.writeFailed?1u:0u,probe.syncErrorPending?1u:0u};
         for(auto v:values){*p++=' ';p=AppendU64(p,v);}*p++='\n';
     }
     *p=0;return MakeProcVnode(buf,static_cast<uint32_t>(p-buf));

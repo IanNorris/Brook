@@ -17,6 +17,15 @@ use defaults. Options load after fw_cfg initialization and before block mounts.
 The existing allocation-metadata threshold remains independently configurable,
 with its 256-operation default unchanged.
 
+Independently of this optional queue, the ext2 worker now checks for pending
+allocation metadata or backing-device writes every five seconds and performs a
+checked filesystem/device sync when needed. Clean idle mounts are skipped. If
+the worker cannot start, allocation metadata is synced on every operation and
+device writes use a synchronous flush fallback. These are scheduling and error
+handling measures, not a guarantee against sudden power loss or a stalled
+device. The active desktop session's dirty marker remains set until checked
+shutdown; an idle flush does not claim that the mounted filesystem is clean.
+
 A mount preallocates its byte arena and 4,096 record descriptors before
 publishing itself. Allocation failure leaves that mount on the original
 synchronous path. Writes never allocate queue storage or grow this fixed budget;
@@ -78,6 +87,9 @@ write attempts, tail merges, submitted backend writes/bytes, total drains,
 capacity-triggered drains, sync/background drains and failures. Submitted byte
 counts include attempted replay, not only successfully completed bytes.
 Use deltas with `/proc/ext2probe` and QMP counters around matched workloads.
+`/proc/ext2probe` also reports background sync count/time, pending backing
+writes, permanent write failure and an unreported automatic sync error. A
+cleared backing-write flag alone is not proof that a prior write succeeded.
 When this queue is enabled, ext2 sync-body timings include draining ordinary
 queued data as well as allocation metadata; they are no longer metadata-only
 flush costs.
