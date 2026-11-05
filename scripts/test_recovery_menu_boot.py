@@ -18,7 +18,8 @@ from pathlib import Path
 
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
-         network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None):
+         network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
+         reset_evidence_marker='PANIC_TEST_RESET_WAIT'):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -80,9 +81,9 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                     if on_marker:on_marker()
                     if expect_reset:
                         try: status=process.wait(timeout=15)
-                        except subprocess.TimeoutExpired: raise RuntimeError('QEMU did not reset after panic marker')
-                        if status!=0 or b'PANIC_TEST_RESET_WAIT' not in serial.read_bytes():
-                            raise RuntimeError('panic reset did not complete successfully')
+                        except subprocess.TimeoutExpired: raise RuntimeError('QEMU did not reset after expected marker')
+                        if status!=0 or reset_evidence_marker.encode() not in serial.read_bytes():
+                            raise RuntimeError('expected reset did not complete successfully')
                         return
                     until = time.monotonic() + hold_after_marker
                     while time.monotonic() < until:
