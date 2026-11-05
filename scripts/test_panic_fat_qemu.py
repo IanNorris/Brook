@@ -120,7 +120,7 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
     before=outside_digest(sata,sectors)
     boot_esp=str(boot)+'@@1048576';initrd=work/'initrd.img'
     subprocess.run(['mcopy','-i',boot_esp,'::/INITRD.IMG',str(initrd)],check=True)
-    for name in ('MEDIA','MEDIA/SYSTEM'):
+    for name in ('MEDIA','MEDIA/SYSTEM','DATA'):
         subprocess.run(['mmd','-i',str(initrd),'::/'+name],check=True)
     records={'ahci-observe':'1\n','ahci-read-only':'1\n',
              'ahci-write-target':'BRKAHCI1\n32902,10530,0,31,2,0,262144,512,512\nQEMU HARDDISK\nBROOK-PANIC-FAT\n',
@@ -177,7 +177,9 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
     if exporter and not short:
         # Reboot a regular kernel, without the panic writer's exclusive file
         # lease, and export through the normal FAT/VFS path as a guest job.
-        init.write_text('run --console --uid 0 /boot/PANICLOG.ELF /media/system/PANIC.BIN /tmp/panic-packet.bin\n')
+        bridge_id='a'*32
+        init.write_text('run --console --uid 0 /boot/PANICLOG.ELF /media/system/PANIC.BIN /tmp/panic-packet.bin\n'
+                        'run --console --uid 0 /boot/PANICLOG.ELF --bridge '+bridge_id+'\n')
         subprocess.run(['mcopy','-o','-i',str(initrd),str(init),'::/BOOT/INIT.RC'],check=True)
         subprocess.run(['mcopy','-o','-i',str(initrd),str(exporter),'::/BOOT/PANICLOG.ELF'],check=True)
         subprocess.run(['mcopy','-o','-i',boot_esp,str(initrd),'::/INITRD.IMG'],check=True)
@@ -189,7 +191,9 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
                 deadline=time.monotonic()+timeout
                 while time.monotonic()<deadline:
                     output=serial.read_text(errors='replace') if serial.exists() else ''
-                    if 'PANICLOG:' in output:break
+                    if output.count('PANICLOG: sequence=')>=2:break
+                    if 'PANICLOG: mkdir:' in output or 'PANICLOG: unsafe artifact directory' in output:
+                        raise RuntimeError('bridge export failed: '+output[-4000:])
                     if proc.poll() is not None:raise RuntimeError('export guest exited: '+output[-4000:])
                     time.sleep(.1)
                 else:raise RuntimeError('export guest timed out: '+output[-4000:])
@@ -197,6 +201,8 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
                 if proc.poll() is None:proc.terminate();proc.wait(timeout=10)
         expected=f'PANICLOG: sequence=2 bytes={len(latest_packet)} crc32={zlib.crc32(latest_packet):08x} output=/tmp/panic-packet.bin'
         if expected not in output:raise RuntimeError('guest export mismatch: '+output[-4000:])
+        expected_bridge=f'PANICLOG: sequence=2 bytes={len(latest_packet)} crc32={zlib.crc32(latest_packet):08x} output={bridge_id}'
+        if expected_bridge not in output:raise RuntimeError('guest bridge export mismatch: '+output[-4000:])
         if subprocess.check_output(['mtype','-i',target,'::/PANIC.BIN'])!=contents:
             raise RuntimeError('guest export changed the journal')
     partition=work/'esp.img'

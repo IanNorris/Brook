@@ -766,6 +766,17 @@ replay. Set an existing guest `cwd` (the minimal probe has no `/data/home`).
 shell or automatic retry. Its command has at most 174 UTF-8 bytes after allowing
 for the boot envelope.
 
+`hw_panic_report` retrieves the newest valid fixed-journal packet after the
+guest has booted again. It requires a boot-pinned session, a fresh request ID,
+the binary-transfer key and a new local output directory. It runs the installed
+`/boot/PANICLOG.ELF`, obtains its staged artifact through the authenticated bulk
+channel, and verifies the packet length and CRC against the export receipt.
+The result is a local packet path and metadata; decode with
+`tools/crash_decoder.py --packet <path> --elf <exact-kernel>`. The receipt records
+both operation IDs; inspect them rather than redispatching an uncertain export
+or transfer. This operation requires a previously provisioned panic journal and
+does not make panic-time networking or the physical writer available.
+
 `hw_doctor` explicitly reports unavailable QMP, raw input, framebuffer transfer,
 registers, raw memory and post-panic transport. A lost TCP connection is not proof
 of panic. Current hardware panics halt CPUs; retain the optical panic scanner.

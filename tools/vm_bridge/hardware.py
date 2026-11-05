@@ -171,6 +171,14 @@ class Hardware:
                 'receipt_path':str(Path(output).absolute()/'receipt.json'),
                 'artifact_path':result.get('artifact_path'),'binary_phase_s':result['binary_phase_s'],'transfer':result['transfer']}
 
+    def panic_report(self,session,request_id,key_file,output,port=1236,**_):
+        from hardware_panic_workflow import PanicRun
+        result=PanicRun(self,output).execute(session,key_file,request_id,port)
+        return {'session':session,'state':result['state'],'guest_boot_id':result['guest_boot_id'],
+                'sequence':result['sequence'],'bytes':result['packet_bytes'],
+                'crc32':result['packet_crc32'],'sha256':result['artifact_sha256'],
+                'artifact_path':result['artifact_path'],'receipt_path':str(Path(output).absolute()/'receipt.json')}
+
     def power(self,session,request_id,operation,**_):
         validate_id(request_id)
         verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit'}
