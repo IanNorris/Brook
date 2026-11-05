@@ -40,8 +40,14 @@ def main():
     a=p.parse_args();desktop=a.desktop.resolve(strict=True);recovery=a.recovery.resolve(strict=True)
     out=a.output.absolute();out.mkdir(parents=True,exist_ok=False)
     manifest=json.loads((desktop/'manifest.json').read_text())
-    for name in ('kernel.elf','INITRD.IMG'):
-        assert sha(desktop/name)==manifest['files'][name]['sha256']
+    if 'files' in manifest:
+        expected={name:manifest['files'][name]['sha256'] for name in ('kernel.elf','INITRD.IMG')}
+    else:
+        # prepare_hardware_kernel_pair.py records the same two hashes directly.
+        expected={'kernel.elf':manifest['kernel_sha256'],'INITRD.IMG':manifest['initrd_sha256']}
+    for name,digest in expected.items():
+        if not isinstance(digest,str) or sha(desktop/name)!=digest:
+            raise RuntimeError('candidate hash mismatch: '+name)
     disk=out/'sata.raw';disk_bytes=512*1024**2;partition_sectors=disk_bytes//512-4096
     with disk.open('xb') as f:f.truncate(disk_bytes)
     layout=f'label: dos\nunit: sectors\n\nstart=2048,size={partition_sectors},type=ef,bootable\n'
