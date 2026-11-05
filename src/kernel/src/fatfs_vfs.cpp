@@ -107,13 +107,15 @@ struct FatPrivateMount {
     Vnode* nodes[2];
     FatImageLease* leases[2];
     bool inspected;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     Vnode* journalNode;
     FatImageLease* journalLease;
     bool journalAttempted;
-    bool journalPublishAttempted;
     bool journalReady;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    bool journalPublishAttempted;
     bool journalPublished;
+#endif
 #endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
     bool pendingAttempted;
@@ -1838,7 +1840,7 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* se
     for(unsigned i=0;!error && i<2;++i)error=FatFsGuardFlushReadback(session->leases[i],buffers[i]);
     return error;
 }
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
 {
     if(!session || !session->mount || !session->inspected || !session->leases[0] || !session->leases[1] ||
@@ -1870,6 +1872,7 @@ int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
     session->journalReady=true;
     return 0;
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
 int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
 {
     if(!session || !session->mount || !session->journalReady ||
@@ -1879,6 +1882,17 @@ int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
     if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
     return AhciSystemGuardPanicTestArm(device,sectors,PanicJournalSectors)?0:-13;
 }
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+int FatFsPrivateRecoveryArmJournal(FatPrivateMount* session)
+{
+    if(!session || !session->mount || !session->journalReady || !session->journalLease)return -22;
+    Device* device=FatFsImageLeaseDevice(session->journalLease);
+    uint64_t sectors[PanicJournalSectors]{};
+    if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
+    return AhciSystemGuardPanicRecoveryArm(device,sectors,PanicJournalSectors)?0:-13;
+}
+#endif
 #endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
 bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* session,const GuardFatProfile& p) {

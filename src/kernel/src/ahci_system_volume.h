@@ -40,6 +40,9 @@ bool AhciSystemGuardTestBeginWrites(Device* adapter);
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 bool AhciSystemGuardPanicTestArm(Device* adapter,const uint64_t* sectors,uint32_t count);
 #endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool AhciSystemGuardPanicRecoveryArm(Device* adapter,const uint64_t* sectors,uint32_t count);
+#endif
 void AhciSystemGuardTestFinish(Device* adapter);
 Device* AhciSystemGuardTestDataArm(Device* adapter,int pendingOutcome);
 bool AhciSystemGuardTestDataVerify(Device* adapter);

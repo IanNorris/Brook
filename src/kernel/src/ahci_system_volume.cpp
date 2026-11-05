@@ -310,6 +310,13 @@ bool AhciSystemGuardPanicTestArm(Device* adapter,const uint64_t* sectors,uint32_
         AhciGuardPanicTestMapSectors(sectors,count,guardRange.start/512,guardRange.bytes/512);
 }
 #endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool AhciSystemGuardPanicRecoveryArm(Device* adapter,const uint64_t* sectors,uint32_t count) {
+    return adapter==&guardTestPartition && guardReady && guardTestPhase==GuardTestPhase::Writing &&
+        guardRange.parent==AhciWriteAdmittedDevice() && !(guardRange.start&511) && !(guardRange.bytes&511) &&
+        AhciGuardPanicRecoveryMapSectors(sectors,count,guardRange.start/512,guardRange.bytes/512);
+}
+#endif
 void AhciSystemGuardTestFinish(Device* adapter) {
     if(adapter==&guardTestPartition && guardTestPhase!=GuardTestPhase::Failed)guardTestPhase=GuardTestPhase::Finished;
 }

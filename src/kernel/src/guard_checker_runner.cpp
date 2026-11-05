@@ -284,6 +284,13 @@ void Worker(void* arg) {
     if(!AhciSystemGuardTestBeginWrites(adapter)) {
         AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE authorization\n");return;
     }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    // The checker and disk reservation precede journal acquisition. Failure
+    // to capture diagnostics must not by itself prevent filesystem repair.
+    const int journalPin=FatFsPrivateRecoveryPinJournal(mount);
+    const int journalArm=journalPin?journalPin:FatFsPrivateRecoveryArmJournal(mount);
+    KPrintf("GUARD_PANIC_JOURNAL pin=%d arm=%d\n",journalPin,journalArm);
+#endif
     uint32_t failAt=0;
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
     char injection[3]{};const uint32_t rawLength=FwCfgReadFile("opt/guard-pending-fail",injection,sizeof(injection));

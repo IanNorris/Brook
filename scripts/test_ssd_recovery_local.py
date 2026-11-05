@@ -93,6 +93,8 @@ def main():
                    help='Require EFI to select recovery without injecting F5')
     p.add_argument('--guard-auto-kernel', action='store_true',
                    help='Expect the isolated automatic-recovery kernel')
+    p.add_argument('--guard-panic-journal', action='store_true',
+                   help='Provision a disposable crash journal and require automatic recovery to arm it')
     p.add_argument('--guard-auto-unsupported', action='store_true',
                    help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
@@ -116,6 +118,8 @@ def main():
         p.error('automatic dispatch requires a dirty filesystem and guarded EFI')
     if a.guard_auto_kernel and not a.guard_real_checker:
         p.error('automatic recovery kernel requires its checker fixture')
+    if a.guard_panic_journal and not (a.guard_auto_kernel and a.guard_ext2_test and a.dirty):
+        p.error('journal arming requires the dirty automatic recovery fixture')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
         p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
@@ -413,6 +417,9 @@ def main():
                 if a.guard_records=='oversized' and index==1:contents+=b'X'
                 record_file=work/f'guard{index}.bin';record_file.write_bytes(contents)
                 subprocess.run(['mcopy','-o','-i',media,str(record_file),target],check=True)
+        if a.guard_panic_journal:
+            journal=work/'panic.bin';journal.write_bytes(bytes(258*512))
+            subprocess.run(['mcopy','-i',media,str(journal),'::/PANIC.BIN'],check=True)
         if a.guarded_efi:
             efi=a.guarded_efi.resolve(strict=True)
             subprocess.run(['mcopy','-o','-i',media,str(efi),'::/EFI/BOOT/BOOTX64.EFI'],check=True)
@@ -568,6 +575,7 @@ def main():
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
                             required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_RESULT outcome=2',preen,expected]
                             if a.guard_auto_condition:required.insert(1,'GUARD_AUTO_NEEDS_CHECK')
+                            if a.guard_panic_journal:required.insert(required.index('GUARD_PENDING_RESULT outcome=2'),'GUARD_PANIC_JOURNAL pin=0 arm=0')
                             if a.guard_complete_test:required.insert(-1,'GUARD_EXT2_VERIFIED_PENDING')
                             if not all(line in complete_lines for line in required):
                                 raise RuntimeError('guarded repair milestones missing')
