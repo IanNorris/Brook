@@ -12,11 +12,13 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 import zlib
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 DIRS = ('store', 'profile', 'profile/bin', 'profile/lib', 'profile/share',
         'profile/share/applications', 'home', 'home/brook', 'var', 'var/cache',
@@ -42,6 +44,9 @@ def main():
                         help='Exercise normal boot read-only panic journal snapshot')
     parser.add_argument('--snapshot-network-module',type=Path,
                         help='Matching virtio-net module; retrieve the snapshot over the debug bridge')
+    parser.add_argument('--snapshot-serial-input',type=Path,
+                        help='Seed a captured PANIC_HEX packet and decode it after bridge retrieval')
+    parser.add_argument('--snapshot-packet-output',type=Path,help='Save the retrieved panic packet to a new file')
     parser.add_argument('--serial-output',type=Path,help='Save the guest serial log to a new file')
     parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--timeout', type=int, default=100)
@@ -52,6 +57,8 @@ def main():
         parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
     if args.snapshot_network_module and args.panic_snapshot_test!='valid':
         parser.error('network snapshot retrieval requires the valid snapshot test')
+    if (args.snapshot_serial_input or args.snapshot_packet_output) and not args.snapshot_network_module:
+        parser.error('captured-packet input/output requires network snapshot retrieval')
     source, kernel, firmware = (p.resolve(strict=True) for p in (args.image, args.kernel, args.firmware))
     with tempfile.TemporaryDirectory(prefix='brook-ext2-idle-sata-') as temp:
         d = Path(temp)
@@ -93,6 +100,11 @@ def main():
             shutil.copyfileobj(input_file, output, length=1024 * 1024)
         if args.panic_snapshot_test:
             payload=b'normal boot panic snapshot fixture';contents=bytearray(258*512)
+            if args.snapshot_serial_input:
+                sys.path.insert(0,str(ROOT/'tools'))
+                from crash_decoder import parse_serial_log
+                payload=parse_serial_log(str(args.snapshot_serial_input.resolve(strict=True)))
+                if not 1<=len(payload)<=65536:raise RuntimeError('invalid captured panic packet size')
             if args.panic_snapshot_test!='empty':
                 contents[:8]=b'BRKPAN01';struct.pack_into('<IIQI',contents,8,1,len(payload),7,zlib.crc32(payload))
                 struct.pack_into('<I',contents,28,zlib.crc32(contents[:512]));contents[512:512+len(payload)]=payload
@@ -186,7 +198,6 @@ def main():
                             if (marker in output)!=(args.panic_snapshot_test=='valid'):
                                 raise RuntimeError('unexpected panic snapshot result: '+output[-4500:])
                             if args.snapshot_network_module:
-                                import sys
                                 sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
                                 from hardware import Hardware
                                 bridge=Hardware(d/'hardware-registry');attach_deadline=time.monotonic()+30
@@ -198,6 +209,15 @@ def main():
                                 report=bridge.recovery_panic(session,str(d/'retrieved.bin'))
                                 if Path(report['artifact_path']).read_bytes()!=payload or report['sequence']!=7:
                                     raise RuntimeError('normal boot bridge returned the wrong panic snapshot')
+                                if args.snapshot_serial_input:
+                                    command=['python3',str(ROOT/'tools/crash_decoder.py'),'--json','--packet']
+                                    original=d/'original.bin';original.write_bytes(payload)
+                                    before=json.loads(subprocess.check_output(command+[str(original)],stderr=subprocess.DEVNULL))
+                                    after=json.loads(subprocess.check_output(command+[report['artifact_path']],stderr=subprocess.DEVNULL))
+                                    if not before.get('message') or not before.get('log_tail',{}).get('available') or before!=after:
+                                        raise RuntimeError('retrieved panic packet did not decode identically')
+                                if args.snapshot_packet_output:
+                                    with args.snapshot_packet_output.open('xb') as saved:saved.write(payload)
                         if args.serial_output:
                             with args.serial_output.open('x') as saved:saved.write(serial.read_text(errors='replace'))
                         print('\n'.join(line for line in output.splitlines() if 'IDLE_' in line), flush=True)

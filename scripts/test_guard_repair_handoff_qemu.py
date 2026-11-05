@@ -5,10 +5,12 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zlib
 
@@ -48,7 +50,11 @@ def main():
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--identity',required=True)
     parser.add_argument('--inject-panic',action='store_true',help='Interrupt the first repair attempt after pending state using GDB')
+    parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
+    parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
+    if bool(a.normal_kernel)!=bool(a.normal_network_module) or (a.normal_kernel and not a.inject_panic):
+        parser.error('normal kernel and network module must be supplied together with --inject-panic')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,False);check_pair(a.recovery_pair,a.identity,True)
@@ -65,8 +71,12 @@ def main():
         defaults.write_text('default-value\n')
         for src,target in ((service,'::/BOOT/GDSVC.ELF'),(script,'::/BOOT/INIT.RC'),(defaults,'::/ETC/desktop-defaults.ini')):
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
+        if a.normal_kernel:
+            if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+                subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
+            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module),'::/DRIVERS/virtio_net.mod'],check=True)
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
-        for src,target in ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
+        for src,target in ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
                            (normal,'::/INITRD.IMG'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
                            (recovery,'::/RECOVERY/INITRD.IMG'),(selection,'::/RECOVERY/SELECT.BIN')):
             subprocess.run(['mcopy','-o','-i',media,str(src),target],check=True)
@@ -144,14 +154,41 @@ def main():
             if f.read(2)!=b'\x01\x00':raise RuntimeError('repair did not clean ext2')
         subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         second=work/'desktop';second.mkdir()
-        boot(disk,a.firmware,second,False,'GUARD_JOURNAL_NORMAL_SCRIPT status=0',120,True,sata_snapshot=False,
-             hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_JOURNAL_DESKTOP_FAIL',
-             extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
+        if a.normal_kernel:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
+            def retrieve():
+                sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                from hardware import Hardware
+                bridge=Hardware(work/'normal-registry');deadline=time.monotonic()+30
+                while True:
+                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                    except (OSError,RuntimeError):
+                        if time.monotonic()>=deadline:raise
+                        time.sleep(.2)
+                report=bridge.recovery_panic(session,str(work/'recovered.bin'))
+                if Path(report['artifact_path']).read_bytes()!=packet_bytes or report['sequence']!=1:
+                    raise RuntimeError('normal debug bridge returned the wrong panic packet')
+                shutil.copyfile(report['artifact_path'],a.output/'retrieved-panic.bin')
+                decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
+                                    '--packet',report['artifact_path'],'--json'],stderr=subprocess.DEVNULL))
+                if (decoded.get('message')!='GDBTEST' or not decoded.get('log_tail',{}).get('available') or
+                    'GUARD_ATTEMPT_NUMBER 1' not in decoded['log_tail']['text']):
+                    raise RuntimeError('retrieved panic did not retain its reason and repair log')
+                (a.output/'decoded-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
+            boot(disk,a.firmware,second,False,'GUARD_DESKTOP_SERVICE_PASS',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=retrieve)
+        else:
+            boot(disk,a.firmware,second,False,'GUARD_JOURNAL_NORMAL_SCRIPT status=0',120,True,sata_snapshot=False,
+                 hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_JOURNAL_DESKTOP_FAIL',
+                 extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
         if ('GUARD_DESKTOP_SERVICE_PASS' not in serial or 'brook-ssd-recovery-automatic-v1' in serial or
             'Recovery required; normal boot blocked.' in serial):
             raise RuntimeError('guarded desktop service did not start after repair')
+        if a.normal_kernel and f'NORMAL_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}' not in serial:
+            raise RuntimeError('normal boot did not validate the captured panic packet')
         if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal unexpectedly changed')
         for index in range(2):
             if subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])!=guards[index]:
