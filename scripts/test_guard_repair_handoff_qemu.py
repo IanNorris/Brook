@@ -37,10 +37,10 @@ def check_pair(path,identity,automatic):
             raise ValueError('pair manifest mismatch: '+name)
 
 
-def compact(source,dest,tree):
+def compact(source,dest,tree,size=8*1024*1024):
     tree.mkdir()
     subprocess.run(['mcopy','-s','-i',str(source),'::*',str(tree)],check=True)
-    with dest.open('wb') as f:f.truncate(8*1024*1024)
+    with dest.open('wb') as f:f.truncate(size)
     subprocess.run(['mformat','-i',str(dest),'::'],check=True)
     subprocess.run(['mcopy','-s','-i',str(dest),*[str(p) for p in tree.iterdir()],'::/'],check=True)
 
@@ -66,6 +66,7 @@ def main():
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
     parser.add_argument('--auto-desktop-shutdown',action='store_true',help='Perform checked shutdown through the desktop bridge')
+    parser.add_argument('--auto-desktop-dell-initrd',action='store_true',help='Exercise the Dell initrd and startup script using synthetic QEMU services')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -99,6 +100,8 @@ def main():
         parser.error('startup-script failure requires the desktop bridge fixture')
     if a.auto_desktop_shutdown and (not a.auto_desktop_network_module or a.auto_desktop_script_fail):
         parser.error('checked shutdown requires a successful desktop bridge fixture')
+    if a.auto_desktop_dell_initrd and (not a.auto_desktop or a.auto_desktop_panic or a.auto_desktop_network_module or a.inject_panic):
+        parser.error('Dell initrd fixture requires a non-panic auto desktop')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -114,11 +117,22 @@ def main():
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
         normal=work/'normal.img';recovery=work/'recovery.img'
-        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree')
+        compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree',16*1024*1024 if a.auto_desktop_dell_initrd else 8*1024*1024)
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
+        if a.auto_desktop_dell_initrd:
+            # Keep the Dell startup script, but bind the private image to the
+            # QEMU disk identity used by the recovery fixture.
+            for name in ('ahci-write-target','ahci-boot-volume','ahci-data-volume'):
+                data=subprocess.check_output(['mtype','-i',str(recovery),'::/ETC/'+name])
+                subprocess.run(['mcopy','-o','-i',str(normal),'-','::/ETC/'+name],input=data,check=True)
+            startup=subprocess.check_output(['mtype','-i',str(normal),'::/BOOT/INIT.RC'])
+            if startup!=subprocess.check_output(['mtype','-i',str(a.desktop_pair/'INITRD.IMG'),'::/BOOT/INIT.RC']):
+                raise RuntimeError('Dell startup script changed during compaction')
+            (a.output/'dell-startup-script.sha256').write_text(hashlib.sha256(startup).hexdigest()+'\n')
         if a.auto_desktop:
             for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
-                subprocess.run(['mmd','-i',str(normal),'::/'+directory],check=True)
+                if subprocess.run(['mdir','-i',str(normal),'::/'+directory],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+                    subprocess.run(['mmd','-i',str(normal),'::/'+directory],check=True)
             volatile=work/'volatile-desktop';volatile.write_text('1\n')
             subprocess.run(['mcopy','-o','-i',str(normal),str(volatile),'::/ETC/volatile-desktop'],check=True)
         service=work/'GDSVC.ELF';script=work/'INIT.RC';defaults=work/'defaults.ini'
@@ -128,7 +142,8 @@ def main():
                           ('shutdown\n' if a.auto_desktop_shutdown_panic else '') +
                           ('run --console /boot/DOES_NOT_EXIST.ELF\n' if a.auto_desktop_script_fail else ''))
         defaults.write_text('default-value\n')
-        for src,target in ((service,'::/BOOT/GDSVC.ELF'),(script,'::/BOOT/INIT.RC'),(defaults,'::/ETC/desktop-defaults.ini')):
+        payloads=((service,'::/BOOT/GDSVC.ELF'),) if a.auto_desktop_dell_initrd else ((service,'::/BOOT/GDSVC.ELF'),(script,'::/BOOT/INIT.RC'),(defaults,'::/ETC/desktop-defaults.ini'))
+        for src,target in payloads:
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
         if a.normal_kernel or a.auto_desktop_network_module:
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
@@ -152,6 +167,11 @@ def main():
             subprocess.run(['debugfs','-w','-R',f'write {witness} /{name}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             if name.startswith(('bin/','profile/bin/')):
                 subprocess.run(['debugfs','-w','-R',f'set_inode_field /{name} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.auto_desktop_dell_initrd:
+            for name in ('waylandd','hardware-dbus','hardware-message'):
+                target='/profile/bin/'+name
+                subprocess.run(['debugfs','-w','-R',f'write {service} {target}',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                subprocess.run(['debugfs','-w','-R',f'set_inode_field {target} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         with disk.open('r+b') as dst,partition.open('rb') as src:
             dst.seek(133120*512);shutil.copyfileobj(src,dst);dst.seek(133120*512+1024+58);dst.write(b'\0\0')
         guard=bytearray(128);guard[:8]=b'BRKRCV01';struct.pack_into('<QI',guard,8,1,1)
@@ -449,6 +469,11 @@ def main():
                  extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
+        if a.auto_desktop_dell_initrd:
+            for executable in ('/nix/profile/bin/waylandd','/nix/profile/bin/hardware-dbus',
+                               '/nix/profile/bin/hardware-message','/boot/HWSTATUS.ELF'):
+                if 'ELF HASH: '+executable+' ' not in serial:
+                    raise RuntimeError('Dell startup did not launch '+executable)
         if ((not a.auto_desktop_panic and 'GUARD_DESKTOP_SERVICE_PASS' not in serial) or (not a.auto_desktop and 'brook-ssd-recovery-automatic-v1' in serial) or
             'Recovery required; normal boot blocked.' in serial):
             raise RuntimeError('guarded desktop service did not start after repair')
