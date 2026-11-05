@@ -7,6 +7,7 @@ loss, and this test does not establish SSD controller-cache durability.
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -49,11 +50,13 @@ def main():
     parser.add_argument('--snapshot-packet-output',type=Path,help='Save the retrieved panic packet to a new file')
     parser.add_argument('--graphics-environment-test',action='store_true',
                         help='Check the launched environment when no virtio GPU is present')
+    parser.add_argument('--watchdog-held-serial-test',action='store_true',
+                        help='Inject a held serial lock and a stagnant watchdog sample using GDB')
     parser.add_argument('--serial-output',type=Path,help='Save the guest serial log to a new file')
     parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
-    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test,args.graphics_environment_test))>1:
+    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test,args.graphics_environment_test,args.watchdog_held_serial_test))>1:
         parser.error('Choose only one provisioning test')
     if args.efi_inventory_stage_test and not args.inventory_efi:
         parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
@@ -134,7 +137,7 @@ def main():
         identity = disk_guid + uuid.UUID(data_part['uuid']).bytes_le.hex() + fs_uuid.hex()
         if args.graphics_environment_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 1000 /boot/GFXENV.ELF\n')
-        elif args.panic_snapshot_test:
+        elif args.panic_snapshot_test or args.watchdog_held_serial_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\n')
         elif args.panic_journal_provision_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/PANICPROV.ELF ' + identity + '\n')
@@ -156,7 +159,7 @@ def main():
             subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
                             str(ROOT/'scripts/workloads/graphics_environment_probe.c'),'-o',str(probe)],check=True)
             subprocess.run(['mcopy','-o','-i',str(initrd),str(probe),'::/BOOT/GFXENV.ELF'],check=True)
-        elif args.panic_snapshot_test:
+        elif args.panic_snapshot_test or args.watchdog_held_serial_test:
             pass
         elif args.panic_journal_provision_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.panic_journal_provision_test.resolve(strict=True)),'::/BOOT/PANICPROV.ELF'],check=True)
@@ -189,18 +192,72 @@ def main():
                 probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
             command += ['-netdev',f'user,id=snapshot-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234',
                         '-device','virtio-net-pci,netdev=snapshot-net']
+        debugger = None
+        if args.watchdog_held_serial_test:
+            symbols = subprocess.check_output(['nm', str(kernel)], text=True)
+            def address(name):
+                match = re.search(r'^([0-9a-f]+)\s+\w\s+' + re.escape(name) + r'$', symbols, re.M)
+                if not match:
+                    raise RuntimeError('missing symbol ' + name)
+                return int(match.group(1), 16)
+            watchdog = address('_ZN5brookL16WatchdogThreadFnEPv')
+            progress = address('_ZN5brookL10g_progressE')
+            lock = address('_ZN5brookL12g_serialLockE')
+            assembly = subprocess.check_output(['objdump', '-d', f'--start-address={watchdog}',
+                                                f'--stop-address={watchdog+0x250}', str(kernel)], text=True)
+            pattern = (r'call\s+[^\n]*<_ZN5brook20SchedulerGetCpuTicksEjRmS0_>\n'
+                       r'\s*([0-9a-f]+):[^\n]*mov\s+-0x30\(%rbp\),%rax\n'
+                       r'[^\n]*add\s+-0x38\(%rbp\),%rax\n'
+                       r'[^\n]*cmp\s+%rax,-0xc\(%r12\)')
+            matches = re.findall(pattern, assembly)
+            if len(matches) != 1:
+                raise RuntimeError('unsupported watchdog instruction layout')
+            script = d / 'watchdog.gdb'
+            script.write_text(f'''set pagination off
+set confirm off
+target remote {d / 'gdb.sock'}
+hbreak *0x{matches[0]} if $r15 == 1
+continue
+if *(unsigned int*)0x{lock:x} != *(unsigned int*)0x{lock+4:x}
+  echo SERIAL_LOCK_ALREADY_HELD\\n
+  quit 1
+end
+set *(unsigned int*)0x{lock:x} = *(unsigned int*)0x{lock+4:x} + 1
+set *(unsigned long long*)0x{progress+16:x} = *(unsigned long long*)($rbp-0x38) + *(unsigned long long*)($rbp-0x30)
+set *(unsigned int*)0x{progress+24:x} = 2
+set *(unsigned char*)0x{progress+28:x} = 1
+printf "WATCHDOG_SERIAL_LOCK_INJECTED\\n"
+delete breakpoints
+detach
+quit
+''')
+            command += ['-S', '-gdb', f'unix:{d / "gdb.sock"},server=on,wait=off']
         with (d / 'qemu.log').open('wb') as errors:
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
             try:
                 deadline = time.monotonic() + args.timeout
+                if args.watchdog_held_serial_test:
+                    while not (d / 'gdb.sock').exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.1)
+                    if not (d / 'gdb.sock').exists():
+                        errors.flush()
+                        raise RuntimeError('QEMU debugger socket unavailable: ' + (d / 'qemu.log').read_text(errors='replace')[-2000:])
+                    debugger_log = (d / 'gdb.log').open('wb')
+                    debugger = subprocess.Popen(['gdb', '-q', '-batch', '-x', str(script)], stdout=debugger_log, stderr=subprocess.STDOUT)
                 while time.monotonic() < deadline:
                     output = serial.read_text(errors='replace') if serial.exists() else ''
-                    success = ('GPU_ENV_NONVIRTIO_PASS' if args.graphics_environment_test else
+                    success = ('WATCHDOG: CPU1 timer accounting unchanged for 3 checks' if args.watchdog_held_serial_test else
+                               'GPU_ENV_NONVIRTIO_PASS' if args.graphics_environment_test else
                                'SHELL: script \'/boot/INIT.RC\' finished' if args.panic_snapshot_test else
                                'PANIC_JOURNAL_PROVISION_OK' if args.panic_journal_provision_test else
                                'EFI_INVENTORY_STAGE_OK' if args.efi_inventory_stage_test else
                                'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK')
                     if success in output:
+                        if args.watchdog_held_serial_test:
+                            debugger.wait(timeout=10)
+                            debugger_log.flush()
+                            if debugger.returncode or 'WATCHDOG_SERIAL_LOCK_INJECTED' not in (d / 'gdb.log').read_text():
+                                raise RuntimeError('watchdog injection failed: ' + (d / 'gdb.log').read_text())
                         if 'ahci direct: ready' not in output:
                             raise RuntimeError('the intended direct data volume was not mounted')
                         if args.panic_snapshot_test:
@@ -235,14 +292,26 @@ def main():
                     if any(x in output for x in ('GPU_ENV_NONVIRTIO_FAIL','IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'EFI_INVENTORY_STAGE_FAILED', 'PANIC_JOURNAL_PROVISION_FAILED', 'PANIC_JOURNAL_IDENTITY_MISMATCH')):
                         raise RuntimeError(output[-4500:])
                     if process.poll() is not None:
-                        raise RuntimeError('QEMU exited: ' + output[-4500:])
+                        errors.flush()
+                        raise RuntimeError('QEMU exited: ' + output[-4500:] + '\n' + (d / 'qemu.log').read_text(errors='replace')[-2000:])
+                    if debugger is not None and debugger.poll() not in (None, 0):
+                        debugger_log.flush()
+                        raise RuntimeError('debugger failed: ' + (d / 'gdb.log').read_text())
                     time.sleep(0.2)
                 else:
                     raise RuntimeError('timed out: ' + output[-4500:])
             finally:
+                if debugger is not None:
+                    if debugger.poll() is None:
+                        debugger.kill()
+                        debugger.wait()
+                    debugger_log.close()
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+        if args.watchdog_held_serial_test:
+            print('normal watchdog warning with injected held serial lock: PASS')
+            return
         if args.graphics_environment_test:
             print('non-virtio graphics launch environment: PASS')
             return
