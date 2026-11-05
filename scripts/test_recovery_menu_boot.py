@@ -19,14 +19,14 @@ from pathlib import Path
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
          network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
-         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None):
+         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
     shutil.copyfile(firmware / 'OVMF_VARS.fd', variables)
     command = [
         'qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm', '-cpu', 'host',
-        '-smp', '2', '-m', '1024', '-nodefaults',
+        '-smp', str(smp), '-m', '1024', '-nodefaults',
         '-drive', f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE.fd"}',
         '-drive', f'if=pflash,format=raw,file={variables}', '-device', 'VGA',
     ]

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -53,6 +54,7 @@ def main():
     parser.add_argument('--auto-desktop',action='store_true',help='Use an automatic guard kernel with checked desktop handoff')
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
+    parser.add_argument('--auto-desktop-hard-stall',action='store_true',help='Stall a real vCPU and require watchdog capture and reset')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -68,6 +70,8 @@ def main():
         parser.error('desktop reset requires desktop panic injection')
     if a.auto_desktop_shutdown_panic and not a.auto_desktop_reset:
         parser.error('shutdown panic requires the armed desktop reset fixture')
+    if a.auto_desktop_hard_stall and (not a.auto_desktop_reset or a.auto_desktop_shutdown_panic):
+        parser.error('hard stall requires desktop reset and excludes shutdown panic')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
@@ -213,19 +217,46 @@ def main():
                 if len(matches)!=1:raise RuntimeError('missing desktop panic injection symbol '+name)
                 return matches[0]
             launch=desktop_symbol('_ZN5brook25AhciSystemDirectFinalSyncEv' if a.auto_desktop_shutdown_panic else '_ZN5brook15ShellExecScriptEPKc')
-            panic=desktop_symbol('KernelPanic');scratch=desktop_symbol('_ZN5brookL8g_kbdBufE')
             gdb=second/'panic.gdb'
+            if a.auto_desktop_hard_stall:
+                from elftools.elf.elffile import ELFFile
+                progress=desktop_symbol('_ZN5brookL18g_recoveryProgressE')
+                spin=None
+                with (a.desktop_pair/'KERNEL.ELF').open('rb') as executable:
+                    for segment in ELFFile(executable).iter_segments():
+                        if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                            at=segment.data().find(b'\xeb\xfe')
+                            if at>=0:spin=segment['p_vaddr']+at;break
+                if spin is None:raise RuntimeError('no executable self-loop for watchdog fixture')
+                body=('delete breakpoints\nset $cpu=$_thread-1\n'
+                      'if $cpu < 0 || $cpu >= 4\necho Invalid vCPU mapping\\n\nquit 1\nend\n'
+                      'printf "WATCHDOG_STALLED_CPU %d\\n", $cpu\n'
+                      'python import time; print("WATCHDOG_STALL_MONOTONIC %.6f" % time.monotonic(), flush=True)\n'
+                      f'set *(unsigned long long*)({progress:#x}+16*$cpu)=0\n'
+                      f'set *(unsigned int*)({progress+8:#x}+16*$cpu)=0\n'
+                      f'set *(unsigned char*)({progress+12:#x}+16*$cpu)=1\n'
+                      f'set $eflags=$eflags & ~0x200\nset $rip={spin:#x}\ndetach\nquit\n')
+            else:
+                panic=desktop_symbol('KernelPanic');scratch=desktop_symbol('_ZN5brookL8g_kbdBufE')
+                body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
+                      f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\ndetach\nquit\n')
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
-                           f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'
-                           f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
-                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\ndetach\nquit\n')
+                           f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'+body)
             capture_seen=[]
             boot(disk,a.firmware,second,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
                  expect_reset=a.auto_desktop_reset and not a.auto_desktop_shutdown_panic,
                  hold_after_marker=7 if a.auto_desktop_shutdown_panic or not a.auto_desktop_reset else 0,reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',
                  on_marker=lambda:capture_seen.append(time.monotonic()),
+                 smp=4 if a.auto_desktop_hard_stall else 2,
                  extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-desktop-panic-reset,string=test-1'] if a.auto_desktop_reset else None)
+            if a.auto_desktop_hard_stall:
+                debugger_log=(second/'qemu.log').read_text(errors='replace')
+                (a.output/'desktop-stall-gdb.log').write_text(debugger_log)
+                stalled=re.search(r'WATCHDOG_STALLED_CPU ([0-3])',debugger_log)
+                started=re.search(r'WATCHDOG_STALL_MONOTONIC ([0-9.]+)',debugger_log)
+                if not stalled or not started or not capture_seen or capture_seen[0]-float(started.group(1))<25:
+                    raise RuntimeError('watchdog did not observe a sustained vCPU stall')
             if a.auto_desktop_reset and not a.auto_desktop_shutdown_panic and (not capture_seen or time.monotonic()-capture_seen[0]<4):
                 raise RuntimeError('desktop panic reset occurred before the expected delay')
         elif a.auto_desktop_network_module:
@@ -297,6 +328,17 @@ def main():
             if not packet:raise RuntimeError('desktop panic packet missing')
             journal_after=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
             verify_record(journal_after,0,1,bytes.fromhex(packet))
+            if a.auto_desktop_hard_stall:
+                cpu=stalled.group(1)
+                if f'WATCHDOG: CPU{cpu} timer accounting unchanged for 3 checks' not in serial:
+                    raise RuntimeError('watchdog did not report the stalled CPU')
+                packet_file=a.output/'desktop-watchdog-panic.bin';packet_file.write_bytes(bytes.fromhex(packet))
+                decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
+                                   '--packet',str(packet_file),'--json'],stderr=subprocess.DEVNULL))
+                if (decoded.get('message')!=f'Recovery watchdog: CPU{cpu} timer accounting stalled for 30 checks' or
+                    not decoded.get('log_tail',{}).get('available')):
+                    raise RuntimeError('watchdog packet did not retain its reason and log')
+                (a.output/'desktop-watchdog-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
         if a.normal_kernel and f'NORMAL_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}' not in serial:
             raise RuntimeError('normal boot did not validate the captured panic packet')
         if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal unexpectedly changed')
