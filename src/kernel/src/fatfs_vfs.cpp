@@ -3,7 +3,7 @@
 #if defined(BROOK_SSD_GUARD_CHECK)
 #include "guard_fat_profile.h"
 #endif
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
 #include "../../shared/update/recovery_guard_transaction.h"
 #endif
 #include "vfs.h"
@@ -103,9 +103,9 @@ struct FatPrivateMount {
     Vnode* nodes[2];
     FatImageLease* leases[2];
     bool inspected;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
     bool pendingAttempted;
-#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#if defined(BROOK_SSD_GUARD_COMPLETION)
     bool pendingSucceeded;
     bool completionAttempted;
 #endif
@@ -1746,7 +1746,7 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* se
     for(unsigned i=0;!error && i<2;++i)error=FatFsGuardFlushReadback(session->leases[i],buffers[i]);
     return error;
 }
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
 bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* session,const GuardFatProfile& p) {
     if(!session || !session->mount || (p.type!=16 && p.type!=32))return false;
     const auto& fs=session->mount->fs;
@@ -1772,12 +1772,12 @@ int FatFsPrivateRecoveryTestPending(FatPrivateMount* session,const char* identit
         bool Flush() {return Step() && !FatFsSync(session->mount);}
     } io{session,failAt};
     const auto result=BrookGuardBeginRepair(io,identity);
-#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#if defined(BROOK_SSD_GUARD_COMPLETION)
     session->pendingSucceeded=result==BrookGuardBeginResult::PendingDurable;
 #endif
     return result==BrookGuardBeginResult::PendingDurable?2:result==BrookGuardBeginResult::Uncertain?1:0;
 }
-#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#if defined(BROOK_SSD_GUARD_COMPLETION)
 int FatFsPrivateRecoveryTestComplete(FatPrivateMount* session,const char* identity,const uint8_t* pending,uint32_t failAt) {
     if(!session || !session->mount || !session->pendingSucceeded || !pending ||
        __atomic_exchange_n(&session->completionAttempted,true,__ATOMIC_ACQ_REL))return 0;

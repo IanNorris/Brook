@@ -1,7 +1,7 @@
 #include "process_fs.h"
 #include "seek_position.h"
 #include "guard_checker_session.h"
-#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+#if defined(BROOK_SSD_GUARD_REPAIR)
 #include "guard_repair_session.h"
 #endif
 #include "device.h"
@@ -3542,7 +3542,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     const char* lookupPath=hasSyntheticName?resolvedPath:path;
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
-#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+#if defined(BROOK_SSD_GUARD_REPAIR)
     if(StrEq(path,"/dev/brook-guard-data") && !hasSyntheticName)return -13;
     if(StrEq(syntheticPath,"/dev/brook-guard-data")) {
         int error=0;Vnode* node=GuardRepairOpenLinux(flags,&error);

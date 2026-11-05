@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <thread>
 #include <sys/wait.h>

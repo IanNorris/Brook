@@ -13,7 +13,7 @@
 #include "mount_namespace.h"
 #include "vfs.h"
 #include "kprintf.h"
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
 #include "guard_checker_session.h"
 #include "guard_fat_profile.h"
 #endif
@@ -54,7 +54,7 @@ uint64_t GuardBlocks(Device*) {return guardReady?guardRange.bytes/512:0;}
 uint32_t GuardBlockSize(Device*) {return 512;}
 const BlockDeviceOps guardOps{GuardRead,GuardWrite,GuardControl,nullptr,GuardBlocks,GuardBlockSize};
 Device guardPartition{reinterpret_cast<const DeviceOps*>(&guardOps),"ahci-guard-esp",DeviceType::Block,nullptr};
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
 enum class GuardTestPhase : uint8_t {Disabled,Preparation,Writing,Finished,Failed};
 GuardTestPhase guardTestPhase=GuardTestPhase::Disabled;
 int GuardTestRead(Device*,uint64_t offset,void* data,uint64_t length) {
@@ -240,17 +240,17 @@ Device* AhciSystemGuardPrepare() {
     if(!ReadExact(disk,layout.data.first+2,superblock,sizeof(superblock)) ||
        superblock[56]!=0x53 || superblock[57]!=0xef || memcmp(superblock+104,largeUuid,16))return nullptr;
     guardRange={disk,layout.esp.first*512,layout.esp.count*512};
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
     guardDataRange={disk,layout.data.first*512,layout.data.count*512};
 #endif
     // Registered callbacks reject I/O until the complete batch is installed.
     if(!DeviceRegister(&guardPartition))return nullptr;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
     if(!DeviceRegister(&guardDataPartition))return nullptr;
 #endif
     BlockWriteLease leases[4]{};
     if(!AhciDirectGuardLeases(layout,reinterpret_cast<uintptr_t>(disk),
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
                               reinterpret_cast<uintptr_t>(&guardDataPartition),
 #else
                               0,
@@ -258,7 +258,7 @@ Device* AhciSystemGuardPrepare() {
                               reinterpret_cast<uintptr_t>(&guardPartition),leases) ||
        !DeviceInstallBootWriteLeases(leases,4))return nullptr;
     guardReady=true;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
     if(!DeviceRegister(&guardTestPartition)) {guardReady=false;return nullptr;}
 #endif
     return &guardPartition;
@@ -273,7 +273,7 @@ bool AhciSystemGuardIdentity(char (&out)[97]) {
     }
     out[at]=0;return true;
 }
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
 AhciGuardDataState AhciSystemGuardDataState(Device* reserved) {
     if(reserved!=&guardPartition || !guardReady || !guardDataRange.parent || guardDataRange.bytes<2048)
         return AhciGuardDataState::Invalid;
@@ -324,7 +324,7 @@ bool AhciSystemGuardTestDataIdentityValid(Device* adapter) {
 void AhciSystemGuardTestDataFinish(Device* adapter) {
     if(adapter==&guardDataPartition && guardDataPhase!=GuardDataPhase::Failed)guardDataPhase=GuardDataPhase::Finished;
 }
-#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#if defined(BROOK_SSD_GUARD_COMPLETION)
 bool AhciSystemGuardTestBeginCompletion(Device* adapter,bool verified) {
     static bool completionAttempted=false;
     if(completionAttempted)return false;

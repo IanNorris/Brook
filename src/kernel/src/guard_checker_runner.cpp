@@ -7,10 +7,10 @@
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
 #endif
-#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#if defined(BROOK_SSD_GUARD_COMPLETION)
 #include "platform_power.h"
 #endif
-#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+#if defined(BROOK_SSD_GUARD_REPAIR)
 #include "guard_repair_session.h"
 #endif
 #include "process.h"
@@ -30,7 +30,7 @@ constexpr uint8_t checkerHash[32]={
     0x4a,0xad,0x4c,0x64,0xbf,0xdc,0x43,0xea,0x83,0xa0,0x16,0xc8,0xfe,0xe9,0xd5,0xe3};
 constexpr const char* checkerPath="/boot/FATFSCK.ELF";
 constexpr uint64_t checkerMax=4*1024*1024;
-#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+#if defined(BROOK_SSD_GUARD_REPAIR)
 constexpr uint8_t ext2Hash[32]={
     0xac,0xc6,0xde,0xe6,0xfb,0x21,0xaf,0xd6,0x70,0xd0,0x52,0x61,0x7b,0x66,0x55,0x88,
     0x07,0x0d,0x53,0x6e,0x2e,0x73,0xb5,0xc4,0xf9,0x5d,0xb1,0x1f,0x98,0x92,0x22,0x68};
@@ -82,7 +82,11 @@ int RunExt2Checker(Device* device,bool writable) {
 }
 #endif
 void Worker(void* arg) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    KPuts("brook-ssd-recovery-automatic-v1\n");
+#else
     KPuts("brook-ssd-recovery-readonly-v1\n");
+#endif
     auto* device=static_cast<Device*>(arg);
     Vnode* vnode=nullptr;char resolved[256]{};
     int err=VfsOpenExecutable(checkerPath,&vnode,resolved,sizeof(resolved));
@@ -152,13 +156,21 @@ void Worker(void* arg) {
     KPuts("GUARD_CHECK_RESULT exit=0\n");
     uint8_t records[2][128]{};char identity[97]{};
     if(!AhciSystemGuardIdentity(identity)) {KPuts("GUARD_RECORDS_INCOMPLETE identity\n");return;}
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
-    // The optional automatic fixture must classify the same reserved data
-    // partition itself; an F5 boot or a loader hint cannot authorize repair.
+#if defined(BROOK_SSD_GUARD_TRANSACTION)
+    // Classify the same reserved data partition itself; an F5 boot or a
+    // loader hint cannot authorize repair.
+    bool autoCondition=false;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    autoCondition=true;
+#else
     char autoMode[8]{};
     const auto autoSize=FwCfgReadFile("opt/guard-auto-condition",autoMode,sizeof(autoMode));
     if(autoSize) {
         if(autoSize!=6 || memcmp(autoMode,"test-1",6)) {KPuts("GUARD_AUTO_INVALID\n");return;}
+        autoCondition=true;
+    }
+#endif
+    if(autoCondition) {
         const auto state=AhciSystemGuardDataState(device);
         if(state==AhciGuardDataState::Clean) {KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
         if(state!=AhciGuardDataState::NeedsCheck) {KPuts("GUARD_AUTO_INVALID\n");return;}
@@ -168,32 +180,34 @@ void Worker(void* arg) {
     FatPrivateMount* mount=nullptr;
     if(!adapter || !FatFsMountPrivateRecovery(1,adapter,&mount) ||
        !FatFsPrivateRecoveryGeometryMatches(mount,profile)) {
-        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_TEST_INCOMPLETE mount\n");return;
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE mount\n");return;
     }
     const int inspection=FatFsPrivateRecoveryInspect(mount,records[0],records[1]);
     if(inspection || !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
-        AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_TEST_INCOMPLETE records=%d\n",inspection);return;
+        AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_INCOMPLETE records=%d\n",inspection);return;
     }
     if(!AhciSystemGuardTestBeginWrites(adapter)) {
-        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_TEST_INCOMPLETE authorization\n");return;
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE authorization\n");return;
     }
+    uint32_t failAt=0;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
     char injection[3]{};const uint32_t rawLength=FwCfgReadFile("opt/guard-pending-fail",injection,sizeof(injection));
     const uint32_t length=rawLength && rawLength<=sizeof(injection) && !injection[rawLength-1]?rawLength-1:rawLength;
-    uint32_t failAt=0;
     for(uint32_t i=0;i<length && i<sizeof(injection);++i) {
         if(injection[i]<'0' || injection[i]>'9') {failAt=99;break;}
         failAt=failAt*10+uint32_t(injection[i]-'0');
     }
     if(rawLength>sizeof(injection) || length>2 || failAt>11 || (rawLength && !failAt)) {
-        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_TEST_INCOMPLETE injection\n");return;
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE injection\n");return;
     }
+#endif
     const int pending=FatFsPrivateRecoveryTestPending(mount,identity,failAt);
     AhciSystemGuardTestFinish(adapter);
     if(FatFsPrivateRecoveryTestPending(mount,identity,failAt)!=0) {
-        KPuts("GUARD_PENDING_TEST_INCOMPLETE repeated\n");return;
+        KPuts("GUARD_PENDING_INCOMPLETE repeated\n");return;
     }
-    KPrintf("GUARD_PENDING_TEST_RESULT outcome=%d\n",pending);
-#if defined(BROOK_SSD_GUARD_EXT2_TEST)
+    KPrintf("GUARD_PENDING_RESULT outcome=%d\n",pending);
+#if defined(BROOK_SSD_GUARD_REPAIR)
     if(pending!=2)return;
     auto* data=AhciSystemGuardTestDataArm(adapter,pending);
     if(!data) {KPuts("GUARD_EXT2_INCOMPLETE data-admission\n");return;}
@@ -208,39 +222,48 @@ void Worker(void* arg) {
     if(verification!=-115)AhciSystemGuardTestDataFinish(data);
     if(verification!=0 || !identityOk) {KPrintf("GUARD_EXT2_INCOMPLETE verify=%d identity=%u\n",verification,identityOk?1u:0u);return;}
     KPuts("GUARD_EXT2_VERIFIED_PENDING\n");
-#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#if defined(BROOK_SSD_GUARD_COMPLETION)
     // Derive the exact pending record from the pair admitted before repair.
     // The repair generation identifies the attempt across both transitions.
     BrookUpdatePut64(records[0]+8,BrookUpdateGet64(records[0]+8)+1);
     BrookUpdatePut32(records[0]+16,BROOK_RECOVERY_GUARD_PENDING);
     BrookUpdatePut32(records[0]+124,BrookUpdateCrc(records[0],124));
+    uint32_t completeFail=0;
+#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
     char completeInjection[3]{};
     const uint32_t completeRaw=FwCfgReadFile("opt/guard-complete-fail",completeInjection,sizeof(completeInjection));
     const uint32_t completeLength=completeRaw && completeRaw<=sizeof(completeInjection) && !completeInjection[completeRaw-1]?completeRaw-1:completeRaw;
-    uint32_t completeFail=0;
     for(uint32_t i=0;i<completeLength && i<sizeof(completeInjection);++i) {
         if(completeInjection[i]<'0' || completeInjection[i]>'9') {completeFail=99;break;}
         completeFail=completeFail*10+uint32_t(completeInjection[i]-'0');
     }
-    if(completeRaw>sizeof(completeInjection) || completeLength>2 || completeFail>11 || (completeRaw && !completeFail) ||
-       !AhciSystemGuardTestBeginCompletion(adapter,identityOk)) {
-        KPuts("GUARD_COMPLETE_TEST_INCOMPLETE authorization\n");return;
+    if(completeRaw>sizeof(completeInjection) || completeLength>2 || completeFail>11 || (completeRaw && !completeFail)) {
+        KPuts("GUARD_COMPLETE_INCOMPLETE injection\n");return;
+    }
+#endif
+    if(!AhciSystemGuardTestBeginCompletion(adapter,identityOk)) {
+        KPuts("GUARD_COMPLETE_INCOMPLETE authorization\n");return;
     }
     const int complete=FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail);
     AhciSystemGuardTestFinish(adapter);
     if(FatFsPrivateRecoveryTestComplete(mount,identity,records[0],completeFail)!=0) {
-        KPuts("GUARD_COMPLETE_TEST_INCOMPLETE repeated\n");return;
+        KPuts("GUARD_COMPLETE_INCOMPLETE repeated\n");return;
     }
-    KPrintf("GUARD_COMPLETE_TEST_RESULT outcome=%d\n",complete);
-    // A fixture-only opt-in exercises a real reset after the durable clean
-    // pair. Failures, uncertain completion and returned reset writes never
-    // retry. The production recovery path does not use this hook.
+    KPrintf("GUARD_COMPLETE_RESULT outcome=%d\n",complete);
+    // Reset only after the durable clean pair. Failures, uncertain completion
+    // and returned reset writes never retry; the test build requires opt-in.
+    bool restartRequested=false;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    restartRequested=true;
+#else
     char restart[8]{};
     const auto restartSize=FwCfgReadFile("opt/guard-complete-restart",restart,sizeof(restart));
-    if(complete==2 && restartSize==6 && !memcmp(restart,"test-1",6)) {
-        KPuts("GUARD_COMPLETE_TEST_RESTART\n");
+    restartRequested=restartSize==6 && !memcmp(restart,"test-1",6);
+#endif
+    if(complete==2 && restartRequested) {
+        KPuts("GUARD_COMPLETE_RESTART\n");
         if(PlatformPowerIssue(true))SchedulerSleepMs(1000);
-        KPuts("GUARD_COMPLETE_TEST_RESTART_RETURNED\n");
+        KPuts("GUARD_COMPLETE_RESTART_RETURNED\n");
     }
 #endif
 #endif

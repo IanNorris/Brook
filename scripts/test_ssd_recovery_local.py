@@ -48,6 +48,7 @@ def main():
                    help='Optionally retain the test serial log as a new file')
     p.add_argument('--kernel-build', type=Path,
                    help='Optionally stage a private installer kernel and matching ABI 64 modules')
+    p.add_argument('--module-abi', type=int, default=64, help='Expected ABI of staged guest modules')
     p.add_argument('--prepared-pair', type=Path,
                    help='Boot this exact physical recovery pair and verify it refuses the QEMU disk')
     p.add_argument('--fat-checker', type=Path,
@@ -84,6 +85,10 @@ def main():
                    help='Exercise a guest-initiated restart after verified completion')
     p.add_argument('--guard-auto-condition', action='store_true',
                    help='Only repair if the reserved data filesystem is dirty')
+    p.add_argument('--guard-auto-dispatch', action='store_true',
+                   help='Require EFI to select recovery without injecting F5')
+    p.add_argument('--guard-auto-kernel', action='store_true',
+                   help='Expect the isolated automatic-recovery kernel')
     p.add_argument('--guard-auto-unsupported', action='store_true',
                    help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
@@ -97,10 +102,16 @@ def main():
     p.add_argument('--guard-ext2-missing-checker', action='store_true',
                    help='Remove the private ext2 checker to test missing-tool handling')
     a = p.parse_args()
+    if a.module_abi < 1:
+        p.error('module ABI must be positive')
     if a.guard_auto_restart and not a.guard_complete_test:
         p.error('automatic restart requires the completion fixture')
     if a.guard_auto_condition and not a.guard_ext2_test:
         p.error('automatic repair condition requires the ext2 fixture')
+    if a.guard_auto_dispatch and (not a.guard_auto_condition or not a.dirty or not a.guarded_efi):
+        p.error('automatic dispatch requires a dirty filesystem and guarded EFI')
+    if a.guard_auto_kernel and not a.guard_real_checker:
+        p.error('automatic recovery kernel requires its checker fixture')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
         p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
@@ -251,7 +262,7 @@ def main():
                     raise RuntimeError('unexpected recovery module name')
                 module = build / 'drivers' / name.lower()
                 data = module.read_bytes()
-                if module_version(data) != 64:
+                if module_version(data) != a.module_abi:
                     raise RuntimeError('unexpected recovery module ABI')
                 subprocess.run(['mcopy', '-o', '-i', str(initrd), str(module), '::/DRIVERS/' + name], check=True)
                 if subprocess.check_output(['mtype', '-i', str(initrd), '::/DRIVERS/' + name]) != data:
@@ -311,7 +322,7 @@ def main():
                     if not name.lower().endswith('.mod') or '/' in name or '..' in name:
                         raise RuntimeError('unexpected normal module name')
                     module=normal_build/'drivers'/name.lower()
-                    if module_version(module.read_bytes())!=64:raise RuntimeError('unexpected normal module ABI')
+                    if module_version(module.read_bytes())!=a.module_abi:raise RuntimeError('unexpected normal module ABI')
                     subprocess.run(['mcopy','-o','-i',str(normal_initrd),str(module),'::DRIVERS/'+name],check=True)
                 subprocess.run(['mcopy','-o','-i',media,str(normal_initrd),'::/INITRD.IMG'],check=True)
                 subprocess.run(['mcopy','-o','-i',media,str(normal_build/'BROOK.elf'),'::/KERNEL/BROOK.ELF'],check=True)
@@ -396,9 +407,10 @@ def main():
         if a.guarded_efi:
             efi=a.guarded_efi.resolve(strict=True)
             subprocess.run(['mcopy','-o','-i',media,str(efi),'::/EFI/BOOT/BOOTX64.EFI'],check=True)
-            normal=work/'normal-boot';normal.mkdir()
-            boot_menu_fixture(disk,a.firmware.resolve(strict=True),normal,False,'BOOT: complete',90,True,
-                              'Recovery required; normal boot blocked.',sata_snapshot=True)
+            if not a.guard_auto_dispatch:
+                normal=work/'normal-boot';normal.mkdir()
+                boot_menu_fixture(disk,a.firmware.resolve(strict=True),normal,False,'BOOT: complete',90,True,
+                                  'Recovery required; normal boot blocked.',sata_snapshot=True)
         before = sha(disk)
         baseline=None
         auto_clean=a.guard_auto_condition and not a.dirty
@@ -442,6 +454,7 @@ def main():
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             stop = threading.Event()
             def select_recovery():
+                if a.guard_auto_dispatch:return
                 while not stop.is_set() and process.poll() is None:
                     if monitor.exists():
                         try:
@@ -470,20 +483,21 @@ def main():
                         if 'SSD_GUARD_RESERVATION_READY' in text or 'ahci system: verified GPT entry' in text:
                             raise RuntimeError('failed guard reservation admitted storage: ' + text[-5000:])
                         break
-                    if AUTO_CHECK_PAYLOAD_ID.decode().strip() in text:
+                    recovery_identity=('brook-ssd-recovery-automatic-v1' if a.guard_auto_kernel else AUTO_CHECK_PAYLOAD_ID.decode().strip())
+                    if recovery_identity in text:
                         selected = True
                         stop.set()
                     pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
                     ext2_checker_failed=a.guard_ext2_bad_checker or a.guard_ext2_missing_checker
                     complete_expected=(0 if a.guard_complete_fail_at in (1,2) else 1 if a.guard_complete_fail_at else 2)
                     expected = (('GUARD_AUTO_INVALID' if a.guard_auto_unsupported else 'GUARD_AUTO_NO_REPAIR') if auto_clean else
-                                f'GUARD_COMPLETE_TEST_RESULT outcome={complete_expected}' if a.guard_complete_test else
+                                f'GUARD_COMPLETE_RESULT outcome={complete_expected}' if a.guard_complete_test else
                                 'GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
                                 'GUARD_EXT2_VERIFIED_PENDING' if a.guard_ext2_test and not a.guard_pending_fail_at else
-                                (f'GUARD_PENDING_TEST_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
-                                 'GUARD_PENDING_TEST_INCOMPLETE records=0' if a.guard_records in ('mismatch','wrong-identity') else
-                                 'GUARD_PENDING_TEST_INCOMPLETE records=-2' if a.guard_records=='missing' else
-                                 'GUARD_PENDING_TEST_INCOMPLETE records=-22') if a.guard_pending_test else
+                                (f'GUARD_PENDING_RESULT outcome={pending_expected}' if a.guard_records=='valid' else
+                                 'GUARD_PENDING_INCOMPLETE records=0' if a.guard_records in ('mismatch','wrong-identity') else
+                                 'GUARD_PENDING_INCOMPLETE records=-2' if a.guard_records=='missing' else
+                                 'GUARD_PENDING_INCOMPLETE records=-22') if a.guard_pending_test else
                                 ('GUARD_RECORDS_MATCH' if a.guard_records=='valid' else
                                  'GUARD_RECORDS_INCOMPLETE mismatch' if a.guard_records in ('mismatch','wrong-identity') else
                                  'GUARD_RECORDS_INCOMPLETE read=-2' if a.guard_records=='missing' else
@@ -516,30 +530,30 @@ def main():
                     if auto_clean and matched:
                         time.sleep(2)
                         final=serial.read_text(errors='replace')
-                        if any(marker in final for marker in ('GUARD_PENDING_TEST_RESULT', 'GUARD_EXT2_PREEN',
-                                                              'GUARD_COMPLETE_TEST_RESTART')):
+                        if any(marker in final for marker in ('GUARD_PENDING_RESULT', 'GUARD_EXT2_PREEN',
+                                                              'GUARD_COMPLETE_RESTART')):
                             raise RuntimeError('clean filesystem unexpectedly entered repair')
                     if a.guard_auto_restart and matched and not auto_clean:
                         if complete_expected!=2:
                             time.sleep(2)
-                            if 'GUARD_COMPLETE_TEST_RESTART' in serial.read_text(errors='replace'):
+                            if 'GUARD_COMPLETE_RESTART' in serial.read_text(errors='replace'):
                                 raise RuntimeError('guest restarted after incomplete completion')
                         else:
                             # Require the same QEMU process to return through EFI
                             # and reach normal boot after completion.
                             after=text.split(expected,1)[1]
-                            if 'GUARD_COMPLETE_TEST_RESTART_RETURNED' in after:
+                            if 'GUARD_COMPLETE_RESTART_RETURNED' in after:
                                 raise RuntimeError('guest reset returned without restarting')
-                            if 'GUARD_COMPLETE_TEST_RESTART' not in after or 'BOOT: complete' not in after:
+                            if 'GUARD_COMPLETE_RESTART' not in after or 'BOOT: complete' not in after:
                                 time.sleep(.2);continue
-                            if after.count('GUARD_COMPLETE_TEST_RESTART')!=1 or 'SSD_GUARD_RESERVATION_READY' in after:
+                            if after.count('GUARD_COMPLETE_RESTART')!=1 or 'SSD_GUARD_RESERVATION_READY' in after:
                                 raise RuntimeError('guest re-entered recovery after completion')
                     if selected and matched:
                         if a.guard_ext2_test and not a.guard_pending_fail_at and not auto_clean:
                             preen=('GUARD_EXT2_PREEN exit=-8' if a.guard_ext2_bad_checker else
                                    'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
-                            required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_TEST_RESULT outcome=2',preen,expected]
+                            required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_RESULT outcome=2',preen,expected]
                             if a.guard_auto_condition:required.insert(1,'GUARD_AUTO_NEEDS_CHECK')
                             if a.guard_complete_test:required.insert(-1,'GUARD_EXT2_VERIFIED_PENDING')
                             if not all(line in complete_lines for line in required):

@@ -70,7 +70,7 @@ add_host_test(test_profiler_write_all)
 target_compile_options(test_profiler_write_all PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_guard_fat_profile PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_guard_repair_session "${BROOK_ROOT}/src/kernel/src/guard_repair_session.cpp")
-target_compile_options(test_guard_repair_session PRIVATE -DBROOK_SSD_GUARD_PENDING_TEST "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_compile_options(test_guard_repair_session PRIVATE -DBROOK_SSD_GUARD_TRANSACTION "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp" "${BROOK_ROOT}/src/bootloader/src/config.cpp")
 target_include_directories(test_update_slots PRIVATE
     "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"

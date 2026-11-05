@@ -7,7 +7,8 @@ struct Device;struct Process;struct Vnode;struct ChildWaitSnapshot;
 inline int GuardRepairRejectedOutcome(bool quiescent) {
     return quiescent?-5:-115;
 }
-// QEMU-only test: a preen session followed by a distinct read-only verifier.
+// A preen session followed by a distinct read-only verifier, on the
+// boot-reserved data adapter.
 bool GuardRepairBegin(Device*,const Process*,bool writable);
 // Tracked mode is controller- and incarnation-bound. Poll consumes a scheduler
 // child event; completion can be claimed once, only after all views/I/O drain.
