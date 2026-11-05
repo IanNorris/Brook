@@ -115,6 +115,8 @@ def main():
                    help='Simulate an unchanged peer sample for the complete watchdog interval')
     p.add_argument('--guard-watchdog-hard-stall', action='store_true',
                    help='Stall the repair vCPU with interrupts disabled and wait for the watchdog')
+    p.add_argument('--guard-watchdog-held-serial', action='store_true',
+                   help='Also leave the serial ticket lock held during the vCPU stall')
     p.add_argument('--guard-panic-network', action='store_true',
                    help='Retrieve the previous panic via the restricted recovery debug listener')
     p.add_argument('--guard-panic-invalid-data', action='store_true',
@@ -169,6 +171,8 @@ def main():
         p.error('watchdog duration requires the watchdog injection fixture')
     if a.guard_watchdog_duration and a.guard_watchdog_hard_stall:
         p.error('choose a watchdog stall fixture')
+    if a.guard_watchdog_held_serial and not a.guard_watchdog_hard_stall:
+        p.error('held serial requires the hard-stall watchdog fixture')
     if a.guard_panic_network and not a.guard_panic_after_pending:
         p.error('network retrieval requires the post-pending panic fixture')
     if (a.guard_panic_invalid_data or a.guard_panic_missing_guard) and not (a.guard_panic_after_pending and a.guard_panic_network):
@@ -583,8 +587,13 @@ def main():
                               'printf "WATCHDOG_STALLED_CPU %d\\n", $cpu\n'
                               f'set *(unsigned long long*)({progress_base:#x}+16*$cpu)=0\n'
                               f'set *(unsigned int*)({progress_base+8:#x}+16*$cpu)=0\n'
-                              f'set *(unsigned char*)({progress_base+12:#x}+16*$cpu)=1\n'
-                              f'set $eflags=$eflags & ~0x200\nset $rip={spin:#x}\ndetach\nquit\n')
+                              f'set *(unsigned char*)({progress_base+12:#x}+16*$cpu)=1\n')
+                        if a.guard_watchdog_held_serial:
+                            serial_lock=symbol('_ZN5brookL12g_serialLockE')
+                            body+=(f'if *(unsigned int*){serial_lock:#x} != *(unsigned int*){serial_lock+4:#x}\n'
+                                   'echo Serial lock already occupied\\n\nquit 1\nend\n'
+                                   f'set *(unsigned int*){serial_lock:#x}=*(unsigned int*){serial_lock+4:#x}+1\n')
+                        body+=f'set $eflags=$eflags & ~0x200\nset $rip={spin:#x}\ndetach\nquit\n'
                     else:
                         body=(f'delete breakpoints\nset $rip={spin:#x}\n'
                               f'hbreak *{armed:#x} if $r15 == 1\n')
@@ -817,6 +826,8 @@ def main():
             stalled=re.search(r'WATCHDOG_STALLED_CPU ([0-3])',(work/'qemu.log').read_text(errors='replace')) if a.guard_watchdog_hard_stall else None
             if a.guard_watchdog_hard_stall and not stalled:raise RuntimeError('missing stalled vCPU identity')
             cpu=stalled.group(1) if stalled else '1'
+            if a.guard_watchdog_held_serial and f'WATCHDOG: CPU{cpu} timer accounting unchanged for 3 checks' not in text:
+                raise RuntimeError('watchdog warning was lost while the serial lock was held')
             expected_message=(f'Recovery watchdog: CPU{cpu} timer accounting stalled for 30 checks' if a.guard_watchdog_inject else 'GDBTEST')
             if decoded.get('message')!=expected_message or not decoded.get('log_tail',{}).get('available'):
                 raise RuntimeError('panic packet lacks the injected reason or recent log')

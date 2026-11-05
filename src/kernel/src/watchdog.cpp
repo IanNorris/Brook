@@ -23,6 +23,14 @@ static WatchdogProgress g_progress[WATCHDOG_MAX_CPUS] = {};
 // and escalate only after recovery has durably authorized panic reset.
 static constexpr uint32_t RECOVERY_WATCHDOG_STRIKES = 30;
 static WatchdogProgress g_recoveryProgress[WATCHDOG_MAX_CPUS] = {};
+static void RecoveryWatchdogWarning(uint32_t cpu) {
+    // A stalled peer may own the ordinary serial ticket lock. Emergency
+    // output is bounded even when the UART itself no longer responds.
+    SerialPanicPuts("WATCHDOG: CPU");
+    if(cpu>=10)SerialPanicPutChar(char('0'+cpu/10));
+    SerialPanicPutChar(char('0'+cpu%10));
+    SerialPanicPuts(" timer accounting unchanged for 3 checks\n");
+}
 #endif
 
 static void WatchdogThreadFn(void* /*arg*/)
@@ -54,8 +62,12 @@ static void WatchdogThreadFn(void* /*arg*/)
 
             if (g_progress[c].Observe(total, WATCHDOG_STRIKES))
             {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+                RecoveryWatchdogWarning(c);
+#else
                 SerialPrintf("WATCHDOG: CPU%u timer accounting unchanged for %u checks\n",
                              c, WATCHDOG_STRIKES);
+#endif
             }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
             // Do not carry a pre-authorization stall across the repair gate.
