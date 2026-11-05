@@ -19,6 +19,9 @@
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "shell.h"
 #endif
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "shutdown.h"
+#endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
 #include "platform_power.h"
 #endif
@@ -35,6 +38,10 @@
 #include "../../shared/update/recovery_guard.h"
 
 namespace brook {
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+namespace { bool guardedDesktopBridge=false; }
+bool GuardedDesktopBridgeEnabled() {return __atomic_load_n(&guardedDesktopBridge,__ATOMIC_ACQUIRE);}
+#endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 namespace {
 uint8_t g_recoveryPanicPacket[PanicJournalPayloadMax]{};
@@ -251,9 +258,17 @@ void Worker(void* arg) {
         if(resetBytes==6 && !memcmp(resetRequest,"test-1",6) && PlatformPowerGetPlan().q35Reset &&
            !PlatformPowerGetPlan().resetDisabledByLaunch)
             KPrintf("GUARD_DESKTOP_PANIC_RESET armed=%u\n",PanicRecoveryResetArm()?1u:0u);
+        char bridgeTest[8]{};
+        if(FwCfgReadFile("opt/guard-bridge-window",bridgeTest,sizeof(bridgeTest))==6 &&
+           !memcmp(bridgeTest,"test-1",6) && PlatformPowerGetPlan().q35Reset) {
+            KPuts("GUARD_DESKTOP_BRIDGE_TEST_WINDOW\n");
+            SchedulerSleepMs(8000);
+        }
 #endif
         GuardTestPrepareDesktopHome();
         const int script=ShellExecScript("/boot/INIT.RC");
+        if(!script && ShutdownLaunchAllowed())
+            __atomic_store_n(&guardedDesktopBridge,true,__ATOMIC_RELEASE);
         KPrintf("GUARD_DESKTOP_HANDOFF_SCRIPT status=%d\n",script);
         return;
 #else

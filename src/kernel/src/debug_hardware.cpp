@@ -27,6 +27,9 @@
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include "panic_snapshot.h"
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "guard_checker_runner.h"
+#endif
 #include "../../drivers/intel_hda/hda_probe.h"
 namespace brook {
 #if defined(BROOK_HOST_TEST)
@@ -55,13 +58,28 @@ bool ReadId(const char*& p,char out[33]){
     for(unsigned i=0;i<32;++i){char c=p[i];if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return false;out[i]=c;}
     out[32]=0;p+=32;return true;
 }
-#if !defined(BROOK_SSD_AUTO_RECOVERY)
+#if !defined(BROOK_SSD_AUTO_RECOVERY) || defined(BROOK_SSD_GUARDED_DESKTOP)
 void PowerCaps(Reply& r){
     const auto power=ShutdownGetPowerCapabilities();
     r.text("\"graceful_quiescence\":");r.text(power.gracefulQuiescence?"true":"false");
     r.text(",\"reset\":");r.text(power.reset?"true":"false");r.text(",\"power_off\":");r.text(power.powerOff?"true":"false");
     r.text(",\"reset_method\":");r.quoted(power.resetMethod);r.text(",\"power_off_method\":");r.quoted(power.powerOffMethod);
     r.text(",\"reset_reason\":");r.quoted(power.resetReason);r.text(",\"power_off_reason\":");r.quoted(power.powerOffReason);
+}
+void DesktopCaps(Reply& r){
+    r.text(",\"power_api\":1,\"power\":{");PowerCaps(r);r.text("}");
+#if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_GUARDED_DESKTOP)
+    r.text(",\"recovery_panic_api\":1");
+#endif
+    VnodeStat helper{},optin{};
+    auto* binary=VfsOpen("/boot/HWBULK.ELF",VFS_O_STREAM);
+    auto* marker=VfsOpen("/etc/hardware-bulk",VFS_O_STREAM);
+    const bool bulk=binary&&marker&&!VfsStat(binary,&helper)&&!helper.isDir&&helper.size>0&&
+        !VfsStat(marker,&optin)&&!optin.isDir&&optin.size>0;
+    if(binary)VfsClose(binary);
+    if(marker)VfsClose(marker);
+    r.text(",\"completed_frame_copy_api\":1,\"bulk_helper_api\":");r.number(bulk?1:0);
+    r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");
 }
 #endif
 const char* I2cProbeResult(DellI2cIdResult result) {
@@ -107,28 +125,16 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("bytes",store.bytes);r.text(",");r.field("drive",store.drive);
         auto signedNumber=[&](int value){if(value<0){r.text("-");r.number(-int64_t(value));}else r.number(value);};
         r.text(",\"error\":");signedNumber(store.error);r.text(",\"final_error\":");signedNumber(store.finalError);r.text("}");
-        r.text(",\"power_api\":");
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-        r.text("0,\"recovery_only\":true,\"recovery_panic_api\":1");
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+        if(GuardedDesktopBridgeEnabled()) DesktopCaps(r);
+        else
+#endif
+        r.text(",\"power_api\":0,\"recovery_only\":true,\"recovery_panic_api\":1,\"completed_frame_copy_api\":0,\"bulk_helper_api\":0,\"panic_transport\":false,\"raw_frame_transfer\":false");
 #else
-        r.text("1,\"power\":{");PowerCaps(r);r.text("}");
-#if !defined(BROOK_SSD_GUARD_CHECK)
-        r.text(",\"recovery_panic_api\":1");
+        DesktopCaps(r);
 #endif
-#endif
-#if defined(BROOK_SSD_AUTO_RECOVERY)
-        r.text(",\"completed_frame_copy_api\":0,\"bulk_helper_api\":0,\"panic_transport\":false,\"raw_frame_transfer\":false}\n");r.send();return true;
-#else
-        VnodeStat helper{},optin{};
-        auto* binary=VfsOpen("/boot/HWBULK.ELF",VFS_O_STREAM);
-        auto* marker=VfsOpen("/etc/hardware-bulk",VFS_O_STREAM);
-        const bool bulk=binary&&marker&&!VfsStat(binary,&helper)&&!helper.isDir&&helper.size>0&&
-            !VfsStat(marker,&optin)&&!optin.isDir&&optin.size>0;
-        if(binary)VfsClose(binary);
-        if(marker)VfsClose(marker);
-        r.text(",\"completed_frame_copy_api\":1,\"bulk_helper_api\":");r.number(bulk?1:0);
-        r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
-#endif
+        r.text("}\n");r.send();return true;
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY) || !defined(BROOK_SSD_GUARD_CHECK)
     constexpr char priorPrefix[]="bridge hardware recovery-panic ";

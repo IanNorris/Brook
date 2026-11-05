@@ -9,6 +9,9 @@
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "recovery_debug_policy.h"
 #endif
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "guard_checker_runner.h"
+#endif
 // net.cpp — Brook OS network stack.
 //
 // Ethernet → ARP / IPv4 → ICMP / UDP
@@ -4873,6 +4876,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         return;
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+    if (!GuardedDesktopBridgeEnabled()) {
+#endif
     switch(RecoveryDebugClassify(cmd)) {
         case RecoveryDebugCommand::Guard:
         case RecoveryDebugCommand::Hardware:
@@ -4886,6 +4892,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         case RecoveryDebugCommand::Deny:break;
     }
     DebugChannelSend("{\"recovery_error\":\"Command unavailable in guarded recovery\"}\n");return;
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+    }
+#endif
 #endif
     if (DebugHardwareHandleCommand(cmd,len)) return;
     if (DebugEpochHandleCommand(cmd)) return;

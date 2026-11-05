@@ -54,6 +54,8 @@ def main():
     parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
+    parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
+    parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -65,6 +67,10 @@ def main():
         parser.error('desktop reset requires desktop panic injection')
     if a.auto_desktop_shutdown_panic and not a.auto_desktop_reset:
         parser.error('shutdown panic requires the armed desktop reset fixture')
+    if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
+        parser.error('desktop bridge test requires a non-panic auto desktop fixture')
+    if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
+        parser.error('startup-script failure requires the desktop bridge fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -85,14 +91,15 @@ def main():
         subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
                         str(ROOT/'scripts/workloads/guard_handoff_service.c'),'-o',str(service)],check=True)
         script.write_text('set wm\nset vfb none\nsched eevdf\nkconsole\nrun --service --once --console --uid 1000 /boot/GDSVC.ELF\n' +
-                          ('shutdown\n' if a.auto_desktop_shutdown_panic else ''))
+                          ('shutdown\n' if a.auto_desktop_shutdown_panic else '') +
+                          ('run --console /boot/DOES_NOT_EXIST.ELF\n' if a.auto_desktop_script_fail else ''))
         defaults.write_text('default-value\n')
         for src,target in ((service,'::/BOOT/GDSVC.ELF'),(script,'::/BOOT/INIT.RC'),(defaults,'::/ETC/desktop-defaults.ini')):
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
-        if a.normal_kernel:
+        if a.normal_kernel or a.auto_desktop_network_module:
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
-            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module),'::/DRIVERS/virtio_net.mod'],check=True)
+            subprocess.run(['mcopy','-o','-i',str(normal),str(a.normal_network_module or a.auto_desktop_network_module),'::/DRIVERS/virtio_net.mod'],check=True)
         selection=work/'select.bin';selection.write_bytes(record(1,0,(a.recovery_pair/'KERNEL.ELF').read_bytes(),recovery.read_bytes()))
         for src,target in ((a.efi,'::/EFI/BOOT/BOOTX64.EFI'),(a.normal_kernel or a.desktop_pair/'KERNEL.ELF','::/KERNEL/BROOK.ELF'),
                            (normal,'::/INITRD.IMG'),(a.recovery_pair/'KERNEL.ELF','::/RECOVERY/KERNEL.ELF'),
@@ -218,6 +225,43 @@ def main():
                  extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-desktop-panic-reset,string=test-1'] if a.auto_desktop_reset else None)
             if a.auto_desktop_reset and not a.auto_desktop_shutdown_panic and (not capture_seen or time.monotonic()-capture_seen[0]<4):
                 raise RuntimeError('desktop panic reset occurred before the expected delay')
+        elif a.auto_desktop_network_module:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
+            bridge_state={}
+            def bridge_before():
+                sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                from hardware import Hardware
+                bridge=Hardware(work/'desktop-registry');deadline=time.monotonic()+6
+                while True:
+                    try:attached=bridge.attach('127.0.0.1',network_port);break
+                    except (OSError,RuntimeError):
+                        if time.monotonic()>=deadline:raise
+                        time.sleep(.1)
+                session=attached['session'];caps=attached['guest']
+                if caps.get('recovery_only') is not True or caps.get('power_api')!=0 or bridge.command(session,'bridge job caps').get('job_api')!=0:
+                    raise RuntimeError('bridge opened before the desktop handoff completed')
+                bridge_state.update(bridge=bridge,session=session,before=caps)
+            def bridge_after():
+                bridge=bridge_state['bridge'];session=bridge_state['session']
+                doctor=bridge.doctor(session)
+                if a.auto_desktop_script_fail:
+                    if (not doctor.get('identity_matches') or doctor['capabilities'].get('command_jobs') or
+                        doctor['capabilities'].get('hardware_power') or bridge.command(session,'bridge job caps').get('job_api')!=0):
+                        raise RuntimeError('failed startup exposed normal bridge capabilities')
+                    (a.output/'bridge-transition.json').write_text(json.dumps({'before':bridge_state['before'],'after':doctor},indent=2)+'\n')
+                    return
+                if not doctor.get('identity_matches') or not doctor['capabilities'].get('command_jobs') or not doctor['capabilities'].get('hardware_power'):
+                    raise RuntimeError('normal bridge capabilities did not appear after handoff')
+                job=bridge.guest_run(session,uuid.uuid4().hex,['/boot/GDSVC.ELF'],cwd='/',uid=1000,wait_s=10)
+                if job.get('state')!='completed' or job.get('exit',{}).get('code')!=0 or 'GUARD_DESKTOP_SERVICE_PASS' not in job.get('stdout',{}).get('text',''):
+                    raise RuntimeError('desktop bridge guest job did not complete: '+str(job))
+                (a.output/'bridge-transition.json').write_text(json.dumps({'before':bridge_state['before'],'after':doctor,'job':job},indent=2)+'\n')
+            boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status='+('-1' if a.auto_desktop_script_fail else '0'),120,True,sata_snapshot=False,
+                 hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                 network_port=network_port,intermediate_marker='GUARD_DESKTOP_BRIDGE_TEST_WINDOW',
+                 on_intermediate=bridge_before,on_marker=bridge_after,
+                 extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-bridge-window,string=test-1'])
         elif a.auto_desktop:
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
