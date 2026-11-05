@@ -70,6 +70,7 @@ def main():
     parser.add_argument('--auto-desktop-real-provider',type=Path,help='Use this extracted Dell Wayland provider with its pinned local runtime')
     parser.add_argument('--auto-desktop-wayland-client',action='store_true',help='Run a Wayland protocol client against the real provider')
     parser.add_argument('--auto-desktop-dell-shutdown-module',type=Path,help='Use this matching virtio-net module for checked Dell-script shutdown')
+    parser.add_argument('--auto-desktop-dell-async-network',action='store_true',help='Retain Dell asynchronous TCP settings with the emulated NIC')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -111,6 +112,8 @@ def main():
         parser.error('Wayland client requires the real provider fixture')
     if a.auto_desktop_dell_shutdown_module and (not a.auto_desktop_wayland_client or a.auto_desktop_shutdown):
         parser.error('Dell shutdown requires the real provider and client fixture')
+    if a.auto_desktop_dell_async_network and not a.auto_desktop_dell_shutdown_module:
+        parser.error('Dell asynchronous network requires the shutdown fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -138,7 +141,7 @@ def main():
             if startup!=subprocess.check_output(['mtype','-i',str(a.desktop_pair/'INITRD.IMG'),'::/BOOT/INIT.RC']):
                 raise RuntimeError('Dell startup script changed during compaction')
             (a.output/'dell-startup-script.sha256').write_text(hashlib.sha256(startup).hexdigest()+'\n')
-            if a.auto_desktop_dell_shutdown_module:
+            if a.auto_desktop_dell_shutdown_module and not a.auto_desktop_dell_async_network:
                 # Dell's opt-in asynchronous TCP stack is tailored to its USB
                 # NIC; the synthetic virtio NIC uses the ordinary TCP path.
                 for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
@@ -550,6 +553,9 @@ def main():
         if a.auto_desktop_dell_initrd:
             if a.auto_desktop_dell_shutdown_module and serial.count('DEBUG_TCP: spawned pid=')!=1:
                 raise RuntimeError('guarded handoff spawned duplicate debug listeners')
+            if a.auto_desktop_dell_async_network and not all(marker in serial for marker in
+                    ('net: TCP try-transmit experiment enabled','net: bounded asynchronous TCP sender enabled')):
+                raise RuntimeError('Dell asynchronous TCP configuration was not active')
             for executable in ('/nix/profile/bin/waylandd','/nix/profile/bin/hardware-dbus',
                                '/nix/profile/bin/hardware-message','/boot/HWSTATUS.ELF'):
                 if 'ELF HASH: '+executable+' ' not in serial:

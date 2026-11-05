@@ -121,6 +121,30 @@ int main() {
     CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
     CHECK(!g_txPending && !g_txFaulted && notifications==2 && used==2 && avail==2 && badFrames==0);
 
+    // Nonblocking TX must never wait on the producer lock or a device-owned
+    // buffer; once it publishes a frame it returns success immediately.
+    initialize();mode=NoCompletion;expectedId=1;memset(pendingPayload,1,sizeof(pendingPayload));
+    SpinLockAcquire(&g_txLock);
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+    SpinLockRelease(&g_txLock);
+    CHECK(notifications==0 && avail==0);
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
+    CHECK(g_txPending && notifications==1 && avail==1);
+    memcpy(pendingSnapshot,dma,sizeof(dma));memset(pendingPayload,2,sizeof(pendingPayload));
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+    CHECK(notifications==1 && !memcmp(pendingSnapshot,dma,sizeof(dma)));
+    completions[0].id=0;used=1;mode=Normal;expectedId=2;
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
+    CHECK(g_txPending && notifications==2 && used==2 && avail==2 && badFrames==0);
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
+    CHECK(notifications==3 && used==3 && avail==3 && badFrames==0);
+
+    initialize();mode=NoCompletion;expectedId=1;memset(pendingPayload,1,sizeof(pendingPayload));
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
+    completions[0].id=1;used=1;
+    CHECK(VirtioNetTryTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-1);
+    CHECK(g_txFaulted && notifications==1);
+
     // The same late-completion path must reject corrupt device responses.
     for(Mode failure:{BadId,BadAdvance}) {
         initialize();mode=NoCompletion;expectedId=1;

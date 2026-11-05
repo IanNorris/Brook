@@ -325,7 +325,7 @@ static void VirtioNetPoll(NetIf* /*nif*/)
 // Transmit
 // ---------------------------------------------------------------------------
 
-static int ReapTxCompletion()
+static int ReapTxCompletion(bool quiet=false)
 {
     if (*g_txq.usedIdx == g_txq.usedIdxShadow) return -11; // EAGAIN
     __asm__ volatile("mfence" ::: "memory");
@@ -334,7 +334,7 @@ static int ReapTxCompletion()
     if (completed != static_cast<uint16_t>(g_txq.usedIdxShadow + 1) ||
         g_txq.usedRing[usedSlot].id != 0) {
         g_txFaulted = true;
-        SerialPuts("virtio_net: invalid TX completion; queue quarantined\n");
+        if(!quiet)SerialPuts("virtio_net: invalid TX completion; queue quarantined\n");
         return -1;
     }
     g_txq.usedIdxShadow = completed;
@@ -342,22 +342,23 @@ static int ReapTxCompletion()
     return 0;
 }
 
-static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
+static int VirtioNetTransmitImpl(NetIf* nif, const void* frame, uint32_t len, bool tryOnly)
 {
     if (len > RX_BUF_SIZE - VIRTIO_NET_HDR_SIZE || (!frame && len)) return -1;
-    SpinLockAcquire(&g_txLock);
+    if(tryOnly) {if(!SpinLockTryAcquire(&g_txLock))return -11;}
+    else SpinLockAcquire(&g_txLock);
     struct ReleaseTx { ~ReleaseTx() { SpinLockRelease(&g_txLock); } } release;
     if (g_txFaulted) return -1;
     // A slow device/host may complete after our bounded polling window. Do
     // not disable networking permanently, or overwrite memory it still owns.
     if (g_txPending) {
-        int result = ReapTxCompletion();
+        int result = ReapTxCompletion(tryOnly);
         if (result) return result;
     }
 
     static uint32_t s_txCount = 0;
     s_txCount++;
-    if (s_txCount <= 3 || (s_txCount % 1000) == 0)
+    if (!tryOnly && (s_txCount <= 3 || (s_txCount % 1000) == 0))
         SerialPrintf("virtio_net: TX %u bytes [pkt#%u]\n", len, s_txCount);
 
     // Prepare virtio-net header + frame in TX buffer
@@ -395,6 +396,10 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
     g_txPending = true;
     NotifyQueue(1, g_txq);
 
+    // The DMA buffer is driver-owned and remains pinned until reaped. A
+    // nonblocking caller must not wait for device completion after publish.
+    if(tryOnly)return 0;
+
     // Wait for TX completion (poll used ring)
 #ifdef BROOK_HOST_TEST
     constexpr uint32_t waitBudget = 1024; // Exercise timeout ownership, not hardware latency.
@@ -413,6 +418,13 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
         }
     }
     return ReapTxCompletion();
+}
+
+static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len) {
+    return VirtioNetTransmitImpl(nif,frame,len,false);
+}
+static int VirtioNetTryTransmit(NetIf* nif, const void* frame, uint32_t len) {
+    return VirtioNetTransmitImpl(nif,frame,len,true);
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +789,7 @@ static int VirtioNetModuleInit()
     g_netIf.gateway  = 0;
     g_netIf.dns      = 0;
     g_netIf.transmit = VirtioNetTransmit;
+    g_netIf.tryTransmit = VirtioNetTryTransmit;
     g_netIf.poll     = VirtioNetPoll;
     g_netIf.driverPriv = nullptr;
 
