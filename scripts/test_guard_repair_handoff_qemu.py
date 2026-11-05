@@ -58,6 +58,7 @@ def main():
     parser.add_argument('--auto-desktop-headless-panic',action='store_true',help='Force the panic framebuffer lookup to fail and check diagnostic sections')
     parser.add_argument('--auto-desktop-serial-stall',action='store_true',help='Stall at serial packet output after the disk capture')
     parser.add_argument('--auto-desktop-nested-panic',action='store_true',help='Re-enter KernelPanic on the panic owner after disk capture')
+    parser.add_argument('--auto-desktop-peer-panic',action='store_true',help='Model an existing owner and verify another CPU parks')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -81,6 +82,8 @@ def main():
         parser.error('serial stall requires desktop reset and excludes other panic fixtures')
     if a.auto_desktop_nested_panic and (not a.auto_desktop_panic or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall):
         parser.error('nested panic requires desktop panic and excludes other fixtures')
+    if a.auto_desktop_peer_panic and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic):
+        parser.error('peer panic requires desktop reset and excludes other fixtures')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
@@ -219,6 +222,40 @@ def main():
                 (a.output/'decoded-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_SERVICE_PASS',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=retrieve)
+        elif a.auto_desktop_peer_panic:
+            kernel=a.desktop_pair/'KERNEL.ELF'
+            symbols=subprocess.check_output(['nm',str(kernel)],text=True)
+            def peer_symbol(name):
+                matches=[int(line.split()[0],16) for line in symbols.splitlines() if line.split()[-1:]==[name]]
+                if len(matches)!=1:raise RuntimeError('missing peer panic symbol '+name)
+                return matches[0]
+            launch=peer_symbol('_ZN5brook15ShellExecScriptEPKc')
+            panic=peer_symbol('KernelPanic');owner=peer_symbol('_ZL12g_panicOwner')
+            disassembly=subprocess.check_output(['objdump','-d','--disassemble=KernelPanic',str(kernel)],text=True)
+            halts=re.findall(r'^\s*([0-9a-f]+):\s+f4\s+hlt\s*$',disassembly,re.MULTILINE)
+            if len(halts)!=1:raise RuntimeError('unexpected peer halt instruction')
+            gdb=second/'peer.gdb'
+            gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
+                           f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'
+                           'set $cpu=$_thread-1\nif $cpu < 0 || $cpu >= 2\necho Invalid vCPU mapping\\n\nquit 1\nend\n'
+                           f'set *(unsigned int*){owner:#x}=2-$cpu\nset $rip={panic:#x}\n'
+                           f'delete breakpoints\nhbreak *{int(halts[0],16):#x}\ncontinue\n'
+                           'printf "PANIC_PEER_PARKED cpu=%d owner=%d\\n", $cpu, 2-$cpu\n'
+                           'delete breakpoints\ndetach\nquit\n')
+            boot(disk,a.firmware,second,False,'GUARD_DESKTOP_PANIC_RESET armed=1',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,hold_after_marker=7,
+                 forbidden='PANIC_RECOVERY_RESET_WAIT',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
+                 extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-desktop-panic-reset,string=test-1'])
+            serial=(second/'serial.log').read_text(errors='replace')
+            debugger_log=(second/'qemu.log').read_text(errors='replace')
+            if not re.search(r'PANIC_PEER_PARKED cpu=[01] owner=[12]',debugger_log) or '*** DOUBLE PANIC' in serial:
+                raise RuntimeError('peer panic did not park without entering owner reset')
+            if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
+                raise RuntimeError('peer panic changed the journal')
+            shutil.copyfile(second/'serial.log',a.output/'desktop-peer-serial.log')
+            (a.output/'desktop-peer-gdb.log').write_text(debugger_log)
+            print('GUARD_DESKTOP_PEER_PANIC_PARK_PASS')
+            return
         elif a.auto_desktop_panic:
             symbols=subprocess.check_output(['nm',str(a.desktop_pair/'KERNEL.ELF')],text=True)
             def desktop_symbol(name):
