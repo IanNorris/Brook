@@ -71,6 +71,9 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "vmware_clock.h"
 #include "vdso.h"
 #include "watchdog.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "debug_overlay.h"
+#endif
 #include "string.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -1030,7 +1033,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::LifecycleChannelStart();
 
         // Start the NIC polling thread now that the scheduler is initialised.
-#if !defined(BROOK_SSD_GUARD_CHECK)
+#if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_AUTO_RECOVERY)
         if (brook::NetGetIf())
             brook::NetStartPollThread();
 #endif
@@ -1101,6 +1104,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // so the profiler thread must already exist.
 #if defined(BROOK_SSD_GUARD_CHECK)
         if(!brook::GuardCheckerStart(guardEsp))KernelPanic("guard checker controller could not start");
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        if(brook::NetGetIf())brook::DebugTcpSpawn();
+#endif
 #else
         brook::ShellExecScript("/boot/INIT.RC");
 #endif

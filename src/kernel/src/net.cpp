@@ -6,6 +6,9 @@
 #include "sched_decision_trace.h"
 #include "bridge_reply.h"
 #include "debug_hardware.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "recovery_debug_policy.h"
+#endif
 // net.cpp — Brook OS network stack.
 //
 // Ethernet → ARP / IPv4 → ICMP / UDP
@@ -4869,6 +4872,21 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         marker[p++]='\n';marker[p]=0;DebugChannelSend(marker);
         return;
     }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    switch(RecoveryDebugClassify(cmd)) {
+        case RecoveryDebugCommand::Guard:
+        case RecoveryDebugCommand::Hardware:
+            if(DebugHardwareHandleCommand(cmd,len))return;
+            break;
+        case RecoveryDebugCommand::Epoch:
+            if(DebugEpochHandleCommand(cmd))return;
+            break;
+        case RecoveryDebugCommand::JobCaps:DebugChannelSend("{\"job_api\":0}\n");return;
+        case RecoveryDebugCommand::UiCaps:DebugChannelSend("{\"ui_api\":0}\n");return;
+        case RecoveryDebugCommand::Deny:break;
+    }
+    DebugChannelSend("{\"recovery_error\":\"Command unavailable in guarded recovery\"}\n");return;
+#endif
     if (DebugHardwareHandleCommand(cmd,len)) return;
     if (DebugEpochHandleCommand(cmd)) return;
     if (DebugJobHandleCommand(cmd)) return;

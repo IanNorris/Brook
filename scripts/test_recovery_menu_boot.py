@@ -17,7 +17,8 @@ from pathlib import Path
 
 
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
-         hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False):
+         hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
+         network_port=None,on_marker=None):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -44,6 +45,9 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         '-display', 'none', '-serial', f'file:{serial}',
         '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot',
     ]
+    if network_port is not None:
+        command += ['-netdev',f'user,id=recovery-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234',
+                    '-device','virtio-net-pci,netdev=recovery-net']
     for item in extra_fw_cfg or ():
         command += ['-fw_cfg',item]
     with (work / 'qemu.log').open('wb') as errors:
@@ -70,6 +74,7 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                 if forbidden and forbidden.encode() in data:
                     raise RuntimeError(f'unexpected boot marker {forbidden!r}')
                 if marker.encode() in data:
+                    if on_marker:on_marker()
                     if expect_reset:
                         try: status=process.wait(timeout=15)
                         except subprocess.TimeoutExpired: raise RuntimeError('QEMU did not reset after panic marker')

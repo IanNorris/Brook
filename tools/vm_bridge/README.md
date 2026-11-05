@@ -777,6 +777,14 @@ both operation IDs; inspect them rather than redispatching an uncertain export
 or transfer. This operation requires a previously provisioned panic journal and
 does not make panic-time networking or the physical writer available.
 
+`hw_recovery_panic` reads a validated packet retained in memory by the
+automatic recovery candidate, using a boot-pinned session and a new local file.
+It verifies every chunk's metadata and the completed packet CRC before creating
+the file. This path needs the candidate's restricted recovery debug listener;
+it does not require the bulk helper or write to the guest. The recovery image
+must include an appropriate network module, and availability on a particular
+physical machine must be verified separately.
+
 `hw_doctor` explicitly reports unavailable QMP, raw input, framebuffer transfer,
 registers, raw memory and post-panic transport. A lost TCP connection is not proof
 of panic. Current hardware panics halt CPUs; retain the optical panic scanner.

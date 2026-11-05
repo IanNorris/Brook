@@ -45,9 +45,13 @@ def selector(data,kind):
     return disk,part,first,count,extra
 
 
-def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile,out,automatic=False,e2fsck=None):
+def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile,out,automatic=False,e2fsck=None,recovery_network=False,module_abi=None,network_hash=None):
     if profile not in ('physical','qemu-fixture'):raise ValueError('unsupported inventory profile')
     if bool(e2fsck)!=automatic:raise ValueError('automatic recovery requires the pinned ext2 checker')
+    if recovery_network and (not automatic or type(module_abi) is not int or module_abi<1 or
+                             not isinstance(network_hash,str) or not re.fullmatch('[0-9a-f]{64}',network_hash)):
+        raise ValueError('recovery networking requires automatic recovery and explicit module ABI and SHA-256')
+    if not recovery_network and (module_abi is not None or network_hash is not None):raise ValueError('module options require recovery networking')
     sources={name:read_regular(path,1024*1024) for name,path in
              (('controller',controller),('disk',disk),('esp',esp),('data',data))}
     ctl=json.loads(sources['controller']);drive=json.loads(sources['disk'])
@@ -113,6 +117,13 @@ def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile
         if ext2_info['sha256']!=E2FSCK_SHA:raise ValueError('ext2 checker does not match kernel pin')
         ext2_data=read_regular(e2fsck,4*1024*1024)
         if sha(ext2_data)!=ext2_info['sha256']:raise ValueError('ext2 checker changed during read')
+    network_data=None;network_name=None
+    if recovery_network:
+        from prepare_hardware_kernel_pair import module_version
+        network_name='xhci.mod' if profile=='physical' else 'virtio_net.mod'
+        network_data=read_regular(build/'drivers'/network_name,4*1024*1024)
+        if sha(network_data)!=network_hash:raise ValueError('recovery network module hash mismatch')
+        if module_version(network_data)!=module_abi:raise ValueError('recovery network module ABI mismatch')
     out.mkdir(mode=0o700,parents=True,exist_ok=False)
     try:
         image=out/'INITRD.IMG';(out/'KERNEL.ELF').write_bytes(kernel)
@@ -120,10 +131,12 @@ def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile
         subprocess.run(['mformat','-i',str(image),'::'],check=True)
         for name in ('BOOT','ETC','DEV','DEV/DRI','TMP','SYS','SYS/DEV','SYS/DEV/CHAR','USR','PROC'):
             subprocess.run(['mmd','-i',str(image),'::'+name],check=True)
+        if recovery_network:subprocess.run(['mmd','-i',str(image),'::DRIVERS'],check=True)
         payload={'ETC/ahci-observe':b'1\n','ETC/ahci-read-only':b'1\n','ETC/ahci-write-target':target,
                  'ETC/ahci-boot-volume':sources['esp'],'ETC/ahci-data-volume':sources['data'],
                  'BOOT/FATFSCK.ELF':checker_data}
         if automatic:payload['BOOT/E2FSCK.ELF']=ext2_data
+        if recovery_network:payload['DRIVERS/'+network_name]=network_data
         for name,content in payload.items():
             subprocess.run(['mcopy','-i',str(image),'-','::'+name],input=content,check=True)
             if subprocess.check_output(['mtype','-i',str(image),'::'+name])!=content:raise RuntimeError('initrd readback failed: '+name)
@@ -136,6 +149,7 @@ def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile
                  'files':{name:{'bytes':len(value),'sha256':sha(value)} for name,value in
                           (('KERNEL.ELF',kernel),('INITRD.IMG',initrd),('SELECT.BIN',selection))}}
         if automatic:receipt['ext2_checker_sha256']=ext2_info['sha256']
+        if recovery_network:receipt['recovery_network_module']={'name':network_name,'abi':module_abi,'sha256':sha(network_data)}
         (out/'manifest.json').write_text(json.dumps(receipt,indent=2)+'\n')
         return receipt
     except BaseException:
@@ -149,8 +163,11 @@ def main():
     p.add_argument('--kernel-sha256',required=True);p.add_argument('--profile',choices=('physical','qemu-fixture'),required=True)
     p.add_argument('--automatic',action='store_true',help='Prepare the isolated automatic recovery configuration')
     p.add_argument('--e2fsck',type=Path,help='Pinned static ext2 checker; required for automatic recovery')
+    p.add_argument('--recovery-network',action='store_true',help='Include this build\'s network driver for read-only recovery debug')
+    p.add_argument('--module-abi',type=int,help='Required expected network module ABI')
+    p.add_argument('--network-module-sha256',help='Required expected SHA-256 of the selected build network module')
     a=p.parse_args();print(json.dumps(prepare(a.kernel_build,a.kernel_sha256,a.checker,a.elf_validator,a.controller,a.disk,
-                                               a.esp_selector,a.data_selector,a.profile,a.output,a.automatic,a.e2fsck),indent=2))
+                                               a.esp_selector,a.data_selector,a.profile,a.output,a.automatic,a.e2fsck,a.recovery_network,a.module_abi,a.network_module_sha256),indent=2))
 
 
 if __name__=='__main__':main()

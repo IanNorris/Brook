@@ -88,6 +88,25 @@ class GuardPairTest(unittest.TestCase):
         self.assertIn('automatic',result['scope'])
         self.assertEqual(subprocess.check_output(['mtype','-i',str(self.output/'INITRD.IMG'),'::BOOT/E2FSCK.ELF']),self.checker.read_bytes())
         self.output.rename(self.root/'completed')
+        (self.build/'drivers').mkdir();(self.build/'drivers/virtio_net.mod').write_bytes(b'test-module')
+        module_hash=hashlib.sha256(b'test-module').hexdigest()
+        with mock.patch.object(target,'CHECKER_SHA',digest),mock.patch.object(target,'E2FSCK_SHA',digest), \
+             mock.patch('prepare_hardware_kernel_pair.module_version',return_value=65):
+            network=target.prepare(self.build,hashlib.sha256(self.kernel).hexdigest(),self.checker,Path('/bin/true'),
+                self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output,True,self.checker,True,65,module_hash)
+        self.assertEqual(network['recovery_network_module']['name'],'virtio_net.mod')
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(self.output/'INITRD.IMG'),'::DRIVERS/virtio_net.mod']),b'test-module')
+        self.output.rename(self.root/'completed-network')
+        with mock.patch.object(target,'CHECKER_SHA',digest),mock.patch.object(target,'E2FSCK_SHA',digest):
+            with self.assertRaisesRegex(ValueError,'hash mismatch'):
+                target.prepare(self.build,hashlib.sha256(self.kernel).hexdigest(),self.checker,Path('/bin/true'),
+                    self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output,True,self.checker,True,65,'0'*64)
+        with mock.patch.object(target,'CHECKER_SHA',digest),mock.patch.object(target,'E2FSCK_SHA',digest), \
+             mock.patch('prepare_hardware_kernel_pair.module_version',return_value=64):
+            with self.assertRaisesRegex(ValueError,'ABI mismatch'):
+                target.prepare(self.build,hashlib.sha256(self.kernel).hexdigest(),self.checker,Path('/bin/true'),
+                    self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output,True,self.checker,True,65,module_hash)
+        self.assertFalse(self.output.exists())
         self.commands[0]['command']+=' -DBROOK_SSD_GUARD_PENDING_TEST=1'
         (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
         with self.assertRaisesRegex(ValueError,'unsafe compile flags'):

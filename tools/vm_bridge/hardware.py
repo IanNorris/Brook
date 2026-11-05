@@ -9,6 +9,8 @@ import stat
 import sys
 import time
 import uuid
+import hashlib
+import zlib
 
 from common import ROOT,write_json
 from guest_transport import exchange
@@ -146,6 +148,10 @@ class Hardware:
                     if hardware.get('bulk_helper_api')==1 else None),
                 hardware_power=hardware.get('power_api')==1,power=hardware.get('power',{}),
                 command_jobs=jobs.get('job_api')==2,semantic_windows=ui.get('ui_api')==1,semantic_launch=ui.get('launch_api')==1,app_catalog=ui.get('apps_api')==1)
+            if hardware.get('recovery_only') is True:
+                caps.update(ram_application_snapshot=False,diagnostics=False,stats=False,writable_desktop=False,
+                            hardware_power=False,completed_frame_copy=False,frame_capture=False,binary_transfer=False,
+                            binary_transfer_limits=None,recovery_panic=hardware.get('recovery_panic_api')==1)
             result.update(reachable=True,identity_matches=True,guest=hardware,jobs=jobs,ui=ui,probe_stage='verified')
         except HardwareBootChanged as error:
             result.update(reachable=True,identity_matches=False,error=str(error),note='Attach explicitly again to target the new guest boot.')
@@ -178,6 +184,39 @@ class Hardware:
                 'sequence':result['sequence'],'bytes':result['packet_bytes'],
                 'crc32':result['packet_crc32'],'sha256':result['artifact_sha256'],
                 'artifact_path':result['artifact_path'],'receipt_path':str(Path(output).absolute()/'receipt.json')}
+
+    def recovery_panic(self,session,output,**_):
+        """Read the immutable boot-pinned recovery snapshot; never touch guest storage."""
+        path=Path(output).absolute()
+        with self.session_lock(session) as data:
+            header=self.guest(data,'bridge hardware recovery-panic 0 0')
+            if header.get('recovery_panic_api')!=1:
+                raise RuntimeError(header.get('recovery_panic_error','Recovery panic snapshot unavailable'))
+            sequence,size,crc=(header.get(k) for k in ('sequence','bytes','crc32'))
+            if any(type(x) is not int for x in (sequence,size,crc)) or not 1<=sequence<2**64 or not 1<=size<=65536 or not 0<=crc<=0xffffffff:
+                raise RuntimeError('Invalid recovery panic metadata')
+            if header.get('offset')!=0 or header.get('hex')!='':raise RuntimeError('Invalid recovery panic header')
+            packet=bytearray()
+            for start in range(0,size,4096):
+                requests=[(offset,min(512,size-offset)) for offset in range(start,min(start+4096,size),512)]
+                replies=self.guest_batch(data,[f'bridge hardware recovery-panic {offset} {length}' for offset,length in requests])
+                if len(replies)!=len(requests):raise RuntimeError('Incomplete recovery panic response')
+                for response,(offset,length) in zip(replies,requests):
+                    if (response.get('recovery_panic_api')!=1 or response.get('sequence')!=sequence or
+                        response.get('bytes')!=size or response.get('crc32')!=crc or response.get('offset')!=offset):
+                        raise RuntimeError('Recovery panic metadata changed during transfer')
+                    encoded=response.get('hex')
+                    if not isinstance(encoded,str) or len(encoded)!=2*length or any(c not in '0123456789abcdef' for c in encoded):
+                        raise RuntimeError('Invalid recovery panic chunk')
+                    packet.extend(bytes.fromhex(encoded))
+            if len(packet)!=size or zlib.crc32(packet)!=crc:raise RuntimeError('Recovery panic checksum mismatch')
+            fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            try:
+                with os.fdopen(fd,'wb') as stream:stream.write(packet)
+            except BaseException:
+                path.unlink(missing_ok=True);raise
+            return {'session':session,'guest_boot_id':data['guest_boot_id'],'sequence':sequence,'bytes':size,
+                    'crc32':f'{crc:08x}','sha256':hashlib.sha256(packet).hexdigest(),'artifact_path':str(path)}
 
     def power(self,session,request_id,operation,**_):
         validate_id(request_id)

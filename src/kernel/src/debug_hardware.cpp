@@ -52,6 +52,7 @@ bool ReadId(const char*& p,char out[33]){
     for(unsigned i=0;i<32;++i){char c=p[i];if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return false;out[i]=c;}
     out[32]=0;p+=32;return true;
 }
+#if !defined(BROOK_SSD_AUTO_RECOVERY)
 void PowerCaps(Reply& r){
     const auto power=ShutdownGetPowerCapabilities();
     r.text("\"graceful_quiescence\":");r.text(power.gracefulQuiescence?"true":"false");
@@ -59,6 +60,7 @@ void PowerCaps(Reply& r){
     r.text(",\"reset_method\":");r.quoted(power.resetMethod);r.text(",\"power_off_method\":");r.quoted(power.powerOffMethod);
     r.text(",\"reset_reason\":");r.quoted(power.resetReason);r.text(",\"power_off_reason\":");r.quoted(power.powerOffReason);
 }
+#endif
 const char* I2cProbeResult(DellI2cIdResult result) {
     switch(result){case DellI2cIdResult::Disabled:return "disabled";case DellI2cIdResult::AlreadyUsed:return "already_used";
     case DellI2cIdResult::Refused:return "refused";case DellI2cIdResult::Unknown:return "unknown";
@@ -102,7 +104,15 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("bytes",store.bytes);r.text(",");r.field("drive",store.drive);
         auto signedNumber=[&](int value){if(value<0){r.text("-");r.number(-int64_t(value));}else r.number(value);};
         r.text(",\"error\":");signedNumber(store.error);r.text(",\"final_error\":");signedNumber(store.finalError);r.text("}");
-        r.text(",\"power_api\":1,\"power\":{");PowerCaps(r);r.text("}");
+        r.text(",\"power_api\":");
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        r.text("0,\"recovery_only\":true,\"recovery_panic_api\":1");
+#else
+        r.text("1,\"power\":{");PowerCaps(r);r.text("}");
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        r.text(",\"completed_frame_copy_api\":0,\"bulk_helper_api\":0,\"panic_transport\":false,\"raw_frame_transfer\":false}\n");r.send();return true;
+#else
         VnodeStat helper{},optin{};
         auto* binary=VfsOpen("/boot/HWBULK.ELF",VFS_O_STREAM);
         auto* marker=VfsOpen("/etc/hardware-bulk",VFS_O_STREAM);
@@ -112,6 +122,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(marker)VfsClose(marker);
         r.text(",\"completed_frame_copy_api\":1,\"bulk_helper_api\":");r.number(bulk?1:0);
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
+#endif
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     constexpr char priorPrefix[]="bridge hardware recovery-panic ";

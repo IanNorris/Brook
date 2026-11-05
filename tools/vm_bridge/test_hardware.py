@@ -6,6 +6,7 @@ import socket
 import tempfile
 import threading
 import unittest
+import zlib
 from unittest.mock import patch
 
 from hardware import Hardware,HardwareBootChanged
@@ -49,6 +50,13 @@ class Endpoint:
                             result={'job_api':2}
                         elif command=='bridge ui caps':result={'ui_api':1,'apps_api':1,'boot_id':self.epoch}
                         elif command=='bridge stats':result={'process_count':7}
+                        elif command.startswith('bridge hardware recovery-panic '):
+                            offset,count=map(int,command.split()[-2:]);payload=getattr(self,'panic_packet',b'')
+                            if not payload:result={'recovery_panic_error':'No validated panic record'}
+                            else:
+                                result={'recovery_panic_api':1,'sequence':3,'bytes':len(payload),'crc32':zlib.crc32(payload),
+                                        'offset':offset,'hex':payload[offset:offset+count].hex()}
+                                if getattr(self,'corrupt_panic',False) and count:result['hex']='00'*count
                         elif command.startswith('bridge hardware power '):
                             _,_,_,request,verb,boot=command.split()
                             if boot!=self.epoch:result={'boot_error':'Guest boot changed'}
@@ -73,6 +81,16 @@ class HardwareTests(unittest.TestCase):
     def setUp(self):self.tmp=tempfile.TemporaryDirectory();self.endpoint=Endpoint();self.hardware=Hardware(self.tmp.name)
     def tearDown(self):self.endpoint.close();self.tmp.cleanup()
     def attach(self):return self.hardware.attach('127.0.0.1',self.endpoint.port)['session']
+    def test_recovery_panic_verified_and_exclusive(self):
+        session=self.attach();self.endpoint.panic_packet=bytes(range(256))*5
+        path=Path(self.tmp.name)/'packet.bin';result=self.hardware.recovery_panic(session,path)
+        self.assertEqual(path.read_bytes(),self.endpoint.panic_packet);self.assertEqual(result['sequence'],3)
+        with self.assertRaises(FileExistsError):self.hardware.recovery_panic(session,path)
+        self.endpoint.corrupt_panic=True;bad=Path(self.tmp.name)/'bad.bin'
+        with self.assertRaisesRegex(RuntimeError,'checksum'):self.hardware.recovery_panic(session,bad)
+        self.assertFalse(bad.exists())
+        self.endpoint.epoch='e'*32
+        with self.assertRaises(HardwareBootChanged):self.hardware.recovery_panic(session,Path(self.tmp.name)/'stale.bin')
     def test_hardware_does_not_need_vm_or_qmp(self):
         with patch('common.process_identity',side_effect=AssertionError('No VM process')):
             session=self.attach();doctor=self.hardware.doctor(session)

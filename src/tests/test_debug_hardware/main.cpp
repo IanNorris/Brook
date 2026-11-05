@@ -212,12 +212,20 @@ int main(){
         assert(handle(std::string("bridge hardware acpi ")+bad) && reply.find("acpi_error")!=std::string::npos);
     }
     assert(handle("bridge hardware caps"));
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    assert(reply.find("\"power_api\":0")!=std::string::npos && reply.find("\"recovery_only\":true")!=std::string::npos);
+#else
     assert(reply.find("\"power_api\":1")!=std::string::npos && reply.find("\"power_off\":false")!=std::string::npos);
+#endif
     assert(reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
     brook::binaryPresent=true;
     assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
     brook::markerPresent=true;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
+#else
     assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":1")!=std::string::npos && !brook::openNodes);
+#endif
     brook::directory=true;
     assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
     brook::directory=false;brook::statError=true;

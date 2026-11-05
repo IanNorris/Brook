@@ -108,6 +108,8 @@ def main():
                    help='Inject before pending state and verify no automatic reset')
     p.add_argument('--guard-panic-pm-fallback', action='store_true',
                    help='Force PIT failure in the disposable debugger and test the ACPI timer')
+    p.add_argument('--guard-panic-network', action='store_true',
+                   help='Retrieve the previous panic via the restricted recovery debug listener')
     p.add_argument('--guard-auto-unsupported', action='store_true',
                    help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
@@ -141,6 +143,8 @@ def main():
         p.error('unarmed panic requires the pre-pending injection')
     if a.guard_panic_pm_fallback and not a.guard_panic_after_pending:
         p.error('PM fallback requires the post-pending panic fixture')
+    if a.guard_panic_network and not a.guard_panic_after_pending:
+        p.error('network retrieval requires the post-pending panic fixture')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
         p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
@@ -727,8 +731,31 @@ def main():
             subprocess.run(['fsck.fat','-n',str(esp)],check=True,stdout=subprocess.DEVNULL,timeout=30)
             reboot=work/'panic-reboot';reboot.mkdir()
             reboot_marker='GUARD_PENDING_INCOMPLETE records=0' if a.guard_panic_after_pending else 'GUARD_PANIC_JOURNAL pin=0 arm=0'
+            network_port=None;on_marker=None
+            if a.guard_panic_network:
+                with socket.socket() as port_probe:
+                    port_probe.bind(('127.0.0.1',0));network_port=port_probe.getsockname()[1]
+                def retrieve_snapshot():
+                    sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                    from hardware import Hardware
+                    bridge=Hardware(work/'recovery-registry');deadline=time.monotonic()+20
+                    while True:
+                        try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                        except (OSError,RuntimeError):
+                            if time.monotonic()>=deadline:raise
+                            time.sleep(.2)
+                    report=bridge.recovery_panic(session,str(work/'recovered-packet.bin'))
+                    if Path(report['artifact_path']).read_bytes()!=bytes.fromhex(packet):raise RuntimeError('remote snapshot differs from panic packet')
+                    if report['sequence']!=1 or report['crc32']!=f'{zlib.crc32(bytes.fromhex(packet)):08x}':raise RuntimeError('remote metadata differs')
+                    with bridge.session_lock(session) as data:
+                        denied=bridge.guest(data,'bridge hardware power 00000000000000000000000000000000 restart')
+                    if 'recovery_error' not in denied:raise RuntimeError('recovery listener admitted a mutating command')
+                    doctor=bridge.doctor(session)
+                    if not doctor.get('identity_matches') or not doctor['capabilities'].get('recovery_panic') or doctor['capabilities'].get('command_jobs'):
+                        raise RuntimeError('recovery bridge capabilities are inconsistent')
+                on_marker=retrieve_snapshot
             boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,reboot_marker,
-                              90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA')
+                              90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=on_marker)
             reboot_text=(reboot/'serial.log').read_text(errors='replace')
             raw_packet=bytes.fromhex(packet)
             prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(raw_packet)} crc={zlib.crc32(raw_packet):x}'
