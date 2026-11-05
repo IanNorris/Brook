@@ -9,10 +9,13 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import socket
+import struct
 import subprocess
 import tempfile
 import time
 import uuid
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRS = ('store', 'profile', 'profile/bin', 'profile/lib', 'profile/share',
@@ -35,13 +38,20 @@ def main():
                         help='Exercise first-time staging of the inventory loader')
     parser.add_argument('--panic-journal-provision-test', type=Path,
                         help='Exercise first-time preallocated panic journal creation')
+    parser.add_argument('--panic-snapshot-test',choices=('valid','corrupt','empty'),
+                        help='Exercise normal boot read-only panic journal snapshot')
+    parser.add_argument('--snapshot-network-module',type=Path,
+                        help='Matching virtio-net module; retrieve the snapshot over the debug bridge')
+    parser.add_argument('--serial-output',type=Path,help='Save the guest serial log to a new file')
     parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
-    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test))>1:
+    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test))>1:
         parser.error('Choose only one provisioning test')
     if args.efi_inventory_stage_test and not args.inventory_efi:
         parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
+    if args.snapshot_network_module and args.panic_snapshot_test!='valid':
+        parser.error('network snapshot retrieval requires the valid snapshot test')
     source, kernel, firmware = (p.resolve(strict=True) for p in (args.image, args.kernel, args.firmware))
     with tempfile.TemporaryDirectory(prefix='brook-ext2-idle-sata-') as temp:
         d = Path(temp)
@@ -81,6 +91,14 @@ def main():
         with sata.open('r+b') as output, part.open('rb') as input_file:
             output.seek(data_part['start'] * 512)
             shutil.copyfileobj(input_file, output, length=1024 * 1024)
+        if args.panic_snapshot_test:
+            payload=b'normal boot panic snapshot fixture';contents=bytearray(258*512)
+            if args.panic_snapshot_test!='empty':
+                contents[:8]=b'BRKPAN01';struct.pack_into('<IIQI',contents,8,1,len(payload),7,zlib.crc32(payload))
+                struct.pack_into('<I',contents,28,zlib.crc32(contents[:512]));contents[512:512+len(payload)]=payload
+                if args.panic_snapshot_test=='corrupt':contents[512]^=1
+            journal=d/'panic.bin';journal.write_bytes(contents)
+            subprocess.run(['mcopy','-o','-i',str(sata)+'@@1048576',str(journal),'::/PANIC.BIN'],check=True)
         esp = str(boot) + '@@1048576'
         initrd = d / 'initrd.img'
         subprocess.run(['mcopy', '-i', esp, '::/INITRD.IMG', str(initrd)], check=True)
@@ -100,7 +118,9 @@ def main():
             subprocess.run(['mcopy', '-o', '-i', str(initrd), str(item), '::/ETC/' + name], check=True)
         init = d / 'INIT.RC'
         identity = disk_guid + uuid.UUID(data_part['uuid']).bytes_le.hex() + fs_uuid.hex()
-        if args.panic_journal_provision_test:
+        if args.panic_snapshot_test:
+            init.write_text('set wm\nset vfb none\nsched eevdf\n')
+        elif args.panic_journal_provision_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/PANICPROV.ELF ' + identity + '\n')
         elif args.efi_inventory_stage_test:
             candidate=args.inventory_efi.resolve(strict=True)
@@ -111,7 +131,13 @@ def main():
         else:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/IDLEQA.ELF /data/home/IDLE.TXT\n')
         subprocess.run(['mcopy', '-o', '-i', str(initrd), str(init), '::/BOOT/INIT.RC'], check=True)
-        if args.panic_journal_provision_test:
+        if args.snapshot_network_module:
+            if subprocess.run(['mdir','-i',str(initrd),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+                subprocess.run(['mmd','-i',str(initrd),'::/DRIVERS'],check=True)
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(args.snapshot_network_module.resolve(strict=True)),'::/DRIVERS/virtio_net.mod'],check=True)
+        if args.panic_snapshot_test:
+            pass
+        elif args.panic_journal_provision_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.panic_journal_provision_test.resolve(strict=True)),'::/BOOT/PANICPROV.ELF'],check=True)
         elif args.efi_inventory_stage_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.efi_inventory_stage_test.resolve(strict=True)),'::/BOOT/EFISTAGE.ELF'],check=True)
@@ -137,18 +163,43 @@ def main():
                    '-drive', f'if=none,id=sata,format=raw,file={sata}',
                    '-device', 'ide-hd,drive=sata,bus=ide.0,serial=BROOK-IDLE-TEST',
                    '-display', 'none', '-serial', f'file:{serial}', '-no-reboot']
+        if args.snapshot_network_module:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
+            command += ['-netdev',f'user,id=snapshot-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234',
+                        '-device','virtio-net-pci,netdev=snapshot-net']
         with (d / 'qemu.log').open('wb') as errors:
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
             try:
                 deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
                     output = serial.read_text(errors='replace') if serial.exists() else ''
-                    success = ('PANIC_JOURNAL_PROVISION_OK' if args.panic_journal_provision_test else
+                    success = ('SHELL: script \'/boot/INIT.RC\' finished' if args.panic_snapshot_test else
+                               'PANIC_JOURNAL_PROVISION_OK' if args.panic_journal_provision_test else
                                'EFI_INVENTORY_STAGE_OK' if args.efi_inventory_stage_test else
                                'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK')
                     if success in output:
                         if 'ahci direct: ready' not in output:
                             raise RuntimeError('the intended direct data volume was not mounted')
+                        if args.panic_snapshot_test:
+                            marker=f'NORMAL_PANIC_PRIOR sequence=7 bytes={len(payload)} crc={zlib.crc32(payload):x}'
+                            if (marker in output)!=(args.panic_snapshot_test=='valid'):
+                                raise RuntimeError('unexpected panic snapshot result: '+output[-4500:])
+                            if args.snapshot_network_module:
+                                import sys
+                                sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                                from hardware import Hardware
+                                bridge=Hardware(d/'hardware-registry');attach_deadline=time.monotonic()+30
+                                while True:
+                                    try:session=bridge.attach('127.0.0.1',network_port)['session'];break
+                                    except (OSError,RuntimeError):
+                                        if time.monotonic()>=attach_deadline:raise
+                                        time.sleep(.2)
+                                report=bridge.recovery_panic(session,str(d/'retrieved.bin'))
+                                if Path(report['artifact_path']).read_bytes()!=payload or report['sequence']!=7:
+                                    raise RuntimeError('normal boot bridge returned the wrong panic snapshot')
+                        if args.serial_output:
+                            with args.serial_output.open('x') as saved:saved.write(serial.read_text(errors='replace'))
                         print('\n'.join(line for line in output.splitlines() if 'IDLE_' in line), flush=True)
                         break
                     if any(x in output for x in ('IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'EFI_INVENTORY_STAGE_FAILED', 'PANIC_JOURNAL_PROVISION_FAILED', 'PANIC_JOURNAL_IDENTITY_MISMATCH')):
@@ -162,6 +213,11 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+        if args.panic_snapshot_test:
+            actual=subprocess.check_output(['mtype','-i',str(sata)+'@@1048576','::/PANIC.BIN'])
+            if actual!=contents:raise RuntimeError('normal boot modified the panic journal')
+            print('normal boot panic snapshot '+args.panic_snapshot_test+': PASS')
+            return
         if args.panic_journal_provision_test:
             media=f'{sata}@@{esp_part["start"]*512}'
             actual=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
@@ -195,7 +251,6 @@ def main():
             print('EFI inventory staging and offline readback: PASS')
             return
         if args.guard_provision_test:
-            import struct, zlib
             media = f'{sata}@@{esp_part["start"]*512}'
             a = subprocess.check_output(['mtype','-i',media,'::/RECOVERY/GUARD0.BIN'])
             b = subprocess.check_output(['mtype','-i',media,'::/RECOVERY/GUARD1.BIN'])

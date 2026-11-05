@@ -40,6 +40,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "virtio_blk.h"
 #include "gpt.h"
 #include "ahci_system_volume.h"
+#include "panic_snapshot.h"
 #if defined(BROOK_SSD_GUARD_CHECK)
 #include "guard_checker_runner.h"
 #endif
@@ -950,6 +951,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
 #endif
     if(systemVolume==brook::AhciSystemBoot::Ready) {
+#if !defined(BROOK_SSD_GUARD_CHECK)
+        brook::PanicNormalSnapshotLoad();
+#endif
 #if defined(BROOK_AHCI_PANIC_TEST)
         brook::AhciPanicTestPrepareFat();
 #endif

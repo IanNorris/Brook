@@ -660,6 +660,9 @@ target_compile_options(test_debug_log_ring PRIVATE -UNDEBUG -DBROOK_HOST_TEST -D
 
 add_host_test(test_debug_hardware "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp")
 add_host_test(test_debug_hardware_recovery "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp")
+add_host_test(test_panic_snapshot)
+target_compile_options(test_panic_snapshot PRIVATE -UNDEBUG -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_compile_definitions(test_debug_hardware_recovery PRIVATE BROOK_SSD_AUTO_RECOVERY=1)
 add_host_test(test_recovery_debug_policy)
 add_host_test(test_display_power)

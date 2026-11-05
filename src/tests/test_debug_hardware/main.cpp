@@ -17,9 +17,7 @@
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
-#if defined(BROOK_SSD_AUTO_RECOVERY)
-#include "guard_checker_runner.h"
-#endif
+#include "panic_snapshot.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -33,14 +31,12 @@ bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& ou
 namespace brook {
 uint16_t PchWatchdogTestRead16(uint16_t port){++pchPortReads;return port;}
 const AcpiPmTimerInfo& AcpiGetPmTimerInfo(){static const AcpiPmTimerInfo value{true,0x1808,false};return value;}
-#if defined(BROOK_SSD_AUTO_RECOVERY)
 bool recoveryPanicAvailable=false;
 uint8_t recoveryPanicBytes[]={0x00,0xab,0xff};
 bool GuardRecoveryPanicSnapshot(GuardPanicSnapshot& out){
     out={};if(!recoveryPanicAvailable)return false;
     out={recoveryPanicBytes,42,3,0x11223344};return true;
 }
-#endif
 DellGpuVtdObservation gpuVtd{};
 const DellGpuVtdObservation& DellGpuVtdObserveRead(){return gpuVtd;}
 BdwGopObservation gpuGop{};
@@ -129,7 +125,6 @@ int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t str
 }
 bool handle(const std::string& command){reply.clear();dispatched.clear();return brook::DebugHardwareHandleCommand(command.c_str(),command.size());}
 int main(){
-#if defined(BROOK_SSD_AUTO_RECOVERY)
     assert(handle("bridge hardware recovery-panic 0 0") && reply.find("No validated panic record")!=std::string::npos);
     brook::recoveryPanicAvailable=true;
     assert(handle("bridge hardware recovery-panic 0 3") && reply.find("\"sequence\":42")!=std::string::npos &&
@@ -137,7 +132,6 @@ int main(){
     assert(handle("bridge hardware recovery-panic 1 2") && reply.find("\"hex\":\"abff\"")!=std::string::npos);
     assert(handle("bridge hardware recovery-panic 3 1") && reply.find("Invalid byte range")!=std::string::npos);
     assert(handle("bridge hardware recovery-panic 0 513") && reply.find("Expected offset")!=std::string::npos);
-#endif
     assert(!handle("bridge unrelated"));
     assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"planned\":false")!=std::string::npos && reply.find("first_index")==std::string::npos);
     brook::gpuGop.otherEnginesRequested=true;brook::gpuGop.wake.otherEnginesSampled=true;

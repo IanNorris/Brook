@@ -26,9 +26,7 @@
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
-#if defined(BROOK_SSD_AUTO_RECOVERY)
-#include "guard_checker_runner.h"
-#endif
+#include "panic_snapshot.h"
 #include "../../drivers/intel_hda/hda_probe.h"
 namespace brook {
 #if defined(BROOK_HOST_TEST)
@@ -113,6 +111,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text("0,\"recovery_only\":true,\"recovery_panic_api\":1");
 #else
         r.text("1,\"power\":{");PowerCaps(r);r.text("}");
+#if !defined(BROOK_SSD_GUARD_CHECK)
+        r.text(",\"recovery_panic_api\":1");
+#endif
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
         r.text(",\"completed_frame_copy_api\":0,\"bulk_helper_api\":0,\"panic_transport\":false,\"raw_frame_transfer\":false}\n");r.send();return true;
@@ -128,7 +129,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
 #endif
     }
-#if defined(BROOK_SSD_AUTO_RECOVERY)
+#if defined(BROOK_SSD_AUTO_RECOVERY) || !defined(BROOK_SSD_GUARD_CHECK)
     constexpr char priorPrefix[]="bridge hardware recovery-panic ";
     if(Prefix(command,priorPrefix)) {
         const char* p=command+sizeof(priorPrefix)-1;uint32_t offset=0,count=0;
