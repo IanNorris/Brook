@@ -50,20 +50,31 @@ def main():
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--identity',required=True)
     parser.add_argument('--inject-panic',action='store_true',help='Interrupt the first repair attempt after pending state using GDB')
+    parser.add_argument('--auto-desktop',action='store_true',help='Use an automatic guard kernel with checked desktop handoff')
+    parser.add_argument('--auto-desktop-panic',action='store_true',help='Inject a panic after the guarded desktop is mounted')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
-    if bool(a.normal_kernel)!=bool(a.normal_network_module) or (a.normal_kernel and not a.inject_panic):
+    if bool(a.normal_kernel)!=bool(a.normal_network_module) or (a.normal_kernel and not a.inject_panic) or (a.normal_kernel and a.auto_desktop):
         parser.error('normal kernel and network module must be supplied together with --inject-panic')
+    if a.auto_desktop_panic and (not a.auto_desktop or a.inject_panic):
+        parser.error('desktop panic requires auto desktop and excludes repair panic')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
-    check_pair(a.desktop_pair,a.identity,False);check_pair(a.recovery_pair,a.identity,True)
+    check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
+    if a.auto_desktop and json.loads((a.desktop_pair/'manifest.json').read_text()).get('kernel_build_flags',{}).get('BROOK_SSD_GUARDED_DESKTOP')!='ON':
+        parser.error('automatic desktop pair lacks the guarded desktop build option')
     a.output.mkdir(parents=True,exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='brk-auto-handoff-') as tmp:
         work=Path(tmp);disk=work/'disk.raw';shutil.copyfile(a.image,disk);media=str(disk)+'@@1048576'
         normal=work/'normal.img';recovery=work/'recovery.img'
         compact(a.desktop_pair/'INITRD.IMG',normal,work/'normal-tree')
         compact(a.recovery_pair/'INITRD.IMG',recovery,work/'recovery-tree')
+        if a.auto_desktop:
+            for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
+                subprocess.run(['mmd','-i',str(normal),'::/'+directory],check=True)
+            volatile=work/'volatile-desktop';volatile.write_text('1\n')
+            subprocess.run(['mcopy','-o','-i',str(normal),str(volatile),'::/ETC/volatile-desktop'],check=True)
         service=work/'GDSVC.ELF';script=work/'INIT.RC';defaults=work/'defaults.ini'
         subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
                         str(ROOT/'scripts/workloads/guard_handoff_service.c'),'-o',str(service)],check=True)
@@ -178,15 +189,40 @@ def main():
                 (a.output/'decoded-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_SERVICE_PASS',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=retrieve)
+        elif a.auto_desktop_panic:
+            symbols=subprocess.check_output(['nm',str(a.desktop_pair/'KERNEL.ELF')],text=True)
+            def desktop_symbol(name):
+                matches=[int(line.split()[0],16) for line in symbols.splitlines() if line.split()[-1:]==[name]]
+                if len(matches)!=1:raise RuntimeError('missing desktop panic injection symbol '+name)
+                return matches[0]
+            launch=desktop_symbol('_ZN5brook15ShellExecScriptEPKc')
+            panic=desktop_symbol('KernelPanic');scratch=desktop_symbol('_ZN5brookL8g_kbdBufE')
+            gdb=second/'panic.gdb'
+            gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
+                           f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'
+                           f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
+                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\ndetach\nquit\n')
+            boot(disk,a.firmware,second,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
+        elif a.auto_desktop:
+            boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
+                 hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
         else:
             boot(disk,a.firmware,second,False,'GUARD_JOURNAL_NORMAL_SCRIPT status=0',120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_JOURNAL_DESKTOP_FAIL',
                  extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
-        if ('GUARD_DESKTOP_SERVICE_PASS' not in serial or 'brook-ssd-recovery-automatic-v1' in serial or
+        if ((not a.auto_desktop_panic and 'GUARD_DESKTOP_SERVICE_PASS' not in serial) or (not a.auto_desktop and 'brook-ssd-recovery-automatic-v1' in serial) or
             'Recovery required; normal boot blocked.' in serial):
             raise RuntimeError('guarded desktop service did not start after repair')
+        if a.auto_desktop_panic:
+            if 'ahci direct: ready ' not in serial or 'PANIC_RECOVERY_RESET_WAIT' in serial:
+                raise RuntimeError('desktop panic occurred before mount or unexpectedly armed reset')
+            packet=next((line[10:] for line in serial.splitlines() if line.startswith('PANIC_HEX:')),None)
+            if not packet:raise RuntimeError('desktop panic packet missing')
+            journal_after=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
+            verify_record(journal_after,0,1,bytes.fromhex(packet))
         if a.normal_kernel and f'NORMAL_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}' not in serial:
             raise RuntimeError('normal boot did not validate the captured panic packet')
         if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal unexpectedly changed')
@@ -194,13 +230,30 @@ def main():
             if subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])!=guards[index]:
                 raise RuntimeError('desktop changed verified clean guard records')
         if metadata_hash(disk)!=metadata:raise RuntimeError('desktop changed GPT or disk metadata')
+        if a.auto_desktop_panic:
+            # The desktop panic has no reset authorization yet; boot() stopped
+            # that halted VM. A fresh boot must select recovery, retain the
+            # panic packet, repair the dirty data volume and request reset.
+            retry=work/'desktop-panic-recovery';retry.mkdir()
+            boot(disk,a.firmware,retry,False,'GUARD_COMPLETE_RESTART',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='GUARD_COMPLETE_RESTART',
+                 failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'])
+            shutil.copyfile(retry/'serial.log',a.output/'desktop-panic-recovery.log')
+            retry_text=(retry/'serial.log').read_text(errors='replace')
+            packet_bytes=bytes.fromhex(packet)
+            prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(packet_bytes)} crc={zlib.crc32(packet_bytes):x}'
+            if prior not in retry_text or 'GUARD_EXT2_VERIFIED_PENDING' not in retry_text:
+                raise RuntimeError('desktop panic recovery lost the packet or did not verify repair')
+            if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
+                raise RuntimeError('desktop panic recovery changed the journal')
         with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
         subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        content=subprocess.check_output(['debugfs','-R','cat /home/brook/SERVICE.TXT',str(partition)],stderr=subprocess.DEVNULL)
-        if content!=b'guarded desktop service\n':raise RuntimeError('desktop service data missing')
+        if not a.auto_desktop_panic:
+            content=subprocess.check_output(['debugfs','-R','cat /home/brook/SERVICE.TXT',str(partition)],stderr=subprocess.DEVNULL)
+            if content!=b'guarded desktop service\n':raise RuntimeError('desktop service data missing')
         fat=work/'esp.img'
         with disk.open('rb') as src,fat.open('wb') as dst:src.seek(2048*512);dst.write(src.read(131072*512))
         subprocess.run(['fsck.fat','-n',str(fat)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        print('GUARD_REPAIR_TO_DESKTOP_PASS')
+        print('GUARD_DESKTOP_PANIC_CAPTURE_PASS' if a.auto_desktop_panic else 'GUARD_REPAIR_TO_DESKTOP_PASS')
 
 if __name__=='__main__':main()

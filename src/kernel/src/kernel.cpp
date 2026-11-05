@@ -242,7 +242,7 @@ static void PrepareDesktopHome()
     }
     brook::VfsPathRelease(root);
 }
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 #endif
 

@@ -46,8 +46,10 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* mount, void* first128, void* se
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 // Retain a checked fixed journal on the private recovery mount for this boot.
 int FatFsPrivateRecoveryPinJournal(FatPrivateMount* mount);
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* mount,bool missingTarget=false,uint64_t* publication=nullptr);
+#endif
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
 int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* mount);
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)

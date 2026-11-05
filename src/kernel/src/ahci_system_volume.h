@@ -42,9 +42,11 @@ bool AhciSystemGuardBeginAttempt(Device* adapter);
 #endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 bool AhciSystemGuardPanicTestArm(Device* adapter,const uint64_t* sectors,uint32_t count);
+#endif
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t publication);
-// Test-only: caller must already have checked both guards and published the
-// checked ESP. Retains the guard-owned data lease and never retries failure.
+// Caller must already have checked both guards and published the checked ESP.
+// Retains the guard-owned data lease and never retries failure.
 bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive);
 int AhciSystemGuardTestFailedDesktopWrite();
 #endif

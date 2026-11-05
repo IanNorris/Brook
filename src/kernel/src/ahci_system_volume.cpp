@@ -32,7 +32,7 @@ struct Range { Device* parent=nullptr;uint64_t start=0,bytes=0; } range;
 bool attempted=false;
 uint64_t systemVolumePublication=0;
 uint8_t systemVolumeDrive=0;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 Device* guardSystemVolumeDevice=nullptr;
 #endif
 Range guardRange{};bool guardReady=false;
@@ -132,8 +132,8 @@ AhciDataInspection largeInspection{};bool largeInspectionClean=false;
 bool largeDesktopReady=false;
 #endif
 bool directPrepared=false,directLeased=false,directReady=false;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
-// Test-only handoff retains the existing data reservation owner; the ordinary
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
+// The handoff retains the existing data reservation owner; the ordinary
 // desktop adapter is not itself allowed to replace or broaden that lease.
 Device* guardDesktopLeaseOwner=nullptr;
 enum class GuardDesktopPhase : uint8_t {Disabled,Preparing,Ready,Failed};
@@ -149,7 +149,7 @@ int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
 int LargeWrite(Device* dev,uint64_t offset,const void* data,uint64_t length) {
     if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
     Device* owner=dev;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
     if(guardDesktopLeaseOwner) {
         if(guardDesktopPhase!=GuardDesktopPhase::Preparing && guardDesktopPhase!=GuardDesktopPhase::Ready)return -30;
         owner=guardDesktopLeaseOwner;
@@ -420,7 +420,7 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
 uint64_t AhciSystemVolumePublication() { return systemVolumePublication; }
 bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory) {
     Device* expected=&partition;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
     if(guardSystemVolumeDevice)expected=guardSystemVolumeDevice;
 #endif
     return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==expected &&
@@ -429,7 +429,7 @@ bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory) {
 
 bool AhciSystemVolumeOwnsMember(Vnode* retainedDirectory) {
     Device* expected=&partition;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
     if(guardSystemVolumeDevice)expected=guardSystemVolumeDevice;
 #endif
     return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==expected &&
@@ -552,7 +552,7 @@ bool AhciSystemDirectDesktopMount(uint8_t* nextDrive) {
     KPrintf("ahci direct: ready bytes=%lu drive=%u home=/data/home (persistent)\n",largeRange.bytes,drive);
     return true;
 }
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t publication) {
     static bool attemptedAdoption=false;
     if(__atomic_exchange_n(&attemptedAdoption,true,__ATOMIC_ACQ_REL) || adapter!=&guardTestPartition ||

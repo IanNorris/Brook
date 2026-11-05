@@ -13,6 +13,8 @@
 #include "fw_cfg.h"
 #include "panic.h"
 #include "shutdown.h"
+#endif
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "shell.h"
 #endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
@@ -226,7 +228,27 @@ void Worker(void* arg) {
     if(inspection || (!resumePending && !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity))) {
         AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_INCOMPLETE records=%d\n",inspection);return;
     }
-    if(autoClean && !resumePending) {AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
+    if(autoClean && !resumePending) {
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+        // The checked private ESP and data reservation remain pinned for the
+        // entire boot. A failure at any step leaves maintenance in control.
+        uint64_t publication=0;
+        int handoff=journalPin;
+        if(!handoff)handoff=FatFsPrivateRecoveryPublishJournalTest(mount,false,&publication);
+        if(!handoff && !AhciSystemGuardTestBeginWrites(adapter))handoff=-13;
+        if(!handoff && !AhciSystemGuardTestAdoptSystemMount(adapter,1,publication))handoff=-13;
+        if(!handoff)handoff=FatFsPrivateRecoveryArmJournal(mount);
+        uint8_t drive=2;
+        if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive))handoff=-5;
+        if(handoff) {KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d\n",handoff);return;}
+        GuardTestPrepareDesktopHome();
+        const int script=ShellExecScript("/boot/INIT.RC");
+        KPrintf("GUARD_DESKTOP_HANDOFF_SCRIPT status=%d\n",script);
+        return;
+#else
+        AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_NO_REPAIR\n");return;
+#endif
+    }
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     // Give a connected recovery bridge a bounded opportunity to retrieve the
     // retained crash before a successful retry restarts the machine again.

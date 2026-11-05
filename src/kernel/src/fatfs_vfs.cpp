@@ -8,7 +8,7 @@
 #endif
 #include "vfs.h"
 #include "vfs_object.h"
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "mount_namespace.h"
 #include "vfs_path.h"
 #endif
@@ -113,7 +113,7 @@ struct FatPrivateMount {
     FatImageLease* journalLease;
     bool journalAttempted;
     bool journalReady;
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
     bool journalPublishAttempted;
     bool journalPublished;
 #endif
@@ -2062,7 +2062,7 @@ static const VfsFsOps g_fatFsOps = {
     .vnode_object = FatObjectFromVnode,
 };
 
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missingTarget,uint64_t* publication)
 {
     if(publication)*publication=0;

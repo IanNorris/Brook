@@ -54,6 +54,18 @@ class GuardPairTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'fixture identity'):self.prepare('physical')
         self.assertFalse(self.output.exists())
 
+    def test_rejects_guarded_desktop_candidate(self):
+        cache=self.build/'CMakeCache.txt'
+        cache.write_text(cache.read_text().replace('BROOK_SSD_GUARDED_DESKTOP:BOOL=OFF',
+                                                   'BROOK_SSD_GUARDED_DESKTOP:BOOL=ON'))
+        with self.assertRaisesRegex(ValueError,'unsafe kernel build option'):self.prepare()
+        cache.write_text(cache.read_text().replace('BROOK_SSD_GUARDED_DESKTOP:BOOL=ON',
+                                                   'BROOK_SSD_GUARDED_DESKTOP:BOOL=OFF'))
+        self.commands[0]['command']+=' -DBROOK_SSD_GUARDED_DESKTOP=1'
+        (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
+        with self.assertRaisesRegex(ValueError,'unsafe compile flags'):self.prepare()
+        self.assertFalse(self.output.exists())
+
     def test_rejects_unsafe_kernel_flags(self):
         self.commands[0]['command']+=' -DBROOK_SSD_GUARD_EXT2_TEST=1'
         (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
