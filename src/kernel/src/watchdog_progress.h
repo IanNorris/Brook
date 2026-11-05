@@ -16,4 +16,10 @@ struct WatchdogProgress {
         return false;
     }
 };
+// Reset authorization must not retroactively turn a pre-existing stall into
+// a failure. Require newly observed progress after every unarmed sample.
+inline bool RecoveryWatchdogObserve(WatchdogProgress& progress,bool armed,uint64_t value,uint32_t threshold) {
+    if(!armed) {progress.Reset(value);return false;}
+    return progress.Observe(value,threshold);
+}
 }

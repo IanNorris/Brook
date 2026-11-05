@@ -108,6 +108,8 @@ def main():
                    help='Inject before pending state and verify no automatic reset')
     p.add_argument('--guard-panic-pm-fallback', action='store_true',
                    help='Force PIT failure in the disposable debugger and test the ACPI timer')
+    p.add_argument('--guard-watchdog-inject', action='store_true',
+                   help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-panic-network', action='store_true',
                    help='Retrieve the previous panic via the restricted recovery debug listener')
     p.add_argument('--guard-panic-invalid-data', action='store_true',
@@ -156,6 +158,8 @@ def main():
         p.error('unarmed panic requires the pre-pending injection')
     if a.guard_panic_pm_fallback and not a.guard_panic_after_pending:
         p.error('PM fallback requires the post-pending panic fixture')
+    if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
+        p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if a.guard_panic_network and not a.guard_panic_after_pending:
         p.error('network retrieval requires the post-pending panic fixture')
     if (a.guard_panic_invalid_data or a.guard_panic_missing_guard) and not (a.guard_panic_after_pending and a.guard_panic_network):
@@ -539,12 +543,39 @@ def main():
                 scratch=symbol('_ZN5brookL8g_kbdBufE') # disposable guest, no keyboard input
                 pit=symbol('_ZN5brook13PanicPitDelayEj') if a.guard_panic_pm_fallback else 0
                 commands=work/'panic.gdb'
-                commands.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
-                    f'target remote {work / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n'
-                    f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
-                    f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +
-                    (f'hbreak *{pit:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pit else '') +
-                    'detach\nquit\n')
+                prefix=('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
+                        f'target remote {work / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n')
+                if a.guard_watchdog_inject:
+                    # The exact optimized fixture keeps the sampled CPU index
+                    # in r15 and its tick total in r12 at this call. Inject a
+                    # final stagnant sample, not a real 30-second CPU stall.
+                    watchdog=symbol('_ZN5brookL16WatchdogThreadFnEPv')
+                    armed=symbol('_ZN5brook23PanicRecoveryResetArmedEv')
+                    progress=symbol('_ZN5brookL18g_recoveryProgressE')+16
+                    from elftools.elf.elffile import ELFFile
+                    spin=None
+                    with (pair/'KERNEL.ELF').open('rb') as executable:
+                        for segment in ELFFile(executable).iter_segments():
+                            if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                                at=segment.data().find(b'\xeb\xfe')
+                                if at>=0:spin=segment['p_vaddr']+at;break
+                    if spin is None:raise RuntimeError('no executable self-loop for watchdog fixture')
+                    disassembly=subprocess.check_output(['objdump','-d',str(pair/'KERNEL.ELF'),
+                        f'--start-address={watchdog}',f'--stop-address={watchdog+0x400}'],text=True)
+                    if 'call' not in disassembly or f'{armed:x}' not in disassembly or '%r15d' not in disassembly or '%r12' not in disassembly:
+                        raise RuntimeError('watchdog injection register assumptions do not match this build')
+                    body=(f'delete breakpoints\nset $rip={spin:#x}\n'
+                          f'hbreak *{armed:#x} if $r15 == 1\ncontinue\n'
+                          f'set *(unsigned long long*){progress:#x}=$r12\n'
+                          f'set *(unsigned int*){progress+8:#x}=29\n'
+                          f'set *(unsigned char*){progress+12:#x}=1\n'
+                          'delete breakpoints\ndetach\nquit\n')
+                else:
+                    body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
+                          f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +
+                          (f'hbreak *{pit:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pit else '') +
+                          'detach\nquit\n')
+                commands.write_text(prefix+body)
                 for _ in range(100):
                     if (work/'gdb.sock').exists():break
                     time.sleep(.05)
@@ -741,7 +772,8 @@ def main():
             decoded_output=StringIO()
             with redirect_stdout(decoded_output):crash_decoder.decode_crash(bytes.fromhex(packet),None,False,True)
             decoded=json.loads(decoded_output.getvalue())
-            if decoded.get('message')!='GDBTEST' or not decoded.get('log_tail',{}).get('available'):
+            expected_message=('Recovery watchdog: CPU1 timer accounting stalled for 30 checks' if a.guard_watchdog_inject else 'GDBTEST')
+            if decoded.get('message')!=expected_message or not decoded.get('log_tail',{}).get('available'):
                 raise RuntimeError('panic packet lacks the injected reason or recent log')
             contents=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
             verify_record(contents,0,1,bytes.fromhex(packet))

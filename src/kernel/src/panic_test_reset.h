@@ -8,5 +8,6 @@ bool PanicTestHeadlessEnabled();
 void PanicTestResetAfterDump();
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 bool PanicRecoveryResetArm();
+bool PanicRecoveryResetArmed();
 #endif
 }

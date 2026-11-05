@@ -4,6 +4,10 @@
 #include "scheduler.h"
 #include "smp.h"
 #include "serial.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "panic.h"
+#include "panic_test_reset.h"
+#endif
 
 namespace brook {
 
@@ -13,6 +17,13 @@ static constexpr uint32_t WATCHDOG_STRIKES     = WATCHDOG_TIMEOUT_MS / WATCHDOG_
 static constexpr uint32_t WATCHDOG_MAX_CPUS    = 64;
 
 static WatchdogProgress g_progress[WATCHDOG_MAX_CPUS] = {};
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+// The software monitor can detect a stalled peer only while this CPU and the
+// scheduler still run. Wait substantially longer than the diagnostic warning,
+// and escalate only after recovery has durably authorized panic reset.
+static constexpr uint32_t RECOVERY_WATCHDOG_STRIKES = 30;
+static WatchdogProgress g_recoveryProgress[WATCHDOG_MAX_CPUS] = {};
+#endif
 
 static void WatchdogThreadFn(void* /*arg*/)
 {
@@ -26,6 +37,9 @@ static void WatchdogThreadFn(void* /*arg*/)
         uint64_t busy = 0, idle = 0;
         SchedulerGetCpuTicks(c, busy, idle);
         g_progress[c].Reset(busy + idle);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        g_recoveryProgress[c].Reset(busy + idle);
+#endif
     }
 
     for (;;)
@@ -43,6 +57,12 @@ static void WatchdogThreadFn(void* /*arg*/)
                 SerialPrintf("WATCHDOG: CPU%u timer accounting unchanged for %u checks\n",
                              c, WATCHDOG_STRIKES);
             }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+            // Do not carry a pre-authorization stall across the repair gate.
+            // An unseen or already-stalled CPU cannot authorize a reset.
+            if (RecoveryWatchdogObserve(g_recoveryProgress[c],PanicRecoveryResetArmed(),total,RECOVERY_WATCHDOG_STRIKES))
+                KernelPanic("Recovery watchdog: CPU%u timer accounting stalled for %u checks",c,RECOVERY_WATCHDOG_STRIKES);
+#endif
         }
     }
 }

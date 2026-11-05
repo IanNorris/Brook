@@ -72,6 +72,7 @@ bool PanicRecoveryResetArm() {
     if(!PlatformPowerGetPlan().CanReset())return false;
     __atomic_store_n(&recoveryArmed,true,__ATOMIC_RELEASE);return true;
 }
+bool PanicRecoveryResetArmed() {return __atomic_load_n(&recoveryArmed,__ATOMIC_ACQUIRE);}
 #endif
 bool PanicTestResetEnabled() {return enabled;}
 bool PanicTestHeadlessEnabled() {return headless;}

@@ -19,4 +19,14 @@ int main() {
     cpu.Reset(0);
     assert(!cpu.Observe(1,0));
     assert(!cpu.Observe(1,0));
+    brook::WatchdogProgress recovery;
+    recovery.Reset(100);
+    for(int i=0;i<40;++i) assert(!brook::RecoveryWatchdogObserve(recovery,false,100,30));
+    for(int i=0;i<40;++i) assert(!brook::RecoveryWatchdogObserve(recovery,true,100,30));
+    assert(!brook::RecoveryWatchdogObserve(recovery,true,101,30));
+    for(int i=0;i<29;++i) assert(!brook::RecoveryWatchdogObserve(recovery,true,101,30));
+    assert(brook::RecoveryWatchdogObserve(recovery,true,101,30));
+    assert(!brook::RecoveryWatchdogObserve(recovery,true,101,30));
+    assert(!brook::RecoveryWatchdogObserve(recovery,false,101,30));
+    for(int i=0;i<31;++i) assert(!brook::RecoveryWatchdogObserve(recovery,true,101,30));
 }
