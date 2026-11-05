@@ -10,6 +10,8 @@ bool AhciSystemDirectDesktopMount(uint8_t* nextDrive);
 int AhciSystemDirectFinalSync();
 // Boot only. An existing selector which fails at any stage is Maintenance.
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive);
+// Boot-local identity of the admitted ESP attachment; zero until mounted.
+uint64_t AhciSystemVolumePublication();
 // Boot-only experimental preparation. Reserves the ESP for the returned
 // adapter and denies data/GPT writes. Does not mount or expose filesystems.
 // Only call before any filesystem, caches or user processes can access disk.

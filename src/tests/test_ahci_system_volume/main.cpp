@@ -85,7 +85,8 @@ extern "C" bool DeviceRegister(Device* d){if(is("register") || is("guard-registe
 extern "C" int DeviceWrite(Device* d,uint64_t off,const void* p,uint64_t n){if(guard() && !guardLedger.AllowOrdinary(reinterpret_cast<uintptr_t>(d),off,n))return -30;return d->ops->write(d,off,p,n);}
 extern "C" int DeviceFlush(Device* d){return d->ops->ioctl(d,DEVICE_IOCTL_FLUSH,nullptr);}
 bool FatFsBindDrive(uint8_t drive,Device* d){assert(drive==1 && d==registered);++binds;return !is("bind");}
-bool VfsMountConfigured(const char* path,const char* type,uint8_t drive,uint64_t flags){assert(!std::strcmp(path,"/media/system")&&!std::strcmp(type,"fatfs")&&drive==1&&!flags);++mounts;return !is("mount");}
+bool VfsMountConfiguredWithPublication(const char* path,const char* type,uint8_t drive,uint64_t flags,uint64_t* publication){assert(!std::strcmp(path,"/media/system")&&!std::strcmp(type,"fatfs")&&drive==1&&!flags);++mounts;*publication=is("mount")?0:42;return !is("mount");}
+bool VfsMountConfigured(const char* path,const char* type,uint8_t drive,uint64_t flags){uint64_t unused;return VfsMountConfiguredWithPublication(path,type,drive,flags,&unused);}
 extern "C" void KPrintf(const char* format,...){char buffer[256];va_list args;va_start(args,format);std::vsnprintf(buffer,sizeof(buffer),format,args);va_end(args);lastLog=buffer;}
 }
 int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
@@ -147,6 +148,7 @@ int main(int argc,char** argv){assert(argc==2);scenario=argv[1];
         return 0;
     }
     uint8_t next=1;const auto result=AhciSystemVolumeMount(&next);
+    assert(AhciSystemVolumePublication()==(result==AhciSystemBoot::Ready?42u:0u));
     if(direct()) {
         if(is("direct-ready"))assert(result==AhciSystemBoot::Ready && registered && dataDevice && leaseCalls==1 && binds==1 && mounts==1 && next==2 && !writes);
         else if(is("direct-lease-fail"))assert(result==AhciSystemBoot::Maintenance && registered && dataDevice && leaseCalls==1 && !binds && !mounts && !writes);
