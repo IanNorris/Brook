@@ -25,7 +25,21 @@ int main() {
     assert(!BrookRecoveryGuardAllowsNormal(a,sizeof(a),b,sizeof(b),identity));
     memcpy(b,a,sizeof(a));BrookUpdatePut32(b+16,BROOK_RECOVERY_GUARD_PENDING);Seal(b);
     assert(!BrookRecoveryGuardAllowsNormal(b,sizeof(b),b,sizeof(b),identity));
+    assert(BrookRecoveryGuardMatchesPending(b,sizeof(b),b,sizeof(b),identity));
+    for(unsigned count=1;count<=3;++count) {
+        BrookUpdatePut32(b+20,count);Seal(b);
+        assert(BrookRecoveryGuardValid(b,sizeof(b)));
+        assert(BrookRecoveryGuardMatchesPending(b,sizeof(b),b,sizeof(b),identity));
+        assert(!BrookRecoveryGuardMatchesPending(b,sizeof(b),b,sizeof(b),wrong));
+        assert(!BrookRecoveryGuardMatchesPending(a,sizeof(a),b,sizeof(b),identity));
+        assert(!BrookRecoveryGuardAllowsNormal(b,sizeof(b),b,sizeof(b),identity));
+    }
+    BrookUpdatePut32(b+20,4);Seal(b);assert(!BrookRecoveryGuardValid(b,sizeof(b)));
+    BrookUpdatePut32(b+16,BROOK_RECOVERY_GUARD_CLEAN);BrookUpdatePut32(b+20,1);Seal(b);
+    assert(!BrookRecoveryGuardValid(b,sizeof(b)));
     BrookUpdatePut32(b+16,BROOK_RECOVERY_GUARD_FAILED);Seal(b);
+    assert(!BrookRecoveryGuardValid(b,sizeof(b)));
+    BrookUpdatePut32(b+20,0);Seal(b);
     assert(!BrookRecoveryGuardAllowsNormal(b,sizeof(b),b,sizeof(b),identity));
     memcpy(b,a,sizeof(a));memset(b+24,0,16);Seal(b);
     assert(!BrookRecoveryGuardValid(b,sizeof(b)));

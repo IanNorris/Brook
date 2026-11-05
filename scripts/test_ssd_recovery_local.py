@@ -110,6 +110,8 @@ def main():
                    help='Force PIT failure in the disposable debugger and test the ACPI timer')
     p.add_argument('--guard-panic-network', action='store_true',
                    help='Retrieve the previous panic via the restricted recovery debug listener')
+    p.add_argument('--guard-attempt-exhausted',action='store_true',
+                   help='Start with both retry slots consumed and verify maintenance without writes')
     p.add_argument('--guard-network-usb', action='store_true',
                    help='Use emulated xHCI/USB Ethernet for the recovery listener')
     p.add_argument('--guard-auto-unsupported', action='store_true',
@@ -147,6 +149,8 @@ def main():
         p.error('PM fallback requires the post-pending panic fixture')
     if a.guard_panic_network and not a.guard_panic_after_pending:
         p.error('network retrieval requires the post-pending panic fixture')
+    if a.guard_attempt_exhausted and (not a.auto_prepared_pair or not a.guard_auto_dispatch or a.guard_panic_inject):
+        p.error('exhaustion requires an automatic dispatch fixture without panic injection')
     if a.guard_network_usb and not a.guard_panic_network:
         p.error('USB network requires the recovery network test')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
@@ -434,6 +438,8 @@ def main():
             record_data[24:40]=uuid.UUID(table['id']).bytes_le
             record_data[40:56]=uuid.UUID(parts[1]['uuid']).bytes_le
             record_data[56:72]=filesystem_uuid
+            if a.guard_attempt_exhausted:
+                struct.pack_into('<II',record_data,16,2,2)
             struct.pack_into('<I',record_data,124,zlib.crc32(record_data[:124]))
             for index in range(2):
                 target=f'::/RECOVERY/GUARD{index}.BIN'
@@ -461,7 +467,7 @@ def main():
         journal_outside=(outside_esp_hash(disk) if a.guard_panic_after_pending else outside_digest(disk,journal_sectors)) if journal_sectors else None
         baseline=None
         auto_clean=a.guard_auto_condition and not a.dirty
-        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean):
+        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean or a.guard_attempt_exhausted):
             baseline=work/'baseline.raw';shutil.copyfile(disk,baseline)
         poison = None
         if a.guard_poison_boot:
@@ -583,7 +589,8 @@ def main():
                     pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
                     ext2_checker_failed=a.guard_ext2_bad_checker or a.guard_ext2_missing_checker
                     complete_expected=(0 if a.guard_complete_fail_at in (1,2) else 1 if a.guard_complete_fail_at else 2)
-                    expected = (('GUARD_AUTO_INVALID' if a.guard_auto_unsupported else 'GUARD_AUTO_NO_REPAIR') if auto_clean else
+                    expected = ('GUARD_ATTEMPT_RESULT outcome=3' if a.guard_attempt_exhausted else
+                                ('GUARD_AUTO_INVALID' if a.guard_auto_unsupported else 'GUARD_AUTO_NO_REPAIR') if auto_clean else
                                 f'GUARD_COMPLETE_RESULT outcome={complete_expected}' if a.guard_complete_test else
                                 'GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
                                 'GUARD_EXT2_VERIFIED_PENDING' if a.guard_ext2_test and not a.guard_pending_fail_at else
@@ -642,7 +649,7 @@ def main():
                             if after.count('GUARD_COMPLETE_RESTART')!=1 or 'SSD_GUARD_RESERVATION_READY' in after:
                                 raise RuntimeError('guest re-entered recovery after completion')
                     if selected and matched:
-                        if a.guard_ext2_test and not a.guard_pending_fail_at and not auto_clean:
+                        if a.guard_ext2_test and not a.guard_pending_fail_at and not auto_clean and not a.guard_attempt_exhausted:
                             preen=('GUARD_EXT2_PREEN exit=-8' if a.guard_ext2_bad_checker else
                                    'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
@@ -659,6 +666,8 @@ def main():
                             raise RuntimeError('guard record result did not follow a successful checker')
                         if a.guard_bad_checker and 'GUARD_CHECK_RESULT' in text:
                             raise RuntimeError('bad checker unexpectedly produced a result')
+                        if a.guard_attempt_exhausted and any(x in text for x in ('GUARD_EXT2_PREEN','GUARD_PANIC_RESET armed=1','GUARD_COMPLETE_RESTART')):
+                            raise RuntimeError('exhausted repair attempted further work')
                         if a.guard_reservation:
                             reservation = 'SSD_GUARD_RESERVATION_READY' if a.guard_reservation == 'valid' else 'SSD_GUARD_RESERVATION_FAILED'
                             if reservation not in text or 'ahci system: verified GPT entry' in text or 'writable desktop: ready' in text:
@@ -725,6 +734,7 @@ def main():
                 raise RuntimeError('panic wrote outside the preallocated journal')
             if a.guard_panic_after_pending:
                 expected_pending=bytearray(record_data);struct.pack_into('<QI',expected_pending,8,2,2)
+                struct.pack_into('<I',expected_pending,20,1)
                 struct.pack_into('<I',expected_pending,124,zlib.crc32(expected_pending[:124]))
                 for index in range(2):
                     actual=subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])
@@ -734,7 +744,7 @@ def main():
                 source.seek(2048*512);target.write(source.read(131072*512))
             subprocess.run(['fsck.fat','-n',str(esp)],check=True,stdout=subprocess.DEVNULL,timeout=30)
             reboot=work/'panic-reboot';reboot.mkdir()
-            reboot_marker='GUARD_PENDING_INCOMPLETE records=0' if a.guard_panic_after_pending else 'GUARD_PANIC_JOURNAL pin=0 arm=0'
+            reboot_marker='GUARD_COMPLETE_RESULT outcome=2' if a.guard_panic_after_pending else 'GUARD_PANIC_JOURNAL pin=0 arm=0'
             network_port=None;on_marker=None
             if a.guard_panic_network:
                 with socket.socket() as port_probe:
@@ -759,11 +769,29 @@ def main():
                         raise RuntimeError('recovery bridge capabilities are inconsistent')
                 on_marker=retrieve_snapshot
             boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,reboot_marker,
-                              90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=on_marker,network_usb=a.guard_network_usb)
+                              90,True,sata_snapshot=not a.guard_panic_after_pending,sata_serial='BROOK-RECOVERY-QA',network_port=network_port,
+                              intermediate_marker='GUARD_PANIC_RETRIEVAL_WINDOW 10s' if on_marker else None,
+                              on_intermediate=on_marker,network_usb=a.guard_network_usb)
             reboot_text=(reboot/'serial.log').read_text(errors='replace')
             raw_packet=bytes.fromhex(packet)
             prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(raw_packet)} crc={zlib.crc32(raw_packet):x}'
             if prior not in reboot_text:raise RuntimeError('next boot did not recover the captured panic snapshot')
+            if a.guard_panic_after_pending:
+                if 'GUARD_ATTEMPT_RESULT outcome=2' not in reboot_text or 'GUARD_ATTEMPT_NUMBER 2' not in reboot_text or 'GUARD_EXT2_VERIFIED_PENDING' not in reboot_text:
+                    raise RuntimeError('interrupted repair did not complete on its bounded retry')
+                expected_clean=bytearray(record_data);struct.pack_into('<Q',expected_clean,8,2)
+                struct.pack_into('<I',expected_clean,124,zlib.crc32(expected_clean[:124]))
+                for index in range(2):
+                    actual=subprocess.check_output(['mtype','-i',media,f'::/RECOVERY/GUARD{index}.BIN'])
+                    if actual!=expected_clean:raise RuntimeError('successful retry did not complete the guard')
+                repaired=work/'repaired-data.img'
+                with disk.open('rb') as source,repaired.open('wb') as target:
+                    source.seek(parts[1]['start']*512);remaining=parts[1]['size']*512
+                    while remaining:
+                        block=source.read(min(1024*1024,remaining))
+                        if not block:raise RuntimeError('short repaired filesystem')
+                        target.write(block);remaining-=len(block)
+                subprocess.run(['e2fsck','-f','-n',str(repaired)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=contents:
                 raise RuntimeError('captured journal changed after the next boot')
             if a.serial_output:

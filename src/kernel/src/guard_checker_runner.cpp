@@ -7,6 +7,7 @@
 #include "panic_journal.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "panic_test_reset.h"
+#include "net.h"
 #endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
@@ -213,10 +214,21 @@ void Worker(void* arg) {
         }
     }
 #endif
-    if(inspection || !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
+    bool resumePending=false;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    resumePending=!inspection && BrookRecoveryGuardMatchesPending(records[0],128,records[1],128,identity);
+#endif
+    if(inspection || (!resumePending && !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity))) {
         AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_INCOMPLETE records=%d\n",inspection);return;
     }
-    if(autoClean) {AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
+    if(autoClean && !resumePending) {AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    // Give a connected recovery bridge a bounded opportunity to retrieve the
+    // retained crash before a successful retry restarts the machine again.
+    if(resumePending && __atomic_load_n(&g_recoveryPanicReady,__ATOMIC_ACQUIRE) && NetGetIf() && NetGetIf()->ipAddr) {
+        KPuts("GUARD_PANIC_RETRIEVAL_WINDOW 10s\n");SchedulerSleepMs(10000);
+    }
+#endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
     char journalMode[8]{};
     const auto journalSize=FwCfgReadFile("opt/guard-journal-pin",journalMode,sizeof(journalMode));
@@ -331,15 +343,23 @@ void Worker(void* arg) {
         AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE injection\n");return;
     }
 #endif
-    const int pending=FatFsPrivateRecoveryTestPending(mount,identity,failAt);
+    const int pending=resumePending?2:FatFsPrivateRecoveryTestPending(mount,identity,failAt);
     AhciSystemGuardTestFinish(adapter);
-    if(FatFsPrivateRecoveryTestPending(mount,identity,failAt)!=0) {
+    if(!resumePending && FatFsPrivateRecoveryTestPending(mount,identity,failAt)!=0) {
         KPuts("GUARD_PENDING_INCOMPLETE repeated\n");return;
     }
     KPrintf("GUARD_PENDING_RESULT outcome=%d\n",pending);
 #if defined(BROOK_SSD_GUARD_REPAIR)
     if(pending!=2)return;
 #if defined(BROOK_SSD_AUTO_RECOVERY)
+    if(!AhciSystemGuardBeginAttempt(adapter)) {
+        KPuts("GUARD_ATTEMPT_INCOMPLETE authorization\n");return;
+    }
+    const int attempt=FatFsPrivateRecoveryBeginAttempt(mount,identity,records[0]);
+    AhciSystemGuardTestFinish(adapter);
+    KPrintf("GUARD_ATTEMPT_RESULT outcome=%d\n",attempt);
+    if(attempt!=2)return;
+    KPrintf("GUARD_ATTEMPT_NUMBER %u\n",BrookUpdateGet32(records[0]+20));
     KPrintf("GUARD_PANIC_RESET armed=%u\n",PanicRecoveryResetArm()?1u:0u);
 #endif
     auto* data=AhciSystemGuardTestDataArm(adapter,pending);
@@ -358,9 +378,11 @@ void Worker(void* arg) {
 #if defined(BROOK_SSD_GUARD_COMPLETION)
     // Derive the exact pending record from the pair admitted before repair.
     // The repair generation identifies the attempt across both transitions.
+#if !defined(BROOK_SSD_AUTO_RECOVERY)
     BrookUpdatePut64(records[0]+8,BrookUpdateGet64(records[0]+8)+1);
     BrookUpdatePut32(records[0]+16,BROOK_RECOVERY_GUARD_PENDING);
     BrookUpdatePut32(records[0]+124,BrookUpdateCrc(records[0],124));
+#endif
     uint32_t completeFail=0;
 #if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
     char completeInjection[3]{};

@@ -119,6 +119,9 @@ struct FatPrivateMount {
 #endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
     bool pendingAttempted;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    bool repairAttempted;
+#endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
     bool pendingSucceeded;
     bool completionAttempted;
@@ -1940,6 +1943,23 @@ int FatFsPrivateRecoveryTestPending(FatPrivateMount* session,const char* identit
 #endif
     return result==BrookGuardBeginResult::PendingDurable?2:result==BrookGuardBeginResult::Uncertain?1:0;
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+int FatFsPrivateRecoveryBeginAttempt(FatPrivateMount* session,const char* identity,uint8_t* expected) {
+    if(!session || !session->mount || !session->inspected || !session->leases[0] || !session->leases[1] ||
+       !expected || __atomic_exchange_n(&session->repairAttempted,true,__ATOMIC_ACQ_REL))return 0;
+    struct Io {
+        FatPrivateMount* session;
+        bool Read(unsigned i,uint8_t* out,unsigned size) {return i<2 && size==128 && !FatFsGuardFlushReadback(session->leases[i],out);}
+        bool Write(unsigned i,const uint8_t* in,unsigned size) {return i<2 && size==128 && FatFsImageWrite(session->leases[i],0,in,size)==128;}
+        bool Sync(unsigned i) {return i<2 && !FatFsImageFlush(session->leases[i]);}
+        bool Flush() {return !FatFsSync(session->mount);}
+    } io{session};
+    const auto result=BrookGuardBeginAttempt(io,identity,2,expected);
+    session->pendingSucceeded=result==BrookGuardAttemptResult::PendingDurable;
+    return result==BrookGuardAttemptResult::PendingDurable?2:result==BrookGuardAttemptResult::Uncertain?1:
+           result==BrookGuardAttemptResult::Exhausted?3:0;
+}
+#endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
 int FatFsPrivateRecoveryTestComplete(FatPrivateMount* session,const char* identity,const uint8_t* pending,uint32_t failAt) {
     if(!session || !session->mount || !session->pendingSucceeded || !pending ||

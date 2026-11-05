@@ -73,6 +73,27 @@ int main() {
     pending.Crash();
     assert(BrookRecoveryGuardAllowsNormal(pending.visible[0],128,pending.visible[1],128,identity));
     assert(BrookUpdateGet64(pending.visible[0]+8)==42);
+    Io retry=Initial();assert(BrookGuardBeginRepair(retry,identity)==BrookGuardBeginResult::PendingDurable);
+    uint8_t attempt[128]{};retry.operation=0;
+    assert(BrookGuardBeginAttempt(retry,identity,2,attempt)==BrookGuardAttemptResult::PendingDurable);
+    assert(retry.operation==11 && BrookUpdateGet32(attempt+20)==1);
+    retry.Crash();assert(BrookRecoveryGuardMatchesPending(retry.visible[0],128,retry.visible[1],128,identity));
+    assert(!BrookRecoveryGuardAllowsNormal(retry.visible[0],128,retry.visible[1],128,identity));
+    retry.operation=0;assert(BrookGuardBeginAttempt(retry,identity,2,attempt)==BrookGuardAttemptResult::PendingDurable);
+    assert(BrookUpdateGet32(attempt+20)==2);
+    retry.operation=0;uint8_t exhausted[128];memset(exhausted,0xaa,sizeof(exhausted));
+    assert(BrookGuardBeginAttempt(retry,identity,2,exhausted)==BrookGuardAttemptResult::Exhausted);
+    for(auto b:exhausted)assert(!b);
+    retry.operation=0;assert(BrookGuardCompleteRepair(retry,identity,attempt)==BrookGuardCompleteResult::CleanDurable);
+    assert(BrookUpdateGet32(retry.stable[0]+20)==0 && BrookRecoveryGuardAllowsNormal(retry.stable[0],128,retry.stable[1],128,identity));
+    for(int failure=1;failure<=11;++failure)for(bool partial:{false,true})for(bool early:{false,true}) {
+        Io io=Initial();assert(BrookGuardBeginRepair(io,identity)==BrookGuardBeginResult::PendingDurable);
+        io.operation=0;io.fail=failure;io.partial=partial;io.early=early;uint8_t out[128];
+        const auto result=BrookGuardBeginAttempt(io,identity,2,out);
+        assert(result==(failure<=2?BrookGuardAttemptResult::Rejected:BrookGuardAttemptResult::Uncertain));
+        io.Crash();assert(!BrookRecoveryGuardAllowsNormal(io.visible[0],128,io.visible[1],128,identity));
+        for(auto b:out)assert(!b);
+    }
     uint8_t cleanExpected[128];memcpy(cleanExpected,pending.visible[0],128);
     assert(BrookGuardCompleteRepair(pending,identity,expected)==BrookGuardCompleteResult::Rejected);
     for(int failure=1;failure<=11;++failure)for(bool partial:{false,true})for(bool early:{false,true}) {

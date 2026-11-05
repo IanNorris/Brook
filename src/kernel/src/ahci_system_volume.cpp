@@ -303,6 +303,14 @@ bool AhciSystemGuardTestBeginWrites(Device* adapter) {
     if(adapter!=&guardTestPartition || guardTestPhase!=GuardTestPhase::Preparation)return false;
     guardTestPhase=GuardTestPhase::Writing;return true;
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool AhciSystemGuardBeginAttempt(Device* adapter) {
+    static bool attemptStarted=false;
+    if(__atomic_exchange_n(&attemptStarted,true,__ATOMIC_ACQ_REL) || adapter!=&guardTestPartition || !guardReady ||
+       guardTestPhase!=GuardTestPhase::Finished || guardDataPhase!=GuardDataPhase::Disabled)return false;
+    guardTestPhase=GuardTestPhase::Writing;return true;
+}
+#endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 bool AhciSystemGuardPanicTestArm(Device* adapter,const uint64_t* sectors,uint32_t count) {
     return adapter==&guardTestPartition && guardReady && guardTestPhase==GuardTestPhase::Writing &&

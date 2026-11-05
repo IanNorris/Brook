@@ -37,6 +37,9 @@ AhciGuardDataState AhciSystemGuardDataState(Device* reserved);
 // writes until the one-shot, checker-authorized transaction.
 Device* AhciSystemGuardTestPrepare(Device* reserved);
 bool AhciSystemGuardTestBeginWrites(Device* adapter);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+bool AhciSystemGuardBeginAttempt(Device* adapter);
+#endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 bool AhciSystemGuardPanicTestArm(Device* adapter,const uint64_t* sectors,uint32_t count);
 #endif

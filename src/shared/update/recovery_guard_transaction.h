@@ -11,6 +11,7 @@
 // this stateless function cannot enforce those requirements across calls.
 enum class BrookGuardBeginResult { Rejected, Uncertain, PendingDurable };
 enum class BrookGuardCompleteResult { Rejected, Uncertain, CleanDurable };
+enum class BrookGuardAttemptResult { Rejected, Uncertain, PendingDurable, Exhausted };
 
 template<typename IO>
 BrookGuardBeginResult BrookGuardBeginRepair(IO& io,const char* identity) {
@@ -36,6 +37,29 @@ BrookGuardBeginResult BrookGuardBeginRepair(IO& io,const char* identity) {
     return BrookGuardBeginResult::PendingDurable;
 }
 
+// Before every automatic repair attempt, durably consume one of a bounded
+// number of attempts. A torn or uncertain pair never authorizes a retry.
+// expected receives the exact newly durable pending record only on success.
+template<typename IO>
+BrookGuardAttemptResult BrookGuardBeginAttempt(IO& io,const char* identity,uint32_t maximum,uint8_t* expected) {
+    if(!expected || !maximum || maximum>3)return BrookGuardAttemptResult::Rejected;
+    for(unsigned i=0;i<BROOK_RECOVERY_GUARD_SIZE;++i)expected[i]=0;
+    uint8_t a[BROOK_RECOVERY_GUARD_SIZE],b[BROOK_RECOVERY_GUARD_SIZE];
+    if(!io.Read(0,a,sizeof(a)) || !io.Read(1,b,sizeof(b)) ||
+       !BrookRecoveryGuardMatchesPending(a,sizeof(a),b,sizeof(b),identity))return BrookGuardAttemptResult::Rejected;
+    const uint32_t attempts=BrookUpdateGet32(a+20);
+    if(attempts>=maximum)return BrookGuardAttemptResult::Exhausted;
+    BrookUpdatePut32(a+20,attempts+1);BrookUpdatePut32(a+124,BrookUpdateCrc(a,124));
+    for(unsigned slot=0;slot<2;++slot) {
+        if(!io.Write(slot,a,sizeof(a)) || !io.Sync(slot) ||
+           !io.Read(slot,b,sizeof(b)) || !BrookUpdateEqual(a,b,sizeof(a)))return BrookGuardAttemptResult::Uncertain;
+    }
+    if(!io.Flush() || !io.Read(0,b,sizeof(b)) || !BrookUpdateEqual(a,b,sizeof(a)) ||
+       !io.Read(1,b,sizeof(b)) || !BrookUpdateEqual(a,b,sizeof(a)))return BrookGuardAttemptResult::Uncertain;
+    for(unsigned i=0;i<sizeof(a);++i)expected[i]=a[i];
+    return BrookGuardAttemptResult::PendingDurable;
+}
+
 // The caller must first have durably completed and independently verified the
 // repair, drained every checker and permanently disabled data writes. Expected
 // is the exact pending record retained from this repair attempt, not a record
@@ -49,6 +73,7 @@ BrookGuardCompleteResult BrookGuardCompleteRepair(IO& io,const char* identity,
     if(BrookUpdateGet32(clean+16)!=BROOK_RECOVERY_GUARD_PENDING ||
        BrookUpdateGet32(clean+124)!=BrookUpdateCrc(clean,124))return BrookGuardCompleteResult::Rejected;
     BrookUpdatePut32(clean+16,BROOK_RECOVERY_GUARD_CLEAN);
+    BrookUpdatePut32(clean+20,0);
     BrookUpdatePut32(clean+124,BrookUpdateCrc(clean,124));
     if(!BrookRecoveryGuardAllowsNormal(clean,sizeof(clean),clean,sizeof(clean),identity) ||
        !io.Read(0,a,sizeof(a)) || !io.Read(1,b,sizeof(b)) ||

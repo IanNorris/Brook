@@ -12,15 +12,33 @@
 static inline int BrookRecoveryGuardValid(const uint8_t* p, BrookUpdateSize n) {
     static const uint8_t magic[8]={'B','R','K','R','C','V','0','1'};
     if(!p || n!=BROOK_RECOVERY_GUARD_SIZE || !BrookUpdateEqual(p,magic,8) ||
-       !BrookUpdateGet64(p+8) || BrookUpdateGet32(p+20))return 0;
+       !BrookUpdateGet64(p+8))return 0;
     const uint32_t state=BrookUpdateGet32(p+16);
     if(state<BROOK_RECOVERY_GUARD_CLEAN || state>BROOK_RECOVERY_GUARD_FAILED)return 0;
+    const uint32_t attempts=BrookUpdateGet32(p+20);
+    if((state!=BROOK_RECOVERY_GUARD_PENDING && attempts) || attempts>3)return 0;
     for(unsigned id=0;id<3;++id) {
         unsigned nonzero=0;for(unsigned i=0;i<16;++i)nonzero|=p[24+id*16+i];
         if(!nonzero)return 0;
     }
     for(unsigned i=72;i<124;++i)if(p[i])return 0;
     return BrookUpdateGet32(p+124)==BrookUpdateCrc(p,124);
+}
+
+// A matching pending pair is never normal-boot authority. It can be considered
+// for a bounded new repair attempt only after the independent FAT check and
+// whole-disk reservation have succeeded.
+static inline int BrookRecoveryGuardAllowsNormal(const uint8_t*,BrookUpdateSize,const uint8_t*,BrookUpdateSize,const char*);
+static inline int BrookRecoveryGuardMatchesPending(const uint8_t* a,BrookUpdateSize an,
+                                                    const uint8_t* b,BrookUpdateSize bn,
+                                                    const char* identity) {
+    if(!BrookRecoveryGuardValid(a,an) || !BrookRecoveryGuardValid(b,bn) ||
+       !BrookUpdateEqual(a,b,BROOK_RECOVERY_GUARD_SIZE) || BrookUpdateGet32(a+16)!=BROOK_RECOVERY_GUARD_PENDING)return 0;
+    uint8_t clean[BROOK_RECOVERY_GUARD_SIZE];
+    for(unsigned i=0;i<sizeof(clean);++i)clean[i]=a[i];
+    BrookUpdatePut32(clean+16,BROOK_RECOVERY_GUARD_CLEAN);BrookUpdatePut32(clean+20,0);
+    BrookUpdatePut32(clean+124,BrookUpdateCrc(clean,124));
+    return BrookRecoveryGuardAllowsNormal(clean,sizeof(clean),clean,sizeof(clean),identity);
 }
 
 static inline int BrookRecoveryGuardAllowsNormal(const uint8_t* a,BrookUpdateSize an,

@@ -18,7 +18,7 @@ from pathlib import Path
 
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
-         network_port=None,on_marker=None,network_usb=False):
+         network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -57,11 +57,8 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         try:
             deadline = time.monotonic() + timeout
             send_until = time.monotonic() + 12
+            intermediate_done=False
             while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise RuntimeError('QEMU exited before the expected boot marker: ' +
-                                       (work / 'qemu.log').read_text(errors='replace')[-2000:] +
-                                       '\nserial tail: ' + (serial.read_text(errors='replace')[-3000:] if serial.exists() else ''))
                 if recovery and monitor.exists() and time.monotonic() < send_until:
                     try:
                         with socket.socket(socket.AF_UNIX) as connection:
@@ -75,7 +72,11 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                     raise RuntimeError(f'boot reported {failure_marker!r}; serial tail: {data[-10000:]!r}')
                 if forbidden and forbidden.encode() in data:
                     raise RuntimeError(f'unexpected boot marker {forbidden!r}')
+                if intermediate_marker and not intermediate_done and intermediate_marker.encode() in data:
+                    intermediate_done=True
+                    if on_intermediate:on_intermediate()
                 if marker.encode() in data:
+                    if intermediate_marker and not intermediate_done:raise RuntimeError('expected intermediate boot marker was absent')
                     if on_marker:on_marker()
                     if expect_reset:
                         try: status=process.wait(timeout=15)
@@ -91,6 +92,10 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
                             raise RuntimeError(f'unexpected boot marker {forbidden!r}')
                         time.sleep(0.1)
                     return
+                if process.poll() is not None:
+                    raise RuntimeError('QEMU exited before the expected boot marker: ' +
+                                       (work / 'qemu.log').read_text(errors='replace')[-2000:] +
+                                       '\nserial tail: ' + (serial.read_text(errors='replace')[-3000:] if serial.exists() else ''))
                 time.sleep(0.2)
             raise RuntimeError(f'timed out waiting for {marker!r}; serial tail: {data[-10000:]!r}')
         finally:
