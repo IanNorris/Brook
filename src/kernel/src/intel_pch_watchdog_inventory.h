@@ -25,6 +25,15 @@ bool PchWatchdogReadStable(const PchWatchdogInventory& boot,Read32 read,PchWatch
     if(id1!=0x9cc38086u || id2!=id1 || a==0xffffffffu || b==0xffffffffu || a!=c || b!=d)return false;
     out={true,a,b};return true;
 }
+// RCBA is a separate PCI configuration register. This reports only two
+// matching raw reads after identity checks; it never maps or accesses RCBA.
+template<class Read32>
+bool PchWatchdogReadRcba(const PchWatchdogInventory& boot,Read32 read,uint32_t& out) {
+    out=0;if(!boot.captured)return false;
+    const uint32_t id1=read(0),first=read(0xf0),id2=read(0),second=read(0xf0);
+    if(id1!=0x9cc38086u || id2!=id1 || first==0xffffffffu || first!=second)return false;
+    out=first;return true;
+}
 struct PchWatchdogStatus {uint16_t base=0,control=0,status2=0,timer=0;uint32_t smiEnable=0;};
 // Read only fixed v2 TCO words after the exact device and decode have been
 // checked, and independently cross-check the FADT PM timer address. The

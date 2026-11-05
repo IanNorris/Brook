@@ -23,6 +23,13 @@ int main() {
     assert(!brook::PchWatchdogReadStable(result,changing,live) && !live.captured);
     auto missing=[](uint8_t) {return 0xffffffffu;};
     assert(!brook::PchWatchdogReadStable(result,missing,live));
+    uint32_t rcba=7;unsigned rcbaReads=0;
+    auto rcbaPci=[&](uint8_t offset){++rcbaReads;assert(offset==0 || offset==0xf0);return offset==0?0x9cc38086u:0xfed1c001u;};
+    assert(!brook::PchWatchdogReadRcba(brook::PchWatchdogInventory{},rcbaPci,rcba) && rcba==0 && rcbaReads==0);
+    assert(brook::PchWatchdogReadRcba(result,rcbaPci,rcba) && rcba==0xfed1c001u && rcbaReads==4);
+    auto unstableRcba=[n=0u](uint8_t offset) mutable {return offset==0?0x9cc38086u:++n;};
+    assert(!brook::PchWatchdogReadRcba(result,unstableRcba,rcba) && rcba==0);
+    assert(!brook::PchWatchdogReadRcba(result,missing,rcba) && rcba==0);
     unsigned ioReads=0;auto io=[&](uint16_t port) {++ioReads;assert(port==0x1868 || port==0x1866 || port==0x1872);return uint16_t(port);};
     unsigned smiReads=0;auto smi=[&](uint16_t port){++smiReads;assert(port==0x1830);return 0x2001u;};
     brook::PchWatchdogStatus status{};

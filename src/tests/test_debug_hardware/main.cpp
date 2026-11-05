@@ -116,7 +116,7 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
     out->command=7;return true;
 }
 extern "C" uint32_t PciConfigRead32(uint8_t bus,uint8_t dev,uint8_t fn,uint8_t offset){
-    assert(bus==0 && dev==31 && fn==0);return offset==0?0x9cc38086u:offset==0x40?0x1801u:0x80u;
+    assert(bus==0 && dev==31 && fn==0);return offset==0?0x9cc38086u:offset==0x40?0x1801u:offset==0xf0?0xfed1c001u:0x80u;
 }
 int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t stride,uint32_t* total,uint32_t* dropped){
     *total=2;*dropped=0;if(*cursor>2)return -22;
@@ -185,6 +185,7 @@ int main(){
     assert(handle("bridge hardware pch-watchdog-status") && reply.find("pch_watchdog_error")!=std::string::npos && pchPortReads==0 && pchSmiReads==0);
     pchPresent=true;
     assert(handle("bridge hardware pch-watchdog-pci") && reply.find("\"live_raw_40\":6145,\"live_raw_44\":128,\"changed\":false")!=std::string::npos);
+    assert(reply.find("\"rcba_config_stable\":true,\"rcba_config\":4275159041")!=std::string::npos);
     assert(handle("bridge hardware pch-watchdog-status") && reply.find("\"pmbase\":6144,\"control\":6248,\"status2\":6246,\"timer\":6258,\"smi_enable\":8193")!=std::string::npos && pchPortReads==3 && pchSmiReads==2);
     pchPresent=false;
     assert(handle("bridge hardware pci 2 16") && reply.find("\"devices\":[]")!=std::string::npos);

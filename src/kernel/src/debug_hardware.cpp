@@ -594,6 +594,11 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("boot_raw_44",match.pchWatchdog.pci44);
         r.text(",");r.field("live_raw_40",live.pci40);r.text(",");r.field("live_raw_44",live.pci44);
         r.text(",\"changed\":");r.text((live.pci40!=match.pchWatchdog.pci40 || live.pci44!=match.pchWatchdog.pci44)?"true":"false");
+        uint32_t rcba=0;
+        const bool rcbaStable=PchWatchdogReadRcba(match.pchWatchdog,
+            [](uint8_t offset){return PciConfigRead32(0,31,0,offset);},rcba);
+        r.text(",\"rcba_config_stable\":");r.text(rcbaStable?"true":"false");
+        if(rcbaStable){r.text(",");r.field("rcba_config",rcba);}
         r.text("}\n");r.send();return true;
     }
     if(Prefix(command,pciPrefix)){
