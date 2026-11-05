@@ -56,6 +56,7 @@ def main():
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
+    parser.add_argument('--auto-desktop-shutdown',action='store_true',help='Perform checked shutdown through the desktop bridge')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
@@ -71,6 +72,8 @@ def main():
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
         parser.error('startup-script failure requires the desktop bridge fixture')
+    if a.auto_desktop_shutdown and (not a.auto_desktop_network_module or a.auto_desktop_script_fail):
+        parser.error('checked shutdown requires a successful desktop bridge fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):parser.error('invalid fixture identity')
     if a.image.is_symlink() or a.image.stat().st_size!=128*1024*1024:parser.error('expected disposable 128 MiB fixture')
     check_pair(a.desktop_pair,a.identity,a.auto_desktop);check_pair(a.recovery_pair,a.identity,True)
@@ -256,7 +259,18 @@ def main():
                 job=bridge.guest_run(session,uuid.uuid4().hex,['/boot/GDSVC.ELF'],cwd='/',uid=1000,wait_s=10)
                 if job.get('state')!='completed' or job.get('exit',{}).get('code')!=0 or 'GUARD_DESKTOP_SERVICE_PASS' not in job.get('stdout',{}).get('text',''):
                     raise RuntimeError('desktop bridge guest job did not complete: '+str(job))
-                (a.output/'bridge-transition.json').write_text(json.dumps({'before':bridge_state['before'],'after':doctor,'job':job},indent=2)+'\n')
+                evidence={'before':bridge_state['before'],'after':doctor,'job':job}
+                if a.auto_desktop_shutdown:
+                    request=uuid.uuid4().hex;state=bridge.power(session,request,'shutdown');deadline=time.monotonic()+60
+                    while state.get('state')!='ready':
+                        if state.get('state')=='failed' or time.monotonic()>=deadline:
+                            raise RuntimeError('checked desktop shutdown did not reach ready: '+str(state))
+                        time.sleep(.2);state=bridge.power(session,request,'status')
+                    final=bridge.doctor(session)['guest']['writable_desktop']
+                    if not final.get('clean_finalized') or final.get('dirty_session') or final.get('state_uncertain') or final.get('final_error'):
+                        raise RuntimeError('desktop did not report a clean final sync: '+str(final))
+                    evidence.update(shutdown=state,final_desktop=final)
+                (a.output/'bridge-transition.json').write_text(json.dumps(evidence,indent=2)+'\n')
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status='+('-1' if a.auto_desktop_script_fail else '0'),120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
                  network_port=network_port,intermediate_marker='GUARD_DESKTOP_BRIDGE_TEST_WINDOW',
@@ -307,6 +321,11 @@ def main():
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
                 raise RuntimeError('desktop panic recovery changed the journal')
         with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
+        if a.auto_desktop_shutdown:
+            with partition.open('rb') as source:
+                source.seek(1024+58)
+                if source.read(2)!=b'\x01\x00':raise RuntimeError('checked shutdown did not persist the clean marker')
+            if 'AHCI_DIRECT_SESSION_CLEAN' not in serial:raise RuntimeError('checked shutdown did not complete direct sync')
         subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if not a.auto_desktop_panic:
             content=subprocess.check_output(['debugfs','-R','cat /home/brook/SERVICE.TXT',str(partition)],stderr=subprocess.DEVNULL)
@@ -314,6 +333,20 @@ def main():
         fat=work/'esp.img'
         with disk.open('rb') as src,fat.open('wb') as dst:src.seek(2048*512);dst.write(src.read(131072*512))
         subprocess.run(['fsck.fat','-n',str(fat)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.auto_desktop_shutdown:
+            # Boot the same clean disk through a QEMU snapshot so this final
+            # check cannot modify the already-verified source image.
+            digest=hashlib.sha256(disk.read_bytes()).hexdigest()
+            third=work/'checked-reboot';third.mkdir()
+            boot(disk,a.firmware,third,False,'GUARD_DESKTOP_SERVICE_PASS',120,True,sata_snapshot=True,
+                 hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
+            third_text=(third/'serial.log').read_text(errors='replace')
+            if ('GUARD_CHECK_RESULT exit=0' not in third_text or 'GUARD_DESKTOP_HANDOFF_SCRIPT status=0' not in third_text or
+                'Recovery required; normal boot blocked.' in third_text):
+                raise RuntimeError('checked desktop did not return after clean shutdown')
+            if hashlib.sha256(disk.read_bytes()).hexdigest()!=digest:
+                raise RuntimeError('snapshot reboot modified the verified source disk')
+            shutil.copyfile(third/'serial.log',a.output/'checked-reboot-serial.log')
         print('GUARD_DESKTOP_SHUTDOWN_PANIC_INHIBITED_PASS' if a.auto_desktop_shutdown_panic else
               'GUARD_DESKTOP_PANIC_RESET_PASS' if a.auto_desktop_reset else
               'GUARD_DESKTOP_PANIC_CAPTURE_PASS' if a.auto_desktop_panic else 'GUARD_REPAIR_TO_DESKTOP_PASS')
