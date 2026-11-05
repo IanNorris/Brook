@@ -128,6 +128,13 @@ AhciDataInspection largeInspection{};bool largeInspectionClean=false;
 bool largeDesktopReady=false;
 #endif
 bool directPrepared=false,directLeased=false,directReady=false;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+// Test-only handoff retains the existing data reservation owner; the ordinary
+// desktop adapter is not itself allowed to replace or broaden that lease.
+Device* guardDesktopLeaseOwner=nullptr;
+enum class GuardDesktopPhase : uint8_t {Disabled,Preparing,Ready,Failed};
+GuardDesktopPhase guardDesktopPhase=GuardDesktopPhase::Disabled;
+#endif
 uint8_t largeUuid[16]{};LargeDataSession largeSession{};
 uint8_t selectedDataDiskGuid[16]{},selectedDataPartGuid[16]{};
 Range largeRange{};
@@ -137,7 +144,14 @@ int LargeRead(Device*,uint64_t offset,void* data,uint64_t length) {
 }
 int LargeWrite(Device* dev,uint64_t offset,const void* data,uint64_t length) {
     if(!largeRange.parent || offset>largeRange.bytes || length>largeRange.bytes-offset)return -22;
-    return directLeased?DeviceWriteLeased(largeRange.parent,dev,largeRange.start+offset,data,length):
+    Device* owner=dev;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    if(guardDesktopLeaseOwner) {
+        if(guardDesktopPhase!=GuardDesktopPhase::Preparing && guardDesktopPhase!=GuardDesktopPhase::Ready)return -30;
+        owner=guardDesktopLeaseOwner;
+    }
+#endif
+    return directLeased?DeviceWriteLeased(largeRange.parent,owner,largeRange.start+offset,data,length):
         DeviceWrite(largeRange.parent,largeRange.start+offset,data,length);
 }
 int LargeControl(Device*,uint32_t request,void*) {
@@ -526,6 +540,27 @@ bool AhciSystemDirectDesktopMount(uint8_t* nextDrive) {
     KPrintf("ahci direct: ready bytes=%lu drive=%u home=/data/home (persistent)\n",largeRange.bytes,drive);
     return true;
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive) {
+    static bool desktopAttempted=false;
+    if(__atomic_exchange_n(&desktopAttempted,true,__ATOMIC_ACQ_REL) || adapter!=&guardTestPartition ||
+       guardTestPhase!=GuardTestPhase::Writing || guardDataPhase!=GuardDataPhase::Disabled ||
+       !guardReady || !nextDrive || directPrepared || directReady ||
+       AhciSystemGuardDataState(&guardPartition)!=AhciGuardDataState::Clean ||
+       DeviceFind("ahci-data"))return false;
+    largePartition.name="ahci-data";
+    if(!DeviceRegister(&largePartition))return false;
+    largeRange=guardDataRange;guardDesktopLeaseOwner=&guardDataPartition;
+    directLeased=true;directPrepared=true;guardDesktopPhase=GuardDesktopPhase::Preparing;
+    const bool ready=AhciSystemDirectDesktopMount(nextDrive);
+    guardDesktopPhase=ready?GuardDesktopPhase::Ready:GuardDesktopPhase::Failed;
+    return ready;
+}
+int AhciSystemGuardTestFailedDesktopWrite() {
+    if(guardDesktopPhase!=GuardDesktopPhase::Failed)return -22;
+    const uint8_t byte=0xa5;return DeviceWrite(&largePartition,0,&byte,1);
+}
+#endif
 int AhciSystemDirectFinalSync() {
     if(!directReady)return 0;
     const int error=largeSession.Finish(LargeIo(),DeviceFinalSyncOwner());

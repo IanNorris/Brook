@@ -240,7 +240,10 @@ void Worker(void* arg) {
         const bool capture=journalSize==6 && !memcmp(journalMode,"test-3",6);
         const bool denyCapture=journalSize==6 && !memcmp(journalMode,"test-4",6);
         const bool failedPublish=journalSize==6 && !memcmp(journalMode,"test-5",6);
-        const bool publish=capture || denyCapture || failedPublish || (journalSize==6 && !memcmp(journalMode,"test-2",6));
+        const bool desktopPanic=journalSize==6 && !memcmp(journalMode,"test-7",6);
+        const bool desktopFailed=journalSize==6 && !memcmp(journalMode,"test-8",6);
+        const bool desktop=desktopPanic || desktopFailed || (journalSize==6 && !memcmp(journalMode,"test-6",6));
+        const bool publish=capture || denyCapture || failedPublish || desktop || (journalSize==6 && !memcmp(journalMode,"test-2",6));
         if(!pinOnly && !publish) {
             AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
         }
@@ -262,6 +265,27 @@ void Worker(void* arg) {
             KPrintf("GUARD_JOURNAL_PUBLISH_MOUNT status=%d\n",publishResult);
             if(!publishResult && FatFsPrivateRecoveryPublishJournalTest(mount)!=-22)publishResult=-5;
             if(!publishResult && !AhciSystemGuardTestBeginWrites(adapter))publishResult=-13;
+            if(desktop && !publishResult) {
+                const int armed=FatFsPrivateRecoveryArmJournalTest(mount);
+                uint8_t drive=2;
+                const bool mounted=!armed && AhciSystemGuardTestMountDesktop(adapter,&drive);
+                if(desktopFailed) {
+                    const int denied=AhciSystemGuardTestFailedDesktopWrite();
+                    KPrintf("GUARD_JOURNAL_DESKTOP_FAILED mounted=%u write=%d\n",mounted?1u:0u,denied);return;
+                }
+                if(!mounted) {
+                    KPrintf("GUARD_JOURNAL_DESKTOP_FAIL arm=%d\n",armed);return;
+                }
+                VfsPath root{};int error=VfsPathRoot(&root);
+                int openError=0;auto* file=!error?VfsOpenAt(root,root,"/data/home/GUARD.TXT",VFS_O_WRITE|VFS_O_CREATE,0644,0,&openError):nullptr;
+                constexpr char witness[]="guarded desktop handoff\n";uint64_t offset=0;
+                if(!file || VfsWrite(file,witness,sizeof(witness)-1,&offset)!=int(sizeof(witness)-1) || VfsFsync(file))error=-5;
+                if(file)VfsClose(file);VfsPathRelease(root);
+                if(error){KPrintf("GUARD_JOURNAL_DESKTOP_FAIL write=%d open=%d\n",error,openError);return;}
+                KPuts("GUARD_JOURNAL_DESKTOP_PASS\n");
+                if(desktopPanic)KernelPanic("guarded desktop handoff panic");
+                return;
+            }
             if(!publishResult) {
                 VfsPath root{};publishResult=VfsPathRoot(&root);
                 int aliasError=0;
