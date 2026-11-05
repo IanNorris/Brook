@@ -28,6 +28,8 @@ def main():
     parser.add_argument('--kernel', type=Path, required=True)
     parser.add_argument('--firmware', type=Path, required=True)
     parser.add_argument('--compiler', default='x86_64-unknown-linux-musl-gcc')
+    parser.add_argument('--guard-provision-test', type=Path,
+                        help='Exercise the first-time guard provisioner on this disposable disk')
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
     source, kernel, firmware = (p.resolve(strict=True) for p in (args.image, args.kernel, args.firmware))
@@ -87,12 +89,19 @@ def main():
             item.write_text(content)
             subprocess.run(['mcopy', '-o', '-i', str(initrd), str(item), '::/ETC/' + name], check=True)
         init = d / 'INIT.RC'
-        init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/IDLEQA.ELF /data/home/IDLE.TXT\n')
+        identity = disk_guid + uuid.UUID(data_part['uuid']).bytes_le.hex() + fs_uuid.hex()
+        if args.guard_provision_test:
+            init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/GUARDP.ELF ' + identity + '\n')
+        else:
+            init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/IDLEQA.ELF /data/home/IDLE.TXT\n')
         subprocess.run(['mcopy', '-o', '-i', str(initrd), str(init), '::/BOOT/INIT.RC'], check=True)
-        binary = d / 'idle.elf'
-        subprocess.run([args.compiler, '-static', '-O2', str(ROOT / 'scripts/workloads/ext2_idle_flush.c'),
-                        '-o', str(binary)], check=True)
-        subprocess.run(['mcopy', '-o', '-i', str(initrd), str(binary), '::/BOOT/IDLEQA.ELF'], check=True)
+        if args.guard_provision_test:
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(args.guard_provision_test.resolve(strict=True)),'::/BOOT/GUARDP.ELF'],check=True)
+        else:
+            binary = d / 'idle.elf'
+            subprocess.run([args.compiler, '-static', '-O2', str(ROOT / 'scripts/workloads/ext2_idle_flush.c'),
+                            '-o', str(binary)], check=True)
+            subprocess.run(['mcopy', '-o', '-i', str(initrd), str(binary), '::/BOOT/IDLEQA.ELF'], check=True)
         subprocess.run(['mcopy', '-o', '-i', esp, str(initrd), '::/INITRD.IMG'], check=True)
         subprocess.run(['mcopy', '-o', '-i', esp, str(kernel), '::/KERNEL/BROOK.ELF'], check=True)
         variables = d / 'vars.fd'
@@ -113,12 +122,13 @@ def main():
                 deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
                     output = serial.read_text(errors='replace') if serial.exists() else ''
-                    if 'IDLE_FLUSH_OK' in output:
+                    success = 'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK'
+                    if success in output:
                         if 'ahci direct: ready' not in output:
                             raise RuntimeError('the intended direct data volume was not mounted')
                         print('\n'.join(line for line in output.splitlines() if 'IDLE_' in line), flush=True)
                         break
-                    if any(x in output for x in ('IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED')):
+                    if any(x in output for x in ('IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH')):
                         raise RuntimeError(output[-4500:])
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited: ' + output[-4500:])
@@ -129,6 +139,23 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+        if args.guard_provision_test:
+            import struct, zlib
+            media = f'{sata}@@{esp_part["start"]*512}'
+            a = subprocess.check_output(['mtype','-i',media,'::/RECOVERY/GUARD0.BIN'])
+            b = subprocess.check_output(['mtype','-i',media,'::/RECOVERY/GUARD1.BIN'])
+            if len(a)!=128 or a!=b or a[:8]!=b'BRKRCV01' or a[24:72]!=bytes.fromhex(identity) or struct.unpack_from('<I',a,124)[0]!=zlib.crc32(a[:124]):
+                raise RuntimeError('offline guard records do not match')
+            fat = d / 'fat.img'
+            with sata.open('rb') as source, fat.open('wb') as target:
+                source.seek(esp_part['start']*512);remaining=esp_part['size']*512
+                while remaining:
+                    block=source.read(min(1024*1024,remaining))
+                    if not block:raise RuntimeError('short FAT partition read')
+                    target.write(block);remaining-=len(block)
+            subprocess.run(['fsck.fat','-n',str(fat)],check=True,timeout=30,stdout=subprocess.DEVNULL)
+            print('guard provisioning and offline readback: PASS')
+            return
         with sata.open('rb') as input_file, part.open('wb') as output:
             input_file.seek(data_part['start'] * 512)
             remaining = data_part['size'] * 512
