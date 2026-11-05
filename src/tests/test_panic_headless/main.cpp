@@ -24,7 +24,8 @@ int main() {
     assert(!brook::PanicCapturedPacket(&captured,&capturedBytes));
     brook::PanicCPURegs regs{}; regs.rip=0x12345678; regs.rsp=0x87654321;
     brook::PanicStackTrace trace{};trace.depth=1;trace.rip[0]=0x12345678;
-    brook::PanicRenderQR(nullptr,0,0,0,&regs,&trace);
+    char message[520];std::memset(message,'X',sizeof(message));
+    brook::PanicRenderQR(nullptr,0,0,0,&regs,&trace,nullptr,nullptr,nullptr,nullptr,nullptr,message);
     const auto pos=output.find("PANIC_HEX:"); assert(pos!=std::string::npos);
     const auto end=output.find('\n',pos);assert(end!=std::string::npos);
     std::vector<unsigned char> bytes;
@@ -48,5 +49,17 @@ int main() {
     assert(header.type==brook::QR_PACKET_TYPE_CPU_REGS && header.size==sizeof(regs));
     brook::PanicCPURegs decoded{};memcpy(&decoded,raw.data()+sizeof(header),sizeof(decoded));
     assert(decoded.rip==regs.rip && decoded.rsp==regs.rsp);
+    size_t at=0;bool found=false;
+    while(at+sizeof(header)<=raw.size()) {
+        std::memcpy(&header,raw.data()+at,sizeof(header));at+=sizeof(header);
+        assert(header.size<=raw.size()-at);
+        if(header.type==brook::QR_PACKET_TYPE_MESSAGE) {
+            assert(!found && header.size==brook::PANIC_MESSAGE_MAX_BYTES);
+            for(size_t i=0;i<header.size;i++)assert(raw[at+i]=='X');
+            found=true;
+        }
+        at+=header.size;
+    }
+    assert(found && at==raw.size());
     puts("headless panic packet: PASS");
 }

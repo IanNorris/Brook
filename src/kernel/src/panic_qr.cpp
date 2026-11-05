@@ -50,8 +50,11 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                                   const PanicProcessList* procList,
                                   const PanicSystemInfo* sysInfo,
                                   const PanicStackDump* stackDump,
-                                  const PanicCpuList* cpuList)
+                                  const PanicCpuList* cpuList,
+                                  const char* message)
 {
+    uint32_t messageLen=0;
+    if(message) while(messageLen<PANIC_MESSAGE_MAX_BYTES && message[messageLen]) ++messageLen;
     uint32_t tracePayloadSize = 1 + trace->depth * 8;
 
     uint32_t needed = sizeof(PanicPacketHeader) + sizeof(PanicCPURegs)
@@ -65,6 +68,7 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
     if (cpuList) needed += sizeof(PanicPacketHeader) + 1
                          + cpuList->count * sizeof(PanicCpuEntry);
     if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackDump->length;
+    if (messageLen) needed += sizeof(PanicPacketHeader) + messageLen;
 
     if (bufLen < needed) return 0;
 
@@ -165,6 +169,12 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
         appendRaw(stackDump->data, stackDump->length);
     }
 
+    if (messageLen) {
+        ph.type = QR_PACKET_TYPE_MESSAGE;
+        ph.size = messageLen;
+        appendRaw(&ph, sizeof(ph));
+        appendRaw(message, messageLen);
+    }
     return off;
 }
 
@@ -260,7 +270,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicProcessList* procList,
                    const PanicSystemInfo* sysInfo,
                    const PanicStackDump* stackDump,
-                   const PanicCpuList* cpuList)
+                   const PanicCpuList* cpuList,
+                   const char* message)
 {
     __atomic_store_n(&g_capturedPacketBytes, 0, __ATOMIC_RELEASE);
     SerialPrintf("PANIC QR: %ux%u fb, preferred %u px/module\n",
@@ -270,7 +281,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     static uint8_t payloadBuf[4096];
     uint32_t payloadLen = BuildPanicPayload(payloadBuf, sizeof(payloadBuf),
                                             regs, trace, excInfo, procList,
-                                            sysInfo, stackDump, cpuList);
+                                            sysInfo, stackDump, cpuList, message);
     if (payloadLen == 0)
     {
         SerialPuts("PANIC QR: payload build failed\n");

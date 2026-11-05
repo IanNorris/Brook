@@ -38,6 +38,8 @@ static constexpr uint32_t QR_PACKET_TYPE_STACK_DUMP     = 0xA3000006;
 // so new extensions are backward/forward compatible by construction.
 static constexpr uint32_t QR_PACKET_TYPE_PROCESS_EXT    = 0xA3000007; // BRO-176 reap gates
 static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU RIP/CR3/pid
+static constexpr uint32_t QR_PACKET_TYPE_MESSAGE        = 0xA3000009; // bounded panic reason bytes
+static constexpr uint32_t PANIC_MESSAGE_MAX_BYTES       = 511;
 
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //
@@ -219,7 +221,8 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                    const PanicProcessList* procList = nullptr,
                    const PanicSystemInfo* sysInfo = nullptr,
                    const PanicStackDump* stackDump = nullptr,
-                   const PanicCpuList* cpuList = nullptr);
+                   const PanicCpuList* cpuList = nullptr,
+                   const char* message = nullptr);
 
 // Fill a PanicCpuList from current kernel state (per-CPU process + CR3, and the
 // NMI-captured spin RIP if available). Safe to call from the panicking CPU after

@@ -576,7 +576,7 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
         static brook::PanicCpuList cpuList;
         brook::PanicCaptureCpuList(&cpuList);
         brook::PanicRenderQR(nullptr, 0, 0, 0, &fullRegs, &trace,
-                             nullptr, nullptr, nullptr, nullptr, &cpuList);
+                             nullptr, nullptr, nullptr, nullptr, &cpuList, g_panicBuf);
     }
 
 #if defined(BROOK_AHCI_PANIC_TEST)

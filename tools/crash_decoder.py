@@ -59,6 +59,7 @@ PKT_SYSTEM_INFO    = 0xA3000005
 PKT_STACK_DUMP     = 0xA3000006
 PKT_PROCESS_EXT    = 0xA3000007  # BRO-176 reap-gate fields, merged onto PROCESS_LIST by pid
 PKT_CPU_STATE      = 0xA3000008  # per-CPU RIP/CR3/pid
+PKT_MESSAGE        = 0xA3000009  # bounded panic reason, UTF-8 bytes
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -596,7 +597,8 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
                  proc_list: ProcessList | None = None,
                  sys_info: SystemInfo | None = None,
                  stack_dump: StackDump | None = None,
-                 cpu_list: "CpuList | None" = None):
+                 cpu_list: "CpuList | None" = None,
+                 message: str | None = None):
     bar = "═" * (W + 4)
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
@@ -608,6 +610,10 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
         version_str += f"  Build: {build_id}"
     print(f"  {C.DIM}{version_str:^{W + 4}}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{bar}{C.RESET}\n")
+
+    if message is not None:
+        safe_message = json.dumps(message, ensure_ascii=True)[1:-1]
+        print(f"  {C.RED}{C.BOLD}Panic reason:{C.RESET} {safe_message}\n")
 
     # System info
     if sys_info:
@@ -769,7 +775,8 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                proc_list: ProcessList | None = None,
                sys_info: SystemInfo | None = None,
                stack_dump: StackDump | None = None,
-               cpu_list: "CpuList | None" = None) -> dict:
+               cpu_list: "CpuList | None" = None,
+               message: str | None = None) -> dict:
     out: dict = {
         "header": {
             "magic": f"0x{hdr.magic:02X}",
@@ -779,6 +786,8 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
             "compressed": hdr.version == PANIC_VERSION_LZ4,
         }
     }
+    if message is not None:
+        out["message"] = message
     if exc_info:
         out["exception"] = {
             "vector": exc_info.vector,
@@ -946,6 +955,7 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     stack_dump = None
     cpu_list = None
     proc_ext_data = None  # buffered until after the loop (may precede PROCESS_LIST)
+    message = None
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -976,6 +986,8 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             sys_info = SystemInfo(pkt_data)
         elif pkt.type == PKT_STACK_DUMP:
             stack_dump = StackDump(pkt_data)
+        elif pkt.type == PKT_MESSAGE:
+            message = pkt_data.decode('utf-8', errors='replace')
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -999,12 +1011,12 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
         print(json.dumps(build_json(hdr, regs, trace, sym,
                                     exc_info=exc_info, proc_list=proc_list,
                                     sys_info=sys_info, stack_dump=stack_dump,
-                                    cpu_list=cpu_list), indent=2))
+                                    cpu_list=cpu_list, message=message), indent=2))
     else:
         print_report(hdr, regs, trace, sym, data, show_raw,
                      exc_info=exc_info, proc_list=proc_list,
                      sys_info=sys_info, stack_dump=stack_dump,
-                     cpu_list=cpu_list)
+                     cpu_list=cpu_list, message=message)
 
 
 def parse_serial_log(path: str) -> bytes:

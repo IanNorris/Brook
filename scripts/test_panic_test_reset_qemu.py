@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
 """Exercise the explicitly armed panic reset on disposable QEMU disk copies."""
 import argparse
+from contextlib import redirect_stdout
+from io import StringIO
+import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT / 'tools'))
+import crash_decoder
+
+
+def check_reason(serial, expected):
+    packet=crash_decoder.parse_serial_log(str(serial))
+    output=StringIO()
+    with redirect_stdout(output):
+        crash_decoder.decode_crash(packet,None,False,True)
+    rendered=output.getvalue()
+    actual=json.loads(rendered[rendered.index('{'):]).get('message')
+    if actual!=expected:raise RuntimeError(f'panic reason differs: {actual!r}')
 
 
 def run_case(root, image, kernel, firmware, command, armed, timeout, verify_reboot=False):
@@ -101,10 +117,13 @@ def main():
             root = Path(temp) / name
             root.mkdir()
             run_case(root, image, kernel, firmware, command, armed, args.timeout)
+            check_reason(root/'serial.log', 'Unrecoverable kernel exception' if name=='exception' else
+                         f'SHELL: {command.split(" ",1)[1]}\n')
             print(f'{name}: PASS', flush=True)
         root = Path(temp) / 'reboot'
         root.mkdir()
         run_case(root, image, kernel, firmware, 'panic reboot_test', True, args.timeout, True)
+        check_reason(root/'serial.log', 'SHELL: reboot_test\n')
         print('reboot: PASS', flush=True)
 
 
