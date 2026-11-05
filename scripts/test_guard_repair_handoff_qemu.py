@@ -59,6 +59,7 @@ def main():
     parser.add_argument('--auto-desktop-serial-stall',action='store_true',help='Stall at serial packet output after the disk capture')
     parser.add_argument('--auto-desktop-nested-panic',action='store_true',help='Re-enter KernelPanic on the panic owner after disk capture')
     parser.add_argument('--auto-desktop-peer-panic',action='store_true',help='Model an existing owner and verify another CPU parks')
+    parser.add_argument('--auto-desktop-early-nested-panic',action='store_true',help='Re-enter panic before the initial peer halt')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -84,6 +85,8 @@ def main():
         parser.error('nested panic requires desktop panic and excludes other fixtures')
     if a.auto_desktop_peer_panic and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic):
         parser.error('peer panic requires desktop reset and excludes other fixtures')
+    if a.auto_desktop_early_nested_panic and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or a.auto_desktop_peer_panic):
+        parser.error('early nested panic requires desktop reset and excludes other fixtures')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
@@ -222,6 +225,51 @@ def main():
                 (a.output/'decoded-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_SERVICE_PASS',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',network_port=network_port,on_marker=retrieve)
+        elif a.auto_desktop_early_nested_panic:
+            kernel=a.desktop_pair/'KERNEL.ELF'
+            symbols=subprocess.check_output(['nm',str(kernel)],text=True)
+            def early_symbol(name):
+                matches=[int(line.split()[0],16) for line in symbols.splitlines() if line.split()[-1:]==[name]]
+                if len(matches)!=1:raise RuntimeError('missing early panic symbol '+name)
+                return matches[0]
+            launch=early_symbol('_ZN5brook15ShellExecScriptEPKc')
+            panic=early_symbol('KernelPanic');halt=early_symbol('_ZN5brook13SmpHaltAllAPsEv')
+            scratch=early_symbol('_ZN5brookL8g_kbdBufE')
+            gdb=second/'early-nested.gdb'
+            gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
+                           f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'
+                           f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
+                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n'
+                           f'hbreak *{halt:#x}\ncontinue\nset $rdi={scratch:#x}\nset $rip={panic:#x}\n'
+                           f'delete breakpoints\nhbreak *{halt:#x}\ncontinue\n'
+                           'set $halt_return=*(unsigned long long*)$rsp\ndelete breakpoints\n'
+                           'hbreak *$halt_return\ncontinue\nprintf "PANIC_NESTED_PEERS_HALTED %u\\n", $rax\n'
+                           'delete breakpoints\ndetach\nquit\n')
+            seen=[]
+            boot(disk,a.firmware,second,False,'PANIC_RECOVERY_RESET_WAIT',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,expect_reset=True,
+                 reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',on_marker=lambda:seen.append(time.monotonic()),
+                 extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-desktop-panic-reset,string=test-1'])
+            serial=(second/'serial.log').read_text(errors='replace')
+            debugger_log=(second/'qemu.log').read_text(errors='replace')
+            if ('PANIC_NESTED_PEERS_HALTED 1' not in debugger_log or '*** DOUBLE PANIC' not in serial or
+                not seen or time.monotonic()-seen[0]<4 or 'PANIC_DISK_CAPTURE_OK' in serial):
+                raise RuntimeError('early nested panic did not halt peers and wait before reset')
+            if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
+                raise RuntimeError('early nested panic unexpectedly changed the journal')
+            shutil.copyfile(second/'serial.log',a.output/'desktop-early-nested-serial.log')
+            (a.output/'desktop-early-nested-gdb.log').write_text(debugger_log)
+            retry=work/'early-nested-recovery';retry.mkdir()
+            boot(disk,a.firmware,retry,False,'GUARD_COMPLETE_RESTART',120,True,sata_snapshot=False,
+                 sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='GUARD_COMPLETE_RESTART',
+                 failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'])
+            shutil.copyfile(retry/'serial.log',a.output/'desktop-early-nested-recovery.log')
+            if 'GUARD_EXT2_VERIFIED_PENDING' not in (retry/'serial.log').read_text(errors='replace'):
+                raise RuntimeError('early nested recovery did not verify ext2')
+            with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
+            subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            print('GUARD_DESKTOP_EARLY_NESTED_RESET_PASS')
+            return
         elif a.auto_desktop_peer_panic:
             kernel=a.desktop_pair/'KERNEL.ELF'
             symbols=subprocess.check_output(['nm',str(kernel)],text=True)

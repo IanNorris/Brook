@@ -311,7 +311,12 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
             // The owner re-entered its panic handler; don't touch the journal.
             brook::SerialPanicPuts("\n*** DOUBLE PANIC (handler faulted) ***\n");
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-            if (brook::PanicRecoveryResetArmed()) brook::PanicTestResetAfterDump();
+            if (brook::PanicRecoveryResetArmed())
+            {
+                // Re-entry can precede the original panic's peer halt.
+                brook::SmpHaltAllAPs();
+                brook::PanicTestResetAfterDump();
+            }
 #endif
         }
         for (;;) { __asm__ volatile("hlt"); }
