@@ -102,6 +102,8 @@ def main():
                    help='Expect the isolated automatic-recovery kernel')
     p.add_argument('--guard-panic-journal', action='store_true',
                    help='Provision a disposable crash journal and require automatic recovery to arm it')
+    p.add_argument('--guard-journal-crosslink', action='store_true',
+                   help='Cross-link the journal on the private ESP and require read-only refusal')
     p.add_argument('--guard-panic-inject', action='store_true',
                    help='Inject a panic at the pending-repair entry using QEMU GDB')
     p.add_argument('--guard-panic-after-pending', action='store_true',
@@ -173,6 +175,8 @@ def main():
         p.error('automatic recovery kernel requires its checker fixture')
     if a.guard_panic_journal and not (a.guard_auto_kernel and a.guard_ext2_test and a.dirty):
         p.error('journal arming requires the dirty automatic recovery fixture')
+    if a.guard_journal_crosslink and (not a.guard_panic_journal or a.guard_panic_inject or a.guard_auto_restart):
+        p.error('cross-linked journal requires automatic recovery without panic injection or restart')
     if a.guard_panic_inject and (not a.guard_panic_journal or not a.auto_prepared_pair or a.guard_auto_restart):
         p.error('panic injection requires the automatic pair and journal, with no automatic-restart test')
     if a.guard_panic_after_pending and not a.guard_panic_inject:
@@ -527,12 +531,36 @@ def main():
                 normal=work/'normal-boot';normal.mkdir()
                 boot_menu_fixture(disk,a.firmware.resolve(strict=True),normal,False,'BOOT: complete',90,True,
                                   'Recovery required; normal boot blocked.',sata_snapshot=True)
+        if a.guard_journal_crosslink:
+            alias=work/'alias.bin';alias.write_bytes(b'X')
+            subprocess.run(['mcopy','-i',media,str(alias),'::/ALIAS.BIN'],check=True)
+            # Follow the disposable FAT32 root chain to locate the two 8.3
+            # entries, then alias the journal's first cluster without changing
+            # FAT links. No guest code participates in creating the corruption.
+            with disk.open('r+b') as stream:
+                esp=2048*512;stream.seek(esp);header=stream.read(512)
+                bps=struct.unpack_from('<H',header,11)[0];spc=header[13]
+                reserved=struct.unpack_from('<H',header,14)[0];fats=header[16]
+                fat_size=struct.unpack_from('<I',header,36)[0];cluster=struct.unpack_from('<I',header,44)[0]
+                if bps!=512 or not spc or not reserved or not fats or not fat_size or cluster<2:
+                    raise RuntimeError('unexpected FAT32 geometry for journal crosslink')
+                data_start=reserved+fats*fat_size;locations={};seen=set()
+                while 2<=cluster<0x0ffffff8 and cluster not in seen:
+                    seen.add(cluster);base=esp+(data_start+(cluster-2)*spc)*512
+                    stream.seek(base);directory=stream.read(spc*512)
+                    for off in range(0,len(directory),32):
+                        name=directory[off:off+11]
+                        if name in (b'PANIC   BIN',b'ALIAS   BIN'):locations[name]=(base+off,directory[off:off+32])
+                    stream.seek(esp+reserved*512+cluster*4);cluster=struct.unpack('<I',stream.read(4))[0]&0x0fffffff
+                if len(locations)!=2:raise RuntimeError('journal or alias directory entry missing')
+                target,entry=locations[b'ALIAS   BIN'];journal=locations[b'PANIC   BIN'][1]
+                for offset in (20,26):stream.seek(target+offset);stream.write(journal[offset:offset+2])
         before = sha(disk)
         journal_sectors=file_sectors(disk,2048,'::/PANIC.BIN') if a.guard_panic_inject else None
         journal_outside=(outside_esp_hash(disk) if a.guard_panic_after_pending else outside_digest(disk,journal_sectors)) if journal_sectors else None
         baseline=None
         auto_clean=a.guard_auto_condition and not a.dirty and not a.guard_pending_clean
-        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean or a.guard_attempt_exhausted):
+        if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean or a.guard_attempt_exhausted or a.guard_journal_crosslink):
             baseline=work/'baseline.raw';shutil.copyfile(disk,baseline)
         poison = None
         if a.guard_poison_boot:
@@ -796,7 +824,8 @@ def main():
                     pending_expected=(0 if a.guard_pending_fail_at in (1,2) else 1 if a.guard_pending_fail_at else 2)
                     ext2_checker_failed=a.guard_ext2_bad_checker or a.guard_ext2_missing_checker
                     complete_expected=(0 if a.guard_complete_fail_at in (1,2) else 1 if a.guard_complete_fail_at else 2)
-                    expected = ('GUARD_ATTEMPT_RESULT outcome=3' if a.guard_attempt_exhausted else
+                    expected = ('GUARD_CHECK_RESULT exit=1' if a.guard_journal_crosslink else
+                                'GUARD_ATTEMPT_RESULT outcome=3' if a.guard_attempt_exhausted else
                                 ('GUARD_AUTO_INVALID' if a.guard_auto_unsupported else 'GUARD_AUTO_NO_REPAIR') if auto_clean else
                                 f'GUARD_COMPLETE_RESULT outcome={complete_expected}' if a.guard_complete_test else
                                 'GUARD_EXT2_INCOMPLETE preen' if a.guard_ext2_test and ext2_checker_failed else
@@ -820,7 +849,7 @@ def main():
                     complete_lines = [line.rstrip('\r') for line in text.split('\n')[:-1]]
                     if a.guard_ext2_test and any(line.startswith('GUARD_EXT2_INCOMPLETE ') and line!=expected for line in complete_lines):
                         raise RuntimeError('guarded ext2 repair failed: '+text[-4000:])
-                    checker_expected='GUARD_CHECK_RESULT exit=0' if a.guard_records else expected
+                    checker_expected='GUARD_CHECK_RESULT exit=1' if a.guard_journal_crosslink else 'GUARD_CHECK_RESULT exit=0' if a.guard_records else expected
                     if a.guard_real_checker and any(
                             line.startswith(('GUARD_CHECK_RESULT ', 'GUARD_CHECK_INCOMPLETE ')) and line != checker_expected
                             for line in complete_lines):
@@ -856,7 +885,7 @@ def main():
                             if after.count('GUARD_COMPLETE_RESTART')!=1 or 'SSD_GUARD_RESERVATION_READY' in after:
                                 raise RuntimeError('guest re-entered recovery after completion')
                     if selected and matched:
-                        if a.guard_ext2_test and not a.guard_pending_fail_at and not auto_clean and not a.guard_attempt_exhausted:
+                        if a.guard_ext2_test and not a.guard_pending_fail_at and not auto_clean and not a.guard_attempt_exhausted and not a.guard_journal_crosslink:
                             preen=('GUARD_EXT2_PREEN exit=-8' if a.guard_ext2_bad_checker else
                                    'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
@@ -869,7 +898,7 @@ def main():
                                 raise RuntimeError('guarded repair milestones missing')
                             indices=[complete_lines.index(line) for line in required]
                             if indices!=sorted(indices):raise RuntimeError('guarded repair milestones out of order')
-                        if a.guard_records and ('GUARD_CHECK_RESULT exit=0' not in complete_lines or
+                        if a.guard_records and not a.guard_journal_crosslink and ('GUARD_CHECK_RESULT exit=0' not in complete_lines or
                                                 complete_lines.index('GUARD_CHECK_RESULT exit=0')>=complete_lines.index(expected)):
                             raise RuntimeError('guard record result did not follow a successful checker')
                         if a.guard_bad_checker and 'GUARD_CHECK_RESULT' in text:
@@ -1071,6 +1100,13 @@ def main():
                     any(marker in final for marker in ('SSD_GUARD_RESERVATION_READY','GUARD_CHECK_RESULT',
                                                        'GUARD_PENDING_RESULT','GUARD_EXT2_PREEN'))):
                 raise RuntimeError('physical automatic pair did not refuse the fixture before recovery')
+        if a.guard_journal_crosslink:
+            final=serial.read_text(errors='replace')
+            if not all(item in final.lower() for item in ('/panic.bin','/alias.bin','share clusters')):
+                raise RuntimeError('FAT checker did not identify the journal crosslink')
+            if any(marker in final for marker in ('GUARD_PANIC_JOURNAL pin=', 'GUARD_PENDING_RESULT',
+                                                   'GUARD_EXT2_PREEN', 'PANIC_DISK_CAPTURE_OK')):
+                raise RuntimeError('cross-linked journal passed the FAT checker boundary')
         if baseline:
             # Ensure only the fixed guard data and their directory entries
             # changed; GPT, data partition, FAT tables and boot code are not
@@ -1186,7 +1222,8 @@ def main():
             raise RuntimeError('read-only check changed the disposable disk')
         if poison and sha(poison) != poison_before:
             raise RuntimeError('guard boot changed the overmount fixture')
-        print('RECOVERY_PHYSICAL_AUTO_REJECTS_QEMU_DISK_PASS' if a.auto_physical_reject else
+        print('RECOVERY_CROSSLINKED_JOURNAL_REFUSED_PASS' if a.guard_journal_crosslink else
+              'RECOVERY_PHYSICAL_AUTO_REJECTS_QEMU_DISK_PASS' if a.auto_physical_reject else
               'RECOVERY_GUEST_GUARD_EXT2_REJECT_PASS' if a.guard_ext2_test and (a.guard_pending_fail_at or a.guard_ext2_bad_checker or a.guard_ext2_missing_checker) else
               'RECOVERY_GUEST_GUARD_EXT2_PASS' if a.guard_ext2_test else
               'RECOVERY_GUEST_GUARD_REJECT_PASS' if a.guard_reservation in ('wrong-guid', 'wrong-fs-uuid') or a.guard_bad_checker or a.guard_pending_no_marker or a.guard_pending_wrong_serial else
