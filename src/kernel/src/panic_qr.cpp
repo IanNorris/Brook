@@ -189,7 +189,7 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
 }
 
 // Emit the binary packet as hex to serial for host-side capture.
-static void DumpPacketToSerial(const uint8_t* data, uint32_t len)
+__attribute__((noinline)) static void DumpPacketToSerial(const uint8_t* data, uint32_t len)
 {
     // The exception handler suppresses ordinary serial writers while it owns
     // the crash dump. Emit directly: taking its reserved ticket lock here
@@ -330,8 +330,7 @@ void PanicPreparePacket(const PanicCPURegs* regs,
         SerialPrintf("PANIC QR: LZ4 compression skipped (no benefit)\n");
     }
 
-    // Also dump hex to serial for host-side capture (works with crash_decoder.py --hex)
-    // Use compressed data with v2 header
+    // Publish the packet before either transport consumes it.
     {
         PanicHeader hdr;
         hdr.magic     = QR_MAGIC_BYTE;
@@ -342,14 +341,14 @@ void PanicPreparePacket(const PanicCPURegs* regs,
         memcpy(g_capturedPacket, &hdr, sizeof(hdr));
         memcpy(g_capturedPacket + sizeof(hdr), dataToEncode, dataLen);
         __atomic_store_n(&g_capturedPacketBytes, sizeof(hdr) + dataLen, __ATOMIC_RELEASE);
-        DumpPacketToSerial(g_capturedPacket, sizeof(hdr) + dataLen);
     }
 
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
-    // Persist the completed packet before QR generation or display transfer:
-    // either can fault or stall after the serial record is already available.
+    // Attempt persistence before serial hex output and display operations.
     AhciPanicTestCapture();
 #endif
+    // Also dump hex to serial for host-side capture (crash_decoder.py --hex).
+    DumpPacketToSerial(g_capturedPacket, sizeof(PanicHeader) + dataLen);
 }
 
 void PanicRenderPreparedQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,

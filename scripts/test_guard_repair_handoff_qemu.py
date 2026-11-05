@@ -56,6 +56,7 @@ def main():
     parser.add_argument('--auto-desktop-reset',action='store_true',help='Require a QEMU-only timed reset after the desktop panic')
     parser.add_argument('--auto-desktop-hard-stall',action='store_true',help='Stall a real vCPU and require watchdog capture and reset')
     parser.add_argument('--auto-desktop-headless-panic',action='store_true',help='Force the panic framebuffer lookup to fail and check diagnostic sections')
+    parser.add_argument('--auto-desktop-serial-stall',action='store_true',help='Stall at serial packet output after the disk capture')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -75,6 +76,8 @@ def main():
         parser.error('hard stall requires desktop reset and excludes shutdown panic')
     if a.auto_desktop_headless_panic and (not a.auto_desktop_panic or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic):
         parser.error('headless panic requires desktop panic and excludes stall and shutdown fixtures')
+    if a.auto_desktop_serial_stall and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic):
+        parser.error('serial stall requires desktop reset and excludes other panic fixtures')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
@@ -247,14 +250,26 @@ def main():
                     fb=desktop_symbol('_ZN5brook19CompositorGetPhysFbEPj')
                     body+=(f'hbreak *{fb:#x}\ncontinue\nset $rax=0\nset $rip=*(unsigned long long*)$rsp\n'
                            'set $rsp=$rsp+8\necho PANIC_FRAMEBUFFER_FORCED_NULL\\n\ndelete breakpoints\n')
+                if a.auto_desktop_serial_stall:
+                    from elftools.elf.elffile import ELFFile
+                    dump=desktop_symbol('_ZN5brookL18DumpPacketToSerialEPKhj')
+                    spin=None
+                    with (a.desktop_pair/'KERNEL.ELF').open('rb') as executable:
+                        for segment in ELFFile(executable).iter_segments():
+                            if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                                at=segment.data().find(b'\xeb\xfe')
+                                if at>=0:spin=segment['p_vaddr']+at;break
+                    if spin is None:raise RuntimeError('no executable self-loop for serial stall fixture')
+                    body+=(f'hbreak *{dump:#x}\ncontinue\nset $rip={spin:#x}\n'
+                           'echo PANIC_SERIAL_STALLED\\n\ndelete breakpoints\n')
                 body+='detach\nquit\n'
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                            f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'+body)
             capture_seen=[]
             boot(disk,a.firmware,second,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
-                 expect_reset=a.auto_desktop_reset and not a.auto_desktop_shutdown_panic,
-                 hold_after_marker=7 if a.auto_desktop_shutdown_panic or not a.auto_desktop_reset else 0,reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',
+                 expect_reset=a.auto_desktop_reset and not (a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall),
+                 hold_after_marker=7 if a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall or not a.auto_desktop_reset else 0,reset_evidence_marker='PANIC_RECOVERY_RESET_WAIT',
                  on_marker=lambda:capture_seen.append(time.monotonic()),
                  smp=4 if a.auto_desktop_hard_stall else 2,
                  extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-desktop-panic-reset,string=test-1'] if a.auto_desktop_reset else None)
@@ -265,7 +280,7 @@ def main():
                 started=re.search(r'WATCHDOG_STALL_MONOTONIC ([0-9.]+)',debugger_log)
                 if not stalled or not started or not capture_seen or capture_seen[0]-float(started.group(1))<25:
                     raise RuntimeError('watchdog did not observe a sustained vCPU stall')
-            if a.auto_desktop_reset and not a.auto_desktop_shutdown_panic and (not capture_seen or time.monotonic()-capture_seen[0]<4):
+            if a.auto_desktop_reset and not (a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall) and (not capture_seen or time.monotonic()-capture_seen[0]<4):
                 raise RuntimeError('desktop panic reset occurred before the expected delay')
         elif a.auto_desktop_network_module:
             with socket.socket() as probe:
@@ -329,12 +344,25 @@ def main():
             raise RuntimeError('guarded desktop service did not start after repair')
         if a.auto_desktop_panic:
             if ('ahci direct: ready ' not in serial or
-                (('PANIC_RECOVERY_RESET_WAIT' in serial)!=(a.auto_desktop_reset and not a.auto_desktop_shutdown_panic)) or
+                (('PANIC_RECOVERY_RESET_WAIT' in serial)!=(a.auto_desktop_reset and not (a.auto_desktop_shutdown_panic or a.auto_desktop_serial_stall))) or
                 (a.auto_desktop_reset and 'GUARD_DESKTOP_PANIC_RESET armed=1' not in serial)):
                 raise RuntimeError('desktop panic occurred before mount or unexpectedly armed reset')
             packet=next((line[10:] for line in serial.splitlines() if line.startswith('PANIC_HEX:')),None)
-            if not packet:raise RuntimeError('desktop panic packet missing')
             journal_after=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
+            if a.auto_desktop_serial_stall:
+                debugger_log=(second/'qemu.log').read_text(errors='replace')
+                (a.output/'desktop-serial-stall-gdb.log').write_text(debugger_log)
+                if 'PANIC_SERIAL_STALLED' not in debugger_log or packet:
+                    raise RuntimeError('serial output was not stopped before packet emission')
+                length=struct.unpack_from('<I',journal_after,12)[0]
+                if not 0<length<=65536:raise RuntimeError('invalid journal packet length')
+                packet=journal_after[512:512+length].hex()
+                packet_file=a.output/'desktop-serial-stall-panic.bin';packet_file.write_bytes(bytes.fromhex(packet))
+                decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
+                                   '--packet',str(packet_file),'--json'],stderr=subprocess.DEVNULL))
+                if decoded.get('message')!='GDBTEST':raise RuntimeError('serial-stall journal packet lost its reason')
+                (a.output/'desktop-serial-stall-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
+            if not packet:raise RuntimeError('desktop panic packet missing')
             verify_record(journal_after,0,1,bytes.fromhex(packet))
             if a.auto_desktop_hard_stall:
                 cpu=stalled.group(1)
