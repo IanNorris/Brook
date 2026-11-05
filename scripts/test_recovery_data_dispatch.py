@@ -82,7 +82,7 @@ def main():
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):p.error('invalid identity')
     a.output.mkdir(parents=True,exist_ok=False)
     scenarios=('dirty','pending','wrong-uuid','wrong-ata','checker-corrupt','journal-crosslink',
-               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing','journal-publish-panic','journal-publish-unarmed','journal-publish-failed','journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
+               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing','journal-publish-panic','journal-publish-unarmed','journal-publish-failed','journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
     if a.case:
         if a.case not in scenarios:p.error('invalid scenario for this mode')
         scenarios=(a.case,)
@@ -137,7 +137,7 @@ def main():
             subprocess.run(['mke2fs','-q','-F','-t','ext2','-b','4096','-I','128','-N','1024',
                             '-m','0','-O','none,filetype,sparse_super,large_file','-U',str(fs_uuid),str(partition)],
                            check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed'):
+            if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown'):
                 from test_ext2_idle_flush_sata_qemu import DIRS,FILES
                 witness=work/'fixture-file';witness.write_text('synthetic fixture\n')
                 for name in DIRS:
@@ -160,7 +160,7 @@ def main():
             record=work/'guard.bin';record.write_bytes(guard)
             for name in ('GUARD0.BIN','GUARD1.BIN'):
                 subprocess.run(['mcopy','-o','-i',media,str(record),'::/RECOVERY/'+name],check=True)
-            if scenario in ('journal-crosslink','journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed') or scenario.startswith(('journal-pin','journal-publish')):
+            if scenario in ('journal-crosslink','journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown') or scenario.startswith(('journal-pin','journal-publish')):
                 contents=bytearray((257 if scenario=='journal-pin-short' else 258)*512)
                 if scenario=='journal-pin-corrupt':contents[0]=0xff
                 if scenario in ('journal-pin-existing','journal-publish-existing','journal-publish-panic'):
@@ -181,7 +181,7 @@ def main():
                 subprocess.run(['mcopy','-o','-i',media,str(corrupt),'::/RECOVERY/SELECT.BIN'],check=True)
             # Serial output from other CPUs can split the prefix from its ID.
             before=sha(disk);outside=outside_esp_hash(disk) if scenario.startswith('journal-publish') else None
-            metadata_before=metadata_hash(disk) if scenario in ('journal-desktop','journal-desktop-panic','journal-desktop-failed') else None
+            metadata_before=metadata_hash(disk) if scenario in ('journal-desktop','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown') else None
             with disk.open('rb') as f:
                 f.seek(133120*512);first_data_before=f.read(512)
             normal='AUDIO_CONTROL_FAIL';recovery='brook-ssd-recovery-manual-v1'
@@ -190,6 +190,7 @@ def main():
             if pair:
                 expect=('GUARD_RECORDS_MATCH' if scenario=='dirty' else
                         'GUARD_RECORDS_INCOMPLETE mismatch' if scenario=='pending' else
+                        'shutdown: request=dddddddddddddddd0000000000000001 phase=ready result=0' if scenario=='journal-desktop-shutdown' else
                         'GUARD_JOURNAL_DESKTOP_FAILED mounted=0 write=-30' if scenario=='journal-desktop-failed' else
                         'GUARD_JOURNAL_DESKTOP_PASS' if scenario=='journal-desktop' else
                         'PANIC_TEST_DISK_CAPTURE_OK' if scenario=='journal-desktop-panic' else
@@ -205,13 +206,14 @@ def main():
             else:expect='Recovery required but payload invalid or missing.' if broken else normal if isNormal else recovery
             forbid=recovery if isNormal else normal
             # No F5 input: dirty/invalid data must reach verified recovery by itself.
-            boot(disk,a.firmware,work,scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed'),expect,90,True,forbid,sata_snapshot=not bool(pair),
+            boot(disk,a.firmware,work,scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown'),expect,90,True,forbid,sata_snapshot=not bool(pair),
                  hold_after_marker=2 if broken or pair else 0,
                  sata_serial=('BROOK-WRONG-DEVICE' if scenario=='wrong-ata' else 'BROOK-RECOVERY-QA') if pair else None,
-                 failure_marker=('GUARD_JOURNAL_DESKTOP_FAIL' if scenario in ('journal-desktop','journal-desktop-panic') else
+                 failure_marker=('GUARD_JOURNAL_DESKTOP_FAIL' if scenario in ('journal-desktop','journal-desktop-panic','journal-desktop-shutdown') else
                                  'GUARD_JOURNAL_PUBLISH_RESULT status=-' if scenario.startswith('journal-publish') else
                                  'SSD_GUARD_RESERVATION_FAILED' if scenario.startswith('journal-pin') else None),
                  extra_fw_cfg=(['name=opt/guard-journal-pin,string=test-7','name=opt/guard-panic-capture,string=test-1','name=opt/brook/power,string=q35-reset','name=opt/brook/panic-test-reset,string=test-1s','name=opt/brook/panic-test-headless,string=yes'] if scenario=='journal-desktop-panic' else
+                               ['name=opt/guard-journal-pin,string=test-9','name=opt/guard-panic-capture,string=test-1'] if scenario=='journal-desktop-shutdown' else
                                ['name=opt/guard-journal-pin,string=test-8','name=opt/guard-panic-capture,string=test-1'] if scenario=='journal-desktop-failed' else
                                ['name=opt/guard-journal-pin,string=test-6','name=opt/guard-panic-capture,string=test-1'] if scenario in ('journal-desktop','journal-desktop-dirty') else
                                ['name=opt/guard-journal-pin,string=test-3','name=opt/guard-panic-capture,string=test-1','name=opt/brook/power,string=q35-reset','name=opt/brook/panic-test-reset,string=test-1s','name=opt/brook/panic-test-headless,string=yes'] if scenario=='journal-publish-panic' else
@@ -220,7 +222,7 @@ def main():
                                ['name=opt/guard-journal-pin,string=test-2' if scenario.startswith('journal-publish') else 'name=opt/guard-journal-pin,string=test-1'] if scenario.startswith(('journal-pin','journal-publish')) else None),
                  expect_reset=scenario in ('journal-publish-panic','journal-desktop-panic'))
             shutil.copyfile(work/'serial.log',a.output/(scenario+'-serial.log'))
-            if scenario in ('journal-desktop','journal-desktop-panic','journal-desktop-failed'):
+            if scenario in ('journal-desktop','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown'):
                 if scenario=='journal-desktop-failed':
                     with disk.open('rb') as f:
                         f.seek(133120*512)
@@ -241,6 +243,10 @@ def main():
                 subprocess.run(['fsck.fat','-n',str(fat)],check=True,stdout=subprocess.DEVNULL,timeout=30)
                 with disk.open('rb') as source,partition.open('wb') as target:
                     source.seek(133120*512);target.write(source.read(126976*512))
+                if scenario=='journal-desktop-shutdown':
+                    with partition.open('rb') as f:
+                        f.seek(1024+58)
+                        if f.read(2)!=b'\x01\x00':raise RuntimeError('checked shutdown did not mark ext2 clean')
                 result=subprocess.run(['e2fsck','-f','-n',str(partition)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
                 if result.returncode:raise RuntimeError('desktop filesystem check failed: '+result.stdout.decode(errors='replace')[-2000:])
                 if scenario!='journal-desktop-failed':
@@ -253,6 +259,14 @@ def main():
                          failure_marker='GUARD_JOURNAL_PIN_RESULT status=-',extra_fw_cfg=['name=opt/guard-journal-pin,string=test-1'])
                     if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal changed after desktop panic reboot')
                     shutil.copyfile(reboot/'serial.log',a.output/'journal-desktop-panic-reboot-serial.log')
+                if scenario=='journal-desktop-shutdown':
+                    reboot=work/'desktop-reboot';reboot.mkdir()
+                    boot(disk,a.firmware,reboot,True,'GUARD_JOURNAL_DESKTOP_PASS',90,True,forbid,
+                         sata_snapshot=False,hold_after_marker=2,sata_serial='BROOK-RECOVERY-QA',
+                         failure_marker='GUARD_JOURNAL_DESKTOP_FAIL',
+                         extra_fw_cfg=['name=opt/guard-journal-pin,string=test-6','name=opt/guard-panic-capture,string=test-1'])
+                    if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:raise RuntimeError('journal changed after checked shutdown reboot')
+                    shutil.copyfile(reboot/'serial.log',a.output/'journal-desktop-shutdown-reboot-serial.log')
             elif scenario.startswith('journal-publish'):
                 if outside_esp_hash(disk)!=outside:raise RuntimeError('write outside the ESP')
                 current=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
@@ -288,15 +302,16 @@ def main():
             if pair:
                 serial=(work/'serial.log').read_text(errors='replace')
                 lines=serial.splitlines()
-                required=([] if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed') else ['Recovery required; normal boot blocked.'])+['Brook SSD recovery payload verified']
+                required=([] if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown') else ['Recovery required; normal boot blocked.'])+['Brook SSD recovery payload verified']
                 if scenario in ('dirty','pending','checker-corrupt','journal-crosslink') or scenario.startswith(('journal-pin','journal-publish')):required+=['SSD_GUARD_RESERVATION_READY']
                 if scenario in ('dirty','pending','journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt') or scenario.startswith('journal-publish'):required+=['GUARD_CHECK_RESULT exit=0']
                 if scenario.startswith('journal-publish'):required+=['GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_EARLY_ARM status=-22']
-                if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed'):required+=['SSD_GUARD_RESERVATION_READY','GUARD_CHECK_RESULT exit=0','GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_EARLY_ARM status=-22']
-                if scenario=='journal-desktop-panic':required+=['GUARD_JOURNAL_DESKTOP_PASS']
-                if scenario in ('journal-desktop','journal-desktop-panic'):
-                    required.insert(required.index('GUARD_JOURNAL_DESKTOP_PASS') if scenario=='journal-desktop-panic' else len(required),
+                if scenario in ('journal-desktop','journal-desktop-dirty','journal-desktop-panic','journal-desktop-failed','journal-desktop-shutdown'):required+=['SSD_GUARD_RESERVATION_READY','GUARD_CHECK_RESULT exit=0','GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_EARLY_ARM status=-22']
+                if scenario in ('journal-desktop-panic','journal-desktop-shutdown'):required+=['GUARD_JOURNAL_DESKTOP_PASS']
+                if scenario in ('journal-desktop','journal-desktop-panic','journal-desktop-shutdown'):
+                    required.insert(required.index('GUARD_JOURNAL_DESKTOP_PASS') if scenario in ('journal-desktop-panic','journal-desktop-shutdown') else len(required),
                                     'GUARD_JOURNAL_DESKTOP_LEGACY status=0 stat=0 open=0 read=2')
+                if scenario=='journal-desktop-shutdown':required+=['GUARD_JOURNAL_DESKTOP_SHUTDOWN state=closing error=0']
                 if scenario.startswith('journal-publish') and scenario!='journal-publish-failed':required+=['GUARD_JOURNAL_PUBLISH_UNLINK status=-16','GUARD_JOURNAL_PUBLISH_REMOVE open=-16 closed=0','GUARD_JOURNAL_PUBLISH_RENAME status=-16','GUARD_JOURNAL_PUBLISH_MOVE open=-16 journal_target=-16 closed=0']
                 if scenario=='journal-publish-panic':required+=['GUARD_JOURNAL_PUBLISH_RESULT status=0','GUARD_JOURNAL_PANIC_ARM status=0']
                 required+=[expect]

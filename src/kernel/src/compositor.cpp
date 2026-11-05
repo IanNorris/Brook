@@ -1764,7 +1764,6 @@ static void CompositorLoopWM()
         CompositorMarkDirty();
     }
     DebugUiPoll();
-    ShutdownCompositorPoll();
     // Reap terminated owners regardless of visibility/minimization. A terminal
     // holds its child alive until cleanup; rendering only visible windows left
     // minimized terminals retaining their process/pipe references indefinitely.
@@ -3749,6 +3748,9 @@ static void CompositorThreadFn(void* /*arg*/)
             { FrameTimingScope phase(FramePhase::SceneDrain);CompositorDrainScenes(); }
             CompositorLoop();
         }
+        // Shutdown must also drain window state when there is no window
+        // manager scene or rendering has been halted.
+        ShutdownCompositorPoll();
 
         // Poll debug channel for incoming commands
         { FrameTimingScope phase(FramePhase::DebugPoll);brook::DebugChannelPoll(); }
