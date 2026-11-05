@@ -2,6 +2,7 @@
 #include <stdint.h>
 namespace brook {
 struct Device;
+struct Vnode;
 enum class AhciSystemBoot { Absent, Ready, Maintenance };
 // An explicit direct-store selector always requires direct admission; failures
 // are maintenance-only rather than selecting a different desktop store.
@@ -12,6 +13,7 @@ int AhciSystemDirectFinalSync();
 AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive);
 // Boot-local identity of the admitted ESP attachment; zero until mounted.
 uint64_t AhciSystemVolumePublication();
+bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory);
 // Boot-only experimental preparation. Reserves the ESP for the returned
 // adapter and denies data/GPT writes. Does not mount or expose filesystems.
 // Only call before any filesystem, caches or user processes can access disk.

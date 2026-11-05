@@ -22,6 +22,7 @@ namespace {
 struct Range { Device* parent=nullptr;uint64_t start=0,bytes=0; } range;
 bool attempted=false;
 uint64_t systemVolumePublication=0;
+uint8_t systemVolumeDrive=0;
 Range guardRange{};bool guardReady=false;
 int GuardRead(Device*,uint64_t offset,void* data,uint64_t length) {
     if(!guardReady || !guardRange.parent)return -19;
@@ -342,11 +343,16 @@ AhciSystemBoot AhciSystemVolumeMount(uint8_t* nextDrive) {
     uint64_t publication=0;
     if(!VfsMountConfiguredWithPublication("/media/system","fatfs",drive,0,&publication) || !publication)return Fail("FAT mount");
     systemVolumePublication=publication;
+    systemVolumeDrive=drive;
     KPrintf("ahci system: verified GPT entry %u mounted at /media/system\n",selected.entry);
     return AhciSystemBoot::Ready;
 }
 
 uint64_t AhciSystemVolumePublication() { return systemVolumePublication; }
+bool AhciSystemVolumeOwnsRoot(Vnode* retainedDirectory) {
+    return systemVolumePublication && FatFsBoundDevice(systemVolumeDrive)==&partition &&
+        VfsVnodeIsPublishedRoot(retainedDirectory,systemVolumePublication,systemVolumeDrive);
+}
 
 void AhciSystemDataInspect() {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
