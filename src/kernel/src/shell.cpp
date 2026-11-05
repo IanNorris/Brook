@@ -31,6 +31,7 @@
 #include "serial.h"
 #include "smp.h"
 #include "panic.h"
+#include "panic_test_reset.h"
 #include "memory/physical_memory.h"
 #include "apic.h"
 #include "klog.h"
@@ -1296,6 +1297,14 @@ static int ExecCommand(int argc, const char* const* argv)
         if (StrEq(mode, "panic"))
         {
             KernelPanic("crashtest: deliberate kernel panic");
+        }
+        else if (StrEq(mode, "seriallock"))
+        {
+            // The reset test requires explicit QEMU fw_cfg and is unavailable
+            // on the physical boot path. Intentionally retain the lock.
+            if(!PanicTestResetEnabled()) {SerialPuts("crashtest: seriallock requires QEMU reset test\n");return -1;}
+            SerialLock();
+            KernelPanic("crashtest: panic while serial lock held");
         }
         else if (StrEq(mode, "nullptr"))
         {

@@ -40,4 +40,5 @@ void PanicTestResetAfterDump() {
     if(result==PanicResetResult::TimerFailed) PanicRaw("PANIC_TEST_RESET_TIMER_FAILED\n");
     else if(result==PanicResetResult::ResetReturned) PanicRaw("PANIC_TEST_RESET_RETURNED\n");
 }
+bool PanicTestResetEnabled() {return enabled;}
 }

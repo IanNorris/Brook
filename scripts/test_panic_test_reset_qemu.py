@@ -29,7 +29,7 @@ def check_reason(serial, expected):
         raise RuntimeError('panic packet lacks available recent boot log')
 
 
-def run_case(root, image, kernel, firmware, command, armed, timeout, verify_reboot=False):
+def run_case(root, image, kernel, firmware, command, armed, timeout, verify_reboot=False, expect_denied=False):
     disk = root / 'disk.raw'
     shutil.copyfile(image, disk)
     esp = str(disk) + '@@1048576'
@@ -62,6 +62,10 @@ def run_case(root, image, kernel, firmware, command, armed, timeout, verify_rebo
             seen_dump = None
             while time.monotonic() < deadline:
                 output = serial.read_bytes() if serial.exists() else b''
+                if expect_denied and b'crashtest: seriallock requires QEMU reset test' in output:
+                    if b'PANIC_HEX:' in output or b'PANIC_TEST_RESET_WAIT' in output:
+                        raise RuntimeError('unarmed serial-lock test unexpectedly panicked')
+                    return
                 marker = b'PANIC_TEST_RESET_WAIT' if armed else b'PANIC QR: rendered to framebuffer'
                 if seen_dump is None and marker in output:
                     seen_dump = time.monotonic()
@@ -77,7 +81,7 @@ def run_case(root, image, kernel, firmware, command, armed, timeout, verify_rebo
                         raise RuntimeError(f'unexpected QEMU exit {status}: {output[-3000:]!r}')
                     if b'PANIC_TEST_RESET_ARMED' not in output or b'PANIC_TEST_RESET_WAIT' not in output:
                         raise RuntimeError('QEMU exited without the armed reset markers')
-                    if command.startswith('crashtest') and b'=== KERNEL FAULT ===' not in output:
+                    if command=='crashtest ud' and b'=== KERNEL FAULT ===' not in output:
                         raise RuntimeError('exception evidence was not emitted')
                     if b'PANIC_HEX:' not in output:
                         raise RuntimeError('structured panic evidence was not emitted')
@@ -128,6 +132,15 @@ def main():
         run_case(root, image, kernel, firmware, 'panic reboot_test', True, args.timeout, True)
         check_reason(root/'serial.log', 'SHELL: reboot_test\n')
         print('reboot: PASS', flush=True)
+        root = Path(temp) / 'seriallock'
+        root.mkdir()
+        run_case(root, image, kernel, firmware, 'crashtest seriallock', True, args.timeout, True)
+        check_reason(root/'serial.log', 'crashtest: panic while serial lock held')
+        print('panic while holding serial lock and reboot: PASS', flush=True)
+        root = Path(temp) / 'seriallock-unarmed'
+        root.mkdir()
+        run_case(root, image, kernel, firmware, 'crashtest seriallock', False, args.timeout, expect_denied=True)
+        print('unarmed serial-lock test rejected: PASS', flush=True)
 
 
 if __name__ == '__main__':
