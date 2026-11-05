@@ -1,6 +1,7 @@
 #include "panic_test_reset.h"
 #include "panic_reset_timer.h"
 #include "platform_power.h"
+#include "acpi.h"
 #include "fw_cfg.h"
 #include "portio.h"
 #include "serial.h"
@@ -25,6 +26,17 @@ struct Pit {
     void pause() { __asm__ volatile("pause"); }
     void issueReset() { (void)PlatformPowerIssue(true); }
 };
+struct PmTimer {
+    uint16_t port;
+    uint32_t readTimer() { return inl(port); }
+    void pause() { __asm__ volatile("pause":::"memory"); }
+    void issueReset() { (void)PlatformPowerIssue(true); }
+};
+}
+// Kept separate so failure of the PIT path can be exercised without altering
+// the firmware-timer fallback or the panic-time reset policy.
+__attribute__((noinline)) PanicResetResult PanicPitDelay(uint32_t intervals) {
+    Pit pit;return PanicResetAfterIntervals(pit,intervals,10000000);
 }
 void PanicTestResetConfigure() {
     // Both settings come only from QEMU fw_cfg, read before scheduling starts.
@@ -46,8 +58,12 @@ void PanicTestResetAfterDump() {
 #endif
     if(!enabled && !recovery)return;
     PanicRaw(enabled?"PANIC_TEST_RESET_WAIT\n":"PANIC_RECOVERY_RESET_WAIT\n");
-    Pit pit;
-    const auto result=PanicResetAfterIntervals(pit,enabled?20:100,10000000);
+    auto result=PanicPitDelay(enabled?20:100);
+    if(result==PanicResetResult::TimerFailed && AcpiGetPmTimerInfo().available) {
+        PanicRaw("PANIC_RESET_PM_FALLBACK\n");
+        PmTimer timer{AcpiGetPmTimerInfo().port};
+        result=PanicResetAfterPmIntervals(timer,enabled?20:100,10000000);
+    }
     if(result==PanicResetResult::TimerFailed) PanicRaw(enabled?"PANIC_TEST_RESET_TIMER_FAILED\n":"PANIC_RECOVERY_RESET_TIMER_FAILED\n");
     else if(result==PanicResetResult::ResetReturned) PanicRaw(enabled?"PANIC_TEST_RESET_RETURNED\n":"PANIC_RECOVERY_RESET_RETURNED\n");
 }

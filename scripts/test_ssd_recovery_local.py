@@ -106,6 +106,8 @@ def main():
                    help='Inject after durable pending state and require the automatic reset')
     p.add_argument('--guard-panic-unarmed', action='store_true',
                    help='Inject before pending state and verify no automatic reset')
+    p.add_argument('--guard-panic-pm-fallback', action='store_true',
+                   help='Force PIT failure in the disposable debugger and test the ACPI timer')
     p.add_argument('--guard-auto-unsupported', action='store_true',
                    help='Check that an unsupported filesystem cannot trigger automatic repair')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
@@ -137,6 +139,8 @@ def main():
         p.error('post-pending panic requires --guard-panic-inject')
     if a.guard_panic_unarmed and (not a.guard_panic_inject or a.guard_panic_after_pending):
         p.error('unarmed panic requires the pre-pending injection')
+    if a.guard_panic_pm_fallback and not a.guard_panic_after_pending:
+        p.error('PM fallback requires the post-pending panic fixture')
     if a.guard_auto_unsupported and (not a.guard_auto_condition or a.dirty or a.guard_desktop_kernel_build):
         p.error('unsupported auto fixture requires the unmodified geometry')
     if a.dirty and a.missing_checker:
@@ -504,11 +508,14 @@ def main():
                                '_ZN5brook31FatFsPrivateRecoveryTestPendingEPNS_15FatPrivateMountEPKcj')
                 panic=symbol('KernelPanic')
                 scratch=symbol('_ZN5brookL8g_kbdBufE') # disposable guest, no keyboard input
+                pit=symbol('_ZN5brook13PanicPitDelayEj') if a.guard_panic_pm_fallback else 0
                 commands=work/'panic.gdb'
                 commands.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                     f'target remote {work / "gdb.sock"}\nhbreak *{pending:#x}\ncontinue\n'
                     f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
-                    f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\ndetach\nquit\n')
+                    f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +
+                    (f'hbreak *{pit:#x}\ncontinue\nset $rip=*(unsigned long long*)$rsp\nset $rsp=$rsp+8\nset $rax=1\ndelete breakpoints\n' if pit else '') +
+                    'detach\nquit\n')
                 for _ in range(100):
                     if (work/'gdb.sock').exists():break
                     time.sleep(.05)
@@ -694,6 +701,8 @@ def main():
                'PANIC_DISK_CAPTURE_OK' not in text or (not a.guard_panic_unarmed and reset_marker not in text) or \
                (a.guard_panic_unarmed and ('PANIC_RECOVERY_RESET_WAIT' in text or 'PANIC_TEST_RESET_WAIT' in text)) or not pending_ok:
                 raise RuntimeError('automatic recovery panic injection failed: '+text[-5000:])
+            if a.guard_panic_pm_fallback and 'PANIC_RESET_PM_FALLBACK' not in text:
+                raise RuntimeError('ACPI PM fallback did not run')
             packet=next((line[10:] for line in text.splitlines() if line.startswith('PANIC_HEX:')),None)
             if not packet:raise RuntimeError('panic packet missing')
             decoded_output=StringIO()

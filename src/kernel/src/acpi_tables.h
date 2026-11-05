@@ -13,6 +13,7 @@ struct AcpiResetInfo {
     bool available=false;uint16_t port=0;uint8_t value=0;
     const char* reason="No validated FADT reset register";
 };
+struct AcpiPmTimerInfo { bool available=false;uint16_t port=0;bool wide=false; };
 
 // The callback must reject unreadable physical spans before accessing memory.
 // Checksums are streamed through a small stack buffer; firmware lengths never
@@ -104,6 +105,25 @@ public:
             result.reason="Firmware reset GAS is unsupported (requires byte System I/O)";return result;
         }
         result.available=true;result.port=static_cast<uint16_t>(port);result.value=bytes[16];result.reason="FADT System I/O reset";return result;
+    }
+    // ACPI 6.6 FADT: PM_TMR_BLK (76), PM_TMR_LEN (91), flags (112),
+    // and X_PM_TMR_BLK GAS (208). Only 32-bit System I/O is supported.
+    AcpiPmTimerInfo PmTimer() const {
+        AcpiPmTimerInfo result{};AcpiSdtHeader header{};
+        const uint64_t address=Find("FACP",&header);
+        if(!address || header.length<116)return result;
+        uint32_t legacy=0,flags=0;uint8_t length=0;
+        if(!Copy(address+76,&legacy,4) || !Copy(address+91,&length,1) ||
+           !Copy(address+112,&flags,4) || length!=4)return result;
+        uint64_t port=legacy;
+        if(header.length>=220) {
+            uint8_t gas[12]{};if(!Copy(address+208,gas,sizeof(gas)))return result;
+            uint64_t extended=0;__builtin_memcpy(&extended,gas+4,8);
+            if(extended && gas[0]==1 && (gas[1]==24 || gas[1]==32) && !gas[2] &&
+               (gas[3]==0 || gas[3]==3) && extended<=65532)port=extended;
+        }
+        if(!port || port>65532)return result;
+        result.available=true;result.port=uint16_t(port);result.wide=(flags&(1u<<8))!=0;return result;
     }
 private:
     static bool Equal(const char* a,const char* b,uint32_t n){for(uint32_t i=0;i<n;++i)if(a[i]!=b[i])return false;return true;}

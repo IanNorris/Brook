@@ -36,6 +36,7 @@ struct MemoryDescriptor;
 bool AcpiInit(uint64_t rsdpPhysical,const MemoryDescriptor* memoryMap,uint32_t memoryMapCount);
 // Frozen descriptor only; discovery never writes hardware registers.
 const AcpiResetInfo& AcpiGetResetInfo();
+const AcpiPmTimerInfo& AcpiGetPmTimerInfo();
 
 // Return parsed MADT information.  Valid only after AcpiInit() returns true.
 const MadtInfo& AcpiGetMadt();

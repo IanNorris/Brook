@@ -50,6 +50,7 @@ struct MadtLapicOverride
 
 static MadtInfo g_madt{};
 static AcpiResetInfo g_reset{};
+static AcpiPmTimerInfo g_pmTimer{};
 static AcpiTableReader g_tables;
 static BootResourceMap g_bootResourceMap;
 static bool g_acpiReady=false;
@@ -146,12 +147,14 @@ static bool ParseMadt(uint64_t physical,const AcpiSdtHeader& header)
 }
 bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 {
-    g_madt={};g_reset={};g_tables={};g_acpiReady=false;g_bootResourceMap.Capture(map,count);
+    g_madt={};g_reset={};g_pmTimer={};g_tables={};g_acpiReady=false;g_bootResourceMap.Capture(map,count);
     if(!CaptureFirmwareRegions(map,count) || !g_tables.Init(ReadFirmware,nullptr,rsdp)) {
         g_mmioMapValid=false;SerialPuts("ACPI: invalid/unreadable RSDP or root table\n");return false;
     }
     g_reset=g_tables.Reset();
+    g_pmTimer=g_tables.PmTimer();
     SerialPrintf("ACPI: reset available=%u port=0x%x value=0x%x reason=%s\n",g_reset.available?1u:0u,g_reset.port,g_reset.value,g_reset.reason);
+    SerialPrintf("ACPI: PM timer available=%u port=0x%x width=%u\n",g_pmTimer.available?1u:0u,g_pmTimer.port,g_pmTimer.wide?32u:24u);
     AcpiSdtHeader header{};const auto madt=g_tables.Find("APIC",&header);
     if(!madt || !ParseMadt(madt,header)) {
         g_madt={};g_mmioMapValid=false;SerialPuts("ACPI: MADT missing or malformed\n");return false;
@@ -160,6 +163,7 @@ bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 }
 const MadtInfo& AcpiGetMadt(){return g_madt;}
 const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
+const AcpiPmTimerInfo& AcpiGetPmTimerInfo(){return g_pmTimer;}
 uint64_t AcpiFindTable(const char* signature){return g_tables.Find(signature);}
 bool AcpiNvsContains(uint64_t address,uint32_t bytes){return ContainsFirmware(address,bytes,true);}
 bool AcpiMmioMapValid(){return g_mmioMapValid;}

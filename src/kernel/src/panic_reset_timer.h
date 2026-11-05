@@ -41,4 +41,23 @@ PanicResetResult PanicResetAfterIntervals(Io& io, uint32_t intervals, uint32_t p
     io.writeGate(saved);
     return PanicResetResult::ResetReturned;
 }
+
+// ACPI PM timer fallback: 24 low bits tick at 3,579,545 Hz. Each interval is
+// at least 50 ms; splitting it avoids ambiguity across the 24-bit wrap.
+// A stalled timer returns without resetting. The caller owns reset authority.
+template<class Io>
+PanicResetResult PanicResetAfterPmIntervals(Io& io,uint32_t intervals,uint32_t pollLimit) {
+    constexpr uint32_t mask=0xffffffu, ticks=178978;
+    if(!intervals || intervals>12000 || !pollLimit || pollLimit>100000000)return PanicResetResult::Invalid;
+    for(uint32_t n=0;n<intervals;++n) {
+        const uint32_t start=io.readTimer()&mask;bool elapsed=false;
+        for(uint32_t i=0;i<pollLimit;++i) {
+            const uint32_t now=io.readTimer()&mask;
+            if(((now-start)&mask)>=ticks){elapsed=true;break;}
+            io.pause();
+        }
+        if(!elapsed)return PanicResetResult::TimerFailed;
+    }
+    io.issueReset();return PanicResetResult::ResetReturned;
+}
 }

@@ -20,8 +20,15 @@ struct Pit {
     void pause() {}
     void issueReset() { ++resetCalls; }
 };
+struct Pm {
+    uint32_t value=0xffff00,step=100000;unsigned resets=0;
+    uint32_t readTimer(){const auto old=value;value=(value+step)&0xffffff;return old;}
+    void pause(){}
+    void issueReset(){++resets;}
+};
 int main() {
     using brook::PanicResetAfterIntervals;
+    using brook::PanicResetAfterPmIntervals;
     using brook::PanicResetResult;
     Pit normal;
     assert(PanicResetAfterIntervals(normal, 3, 10) == PanicResetResult::ResetReturned);
@@ -39,4 +46,9 @@ int main() {
     assert(PanicResetAfterIntervals(invalid, 12001, 3) == PanicResetResult::Invalid);
     assert(PanicResetAfterIntervals(invalid, 1, 0) == PanicResetResult::Invalid);
     assert(invalid.resetCalls == 0 && invalid.controlCalls == 0);
+    Pm pm;
+    assert(PanicResetAfterPmIntervals(pm,3,3)==PanicResetResult::ResetReturned && pm.resets==1);
+    Pm stuck;stuck.step=0;
+    assert(PanicResetAfterPmIntervals(stuck,1,3)==PanicResetResult::TimerFailed && !stuck.resets);
+    assert(PanicResetAfterPmIntervals(stuck,0,3)==PanicResetResult::Invalid && !stuck.resets);
 }

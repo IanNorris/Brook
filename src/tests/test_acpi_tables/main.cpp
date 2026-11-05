@@ -40,6 +40,15 @@ struct Firmware {
 };
 int main(){
     Firmware f;assert(f.init());auto reset=AcpiGetResetInfo();assert(reset.available && reset.port==0xcf9 && reset.value==6);
+    assert(!AcpiGetPmTimerInfo().available);
+    Firmware::put32(f.fadt+76,0x408);f.fadt[91]=4;f.fadtCrc();assert(f.init());
+    assert(AcpiGetPmTimerInfo().available && AcpiGetPmTimerInfo().port==0x408 && !AcpiGetPmTimerInfo().wide);
+    Firmware::put32(f.fadt+112,(1u<<10)|(1u<<8));f.fadt[208]=1;f.fadt[209]=32;f.fadt[211]=3;
+    Firmware::put64(f.fadt+212,0x508);f.fadtCrc();assert(f.init());
+    assert(AcpiGetPmTimerInfo().available && AcpiGetPmTimerInfo().port==0x508 && AcpiGetPmTimerInfo().wide);
+    f.fadt[208]=0;f.fadtCrc();assert(f.init() && AcpiGetPmTimerInfo().port==0x408);
+    f.fadt[91]=3;f.fadtCrc();assert(f.init() && !AcpiGetPmTimerInfo().available);
+    f.reset();assert(f.init());
     // Enumeration retains duplicate root entries and exposes DSDT only via a
     // checksum-validated FADT reference. Firmware spans remain bounded.
     {
