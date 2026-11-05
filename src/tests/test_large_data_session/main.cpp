@@ -7,6 +7,7 @@ static void put32(uint8_t* p,uint32_t v){for(int i=0;i<4;++i)p[i]=uint8_t(v>>(8*
 struct Disk {
     uint8_t sb[1024]{},gdt[32]{},uuid[16]{};
     unsigned reads=0,writes=0,flushes=0;int failRead=0,failWrite=0,failFlush=0,shortRead=0,shortWrite=0;
+    bool ignoreWrite=false;
     Disk(){
         put32(sb,1024);put32(sb+4,4096);put32(sb+12,4000);put32(sb+16,1000);
         put32(sb+24,2);put32(sb+28,2);put32(sb+32,32768);put32(sb+36,32768);put32(sb+40,1024);
@@ -23,7 +24,7 @@ struct Disk {
         [](void* p,uint64_t at,const void* data,uint32_t n)->int{auto& d=*static_cast<Disk*>(p);++d.writes;
             if(d.failWrite==int(d.writes))return -5;if(at!=1082 || n!=2)return -22;
             if(d.shortWrite==int(d.writes)){std::memcpy(d.sb+58,data,1);return 1;}
-            std::memcpy(d.sb+58,data,n);return int(n);},
+            if(!d.ignoreWrite)std::memcpy(d.sb+58,data,n);return int(n);},
         [](void* p)->int{auto& d=*static_cast<Disk*>(p);++d.flushes;return d.failFlush==int(d.flushes)?-5:0;}};}
 };
 int main(){
@@ -34,9 +35,9 @@ int main(){
     assert(s.Arm() && s.Finish(d.Io(),false)==-1 && !LargeExt2Read16(d.sb+58));
     assert(s.Finish(d.Io(),true)==0 && LargeExt2Read16(d.sb+58)==1 && s.clean);
     assert(s.Finish(d.Io(),true)==0 && d.writes==2);
-    for(int fault=1;fault<=4;++fault){
+    for(int fault=1;fault<=5;++fault){
         Disk bad;LargeDataSession session;
-        if(fault<=2)bad.failRead=fault;else if(fault==3)bad.failWrite=1;else bad.failFlush=1;
+        if(fault<=2)bad.failRead=fault;else if(fault==3)bad.failWrite=1;else if(fault==4)bad.failFlush=1;else bad.failRead=3;
         assert(session.Begin(bad.Io(),bytes,bad.uuid,scratch,sizeof(scratch))<0 && !session.Arm());
         if(fault>=3)assert(session.dirtyAttempted && session.Begin(bad.Io(),bytes,bad.uuid,scratch,sizeof(scratch))<0);
         const auto writes=bad.writes;assert(session.Finish(bad.Io(),true)==0 && bad.writes==writes);
@@ -45,12 +46,16 @@ int main(){
     assert(rejected.Begin(dirty.Io(),bytes,dirty.uuid,scratch,sizeof(scratch))==-117 && dirty.reads==1 && !dirty.writes);
     Disk bad;put32(bad.gdt,1);LargeDataSession metadata;
     assert(metadata.Begin(bad.Io(),bytes,bad.uuid,scratch,sizeof(scratch))==-22 && !bad.writes);
-    for(int shortAt=1;shortAt<=2;++shortAt){
+    for(int shortAt=1;shortAt<=3;++shortAt){
         Disk x;LargeDataSession session;x.shortRead=shortAt;
-        assert(session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch))<0 && !x.writes);
+        assert(session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch))<0 && !session.Arm());
+        assert(x.writes==(shortAt==3?1u:0u));
     }
     {Disk x;LargeDataSession session;x.shortWrite=1;
         assert(session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch))<0 && session.dirtyAttempted && !session.Arm());
+        assert(session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch))<0 && x.writes==1);}
+    {Disk x;LargeDataSession session;x.ignoreWrite=true;
+        assert(session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch))==-5 && session.dirtyAttempted && !session.Arm());
         assert(session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch))<0 && x.writes==1);}
     for(int fault=1;fault<=2;++fault){
         Disk x;LargeDataSession session;assert(!session.Begin(x.Io(),bytes,x.uuid,scratch,sizeof(scratch)) && session.Arm());

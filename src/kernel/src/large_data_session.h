@@ -26,6 +26,12 @@ struct LargeDataSession {
         const uint8_t stateBytes[2]={0,0};dirtyAttempted=true;
         r=io.write(io.context,1082,stateBytes,2);if(r!=2)return r<0?r:-5;
         r=io.flush(io.context);if(r)return r<0?r:-5;
+        // A successful write and flush are not enough to authorize a later
+        // reset: confirm the loader will see this same filesystem as dirty.
+        r=io.read(io.context,1024,sb,sizeof(sb));if(r!=int(sizeof(sb)))return r<0?r:-5;
+        LargeExt2Geometry verified{};
+        if(LargeExt2ClassifyHeader(sb,sizeof(sb),bytes,uuid,verified)!=LargeExt2HeaderState::NeedsCheck ||
+           LargeExt2Read16(sb+58)!=0)return -5;
         dirty=true;return 0;
     }
     bool Arm(){if(!dirty || clean)return false;armed=true;return true;}

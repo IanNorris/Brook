@@ -9,8 +9,10 @@
 #include "panic_test_reset.h"
 #include "net.h"
 #endif
-#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
 #include "fw_cfg.h"
+#endif
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "panic.h"
 #include "shutdown.h"
 #endif
@@ -241,6 +243,15 @@ void Worker(void* arg) {
         uint8_t drive=2;
         if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive))handoff=-5;
         if(handoff) {KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d\n",handoff);return;}
+#if defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
+        // Only the disposable QEMU fixture supplies both explicit requests.
+        // Physical enablement additionally requires verified firmware paths.
+        char resetRequest[8]{};
+        const auto resetBytes=FwCfgReadFile("opt/guard-desktop-panic-reset",resetRequest,sizeof(resetRequest));
+        if(resetBytes==6 && !memcmp(resetRequest,"test-1",6) && PlatformPowerGetPlan().q35Reset &&
+           !PlatformPowerGetPlan().resetDisabledByLaunch)
+            KPrintf("GUARD_DESKTOP_PANIC_RESET armed=%u\n",PanicRecoveryResetArm()?1u:0u);
+#endif
         GuardTestPrepareDesktopHome();
         const int script=ShellExecScript("/boot/INIT.RC");
         KPrintf("GUARD_DESKTOP_HANDOFF_SCRIPT status=%d\n",script);

@@ -18,6 +18,9 @@
 #include "compositor.h"
 #include "serial.h"
 #include "string.h"
+#if defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
+#include "panic_test_reset.h"
+#endif
 
 namespace brook {
 namespace {
@@ -108,6 +111,11 @@ void Worker(void*) {
             bool closed=false;uint32_t births=0;SchedulerUserBirthStatus(&closed,&births);
             const auto cleanup=ProcessGetCleanupStatus();uint32_t apps=0;
             if(closed&&!births&&!Census(&apps)&&!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers) {
+#if defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST)
+                // The clean-marker transaction may fail after an uncertain
+                // write. Do not force a reset across shutdown's final sync.
+                PanicRecoveryResetDisarm();
+#endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
                 if(!SsdQemuInstallCloseReady()){SchedulerSleepMs(25);continue;}
 #endif
