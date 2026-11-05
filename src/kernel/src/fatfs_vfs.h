@@ -49,6 +49,8 @@ int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* mount);
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 int FatFsPrivateRecoveryArmJournal(FatPrivateMount* mount);
+int FatFsPrivateRecoveryReadPanic(FatPrivateMount* mount,uint8_t* out,uint32_t capacity,
+                                  uint64_t* sequence,uint32_t* bytes,uint32_t* crc);
 #endif
 #endif
 // True only for a streaming regular FIL whose retained drive binding is immutable.

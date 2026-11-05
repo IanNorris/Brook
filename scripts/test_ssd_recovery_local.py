@@ -729,6 +729,10 @@ def main():
             reboot_marker='GUARD_PENDING_INCOMPLETE records=0' if a.guard_panic_after_pending else 'GUARD_PANIC_JOURNAL pin=0 arm=0'
             boot_menu_fixture(disk,a.firmware.resolve(strict=True),reboot,False,reboot_marker,
                               90,True,sata_snapshot=True,sata_serial='BROOK-RECOVERY-QA')
+            reboot_text=(reboot/'serial.log').read_text(errors='replace')
+            raw_packet=bytes.fromhex(packet)
+            prior=f'GUARD_PANIC_PRIOR sequence=1 bytes={len(raw_packet)} crc={zlib.crc32(raw_packet):x}'
+            if prior not in reboot_text:raise RuntimeError('next boot did not recover the captured panic snapshot')
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=contents:
                 raise RuntimeError('captured journal changed after the next boot')
             if a.serial_output:

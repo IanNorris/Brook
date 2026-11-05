@@ -25,6 +25,9 @@
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "guard_checker_runner.h"
+#endif
 #include "../../drivers/intel_hda/hda_probe.h"
 namespace brook {
 namespace {
@@ -110,6 +113,27 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"completed_frame_copy_api\":1,\"bulk_helper_api\":");r.number(bulk?1:0);
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    constexpr char priorPrefix[]="bridge hardware recovery-panic ";
+    if(Prefix(command,priorPrefix)) {
+        const char* p=command+sizeof(priorPrefix)-1;uint32_t offset=0,count=0;
+        if(!Decimal(p,offset) || *p++!=' ' || !Decimal(p,count) || *p || count>512) {
+            DebugChannelSend("{\"recovery_panic_error\":\"Expected offset and byte count 0..512\"}\n");return true;
+        }
+        GuardPanicSnapshot snapshot{};
+        if(!GuardRecoveryPanicSnapshot(snapshot)) {
+            DebugChannelSend("{\"recovery_panic_error\":\"No validated panic record\"}\n");return true;
+        }
+        if(offset>snapshot.bytes || count>snapshot.bytes-offset) {
+            DebugChannelSend("{\"recovery_panic_error\":\"Invalid byte range\"}\n");return true;
+        }
+        Reply r;r.text("{\"recovery_panic_api\":1,");r.field("sequence",snapshot.sequence);
+        r.text(",");r.field("bytes",snapshot.bytes);r.text(",");r.field("crc32",snapshot.crc);
+        r.text(",");r.field("offset",offset);r.text(",\"hex\":\"");
+        const char* hex="0123456789abcdef";for(uint32_t i=0;i<count;++i){const auto b=snapshot.data[offset+i];r.append(hex[b>>4]);r.append(hex[b&15]);}
+        r.text("\"}\n");r.send();return true;
+    }
+#endif
     constexpr char pciPrefix[]="bridge hardware pci ";
     if(!strcmp(command,"bridge hardware dell-i2c-id start")) {
         uint32_t value=0;const auto result=DellI2cIdProbe(value);Reply r;r.text("{\"dell_i2c_id_api\":1,\"result\":");

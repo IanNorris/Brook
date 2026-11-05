@@ -1884,6 +1884,21 @@ int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
 }
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
+int FatFsPrivateRecoveryReadPanic(FatPrivateMount* session,uint8_t* out,uint32_t capacity,
+                                  uint64_t* sequence,uint32_t* bytes,uint32_t* crc)
+{
+    if(!session || !session->journalReady || !session->journalLease || !out || !sequence || !bytes || !crc)return -22;
+    *sequence=0;*bytes=0;*crc=0;
+    struct Reader {
+        FatImageLease* lease;
+        bool read(uint32_t sector,uint8_t* output) {
+            return sector<PanicJournalSectors && FatFsImageRead(lease,uint64_t(sector)*512,output,512)==512;
+        }
+    } reader{session->journalLease};
+    PanicJournalRecord record{};const auto result=PanicJournalReadLatest(reader,out,capacity,record);
+    if(result!=PanicJournalResult::Ok)return result==PanicJournalResult::NoValidRecord?-2:-5;
+    *sequence=record.sequence;*bytes=record.bytes;*crc=record.checksum;return 0;
+}
 int FatFsPrivateRecoveryArmJournal(FatPrivateMount* session)
 {
     if(!session || !session->mount || !session->journalReady || !session->journalLease)return -22;

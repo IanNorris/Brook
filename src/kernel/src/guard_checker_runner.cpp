@@ -4,6 +4,7 @@
 #include "ahci_system_volume.h"
 #include "exec_image.h"
 #include "fatfs_vfs.h"
+#include "panic_journal.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "panic_test_reset.h"
 #endif
@@ -27,6 +28,17 @@
 #include "../../shared/update/recovery_guard.h"
 
 namespace brook {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+namespace {
+uint8_t g_recoveryPanicPacket[PanicJournalPayloadMax]{};
+GuardPanicSnapshot g_recoveryPanic{};
+bool g_recoveryPanicReady=false;
+}
+bool GuardRecoveryPanicSnapshot(GuardPanicSnapshot& out) {
+    out={};if(!__atomic_load_n(&g_recoveryPanicReady,__ATOMIC_ACQUIRE))return false;
+    out=g_recoveryPanic;return true;
+}
+#endif
 namespace {
 // Pinned static dosfstools 4.2 image from nix/nixpkgs.nix. A new checker
 // requires an explicitly reviewed digest and recovery-image rebuild.
@@ -175,11 +187,12 @@ void Worker(void* arg) {
         autoCondition=true;
     }
 #endif
+    bool autoClean=false;
     if(autoCondition) {
         const auto state=AhciSystemGuardDataState(device);
-        if(state==AhciGuardDataState::Clean) {KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
-        if(state!=AhciGuardDataState::NeedsCheck) {KPuts("GUARD_AUTO_INVALID\n");return;}
-        KPuts("GUARD_AUTO_NEEDS_CHECK\n");
+        if(state==AhciGuardDataState::Invalid) {KPuts("GUARD_AUTO_INVALID\n");return;}
+        autoClean=state==AhciGuardDataState::Clean;
+        if(!autoClean)KPuts("GUARD_AUTO_NEEDS_CHECK\n");
     }
     auto* adapter=AhciSystemGuardTestPrepare(device);
     FatPrivateMount* mount=nullptr;
@@ -188,9 +201,22 @@ void Worker(void* arg) {
         AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE mount\n");return;
     }
     const int inspection=FatFsPrivateRecoveryInspect(mount,records[0],records[1]);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    int journalPin=inspection?inspection:FatFsPrivateRecoveryPinJournal(mount);
+    if(!journalPin) {
+        uint64_t sequence=0;uint32_t bytes=0,crc=0;
+        const int read=FatFsPrivateRecoveryReadPanic(mount,g_recoveryPanicPacket,sizeof(g_recoveryPanicPacket),&sequence,&bytes,&crc);
+        if(!read) {
+            g_recoveryPanic={g_recoveryPanicPacket,sequence,bytes,crc};
+            __atomic_store_n(&g_recoveryPanicReady,true,__ATOMIC_RELEASE);
+            KPrintf("GUARD_PANIC_PRIOR sequence=%lu bytes=%u crc=%x\n",sequence,bytes,crc);
+        }
+    }
+#endif
     if(inspection || !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
         AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_INCOMPLETE records=%d\n",inspection);return;
     }
+    if(autoClean) {AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_NO_REPAIR\n");return;}
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
     char journalMode[8]{};
     const auto journalSize=FwCfgReadFile("opt/guard-journal-pin",journalMode,sizeof(journalMode));
@@ -290,7 +316,6 @@ void Worker(void* arg) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     // The checker and disk reservation precede journal acquisition. Failure
     // to capture diagnostics must not by itself prevent filesystem repair.
-    const int journalPin=FatFsPrivateRecoveryPinJournal(mount);
     const int journalArm=journalPin?journalPin:FatFsPrivateRecoveryArmJournal(mount);
     KPrintf("GUARD_PANIC_JOURNAL pin=%d arm=%d\n",journalPin,journalArm);
 #endif
