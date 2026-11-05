@@ -43,6 +43,7 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* mount, void* first128, void* se
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 // Disposable test only: retain a checked fixed journal on the private mount.
 int FatFsPrivateRecoveryPinJournal(FatPrivateMount* mount);
+int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* mount);
 #endif
 // True only for a streaming regular FIL whose retained drive binding is immutable.
 bool FatFsFileSourceReadOnly(Vnode* node);

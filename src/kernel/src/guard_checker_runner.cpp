@@ -18,6 +18,7 @@
 #include "kprintf.h"
 #include "string.h"
 #include "vfs.h"
+#include "vfs_path.h"
 #include "../../shared/update/payload.h"
 #include "../../shared/update/recovery_guard.h"
 
@@ -190,14 +191,52 @@ void Worker(void* arg) {
     char journalMode[8]{};
     const auto journalSize=FwCfgReadFile("opt/guard-journal-pin",journalMode,sizeof(journalMode));
     if(journalSize) {
-        if(journalSize!=6 || memcmp(journalMode,"test-1",6)) {
+        const bool pinOnly=journalSize==6 && !memcmp(journalMode,"test-1",6);
+        const bool publish=journalSize==6 && !memcmp(journalMode,"test-2",6);
+        if(!pinOnly && !publish) {
             AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
         }
         const int pinned=FatFsPrivateRecoveryPinJournal(mount);
         const int repeated=FatFsPrivateRecoveryPinJournal(mount);
         KPrintf("GUARD_JOURNAL_PIN_RESULT status=%d repeated=%d\n",pinned,repeated);
-        // Keep the reservation, private mount and leases for the rest of this
-        // boot; never authorize writes or publish the mount in this test.
+        if(publish && !pinned && repeated==-22) {
+            int publishResult=FatFsPrivateRecoveryPublishJournalTest(mount);
+            KPrintf("GUARD_JOURNAL_PUBLISH_MOUNT status=%d\n",publishResult);
+            if(!publishResult && !AhciSystemGuardTestBeginWrites(adapter))publishResult=-13;
+            if(!publishResult) {
+                VfsPath root{};publishResult=VfsPathRoot(&root);
+                int aliasError=0;
+                auto* alias=!publishResult?VfsOpenAt(root,root,"/media/system/PANIC.BIN",0,0,0,&aliasError):nullptr;
+                KPrintf("GUARD_JOURNAL_PUBLISH_ALIAS opened=%u status=%d\n",alias?1u:0u,aliasError);
+                if(alias) {VfsClose(alias);publishResult=-16;}
+                else if(!publishResult && aliasError!=-16)publishResult=-5;
+                if(!publishResult) {
+                    const int unlinkResult=VfsRemoveAt(root,root,"/media/system/PANIC.BIN",false);
+                    KPrintf("GUARD_JOURNAL_PUBLISH_UNLINK status=%d\n",unlinkResult);
+                    if(unlinkResult!=-16 && unlinkResult!=-95)publishResult=-16;
+                }
+                if(!publishResult) {
+                    const int renameResult=VfsRenameAt(root,root,"/media/system/PANIC.BIN",root,"/media/system/PANIC2.BIN");
+                    KPrintf("GUARD_JOURNAL_PUBLISH_RENAME status=%d\n",renameResult);
+                    if(renameResult!=-16 && renameResult!=-95)publishResult=-16;
+                }
+                if(!publishResult) {
+                    constexpr char witness[]="checked journal remains pinned\n";
+                    int openError=0;
+                    auto* file=VfsOpenAt(root,root,"/media/system/PINTST.TXT",VFS_O_WRITE|VFS_O_CREATE,0644,0,&openError);
+                    uint64_t offset=0;
+                    if(!file)publishResult=-5;
+                    else {
+                        if(VfsWrite(file,witness,sizeof(witness)-1,&offset)!=int(sizeof(witness)-1) || VfsFsync(file))publishResult=-5;
+                        VfsClose(file);
+                    }
+                    if(!publishResult && VfsSync(nullptr))publishResult=-5;
+                }
+                VfsPathRelease(root);
+            }
+            KPrintf("GUARD_JOURNAL_PUBLISH_RESULT status=%d\n",publishResult);
+        }
+        // Keep the reservation, mount and leases for the rest of this boot.
         return;
     }
 #endif

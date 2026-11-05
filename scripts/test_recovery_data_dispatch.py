@@ -20,6 +20,14 @@ def sha(path):
     with path.open('rb') as source:return hashlib.file_digest(source,'sha256').hexdigest()
 
 
+def outside_esp_hash(path):
+    digest=hashlib.sha256()
+    with path.open('rb') as stream:
+        digest.update(stream.read(2048*512));stream.seek(133120*512)
+        for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
+    return digest.hexdigest()
+
+
 def crosslink_root_files(disk,first,source_name,target_name):
     """Make target's first cluster equal source's on a private FAT fixture."""
     with disk.open('r+b') as stream:
@@ -66,7 +74,7 @@ def main():
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):p.error('invalid identity')
     a.output.mkdir(parents=True,exist_ok=False)
     scenarios=('dirty','pending','wrong-uuid','wrong-ata','checker-corrupt','journal-crosslink',
-               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
+               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
     if a.case:
         if a.case not in scenarios:p.error('invalid scenario for this mode')
         scenarios=(a.case,)
@@ -125,7 +133,7 @@ def main():
                 target.seek(133120*512);shutil.copyfileobj(data,target,1024*1024)
             partition.unlink()
             with disk.open('r+b') as target:
-                if scenario in ('dirty','slot-dirty','missing-recovery','corrupt-recovery','wrong-ata','checker-corrupt','journal-crosslink') or scenario.startswith('journal-pin'):
+                if scenario in ('dirty','slot-dirty','missing-recovery','corrupt-recovery','wrong-ata','checker-corrupt','journal-crosslink') or scenario.startswith(('journal-pin','journal-publish')):
                     target.seek(133120*512+1024+58);target.write(b'\0\0')
                 if scenario=='wrong-uuid':target.seek(133120*512+1024+104);target.write(b'\xff')
             guard=bytearray(128);guard[:8]=b'BRKRCV01';struct.pack_into('<QI',guard,8,1,2 if scenario=='pending' else 1)
@@ -133,10 +141,10 @@ def main():
             record=work/'guard.bin';record.write_bytes(guard)
             for name in ('GUARD0.BIN','GUARD1.BIN'):
                 subprocess.run(['mcopy','-o','-i',media,str(record),'::/RECOVERY/'+name],check=True)
-            if scenario=='journal-crosslink' or scenario.startswith('journal-pin'):
+            if scenario=='journal-crosslink' or scenario.startswith(('journal-pin','journal-publish')):
                 contents=bytearray((257 if scenario=='journal-pin-short' else 258)*512)
                 if scenario=='journal-pin-corrupt':contents[0]=0xff
-                if scenario=='journal-pin-existing':
+                if scenario in ('journal-pin-existing','journal-publish-existing'):
                     payload=b'previous panic evidence';contents[:8]=b'BRKPAN01'
                     struct.pack_into('<IIQI',contents,8,1,len(payload),7,zlib.crc32(payload))
                     struct.pack_into('<I',contents,28,zlib.crc32(contents[:512]));contents[512:512+len(payload)]=payload
@@ -153,7 +161,8 @@ def main():
                 selection[124]^=1;corrupt=work/'corrupt-select.bin';corrupt.write_bytes(selection)
                 subprocess.run(['mcopy','-o','-i',media,str(corrupt),'::/RECOVERY/SELECT.BIN'],check=True)
             # Serial output from other CPUs can split the prefix from its ID.
-            before=sha(disk);normal='AUDIO_CONTROL_FAIL';recovery='brook-ssd-recovery-manual-v1'
+            before=sha(disk);outside=outside_esp_hash(disk) if scenario.startswith('journal-publish') else None
+            normal='AUDIO_CONTROL_FAIL';recovery='brook-ssd-recovery-manual-v1'
             isNormal=scenario in ('clean','slot-clean')
             broken=scenario in ('missing-recovery','corrupt-recovery')
             if pair:
@@ -161,6 +170,7 @@ def main():
                         'GUARD_RECORDS_INCOMPLETE mismatch' if scenario=='pending' else
                         'GUARD_CHECK_INCOMPLETE load=-8' if scenario=='checker-corrupt' else
                         'GUARD_CHECK_RESULT exit=1' if scenario in ('journal-crosslink','journal-pin-crosslink') else
+                        'GUARD_JOURNAL_PUBLISH_RESULT status=0' if scenario.startswith('journal-publish') else
                         'GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22' if scenario in ('journal-pin','journal-pin-existing') else
                         'GUARD_JOURNAL_PIN_RESULT status=-22 repeated=-22' if scenario in ('journal-pin-short','journal-pin-corrupt') else 'SSD_GUARD_RESERVATION_FAILED')
             else:expect='Recovery required but payload invalid or missing.' if broken else normal if isNormal else recovery
@@ -169,15 +179,29 @@ def main():
             boot(disk,a.firmware,work,False,expect,90,True,forbid,sata_snapshot=not bool(pair),
                  hold_after_marker=2 if broken or pair else 0,
                  sata_serial=('BROOK-WRONG-DEVICE' if scenario=='wrong-ata' else 'BROOK-RECOVERY-QA') if pair else None,
-                 failure_marker='SSD_GUARD_RESERVATION_FAILED' if scenario.startswith('journal-pin') else None,
-                 extra_fw_cfg=['name=opt/guard-journal-pin,string=test-1'] if scenario.startswith('journal-pin') else None)
-            if sha(disk)!=before:raise RuntimeError('source fixture changed')
+                 failure_marker=('GUARD_JOURNAL_PUBLISH_RESULT status=-' if scenario.startswith('journal-publish') else
+                                 'SSD_GUARD_RESERVATION_FAILED' if scenario.startswith('journal-pin') else None),
+                 extra_fw_cfg=['name=opt/guard-journal-pin,string=test-2' if scenario.startswith('journal-publish') else 'name=opt/guard-journal-pin,string=test-1'] if scenario.startswith(('journal-pin','journal-publish')) else None)
+            if scenario.startswith('journal-publish'):
+                if outside_esp_hash(disk)!=outside:raise RuntimeError('write outside the ESP')
+                if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=contents:raise RuntimeError('published journal changed')
+                if subprocess.check_output(['mtype','-i',media,'::/PINTST.TXT'])!=b'checked journal remains pinned\n':raise RuntimeError('ordinary FAT witness differs')
+                fat=work/'fat.img'
+                with disk.open('rb') as inp, fat.open('wb') as out:
+                    inp.seek(2048*512);remaining=(133120-2048)*512
+                    while remaining:
+                        block=inp.read(min(1024*1024,remaining))
+                        if not block:raise RuntimeError('short FAT partition read')
+                        out.write(block);remaining-=len(block)
+                subprocess.run(['fsck.fat','-n',str(fat)],check=True,stdout=subprocess.DEVNULL,timeout=30)
+            elif sha(disk)!=before:raise RuntimeError('source fixture changed')
             if pair:
                 serial=(work/'serial.log').read_text(errors='replace')
                 lines=serial.splitlines()
                 required=['Recovery required; normal boot blocked.','Brook SSD recovery payload verified']
-                if scenario in ('dirty','pending','checker-corrupt','journal-crosslink') or scenario.startswith('journal-pin'):required+=['SSD_GUARD_RESERVATION_READY']
-                if scenario in ('dirty','pending','journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt'):required+=['GUARD_CHECK_RESULT exit=0']
+                if scenario in ('dirty','pending','checker-corrupt','journal-crosslink') or scenario.startswith(('journal-pin','journal-publish')):required+=['SSD_GUARD_RESERVATION_READY']
+                if scenario in ('dirty','pending','journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt') or scenario.startswith('journal-publish'):required+=['GUARD_CHECK_RESULT exit=0']
+                if scenario.startswith('journal-publish'):required+=['GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22']
                 required+=[expect]
                 if any(lines.count(marker)!=1 for marker in required) or [lines.index(marker) for marker in required]!=sorted(lines.index(marker) for marker in required):
                     raise RuntimeError('missing, repeated or reordered guard outcome')

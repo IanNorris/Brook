@@ -8,6 +8,10 @@
 #endif
 #include "vfs.h"
 #include "vfs_object.h"
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+#include "mount_namespace.h"
+#include "vfs_path.h"
+#endif
 #include "fatfs_object.h"
 #include "process.h"
 #include "fatfs_glue.h"
@@ -107,6 +111,8 @@ struct FatPrivateMount {
     Vnode* journalNode;
     FatImageLease* journalLease;
     bool journalAttempted;
+    bool journalReady;
+    bool journalPublished;
 #endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
     bool pendingAttempted;
@@ -1780,6 +1786,7 @@ int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
     if(alias) {VfsRelease(alias);return -16;}
     if(FatFsUnlink(session->mount,session->mount->pdrv,"/PANIC.BIN")!=-16 ||
        FatFsRename(session->mount,session->mount->pdrv,"/PANIC.BIN","/PANIC2.BIN")!=-16)return -16;
+    session->journalReady=true;
     return 0;
 }
 #endif
@@ -1910,6 +1917,29 @@ static const VfsFsOps g_fatFsOps = {
     .root_object = FatRootObject,
     .vnode_object = FatObjectFromVnode,
 };
+
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session)
+{
+    if(!session || !session->mount || !session->journalReady || !session->journalLease ||
+       __atomic_exchange_n(&session->journalPublished,true,__ATOMIC_ACQ_REL))return -22;
+    auto* data=session->mount;
+    KMutexLock(&g_fatLock);
+    const bool available=data->pdrv<FF_VOLUMES && !g_fatBackgroundMounts[data->pdrv];
+    KMutexUnlock(&g_fatLock);
+    if(!available)return -16;
+    VfsPath root{},target{};
+    int error=VfsPathRoot(&root);
+    if(!error)error=VfsPathResolve(root,root,"/media/system",&target);
+    if(!error)error=VfsMountNamespaceMountFresh(VfsMountNamespaceInitial(),target,"fatfs",&g_fatFsOps,data,data->pdrv,0);
+    VfsPathRelease(target);VfsPathRelease(root);
+    if(error)return error;
+    KMutexLock(&g_fatLock);
+    g_fatBackgroundMounts[data->pdrv]=data;
+    KMutexUnlock(&g_fatLock);
+    return 0;
+}
+#endif
 
 // ---- Public init ----
 
