@@ -80,6 +80,8 @@ def main():
                    help='Run guarded ext2 repair and verification on the private data partition')
     p.add_argument('--guard-complete-test', action='store_true',
                    help='Complete verified recovery on the private QEMU disk')
+    p.add_argument('--guard-auto-restart', action='store_true',
+                   help='Exercise a guest-initiated restart after verified completion')
     p.add_argument('--guard-complete-fail-at', type=int, choices=range(1,12),
                    help='Inject a failure in the guard completion transaction')
     p.add_argument('--guard-desktop-kernel-build', type=Path,
@@ -91,6 +93,8 @@ def main():
     p.add_argument('--guard-ext2-missing-checker', action='store_true',
                    help='Remove the private ext2 checker to test missing-tool handling')
     a = p.parse_args()
+    if a.guard_auto_restart and not a.guard_complete_test:
+        p.error('automatic restart requires the completion fixture')
     if a.dirty and a.missing_checker:
         p.error('choose one failure scenario')
     if a.prepared_pair and (a.dirty or a.missing_checker or a.kernel_build or a.fat_checker):
@@ -411,7 +415,11 @@ def main():
                    '-device', 'ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=' +
                               ('BROOK-WRONG-ID' if a.guard_pending_wrong_serial else 'BROOK-RECOVERY-QA'),
                    '-display', 'none', '-serial', f'file:{serial}',
-                   '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot']
+                   '-monitor', f'unix:{monitor},server=on,wait=off']
+        if a.guard_auto_restart:
+            command += ['-fw_cfg', 'name=opt/guard-complete-restart,string=test-1']
+        else:
+            command += ['-no-reboot']
         if poison:
             command += ['-drive', f'if=none,id=poison,format=raw,file={poison}',
                         '-device', 'virtio-blk-pci,drive=poison']
@@ -493,6 +501,21 @@ def main():
                             for line in complete_lines):
                         raise RuntimeError('guest FAT checker failed: ' + text[-3000:])
                     matched = expected in complete_lines if a.fat_checker else expected in text
+                    if a.guard_auto_restart and matched:
+                        if complete_expected!=2:
+                            time.sleep(2)
+                            if 'GUARD_COMPLETE_TEST_RESTART' in serial.read_text(errors='replace'):
+                                raise RuntimeError('guest restarted after incomplete completion')
+                        else:
+                            # Require the same QEMU process to return through EFI
+                            # and reach normal boot after completion.
+                            after=text.split(expected,1)[1]
+                            if 'GUARD_COMPLETE_TEST_RESTART_RETURNED' in after:
+                                raise RuntimeError('guest reset returned without restarting')
+                            if 'GUARD_COMPLETE_TEST_RESTART' not in after or 'BOOT: complete' not in after:
+                                time.sleep(.2);continue
+                            if after.count('GUARD_COMPLETE_TEST_RESTART')!=1 or 'SSD_GUARD_RESERVATION_READY' in after:
+                                raise RuntimeError('guest re-entered recovery after completion')
                     if selected and matched:
                         if a.guard_ext2_test and not a.guard_pending_fail_at:
                             preen=('GUARD_EXT2_PREEN exit=-8' if a.guard_ext2_bad_checker else

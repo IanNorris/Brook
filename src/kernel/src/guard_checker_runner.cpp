@@ -7,6 +7,9 @@
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
 #include "fw_cfg.h"
 #endif
+#if defined(BROOK_SSD_GUARD_COMPLETE_TEST)
+#include "platform_power.h"
+#endif
 #if defined(BROOK_SSD_GUARD_EXT2_TEST)
 #include "guard_repair_session.h"
 #endif
@@ -218,6 +221,16 @@ void Worker(void* arg) {
         KPuts("GUARD_COMPLETE_TEST_INCOMPLETE repeated\n");return;
     }
     KPrintf("GUARD_COMPLETE_TEST_RESULT outcome=%d\n",complete);
+    // A fixture-only opt-in exercises a real reset after the durable clean
+    // pair. Failures, uncertain completion and returned reset writes never
+    // retry. The production recovery path does not use this hook.
+    char restart[8]{};
+    const auto restartSize=FwCfgReadFile("opt/guard-complete-restart",restart,sizeof(restart));
+    if(complete==2 && restartSize==6 && !memcmp(restart,"test-1",6)) {
+        KPuts("GUARD_COMPLETE_TEST_RESTART\n");
+        if(PlatformPowerIssue(true))SchedulerSleepMs(1000);
+        KPuts("GUARD_COMPLETE_TEST_RESTART_RETURNED\n");
+    }
 #endif
 #endif
     return;
