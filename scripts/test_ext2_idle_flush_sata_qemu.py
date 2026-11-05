@@ -5,6 +5,7 @@ The application tree is synthetic. QEMU process kill is not physical power
 loss, and this test does not establish SSD controller-cache durability.
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -30,8 +31,13 @@ def main():
     parser.add_argument('--compiler', default='x86_64-unknown-linux-musl-gcc')
     parser.add_argument('--guard-provision-test', type=Path,
                         help='Exercise the first-time guard provisioner on this disposable disk')
+    parser.add_argument('--efi-inventory-stage-test', type=Path,
+                        help='Exercise first-time staging of the inventory loader')
+    parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
+    if args.efi_inventory_stage_test and (args.guard_provision_test or not args.inventory_efi):
+        parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
     source, kernel, firmware = (p.resolve(strict=True) for p in (args.image, args.kernel, args.firmware))
     with tempfile.TemporaryDirectory(prefix='brook-ext2-idle-sata-') as temp:
         d = Path(temp)
@@ -90,12 +96,19 @@ def main():
             subprocess.run(['mcopy', '-o', '-i', str(initrd), str(item), '::/ETC/' + name], check=True)
         init = d / 'INIT.RC'
         identity = disk_guid + uuid.UUID(data_part['uuid']).bytes_le.hex() + fs_uuid.hex()
-        if args.guard_provision_test:
+        if args.efi_inventory_stage_test:
+            candidate=args.inventory_efi.resolve(strict=True)
+            digest=hashlib.sha256(candidate.read_bytes()).hexdigest()
+            init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/EFISTAGE.ELF /boot/INV.efi ' + digest + '\n')
+        elif args.guard_provision_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/GUARDP.ELF ' + identity + '\n')
         else:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/IDLEQA.ELF /data/home/IDLE.TXT\n')
         subprocess.run(['mcopy', '-o', '-i', str(initrd), str(init), '::/BOOT/INIT.RC'], check=True)
-        if args.guard_provision_test:
+        if args.efi_inventory_stage_test:
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(args.efi_inventory_stage_test.resolve(strict=True)),'::/BOOT/EFISTAGE.ELF'],check=True)
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(candidate),'::/BOOT/INV.EFI'],check=True)
+        elif args.guard_provision_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.guard_provision_test.resolve(strict=True)),'::/BOOT/GUARDP.ELF'],check=True)
         else:
             binary = d / 'idle.elf'
@@ -122,13 +135,14 @@ def main():
                 deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
                     output = serial.read_text(errors='replace') if serial.exists() else ''
-                    success = 'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK'
+                    success = ('EFI_INVENTORY_STAGE_OK' if args.efi_inventory_stage_test else
+                               'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK')
                     if success in output:
                         if 'ahci direct: ready' not in output:
                             raise RuntimeError('the intended direct data volume was not mounted')
                         print('\n'.join(line for line in output.splitlines() if 'IDLE_' in line), flush=True)
                         break
-                    if any(x in output for x in ('IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH')):
+                    if any(x in output for x in ('IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'EFI_INVENTORY_STAGE_FAILED')):
                         raise RuntimeError(output[-4500:])
                     if process.poll() is not None:
                         raise RuntimeError('QEMU exited: ' + output[-4500:])
@@ -139,6 +153,24 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+        if args.efi_inventory_stage_test:
+            media=f'{sata}@@{esp_part["start"]*512}'
+            actual=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/BROOKINV.EFI'])
+            if actual!=candidate.read_bytes():raise RuntimeError('offline inventory EFI differs')
+            original=subprocess.check_output(['mtype','-i',str(source)+'@@1048576','::/EFI/BOOT/BOOTX64.EFI'])
+            after=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/BOOTX64.EFI'])
+            if after!=original:raise RuntimeError('default EFI changed')
+            fat=d/'fat.img'
+            with sata.open('rb') as inp, fat.open('wb') as out:
+                inp.seek(esp_part['start']*512)
+                remaining=esp_part['size']*512
+                while remaining:
+                    block=inp.read(min(1024*1024,remaining))
+                    if not block:raise RuntimeError('short FAT partition read')
+                    out.write(block);remaining-=len(block)
+            subprocess.run(['fsck.fat','-n',str(fat)],check=True,timeout=30,stdout=subprocess.DEVNULL)
+            print('EFI inventory staging and offline readback: PASS')
+            return
         if args.guard_provision_test:
             import struct, zlib
             media = f'{sata}@@{esp_part["start"]*512}'
