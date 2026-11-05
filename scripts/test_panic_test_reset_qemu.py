@@ -27,9 +27,10 @@ def check_reason(serial, expected):
     log=decoded.get('log_tail')
     if not log or not log['available'] or 'BOOT' not in log['text']:
         raise RuntimeError('panic packet lacks available recent boot log')
+    return decoded
 
 
-def run_case(root, image, kernel, firmware, command, armed, timeout, verify_reboot=False, expect_denied=False):
+def run_case(root, image, kernel, firmware, command, armed, timeout, verify_reboot=False, expect_denied=False, headless=False):
     disk = root / 'disk.raw'
     shutil.copyfile(image, disk)
     esp = str(disk) + '@@1048576'
@@ -55,6 +56,8 @@ def run_case(root, image, kernel, firmware, command, armed, timeout, verify_rebo
         args += ['-no-reboot']
     if armed:
         args += ['-fw_cfg', 'name=opt/brook/panic-test-reset,string=test-1s']
+    if headless:
+        args += ['-fw_cfg', 'name=opt/brook/panic-test-headless,string=yes']
     with (root / 'qemu.log').open('wb') as errors:
         process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors)
         try:
@@ -141,6 +144,14 @@ def main():
         root.mkdir()
         run_case(root, image, kernel, firmware, 'crashtest seriallock', False, args.timeout, expect_denied=True)
         print('unarmed serial-lock test rejected: PASS', flush=True)
+        root = Path(temp) / 'headless-exception'
+        root.mkdir()
+        run_case(root, image, kernel, firmware, 'crashtest ud', True, args.timeout,
+                 verify_reboot=True, headless=True)
+        decoded=check_reason(root/'serial.log', 'Unrecoverable kernel exception')
+        if decoded.get('exception',{}).get('vector')!=6 or 'RIP' not in decoded.get('registers',{}) or not decoded.get('system_info',{}).get('git_hash'):
+            raise RuntimeError('headless exception packet missing vector, RIP or build identity')
+        print('headless exception packet and reboot: PASS', flush=True)
 
 
 if __name__ == '__main__':

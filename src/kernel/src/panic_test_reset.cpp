@@ -9,6 +9,7 @@
 namespace brook {
 namespace {
 bool enabled = false;
+bool headless = false;
 void PanicRaw(const char* text) {
     // Exception handling intentionally suppresses normal SerialPuts.
     while (*text) SerialPanicPutChar(*text++);
@@ -30,6 +31,9 @@ void PanicTestResetConfigure() {
     const auto& power=PlatformPowerGetPlan();
     enabled=size==7 && !memcmp(request,"test-1s",7) && power.q35Reset &&
             !power.resetDisabledByLaunch;
+    char headlessRequest[8]{};
+    const auto headlessSize=FwCfgReadFile("opt/brook/panic-test-headless",headlessRequest,sizeof(headlessRequest));
+    headless=enabled && headlessSize==3 && !memcmp(headlessRequest,"yes",3);
     if(enabled) SerialPuts("PANIC_TEST_RESET_ARMED 1s disposable QEMU only\n");
 }
 void PanicTestResetAfterDump() {
@@ -41,4 +45,5 @@ void PanicTestResetAfterDump() {
     else if(result==PanicResetResult::ResetReturned) PanicRaw("PANIC_TEST_RESET_RETURNED\n");
 }
 bool PanicTestResetEnabled() {return enabled;}
+bool PanicTestHeadlessEnabled() {return headless;}
 }

@@ -1167,7 +1167,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
             volatile uint32_t* physFb = brook::CompositorGetPhysFb(&physStride);
             uint32_t fbW = 0, fbH = 0;
             brook::CompositorGetPhysDims(&fbW, &fbH);
-            if (physFb && fbW && fbH)
+            if (physFb && fbW && fbH && !brook::PanicTestHeadlessEnabled())
             {
                 uint32_t fbStride = physStride * 4; // pixel stride → byte stride
                 brook::PanicCPURegs pregs = {};
@@ -1300,6 +1300,43 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                 // Present the panic screen to the actual scanout (no-op for
                 // direct-mapped FBs; virtio-gpu reverts scanout + transfers/flushes).
                 brook::DisplayPanicPresent();
+            }
+            else
+            {
+                // Do not walk a potentially corrupt exception stack merely
+                // to produce a headless packet. Keep the original RIP and
+                // registers even when no display exists.
+                brook::PanicCPURegs regs = {};
+                regs.rax=ef->rax; regs.rbx=ef->rbx; regs.rcx=ef->rcx; regs.rdx=ef->rdx;
+                regs.rsi=ef->rsi; regs.rdi=ef->rdi;
+                regs.r8=ef->r8; regs.r9=ef->r9; regs.r10=ef->r10; regs.r11=ef->r11;
+                regs.r12=ef->r12; regs.r13=ef->r13; regs.r14=ef->r14; regs.r15=ef->r15;
+                regs.rip=ef->rip; regs.rsp=ef->rsp; regs.rbp=ef->rbp; regs.rflags=ef->rflags;
+                regs.cs=static_cast<uint16_t>(ef->cs); regs.ss=static_cast<uint16_t>(ef->ss);
+                __asm__ volatile("movq %%cr0, %0" : "=r"(regs.cr0));
+                regs.cr2=cr2;
+                __asm__ volatile("movq %%cr3, %0" : "=r"(regs.cr3));
+                __asm__ volatile("movq %%cr4, %0" : "=r"(regs.cr4));
+                brook::PanicStackTrace trace = {};trace.rip[0]=ef->rip;trace.depth=1;
+                brook::PanicExceptionInfo exception = {};
+                exception.vector=static_cast<uint8_t>(vector);
+                exception.errorCode=static_cast<uint32_t>(ef->errorCode);
+                auto* current=brook::ProcessCurrent();exception.pid=current?current->pid:0;
+                brook::PanicSystemInfo system = {};
+                const uint32_t cpu=brook::SmpCurrentCpuIndex();
+                system.cpuIndex=static_cast<uint8_t>(cpu);
+                system.cpuCount=static_cast<uint8_t>(brook::SmpGetCpuCount());
+                uint32_t lo,hi;__asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+                system.tscTicks=(static_cast<uint64_t>(hi)<<32)|lo;
+                auto* tss=GdtGetTss(cpu);system.tssRsp0=tss?tss->rsp[0]:0;
+                const char* hash=brook::BuildGitHash();
+                for(uint32_t i=0;i<brook::PANIC_GIT_HASH_LEN-1 && hash[i];++i)system.gitHash[i]=hash[i];
+                const char* branch=brook::BuildGitBranch();
+                for(uint32_t i=0;i<brook::PANIC_GIT_BRANCH_LEN-1 && branch[i];++i)system.gitBranch[i]=branch[i];
+                static brook::PanicCpuList cpus;
+                brook::PanicCaptureCpuList(&cpus);
+                brook::PanicRenderQR(nullptr,0,0,0,&regs,&trace,&exception,nullptr,&system,nullptr,
+                                     &cpus,"Unrecoverable kernel exception");
             }
         }
 
