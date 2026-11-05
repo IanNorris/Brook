@@ -1038,6 +1038,7 @@ def main():
     ap.add_argument("--elf", metavar="PATH", help="Path to BROOK.elf for symbolication")
     ap.add_argument("--vnc", metavar="HOST:PORT", help="Capture from VNC server")
     ap.add_argument("--serial", metavar="PATH", help="Extract from serial log (PANIC_HEX: line)")
+    ap.add_argument("--packet", metavar="PATH", help="Decode an exported binary panic packet")
     ap.add_argument("--stdin", action="store_true", help="Read hex from stdin (paste mode)")
     ap.add_argument("--save", metavar="PATH", help="Save report to file")
     ap.add_argument("--raw", action="store_true", help="Show raw hex dump")
@@ -1075,6 +1076,15 @@ def main():
         except (KeyError, ValueError) as e:
             print(f"{C.RED}[error]{C.RESET} Base45 decode failed: {e}", file=sys.stderr)
             sys.exit(1)
+    elif args.packet:
+        try:
+            with open(args.packet, 'rb') as stream:
+                raw = stream.read(65537)
+            if not raw or len(raw) > 65536:
+                raise ValueError('packet must contain 1 to 65536 bytes')
+        except (OSError, ValueError) as e:
+            print(f"{C.RED}[error]{C.RESET} Packet read failed: {e}", file=sys.stderr)
+            sys.exit(1)
     elif args.serial:
         try:
             raw = parse_serial_log(args.serial)
@@ -1086,7 +1096,7 @@ def main():
     elif args.image:
         raw = scan_qr(args.image)
     else:
-        ap.error("Provide an image, --hex, --base45, --serial, --stdin, or --vnc")
+        ap.error("Provide an image, --hex, --base45, --packet, --serial, --stdin, or --vnc")
 
     # Symbolicator — use explicit --elf if provided, otherwise let
     # decode_crash() auto-detect from the dump's git hash + symbol archive

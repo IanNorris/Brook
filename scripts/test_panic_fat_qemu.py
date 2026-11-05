@@ -103,7 +103,7 @@ def verify_record(contents,slot,sequence,expected):
         raise RuntimeError('journal packet or checksum mismatch')
 
 
-def run_case(work,image,kernel,firmware,short,timeout,fragmented=False):
+def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=None,normal_kernel=None):
     boot=work/'boot.raw';sata=work/'sata.raw'
     shutil.copyfile(image,boot);shutil.copyfile(image,sata)
     table=json.loads(subprocess.check_output(['sfdisk','--json',str(sata)]))['partitiontable']
@@ -146,7 +146,7 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False):
           '-fw_cfg','name=opt/brook/power,string=q35-reset',
           '-fw_cfg','name=opt/brook/panic-test-reset,string=test-1s',
           '-fw_cfg','name=opt/brook/panic-test-disk,string=journal-fat-1']
-    old_slot=None
+    old_slot=None;latest_packet=None
     for boot_number in range(1 if short else 2):
         serial.unlink(missing_ok=True)
         with (work/f'qemu-{boot_number}.log').open('wb') as errors:
@@ -168,11 +168,37 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False):
                 raise RuntimeError('FAT capture not confirmed: '+output[-5000:])
             line=next((x for x in output.splitlines() if x.startswith('PANIC_HEX:')),None)
             if not line:raise RuntimeError('serial packet absent')
+            latest_packet=bytes.fromhex(line[len('PANIC_HEX:'):])
             contents=subprocess.check_output(['mtype','-i',target,'::/PANIC.BIN'])
-            verify_record(contents,boot_number,boot_number+1,bytes.fromhex(line[len('PANIC_HEX:'):]))
+            verify_record(contents,boot_number,boot_number+1,latest_packet)
             if boot_number==0:old_slot=contents[:SLOT_SECTORS*SECTOR]
             elif contents[:SLOT_SECTORS*SECTOR]!=old_slot:raise RuntimeError('previous slot changed')
         if outside_digest(sata,sectors)!=before:raise RuntimeError('write outside journal sectors')
+    if exporter and not short:
+        # Reboot a regular kernel, without the panic writer's exclusive file
+        # lease, and export through the normal FAT/VFS path as a guest job.
+        init.write_text('run --console --uid 0 /boot/PANICLOG.ELF /media/system/PANIC.BIN /tmp/panic-packet.bin\n')
+        subprocess.run(['mcopy','-o','-i',str(initrd),str(init),'::/BOOT/INIT.RC'],check=True)
+        subprocess.run(['mcopy','-o','-i',str(initrd),str(exporter),'::/BOOT/PANICLOG.ELF'],check=True)
+        subprocess.run(['mcopy','-o','-i',boot_esp,str(initrd),'::/INITRD.IMG'],check=True)
+        subprocess.run(['mcopy','-o','-i',boot_esp,str(normal_kernel),'::/KERNEL/BROOK.ELF'],check=True)
+        serial.unlink(missing_ok=True)
+        with (work/'qemu-export.log').open('wb') as errors:
+            proc=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=errors)
+            try:
+                deadline=time.monotonic()+timeout
+                while time.monotonic()<deadline:
+                    output=serial.read_text(errors='replace') if serial.exists() else ''
+                    if 'PANICLOG:' in output:break
+                    if proc.poll() is not None:raise RuntimeError('export guest exited: '+output[-4000:])
+                    time.sleep(.1)
+                else:raise RuntimeError('export guest timed out: '+output[-4000:])
+            finally:
+                if proc.poll() is None:proc.terminate();proc.wait(timeout=10)
+        expected=f'PANICLOG: sequence=2 bytes={len(latest_packet)} crc32={zlib.crc32(latest_packet):08x} output=/tmp/panic-packet.bin'
+        if expected not in output:raise RuntimeError('guest export mismatch: '+output[-4000:])
+        if subprocess.check_output(['mtype','-i',target,'::/PANIC.BIN'])!=contents:
+            raise RuntimeError('guest export changed the journal')
     partition=work/'esp.img'
     with sata.open('rb') as source,partition.open('wb') as output:
         source.seek(first*SECTOR);remaining=part['size']*SECTOR
@@ -190,12 +216,17 @@ def main():
     parser.add_argument('--firmware',type=Path,required=True)
     parser.add_argument('--timeout',type=int,default=120)
     parser.add_argument('--case',choices=['capture','fragmented','short-file'])
+    parser.add_argument('--exporter',type=Path,help='Static PANICLOG.ELF to exercise after captures')
+    parser.add_argument('--normal-kernel',type=Path,help='Regular kernel for the export boot')
     args=parser.parse_args()
+    if bool(args.exporter)!=bool(args.normal_kernel):parser.error('exporter and normal kernel are required together')
     image,kernel,firmware=(p.resolve(strict=True) for p in (args.image,args.kernel,args.firmware))
     with tempfile.TemporaryDirectory(prefix='brook-panic-fat-') as temp:
         for name,short in [('capture',False),('fragmented',False),('short-file',True)]:
             if args.case and args.case!=name:continue
-            work=Path(temp)/name;work.mkdir();run_case(work,image,kernel,firmware,short,args.timeout,fragmented=name=='fragmented')
+            work=Path(temp)/name;work.mkdir();run_case(work,image,kernel,firmware,short,args.timeout,fragmented=name=='fragmented',
+                exporter=args.exporter.resolve(strict=True) if args.exporter else None,
+                normal_kernel=args.normal_kernel.resolve(strict=True) if args.normal_kernel else None)
             print(name+': PASS',flush=True)
 
 

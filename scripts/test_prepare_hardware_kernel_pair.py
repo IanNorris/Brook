@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import prepare_hardware_kernel_pair as pair
+from test_hardware_recovery_fsck import elf
 
 
 @unittest.skipUnless(all(shutil.which(x) for x in ('mkfs.fat', 'mmd', 'mcopy', 'mtype', 'mdir', 'mattrib')),
@@ -21,7 +22,7 @@ class PreparePair(unittest.TestCase):
         with self.image.open('wb') as f:
             f.truncate(8 * 1024 * 1024)
         subprocess.run(['mkfs.fat', str(self.image)], check=True, stdout=subprocess.DEVNULL)
-        for name in ('DRIVERS', 'ETC'):
+        for name in ('DRIVERS', 'ETC', 'BOOT'):
             subprocess.run(['mmd', '-i', str(self.image), '::/' + name], check=True)
         self.build = self.root / 'build'
         (self.build / 'drivers').mkdir(parents=True)
@@ -78,6 +79,19 @@ class PreparePair(unittest.TestCase):
         with self.assertRaises(ValueError):
             pair.prepare(self.image, self.build, 64, 'test', out, '0' * 64)
         self.assertFalse(out.exists())
+
+    def test_optional_panic_exporter_is_copied_and_recorded(self):
+        exporter=self.root/'exporter';exporter.write_bytes(elf())
+        out=self.root/'out'
+        with patch.object(pair, 'module_version', return_value=64):
+            result=pair.prepare(self.image,self.build,64,'test',out,pair.digest(b'kernel'),exporter)
+        self.assertEqual(result['panic_journal_exporter']['sha256'],pair.digest(exporter.read_bytes()))
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(out/'INITRD.IMG'),'::/BOOT/PANICLOG.ELF']),exporter.read_bytes())
+        exporter.write_bytes(b'invalid')
+        with patch.object(pair, 'module_version', return_value=64):
+            with self.assertRaises(ValueError):
+                pair.prepare(self.image,self.build,64,'test',self.root/'bad',pair.digest(b'kernel'),exporter)
+        self.assertFalse((self.root/'bad').exists())
 
     @unittest.skipUnless(shutil.which('cc'), 'requires a C compiler')
     def test_real_elf_module_metadata(self):

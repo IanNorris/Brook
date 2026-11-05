@@ -48,6 +48,11 @@ if a.compressed_helper:
     run('cp',helper,out/'HWBULKZ.ELF')
     run('mcopy','-o','-i',initrd,out/'HWBULKZ.ELF','::BOOT/HWBULKZ.ELF')
 musl_cxx=os.environ.get('MUSL_CXX') or os.environ['MUSL_CC'].removesuffix('gcc')+'g++'
+run(musl_cxx,'-static','-std=c++17','-O2','-Wall','-Wextra','-Werror',
+    ROOT/'tools/panic_journal_export.cpp','-o',out/'PANICLOG.ELF')
+run('mcopy','-o','-i',initrd,out/'PANICLOG.ELF','::BOOT/PANICLOG.ELF')
+if hashlib.sha256(subprocess.check_output(['mtype','-i',str(initrd),'::BOOT/PANICLOG.ELF'])).hexdigest()!=sha(out/'PANICLOG.ELF'):
+    raise RuntimeError('panic exporter initrd readback mismatch')
 run(musl_cxx,'-static','-std=c++17','-O2','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
     ROOT/'tools/hardware_store_receiver.cpp',ROOT/'tools/hardware_store_transaction.cpp',
     ROOT/'tools/hardware_store_validate.cpp','-o',out/'HWSTORE.ELF')
@@ -78,6 +83,7 @@ run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 files={name:{'bytes':(out/name).stat().st_size,'sha256':sha(out/name)} for name in ['kernel.elf','INITRD.IMG']}
 if files['kernel.elf']['bytes']>8*1024**2 or files['INITRD.IMG']['bytes']>64*1024**2:p.error('Upload exceeds bootstrap slot capacities')
 manifest={'scope':'Opt-in RAM application desktop; kernel/initrd upload only','payload_id':payload_id,'files':files,
+    'panic_journal_exporter_sha256':sha(out/'PANICLOG.ELF'),
     'application_source':'/media/usb/APPS.BRK','application_image':apps,'application_snapshot_limit_bytes':512*1024**2,
     'initial_headroom_bytes':256*1024**2,'update_key_file':str(out/'hardware-update-key'),'recovery_probe':str(recovery),
     'maintenance_probe':str(maintenance),'physical_status':'Prepared; QEMU and physical acceptance required',
