@@ -40,6 +40,10 @@ bool FatFsMountPrivateRecovery(uint8_t pdrv, Device* expected, FatPrivateMount**
 // be partially filled on failure. No write authority or namespace entry is
 // exposed. Success does not validate record contents or third-file crosslinks.
 int FatFsPrivateRecoveryInspect(FatPrivateMount* mount, void* first128, void* second128);
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+// Disposable test only: retain a checked fixed journal on the private mount.
+int FatFsPrivateRecoveryPinJournal(FatPrivateMount* mount);
+#endif
 // True only for a streaming regular FIL whose retained drive binding is immutable.
 bool FatFsFileSourceReadOnly(Vnode* node);
 

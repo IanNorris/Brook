@@ -186,6 +186,21 @@ void Worker(void* arg) {
     if(inspection || !BrookRecoveryGuardAllowsNormal(records[0],128,records[1],128,identity)) {
         AhciSystemGuardTestFinish(adapter);KPrintf("GUARD_PENDING_INCOMPLETE records=%d\n",inspection);return;
     }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    char journalMode[8]{};
+    const auto journalSize=FwCfgReadFile("opt/guard-journal-pin",journalMode,sizeof(journalMode));
+    if(journalSize) {
+        if(journalSize!=6 || memcmp(journalMode,"test-1",6)) {
+            AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
+        }
+        const int pinned=FatFsPrivateRecoveryPinJournal(mount);
+        const int repeated=FatFsPrivateRecoveryPinJournal(mount);
+        KPrintf("GUARD_JOURNAL_PIN_RESULT status=%d repeated=%d\n",pinned,repeated);
+        // Keep the reservation, private mount and leases for the rest of this
+        // boot; never authorize writes or publish the mount in this test.
+        return;
+    }
+#endif
     if(!AhciSystemGuardTestBeginWrites(adapter)) {
         AhciSystemGuardTestFinish(adapter);KPuts("GUARD_PENDING_INCOMPLETE authorization\n");return;
     }

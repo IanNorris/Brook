@@ -103,6 +103,11 @@ struct FatPrivateMount {
     Vnode* nodes[2];
     FatImageLease* leases[2];
     bool inspected;
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+    Vnode* journalNode;
+    FatImageLease* journalLease;
+    bool journalAttempted;
+#endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
     bool pendingAttempted;
 #if defined(BROOK_SSD_GUARD_COMPLETION)
@@ -1746,6 +1751,38 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* se
     for(unsigned i=0;!error && i<2;++i)error=FatFsGuardFlushReadback(session->leases[i],buffers[i]);
     return error;
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
+{
+    if(!session || !session->mount || !session->inspected || !session->leases[0] || !session->leases[1] ||
+       __atomic_exchange_n(&session->journalAttempted,true,__ATOMIC_ACQ_REL))return -22;
+    session->journalNode=FatFsOpen(session->mount,session->mount->pdrv,"/PANIC.BIN",VFS_O_WRITE|VFS_O_READWRITE);
+    if(!session->journalNode)return -2;
+    const int acquired=FatFsAcquireImageLease(session->journalNode,uint64_t(PanicJournalSectors)*512,&session->journalLease);
+    if(acquired)return acquired;
+    uint64_t sectors[PanicJournalSectors]{};
+    int error=FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors);
+    if(error)return error;
+    struct Reader {
+        FatImageLease* lease;
+        bool read(uint32_t sector,uint8_t* out) {
+            return sector<PanicJournalSectors && FatFsImageRead(lease,uint64_t(sector)*512,out,512)==512;
+        }
+    } reader{session->journalLease};
+    PanicJournalRecord a{},b{};
+    if(PanicJournalInspect(reader,0,a)!=PanicJournalResult::Ok ||
+       PanicJournalInspect(reader,1,b)!=PanicJournalResult::Ok ||
+       (a.valid && b.valid && a.sequence==b.sequence) ||
+       (!a.valid && !b.valid && (!a.blank || !b.blank)))return -22;
+    // The lease is retained for the boot, including all later failures.
+    // Confirm normal FAT aliases cannot reopen or remove this object.
+    auto* alias=FatFsOpen(session->mount,session->mount->pdrv,"/panic.bin",VFS_O_STREAM);
+    if(alias) {VfsRelease(alias);return -16;}
+    if(FatFsUnlink(session->mount,session->mount->pdrv,"/PANIC.BIN")!=-16 ||
+       FatFsRename(session->mount,session->mount->pdrv,"/PANIC.BIN","/PANIC2.BIN")!=-16)return -16;
+    return 0;
+}
+#endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)
 bool FatFsPrivateRecoveryGeometryMatches(FatPrivateMount* session,const GuardFatProfile& p) {
     if(!session || !session->mount || (p.type!=16 && p.type!=32))return false;

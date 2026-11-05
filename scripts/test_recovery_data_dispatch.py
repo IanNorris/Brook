@@ -65,7 +65,8 @@ def main():
         p.error('expected the disposable 128 MiB fixture')
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):p.error('invalid identity')
     a.output.mkdir(parents=True,exist_ok=False)
-    scenarios=('dirty','pending','wrong-uuid','wrong-ata','checker-corrupt','journal-crosslink') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
+    scenarios=('dirty','pending','wrong-uuid','wrong-ata','checker-corrupt','journal-crosslink',
+               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
     if a.case:
         if a.case not in scenarios:p.error('invalid scenario for this mode')
         scenarios=(a.case,)
@@ -124,7 +125,7 @@ def main():
                 target.seek(133120*512);shutil.copyfileobj(data,target,1024*1024)
             partition.unlink()
             with disk.open('r+b') as target:
-                if scenario in ('dirty','slot-dirty','missing-recovery','corrupt-recovery','wrong-ata','checker-corrupt','journal-crosslink'):
+                if scenario in ('dirty','slot-dirty','missing-recovery','corrupt-recovery','wrong-ata','checker-corrupt','journal-crosslink') or scenario.startswith('journal-pin'):
                     target.seek(133120*512+1024+58);target.write(b'\0\0')
                 if scenario=='wrong-uuid':target.seek(133120*512+1024+104);target.write(b'\xff')
             guard=bytearray(128);guard[:8]=b'BRKRCV01';struct.pack_into('<QI',guard,8,1,2 if scenario=='pending' else 1)
@@ -132,12 +133,19 @@ def main():
             record=work/'guard.bin';record.write_bytes(guard)
             for name in ('GUARD0.BIN','GUARD1.BIN'):
                 subprocess.run(['mcopy','-o','-i',media,str(record),'::/RECOVERY/'+name],check=True)
-            if scenario=='journal-crosslink':
-                journal=work/'panic.bin';journal.write_bytes(bytes(258*512))
-                other=work/'other.bin';other.write_bytes(bytes(512))
+            if scenario=='journal-crosslink' or scenario.startswith('journal-pin'):
+                contents=bytearray((257 if scenario=='journal-pin-short' else 258)*512)
+                if scenario=='journal-pin-corrupt':contents[0]=0xff
+                if scenario=='journal-pin-existing':
+                    payload=b'previous panic evidence';contents[:8]=b'BRKPAN01'
+                    struct.pack_into('<IIQI',contents,8,1,len(payload),7,zlib.crc32(payload))
+                    struct.pack_into('<I',contents,28,zlib.crc32(contents[:512]));contents[512:512+len(payload)]=payload
+                journal=work/'panic.bin';journal.write_bytes(contents)
                 subprocess.run(['mcopy','-i',media,str(journal),'::/PANIC.BIN'],check=True)
-                subprocess.run(['mcopy','-i',media,str(other),'::/OTHER.BIN'],check=True)
-                crosslink_root_files(disk,2048,b'PANIC   BIN',b'OTHER   BIN')
+                if scenario in ('journal-crosslink','journal-pin-crosslink'):
+                    other=work/'other.bin';other.write_bytes(bytes(512))
+                    subprocess.run(['mcopy','-i',media,str(other),'::/OTHER.BIN'],check=True)
+                    crosslink_root_files(disk,2048,b'PANIC   BIN',b'OTHER   BIN')
             if scenario=='missing-recovery':
                 subprocess.run(['mdel','-i',media,'::/RECOVERY/INITRD.IMG'],check=True)
             if scenario=='corrupt-recovery':
@@ -152,20 +160,24 @@ def main():
                 expect=('GUARD_RECORDS_MATCH' if scenario=='dirty' else
                         'GUARD_RECORDS_INCOMPLETE mismatch' if scenario=='pending' else
                         'GUARD_CHECK_INCOMPLETE load=-8' if scenario=='checker-corrupt' else
-                        'GUARD_CHECK_RESULT exit=1' if scenario=='journal-crosslink' else 'SSD_GUARD_RESERVATION_FAILED')
+                        'GUARD_CHECK_RESULT exit=1' if scenario in ('journal-crosslink','journal-pin-crosslink') else
+                        'GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22' if scenario in ('journal-pin','journal-pin-existing') else
+                        'GUARD_JOURNAL_PIN_RESULT status=-22 repeated=-22' if scenario in ('journal-pin-short','journal-pin-corrupt') else 'SSD_GUARD_RESERVATION_FAILED')
             else:expect='Recovery required but payload invalid or missing.' if broken else normal if isNormal else recovery
             forbid=recovery if isNormal else normal
             # No F5 input: dirty/invalid data must reach verified recovery by itself.
             boot(disk,a.firmware,work,False,expect,90,True,forbid,sata_snapshot=not bool(pair),
                  hold_after_marker=2 if broken or pair else 0,
-                 sata_serial=('BROOK-WRONG-DEVICE' if scenario=='wrong-ata' else 'BROOK-RECOVERY-QA') if pair else None)
+                 sata_serial=('BROOK-WRONG-DEVICE' if scenario=='wrong-ata' else 'BROOK-RECOVERY-QA') if pair else None,
+                 failure_marker='SSD_GUARD_RESERVATION_FAILED' if scenario.startswith('journal-pin') else None,
+                 extra_fw_cfg=['name=opt/guard-journal-pin,string=test-1'] if scenario.startswith('journal-pin') else None)
             if sha(disk)!=before:raise RuntimeError('source fixture changed')
             if pair:
                 serial=(work/'serial.log').read_text(errors='replace')
                 lines=serial.splitlines()
                 required=['Recovery required; normal boot blocked.','Brook SSD recovery payload verified']
-                if scenario in ('dirty','pending','checker-corrupt','journal-crosslink'):required+=['SSD_GUARD_RESERVATION_READY']
-                if scenario in ('dirty','pending'):required+=['GUARD_CHECK_RESULT exit=0']
+                if scenario in ('dirty','pending','checker-corrupt','journal-crosslink') or scenario.startswith('journal-pin'):required+=['SSD_GUARD_RESERVATION_READY']
+                if scenario in ('dirty','pending','journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt'):required+=['GUARD_CHECK_RESULT exit=0']
                 required+=[expect]
                 if any(lines.count(marker)!=1 for marker in required) or [lines.index(marker) for marker in required]!=sorted(lines.index(marker) for marker in required):
                     raise RuntimeError('missing, repeated or reordered guard outcome')
@@ -173,9 +185,9 @@ def main():
                     raise RuntimeError('rejected target unexpectedly admitted')
                 if scenario=='checker-corrupt' and any(x.startswith(('GUARD_CHECK_RESULT','GUARD_RECORDS_')) for x in lines):
                     raise RuntimeError('tampered checker was not rejected after reservation')
-                if scenario=='journal-crosslink' and any(x.startswith('GUARD_RECORDS_') for x in lines):
+                if scenario in ('journal-crosslink','journal-pin-crosslink') and any(x.startswith(('GUARD_RECORDS_','GUARD_JOURNAL_PIN_RESULT')) for x in lines):
                     raise RuntimeError('crosslinked journal unexpectedly reached record admission')
-                if scenario=='journal-crosslink' and not all(x in serial.lower() for x in ('/panic.bin','/other.bin','share clusters')):
+                if scenario in ('journal-crosslink','journal-pin-crosslink') and not all(x in serial.lower() for x in ('/panic.bin','/other.bin','share clusters')):
                     raise RuntimeError('checker did not identify the injected journal crosslink')
                 if scenario=='dirty' and any(x.startswith(('GUARD_CHECK_INCOMPLETE','GUARD_RECORDS_INCOMPLETE')) for x in lines):
                     raise RuntimeError('successful run has contradictory failure')

@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
-         hold_after_marker=0, sata_serial=None, failure_marker=None):
+         hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -44,6 +44,8 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         '-display', 'none', '-serial', f'file:{serial}',
         '-monitor', f'unix:{monitor},server=on,wait=off', '-no-reboot',
     ]
+    for item in extra_fw_cfg or ():
+        command += ['-fw_cfg',item]
     with (work / 'qemu.log').open('wb') as errors:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
         try:
