@@ -23,4 +23,15 @@ int main() {
     assert(!brook::PchWatchdogReadStable(result,changing,live) && !live.captured);
     auto missing=[](uint8_t) {return 0xffffffffu;};
     assert(!brook::PchWatchdogReadStable(result,missing,live));
+    unsigned ioReads=0;auto io=[&](uint16_t port) {++ioReads;assert(port==0x1868 || port==0x1866 || port==0x1872);return uint16_t(port);};
+    brook::PchWatchdogStatus status{};
+    assert(!brook::PchWatchdogReadStatus(result,false,0x1808,stable,io,status) && ioReads==0);
+    assert(!brook::PchWatchdogReadStatus(result,true,0x1908,stable,io,status) && ioReads==0);
+    assert(brook::PchWatchdogReadStatus(result,true,0x1808,stable,io,status));
+    assert(ioReads==3 && status.base==0x1800 && status.control==0x1868 && status.status2==0x1866 && status.timer==0x1872);
+    ioReads=0;n=0;
+    auto altered=[&](uint8_t offset){++n;return offset==0?0x9cc38086u:offset==0x40?(n>6?0x1901u:0x1801u):0x80u;};
+    assert(!brook::PchWatchdogReadStatus(result,true,0x1808,altered,io,status) && ioReads==3 && status.base==0);
+    ioReads=0;auto disabled=[](uint8_t offset){return offset==0?0x9cc38086u:offset==0x40?0x1801u:0u;};
+    assert(!brook::PchWatchdogReadStatus(result,true,0x1808,disabled,io,status) && ioReads==0);
 }

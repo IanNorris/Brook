@@ -11,6 +11,7 @@
 #include "fs/compressed_vfs.h"
 #include "vfs.h"
 #include "pci.h"
+#include "portio.h"
 #include "display_power.h"
 #include "ahci_observe.h"
 #include "ahci_readonly.h"
@@ -30,6 +31,9 @@
 #endif
 #include "../../drivers/intel_hda/hda_probe.h"
 namespace brook {
+#if defined(BROOK_HOST_TEST)
+uint16_t PchWatchdogTestRead16(uint16_t port);
+#endif
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
 bool Prefix(const char* text,const char* prefix){while(*prefix)if(*text++!=*prefix++)return false;return true;}
@@ -539,6 +543,30 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("pch_duty",v.pchDuty);r.text("}");};
         r.text(",\"boot_registers\":");registers(status.original);r.text(",\"current_registers\":");registers(status.current);
         r.text(",\"scope\":\"backlight PWM only; panel link and system remain running\"}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware pch-watchdog-status")) {
+        const uint32_t count=PciBootInventoryCount();PciBootEntry match{};unsigned found=0;
+        if(PciBootInventorySeen()!=count){DebugChannelSend("{\"pch_watchdog_error\":\"incomplete boot inventory\"}\n");return true;}
+        for(uint32_t i=0;i<count;++i) {
+            PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry)){DebugChannelSend("{\"pch_watchdog_error\":\"inventory unavailable\"}\n");return true;}
+            if(entry.device.bus==0 && entry.device.dev==31 && entry.device.fn==0 &&
+               entry.device.vendorId==0x8086 && entry.device.deviceId==0x9cc3 && entry.pchWatchdog.captured) {match=entry;++found;}
+        }
+        const auto& pm=AcpiGetPmTimerInfo();PchWatchdogStatus status{};
+        if(found!=1 || !PchWatchdogReadStatus(match.pchWatchdog,pm.available,pm.port,
+                [](uint8_t offset){return PciConfigRead32(0,31,0,offset);},
+                [](uint16_t port){
+#if defined(BROOK_HOST_TEST)
+                    return PchWatchdogTestRead16(port);
+#else
+                    return inw(port);
+#endif
+                },status)) {
+            DebugChannelSend("{\"pch_watchdog_error\":\"status admission failed\"}\n");return true;
+        }
+        Reply r;r.text("{\"pch_watchdog_status_api\":1,");r.field("pmbase",status.base);
+        r.text(",");r.field("control",status.control);r.text(",");r.field("status2",status.status2);
+        r.text(",");r.field("timer",status.timer);r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware pch-watchdog-pci")) {
         const uint32_t count=PciBootInventoryCount();
