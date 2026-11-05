@@ -1,5 +1,6 @@
 """Run the actual wrapper with a fake game to check argv and saved preferences."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,6 +10,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Launchers(unittest.TestCase):
+    def test_mesa_paths_inherited_or_defaulted(self):
+        with tempfile.TemporaryDirectory() as name:
+            directory=Path(name);game=directory/'game'
+            game.write_text('#!/usr/bin/env python3\nimport json,os\nprint(json.dumps([os.environ[k] for k in ("LIBGL_DRIVERS_PATH","GBM_BACKENDS_PATH","__EGL_VENDOR_LIBRARY_DIRS")]))\n')
+            game.chmod(0o700)
+            text=(ROOT/'data/nix-wrappers/yquake2-play.sh.in').read_text()
+            text=text.replace('/data/yq2',str(directory/'home')).replace('@YQUAKE2_BIN@',str(game)).replace('@MESA_PATH@','/fixture/mesa')
+            wrapper=directory/'wrapper';wrapper.write_text(text)
+            env=os.environ.copy();keys=('LIBGL_DRIVERS_PATH','GBM_BACKENDS_PATH','__EGL_VENDOR_LIBRARY_DIRS')
+            for key in keys:env.pop(key,None)
+            def run():
+                return json.loads(subprocess.check_output(['bash',str(wrapper),'gl3'],env=env,text=True))
+            self.assertEqual(run(),['/fixture/mesa/lib/dri','/fixture/mesa/lib/gbm','/fixture/mesa/share/glvnd/egl_vendor.d'])
+            env.update(dict(zip(keys,('/target/dri','/target/gbm','/target/egl'))))
+            self.assertEqual(run(),['/target/dri','/target/gbm','/target/egl'])
+
     def run_wrapper(self, saved=False, args=None, autoexec=False):
         if args is None:
             args = ['+map', 'base1']
