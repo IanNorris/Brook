@@ -292,20 +292,28 @@ uint32_t brook::PanicCaptureCpuList(brook::PanicCpuList* out)
     return out->count;
 }
 
-// Re-entrance guard — if the panic handler itself faults (e.g. TTY rendering
-// hits an unmapped page), we detect it and emit a minimal serial message + halt.
-static volatile int g_panicNesting = 0;
+// Zero means unclaimed; otherwise this is the panic-owning CPU index plus one.
+// A peer entering panic must not reset while the owner is capturing evidence.
+static uint32_t g_panicOwner = 0;
 
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
     brook::SerialPanicBegin();
 
-    int depth = __atomic_add_fetch(&g_panicNesting, 1, __ATOMIC_SEQ_CST);
-    if (depth > 1)
+    const uint32_t cpu = brook::SmpCurrentCpuIndex();
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&g_panicOwner, &expected, cpu + 1, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
     {
-        // Nested panic — the handler itself faulted.  Serial-only, minimal output.
-        brook::SerialPanicPuts("\n*** DOUBLE PANIC (handler faulted) ***\n");
+        if (expected == cpu + 1)
+        {
+            // The owner re-entered its panic handler; don't touch the journal.
+            brook::SerialPanicPuts("\n*** DOUBLE PANIC (handler faulted) ***\n");
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+            if (brook::PanicRecoveryResetArmed()) brook::PanicTestResetAfterDump();
+#endif
+        }
         for (;;) { __asm__ volatile("hlt"); }
     }
 

@@ -57,6 +57,7 @@ def main():
     parser.add_argument('--auto-desktop-hard-stall',action='store_true',help='Stall a real vCPU and require watchdog capture and reset')
     parser.add_argument('--auto-desktop-headless-panic',action='store_true',help='Force the panic framebuffer lookup to fail and check diagnostic sections')
     parser.add_argument('--auto-desktop-serial-stall',action='store_true',help='Stall at serial packet output after the disk capture')
+    parser.add_argument('--auto-desktop-nested-panic',action='store_true',help='Re-enter KernelPanic on the panic owner after disk capture')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
@@ -78,6 +79,8 @@ def main():
         parser.error('headless panic requires desktop panic and excludes stall and shutdown fixtures')
     if a.auto_desktop_serial_stall and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic):
         parser.error('serial stall requires desktop reset and excludes other panic fixtures')
+    if a.auto_desktop_nested_panic and (not a.auto_desktop_panic or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall):
+        parser.error('nested panic requires desktop panic and excludes other fixtures')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
@@ -262,6 +265,10 @@ def main():
                     if spin is None:raise RuntimeError('no executable self-loop for serial stall fixture')
                     body+=(f'hbreak *{dump:#x}\ncontinue\nset $rip={spin:#x}\n'
                            'echo PANIC_SERIAL_STALLED\\n\ndelete breakpoints\n')
+                if a.auto_desktop_nested_panic:
+                    dump=desktop_symbol('_ZN5brookL18DumpPacketToSerialEPKhj')
+                    body+=(f'hbreak *{dump:#x}\ncontinue\nset $rdi={scratch:#x}\nset $rip={panic:#x}\n'
+                           'echo PANIC_NESTED_INJECTED\\n\ndelete breakpoints\n')
                 body+='detach\nquit\n'
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                            f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'+body)
@@ -349,19 +356,22 @@ def main():
                 raise RuntimeError('desktop panic occurred before mount or unexpectedly armed reset')
             packet=next((line[10:] for line in serial.splitlines() if line.startswith('PANIC_HEX:')),None)
             journal_after=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
-            if a.auto_desktop_serial_stall:
+            if a.auto_desktop_serial_stall or a.auto_desktop_nested_panic:
                 debugger_log=(second/'qemu.log').read_text(errors='replace')
-                (a.output/'desktop-serial-stall-gdb.log').write_text(debugger_log)
-                if 'PANIC_SERIAL_STALLED' not in debugger_log or packet:
-                    raise RuntimeError('serial output was not stopped before packet emission')
+                (a.output/'desktop-interrupted-serial-gdb.log').write_text(debugger_log)
+                expected_injection='PANIC_SERIAL_STALLED' if a.auto_desktop_serial_stall else 'PANIC_NESTED_INJECTED'
+                if expected_injection not in debugger_log or packet:
+                    raise RuntimeError('panic was not interrupted before serial packet emission')
+                if a.auto_desktop_nested_panic and '*** DOUBLE PANIC (handler faulted) ***' not in serial:
+                    raise RuntimeError('nested panic handler did not run')
                 length=struct.unpack_from('<I',journal_after,12)[0]
                 if not 0<length<=65536:raise RuntimeError('invalid journal packet length')
                 packet=journal_after[512:512+length].hex()
-                packet_file=a.output/'desktop-serial-stall-panic.bin';packet_file.write_bytes(bytes.fromhex(packet))
+                packet_file=a.output/'desktop-interrupted-serial-panic.bin';packet_file.write_bytes(bytes.fromhex(packet))
                 decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
                                    '--packet',str(packet_file),'--json'],stderr=subprocess.DEVNULL))
                 if decoded.get('message')!='GDBTEST':raise RuntimeError('serial-stall journal packet lost its reason')
-                (a.output/'desktop-serial-stall-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
+                (a.output/'desktop-interrupted-serial-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
             if not packet:raise RuntimeError('desktop panic packet missing')
             verify_record(journal_after,0,1,bytes.fromhex(packet))
             if a.auto_desktop_hard_stall:
