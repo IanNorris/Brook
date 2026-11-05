@@ -55,7 +55,7 @@ bool AcpiMmioContains(uint64_t address,uint32_t bytes);
 // ownership check. Consumers must never expose caller-selected addresses.
 bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassification& result);
 // Read-only firmware inventory: index 0 is DSDT; subsequent indices select
-// validated SSDT or DMAR entries. No caller-supplied physical addresses.
+// validated SSDT, DMAR or WDAT entries. No caller-supplied physical addresses.
 uint32_t AcpiInventoryCount();
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& header);
 // Copy exactly one checksum-validated DMAR into caller-owned memory. Rejects

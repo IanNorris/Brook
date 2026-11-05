@@ -206,11 +206,13 @@ bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,A
     const uint64_t address=index?g_tables.RootEntry(index-1,&header):g_tables.Dsdt(&header);
     if(!address || offset>header.length || bytes>header.length-offset)return false;
     // Firmware tables such as MSDM can contain product keys. Expose only AML
-    // and the fixed DMA-remapping topology table, never arbitrary ACPI tables.
+    // and fixed DMA-remapping/watchdog description tables, never arbitrary
+    // ACPI tables. Copying WDAT does not execute its register instructions.
     const char* s=header.signature;
     if(!((s[0]=='D' && s[1]=='S' && s[2]=='D' && s[3]=='T') ||
          (s[0]=='S' && s[1]=='S' && s[2]=='D' && s[3]=='T') ||
-         (s[0]=='D' && s[1]=='M' && s[2]=='A' && s[3]=='R')))return false;
+         (s[0]=='D' && s[1]=='M' && s[2]=='A' && s[3]=='R') ||
+         (s[0]=='W' && s[1]=='D' && s[2]=='A' && s[3]=='T')))return false;
     return !bytes || g_tables.CopyTable(address,offset,out,bytes);
 }
 } // namespace brook

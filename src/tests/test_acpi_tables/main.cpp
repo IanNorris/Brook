@@ -81,6 +81,7 @@ int main(){
         assert(!AcpiUniqueDmarCopy(dmar,100,dmarBytes) && dmarBytes==0);
         std::memcpy(f.madt,"DMAR",4);f.madtCrc();assert(!AcpiUniqueDmarCopy(dmar,sizeof(dmar),dmarBytes) && !dmarBytes);
         std::memcpy(f.madt,"APIC",4);f.madtCrc();
+        std::memcpy(f.fadt,"WDAT",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"WDAT",4));
         f.fadt[9]++;assert(!AcpiInventoryRead(1,0,copy,4,table)); // checksum still required
         assert(!AcpiUniqueDmarCopy(dmar,sizeof(dmar),dmarBytes) && !dmarBytes);
         std::memcpy(f.fadt,"FACP",4);f.fadtCrc();
