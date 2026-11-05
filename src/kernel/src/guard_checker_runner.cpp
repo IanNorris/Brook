@@ -188,12 +188,12 @@ void Worker(void* arg) {
         autoCondition=true;
     }
 #endif
-    bool autoClean=false;
+    bool autoClean=false,autoInvalid=false;
     if(autoCondition) {
         const auto state=AhciSystemGuardDataState(device);
-        if(state==AhciGuardDataState::Invalid) {KPuts("GUARD_AUTO_INVALID\n");return;}
+        autoInvalid=state==AhciGuardDataState::Invalid;
         autoClean=state==AhciGuardDataState::Clean;
-        if(!autoClean)KPuts("GUARD_AUTO_NEEDS_CHECK\n");
+        if(!autoClean && !autoInvalid)KPuts("GUARD_AUTO_NEEDS_CHECK\n");
     }
     auto* adapter=AhciSystemGuardTestPrepare(device);
     FatPrivateMount* mount=nullptr;
@@ -214,6 +214,9 @@ void Worker(void* arg) {
         }
     }
 #endif
+    // A damaged or unsupported data filesystem must not prevent retrieval of
+    // an already validated crash journal from the independently checked ESP.
+    if(autoInvalid) {AhciSystemGuardTestFinish(adapter);KPuts("GUARD_AUTO_INVALID\n");return;}
     bool resumePending=false;
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     resumePending=!inspection && BrookRecoveryGuardMatchesPending(records[0],128,records[1],128,identity);
