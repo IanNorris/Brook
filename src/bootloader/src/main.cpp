@@ -11,6 +11,9 @@
 #include "update_slots.h"
 #include "paging.h"
 #include "boot_protocol/boot_protocol.h"
+#if defined(BROOK_EFI_BOOT_INVENTORY)
+#include "boot_variable_inventory.h"
+#endif
 #if defined(BROOK_GUARD_CHECK_DATA)
 #include "recovery_firmware_discovery.h"
 static bool ConfiguredDataIsClean(EFI_HANDLE image,EFI_BOOT_SERVICES* services) {
@@ -32,6 +35,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 
     ConsoleInit(systemTable->ConOut);
     ConsoleSetQuiet(true);
+#if defined(BROOK_EFI_BOOT_INVENTORY)
+    SaveBootVariableInventory(imageHandle,systemTable);
+#endif
 
     // --- Config ---
     LoadConfig(imageHandle, systemTable->BootServices);

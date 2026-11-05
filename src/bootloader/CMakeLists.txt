@@ -63,6 +63,18 @@ target_link_options(bootloader PRIVATE
     "/entry:EfiMain"
 )
 
+# Separate one-time diagnostic: does not alter the regular or guarded target.
+option(BROOK_BUILD_BOOT_INVENTORY "Build a boot-variable inventory loader" OFF)
+if(BROOK_BUILD_BOOT_INVENTORY)
+    get_target_property(INVENTORY_SOURCES bootloader SOURCES)
+    add_executable(bootloader_inventory ${INVENTORY_SOURCES} src/boot_variable_inventory.cpp)
+    target_include_directories(bootloader_inventory PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" ${UEFI_INCLUDE_DIRS} ${SHARED_INCLUDE_DIRS} src)
+    target_compile_options(bootloader_inventory PRIVATE -Wall -Wextra -Werror -Wshadow -Wno-unused-parameter)
+    target_compile_definitions(bootloader_inventory PRIVATE BROOK_EFI_BOOT_INVENTORY=1)
+    target_link_options(bootloader_inventory PRIVATE "/entry:EfiMain")
+    set_target_properties(bootloader_inventory PROPERTIES OUTPUT_NAME "BROOKINV" SUFFIX ".efi")
+endif()
+
 # Separate experimental binary: never replace the generic EFI target by
 # enabling this build option. Deployment requires every firmware-reachable EFI
 # entrypoint to be inventoried and migrated independently.
