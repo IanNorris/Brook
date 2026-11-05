@@ -10,6 +10,7 @@ import hashlib
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import shutil
 import socket
 import struct
@@ -110,6 +111,10 @@ def main():
                    help='Force PIT failure in the disposable debugger and test the ACPI timer')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
+    p.add_argument('--guard-watchdog-duration', action='store_true',
+                   help='Simulate an unchanged peer sample for the complete watchdog interval')
+    p.add_argument('--guard-watchdog-hard-stall', action='store_true',
+                   help='Stall the repair vCPU with interrupts disabled and wait for the watchdog')
     p.add_argument('--guard-panic-network', action='store_true',
                    help='Retrieve the previous panic via the restricted recovery debug listener')
     p.add_argument('--guard-panic-invalid-data', action='store_true',
@@ -160,6 +165,10 @@ def main():
         p.error('PM fallback requires the post-pending panic fixture')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
+    if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
+        p.error('watchdog duration requires the watchdog injection fixture')
+    if a.guard_watchdog_duration and a.guard_watchdog_hard_stall:
+        p.error('choose a watchdog stall fixture')
     if a.guard_panic_network and not a.guard_panic_after_pending:
         p.error('network retrieval requires the post-pending panic fixture')
     if (a.guard_panic_invalid_data or a.guard_panic_missing_guard) and not (a.guard_panic_after_pending and a.guard_panic_network):
@@ -551,7 +560,8 @@ def main():
                     # final stagnant sample, not a real 30-second CPU stall.
                     watchdog=symbol('_ZN5brookL16WatchdogThreadFnEPv')
                     armed=symbol('_ZN5brook23PanicRecoveryResetArmedEv')
-                    progress=symbol('_ZN5brookL18g_recoveryProgressE')+16
+                    progress_base=symbol('_ZN5brookL18g_recoveryProgressE')
+                    progress=progress_base+16
                     from elftools.elf.elffile import ELFFile
                     spin=None
                     with (pair/'KERNEL.ELF').open('rb') as executable:
@@ -564,12 +574,35 @@ def main():
                         f'--start-address={watchdog}',f'--stop-address={watchdog+0x400}'],text=True)
                     if 'call' not in disassembly or f'{armed:x}' not in disassembly or '%r15d' not in disassembly or '%r12' not in disassembly:
                         raise RuntimeError('watchdog injection register assumptions do not match this build')
-                    body=(f'delete breakpoints\nset $rip={spin:#x}\n'
-                          f'hbreak *{armed:#x} if $r15 == 1\ncontinue\n'
-                          f'set *(unsigned long long*){progress:#x}=$r12\n'
-                          f'set *(unsigned int*){progress+8:#x}=29\n'
-                          f'set *(unsigned char*){progress+12:#x}=1\n'
-                          'delete breakpoints\ndetach\nquit\n')
+                    if a.guard_watchdog_hard_stall:
+                        # GDB's QEMU thread numbers correspond to vCPU index+1.
+                        # Prime only the observation baseline, then stop real
+                        # timer interrupts on this CPU for the full interval.
+                        body=('delete breakpoints\nset $cpu=$_thread-1\n'
+                              'if $cpu < 0 || $cpu >= 4\necho Invalid vCPU mapping\nquit 1\nend\n'
+                              'printf "WATCHDOG_STALLED_CPU %d\\n", $cpu\n'
+                              f'set *(unsigned long long*)({progress_base:#x}+16*$cpu)=0\n'
+                              f'set *(unsigned int*)({progress_base+8:#x}+16*$cpu)=0\n'
+                              f'set *(unsigned char*)({progress_base+12:#x}+16*$cpu)=1\n'
+                              f'set $eflags=$eflags & ~0x200\nset $rip={spin:#x}\ndetach\nquit\n')
+                    else:
+                        body=(f'delete breakpoints\nset $rip={spin:#x}\n'
+                              f'hbreak *{armed:#x} if $r15 == 1\n')
+                    if a.guard_watchdog_duration:
+                        # Override the observed tick total, not the watchdog
+                        # state, for its first progressing sample and all 30
+                        # subsequent stagnant observations.
+                        body+=('set $samples=0\ncommands\nsilent\nset $r12=0x123456789abc\n'
+                               'set $samples=$samples+1\nif $samples == 1\n'
+                               'python import time; watchdog_started=time.monotonic()\nend\n'
+                               'if $samples == 31\n'
+                               'python print("WATCHDOG_SAMPLE_SECONDS %.3f" % (time.monotonic()-watchdog_started))\n'
+                               'delete breakpoints\ndetach\nquit\nend\ncontinue\nend\ncontinue\n')
+                    elif not a.guard_watchdog_hard_stall:
+                        body+=(f'continue\nset *(unsigned long long*){progress:#x}=$r12\n'
+                               f'set *(unsigned int*){progress+8:#x}=29\n'
+                               f'set *(unsigned char*){progress+12:#x}=1\n'
+                               'delete breakpoints\ndetach\nquit\n')
                 else:
                     body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
                           f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n' +
@@ -597,6 +630,7 @@ def main():
                 deadline = time.monotonic() + 120
                 selected = False
                 reset_wait_since=None
+                hard_stall_since=None
                 while time.monotonic() < deadline:
                     if debugger and debugger.poll() not in (None,0):
                         raise RuntimeError('panic injection debugger failed: '+(work/'qemu.log').read_text(errors='replace')[-3000:])
@@ -608,8 +642,12 @@ def main():
                         detail = (work / 'qemu.log').read_text(errors='replace')[-4000:]
                         raise RuntimeError('QEMU exited before local check completed: ' + detail)
                     text = serial.read_text(errors='replace') if serial.exists() else ''
+                    if a.guard_watchdog_hard_stall and hard_stall_since is None and 'WATCHDOG_STALLED_CPU' in (work/'qemu.log').read_text(errors='replace'):
+                        hard_stall_since=time.monotonic()
                     if a.guard_panic_after_pending and reset_wait_since is None and 'PANIC_RECOVERY_RESET_WAIT' in text:
                         reset_wait_since=time.monotonic()
+                        if a.guard_watchdog_hard_stall and (hard_stall_since is None or reset_wait_since-hard_stall_since<25):
+                            raise RuntimeError('hard-stall watchdog reset occurred too early')
                     if a.guard_panic_unarmed and 'PANIC_DISK_CAPTURE_OK' in text:
                         time.sleep(7)
                         if process.poll() is not None:raise RuntimeError('unarmed panic unexpectedly reset')
@@ -759,6 +797,10 @@ def main():
                         output.write(serial.read_bytes())
         if a.guard_panic_inject:
             text=serial.read_text(errors='replace')
+            if a.guard_watchdog_duration:
+                match=re.search(r'WATCHDOG_SAMPLE_SECONDS ([0-9.]+)',(work/'qemu.log').read_text(errors='replace'))
+                if not match or float(match.group(1))<25:
+                    raise RuntimeError('watchdog sample interval was missing or too short')
             reset_marker='PANIC_RECOVERY_RESET_WAIT' if a.guard_panic_after_pending else 'PANIC_TEST_RESET_WAIT'
             pending_ok=('GUARD_PENDING_RESULT outcome=2' in text and 'GUARD_PANIC_RESET armed=1' in text) if a.guard_panic_after_pending else 'GUARD_PENDING_RESULT' not in text
             if debugger.returncode!=0 or 'GUARD_PANIC_JOURNAL pin=0 arm=0' not in text or \
@@ -772,7 +814,10 @@ def main():
             decoded_output=StringIO()
             with redirect_stdout(decoded_output):crash_decoder.decode_crash(bytes.fromhex(packet),None,False,True)
             decoded=json.loads(decoded_output.getvalue())
-            expected_message=('Recovery watchdog: CPU1 timer accounting stalled for 30 checks' if a.guard_watchdog_inject else 'GDBTEST')
+            stalled=re.search(r'WATCHDOG_STALLED_CPU ([0-3])',(work/'qemu.log').read_text(errors='replace')) if a.guard_watchdog_hard_stall else None
+            if a.guard_watchdog_hard_stall and not stalled:raise RuntimeError('missing stalled vCPU identity')
+            cpu=stalled.group(1) if stalled else '1'
+            expected_message=(f'Recovery watchdog: CPU{cpu} timer accounting stalled for 30 checks' if a.guard_watchdog_inject else 'GDBTEST')
             if decoded.get('message')!=expected_message or not decoded.get('log_tail',{}).get('available'):
                 raise RuntimeError('panic packet lacks the injected reason or recent log')
             contents=subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])
