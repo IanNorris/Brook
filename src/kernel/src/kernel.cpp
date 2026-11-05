@@ -241,6 +241,9 @@ static void PrepareDesktopHome()
     }
     brook::VfsPathRelease(root);
 }
+#if defined(BROOK_SSD_GUARD_PENDING_TEST)
+namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
+#endif
 
 // Probe a block device for a filesystem (FAT, ext4, or ext2), read BROOK.MNT,
 // and mount at the specified path.  Returns true if mounted.

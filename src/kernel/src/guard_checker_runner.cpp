@@ -325,6 +325,7 @@ void Worker(void* arg) {
                 if(error){KPrintf("GUARD_JOURNAL_DESKTOP_FAIL write=%d open=%d\n",error,openError);return;}
                 KPuts("GUARD_JOURNAL_DESKTOP_PASS\n");
                 if(desktopScript) {
+                    GuardTestPrepareDesktopHome();
                     const int scriptResult=ShellExecScript("/boot/INIT.RC");
                     KPrintf("GUARD_JOURNAL_NORMAL_SCRIPT status=%d\n",scriptResult);
                 }
