@@ -1,4 +1,7 @@
 #include "panic_test_reset.h"
+#if defined(BROOK_AHCI_PANIC_TEST)
+#include "ahci_readonly.h"
+#endif
 #include "idt.h"
 #include "gdt.h"
 #include "serial.h"
@@ -1322,6 +1325,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         // This path already owns the panic print lock. HandleException below
         // deliberately halts a second lock claimant, so the opt-in test reset
         // must run after the visual dump but before that fallback.
+#if defined(BROOK_AHCI_PANIC_TEST)
+        brook::AhciPanicTestCapture();
+#endif
         brook::PanicTestResetAfterDump();
 
         InterruptFrame ifrm;

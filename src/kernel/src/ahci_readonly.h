@@ -25,6 +25,10 @@ int AhciReadOnlyExportRead(uint64_t offset,void* output,uint32_t length);
 // Internal diagnostic read: exactly one 512-byte sector. Write admission is a
 // separate boot-time identity policy; this diagnostic never writes.
 int AhciReadOnlySector(uint64_t lba, void* output);
+#if defined(BROOK_AHCI_PANIC_TEST)
+// Disposable test disk only; retains ownership even if capture fails.
+void AhciPanicTestCapture();
+#endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 int AhciDisposableQemuTest();
 bool AhciDisposableQemuWritable();

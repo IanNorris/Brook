@@ -18,6 +18,11 @@
 #include "apic.h"
 #include "serial.h"
 #include "string.h"
+#if defined(BROOK_AHCI_PANIC_TEST)
+#include "fw_cfg.h"
+#include "panic_journal.h"
+#include "panic_qr.h"
+#endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 #include "ahci_test_admission.h"
 #endif
@@ -44,6 +49,10 @@ struct NormalIoGuard {
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
+#if defined(BROOK_AHCI_PANIC_TEST)
+bool panicTestReady=false,panicTestCandidate=false,panicIoMode=false;
+constexpr uint64_t panicTestStart=4096;
+#endif
 #if defined(BROOK_SSD_INSTALLER)
 bool physicalInstallMode=false;
 bool physicalBlockToolsMode=false;
@@ -83,7 +92,12 @@ struct PortIo {
     }
     bool waitClear(uint32_t offset,uint32_t mask) {
         const uint64_t start=ApicTickCount();
-        for(uint32_t spins=0;spins<100000000u;++spins) {
+        const uint32_t limit=
+#if defined(BROOK_AHCI_PANIC_TEST)
+            panicIoMode?10000000u:
+#endif
+            100000000u;
+        for(uint32_t spins=0;spins<limit;++spins) {
             const uint32_t value=read(offset);
             if(value==0xffffffffu)return false;
             if(!(value&mask))return true;
@@ -95,7 +109,12 @@ struct PortIo {
     }
     bool waitClearFlush(uint32_t offset,uint32_t mask) {
         const uint64_t start=ApicTickCount();
-        for(uint64_t spins=0;spins<2000000000ull;++spins) {
+        const uint64_t limit=
+#if defined(BROOK_AHCI_PANIC_TEST)
+            panicIoMode?10000000ull:
+#endif
+            2000000000ull;
+        for(uint64_t spins=0;spins<limit;++spins) {
             const uint32_t value=read(offset);
             if(value==0xffffffffu)return false;
             if(!(value&mask))return true;
@@ -322,6 +341,17 @@ void AhciReadOnlyInit() {
     const bool parsed=ReadWriteTarget(target,targetPresent);
     writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
         selected,info,AtaSupportsFlushExt(dma+dataOffset,512));
+#if defined(BROOK_AHCI_PANIC_TEST)
+    // This special build has no production write admission. It requires an
+    // explicit QEMU fw_cfg marker and a separate exact-identity scratch disk.
+    char testMarker[16]{};
+    const auto markerBytes=FwCfgReadFile("opt/brook/panic-test-disk",testMarker,sizeof(testMarker));
+    panicTestCandidate=writeEnabled && markerBytes==9 && !memcmp(testMarker,"journal-1",9) &&
+        pci.vendorId==0x8086 && pci.deviceId==0x2922 && pci.bus==0 && pci.dev==31 && pci.fn==2 &&
+        selected==0 && info.sectors==131072 && info.logicalSectorBytes==512 && info.physicalSectorBytes==512 &&
+        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-PANIC-QA");
+    writeEnabled=panicTestCandidate;
+#endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
     // Never fall back to production admission in this test binary. The
     // harness additionally uses only a fresh regular-file copy as the disk.
@@ -396,6 +426,31 @@ void AhciReadOnlyInit() {
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
 #endif
     status.ready=true;status.reason="read-only ATA device ready";
+#if defined(BROOK_AHCI_PANIC_TEST)
+    if(panicTestCandidate) {
+        // A separate 64 MiB unpartitioned disk is required. Accept an empty
+        // journal or a previously valid test capture, never unknown contents.
+        bool safe=ReadBlocks(0,1);
+        if(safe)for(uint32_t i=0;i<512;++i)if(dma[dataOffset+i]){safe=false;break;}
+        struct BootRead {
+            bool read(uint32_t sector,uint8_t* output) {
+                if(sector>=PanicJournalSectors || !ReadBlocks(panicTestStart+sector,1))return false;
+                memcpy(output,dma+dataOffset,512);return true;
+            }
+        } bootRead;
+        PanicJournalRecord a{},b{};
+        if(safe)safe=PanicJournalInspect(bootRead,0,a)==PanicJournalResult::Ok &&
+                     PanicJournalInspect(bootRead,1,b)==PanicJournalResult::Ok &&
+                     ((a.blank && b.blank) || a.valid || b.valid) &&
+                     !(a.valid && b.valid && a.sequence==b.sequence);
+        panicTestReady=safe && status.ready;
+        SerialPuts(panicTestReady?"PANIC_TEST_DISK_READY\n":"PANIC_TEST_DISK_REJECTED\n");
+        char busyMarker[2]{};
+        if(panicTestReady && FwCfgReadFile("opt/brook/panic-test-busy",busyMarker,sizeof(busyMarker))==1 &&
+           busyMarker[0]=='1' && panicGate.EnterNormal())
+            SerialPuts("PANIC_TEST_DISK_BUSY_ARMED\n");
+    }
+#endif
     if(targetPresent)status.reason=writeEnabled?"configured ATA device writable":"ATA write target rejected; device read-only";
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(testWritable)status.reason="disposable QEMU test ATA device writable";
@@ -453,6 +508,36 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     if(ok)memcpy(output,dma+dataOffset,512);
     return ok?512:-5;
 }
+#if defined(BROOK_AHCI_PANIC_TEST)
+void AhciPanicTestCapture() {
+    const uint8_t* packet=nullptr;uint32_t bytes=0;
+    if(!panicTestReady || !PanicCapturedPacket(&packet,&bytes))return;
+    if(!panicGate.EnterPanic()) {
+        const char* message="PANIC_TEST_DISK_BUSY\n";
+        while(*message)SerialPutChar(*message++);
+        return;
+    }
+    panicIoMode=true;
+    struct PanicIo {
+        bool read(uint32_t sector,uint8_t* output) {
+            if(sector>=PanicJournalSectors || !ReadBlocks(panicTestStart+sector,1))return false;
+            memcpy(output,dma+dataOffset,512);return true;
+        }
+        bool write(uint32_t sector,const uint8_t* input) {
+            if(sector>=PanicJournalSectors)return false;
+            memcpy(dma+dataOffset,input,512);AhciReadPlan plan{};
+            return AhciPlanWrite(plan,panicTestStart+sector,1,status.sectors,dmaPhys+dataOffset,dma64) && Run(plan,512);
+        }
+        bool flush() {
+            AhciReadPlan plan{};return AhciPlanFlush(plan,true) && Run(plan,0);
+        }
+    } panicIo;
+    const auto result=PanicJournalWrite(panicIo,packet,bytes);
+    const char* message=result==PanicJournalResult::Ok?"PANIC_TEST_DISK_CAPTURE_OK\n":"PANIC_TEST_DISK_CAPTURE_FAILED\n";
+    while(*message)SerialPutChar(*message++);
+    // Never release panic ownership: other CPUs may not actually have halted.
+}
+#endif
 bool AhciReadOnlyExportInfo(BrookAhciExportInfo& info) {
     info={};if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE) || !exportEnabled || writeEnabled)return false;
     KMutexLock(&ioLock);
