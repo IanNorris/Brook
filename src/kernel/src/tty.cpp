@@ -22,6 +22,17 @@ static uint64_t  g_fbPhysBase         = 0;        // physical base of framebuffe
 static uint32_t  g_fbWidth            = 0;
 static uint32_t  g_fbHeight           = 0;
 static uint32_t  g_fbStride           = 0;        // stride in pixels (not bytes)
+static const FontAtlas* g_ttyFont     = &g_fontAtlas;
+
+static void SelectTtyFont(uint32_t width, uint32_t height)
+{
+    // High-resolution laptop panels otherwise make early recovery messages
+    // unreadably small. Reuse the already-baked desktop atlas; low-resolution
+    // displays retain the original console size.
+    g_ttyFont = width >= 2560 && height >= 1440 ? &g_desktopFont200 : &g_fontAtlas;
+}
+
+uint32_t TtyLineHeight() { return static_cast<uint32_t>(g_ttyFont->lineHeight); }
 
 static int        g_curX              = 0;        // current pen X (pixels)
 static int        g_curY              = 0;        // current line top Y (pixels)
@@ -92,7 +103,7 @@ static inline void WritePixel(int x, int y, uint8_t coverage)
 
 static void ScrollUp()
 {
-    int lh = g_fontAtlas.lineHeight;
+    int lh = g_ttyFont->lineHeight;
     // Move rows within the region up by one line height.
     for (uint32_t row = 0; (int)row + lh < (int)g_rh; row++)
     {
@@ -113,11 +124,11 @@ static void ScrollUp()
 static void Newline()
 {
     g_curX  = 0;
-    g_curY += g_fontAtlas.lineHeight;
-    if ((uint32_t)(g_curY + g_fontAtlas.lineHeight) > g_rh)
+    g_curY += g_ttyFont->lineHeight;
+    if ((uint32_t)(g_curY + g_ttyFont->lineHeight) > g_rh)
     {
         ScrollUp();
-        g_curY = (int)g_rh - g_fontAtlas.lineHeight;
+        g_curY = (int)g_rh - g_ttyFont->lineHeight;
     }
 }
 
@@ -127,7 +138,7 @@ static void Newline()
 
 static void RenderGlyph(int code)
 {
-    const FontAtlas& fa = g_fontAtlas;
+    const FontAtlas& fa = *g_ttyFont;
 
     if (code < (int)fa.firstChar || code >= (int)(fa.firstChar + fa.glyphCount))
         return;
@@ -201,6 +212,7 @@ bool TtyInit(const Framebuffer& fb)
     g_fbWidth  = fb.width;
     g_fbHeight = fb.height;
     g_fbStride = fb.stride / 4u;
+    SelectTtyFont(g_fbWidth, g_fbHeight);
     g_curX     = 0;
     g_curY     = 0;
 
@@ -219,9 +231,9 @@ bool TtyInit(const Framebuffer& fb)
                  g_fbWidth, g_fbHeight,
                  reinterpret_cast<void*>(fbVirt),
                  physBase,
-                 static_cast<uint32_t>(g_fontAtlas.lineHeight),
-                 static_cast<uint32_t>(g_fontAtlas.lineHeight),
-                 static_cast<uint32_t>(g_fontAtlas.ascent));
+                 static_cast<uint32_t>(g_ttyFont->lineHeight),
+                 static_cast<uint32_t>(g_ttyFont->lineHeight),
+                 static_cast<uint32_t>(g_ttyFont->ascent));
     return true;
 }
 
@@ -312,7 +324,7 @@ void TtyPutChar(char c)
     }
     if (c == '\033') { g_ansiState = TTY_ESC; return; }
 
-    const FontAtlas& fa = g_fontAtlas;
+    const FontAtlas& fa = *g_ttyFont;
     int code = static_cast<uint8_t>(c);
 
     switch (c)
@@ -374,7 +386,7 @@ void TtyPutChar(char c)
         // Without this, chars only appear when the compositor next flushes.
         if (g_fbMMIO && g_fbMMIO != g_fbPixels)
         {
-            const FontAtlas& fa2 = g_fontAtlas;
+            const FontAtlas& fa2 = *g_ttyFont;
             if (code >= (int)fa2.firstChar && code < (int)(fa2.firstChar + fa2.glyphCount))
             {
                 const GlyphInfo& gi2 = fa2.glyphs[code - (int)fa2.firstChar];
@@ -638,6 +650,7 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
     g_fbWidth    = w;
     g_fbHeight   = h;
     g_fbStride   = stridePixels;
+    SelectTtyFont(w, h);
 
     // Reset cursor and region.
     g_curX = 0;

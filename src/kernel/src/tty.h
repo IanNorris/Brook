@@ -6,7 +6,7 @@
 // Kernel TTY — renders text to the UEFI framebuffer using a pre-baked glyph atlas.
 //
 // Features:
-//   - Hack 16px anti-aliased glyphs (baked at build time, no FPU needed at runtime)
+//   - Baked anti-aliased glyphs, scaled up on high-resolution displays
 //   - Automatic word-wrap and newline handling
 //   - Scrolling: when the cursor hits the bottom, all rows scroll up by one line
 //   - Configurable foreground/background colour
@@ -23,6 +23,7 @@ volatile uint32_t* TtyGetFramebufferMmio();
 // clears it to the default background colour, and resets the cursor.
 // Returns true on success; false if the VMM cannot map the framebuffer.
 bool TtyInit(const Framebuffer& fb);
+uint32_t TtyLineHeight();
 
 // Output a single character.  Handles \n, \r, \t.  Word-wraps at screen edge.
 void TtyPutChar(char c);

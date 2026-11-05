@@ -1022,7 +1022,7 @@ static int ExecCommand(int argc, const char* const* argv)
             else if (StrEq(argv[2], "bar"))
             {
                 constexpr uint32_t STATUS_BAR_LINES = 6;
-                uint32_t barH = STATUS_BAR_LINES * static_cast<uint32_t>(brook::g_fontAtlas.lineHeight);
+                uint32_t barH = STATUS_BAR_LINES * brook::TtyLineHeight();
                 uint32_t fbW = 0, fbH = 0, fbStride = 0;
                 uint32_t* fbPtr = nullptr;
                 brook::TtyGetFramebuffer(&fbPtr, &fbW, &fbH, &fbStride);
