@@ -1,4 +1,5 @@
 #include <cassert>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -621,6 +622,78 @@ int main(int argc,char** argv){
     int deviceStatus=0;assert(waitpid(failedDevice,&deviceStatus,0)==failedDevice && WIFEXITED(deviceStatus) && !WEXITSTATUS(deviceStatus));
     assert(!FatImageDeviceDestroyUnregistered(device) && !g_imageLeaseMounts[0]);
     alias=FatFsOpen(mount,0,image,VFS_O_STREAM);assert(alias);closeNode(alias);
+    {
+        constexpr uint32_t sectors=PanicJournalSectors;
+        std::vector<uint8_t> content(sectors*512);
+        for(size_t i=0;i<content.size();++i)content[i]=uint8_t(i*31+(i>>9));
+        std::fill_n(content.begin(),512,0);
+        std::fill_n(content.begin()+PanicJournalSlotSectors*512,512,0);
+        Vnode* created=FatFsOpen(mount,0,"/PANIC.BIN",VFS_O_CREATE|VFS_O_WRITE);assert(created);
+        uint64_t pos=0;unsigned paddingCount=0;
+        for(size_t offset=0;offset<content.size();) {
+            const size_t count=std::min(size_t(32768),content.size()-offset);
+            assert(created->ops->write(created,content.data()+offset,count,&pos)==int(count));offset+=count;
+            if(offset<content.size()) {
+                char name[32];std::snprintf(name,sizeof(name),"/PANPAD%u.BIN",paddingCount++);
+                const std::string padding(mount->fs.csize*512,'p');create(name,padding.c_str());
+            }
+        }
+        assert(!created->ops->fsync(created));closeNode(created);
+        Vnode* journal=FatFsOpen(mount,0,"/PANIC.BIN",VFS_O_WRITE|VFS_O_READWRITE);assert(journal);
+        FatImageLease* retained=nullptr;
+        assert(!FatFsAcquireImageLease(journal,content.size(),&retained));
+        assert(retained->linkMap[0]>4); // interleaved files force fragmentation
+        uint64_t mapping[sectors]{};
+        assert(!FatFsJournalSectorMap(retained,mapping,sectors));
+        for(uint32_t i=0;i<sectors;++i) {
+            assert(mapping[i]<disk.size()/512);
+            assert(!std::memcmp(disk.data()+mapping[i]*512,content.data()+i*512,512));
+            for(uint32_t j=0;j<i;++j)assert(mapping[i]!=mapping[j]);
+        }
+        assert(!FatFsOpen(mount,0,"/PANIC.BIN",VFS_O_WRITE));
+        // Exercise the actual journal through the mapped, leased FAT file.
+        // Verify with an independent memory-disk view that no sector outside
+        // that file changed and that its data can be recovered after writes.
+        const auto beforeJournal=disk;
+        struct MappedJournalIo {
+            const uint64_t* sectors;
+            bool read(uint32_t i,uint8_t* out) {
+                return i<PanicJournalSectors && disk_read(0,out,sectors[i],1)==RES_OK;
+            }
+            bool write(uint32_t i,const uint8_t* in) {
+                return i<PanicJournalSectors && disk_write(0,in,sectors[i],1)==RES_OK;
+            }
+            bool flush() {return disk_ioctl(0,CTRL_SYNC,nullptr)==RES_OK;}
+        } mappedIo{mapping};
+        const uint8_t packet[]={0x2d,0x02,0x00,0x01,0x0d,0xf0,0xfe,0xca,0x42};
+        assert(PanicJournalWrite(mappedIo,packet,sizeof(packet))==PanicJournalResult::Ok);
+        uint8_t recovered[sizeof(packet)]{};PanicJournalRecord result;
+        assert(PanicJournalReadLatest(mappedIo,recovered,sizeof(recovered),result)==PanicJournalResult::Ok);
+        assert(result.sequence==1 && !std::memcmp(packet,recovered,sizeof(packet)));
+        std::unordered_set<uint64_t> owned(mapping,mapping+sectors);
+        for(uint64_t i=0;i<disk.size()/512;++i)
+            if(!owned.count(i))assert(!std::memcmp(disk.data()+i*512,beforeJournal.data()+i*512,512));
+        // A damaged extent map must never publish a partial sector list.
+        const pid_t malformed=fork();assert(malformed>=0);
+        if(!malformed) {
+            const DWORD first=retained->linkMap[2];
+            const DWORD needed=(sectors+mount->fs.csize-1)/mount->fs.csize;
+            assert(needed>1);
+            retained->linkMap[0]=6;retained->linkMap[1]=1;retained->linkMap[2]=first;
+            retained->linkMap[3]=needed-1;retained->linkMap[4]=first;retained->linkMap[5]=0;
+            for(auto& entry:mapping)entry=~uint64_t(0);
+            assert(FatFsJournalSectorMap(retained,mapping,sectors)==-5);
+            for(auto entry:mapping)assert(entry==0);
+            _exit(0);
+        }
+        int status=0;assert(waitpid(malformed,&status,0)==malformed && WIFEXITED(status) && !WEXITSTATUS(status));
+        assert(!FatFsReleaseImageLease(retained));closeNode(journal);
+        assert(!FatFsUnlink(mount,0,"/PANIC.BIN"));
+        for(unsigned i=0;i<paddingCount;++i) {
+            char name[32];std::snprintf(name,sizeof(name),"/PANPAD%u.BIN",i);
+            assert(!FatFsUnlink(mount,0,name));
+        }
+    }
     assert(!FatFsMkdir(mount,0,"/RECOVERY",0755));
     for(unsigned i=0;i<3;++i) {
         const char* path=i==0?"/RECOVERY/GUARD0.BIN":i==1?"/RECOVERY/GUARD1.BIN":"/RECOVERY/THIRD.BIN";

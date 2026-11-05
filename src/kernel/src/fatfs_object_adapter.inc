@@ -337,6 +337,58 @@ FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
 #endif
 }
 
+/* Snapshot at most one panic journal's sectors. The retained CLMT has already
+ * been constructed under the FAT mutex; never traverse FAT chains at panic
+ * time. The caller must hold the file lease for the lifetime of the map. */
+FRESULT f_object_image_sectors (FIL* fp, UINT map_entries, uint64_t* out, UINT sectors)
+{
+#if FF_USE_FASTSEEK
+    FATFS* fs; FRESULT result; LBA_t disk_sectors=0; uint64_t mapped[258];
+    UINT i, n=0, at; DWORD clusters=0, needed, entries;
+    if (!out || !sectors || sectors>258) return FR_INVALID_PARAMETER;
+    for (i=0;i<sectors;++i) out[i]=0;
+    if (!fp || !fp->cltbl || map_entries<4 || fp->obj.objsize!=(FSIZE_t)sectors*512)
+        return FR_INVALID_PARAMETER;
+    result=validate(&fp->obj,&fs);if(result!=FR_OK)return result;
+    if(fp->err)return (FRESULT)fp->err;
+    if((fs->fs_type!=FS_FAT16 && fs->fs_type!=FS_FAT32) || SS(fs)!=512 ||
+       !fs->csize || (fs->csize & (fs->csize-1)) || fs->n_fatent<3)
+        return FR_INVALID_PARAMETER;
+    if(disk_ioctl(fs->pdrv,GET_SECTOR_COUNT,&disk_sectors)!=RES_OK || !disk_sectors)
+        return FR_DISK_ERR;
+    needed=(DWORD)(((uint64_t)sectors+fs->csize-1)/fs->csize);
+    entries=fp->cltbl[0];
+    if(entries<4 || entries>map_entries || (entries&1) || fp->cltbl[entries-1]!=0)
+        return FR_INT_ERR;
+    for(at=1;at+1<entries-1;at+=2) {
+        const DWORD length=fp->cltbl[at],first=fp->cltbl[at+1];
+        const DWORD reserved=fs->fs_type==FS_FAT16?0xfff0:0x0ffffff0;
+        DWORD k;
+        if(!length || length>needed-clusters || first<2 || first>=reserved || first>=fs->n_fatent ||
+           length>fs->n_fatent-first || length>reserved-first)return FR_INT_ERR;
+        for(k=0;k<length;++k) {
+            const DWORD cluster=first+k;
+            const uint64_t base=(uint64_t)fs->database+(uint64_t)fs->csize*(cluster-2);
+            LBA_t actual=clst2sect(fs,cluster);UINT j;
+            if(!actual || (uint64_t)actual!=base || base>=disk_sectors || fs->csize>disk_sectors-base)
+                return FR_INT_ERR;
+            for(j=0;j<fs->csize && n<sectors;++j) {
+                UINT previous;const uint64_t sector=base+j;
+                for(previous=0;previous<n;++previous)if(mapped[previous]==sector)return FR_INT_ERR;
+                mapped[n++]=sector;
+            }
+        }
+        clusters+=length;
+    }
+    if(at!=entries-1 || clusters!=needed || n!=sectors)return FR_INT_ERR;
+    for(i=0;i<sectors;++i)out[i]=mapped[i];
+    return FR_OK;
+#else
+    (void)fp;(void)map_entries;(void)out;(void)sectors;
+    return FR_INVALID_PARAMETER;
+#endif
+}
+
 FRESULT f_object_guard_sector (FIL* fp, LBA_t* out)
 {
     FATFS* fs;

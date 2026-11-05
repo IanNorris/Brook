@@ -56,6 +56,10 @@ int FatFsGuardFlushReadback(FatImageLease* lease, void* out);
 // their identities and one-cluster allocations differ on the same FAT mount;
 // does not establish exclusive ownership of the rest of the mount.
 int FatFsGuardPairValidate(FatImageLease* first, FatImageLease* second);
+// Copy the fixed journal file's sector map relative to its bound device. The
+// lease stays pinned. This does not rule out third-file crosslinks or grant
+// raw-write authority.
+int FatFsJournalSectorMap(FatImageLease* lease, uint64_t* out, uint32_t sectors);
 int FatFsImageRead(FatImageLease* lease, uint64_t offset, void* out, uint32_t bytes);
 int FatFsImageWrite(FatImageLease* lease, uint64_t offset, const void* in, uint32_t bytes);
 int FatFsImageFlush(FatImageLease* lease);

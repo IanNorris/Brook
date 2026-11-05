@@ -1,4 +1,5 @@
 #include "fatfs_vfs.h"
+#include "panic_journal.h"
 #if defined(BROOK_SSD_GUARD_CHECK)
 #include "guard_fat_profile.h"
 #endif
@@ -33,6 +34,7 @@ namespace brook {
 // FatFS is NOT thread-safe — all FatFS calls are serialised by this lock.
 static KMutex g_fatLock;
 static bool   g_fatLockInit = false;
+static constexpr uint32_t FAT_IMAGE_MAP_ENTRIES=16384;
 
 // Linux/musl errno values used to report FatFS failures honestly. The kernel
 // has no shared errno header (syscall.cpp defines its own), so the handful we
@@ -1556,7 +1558,7 @@ static int FatFsAcquireFixedLease(Vnode* node,uint64_t bytes,FatImageLease** out
     auto* lease=static_cast<FatImageLease*>(kmalloc(sizeof(FatImageLease)));
     if(!lease)return -12;
     *lease={};
-    constexpr uint32_t mapEntries=16384;
+    constexpr uint32_t mapEntries=FAT_IMAGE_MAP_ENTRIES;
     lease->linkMap=static_cast<DWORD*>(kmalloc(mapEntries*sizeof(DWORD)));
     if(!lease->linkMap){kfree(lease);return -12;}
     KMutexLock(&g_fatLock);
@@ -1652,6 +1654,22 @@ int FatFsGuardFlushReadback(FatImageLease* lease,void* out)
             result=f_object_guard_readback(&file->fil,static_cast<BYTE*>(out));
             if(result!=FR_OK)error=FrToErrno(result);
         }
+    }
+    if(error)lease->error=error;
+    KMutexUnlock(&g_fatLock);return error;
+}
+int FatFsJournalSectorMap(FatImageLease* lease,uint64_t* out,uint32_t sectors)
+{
+    if(out && sectors==PanicJournalSectors)memset(out,0,uint64_t(sectors)*sizeof(*out));
+    if(!lease || !out || sectors!=PanicJournalSectors ||
+       lease->guard || lease->bytes!=uint64_t(sectors)*512)return -22;
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
+    int error=lease->error;
+    if(!error && (file->imageLease!=lease || file->fil.cltbl!=lease->linkMap))error=-22;
+    if(!error) {
+        const auto result=f_object_image_sectors(&file->fil,FAT_IMAGE_MAP_ENTRIES,out,sectors);
+        if(result!=FR_OK)error=FrToErrno(result);
     }
     if(error)lease->error=error;
     KMutexUnlock(&g_fatLock);return error;
