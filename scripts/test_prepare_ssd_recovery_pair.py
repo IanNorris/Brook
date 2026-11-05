@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-from prepare_ssd_recovery_pair import INIT, AUTO_CHECK_INIT, AUTO_CHECK_PAYLOAD_ID, prepare
+from prepare_ssd_recovery_pair import INIT, AUTO_CHECK_INIT, AUTO_CHECK_PAYLOAD_ID, NETWORK_SHORTCUT, FILESYSTEM_SHORTCUT, prepare
 from test_hardware_recovery_fsck import elf
 
 
@@ -92,6 +92,27 @@ class RecoveryPairTest(unittest.TestCase):
                                ('ETC/hardware-payload-id', AUTO_CHECK_PAYLOAD_ID)):
             self.assertEqual(subprocess.check_output(['mtype', '-i', str(output / 'INITRD.IMG'),
                                                        '::' + name]), expected)
+
+    def test_current_pair_manifest_without_wallpaper(self):
+        run('mdel', '-i', str(self.image), '::BOOT/WALLPAPER.RAW')
+        current={'payload_id':'current','kernel_sha256':hashlib.sha256(self.kernel.read_bytes()).hexdigest(),
+                 'initrd_sha256':hashlib.sha256(self.image.read_bytes()).hexdigest()}
+        (self.source/'manifest.json').write_text(json.dumps(current))
+        result=prepare(self.source,self.checker,Path('/bin/true'),self.root/'out')
+        self.assertEqual(result['source_payload_id'],'current')
+        current['initrd_sha256']='0'*64
+        (self.source/'manifest.json').write_text(json.dumps(current))
+        with self.assertRaisesRegex(ValueError,'manifest mismatch'):
+            prepare(self.source,self.checker,Path('/bin/true'),self.root/'bad')
+
+    def test_recovery_tools_and_launcher_shortcuts(self):
+        output=self.root/'out'
+        result=prepare(self.source,self.checker,Path('/bin/true'),output,self.checker,self.checker)
+        self.assertEqual(result['network_diagnostic']['sha256'],hashlib.sha256(self.checker.read_bytes()).hexdigest())
+        for name,expected in (('BOOT/NETCHECK.ELF',self.checker.read_bytes()),
+                              ('BOOT/SHORTCUTS/NETCHECK.RC',NETWORK_SHORTCUT),
+                              ('BOOT/SHORTCUTS/FSCHECK.RC',FILESYSTEM_SHORTCUT)):
+            self.assertEqual(subprocess.check_output(['mtype','-i',str(output/'INITRD.IMG'),'::'+name]),expected)
 
     def test_invalid_local_supervisor_removes_partial_output(self):
         output = self.root / 'out'

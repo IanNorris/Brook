@@ -1,5 +1,31 @@
 # SSD boot generations: proposed design
 
+## SSD-local recovery tools (in progress)
+
+The SSD's currently observed EFI loader predates the F5 recovery menu. Merely
+copying a recovery pair to its ESP therefore does not make it selectable. A
+candidate RAM-only recovery pair includes a static `e2fsck`, a read-only SSD
+check supervisor, and launcher entries for that check and local network/bridge
+diagnostics. Its maintenance block access is limited to the configured ATA
+device; the user-visible filesystem action only runs `e2fsck -f -n`.
+
+The recovery pair and network tool have been exercised in private QEMU boots;
+the pair refused an unrelated synthetic SATA disk, and the network tool was
+launched through the guest launcher and received a local bridge reply. This is
+not yet SSD installation or physical recovery acceptance.
+
+Installing the pair needs a first-install publisher which retains and verifies
+the admitted ESP and its ATA/GPT identities, records a backup and transaction
+receipt, writes and flushes both payloads, reopens and verifies their hashes,
+and publishes `RECOVERY/SELECT.BIN` only afterward. Enable the menu only after
+confirming an F5-capable EFI loader; the currently installed loader must be
+backed up and its replacement tested independently. Interruptions must leave
+the existing normal boot and external recovery path usable. A different
+already-installed pair requires a separate upgrade strategy because the current
+loader has only one recovery bank. A locally selectable write repair also
+needs a separate identity and exclusive-ownership gate; the diagnostic check
+does not authorize it.
+
 The Dell has two verified kernel/initrd slots on its SSD, plus the retained
 legacy root payload and an independent USB recovery stick. Updates and fallback
 between valid pairs have been tested, but an interactive menu and health-based
