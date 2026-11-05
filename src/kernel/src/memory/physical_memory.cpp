@@ -1,6 +1,7 @@
 #include "physical_memory.h"
 #include "oom_recovery.h"
 #include "serial.h"
+#include "panic_serial.h"
 #include "spinlock.h"
 #include "portio.h"
 #include "../memory/virtual_memory.h"  // PhysToVirt (direct map) for frame poison
@@ -1228,12 +1229,13 @@ void PmmEnableTracking()
 // (the whole point of the free-log) actually reaches the serial log.
 static inline void FlRawChar(char c)
 {
-    if (c == '\n') {
-        while ((inb(0x3FD) & 0x20) == 0) {}
-        outb(0x3F8, '\r');
-    }
-    while ((inb(0x3FD) & 0x20) == 0) {}
-    outb(0x3F8, static_cast<uint8_t>(c));
+    static PanicSerialState state;
+    struct Port {
+        bool ready() { return (inb(0x3FD) & 0x20) != 0; }
+        void write(uint8_t byte) { outb(0x3F8, byte); }
+        void pause() { __asm__ volatile("pause" ::: "memory"); }
+    } port;
+    PanicSerialWrite(state, port, c, 100000);
 }
 static inline void FlRawStr(const char* s) { if (s) while (*s) FlRawChar(*s++); }
 static inline void FlRawHex(uint64_t v)
@@ -1294,7 +1296,7 @@ static int PmmDumpFreeLogLocked(uint64_t phys)
         FlRawChar('\n');
         // BRO-179: the dynamic callstack of this alloc/free, symbolized — names
         // WHO performed the operation (the cheap mapCount counters can't).
-        for (uint8_t s = 0; s < r.stackDepth; ++s)
+        for (uint8_t s = 0; s < r.stackDepth && s < REFLOG_STACK_DEPTH; ++s)
         {
             FlRawStr("      #"); FlRawDec(s); FlRawStr(" ");
             FlRawHex(r.stack[s]);
@@ -1368,6 +1370,17 @@ extern "C" int PmmDumpFreeLog(uint64_t phys)
     int found = PmmDumpFreeLogLocked(phys);
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
     return found;
+}
+
+// Panic callers cannot wait for a lock that may belong to a halted CPU.
+// Skip the log if it is busy rather than observing a concurrently updated ring.
+extern "C" bool PmmTryDumpFreeLog(uint64_t phys)
+{
+    uint64_t flags = 0;
+    if (!IrqSpinLockTryAcquire(&g_pmmLock, &flags)) return false;
+    (void)PmmDumpFreeLogLocked(phys);
+    IrqSpinLockRelease(&g_pmmLock, flags);
+    return true;
 }
 
 // BRO-179 fault-context reflog dump. Does NOT take g_pmmLock: an exception

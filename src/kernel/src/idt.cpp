@@ -288,6 +288,7 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
 }
 
 extern "C" int PmmDumpFreeLog(uint64_t phys);  // BRO-176 diag (physical_memory.cpp)
+extern "C" bool PmmTryDumpFreeLog(uint64_t phys);
 
 extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
                             uint32_t* mapCount, uint32_t* tag, uint32_t* ownerPid);
@@ -1097,54 +1098,65 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
                 ExcPutsRaw(" map=");  ExcPutHex(mapc);
                 ExcPutsRaw(" tag=");  ExcPutsRaw(tag < 8 ? tagName[tag] : "?");
                 ExcPutsRaw(" owner=pid"); ExcPutHex(owner); ExcPutsRaw("]\n");
-                // Full ref/unref + alloc/free ring for the frame (re-takes the
-                // PMM lock, safe now that every other CPU is halted).
-                PmmDumpFreeLog(phys);
+                // A halted peer may own the PMM lock. Never wait for it here.
+                if (!PmmTryDumpFreeLog(phys))
+                    ExcPutsRaw("  PMM history unavailable: lock busy\n");
 
-                // BRO-179: name the leaking mapper FIRST — scan every live
-                // process's user page table for a present PTE still pointing at
-                // this recycled frame. Authoritative (PMM mapCount is
-                // unreliable). Done BEFORE the frame[0..7] dump because that dump
-                // reads the corrupt frame through the direct map and has been
-                // observed to nested-fault (the corruption can hit the direct-map
-                // tables themselves), truncating output. The reverse-map reads
-                // OTHER processes' tables, so it survives. All APs are halted and
-                // every table pointer is range-checked.
-                ProcessDumpFrameMappers(phys);
+                bool recoveryResetArmed = false;
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+                recoveryResetArmed = brook::PanicRecoveryResetArmed();
+#endif
+                if (recoveryResetArmed) {
+                    // The reverse-map walk and direct frame reads can fault or
+                    // run indefinitely on corrupt tables, before reset.
+                    ExcPutsRaw("  unsafe page-table scan skipped for armed recovery\n");
+                } else {
 
-                // Dump the corrupt frame's first 8 qwords + the faulting entry.
-                // CLASSIFIES the corruption: if this "page table" is full of
-                // user data (ASCII, 0x00007fff... stack pointers) the frame was
-                // written THROUGH A STALE TLB mapping after being reused — a
-                // missing cross-CPU shootdown on free (the leading hypothesis:
-                // VmmFreePages only does a local Invlpg). If instead a single
-                // entry is a plausible-but-misflagged PTE, it's a torn/garbage
-                // PTE write. The faulting entry index is (CR2 & 0xFFF) / 8.
-                const uint64_t* frame =
-                    reinterpret_cast<const uint64_t*>(kDirectMapBase + phys);
-                ExcPutsRaw("  frame[0..7]:\n");
-                for (uint32_t q = 0; q < 8; q++)
-                {
-                    ExcPutsRaw("    +"); ExcPutHex(q * 8);
-                    ExcPutsRaw(" "); ExcPutHex(frame[q]); ExcPutsRaw("\n");
+                    // BRO-179: name the leaking mapper FIRST — scan every live
+                    // process's user page table for a present PTE still pointing at
+                    // this recycled frame. Authoritative (PMM mapCount is
+                    // unreliable). Done BEFORE the frame[0..7] dump because that dump
+                    // reads the corrupt frame through the direct map and has been
+                    // observed to nested-fault (the corruption can hit the direct-map
+                    // tables themselves), truncating output. The reverse-map reads
+                    // OTHER processes' tables, so it survives. All APs are halted and
+                    // every table pointer is range-checked.
+                    ProcessDumpFrameMappers(phys);
+
+                    // Dump the corrupt frame's first 8 qwords + the faulting entry.
+                    // CLASSIFIES the corruption: if this "page table" is full of
+                    // user data (ASCII, 0x00007fff... stack pointers) the frame was
+                    // written THROUGH A STALE TLB mapping after being reused — a
+                    // missing cross-CPU shootdown on free (the leading hypothesis:
+                    // VmmFreePages only does a local Invlpg). If instead a single
+                    // entry is a plausible-but-misflagged PTE, it's a torn/garbage
+                    // PTE write. The faulting entry index is (CR2 & 0xFFF) / 8.
+                    const uint64_t* frame =
+                        reinterpret_cast<const uint64_t*>(kDirectMapBase + phys);
+                    ExcPutsRaw("  frame[0..7]:\n");
+                    for (uint32_t q = 0; q < 8; q++)
+                    {
+                        ExcPutsRaw("    +"); ExcPutHex(q * 8);
+                        ExcPutsRaw(" "); ExcPutHex(frame[q]); ExcPutsRaw("\n");
+                    }
+                    uint32_t fidx = static_cast<uint32_t>((cr2val & 0xFFF) / 8);
+                    ExcPutsRaw("  faulting entry["); ExcPutHex(fidx);
+                    ExcPutsRaw("] = "); ExcPutHex(frame[fidx]); ExcPutsRaw("\n");
+
+                    // BRO-179 forensic: if any of these qwords carries the 0xDFDF
+                    // poison marker, decode the ORIGINAL owner PID + free-seq and
+                    // dump that frame's alloc/free callstack history — the
+                    // corruption names the frame's previous life and who freed it.
+                    // Try both the heap (kfree-over-live) and PMM (frame) decoders.
+                    ExcPutsRaw("  [BRO179 poison decode of corrupt qwords]\n");
+                    for (uint32_t q = 0; q < 8; q++)
+                    {
+                        PmmDecodePoison(frame[q]);
+                        brook::HeapDecodePoison(frame[q]);
+                    }
+                    PmmDecodePoison(frame[fidx]);
+                    brook::HeapDecodePoison(frame[fidx]);
                 }
-                uint32_t fidx = static_cast<uint32_t>((cr2val & 0xFFF) / 8);
-                ExcPutsRaw("  faulting entry["); ExcPutHex(fidx);
-                ExcPutsRaw("] = "); ExcPutHex(frame[fidx]); ExcPutsRaw("\n");
-
-                // BRO-179 forensic: if any of these qwords carries the 0xDFDF
-                // poison marker, decode the ORIGINAL owner PID + free-seq and
-                // dump that frame's alloc/free callstack history — the
-                // corruption names the frame's previous life and who freed it.
-                // Try both the heap (kfree-over-live) and PMM (frame) decoders.
-                ExcPutsRaw("  [BRO179 poison decode of corrupt qwords]\n");
-                for (uint32_t q = 0; q < 8; q++)
-                {
-                    PmmDecodePoison(frame[q]);
-                    brook::HeapDecodePoison(frame[q]);
-                }
-                PmmDecodePoison(frame[fidx]);
-                brook::HeapDecodePoison(frame[fidx]);
             }
             // These RSVD/corrupt-table faults make the QR renderer re-fault
             // (it walks memory through the same corrupt tables) — that nested

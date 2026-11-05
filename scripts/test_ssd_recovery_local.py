@@ -114,6 +114,8 @@ def main():
                    help='Also force ACPI timer failure and require the armed last-resort reset')
     p.add_argument('--guard-panic-rsvd', action='store_true',
                    help='Inject an exception frame classified as a reserved-bit page fault')
+    p.add_argument('--guard-panic-rsvd-pmm-held', action='store_true',
+                   help='Also inject a held PMM lock and a direct-map fault address')
     p.add_argument('--guard-watchdog-inject', action='store_true',
                    help='Use GDB to trigger the recovery watchdog after its reset gate is armed')
     p.add_argument('--guard-watchdog-duration', action='store_true',
@@ -175,6 +177,8 @@ def main():
     if a.guard_panic_rsvd and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback or
                                a.guard_watchdog_inject or a.guard_panic_network):
         p.error('reserved-bit fixture requires post-pending panic without other injections or network retrieval')
+    if a.guard_panic_rsvd_pmm_held and not a.guard_panic_rsvd:
+        p.error('held PMM lock requires the reserved-bit fixture')
     if a.guard_watchdog_inject and (not a.guard_panic_after_pending or a.guard_panic_pm_fallback):
         p.error('watchdog injection requires post-pending panic without PM fallback injection')
     if (a.guard_watchdog_duration or a.guard_watchdog_hard_stall) and not a.guard_watchdog_inject:
@@ -579,11 +583,16 @@ def main():
                                 if at>=0:trap=segment['p_vaddr']+at;break
                     if trap is None:raise RuntimeError('no executable UD2 for exception fixture')
                     handler=symbol('HandleExceptionFull')
+                    lock=symbol('_ZN5brookL9g_pmmLockE') if a.guard_panic_rsvd_pmm_held else 0
                     # Convert a genuine #UD entry into a synthetic supervisor
                     # reserved-bit #PF; do not corrupt guest page tables.
                     body=(f'delete breakpoints\nset $rip={trap:#x}\n'
                           f'hbreak *{handler:#x}\ncontinue\nset $rsi=14\n'
-                          'set *(unsigned long long*)($rdi+120)=9\nset $cr2=0\n'
+                          'set *(unsigned long long*)($rdi+120)=9\n' +
+                          (f'if *(unsigned int*){lock:#x} != *(unsigned int*){lock+4:#x}\n'
+                           'echo PMM_LOCK_ALREADY_HELD\\n\nquit 1\nend\n'
+                           f'set *(unsigned int*){lock:#x}=*(unsigned int*){lock+4:#x}+1\n'
+                           'set $cr2=0xffff800000001000\n' if lock else 'set $cr2=0\n') +
                           'delete breakpoints\ndetach\nquit\n')
                 elif a.guard_watchdog_inject:
                     # The exact optimized fixture keeps the sampled CPU index
@@ -846,6 +855,9 @@ def main():
                 raise RuntimeError('automatic recovery panic injection failed: '+text[-5000:])
             if a.guard_panic_rsvd and 'RSVD-corrupt-table: halting' not in text:
                 raise RuntimeError('reserved-bit fault path did not run')
+            if a.guard_panic_rsvd_pmm_held and not all(marker in text for marker in
+                    ('PMM history unavailable: lock busy', 'unsafe page-table scan skipped for armed recovery')):
+                raise RuntimeError('held PMM lock or armed scan policy was not observed')
             if a.guard_panic_pm_fallback and 'PANIC_RESET_PM_FALLBACK' not in text:
                 raise RuntimeError('ACPI PM fallback did not run')
             if a.guard_panic_timerless_reset and 'PANIC_RECOVERY_RESET_TIMERLESS_ATTEMPT' not in text:
