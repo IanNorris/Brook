@@ -7,7 +7,7 @@
 // checked durable sync and independent media readback after each sync (a
 // retained FatFs FIL cache alone is insufficient). It does not acquire those capabilities,
 // start a checker or write the data partition. The caller must poison its
-// session after Uncertain, retain ownership, and forbid automatic retries;
+// session after Uncertain, retain ownership, and forbid retries in that boot;
 // this stateless function cannot enforce those requirements across calls.
 enum class BrookGuardBeginResult { Rejected, Uncertain, PendingDurable };
 enum class BrookGuardCompleteResult { Rejected, Uncertain, CleanDurable };

@@ -112,6 +112,8 @@ def main():
                    help='Retrieve the previous panic via the restricted recovery debug listener')
     p.add_argument('--guard-attempt-exhausted',action='store_true',
                    help='Start with both retry slots consumed and verify maintenance without writes')
+    p.add_argument('--guard-pending-clean',action='store_true',
+                   help='Resume a pending repair when ext2 already looks clean')
     p.add_argument('--guard-network-usb', action='store_true',
                    help='Use emulated xHCI/USB Ethernet for the recovery listener')
     p.add_argument('--guard-auto-unsupported', action='store_true',
@@ -133,8 +135,11 @@ def main():
         p.error('automatic restart requires the completion fixture')
     if a.guard_auto_condition and not a.guard_ext2_test:
         p.error('automatic repair condition requires the ext2 fixture')
-    if a.guard_auto_dispatch and (not a.guard_auto_condition or not a.dirty or not a.guarded_efi):
+    if a.guard_auto_dispatch and (not a.guard_auto_condition or not (a.dirty or a.guard_pending_clean) or not a.guarded_efi):
         p.error('automatic dispatch requires a dirty filesystem and guarded EFI')
+    if a.guard_pending_clean and (a.dirty or not a.auto_prepared_pair or not a.guard_auto_dispatch or
+                                  not a.guard_complete_test or not a.guard_auto_restart):
+        p.error('clean pending retry requires an automatic completion and restart fixture')
     if a.guard_auto_kernel and not a.guard_real_checker:
         p.error('automatic recovery kernel requires its checker fixture')
     if a.guard_panic_journal and not (a.guard_auto_kernel and a.guard_ext2_test and a.dirty):
@@ -440,6 +445,8 @@ def main():
             record_data[56:72]=filesystem_uuid
             if a.guard_attempt_exhausted:
                 struct.pack_into('<II',record_data,16,2,2)
+            if a.guard_pending_clean:
+                struct.pack_into('<II',record_data,16,2,1)
             struct.pack_into('<I',record_data,124,zlib.crc32(record_data[:124]))
             for index in range(2):
                 target=f'::/RECOVERY/GUARD{index}.BIN'
@@ -466,7 +473,7 @@ def main():
         journal_sectors=file_sectors(disk,2048,'::/PANIC.BIN') if a.guard_panic_inject else None
         journal_outside=(outside_esp_hash(disk) if a.guard_panic_after_pending else outside_digest(disk,journal_sectors)) if journal_sectors else None
         baseline=None
-        auto_clean=a.guard_auto_condition and not a.dirty
+        auto_clean=a.guard_auto_condition and not a.dirty and not a.guard_pending_clean
         if a.guard_pending_test and a.guard_records=='valid' and not (a.guard_pending_no_marker or a.guard_pending_wrong_serial or auto_clean or a.guard_attempt_exhausted):
             baseline=work/'baseline.raw';shutil.copyfile(disk,baseline)
         poison = None
@@ -654,7 +661,8 @@ def main():
                                    'GUARD_EXT2_PREEN exit=-2' if a.guard_ext2_missing_checker else
                                    'GUARD_EXT2_PREEN exit=1' if a.dirty else 'GUARD_EXT2_PREEN exit=0')
                             required=['GUARD_CHECK_RESULT exit=0','GUARD_PENDING_RESULT outcome=2',preen,expected]
-                            if a.guard_auto_condition:required.insert(1,'GUARD_AUTO_NEEDS_CHECK')
+                            if a.guard_auto_condition and not a.guard_pending_clean:required.insert(1,'GUARD_AUTO_NEEDS_CHECK')
+                            if a.guard_pending_clean:required.insert(required.index(preen),'GUARD_ATTEMPT_NUMBER 2')
                             if a.guard_panic_journal:required.insert(required.index('GUARD_PENDING_RESULT outcome=2'),'GUARD_PANIC_JOURNAL pin=0 arm=0')
                             if a.guard_complete_test:required.insert(-1,'GUARD_EXT2_VERIFIED_PENDING')
                             if not all(line in complete_lines for line in required):
@@ -828,7 +836,10 @@ def main():
             if nfats!=2 or not fat or not csize:raise RuntimeError('invalid baseline FAT geometry')
             allowed=[]
             expected_pending=bytearray(record_data)
-            struct.pack_into('<QI',expected_pending,8,2,2)
+            if not a.guard_pending_clean:
+                struct.pack_into('<QI',expected_pending,8,2,2)
+            else:
+                struct.pack_into('<I',expected_pending,20,2)
             struct.pack_into('<I',expected_pending,124,zlib.crc32(expected_pending[:124]))
             if not a.guard_pending_fail_at:
                 expected_records=[expected_pending,expected_pending]
@@ -841,6 +852,7 @@ def main():
             if a.guard_complete_test:
                 expected_clean=bytearray(expected_pending)
                 struct.pack_into('<I',expected_clean,16,1)
+                struct.pack_into('<I',expected_clean,20,0)
                 struct.pack_into('<I',expected_clean,124,zlib.crc32(expected_clean[:124]))
                 if not a.guard_complete_fail_at or a.guard_complete_fail_at>=8:
                     expected_records=[expected_clean,expected_clean]
