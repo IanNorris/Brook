@@ -111,6 +111,7 @@ struct FatPrivateMount {
     Vnode* journalNode;
     FatImageLease* journalLease;
     bool journalAttempted;
+    bool journalPublishAttempted;
     bool journalReady;
     bool journalPublished;
 #endif
@@ -1871,7 +1872,8 @@ int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
 }
 int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
 {
-    if(!session || !session->mount || !session->journalReady || !session->journalPublished || !session->journalLease)return -22;
+    if(!session || !session->mount || !session->journalReady ||
+       !__atomic_load_n(&session->journalPublished,__ATOMIC_ACQUIRE) || !session->journalLease)return -22;
     Device* device=FatFsImageLeaseDevice(session->journalLease);
     uint64_t sectors[PanicJournalSectors]{};
     if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
@@ -2007,10 +2009,10 @@ static const VfsFsOps g_fatFsOps = {
 };
 
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)
-int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session)
+int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session,bool missingTarget)
 {
     if(!session || !session->mount || !session->journalReady || !session->journalLease ||
-       __atomic_exchange_n(&session->journalPublished,true,__ATOMIC_ACQ_REL))return -22;
+       __atomic_exchange_n(&session->journalPublishAttempted,true,__ATOMIC_ACQ_REL))return -22;
     auto* data=session->mount;
     KMutexLock(&g_fatLock);
     const bool available=data->pdrv<FF_VOLUMES && !g_fatBackgroundMounts[data->pdrv];
@@ -2018,13 +2020,14 @@ int FatFsPrivateRecoveryPublishJournalTest(FatPrivateMount* session)
     if(!available)return -16;
     VfsPath root{},target{};
     int error=VfsPathRoot(&root);
-    if(!error)error=VfsPathResolve(root,root,"/media/system",&target);
+    if(!error)error=VfsPathResolve(root,root,missingTarget?"/media/brook-missing-test-target":"/media/system",&target);
     if(!error)error=VfsMountNamespaceMountFresh(VfsMountNamespaceInitial(),target,"fatfs",&g_fatFsOps,data,data->pdrv,0);
     VfsPathRelease(target);VfsPathRelease(root);
     if(error)return error;
     KMutexLock(&g_fatLock);
     g_fatBackgroundMounts[data->pdrv]=data;
     KMutexUnlock(&g_fatLock);
+    __atomic_store_n(&session->journalPublished,true,__ATOMIC_RELEASE);
     return 0;
 }
 #endif

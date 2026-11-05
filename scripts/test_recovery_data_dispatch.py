@@ -75,7 +75,7 @@ def main():
     if len(a.identity)!=96 or any(c not in '0123456789abcdef' for c in a.identity):p.error('invalid identity')
     a.output.mkdir(parents=True,exist_ok=False)
     scenarios=('dirty','pending','wrong-uuid','wrong-ata','checker-corrupt','journal-crosslink',
-               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing','journal-publish-panic') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
+               'journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt','journal-pin-crosslink','journal-publish','journal-publish-existing','journal-publish-panic','journal-publish-unarmed','journal-publish-failed') if a.recovery_pair else ('clean','dirty','wrong-uuid','pending','slot-clean','slot-dirty','missing-recovery','corrupt-recovery')
     if a.case:
         if a.case not in scenarios:p.error('invalid scenario for this mode')
         scenarios=(a.case,)
@@ -172,6 +172,8 @@ def main():
                         'GUARD_CHECK_INCOMPLETE load=-8' if scenario=='checker-corrupt' else
                         'GUARD_CHECK_RESULT exit=1' if scenario in ('journal-crosslink','journal-pin-crosslink') else
                         'PANIC_TEST_DISK_CAPTURE_OK' if scenario=='journal-publish-panic' else
+                        'GUARD_JOURNAL_PANIC_DENIED status=-13' if scenario=='journal-publish-unarmed' else
+                        'GUARD_JOURNAL_PUBLISH_FAILED status=-2 retry=-22 arm=-22' if scenario=='journal-publish-failed' else
                         'GUARD_JOURNAL_PUBLISH_RESULT status=0' if scenario.startswith('journal-publish') else
                         'GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22' if scenario in ('journal-pin','journal-pin-existing') else
                         'GUARD_JOURNAL_PIN_RESULT status=-22 repeated=-22' if scenario in ('journal-pin-short','journal-pin-corrupt') else 'SSD_GUARD_RESERVATION_FAILED')
@@ -184,6 +186,8 @@ def main():
                  failure_marker=('GUARD_JOURNAL_PUBLISH_RESULT status=-' if scenario.startswith('journal-publish') else
                                  'SSD_GUARD_RESERVATION_FAILED' if scenario.startswith('journal-pin') else None),
                  extra_fw_cfg=(['name=opt/guard-journal-pin,string=test-3','name=opt/guard-panic-capture,string=test-1','name=opt/brook/power,string=q35-reset','name=opt/brook/panic-test-reset,string=test-1s','name=opt/brook/panic-test-headless,string=yes'] if scenario=='journal-publish-panic' else
+                               ['name=opt/guard-journal-pin,string=test-4'] if scenario=='journal-publish-unarmed' else
+                               ['name=opt/guard-journal-pin,string=test-5'] if scenario=='journal-publish-failed' else
                                ['name=opt/guard-journal-pin,string=test-2' if scenario.startswith('journal-publish') else 'name=opt/guard-journal-pin,string=test-1'] if scenario.startswith(('journal-pin','journal-publish')) else None),
                  expect_reset=scenario=='journal-publish-panic')
             if scenario.startswith('journal-publish'):
@@ -196,7 +200,7 @@ def main():
                     if current[:129*512]!=contents[:129*512]:raise RuntimeError('previous panic record changed')
                     verify_record(current,1,8,bytes.fromhex(packet))
                 elif current!=contents:raise RuntimeError('published journal changed')
-                if subprocess.check_output(['mtype','-i',media,'::/PINTST.TXT'])!=b'checked journal remains pinned\n':raise RuntimeError('ordinary FAT witness differs')
+                if scenario!='journal-publish-failed' and subprocess.check_output(['mtype','-i',media,'::/PINTST.TXT'])!=b'checked journal remains pinned\n':raise RuntimeError('ordinary FAT witness differs')
                 fat=work/'fat.img'
                 with disk.open('rb') as inp, fat.open('wb') as out:
                     inp.seek(2048*512);remaining=(133120-2048)*512
@@ -224,7 +228,8 @@ def main():
                 required=['Recovery required; normal boot blocked.','Brook SSD recovery payload verified']
                 if scenario in ('dirty','pending','checker-corrupt','journal-crosslink') or scenario.startswith(('journal-pin','journal-publish')):required+=['SSD_GUARD_RESERVATION_READY']
                 if scenario in ('dirty','pending','journal-pin','journal-pin-existing','journal-pin-short','journal-pin-corrupt') or scenario.startswith('journal-publish'):required+=['GUARD_CHECK_RESULT exit=0']
-                if scenario.startswith('journal-publish'):required+=['GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_UNLINK status=-16','GUARD_JOURNAL_PUBLISH_REMOVE open=-16 closed=0','GUARD_JOURNAL_PUBLISH_RENAME status=-16','GUARD_JOURNAL_PUBLISH_MOVE open=-16 journal_target=-16 closed=0']
+                if scenario.startswith('journal-publish'):required+=['GUARD_JOURNAL_PIN_RESULT status=0 repeated=-22','GUARD_JOURNAL_PUBLISH_EARLY_ARM status=-22']
+                if scenario.startswith('journal-publish') and scenario!='journal-publish-failed':required+=['GUARD_JOURNAL_PUBLISH_UNLINK status=-16','GUARD_JOURNAL_PUBLISH_REMOVE open=-16 closed=0','GUARD_JOURNAL_PUBLISH_RENAME status=-16','GUARD_JOURNAL_PUBLISH_MOVE open=-16 journal_target=-16 closed=0']
                 if scenario=='journal-publish-panic':required+=['GUARD_JOURNAL_PUBLISH_RESULT status=0','GUARD_JOURNAL_PANIC_ARM status=0']
                 required+=[expect]
                 if any(lines.count(marker)!=1 for marker in required) or [lines.index(marker) for marker in required]!=sorted(lines.index(marker) for marker in required):

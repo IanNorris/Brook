@@ -194,7 +194,9 @@ void Worker(void* arg) {
     if(journalSize) {
         const bool pinOnly=journalSize==6 && !memcmp(journalMode,"test-1",6);
         const bool capture=journalSize==6 && !memcmp(journalMode,"test-3",6);
-        const bool publish=capture || (journalSize==6 && !memcmp(journalMode,"test-2",6));
+        const bool denyCapture=journalSize==6 && !memcmp(journalMode,"test-4",6);
+        const bool failedPublish=journalSize==6 && !memcmp(journalMode,"test-5",6);
+        const bool publish=capture || denyCapture || failedPublish || (journalSize==6 && !memcmp(journalMode,"test-2",6));
         if(!pinOnly && !publish) {
             AhciSystemGuardTestFinish(adapter);KPuts("GUARD_JOURNAL_PIN_INVALID\n");return;
         }
@@ -202,8 +204,19 @@ void Worker(void* arg) {
         const int repeated=FatFsPrivateRecoveryPinJournal(mount);
         KPrintf("GUARD_JOURNAL_PIN_RESULT status=%d repeated=%d\n",pinned,repeated);
         if(publish && !pinned && repeated==-22) {
+            const int premature=FatFsPrivateRecoveryArmJournalTest(mount);
+            KPrintf("GUARD_JOURNAL_PUBLISH_EARLY_ARM status=%d\n",premature);
+            if(premature!=-22)return;
+            if(failedPublish) {
+                const int failed=FatFsPrivateRecoveryPublishJournalTest(mount,true);
+                const int retried=FatFsPrivateRecoveryPublishJournalTest(mount);
+                const int arm=FatFsPrivateRecoveryArmJournalTest(mount);
+                KPrintf("GUARD_JOURNAL_PUBLISH_FAILED status=%d retry=%d arm=%d\n",failed,retried,arm);
+                return;
+            }
             int publishResult=FatFsPrivateRecoveryPublishJournalTest(mount);
             KPrintf("GUARD_JOURNAL_PUBLISH_MOUNT status=%d\n",publishResult);
+            if(!publishResult && FatFsPrivateRecoveryPublishJournalTest(mount)!=-22)publishResult=-5;
             if(!publishResult && !AhciSystemGuardTestBeginWrites(adapter))publishResult=-13;
             if(!publishResult) {
                 VfsPath root{};publishResult=VfsPathRoot(&root);
@@ -254,6 +267,10 @@ void Worker(void* arg) {
                 VfsPathRelease(root);
             }
             KPrintf("GUARD_JOURNAL_PUBLISH_RESULT status=%d\n",publishResult);
+            if(denyCapture && !publishResult) {
+                const int denied=FatFsPrivateRecoveryArmJournalTest(mount);
+                KPrintf("GUARD_JOURNAL_PANIC_DENIED status=%d\n",denied);
+            }
             if(capture && !publishResult) {
                 const int armed=FatFsPrivateRecoveryArmJournalTest(mount);
                 KPrintf("GUARD_JOURNAL_PANIC_ARM status=%d\n",armed);
