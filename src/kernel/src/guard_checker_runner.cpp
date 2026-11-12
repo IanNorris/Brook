@@ -21,6 +21,9 @@
 #endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "shutdown.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+#include "ac_shutdown_record.h"
+#endif
 #endif
 #if defined(BROOK_SSD_GUARD_COMPLETION)
 #include "platform_power.h"
@@ -41,16 +44,39 @@ namespace brook {
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 namespace { bool guardedDesktopBridge=false; }
 bool GuardedDesktopBridgeEnabled() {return __atomic_load_n(&guardedDesktopBridge,__ATOMIC_ACQUIRE);}
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+namespace {
+FatPrivateMount* acShutdownMount=nullptr;
+AcShutdownRecord previousAcShutdown{};
+}
+bool GuardCheckedAcShutdownPrior(AcShutdownRecord& out) {
+    out={};
+    if(!__atomic_load_n(&acShutdownMount,__ATOMIC_ACQUIRE))return false;
+    out=previousAcShutdown;
+    return out.sequence!=0;
+}
+bool GuardRecordCheckedAcShutdown(const char (&bootId)[33]) {
+    auto* mount=__atomic_load_n(&acShutdownMount,__ATOMIC_ACQUIRE);
+    return mount && FatFsPrivateRecoveryWriteAcShutdown(mount,bootId);
+}
+#endif
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 namespace {
 uint8_t g_recoveryPanicPacket[PanicJournalPayloadMax]{};
+uint8_t g_recoveryPanicPreviousPacket[PanicJournalPayloadMax]{};
 GuardPanicSnapshot g_recoveryPanic{};
+GuardPanicSnapshot g_recoveryPanicPrevious{};
 bool g_recoveryPanicReady=false;
+bool g_recoveryPanicPreviousReady=false;
 }
 bool GuardRecoveryPanicSnapshot(GuardPanicSnapshot& out) {
     out={};if(!__atomic_load_n(&g_recoveryPanicReady,__ATOMIC_ACQUIRE))return false;
     out=g_recoveryPanic;return true;
+}
+bool GuardRecoveryPanicPreviousSnapshot(GuardPanicSnapshot& out) {
+    out={};if(!__atomic_load_n(&g_recoveryPanicPreviousReady,__ATOMIC_ACQUIRE))return false;
+    out=g_recoveryPanicPrevious;return true;
 }
 #endif
 namespace {
@@ -224,6 +250,12 @@ void Worker(void* arg) {
             g_recoveryPanic={g_recoveryPanicPacket,sequence,bytes,crc};
             __atomic_store_n(&g_recoveryPanicReady,true,__ATOMIC_RELEASE);
             KPrintf("GUARD_PANIC_PRIOR sequence=%lu bytes=%u crc=%x\n",sequence,bytes,crc);
+            uint64_t previousSequence=0;uint32_t previousBytes=0,previousCrc=0;
+            if(!FatFsPrivateRecoveryReadPanic(mount,g_recoveryPanicPreviousPacket,sizeof(g_recoveryPanicPreviousPacket),
+                    &previousSequence,&previousBytes,&previousCrc,1) && previousSequence<sequence) {
+                g_recoveryPanicPrevious={g_recoveryPanicPreviousPacket,previousSequence,previousBytes,previousCrc};
+                __atomic_store_n(&g_recoveryPanicPreviousReady,true,__ATOMIC_RELEASE);
+            }
         }
     }
 #endif
@@ -243,6 +275,8 @@ void Worker(void* arg) {
         // entire boot. A failure at any step leaves maintenance in control.
         uint64_t publication=0;
         int handoff=journalPin;
+        AcShutdownRecord prior{};
+        const bool haveShutdownRecord=!handoff && !FatFsPrivateRecoveryPinAcShutdown(mount,prior);
         if(!handoff)handoff=FatFsPrivateRecoveryPublishJournalTest(mount,false,&publication);
         if(!handoff && !AhciSystemGuardTestBeginWrites(adapter))handoff=-13;
         if(!handoff && !AhciSystemGuardTestAdoptSystemMount(adapter,1,publication))handoff=-13;
@@ -250,6 +284,11 @@ void Worker(void* arg) {
         uint8_t drive=2;
         if(!handoff && !AhciSystemGuardTestMountDesktop(adapter,&drive))handoff=-5;
         if(handoff) {KPrintf("GUARD_DESKTOP_HANDOFF_FAILED status=%d\n",handoff);return;}
+        if(haveShutdownRecord) {
+            previousAcShutdown=prior;
+            __atomic_store_n(&acShutdownMount,mount,__ATOMIC_RELEASE);
+            KPrintf("GUARD_AC_SHUTDOWN_RECORD_READY prior_sequence=%lu\n",prior.sequence);
+        }
 #if defined(BROOK_SSD_GUARDED_DESKTOP_RESET)
         // All guard, journal and dirty-session admission checks have passed.
         // Reset is opt-in and still requires a supported platform reset plan.

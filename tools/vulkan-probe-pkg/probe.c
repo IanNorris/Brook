@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "probe_spv.h"
+#include "compositor_spv.h"
+#include "compositor_probe.h"
 
 enum { WORDS = 16384, ROUNDS = 3 };
 static const VkDeviceSize bytes = WORDS * sizeof(uint32_t);
@@ -71,13 +73,15 @@ int main(int argc, char** argv)
     const char* expected = argc == 3 && !strcmp(argv[1], "--expect-driver") ? argv[2] : "hardware";
     if ((argc != 1 && argc != 3) ||
         (argc == 3 && strcmp(argv[1], "--expect-driver")) ||
-        (strcmp(expected, "hardware") && strcmp(expected, "venus") && strcmp(expected, "intel"))) {
-        fprintf(stderr, "usage: vulkan-probe [--expect-driver hardware|intel|venus]\n"); return 2;
+        (strcmp(expected, "hardware") && strcmp(expected, "venus") && strcmp(expected, "intel") && strcmp(expected,"software"))) {
+        fprintf(stderr, "usage: vulkan-probe [--expect-driver hardware|intel|venus|software]\n"); return 2;
     }
     int passed = 0;
     const int timestamping = getenv("BROOK_VULKAN_TIMESTAMPS") != NULL;
     ProbeTiming timing = {0};
     const int externalSync=getenv("BROOK_VULKAN_SYNC_FD")!=NULL;
+    const int compositorTest=getenv("BROOK_VULKAN_COMPOSITOR_TEST")!=NULL;
+    if(compositorTest && externalSync) {fprintf(stderr,"Compositor test excludes repeated sync-fd dispatch\n");return 2;}
     int exportedFd=-1;
     VkSemaphore exportedSemaphore=VK_NULL_HANDLE;
     VkInstance instance = VK_NULL_HANDLE;
@@ -105,7 +109,8 @@ int main(int argc, char** argv)
         VkPhysicalDeviceProperties2 info = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
             .pNext = &driver };
         vkGetPhysicalDeviceProperties2(devices[i], &info);
-        if (info.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
+        if (info.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && strcmp(expected,"software")) continue;
+        if (info.properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && !strcmp(expected,"software")) continue;
         if (!strcmp(expected, "venus") && driver.driverID != VK_DRIVER_ID_MESA_VENUS) continue;
         if (!strcmp(expected, "intel") && driver.driverID != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) continue;
         properties = info.properties; physical = devices[i]; break;
@@ -177,6 +182,7 @@ int main(int argc, char** argv)
     CHECK_VK(vkCreatePipelineLayout(device, &pipelineInfo, NULL, &pipelineLayout));
     VkShaderModuleCreateInfo shaderInfo = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = sizeof(shaderCode), .pCode = shaderCode };
+    if(compositorTest) {shaderInfo.codeSize=sizeof(compositorCode);shaderInfo.pCode=compositorCode;}
     CHECK_VK(vkCreateShaderModule(device, &shaderInfo, NULL, &shader));
     VkComputePipelineCreateInfo compute = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -204,10 +210,37 @@ int main(int argc, char** argv)
     CHECK_VK(vkAllocateCommandBuffers(device, &allocateCommand, &command));
     VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     CHECK_VK(vkCreateFence(device, &fenceInfo, NULL, &fence));
+    if (getenv("BROOK_VULKAN_FILL_DIAGNOSTIC")) {
+        VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        CHECK_VK(vkBeginCommandBuffer(command, &begin));
+        vkCmdFillBuffer(command, readback.buffer, 0, bytes, 0x95c73a2du);
+        VkMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &barrier, 0, NULL, 0, NULL);
+        CHECK_VK(vkEndCommandBuffer(command));
+        VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &command };
+        CHECK_VK(vkQueueSubmit(queue, 1, &submit, fence));
+        CHECK_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ULL));
+        if (!(readback.flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                .memory = readback.memory, .size = VK_WHOLE_SIZE };
+            CHECK_VK(vkInvalidateMappedMemoryRanges(device, 1, &range));
+        }
+        fprintf(stderr, "VULKAN_FILL_DIAGNOSTIC first=%08x last=%08x\n",
+                ((const uint32_t*)readback.mapped)[0], ((const uint32_t*)readback.mapped)[WORDS - 1]);
+        if (((const uint32_t*)readback.mapped)[0] != 0x95c73a2du ||
+            ((const uint32_t*)readback.mapped)[WORDS - 1] != 0x95c73a2du) goto cleanup;
+    }
     for (uint32_t round = 0; round < ROUNDS; ++round) {
         uint32_t seed = 7 + round * 31;
         uint32_t* input = upload.mapped;
         for (uint32_t i = 0; i < WORDS; ++i) input[i] = (i * 17u) ^ seed;
+        if(compositorTest) {
+            compositor_probe_prepare(input,WORDS,round);
+            if(!brook_vk_scene_valid(input,WORDS)) {fprintf(stderr,"Invalid compositor fixture\n");goto cleanup;}
+        }
         if (!(upload.flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .memory = upload.memory, .size = VK_WHOLE_SIZE };
@@ -226,7 +259,7 @@ int main(int argc, char** argv)
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &barrier, 0, NULL, 0, NULL);
-        vkCmdFillBuffer(command, storage.buffer, 256, 512, 0x13579bdfu);
+        if(!compositorTest)vkCmdFillBuffer(command, storage.buffer, 256, 512, 0x13579bdfu);
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &barrier, 0, NULL, 0, NULL);
@@ -287,9 +320,12 @@ int main(int argc, char** argv)
         }
         const uint32_t* output = readback.mapped;
         for (uint32_t i = 0; i < WORDS; ++i) {
-            uint32_t value = i >= 64 && i < 192 ? 0x13579bdfu : (i * 17u) ^ seed;
-            uint32_t want=value;
-            for(unsigned step=0;step<dispatches;++step)want=(want^(0x9e3779b9u+seed))*1664525u+1013904223u;
+            uint32_t want;
+            if(compositorTest)want=i>=12288?compositor_probe_pixel(input,(i-12288)%64,(i-12288)/64):input[i];
+            else {
+                want=i >= 64 && i < 192 ? 0x13579bdfu : (i * 17u) ^ seed;
+                for(unsigned step=0;step<dispatches;++step)want=(want^(0x9e3779b9u+seed))*1664525u+1013904223u;
+            }
             if (output[i] != want) {
                 fprintf(stderr, "READBACK_MISMATCH round=%u index=%u actual=%08x expected=%08x\n",
                         round, i, output[i], want); goto cleanup;
@@ -323,9 +359,10 @@ cleanup:
     printf("{\"passed\":%s,\"device\":", passed ? "true" : "false"); json_string(properties.deviceName);
     printf(",\"driver\":"); json_string(driver.driverName);
     printf(",\"driver_id\":%u,\"vendor_id\":%u,\"device_id\":%u,\"words_per_round\":%u,\"rounds\":%u,"
-           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s,\"sync_fd_readback\":%s",
+           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s,\"sync_fd_readback\":%s,\"compositor_scene_passed\":%s",
            driver.driverID, properties.vendorID, properties.deviceID, WORDS, passed ? ROUNDS : 0,
-           upload.flags, readback.flags, passed ? "true" : "false", passed && externalSync ? "true" : "false");
+           upload.flags, readback.flags, passed ? "true" : "false", passed && externalSync ? "true" : "false",
+           passed && compositorTest ? "true" : "false");
     if (timestamping) timing_print(&timing);
     puts("}");
     return passed ? 0 : 1;

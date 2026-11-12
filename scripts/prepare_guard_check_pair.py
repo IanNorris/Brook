@@ -23,7 +23,7 @@ from hardware_update_protocol import record
 
 CHECKER_SHA='99cc8160e7a076ecd9cb04e13bdbe71c4aad4c64bfdc43ea83a016c8fee9d5e3'
 E2FSCK_SHA='acc6dee6fb21afd670d052617b665588070d536e2e73b5c4f95db11f98922268'
-REQUIRED={'BROOK_SSD_GUARD_CHECK':'ON','BROOK_SSD_INSTALLER':'OFF','BROOK_AHCI_WRITE_TEST_HOOKS':'OFF','BROOK_AHCI_PANIC_TEST':'OFF',
+REQUIRED={'BROOK_SSD_GUARD_CHECK':'ON','BROOK_SSD_INSTALLER':'OFF','BROOK_AHCI_WRITE_TEST_HOOKS':'OFF','BROOK_AHCI_PANIC_TEST':'OFF','BROOK_AHCI_PANIC_CONTENTION_TEST':'OFF',
           'BROOK_SSD_GUARD_PENDING_TEST':'OFF','BROOK_SSD_GUARD_EXT2_TEST':'OFF','BROOK_SSD_GUARD_COMPLETE_TEST':'OFF',
           'BROOK_SSD_AUTO_RECOVERY':'OFF','BROOK_SSD_GUARDED_DESKTOP':'OFF',
           'BROOK_SSD_GUARDED_DESKTOP_RESET':'OFF',
@@ -47,8 +47,9 @@ def selector(data,kind):
     return disk,part,first,count,extra
 
 
-def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile,out,automatic=False,e2fsck=None,recovery_network=False,module_abi=None,network_hash=None):
+def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile,out,automatic=False,e2fsck=None,recovery_network=False,module_abi=None,network_hash=None,compact_initrd=False,tiny_initrd=False):
     if profile not in ('physical','qemu-fixture'):raise ValueError('unsupported inventory profile')
+    if compact_initrd and tiny_initrd:raise ValueError('choose one initrd size')
     if bool(e2fsck)!=automatic:raise ValueError('automatic recovery requires the pinned ext2 checker')
     if recovery_network and (not automatic or type(module_abi) is not int or module_abi<1 or
                              not isinstance(network_hash,str) or not re.fullmatch('[0-9a-f]{64}',network_hash)):
@@ -129,7 +130,7 @@ def prepare(build,kernel_hash,checker,validator,controller,disk,esp,data,profile
     out.mkdir(mode=0o700,parents=True,exist_ok=False)
     try:
         image=out/'INITRD.IMG';(out/'KERNEL.ELF').write_bytes(kernel)
-        with image.open('wb') as f:f.truncate(32*1024*1024)
+        with image.open('wb') as f:f.truncate((8 if tiny_initrd else 16 if compact_initrd else 32)*1024*1024)
         subprocess.run(['mformat','-i',str(image),'::'],check=True)
         for name in ('BOOT','ETC','DEV','DEV/DRI','TMP','SYS','SYS/DEV','SYS/DEV/CHAR','USR','PROC'):
             subprocess.run(['mmd','-i',str(image),'::'+name],check=True)
@@ -168,8 +169,10 @@ def main():
     p.add_argument('--recovery-network',action='store_true',help='Include this build\'s network driver for read-only recovery debug')
     p.add_argument('--module-abi',type=int,help='Required expected network module ABI')
     p.add_argument('--network-module-sha256',help='Required expected SHA-256 of the selected build network module')
+    p.add_argument('--compact-initrd',action='store_true',help='Use a 16 MiB FAT initrd for limited ESP space')
+    p.add_argument('--tiny-initrd',action='store_true',help='Use an 8 MiB FAT initrd for limited ESP space')
     a=p.parse_args();print(json.dumps(prepare(a.kernel_build,a.kernel_sha256,a.checker,a.elf_validator,a.controller,a.disk,
-                                               a.esp_selector,a.data_selector,a.profile,a.output,a.automatic,a.e2fsck,a.recovery_network,a.module_abi,a.network_module_sha256),indent=2))
+                                               a.esp_selector,a.data_selector,a.profile,a.output,a.automatic,a.e2fsck,a.recovery_network,a.module_abi,a.network_module_sha256,a.compact_initrd,a.tiny_initrd),indent=2))
 
 
 if __name__=='__main__':main()

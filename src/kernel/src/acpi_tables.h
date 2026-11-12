@@ -14,6 +14,16 @@ struct AcpiResetInfo {
     const char* reason="No validated FADT reset register";
 };
 struct AcpiPmTimerInfo { bool available=false;uint16_t port=0;bool wide=false; };
+struct AcpiLegacyPowerInfo {
+    uint64_t facs=0;
+    uint16_t sci=0,pm1aControl=0,pm1bControl=0;
+    uint32_t smiCommand=0;
+    uint8_t acpiEnable=0;
+};
+struct AcpiSciRoute {
+    bool available=false,activeLow=true;
+    uint32_t gsi=0;
+};
 
 // The callback must reject unreadable physical spans before accessing memory.
 // Checksums are streamed through a small stack buffer; firmware lengths never
@@ -125,7 +135,49 @@ public:
         if(!port || port>65532)return result;
         result.available=true;result.port=uint16_t(port);result.wide=(flags&(1u<<8))!=0;return result;
     }
+    // Discover the fixed-register subset used by a legacy FACS Global Lock
+    // owner. Hardware-reduced, MMIO and non-word control blocks are excluded.
+    AcpiLegacyPowerInfo LegacyPower() const {
+        AcpiSdtHeader fadt{};
+        const uint64_t address=Find("FACP",&fadt);
+        if(!address || fadt.length<116)return {};
+        uint32_t flags=0,legacyFacs=0,legacyA=0,legacyB=0,smiCommand=0;
+        uint64_t extendedFacs=0;
+        uint16_t sci=0;
+        uint8_t controlLength=0,acpiEnable=0;
+        if(!Copy(address+112,&flags,4) || (flags&(1u<<20)) ||
+           !Copy(address+36,&legacyFacs,4) ||
+           !Copy(address+46,&sci,2) || !sci ||
+           !Copy(address+48,&smiCommand,4) || !Copy(address+52,&acpiEnable,1) ||
+           !Copy(address+64,&legacyA,4) || !Copy(address+68,&legacyB,4) ||
+           !Copy(address+89,&controlLength,1) || controlLength!=2)return {};
+        if(fadt.length>=140 && !Copy(address+132,&extendedFacs,8))return {};
+        if(extendedFacs && legacyFacs && extendedFacs!=legacyFacs)return {};
+        const uint64_t facs=extendedFacs?extendedFacs:legacyFacs;
+        if(!facs || (facs&63))return {};
+        uint16_t a=0,b=0;
+        if(!ControlPort(address,fadt.length,172,legacyA,a) || !a ||
+           !ControlPort(address,fadt.length,184,legacyB,b) || a==b)return {};
+        return {facs,sci,a,b,smiCommand,acpiEnable};
+    }
 private:
+    bool ControlPort(uint64_t fadt,uint32_t length,uint32_t offset,uint32_t legacy,uint16_t& out) const {
+        uint64_t port=legacy;
+        if(length>=offset+12) {
+            uint8_t gas[12]{};
+            if(!Copy(fadt+offset,gas,sizeof(gas)))return false;
+            uint64_t address=0;
+            __builtin_memcpy(&address,gas+4,8);
+            if(address) {
+                if(gas[0]!=1 || gas[1]!=16 || gas[2] || (gas[3]!=0 && gas[3]!=2))return false;
+                if(legacy && legacy!=address)return false;
+                port=address;
+            }
+        }
+        if(port>65534 || (port&1))return false;
+        out=uint16_t(port);
+        return true;
+    }
     static bool Equal(const char* a,const char* b,uint32_t n){for(uint32_t i=0;i<n;++i)if(a[i]!=b[i])return false;return true;}
     bool Checksum(uint64_t at,uint32_t length) const {
         uint8_t buffer[256];uint8_t sum=0;

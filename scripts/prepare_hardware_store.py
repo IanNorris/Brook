@@ -22,6 +22,7 @@ from ext2_image_export import Source
 
 ROOT = Path(__file__).resolve().parents[1]
 FAT_FILE_MAX = 0xfffffe00
+INTEL_VULKAN_DIR = 'system/graphics/intel-vulkan-26.0.6-brook1'
 
 
 def run(*argv, **kwargs):
@@ -53,6 +54,31 @@ def profile_tree(source, target, closure, ancestors=()):
 def mutable(path):
     return path == 'store' or any(path == root or path.startswith(root+'/')
         for root in ('profile', 'var', 'home/brook', 'share/applications'))
+
+
+def seed_intel_vulkan(seed, driver, closure):
+    """Install the trusted, self-contained ICD used by the desktop environment."""
+    driver = Path(driver)
+    if driver.parent != Path('/nix/store') or str(driver) not in closure:
+        raise ValueError('Intel Vulkan driver must belong to the profile closure')
+    source_lib = driver/'lib/libvulkan_intel_hasvk.so'
+    source_manifest = driver/'share/vulkan/icd.d/intel_hasvk_icd.x86_64.json'
+    manifest = json.loads(source_manifest.read_text())
+    if manifest['ICD']['library_path'] != str(source_lib):
+        raise ValueError('Unexpected Intel Vulkan ICD library path')
+    destination = seed/INTEL_VULKAN_DIR
+    destination.mkdir(parents=True, mode=0o755)
+    for directory in (seed/'system', seed/'system/graphics', destination):
+        directory.chmod(0o755)
+    library = destination/'libvulkan_intel_hasvk.so'
+    shutil.copyfile(source_lib, library)
+    library.chmod(0o644)
+    manifest['ICD']['library_path'] = '/nix/'+INTEL_VULKAN_DIR+'/libvulkan_intel_hasvk.so'
+    target_manifest = destination/'intel_hasvk.json'
+    target_manifest.write_text(json.dumps(manifest, indent=2)+'\n')
+    target_manifest.chmod(0o644)
+    return {'driver': str(driver), 'library_sha256': digest(library),
+            'manifest_sha256': digest(target_manifest)}
 
 
 def normalize_owners(image, output):
@@ -132,7 +158,8 @@ def main():
     nix = ('let e = import (builtins.toPath '+json.dumps(str(expression))+') {}; in '
            '{ profile = toString e.profile; packages = map (p: { '
            'name = p.pname or p.name; version = p.version or ""; '
-           'store = builtins.baseNameOf (toString p); }) e.packages; }')
+           'store = builtins.baseNameOf (toString p); }) e.packages; '
+           'intelVulkanDriver = if e ? intelVulkanDriver then toString e.intelVulkanDriver else null; }')
     metadata = json.loads(subprocess.check_output(
         ['nix-instantiate', '--eval', '--strict', '--json', '-E', nix], text=True))
     if metadata['profile'] != str(profile):
@@ -141,6 +168,8 @@ def main():
     seed = output/'seed';(seed/'store').mkdir(parents=True)
     for item in closure:
         run('cp', '-a', '--reflink=auto', '--', item, seed/'store'/Path(item).name)
+    intel_vulkan = (seed_intel_vulkan(seed, metadata['intelVulkanDriver'], closure)
+                    if metadata['intelVulkanDriver'] else None)
     profile_tree(profile, seed/'profile', {Path(p).name for p in closure})
     for directory in ('bin', 'index', 'etc/ssl/certs', 'var/cache/narinfo',
                       'home/brook/.config/brook', 'home/brook/.cache',
@@ -184,6 +213,7 @@ def main():
     (seed/'BROOK.MNT').write_text('/nix\n')
     identity = {'profile': str(profile), 'closure': sorted(closure),
                 'index_sha256': digest(index), 'index_metadata': index_metadata, 'tools': tools,
+                'intel_vulkan': intel_vulkan,
                 'builder_sha256': digest(Path(__file__))}
     identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity, sort_keys=True)))
     (seed/'.brook-store.json').write_text(json.dumps({'format': 1, 'uuid': identifier, **identity}, indent=2)+'\n')

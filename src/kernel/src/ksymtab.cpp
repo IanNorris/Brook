@@ -41,6 +41,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "audio.h"
 #include "sync/kmutex.h"
 #include "kvmclock.h"
+#include "usb_boot_health.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -62,6 +63,7 @@ EXPORT_SYMBOL(KPuts);
 EXPORT_SYMBOL(SerialPrintf);
 EXPORT_SYMBOL(SerialVPrintf);
 EXPORT_SYMBOL(SerialPuts);
+EXPORT_SYMBOL(UsbBootReportReset);
 
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);

@@ -911,7 +911,7 @@ static void TerminalThreadFn(void* arg)
         {
             Process* child = t->child;
             if (child && child->state != ProcessState::Terminated)
-                child->fbDirty = 1;
+                ProcessFramebufferMarkDirty(child);
             t->dirty = false;
             CompositorWake();
         }
@@ -1209,7 +1209,7 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
     {
         t->viewOffset = 0;
         CellRedrawAll(t);
-        if (t->child) t->child->fbDirty = 1;
+        if (t->child) ProcessFramebufferMarkDirty(t->child);
         CompositorWake();
     }
 
@@ -1227,7 +1227,7 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
             TermRenderGlyph(t, 'C');
             TermRenderGlyph(t, '\n');
             t->dirty = true;
-            if (t->child) t->child->fbDirty = 1;
+            if (t->child) ProcessFramebufferMarkDirty(t->child);
             CompositorWake();
             continue;
         }
@@ -1239,7 +1239,7 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
             TermRenderGlyph(t, 'Z');
             TermRenderGlyph(t, '\n');
             t->dirty = true;
-            if (t->child) t->child->fbDirty = 1;
+            if (t->child) ProcessFramebufferMarkDirty(t->child);
             CompositorWake();
             continue;
         }
@@ -1249,7 +1249,7 @@ void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
         // echoes characters itself via stdout writes.
     }
     t->dirty = true;
-    if (t->child) t->child->fbDirty = 1;
+    if (t->child) ProcessFramebufferMarkDirty(t->child);
     CompositorWake();
 
     // Write non-signal bytes to pipe
@@ -1322,6 +1322,22 @@ bool TerminalSnapshotGeometry(Process* proc,TerminalGeometry* result)
     return true;
 }
 
+bool TerminalSnapshotCaret(uint16_t pid,uint64_t incarnation,TerminalCaret* result)
+{
+    if(!pid || !incarnation || !result || !g_fontAtlas.lineHeight ||
+       !g_fontAtlas.glyphCount || g_fontAtlas.glyphs[0].advance<=0)return false;
+    TerminalStateGuard state;
+    for(uint32_t i=0;i<g_terminalCount;++i){
+        const auto& t=g_terminals[i];
+        if(!t.active || !t.child || t.child->pid!=pid || t.child->incarnation!=incarnation)continue;
+        const uint32_t width=uint32_t(g_fontAtlas.glyphs[0].advance),height=uint32_t(g_fontAtlas.lineHeight);
+        const uint64_t x=uint64_t(t.curX)*width,y=uint64_t(t.curY)*height;
+        if(x>0xffffffffu || y>0xffffffffu)return false;
+        *result={uint32_t(x),uint32_t(y),width,height};return true;
+    }
+    return false;
+}
+
 void TerminalRestoreAfterExec(Process* proc)
 {
     TerminalStateGuard state;
@@ -1331,7 +1347,7 @@ void TerminalRestoreAfterExec(Process* proc)
         UserFramebufferPublish(proc,terminal.vfbBacking,terminal.vfb,
             terminal.vfbW*terminal.vfbH*4,terminal.vfbW,terminal.vfbH,terminal.vfbW);
         KMutexLock(&proc->framebufferLock);proc->fbScale=1;KMutexUnlock(&proc->framebufferLock);
-        proc->fbDirty=1;
+        ProcessFramebufferMarkDirty(proc);
         CompositorWake();
         return;
     }
@@ -1582,7 +1598,7 @@ void TerminalScroll(Terminal* t, int32_t dy)
 
     t->viewOffset = newOffU;
     CellRedrawAll(t);
-    if (t->child) t->child->fbDirty = 1;
+    if (t->child) ProcessFramebufferMarkDirty(t->child);
     CompositorWake();
 }
 

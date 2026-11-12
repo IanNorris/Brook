@@ -45,6 +45,18 @@ class GuardPairTest(unittest.TestCase):
         for name in ('DEV/DRI','SYS/DEV/CHAR','PROC'):
             subprocess.run(['mdir','-i',str(image),'::'+name],check=True,stdout=subprocess.DEVNULL)
 
+    def test_compact_initrd_retains_guard_inputs(self):
+        with mock.patch.object(target,'CHECKER_SHA',hashlib.sha256(self.checker.read_bytes()).hexdigest()):
+            result=target.prepare(self.build,hashlib.sha256(self.kernel).hexdigest(),self.checker,Path('/bin/true'),
+                                  self.controller,self.disk,self.esp,self.data,'qemu-fixture',self.output,
+                                  compact_initrd=True)
+        image=self.output/'INITRD.IMG'
+        self.assertEqual(image.stat().st_size,16*1024*1024)
+        self.assertEqual(result['files']['INITRD.IMG']['bytes'],16*1024*1024)
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(image),'::/ETC/ahci-data-volume']),self.data.read_bytes())
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(image),'::/BOOT/FATFSCK.ELF']),self.checker.read_bytes())
+        subprocess.run(['fsck.fat','-n',str(image)],check=True,stdout=subprocess.DEVNULL)
+
     def test_rejects_mixed_or_overlapping_identity(self):
         self.data.write_bytes(self.data.read_bytes().replace(b'01'*16,b'05'*16,1))
         with self.assertRaisesRegex(ValueError,'inconsistent'):self.prepare()
@@ -68,6 +80,18 @@ class GuardPairTest(unittest.TestCase):
 
     def test_rejects_unsafe_kernel_flags(self):
         self.commands[0]['command']+=' -DBROOK_SSD_GUARD_EXT2_TEST=1'
+        (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
+        with self.assertRaisesRegex(ValueError,'unsafe compile flags'):self.prepare()
+        self.assertFalse(self.output.exists())
+
+    def test_rejects_ahci_contention_hook_in_cache_and_compiler(self):
+        cache=self.build/'CMakeCache.txt'
+        cache.write_text(cache.read_text().replace('BROOK_AHCI_PANIC_CONTENTION_TEST:BOOL=OFF',
+                                                   'BROOK_AHCI_PANIC_CONTENTION_TEST:BOOL=ON'))
+        with self.assertRaisesRegex(ValueError,'unsafe kernel build option'):self.prepare()
+        cache.write_text(cache.read_text().replace('BROOK_AHCI_PANIC_CONTENTION_TEST:BOOL=ON',
+                                                   'BROOK_AHCI_PANIC_CONTENTION_TEST:BOOL=OFF'))
+        self.commands[1]['command']+=' -DBROOK_AHCI_PANIC_CONTENTION_TEST=1'
         (self.build/'compile_commands.json').write_text(json.dumps(self.commands))
         with self.assertRaisesRegex(ValueError,'unsafe compile flags'):self.prepare()
         self.assertFalse(self.output.exists())

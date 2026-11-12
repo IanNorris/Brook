@@ -24,6 +24,8 @@ The final paused attachment, boot ID and completed recovery job IDs are in [evid
 
 ## Operational distinctions worth retaining
 
+For an explicitly selected physical IPv4 endpoint, `python3 scripts/hardware_panic_collect.py --host ADDRESS --output OUTPUT_DIR` collects the newest and previous validated boot-pinned recovery snapshots. It verifies CRC and SHA-256 before retaining an artifact and avoids fetching an already verified record again. A durable sidecar records the endpoint and boot from which each snapshot was observed; this is not necessarily the boot that crashed. Add `--watch` to check repeatedly (default interval 60 seconds); connection loss is reported as unknown, and a boot change causes an explicit reattach on a later check. This host watcher does not power-cycle the machine and does not transmit during a kernel panic. Leave it stopped when measuring truly idle network behavior, since its checks create traffic. It requires a reachable normal or recovery debug bridge and can only collect records still present in the two journal slots.
+
 - `*_guest_run` starts a structured guest command job; `*_job` observes that same operation. A timeout or cancelled wait does not stop it. Preserve independent stdout/stderr cursors, exit status and descendant/EOF state.
 - `*_apps`/`*_launch` exercise the installed-app launcher. `*_windows`/`*_window` use semantic window references; `*_ui` recovers the same UI request. Window disappearance is separate from process exit.
 - `hw_doctor` distinguishes a local lock, TCP reachability, valid replies and matching boot identity. Connection loss alone cannot distinguish panic from network failure. The guest debug listener is serial; duplicate simultaneous probes can compete with real work.

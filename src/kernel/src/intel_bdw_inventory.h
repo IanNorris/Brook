@@ -16,6 +16,13 @@ struct BdwStolenRange {
     bool valid;
     uint64_t base, size, end;
 };
+// Broadwell GGMS bits 7:6 encode the actual GSM size, not the 8 MiB
+// maximum BAR aperture. Each 64-bit entry translates one 4 KiB page.
+inline uint32_t BdwGgttEntries(const BdwFirmwareGraphics& raw) {
+    if(!raw.captured || raw.graphicsControl==0xffff)return 0;
+    const uint32_t ggms=(raw.graphicsControl>>6)&3;
+    return ggms ? (1u<<(20+ggms))/8 : 0;
+}
 inline BdwStolenRange BdwDecodeStolenRange(const BdwFirmwareGraphics& raw) {
     if (!raw.captured || raw.graphicsControl == 0xffff || raw.stolenBase == 0xffffffff)
         return {};

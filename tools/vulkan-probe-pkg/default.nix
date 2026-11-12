@@ -8,6 +8,9 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     glslangValidator -V --target-env vulkan1.1 probe.comp -o probe.spv
+    glslangValidator -V --target-env vulkan1.1 ${../vulkan-compositor-pkg/composite.comp} -o compositor.spv
+    cp ${../vulkan-compositor-pkg/scene.h} scene.h
+    cp ${../vulkan-compositor-pkg/compositor_probe.h} compositor_probe.h
     glslangValidator -V --target-env vulkan1.1 triangle.vert -o vertex.spv
     glslangValidator -V --target-env vulkan1.1 triangle.frag -o fragment.spv
     python3 - <<'PY'
@@ -16,6 +19,10 @@ pkgs.stdenv.mkDerivation {
     data = Path('probe.spv').read_bytes()
     words = struct.unpack('<' + 'I' * (len(data) // 4), data)
     Path('probe_spv.h').write_text('static const uint32_t shaderCode[] = {\n' +
+        ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+    data = Path('compositor.spv').read_bytes()
+    words = struct.unpack('<' + 'I' * (len(data) // 4), data)
+    Path('compositor_spv.h').write_text('static const uint32_t compositorCode[] = {\n' +
         ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
     text = ""
     for name in ('vertex', 'fragment'):

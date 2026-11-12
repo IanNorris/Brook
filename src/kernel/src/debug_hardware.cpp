@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "smp.h"
 #include "shutdown.h"
+#include "usb_boot_health.h"
 #include "net.h"
 #include "string.h"
 #include "fs/compressed_vfs.h"
@@ -22,12 +23,26 @@
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_bootstrap_gate.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
+#include "kprintf.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include "panic_snapshot.h"
+#include "intel_bdw_gtt_probe.h"
+#include "intel_bdw_display_probe.h"
+#include "intel_bdw_forcewake_adapter.h"
+#include "intel_bdw_pat.h"
+#include "intel_bdw_render_gt_init.h"
+#include "intel_bdw_oneshot.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+#include "process.h"
+#include "scheduler.h"
+#include "apic.h"
+#endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "ac_shutdown_record.h"
 #include "guard_checker_runner.h"
 #endif
 #include "../../drivers/intel_hda/hda_probe.h"
@@ -38,6 +53,91 @@ uint32_t PchWatchdogTestRead32(uint16_t port);
 #endif
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
+
+void HardwarePayloadId(Reply& reply) {
+    // Same newline-terminated initrd marker used by HWSTATUS.ELF. Treat a
+    // missing or malformed marker as unknown rather than a build identity.
+    char id[96]{};
+    bool valid=false;
+    if(auto* file=VfsOpen("/etc/hardware-payload-id",VFS_O_STREAM)) {
+        VnodeStat stat{};
+        uint64_t offset=0;
+        if(!VfsStat(file,&stat) && !stat.isDir && !stat.isSymlink &&
+           stat.size>=2 && stat.size<=sizeof(id) &&
+           VfsRead(file,id,stat.size,&offset)==static_cast<int>(stat.size) &&
+           id[stat.size-1]=='\n') {
+            valid=true;
+            for(uint64_t i=0;i+1<stat.size;++i) {
+                const char c=id[i];
+                if((c>='a' && c<='z') || (c>='A' && c<='Z') ||
+                   (c>='0' && c<='9') || c=='-' || c=='_' || c=='.')continue;
+                valid=false;
+                break;
+            }
+            id[stat.size-1]=0;
+        }
+        VfsRelease(file);
+    }
+    reply.text(",\"payload_id\":");
+    if(valid)reply.quoted(id);else reply.text("null");
+}
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+// One persistent receipt per test variant. A timed-out bridge observation
+// must never start another worker while the original may still be running.
+struct RcsDebugJob {
+    uint32_t state=0; // 0 unused, 1 worker published/running, 2 finished
+    uint32_t mode=0;bool ok=false,sampleVtd=false,sampledVtd=false;
+    BdwForcewakeAdapterResult forcewake{};
+    BdwRenderRunResult render{};
+};
+RcsDebugJob rcsDebugJobs[3];
+void RcsDebugWorker(void* opaque) {
+    auto* job=static_cast<RcsDebugJob*>(opaque);
+    // Firmware table addresses are mapped in the kernel-thread address
+    // space, not necessarily in the application that issued the ioctl.
+    if(job->sampleVtd){
+        job->sampledVtd=DellGpuVtdObserveRead().sampled || DellGpuVtdObserveDeferred();
+        if(!job->sampledVtd){__atomic_store_n(&job->state,2,__ATOMIC_RELEASE);return;}
+    }
+    job->ok=job->mode==2?BdwTestRenderRepeat(job->forcewake,job->render):job->mode==1?BdwTestRebasedRenderRun(job->forcewake,job->render):
+        BdwTestRenderRun(job->forcewake,job->render);
+    __atomic_store_n(&job->state,2,__ATOMIC_RELEASE);
+}
+bool RcsDebugRun(unsigned mode,BdwForcewakeAdapterResult& forcewake,BdwRenderRunResult& render,bool& pending,bool sampleVtd=false) {
+    auto& job=rcsDebugJobs[mode];pending=false;
+    uint32_t expected=0;
+    if(__atomic_compare_exchange_n(&job.state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+        job.mode=mode;job.sampleVtd=sampleVtd;
+        auto* worker=KernelThreadCreate("gpu-rcs-test",RcsDebugWorker,&job);
+        if(!worker){__atomic_store_n(&job.state,0,__ATOMIC_RELEASE);return false;}
+        worker->cpuAffinity=0;SchedulerAddProcess(worker);
+    }
+    const uint64_t deadline=ApicTickCount()+5000;
+    while(__atomic_load_n(&job.state,__ATOMIC_ACQUIRE)!=2 && ApicTickCount()<deadline)SchedulerSleepMs(5);
+    if(__atomic_load_n(&job.state,__ATOMIC_ACQUIRE)!=2){pending=true;return false;}
+    forcewake=job.forcewake;render=job.render;return job.ok;
+}
+struct SubmissionDebugJob {uint32_t state=0;bool ok=false,contexts=false;BdwWorkerProbeResult result{};};
+SubmissionDebugJob submissionDebugJobs[2];
+void SubmissionDebugWorker(void* opaque){
+    auto* job=static_cast<SubmissionDebugJob*>(opaque);
+    job->ok=job->contexts?BdwTestContextSubmissionWorker(job->result):BdwTestSubmissionWorker(job->result);
+    __atomic_store_n(&job->state,2,__ATOMIC_RELEASE);
+}
+bool SubmissionDebugRun(BdwWorkerProbeResult& result,bool& pending,bool contexts){
+    auto& job=submissionDebugJobs[contexts?1:0];pending=false;uint32_t expected=0;
+    if(__atomic_compare_exchange_n(&job.state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+        job.contexts=contexts;
+        auto* thread=KernelThreadCreate("gpu-worker-test",SubmissionDebugWorker,&job);
+        if(!thread){__atomic_store_n(&job.state,0,__ATOMIC_RELEASE);return false;}
+        thread->cpuAffinity=0;SchedulerAddProcess(thread);
+    }
+    const uint64_t deadline=ApicTickCount()+5000;
+    while(__atomic_load_n(&job.state,__ATOMIC_ACQUIRE)!=2 && ApicTickCount()<deadline)SchedulerSleepMs(5);
+    if(__atomic_load_n(&job.state,__ATOMIC_ACQUIRE)!=2){pending=true;return false;}
+    result=job.result;return job.ok;
+}
+#endif
 bool Prefix(const char* text,const char* prefix){while(*prefix)if(*text++!=*prefix++)return false;return true;}
 bool Decimal(const char*& p,uint32_t& value){
     if(*p<'0'||*p>'9')return false;value=0;
@@ -90,6 +190,31 @@ const char* I2cProbeResult(DellI2cIdResult result) {
 }
 
 }
+bool DebugHardwareAutoInitializeIntel(){
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(BdwRenderExperimentEnabled())return true;
+    if(!BdwAutomaticRenderRequested())return false;
+    // A single boot-lifetime owner performs the deferred observation and
+    // delegates the one-shot operation to the same pinned worker used by the
+    // debug command. Other callers wait for that owner; they never replay it.
+    static BdwBootstrapGate gate;
+    if(gate.TryStart()){
+        BdwForcewakeAdapterResult forcewake{};BdwRenderRunResult render{};bool pending=false;
+        const bool ok=RcsDebugRun(0,forcewake,render,pending,true) && BdwRenderExperimentEnabled();
+        const bool sampled=DellGpuVtdObserveRead().sampled;
+        KPrintf("INTEL_AUTO_BOOTSTRAP sampled=%u ready=%u pending=%u stage=%u dma=%u\n",
+                unsigned(sampled),unsigned(ok),unsigned(pending),render.preflightStage,render.dmaStatus);
+        gate.Finish(ok);
+        return ok;
+    }
+    const uint64_t deadline=ApicTickCount()+5000;
+    uint32_t state;
+    while((state=gate.State())==1 && ApicTickCount()<deadline)SchedulerSleepMs(5);
+    return state==2 && BdwRenderExperimentEnabled();
+#else
+    return false;
+#endif
+}
 bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     constexpr const char* guard="bridge guard ";
     if(Prefix(command,guard)){
@@ -108,8 +233,26 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         char boot[33];DebugEpochCopy(boot);
         Reply r;r.text("{\"hardware_api\":1,\"boot_guard\":true,\"logs_api\":1,\"boot_id\":");r.quoted(boot);
         r.text(",\"backlight_api\":1,\"pci_inventory_api\":1,\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
+        HardwarePayloadId(r);
         r.text(",");r.field("logical_cpus",SmpGetCpuCount());
         r.text(",\"audio_device\":");r.text(AudioAvailable()?"true":"false");
+        const auto ac=ShutdownGetAcStatus();
+        r.text(",\"ac_recovery\":{\"api\":1,\"enabled\":");r.text(ac.enabled?"true":"false");
+        r.text(",\"ready\":");r.text(ac.ready?"true":"false");
+        r.text(",\"requested\":");r.text(ac.requested?"true":"false");
+        r.text(",\"source\":");
+        r.quoted(ac.source==AcPowerSource::Online?"online":ac.source==AcPowerSource::Offline?"offline":"unknown");
+        r.text(",\"sample_age_ms\":");
+        if(ac.sampleAgeMs==~uint64_t{0})r.text("null");else r.number(ac.sampleAgeMs);
+        r.text("}");
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+        AcShutdownRecord prior{};
+        r.text(",\"ac_shutdown_record\":");
+        if(GuardCheckedAcShutdownPrior(prior)) {
+            r.text("{\"boot_id\":");r.quoted(prior.bootId);
+            r.text(",\"stage\":\"checked_finalization\",");r.field("sequence",prior.sequence);r.text("}");
+        }else r.text("null");
+#endif
         const auto snapshot=CompressedVfsAppSnapshotInfo();
         r.text(",\"app_snapshot_api\":1,\"app_snapshot\":{\"configured\":");r.text(snapshot.configured?"true":"false");
         r.text(",\"ready\":");r.text(snapshot.ready?"true":"false");
@@ -136,15 +279,27 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
 #endif
         r.text("}\n");r.send();return true;
     }
+    if(!strcmp(command,"bridge hardware usb-reset")){
+        UsbBootResetReport report{};const bool available=UsbBootReadReset(report);
+        Reply r;r.text("{\"usb_reset_api\":1,\"available\":");r.text(available?"true":"false");
+        if(available){r.text(",");r.field("vendor",report.vendor);r.text(",");r.field("device",report.device);
+            r.text(",");r.field("phase",report.phase);r.text(",");r.field("error",report.error);
+            r.text(",");r.field("command",report.command);r.text(",");r.field("status",report.status);
+            r.text(",");r.field("status_now",report.statusNow);r.text(",\"status_now_valid\":");r.text(report.statusNowValid?"true":"false");
+            r.text(",");r.field("elapsed_ms",report.elapsedMs);}
+        r.text("}\n");r.send();return true;
+    }
 #if defined(BROOK_SSD_AUTO_RECOVERY) || !defined(BROOK_SSD_GUARD_CHECK)
     constexpr char priorPrefix[]="bridge hardware recovery-panic ";
-    if(Prefix(command,priorPrefix)) {
-        const char* p=command+sizeof(priorPrefix)-1;uint32_t offset=0,count=0;
+    constexpr char olderPrefix[]="bridge hardware recovery-panic-previous ";
+    const bool older=Prefix(command,olderPrefix);
+    if(older || Prefix(command,priorPrefix)) {
+        const char* p=command+(older?sizeof(olderPrefix)-1:sizeof(priorPrefix)-1);uint32_t offset=0,count=0;
         if(!Decimal(p,offset) || *p++!=' ' || !Decimal(p,count) || *p || count>512) {
             DebugChannelSend("{\"recovery_panic_error\":\"Expected offset and byte count 0..512\"}\n");return true;
         }
         GuardPanicSnapshot snapshot{};
-        if(!GuardRecoveryPanicSnapshot(snapshot)) {
+        if(!(older?GuardRecoveryPanicPreviousSnapshot(snapshot):GuardRecoveryPanicSnapshot(snapshot))) {
             DebugChannelSend("{\"recovery_panic_error\":\"No validated panic record\"}\n");return true;
         }
         if(offset>snapshot.bytes || count>snapshot.bytes-offset) {
@@ -350,7 +505,14 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     }
     if(!strcmp(command,"bridge hardware gpu-gop-plan")) {
         const auto& s=BdwGopObserveRead();Reply r;r.text("{\"gpu_gop_plan_api\":1,\"prepare_requested\":");r.text(s.prepareRequested?"true":"false");
-        r.text(",\"prepare_built\":");r.text(s.prepareBuilt?"true":"false");r.text(",\"inventory\":");r.text(s.inventory?"true":"false");
+        r.text(",\"prepare_built\":");r.text(s.prepareBuilt?"true":"false");
+        r.text(",\"render_prepare_requested\":");r.text(s.renderPrepareRequested?"true":"false");
+        r.text(",\"render_prepare_built\":");r.text(s.renderPrepareBuilt?"true":"false");
+        r.text(",\"retain_requested\":");r.text(s.retainRequested?"true":"false");
+        r.text(",\"retain_built\":");r.text(s.retainBuilt?"true":"false");
+        r.text(",\"render_retain_requested\":");r.text(s.renderRetainRequested?"true":"false");
+        r.text(",\"render_retain_built\":");r.text(s.renderRetainBuilt?"true":"false");
+        r.text(",\"inventory\":");r.text(s.inventory?"true":"false");
         r.text(",\"planned\":");r.text(s.planned?"true":"false");
         if(s.planned){r.text(",");r.field("first_index",s.plan.firstIndex);r.text(",");r.field("last_index",s.plan.lastIndex);
             r.text(",");r.field("first_pte_address",s.plan.firstAddress);r.text(",");r.field("last_pte_address",s.plan.lastAddress);}
@@ -393,6 +555,10 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"wake_submission_quiescent\":");r.text(s.wake.submissionQuiescent?"true":"false");
         r.text(",\"wake_clear_delivered\":");r.text(s.wakeClearDelivered?"true":"false");
         r.text(",\"wake_released\":");r.text(s.wake.released?"true":"false");
+        r.text(",\"pat_requested\":");r.text(s.patRequested?"true":"false");
+        r.text(",\"pat_page_admitted\":");r.text(s.patPageAdmitted?"true":"false");
+        r.text(",\"pat_sampled\":");r.text(s.wake.patSampled?"true":"false");
+        if(s.wake.patSampled){r.text(",");r.field("pat_lo",s.wake.patLo);r.text(",");r.field("pat_hi",s.wake.patHi);}
         if(s.wake.sampled){r.text(",");r.field("bcs_head",s.wake.first.head);r.text(",");r.field("bcs_tail",s.wake.first.tail);r.text(",");r.field("bcs_mode",s.wake.first.mode);
             r.text(",");r.field("bcs_head2",s.wake.second.head);r.text(",");r.field("bcs_tail2",s.wake.second.tail);r.text(",");r.field("bcs_mode2",s.wake.second.mode);
             r.text(",");r.field("bcs_start",s.wake.first.start);r.text(",");r.field("bcs_control",s.wake.first.control);
@@ -402,9 +568,267 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("bcs_submission_mode",s.wake.first.submissionMode);r.text(",");r.field("bcs_submission_mode2",s.wake.second.submissionMode);}
         r.text("}\n");r.send();return true;
     }
-    if(!strcmp(command,"bridge hardware gpu-vtd")) {
+    if(!strcmp(command,"bridge hardware gpu-forcewake-live")) {
+        BdwForcewakeAdapterResult p{};const bool sampled=BdwObserveForcewakeLive(p);Reply r;
+        r.text("{\"gpu_forcewake_live_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        r.text(",\"requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"released\":");r.text(p.sequence.released?"true":"false");
+        if(sampled){r.text(",");r.field("pat_lo",p.sequence.patLo);r.text(",");r.field("pat_hi",p.sequence.patHi);}
+        r.text(",\"ownership\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-engines-live") || !strcmp(command,"bridge hardware gpu-scope-check")) {
+        const bool scope=!strcmp(command,"bridge hardware gpu-scope-check");
+        BdwForcewakeAdapterResult p{};const bool sampled=BdwObserveForcewakeLive(p,true,scope);Reply r;
+        r.text("{\"gpu_engines_live_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        r.text(",\"requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"released\":");r.text(p.sequence.released?"true":"false");
+        if(scope){r.text(",\"scope_attempted\":");r.text(p.sequence.workAttempted?"true":"false");
+            r.text(",\"scope_complete\":");r.text(p.sequence.workComplete?"true":"false");}
+        r.text(",\"other_engines_quiescent\":");r.text(p.sequence.otherEnginesQuiescent?"true":"false");
+        if(sampled){r.text(",");r.field("pat_lo",p.sequence.patLo);r.text(",");r.field("pat_hi",p.sequence.patHi);
+            r.text(",\"bcs_idle\":");r.text(p.sequence.submissionQuiescent?"true":"false");r.text(",\"other\":[");
+            for(unsigned i=0;i<3;++i){if(i)r.text(",");const auto& e=p.sequence.other[i];r.text("{");
+                r.field("head",e.first.head);r.text(",");r.field("tail",e.first.tail);r.text(",");r.field("mode",e.first.mode);
+                r.text(",");r.field("control",e.first.control);r.text(",");r.field("submission_mode",e.first.submissionMode);
+                r.text(",\"quiescent\":");r.text(e.submissionQuiescent?"true":"false");r.text("}");}r.text("]");}
+        r.text(",\"ownership\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-clear-prior-scratch")) {
+        BdwForcewakeAdapterResult p{};BdwScratchTakeoverResult s{};const bool ok=BdwClearPriorScratch(p,s);Reply r;
+        r.text("{\"gpu_clear_prior_scratch_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"forcewake_requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"pte_attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"pte_complete\":");r.text(s.complete?"true":"false");r.text(",");r.field("stage",s.stage);
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-bcs-copy-test")) {
+        BdwForcewakeAdapterResult p{};BdwBcsRunResult s{};const bool ok=BdwTestBcsCopy(p,s);Reply r;
+        r.text("{\"gpu_bcs_copy_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"reset_before\":");r.text(s.resetBefore?"true":"false");
+        r.text(",\"pat_established\":");r.text(s.patEstablished?"true":"false");
+        r.text(",\"pat_uncertain\":");r.text(s.patUncertain?"true":"false");
+        r.text(",\"copy_complete\":");r.text(s.copyComplete?"true":"false");
+        r.text(",\"context_complete\":");r.text(s.contextComplete?"true":"false");
+        r.text(",");r.field("ggtt_write_attempts",s.ggttWriteAttempts);
+        r.text(",");r.field("port_write_attempts",s.portWriteAttempts);
+        r.text(",\"engine_sampled\":");r.text(s.engineSampled?"true":"false");
+        if(s.engineSampled){r.text(",");r.field("head",s.head);r.text(",");r.field("tail",s.tail);
+            r.text(",");r.field("mode",s.mode);r.text(",");r.field("control",s.control);
+            r.text(",");r.field("acthd",s.acthd);r.text(",");r.field("ipeir",s.ipeir);
+            r.text(",");r.field("ipehr",s.ipehr);r.text(",");r.field("execlist",s.execlist);}
+        r.text(",\"reset_after\":");r.text(s.resetAfter?"true":"false");
+        r.text(",\"pat_restored\":");r.text(s.patRestored?"true":"false");
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");r.text("}\n");r.send();return true;
+    }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(!strcmp(command,"bridge hardware gpu-rcs-worker-test") || !strcmp(command,"bridge hardware gpu-rcs-context-test")){
+        const bool contexts=!strcmp(command,"bridge hardware gpu-rcs-context-test");
+        BdwWorkerProbeResult s{};bool pending=false;const bool ok=SubmissionDebugRun(s,pending,contexts);Reply r;
+        r.text("{\"gpu_rcs_worker_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"worker_pending\":");r.text(pending?"true":"false");
+        r.text(",");r.field("submitted",s.submitted);r.text(",");r.field("completed_jobs",s.completed);
+        r.text(",\"failed\":");r.text(s.failed?"true":"false");
+        r.text(",");r.field("value0",s.values[0]);r.text(",");r.field("value1",s.values[1]);
+        if(contexts){r.text(",");r.field("value2",s.values[2]);r.text(",");r.field("context_hash0",s.contextHashes[0]);
+            r.text(",");r.field("context_hash1",s.contextHashes[1]);}
+        r.text("}\n");r.send();return true;
+    }
+#endif
+    if(!strcmp(command,"bridge hardware gpu-rcs-run-test") || !strcmp(command,"bridge hardware gpu-rcs-rebase-test") ||
+       !strcmp(command,"bridge hardware gpu-rcs-repeat-test")) {
+        const bool rebased=!strcmp(command,"bridge hardware gpu-rcs-rebase-test");
+        const bool repeat=!strcmp(command,"bridge hardware gpu-rcs-repeat-test");
+        BdwForcewakeAdapterResult p{};BdwRenderRunResult s{};bool pending=false;
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+        const bool ok=RcsDebugRun(repeat?2:rebased?1:0,p,s,pending);
+#else
+        const bool ok=repeat?BdwTestRenderRepeat(p,s):rebased?BdwTestRebasedRenderRun(p,s):BdwTestRenderRun(p,s);
+#endif
+        Reply r;
+        r.text("{\"gpu_rcs_run_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"worker_pending\":");r.text(pending?"true":"false");
+        r.text(",\"rebased\":");r.text(rebased?"true":"false");
+        r.text(",\"repeat\":");r.text(repeat?"true":"false");
+        r.text(",\"admitted\":");r.text(s.admitted?"true":"false");
+        r.text(",");r.field("preflight_stage",s.preflightStage);r.text(",");r.field("dma_status",s.dmaStatus);
+        r.text(",\"attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"gt_ready\":");r.text(s.transaction.gtReady?"true":"false");
+        r.text(",\"pat_ready\":");r.text(s.transaction.patReady?"true":"false");
+        r.text(",\"breadcrumb\":");r.text(s.breadcrumb?"true":"false");
+        r.text(",\"context_complete\":");r.text(s.contextComplete?"true":"false");
+        r.text(",\"context_saved\":");r.text(s.transaction.contextSaved?"true":"false");
+        r.text(",\"ggtt_clear_requested\":");r.text(s.ggttClearRequested?"true":"false");
+        r.text(",\"ggtt_cleared\":");r.text(s.ggttCleared?"true":"false");
+        r.text(",\"gem_release_requested\":");r.text(s.gemReleaseRequested?"true":"false");
+        r.text(",\"gem_released\":");r.text(s.gemReleased?"true":"false");
+        r.text(",\"external_tables_requested\":");r.text(s.externalTablesRequested?"true":"false");
+        r.text(",\"gem_queued\":");r.text(s.gemQueued?"true":"false");
+        r.text(",\"gem_ioctl_decoded\":");r.text(s.gemIoctlDecoded?"true":"false");
+        r.text(",\"gem_ioctl_submitted\":");r.text(s.gemIoctlSubmitted?"true":"false");
+        r.text(",\"poll_yield_requested\":");r.text(s.pollYieldRequested?"true":"false");
+        r.text(",\"poll_yield_failed\":");r.text(s.pollYieldFailed?"true":"false");
+        r.text(",");r.field("poll_yields",s.pollYields);
+        r.text(",\"reset_complete\":");r.text(s.transaction.resetComplete?"true":"false");
+        r.text(",\"pat_restored\":");r.text(s.transaction.patRestored?"true":"false");
+        r.text(",\"uncertain\":");r.text(s.transaction.uncertain?"true":"false");
+        r.text(",");r.field("ggtt_write_attempts",s.ggttWriteAttempts);r.text(",");r.field("port_write_attempts",s.portWriteAttempts);
+        r.text(",");r.field("context_hash",s.contextHash);r.text(",\"engine_sampled\":");r.text(s.engineSampled?"true":"false");
+        if(s.engineSampled){r.text(",");r.field("head",s.head);r.text(",");r.field("tail",s.tail);
+            r.text(",");r.field("mode",s.mode);r.text(",");r.field("control",s.control);
+            r.text(",");r.field("acthd",s.acthd);r.text(",");r.field("ipeir",s.ipeir);
+            r.text(",");r.field("ipehr",s.ipehr);r.text(",");r.field("execlist",s.execlist);}
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-rcs-gt-init")) {
+        BdwForcewakeAdapterResult p{};BdwRenderGtInitResult s{};const bool ok=BdwTestRenderGtInit(p,s);Reply r;
+        r.text("{\"gpu_rcs_gt_init_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",");r.field("status",unsigned(s.status));r.text(",");r.field("stage",s.stage);
+        r.text(",");r.field("writes",s.writes);r.text(",");r.field("l3_before",s.l3Before);r.text(",");r.field("l3_after",s.l3After);
+        r.text(",\"topology_sampled\":");r.text(s.topologySampled?"true":"false");
+        if(s.topologySampled){r.text(",");r.field("selector",s.selector);r.text(",");r.field("fuse2",s.fuse2);}
+        r.text(",\"dop_restored\":");r.text(s.dopRestored?"true":"false");
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-rcs-reset-test")) {
+        BdwForcewakeAdapterResult p{};BdwRcsResetTestResult s{};const bool ok=BdwTestRcsReset(p,s);Reply r;
+        r.text("{\"gpu_rcs_reset_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"reset_complete\":");r.text(s.complete?"true":"false");
+        r.text(",\"reset_uncertain\":");r.text(s.uncertain?"true":"false");
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-pat-transition-test")) {
+        BdwForcewakeAdapterResult p{};BdwPatTestResult s{};const bool ok=BdwTestPrivatePat(p,s);Reply r;
+        r.text("{\"gpu_pat_transition_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"reset_complete\":");r.text(s.resetComplete?"true":"false");
+        r.text(",\"established\":");r.text(s.established?"true":"false");
+        r.text(",\"restored\":");r.text(s.restored?"true":"false");
+        r.text(",");r.field("before_lo",s.beforeLo);r.text(",");r.field("before_hi",s.beforeHi);
+        r.text(",");r.field("active_lo",s.activeLo);r.text(",");r.field("active_hi",s.activeHi);
+        r.text(",");r.field("after_lo",s.afterLo);r.text(",");r.field("after_hi",s.afterHi);
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-bcs-init-test")) {
+        BdwForcewakeAdapterResult p{};BdwBcsInitResult s{};const bool ok=BdwTestBcsInitialize(p,s);Reply r;
+        r.text("{\"gpu_bcs_init_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"forcewake_requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"init_attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"reset_complete\":");r.text(s.resetComplete?"true":"false");
+        r.text(",\"init_complete\":");r.text(s.initComplete?"true":"false");
+        r.text(",");r.field("stage",s.stage);
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");
+        r.text(",\"dma_submission\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-scratch-takeover")) {
+        BdwForcewakeAdapterResult p{};BdwScratchTakeoverResult s{};const bool ok=BdwTestScratchTakeover(p,s);Reply r;
+        r.text("{\"gpu_scratch_takeover_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"forcewake_requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"reset_attempted\":");r.text(s.resetAttempted?"true":"false");
+        r.text(",\"reset_complete\":");r.text(s.resetComplete?"true":"false");
+        r.text(",\"pte_attempted\":");r.text(s.attempted?"true":"false");
+        r.text(",\"pte_complete\":");r.text(s.complete?"true":"false");
+        r.text(",");r.field("stage",s.stage);
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");
+        r.text(",\"dma_submission\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-tlb-test")) {
+        BdwForcewakeAdapterResult p{};const bool ok=BdwTestTlbInvalidate(p);Reply r;
+        r.text("{\"gpu_tlb_test_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"forcewake_requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"tlb_attempted\":");r.text(p.sequence.tlbAttempted?"true":"false");
+        r.text(",\"tlb_complete\":");r.text(p.sequence.tlbComplete?"true":"false");
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");
+        r.text(",\"dma_authorized\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-bcs-reset-test")) {
+        BdwForcewakeAdapterResult p{};const bool ok=BdwTestBcsReset(p);Reply r;
+        r.text("{\"gpu_bcs_reset_test_api\":1,\"completed\":");r.text(ok?"true":"false");
+        r.text(",\"forcewake_requested\":");r.text(p.sequence.requested?"true":"false");
+        r.text(",\"reset_attempted\":");r.text(p.sequence.resetAttempted?"true":"false");
+        r.text(",\"reset_complete\":");r.text(p.sequence.resetComplete?"true":"false");
+        r.text(",\"csb_sampled\":");r.text(p.sequence.resetCsbSampled?"true":"false");
+        if(p.sequence.resetCsbSampled){r.text(",");r.field("csb_ptr",p.sequence.resetCsb);}
+        r.text(",\"wake_released\":");r.text(p.sequence.released?"true":"false");
+        r.text(",\"dma_authorized\":false}\n");r.send();return true;
+    }
+    constexpr char surveyPrefix[]="bridge hardware gpu-ggtt-survey ";
+    if(length>=sizeof(surveyPrefix)-1 && !strncmp(command,surveyPrefix,sizeof(surveyPrefix)-1)) {
+        const char* p=command+sizeof(surveyPrefix)-1;uint32_t first=0;bool valid=*p!=0;
+        while(*p){if(*p<'0' || *p>'9' || first>(1048576u-uint32_t(*p-'0'))/10u){valid=false;break;}
+            first=first*10+uint32_t(*p++-'0');}
+        BdwGgttSurvey s{};const bool sampled=valid && BdwObserveGgttSurvey(first,s);Reply r;
+        r.text("{\"gpu_ggtt_survey_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        if(sampled){r.text(",");r.field("first",s.first);r.text(",");r.field("zero",s.zero);
+            r.text(",");r.field("valid",s.valid);r.text(",");r.field("other",s.other);}
+        r.text(",\"ownership\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-display-state")) {
+        BdwDisplaySnapshot p{};const bool sampled=BdwObserveDisplayLive(p);Reply r;
+        r.text("{\"gpu_display_state_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        if(sampled){r.text(",\"pipes\":[");for(unsigned i=0;i<3;++i){if(i)r.text(",");r.text("[");
+            for(unsigned j=0;j<BdwDisplaySnapshot::PrimaryOffset;++j){if(j)r.text(",");r.number(p.regs[i][j]);}r.text("]");}r.text("]");
+            r.text(",\"primary_offsets\":[");for(unsigned i=0;i<3;++i){if(i)r.text(",");r.number(p.regs[i][BdwDisplaySnapshot::PrimaryOffset]);}r.text("]");}
+        r.text(",\"ownership\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-gop-ggtt")) {
+        BdwGopPtes p{};const bool sampled=BdwObserveGopPtesLive(p);Reply r;
+        r.text("{\"gpu_gop_ggtt_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        if(sampled){r.text(",");r.field("first",p.first);r.text(",");r.field("last",p.last);}
+        r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-gop-backing")) {
+        BdwGopBacking backing{};const bool sampled=BdwObserveGopBacking(backing);Reply r;
+        r.text("{\"gpu_gop_backing_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        if(sampled){r.text(",");r.field("bytes",backing.bytes);}
+        r.text(",\"ownership\":false}\n");r.send();return true;
+    }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(!strcmp(command,"bridge hardware gpu-bcs-present")) {
+        const auto stats=BdwReadScanoutCopyStats();Reply r;
+        uint64_t queued=0,presented=0;BdwOffscreenPresentCounts(queued,presented);
+        r.text("{\"gpu_bcs_present_api\":1,\"enabled\":");r.text(BdwBcsScanoutEnabled()?"true":"false");
+        r.text(",");r.field("requested",stats.requested);
+        r.text(",");r.field("submitted",stats.submitted);
+        r.text(",");r.field("full",stats.full);
+        r.text(",");r.field("partial",stats.partial);
+        r.text(",");r.field("stage",stats.lastStage);
+        r.text(",");r.field("queued",queued);
+        r.text(",");r.field("queued_presented",presented);
+        r.text("}\n");r.send();return true;
+    }
+#endif
+    if(!strcmp(command,"bridge hardware gpu-bcs-ggtt")) {
+        BdwGgttReservedPtes p{};const bool sampled=BdwObserveReservedGgtt(p);Reply r;
+        r.text("{\"gpu_bcs_ggtt_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        if(sampled){r.text(",\"entries\":[");for(unsigned i=0;i<8;++i){if(i)r.text(",");r.number(p.values[i]);}r.text("]");}
+        r.text(",\"ownership\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-rcs-ggtt")) {
+        BdwRcsGgttPtes p{};const bool sampled=BdwObserveRcsGgtt(p);Reply r;
+        r.text("{\"gpu_rcs_ggtt_api\":1,\"sampled\":");r.text(sampled?"true":"false");
+        if(sampled){r.text(",\"entries\":[");for(unsigned i=0;i<29;++i){if(i)r.text(",");r.number(p.values[i]);}r.text("]");}
+        r.text(",\"ownership\":false,\"atomic_snapshot\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-bcs-dma-check")) {
+        const uint32_t status=BdwInspectPrivateBcsDma();Reply r;
+        r.text("{\"gpu_bcs_dma_snapshot_api\":1,\"snapshot_ok\":");r.text(!status?"true":"false");
+        r.text(",");r.field("status",status);
+        r.text(",\"dma_authorized\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-rcs-dma-check")) {
+        const uint32_t status=BdwInspectPrivateRenderDma();Reply r;
+        r.text("{\"gpu_rcs_dma_snapshot_api\":1,\"snapshot_ok\":");r.text(!status?"true":"false");
+        r.text(",");r.field("status",status);
+        r.text(",\"dma_authorized\":false}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware gpu-vtd") || !strcmp(command,"bridge hardware gpu-vtd sample")) {
+        if(!strcmp(command,"bridge hardware gpu-vtd sample"))DellGpuVtdObserveDeferred();
         const auto& s=DellGpuVtdObserveRead();Reply r;
         r.text("{\"gpu_vtd_api\":1,\"requested\":");r.text(s.requested?"true":"false");
+        r.text(",\"deferred\":");r.text(s.deferred?"true":"false");
+        r.text(",\"deferred_attempted\":");r.text(s.deferredAttempted?"true":"false");
         r.text(",\"topology\":");r.text(s.topology?"true":"false");
         r.text(",\"inventory\":");r.text(s.inventory?"true":"false");
         r.text(",\"boot_map\":");r.text(s.bootMap?"true":"false");
@@ -414,7 +838,10 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"audited_dmar_unreported\":");r.text(s.auditedDmarHole?"true":"false");
         r.text(",\"sampled\":");r.text(s.sampled?"true":"false");
         if(s.sampled){r.text(",");r.field("version",s.status.version);r.text(",");r.field("global_status",s.status.globalStatus);
-            r.text(",\"translation_enabled\":");r.text((s.status.globalStatus&(1u<<31))?"true":"false");}
+            r.text(",\"translation_enabled\":");r.text((s.status.globalStatus&(1u<<31))?"true":"false");
+            r.text(",");r.field("capability",s.status.capability);
+            r.text(",\"protected_memory_sampled\":");r.text(s.status.protectedMemorySampled?"true":"false");
+            if(s.status.protectedMemorySampled){r.text(",");r.field("protected_memory",s.status.protectedMemory);}}
         r.text("}\n");r.send();return true;
     }
     if(!strcmp(command,"bridge hardware acpi-info")) {

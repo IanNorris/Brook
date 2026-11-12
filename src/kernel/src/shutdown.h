@@ -9,6 +9,16 @@ struct ShutdownPowerCapabilities {
 };
 ShutdownPowerCapabilities ShutdownGetPowerCapabilities();
 void ShutdownStart();
+enum class AcPowerSource : uint8_t { Unknown, Online, Offline };
+struct ShutdownAcStatus {
+    AcPowerSource source;
+    bool enabled, ready, requested;
+    uint64_t sampleAgeMs;
+};
+// The platform AC driver publishes a new sample once per second. Reports
+// must come from the kernel and be independent of USB/network availability.
+void ShutdownReportAcSource(AcPowerSource source);
+ShutdownAcStatus ShutdownGetAcStatus();
 // Request/result identities are retained until reboot. Caller binds the boot.
 void ShutdownCommand(const char* id,const char* verb,char state[24],int* error);
 void ShutdownDesktopRequest(bool restart);

@@ -93,6 +93,9 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+// True only after every task, including terminated but not-yet-reaped tasks,
+// of this exact non-reused group has left the scheduler registry.
+bool SchedulerThreadGroupGone(uint16_t tgid,uint64_t incarnation);
 #ifdef BROOK_REGISTER_TEST_HOOKS
 bool SchedulerTestTargetApic(Process* actor,uint16_t pid,uint8_t* apic);
 #endif

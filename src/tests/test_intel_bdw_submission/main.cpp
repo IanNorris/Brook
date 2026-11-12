@@ -16,6 +16,11 @@ int main(){
     for(unsigned i=0;i<14;++i)assert(ring[i]==expectedRing[i]);
     auto adjacent=s;adjacent.completionGgtt=s.context.ringGgtt+s.context.ringBytes;
     assert(BdwBuildBcsSubmission(adjacent,ctx,batch,ring,desc));
+    auto region=s;region.copy.widthPixels=5;region.copy.heightPixels=2;
+    region.sourceX=3;region.sourceY=1;region.destinationX=7;region.destinationY=2;
+    assert(BdwBuildBcsSubmission(region,ctx,batch,ring,desc));
+    assert(batch[2]==0x00020007 && batch[3]==0x0004000c && batch[6]==0x00010003);
+    for(unsigned i=0;i<14;++i)assert(ring[i]==expectedRing[i]);
     auto reject=[&](BdwBcsSubmission bad){for(auto& x:ctx)x=0xcccccccc;for(auto& x:batch)x=0xcccccccc;
         for(auto& x:ring)x=0xcccccccc;desc=0xfeed;assert(!BdwBuildBcsSubmission(bad,ctx,batch,ring,desc));
         for(auto x:ctx)assert(x==0xcccccccc);for(auto x:batch)assert(x==0xcccccccc);
@@ -27,4 +32,46 @@ int main(){
     b=s;b.copy.source.gpuAddress=~uint64_t{0}-7;b.copy.source.allocationBytes=32;reject(b);
     b=s;b.context.contextGgtt=~uint64_t{0}-4095;reject(b);
     b=s;b.nonce=0;reject(b);b=s;b.context.tailBytes=48;reject(b);b=s;b.copy.widthPixels=0;reject(b);
+    b=region;b.destinationY=3;reject(b);b=region;b.sourceX=12;reject(b);
+
+    BdwBcsLaunch launch{s.context,s.batchPpgtt,s.completionGgtt,s.nonce};
+    BdwBlitRegion regions[BdwBcsMaxRegions]{};
+    for(unsigned i=0;i<BdwBcsMaxRegions;++i)
+        regions[i]={{0x200000+i*64ull,64,64},{0x300000,2048,64},0,0,0,i,16,1};
+    uint32_t packed[BdwBcsBatchWords]{};
+    assert(BdwBuildBcsRegions(launch,regions,BdwBcsMaxRegions,ctx,packed,ring,desc));
+    for(unsigned i=0;i<BdwBcsMaxRegions;++i) {
+        assert(packed[i*10]==0x54f00008);
+        assert(packed[i*10+2]==(i<<16));
+        assert(packed[i*10+3]==(((i+1)<<16)|16));
+        assert(packed[i*10+4]==0x300000);
+        assert(packed[i*10+8]==0x200000+i*64);
+    }
+    assert(packed[BdwBcsBatchWords-2]==0x05000000 && packed[BdwBcsBatchWords-1]==0);
+    for(unsigned i=0;i<14;++i)assert(ring[i]==expectedRing[i]);
+
+    const auto rejectRegions=[&](const BdwBcsLaunch& request,unsigned count) {
+        for(auto& word:ctx)word=0xcccccccc;
+        for(auto& word:packed)word=0xcccccccc;
+        for(auto& word:ring)word=0xcccccccc;
+        desc=0xfeed;
+        assert(!BdwBuildBcsRegions(request,regions,count,ctx,packed,ring,desc));
+        for(auto word:ctx)assert(word==0xcccccccc);
+        for(auto word:packed)assert(word==0xcccccccc);
+        for(auto word:ring)assert(word==0xcccccccc);
+        assert(desc==0xfeed);
+    };
+    rejectRegions(launch,0);
+    rejectRegions(launch,BdwBcsMaxRegions+1);
+    assert(!BdwBuildBcsRegions(launch,regions,2,ctx,batch,ring,desc));
+    auto last=regions[BdwBcsMaxRegions-1];
+    regions[BdwBcsMaxRegions-1].source.gpuAddress+=4;
+    rejectRegions(launch,BdwBcsMaxRegions);
+    regions[BdwBcsMaxRegions-1]=last;
+    regions[BdwBcsMaxRegions-1].destination.gpuAddress+=64;
+    rejectRegions(launch,BdwBcsMaxRegions);
+    regions[BdwBcsMaxRegions-1]=last;
+    auto overlappingBatch=launch;
+    overlappingBatch.batchPpgtt=0x1fffc0;
+    rejectRegions(overlappingBatch,BdwBcsMaxRegions);
 }

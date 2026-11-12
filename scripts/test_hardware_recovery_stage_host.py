@@ -32,4 +32,6 @@ with tempfile.TemporaryDirectory() as temp:
                     str(path / 'test.c'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test'), str(path / 'payload'), str(path / 'target')], check=True)
     subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-fsyntax-only', str(SOURCE)], check=True)
+    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-DBROOK_RECOVERY_STAGE_ALTERNATE',
+                    '-fsyntax-only', str(SOURCE)], check=True)
 print('recovery staging file primitives: PASS')

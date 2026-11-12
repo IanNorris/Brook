@@ -475,7 +475,7 @@ int VfsCanonicalDrmAnchorInitialize()
     VfsPathRelease(device.parent);VfsPathRelease(device.object);
     VfsPathRelease(walk.parent);VfsPathRelease(walk.object);VfsPathRelease(root);return error;
 }
-int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed)
+int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed,bool intel)
 {
     if(!allowed)return -22;
     *allowed=false;if(!root.object || !root.attachment)return -9;
@@ -487,7 +487,7 @@ int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed)
     if(!error && VfsPathSameObject(parent.object,anchor)) {
         // The entire subtree is synthetic. Never activate it through a real
         // child, symlink, reserved mount ancestor or a shadowing attachment.
-        const char* leaf=sysfs?"226:128":"renderD128";
+        const char* leaf=sysfs?(intel?"226:129":"226:128"):(intel?"renderD129":"renderD128");
         VfsPath reserved{};
         if(VfsReservedVirtualLocked(parent.object,leaf,&reserved))VfsPathRelease(reserved);
         else {

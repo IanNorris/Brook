@@ -7,17 +7,18 @@
 #include "smp.h"
 #include "vfs.h"
 #include "serial.h"
+#include "panic_test_reset.h"
 
 namespace brook {
 namespace {
 DellGpuVtdObservation observation{};
 bool configured=false;
-bool OptedIn() {
+unsigned OptedIn() {
     auto* file=VfsOpen("/etc/dell-gpu-vtd-probe",VFS_O_STREAM);if(!file)return false;
     VnodeStat st{};uint64_t offset=0;char text[2]{};
     const bool ok=!VfsStat(file,&st) && !st.isDir && !st.isSymlink && st.size==2 &&
-        VfsRead(file,text,2,&offset)==2 && text[0]=='1' && text[1]=='\n';
-    VfsRelease(file);return ok;
+        VfsRead(file,text,2,&offset)==2 && (text[0]=='1' || text[0]=='2') && text[1]=='\n';
+    VfsRelease(file);return ok?unsigned(text[0]-'0'):0;
 }
 bool ExactIdentity() {
     bool gpu=false,bridge=false;
@@ -31,11 +32,7 @@ bool ExactIdentity() {
     return gpu && bridge;
 }
 }
-void DellGpuVtdObserveConfigure() {
-    if(configured)return;configured=true;
-    if(!OptedIn())return;
-    observation.requested=true;
-    if(SmpCurrentCpuIndex()!=0)return;
+static void Sample() {
     uint8_t dmar[212]{};uint32_t size=0;
     observation.topology=AcpiUniqueDmarCopy(dmar,sizeof(dmar),size) && DmarAuditedDellGpuUnit(dmar,size).found;
     observation.inventory=HdaDellToneInventoryMatches() && ExactIdentity();
@@ -54,6 +51,27 @@ void DellGpuVtdObserveConfigure() {
         observation.sampled=VmmDellGpuVtdCriticalRead(observation.status);
     }
     SerialPrintf("gpu-vtd: topology=%u inventory=%u bootmap=%u sampled=%u\n",observation.topology,observation.inventory,observation.bootMap,observation.sampled);
+}
+void DellGpuVtdObserveConfigure() {
+    if(configured)return;configured=true;
+    const unsigned mode=OptedIn();if(!mode)return;
+    observation.requested=true;
+    if(mode==2){observation.deferred=true;return;}
+    if(SmpCurrentCpuIndex()!=0)return;
+    Sample();
+}
+bool DellGpuVtdObserveDeferred() {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    // The VMM critical read pins execution with interrupts disabled and
+    // validates the current CPU's MTRR/PAT state and active aliases. It need
+    // not run on the BSP; debug workers are deliberately free to migrate.
+    if(!configured || !observation.deferred || observation.deferredAttempted ||
+       !PanicRecoveryResetArmed())return false;
+    observation.deferredAttempted=true;
+    Sample();return observation.sampled;
+#else
+    return false;
+#endif
 }
 const DellGpuVtdObservation& DellGpuVtdObserveRead(){return observation;}
 }

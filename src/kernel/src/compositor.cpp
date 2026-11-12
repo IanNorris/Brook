@@ -4,8 +4,11 @@
 #include "compositor_wake_sequence.h"
 #include "apic.h"
 #include "scene_damage.h"
+#include "desktop_backdrop.h"
+#include "compositor_present_lease.h"
 #include "desktop_pointer_route.h"
 #include "compositor.h"
+#include "../../shared/brook_debug_frame.h"
 #include "boot_logo.h"
 #include "kvmclock.h"
 #include "compositor_scene.h"
@@ -45,6 +48,18 @@
 namespace brook {
 
 static KMutex g_scanoutMappingLock{};
+static CompositorPresentLease g_presentLease{};
+// Compositor progress and guest time when the most recent leased image was
+// published. Protected by the scanout mapping lock, like the image itself.
+static uint64_t g_leasedFrameEpoch=0, g_leasedFrameTick=0;
+static uint64_t g_leasedFrameDisplay=0, g_leasedFrameBackdrop=0;
+static uint32_t g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_NONE;
+// A released/expired lease leaves its last complete image on screen until the
+// software flip. A failed or partial probe must not be reported as a frame.
+static bool g_scanoutContainsLeasedFrame=false, g_scanoutNeedsRepair=false;
+// Zero means generation tracking has exhausted its unique identifiers.
+// Protected by g_scanoutMappingLock, together with the display mapping.
+static uint64_t g_displayGeneration=1;
 struct CompositorMutexGuard {
     KMutex* mutex;
     explicit CompositorMutexGuard(KMutex* value):mutex(value) { KMutexLock(mutex); }
@@ -342,6 +357,8 @@ static DebugFrameSnapshot g_debugFrame{};
 static uint32_t g_debugFrameNextToken;
 static uint64_t g_debugFrameDeadline;
 static uint64_t g_debugFrameOwner;
+static bool g_debugFrameOverlay=false;
+static DesktopOverlayBands g_debugOverlayBands{};
 static VirtualAddress g_debugFrameBuffer{};
 static uint64_t g_debugFramePages;
 static constexpr uint64_t DEBUG_FRAME_LEASE_MS=30000;
@@ -352,7 +369,7 @@ static void ExpireDebugFrameLocked()
         g_debugFrame={};
 }
 
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner)
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
@@ -363,8 +380,9 @@ DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner)
     if (g_debugFrameNextToken==0xffffffffU) {
         DebugFrameSnapshot failed{};failed.state=DebugFrameState::Failed;return failed;
     }
-    g_debugFrame={};g_debugFrame.token=++g_debugFrameNextToken;
+    g_debugFrame={};g_debugOverlayBands={};g_debugFrame.token=++g_debugFrameNextToken;
     g_debugFrameOwner=owner;
+    g_debugFrameOverlay=overlay;
     g_debugFrame.state=DebugFrameState::Pending;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     CompositorWake();
@@ -379,6 +397,14 @@ DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner)
         DebugFrameSnapshot expired{};expired.token=token;expired.state=DebugFrameState::Expired;return expired;
     }
     return g_debugFrame;
+}
+
+int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& bands)
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);ExpireDebugFrameLocked();
+    if(!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner)return -116;
+    if(!g_debugFrameOverlay || g_debugFrame.state!=DebugFrameState::Ready)return -11;
+    bands=g_debugOverlayBands;return 0;
 }
 
 bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner)
@@ -410,22 +436,28 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
-    if (g_debugFrame.state!=DebugFrameState::Pending) return;
-    g_debugFrame.state=DebugFrameState::Failed;
+    if (g_debugFrame.state!=DebugFrameState::Pending || g_debugFrameOverlay) return;
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    // Wait for the software compositor to repair a partially written scanout.
+    if(g_scanoutNeedsRepair) return;
+    g_debugFrame.state=DebugFrameState::Failed;
     // Reject a runtime remap since frame start rather than tagging a new,
     // unpresented buffer with this frame's epoch.
     if (presented.pixels!=g_physFb || presented.width!=g_physFbWidth ||
         presented.height!=g_physFbHeight || presented.stride!=g_physFbStride) return;
+    const bool leased=g_scanoutContainsLeasedFrame;
+    if (leased) epoch=g_leasedFrameEpoch;
     uint32_t width=presented.width,height=presented.height,stride=presented.stride;
     // Read the presented CPU front buffer, not the mutable backbuffer (which
     // can also be written by legacy TTY/scanout aliases outside the renderer).
     const uint32_t* source=const_cast<const uint32_t*>(presented.pixels);
+    uint32_t sourceKind=leased?BROOK_DEBUG_FRAME_SOURCE_LEASED:BROOK_DEBUG_FRAME_SOURCE_FRONT;
     if (CompositorGpuActive()) {
         const auto* gpu=GpuCompositorGet();
         if (!gpu || !gpu->CaptureFull) return;
         source=gpu->CaptureFull(&width,&height);stride=width;
         if (width!=presented.width || height!=presented.height) return;
+        sourceKind=BROOK_DEBUG_FRAME_SOURCE_LEGACY_GPU;
     }
     if (!source || !width || !height || width>4096 || height>2160 || stride<width || stride>8192) return;
     const uint64_t bytes=static_cast<uint64_t>(width)*height*4;
@@ -440,7 +472,8 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     for (uint32_t y=0;y<height;++y)
         memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
-    g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=ApicTickCount();g_debugFrame.epoch=epoch;
+    g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=leased?g_leasedFrameTick:ApicTickCount();g_debugFrame.epoch=epoch;g_debugFrame.source=sourceKind;
+    g_debugFrame.presentationMode=sourceKind==BROOK_DEBUG_FRAME_SOURCE_LEASED?g_leasedFrameMode:BROOK_DEBUG_FRAME_PRESENT_NONE;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     g_debugFrame.state=DebugFrameState::Ready;
 }
@@ -493,6 +526,20 @@ uint64_t CompositorBootDurationMs(){return __atomic_load_n(&g_bootDurationMs,__A
 static uint32_t* g_wallpaper       = nullptr;
 static uint32_t  g_wallpaperWidth  = 0;
 static uint32_t  g_wallpaperHeight = 0;
+// Modified under g_scanoutMappingLock. Wallpaper storage published through
+// CompositorSetWallpaper must remain immutable while installed.
+static uint64_t g_backdropGeneration=1;
+static uint64_t g_backdropStyleVersion=0;
+// Called under the scanout mapping lock. Never reuse an identity on overflow.
+static bool RefreshBackdropStyle(){
+    const uint64_t version=WmBackdropStyleVersion();
+    if(!version || (version&1))return false;
+    if(version!=g_backdropStyleVersion){
+        if(!g_backdropGeneration || g_backdropGeneration==~uint64_t{0}){g_backdropGeneration=0;return false;}
+        ++g_backdropGeneration;g_backdropStyleVersion=version;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // GPU composition (BLIT-based). When enabled (BROOK_COMPOSITE=gpu via fw_cfg)
@@ -1042,7 +1089,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     proc->fbDestX       = destX;
     proc->fbDestY       = destY;
     proc->fbScale       = (scale > 0) ? scale : 1;
-    proc->fbDirty       = 1;  // ensure first composite renders
+    ProcessFramebufferMarkDirty(proc);  // ensure first composite renders
     }
 
     if (g_compositedCount < MAX_COMPOSITED)
@@ -1307,11 +1354,9 @@ static void BlitWindowVfb(const uint32_t* src,
         uint32_t* dstRow = dstBase +
             static_cast<uint64_t>(y) * dstStride + static_cast<uint32_t>(clip.left);
 
-        // Fast path: if both the first and last pixel are fully opaque,
-        // the row is almost certainly all opaque — use memcpy.  This is
-        // correct for solid UI content and video.  CSD windows have
-        // transparent shadow edges, so checking both endpoints catches them.
-        if ((srcRow[0] >> 24) == 255 && (srcRow[rowLen - 1] >> 24) == 255)
+        // A translucent interior must not be copied merely because both
+        // endpoints are opaque. Confirm the complete row before memcpy.
+        if (SceneRowOpaque(srcRow,rowLen))
         {
             __builtin_memcpy(dstRow, srcRow, rowLen * 4);
             continue;
@@ -1351,36 +1396,9 @@ static void BlitWallpaper()
     uint32_t*      dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
-    if (g_wallpaper && g_wallpaperWidth > 0 && g_wallpaperHeight > 0)
-    {
-        uint32_t copyH = (g_wallpaperHeight < g_physFbHeight) ? g_wallpaperHeight : g_physFbHeight;
-        uint32_t copyW = (g_wallpaperWidth < g_physFbWidth) ? g_wallpaperWidth : g_physFbWidth;
-        uint32_t offX = (g_physFbWidth > copyW) ? (g_physFbWidth - copyW) / 2 : 0;
-        uint32_t offY = (g_physFbHeight > copyH) ? (g_physFbHeight - copyH) / 2 : 0;
-
-        // Clear edges if wallpaper doesn't fill
-        if (copyW < g_physFbWidth || copyH < g_physFbHeight)
-        {
-            for (uint32_t y = 0; y < g_physFbHeight; ++y)
-                for (uint32_t x = 0; x < g_physFbWidth; ++x)
-                    dstBase[y * dstStride + x] = 0x00001A3A;
-        }
-
-        for (uint32_t y = 0; y < copyH; ++y)
-        {
-            __builtin_memcpy(
-                dstBase + (offY + y) * dstStride + offX,
-                g_wallpaper + y * g_wallpaperWidth,
-                copyW * 4);
-        }
-    }
-    else
-    {
-        // WM mode needs a stable scene base even before an image is loaded
-        // or if loading fails. Match partial repaint's desktop fallback.
-        for(uint32_t y=0;y<g_physFbHeight;++y)
-            for(uint32_t x=0;x<g_physFbWidth;++x)dstBase[y*dstStride+x]=0x00001a3a;
-    }
+    for(uint32_t y=0;y<g_physFbHeight;++y)
+        DesktopBackdropSpan(dstBase+uint64_t(y)*dstStride,0,g_physFbWidth,y,g_physFbWidth,g_physFbHeight,
+                            g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
     WmDrawBuildId(dstBase,dstStride,g_physFbWidth,g_physFbHeight);
     g_desktopTexNeedsFull=true;
     MarkAllDirty();
@@ -1394,26 +1412,9 @@ static void BlitWallpaperRegion(const SceneRect& region)
     if(clip.empty())return;
     uint32_t* dst=g_backBuffer?g_backBuffer:const_cast<uint32_t*>(g_physFb);
     const uint32_t stride=g_backBuffer?g_backBufStride:g_physFbStride;
-    const uint32_t copyW=g_wallpaperWidth<g_physFbWidth?g_wallpaperWidth:g_physFbWidth;
-    const uint32_t copyH=g_wallpaperHeight<g_physFbHeight?g_wallpaperHeight:g_physFbHeight;
-    const int64_t offX=(g_physFbWidth-copyW)/2,offY=(g_physFbHeight-copyH)/2;
     for(int64_t y=clip.top;y<clip.bottom;++y) {
-        uint32_t* row=dst+y*stride;
-        // Match the full wallpaper path's edge colour. With a full-sized
-        // image the row is copied exactly once, with no extra clearing pass.
-        if(!g_wallpaper || y<offY || y>=offY+copyH) {
-            for(int64_t x=clip.left;x<clip.right;++x)row[x]=0x00001a3a;
-            continue;
-        }
-        const int64_t left=clip.left>offX?clip.left:offX;
-        const int64_t right=clip.right<offX+copyW?clip.right:offX+copyW;
-        if(left>=right) {
-            for(int64_t x=clip.left;x<clip.right;++x)row[x]=0x00001a3a;
-            continue;
-        }
-        for(int64_t x=clip.left;x<left;++x)row[x]=0x00001a3a;
-        __builtin_memcpy(row+left,g_wallpaper+(y-offY)*g_wallpaperWidth+left-offX,(right-left)*4);
-        for(int64_t x=right;x<clip.right;++x)row[x]=0x00001a3a;
+        DesktopBackdropSpan(dst+y*stride+clip.left,clip.left,clip.right,y,g_physFbWidth,g_physFbHeight,
+                            g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
     }
     const WmRect badgeClip{static_cast<int>(clip.left),static_cast<int>(clip.top),
         static_cast<int>(clip.right-clip.left),static_cast<int>(clip.bottom-clip.top)};
@@ -1745,6 +1746,82 @@ static void OverlaySetAlphaRect(int x, int y, int w, int h,bool opaque=false)
     }
 }
 
+// Runs only on the compositor thread, so taskbar/launcher state is sampled at
+// the same frame boundary as ordinary software rendering. The debug-frame
+// lease prevents replacement while a client copies its pixels.
+static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,bool cursorVisible)
+{
+    CompositorMutexGuard capture(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if(g_debugFrame.state!=DebugFrameState::Pending || !g_debugFrameOverlay)return;
+    g_debugFrame.state=DebugFrameState::Failed;
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint32_t width=g_physFbWidth,height=g_physFbHeight;
+    if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
+    const uint64_t bytes=uint64_t(width)*height*4,pages=(bytes+4095)/4096;
+    if(pages>g_debugFramePages){
+        auto buffer=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
+        if(!buffer)return;
+        if(g_debugFramePages)VmmFreePages(g_debugFrameBuffer,g_debugFramePages);
+        g_debugFrameBuffer=buffer;g_debugFramePages=pages;
+    }
+    auto* pixels=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
+    __builtin_memset(pixels,0,bytes);
+    DesktopOverlayRect rects[4]{};uint32_t rectCount=0;
+    auto opaque=[&](int32_t x,int32_t y,uint32_t w,uint32_t h){
+        int64_t left=x,top=y,right=left+w,bottom=top+h;
+        if(left<0)left=0;if(top<0)top=0;
+        if(right>width)right=width;if(bottom>height)bottom=height;
+        for(int64_t row=top;row<bottom;++row)for(int64_t col=left;col<right;++col)
+            pixels[uint64_t(row)*width+col]|=0xff000000u;
+    };
+    WmRenderTaskbar(pixels,width,width,height,now,mouseX,mouseY);
+    const uint32_t tbY=WmDesktopHeight(height);opaque(0,tbY,width,height-tbY);
+    rects[rectCount++]={0,int32_t(tbY),width,height-tbY};
+    if(WmLauncherVisible()){
+        int32_t x=0,y=0;uint32_t w=0,h=0;WmLauncherGetRect(width,height,&x,&y,&w,&h);
+        WmLauncherRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
+        rects[rectCount++]={x,y,w,h};
+    }
+    int32_t x=0,y=0;uint32_t w=0,h=0;
+    if(WmBootSummaryRect(width,height,&x,&y,&w,&h)){
+        WmRenderBootSummary(pixels,width,width,height);opaque(x,y,w,h);
+        rects[rectCount++]={x,y,w,h};
+    }
+    if(cursorVisible){
+        const int64_t left=int64_t(mouseX)-g_cursorFrame.hotX,top=int64_t(mouseY)-g_cursorFrame.hotY;
+        // Clamp before narrowing so even an invalid off-screen input cannot
+        // wrap into a spurious region.
+        const int64_t clippedLeft=left<0?0:left,clippedTop=top<0?0:top;
+        const int64_t cursorRight=left+(g_cursorFrame.width<CURSOR_MAX?g_cursorFrame.width:CURSOR_MAX);
+        const int64_t cursorBottom=top+(g_cursorFrame.height<CURSOR_MAX?g_cursorFrame.height:CURSOR_MAX);
+        if(clippedLeft<int64_t(width) && clippedTop<int64_t(height) && cursorRight>clippedLeft && cursorBottom>clippedTop){
+            const int64_t right=cursorRight>width?width:cursorRight,bottom=cursorBottom>height?height:cursorBottom;
+            rects[rectCount++]={int32_t(clippedLeft),int32_t(clippedTop),uint32_t(right-clippedLeft),uint32_t(bottom-clippedTop)};
+        }
+        for(uint32_t row=0;row<g_cursorFrame.height && row<CURSOR_MAX;++row){
+            const int64_t py=top+row;if(py<0 || py>=height)continue;
+            for(uint32_t col=0;col<g_cursorFrame.width && col<CURSOR_MAX;++col){
+                const int64_t px=left+col;if(px<0 || px>=width)continue;
+                const uint32_t src=g_cursorFrame.pixels[row*CURSOR_MAX+col],a=src>>24;
+                if(!a)continue;
+                auto& dst=pixels[uint64_t(py)*width+px];
+                if(a==255 || !(dst>>24)){dst=src;continue;}
+                const uint32_t inv=255-a;
+                const uint32_t r=(((src>>16)&255)*a+((dst>>16)&255)*inv)/255;
+                const uint32_t g=(((src>>8)&255)*a+((dst>>8)&255)*inv)/255;
+                const uint32_t b=((src&255)*a+(dst&255)*inv)/255;
+                dst=0xff000000u|(r<<16)|(g<<8)|b;
+            }
+        }
+    }
+    if(!DesktopOverlayMakeBands(width,height,rects,rectCount,g_debugOverlayBands))return;
+    g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
+    g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=now;
+    g_debugFrame.epoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
+    g_debugFrameDeadline=now+DEBUG_FRAME_LEASE_MS;g_debugFrame.state=DebugFrameState::Ready;
+}
+
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
 static void CompositorInputWM();
 static bool CompositorWmGestureActive();
@@ -2074,6 +2151,9 @@ static void CompositorLoopWM()
         MarkDirtyRows(0,WmDesktopFont().lineHeight*4+WmMetric(60));
     }
     summaryShown=showSummary;
+    const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
+        __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0;
+    CaptureDesktopOverlay(now,chromeMx,chromeMy,overlayCursor);
 }
 
 static DesktopPointerGate g_desktopPointerGate;
@@ -2312,16 +2392,7 @@ static void CompositorInputWM()
             // blur) <-> off (opaque). Only meaningful on the GPU DRAW path.
             if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x22) // G
             {
-                int cur = WmGetFocusedWindow();
-                if (cur >= 0) {
-                    Window* w = WmGetWindow(cur);
-                    if (w && w->proc) {
-                        bool glassOn = (w->blurRadius == 0);
-                        WmSetWindowProperties(cur, WM_PROP_OPACITY | WM_PROP_BLUR,
-                                              glassOn ? WM_GLASS_OPACITY : 255,
-                                              glassOn ? WM_GLASS_BLUR : 0);
-                    }
-                }
+                WmToggleFocusedWindowGlass();
                 continue;
             }
         }
@@ -3435,11 +3506,37 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     gpu->EndFrame();
 }
 
+static void CompositorExpirePresentLease()
+{
+    bool expired;
+    {CompositorMutexGuard geometry(&g_scanoutMappingLock);expired=g_presentLease.Expire(ApicTickCount());}
+    if(expired)CompositorMarkDirty();
+}
+static void CompositorFlipSoftware()
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    if(g_presentLease.Active(ApicTickCount()) || !g_backBuffer ||
+       (!g_scanoutContainsLeasedFrame && g_dirtyMinY>=g_dirtyMaxY))return;
+    // The scanout still contains the renderer's frame if its lease expired
+    // during this loop. Replace the whole frame on software takeover.
+    uint32_t minY=g_scanoutContainsLeasedFrame?0:g_dirtyMinY;
+    uint32_t maxY=g_scanoutContainsLeasedFrame?g_physFbHeight:g_dirtyMaxY;
+    if(maxY>g_physFbHeight)maxY=g_physFbHeight;
+    g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
+    if(minY>=maxY)return;
+    for(uint32_t y=minY;y<maxY;++y)
+        __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),
+                         g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
+    brook::DisplayFlush(minY,maxY);
+    g_scanoutContainsLeasedFrame=false;
+    if(minY==0 && maxY==g_physFbHeight)g_scanoutNeedsRepair=false;
+}
 static void CompositorLoop()
 {
     FrameTimingScope framePhase(FramePhase::Preparation);
     if (!g_physFb)
         return;
+    CompositorExpirePresentLease();
     // Apply material changes at a frame boundary so chrome and GPU backdrops agree.
     const auto material=WmGetAppearance();
     if(material!=__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)){
@@ -3636,24 +3733,7 @@ static void CompositorLoop()
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     else if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
     {
-        CompositorMutexGuard geometry(&g_scanoutMappingLock);
-        uint32_t minY = g_dirtyMinY;
-        uint32_t maxY = g_dirtyMaxY;
-        if (maxY > g_physFbHeight) maxY = g_physFbHeight;
-        g_dirtyMinY = 0xFFFFFFFFu;
-        g_dirtyMaxY = 0;
-        for (uint32_t y = minY; y < maxY; ++y)
-        {
-            __builtin_memcpy(
-                const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
-                g_backBuffer + y * g_backBufStride,
-                g_physFbWidth * 4);
-        }
-
-        // Push the damaged span to the active display. No-op for direct-mapped
-        // linear framebuffers (GOP/bochs); virtio-gpu transfers + flushes the
-        // dirty rect to the host here.
-        brook::DisplayFlush(minY, maxY);
+        CompositorFlipSoftware();
     }
 
     const uint64_t probePresentEnd=ApicTickCount();
@@ -3796,6 +3876,171 @@ void CompositorMarkDirty()
     __atomic_store_n(&g_needsFullRepaint, true, __ATOMIC_RELEASE);
 }
 
+uint64_t CompositorDisplayGeneration()
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    return g_physFb ? g_displayGeneration : 0;
+}
+
+bool CompositorGetBackdropInfo(CompositorBackdropInfo* out)
+{
+    if(!out)return false;
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    if(!g_physFb || !g_displayGeneration || !RefreshBackdropStyle() || !g_backdropGeneration || !g_physFbWidth || !g_physFbHeight)return false;
+    *out={g_displayGeneration,g_backdropGeneration,g_physFbWidth,g_physFbHeight};return true;
+}
+
+bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t y,uint32_t left,uint32_t count,uint32_t* out)
+{
+    if(!out || !count)return false;
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    if(!g_physFb || !RefreshBackdropStyle() || !expected.display || !expected.generation || expected.display!=g_displayGeneration ||
+       expected.generation!=g_backdropGeneration || expected.width!=g_physFbWidth || expected.height!=g_physFbHeight ||
+       y>=g_physFbHeight || left>=g_physFbWidth || count>g_physFbWidth-left)return false;
+    DesktopBackdropSpan(out,left,left+count,y,g_physFbWidth,g_physFbHeight,g_wallpaper,g_wallpaperWidth,g_wallpaperHeight);
+    WmDrawBuildIdSpan(out,left,count,y,g_physFbWidth,g_physFbHeight);
+    if(WmBackdropStyleVersion()!=g_backdropStyleVersion)return false;
+    for(uint32_t x=0;x<count;++x)out[x]|=0xff000000u;
+    return true;
+}
+
+static bool CompositorCanBlitGopLocked(){
+    return g_backBuffer && g_backBuffer!=g_physFb && TtyDisplaySuppressed() && !BootLogoActive() &&
+        g_physFbWidth==3200 && g_physFbHeight==1800 && g_physFbStride==3200 &&
+        DisplayGetFramebufferPhys()==0xe0000000;
+}
+
+int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t stride,
+                           void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),uint32_t samples[4],
+                           uint64_t expectedDisplay,uint64_t expectedBackdrop,uint64_t leaseOwner,bool region,
+                           const CompositorPresentAcceleration* acceleration)
+{
+    if(!width || !height || width>16384 || height>16384 || stride<width || stride>16384 ||
+       !source || !copy || (!samples && (!leaseOwner || region)) || (region && !leaseOwner))return -22;
+    int result=0;bool touched=false;
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if(expectedDisplay && expectedDisplay!=g_displayGeneration)return -116;
+        if(expectedBackdrop && (!RefreshBackdropStyle() || expectedBackdrop!=g_backdropGeneration))return -116;
+        const uint64_t now=ApicTickCount();
+        if(region && (!expectedDisplay || !expectedBackdrop || !g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair ||
+           !g_presentLease.Active(now) || g_presentLease.owner!=leaseOwner ||
+           expectedDisplay!=g_leasedFrameDisplay || expectedBackdrop!=g_leasedFrameBackdrop))return -116;
+        if(leaseOwner && !region && (!expectedDisplay || !expectedBackdrop || x || y || width!=g_physFbWidth ||
+           height!=g_physFbHeight || !g_presentLease.CanAcquire(leaseOwner,now)))return -16;
+        if(!g_physFb || CompositorGpuActive() || x>=g_physFbWidth || y>=g_physFbHeight ||
+           width>g_physFbWidth-x || height>g_physFbHeight-y)return -22;
+        bool copied=false;
+        if(acceleration){
+            if(leaseOwner && CompositorCanBlitGopLocked()){
+                const CompositorPresentRegion rect{x,y,width,height,stride,0};
+                touched=true;
+                copied=acceleration->present(acceleration->context,&rect,1);
+            }
+            if(!copied && !acceleration->prepareCpu(acceleration->context))result=-5;
+        }
+        for(uint32_t row=0;!copied && !result && row<height;++row){
+            void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(y+row)*g_physFbStride+x);
+            touched=true;
+            if(!copy(source,uint64_t(row)*stride*4,dest,uint64_t(width)*4)){result=-5;break;}
+        }
+        if(!result){
+            if(samples){
+                // Drain WC writes before reading diagnostic pixels.
+                __asm__ volatile("sfence" ::: "memory");
+                samples[0]=g_physFb[uint64_t(y)*g_physFbStride+x];
+                samples[1]=g_physFb[uint64_t(y)*g_physFbStride+x+width-1];
+                samples[2]=g_physFb[uint64_t(y+height-1)*g_physFbStride+x];
+                samples[3]=g_physFb[uint64_t(y+height-1)*g_physFbStride+x+width-1];
+            }
+            DisplayFlush(y,y+height);
+            if(leaseOwner) {
+                const uint64_t tick=ApicTickCount();
+                if(region && (!g_presentLease.Active(tick) || g_presentLease.owner!=leaseOwner))result=-116;
+                else if(!g_presentLease.Acquire(leaseOwner,tick,COMPOSITOR_PRESENT_LEASE_MS))result=-75;
+                else {g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);g_leasedFrameTick=tick;
+                    g_leasedFrameDisplay=expectedDisplay;g_leasedFrameBackdrop=expectedBackdrop;
+                    g_leasedFrameMode=region?BROOK_DEBUG_FRAME_PRESENT_PARTIAL:BROOK_DEBUG_FRAME_PRESENT_FULL;
+                    g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;}
+            }
+        }
+        if(touched && (result || !leaseOwner))g_scanoutNeedsRepair=true;
+        if(result && leaseOwner)g_presentLease.Release(leaseOwner);
+    }
+    if(touched){
+        // The leased frame is already visible. Only a failed or unleased
+        // write requires the software compositor to rebuild its whole frame.
+        if(result || !leaseOwner)CompositorMarkDirty();
+        CompositorWake();
+    }
+    return result;
+}
+
+int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t count,uint64_t sourceBytes,
+                             void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
+                             uint64_t display,uint64_t backdrop,uint64_t owner,
+                             const CompositorPresentAcceleration* acceleration)
+{
+    if(!regions || !count || count>COMPOSITOR_MAX_REGIONS || !source || !copy || !display || !backdrop || !owner)return -22;
+    int result=0;bool touched=false;uint32_t minY=~uint32_t{0},maxY=0;
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        const uint64_t now=ApicTickCount();
+        if(!RefreshBackdropStyle() || display!=g_displayGeneration || backdrop!=g_backdropGeneration ||
+           display!=g_leasedFrameDisplay || backdrop!=g_leasedFrameBackdrop || !g_scanoutContainsLeasedFrame ||
+           g_scanoutNeedsRepair || !g_presentLease.Active(now) || g_presentLease.owner!=owner)return -116;
+        if(!g_physFb || CompositorGpuActive())return -22;
+        // Validate the whole list before the first write. The caller supplies
+        // kernel-owned immutable metadata and pins the completed source.
+        for(uint32_t i=0;i<count;++i){
+            const auto& r=regions[i];
+            if(!r.width || !r.height || r.stride<r.width || r.stride>16384 ||
+               r.x>=g_physFbWidth || r.y>=g_physFbHeight || r.width>g_physFbWidth-r.x || r.height>g_physFbHeight-r.y)return -22;
+            const uint64_t bytes=(uint64_t(r.height-1)*r.stride+r.width)*4;
+            if(r.offset>sourceBytes || bytes>sourceBytes-r.offset)return -22;
+            if(r.y<minY)minY=r.y;
+            if(r.y+r.height>maxY)maxY=r.y+r.height;
+        }
+        bool copied=false;
+        if(acceleration){
+            if(CompositorCanBlitGopLocked()){
+                touched=true;
+                copied=acceleration->present(acceleration->context,regions,count);
+            }
+            if(!copied && !acceleration->prepareCpu(acceleration->context))result=-5;
+        }
+        for(uint32_t i=0;!copied && !result && i<count;++i){
+            const auto& r=regions[i];
+            for(uint32_t row=0;row<r.height;++row){
+                void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(r.y+row)*g_physFbStride+r.x);
+                touched=true;
+                if(!copy(source,r.offset+uint64_t(row)*r.stride*4,dest,uint64_t(r.width)*4)){result=-5;break;}
+            }
+        }
+        if(touched)__asm__ volatile("sfence" ::: "memory");
+        if(!result){
+            const uint64_t tick=ApicTickCount();
+            if(!g_presentLease.Active(tick) || g_presentLease.owner!=owner)result=-116;
+            else if(!g_presentLease.Acquire(owner,tick,COMPOSITOR_PRESENT_LEASE_MS))result=-75;
+            else {DisplayFlush(minY,maxY);g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);g_leasedFrameTick=tick;
+                g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_PARTIAL;}
+        }
+        if(result && touched){g_scanoutNeedsRepair=true;g_presentLease.Release(owner);}
+    }
+    if(touched){
+        if(result)CompositorMarkDirty();
+        CompositorWake();
+    }
+    return result;
+}
+
+void CompositorReleasePresentLease(uint64_t owner)
+{
+    bool released;
+    {CompositorMutexGuard geometry(&g_scanoutMappingLock);released=g_presentLease.Release(owner);}
+    if(released){CompositorMarkDirty();CompositorWake();}
+}
+
 void CompositorUnregisterProcess(Process* proc)
 {
     if (!proc) return;
@@ -3866,23 +4111,29 @@ void CompositorRemap(uint64_t fbPhys,uint32_t w,uint32_t h,uint32_t stridePixels
     for (uint32_t y=0;y<h;++y)
         memcpy(buffer+static_cast<uint64_t>(y)*stridePixels,
                const_cast<uint32_t*>(physical+static_cast<uint64_t>(y)*stridePixels),w*4);
+    bool cancelled=false;
     {
         CompositorMutexGuard publication(&g_scanoutMappingLock);
+        cancelled=g_presentLease.Clear();
+        g_scanoutContainsLeasedFrame=false;g_scanoutNeedsRepair=false;
         // Previous backbuffers remain allocated for existing scanout aliases.
         // Commit storage and geometry together only after successful preparation.
         g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
         g_backBuffer=buffer;g_backBufStride=stridePixels;
+        if(g_displayGeneration)++g_displayGeneration;
         TtyRedirectToBackbuffer(buffer);
     }
     MouseSetBounds(w,h);MarkAllDirty();
+    if(cancelled){CompositorMarkDirty();CompositorWake();}
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
 }
 
 void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
 {
-    g_wallpaper = pixels;
-    g_wallpaperWidth = w;
-    g_wallpaperHeight = h;
+    { CompositorMutexGuard geometry(&g_scanoutMappingLock);
+      g_wallpaper = pixels;g_wallpaperWidth = w;g_wallpaperHeight = h;
+      if(g_backdropGeneration)++g_backdropGeneration;
+    }
     CompositorMarkDirty();CompositorWake();
     SerialPrintf("COMPOSITOR: wallpaper set %ux%u\n", w, h);
 }

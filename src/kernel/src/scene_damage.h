@@ -2,6 +2,10 @@
 #include <stdint.h>
 
 namespace brook {
+inline bool SceneRowOpaque(const uint32_t* pixels,uint32_t count) {
+    for(uint32_t i=0;i<count;++i)if((pixels[i]>>24)!=255)return false;
+    return true;
+}
 // Screen-space half-open bounds. Expand a dirty region to whole intersecting
 // layers before repainting: every blended layer then sees a rebuilt backdrop.
 // Repeating closure also catches a layer encountered before a later expansion.

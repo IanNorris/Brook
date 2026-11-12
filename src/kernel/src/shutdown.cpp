@@ -14,10 +14,16 @@
 #include "ahci_readonly.h"
 #include "fw_cfg.h"
 #include "platform_power.h"
+#include "usb_boot_recovery.h"
 #include "apic.h"
 #include "compositor.h"
+#include "klog.h"
 #include "serial.h"
 #include "string.h"
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "debug_epoch.h"
+#include "guard_checker_runner.h"
+#endif
 #if defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP_RESET)
 #include "panic_test_reset.h"
 #endif
@@ -25,9 +31,18 @@
 namespace brook {
 namespace {
 enum class Phase { Empty,Closing,Services,Cleanup,Syncing,Ready,Committing,Failed,Cancelled };
-struct Operation {char id[33];Phase phase;bool restart,automatic,cancel,commit;int error;};
+struct Operation {char id[33];Phase phase;bool restart,automatic,cancel,commit,acLoss;int error;};
 Operation operations[64]{};int current=-1;SpinLock lock{};
 bool workerStarted=false,powerOff=false,powerRestart=false,irreversible=false;
+UsbBootRecoveryPolicy usbBootRecovery{};
+constexpr uint64_t AcSampleFreshMs=2000;
+constexpr uint64_t AcSampleIntervalMs=1000;
+constexpr uint64_t AcOfflineConfirmMs=8000;
+struct AcRecovery {
+    AcPowerSource source=AcPowerSource::Unknown;
+    uint64_t sampledAt=0,offlineSince=0;
+    bool enabled=false,sampled=false,seenOnline=false,requested=false,dispatch=false;
+} acRecovery;
 const char* desktopNotice=nullptr;
 uint64_t desktopSequence=0;bool closeCaptured=false,admissionReady=false,closePolling=false;
 struct CloseTarget {uint32_t id;uint64_t incarnation;bool sent;};
@@ -35,6 +50,7 @@ struct ClientIdentity {uint32_t pid;uint64_t incarnation;};
 ClientIdentity closeClients[MAX_PROCESSES]{};uint32_t closeClientCount=0;
 CloseTarget closeTargets[WM_MAX_WINDOWS]{};uint32_t closeCount=0,guiRemaining=0;
 DebugTaskSnapshot tasks[MAX_PROCESSES];uint32_t taskCount=0;
+void RequestDesktopPower(bool restart,bool acLoss);
 const char* Name(Phase phase) {
     switch(phase) {
     case Phase::Empty:return "missing";case Phase::Closing:return "closing";
@@ -83,6 +99,20 @@ void StopServices() {
 }
 void Worker(void*) {
     for(;;) {
+        SpinLockAcquire(&lock);
+        const bool acShutdown=acRecovery.dispatch;
+        acRecovery.dispatch=false;
+        SpinLockRelease(&lock);
+        if(acShutdown) {
+            KLog("shutdown: reason=ac-loss");
+            RequestDesktopPower(false,true);
+        }
+        if(usbBootRecovery.enabled && !usbBootRecovery.decided && ApicTickCount()>=60000) {
+            UsbBootResetReport report{};const bool available=UsbBootReadReset(report);
+            const bool shutdown=usbBootRecovery.ShouldShutdown(ApicTickCount(),powerOff,available,report);
+            SerialPrintf("shutdown: usb-boot-recovery uptime_ms=%lu report=%u poweroff=%u requested=%u\n",ApicTickCount(),available?1u:0u,powerOff?1u:0u,shutdown?1u:0u);
+            if(shutdown)ShutdownDesktopRequest(false);
+        }
         int selected;Operation op{};bool captured,ready,polling;uint32_t windows;
         SpinLockAcquire(&lock);selected=current;if(selected>=0)op=operations[selected];captured=closeCaptured;ready=admissionReady;polling=closePolling;windows=guiRemaining;SpinLockRelease(&lock);
         if(selected<0||!ready||!Active(op.phase)){SchedulerSleepMs(25);continue;}
@@ -121,6 +151,10 @@ void Worker(void*) {
 #endif
                 FileObjectStopWriteback();
                 Ext2StopWriteback();
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+                for(uint8_t i=0;i<16;++i){Ext2SyncProbe p{};if(Ext2GetSyncProbe(i,p))
+                    SerialPrintf("EFI_SHUTDOWN_PRE_SYNC drive=%u pending=%lu dirty=%u\n",i,p.pendingOps,p.backingDirty?1u:0u);}
+#endif
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioPrepareShutdown();AudioStop();HdaRuntimeShutdown();
                 int error=VfsSync(nullptr);
@@ -138,6 +172,13 @@ void Worker(void*) {
             SetPhase(selected,Phase::Committing);
             // Allow the UART reply and a final progress frame to be delivered.
             SchedulerSleepMs(500);
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+            if(op.acLoss) {
+                char bootId[33];DebugEpochCopy(bootId);
+                const bool recorded=GuardRecordCheckedAcShutdown(bootId);
+                KLog("shutdown: AC-loss finalization record %s",recorded?"verified":"unavailable");
+            }
+#endif
             // All fallible sync/cleanup precedes this single selected write.
             // Keep the quiesced kernel available for diagnostics if it returns;
             // the panic-only SMP halt API cannot provide recoverable failure.
@@ -148,9 +189,63 @@ void Worker(void*) {
     }
 }
 }
+static bool ReadShutdownOptIn(const char* path) {
+    auto* file=VfsOpen(path,VFS_O_STREAM);
+    if(!file)return false;
+    VnodeStat st{};char value[2]{};uint64_t offset=0;
+    const bool enabled=!VfsStat(file,&st) && !st.isDir && !st.isSymlink && st.size==2 &&
+        VfsRead(file,value,2,&offset)==2 && value[0]=='1' && value[1]=='\n';
+    VfsRelease(file);
+    return enabled;
+}
 void ShutdownConfigure() {
     PlatformPowerConfigure();
+#if defined(BROOK_EFI_SHUTDOWN_TEST)
+    char injection[2]{};
+    if(FwCfgReadFile("opt/brook/usb-reset-inject",injection,sizeof(injection))==1 && injection[0]=='1') {
+        UsbBootReportReset(0x8086,0x9cb1,static_cast<uint32_t>(XhciResetPhase::ExistingReset),
+            static_cast<uint32_t>(XhciResetError::Timeout),2,0x11,0x11,true,10002);
+        SerialPuts("USB_BOOT_RESET_TEST_INJECTED\n");
+    }
+#endif
+    if(ReadShutdownOptIn("/etc/efi-poweroff"))
+        SerialPrintf("efi-runtime: power-off opt-in %s\n",PlatformPowerEnableEfi()?"enabled":"unavailable");
     const auto& plan=PlatformPowerGetPlan();powerOff=plan.CanPowerOff();powerRestart=plan.CanReset();
+    usbBootRecovery.enabled=ReadShutdownOptIn("/etc/usb-boot-poweroff");
+    acRecovery.enabled=ReadShutdownOptIn("/etc/ac-loss-poweroff");
+}
+void ShutdownReportAcSource(AcPowerSource source) {
+    SpinLockAcquire(&lock);
+    const uint64_t now=ApicTickCount();
+    const uint64_t elapsed=now-acRecovery.sampledAt;
+    if(acRecovery.sampled && elapsed<AcSampleIntervalMs) {
+        SpinLockRelease(&lock);
+        return;
+    }
+    if(!acRecovery.sampled || elapsed>AcSampleFreshMs || acRecovery.source!=AcPowerSource::Offline)
+        acRecovery.offlineSince=now;
+    acRecovery.sampled=true;
+    acRecovery.sampledAt=now;
+    acRecovery.source=source;
+    if(source==AcPowerSource::Online)acRecovery.seenOnline=true;
+    if(source==AcPowerSource::Offline && acRecovery.seenOnline &&
+       now-acRecovery.offlineSince>=AcOfflineConfirmMs &&
+       acRecovery.enabled && workerStarted && powerOff && !acRecovery.requested){
+        acRecovery.requested=true;
+        acRecovery.dispatch=true;
+    }
+    SpinLockRelease(&lock);
+}
+ShutdownAcStatus ShutdownGetAcStatus() {
+    SpinLockAcquire(&lock);
+    const auto age=acRecovery.sampled?ApicTickCount()-acRecovery.sampledAt:~uint64_t{0};
+    const auto source=age<=AcSampleFreshMs?acRecovery.source:AcPowerSource::Unknown;
+    const bool shutdownActive=irreversible || (current>=0 && Active(operations[current].phase));
+    const bool ready=acRecovery.enabled && workerStarted && powerOff &&
+        source==AcPowerSource::Online && !acRecovery.requested && !shutdownActive;
+    const ShutdownAcStatus status{source,acRecovery.enabled,ready,acRecovery.requested,age};
+    SpinLockRelease(&lock);
+    return status;
 }
 ShutdownPowerCapabilities ShutdownGetPowerCapabilities() {
     const auto& plan=PlatformPowerGetPlan();
@@ -158,12 +253,14 @@ ShutdownPowerCapabilities ShutdownGetPowerCapabilities() {
 }
 void ShutdownStart() {
     auto* worker=KernelThreadCreate("shutdown",Worker,nullptr,3);
-    if(worker){workerStarted=true;SchedulerAddProcess(worker);}
+    if(worker){if(PlatformPowerGetPlan().efiEntry)worker->cpuAffinity=0;workerStarted=true;SchedulerAddProcess(worker);}
 }
 bool ShutdownLaunchAllowed() {
     SpinLockAcquire(&lock);const bool result=!irreversible&&(current<0||!Active(operations[current].phase));SpinLockRelease(&lock);return result;
 }
-void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) {
+namespace {
+void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* error,
+                           bool automatic,bool acLoss) {
     *error=0;bool admitted=false;SpinLockAcquire(&lock);int found=-1,empty=-1;
     for(int i=0;i<64;++i){if(operations[i].id[0]&&!strcmp(operations[i].id,id))found=i;else if(!operations[i].id[0]&&empty<0)empty=i;}
     const bool start=!strcmp(verb,"shutdown")||!strcmp(verb,"restart");const bool restart=!strcmp(verb,"restart");
@@ -175,6 +272,7 @@ void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) 
         else if(empty<0){result="full";*error=-28;}
         else {
             found=empty;auto& op=operations[found];memcpy(op.id,id,33);op.phase=Phase::Closing;op.restart=restart;
+            op.automatic=automatic;op.acLoss=acLoss;
             // Admission closes under the launch/job locks before the worker can
             // observe this operation. Already dispatched work is awaited.
             current=found;closeCaptured=false;guiRemaining=0;admissionReady=false;admitted=true;
@@ -197,14 +295,18 @@ void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) 
     }
     CompositorMarkDirty();CompositorWake();
 }
-void ShutdownDesktopRequest(bool restart) {
+void RequestDesktopPower(bool restart,bool acLoss) {
     char id[33];const auto n=__atomic_add_fetch(&desktopSequence,1ULL,__ATOMIC_RELAXED);
     for(unsigned i=0;i<32;++i)id[i]=i<16?'d':"0123456789abcdef"[(n>>((31-i)*4))&15];id[32]=0;
-    char state[24];int error;ShutdownCommand(id,restart?"restart":"shutdown",state,&error);
+    char state[24];int error;HandleShutdownCommand(id,restart?"restart":"shutdown",state,&error,true,acLoss);
     if(error)__atomic_store_n(&desktopNotice,error==-95?"Requested power transition is unavailable on this machine":"Another shutdown operation is pending",__ATOMIC_RELEASE);
     else __atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);
-    if(!error){SpinLockAcquire(&lock);if(current>=0&&!strcmp(operations[current].id,id))operations[current].automatic=true;SpinLockRelease(&lock);}
 }
+}
+void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) {
+    HandleShutdownCommand(id,verb,state,error,false,false);
+}
+void ShutdownDesktopRequest(bool restart) {RequestDesktopPower(restart,false);}
 void ShutdownDesktopCancel() {
     char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
     if(id[0]){char state[24];int error;ShutdownCommand(id,"cancel",state,&error);if(!error)__atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);}

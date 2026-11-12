@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../shared/gpu_output_abi.h"
 namespace brook {
 // Delivered-tick fallback is coarse and can undercount stalls; zero means the
 // source has not advanced or cannot be represented, not a valid timestamp.
@@ -8,16 +9,19 @@ inline uint64_t SyscallTimingTickNs(uint64_t ticks) {
 }
 enum class SyscallTimingPhase : uint8_t { Dispatch,ReturnCheck };
 struct SyscallTimingTicket {uint64_t epoch=0,sequence=0;};
-struct SyscallTimingEvent {uint64_t number=0,arg0=0,beginNs=0,endNs=0,gapNs=0;int64_t result=0;bool hasGap=false;SyscallTimingPhase phase=SyscallTimingPhase::Dispatch;};
+struct SyscallTimingEvent {uint64_t number=0,arg0=0,beginNs=0,endNs=0,gapNs=0;int64_t result=0;bool hasGap=false;SyscallTimingPhase phase=SyscallTimingPhase::Dispatch;uint64_t ioctlRequest=0;};
 struct SyscallTimingSnapshot {
     uint64_t epoch=0,pid=0,incarnation=0,entries=0,completed=0,invalid=0,incomplete=0,overflowKinds=0;
     uint64_t contended=0,continuityBreaks=0,maxCallNs=0,maxGapNs=0,slow=0,excluded=0;
     bool active=false,saturated=false,coarseClock=false;
-    uint64_t sequence=0,activeNumber=0,activeArg0=0,activeBeginNs=0;
+    uint64_t sequence=0,activeNumber=0,activeArg0=0,activeBeginNs=0,activeIoctlRequest=0;
     SyscallTimingPhase activePhase=SyscallTimingPhase::Dispatch;
     unsigned kinds=0,retained=0,failures=0;
     uint64_t overflowFailures=0;
     struct Kind {uint64_t number=0,calls=0,sumNs=0,maxNs=0,negativeResults=0;SyscallTimingPhase phase=SyscallTimingPhase::Dispatch;} kind[16]{};
+    // Successful and failed presentation dispatches remain distinguishable
+    // even when the bounded generic syscall-kind table overflows.
+    struct PresentCount {uint64_t success=0,failure=0;} present[3]{};
     // First 16 distinct dispatch failures; arg0 is the most recent occurrence,
     // and may be an address rather than an fd depending on the syscall.
     struct Failure {uint64_t number=0,arg0=0,count=0;int64_t result=0;} failure[16]{};
@@ -50,7 +54,7 @@ public:
     }
     void Off(){Advance(false);}
     void Reset(){auto old=data_;data_={};data_.epoch=old.epoch;data_.pid=old.pid;data_.incarnation=old.incarnation;data_.coarseClock=old.coarseClock;Advance(old.epoch&1);}
-    SyscallTimingTicket Begin(uint64_t token,uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,uint64_t now,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch){
+    SyscallTimingTicket Begin(uint64_t token,uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,uint64_t now,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch,uint64_t ioctlRequest=0){
         if(!(token&1) || token!=Token() || pid!=data_.pid || incarnation!=data_.incarnation)return {};
         if(data_.active){
             const auto previous=data_.activeBeginNs;Add(data_.incomplete);lastEnd_=0;data_.active=false;
@@ -61,19 +65,25 @@ public:
         }
         activeHasGap_=lastEnd_!=0;activeGap_=lastEnd_?now-lastEnd_:0;
         data_.active=true;data_.activePhase=phase;data_.activeNumber=number;data_.activeArg0=arg0;data_.activeBeginNs=now;
+        data_.activeIoctlRequest=number==16 && phase==SyscallTimingPhase::Dispatch?ioctlRequest:0;
         ++data_.sequence;Add(data_.entries);return {token,data_.sequence};
     }
     bool End(SyscallTimingTicket ticket,uint64_t now,int64_t result,bool hasResult=true){
         if(!(ticket.epoch&1) || ticket.epoch!=Token() || !data_.active || ticket.sequence!=data_.sequence)return false;
         data_.active=false;
         if(!hasResult || now<data_.activeBeginNs){Add(data_.invalid);lastEnd_=0;return false;}
-        SyscallTimingEvent e{data_.activeNumber,data_.activeArg0,data_.activeBeginNs,now,activeGap_,result,activeHasGap_,data_.activePhase};
+        SyscallTimingEvent e{data_.activeNumber,data_.activeArg0,data_.activeBeginNs,now,activeGap_,result,activeHasGap_,data_.activePhase,data_.activeIoctlRequest};
         lastEnd_=now;Add(data_.completed);const auto duration=now-e.beginNs;
         if(duration>data_.maxCallNs)data_.maxCallNs=duration;if(e.gapNs>data_.maxGapNs)data_.maxGapNs=e.gapNs;
         unsigned at=0;while(at<data_.kinds && (data_.kind[at].number!=e.number || data_.kind[at].phase!=e.phase))++at;
         if(at==data_.kinds && at<16){data_.kind[at].number=e.number;data_.kind[at].phase=e.phase;++data_.kinds;}
         if(at==16)Add(data_.overflowKinds);
         else {auto& k=data_.kind[at];Add(k.calls);Add(k.sumNs,duration);if(duration>k.maxNs)k.maxNs=duration;if(result<0)Add(k.negativeResults);}
+        if(e.phase==SyscallTimingPhase::Dispatch && e.number==BROOK_SYS_GPU_HANDOFF_CTL &&
+           e.arg0>=BROOK_GPU_HANDOFF_PRESENT_PROBE && e.arg0<=BROOK_GPU_HANDOFF_PRESENT_REGIONS){
+            auto& p=data_.present[e.arg0-BROOK_GPU_HANDOFF_PRESENT_PROBE];
+            if(result<0)Add(p.failure);else Add(p.success);
+        }
         if(result<0 && e.phase==SyscallTimingPhase::Dispatch){
             unsigned f=0;while(f<data_.failures && (data_.failure[f].number!=e.number || data_.failure[f].result!=result))++f;
             if(f==data_.failures && f<16){data_.failure[f].number=e.number;data_.failure[f].result=result;++data_.failures;}
@@ -93,12 +103,12 @@ bool SyscallTimingWatch(uint64_t pid,uint64_t incarnation,SyscallTimingSnapshot*
 bool SyscallTimingOff(SyscallTimingSnapshot* output=nullptr);
 bool SyscallTimingReset(SyscallTimingSnapshot* output=nullptr);
 bool SyscallTimingRead(SyscallTimingSnapshot* output);
-SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch);
+SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch,uint64_t ioctlRequest=0);
 void SyscallTimingLeave(SyscallTimingTicket ticket,int64_t result,bool hasResult);
 class SyscallTimingCall {
     SyscallTimingTicket ticket_{};int64_t result_=0;bool hasResult_=false;
 public:
-    SyscallTimingCall(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch):ticket_(SyscallTimingEnter(pid,incarnation,number,arg0,phase)){}
+    SyscallTimingCall(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase=SyscallTimingPhase::Dispatch,uint64_t ioctlRequest=0):ticket_(SyscallTimingEnter(pid,incarnation,number,arg0,phase,ioctlRequest)){}
     SyscallTimingCall(const SyscallTimingCall&)=delete;
     SyscallTimingCall& operator=(const SyscallTimingCall&)=delete;
     int64_t Result(int64_t result){result_=result;hasResult_=true;return result;}

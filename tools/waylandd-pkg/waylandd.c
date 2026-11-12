@@ -34,6 +34,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <errno.h>
@@ -54,6 +55,10 @@
 #include "surface-tree.h"
 #include "surface-geometry.h"
 #include "gpu-scene-abi.h"
+#include "gpu_buffer_abi.h"
+#include "gpu_window_source_abi.h"
+#include "gpu_window_channel.h"
+#include "intel_pending_drain.h"
 #include "wm-window-state.h"
 #include "xwm-wire.h"
 
@@ -395,6 +400,7 @@ struct brook_surface {
 
 static struct brook_surface *g_surfaces = NULL;
 static int g_drm_fd = -1;
+static int g_drm_intel;
 static void popup_apply_position(struct brook_surface *);
 static int xwayland_surface_ready(const struct brook_surface *);
 static unsigned xwayland_surface_flags(const struct brook_surface *);
@@ -416,7 +422,11 @@ static wl_fixed_t surface_pointer_fixed(const struct brook_surface *s,int32_t ph
 static int32_t pointer_fixed_floor(wl_fixed_t value) {
     return (int32_t)(value>=0?(int64_t)value/256:-((-(int64_t)value+255)/256));
 }
+#define BROOK_WAYLAND_SOURCE_COMMIT_TAG 1
 #include "surface-scene.h"
+static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
+static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
+static void intel_pending_poll(void);
 #include "xwayland-shell.h"
 #include "xwayland-xwm.h"
 
@@ -581,6 +591,7 @@ static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t
 static struct wl_event_source *g_frame_timer;
 static int frame_clock_tick(void *unused) {
     (void)unused;
+    intel_pending_poll();
     uint32_t now = g_now_ms();
     if (g_trace_frames) {
         if (g_trace_ticks && now - g_trace_last_tick > g_trace_tick_max_ms)
@@ -591,6 +602,10 @@ static int frame_clock_tick(void *unused) {
     for (struct brook_surface *surface = g_surfaces; surface; surface = surface->next) {
         struct brook_surface *root = surface;
         while (root->subsurface_parent) root = root->subsurface_parent;
+        struct brook_draw draws[64];unsigned n=0;int pending=0;
+        if(!surface_layers(root,draws,&n))pending=1;
+        for(unsigned i=0;i<n;++i)if(draws[i].view->image->pending_cpu){pending=1;break;}
+        if(pending)continue;
         if (root->wm_id || surface->is_cursor) surface_send_frame_callbacks(surface, now);
     }
     wl_event_source_timer_update(g_frame_timer, 16);
@@ -729,8 +744,19 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
             if (db->width<=0 || db->height<=0 || db->width>16384 || db->height>16384) {
                 wl_client_post_implementation_error(c,"invalid dmabuf dimensions");return;
             }
-            image=calloc(1,sizeof(*image));
-            if (image) {
+            if (g_drm_intel) {
+                const char *async=getenv("BROOK_WAYLAND_INTEL_ASYNC");
+                if(async && !strcmp(async,"1")){
+                    image=intel_dmabuf_defer(buffer);
+                    if(!image){wl_client_post_implementation_error(c,"Unable to queue GPU buffer completion");return;}
+                }else{
+                    buffer_begin_use(buffer);
+                    int uncertain=0;image=intel_dmabuf_snapshot(db,&uncertain);
+                    if(uncertain)buffer->uncertain=1;
+                    buffer_release(buffer);
+                }
+            } else image=calloc(1,sizeof(*image));
+            if (image && !g_drm_intel) {
                 image->refs=1;image->width=db->width;image->height=db->height;
                 image->format=db->fourcc==0x34325258?2:1;image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
             }
@@ -741,7 +767,11 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
             image=image_snapshot(wl_shm_buffer_get_data(shm),wl_shm_buffer_get_width(shm),wl_shm_buffer_get_height(shm),wl_shm_buffer_get_stride(shm),wl_shm_buffer_get_format(shm));
             wl_shm_buffer_end_access(shm);buffer_release(buffer);
         }
-        if (buffer && !image) { wl_client_post_no_memory(c);return; }
+        if (buffer && !image) {
+            if(buffer->uncertain)wl_client_post_implementation_error(c,"GPU buffer completion could not be verified");
+            else wl_client_post_no_memory(c);
+            return;
+        }
     }
     int committed=surface_tree_commit(s,image),published=1;
     if (!committed) wl_client_post_no_memory(c);
@@ -2450,6 +2480,13 @@ static uint32_t dmabuf_resolve_gres(int fd, uint32_t *out_bo)
             return entry->gres;
         }
     }
+    if (g_drm_intel) {
+        struct brook_dmabuf_import *entry=calloc(1,sizeof(*entry));
+        if (!entry) { struct drm_gem_close gc={ph.handle,0};ioctl(g_drm_fd,DRM_IOCTL_GEM_CLOSE,&gc);return 0; }
+        entry->bo=ph.handle;entry->gres=1;entry->refs=1;entry->next=g_dmabuf_imports;g_dmabuf_imports=entry;
+        if (out_bo) *out_bo=entry->bo;
+        return entry->gres;
+    }
     struct drm_virtgpu_resource_info ri;
     memset(&ri, 0, sizeof(ri));
     ri.bo_handle = ph.handle;
@@ -2470,6 +2507,284 @@ static uint32_t dmabuf_resolve_gres(int fd, uint32_t *out_bo)
     if (out_bo) *out_bo = ph.handle;
     return ri.res_handle;
 }
+
+/* The caller has established CPU visibility and retains the producer until
+ * this copy finishes. */
+static struct brook_image *intel_dmabuf_copy(const struct brook_dmabuf_buffer *db)
+{
+    struct { uint32_t handle,pad;uint64_t offset,flags,extensions; } map={db->bo_handle,0,0,2,0};
+    if (ioctl(g_drm_fd,DRM_IOC(0x64,sizeof(map)),&map)) return NULL;
+    uint64_t bytes=(uint64_t)db->offset+(uint64_t)db->stride*(uint32_t)db->height;
+    if (!bytes || bytes>SIZE_MAX-4095) return NULL;
+    size_t length=(size_t)((bytes+4095)&~UINT64_C(4095));
+    void *pixels=mmap(NULL,length,PROT_READ,MAP_SHARED,g_drm_fd,(off_t)map.offset);
+    if (pixels==MAP_FAILED) return NULL;
+    struct brook_image *image=image_snapshot((const uint8_t *)pixels+db->offset,db->width,db->height,
+        db->stride,db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
+    munmap(pixels,length);return image;
+}
+/* The Wayland buffer ownership contract excludes new producer writes until
+ * release. Wait for submitted work and transition the backing to CPU access. */
+static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain)
+{
+    if(!uncertain)return NULL;
+    *uncertain=0;
+    struct { uint32_t handle,flags;int64_t timeout; } wait={db->bo_handle,0,-1};
+    struct { uint32_t handle,read,write; } domain={db->bo_handle,1,0};
+    /* A failed wait/domain transition does not prove that the GPU stopped.
+     * Suppress wl_buffer.release; the buffer's sticky uncertainty survives
+     * reuse of the same protocol resource. Mapping/allocation failures after
+     * both calls succeed can release the producer normally. */
+    if (ioctl(g_drm_fd,DRM_IOC(0x6c,sizeof(wait)),&wait)) {
+        int error=errno;*uncertain=1;
+        fprintf(stderr,"[waylandd] Intel buffer completion wait failed: errno=%d; release withheld\n",error);
+        errno=error;return NULL;
+    }
+    if (ioctl(g_drm_fd,DRM_IOC(0x5f,sizeof(domain)),&domain)) {
+        int error=errno;*uncertain=1;
+        fprintf(stderr,"[waylandd] Intel buffer CPU transition failed: errno=%d; release withheld\n",error);
+        errno=error;return NULL;
+    }
+    return intel_dmabuf_copy(db);
+}
+
+/* Queue ownership outlives a surface or a superseding commit. Every buffer is
+ * retained until completion is observed; round-robin polling prevents one
+ * stuck producer from starving unrelated surfaces. Event-loop only. */
+enum { INTEL_PENDING_LIMIT=64,INTEL_PENDING_PER_TICK=8 };
+static struct brook_image *g_intel_pending_head,*g_intel_pending_tail;
+static unsigned g_intel_pending_count;
+static uint64_t g_intel_queued,g_intel_ready,g_intel_busy,g_intel_failed;
+static uint64_t g_intel_fences,g_intel_fence_pending,g_intel_direct;
+static void intel_pending_append(struct brook_image *image){
+    image->pending_next=NULL;
+    if(g_intel_pending_tail)g_intel_pending_tail->pending_next=image;else g_intel_pending_head=image;
+    g_intel_pending_tail=image;++g_intel_pending_count;
+}
+/* Experimental opt-in bridge to one trusted desktop consumer. Only records
+ * actually delivered need acknowledgement. A lost channel never implies
+ * that its previously delivered GPU reads have retired. Event-loop only. */
+static int g_gpu_window_channel=-1;
+static int g_gpu_window_dead=-1;
+static uint64_t g_gpu_window_offers,g_gpu_window_acks,g_gpu_window_recovered;
+/* Aggregate failures instead of logging each frame; the latter perturbs pacing. */
+static uint64_t g_gpu_offer_no_channel,g_gpu_offer_no_root,g_gpu_offer_layers,g_gpu_offer_geometry,g_gpu_offer_window,g_gpu_offer_metadata;
+static uint64_t g_gpu_connect_fail,g_gpu_auth_fail;
+static int g_gpu_connect_errno,g_gpu_auth_errno;
+struct GpuWindowTiming {uint64_t count,sum,buckets[10];uint32_t max;};
+static const uint32_t g_gpuTimingBounds[10]={10,20,50,100,200,500,1000,2000,5000,UINT32_MAX};
+static struct GpuWindowTiming g_offerWait,g_snapshotWait;
+static void gpu_window_timing_add(struct GpuWindowTiming *s,uint32_t start,uint32_t end){
+    if(!getenv("BROOK_WAYLAND_GPU_TIMING") || !start)return;
+    uint32_t elapsed=end-start;
+    if(elapsed>0x7fffffffu)return;
+    ++s->count;s->sum+=elapsed;if(elapsed>s->max)s->max=elapsed;
+    for(unsigned i=0;i<10;++i)if(elapsed<=g_gpuTimingBounds[i]){++s->buckets[i];break;}
+}
+static uint32_t gpu_window_timing_p80_bound(const struct GpuWindowTiming *s){
+    if(!s->count)return 0;
+    uint64_t target=(s->count/5)*4+((s->count%5)*4+4)/5,seen=0;
+    for(unsigned i=0;i<10;++i){seen+=s->buckets[i];if(seen>=target)return g_gpuTimingBounds[i];}
+    return UINT32_MAX;
+}
+static void gpu_window_channel_lost(void){
+    if(g_gpu_window_channel>=0){
+        if(g_gpu_window_dead>=0)close(g_gpu_window_channel);
+        else g_gpu_window_dead=g_gpu_window_channel;
+    }
+    g_gpu_window_channel=-1;
+    for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==1)i->offer_state=3;
+}
+static void gpu_window_reap_dead(void){
+    if(g_gpu_window_dead<0)return;
+    for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==3)return;
+    close(g_gpu_window_dead);g_gpu_window_dead=-1;
+}
+static int gpu_window_channel_connect(void){
+    const char *path=getenv("BROOK_WAYLAND_GPU_SOCKET");
+    if(!path || !*path)return 0;
+    if(g_gpu_window_channel>=0)return 1;
+    if(g_gpu_window_dead>=0)return 0;
+    struct sockaddr_un addr={.sun_family=AF_UNIX};size_t length=strlen(path);
+    if(length>=sizeof(addr.sun_path))return 0;
+    memcpy(addr.sun_path,path,length+1);
+    int fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);if(fd<0)return 0;
+    if(connect(fd,(struct sockaddr *)&addr,sizeof(addr))){
+        ++g_gpu_connect_fail;g_gpu_connect_errno=errno;close(fd);return 0;
+    }
+    if(syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)fd,(long)BROOK_GPU_WINDOW_PEER_AUTH,0L,0L,0L,0L)){
+        ++g_gpu_auth_fail;g_gpu_auth_errno=errno;close(fd);return 0;
+    }
+    g_gpu_window_channel=fd;return 1;
+}
+static void gpu_window_channel_drain(void){
+    if(g_gpu_window_channel<0)return;
+    for(unsigned n=0;n<16;++n){
+        struct BrookGpuWindowPacket packet={0};int fds[2];
+        int result=brook_gpu_window_receive(g_gpu_window_channel,&packet,fds);
+        if(!result)return;
+        if(result<0 || packet.type!=BROOK_GPU_WINDOW_SAFE){
+            if(result>0){if(fds[0]>=0)close(fds[0]);if(fds[1]>=0)close(fds[1]);}
+            gpu_window_channel_lost();return;
+        }
+        struct brook_image *match=NULL;
+        for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)
+            if(i->offer_state==1 && brook_gpu_window_identity_equal(&i->offer_identity,&packet.identity)){match=i;break;}
+        if(!match){gpu_window_channel_lost();return;}
+        match->offer_state=2;++g_gpu_window_acks;
+        if(getenv("BROOK_WAYLAND_GPU_TIMING")){match->offer_ack_ms=g_now_ms();
+            gpu_window_timing_add(&g_offerWait,match->offer_sent_ms,match->offer_ack_ms);}
+    }
+}
+/* Returns 1 delivered, 0 unsupported/not delivered, -1 uncertain delivery. */
+static int gpu_window_offer(struct brook_image *image){
+    if(!image || !image->source || !image->source->dmabuf || image->producer_fence<0 || !gpu_window_channel_connect()){++g_gpu_offer_no_channel;return 0;}
+    struct brook_surface *root=NULL;
+    for(struct brook_surface *s=g_surfaces;s;s=s->next){struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+        if(view && view->image==image && !s->tree.parent){root=s;break;}}
+    if(!root || !root->xdg_toplevel || !root->xdg_acked){++g_gpu_offer_no_root;return 0;}
+    struct brook_draw draws[64];unsigned count=0;
+    if(!surface_layers(root,draws,&count) || count!=1 || draws[0].view->image!=image){++g_gpu_offer_layers;return 0;}
+    const struct brook_view *view=draws[0].view;const struct brook_geometry *g=&view->geometry;
+    const struct brook_dmabuf_buffer *db=image->source->dmabuf;
+    if(g->transform || g->sx || g->sy || g->sw!=(int64_t)image->width*256 || g->sh!=(int64_t)image->height*256 ||
+       (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
+    if(!surface_window(root,(struct brook_view *)view) || !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
+    struct stat st={0};BrookWindowState window={0};
+    if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3) ||
+       syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
+       window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id || !root->tree.current ||
+       window.width!=root->vfb_w || window.height!=root->vfb_h){++g_gpu_offer_metadata;return 0;}
+    struct BrookGpuWindowPacket offer={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION,
+        .type=BROOK_GPU_WINDOW_OFFER,.identity={root->wm_id,0,window.incarnation,root->tree.current->commit,
+            (uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=(uint64_t)st.st_size/4,.offset=db->offset/4,
+        .stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
+    int sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
+    if(sent==1){image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;
+        if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->offer_sent_ms=g_now_ms();
+        return 1;}
+    if(sent<0){image->offer_state=3;gpu_window_channel_lost();return -1;}
+    return 0;
+}
+static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer){
+    if(!buffer || !buffer->dmabuf || g_intel_pending_count>=INTEL_PENDING_LIMIT)return NULL;
+    const struct brook_dmabuf_buffer *db=buffer->dmabuf;
+    struct drm_prime_handle prime={db->bo_handle,O_CLOEXEC|O_RDWR,-1};
+    if(ioctl(g_drm_fd,DRM_IOC(0x2d,sizeof(prime)),&prime) || prime.fd<0)return NULL;
+    struct brook_image *image=calloc(1,sizeof(*image));if(!image){close(prime.fd);return NULL;}
+    image->refs=1;image->width=db->width;image->height=db->height;image->format=db->fourcc==0x34325258?2:1;
+    image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
+    image->pending_cpu=1;image->pending_fd=prime.fd;image->producer_fence=-1;
+    const char *fenced=getenv("BROOK_WAYLAND_SNAPSHOT_FENCE");
+    image->producer_fence_required=fenced && !strcmp(fenced,"1");
+    image_ref(image);intel_pending_append(image);++g_intel_queued;return image;
+}
+static void intel_pending_poll(void){
+    gpu_window_channel_drain();
+    unsigned budget=g_intel_pending_count<INTEL_PENDING_PER_TICK?g_intel_pending_count:INTEL_PENDING_PER_TICK;
+    while(budget-- && g_intel_pending_head){
+        struct brook_image *image=g_intel_pending_head;g_intel_pending_head=image->pending_next;
+        if(!g_intel_pending_head)g_intel_pending_tail=NULL;
+        --g_intel_pending_count;image->pending_next=NULL;
+        int fence_error=0;
+        if(image->producer_fence_required){
+            if(image->producer_fence<0){
+                errno=0;long fd=syscall(BROOK_SYS_GPU_BUFFER_SNAPSHOT_FENCE,(long)image->pending_fd,0L,0L,0L,0L,0L);
+                if(fd<0 && (errno==EAGAIN || errno==EINTR)){++g_intel_fence_pending;intel_pending_append(image);continue;}
+                if(fd<0)fence_error=errno?errno:EIO;
+                else {image->producer_fence=(int)fd;++g_intel_fences;}
+            }
+            if(!fence_error && image->producer_fence>=0){
+                if(image->offer_state==3){
+                    errno=0;long recovered=g_gpu_window_dead<0?-1:
+                        syscall(BROOK_SYS_GPU_WINDOW_PEER_RECOVERY,(long)g_gpu_window_dead,(long)BROOK_GPU_WINDOW_PEER_DRAIN,
+                                (long)image->pending_fd,0L,0L,0L);
+                    if(recovered<0 && (errno==EAGAIN || errno==EINTR)){intel_pending_append(image);continue;}
+                    if(recovered<0)fence_error=EIO;
+                    else {image->offer_state=2;++g_gpu_window_recovered;}
+                }
+                else if(image->offer_state==1){intel_pending_append(image);continue;}
+                else if(!image->offer_state){
+                    int offered=gpu_window_offer(image);
+                    if(offered<0){intel_pending_append(image);continue;}
+                    else if(offered>0){intel_pending_append(image);continue;}
+                    else image->offer_state=4; /* fallback, no fd transferred */
+                }
+            }
+#ifdef BROOK_WAYLAND_VULKAN_COMPOSITOR
+            if(!fence_error && image->producer_fence>=0 && !image->direct_attempted){
+                image->direct_attempted=1;
+                for(struct brook_surface *s=g_surfaces;s;s=s->next){
+                    struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+                    if(!view || view->image!=image || s->tree.parent)continue;
+                    int direct=surface_vulkan_direct(s,image,image->pending_fd,image->producer_fence);
+                    if(direct<0)fence_error=EIO;else if(direct>0)++g_intel_direct;
+                    break;
+                }
+            }
+#endif
+            if(!fence_error){
+                struct pollfd p={.fd=image->producer_fence,.events=POLLIN};
+                int polled=poll(&p,1,0);
+                if(!polled || (polled<0 && errno==EINTR)){++g_intel_fence_pending;intel_pending_append(image);continue;}
+                if(polled<0 || !(p.revents&POLLIN) || (p.revents&(POLLERR|POLLHUP|POLLNVAL)))fence_error=EIO;
+                else {
+                    struct {char name[32];int32_t status;uint32_t flags,num_fences,pad;uint64_t fences;} info={0};
+                    if(ioctl(image->producer_fence,0xc0383e04u,&info) || info.status!=1)fence_error=EIO;
+                }
+            }
+        }
+        if(fence_error){
+            ++g_intel_failed;image->uncertain=1;image->source->uncertain=1;
+            fprintf(stderr,"[waylandd] Intel producer fence failed: errno=%d; release withheld\n",fence_error);
+            if(image->source->resource)wl_client_post_implementation_error(wl_resource_get_client(image->source->resource),"GPU producer completion could not be verified");
+            if(image->producer_fence>=0)close(image->producer_fence);
+            close(image->pending_fd);image->pending_fd=-1;image->pending_cpu=2;image_unref(image);continue;
+        }
+        errno=0;long result=syscall(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ,(long)image->pending_fd,0L,0L,0L,0L,0L);
+        int error=result<0?errno:0,uncertain=0;
+        if(result<0 && (error==EAGAIN || error==EINTR)){++g_intel_busy;intel_pending_append(image);continue;}
+        struct brook_image *copy=NULL;
+        if(!result)copy=intel_dmabuf_copy(image->source->dmabuf);
+        else {
+            /* Never fall back to a blocking wait in the event loop.  Without
+             * a successful transition the producer's completion is unknown. */
+            uncertain=1;
+            fprintf(stderr,"[waylandd] Intel buffer readiness failed: errno=%d; release withheld\n",error);
+        }
+        int ready=copy!=NULL;
+        if(!ready){
+            ++g_intel_failed;
+            image->uncertain=1;if(uncertain)image->source->uncertain=1;
+            if(image->source->resource){struct wl_client *client=wl_resource_get_client(image->source->resource);
+                if(uncertain)wl_client_post_implementation_error(client,"GPU buffer completion could not be verified");
+                else wl_client_post_no_memory(client);}
+            if(!uncertain){buffer_release(image->source);buffer_drop(image->source);image->source=NULL;}
+        }else{
+            ++g_intel_ready;
+            image->pixels=copy->pixels;copy->pixels=NULL;image_unref(copy);
+            buffer_release(image->source);buffer_drop(image->source);image->source=NULL;
+        }
+        if(image->producer_fence>=0)close(image->producer_fence);
+        close(image->pending_fd);image->pending_fd=-1;image->pending_cpu=ready?0:2;
+        if(ready)for(struct brook_surface *surface=g_surfaces;surface;surface=surface->next){
+            struct brook_view *view=surface->tree.current?surface->tree.current->value:NULL;
+            if(!view || view->image!=image)continue;
+            surface->image=image->pixels;
+            if(surface->is_cursor)surface_cursor_commit(surface);else {
+                surface_repaint(surface);
+                if(image->offer_ack_ms && !surface->tree.parent){struct brook_draw draws[64];unsigned count=0;
+                    if(surface_layers(surface,draws,&count) && count==1 && draws[0].view->image==image)
+                        gpu_window_timing_add(&g_snapshotWait,image->offer_ack_ms,g_now_ms());}
+            }
+        }
+        image_unref(image);
+    }
+    gpu_window_reap_dead();
+}
+static unsigned shutdown_pending_count(void *unused){(void)unused;return g_intel_pending_count;}
+static void shutdown_pending_poll(void *unused){(void)unused;intel_pending_poll();wl_display_flush_clients(g_display);}
+static void shutdown_pending_wait(void *unused){(void)unused;usleep(10000);}
 
 static void dmabuf_buffer_unref(struct brook_dmabuf_buffer *db)
 {
@@ -2745,10 +3060,14 @@ int main(int argc, char **argv)
     fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
     output_scale_init();
     int run_seconds = 0, no_xwayland = 0;
-    const char *xwayland_server=NULL,*xwm_helper=NULL,*xdisplay=":0";
+    const char *xwayland_server=NULL,*xwm_helper=NULL,*xdisplay=":0",*gpu_socket=NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--trace-frames")) g_trace_frames = 1;
         if (!strcmp(argv[i], "--no-xwayland")) no_xwayland = 1;
+        if (!strcmp(argv[i], "--gpu-source")) {
+            if(gpu_socket || i+1>=argc || argv[i+1][0]!='/')return 2;
+            gpu_socket=argv[++i];
+        }
         if (!strcmp(argv[i],"--xwayland") && i+1<argc) xwayland_server=argv[++i];
         if (!strcmp(argv[i],"--xwm") && i+1<argc) xwm_helper=argv[++i];
         if (!strcmp(argv[i],"--xdisplay") && i+1<argc) xdisplay=argv[++i];
@@ -2756,6 +3075,8 @@ int main(int argc, char **argv)
             && i + 1 < argc)
             run_seconds = atoi(argv[++i]);
     }
+    if(gpu_socket && (setenv("BROOK_WAYLAND_GPU_SOCKET",gpu_socket,1) ||
+       setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1) || setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1)))return 1;
     if (!!xwayland_server!=!!xwm_helper || xdisplay[0]!=':' || !xdisplay[1] ||
         strspn(xdisplay+1,"0123456789")!=strlen(xdisplay+1) || strlen(xdisplay)>3 || atoi(xdisplay+1)>63) return 2;
     if (no_xwayland && xwayland_server) return 2;
@@ -2831,6 +3152,7 @@ int main(int argc, char **argv)
     /* Open the DRM render node once for PRIME dmabuf import (hardware GL windows).
      * Absence is non-fatal: we simply won't advertise working dmabuf import. */
     g_drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (g_drm_fd < 0) { g_drm_fd=open("/dev/dri/renderD129",O_RDWR | O_CLOEXEC);g_drm_intel=g_drm_fd>=0; }
     if (g_drm_fd < 0) {
         fprintf(stderr, "[waylandd] dmabuf: no DRM node (%s) — GL windows will be software\n",
                 strerror(errno));
@@ -2886,11 +3208,32 @@ int main(int argc, char **argv)
         if (run_seconds > 0 && (int)((g_now_ms() - loop_start) / 1000) >= run_seconds)
             break;
     }
-done:
+done:;
+    const struct IntelPendingDrainOps drain={NULL,shutdown_pending_count,shutdown_pending_poll,shutdown_pending_wait};
+    const int pendingDrained=intel_pending_drain(&drain,200);
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
+    if(g_intel_queued)fprintf(stderr,"[waylandd] Intel async queued=%llu ready=%llu busy_polls=%llu failed=%llu pending=%u\n",
+        (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_busy,
+        (unsigned long long)g_intel_failed,g_intel_pending_count);
+    if(g_intel_fences || g_intel_fence_pending)fprintf(stderr,"[waylandd] Intel producer fences=%llu pending_polls=%llu\n",
+        (unsigned long long)g_intel_fences,(unsigned long long)g_intel_fence_pending);
+    if(g_intel_direct)fprintf(stderr,"[waylandd] Vulkan direct source presentations=%llu\n",(unsigned long long)g_intel_direct);
+    if(g_gpu_window_offers)fprintf(stderr,"[waylandd] GPU window offers=%llu acknowledgements=%llu\n",
+        (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks);
+    if(getenv("BROOK_WAYLAND_GPU_DIAGNOSTICS"))fprintf(stderr,"[waylandd] GPU offer skipped channel=%llu root=%llu layers=%llu geometry=%llu window=%llu metadata=%llu connect_fail=%llu connect_errno=%d auth_fail=%llu auth_errno=%d\n",
+        (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,
+        (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
+        (unsigned long long)g_gpu_connect_fail,g_gpu_connect_errno,(unsigned long long)g_gpu_auth_fail,g_gpu_auth_errno);
+    if(g_offerWait.count || g_snapshotWait.count)fprintf(stderr,"[waylandd] GPU window timing offer_ack_count=%llu offer_ack_mean_ms=%llu offer_ack_p80_le_ms=%u offer_ack_max_ms=%u ack_repaint_count=%llu ack_repaint_mean_ms=%llu ack_repaint_p80_le_ms=%u ack_repaint_max_ms=%u\n",
+        (unsigned long long)g_offerWait.count,(unsigned long long)(g_offerWait.count?g_offerWait.sum/g_offerWait.count:0),gpu_window_timing_p80_bound(&g_offerWait),g_offerWait.max,
+        (unsigned long long)g_snapshotWait.count,(unsigned long long)(g_snapshotWait.count?g_snapshotWait.sum/g_snapshotWait.count:0),gpu_window_timing_p80_bound(&g_snapshotWait),g_snapshotWait.max);
+    if(g_gpu_window_recovered)fprintf(stderr,"[waylandd] GPU window recovered after renderer exit=%llu\n",(unsigned long long)g_gpu_window_recovered);
     int xwayland_stopped=xwayland_shutdown();
     wl_display_destroy(g_display);
-    if (!xwayland_stopped) return 1;
+    if (!xwayland_stopped || !pendingDrained || g_intel_failed){
+        fprintf(stderr,"[waylandd] INCOMPLETE pending=%u failed=%llu\n",g_intel_pending_count,(unsigned long long)g_intel_failed);
+        return 1;
+    }
     fprintf(stderr, "[waylandd] PASS\n");
     return 0;
 }

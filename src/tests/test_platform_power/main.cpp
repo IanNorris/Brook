@@ -12,6 +12,7 @@ struct Trace {
     unsigned count=0,width=0;uint16_t port=0,value=0;bool accept=true;
     static bool byte(void* p,uint16_t port,uint8_t value){auto& t=*static_cast<Trace*>(p);++t.count;t.width=8;t.port=port;t.value=value;return t.accept;}
     static bool word(void* p,uint16_t port,uint16_t value){auto& t=*static_cast<Trace*>(p);++t.count;t.width=16;t.port=port;t.value=value;return t.accept;}
+    static bool efi(void* p,uint64_t entry){auto& t=*static_cast<Trace*>(p);++t.count;t.width=64;t.value=entry;return t.accept;}
     brook::PowerIo io(){return {this,byte,word};}
 };
 int main(){
@@ -33,4 +34,7 @@ int main(){
     assert(!plan.CanReset() && !plan.CanPowerOff() && !plan.Issue(false,trace.io()) && !trace.count);
     firmware={true,0xcf9,6,"fixture"};mode.clear();PlatformPowerConfigure();plan=PlatformPowerGetPlan();
     assert(!plan.Issue(true,{nullptr,nullptr,nullptr}));
+    trace={};plan.efiEntry=0x1234;
+    assert(plan.CanPowerOff() && plan.Issue(false,{&trace,Trace::byte,Trace::word,Trace::efi}) && trace.width==64 && trace.value==0x1234);
+    trace={};assert(!plan.Issue(false,trace.io()) && !trace.count); // no speculative fallback
 }

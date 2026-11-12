@@ -54,6 +54,7 @@ bool TtyReady();
 // still output to the serial console but skip all framebuffer writes.
 // Used during boot-logo display to prevent TTY from overwriting the logo.
 void TtySuppressDisplay(bool suppress);
+bool TtyDisplaySuppressed();
 
 // Retrieve framebuffer info for direct rendering (e.g. QR panic screen).
 // Returns false if TTY is not initialised.

@@ -62,6 +62,29 @@ PKT_PROCESS_EXT    = 0xA3000007  # BRO-176 reap-gate fields, merged onto PROCESS
 PKT_CPU_STATE      = 0xA3000008  # per-CPU RIP/CR3/pid
 PKT_MESSAGE        = 0xA3000009  # bounded panic reason, UTF-8 bytes
 PKT_LOG_TAIL       = 0xA300000A  # one-byte snapshot status, followed by log text
+PKT_GPU_CAPTURE    = 0xA300000B  # bounded failure-time samples of marked Intel buffers
+
+def decode_gpu_capture(data: bytes) -> dict:
+    if len(data) < 16:
+        raise ValueError('short GPU capture header')
+    version, count, requested, reserved = struct.unpack_from('<IIII', data)
+    if version not in (1, 2, 3, 4) or count > 4 or count > requested or reserved:
+        raise ValueError('invalid GPU capture header')
+    entries = []
+    offset = 16
+    for i in range(count):
+        if len(data)-offset < 24:
+            raise ValueError('short GPU capture entry')
+        address, size, length, entry_reserved = struct.unpack_from('<QQII', data, offset)
+        limit = 128 if version == 1 else 512 if version == 2 else 4096 if version == 3 else 8192
+        if entry_reserved or length > limit or length > size or len(data)-offset-24 < (128 if version == 1 else length):
+            raise ValueError('invalid GPU capture entry')
+        entries.append({'address': address, 'size': size, 'bytes': length,
+                        'sample_hex': data[offset+24:offset+24+length].hex()})
+        offset += 24 + (128 if version == 1 else length)
+    if offset != len(data):
+        raise ValueError('trailing GPU capture data')
+    return {'version': version, 'requested': requested, 'captured': count, 'entries': entries}
 
 GPR_NAMES = [
     "RAX", "RBX", "RCX", "RDX", "RSI", "RDI",
@@ -601,7 +624,7 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
                  stack_dump: StackDump | None = None,
                  cpu_list: "CpuList | None" = None,
                  message: str | None = None,
-                 log_tail: dict | None = None):
+                 log_tail: dict | None = None, gpu_capture: dict | None = None):
     bar = "═" * (W + 4)
     print(f"\n  {C.RED}{C.BOLD}{bar}{C.RESET}")
     print(f"  {C.RED}{C.BOLD}{'🔴 BROOK OS CRASH DUMP':^{W + 4}}{C.RESET}")
@@ -617,6 +640,10 @@ def print_report(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | Non
     if message is not None:
         safe_message = json.dumps(message, ensure_ascii=True)[1:-1]
         print(f"  {C.RED}{C.BOLD}Panic reason:{C.RESET} {safe_message}\n")
+    if gpu_capture is not None:
+        print(f"  GPU capture: {gpu_capture['captured']}/{gpu_capture['requested']} marked buffers (samples may be stale or incomplete)")
+        for entry in gpu_capture['entries']:
+            print(f"    address=0x{entry['address']:x} size={entry['size']} sample={entry['sample_hex']}")
     if log_tail is not None:
         print(f"  {C.CYAN}{C.BOLD}Recent kernel log:{C.RESET}")
         if log_tail['available']:
@@ -788,7 +815,7 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
                stack_dump: StackDump | None = None,
                cpu_list: "CpuList | None" = None,
                message: str | None = None,
-               log_tail: dict | None = None) -> dict:
+               log_tail: dict | None = None, gpu_capture: dict | None = None) -> dict:
     out: dict = {
         "header": {
             "magic": f"0x{hdr.magic:02X}",
@@ -802,6 +829,8 @@ def build_json(hdr: PanicHeader, regs: CPURegs | None, trace: StackTrace | None,
         out["message"] = message
     if log_tail is not None:
         out["log_tail"] = log_tail
+    if gpu_capture is not None:
+        out["gpu_capture"] = gpu_capture
     if exc_info:
         out["exception"] = {
             "vector": exc_info.vector,
@@ -973,6 +1002,7 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
     proc_ext_data = None  # buffered until after the loop (may precede PROCESS_LIST)
     message = None
     log_tail = None
+    gpu_capture = None
 
     while off + PacketHeader.SIZE <= len(payload):
         pkt = PacketHeader(payload, off)
@@ -1011,6 +1041,11 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
             else:
                 log_tail={'available':pkt_data[0]==0,
                           'text':pkt_data[1:].decode('utf-8',errors='replace')}
+        elif pkt.type == PKT_GPU_CAPTURE:
+            try:
+                gpu_capture=decode_gpu_capture(pkt_data)
+            except ValueError as exc:
+                print(f'[warn] Invalid GPU capture: {exc}', file=sys.stderr)
         else:
             print(f"[warn] Unknown packet type 0x{pkt.type:08X} ({pkt.size}B)",
                   file=sys.stderr)
@@ -1034,12 +1069,12 @@ def decode_crash(data: bytes, sym: Symbolicator | None,
         print(json.dumps(build_json(hdr, regs, trace, sym,
                                     exc_info=exc_info, proc_list=proc_list,
                                     sys_info=sys_info, stack_dump=stack_dump,
-                                    cpu_list=cpu_list, message=message, log_tail=log_tail), indent=2))
+                                    cpu_list=cpu_list, message=message, log_tail=log_tail, gpu_capture=gpu_capture), indent=2))
     else:
         print_report(hdr, regs, trace, sym, data, show_raw,
                      exc_info=exc_info, proc_list=proc_list,
                      sys_info=sys_info, stack_dump=stack_dump,
-                     cpu_list=cpu_list, message=message, log_tail=log_tail)
+                     cpu_list=cpu_list, message=message, log_tail=log_tail, gpu_capture=gpu_capture)
 
 
 def parse_serial_log(path: str) -> bytes:

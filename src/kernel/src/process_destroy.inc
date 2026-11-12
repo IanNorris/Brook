@@ -36,6 +36,9 @@ static void DestroyProcessResources(Process* proc, bool published)
     // This finalizer runs on the cleanup worker, outside scheduler IRQ context.
     if (published && !isThread)
     {
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+        BdwOffscreenHandoffOwnerExit(proc->incarnation);
+#endif
         CompositorUnregisterProcess(proc);
         WmDestroyWindowForProcess(proc);
         // Release the app's GPU (virgl) context, if it created one.

@@ -81,7 +81,8 @@ static volatile uint32_t g_apSignal = 0;
 // Panic halt state — NMI handler captures per-CPU state here
 // ---------------------------------------------------------------------------
 // These are extern "C" so the naked asm NMI handler can reference them.
-extern "C" volatile bool      g_panicHaltActive = false;
+// Zero means no panic halt; otherwise the initiating CPU's initial APIC ID + 1.
+extern "C" volatile uint32_t  g_panicHaltActive = 0;
 static CpuHaltedState         g_haltedState[MAX_CPUS] = {};
 extern "C" volatile uint32_t  g_haltedCount = 0;
 
@@ -742,7 +743,7 @@ __asm__(
     ".global PanicNmiHandlerAsm\n"
     ".type PanicNmiHandlerAsm,@function\n"
     "PanicNmiHandlerAsm:\n"
-    "    cmpb $0, g_panicHaltActive(%rip)\n"
+    "    cmpl $0, g_panicHaltActive(%rip)\n"
     "    jne .Lnmi_panic\n"
     // Not a panic NMI. Is the TLB epoch barrier escalating (BRO-179)? If so,
     // service this CPU's epoch flush; otherwise it is a spurious NMI — return.
@@ -813,8 +814,11 @@ extern "C" void PanicNmiHandlerAsm();
 uint32_t SmpHaltAllAPs()
 {
     // Only the first caller sends halt NMIs; subsequent calls observe its count.
-    bool expected = false;
-    if (!__atomic_compare_exchange_n(&g_panicHaltActive, &expected, true,
+    uint32_t apicId;
+    __asm__ volatile("mov $1, %%eax; cpuid; shr $24, %%ebx; mov %%ebx, %0"
+                     : "=r"(apicId) : : "eax", "ebx", "ecx", "edx");
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&g_panicHaltActive, &expected, apicId + 1,
                                      false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
     {
         // Already in panic halt; do not send another round.
@@ -848,6 +852,16 @@ uint32_t SmpHaltAllAPs()
 bool SmpIsPanicActive()
 {
     return __atomic_load_n(&g_panicHaltActive, __ATOMIC_ACQUIRE);
+}
+
+bool SmpIsPanicHaltOwner()
+{
+    const uint32_t owner=__atomic_load_n(&g_panicHaltActive,__ATOMIC_ACQUIRE);
+    if(!owner)return false;
+    uint32_t apicId;
+    __asm__ volatile("mov $1, %%eax; cpuid; shr $24, %%ebx; mov %%ebx, %0"
+                     : "=r"(apicId) : : "eax", "ebx", "ecx", "edx");
+    return owner==apicId+1;
 }
 
 const CpuHaltedState* SmpGetHaltedState(uint32_t cpuIndex)

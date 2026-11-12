@@ -61,12 +61,12 @@ bool SyscallTimingRead(SyscallTimingSnapshot* output){
     if(!output)return false;Guard guard;if(!guard.held)return false;
     SyncDrops();*output=model.Snapshot();output->contended=__atomic_load_n(&contention,__ATOMIC_RELAXED);return true;
 }
-SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase){
+SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase,uint64_t ioctlRequest){
     const auto epoch=__atomic_load_n(&publishedEpoch,__ATOMIC_ACQUIRE);
     if(!(epoch&1) || pid!=__atomic_load_n(&targetPid,__ATOMIC_RELAXED) ||
         incarnation!=__atomic_load_n(&targetIncarnation,__ATOMIC_RELAXED))return {};
     const auto now=TimingNowNs();Guard guard;if(!guard.held){Drop();return {};}
-    SyncDrops();return model.Begin(epoch,pid,incarnation,number,arg0,now,phase);
+    SyncDrops();return model.Begin(epoch,pid,incarnation,number,arg0,now,phase,ioctlRequest);
 }
 void SyscallTimingLeave(SyscallTimingTicket ticket,int64_t result,bool hasResult){
     Process* proc=ProcessCurrent();if(!proc)return;

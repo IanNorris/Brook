@@ -59,6 +59,13 @@ static void expectRecovery(bool success) {
     else assert(!k&&!i);
     assert(allocations.empty());
 }
+static void expectAlternate(bool success) {
+    uint8_t *k=nullptr,*i=nullptr;UINTN kb=0,ib=0;
+    assert(brook::bootloader::LoadAlternateRecoveryPair(nullptr,nullptr,k,kb,i,ib)==success);
+    if(success){assert(k&&i&&kb==4096&&ib==512);brook::bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)k,kb);brook::bootloader::FreePages(nullptr,(EFI_PHYSICAL_ADDRESS)i,ib);}
+    else assert(!k&&!i);
+    assert(allocations.empty());
+}
 int main() {
     const char* identity="01000000000000000000000000000000"
                          "02000000000000000000000000000000"
@@ -90,6 +97,16 @@ int main() {
     files[u"RECOVERY\\SELECT.BIN"]=files[u"UPDATES\\SELECT0.BIN"];
     files[u"RECOVERY\\KERNEL.ELF"]=files[u"UPDATES\\A\\KERNEL.ELF"];
     files[u"RECOVERY\\INITRD.IMG"]=files[u"UPDATES\\A\\INITRD.IMG"];
+    expectAlternate(false);
+    files[u"RECOV2\\SELECT.BIN"]=files[u"RECOVERY\\SELECT.BIN"];
+    files[u"RECOV2\\KERNEL.ELF"]=files[u"RECOVERY\\KERNEL.ELF"];
+    files[u"RECOV2\\INITRD.IMG"]=files[u"RECOVERY\\INITRD.IMG"];
+    expectAlternate(true);expectRecovery(true);
+    files[u"RECOV2\\INITRD.IMG"][0]^=1;expectAlternate(false);expectRecovery(true);
+    files[u"RECOV2\\INITRD.IMG"]=files[u"RECOVERY\\INITRD.IMG"];
+    files[u"RECOV2\\SELECT.BIN"][124]^=1;expectAlternate(false);expectRecovery(true);
+    files[u"RECOV2\\SELECT.BIN"]=files[u"RECOVERY\\SELECT.BIN"];
+    files.erase(u"RECOV2\\KERNEL.ELF");expectAlternate(false);expectRecovery(true);
     expectRecovery(true);
     files[u"RECOVERY\\INITRD.IMG"][0]^=1;expectRecovery(false);
     files[u"RECOVERY\\INITRD.IMG"]=files[u"UPDATES\\A\\INITRD.IMG"];

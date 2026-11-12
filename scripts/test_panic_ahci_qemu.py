@@ -46,7 +46,7 @@ def verify_scratch(path, expected, slot=0, sequence=1):
 
 
 def run_case(work, image, kernel, firmware, marker, serial_number, timeout, repeat=False,
-             command='panic disk_capture_test', corrupt=False, busy=False):
+             command='panic disk_capture_test', corrupt=False, busy=False, torn=False):
     boot = work / 'boot.raw'
     shutil.copyfile(image, boot)
     esp = str(boot) + '@@1048576'
@@ -70,6 +70,9 @@ def run_case(work, image, kernel, firmware, marker, serial_number, timeout, repe
         if corrupt:
             stream.seek(BASE * SECTOR)
             stream.write(b'\x01')
+        if torn:
+            stream.seek(BASE * SECTOR)
+            stream.write(b'BRKPAN01' + struct.pack('<II', 1, 123))
     initial_hash = hashlib.sha256(scratch.read_bytes()).digest()
     variables = work / 'vars.fd'
     shutil.copyfile(firmware / 'OVMF_VARS.fd', variables)
@@ -115,7 +118,9 @@ def run_case(work, image, kernel, firmware, marker, serial_number, timeout, repe
             raise RuntimeError(f'panic/reset failed, exit={status}: {output[-4000:]}')
         if not capture:
             if busy:
-                if 'PANIC_TEST_DISK_BUSY_ARMED' not in output or 'PANIC_TEST_DISK_BUSY\n' not in output:
+                if any(marker not in output for marker in ('PANIC_TEST_DISK_BUSY_ARMED',
+                        'PANIC_DISK_RESERVE_WAIT\n', 'PANIC_DISK_RESERVE_HELD\n',
+                        'PANIC_TEST_DISK_BUSY\n')):
                     raise RuntimeError('busy ownership was not observed: ' + output[-4000:])
             elif 'PANIC_TEST_DISK_READY' in output:
                 raise RuntimeError('rejected disk was unexpectedly admitted')
@@ -129,7 +134,15 @@ def run_case(work, image, kernel, firmware, marker, serial_number, timeout, repe
         line = next((x for x in output.splitlines() if x.startswith('PANIC_HEX:')), None)
         if not line:
             raise RuntimeError('structured serial packet missing')
-        verify_scratch(scratch, bytes.fromhex(line[len('PANIC_HEX:'):]), boot_number, boot_number + 1)
+        verify_scratch(scratch, bytes.fromhex(line[len('PANIC_HEX:'):]),
+                       1 if torn else boot_number, boot_number + 1)
+        if torn:
+            with scratch.open('rb') as stream:
+                stream.seek(BASE * SECTOR)
+                if stream.read(SLOT_SECTORS * SECTOR) != (
+                        b'BRKPAN01' + struct.pack('<II', 1, 123) +
+                        bytes(SLOT_SECTORS * SECTOR - 16)):
+                    raise RuntimeError('torn first slot was modified')
         with scratch.open('rb') as stream:
             stream.seek(BASE * SECTOR)
             now = stream.read(SLOT_SECTORS * SECTOR)
@@ -146,7 +159,7 @@ def main():
     parser.add_argument('--kernel', type=Path, required=True, help='BROOK_AHCI_PANIC_TEST kernel')
     parser.add_argument('--firmware', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=120)
-    parser.add_argument('--case', choices=['capture', 'exception', 'unarmed', 'wrong-serial', 'corrupt-journal', 'busy'])
+    parser.add_argument('--case', choices=['capture', 'exception', 'unarmed', 'wrong-serial', 'corrupt-journal', 'torn-journal', 'busy'])
     args = parser.parse_args()
     image, kernel, firmware = (p.resolve(strict=True) for p in (args.image, args.kernel, args.firmware))
     with tempfile.TemporaryDirectory(prefix='brook-panic-ahci-') as temp:
@@ -155,6 +168,7 @@ def main():
                  ('unarmed', False, 'BROOK-PANIC-QA', 'panic unarmed', False),
                  ('wrong-serial', True, 'BROOK-WRONG-QA', 'panic wrong_serial', False),
                  ('corrupt-journal', True, 'BROOK-PANIC-QA', 'panic corrupt_journal', True),
+                 ('torn-journal', True, 'BROOK-PANIC-QA', 'panic torn_journal', False),
                  ('busy', True, 'BROOK-PANIC-QA', 'panic busy', False)]
         for name, marker, serial, command, corrupt in cases:
             if args.case and args.case != name:
@@ -162,7 +176,8 @@ def main():
             work = Path(temp) / name
             work.mkdir()
             run_case(work, image, kernel, firmware, marker, serial, args.timeout,
-                     repeat=name == 'capture', command=command, corrupt=corrupt, busy=name == 'busy')
+                     repeat=name == 'capture', command=command, corrupt=corrupt, busy=name == 'busy',
+                     torn=name == 'torn-journal')
             print(f'{name}: PASS', flush=True)
 
 

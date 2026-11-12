@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,12 @@ static void (*real_swap)(void *);
 static void (*drm_enter)(void), (*drm_leave)(void);
 static int (*get_interval)(void); // SDL2 ABI, matching this probe's swap ABI.
 static const char *settings_path;
+static volatile sig_atomic_t marker_requested;
+static uint64_t marker_ns;
+static void mark_swap_trace(int signal_number) {
+    (void)signal_number;
+    marker_requested = 1;
+}
 
 static uint64_t now_ns(void) {
     struct timespec t;
@@ -34,6 +41,12 @@ __attribute__((constructor)) static void init(void) {
     drm_enter = (void (*)(void))dlsym(RTLD_DEFAULT, "brook_drm_trace_swap_enter");
     drm_leave = (void (*)(void))dlsym(RTLD_DEFAULT, "brook_drm_trace_swap_leave");
     settings_path = getenv("BROOK_SWAP_SETTINGS");
+    if (getenv("BROOK_SWAP_MARKER_SIGNAL")) {
+        struct sigaction action = {0};
+        action.sa_handler = mark_swap_trace;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR2, &action, NULL)) { perror("sdl_swap_trace sigaction"); _exit(127); }
+    }
     if (settings_path && *settings_path)
         get_interval = (int (*)(void))dlsym(RTLD_NEXT, "SDL_GL_GetSwapInterval");
 }
@@ -59,6 +72,11 @@ void SDL_GL_SwapWindow(void *window) {
     if (drm_leave) drm_leave();
     e->end = now_ns();
     __atomic_store_n(&e->ready, 1, __ATOMIC_RELEASE);
+    if (marker_requested) {
+        uint64_t expected = 0;
+        (void)__atomic_compare_exchange_n(&marker_ns, &expected, e->end, 0,
+                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    }
 }
 
 __attribute__((destructor)) static void finish(void) {
@@ -73,6 +91,8 @@ __attribute__((destructor)) static void finish(void) {
         if (!__atomic_load_n(&entries[i].ready, __ATOMIC_ACQUIRE)) ++incomplete;
     fprintf(f, "# brook_swap_trace_v1 count=%u dropped=%u incomplete=%u invalid_clock=%u\n",
             kept, total - kept, incomplete, invalid_clock);
+    if (getenv("BROOK_SWAP_MARKER_SIGNAL"))
+        fprintf(f, "# marker_first_completed_swap_ns=%llu\n", (unsigned long long)__atomic_load_n(&marker_ns, __ATOMIC_RELAXED));
     fputs("index,tid,begin_ns,end_ns\n", f);
     for (unsigned i = 0; i < kept; ++i) {
         struct Entry *e = &entries[i];

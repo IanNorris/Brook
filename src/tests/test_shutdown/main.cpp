@@ -1,11 +1,51 @@
 #include <cassert>
 #include <cstdio>
+#include "ac_shutdown_record.h"
 #include "../../kernel/src/shutdown.cpp"
 namespace {
+void TestAcShutdownRecord() {
+    using namespace brook;
+    struct Disk {
+        uint8_t sectors[2][AcShutdownSectorBytes]{};
+        unsigned reads=0,failRead=0;
+        bool torn=false,failFlush=false;
+        bool read(unsigned slot,uint8_t* out) {
+            if(++reads==failRead)return false;
+            memcpy(out,sectors[slot],AcShutdownSectorBytes);return true;
+        }
+        bool write(unsigned slot,const uint8_t* in) {
+            memcpy(sectors[slot],in,torn?24:AcShutdownSectorBytes);return !torn;
+        }
+        bool flush(){return !failFlush;}
+    } disk;
+    constexpr char oldBoot[]="11111111111111111111111111111111";
+    constexpr char newBoot[]="22222222222222222222222222222222";
+    AcShutdownSelection selection{};
+    assert(!AcShutdownWrite(disk,"00000000000000000000000000000000"));
+    assert(AcShutdownRead(disk,selection) && selection.newest<0);
+    assert(AcShutdownWrite(disk,oldBoot));
+    disk.torn=true;
+    assert(!AcShutdownWrite(disk,newBoot));
+    assert(AcShutdownRead(disk,selection) && selection.newest==0 && selection.latest.sequence==1);
+    assert(selection.kind[1]==AcShutdownSlotKind::Torn && !strcmp(selection.latest.bootId,oldBoot));
+    disk.torn=false;
+    assert(AcShutdownWrite(disk,newBoot));
+    assert(AcShutdownRead(disk,selection) && selection.newest==1 && selection.latest.sequence==2);
+    assert(!strcmp(selection.latest.bootId,newBoot));
+    disk.sectors[0][0]=0xff;
+    assert(!AcShutdownWrite(disk,oldBoot));
+    memcpy(disk.sectors[0],disk.sectors[1],AcShutdownSectorBytes);
+    assert(!AcShutdownRead(disk,selection) && !AcShutdownWrite(disk,oldBoot));
+    Disk missingRead{};missingRead.failRead=3;
+    assert(!AcShutdownWrite(missingRead,oldBoot));
+    Disk failedFlush{};failedFlush.failFlush=true;
+    assert(!AcShutdownWrite(failedFlush,oldBoot) && failedFlush.reads==2);
+}
 struct Yield {};
 bool launched=true,jobsAllowed=true,jobsBusy=false,dispatching=false,gate=false,canFreeze=true;
 uint32_t births=0;unsigned closes=0,signals=0,syncs=0,freezes=0;
 unsigned writebackStops=0,powerWrites=0;
+uint64_t tick=0;
 bool terminalSleeps=false,lastRestart=false;
 brook::PlatformPowerPlan powerPlan;
 bool writebackStopped=false;
@@ -58,9 +98,14 @@ int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncErro
 void CompositorMarkDirty(){}
 void CompositorWake(){}
 uint32_t FwCfgReadFile(const char*,void*,uint32_t){return 0;}
+bool UsbBootReadReset(UsbBootResetReport&){return false;}
 void SerialPrintf(const char*,...){}
+void SerialPuts(const char*){}
+void KLog(const char*,...){}
+uint64_t ApicTickCount(){return tick;}
 }
 int main(){
+    TestAcShutdownRecord();
     using namespace brook;workerStarted=false;
     command(id,"shutdown","unsupported",-95);assert(launched&&jobsAllowed);
     workerStarted=true;powerOff=true;powerRestart=true;
@@ -137,6 +182,42 @@ step();assert(!signals&&!syncs&&!gate);
     for(unsigned i=0;i<10 && operations[current].phase!=Phase::Failed;++i)step();
     command(failedDirect,"power_status","failed",-5);const auto directBefore=directFinalCalls;step();
     assert(directFinalCalls==directBefore && finalCalls==legacyBefore && powerWrites==2);
+    current=-1;irreversible=false;powerOff=true;directFinalError=0;
+    auto sample=[](AcPowerSource source){tick+=1000;ShutdownReportAcSource(source);};
+    assert(!ShutdownGetAcStatus().enabled && !ShutdownGetAcStatus().ready);
+    sample(AcPowerSource::Online);
+    for(unsigned i=0;i<10;++i)sample(AcPowerSource::Offline);
+    step();assert(current<0 && !ShutdownGetAcStatus().requested);
+    acRecovery={};acRecovery.enabled=true;
+    for(unsigned i=0;i<10;++i)sample(AcPowerSource::Offline);
+    step();assert(current<0 && !ShutdownGetAcStatus().requested); // boot on battery
+    sample(AcPowerSource::Online);
+    assert(ShutdownGetAcStatus().ready);
+    // The real Dell kept reporting Offline for nearly three seconds after
+    // restoring AC. A brief relay interruption must not close the desktop.
+    for(unsigned i=0;i<4;++i)sample(AcPowerSource::Offline);
+    sample(AcPowerSource::Online);
+    step();assert(current<0 && ShutdownGetAcStatus().ready);
+    sample(AcPowerSource::Offline);
+    sample(AcPowerSource::Unknown);
+    sample(AcPowerSource::Offline);
+    ShutdownReportAcSource(AcPowerSource::Offline); // same-tick duplicates do not count
+    sample(AcPowerSource::Offline);
+    tick+=3000;assert(ShutdownGetAcStatus().source==AcPowerSource::Unknown);
+    for(unsigned i=0;i<8;++i)sample(AcPowerSource::Offline);
+    step();assert(current<0);
+    sample(AcPowerSource::Offline);
+    step();assert(ShutdownGetAcStatus().requested && operations[current].automatic && operations[current].acLoss);
+    assert(!ShutdownGetAcStatus().ready && operations[current].phase==Phase::Closing);
+    ShutdownCompositorPoll();
+    for(unsigned i=0;i<10 && operations[current].phase!=Phase::Ready;++i)step();
+    assert(operations[current].phase==Phase::Ready && powerWrites==2);
+    terminalSleeps=true;step();terminalSleeps=false;
+    assert(powerWrites==3 && !lastRestart);
+    current=-1;irreversible=false;
+    sample(AcPowerSource::Online);
+    for(unsigned i=0;i<10;++i)sample(AcPowerSource::Offline);
+    step();assert(current<0 && powerWrites==3); // one attempt per boot
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

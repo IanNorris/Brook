@@ -690,8 +690,11 @@ The snapshot mutex can wait through readback/allocation/copy; debug commands
 never wait for another compositor frame, since they may run on that thread.
 
 Normal images report `source: guest_completed_frame`, `frame_epoch` and
-`frame_tick_ms`. These identify a completed render, not GPU timing or the host
-capture instant. Panic capture still reads the cached physical framebuffer and
+`frame_tick_ms`. For a software frame these describe the compositor pass and
+capture time. During a hardware presentation lease, they record the compositor
+epoch observed at publication and the guest publication time. The hardware
+image can represent an earlier desktop state, and multiple presentations can
+share an epoch; it is not a unique frame ID or GPU timing. Panic capture still reads the cached physical framebuffer and
 reports null frame epoch/tick, rather than borrowing an earlier image's time.
 It is a separate best-effort crash view. Reset invalidates cached metadata.
 

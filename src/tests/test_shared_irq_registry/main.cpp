@@ -45,6 +45,14 @@ template<class Fn> static void rejects(Fn action){
 }
 int main(){
     reset();
+    masked[9]=true;
+    const auto sci=IoApicInstallMaskedBootHandler(9,reinterpret_cast<void*>(handlerA));
+    CHECK(sci && installs==1 && !unmasks && masked[9] && installed[sci]);
+    CHECK(!IoApicInstallMaskedBootHandler(9,reinterpret_cast<void*>(handlerB)));
+    IoApicUnmaskIrq(9,sci);
+    reinterpret_cast<StubFn>(installed[routed[9]])();
+    CHECK(callsA==1 && !callsB && eois==1);
+    reset();
     const auto first=IoApicRegisterHandler(11,50,reinterpret_cast<void*>(handlerA));
     const auto second=IoApicRegisterHandler(10,50,reinterpret_cast<void*>(handlerB));
     CHECK(first!=second);

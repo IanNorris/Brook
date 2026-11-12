@@ -68,6 +68,7 @@ uint32_t SmpHaltAllAPs();
 
 // Check if a panic halt is active (set by SmpHaltAllAPs).
 bool SmpIsPanicActive();
+bool SmpIsPanicHaltOwner();
 
 // Per-CPU halted state captured by NMI handler.
 struct CpuHaltedState {

@@ -1,8 +1,23 @@
 /* Production tree adapter: commit dependencies, pixels, callbacks and lifetime. */
 #include <assert.h>
+#include <stdarg.h>
+static long test_syscall(long,...);
+#define syscall test_syscall
 #define main brook_waylandd_main
 #include "waylandd.c"
 #undef main
+#undef syscall
+static unsigned sourceBegins,sourceTags;static uint64_t sourceCommit;
+static long test_syscall(long number,...){
+    va_list args;va_start(args,number);
+    if(number==BROOK_SYS_WM_WINDOW_STATE){long window=va_arg(args,long);(void)va_arg(args,long);
+        BrookWindowState *state=(void *)(uintptr_t)va_arg(args,long);*state=(BrookWindowState){.version=BROOK_WINDOW_STATE_VERSION,.window=(uint32_t)window,.incarnation=77};
+        va_end(args);return 0;}
+    if(number==BROOK_SYS_WM_BEGIN_SOURCE_WRITE){++sourceBegins;va_end(args);return 0;}
+    if(number==BROOK_SYS_WM_PUBLISH_SOURCE_COMMIT){long window=va_arg(args,long),incarnation=va_arg(args,long);
+        long commit=va_arg(args,long);assert(window==1 && incarnation==77 && commit>0);sourceCommit=(uint64_t)commit;++sourceTags;va_end(args);return 0;}
+    va_end(args);return 0;
+}
 static struct brook_surface *make_surface(struct wl_client *client) {
     struct brook_surface *s=calloc(1,sizeof(*s));assert(s);surface_tree_init(s);
     s->resource=wl_resource_create(client,&wl_surface_interface,4,0);assert(s->resource);
@@ -24,11 +39,13 @@ int main(void) {
     struct wl_resource *sc=wl_resource_create(client,&wl_subcompositor_interface,1,0);assert(sc);
     struct brook_surface *r=make_surface(client),*p=make_surface(client),*c=make_surface(client);
     uint32_t vfb[12]={0};r->wm_id=1;r->vfb=vfb;r->vfb_w=4;r->vfb_h=3;r->vfb_stride=4;r->scene_disabled=1;
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/brook-retained-test",1));
     associate(client,sc,p,r);associate(client,sc,c,p);
     subsurface_set_position(client,p->subsurface_resource,1,1);
     snapshot(c,0xffff0000,1,1);snapshot(p,0xffabcdef,2,2);
     snapshot(c,0xff0000ff,1,1);snapshot(r,0xff102030,4,3);
     assert(vfb[5]==0xffff0000 && vfb[0]==0xff102030); // captured A, not newer B
+    assert(sourceBegins && sourceTags && sourceCommit==r->tree.current->commit);
     assert(c->tree.cached && ((struct brook_view *)c->tree.cached->value)->image->pixels[0]==0xff0000ff);
     snapshot(r,0xff102030,4,3);assert(vfb[5]==0xffff0000);
     surface_commit(client,p->resource);surface_commit(client,r->resource);assert(vfb[5]==0xff0000ff);
@@ -51,6 +68,7 @@ int main(void) {
     subsurface_set_desync(client,c->subsurface_resource);
     snapshot(c,0xff00ff00,1,1);assert(vfb[0]!=0xff00ff00); // inherited sync remains
     subsurface_set_desync(client,p->subsurface_resource);assert(vfb[0]==0xff00ff00);
+    assert(sourceCommit==r->tree.current->commit && sourceTags==sourceBegins);
     // Destroying a role unmaps immediately; old snapshots retain safe dead nodes.
     struct wl_resource *role=c->subsurface_resource;wl_resource_destroy(role);assert(vfb[0]==0xff102030 && c->role==2);
     associate(client,sc,c,p);snapshot(c,0xff0000ff,1,1);surface_commit(client,p->resource);
@@ -60,5 +78,6 @@ int main(void) {
     role=p->subsurface_resource;surface_destroy(client,r->resource);
     assert(!p->tree.parent && !p->subsurface_parent);wl_resource_destroy(role);surface_destroy(client,p->resource);
     assert(!g_surfaces);wl_client_destroy(client);wl_display_destroy(display);close(sockets[1]);
+    unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     puts("RETAINED_SURFACE_PASS exact A/B dependencies, parent stacking/position, alpha, inherited desync, NULL mapping, detach/deep lifetime");
 }

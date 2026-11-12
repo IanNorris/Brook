@@ -14,7 +14,7 @@ struct Writer {
     bool write(uint32_t sector,const uint8_t* in) {std::memcpy(disk.data()+sector*PanicJournalSector,in,PanicJournalSector);return true;}
     bool flush() {return true;}
 };
-void reset() {attempted=false;ready=false;snapshot={};present=true;owned=true;isDirectory=false;size=disk.size();reads=releases=failRead=0;}
+void reset() {attempted=false;ready=false;previousReady=false;snapshot={};previousSnapshot={};present=true;owned=true;isDirectory=false;size=disk.size();reads=releases=failRead=0;}
 }
 extern "C" Vnode* VfsOpen(const char* path,int flags) {assert(!std::strcmp(path,"/media/system/PANIC.BIN") && flags==VFS_O_STREAM);return present?&file:nullptr;}
 void VfsRelease(Vnode* node) {assert(node==&file);++releases;}
@@ -41,4 +41,10 @@ int main() {
     assert(!std::memcmp(out.data,contents,sizeof(contents)) && out.crc==PanicJournalCrc(contents,sizeof(contents)));
     const unsigned before=reads;disk[PanicJournalSector]^=1;PanicNormalSnapshotLoad();
     assert(reads==before && GuardRecoveryPanicSnapshot(out) && !std::memcmp(out.data,contents,sizeof(contents)));
+    disk[PanicJournalSector]^=1;
+    const uint8_t newer[]={'n','e','w'};
+    assert(PanicJournalWrite(writer,newer,sizeof(newer))==PanicJournalResult::Ok);
+    reset();PanicNormalSnapshotLoad();
+    assert(GuardRecoveryPanicSnapshot(out) && out.sequence==2 && !std::memcmp(out.data,newer,sizeof(newer)));
+    assert(GuardRecoveryPanicPreviousSnapshot(out) && out.sequence==1 && !std::memcmp(out.data,contents,sizeof(contents)));
 }

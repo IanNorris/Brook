@@ -394,7 +394,7 @@ static void KernelConsoleThread(void* /*arg*/)
             KMutexLock(&self->framebufferLock);
             self->fbVfbWidth=width;self->fbVfbHeight=height;self->fbVfbStride=width;
             KMutexUnlock(&self->framebufferLock);
-            __atomic_store_n(&self->fbDirty, 1u, __ATOMIC_RELEASE);
+            ProcessFramebufferMarkDirty(self);
             CompositorWake();
         }
 

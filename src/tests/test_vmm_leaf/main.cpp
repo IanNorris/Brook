@@ -1256,6 +1256,9 @@ static void graphicsBufferMappings() {
     failHeapAfter=1;CHECK(!UserMappingBufferSnapshot(kernelBase,3*pageSize));
     for (auto page:pages) CHECK(PmmGetRefCount(page)==1);
     auto* descriptor=UserMappingBufferSnapshot(kernelBase,3*pageSize);CHECK(descriptor);
+    auto* first=reinterpret_cast<unsigned char*>(pages[0].raw());
+    auto* second=reinterpret_cast<unsigned char*>(pages[1].raw());
+    first[pageSize-2]=0x12;first[pageSize-1]=0x34;second[0]=0x56;second[1]=0x78;
     auto* space=AddressSpaceCreate(40);auto* child=AddressSpaceCreate(41);CHECK(space&&child);
     Process actor{};actor.addressSpace=space;KMutexInit(&actor.framebufferLock);
     UserFramebufferPublish(&actor,descriptor,reinterpret_cast<uint32_t*>(kernelBase),3*pageSize,64,48,64);
@@ -1277,6 +1280,13 @@ static void graphicsBufferMappings() {
         auto detached=VmmDetachPage(KernelPageTable,VirtualAddress(kernelBase+i*pageSize));
         CHECK(VmmLeafPhysical(detached)==pages[i]);PmmUnrefPage(pages[i]);
     }
+    unsigned char copied[4]{};
+    CHECK(UserMappingBufferRead(captured,pageSize-2,copied,sizeof(copied)));
+    CHECK(copied[0]==0x12 && copied[1]==0x34 && copied[2]==0x56 && copied[3]==0x78);
+    CHECK(!UserMappingBufferRead(captured,3*pageSize-1,copied,sizeof(copied)));
+    CHECK(!UserMappingBufferRead(captured,~uint64_t{0},copied,1));
+    CHECK(!UserMappingBufferRead(captured,0,nullptr,1));
+    CHECK(UserMappingBufferRead(captured,3*pageSize,nullptr,0));
     // Preparation after source unpublication and kernel VA removal uses only
     // retained physical snapshot pages, including a nonzero buffer offset.
     UserMappingRequest slice{};slice.range=rangeRecord(0,pageSize,nullptr,1,3);

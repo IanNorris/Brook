@@ -26,6 +26,13 @@ SDL3 application. The optional settings file reports the actual getter's
 minimum/maximum over recorded swaps; a saved game cvar alone does not prove
 that API state. Missing getters or zero queries do not establish VSync state.
 
+For a bounded restart experiment, `BROOK_SWAP_MARKER_SIGNAL=1` installs a
+SIGUSR2 handler in the traced process. Sending SIGUSR2 records the end timestamp
+of the first swap completed after the signal is observed, as a comment in the
+swap CSV. Subsequent recorded completions establish client progress, not
+presentation or scanout. The option reserves SIGUSR2 for the probe and should
+only be used when the application does not need that signal.
+
 The DRM probe groups `drmIoctl` calls by thread, request number and phase:
 
 - `0`: unscoped, including startup, skipped swaps and non-swap threads.

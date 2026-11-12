@@ -1,4 +1,7 @@
 #include "panic_test_reset.h"
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+#include "ahci_readonly.h"
+#endif
 #include "panic_stack.h"
 #include "idt.h"
 #include "gdt.h"
@@ -340,6 +343,10 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(" — halting ===\n");
         ExcPutsRaw("  RIP   "); ExcPutHex(frame->ip); ExcPutsRaw("\n");
         ExcPutsRaw("  RSP   "); ExcPutHex(frame->sp); ExcPutsRaw("\n");
+        if (brook::SmpIsPanicHaltOwner()) {
+            ExcPutsRaw("PANIC_OWNER_EXCEPTION\n");
+            brook::PanicTestResetAfterDump();
+        }
         for (;;) __asm__ volatile("cli; hlt");
     }
     ++excDepthPerCpu[cpuSlot];
@@ -352,6 +359,10 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // it arrived), this guard catches us.
     if (brook::SmpIsPanicActive())
     {
+        if (brook::SmpIsPanicHaltOwner()) {
+            ExcPutsRaw("PANIC_OWNER_EXCEPTION\n");
+            brook::PanicTestResetAfterDump();
+        }
         for (;;) __asm__ volatile("cli; hlt");
     }
 
@@ -914,6 +925,10 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
     // HandleException where the main guard lives).
     if (brook::SmpIsPanicActive())
     {
+        if (brook::SmpIsPanicHaltOwner()) {
+            ExcPutsRaw("PANIC_OWNER_EXCEPTION\n");
+            brook::PanicTestResetAfterDump();
+        }
         for (;;) __asm__ volatile("cli; hlt");
     }
 
@@ -1067,6 +1082,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
             ExcPutsRaw(") - likely corrupted return/indirect branch target\n");
         }
 
+        // Reserve while a peer can finish normal I/O. A reserved-bit page
+        // fault intentionally avoids journal I/O on possibly corrupt tables.
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+        if(vector!=14 || !(ef->errorCode&8))brook::AhciPanicReserveBeforeHalt();
+#endif
         // Halt all other CPUs and stop the compositor before rendering
         // the panic screen — otherwise the compositor will overwrite it.
         brook::SmpHaltAllAPs();

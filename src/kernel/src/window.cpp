@@ -78,6 +78,20 @@ static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
 static void FocusWindowLocked(int idx);
 
 static uint32_t g_themeId = BROOK_THEME_BROOK;
+// Protected by g_vfbLock. Never reuse an epoch after counter exhaustion.
+static uint64_t g_chromeSettingsEpoch=1;
+// Writers hold g_vfbLock; lock-free readers use this as a sequence counter.
+static uint64_t g_backdropStyleSequence=2;
+uint64_t WmBackdropStyleVersion(){return __atomic_load_n(&g_backdropStyleSequence,__ATOMIC_ACQUIRE);}
+static void BeginBackdropStyleChange(){
+    const uint64_t value=WmBackdropStyleVersion();
+    if(value && value<~uint64_t{0}-1)
+        __atomic_add_fetch(&g_backdropStyleSequence,1,__ATOMIC_ACQ_REL);
+    else __atomic_store_n(&g_backdropStyleSequence,0,__ATOMIC_RELEASE);
+}
+static void EndBackdropStyleChange(){
+    if(WmBackdropStyleVersion())__atomic_add_fetch(&g_backdropStyleSequence,1,__ATOMIC_RELEASE);
+}
 static bool g_themeSettingsLoaded = false;
 static uint32_t g_appearance = BROOK_APPEARANCE_DEFAULT;
 static uint32_t g_taskbarMetrics = BROOK_TASKBAR_DEFAULT;
@@ -90,10 +104,14 @@ bool WmSetTaskbarMetrics(uint32_t value){
 uint32_t WmGetAppearance(){return __atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE);}
 bool WmSetAppearance(uint32_t value){
     if(!brook_appearance_valid(value))return false;
+    VfbGuard guard;
+    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
     __atomic_store_n(&g_appearance,value,__ATOMIC_RELEASE);
     CompositorMarkDirty();CompositorWake();return true;
 }
 void WmSetPerformanceMode(bool enabled){
+    VfbGuard guard;
+    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
     if(enabled)__atomic_fetch_or(&g_appearance,uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
     else __atomic_fetch_and(&g_appearance,~uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
     CompositorMarkDirty();CompositorWake();
@@ -103,6 +121,8 @@ const WmPalette& WmCurrentPalette() { return *brook_theme_palette(WmGetTheme());
 bool WmSetTheme(uint32_t theme)
 {
     if (!brook_theme_palette(theme)) return false;
+    VfbGuard guard;
+    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
     __atomic_store_n(&g_themeId, theme, __ATOMIC_RELEASE);
     CompositorMarkDirty();
     CompositorWake();
@@ -364,6 +384,8 @@ static LauncherSnapshot* g_launcherActive = &g_emptyLauncher;
 static LauncherSnapshot* g_launcherPending = nullptr;
 static LauncherSnapshot* g_launcherRetired = nullptr;
 static SpinLock g_launcherLock;
+// Zero means exhausted; it is never reused for a later icon catalog.
+static uint64_t g_launcherSnapshotEpoch=1;
 static uint32_t g_launcherRequested = 1;
 static bool g_launcherWorkerStarted = false;
 static bool g_launcherLoaded = false;
@@ -489,6 +511,7 @@ void WmRequestLauncherRefresh()
 
 bool WmLauncherApplyPending()
 {
+    VfbGuard windows;
     SpinLockAcquire(&g_launcherLock);
     if (!g_launcherPending || g_launcherRetired) {
         SpinLockRelease(&g_launcherLock);
@@ -496,6 +519,7 @@ bool WmLauncherApplyPending()
     }
     LauncherSnapshot* previous = g_launcherActive;
     g_launcherActive = g_launcherPending;
+    if(g_launcherSnapshotEpoch)++g_launcherSnapshotEpoch;
     g_launcherPending = nullptr;
     if (previous != &g_emptyLauncher) g_launcherRetired = previous;
     const uint32_t count = g_launcherActive->count;
@@ -765,11 +789,11 @@ void WmInit()
 
 bool WmIsActive()
 {
-    return g_wmActive;
+    return __atomic_load_n(&g_wmActive,__ATOMIC_ACQUIRE);
 }
 
 static void SetWmActiveLocked(bool active) {
-    g_wmActive=active;
+    if(g_wmActive!=active){BeginBackdropStyleChange();__atomic_store_n(&g_wmActive,active,__ATOMIC_RELEASE);EndBackdropStyleChange();}
     if(!active)PointerCaptureReleaseLocked();
 }
 void WmSetActive(bool active)
@@ -1176,7 +1200,7 @@ void WmSetClientSideDecoration(int idx, bool enable)
 // selects which fields to apply: bit 0 = opacity, bit 1 = blurRadius. Marks the
 // compositor dirty so the change is composited next frame. The GPU DRAW path
 // reads w.opacity (and, for frosted glass, w.blurRadius).
-void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius)
+static void SetWindowPropertiesLocked(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
@@ -1187,6 +1211,25 @@ void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blur
     if (!changed) return;
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
+}
+
+void WmToggleFocusedWindowGlass()
+{
+    VfbGuard guard;
+    const int idx=g_focusedIdx;
+    if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS) || !g_windows[idx].proc || !g_windows[idx].focused)return;
+    const bool glassOn=g_windows[idx].blurRadius==0;
+    SetWindowPropertiesLocked(idx,WM_PROP_OPACITY|WM_PROP_BLUR,
+                              glassOn?WM_GLASS_OPACITY:255,glassOn?WM_GLASS_BLUR:0);
+}
+
+bool WmSetOwnedWindowProperties(Process* proc, uint32_t wmId, uint32_t mask,
+                                uint8_t opacity, uint8_t blurRadius)
+{
+    VfbGuard guard;
+    if (!WmFindWindowById(proc, wmId)) return false;
+    SetWindowPropertiesLocked(static_cast<int>(wmId) - 1, mask, opacity, blurRadius);
+    return true;
 }
 
 uint32_t WmWindowCount()
@@ -1417,7 +1460,10 @@ bool WmApplyScalePending()
         }
         w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
     }
+    BeginBackdropStyleChange();
     __atomic_store_n(&g_desktopMetrics,next,__ATOMIC_RELEASE);
+    EndBackdropStyleChange();
+    if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
     g_launcherScroll=0;
     CompositorMarkDirty();
     SerialPrintf("WM: desktop scale applied %u%%\n",next->percent);
@@ -1994,7 +2040,7 @@ void WmSpawnTerminal()
         t->child->fbDestX = winX + static_cast<int16_t>(WmMetric(WM_BORDER_WIDTH));
         t->child->fbDestY = winY + static_cast<int16_t>(WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH));
         t->child->fbScale = 1;
-        t->child->fbDirty = 1;
+        ProcessFramebufferMarkDirty(t->child);
 
         WmCreateWindow(t->child, winX, winY,
                        static_cast<uint16_t>(clientW),
@@ -2473,9 +2519,12 @@ void WmLauncherLoad()
     {
         // Initial activation precedes rendering; later publication belongs
         // exclusively to the compositor's frame-boundary hook.
-        SpinLockAcquire(&g_launcherLock);
-        g_launcherActive = snapshot;
-        SpinLockRelease(&g_launcherLock);
+        { VfbGuard windows;
+          SpinLockAcquire(&g_launcherLock);
+          g_launcherActive = snapshot;
+          if(g_launcherSnapshotEpoch)++g_launcherSnapshotEpoch;
+          SpinLockRelease(&g_launcherLock);
+        }
         SerialPrintf("WM: launcher initial generation=%u items=%u\n", generation, snapshot->count);
     }
     g_launcherLoaded = true;
@@ -2851,6 +2900,14 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId)
     return &w;
 }
 
+bool WmGpuSourceProviderMatches(uint32_t window,uint64_t incarnation,uint32_t pid,uint64_t providerIncarnation)
+{
+    if(!window || window>WM_MAX_WINDOWS || !incarnation || !pid || !providerIncarnation)return false;
+    VfbGuard guard;const Window& w=g_windows[window-1];
+    return w.proc && w.wmId==window && w.creationIdentity==incarnation && (w.proc->tgid?w.proc->tgid:w.proc->pid)==pid &&
+        (w.proc->isThread?w.proc->leaderIncarnation:w.proc->incarnation)==providerIncarnation;
+}
+
 int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
                                uint64_t expectedIncarnation, BrookWindowState* out)
 {
@@ -3054,6 +3111,206 @@ bool WmSnapshotVfb(const Window* window,uint32_t** pixels,uint32_t* stride,uint6
     return *pixels && *stride && *bytes;
 }
 
+// g_vfbLock covers the ordered metadata and pin acquisition. The renderer
+// never receives w.vfb: its old kernel virtual address can be retired after
+// resize even while the backing's physical pages remain retained.
+static bool DesktopLayerLocked(const Window& w,WmDesktopLayer& out,bool retain) {
+    if(!w.proc || !w.visible || w.minimized || w.externalCaptured ||
+       w.publicationGeneration==~uint64_t{0} || !w.creationIdentity || !w.wmId || !w.upscale)return false;
+    MappingBacking* backing=nullptr;uint64_t generation=0,bytes=0;
+    uint32_t width=0,height=0,stride=0;bool legacy=!w.vfb;
+    if(!legacy){
+        backing=w.vfbBacking;generation=w.publishedGeneration;bytes=w.vfbBytes;
+        width=w.vfbWidth;height=w.vfbHeight;stride=w.vfbStride;
+        if(!backing || !width || !height || stride<width ||
+           uint64_t(stride)>~uint64_t{0}/4/height || uint64_t(stride)*height*4>bytes)return false;
+        if(retain)MappingBackingRef(backing);
+    }else{
+        auto* proc=w.proc;KMutexLock(&proc->framebufferLock);
+        backing=proc->fbBacking;generation=__atomic_load_n(&proc->fbPublicationGeneration,__ATOMIC_ACQUIRE);
+        bytes=proc->fbVirtualSize;width=proc->fbVfbWidth;height=proc->fbVfbHeight;stride=proc->fbVfbStride;
+        const bool valid=backing && proc->fbVirtual && generation!=~uint64_t{0} && width && height && stride>=width &&
+            uint64_t(stride)<=~uint64_t{0}/4/height && uint64_t(stride)*height*4<=bytes;
+        if(valid && retain)MappingBackingRef(backing);
+        KMutexUnlock(&proc->framebufferLock);if(!valid)return false;
+    }
+    out={backing,w.creationIdentity,generation,bytes,w.wmId,width,height,stride,w.clientW,w.clientH,
+         w.clientX(),w.clientY(),w.upscale,uint8_t(legacy),0,0,0,0,0,{}, {},0,0,0,0,0,0};
+    out.focused=w.focused;out.noChrome=w.noChrome;out.state=uint8_t(w.state);
+    out.opacity=w.opacity;out.blurRadius=w.blurRadius;
+    __builtin_memcpy(out.title,w.title,sizeof(out.title));__builtin_memcpy(out.appId,w.appId,sizeof(out.appId));
+    out.ownerPid=w.proc->pid;out.ownerIncarnation=w.proc->incarnation;
+    return true;
+}
+bool WmAcquireDesktopLayers(WmDesktopLayers* out) {
+    if(!out)return false;
+    *out={};bool success=true;
+    { VfbGuard guard;int sorted[WM_MAX_WINDOWS];const uint32_t count=WmGetZOrder(sorted,WM_MAX_WINDOWS);
+      out->theme=WmGetTheme();out->appearance=WmGetAppearance();out->scale=WmGetAppliedScale();out->settingsGeneration=g_chromeSettingsEpoch;
+      SpinLockAcquire(&g_launcherLock);out->launcherGeneration=g_launcherSnapshotEpoch;SpinLockRelease(&g_launcherLock);
+      if(!out->launcherGeneration || !out->settingsGeneration)success=false;
+      for(uint32_t i=0;success && i<count;++i){
+          if(!DesktopLayerLocked(g_windows[sorted[i]],out->layers[i],true)){success=false;break;}
+          ++out->count;
+      }
+    }
+    if(success && ((ApicTickCount()/500)&1)==0){
+        for(uint32_t i=0;i<out->count;++i){auto& layer=out->layers[i];TerminalCaret caret{};
+            if(!TerminalSnapshotCaret(layer.ownerPid,layer.ownerIncarnation,&caret))continue;
+            // Inversion before alpha compositing is only equivalent for opaque legacy buffers.
+            if(!layer.legacyOpaque){success=false;break;}
+            layer.caretX=caret.x;layer.caretY=caret.y;layer.caretWidth=caret.width;layer.caretHeight=caret.height;
+        }
+    }
+    if(!success)WmReleaseDesktopLayers(out);
+    return success;
+}
+bool WmRetainDesktopLayers(const WmDesktopLayers& source,WmDesktopLayers* out) {
+    if(!out || out==&source || source.count>WM_MAX_WINDOWS)return false;
+    VfbGuard guard;
+    for(uint32_t i=0;i<source.count;++i)if(!source.layers[i].backing)return false;
+    *out=source;
+    for(uint32_t i=0;i<source.count;++i)MappingBackingRef(source.layers[i].backing);
+    return true;
+}
+static bool DesktopLayersCurrentLocked(const WmDesktopLayers& layers,bool visual=true) {
+    if(layers.count>WM_MAX_WINDOWS)return false;
+    if(!layers.settingsGeneration || layers.settingsGeneration!=g_chromeSettingsEpoch || layers.theme!=WmGetTheme() ||
+       layers.appearance!=WmGetAppearance() || layers.scale!=WmGetAppliedScale())return false;
+    SpinLockAcquire(&g_launcherLock);const auto launcherGeneration=g_launcherSnapshotEpoch;SpinLockRelease(&g_launcherLock);
+    if(layers.launcherGeneration!=launcherGeneration)return false;
+    int sorted[WM_MAX_WINDOWS];
+    const uint32_t count=WmGetZOrder(sorted,WM_MAX_WINDOWS);
+    if(count!=layers.count)return false;
+    for(uint32_t i=0;i<count;++i){
+        WmDesktopLayer now{};const auto& old=layers.layers[i];
+        if(!DesktopLayerLocked(g_windows[sorted[i]],now,false) ||
+           now.backing!=old.backing || now.incarnation!=old.incarnation || now.generation!=old.generation ||
+           now.bytes!=old.bytes || now.window!=old.window || now.width!=old.width || now.height!=old.height ||
+           now.stride!=old.stride || now.clientWidth!=old.clientWidth || now.clientHeight!=old.clientHeight ||
+           now.clientX!=old.clientX || now.clientY!=old.clientY || now.upscale!=old.upscale ||
+           now.legacyOpaque!=old.legacyOpaque || (visual && now.focused!=old.focused) || now.noChrome!=old.noChrome ||
+           now.state!=old.state || now.opacity!=old.opacity || now.blurRadius!=old.blurRadius)return false;
+        if(visual){
+            for(uint32_t j=0;j<sizeof(now.title);++j)if(now.title[j]!=old.title[j])return false;
+            for(uint32_t j=0;j<sizeof(now.appId);++j)if(now.appId[j]!=old.appId[j])return false;
+        }
+    }
+    return true;
+}
+bool WmDesktopLayersCurrent(const WmDesktopLayers& layers) {
+    VfbGuard guard;return DesktopLayersCurrentLocked(layers);
+}
+bool WmDesktopLayersCaptureCurrent(const WmDesktopLayers& layers) {
+    VfbGuard guard;return DesktopLayersCurrentLocked(layers,false);
+}
+static bool DesktopLayersPresentableLocked(const WmDesktopLayers& layers) {
+    if(layers.count>WM_MAX_WINDOWS)return false;
+    int sorted[WM_MAX_WINDOWS];
+    if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return false;
+    // Compare the set of identities, not their order: raises and moves may be
+    // reflected by the next frame. Do not pair a recycled ID with old pixels.
+    for(uint32_t i=0;i<layers.count;++i){
+        const auto& old=layers.layers[i];bool found=false;
+        for(uint32_t j=0;j<layers.count;++j){
+            WmDesktopLayer now{};
+            if(!DesktopLayerLocked(g_windows[sorted[j]],now,false))return false;
+            if(now.window!=old.window || now.incarnation!=old.incarnation)continue;
+            if(now.backing!=old.backing || now.width!=old.width || now.height!=old.height ||
+               now.stride!=old.stride || now.bytes!=old.bytes || now.legacyOpaque!=old.legacyOpaque)return false;
+            found=true;break;
+        }
+        if(!found)return false;
+    }
+    return true;
+}
+int64_t WmDesktopLayersUseIfPresentable(const WmDesktopLayers& layers,void* context,int64_t (*use)(void*)) {
+    if(!use || layers.count>WM_MAX_WINDOWS)return -22;
+    VfbGuard guard;if(!DesktopLayersPresentableLocked(layers))return -116;
+    return use(context);
+}
+int64_t WmDesktopLayersUseIfBothPresentable(const WmDesktopLayers& base,const WmDesktopLayers& next,
+                                             void* context,int64_t (*use)(void*)) {
+    if(!use || base.count>WM_MAX_WINDOWS || next.count>WM_MAX_WINDOWS)return -22;
+    VfbGuard guard;
+    if(!DesktopLayersPresentableLocked(base) || !DesktopLayersPresentableLocked(next))return -116;
+    return use(context);
+}
+int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
+                               WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
+                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges) {
+    if(!info || index>=layers.count || layers.count>WM_MAX_WINDOWS)return -22;
+    Window local{};uint32_t width=0,height=0;int16_t originX=0,originY=0;
+    {
+        VfbGuard guard;
+        if(!DesktopLayersCurrentLocked(layers,!tolerateVisualChanges))return -116;
+        if(!g_wmActive || CompositorGlassActive())return -95;
+        int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
+        const Window& source=g_windows[sorted[index]];
+        if(source.noChrome){*info={source.x,source.y,0,0};return 0;}
+        width=source.outerWidth();height=source.outerHeight();
+        if(!width || !height || uint64_t(width)*height>64ull*1024*1024/4)return -7;
+        *info={source.x,source.y,width,height};
+        if(!pixels)return 0;
+        if(capacity<uint64_t(width)*height*4)return -22;
+        local=source;originX=source.x;originY=source.y;ProcessRef(local.proc);
+    }
+    const uint64_t bytes=uint64_t(width)*height*4;
+    __builtin_memset(pixels,0,bytes);
+    local.x=0;local.y=0;
+    auto relative=[](int32_t value,int16_t origin){
+        const int64_t n=int64_t(value)-origin;
+        return n<(-2147483647ll-1)?int32_t(-2147483647-1):n>2147483647ll?int32_t(2147483647):int32_t(n);
+    };
+    const bool noMouse=mouseX==-1 && mouseY==-1;
+    RenderWindowChrome(pixels,width,width,height,local,noMouse?-1:relative(mouseX,originX),noMouse?-1:relative(mouseY,originY));
+    const int cx=local.clientX(),cy=local.clientY();
+    // The client interior remains transparent. Mark only the chrome spans;
+    // testing every interior pixel is costly for large application windows.
+    auto clip=[](int64_t v,uint32_t limit)->uint32_t {
+        return v<=0?0:v>=limit?limit:static_cast<uint32_t>(v);
+    };
+    const uint32_t left=clip(cx,width),right=clip(int64_t(cx)+local.clientW,width);
+    const uint32_t top=clip(cy,height),bottom=clip(int64_t(cy)+local.clientH,height);
+    for(uint32_t y=0;y<height;++y){
+        uint32_t* row=pixels+uint64_t(y)*width;
+        if(y<top || y>=bottom){for(uint32_t x=0;x<width;++x)row[x]|=0xff000000u;}
+        else {
+            for(uint32_t x=0;x<left;++x)row[x]|=0xff000000u;
+            for(uint32_t x=right;x<width;++x)row[x]|=0xff000000u;
+        }
+    }
+    ProcessUnref(local.proc);
+    return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
+}
+int64_t WmDesktopLayersUseIfCurrent(const WmDesktopLayers& layers,void* context,int64_t (*use)(void*)) {
+    if(!use)return -22;
+    VfbGuard guard;
+    if(!DesktopLayersCurrentLocked(layers))return -116;
+    return use(context);
+}
+bool WmCopyDesktopLayers(const WmDesktopLayers& layers,const WmDesktopLayerCopy* copies,uint32_t count) {
+    if(count!=layers.count || count>WM_MAX_WINDOWS || (count && !copies))return false;
+    for(uint32_t i=0;i<count;++i){
+        const auto& layer=layers.layers[i];
+        if(!layer.height || uint64_t(layer.stride)>~uint64_t{0}/4/layer.height)return false;
+        const uint64_t bytes=uint64_t(layer.stride)*layer.height*4;
+        if(!layer.backing || !bytes || bytes>layer.bytes || !copies[i].pixels || copies[i].capacity<bytes)return false;
+    }
+    if(!WmDesktopLayersCurrent(layers))return false;
+    for(uint32_t i=0;i<count;++i){
+        const auto& layer=layers.layers[i];
+        if(!UserMappingBufferRead(layer.backing,0,copies[i].pixels,uint64_t(layer.stride)*layer.height*4))return false;
+    }
+    return WmDesktopLayersCurrent(layers);
+}
+void WmReleaseDesktopLayers(WmDesktopLayers* layers) {
+    if(!layers)return;
+    const uint32_t count=layers->count<=WM_MAX_WINDOWS?layers->count:0;
+    for(uint32_t i=0;i<count;++i)MappingBackingUnref(layers->layers[i].backing);
+    *layers={};
+}
+
 uint64_t WmMapWindowVfb(Process* caller,uint32_t wmId) {
     if (!caller) return 0;
     VfbGuard guard;
@@ -3072,6 +3329,7 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId)
     VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w) return;
+    w->sourceWriteActive=false;
     // This syscall publishes CPU-written VFB content, including a surface
     // switching from dmabuf to SHM. Stop sampling any previous GL buffer.
     w->externalCaptured = false;
@@ -3079,6 +3337,38 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId)
     w->externalW = w->externalH = 0;
     w->vfbDirty = 1;
     CompositorWake();
+}
+
+int64_t WmBeginSourceWrite(Process* proc,uint32_t wmId,uint64_t incarnation)
+{
+    if(!proc || !wmId || !incarnation)return -22;
+    VfbGuard guard;Window* w=WmFindWindowById(proc,wmId);
+    if(!w)return -2;
+    if(w->creationIdentity!=incarnation)return -116;
+    if(w->sourceWriteActive && w->sourceWriteEpoch==w->publicationGeneration)return -16;
+    w->sourceCommitGeneration=0;w->sourceCommit=0;
+    w->sourceWriteEpoch=w->publicationGeneration;w->sourceWriteActive=true;return 0;
+}
+int64_t WmPublishSourceCommit(Process* proc,uint32_t wmId,uint64_t incarnation,uint64_t commit)
+{
+    if(!proc || !wmId || !incarnation || !commit)return -22;
+    VfbGuard guard;Window* w=WmFindWindowById(proc,wmId);
+    if(!w)return -2;
+    if(w->creationIdentity!=incarnation)return -116;
+    if(!w->sourceWriteActive || w->sourceWriteEpoch!=w->publicationGeneration){w->sourceWriteActive=false;return -116;}
+    if(!w->vfb || w->publicationGeneration>=~uint64_t{0}-1)return -75;
+    w->externalCaptured=false;w->externalW=w->externalH=0;
+    w->publishedGeneration=NextPublication(*w);
+    w->sourceCommitGeneration=w->publishedGeneration;w->sourceCommit=commit;w->sourceWriteActive=false;
+    w->vfbDirty=1;CompositorWake();return 0;
+}
+int64_t WmQuerySourceCommit(uint32_t wmId,uint64_t incarnation,uint64_t generation,uint64_t* commit)
+{
+    if(!wmId || wmId>WM_MAX_WINDOWS || !incarnation || !generation || !commit)return -22;
+    VfbGuard guard;const Window& w=g_windows[wmId-1];
+    if(!w.proc || w.wmId!=wmId || w.creationIdentity!=incarnation || w.externalCaptured ||
+       w.publishedGeneration!=generation || w.sourceCommitGeneration!=generation || !w.sourceCommit)return -116;
+    *commit=w.sourceCommit;return 0;
 }
 
 bool WmReserveCapture(Process* proc,uint32_t wmId,uint32_t width,uint32_t height,WmCaptureToken* out)

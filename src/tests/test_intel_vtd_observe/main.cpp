@@ -8,15 +8,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 using namespace brook;
-static int scenario;static unsigned reads;static Vnode marker;
+static int scenario;static unsigned reads;static Vnode marker;static bool armed;
 namespace brook {
 extern "C" void SerialPrintf(const char*,...){}
 extern "C" void SerialPuts(const char*){}
 extern "C" Vnode* VfsOpen(const char* p,int){return !std::strcmp(p,"/etc/dell-gpu-vtd-probe")?&marker:nullptr;}
 void VfsRelease(Vnode*){}
 int VfsStat(Vnode*,VnodeStat* s){*s={};s->size=scenario==1?3:2;return 0;}
-extern "C" int VfsRead(Vnode*,void* out,uint64_t n,uint64_t*){if(n!=2)return -1;std::memcpy(out,"1\n",2);return 2;}
-uint32_t SmpCurrentCpuIndex(){return scenario==6?1:0;}
+extern "C" int VfsRead(Vnode*,void* out,uint64_t n,uint64_t*){if(n!=2)return -1;std::memcpy(out,scenario>=14?"2\n":"1\n",2);return 2;}
+uint32_t SmpCurrentCpuIndex(){return scenario==6 || scenario==15?1:0;}
+bool PanicRecoveryResetArmed(){return armed;}
 bool AcpiUniqueDmarCopy(void* out,uint32_t capacity,uint32_t& size){size=0;if(scenario==2 || scenario==12 || capacity<sizeof(dellDmarFixture))return false;std::memcpy(out,dellDmarFixture,sizeof(dellDmarFixture));size=sizeof(dellDmarFixture);return true;}
 uint32_t PciBootInventoryCount(){return 16;}
 uint32_t PciBootInventorySeen(){return scenario==4 || scenario==13?17:16;}
@@ -31,9 +32,18 @@ bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
 bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassification& c){
     assert(address==DellGpuVtdPage && bytes==4096);c={scenario==8?3u:scenario==9?16u:scenario>=10?0u:2u,scenario==5 || scenario>=10};return scenario!=11;
 }
-bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& s){++reads;if(scenario==7)return false;s={0x10,0};return true;}
+bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& s){++reads;if(scenario==7 || scenario==16)return false;s={0x10,0};return true;}
 }
 static void run(int n){scenario=n;DellGpuVtdObserveConfigure();const auto& r=DellGpuVtdObserveRead();
+    if(n>=14){
+        assert(r.requested && r.deferred && !r.deferredAttempted && !reads);
+        assert(!DellGpuVtdObserveDeferred() && !reads);
+        armed=true;
+        assert(DellGpuVtdObserveDeferred()==(n!=16));
+        assert(r.deferredAttempted && r.sampled==(n!=16) && reads==1);
+        assert(!DellGpuVtdObserveDeferred() && reads==1);
+        return;
+    }
     if(n==0 || n==9 || n==10){assert(r.requested && r.topology && r.inventory && r.bootMap && r.sampled && reads==1 && r.status.version==0x10);}
     else {assert(!r.sampled && reads==(n==7?1u:0u));}
     if(n==5)assert(r.bootMapClassified && r.bootMapUnreported && r.bootMapTypes==2);
@@ -41,4 +51,4 @@ static void run(int n){scenario=n;DellGpuVtdObserveConfigure();const auto& r=Del
     if(n==10)assert(r.auditedDmarHole);
     DellGpuVtdObserveConfigure();assert(reads==(n==0 || n==7 || n==9 || n==10?1u:0u));
 }
-int main(){for(int n=0;n<=13;++n){pid_t p=fork();assert(p>=0);if(!p){run(n);_exit(0);}int status=0;assert(waitpid(p,&status,0)==p && WIFEXITED(status) && WEXITSTATUS(status)==0);}}
+int main(){for(int n=0;n<=16;++n){pid_t p=fork();assert(p>=0);if(!p){run(n);_exit(0);}int status=0;assert(waitpid(p,&status,0)==p && WIFEXITED(status) && WEXITSTATUS(status)==0);}}

@@ -2662,9 +2662,13 @@ Quake/STK GPU resource-lifetime investigation.
 The later opt-in `BROOK_SCHED_START_TEST_HOOKS` kernel closes the ordinary-boot
 coverage gap for suspended user/kernel tasks, a fresh kernel thread and idle.
 It holds AP1/AP2 at first selection until a previously suspended user/kernel
-task is eligible, explicitly reserves a fresh thread for AP3, and selects idle
-on AP4. Kernel-thread affinity is normally ignored, so the fixture reservation
-is enforced separately in the test-only picker and cleared before fixture exit.
+task is eligible, pins a fresh thread to AP3, and selects idle on AP4. At the
+time of the historical run below kernel-thread affinity was ignored, so the
+fixture also enforced that reservation in its test-only picker. Current source
+honors explicit kernel-thread affinity and uses the production eligibility
+check for this pin. An eight-CPU KVM test with a controlled CPU-bound user
+process subsequently passed all four cases and the exact-ELF mutation audit at
+`build/workloads/affinity-smp-busy-20261106/audit.json`.
 The initial test boot happened to pass but review found that reservation race;
 its evidence is retained as preliminary, and the corrected run is authoritative.
 

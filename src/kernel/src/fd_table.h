@@ -60,6 +60,9 @@ enum class FdType : uint8_t
     NetlinkSocket, // AF_NETLINK read-only NETLINK_ROUTE datagram endpoint
     DebugConsole,  // Explicit diagnostic text output to serial + kernel log pane
     BlockDevice,   // Explicitly admitted maintenance-mode block device
+    DevIntelDri,   // Intel render file; not published until backend admission
+    IntelPrime,    // Capability retaining one Intel GEM buffer
+    IntelSyncObj,  // Capability retaining an Intel DRM sync object
 };
 
 struct FdEntry

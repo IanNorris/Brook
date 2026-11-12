@@ -37,6 +37,61 @@ static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bot
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
+
+// Retained per-window inputs for an eventual userspace desktop renderer. This
+// is only the client-content part of the desktop; chrome, cursor and overlays
+// are separate. Backing pins pages, not the lifetime of a kernel VFB pointer.
+// Client pixels may change before the next dirty publication; callers must
+// copy or otherwise synchronize them and validate before using the result.
+struct WmDesktopLayer {
+    MappingBacking* backing;
+    uint64_t incarnation,generation,bytes;
+    uint32_t window,width,height,stride,clientWidth,clientHeight;
+    int32_t clientX,clientY;
+    uint8_t upscale,legacyOpaque;
+    uint8_t focused,noChrome,state,opacity,blurRadius;
+    char title[64],appId[128];
+    uint16_t ownerPid;uint64_t ownerIncarnation;
+    uint32_t caretX,caretY,caretWidth,caretHeight;
+};
+struct WmDesktopLayers {
+    uint32_t count,theme,appearance,scale;
+    uint64_t launcherGeneration,settingsGeneration;
+    WmDesktopLayer layers[WM_MAX_WINDOWS];
+};
+// Unsupported visible content fails the entire capture, so callers can fall
+// back to the existing compositor without silently omitting a window.
+bool WmAcquireDesktopLayers(WmDesktopLayers* out);
+// Clone an already retained snapshot; the caller serializes its lifetime and
+// releases the independent clone with WmReleaseDesktopLayers.
+bool WmRetainDesktopLayers(const WmDesktopLayers& source,WmDesktopLayers* out);
+bool WmDesktopLayersCurrent(const WmDesktopLayers& layers);
+bool WmGpuSourceProviderMatches(uint32_t window,uint64_t incarnation,uint32_t pid,uint64_t providerIncarnation);
+// Capture may tolerate changing decoration text/focus while retaining the
+// same backing publication and geometry.
+bool WmDesktopLayersCaptureCurrent(const WmDesktopLayers& layers);
+// Run a short kernel presentation operation while WM geometry/order and
+// published native-window generations remain locked. Legacy producers can
+// still write or publish independently; this is not a pixel write barrier.
+int64_t WmDesktopLayersUseIfCurrent(const WmDesktopLayers& layers,void* context,int64_t (*use)(void*));
+// Presentation may be a frame behind: retain identity/backing safety without
+// requiring newer content, geometry or appearance to stop changing.
+int64_t WmDesktopLayersUseIfPresentable(const WmDesktopLayers& layers,void* context,int64_t (*use)(void*));
+// Verify both the retained base and candidate under one WM lock, so a window
+// cannot be replaced between the two identity/backing checks.
+int64_t WmDesktopLayersUseIfBothPresentable(const WmDesktopLayers& base,const WmDesktopLayers& next,
+                                            void* context,int64_t (*use)(void*));
+struct WmDesktopLayerCopy { void* pixels; uint64_t capacity; };
+// Copy into caller-owned kernel buffers. False means discard all copies;
+// this does not prevent a client writing concurrently without publication.
+bool WmCopyDesktopLayers(const WmDesktopLayers& layers,const WmDesktopLayerCopy* copies,uint32_t count);
+void WmReleaseDesktopLayers(WmDesktopLayers* layers);
+// Offscreen opaque-chrome prototype, one independent surface per window.
+// It excludes glass effects and does not yet version theme, title or hover.
+struct WmDesktopChrome {int32_t x,y;uint32_t width,height;};
+int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
+                               WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
+                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false);
 static constexpr uint32_t WM_TASKBAR_HEIGHT   = 44;   // bottom taskbar height
 
 // Chrome layout constants
@@ -56,6 +111,9 @@ void WmSetPerformanceMode(bool enabled);
 void WmObserveDesktopTick(uint64_t now);
 using WmRect = DesktopRect;
 void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
+void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+// Even nonzero values identify a stable badge style; odd means an update is in progress.
+uint64_t WmBackdropStyleVersion();
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*);
 void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t);
 static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
@@ -119,6 +177,8 @@ struct Window
     bool externalCaptured;
     uint32_t externalW,externalH;
     uint64_t publicationGeneration,publishedGeneration;
+    uint64_t sourceCommitGeneration,sourceCommit,sourceWriteEpoch;
+    bool sourceWriteActive;
 
     // Per-window input ring (Phase B).  When the WM routes an event
     // to this window (mouse over client area, or keyboard while focused),
@@ -268,7 +328,9 @@ static constexpr uint8_t  WM_GLASS_BLUR    = 4;       // backdrop blur radius
 
 // Set per-window opacity and/or backdrop blur radius (selected by `mask`).
 // Marks the compositor dirty. The GPU DRAW path reads these per window.
-void WmSetWindowProperties(int idx, uint32_t mask, uint8_t opacity, uint8_t blurRadius);
+void WmToggleFocusedWindowGlass();
+bool WmSetOwnedWindowProperties(Process* proc, uint32_t wmId, uint32_t mask,
+                                uint8_t opacity, uint8_t blurRadius);
 
 // Move a window to a new position.
 void WmMoveWindow(int idx, int16_t newX, int16_t newY);
@@ -351,6 +413,9 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);
+int64_t WmPublishSourceCommit(Process* proc,uint32_t wmId,uint64_t incarnation,uint64_t commit);
+int64_t WmQuerySourceCommit(uint32_t wmId,uint64_t incarnation,uint64_t generation,uint64_t* commit);
+int64_t WmBeginSourceWrite(Process* proc,uint32_t wmId,uint64_t incarnation);
 // Reserve an incarnation/generation identity for publication after GPU completion.
 struct WmCaptureToken {
     uint32_t wmId,w,h;

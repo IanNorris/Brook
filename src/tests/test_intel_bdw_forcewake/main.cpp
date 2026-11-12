@@ -6,6 +6,8 @@ struct Fake {
     bool badClock=false,allOnes=false,badPoll=false,late=false,reverse=false,pendingSet=false,appliedSet=false,changingContext=false,pendingContext=false,listMode=false,validRing=false,stoppedRing=false;uint64_t time=0;unsigned clocks=0;
     unsigned writes=0,samples=0,ackReads=0,contextReads=0;uint32_t commands[2]{};
     bool owned(){return owner;}
+    bool invalidateTlb(){return false;}
+    bool resetBcs(){return false;}
     bool read(uint32_t reg,uint32_t& v){
         if(reg==0x130044){++ackReads;v=(allOnes || (badPoll && writes==1))?0xffffffffu:(writes==0?(ackInitial?1:0):writes==1?(!failAcquire && !failSet?1:0):(failRelease?1:0));return true;}
         if(reg==0x13805c){v=failThread?1:0;return true;}

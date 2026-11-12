@@ -1,0 +1,72 @@
+#version 450
+// All offsets and bounds are validated by the host before dispatch. One
+// invocation owns one destination pixel; the destination never aliases inputs.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Scene { uint words[]; } scene;
+#ifdef BROOK_MULTI_SOURCE
+layout(set = 0, binding = 1, std430) readonly buffer Source { uint words[]; } sourceBuffer[64];
+#elif defined(BROOK_EXTERNAL_SOURCE)
+layout(set = 0, binding = 1, std430) readonly buffer Source { uint words[]; } sourceBuffer;
+#endif
+#ifdef BROOK_EXTERNAL_OUTPUT
+layout(set = 0, binding = 2, std430) writeonly buffer Output { uint words[]; } outputBuffer;
+layout(push_constant) uniform Tile { uint base; } tile;
+#endif
+
+uint scale8(uint x, uint factor) { return (x * factor + 127u) / 255u; }
+uvec4 unpack_bgra(uint p) {
+    return uvec4(p & 255u, (p >> 8) & 255u, (p >> 16) & 255u, p >> 24);
+}
+uint pack_bgra(uvec4 p) { return p.x | (p.y << 8) | (p.z << 16) | (p.w << 24); }
+
+void main() {
+#ifdef BROOK_EXTERNAL_OUTPUT
+    uint base=tile.base;
+#else
+    uint base=0u;
+#endif
+    uint width=scene.words[base], height=scene.words[base+1u], count=scene.words[base+2u];
+    uint pixel=gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
+    if(pixel >= width*height) return;
+    int x=int(pixel%width), y=int(pixel/width);
+    uvec4 dst=uvec4(0u);
+    for(uint i=0u;i<count;++i) {
+        uint b=base+4u+i*17u;
+        int dx=int(scene.words[b+8u]),dy=int(scene.words[b+9u]);
+        int cx=int(scene.words[b+12u]),cy=int(scene.words[b+13u]);
+        uint dw=scene.words[b+10u],dh=scene.words[b+11u];
+        uint cw=scene.words[b+14u],ch=scene.words[b+15u];
+        if(x<dx || y<dy || x>=dx+int(dw) || y>=dy+int(dh) ||
+           x<cx || y<cy || x>=cx+int(cw) || y>=cy+int(ch)) continue;
+        uint sx=scene.words[b+4u]+(2u*uint(x-dx)+1u)*scene.words[b+6u]/(2u*dw);
+        uint sy=scene.words[b+5u]+(2u*uint(y-dy)+1u)*scene.words[b+7u]/(2u*dh);
+        uint source=scene.words[b]+sy*scene.words[b+1u]+sx;
+#ifdef BROOK_MULTI_SOURCE
+        uvec4 s=unpack_bgra(sourceBuffer[i].words[source]);
+#elif defined(BROOK_EXTERNAL_SOURCE)
+        uvec4 s=unpack_bgra(sourceBuffer.words[source]);
+#else
+        uvec4 s=unpack_bgra(scene.words[source]);
+#endif
+        uint mode=scene.words[b+16u],opacity=mode&255u;
+        if((mode&512u)!=0u)s.w=255u;
+        if((mode&256u)!=0u) {
+            // Match the kernel's straight-alpha client blend with one final
+            // rounding step. Destination remains premultiplied.
+            uint alpha=scale8(s.w,opacity),inv=255u-alpha;
+            dst=uvec4((s.xyz*alpha+dst.xyz*inv+uvec3(127u))/255u,
+                      min(255u,alpha+scale8(dst.w,inv)));
+        } else {
+            s=uvec4(scale8(s.x,opacity),scale8(s.y,opacity),
+                    scale8(s.z,opacity),scale8(s.w,opacity));
+            uint inv=255u-s.w;
+            dst=min(uvec4(255u),s+uvec4(scale8(dst.x,inv),scale8(dst.y,inv),
+                                        scale8(dst.z,inv),scale8(dst.w,inv)));
+        }
+    }
+#ifdef BROOK_EXTERNAL_OUTPUT
+    outputBuffer.words[scene.words[base+3u]+pixel]=pack_bgra(dst);
+#else
+    scene.words[scene.words[3]+pixel]=pack_bgra(dst);
+#endif
+}

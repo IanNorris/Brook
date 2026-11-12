@@ -25,7 +25,7 @@ int VfsCanonicalDeviceAllowed(const VfsPath& root,const VfsPath& start,const cha
 // must first restrict the request to the fixed DRM devfs/sysfs path allowlist.
 // A real entry or overmount at the synthetic subtree masks the broker.
 int VfsCanonicalDrmAnchorInitialize();
-int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed);
+int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed,bool intel=false);
 // Device activation only: metadata/O_PATH, directories, /dev/shm and existing
 // device descriptors are unaffected. Called for a recognized broker device.
 int VfsPathDeviceActivation(const VfsPath& root,const char* absolute);

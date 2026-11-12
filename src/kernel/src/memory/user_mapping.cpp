@@ -176,6 +176,20 @@ MappingBacking* UserMappingBufferSnapshot(uint64_t kernelAddress,uint64_t length
     if (!descriptor) ReleaseBufferMapping(buffer);
     return descriptor;
 }
+bool UserMappingBufferRead(MappingBacking* descriptor,uint64_t offset,void* destination,uint64_t length) {
+    if(!descriptor || descriptor->release!=ReleaseBufferMapping || (!destination && length))return false;
+    const auto* buffer=static_cast<const BufferMapping*>(descriptor->object);
+    if(!buffer || buffer->pages>~uint64_t{0}/4096)return false;
+    const uint64_t bytes=buffer->pages*4096;
+    if(offset>bytes || length>bytes-offset)return false;
+    auto* out=static_cast<uint8_t*>(destination);
+    while(length){
+        const uint64_t inPage=offset&4095,chunk=(4096-inPage)<length?(4096-inPage):length;
+        const auto* source=reinterpret_cast<const uint8_t*>(PhysToVirt(buffer->frames[offset/4096].physical).raw());
+        memcpy(out,source+inPage,chunk);out+=chunk;offset+=chunk;length-=chunk;
+    }
+    return true;
+}
 static int PrepareBufferAlias(MappingTransaction& operation,const UserMappingRequest& request,void*) {
     auto* buffer=static_cast<BufferMapping*>(request.range.backing->object);
     for (uint64_t i=0;i<request.preparedPages;++i) {
@@ -209,7 +223,7 @@ void UserFramebufferPublish(Process* process,MappingBacking* descriptor,uint32_t
     KMutexLock(&process->framebufferLock);
     auto* previous=process->fbBacking;process->fbBacking=descriptor;
     process->fbVirtual=pixels;process->fbVirtualSize=bytes;
-    process->fbVfbWidth=width;process->fbVfbHeight=height;process->fbVfbStride=stride;process->fbDirty=1;
+    process->fbVfbWidth=width;process->fbVfbHeight=height;process->fbVfbStride=stride;ProcessFramebufferMarkDirty(process);
     KMutexUnlock(&process->framebufferLock);MappingBackingUnref(previous);
 }
 int64_t UserMappingBufferAlias(Process* actor,AddressSpaceState* space,MappingBacking* descriptor,uint32_t protection) {

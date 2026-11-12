@@ -5,8 +5,13 @@ static long call3(long n, long a, long b, long c) {
     return result;
 }
 __attribute__((noreturn)) void _start(void) {
+#if defined(BROOK_AHCI_CONTENTION_FIXTURE)
+    static const char path[]="/data/home/CONTEND.TXT";
+    static const char data[]="BROOK_QEMU_AHCI_CONTENTION_20261105\n";
+#else
     static const char path[]="/data/home/SERVICE.TXT";
     static const char data[]="guarded desktop service\n";
+#endif
     static const char success[]="GUARD_DESKTOP_SERVICE_PASS\n";
     static const char failure[]="GUARD_DESKTOP_SERVICE_FAIL\n";
     long fd=call3(2,(long)path,577,0644); /* O_WRONLY|O_CREAT|O_TRUNC */

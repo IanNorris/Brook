@@ -6,6 +6,11 @@ struct BdwEngineObservation {bool sampled=false,idle=false,submissionQuiescent=f
 struct BdwForcewakeResult {
     bool requested=false,acquired=false,threadReady=false,sampled=false,idle=false,submissionQuiescent=false,released=false;
     bool otherEnginesRequested=false,otherEnginesSampled=false,otherEnginesQuiescent=false;
+    bool patSampled=false;uint32_t patLo=0,patHi=0;
+    bool tlbAttempted=false,tlbComplete=false;
+    bool resetAttempted=false,resetComplete=false;
+    bool workAttempted=false,workComplete=false;
+    bool resetCsbSampled=false;uint32_t resetCsb=0;
     BdwBcsSample first{},second{};BdwEngineObservation other[3]{};
 };
 // A point-in-time sample only. The caller must separately exclude future
@@ -43,7 +48,8 @@ inline bool BdwExeclistObservationReady(const BdwEngineObservation& r,bool csbOw
 // writes, before ACK is sampled. A successful
 // release requires an ACK-clear observation; uncertain cleanup must quarantine
 // further GT use. This operation does not hand off engines or grant GGTT slots.
-template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io,bool otherEngines=false) {
+template<class Io,class Work> BdwForcewakeResult BdwObserveBcsWithWork(Io& io,Work& work,bool workRequested,
+        bool otherEngines=false,bool patRequested=false,bool tlbRequested=false,bool resetRequested=false) {
     constexpr uint32_t request=0xa188,ack=0x130044,thread=0x13805c;
     BdwForcewakeResult result{};result.otherEnginesRequested=otherEngines;uint32_t value=0;
     // ACK is always-on. REQ is not used to establish ownership: a pre-wake
@@ -72,6 +78,13 @@ template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io,bool otherEngines=fal
             const auto bcs=BdwObserveEngine(io,0x22000);
             result.first=bcs.first;result.second=bcs.second;result.sampled=bcs.sampled;
             result.idle=bcs.idle;result.submissionQuiescent=bcs.submissionQuiescent;
+            if(patRequested && bcs.sampled) {
+                uint32_t lo=0,hi=0,lo2=0,hi2=0;
+                if(io.read(0x40e0,lo) && io.read(0x40e4,hi) && io.read(0x40e0,lo2) && io.read(0x40e4,hi2) &&
+                   lo!=0xffffffffu && hi!=0xffffffffu && lo==lo2 && hi==hi2) {
+                    result.patSampled=true;result.patLo=lo;result.patHi=hi;
+                }
+            }
             if(otherEngines && bcs.sampled) {
                 // Broadwell GT2 has RCS0, VCS0 and VECS0 in addition to BCS0.
                 constexpr uint32_t bases[]={0x2000,0x12000,0x1a000};
@@ -83,11 +96,38 @@ template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io,bool otherEngines=fal
                     if(!result.other[i].sampled)break;
                 }
             }
+            if(tlbRequested && result.patSampled && result.submissionQuiescent &&
+               result.otherEnginesSampled && result.otherEnginesQuiescent) {
+                result.tlbAttempted=true;result.tlbComplete=io.invalidateTlb();
+            }
+            if(resetRequested && result.patSampled && result.submissionQuiescent &&
+               result.otherEnginesSampled && result.otherEnginesQuiescent) {
+                result.resetAttempted=true;result.resetComplete=io.resetBcs();
+                if(result.resetComplete) {
+                    uint32_t ackAfter=0,ptr=0,again=0;
+                    if(io.read(ack,ackAfter) && ackAfter!=0xffffffffu && (ackAfter&1) &&
+                       io.read(0x223a0,ptr) && ptr!=0xffffffffu && io.read(0x223a0,again) && ptr==again) {
+                        result.resetCsbSampled=true;result.resetCsb=ptr;
+                    }
+                }
+            }
+            // The callback runs before the clear, while the same forcewake
+            // ownership remains held. It must be bounded and retain its own
+            // mappings and engine/PAT ownership; observations alone are not a
+            // handoff. A failed callback is an uncertain transaction.
+            if(workRequested && !tlbRequested && !resetRequested && result.patSampled &&
+               result.submissionQuiescent && result.otherEnginesSampled && result.otherEnginesQuiescent) {
+                result.workAttempted=true;result.workComplete=work(io,result);
+            }
         }
     }
     // Even a failed write may have reached the hardware: always clear our bit.
     const bool cleared=io.write(request,0x00010000u);
     result.released=cleared && wait(ack,1,0,50);
     return result;
+}
+template<class Io> BdwForcewakeResult BdwObserveBcs(Io& io,bool otherEngines=false,bool patRequested=false,bool tlbRequested=false,bool resetRequested=false) {
+    auto none=[](Io&,const BdwForcewakeResult&){return false;};
+    return BdwObserveBcsWithWork(io,none,false,otherEngines,patRequested,tlbRequested,resetRequested);
 }
 }

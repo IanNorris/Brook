@@ -1,5 +1,22 @@
 # Brook project handover
 
+## Dell hardware baseline, 12 November
+
+The Dell XPS 13 9343 has a guarded SSD desktop and SSD/USB recovery paths.
+Generation 304 passed checked activation, partial-frame pixel checks and
+software fallback and resumption. The two-buffer Vulkan compositor and
+Broadwell blitter are enabled in this Dell image. Its 40 ms partial-frame
+grace reduced idle kernel-loop p95 from about 100 ms to 19 ms and increased
+blits from about 16 to 28 per second. The short yquake2 GL3 comparison improved
+from 2.10 to 2.75 swaps/s, so application performance remains a priority.
+
+The opt-in AC-loss shutdown performed checked finalization and left a durable
+record. A host controller test simulated the bridge outage and used the
+physical relay to verify Wake on AC. Guarded QEMU fixtures also passed panic
+snapshot retrieval and checked reset. Generation 303 is the prior Dell slot.
+For the next matched Linux and Brook capture and hardware priorities, see
+[Compositor direction](../compositor-direction.md#next-hardware-performance-pass).
+
 Continuation update, 5 November 2026: read-only onboarding and documentation installation are complete. Ian authorized physical recovery testing; keep the old chat paused and available. After a graceful restart the keyboard and touchpad failed in Brook, but both worked again after a checked shutdown and full power pull. The cause is unconfirmed. On the subsequent boot Brook reports the SSD recovery files and both loaders present, with loader/configuration hashes matching the transfer snapshot. Ian subsequently located BROOKF5.EFI in the firmware file picker, created an entry and verified an F5 recovery boot; the earlier file-picker discrepancy is resolved. The branch and other hardware observations below describe the transfer snapshot unless explicitly updated.
 
 The original Brook goal was paused at 01:19:47 UTC on 5 November 2026, and its last turn completed at 01:19:56. Ian stopped it at a safe point for transfer. [evidence/snapshot.json](/data/Programming/DSHScratch/brook-handoff/evidence/snapshot.json) records the final repository state; [evidence/final-state.json](/data/Programming/DSHScratch/brook-handoff/evidence/final-state.json) preserves final messages and completed operation results. Keep the old chat paused and available through the transition; do not archive or delete it. Physical recovery testing was later authorized; keep the old chat paused.

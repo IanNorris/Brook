@@ -12,6 +12,16 @@
 #include "../src/shared/brook_system_esp.h"
 #include "../src/shared/update/payload.h"
 
+#if defined(BROOK_MAINTENANCE_RAM_EXEC_STAGE)
+#define STAGE_EFI_NAME "BRKMODE.ELF"
+#elif defined(BROOK_EFI_GUARD_NEXT_STAGE)
+#define STAGE_EFI_NAME "BROOKV5.EFI"
+#elif defined(BROOK_EFI_GUARD_STAGE)
+#define STAGE_EFI_NAME "BROOKG2.EFI"
+#else
+#define STAGE_EFI_NAME "BROOKINV.EFI"
+#endif
+
 static int exact_read(int fd, void *data, size_t size) {
     uint8_t *p=data;
     while(size) { ssize_t n=read(fd,p,size); if(n<0&&errno==EINTR)continue; if(n<=0)return -1; p+=n; size-=(size_t)n; }
@@ -34,19 +44,21 @@ static int decode_hash(const char *text,uint8_t hash[32]) {
     }
     return 0;
 }
+#if !defined(BROOK_MAINTENANCE_RAM_EXEC_STAGE)
 static int valid_efi(const uint8_t *p,size_t size) {
     if(size<256 || p[0]!='M'||p[1]!='Z')return 0;
     uint32_t off=BrookUpdateGet32(p+0x3c);
     if(off>size-26 || memcmp(p+off,"PE\0\0",4) || p[off+4]!=0x64 || p[off+5]!=0x86)return 0;
     return p[off+24]==0x0b && p[off+25]==0x02;
 }
+#endif
 static int create_checked(int dir,const uint8_t *data,size_t size,dev_t device) {
-    int fd=openat(dir,"BROOKINV.EFI",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
+    int fd=openat(dir,STAGE_EFI_NAME,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
     if(fd<0)return -1;
     int error=exact_write(fd,data,size) || fsync(fd);
     if(close(fd))error=1;
     if(error)return -1;
-    fd=openat(dir,"BROOKINV.EFI",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    fd=openat(dir,STAGE_EFI_NAME,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
     struct stat st;uint8_t buffer[65536];size_t at=0;
     if(fd<0)return -1;
     if(fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_dev!=device||(uint64_t)st.st_size!=size)error=1;
@@ -67,7 +79,12 @@ int main(int argc,char **argv) {
     if(source<0||fstat(source,&st)||!S_ISREG(st.st_mode)||st.st_size<256||st.st_size>8*1024*1024)goto done;
     image=malloc((size_t)st.st_size);if(!image||exact_read(source,image,(size_t)st.st_size))goto done;
     BrookUpdateHash(image,(size_t)st.st_size,actual);
-    if(!BrookUpdateEqual(expected,actual,32)||!valid_efi(image,(size_t)st.st_size))goto done;
+    if(!BrookUpdateEqual(expected,actual,32))goto done;
+#if defined(BROOK_MAINTENANCE_RAM_EXEC_STAGE)
+    if (st.st_size < 64 || memcmp(image,"\177ELF\2\1\1",7) || image[18]!=62 || image[19]) goto done;
+#else
+    if(!valid_efi(image,(size_t)st.st_size))goto done;
+#endif
     root=open("/media/system",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(root<0||ioctl(root,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)||fstat(root,&rst))goto done;
     lock=open("/tmp/hardware-update.lock",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);if(lock<0)goto done;
@@ -75,7 +92,7 @@ int main(int argc,char **argv) {
     if(efi<0||ioctl(efi,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0))goto done;
     dir=openat(efi,"BOOT",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(dir<0||ioctl(dir,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0)||fstat(dir,&dst)||dst.st_dev!=rst.st_dev)goto done;
-    if(fstatat(dir,"BROOKINV.EFI",&check,AT_SYMLINK_NOFOLLOW)==0||errno!=ENOENT)goto done;
+    if(fstatat(dir,STAGE_EFI_NAME,&check,AT_SYMLINK_NOFOLLOW)==0||errno!=ENOENT)goto done;
     mutated=1;
     if(create_checked(dir,image,(size_t)st.st_size,rst.st_dev)||fsync(dir)||fsync(efi)||fsync(root))goto done;
     {

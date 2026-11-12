@@ -43,6 +43,7 @@
 #include "gpu_app.h"
 #include "desktop_gpu_environment.h"
 #include "gpu_presentation_policy.h"
+#include "intel_bdw_scanout.h"
 
 // Strace control (defined in syscall.cpp)
 bool StraceEnablePid(uint32_t pid, bool enable, uint32_t filter = 0);
@@ -218,6 +219,20 @@ static constexpr DesktopMesaPaths g_dellMesaPaths{
     "GBM_BACKENDS_PATH=/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/lib/gbm",
     "__EGL_VENDOR_LIBRARY_DIRS=/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/share/glvnd/egl_vendor.d"};
 static constexpr auto g_dellMesaEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,false,false,&g_dellMesaPaths);
+static constexpr auto g_dellVulkanEnvironment=DesktopBuildGpuEnvironment(g_defaultEnvp,false,false,&g_dellMesaPaths,
+    "VK_DRIVER_FILES=/nix/system/graphics/intel-vulkan-26.0.6-brook1/intel_hasvk.json");
+static bool DellVulkanAvailable() {
+    struct Item {const char* path;bool dir;};
+    const Item paths[]={
+        {"/nix",true},{"/nix/system",true},{"/nix/system/graphics",true},
+        {"/nix/system/graphics/intel-vulkan-26.0.6-brook1",true},
+        {"/nix/system/graphics/intel-vulkan-26.0.6-brook1/intel_hasvk.json",false},
+        {"/nix/system/graphics/intel-vulkan-26.0.6-brook1/libvulkan_intel_hasvk.so",false}};
+    for(const auto& item:paths){VnodeStat st{};
+        if(VfsLstatPath(item.path,&st) || !DesktopTrustedGpuPath(st.uid,st.mode,st.isDir,st.isSymlink,item.dir))return false;
+    }
+    return true;
+}
 static bool DellMesaAvailable() {
     const char* paths[]={
         "/nix/store/9kypdl7xqn01sis0ly591wmnsa7hm509-mesa-26.0.6/lib/dri/iris_dri.so",
@@ -233,7 +248,10 @@ static bool DellMesaAvailable() {
 }
 const char* const* ShellGetDefaultEnvp() {
     const auto* app=GpuAppGet();
-    if(!app)return DellMesaAvailable()?g_dellMesaEnvironment.entries:g_nonVirtioEnvironment.entries;
+    if(!app){
+        if(!DellMesaAvailable())return g_nonVirtioEnvironment.entries;
+        return BdwAutomaticRenderRequested() && DellVulkanAvailable()?g_dellVulkanEnvironment.entries:g_dellMesaEnvironment.entries;
+    }
     const auto caps=app && app->Capabilities?app->Capabilities():GpuAppCapabilities{};
     return GpuVulkanDirectPresentation(CompositorGpuActive(),caps,app && app->PrepareBlobImage)?
         g_directEnvironment.entries:g_stagedEnvironment.entries;
@@ -1097,7 +1115,7 @@ static int ExecCommand(int argc, const char* const* argv)
             t->child->fbDestX = winX + WmMetric(WM_BORDER_WIDTH);
             t->child->fbDestY = winY + WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH);
             t->child->fbScale = 1;
-            t->child->fbDirty = 1;
+            ProcessFramebufferMarkDirty(t->child);
 
             WmCreateWindow(t->child, winX, winY,
                           static_cast<uint16_t>(clientW),

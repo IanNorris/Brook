@@ -25,9 +25,17 @@ int main(int argc,char **argv){
  if(probe(&after,&pending,&dirty)){puts("IDLE_PROBE_FAILED");return 4;}
  printf("IDLE_BEFORE bg=%llu pending=%llu dirty=%llu\n",after,pending,dirty);
  if(!pending && !dirty){puts("IDLE_NO_PENDING_WORK");return 5;}
+#ifdef BROOK_IDLE_DIRTY_EXIT
+ puts("IDLE_DIRTY_OK");return 0;
+#endif
  sleep(8);
  if(probe(&after,&pending,&dirty)){puts("IDLE_PROBE_FAILED");return 6;}
  printf("IDLE_AFTER bg=%llu pending=%llu dirty=%llu\n",after,pending,dirty);
  if(after<=before || pending || dirty){puts("IDLE_FLUSH_FAILED");return 7;}
- puts("IDLE_FLUSH_OK");for(;;)sleep(10);
+ puts("IDLE_FLUSH_OK");
+#ifdef BROOK_IDLE_EXIT_AFTER_SUCCESS
+ return 0;
+#else
+ for(;;)sleep(10);
+#endif
 }

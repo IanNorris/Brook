@@ -14,6 +14,14 @@
 #include "../src/shared/update/payload.h"
 #include "../src/shared/update/executable.h"
 
+#if defined(BROOK_RECOVERY_STAGE_REPLACEMENT)
+#define STAGE_DIRECTORY "RECOVNEW"
+#elif defined(BROOK_RECOVERY_STAGE_ALTERNATE)
+#define STAGE_DIRECTORY "RECOV2"
+#else
+#define STAGE_DIRECTORY "RECOVERY"
+#endif
+
 static int exact_read(int fd, void *buffer, size_t size) {
     uint8_t *p=buffer;
     while(size) { ssize_t n=read(fd,p,size); if(n<0 && errno==EINTR)continue; if(n<=0)return -1; p+=n; size-=(size_t)n; }
@@ -48,8 +56,33 @@ static int marker(const char *path) {
     struct stat st;int err=fstat(fd,&st)||!S_ISREG(st.st_mode);if(close(fd))err=1;
     return err?-1:0;
 }
+static int initialize_power_record(void) {
+    static const uint8_t empty[1024];
+    int root=-1,dir=-1,lock=-1,result=1,mutated=0;
+    struct stat file;
+    root=open("/media/system",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(root<0||ioctl(root,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)||
+       marker("/etc/hardware-maintenance"))goto done;
+    lock=open("/tmp/hardware-update.lock",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+    if(lock<0)goto done;
+    dir=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0||ioctl(dir,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0)||
+       fstatat(dir,"POWER.BIN",&file,AT_SYMLINK_NOFOLLOW)==0||errno!=ENOENT)goto done;
+    mutated=1;
+    if(create_checked(dir,"POWER.BIN",empty,sizeof(empty))||fsync(dir)||fsync(root))goto done;
+    result=0;
+done:
+    if(dir>=0)close(dir);
+    if(root>=0)close(root);
+    if(lock>=0){close(lock);if((!result||!mutated) && unlink("/tmp/hardware-update.lock"))result=1;}
+    if(result)fprintf(stderr,"AC_SHUTDOWN_RECORD_INIT_FAILED mutated=%d\n",mutated);
+    else puts("AC_SHUTDOWN_RECORD_INIT_OK");
+    return result;
+}
 int main(int argc,char **argv) {
-    if(argc!=4||geteuid()!=0){fprintf(stderr,"usage: recovery-stage kernel initrd selector\n");return 2;}
+    if(geteuid()==0 && argc==2 && !strcmp(argv[1],"--init-ac-shutdown-record"))
+        return initialize_power_record();
+    if(argc!=4||geteuid()!=0){fprintf(stderr,"usage: recovery-stage kernel initrd selector | --init-ac-shutdown-record\n");return 2;}
     uint8_t *kernel=NULL,*initrd=NULL,*record=NULL,hash[32];size_t kb=0,ib=0,rb=0;
     int root=-1,dir=-1,lock=-1,result=1,mutated=0;struct stat st,child;struct statvfs space;
     if(load(argv[1],64,BROOK_UPDATE_KERNEL_MAX,&kernel,&kb)||!BrookUpdateExecutable(kernel,kb)||
@@ -65,18 +98,18 @@ int main(int argc,char **argv) {
        (uint64_t)space.f_bavail*space.f_frsize<(uint64_t)kb+ib+1048576)goto done;
     lock=open("/tmp/hardware-update.lock",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);if(lock<0)goto done;
     /* An existing directory is never modified: inspect interrupted attempts. */
-    if(fstatat(root,"RECOVERY",&child,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
+    if(fstatat(root,STAGE_DIRECTORY,&child,AT_SYMLINK_NOFOLLOW)==0 || errno!=ENOENT)goto done;
     /* FAT mkdir can change disk state even when its final sync fails. */
     mutated=1;
-    if(mkdirat(root,"RECOVERY",0755))goto done;
-    dir=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(mkdirat(root,STAGE_DIRECTORY,0755))goto done;
+    dir=openat(root,STAGE_DIRECTORY,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(dir<0||fstat(dir,&child)||child.st_dev!=st.st_dev||
        ioctl(dir,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0))goto done;
     if(create_checked(dir,"KERNEL.ELF",kernel,kb)||create_checked(dir,"INITRD.IMG",initrd,ib)||fsync(dir))goto done;
     /* Publish the selector last; the existing bootloader remains unchanged. */
     if(create_checked(dir,"SELECT.BIN",record,rb)||fsync(dir)||fsync(root))goto done;
     /* Detect a concurrent rename or overmount before reporting publication. */
-    int check=openat(root,"RECOVERY",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    int check=openat(root,STAGE_DIRECTORY,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     struct stat final;
     if(check<0)goto done;
     int changed=ioctl(check,BROOK_IOCTL_VERIFY_SYSTEM_ESP_MEMBER,0)||fstat(check,&final)||

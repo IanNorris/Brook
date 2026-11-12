@@ -283,7 +283,7 @@ static void AnsiApplySgr()
 void TtyPutChar(char c)
 {
     if (!g_fbPixels) return;
-    if (g_displaySuppressed) return;   // logo is showing — skip FB writes
+    if (TtyDisplaySuppressed()) return;
     struct Fence { ~Fence() { FramebufferWriteFence(); } } fence;
 
     // ANSI escape sequence state machine
@@ -576,8 +576,10 @@ void TtySetRegion(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 
 void TtySuppressDisplay(bool suppress)
 {
-    g_displaySuppressed = suppress;
+    __atomic_store_n(&g_displaySuppressed,suppress,__ATOMIC_RELEASE);
 }
+
+bool TtyDisplaySuppressed(){return __atomic_load_n(&g_displaySuppressed,__ATOMIC_ACQUIRE);}
 
 bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
                        uint32_t* outHeight, uint32_t* outStride)

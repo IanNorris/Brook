@@ -6,6 +6,7 @@
 #include <vector>
 #include "panic_qr.h"
 #include "panic_journal.h"
+#include "intel_bdw_exec_snapshot.h"
 #include "lz4.h"
 static std::string output;
 namespace brook {
@@ -31,13 +32,16 @@ int main() {
     const uint8_t* captured=nullptr;uint32_t capturedBytes=0;
     assert(!brook::PanicCapturedPacket(&captured,&capturedBytes));
     brook::PanicCPURegs regs{}; regs.rip=0x12345678; regs.rsp=0x87654321;
-    brook::PanicStackTrace trace{};trace.depth=brook::PANIC_MAX_STACK_DEPTH;trace.rip[0]=0x12345678;
+    brook::PanicStackTrace trace{};trace.depth=255;trace.rip[0]=0x12345678;
     brook::PanicExceptionInfo exception{};
-    brook::PanicProcessList processes{};processes.count=brook::PANIC_MAX_PROCESSES;
+    brook::PanicProcessList processes{};processes.count=255;
     brook::PanicSystemInfo system{};
-    brook::PanicStackDump stack{};stack.length=brook::PANIC_STACK_DUMP_BYTES;
-    brook::PanicCpuList cpus{};cpus.count=brook::PANIC_MAX_CPUS_DUMP;
-    char message[520];std::memset(message,'X',sizeof(message));
+    brook::PanicStackDump stack{};stack.length=65535;
+    brook::PanicCpuList cpus{};cpus.count=255;
+    char message[brook::PANIC_MESSAGE_MAX_BYTES+9];std::memset(message,'X',sizeof(message));
+    brook::BdwGpuCapture gpu{};gpu.version=3;gpu.count=1;gpu.requested=2;gpu.entries[0].address=0x12345000;
+    gpu.entries[0].size=4096;gpu.entries[0].bytes=128;gpu.entries[0].data[0]=0xa5;
+    brook::PanicSetGpuCapture(gpu);
     brook::PanicRenderQR(nullptr,0,0,0,&regs,&trace,&exception,&processes,&system,&stack,&cpus,message);
     const auto pos=output.find("PANIC_HEX:"); assert(pos!=std::string::npos);
     const auto end=output.find('\n',pos);assert(end!=std::string::npos);
@@ -72,10 +76,18 @@ int main() {
     assert(header.type==brook::QR_PACKET_TYPE_CPU_REGS && header.size==sizeof(regs));
     brook::PanicCPURegs decoded{};memcpy(&decoded,raw.data()+sizeof(header),sizeof(decoded));
     assert(decoded.rip==regs.rip && decoded.rsp==regs.rsp);
-    size_t at=0;bool found=false,foundLog=false;
+    size_t at=0;bool found=false,foundLog=false,foundGpu=false;
     while(at+sizeof(header)<=raw.size()) {
         std::memcpy(&header,raw.data()+at,sizeof(header));at+=sizeof(header);
         assert(header.size<=raw.size()-at);
+        if(header.type==brook::QR_PACKET_TYPE_STACK_TRACE)assert(uint8_t(raw[at])==brook::PANIC_MAX_STACK_DEPTH);
+        if(header.type==brook::QR_PACKET_TYPE_PROCESS_LIST || header.type==brook::QR_PACKET_TYPE_PROCESS_EXT)
+            assert(uint8_t(raw[at])==brook::PANIC_MAX_PROCESSES);
+        if(header.type==brook::QR_PACKET_TYPE_CPU_STATE)assert(uint8_t(raw[at])==brook::PANIC_MAX_CPUS_DUMP);
+        if(header.type==brook::QR_PACKET_TYPE_STACK_DUMP) {
+            uint16_t size=0;std::memcpy(&size,raw.data()+at+8,2);
+            assert(size==brook::PANIC_STACK_DUMP_BYTES && header.size==10+size);
+        }
         if(header.type==brook::QR_PACKET_TYPE_MESSAGE) {
             assert(!found && header.size==brook::PANIC_MESSAGE_MAX_BYTES);
             for(size_t i=0;i<header.size;i++)assert(raw[at+i]=='X');
@@ -87,8 +99,69 @@ int main() {
             assert(std::memcmp(raw.data()+at,expected,sizeof(expected)-1)==0);
             foundLog=true;
         }
+        if(header.type==brook::QR_PACKET_TYPE_GPU_CAPTURE){
+            assert(!foundGpu && header.size==16+24+128);brook::BdwGpuCapture parsed{};
+            std::memcpy(&parsed,raw.data()+at,header.size);
+            assert(parsed.version==4 && parsed.count==1 && parsed.requested==2 && parsed.entries[0].address==0x12345000 && parsed.entries[0].data[0]==0xa5);foundGpu=true;
+        }
         at+=header.size;
     }
-    assert(found && foundLog && at==raw.size());
+    assert(found && foundLog && foundGpu && at==raw.size());
+    // With a nearly full base report, retain as many marked samples as fit
+    // and encode the actual lengths/count instead of dropping them all.
+    gpu.count=4;gpu.requested=5;
+    for(unsigned i=0;i<4;++i){gpu.entries[i].address=0x200000+i*4096;gpu.entries[i].size=4096;
+        gpu.entries[i].bytes=512;std::memset(gpu.entries[i].data,int(0x30+i),512);}
+    brook::PanicSetGpuCapture(gpu);brook::PanicPreparePacket(&regs,&trace,&exception,&processes,&system,&stack,&cpus,message);
+    assert(brook::PanicCapturedPacket(&captured,&capturedBytes));raw.clear();
+    if(captured[1]==brook::QR_VERSION){unsigned n=unsigned(captured[8])|(unsigned(captured[9])<<8)|(unsigned(captured[10])<<16)|(unsigned(captured[11])<<24);
+        raw.resize(n);assert(LZ4_decompress_safe((const char*)captured+12,raw.data(),capturedBytes-12,n)==(int)n);
+    }else raw.assign(captured+8,captured+capturedBytes);
+    at=0;foundGpu=false;
+    while(at+sizeof(header)<=raw.size()){
+        std::memcpy(&header,raw.data()+at,sizeof(header));at+=sizeof(header);assert(header.size<=raw.size()-at);
+        if(header.type==brook::QR_PACKET_TYPE_GPU_CAPTURE){
+            uint32_t version=0,count=0,requested=0;std::memcpy(&version,raw.data()+at,4);std::memcpy(&count,raw.data()+at+4,4);
+            std::memcpy(&requested,raw.data()+at+8,4);assert(version==4 && count>0 && count<=4 && requested==5);
+            size_t cursor=at+16;for(unsigned i=0;i<count;++i){uint32_t length=0;assert(cursor+24<=at+header.size);
+                std::memcpy(&length,raw.data()+cursor+16,4);assert(length<=512 && cursor+24+length<=at+header.size);
+                for(unsigned j=0;j<length;++j)assert(raw[cursor+24+j]==char(0x30+i));cursor+=24+length;}
+            assert(cursor==at+header.size);foundGpu=true;
+        }
+        at+=header.size;
+    }
+    assert(foundGpu && at==raw.size());
+    // An incompressible full capture exceeds QR capacity. Preserve it in the
+    // journal while serial/QR receive a separate complete core packet.
+    uint32_t random=0x12345678;
+    for(unsigned i=0;i<4;++i){gpu.entries[i].size=8192;gpu.entries[i].bytes=8192;
+        for(unsigned j=0;j<8192;++j){random^=random<<13;random^=random>>17;random^=random<<5;gpu.entries[i].data[j]=uint8_t(random);}}
+    brook::PanicSetGpuCapture(gpu);const auto beforeLarge=output.size();
+    brook::PanicPreparePacket(&regs,&trace,&exception,&processes,&system,&stack,&cpus,message);
+    assert(brook::PanicCapturedPacket(&captured,&capturedBytes) && capturedBytes>32768);
+    raw.clear();
+    if(captured[1]==brook::QR_VERSION){unsigned n=unsigned(captured[8])|(unsigned(captured[9])<<8)|(unsigned(captured[10])<<16)|(unsigned(captured[11])<<24);
+        raw.resize(n);assert(LZ4_decompress_safe((const char*)captured+12,raw.data(),capturedBytes-12,n)==(int)n);
+    }else raw.assign(captured+8,captured+capturedBytes);
+    at=0;foundGpu=false;
+    while(at+sizeof(header)<=raw.size()){
+        std::memcpy(&header,raw.data()+at,sizeof(header));at+=sizeof(header);assert(header.size<=raw.size()-at);
+        if(header.type==brook::QR_PACKET_TYPE_GPU_CAPTURE){
+            uint32_t version=0,count=0;std::memcpy(&version,raw.data()+at,4);std::memcpy(&count,raw.data()+at+4,4);
+            assert(version==4 && count==4);size_t cursor=at+16;
+            for(unsigned i=0;i<4;++i){uint32_t length=0;assert(cursor+24<=at+header.size);
+                std::memcpy(&length,raw.data()+cursor+16,4);assert(length==8192 && cursor+24+length<=at+header.size);
+                assert(!std::memcmp(raw.data()+cursor+24,gpu.entries[i].data,length));cursor+=24+length;}
+            assert(cursor==at+header.size);foundGpu=true;
+        }
+        at+=header.size;
+    }
+    assert(foundGpu && at==raw.size());
+    assert(output.find("full capture is in disk journal; serial/QR contain core report",beforeLarge)!=std::string::npos);
+    assert(brook::PanicJournalWrite(disk,captured,capturedBytes)==brook::PanicJournalResult::Ok);
+    assert(brook::PanicJournalReadLatest(disk,recovered.data(),recovered.size(),record)==brook::PanicJournalResult::Ok && record.bytes==capturedBytes);
+    assert(!std::memcmp(recovered.data(),captured,capturedBytes));
+    const auto beforeLargeQr=output.size();brook::PanicRenderPreparedQR(framebuffer.data(),1920,1080,1920*4);
+    assert(output.find("PANIC_B45_P0:",beforeLargeQr)!=std::string::npos);
     puts("headless panic packet: PASS");
 }

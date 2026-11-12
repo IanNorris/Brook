@@ -42,6 +42,10 @@ uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, voi
 // Source allocation must remain owned while the snapshot translates and pins
 // its pages. The returned descriptor owns those pins independently of the source.
 MappingBacking* UserMappingBufferSnapshot(uint64_t kernelAddress,uint64_t length);
+// Copies from pinned physical pages without depending on the source's kernel
+// virtual address, which may have been retired. The caller retains descriptor
+// and separately synchronizes concurrent writers; bounds are checked in full.
+bool UserMappingBufferRead(MappingBacking* buffer,uint64_t offset,void* destination,uint64_t length);
 bool UserMappingConfigureBuffer(UserMappingRequest& request,MappingBacking* buffer);
 // Publishes a coherent process framebuffer source, retaining the new descriptor
 // and releasing the old one outside the process framebuffer source lock. Caller owns the source pixels.

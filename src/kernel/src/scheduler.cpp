@@ -1,5 +1,6 @@
 #include "process_fs.h"
 #include "scheduler.h"
+#include "scheduler_affinity.h"
 #include "robust_futex.h"
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
@@ -656,9 +657,7 @@ static void StartTestFresh(void*)
 }
 static bool StartTestEligible(Process* task, uint32_t cpu)
 {
-    // Kernel threads intentionally bypass production affinity checks. Reserve
-    // this fixture explicitly, including picks on already-started CPUs.
-    if (task == g_startTestFresh && cpu != 3) return false;
+    // The fresh kernel thread's CPU pin is checked by the production picker.
     if (g_perCpu[cpu].currentProcess) return true;
     if (cpu == 1 || cpu == 2) {
         const bool suspended = task->savedCtx.rsp < task->kernelStackTop - 24;
@@ -852,10 +851,9 @@ static void ReadyQueueRemoveLocked(Process* proc)
 
 static bool ProcessCanRunOnCpu(Process* proc, uint32_t cpu)
 {
-    if (!proc || proc->pid == 0 || proc->isKernelThread)
-        return true;
+    if (!proc) return true;
     int32_t affinity = __atomic_load_n(&proc->cpuAffinity, __ATOMIC_ACQUIRE);
-    return affinity < 0 || affinity == static_cast<int32_t>(cpu);
+    return SchedulerCpuEligible(proc->pid,affinity,cpu);
 }
 
 // Retained for future sched_setaffinity — not called during normal scheduling
@@ -2699,6 +2697,14 @@ Process* SchedulerFindProcessReference(uint16_t pid)
     }
     SchedLockRelease(g_allProcLock, flags);
     return found;
+}
+bool SchedulerThreadGroupGone(uint16_t tgid,uint64_t incarnation)
+{
+    if(!tgid || !incarnation)return false;
+    const auto flags=SchedLockAcquire(g_allProcLock);bool gone=true;
+    for(uint32_t i=0;i<g_processCount;++i){const auto* p=g_allProcesses[i];
+        if(p && (p->tgid?p->tgid:p->pid)==tgid && (p->isThread?p->leaderIncarnation:p->incarnation)==incarnation){gone=false;break;}}
+    SchedLockRelease(g_allProcLock,flags);return gone;
 }
 #ifdef BROOK_REGISTER_TEST_HOOKS
 bool SchedulerTestTargetApic(Process* actor,uint16_t pid,uint8_t* apic)

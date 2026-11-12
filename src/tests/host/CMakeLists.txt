@@ -120,6 +120,8 @@ target_compile_options(test_xhci_try_transmit PRIVATE -DBROOK_HOST_TEST -ffuncti
 target_link_options(test_xhci_try_transmit PRIVATE -Wl,--gc-sections)
 add_test(NAME xhci_try_transmit COMMAND test_xhci_try_transmit)
 add_host_test(test_boot_resource_map)
+add_host_test(test_usb_boot_health "${BROOK_ROOT}/src/kernel/src/usb_boot_health.cpp")
+target_compile_options(test_usb_boot_health PRIVATE -UNDEBUG)
 target_compile_options(test_boot_resource_map PRIVATE "-iquote${BROOK_ROOT}/src/shared")
 add_host_test(test_kernel_alias_probe)
 add_host_test(test_mtrr_page_probe)
@@ -292,6 +294,9 @@ target_compile_options(test_window_surfaces PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_window_surfaces PRIVATE -Wl,--gc-sections)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_window_surfaces PRIVATE -Wno-error=class-memaccess)
+endif()
 add_host_test(test_pointer_capture)
 target_compile_options(test_pointer_capture PRIVATE
     -Wno-unused-parameter -Wno-attributes -Wno-misleading-indentation -Wno-error=extra
@@ -310,6 +315,9 @@ target_compile_options(test_gpu_capture_queue PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_gpu_capture_queue PRIVATE -Wl,--gc-sections)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_gpu_capture_queue PRIVATE -Wno-error=class-memaccess)
+endif()
 set_tests_properties(test_gpu_capture_queue PROPERTIES TIMEOUT 20)
 add_host_test(test_ready_latency)
 target_compile_options(test_ready_latency PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
@@ -554,6 +562,9 @@ target_compile_options(test_vmm_leaf PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_vmm_leaf PRIVATE -Wl,--gc-sections)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_vmm_leaf PRIVATE -Wno-error=class-memaccess -Wno-error=attributes -Wno-error=array-bounds)
+endif()
 
 # Actual canonical cache adoption under simultaneous independent-open misses.
 add_host_test(test_file_page_cache
@@ -658,8 +669,8 @@ target_compile_options(test_debug_log_ring PRIVATE -UNDEBUG -DBROOK_HOST_TEST -D
     "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
 
-add_host_test(test_debug_hardware "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp")
-add_host_test(test_debug_hardware_recovery "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp")
+add_host_test(test_debug_hardware "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp" "${BROOK_ROOT}/src/kernel/src/usb_boot_health.cpp")
+add_host_test(test_debug_hardware_recovery "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp" "${BROOK_ROOT}/src/kernel/src/usb_boot_health.cpp")
 add_host_test(test_panic_snapshot)
 target_compile_options(test_panic_snapshot PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
@@ -680,17 +691,21 @@ add_host_test(test_intel_bdw_forcewake_ack)
 target_compile_options(test_intel_bdw_forcewake_ack PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_ggtt_bind)
 target_compile_options(test_intel_bdw_ggtt_bind PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_ggtt_space)
+target_compile_options(test_intel_bdw_ggtt_space PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_scanout)
 target_compile_options(test_intel_bdw_scanout PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_gtt_probe)
 target_compile_options(test_intel_bdw_gtt_probe PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_scanout_observe "${BROOK_ROOT}/src/kernel/src/intel_bdw_scanout.cpp")
+target_compile_definitions(test_intel_bdw_scanout_observe PRIVATE BROOK_SSD_AUTO_RECOVERY)
 target_compile_options(test_intel_bdw_scanout_observe PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_intel_dmar_gpu)
 target_compile_options(test_intel_dmar_gpu PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_vtd_probe)
 target_compile_options(test_intel_vtd_probe PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_vtd_observe "${BROOK_ROOT}/src/kernel/src/intel_vtd_observe.cpp")
+target_compile_definitions(test_intel_vtd_observe PRIVATE BROOK_SSD_AUTO_RECOVERY)
 target_compile_options(test_intel_vtd_observe PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_compile_options(test_debug_hardware PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"
@@ -814,6 +829,8 @@ target_compile_options(test_gpu_scene PRIVATE -DBROOK_HOST_TEST -Wno-unused-para
 add_host_test(test_gpu_context)
 add_host_test(test_desktop_gpu_environment)
 target_compile_options(test_desktop_gpu_environment PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_compositor_handoff)
+target_compile_options(test_compositor_handoff PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_cpu_memory_type)
 add_host_test(test_cpu_execute_disable)
@@ -899,12 +916,25 @@ target_compile_options(test_signal_context PRIVATE -DBROOK_HOST_TEST -UNDEBUG
 target_compile_options(test_intel_bdw_forcewake_adapter PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_context)
 target_compile_options(test_intel_bdw_context PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_rcs_context)
+target_compile_options(test_intel_bdw_rcs_context PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_render_plan)
+target_compile_options(test_intel_bdw_render_plan PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_ppgtt)
+target_compile_options(test_intel_bdw_ppgtt PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_buffer "${BROOK_ROOT}/src/kernel/src/intel_bdw_buffer.cpp" "${BROOK_ROOT}/src/kernel/src/intel_bdw_file.cpp" "${BROOK_ROOT}/src/kernel/src/intel_bdw_exec_snapshot.cpp" "${BROOK_ROOT}/src/kernel/src/intel_bdw_ioctl.cpp")
+target_compile_definitions(test_intel_bdw_buffer PRIVATE BROOK_HOST_TEST BROOK_SSD_AUTO_RECOVERY)
+target_compile_options(test_intel_bdw_buffer PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+add_host_test(test_intel_bdw_render_gt_init)
+target_compile_options(test_intel_bdw_render_gt_init PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_submission)
 target_compile_options(test_intel_bdw_submission PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_oneshot)
 target_compile_options(test_intel_bdw_oneshot PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_render_oneshot)
+target_compile_options(test_intel_bdw_render_oneshot PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_prepare "${BROOK_ROOT}/src/kernel/src/intel_bdw_prepare.cpp")
-target_compile_definitions(test_intel_bdw_prepare PRIVATE BROOK_HOST_TEST)
+target_compile_definitions(test_intel_bdw_prepare PRIVATE BROOK_HOST_TEST BROOK_SSD_AUTO_RECOVERY)
 target_compile_options(test_intel_bdw_prepare PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_intel_bdw_publish)
 target_compile_options(test_intel_bdw_publish PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")

@@ -28,6 +28,9 @@ static bool contains(const SceneRect& r,int x,int y) {
     return r.left<=x && x<r.right && r.top<=y && y<r.bottom;
 }
 static void checkSceneDamage() {
+    uint32_t opaque[]={0xff112233u,0xff445566u,0xff778899u};
+    CHECK(SceneRowOpaque(opaque,3));opaque[1]=0x80445566u;
+    CHECK(!SceneRowOpaque(opaque,3) && SceneRowOpaque(opaque,1));
     SceneRect native=SceneClientBlitRect(10,20,320,200,100,80,4,1920,1080);
     CHECK(native.left==10 && native.top==20 && native.right==110 && native.bottom==100);
     native=SceneClientBlitRect(-10,-20,320,200,100,80,1,1920,1080);

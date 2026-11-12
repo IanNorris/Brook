@@ -1,0 +1,96 @@
+--- a/source/mutex.c
++++ b/source/mutex.c
+@@ -58,6 +58,7 @@
+     uacpi_cpu_flags flags;
+     uacpi_u16 spins = 0;
+     uacpi_bool success;
++    const uacpi_u64 start = uacpi_kernel_get_nanoseconds_since_boot();
+ 
+     if (!g_uacpi_rt_ctx.has_global_lock)
+         return UACPI_STATUS_OK;
+@@ -76,9 +77,14 @@
+         if (success)
+             break;
+ 
+-        if (uacpi_unlikely(spins == 0xFFFF))
++        const uacpi_u64 elapsed = uacpi_kernel_get_nanoseconds_since_boot() - start;
++        // Preserve the firmware-owned lock and its pending bit on timeout.
++        // A later SCI may acknowledge the request, but this caller did not
++        // acquire the lock and must never clear it or access a Lock field.
++        if (spins >= 16 || elapsed >= 250000000)
+             break;
+ 
++        uacpi_kernel_reset_event(g_uacpi_rt_ctx.global_lock_event);
+         g_uacpi_rt_ctx.global_lock_pending = UACPI_TRUE;
+         uacpi_trace(
+             "global lock is owned by firmware, waiting for a release "
+@@ -86,8 +92,12 @@
+         );
+         uacpi_kernel_unlock_spinlock(g_uacpi_rt_ctx.global_lock_spinlock, flags);
+ 
+-        uacpi_kernel_wait_for_event(g_uacpi_rt_ctx.global_lock_event, 0xFFFF);
++        const uacpi_u16 wait_ms = (uacpi_u16)((250000000 - elapsed + 999999) / 1000000);
++        const uacpi_bool notified =
++            uacpi_kernel_wait_for_event(g_uacpi_rt_ctx.global_lock_event, wait_ms);
+         flags = uacpi_kernel_lock_spinlock(g_uacpi_rt_ctx.global_lock_spinlock);
++        if (!notified)
++            break;
+     }
+ 
+     g_uacpi_rt_ctx.global_lock_pending = UACPI_FALSE;
+--- a/source/opregion.c
++++ b/source/opregion.c
+@@ -564,7 +564,7 @@
+         uacpi_address_space_to_string(space),
+         device_node->name.text, ctx.reg_executed, ctx.reg_errors
+     );
+-    return UACPI_STATUS_OK;
++    return ctx.reg_errors ? UACPI_STATUS_INTERNAL_ERROR : UACPI_STATUS_OK;
+ }
+ 
+ static uacpi_address_space_handlers *extract_handlers(
+--- a/source/uacpi.c
++++ b/source/uacpi.c
+@@ -484,6 +484,13 @@
+         uacpi_table_unref(&tbl);
+     }
+ 
++    // Brook admits an exact firmware set. A partially loaded namespace
++    // must never proceed to platform register access.
++    if (st.failure_counter) {
++        ret = UACPI_STATUS_AML_BAD_ENCODING;
++        goto out_fatal_error;
++    }
++
+     end_ts = uacpi_kernel_get_nanoseconds_since_boot();
+     g_uacpi_rt_ctx.bad_timesource = warn_on_bad_timesource(begin_ts, end_ts);
+ 
+--- a/source/event.c
++++ b/source/event.c
+@@ -72,7 +72,7 @@
+ {
+     uacpi_size i;
+ 
+-    for (i = 0; i < UACPI_FIXED_EVENT_MAX; ++i) {
++    for (i = 0; i <= UACPI_FIXED_EVENT_MAX; ++i) {
+         uacpi_write_register_field(
+             fixed_events[i].enable_field, UACPI_EVENT_DISABLED
+         );
+@@ -210,7 +210,7 @@
+     if (uacpi_unlikely_error(ret))
+         return int_ret;
+ 
+-    for (i = 0; i < UACPI_FIXED_EVENT_MAX; ++i)
++    for (i = 0; i <= UACPI_FIXED_EVENT_MAX; ++i)
+     {
+         const struct fixed_event *ev = &fixed_events[i];
+ 
+@@ -2274,7 +2274,7 @@
+         }
+     }
+ 
+-    for (i = 0; i < UACPI_FIXED_EVENT_MAX; ++i) {
++    for (i = 0; i <= UACPI_FIXED_EVENT_MAX; ++i) {
+         if (fixed_event_handlers[i].handler)
+             uacpi_uninstall_fixed_event_handler(i);
+     }

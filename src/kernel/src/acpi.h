@@ -37,6 +37,15 @@ bool AcpiInit(uint64_t rsdpPhysical,const MemoryDescriptor* memoryMap,uint32_t m
 // Frozen descriptor only; discovery never writes hardware registers.
 const AcpiResetInfo& AcpiGetResetInfo();
 const AcpiPmTimerInfo& AcpiGetPmTimerInfo();
+// Validated legacy ACPI descriptors. Discovery performs no register I/O.
+const AcpiLegacyPowerInfo& AcpiGetLegacyPowerInfo();
+const AcpiSciRoute& AcpiGetSciRoute();
+#ifdef BROOK_DELL_ACPI_MONITOR
+// Returns the real RSDP only when the pinned Dell FADT, MADT, and all
+// executable ACPI tables match. Table mapping does not authorize AML I/O.
+uint64_t AcpiAdmitDellMonitorFirmware();
+bool AcpiFirmwareRange(uint64_t address,uint32_t bytes);
+#endif
 
 // Return parsed MADT information.  Valid only after AcpiInit() returns true.
 const MadtInfo& AcpiGetMadt();

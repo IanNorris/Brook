@@ -439,6 +439,7 @@ struct Process
     uint32_t  fbVfbWidth;       // VFB width in pixels
     uint32_t  fbVfbHeight;      // VFB height in pixels
     uint32_t  fbVfbStride;      // VFB stride in pixels (= fbVfbWidth)
+    uint64_t  fbPublicationGeneration; // saturating content/source publication counter
 
     // Per-process GPU (virgl) context id for app GL rendering, or 0 if none.
     // Allocated by GPU_CTX_CREATE (syscall 0xB10); torn down on process exit.
@@ -559,6 +560,16 @@ struct Process
     // stable. Set under the scheduler registry; preserved across exec.
     uint64_t oomEpisode;
 };
+
+// A completed producer update invalidates any copied desktop-layer snapshot.
+// A saturated counter deliberately remains invalid for future captures.
+inline void ProcessFramebufferMarkDirty(Process* proc) {
+    if(!proc)return;
+    uint64_t current=__atomic_load_n(&proc->fbPublicationGeneration,__ATOMIC_RELAXED);
+    while(current!=~uint64_t{0} && !__atomic_compare_exchange_n(&proc->fbPublicationGeneration,&current,current+1,
+          false,__ATOMIC_RELEASE,__ATOMIC_RELAXED)) {}
+    __atomic_store_n(&proc->fbDirty,1u,__ATOMIC_RELEASE);
+}
 
 // User backing pages belong to the shared address space, not the allocating
 // thread. A thread's PID can be reused while its mappings remain live; charging

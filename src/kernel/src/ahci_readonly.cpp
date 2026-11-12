@@ -22,6 +22,8 @@
 #include "fw_cfg.h"
 #include "panic_journal.h"
 #include "panic_qr.h"
+#include "acpi.h"
+#include "portio.h"
 #endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 #include "ahci_test_admission.h"
@@ -51,6 +53,7 @@ bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 bool panicTestReady=false,panicTestFat=false,panicIoMode=false;
+bool panicReservationRequested=false;
 #if defined(BROOK_AHCI_PANIC_TEST)
 bool panicTestCandidate=false;
 #endif
@@ -67,12 +70,17 @@ bool testInstallMode=false;
 bool blockToolsMode=false;
 bool largeDataTestWritable=false;
 #endif
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_GUARD_PENDING_TEST)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
 bool TestKvm() {
     uint32_t a,b,c,d;
     __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x40000000u),"c"(0));
     return b==0x4b4d564bu && c==0x564b4d56u && d==0x0000004du;
 }
+#endif
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+bool contentionTestEnabled=false;
+uint32_t contentionTestWriter=0;
+uint32_t contentionTestYielded=0;
 #endif
 static constexpr uint32_t pages=17, dataOffset=4096, tableOffset=1280, fisOffset=1024;
 
@@ -150,6 +158,12 @@ void Quarantine(const char* reason) {
 }
 
 bool Run(const AhciReadPlan& plan, uint32_t expected) {
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+    // Let the normal owner unwind after its current command instead of
+    // starting another one while panic waits for its DMA buffer. This is a
+    // clean refusal before descriptor changes, not a failed device command.
+    if(!panicIoMode && panicGate.PanicPending())return false;
+#endif
     bool valid=(plan.fis[2]==0xec || plan.fis[2]==0x25) && plan.commandFlags==5 &&
         plan.prdtEntries==1 && expected && plan.byteCountMinusOne+1==expected;
     const bool isFlush=writeEnabled && plan.fis[2]==0xea && plan.commandFlags==5 &&
@@ -214,7 +228,38 @@ int Write(Device*,uint64_t offset,const void* data,uint64_t len) {
     if(writeEnabled && __atomic_load_n(&published,__ATOMIC_ACQUIRE)) {
         NormalIoGuard guard;if(!guard.admitted)return -5;
         AhciByteIo bytes;
-        return status.ready ? AhciByteWrite(bytes,offset,data,len,status.sectors,dma+dataOffset) : -5;
+        const int result=status.ready ? AhciByteWrite(bytes,offset,data,len,status.sectors,dma+dataOffset) : -5;
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+        constexpr char tag[]="BROOK_QEMU_AHCI_CONTENTION_20261105";
+        const auto* input=static_cast<const uint8_t*>(data);
+        bool found=false;
+        if(contentionTestEnabled && result>0 && input && len>=sizeof(tag)-1)
+            for(uint64_t i=0;i<=len-(sizeof(tag)-1);++i)
+                if(!memcmp(input+i,tag,sizeof(tag)-1)){found=true;break;}
+        uint32_t expected=0;
+        if(found && __atomic_compare_exchange_n(&contentionTestWriter,&expected,2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+            SerialPuts("PANIC_CONTENTION_WRITER_HELD\n");
+            __atomic_store_n(&contentionTestWriter,1,__ATOMIC_RELEASE);
+            for(uint64_t spin=0;spin<2000000000ull && !panicGate.NormalWithPanicPending();++spin)
+                __asm__ volatile("pause");
+            // Disposable test build only: model a command that takes half a
+            // second to finish after the panic asks for the gate.
+            const auto& timer=AcpiGetPmTimerInfo();
+            if(panicGate.PanicPending() && timer.available) {
+                const uint32_t start=inl(timer.port)&0xffffffu;
+                for(uint32_t spin=0;spin<20000000;++spin)
+                    if(((inl(timer.port)-start)&0xffffffu)>=1789773u) {
+                        SerialPanicPuts("PANIC_CONTENTION_DELAY_COMPLETE\n");break;
+                    }
+            }
+            // Exercise the real command boundary while still owning the
+            // ordinary gate. Pending panic must reject this next command
+            // without quarantining the controller or touching descriptors.
+            if(panicGate.PanicPending() && !ReadBlocks(0,1) && status.ready && !status.quarantined)
+                __atomic_store_n(&contentionTestYielded,1,__ATOMIC_RELEASE);
+        }
+#endif
+        return result;
     }
     return -30;
 }
@@ -434,6 +479,12 @@ void AhciReadOnlyInit() {
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
 #endif
     status.ready=true;status.reason="read-only ATA device ready";
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+    char contentionMarker[8]{};
+    contentionTestEnabled=TestKvm() && pci.vendorId==0x8086 && pci.deviceId==0x2922 &&
+        FwCfgReadFile("opt/brook/panic-contention",contentionMarker,sizeof(contentionMarker))==6 &&
+        !memcmp(contentionMarker,"test-1",6);
+#endif
 #if defined(BROOK_AHCI_PANIC_TEST)
     if(panicTestCandidate && !panicTestFat) {
         // A separate 64 MiB unpartitioned disk is required. Accept an empty
@@ -449,8 +500,7 @@ void AhciReadOnlyInit() {
         PanicJournalRecord a{},b{};
         if(safe)safe=PanicJournalInspect(bootRead,0,a)==PanicJournalResult::Ok &&
                      PanicJournalInspect(bootRead,1,b)==PanicJournalResult::Ok &&
-                     ((a.blank && b.blank) || a.valid || b.valid) &&
-                     !(a.valid && b.valid && a.sequence==b.sequence);
+                     PanicJournalWritable(a,b);
         panicTestReady=safe && status.ready;
         SerialPuts(panicTestReady?"PANIC_TEST_DISK_READY\n":"PANIC_TEST_DISK_REJECTED\n");
         char busyMarker[2]{};
@@ -541,8 +591,7 @@ bool AhciPanicTestMapSectors(const uint64_t* sectors,uint32_t count,uint64_t fir
     PanicJournalRecord a{},b{};
     if(PanicJournalInspect(reader,0,a)!=PanicJournalResult::Ok ||
        PanicJournalInspect(reader,1,b)!=PanicJournalResult::Ok ||
-       !((a.blank && b.blank) || a.valid || b.valid) ||
-       (a.valid && b.valid && a.sequence==b.sequence))return false;
+       !PanicJournalWritable(a,b))return false;
     for(uint32_t i=0;i<count;++i)panicTestMap[i]=mapped[i];
     panicTestReady=true;return true;
 }
@@ -566,10 +615,45 @@ bool AhciGuardPanicRecoveryMapSectors(const uint64_t* sectors,uint32_t count,uin
     panicTestFat=false;return false;
 }
 #endif
+void AhciPanicReserveBeforeHalt() {
+    if(!panicTestReady)return;
+    const auto request=panicGate.RequestPanic();
+    if(request==AhciPanicGate::Request::Unavailable)return;
+    panicReservationRequested=true;
+    if(request==AhciPanicGate::Request::Pending) {
+        // Peers are still running here. Do not block forever if the current
+        // CPU or a failed peer owns normal I/O; never seize its DMA buffer.
+        SerialPanicPuts("PANIC_DISK_RESERVE_WAIT\n");
+        const auto& timer=AcpiGetPmTimerInfo();
+        if(timer.available) {
+            struct WaitIo {
+                uint16_t port;
+                uint32_t readTimer(){return inl(port);}
+                void pause(){__asm__ volatile("pause":::"memory");}
+            } wait{timer.port};
+            (void)AhciWaitForPanicOwner(panicGate,wait,20000000);
+        } else {
+            for(uint32_t spins=0;spins<10000000 && !panicGate.PanicOwned();++spins)
+                __asm__ volatile("pause");
+        }
+        SerialPanicPuts(panicGate.PanicOwned()?"PANIC_DISK_RESERVE_READY\n":"PANIC_DISK_RESERVE_HELD\n");
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+        if(panicGate.PanicOwned() && __atomic_load_n(&contentionTestYielded,__ATOMIC_ACQUIRE))
+            SerialPanicPuts("PANIC_CONTENTION_NEXT_COMMAND_YIELDED\n");
+#endif
+    }
+}
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+void AhciPanicTestWaitForWriter() {
+    if(!contentionTestEnabled)return;
+    for(uint32_t spin=0;spin<200000000 && __atomic_load_n(&contentionTestWriter,__ATOMIC_ACQUIRE)!=1;++spin)
+        __asm__ volatile("pause");
+}
+#endif
 void AhciPanicTestCapture() {
     const uint8_t* packet=nullptr;uint32_t bytes=0;
     if(!panicTestReady || !PanicCapturedPacket(&packet,&bytes))return;
-    if(!panicGate.EnterPanic()) {
+    if(!(panicReservationRequested?panicGate.PanicOwned():panicGate.EnterPanic())) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
         const char* message="PANIC_DISK_BUSY\n";
 #else

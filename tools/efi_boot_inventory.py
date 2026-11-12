@@ -18,7 +18,7 @@ def parse_option(data):
     description=data[6:end].decode('utf-16-le',errors='strict')
     at=end+2
     if path_bytes>len(data)-at:raise ValueError('device path exceeds load option')
-    limit=at+path_bytes;nodes=[];files=[];partitions=[];instances=[];ended=False
+    limit=at+path_bytes;nodes=[];files=[];partitions=[];instances=[];ended=False;path_index=0
     while at<limit:
         if limit-at<4:raise ValueError('short device path header')
         typ,subtype,size=struct.unpack_from('<BBH',data,at)
@@ -40,11 +40,13 @@ def parse_option(data):
             if size!=4:raise ValueError('invalid end node')
             if subtype==0x01 and (len(nodes)==1 or at==limit):raise ValueError('empty device path instance')
             if subtype==0xff and instances and len(nodes)==1:raise ValueError('empty device path instance')
-            instances.append({'nodes':nodes,'partitions':partitions,'files':files})
+            instances.append({'device_path_index':path_index,'nodes':nodes,'partitions':partitions,'files':files})
             nodes=[];partitions=[];files=[]
             if subtype==0xff:
-                if at!=limit:raise ValueError('invalid end node')
-                ended=True
+                # EFI_LOAD_OPTION FilePathList may contain more than one
+                # complete device path, each terminated by End Entire.
+                path_index+=1
+                ended=at==limit
     if not ended:raise ValueError('device path lacks end node')
     return {'active':bool(attributes&1),'attributes':attributes,'description':description,
             'instances':instances,

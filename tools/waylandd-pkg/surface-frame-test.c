@@ -24,6 +24,21 @@ int main(void) {
     surface.resource=wl_resource_create(client,&wl_surface_interface,4,2);
     assert(surface.resource);
     wl_resource_set_user_data(surface.resource,&surface);
+    /* A pending producer must preserve the published pixels and withhold its
+     * callback, then publish and acknowledge once its retained image is ready. */
+    struct brook_image *pending=image_snapshot((uint8_t *)&pixel,1,1,4,WL_SHM_FORMAT_ARGB8888);assert(pending);
+    pending->pending_cpu=1;assert(surface_tree_commit(&surface,pending));
+    vfb=0xffaabbcc;surface_frame(client,surface.resource,3);
+    surface_commit(client,surface.resource);assert(vfb==0xffaabbcc);
+    assert(wl_list_length(&surface.committed_frames)==1);
+    assert(wl_event_loop_dispatch(loop,32)==0);
+    assert(wl_list_length(&surface.committed_frames)==1);
+    pending->pending_cpu=0;assert(surface_repaint(&surface));assert(vfb==pixel);
+    assert(wl_event_loop_dispatch(loop,32)==0);assert(wl_list_empty(&surface.committed_frames));
+    wl_display_flush_clients(display);uint32_t pending_wire[32];
+    assert(recv(sockets[1],pending_wire,sizeof(pending_wire),MSG_DONTWAIT)>0);
+    image_unref(pending);
+    surface.trace_requests=surface.trace_done=0;
     for(unsigned round=0;round<3;++round) {
         surface_frame(client,surface.resource,3+round);
         assert(wl_list_length(&surface.pending_frames)==1);

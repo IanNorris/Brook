@@ -30,6 +30,7 @@
 #include "terminal.h"
 #include "window.h"
 #include "gpu_app.h"
+#include "intel_bdw_scanout.h"
 #include "ext2_vfs.h"
 #include "string.h"
 #include "spinlock.h"
@@ -1224,6 +1225,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->fbDestY = 0;
     child->fbScale = 0;
     child->fbDirty = 0;
+    child->fbPublicationGeneration = 0;
     child->fbExitColor = 0;
 
     // Allocate per-process kernel stack
@@ -1439,6 +1441,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->fbDestY = 0;
     thread->fbScale = 0;
     thread->fbDirty = 0;
+    thread->fbPublicationGeneration = 0;
     thread->fbExitColor = 0;
 
     // Initialize FPU/SSE state

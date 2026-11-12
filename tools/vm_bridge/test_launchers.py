@@ -10,6 +10,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Launchers(unittest.TestCase):
+    def test_data_directory_override(self):
+        with tempfile.TemporaryDirectory() as name:
+            directory=Path(name);game=directory/'game'
+            game.write_text('#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+            game.chmod(0o700)
+            text=(ROOT/'data/nix-wrappers/yquake2-play.sh.in').read_text()
+            text=text.replace('/data/yq2',str(directory/'home')).replace('@YQUAKE2_BIN@',str(game))
+            wrapper=directory/'wrapper';wrapper.write_text(text)
+            env=os.environ.copy();env.pop('BROOK_QUAKE2_DATA_DIR',None)
+            def datadir():
+                args=json.loads(subprocess.check_output(['bash',str(wrapper)],env=env,text=True))
+                return args[args.index('-datadir')+1]
+            self.assertEqual(datadir(),'/data/games/quake2')
+            env['BROOK_QUAKE2_DATA_DIR']='/data/home/quake2 with spaces'
+            self.assertEqual(datadir(),'/data/home/quake2 with spaces')
+
     def test_mesa_paths_inherited_or_defaulted(self):
         with tempfile.TemporaryDirectory() as name:
             directory=Path(name);game=directory/'game'
