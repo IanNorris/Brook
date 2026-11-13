@@ -1,4 +1,7 @@
 #include "intel_bdw_buffer.h"
+#ifdef BROOK_BDW_CACHE_PROBE
+#include "../../shared/bdw_cache_probe_abi.h"
+#endif
 #include "intel_bdw_publish.h"
 #include "memory/mapping_ranges.h"
 #include "memory/physical_memory.h"
@@ -15,6 +18,11 @@ struct BdwGpuBuffer {
     uint64_t gpuState; // 63 failure; 62 CPU transition; 61/60 handoff/consumed; 59 scanout map; low 32 GPU uses
     uint64_t handoffToken;
     bool userMappingAllowed;
+#ifdef BROOK_BDW_CACHE_PROBE
+    bool cacheProbe;
+    uint32_t cacheProbeOmit;
+    uint64_t skippedToDevice, skippedToCpu;
+#endif
 };
 static uint64_t g_nextBufferIdentity=1;
 static uint64_t BdwNextBufferIdentity(){
@@ -63,7 +71,53 @@ static BdwGpuBuffer* BdwGpuBufferCreateInternal(uint64_t bytes,bool userMappingA
     if(!buffer->backing){BdwGpuBufferDestroy(buffer);return nullptr;}
     return buffer;
 }
-BdwGpuBuffer* BdwGpuBufferCreate(uint64_t bytes){return BdwGpuBufferCreateInternal(bytes,true);}
+BdwGpuBuffer* BdwGpuBufferCreate(uint64_t bytes){
+    auto* buffer=BdwGpuBufferCreateInternal(bytes,true);
+#ifdef BROOK_BDW_COHERENT_RENDER
+    // Publish initial zeroing even if a later render submission uses the
+    // coherent path. Existing CPU and PRIME transition rules still apply.
+    if(buffer && !BdwGpuBufferSyncCpuCache(buffer)){BdwGpuBufferUnref(buffer);return nullptr;}
+#endif
+    return buffer;
+}
+#ifdef BROOK_BDW_CACHE_PROBE
+BdwGpuBuffer* BdwGpuBufferCreateCacheProbe(uint64_t bytes,uint32_t omit)
+{
+    if(!bytes || bytes>BROOK_BDW_CACHE_PROBE_MAX_BYTES || (omit&~3u))return nullptr;
+    auto* buffer=BdwGpuBufferCreate(bytes);
+    if(!buffer)return nullptr;
+    buffer->cacheProbe=true;
+    buffer->cacheProbeOmit=omit;
+    return buffer;
+}
+bool BdwGpuBufferCacheProbeCounters(const BdwGpuBuffer* buffer,BdwCacheProbeCounters& result)
+{
+    if(!buffer || !buffer->cacheProbe)return false;
+    result={buffer->cacheProbeOmit,
+        __atomic_load_n(&buffer->skippedToDevice,__ATOMIC_ACQUIRE),
+        __atomic_load_n(&buffer->skippedToCpu,__ATOMIC_ACQUIRE)};
+    return true;
+}
+bool BdwGpuBufferSkipCacheProbeFlush(BdwGpuBuffer* buffer,bool forDevice)
+{
+    const uint32_t flag=forDevice?BROOK_BDW_CACHE_PROBE_SKIP_TO_DEVICE:BROOK_BDW_CACHE_PROBE_SKIP_TO_CPU;
+    if(!buffer->cacheProbe || !(buffer->cacheProbeOmit&flag))return false;
+    auto* counter=forDevice?&buffer->skippedToDevice:&buffer->skippedToCpu;
+    __atomic_add_fetch(counter,buffer->count,__ATOMIC_RELEASE);
+    return true;
+}
+void BdwGpuBufferPrimeCacheProbe(BdwGpuBuffer* buffer)
+{
+    if(!buffer->cacheProbe || !(buffer->cacheProbeOmit&BROOK_BDW_CACHE_PROBE_SKIP_TO_CPU))return;
+    // Establish cache residency after the input-side CLFLUSH. Read the exact
+    // output via its WB kernel alias, without modifying the payload.
+    for(uint32_t page=0;page<buffer->count;++page){
+        const auto* data=reinterpret_cast<const volatile uint32_t*>(BdwGpuBufferPageKernelAddress(buffer,page));
+        for(unsigned word=0;word<4096/sizeof(uint32_t);word+=16)
+            (void)data[word];
+    }
+}
+#endif
 BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes){
     auto* buffer=BdwGpuBufferCreateInternal(bytes,false);
     if(!buffer)return nullptr;

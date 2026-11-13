@@ -197,8 +197,18 @@ public:
     // outside the mutex. A quarantined active snapshot stays owned forever.
     bool Finish(uint64_t id,bool success,bool safelyStopped){
         if(!initialized_)return false;
+        bool cacheReady=false;
+        if(success && safelyStopped){
+            KMutexLock(&mutex_);auto* snapshot=queue_.ActiveSnapshot(id);KMutexUnlock(&mutex_);
+            if(!snapshot)return false;
+            // The engine owner is the only finisher. Active records cannot be
+            // canceled or reaped, so their buffers stay reserved and pinned.
+            cacheReady=BdwExecSnapshotSyncForRetirement(snapshot);
+        }
         BdwExecSnapshot* finished[32]{};BdwRetirementLedger::Node retirements[32]{};unsigned count=0;
-        KMutexLock(&mutex_);const bool ok=queue_.Finish(id,success,safelyStopped);
+        KMutexLock(&mutex_);
+        const bool ok=success && safelyStopped?
+            queue_.FinishWithCacheResult(id,true,true,cacheReady):queue_.Finish(id,success,safelyStopped);
         const bool poisoned=queue_.Poisoned();
         if(ok)while(count<32){auto* item=queue_.ReapAnyFinished();if(!item)break;finished[count]=item;retiring_.Add(retirements[count],BdwExecSnapshotOwner(item));++count;}
         KMutexUnlock(&mutex_);

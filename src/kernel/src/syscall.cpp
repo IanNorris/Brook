@@ -54,6 +54,9 @@
 #include "drm_map_tokens.h"
 #include "drm_backing_diagnostics.h"
 #include "intel_bdw_buffer.h"
+#ifdef BROOK_BDW_CACHE_PROBE
+#include "../../shared/bdw_cache_probe_abi.h"
+#endif
 #include "intel_bdw_file.h"
 #include "intel_bdw_ioctl.h"
 #include "intel_bdw_scanout.h"
@@ -7388,12 +7391,45 @@ static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t ar
         user.submitterIncarnation=current->leaderIncarnation?current->leaderIncarnation:current->incarnation;
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
-    if(!brook::BdwRenderExperimentEnabled())brook::DebugHardwareAutoInitializeIntel();
-    if(brook::BdwRenderExperimentEnabled()){
+    if(brook::BdwRenderExperimentEnabled() || brook::DebugHardwareAutoInitializeIntel()){
         user.submit=brook::BdwSubmitRenderExperiment;user.renderExperiment=true;
         user.handoffSubmit=brook::BdwOffscreenHandoffSubmit;
     } else if(brook::BdwStoreProbeEnabled())user.submit=brook::BdwSubmitStoreProbe;
     if(user.submit){user.beginExec=brook::BdwBeginRenderPreparation;user.endExec=brook::BdwEndRenderPreparation;}
+#endif
+#ifdef BROOK_BDW_CACHE_PROBE
+    if(cmd==BROOK_BDW_CACHE_PROBE_IOCTL){
+        auto* proc=ProcessCurrent();
+        if(!proc || proc->euid!=0)return -EPERM;
+        if(!user.renderExperiment)return -ENODEV;
+        BrookBdwCacheProbe request{};
+        if(!CopyFromUser(&request,arg,sizeof(request)) || !UserBufferWritable(arg,sizeof(request)))return -EFAULT;
+        if(request.reserved || request.skippedToDevice || request.skippedToCpu)return -EINVAL;
+        if(request.operation==BROOK_BDW_CACHE_PROBE_QUERY){
+            if(request.fd<0 || request.fd>=static_cast<int32_t>(MAX_FDS) || request.omit || request.bytes)return -EINVAL;
+            FdRef prime(proc,request.fd);
+            if(!prime || prime->type!=FdType::IntelPrime || !prime->handle)return -EBADF;
+            auto* buffer=static_cast<brook::BdwGpuBuffer*>(prime->handle);
+            brook::BdwCacheProbeCounters counters{};
+            if(!brook::BdwGpuBufferCacheProbeCounters(buffer,counters))return -EINVAL;
+            request.bytes=brook::BdwGpuBufferBytes(buffer);
+            request.omit=counters.omit;
+            request.skippedToDevice=counters.toDevice;
+            request.skippedToCpu=counters.toCpu;
+            return CopyToUser(arg,&request,sizeof(request))?0:-EFAULT;
+        }
+        if(request.operation!=BROOK_BDW_CACHE_PROBE_ALLOC || request.fd!=-1 ||
+           !request.bytes || request.bytes>BROOK_BDW_CACHE_PROBE_MAX_BYTES || (request.omit&~3u))return -EINVAL;
+        auto* buffer=brook::BdwGpuBufferCreateCacheProbe(request.bytes,request.omit);
+        if(!buffer)return -ENOMEM;
+        FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;owned.statusFlags=2;
+        const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        if(fd<0){brook::BdwGpuBufferUnref(buffer);return fd;}
+        request.fd=fd;
+        if(CopyToUser(arg,&request,sizeof(request)))return 0;
+        CloseProcessFd(proc,fd);
+        return -EFAULT;
+    }
 #endif
     // Plain syncobj descriptors retain the mutable object. Flag 1 instead
     // transfers an immutable fence through a sync-file descriptor.
@@ -12351,6 +12387,9 @@ static int64_t sys_brook_profile(uint64_t op, uint64_t a1, uint64_t, uint64_t,
     case 0: brook::ProfilerStart(static_cast<uint32_t>(a1)); return 0;
     case 1: brook::ProfilerStop(); return 0;
     case 2: return brook::ProfilerIsRunning() ? 1 : 0;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    case 3: return a1 <= 4000 ? brook::ProfilerStartFrameTrace(static_cast<uint32_t>(a1), ProcessCurrent()) : -EINVAL;
+#endif
     default: return -EINVAL;
     }
 }
@@ -12864,8 +12903,10 @@ static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t addres
         else if(uint64_t(info.width)*info.height>64ull*1024*1024/4)result=-E2BIG;
         else {
             auto& layer=wire->layers[0];const uint64_t bytes=uint64_t(info.width)*info.height*4;
-            const bool capture=op!=BROOK_DESKTOP_BACKDROP_QUERY;
-            result=0;
+            const bool capture=op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
+                op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE;
+            result=op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND?
+                brook::BdwOffscreenRegisterBackdrop(owner,info):0;
             if(capture && (wire->count!=1 || layer.incarnation!=info.display || layer.generation!=info.generation ||
                layer.width!=info.width || layer.height!=info.height || layer.stride!=info.width || layer.bytes!=bytes))result=-EAGAIN;
             else if(capture && (!layer.pixels || layer.capacity<bytes || layer.pixels>~uint64_t{0}-bytes ||
@@ -12903,7 +12944,8 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
     if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
-    if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE) &&
+    if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
+        op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopBackdrop(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
     if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED &&

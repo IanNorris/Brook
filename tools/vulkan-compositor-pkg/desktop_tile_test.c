@@ -122,6 +122,11 @@ int main(void){
         assert(packed[0]==scene[64] && packed[112]==scene[64+20*64+30]);
         scene[2]=2;scene[21+16]=127;
     }
+    assert(desktop_tile_pack(scene,38,sources,2,&damage,NULL,NULL,212,scenes,2*BROOK_VK_TILE_STRIDE,packedTiles,2));
+    const uint32_t *cachedTile=scenes+BROOK_VK_TILE_STRIDE;
+    assert(packedTiles[1].offsetBytes==448 && cachedTile[3]==112 && cachedTile[4]==64);
+    assert((int32_t)cachedTile[12]==-30 && (int32_t)cachedTile[13]==-20);
+    assert(cachedTile[5]==64 && cachedTile[6]==64 && cachedTile[7]==64);
     assert(!desktop_tile_pack(scene,38,sources,2,&damage,scene,packed,211,scenes,2*BROOK_VK_TILE_STRIDE,packedTiles,2));
     damage.rects[1]=damage.rects[0];
     assert(!desktop_tile_pack(scene,38,sources,2,&damage,scene,packed,212,scenes,2*BROOK_VK_TILE_STRIDE,packedTiles,2));

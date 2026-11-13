@@ -18,6 +18,29 @@
 #include <stdint.h>
 
 namespace brook {
+struct Process;
+
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+// Capture only the selected application and its graphics infrastructure.
+enum FrameGpuStage : unsigned {
+    FrameQueued, FrameTaken, FramePrepBegin, FrameDeviceSyncBegin,
+    FrameDeviceSyncEnd, FrameDeviceBegin, FrameDeviceEnd, FrameCpuSyncBegin,
+    FrameCpuSyncEnd, FrameRetired, FrameObject, FrameFenceSignal,
+    FrameFenceWait, FrameBlitBegin, FrameBlitIssue, FrameBlitEnd,
+    FrameBatch, FrameFenceDependency,
+    FrameRenderIssue, FrameRenderBreadcrumb, FrameRenderContextRetired,
+    FrameRenderFrequency, FrameRenderFrequencyRequest, FrameRenderPowerControl,
+    FrameRenderFrequencyCaps, FrameRenderFrequencyTrial,
+    FrameDesktopBegin, FrameDesktopCadence, FrameDesktopEnd,
+};
+bool ProfilerFrameTraceActive();
+int ProfilerStartFrameTrace(uint32_t durationMs, const Process* application);
+void ProfilerTraceReady(const Process* process);
+void ProfilerTraceMutex(const Process* waiter, const Process* holder,
+                        const void* mutex, bool granted);
+void ProfilerTraceGpu(uint16_t origin, unsigned stage, uint64_t id,
+                      uint64_t value = 0, uint64_t timestamp = 0);
+#endif
 
 // Initialise profiler subsystem (creates kernel thread, does NOT start sampling).
 void ProfilerInit();
@@ -45,7 +68,6 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
 // newPid: PID of the process being switched to.
 // Must be safe for scheduler context: no locks, no memory allocation.
 // Explicit outgoing bounds: ProcessCurrent already names the incoming task.
-void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
-                           uint64_t oldStackBase, uint64_t oldStackTop);
+void ProfilerContextSwitch(const Process* outgoing, const Process* incoming);
 
 } // namespace brook

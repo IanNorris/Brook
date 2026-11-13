@@ -21,6 +21,11 @@
 #include "vfs.h"
 #include "panic_test_reset.h"
 #include "intel_bdw_submission_worker.h"
+#include "profiler.h"
+#if defined(BROOK_BDW_RPS_TRIAL)
+#include "shutdown.h"
+#endif
+#include "process.h"
 #include "intel_bdw_file.h"
 #include "compositor.h"
 #include "panic_qr.h"
@@ -40,6 +45,13 @@ struct DiagnosticLease {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 uint32_t scratchMappingReady=0;
 uint32_t firstReleased=0;
+// Read from the boot filesystem before the scheduler starts. Device identity,
+// D0 and recovery admission are still checked at the existing call sites.
+struct RuntimeBootOptions {
+    bool execStore=false, contextWorker=false, renderWorker=false;
+    bool intelNode=false, renderExperiment=false, autoBootstrap=false;
+};
+RuntimeBootOptions runtimeBootOptions{};
 uint32_t* retainedRenderContext=nullptr;
 uint32_t* rebasedRenderContext=nullptr;
 #endif
@@ -483,12 +495,15 @@ static void CaptureWorkerObjects(const BdwExecSnapshot* snapshot){
         BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),current.bytes,current.words[0],current.words[1],current.words[2],current.words[3],current.words[4],current.words[5],current.words[6],current.words[7],sample.bytes,sample.words[0],sample.words[1],sample.words[2],sample.words[3],sample.words[4],sample.words[5],sample.words[6],sample.words[7]);
 }
 static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool contextTest){
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(snapshot,FramePrepBegin);
+#endif
     DiagnosticLease lease;if(!lease.held)return {false,true};
     auto* owner=snapshot?BdwExecSnapshotContext(snapshot):nullptr;
     if(!snapshot || (contextTest?!owner:owner!=nullptr) || !PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 ||
        !__atomic_load_n(&firstReleased,__ATOMIC_ACQUIRE) || !retainedRenderContext ||
        !observation.inventory || !observation.planned || !observation.patRequested ||
-       !OptedIn(contextTest?"/etc/dell-gpu-rcs-context-test":"/etc/dell-gpu-rcs-worker-test"))return {false,true};
+       !(contextTest?runtimeBootOptions.contextWorker:runtimeBootOptions.renderWorker))return {false,true};
     constexpr uint64_t pages[]={BdwDellBar0,BdwDellBar0+0xb000,BdwPrivatePatPage,BdwResetPage,0xf6880000ull,0xf6101000ull};
     for(auto page:pages)if(!PageAdmitted(page))return {false,true};
     for(auto page:BdwForcewakePages)if(!PageAdmitted(page))return {false,true};
@@ -532,6 +547,11 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     if(dmaStatus!=BdwDmaSnapshotOk){kfree(memory);PanicWorkerStage("private-dma",snapshot,dmaStatus);}
     BdwGgttReservation reservation{};
     if(!BdwRetainedRenderReservation(reservation) || reservation.first!=65544 || reservation.count!=29){kfree(memory);PanicWorkerStage("reservation",snapshot);}
+#ifdef BROOK_BDW_COHERENT_RENDER
+    // This worker has verified the exact Dell GT2 and owns the RCS path
+    // that installs and verifies the WB LLC/eLLC PPGTT policy.
+    if(!BdwExecSnapshotUseCoherentRender(snapshot)){kfree(memory);PanicWorkerStage("cache policy",snapshot);}
+#endif
     if(!BdwPrepareRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("prepare",snapshot);}
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t preparedTicks=tick();
@@ -541,9 +561,40 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
        pinned.count!=reservation.count || pinned.token!=reservation.token){kfree(memory);PanicWorkerStage("scratch",snapshot);}
     BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};
     run.ggttClearRequested=true;run.pollYieldRequested=true;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    run.sampleFrequency=ProfilerFrameTraceActive();
+#if defined(BROOK_BDW_RPS_TRIAL)
+    run.tryFrequency=ShutdownGetAcStatus().source==AcPowerSource::Online &&
+        PageAdmitted(BdwRenderFrequencyCapsPage);
+#endif
+    BdwTraceSnapshot(snapshot,FrameDeviceBegin);
+#endif
     VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t deviceTicks=tick();
+#endif
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(snapshot,FrameDeviceEnd);
+    if(run.sampleFrequency && run.issueTicks){
+        BdwTraceSnapshot(snapshot,FrameRenderIssue,0,run.issueTicks);
+        BdwTraceSnapshot(snapshot,FrameRenderBreadcrumb,0,run.breadcrumbTicks);
+        BdwTraceSnapshot(snapshot,FrameRenderContextRetired,0,run.contextRetiredTicks);
+        if(run.frequencySamples){
+            const auto first=run.frequency[0].ticks;
+            BdwTraceSnapshot(snapshot,FrameRenderFrequencyRequest,run.frequencyRequest,first);
+            BdwTraceSnapshot(snapshot,FrameRenderPowerControl,(uint64_t{run.rc6Control}<<32)|run.rpsControl,first);
+#if defined(BROOK_BDW_RPS_TRIAL)
+            BdwTraceSnapshot(snapshot,FrameRenderFrequencyCaps,run.trialFrequencyCaps,first);
+            if(run.trialFrequencyOriginal)
+                BdwTraceSnapshot(snapshot,FrameRenderFrequencyTrial,
+                    (uint64_t{run.trialFrequencyOriginal}<<32)|run.trialFrequencyPosted,first);
+#endif
+            for(unsigned i=0;i<run.frequencySamples;++i){
+                const auto& sample=run.frequency[i];
+                BdwTraceSnapshot(snapshot,FrameRenderFrequency,sample.status,sample.ticks);
+            }
+        }
+    }
 #endif
     const auto& t=run.transaction;
     const bool ok=t.contextSaved && t.resetComplete && t.patRestored && !t.uncertain && run.ggttCleared &&
@@ -566,11 +617,18 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
         BdwTimingRecord(snapshot,BdwTimingRetire,(retiredTicks-deviceTicks)*1000/tsc.khz,pageCount);
         for(unsigned i=0;i<6;++i)if(run.transactionTicks[i] && run.transactionTicks[i]<=~uint64_t{0}/1000)
             BdwTimingRecord(snapshot,static_cast<BdwTimingStage>(BdwTimingGtInit+i),run.transactionTicks[i]*1000/tsc.khz,pageCount);
-        if(run.issueToBreadcrumbTicks && run.issueToBreadcrumbTicks<=~uint64_t{0}/1000)
-            BdwTimingRecord(snapshot,BdwTimingIssueToBreadcrumb,run.issueToBreadcrumbTicks*1000/tsc.khz,pageCount);
-        if(run.breadcrumbToRetirementTicks && run.breadcrumbToRetirementTicks<=~uint64_t{0}/1000)
-            BdwTimingRecord(snapshot,BdwTimingBreadcrumbToRetirement,run.breadcrumbToRetirementTicks*1000/tsc.khz,pageCount);
+        if(run.issueTicks){
+            const auto issueToBreadcrumb=run.breadcrumbTicks-run.issueTicks;
+            const auto breadcrumbToRetirement=run.contextRetiredTicks-run.breadcrumbTicks;
+            if(issueToBreadcrumb<=~uint64_t{0}/1000)
+                BdwTimingRecord(snapshot,BdwTimingIssueToBreadcrumb,issueToBreadcrumb*1000/tsc.khz,pageCount);
+            if(breadcrumbToRetirement<=~uint64_t{0}/1000)
+                BdwTimingRecord(snapshot,BdwTimingBreadcrumbToRetirement,breadcrumbToRetirement*1000/tsc.khz,pageCount);
+        }
     }
+#endif
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(snapshot,FrameRetired);
 #endif
     if(owner){
         if(!BdwGpuContextFinish(owner,&context,true)){kfree(memory);PanicWorkerStage("context-finish",snapshot);}
@@ -582,16 +640,16 @@ BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* sna
 BdwSubmissionOutcome BdwExecuteRetainedContextWorkerSnapshot(void*,BdwExecSnapshot* snapshot){return ExecuteRetainedWorker(snapshot,true);}
 bool BdwStoreProbeEnabled(){
     return __atomic_load_n(&firstReleased,__ATOMIC_ACQUIRE) && PanicRecoveryResetArmed() &&
-        OptedIn("/etc/dell-gpu-exec-store-test") && OptedIn("/etc/dell-gpu-rcs-context-test") &&
+        runtimeBootOptions.execStore && runtimeBootOptions.contextWorker &&
         BdwIntelUserNodeEnabled();
 }
 bool BdwRenderExperimentEnabled(){
-    return BdwStoreProbeEnabled() && OptedIn("/etc/dell-gpu-render-experiment");
+    return BdwStoreProbeEnabled() && runtimeBootOptions.renderExperiment;
 }
 #endif
 bool BdwIntelUserNodeEnabled(){
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-    if(!PanicRecoveryResetArmed() || !observation.inventory || !observation.planned || !OptedIn("/etc/dell-gpu-intel-user-test"))return false;
+    if(!PanicRecoveryResetArmed() || !observation.inventory || !observation.planned || !runtimeBootOptions.intelNode)return false;
     for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))return false;
         const auto& d=entry.device;if(d.bus==0 && d.dev==2 && d.fn==0)return LiveGpuMatches(entry) && PowerD0(d);}
     return false;
@@ -601,8 +659,8 @@ bool BdwIntelUserNodeEnabled(){
 }
 bool BdwAutomaticRenderRequested(){
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
-    return BdwIntelUserNodeEnabled() && OptedIn("/etc/dell-gpu-auto-bootstrap") &&
-        OptedIn("/etc/dell-gpu-render-experiment");
+    return BdwIntelUserNodeEnabled() && runtimeBootOptions.autoBootstrap &&
+        runtimeBootOptions.renderExperiment;
 #else
     return false;
 #endif
@@ -811,6 +869,12 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     __atomic_add_fetch(&copyStats.requested,1,__ATOMIC_RELAXED);
     auto stage=[](uint32_t value){__atomic_store_n(&copyStats.lastStage,value,__ATOMIC_RELAXED);};
     stage(1);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    const auto* current=ProcessCurrent();
+    const uint16_t pid=current?current->pid:0;
+    const auto sourceId=BdwGpuBufferIdentity(source);
+    ProfilerTraceGpu(pid,FrameBlitBegin,token,sourceId);
+#endif
     DiagnosticLease lease;
     if(!lease.held || !BdwBcsScanoutEnabled() || !BdwRenderExperimentEnabled() || SmpCurrentCpuIndex()!=0 ||
        !PanicRecoveryResetArmed() || !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) ||
@@ -829,6 +893,9 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     stage(4);
     BdwForcewakeAdapterResult wake{};
     BdwBcsRunResult copy{};
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    ProfilerTraceGpu(pid,FrameBlitIssue,token,sourceId);
+#endif
     VmmDellBcsScanout(tsc.khz,reservation.first,reservation.token,scratch.dma,wake,copy);
     if(copy.portWriteAttempts)__atomic_add_fetch(&copyStats.submitted,1,__ATOMIC_RELAXED);
     if((copy.resetBeforeAttempted && !copy.resetBefore) || copy.patUncertain ||
@@ -837,6 +904,9 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
         KernelPanic("Broadwell scanout retirement uncertain: reset=%u/%u pat=%u ggtt=%u elsp=%u head=%x tail=%x acthd=%x ipeir=%x ipehr=%x",
             unsigned(copy.resetBefore),unsigned(copy.resetAfter),unsigned(copy.patRestored),
             copy.ggttWriteAttempts,copy.portWriteAttempts,copy.head,copy.tail,copy.acthd,copy.ipeir,copy.ipehr);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);
+#endif
     if(!copy.copyComplete || !copy.contextComplete || !copy.scanoutRetired || !wake.sequence.workComplete)return false;
     const bool full=count==1 && !regions[0].x && !regions[0].y && regions[0].width==3200 && regions[0].height==1800;
     __atomic_add_fetch(full?&copyStats.full:&copyStats.partial,1,__ATOMIC_RELAXED);
@@ -847,6 +917,9 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
 void BdwGopObserveConfigure(const BootProtocol* boot) {
     if(probeAttempted)return;
     observation={};
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+    runtimeBootOptions={};
+#endif
     if(!boot)return;
     observation.inventory=HdaDellToneInventoryMatches();
     if(!observation.inventory)return;
@@ -861,6 +934,16 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         const auto& f=boot->framebuffer;
         observation.planned=BdwPlanGopPtes(bar0,16ull<<20,bar2,256ull<<20,e.bdwGraphics.apertureControl,
             e.bdwGraphics.graphicsControl,f.physicalBase,f.width,f.height,f.stride,observation.plan);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        runtimeBootOptions={
+            OptedIn("/etc/dell-gpu-exec-store-test"),
+            OptedIn("/etc/dell-gpu-rcs-context-test"),
+            OptedIn("/etc/dell-gpu-rcs-worker-test"),
+            OptedIn("/etc/dell-gpu-intel-user-test"),
+            OptedIn("/etc/dell-gpu-render-experiment"),
+            OptedIn("/etc/dell-gpu-auto-bootstrap"),
+        };
+#endif
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");
         observation.otherEnginesRequested=OptedIn("/etc/dell-gpu-engines-run");

@@ -9,7 +9,11 @@
 namespace brook {
 // One immutable fence identity: state changes exactly once. A sync object may
 // replace its current fence without changing references held by queued work.
-struct BdwFence {uint32_t references,state,dependencyDepth,resolved,orderedPredecessor,isTimeline;BdwFence* predecessor;BdwFence* dependency;BdwFence* reapNext;uint64_t point, signalNs, resolvedNs;}; // pending=0, complete=1, failed=2, publishing=3
+struct BdwFence {uint32_t references,state,dependencyDepth,resolved,orderedPredecessor,isTimeline;BdwFence* predecessor;BdwFence* dependency;BdwFence* reapNext;uint64_t point, signalNs, resolvedNs;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    uint64_t traceId;
+#endif
+}; // pending=0, complete=1, failed=2, publishing=3
 inline uint64_t BdwFenceClockNs(){
 #ifndef BROOK_HOST_TEST
     const uint64_t now=KvmClockAvailable()?KvmClockReadNs():ApicTickCount()*1000000ULL;
@@ -25,6 +29,10 @@ inline BdwFence* BdwFenceCreate(bool completed=false,BdwFence* predecessor=nullp
     const uint32_t depDepth=dependency?dependency->dependencyDepth+1:0;
     const uint32_t depth=predDepth>depDepth?predDepth:depDepth;
     auto* f=static_cast<BdwFence*>(kmalloc(sizeof(BdwFence)));if(!f)return nullptr;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    static uint64_t serial;
+    f->traceId=__atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);
+#endif
     f->references=1;f->state=completed?1:0;f->dependencyDepth=depth;f->resolved=0;
     f->signalNs=completed && !predecessor && !dependency && !synthetic?(signalNs?signalNs:BdwFenceClockNs()):0;
     f->resolvedNs=0;

@@ -132,9 +132,23 @@ public:
         if(!first)return false;
         first->state=BdwExecRequestState::Active;active_=first->id;id=first->id;snapshot=first->snapshot;return true;
     }
-    // Only the engine owner may call Finish. safelyStopped requires verified
-    // retirement/reset and all necessary device/cache cleanup, not a timeout.
+    BdwExecSnapshot* ActiveSnapshot(uint64_t id){
+        auto* e=find(id);
+        return e && e->state==BdwExecRequestState::Active && active_==id?e->snapshot:nullptr;
+    }
+    // Only the engine owner may call Finish. The service can perform cache
+    // synchronization before acquiring its admission mutex while the active
+    // snapshot remains pinned. Other users keep the synchronous path.
     bool Finish(uint64_t id,bool success,bool safelyStopped){
+        auto* e=find(id);
+        if(!e || e->state!=BdwExecRequestState::Active || active_!=id)return false;
+        return FinishImpl(id,success,safelyStopped,false,false);
+    }
+    bool FinishWithCacheResult(uint64_t id,bool success,bool safelyStopped,bool cacheReady){
+        return FinishImpl(id,success,safelyStopped,true,cacheReady);
+    }
+private:
+    bool FinishImpl(uint64_t id,bool success,bool safelyStopped,bool cacheChecked,bool cacheReady){
         auto* e=find(id);if(!e || e->state!=BdwExecRequestState::Active || active_!=id)return false;
         // Publish failure before any use count can fall, so waiters cannot
         // mistake failed work for successful idle buffers. An unsafe engine
@@ -147,7 +161,8 @@ public:
             if(!BdwExecSnapshotSignalFences(pending.snapshot,false))return false;
             pending.state=BdwExecRequestState::Failed;
         }
-        if(safelyStopped && !BdwExecSnapshotRetire(e->snapshot,true)){
+        if(safelyStopped && !(cacheChecked?(cacheReady && BdwExecSnapshotRetireSynced(e->snapshot)):
+                                          BdwExecSnapshotRetire(e->snapshot,true))){
             // A cache synchronization failure must never look like success.
             // Keep the active snapshot retained and poison the queue.
             if(!BdwExecSnapshotMarkFailed(e->snapshot))return false;
@@ -164,6 +179,7 @@ public:
             e->state=success?BdwExecRequestState::Complete:BdwExecRequestState::Failed;}
         return true;
     }
+public:
     BdwExecSnapshot* Reap(uint64_t owner,uint64_t id,BdwExecRequestState& state){
         auto* e=find(id);if(!e || !owner || e->owner!=owner ||
             (e->state!=BdwExecRequestState::Cancelled && e->state!=BdwExecRequestState::Complete && e->state!=BdwExecRequestState::Failed))return nullptr;

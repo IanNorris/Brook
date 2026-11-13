@@ -6,6 +6,7 @@
 // themselves to take over.
 
 #include "display.h"
+#include "compositor.h"
 #include "display_power.h"
 #include "tty.h"
 #include "serial.h"
@@ -71,48 +72,52 @@ static const DisplayOps* g_activeDisplay = &g_gopOps;
 void DisplayRegister(const DisplayOps* ops)
 {
     if (!ops || !ops->name) return;
+    CompositorLockScanoutForDisplayChange();
     SerialPrintf("DISPLAY: registering '%s' (replacing '%s')\n",
-                 ops->name, g_activeDisplay->name);
-    g_activeDisplay = ops;
+                 ops->name, DisplayGetActive()->name);
+    __atomic_store_n(&g_activeDisplay, ops, __ATOMIC_RELEASE);
+    CompositorUnlockScanoutForDisplayChange();
 }
 
 const DisplayOps* DisplayGetActive()
 {
-    return g_activeDisplay;
+    return __atomic_load_n(&g_activeDisplay, __ATOMIC_ACQUIRE);
 }
+
+bool DisplayUsesFirmwareFramebuffer() { return DisplayGetActive()==&g_gopOps; }
 
 bool DisplaySetMode(uint32_t width, uint32_t height)
 {
-    return g_activeDisplay->SetMode(width, height);
+    return DisplayGetActive()->SetMode(width, height);
 }
 
 void DisplayGetMode(DisplayMode* mode)
 {
-    g_activeDisplay->GetMode(mode);
+    DisplayGetActive()->GetMode(mode);
 }
 
 volatile uint32_t* DisplayGetFramebuffer()
 {
-    return g_activeDisplay->GetFramebuffer();
+    return DisplayGetActive()->GetFramebuffer();
 }
 
 uint64_t DisplayGetFramebufferPhys()
 {
-    return g_activeDisplay->GetFramebufferPhys();
+    return DisplayGetActive()->GetFramebufferPhys();
 }
 
 void DisplayFlush(uint32_t minY, uint32_t maxY)
 {
     FramebufferWriteFence();
-    g_activeDisplay->Flush(minY, maxY);
+    DisplayGetActive()->Flush(minY, maxY);
 }
 
 void DisplayPanicPresent()
 {
     DisplayPowerPanicRestore();
     FramebufferWriteFence();
-    if (g_activeDisplay && g_activeDisplay->PanicPresent)
-        g_activeDisplay->PanicPresent();
+    if (const auto* active=DisplayGetActive(); active && active->PanicPresent)
+        active->PanicPresent();
 }
 
 // ---------------------------------------------------------------------------

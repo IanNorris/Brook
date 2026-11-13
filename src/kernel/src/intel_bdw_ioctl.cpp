@@ -1,4 +1,5 @@
 #include "intel_bdw_ioctl.h"
+#include "profiler.h"
 #include "intel_bdw_file.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_exec_snapshot.h"
@@ -287,6 +288,12 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
             const uint64_t now=u.nowNs(u.context);
             if(request.timeout<=0 || now>=uint64_t(request.timeout)){result=-62;break;}
             const uint64_t remaining=uint64_t(request.timeout)-now;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            if (ProfilerFrameTraceActive())
+                for(uint32_t i=0;i<request.count;++i)
+                    ProfilerTraceGpu(static_cast<uint16_t>(u.submitterPid),FrameFenceWait,
+                                     fences[i]?fences[i]->traceId:0,handles[i]);
+#endif
             if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         for(uint32_t i=0;i<acquired;++i){BdwFenceUnref(fences[i]);BdwGpuSyncUnref(objects[i]);}
@@ -320,6 +327,12 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
             const uint64_t now=u.nowNs(u.context);
             if(request.timeout<=0 || now>=uint64_t(request.timeout)){result=-62;break;}
             const uint64_t remaining=uint64_t(request.timeout)-now;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+            if (ProfilerFrameTraceActive())
+                for(uint32_t i=0;i<request.count;++i)
+                    ProfilerTraceGpu(static_cast<uint16_t>(u.submitterPid),FrameFenceWait,
+                                     fences[i]?fences[i]->traceId:0,handles[i]);
+#endif
             if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         for(uint32_t i=0;i<acquired;++i){BdwFenceUnref(fences[i]);BdwGpuSyncUnref(objects[i]);}

@@ -115,7 +115,21 @@ struct BdwRenderRunResult {
     // Diagnostic TSC durations for GT, PAT setup, run, save, reset/unbind,
     // PAT restore. Zero or backwards-clock intervals are omitted.
     uint64_t transactionTicks[6]{};
-    uint64_t issueToBreadcrumbTicks=0,breadcrumbToRetirementTicks=0;
+    uint64_t issueTicks=0,breadcrumbTicks=0,contextRetiredTicks=0;
+    struct FrequencySample {
+        uint64_t ticks;
+        uint32_t status;
+    };
+    static constexpr unsigned FrequencySampleLimit=12;
+    bool sampleFrequency=false;
+#if defined(BROOK_BDW_RPS_TRIAL)
+    bool tryFrequency=false;
+    uint32_t trialFrequencyCaps=0;
+    uint32_t trialFrequencyOriginal=0,trialFrequencyPosted=~uint32_t{0};
+#endif
+    unsigned frequencySamples=0;
+    FrequencySample frequency[FrequencySampleLimit]{};
+    uint32_t frequencyRequest=~uint32_t{0},rpsControl=~uint32_t{0},rc6Control=~uint32_t{0};
 #endif
     BdwRenderTransactionResult transaction{};
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;

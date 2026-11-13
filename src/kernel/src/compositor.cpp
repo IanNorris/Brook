@@ -36,6 +36,7 @@
 #include "gpu_compositor.h"
 #include "gpu_quad_math.h"
 #include "frame_timing.h"
+#include "profiler.h"
 #include "fw_cfg.h"
 #include "font_atlas.h"
 #include "debug_overlay.h"
@@ -57,9 +58,13 @@ static uint32_t g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_NONE;
 // A released/expired lease leaves its last complete image on screen until the
 // software flip. A failed or partial probe must not be reported as a frame.
 static bool g_scanoutContainsLeasedFrame=false, g_scanoutNeedsRepair=false;
+static CompositorSoftwareTakeoverStats g_softwareTakeover{};
 // Zero means generation tracking has exhausted its unique identifiers.
 // Protected by g_scanoutMappingLock, together with the display mapping.
 static uint64_t g_displayGeneration=1;
+// Writer ownership survives expiry of the renewable presentation lease.
+static uint64_t g_gopWriter=0,g_nextGopWriter=0,g_gopWriterOwner=0;
+static bool g_gopWriterRevoked=false;
 struct CompositorMutexGuard {
     KMutex* mutex;
     explicit CompositorMutexGuard(KMutex* value):mutex(value) { KMutexLock(mutex); }
@@ -439,7 +444,7 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     if (g_debugFrame.state!=DebugFrameState::Pending || g_debugFrameOverlay) return;
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     // Wait for the software compositor to repair a partially written scanout.
-    if(g_scanoutNeedsRepair) return;
+    if(g_gopWriter || g_scanoutNeedsRepair) return;
     g_debugFrame.state=DebugFrameState::Failed;
     // Reject a runtime remap since frame start rather than tagging a new,
     // unpresented buffer with this frame's epoch.
@@ -1826,6 +1831,14 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
 static void CompositorInputWM();
 static bool CompositorWmGestureActive();
 
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+static uint64_t desktopTraceCycle;
+static void TraceDesktopCycle(FrameGpuStage stage,uint64_t tick)
+{
+    if(ProfilerFrameTraceActive())
+        ProfilerTraceGpu(ProcessCurrent()->pid,stage,desktopTraceCycle,tick);
+}
+#endif
 static void CompositorLoopWM()
 {
     // Apply movement/focus/resize before rendering either chrome or content.
@@ -1920,6 +1933,9 @@ static void CompositorLoopWM()
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
 
     WmObserveDesktopTick(now);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    TraceDesktopCycle(FrameDesktopCadence,now);
+#endif
     SceneRect cpuDamage;
     const bool cpuPartial=!CompositorGpuActive() && !fullRepaint;
     if(cpuPartial) {
@@ -3515,12 +3531,14 @@ static void CompositorExpirePresentLease()
 static void CompositorFlipSoftware()
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
-    if(g_presentLease.Active(ApicTickCount()) || !g_backBuffer ||
-       (!g_scanoutContainsLeasedFrame && g_dirtyMinY>=g_dirtyMaxY))return;
+    const bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair;
+    const uint64_t tick=ApicTickCount();
+    if(g_gopWriter || g_presentLease.Active(tick) || !g_physFb || !g_backBuffer ||
+       (!full && g_dirtyMinY>=g_dirtyMaxY))return;
     // The scanout still contains the renderer's frame if its lease expired
     // during this loop. Replace the whole frame on software takeover.
-    uint32_t minY=g_scanoutContainsLeasedFrame?0:g_dirtyMinY;
-    uint32_t maxY=g_scanoutContainsLeasedFrame?g_physFbHeight:g_dirtyMaxY;
+    uint32_t minY=full?0:g_dirtyMinY;
+    uint32_t maxY=full?g_physFbHeight:g_dirtyMaxY;
     if(maxY>g_physFbHeight)maxY=g_physFbHeight;
     g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
     if(minY>=maxY)return;
@@ -3528,6 +3546,10 @@ static void CompositorFlipSoftware()
         __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),
                          g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
     brook::DisplayFlush(minY,maxY);
+    if(g_scanoutContainsLeasedFrame){
+        ++g_softwareTakeover.count;
+        g_softwareTakeover.lastAgeMs=tick-g_leasedFrameTick;
+    }
     g_scanoutContainsLeasedFrame=false;
     if(minY==0 && maxY==g_physFbHeight)g_scanoutNeedsRepair=false;
 }
@@ -3731,7 +3753,7 @@ static void CompositorLoop()
         }
     }
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
-    else if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
+    else
     {
         CompositorFlipSoftware();
     }
@@ -3821,6 +3843,10 @@ static void CompositorThreadFn(void* /*arg*/)
     for (;;)
     {
         const uint64_t frameGeneration=g_compositorWakeSequence.Snapshot();
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+        ++desktopTraceCycle;
+        TraceDesktopCycle(FrameDesktopBegin,ApicTickCount());
+#endif
         FrameTimingBegin();
         if (!g_compositorHalted) {
             DisplayPowerTick(ApicTickCount(),InputLatestSequence());
@@ -3838,6 +3864,9 @@ static void CompositorThreadFn(void* /*arg*/)
         // Block until either a process signals dirty (CompositorWake) or
         // the fallback interval elapses (ensures cursor updates even with
         // no dirty frames).
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+        TraceDesktopCycle(FrameDesktopEnd,ApicTickCount());
+#endif
         CompositorWaitForWork(frameGeneration);
     }
 }
@@ -3905,21 +3934,110 @@ bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t 
 }
 
 static bool CompositorCanBlitGopLocked(){
-    return g_backBuffer && g_backBuffer!=g_physFb && TtyDisplaySuppressed() && !BootLogoActive() &&
+    return DisplayUsesFirmwareFramebuffer() && g_backBuffer && g_backBuffer!=g_physFb &&
+        TtyDisplaySuppressed() && !BootLogoActive() &&
         g_physFbWidth==3200 && g_physFbHeight==1800 && g_physFbStride==3200 &&
         DisplayGetFramebufferPhys()==0xe0000000;
 }
 
+int CompositorReserveGopWrite(CompositorGopWrite& write,const CompositorPresentRegion* regions,
+                              uint32_t count,uint64_t sourceBytes,uint64_t display,uint64_t backdrop,
+                              uint64_t owner,bool partial)
+{
+    if(!regions || !count || count>COMPOSITOR_MAX_REGIONS || !display || !backdrop || !owner)return -22;
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    if(g_gopWriter)return -16;
+    if(!CompositorCanBlitGopLocked() || CompositorGpuActive())return -95;
+    if(!RefreshBackdropStyle() || display!=g_displayGeneration || backdrop!=g_backdropGeneration)return -116;
+    const uint64_t now=ApicTickCount();
+    if(!g_presentLease.CanAcquire(owner,now))return -16;
+    if(partial && (!g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair ||
+       !g_presentLease.Active(now) || g_presentLease.owner!=owner ||
+       display!=g_leasedFrameDisplay || backdrop!=g_leasedFrameBackdrop))return -116;
+    if(!partial && (count!=1 || regions[0].x || regions[0].y ||
+       regions[0].width!=g_physFbWidth || regions[0].height!=g_physFbHeight))return -22;
+    uint32_t minY=g_physFbHeight,maxY=0;
+    for(uint32_t i=0;i<count;++i){
+        const auto& r=regions[i];
+        if(!r.width || !r.height || r.stride<r.width || r.stride>16384 ||
+           r.x>=g_physFbWidth || r.y>=g_physFbHeight ||
+           r.width>g_physFbWidth-r.x || r.height>g_physFbHeight-r.y)return -22;
+        const uint64_t bytes=(uint64_t(r.height-1)*r.stride+r.width)*4;
+        if(r.offset>sourceBytes || bytes>sourceBytes-r.offset)return -22;
+        if(r.y<minY)minY=r.y;
+        if(r.y+r.height>maxY)maxY=r.y+r.height;
+    }
+    if(g_nextGopWriter==~uint64_t{0})return -75;
+    g_gopWriter=++g_nextGopWriter;
+    g_gopWriterOwner=owner;
+    g_gopWriterRevoked=false;
+    write={g_gopWriter,display,backdrop,owner,minY,maxY,partial};
+    return 0;
+}
+
+int CompositorCopyGopWrite(const CompositorGopWrite& write,const CompositorPresentRegion* regions,
+                           uint32_t count,void* source,bool (*copy)(void*,uint64_t,void*,uint64_t))
+{
+    if(!write.token)return -22;
+    // Admission validated the immutable regions. Remap and other writes
+    // defer while this reservation owns the current framebuffer.
+    for(uint32_t i=0;i<count;++i){
+        const auto& r=regions[i];
+        for(uint32_t row=0;row<r.height;++row){
+            auto* dest=const_cast<uint32_t*>(g_physFb+uint64_t(r.y+row)*g_physFbStride+r.x);
+            if(!copy(source,r.offset+uint64_t(row)*r.stride*4,dest,uint64_t(r.width)*4))return -5;
+        }
+    }
+    __asm__ volatile("sfence" ::: "memory");
+    return 0;
+}
+
+void CompositorSampleGopWrite(const CompositorGopWrite& write,uint32_t samples[4])
+{
+    if(!write.token || !samples)return;
+    const uint64_t lastRow=uint64_t(g_physFbHeight-1)*g_physFbStride;
+    samples[0]=g_physFb[0];samples[1]=g_physFb[g_physFbWidth-1];
+    samples[2]=g_physFb[lastRow];samples[3]=g_physFb[lastRow+g_physFbWidth-1];
+}
+
+int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool touched)
+{
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if(!write.token || write.token!=g_gopWriter || write.owner!=g_gopWriterOwner)return -116;
+        const uint64_t tick=ApicTickCount();
+        if(!result){
+            if(g_gopWriterRevoked || !RefreshBackdropStyle() || write.display!=g_displayGeneration ||
+               write.backdrop!=g_backdropGeneration || (write.partial &&
+               (!g_presentLease.Active(tick) || g_presentLease.owner!=write.owner)))result=-116;
+            else if(!g_presentLease.Acquire(write.owner,tick,COMPOSITOR_PRESENT_LEASE_MS))result=-75;
+            else {
+                DisplayFlush(write.minY,write.maxY);
+                g_leasedFrameEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
+                g_leasedFrameTick=tick;
+                g_leasedFrameDisplay=write.display;g_leasedFrameBackdrop=write.backdrop;
+                g_leasedFrameMode=write.partial?BROOK_DEBUG_FRAME_PRESENT_PARTIAL:BROOK_DEBUG_FRAME_PRESENT_FULL;
+                g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;
+            }
+        }
+        if(result && touched){g_scanoutNeedsRepair=true;g_presentLease.Release(write.owner);}
+        g_gopWriter=0;g_gopWriterOwner=0;
+    }
+    if(result && touched)CompositorMarkDirty();
+    CompositorWake();
+    return result;
+}
+
 int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t stride,
                            void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),uint32_t samples[4],
-                           uint64_t expectedDisplay,uint64_t expectedBackdrop,uint64_t leaseOwner,bool region,
-                           const CompositorPresentAcceleration* acceleration)
+                           uint64_t expectedDisplay,uint64_t expectedBackdrop,uint64_t leaseOwner,bool region)
 {
     if(!width || !height || width>16384 || height>16384 || stride<width || stride>16384 ||
        !source || !copy || (!samples && (!leaseOwner || region)) || (region && !leaseOwner))return -22;
     int result=0;bool touched=false;
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if(g_gopWriter)return -16;
         if(expectedDisplay && expectedDisplay!=g_displayGeneration)return -116;
         if(expectedBackdrop && (!RefreshBackdropStyle() || expectedBackdrop!=g_backdropGeneration))return -116;
         const uint64_t now=ApicTickCount();
@@ -3930,16 +4048,7 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
            height!=g_physFbHeight || !g_presentLease.CanAcquire(leaseOwner,now)))return -16;
         if(!g_physFb || CompositorGpuActive() || x>=g_physFbWidth || y>=g_physFbHeight ||
            width>g_physFbWidth-x || height>g_physFbHeight-y)return -22;
-        bool copied=false;
-        if(acceleration){
-            if(leaseOwner && CompositorCanBlitGopLocked()){
-                const CompositorPresentRegion rect{x,y,width,height,stride,0};
-                touched=true;
-                copied=acceleration->present(acceleration->context,&rect,1);
-            }
-            if(!copied && !acceleration->prepareCpu(acceleration->context))result=-5;
-        }
-        for(uint32_t row=0;!copied && !result && row<height;++row){
+        for(uint32_t row=0;row<height;++row){
             void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(y+row)*g_physFbStride+x);
             touched=true;
             if(!copy(source,uint64_t(row)*stride*4,dest,uint64_t(width)*4)){result=-5;break;}
@@ -3978,13 +4087,13 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
 
 int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t count,uint64_t sourceBytes,
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
-                             uint64_t display,uint64_t backdrop,uint64_t owner,
-                             const CompositorPresentAcceleration* acceleration)
+                             uint64_t display,uint64_t backdrop,uint64_t owner)
 {
     if(!regions || !count || count>COMPOSITOR_MAX_REGIONS || !source || !copy || !display || !backdrop || !owner)return -22;
     int result=0;bool touched=false;uint32_t minY=~uint32_t{0},maxY=0;
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if(g_gopWriter)return -16;
         const uint64_t now=ApicTickCount();
         if(!RefreshBackdropStyle() || display!=g_displayGeneration || backdrop!=g_backdropGeneration ||
            display!=g_leasedFrameDisplay || backdrop!=g_leasedFrameBackdrop || !g_scanoutContainsLeasedFrame ||
@@ -4001,15 +4110,7 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
             if(r.y<minY)minY=r.y;
             if(r.y+r.height>maxY)maxY=r.y+r.height;
         }
-        bool copied=false;
-        if(acceleration){
-            if(CompositorCanBlitGopLocked()){
-                touched=true;
-                copied=acceleration->present(acceleration->context,regions,count);
-            }
-            if(!copied && !acceleration->prepareCpu(acceleration->context))result=-5;
-        }
-        for(uint32_t i=0;!copied && !result && i<count;++i){
+        for(uint32_t i=0;!result && i<count;++i){
             const auto& r=regions[i];
             for(uint32_t row=0;row<r.height;++row){
                 void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(r.y+row)*g_physFbStride+r.x);
@@ -4037,8 +4138,16 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
 void CompositorReleasePresentLease(uint64_t owner)
 {
     bool released;
-    {CompositorMutexGuard geometry(&g_scanoutMappingLock);released=g_presentLease.Release(owner);}
+    {CompositorMutexGuard geometry(&g_scanoutMappingLock);
+     if(owner && g_gopWriterOwner==owner)g_gopWriterRevoked=true;
+     released=g_presentLease.Release(owner);}
     if(released){CompositorMarkDirty();CompositorWake();}
+}
+
+CompositorSoftwareTakeoverStats CompositorReadSoftwareTakeoverStats()
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    return g_softwareTakeover;
 }
 
 void CompositorUnregisterProcess(Process* proc)
@@ -4108,24 +4217,37 @@ void CompositorRemap(uint64_t fbPhys,uint32_t w,uint32_t h,uint32_t stridePixels
     }
     auto* physical=reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhys)).raw());
     auto* buffer=reinterpret_cast<uint32_t*>(replacement.raw());
-    for (uint32_t y=0;y<h;++y)
+    CompositorLockScanoutForDisplayChange();
+    for(uint32_t y=0;y<h;++y)
         memcpy(buffer+static_cast<uint64_t>(y)*stridePixels,
                const_cast<uint32_t*>(physical+static_cast<uint64_t>(y)*stridePixels),w*4);
-    bool cancelled=false;
-    {
-        CompositorMutexGuard publication(&g_scanoutMappingLock);
-        cancelled=g_presentLease.Clear();
-        g_scanoutContainsLeasedFrame=false;g_scanoutNeedsRepair=false;
-        // Previous backbuffers remain allocated for existing scanout aliases.
-        // Commit storage and geometry together only after successful preparation.
-        g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
-        g_backBuffer=buffer;g_backBufStride=stridePixels;
-        if(g_displayGeneration)++g_displayGeneration;
-        TtyRedirectToBackbuffer(buffer);
-    }
+    const bool cancelled=g_presentLease.Clear();
+    g_scanoutContainsLeasedFrame=false;g_scanoutNeedsRepair=false;
+    // Previous backbuffers remain allocated for existing scanout aliases.
+    // Commit storage and geometry together only after successful preparation.
+    g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
+    g_backBuffer=buffer;g_backBufStride=stridePixels;
+    if(g_displayGeneration)++g_displayGeneration;
+    TtyRedirectToBackbuffer(buffer);
+    CompositorUnlockScanoutForDisplayChange();
     MouseSetBounds(w,h);MarkAllDirty();
     if(cancelled){CompositorMarkDirty();CompositorWake();}
     SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
+}
+
+void CompositorLockScanoutForDisplayChange()
+{
+    for(;;){
+        KMutexLock(&g_scanoutMappingLock);
+        if(!g_gopWriter)return;
+        KMutexUnlock(&g_scanoutMappingLock);
+        SchedulerSleepMs(1);
+    }
+}
+
+void CompositorUnlockScanoutForDisplayChange()
+{
+    KMutexUnlock(&g_scanoutMappingLock);
 }
 
 void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
@@ -4162,6 +4284,7 @@ uint64_t CompositorScanoutMap(Process* proc,ScanoutMapResult* out)
 int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    if(g_gopWriter)return -16;
     if (!g_physFb || !g_backBuffer) return -1;
     if (minY >= g_physFbHeight) return -1;
     if (maxY > g_physFbHeight) maxY = g_physFbHeight;
@@ -4175,6 +4298,11 @@ int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
             const_cast<uint32_t*>(g_physFb + y * g_physFbStride),
             g_backBuffer + y * g_backBufStride,
             rowBytes);
+    }
+    if(g_presentLease.Clear() || g_scanoutContainsLeasedFrame){
+        g_scanoutNeedsRepair=true;
+        CompositorMarkDirty();
+        CompositorWake();
     }
     return 0;
 }

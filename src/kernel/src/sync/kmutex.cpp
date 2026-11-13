@@ -2,6 +2,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "serial.h"
+#include "profiler.h"
 
 namespace brook {
 
@@ -82,6 +83,9 @@ void KMutexLock(KMutex* m)
         SerialPrintf("KMutex: SELF-DEADLOCK pid=%u re-locking mutex it already owns "
                      "(mutex=%p)\n", self->pid, (void*)m);
     }
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    ProfilerTraceMutex(self, m->owner, m, false);
+#endif
     // Enqueue ourselves once on the FIFO wait queue.
     self->syncNext = nullptr;
     if (m->waitTail)
@@ -148,6 +152,9 @@ void KMutexUnlock(KMutex* m)
             m->waitTail = nullptr;
         waiter->syncNext = nullptr;
 
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+        ProfilerTraceMutex(waiter, self, m, true);
+#endif
         m->ownerPid = waiter->pid;
         m->owner = waiter;
         m->ownerIncarnation = waiter->incarnation;

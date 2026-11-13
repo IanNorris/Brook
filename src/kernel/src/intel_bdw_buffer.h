@@ -10,6 +10,13 @@ struct BdwGpuBuffer;
 // serialize handle lookup/close and establish DMA/IOMMU/cache safety before
 // publishing any page to hardware. This does not expose an i915 device.
 BdwGpuBuffer* BdwGpuBufferCreate(uint64_t bytes);
+#ifdef BROOK_BDW_CACHE_PROBE
+struct BdwCacheProbeCounters { uint32_t omit; uint64_t toDevice, toCpu; };
+BdwGpuBuffer* BdwGpuBufferCreateCacheProbe(uint64_t bytes,uint32_t omit);
+bool BdwGpuBufferCacheProbeCounters(const BdwGpuBuffer*,BdwCacheProbeCounters&);
+bool BdwGpuBufferSkipCacheProbeFlush(BdwGpuBuffer*,bool forDevice);
+void BdwGpuBufferPrimeCacheProbe(BdwGpuBuffer*);
+#endif
 // Kernel-owned output: CPU mappings through Intel DRM are forbidden from
 // creation for its entire lifetime, including after PRIME/GEM import.
 BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes);

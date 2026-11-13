@@ -8,6 +8,10 @@ namespace brook {
 // ownership and holds the mapping lock throughout. The backend supplies only
 // fixed-address DWORD device accesses and an ordered, invariant BSP TSC.
 constexpr uint64_t BdwDellBar0=0xf6000000ull;
+#if defined(BROOK_BDW_RPS_TRIAL)
+constexpr uint32_t BdwRenderFrequencyCaps=0x145998;
+constexpr uint64_t BdwRenderFrequencyCapsPage=BdwDellBar0+(BdwRenderFrequencyCaps&~4095u);
+#endif
 constexpr uint64_t BdwForcewakePages[]={0xf600a000ull,0xf6130000ull,0xf6138000ull,0xf6022000ull};
 constexpr uint64_t BdwOtherEnginePages[]={0xf6002000ull,0xf6012000ull,0xf601a000ull};
 constexpr uint64_t BdwPrivatePatPage=0xf6004000ull;

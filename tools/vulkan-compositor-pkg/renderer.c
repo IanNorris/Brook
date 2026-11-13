@@ -329,11 +329,19 @@ static BrookVkResult compose(BrookVkRenderer *r,const uint32_t *scene,size_t wor
     if(!maxX)return BROOK_VK_REJECTED;
     uint32_t dispatchX[BROOK_VK_MAX_TILES],dispatchY[BROOK_VK_MAX_TILES];
     for(uint32_t i=0;i<tiles;++i){const uint32_t *s=local+(size_t)i*BROOK_VK_TILE_STRIDE;
-        const uint64_t groups=((uint64_t)s[0]*s[1]+63)/64;
-        dispatchX[i]=groups<maxX?(uint32_t)groups:maxX;
-        const uint64_t y=(groups+dispatchX[i]-1)/dispatchX[i];
-        if(!y || y>r->properties.limits.maxComputeWorkGroupCount[1])return BROOK_VK_REJECTED;
-        dispatchY[i]=(uint32_t)y;
+        if(r->external==3){
+            // Match the 16 by 4 workgroup in the separate-output shader.
+            // Each invocation has integer x/y coordinates without dividing
+            // a flattened index by the tile width.
+            dispatchX[i]=(s[0]+15)/16;
+            dispatchY[i]=(s[1]+3)/4;
+        }else{
+            const uint64_t groups=((uint64_t)s[0]*s[1]+63)/64;
+            dispatchX[i]=groups<maxX?(uint32_t)groups:maxX;
+            dispatchY[i]=(uint32_t)((groups+dispatchX[i]-1)/dispatchX[i]);
+        }
+        if(!dispatchX[i] || dispatchX[i]>maxX || !dispatchY[i] ||
+           dispatchY[i]>r->properties.limits.maxComputeWorkGroupCount[1])return BROOK_VK_REJECTED;
     }
     VkMappedMemoryRange range={.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,.memory=r->memory,.size=VK_WHOLE_SIZE};
     if(!(r->flags&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && vkFlushMappedMemoryRanges(r->device,1,&range)!=VK_SUCCESS)
@@ -524,7 +532,8 @@ static void multi_cleanup(BrookVkRenderer *r){
 static BrookVkResult compose_multi(BrookVkRenderer *r,const uint32_t *scene,size_t words,
         const struct BrookVkExternalSource *sources,size_t count,uint32_t *output,int outputFd,size_t outputWords,uint64_t timeoutNs,uint32_t tiles,int asynchronous) {
     uint64_t start=renderer_now_ns(),imported=0,composed=0;
-    if(!r || (r->external!=2 && r->external!=3) || r->quarantined || r->multiCount || !sources || !count || count>BROOK_VK_MAX_LAYERS ||
+    if(!r || (r->external!=2 && r->external!=3) || r->quarantined || r->pending || r->multiCount ||
+       (count && !sources) || (!count && r->external!=3) || count>BROOK_VK_MAX_LAYERS ||
        !scene || !tiles || tiles>r->maxTiles || (r->external==2 && (!output || tiles!=1)) || (r->external==3 && outputFd<0) || words>r->maxWords)return BROOK_VK_REJECTED;
     size_t sizes[BROOK_VK_MAX_LAYERS];struct stat identity[BROOK_VK_MAX_LAYERS+1];
     for(size_t i=0;i<count;++i){
@@ -607,7 +616,8 @@ static BrookVkResult compose_multi(BrookVkRenderer *r,const uint32_t *scene,size
         if(!destination)descriptors[i]=(VkDescriptorBufferInfo){r->multiSource[i],0,(VkDeviceSize)size};
     }
     /* The layout does not use partially-bound descriptors. */
-    for(uint32_t i=r->multiCount;i<BROOK_VK_MAX_LAYERS;++i)descriptors[i]=descriptors[0];
+    if(!count)descriptors[0]=(VkDescriptorBufferInfo){r->buffer,0,4};
+    for(uint32_t i=r->multiCount?r->multiCount:1;i<BROOK_VK_MAX_LAYERS;++i)descriptors[i]=descriptors[0];
     VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=r->set,.dstBinding=1,
         .descriptorCount=BROOK_VK_MAX_LAYERS,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=descriptors};
     vkUpdateDescriptorSets(r->device,1,&write,0,NULL);

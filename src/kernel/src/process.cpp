@@ -1868,6 +1868,9 @@ extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp,unsigned source) {
     if(!PosixTimerClaimCaught(proc,signum,&info,&action) && !ProcessClaimCaughtSignal(proc,signum,&info,&action)) {
         FinishIrqSignalProbe(proc);return;
     }
+#ifdef BROOK_MAPPING_TEST_HOOKS
+    SerialPrintf("SIGNAL_IRQ_TEST pid=%u source=%u signal=%d\n",proc->pid,source,signum);
+#endif
     if(irqSignalProbeMode==2)SerialPrintf("SIGNAL_IRQ_PROBE source=ipi pid=%u signal=%d\n",proc->pid,signum);
     const uint64_t savedMask=proc->sigMask;
     const uint64_t handlerMask=(savedMask|action.mask|((action.flags&SA_NODEFER)?0:(1ULL<<(signum-1)))) & ~((1ULL<<8)|(1ULL<<18));

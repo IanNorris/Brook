@@ -28,6 +28,7 @@
 #include "vfs.h"
 #include "rtc.h"
 #include "memory/heap.h"
+#include "native_tsc_observe.h"
 
 extern "C" uint8_t __text_start[], __text_end[];
 
@@ -68,7 +69,7 @@ static uint8_t CaptureCallers(uint32_t cpu, uint64_t rbp, uint64_t base,
 // Event record — either a sample (P) or context-switch (CS)
 // ---------------------------------------------------------------------------
 
-enum class ProfileEventType : uint8_t { Sample = 0, ContextSwitch = 1 };
+enum class ProfileEventType : uint8_t { Sample, ContextSwitch, TracePoint };
 
 static constexpr uint32_t MAX_STACK_DEPTH = 8;
 
@@ -82,6 +83,9 @@ struct ProfileSample {
     uint8_t  depth;                    // number of valid frames
     // Used only for ContextSwitch events:
     uint16_t newPid;
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    uint64_t timestamp;
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -96,7 +100,11 @@ struct ProfileSample {
 // profiling window.  Accept ring-buffer overflow instead; the last
 // SAMPLES_PER_CPU events per CPU are always preserved.
 
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+static constexpr uint32_t SAMPLES_PER_CPU = 32768;
+#else
 static constexpr uint32_t SAMPLES_PER_CPU = 4096;
+#endif
 
 struct PerCpuBuffer {
     ProfileSample samples[SAMPLES_PER_CPU];
@@ -119,6 +127,115 @@ static volatile bool     g_profilerFlushReq  = false;
 static volatile bool     g_profilerFlushing  = false; // true while drain/close in progress
 static volatile int      g_profilerLastError = 0;
 static Process*          g_profilerThread    = nullptr;
+
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+static uint16_t g_traceTgid;
+static uint64_t g_traceStartTsc;
+static uint32_t g_traceWriters;
+static uint64_t TraceTime()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return (uint64_t{hi} << 32) | lo;
+}
+
+static bool TraceName(const char* name, const char* expected)
+{
+    for (; *expected; ++expected, ++name)
+        if (*name != *expected) return false;
+    return !*name;
+}
+
+static bool TraceWatches(const Process* process)
+{
+    return process && (process->tgid == g_traceTgid ||
+        TraceName(process->name, "compositor") ||
+        TraceName(process->name, "gpu-submit") ||
+        TraceName(process->name, "INTLWL.ELF") ||
+        TraceName(process->name, "VKRENDER.ELF") ||
+        TraceName(process->name, "VKSUP.ELF"));
+}
+
+// Pin the CPU by disabling interrupts. The writer count fences the final drain
+// against a remote CPU that entered just before sampling stopped.
+struct TraceWriter {
+    uint64_t flags = 0;
+    bool pinned = false;
+    bool enabled = false;
+    TraceWriter()
+    {
+        if (!__atomic_load_n(&g_profilerEnabled, __ATOMIC_ACQUIRE) || !g_traceTgid)
+            return;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+        pinned = true;
+        __atomic_add_fetch(&g_traceWriters, 1, __ATOMIC_ACQ_REL);
+        enabled = __atomic_load_n(&g_profilerEnabled, __ATOMIC_ACQUIRE) && g_traceTgid;
+    }
+    ~TraceWriter()
+    {
+        if (!pinned) return;
+        __atomic_sub_fetch(&g_traceWriters, 1, __ATOMIC_RELEASE);
+        if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+    }
+};
+
+static void TracePoint(unsigned kind, uint16_t pid, uint16_t peer,
+                       uint64_t id, uint64_t value, uint64_t timestamp)
+{
+    const uint32_t cpu = SmpCurrentCpuIndex();
+    if (cpu >= MAX_PROFILER_CPUS) return;
+    auto& buf = g_cpuBuf[cpu];
+    const uint32_t wi = buf.writeIdx;
+    const uint32_t next = (wi + 1) % SAMPLES_PER_CPU;
+    if (next == buf.readIdx) {
+        ++buf.dropped;
+        return;
+    }
+    auto& row = buf.samples[wi];
+    row.type = ProfileEventType::TracePoint;
+    row.cpu = static_cast<uint8_t>(cpu);
+    row.flags = static_cast<uint8_t>(kind);
+    row.pid = pid;
+    row.newPid = peer;
+    row.timestamp = timestamp ? timestamp : TraceTime();
+    row.rip[0] = id;
+    row.rip[1] = value;
+    __atomic_store_n(&buf.writeIdx, next, __ATOMIC_RELEASE);
+}
+
+void ProfilerTraceReady(const Process* process)
+{
+    TraceWriter writer;
+    if (writer.enabled && TraceWatches(process)) {
+        const auto* waker = ProcessCurrent();
+        TracePoint(1, process->pid, waker ? waker->pid : 0, process->incarnation, 0, 0);
+    }
+}
+
+void ProfilerTraceMutex(const Process* waiter, const Process* holder,
+                        const void* mutex, bool granted)
+{
+    TraceWriter writer;
+    if (writer.enabled && TraceWatches(waiter))
+        TracePoint(granted ? 3 : 2, waiter->pid, holder ? holder->pid : 0,
+                   reinterpret_cast<uint64_t>(mutex), waiter->incarnation, 0);
+}
+
+bool ProfilerFrameTraceActive()
+{
+    return __atomic_load_n(&g_profilerEnabled, __ATOMIC_ACQUIRE) && g_traceTgid;
+}
+
+void ProfilerTraceGpu(uint16_t origin, unsigned stage, uint64_t id,
+                      uint64_t value, uint64_t timestamp)
+{
+    TraceWriter writer;
+    if (writer.enabled && origin) {
+        const auto* current = ProcessCurrent();
+        TracePoint(16 + stage, origin, current ? current->pid : 0, id, value, timestamp);
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // ISR hot path — called from LAPIC timer handler on every CPU
@@ -153,6 +270,11 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     uint32_t cpu = SmpCurrentCpuIndex();
     if (cpu >= MAX_PROFILER_CPUS) return;
 
+    Process* proc = ProcessCurrent();
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    TraceWriter writer;
+    if (g_traceTgid && (!writer.enabled || !TraceWatches(proc))) return;
+#endif
     PerCpuBuffer& buf = g_cpuBuf[cpu];
 
     // Check if buffer is full (leave 1 slot gap for SPSC safety)
@@ -163,7 +285,6 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
         return;
     }
 
-    Process* proc = ProcessCurrent();
     uint16_t pid = proc ? proc->pid : 0xFFFF;
     bool userMode = (interruptedCs & 3) != 0;
 
@@ -173,6 +294,9 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     s.pid   = pid;
     s.cpu   = static_cast<uint8_t>(cpu);
     s.flags = userMode ? 1 : 0;
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    s.timestamp = writer.enabled ? TraceTime() : 0;
+#endif
 
     // Frame 0 = leaf (interrupted RIP)
     s.rip[0] = interruptedRip;
@@ -200,11 +324,14 @@ static const char kHexDigits[] = "0123456789abcdef";
 // Context-switch hook — emits a CS event into the calling CPU's ring buffer
 // ---------------------------------------------------------------------------
 
-void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
-                           uint64_t oldStackBase, uint64_t oldStackTop)
+void ProfilerContextSwitch(const Process* outgoing, const Process* incoming)
 {
-    if (!g_profilerEnabled) return;
-    if (oldPid == newPid) return; // no actual switch (e.g. same idle process)
+    if (!g_profilerEnabled || outgoing->pid == incoming->pid) return;
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    TraceWriter writer;
+    if (g_traceTgid && (!writer.enabled ||
+        (!TraceWatches(outgoing) && !TraceWatches(incoming)))) return;
+#endif
 
     uint32_t cpu = SmpCurrentCpuIndex();
     if (cpu >= MAX_PROFILER_CPUS) return;
@@ -224,8 +351,12 @@ void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
     s.type   = ProfileEventType::ContextSwitch;
     s.tick   = static_cast<uint32_t>(now - g_profilerStartTick);
     s.cpu    = static_cast<uint8_t>(cpu);
-    s.pid    = oldPid;
-    s.newPid = newPid;
+    s.pid    = outgoing->pid;
+    s.newPid = incoming->pid;
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    s.timestamp = writer.enabled ? TraceTime() : 0;
+    s.flags = static_cast<uint8_t>(outgoing->state);
+#endif
 
     // Capture the outgoing process's kernel stack at the CS point. This is
     // the most useful piece of data when investigating why a PID is stuck:
@@ -237,7 +368,7 @@ void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
     s.rip[0] = leafRip;
     uint8_t depth = 1;
 
-    depth += CaptureCallers(cpu, rbp, oldStackBase, oldStackTop,
+    depth += CaptureCallers(cpu, rbp, outgoing->kernelStackBase, outgoing->kernelStackTop,
                             s.rip + depth, MAX_STACK_DEPTH - depth, true);
     s.depth = depth;
 
@@ -295,6 +426,31 @@ static uint32_t FormatEvent(const ProfileSample& s, char* buf)
 {
     uint32_t p = 0;
 
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    if (s.timestamp) {
+        // T <tsc_hex> <cpu> <kind> <pid_hex> <peer_hex> <flags> <data_hex...>
+        buf[p++] = 'T'; buf[p++] = ' ';
+        p = AppendHex16(buf, p, s.timestamp);
+        buf[p++] = ' ';
+        p = AppendDec(buf, p, s.cpu);
+        buf[p++] = ' ';
+        p = AppendDec(buf, p, s.type == ProfileEventType::TracePoint ? s.flags :
+                     s.type == ProfileEventType::ContextSwitch ? 0 : 4);
+        buf[p++] = ' ';
+        p = AppendHex4(buf, p, s.pid);
+        buf[p++] = ' ';
+        p = AppendHex4(buf, p, s.type == ProfileEventType::Sample ? 0 : s.newPid);
+        buf[p++] = ' ';
+        p = AppendDec(buf, p, s.type == ProfileEventType::TracePoint ? 0 : s.flags);
+        const unsigned count = s.type == ProfileEventType::TracePoint ? 2 : s.depth;
+        for (unsigned i = 0; i < count; ++i) {
+            buf[p++] = ' ';
+            p = AppendHex16(buf, p, s.rip[i]);
+        }
+        buf[p++] = '\n';
+        return p;
+    }
+#endif
     if (s.type == ProfileEventType::ContextSwitch) {
         // CS <tick> <cpu> <old_pid_hex> <new_pid_hex> [<rip0>;<rip1>;...]
         // Stack frames are the OUTGOING process's kernel callstack at the
@@ -503,6 +659,18 @@ static bool ProfileWriterOpen(ProfileWriter& pw)
     p = AppendDec(hdr, p, static_cast<uint32_t>(g_profilerStartTick));
     hdr[p++] = '\n';
     ProfileWriterAppend(pw, hdr, p);
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+    if (g_traceTgid) {
+        p = AppendStr(hdr, 0, "FRAME_CLOCK ");
+        p = AppendHex16(hdr, p, g_traceStartTsc);
+        hdr[p++] = ' ';
+        p = AppendDec(hdr, p, NativeTscObserveRead().khz);
+        hdr[p++] = ' ';
+        p = AppendDec(hdr, p, g_traceTgid);
+        hdr[p++] = '\n';
+        ProfileWriterAppend(pw, hdr, p);
+    }
+#endif
     return true;
 }
 
@@ -591,6 +759,31 @@ static void ProfilerThreadFn(void* /*arg*/)
             }
         }
 
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+        if (g_traceTgid) {
+            while (__atomic_load_n(&g_profilerEnabled, __ATOMIC_ACQUIRE)) {
+                Process* self = ProcessCurrent();
+                self->wakeupTick = ApicTickCount() + 1000;
+                SchedulerBlock(self);
+            }
+            __atomic_store_n(&g_profilerFlushing, true, __ATOMIC_RELEASE);
+            while (__atomic_load_n(&g_traceWriters, __ATOMIC_ACQUIRE))
+                __asm__ volatile("pause" ::: "memory");
+            ProfileWriter pw;
+            if (ProfileWriterOpen(pw)) {
+                ProfileWriterDrain(pw);
+                ProfileWriterClose(pw);
+            }
+            __atomic_store_n(&g_profilerLastError, pw.error, __ATOMIC_RELEASE);
+            for (auto& buf : g_cpuBuf) {
+                buf.readIdx = buf.writeIdx = buf.dropped = 0;
+            }
+            g_traceTgid = 0;
+            __atomic_store_n(&g_profilerFlushReq, false, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_profilerFlushing, false, __ATOMIC_RELEASE);
+            continue;
+        }
+#endif
         if (g_profilerEnabled) {
             // Open the profile file immediately so we can drain into it each
             // second.  This prevents the 4096-slot per-CPU ring buffers from
@@ -720,6 +913,20 @@ void ProfilerStart(uint32_t durationMs)
     SerialPrintf("PROFILER: recording started (%u ms, %u CPUs)\n",
                  durationMs, SmpGetCpuCount());
 }
+
+#ifdef BROOK_GPU_SUBMISSION_TIMING
+int ProfilerStartFrameTrace(uint32_t durationMs, const Process* application)
+{
+    if (!application || !durationMs || durationMs > 4000) return -22;
+    const auto& tsc = NativeTscObserveRead();
+    if (!tsc.capable || !tsc.consistent || !tsc.khz) return -95;
+    if (ProfilerIsRunning()) return -16;
+    g_traceStartTsc = TraceTime();
+    g_traceTgid = application->tgid;
+    ProfilerStart(durationMs);
+    return 0;
+}
+#endif
 
 void ProfilerStop()
 {
