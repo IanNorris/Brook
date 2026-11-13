@@ -5,6 +5,7 @@
 #include <chrono>
 #include <atomic>
 #include "../../kernel/src/compositor.cpp"
+#include "../../kernel/src/desktop_frame_scenes.h"
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"CAPTURE_QUEUE line %d: %s\n",__LINE__,#x);std::abort(); } } while(0)
 namespace {
@@ -223,6 +224,30 @@ int main() {
     CHECK(framebuffer[0]==fullSource[0] && framebuffer[47]==fullSource[47]);
     CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42));
     CHECK(g_presentLease.owner==42 && g_presentLease.deadline==100+COMPOSITOR_PRESENT_LEASE_MS && framebuffer[47]==fullSource[47]);
+    // Exercise dependency coverage against the real software scanout and
+    // lease implementation. This fixture does not exercise the Intel ioctl.
+    int sceneMarkers[2]{};DesktopFrameScenes<int> dependencies{};
+    CHECK(dependencies.Insert({42,11,1,display,g_backdropGeneration,0,false,&sceneMarkers[0],false}));
+    CHECK(dependencies.Insert({42,12,2,display,g_backdropGeneration,0,false,&sceneMarkers[1],false}));
+    uint32_t olderPixels[]={101,102};CompositorPresentRegion olderRegion{2,1,2,1,2,0};
+    CHECK(!CompositorPresentRegions(&olderRegion,1,sizeof(olderPixels),olderPixels,copy,display,g_backdropGeneration,42));
+    DesktopDependencyRect olderWrite{2,1,2,1};dependencies.RecordAccepted(42,11,&olderWrite,1,false);
+    DesktopDependencyRect missingWrite{2,1,1,1},coveredWrites[]={{2,1,1,1},{3,1,1,1}};
+    CHECK(!DesktopDependenciesCovered(dependencies.Find(42,12)->dependencies,&missingWrite,1));
+    CHECK(DesktopDependenciesCovered(dependencies.Find(42,12)->dependencies,coveredWrites,2));
+    CHECK(framebuffer[10]==101 && framebuffer[11]==102);
+    // A rejected update makes no framebuffer change; a covering successor
+    // reconstructs both pixels using the actual region presentation path.
+    uint32_t newerPixels[]={201,202};
+    if(DesktopDependenciesCovered(dependencies.Find(42,12)->dependencies,&missingWrite,1))
+        (void)CompositorPresentRegions(&olderRegion,1,sizeof(newerPixels),newerPixels,copy,display,g_backdropGeneration,42);
+    CHECK(framebuffer[10]==101 && framebuffer[11]==102);
+    CHECK(DesktopDependenciesCovered(dependencies.Find(42,12)->dependencies,coveredWrites,2));
+    CHECK(!CompositorPresentRegions(&olderRegion,1,sizeof(newerPixels),newerPixels,copy,display,g_backdropGeneration,42));
+    CHECK(framebuffer[10]==201 && framebuffer[11]==202);
+    dependencies.RecordAccepted(42,11,nullptr,0,true);
+    CHECK(!DesktopDependenciesCovered(dependencies.Find(42,12)->dependencies,coveredWrites,2));
+    CHECK(!CompositorPresentProbe(0,0,8,6,8,fullSource,copy,samples,display,g_backdropGeneration,42));
     CHECK(g_presentLease.Active(100+COMPOSITOR_PRESENT_LEASE_MS-1));
     CHECK(!g_presentLease.Active(100+COMPOSITOR_PRESENT_LEASE_MS));
     uint32_t patchPixels[]={11,12,13,14};

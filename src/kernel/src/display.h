@@ -58,6 +58,7 @@ extern "C" void DisplayRegister(const DisplayOps* ops);
 
 // Get the active display. Returns the GOP fallback if no driver registered.
 const DisplayOps* DisplayGetActive();
+bool DisplayUsesFirmwareFramebuffer();
 
 // Set display mode via the active driver.
 bool DisplaySetMode(uint32_t width, uint32_t height);

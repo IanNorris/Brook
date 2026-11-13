@@ -85,7 +85,7 @@ static int capture_overlay(uint32_t *output,uint32_t width,uint32_t height){
     return 0;
 }
 int main(int argc,char **argv){
-    int legacy=0,presentProbe=0,tracked=0,staleCheck=0,titleCheck=0,backdropEnabled=0,chromeEnabled=0,overlayEnabled=0,leaseCheck=0,leaseHold=0,repeatLease=0,liveLease=0,liveCache=0,regionCheck=0,overlapCheck=0,coverPoint=0;
+    int legacy=0,presentProbe=0,tracked=0,staleCheck=0,titleCheck=0,backdropEnabled=0,chromeEnabled=0,overlayEnabled=0,leaseCheck=0,leaseHold=0,repeatLease=0,liveLease=0,liveCache=0,regionCheck=0,overlapCheck=0,dependentCheck=0,coverPoint=0;
     unsigned long coverX=0,coverY=0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--with-legacy"))legacy=1;
@@ -103,6 +103,7 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--live-cache")){tracked=1;backdropEnabled=1;chromeEnabled=1;overlayEnabled=1;presentProbe=1;leaseCheck=1;liveLease=1;liveCache=1;}
         else if(!strcmp(argv[i],"--region-check")){tracked=1;backdropEnabled=1;chromeEnabled=1;overlayEnabled=1;presentProbe=1;leaseCheck=1;regionCheck=1;}
         else if(!strcmp(argv[i],"--overlap-check")){tracked=1;backdropEnabled=1;chromeEnabled=1;overlayEnabled=1;presentProbe=1;leaseCheck=1;regionCheck=1;overlapCheck=1;}
+        else if(!strcmp(argv[i],"--dependent-check")){tracked=1;backdropEnabled=1;chromeEnabled=1;overlayEnabled=1;presentProbe=1;leaseCheck=1;regionCheck=1;dependentCheck=1;}
         else if(!strcmp(argv[i],"--cover-point") && i+2<argc){
             char *end=NULL;coverX=strtoul(argv[++i],&end,10);CHECK(end && !*end);
             coverY=strtoul(argv[++i],&end,10);CHECK(end && !*end);coverPoint=1;
@@ -328,6 +329,58 @@ int main(int argc,char **argv){
         if(status==BROOK_VK_UNCERTAIN)uncertain("DESKTOP_REGION_UNCERTAIN");
         CHECK(status==BROOK_VK_COMPLETE && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,batchTicket,0,0,0,0)==1);
         CHECK(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&batch,0,0,0,0));
+        if(dependentCheck){
+            const long caps=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_CAPS,0,0,0,0,0);
+            CHECK(caps>0 && (caps&BROOK_GPU_PRESENT_CAP_DEPENDENT));
+            int output2=(int)syscall(BROOK_SYS_GPU_OUTPUT_ALLOC,(long)(batchWords*4),0L,0L,0L,0L,0L);CHECK(output2>=0);
+            BrookVkRenderer *renderer2=brook_vk_renderer_create_batch_output(2,0);CHECK(renderer2);
+            uint64_t baseline=(uint64_t)batchTicket;
+            for(unsigned mode=0;mode<4;++mode){
+                errno=0;CHECK(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE_DEPENDENT,output2,baseline-1,0,0,0)==-1 && errno==ESTALE);
+                long older=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,mode==3?protectedFd:batchOutput,0,0,0,0);CHECK(older>0);
+                desktop.reserved=0;
+                CHECK(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED,&desktop,sizeof(desktop),0,0,0) && desktop.reserved);
+                CHECK(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE,&backdrop,sizeof(backdrop),0,0,0));
+                for(unsigned i=0;i<desktop.count;++i){
+                    CHECK(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_QUERY,&chrome[i],sizeof(chrome[i]),0,0,0));
+                    CHECK(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&chrome[i],sizeof(chrome[i]),0,0,0));
+                }
+                long newer=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE_DEPENDENT,output2,baseline,0,0,0);CHECK(newer>older);
+                status=mode==3?brook_vk_renderer_compose_multi_output(renderer,scene,WORDS,sources,sceneCount,protectedFd,dst.size/4,10000000000ULL):
+                    brook_vk_renderer_compose_batch_output(batchRenderer,batchScenes,2*BROOK_VK_TILE_STRIDE,2,regionSources,sceneCount,batchOutput,batchWords,10000000000ULL);
+                if(status==BROOK_VK_UNCERTAIN)uncertain("DESKTOP_DEPENDENT_OLDER_UNCERTAIN");
+                CHECK(status==BROOK_VK_COMPLETE && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,older,0,0,0,0)==1);
+                status=brook_vk_renderer_compose_batch_output(renderer2,batchScenes,2*BROOK_VK_TILE_STRIDE,2,regionSources,sceneCount,output2,batchWords,10000000000ULL);
+                if(status==BROOK_VK_UNCERTAIN)uncertain("DESKTOP_DEPENDENT_NEWER_UNCERTAIN");
+                CHECK(status==BROOK_VK_COMPLETE && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,newer,0,0,0,0)==1);
+                struct BrookGpuPresentRegions oldBatch=batch,newBatch=batch;oldBatch.ticket=(uint64_t)older;newBatch.ticket=(uint64_t)newer;
+                if(mode==3){struct BrookGpuPresentProbe full={(uint64_t)older,0,0,WIDTH,HEIGHT,WIDTH,0,{0}};
+                    CHECK(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_LEASE,&full,0,0,0,0));}
+                else if(mode!=2)CHECK(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&oldBatch,0,0,0,0));
+                if(mode==0 || mode==3){if(mode==0)newBatch.count=1;errno=0;
+                    CHECK(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&newBatch,0,0,0,0)==-1 && errno==ESTALE);
+                    baseline=(uint64_t)older;
+                }else {CHECK(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&newBatch,0,0,0,0));
+                    baseline=(uint64_t)newer;
+                    if(mode==2){errno=0;CHECK(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&oldBatch,0,0,0,0)==-1 && errno==ESTALE);}
+                }
+            }
+            long expired=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE_DEPENDENT,output2,baseline,0,0,0);CHECK(expired>0);
+            status=brook_vk_renderer_compose_batch_output(renderer2,batchScenes,2*BROOK_VK_TILE_STRIDE,2,regionSources,sceneCount,output2,batchWords,10000000000ULL);
+            if(status==BROOK_VK_UNCERTAIN)uncertain("DESKTOP_DEPENDENT_EXPIRED_UNCERTAIN");
+            CHECK(status==BROOK_VK_COMPLETE && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,expired,0,0,0,0)==1);
+            usleep(650000);struct BrookGpuPresentRegions expiredBatch=batch;expiredBatch.ticket=(uint64_t)expired;errno=0;
+            CHECK(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&expiredBatch,0,0,0,0)==-1 && errno==ESTALE);
+            // Restore a full lease for the rest of the fixture.
+            long full=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,protectedFd,0,0,0,0);CHECK(full>0);
+            status=brook_vk_renderer_compose_multi_output(renderer,scene,WORDS,sources,sceneCount,protectedFd,dst.size/4,10000000000ULL);
+            if(status==BROOK_VK_UNCERTAIN)uncertain("DESKTOP_DEPENDENT_RESTORE_UNCERTAIN");
+            CHECK(status==BROOK_VK_COMPLETE && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,full,0,0,0,0)==1);
+            struct BrookGpuPresentProbe reset={(uint64_t)full,0,0,WIDTH,HEIGHT,WIDTH,0,{0}};
+            CHECK(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_LEASE,&reset,0,0,0,0));
+            CHECK(brook_vk_renderer_destroy(renderer2));close(output2);
+            fprintf(stderr,"DESKTOP_DEPENDENT_PRESENT_PASS stale_baseline=1 incomplete=1 covered=1 newer_first=1 full_interposed=1 lease_expiry=1\n");
+        }
         if(overlapCheck){
             long older=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,batchOutput,0,0,0,0);CHECK(older>0);
             desktop.reserved=0;

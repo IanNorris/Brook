@@ -118,7 +118,8 @@ static inline int desktop_tile_crop_backdrop(const uint32_t *scene,size_t words,
 
 struct DesktopPackedTile {uint32_t x,y,width,height;uint64_t offsetBytes;};
 enum { DESKTOP_TILE_ALIGNMENT_WORDS=64/sizeof(uint32_t) };
-/* Prepare disjoint backgrounds and matching batch scenes with tight rows.
+/* Prepare disjoint batch outputs with tight rows. Optionally copy cropped
+ * backdrop tiles, or retain the original source and transform its coordinates.
  * Tile bases are cache-line aligned for the Broadwell linear blitter.
  * On failure the caller must discard all outputs; no GPU submission has
  * occurred. All input/output arrays must be independent. Source buffers
@@ -127,7 +128,7 @@ static inline int desktop_tile_pack(const uint32_t *scene,size_t words,const siz
         const struct DesktopDamageSet *damage,const uint32_t *backdrop,uint32_t *packed,size_t packedWords,
         uint32_t *scenes,size_t sceneWords,struct DesktopPackedTile *tiles,size_t tileCapacity){
     if(!scene || words<BROOK_VK_SCENE_HEADER || !sources || !damage || !damage->count || damage->count>BROOK_VK_MAX_TILES ||
-       !backdrop || !packed || !scenes || !tiles || tileCapacity<damage->count ||
+       (!!backdrop!=!!packed) || !scenes || !tiles || tileCapacity<damage->count ||
        sceneWords<(size_t)damage->count*BROOK_VK_TILE_STRIDE)return 0;
     uint64_t total=0;
     uint32_t offsets[BROOK_VK_MAX_TILES];
@@ -146,9 +147,13 @@ static inline int desktop_tile_pack(const uint32_t *scene,size_t words,const siz
         const uint32_t width=(uint32_t)(r->right-r->left),height=(uint32_t)(r->bottom-r->top);
         const uint32_t offset=offsets[i];
         uint32_t *out=scenes+(size_t)i*BROOK_VK_TILE_STRIDE;
-        if(!desktop_tile_crop_backdrop(scene,words,sources,count,(uint32_t)r->left,(uint32_t)r->top,width,height,
-                                       backdrop,packed+offset,packedWords-offset,out,BROOK_VK_TILE_STRIDE))return 0;
-        out[3]=offset;out[4]=offset;
+        const uint32_t x=(uint32_t)r->left,y=(uint32_t)r->top;
+        if(backdrop){
+            if(!desktop_tile_crop_backdrop(scene,words,sources,count,x,y,width,height,
+                                           backdrop,packed+offset,packedWords-offset,out,BROOK_VK_TILE_STRIDE))return 0;
+            out[4]=offset;
+        }else if(!desktop_tile_scene(scene,words,sources,count,x,y,width,height,out,BROOK_VK_TILE_STRIDE))return 0;
+        out[3]=offset;
         tiles[i]=(struct DesktopPackedTile){(uint32_t)r->left,(uint32_t)r->top,width,height,(uint64_t)offset*4};
     }
     return 1;

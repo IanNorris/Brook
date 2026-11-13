@@ -1,10 +1,19 @@
 #version 450
 layout(local_size_x = 64) in;
+#ifdef BROOK_CACHE_PROBE
+layout(set = 0, binding = 0, std430) readonly buffer Data { uint words[]; } data;
+layout(set = 0, binding = 1, std430) writeonly buffer Result { uint words[]; } outputData;
+#else
 layout(set = 0, binding = 0, std430) buffer Data { uint words[]; } data;
+#endif
 layout(push_constant) uniform Parameters { uint seed; } params;
 void main()
 {
     uint i = gl_GlobalInvocationID.x;
-    data.words[i] = (data.words[i] ^ (0x9e3779b9u + params.seed))
-                    * 1664525u + 1013904223u;
+    uint value = (data.words[i] ^ (0x9e3779b9u + params.seed)) * 1664525u + 1013904223u;
+#ifdef BROOK_CACHE_PROBE
+    outputData.words[i] = value;
+#else
+    data.words[i] = value;
+#endif
 }

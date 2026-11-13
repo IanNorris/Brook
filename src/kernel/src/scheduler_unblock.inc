@@ -1,3 +1,45 @@
+static void SchedulerMakeReadyLocked(Process* proc)
+{
+    __atomic_store_n(&proc->resumePending, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&proc->wakeAfterSwitch, false, __ATOMIC_RELEASE);
+    proc->state = ProcessState::Ready;
+    const uint64_t wakeDeadline=proc->wakeupTick;
+    proc->wakeupTick = 0;
+    __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
+    SchedTrace(proc, STR_READY_UNBLOCK);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_SCHED_BLOCK_HOST_TEST)
+    ProfilerTraceReady(proc);
+#endif
+    ReadyQueueInsertLocked(proc);
+    if(wakeDeadline && g_readyLatency.Watching(proc->pid,proc->incarnation))
+        g_readyLatency.Deadline(proc->pid,proc->incarnation,wakeDeadline,ApicTickCount());
+}
+
+// Recheck the wake reason while holding the ready lock. A timer scan can
+// retain a task across dispatch and must not wake its next unrelated wait.
+[[maybe_unused]] static bool SchedulerConsumeDeferredWake(Process* proc, uint64_t now, bool afterSwitch)
+{
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    bool ready = false;
+    if (__atomic_load_n(&proc->runningOnCpu, __ATOMIC_ACQUIRE) == -1) {
+        if (proc->state == ProcessState::Blocked) {
+            if (afterSwitch)
+                ready = __atomic_load_n(&proc->wakeAfterSwitch, __ATOMIC_ACQUIRE);
+            else
+                ready = __atomic_load_n(&proc->pendingWakeup, __ATOMIC_ACQUIRE) ||
+                    (proc->wakeupTick && now >= proc->wakeupTick);
+        } else if (proc->state == ProcessState::Stopped) {
+            ready = __atomic_load_n(&proc->resumePending, __ATOMIC_ACQUIRE);
+        }
+        if (ready)
+            SchedulerMakeReadyLocked(proc);
+    }
+    SchedLockRelease(g_readyLock, flags);
+    if (ready)
+        KickIdleCpu();
+    return ready;
+}
+
 // Production unblock/continue body shared with deterministic ownership tests.
 static void SchedulerUnblockInternal(Process* proc, bool continued)
 {
@@ -65,21 +107,15 @@ static void SchedulerUnblockInternal(Process* proc, bool continued)
         // be confused with an ordinary I/O wakeup or SchedulerBlock fast path.
         if (proc->state == ProcessState::Stopped)
             __atomic_store_n(&proc->resumePending, true, __ATOMIC_RELEASE);
-        else
+        else {
             __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&proc->wakeAfterSwitch, true, __ATOMIC_RELEASE);
+        }
         SchedTrace(proc, STR_UNBLOCK_DEFER_CPU);
         SchedLockRelease(g_readyLock, rlf4);
         return;
     }
-    __atomic_store_n(&proc->resumePending, false, __ATOMIC_RELEASE);
-    proc->state = ProcessState::Ready;
-    const uint64_t wakeDeadline=proc->wakeupTick;
-    proc->wakeupTick = 0;
-    __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
-    SchedTrace(proc, STR_READY_UNBLOCK);
-    ReadyQueueInsertLocked(proc);
-    if(wakeDeadline && g_readyLatency.Watching(proc->pid,proc->incarnation))
-        g_readyLatency.Deadline(proc->pid,proc->incarnation,wakeDeadline,ApicTickCount());
+    SchedulerMakeReadyLocked(proc);
     SchedLockRelease(g_readyLock, rlf4);
 
     KickIdleCpu();

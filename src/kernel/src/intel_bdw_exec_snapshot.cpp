@@ -10,6 +10,7 @@
 #include "memory/virtual_memory.h"
 #include "panic_test_reset.h"
 #include "smp.h"
+#include "profiler.h"
 #include "memory/heap.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
@@ -28,8 +29,11 @@ struct BdwExecSnapshot {
     uint32_t submitterPid,contextId;
     uint64_t batchAddress,batchLength,submitterIncarnation;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
-    uint64_t diagnosticQueuedTicks;
+    uint64_t diagnosticQueuedTicks, traceId;
     BdwTimingObjectHints diagnosticHints;
+#endif
+#ifdef BROOK_BDW_COHERENT_RENDER
+    bool coherentRender;
 #endif
     BdwBatchSample batchSample;
     uint32_t captureIndices[4],captureCount,captureRequested;
@@ -109,6 +113,12 @@ bool BdwExecSnapshotContainsBuffer(const BdwExecSnapshot* s,const BdwGpuBuffer* 
     for(uint32_t i=0;i<s->count;++i)if(s->buffers[i]==buffer)return true;
     return false;
 }
+bool BdwExecSnapshotHasProtectedBuffer(const BdwExecSnapshot* s){
+    if(!s)return false;
+    for(uint32_t i=0;i<s->count;++i)
+        if(!BdwGpuBufferAllowsUserMapping(s->buffers[i]))return true;
+    return false;
+}
 BdwFence* BdwExecSnapshotAcquireCompletionForBuffer(const BdwExecSnapshot* s,const BdwGpuBuffer* buffer){
     if(!s || !buffer || !s->completionFence)return nullptr;
     for(uint32_t i=0;i<s->count;++i)if(s->buffers[i]==buffer){BdwFenceRef(s->completionFence);return s->completionFence;}
@@ -128,9 +138,21 @@ bool BdwExecSnapshotHandoffUndelivered(const BdwExecSnapshot* s,const BdwGpuBuff
     return s && buffer && token && __atomic_load_n(&s->state,__ATOMIC_ACQUIRE)==0 &&
            s->handoffBuffer==buffer && s->handoffToken==token;
 }
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+void BdwTraceSnapshot(const BdwExecSnapshot* s, unsigned stage, uint64_t value, uint64_t timestamp)
+{
+    if (s && s->traceId)
+        ProfilerTraceGpu(static_cast<uint16_t>(s->submitterPid),stage,s->traceId,value,timestamp);
+}
+#endif
 bool BdwExecSnapshotSignalFences(BdwExecSnapshot* s,bool success){
     if(!s || __atomic_load_n(&s->state,__ATOMIC_ACQUIRE)!=4)return false;
-    for(uint32_t i=0;i<s->signalCount;++i)if(!BdwFenceComplete(s->signalFences[i],success))return false;
+    for(uint32_t i=0;i<s->signalCount;++i){
+        if(!BdwFenceComplete(s->signalFences[i],success))return false;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+        BdwTraceSnapshot(s,FrameFenceSignal,s->signalFences[i]->traceId);
+#endif
+    }
     return BdwFenceComplete(s->completionFence,success);
 }
 bool BdwExecSnapshotAddWaitFence(BdwExecSnapshot* s,BdwFence* f){
@@ -290,9 +312,27 @@ void BdwTimingOwnerElapsed(uint64_t owner,BdwTimingStage stage,uint64_t start,ui
     if(start && end>=start && t.capable && t.measured && t.consistent && t.khz && end-start<=~uint64_t{0}/1000)
         BdwTimingRecordOwner(owner,stage,(end-start)*1000/t.khz,0);
 }
-void BdwTimingQueued(BdwExecSnapshot* s){if(s)s->diagnosticQueuedTicks=BdwTimingNow();}
+void BdwTimingQueued(BdwExecSnapshot* s)
+{
+    if (!s) return;
+    s->diagnosticQueuedTicks=BdwTimingNow();
+#ifndef BROOK_HOST_TEST
+    if (!ProfilerFrameTraceActive()) return;
+    static uint64_t serial;
+    s->traceId=__atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);
+    BdwTraceSnapshot(s,FrameQueued,(uint64_t{s->contextId}<<32)|s->pages);
+    BdwTraceSnapshot(s,FrameBatch,s->batchLength);
+    for(uint32_t i=0;i<s->count;++i)
+        BdwTraceSnapshot(s,FrameObject,BdwGpuBufferIdentity(s->buffers[i]));
+    for(uint32_t i=0;i<s->waitCount;++i)
+        BdwTraceSnapshot(s,FrameFenceDependency,s->waitFences[i]->traceId);
+#endif
+}
 void BdwTimingTaken(BdwExecSnapshot* s){
     if(!s || !s->diagnosticQueuedTicks)return;
+#ifndef BROOK_HOST_TEST
+    BdwTraceSnapshot(s,FrameTaken);
+#endif
     const auto end=BdwTimingNow();const auto& t=NativeTscObserveRead();
     if(t.capable && t.measured && t.consistent && t.khz && end>=s->diagnosticQueuedTicks)
         BdwTimingRecord(s,BdwTimingQueue,(end-s->diagnosticQueuedTicks)*1000/t.khz,s->pages);
@@ -334,16 +374,44 @@ bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* s,const BdwPpgttPage (&scr
     for(unsigned i=0;i<56;++i)ring[i]=next[i];
     return true;
 }
-static bool SyncSnapshotCpuCache(const BdwExecSnapshot& snapshot,uint64_t& flushedPages) {
+#ifdef BROOK_BDW_COHERENT_RENDER
+bool BdwExecSnapshotUseCoherentRender(BdwExecSnapshot* snapshot) {
+    if(!Preparing(snapshot) || snapshot->preparedFlags)return false;
+    snapshot->coherentRender=true;
+    return true;
+}
+#endif
+static bool SyncSnapshotCpuCache(const BdwExecSnapshot& snapshot,uint64_t& flushedPages,
+                                 [[maybe_unused]] bool forDevice) {
     flushedPages=0;
     for(uint32_t i=0;i<snapshot.count;++i) {
         auto* buffer=snapshot.buffers[i];
         if(buffer==snapshot.handoffBuffer && !BdwGpuBufferAllowsUserMapping(buffer))continue;
+#ifdef BROOK_BDW_CACHE_PROBE
+        // Preserve all aliases of the batch allocation, even if an oracle
+        // explicitly registered it as data. Private GPU pages use separate
+        // publication paths and never enter this diagnostic.
+        if(buffer!=snapshot.buffers[snapshot.batchIndex] &&
+           BdwGpuBufferSkipCacheProbeFlush(buffer,forDevice))continue;
+#endif
+#ifdef BROOK_BDW_COHERENT_RENDER
+        // The admitted Dell RCS maps local ordinary BOs through the leased
+        // WB LLC/eLLC PPGTT PAT slot. The ring still invalidates device
+        // caches before the batch and drains writes before its breadcrumb.
+        // Keep the batch allocation and every alias on the original path.
+        if(snapshot.coherentRender && buffer!=snapshot.buffers[snapshot.batchIndex] &&
+           BdwGpuBufferAllowsUserMapping(buffer))continue;
+#endif
         if(!BdwGpuBufferSyncCpuCache(buffer))return false;
         uint32_t pages=0;
         (void)BdwGpuBufferPages(buffer,pages);
         flushedPages+=pages;
     }
+#ifdef BROOK_BDW_COHERENT_RENDER
+    // Preserve CPU ordering across the submission and retirement boundaries
+    // independently of whether a particular object needed a cache flush.
+    if(snapshot.coherentRender)__atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
     return true;
 }
 bool BdwExecSnapshotSyncForDevice(BdwExecSnapshot* s){
@@ -358,9 +426,19 @@ bool BdwExecSnapshotSyncForDevice(BdwExecSnapshot* s){
     auto tick=[](){uint32_t lo,hi;__asm__ volatile("lfence; rdtsc":"=a"(lo),"=d"(hi)::"memory");return (uint64_t(hi)<<32)|lo;};
     const uint64_t start=tick();
 #endif
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(s,FrameDeviceSyncBegin);
+#endif
     // The exact protected handoff has no CPU writers after initial zeroing.
     uint64_t flushedPages=0;
-    if(!SyncSnapshotCpuCache(*s,flushedPages))return false;
+    if(!SyncSnapshotCpuCache(*s,flushedPages,true))return false;
+#ifdef BROOK_BDW_CACHE_PROBE
+    for(uint32_t i=0;i<s->count;++i)
+        if(s->buffers[i]!=s->buffers[s->batchIndex])BdwGpuBufferPrimeCacheProbe(s->buffers[i]);
+#endif
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(s,FrameDeviceSyncEnd,flushedPages);
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t end=tick();const auto& tsc=NativeTscObserveRead();
     if(tsc.capable && tsc.measured && tsc.consistent && tsc.khz && end>=start) {
@@ -381,10 +459,16 @@ bool BdwExecSnapshotSyncForCpu(BdwExecSnapshot* s,bool safelyStopped){
     auto tick=[](){uint32_t lo,hi;__asm__ volatile("lfence; rdtsc":"=a"(lo),"=d"(hi)::"memory");return (uint64_t(hi)<<32)|lo;};
     const uint64_t start=tick();
 #endif
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(s,FrameCpuSyncBegin);
+#endif
     // The compositor fallback acquires CPU visibility only if it copies this
     // output. Retiring the producer still requires the device-side flush.
     uint64_t flushedPages=0;
-    if(!SyncSnapshotCpuCache(*s,flushedPages))return false;
+    if(!SyncSnapshotCpuCache(*s,flushedPages,false))return false;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    BdwTraceSnapshot(s,FrameCpuSyncEnd,flushedPages);
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t end=tick();const auto& tsc=NativeTscObserveRead();
     if(tsc.capable && tsc.measured && tsc.consistent && tsc.khz && end>=start)
@@ -456,14 +540,24 @@ bool BdwExecSnapshotArm(BdwExecSnapshot* s,bool tablesPublished){
     if(!__atomic_compare_exchange_n(&s->state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))__builtin_trap();
     return true;
 }
-bool BdwExecSnapshotRetire(BdwExecSnapshot* s,bool safelyStopped){
+bool BdwExecSnapshotSyncForRetirement(BdwExecSnapshot* s){
+    if(!s)return false;
+    const uint32_t state=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
+    return state==3 || (state==1 && BdwExecSnapshotSyncForCpu(s,true));
+}
+bool BdwExecSnapshotRetireSynced(BdwExecSnapshot* s){
     if(!s)return false;
     uint32_t expected=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
     if(expected!=1 && expected!=3)return false;
-    if(expected==1 && (!safelyStopped || !BdwExecSnapshotSyncForCpu(s,true)))return false;
     if(!__atomic_compare_exchange_n(&s->state,&expected,4,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
     for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
     return true;
+}
+bool BdwExecSnapshotRetire(BdwExecSnapshot* s,bool safelyStopped){
+    if(!s)return false;
+    const uint32_t state=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
+    if(state!=3 && (state!=1 || !safelyStopped || !BdwExecSnapshotSyncForRetirement(s)))return false;
+    return BdwExecSnapshotRetireSynced(s);
 }
 bool BdwExecSnapshotRelease(BdwExecSnapshot* s,bool safelyStopped){
     if(!s)return false;

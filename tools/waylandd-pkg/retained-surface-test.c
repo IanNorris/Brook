@@ -40,6 +40,21 @@ int main(void) {
     struct brook_surface *r=make_surface(client),*p=make_surface(client),*c=make_surface(client);
     uint32_t vfb[12]={0};r->wm_id=1;r->vfb=vfb;r->vfb_w=4;r->vfb_h=3;r->vfb_stride=4;r->scene_disabled=1;
     assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/brook-retained-test",1));
+    // Single full-frame ARGB snapshot retains alpha semantics and row padding.
+    struct brook_surface *single=make_surface(client);
+    uint32_t padded[8];for(unsigned i=0;i<8;++i)padded[i]=0x12345678;
+    single->wm_id=1;single->vfb=padded;single->vfb_w=3;single->vfb_h=2;single->vfb_stride=4;single->scene_disabled=1;
+    uint32_t input[6]={0x00000000,0x01010000,0x80800000,0xffabcdef,0x7f204060,0x0000ffff};
+    struct brook_image *whole=image_snapshot((uint8_t *)input,3,2,12,WL_SHM_FORMAT_ARGB8888);assert(whole);
+    assert(surface_tree_commit(single,whole));image_unref(whole);assert(surface_repaint(single));
+    assert(!single->composite); // full-frame fast path avoided the intermediate
+    for(unsigned y=0;y<2;++y){
+        for(unsigned x=0;x<3;++x)
+            assert(padded[y*4+x]==pixel_straight(pixel_over(input[y*3+x],0)));
+        assert(padded[y*4+3]==0x12345678);
+    }
+    assert(sourceCommit==single->tree.current->commit && sourceTags==sourceBegins);
+    surface_destroy(client,single->resource);
     associate(client,sc,p,r);associate(client,sc,c,p);
     subsurface_set_position(client,p->subsurface_resource,1,1);
     snapshot(c,0xffff0000,1,1);snapshot(p,0xffabcdef,2,2);

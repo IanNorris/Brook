@@ -107,7 +107,7 @@ class MarkerTimingTests(unittest.TestCase):
                 'import os,sys,time,json\nfrom pathlib import Path\n'
                 "h=Path(os.environ['HOME']);(h/'argv.json').write_text(json.dumps(sys.argv))\n"
                 "with (h/'.yq2/baseq2/qconsole.log').open('w') as f:\n"
-                " f.write('BROOK_DEMO_TIMING_START\\n');f.flush();time.sleep(.25)\n"
+                " f.write('loading...\\rBROOK_DEMO_TIMING_START\\n');f.flush();time.sleep(.25)\n"
                 " f.write('BROOK_DEMO_TIMING_END\\n');f.flush()\n")
             engine.chmod(0o755);home=root/'home'
             result=subprocess.run([sys.executable,str(Path(__file__).parent/'workloads/q2_demo_timing.py'),

@@ -5,8 +5,12 @@ namespace brook {
 struct BdwGpuFile;
 struct BdwGpuContext;
 struct BdwFence;
-struct BdwGpuBuffer;
 struct BdwExecSnapshot;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+void BdwTraceSnapshot(const BdwExecSnapshot* snapshot, unsigned stage,
+                      uint64_t value=0, uint64_t timestamp=0);
+#endif
+struct BdwGpuBuffer;
 constexpr uint32_t BdwMaxSubmissionFences=256;
 // Kernel-copied subset of i915 exec objects. The caller decodes the UAPI,
 // rejects unsupported relocation, fence and engine features, and supplies
@@ -38,6 +42,7 @@ BdwFence* BdwExecSnapshotAcquireWriteSignal(const BdwExecSnapshot*,const BdwGpuB
 // Recognize a reserved buffer even when the request has no usable signal;
 // routers must reject that case instead of falling back to ordinary submit.
 bool BdwExecSnapshotContainsBuffer(const BdwExecSnapshot*,const BdwGpuBuffer*);
+bool BdwExecSnapshotHasProtectedBuffer(const BdwExecSnapshot*);
 // Queue lock protects the snapshot and its immutable object list. The returned
 // fence is retained and resolves only after this exact submission retires.
 // It remains pending for uncertain device work. Null means no match/error.
@@ -100,6 +105,9 @@ bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* snapshot,const BdwPpgttPag
 // CPU cache operations only; caller must exclude concurrent CPU access and
 // independently establish device cache flushing and DMA ownership. CPU sync
 // after GPU work requires a verified retirement/reset.
+#ifdef BROOK_BDW_COHERENT_RENDER
+bool BdwExecSnapshotUseCoherentRender(BdwExecSnapshot* snapshot);
+#endif
 bool BdwExecSnapshotSyncForDevice(BdwExecSnapshot* snapshot);
 bool BdwExecSnapshotSyncForCpu(BdwExecSnapshot* snapshot,bool safelyStopped);
 // Mark every retained buffer unusable after a failed/uncertain GPU request or
@@ -127,5 +135,9 @@ bool BdwExecSnapshotArm(BdwExecSnapshot* snapshot,bool tablesPublished);
 // work requires a verified stop and CPU cache synchronization; a queued but
 // unsubmitted reservation can be retired without a device stop.
 bool BdwExecSnapshotRetire(BdwExecSnapshot* snapshot,bool safelyStopped);
+// Single engine owner only, after device retirement. Sync leaves reservation
+// counts and fences intact. RetireSynced publishes the completed transition.
+bool BdwExecSnapshotSyncForRetirement(BdwExecSnapshot* snapshot);
+bool BdwExecSnapshotRetireSynced(BdwExecSnapshot* snapshot);
 bool BdwExecSnapshotRelease(BdwExecSnapshot* snapshot,bool safelyStopped);
 }

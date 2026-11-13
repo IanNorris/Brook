@@ -1,6 +1,7 @@
 #include "compositor_handoff.h"
 #include "compositor_scanout_lifetime.h"
 #include "intel_bdw_present_queue.h"
+#include "desktop_frame_scenes.h"
 #include <assert.h>
 using namespace brook;
 int main(){
@@ -28,6 +29,25 @@ int main(){
     assert(!HandoffPresentationAllowed(order,20,older) && !HandoffPresentationAllowed(order,20,newer));
     HandoffPresentationCommitted(order,21,older);assert(order.lastPresented==newer.ticket);
     HandoffDetach(order,20);assert(HandoffAttach(order,21) && !order.lastPresented);
+    // Dependency baseline is the last accepted ticket at reservation, not
+    // merely the most recently reserved or GPU-completed ticket.
+    CompositorHandoff dep{};HandoffTicket first{},next{};int scenes[2]{};
+    DesktopFrameScenes<int> frames{};
+    assert(HandoffAttach(dep,30) && HandoffReserve(dep,30,1,1,first));
+    assert(!DesktopDependencyBaselineCurrent(first.ticket,dep.lastPresented));
+    HandoffPresentationCommitted(dep,30,first);
+    assert(DesktopDependencyBaselineCurrent(first.ticket,dep.lastPresented));
+    assert(HandoffReserve(dep,30,2,1,next));
+    assert(frames.Insert({30,next.ticket,2,1,1,0,false,&scenes[0],false}));
+    DesktopDependencyRect changed{2,2,4,4},missing{2,2,3,4},covered[]={{2,2,2,4},{4,2,2,4}};
+    frames.RecordAccepted(30,first.ticket,&changed,1,false);
+    assert(!DesktopDependenciesCovered(frames.Find(30,next.ticket)->dependencies,&missing,1));
+    assert(DesktopDependenciesCovered(frames.Find(30,next.ticket)->dependencies,covered,2));
+    HandoffPresentationCommitted(dep,30,next);
+    assert(!HandoffPresentationAllowed(dep,30,first));
+    assert(!DesktopDependencyBaselineCurrent(first.ticket,dep.lastPresented));
+    frames.RecordAccepted(30,first.ticket,nullptr,0,true);
+    assert(!DesktopDependenciesCovered(frames.Find(30,next.ticket)->dependencies,covered,2));
     CompositorHandoff h{};HandoffTicket a{},b{},c{};
     assert(!HandoffAttach(h,0) && HandoffAttach(h,10) && !HandoffAttach(h,11));
     assert(HandoffReserve(h,10,1,1,a) && HandoffReserve(h,10,2,1,b));

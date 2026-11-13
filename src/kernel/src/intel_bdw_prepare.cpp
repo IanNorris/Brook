@@ -380,8 +380,8 @@ bool BdwRetainPrivateRenderImages(uint32_t ggttEntries,bool ppgttProbe,bool stor
 #ifndef BROOK_HOST_TEST
 bool BdwStartKernelSubmissionWorker(BdwSubmissionWorker& worker,void* context,
                                     BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly,
-                                    bool (*service)(void*,BdwSubmissionQueue&)) {
-    BdwSubmissionWorker::Hooks hooks{};hooks.context=context;hooks.execute=execute;hooks.service=service;
+                                    bool (*service)(void*,BdwSubmissionQueue&),bool (*servicePending)(void*)) {
+    BdwSubmissionWorker::Hooks hooks{};hooks.context=context;hooks.execute=execute;hooks.service=service;hooks.servicePending=servicePending;
     hooks.launch=[](void*,void (*entry)(void*),void* arg,uint32_t cpu){
         auto* thread=KernelThreadCreate("gpu-submit",entry,arg);if(!thread)return false;
         thread->cpuAffinity=cpu;SchedulerAddProcess(thread);return true;
@@ -461,6 +461,11 @@ static bool TestSubmissionWorker(BdwWorkerProbeResult& result,bool contexts) {
 bool BdwTestSubmissionWorker(BdwWorkerProbeResult& result){return TestSubmissionWorker(result,false);}
 bool BdwTestContextSubmissionWorker(BdwWorkerProbeResult& result){return TestSubmissionWorker(result,true);}
 static BdwSubmissionWorker applicationWorker;
+bool BdwSetScanoutFairness(bool enabled){return applicationWorker.SetServiceFairness(enabled);}
+bool BdwScanoutFairness(){return applicationWorker.ServiceFairness();}
+void BdwScanoutFairnessCounts(uint64_t& pending,uint64_t& bypass,uint64_t& noEligible,uint64_t& forced){
+    applicationWorker.ServiceFairnessCounts(pending,bypass,noEligible,forced);
+}
 static BdwHandoffSession offscreenSession;
 static KMutex offscreenMutex{};
 static uint32_t offscreenInit=0;
@@ -494,6 +499,7 @@ static struct {
     uint32_t count=0;
     bool completed=false;
 } scanoutWork;
+static bool ScanoutPending(void*){return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued;}
 // This runs between RCS submissions on the same BSP kernel worker. The
 // presenter holds the scene and framebuffer locks. The worker takes neither.
 static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
@@ -608,7 +614,7 @@ static int64_t InitApplicationWorker(){
     uint32_t current=__atomic_load_n(&state,__ATOMIC_ACQUIRE);
     if(!current){uint32_t expected=0;
         if(__atomic_compare_exchange_n(&state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
-            const bool ok=BdwStartKernelSubmissionWorker(applicationWorker,nullptr,BdwExecuteRetainedContextWorkerSnapshot,true,ServiceScanout);
+            const bool ok=BdwStartKernelSubmissionWorker(applicationWorker,nullptr,BdwExecuteRetainedContextWorkerSnapshot,true,ServiceScanout,ScanoutPending);
             __atomic_store_n(&state,ok?2u:3u,__ATOMIC_RELEASE);current=ok?2u:3u;
         }else current=expected;
     }
@@ -618,27 +624,28 @@ static int64_t InitApplicationWorker(){
 // offscreenMutex serializes the producer and holds the exact completed
 // source until the worker finishes. Cancellation can win only before the
 // worker claims the request.
-static bool PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
+enum class BdwPresentCopy { Completed, Unavailable, Expired };
+static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
     if(!source || !token || !regions || !count || count>COMPOSITOR_MAX_REGIONS ||
        !BdwBcsScanoutEnabled() || InitApplicationWorker() ||
-       __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutIdle)return false;
+       __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutIdle)return BdwPresentCopy::Unavailable;
     scanoutWork.source=source;scanoutWork.token=token;scanoutWork.count=count;
     for(uint32_t i=0;i<count;++i)scanoutWork.regions[i]=regions[i];
     __atomic_store_n(&scanoutWork.state,ScanoutQueued,__ATOMIC_RELEASE);
-    const auto deadline=ApicTickCount()+250;
+    const auto deadline=ApicTickCount()+32;
     for(;;){
         if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutDone){
             const bool result=scanoutWork.completed;
             scanoutWork.source=nullptr;
             __atomic_store_n(&scanoutWork.state,ScanoutIdle,__ATOMIC_RELEASE);
-            return result;
+            return result?BdwPresentCopy::Completed:BdwPresentCopy::Unavailable;
         }
         if(ApicTickCount()>=deadline){
             uint32_t queued=ScanoutQueued;
             if(__atomic_compare_exchange_n(&scanoutWork.state,&queued,ScanoutIdle,false,
                                            __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
                 scanoutWork.source=nullptr;
-                return false;
+                return BdwPresentCopy::Expired;
             }
         }
         SchedulerSleepMs(1);
@@ -717,7 +724,7 @@ int64_t BdwOffscreenRegisterChrome(uint64_t owner,const WmDesktopLayer& layer){
     else offscreenChromeTracking=true;
     KMutexUnlock(&offscreenMutex);return result;
 }
-int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGpuBuffer* buffer){
+int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGpuBuffer* buffer,uint64_t baseline){
     if(!BdwRenderExperimentEnabled())return -19;
     if(!owner || !InitOffscreenMutex())return -16;
     KMutexLock(&offscreenMutex);int64_t result=-22;WmDesktopLayers* old=nullptr;WmDesktopLayers* oldBase=nullptr;bool detached=false;
@@ -731,7 +738,10 @@ int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGp
         }
         break;
     case BROOK_GPU_HANDOFF_RESERVE:
+    case BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:
         if(offscreenSceneOwner==owner && offscreenScene){
+            if(op==BROOK_GPU_HANDOFF_RESERVE_DEPENDENT &&
+               (!offscreenBaseScene || !DesktopDependencyBaselineCurrent(baseline,offscreenSession.LastPresented(owner)))){result=-116;break;}
             bool freeBinding=false;for(const auto& e:offscreenFrameScenes.entries)if(!e.ticket)freeBinding=true;
             if(!freeBinding){result=-16;break;}
             auto* snapshot=static_cast<WmDesktopLayers*>(kmalloc(sizeof(WmDesktopLayers)));
@@ -740,14 +750,15 @@ int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGp
             // Damage for a second capture may be relative to an output that
             // has not presented yet. Require a complete output until that
             // dependency is represented explicitly.
-            const bool fullOnly=!offscreenSession.Idle();
+            const bool fullOnly=op!=BROOK_GPU_HANDOFF_RESERVE_DEPENDENT && !offscreenSession.Idle();
             result=offscreenSession.Reserve(owner,buffer,offscreenSceneId,offscreenDisplay);
             if(result>0){
                 OffscreenFrameScenes::Binding binding{owner,static_cast<uint64_t>(result),offscreenSceneId,
                     offscreenDisplay,offscreenBackdrop,offscreenChromeMask,offscreenChromeTracking,snapshot,fullOnly};
                 if(!offscreenFrameScenes.Insert(binding)){(void)offscreenSession.Release(owner,result);result=-5;old=snapshot;}
             }else old=snapshot;
-        }else result=offscreenSession.Reserve(owner,buffer);
+        }else if(op==BROOK_GPU_HANDOFF_RESERVE_DEPENDENT)result=-116;
+        else result=offscreenSession.Reserve(owner,buffer);
         break;
     case BROOK_GPU_HANDOFF_OBSERVE: result=offscreenSession.Observe(owner,arg);break;
     case BROOK_GPU_HANDOFF_RELEASE: result=QueuedPresentHolds(owner,arg)?-16:offscreenSession.Release(owner,arg);break;
@@ -783,15 +794,41 @@ static bool CopyOffscreenBuffer(void* source,uint64_t offset,void* destination,u
     }
     return true;
 }
-struct ScanoutSource {BdwGpuBuffer* buffer;uint64_t token,offset,bytes;};
-static CompositorPresentAcceleration ScanoutAcceleration(ScanoutSource& source){
-    return {&source,[](void* raw,const CompositorPresentRegion* regions,uint32_t count){
-            const auto& s=*static_cast<ScanoutSource*>(raw);
-            return PresentOnBcs(s.buffer,s.token,regions,count);
-        },[](void* raw){
-            const auto& s=*static_cast<ScanoutSource*>(raw);
-            return BdwGpuBufferPrepareHandoffRead(s.buffer,s.token,s.offset,s.bytes);
-        }};
+// The handoff session pins the completed source through retirement. Reserve
+// the fixed framebuffer while holding the WM lock, then release it before
+// queueing the copy or waiting for the device.
+static int64_t PresentGopWrite(const WmDesktopLayers& scene,const WmDesktopLayers* base,
+                              BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,
+                              uint32_t count,uint64_t first,uint64_t bytes,uint64_t display,
+                              uint64_t backdrop,uint64_t owner,uint32_t* samples){
+    struct Admission {
+        const CompositorPresentRegion* regions;
+        uint32_t count;
+        uint64_t capacity,display,backdrop,owner;
+        bool partial;
+        CompositorGopWrite write{};
+    } admission{regions,count,BdwGpuBufferBytes(source),display,backdrop,owner,base!=nullptr};
+    auto reserve=[](void* opaque)->int64_t {
+        auto& a=*static_cast<Admission*>(opaque);
+        return CompositorReserveGopWrite(a.write,a.regions,a.count,a.capacity,
+                                         a.display,a.backdrop,a.owner,a.partial);
+    };
+    const auto admitted=base?WmDesktopLayersUseIfBothPresentable(*base,scene,&admission,reserve):
+                             WmDesktopLayersUseIfPresentable(scene,&admission,reserve);
+    if(admitted)return admitted;
+    const auto copied=PresentOnBcs(source,token,regions,count);
+    bool touched=copied==BdwPresentCopy::Completed;
+    int result=copied==BdwPresentCopy::Expired?-62:0;
+    if(copied==BdwPresentCopy::Unavailable){
+        // The worker may have reached the framebuffer before reporting that
+        // the accelerated path could not complete. A failing fallback
+        // must force the software compositor to repair the whole scanout.
+        touched=true;
+        if(!BdwGpuBufferPrepareHandoffRead(source,token,first,bytes))result=-5;
+        else result=CompositorCopyGopWrite(admission.write,regions,count,source,CopyOffscreenBuffer);
+    }
+    if(!result && samples)CompositorSampleGopWrite(admission.write,samples);
+    return CompositorFinishGopWrite(admission.write,result,touched);
 }
 int64_t BdwOffscreenHandoffPresentProbe(uint64_t owner,::BrookGpuPresentProbe& probe,bool lease,bool region,bool collectSamples,
                                        bool fromQueue){
@@ -818,23 +855,32 @@ int64_t BdwOffscreenHandoffPresentProbe(uint64_t owner,::BrookGpuPresentProbe& p
                 buffer,CopyOffscreenBuffer,probe.samples);
         }
         if(!frame || frame->sceneId!=scene || frame->display!=display)return -116;
-        if(region && (!offscreenBaseScene || frame->fullOnly))return -116;
+        const DesktopDependencyRect single{probe.x,probe.y,probe.width,probe.height};
+        if(region && (!offscreenBaseScene || frame->fullOnly ||
+                      !DesktopDependenciesCovered(frame->dependencies,&single,1)))return -116;
         if(lease && !frame->backdrop)return -22;
         if(lease && frame->chromeTracking && !DesktopChromeComplete(frame->scene->count,frame->chromeMask))return -116;
-        const bool accelerated=lease && BdwBcsScanoutEnabled();
-        if(!accelerated && !BdwGpuBufferPrepareHandoffRead(buffer,token,0,required))return -5;
-        ScanoutSource source{buffer,token,0,required};
-        const auto acceleration=ScanoutAcceleration(source);
-        struct PresentContext {::BrookGpuPresentProbe* probe;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;bool region,collectSamples;
-            const CompositorPresentAcceleration* acceleration;};
-        PresentContext context{&probe,buffer,display,frame->backdrop,lease?owner:0,region,collectSamples,accelerated?&acceleration:nullptr};
+        if(lease && !region && BdwBcsScanoutEnabled()){
+            const CompositorPresentRegion rect{probe.x,probe.y,probe.width,probe.height,probe.stride,0};
+            const auto presented=PresentGopWrite(*frame->scene,nullptr,buffer,token,&rect,1,0,required,
+                                                  display,frame->backdrop,owner,collectSamples?probe.samples:nullptr);
+            if(presented!=-95){
+                if(!presented)offscreenFrameScenes.RecordAccepted(owner,probe.ticket,nullptr,0,true);
+                return presented;
+            }
+        }
+        if(!BdwGpuBufferPrepareHandoffRead(buffer,token,0,required))return -5;
+        struct PresentContext {::BrookGpuPresentProbe* probe;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;bool region,collectSamples;};
+        PresentContext context{&probe,buffer,display,frame->backdrop,lease?owner:0,region,collectSamples};
         auto present=[](void* raw)->int64_t{
             auto& c=*static_cast<PresentContext*>(raw);auto& p=*c.probe;
             return CompositorPresentProbe(p.x,p.y,p.width,p.height,p.stride,c.buffer,CopyOffscreenBuffer,c.collectSamples?p.samples:nullptr,
-                c.display,c.backdrop,c.owner,c.region,c.acceleration);
+                c.display,c.backdrop,c.owner,c.region);
         };
-        if(region)return WmDesktopLayersUseIfBothPresentable(*offscreenBaseScene,*frame->scene,&context,present);
-        return lease?WmDesktopLayersUseIfPresentable(*frame->scene,&context,present):WmDesktopLayersUseIfCurrent(*frame->scene,&context,present);
+        const int64_t outcome=region?WmDesktopLayersUseIfBothPresentable(*offscreenBaseScene,*frame->scene,&context,present):
+            (lease?WmDesktopLayersUseIfPresentable(*frame->scene,&context,present):WmDesktopLayersUseIfCurrent(*frame->scene,&context,present));
+        if(!outcome && lease)offscreenFrameScenes.RecordAccepted(owner,probe.ticket,region?&single:nullptr,region?1:0,!region);
+        return outcome;
     });
     if(!result && newBase){oldBase=offscreenBaseScene;offscreenBaseScene=newBase;newBase=nullptr;}
     WmDesktopLayers* retired[BROOK_GPU_HANDOFF_MAX_DEPTH]={};unsigned retiredCount=0;CollectRetiredFrameScenes(retired,retiredCount);
@@ -851,8 +897,11 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
     KMutexLock(&offscreenMutex);
     if(!fromQueue && QueuedPresentHolds(owner,ticket)){KMutexUnlock(&offscreenMutex);return -16;}
     auto* frame=offscreenFrameScenes.Find(owner,ticket);
+    DesktopDependencyRect writes[COMPOSITOR_MAX_REGIONS]{};
+    for(uint32_t i=0;i<count;++i)writes[i]={regions[i].x,regions[i].y,regions[i].width,regions[i].height};
     const auto result=offscreenSession.PresentProbe(owner,ticket,[&](BdwGpuBuffer* buffer,uint64_t token,uint64_t scene,uint64_t display)->int64_t{
         if(!buffer || !frame || frame->fullOnly || !offscreenBaseScene || frame->sceneId!=scene || frame->display!=display || !frame->backdrop)return -116;
+        if(!DesktopDependenciesCovered(frame->dependencies,writes,count))return -116;
         if(frame->chromeTracking && !DesktopChromeComplete(frame->scene->count,frame->chromeMask))return -116;
         const uint64_t capacity=BdwGpuBufferBytes(buffer);
         uint64_t start=capacity,end=0;
@@ -864,17 +913,23 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
             if(r.offset<start)start=r.offset;
             if(r.offset+bytes>end)end=r.offset+bytes;
         }
-        const bool accelerated=BdwBcsScanoutEnabled();
-        if(!accelerated && !BdwGpuBufferPrepareHandoffRead(buffer,token,start,end-start))return -5;
-        ScanoutSource source{buffer,token,start,end-start};
-        const auto acceleration=ScanoutAcceleration(source);
-        struct Context {const CompositorPresentRegion* regions;uint32_t count;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;
-            const CompositorPresentAcceleration* acceleration;};
-        Context context{regions,count,buffer,display,frame->backdrop,owner,accelerated?&acceleration:nullptr};
+        if(BdwBcsScanoutEnabled()){
+            const auto presented=PresentGopWrite(*frame->scene,offscreenBaseScene,buffer,token,regions,count,
+                                                  start,end-start,display,frame->backdrop,owner,nullptr);
+            if(presented!=-95){
+                if(!presented)offscreenFrameScenes.RecordAccepted(owner,ticket,writes,count,false);
+                return presented;
+            }
+        }
+        if(!BdwGpuBufferPrepareHandoffRead(buffer,token,start,end-start))return -5;
+        struct Context {const CompositorPresentRegion* regions;uint32_t count;BdwGpuBuffer* buffer;uint64_t display,backdrop,owner;};
+        Context context{regions,count,buffer,display,frame->backdrop,owner};
         auto present=[](void* raw)->int64_t {auto& c=*static_cast<Context*>(raw);
             return CompositorPresentRegions(c.regions,c.count,BdwGpuBufferBytes(c.buffer),c.buffer,
-                CopyOffscreenBuffer,c.display,c.backdrop,c.owner,c.acceleration);};
-        return WmDesktopLayersUseIfBothPresentable(*offscreenBaseScene,*frame->scene,&context,present);
+                CopyOffscreenBuffer,c.display,c.backdrop,c.owner);};
+        const int64_t outcome=WmDesktopLayersUseIfBothPresentable(*offscreenBaseScene,*frame->scene,&context,present);
+        if(!outcome)offscreenFrameScenes.RecordAccepted(owner,ticket,writes,count,false);
+        return outcome;
     });
     WmDesktopLayers* retired[BROOK_GPU_HANDOFF_MAX_DEPTH]={};unsigned retiredCount=0;CollectRetiredFrameScenes(retired,retiredCount);
     KMutexUnlock(&offscreenMutex);for(unsigned i=0;i<retiredCount;++i)FreeOffscreenScene(retired[i]);return result;
@@ -889,7 +944,10 @@ void BdwOffscreenHandoffOwnerExit(uint64_t owner){
     for(unsigned i=0;i<retiredCount;++i)FreeOffscreenScene(retired[i]);
 }
 bool BdwOffscreenHandoffSubmit(void*,BdwExecSnapshot* snapshot,int64_t* result){
-    if(!result || !snapshot || !InitOffscreenMutex())return false;
+    // Every reserved output has immutable non-mappable backing. Keep the
+    // session check for all aliases of protected buffers, including foreign
+    // owners. Ordinary GEM snapshots can proceed without the present lock.
+    if(!result || !BdwExecSnapshotHasProtectedBuffer(snapshot) || !InitOffscreenMutex())return false;
     auto* current=ProcessCurrent();const uint64_t owner=current?(current->leaderIncarnation?current->leaderIncarnation:current->incarnation):0;
     KMutexLock(&offscreenMutex);
     // The initialized worker is shared with ordinary DRM submissions.

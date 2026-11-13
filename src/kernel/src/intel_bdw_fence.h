@@ -1,19 +1,41 @@
 #pragma once
 #include <stdint.h>
 #include "memory/heap.h"
+#ifndef BROOK_HOST_TEST
+#include "apic.h"
+#include "kvmclock.h"
+#endif
 #include "sync/kmutex.h"
 namespace brook {
 // One immutable fence identity: state changes exactly once. A sync object may
 // replace its current fence without changing references held by queued work.
-struct BdwFence {uint32_t references,state,dependencyDepth,resolved,orderedPredecessor,isTimeline;BdwFence* predecessor;BdwFence* dependency;BdwFence* reapNext;uint64_t point;}; // pending=0, complete=1, failed=2
+struct BdwFence {uint32_t references,state,dependencyDepth,resolved,orderedPredecessor,isTimeline;BdwFence* predecessor;BdwFence* dependency;BdwFence* reapNext;uint64_t point, signalNs, resolvedNs;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    uint64_t traceId;
+#endif
+}; // pending=0, complete=1, failed=2, publishing=3
+inline uint64_t BdwFenceClockNs(){
+#ifndef BROOK_HOST_TEST
+    const uint64_t now=KvmClockAvailable()?KvmClockReadNs():ApicTickCount()*1000000ULL;
+    return now?now:1;
+#else
+    return 0;
+#endif
+}
 // Traversal and final release are iterative, including secondary dependencies.
-inline BdwFence* BdwFenceCreate(bool completed=false,BdwFence* predecessor=nullptr,uint64_t point=0,BdwFence* dependency=nullptr){
+inline BdwFence* BdwFenceCreate(bool completed=false,BdwFence* predecessor=nullptr,uint64_t point=0,BdwFence* dependency=nullptr,uint64_t signalNs=0,bool synthetic=false){
     const uint32_t predDepth=predecessor?predecessor->dependencyDepth:0;
     if(dependency && dependency->dependencyDepth==~uint32_t{0})return nullptr;
     const uint32_t depDepth=dependency?dependency->dependencyDepth+1:0;
     const uint32_t depth=predDepth>depDepth?predDepth:depDepth;
     auto* f=static_cast<BdwFence*>(kmalloc(sizeof(BdwFence)));if(!f)return nullptr;
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    static uint64_t serial;
+    f->traceId=__atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);
+#endif
     f->references=1;f->state=completed?1:0;f->dependencyDepth=depth;f->resolved=0;
+    f->signalNs=completed && !predecessor && !dependency && !synthetic?(signalNs?signalNs:BdwFenceClockNs()):0;
+    f->resolvedNs=0;
     f->orderedPredecessor=0;f->isTimeline=0;
     f->predecessor=predecessor;f->dependency=dependency;f->reapNext=nullptr;f->point=point;
     if(predecessor)__atomic_fetch_add(&predecessor->references,1,__ATOMIC_RELAXED);
@@ -27,30 +49,61 @@ inline void BdwFenceUnref(BdwFence* f){
     drop(f);
     while(pending){auto* node=pending;pending=node->reapNext;drop(node->predecessor);drop(node->dependency);kfree(node);}
 }
-inline uint32_t BdwFenceState(const BdwFence* f){
-    if(!f)return 0;auto* root=const_cast<BdwFence*>(f);bool failed=false;
-    const auto cached=__atomic_load_n(&root->resolved,__ATOMIC_ACQUIRE);if(cached)return cached;
-    struct Frame {const BdwFence* resume;BdwFence* dependency;bool failed;};
+inline uint32_t BdwFenceState(const BdwFence* f,uint64_t* timestamp=nullptr){
+    if(timestamp)*timestamp=0;
+    if(!f)return 0;
+    auto* root=const_cast<BdwFence*>(f);
+    bool failed=false;
+    uint64_t latest=0;
+    const auto cached=__atomic_load_n(&root->resolved,__ATOMIC_ACQUIRE);
+    if(cached){
+        if(timestamp)*timestamp=__atomic_load_n(&root->resolvedNs,__ATOMIC_RELAXED);
+        return cached;
+    }
+    struct Frame {const BdwFence* resume;BdwFence* dependency;bool failed;uint64_t latest;};
     Frame local[64];Frame* stack=local;const uint64_t capacity=uint64_t(root->dependencyDepth)+1;
     if(capacity>64){stack=static_cast<Frame*>(kmalloc(capacity*sizeof(*stack)));if(!stack)return 0;}
     uint64_t used=0;uint32_t result=0;
     while(f || used){
-        if(!f){const auto frame=stack[--used];
+        if(!f){
+            const auto frame=stack[--used];
+            __atomic_store_n(&frame.dependency->resolvedNs,latest,__ATOMIC_RELAXED);
             __atomic_store_n(&frame.dependency->resolved,failed?2u:1u,__ATOMIC_RELEASE);
-            failed=failed || frame.failed;f=frame.resume;continue;}
+            failed=failed || frame.failed;
+            if(frame.latest>latest)latest=frame.latest;
+            f=frame.resume;continue;
+        }
         const auto state=__atomic_load_n(&f->state,__ATOMIC_ACQUIRE);
         const auto resolved=__atomic_load_n(&f->resolved,__ATOMIC_ACQUIRE);
-        if(resolved){if(resolved==2)failed=true;f=nullptr;continue;}
-        if(!state)goto done;if(state==2)failed=true;
-        if(f->dependency){stack[used++]={f->predecessor,f->dependency,failed};failed=false;f=f->dependency;}else f=f->predecessor;
+        if(resolved){
+            if(resolved==2)failed=true;
+            const auto at=__atomic_load_n(&f->resolvedNs,__ATOMIC_RELAXED);
+            if(at>latest)latest=at;
+            f=nullptr;continue;
+        }
+        if(!state || state==3)goto done;
+        if(state==2)failed=true;
+        if(f->signalNs>latest)latest=f->signalNs;
+        if(f->dependency){
+            stack[used++]={f->predecessor,f->dependency,failed,latest};
+            failed=false;latest=0;f=f->dependency;
+        }else f=f->predecessor;
     }
-    result=failed?2:1;__atomic_store_n(&root->resolved,result,__ATOMIC_RELEASE);
+    result=failed?2:1;
+    __atomic_store_n(&root->resolvedNs,latest,__ATOMIC_RELAXED);
+    __atomic_store_n(&root->resolved,result,__ATOMIC_RELEASE);
+    if(timestamp)*timestamp=latest;
 done:
-    if(stack!=local)kfree(stack);return result;
+    if(stack!=local)kfree(stack);
+    return result;
 }
-inline bool BdwFenceComplete(BdwFence* f,bool success){
-    if(!f)return false;uint32_t expected=0;
-    return __atomic_compare_exchange_n(&f->state,&expected,success?1u:2u,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+inline bool BdwFenceComplete(BdwFence* f,bool success,uint64_t signalNs=0){
+    if(!f)return false;
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&f->state,&expected,3,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))return false;
+    f->signalNs=signalNs?signalNs:BdwFenceClockNs();
+    __atomic_store_n(&f->state,success?1u:2u,__ATOMIC_RELEASE);
+    return true;
 }
 // Prepare a timeline node after an unpublished predecessor from the same
 // admission transaction. The caller serializes all sync-object publication.
@@ -97,8 +150,9 @@ public:
         KMutexLock(&mutex_);BdwFence* result=nullptr;BdwFence* retired=nullptr;
         // Completed successful history can be represented by one anchor;
         // outstanding readers still retain their original immutable chain.
-        if(head_ && head_->predecessor && BdwFenceState(head_)==1){
-            auto* anchor=BdwFenceCreate(true,nullptr,head_->point);
+        uint64_t historyNs=0;
+        if(head_ && head_->predecessor && BdwFenceState(head_,&historyNs)==1){
+            auto* anchor=BdwFenceCreate(true,nullptr,head_->point,nullptr,historyNs);
             if(anchor){anchor->isTimeline=head_->isTimeline;retired=head_;head_=anchor;}
         }
         // Like dma_fence_chain, an out-of-order insertion starts a new

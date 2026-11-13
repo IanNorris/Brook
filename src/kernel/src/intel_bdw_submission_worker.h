@@ -19,9 +19,12 @@ public:
         BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*)=nullptr;
         void (*recover)(void*)=nullptr;
         bool (*service)(void*,BdwSubmissionQueue&)=nullptr;
+        bool (*servicePending)(void*)=nullptr;
     };
 private:
     BdwSubmissionQueue queue_;Hooks hooks_{};uint32_t state_=0; // fresh, starting, ready, failed
+    uint32_t fairService_=0;bool serviceDeferred_=false; // deferred_ is worker-thread-only
+    uint64_t pendingCount_=0,bypassCount_=0,noEligibleCount_=0,forcedServiceCount_=0;
     static void Run(void* opaque){
         auto& self=*static_cast<BdwSubmissionWorker*>(opaque);
         for(;;){
@@ -91,11 +94,37 @@ public:
     static int64_t SubmitCallback(void* context,BdwExecSnapshot* snapshot){
         return context?static_cast<BdwSubmissionWorker*>(context)->Submit(snapshot):-19;
     }
+    bool SetServiceFairness(bool enabled){
+        if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)!=2 || (enabled && (!hooks_.service || !hooks_.servicePending)))return false;
+        __atomic_store_n(&fairService_,enabled?1u:0u,__ATOMIC_RELEASE);return true;
+    }
+    bool ServiceFairness()const{return __atomic_load_n(&fairService_,__ATOMIC_ACQUIRE)!=0;}
+    void ServiceFairnessCounts(uint64_t& pending,uint64_t& bypass,uint64_t& noEligible,uint64_t& forced)const{
+        pending=__atomic_load_n(&pendingCount_,__ATOMIC_RELAXED);
+        bypass=__atomic_load_n(&bypassCount_,__ATOMIC_RELAXED);
+        noEligible=__atomic_load_n(&noEligibleCount_,__ATOMIC_RELAXED);
+        forced=__atomic_load_n(&forcedServiceCount_,__ATOMIC_RELAXED);
+    }
     // Single-consumer only. Exposed separately for deterministic worker tests.
     BdwSubmissionStep Step(){
-        if(hooks_.service && hooks_.service(hooks_.context,queue_))return BdwSubmissionStep::Finished;
         uint64_t id=0;BdwExecSnapshot* snapshot=nullptr;
-        if(!queue_.Take(id,snapshot))return queue_.Poisoned()?BdwSubmissionStep::Recover:BdwSubmissionStep::Idle;
+        const bool fair=__atomic_load_n(&fairService_,__ATOMIC_ACQUIRE) && hooks_.servicePending;
+        const bool pending=hooks_.servicePending && hooks_.servicePending(hooks_.context);
+        if(pending)__atomic_fetch_add(&pendingCount_,uint64_t{1},__ATOMIC_RELAXED);
+        bool taken=false;
+        if(fair && pending && !serviceDeferred_){
+            if(queue_.Take(id,snapshot,true)){
+                __atomic_fetch_add(&bypassCount_,uint64_t{1},__ATOMIC_RELAXED);serviceDeferred_=true;taken=true;
+            }else __atomic_fetch_add(&noEligibleCount_,uint64_t{1},__ATOMIC_RELAXED);
+        }
+        if(!taken){
+            if(hooks_.service && hooks_.service(hooks_.context,queue_)){
+                if(serviceDeferred_)__atomic_fetch_add(&forcedServiceCount_,uint64_t{1},__ATOMIC_RELAXED);
+                serviceDeferred_=false;return BdwSubmissionStep::Finished;
+            }
+            if(!pending)serviceDeferred_=false;
+            if(!queue_.Take(id,snapshot))return queue_.Poisoned()?BdwSubmissionStep::Recover:BdwSubmissionStep::Idle;
+        }
         const auto result=BdwExecSnapshotDependencies(snapshot)==2?BdwSubmissionOutcome{false,true}:
             hooks_.execute(hooks_.context,snapshot);
         return queue_.Finish(id,result.success,result.safelyStopped)?BdwSubmissionStep::Finished:BdwSubmissionStep::Recover;
@@ -105,5 +134,6 @@ public:
 // The caller retains worker/context forever and provides the device executor.
 bool BdwStartKernelSubmissionWorker(BdwSubmissionWorker& worker,void* context,
                                     BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly=false,
-                                    bool (*service)(void*,BdwSubmissionQueue&)=nullptr);
+                                    bool (*service)(void*,BdwSubmissionQueue&)=nullptr,
+                                    bool (*servicePending)(void*)=nullptr);
 }

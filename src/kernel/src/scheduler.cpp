@@ -255,7 +255,8 @@ static void KickIdleCpu()
 static inline uint32_t ThisCpu() { return SmpCurrentCpuIndex(); }
 
 // Drain per-CPU bookkeeping after context_switch — forward declared, defined below.
-static void DrainPostSwitch(uint32_t cpu);
+static bool DrainPostSwitch(uint32_t cpu);
+static bool SchedulerConsumeDeferredWake(Process* proc, uint64_t now, bool afterSwitch);
 
 // Update the per-CPU syscall stack pointer.
 static inline void SetSyscallStack(uint32_t cpuIdx, uint64_t stackTop)
@@ -1071,7 +1072,7 @@ void SchedulerReleaseWaitReference(Process* proc)
     ReleaseSchedulerReference(proc, false);
 }
 
-static void DrainPostSwitch(uint32_t cpu)
+static bool DrainPostSwitch(uint32_t cpu)
 {
     // Defensive: a corrupt-stack panic was observed where this function was
     // entered with cpu = 0x80040f0c — the low 32 bits of context_switch's
@@ -1098,6 +1099,7 @@ static void DrainPostSwitch(uint32_t cpu)
     // RSP is on the NEW process's kernel stack, so the old stack is unused.
     Process* retired = g_perCpu[cpu].pendingRetire;
     g_perCpu[cpu].pendingRetire = nullptr;
+    bool wokeRetired = false;
     if (retired)
     {
         // BRO-173/175: `reapable` now means only "switched away cleanly, no
@@ -1109,6 +1111,12 @@ static void DrainPostSwitch(uint32_t cpu)
         // alive via refCount until released.  Previously this deferred reapable
         // while compositorRegistered, which livelocked if the compositor never
         // unregistered the proc (BRO-175).
+        // Assembly has left the old stack. An unblock that raced that
+        // release can now enqueue it without waiting for a timer scan.
+        // Take the ready lock even when the latch looks clear. The sender
+        // may have seen the old ownership and still be publishing the wake.
+        if (retired != g_perCpu[cpu].idleProcess)
+            wokeRetired = SchedulerConsumeDeferredWake(retired, 0, true);
         ReleaseSchedulerReference(retired, true);
     }
 
@@ -1135,6 +1143,7 @@ static void DrainPostSwitch(uint32_t cpu)
        timing.epoch==SchedDecisionToken(current->pid,current->incarnation)){
         timing.drain=RuntimeNow(cpu);timing.drained=true;
     }
+    return wokeRetired;
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,7 +1165,8 @@ static void IdleLoop()
         // threads stuck unreapable (reaper saw runCpu=-1, refCount=0, but
         // reapable=0) and livelocked the parent's wait/fork loop under heavy
         // thread churn.  Draining at the top of every idle iteration closes it.
-        DrainPostSwitch(ThisCpu());
+        if (DrainPostSwitch(ThisCpu()))
+            SchedulerYield();
 #ifdef BROOK_SCHED_START_TEST_HOOKS
         StartTestArrival(ThisCpu(), ProcessCurrent(), "idle");
 #endif
@@ -1390,6 +1400,7 @@ void SchedulerMarkStopped(Process* proc, int signal)
         proc->stopReported = false;
         proc->continuedPending = false;
         __atomic_store_n(&proc->resumePending, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&proc->wakeAfterSwitch, false, __ATOMIC_RELEASE);
         __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
         ReadyQueueRemoveLocked(proc);
         uint64_t alf = SchedLockAcquire(g_allProcLock);
@@ -1509,13 +1520,15 @@ static uint32_t CheckBlockedWakeups()
     }
     SchedLockRelease(g_allProcLock, alf3);
 
+    uint32_t woken = 0;
     for (uint32_t i = 0; i < unblockCount; ++i) {
         auto* process=g_wakeScanCandidates[i];
         g_wakeScanCandidates[i]=nullptr;
-        SchedulerUnblock(process);
+        if (SchedulerConsumeDeferredWake(process, now, false))
+            ++woken;
         ReleaseSchedulerReference(process, false);
     }
-    return unblockCount;
+    return woken;
 }
 
 static uint32_t TryBlockedWakeScan(unsigned cpu)
@@ -1874,8 +1887,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // are running a given address space (critical for CoW fork correctness).
     SmpSetCurrentCr3(cpu, newProc->savedCtx.cr3);
 
-    ProfilerContextSwitch(oldProc->pid, newProc->pid,
-                          oldProc->kernelStackBase, oldProc->kernelStackTop);
+    ProfilerContextSwitch(oldProc, newProc);
 
 #ifdef BROOK_SCHED_START_TEST_HOOKS
     // A new invocation after a restart must not count as resuming this frame.
@@ -2465,8 +2477,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // stays 0 across the switch (the resumed thread restores its own IF).
     SchedLockReleaseRaw(g_readyLock);
 
-    ProfilerContextSwitch(proc->pid, next->pid,
-                          proc->kernelStackBase, proc->kernelStackTop);
+    ProfilerContextSwitch(proc, next);
     ContextSwitchCommitted(cpu);
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave,

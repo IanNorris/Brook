@@ -7,6 +7,8 @@ pkgs.stdenv.mkDerivation {
   buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.libdrm pkgs.xorg.libX11 ];
   buildPhase = ''
     runHook preBuild
+    cp ${../../src/shared/bdw_cache_probe_abi.h} bdw_cache_probe_abi.h
+    glslangValidator -V --target-env vulkan1.1 -DBROOK_CACHE_PROBE=1 probe.comp -o cache_probe.spv
     glslangValidator -V --target-env vulkan1.1 probe.comp -o probe.spv
     glslangValidator -V --target-env vulkan1.1 ${../vulkan-compositor-pkg/composite.comp} -o compositor.spv
     cp ${../vulkan-compositor-pkg/scene.h} scene.h
@@ -23,6 +25,10 @@ pkgs.stdenv.mkDerivation {
     data = Path('compositor.spv').read_bytes()
     words = struct.unpack('<' + 'I' * (len(data) // 4), data)
     Path('compositor_spv.h').write_text('static const uint32_t compositorCode[] = {\n' +
+        ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+    data = Path('cache_probe.spv').read_bytes()
+    words = struct.unpack('<' + 'I' * (len(data) // 4), data)
+    Path('cache_probe_spv.h').write_text('static const uint32_t cacheProbeCode[] = {\n' +
         ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
     text = ""
     for name in ('vertex', 'fragment'):

@@ -1,7 +1,11 @@
 #version 450
 // All offsets and bounds are validated by the host before dispatch. One
 // invocation owns one destination pixel; the destination never aliases inputs.
+#ifdef BROOK_EXTERNAL_OUTPUT
+layout(local_size_x = 16, local_size_y = 4) in;
+#else
 layout(local_size_x = 64) in;
+#endif
 layout(set = 0, binding = 0, std430) buffer Scene { uint words[]; } scene;
 #ifdef BROOK_MULTI_SOURCE
 layout(set = 0, binding = 1, std430) readonly buffer Source { uint words[]; } sourceBuffer[64];
@@ -26,9 +30,16 @@ void main() {
     uint base=0u;
 #endif
     uint width=scene.words[base], height=scene.words[base+1u], count=scene.words[base+2u];
+#ifdef BROOK_EXTERNAL_OUTPUT
+    uvec2 position=gl_GlobalInvocationID.xy;
+    if(position.x>=width || position.y>=height) return;
+    uint pixel=position.y*width+position.x;
+    int x=int(position.x), y=int(position.y);
+#else
     uint pixel=gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
     if(pixel >= width*height) return;
     int x=int(pixel%width), y=int(pixel/width);
+#endif
     uvec4 dst=uvec4(0u);
     for(uint i=0u;i<count;++i) {
         uint b=base+4u+i*17u;
@@ -38,8 +49,10 @@ void main() {
         uint cw=scene.words[b+14u],ch=scene.words[b+15u];
         if(x<dx || y<dy || x>=dx+int(dw) || y>=dy+int(dh) ||
            x<cx || y<cy || x>=cx+int(cw) || y>=cy+int(ch)) continue;
-        uint sx=scene.words[b+4u]+(2u*uint(x-dx)+1u)*scene.words[b+6u]/(2u*dw);
-        uint sy=scene.words[b+5u]+(2u*uint(y-dy)+1u)*scene.words[b+7u]/(2u*dh);
+        uint sw=scene.words[b+6u],sh=scene.words[b+7u];
+        uint u=uint(x-dx),v=uint(y-dy);
+        uint sx=scene.words[b+4u]+(sw==dw ? u : (2u*u+1u)*sw/(2u*dw));
+        uint sy=scene.words[b+5u]+(sh==dh ? v : (2u*v+1u)*sh/(2u*dh));
         uint source=scene.words[b]+sy*scene.words[b+1u]+sx;
 #ifdef BROOK_MULTI_SOURCE
         uvec4 s=unpack_bgra(sourceBuffer[i].words[source]);
@@ -50,6 +63,10 @@ void main() {
 #endif
         uint mode=scene.words[b+16u],opacity=mode&255u;
         if((mode&512u)!=0u)s.w=255u;
+        if(opacity==255u && s.w==255u) {
+            dst=s;
+            continue;
+        }
         if((mode&256u)!=0u) {
             // Match the kernel's straight-alpha client blend with one final
             // rounding step. Destination remains premultiplied.

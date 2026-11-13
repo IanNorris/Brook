@@ -30,6 +30,9 @@ bool BdwRunPreparedBcsScanout(BdwBcsExecutionBackend&,uint64_t scratchDma,BdwBcs
 bool BdwRetirePreparedBcsScanout(BdwBcsExecutionBackend&);
 bool BdwReleasePreparedBcsScanout();
 bool BdwBcsScanoutEnabled();
+bool BdwSetScanoutFairness(bool enabled);
+bool BdwScanoutFairness();
+void BdwScanoutFairnessCounts(uint64_t&,uint64_t&,uint64_t&,uint64_t&);
 bool BdwExecuteBcsScanout(BdwGpuBuffer*,uint64_t token,const CompositorPresentRegion*,uint32_t count);
 struct BdwScanoutCopyStats {uint64_t requested=0,submitted=0,full=0,partial=0;uint32_t lastStage=0;};
 BdwScanoutCopyStats BdwReadScanoutCopyStats();
@@ -59,7 +62,7 @@ int64_t BdwSubmitRenderExperiment(void*,BdwExecSnapshot* snapshot);
 int64_t BdwBeginRenderPreparation(void*,uint64_t owner,BdwSubmissionPreparation& entry);
 void BdwEndRenderPreparation(void*,BdwSubmissionPreparation& entry);
 struct BdwGpuBuffer;
-int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGpuBuffer* buffer);
+int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGpuBuffer* buffer,uint64_t baseline=0);
 struct WmDesktopLayers;
 struct WmDesktopLayer;
 // On success takes ownership of the heap-allocated, pinned snapshot.
@@ -112,7 +115,21 @@ struct BdwRenderRunResult {
     // Diagnostic TSC durations for GT, PAT setup, run, save, reset/unbind,
     // PAT restore. Zero or backwards-clock intervals are omitted.
     uint64_t transactionTicks[6]{};
-    uint64_t issueToBreadcrumbTicks=0,breadcrumbToRetirementTicks=0;
+    uint64_t issueTicks=0,breadcrumbTicks=0,contextRetiredTicks=0;
+    struct FrequencySample {
+        uint64_t ticks;
+        uint32_t status;
+    };
+    static constexpr unsigned FrequencySampleLimit=12;
+    bool sampleFrequency=false;
+#if defined(BROOK_BDW_RPS_TRIAL)
+    bool tryFrequency=false;
+    uint32_t trialFrequencyCaps=0;
+    uint32_t trialFrequencyOriginal=0,trialFrequencyPosted=~uint32_t{0};
+#endif
+    unsigned frequencySamples=0;
+    FrequencySample frequency[FrequencySampleLimit]{};
+    uint32_t frequencyRequest=~uint32_t{0},rpsControl=~uint32_t{0},rc6Control=~uint32_t{0};
 #endif
     BdwRenderTransactionResult transaction{};
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;

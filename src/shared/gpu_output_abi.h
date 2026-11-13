@@ -54,6 +54,11 @@
 #define BROOK_GPU_HANDOFF_QUEUE_REGIONS 17
 #define BROOK_GPU_HANDOFF_PRESENT_RESULT 18
 #define BROOK_GPU_PRESENT_CAP_ASYNC 2
+// Opt-in partial reservation: argument is the output fd and the next syscall
+// argument is the last accepted ticket used as the damage baseline. Rejected
+// if the baseline changed before reservation. Existing RESERVE is unchanged.
+#define BROOK_GPU_HANDOFF_RESERVE_DEPENDENT 19
+#define BROOK_GPU_PRESENT_CAP_DEPENDENT 4
 #define BROOK_GPU_RECOVERY_QUEUED 1
 #define BROOK_GPU_RECOVERY_ACTIVE 2
 #define BROOK_GPU_RECOVERY_QUARANTINED 4

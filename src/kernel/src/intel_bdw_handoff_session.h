@@ -32,6 +32,7 @@ public:
 #endif
         BdwHandoffDetach(resources_,owner);Reap();return true;}
     bool OwnedBy(uint64_t owner) const{return owner && resources_.policy.owner==owner;}
+    uint64_t LastPresented(uint64_t owner) const{return OwnedBy(owner)?resources_.policy.lastPresented:0;}
     bool ContainsTicket(uint64_t owner,uint64_t ticket) const {
         auto t=Find(ticket);return t.ticket && resources_.policy.slots[t.slot].owner==owner &&
             resources_.policy.slots[t.slot].state!=HandoffSlotState::Free;

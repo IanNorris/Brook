@@ -20,8 +20,12 @@ static int place(const struct window_out *w,BrookWindowState *state,long x,long 
     return (int)syscall(BROOK_SYS_WM_WINDOW_STATE,(long)w->id,(long)state->incarnation,(long)state,(long)sizeof(*state),0L,0L);
 }
 static int expect_pair(const BrookWindowState *a,uint32_t ca,uint32_t cb,unsigned *samples,int requirePartial){
+    unsigned unavailable=0,pending=0,software=0,full=0,mismatches=0;
+    uint32_t last[2]={0,0};
     for(unsigned attempt=0;attempt<120;++attempt){
-        usleep(50000);long token=syscall(BROOK_SYS_DEBUG_FRAME,0L,0L,0L,0L,0L,0L);if(token<=0)continue;
+        usleep(50000);
+        long token=syscall(BROOK_SYS_DEBUG_FRAME,0L,0L,0L,0L,0L,0L);
+        if(token<=0){++unavailable;continue;}
         struct BrookDebugFrameInfoV3 extended={0};struct BrookDebugFrameInfoV2 *info=&extended.v2;
         for(unsigned poll=0;poll<40;++poll){
             long rc=requirePartial?syscall(BROOK_SYS_DEBUG_FRAME,5L,token,(long)&extended,(long)sizeof(extended),0L,0L):
@@ -40,9 +44,14 @@ static int expect_pair(const BrookWindowState *a,uint32_t ca,uint32_t cb,unsigne
                 reads+=syscall(BROOK_SYS_DEBUG_FRAME,2L,token,(long)&pixels[i],4L,
                     (long)(((uint64_t)y[i]*info->frame.stride+(uint32_t)x[i])*4),0L)==4;
             ok=reads==2 && (pixels[0]&0xffffffu)==(ca&0xffffffu) && (pixels[1]&0xffffffu)==(cb&0xffffffu);
-        }
+            if(reads==2 && !ok){++mismatches;last[0]=pixels[0];last[1]=pixels[1];}
+        } else if(info->frame.state!=2)++pending;
+        else if(info->source!=BROOK_DEBUG_FRAME_SOURCE_LEASED)++software;
+        else if(extended.presentation_mode==BROOK_DEBUG_FRAME_PRESENT_FULL)++full;
         (void)syscall(BROOK_SYS_DEBUG_FRAME,3L,token,0L,0L,0L,0L);if(ok)return 0;
     }
+    fprintf(stderr,"OPACITY_PAIR_TIMEOUT unavailable=%u incomplete=%u software=%u full=%u mismatches=%u actual=%08x/%08x expected=%08x/%08x\n",
+            unavailable,pending,software,full,mismatches,last[0],last[1],ca,cb);
     return -1;
 }
 static uint32_t blended(uint32_t below,uint32_t above,unsigned opacity){

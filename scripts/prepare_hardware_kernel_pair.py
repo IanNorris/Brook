@@ -87,7 +87,7 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
             enable_efi_poweroff=False, enable_usb_boot_poweroff=False, enable_vulkan_desktop=False,
             vulkan_supervisor=None,vulkan_renderer=None,enable_vulkan_partial=False,
             gpu_source_provider=None,enable_gpu_source_trace=False,enable_ac_loss_poweroff=False,
-            enable_dell_acpi_monitor=False,enable_dell_bcs_present=False,enable_vulkan_async_partial=False):
+            enable_dell_acpi_monitor=False,enable_dell_bcs_present=False,enable_vulkan_async_partial=False, enable_irq_signal_probe=False):
     if enable_gpu_source_trace and not gpu_source_provider:
         raise ValueError('GPU source trace requires GPU source opt-in')
     if gpu_source_provider and not enable_vulkan_desktop:
@@ -175,7 +175,8 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
                               (enable_usb_boot_poweroff,'usb-boot-poweroff'),
                               (enable_dell_acpi_monitor,'dell-acpi-monitor'),
                               (enable_ac_loss_poweroff,'ac-loss-poweroff'),
-                              (enable_dell_bcs_present,'dell-gpu-bcs-present')):
+                              (enable_dell_bcs_present,'dell-gpu-bcs-present'),
+                              (enable_irq_signal_probe,'irq-signal-probe')):
             if selected:
                 item=output/name;item.write_bytes(b'1\n')
                 subprocess.run(['mcopy','-o','-i',str(image),str(item),'::/ETC/'+name],check=True)
@@ -242,13 +243,14 @@ def main():
     p.add_argument('--vulkan-renderer',type=Path,help='Pinned renderer executable to embed in the boot image')
     p.add_argument('--gpu-source-provider',type=Path,help='Embed and explicitly enable the paired direct-source Wayland provider')
     p.add_argument('--enable-gpu-source-trace',action='store_true',help='Log the first direct presentation per window incarnation')
+    p.add_argument('--enable-irq-signal-probe',action='store_true',help='Enable experimental interrupt-return signal delivery')
     a = p.parse_args()
     print(json.dumps(prepare(a.source_initrd, a.build, a.abi, a.payload_id, a.output,
                              a.expected_kernel_sha256, a.panic_exporter, a.fat_checker,
                              a.enable_efi_poweroff, a.enable_usb_boot_poweroff, a.enable_vulkan_desktop,
                              a.vulkan_supervisor,a.vulkan_renderer,a.enable_vulkan_partial,a.gpu_source_provider,
                              a.enable_gpu_source_trace,a.enable_ac_loss_poweroff,a.enable_dell_acpi_monitor,
-                             a.enable_dell_bcs_present,a.enable_vulkan_async_partial), indent=2))
+                             a.enable_dell_bcs_present,a.enable_vulkan_async_partial,a.enable_irq_signal_probe), indent=2))
 
 
 if __name__ == '__main__':

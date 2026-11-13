@@ -785,6 +785,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"ownership\":false}\n");r.send();return true;
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(!strcmp(command,"bridge hardware gpu-scanout-fair on") || !strcmp(command,"bridge hardware gpu-scanout-fair off") ||
+       !strcmp(command,"bridge hardware gpu-scanout-fair status")) {
+        const bool set=strcmp(command,"bridge hardware gpu-scanout-fair status")!=0;
+        const bool wanted=!strcmp(command,"bridge hardware gpu-scanout-fair on");
+        const bool ok=!set || BdwSetScanoutFairness(wanted);Reply r;
+        uint64_t pending=0,bypass=0,noEligible=0,forced=0;
+        BdwScanoutFairnessCounts(pending,bypass,noEligible,forced);
+        r.text("{\"gpu_scanout_fair_api\":1,\"ok\":");r.text(ok?"true":"false");
+        r.text(",\"enabled\":");r.text(BdwScanoutFairness()?"true":"false");
+        r.text(",");r.field("pending_observations",pending);r.text(",");r.field("bypasses",bypass);
+        r.text(",");r.field("no_eligible",noEligible);r.text(",");r.field("forced_service",forced);
+        r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware gpu-bcs-present")) {
         const auto stats=BdwReadScanoutCopyStats();Reply r;
         uint64_t queued=0,presented=0;BdwOffscreenPresentCounts(queued,presented);

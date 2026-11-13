@@ -67,6 +67,7 @@ static void json_string(const char* text)
 
 #include "triangle.h"
 #include "timestamps.h"
+#include "cache_probe.h"
 
 int main(int argc, char** argv)
 {
@@ -77,10 +78,23 @@ int main(int argc, char** argv)
         fprintf(stderr, "usage: vulkan-probe [--expect-driver hardware|intel|venus|software]\n"); return 2;
     }
     int passed = 0;
+    const char* cacheArm=getenv("BROOK_VULKAN_CACHE_PROBE");
+    const int cacheProbe=cacheArm!=NULL;
+    unsigned cacheOmit=0,cacheWords=1024;
+    enum { CacheRounds=12 };
+    int node=-1, inputFd=-1, outputFd=-1;
+    if(cacheProbe){
+        if(cacheArm[0]<'0' || cacheArm[0]>'3' || cacheArm[1] ||
+           strcmp(expected,"intel"))return 2;
+        cacheOmit=(unsigned)(cacheArm[0]-'0');
+        const char* footprint=getenv("BROOK_VULKAN_CACHE_PROBE_LARGE");
+        if(footprint && !strcmp(footprint,"1"))cacheWords=524288;
+    }
     const int timestamping = getenv("BROOK_VULKAN_TIMESTAMPS") != NULL;
     ProbeTiming timing = {0};
     const int externalSync=getenv("BROOK_VULKAN_SYNC_FD")!=NULL;
     const int compositorTest=getenv("BROOK_VULKAN_COMPOSITOR_TEST")!=NULL;
+    if(cacheProbe && (timestamping || externalSync || compositorTest || getenv("BROOK_VULKAN_FILL_DIAGNOSTIC")))return 2;
     if(compositorTest && externalSync) {fprintf(stderr,"Compositor test excludes repeated sync-fd dispatch\n");return 2;}
     int exportedFd=-1;
     VkSemaphore exportedSemaphore=VK_NULL_HANDLE;
@@ -137,10 +151,14 @@ int main(int argc, char** argv)
     float priority = 1;
     VkDeviceQueueCreateInfo queueInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
-    const char* deviceExtensions[2];
+    const char* deviceExtensions[4];
     uint32_t extensionCount = 0;
     if (externalSync) deviceExtensions[extensionCount++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
     if (calibration) deviceExtensions[extensionCount++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+    if(cacheProbe){
+        deviceExtensions[extensionCount++]=VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        deviceExtensions[extensionCount++]=VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo deviceInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo,
         .enabledExtensionCount=extensionCount,.ppEnabledExtensionNames=deviceExtensions };
@@ -165,16 +183,28 @@ int main(int argc, char** argv)
     vkGetDeviceQueue(device, family, 0, &queue);
     VkPhysicalDeviceMemoryProperties memory;
     vkGetPhysicalDeviceMemoryProperties(physical, &memory);
-    CHECK_VK(make_buffer(device, &memory, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &upload));
-    CHECK_VK(make_buffer(device, &memory, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &readback));
-    CHECK_VK(make_buffer(device, &memory, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, &storage));
-    CHECK_VK(vkMapMemory(device, upload.memory, 0, VK_WHOLE_SIZE, 0, &upload.mapped));
-    CHECK_VK(vkMapMemory(device, readback.memory, 0, VK_WHOLE_SIZE, 0, &readback.mapped));
-    VkDescriptorSetLayoutBinding binding = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
-    VkDescriptorSetLayoutCreateInfo layoutInfo = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1, .pBindings = &binding };
+    const VkDeviceSize probeBytes=cacheProbe?(VkDeviceSize)cacheWords*sizeof(uint32_t):bytes;
+    if(cacheProbe){
+        node=open("/dev/dri/renderD129",O_RDWR|O_CLOEXEC);
+        if(node<0 || !cache_probe_allocate(node,device,cacheOmit&1u,&memory,probeBytes,&upload,&inputFd) ||
+           !cache_probe_allocate(node,device,cacheOmit&2u,&memory,probeBytes,&readback,&outputFd)){
+            fprintf(stderr,"CACHE_PROBE_ALLOC_FAIL\n");goto cleanup;
+        }
+    }else{
+        CHECK_VK(make_buffer(device, &memory, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &upload));
+        CHECK_VK(make_buffer(device, &memory, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &readback));
+        CHECK_VK(make_buffer(device, &memory, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, &storage));
+        CHECK_VK(vkMapMemory(device, upload.memory, 0, VK_WHOLE_SIZE, 0, &upload.mapped));
+        CHECK_VK(vkMapMemory(device, readback.memory, 0, VK_WHOLE_SIZE, 0, &readback.mapped));
+    }
+    VkDescriptorSetLayoutBinding binding[2] = {
+        {.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT},
+    };
+    const unsigned descriptorCount=cacheProbe?2u:1u;
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount=descriptorCount,.pBindings=binding};
     CHECK_VK(vkCreateDescriptorSetLayout(device, &layoutInfo, NULL, &layout));
     VkPushConstantRange push = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = sizeof(uint32_t) };
     VkPipelineLayoutCreateInfo pipelineInfo = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -183,12 +213,13 @@ int main(int argc, char** argv)
     VkShaderModuleCreateInfo shaderInfo = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = sizeof(shaderCode), .pCode = shaderCode };
     if(compositorTest) {shaderInfo.codeSize=sizeof(compositorCode);shaderInfo.pCode=compositorCode;}
+    if(cacheProbe) {shaderInfo.codeSize=sizeof(cacheProbeCode);shaderInfo.pCode=cacheProbeCode;}
     CHECK_VK(vkCreateShaderModule(device, &shaderInfo, NULL, &shader));
     VkComputePipelineCreateInfo compute = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" }, .layout = pipelineLayout };
     CHECK_VK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &compute, NULL, &pipeline));
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount };
     VkDescriptorPoolCreateInfo poolInfo = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &poolSize };
     CHECK_VK(vkCreateDescriptorPool(device, &poolInfo, NULL, &descriptors));
@@ -196,11 +227,17 @@ int main(int argc, char** argv)
         .descriptorPool = descriptors, .descriptorSetCount = 1, .pSetLayouts = &layout };
     VkDescriptorSet set;
     CHECK_VK(vkAllocateDescriptorSets(device, &allocateSet, &set));
-    VkDescriptorBufferInfo bufferInfo = { storage.buffer, 0, bytes };
-    VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bufferInfo };
-    vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+    VkDescriptorBufferInfo bufferInfo[2] = {
+        {cacheProbe?upload.buffer:storage.buffer,0,probeBytes},
+        {readback.buffer,0,probeBytes},
+    };
+    VkWriteDescriptorSet write[2] = {
+        {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=0,.descriptorCount=1,
+         .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bufferInfo[0]},
+        {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=1,.descriptorCount=1,
+         .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bufferInfo[1]},
+    };
+    vkUpdateDescriptorSets(device,descriptorCount,write,0,NULL);
     VkCommandPoolCreateInfo commandInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = family };
     CHECK_VK(vkCreateCommandPool(device, &commandInfo, NULL, &commands));
@@ -210,6 +247,57 @@ int main(int argc, char** argv)
     CHECK_VK(vkAllocateCommandBuffers(device, &allocateCommand, &command));
     VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     CHECK_VK(vkCreateFence(device, &fenceInfo, NULL, &fence));
+    if(cacheProbe){
+        volatile uint32_t* input=upload.mapped;
+        volatile uint32_t* output=readback.mapped;
+        for(uint32_t round=0;round<CacheRounds;++round){
+            const uint32_t seed=7u+round*31u;
+            const uint32_t sentinel=0xcafe0123u^seed;
+            CHECK_VK(vkResetCommandBuffer(command,0));
+            VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHECK_VK(vkBeginCommandBuffer(command,&begin));
+            VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask=VK_ACCESS_HOST_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0,1,&barrier,0,NULL,0,NULL);
+            vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);
+            vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,1,&set,0,NULL);
+            vkCmdPushConstants(command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(seed),&seed);
+            // Leave the last workgroup as an overwrite guard.
+            vkCmdDispatch(command,cacheWords/64-1,1,1);
+            barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,
+                                 0,1,&barrier,0,NULL,0,NULL);
+            CHECK_VK(vkEndCommandBuffer(command));
+            CHECK_VK(vkResetFences(device,1,&fence));
+            for(uint32_t i=0;i<cacheWords;++i)output[i]=sentinel;
+            for(uint32_t i=0;i<cacheWords;++i)input[i]=(i*17u)^seed;
+            // Populate CPU lines in the writer's cache. The kernel additionally
+            // primes output lines after the input-side pass in post-omit arms.
+            for(uint32_t i=0;i<cacheWords;i+=16)if(output[i]!=sentinel)goto cleanup;
+            VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount=1,.pCommandBuffers=&command};
+            CHECK_VK(vkQueueSubmit(queue,1,&submit,fence));
+            CHECK_VK(vkWaitForFences(device,1,&fence,VK_TRUE,10000000000ULL));
+            const uint64_t pages=probeBytes/4096;
+            if(!cache_probe_query(node,inputFd,cacheOmit&1u,probeBytes,cacheOmit&1u?pages*(round+1):0,0) ||
+               !cache_probe_query(node,outputFd,cacheOmit&2u,probeBytes,0,cacheOmit&2u?pages*(round+1):0))
+                goto cleanup;
+            for(uint32_t i=0;i<cacheWords;++i){
+                const uint32_t want=i>=cacheWords-64?sentinel:
+                    (((i*17u)^seed)^(0x9e3779b9u+seed))*1664525u+1013904223u;
+                if(output[i]!=want){
+                    fprintf(stderr,"CACHE_PROBE_MISMATCH arm=%u round=%u word=%u got=%08x expected=%08x\n",
+                            cacheOmit,round,i,output[i],want);goto cleanup;
+                }
+            }
+        }
+        printf("CACHE_PROBE_PASS omit=%u bytes=%llu rounds=%u\n",cacheOmit,
+               (unsigned long long)probeBytes,CacheRounds);
+        passed=1;
+        goto cleanup;
+    }
     if (getenv("BROOK_VULKAN_FILL_DIAGNOSTIC")) {
         VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         CHECK_VK(vkBeginCommandBuffer(command, &begin));
@@ -355,7 +443,11 @@ cleanup:
         release_buffer(device, &readback); release_buffer(device, &storage); release_buffer(device, &upload);
         vkDestroyDevice(device, NULL);
     }
+    if(inputFd>=0)close(inputFd);
+    if(outputFd>=0)close(outputFd);
+    if(node>=0)close(node);
     if (instance) vkDestroyInstance(instance, NULL);
+    if(cacheProbe)return passed?0:1;
     printf("{\"passed\":%s,\"device\":", passed ? "true" : "false"); json_string(properties.deviceName);
     printf(",\"driver\":"); json_string(driver.driverName);
     printf(",\"driver_id\":%u,\"vendor_id\":%u,\"device_id\":%u,\"words_per_round\":%u,\"rounds\":%u,"

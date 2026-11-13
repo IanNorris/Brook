@@ -2555,6 +2555,7 @@ enum { INTEL_PENDING_LIMIT=64,INTEL_PENDING_PER_TICK=8 };
 static struct brook_image *g_intel_pending_head,*g_intel_pending_tail;
 static unsigned g_intel_pending_count;
 static uint64_t g_intel_queued,g_intel_ready,g_intel_busy,g_intel_failed;
+static uint64_t g_intel_discarded;
 static uint64_t g_intel_fences,g_intel_fence_pending,g_intel_direct;
 static void intel_pending_append(struct brook_image *image){
     image->pending_next=NULL;
@@ -2675,6 +2676,7 @@ static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer){
     image->refs=1;image->width=db->width;image->height=db->height;image->format=db->fourcc==0x34325258?2:1;
     image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
     image->pending_cpu=1;image->pending_fd=prime.fd;image->producer_fence=-1;
+    if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->trace_queued_ms=g_now_ms();
     const char *fenced=getenv("BROOK_WAYLAND_SNAPSHOT_FENCE");
     image->producer_fence_required=fenced && !strcmp(fenced,"1");
     image_ref(image);intel_pending_append(image);++g_intel_queued;return image;
@@ -2686,6 +2688,7 @@ static void intel_pending_poll(void){
         struct brook_image *image=g_intel_pending_head;g_intel_pending_head=image->pending_next;
         if(!g_intel_pending_head)g_intel_pending_tail=NULL;
         --g_intel_pending_count;image->pending_next=NULL;
+        if(image->trace_queued_ms && !image->trace_first_poll_ms)image->trace_first_poll_ms=g_now_ms();
         int fence_error=0;
         if(image->producer_fence_required){
             if(image->producer_fence<0){
@@ -2741,7 +2744,19 @@ static void intel_pending_poll(void){
             if(image->producer_fence>=0)close(image->producer_fence);
             close(image->pending_fd);image->pending_fd=-1;image->pending_cpu=2;image_unref(image);continue;
         }
+        if(image->trace_queued_ms && !image->trace_fence_ms)image->trace_fence_ms=g_now_ms();
+        /* A successfully fenced image held only by this queue has no view
+         * left to paint. The offer path above has also retired its readers. */
+        if(image->producer_fence_required && image->refs==1){
+            ++g_intel_discarded;
+            close(image->producer_fence);
+            close(image->pending_fd);
+            image_unref(image);
+            continue;
+        }
+        uint32_t trace_try_start=image->trace_queued_ms?g_now_ms():0;
         errno=0;long result=syscall(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ,(long)image->pending_fd,0L,0L,0L,0L,0L);
+        uint32_t trace_try_done=image->trace_queued_ms?g_now_ms():0;
         int error=result<0?errno:0,uncertain=0;
         if(result<0 && (error==EAGAIN || error==EINTR)){++g_intel_busy;intel_pending_append(image);continue;}
         struct brook_image *copy=NULL;
@@ -2752,6 +2767,7 @@ static void intel_pending_poll(void){
             uncertain=1;
             fprintf(stderr,"[waylandd] Intel buffer readiness failed: errno=%d; release withheld\n",error);
         }
+        uint32_t trace_copy_done=image->trace_queued_ms?g_now_ms():0;
         int ready=copy!=NULL;
         if(!ready){
             ++g_intel_failed;
@@ -2777,6 +2793,14 @@ static void intel_pending_poll(void){
                     if(surface_layers(surface,draws,&count) && count==1 && draws[0].view->image==image)
                         gpu_window_timing_add(&g_snapshotWait,image->offer_ack_ms,g_now_ms());}
             }
+        }
+        if(image->trace_queued_ms){
+            uint32_t trace_done=g_now_ms();
+            fprintf(stderr,"[wayland-gpu-stage] width=%u height=%u queued=%u first_poll=%u fence=%u offer=%u ack=%u try_start=%u try_done=%u copy_done=%u done=%u offer_state=%d ready=%d window=%u incarnation=%llu commit=%llu\n",
+                image->width,image->height,image->trace_queued_ms,image->trace_first_poll_ms,image->trace_fence_ms,
+                image->offer_sent_ms,image->offer_ack_ms,trace_try_start,trace_try_done,trace_copy_done,trace_done,image->offer_state,ready,
+                image->offer_identity.window,(unsigned long long)image->offer_identity.incarnation,
+                (unsigned long long)image->offer_identity.commit);
         }
         image_unref(image);
     }
@@ -3212,8 +3236,8 @@ done:;
     const struct IntelPendingDrainOps drain={NULL,shutdown_pending_count,shutdown_pending_poll,shutdown_pending_wait};
     const int pendingDrained=intel_pending_drain(&drain,200);
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
-    if(g_intel_queued)fprintf(stderr,"[waylandd] Intel async queued=%llu ready=%llu busy_polls=%llu failed=%llu pending=%u\n",
-        (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_busy,
+    if(g_intel_queued)fprintf(stderr,"[waylandd] Intel async queued=%llu ready=%llu discarded=%llu busy_polls=%llu failed=%llu pending=%u\n",
+        (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_discarded,(unsigned long long)g_intel_busy,
         (unsigned long long)g_intel_failed,g_intel_pending_count);
     if(g_intel_fences || g_intel_fence_pending)fprintf(stderr,"[waylandd] Intel producer fences=%llu pending_polls=%llu\n",
         (unsigned long long)g_intel_fences,(unsigned long long)g_intel_fence_pending);

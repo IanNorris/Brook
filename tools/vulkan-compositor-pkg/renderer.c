@@ -29,7 +29,7 @@ struct BrookVkRenderer {
     VkDescriptorSetLayout layout; VkDescriptorPool descriptors; VkDescriptorSet set;
     VkPipelineLayout pipelineLayout; VkPipeline pipeline; VkShaderModule shader;
     VkCommandPool pool; VkCommandBuffer command; VkFence fence;
-    VkQueryPool timestampPool;uint32_t timestampBits;uint64_t gpuTimestampNs;int gpuTimestampValid,timestampPending;
+    VkQueryPool timestampPool;uint32_t timestampBits;uint64_t gpuTimestampNs;int gpuTimestampValid,timestampPending,timestampDispatchOnly;
     VkPhysicalDeviceProperties properties; size_t maxWords; uint32_t maxTiles; int quarantined,pending,external,syncSupported;
     uint32_t family; VkBuffer source; VkDeviceMemory sourceMemory; VkSemaphore sourceSemaphore;
     VkBuffer multiSource[BROOK_VK_MAX_LAYERS+1]; VkDeviceMemory multiMemory[BROOK_VK_MAX_LAYERS+1];
@@ -196,6 +196,7 @@ static BrookVkRenderer *renderer_create(size_t maxWords,int allowSoftware,int ex
         .enabledExtensionCount=extensionCount,.ppEnabledExtensionNames=external?extensions:NULL};
     VK_OK(vkCreateDevice(r->physical,&di,NULL,&r->device));vkGetDeviceQueue(r->device,family,0,&r->queue);
     if(getenv("BROOK_RENDER_GPU_TIMESTAMPS")){
+        r->timestampDispatchOnly=getenv("BROOK_RENDER_GPU_DISPATCH_ONLY")!=NULL;
         if(!r->timestampBits || r->timestampBits>64 || !(r->properties.limits.timestampPeriod>0))goto fail;
         VkQueryPoolCreateInfo query={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=2};
         VK_OK(vkCreateQueryPool(r->device,&query,NULL,&r->timestampPool));
@@ -320,11 +321,19 @@ static BrookVkResult compose(BrookVkRenderer *r,const uint32_t *scene,size_t wor
     if(!maxX)return BROOK_VK_REJECTED;
     uint32_t dispatchX[BROOK_VK_MAX_TILES],dispatchY[BROOK_VK_MAX_TILES];
     for(uint32_t i=0;i<tiles;++i){const uint32_t *s=local+(size_t)i*BROOK_VK_TILE_STRIDE;
-        const uint64_t groups=((uint64_t)s[0]*s[1]+63)/64;
-        dispatchX[i]=groups<maxX?(uint32_t)groups:maxX;
-        const uint64_t y=(groups+dispatchX[i]-1)/dispatchX[i];
-        if(!y || y>r->properties.limits.maxComputeWorkGroupCount[1])return BROOK_VK_REJECTED;
-        dispatchY[i]=(uint32_t)y;
+        if(r->external==3){
+            // Match the 16 by 4 workgroup in the separate-output shader.
+            // Each invocation has integer x/y coordinates without dividing
+            // a flattened index by the tile width.
+            dispatchX[i]=(s[0]+15)/16;
+            dispatchY[i]=(s[1]+3)/4;
+        }else{
+            const uint64_t groups=((uint64_t)s[0]*s[1]+63)/64;
+            dispatchX[i]=groups<maxX?(uint32_t)groups:maxX;
+            dispatchY[i]=(uint32_t)((groups+dispatchX[i]-1)/dispatchX[i]);
+        }
+        if(!dispatchX[i] || dispatchX[i]>maxX || !dispatchY[i] ||
+           dispatchY[i]>r->properties.limits.maxComputeWorkGroupCount[1])return BROOK_VK_REJECTED;
     }
     VkMappedMemoryRange range={.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,.memory=r->memory,.size=VK_WHOLE_SIZE};
     if(!(r->flags&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && vkFlushMappedMemoryRanges(r->device,1,&range)!=VK_SUCCESS)
@@ -334,7 +343,7 @@ static BrookVkResult compose(BrookVkRenderer *r,const uint32_t *scene,size_t wor
     if(vkBeginCommandBuffer(r->command,&begin)!=VK_SUCCESS)return BROOK_VK_REJECTED;
     r->gpuTimestampValid=0;r->timestampPending=asynchronous && r->timestampPool;
     if(r->timestampPending){vkCmdResetQueryPool(r->command,r->timestampPool,0,2);
-        vkCmdWriteTimestamp(r->command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,r->timestampPool,0);}
+        if(!r->timestampDispatchOnly)vkCmdWriteTimestamp(r->command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,r->timestampPool,0);}
     VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT,
         .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
     vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,NULL,0,NULL);
@@ -353,6 +362,8 @@ static BrookVkResult compose(BrookVkRenderer *r,const uint32_t *scene,size_t wor
             .srcQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL,.dstQueueFamilyIndex=r->family,.buffer=r->multiSource[BROOK_VK_MAX_LAYERS],.size=VK_WHOLE_SIZE};
         vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,NULL,1,&acquire,0,NULL);
     }
+    if(r->timestampPending && r->timestampDispatchOnly)
+        vkCmdWriteTimestamp(r->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,r->timestampPool,0);
     vkCmdBindPipeline(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->pipeline);
     vkCmdBindDescriptorSets(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->pipelineLayout,0,1,&r->set,0,NULL);
     for(uint32_t i=0;i<tiles;++i){
@@ -360,6 +371,8 @@ static BrookVkResult compose(BrookVkRenderer *r,const uint32_t *scene,size_t wor
             vkCmdPushConstants(r->command,r->pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(base),&base);}
         vkCmdDispatch(r->command,dispatchX[i],dispatchY[i],1);
     }
+    if(r->timestampPending && r->timestampDispatchOnly)
+        vkCmdWriteTimestamp(r->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,r->timestampPool,1);
     if(r->external==1){
         VkBufferMemoryBarrier release={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_READ_BIT,
             .srcQueueFamilyIndex=r->family,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL,.buffer=r->source,.size=VK_WHOLE_SIZE};
@@ -377,7 +390,8 @@ static BrookVkResult compose(BrookVkRenderer *r,const uint32_t *scene,size_t wor
     }
     barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,NULL,0,NULL);
-    if(r->timestampPending)vkCmdWriteTimestamp(r->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,r->timestampPool,1);
+    if(r->timestampPending && !r->timestampDispatchOnly)
+        vkCmdWriteTimestamp(r->command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,r->timestampPool,1);
     if(vkEndCommandBuffer(r->command)!=VK_SUCCESS || vkResetFences(r->device,1,&r->fence)!=VK_SUCCESS)return BROOK_VK_REJECTED;
     VkPipelineStageFlags waitStage=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     VkSemaphore waits[BROOK_VK_MAX_LAYERS];VkPipelineStageFlags stages[BROOK_VK_MAX_LAYERS];uint32_t waitCount=0;
@@ -510,7 +524,8 @@ static void multi_cleanup(BrookVkRenderer *r){
 static BrookVkResult compose_multi(BrookVkRenderer *r,const uint32_t *scene,size_t words,
         const struct BrookVkExternalSource *sources,size_t count,uint32_t *output,int outputFd,size_t outputWords,uint64_t timeoutNs,uint32_t tiles,int asynchronous) {
     uint64_t start=renderer_now_ns(),imported=0,composed=0;
-    if(!r || (r->external!=2 && r->external!=3) || r->quarantined || r->multiCount || !sources || !count || count>BROOK_VK_MAX_LAYERS ||
+    if(!r || (r->external!=2 && r->external!=3) || r->quarantined || r->pending || r->multiCount ||
+       (count && !sources) || (!count && r->external!=3) || count>BROOK_VK_MAX_LAYERS ||
        !scene || !tiles || tiles>r->maxTiles || (r->external==2 && (!output || tiles!=1)) || (r->external==3 && outputFd<0) || words>r->maxWords)return BROOK_VK_REJECTED;
     size_t sizes[BROOK_VK_MAX_LAYERS];struct stat identity[BROOK_VK_MAX_LAYERS+1];
     for(size_t i=0;i<count;++i){
@@ -593,7 +608,8 @@ static BrookVkResult compose_multi(BrookVkRenderer *r,const uint32_t *scene,size
         if(!destination)descriptors[i]=(VkDescriptorBufferInfo){r->multiSource[i],0,(VkDeviceSize)size};
     }
     /* The layout does not use partially-bound descriptors. */
-    for(uint32_t i=r->multiCount;i<BROOK_VK_MAX_LAYERS;++i)descriptors[i]=descriptors[0];
+    if(!count)descriptors[0]=(VkDescriptorBufferInfo){r->buffer,0,4};
+    for(uint32_t i=r->multiCount?r->multiCount:1;i<BROOK_VK_MAX_LAYERS;++i)descriptors[i]=descriptors[0];
     VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=r->set,.dstBinding=1,
         .descriptorCount=BROOK_VK_MAX_LAYERS,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=descriptors};
     vkUpdateDescriptorSets(r->device,1,&write,0,NULL);

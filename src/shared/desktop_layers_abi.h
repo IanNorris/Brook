@@ -34,6 +34,9 @@
 // pixels are supplied separately. All input window/incarnation identities
 // must still match the query; skipped layers require zero pixels/capacity.
 #define BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE 9
+// Bind current display/backdrop identity for a renderer that draws a clear
+// or a procedural backdrop. Returns the same metadata as QUERY.
+#define BROOK_DESKTOP_BACKDROP_TRACKED_BIND 10
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u

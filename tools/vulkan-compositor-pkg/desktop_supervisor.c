@@ -30,10 +30,19 @@ int main(int argc,char **argv){
     if(!renderer || renderer[0]!='/' || (socketPath && socketPath[0]!='/') || (traceSource && !socketPath)){
         fprintf(stderr,"usage: brook-desktop-supervisor [--partial | --async-partial] [--gpu-source /socket] [--trace-gpu-source] /absolute/path/to/brook-desktop-renderer\n");return 2;
     }
+#ifdef BROOK_SUPERVISOR_DIAGNOSTIC_REUSE_BACKDROP
+    if(setenv("BROOK_RENDER_REUSE_TILE_BACKDROP","1",1))return 1;
+#endif
+#ifdef BROOK_SUPERVISOR_DIAGNOSTIC_BARE
+    if(setenv("BROOK_RENDER_BARE","1",1))return 1;
+#endif
     if(partial && setenv("BROOK_RENDER_PARTIAL","1",1))return 1;
     if(asyncPartial && (setenv("BROOK_RENDER_ASYNC_PARTIAL","1",1) ||
        setenv("BROOK_RENDER_BUFFER_COUNT","2",1) ||
        setenv("BROOK_RENDER_ASYNC_PARTIAL_GRACE","1",0)))return 1;
+#ifdef BROOK_SUPERVISOR_SERIAL
+    if(!asyncPartial || setenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL","1",1))return 1;
+#endif
     if(socketPath && (setenv("BROOK_DESKTOP_GPU_SOCKET",socketPath,1) || setenv("BROOK_RENDER_SELECTIVE_CAPTURE","1",1)))return 1;
     if(traceSource && setenv("BROOK_RENDER_GPU_SOURCE_TRACE","1",1))return 1;
 #ifdef BROOK_SUPERVISOR_TEST_LATE_FENCE

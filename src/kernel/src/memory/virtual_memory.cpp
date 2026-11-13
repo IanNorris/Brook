@@ -943,7 +943,32 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     return owned() && inTime();
                 }
                 bool immediatePollAllowed(){return owned() && inTime();}
-                bool completionContinue(){return BdwFirstGpuPoll(*this,firstCompletionPoll);}
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+                void sampleRenderFrequency(){
+                    if(!result.sampleFrequency || result.frequencySamples==result.FrequencySampleLimit)return;
+                    uint64_t now=0;
+                    if(!io.tsc(now))return;
+                    const auto count=result.frequencySamples;
+                    if(count && now-result.frequency[count-1].ticks<uint64_t{khz}*5)return;
+                    // The forcewake claim already audits the 0xa000 MMIO page.
+                    uint32_t status=~uint32_t{0};
+                    if(!io.read32(BdwDellBar0+0xa01c,status))return; // GEN6_RPSTAT1
+                    result.frequency[count]={now,status};
+                    ++result.frequencySamples;
+                    if(!count){
+                        io.read32(BdwDellBar0+0xa008,result.frequencyRequest); // GEN6_RPNSWREQ
+                        io.read32(BdwDellBar0+0xa024,result.rpsControl); // GEN6_RP_CONTROL
+                        io.read32(BdwDellBar0+0xa090,result.rc6Control); // GEN6_RC_CONTROL
+                    }
+                }
+#endif
+                bool completionContinue(){
+                    if(!BdwFirstGpuPoll(*this,firstCompletionPoll))return false;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+                    sampleRenderFrequency();
+#endif
+                    return true;
+                }
                 bool retirementContinue(){return BdwFirstGpuPoll(*this,firstRetirementPoll);}
                 void relax(){io.relax();}
                 bool renderStateReady(){return owned() && gtReady;}
@@ -1024,12 +1049,51 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool initializeGt(){return BdwTimedTransaction(result,0,[&](){return o.restoreRenderState();});}
                 bool establishPat(){return BdwTimedTransaction(result,1,[&](){const bool ok=lease.Establish(pat,0x119);o.patActive=ok;
                     if(lease.State()==BdwPatLeaseState::Quarantined)o.fault=true;return ok;});}
-                bool run(){return BdwTimedTransaction(result,2,[&](){const bool ok=rebased?BdwRunRebasedRender(backend,scratch,result):BdwRunRetainedRender(backend,scratch,result);
+#if defined(BROOK_BDW_RPS_TRIAL)
+                bool restoreFrequency=false;
+                uint32_t savedFrequency=0;
+                void requestTrialFrequency(){
+                    constexpr uint32_t requestReg=0xa008; // GEN6_RPNSWREQ
+                    constexpr uint32_t trialBin=10; // 500 MHz, in 50 MHz bins
+                    constexpr uint32_t ratioMask=0x7f000000u;
+                    if(!result.tryFrequency || !o.owned())return;
+                    DellI2cCriticalEvidence evidence{};
+                    if(!o.io.evidence(BdwRenderFrequencyCapsPage,evidence) || !BdwGttEvidenceValid(evidence))return;
+                    if(!o.io.read32(BdwDellBar0+BdwRenderFrequencyCaps,result.trialFrequencyCaps))return;
+                    const uint32_t caps=result.trialFrequencyCaps;
+                    const uint32_t minBin=(caps>>16)&0xff;
+                    const uint32_t maxBin=caps&0xff;
+                    uint32_t control=0;
+                    if(caps==0xffffffffu || !minBin || minBin>trialBin || maxBin<trialBin ||
+                       !o.io.read32(BdwDellBar0+0xa024,control) || control==0xffffffffu || !(control&(1u<<7)) ||
+                       !o.io.read32(BdwDellBar0+requestReg,savedFrequency) || savedFrequency==0xffffffffu ||
+                       ((savedFrequency&ratioMask)>>24)<minBin || ((savedFrequency&ratioMask)>>24)>=trialBin)return;
+                    const auto desired=(savedFrequency&~ratioMask)|(trialBin<<24);
+                    // Restore the prior request even if the posting read does
+                    // not confirm the trial write.
+                    restoreFrequency=true;
+                    result.trialFrequencyOriginal=savedFrequency;
+                    o.io.write32(BdwDellBar0+requestReg,desired);
+                    o.io.read32(BdwDellBar0+requestReg,result.trialFrequencyPosted);
+                }
+                bool restoreTrialFrequency(){
+                    if(!restoreFrequency)return true;
+                    uint32_t posted=0;
+                    return o.owned() && o.io.write32(BdwDellBar0+0xa008,savedFrequency) &&
+                        o.io.read32(BdwDellBar0+0xa008,posted) && posted==savedFrequency;
+                }
+#endif
+                bool run(){return BdwTimedTransaction(result,2,[&](){
+#if defined(BROOK_BDW_RPS_TRIAL)
+                    requestTrialFrequency();
+#endif
+                    const bool ok=rebased?BdwRunRebasedRender(backend,scratch,result):BdwRunRetainedRender(backend,scratch,result);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                     const auto retired=BdwTimingNow();uint64_t issued=0,breadcrumb=0;backend.timingTicks(issued,breadcrumb);
                     if(ok && issued && breadcrumb>issued && retired>breadcrumb){
-                        result.issueToBreadcrumbTicks=breadcrumb-issued;
-                        result.breadcrumbToRetirementTicks=retired-breadcrumb;
+                        result.issueTicks=issued;
+                        result.breadcrumbTicks=breadcrumb;
+                        result.contextRetiredTicks=retired;
                     }
 #endif
                     result.engineSampled=o.owned() && o.io.read32(BdwDellBar0+0x2034,result.head) &&
@@ -1051,6 +1115,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool uncertain(){return o.fault;}
             } transaction(owner,backend,*renderResult,scratchDma,*snapshot,rebased);
             renderResult->transaction=BdwRunOwnedRenderTransaction(transaction);
+#if defined(BROOK_BDW_RPS_TRIAL)
+            if(!transaction.restoreTrialFrequency())renderResult->transaction.uncertain=true;
+#endif
             renderResult->ggttWriteAttempts=backend.ggttWriteAttempts();renderResult->portWriteAttempts=backend.portWriteAttempts();
             const auto& r=renderResult->transaction;
             return r.contextSaved && r.resetComplete && r.patRestored && !r.uncertain;

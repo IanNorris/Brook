@@ -16,6 +16,7 @@ struct brook_image {
     int producer_fence,producer_fence_required,direct_attempted;
     int offer_state;
     uint32_t offer_sent_ms,offer_ack_ms;
+    uint32_t trace_queued_ms,trace_first_poll_ms,trace_fence_ms;
     struct BrookGpuWindowIdentity offer_identity;
     struct brook_image *pending_next;
 };
@@ -275,6 +276,8 @@ static int surface_render(struct brook_surface *root) {
      * partially visible subsurfaces rather than only the root window. */
     for(unsigned i=0;i<count;++i)
         if(draws[i].view->geometry.w>16384/scale || draws[i].view->geometry.h>16384/scale) return 0;
+    uint64_t writeIncarnation=0;
+    int writeGuard=0;
     /* The native scene service does not yet expose a begin-write/commit tag
      * transaction. Keep channel-backed windows on the tagged CPU path. */
     if (root->scene && !(getenv("BROOK_WAYLAND_GPU_SOCKET") && *getenv("BROOK_WAYLAND_GPU_SOCKET"))) {
@@ -293,6 +296,23 @@ static int surface_render(struct brook_surface *root) {
         // Native resize/content generation changes can safely discard a frame.
         // Keep the captured versions; the next commit/configure can redraw.
         return result==0 || result==-116;
+    }
+    /* A single full-size retained image over transparent black needs no
+     * intermediate scene or alpha blend. Preserve straight-alpha conversion
+     * and the same source-write/commit protocol as the general path. */
+    if(count==1 && draws[0].x==0 && draws[0].y==0){
+        const struct brook_view *view=draws[0].view;
+        const struct brook_geometry *g=&view->geometry;
+        const struct brook_image *image=view->image;
+        if(image->pixels && image->format==1 && !g->transform && !g->sx && !g->sy &&
+           g->sw==(int64_t)image->width*256 && g->sh==(int64_t)image->height*256 &&
+           g->w*scale==image->width && g->h*scale==image->height &&
+           root->vfb_w==image->width && root->vfb_h==image->height){
+            writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
+            for(unsigned y=0;y<root->vfb_h;++y)for(unsigned x=0;x<root->vfb_w;++x)
+                root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(image->pixels[(size_t)y*image->width+x]);
+            goto publish;
+        }
     }
     size_t pixels=(size_t)root->vfb_w*root->vfb_h;
     if (root->composite_pixels<pixels) {
@@ -321,10 +341,10 @@ static int surface_render(struct brook_surface *root) {
         }
     }
     }
-    uint64_t writeIncarnation=0;
-    const int writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
+    writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
     for (unsigned y=0;y<root->vfb_h;++y) for (unsigned x=0;x<root->vfb_w;++x)
         root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(root->composite[(size_t)y*root->vfb_w+x]);
+publish:;
     int tagged=0;
 #ifdef BROOK_WAYLAND_SOURCE_COMMIT_TAG
     /* Tag only when the composed snapshot includes the current root view.

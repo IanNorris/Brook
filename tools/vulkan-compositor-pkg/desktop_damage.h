@@ -50,6 +50,18 @@ static inline void desktop_damage_add(struct DesktopDamageSet *s,struct DesktopD
     if(s->count==DESKTOP_DAMAGE_MAX_RECTS){s->count=1;s->rects[0]=(struct DesktopDamageRect){0,0,width,height};return;}
     s->rects[s->count++]=r;
 }
+/* Include the footprint of every older in-flight frame when preparing a
+ * partial successor. If an older frame presents first, its changed pixels
+ * must also be covered by the successor. A different output/backdrop cannot
+ * share this partial baseline. The caller still enforces ticket ordering. */
+static inline int desktop_damage_include_pending(struct DesktopDamageState *base,struct DesktopDamageState pending){
+    if(!base->display || !base->backdrop || !base->width || !base->height ||
+       base->display!=pending.display || base->backdrop!=pending.backdrop ||
+       base->width!=pending.width || base->height!=pending.height)return 0;
+    for(uint32_t i=0;i<pending.previous.count;++i)
+        desktop_damage_add(&base->previous,pending.previous.rects[i],base->width,base->height);
+    return 1;
+}
 static inline struct DesktopDamageSet desktop_damage_current(struct DesktopDamageState s,uint64_t display,uint64_t backdrop,
                                                                uint32_t width,uint32_t height,struct DesktopDamageSet current){
     if(!display || !backdrop || !width || !height || s.display!=display || s.backdrop!=backdrop ||

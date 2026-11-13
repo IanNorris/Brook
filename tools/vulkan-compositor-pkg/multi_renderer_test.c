@@ -251,6 +251,40 @@ int main(int argc,char **argv){
             uint32_t want=compositor_probe_pixel(reference,x+7,y+9),got=tilePixels[y*37+x];
             if(got!=want){fprintf(stderr,"opaque batch mismatch x=%u y=%u got=%08x expected=%08x\n",x,y,got,want);return 1;}
         }
+        {
+            // Opaque middle layer with a clipped translucent layer above it:
+            // skipping lower layers must not alter blending or exposed edges.
+            uint32_t stacked[55]={0};memcpy(stacked,scene,38*sizeof(uint32_t));stacked[2]=3;
+            const uint32_t upper[]={0,64,64,64,0,0,32,32,12,8,32,32,0,0,64,64,127|BROOK_VK_STRAIGHT_ALPHA};
+            memcpy(stacked+38,upper,sizeof(upper));
+            struct create upperGem={65536,0,0};CHECK(!ioctl(drm,IOC(0x5b,sizeof(upperGem)),&upperGem));
+            struct map_offset upperMap={upperGem.handle,0,0,2,0};CHECK(!ioctl(drm,IOC(0x64,sizeof(upperMap)),&upperMap));
+            uint32_t *upperPixels=mmap(NULL,upperGem.size,PROT_READ|PROT_WRITE,MAP_SHARED,drm,(off_t)upperMap.offset);
+            CHECK(upperPixels!=MAP_FAILED);memcpy(upperPixels,reference+4160,4096*sizeof(uint32_t));
+            struct prime upperPrime={upperGem.handle,O_CLOEXEC|O_RDWR,-1};CHECK(!ioctl(drm,IOC(0x2d,sizeof(upperPrime)),&upperPrime));
+            struct BrookVkExternalSource stackedSources[]={sources[0],sources[1],{upperPrime.fd,upperGem.size/4,-1}};
+            size_t stackedWords[]={sourceWords[0],sourceWords[1],upperGem.size/4};
+            CHECK(desktop_tile_scene(stacked,55,stackedWords,3,7,9,37,25,tileScene,BROOK_VK_TILE_STRIDE));tileScene[3]=0;
+            status=brook_vk_renderer_compose_batch_output(batch,tileScene,BROOK_VK_TILE_STRIDE,1,
+                                                          stackedSources,3,tilePrime.fd,tile.size/4,10000000000ULL);
+            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"STACKED_BATCH_UNCERTAIN resources retained\n");for(;;)pause();}
+            CHECK(status==BROOK_VK_COMPLETE && !ioctl(drm,IOC(0x5f,sizeof(tileDomain)),&tileDomain));
+            for(unsigned y=0;y<25;++y)for(unsigned x=0;x<37;++x){
+                const unsigned px=x+7,py=y+9;uint32_t want=compositor_probe_pixel(reference,px,py);
+                if(px>=12 && px<44 && py>=8 && py<40){
+                    const uint32_t src=reference[4160+(py-8)*64+(px-12)];
+                    const uint32_t alpha=compositor_probe_scale(src>>24,127),inv=255-alpha;
+                    uint32_t blended=0xff000000u;
+                    for(unsigned c=0;c<3;++c){const uint32_t s=(src>>(8*c))&255u,d=(want>>(8*c))&255u;
+                        blended|=((s*alpha+d*inv+127u)/255u)<<(8*c);}
+                    want=blended;
+                }
+                CHECK(tilePixels[y*37+x]==want);
+            }
+            CHECK(!close(upperPrime.fd) && !munmap(upperPixels,upperGem.size));
+            struct gem_close upperClose={upperGem.handle,0};CHECK(!ioctl(drm,IOC(9,sizeof(upperClose)),&upperClose));
+            fprintf(stderr,"STACKED_OPAQUE_TRANSLUCENT_BATCH_PASS\n");
+        }
         /* The second layer cannot intersect this tile. Submit only the
          * selected descriptor and compare against the independent full scene. */
         struct DesktopDamageSet outside={0};desktop_damage_add(&outside,(struct DesktopDamageRect){50,50,60,60},64,64);

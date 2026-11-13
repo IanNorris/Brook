@@ -109,23 +109,33 @@ bool CompositorGetBackdropInfo(CompositorBackdropInfo* out);
 bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t y,uint32_t left,uint32_t count,uint32_t* out);
 constexpr uint32_t COMPOSITOR_MAX_REGIONS=32;
 struct CompositorPresentRegion {uint32_t x,y,width,height,stride;uint64_t offset;};
-struct CompositorPresentAcceleration {
-    void* context;
-    // Returns only after the device can no longer write to scanout.
-    bool (*present)(void*,const CompositorPresentRegion*,uint32_t);
-    bool (*prepareCpu)(void*);
+// A write reservation for the fixed firmware framebuffer. The caller holds
+// the scene lock for admission, and pins the completed source until finish.
+struct CompositorGopWrite {
+    uint64_t token=0,display=0,backdrop=0,owner=0;
+    uint32_t minY=0,maxY=0;
+    bool partial=false;
 };
+int CompositorReserveGopWrite(CompositorGopWrite& write,const CompositorPresentRegion* regions,
+                              uint32_t count,uint64_t sourceBytes,uint64_t display,uint64_t backdrop,
+                              uint64_t owner,bool partial);
+int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool touched);
+int CompositorCopyGopWrite(const CompositorGopWrite& write,const CompositorPresentRegion* regions,
+                           uint32_t count,void* source,bool (*copy)(void*,uint64_t,void*,uint64_t));
+void CompositorSampleGopWrite(const CompositorGopWrite& write,uint32_t samples[4]);
+struct CompositorSoftwareTakeoverStats {uint64_t count,lastAgeMs;};
+CompositorSoftwareTakeoverStats CompositorReadSoftwareTakeoverStats();
+void CompositorLockScanoutForDisplayChange();
+void CompositorUnlockScanoutForDisplayChange();
 int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t stride,
                            void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),uint32_t samples[4],
-                           uint64_t expectedDisplay=0,uint64_t expectedBackdrop=0,uint64_t leaseOwner=0,bool region=false,
-                           const CompositorPresentAcceleration* acceleration=nullptr);
+                           uint64_t expectedDisplay=0,uint64_t expectedBackdrop=0,uint64_t leaseOwner=0,bool region=false);
 // Internal only. The caller pins a completed source and holds scene identity
 // stable. The display lock serializes the entire batch against other writers;
 // it does not guarantee tear-free physical scanout.
 int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t count,uint64_t sourceBytes,
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
-                             uint64_t display,uint64_t backdrop,uint64_t owner,
-                             const CompositorPresentAcceleration* acceleration=nullptr);
+                             uint64_t display,uint64_t backdrop,uint64_t owner);
 void CompositorReleasePresentLease(uint64_t owner);
 
 // Begin a WM drag operation for a window at the current mouse position.

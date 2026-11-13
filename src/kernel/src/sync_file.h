@@ -33,8 +33,9 @@ static inline void SyncFileDescribe(const SyncFileData& fence,SyncFileInfo& info
     for(uint32_t i=0;name[i] && i<31;++i) {info.name[i]=name[i];detail.driverName[i]=name[i];}
     const char* object=fence.intelFence?"intel-fence":"completed-timeline";
     for(uint32_t i=0;object[i] && i<31;++i)detail.objectName[i]=object[i];
-    const uint32_t state=SyncFileState(fence);
+    uint64_t timestamp=0;
+    const uint32_t state=fence.intelFence?BdwFenceState(fence.intelFence,&timestamp):1;
     info.status=detail.status=state==2?-5:static_cast<int32_t>(state);
-    info.numFences=1;detail.timestampNs=fence.intelFence?0:fence.timestampNs;
+    info.numFences=1;detail.timestampNs=fence.intelFence?timestamp:fence.timestampNs;
 }
 }

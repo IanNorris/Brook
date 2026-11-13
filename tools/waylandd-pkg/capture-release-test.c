@@ -173,6 +173,25 @@ static void check_intel_deferred_surface(void)
     g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;unsetenv("BROOK_WAYLAND_INTEL_ASYNC");
     wl_client_destroy(client);close(sockets[1]);wl_display_destroy(display);
 }
+static void check_superseded_intel_image(void)
+{
+    struct brook_dmabuf_buffer db={.width=1,.height=1,.stride=4,.bo_handle=123};
+    struct brook_buffer buffer={.refs=1,.dmabuf=&db};
+    g_drm_fd=open("/dev/zero",O_RDWR);assert(g_drm_fd>=0);
+    int fence[2];assert(!pipe(fence));mock_fence_fd=fence[0];
+    assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    struct brook_image *image=intel_dmabuf_defer(&buffer);assert(image && buffer.uses==1);
+    image_unref(image);
+    intel_pending_poll();assert(g_intel_pending_count==1 && buffer.uses==1);
+    assert(write(fence[1],"x",1)==1);
+    const uint64_t discarded=g_intel_discarded;
+    try_error=EAGAIN; /* A discarded image must never attempt a CPU transition. */
+    intel_pending_poll();
+    assert(!g_intel_pending_count && !buffer.uses && !buffer.uncertain && buffer.refs==1);
+    assert(g_intel_discarded==discarded+1);
+    try_error=0;mock_fence_fd=-1;close(fence[0]);close(fence[1]);
+    close(g_drm_fd);g_drm_fd=-1;unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");
+}
 #ifdef BROOK_DIRECT_TEST
 static void check_gpu_window_offer(int mode)
 {
@@ -366,6 +385,7 @@ int main(void)
     check_intel_deferred(0,0);check_intel_deferred(0,1);
     check_intel_deferred(EIO,0);check_intel_deferred(ENOSYS,0);
     check_intel_fence(0);check_intel_fence(1);check_intel_fence(2);
+    check_superseded_intel_image();
     check_intel_deferred_surface();
 #ifdef BROOK_DIRECT_TEST
     source_begins=source_tags=0;check_gpu_window_offer(0);

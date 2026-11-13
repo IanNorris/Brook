@@ -1204,6 +1204,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->pendingWaitStatus = 0;
     child->syncNext = nullptr;
     child->pendingWakeup = 0;
+    child->wakeAfterSwitch = false;
 
     // Set fork-child trampoline state
     child->stopReported = false;
@@ -1419,6 +1420,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->pendingWaitStatus = 0;
     thread->syncNext = nullptr;
     thread->pendingWakeup = 0;
+    thread->wakeAfterSwitch = false;
     thread->vforkParent = nullptr;
     thread->blockedOnRwLock = nullptr;
     thread->heldWriteLock = nullptr;
@@ -1828,6 +1830,11 @@ void ProcessConfigureIrqSignalProbe() {
     char value[2]{};const auto n=FwCfgReadFile("opt/irq-signal-probe",value,sizeof(value));
     if((n==1 || (n==2 && !value[1])) && (value[0]=='1' || value[0]=='2'))
         irqSignalProbeMode=unsigned(value[0]-'0');
+    if(!irqSignalProbeMode) {
+        VnodeStat marker{};
+        if(VfsStatPath("/etc/irq-signal-probe",&marker)==0)irqSignalProbeMode=1;
+    }
+    if(irqSignalProbeMode)SerialPrintf("SIGNAL_IRQ_PROBE enabled mode=%u\n",irqSignalProbeMode);
 }
 static void FinishIrqSignalProbe(Process* proc) {
     SchedulerKernelRegionLeave(proc);
@@ -1835,7 +1842,7 @@ static void FinishIrqSignalProbe(Process* proc) {
 }
 }
 
-// Experimental QEMU-only path for caught signals. Default and ignored signal
+// Experimental opt-in path for caught signals. Default and ignored signal
 // dispositions remain on their existing paths while this probe is validated.
 extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp,unsigned source) {
     using namespace brook;
@@ -1861,6 +1868,9 @@ extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp,unsigned source) {
     if(!PosixTimerClaimCaught(proc,signum,&info,&action) && !ProcessClaimCaughtSignal(proc,signum,&info,&action)) {
         FinishIrqSignalProbe(proc);return;
     }
+#ifdef BROOK_MAPPING_TEST_HOOKS
+    SerialPrintf("SIGNAL_IRQ_TEST pid=%u source=%u signal=%d\n",proc->pid,source,signum);
+#endif
     if(irqSignalProbeMode==2)SerialPrintf("SIGNAL_IRQ_PROBE source=ipi pid=%u signal=%d\n",proc->pid,signum);
     const uint64_t savedMask=proc->sigMask;
     const uint64_t handlerMask=(savedMask|action.mask|((action.flags&SA_NODEFER)?0:(1ULL<<(signum-1)))) & ~((1ULL<<8)|(1ULL<<18));

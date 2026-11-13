@@ -195,12 +195,25 @@ int main(){
         SyncFileData file{1,0,17,fence};
         assert(!SyncFileReady(file,1));SyncFileDescribe(file,info,detail);
         assert(info.status==0 && detail.status==0 && info.numFences==1 && !detail.timestampNs);
-        assert(BdwFenceComplete(fence,true) && SyncFileReady(file,1)==1 && !SyncFileReady(file,4));
-        SyncFileDescribe(file,info,detail);assert(info.status==1 && detail.status==1 && !detail.timestampNs);
+        assert(BdwFenceComplete(fence,true,321) && SyncFileReady(file,1)==1 && !SyncFileReady(file,4));
+        SyncFileDescribe(file,info,detail);assert(info.status==1 && detail.status==1 && detail.timestampNs==321);
         BdwFenceUnref(fence);
         fence=BdwFenceCreate();assert(fence && BdwFenceComplete(fence,false));file.intelFence=fence;
         assert(SyncFileReady(file,1)==1);SyncFileDescribe(file,info,detail);
         assert(info.status==-5 && detail.status==-5);BdwFenceUnref(fence);
+    }
+    {
+        auto* a=BdwFenceCreate();
+        auto* b=BdwFenceCreate();
+        auto* joined=BdwFenceCreate(true,a,0,b);
+        assert(a && b && joined);
+        uint64_t timestamp=1;
+        assert(BdwFenceComplete(a,true,700));
+        assert(BdwFenceState(joined,&timestamp)==0 && timestamp==0);
+        assert(BdwFenceComplete(b,true,550));
+        assert(BdwFenceState(joined,&timestamp)==1 && timestamp==700);
+        assert(BdwFenceState(joined,&timestamp)==1 && timestamp==700);
+        BdwFenceUnref(joined);BdwFenceUnref(b);BdwFenceUnref(a);
     }
     {
         auto* file=BdwGpuFileCreate();assert(file);const auto id=BdwGpuFileCreateSync(file,false);assert(id);
