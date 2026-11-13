@@ -158,4 +158,3 @@ static inline int desktop_tile_pack(const uint32_t *scene,size_t words,const siz
     }
     return 1;
 }
-

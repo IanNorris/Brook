@@ -82,6 +82,7 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_capture_timing.c -o brook-desktop-capture-timing
     $CC -std=c11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation desktop_caret_test.c -o brook-desktop-caret-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_supervisor.c -o brook-desktop-supervisor
+    $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_SERIAL=1 desktop_supervisor.c -o brook-desktop-supervisor-serial
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_LATE_FENCE=1 desktop_supervisor.c -o brook-desktop-supervisor-test-late-fence
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_BLOCKED_FENCE=1 desktop_supervisor.c -o brook-desktop-supervisor-test-blocked-fence
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_CHROME_SPANS=1 desktop_supervisor.c -o brook-desktop-supervisor-test-chrome-spans
@@ -94,6 +95,8 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation desktop_chrome_present_test.c -o brook-desktop-chrome-present-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_layers_vulkan_test.c renderer.o -lvulkan -o brook-desktop-layers-vulkan-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer.c renderer.o graphics_image.o graphics_pass.o -lvulkan -o brook-desktop-renderer
+    $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_DIAGNOSTIC_REUSE_BACKDROP=1 desktop_supervisor.c -o brook-desktop-supervisor-reuse-backdrop
+    $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_DIAGNOSTIC_BARE=1 desktop_supervisor.c -o brook-desktop-supervisor-bare
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_RENDER_TEST_SOURCE_CRASH=1 desktop_renderer.c renderer.o graphics_image.o graphics_pass.o -lvulkan -o brook-desktop-renderer-test-source-crash
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer_client_test.c -o brook-desktop-renderer-client-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_present_test.c -o brook-desktop-present-test
@@ -132,7 +135,7 @@ pkgs.stdenv.mkDerivation {
     cp brook-desktop-source-commit-test $out/bin/
     cp brook-desktop-capture-timing $out/bin/
     cp brook-desktop-caret-test $out/bin/
-    cp brook-desktop-supervisor $out/bin/
+    cp brook-desktop-supervisor brook-desktop-supervisor-serial $out/bin/
     cp brook-desktop-supervisor-test-late-fence $out/bin/
     cp brook-desktop-supervisor-test-blocked-fence $out/bin/
     cp brook-desktop-supervisor-test-chrome-spans $out/bin/
@@ -144,6 +147,7 @@ pkgs.stdenv.mkDerivation {
     cp brook-desktop-chrome-present-test $out/bin/
     cp brook-desktop-layers-vulkan-test $out/bin/
     cp brook-desktop-renderer $out/bin/
+    cp brook-desktop-supervisor-bare brook-desktop-supervisor-reuse-backdrop $out/bin/
     cp brook-desktop-renderer-test-source-crash $out/bin/
     cp brook-desktop-renderer-client-test $out/bin/
     cp brook-desktop-blocked-hardware-test $out/bin/
