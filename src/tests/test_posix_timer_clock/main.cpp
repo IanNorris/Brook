@@ -83,6 +83,7 @@ void init(brook::Process& p,uint16_t pid=7) {
     using namespace brook;
     p.magic=PROCESS_MAGIC;p.pid=p.tgid=pid;p.incarnation=100+pid;p.state=ProcessState::Running;
     p.sigPending=p.sigMask=0;p.pendingWakeup=0;p.interruptibleWait=p.terminalPending=p.resumePending=false;
+    p.wakeAfterSwitch = false;
     p.kernelRegionDepth=0;p.isThread=false;p.leaderIncarnation=0;p.tgidExiting=false;
     p.runningOnCpu=0;p.asLiveThreads=1;g_perCpu[0].currentProcess=&p;
     policyOps.VoluntaryYield=PolicyVoluntaryYield;

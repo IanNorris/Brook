@@ -88,6 +88,9 @@ Terminal* TerminalFindByProcess(Process* proc);
 struct TerminalGeometry { uint32_t rows,cols,width,height; };
 // Copies geometry under the terminal state lock; no terminal pointer escapes.
 bool TerminalSnapshotGeometry(Process* proc,TerminalGeometry* result);
+struct TerminalCaret {uint32_t x,y,width,height;};
+// Exact child identity only; no terminal pointer escapes the state lock.
+bool TerminalSnapshotCaret(uint16_t pid,uint64_t incarnation,TerminalCaret* result);
 // Reattach the terminal's kernel-owned source after its owning shell execs.
 // Descendant processes keep their independent framebuffer setup.
 void TerminalRestoreAfterExec(Process* proc);

@@ -16,6 +16,7 @@ Use the handover and decision ledger first. These references provide detail for 
 | What is known about Dell Steam? | `docs/steam-dell-software-glx-checkpoint.md` | `docs/steam-shared-memory-checkpoint.md`, `docs/steam-pulse-shm-checkpoint.md`, `docs/steam-library-stability.md` |
 | What games already work? | README application table, `docs/stardew-native64.md` | `docs/three-games-checkpoint-20261026.md`, `docs/proton.md`, `docs/d3d12.md`, `docs/wine-dxvk.md` |
 | What Intel graphics work exists? | `docs/dell-bdw-forcewake-checkpoint.md` | Latest source and private hardware receipts; `docs/gpu-command-ownership.md`, `docs/gpu-resource-lifetime.md` for related lifetime reasoning |
+| Where are the current Dell Quake and browser measurements? | `docs/gpu-frame-breakdown.md`, `docs/workloads.md` | The handover identifies the exact tested images and private captures. The GPU frame ledger includes wait stacks and fence dependencies. |
 | Where are performance investigations? | `docs/steam-loading-performance-20261029.md`, `docs/dell-io-performance-20261031.md` | Search headings in scheduler/audio/timing notes for the precise subsystem; read `docs/backlog.md` before restarting an old avenue |
 | What is parked or superseded? | `docs/backlog.md`, `docs/branch-recovery.md`, `docs/branch-cleanup-20261028.md` | `docs/roadmap.md` records the original October targets, not today's execution order |
 

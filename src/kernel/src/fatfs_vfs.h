@@ -55,7 +55,14 @@ int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* mount);
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 int FatFsPrivateRecoveryArmJournal(FatPrivateMount* mount);
 int FatFsPrivateRecoveryReadPanic(FatPrivateMount* mount,uint8_t* out,uint32_t capacity,
-                                  uint64_t* sequence,uint32_t* bytes,uint32_t* crc);
+                                  uint64_t* sequence,uint32_t* bytes,uint32_t* crc,unsigned rank=0);
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+struct AcShutdownRecord;
+// Call only on the checked, private ESP before publishing the desktop mount.
+int FatFsPrivateRecoveryPinAcShutdown(FatPrivateMount* mount,AcShutdownRecord& previous);
+// Shutdown coordinator only, after checked filesystem sync and clean readback.
+bool FatFsPrivateRecoveryWriteAcShutdown(FatPrivateMount* mount,const char (&bootId)[33]);
+#endif
 #endif
 #endif
 // True only for a streaming regular FIL whose retained drive binding is immutable.

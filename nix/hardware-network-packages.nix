@@ -8,6 +8,10 @@ let
   firefox = import ../tools/firefox-brook-pkg { inherit pkgs; };
   chromium = import ../tools/chromium-brook-pkg { inherit pkgs; };
   gallery = import ../tools/brook-gallery-pkg { inherit pkgs; };
+  intelVulkan = import ../tools/mesa-hasvk-brook-pkg/launcher.nix { inherit pkgs; };
+  intelVulkanDriver = import ../tools/mesa-hasvk-brook-pkg/default.nix { inherit pkgs; };
+  intelGl = import ../tools/mesa-iris-brook-pkg/runtime.nix { inherit pkgs; };
+  desktopCompositor = import ../tools/vulkan-compositor-pkg/default.nix { inherit pkgs; };
   launchers = pkgs.runCommand "brook-hardware-network-launchers" {} ''
     mkdir -p $out/bin $out/share/applications
     cp ${../data/nix-wrappers/brook-firefox} $out/bin/brook-firefox
@@ -61,8 +65,8 @@ let
     DESKTOP
     chmod +x $out/bin/*
   '';
-  packages = [ (pkgs.lib.hiPrio launchers) firefox chromium gallery graphics.mesaRuntime pkgs.xz.bin pkgs.zstd.bin ] ++ base.packages;
+  packages = [ (pkgs.lib.hiPrio launchers) intelVulkan desktopCompositor firefox chromium gallery graphics.mesaRuntime pkgs.xz.bin pkgs.zstd.bin ] ++ base.packages ++ [ (pkgs.lib.lowPrio intelGl) ];
 in {
-  inherit packages firefox chromium gallery;
+  inherit packages firefox chromium gallery intelVulkanDriver;
   profile = pkgs.buildEnv { name = "brook-network-hardware-desktop"; paths = packages; ignoreCollisions = true; };
 }

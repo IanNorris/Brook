@@ -30,6 +30,7 @@
 #include "terminal.h"
 #include "window.h"
 #include "gpu_app.h"
+#include "intel_bdw_scanout.h"
 #include "ext2_vfs.h"
 #include "string.h"
 #include "spinlock.h"
@@ -1203,6 +1204,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->pendingWaitStatus = 0;
     child->syncNext = nullptr;
     child->pendingWakeup = 0;
+    child->wakeAfterSwitch = false;
 
     // Set fork-child trampoline state
     child->stopReported = false;
@@ -1224,6 +1226,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->fbDestY = 0;
     child->fbScale = 0;
     child->fbDirty = 0;
+    child->fbPublicationGeneration = 0;
     child->fbExitColor = 0;
 
     // Allocate per-process kernel stack
@@ -1417,6 +1420,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->pendingWaitStatus = 0;
     thread->syncNext = nullptr;
     thread->pendingWakeup = 0;
+    thread->wakeAfterSwitch = false;
     thread->vforkParent = nullptr;
     thread->blockedOnRwLock = nullptr;
     thread->heldWriteLock = nullptr;
@@ -1439,6 +1443,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->fbDestY = 0;
     thread->fbScale = 0;
     thread->fbDirty = 0;
+    thread->fbPublicationGeneration = 0;
     thread->fbExitColor = 0;
 
     // Initialize FPU/SSE state
@@ -1825,6 +1830,11 @@ void ProcessConfigureIrqSignalProbe() {
     char value[2]{};const auto n=FwCfgReadFile("opt/irq-signal-probe",value,sizeof(value));
     if((n==1 || (n==2 && !value[1])) && (value[0]=='1' || value[0]=='2'))
         irqSignalProbeMode=unsigned(value[0]-'0');
+    if(!irqSignalProbeMode) {
+        VnodeStat marker{};
+        if(VfsStatPath("/etc/irq-signal-probe",&marker)==0)irqSignalProbeMode=1;
+    }
+    if(irqSignalProbeMode)SerialPrintf("SIGNAL_IRQ_PROBE enabled mode=%u\n",irqSignalProbeMode);
 }
 static void FinishIrqSignalProbe(Process* proc) {
     SchedulerKernelRegionLeave(proc);
@@ -1832,7 +1842,7 @@ static void FinishIrqSignalProbe(Process* proc) {
 }
 }
 
-// Experimental QEMU-only path for caught signals. Default and ignored signal
+// Experimental opt-in path for caught signals. Default and ignored signal
 // dispositions remain on their existing paths while this probe is validated.
 extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp,unsigned source) {
     using namespace brook;

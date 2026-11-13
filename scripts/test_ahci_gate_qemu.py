@@ -17,6 +17,8 @@ def main():
     parser.add_argument('--image', required=True, type=Path)
     parser.add_argument('--kernel', required=True, type=Path)
     parser.add_argument('--firmware', required=True, type=Path)
+    parser.add_argument('--initrd', type=Path, help='Use this private candidate initrd as the fixture base')
+    parser.add_argument('--efi', type=Path, help='Use this unguarded EFI loader in the disposable fixture')
     parser.add_argument('--compiler', default='x86_64-unknown-linux-musl-gcc')
     parser.add_argument('--timeout', default=75, type=int)
     args = parser.parse_args()
@@ -32,10 +34,21 @@ def main():
             raise RuntimeError('expected the 128 MiB GPT test fixture')
         part = table['partitions'][0]
         esp = f'{disk}@@{part["start"] * 512}'
+        if args.efi:
+            subprocess.run(['mcopy', '-o', '-i', esp, str(args.efi.resolve(strict=True)),
+                            '::/EFI/BOOT/BOOTX64.EFI'], check=True)
+            cfg = d / 'BROOK.CFG'
+            cfg.write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nDISPLAY_WIDTH=800\nDISPLAY_HEIGHT=600\n')
+            subprocess.run(['mcopy', '-o', '-i', esp, str(cfg), '::/BROOK.CFG'], check=True)
         initrd = d / 'initrd.img'
-        subprocess.run(['mcopy', '-i', esp, '::/INITRD.IMG', str(initrd)], check=True)
+        if args.initrd:
+            shutil.copyfile(args.initrd.resolve(strict=True), initrd)
+        else:
+            subprocess.run(['mcopy', '-i', esp, '::/INITRD.IMG', str(initrd)], check=True)
         for directory in ('MEDIA', 'MEDIA/SYSTEM'):
-            subprocess.run(['mmd', '-i', str(initrd), '::/' + directory], check=True)
+            if subprocess.run(['mdir', '-i', str(initrd), '::/' + directory], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode:
+                subprocess.run(['mmd', '-i', str(initrd), '::/' + directory], check=True)
         records = {
             'ahci-observe': '1\n',
             'ahci-read-only': '1\n',
@@ -55,6 +68,11 @@ def main():
         subprocess.run([args.compiler, '-static', '-O2', str(ROOT / 'scripts/workloads/ahci_gate_smoke.c'),
                         '-o', str(binary)], check=True)
         subprocess.run(['mcopy', '-o', '-i', str(initrd), str(binary), '::/BOOT/GATEQA.ELF'], check=True)
+        if args.initrd:
+            # mcopy may require space for both files before replacing one.
+            # This is the disposable clone, so delete its old initrd first.
+            subprocess.run(['mdel', '-i', esp, '::/INITRD.IMG'], check=True)
+            subprocess.run(['mdeltree', '-i', esp, '::/RECOVERY'], check=True)
         subprocess.run(['mcopy', '-o', '-i', esp, str(initrd), '::/INITRD.IMG'], check=True)
         subprocess.run(['mcopy', '-o', '-i', esp, str(kernel), '::/KERNEL/BROOK.ELF'], check=True)
         variables = d / 'vars.fd'

@@ -1,6 +1,7 @@
 #include "debug_hardware.h"
 #include "bridge_reply.h"
 #include "shutdown.h"
+#include "usb_boot_health.h"
 #include "fs/compressed_vfs.h"
 #include "vfs.h"
 #include "pci.h"
@@ -12,7 +13,9 @@
 #include "dell_audio_probe.h"
 #include "dell_i2c_probe.h"
 #include "intel_vtd_observe.h"
+#include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_forcewake_adapter.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
@@ -39,8 +42,34 @@ bool GuardRecoveryPanicSnapshot(GuardPanicSnapshot& out){
     out={};if(!recoveryPanicAvailable)return false;
     out={recoveryPanicBytes,42,3,0x11223344};return true;
 }
+bool GuardRecoveryPanicPreviousSnapshot(GuardPanicSnapshot& out){
+    out={};if(!recoveryPanicAvailable)return false;
+    out={recoveryPanicBytes,41,3,0x11223344};return true;
+}
 DellGpuVtdObservation gpuVtd{};
 const DellGpuVtdObservation& DellGpuVtdObserveRead(){return gpuVtd;}
+bool DellGpuVtdObserveDeferred(){return false;}
+uint32_t BdwInspectPrivateBcsDma(){return 1;}
+uint32_t BdwInspectPrivateRenderDma(){return 1;}
+bool BdwObserveReservedGgtt(BdwGgttReservedPtes&){return false;}
+bool BdwObserveRcsGgtt(BdwRcsGgttPtes&){return false;}
+bool BdwObserveGopPtesLive(BdwGopPtes&){return false;}
+bool BdwObserveGopBacking(BdwGopBacking&){return false;}
+bool BdwObserveDisplayLive(BdwDisplaySnapshot&){return false;}
+bool BdwObserveGgttSurvey(uint32_t,BdwGgttSurvey&){return false;}
+bool BdwObserveForcewakeLive(BdwForcewakeAdapterResult&,bool,bool){return false;}
+bool BdwTestTlbInvalidate(BdwForcewakeAdapterResult&){return false;}
+bool BdwTestBcsReset(BdwForcewakeAdapterResult&){return false;}
+bool BdwTestScratchTakeover(BdwForcewakeAdapterResult&,BdwScratchTakeoverResult&){return false;}
+bool BdwTestBcsInitialize(BdwForcewakeAdapterResult&,BdwBcsInitResult&){return false;}
+bool BdwTestPrivatePat(BdwForcewakeAdapterResult&,BdwPatTestResult&){return false;}
+bool BdwTestRcsReset(BdwForcewakeAdapterResult&,BdwRcsResetTestResult&){return false;}
+bool BdwTestRenderGtInit(BdwForcewakeAdapterResult&,BdwRenderGtInitResult&){return false;}
+bool BdwTestRenderRun(BdwForcewakeAdapterResult&,BdwRenderRunResult&){return false;}
+bool BdwTestRenderRepeat(BdwForcewakeAdapterResult&,BdwRenderRunResult&){return false;}
+bool BdwTestRebasedRenderRun(BdwForcewakeAdapterResult&,BdwRenderRunResult&){return false;}
+bool BdwTestBcsCopy(BdwForcewakeAdapterResult&,BdwBcsRunResult&){return false;}
+bool BdwClearPriorScratch(BdwForcewakeAdapterResult&,BdwScratchTakeoverResult&){return false;}
 BdwGopObservation gpuGop{};
 const BdwGopObservation& BdwGopObserveRead(){return gpuGop;}
 HdaObservation hdaObservation{};
@@ -75,17 +104,25 @@ AhciObservation ahciObservation{};
 AhciReadOnlyStatus AhciReadOnlyGetStatus(){return ahciStatus;}
 const AhciObservation& AhciObserveRead(){return ahciObservation;}
 int AhciReadOnlySector(uint64_t lba,void* out){if(lba!=3)return -22;std::memset(out,0x5a,512);return 512;}
-Vnode binaryNode{},markerNode{};
+Vnode binaryNode{},markerNode{},payloadNode{};
 bool binaryPresent=false,markerPresent=false,directory=false,statError=false;
+std::string payload;
 unsigned openNodes=0;
 AppSnapshotBootInfo CompressedVfsAppSnapshotInfo(){return snapshot;}
 extern "C" Vnode* VfsOpen(const char* path,int){
     if(!std::strcmp(path,"/boot/HWBULK.ELF")&&binaryPresent){++openNodes;return &binaryNode;}
     if(!std::strcmp(path,"/etc/hardware-bulk")&&markerPresent){++openNodes;return &markerNode;}
+    if(!std::strcmp(path,"/etc/hardware-payload-id")&&!payload.empty()){++openNodes;return &payloadNode;}
     return nullptr;
 }
-int VfsStat(Vnode*,VnodeStat* out){*out={};out->size=1;out->isDir=directory;return statError?-5:0;}
+int VfsStat(Vnode* node,VnodeStat* out){*out={};out->size=node==&payloadNode?payload.size():1;out->isDir=directory;return statError?-5:0;}
 extern "C" void VfsClose(Vnode*){assert(openNodes);--openNodes;}
+void VfsRelease(Vnode* node){VfsClose(node);}
+extern "C" int VfsRead(Vnode* node,void* out,uint64_t len,uint64_t* off){
+    if(node!=&payloadNode || *off>payload.size() || len>payload.size()-*off)return -5;
+    std::memcpy(out,payload.data()+*off,len);*off+=len;
+    return int(len);
+}
 
 void DebugChannelSend(const char* s){reply+=s;}
 void DebugEpochCopy(char out[33]){std::memset(out,'a',32);out[32]=0;}
@@ -98,6 +135,7 @@ DisplayPowerStatus DisplayPowerRead(){return {};}
 bool DisplayPowerSetOn(bool on,uint32_t seconds){++backlightCalls;backlightSeconds=seconds;backlightOn=on;return false;}
 bool DisplayPowerSetIdle(uint32_t seconds){++backlightCalls;backlightSeconds=seconds;return false;}
 ShutdownPowerCapabilities ShutdownGetPowerCapabilities(){return {true,true,false,"acpi-io8","manual","firmware","S5 unavailable"};}
+ShutdownAcStatus ShutdownGetAcStatus(){return {AcPowerSource::Unknown,false,false,false,~uint64_t{0}};}
 const char* ShutdownRequestStatus(const char*){return "Safe to power off manually";}
 void ShutdownCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
 uint32_t SmpGetCpuCount(){return 4;}
@@ -132,20 +170,71 @@ int main(){
     assert(handle("bridge hardware recovery-panic 0 3") && reply.find("\"sequence\":42")!=std::string::npos &&
            reply.find("\"crc32\":287454020")!=std::string::npos && reply.find("\"hex\":\"00abff\"")!=std::string::npos);
     assert(handle("bridge hardware recovery-panic 1 2") && reply.find("\"hex\":\"abff\"")!=std::string::npos);
+    assert(handle("bridge hardware recovery-panic-previous 1 2") && reply.find("\"sequence\":41")!=std::string::npos &&
+           reply.find("\"hex\":\"abff\"")!=std::string::npos);
     assert(handle("bridge hardware recovery-panic 3 1") && reply.find("Invalid byte range")!=std::string::npos);
     assert(handle("bridge hardware recovery-panic 0 513") && reply.find("Expected offset")!=std::string::npos);
     assert(!handle("bridge unrelated"));
+    assert(handle("bridge hardware gpu-ggtt-survey 65536") && reply.find("\"sampled\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-ggtt-survey 1048577") && reply.find("\"sampled\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-ggtt-survey 65536x") && reply.find("\"sampled\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-display-state") && reply.find("\"sampled\":false")!=std::string::npos &&
+           reply.find("\"ownership\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-forcewake-live") && reply.find("\"sampled\":false")!=std::string::npos &&
+           reply.find("\"ownership\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-engines-live") && reply.find("\"sampled\":false")!=std::string::npos &&
+           reply.find("\"ownership\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-scope-check") && reply.find("\"scope_attempted\":false")!=std::string::npos &&
+           reply.find("\"scope_complete\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-tlb-test") && reply.find("\"completed\":false")!=std::string::npos &&
+           reply.find("\"dma_authorized\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-scratch-takeover") && reply.find("\"pte_attempted\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-bcs-init-test") && reply.find("\"init_attempted\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-rcs-reset-test") && reply.find("\"attempted\":false")!=std::string::npos &&
+           reply.find("\"reset_uncertain\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-rcs-gt-init") && reply.find("\"completed\":false")!=std::string::npos &&
+           reply.find("\"writes\":0")!=std::string::npos);
+    assert(handle("bridge hardware gpu-rcs-run-test") && reply.find("\"attempted\":false")!=std::string::npos &&
+           reply.find("\"uncertain\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-rcs-rebase-test") && reply.find("\"rebased\":true")!=std::string::npos);
+    assert(handle("bridge hardware gpu-clear-prior-scratch") && reply.find("\"pte_attempted\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-bcs-reset-test") && reply.find("\"completed\":false")!=std::string::npos &&
+           reply.find("\"dma_authorized\":false")!=std::string::npos);
     assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"planned\":false")!=std::string::npos && reply.find("first_index")==std::string::npos);
     brook::gpuGop.otherEnginesRequested=true;brook::gpuGop.wake.otherEnginesSampled=true;
     for(unsigned i=0;i<3;++i){brook::gpuGop.wake.other[i].sampled=true;brook::gpuGop.wake.other[i].first.head=i+10;}
     assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"other_engines_sampled\":true")!=std::string::npos &&
         reply.find("\"name\":\"rcs0\"")!=std::string::npos && reply.find("\"name\":\"vcs0\"")!=std::string::npos &&
         reply.find("\"name\":\"vecs0\"")!=std::string::npos && reply.find("\"head\":12")!=std::string::npos && reply.back()=='\n');
+    brook::gpuGop.patRequested=brook::gpuGop.patPageAdmitted=brook::gpuGop.wake.patSampled=true;
+    brook::gpuGop.wake.patLo=0x1234;brook::gpuGop.wake.patHi=0x5678;
+    assert(handle("bridge hardware gpu-gop-plan") && reply.find("\"pat_sampled\":true")!=std::string::npos &&
+        reply.find("\"pat_lo\":4660")!=std::string::npos && reply.find("\"pat_hi\":22136")!=std::string::npos);
     brook::gpuGop={};
     assert(handle("bridge hardware gpu-vtd") && reply.find("\"sampled\":false")!=std::string::npos && reply.find("global_status")==std::string::npos);
-    brook::gpuVtd.sampled=true;brook::gpuVtd.status={0x10,0x80000000};
-    assert(handle("bridge hardware gpu-vtd") && reply.find("\"translation_enabled\":true")!=std::string::npos);
+    brook::gpuVtd.sampled=true;brook::gpuVtd.status={0x10,0x80000000,32,0x80000001,true};
+    assert(handle("bridge hardware gpu-vtd") && reply.find("\"translation_enabled\":true")!=std::string::npos &&
+        reply.find("\"protected_memory_sampled\":true")!=std::string::npos && reply.find("\"protected_memory\":2147483649")!=std::string::npos);
+    assert(handle("bridge hardware gpu-bcs-dma-check") && reply.find("\"snapshot_ok\":false")!=std::string::npos &&
+        reply.find("\"dma_authorized\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-rcs-dma-check") && reply.find("\"snapshot_ok\":false")!=std::string::npos &&
+        reply.find("\"gpu_rcs_dma_snapshot_api\":1")!=std::string::npos && reply.find("\"dma_authorized\":false")!=std::string::npos);
+    assert(handle("bridge hardware gpu-bcs-ggtt") && reply.find("\"sampled\":false")!=std::string::npos &&
+        reply.find("\"ownership\":false")!=std::string::npos);
     assert(handle("bridge hardware caps") && reply.find("\"hardware_api\":1")!=std::string::npos);
+    assert(reply.find("\"payload_id\":null")!=std::string::npos);
+    brook::payload="dell-recovery.test\n";
+    assert(handle("bridge hardware caps") && reply.find("\"payload_id\":\"dell-recovery.test\"")!=std::string::npos);
+    assert(!brook::openNodes);
+    brook::payload="invalid\nmarker\n";
+    assert(handle("bridge hardware caps") && reply.find("\"payload_id\":null")!=std::string::npos);
+    assert(!brook::openNodes);
+    brook::payload.clear();
+    assert(handle("bridge hardware usb-reset") && reply.find("\"available\":false")!=std::string::npos);
+    brook::UsbBootReportReset(0x8086,0x9cb1,8,2,2,0x11,0x11,true,10002);
+    assert(handle("bridge hardware usb-reset") && reply.find("\"phase\":8")!=std::string::npos &&
+        reply.find("\"error\":2")!=std::string::npos && reply.find("\"status_now_valid\":true")!=std::string::npos);
+    assert(handle("bridge hardware caps"));
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
     assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);
     assert(reply.find("\"backlight_api\":1")!=std::string::npos);

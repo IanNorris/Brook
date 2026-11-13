@@ -58,16 +58,26 @@ def main():
     parser.add_argument('--auto-desktop-no-test-request',action='store_true',help='Request the QEMU reset hook on a build that must not contain it')
     parser.add_argument('--auto-desktop-hard-stall',action='store_true',help='Stall a real vCPU and require watchdog capture and reset')
     parser.add_argument('--auto-desktop-headless-panic',action='store_true',help='Force the panic framebuffer lookup to fail and check diagnostic sections')
+    parser.add_argument('--auto-desktop-corrupt-counts',action='store_true',help='Corrupt panic diagnostic counts before packet construction')
     parser.add_argument('--auto-desktop-serial-stall',action='store_true',help='Stall at serial packet output after the disk capture')
     parser.add_argument('--auto-desktop-nested-panic',action='store_true',help='Re-enter KernelPanic on the panic owner after disk capture')
+    parser.add_argument('--auto-desktop-owner-fault',action='store_true',help='Raise #UD on the panic owner after disk capture')
     parser.add_argument('--auto-desktop-peer-panic',action='store_true',help='Model an existing owner and verify another CPU parks')
+    parser.add_argument('--auto-desktop-peer-fault',action='store_true',help='Raise #UD on a CPU other than the panic-halt owner')
     parser.add_argument('--auto-desktop-early-nested-panic',action='store_true',help='Re-enter panic before the initial peer halt')
     parser.add_argument('--auto-desktop-usb-panic-retrieval',action='store_true',help='Retrieve a desktop panic during recovery over emulated USB Ethernet')
+    parser.add_argument('--auto-desktop-startup-panic',action='store_true',help='Append a panic to the disposable Dell startup script')
+    parser.add_argument('--torn-journal-before-desktop',action='store_true',help='Seed an interrupted initial journal header after repair')
+    parser.add_argument('--torn-journal-before-repair',action='store_true',help='Seed an interrupted initial journal header before recovery')
+    parser.add_argument('--auto-desktop-contention-panic',action='store_true',help='Hold a QEMU SATA writer until startup panic reserves its gate')
     parser.add_argument('--auto-desktop-shutdown-panic',action='store_true',help='Inject during final shutdown sync and require reset inhibition')
     parser.add_argument('--auto-desktop-network-module',type=Path,help='Test the bridge transition using this matching virtio-net module')
+    parser.add_argument('--two-panic-records',action='store_true',help='Seed two validated records and retrieve both after desktop handoff')
     parser.add_argument('--auto-desktop-script-fail',action='store_true',help='Require the bridge to stay restricted after a startup-script failure')
     parser.add_argument('--auto-desktop-shutdown',action='store_true',help='Perform checked shutdown through the desktop bridge')
     parser.add_argument('--auto-desktop-dell-initrd',action='store_true',help='Exercise the Dell initrd and startup script using synthetic QEMU services')
+    parser.add_argument('--auto-desktop-intel-provider',action='store_true',help='Replace the Dell Intel boot provider with the synthetic QEMU service')
+    parser.add_argument('--auto-desktop-vulkan-service',action='store_true',help='Supply and verify a synthetic supervised desktop service')
     parser.add_argument('--auto-desktop-real-provider',type=Path,help='Use this extracted Dell Wayland provider with its pinned local runtime')
     parser.add_argument('--auto-desktop-wayland-client',action='store_true',help='Run a Wayland protocol client against the real provider')
     parser.add_argument('--auto-desktop-dell-shutdown-module',type=Path,help='Use this matching virtio-net module for checked Dell-script shutdown')
@@ -76,6 +86,12 @@ def main():
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
     a=parser.parse_args()
+    if (a.torn_journal_before_desktop or a.torn_journal_before_repair) and (not a.auto_desktop_reset or a.two_panic_records or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or (a.torn_journal_before_desktop and a.torn_journal_before_repair)):
+        parser.error('torn journal requires an ordinary desktop panic and reset')
+    if a.auto_desktop_corrupt_counts and (not a.auto_desktop_reset or a.auto_desktop_startup_panic or
+            a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_hard_stall or
+            a.auto_desktop_shutdown_panic or a.auto_desktop_nested_panic or a.auto_desktop_peer_panic or a.auto_desktop_early_nested_panic):
+        parser.error('corrupt-counts requires a debugger-injected desktop panic and reset')
     if bool(a.normal_kernel)!=bool(a.normal_network_module) or (a.normal_kernel and not a.inject_panic) or (a.normal_kernel and a.auto_desktop):
         parser.error('normal kernel and network module must be supplied together with --inject-panic')
     if a.auto_desktop_panic and (not a.auto_desktop or a.inject_panic):
@@ -96,14 +112,26 @@ def main():
         parser.error('serial stall requires desktop reset and excludes other panic fixtures')
     if a.auto_desktop_nested_panic and (not a.auto_desktop_panic or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall):
         parser.error('nested panic requires desktop panic and excludes other fixtures')
+    if a.auto_desktop_owner_fault and (not a.auto_desktop_nested_panic or not a.auto_desktop_reset):
+        parser.error('owner fault requires the nested panic reset fixture')
     if a.auto_desktop_peer_panic and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic):
         parser.error('peer panic requires desktop reset and excludes other fixtures')
+    if a.auto_desktop_peer_fault and not a.auto_desktop_peer_panic:
+        parser.error('peer fault requires the peer panic fixture')
     if a.auto_desktop_early_nested_panic and (not a.auto_desktop_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or a.auto_desktop_peer_panic):
         parser.error('early nested panic requires desktop reset and excludes other fixtures')
     if a.auto_desktop_usb_panic_retrieval and (not a.auto_desktop_production_reset or a.auto_desktop_hard_stall or a.auto_desktop_shutdown_panic or a.auto_desktop_headless_panic or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or a.auto_desktop_peer_panic or a.auto_desktop_early_nested_panic):
         parser.error('USB panic retrieval requires the ordinary guarded desktop reset fixture')
+    if a.auto_desktop_startup_panic and (not a.auto_desktop_dell_initrd or not a.auto_desktop_usb_panic_retrieval):
+        parser.error('startup panic requires Dell startup and USB retrieval fixtures')
+    if a.auto_desktop_contention_panic and not a.auto_desktop_startup_panic:
+        parser.error('contention panic requires the startup panic fixture')
+    if a.auto_desktop_contention_panic and json.loads((a.desktop_pair/'manifest.json').read_text()).get('kernel_build_flags',{}).get('BROOK_AHCI_PANIC_CONTENTION_TEST')!='ON':
+        parser.error('contention panic requires the disposable test kernel')
     if a.auto_desktop_network_module and (not a.auto_desktop or a.auto_desktop_panic):
         parser.error('desktop bridge test requires a non-panic auto desktop fixture')
+    if a.two_panic_records and (not a.auto_desktop_network_module or a.inject_panic or a.auto_desktop_script_fail):
+        parser.error('two panic records require the successful desktop bridge fixture')
     if a.auto_desktop_script_fail and not a.auto_desktop_network_module:
         parser.error('startup-script failure requires the desktop bridge fixture')
     if a.auto_desktop_shutdown and (not a.auto_desktop_network_module or a.auto_desktop_script_fail):
@@ -112,6 +140,8 @@ def main():
         parser.error('Dell initrd fixture requires a non-panic auto desktop')
     if a.auto_desktop_real_provider and not a.auto_desktop_dell_initrd:
         parser.error('real provider requires the Dell initrd fixture')
+    if a.auto_desktop_vulkan_service and not a.auto_desktop_dell_initrd:
+        parser.error('Vulkan service fixture requires the Dell initrd')
     if a.auto_desktop_wayland_client and not a.auto_desktop_real_provider:
         parser.error('Wayland client requires the real provider fixture')
     dell_shutdown=bool(a.auto_desktop_dell_shutdown_module or a.auto_desktop_dell_usb_network)
@@ -172,8 +202,24 @@ def main():
                           ('run --console /boot/DOES_NOT_EXIST.ELF\n' if a.auto_desktop_script_fail else ''))
         defaults.write_text('default-value\n')
         payloads=((service,'::/BOOT/GDSVC.ELF'),) if a.auto_desktop_dell_initrd else ((service,'::/BOOT/GDSVC.ELF'),(script,'::/BOOT/INIT.RC'),(defaults,'::/ETC/desktop-defaults.ini'))
+        if a.auto_desktop_intel_provider:
+            if not a.auto_desktop_dell_initrd or a.auto_desktop_real_provider:
+                raise ValueError('Intel provider fixture needs Dell initrd and synthetic services')
+            payloads += ((service,'::/BOOT/INTLWL.ELF'),)
+        if a.auto_desktop_vulkan_service:
+            payloads += ((service,'::/BOOT/VKSUP.ELF'),(service,'::/BOOT/VKRENDER.ELF'))
         for src,target in payloads:
             subprocess.run(['mcopy','-o','-i',str(normal),str(src),target],check=True)
+        if a.auto_desktop_startup_panic:
+            additional=b''
+            if a.auto_desktop_contention_panic:
+                contender=work/'CONTEND.ELF'
+                subprocess.run(['cc','-nostdlib','-static','-fno-stack-protector','-no-pie','-O2',
+                                '-DBROOK_AHCI_CONTENTION_FIXTURE',str(ROOT/'scripts/workloads/guard_handoff_service.c'),'-o',str(contender)],check=True)
+                subprocess.run(['mcopy','-o','-i',str(normal),str(contender),'::/BOOT/CONTEND.ELF'],check=True)
+                additional=b'run --service --console --uid 1000 /boot/CONTEND.ELF\n'
+            script.write_bytes(startup.rstrip(b'\r\n')+b'\n'+additional+b'panic GDBTEST\n')
+            subprocess.run(['mcopy','-o','-i',str(normal),str(script),'::/BOOT/INIT.RC'],check=True)
         if a.normal_kernel or a.auto_desktop_network_module or a.auto_desktop_dell_shutdown_module:
             if subprocess.run(['mdir','-i',str(normal),'::/DRIVERS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
                 subprocess.run(['mmd','-i',str(normal),'::/DRIVERS'],check=True)
@@ -197,7 +243,8 @@ def main():
             if name.startswith(('bin/','profile/bin/')):
                 subprocess.run(['debugfs','-w','-R',f'set_inode_field /{name} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if a.auto_desktop_dell_initrd:
-            for name in ('waylandd','hardware-dbus','hardware-message'):
+            names=('waylandd','hardware-dbus','hardware-message')
+            for name in names:
                 target='/profile/bin/'+name
                 binary=(a.auto_desktop_real_provider.resolve(strict=True) if name=='waylandd' and a.auto_desktop_real_provider else
                         client if name=='hardware-message' and a.auto_desktop_wayland_client else service)
@@ -232,7 +279,17 @@ def main():
         guard_file=work/'guard.bin';guard_file.write_bytes(guard)
         for name in ('GUARD0.BIN','GUARD1.BIN'):
             subprocess.run(['mcopy','-o','-i',media,str(guard_file),'::/RECOVERY/'+name],check=True)
-        journal=work/'PANIC.BIN';journal.write_bytes(bytes(258*512))
+        seeded_packets=(b'older boot failure',b'newer boot failure')
+        journal_bytes=bytearray(258*512)
+        if a.torn_journal_before_repair:journal_bytes[:16]=b'BRKPAN01'+struct.pack('<II',1,123)
+        if a.two_panic_records:
+            for slot,packet in enumerate(seeded_packets):
+                header=bytearray(512);header[:8]=b'BRKPAN01'
+                struct.pack_into('<IIQI',header,8,1,len(packet),slot+1,zlib.crc32(packet))
+                struct.pack_into('<I',header,28,zlib.crc32(header))
+                offset=slot*129*512;journal_bytes[offset:offset+512]=header
+                journal_bytes[offset+512:offset+512+len(packet)]=packet
+        journal=work/'PANIC.BIN';journal.write_bytes(journal_bytes)
         subprocess.run(['mcopy','-o','-i',media,str(journal),'::/PANIC.BIN'],check=True)
         metadata=metadata_hash(disk)
         journal_after=journal.read_bytes()
@@ -265,9 +322,24 @@ def main():
             verify_record(journal_after,0,1,packet_bytes)
             if outside_esp_hash(disk)!=before_data:raise RuntimeError('interrupted repair changed disk outside ESP')
         first=work/'repair';first.mkdir()
+        recovery_port=None
+        if a.two_panic_records:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1',0));recovery_port=probe.getsockname()[1]
+        def retrieve_during_repair():
+            sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+            from hardware import Hardware
+            bridge=Hardware(work/'recovery-registry');session=bridge.attach('127.0.0.1',recovery_port)['session']
+            for previous,packet in ((False,seeded_packets[1]),(True,seeded_packets[0])):
+                destination=a.output/('recovery-older-panic.bin' if previous else 'recovery-newer-panic.bin')
+                report=bridge.recovery_panic(session,destination,previous=previous)
+                if destination.read_bytes()!=packet or report['sequence']!=(1 if previous else 2):
+                    raise RuntimeError('wrong recovery panic record')
         boot(disk,a.firmware,first,False,'GUARD_COMPLETE_RESTART',120,True,sata_snapshot=False,
              sata_serial='BROOK-RECOVERY-QA',expect_reset=True,reset_evidence_marker='GUARD_COMPLETE_RESTART',
-             failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'])
+             failure_marker='GUARD_EXT2_INCOMPLETE',extra_fw_cfg=['name=opt/brook/power,string=q35-reset'],
+             network_port=recovery_port,intermediate_marker='GUARD_PANIC_RETRIEVAL_WINDOW 10s' if a.two_panic_records else None,
+             on_intermediate=retrieve_during_repair if a.two_panic_records else None)
         shutil.copyfile(first/'serial.log',a.output/'repair-serial.log')
         serial=(first/'serial.log').read_text(errors='replace')
         if a.inject_panic:
@@ -285,6 +357,11 @@ def main():
             f.seek(1024+58)
             if f.read(2)!=b'\x01\x00':raise RuntimeError('repair did not clean ext2')
         subprocess.run(['e2fsck','-f','-n',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.torn_journal_before_desktop:
+            journal_bytes[:16]=b'BRKPAN01'+struct.pack('<II',1,123)
+            journal.write_bytes(journal_bytes)
+            subprocess.run(['mcopy','-o','-i',media,str(journal),'::/PANIC.BIN'],check=True)
+            journal_after=bytes(journal_bytes)
         second=work/'desktop';second.mkdir()
         if a.normal_kernel:
             with socket.socket() as probe:
@@ -363,18 +440,36 @@ def main():
                 if len(matches)!=1:raise RuntimeError('missing peer panic symbol '+name)
                 return matches[0]
             launch=peer_symbol('_ZN5brook15ShellExecScriptEPKc')
-            panic=peer_symbol('KernelPanic');owner=peer_symbol('_ZL12g_panicOwner')
+            panic=peer_symbol('KernelPanic');owner=peer_symbol('g_panicHaltActive' if a.auto_desktop_peer_fault else '_ZL12g_panicOwner')
             disassembly=subprocess.check_output(['objdump','-d','--disassemble=KernelPanic',str(kernel)],text=True)
             halts=re.findall(r'^\s*([0-9a-f]+):\s+f4\s+hlt\s*$',disassembly,re.MULTILINE)
             if len(halts)!=1:raise RuntimeError('unexpected peer halt instruction')
             gdb=second/'peer.gdb'
+            if a.auto_desktop_peer_fault:
+                from elftools.elf.elffile import ELFFile
+                fault=None
+                with kernel.open('rb') as executable:
+                    for segment in ELFFile(executable).iter_segments():
+                        if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                            at=segment.data().find(b'\x0f\x0b')
+                            if at>=0:fault=segment['p_vaddr']+at;break
+                if fault is None:raise RuntimeError('no executable UD2 for peer fault fixture')
+                owner_check=peer_symbol('_ZN5brook19SmpIsPanicHaltOwnerEv')
+                body=(f'set *(unsigned int*){owner:#x}=2-$cpu\nset $rip={fault:#x}\n'
+                      f'delete breakpoints\nhbreak *{owner_check:#x}\ncontinue\nfinish\n'
+                      'if ($rax & 255) != 0\necho Peer misidentified as owner\\n\nquit 1\nend\n'
+                      'stepi\nstepi\nif *(unsigned char*)$rip != 0xfa\necho Peer did not reach park loop\\n\nquit 1\nend\n'
+                      'printf "PANIC_PEER_PARKED cpu=%d owner=%d\\n", $cpu, 2-$cpu\n'
+                      'delete breakpoints\ndetach\nquit\n')
+            else:
+                body=(f'set *(unsigned int*){owner:#x}=2-$cpu\nset $rip={panic:#x}\n'
+                      f'delete breakpoints\nhbreak *{int(halts[0],16):#x}\ncontinue\n'
+                      'printf "PANIC_PEER_PARKED cpu=%d owner=%d\\n", $cpu, 2-$cpu\n'
+                      'delete breakpoints\ndetach\nquit\n')
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                            f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'
                            'set $cpu=$_thread-1\nif $cpu < 0 || $cpu >= 2\necho Invalid vCPU mapping\\n\nquit 1\nend\n'
-                           f'set *(unsigned int*){owner:#x}=2-$cpu\nset $rip={panic:#x}\n'
-                           f'delete breakpoints\nhbreak *{int(halts[0],16):#x}\ncontinue\n'
-                           'printf "PANIC_PEER_PARKED cpu=%d owner=%d\\n", $cpu, 2-$cpu\n'
-                           'delete breakpoints\ndetach\nquit\n')
+                           +body)
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_PANIC_RESET armed=1',120,True,sata_snapshot=False,
                  sata_serial='BROOK-RECOVERY-QA',gdb_script=gdb,hold_after_marker=7,
                  forbidden='PANIC_RECOVERY_RESET_WAIT',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
@@ -419,6 +514,14 @@ def main():
                 panic=desktop_symbol('KernelPanic');scratch=desktop_symbol('_ZN5brookL8g_kbdBufE')
                 body=(f'set {{unsigned long long}}{scratch:#x}=0x0054534554424447\n'
                       f'set $rdi={scratch:#x}\nset $rip={panic:#x}\ndelete breakpoints\n')
+                if a.auto_desktop_corrupt_counts:
+                    prepare=desktop_symbol('_ZN5brook18PanicPreparePacketEPKNS_12PanicCPURegsEPKNS_15PanicStackTraceEPKNS_18PanicExceptionInfoEPKNS_16PanicProcessListEPKNS_15PanicSystemInfoEPKNS_14PanicStackDumpEPKNS_12PanicCpuListEPKc')
+                    body+=(f'hbreak *{prepare:#x}\ncontinue\n'
+                           'if $rsi == 0 || $rcx == 0 || $r9 == 0 || *(unsigned long long*)($rsp+8) == 0\nquit 1\nend\n'
+                           'set {unsigned char}$rsi=255\nset {unsigned char}$rcx=255\n'
+                           'set {unsigned short}($r9+8)=65535\n'
+                           'set {unsigned char}(*(unsigned long long*)($rsp+8))=255\n'
+                           'echo PANIC_COUNTS_CORRUPTED\\n\ndelete breakpoints\n')
                 if a.auto_desktop_headless_panic:
                     fb=desktop_symbol('_ZN5brook19CompositorGetPhysFbEPj')
                     body+=(f'hbreak *{fb:#x}\ncontinue\nset $rax=0\nset $rip=*(unsigned long long*)$rsp\n'
@@ -437,11 +540,22 @@ def main():
                            'echo PANIC_SERIAL_STALLED\\n\ndelete breakpoints\n')
                 if a.auto_desktop_nested_panic:
                     dump=desktop_symbol('_ZN5brookL18DumpPacketToSerialEPKhj')
-                    body+=(f'hbreak *{dump:#x}\ncontinue\nset $rdi={scratch:#x}\nset $rip={panic:#x}\n'
+                    if a.auto_desktop_owner_fault:
+                        from elftools.elf.elffile import ELFFile
+                        fault=None
+                        with (a.desktop_pair/'KERNEL.ELF').open('rb') as executable:
+                            for segment in ELFFile(executable).iter_segments():
+                                if segment['p_type']=='PT_LOAD' and segment['p_flags']&1:
+                                    at=segment.data().find(b'\x0f\x0b')
+                                    if at>=0:fault=segment['p_vaddr']+at;break
+                        if fault is None:raise RuntimeError('no executable UD2 for owner fault fixture')
+                    else:fault=panic
+                    body+=(f'hbreak *{dump:#x}\ncontinue\nset $rdi={scratch:#x}\nset $rip={fault:#x}\n'
                            'echo PANIC_NESTED_INJECTED\\n\ndelete breakpoints\n')
                 body+='detach\nquit\n'
             gdb.write_text('set pagination off\nset confirm off\nset architecture i386:x86-64\n'
                            f'target remote {second / "gdb.sock"}\nhbreak *{launch:#x}\ncontinue\n'+body)
+            if a.auto_desktop_startup_panic:gdb=None
             capture_seen=[]
             try:
                 boot(disk,a.firmware,second,False,'PANIC_DISK_CAPTURE_OK',120,True,sata_snapshot=False,
@@ -451,6 +565,7 @@ def main():
                      on_marker=lambda:capture_seen.append(time.monotonic()),
                      smp=4 if a.auto_desktop_hard_stall else 2,
                      extra_fw_cfg=(['name=opt/brook/power,string=q35-reset']+
+                         (['name=opt/brook/panic-contention,string=test-1'] if a.auto_desktop_contention_panic else [])+
                          ([] if a.auto_desktop_production_reset else ['name=opt/guard-desktop-panic-reset,string=test-1'])
                          if a.auto_desktop_reset or a.auto_desktop_no_test_request else None))
             finally:
@@ -483,6 +598,11 @@ def main():
                     raise RuntimeError('bridge opened before the desktop handoff completed')
                 bridge_state.update(bridge=bridge,session=session,before=caps)
             def bridge_after():
+                if a.two_panic_records:
+                    sys.path.insert(0,str(ROOT/'tools/vm_bridge'))
+                    from hardware import Hardware
+                    bridge=Hardware(work/'desktop-registry');attached=bridge.attach('127.0.0.1',network_port)
+                    bridge_state.update(bridge=bridge,session=attached['session'],before=None)
                 bridge=bridge_state['bridge'];session=bridge_state['session']
                 doctor=bridge.doctor(session)
                 if a.auto_desktop_script_fail:
@@ -493,6 +613,12 @@ def main():
                     return
                 if not doctor.get('identity_matches') or not doctor['capabilities'].get('command_jobs') or not doctor['capabilities'].get('hardware_power'):
                     raise RuntimeError('normal bridge capabilities did not appear after handoff')
+                if a.two_panic_records:
+                    for previous,packet in ((False,seeded_packets[1]),(True,seeded_packets[0])):
+                        destination=a.output/('older-panic.bin' if previous else 'newer-panic.bin')
+                        report=bridge.recovery_panic(session,destination,previous=previous)
+                        if destination.read_bytes()!=packet or report['sequence']!=(1 if previous else 2):
+                            raise RuntimeError('wrong boot-pinned panic record')
                 job=bridge.guest_run(session,uuid.uuid4().hex,['/boot/GDSVC.ELF'],cwd='/',uid=1000,wait_s=10)
                 if job.get('state')!='completed' or job.get('exit',{}).get('code')!=0 or 'GUARD_DESKTOP_SERVICE_PASS' not in job.get('stdout',{}).get('text',''):
                     raise RuntimeError('desktop bridge guest job did not complete: '+str(job))
@@ -510,8 +636,8 @@ def main():
                 (a.output/'bridge-transition.json').write_text(json.dumps(evidence,indent=2)+'\n')
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status='+('-1' if a.auto_desktop_script_fail else '0'),120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED',
-                 network_port=network_port,intermediate_marker='GUARD_DESKTOP_BRIDGE_TEST_WINDOW',
-                 on_intermediate=bridge_before,on_marker=bridge_after,
+                 network_port=network_port,intermediate_marker=None if a.two_panic_records else 'GUARD_DESKTOP_BRIDGE_TEST_WINDOW',
+                 on_intermediate=None if a.two_panic_records else bridge_before,on_marker=bridge_after,
                  extra_fw_cfg=['name=opt/brook/power,string=q35-reset','name=opt/guard-bridge-window,string=test-1'])
         elif dell_shutdown:
             with socket.socket() as probe:
@@ -557,6 +683,9 @@ def main():
                  extra_fw_cfg=['name=opt/guard-journal-pin,string=test-b','name=opt/guard-panic-capture,string=test-1'])
         shutil.copyfile(second/'serial.log',a.output/'desktop-serial.log')
         serial=(second/'serial.log').read_text(errors='replace')
+        if a.auto_desktop_contention_panic and not all(marker in serial for marker in
+                ('PANIC_CONTENTION_WRITER_HELD','PANIC_DISK_RESERVE_WAIT','PANIC_CONTENTION_NEXT_COMMAND_YIELDED','PANIC_DISK_RESERVE_READY')):
+            raise RuntimeError('panic did not transfer ownership from the live disk writer')
         if a.auto_desktop_dell_initrd:
             if dell_shutdown and serial.count('DEBUG_TCP: spawned pid=')!=1:
                 raise RuntimeError('guarded handoff spawned duplicate debug listeners')
@@ -565,12 +694,15 @@ def main():
                 raise RuntimeError('Dell asynchronous TCP configuration was not active')
             if a.auto_desktop_dell_usb_network and 'xhci: CDC-ECM network interface ready' not in serial:
                 raise RuntimeError('emulated USB Ethernet interface was not initialized')
-            for executable in ('/nix/profile/bin/waylandd','/nix/profile/bin/hardware-dbus',
-                               '/nix/profile/bin/hardware-message','/boot/HWSTATUS.ELF'):
-                if 'ELF HASH: '+executable+' ' not in serial:
-                    raise RuntimeError('Dell startup did not launch '+executable)
+            if not a.auto_desktop_corrupt_counts:
+                for executable in (('/boot/INTLWL.ELF' if a.auto_desktop_intel_provider else '/nix/profile/bin/waylandd'),'/nix/profile/bin/hardware-dbus',
+                                   '/nix/profile/bin/hardware-message','/boot/HWSTATUS.ELF'):
+                    if 'ELF HASH: '+executable+' ' not in serial:
+                        raise RuntimeError('Dell startup did not launch '+executable)
             if a.auto_desktop_real_provider and '[waylandd] listening on WAYLAND_DISPLAY=' not in serial:
                 raise RuntimeError('real Wayland provider did not report listening')
+            if a.auto_desktop_vulkan_service and 'ELF HASH: /boot/VKSUP.ELF ' not in serial:
+                raise RuntimeError('supervised desktop service did not launch')
             if a.auto_desktop_wayland_client and ('GUARD_WAYLAND_CLIENT_PASS' not in serial or 'GUARD_WAYLAND_CLIENT_FAIL' in serial):
                 raise RuntimeError('Wayland client did not complete its registry and sync exchange')
         if ((not a.auto_desktop_panic and 'GUARD_DESKTOP_SERVICE_PASS' not in serial) or (not a.auto_desktop and 'brook-ssd-recovery-automatic-v1' in serial) or
@@ -591,8 +723,10 @@ def main():
                 expected_injection='PANIC_SERIAL_STALLED' if a.auto_desktop_serial_stall else 'PANIC_NESTED_INJECTED'
                 if expected_injection not in debugger_log or packet:
                     raise RuntimeError('panic was not interrupted before serial packet emission')
-                if a.auto_desktop_nested_panic and '*** DOUBLE PANIC (handler faulted) ***' not in serial:
+                if a.auto_desktop_nested_panic and not a.auto_desktop_owner_fault and '*** DOUBLE PANIC (handler faulted) ***' not in serial:
                     raise RuntimeError('nested panic handler did not run')
+                if a.auto_desktop_owner_fault and 'PANIC_OWNER_EXCEPTION' not in serial:
+                    raise RuntimeError('owner exception reset path did not run')
                 length=struct.unpack_from('<I',journal_after,12)[0]
                 if not 0<length<=65536:raise RuntimeError('invalid journal packet length')
                 packet=journal_after[512:512+length].hex()
@@ -602,7 +736,26 @@ def main():
                 if decoded.get('message')!='GDBTEST':raise RuntimeError('serial-stall journal packet lost its reason')
                 (a.output/'desktop-interrupted-serial-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
             if not packet:raise RuntimeError('desktop panic packet missing')
-            verify_record(journal_after,0,1,bytes.fromhex(packet))
+            torn=a.torn_journal_before_desktop or a.torn_journal_before_repair
+            verify_record(journal_after,1 if torn else 0,1,bytes.fromhex(packet))
+            if torn and journal_after[:129*512]!=bytes(journal_bytes[:129*512]):
+                raise RuntimeError('torn first journal slot was modified')
+            if a.auto_desktop_corrupt_counts:
+                debugger_log=(second/'qemu.log').read_text(errors='replace')
+                (a.output/'desktop-corrupt-counts-gdb.log').write_text(debugger_log)
+                if 'PANIC_COUNTS_CORRUPTED' not in debugger_log:raise RuntimeError('panic count injection did not run')
+                packet_file=a.output/'desktop-corrupt-counts.bin';packet_file.write_bytes(bytes.fromhex(packet))
+                decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
+                                   '--packet',str(packet_file),'--json'],stderr=subprocess.DEVNULL))
+                if decoded.get('message')!='GDBTEST' or not decoded.get('system_info') or not decoded.get('stack_dump'):
+                    raise RuntimeError('corrupt counts lost required panic diagnostics')
+                (a.output/'desktop-corrupt-counts.json').write_text(json.dumps(decoded,indent=2)+'\n')
+            if a.auto_desktop_startup_panic:
+                packet_file=a.output/'desktop-startup-panic.bin';packet_file.write_bytes(bytes.fromhex(packet))
+                decoded=json.loads(subprocess.check_output(['python3',str(ROOT/'tools/crash_decoder.py'),
+                                   '--packet',str(packet_file),'--json'],stderr=subprocess.DEVNULL))
+                if decoded.get('message')!='SHELL: GDBTEST\n':raise RuntimeError('startup panic packet lost its reason')
+                (a.output/'desktop-startup-panic.json').write_text(json.dumps(decoded,indent=2)+'\n')
             if a.auto_desktop_hard_stall:
                 cpu=stalled.group(1)
                 if f'WATCHDOG: CPU{cpu} timer accounting unchanged for 3 checks' not in serial:

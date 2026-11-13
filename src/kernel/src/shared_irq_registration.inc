@@ -43,7 +43,7 @@ bool IoApicHandlerCapacity(uint8_t irq, void* handler)
     return false;
 }
 
-uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler)
+static uint8_t RegisterIoApicHandler(uint8_t irq,uint8_t preferredVector,void* handler,bool unmask)
 {
     // The legacy ABI returns a vector, and existing drivers do not check a
     // failure sentinel. Fail explicitly before publication rather than return
@@ -98,8 +98,19 @@ uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handle
     entry.count = 1;
     ++g_sharedIrqCount;
     IdtInstallHandler(vector, reinterpret_cast<void*>(g_sharedIrqStubs[slot]));
-    IoApicUnmaskIrq(irq, vector);
+    if(unmask)IoApicUnmaskIrq(irq,vector);
     return vector;
+}
+
+uint8_t IoApicRegisterHandler(uint8_t irq,uint8_t preferredVector,void* handler)
+{
+    return RegisterIoApicHandler(irq,preferredVector,handler,true);
+}
+
+uint8_t IoApicInstallMaskedBootHandler(uint8_t pin,void* handler)
+{
+    if(FindSharedIrq(pin) || !IoApicHandlerCapacity(pin,handler))return 0;
+    return RegisterIoApicHandler(pin,0,handler,false);
 }
 
 void IoApicUnregisterHandler(uint8_t irq, void* handler)

@@ -8,7 +8,7 @@
 namespace brook {
 enum class ProcessState{Running,Ready,Blocked,Stopped,Terminated};
 constexpr uint64_t PROCESS_MAGIC=0x12345;
-struct Process{uint64_t magic=PROCESS_MAGIC;uint16_t pid=1,tgid=1;ProcessState state=ProcessState::Running;bool interruptibleWait=false,terminalPending=false,resumePending=false,continuedPending=false,stopReported=false;int runningOnCpu=-1;uint32_t pendingWakeup=0;uint64_t sigPending=0,sigMask=0,wakeupTick=0,incarnation=1;unsigned depth=0;};
+struct Process{uint64_t magic=PROCESS_MAGIC;uint16_t pid=1,tgid=1;ProcessState state=ProcessState::Running;bool wakeAfterSwitch=false;bool interruptibleWait=false,terminalPending=false,resumePending=false,continuedPending=false,stopReported=false;int runningOnCpu=-1;uint32_t pendingWakeup=0;uint64_t sigPending=0,sigMask=0,wakeupTick=0,incarnation=1;unsigned depth=0;};
 struct SchedLock{};static SchedLock g_readyLock,g_allProcLock;static std::mutex ready,allProc;
 static std::function<void()> afterReadyRelease;
 static bool irq=true;static unsigned removes=0,voluntary=0,yields=0;
@@ -142,5 +142,32 @@ int main(){using namespace brook;
     };
     CHECK(ProcessSendSignal(&restopped,18,nullptr)==0);
     CHECK(restopped.state==ProcessState::Stopped && !restopped.resumePending && !inserts && notifications==1);
+    Process handoff;
+    handoff.state=ProcessState::Blocked;
+    handoff.runningOnCpu=2;
+    inserts=kicks=0;
+    SchedulerUnblock(&handoff);
+    CHECK(handoff.pendingWakeup && !inserts && !kicks);
+    CHECK(!SchedulerConsumeDeferredWake(&handoff, 10, true));
+    handoff.runningOnCpu=-1;
+    CHECK(SchedulerConsumeDeferredWake(&handoff, 10, true));
+    CHECK(handoff.state==ProcessState::Ready && !handoff.pendingWakeup);
+    CHECK(!SchedulerConsumeDeferredWake(&handoff, 10, true) && inserts==1 && kicks==1);
+    // A stale scan reference cannot wake a new blocked operation.
+    handoff.state=ProcessState::Blocked;
+    handoff.pendingWakeup=1;
+    CHECK(!SchedulerConsumeDeferredWake(&handoff, 0, true) && inserts==1);
+    handoff.pendingWakeup=0;
+    handoff.wakeupTick=11;
+    CHECK(!SchedulerConsumeDeferredWake(&handoff, 10, false) && inserts==1);
+    CHECK(SchedulerConsumeDeferredWake(&handoff, 11, false) && inserts==2);
+    handoff.state=ProcessState::Stopped;
+    handoff.pendingWakeup=1;
+    CHECK(!SchedulerConsumeDeferredWake(&handoff, 11, false));
+    handoff.resumePending=true;
+    CHECK(SchedulerConsumeDeferredWake(&handoff, 11, false) && inserts==3);
+    handoff.state=ProcessState::Terminated;
+    handoff.pendingWakeup=1;
+    CHECK(!SchedulerConsumeDeferredWake(&handoff, 11, false) && inserts==3);
     std::printf("SIGNAL_WAIT %s\n",failures?"FAIL":"PASS");return failures?1:0;
 }

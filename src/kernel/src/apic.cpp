@@ -1688,6 +1688,7 @@ static uint64_t  g_ioApicVirt   = 0;
 static uint32_t  g_ioApicGsiBase = 0;
 static uint32_t g_ioApicEntries;
 static IoApicRoutePolicy g_ioApicRoutePolicy;
+static IrqSpinLock g_ioApicRouteLock;
 
 static inline void IoApicWrite(uint8_t reg, uint32_t val)
 {

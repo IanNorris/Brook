@@ -21,6 +21,7 @@ let
     MESA_PATH = "${pkgs.mesa}";
     YQUAKE2_BIN = "${package}/lib/yquake2/quake2";
     YQUAKE2_LIBDIRS = "${openal}/lib:${package}/lib/yquake2";
+    ALSOFT_CONFIG = "${pkgs.writeText "brook-alsoft-oss.conf" (builtins.readFile ../data/config/alsoft-oss.conf)}";
   };
   launchers = pkgs.runCommand "brook-experiment-launchers" {} ''
     mkdir -p $out/bin

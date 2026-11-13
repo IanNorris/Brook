@@ -21,7 +21,7 @@ struct Output { char* bytes;uint64_t total,fullWaits;bool eof; };
 struct Job {
     char id[33];State state;uint8_t* request;uint32_t size,received;
     uint16_t pid;uint64_t incarnation;uint64_t tag;
-    bool leaderExited,waited;int waitStatus;
+    bool leaderExited,waited,terminateRequested;int waitStatus;
     uint32_t tasks,groupTasks;
     Output output[2];
     const char* error;
@@ -57,6 +57,7 @@ void Status(const Job& job) {
     Field("received",job.received);Field("request_size",job.size);Field("pid",job.pid);
     Field("incarnation",job.incarnation);Field("live_tasks",job.tasks);Field("original_group_tasks",job.groupTasks);
     Send(",\"leader_exited\":");Send(job.leaderExited?"true":"false");
+    Send(",\"terminate_requested\":");Send(job.terminateRequested?"true":"false");
     Send(",\"exit_collected\":");Send(job.waited?"true":"false");
     Field("wait_status",static_cast<uint32_t>(job.waitStatus));
     Send(",\"stdout_eof\":");Send(job.output[0].eof?"true":"false");
@@ -172,7 +173,7 @@ bool DebugJobHandleCommand(const char* command) {
     }
     if(*at || !count) {Error("Invalid fields");return true;}
     if(count==1 && !strcmp(args[0],"caps")) {
-        char boot[33];DebugEpochCopy(boot);Send("{\"boot_id\":\"");Send(boot);Send("\",\"job_api\":2,\"task_budget_version\":1,\"max_task_limit\":1023,\"max_request_bytes\":32768,\"max_jobs\":256,\"max_active\":8,\"retained_stream_bytes\":65536,\"dedup_retention\":\"until_reboot\",\"stdin\":\"null\",\"auto_window\":false}\n");return true;
+        char boot[33];DebugEpochCopy(boot);Send("{\"boot_id\":\"");Send(boot);Send("\",\"job_api\":2,\"terminate_api\":1,\"task_budget_version\":1,\"max_task_limit\":1023,\"max_request_bytes\":32768,\"max_jobs\":256,\"max_active\":8,\"retained_stream_bytes\":65536,\"dedup_retention\":\"until_reboot\",\"stdin\":\"null\",\"auto_window\":false}\n");return true;
     }
     if(count<3 || !DebugEpochMatches(args[count-1])) {Error("Stale guest boot");return true;}
     --count; // All operation reads and writes carry the expected boot epoch.
@@ -229,6 +230,22 @@ bool DebugJobHandleCommand(const char* command) {
         SchedulerAddProcess(worker);Status(*job);return true;
     }
     if(!strcmp(args[0],"status") && count==2) {Status(*job);return true;}
+    // This operates on the existing job rather than allocating another slot.
+    // Keep the Process reference and verify its incarnation and job lineage so
+    // PID reuse cannot signal an unrelated process. A repeated request must
+    // not deliver SIGTERM twice. Completion still requires the normal drain.
+    if(!strcmp(args[0],"terminate") && count==2) {
+        if(job->terminateRequested || job->state==State::Complete || job->state==State::Failed) {Status(*job);return true;}
+        if(job->state!=State::Running || !job->pid || !job->incarnation) {Error("Job leader not running");return true;}
+        Process* target=SchedulerFindProcessReference(job->pid);
+        if(!target) {Error("Job leader unavailable");return true;}
+        const bool matches=target->incarnation==job->incarnation && target->debugJobId==job->tag &&
+            target->state!=ProcessState::Terminated;
+        const int result=matches?ProcessSendSignal(target,15):-1;
+        ProcessUnref(target);
+        if(result) {Error("Job leader unavailable or signal failed");return true;}
+        job->terminateRequested=true;Status(*job);return true;
+    }
     if(!strcmp(args[0],"read") && count==5) {
         uint64_t offset,limit;
         if((strcmp(args[2],"out") && strcmp(args[2],"err")) || !Decimal(args[3],&offset) ||

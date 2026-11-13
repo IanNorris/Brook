@@ -586,6 +586,14 @@ int AhciSystemGuardTestFailedDesktopWrite() {
     if(guardDesktopPhase!=GuardDesktopPhase::Failed)return -22;
     const uint8_t byte=0xa5;return DeviceWrite(&largePartition,0,&byte,1);
 }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
+bool AhciSystemGuardShutdownClean(Device* esp) {
+    return esp==&guardTestPartition && esp==guardSystemVolumeDevice &&
+        guardTestPhase==GuardTestPhase::Writing && guardDesktopPhase==GuardDesktopPhase::Ready &&
+        largeSession.clean && DeviceFinalSyncOwner() &&
+        AhciSystemGuardDataState(&guardPartition)==AhciGuardDataState::Clean;
+}
+#endif
 #endif
 int AhciSystemDirectFinalSync() {
     if(!directReady)return 0;

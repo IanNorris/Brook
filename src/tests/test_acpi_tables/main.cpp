@@ -5,6 +5,7 @@
 #include <initializer_list>
 #include <sys/mman.h>
 #include "acpi.h"
+#include "acpi_embedded_controller.h"
 #include "boot_protocol.h"
 namespace brook {
 extern "C" void SerialPrintf(const char*,...){}
@@ -38,8 +39,91 @@ struct Firmware {
     bool init(){return AcpiInit(address(rsdp),&map,1);}
     void noReset(){assert(init());assert(!AcpiGetResetInfo().available);}
 };
+static void TestLegacyPower(Firmware& f) {
+    f.reset();
+    auto* facs=f.memory+20480;
+    Firmware::header(facs,"FACS",64);
+    Firmware::put32(f.fadt+36,Firmware::address(facs));
+    f.fadt[46]=9;
+    Firmware::put32(f.fadt+48,0xb2);
+    f.fadt[52]=0xd1;
+    Firmware::put32(f.fadt+64,0x1804);
+    f.fadt[89]=2;
+    f.fadtCrc();
+    assert(f.init() && !AcpiGetLegacyPowerInfo().facs); // needs ACPI NVS
+    f.map.type=MemoryType::AcpiNvs;
+    assert(f.init() && AcpiGetLegacyPowerInfo().facs==Firmware::address(facs));
+    assert(AcpiGetLegacyPowerInfo().pm1aControl==0x1804);
+    assert(AcpiGetLegacyPowerInfo().smiCommand==0xb2 && AcpiGetLegacyPowerInfo().acpiEnable==0xd1);
+    assert(AcpiGetSciRoute().available && AcpiGetSciRoute().gsi==9 && AcpiGetSciRoute().activeLow);
+    const uint8_t dellIso[]={2,10,0,9,9,0,0,0,13,0}; // Dell routes SCI level/high
+    std::memcpy(f.madt+64,dellIso,sizeof(dellIso));
+    Firmware::put32(f.madt+4,74);f.madtCrc(74);
+    assert(f.init() && AcpiGetSciRoute().available && !AcpiGetSciRoute().activeLow);
+    f.madt[72]=5;f.madtCrc(74); // edge/high is not supported for SCI
+    assert(f.init() && !AcpiGetSciRoute().available);
+    f.madt[72]=13;
+    std::memcpy(f.madt+74,dellIso,sizeof(dellIso));
+    Firmware::put32(f.madt+4,84);f.madtCrc(84);
+    assert(f.init() && !AcpiGetSciRoute().available);
+    f.fadt[172]=0;f.fadt[173]=16;f.fadt[175]=2; // unsupported SystemMemory control GAS
+    Firmware::put64(f.fadt+176,0x1804);f.fadtCrc();
+    assert(f.init() && !AcpiGetLegacyPowerInfo().facs);
+    f.fadt[172]=1;f.fadtCrc();
+    assert(f.init() && AcpiGetLegacyPowerInfo().facs);
+    Firmware::put64(f.fadt+132,Firmware::address(facs)+64);f.fadtCrc();
+    assert(f.init() && !AcpiGetLegacyPowerInfo().facs);
+    Firmware::put64(f.fadt+132,0);f.fadtCrc();
+    Firmware::put32(facs+4,65536);
+    assert(f.init() && !AcpiGetLegacyPowerInfo().facs);
+    f.reset();
+    assert(f.init());
+}
+static void TestEmbeddedController() {
+    struct Io {
+        uint8_t trace[3]{};
+        uint8_t traceCount=0,reads=0,forcedStatus=0;
+        unsigned polls=0;
+        uint64_t now=0;
+        bool stuck=false,clockStuck=false;
+        uint64_t nowUs() const {return now;}
+        void delayPoll(){if(!clockStuck)now+=10;}
+        uint8_t status(){
+            ++polls;
+            if(forcedStatus)return forcedStatus;
+            if(stuck && traceCount)return 2;
+            if(traceCount==2 && trace[0]==0x80)return 1;
+            return polls%2?2:0;
+        }
+        void command(uint8_t byte){assert(!traceCount);trace[traceCount++]=byte;}
+        void writeData(uint8_t byte){assert(traceCount && traceCount<3);trace[traceCount++]=byte;}
+        uint8_t readData(){++reads;return 0x45;}
+    };
+    AcpiEmbeddedController controller;
+    uint8_t value=0;
+    Io input;
+    assert(controller.Read(input,6,value)==AcpiEcResult::Ok && value==0x45);
+    assert(input.traceCount==2 && input.trace[0]==0x80 && input.trace[1]==6 && input.reads==1);
+    Io output;
+    assert(controller.Write(output,1,5)==AcpiEcResult::Ok);
+    assert(output.traceCount==3 && output.trace[0]==0x81 && output.trace[1]==1 && output.trace[2]==5 && !output.reads);
+    Io stale;stale.forcedStatus=1;
+    assert(controller.Read(stale,6,value)==AcpiEcResult::UnexpectedOutput && !stale.traceCount && !stale.reads);
+    Io missing;missing.forcedStatus=0xff;
+    assert(controller.Read(missing,6,value)==AcpiEcResult::Unavailable && !missing.traceCount);
+    Io busy;busy.forcedStatus=2;busy.clockStuck=true;
+    assert(controller.Read(busy,6,value)==AcpiEcResult::Busy && busy.polls==5000 && !busy.traceCount);
+    assert(!controller.Quarantined());
+    Io lost;lost.stuck=true;
+    assert(controller.Read(lost,6,value)==AcpiEcResult::TimedOut && controller.Quarantined());
+    assert(lost.traceCount==1 && !lost.reads && value==0x45);
+    Io after;
+    assert(controller.Read(after,6,value)==AcpiEcResult::Unavailable && !after.polls);
+}
 int main(){
     Firmware f;assert(f.init());auto reset=AcpiGetResetInfo();assert(reset.available && reset.port==0xcf9 && reset.value==6);
+    TestLegacyPower(f);
+    TestEmbeddedController();
     assert(!AcpiGetPmTimerInfo().available);
     Firmware::put32(f.fadt+76,0x408);f.fadt[91]=4;f.fadtCrc();assert(f.init());
     assert(AcpiGetPmTimerInfo().available && AcpiGetPmTimerInfo().port==0x408 && !AcpiGetPmTimerInfo().wide);

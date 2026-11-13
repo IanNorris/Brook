@@ -40,8 +40,12 @@ static constexpr uint32_t QR_PACKET_TYPE_PROCESS_EXT    = 0xA3000007; // BRO-176
 static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU RIP/CR3/pid
 static constexpr uint32_t QR_PACKET_TYPE_MESSAGE        = 0xA3000009; // bounded panic reason bytes
 static constexpr uint32_t QR_PACKET_TYPE_LOG_TAIL       = 0xA300000A; // status byte + completed log lines
-static constexpr uint32_t PANIC_MESSAGE_MAX_BYTES       = 511;
+static constexpr uint32_t QR_PACKET_TYPE_GPU_CAPTURE    = 0xA300000B; // bounded failure-time CPU samples
+static constexpr uint32_t PANIC_MESSAGE_MAX_BYTES       = 1023;
 static constexpr uint32_t PANIC_LOG_MAX_BYTES           = 1024;
+struct BdwGpuCapture;
+// Called by the serialized GPU worker immediately before entering panic.
+void PanicSetGpuCapture(const BdwGpuCapture& capture);
 
 // Rendering constants (tuned on real hardware — Enkel required dozens of iterations)
 //

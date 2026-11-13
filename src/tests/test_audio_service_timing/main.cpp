@@ -15,9 +15,9 @@ void DspProducerTimingRecord(uint64_t token,const DspProducerEvent& event){produ
 namespace brook {
 static SyscallTimingModel syscallProbe;
 static uint64_t syscallNow=0,syscallClockReads=0;
-SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase){
+SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase,uint64_t ioctlRequest){
     auto s=syscallProbe.Snapshot();if(!(s.epoch&1) || s.pid!=pid || s.incarnation!=incarnation)return {};
-    ++syscallClockReads;return syscallProbe.Begin(s.epoch,pid,incarnation,number,arg0,syscallNow,phase);
+    ++syscallClockReads;return syscallProbe.Begin(s.epoch,pid,incarnation,number,arg0,syscallNow,phase,ioctlRequest);
 }
 void SyscallTimingLeave(SyscallTimingTicket ticket,int64_t result,bool hasResult){++syscallClockReads;syscallProbe.End(ticket,syscallNow,result,hasResult);}
 }
@@ -52,6 +52,12 @@ static void CheckSyscalls(){
     { brook::SyscallTimingModel coarse; coarse.Watch(2,3,true);
       CHECK(coarse.Snapshot().coarseClock); coarse.Reset(); CHECK(coarse.Snapshot().coarseClock); }
     using namespace brook;
+    {SyscallTimingModel ioctl;ioctl.Watch(2,3);auto token=ioctl.Token();
+     auto call=ioctl.Begin(token,2,3,16,15,1,SyscallTimingPhase::Dispatch,0xc010646c);
+     CHECK(ioctl.Snapshot().activeIoctlRequest==0xc010646c && ioctl.End(call,21000001,0));
+     CHECK(ioctl.Snapshot().events[0].ioctlRequest==0xc010646c);
+     auto other=ioctl.Begin(token,2,3,1,15,22000000,SyscallTimingPhase::Dispatch,123);
+     CHECK(ioctl.Snapshot().activeIoctlRequest==0 && ioctl.End(other,23000000,0));}
     {SyscallTimingCall call(22,100,1,7);CHECK(call.Result(-11)==-11);}
     CHECK(!syscallClockReads && !syscallProbe.Snapshot().entries);
     syscallProbe.Watch(22,100);syscallNow=100;
@@ -76,6 +82,12 @@ static void CheckSyscalls(){
     CHECK(snap.events[0].number==202 && snap.events[0].result==-11 && snap.events[0].arg0==123 && snap.events[0].hasGap);
     CHECK(snap.kind[0].calls==1 && snap.kind[0].sumNs==50000000 && snap.kind[1].negativeResults==1);
     CHECK(snap.failures==1 && snap.failure[0].number==202 && snap.failure[0].result==-11 && snap.failure[0].arg0==123 && snap.failure[0].count==1);
+    { SyscallTimingModel present;present.Watch(3,4);auto token=present.Token();uint64_t t=1;
+      for(unsigned op=6;op<=8;++op){auto call=present.Begin(token,3,4,BROOK_SYS_GPU_HANDOFF_CTL,op,t++);CHECK(present.End(call,t++,0));}
+      auto failed=present.Begin(token,3,4,BROOK_SYS_GPU_HANDOFF_CTL,8,t++);CHECK(present.End(failed,t++,-116));
+      auto ret=present.Begin(token,3,4,BROOK_SYS_GPU_HANDOFF_CTL,8,t++,SyscallTimingPhase::ReturnCheck);CHECK(present.End(ret,t++,0));
+      auto p=present.Snapshot();CHECK(p.present[0].success==1 && p.present[1].success==1 && p.present[2].success==1 && p.present[2].failure==1);
+      present.Reset();CHECK(!present.Snapshot().present[2].success && !present.Snapshot().present[2].failure); }
     {SyscallTimingModel errors;errors.Watch(3,4);auto token=errors.Token();uint64_t t=1;
      for(unsigned i=0;i<18;++i){auto call=errors.Begin(token,3,4,47,i,t++);CHECK(errors.End(call,t++,-11));}
      {auto call=errors.Begin(token,3,4,47,88,t++);CHECK(errors.End(call,t++,-5));}

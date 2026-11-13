@@ -13,6 +13,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'tools'),str(ROOT/'tools/vm_bridge')]
 from hardware_update_workflow import UpdateRun
 from hardware import Hardware
+from dell_recovery_lock import inhibit_recovery
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -25,8 +26,11 @@ def main():
     p.add_argument('--helper',choices=['usb','system'],default='usb',help='Select the explicitly provisioned update target')
     p.add_argument('--pace-bytes-per-second',type=int,help='Optional Linux TCP pacing cap for the upload')
     a=p.parse_args()
-    result=UpdateRun(Hardware(),a.output).execute(a.session,a.key_file,a.kernel,a.initrd,
-        a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second)
+    bridge = Hardware()
+    target = bridge.load_session(a.session)
+    with inhibit_recovery(target['host'], target['port']):
+        result=UpdateRun(bridge,a.output).execute(a.session,a.key_file,a.kernel,a.initrd,
+            a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second)
     print(json.dumps({'state':result['state'],'receipt':str(a.output.resolve()/'receipt.json'),
         'session':result.get('new_session',a.session),'transaction_id':result['transaction_id']},indent=2))
 if __name__=='__main__':main()

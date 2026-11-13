@@ -3,8 +3,14 @@ project(brook-kernel C CXX ASM)
 option(BROOK_MAPPING_TEST_HOOKS "Enable guest-controlled mapping fault barriers (test kernels only)" OFF)
 option(BROOK_EPOLL_TARGET_DIAGNOSTICS "Record epoll target representations for opt-in investigation" OFF)
 option(BROOK_REGISTER_TEST_HOOKS "Enable controlled kernel register probes (test kernels only)" OFF)
+option(BROOK_GPU_CAPTURE_FAULT_TEST "Enable exact-signature GPU capture panic test (test kernels only)" OFF)
+option(BROOK_GPU_SUBMISSION_TIMING "Record bounded GPU submission timing (diagnostic kernels only)" OFF)
+option(BROOK_GPU_BLOCKED_RECOVERY_TEST "Allow synthetic pending GPU fences (test kernels only)" OFF)
+option(BROOK_EFI_SHUTDOWN_TEST "Enable disposable QEMU-only early UEFI shutdown experiment" OFF)
+option(BROOK_DELL_ACPI_MONITOR "Include the opt-in Dell XPS 9343 AC monitor" OFF)
 option(BROOK_AHCI_WRITE_TEST_HOOKS "Enable disposable QEMU SATA write test (never use on hardware)" OFF)
 option(BROOK_AHCI_PANIC_TEST "Enable disposable QEMU-only panic disk capture test" OFF)
+option(BROOK_AHCI_PANIC_CONTENTION_TEST "Enable disposable guarded QEMU AHCI contention test" OFF)
 option(BROOK_SSD_INSTALLER "Enable the boot-pinned, one-shot physical SSD installer" OFF)
 option(BROOK_SSD_GUARD_CHECK "Enable isolated SSD guard reservation test boot" OFF)
 option(BROOK_SSD_GUARD_PENDING_TEST "Enable disposable QEMU-only pending guard transaction" OFF)
@@ -16,6 +22,9 @@ option(BROOK_SSD_GUARDED_DESKTOP_RESET "Arm panic reset after checked guarded de
 option(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST "Enable disposable QEMU guarded desktop panic reset test" OFF)
 if(BROOK_SSD_GUARDED_DESKTOP AND NOT BROOK_SSD_AUTO_RECOVERY)
     message(FATAL_ERROR "Guarded desktop requires automatic recovery")
+endif()
+if(BROOK_AHCI_PANIC_CONTENTION_TEST AND (NOT BROOK_SSD_GUARDED_DESKTOP OR BROOK_SSD_INSTALLER))
+    message(FATAL_ERROR "AHCI panic contention fixture requires guarded desktop and excludes the installer")
 endif()
 if(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST AND NOT BROOK_SSD_GUARDED_DESKTOP)
     message(FATAL_ERROR "Guarded desktop reset test requires guarded desktop")
@@ -320,6 +329,10 @@ add_executable(kernel
     src/intel_vtd_observe.cpp
     src/intel_bdw_scanout.cpp
     src/intel_bdw_prepare.cpp
+    src/intel_bdw_buffer.cpp
+    src/intel_bdw_file.cpp
+    src/intel_bdw_exec_snapshot.cpp
+    src/intel_bdw_ioctl.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp
@@ -351,6 +364,7 @@ add_executable(kernel
     src/net.cpp
     src/shutdown.cpp
     src/platform_power.cpp
+    src/usb_boot_health.cpp
     src/lifecycle_channel.cpp
     src/debug_epoch.cpp
     src/debug_hardware.cpp
@@ -415,7 +429,9 @@ target_compile_options(kernel PRIVATE
     -Wno-unused-parameter
     -Wno-unused-command-line-argument
     -msse2
-    -mfpmath=sse   # use SSE for scalar float, not x87 (cleaner ABI)
+    # SSE is the x86-64 default. Keep the explicit setting on other builds,
+    # but let the ACPI interrupt code disable SIMD with -mgeneral-regs-only.
+    $<$<NOT:$<BOOL:${BROOK_DELL_ACPI_MONITOR}>>:-mfpmath=sse>
     -fno-omit-frame-pointer  # enable RBP frame chain for profiler stack walking
 )
 
@@ -432,6 +448,27 @@ set_source_files_properties("${BUILD_INFO_CPP}" PROPERTIES GENERATED TRUE)
 target_sources(kernel PRIVATE "${BUILD_INFO_CPP}")
 add_dependencies(kernel refresh_build_info)
 target_compile_definitions(kernel PRIVATE __BROOK_KERNEL__=1)
+if(BROOK_DELL_ACPI_MONITOR)
+    include(FetchContent)
+    find_program(BROOK_PATCH patch REQUIRED)
+    set(BROOK_UACPI_ARCHIVE "https://codeload.github.com/uACPI/uACPI/tar.gz/refs/tags/6.1.0"
+        CACHE STRING "URL or local path of the pinned uACPI 6.1.0 archive")
+    FetchContent_Declare(brook_uacpi
+        URL "${BROOK_UACPI_ARCHIVE}"
+        URL_HASH SHA256=3ea319c53984b90a65aacb55b868aab5a66cc7765ee06474e174eb70cc884519
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        PATCH_COMMAND "${BROOK_PATCH}" --batch -p1 -i "${BROOK_ROOT}/cmake/patches/uacpi-dell-monitor.patch")
+    FetchContent_MakeAvailable(brook_uacpi)
+    include("${brook_uacpi_SOURCE_DIR}/uacpi.cmake")
+    target_sources(kernel PRIVATE ${UACPI_SOURCES} src/dell_acpi_monitor.cpp)
+    set_source_files_properties(${UACPI_SOURCES} src/dell_acpi_monitor.cpp
+        PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only")
+    target_include_directories(kernel SYSTEM PRIVATE ${UACPI_INCLUDES})
+    target_compile_definitions(kernel PRIVATE BROOK_DELL_ACPI_MONITOR=1 UACPI_NATIVE_MMIO UACPI_USE_BUILTIN_STRING)
+endif()
+if(BROOK_GPU_BLOCKED_RECOVERY_TEST)
+    target_compile_definitions(kernel PRIVATE BROOK_GPU_BLOCKED_RECOVERY_TEST=1)
+endif()
 if(BROOK_EPOLL_TARGET_DIAGNOSTICS)
     target_compile_definitions(kernel PRIVATE BROOK_EPOLL_TARGET_DIAGNOSTICS=1)
 endif()
@@ -440,6 +477,9 @@ if(BROOK_AHCI_WRITE_TEST_HOOKS)
 endif()
 if(BROOK_AHCI_PANIC_TEST)
     target_compile_definitions(kernel PRIVATE BROOK_AHCI_PANIC_TEST=1)
+endif()
+if(BROOK_AHCI_PANIC_CONTENTION_TEST)
+    target_compile_definitions(kernel PRIVATE BROOK_AHCI_PANIC_CONTENTION_TEST=1)
 endif()
 if(BROOK_SSD_INSTALLER)
     target_compile_definitions(kernel PRIVATE BROOK_SSD_INSTALLER=1)
@@ -469,6 +509,15 @@ if(BROOK_SSD_GUARD_COMPLETE_TEST OR BROOK_SSD_AUTO_RECOVERY)
 endif()
 if(BROOK_SSD_AUTO_RECOVERY)
     target_compile_definitions(kernel PRIVATE BROOK_SSD_AUTO_RECOVERY=1)
+endif()
+if(BROOK_GPU_CAPTURE_FAULT_TEST)
+    target_compile_definitions(kernel PRIVATE BROOK_GPU_CAPTURE_FAULT_TEST=1)
+endif()
+if(BROOK_GPU_SUBMISSION_TIMING)
+    target_compile_definitions(kernel PRIVATE BROOK_GPU_SUBMISSION_TIMING=1)
+endif()
+if(BROOK_EFI_SHUTDOWN_TEST)
+    target_compile_definitions(kernel PRIVATE BROOK_EFI_SHUTDOWN_TEST=1)
 endif()
 if(BROOK_SSD_GUARDED_DESKTOP)
     target_compile_definitions(kernel PRIVATE BROOK_SSD_GUARDED_DESKTOP=1)

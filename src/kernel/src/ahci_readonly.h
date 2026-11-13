@@ -28,6 +28,10 @@ int AhciReadOnlySector(uint64_t lba, void* output);
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 // Disposable test disk only; retains ownership even if capture fails.
 void AhciPanicTestCapture();
+void AhciPanicReserveBeforeHalt();
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+void AhciPanicTestWaitForWriter();
+#endif
 bool AhciPanicTestFatCandidate();
 bool AhciPanicTestMapSectors(const uint64_t* sectors,uint32_t count,uint64_t partitionStart,uint64_t partitionSectors);
 #if defined(BROOK_SSD_GUARD_PENDING_TEST)

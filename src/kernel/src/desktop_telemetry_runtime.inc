@@ -87,18 +87,33 @@ static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint3
     char n[12];append("80:");DesktopNumber(n,summary.p80);append(n);append(" 95:");DesktopNumber(n,summary.p95);append(n);append(" max:");DesktopNumber(n,summary.max);append(n);append("ms");
     text(r.x,bottom,value,p.secondaryText);
 }
-void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect* clip) {
-    if(!WmIsActive())return;
-    char text[100]="Brook ";WmStrCopy(text+6,BuildGitHash(),sizeof(text)-6);
+static bool WmBuildIdLayout(uint32_t sw,uint32_t sh,char (&text)[100],WmRect& rect) {
+    if(!WmIsActive())return false;
+    WmStrCopy(text,"Brook ",sizeof(text));WmStrCopy(text+6,BuildGitHash(),sizeof(text)-6);
     const int width=WmTextWidth(text)+WmMetric(14),height=WmDesktopFont().lineHeight+WmMetric(6);
-    if(sw<static_cast<uint32_t>(width)+WmMetric(10)||sh<WmMetric(WM_TASKBAR_HEIGHT)+height+WmMetric(6))return;
-    const int x=sw-width-WmMetric(8),y=sh-WmMetric(WM_TASKBAR_HEIGHT)-height-WmMetric(6);
+    if(sw<static_cast<uint32_t>(width)+WmMetric(10)||sh<WmMetric(WM_TASKBAR_HEIGHT)+height+WmMetric(6))return false;
+    rect={int(sw)-width-int(WmMetric(8)),int(sh)-int(WmMetric(WM_TASKBAR_HEIGHT))-height-int(WmMetric(6)),width,height};
+    return true;
+}
+void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect* clip) {
+    char text[100];WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect))return;
+    const int x=rect.x,y=rect.y,width=rect.w,height=rect.h;
     const int left=clip && clip->x>x?clip->x:x,top=clip && clip->y>y?clip->y:y;
     const int right=clip && clip->x+clip->w<x+width?clip->x+clip->w:x+width;
     const int bottom=clip && clip->y+clip->h<y+height?clip->y+clip->h:y+height;
     if(right<=left||bottom<=top)return;
     WmFillRect(pixels,stride,sw,sh,left,top,right-left,bottom-top,0x172335);
     WmRenderString(pixels,stride,sw,sh,x+WmMetric(7),y+WmMetric(3),text,0xa4b2c7,0x172335,0,clip);
+}
+// Draw into one already-populated screen span, using the same glyph renderer
+// and coordinates as the normal full-frame path.
+void WmDrawBuildIdSpan(uint32_t* pixels,uint32_t left,uint32_t count,uint32_t row,uint32_t sw,uint32_t sh) {
+    if(!pixels || !count || left>=sw || count>sw-left || row>=sh)return;
+    char text[100];WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect) ||
+        int64_t(row)<rect.y || int64_t(row)>=int64_t(rect.y)+rect.h)return;
+    WmFillRect(pixels,count,count,1,rect.x-int(left),0,rect.w,1,0x172335);
+    WmRenderString(pixels,count,count,1,rect.x+int(WmMetric(7))-int(left),
+                   rect.y+int(WmMetric(3))-int(row),text,0xa4b2c7,0x172335);
 }
 bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* width,uint32_t* height) {
     const uint64_t ready=CompositorDesktopReadyTick(),now=ApicTickCount();

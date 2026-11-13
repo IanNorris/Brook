@@ -5,6 +5,7 @@ using namespace brook;
 int main() {
     assert(RecoveryDebugClassify("bridge hardware caps")==RecoveryDebugCommand::Hardware);
     assert(RecoveryDebugClassify("bridge hardware recovery-panic 0 512")==RecoveryDebugCommand::Hardware);
+    assert(RecoveryDebugClassify("bridge hardware recovery-panic-previous 0 512")==RecoveryDebugCommand::Hardware);
     assert(RecoveryDebugClassify("bridge hardware logs 0 10")==RecoveryDebugCommand::Hardware);
     assert(RecoveryDebugClassify("bridge guard 01234567890123456789012345678901 bridge hardware caps")==RecoveryDebugCommand::Guard);
     assert(RecoveryDebugClassify("bridge epoch init 01234567890123456789012345678901")==RecoveryDebugCommand::Epoch);

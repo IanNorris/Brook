@@ -4,6 +4,7 @@
 #include "dsp_producer_timing.h"
 #include "syscall_timing.h"
 #include "sched_decision_trace.h"
+#include "intel_bdw_submission_timing.h"
 #include "bridge_reply.h"
 #include "debug_hardware.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -5103,6 +5104,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu glass on|off|status - frame-boundary material toggle; keeps GPU composition\n"
             "  gpu uploads - cumulative requested bytes by desktop/chrome/overlay/cursor layer\n"
             "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
+            "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
@@ -5476,16 +5478,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         h.text(",");h.field("excluded",s.excluded);
         h.text(",");h.field("active_syscall",s.activeNumber);
         h.text(",");h.field("active_arg0",s.activeArg0);
+        h.text(",");h.field("active_ioctl_request",s.activeIoctlRequest);
         h.text(",");h.field("active_begin_ns",s.activeBeginNs);
         h.text(",");h.field("sequence",s.sequence);
         h.text(",\"unmatched_entry\":");h.text(s.active?"true":"false");h.text(",\"active_phase\":\"");h.text(s.activePhase==SyscallTimingPhase::ReturnCheck?"return_check":"dispatch");h.text("\"");h.text(",\"saturated\":");h.text(s.saturated?"true":"false");h.text(",\"kinds\":[");h.send();
         for(unsigned i=0;i<s.kinds;++i){const auto& k=s.kind[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("number",k.number);r.text(",\"phase\":\"");r.text(k.phase==SyscallTimingPhase::ReturnCheck?"return_check":"dispatch");r.text("\"");
             r.text(",");r.field("calls",k.calls);r.text(",");r.field("sum_ns",k.sumNs);r.text(",");r.field("max_ns",k.maxNs);r.text(",");r.field("negative_results",k.negativeResults);r.text("}");r.send();}
+        DebugChannelSend("],\"present\":[");
+        for(unsigned i=0;i<3;++i){BridgeReply r;if(i)r.text(",");r.text("{");r.field("op",i+BROOK_GPU_HANDOFF_PRESENT_PROBE);
+            r.text(",");r.field("success",s.present[i].success);r.text(",");r.field("failure",s.present[i].failure);r.text("}");r.send();}
         DebugChannelSend("],\"failures\":[");
         for(unsigned i=0;i<s.failures;++i){const auto& f=s.failure[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("number",f.number);r.text(",");r.field("last_arg0",f.arg0);r.text(",");r.field("count",f.count);r.text(",\"result\":-");r.number(uint64_t(0)-uint64_t(f.result));r.text("}");r.send();}
         {BridgeReply r;r.text("],");r.field("overflow_failures",s.overflowFailures);r.text(",\"events\":[");r.send();}
         for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("number",e.number);r.text(",\"phase\":\"");r.text(e.phase==SyscallTimingPhase::ReturnCheck?"return_check":"dispatch");r.text("\"");
-            r.text(",");r.field("arg0",e.arg0);r.text(",");r.field("begin_ns",e.beginNs);r.text(",");r.field("end_ns",e.endNs);r.text(",");r.field("call_ns",e.endNs-e.beginNs);
+            r.text(",");r.field("arg0",e.arg0);r.text(",");r.field("ioctl_request",e.ioctlRequest);r.text(",");r.field("begin_ns",e.beginNs);r.text(",");r.field("end_ns",e.endNs);r.text(",");r.field("call_ns",e.endNs-e.beginNs);
             r.text(",");r.field("gap_ns",e.gapNs);r.text(",\"has_gap\":");r.text(e.hasGap?"true":"false");r.text(",\"result\":");
             if(e.result<0)r.text("-");r.number(e.result<0?uint64_t(0)-uint64_t(e.result):uint64_t(e.result));r.text("}");r.send();}
         DebugChannelSend("]}\n");
@@ -5627,6 +5633,29 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("invalid_clock",s.invalidClock);r.text(",");r.field("unsupported_driver",s.unsupportedDriver);
         r.text(",");r.field("late_resumes",s.lateResumes);
         r.text(",\"scope\":\"default-off fixed intel_hda 12-KiB lead experiment; one deferred opportunity, not a wall-time guarantee; recovered means ready at next preparation, not proven playback\"}\n");r.send();
+    }
+    else if(StrStartsWith(cmd,"gpu submission timing watch ") || NetStrEq(cmd,"gpu submission timing off") ||
+            NetStrEq(cmd,"gpu submission timing status")) {
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+        bool applied=true;
+        if(StrStartsWith(cmd,"gpu submission timing watch ")){
+            const char* p=cmd+sizeof("gpu submission timing watch ")-1;uint64_t owner=0;bool any=false,valid=true;
+            while(*p>='0' && *p<='9'){const uint64_t digit=*p++-'0';
+                if(owner>(~uint64_t{0}-digit)/10){valid=false;break;}owner=owner*10+digit;any=true;}
+            if(!valid || !any || *p || !owner){DebugChannelSend("{\"error\":\"expected nonzero owner incarnation\"}\n");return;}
+            applied=BdwTimingConfigure(owner);
+        }else if(NetStrEq(cmd,"gpu submission timing off"))applied=BdwTimingConfigure(0);
+        BdwTimingSnapshot s{};
+        if(!applied || !BdwTimingRead(s)){DebugChannelSend("{\"error\":\"submission timing busy\"}\n");return;}
+        BridgeReply r;r.text("{\"owner\":");r.number(s.owner);r.text(",");r.field("dropped",s.dropped);
+        r.text(",\"saturated\":");r.text(s.saturated?"true":"false");r.text(",\"stages\":[");r.send();
+        for(unsigned i=0;i<BdwTimingStageCount;++i){const auto& b=s.stages[i];BridgeReply row;
+            if(i)row.text(",");row.text("{");row.field("count",b.count);row.text(",");row.field("total_us",b.totalUs);
+            row.text(",");row.field("max_us",b.maxUs);row.text(",");row.field("total_pages",b.totalPages);row.text("}");row.send();}
+        DebugChannelSend("],\"scope\":\"queue, device sync, preparation including device sync, device including reset, retirement, CPU sync, admission lock wait, snapshot build, WRITE pages, ASYNC pages, GT init, PAT setup, render run, context save, reset and unbind, PAT restore, issue to breadcrumb observation, breadcrumb observation to context retirement, unique buffer-object pages, repeated buffer-object pages; duplicate counts are within a submission and do not detect distinct objects aliasing pages; WRITE/ASYNC are overlapping hints, not access directions; later intervals nest inside device and render run; observed times include polling and scheduling, not GPU timestamps; cross-CPU TSC requires validation\"}\n");
+#else
+        DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
     }
     else if(NetStrEq(cmd,"gpu completion wake on") || NetStrEq(cmd,"gpu completion wake off") ||
             NetStrEq(cmd,"gpu completion wake status")) {

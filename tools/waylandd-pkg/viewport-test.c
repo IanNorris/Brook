@@ -68,6 +68,9 @@ static void protocol_error(unsigned scenario) {
     assert(errors==1);wl_client_destroy(client);assert(!g_surfaces);wl_display_destroy(display);close(sockets[1]);
 }
 int main(void) {
+#ifdef BROOK_WAYLAND_VULKAN_TEST
+    assert(!setenv("BROOK_WAYLAND_VULKAN_COMPOSE","1",1));
+#endif
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
     struct wl_display *display=wl_display_create();struct wl_client *client=wl_client_create(display,sockets[0]);assert(client);
     struct wl_resource *vpman=wl_resource_create(client,&wp_viewporter_interface,1,0);assert(vpman);
@@ -85,6 +88,9 @@ int main(void) {
     struct brook_view *first=current(child);view_ref(first);
     assert(first->geometry.sx==256 && first->geometry.w==2);
     assert(surface_render(root));assert(screen[0]==grid[1] && screen[1]==grid[2] && screen[4]==grid[4]);
+#ifdef BROOK_WAYLAND_VULKAN_TEST
+    assert(brook_vulkan_test_success>0);
+#endif
     // Cached metadata B stays hidden until the parent commits.
     viewport_set_source(client,vp,0,0,256,2*256);
     viewport_set_destination(client,vp,1,2);surface_commit(client,child->resource);
@@ -108,6 +114,9 @@ int main(void) {
     surface_commit(client,child->resource);surface_commit(client,root->resource);
     assert(current(child)->geometry.w==2 && current(child)->geometry.h==3);
     assert(screen[0]==grid[3] && screen[1]==grid[0] && screen[8]==grid[5]);
+#ifdef BROOK_WAYLAND_VULKAN_TEST
+    assert(brook_vulkan_test_fallback>0);
+#endif
     surface_attach(client,child->resource,NULL,0,0);surface_commit(client,child->resource);surface_commit(client,root->resource);
     assert(!child->tree.current->value && screen[0]==black[0]);
     // A viewport may outlive its surface, without retaining a dangling pointer.

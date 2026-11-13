@@ -1,4 +1,5 @@
 #pragma once
+#include "desktop_overlay_regions.h"
 
 #include <stdint.h>
 
@@ -57,9 +58,11 @@ struct DebugFrameSnapshot {
     uint32_t token, width, height, stride;
     uint64_t address, tick, epoch;
     DebugFrameState state;
+    uint32_t source,presentationMode;
 };
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0);
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false);
 DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner=0);
+int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& bands);
 bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner=0);
 // Destination must be kernel memory. Copies under the lease lock; callers
 // must copy to userspace only after this returns and releases that lock.
@@ -93,6 +96,37 @@ extern "C" void CompositorWake();
 // Mark the backbuffer as dirty so the next compositor loop copies it to MMIO.
 // Called by the TTY after rendering text into the backbuffer.
 void CompositorMarkDirty();
+// One-shot probe from a completed, retained renderer output. The compositor
+// retains the display and schedules a full software repaint after this copy.
+// Copy must be nonblocking and read only the caller-pinned completed source.
+// A nonzero expectedDisplay rejects output for a remapped display before any
+// writes. Zero retains the diagnostic probe's untracked behavior.
+// Region mode is internal-only: callers must additionally establish that the
+// retained base and region cover all scene changes before exposing it.
+uint64_t CompositorDisplayGeneration();
+struct CompositorBackdropInfo {uint64_t display,generation;uint32_t width,height;};
+bool CompositorGetBackdropInfo(CompositorBackdropInfo* out);
+bool CompositorReadBackdropSpan(const CompositorBackdropInfo& expected,uint32_t y,uint32_t left,uint32_t count,uint32_t* out);
+constexpr uint32_t COMPOSITOR_MAX_REGIONS=32;
+struct CompositorPresentRegion {uint32_t x,y,width,height,stride;uint64_t offset;};
+struct CompositorPresentAcceleration {
+    void* context;
+    // Returns only after the device can no longer write to scanout.
+    bool (*present)(void*,const CompositorPresentRegion*,uint32_t);
+    bool (*prepareCpu)(void*);
+};
+int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t stride,
+                           void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),uint32_t samples[4],
+                           uint64_t expectedDisplay=0,uint64_t expectedBackdrop=0,uint64_t leaseOwner=0,bool region=false,
+                           const CompositorPresentAcceleration* acceleration=nullptr);
+// Internal only. The caller pins a completed source and holds scene identity
+// stable. The display lock serializes the entire batch against other writers;
+// it does not guarantee tear-free physical scanout.
+int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t count,uint64_t sourceBytes,
+                             void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
+                             uint64_t display,uint64_t backdrop,uint64_t owner,
+                             const CompositorPresentAcceleration* acceleration=nullptr);
+void CompositorReleasePresentLease(uint64_t owner);
 
 // Begin a WM drag operation for a window at the current mouse position.
 // Used by Wayland clients via xdg_toplevel.move when they draw their own chrome.

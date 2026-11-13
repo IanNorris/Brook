@@ -185,7 +185,9 @@ def main():
             data = stream.read(65536)
         after = time.monotonic_ns()
         cursor += len(data)
-        lines = (pending + data).split(b'\n')
+        # The engine prints in-place loading progress with carriage returns.
+        # A marker may follow that progress without an intervening newline.
+        lines = (pending + data).replace(b'\r', b'\n').split(b'\n')
         pending = lines.pop()
         for line in lines:
             for name in ('START', 'END'):

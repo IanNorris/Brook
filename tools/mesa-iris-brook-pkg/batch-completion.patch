@@ -1,0 +1,106 @@
+--- a/src/gallium/drivers/iris/iris_fence.h
++++ b/src/gallium/drivers/iris/iris_fence.h
+@@ -36,6 +36,8 @@
+ struct iris_syncobj {
+    struct pipe_reference ref;
+    uint32_t handle;
++   /* Only BO dependency waits use this bit, under bo_deps_lock. */
++   bool bo_wait_completed;
+ };
+ 
+ struct iris_syncobj *iris_create_syncobj(struct iris_bufmgr *bufmgr);
+--- a/src/gallium/drivers/iris/iris_fence.c
++++ b/src/gallium/drivers/iris/iris_fence.c
+@@ -74,6 +74,7 @@
+    syncobj->handle = gem_syncobj_create(fd, 0);
+    assert(syncobj->handle);
+ 
++   syncobj->bo_wait_completed = false;
+    pipe_reference_init(&syncobj->ref, 1);
+ 
+    return syncobj;
+@@ -576,6 +577,7 @@
+       return;
+    }
+    syncobj->handle = args.handle;
++   syncobj->bo_wait_completed = false;
+    pipe_reference_init(&syncobj->ref, 1);
+ 
+    struct iris_fine_fence *fine = calloc(1, sizeof(*fine));
+--- a/src/gallium/drivers/iris/iris_bufmgr.c
++++ b/src/gallium/drivers/iris/iris_bufmgr.c
+@@ -543,39 +543,48 @@
+       for (int b = 0; b < IRIS_BATCH_COUNT; b++) {
+          struct iris_syncobj *r = bo->deps[d].read_syncobjs[b];
+          struct iris_syncobj *w = bo->deps[d].write_syncobjs[b];
+-         if (r)
++         if (r && !r->bo_wait_completed)
+             handles[handle_count++] = r->handle;
+-         if (w)
++         if (w && !w->bo_wait_completed)
+             handles[handle_count++] = w->handle;
+       }
+    }
+ 
+-   if (handle_count == 0)
+-      goto out;
+-
+-   /* Unlike the gem wait, negative values are not infinite here. */
+-   int64_t timeout_abs = os_time_get_absolute_timeout(timeout_ns);
+-   if (timeout_abs < 0)
+-      timeout_abs = INT64_MAX;
+-
+-   struct drm_syncobj_wait args = {
+-      .handles = (uintptr_t) handles,
+-      .timeout_nsec = timeout_abs,
+-      .count_handles = handle_count,
+-      .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+-   };
+-
+-   ret = intel_ioctl(bufmgr->fd, DRM_IOCTL_SYNCOBJ_WAIT, &args);
+-   if (ret != 0) {
+-      ret = -errno;
+-      goto out;
+-   }
+-
+-   /* We just waited everything, so clean all the deps. */
++   if (handle_count > 0) {
++      /* Unlike the gem wait, negative values are not infinite here. */
++      int64_t timeout_abs = os_time_get_absolute_timeout(timeout_ns);
++      if (timeout_abs < 0)
++         timeout_abs = INT64_MAX;
++
++      struct drm_syncobj_wait args = {
++         .handles = (uintptr_t) handles,
++         .timeout_nsec = timeout_abs,
++         .count_handles = handle_count,
++         .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
++      };
++
++      ret = intel_ioctl(bufmgr->fd, DRM_IOCTL_SYNCOBJ_WAIT, &args);
++      if (ret != 0) {
++         ret = -errno;
++         goto out;
++      }
++   }
++
++   /* A dependency slot holds the private, one-shot signaling object of
++    * a batch. That object can be shared by many BOs. Record success before
++    * releasing this BO's references so the other BOs can skip the wait.
++    * External implicit sync is refreshed on each wait and is excluded.
++    */
+    for (int d = 0; d < bo->deps_size; d++) {
+       for (int b = 0; b < IRIS_BATCH_COUNT; b++) {
+-         iris_syncobj_reference(bufmgr, &bo->deps[d].write_syncobjs[b], NULL);
+-         iris_syncobj_reference(bufmgr, &bo->deps[d].read_syncobjs[b], NULL);
++         struct iris_syncobj **w = &bo->deps[d].write_syncobjs[b];
++         struct iris_syncobj **r = &bo->deps[d].read_syncobjs[b];
++         if (*w)
++            (*w)->bo_wait_completed = true;
++         if (*r)
++            (*r)->bo_wait_completed = true;
++         iris_syncobj_reference(bufmgr, w, NULL);
++         iris_syncobj_reference(bufmgr, r, NULL);
+       }
+    }
+ 

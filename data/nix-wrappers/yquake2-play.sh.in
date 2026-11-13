@@ -13,7 +13,8 @@
 # otherwise Mesa chooses a driver. We supply the DRI and EGL paths, SDL Wayland, a
 # dummy SDL audio backend, and a writable HOME for yquake2's ~/.yq2 config +
 # savegames. The game data is read-only and SHARED with the native software port
-# (/data/games/quake2/baseq2/pak0.pak), passed via -datadir.
+# (/data/games/quake2/baseq2/pak0.pak), passed via -datadir. Set
+# BROOK_QUAKE2_DATA_DIR to use an existing baseq2 directory elsewhere.
 #
 # IMPORTANT: these launchers run yquake2 as uid 1000 (yquake2 refuses to run as
 # root). The ext2 /data mount enforces DAC, so HOME=/data/yq2 must be a
@@ -48,9 +49,9 @@ BROOK_FIRST_CONTROLS=0
 if [ ! -f "$HOME/.yq2/baseq2/config.cfg" ] && [ ! -f "$HOME/.yq2/baseq2/autoexec.cfg" ]; then
     BROOK_FIRST_CONTROLS=1
 fi
-# Installed by create_experiment_disks.py; guest directory creation can lose
-# newly written files, so the mixer format must not depend on a startup heredoc.
-export ALSOFT_CONF=/nix/etc/alsoft-oss.conf
+# The launcher package supplies a store-backed configuration; callers may
+# explicitly choose another configuration when needed.
+export ALSOFT_CONF="${ALSOFT_CONF:-@ALSOFT_CONFIG@}"
 
 # Library search path for libs yquake2 dlopen()s by bare soname that aren't on
 # its rpath — notably libopenal.so.1 (OpenAL backend). @YQUAKE2_LIBDIRS@ is filled
@@ -111,6 +112,6 @@ fi
 # serial console never shows WHY. With a per-line-flushed logfile the exit
 # reason survives the crash. ext2 write-persistence on /data is verified working
 # (a plain echo>file;cat round-trips), so the log will actually contain data.
-exec @YQUAKE2_BIN@ -datadir /data/games/quake2 \
+exec @YQUAKE2_BIN@ -datadir "${BROOK_QUAKE2_DATA_DIR:-/data/games/quake2}" \
     +set al_driver libopenal.so.1 +set s_openal 1 +set logfile 2 \
     +set vid_renderer "$RENDERER" "$@"

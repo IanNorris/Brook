@@ -454,3 +454,18 @@ web helper reported shared-memory ENOSPC
 and an unresponsive browser during the run. The Dell still used the previously
 accepted kernel, not the QEMU-tested tmpfs candidate. Captures and account
 details remain private, outside version control.
+
+
+## Physical rootless gameplay, 13 November
+
+The already installed native Linux Stardew Valley depot rendered in a rootless
+Xwayland window on Dell generation 341. The diagnostic used an isolated home
+and a private Brook-compatible loader next to links to the installed assets.
+Windowed 1280×720 preferences and the game's display-mode toggle exposed the
+full title menu. A disposable character reached day one. Captures show
+movement away from the bed and the game menu opening at 7:10 am. The desktop's
+APP telemetry reported roughly 45 ms p80 and 47–49 ms p95 in the steady game
+samples, measuring publication cadence. The exit attempt near the harness
+deadline resulted in status 137 with all tasks drained and no SDL swap
+capture. Steam-client launch and audio still need physical acceptance. Private
+evidence is under `build/hardware/dell-media-20261113/gen341-stardew-depot-windowed/`.

@@ -49,6 +49,10 @@ bool AhciSystemGuardTestAdoptSystemMount(Device* adapter,uint8_t drive,uint64_t 
 // Retains the guard-owned data lease and never retries failure.
 bool AhciSystemGuardTestMountDesktop(Device* adapter,uint8_t* nextDrive);
 int AhciSystemGuardTestFailedDesktopWrite();
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
+// Recheck the admitted desktop data superblock from disk after final sync.
+bool AhciSystemGuardShutdownClean(Device* esp);
+#endif
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 bool AhciSystemGuardPanicRecoveryArm(Device* adapter,const uint64_t* sectors,uint32_t count);

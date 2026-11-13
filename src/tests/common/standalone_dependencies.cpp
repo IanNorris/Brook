@@ -3,10 +3,18 @@
 #include "acpi.h"
 #include "cpu.h"
 #include "module.h"
+#include "intel_bdw_scanout.h"
 
 extern "C" uint8_t __text_start[], __kernel_end[];
 
 namespace brook {
+// Standalone memory tests have no GPU owner or hardware execution backend.
+bool BdwRunRetainedBcs(BdwBcsExecutionBackend&,uint64_t,BdwBcsRunResult&) {return false;}
+bool BdwRunRetainedRender(BdwRenderExecutionBackend&,uint64_t,BdwRenderRunResult&) {return false;}
+bool BdwRetireRetainedRenderAfterReset(BdwRenderExecutionBackend&) {return false;}
+bool BdwRunRebasedRender(BdwRenderExecutionBackend&,uint64_t,BdwRenderRunResult&) {return false;}
+bool BdwCopyRetainedRenderContext(BdwRenderExecutionBackend&,uint32_t (&)[20*1024]) {return false;}
+bool BdwCopyRebasedRenderContext(BdwRenderExecutionBackend&,uint32_t (&)[20*1024]) {return false;}
 bool ModuleRetainAddresses(const uintptr_t* addresses, uint32_t count)
 {
     if (!addresses || !count) return false;

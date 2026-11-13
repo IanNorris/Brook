@@ -3,13 +3,16 @@
 #include "intel_bdw_oneshot.h"
 
 namespace brook {
+// Match the variable PPGTT allocation limit so the complete table image can
+// be validated before its first cache flush.
+constexpr uint32_t BdwPublishMaximumPages=128;
 // CPU cache publication only. Caller owns every complete page, excludes CPU
 // writers, retains pages until the final barrier, and must separately prove
 // mapping types, DMA translation and device-side visibility before submission.
 // All ranges and the line size are checked before issuing the first flush.
 template<class Flush>
 bool BdwPublishCpuPages(Flush& flush,const BdwOwnedPage* pages,unsigned count,uint32_t line) {
-    if(!pages || !count || count>19 || line<16 || line>4096 ||
+    if(!pages || !count || count>BdwPublishMaximumPages || line<16 || line>4096 ||
        (line&(line-1)) || (4096%line))return false;
     for(unsigned i=0;i<count;++i) {
         const uintptr_t p=reinterpret_cast<uintptr_t>(pages[i].cpu);

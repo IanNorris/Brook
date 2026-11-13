@@ -84,14 +84,22 @@ void SerialInit()
     outb(COM1_MCR, 0x03);   // DTR + RTS
 }
 
+// Normal output must stop even if it entered its lock before panic began.
+static volatile uint32_t g_panicInProgress = 0;
+
 void SerialPutChar(char c)
 {
+    if (__atomic_load_n(&g_panicInProgress,__ATOMIC_ACQUIRE)) return;
     if (c == '\n') {
         // QEMU serial stdio expects CRLF
-        while ((inb(COM1_LSR) & 0x20) == 0) {}
+        while ((inb(COM1_LSR) & 0x20) == 0)
+            if (__atomic_load_n(&g_panicInProgress,__ATOMIC_ACQUIRE)) return;
+        if (__atomic_load_n(&g_panicInProgress,__ATOMIC_ACQUIRE)) return;
         outb(COM1_DATA, '\r');
     }
-    while ((inb(COM1_LSR) & 0x20) == 0) {}
+    while ((inb(COM1_LSR) & 0x20) == 0)
+        if (__atomic_load_n(&g_panicInProgress,__ATOMIC_ACQUIRE)) return;
+    if (__atomic_load_n(&g_panicInProgress,__ATOMIC_ACQUIRE)) return;
     outb(COM1_DATA, static_cast<uint8_t>(c));
 }
 
@@ -100,7 +108,6 @@ void SerialPutChar(char c)
 // prevents other CPUs that haven't yet been halted by SmpHaltAllAPs from
 // interleaving their SCHED/CLOSE/etc. messages into the panic register
 // dump and rendering it unreadable on the serial log.
-static volatile uint32_t g_panicInProgress = 0;
 static PanicSerialState g_panicSerialState;
 void SerialPanicBegin() { __atomic_store_n(&g_panicInProgress,1,__ATOMIC_RELEASE); }
 void SerialPanicPutChar(char c) {

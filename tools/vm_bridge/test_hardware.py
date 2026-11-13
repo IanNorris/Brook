@@ -50,11 +50,12 @@ class Endpoint:
                             result={'job_api':2}
                         elif command=='bridge ui caps':result={'ui_api':1,'apps_api':1,'boot_id':self.epoch}
                         elif command=='bridge stats':result={'process_count':7}
-                        elif command.startswith('bridge hardware recovery-panic '):
-                            offset,count=map(int,command.split()[-2:]);payload=getattr(self,'panic_packet',b'')
+                        elif command.startswith(('bridge hardware recovery-panic ','bridge hardware recovery-panic-previous ')):
+                            previous=command.startswith('bridge hardware recovery-panic-previous ')
+                            offset,count=map(int,command.split()[-2:]);payload=getattr(self,'previous_panic_packet' if previous else 'panic_packet',b'')
                             if not payload:result={'recovery_panic_error':'No validated panic record'}
                             else:
-                                result={'recovery_panic_api':1,'sequence':3,'bytes':len(payload),'crc32':zlib.crc32(payload),
+                                result={'recovery_panic_api':1,'sequence':2 if previous else 3,'bytes':len(payload),'crc32':zlib.crc32(payload),
                                         'offset':offset,'hex':payload[offset:offset+count].hex()}
                                 if getattr(self,'corrupt_panic',False) and count:result['hex']='00'*count
                         elif command.startswith('bridge hardware power '):
@@ -85,6 +86,9 @@ class HardwareTests(unittest.TestCase):
         session=self.attach();self.endpoint.panic_packet=bytes(range(256))*5
         path=Path(self.tmp.name)/'packet.bin';result=self.hardware.recovery_panic(session,path)
         self.assertEqual(path.read_bytes(),self.endpoint.panic_packet);self.assertEqual(result['sequence'],3)
+        self.endpoint.previous_panic_packet=b'previous crash'
+        previous=Path(self.tmp.name)/'previous.bin';old=self.hardware.recovery_panic(session,previous,previous=True)
+        self.assertEqual(old['sequence'],2);self.assertEqual(previous.read_bytes(),self.endpoint.previous_panic_packet)
         with self.assertRaises(FileExistsError):self.hardware.recovery_panic(session,path)
         self.endpoint.corrupt_panic=True;bad=Path(self.tmp.name)/'bad.bin'
         with self.assertRaisesRegex(RuntimeError,'checksum'):self.hardware.recovery_panic(session,bad)

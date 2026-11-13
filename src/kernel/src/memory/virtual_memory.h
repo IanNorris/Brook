@@ -152,12 +152,41 @@ struct DellGpuVtdStatus;
 // page, and an opted-in single BSP attempt. Output is unchanged on failure.
 bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status);
 struct BdwGopPtePlan;struct BdwGopPtes;
+struct BdwDisplaySnapshot;
+bool VmmDellDisplayCriticalRead(BdwDisplaySnapshot& result);
 // Caller proves audited Dell/GOP identity, BAR extents, GPU D0 and opt-in.
 bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& result);
+bool VmmDellGopBackingPage(uint32_t first,uint32_t count,uint64_t& physicalBase);
+struct BdwGgttReservedPtes;
+struct BdwGgttSurvey;
+bool VmmDellGgttSurveyCriticalRead(uint32_t first,BdwGgttSurvey& result);
+bool VmmDellReservedGgttCriticalRead(uint32_t first,BdwGgttReservedPtes& result);
 // Caller proves audited Dell identity, BAR extent, D0 and opt-in.
 bool VmmDellForcewakeAckCriticalRead(uint32_t& value);
 struct BdwForcewakeAdapterResult;
-void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines=false);
+struct BdwPatTestResult;
+struct BdwBcsRunResult;
+struct BdwRcsResetTestResult;
+struct BdwRenderGtInitResult;
+struct BdwRenderRunResult;
+void VmmDellRenderRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,
+                      uint32_t (&snapshot)[20*1024],BdwForcewakeAdapterResult& result,BdwRenderRunResult& render);
+void VmmDellRenderGtInit(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRenderGtInitResult& init);
+void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
+void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
+#endif
+void VmmDellForcewakePatTest(uint32_t khz,BdwForcewakeAdapterResult& result,BdwPatTestResult& pat);
+void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines=false,bool patRequested=false,bool tlbRequested=false,bool resetRequested=false,bool scopeCheck=false);
+struct BdwScratchTakeoverResult;
+// Caller pins the exact scratch page/range and establishes device admission;
+// an attempted PTE write leaves both pinned, even if this returns failure.
+void VmmDellForcewakeScratchRun(uint32_t khz,uint32_t index,uint64_t dma,BdwForcewakeAdapterResult& result,BdwScratchTakeoverResult& scratch);
+void VmmDellForcewakeClearStale(uint32_t khz,uint64_t expected,BdwForcewakeAdapterResult& result,BdwScratchTakeoverResult& clear);
+struct BdwBcsInitResult;
+void VmmDellForcewakeBcsInit(uint32_t khz,uint32_t index,uint64_t dma,uint8_t* cpu,
+                             BdwForcewakeAdapterResult& result,BdwBcsInitResult& init);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.

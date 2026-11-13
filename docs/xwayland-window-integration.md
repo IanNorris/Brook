@@ -377,3 +377,53 @@ The compiled entry audit covers both hook arguments, source and target, with
 mutation checks; it remains a structural check. Concurrent termination and
 broader SMP coverage remain. The option defaults off and has not been deployed
 to Dell.
+
+On the physical Dell generation 347, a static musl build of the caught-signal
+fixture confirmed successful `tgkill` submission with `send_result=1` while
+the userspace-only target reported `delivered=0` and exited 3. The same binary
+with a periodic `gettid` syscall in the target loop exited 0. Both variants
+passed on the Linux host. The guest jobs completed with no live descendants.
+This confirms the delivery gap on this Dell boot. The fixture result is
+consistent with the sparse Chromium profiler samples, while the profiler's
+signal handling has not been directly traced. The syscall-control binary
+printed the older no-syscall success label; its command line and receipt record
+the periodic-syscall mode. See `build/hardware/dell-media-20261113/` under
+`gen347-signal-irq-dell-detail` and `gen347-signal-irq-syscall-control`.
+
+An independent review of the experimental IRQ path found the protected
+usercopy region and deferred termination boundary coherent. It identified
+concurrent group termination during blocking or COW signal-frame copy as an
+unverified case. The reviewer also noted that an earlier pending default
+disposition can defer a caught signal, and that the existing opt-in is QEMU
+fw_cfg only. A physical diagnostic needs a separate default-off configuration
+and validation of those cases.
+
+The `signal_irq_termination.c` fixture now uses the existing mapping-test
+usercopy barrier to hold signal-frame copying after prefault. In a disposable
+two-CPU QEMU/TCG boot with `BROOK_MAPPING_TEST_HOOKS=ON` and
+`opt/irq-signal-probe=1`, a privileged parent observed one waiting copy,
+requested `SIGKILL`, and confirmed the child was still unreaped and the
+barrier still held. After release it reaped the child with `SIGKILL`, saw no
+handler execution, and verified its private alternate-stack bytes and a
+subsequent write. The fixture reported `SIGNAL_IRQ_TERMINATION_PASS`. This
+covers termination during the suspended checked copy after prefault. It does
+not establish termination during COW resolution or identify which interrupt
+wrapper delivered the signal. The test-only mapping barrier needed its clock
+read updated to call `ApicTickCount()` directly before the kernel would build.
+The first unprivileged control could not arm the privileged hook. Both
+disposable VMs were stopped by the external timeout. Kernel and fixture hashes,
+build output and serial logs are in
+`build/hardware/dell-media-20261113/irq-signal-termination-qemu/`.
+
+A follow-up test-only kernel logs the interrupt source after claiming the
+caught signal. The marker-enabled two-CPU QEMU boot passed the same
+termination fixture with `source=0` for the timer return. A second boot used
+the existing test-only IPI control and `opt/irq-signal-probe=2`, which disables
+timer-return delivery. It passed with `source=1`. The fixture held the same
+post-prefault usercopy barrier in each run. An otherwise identical boot
+without the marker or fw_cfg option failed to reach the barrier, as expected.
+The new `/etc/irq-signal-probe` marker enables the existing experimental path
+at boot and is absent by default. This marker permits a physical diagnostic;
+it has not been deployed or validated on the Dell. The IPI fixture uses
+`BROOK_REGISTER_TEST_HOOKS` and repeated test-only IPI requests. Logs and
+kernel hashes are in `irq-signal-termination-qemu/`.

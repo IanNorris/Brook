@@ -12,6 +12,9 @@
 #include "mount_namespace.h"
 #include "vfs_path.h"
 #endif
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
+#include "ac_shutdown_record.h"
+#endif
 #include "fatfs_object.h"
 #include "process.h"
 #include "fatfs_glue.h"
@@ -108,6 +111,11 @@ struct FatPrivateMount {
     FatImageLease* leases[2];
     bool inspected;
     bool inspectionSucceeded;
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_SSD_GUARDED_DESKTOP)
+    FatImageLease* acShutdownLease;
+    uint64_t acShutdownSectors[AcShutdownSlots];
+    bool acShutdownReady;
+#endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     Vnode* journalNode;
     FatImageLease* journalLease;
@@ -1790,10 +1798,11 @@ int FatFsGuardFlushReadback(FatImageLease* lease,void* out)
     if(error)lease->error=error;
     KMutexUnlock(&g_fatLock);return error;
 }
-int FatFsJournalSectorMap(FatImageLease* lease,uint64_t* out,uint32_t sectors)
+static int FatFsImageSectorMap(FatImageLease* lease,uint64_t* out,uint32_t sectors)
 {
-    if(out && sectors==PanicJournalSectors)memset(out,0,uint64_t(sectors)*sizeof(*out));
-    if(!lease || !out || sectors!=PanicJournalSectors ||
+    if(!out || !sectors || sectors>PanicJournalSectors)return -22;
+    memset(out,0,uint64_t(sectors)*sizeof(*out));
+    if(!lease ||
        lease->guard || lease->bytes!=uint64_t(sectors)*512)return -22;
     KMutexLock(&g_fatLock);
     auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
@@ -1848,6 +1857,10 @@ int FatFsPrivateRecoveryInspect(FatPrivateMount* session,void* first128,void* se
     session->inspectionSucceeded=!error;
     return error;
 }
+int FatFsJournalSectorMap(FatImageLease* lease,uint64_t* out,uint32_t sectors)
+{
+    return sectors==PanicJournalSectors?FatFsImageSectorMap(lease,out,sectors):-22;
+}
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
 int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
 {
@@ -1869,8 +1882,7 @@ int FatFsPrivateRecoveryPinJournal(FatPrivateMount* session)
     PanicJournalRecord a{},b{};
     if(PanicJournalInspect(reader,0,a)!=PanicJournalResult::Ok ||
        PanicJournalInspect(reader,1,b)!=PanicJournalResult::Ok ||
-       (a.valid && b.valid && a.sequence==b.sequence) ||
-       (!a.valid && !b.valid && (!a.blank || !b.blank)))return -22;
+       !PanicJournalWritable(a,b))return -22;
     // The lease is retained for the boot, including all later failures.
     // Confirm normal FAT aliases cannot reopen or remove this object.
     auto* alias=FatFsOpen(session->mount,session->mount->pdrv,"/panic.bin",VFS_O_STREAM);
@@ -1893,7 +1905,7 @@ int FatFsPrivateRecoveryArmJournalTest(FatPrivateMount* session)
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 int FatFsPrivateRecoveryReadPanic(FatPrivateMount* session,uint8_t* out,uint32_t capacity,
-                                  uint64_t* sequence,uint32_t* bytes,uint32_t* crc)
+                                  uint64_t* sequence,uint32_t* bytes,uint32_t* crc,unsigned rank)
 {
     if(!session || !session->journalReady || !session->journalLease || !out || !sequence || !bytes || !crc)return -22;
     *sequence=0;*bytes=0;*crc=0;
@@ -1903,7 +1915,7 @@ int FatFsPrivateRecoveryReadPanic(FatPrivateMount* session,uint8_t* out,uint32_t
             return sector<PanicJournalSectors && FatFsImageRead(lease,uint64_t(sector)*512,output,512)==512;
         }
     } reader{session->journalLease};
-    PanicJournalRecord record{};const auto result=PanicJournalReadLatest(reader,out,capacity,record);
+    PanicJournalRecord record{};const auto result=PanicJournalReadRanked(reader,out,capacity,record,rank);
     if(result!=PanicJournalResult::Ok)return result==PanicJournalResult::NoValidRecord?-2:-5;
     *sequence=record.sequence;*bytes=record.bytes;*crc=record.checksum;return 0;
 }
@@ -1915,6 +1927,56 @@ int FatFsPrivateRecoveryArmJournal(FatPrivateMount* session)
     if(!device || FatFsJournalSectorMap(session->journalLease,sectors,PanicJournalSectors))return -5;
     return AhciSystemGuardPanicRecoveryArm(device,sectors,PanicJournalSectors)?0:-13;
 }
+#if defined(BROOK_SSD_GUARDED_DESKTOP)
+namespace {
+struct AcShutdownSectorIo {
+    Device* device;
+    const uint64_t (&sectors)[AcShutdownSlots];
+    bool read(unsigned slot,uint8_t* out) {
+        return slot<AcShutdownSlots && device->ops->read(device,sectors[slot]*AcShutdownSectorBytes,
+                     out,AcShutdownSectorBytes)==int(AcShutdownSectorBytes);
+    }
+    bool write(unsigned slot,const uint8_t* in) {
+        return slot<AcShutdownSlots && DeviceWrite(device,sectors[slot]*AcShutdownSectorBytes,
+                     in,AcShutdownSectorBytes)==int(AcShutdownSectorBytes);
+    }
+    bool flush(){return DeviceFlush(device)==0;}
+};
+}
+int FatFsPrivateRecoveryPinAcShutdown(FatPrivateMount* session,AcShutdownRecord& previous)
+{
+    previous={};
+    if(!session || !session->inspectionSucceeded || !session->journalReady || session->acShutdownLease)
+        return -22;
+    auto* node=FatFsOpen(session->mount,session->mount->pdrv,"/RECOVERY/POWER.BIN",VFS_O_WRITE|VFS_O_READWRITE);
+    if(!node)return -2;
+    const int pinned=FatFsAcquireImageLease(node,AcShutdownSlots*AcShutdownSectorBytes,&session->acShutdownLease);
+    VfsRelease(node);
+    if(pinned)return pinned;
+    auto* device=FatFsImageLeaseDevice(session->acShutdownLease);
+    if(!device || device!=FatFsImageLeaseDevice(session->journalLease) ||
+       !device->ops->read || DeviceBlockSize(device)!=AcShutdownSectorBytes ||
+       FatFsImageSectorMap(session->acShutdownLease,session->acShutdownSectors,AcShutdownSlots))return -5;
+    const auto blocks=DeviceBlockCount(device);
+    const auto& sectors=session->acShutdownSectors;
+    if(!sectors[0] || !sectors[1] || sectors[0]>=blocks || sectors[1]>=blocks || sectors[0]==sectors[1])return -22;
+    AcShutdownSectorIo io{device,sectors};
+    AcShutdownSelection selection{};
+    if(!AcShutdownRead(io,selection) || selection.kind[0]==AcShutdownSlotKind::Foreign ||
+       selection.kind[1]==AcShutdownSlotKind::Foreign)return -22;
+    previous=selection.latest;
+    session->acShutdownReady=true;
+    return 0;
+}
+bool FatFsPrivateRecoveryWriteAcShutdown(FatPrivateMount* session,const char (&bootId)[33])
+{
+    if(!session || !session->acShutdownReady || !DeviceFinalSyncOwner())return false;
+    auto* device=FatFsImageLeaseDevice(session->acShutdownLease);
+    if(!AhciSystemGuardShutdownClean(device))return false;
+    AcShutdownSectorIo io{device,session->acShutdownSectors};
+    return AcShutdownWrite(io,bootId);
+}
+#endif
 #endif
 #endif
 #if defined(BROOK_SSD_GUARD_TRANSACTION)

@@ -22,7 +22,7 @@ int main(int argc,char **argv) {
     if(create_checked(dir,data,(size_t)src.st_size,st.st_dev))return 5;
     data[0]^=1;
     if(!create_checked(dir,data,(size_t)src.st_size,st.st_dev))return 6;
-    int output=openat(dir,"BROOKINV.EFI",O_RDONLY);uint8_t first;
+    int output=openat(dir,STAGE_EFI_NAME,O_RDONLY);uint8_t first;
     if(output<0||read(output,&first,1)!=1||first!='M')return 7;
     close(output);close(input);close(dir);free(data);return 0;
 }
@@ -38,4 +38,8 @@ with tempfile.TemporaryDirectory(prefix='brook-efi-stage-') as temporary:
                     str(path/'test.c'), '-o', str(path/'test')], check=True)
     subprocess.run([str(path/'test'), str(path/'target'),
                     str(args.efi.resolve(strict=True))], check=True)
+    (path/'alternate').mkdir()
+    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-DBROOK_EFI_GUARD_STAGE',
+                    '-I', str(ROOT/'tools'),str(path/'test.c'), '-o', str(path/'test-alt')],check=True)
+    subprocess.run([str(path/'test-alt'),str(path/'alternate'),str(args.efi.resolve(strict=True))],check=True)
 print('EFI inventory stage primitives: PASS')

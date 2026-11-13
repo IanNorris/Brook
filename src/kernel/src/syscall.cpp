@@ -35,6 +35,10 @@
 #include "dsp_geometry.h"
 #include "futex_timeout.h"
 #include "sync_file.h"
+#include "gpu_output_abi.h"
+#include "gpu_buffer_abi.h"
+#include "gpu_window_source_abi.h"
+#include "desktop_layers_export.h"
 #include "gpu_reservation.h"
 #include "busybox_applets.h"
 #include "cpu.h"
@@ -49,6 +53,11 @@
 #include "exec_limits.h"
 #include "drm_map_tokens.h"
 #include "drm_backing_diagnostics.h"
+#include "intel_bdw_buffer.h"
+#include "intel_bdw_file.h"
+#include "intel_bdw_ioctl.h"
+#include "intel_bdw_scanout.h"
+#include "debug_hardware.h"
 #include "sync/ksemaphore.h"
 #include "exec_image.h"
 #include "fpu_irq.h"
@@ -480,7 +489,7 @@ static void WakeProcess(Process* proc)
 #include "pipe_poll.inc"
 
 static void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
-static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1)kfree(file); }
+static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1){BdwFenceUnref(file->intelFence);kfree(file);} }
 
 // EventFd data structure (used in read/write/poll/close)
 struct EventFdData {
@@ -1492,6 +1501,7 @@ struct UnixSocketData {
     UnixCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
     uint64_t peerIncarnation,peerLaunchId;
     bool acceptedEndpoint; // Only accept(), never connect() or socketpair().
+    bool gpuPeerAuthorized; // exact connected renderer was checked while attached
     char    path[108];
     Vnode* boundNode; // Owns an inode pin even after unlink; close never unlinks.
     uint64_t boundDev, boundIno;
@@ -2280,7 +2290,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     // Write to /dev/fb0 signals a frame is complete (sets dirty flag).
     if (fde->type == FdType::DevFramebuf)
     {
-        proc->fbDirty = 1;
+        ProcessFramebufferMarkDirty(proc);
         CompositorWake();
         return static_cast<int64_t>(count);
     }
@@ -3236,6 +3246,15 @@ static const DrmSysAttr kDrmSysAttrs[] = {
     { "/sys/dev/char/226:128/device/revision",         "0x00\n" },
     { nullptr, nullptr }
 };
+static const DrmSysAttr kIntelDrmSysAttrs[] = {
+    { "/sys/dev/char/226:129/device/uevent", "DRIVER=i915\nPCI_SLOT_NAME=0000:00:02.0\n" },
+    { "/sys/dev/char/226:129/device/vendor", "0x8086\n" },
+    { "/sys/dev/char/226:129/device/device", "0x1616\n" },
+    { "/sys/dev/char/226:129/device/subsystem_vendor", "0x1028\n" },
+    { "/sys/dev/char/226:129/device/subsystem_device", "0x0665\n" },
+    { "/sys/dev/char/226:129/device/revision", "0x09\n" },
+    { nullptr,nullptr }
+};
 // Directories that must stat as S_IFDIR (realpath / openat / drmNodeIsDRM).
 static const char* kDrmSysDirs[] = {
     "/sys/dev/char/226:128/device",
@@ -3257,6 +3276,12 @@ static bool DrmSysIsDir(const char* path) {
         if (StrEq(path, *d)) return true;
     return false;
 }
+static const char* IntelDrmSysAttrContent(const char* path){
+    for(auto* a=kIntelDrmSysAttrs;a->path;++a)if(StrEq(path,a->path))return a->content;
+    return nullptr;
+}
+static bool IntelDrmSysIsDir(const char* path){return StrEq(path,"/sys/dev/char/226:129/device") ||
+    StrEq(path,"/sys/dev/char/226:129/device/drm");}
 
 // Per-fd DRM render-node state (GL shim M1). Each open("/dev/dri/renderD128")
 // gets one. Holds the app's GpuApp (virgl) context id plus a per-fd GEM-handle
@@ -3458,6 +3483,7 @@ DrmBackingDiagnostics DrmBackingDiagnosticsRead() {
 struct AtLookup {
     FsSnapshot fs{};
     VfsPath directory{};
+    bool drmDirectory=false;
     const VfsPath& start() const { return directory.object?directory:fs.cwd; }
     void Clear() { VfsPathRelease(directory);directory={};FsSnapshotRelease(&fs); }
     ~AtLookup() { Clear(); }
@@ -3469,12 +3495,31 @@ struct AtLookup {
         if(fd==-100)return 0;
         FdRef ref(ProcessCurrent(),fd);
         if(!ref)return -EBADF;
+        if(ref->type==FdType::SyntheticMem && ref->handle==g_drmDriDirTag){
+            const bool intel=brook::BdwIntelUserNodeEnabled();
+            if(!GpuAppGet() && !intel)return -ENOTDIR;
+            bool allowed=false;error=VfsCanonicalDrmBrokerAllowed(fs.root,false,&allowed,!GpuAppGet() && intel);
+            if(error)return error;if(!allowed)return -ENOTDIR;
+            // Resolve the retained canonical directory in the caller's root;
+            // SyntheticName will revalidate its visible identity and broker
+            // each child before dispatch, including after mount changes.
+            error=VfsPathResolve(fs.root,fs.root,"/dev/dri",&directory);
+            if(!error)drmDirectory=true;
+            return error;
+        }
         if((ref->type!=FdType::Vnode && ref->type!=FdType::Path) || !ref->handle)return -ENOTDIR;
         auto* vnode=static_cast<Vnode*>(ref->handle);
         if(vnode->type!=VnodeType::Dir)return -ENOTDIR;
         return VfsPathFromVnode(vnode,&directory);
     }
     int BrokerAllowed(const char* absolute,bool* allowed) const {
+        if(brook::BdwIntelUserNodeEnabled()){
+            const bool node=StrEq(absolute,"/dev/dri/renderD129");
+            const bool sysfs=IntelDrmSysIsDir(absolute) || IntelDrmSysAttrContent(absolute) ||
+                StrEq(absolute,"/sys/dev/char/226:129/device/subsystem");
+            if(node || sysfs)return VfsCanonicalDrmBrokerAllowed(fs.root,sysfs,allowed,true);
+            if(StrEq(absolute,"/dev/dri") && !GpuAppGet())return VfsCanonicalDrmBrokerAllowed(fs.root,false,allowed,true);
+        }
         if(GpuAppGet()) {
             const bool device=StrEq(absolute,"/dev/dri") || StrEq(absolute,"/dev/dri/renderD128");
             const bool sysfs=DrmSysIsDir(absolute) || DrmSysAttrContent(absolute) ||
@@ -3487,6 +3532,13 @@ struct AtLookup {
     // normal filesystem operations. Reject hidden retained starts: a current
     // global label must not redirect a lower cwd into an overmount.
     int SyntheticName(const char* text,char* out,uint32_t capacity) const {
+        if(drmDirectory && (StrEq(text,"renderD128") || StrEq(text,"renderD129"))){
+            const char* prefix="/dev/dri/";const uint32_t prefixLen=9,suffixLen=uint32_t(strlen(text));
+            if(prefixLen+suffixLen+1>capacity)return -36;
+            memcpy(out,prefix,prefixLen);memcpy(out+prefixLen,text,suffixLen+1);
+            bool allowed=false;const int error=BrokerAllowed(out,&allowed);
+            return error?error:allowed?0:-95;
+        }
         if(text[0]=='/') {
             size_t bytes=strlen(text)+1;if(bytes>capacity)return -36;
             memcpy(out,text,bytes);bool allowed=false;
@@ -3636,6 +3688,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     if(StrEq(syntheticPath,"keyboard") || StrEq(syntheticPath,"/dev/fb0") || StrEq(syntheticPath,"/dev/keyboard") ||
        StrEq(syntheticPath,"/dev/tty") || StrEq(syntheticPath,"/dev/console") ||
        StrEq(syntheticPath,"/dev/dri/renderD128") ||
+       StrEq(syntheticPath,"/dev/dri/renderD129") ||
        StrEq(syntheticPath,"/dev/random") ||
        StrEq(syntheticPath,"/dev/klog") || StrEq(syntheticPath,"/dev/dsp")) {
         const char* deviceName=StrEq(syntheticPath,"keyboard")?"/dev/keyboard":syntheticPath;
@@ -3692,6 +3745,16 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // drive it. Only the render node (no card0/KMS) is offered. Available only
     // when a 3D driver has registered GpuAppOps. (GL shim — see
     // artifacts/gl-drm-enumeration-spike.md.)
+    if(StrEq(syntheticPath,"/dev/dri/renderD129") && brook::BdwIntelUserNodeEnabled()){
+        if((flags&0xc0)==0xc0)return -EEXIST;
+        if((flags&3)==3 || (flags&0x10000))return -EINVAL;
+        auto* file=brook::BdwGpuFileCreate();if(!file)return -ENOMEM;
+        FdEntry owned{};owned.type=FdType::DevIntelDri;owned.handle=file;
+        owned.statusFlags=static_cast<uint32_t>(flags)&~(0x80000u|0x40u|0x80u|0x200u);
+        owned.fdFlags=(flags&0x80000u)?1:0;
+        const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        if(fd<0){brook::BdwGpuFileUnref(file);return -EMFILE;}return fd;
+    }
     if (StrEq(syntheticPath, "/dev/dri/renderD128"))
     {
         if (!brook::GpuAppGet()) return -ENODEV;
@@ -3712,7 +3775,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // /dev/dri directory — enumerable so libdrm's drmGetDevices2 can list the
     // render node. Allocate a synthetic-directory fd (recognised by the marker
     // handle in getdents64/fstat). Only when a 3D driver is present.
-    if (StrEq(syntheticPath, "/dev/dri") && brook::GpuAppGet())
+    if (StrEq(syntheticPath, "/dev/dri") && (brook::GpuAppGet() || brook::BdwIntelUserNodeEnabled()))
     {
         int fd = FdAlloc(proc, FdType::SyntheticMem,
                          const_cast<char*>(g_drmDriDirTag));
@@ -3734,6 +3797,11 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             proc->fds[fd].seekPos = 0;
             return fd;
         }
+    }
+    if(brook::BdwIntelUserNodeEnabled()){
+        const char* attr=IntelDrmSysAttrContent(syntheticPath);
+        if(attr){int fd=FdAlloc(proc,FdType::SyntheticMem,const_cast<char*>(attr));if(fd<0)return -EMFILE;
+            proc->fds[fd].seekPos=0;return fd;}
     }
 
     // /dev/null — discard writes, EOF on read
@@ -4104,6 +4172,9 @@ void FinalizeClosedFd(const FdClaimResult& c)
         DrmOwnerUnref(dctx->owner);
         kfree(dctx);
     }
+    if(c.type==FdType::DevIntelDri && c.handle)brook::BdwGpuFileUnref(static_cast<brook::BdwGpuFile*>(c.handle));
+    if(c.type==FdType::IntelPrime && c.handle)brook::BdwGpuBufferUnref(static_cast<brook::BdwGpuBuffer*>(c.handle));
+    if(c.type==FdType::IntelSyncObj && c.handle)brook::BdwGpuSyncUnref(static_cast<brook::BdwGpuSync*>(c.handle));
 
     if (c.type == FdType::DevTty && c.handle)
     {
@@ -4299,6 +4370,12 @@ static void FdBumpRefcount(const FdEntry* fde)
     case FdType::DevDri:
         __atomic_fetch_add(&static_cast<DrmCtx*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
         break;
+    case FdType::DevIntelDri:
+        brook::BdwGpuFileRef(static_cast<brook::BdwGpuFile*>(fde->handle));break;
+    case FdType::IntelPrime:
+        brook::BdwGpuBufferRef(static_cast<brook::BdwGpuBuffer*>(fde->handle));break;
+    case FdType::IntelSyncObj:
+        brook::BdwGpuSyncRef(static_cast<brook::BdwGpuSync*>(fde->handle));break;
     case FdType::DrmPrime:
         DrmPrimeRef(static_cast<DrmPrimeObj*>(fde->handle));
         break;
@@ -4437,6 +4514,12 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
 #endif
     if(fde->type==FdType::SignalFd)return whence<=4?0:-EINVAL; // Linux noop_llseek
     if(fde->type==FdType::SyncFile)return -29; // ESPIPE
+    // DMA-BUF exposes its immutable size through SEEK_END, not arbitrary seeks.
+    if(fde->type==FdType::IntelPrime) {
+        if(!fde->handle || offset!=0)return -EINVAL;
+        if(whence==SEEK_END)return static_cast<int64_t>(brook::BdwGpuBufferBytes(static_cast<brook::BdwGpuBuffer*>(fde->handle)));
+        return whence==SEEK_SET?0:-EINVAL;
+    }
 
     if(fde->type==FdType::Path)return -EBADF;
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)return -29;
@@ -4505,6 +4588,8 @@ struct DeviceMappingBacking {
     uint64_t kernelBase, physicalBase;
     bool borrowedPhysical;
     MappingBacking* resourceLifetime;
+    brook::BdwGpuBuffer* intelBuffer;
+    uint64_t intelPageOffset;
 };
 struct MappingBackingGuard {
     MappingBacking* value = nullptr;
@@ -4533,8 +4618,11 @@ static int PrepareFileMapping(MappingTransaction& operation, const UserMappingRe
 static int PrepareDeviceMapping(MappingTransaction& operation, const UserMappingRequest& request, void*) {
     const auto* source = static_cast<DeviceMappingBacking*>(request.range.backing->object);
     for (uint64_t page=0;page<request.preparedPages;++page) {
+        const uint64_t kernelAddress=source->intelBuffer ?
+            brook::BdwGpuBufferPageKernelAddress(source->intelBuffer,static_cast<uint32_t>(source->intelPageOffset+page)) :
+            source->kernelBase+page*4096;
         auto physical = source->borrowedPhysical ? PhysicalAddress(source->physicalBase+page*4096) :
-            VmmVirtToPhys(KernelPageTable,VirtualAddress(source->kernelBase+page*4096));
+            VmmVirtToPhys(KernelPageTable,VirtualAddress(kernelAddress));
         if (!physical) return -ENOMEM;
         if (!source->borrowedPhysical) PmmRefPage(physical);
         if (!operation.StagePage(page,physical,!source->borrowedPhysical)) {
@@ -4615,13 +4703,23 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         request.range.backing=backing.value;
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
-    if (entry->type == FdType::DevDri || entry->type == FdType::DevFramebuf) {
+    if (entry->type == FdType::DevDri || entry->type == FdType::DevIntelDri || entry->type == FdType::DevFramebuf) {
         auto* source=static_cast<DeviceMappingBacking*>(kmalloc(sizeof(DeviceMappingBacking)));
         if (!source) return -ENOMEM;
         *source={};backing.value=MappingBackingCreate(source,ReleaseDeviceMapping);
         if (!backing.value) { kfree(source);return -ENOMEM; }
         uint64_t available=0;
-        if (entry->type == FdType::DevDri) {
+        if(entry->type == FdType::DevIntelDri){
+            if(!(flags&MAP_SHARED))return -EINVAL;
+            auto* file=static_cast<brook::BdwGpuFile*>(entry->handle);uint64_t relative=0;
+            auto* buffer=brook::BdwGpuFileGetMapping(file,offset,request.length,relative);
+            if(!buffer)return -EINVAL;
+            source->resourceLifetime=brook::BdwGpuBufferBacking(buffer);
+            MappingBackingRef(source->resourceLifetime);
+            source->intelBuffer=buffer;source->intelPageOffset=relative/4096;
+            available=brook::BdwGpuBufferBytes(buffer)-relative;
+            brook::BdwGpuBufferUnref(buffer);
+        } else if (entry->type == FdType::DevDri) {
             auto* context=static_cast<DrmCtx*>(entry->handle);if (!context) return -ENODEV;
             DrmMappingGuard guard(context);
             auto* gem=DrmFindMapToken(context->gem,DRM_MAX_GEM,offset);
@@ -6762,6 +6860,17 @@ static int CreateCompletedSyncFile(Process* process) {
     if(fd<0)SyncFileUnref(file);
     return fd;
 }
+static int CreateIntelSyncFile(Process* process,BdwFence* fence) {
+    if(!process || !fence)return -EINVAL;
+    auto* file=static_cast<SyncFileData*>(kmalloc(sizeof(SyncFileData)));
+    if(!file)return -ENOMEM;
+    BdwFenceRef(fence);
+    *file={1,0,__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED),fence};
+    FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;
+    const int fd=FdTablePublishOwnedPinned(process->fds,ProcessFdLock(process),owned);
+    if(fd<0)SyncFileUnref(file);
+    return fd;
+}
 // Adopts the pin installed atomically by CreateCompletedSyncFile; no second
 // lookup/pin is allowed because a sibling may already have logically closed it.
 struct SyncFilePublicationPin {
@@ -7259,6 +7368,110 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     }
 }
 
+// The Intel file type is not published yet. These operations provide the
+// real GEM handle/mmap substrate for a future admitted i915 render node;
+// unsupported execution and cache modes fail rather than report success.
+static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg) {
+    // Exec preparation and admission retain stack-owned ledger nodes and
+    // snapshots across user copies and sleepable locks. A fatal signal must
+    // unwind those objects before the scheduler may retire this thread.
+    KernelOperationGuard operation(ProcessCurrent());
+    brook::BdwI915UserAccess user{nullptr,
+        [](void*,void* dst,uint64_t src,uint64_t n){return CopyFromUser(dst,src,n);},
+        [](void*,uint64_t dst,uint64_t n){return UserBufferWritable(dst,n);},
+        [](void*,uint64_t dst,const void* src,uint64_t n){return CopyToUser(dst,src,n);},
+        [](void*){return ClockNowNs(1);},
+        [](void*,uint64_t){auto* self=ProcessCurrent();if(!self || HasPendingSignals())return false;
+            self->wakeupTick=ApicTickCount()+1;SchedulerBlockInterruptible(self);return !HasPendingSignals();}};
+    if(auto* current=ProcessCurrent()){
+        user.submitterPid=current->pid;
+        user.submitterIncarnation=current->leaderIncarnation?current->leaderIncarnation:current->incarnation;
+    }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(!brook::BdwRenderExperimentEnabled())brook::DebugHardwareAutoInitializeIntel();
+    if(brook::BdwRenderExperimentEnabled()){
+        user.submit=brook::BdwSubmitRenderExperiment;user.renderExperiment=true;
+        user.handoffSubmit=brook::BdwOffscreenHandoffSubmit;
+    } else if(brook::BdwStoreProbeEnabled())user.submit=brook::BdwSubmitStoreProbe;
+    if(user.submit){user.beginExec=brook::BdwBeginRenderPreparation;user.endExec=brook::BdwEndRenderPreparation;}
+#endif
+    // Plain syncobj descriptors retain the mutable object. Flag 1 instead
+    // transfers an immutable fence through a sync-file descriptor.
+    struct IntelSyncHandle {uint32_t handle,flags;int32_t fd;uint32_t pad;uint64_t point;};
+    const uint32_t ioctlSize=uint32_t((cmd>>16)&0x3fff);
+    if(user.renderExperiment && ((cmd>>8)&255)=='d' && ((cmd&255)==0xc1 || (cmd&255)==0xc2) &&
+       (ioctlSize==16 || ioctlSize==sizeof(IntelSyncHandle))){
+        IntelSyncHandle request{};
+        if(!CopyFromUser(&request,arg,ioctlSize) || !UserBufferWritable(arg,ioctlSize))return -EFAULT;
+        if((request.flags&~3u) || request.pad || (!(request.flags&1u) && request.point))return -EINVAL;
+        const uint64_t point=(request.flags&2u)?request.point:0;
+        auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+        if(request.flags==1 || request.flags==3){
+            auto* sync=brook::BdwGpuFileGetSync(file,request.handle);if(!sync)return -ENOENT;
+            if((cmd&255)==0xc1){
+                auto* fence=point?brook::BdwGpuSyncFindTimeline(sync,point):brook::BdwGpuSyncAcquire(sync);
+                brook::BdwGpuSyncUnref(sync);
+                if(!fence)return -EINVAL;
+                const int fd=CreateIntelSyncFile(proc,fence);brook::BdwFenceUnref(fence);
+                if(fd<0)return fd;
+                SyncFilePublicationPin publication(proc,fd);
+                request.fd=fd;if(!CopyToUser(arg,&request,ioctlSize)){CloseProcessFd(proc,fd);return -EFAULT;}
+                return 0;
+            }
+            FdRef reference(proc,request.fd);auto* entry=reference.get();
+            if(!entry || entry->type!=FdType::SyncFile || !entry->handle){brook::BdwGpuSyncUnref(sync);return -EINVAL;}
+            auto* source=static_cast<SyncFileData*>(entry->handle);
+            BdwFence* fence=source->intelFence;
+            if(fence)BdwFenceRef(fence);else fence=BdwFenceCreate(true,nullptr,0,nullptr,source->timestampNs);
+            if(!fence){brook::BdwGpuSyncUnref(sync);return -ENOMEM;}
+            const bool ok=point?brook::BdwIntelSyncPointAdmitted(sync,point,fence):brook::BdwIntelSyncReplaceAdmitted(sync,fence);
+            BdwFenceUnref(fence);brook::BdwGpuSyncUnref(sync);return ok?0:-EINVAL;
+        }
+        if((cmd&255)==0xc1){
+            auto* sync=brook::BdwGpuFileGetSync(file,request.handle);if(!sync)return -ENOENT;
+            FdEntry owned{};owned.type=FdType::IntelSyncObj;owned.handle=sync;owned.fdFlags=1;
+            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            if(fd<0){brook::BdwGpuSyncUnref(sync);return -EMFILE;}
+            request.fd=fd;if(!CopyToUser(arg,&request,ioctlSize)){CloseProcessFd(proc,fd);return -EFAULT;}
+            return 0;
+        }
+        FdRef reference(proc,request.fd);auto* entry=reference.get();
+        if(!entry || entry->type!=FdType::IntelSyncObj || !entry->handle)return -EINVAL;
+        request.handle=brook::BdwGpuFileImportSync(file,static_cast<brook::BdwGpuSync*>(entry->handle));
+        if(!request.handle)return -ENOMEM;
+        if(!CopyToUser(arg,&request,ioctlSize)){brook::BdwGpuFileDestroySync(file,request.handle);return -EFAULT;}
+        return 0;
+    }
+    // Keep Intel PRIME private to the explicit render experiment until its
+    // synchronization and compositor consumers are implemented and tested.
+    if(user.renderExperiment && ((cmd>>8)&255)=='d' && ((cmd>>16)&0x3fff)==sizeof(DrmPrimeHandle) &&
+       ((cmd&255)==DRM_NR_PRIME_HANDLE_TO_FD || (cmd&255)==DRM_NR_PRIME_FD_TO_HANDLE)){
+        DrmPrimeHandle request{};
+        if(!CopyFromUser(&request,arg,sizeof(request)) || !UserBufferWritable(arg,sizeof(request)))return -EFAULT;
+        auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+        if((cmd&255)==DRM_NR_PRIME_HANDLE_TO_FD){
+            if(request.flags&~(0x80000u|2u))return -EINVAL; // DRM_CLOEXEC | DRM_RDWR
+            auto* buffer=brook::BdwGpuFileGetBuffer(file,request.handle);if(!buffer)return -ENOENT;
+            FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;
+            owned.fdFlags=(request.flags&0x80000u)?1:0;owned.statusFlags=(request.flags&2)?2:0;
+            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            if(fd<0){brook::BdwGpuBufferUnref(buffer);return -EMFILE;}
+            request.fd=fd;
+            if(!CopyToUser(arg,&request,sizeof(request))){CloseProcessFd(proc,fd);return -EFAULT;}
+            return 0;
+        }
+        if(request.flags)return -EINVAL;
+        FdRef prime(proc,request.fd);auto* entry=prime.get();
+        if(!entry || entry->type!=FdType::IntelPrime || !entry->handle)return -EINVAL;
+        request.handle=brook::BdwGpuFileImportBuffer(file,static_cast<brook::BdwGpuBuffer*>(entry->handle));
+        if(!request.handle)return -ENOMEM;
+        // On an exceptional copyout failure the alias remains until the file
+        // closes: removing it could revoke a concurrent successful import.
+        return CopyToUser(arg,&request,sizeof(request))?0:-EFAULT;
+    }
+    return brook::BdwIntelRenderIoctl(file,cmd,arg,user);
+}
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
@@ -7314,6 +7527,34 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // libsync uses this query to distinguish a sync_file from an arbitrary fd.
     if(cmd==SYNC_FILE_INFO_IOCTL)return -25;
 
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(fde->type==FdType::IntelPrime && cmd==0x40086203) { // DMA_BUF_IOCTL_IMPORT_SYNC_FILE
+        if(!fde->handle)return -EBADF;
+        auto* target=static_cast<BdwGpuBuffer*>(fde->handle);
+        if(!BdwGpuBufferAllowsUserMapping(target))return -13; // EACCES
+        struct ImportFence {uint32_t flags;int32_t fd;} request{};
+        if(!CopyFromUser(&request,arg,sizeof(request)))return -EFAULT;
+        if(!request.flags || (request.flags&~3u) || request.fd<0)return -EINVAL;
+        KernelOperationGuard operation(proc);
+        FdRef source(proc,request.fd);
+        if(!source || source->type!=FdType::SyncFile || !source->handle)return -EINVAL;
+        auto* file=static_cast<const SyncFileData*>(source->handle);
+        // Consume the immutable dependency synchronously. No descriptor or
+        // reservation lock is held while waiting. This compatibility path
+        // never reports success for an outstanding writer or reader.
+        const uint64_t deadline=TimeoutAddSafe(ClockNowNs(1),5000000000ULL);
+        for(;;) {
+            const uint32_t state=SyncFileState(*file);
+            if(state==1)return 0;
+            if(state==2)return -EIO;
+            if(proc->terminalPending || HasPendingSignals())return -EINTR;
+            if(ClockNowNs(1)>=deadline)return -ETIMEDOUT;
+            proc->wakeupTick=ApicTickCount()+1;
+            SchedulerBlockInterruptible(proc);
+        }
+    }
+#endif
+
     if(fde->type==FdType::DrmPrime) {
         if(!fde->handle)return -EBADF;
         struct FenceIoctl {uint32_t flags;int32_t fd;};
@@ -7328,6 +7569,10 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if(request.fd<0)return -EINVAL;
             FdRef source(proc,request.fd);
             if(!source || source->type!=FdType::SyncFile || !source->handle)return -EINVAL;
+            // Virtgpu currently imports completed fences only; a live Intel
+            // fence cannot be silently treated as already synchronized.
+            const uint32_t sourceState=SyncFileState(*static_cast<SyncFileData*>(source->handle));
+            if(sourceState!=1)return sourceState==2?-EIO:-EAGAIN;
             KMutexLock(&resource->reservationLock);
             const bool accepted=resource->reservation.ImportCompleted(request.flags);
             KMutexUnlock(&resource->reservationLock);
@@ -7408,6 +7653,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         return 0;
     }
 
+    if(fde->type==FdType::DevIntelDri)return IntelRenderIoctl(static_cast<brook::BdwGpuFile*>(fde->handle),cmd,arg);
     if (fde->type == FdType::DevDri)
     {
         uint8_t type = static_cast<uint8_t>((cmd >> 8) & 0xFF);
@@ -8165,17 +8411,18 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         return true;
     }
 #endif
-    if (!brook::GpuAppGet()) return false;
-    if (StrEq(path, "/dev/dri/renderD128"))
+    const bool virt=brook::GpuAppGet()!=nullptr,intel=brook::BdwIntelUserNodeEnabled();
+    if(!virt && !intel)return false;
+    if ((virt && StrEq(path, "/dev/dri/renderD128")) || (intel && StrEq(path,"/dev/dri/renderD129")))
     {
         memset(st, 0, sizeof(*st));
         st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
-        st->st_rdev = DRM_RENDER_RDEV;
+        st->st_rdev = intel && StrEq(path,"/dev/dri/renderD129")?DRM_RENDER_RDEV+1:DRM_RENDER_RDEV;
         st->st_nlink = 1;
         st->st_blksize = 4096;
         return true;
     }
-    if (StrEq(path, "/dev/dri") || DrmSysIsDir(path))
+    if (StrEq(path, "/dev/dri") || (virt && DrmSysIsDir(path)) || (intel && IntelDrmSysIsDir(path)))
     {
         memset(st, 0, sizeof(*st));
         st->st_mode = 0040755; // S_IFDIR | rwxr-xr-x
@@ -8183,7 +8430,8 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         st->st_blksize = 4096;
         return true;
     }
-    const char* drmAttr = DrmSysAttrContent(path);
+    const char* drmAttr = virt?DrmSysAttrContent(path):nullptr;
+    if(!drmAttr && intel)drmAttr=IntelDrmSysAttrContent(path);
     if (drmAttr)
     {
         uint64_t len = 0; while (drmAttr[len]) ++len;
@@ -8381,11 +8629,11 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
 
     // GL shim: /dev/dri/renderD128 is a char device (libdrm fstats the open fd
     // to recover major:minor for its sysfs lookups).
-    if (fde->type == FdType::DevDri) {
+    if (fde->type == FdType::DevDri || fde->type == FdType::DevIntelDri) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR | rw-rw-rw-
-        st->st_rdev = DRM_RENDER_RDEV;
+        st->st_rdev = fde->type==FdType::DevIntelDri ? DRM_RENDER_RDEV+1 : DRM_RENDER_RDEV;
         st->st_nlink = 1;
         st->st_blksize = 4096;
         return 0;
@@ -8433,6 +8681,17 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
         st->st_nlink = 1;
         st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
         st->st_blksize = 4096;
+        return 0;
+    }
+
+    if (fde->type==FdType::IntelPrime && fde->handle) {
+        auto* buffer=static_cast<brook::BdwGpuBuffer*>(fde->handle);
+        memset(st,0,sizeof(LinuxStat));
+        st->st_dev=0x42524b01; // boot-local Intel PRIME identity namespace
+        st->st_ino=brook::BdwGpuBufferIdentity(buffer);
+        st->st_mode=0100600;st->st_nlink=1;st->st_blksize=4096;
+        st->st_size=static_cast<int64_t>(brook::BdwGpuBufferBytes(buffer));
+        st->st_blocks=(st->st_size+511)/512;
         return 0;
     }
 
@@ -8560,11 +8819,13 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // so libdrm's drmGetDevices2 can discover the render node.
     if (fde->type == FdType::SyntheticMem && fde->handle == g_drmDriDirTag)
     {
-        static const char* driEntries[] = { ".", "..", "renderD128" };
+        const char* driEntries[4]={".","..",nullptr,nullptr};uint32_t entries=2;
+        if(brook::GpuAppGet())driEntries[entries++]="renderD128";
+        if(brook::BdwIntelUserNodeEnabled())driEntries[entries++]="renderD129";
         auto* obuf = reinterpret_cast<uint8_t*>(bufAddr);
         uint64_t opos = 0;
         uint32_t ck = static_cast<uint32_t>(fde->seekPos);
-        while (ck < 3)
+        while (ck < entries)
         {
             const char* nm = driEntries[ck];
             uint64_t nameLen = 0;
@@ -9359,7 +9620,7 @@ retry_poll:
         }
 
         if(fde->type==FdType::SyncFile && fde->handle) {
-            fds[i].revents|=SyncFileReady(fds[i].events);
+            fds[i].revents|=SyncFileReady(*static_cast<SyncFileData*>(fde->handle),fds[i].events);
             if(fds[i].revents)++ready;
             continue;
         }
@@ -9702,7 +9963,8 @@ static int64_t DoReadlink(const char* original,uint64_t bufAddr,uint64_t bufsiz,
     // GL shim (M0): the DRM device's 'subsystem' symlink. libdrm's
     // get_subsystem_type() readlinks this and matches the basename to classify
     // the bus; returning ".../pci" yields DRM_BUS_PCI for the virtio-gpu node.
-    if (StrEq(path, "/sys/dev/char/226:128/device/subsystem") && brook::GpuAppGet())
+    if ((StrEq(path, "/sys/dev/char/226:128/device/subsystem") && brook::GpuAppGet()) ||
+        (StrEq(path, "/sys/dev/char/226:129/device/subsystem") && brook::BdwIntelUserNodeEnabled()))
     {
         const char* tgt = "/sys/bus/pci";
         uint64_t slen = 0; while (tgt[slen]) ++slen;
@@ -9941,7 +10203,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
 
     if(fde->type==FdType::NetlinkSocket)return NetlinkReady(static_cast<NetlinkSocket*>(fde->handle),events);
     if(FdNamedFifo(fde))return NamedFifoReady(fde,events);
-    if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(events);
+    if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(*static_cast<SyncFileData*>(fde->handle),events);
     if(fde->type==FdType::SignalFd && fde->handle)
         return SignalFdReady(ProcessCurrent(),static_cast<SignalFd*>(fde->handle),events);
 
@@ -10070,7 +10332,7 @@ struct EpollWalk {
         auto* fde = pin(entry.fd);
         if(fde && fde->type==FdType::SyncFile && fde->handle && (entry.events&(EPOLLET|EPOLLONESHOT))) {
             auto* fence=static_cast<SyncFileData*>(fde->handle);
-            EventFdSnapshot snapshot{fence->identity,1,0,SyncFileReady(entry.events)};
+            EventFdSnapshot snapshot{fence->identity,1,0,SyncFileReady(*fence,entry.events)};
             if(captured)*captured=snapshot;
             return entry.eventFdIdentity!=fence->identity ? snapshot.ready : 0;
         }
@@ -12318,6 +12580,30 @@ static int64_t sys_brook_wm_signal_dirty(uint64_t wmId, uint64_t, uint64_t,
     return 0;
 }
 
+static int64_t sys_brook_wm_publish_source_commit(uint64_t wmId,uint64_t incarnation,uint64_t commit,
+                                                   uint64_t a,uint64_t b,uint64_t c)
+{
+    Process* proc=ProcessCurrent();
+    if(!proc)return -ESRCH;
+    if(!wmId || wmId>0xffffffffULL || a || b || c)return -EINVAL;
+    return brook::WmPublishSourceCommit(proc,static_cast<uint32_t>(wmId),incarnation,commit);
+}
+static int64_t sys_brook_wm_begin_source_write(uint64_t wmId,uint64_t incarnation,uint64_t a,
+                                                uint64_t b,uint64_t c,uint64_t d)
+{
+    Process* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    if(!wmId || wmId>0xffffffffULL || a || b || c || d)return -EINVAL;
+    return brook::WmBeginSourceWrite(proc,static_cast<uint32_t>(wmId),incarnation);
+}
+static int64_t sys_brook_wm_query_source_commit(uint64_t wmId,uint64_t incarnation,uint64_t generation,
+                                                 uint64_t output,uint64_t a,uint64_t b)
+{
+    if(!wmId || wmId>0xffffffffULL || !output || a || b || !UserBufferWritable(output,sizeof(uint64_t)))return -EINVAL;
+    uint64_t commit=0;const auto result=brook::WmQuerySourceCommit(static_cast<uint32_t>(wmId),incarnation,generation,&commit);
+    if(result)return result;
+    return CopyToUser(output,&commit,sizeof(commit))?0:-EFAULT;
+}
+
 // 525: WM_PRESENT_GRES(wmId, gres, w, h) — present a hardware-GL (dmabuf) frame.
 // waylandd resolves a client's dmabuf to a host virgl resource id (gres) and
 // calls this to wait for a compositor-owned capture of the source frame.
@@ -12386,6 +12672,283 @@ static int64_t sys_brook_wm_window_state(uint64_t window, uint64_t incarnation,
     const int result = brook::WmSnapshotOwnedWindowState(proc, static_cast<uint32_t>(window), incarnation, &state);
     if (result) return result;
     return CopyToUser(output, &state, sizeof(state)) ? 0 : -EFAULT;
+}
+
+static_assert(BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_WM_APPEARANCE &&
+              BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_WM_TASKBAR_METRICS &&
+              BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_AUDIO_CONTROL &&
+              BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_DEBUG_FRAME &&
+              BROOK_SYS_GPU_OUTPUT_ALLOC!=BROOK_SYS_AHCI_EXPORT,
+              "GPU output syscall must not overlap existing Brook extensions");
+static int64_t sys_brook_gpu_output_alloc(uint64_t bytes,uint64_t flags,uint64_t a,uint64_t b,uint64_t c,uint64_t d)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(!bytes || bytes>BROOK_GPU_OUTPUT_MAX_BYTES || flags || a || b || c || d)return -EINVAL;
+    if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    auto* buffer=brook::BdwGpuBufferCreateHandoff(bytes);if(!buffer)return -ENOMEM;
+    FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;
+    const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+    if(fd<0)brook::BdwGpuBufferUnref(buffer);
+    return fd;
+#else
+    (void)bytes;(void)flags;(void)a;(void)b;(void)c;(void)d;return -ENODEV;
+#endif
+}
+
+static_assert(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ==0xB1B && BROOK_SYS_GPU_BUFFER_TRY_CPU_READ!=BROOK_SYS_DESKTOP_OVERLAY,
+              "GPU shared-buffer syscall must be distinct");
+static int64_t sys_brook_gpu_buffer_try_cpu_read(uint64_t fd,uint64_t flags,uint64_t a,uint64_t b,uint64_t c,uint64_t d)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(flags || a || b || c || d)return -EINVAL;
+    if(fd>=MAX_FDS)return -EBADF;
+    FdRef ref(proc,static_cast<int>(fd));if(!ref)return -EBADF;
+    auto* entry=ref.get();
+    if(entry->type!=FdType::IntelPrime || !entry->handle)return -95; // ENOTSUP
+    auto* buffer=static_cast<brook::BdwGpuBuffer*>(entry->handle);
+    if(!brook::BdwGpuBufferAllowsUserMapping(buffer))return -13; // EACCES
+    const auto result=brook::BdwGpuBufferTryCpuTransition(buffer);
+    if(result==brook::BdwCpuTransitionResult::Ready)return 0;
+    return result==brook::BdwCpuTransitionResult::Busy?-EAGAIN:-EIO;
+#else
+    (void)fd;(void)flags;(void)a;(void)b;(void)c;(void)d;return -ENODEV;
+#endif
+}
+
+static int64_t sys_brook_gpu_buffer_snapshot_fence(uint64_t fd,uint64_t flags,uint64_t a,uint64_t b,uint64_t c,uint64_t d)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(flags || a || b || c || d)return -EINVAL;
+    if(fd>=MAX_FDS)return -EBADF;
+    FdRef ref(proc,static_cast<int>(fd));if(!ref)return -EBADF;
+    auto* entry=ref.get();if(entry->type!=FdType::IntelPrime || !entry->handle)return -95;
+    auto* buffer=static_cast<brook::BdwGpuBuffer*>(entry->handle);
+    if(!brook::BdwGpuBufferAllowsUserMapping(buffer))return -13;
+    brook::BdwFence* fence=nullptr;
+    const auto result=brook::BdwAcquireApplicationBufferFence(buffer,&fence);if(result)return result;
+    const int published=CreateIntelSyncFile(proc,fence);brook::BdwFenceUnref(fence);
+    if(published<0)return published;
+    SyncFilePublicationPin pin(proc,published);return published;
+#else
+    (void)fd;(void)flags;(void)a;(void)b;(void)c;(void)d;return -ENODEV;
+#endif
+}
+
+static_assert(BROOK_SYS_GPU_HANDOFF_CTL!=BROOK_SYS_GPU_OUTPUT_ALLOC && BROOK_SYS_GPU_HANDOFF_CTL==0xB18,
+              "GPU handoff syscall must be distinct");
+static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b,uint64_t c,uint64_t d)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if((a && op!=BROOK_GPU_HANDOFF_RESERVE_DEPENDENT) || b || c || d)return -EINVAL;
+    const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
+    if(op==BROOK_GPU_HANDOFF_PRESENT_CAPS)
+        return arg?-EINVAL:(BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_ASYNC|BROOK_GPU_PRESENT_CAP_DEPENDENT);
+    if(op==BROOK_GPU_HANDOFF_PRESENT_RESULT)return brook::BdwOffscreenPresentResult(owner,arg);
+    if(op==BROOK_GPU_HANDOFF_PRESENT_FRAME || op==BROOK_GPU_HANDOFF_QUEUE_FRAME){
+        BrookGpuPresentFrame wire{};
+        if(!CopyFromUser(&wire,arg,sizeof(wire)))return -EFAULT;
+        if(op==BROOK_GPU_HANDOFF_QUEUE_FRAME){
+            if(wire.reserved)return -EINVAL;
+            return brook::BdwQueueOffscreenPresent(owner,wire.ticket,wire.width,wire.height,wire.stride,nullptr,0);
+        }
+        BrookGpuPresentProbe frame{wire.ticket,0,0,wire.width,wire.height,wire.stride,wire.reserved,{}};
+        return brook::BdwOffscreenHandoffPresentProbe(owner,frame,true,false,false);
+    }
+    if(op==BROOK_GPU_HANDOFF_PRESENT_REGIONS || op==BROOK_GPU_HANDOFF_QUEUE_REGIONS){
+        BrookGpuPresentRegions wire{};
+        if(!CopyFromUser(&wire,arg,sizeof(wire)))return -EFAULT;
+        static_assert(BROOK_GPU_PRESENT_MAX_REGIONS==brook::COMPOSITOR_MAX_REGIONS,"region limits must match");
+        if(!wire.ticket || wire.reserved || !wire.count || wire.count>BROOK_GPU_PRESENT_MAX_REGIONS)return -EINVAL;
+        brook::CompositorPresentRegion regions[brook::COMPOSITOR_MAX_REGIONS]{};
+        for(uint32_t i=0;i<wire.count;++i){const auto& r=wire.regions[i];
+            if(r.reserved)return -EINVAL;
+            regions[i]={r.x,r.y,r.width,r.height,r.stride,r.offset};
+        }
+        if(op==BROOK_GPU_HANDOFF_QUEUE_REGIONS)
+            return brook::BdwQueueOffscreenPresent(owner,wire.ticket,0,0,0,regions,wire.count);
+        return brook::BdwOffscreenHandoffPresentRegions(owner,wire.ticket,regions,wire.count);
+    }
+    if(op==BROOK_GPU_HANDOFF_PRESENT_PROBE || op==BROOK_GPU_HANDOFF_PRESENT_LEASE){
+        BrookGpuPresentProbe probe{};
+        if(!CopyFromUser(&probe,arg,sizeof(probe)) || !UserBufferWritable(arg,sizeof(probe)))return -EFAULT;
+        const int64_t result=brook::BdwOffscreenHandoffPresentProbe(owner,probe,op==BROOK_GPU_HANDOFF_PRESENT_LEASE);
+        if(result)return result;
+        return CopyToUser(arg,&probe,sizeof(probe))?0:-EFAULT;
+    }
+    if(op==BROOK_GPU_HANDOFF_RESERVE || op==BROOK_GPU_HANDOFF_RESERVE_DEPENDENT){
+        if(arg>=MAX_FDS)return -EBADF;
+        FdRef ref(proc,static_cast<int>(arg));
+        if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
+        return brook::BdwOffscreenHandoffControl(owner,op,arg,static_cast<brook::BdwGpuBuffer*>(ref->handle),a);
+    }
+    return brook::BdwOffscreenHandoffControl(owner,op,arg,nullptr);
+#else
+    (void)op;(void)arg;(void)a;(void)b;(void)c;(void)d;return -ENODEV;
+#endif
+}
+
+static_assert(BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_HANDOFF_CTL && BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_OUTPUT_ALLOC,
+              "desktop layers syscall must be distinct");
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
+{
+    auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
+    auto* snapshot=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
+    if(!wire || !snapshot){kfree(wire);kfree(snapshot);return -ENOMEM;}
+    int64_t result=-EFAULT;
+    if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
+        if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || wire->reserved || !wire->layers[0].window)result=-EINVAL;
+        else if(!brook::WmAcquireDesktopLayers(snapshot))result=-95;
+        else {
+            auto& layer=wire->layers[0];uint32_t index=0;
+            while(index<snapshot->count && snapshot->layers[index].window!=layer.window)++index;
+            if(index==snapshot->count)result=-ENOENT;
+            else {
+                brook::WmDesktopChrome chrome{};
+                const bool tracked=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
+                result=brook::WmDesktopChromeCapture(*snapshot,index,&chrome,nullptr,0,-1,-1,tracked);
+                const uint64_t bytes=uint64_t(chrome.width)*chrome.height*4;
+                const bool capture=op!=BROOK_DESKTOP_CHROME_QUERY;
+                const auto& source=snapshot->layers[index];
+                if(!result && capture && (wire->count!=1 || layer.incarnation!=source.incarnation ||
+                   (!tracked && layer.generation!=source.generation) || layer.width!=chrome.width || layer.height!=chrome.height ||
+                   layer.clientX!=chrome.x || layer.clientY!=chrome.y || layer.bytes!=bytes))result=-EAGAIN;
+                if(!result && capture && bytes && (!layer.pixels || layer.capacity<bytes || layer.pixels>~uint64_t{0}-bytes ||
+                   (layer.pixels<address+size && address<layer.pixels+bytes)))result=-EINVAL;
+                uint32_t* pixels=nullptr;
+                if(!result && capture && bytes){
+                    pixels=static_cast<uint32_t*>(kmalloc(bytes));
+                    if(!pixels)result=-ENOMEM;
+                    else {
+                        brook::WmDesktopChrome current{};
+                        int32_t mouseX=0,mouseY=0;MouseGetPosition(&mouseX,&mouseY);
+                        result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked);
+                        if(!result && (current.x!=chrome.x || current.y!=chrome.y || current.width!=chrome.width || current.height!=chrome.height))result=-EAGAIN;
+                        if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
+                        if(!result && !(tracked?brook::WmDesktopLayersCaptureCurrent(*snapshot):brook::WmDesktopLayersCurrent(*snapshot)))result=-EAGAIN;
+                    }
+                }
+                kfree(pixels);
+                if(!result && op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE)
+                    result=brook::BdwOffscreenRegisterChrome(owner,source);
+                if(!result){
+                    layer.incarnation=source.incarnation;layer.generation=source.generation;layer.bytes=bytes;
+                    layer.width=layer.stride=layer.clientWidth=chrome.width;layer.height=layer.clientHeight=chrome.height;
+                    layer.clientX=chrome.x;layer.clientY=chrome.y;layer.upscale=1;layer.flags=0;wire->count=1;
+                    if(!CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
+                }
+            }
+            brook::WmReleaseDesktopLayers(snapshot);
+        }
+    }
+    kfree(snapshot);kfree(wire);return result;
+}
+static int64_t CaptureDesktopBackdrop(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
+{
+    auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
+    auto* scratch=static_cast<uint32_t*>(kmalloc(4096));
+    if(!wire || !scratch){kfree(wire);kfree(scratch);return -ENOMEM;}
+    int64_t result=-EFAULT;
+    if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
+        brook::CompositorBackdropInfo info{};
+        if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || wire->reserved)result=-EINVAL;
+        else if(!brook::CompositorGetBackdropInfo(&info))result=-ENODEV;
+        else if(uint64_t(info.width)*info.height>64ull*1024*1024/4)result=-E2BIG;
+        else {
+            auto& layer=wire->layers[0];const uint64_t bytes=uint64_t(info.width)*info.height*4;
+            const bool capture=op!=BROOK_DESKTOP_BACKDROP_QUERY;
+            result=0;
+            if(capture && (wire->count!=1 || layer.incarnation!=info.display || layer.generation!=info.generation ||
+               layer.width!=info.width || layer.height!=info.height || layer.stride!=info.width || layer.bytes!=bytes))result=-EAGAIN;
+            else if(capture && (!layer.pixels || layer.capacity<bytes || layer.pixels>~uint64_t{0}-bytes ||
+                    (layer.pixels<address+size && address<layer.pixels+bytes)))result=-EINVAL;
+            if(!result && capture){
+                for(uint32_t y=0;y<info.height && !result;++y)for(uint32_t x=0;x<info.width;){
+                    const uint32_t count=info.width-x<1024?info.width-x:1024;
+                    if(!brook::CompositorReadBackdropSpan(info,y,x,count,scratch)){result=-EAGAIN;break;}
+                    if(!CopyToUser(layer.pixels+(uint64_t(y)*info.width+x)*4,scratch,uint64_t(count)*4)){result=-EFAULT;break;}
+                    x+=count;
+                }
+                brook::CompositorBackdropInfo after{};
+                if(!result && (!brook::CompositorGetBackdropInfo(&after) || after.display!=info.display ||
+                   after.generation!=info.generation || after.width!=info.width || after.height!=info.height))result=-EAGAIN;
+                if(!result && op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE)
+                    result=brook::BdwOffscreenRegisterBackdrop(owner,info);
+            }
+            if(!result){
+                layer.incarnation=info.display;layer.generation=info.generation;layer.bytes=bytes;
+                layer.width=layer.stride=layer.clientWidth=info.width;layer.height=layer.clientHeight=info.height;
+                layer.window=0;layer.clientX=layer.clientY=0;layer.upscale=1;layer.flags=0;wire->count=1;
+                if(!CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
+            }
+        }
+    }
+    kfree(scratch);kfree(wire);return result;
+}
+#endif
+static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint64_t a,uint64_t b,uint64_t c)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE) &&
+       size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
+        return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
+    if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE) &&
+       size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
+        return CaptureDesktopBackdrop(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
+    if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED &&
+        op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE) ||
+       size!=sizeof(BrookDesktopLayers) || (op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE && a) || a>0xffffffffULL || b || c || address>~uint64_t{0}-size)return -EINVAL;
+    const bool capture=op!=BROOK_DESKTOP_LAYERS_QUERY;
+    auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
+    auto* layers=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
+    uint64_t scratchBytes=65536;
+    auto* scratch=capture?static_cast<uint8_t*>(kmalloc(scratchBytes)):nullptr;
+    if(capture && !scratch){scratchBytes=4096;scratch=static_cast<uint8_t*>(kmalloc(scratchBytes));}
+    if(!wire || !layers || (capture && !scratch)){
+        kfree(wire);kfree(layers);kfree(scratch);return -ENOMEM;
+    }
+    int64_t result=-EFAULT;
+    if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
+        if(!brook::WmAcquireDesktopLayers(layers))result=-95;
+        else {
+            auto sink=[&](const brook::WmDesktopLayer& layer,uint64_t offset,uint64_t destination,uint64_t bytes){
+                // Never let pixel output overwrite the request/metadata.
+                if(destination<address+size && address<destination+bytes)return false;
+                if(!brook::UserMappingBufferRead(layer.backing,offset,scratch,bytes))return false;
+                brook::DesktopInvertCaret(layer,offset,scratch,bytes);
+                return CopyToUser(destination,scratch,bytes);
+            };
+            result=brook::ExportDesktopLayers(*layers,*wire,capture,sink,
+                [op](const brook::WmDesktopLayers& current){
+                    return (op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE)
+                        ?brook::WmDesktopLayersCaptureCurrent(current)
+                        :brook::WmDesktopLayersCurrent(current);
+                },scratchBytes,static_cast<uint32_t>(a));
+            bool adopted=false;
+            if(!result && (op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE)){
+                const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
+                result=brook::BdwOffscreenRegisterScene(owner,layers,&wire->reserved);adopted=!result;
+            }
+            if(!result && !CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
+            if(!adopted)brook::WmReleaseDesktopLayers(layers);
+            else layers=nullptr;
+        }
+    }
+    kfree(scratch);kfree(layers);kfree(wire);return result;
+#else
+    (void)op;(void)address;(void)size;(void)a;(void)b;(void)c;return -ENODEV;
+#endif
 }
 
 // 0xB06/0xB07: capability-based retained scenes. See gpu_scene_abi.h.
@@ -12588,6 +13151,22 @@ static int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destina
             BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch};
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
+    if(op==4){
+        if(offset || length!=sizeof(BrookDebugFrameInfoV2))return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state==DebugFrameState::Expired)return -116;
+        BrookDebugFrameInfoV2 info{{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch},frame.source,0};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==5){
+        if(offset || length!=sizeof(BrookDebugFrameInfoV3))return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state==DebugFrameState::Expired)return -116;
+        BrookDebugFrameInfoV3 info{{{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch},frame.source,0},frame.presentationMode,0};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
     if(op==2){
         if(!length || length>BROOK_DEBUG_FRAME_CHUNK)return -EINVAL;
         void* staged=kmalloc(uint32_t(length));if(!staged)return -ENOMEM;
@@ -12600,6 +13179,75 @@ static int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destina
         return CompositorReleaseDebugFrame(uint32_t(token),owner)?0:-116; // ESTALE
     }
     return -EINVAL;
+}
+
+// Experimental renderer overlay uses the immutable compositor-thread frame
+// lease; it shares the single capture slot with root debug screenshots.
+static int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destination,uint64_t length,uint64_t offset,uint64_t reserved)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    if(reserved || token>0xffffffffULL)return -EINVAL;
+    const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
+    if(op==0){
+        if(token || destination || length || offset)return -EINVAL;
+        const auto frame=CompositorRequestDebugFrame(owner,true);
+        if(frame.state==DebugFrameState::Busy)return -16;
+        return frame.token?int64_t(frame.token):-EIO;
+    }
+    if(op==1){
+        if(offset || length!=sizeof(BrookDebugFrameInfo))return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state==DebugFrameState::Expired)return -116;
+        BrookDebugFrameInfo info{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==2){
+        if(!length || length>BROOK_DEBUG_FRAME_CHUNK)return -EINVAL;
+        void* staged=kmalloc(uint32_t(length));if(!staged)return -ENOMEM;
+        int64_t result=CompositorReadDebugFrame(uint32_t(token),owner,offset,staged,uint32_t(length));
+        if(result>0 && !CopyToUser(destination,staged,uint32_t(result)))result=-EFAULT;
+        kfree(staged);return result;
+    }
+    if(op==3){
+        if(destination || length || offset)return -EINVAL;
+        return CompositorReleaseDebugFrame(uint32_t(token),owner)?0:-116;
+    }
+    if(op==4){
+        if(offset || length!=sizeof(BrookDesktopOverlayBands))return -EINVAL;
+        DesktopOverlayBands bands{};const int result=CompositorOverlayBands(uint32_t(token),owner,bands);
+        if(result)return result;
+        BrookDesktopOverlayBands info{};info.count=bands.count;
+        for(uint32_t i=0;i<bands.count;++i)info.bands[i]={bands.bands[i].x,bands.bands[i].y,bands.bands[i].width,bands.bands[i].height};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==BROOK_DESKTOP_OVERLAY_READ_BAND){
+        DesktopOverlayBands bands{};int result=CompositorOverlayBands(uint32_t(token),owner,bands);
+        if(result)return result;
+        if(offset>=bands.count)return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state!=DebugFrameState::Ready)return -116;
+        const auto& band=bands.bands[offset];const uint64_t bytes=uint64_t(band.width)*band.height*4;
+        if(!destination || !bytes || bytes!=length || bytes>64ull*1024*1024 || destination>~uint64_t{0}-bytes)return -EINVAL;
+        if(!UserBufferWritable(destination,bytes))return -EFAULT;
+        auto* scratch=static_cast<uint8_t*>(kmalloc(4096));if(!scratch)return -ENOMEM;
+        int64_t failure=-EFAULT;
+        const bool copied=DesktopOverlayPackedRead(band,frame.width,frame.height,4096,
+            [&](uint64_t from,uint64_t to,uint32_t n){
+                const int64_t read=CompositorReadDebugFrame(uint32_t(token),owner,from,scratch,n);
+                if(read!=n){failure=read<0?read:-EIO;return false;}
+                if(!CopyToUser(destination+to,scratch,n)){failure=-EFAULT;return false;}
+                return true;
+            });
+        kfree(scratch);return copied?int64_t(bytes):failure;
+    }
+    return -EINVAL;
+#else
+    (void)op;(void)token;(void)destination;(void)length;(void)offset;(void)reserved;return -ENODEV;
+#endif
 }
 
 // Boot-opted-in read-only export of the single initialized AHCI disk. Disk
@@ -12667,6 +13315,63 @@ static int64_t sys_brook_wm_set_client_socket(uint64_t wmId,uint64_t fdValue,
     if (credentials.pid<=0 || credentials.pid>65535 || !incarnation) return -ESRCH;
     return WmRegisterClientOrigin(proc,static_cast<uint32_t>(wmId),
         static_cast<uint16_t>(credentials.pid),incarnation,launchId)?0:-EPERM;
+}
+
+static int64_t sys_brook_gpu_window_validate(uint64_t fdValue,uint64_t window,uint64_t incarnation,
+                                              uint64_t a,uint64_t b,uint64_t c)
+{
+    auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(fdValue>=MAX_FDS || !window || window>WM_MAX_WINDOWS || !incarnation || a || b || c)return -EINVAL;
+    FdRef descriptor(proc,static_cast<int>(fdValue));auto* entry=descriptor.get();
+    if(!entry || entry->type!=FdType::UnixSocket || !entry->handle)return -EBADF;
+    auto* socket=static_cast<UnixSocketData*>(entry->handle);
+    UnixCredentials peer{};uint64_t peerIncarnation=0;
+    SpinLockAcquire(&g_unixRegistryLock);
+    const bool accepted=socket->state==UnixSocketData::State::Connected && socket->acceptedEndpoint && socket->socketType==5;
+    if(accepted){peer=socket->peerCredentials;peerIncarnation=socket->peerIncarnation;}
+    SpinLockRelease(&g_unixRegistryLock);
+    if(!accepted || peer.pid<=0 || !peerIncarnation)return -EPERM;
+    return brook::WmGpuSourceProviderMatches(static_cast<uint32_t>(window),incarnation,
+                                             static_cast<uint32_t>(peer.pid),peerIncarnation)?0:-EPERM;
+}
+
+static int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t bufferFd,
+                                                   uint64_t a,uint64_t b,uint64_t c)
+{
+#if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if(fdValue>=MAX_FDS || a || b || c || op>BROOK_GPU_WINDOW_PEER_DRAIN ||
+       (op==BROOK_GPU_WINDOW_PEER_AUTH && bufferFd))return -EINVAL;
+    FdRef descriptor(proc,static_cast<int>(fdValue));auto* entry=descriptor.get();
+    if(!entry || entry->type!=FdType::UnixSocket || !entry->handle)return -EBADF;
+    auto* socket=static_cast<UnixSocketData*>(entry->handle);
+    UnixCredentials peer{};uint64_t peerIncarnation=0;bool authorized=false;
+    SpinLockAcquire(&g_unixRegistryLock);
+    const bool connected=socket->state==UnixSocketData::State::Connected && !socket->acceptedEndpoint && socket->socketType==5;
+    if(connected){peer=socket->peerCredentials;peerIncarnation=socket->peerIncarnation;authorized=socket->gpuPeerAuthorized;}
+    SpinLockRelease(&g_unixRegistryLock);
+    if(!connected || peer.pid<=0 || peer.pid>65535 || !peerIncarnation)return -EPERM;
+    if(op==BROOK_GPU_WINDOW_PEER_AUTH){
+        if(!brook::BdwOffscreenRendererOwnedBy(peerIncarnation))return -EPERM;
+        SpinLockAcquire(&g_unixRegistryLock);
+        const bool same=socket->state==UnixSocketData::State::Connected && socket->peerIncarnation==peerIncarnation && socket->peerCredentials.pid==peer.pid;
+        if(same)socket->gpuPeerAuthorized=true;
+        SpinLockRelease(&g_unixRegistryLock);return same?0:-116; // ESTALE
+    }
+    if(!authorized)return -EPERM;
+    if(bufferFd>=MAX_FDS)return -EBADF;
+    FdRef source(proc,static_cast<int>(bufferFd));auto* bufferEntry=source.get();
+    if(!bufferEntry || bufferEntry->type!=FdType::IntelPrime || !bufferEntry->handle)return -EBADF;
+    auto* buffer=static_cast<brook::BdwGpuBuffer*>(bufferEntry->handle);
+    if(!brook::BdwGpuBufferAllowsUserMapping(buffer))return -13;
+    if(!brook::SchedulerThreadGroupGone(static_cast<uint16_t>(peer.pid),peerIncarnation))return -EAGAIN;
+    const auto state=brook::BdwGpuBufferTryCpuTransition(buffer);
+    return state==brook::BdwCpuTransitionResult::Ready?0:state==brook::BdwCpuTransitionResult::Busy?-EAGAIN:-EIO;
+#else
+    (void)fdValue;(void)op;(void)bufferFd;(void)a;(void)b;(void)c;return -ENODEV;
+#endif
 }
 
 static int64_t sys_brook_wm_set_app_id(uint64_t wmId, uint64_t appIdPtr,
@@ -12805,13 +13510,10 @@ static int64_t sys_brook_wm_set_window_properties(uint64_t wmId, uint64_t mask,
     if (!proc) return -ESRCH;
     if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
 
-    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
-    if (!w) return -EINVAL;
-    int idx = static_cast<int>(wmId) - 1;
-    brook::WmSetWindowProperties(idx, static_cast<uint32_t>(mask),
-                                 static_cast<uint8_t>(opacity & 0xFF),
-                                 static_cast<uint8_t>(blurRadius & 0xFF));
-    return 0;
+    return brook::WmSetOwnedWindowProperties(proc, static_cast<uint32_t>(wmId),
+                                             static_cast<uint32_t>(mask),
+                                             static_cast<uint8_t>(opacity & 0xFF),
+                                             static_cast<uint8_t>(blurRadius & 0xFF)) ? 0 : -EINVAL;
 }
 
 // ===========================================================================
@@ -14969,6 +15671,9 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
         case FdType::NetlinkSocket:
         case FdType::Pipe:
         case FdType::DevDri:
+        case FdType::DevIntelDri:
+        case FdType::IntelPrime:
+        case FdType::IntelSyncObj:
         case FdType::SignalFd:
         case FdType::SyncFile:
         case FdType::EventFd:
@@ -15092,6 +15797,12 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
             // Share ordinary final-close retirement when a message is discarded.
             FinalizeClosedFd({FdType::DevDri,snap->handle,snap->flags});
             break;
+        case FdType::DevIntelDri:
+            brook::BdwGpuFileUnref(static_cast<brook::BdwGpuFile*>(snap->handle));break;
+        case FdType::IntelPrime:
+            brook::BdwGpuBufferUnref(static_cast<brook::BdwGpuBuffer*>(snap->handle));break;
+        case FdType::IntelSyncObj:
+            brook::BdwGpuSyncUnref(static_cast<brook::BdwGpuSync*>(snap->handle));break;
         case FdType::DrmPrime:
             DrmPrimeUnref(static_cast<DrmPrimeObj*>(snap->handle));
             break;
@@ -15806,10 +16517,21 @@ void SyscallTableInit()
     g_syscallTable[0xB08]                = sys_brook_wm_window_state;
     g_syscallTable[0xB09]                = sys_brook_wm_place_window;
     g_syscallTable[0xB0A]                = sys_brook_wm_pointer_capture;
+    g_syscallTable[BROOK_SYS_GPU_OUTPUT_ALLOC] = sys_brook_gpu_output_alloc;
+    g_syscallTable[BROOK_SYS_GPU_BUFFER_TRY_CPU_READ] = sys_brook_gpu_buffer_try_cpu_read;
+    g_syscallTable[BROOK_SYS_GPU_BUFFER_SNAPSHOT_FENCE] = sys_brook_gpu_buffer_snapshot_fence;
+    g_syscallTable[BROOK_SYS_GPU_WINDOW_VALIDATE] = sys_brook_gpu_window_validate;
+    g_syscallTable[BROOK_SYS_GPU_WINDOW_PEER_RECOVERY] = sys_brook_gpu_window_peer_recovery;
+    g_syscallTable[BROOK_SYS_WM_PUBLISH_SOURCE_COMMIT] = sys_brook_wm_publish_source_commit;
+    g_syscallTable[BROOK_SYS_WM_QUERY_SOURCE_COMMIT] = sys_brook_wm_query_source_commit;
+    g_syscallTable[BROOK_SYS_WM_BEGIN_SOURCE_WRITE] = sys_brook_wm_begin_source_write;
+    g_syscallTable[BROOK_SYS_GPU_HANDOFF_CTL] = sys_brook_gpu_handoff_ctl;
+    g_syscallTable[BROOK_SYS_DESKTOP_LAYERS] = sys_brook_desktop_layers;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
     g_syscallTable[BROOK_SYS_DEBUG_FRAME] = sys_brook_debug_frame;
+    g_syscallTable[BROOK_SYS_DESKTOP_OVERLAY] = sys_brook_desktop_overlay;
     g_syscallTable[BROOK_SYS_AHCI_EXPORT] = sys_brook_ahci_export;
     g_syscallTable[BROOK_SYS_SYSTEM_MESSAGE] = sys_brook_system_message;
     g_syscallTable[0xB40]                = sys_brook_pageable_memory;
@@ -16153,7 +16875,7 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     Process* proc = ProcessCurrent();
-    SyscallTimingCall timing(proc?proc->pid:0,proc?proc->incarnation:0,num,a0);
+    SyscallTimingCall timing(proc?proc->pid:0,proc?proc->incarnation:0,num,a0,SyscallTimingPhase::Dispatch,num==SYS_IOCTL?a1:0);
     if(proc && proc->addressSpace && proc->addressSpace->pagingAdmission.Exclusive()) {
         KernelOperationGuard guard(proc);
         const int error=PageableMemoryPrepareSyscall(proc,num);

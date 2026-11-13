@@ -207,7 +207,7 @@ int DebugOverlayTestPanicSnapshotBusy(char* out,uint32_t capacity)
 // --- Kernel console window thread ------------------------------------------
 
 static constexpr uint32_t CONSOLE_W      = 800;
-static constexpr uint32_t CONSOLE_H      = 500;
+static constexpr uint32_t CONSOLE_H      = 1000;
 static constexpr uint32_t CONSOLE_BG     = 0x001A1A2E;  // dark blue-grey
 static constexpr uint32_t CONSOLE_FG_R   = 0xC0;
 static constexpr uint32_t CONSOLE_FG_G   = 0xE0;
@@ -394,7 +394,7 @@ static void KernelConsoleThread(void* /*arg*/)
             KMutexLock(&self->framebufferLock);
             self->fbVfbWidth=width;self->fbVfbHeight=height;self->fbVfbStride=width;
             KMutexUnlock(&self->framebufferLock);
-            __atomic_store_n(&self->fbDirty, 1u, __ATOMIC_RELEASE);
+            ProcessFramebufferMarkDirty(self);
             CompositorWake();
         }
 

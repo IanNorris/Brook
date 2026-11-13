@@ -5,11 +5,13 @@
 #include <cstring>
 namespace brook { int DebugOverlayTestPanicSnapshotBusy(char*,uint32_t); }
 int main(){
-    auto small=brook::ConsoleFitInitial(800,556,800,500,2,28);
+    auto small=brook::ConsoleFitInitial(800,556,800,1000,2,28);
     assert(small.x+small.width+4<=800 && small.y+small.height+32<=556);
     assert(small.x==20 && small.y==60 && small.width==776 && small.height==464);
-    auto large=brook::ConsoleFitInitial(3200,1712,1600,1000,4,56);
-    assert(large.x==20 && large.y==60 && large.width==1600 && large.height==1000);
+    auto unscaled=brook::ConsoleFitInitial(3200,1712,800,1000,4,72);
+    assert(unscaled.width==800 && unscaled.height==1000);
+    auto large=brook::ConsoleFitInitial(3200,1712,1600,2000,4,56);
+    assert(large.x==20 && large.y==60 && large.width==1600 && large.height==1588);
     auto tiny=brook::ConsoleFitInitial(4,4,800,500,2,28);
     assert(tiny.width==0 && tiny.height==0);
     assert(brook::ConsoleVisibleHeight(98,464,512)==414);

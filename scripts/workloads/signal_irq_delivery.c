@@ -20,7 +20,9 @@ static void *sender(void *unused) {
     int result=(int)syscall(SYS_tgkill,process_id,target_tid,SIGUSR1);
     atomic_store_explicit(&send_result,result?-1:1,memory_order_release);return NULL;
 }
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argv;
+    if(argc>2)return 2;
     sigset_t mask;sigemptyset(&mask);sigaddset(&mask,SIGUSR1);
     if(pthread_sigmask(SIG_BLOCK,&mask,NULL))return 1;
     struct sigaction action={0};action.sa_handler=handler;sigemptyset(&action.sa_mask);
@@ -29,8 +31,15 @@ int main(void) {
     pthread_t thread;if(pthread_create(&thread,NULL,sender,NULL))return 2;
     if(pthread_sigmask(SIG_UNBLOCK,&mask,NULL))return 2;
     atomic_store_explicit(&started,1,memory_order_release);
-    for(volatile unsigned long i=0;!caught && atomic_load_explicit(&send_result,memory_order_acquire)!=-1 && i<2000000000UL;++i) {}
+    for(volatile unsigned long i=0;!caught && atomic_load_explicit(&send_result,memory_order_acquire)!=-1 && i<2000000000UL;++i) {
+        if(argc==2 && (i&65535UL)==0)(void)syscall(SYS_gettid);
+    }
     int delivered=caught;pthread_join(thread,NULL);
-    if(!delivered || atomic_load(&send_result)!=1){puts("SIGNAL_IRQ_FAIL");return 3;}
-    puts("SIGNAL_IRQ_PASS caught-target-no-syscall");return 0;
+    int sent=atomic_load(&send_result);
+    if(!delivered || sent!=1){
+        printf("SIGNAL_IRQ_FAIL delivered=%d send_result=%d\n",delivered,sent);
+        return 3;
+    }
+    puts(argc==2 ? "SIGNAL_IRQ_PASS periodic-syscall" : "SIGNAL_IRQ_PASS caught-target-no-syscall");
+    return 0;
 }

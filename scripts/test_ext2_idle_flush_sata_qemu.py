@@ -39,6 +39,11 @@ def main():
                         help='Exercise the first-time guard provisioner on this disposable disk')
     parser.add_argument('--efi-inventory-stage-test', type=Path,
                         help='Exercise first-time staging of the inventory loader')
+    parser.add_argument('--guard-default-stage-test', type=Path,
+                        help='Exercise guarded default-loader promotion')
+    parser.add_argument('--guard-repromote',action='store_true',help='Exercise promotion while preserving earlier loader backups')
+    parser.add_argument('--recovery-promote-test', type=Path,
+                        help='Exercise checked recovery-directory promotion')
     parser.add_argument('--panic-journal-provision-test', type=Path,
                         help='Exercise first-time preallocated panic journal creation')
     parser.add_argument('--panic-snapshot-test',choices=('valid','corrupt','empty'),
@@ -57,17 +62,39 @@ def main():
     parser.add_argument('--watchdog-held-serial-test',action='store_true',
                         help='Inject a held serial lock and a stagnant watchdog sample using GDB')
     parser.add_argument('--serial-output',type=Path,help='Save the guest serial log to a new file')
+    parser.add_argument('--efi-shutdown-loader',type=Path,
+                        help='Test checked EFI shutdown using this version-3 loader and test-only kernel')
+    parser.add_argument('--efi-shutdown-dirty',action='store_true',
+                        help='Request shutdown with pending ext2 writes; requires --efi-shutdown-loader')
+    parser.add_argument('--efi-shutdown-opt-in',action='store_true',
+                        help='Enable the normal kernel EFI power-off marker in this disposable initrd')
+    parser.add_argument('--usb-reset-auto-test',action='store_true',
+                        help='Inject the documented Dell reset failure and wait for automatic shutdown')
     parser.add_argument('--inventory-efi', type=Path)
+    parser.add_argument('--guard-efi-stage',action='store_true',help='Expect the separately staged guarded EFI name')
+    parser.add_argument('--ram-exec-stage',action='store_true',help='Expect the maintenance RAM executable helper')
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
+    if (args.efi_shutdown_dirty or args.efi_shutdown_opt_in) and not args.efi_shutdown_loader:
+        parser.error('EFI shutdown options require --efi-shutdown-loader')
+    if args.usb_reset_auto_test and (not args.efi_shutdown_opt_in or args.efi_shutdown_dirty):
+        parser.error('USB reset auto test requires EFI opt-in and excludes immediate dirty-write mode')
     if args.graphics_mesa_fixture and not args.graphics_environment_test:
         parser.error('alternate Mesa fixture requires graphics environment test')
     if args.graphics_mesa_incomplete and not args.graphics_mesa_fixture:
         parser.error('incomplete Mesa fixture requires the alternate Mesa fixture')
-    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.panic_journal_provision_test,args.panic_snapshot_test,args.graphics_environment_test,args.watchdog_held_serial_test))>1:
+    if sum(bool(x) for x in (args.guard_provision_test,args.efi_inventory_stage_test,args.guard_default_stage_test,args.recovery_promote_test,args.panic_journal_provision_test,args.panic_snapshot_test,args.graphics_environment_test,args.watchdog_held_serial_test))>1:
         parser.error('Choose only one provisioning test')
     if args.efi_inventory_stage_test and not args.inventory_efi:
         parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
+    if args.guard_default_stage_test and not args.inventory_efi:
+        parser.error('default staging requires --inventory-efi')
+    if args.guard_repromote and not args.guard_default_stage_test:
+        parser.error('guard repromotion requires --guard-default-stage-test')
+    if args.guard_efi_stage and not args.efi_inventory_stage_test:
+        parser.error('guard EFI staging requires the EFI staging fixture')
+    if args.ram_exec_stage and (not args.efi_inventory_stage_test or args.guard_efi_stage):
+        parser.error('RAM executable staging requires the EFI staging fixture alone')
     if args.snapshot_network_module and args.panic_snapshot_test!='valid':
         parser.error('network snapshot retrieval requires the valid snapshot test')
     if (args.snapshot_serial_input or args.snapshot_packet_output) and not args.snapshot_network_module:
@@ -131,6 +158,13 @@ def main():
             journal=d/'panic.bin';journal.write_bytes(contents)
             subprocess.run(['mcopy','-o','-i',str(sata)+'@@1048576',str(journal),'::/PANIC.BIN'],check=True)
         esp = str(boot) + '@@1048576'
+        if args.efi_shutdown_loader:
+            if any((args.guard_provision_test,args.efi_inventory_stage_test,args.guard_default_stage_test,
+                    args.recovery_promote_test,args.panic_journal_provision_test,args.panic_snapshot_test,
+                    args.graphics_environment_test,args.watchdog_held_serial_test)):
+                parser.error('EFI shutdown fixture cannot be combined with other modes')
+            subprocess.run(['mcopy','-o','-i',esp,str(args.efi_shutdown_loader.resolve(strict=True)),
+                            '::/EFI/BOOT/BOOTX64.EFI'],check=True)
         initrd = d / 'initrd.img'
         subprocess.run(['mcopy', '-i', esp, '::/INITRD.IMG', str(initrd)], check=True)
         for name in ('DATA', 'NIX', 'MEDIA', 'MEDIA/SYSTEM', 'MNT', 'MNT/PROBE', 'PROC'):
@@ -147,6 +181,12 @@ def main():
             item = d / name
             item.write_text(content)
             subprocess.run(['mcopy', '-o', '-i', str(initrd), str(item), '::/ETC/' + name], check=True)
+        if args.efi_shutdown_opt_in:
+            item=d/'efi-poweroff';item.write_text('1\n')
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(item),'::/ETC/efi-poweroff'],check=True)
+        if args.usb_reset_auto_test:
+            item=d/'usb-boot-poweroff';item.write_text('1\n')
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(item),'::/ETC/usb-boot-poweroff'],check=True)
         init = d / 'INIT.RC'
         identity = disk_guid + uuid.UUID(data_part['uuid']).bytes_le.hex() + fs_uuid.hex()
         if args.graphics_environment_test:
@@ -155,6 +195,53 @@ def main():
             init.write_text('set wm\nset vfb none\nsched eevdf\n')
         elif args.panic_journal_provision_test:
             init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/PANICPROV.ELF ' + identity + '\n')
+        elif args.recovery_promote_test:
+            sys.path.insert(0,str(ROOT/'tools'))
+            from hardware_update_protocol import record
+            media=f'{sata}@@{esp_part["start"]*512}'
+            recovery_pairs=[]
+            for index,directory in enumerate(('RECOV2','RECOVNEW','RECOVERY')):
+                target='::/'+directory
+                if subprocess.run(['mdir','-i',media,target],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+                    subprocess.run(['mmd','-i',media,target],check=True)
+                kernel_data=kernel.read_bytes();initrd_data=bytes([index+1])*512
+                values=(kernel_data,initrd_data,record(1,0,kernel_data,initrd_data));recovery_pairs.append(values)
+                for name,value in zip(('KERNEL.ELF','INITRD.IMG','SELECT.BIN'),values):
+                    item=d/f'{directory}-{name}';item.write_bytes(value)
+                    subprocess.run(['mcopy','-o','-i',media,str(item),target+'/'+name],check=True)
+            hashes=[hashlib.sha256(value).hexdigest() for pair in recovery_pairs for value in pair]
+            wrapper=d/'recovery-wrapper.c'
+            wrapper.write_text('#include <unistd.h>\nint main(void){char *a[]={"/boot/RECPROM.ELF",'+
+                               ','.join('"'+value+'"' for value in hashes)+',0};execv(a[0],a);return 127;}\n')
+            wrapper_elf=d/'recovery-wrapper.elf'
+            subprocess.run([args.compiler,'-static','-O2',str(wrapper),'-o',str(wrapper_elf)],check=True)
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(wrapper_elf),'::/BOOT/RECWRAP.ELF'],check=True)
+            init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/RECWRAP.ELF\n')
+        elif args.guard_default_stage_test:
+            candidate=args.inventory_efi.resolve(strict=True)
+            media=f'{sata}@@{esp_part["start"]*512}'
+            original=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/BOOTX64.EFI'])
+            files=[original,candidate.read_bytes(),original,b'fixture kernel',b'fixture initrd',b'fixture selector',b'g'*128,b'g'*128]
+            targets=['::/EFI/BOOT/BOOTX64.EFI','::/EFI/BOOT/'+('BROOKV5.EFI' if args.guard_repromote else 'BROOKG2.EFI'),'::/EFI/BOOT/BROOKF5.EFI',
+                     '::/RECOV2/KERNEL.ELF','::/RECOV2/INITRD.IMG','::/RECOV2/SELECT.BIN',
+                     '::/RECOVERY/GUARD0.BIN','::/RECOVERY/GUARD1.BIN']
+            if args.guard_repromote:
+                files += [original,original]
+                targets += ['::/EFI/BOOT/BROOKOLD.EFI','::/EFI/BOOT/BROOKG2.EFI']
+            for directory in ('::/RECOV2','::/RECOVERY'):
+                if subprocess.run(['mdir','-i',media,directory],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+                    subprocess.run(['mmd','-i',media,directory],check=True)
+            for index,(payload,target) in enumerate(zip(files,targets)):
+                item=d/f'fixture-{index}';item.write_bytes(payload)
+                subprocess.run(['mcopy','-o','-i',media,str(item),target],check=True)
+            hashes=[hashlib.sha256(payload).hexdigest() for payload in files]
+            wrapper=d/'default-wrapper.c'
+            wrapper.write_text('#include <unistd.h>\nint main(void){char *a[]={"/boot/DEFSTAGE.ELF",'+
+                               ','.join('"'+value+'"' for value in hashes)+',0};execv(a[0],a);return 127;}\n')
+            wrapper_elf=d/'default-wrapper.elf'
+            subprocess.run([args.compiler,'-static','-O2',str(wrapper),'-o',str(wrapper_elf)],check=True)
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(wrapper_elf),'::/BOOT/DEFWRAP.ELF'],check=True)
+            init.write_text('set wm\nset vfb none\nsched eevdf\nrun --console --uid 0 /boot/DEFWRAP.ELF\n')
         elif args.efi_inventory_stage_test:
             candidate=args.inventory_efi.resolve(strict=True)
             digest=hashlib.sha256(candidate.read_bytes()).hexdigest()
@@ -178,6 +265,10 @@ def main():
             pass
         elif args.panic_journal_provision_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.panic_journal_provision_test.resolve(strict=True)),'::/BOOT/PANICPROV.ELF'],check=True)
+        elif args.recovery_promote_test:
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(args.recovery_promote_test.resolve(strict=True)),'::/BOOT/RECPROM.ELF'],check=True)
+        elif args.guard_default_stage_test:
+            subprocess.run(['mcopy','-o','-i',str(initrd),str(args.guard_default_stage_test.resolve(strict=True)),'::/BOOT/DEFSTAGE.ELF'],check=True)
         elif args.efi_inventory_stage_test:
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.efi_inventory_stage_test.resolve(strict=True)),'::/BOOT/EFISTAGE.ELF'],check=True)
             subprocess.run(['mcopy','-o','-i',str(initrd),str(candidate),'::/BOOT/INV.EFI'],check=True)
@@ -185,7 +276,7 @@ def main():
             subprocess.run(['mcopy','-o','-i',str(initrd),str(args.guard_provision_test.resolve(strict=True)),'::/BOOT/GUARDP.ELF'],check=True)
         else:
             binary = d / 'idle.elf'
-            subprocess.run([args.compiler, '-static', '-O2', str(ROOT / 'scripts/workloads/ext2_idle_flush.c'),
+            subprocess.run([args.compiler, '-static', '-O2', *(['-DBROOK_IDLE_DIRTY_EXIT'] if args.efi_shutdown_dirty else ['-DBROOK_IDLE_EXIT_AFTER_SUCCESS'] if args.efi_shutdown_loader else []), str(ROOT / 'scripts/workloads/ext2_idle_flush.c'),
                             '-o', str(binary)], check=True)
             subprocess.run(['mcopy', '-o', '-i', str(initrd), str(binary), '::/BOOT/IDLEQA.ELF'], check=True)
         subprocess.run(['mcopy', '-o', '-i', esp, str(initrd), '::/INITRD.IMG'], check=True)
@@ -193,7 +284,8 @@ def main():
         variables = d / 'vars.fd'
         shutil.copyfile(firmware / 'OVMF_VARS.fd', variables)
         serial = d / 'serial.log'
-        command = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'tcg', '-cpu', 'max',
+        accelerated=bool(args.efi_shutdown_loader or args.guard_repromote)
+        command = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm' if accelerated else 'tcg', '-cpu', 'host' if accelerated else 'max',
                    '-smp', '2', '-m', '1024', '-nodefaults',
                    '-drive', f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE.fd"}',
                    '-drive', f'if=pflash,format=raw,file={variables}', '-device', 'VGA',
@@ -207,6 +299,14 @@ def main():
                 probe.bind(('127.0.0.1',0));network_port=probe.getsockname()[1]
             command += ['-netdev',f'user,id=snapshot-net,hostfwd=tcp:127.0.0.1:{network_port}-:1234',
                         '-device','virtio-net-pci,netdev=snapshot-net']
+        if args.efi_shutdown_loader:
+            cookie=uuid.uuid4().hex
+            command += ['-serial',f'unix:{d / "life.sock"},server=on,wait=off',
+                        '-qmp',f'unix:{d / "qmp.sock"},server=on,wait=off','-no-shutdown',
+                        '-fw_cfg','name=opt/brook/power,string='+('normal' if args.efi_shutdown_opt_in else 'efi-test'),
+                        '-fw_cfg',f'name=opt/brook/lifecycle,string={cookie}']
+        if args.usb_reset_auto_test:
+            command += ['-fw_cfg','name=opt/brook/usb-reset-inject,string=1']
         debugger = None
         if args.watchdog_held_serial_test:
             symbols = subprocess.check_output(['nm', str(kernel)], text=True)
@@ -265,7 +365,10 @@ quit
                                'GPU_ENV_NONVIRTIO_PASS' if args.graphics_environment_test else
                                'SHELL: script \'/boot/INIT.RC\' finished' if args.panic_snapshot_test else
                                'PANIC_JOURNAL_PROVISION_OK' if args.panic_journal_provision_test else
+                               'RECOVERY_PROMOTE_OK' if args.recovery_promote_test else
+                               'GUARD_DEFAULT_OK' if args.guard_default_stage_test else
                                'EFI_INVENTORY_STAGE_OK' if args.efi_inventory_stage_test else
+                               'IDLE_DIRTY_OK' if args.efi_shutdown_dirty else
                                'GUARD_PROVISION_OK' if args.guard_provision_test else 'IDLE_FLUSH_OK')
                     if success in output:
                         if args.watchdog_held_serial_test:
@@ -275,6 +378,48 @@ quit
                                 raise RuntimeError('watchdog injection failed: ' + (d / 'gdb.log').read_text())
                         if 'ahci direct: ready' not in output:
                             raise RuntimeError('the intended direct data volume was not mounted')
+                        if args.efi_shutdown_loader:
+                            # Connect after firmware console output; pace input so
+                            # the guest's emulated UART FIFO cannot overrun.
+                            with socket.socket(socket.AF_UNIX) as life, socket.socket(socket.AF_UNIX) as qmp:
+                                if not args.usb_reset_auto_test:life.settimeout(20);life.connect(str(d/'life.sock'))
+                                qmp.settimeout(90 if args.usb_reset_auto_test else 30);qmp.connect(str(d/'qmp.sock'))
+                                q=qmp.makefile('rwb',buffering=0);json.loads(q.readline());q.write(b'{"execute":"qmp_capabilities"}\n');json.loads(q.readline())
+                                if not args.usb_reset_auto_test:
+                                    stream=life.makefile('rwb',buffering=0)
+                                    request=uuid.uuid4().hex
+                                    def exchange(ident,boot,verb):
+                                        message=f'BLC1 {cookie} {ident} {boot} {verb}\n'.encode()
+                                        for byte in message:life.sendall(bytes([byte]));time.sleep(.002)
+                                        line=stream.readline().decode().strip().split()
+                                        if len(line)!=5 or line[0]!='BLC1' or line[1]!=ident or line[4]!='0':
+                                            raise RuntimeError('bad lifecycle response '+str(line))
+                                        return line
+                                    hello=exchange(uuid.uuid4().hex,uuid.uuid4().hex,'hello');bootId=hello[2]
+                                    exchange(request,bootId,'shutdown')
+                                    end=time.monotonic()+60
+                                    while time.monotonic()<end:
+                                        state=exchange(request,bootId,'power_status')[3]
+                                        if state=='ready':break
+                                        if state in ('failed','cancelled'):raise RuntimeError('checked shutdown '+state)
+                                        time.sleep(.2)
+                                    else:raise RuntimeError('checked shutdown timed out')
+                                    exchange(request,bootId,'commit')
+                                events=[]
+                                while True:
+                                    event=json.loads(q.readline());events.append(event)
+                                    if event.get('event')=='SHUTDOWN':break
+                                if event.get('data',{}).get('reason')!='guest-shutdown':raise RuntimeError('unexpected QEMU shutdown event')
+                                output=serial.read_text(errors='replace')
+                                if args.usb_reset_auto_test:
+                                    decision=re.search(r'usb-boot-recovery uptime_ms=(\d+) report=1 poweroff=1 requested=1',output)
+                                    if 'USB_BOOT_RESET_TEST_INJECTED' not in output or not decision or int(decision.group(1))<60000:
+                                        raise RuntimeError('USB recovery did not wait a full minute for the injected reset fault')
+                                if 'efi-runtime: shutdown call' not in output or 'efi-runtime: shutdown returned' in output:
+                                    raise RuntimeError('UEFI shutdown call not confirmed')
+                                if args.efi_shutdown_dirty and not re.search(r'EFI_SHUTDOWN_PRE_SYNC drive=\d+ pending=[1-9]\d*',output):
+                                    raise RuntimeError('no pending ext2 operations at final shutdown sync')
+                            print('EFI_CHECKED_DISK_SHUTDOWN_PASS',flush=True)
                         if args.panic_snapshot_test:
                             marker=f'NORMAL_PANIC_PRIOR sequence=7 bytes={len(payload)} crc={zlib.crc32(payload):x}'
                             if (marker in output)!=(args.panic_snapshot_test=='valid'):
@@ -304,7 +449,7 @@ quit
                             with args.serial_output.open('x') as saved:saved.write(serial.read_text(errors='replace'))
                         print('\n'.join(line for line in output.splitlines() if 'IDLE_' in line), flush=True)
                         break
-                    if any(x in output for x in ('GPU_ENV_NONVIRTIO_FAIL','IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'EFI_INVENTORY_STAGE_FAILED', 'PANIC_JOURNAL_PROVISION_FAILED', 'PANIC_JOURNAL_IDENTITY_MISMATCH')):
+                    if any(x in output for x in ('GPU_ENV_NONVIRTIO_FAIL','IDLE_PROBE_FAILED', 'IDLE_NO_PENDING_WORK', 'IDLE_FLUSH_FAILED', 'GUARD_PROVISION_FAILED', 'GUARD_PROVISION_IDENTITY_MISMATCH', 'GUARD_DEFAULT_FAILED', 'RECOVERY_PROMOTE_FAILED', 'EFI_INVENTORY_STAGE_FAILED', 'PANIC_JOURNAL_PROVISION_FAILED', 'PANIC_JOURNAL_IDENTITY_MISMATCH')):
                         raise RuntimeError(output[-4500:])
                     if process.poll() is not None:
                         errors.flush()
@@ -349,9 +494,46 @@ quit
             subprocess.run(['fsck.fat','-n',str(fat)],check=True,timeout=30,stdout=subprocess.DEVNULL)
             print('panic journal provisioning and offline readback: PASS')
             return
+        if args.recovery_promote_test:
+            media=f'{sata}@@{esp_part["start"]*512}'
+            for directory,index in (('RECOV2',1),('RECOVBAK',0),('RECOVERY',2)):
+                for name,expected in zip(('KERNEL.ELF','INITRD.IMG','SELECT.BIN'),recovery_pairs[index]):
+                    if subprocess.check_output(['mtype','-i',media,'::/'+directory+'/'+name])!=expected:
+                        raise RuntimeError('offline recovery promotion mismatch: '+directory+'/'+name)
+            fat=d/'fat.img'
+            with sata.open('rb') as inp, fat.open('wb') as out:
+                inp.seek(esp_part['start']*512);remaining=esp_part['size']*512
+                while remaining:
+                    block=inp.read(min(1024*1024,remaining))
+                    if not block:raise RuntimeError('short FAT partition read')
+                    out.write(block);remaining-=len(block)
+            subprocess.run(['fsck.fat','-n',str(fat)],check=True,timeout=30,stdout=subprocess.DEVNULL)
+            print('recovery promotion and offline readback: PASS')
+            return
+        if args.guard_default_stage_test:
+            media=f'{sata}@@{esp_part["start"]*512}'
+            expected_loaders=(('BOOTX64.EFI',candidate.read_bytes()),('BROOKV4.EFI',original),
+                              ('BROOKV5.EFI',candidate.read_bytes()),('BROOKOLD.EFI',original),
+                              ('BROOKG2.EFI',original),('BROOKF5.EFI',original)) if args.guard_repromote else (
+                              ('BOOTX64.EFI',candidate.read_bytes()),('BROOKOLD.EFI',original),
+                              ('BROOKG2.EFI',candidate.read_bytes()),('BROOKF5.EFI',original))
+            for name,expected in expected_loaders:
+                actual=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/'+name])
+                if actual!=expected:raise RuntimeError('offline loader mismatch: '+name)
+            fat=d/'fat.img'
+            with sata.open('rb') as inp, fat.open('wb') as out:
+                inp.seek(esp_part['start']*512);remaining=esp_part['size']*512
+                while remaining:
+                    block=inp.read(min(1024*1024,remaining))
+                    if not block:raise RuntimeError('short FAT partition read')
+                    out.write(block);remaining-=len(block)
+            subprocess.run(['fsck.fat','-n',str(fat)],check=True,timeout=30,stdout=subprocess.DEVNULL)
+            print('guard default promotion and offline readback: PASS')
+            return
         if args.efi_inventory_stage_test:
             media=f'{sata}@@{esp_part["start"]*512}'
-            actual=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/BROOKINV.EFI'])
+            staged_name='BRKMODE.ELF' if args.ram_exec_stage else ('BROOKG2.EFI' if args.guard_efi_stage else 'BROOKINV.EFI')
+            actual=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/'+staged_name])
             if actual!=candidate.read_bytes():raise RuntimeError('offline inventory EFI differs')
             original=subprocess.check_output(['mtype','-i',str(source)+'@@1048576','::/EFI/BOOT/BOOTX64.EFI'])
             after=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/BOOTX64.EFI'])
@@ -397,7 +579,8 @@ quit
                                        stderr=subprocess.DEVNULL)
         if data != b'periodic ext2 durability witness\n':
             raise RuntimeError('offline file contents do not match')
-        print('direct SATA idle flush and offline readback: PASS')
+        print(('direct SATA checked shutdown' if args.efi_shutdown_dirty else 'direct SATA idle flush')+
+              ' and offline readback: PASS')
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@
 // codes if a single QR cannot hold it all.
 
 #include "panic_qr.h"
+#include "intel_bdw_exec_snapshot.h"
 #include "panic_qr_layout.h"
 #include "base45.h"
 #include "debug_overlay.h"
@@ -23,8 +24,18 @@ extern "C" {
 
 namespace brook {
 
-static uint8_t g_capturedPacket[sizeof(PanicHeader) + 4096];
+static constexpr uint32_t PANIC_FULL_PAYLOAD_MAX=49152;
+static uint8_t g_capturedPacket[sizeof(PanicHeader) + PANIC_FULL_PAYLOAD_MAX];
 static uint32_t g_capturedPacketBytes = 0;
+static uint8_t g_displayPacket[sizeof(PanicHeader) + 4096];
+static uint32_t g_displayPacketBytes=0;
+static BdwGpuCapture g_gpuCapture{};
+static uint32_t g_gpuCaptureReady=0;
+void PanicSetGpuCapture(const BdwGpuCapture& capture){
+    __atomic_store_n(&g_gpuCaptureReady,0,__ATOMIC_RELAXED);
+    g_gpuCapture=capture;
+    __atomic_store_n(&g_gpuCaptureReady,1,__ATOMIC_RELEASE);
+}
 
 bool PanicCapturedPacket(const uint8_t** data, uint32_t* bytes)
 {
@@ -56,23 +67,29 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
                                   const PanicStackDump* stackDump,
                                   const PanicCpuList* cpuList,
                                   const char* message,
-                                  const uint8_t* log, uint32_t logBytes)
+                                  const uint8_t* log, uint32_t logBytes,bool includeGpu=true)
 {
     uint32_t messageLen=0;
     if(message) while(messageLen<PANIC_MESSAGE_MAX_BYTES && message[messageLen]) ++messageLen;
-    uint32_t tracePayloadSize = 1 + trace->depth * 8;
+    // A panic may follow memory corruption. Never trust counts stored next
+    // to the fixed-size diagnostic arrays when reading or sizing the packet.
+    const uint8_t traceCount=trace->depth>PANIC_MAX_STACK_DEPTH?PANIC_MAX_STACK_DEPTH:trace->depth;
+    const uint8_t processCount=procList?(procList->count>PANIC_MAX_PROCESSES?PANIC_MAX_PROCESSES:procList->count):0;
+    const uint8_t cpuCount=cpuList?(cpuList->count>PANIC_MAX_CPUS_DUMP?PANIC_MAX_CPUS_DUMP:cpuList->count):0;
+    const uint16_t stackBytes=stackDump?(stackDump->length>PANIC_STACK_DUMP_BYTES?PANIC_STACK_DUMP_BYTES:stackDump->length):0;
+    uint32_t tracePayloadSize = 1 + traceCount * 8;
 
     uint32_t needed = sizeof(PanicPacketHeader) + sizeof(PanicCPURegs)
                     + sizeof(PanicPacketHeader) + tracePayloadSize;
     if (excInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicExceptionInfo);
     if (procList) needed += sizeof(PanicPacketHeader) + 1
-                          + procList->count * PANIC_PROCESS_ENTRY_WIRE_SIZE
+                          + processCount * PANIC_PROCESS_ENTRY_WIRE_SIZE
                           + sizeof(PanicPacketHeader) + 1
-                          + procList->count * sizeof(PanicProcessExtEntry);
+                          + processCount * sizeof(PanicProcessExtEntry);
     if (sysInfo) needed += sizeof(PanicPacketHeader) + sizeof(PanicSystemInfo);
     if (cpuList) needed += sizeof(PanicPacketHeader) + 1
-                         + cpuList->count * sizeof(PanicCpuEntry);
-    if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackDump->length;
+                         + cpuCount * sizeof(PanicCpuEntry);
+    if (stackDump) needed += sizeof(PanicPacketHeader) + 8 + 2 + stackBytes;
     if (messageLen) needed += sizeof(PanicPacketHeader) + messageLen;
     needed += sizeof(PanicPacketHeader) + logBytes;
 
@@ -96,8 +113,8 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
     ph.type = QR_PACKET_TYPE_STACK_TRACE;
     ph.size = tracePayloadSize;
     appendRaw(&ph, sizeof(ph));
-    buf[off++] = trace->depth;
-    for (uint8_t d = 0; d < trace->depth; d++)
+    buf[off++] = traceCount;
+    for (uint8_t d = 0; d < traceCount; d++)
         appendRaw(&trace->rip[d], 8);
 
     // Packet 3: Exception info (optional)
@@ -110,25 +127,25 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
     }
 
     // Packet 4: Process list (optional) — STABLE 24-byte wire entries only.
-    if (procList && procList->count > 0)
+    if (processCount > 0)
     {
-        uint32_t plSize = 1 + procList->count * PANIC_PROCESS_ENTRY_WIRE_SIZE;
+        uint32_t plSize = 1 + processCount * PANIC_PROCESS_ENTRY_WIRE_SIZE;
         ph.type = QR_PACKET_TYPE_PROCESS_LIST;
         ph.size = plSize;
         appendRaw(&ph, sizeof(ph));
-        buf[off++] = procList->count;
-        for (uint8_t i = 0; i < procList->count; i++)
+        buf[off++] = processCount;
+        for (uint8_t i = 0; i < processCount; i++)
             // Only the first 24 bytes (pid/state/cpu/name/rip) are on the wire.
             appendRaw(&procList->entries[i], PANIC_PROCESS_ENTRY_WIRE_SIZE);
 
         // Packet 4b: Process reap-gate extension (BRO-176). Optional, self-
         // describing TLV — old decoders skip it; new ones merge by pid.
-        uint32_t extSize = 1 + procList->count * sizeof(PanicProcessExtEntry);
+        uint32_t extSize = 1 + processCount * sizeof(PanicProcessExtEntry);
         ph.type = QR_PACKET_TYPE_PROCESS_EXT;
         ph.size = extSize;
         appendRaw(&ph, sizeof(ph));
-        buf[off++] = procList->count;
-        for (uint8_t i = 0; i < procList->count; i++)
+        buf[off++] = processCount;
+        for (uint8_t i = 0; i < processCount; i++)
         {
             const PanicProcessEntry& e = procList->entries[i];
             PanicProcessExtEntry x;
@@ -152,27 +169,27 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
     }
 
     // Packet 5b: Per-CPU state (optional TLV extension)
-    if (cpuList && cpuList->count > 0)
+    if (cpuCount > 0)
     {
-        uint32_t clSize = 1 + cpuList->count * sizeof(PanicCpuEntry);
+        uint32_t clSize = 1 + cpuCount * sizeof(PanicCpuEntry);
         ph.type = QR_PACKET_TYPE_CPU_STATE;
         ph.size = clSize;
         appendRaw(&ph, sizeof(ph));
-        buf[off++] = cpuList->count;
-        for (uint8_t i = 0; i < cpuList->count; i++)
+        buf[off++] = cpuCount;
+        for (uint8_t i = 0; i < cpuCount; i++)
             appendRaw(&cpuList->entries[i], sizeof(PanicCpuEntry));
     }
 
     // Packet 6: Stack dump (optional)
-    if (stackDump && stackDump->length > 0)
+    if (stackBytes > 0)
     {
-        uint32_t sdSize = 8 + 2 + stackDump->length;  // rsp + length + data
+        uint32_t sdSize = 8 + 2 + stackBytes;  // rsp + length + data
         ph.type = QR_PACKET_TYPE_STACK_DUMP;
         ph.size = sdSize;
         appendRaw(&ph, sizeof(ph));
         appendRaw(&stackDump->rsp, 8);
-        appendRaw(&stackDump->length, 2);
-        appendRaw(stackDump->data, stackDump->length);
+        appendRaw(&stackBytes, 2);
+        appendRaw(stackDump->data, stackBytes);
     }
 
     if (messageLen) {
@@ -185,6 +202,23 @@ static uint32_t BuildPanicPayload(uint8_t* buf, uint32_t bufLen,
     ph.size = logBytes;
     appendRaw(&ph,sizeof(ph));
     appendRaw(log,logBytes);
+    // Optional diagnostics never displace the core panic report. The worker
+    // publishes a fixed-size copy before panic; no GPU or heap access here.
+    if(includeGpu && __atomic_load_n(&g_gpuCaptureReady,__ATOMIC_ACQUIRE) && g_gpuCapture.count<=4 &&
+       off<=bufLen && sizeof(ph)+16<=bufLen-off){
+        const uint32_t packetOffset=off;ph.type=QR_PACKET_TYPE_GPU_CAPTURE;ph.size=0;appendRaw(&ph,sizeof(ph));
+        const uint32_t version=4,requested=g_gpuCapture.requested,reserved=0;uint32_t written=0;
+        appendRaw(&version,4);const uint32_t countOffset=off;appendRaw(&written,4);appendRaw(&requested,4);appendRaw(&reserved,4);
+        for(uint32_t i=0;i<g_gpuCapture.count && bufLen-off>=24;++i){
+            const auto& entry=g_gpuCapture.entries[i];uint32_t length=entry.bytes;
+            if(length>sizeof(entry.data))length=sizeof(entry.data);
+            if(length>bufLen-off-24)length=bufLen-off-24;
+            appendRaw(&entry.address,8);appendRaw(&entry.size,8);appendRaw(&length,4);appendRaw(&reserved,4);
+            appendRaw(entry.data,length);++written;
+        }
+        memcpy(buf+countOffset,&written,4);const uint32_t size=off-packetOffset-sizeof(ph);
+        memcpy(buf+packetOffset+4,&size,4);
+    }
     return off;
 }
 
@@ -283,8 +317,9 @@ void PanicPreparePacket(const PanicCPURegs* regs,
                    const char* message)
 {
     __atomic_store_n(&g_capturedPacketBytes, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_displayPacketBytes,0,__ATOMIC_RELEASE);
     // Step 1: Build binary TLV payload (no header yet — added per page)
-    static uint8_t payloadBuf[4096];
+    static uint8_t payloadBuf[PANIC_FULL_PAYLOAD_MAX];
     static uint8_t logBuf[1+PANIC_LOG_MAX_BYTES];
     const int logBytes=DebugOverlayTryPanicSnapshot(reinterpret_cast<char*>(logBuf+1),PANIC_LOG_MAX_BYTES);
     logBuf[0]=logBytes<0?1:0;
@@ -301,7 +336,7 @@ void PanicPreparePacket(const PanicCPURegs* regs,
     SerialPrintf("PANIC QR: payload %u bytes\n", payloadLen);
 
     // Step 1b: Compress with LZ4
-    static uint8_t compressedBuf[4096];
+    static uint8_t compressedBuf[PANIC_FULL_PAYLOAD_MAX];
     int compressedLen = LZ4_compress_default(
         reinterpret_cast<const char*>(payloadBuf),
         reinterpret_cast<char*>(compressedBuf + 4),  // leave 4 bytes for uncompressed size
@@ -343,12 +378,30 @@ void PanicPreparePacket(const PanicCPURegs* regs,
         __atomic_store_n(&g_capturedPacketBytes, sizeof(hdr) + dataLen, __ATOMIC_RELEASE);
     }
 
+    // QR has four pages. If the full disk record will not fit, encode a
+    // separate complete core report rather than displaying truncated pages.
+    if(dataLen>QR_MAX_PAYLOAD_BYTES_PER_PAGE*QR_MAX_PAGES){
+        static uint8_t core[4096],compressedCore[4096];
+        const uint32_t coreLen=BuildPanicPayload(core,sizeof(core),regs,trace,excInfo,procList,sysInfo,stackDump,cpuList,message,logBuf,logSize,false);
+        if(coreLen){
+            const int n=LZ4_compress_default(reinterpret_cast<const char*>(core),reinterpret_cast<char*>(compressedCore+4),coreLen,sizeof(compressedCore)-4);
+            const bool compressed=n>0 && uint32_t(n+4)<coreLen;
+            if(compressed){compressedCore[0]=uint8_t(coreLen);compressedCore[1]=uint8_t(coreLen>>8);compressedCore[2]=uint8_t(coreLen>>16);compressedCore[3]=uint8_t(coreLen>>24);}
+            const uint32_t size=compressed?uint32_t(n+4):coreLen;
+            const PanicHeader hdr{QR_MAGIC_BYTE,uint8_t(compressed?QR_VERSION:QR_VERSION_RAW),0,1,QR_HEADER_PAD};
+            memcpy(g_displayPacket,&hdr,sizeof(hdr));memcpy(g_displayPacket+sizeof(hdr),compressed?compressedCore:core,size);
+            __atomic_store_n(&g_displayPacketBytes,sizeof(hdr)+size,__ATOMIC_RELEASE);
+        }
+    }
+
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
     // Attempt persistence before serial hex output and display operations.
     AhciPanicTestCapture();
 #endif
     // Also dump hex to serial for host-side capture (crash_decoder.py --hex).
-    DumpPacketToSerial(g_capturedPacket, sizeof(PanicHeader) + dataLen);
+    const uint32_t displayBytes=__atomic_load_n(&g_displayPacketBytes,__ATOMIC_ACQUIRE);
+    if(displayBytes){SerialPanicPuts("PANIC: full capture is in disk journal; serial/QR contain core report\n");DumpPacketToSerial(g_displayPacket,displayBytes);}
+    else DumpPacketToSerial(g_capturedPacket, sizeof(PanicHeader) + dataLen);
 }
 
 void PanicRenderPreparedQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
@@ -357,6 +410,8 @@ void PanicRenderPreparedQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight
     const uint8_t* packet=nullptr;
     uint32_t packetBytes=0;
     if (!PanicCapturedPacket(&packet,&packetBytes) || packetBytes<=sizeof(PanicHeader)) return;
+    const uint32_t displayBytes=__atomic_load_n(&g_displayPacketBytes,__ATOMIC_ACQUIRE);
+    if(displayBytes){packet=g_displayPacket;packetBytes=displayBytes;}
     const auto* hdr=reinterpret_cast<const PanicHeader*>(packet);
     const uint8_t* dataToEncode=packet+sizeof(PanicHeader);
     const uint32_t dataLen=packetBytes-sizeof(PanicHeader);

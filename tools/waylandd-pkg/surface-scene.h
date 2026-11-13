@@ -12,6 +12,13 @@ struct brook_image {
     struct brook_scene_owner *owner;
     uint64_t version;
     int uncertain;
+    int pending_cpu,pending_fd;
+    int producer_fence,producer_fence_required,direct_attempted;
+    int offer_state;
+    uint32_t offer_sent_ms,offer_ack_ms;
+    uint32_t trace_queued_ms,trace_first_poll_ms,trace_fence_ms;
+    struct BrookGpuWindowIdentity offer_identity;
+    struct brook_image *pending_next;
 };
 static long scene_ctl(int fd,unsigned op,const void *arg,size_t size) {
     errno=0;
@@ -228,21 +235,52 @@ static uint32_t pixel_straight(uint32_t px) {
     }
     return out;
 }
+/* 2 means the OS invalidated an earlier tagged snapshot, 1 means this
+ * provider is using an older kernel/no tagged channel, 0 means retry later. */
+static int surface_begin_source_write(struct brook_surface *root,uint64_t *incarnation){
+    if(incarnation)*incarnation=0;
+#ifdef BROOK_WAYLAND_SOURCE_COMMIT_TAG
+    const char *channel=getenv("BROOK_WAYLAND_GPU_SOCKET");
+    if(channel && *channel){
+        BrookWindowState state={0};
+        if(syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&state,(long)sizeof(state),0L,0L))return 0;
+        errno=0;
+        if(!syscall(BROOK_SYS_WM_BEGIN_SOURCE_WRITE,(long)root->wm_id,(long)state.incarnation,0L,0L,0L,0L)){
+            if(incarnation)*incarnation=state.incarnation;
+            return 2;
+        }
+        if(errno!=ENOSYS)return 0;
+    }
+#else
+    (void)root;
+#endif
+    return 1;
+}
+#ifdef BROOK_WAYLAND_VULKAN_COMPOSITOR
+#include "surface-vulkan.h"
+#endif
 static int surface_render(struct brook_surface *root) {
     if ((root->xdg_toplevel || root->xdg_popup) && !root->xdg_acked) return 1;
     struct brook_view *base=root->tree.current?root->tree.current->value:NULL;
     if (root->role==4 && base && !xwayland_accept_view(root,base->geometry.w,base->geometry.h)) return 1;
+    struct brook_draw draws[64];unsigned count=0;
+    if (!surface_layers(root,draws,&count)) return 0;
+    /* Keep the previously published frame until every current producer is
+     * ready. The queue owns pending images even if their surface is removed. */
+    for(unsigned i=0;i<count;++i)if(draws[i].view->image->pending_cpu)return 1;
     if (!surface_window(root,base)) return 0;
     if (!root->wm_id || !root->vfb) return 1;
     if (!scene_ensure(root)) return 0;
-    struct brook_draw draws[64];unsigned count=0;
-    if (!surface_layers(root,draws,&count)) return 0;
     const uint32_t scale=surface_output_scale(root);
     /* Match the native scene-service bound in both backends, including
      * partially visible subsurfaces rather than only the root window. */
     for(unsigned i=0;i<count;++i)
         if(draws[i].view->geometry.w>16384/scale || draws[i].view->geometry.h>16384/scale) return 0;
-    if (root->scene) {
+    uint64_t writeIncarnation=0;
+    int writeGuard=0;
+    /* The native scene service does not yet expose a begin-write/commit tag
+     * transaction. Keep channel-backed windows on the tagged CPU path. */
+    if (root->scene && !(getenv("BROOK_WAYLAND_GPU_SOCKET") && *getenv("BROOK_WAYLAND_GPU_SOCKET"))) {
         struct SceneLayerDesc layers[64];unsigned n=0;
         for (unsigned i=0;i<count;++i) {
             struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
@@ -259,11 +297,33 @@ static int surface_render(struct brook_surface *root) {
         // Keep the captured versions; the next commit/configure can redraw.
         return result==0 || result==-116;
     }
+    /* A single full-size retained image over transparent black needs no
+     * intermediate scene or alpha blend. Preserve straight-alpha conversion
+     * and the same source-write/commit protocol as the general path. */
+    if(count==1 && draws[0].x==0 && draws[0].y==0){
+        const struct brook_view *view=draws[0].view;
+        const struct brook_geometry *g=&view->geometry;
+        const struct brook_image *image=view->image;
+        if(image->pixels && image->format==1 && !g->transform && !g->sx && !g->sy &&
+           g->sw==(int64_t)image->width*256 && g->sh==(int64_t)image->height*256 &&
+           g->w*scale==image->width && g->h*scale==image->height &&
+           root->vfb_w==image->width && root->vfb_h==image->height){
+            writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
+            for(unsigned y=0;y<root->vfb_h;++y)for(unsigned x=0;x<root->vfb_w;++x)
+                root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(image->pixels[(size_t)y*image->width+x]);
+            goto publish;
+        }
+    }
     size_t pixels=(size_t)root->vfb_w*root->vfb_h;
     if (root->composite_pixels<pixels) {
         uint32_t *next=realloc(root->composite,pixels*4);if (!next) return 0;
         root->composite=next;root->composite_pixels=pixels;
     }
+    int gpuComposed=0;
+#ifdef BROOK_WAYLAND_VULKAN_COMPOSITOR
+    gpuComposed=surface_vulkan_compose(root,draws,count,scale);
+#endif
+    if (!gpuComposed) {
     memset(root->composite,0,pixels*4);
     for (unsigned i=0;i<count;++i) {
         struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
@@ -280,9 +340,25 @@ static int surface_render(struct brook_surface *root) {
             *out=pixel_over(image->pixels[(size_t)py*image->width+px],*out);
         }
     }
+    }
+    writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
     for (unsigned y=0;y<root->vfb_h;++y) for (unsigned x=0;x<root->vfb_w;++x)
         root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(root->composite[(size_t)y*root->vfb_w+x]);
-    wm_signal_dirty(root->wm_id);return 1;
+publish:;
+    int tagged=0;
+#ifdef BROOK_WAYLAND_SOURCE_COMMIT_TAG
+    /* Tag only when the composed snapshot includes the current root view.
+     * This also permits later SHM and subsurface commits to supersede an
+     * earlier direct source without guessing from publication generation. */
+    if(writeGuard==2 && root->tree.current && root->tree.current->value && root->tree.current->commit){
+        int includesRoot=0;
+        for(unsigned i=0;i<count;++i)if(draws[i].view==root->tree.current->value){includesRoot=1;break;}
+        if(includesRoot && !syscall(BROOK_SYS_WM_PUBLISH_SOURCE_COMMIT,(long)root->wm_id,(long)writeIncarnation,
+                                    (long)root->tree.current->commit,0L,0L,0L))tagged=1;
+    }
+#endif
+    if(!tagged)wm_signal_dirty(root->wm_id);
+    return 1;
 }
 static int surface_repaint(struct brook_surface *s) {
     while (s->tree.parent) s=s->tree.parent->user;

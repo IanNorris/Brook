@@ -7,6 +7,7 @@
 
 // Include the real header — sched_policy.h has no kernel dependencies.
 #include "../../kernel/src/sched_policy.h"
+#include "../../kernel/src/scheduler_affinity.h"
 
 // ---------- Test infrastructure ----------
 static int g_testsPassed = 0;
@@ -42,6 +43,15 @@ static SchedProcess MakeProc(uint16_t pid, uint8_t prio = SCHED_PRIORITY_NORMAL)
 }
 
 // ---------- Tests ----------
+
+TEST(cpu_affinity) {
+    ASSERT(SchedulerCpuEligible(0,3,0));
+    ASSERT(SchedulerCpuEligible(12,-1,3));
+    ASSERT(SchedulerCpuEligible(12,0,0));
+    ASSERT(!SchedulerCpuEligible(12,0,1));
+    ASSERT(SchedulerCpuEligible(12,3,3));
+    ASSERT(!SchedulerCpuEligible(12,3,0));
+}
 
 TEST(init_empty) {
     SchedPolicyState state;
@@ -286,6 +296,7 @@ TEST(many_processes_round_robin) {
 int main()
 {
     printf("SchedPolicy (MLFQ) tests:\n");
+    run_cpu_affinity();
     run_init_empty();
     run_enqueue_dequeue_single();
     run_fifo_same_priority();

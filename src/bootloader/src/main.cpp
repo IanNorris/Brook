@@ -5,6 +5,7 @@
 #include "config.h"
 #include "graphics.h"
 #include "memory.h"
+#include "firmware_runtime_cache.h"
 #include "acpi.h"
 #include "elf_loader.h"
 #include "fs.h"
@@ -105,7 +106,12 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         ConsolePrintLine(u"Recovery selected; verifying payload.");
         ConsoleSetQuiet(!g_bootConfig.debugText);
     }
-    bool updatePair = recoveryRequested && LoadRecoveryPair(imageHandle,
+    bool updatePair = false;
+#if defined(BROOK_GUARD_ALTERNATE_RECOVERY)
+    if (recoveryRequested) updatePair = LoadAlternateRecoveryPair(imageHandle,
+        systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
+#endif
+    if (recoveryRequested && !updatePair) updatePair = LoadRecoveryPair(imageHandle,
         systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
     if (updatePair) {
         ConsoleSetQuiet(false);
@@ -160,6 +166,11 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     PageTableAllocation pageTableAlloc = AllocatePageTables(systemTable->BootServices, kernelPhysPages);
     splash(5);
 
+    // Remember the physical entrypoint before leaving firmware. It is only
+    // handed off if the final memory map identifies it as runtime code.
+    const UINT64 efiResetSystem = systemTable->RuntimeServices
+        ? reinterpret_cast<UINT64>(systemTable->RuntimeServices->ResetSystem) : 0;
+
     // --- Memory map (must be last thing before ExitBootServices) ---
     brook::MemoryDescriptor* memoryMap = nullptr;
     UINT32 memoryMapCount              = 0;
@@ -180,7 +191,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         }
     }
 
-    // From here: no UEFI services available. No console output.
+    // No UEFI calls after ExitBootServices; capture the actual firmware page
+    // mappings while its original CR3 is still active.
+    const auto firmwareRuntimeCache = CaptureFirmwareRuntimeCache(memoryMap,memoryMapCount);
 
     // --- Build and activate page tables ---
     // After this, virtual 0xFFFFFFFF80000000 maps to kernelPhysBase.
@@ -203,6 +216,14 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.initrdPhysBase  = initrdData
         ? reinterpret_cast<uint64_t>(initrdData) : 0;
     bootProtocol.initrdSize      = initrdData ? initrdFileSize : 0;
+    bootProtocol.efiResetSystemPhysical = brook::BootEfiRuntimeCodeContains(
+        memoryMap, memoryMapCount, efiResetSystem) ? efiResetSystem : 0;
+    bootProtocol.efiRuntimeCacheFingerprint = firmwareRuntimeCache.fingerprint.hash;
+    bootProtocol.efiRuntimePat = firmwareRuntimeCache.pat;
+    bootProtocol.efiRuntimePatSlots = firmwareRuntimeCache.fingerprint.slots;
+    bootProtocol.efiRuntimeCacheValid = firmwareRuntimeCache.fingerprint.valid ? 1 : 0;
+    bootProtocol.efiRuntimeMtrrFingerprint = firmwareRuntimeCache.mtrr;
+    bootProtocol.efiRuntimeMtrrValid = firmwareRuntimeCache.mtrr ? 1 : 0;
 
     // --- Jump to kernel at virtual address ---
     // Use inline asm to ensure SysV calling convention:

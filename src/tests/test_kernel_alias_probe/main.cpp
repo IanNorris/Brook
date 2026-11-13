@@ -15,7 +15,8 @@ int main(){
     t.data[0][0]=0x2003;t.data[1][0]=0x3003;t.data[2][(va>>21)&511]=0x4003;
     const unsigned pt=(va>>12)&511;
     t.data[3][pt]=0x56789003;
-    assert(InspectKernelAlias(t,0x1000,va,out) && out.writable);
+    assert(InspectKernelAlias(t,0x1000,va,out) && out.writable && out.executable);
+    t.data[1][0]|=1ull<<63;assert(InspectKernelAlias(t,0x1000,va,out) && !out.executable);t.data[1][0]&=~(1ull<<63);
     t.data[1][0]=0x3001;assert(InspectKernelAlias(t,0x1000,va,out) && out.present && !out.writable);
     t.data[1][0]=0x3003;t.data[3][pt]=0x56789001;
     assert(InspectKernelAlias(t,0x1000,va,out) && out.present && !out.writable);

@@ -7,6 +7,11 @@ struct Device;
 bool GuardCheckerStart(Device* device);
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 bool GuardedDesktopBridgeEnabled();
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+struct AcShutdownRecord;
+bool GuardCheckedAcShutdownPrior(AcShutdownRecord& out);
+bool GuardRecordCheckedAcShutdown(const char (&bootId)[33]);
+#endif
 #endif
 #if defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP)
 void GuardTestPrepareDesktopHome();

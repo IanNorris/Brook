@@ -2662,9 +2662,13 @@ Quake/STK GPU resource-lifetime investigation.
 The later opt-in `BROOK_SCHED_START_TEST_HOOKS` kernel closes the ordinary-boot
 coverage gap for suspended user/kernel tasks, a fresh kernel thread and idle.
 It holds AP1/AP2 at first selection until a previously suspended user/kernel
-task is eligible, explicitly reserves a fresh thread for AP3, and selects idle
-on AP4. Kernel-thread affinity is normally ignored, so the fixture reservation
-is enforced separately in the test-only picker and cleared before fixture exit.
+task is eligible, pins a fresh thread to AP3, and selects idle on AP4. At the
+time of the historical run below kernel-thread affinity was ignored, so the
+fixture also enforced that reservation in its test-only picker. Current source
+honors explicit kernel-thread affinity and uses the production eligibility
+check for this pin. An eight-CPU KVM test with a controlled CPU-bound user
+process subsequently passed all four cases and the exact-ELF mutation audit at
+`build/workloads/affinity-smp-busy-20261106/audit.json`.
 The initial test boot happened to pass but review found that reservation race;
 its evidence is retained as preliminary, and the corrected run is authoritative.
 
@@ -2803,3 +2807,201 @@ The exact assembled release image also passed Opus output with the packaged
 Chromium configuration (no custom ALSA library/config), icon/MIME exports,
 compiler/Python/Git smoke, guarded restart, durable reopen and synced shutdown.
 The five-second Opus output had RMS 2840.4 and only isolated zero crossings.
+
+## Dell Chromium video and Broadwell VA-API, 13 November
+
+The local 720p60 H.264 clip with its audio track removed separates video
+presentation from the audio clock. Chromium dropped 12 of 2,172 frames
+headlessly with a 16.8 ms callback p95. The normal Wayland software run
+dropped 1,678 of 2,138 with 84 ms p95. A direct Wayland ANGLE GLES run
+reported the Intel HD Graphics 5500 renderer and enabled GPU compositing and
+rasterization. It retained software video decode and dropped 1,701 of 1,890
+frames with 203 ms p95. The harness verified the local test URL and queried
+the actual GPU process. The earlier diagnostic's malformed environment
+arguments selected an unrelated tab. The headless result isolates a large
+windowed rendering or presentation cost for this H.264 clip.
+
+On generation 349, the same local silent clip and windowed ANGLE GLES mode
+were run through the staged Iris launcher with the eight-buffer setting. It
+reported the same Intel renderer, enabled GPU compositing and software decode,
+and dropped 1,683 of 1,883 frames with a 199.6 ms callback p95. The job exited
+zero and the browser process tree drained. This cross-boot comparison shows no
+material improvement in the measured result. The launcher and setting were
+passed to Chromium, but this run did not independently inspect its GPU
+process's library mappings or establish how many Wayland buffers it used.
+It therefore does not rule out a buffer-depth benefit in a controlled path.
+Evidence: `gen349-playback-gpu-gles-iris-eight/` under the Dell media campaign.
+Two short follow-up attempts to inspect Chromium's GPU process through guest
+`/proc` did not establish the mapping: the first discarded entries when an
+environment field was unavailable; the corrected probe found GPU-process
+threads but no EGL or Gallium mappings in their reported maps, and the
+environment field remained unavailable. The second playback job also exited
+zero. This absence is an observation limit, not evidence that Iris was not
+loaded. See `gen349-gpu-iris-provenance{,-v2}/`.
+
+A `dlopen` interposer perturbed Chromium's native EGL lookup, so its resulting
+software-fallback run is invalid as a GPU control. A subsequent glibc loader
+audit left hardware compositing active and showed the GPU process loading
+stock Gallium before the selected patched EGL vendor. With the patched library
+directory placed first in that process's search path, the audit instead showed
+both patched Gallium and EGL loaded, with eight buffers requested. Two short
+same-boot controls still had approximately 198–199 ms callback p95 and dropped
+530/618 versus 524/591 frames at sample 7; these runs do not measure actual
+Wayland buffer allocations. The opt-in launcher was corrected to prepend its
+library directory. The rebuilt launcher independently loaded its matching EGL
+and Gallium in Chromium with GPU compositing enabled; its short control dropped
+520/588 frames at sample 7 with 199.1 ms p95. These are local silent H.264
+controls, not YouTube or audible-playback acceptance. The audit and fix do not
+explain the remaining presentation delay. See `gen349-gpu-library-{preload,
+audit,audit-first,audit-fixed}/` under the Dell media campaign.
+
+A short `WAYLAND_DEBUG=client` capture on generation 349 used the fixed Iris
+launcher, local silent 720p60 clip and windowed ANGLE GLES. Chromium reported
+Intel GPU compositing enabled; the job exited zero and drained. The main video
+window used one Wayland surface with three observed dmabuf buffer IDs, each
+1664×1284, and a viewport destination of 832×642. Across 75 positive intervals,
+frame requests were 184 ms median and 211 ms p95. Across 76 observed buffer
+attachments with a later matching release, attach-to-release was 184 ms median
+and 212 ms p95. In the steady trace the next frame request and attach followed
+the preceding callback and release at the same logged timestamp. This is a
+Wayland wire observation under logging overhead, not a GPU-execution or actual
+scanout timestamp, and IDs are scoped to the captured connection. The provider's
+frame timer explicitly defers callbacks while a surface image has a pending
+CPU snapshot; the wire trace alone cannot say how much time is producer fence,
+GPU handoff, CPU readback, event-loop scheduling or an unobserved reason.
+Evidence: `gen349-chromium-wayland-wire/trace-transfer/artifact.bin` under the
+Dell media campaign. Profile those stages before changing release or callback
+ordering; preserving committed-image lifetime and fallback remains necessary.
+
+A same-boot timed-provider comparison split that 184 ms interval. The baseline
+reported medians of 16 ms from enqueue to first poll, 96 ms from GPU source
+offer to safe acknowledgement, 3 ms in the final CPU-readiness call, 3 ms
+copying the image and 66 ms after the copy through fallback repaint. For a
+single full-size 1:1 ARGB image, a candidate writes the straight-alpha fallback
+directly from the retained snapshot, avoiding an intermediate blend and copy;
+it retains source-write guarding and commit tagging. Host package tests cover
+transparent, partial and opaque alpha, stride padding and the shortcut's
+execution. With the temporary candidate provider, median post-copy repaint fell
+to 11 ms and enqueue-to-repaint to 128 ms. Offer-to-ACK remained 96 ms. At the
+seventh two-second browser sample, callback p95 moved from 192 to 131.9 ms and
+drops from 521/588 to 566/668. These are one short same-boot run per arm with
+diagnostic logging, not a final playback or image-correctness acceptance.
+The candidate provider and browser exited zero with no pending or failed image
+operations; the original provider was restored. Full stage logs and captures:
+`gen349-wayland-stage-browser/` and `gen349-wayland-argb-browser/` under the Dell
+media campaign. Pixel/panel correctness under physical use, repeatability and
+the larger GPU handoff delay remain open.
+
+A second candidate run on that boot measured 12 ms median post-copy repaint,
+145 ms median enqueue-to-repaint and 112 ms median offer-to-ACK, with 147 ms
+callback p95 at sample 7. An independent completed-frame probe observed the
+expected opaque red and blue regions of a deterministic ARGB Wayland SHM
+fixture. It sampled two pixels and does not verify physical partial alpha or
+the whole panel. The candidate and fixture were stopped and the normal provider
+was restored. See `gen349-wayland-argb-browser-repeat/` and the observer job
+`14489cc272854efb820686e6aacd6326`.
+
+The earlier YouTube playback selected 854×480 AV1 with Opus and advanced
+about seven seconds during the observation with around 40 seconds buffered.
+Its callback p95 exceeded two seconds. A headless control with the same
+854×480 AV1/Opus variant still advanced only 2.45 seconds with about 48
+seconds buffered at the end. The HDA queue reserved 945 later gaps across
+that bracket. Headless H.264 performance does not explain that YouTube result.
+Temporary downstream ALSA staging held the HDA queue gap counter steady
+in the earlier local control. A headless run with 4,096 frames of staging
+reserved one later HDA gap across the bracket. YouTube selected a different
+720p AV1 variant and advanced only 3.34 seconds. Staging was disabled at
+the end. Audible continuity and smooth YouTube presentation remain unverified.
+
+A generated 854×480, 30 FPS AV1 video-only clip ran headlessly at realtime,
+dropped two of 1,074 frames and had a 33.4 ms callback p95. The clip matches
+the first YouTube control's dimensions, codec and nominal frame rate. The
+stream, audio, and page differ, so it isolates basic decode capability rather
+than the remaining YouTube delay.
+
+Adding a generated stereo 48 kHz Opus track to that same AV1 video slowed
+the default audio-driven playback clock to about 0.8× realtime. There were
+1,064 new HDA gap reservations and callback p95 reached 83.4 ms, despite no
+drops in the browser's video-frame counter. With downstream ALSA and 4,096
+frames of mixer staging, the local clip reached realtime, with one new gap
+reservation, 42 drops out of 1,049 frames and 33.4 ms callback p95 at the
+last sample. The audio counters measure queue reservations. Speaker output
+was not recorded. See `gen347-local-av1-opus-headless` and
+`gen347-local-av1-opus-headless-staging`.
+
+Feeding the same generated tracks to separate Chromium Media Source
+Extensions buffers with audio staging also played at realtime headlessly.
+It recorded 41 drops out of 1,041 frames, 33.4 ms callback p95 and one new
+HDA gap reservation. This local control buffers the complete clip before
+playback. YouTube uses its own streaming append schedule, content and page
+workload. See `gen347-local-av1-opus-mse-staging`.
+
+On the next checked generation 347 boot, DevTools' `Media` domain confirmed
+`ChunkDemuxer`, `Dav1dVideoDecoder` and `FFmpegAudioDecoder` on the YouTube
+720p60 AV1/Opus stream. The player reached `BUFFERING_HAVE_ENOUGH` and
+reported no media errors. It still advanced only 4.46 seconds in about
+38 seconds, with 34.43 seconds buffered, 77 drops out of 268 frames and a
+4.03-second callback p95. The HDA queue counter recorded zero new gap
+reservations while staging was active. See `gen347-youtube-staging-devtools`
+for the 34 raw media events and audio snapshots. [Chrome DevTools Media domain](https://chromedevtools.github.io/devtools-protocol/tot/Media/)
+
+On that boot a generated 1280×720 60 FPS AV1/Opus clip ran headlessly at
+realtime with the same staging settings. It recorded 3 drops in 1,980 frames,
+16.8 ms callback p95 and one new HDA gap reservation. This matches the
+YouTube stream's codecs, dimensions and nominal cadence. The source content,
+bitstream complexity, delivery and page differ. It rules out a general
+720p60 decode ceiling as the sole explanation. See
+`gen347-local-av1-opus-720p60-staging`.
+
+The following watch-page run collected Chromium Performance-domain task
+durations. From sample 4 to 9, the main thread recorded 9.081 seconds of
+tasks over 10.002 seconds. From sample 9 to 19 it recorded 2.327 seconds
+over 19.999 seconds, while media time advanced only 0.69 seconds. The initial
+main-thread load coincides with startup. The later stall persists after that
+load falls. The page retained over 30 seconds of buffered video and the HDA
+queue added one gap reservation. See `gen347-youtube-watch-perf`.
+
+A subsequent DevTools CPU sampling attempt produced only two samples over
+37.825 seconds, and this run never received video metadata or buffered
+media. It cannot attribute the earlier stall. The sampling request used a
+1 ms interval. See `gen347-youtube-watch-cpu-profile`.
+
+A local control installed a repeating JavaScript workload after the video
+element appeared. Its counter reached 89 executions, with about 17.9 seconds
+of script time by the last observation. DevTools again recorded only two CPU
+samples over 40.01 seconds at a requested 1 ms interval. This establishes
+that the sparse profile also occurs during sustained JavaScript activity.
+The profiler did not provide useful attribution in this control. V8's current
+POSIX sampler sends a thread-directed SIGPROF, and Brook's normal signal path
+delivers on syscall return. A QEMU-only IRQ-return experiment exists; its
+physical SMP behavior has not been validated. The signal path is a hypothesis
+for the missing samples. See `gen347-cpu-profiler-control-v2` and
+`xwayland-window-integration.md`. [V8 sampler](https://chromium.googlesource.com/v8/v8/+/refs/heads/main/src/libsampler/sampler.cc)
+
+The opt-in IRQ signal path was subsequently tested on the Dell, generation
+348. The no-syscall signal fixture passed, but the matched Chromium control
+still produced only three samples in 40.013 seconds, versus two in 40.010
+seconds on generation 347. Both controls reported 89 JavaScript workload
+iterations and approximately 17.9 seconds of script time. Thus this signal
+return-path fix alone does not restore useful DevTools sampling; investigate
+sampler startup, signal targeting and acknowledgement separately. The local
+control is headless and is not an assessment of on-screen video or YouTube.
+Evidence: `build/hardware/dell-media-20261113/gen348-cpu-profiler-control/`
+and `gen348-signal-irq-dell-detail/`.
+
+The same YouTube video's top-level embed page never supplied metadata or
+buffered media in the observation window. It produced no DevTools media
+events. It cannot isolate watch-page overhead. The next diagnostic needs a
+matching encoded stream played locally or decoder and renderer timing from
+the ordinary watch page. See `gen347-youtube-embed-staging-devtools`.
+
+Intel's [i965 support table](https://github.com/intel/intel-vaapi-driver/blob/master/README)
+lists H.264 and VP8 decode for Broadwell. The tested AV1 stream has no
+Broadwell hardware decode path. On Brook, pinned libva loaded i965 on
+`/dev/dri/renderD129`. The aperture query returned ENOTTY and the driver
+used its fallback size. The subsequent legacy `DRM_IOCTL_I915_GEM_MMAP`
+returned ENOTTY, then i965 aborted while mapping its initialization batch.
+This is a concrete startup gap. Video-engine execution is a separate
+driver prerequisite. Logs and job receipts are under
+`build/hardware/dell-media-20261113/` in `gen343-playback-headless-video-only`,
+`gen343-playback-angle-gles-verified-tab`, and `gen347-vaapi-i965-ioctls`.

@@ -19,14 +19,18 @@ from hardware import Hardware
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--host',required=True);p.add_argument('--port',type=int,default=1234)
+    p.add_argument('--index',type=int,action='append',help='Collect only the specified table index (repeatable)')
     p.add_argument('--output',required=True,type=Path)
     a=p.parse_args();out=a.output.absolute();out.mkdir(parents=True,exist_ok=False,mode=0o700)
     bridge=Hardware(out/'registry');attached=bridge.attach(a.host,a.port);session=attached['session']
     info=bridge.command(session,'bridge hardware acpi-info')
     if info.get('acpi_api')!=1 or not isinstance(info.get('tables'),int) or not 1<=info['tables']<=256:
         raise ValueError('Unsupported or excessive ACPI inventory')
+    indices=range(info['tables']) if a.index is None else sorted(set(a.index))
+    if any(not 0<=index<info['tables'] for index in indices):
+        raise ValueError('ACPI table index is outside the reported inventory')
     result={'guest_boot_id':attached['guest_boot_id'],'tables':[],'unavailable':[]};total=0
-    for index in range(info['tables']):
+    for index in indices:
         meta=bridge.command(session,f'bridge hardware acpi {index} 0 0')
         if 'acpi_error' in meta:
             result['unavailable'].append(index);continue
@@ -36,14 +40,20 @@ def main():
         total+=length
         if total>16*1024*1024:raise ValueError('ACPI inventory exceeds size bound')
         content=bytearray()
-        while len(content)<length:
-            offset=len(content);n=min(512,length-offset)
-            part=bridge.command(session,f'bridge hardware acpi {index} {offset} {n}')
-            if part.get('acpi_api')!=1 or part.get('index')!=index or part.get('offset')!=offset or part.get('length')!=length:
-                raise ValueError('ACPI table changed or response mismatched')
-            block=bytes.fromhex(part['hex'])
-            if len(block)!=n:raise ValueError('Short ACPI response')
-            content.extend(block)
+        with bridge.session_lock(session) as data:
+            while len(content)<length:
+                offsets=list(range(len(content),min(length,len(content)+4096),512))
+                sizes=[min(512,length-offset) for offset in offsets]
+                parts=bridge.guest_batch(data,[
+                    f'bridge hardware acpi {index} {offset} {size}'
+                    for offset,size in zip(offsets,sizes)
+                ])
+                for offset,size,part in zip(offsets,sizes,parts):
+                    if part.get('acpi_api')!=1 or part.get('index')!=index or part.get('offset')!=offset or part.get('length')!=length:
+                        raise ValueError('ACPI table changed or response mismatched')
+                    block=bytes.fromhex(part['hex'])
+                    if len(block)!=size:raise ValueError('Short ACPI response')
+                    content.extend(block)
         if struct.unpack_from('<I',content,4)[0]!=length or sum(content)&255:
             raise ValueError('ACPI table checksum or length mismatch')
         signature=bytes(content[:4]).decode('ascii',errors='replace')

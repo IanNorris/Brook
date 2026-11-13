@@ -9,6 +9,10 @@
 , libxcb ? (import ../../nix/nixpkgs.nix {}).libxcb
 , xorgserver ? (import ../../nix/nixpkgs.nix {}).xorg.xorgserver
 , python3 ? (import ../../nix/nixpkgs.nix {}).python3
+, enableVulkanCompositor ? false
+, glslang ? (import ../../nix/nixpkgs.nix {}).glslang
+, vulkanHeaders ? (import ../../nix/nixpkgs.nix {}).vulkan-headers
+, vulkanLoader ? (import ../../nix/nixpkgs.nix {}).vulkan-loader
 }:
 
 # Package the Brook Wayland server.
@@ -28,15 +32,28 @@ stdenv.mkDerivation {
     cp ${../../src/shared/dmabuf_layout.h} "$sourceRoot/dmabuf-layout.h"
     cp ${../../src/shared/wm_window_state.h} "$sourceRoot/wm-window-state.h"
     cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
+    cp ${../../src/shared/gpu_buffer_abi.h} "$sourceRoot/gpu_buffer_abi.h"
+    cp ${../../src/shared/gpu_window_source_abi.h} "$sourceRoot/gpu_window_source_abi.h"
+    cp ${../../src/shared/gpu_window_channel.h} "$sourceRoot/gpu_window_channel.h"
+    ${if enableVulkanCompositor then ''
+      cp ${../vulkan-compositor-pkg/renderer.c} "$sourceRoot/renderer.c"
+      cp ${../vulkan-compositor-pkg/renderer.h} "$sourceRoot/renderer.h"
+      cp ${../vulkan-compositor-pkg/surface.c} "$sourceRoot/surface.c"
+      cp ${../vulkan-compositor-pkg/surface.h} "$sourceRoot/surface.h"
+      cp ${../vulkan-compositor-pkg/scene.h} "$sourceRoot/scene.h"
+      cp ${../vulkan-compositor-pkg/composite.comp} "$sourceRoot/composite.comp"
+    '' else ""}
   '';
 
-  nativeBuildInputs = [ patchelf wayland-scanner ];
-  buildInputs = [ wayland libxcb ];
+  nativeBuildInputs = [ patchelf wayland-scanner ] ++ (if enableVulkanCompositor then [ glslang python3 ] else []);
+  buildInputs = [ wayland libxcb ] ++ (if enableVulkanCompositor then [ vulkanHeaders vulkanLoader ] else []);
   nativeCheckInputs = [ xkbcomp xorgserver python3 ];
   checkInputs = [ libxkbfile libX11 ];
   doCheck = true;
 
   checkPhase = ''
+    $CC -O2 -UNDEBUG -Wall -Wextra intel-pending-drain-test.c -o intel-pending-drain-test
+    ./intel-pending-drain-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         display-scale-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
@@ -102,6 +119,13 @@ stdenv.mkDerivation {
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o capture-release-test
     ./capture-release-test
+    ${if enableVulkanCompositor then ''
+      $CC -O2 -UNDEBUG -Wall -Wextra -DBROOK_DIRECT_TEST -I${wayland.dev}/include -I. \
+          capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+          linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
+          -L${wayland}/lib -lwayland-server -o direct-release-test
+      ./direct-release-test
+    '' else ""}
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         xwayland-shell-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
@@ -154,12 +178,40 @@ stdenv.mkDerivation {
     wayland-scanner server-header  $DMABUF_XML linux-dmabuf-unstable-v1-server-protocol.h
     wayland-scanner private-code   $DMABUF_XML linux-dmabuf-unstable-v1-protocol.c
 
+    ${if enableVulkanCompositor then ''
+      glslangValidator -V --target-env vulkan1.1 composite.comp -o composite.spv
+      glslangValidator -V --target-env vulkan1.1 -DBROOK_EXTERNAL_SOURCE=1 composite.comp -o composite_external.spv
+      glslangValidator -V --target-env vulkan1.1 -DBROOK_MULTI_SOURCE=1 composite.comp -o composite_multi.spv
+      glslangValidator -V --target-env vulkan1.1 -DBROOK_MULTI_SOURCE=1 -DBROOK_EXTERNAL_OUTPUT=1 composite.comp -o composite_output.spv
+      python3 - <<'PY'
+      import struct
+      from pathlib import Path
+      data = Path('composite.spv').read_bytes()
+      words = struct.unpack('<' + 'I' * (len(data)//4), data)
+      Path('compositor_spv.h').write_text('static const uint32_t compositorCode[] = {\n' +
+          ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+      data = Path('composite_external.spv').read_bytes()
+      words = struct.unpack('<' + 'I' * (len(data)//4), data)
+      Path('compositor_external_spv.h').write_text('static const uint32_t compositorExternalCode[] = {\n' +
+          ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+      data = Path('composite_multi.spv').read_bytes()
+      words = struct.unpack('<' + 'I' * (len(data)//4), data)
+      Path('compositor_multi_spv.h').write_text('static const uint32_t compositorMultiCode[] = {\n' +
+          ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+      data = Path('composite_output.spv').read_bytes()
+      words = struct.unpack('<' + 'I' * (len(data)//4), data)
+      Path('compositor_output_spv.h').write_text('static const uint32_t compositorOutputCode[] = {\n' +
+          ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+      PY
+    '' else ""}
+
     $CC -O2 -Wall -Wextra \
+        ${if enableVulkanCompositor then "-DBROOK_WAYLAND_VULKAN_COMPOSITOR renderer.c surface.c -I${vulkanHeaders}/include" else ""} \
         -I${wayland.dev}/include -I. \
         waylandd.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
-        -L${wayland}/lib -lwayland-server \
-        -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib \
+        -L${wayland}/lib -lwayland-server ${if enableVulkanCompositor then "-L${vulkanLoader}/lib -lvulkan" else ""} \
+        -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib${if enableVulkanCompositor then ":${vulkanLoader}/lib" else ""} \
         -o waylandd
     $CC -O2 -Wall -Wextra -I${libxcb.dev}/include xwm-helper.c \
         -L${libxcb}/lib -lxcb -lxcb-composite -o brook-xwm

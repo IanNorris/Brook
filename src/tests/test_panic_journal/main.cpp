@@ -36,6 +36,8 @@ int main() {
     assert(PanicJournalReadLatest(seed,out.data(),out.size(),record)==PanicJournalResult::Ok);
     assert(record.sequence==1 && record.bytes==first.size());
     assert(std::equal(first.begin(),first.end(),out.begin()));
+    assert(PanicJournalReadRanked(seed,out.data(),out.size(),record,1)==PanicJournalResult::NoValidRecord);
+    assert(PanicJournalReadRanked(seed,out.data(),out.size(),record,2)==PanicJournalResult::Invalid);
     MemoryDisk success=seed;success.reset();
     assert(PanicJournalWrite(success,second.data(),second.size())==PanicJournalResult::Ok);
     const unsigned operations=success.calls;
@@ -44,6 +46,8 @@ int main() {
     assert(PanicJournalReadLatest(success,out.data(),out.size(),record)==PanicJournalResult::Ok);
     assert(record.sequence==2 && record.bytes==second.size());
     assert(std::equal(second.begin(),second.end(),out.begin()));
+    assert(PanicJournalReadRanked(success,out.data(),out.size(),record,1)==PanicJournalResult::Ok);
+    assert(record.sequence==1 && std::equal(first.begin(),first.end(),out.begin()));
     // Every individual read, sector write, and flush is independently failed;
     // a torn sector write must never destroy the previous committed slot.
     for(unsigned failure=1;failure<=operations;++failure)for(bool partial:{false,true}) {
@@ -58,9 +62,28 @@ int main() {
     success.bytes[PanicJournalSlotSectors*PanicJournalSector+PanicJournalSector+5]^=1;
     assert(PanicJournalReadLatest(success,out.data(),out.size(),record)==PanicJournalResult::Ok);
     assert(record.sequence==1 && std::equal(first.begin(),first.end(),out.begin()));
+    assert(PanicJournalReadRanked(success,out.data(),out.size(),record,1)==PanicJournalResult::NoValidRecord);
     MemoryDisk corrupt;corrupt.bytes[0]=1;
     assert(PanicJournalWrite(corrupt,first.data(),first.size())==PanicJournalResult::NoValidRecord);
     assert(corrupt.writes==0);
+    // A recognizable torn first header must not prevent the next panic from
+    // using the other slot, and that damaged evidence must remain untouched.
+    for(unsigned damagedSlot=0;damagedSlot<2;++damagedSlot) {
+        MemoryDisk torn;
+        auto* header=torn.bytes.data()+damagedSlot*PanicJournalSlotSectors*PanicJournalSector;
+        std::memcpy(header,"BRKPAN01",8);PanicJournalPut32(header+8,1);
+        PanicJournalPut32(header+12,123); // intentionally invalid header CRC
+        const auto original=torn.bytes;
+        PanicJournalRecord a{},b{};
+        assert(PanicJournalInspect(torn,0,a)==PanicJournalResult::Ok);
+        assert(PanicJournalInspect(torn,1,b)==PanicJournalResult::Ok);
+        assert(PanicJournalWritable(a,b));
+        assert(PanicJournalWrite(torn,first.data(),first.size())==PanicJournalResult::Ok);
+        const auto begin=damagedSlot*PanicJournalSlotSectors*PanicJournalSector;
+        assert(std::equal(original.begin()+begin,original.begin()+begin+PanicJournalSlotSectors*PanicJournalSector,torn.bytes.begin()+begin));
+        assert(PanicJournalReadLatest(torn,out.data(),out.size(),record)==PanicJournalResult::Ok);
+        assert(record.sequence==1 && std::equal(first.begin(),first.end(),out.begin()));
+    }
     assert(PanicJournalWrite(seed,nullptr,1)==PanicJournalResult::Invalid);
     assert(PanicJournalWrite(seed,first.data(),0)==PanicJournalResult::Invalid);
     assert(PanicJournalWrite(seed,first.data(),PanicJournalPayloadMax+1)==PanicJournalResult::Invalid);

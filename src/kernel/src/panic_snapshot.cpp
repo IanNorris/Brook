@@ -7,8 +7,11 @@
 namespace brook {
 namespace {
 uint8_t packet[PanicJournalPayloadMax]{};
+uint8_t previousPacket[PanicJournalPayloadMax]{};
 GuardPanicSnapshot snapshot{};
+GuardPanicSnapshot previousSnapshot{};
 bool ready=false;
+bool previousReady=false;
 bool attempted=false;
 }
 void PanicNormalSnapshotLoad() {
@@ -31,15 +34,26 @@ void PanicNormalSnapshotLoad() {
     } reader{node};
     PanicJournalRecord record{};
     const auto result=PanicJournalReadLatest(reader,packet,sizeof(packet),record);
+    PanicJournalRecord previous{};
+    const auto previousResult=result==PanicJournalResult::Ok ?
+        PanicJournalReadRanked(reader,previousPacket,sizeof(previousPacket),previous,1) : result;
     VfsRelease(node);
     if(result!=PanicJournalResult::Ok)return;
     snapshot={packet,record.sequence,record.bytes,record.checksum};
     __atomic_store_n(&ready,true,__ATOMIC_RELEASE);
+    if(previousResult==PanicJournalResult::Ok && previous.sequence<record.sequence) {
+        previousSnapshot={previousPacket,previous.sequence,previous.bytes,previous.checksum};
+        __atomic_store_n(&previousReady,true,__ATOMIC_RELEASE);
+    }
     KPrintf("NORMAL_PANIC_PRIOR sequence=%lu bytes=%u crc=%x\n",record.sequence,record.bytes,record.checksum);
 }
 bool GuardRecoveryPanicSnapshot(GuardPanicSnapshot& out) {
     out={};if(!__atomic_load_n(&ready,__ATOMIC_ACQUIRE))return false;
     out=snapshot;return true;
+}
+bool GuardRecoveryPanicPreviousSnapshot(GuardPanicSnapshot& out) {
+    out={};if(!__atomic_load_n(&previousReady,__ATOMIC_ACQUIRE))return false;
+    out=previousSnapshot;return true;
 }
 }
 #endif

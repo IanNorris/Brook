@@ -2,6 +2,9 @@
 // interrupt context.  No SSE/FPU registers are touched here.
 #include "panic.h"
 #include "panic_test_reset.h"
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+#include "ahci_readonly.h"
+#endif
 #include "serial.h"
 #include "tty.h"
 #include "panic_qr.h"
@@ -162,7 +165,7 @@ static void SerialPutHex64(uint64_t v)
 // ---- Minimal printf fan-out (no va_copy — serial first, TTY second) ---------
 // We use a simple char-buffer approach to avoid needing va_copy from
 // -mgeneral-regs-only context (where the ABI for va_list is tricky).
-static char g_panicBuf[512];
+static char g_panicBuf[brook::PANIC_MESSAGE_MAX_BYTES + 1];
 
 static int PanicFormatStr(char* buf, int cap, const char* fmt, __builtin_va_list args)
 {
@@ -299,6 +302,9 @@ static uint32_t g_panicOwner = 0;
 __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
 {
     __asm__ volatile("cli");
+#if defined(BROOK_AHCI_PANIC_CONTENTION_TEST)
+    brook::AhciPanicTestWaitForWriter();
+#endif
     brook::SerialPanicBegin();
 
     const uint32_t cpu = brook::SmpCurrentCpuIndex();
@@ -399,6 +405,10 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     }
     brook::SerialPanicPuts("System halted.\n");
 
+    // Reserve the journal writer while an in-flight peer can still complete.
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+    brook::AhciPanicReserveBeforeHalt();
+#endif
     // Halt other CPUs AFTER serial output — if the NMI broadcast crashes,
     // we've already printed the full diagnostic to serial.
     brook::SmpHaltAllAPs();

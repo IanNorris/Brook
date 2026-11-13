@@ -1,0 +1,48 @@
+--- a/src/egl/drivers/dri2/egl_dri2.h
++++ b/src/egl/drivers/dri2/egl_dri2.h
+@@ -360,7 +360,7 @@
+ #endif
+       bool locked;
+       int age;
+-   } color_buffers[4], *back, *current;
++   } color_buffers[8], *back, *current;
+ #endif
+ 
+ #ifdef HAVE_ANDROID_PLATFORM
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -1257,6 +1257,8 @@
+                     surf_modifiers_count, &dri2_dpy->formats);
+ }
+ 
++enum { BROOK_WAYLAND_DEFAULT_BUFFERS = 4 };
++
+ static void
+ wait_for_free_buffer(struct dri2_egl_display *dri2_dpy,
+                      struct dri2_egl_surface *dri2_surf)
+@@ -1266,8 +1268,15 @@
+    /* There might be a buffer release already queued that wasn't processed */
+    wl_display_dispatch_queue_pending(dri2_dpy->wl_dpy, dri2_surf->wl_queue);
+ 
++   int buffer_limit = BROOK_WAYLAND_DEFAULT_BUFFERS;
++   const char *requested = getenv("BROOK_MESA_WAYLAND_BUFFERS");
++   if (requested && !strcmp(requested, "6"))
++      buffer_limit = 6;
++   if (requested && !strcmp(requested, "8"))
++      buffer_limit = 8;
++
+    while (dri2_surf->back == NULL) {
+-      for (int i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
++      for (int i = 0; i < buffer_limit; i++) {
+          /* Get an unlocked buffer, preferably one with a dri_buffer
+           * already allocated and with minimum age.
+           */
+@@ -2862,7 +2871,7 @@
+ 
+    /* else choose any another free location */
+    while (!dri2_surf->back) {
+-      for (int i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
++      for (int i = 0; i < BROOK_WAYLAND_DEFAULT_BUFFERS; i++) {
+          if (!dri2_surf->color_buffers[i].locked) {
+             dri2_surf->back = &dri2_surf->color_buffers[i];
+             if (dri2_surf->back->wayland_buffer.buffer)

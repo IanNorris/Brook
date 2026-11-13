@@ -130,10 +130,9 @@ UINTN BuildMemoryMap(
         EFI_MEMORY_DESCRIPTOR* src   = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)uefiBuffer + i * descriptorSize);
         brook::MemoryDescriptor& dst = descriptors[i];
 
-        dst.physicalStart = src->PhysicalStart;
-        dst.pageCount     = src->NumberOfPages;
-        dst.type          = ConvertMemoryType(src->Type);
-        dst._reserved     = 0;
+        dst = brook::BootMemoryDescriptor(src->PhysicalStart, src->NumberOfPages,
+            ConvertMemoryType(src->Type), src->Attribute,
+            src->Type == EfiRuntimeServicesCode, src->Type == EfiRuntimeServicesData);
     }
 
     *outMap   = descriptors;

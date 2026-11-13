@@ -39,6 +39,11 @@ def main():
     second=file_node('second\0'.encode('utf-16-le'))
     parsed_option=parse_option(option(first+b'\x7f\x01\x04\x00'+second+end))
     assert [instance['files'] for instance in parsed_option['instances']]==[['first'],['second']]
+    parsed_option=parse_option(option(first+end+second+end))
+    assert [instance['device_path_index'] for instance in parsed_option['instances']]==[0,1]
+    assert [instance['files'] for instance in parsed_option['instances']]==[['first'],['second']]
+    rejected(parse_option, option(first+end+second))
+    rejected(parse_option, option(first+end+end))
     rejected(parse_option, option(end[:-1]))
     rejected(parse_inventory, report([('BootOrder', b'\0\0\0\0')]))
     print('Firmware inventory parser: PASS')

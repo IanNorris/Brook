@@ -13,7 +13,16 @@ constexpr uint32_t PanicJournalSectors = 2 * PanicJournalSlotSectors;
 
 enum class PanicJournalResult { Ok, Invalid, ReadFailed, NoValidRecord, Ambiguous,
                                 Exhausted, WriteFailed, FlushFailed, VerifyFailed };
-struct PanicJournalRecord { bool valid=false, blank=false; uint64_t sequence=0; uint32_t bytes=0, checksum=0; };
+struct PanicJournalRecord { bool valid=false, blank=false, recognized=false; uint64_t sequence=0; uint32_t bytes=0, checksum=0; };
+
+// An interrupted initial header publication may leave one recognizable but
+// invalid record. Preserve that slot and admit only the still-blank header;
+// arbitrary nonzero contents do not authorize a write to the journal.
+inline bool PanicJournalWritable(const PanicJournalRecord& a,const PanicJournalRecord& b) {
+    if(a.valid && b.valid && a.sequence==b.sequence)return false;
+    return a.valid || b.valid || (a.blank && b.blank) ||
+        (a.blank && b.recognized) || (b.blank && a.recognized);
+}
 
 inline uint32_t PanicJournalCrcUpdate(uint32_t crc, const uint8_t* data, uint32_t size) {
     while (size--) { crc ^= *data++; for (unsigned i=0;i<8;++i) crc=(crc>>1) ^ (0xedb88320u & (0u-(crc&1u))); }
@@ -36,8 +45,9 @@ PanicJournalResult PanicJournalInspect(Io& io,unsigned slot,PanicJournalRecord& 
     bool blank=true;for(auto b:sector)if(b){blank=false;break;}out.blank=blank;
     const uint8_t magic[8]={'B','R','K','P','A','N','0','1'};
     for(unsigned i=0;i<8;++i)if(sector[i]!=magic[i])return PanicJournalResult::Ok;
+    out.recognized=PanicJournalGet32(sector+8)==1;
     const uint32_t headerCrc=PanicJournalGet32(sector+28);PanicJournalPut32(sector+28,0);
-    if(PanicJournalGet32(sector+8)!=1 || PanicJournalCrc(sector,sizeof(sector))!=headerCrc)return PanicJournalResult::Ok;
+    if(!out.recognized || PanicJournalCrc(sector,sizeof(sector))!=headerCrc)return PanicJournalResult::Ok;
     const uint32_t bytes=PanicJournalGet32(sector+12);const uint64_t sequence=PanicJournalGet64(sector+16);
     const uint32_t checksum=PanicJournalGet32(sector+24);
     if(!bytes || bytes>PanicJournalPayloadMax || !sequence)return PanicJournalResult::Ok;
@@ -56,14 +66,15 @@ PanicJournalResult PanicJournalInspect(Io& io,unsigned slot,PanicJournalRecord& 
 // it only after Ok. Recheck the copied payload so media changes during the
 // two reads cannot silently produce a successful inconsistent capture.
 template<class Io>
-PanicJournalResult PanicJournalReadLatest(Io& io,uint8_t* output,uint32_t capacity,PanicJournalRecord& result) {
-    result={};if(!output)return PanicJournalResult::Invalid;
+PanicJournalResult PanicJournalReadRanked(Io& io,uint8_t* output,uint32_t capacity,PanicJournalRecord& result,unsigned rank) {
+    result={};if(!output || rank>1)return PanicJournalResult::Invalid;
     PanicJournalRecord slots[2];
     for(unsigned i=0;i<2;++i) {const auto r=PanicJournalInspect(io,i,slots[i]);if(r!=PanicJournalResult::Ok)return r;}
     if(slots[0].valid && slots[1].valid && slots[0].sequence==slots[1].sequence)return PanicJournalResult::Ambiguous;
     int newest=-1;if(slots[0].valid)newest=0;
     if(slots[1].valid && (newest<0 || slots[1].sequence>slots[0].sequence))newest=1;
     if(newest<0)return PanicJournalResult::NoValidRecord;
+    if(rank) {newest=1-newest;if(!slots[newest].valid)return PanicJournalResult::NoValidRecord;}
     if(capacity<slots[newest].bytes)return PanicJournalResult::Invalid;
     uint8_t sector[PanicJournalSector];uint32_t done=0,index=1;
     const uint32_t base=uint32_t(newest)*PanicJournalSlotSectors;
@@ -76,6 +87,10 @@ PanicJournalResult PanicJournalReadLatest(Io& io,uint8_t* output,uint32_t capaci
     if(PanicJournalCrc(output,done)!=slots[newest].checksum)return PanicJournalResult::VerifyFailed;
     result=slots[newest];return PanicJournalResult::Ok;
 }
+template<class Io>
+PanicJournalResult PanicJournalReadLatest(Io& io,uint8_t* output,uint32_t capacity,PanicJournalRecord& result) {
+    return PanicJournalReadRanked(io,output,capacity,result,0);
+}
 
 template<class Io>
 PanicJournalResult PanicJournalWrite(Io& io,const uint8_t* payload,uint32_t bytes) {
@@ -86,9 +101,9 @@ PanicJournalResult PanicJournalWrite(Io& io,const uint8_t* payload,uint32_t byte
     int newest=-1;
     if(slots[0].valid)newest=0;
     if(slots[1].valid && (newest<0 || slots[1].sequence>slots[0].sequence))newest=1;
-    if(newest<0 && (!slots[0].blank || !slots[1].blank))return PanicJournalResult::NoValidRecord;
+    if(newest<0 && !PanicJournalWritable(slots[0],slots[1]))return PanicJournalResult::NoValidRecord;
     if(newest>=0 && slots[newest].sequence==~uint64_t(0))return PanicJournalResult::Exhausted;
-    const unsigned target=newest<0?0:unsigned(1-newest);
+    const unsigned target=newest<0?(slots[0].blank?0:1):unsigned(1-newest);
     const uint64_t sequence=newest<0?1:slots[newest].sequence+1;
     const uint32_t checksum=PanicJournalCrc(payload,bytes),base=target*PanicJournalSlotSectors;
     uint8_t sector[PanicJournalSector]{};

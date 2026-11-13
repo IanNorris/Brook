@@ -35,6 +35,7 @@ class PreparePair(unittest.TestCase):
         self.policy = self.root / 'policy'
         self.policy.write_bytes(b'preserve boot policy\n')
         subprocess.run(['mcopy', '-i', str(self.image), str(self.policy), '::/ETC/policy'], check=True)
+        subprocess.run(['mcopy','-i',str(self.image),'-','::/BOOT/INIT.RC'],input=b'set wm\n',check=True)
 
     def prepare(self, out, payload='test-pair', version=64):
         with patch.object(pair, 'module_version', return_value=version):
@@ -49,6 +50,18 @@ class PreparePair(unittest.TestCase):
         self.assertEqual(json.loads((out / 'manifest.json').read_text()), result)
         self.assertEqual(subprocess.check_output(['mtype', '-i', str(self.image), '::/DRIVERS/xhci.mod']),
                          b'old-xhci.mod')
+
+    def test_irq_signal_probe_is_explicit_and_recorded(self):
+        with patch.object(pair, 'module_version', return_value=64):
+            result = pair.prepare(self.image, self.build, 64, 'test', self.root / 'irq',
+                                  pair.digest(b'kernel'), enable_irq_signal_probe=True)
+        self.assertIn('irq-signal-probe', result['enabled_boot_options'])
+        self.assertEqual(subprocess.check_output(['mtype', '-i', str(self.root / 'irq/INITRD.IMG'),
+                                                  '::/ETC/irq-signal-probe']), b'1\n')
+        result = self.prepare(self.root / 'normal')
+        self.assertNotIn('irq-signal-probe', result['enabled_boot_options'])
+        self.assertNotEqual(subprocess.run(['mtype', '-i', str(self.root / 'normal/INITRD.IMG'),
+                                           '::/ETC/irq-signal-probe'], capture_output=True).returncode, 0)
 
     def test_wrong_abi_and_missing_module_do_not_publish(self):
         out = self.root / 'out'
@@ -92,6 +105,60 @@ class PreparePair(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pair.prepare(self.image,self.build,64,'test',self.root/'bad',pair.digest(b'kernel'),exporter)
         self.assertFalse((self.root/'bad').exists())
+
+    def test_vulkan_desktop_requires_opt_in_and_is_exact(self):
+        supervisor=self.root/'supervisor';supervisor.write_bytes(b'\x7fELF-supervisor')
+        renderer=self.root/'renderer';renderer.write_bytes(b'\x7fELF-renderer')
+        with patch.object(pair,'module_version',return_value=64):
+            result=pair.prepare(self.image,self.build,64,'test',self.root/'vulkan',pair.digest(b'kernel'),
+                                enable_vulkan_desktop=True,vulkan_supervisor=supervisor,vulkan_renderer=renderer)
+        script=subprocess.check_output(['mtype','-i',str(self.root/'vulkan/INITRD.IMG'),'::/BOOT/INIT.RC'])
+        self.assertEqual(script,pair.add_vulkan_desktop_start(b'set wm\n'))
+        self.assertIn('vulkan-desktop',result['enabled_boot_options'])
+        self.assertEqual(result['vulkan_executables_sha256']['VKRENDER.ELF'],pair.digest(renderer.read_bytes()))
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(self.root/'vulkan/INITRD.IMG'),'::/BOOT/VKSUP.ELF']),supervisor.read_bytes())
+        with self.assertRaises(ValueError):pair.add_vulkan_desktop_start(script)
+        partial=pair.add_vulkan_desktop_start(b'set wm\n',True)
+        self.assertIn(pair.VULKAN_PARTIAL_START,partial)
+        with self.assertRaises(ValueError):pair.add_vulkan_desktop_start(partial)
+        with self.assertRaises(ValueError):pair.add_vulkan_desktop_start(script,True)
+        with self.assertRaisesRegex(ValueError,'exactly one'):
+            pair.add_vulkan_desktop_start(b'set wm\n',True,True)
+        source=b'set wm\n'+pair.GPU_PROVIDER+b'\n'
+        gpu=pair.add_vulkan_desktop_start(source,True,True)
+        self.assertIn(pair.GPU_PROVIDER+b' --gpu-source '+pair.GPU_SOCKET+b'\n',gpu)
+        self.assertIn(b'/boot/VKSUP.ELF --partial --gpu-source '+pair.GPU_SOCKET+b' /boot/VKRENDER.ELF\n',gpu)
+        with self.assertRaises(ValueError):pair.add_vulkan_desktop_start(gpu,True,True)
+        with self.assertRaises(ValueError):pair.add_vulkan_desktop_start(source+pair.GPU_PROVIDER+b'\n',True,True)
+        traced=pair.add_vulkan_desktop_start(source,True,True,True)
+        self.assertIn(b'--trace-gpu-source /boot/VKRENDER.ELF',traced)
+        with self.assertRaisesRegex(ValueError,'requires GPU source'):
+            pair.add_vulkan_desktop_start(source,True,False,True)
+        subprocess.run(['mcopy','-o','-i',str(self.image),'-','::/BOOT/INIT.RC'],input=source,check=True)
+        provider=self.root/'provider';provider.write_bytes(b'\x7fELF-provider')
+        with patch.object(pair,'module_version',return_value=64):
+            result=pair.prepare(self.image,self.build,64,'test',self.root/'source-pair',pair.digest(b'kernel'),
+                enable_vulkan_desktop=True,vulkan_supervisor=supervisor,vulkan_renderer=renderer,
+                enable_vulkan_partial=True,gpu_source_provider=provider)
+        image=self.root/'source-pair/INITRD.IMG'
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC']),gpu)
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INTLWL.ELF']),provider.read_bytes())
+        self.assertEqual(result['vulkan_executables_sha256']['INTLWL.ELF'],pair.digest(provider.read_bytes()))
+        self.assertIn('gpu-source',result['enabled_boot_options'])
+        with patch.object(pair,'module_version',return_value=64):
+            with self.assertRaisesRegex(ValueError,'requires Vulkan'):
+                pair.prepare(self.image,self.build,64,'test',self.root/'source-missing',pair.digest(b'kernel'),gpu_source_provider=provider)
+        subprocess.run(['mcopy','-o','-i',str(self.image),'-','::/BOOT/INIT.RC'],input=b'set wm\n',check=True)
+        for old in pair.VULKAN_OLD_STARTS:
+            with self.assertRaises(ValueError):pair.add_vulkan_desktop_start(b'set wm\n'+old+b'\n')
+        with patch.object(pair,'module_version',return_value=64):
+            partialResult=pair.prepare(self.image,self.build,64,'test',self.root/'partial',pair.digest(b'kernel'),
+                enable_vulkan_desktop=True,vulkan_supervisor=supervisor,vulkan_renderer=renderer,enable_vulkan_partial=True)
+        self.assertIn('vulkan-partial',partialResult['enabled_boot_options'])
+        self.assertEqual(subprocess.check_output(['mtype','-i',str(self.root/'partial/INITRD.IMG'),'::/BOOT/INIT.RC']),partial)
+        with self.assertRaisesRegex(ValueError,'requires Vulkan'):
+            pair.prepare(self.image,self.build,64,'test',self.root/'partial-missing',pair.digest(b'kernel'),enable_vulkan_partial=True)
+        with self.assertRaises(ValueError):pair.prepare(self.image,self.build,64,'test',self.root/'missing',pair.digest(b'kernel'),enable_vulkan_desktop=True)
 
     def test_optional_fat_checker_requires_pin_and_is_read_back(self):
         checker=self.root/'fat-checker';checker.write_bytes(elf())

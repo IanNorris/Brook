@@ -60,3 +60,6 @@ extern "C" void IoApicUnregisterHandler(uint8_t irq, void* handler);
 
 // Optional boot-only provider preflight; caller serializes boot registration.
 bool IoApicHandlerCapacity(uint8_t irq, void* handler);
+// Reserve an unused boot route and install its stub while the pin is masked.
+// The owning driver publishes its interrupt callback before unmasking.
+uint8_t IoApicInstallMaskedBootHandler(uint8_t pin,void* handler);

@@ -1,4 +1,5 @@
 #include "../../kernel/src/ahci_byte_write.h"
+#include "../../kernel/src/ahci_panic_gate.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -17,6 +18,22 @@ struct Disk {
         assert(lba*512+count*512<=data.size());memcpy(data.data()+lba*512,in,count*512);return true;
     }
 };
+struct PendingDisk : Disk {
+    AhciPanicGate gate;
+    bool requestOnRead=false;
+    bool read(uint64_t lba,uint32_t count,uint8_t* out) {
+        if(gate.PanicPending())return false;
+        bool ok=Disk::read(lba,count,out);
+        if(requestOnRead)assert(gate.RequestPanic()==AhciPanicGate::Request::Pending);
+        return ok;
+    }
+    bool write(uint64_t lba,uint32_t count,const uint8_t* in) {
+        if(gate.PanicPending())return false;
+        bool ok=Disk::write(lba,count,in);
+        assert(gate.RequestPanic()==AhciPanicGate::Request::Pending);
+        return ok;
+    }
+};
 int main() {
     Disk d;d.data.resize(256*512);std::vector<uint8_t> oracle=d.data,scratch(65536),in(90000);
     std::mt19937 rnd(4916);
@@ -33,4 +50,10 @@ int main() {
     d.failRead=0;d.failWrite=d.writes+2;d.partialFailure=true;
     assert(AhciByteWrite(d,0,in.data(),65536+512,256,scratch.data())==65536);
     assert(d.writes==d.failWrite); // no command after an uncertain write
+    { PendingDisk pending;pending.data.resize(256*512);assert(pending.gate.EnterNormal());
+      assert(AhciByteWrite(pending,0,in.data(),65536+512,256,scratch.data())==65536);
+      assert(pending.writes==1);pending.gate.LeaveNormal();assert(pending.gate.PanicOwned()); }
+    { PendingDisk pending;pending.data.resize(256*512);pending.requestOnRead=true;assert(pending.gate.EnterNormal());
+      assert(AhciByteWrite(pending,1,in.data(),1,256,scratch.data())==-5);
+      assert(pending.reads==1 && pending.writes==0);pending.gate.LeaveNormal();assert(pending.gate.PanicOwned()); }
 }

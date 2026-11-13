@@ -23,6 +23,7 @@
 #include "net.h"
 #include "xhci_ownership.h"
 #include "xhci_controller_reset.h"
+#include "usb_boot_health.h"
 #include "xhci_root_port.h"
 #include "xhci_intel_routing.h"
 #include "xhci_msi.h"
@@ -59,6 +60,7 @@ MODULE_IMPORT_SYMBOL(PciConfigWrite16);
 MODULE_IMPORT_SYMBOL(PciConfigWrite32);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
+MODULE_IMPORT_SYMBOL(UsbBootReportReset);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
@@ -628,12 +630,15 @@ static bool XhciReset(XhciController& ctrl)
     } io{ctrl};
     const uint64_t started=ApicTickCount();
     const auto result = XhciResetController(io, ctrl.pciDev.vendorId==0x8086, 10000, 500000000);
+    const bool sampleStatus=result.phase==XhciResetPhase::ExistingReset &&
+                            result.error==XhciResetError::Timeout;
+    const uint32_t statusNow=sampleStatus?io.status():0;
+    UsbBootReportReset(ctrl.pciDev.vendorId,ctrl.pciDev.deviceId,
+        static_cast<uint32_t>(result.phase),static_cast<uint32_t>(result.error),
+        result.command,result.status,statusNow,sampleStatus && statusNow!=0xffffffffu,ApicTickCount()-started);
     if (result.error != XhciResetError::None) {
         // The wait may have sampled only USBCMD; label its last status and
         // take a fresh status sample after the bounded wait for diagnostics.
-        const bool sampleStatus=result.phase==XhciResetPhase::ExistingReset &&
-                                result.error==XhciResetError::Timeout;
-        const uint32_t statusNow=sampleStatus?io.status():0;
         KPrintf("xhci: reset failed phase=%u error=%u USBCMD=0x%x USBSTS_last=0x%x USBSTS_now=0x%x valid=%u elapsed=%lu ms\n",
                 static_cast<unsigned>(result.phase),static_cast<unsigned>(result.error),
                 result.command,result.status,statusNow,(sampleStatus && statusNow!=0xffffffffu)?1u:0u,ApicTickCount()-started);

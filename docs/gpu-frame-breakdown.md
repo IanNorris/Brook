@@ -1,8 +1,339 @@
 # Empty desktop frame breakdown
 
+**Configuration correction:** The generation-351/352 tests immediately below used the default four Wayland buffers: their launcher was capable of eight, but `BROOK_MESA_WAYLAND_BUFFERS=8` was not set. They compare their own arms only. A later corrected eight-buffer run on generation 352 achieved 66.65 and 68.76 completed SDL swaps/s in two bounded demos, but only 120 distinct direct compositor commits were recorded during the 8.74 s observed window (about 13.7/s). That ledger covers nearly the whole window, with 218 later rows dropped over its lifetime. These are not physical scanout counts; the disparity makes visible frame delivery the next question. Exact launcher and evidence are in `docs/agent/HANDOVER.md`.
+
+## Physical compositor workload and GPU interval (generation 352)
+
+The 1280×720 Quake drawable was shown in a 2560×1440 physical window at the provider's 200% output scale. A diagnostic run logged 4,603,760 damaged pixels for 125 game-scene preparations on the 3200×1800 output. Damage includes conservative bounds for all visible windows, chrome and overlays; it is not a count of changed pixels. Its log interval includes game startup and idle rather than exact demo markers.
+
+In a separate serial-partial run, 62 direct compositor frames finishing during the 180-record demo had valid GPU timestamps. Median/p95 TOP_OF_PIPE-to-BOTTOM_OF_PIPE command-buffer interval was 36.317/36.448 ms; submitted-to-observed-completion was 49.5/53 ms. The GPU interval includes command-buffer barriers and dispatches, and possible scheduling effects. It is neither isolated shader execution nor panel scanout, and independently computed percentiles must not be subtracted. The 512-row recorder dropped 147 later rows. Evidence and boot identity are in the current handover and `build/hardware/dell-present-ownership-20261113/gen352-gputime-quake/`.
+
+On the same boot, bounded scanout fairness actually moved 198 eligible render submissions ahead of pending copies, with 198 subsequent forced services. A separate off/on pair measured 29.13/29.39 completed swaps/s under overlapping partial composition; this does not establish a small difference. Reusing the full cached wallpaper instead of copying packed wallpaper tiles measured 40.07/40.23 swaps/s in a serial-partial pair, with 204 distinct observed direct commits per arm. Each comparison is one sequential pair, not proof of visual equivalence or absence of a small effect. Both policies remain opt-in.
+
+## Direct fence wait under serial and overlapping desktop work
+
+On the Dell, the existing direct-`ioctl` and kernel TSC probes reconciled eight complete Quake frame intervals per arm. Serial intervals totaled 98.967 ms; overlap totaled 254.000 ms. Time sleeping in Intel `SYNCOBJ_WAIT` rose from 67.383 to 220.903 ms, accounting for nearly all of the 155.033 ms difference. Median app queue-to-worker-take rose from 3.95 to 53.82 ms across nine matched app submissions per arm. App issue-to-observed-breadcrumb medians were 3.31 and 3.40 ms; matched compositor intervals were 32.90 ms for one serial submission and median 34.33 ms for four overlap submissions. These timings include worker observation and scheduling and the limited samples are not GPU-only execution times. About 31.69/96.41 ms of app fence sleep coincided with observed compositor issue-to-breadcrumb intervals; correlation does not assign the whole wait to those submissions. Both traces reported zero drops. Raw traces and fence IDs are under `build/hardware/dell-present-ownership-20261113/gen350-fence-compare/`.
+
+## Quake with dependent overlap, corrected socket ownership
+
+On generation 350 the renderer and provider ran as the same UID, and the trace matched game-window incarnations and commits. The 600-record control took 10.122 s (601 observed swaps), while dependent overlap took 15.983 s (602). The marker-window sum inside `SDL_GL_SwapWindow` increased from 8.935 to 14.809 s; the remaining window was 1.187 versus 1.174 s. Guest timestamps have 1 ms resolution and marker observation can include a boundary swap. This accounts for the additional wall time at the application API boundary; it does not identify the GPU or a specific wait as its cause.
+
+```mermaid
+gantt
+    title Measured marker windows (seconds, schematic)
+    dateFormat X
+    axisFormat %s
+    section Serial
+    Inside swaps :0, 8.935
+    Other time :8.935, 10.122
+    section Overlap
+    Inside swaps :0, 14.809
+    Other time :14.809, 15.983
+```
+
+The bounded renderer ledger recorded 125 versus 299 distinct direct commits during those windows, and submission-to-observed-completion medians were 52 versus 74 ms. These are CPU observations of completion and OS presentation acceptance, not hardware execution or panel scanout timestamps. The 512-row ledgers dropped 108 and 548 later rows, respectively; their retained game rows span nearly the whole measured windows. A separate overlap run with a 50 ms minimum admission period still measured 36.40 swaps/s and 18.11 direct commits/s. The earlier root-owned renderer comparisons did not record direct sources; do not use them to characterize the normal direct path. Raw traces and the limits of the comparison are in the current handover.
+
+## Overlapping partial-present dependency design
+
+The existing kernel marks tickets reserved while another is active as full-only. A proposed opt-in successor would instead bind its preparation baseline to the last accepted ticket: reservation must reject a zero or changed baseline. While that ticket remains outstanding, the OS records every rectangle actually written by accepted older tickets; it accepts a partial successor only when its supplied rectangles cover their union. An intervening full present, malformed input, or bounded tracking overflow forces a full successor. Kernel ticket ordering still prevents an older frame from presenting after a newer one. A failed or partially written presentation still follows the existing lease invalidation and scanout-repair path; identity and scene checks remain mandatory.
+
+`desktop_present_dependencies.h` and `DesktopFrameScenes::RecordAccepted` implement bounded bookkeeping and region-union coverage. The checker was compared to an independent pixel oracle over 30,000 randomized cases, and the existing window-surface fixture passed. These helpers are **not connected to the handoff ABI or presentation path**; the existing full-only guard is unchanged. A complete implementation still needs atomic baseline validation at reservation, acceptance recording under the handoff lock for every presentation path, coverage enforcement before scanout, lifecycle and failure tests, and a real matched hardware comparison. The renderer must account for its displayed and pending footprints; the kernel's additional check covers intervening writes, not all changes in the current scene.
+
+The preceding paragraph describes the first groundwork stage. The current local candidate now wires the checks through a new negotiated reservation, while leaving ordinary reservations unchanged. The renderer enables it only with `BROOK_RENDER_EXPERIMENTAL_OVERLAP_PARTIAL` and the capability bit. Kernel and renderer builds and host ordering/coverage tests pass; integrated presentation, recovery and physical performance remain unverified. See the current handover before using the candidate.
+
+## Browser offer versus intervening desktop frames (generation 349)
+
+The all-presented-frame diagnostic matched 117 Chromium direct offers by window, incarnation and commit. Median/p95 offer-to-receipt was 55/61 ms; the union of other successfully presented desktop-frame intervals covered 55/61 ms, with 0/4 ms uncovered. Eighty-one offers arrived during a recorded non-direct frame. Receipt-to-renderer-finish was 39/56 ms and finish-to-provider-ACK 4/15 ms. One initial offer had 37 ms uncovered because recording starts at the first direct frame. The bounded capture retained 512 rows and later dropped 762; all 117 tested offers were matched. Timestamps observe CPU-side events and present acceptance, not GPU execution time or physical scanout. Unsuccessful frames are not recorded.
+
+Across the 395 recorded non-direct frames, preparation was 12/16 ms median/p95, submission to observed completion 9/39 ms, and observed completion to finish 4/5 ms. The corresponding 117 direct frames were 13/14, 21/39 and 4/5 ms. These are separate distributions; their percentiles cannot be added to derive a frame percentile, and completion observation includes polling and scheduling delay.
+
+```mermaid
+gantt
+    title Typical browser offer in a busy desktop (median ms, schematic)
+    dateFormat X
+    axisFormat %s
+    section Other desktop frame
+    Occupies offer-to-receipt interval :0, 55
+    section Browser direct frame
+    Offer received to renderer finish :55, 94
+    Finish to provider ACK :94, 98
+```
+
+Evidence: `build/hardware/dell-media-20261113/gen349-allframe-browser/`. This is a scheduling/retirement lead, not proof that removing serialization is safe: earlier overlapping partial frames triggered full-screen damage and degraded Quake throughput.
+
+## Dell i915 and VirGL frame waits (13 November 2026)
+
+The Dell diagnostic ran the uncapped 1280×720 yquake2 GL3 demo on the HD 5500
+with the patched Iris library. Eight consecutive completed swaps (indices
+67–74) took 1,098.366 ms, with individual intervals of 46.9–354.0 ms. The
+kernel recorder retained the first events on each CPU and dropped 2,549
+events once CPU 1 filled its buffer. Every reported interval ends before
+the earliest per-CPU last retained timestamp, with a margin for cross-core
+TSC skew. The app trace had zero drops. The ledger reconciles all 1,098.366 ms
+as scheduler residency and elapsed wait classes. Samples and stacks give
+locations. CPU residency includes kernel execution and interrupt time.
+
+| Exclusive Quake-thread wall time | Eight frames |
+| --- | ---: |
+| FAT filesystem mutex | 641.281 ms (58.39%) |
+| Offscreen submission mutex | 139.414 ms (12.69%) |
+| Poll sleep between swaps | 130.490 ms (11.88%) |
+| CPU residency | 121.771 ms (11.09%) |
+| Render admission mutex | 33.908 ms (3.09%) |
+| Runnable, awaiting dispatch | 16.284 ms (1.48%) |
+| Other mutexes and blocking | 15.218 ms (1.39%) |
+
+Most FAT waits are on the common boot-flag path above the ioctl decoder.
+In particular, 408.231 ms of the FAT wait time is inside GEM_MADVISE, whose
+handler checks the handle and reports retained backing. Another 156.048 ms is
+inside SYNCOBJ_WAIT. The trace saw no direct ioctl fence-poll sleep events
+during these frames. The apparent cost of that ioctl is mostly the filesystem
+gate. The offscreen submission stack passes through the same mutex used by
+inline compositor scanout even for Quake's ordinary buffers.
+
+Nine observed Quake render submissions averaged 30.6 ms queued (0.6–155.0 ms),
+15.3 ms in device-direction cache maintenance, 6.3 ms in the render device
+transaction and 15.3 ms in CPU-direction cache maintenance before fence
+publication. These worker intervals run alongside Quake's CPU timeline.
+They overlap app elapsed time. Four in-window scanout blits each took
+approximately 12.3 ms in the BCS transaction. Immutable kernel fence IDs link
+13 retained GPU dependencies to observed producers. One queued consumer in
+the selected three-frame diagram arrived 34.4 ms before its producer's
+signal. A deadline or synchronization wait that appears only as a poll
+stack has no inferred producer in this capture.
+
+The historical 1 ms host-poll VirGL trace completed 617 swap intervals at
+44.39/s with 22.04 ms median and 32.93 ms p95. The DRM probe recorded 4,029
+EXECBUFFER calls consuming 7.237 s across the capture (about 11.73 ms per
+completed interval, with the recorded shutdown-tail bound on between-swap
+totals). It recorded 271,472 VIRTGPU_WAIT calls consuming 0.624 s (about
+2.30 µs per call and 1.01 ms per completed interval). The control queue
+waits for used-ring completion inside EXECBUFFER and adds a real producer
+fence for FENCE_FD_OUT. A separate zero-drop profile found Quake command-lock
+and PresentBarrier stacks. The VirGL run used a different host, VM and Brook
+revision, and its ioctl timings include host scheduling. It establishes
+which synchronization survived at usable cadence and gives order-of-magnitude
+reference costs. It does not establish the Dell speedup or GPU execution time.
+
+Latching the six runtime opt-in markers at boot while retaining live PCI,
+D0 and recovery checks removed the FAT waits in a second eight-interval
+trace with zero kernel and userspace drops. The 90-record marked run rose
+from 6.64 to 7.36 completed swaps/s. The remaining trace is dominated by
+705.366 ms (60.03%) sleeping on Intel syncobj waits and 312.081 ms (26.56%)
+in kernel mutexes between swaps, chiefly address-space mutation during
+poll, sendmsg and futex argument validation. Six application fences match
+733 polls from Quake in the eight-interval window. The first observed wait
+to matching signal spans 20–243 ms. These are repeated observations of
+six waits on immutable fences.
+
+The queued game submissions now reach the shared worker after a median
+154.9 ms (nine observed submissions). They spend a median 39.5 ms between
+worker admission and their fence signal. The compositor's seven complete
+render transactions spend a median 107.6 ms on the same worker. A separate
+scoped timing run on that boot collected 82 compositor transactions without
+new drops. It measured a mean 67.6 ms from issue to breadcrumb, 0.072 ms
+from breadcrumb to observed retirement, and roughly 15 ms of cache
+maintenance in each direction. The issue-to-breadcrumb interval includes
+completion observation. The 70 ms compositor device interval is therefore
+concentrated inside the render operation. This does not include the separate
+BCS scanout copy.
+
+Generation 321 tested an exact shader simplification for 1:1 scaling and
+fully opaque pixels. The compositor transaction median moved from 107.6 to
+106.3 ms and the marked demo from 7.36 to 7.72 swaps/s (interval p95 268 to
+234 ms in one run per build). The eight-frame trace has zero drops and
+0.201 ms of unknown initial scheduler state. Quake's 134.6 ms median
+submission queue time still dominates the 30 FPS budget. Host Vulkan
+renderer/surface oracles and physical Intel compute, triangle, scene and
+the seven-sample partial opacity/move/fallback fixture pass. The first two
+opacity attempts ran without the root permission required by the capture
+syscall. The initial harness result is invalid for pixel acceptance.
+
+Raw data, resolved stacks, resource and fence IDs, frame ledgers and diagrams
+are under `build/hardware/dell-present-ownership-20261113/` in
+`frame-trace-dell-v2/`, `frame-trace-boot-flags/` and
+`frame-trace-composite-shader/`. The October sections below identify the
+VirGL timing data and the separate switch profile.
+
 This is the first control for the GPU performance investigation. It measures
 the shared compositor/virgl path, not a Vulkan application. No pacing,
 buffering, fence, resource lifetime or scheduler-default behavior has changed.
+
+
+### Broadwell render frequency and retirement
+
+The HD 5500 stayed at 300 MHz under Brook in all 87 sampled points from
+14 complete render submissions. The render-frequency request also read
+300 MHz on every submission. The earlier Linux i915 capture on the same
+Dell had a 480 MHz actual median and 82% render-engine busy median over the
+approximately aligned demo window. Linux sampled continuously while the
+Brook trace sampled under the existing render forcewake lease.
+
+| CPU-observed event interval | Quake median (8 submissions) | Compositor median (6 submissions) |
+| --- | ---: | ---: |
+| ELSP issue to GPU breadcrumb observed | 5.41 ms | 63.55 ms |
+| Breadcrumb to context switch observed | 0.072 ms | 0.072 ms |
+| Context switch to exported fence signal | 16.27 ms | 15.23 ms |
+
+The last interval is dominated by the post-render CPU cache pass. The
+clock probe only read MMIO. The same candidate moved that cache pass
+outside the render queue lock and changed the compositor output shader to
+16×4 workgroups. Its marked run delivered 8.26 swaps/s (217 ms p95). That
+single run combines both changes. The physical Intel Vulkan oracles and
+the root partial-opacity fixture passed.
+
+The zero-drop eight-frame ledger also accounted for 59.23% of application
+wall time in syncobj waits and 26.32% blocked on kernel mutexes between
+swaps. The latter stacks again point to user-address-space validation.
+The diagram with real fence edges and clock samples is
+`build/hardware/dell-present-ownership-20261113/frame-trace-gt-clock/frame-timeline.svg`.
+
+
+A guarded comparison changed the render frequency request to 500 MHz on AC
+power, with the same renderer and cache logic. The PCI device stayed in
+D0. The Dell reported a 300 MHz minimum and 950 MHz maximum in the
+hardware capability register. All 50 samples across 14 complete render
+submissions were 500 MHz. Each submission verified restoration of the prior
+300 MHz request before releasing forcewake.
+
+| Matched result | Firmware request, 300 MHz | Temporary request, 500 MHz |
+| --- | ---: | ---: |
+| Completed swaps per second | 8.26 | 9.63 |
+| Swap interval p95 | 217 ms | 197 ms |
+| Quake issue to breadcrumb, median | 5.41 ms | 3.36 ms |
+| Compositor issue to breadcrumb, median | 63.55 ms | 38.55 ms |
+| Quake context switch to fence, median | 16.27 ms | 16.25 ms |
+| Compositor context switch to fence, median | 15.23 ms | 15.26 ms |
+
+Both runs completed 91 swaps within the marked demo, with eight complete
+swap intervals in each kernel trace. The clock change shortened the render
+intervals by 38–39% and increased the measured swap rate by 17% in this
+single pair. The post-retirement CPU work stayed near 15–16 ms. The boosted
+trace spent 39% of elapsed application time in kernel mutexes between swaps
+and 34% in syncobj sleeps. Vulkan compute, triangle, scene and six
+partial-opacity samples passed at 500 MHz. The data and updated timeline
+are in `frame-trace-gt-rps-posted/` in the same campaign directory. The
+temporary request is a diagnostic, with no production governor selected.
+
+
+### Console-only and bare desktop controls
+
+Generation 330 traced the kernel compositor's cadence markers, context
+switches, blocking stacks, worker submissions and scanout copies. No
+Quake process was running during these two controls.
+
+| Observation | Console visible | Console minimized |
+| --- | ---: | ---: |
+| Taskbar cadence p80 | 19 ms | 17 ms |
+| Kernel work portion of a cadence interval, p80 | 3.85 ms | 2.99 ms |
+| Kernel compositor timer/event sleep across trace | 1,434 ms | 1,815 ms |
+| Kernel compositor scanout mutex waits across trace | 383 ms | 4 ms |
+| Render issue to breadcrumb, median | 4.42 ms | 1.86 ms |
+| BCS worker time, median | 4.09 ms | 3.05 ms |
+
+The kernel work portion includes mutex delays. The fallback timer arms
+after the cycle and requests a 16 ms sleep, which events can cut short.
+The current GOP blitter writes the live framebuffer and performs no
+vblank wait. Taskbar COMP measures kernel cycle cadence.
+
+The bare renderer clears or composites client surfaces, with no wallpaper,
+chrome, taskbar, or cursor layer. The clear-only full-screen copy took a
+median 14.65 ms on the BCS worker. The matched Quake demo reached 23.91
+swaps/s, with p95 75 ms, versus 21.33 swaps/s and 103 ms on the regular
+desktop at the same clock and CPU coherency policy. The console process
+continued to run, but the bare scene excluded its minimized surface.
+Eight fully traced swap intervals attributed 76.8% of application wall time
+to sleep inside Intel syncobj waits. For eight paired fence submissions,
+Quake waited 41.5–45.9 ms from enqueue until the shared worker took the job.
+Quake's GPU issue to breadcrumb took a median 3.17 ms across seven complete
+transactions, followed by 0.26 ms from context switch to fence signal.
+In submission 153, a full-screen BCS transaction occupied the worker for
+the last 12.34 ms of the 42.80 ms queue wait. The timeline in
+`build/hardware/dell-present-ownership-20261113/frame-trace-bare-quake/frame-timeline.svg`
+shows the overlapping compositor work and the exact app fence IDs.
+
+The full-frame renderer retains wallpaper capture by display and backdrop
+generation in each render context. The partial renderer copies wallpaper
+pixels into a packed source buffer for each damaged rectangle. The
+experimental renderer instead samples the cached wallpaper BO by adjusting
+the source coordinates for each output tile.
+
+Generation 334 combined that wallpaper change with the short-lock GOP
+present experiment. It recorded zero BCS requests and a 12 ms kernel COMP
+p80 on the software desktop. Its Quake rate is excluded from hardware
+desktop comparisons. A same-boot run on the restored kernel also failed in
+overlay capture with wallpaper reuse disabled, before submitting a
+composition. The bare-mode patch had inverted the overlay success check.
+The verified full and partial BCS path returned after restoring the
+generation 330 kernel and initrd as generation 335.
+
+The corrected renderer completed a same-boot packed/reuse/reuse/packed
+comparison with the console visible and overlays included. The diagnostic
+serialized desktop frames so each arm completed one full and 179 partial
+hardware blits. Across 165 warm partial intervals per arm, packed medians
+were 24/24 ms and p95s 26/25 ms. Reuse medians were 24/25 ms and both p95s
+were 26 ms. All 720 BCS requests retired. This console-only control
+showed no measurable improvement from removing the wallpaper copy.
+Results are in `wallpaper-abba-corrected-overlay/` in the same campaign.
+
+Generation 336 kept packed wallpaper and tested the short-lock GOP writer
+with the corrected overlay check. In the visible-console trace, the earlier
+391 ms of total compositor mutex waits fell to 2.9 ms across a slightly
+longer trace. The remaining waits were in window cleanup and launcher
+publication. COMP p80 stayed at 19 ms and p95 moved from 21 to 19 ms.
+The matched Quake prefix completed 90 swaps in 3.96 seconds (22.73/s)
+with a 79 ms p95. The eight-frame ledger still attributes 44.7% of app
+time to kernel mutex waits between swaps and 32.0% to Intel fence sleep.
+Nine Quake submissions with both queue events spent a median 55.65 ms
+queued. The scanout reservation removes lock hold time from desktop input
+and drawing while both engines still share one serialized submission worker.
+See `desktop-short-lock-overlay/visible/summary.json` and
+`frame-trace-short-lock-overlay/frame-timeline.svg`.
+
+### Desktop submission pacing
+
+The two-context renderer admits a full-screen frame when a partial frame
+is still pending after its grace period. That adds an expensive full render
+and scanout to the shared worker under the same GPU contention that caused
+the partial frame to run late. The RAM experiment retained two render
+contexts, allowed one desktop frame in flight, and optionally delayed the
+next capture until a minimum period had elapsed. It preserved partial
+damage, the exact source/commit checks, handoff retirement and hardware BCS.
+
+The four arms used the same generation 337 boot with the backlight
+timeout disabled and the same 180-record 1280×720 uncapped demo. Blit
+counts cover the launch-to-exit observation, including warmup and drain.
+
+| Desktop submission policy | Completed swaps/s | Swap p95 | Full blits | Partial blits |
+| --- | ---: | ---: | ---: | ---: |
+| One in flight, 50 ms minimum | 32.87 | 71 ms | 5 | 234 |
+| One in flight, 33 ms minimum | 32.12 | 72 ms | 5 | 283 |
+| One in flight, no added delay | 36.03 | 68 ms | 5 | 340 |
+| Existing two-in-flight policy | 21.02 | 95 ms | 177 | 226 |
+
+An earlier two-in-flight control on the same kernel measured 24.25/s
+and 84 ms p95. An interrupted serial arm counted 254 swaps for the
+180-record window and was excluded. The short-lock candidate uses one
+desktop frame in flight with no added delay. See
+`pacing-180-physical-awake/` in the same campaign.
+
+Generation 338 combined that policy with the short-lock scanout writer.
+Two physical 600-record windows on the supervised desktop completed
+601 swaps in 17.470 s and 602 in 17.509 s (34.40 and 34.38/s). Median
+swap intervals were 16 ms in both, p95 was 71 ms, and maxima were 77
+and 76 ms. The lowest complete five-second block was 33.0 swaps/s.
+Intel HD 5500 GL3, 1280×720, timedemo, zero swap interval and the patched
+Iris library were verified. BCS retired 1,278 and 1,215 jobs across the
+two launch-to-exit observations, including 1,271 and 1,209 partials.
+
+The first repeat's zero-drop eight-frame trace measured a 30.16 ms
+median Quake worker queue residence across nine paired requests, down
+from 55.65 ms on generation 336. It attributed 49.36% of elapsed app
+time to kernel mutex waits between swaps, mostly user-address-space
+validation, 21.25% to Intel fence sleep, and 12.64% to poll sleep. Median
+Quake issue to breadcrumb was 3.55 ms at the measured 500 MHz.
+See `short-lock-serial-600/frame-timeline.svg` and
+`short-lock-serial-repeat-600/summary.json`.
 
 ## Host polling baseline
 
@@ -1222,3 +1553,225 @@ the requested word and effective opacity/blur, including fallback state.
 choice at boot; leave it unset to restore that user preference. Settings can
 change it afterward. The earlier timing values are not measurements of every
 new blur preset or the taller Settings layout.
+
+
+### Deferred wake after scheduler handoff
+
+Generation 338's two lossless eight-frame traces attribute 34.36 and 68.94 ms of main-thread lock contention to the same per-address-space mutex. One transferred owner remained off-CPU for 10.29 ms, then ran about 2.46 µs before handing off the lock. Generation 339 checks for a deferred wake after assembly releases the old stack, using the same ready lock as normal unblocking. It also rechecks the wake reason when consuming timer-scan candidates.
+
+Matched 600-record runs moved from 34.40/34.38 to 40.68/39.97 completed SDL swaps/s and from 71 to 54/55 ms p95. In the new eight-frame samples, paired waits on the mutation mutex total 2.12/1.69 ms. Quake now spends 49.86/51.65 ms blocked in PollWait over 176.55/178.13 ms total, with additional wake-to-dispatch time. These are client wait stacks. The dependency on actual buffer releases and frame callbacks still requires a provider-side control.
+
+See `build/hardware/dell-present-ownership-20261113/short-lock-wake-600/` and `short-lock-wake-repeat-600/` for the exact matched traces. The latter contains `frame-timeline.svg` and both contain `mutex-handoff-summary.json`.
+
+With the generation 339 kernel and renderer held constant, generation 340 polled queued Intel producers every 1 ms instead of from the 16 ms frame timer. The same two long demos fell to 29.97 and 29.07 swaps/s, with p95 69 and 71 ms. Client PollWait consumed roughly 82 ms in both eight-frame samples. The first sample's median GPU queue residence and issue-to-breadcrumb remained close to baseline, at 4.15 and 3.11 ms. The provider timer was reverted and the exact generation 339 pair was restored as generation 341. The control does not distinguish client waits for a buffer release from waits for a frame callback.
+
+On the restored provider, a bounded Wayland wire trace recorded 24,630 Mesa
+sync round trips for 157 buffer attachments and 154 releases. One
+surface frame callback request appeared at shutdown. Mesa 26.0.6's four
+locked buffers send repeat round trips in `wait_for_free_buffer()`. Across
+154 matched commits/releases the p50 was 129 ms and p95 174 ms with tracing
+active. This identifies buffer release as the primary wait condition and
+shows the volume of retry traffic. It does not measure uninstrumented
+commit-to-release latency. Raw wire and kernel ledger are in
+`build/hardware/dell-present-ownership-20261113/gen341-wayland-wire-90/`.
+
+### Wayland release controls
+
+Four 180-record runs on generation 342 used the same rebuilt Mesa EGL vendor,
+patched Iris, and normal hardware desktop. Blocking on Wayland events while
+all four buffers were busy yielded 37.01 and 36.54 swaps/s, with p95 of 69 and
+70 ms. Mesa's usual round trips yielded 38.03 and 36.88 swaps/s, with p95 of
+69 and 72 ms. The first event arm's eight-frame ledger attributed 185.77 of
+220.20 ms to poll sleep, with about 6% of the interval executing between swaps.
+Removing the request churn leaves the release dependency in place. The Mesa
+candidate is archived as `source-mesa-wayland-buffer-event.patch`. Captures are
+in `egl-event-180-*` under the ownership campaign.
+
+A separate same-boot test held the renderer binary, two contexts, one desktop
+submission in flight, and game launch fixed. It compared acknowledging GPU
+inputs at the Vulkan fence with the existing acknowledgement after the OS
+present result. Early acknowledgement yielded 32.88/33.08 swaps/s and 106
+full blits per arm. The controls yielded 35.01/39.34 swaps/s and six/five
+full blits. The test preserved output ownership and only advanced the window
+commit watermark after present. The increase in full blits is an observed
+side effect. It does not establish which overlapping operation caused the
+full damage. The early-release source is archived and the verified boot
+renderer was restored. See `early-input-release-physical/` and
+`source-early-release-complete.patch`.
+
+Generation 343 keeps the generation 342 kernel, renderer and supervisor.
+Wayland skips the CPU transition and copy only after the producer fence
+and any delivered GPU offer have retired, and only if the pending queue
+holds the image's sole reference. Images still retained by a surface
+keep their fallback snapshot. Two 600-record runs produced 44.48 and
+43.29 swaps/s, with p95 of 51 and 61 ms and a slowest complete five-second
+block of 42.6 swaps/s. Both arms reported five full hardware blits and
+more than 1,100 partial blits across the game job. Physical Intel Vulkan
+compute, triangle and scene checks passed, as did seven compositor
+opacity and fallback samples. In two zero-drop eight-frame traces,
+Quake's main thread spent 19–20% of the interval in poll sleep, 14% ready
+to run, and 45–47% executing between swap calls. See the `short-lock-discard-
+superseded*600` captures and the repeat's `frame-timeline.svg`.
+
+Generation 344 added readiness processing for the renderer acknowledgement
+socket while keeping the timer fallback and snapshot policy. It measured
+41.78 and 34.27 swaps/s with 52 and 55 ms p95. The eight-frame samples
+spent 41.39 and 57.41 ms in poll sleep, compared with 41.14 and 45.87 ms
+on generation 343. The strict pixel and Vulkan checks passed. The result
+favored generation 343 for the default desktop. Generation 344's source
+and tests are in `source-short-lock-ack-event.patch` and the two
+`short-lock-ack-event*600` capture directories.
+
+The same-boot overlay request comparison on generation 344 moved the
+capture request ahead of scene preparation. Median preparation fell from
+23/19 to 14/10 ms, while submit-to-observed-completion increased from
+38/45 to 44/51 ms. Quake measured 34.28/33.83 swaps/s in the controls and
+34.07/33.19 in the overlap arms. One run in each policy produced over 100
+full blits. This control supports optimizing the amount of desktop work
+and its submission order instead of starting the same work earlier. The
+policy was removed. See `overlay-overlap-physical/` and
+`source-overlap-overlay-complete.patch`.
+
+Generation 346 tested direct row copying for a retained opaque 1:1 XRGB
+fallback snapshot. It kept the original generic path for other scenes and
+passed host output, padding and commit-tag checks. Physical Vulkan and
+seven strict opacity/fallback samples passed. Matched runs gave 44.13 and
+43.31 swaps/s at 60 and 62 ms p95. That is within generation 343's observed
+throughput range. The tested path was removed and generation 347 restored
+the exact generation 343 payload. See `short-lock-opaque-copy*600` and
+`source-short-lock-opaque-copy.patch`.
+
+### Mesa Wayland client buffer depth
+
+On generation 347, the same Mesa EGL binary and patched Iris Gallium ran the
+matched 1280×720 demo in four/six/six/four order. The default four-slot mode
+kept Mesa's round trips. The six-slot mode used event dispatch when all six
+were locked. Each run covered 180 demo records on the boot-supervised
+hardware desktop.
+
+| Client buffer slots | Swaps/s | Swap interval p95 |
+| --- | ---: | ---: |
+| 4 | 41.70 | 63 ms |
+| 6 | 55.15 | 49 ms |
+| 6 | 56.94 | 49 ms |
+| 4 | 40.00 | 64 ms |
+
+The eight-frame traces for six buffers spent 52–74% in `SYNCOBJ_WAIT`
+compared with 6–8% in the controls. Between-swap CPU residency fell from
+44–46% to 10–11%, consistent with less Wayland round-trip churn. These are
+short intervals measured with tracing enabled. The prior event-dispatch
+control at four buffers had no throughput gain. The depth-only comparison
+keeps the round-trip policy fixed. Completed swaps include frames superseded
+before desktop presentation. Six and eight full 1280×720 XRGB images add
+about 7.0 and 14.1 MiB of color storage respectively versus four. Eight
+matches the provider's global per-tick pending-image budget. See
+`egl-buffer-180-*` and `source-mesa-wayland-six-buffers.patch`.
+
+The depth-only runs on the same boot retained Mesa's original round-trip
+policy and changed only the hardware Wayland color-buffer allocation limit.
+The four-slot control reached 36.96 swaps/s with 65 ms p95. Six slots reached
+55.74 and 52.59 swaps/s with p95 of 48 and 51 ms. The closing four-slot
+control was repeated after a checked restart when the debug job table filled.
+The repeat reached 40.83 swaps/s with 63 ms p95.
+The two eight-slot, 600-record runs reached **65.03 and 64.64 swaps/s**.
+Both had 44 ms p95. The slowest rolling five-second windows in the
+marked intervals were 63.0 and 63.2 swaps/s. The frame ledgers assign
+72–79% of the eight-frame samples to sleeping in `SYNCOBJ_WAIT`. In the
+first six-slot arm, symbolization resolves the long wait to
+`iris_fence_finish`. Mesa's Wayland drawable swap flush submits work and
+then throttles on the preceding drawable fence. The same capture has one
+long wait per interval, each for a single sync object. The saved PC is
+inside Iris, so the trace alone does not include its parent call stack.
+See `egl-buffer-600-*` and the second eight-slot run's `frame-timeline.svg`.
+
+After a checked restart into the same generation 347 payload, the isolated
+opt-in package repeated eight slots at **70.83 swaps/s** over 600 records,
+with 8 ms median, 40 ms p95 and a slowest rolling five-second window of
+69.6 swaps/s. The game mapped the package's EGL and Gallium libraries through
+the isolated vendor manifest and `$ORIGIN`. The kernel and userspace trace
+reported zero drops. The renderer continued hardware scanout blits throughout
+the job. The benchmark did not count unique displayed game frames. The installed
+launcher still selects stock Mesa. See `gen347-packaged-iris-depth-8-600/`.
+
+Across the three eight-slot traces, the median app issue-to-breadcrumb time
+was 3.21–3.41 ms, with eight matched submissions in each sample. Median app
+queue residence was 9.06–15.71 ms. Each sample captured one complete desktop
+issue-to-breadcrumb interval, ranging from 29.78 to 32.39 ms. These are
+host-observed intervals. They include time until the worker observes the
+breadcrumb and do not measure engine execution in isolation. The long Iris
+waits are consistent with the app sharing the render queue with a much
+longer desktop submission.
+
+A final diagnostic on the packaged runtime set Mesa's `disable_throttling`
+option for Quake alone. Both packaged libraries were mapped and the calibrated
+eight-frame trace showed no `SYNCOBJ_WAIT` sleep, versus 107.67 ms with the
+default throttle. The eight-frame time moved principally into CPU execution,
+poll and ready-queue waits. The raw 600-record marker window counts 601 swaps
+in 7.767 s with a 59 ms p95, versus 70.83 swaps/s and 40 ms p95 with the
+throttle. The strict swap analyzer rejected one equal completion timestamp on
+the 1 ms guest clock, so the diagnostic has no accepted throughput result.
+The observed tail and shift to other waits favor keeping the default throttle.
+See `gen347-packaged-iris-depth-8-unthrottled-600/`.
+
+## Chromium source handoff, generation 349
+
+A correlated, instrumented local 720p video run matched 64 provider and renderer
+records by window incarnation and commit. The median intervals below are
+separately calculated and rounded to milliseconds; they are not an additive
+per-frame reconstruction. The provider clock and renderer monotonic clock both
+use `CLOCK_MONOTONIC` with millisecond guest resolution.
+
+```mermaid
+sequenceDiagram
+    participant P as Wayland provider
+    participant R as Desktop renderer
+    participant G as GPU and presentation
+    P->>R: Offer retained buffer and fence
+    Note over P,R: 56 ms median until renderer receives offer
+    R->>R: Capture and prepare scene, 13 ms median
+    R->>G: Submit composition
+    Note over R,G: 20 ms median until completion observed
+    G-->>R: Composition complete
+    R->>G: Present, 4 ms median to acceptance
+    R-->>P: SAFE; 4 ms median until provider observes ACK
+    P->>P: Retain fallback snapshot and repaint
+```
+
+Matched offer-to-ACK was 96 ms median, 112 ms p95. Provider post-copy repaint
+with the experimental ARGB path was 12 ms median, 18 ms p95 in this capture.
+The first 64 direct-source presentations were retained and 49 later rows were
+dropped by the trace's bounded ledger; the matched rows are not a whole-run
+distribution. Renderer completion is when its polling observed completion, and
+presentation is OS acceptance, not panel scanout. GPU timestamps were invalid.
+The current renderer polls the source channel from `render_frame`, which is
+entered only when a rendering slot can be prepared; this is consistent with
+waiting behind other desktop work but does not by itself identify which work
+occupies the 56 ms. The prior standalone trace measured 44 ms median after
+receive and no usable GPU timestamps. See
+`build/hardware/dell-media-20261113/gen349-correlated-browser/` and
+`gen349-chromium-renderer-timeline/`.
+
+On generation 349, the rebuilt launcher package was staged at its exact Nix
+store path after independent SHA-256 verification of its four files. A
+uid-1000 environment check through `brook-run` and `brook-iris-run` confirmed
+that inherited `LIBGL_ALWAYS_SOFTWARE` was cleared and the staged EGL vendor
+was selected. The matched uncapped demo through that same launcher chain,
+with `BROOK_MESA_WAYLAND_BUFFERS=8`, completed 601 swaps in 8.564 seconds:
+70.18 swaps/s, 8 ms median and 41 ms p95. The game reported Intel HD 5500;
+the userspace trace mapped the staged EGL and Gallium files. The job exited
+zero. This is an opt-in staging result, not proof of persistent package
+installation, unique panel frames or a changed system default. Evidence:
+`build/hardware/dell-present-ownership-20261113/gen349-normal-iris-launcher-600/`.
+# Shared Vulkan image feasibility (generation 354)
+
+The Dell's Intel HD 5500 advertised importable and exportable linear BGRA
+DMA-BUF images for sampled and color-attachment use. A physical offscreen
+fixture then imported a Brook Intel GEM buffer as a 64×64 Vulkan image,
+cleared all 4,096 pixels on the GPU and verified them after synchronization.
+The same imported image was used as the color attachment for a graphics
+pipeline; seven independent triangle and background samples matched. The
+fixture is `tools/vulkan-probe-pkg/external_image_roundtrip.c`; job record
+`build/hardware/dell-present-ownership-20261113/gen354-external-image-triangle.json`.
+This validates an image target, not sampling an imported producer buffer,
+real client layouts, protected scanout handoff, blending, or performance.
+See the current handover for the preceding clock and overlay comparisons.

@@ -1,6 +1,14 @@
 #include "desktop_identity.h"
 namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart(); }
+#ifdef BROOK_DELL_ACPI_MONITOR
+#include "dell_acpi_monitor.h"
+#endif
 #include "boot_protocol/boot_protocol.h"
+#include "boot_protocol/efi_runtime_cache.h"
+#include "boot_protocol/efi_runtime_mtrr.h"
+#include "efi_runtime_inventory.h"
+#include "efi_runtime_mapping.h"
+#include "platform_power.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -417,6 +425,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::VmmInit();
     brook::VmmInitFramebufferMemory(bootProtocol);
+    const auto efiRuntime=brook::InspectEfiRuntime(bootProtocol);
+    brook::SerialPrintf("efi-runtime: handoff=%s ranges=%u pages=%lu (not yet enabled)\n",
+        efiRuntime.valid?"valid":"unavailable",efiRuntime.runtimeRanges,efiRuntime.runtimePages);
     brook::HeapInit();
     brook::PmmEnableTracking();
 
@@ -490,6 +501,38 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // ACPI: parse tables to get LAPIC/IOAPIC addresses.
     bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical,bootProtocol->memoryMap,bootProtocol->memoryMapCount);
+    if(acpiOk && efiRuntime.valid) {
+        auto probe=[](uint64_t address,brook::KernelAliasMapping& identity) {
+            brook::KernelAliasMapping direct{};return brook::VmmInspectKernelAliases(address,identity,direct);
+        };
+        const auto mapping=brook::InspectEfiRuntimeMappings(bootProtocol,efiRuntime,probe);
+        bool cacheMatch=false,mtrrMatch=false;
+        brook::SerialPrintf("efi-runtime: identity checked=%lu unavailable=%lu wrong=%lu nx=%lu readonly=%lu complete=%u\n",
+            mapping.checked,mapping.unavailable,mapping.wrongAddress,mapping.nonExecutable,mapping.nonWritable,mapping.complete?1u:0u);
+        if(bootProtocol->version>=4 && bootProtocol->efiRuntimeCacheValid==1) {
+            auto cacheProbe=[&](uint64_t address,uint64_t& physical,uint8_t& pat){brook::KernelAliasMapping m{};
+                if(!probe(address,m) || !m.present)return false;physical=m.physical;pat=m.patIndex;return true;};
+            const auto current=brook::FingerprintRuntimeCache(bootProtocol->memoryMap,bootProtocol->memoryMapCount,cacheProbe);
+            uint32_t low=0,high=0;__asm__ volatile("rdmsr":"=a"(low),"=d"(high):"c"(0x277));
+            const uint64_t pat=uint64_t(low)|(uint64_t(high)<<32);
+            const bool match=current.valid && current.hash==bootProtocol->efiRuntimeCacheFingerprint &&
+                current.slots==bootProtocol->efiRuntimePatSlots && brook::RuntimePatSlotsMatch(bootProtocol->efiRuntimePat,pat,current.slots);
+            cacheMatch=match;
+            brook::SerialPrintf("efi-runtime: firmware-cache-baseline=%u slots=%x pages=%lu match=%u\n",
+                1u,current.slots,current.pages,match?1u:0u);
+        } else brook::SerialPuts("efi-runtime: firmware-cache-baseline=0\n");
+        if(bootProtocol->version>=5 && bootProtocol->efiRuntimeMtrrValid==1){
+            brook::CpuCacheSnapshot snapshot{};const bool available=CpuCaptureCacheSnapshot(snapshot);
+            const auto& m=snapshot.mtrrs;
+            const uint64_t fingerprint=available?brook::RuntimeMtrrFingerprint(m.physicalBits,m.capability,m.defaults,m.base,m.mask,m.fixed,m.count):0;
+            mtrrMatch=fingerprint && fingerprint==bootProtocol->efiRuntimeMtrrFingerprint && !snapshot.cacheDisabled && !snapshot.notWriteThrough;
+            brook::SerialPrintf("efi-runtime: firmware-mtrr-baseline=1 available=%u match=%u\n",available?1u:0u,
+                mtrrMatch?1u:0u);
+        } else brook::SerialPuts("efi-runtime: firmware-mtrr-baseline=0\n");
+        if(mapping.complete && !mapping.unavailable && !mapping.wrongAddress &&
+           !mapping.nonExecutable && !mapping.nonWritable && cacheMatch && mtrrMatch)
+            brook::PlatformPowerSetEfiCandidate(bootProtocol);
+    }
     if (acpiOk)
     {
         // APIC: disable legacy PIC, enable LAPIC, calibrate + start timer.
@@ -1038,6 +1081,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::SchedulerInit();
         brook::CompositorInit();
         brook::LifecycleChannelStart();
+#ifdef BROOK_DELL_ACPI_MONITOR
+        brook::DellAcpiMonitorConfigure();
+        brook::DellAcpiMonitorStart();
+#endif
 
         // Start the NIC polling thread now that the scheduler is initialised.
 #if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_AUTO_RECOVERY)

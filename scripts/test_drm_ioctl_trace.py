@@ -47,6 +47,7 @@ void SDL_GL_SwapWindow(void *w) {
         main.write_text('''
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 extern int drmIoctl(int,unsigned long,void*);
@@ -65,6 +66,11 @@ int main(int argc,char **argv) {
    if(drmIoctl(1,0x10,0)!=7 || errno!=EAGAIN) return 92;
    SDL_GL_SwapWindow(0);
   }
+ } else if(argv[1][0]=='m') {
+  SDL_GL_SwapWindow(0);
+  raise(SIGUSR2);
+  SDL_GL_SwapWindow(0);
+  SDL_GL_SwapWindow(0);
  } else if(argv[1][0]=='t') {
   pthread_t t[16];
   for(int i=0;i<16;i++) if(pthread_create(&t[i],0,worker,0)) return 93;
@@ -142,6 +148,19 @@ int main(int argc,char **argv) {
         subprocess.run([str(self.root/'main'), 'swap'], env=env, check=True, timeout=15)
         self.assertEqual(json.loads(path.read_text()), dict(sdl_abi=2, getter_available=True,
                          queries=5, interval_min=-1, interval_max=-1, incomplete=0, dropped=0))
+
+    def test_swap_marker_records_post_signal_progress(self):
+        path = self.root/'marked-swaps.csv'
+        env = dict(os.environ, LD_PRELOAD=str(self.root/'swap.so'),
+                   BROOK_SWAP_TRACE=str(path), BROOK_SWAP_MARKER_SIGNAL='1')
+        subprocess.run([str(self.root/'main'), 'marker'], env=env, check=True, timeout=15)
+        lines=path.read_text().splitlines()
+        marker=int(lines[1].split('=')[1])
+        ends=[int(line.split(',')[3]) for line in lines[3:]]
+        self.assertEqual(len(ends),3)
+        self.assertEqual(marker,ends[1])
+        self.assertLess(ends[0],marker)
+        self.assertGreater(ends[2],marker)
 
     def test_slot_overflow_rejected(self):
         with self.assertRaisesRegex(ValueError, 'overflowed'):

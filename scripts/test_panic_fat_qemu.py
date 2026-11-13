@@ -103,7 +103,7 @@ def verify_record(contents,slot,sequence,expected):
         raise RuntimeError('journal packet or checksum mismatch')
 
 
-def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=None,normal_kernel=None):
+def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=None,normal_kernel=None,torn=False):
     boot=work/'boot.raw';sata=work/'sata.raw'
     shutil.copyfile(image,boot);shutil.copyfile(image,sata)
     table=json.loads(subprocess.check_output(['sfdisk','--json',str(sata)]))['partitiontable']
@@ -113,7 +113,9 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
     if first!=2048:raise RuntimeError('unexpected ESP offset')
     target=f'{sata}@@{first*SECTOR}'
     journal=work/'PANIC.BIN'
-    with journal.open('wb') as stream:stream.truncate((JOURNAL_SECTORS-(1 if short else 0))*SECTOR)
+    with journal.open('wb') as stream:
+        stream.truncate((JOURNAL_SECTORS-(1 if short else 0))*SECTOR)
+        if torn:stream.write(b'BRKPAN01'+struct.pack('<II',1,123))
     subprocess.run(['mcopy','-i',target,str(journal),'::/PANIC.BIN'],check=True)
     if fragmented:fragment_test_file(sata,first,'::/PANIC.BIN')
     sectors=[] if short else file_sectors(sata,first,'::/PANIC.BIN')
@@ -147,7 +149,7 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
           '-fw_cfg','name=opt/brook/panic-test-reset,string=test-1s',
           '-fw_cfg','name=opt/brook/panic-test-disk,string=journal-fat-1']
     old_slot=None;latest_packet=None
-    for boot_number in range(1 if short else 2):
+    for boot_number in range(1 if short or torn else 2):
         serial.unlink(missing_ok=True)
         with (work/f'qemu-{boot_number}.log').open('wb') as errors:
             proc=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=errors)
@@ -170,11 +172,13 @@ def run_case(work,image,kernel,firmware,short,timeout,fragmented=False,exporter=
             if not line:raise RuntimeError('serial packet absent')
             latest_packet=bytes.fromhex(line[len('PANIC_HEX:'):])
             contents=subprocess.check_output(['mtype','-i',target,'::/PANIC.BIN'])
-            verify_record(contents,boot_number,boot_number+1,latest_packet)
+            verify_record(contents,1 if torn else boot_number,boot_number+1,latest_packet)
+            if torn and contents[:SLOT_SECTORS*SECTOR] != (b'BRKPAN01'+struct.pack('<II',1,123)+bytes(SLOT_SECTORS*SECTOR-16)):
+                raise RuntimeError('torn first slot was modified')
             if boot_number==0:old_slot=contents[:SLOT_SECTORS*SECTOR]
             elif contents[:SLOT_SECTORS*SECTOR]!=old_slot:raise RuntimeError('previous slot changed')
         if outside_digest(sata,sectors)!=before:raise RuntimeError('write outside journal sectors')
-    if exporter and not short:
+    if exporter and not short and not torn:
         # Reboot a regular kernel, without the panic writer's exclusive file
         # lease, and export through the normal FAT/VFS path as a guest job.
         bridge_id='a'*32
@@ -221,18 +225,19 @@ def main():
     parser.add_argument('--kernel',type=Path,required=True)
     parser.add_argument('--firmware',type=Path,required=True)
     parser.add_argument('--timeout',type=int,default=120)
-    parser.add_argument('--case',choices=['capture','fragmented','short-file'])
+    parser.add_argument('--case',choices=['capture','fragmented','short-file','torn-journal'])
     parser.add_argument('--exporter',type=Path,help='Static PANICLOG.ELF to exercise after captures')
     parser.add_argument('--normal-kernel',type=Path,help='Regular kernel for the export boot')
     args=parser.parse_args()
     if bool(args.exporter)!=bool(args.normal_kernel):parser.error('exporter and normal kernel are required together')
     image,kernel,firmware=(p.resolve(strict=True) for p in (args.image,args.kernel,args.firmware))
     with tempfile.TemporaryDirectory(prefix='brook-panic-fat-') as temp:
-        for name,short in [('capture',False),('fragmented',False),('short-file',True)]:
+        for name,short in [('capture',False),('fragmented',False),('short-file',True),('torn-journal',False)]:
             if args.case and args.case!=name:continue
             work=Path(temp)/name;work.mkdir();run_case(work,image,kernel,firmware,short,args.timeout,fragmented=name=='fragmented',
                 exporter=args.exporter.resolve(strict=True) if args.exporter else None,
-                normal_kernel=args.normal_kernel.resolve(strict=True) if args.normal_kernel else None)
+                normal_kernel=args.normal_kernel.resolve(strict=True) if args.normal_kernel else None,
+                torn=name=='torn-journal')
             print(name+': PASS',flush=True)
 
 

@@ -185,11 +185,13 @@ class Hardware:
                 'crc32':result['packet_crc32'],'sha256':result['artifact_sha256'],
                 'artifact_path':result['artifact_path'],'receipt_path':str(Path(output).absolute()/'receipt.json')}
 
-    def recovery_panic(self,session,output,**_):
+    def recovery_panic(self,session,output,previous=False,**_):
         """Read the immutable boot-pinned recovery snapshot; never touch guest storage."""
+        if type(previous) is not bool:raise ValueError('previous must be a boolean')
+        command='bridge hardware recovery-panic-previous' if previous else 'bridge hardware recovery-panic'
         path=Path(output).absolute()
         with self.session_lock(session) as data:
-            header=self.guest(data,'bridge hardware recovery-panic 0 0')
+            header=self.guest(data,f'{command} 0 0')
             if header.get('recovery_panic_api')!=1:
                 raise RuntimeError(header.get('recovery_panic_error','Recovery panic snapshot unavailable'))
             sequence,size,crc=(header.get(k) for k in ('sequence','bytes','crc32'))
@@ -199,7 +201,7 @@ class Hardware:
             packet=bytearray()
             for start in range(0,size,4096):
                 requests=[(offset,min(512,size-offset)) for offset in range(start,min(start+4096,size),512)]
-                replies=self.guest_batch(data,[f'bridge hardware recovery-panic {offset} {length}' for offset,length in requests])
+                replies=self.guest_batch(data,[f'{command} {offset} {length}' for offset,length in requests])
                 if len(replies)!=len(requests):raise RuntimeError('Incomplete recovery panic response')
                 for response,(offset,length) in zip(replies,requests):
                     if (response.get('recovery_panic_api')!=1 or response.get('sequence')!=sequence or
