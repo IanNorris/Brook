@@ -3220,6 +3220,19 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
 
 /* ---------------- main ---------------- */
 
+/* 1 when a server accepts connections on dir/name (a stale file refuses). */
+static int display_socket_live(const char *dir, const char *name) {
+    if (!dir || !*dir || !name || strchr(name, '/')) return 0;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    if (snprintf(a.sun_path, sizeof(a.sun_path), "%s/%s", dir, name) >= (int)sizeof(a.sun_path)) return 0;
+    int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (probe < 0) return 0;
+    int live = connect(probe, (struct sockaddr *)&a, sizeof(a)) == 0;
+    close(probe);
+    return live;
+}
 int main(int argc, char **argv)
 {
     fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
@@ -3265,6 +3278,16 @@ int main(int argc, char **argv)
 
     const char *sock_name = getenv("WAYLAND_DISPLAY");
     if (!sock_name) sock_name = "wayland-0";
+    /* Never take over a live display. The desktop launcher runs
+     * `run --once waylandd` before each app, and --once matches only the
+     * basename, so it does not see the boot provider (INTLWL.ELF). Both bind
+     * paths below unlink an existing socket, so a second server used to
+     * steal wayland-0 from the provider and compose every later app on the
+     * CPU without the GPU source channel. */
+    if (display_socket_live(getenv("XDG_RUNTIME_DIR"), sock_name) || display_socket_live("/tmp", sock_name)) {
+        fprintf(stderr, "[waylandd] WAYLAND_DISPLAY=%s already has a live server; exiting\n", sock_name);
+        return 0;
+    }
 
     const char *sock = NULL;
     if (getenv("XDG_RUNTIME_DIR")) {
