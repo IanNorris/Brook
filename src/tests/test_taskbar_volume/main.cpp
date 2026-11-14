@@ -87,11 +87,11 @@ static void checkPopup() {
 
 static void checkTooltipBox() {
     const DesktopRect icon{1690,1040,16,36};
-    auto b=TaskbarTooltipBox(icon,200,1920,8);
-    CHECK(b.x+b.w/2==icon.x+icon.w/2 && b.y==icon.y && b.h==icon.h);
-    b=TaskbarTooltipBox({1900,1040,16,36},200,1920,8);CHECK(b.x+b.w==1912);
-    b=TaskbarTooltipBox({0,1040,16,36},200,1920,8);CHECK(b.x==8);
-    b=TaskbarTooltipBox({0,1040,16,36},400,300,8);CHECK(b.x==8);
+    auto b=TaskbarTooltipBox(icon,200,30,1036,4,1920,4);
+    CHECK(b.x+b.w/2==icon.x+icon.w/2 && b.y+b.h+4==1036 && b.h==30 && b.w==200);
+    b=TaskbarTooltipBox({1900,1040,16,36},200,30,1036,4,1920,4);CHECK(b.x+b.w==1916);
+    b=TaskbarTooltipBox({0,1040,16,36},200,30,1036,4,1920,4);CHECK(b.x==4);
+    b=TaskbarTooltipBox({0,10,16,36},200,30,10,4,300,4);CHECK(b.y==0);
 }
 static void checkTooltip() {
     char text[32];

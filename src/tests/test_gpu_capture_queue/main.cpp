@@ -55,6 +55,8 @@ void SchedulerBlock(Process* p){
 void WmLauncherGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=1;*y=1;*w=2;*h=2;}
 void WmLauncherRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=1;x<3;++x)p[y*stride+x]=0x00654321;}
 bool volumeVisible=false;
+bool WmTrayTooltipGetRect(uint32_t,uint32_t,int32_t,int32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
+void WmTrayTooltipRender(uint32_t*,uint32_t,uint32_t,uint32_t,int32_t,int32_t){}
 bool WmVolumePopupVisible(){return volumeVisible;}
 void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
 void WmVolumePopupRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=4;x<6;++x)p[y*stride+x]=0x00777777;}

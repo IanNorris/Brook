@@ -86,13 +86,16 @@ inline TaskbarVolumePopupLayout TaskbarVolumePopup(const DesktopMetrics& m, cons
     return l;
 }
 
-// Horizontal box of width w centred on a tray icon, kept margin pixels
-// inside the screen (left-aligned at the margin when it cannot fit).
-inline DesktopRect TaskbarTooltipBox(const DesktopRect& icon, int w, int screenW, int margin) {
+// A w x h tooltip floating gap pixels above the taskbar, centred on a tray
+// icon and kept margin pixels inside the screen.
+inline DesktopRect TaskbarTooltipBox(const DesktopRect& icon, int w, int h, int taskbarY, int gap,
+                                     int screenW, int margin) {
     int x = icon.x + icon.w / 2 - w / 2;
     if (x + w > screenW - margin) x = screenW - margin - w;
     if (x < margin) x = margin;
-    return {x, icon.y, w, icon.h};
+    int y = taskbarY - gap - h;
+    if (y < 0) y = 0;
+    return {x, y, w, h};
 }
 
 enum class TaskbarVolumeHit : uint8_t { Outside, Panel, Mute, Slider };

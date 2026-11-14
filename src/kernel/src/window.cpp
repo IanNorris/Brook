@@ -2190,32 +2190,8 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                l.terminal.y + (l.terminal.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), icons.get().terminalIcon);
     char launchTitle[80]{};
     const uint32_t netAddress = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
-    char netTitle[48]{};
     const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
         l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
-    // Tray tooltips are centred on their icon; other labels use the tray.
-    const WmRect* trayAnchor = nullptr;
-    if (l.network.contains(mouseX, mouseY)) {
-        trayAnchor = &l.network;
-        if (netAddress) {
-            const uint8_t* o = reinterpret_cast<const uint8_t*>(&netAddress);
-            WmStrCopy(netTitle, "Network: ", sizeof(netTitle));
-            char* out = netTitle + strlen(netTitle);
-            for (int i = 0; i < 4; ++i) {
-                DesktopNumber(out, o[i]);
-                while (*out) ++out;
-                if (i < 3) *out++ = '.';
-            }
-            *out = 0;
-            hoverTitle = netTitle;
-        } else hoverTitle = "Network: disconnected";
-    }
-    char volumeTitle[32]{};
-    if (l.volume.contains(mouseX, mouseY) && !g_volumePopupOpen) {
-        TaskbarVolumeTooltip(volumeTitle, g_volumeControl, g_volumeAvailable);
-        hoverTitle = volumeTitle;
-        trayAnchor = &l.volume;
-    }
     for (int i = 0; i < l.count; ++i)
     {
         const WmRect& r = l.buttons[i];
@@ -2271,8 +2247,6 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     int labelX = static_cast<int>(screenW);
     const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.volume,l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
-    const char* trayTitle = trayAnchor ? hoverTitle : nullptr;
-    if (trayTitle) hoverTitle = nullptr;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
         WmRenderString(backBuffer, stride, screenW, screenH, labelX, l.textY,
@@ -2287,16 +2261,68 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
     DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
     for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
-    if (!trayTitle) return;
-    // A tray tooltip covers only its own box, centred on the icon and kept
-    // on screen; the rest of the tray stays visible.
+}
+
+// Volume and network tooltips float in a small panel just above the
+// taskbar, centred on the hovered icon. They share the desktop overlay slot
+// with the launcher and the volume popup, so none shows while either is open.
+static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
+                          char (&text)[48], DesktopRect& box)
+{
+    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen) return false;
+    const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
+    const WmRect* anchor = nullptr;
+    if (l.volume.contains(mx, my)) {
+        anchor = &l.volume;
+        TaskbarVolumeTooltip(text, g_volumeControl, g_volumeAvailable);
+    } else if (l.network.contains(mx, my)) {
+        anchor = &l.network;
+        const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
+        if (address) {
+            const uint8_t* o = reinterpret_cast<const uint8_t*>(&address);
+            WmStrCopy(text, "Network: ", sizeof(text));
+            char* out = text + strlen(text);
+            for (int i = 0; i < 4; ++i) {
+                DesktopNumber(out, o[i]);
+                while (*out) ++out;
+                if (i < 3) *out++ = '.';
+            }
+            *out = 0;
+        } else WmStrCopy(text, "Network: disconnected", sizeof(text));
+    }
+    if (!anchor) return false;
     const int pad = static_cast<int>(WmMetric(8));
-    const DesktopRect box = TaskbarTooltipBox(*trayAnchor, WmTextWidth(trayTitle) + 2 * pad,
-                                              static_cast<int>(screenW), static_cast<int>(WmMetric(8)));
-    WmFillRect(backBuffer, stride, screenW, screenH, box.x, l.y + 1, box.w, static_cast<int>(screenH) - l.y - 1,
-               WmMaterialColor(WmCurrentPalette().taskbar));
-    WmRenderString(backBuffer, stride, screenW, screenH, box.x + pad, l.textY, trayTitle,
-                   WmCurrentPalette().text, WmCurrentPalette().taskbar, box.w - pad);
+    box = TaskbarTooltipBox(*anchor, WmTextWidth(text) + 2 * pad,
+                            WmDesktopFont().lineHeight + static_cast<int>(WmMetric(10)), l.y,
+                            static_cast<int>(WmMetric(4)), static_cast<int>(screenW), static_cast<int>(WmMetric(4)));
+    return box.w > 0 && box.h > 0;
+}
+
+bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
+                          int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH)
+{
+    char text[48]{};
+    DesktopRect box{};
+    if (!WmTrayTooltip(screenW, screenH, mx, my, text, box)) return false;
+    *outX = box.x; *outY = box.y; *outW = static_cast<uint32_t>(box.w); *outH = static_cast<uint32_t>(box.h);
+    return true;
+}
+
+void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mx, int32_t my)
+{
+    char text[48]{};
+    DesktopRect p{};
+    if (!pixels || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
+    const WmPalette& pal = WmCurrentPalette();
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, p.h, WmMaterialColor(pal.launcher));
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, 1, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y + p.h - 1, p.w, 1, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, 1, p.h, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, p.x + p.w - 1, p.y, 1, p.h, pal.launcherBorder);
+    const int pad = static_cast<int>(WmMetric(8));
+    WmRenderMaterialString(pixels, stride, screenW, screenH, p.x + pad,
+                           p.y + (p.h - WmDesktopFont().lineHeight) / 2, text, pal.text, pal.launcher, p.w - pad);
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

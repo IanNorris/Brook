@@ -1877,6 +1877,12 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
         int32_t x=0,y=0;uint32_t w=0,h=0;WmVolumePopupGetRect(width,height,&x,&y,&w,&h);
         WmVolumePopupRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
         rects[rectCount++]={x,y,w,h};
+    }else{
+        int32_t x=0,y=0;uint32_t w=0,h=0;
+        if(WmTrayTooltipGetRect(width,height,mouseX,mouseY,&x,&y,&w,&h)){
+            WmTrayTooltipRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
+            rects[rectCount++]={x,y,w,h};
+        }
     }
     int32_t x=0,y=0;uint32_t w=0,h=0;
     if(WmBootSummaryRect(width,height,&x,&y,&w,&h)){
@@ -2065,6 +2071,16 @@ static void CompositorLoopWM()
     // repaint once on the transition (both the CPU and overlay-layer paths).
     static bool volumePopupShown=false;
     if(WmVolumePopupVisible()!=volumePopupShown){volumePopupShown=!volumePopupShown;CompositorMarkDirty();}
+    // Likewise when the floating tray tooltip appears, moves or goes away.
+    {
+        static DesktopOverlayRect tooltipShown{};
+        int32_t tmx=0,tmy=0;MouseGetPosition(&tmx,&tmy);
+        DesktopOverlayRect tip{};
+        if(!WmTrayTooltipGetRect(g_physFbWidth,g_physFbHeight,tmx,tmy,&tip.x,&tip.y,&tip.width,&tip.height))tip={};
+        if(tip.x!=tooltipShown.x||tip.y!=tooltipShown.y||tip.width!=tooltipShown.width||tip.height!=tooltipShown.height){
+            tooltipShown=tip;CompositorMarkDirty();
+        }
+    }
     static bool summaryShown=false;
     int32_t summaryX=0,summaryY=0;uint32_t summaryW=0,summaryH=0;
     const bool showSummary=WmBootSummaryRect(g_physFbWidth,g_physFbHeight,&summaryX,&summaryY,&summaryW,&summaryH);
@@ -2347,6 +2363,15 @@ static void CompositorLoopWM()
             OverlaySetAlphaRect(vx, vy, (int)vw, (int)vh);
             MarkDirtyRows(vy > 0 ? (uint32_t)vy : 0, (uint32_t)(vy + (int)vh));
         }
+        int32_t tx, ty; uint32_t tw, th;
+        if (WmTrayTooltipGetRect(g_physFbWidth, g_physFbHeight, chromeMx, chromeMy, &tx, &ty, &tw, &th))
+        {
+            OverlayClearRect(tx, ty, (int)tw, (int)th);
+            WmTrayTooltipRender(g_overlayBuffer, g_backBufStride,
+                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
+            OverlaySetAlphaRect(tx, ty, (int)tw, (int)th);
+            MarkDirtyRows(ty > 0 ? (uint32_t)ty : 0, (uint32_t)(ty + (int)th));
+        }
     }
     else if (g_backBuffer)
     {
@@ -2370,6 +2395,13 @@ static void CompositorLoopWM()
             WmVolumePopupRender(g_backBuffer, g_backBufStride,
                                 g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
             MarkDirtyRows(vy > 0 ? (uint32_t)vy : 0, (uint32_t)(vy + (int)vh));
+        }
+        int32_t tx, ty; uint32_t tw, th;
+        if (WmTrayTooltipGetRect(g_physFbWidth, g_physFbHeight, chromeMx, chromeMy, &tx, &ty, &tw, &th))
+        {
+            WmTrayTooltipRender(g_backBuffer, g_backBufStride,
+                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
+            MarkDirtyRows(ty > 0 ? (uint32_t)ty : 0, (uint32_t)(ty + (int)th));
         }
     }
     if(showSummary) {
@@ -3720,6 +3752,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             GpuComposeRectBlur(gpu,0,scrH-WmMetric(WM_TASKBAR_HEIGHT),scrW,WmMetric(WM_TASKBAR_HEIGHT));
             if(WmLauncherVisible()) {int32_t x,y;uint32_t w,h;WmLauncherGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
             if(WmVolumePopupVisible()) {int32_t x,y;uint32_t w,h;WmVolumePopupGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
+            {int32_t mx=0,my=0,x,y;uint32_t w,h;MouseGetPosition(&mx,&my);
+             if(WmTrayTooltipGetRect(scrW,scrH,mx,my,&x,&y,&w,&h))GpuComposeRectBlur(gpu,x,y,w,h);}
         }
         GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WmMetric(WM_TASKBAR_HEIGHT),
                           (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), overlayOpacity, true);
@@ -3736,6 +3770,12 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             WmVolumePopupGetRect(scrW, scrH, &vx, &vy, &vw, &vh);
             GpuComposeSrcRect(gpu, g_overlayTex, vx, vy, (int)vw, (int)vh,
                               overlayOpacity, true);
+        }
+        {
+            int32_t mx = 0, my = 0, tx, ty; uint32_t tw, th;
+            MouseGetPosition(&mx, &my);
+            if (WmTrayTooltipGetRect(scrW, scrH, mx, my, &tx, &ty, &tw, &th))
+                GpuComposeSrcRect(gpu, g_overlayTex, tx, ty, (int)tw, (int)th, overlayOpacity, true);
         }
     }
 

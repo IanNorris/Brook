@@ -391,6 +391,12 @@ void WmVolumeDrag(int32_t mx, bool held, uint32_t screenW, uint32_t screenH);
 bool WmVolumeScroll(int32_t mx, int32_t my, int delta, uint32_t screenW, uint32_t screenH);
 bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 void WmLauncherClose();
+// Floating volume/network tooltip above the taskbar for pointer (mx,my);
+// false when none is shown. Occupies the launcher/popup overlay slot.
+bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
+                          int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH);
+void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mx, int32_t my);
 
 // Render the taskbar (bottom of screen) with window buttons and clock.
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
