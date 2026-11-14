@@ -181,6 +181,8 @@ struct MixerStream {
     uint32_t stagingFrames = 0;
     bool discontinuity = false;
     bool coalesceUsed = false; // one grace per empty software-queue episode
+    bool cue = false;          // AudioMixerOpenCue: never extends a batch past live audio
+    uint64_t lastSubmitNs = 0; // last non-empty submit (clocked), for cue pacing
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
 static uint64_t g_nextStreamIdentity = 1;
@@ -498,10 +500,18 @@ AudioStreamId AudioMixerOpen()
             if (stream.identity) continue;
             identity = (g_nextStreamIdentity++ << 4) | (i + 1);
             ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES;
-            stream.writableFrames = stream.fragmentFrames = 1; stream.stagingFrames=0;stream.identity = identity;
+            stream.writableFrames = stream.fragmentFrames = 1; stream.stagingFrames=0;stream.cue=false;stream.lastSubmitNs=0;stream.identity = identity;
             break;
         }
     }
+    SpinLockRelease(&g_mixerLock);
+    return identity;
+}
+AudioStreamId AudioMixerOpenCue()
+{
+    const AudioStreamId identity=AudioMixerOpen();if(!identity)return 0;
+    SpinLockAcquire(&g_mixerLock);
+    if(auto* stream=FindStream(identity))stream->cue=true;
     SpinLockRelease(&g_mixerLock);
     return identity;
 }
@@ -566,6 +576,7 @@ uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
 uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId identity)
 {
     if (!samples || !frames) return 0;
+    const uint64_t submitNs = AudioClockNowNs();
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     if (!stream || stream->discontinuity) { SpinLockRelease(&g_mixerLock); return 0; }
@@ -584,7 +595,7 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
     }
     stream->write += frames;
     stream->submittedFrames += frames;
-    if (frames) stream->coalesceUsed = false;
+    if (frames) { stream->coalesceUsed = false; stream->lastSubmitNs = submitNs; }
     SpinLockRelease(&g_mixerLock);
     return frames;
 }
@@ -604,10 +615,23 @@ static void Consume(const Contribution* contributions, uint32_t frames, bool clo
 static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* prepared,
                         const AudioDeviceProgress& device,uint64_t sampledBefore,SharedPrefixAttempt& prefix)
 {
-    uint32_t frames = 0;
-    for (const auto& stream : g_streams)
-        if (stream.identity && stream.enabled && !stream.discontinuity && stream.write - stream.read > frames)
-            frames = static_cast<uint32_t>(stream.write - stream.read);
+    // Cue streams (AudioMixerOpenCue) are summed into batches sized by the
+    // other streams. While another stream is producing (submitted within
+    // CueHoldNs) the cue waits for its frames; mixing the cue ahead alone
+    // would push the live stream's next frames after it, so the cue would
+    // replace rather than overlay it. With no live stream it plays alone.
+    constexpr uint64_t CueHoldNs = 50000000;
+    const uint64_t nowNs = AudioClockNowNs();
+    uint32_t frames = 0, cueFrames = 0;bool liveStream = false;
+    for (const auto& stream : g_streams) {
+        if (!stream.identity || !stream.enabled || stream.discontinuity) continue;
+        const uint32_t queued = static_cast<uint32_t>(stream.write - stream.read);
+        if (stream.cue) { if (queued > cueFrames) cueFrames = queued; continue; }
+        if (queued > frames) frames = queued;
+        if (stream.submittedFrames && stream.lastSubmitNs && nowNs >= stream.lastSubmitNs &&
+            nowNs - stream.lastSubmitNs <= CueHoldNs) liveStream = true;
+    }
+    if (!frames && !liveStream) frames = cueFrames;
     if (frames > MIXER_BATCH_FRAMES) frames = MIXER_BATCH_FRAMES;
     if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
     const uint32_t normalFrames=frames;
