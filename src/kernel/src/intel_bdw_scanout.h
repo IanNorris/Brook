@@ -224,6 +224,16 @@ bool BdwRunPreparedVcsSelftest(BdwBcsExecutionBackend& backend,uint64_t scratchD
 bool BdwRetirePreparedVcsSelftest(BdwBcsExecutionBackend& backend);
 uint32_t BdwVcsSelftestReadback();
 bool BdwReleasePreparedVcsSelftest();
+// VCS0 user jobs (VA-API phase 1c; BROOK_BDW_VIDEO_ENGINE builds only). CPU0
+// application worker only. Ready arms the snapshot; Refused unwound cleanly.
+struct BdwVcsTableSink;
+#ifndef BROOK_HOST_TEST
+BdwPrepareOutcome BdwPrepareVcsUserJob(BdwExecSnapshot* snapshot,uint32_t nonce,BdwGgttReservation& reservation,
+                                       BdwOwnedPage& scratch,const char*& reason);
+bool BdwRunPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink,uint64_t scratchDma,BdwBcsRunResult& result);
+bool BdwRetirePreparedVcsUser(BdwBcsExecutionBackend& backend);
+bool BdwReleaseVcsUserJob(BdwExecSnapshot* snapshot,bool verifiedStopped);
+#endif
 // Snapshot only. It does not grant GPU access or release the retained page.
 bool BdwRetainedBcsScratch(BdwOwnedPage& out);
 // Caller serializes against retain/release; this is a one-way boot-lifetime
@@ -268,6 +278,9 @@ bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset
 class BdwVideoGate;enum class BdwVideoRefusal : uint8_t;
 bool BdwVideoBuilt();
 bool BdwVideoStatus(BdwVideoGate& out);
+// VCS0 user jobs run by the worker (phase 1c). Counters are relaxed reads.
+struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=0,lastUs=0,maxUs=0;bool quarantined=false;const char* detail="none";};
+void BdwVideoUserCountsRead(BdwVcsUserCounts& out);
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
 bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal);

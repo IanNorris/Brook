@@ -10,6 +10,7 @@
 #include "intel_bdw_context.h"
 #include "intel_bdw_submission.h"
 #include "intel_bdw_ioctl_trace.h"
+#include "intel_bdw_vcs_user.h"
 
 using namespace brook;
 
@@ -141,7 +142,7 @@ static void TestSelftestGate(){
     g.selftestDone(false,false,BdwVideoRefusal::PrepareFailed);       // refused before any write
     assert(g.stage()==BdwVideoStage::Probed && g.lastRefusal()==BdwVideoRefusal::PrepareFailed);
     g.selftestDone(true,true,BdwVideoRefusal::None);
-    assert(g.stage()==BdwVideoStage::SelftestOk && g.selftests()==2 && g.selftestPasses()==1 && !g.advertiseBsd());
+    assert(g.stage()==BdwVideoStage::SelftestOk && g.selftests()==2 && g.selftestPasses()==1 && g.advertiseBsd());
     assert(g.maySelftest()==BdwVideoRefusal::None);                   // repeatable
     g.selftestDone(false,true,BdwVideoRefusal::Mismatch);             // engine touched: quarantine
     assert(g.stage()==BdwVideoStage::Quarantined && g.maySelftest()==BdwVideoRefusal::Quarantined && !g.setEnabled(true));
@@ -213,7 +214,51 @@ static void TestIoctlTrace(){
     assert(!BdwVideoUserSubmissionReady());                 // no executor in this build
 }
 
+// Phase 1c: user-job ring, run classification and BSD advertisement.
+static void TestVcsUser(){
+    BdwBcsLaunch l{{0x10000000,0x10002000,0x900000,16384,56,1},0x7fff00001008ull,0x10007000,0x56435501};
+    uint32_t ctx[2048]{},ring[14]{};uint64_t d=0;
+    assert(BdwBuildVcsUser(l,ctx,ring,d) && d==0x11000013dull);
+    assert(ring[5]==0x18800101 && ring[6]==0x00001008u && ring[7]==0x7fffu);    // 48-bit PPGTT batch start
+    assert(ring[8]==0x13004002 && ring[9]==(0x10007000u|4) && ring[11]==0x56435501u && ring[13]==0x04000001);
+    assert(ctx[1024+2]==0x12244);                                            // VCS context registers
+    {auto bad=l;bad.batchPpgtt=0x1004;assert(!BdwBuildVcsUser(bad,ctx,ring,d));}   // not 8-byte aligned
+    {auto bad=l;bad.batchPpgtt=uint64_t{1}<<48;assert(!BdwBuildVcsUser(bad,ctx,ring,d));}
+    {auto bad=l;bad.nonce=0;assert(!BdwBuildVcsUser(bad,ctx,ring,d));}
+    {auto bad=l;bad.completionGgtt=0x10000000;assert(!BdwBuildVcsUser(bad,ctx,ring,d));} // breadcrumb on the context
+    {auto bad=l;bad.context.pml4Dma=0;assert(!BdwBuildVcsUser(bad,ctx,ring,d));}
+    // Classification.
+    BdwVcsUserRunView ok{};ok.forcewakeRequested=ok.forcewakeReleased=ok.clearDelivered=ok.workAttempted=ok.workComplete=true;
+    ok.resetBeforeAttempted=ok.resetBefore=ok.attempted=ok.copyComplete=ok.contextComplete=ok.resetAfter=ok.retired=true;
+    ok.patEstablished=ok.patRestored=true;ok.ggttWrites=8;ok.portWrites=4;
+    assert(BdwClassifyVcsUserRun(ok)==BdwVcsUserClass::Completed);
+    {auto v=ok;v.copyComplete=v.contextComplete=false;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::FailedStopped);} // hang
+    {auto v=ok;v.contextComplete=false;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::FailedStopped);}           // CSB
+    {auto v=ok;v.retired=false;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::StoppedRetained);}
+    {auto v=ok;v.resetAfter=false;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::Uncertain);}
+    {auto v=ok;v.patRestored=false;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::Uncertain);}
+    {auto v=ok;v.resetUncertain=true;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::Uncertain);}
+    {auto v=ok;v.forcewakeReleased=false;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::Uncertain);}
+    BdwVcsUserRunView busy{};busy.forcewakeRequested=false;                       // claim busy: nothing requested
+    assert(BdwClassifyVcsUserRun(busy)==BdwVcsUserClass::RefusedUntouched);
+    BdwVcsUserRunView step{};step.forcewakeRequested=step.forcewakeReleased=step.clearDelivered=step.workAttempted=true;step.refusalStep=2;
+    assert(BdwClassifyVcsUserRun(step)==BdwVcsUserClass::RefusedUntouched);   // callback evidence refusal
+    {auto v=step;v.refusalStep=5;v.resetBeforeAttempted=true;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::RefusedUntouched);}
+    {auto v=step;v.refusalStep=0;v.resetBeforeAttempted=v.resetBefore=true;assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::Uncertain);} // reset, never stopped
+    {auto v=step;v.refusalStep=0;v.resetBeforeAttempted=v.resetBefore=v.resetAfter=v.retired=true;
+     assert(BdwClassifyVcsUserRun(v)==BdwVcsUserClass::FailedStopped);}        // table admission failed after reset
+    // Advertisement: only gate on + a passing self-test; quarantine withdraws it.
+    BdwVideoGate g;BdwVcsSample idle{};idle.sampled=idle.idle=idle.quiescent=true;
+    g.setEnabled(true);g.probed(true,idle);assert(!g.advertiseBsd());
+    g.selftestDone(true,true,BdwVideoRefusal::None);assert(g.advertiseBsd());
+    g.setEnabled(false);assert(!g.advertiseBsd());
+    g.setEnabled(true);assert(g.advertiseBsd());                               // passed earlier this boot
+    g.quarantine(BdwVideoRefusal::SubmitFailed);
+    assert(!g.advertiseBsd() && g.stage()==BdwVideoStage::Quarantined && !g.setEnabled(true));
+}
+
 int main(){
+    TestVcsUser();
     TestIoctlTrace();
     TestStepSlot();
     TestPmRestore();

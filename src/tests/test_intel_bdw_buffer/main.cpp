@@ -1,3 +1,4 @@
+#include "intel_bdw_video.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_bootstrap_gate.h"
 #include "intel_bdw_file.h"
@@ -2207,6 +2208,18 @@ int main(){
         assert(BdwGpuFileCloseBuffer(f,secondHandle));
     }
     eb.flags|=1u<<17;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eb.flags=1u<<11;
+    // I915_EXEC_BSD (2): refused until the VCS executor is ready; then tagged
+    // for the VCS worker path. Other engine selectors (BLT 3, VEBOX 4) stay refused.
+    eb.flags=(1u<<11)|2u;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);
+    __atomic_store_n(&BdwVideoUserSubmissionStorage(),1u,__ATOMIC_RELEASE);
+    assert(!BdwIntelCopyExecSnapshot(f,execArg,user,&decoded) && decoded && BdwExecSnapshotEngine(decoded)==BdwExecEngineVideo);
+    assert(!BdwExecSnapshotSetEngine(decoded,3) && BdwExecSnapshotEngine(decoded)==BdwExecEngineVideo);
+    assert(BdwExecSnapshotRelease(decoded,false));decoded=nullptr;
+    eb.flags=(1u<<11)|1u;assert(!BdwIntelCopyExecSnapshot(f,execArg,user,&decoded) && decoded && BdwExecSnapshotEngine(decoded)==0);
+    assert(BdwExecSnapshotRelease(decoded,false));decoded=nullptr;
+    eb.flags=(1u<<11)|3u;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);
+    eb.flags=(1u<<11)|4u;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);
+    __atomic_store_n(&BdwVideoUserSubmissionStorage(),0u,__ATOMIC_RELEASE);eb.flags=1u<<11;
     eb.start=1;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eb.start=8;
     eo.relocCount=1;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eo.relocCount=0;
     eo.reserved1=1;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eo.reserved1=0;

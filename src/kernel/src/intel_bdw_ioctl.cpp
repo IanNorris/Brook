@@ -83,11 +83,13 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
     ExecBuffer request{};if(!u.read(u.context,&request,arg,sizeof(request)))return fault;
     constexpr uint64_t noReloc=uint64_t{1}<<11,handleLut=uint64_t{1}<<12,batchFirst=uint64_t{1}<<18,fenceArray=uint64_t{1}<<19,useExtensions=uint64_t{1}<<21;
     const uint64_t engine=request.flags&63;
-    // I915_EXEC_BSD (2): VCS user submission (VA-API phase 1c) is not wired
-    // into the worker yet; refuse it explicitly with a recorded reason.
+    // I915_EXEC_BSD (2): VCS0 user submission (VA-API phase 1c). Admitted only
+    // while the VCS executor is ready (gate on, a self-test passed this boot,
+    // not quarantined); otherwise refused with a recorded reason. The worker
+    // re-checks readiness for every job it runs.
     if(engine==2 && !BdwVideoUserSubmissionReady()){BdwNoteRefusal("execbuffer: I915_EXEC_BSD video engine submission not available");return invalid;}
     if(!request.count || request.count>8192 || !request.objects ||
-       (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>1 ||
+       (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>2 ||
        request.dr1 || request.dr4 || request.context>0xffffffffull || request.fences ||
        ((request.flags&useExtensions)?(!plan || (request.flags&fenceArray) || request.clipCount || !request.clips):
         (request.flags&fenceArray)?(!plan || !request.clipCount || request.clipCount>BdwMaxSubmissionFences || !request.clips):
@@ -112,6 +114,7 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
             if(!*out)result=invalid;
             else {
                 BdwExecSnapshotSetOrigin(*out,u.submitterPid,uint32_t(request.context),u.submitterIncarnation);
+                if(engine==2 && !BdwExecSnapshotSetEngine(*out,BdwExecEngineVideo)){BdwExecSnapshotRelease(*out,false);*out=nullptr;result=invalid;}
             }
             if(!result && (request.context || u.renderExperiment)){
                 auto* context=request.context?BdwGpuFileGetContext(file,uint32_t(request.context)):
@@ -209,9 +212,9 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
         // Publication is restricted to the matching live Dell PCI function.
         case 4: value=0x1616;break; // CHIPSET_ID
         case 32: value=9;break;     // REVISION
-        // HAS_BSD: VCS submission is not implemented (VA-API phase 1b). Answer 0
-        // explicitly so libva/i965 probe the engine as absent instead of seeing
-        // an error. I915_EXEC_BSD stays refused by execbuffer (engine>1).
+        // HAS_BSD: 1 only while the VCS0 user-job executor is ready (VA-API
+        // phase 1c: gate on and a self-test passed this boot). Otherwise 0, so
+        // libva/i965 probe the engine as absent instead of seeing an error.
         case 5: value=BdwVideoUserSubmissionReady()?1:0;break;
         case 19: value=(u.nowNs && u.sleepNs)?1:0;break; // HAS_WAIT_TIMEOUT
         // Iris can use the implemented WB mmap-offset path in this explicit

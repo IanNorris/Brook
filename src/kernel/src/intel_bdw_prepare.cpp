@@ -2,6 +2,7 @@
 #include "kprintf.h"
 #include "serial.h"
 #include "intel_bdw_oneshot.h"
+#include "intel_bdw_vcs_user.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_publish.h"
@@ -489,6 +490,118 @@ uint32_t BdwVcsSelftestReadback(){return videoImage.VideoReadback();}
 // Fails (and keeps every page) unless the image never ran or was retired.
 bool BdwReleasePreparedVcsSelftest(){
     return videoImage.ReleasePrepared(retainedAllocator) && videoImage.Recycle();
+}
+// VCS0 user jobs (VA-API phase 1c). A second, private table instance and
+// one-shot, and a boot-lifetime GGTT reservation of their own: never the RCS
+// image/tables (65544/29), the BCS diagnostic slot, the scanout reservation
+// or the self-test's. Only the CPU0 application worker calls these, one job
+// at a time, so the objects need no further locking.
+namespace {
+BdwVcsUserOneShot vcsUserImage;
+BdwExecTables vcsUserTables;
+BdwGgttReservation vcsUserReservation;
+BdwOwnedPage vcsUserScratch{};
+uint32_t vcsUserStaging[2048];
+BdwExecSnapshot* vcsUserSnapshot=nullptr;
+// Undo everything before any GPU use; false if a page may be device-visible.
+bool UnwindVcsUser(){
+    bool ok=vcsUserTables.AbandonUnsubmitted(retainedAllocator) && vcsUserTables.Recycle();
+    const auto st=vcsUserImage.State();
+    if(st==BdwOneShotState::Prepared)ok=vcsUserImage.ReleasePrepared(retainedAllocator) && vcsUserImage.UserRecycle() && ok;
+    else if(st==BdwOneShotState::Released)ok=vcsUserImage.UserRecycle() && ok;
+    else if(st!=BdwOneShotState::Fresh)ok=false;
+    if(ok)vcsUserSnapshot=nullptr;
+    return ok;
+}
+}
+BdwPrepareOutcome BdwPrepareVcsUserJob(BdwExecSnapshot* snapshot,uint32_t nonce,BdwGgttReservation& reservation,
+                                       BdwOwnedPage& scratch,const char*& reason){
+    reason="vcs user objects not fresh";
+    if(!snapshot || !nonce || vcsUserSnapshot || vcsUserImage.State()!=BdwOneShotState::Fresh || !vcsUserTables.Fresh())
+        return BdwPrepareOutcome::Uncertain;
+    auto refuse=[&](const char* why){reason=why;return UnwindVcsUser()?BdwPrepareOutcome::Refused:BdwPrepareOutcome::Uncertain;};
+    if(!vcsUserReservation.token){
+        auto& space=BdwGlobalGgttSpace();
+        if(!space.reserve(8,vcsUserReservation)){vcsUserReservation={};return refuse("vcs GGTT reservation unavailable");}
+        if(vcsUserReservation.first<65536 || vcsUserReservation.first>65536+512-8 || !retainedAllocator.alloc(vcsUserScratch)){
+            space.release(vcsUserReservation);vcsUserReservation={};return refuse("vcs GGTT reservation outside the one-shot window");
+        }
+        for(unsigned i=0;i<4096;++i)vcsUserScratch.cpu[i]=0;
+    }
+    if(!BdwGlobalGgttSpace().owns(vcsUserReservation)){reason="vcs GGTT reservation lost";return BdwPrepareOutcome::Uncertain;}
+    // The engine reaches only what the snapshot maps; a zero-copy scanout
+    // image (uncached PAT slot 3) or a protected buffer is never VCS work.
+    if(BdwExecSnapshotHasUncached(snapshot) || BdwExecSnapshotHasProtectedBuffer(snapshot))return refuse("scanout or protected buffer in a video job");
+    const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
+    if(!pages || pages>65536)return refuse("more than 65536 pages");
+    uint32_t tableCount=0;
+    if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
+        return refuse("address space needs more than 512 page tables");
+    vcsUserSnapshot=snapshot;
+    if(!vcsUserTables.Prepare(retainedAllocator,snapshot)){
+        if(vcsUserTables.Quarantined()){reason="table page allocation returned an unsafe page";return BdwPrepareOutcome::Uncertain;}
+        return refuse("page table allocation failed");
+    }
+    const uint64_t root=vcsUserTables.RootDma();
+    if(!vcsUserImage.PrepareUser(retainedAllocator,vcsUserReservation.first,vcsUserReservation.token,nonce,root,
+                                 BdwExecSnapshotBatchAddress(snapshot),vcsUserStaging)){
+        if(vcsUserImage.State()==BdwOneShotState::Quarantined){reason="private page allocation returned an unsafe page";return BdwPrepareOutcome::Uncertain;}
+        return refuse("private image or ring rejected (batch address)");
+    }
+    if(!vcsUserTables.Inspect(retainedAllocator,[&](const BdwOwnedPage* t,uint32_t count){
+        for(uint32_t i=0;i<count;++i)if(!vcsUserImage.DistinctPage(t[i]) || t[i].dma==vcsUserScratch.dma)return false;
+        return true;}))return refuse("table pages overlap private pages");
+    BdwPpgttPage scratchTables[4];
+    if(!vcsUserImage.ScratchTables(scratchTables))return refuse("scratch tables");
+    auto* workspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(pages)*sizeof(BdwPpgttMapping)));
+    if(!workspace)return refuse("mapping workspace allocation failed");
+    const bool built=vcsUserTables.BuildTables(retainedAllocator,snapshot,scratchTables,workspace,pages);
+    kfree(workspace);
+    if(!built)return refuse("page table build rejected the buffer set");
+    uint32_t status=BdwDmaNotPrepared;
+    if(!vcsUserTables.InspectDma(retainedAllocator,status) || status!=BdwDmaSnapshotOk)return refuse("page table DMA inspection");
+    if(vcsUserImage.InspectPreparedDma(retainedAllocator)!=BdwDmaSnapshotOk || !vcsUserImage.DistinctPage(vcsUserScratch))
+        return refuse("private image DMA inspection");
+    if(!vcsUserTables.Publish(retainedAllocator) || !vcsUserImage.PublishPrepared(retainedAllocator))return refuse("publish");
+    if(!BdwExecSnapshotSyncForDevice(snapshot))return refuse("device cache sync");
+    if(BdwExecSnapshotInspectDma(snapshot)!=BdwDmaSnapshotOk)return refuse("buffer DMA inspection");
+    // Arm immediately before the run. Nothing has been submitted yet, so a
+    // failure here still unwinds cleanly.
+    if(!vcsUserTables.BeginUse(retainedAllocator))return refuse("tables begin use");
+    if(!BdwExecSnapshotArm(snapshot,true)){
+        reason="arm";
+        const bool ok=vcsUserTables.ReleaseStopped(retainedAllocator,true) && vcsUserTables.Recycle() &&
+            vcsUserImage.ReleasePrepared(retainedAllocator) && vcsUserImage.UserRecycle();
+        if(ok)vcsUserSnapshot=nullptr;
+        return ok?BdwPrepareOutcome::Refused:BdwPrepareOutcome::Uncertain;
+    }
+    reservation=vcsUserReservation;scratch=vcsUserScratch;reason=nullptr;
+    return BdwPrepareOutcome::Ready;
+}
+bool BdwRunPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink,uint64_t scratchDma,BdwBcsRunResult& result){
+    if(scratchDma!=vcsUserScratch.dma || !vcsUserSnapshot || !BdwGlobalGgttSpace().owns(vcsUserReservation))return false;
+    // Recheck the table pages' geometry and flush them under the device lease.
+    if(!vcsUserTables.AdmitAndPublish(sink))return false;
+    result.attempted=true;
+    if(!vcsUserImage.ExecuteTakenOverWithBackend(retainedAllocator,backend,scratchDma))return false;
+    result.copyComplete=true;
+    while(backend.retirementContinue()){
+        const auto status=vcsUserImage.PollContextSwitch(backend);
+        if(status==BdwCsbPoll::Fault)return false;
+        if(status==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
+    }
+    return false;
+}
+// Only after an acknowledged VCS reset: unbinds the lease back to scratch.
+bool BdwRetirePreparedVcsUser(BdwBcsExecutionBackend& backend){return vcsUserImage.RetireScanout(backend);}
+// After a run: release the private image and the tables. verifiedStopped is
+// true only after an acknowledged VCS reset and a retired lease; otherwise
+// (or if any step fails) every page stays retained for the boot.
+bool BdwReleaseVcsUserJob(BdwExecSnapshot* snapshot,bool verifiedStopped){
+    if(!snapshot || snapshot!=vcsUserSnapshot || !verifiedStopped)return false;
+    if(!vcsUserImage.ReleasePrepared(retainedAllocator) || !vcsUserImage.UserRecycle())return false;
+    if(!vcsUserTables.ReleaseStopped(retainedAllocator,true) || !vcsUserTables.Recycle())return false;
+    vcsUserSnapshot=nullptr;return true;
 }
 #endif
 #endif

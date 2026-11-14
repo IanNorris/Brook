@@ -138,6 +138,18 @@ public:
             if(ownScratch_){list_=workspace;listCount_=workspaceCount;checksum_=Checksum(pages_,count_);}}
         return built_;
     }
+    // Table-only build for a non-render engine (VCS0 user jobs, VA-API phase
+    // 1c): the same PPGTT image as Build, without a render ring. Never adopts
+    // or retains a cached set; the workspace stays the caller's.
+    template<class Allocator> bool BuildTables(Allocator& a,BdwExecSnapshot* snapshot,const BdwPpgttPage (&scratch)[4],
+            BdwPpgttMapping* workspace,uint32_t workspaceCount){
+        if(allocator_!=static_cast<const void*>(&a) || state_!=State::Prepared || snapshot_!=snapshot ||
+           reused_ || ownScratch_ || !workspace)return false;
+        built_=false;dmaChecked_=false;
+        built_=BdwExecSnapshotBuildPpgtt(snapshot,scratch,tables_,tableCount_,workspace,workspaceCount);
+        if(built_){++stats_.builds;stats_.builtPages+=workspaceCount;}
+        return built_;
+    }
     bool KeepsWorkspace()const{return ownScratch_ && !reused_ && list_;}
     void RecordTiming(uint64_t us){if(reused_)stats_.adoptUs+=us;else{stats_.buildUs+=us;stats_.lastBuildUs=us;}}
     template<class Allocator> bool Publish(Allocator& a){

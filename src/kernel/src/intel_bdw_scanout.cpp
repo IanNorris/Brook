@@ -39,6 +39,8 @@
 #include "compositor.h"
 #include "panic_qr.h"
 #include "intel_bdw_video.h"
+#include "intel_bdw_vcs_user.h"
+#include "tsc_clock.h"
 #include "kprintf.h"
 extern "C" [[noreturn]] void KernelPanic(const char*,...);
 namespace brook {
@@ -356,6 +358,27 @@ struct VideoLease {
     VideoLease(){uint32_t expected=0;held=__atomic_compare_exchange_n(&videoOwner,&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED);}
     ~VideoLease(){if(held)__atomic_store_n(&videoOwner,0,__ATOMIC_RELEASE);}
 };
+// Phase 1c: the CPU0 worker's VCS user-job executor cannot take the video
+// lease (a self-test holding it waits on that same worker), so it reports a
+// quarantine through this flag. Holders of the video lease fold it into the
+// gate and publish BdwVideoUserSubmissionReady (HAS_BSD and BSD admission).
+uint32_t vcsUserQuarantined=0;
+const char* vcsUserQuarantineDetail="none";
+BdwVcsUserCounts vcsUserCounts{};
+[[maybe_unused]] void VideoSyncUserReadiness(){
+    if(__atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE) && videoGate.stage()!=BdwVideoStage::Quarantined){
+        videoGate.quarantine(BdwVideoRefusal::SubmitFailed);videoGate.setDetail(vcsUserQuarantineDetail);}
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    const bool ready=videoGate.advertiseBsd() && !__atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE);
+#else
+    const bool ready=false;
+#endif
+    const uint32_t was=__atomic_exchange_n(&BdwVideoUserSubmissionStorage(),ready?1u:0u,__ATOMIC_ACQ_REL);
+    // A worker quarantine that raced this publication wins.
+    if(ready && __atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE))__atomic_store_n(&BdwVideoUserSubmissionStorage(),0u,__ATOMIC_RELEASE);
+    if(was!=uint32_t(ready))KPrintf("gpu-video: I915_EXEC_BSD user submission %s\n",ready?"ready (HAS_BSD=1)":"withdrawn (HAS_BSD=0)");
+}
+struct VideoReadinessSync {~VideoReadinessSync(){VideoSyncUserReadiness();}};
 }
 namespace {
 // Precise sub-reasons (static strings) for `gpu video status` detail.
@@ -410,11 +433,19 @@ bool BdwVideoBuilt(){
     return false;
 #endif
 }
-bool BdwVideoStatus(BdwVideoGate& out){VideoLease lease;if(!lease.held)return false;out=videoGate;return true;}
+bool BdwVideoStatus(BdwVideoGate& out){VideoLease lease;if(!lease.held)return false;VideoSyncUserReadiness();out=videoGate;return true;}
+void BdwVideoUserCountsRead(BdwVcsUserCounts& out){
+    out.jobs=__atomic_load_n(&vcsUserCounts.jobs,__ATOMIC_RELAXED);out.completed=__atomic_load_n(&vcsUserCounts.completed,__ATOMIC_RELAXED);
+    out.refused=__atomic_load_n(&vcsUserCounts.refused,__ATOMIC_RELAXED);out.failed=__atomic_load_n(&vcsUserCounts.failed,__ATOMIC_RELAXED);
+    out.retries=__atomic_load_n(&vcsUserCounts.retries,__ATOMIC_RELAXED);out.lastUs=__atomic_load_n(&vcsUserCounts.lastUs,__ATOMIC_RELAXED);
+    out.maxUs=__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED);
+    out.quarantined=__atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE)!=0;out.detail=vcsUserQuarantineDetail;
+}
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
     refusal=BdwVideoRefusal::None;
     if(!BdwVideoBuilt()){refusal=BdwVideoRefusal::NotImplemented;return false;}
     VideoLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    VideoReadinessSync sync;VideoSyncUserReadiness();
     if(!videoGate.setEnabled(on)){refusal=videoGate.lastRefusal();return false;}
     KPrintf("gpu-video: gate %s\n",on?"on":"off");return true;
 }
@@ -513,6 +544,7 @@ bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,B
     refusal=BdwVideoRefusal::None;reset={};
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
     VideoLease video;if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    VideoReadinessSync sync;VideoSyncUserReadiness();
     refusal=videoGate.mayReset();if(refusal!=BdwVideoRefusal::None)return false;
     if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
        !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
@@ -557,6 +589,7 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
     RetryLease video(&videoOwner,200);
     if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    VideoReadinessSync sync;VideoSyncUserReadiness();
     refusal=videoGate.maySelftest();if(refusal!=BdwVideoRefusal::None){videoGate.setDetail("gate");return false;}
     auto refuseEarly=[&](BdwVideoRefusal r,const char* detail){refusal=r;videoGate.setDetail(detail);videoGate.selftestDone(false,false,r);return false;};
     if(!PanicRecoveryResetArmed())return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-recovery-unarmed");
@@ -665,6 +698,134 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
 #endif
 }
+// ---- VA-API phase 1c: VCS0 user jobs (I915_EXEC_BSD) on the CPU0 worker ----
+// The application worker routes snapshots tagged BdwExecEngineVideo here, one
+// job at a time between RCS jobs. Each job runs the phase 1b sequence on its
+// own image, tables and GGTT reservation: VCS reset (firmware engine values
+// restored), PAT lease, takeover bind, execlist init, ELSP, breadcrumb and CSB
+// within the 2 s budget, VCS reset, unbind. Fences fail or complete through
+// the queue's snapshot retirement.
+//
+// Failure policy (docs/bdw-video-engine.md, phase 1c):
+//  - a refusal before any VCS write (gate, preconditions, sizes, allocation,
+//    claim busy) fails the job's fence and keeps the device: {false,true,true};
+//  - a failure after VCS was touched (hang: no breadcrumb or CSB completion
+//    in the budget, CSB fault) with an acknowledged reset fails the fence and
+//    quarantines VCS for the boot (HAS_BSD withdrawn, BSD admission refused);
+//  - only an uncertain GDRST, PAT or forcewake state panics, as in 1b.
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+namespace {
+void VcsUserQuarantine(const char* detail){
+    vcsUserQuarantineDetail=detail?detail:"vcs-user-job";
+    __atomic_store_n(&vcsUserQuarantined,1u,__ATOMIC_RELEASE);
+    __atomic_store_n(&BdwVideoUserSubmissionStorage(),0u,__ATOMIC_RELEASE);
+    KPrintf("gpu-video: VCS quarantined for this boot (%s); I915_EXEC_BSD withdrawn\n",vcsUserQuarantineDetail);
+}
+BdwVcsUserRunView VcsUserView(const BdwForcewakeAdapterResult& out,const BdwBcsRunResult& run){
+    BdwVcsUserRunView v{};
+    v.forcewakeRequested=out.sequence.requested;v.forcewakeReleased=out.sequence.released;v.clearDelivered=out.clearDelivered;
+    v.workAttempted=out.sequence.workAttempted;v.workComplete=out.sequence.workComplete;
+    v.resetBeforeAttempted=run.resetBeforeAttempted;v.resetBefore=run.resetBefore;v.resetUncertain=run.resetUncertain;
+    v.attempted=run.attempted;v.copyComplete=run.copyComplete;v.contextComplete=run.contextComplete;
+    v.resetAfter=run.resetAfter;v.retired=run.scanoutRetired;v.patEstablished=run.patEstablished;v.patRestored=run.patRestored;
+    v.refusalStep=run.refusalStep;v.ggttWrites=run.ggttWriteAttempts;v.portWrites=run.portWriteAttempts;
+    return v;
+}
+}
+static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
+    __atomic_add_fetch(&vcsUserCounts.jobs,1,__ATOMIC_RELAXED);
+    uint32_t pid=0,ctx=0;BdwExecSnapshotOrigin(snapshot,pid,ctx);
+    auto refuse=[&](const char* reason)->BdwSubmissionOutcome{
+        const uint64_t n=__atomic_add_fetch(&vcsUserCounts.refused,1,__ATOMIC_RELAXED);
+        if(n<=16 || !(n&(n-1)))KPrintf("gpu-exec: vcs job refused pid=%u context=%u objects=%u pages=%u reason=%s count=%lu\n",
+            pid,ctx,BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),reason?reason:"?",n);
+        return {false,true,true};
+    };
+    if(!snapshot)return {false,true,true};
+    if(!BdwVideoUserSubmissionReady() || __atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE))return refuse("video engine not ready");
+    // The diagnostic slot covers every Brook GPU operation; wait briefly for
+    // a shell diagnostic instead of failing the job at once.
+    RetryLease lease(&diagnosticOwner,20);if(!lease.held)return refuse("diagnostic lease busy");
+    if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !__atomic_load_n(&firstReleased,__ATOMIC_ACQUIRE) ||
+       !observation.inventory || !observation.planned || !observation.patRequested)return refuse("precondition");
+    constexpr uint64_t pages[]={BdwDellBar0,BdwPrivatePatPage,BdwResetPage,0xf6880000ull,0xf6101000ull};
+    for(auto page:pages)if(!PageAdmitted(page))return refuse("precondition-pages");
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page))return refuse("precondition-forcewake-pages");
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page))return refuse("precondition-engine-pages");
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz)return refuse("precondition-tsc");
+    PciBootEntry entry{};bool found=false;
+    for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};if(!PciBootInventoryRead(i,&e))break;
+        const auto& d=e.device;if(d.bus==0 && d.dev==2 && d.fn==0){entry=e;found=true;break;}}
+    if(!found || !LiveGpuMatches(entry) || !PowerD0(entry.device) ||
+       !(PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4)&4))return refuse("precondition-gpu-identity-or-d0");
+    static uint32_t nonce=0x56435500; // "VCU\0"
+    if(nonce==~uint32_t{0})return refuse("nonce exhausted");
+    const uint64_t startNs=TscClockReadNs();
+    BdwGgttReservation reservation{};BdwOwnedPage scratch{};const char* reason=nullptr;
+    const auto prepared=BdwPrepareVcsUserJob(snapshot,++nonce,reservation,scratch,reason);
+    if(prepared==BdwPrepareOutcome::Refused)return refuse(reason);
+    if(prepared!=BdwPrepareOutcome::Ready){
+        // Nothing reached VCS, but its private objects are in an unknown
+        // state: refuse this job and every later one.
+        VcsUserQuarantine("prepare-uncertain");return refuse(reason?reason:"prepare");
+    }
+    BdwForcewakeAdapterResult out{};BdwBcsRunResult run{};
+    BdwVcsUserClass result=BdwVcsUserClass::RefusedUntouched;
+    unsigned attempt=0;
+    for(;;){
+        ++attempt;
+        VmmDellVcsUserRun(tsc.khz,reservation.first,reservation.token,scratch.dma,out,run);
+        result=BdwClassifyVcsUserRun(VcsUserView(out,run));
+        if(result!=BdwVcsUserClass::RefusedUntouched || attempt>=20)break;
+        SchedulerSleepMs(1);
+    }
+    if(attempt>1)__atomic_add_fetch(&vcsUserCounts.retries,attempt-1,__ATOMIC_RELAXED);
+    const uint64_t us=(TscClockReadNs()-startNs)/1000;
+    __atomic_store_n(&vcsUserCounts.lastUs,us,__ATOMIC_RELAXED);
+    if(us>__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED))__atomic_store_n(&vcsUserCounts.maxUs,us,__ATOMIC_RELAXED);
+    switch(result){
+    case BdwVcsUserClass::Uncertain:
+        KernelPanic("Broadwell video (VCS) user job uncertain: pid=%u context=%u batch=%lx reset=%u/%u/%u pat=%u/%u retired=%u ggtt=%u elsp=%u wake=%u/%u head=%x tail=%x acthd=%x ipehr=%x",
+            pid,ctx,BdwExecSnapshotBatchAddress(snapshot),unsigned(run.resetBefore),unsigned(run.resetAfter),unsigned(run.resetUncertain),
+            unsigned(run.patEstablished),unsigned(run.patRestored),unsigned(run.scanoutRetired),run.ggttWriteAttempts,run.portWriteAttempts,
+            unsigned(out.clearDelivered),unsigned(out.sequence.released),run.head,run.tail,run.acthd,run.ipehr);
+    case BdwVcsUserClass::RefusedUntouched:
+        // Never submitted: the armed snapshot retires through the queue as
+        // skipped (fence error, buffers not poisoned).
+        if(!BdwReleaseVcsUserJob(snapshot,true)){VcsUserQuarantine("release-after-refusal");return {false,true};}
+        return refuse(!out.sequence.workAttempted?VideoAdapterDetail(out):VideoStepDetail(run.refusalStep));
+    case BdwVcsUserClass::StoppedRetained:
+        // VCS was reset, but the GGTT lease could not be unbound: keep the
+        // image and tables for the boot (unreachable by the reset engine).
+        __atomic_add_fetch(&vcsUserCounts.failed,1,__ATOMIC_RELAXED);
+        KPrintf("gpu-exec: vcs job failed pid=%u context=%u reason=lease-not-retired; pages retained\n",pid,ctx);
+        VcsUserQuarantine("lease-not-retired");
+        return {false,true};
+    case BdwVcsUserClass::FailedStopped:{
+        __atomic_add_fetch(&vcsUserCounts.failed,1,__ATOMIC_RELAXED);
+        const char* detail=!run.attempted?"table-admission":!run.copyComplete?(run.portWriteAttempts<4?"execlist-init-or-elsp":"breadcrumb-timeout"):
+            !run.contextComplete?"csb-context-complete":"work-incomplete";
+        const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
+        KPrintf("gpu-exec: vcs job failed pid=%u context=%u reason=%s batch=%lx objects=%u pages=%u ggtt=%u elsp=%u head=%x tail=%x acthd=%x ipehr=%x execlist=%x words=%x,%x,%x,%x us=%lu\n",
+            pid,ctx,detail,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
+            run.ggttWriteAttempts,run.portWriteAttempts,run.head,run.tail,run.acthd,run.ipehr,run.execlist,
+            current.words[0],current.words[1],current.words[2],current.words[3],us);
+        const bool released=BdwReleaseVcsUserJob(snapshot,true);
+        VcsUserQuarantine(released?detail:"release-after-failure");
+        return {false,true};
+    }
+    case BdwVcsUserClass::Completed:
+        break;
+    }
+    if(!BdwReleaseVcsUserJob(snapshot,true)){
+        // The job completed and VCS was reset; only our bookkeeping failed.
+        VcsUserQuarantine("release-after-completion");
+    }
+    __atomic_add_fetch(&vcsUserCounts.completed,1,__ATOMIC_RELAXED);
+    return {true,true};
+}
+#endif
 // VCS power-management experiments and residency sampling (gen 391 clock sag).
 namespace {
 BdwGtPmSnapshot videoSampleA{},videoSampleB{};uint64_t videoSampleUs=0;
@@ -1006,6 +1167,11 @@ static BdwRenderAttemptView BdwRenderAttemptViewOf(const BdwForcewakeAdapterResu
     return v;
 }
 static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool contextTest){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    // I915_EXEC_BSD jobs never reach the render path. (Without the build
+    // option readiness is never published, so no BSD snapshot is admitted.)
+    if(snapshot && BdwExecSnapshotEngine(snapshot)==BdwExecEngineVideo)return ExecuteVcsUserJob(snapshot);
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FramePrepBegin);
 #endif

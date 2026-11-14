@@ -5889,6 +5889,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("refusals",g.refusals());
             r.text(",\"last_refusal\":\"");r.text(BdwVideoRefusalName(g.lastRefusal()));r.text("\"");
             r.text(",\"advertised\":");r.text(g.advertiseBsd()?"true":"false");
+            // Phase 1c: what userspace actually sees (HAS_BSD / BSD admission) and
+            // the worker's VCS user-job counters.
+            r.text(",\"user_ready\":");r.text(BdwVideoUserSubmissionReady()?"true":"false");
+            {BdwVcsUserCounts c{};BdwVideoUserCountsRead(c);
+             r.text(",\"user_jobs\":{");r.field("jobs",c.jobs);r.text(",");r.field("completed",c.completed);
+             r.text(",");r.field("refused",c.refused);r.text(",");r.field("failed",c.failed);
+             r.text(",");r.field("retries",c.retries);r.text(",");r.field("last_us",c.lastUs);r.text(",");r.field("max_us",c.maxUs);
+             r.text(",\"quarantined\":");r.text(c.quarantined?"true":"false");
+             r.text(",\"quarantine_detail\":\"");r.text(c.detail);r.text("\"}");}
             r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
             r.text(",");r.field("retries",g.retries());
             r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");

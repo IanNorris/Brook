@@ -21,6 +21,7 @@
 #include "intel_bdw_rcs_reset_mmio.h"
 #include "intel_bdw_vcs_reset_mmio.h"
 #include "intel_bdw_video.h"
+#include "intel_bdw_vcs_user.h"
 #include "intel_bdw_render_gt_mmio.h"
 #include "intel_bdw_render_backend.h"
 #include "intel_bdw_csb.h"
@@ -287,7 +288,9 @@ bool VmmDellForcewakeAckCriticalRead(uint32_t& result) {
 // bounded observation; an uncertain release permanently blocks further use.
 // The page-table lock prevents mapping changes throughout each operation.
 static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines,bool patRequested,bool tlbRequested,bool resetRequested,bool scopeCheck,
-                                        uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false,BdwRcsResetTestResult* vcsReset=nullptr,bool vcsSelftest=false,uint8_t vcsPmOp=0,BdwRcsResetTestResult* vcsPmResult=nullptr) {
+                                        uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false,BdwRcsResetTestResult* vcsReset=nullptr,bool vcsSelftest=false,uint8_t vcsPmOp=0,BdwRcsResetTestResult* vcsPmResult=nullptr,bool vcsUser=false) {
+    // VCS0 copy-flow users: the phase 1b self-test and phase 1c user jobs.
+    const bool vcsCopy=vcsSelftest || vcsUser;
     static BdwForcewakeClaim claim;result={};
     if(!claim.acquire()){result.refusal=claim.state()==2?BdwFwRefusalClaimUncertain:BdwFwRefusalClaimBusy;return;}
     struct Io {
@@ -397,7 +400,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         }
         void Poison(){mappingsValid=false;}
         uint64_t spinTicks=0,waitEnd=0;
-    } io{tlbRequested,resetRequested,scratchResult!=nullptr,initResult!=nullptr,patResult!=nullptr,copyResult!=nullptr,rcsReset!=nullptr,gtInit!=nullptr,renderResult!=nullptr,vcsReset!=nullptr,vcsSelftest || (vcsPmResult && vcsPmOp>uint8_t(BdwVcsPmOp::Sample))};
+    } io{tlbRequested,resetRequested,scratchResult!=nullptr,initResult!=nullptr,patResult!=nullptr,copyResult!=nullptr,rcsReset!=nullptr,gtInit!=nullptr,renderResult!=nullptr,vcsReset!=nullptr,vcsCopy || (vcsPmResult && vcsPmOp>uint8_t(BdwVcsPmOp::Sample))};
     uint64_t irq=VmmKernelPtCriticalEnter();io.irq=&irq;
     // Read-only exercise of the callback boundary. The callback remains under
     // the same page-table lock and forcewake claim as the initial samples.
@@ -868,15 +871,15 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         if(!scratchResult && !initResult && !copyResult)return true;
         // The audited MMIO page contains the diagnostic's fixed slots and
         // the separate scanout reservation. Their PTE writes stay disjoint.
-        if(!scratchDma || ((scanoutCopy || vcsSelftest)?(!copyResult || scratchIndex<65536 || scratchIndex>65536+512-8):scratchIndex!=65536) ||
-           (scanoutCopy && vcsSelftest)){
+        if(!scratchDma || ((scanoutCopy || vcsCopy)?(!copyResult || scratchIndex<65536 || scratchIndex>65536+512-8):scratchIndex!=65536) ||
+           (scanoutCopy && vcsCopy) || (vcsSelftest && vcsUser)){
             if(copyResult)copyResult->refusalStep=1;
             return false;}
         const uint64_t scratchPages[]={0xf6880000ull,(scratchResult || copyResult)?0xf6101000ull:BdwResetPage,BdwResetPage};
         for(uint64_t page:scratchPages) {
             DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e)){if(copyResult)copyResult->refusalStep=2;return false;}
         }
-        if(vcsSelftest){DellI2cCriticalEvidence e{};
+        if(vcsCopy){DellI2cCriticalEvidence e{};
             if(!held.evidence(BdwOtherEnginePages[1],e) || !BdwGttEvidenceValid(e)){copyResult->refusalStep=6;return false;}}
         if(copyResult) {
             if(!copyToken){copyResult->refusalStep=3;return false;}
@@ -959,28 +962,47 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 }
             } owner{held,khz,0,0};
             owner.scanout=scanoutCopy;
-            if(vcsSelftest)owner.base=BdwVcsBase;
+            if(vcsCopy)owner.base=BdwVcsBase;
             uint32_t a,b,c,d;__asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
             owner.line=((b>>8)&255)*8;
             if(!(d&(1u<<19)) || owner.line<16 || owner.line>4096 || (owner.line&(owner.line-1)) ||
                4096%owner.line || !held.tsc(owner.origin)){copyResult->refusalStep=4;return false;}
-            if(vcsSelftest)BdwVcsPmBegin(held);
+            if(vcsCopy)BdwVcsPmBegin(held);
             copyResult->resetBeforeAttempted=true;copyResult->resetBefore=owner.resetBcs();
             copyResult->resetUncertain=owner.resetWasUncertain;
-            if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsSelftest)BdwVcsPmFinish(held,2);return false;}
+            if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsCopy)BdwVcsPmFinish(held,2);return false;}
             BdwPatMmio<CopyOwner> patMmio(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),scanoutCopy);
             BdwPatLease pat;copyResult->patEstablished=pat.Establish(patMmio,0x119,scanoutCopy);
             if(!copyResult->patEstablished){copyResult->patUncertain=pat.State()==BdwPatLeaseState::Quarantined;return false;}
             owner.patActive=true;
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
-            if(vcsSelftest){
+            if(vcsCopy){
                 // Same takeover, PAT lease, execlist and CSB flow as the BCS
                 // one-shot, on VCS0. The GGTT PTE window and flush register are
                 // the one-shot ones; the engine page is BAR0+0x12000.
                 BdwVcsDeviceBackend<CopyOwner> vcs(owner,reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+0xf6880000ull),
                     reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
                     reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwVcsEnginePage),scratchIndex,copyToken,scratchDma);
-                const bool ran=BdwRunPreparedVcsSelftest(vcs,scratchDma,*copyResult);
+                // User jobs (phase 1c): the external table pages are checked
+                // and flushed under this lease before the first engine write.
+                struct TableSink final:BdwVcsTableSink {
+                    CopyOwner& o;explicit TableSink(CopyOwner& owner):o(owner){}
+                    bool admitExtraTables(BdwOwnedPage* p,unsigned count)override{
+                        if(!o.owned() || !p || !count || count>BdwPpgttMaxTables+4)return false;
+                        for(unsigned i=0;i<count;++i){const auto dma=p[i].dma;
+                            if(!dma || (dma&4095) || dma>=(uint64_t{16}<<30) || p[i].cpu!=reinterpret_cast<uint8_t*>(DIRECT_MAP_BASE+dma))return false;
+                            for(unsigned j=0;j<i;++j)if(p[j].dma==dma)return false;
+                        }
+                        return true;
+                    }
+                    bool publishExtraTables(BdwOwnedPage* p,unsigned count)override{
+                        if(!o.owned() || !p || !count || count>BdwPpgttMaxTables+4)return false;
+                        for(unsigned i=0;i<count;++i)if(!o.flushPage(p[i]))return false;
+                        return true;
+                    }
+                } sink{owner};
+                const bool ran=vcsUser?BdwRunPreparedVcsUser(vcs,sink,scratchDma,*copyResult):
+                    BdwRunPreparedVcsSelftest(vcs,scratchDma,*copyResult);
                 copyResult->ggttWriteAttempts=vcs.ggttWriteAttempts();copyResult->portWriteAttempts=vcs.portWriteAttempts();
                 copyResult->engineSampled=held.read32(BdwDellBar0+BdwVcsBase+0x34,copyResult->head) &&
                     held.read32(BdwDellBar0+BdwVcsBase+0x30,copyResult->tail) && held.read32(BdwDellBar0+BdwVcsBase+0x9c,copyResult->mode) &&
@@ -989,7 +1011,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     held.read32(BdwDellBar0+BdwVcsBase+0x234,copyResult->execlist);
                 // Stop the owned engine whatever happened, then unbind.
                 copyResult->resetAfter=owner.resetBcs(BdwBcsResetIntent::StopOwnedWork);
-                if(copyResult->resetAfter)copyResult->scanoutRetired=BdwRetirePreparedVcsSelftest(vcs);
+                if(copyResult->resetAfter)copyResult->scanoutRetired=vcsUser?BdwRetirePreparedVcsUser(vcs):BdwRetirePreparedVcsSelftest(vcs);
                 if(copyResult->resetAfter)copyResult->patRestored=pat.Release(patMmio);
                 copyResult->patUncertain=!copyResult->resetAfter || !copyResult->patRestored || !copyResult->scanoutRetired;
                 copyResult->resetUncertain=owner.resetWasUncertain;
@@ -1006,7 +1028,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 return !copyResult->patUncertain && !copyResult->resetUncertain;
             }
 #else
-            if(vcsSelftest)return false;
+            if(vcsCopy)return false;
 #endif
             BdwBcsDeviceBackend<CopyOwner> backend(owner,reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+0xf6880000ull),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
@@ -1115,7 +1137,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
     // evidence check, before any write.
     if(vcsPmResult && result.sequence.workAttempted && !result.sequence.workComplete && !vcsPmResult->attempted)
         result.workRefusedUntouched=true;
-    if(vcsSelftest && copyResult && result.sequence.workAttempted && !result.sequence.workComplete &&
+    if(vcsCopy && copyResult && result.sequence.workAttempted && !result.sequence.workComplete &&
        copyResult->refusalStep && !copyResult->resetUncertain && !copyResult->portWriteAttempts && !copyResult->ggttWriteAttempts &&
        !copyResult->patEstablished)
         result.workRefusedUntouched=true;
@@ -1225,6 +1247,11 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run) {
     run={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,false,nullptr,token,&run,
         nullptr,nullptr,nullptr,nullptr,false,nullptr,true);
+}
+// VCS0 user job (VA-API phase 1c), prepared by BdwPrepareVcsUserJob.
+void VmmDellVcsUserRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run) {
+    run={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,false,nullptr,token,&run,
+        nullptr,nullptr,nullptr,nullptr,false,nullptr,false,0,nullptr,true);
 }
 void VmmDellVcsPmOp(uint32_t khz,uint8_t op,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& r) {
     r={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,0,0,nullptr,nullptr,nullptr,false,nullptr,0,nullptr,
