@@ -33,7 +33,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | 0c | Reproducible Dell image build: `scripts/build_dell_image.py --qemu-check` (guarded QEMU repair-to-desktop via `scripts/check_dell_image_qemu.py`) | done: `74342a6b`, `e8680304`, `56fbc88b` |
 | M0 | Diagnostics: `gpu worker stats` (kernel), `/tmp/brook-desktop-stats.json` + `scripts/desktop_stats_diff.py` (renderer), `scripts/dell_quake_measure.py` | done: gen 357 results below |
 | M2 | Release the previous client buffer as soon as the compositor has consumed it; remove the CPU copies on the GPU path (waylandd snapshot); present-driven frame callbacks; drop the 8-buffer workaround | todo |
-| — | Close the Kernel Console at startup on the GPU desktop (no CPU console writes) and add a network up/down indicator near the taskbar clock | done on `work/desktop-ui`: `build_dell_image.py` hides it by default (`--show-kernel-console` keeps it; Apps > Kernel Console reopens it); taskbar bars left of the clock show primary-interface IPv4 state |
+| — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
 | M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
 | M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | todo |
