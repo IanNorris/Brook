@@ -1,10 +1,13 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
-enum class LaunchPhase : uint8_t { Empty, Queued, Dispatching, Waiting, Failed, TimedOut };
+// Exited: dispatch succeeded but every tagged process ended without a window.
+// Not a failure claim (a single-instance handoff can look the same); a late
+// window still resolves it.
+enum class LaunchPhase : uint8_t { Empty, Queued, Dispatching, Waiting, Failed, TimedOut, Exited };
 struct LaunchFeedback {
     uint64_t token=0, requested=0, changed=0, windowCeiling=0;
-    uint64_t startedTick=0,dispatchTick=0,windowTick=0,observedWindowIncarnation=0;
+    uint64_t startedTick=0,dispatchTick=0,windowTick=0,observedWindowIncarnation=0,absentSince=0;
     uint32_t observedWindowId=0;bool observedViaToken=false,existingWindow=false;
     uint32_t catalogGeneration=0;
     int rawResult=0;bool rawResultKnown=false;
@@ -21,7 +24,7 @@ struct LaunchFeedback {
 class LaunchFeedbackTable {
 public:
     static constexpr unsigned Capacity=8;
-    static constexpr uint64_t TimeoutMs=300000, NoticeMs=15000;
+    static constexpr uint64_t TimeoutMs=300000, NoticeMs=15000, ExitGraceMs=3000;
     LaunchFeedback entries[Capacity]{};
     static bool Equal(const char* a,const char* b) {
         if(!a||!b||!*a||!*b)return false;
@@ -104,7 +107,15 @@ public:
     }
     void Advance(uint64_t token,uint64_t now,bool liveProcesses) {
         int i=Find(token);if(i<0)return;auto& e=entries[i];
-        (void)liveProcesses; // A successful single-instance handoff can leave no tagged process.
+        // All tagged processes gone for ExitGraceMs after a successful dispatch,
+        // with no window: stop the spinner and say so instead of waiting the
+        // full timeout. A single-instance handoff can leave no tagged process,
+        // so this is reported as Exited, not Failed, and a late window clears it.
+        if(e.phase==LaunchPhase::Waiting&&e.dispatchFinished&&e.dispatched&&!e.windowObserved) {
+            if(liveProcesses)e.absentSince=0;
+            else if(!e.absentSince)e.absentSince=now|1;
+            else if(now-e.absentSince>=ExitGraceMs){e.phase=LaunchPhase::Exited;e.changed=now;return;}
+        }
         if(e.busy()&&now-e.requested>=TimeoutMs){e.phase=LaunchPhase::TimedOut;e.changed=now;}
         else if(!e.busy()&&!e.inFlight()&&now-e.changed>=NoticeMs)e={};
     }
