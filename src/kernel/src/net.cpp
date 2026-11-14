@@ -18,6 +18,7 @@
 #include "intel_bdw_render_clock_runtime.h"
 #endif
 #include "intel_bdw_wait_queue.h"
+#include "cpu_idle.h"
 #include "thermal_runtime.h"
 #include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -5127,6 +5128,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6 | cpu idle status|reset - idle C-state (default hlt)\n"
+            "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (default: firmware value)\n"
             "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
@@ -5717,6 +5720,61 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
+    }
+    else if(StrStartsWith(cmd,"cpu idle") || StrStartsWith(cmd,"cpu epb")) {
+        // Idle C-state selection (default hlt = C1, the pre-existing behaviour)
+        // and IA32_ENERGY_PERF_BIAS. Changes apply at each CPU's next idle entry.
+        const char* note="";
+        bool bad=false;
+        if(NetStrEq(cmd,"cpu idle mwait on"))note=CpuIdleStateName(CpuIdleRequest(CpuIdleState::C6).state);
+        else if(NetStrEq(cmd,"cpu idle mwait off"))note=CpuIdleStateName(CpuIdleRequest(CpuIdleState::Hlt).state);
+        else if(StrStartsWith(cmd,"cpu idle state ")){
+            const char* v=cmd+15;CpuIdleState st=CpuIdleState::Count;
+            for(uint32_t i=0;i<uint32_t(CpuIdleState::Count);++i)if(NetStrEq(v,CpuIdleStateName(CpuIdleState(i))))st=CpuIdleState(i);
+            if(st==CpuIdleState::Count)bad=true;else note=CpuIdleStateName(CpuIdleRequest(st).state);
+        }
+        else if(NetStrEq(cmd,"cpu idle reset")){CpuIdleResetCounters();note="counters reset";}
+        else if(NetStrEq(cmd,"cpu epb default")){
+            CpuIdleStatus cur{};CpuIdleRequestSample();CpuIdleReadStatus(cur);
+            const int32_t t=CpuEpbBootTarget(cur.cpus[0].epb);
+            note=t<0?"left unchanged":(CpuIdleRequestEpb(uint32_t(t))?"set 6":"unsupported");
+        }
+        else if(StrStartsWith(cmd,"cpu epb ") && !NetStrEq(cmd,"cpu epb status")){
+            uint32_t v=0;const char* q=cmd+8;bool digits=*q!=0;
+            for(;*q;++q){if(*q<'0'||*q>'9'){digits=false;break;}v=v*10+uint32_t(*q-'0');}
+            if(!digits||v>15)bad=true;else note=CpuIdleRequestEpb(v)?"requested":"unsupported";
+        }
+        else if(!NetStrEq(cmd,"cpu idle status") && !NetStrEq(cmd,"cpu idle") && !NetStrEq(cmd,"cpu epb status"))bad=true;
+        if(bad){DebugChannelSend("{\"error\":\"usage: cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6 | cpu idle status|reset | cpu epb <0-15>|default|status\"}\n");}
+        else {
+            CpuIdleRequestSample();
+            // Give idle loops a moment to honour the sample/EPB request.
+            for(int i=0;i<20;++i)SchedulerSleepMs(5);
+            CpuIdleStatus st{};CpuIdleReadStatus(st);
+            BridgeReply r;
+            auto hex=[&](const char* name,uint64_t v){r.text(",\"");r.text(name);r.text("\":\"0x");r.number(v,true);r.text("\"");};
+            r.text("{\"note\":\"");r.text(note);r.text("\",\"bare_intel\":");r.text(st.bareIntel?"true":"false");
+            r.text(",\"mwait\":");r.text(st.caps.mwait?"true":"false");r.text(",\"arat\":");r.text(st.caps.arat?"true":"false");
+            r.text(",\"interrupt_break\":");r.text(st.caps.interruptBreak?"true":"false");hex("cpuid5_edx",st.caps.leaf5Edx);
+            r.text(",\"requested\":\"");r.text(CpuIdleStateName(st.requested));r.text("\",\"state\":\"");r.text(CpuIdleStateName(st.choice.state));
+            r.text("\",");r.field("hint",st.choice.hint<0?0xffffffffu:uint64_t(st.choice.hint));r.text(",");r.field("ecx",st.choice.ecx);
+            r.text(",\"clamp\":\"");r.text(st.choice.clamp);r.text("\"");
+            r.text(",\"epb_supported\":");r.text(st.epbSupported?"true":"false");
+            r.text(",\"epb_target\":");if(st.epbTarget<0)r.text("null");else r.number(uint64_t(st.epbTarget));
+            hex("misc_enable",st.miscEnable);r.text(",\"turbo_disabled\":");r.text((st.miscEnable>>38)&1?"true":"false");
+            hex("turbo_ratio_limit",st.turboRatioLimit);hex("pkg_cst_config_control",st.pkgCstConfig);
+            r.text(",");r.field("tsc",st.tsc);
+            r.text(",\"pkg\":{");r.field("c2",st.pkgC2);r.text(",");r.field("c3",st.pkgC3);r.text(",");r.field("c6",st.pkgC6);r.text(",");r.field("c7",st.pkgC7);r.text("}");
+            r.text(",\"cpus\":[");
+            for(uint32_t i=0;i<st.cpuCount;++i){if(i)r.text(",");const auto& c=st.cpus[i];
+                r.text("{");r.field("hlt",c.entries[0]);r.text(",");r.field("c1",c.entries[1]);r.text(",");r.field("c1e",c.entries[2]);
+                r.text(",");r.field("c3",c.entries[3]);r.text(",");r.field("c6",c.entries[4]);r.text(",");r.field("idle_tsc",c.idleTsc);
+                r.text(",");r.field("core_c3",c.coreC3);r.text(",");r.field("core_c6",c.coreC6);r.text(",");r.field("core_c7",c.coreC7);
+                r.text(",");r.field("sample_tsc",c.sampleTsc);r.text(",");r.field("sample_gen",c.sampleGen);hex("epb",c.epb);r.text("}");}
+            r.text("]");
+            r.text(",\"scope\":\"idle C-state: hlt (default) or MWAIT hint from CPUID.05H; C3/C6 need ARAT; counts per CPU since boot or reset; idle_tsc includes the waking ISR; core/pkg residency MSRs count at TSC rate (core values sampled by each CPU's idle loop at sample_tsc); epb is IA32_ENERGY_PERF_BIAS read back per CPU\"}\n");
+            r.send();
+        }
     }
     else if(NetStrEq(cmd,"thermal status") || NetStrEq(cmd,"thermal history") || NetStrEq(cmd,"thermal graph") ||
             NetStrEq(cmd,"thermal power") || NetStrEq(cmd,"thermal reset")) {

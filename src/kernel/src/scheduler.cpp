@@ -1,5 +1,6 @@
 #include "process_fs.h"
 #include "scheduler.h"
+#include "cpu_idle.h"
 #include "scheduler_affinity.h"
 #include "robust_futex.h"
 #include "irq_accounting.h"
@@ -1170,7 +1171,8 @@ static void IdleLoop()
 #ifdef BROOK_SCHED_START_TEST_HOOKS
         StartTestArrival(ThisCpu(), ProcessCurrent(), "idle");
 #endif
-        __asm__ volatile("sti\n\thlt" ::: "memory");
+        // HLT (C1) by default; `cpu idle` may select an MWAIT state.
+        CpuIdleEnter(ThisCpu());
     }
 }
 

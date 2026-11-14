@@ -352,6 +352,7 @@ add_executable(kernel
     src/shell.cpp
     src/audio.cpp
     src/thermal_sampler.cpp
+    src/cpu_idle.cpp
     src/syscall_timing.cpp
     src/sched_decision_trace.cpp
     src/boot_logo.cpp
