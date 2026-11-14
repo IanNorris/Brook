@@ -63,7 +63,7 @@ return {layerManager:w?w.windowUtils.layerManagerType:null, webrender:w?w.window
  windowProtocol:g.windowProtocol, features:features, log:log};"""
 result = {'wrapper': wrapper}
 with (work / 'browser.log').open('w') as log:
-    proc = subprocess.Popen([wrapper, '--marionette', '--new-window', 'about:blank'], stdout=log, stderr=log)
+    proc = subprocess.Popen([wrapper, '--marionette', '-remote-allow-system-access', '--new-window', 'about:blank'], stdout=log, stderr=log)
     try:
         m = Marionette()
         m.call('WebDriver:NewSession', capabilities={})
