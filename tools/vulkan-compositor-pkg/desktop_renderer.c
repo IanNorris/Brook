@@ -144,6 +144,14 @@ static int present_full(uint64_t ticket,uint32_t width,uint32_t height){
 }
 
 static void source_close(int drm,struct Source *s);
+/* The desktop path never parks: a GPU or handoff failure is logged and the
+ * renderer exits so the supervisor restarts it. Process exit is the kernel's
+ * designed recovery: it quarantines or reclaims any in-flight GPU work and
+ * the buffers it references, so nothing is freed under the device. */
+static void renderer_exit_for_restart(const char *cause,long detail){
+    fprintf(stderr,"DESKTOP_RENDERER_EXIT_FOR_RESTART cause=%s detail=%ld\n",cause,detail);
+    fflush(stderr);_exit(76);
+}
 /* Zero-copy scanout ring size (0 = off): the kernel advertises
  * BROOK_GPU_PRESENT_CAP_SCANOUT; BROOK_RENDER_SCANOUT_IMAGES=0|3|4 overrides. */
 static unsigned g_scanoutImages;
@@ -197,17 +205,17 @@ static void context_init(struct RenderContext *ctx){
 
 static void context_close(int drm,struct RenderContext *ctx){
     if(ctx->quad && !brook_vk_quad_pass_destroy(ctx->quad)){
-        fprintf(stderr,"DESKTOP_QUAD_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_QUAD_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("quad_destroy_uncertain",0);
     }
     free(ctx->plan);free(ctx->track);
     if(ctx->graphics && !brook_vk_graphics_pass_destroy(ctx->graphics)){
-        fprintf(stderr,"DESKTOP_GRAPHICS_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_GRAPHICS_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_destroy_uncertain",0);
     }
     if(ctx->renderer && !brook_vk_renderer_destroy(ctx->renderer)){
-        fprintf(stderr,"DESKTOP_RENDERER_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_RENDERER_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("renderer_destroy_uncertain",0);
     }
     if(ctx->batchRenderer && !brook_vk_renderer_destroy(ctx->batchRenderer)){
-        fprintf(stderr,"DESKTOP_BATCH_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_BATCH_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("batch_destroy_uncertain",0);
     }
     free(ctx->batchScenes);source_close(drm,&ctx->batchBackdrop);
     if(ctx->batchOutput>=0)close(ctx->batchOutput);
@@ -721,7 +729,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             statsSubmitStart=monotonic_ns();
             if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
             status=brook_vk_quad_pass_submit(ctx->quad,scene,words,inputs,count,&output,plan);
-            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN resources retained\n");for(;;)pause();}
+            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN stage=submit vk_result=%d (the kernel refused the submission or the device is lost)\n",
+                brook_vk_quad_pass_last_result(ctx->quad));renderer_exit_for_restart("quad_submit",brook_vk_quad_pass_last_result(ctx->quad));}
             if(status==BROOK_VK_PENDING){
                 quadUsed=1;++g_quadSubmitted;attemptPartial=qpartial;damage=qdamage;damagePixels=plan->damagePixels;
                 traceLayers=plan->layersDrawn;statsDraws=plan->drawCount;statsShaded=plan->pixelsShaded;
@@ -747,7 +756,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             }else{
                 ++g_quadFallback;
                 if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0)){
-                    fprintf(stderr,"DESKTOP_QUAD_RELEASE_UNCERTAIN resources retained\n");for(;;)pause();}
+                    fprintf(stderr,"DESKTOP_QUAD_RELEASE_UNCERTAIN resources retained\n");renderer_exit_for_restart("quad_release_uncertain",0);}
                 ticket=-1;
                 if(getenv("BROOK_RENDER_DIAGNOSTIC"))fprintf(stderr,"DESKTOP_QUAD_REJECTED compute fallback\n");
             }
@@ -815,11 +824,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
                 status=brook_vk_graphics_pass_submit_regions(ctx->graphics,culledScene,SCENE_HEADER,inputs,batchCount,&output,regions,damage.count);
                 if(status==BROOK_VK_PENDING){graphicsUsed=1;++g_graphicsSubmitted;}
-                else if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_PARTIAL_UNCERTAIN resources retained\n");for(;;)pause();}
+                else if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_PARTIAL_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_partial_uncertain",0);}
                 else {
                     ++g_graphicsFallback;
                     if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0)){
-                        fprintf(stderr,"DESKTOP_GRAPHICS_RELEASE_UNCERTAIN resources retained\n");for(;;)pause();}
+                        fprintf(stderr,"DESKTOP_GRAPHICS_RELEASE_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_release_uncertain",0);}
                     ticket=-1;
                 }
             }
@@ -867,7 +876,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             if(validInputs)status=brook_vk_graphics_pass_submit_scene(ctx->graphics,scene,words,inputs,count,&output);
             if(status==BROOK_VK_PENDING){graphicsUsed=1;++g_graphicsSubmitted;}
             else if(status==BROOK_VK_REJECTED)++g_graphicsFallback;
-            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_SUBMIT_UNCERTAIN resources retained\n");for(;;)pause();}
+            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_SUBMIT_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_submit_uncertain",0);}
             if(status==BROOK_VK_REJECTED && getenv("BROOK_RENDER_DIAGNOSTIC"))fprintf(stderr,"DESKTOP_GRAPHICS_REJECTED compute fallback\n");
         }
         if(status==BROOK_VK_REJECTED)
@@ -925,7 +934,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             }
             if(recovery==DESKTOP_FENCE_RETAIN){
                 fprintf(stderr,"DESKTOP_RENDERER_RELEASE_UNCERTAIN result=%ld errno=%d resources retained\n",pending.released,pending.releaseErrno);
-                for(;;)pause();
+                renderer_exit_for_restart("renderer_release_uncertain",0);
             }
             uint64_t now=monotonic_ns();
             if(nextReport && now>=nextReport){
@@ -952,7 +961,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     long observed=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,ticket,0,0,0,0);
     if(observed!=1){
         const int observeErrno=observed<0?errno:0;
-        fprintf(stderr,"DESKTOP_RENDERER_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,observeErrno);for(;;)pause();
+        fprintf(stderr,"DESKTOP_RENDERER_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,observeErrno);renderer_exit_for_restart("renderer_fence_unknown",0);
     }
     timing[4]=monotonic_ns();
     stage=attemptPartial?"region_present":"full_present";
@@ -1065,10 +1074,11 @@ static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer
         return 0;
     }
     if(status!=BROOK_VK_COMPLETE){
-        if(p->graphics || p->quad){fprintf(stderr,"DESKTOP_%s_UNCERTAIN result=%d resources retained\n",p->quad?"QUAD":"GRAPHICS",status);for(;;)pause();}
+        if(p->graphics || p->quad){fprintf(stderr,"DESKTOP_%s_UNCERTAIN stage=fence result=%d vk_result=%d\n",p->quad?"QUAD":"GRAPHICS",status,
+            p->quad?brook_vk_quad_pass_last_result(ctx->quad):0);renderer_exit_for_restart("quad_or_graphics_uncertain",0);}
         struct BrookVkFailure failure=brook_vk_renderer_failure(renderer);
         fprintf(stderr,"DESKTOP_ASYNC_UNCERTAIN stage=%d vk_result=%d resources retained\n",failure.stage,failure.result);
-        for(;;)pause();
+        renderer_exit_for_restart("async_uncertain",0);
     }
     p->compositionReady=1;p->statsFence=monotonic_ns();
     p->traceCompleted=getenv("BROOK_RENDER_TIMELINE")?monotonic_ns():0;
@@ -1077,7 +1087,7 @@ static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer
 
 static int submit_present(struct PendingDesktopFrame *p){
     long observed=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,p->ticket,0,0,0,0);
-    if(observed!=1){fprintf(stderr,"DESKTOP_ASYNC_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,errno);for(;;)pause();}
+    if(observed!=1){fprintf(stderr,"DESKTOP_ASYNC_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,errno);renderer_exit_for_restart("async_fence_unknown",0);}
     if(!async_sources_presentable(g_asyncSourceBarriers,p->sources,p->visible)){
         if(getenv("BROOK_RENDER_ASYNC_TRACE"))fprintf(stderr,"DESKTOP_ASYNC_STALE_CPU ticket=%ld\n",p->ticket);
         errno=ESTALE;return -1;
@@ -1104,7 +1114,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
         if(!status)return 0;
         if(status<0){
             fprintf(stderr,"DESKTOP_ASYNC_PRESENT_UNKNOWN ticket=%ld errno=%d resources retained\n",p->ticket,errno);
-            for(;;)pause();
+            renderer_exit_for_restart("async_present_unknown",0);
         }
         g_presentingTicket=0;
         result=status==1?0:-1;

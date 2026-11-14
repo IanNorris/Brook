@@ -33,7 +33,7 @@ struct BrookVkQuadPass {
     PFN_vkGetMemoryFdPropertiesKHR getFdProperties;PFN_vkImportSemaphoreFdKHR importSemaphore;
     struct QuadImage cache[QUAD_CACHE_SLOTS],frame[QUAD_FRAME_SLOTS];unsigned frameCount;
     VkSemaphore wait[BROOK_VK_MAX_LAYERS];unsigned waitCount;
-    uint64_t clock;int pending,uncertain;
+    uint64_t clock;int pending,uncertain;VkResult lastResult;
     struct BrookVkQuadStats stats;
 };
 
@@ -464,7 +464,8 @@ BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene
     if(vkEndCommandBuffer(p->command)!=VK_SUCCESS)goto reject;
     VkSubmitInfo submit={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.waitSemaphoreCount=p->waitCount,.pWaitSemaphores=waits,
         .pWaitDstStageMask=stages,.commandBufferCount=1,.pCommandBuffers=&p->command};
-    if(vkQueueSubmit(p->queue,1,&submit,p->fence)!=VK_SUCCESS){p->uncertain=1;return BROOK_VK_UNCERTAIN;}
+    {const VkResult submitted=vkQueueSubmit(p->queue,1,&submit,p->fence);
+     if(submitted!=VK_SUCCESS){p->lastResult=submitted;p->uncertain=1;return BROOK_VK_UNCERTAIN;}}
     ++p->stats.submits;p->pending=1;return BROOK_VK_PENDING;
 reject:
     /* Cached imports stay valid for the next submission. */
@@ -474,7 +475,7 @@ reject:
 static BrookVkResult retire(BrookVkQuadPass *p,VkResult status){
     if(status==VK_NOT_READY || status==VK_TIMEOUT)return BROOK_VK_PENDING;
     p->pending=0;
-    if(status!=VK_SUCCESS){p->uncertain=1;return BROOK_VK_UNCERTAIN;}
+    if(status!=VK_SUCCESS){p->lastResult=status;p->uncertain=1;return BROOK_VK_UNCERTAIN;}
     if(p->timestamps){
         uint64_t ticks[2]={0};
         if(vkGetQueryPoolResults(p->device,p->timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){
@@ -493,6 +494,7 @@ BrookVkResult brook_vk_quad_pass_wait(BrookVkQuadPass *p,uint64_t timeoutNs){
     if(!p || !p->pending || p->uncertain)return BROOK_VK_REJECTED;
     return retire(p,vkWaitForFences(p->device,1,&p->fence,VK_TRUE,timeoutNs));
 }
+int brook_vk_quad_pass_last_result(const BrookVkQuadPass *p){return p?(int)p->lastResult:0;}
 int brook_vk_quad_pass_gpu_timestamp_ns(const BrookVkQuadPass *p,uint64_t *ns){
     if(!p || !ns || !p->gpuValid)return 0;
     *ns=p->gpuNs;return 1;

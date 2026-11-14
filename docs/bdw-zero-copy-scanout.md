@@ -127,6 +127,18 @@ hasvk's Gen8 MOCS for external buffers is 0x18 (target cache "L3, defer to PAT";
 
 A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it always sees the newest pixels.
 
+**Third Dell finding (gen 375): renderer park.** This was not a zero-copy or PAT fault.
+- **What the log shows:** the renderer logged `DESKTOP_QUAD_UNCERTAIN` from the *submit* branch: `vkQueueSubmit` failed because the kernel refused the execbuffer or hasvk saw its context lost. The renderer then parked in `pause()`.
+- **Mechanism in the kernel:** when a job's wait dependency failed, the worker failed the job without running it (`BdwExecSnapshotDependencies==2`). `BdwExecSnapshotMarkFailed` then poisoned the job's context and set a sticky failed bit on every buffer it referenced. One client's failed frame (yquake2 there; Chromium on gen 374) thereby poisoned the compositor job that sampled or waited on it, and every later job touching those buffers.
+- **Fixes:**
+  - A dependency-skipped job is now finished as *skipped*: its fences fail, so the error propagates, but its context and buffers are not poisoned.
+  - The worker logs the first failures of each kind (`gpu-submit: job skipped|failed|unsafe pid=…`).
+  - The renderer never samples a GPU offer whose producer fence reports an error (`SYNC_IOC_FILE_INFO`; `DESKTOP_GPU_SOURCE_FAILED`, CPU fallback for that window).
+  - Every former `pause()` park logs `DESKTOP_RENDERER_EXIT_FOR_RESTART cause=… detail=…` (the quad VkResult included) and exits with status 76, so the supervisor restarts it. Process exit is the kernel's designed recovery.
+- **Caveat:** a restarted renderer cannot re-register the zero-copy ring (one registration per boot), so it uses single outputs and the copy path until reboot.
+- **Tests:** `test_intel_bdw_buffer` (skipped versus executed failure) and `desktop_gpu_channel_test` (failed-fence offer excluded, newer good offer selected).
+- **Not established:** what made the first client job fail. The new log line names it next time.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:

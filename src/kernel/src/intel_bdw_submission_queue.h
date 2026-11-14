@@ -195,7 +195,7 @@ public:
     // Return false for any invariant failure or unsafe stop; the caller must
     // initiate recovery. Safely completed/aborted records are released
     // outside the mutex. A quarantined active snapshot stays owned forever.
-    bool Finish(uint64_t id,bool success,bool safelyStopped){
+    bool Finish(uint64_t id,bool success,bool safelyStopped,bool skipped=false){
         if(!initialized_)return false;
         bool cacheReady=false;
         if(success && safelyStopped){
@@ -208,7 +208,7 @@ public:
         BdwExecSnapshot* finished[32]{};BdwRetirementLedger::Node retirements[32]{};unsigned count=0;
         KMutexLock(&mutex_);
         const bool ok=success && safelyStopped?
-            queue_.FinishWithCacheResult(id,true,true,cacheReady):queue_.Finish(id,success,safelyStopped);
+            queue_.FinishWithCacheResult(id,true,true,cacheReady):queue_.Finish(id,success,safelyStopped,skipped);
         const bool poisoned=queue_.Poisoned();
         if(ok)while(count<32){auto* item=queue_.ReapAnyFinished();if(!item)break;finished[count]=item;retiring_.Add(retirements[count],BdwExecSnapshotOwner(item));++count;}
         KMutexUnlock(&mutex_);

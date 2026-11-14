@@ -633,6 +633,42 @@ int main(){
             auto* retired=queue.Reap(1,id,state);assert(retired && BdwExecSnapshotRelease(retired,false));}
         BdwFenceUnref(wait);BdwGpuContextUnref(aCtx);BdwGpuContextUnref(bCtx);BdwGpuContextUnref(cCtx);BdwGpuFileUnref(thirdFile);
     }
+    {
+        // gen 375: a job skipped because a wait dependency failed (a client's
+        // failed frame) must fail its own fences without poisoning its
+        // context or buffers; an executed failure still poisons both.
+        // Own file and buffer: the executed-failure contrast poisons both.
+        auto* own=BdwGpuFileCreate();uint64_t ownRounded=0;assert(own);
+        const uint32_t ownBuffer=BdwGpuFileCreateBuffer(own,4096,ownRounded);assert(ownBuffer);
+        auto* ctx=BdwGpuFileGetDefaultContext(own);assert(ctx && !BdwGpuContextLoss(ctx));
+        BdwExecObjectInput object{ownBuffer,0x10000,4096,16};
+        auto* skipped=BdwExecSnapshotCreate(own,&object,1,0,0,8);auto* wait=BdwFenceCreate();auto* out=BdwFenceCreate();
+        assert(skipped && wait && out && BdwExecSnapshotBindContext(skipped,ctx));
+        BdwExecSnapshotSetOrigin(skipped,9,0,76);
+        assert(BdwExecSnapshotAddWaitFence(skipped,wait) && BdwExecSnapshotAddSignalFence(skipped,out));
+        BdwExecQueue queue;uint64_t sid=0,id=0;BdwExecSnapshot* item=nullptr;BdwExecRequestState state{};
+        assert(queue.Enqueue(1,skipped,sid) && BdwFenceComplete(wait,false));
+        assert(BdwExecSnapshotDependencies(skipped)==2);
+        assert(queue.StartNext(id,item) && id==sid);
+        assert(!queue.Finish(id,true,true,true));         // skipped requires a failure outcome
+        assert(queue.Finish(id,false,true,true));
+        assert(BdwFenceState(out)==2);                     // error propagates to dependents
+        assert(BdwGpuContextLoss(ctx)==0);                 // the context is still usable
+        assert(queue.Reap(1,sid,state)==skipped && state==BdwExecRequestState::Failed && BdwExecSnapshotRelease(skipped,false));
+        // The same buffer and context still run the next job.
+        auto* next=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(next && BdwExecSnapshotBindContext(next,ctx));
+        BdwExecSnapshotSetOrigin(next,9,0,76);uint64_t nid=0;
+        assert(queue.Enqueue(1,next,nid) && queue.StartNext(id,item) && id==nid && queue.Finish(id,true,true));
+        assert(queue.Reap(1,nid,state)==next && state==BdwExecRequestState::Complete && BdwExecSnapshotRelease(next,false));
+        // Contrast: an executed failure poisons the context (hasvk then reports
+        // the device lost) - the path that parked the renderer.
+        auto* failed=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(failed && BdwExecSnapshotBindContext(failed,ctx));
+        BdwExecSnapshotSetOrigin(failed,9,0,76);uint64_t fid=0;
+        assert(queue.Enqueue(1,failed,fid) && queue.StartNext(id,item) && id==fid && queue.Finish(id,false,true));
+        assert(BdwGpuContextLoss(ctx)==1);
+        assert(queue.Reap(1,fid,state)==failed && BdwExecSnapshotRelease(failed,false));
+        BdwFenceUnref(wait);BdwFenceUnref(out);BdwGpuContextUnref(ctx);BdwGpuFileUnref(own);
+    }
     {pid_t child=fork();assert(child>=0);if(!child){
         auto* output=BdwGpuFileGetBuffer(f,protectedHandle);auto* snapshot=BdwExecSnapshotCreate(f,protectedExec,2,0,8,64);auto* fence=BdwFenceCreate();
         assert(output && snapshot && fence && BdwExecSnapshotAddSignalFence(snapshot,fence));

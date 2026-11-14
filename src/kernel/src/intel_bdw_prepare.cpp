@@ -1,3 +1,4 @@
+#include "serial.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_gtt_probe.h"
@@ -492,6 +493,14 @@ static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
     };
     hooks.sleep=sleep;
     hooks.recover=[](void*){KernelPanic("Broadwell submission worker requires recovery");};
+    // Log the first failures of each kind: a failed job fails its fences and
+    // (unless skipped) poisons its context and buffers, so name the owner.
+    hooks.failure=[](void*,BdwExecSnapshot* snapshot,unsigned kind,uint64_t n){
+        if(n>8 && n!=64 && n!=1024)return;
+        uint32_t pid=0,context=0;BdwExecSnapshotOrigin(snapshot,pid,context);
+        static const char* const names[]={"skipped (a wait dependency failed)","failed (executed, safely stopped)","unsafe stop"};
+        SerialPrintf("gpu-submit: job %s pid=%u context=%u count=%lu\n",names[kind<3?kind:2],pid,context,n);
+    };
     return worker.Start(hooks,0,knownOwnersOnly);
 }
 bool BdwStartKernelSubmissionWorker(BdwSubmissionWorker& worker,void* context,

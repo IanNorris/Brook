@@ -40,6 +40,8 @@ BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *,const uint32_t *scene,
 BrookVkResult brook_vk_quad_pass_poll(BrookVkQuadPass *);
 /* Blocks up to timeoutNs; returns PENDING on timeout. */
 BrookVkResult brook_vk_quad_pass_wait(BrookVkQuadPass *,uint64_t timeoutNs);
+/* VkResult of the last failed submit or wait (0 when none). */
+int brook_vk_quad_pass_last_result(const BrookVkQuadPass *);
 int brook_vk_quad_pass_gpu_timestamp_ns(const BrookVkQuadPass *,uint64_t *);
 struct BrookVkQuadStats brook_vk_quad_pass_stats(const BrookVkQuadPass *);
 /* Refuses pending or uncertain work. */
