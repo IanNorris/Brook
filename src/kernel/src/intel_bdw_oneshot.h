@@ -171,6 +171,58 @@ public:
         StoreImages(staging,batch,count*10+2,ring);
         return true;
     }
+    // As PrepareScanout, but every destination (and any non-renderer source)
+    // lies in caller-owned persistent leaf tables, so only the batch and the
+    // renderer's source pages are mapped per present. The caller retains,
+    // validates and publishes those leaves and their pages; leaves map only
+    // kernel-owned scanout memory (the firmware GOP or kernel flip buffers).
+    template<class Io> bool PrepareScanoutLeaves(Io& io,uint32_t first,uint64_t token,uint32_t nonce,
+            const uint64_t* source,uint32_t sourceCount,const BdwPpgttLeaf* leaves,uint32_t leafCount,
+            const BdwBlitRegion* regions,uint32_t count,BdwPpgttMapping* maps,uint32_t mapCapacity,uint32_t (&staging)[2048]){
+        if(!source || !sourceCount || sourceCount>BdwBcsOperandPages || !leaves || !leafCount ||
+           leafCount>BdwPpgttMaxLeaves || !maps || !regions || !count || count>BdwBcsTargetMaxRegions ||
+           mapCapacity<1+sourceCount)return false;
+        const uint64_t sourceBytes=uint64_t(sourceCount)*4096;
+        auto inLeaves=[&](uint64_t address,uint64_t bytes){
+            if(!bytes || address>~uint64_t{0}-bytes)return false;
+            for(uint64_t chunk=address>>21;chunk<=(address+bytes-1)>>21;++chunk){
+                bool found=false;for(uint32_t i=0;i<leafCount;++i)if((leaves[i].address>>21)==chunk)found=true;
+                if(!found)return false;
+            }
+            return true;
+        };
+        for(uint32_t i=0;i<count;++i){
+            const auto& r=regions[i];
+            const bool rendererSource=r.source.gpuAddress>=BdwBcsSourceAddress &&
+                r.source.gpuAddress<BdwBcsSourceAddress+sourceBytes &&
+                r.source.allocationBytes<=BdwBcsSourceAddress+sourceBytes-r.source.gpuAddress;
+            if((!rendererSource && !inLeaves(r.source.gpuAddress,r.source.allocationBytes)) ||
+               !inLeaves(r.destination.gpuAddress,r.destination.allocationBytes))return false;
+        }
+        // Source tables only; every leaf lives below 1 GiB beside the batch,
+        // so the root, PDPT and PD pages in Count suffice for the hierarchy.
+        const unsigned extra=(sourceCount+511)/512;
+        if(!Allocate(io,first,token,nonce,Count+extra))return false;
+        maps[0]={0x10000,pages_[Batch].dma,false};
+        for(uint32_t i=0;i<sourceCount;++i){
+            const uint64_t dma=source[i];
+            if(dma>=0xdd000000ull && dma<0xdf800000ull)return PrepareFailed(io);
+            maps[i+1]={BdwBcsSourceAddress+uint64_t(i)*4096,dma,false};
+        }
+        uint32_t batch[BdwBcsTargetBatchWords]{},ring[14]{};
+        const BdwPpgttPage scratch[]={{pages_[ScratchData].dma,pages_[ScratchData].cpu},
+            {pages_[ScratchPt].dma,pages_[ScratchPt].cpu},{pages_[ScratchPd].dma,pages_[ScratchPd].cpu},
+            {pages_[ScratchPdpt].dma,pages_[ScratchPdpt].cpu}};
+        BdwPpgttPage tables[4+ExtraTables]={{pages_[Pml4].dma,pages_[Pml4].cpu},{pages_[Pdpt].dma,pages_[Pdpt].cpu},
+            {pages_[Pd].dma,pages_[Pd].cpu},{pages_[Pt].dma,pages_[Pt].cpu}};
+        for(unsigned i=Count;i<allocated_;++i)tables[4+i-Count]={pages_[i].dma,pages_[i].cpu};
+        if(!BdwBuildPpgttImage(scratch,tables,4+allocated_-Count,maps,1+sourceCount,true,leaves,leafCount))
+            return PrepareFailed(io);
+        if(!BdwBuildBcsRegions(Launch(),regions,count,staging,batch,ring,descriptor_))return PrepareFailed(io);
+        scanout_=true;
+        StoreImages(staging,batch,count*10+2,ring);
+        return true;
+    }
     template<class Io> bool ReleasePrepared(Io& io) {
         if(owner_!=static_cast<const void*>(&io) ||
            (state_!=BdwOneShotState::Prepared && state_!=BdwOneShotState::StoppedRetained) || !bind_.SafeToRelease())return false;

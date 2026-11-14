@@ -4,6 +4,11 @@
 namespace brook {
 constexpr uint32_t BdwBcsMaxRegions=32;
 constexpr uint32_t BdwBcsBatchWords=BdwBcsMaxRegions*10+2;
+// Persistent-target presents add up to 32 repair copies (front to back
+// buffer) ahead of the renderer's 32 damage copies. The batch is one page.
+constexpr uint32_t BdwBcsTargetMaxRegions=64;
+constexpr uint32_t BdwBcsTargetBatchWords=BdwBcsTargetMaxRegions*10+2;
+static_assert(BdwBcsTargetBatchWords*4<=4096);
 
 // Constructs private RAM images only. The caller owns all GGTT/PPGTT mappings,
 // must initialize the completion slot to a different value, publish CPU writes
@@ -21,7 +26,8 @@ inline bool BdwBuildBcsRegions(const BdwBcsLaunch& s,const BdwBlitRegion* region
                                uint32_t (&context)[2048],uint32_t (&batch)[BatchWords],
                                uint32_t (&ring)[14],uint64_t& descriptor) {
     static_assert(BatchWords>=12);
-    if(!regions || !count || count>BdwBcsMaxRegions || count>(BatchWords-2)/10)return false;
+    constexpr uint32_t maxRegions=BatchWords>=BdwBcsTargetBatchWords?BdwBcsTargetMaxRegions:BdwBcsMaxRegions;
+    if(!regions || !count || count>maxRegions || count>(BatchWords-2)/10)return false;
     constexpr uint64_t limit=uint64_t{1}<<32;
     const uint64_t batchBytes=(uint64_t(count)*10+2)*sizeof(uint32_t);
     if(s.context.tailBytes!=56 || !s.nonce || (s.batchPpgtt&7) ||
@@ -35,7 +41,7 @@ inline bool BdwBuildBcsRegions(const BdwBcsLaunch& s,const BdwBlitRegion* region
 
     const auto& destination=regions[0].destination;
     constexpr unsigned capacity=(BatchWords-2)/10;
-    uint32_t packets[capacity<BdwBcsMaxRegions ? capacity : BdwBcsMaxRegions][10];
+    uint32_t packets[capacity<maxRegions ? capacity : maxRegions][10];
     for(uint32_t i=0;i<count;++i) {
         const auto& region=regions[i];
         if(region.destination.gpuAddress!=destination.gpuAddress ||
