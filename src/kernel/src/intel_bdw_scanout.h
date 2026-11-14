@@ -137,6 +137,10 @@ struct BdwRenderRunResult {
     bool uncachedScanout=false;
     uint8_t scanoutPat=0; // slot-3 value while uncachedScanout: 0 UC, 2 WT
     bool admitted=false,attempted=false,breadcrumb=false,contextComplete=false;
+    // Output: the callback refused before any device write
+    // (BdwRenderEntryRefusal, intel_bdw_render_refusal.h); detail is the page
+    // index for evidence and the GT init refusal code for GT NotStarted.
+    uint8_t entryRefusal=0,entryDetail=0;uint32_t gtWrites=0;
     bool ggttClearRequested=false,ggttCleared=false;
     bool gemReleaseRequested=false,gemReleased=false;
     bool externalTablesRequested=false;

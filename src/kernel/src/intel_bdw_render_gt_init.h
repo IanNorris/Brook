@@ -18,6 +18,10 @@ enum class BdwRenderGtInitStatus : uint8_t { NotStarted, Applied, Uncertain };
 struct BdwRenderGtInitResult {
     BdwRenderGtInitStatus status=BdwRenderGtInitStatus::NotStarted;
     uint8_t stage=0;uint32_t writes=0;
+    // Why a NotStarted result returned (no register written): 1 ownership or
+    // engines/display/MCR not ready, 2+i register i invalid or unstable,
+    // 8 L3 credit register, 9 the second readiness check.
+    uint8_t refusal=0;
     uint32_t before[6]{},l3Before=0,l3After=0;
     uint32_t selector=0,fuse2=0;bool topologySampled=false;
     bool dopRestoreAttempted=false,dopRestored=false;
@@ -33,15 +37,15 @@ template<class Io> BdwRenderGtInitResult BdwInitializeRenderGt(Io& io) {
     constexpr uint32_t regs[]={0x4090,0x20a0,0x2050,0x9430,0x9400,0x9424};
     constexpr uint32_t creditReg=0xb100,creditMask=(0x1fu<<19)|(0x1fu<<14);
     constexpr uint32_t creditValue=(15u<<19)|(1u<<14);
-    if(!io.owned() || !io.allEnginesQuiescent() || !io.displayAndFirmwareSafe() || !io.mcrSteeringReady())return result;
+    if(!io.owned() || !io.allEnginesQuiescent() || !io.displayAndFirmwareSafe() || !io.mcrSteeringReady()){result.refusal=1;return result;}
     for(unsigned i=0;i<6;++i){uint32_t second=0;
         if(!io.readReg(regs[i],result.before[i]) || result.before[i]==0xffffffffu ||
-           !io.readReg(regs[i],second) || second!=result.before[i])return result;
+           !io.readReg(regs[i],second) || second!=result.before[i]){result.refusal=uint8_t(2+i);return result;}
     }
     uint32_t second=0;
     if(!io.readMcr(creditReg,result.l3Before) || result.l3Before==0xffffffffu ||
-       !io.readMcr(creditReg,second) || second!=result.l3Before ||
-       !io.owned() || !io.allEnginesQuiescent() || !io.displayAndFirmwareSafe() || !io.mcrSteeringReady())return result;
+       !io.readMcr(creditReg,second) || second!=result.l3Before){result.refusal=8;return result;}
+    if(!io.owned() || !io.allEnginesQuiescent() || !io.displayAndFirmwareSafe() || !io.mcrSteeringReady()){result.refusal=9;return result;}
     auto write=[&](uint32_t reg,uint32_t value){++result.writes;return io.owned() && io.writeReg(reg,value);};
     auto verify=[&](uint32_t reg,uint32_t mask,uint32_t value){uint32_t v=0;
         return io.owned() && io.readReg(reg,v) && v!=0xffffffffu && (v&mask)==(value&mask);};

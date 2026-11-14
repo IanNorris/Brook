@@ -1,3 +1,5 @@
+#include "scheduler.h"
+#include "intel_bdw_render_refusal.h"
 #include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_node_cache.h"
@@ -671,6 +673,17 @@ static void CaptureWorkerObjects(const BdwExecSnapshot* snapshot){
         stage,detail,pid,context,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotBatchLength(snapshot),
         BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),current.bytes,current.words[0],current.words[1],current.words[2],current.words[3],current.words[4],current.words[5],current.words[6],current.words[7],sample.bytes,sample.words[0],sample.words[1],sample.words[2],sample.words[3],sample.words[4],sample.words[5],sample.words[6],sample.words[7]);
 }
+static BdwRenderAttemptView BdwRenderAttemptViewOf(const BdwForcewakeAdapterResult& out,const BdwRenderRunResult& run){
+    BdwRenderAttemptView v{};
+    v.adapterRefusal=out.refusal;v.requested=out.sequence.requested;v.released=out.sequence.released;
+    v.clearDelivered=out.clearDelivered;v.workAttempted=out.sequence.workAttempted;
+    v.entryRefusal=run.entryRefusal;v.gtWrites=run.gtWrites;
+    const auto& t=run.transaction;
+    v.gtReady=t.gtReady;v.patReady=t.patReady;v.runComplete=t.runComplete;v.contextSaved=t.contextSaved;
+    v.resetAttempted=t.resetAttempted;v.patRestored=t.patRestored;v.uncertain=t.uncertain;
+    v.executeAttempted=run.attempted;v.pollYieldFailed=run.pollYieldFailed;
+    return v;
+}
 static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool contextTest){
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FramePrepBegin);
@@ -797,7 +810,27 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     run.scanoutPat=BdwZeroCopyScanoutPat();
 #endif
     ohMark=BdwOverheadTicks();
-    VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+    // gen 387: a run can end before any device write (forcewake claim busy,
+    // entry evidence, engines not yet idle, GT init NotStarted). The job is
+    // still Prepared and armed, so rerun it a bounded number of times after a
+    // tick; only genuine device uncertainty reaches the panic below.
+    const BdwRenderRunResult request=run;
+    BdwRenderAttemptView attemptView{};
+    BdwRenderAttemptClass attemptClass=BdwRenderAttemptClass::Ran;
+    for(unsigned attempt=1;;++attempt){
+        VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+        attemptView=BdwRenderAttemptViewOf(out,run);
+        attemptClass=BdwClassifyRenderAttempt(attemptView);
+        if(attemptClass!=BdwRenderAttemptClass::RefusedUntouched)break;
+        static uint32_t refusals=0;const uint32_t n=++refusals;
+        if(n<=16 || !(n&(n-1)))
+            KPrintf("gpu-submit: render run refused before device access pid=%u context=%u reason=%s detail=%u gt_refusal=%u attempt=%u count=%u\n",
+                originPid,originContext,BdwRenderAttemptReason(attemptView),
+                unsigned(attemptView.adapterRefusal?out.refusalDetail:run.entryDetail),unsigned(run.entryDetail),attempt,n);
+        if(attempt>=BdwRenderRefusalRetries)break;
+        SchedulerSleepMs(1);
+        run=request;
+    }
     ohStep(BdwOhRenderRun);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && defined(BROOK_BDW_RPS_TRIAL) && !defined(BROOK_HOST_TEST)
     if(run.trialFrequencyCaps && run.trialFrequencyCaps!=0xffffffffu)BdwClock().lastCaps=run.trialFrequencyCaps;
@@ -838,7 +871,16 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     if(ok && run.completionEndTicks>run.completionStartTicks)
         completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
     const auto sample=BdwExecSnapshotBatchSample(snapshot);
-    if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);KernelPanic("Broadwell worker uncertain: pid=%u context=%u batch=%lx length=%lu objects=%u pages=%u gt=%u pat=%u reset=%u restore=%u ggtt=%u port=%u yield=%u/%u sampled=%u head=%x tail=%x mode=%x ctl=%x acthd=%x ipeir=%x ipehr=%x elsp=%x current_bytes=%u current_words=%x,%x,%x,%x,%x,%x,%x,%x admission_bytes=%u admission_words=%x,%x,%x,%x,%x,%x,%x,%x",
+    if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
+        KPrintf("gpu-submit: render run failed class=%u reason=%s fw_refusal=%u/%u requested=%u acquired=%u idle=%u quiescent=%u/%u released=%u clear=%u work=%u/%u entry=%u/%u gt_writes=%u\n",
+            unsigned(attemptClass),BdwRenderAttemptReason(attemptView),unsigned(out.refusal),unsigned(out.refusalDetail),
+            unsigned(out.sequence.requested),unsigned(out.sequence.acquired),unsigned(out.sequence.idle),
+            unsigned(out.sequence.submissionQuiescent),unsigned(out.sequence.otherEnginesQuiescent),unsigned(out.sequence.released),
+            unsigned(out.clearDelivered),unsigned(out.sequence.workAttempted),unsigned(out.sequence.workComplete),
+            unsigned(run.entryRefusal),unsigned(run.entryDetail),run.gtWrites);
+        KernelPanic("Broadwell worker uncertain: fw=%u/%u/%u/%u entry=%u/%u reason=%s pid=%u context=%u batch=%lx length=%lu objects=%u pages=%u gt=%u pat=%u reset=%u restore=%u ggtt=%u port=%u yield=%u/%u sampled=%u head=%x tail=%x mode=%x ctl=%x acthd=%x ipeir=%x ipehr=%x elsp=%x current_bytes=%u current_words=%x,%x,%x,%x,%x,%x,%x,%x admission_bytes=%u admission_words=%x,%x,%x,%x,%x,%x,%x,%x",
+        unsigned(out.refusal),unsigned(out.sequence.requested),unsigned(out.sequence.workAttempted),unsigned(out.clearDelivered && out.sequence.released),
+        unsigned(run.entryRefusal),unsigned(run.entryDetail),BdwRenderAttemptReason(attemptView),
         originPid,originContext,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotBatchLength(snapshot),BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
         unsigned(t.gtReady),unsigned(t.patReady),unsigned(t.resetComplete),unsigned(t.patRestored),run.ggttWriteAttempts,
         run.portWriteAttempts,unsigned(run.pollYieldFailed),run.pollYields,unsigned(run.engineSampled),run.head,run.tail,run.mode,run.control,run.acthd,run.ipeir,run.ipehr,run.execlist,
