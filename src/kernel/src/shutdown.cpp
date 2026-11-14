@@ -83,7 +83,7 @@ char servicesStatus[96]{};
 void FormatServicesStatus(uint64_t now) {
     uint32_t unused=0;Census(&unused);
     const DebugTaskSnapshot* blocker=nullptr;uint32_t remaining=0;
-    for(uint32_t i=0;i<taskCount;++i)if(!tasks[i].kernel&&tasks[i].state!=ProcessState::Terminated){++remaining;if(!blocker||tasks[i].pid==tasks[i].tgid&&blocker->pid!=blocker->tgid)blocker=&tasks[i];}
+    for(uint32_t i=0;i<taskCount;++i)if(!tasks[i].kernel&&tasks[i].state!=ProcessState::Terminated){++remaining;if(!blocker||(tasks[i].pid==tasks[i].tgid&&blocker->pid!=blocker->tgid))blocker=&tasks[i];}
     char text[96];uint32_t n=0;
     auto put=[&](const char* x){while(*x&&n<sizeof(text)-1)text[n++]=*x++;};
     auto num=[&](uint64_t v){char d[21];int k=0;do{d[k++]=char('0'+v%10);v/=10;}while(v&&k<20);while(k&&n<sizeof(text)-1)text[n++]=d[--k];};
