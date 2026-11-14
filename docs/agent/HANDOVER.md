@@ -92,6 +92,22 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Afternoon session, 14 Nov (gens 372–376, with Ian):**
+- **Integration branches:** `work/integration` (gen 374) → `work/integration2` (gen 376, `dell-integration2-20261114`, not yet on main). It has the audio downstream allowance, the zero-copy ring plus coherency, the waylandd fast blit plus socket guard, the `run --once waylandd` fix (counts INTLWL.ELF), Steam launch feedback, restart escalation, renderer exit-for-restart, the hardware volume plus pop, and the compositor idle fix.
+- **Zero-copy:** the kernel side works on the Dell (latch in 1 vblank, 0 missed).
+  - **Taskbar flicker:** caused first by per-context ring histories, then by write-back render writes (PAT slot 3 never UC). Both are fixed; Ian sees no flicker.
+  - **Not measured armed yet:** the renderer hit `QUAD_UNCERTAIN stage=submit vk_result=-4` after `ASYNC_RETRY errno=11`, restarted (recovery works), and the new renderer can't re-register the ring (`errno=16`). Being fixed.
+- **App routing:** apps now connect to INTLWL (the GPU path). Chrome YouTube went from ~170 ms to 46 ms windowed and ~90 ms maximized (~150 ms fullscreen, still CPU raster).
+- **Volume:** the master volume now drives the DAC up to 0 dB (step 127); before, it was fixed at −23.5 dB. The pop is normalised to −0.1 dBFS. Ian: works well. **Bug:** the pop overwrites the playing audio instead of mixing (being fixed).
+- **Idle CPU:** the 9% idle came from the CPU fallback after the renderer parked. With a healthy renderer on gen 376: 0 CPU overlay draws and 0 bytes copied over 10 s.
+- **Restart hangs:** the services phase had no time limit. Now SIGTERM, SIGTERM again at 3 s, SIGKILL at 8 s. "Closing apps" can still block on windows that ignore close (Ian power-cycled twice).
+- **Steam:** Xephyr fails because the desktop `/tmp` has no `link()` (lock file). The workaround `-displayfd` is on `work/steam`; proper fix: tmpfs `link()`.
+- **Backlog added:**
+  - repair progress UI with a distinct icon (Ian saw 92% then reboot);
+  - tmpfs `link()`;
+  - Chromium GPU stalls after the first frame (`work/browser-gpu`);
+  - the Chrome audio store install, awaiting Ian's explicit approval.
+
 **Browser and audio captures (gen 371, 14 Nov, Ian watching):**
 - **Chrome YouTube** (windowed; slow, fluttering audio):
   - mixer stream 34.5k frames/s against the HDA's 44.1k;
