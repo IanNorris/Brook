@@ -123,7 +123,7 @@ def main():
         run(['git', '-C', ROOT, 'submodule', 'update', '--init', '--recursive', '--',
              'vendor/uefi-headers', 'src/third_party/fatfs'])
     build = a.kernel_build.resolve()
-    configure = ['cmake', '-S', ROOT / 'src/kernel', '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+    configure = ['cmake', '-S', ROOT / 'src/kernel', '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
                  f'-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/toolchains/kernel-x86_64-clang.cmake']
     configure += [f'-D{k}:BOOL={v}' for k, v in sorted(options.items())]
     archive = a.shared / 'uacpi-6.1.0.tar.gz'
