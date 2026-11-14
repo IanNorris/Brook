@@ -51,6 +51,11 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **Non-game presents run at ~13–17/s** (console and cursor) and each costs a full compositor job.
 - Evidence: `/data/Programming/Brook/display-perf/build/dell/measure-m0/`.
 
+**Incident (14 Nov, ~02:10 UTC):**
+- **What happened:** the first M4a image (`dell-m4a-test`, gen 359, slot 0) panicked at the first Mesa job: "Broadwell worker uncertain … yield=1/0". The root cause was that `SchedulerYield()` inside the new spin slice can return with IRQs off, which made the next `MayYield()` fail. Fixed in `8fc4bb07` (with a host test); the fixed image is `m4a-wakeups/build/dell/pair-m4a-2`, not yet tested on the Dell.
+- **The consequence:** the guard retried the active slot and entered a recovery-only reboot loop. That boot has no command jobs, so there is no remote way to switch back to gen 358 in slot 1. Ian cold-booted the USB maintenance stick; gen 358's slot was promoted to gen 360 with `scripts/hardware_promote_slot.py`, and the SSD then booted normally.
+- **Lesson:** the QEMU check never runs Intel GPU code, so kernel GPU-path changes are a recovery risk. Until the guard can fall back to the previous slot automatically, deploy them only when Ian is around.
+
 **Gen 361 (M2 + overlay caching, `6a560d68`):**
 - **Displayed:** mean interval 69 ms with 8 buffers and 60 ms with 2 (was 68–71).
 - **Swaps fell:** 53 and 26/s (were 69 and 40).
@@ -131,6 +136,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 
 ## Backlog (outside the immediate goal)
 
+- **Automatic slot rollback in the guard:** after N consecutive desktop panics on a newly activated generation, select the previous verified slot instead of looping in recovery-only mode. Also expose a slot-select operation in the recovery-only bridge.
 - **Split `src/kernel/src/syscall.cpp`** (17k lines) by area: memory, files, process/signal, sockets, epoll/timers and Brook-specific.
 - **Remove or declare the twelve orphaned `tools/netsurf-build/*` gitlinks** (they have no `.gitmodules` entries).
 - **Transparent kernel rendering interfaces,** so console and shell output uses the GPU path.
