@@ -92,6 +92,15 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Zero-copy reaches ~45 displayed fps (gen 381, `dell-zero-copy-carry-20261114`, `work/zero-copy-fix3` `1c66453f`):**
+- **Bug fixed:** the cache-mode change had fed full-draw regions back as the next frame's damage, so most frames were full redraws.
+- **Matched 2-buffer demo, wt armed:**
+  - displayed mean **22.3 ms**, p50 20.2, p90 24.4 (copy path: 33.3 / 30.0 / 41.8);
+  - swaps 49.7/s (31.6 copy); compositor job 13.1 ms; present 0;
+  - 804 of 805 latched in 1 vblank; `verify` coherent; 0 restarts.
+- **Flush mode** still writes back ~13 MB per present. Keep wt.
+- **Next:** M4a wakeups ported onto this base (`work/m4a-zc`), then per-job overhead (M5). The game/worker pipeline is now the limit.
+
 **Evening, 14 Nov (gens 377–379):**
 - **Renderer restarts, two causes, both fixed:**
   - client-buffer CPU-transition race (`c975d4a7`);
