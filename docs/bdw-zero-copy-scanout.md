@@ -66,6 +66,19 @@ Slot 0 is the GOP (GGTT 0); slots 1..n are the images. It has the same latch sem
 
 ### Buffer age in the renderer (`desktop_buffer_age.h`, host-tested)
 
+**One ring for all contexts.** The pipelined renderer has one render context per in-flight frame. The ring (`g_ring`, a `DesktopScanoutRing`) and its age history are process-wide: frames are committed in submission order whichever context prepared them. A frame keeps its image *in flight* from submit until it retires, so a second pipelined frame never writes the same image, even while the kernel still reports it free (not armed).
+
+The first Dell run (gen 372) had a per-context ring:
+- Only context 0 registered the images. Context 1's registration got EBUSY and it drew into its own output, which also zeroed the stats `images` field.
+- Each context had its own history, so images missed the other context's frames.
+- Copying showed nothing wrong (only damage is copied), but armed zero-copy scanned out stale taskbar regions: the flicker.
+
+`desktop_scanout_ring_test.c` reproduces the bug (split histories: 194 of 198 presented frames wrong) and checks convergence for the shared ring. The scenarios are:
+- cursor, clock overlay and tray blink;
+- steady game;
+- a mix with a window move and a fallback frame;
+- 3 and 4 images, two alternating contexts, and a kernel front/armed model.
+
 Each image must be complete when presented. When the renderer draws frame n into image i, which last held frame k, it draws the union of:
 - frame n's own damage;
 - the own damage of frames k+1..n−1, from an 8-frame history.

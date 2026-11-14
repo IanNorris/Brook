@@ -74,3 +74,24 @@ static inline int desktop_buffer_age_pick(const struct DesktopBufferAge *a,uint3
     }
     return best;
 }
+
+/* The process-wide ring. Every render context (one per pipelined frame)
+ * draws into the same images and shares one age history: frames are
+ * committed in submission order whichever context prepared them. A frame
+ * keeps its image in flight from submit until it retires (presented or
+ * refused), so a second pipelined frame never writes the same image even
+ * while the kernel still reports it free (zero-copy not armed). */
+struct DesktopScanoutRing {
+    unsigned count;
+    struct DesktopBufferAge age;
+    unsigned inflight[DESKTOP_AGE_MAX_IMAGES];
+};
+static inline uint32_t desktop_scanout_ring_busy(const struct DesktopScanoutRing *r){
+    uint32_t mask=0;for(unsigned i=0;i<r->count && i<DESKTOP_AGE_MAX_IMAGES;++i)if(r->inflight[i])mask|=1u<<i;
+    return mask;
+}
+static inline int desktop_scanout_ring_pick(const struct DesktopScanoutRing *r,uint32_t kernelFree){
+    return desktop_buffer_age_pick(&r->age,kernelFree&~desktop_scanout_ring_busy(r),r->count);
+}
+static inline void desktop_scanout_ring_begin(struct DesktopScanoutRing *r,unsigned image){if(image<r->count)++r->inflight[image];}
+static inline void desktop_scanout_ring_end(struct DesktopScanoutRing *r,unsigned image){if(image<r->count && r->inflight[image])--r->inflight[image];}
