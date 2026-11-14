@@ -10,6 +10,7 @@
 #include "window.h"
 #include "desktop_telemetry.h"
 #include "taskbar_volume.h"
+#include "debug_hardware.h"
 #include "device.h"
 #include "virtio_blk.h"
 #include "net.h"
@@ -130,12 +131,19 @@ bool WmSetTheme(uint32_t theme)
     return true;
 }
 
+// Hardware payload name for the desktop build label, read once at activation
+// (empty on QEMU and other images without /etc/hardware-payload-id).
+static char g_buildPayloadId[64];
+
 // Startup I/O runs in the shell's activation path, never during rendering.
 // Accept only a complete bounded file and an exact supported numeric ID.
 static void WmRestoreTheme()
 {
     if (g_themeSettingsLoaded) return;
     g_themeSettingsLoaded = true;
+    if (HardwarePayloadIdRead(g_buildPayloadId, sizeof(g_buildPayloadId)))
+        SerialPrintf("WM: build label payload %s\n", g_buildPayloadId);
+    else g_buildPayloadId[0] = 0;
     uint32_t selected = BROOK_THEME_BROOK;
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();
@@ -2040,7 +2048,7 @@ static void DrawVolumeIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, 
 static TaskbarVolumePopupLayout WmVolumePopupLayout(uint32_t screenW, uint32_t screenH)
 {
     const TaskbarLayout t = GetTaskbarLayout(screenW, screenH);
-    char label[100];
+    WmBuildIdText label{};
     WmRect badge{};
     const bool hasBadge = WmBuildIdLayout(screenW, screenH, label, badge);
     return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), WmTextWidth("100%"),
