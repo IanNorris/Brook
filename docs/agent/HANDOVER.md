@@ -92,6 +92,34 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Evening, 14 Nov (gens 377–379):**
+- **Renderer restarts, two causes, both fixed:**
+  - client-buffer CPU-transition race (`c975d4a7`);
+  - hasvk adds every live VkDeviceMemory to each execbuffer, so cached ring-image imports made a quad job reference two tickets' outputs (`b9d05868`, per-frame import).
+  - Gen 379: 0 restarts over 4 yquake runs (gen 378: 13).
+- **Zero-copy cache modes** (gen 379, `gpu zerocopy cache flush|wt|uc`), 2-buffer demo:
+
+  | Mode | Swaps/s | Displayed mean | Compositor | Worker present |
+  |---|---|---|---|---|
+  | off | 31.6 | 33.4 ms | 12.6 ms | 11.0 ms |
+  | flush | 35.3 | 38.6 ms | 16.0 ms | 7.6 ms |
+  | **wt** | **44.9** | **31.4 ms** | 16.0 ms | 0 |
+  | uc | 45.1 | 31.3 ms | 16.0 ms | 0 |
+
+  - wt is the chosen default.
+  - **Remaining blocker for 60:** displayed p50 is quantised to ~33 ms although 98% of latches are 1-vblank (under investigation).
+  - `verify` never sees an idle front: the taskbar graph presents continuously.
+- **Live yquake attract demo with audio** (gen 377): Ian saw ~59 fps between hitches. The hitches were the renderer restarts above.
+- **Chrome audio fixed on the Dell:**
+  - store install of the q2mhvi0z chromium and 3wv97kbb firefox wrappers plus the downstream OSS plugin;
+  - `/nix/profile` repointed; rollback record `/nix/.brook-profile-rollback-2ed5fc3e….json`;
+  - Chrome 44.1k frames/s, 0 gaps; Ian: "sounds good, no fluttering".
+- **Browsers on the GPU** (gen 378, `work/browser-gpu` launchers via `brook-iris-run`):
+  - Chromium ANGLE: 606 app jobs, rAF p50 17 ms;
+  - Firefox hardware WebRender: 869 jobs, p50 16.7 ms;
+  - **shipping needs `brook-iris-run` in `/nix/profile`**, a store write awaiting Ian's approval.
+- **Volume pop now mixes over playing audio** (cue streams, `22e9f017`); not yet heard by Ian.
+
 **Afternoon session, 14 Nov (gens 372–376, with Ian):**
 - **Integration branches:** `work/integration` (gen 374) → `work/integration2` (gen 376, `dell-integration2-20261114`, not yet on main). It has the audio downstream allowance, the zero-copy ring plus coherency, the waylandd fast blit plus socket guard, the `run --once waylandd` fix (counts INTLWL.ELF), Steam launch feedback, restart escalation, renderer exit-for-restart, the hardware volume plus pop, and the compositor idle fix.
 - **Zero-copy:** the kernel side works on the Dell (latch in 1 vblank, 0 missed).
