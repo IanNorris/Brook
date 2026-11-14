@@ -9,6 +9,10 @@
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_exec_tables.h"
 #include "intel_bdw_scanout.h"
+#if defined(BROOK_BDW_RPS_TRIAL)
+#include "intel_bdw_render_clock.h"
+#include "intel_bdw_render_clock_runtime.h"
+#endif
 #include "intel_bdw_wait_queue.h"
 #include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -5119,6 +5123,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
+            "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -5703,6 +5708,59 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(StrStartsWith(cmd,"gpu clock")) {
+#if defined(BROOK_BDW_RPS_TRIAL)
+        // Runtime render-clock request. Only the per-job GEN6_RPNSWREQ ratio
+        // changes; it is clamped to the fused caps and falls back to 500 MHz
+        // (latched) at the package thermal limit.
+        auto& st=BdwClock();
+        const char* arg=cmd+9;while(*arg==' ')++arg;
+        bool bad=false;
+        if(*arg && !NetStrEq(arg,"status")){
+            uint32_t mhz=0;
+            if(ParseUint(arg,&mhz)<=0 || mhz<100 || mhz>2000)bad=true;
+            else BdwClockSetMhz(st,mhz);
+        }
+        if(bad){DebugChannelSend("{\"error\":\"usage: gpu clock <MHz>|status\"}\n");}
+        else {
+            static BdwClockEnergy prev{};
+            const auto now=BdwClockReadEnergy();
+            const auto caps=BdwClockDecodeCaps(st.lastCaps);
+            const int32_t temp=BdwClockReadTempC();
+            BridgeReply r;
+            r.text("{");r.field("requested_mhz",st.requestedMhz);
+            r.text(",");r.field("effective_mhz",BdwClockEffectiveBin(st)*BdwClockBinMhz);
+            r.text(",");r.field("last_job_mhz",st.lastRequestedBin*BdwClockBinMhz);
+            r.text(",\"caps_valid\":");r.text(caps.valid?"true":"false");
+            r.text(",");r.field("rpn_mhz",caps.rpn*BdwClockBinMhz);
+            r.text(",");r.field("rp1_mhz",caps.rp1*BdwClockBinMhz);
+            r.text(",");r.field("rp0_mhz",caps.rp0*BdwClockBinMhz);
+            r.text(",");r.field("caps_raw",st.lastCaps);
+            r.text(",\"thermal_available\":");r.text(BdwClockPlatformInfo().thermal?"true":"false");
+            r.text(",");r.field("temp_c",temp<0?0:uint64_t(temp));
+            r.text(",");r.field("max_temp_c",st.maxTempC<0?0:uint64_t(st.maxTempC));
+            r.text(",");r.field("limit_c",uint64_t(st.limitC));
+            r.text(",\"tripped\":");r.text(st.tripped?"true":"false");
+            r.text(",");r.field("trips",st.trips);
+            r.text(",");r.field("thermal_samples",st.samples);
+            r.text(",\"rapl_available\":");r.text(now.valid?"true":"false");
+            if(now.valid && prev.valid && now.tsc>prev.tsc){
+                const auto t=TscClockReadStatus();
+                const uint64_t us=t.khz?(now.tsc-prev.tsc)*1000/t.khz:0;
+                if(us){
+                    r.text(",");r.field("pkg_mw",BdwClockEnergyDeltaUj(prev.pkg,now.pkg,now.unit)*1000/us);
+                    r.text(",");r.field("gt_mw",BdwClockEnergyDeltaUj(prev.pp1,now.pp1,now.unit)*1000/us);
+                    r.text(",");r.field("power_window_ms",us/1000);
+                }
+            }
+            if(now.valid)prev=now;
+            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; trip latches 500 until the next gpu clock command; pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
+            r.send();
+        }
+#else
+        DebugChannelSend("{\"error\":\"BROOK_BDW_RPS_TRIAL kernel required\"}\n");
 #endif
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
