@@ -71,15 +71,29 @@ Main risks are in the crash dump user-pointer dereference and missing
 ELF entry validation — both are defense-in-depth concerns rather than
 likely failure modes.
 
-## Boot timing handoff (BootProtocol v6)
+## Boot timing handoff (version-5 extension)
 
 The loader records raw boot-CPU TSC values in `BootProtocol::timing`
 (`src/shared/boot_protocol/boot_protocol.h`): EfiMain entry, F5-wait start
 and end, just before ExitBootServices and just before the kernel jump, plus
 flags, the configured wait and the keystrokes ConIn returned during the wait.
-The kernel reads them only when `version >= 6`, so a new kernel booted by an
-older loader shows "n/a" for firmware, menu and loader. An older kernel ignores
-the appended fields.
+
+The handoff **stays at version 5**. Every kernel already installed on the Dell
+(both update slots and the RECOVERY/RECOV2 pairs) rejects other versions: the
+EFI runtime inventory accepts only 3..5 and EFI power-off required exactly 5,
+so a version bump would silently disable EFI power-off (and with it the
+AC-loss and USB-boot power-off paths) on every older kernel. Instead the loader
+sets `extensions` (the former always-zero `efiRuntimeMtrrReserved`) to
+`BootExtensionTimingMagic` and appends `timing` after the version-5 fields.
+Older loaders zero-initialise the struct, so `extensions` is 0 there.
+
+The kernel reads `timing` only when `BootHasTiming()` sees the marker, so a new
+kernel booted by an older loader shows "n/a" for firmware, menu and loader and
+never reads past the version-5 fields (`BootProtocolV5Size`); the EFI power-off
+copy is also limited to that size. An older kernel ignores the appended fields.
+Future additions should follow the same pattern (another marker bit or field
+announced by the loader), not a version bump, until every installed kernel
+accepts newer versions.
 
 The kernel (`src/kernel/src/boot_timing.*`) converts with the TSC rate it
 measures during LAPIC calibration and logs one `BOOT_TIMING` line plus a

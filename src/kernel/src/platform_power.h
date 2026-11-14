@@ -1,5 +1,6 @@
 #pragma once
 #include "acpi_tables.h"
+#include "boot_protocol/boot_protocol.h"
 namespace brook {
 struct PowerIo {
     void* context;
@@ -36,6 +37,14 @@ const PlatformPowerPlan& PlatformPowerGetPlan();
 // succeeded. The coordinator stays quiescent and reports a returned transition.
 bool PlatformPowerIssue(bool restart);
 struct BootProtocol;
+// EFI runtime power-off needs at least a version-5 handoff (cache and MTRR
+// fingerprints). Later loaders keep version 5 and append extensions, so this
+// must never require an exact version.
+inline bool PlatformPowerEfiHandoffAccepted(const BootProtocol* boot, bool inventoryValid)
+{
+    return boot && inventoryValid && boot->version >= 5 && boot->efiRuntimeCacheValid == 1 &&
+           boot->efiRuntimeMtrrValid == 1 && boot->memoryMapCount <= 4096;
+}
 void PlatformPowerSetEfiCandidate(const BootProtocol* boot);
 bool PlatformPowerEnableEfi();
 }

@@ -37,4 +37,18 @@ int main(){
     trace={};plan.efiEntry=0x1234;
     assert(plan.CanPowerOff() && plan.Issue(false,{&trace,Trace::byte,Trace::word,Trace::efi}) && trace.width==64 && trace.value==0x1234);
     trace={};assert(!plan.Issue(false,trace.io()) && !trace.count); // no speculative fallback
+
+    // EFI power-off handoff: version 5 with cache and MTRR fingerprints, with or
+    // without the appended timing extension. Never an exact-version match.
+    BootProtocol boot{};boot.magic=BootProtocolMagic;boot.version=5;
+    boot.efiRuntimeCacheValid=1;boot.efiRuntimeMtrrValid=1;boot.memoryMapCount=64;
+    assert(PlatformPowerEfiHandoffAccepted(&boot,true));              // older loader, marker 0
+    boot.extensions=BootExtensionTimingMagic;
+    assert(PlatformPowerEfiHandoffAccepted(&boot,true));              // timing loader
+    assert(!PlatformPowerEfiHandoffAccepted(&boot,false));
+    boot.version=6;assert(PlatformPowerEfiHandoffAccepted(&boot,true)); // forward compatible
+    boot.version=4;assert(!PlatformPowerEfiHandoffAccepted(&boot,true));
+    boot.version=5;boot.efiRuntimeMtrrValid=0;assert(!PlatformPowerEfiHandoffAccepted(&boot,true));
+    boot.efiRuntimeMtrrValid=1;boot.memoryMapCount=4097;assert(!PlatformPowerEfiHandoffAccepted(&boot,true));
+    assert(!PlatformPowerEfiHandoffAccepted(nullptr,true));
 }
