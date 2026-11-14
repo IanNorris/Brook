@@ -106,6 +106,27 @@ class PreparePair(unittest.TestCase):
                 pair.prepare(self.image,self.build,64,'test',self.root/'bad',pair.digest(b'kernel'),exporter)
         self.assertFalse((self.root/'bad').exists())
 
+    def test_hidden_kernel_console_removes_startup_and_adds_shortcut(self):
+        source=b'set wm\nset vfb none\nkconsole\nrun /boot/HWSTATUS.ELF\n'
+        subprocess.run(['mcopy','-o','-i',str(self.image),'-','::/BOOT/INIT.RC'],input=source,check=True)
+        supervisor=self.root/'supervisor';supervisor.write_bytes(b'\x7fELF-supervisor')
+        renderer=self.root/'renderer';renderer.write_bytes(b'\x7fELF-renderer')
+        with patch.object(pair,'module_version',return_value=64):
+            result=pair.prepare(self.image,self.build,64,'test',self.root/'hidden',pair.digest(b'kernel'),
+                                enable_vulkan_desktop=True,vulkan_supervisor=supervisor,vulkan_renderer=renderer,
+                                hide_kernel_console_window=True)
+        image=self.root/'hidden/INITRD.IMG'
+        script=subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])
+        self.assertNotIn(b'kconsole',script.splitlines())
+        self.assertEqual(script,pair.add_vulkan_desktop_start(b'set wm\nset vfb none\nrun /boot/HWSTATUS.ELF\n'))
+        self.assertEqual(script,pair.desktop_startup(source,True,True))
+        shortcut=subprocess.check_output(['mtype','-i',str(image),'::/'+pair.KERNEL_CONSOLE_SHORTCUT_PATH])
+        self.assertEqual(shortcut,pair.KERNEL_CONSOLE_SHORTCUT)
+        self.assertIn(b'# title: Kernel Console',shortcut);self.assertIn(b'\nkconsole\n',shortcut)
+        self.assertIn('hidden-kernel-console',result['enabled_boot_options'])
+        with self.assertRaises(ValueError):pair.hide_kernel_console(b'set wm\n')
+        with self.assertRaises(ValueError):pair.hide_kernel_console(b'kconsole\nkconsole\n')
+
     def test_vulkan_desktop_requires_opt_in_and_is_exact(self):
         supervisor=self.root/'supervisor';supervisor.write_bytes(b'\x7fELF-supervisor')
         renderer=self.root/'renderer';renderer.write_bytes(b'\x7fELF-renderer')

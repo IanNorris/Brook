@@ -14,7 +14,8 @@ import subprocess
 import tempfile
 
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA, REQUIRED, selector
-from prepare_hardware_kernel_pair import INITRD_MAX, KERNEL_MAX, module_version, regular, add_vulkan_desktop_start
+from prepare_hardware_kernel_pair import (INITRD_MAX, KERNEL_MAX, module_version, regular, desktop_startup, add_vulkan_desktop_start,
+                                          KERNEL_CONSOLE_SHORTCUT, KERNEL_CONSOLE_SHORTCUT_PATH)
 
 FILES=('ETC/ahci-write-target','ETC/ahci-boot-volume','ETC/ahci-data-volume',
        'BOOT/FATFSCK.ELF','BOOT/E2FSCK.ELF')
@@ -26,7 +27,7 @@ DERIVED={'BROOK_SSD_GUARD_TRANSACTION','BROOK_SSD_GUARD_REPAIR','BROOK_SSD_GUARD
 
 def sha(data):return hashlib.sha256(data).hexdigest()
 
-def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False):
+def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False):
     if (allow_vulkan_partial or allow_vulkan_async_partial) and not allow_vulkan_desktop:
         raise ValueError('partial rendering requires Vulkan desktop opt-in')
     if allow_dell_bcs_present and not allow_vulkan_desktop:raise ValueError('Dell BCS presentation requires Vulkan desktop opt-in')
@@ -108,9 +109,15 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
             raise ValueError('inconsistent guard selectors')
         script=read(live,'BOOT/INIT.RC')
         original_script=read(base,'BOOT/INIT.RC')
-        expected_script=add_vulkan_desktop_start(original_script,allow_vulkan_partial,bool(expected_gpu_provider),
-            allow_gpu_source_trace,allow_vulkan_async_partial) if allow_vulkan_desktop else original_script
+        expected_script=desktop_startup(original_script,allow_hidden_kernel_console,allow_vulkan_desktop,allow_vulkan_partial,
+            bool(expected_gpu_provider),allow_gpu_source_trace,allow_vulkan_async_partial)
         if not script or script!=expected_script:raise ValueError('desktop startup script mismatch')
+        def optional(path,name):
+            found=subprocess.run(['mtype','-i',str(path),'::/'+name],capture_output=True)
+            return None if found.returncode else found.stdout
+        shortcut=optional(live,KERNEL_CONSOLE_SHORTCUT_PATH)
+        expected_shortcut=KERNEL_CONSOLE_SHORTCUT if allow_hidden_kernel_console else optional(base,KERNEL_CONSOLE_SHORTCUT_PATH)
+        if shortcut!=expected_shortcut:raise ValueError('Kernel Console shortcut mismatch')
         vulkan_files={}
         if allow_vulkan_desktop:
             executables=[('VKSUP.ELF',expected_vulkan_supervisor),('VKRENDER.ELF',expected_vulkan_renderer)]
@@ -139,7 +146,8 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
             'compile_commands_sha256':sha(compile_data),'startup_script_sha256':sha(script),
             'guard_input_sha256':{name:sha(value) for name,value in values.items()},'module_abi':abi,'modules':module_hashes,
             'vulkan_desktop_enabled':allow_vulkan_desktop,'vulkan_partial_enabled':allow_vulkan_partial or allow_vulkan_async_partial,
-            'vulkan_async_partial_enabled':allow_vulkan_async_partial,'vulkan_executables_sha256':vulkan_files}
+            'vulkan_async_partial_enabled':allow_vulkan_async_partial,'vulkan_executables_sha256':vulkan_files,
+            'kernel_console_hidden':allow_hidden_kernel_console}
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -163,6 +171,8 @@ def main():
     p.add_argument('--allow-dell-acpi-monitor',action='store_true',help='expect the Dell firmware monitor build and boot opt-in')
     p.add_argument('--allow-ac-loss-poweroff',action='store_true',help='expect the AC loss shutdown boot opt-in')
     p.add_argument('--allow-irq-signal-probe',action='store_true',help='expect experimental interrupt-return signal delivery')
-    a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe),indent=2))
+    p.add_argument('--allow-hidden-kernel-console',action='store_true',
+                   help='expect the boot kconsole line removed and the Kernel Console Apps entry added')
+    a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe,a.allow_hidden_kernel_console),indent=2))
 
 if __name__=='__main__':main()

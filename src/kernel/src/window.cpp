@@ -1803,7 +1803,7 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
 struct TaskbarLayout
 {
     int y, textY;
-    WmRect apps, terminal, next, clock;
+    WmRect apps, terminal, next, clock, network;
     WmRect metrics[6];
     WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
@@ -1836,6 +1836,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         right -= WmMetric(12);
     };
     reserve(l.clock, WmTextWidth(l.clockText));
+    reserve(l.network, WmMetric(16));
     const int widths[6]={64,64,112,112,240,240};
     const uint32_t enabledMetrics=WmGetTaskbarMetrics();
     for(int i=5;i>=0;--i)if(enabledMetrics&(1u<<i)){
@@ -1893,6 +1894,66 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     return l;
 }
 
+// Network indicator. The compositor thread refreshes this cache at most once
+// per second from already-maintained stack state (primary interface address,
+// plus the driver's software failure flag); taskbar rendering only reads it.
+// No NIC register is touched here. Address 0 means disconnected.
+static uint32_t g_netIndicatorAddress = 0;
+static uint64_t g_netIndicatorTick = 0;
+static bool g_netIndicatorSampled = false;
+
+bool WmNetworkIndicatorRefresh(uint64_t now)
+{
+    if (g_netIndicatorSampled && now - g_netIndicatorTick < 1000) return false;
+    g_netIndicatorSampled = true;
+    g_netIndicatorTick = now;
+    uint32_t address = 0;
+    if (NetIf* nif = NetGetIf()) {
+        address = __atomic_load_n(&nif->ipAddr, __ATOMIC_RELAXED);
+        NetDriverSnapshot driver{};
+        if (address && nif->snapshot && nif->snapshot(nif, &driver) && driver.failed) address = 0;
+    }
+    const uint32_t previous = __atomic_exchange_n(&g_netIndicatorAddress, address, __ATOMIC_ACQ_REL);
+    if (previous == address) return false;
+    const uint8_t* octet = reinterpret_cast<const uint8_t*>(&address);
+    if (address) SerialPrintf("WM: network indicator connected %u.%u.%u.%u\n", octet[0], octet[1], octet[2], octet[3]);
+    else SerialPuts("WM: network indicator disconnected\n");
+    return true;
+}
+
+static uint32_t WmBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
+{
+    uint32_t out = 0;
+    for (uint32_t shift = 0; shift <= 16; shift += 8) {
+        const uint32_t f = (fg >> shift) & 255, b = (bg >> shift) & 255;
+        out |= ((f * alpha + b * (255 - alpha)) / 255) << shift;
+    }
+    return out;
+}
+
+// Four ascending bars in the clock colour when connected; dimmed bars with a
+// cross over the short (left) end when disconnected.
+static void DrawNetworkIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
+                                 const WmRect& r, bool connected)
+{
+    if (r.w <= 0) return;
+    const uint32_t fg = WmCurrentPalette().secondaryText;
+    const uint32_t bar = connected ? fg : WmBlendColor(fg, WmCurrentPalette().taskbar, 90);
+    const int size = static_cast<int>(WmMetric(16));
+    const int barW = static_cast<int>(WmMetric(3)), gap = static_cast<int>(WmMetric(1));
+    const int x0 = r.x, top = r.y + (r.h - size) / 2, bottom = top + size;
+    for (int i = 0; i < 4; ++i) {
+        const int h = size * (i + 1) / 4;
+        WmFillRect(pixels, stride, sw, sh, x0 + i * (barW + gap), bottom - h, barW, h, bar);
+    }
+    if (connected) return;
+    const int span = size * 5 / 8, t = static_cast<int>(WmMetric(2));
+    for (int i = 0; i + t <= span; ++i) {
+        WmFillRect(pixels, stride, sw, sh, x0 + i, top + i, t, t, fg);
+        WmFillRect(pixels, stride, sw, sh, x0 + span - t - i, top + i, t, t, fg);
+    }
+}
+
 static void WmMaterialRect(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect& r,uint32_t color){
     const unsigned radius=CompositorGlassActive()?WmMetric(4):0;
     for(int y=0;y<r.h;++y){const unsigned row=y<r.h/2?y:r.h-1-y;
@@ -1928,8 +1989,24 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     WmDrawIcon(backBuffer, stride, screenW, screenH, l.terminal.x + (l.terminal.w - static_cast<int>(WmMetric(24))) / 2,
                l.terminal.y + (l.terminal.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), icons.get().terminalIcon);
     char launchTitle[80]{};
+    const uint32_t netAddress = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
+    char netTitle[48]{};
     const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
         l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
+    if (l.network.contains(mouseX, mouseY)) {
+        if (netAddress) {
+            const uint8_t* o = reinterpret_cast<const uint8_t*>(&netAddress);
+            WmStrCopy(netTitle, "Network: ", sizeof(netTitle));
+            char* out = netTitle + strlen(netTitle);
+            for (int i = 0; i < 4; ++i) {
+                DesktopNumber(out, o[i]);
+                while (*out) ++out;
+                if (i < 3) *out++ = '.';
+            }
+            *out = 0;
+            hoverTitle = netTitle;
+        } else hoverTitle = "Network: disconnected";
+    }
     for (int i = 0; i < l.count; ++i)
     {
         const WmRect& r = l.buttons[i];
@@ -1983,7 +2060,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // Use the already-reserved tray for the hover label. Geometry stays fixed
     // and no additional empty strip is reserved when nothing is hovered.
     int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.clock};
+    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
@@ -1996,6 +2073,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             r.x, l.textY, text, fg, WmCurrentPalette().taskbar, r.w);
     };
     trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
+    DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
     for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
 }
 

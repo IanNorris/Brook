@@ -90,6 +90,9 @@ def main():
                    help='override one kernel option (repeatable)')
     p.add_argument('--supervisor', default='brook-desktop-supervisor-serial',
                    help='supervisor variant from the vulkan-compositor package')
+    p.add_argument('--show-kernel-console', action='store_true',
+                   help='keep the source startup script\'s Kernel Console window (hidden by default; '
+                        'otherwise it opens from Apps > Kernel Console)')
     p.add_argument('--allow-dirty', action='store_true', help='permit uncommitted changes (recorded)')
     p.add_argument('--qemu-check', action='store_true',
                    help='then run scripts/check_dell_image_qemu.py on the pair (results in <output>/qemu-check)')
@@ -147,7 +150,8 @@ def main():
          '--expected-kernel-sha256', sha(kernel), '--enable-efi-poweroff', '--enable-usb-boot-poweroff',
          '--enable-dell-acpi-monitor', '--enable-ac-loss-poweroff', '--enable-vulkan-desktop',
          '--enable-vulkan-async-partial', '--enable-dell-bcs-present', '--vulkan-supervisor', supervisor,
-         '--vulkan-renderer', renderer, '--gpu-source-provider', provider], cwd=ROOT / 'scripts')
+         '--vulkan-renderer', renderer, '--gpu-source-provider', provider]
+        + ([] if a.show_kernel_console else ['--hide-kernel-console']), cwd=ROOT / 'scripts')
 
     # 4. Independent verification
     verify = [sys.executable, ROOT / 'scripts/verify_guarded_desktop_candidate.py', '--candidate', a.output,
@@ -157,6 +161,8 @@ def main():
               '--allow-ac-loss-poweroff', '--expected-vulkan-supervisor', sha(supervisor),
               '--expected-vulkan-renderer', sha(renderer), '--expected-gpu-provider', sha(provider)]
     verify += [flag for name, flag in VERIFY_ALLOW.items() if options.get(name) == 'ON']
+    if not a.show_kernel_console:
+        verify.append('--allow-hidden-kernel-console')
     result = subprocess.run([str(x) for x in verify], cwd=ROOT / 'scripts', capture_output=True, text=True)
     if result.returncode:
         sys.exit('verification failed:\n' + result.stdout[-2000:] + result.stderr[-4000:])
@@ -165,7 +171,7 @@ def main():
     # 5. Manifest
     manifest = {
         'payload_id': a.payload_id, 'commit': commit, 'dirty': dirty, 'module_abi': abi,
-        'kernel_options': options, 'kernel_sha256': sha(a.output / 'kernel.elf'),
+        'kernel_options': options, 'kernel_console_hidden': not a.show_kernel_console, 'kernel_sha256': sha(a.output / 'kernel.elf'),
         'initrd_sha256': sha(a.output / 'INITRD.IMG'), 'source_initrd_sha256': SOURCE_INITRD_SHA,
         'packages': {'vulkan_compositor': str(compositor), 'waylandd_vulkan': str(waylandd)},
         'boot_services': {name: {'source': str(path), 'sha256': sha(path), 'runtime_store_paths': runtime_paths(path)}

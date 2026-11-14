@@ -1866,6 +1866,8 @@ static void CompositorLoopWM()
         ProcessUnref(owner);
     }
     uint64_t now = ApicTickCount();
+    // The taskbar (drawn every pass, like the clock) reads only this cache.
+    WmNetworkIndicatorRefresh(now);
     static bool summaryShown=false;
     int32_t summaryX=0,summaryY=0;uint32_t summaryW=0,summaryH=0;
     const bool showSummary=WmBootSummaryRect(g_physFbWidth,g_physFbHeight,&summaryX,&summaryY,&summaryW,&summaryH);

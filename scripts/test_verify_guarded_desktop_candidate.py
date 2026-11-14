@@ -39,7 +39,7 @@ class VerifyGuardedDesktop(unittest.TestCase):
         shutil.copyfile(self.image,self.source);shutil.copyfile(self.image,self.ref)
     def copy(self,name,data):
         subprocess.run(['mcopy','-o','-i',str(self.image),'-','::/'+name],input=data,check=True)
-    def check(self, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_vulkan_async_partial=False, allow_dell_bcs_present=False, allow_irq_signal_probe=False):
+    def check(self, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_vulkan_async_partial=False, allow_dell_bcs_present=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False):
         with mock.patch.object(verifier,'CHECKER_SHA',hashlib.sha256(self.fat).hexdigest()), \
              mock.patch.object(verifier,'E2FSCK_SHA',hashlib.sha256(self.ext).hexdigest()), \
              mock.patch.object(verifier,'module_version',return_value=65):
@@ -50,7 +50,7 @@ class VerifyGuardedDesktop(unittest.TestCase):
                                    allow_vulkan_partial=allow_vulkan_partial,allow_gpu_blocked_recovery_test=allow_gpu_blocked_recovery_test,
                                    expected_gpu_provider=expected_gpu_provider,allow_gpu_source_trace=allow_gpu_source_trace,
                                    allow_vulkan_async_partial=allow_vulkan_async_partial,allow_dell_bcs_present=allow_dell_bcs_present,
-                                   allow_irq_signal_probe=allow_irq_signal_probe)
+                                   allow_irq_signal_probe=allow_irq_signal_probe,allow_hidden_kernel_console=allow_hidden_kernel_console)
     def test_irq_signal_probe_requires_exact_opt_in(self):
         with self.assertRaisesRegex(ValueError, 'Missing or invalid opt-in irq-signal-probe'):
             self.check(allow_irq_signal_probe=True)
@@ -61,6 +61,19 @@ class VerifyGuardedDesktop(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unexpected opt-in irq-signal-probe'):
             self.check()
         self.assertEqual(self.check(allow_irq_signal_probe=True)['module_abi'], 65)
+    def test_hidden_kernel_console_requires_exact_opt_in(self):
+        self.copy('BOOT/INIT.RC',b'set wm\nkconsole\n')
+        shutil.copyfile(self.image,self.source);shutil.copyfile(self.image,self.ref)
+        self.copy('BOOT/INIT.RC',b'set wm\n')
+        with self.assertRaisesRegex(ValueError,'startup script mismatch'):self.check()
+        with self.assertRaisesRegex(ValueError,'shortcut mismatch'):self.check(allow_hidden_kernel_console=True)
+        subprocess.run(['mmd','-i',str(self.image),'::/BOOT/SHORTCUTS'],check=True)
+        self.copy(verifier.KERNEL_CONSOLE_SHORTCUT_PATH,b'# title: other\n')
+        with self.assertRaisesRegex(ValueError,'shortcut mismatch'):self.check(allow_hidden_kernel_console=True)
+        self.copy(verifier.KERNEL_CONSOLE_SHORTCUT_PATH,verifier.KERNEL_CONSOLE_SHORTCUT)
+        self.assertTrue(self.check(allow_hidden_kernel_console=True)['kernel_console_hidden'])
+        self.copy('BOOT/INIT.RC',b'set wm\nkconsole\n')
+        with self.assertRaisesRegex(ValueError,'shortcut mismatch'):self.check()
     def test_valid_pair(self):
         self.assertEqual(self.check()['modules']['xhci.mod'],verifier.sha(self.module))
     def test_rejects_changed_guard_and_script(self):
