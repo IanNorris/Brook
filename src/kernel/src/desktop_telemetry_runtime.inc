@@ -87,33 +87,53 @@ static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint3
     char n[12];append("80:");DesktopNumber(n,summary.p80);append(n);append(" 95:");DesktopNumber(n,summary.p95);append(n);append(" max:");DesktopNumber(n,summary.max);append(n);append("ms");
     text(r.x,bottom,value,p.secondaryText);
 }
-static bool WmBuildIdLayout(uint32_t sw,uint32_t sh,char (&text)[100],WmRect& rect) {
+// "Brook <build>" plus, on hardware payloads, a drawn middle dot and the
+// payload name (the desktop font is ASCII-only).
+struct WmBuildIdText { char main[48]; const char* suffix; int mainWidth, dotGap, dot; };
+static bool WmBuildIdLayout(uint32_t sw,uint32_t sh,WmBuildIdText& text,WmRect& rect) {
     if(!WmIsActive())return false;
-    WmStrCopy(text,"Brook ",sizeof(text));WmStrCopy(text+6,BuildGitHash(),sizeof(text)-6);
-    const int width=WmTextWidth(text)+WmMetric(14),height=WmDesktopFont().lineHeight+WmMetric(6);
+    WmStrCopy(text.main,"Brook ",sizeof(text.main));WmStrCopy(text.main+6,BuildGitHash(),sizeof(text.main)-6);
+    text.suffix=g_buildPayloadId[0]?g_buildPayloadId:nullptr;
+    text.mainWidth=WmTextWidth(text.main);text.dotGap=WmMetric(6);text.dot=WmMetric(2)>1?WmMetric(2):1;
+    int width=text.mainWidth+WmMetric(14);
+    if(text.suffix)width+=2*text.dotGap+text.dot+WmTextWidth(text.suffix);
+    const int height=WmDesktopFont().lineHeight+WmMetric(6);
     if(sw<static_cast<uint32_t>(width)+WmMetric(10)||sh<WmMetric(WM_TASKBAR_HEIGHT)+height+WmMetric(6))return false;
     rect={int(sw)-width-int(WmMetric(8)),int(sh)-int(WmMetric(WM_TASKBAR_HEIGHT))-height-int(WmMetric(6)),width,height};
     return true;
 }
+// Draws the label text with its top-left glyph origin at (x,y) in a buffer
+// of sw x sh pixels (a full frame, or one row for the span path).
+static void WmDrawBuildIdText(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,int x,int y,
+                          const WmBuildIdText& text,const WmRect* clip) {
+    WmRenderString(pixels,stride,sw,sh,x,y,text.main,0xa4b2c7,0x172335,0,clip);
+    if(!text.suffix)return;
+    const int dotX=x+text.mainWidth+text.dotGap,dotY=y+(WmDesktopFont().lineHeight-text.dot)/2;
+    int l=dotX,t=dotY,r=dotX+text.dot,b=dotY+text.dot;
+    if(clip){if(l<clip->x)l=clip->x;if(t<clip->y)t=clip->y;
+        if(r>clip->x+clip->w)r=clip->x+clip->w;if(b>clip->y+clip->h)b=clip->y+clip->h;}
+    if(r>l && b>t)WmFillRect(pixels,stride,sw,sh,l,t,r-l,b-t,0xa4b2c7);
+    WmRenderString(pixels,stride,sw,sh,dotX+text.dot+text.dotGap,y,text.suffix,0xa4b2c7,0x172335,0,clip);
+}
 void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect* clip) {
-    char text[100];WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect))return;
+    WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect))return;
     const int x=rect.x,y=rect.y,width=rect.w,height=rect.h;
     const int left=clip && clip->x>x?clip->x:x,top=clip && clip->y>y?clip->y:y;
     const int right=clip && clip->x+clip->w<x+width?clip->x+clip->w:x+width;
     const int bottom=clip && clip->y+clip->h<y+height?clip->y+clip->h:y+height;
     if(right<=left||bottom<=top)return;
     WmFillRect(pixels,stride,sw,sh,left,top,right-left,bottom-top,0x172335);
-    WmRenderString(pixels,stride,sw,sh,x+WmMetric(7),y+WmMetric(3),text,0xa4b2c7,0x172335,0,clip);
+    WmDrawBuildIdText(pixels,stride,sw,sh,x+WmMetric(7),y+WmMetric(3),text,clip);
 }
 // Draw into one already-populated screen span, using the same glyph renderer
 // and coordinates as the normal full-frame path.
 void WmDrawBuildIdSpan(uint32_t* pixels,uint32_t left,uint32_t count,uint32_t row,uint32_t sw,uint32_t sh) {
     if(!pixels || !count || left>=sw || count>sw-left || row>=sh)return;
-    char text[100];WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect) ||
+    WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect) ||
         int64_t(row)<rect.y || int64_t(row)>=int64_t(rect.y)+rect.h)return;
     WmFillRect(pixels,count,count,1,rect.x-int(left),0,rect.w,1,0x172335);
-    WmRenderString(pixels,count,count,1,rect.x+int(WmMetric(7))-int(left),
-                   rect.y+int(WmMetric(3))-int(row),text,0xa4b2c7,0x172335);
+    WmDrawBuildIdText(pixels,count,count,1,rect.x+int(WmMetric(7))-int(left),
+                      rect.y+int(WmMetric(3))-int(row),text,nullptr);
 }
 bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* width,uint32_t* height) {
     const uint64_t ready=CompositorDesktopReadyTick(),now=ApicTickCount();

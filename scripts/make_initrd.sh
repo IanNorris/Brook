@@ -128,6 +128,14 @@ if [ -n "${BROOK_INITRD_MARKERS:-}" ]; then
         printf '1\n' | mcopy -i "${INITRD_IMG}.tmp" - "::ETC/${marker}"
     done
 fi
+# Optional hardware payload name for QEMU checks of payload-labelled images
+# (the Dell pair tooling writes the same marker into its own initrd copy).
+if [ -n "${BROOK_HARDWARE_PAYLOAD_ID:-}" ]; then
+    if [[ ! "${BROOK_HARDWARE_PAYLOAD_ID}" =~ ^[A-Za-z0-9._-]{1,62}$ ]]; then
+        echo "Invalid BROOK_HARDWARE_PAYLOAD_ID" >&2; exit 1
+    fi
+    printf '%s\n' "${BROOK_HARDWARE_PAYLOAD_ID}" | mcopy -i "${INITRD_IMG}.tmp" - "::ETC/hardware-payload-id"
+fi
 # Resolver configuration must be a real retained file: container runtimes use
 # O_PATH and bind mounts, which cannot retain syscall-only synthetic contents.
 # The kernel replaces this RAM-backed seed after DHCP/static configuration.

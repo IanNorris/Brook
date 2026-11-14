@@ -6,7 +6,7 @@
 static struct DesktopStats stats;
 static void present(uint32_t window,uint64_t incarnation,uint64_t commit,uint64_t snapshot,uint32_t omitted,uint64_t ns,unsigned direct){
     struct AsyncWindowSource source={incarnation,1,commit,snapshot,window,omitted};
-    const struct DesktopStatsFrame frame={&source,1,direct,0,0,ns,ns-3000000,ns-1000000,ns-500000,direct?200000:0,direct!=0};
+    const struct DesktopStatsFrame frame={&source,1,direct,0,0,ns,ns-3000000,ns-1000000,ns-500000,direct?200000:0,direct!=0,0,0,0,0,0};
     desktop_stats_presented(&stats,&frame);
 }
 static struct DesktopStatsWindow *find(uint32_t window,uint64_t incarnation){
@@ -59,15 +59,30 @@ int main(void){
     assert(stats.overlayCaptures==2 && stats.overlayFailures==1 && stats.overlayPolls==503 && stats.overlayMaxPolls==500);
     assert(stats.overlayWait.minNs==0 && stats.overlayWait.maxNs==25000000);
 
+    /* Composition work per class, the path counters and the last frame. */
+    {const struct DesktopStatsFrame quad={NULL,0,1,1,0,base+850000000,0,0,0,0,0,DESKTOP_STATS_PATH_QUAD,3,7,4000000,3686400};
+     const struct DesktopStatsFrame small={NULL,0,0,1,0,base+860000000,0,0,0,0,0,DESKTOP_STATS_PATH_QUAD,2,3,20000,10240};
+     const uint64_t before=stats.cls[DESKTOP_STATS_DIRECT].work.pixelsShaded;
+     desktop_stats_presented(&stats,&quad);desktop_stats_presented(&stats,&small);
+     assert(stats.quad==2 && stats.cls[DESKTOP_STATS_DIRECT].work.pixelsShaded==before+4000000);
+     assert(stats.cls[DESKTOP_STATS_NONDIRECT].work.maxLayersDrawn>=2 && stats.last.path==DESKTOP_STATS_PATH_QUAD);
+     assert(stats.last.pixelsShaded==20000 && stats.last.damagePixels==10240 && stats.last.draws==3);
+     stats.idleSkips=5;stats.keepalives=1;}
     const struct DesktopStatsMeta meta={7,base+900000000,base,0,42,2,1,0};
     char small[64];assert(!desktop_stats_format(&stats,&meta,small,sizeof(small)));
     static char json[32768];
     const size_t length=desktop_stats_format(&stats,&meta,json,sizeof(json));
     assert(length && length==strlen(json) && json[length-1]=='\n');
     assert(strstr(json,"\"seq\":7,") && strstr(json,"\"window\":3,\"incarnation\":9,"));
+    assert(strstr(json,"\"quad\":2,") && strstr(json,"\"skipped_polls\":5,") && strstr(json,"\"last_frame\":{\"path\":\"quad\""));
+    assert(strstr(json,"\"composition\":{\"frames\":"));
     /* Worst case: every table entry populated with large values still fits. */
     for(unsigned i=0;i<DESKTOP_STATS_WINDOWS;++i){stats.windows[i].displayed=UINT64_MAX;stats.windows[i].lastCommit=UINT64_MAX;
         stats.windows[i].incarnation=UINT64_MAX;stats.windows[i].window=UINT32_MAX;for(unsigned j=0;j<DESKTOP_STATS_BUCKETS;++j)stats.windows[i].hist[j]=UINT64_MAX;}
+    for(unsigned i=0;i<2;++i){struct DesktopStatsWork *w=&stats.cls[i].work;w->frames=w->layersDrawn=w->draws=w->pixelsShaded=
+        w->damagePixels=w->maxLayersDrawn=w->maxPixelsShaded=UINT64_MAX;}
+    stats.last.pixelsShaded=stats.last.damagePixels=stats.last.submitToFenceNs=stats.last.gpuNs=UINT64_MAX;
+    stats.idleSkips=stats.keepalives=stats.quad=UINT64_MAX;
     static char worst[32768];assert(desktop_stats_format(&stats,&meta,worst,sizeof(worst)));
     fputs(json,stdout);
     return 0;

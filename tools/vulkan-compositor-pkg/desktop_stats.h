@@ -24,14 +24,27 @@ struct DesktopStatsWindow {
     uint64_t hist[DESKTOP_STATS_BUCKETS];struct DesktopStatsDuration interval;
 };
 enum {DESKTOP_STATS_DIRECT=0,DESKTOP_STATS_NONDIRECT=1};
+/* Composition path of a frame: the compute shader (every invocation loops
+ * over every layer), the experimental full-scene graphics pass, or the
+ * per-layer quad pass. */
+enum {DESKTOP_STATS_PATH_COMPUTE=0,DESKTOP_STATS_PATH_GRAPHICS=1,DESKTOP_STATS_PATH_QUAD=2};
+/* Work per frame: layers drawn, draw calls (compute: tiles), pixels
+ * shaded (damage area times overdraw; compute: damage times layers) and
+ * damage area. */
+struct DesktopStatsWork {uint64_t frames,layersDrawn,draws,pixelsShaded,damagePixels,maxLayersDrawn,maxPixelsShaded;};
 struct DesktopStatsClass {
     uint64_t frames;
     struct DesktopStatsDuration gpuTimestamp,submitToFence,prepare;
+    struct DesktopStatsWork work;
 };
 struct DesktopStats {
     uint64_t useClock,evictions;
     struct DesktopStatsWindow windows[DESKTOP_STATS_WINDOWS];
-    uint64_t presents,full,partial,graphics,compute,directLayers;
+    uint64_t presents,full,partial,graphics,compute,quad,directLayers;
+    /* Polls with no change since the displayed frame (no GPU work), and
+     * minimal presents that only keep the presentation lease alive. */
+    uint64_t idleSkips,keepalives;
+    struct {uint32_t path,direct,partial,layersDrawn,draws;uint64_t pixelsShaded,damagePixels,submitToFenceNs,gpuNs;} last;
     uint64_t presentFailures,presentStale,presentBusy,prepareFailures;
     struct DesktopStatsClass cls[2];
     uint64_t overlayCaptures,overlayFailures,overlayPolls,overlayMaxPolls;
@@ -42,6 +55,8 @@ struct DesktopStats {
 struct DesktopStatsFrame {
     const struct AsyncWindowSource *sources;unsigned count,direct;int partial,graphics;
     uint64_t presentedNs,startNs,submitStartNs,fenceNs,gpuNs;int gpuValid;
+    /* Appended; zero means a compute frame with unknown work. */
+    unsigned path;uint32_t layersDrawn,draws;uint64_t pixelsShaded,damagePixels;
 };
 
 static inline unsigned desktop_stats_bucket(uint64_t ns){
@@ -88,13 +103,23 @@ static inline void desktop_stats_source(struct DesktopStats *s,const struct Asyn
 static inline void desktop_stats_presented(struct DesktopStats *s,const struct DesktopStatsFrame *f){
     ++s->presents;
     if(f->partial)++s->partial;else ++s->full;
-    if(f->graphics)++s->graphics;else ++s->compute;
+    const unsigned path=f->path==DESKTOP_STATS_PATH_QUAD?DESKTOP_STATS_PATH_QUAD:
+        f->path==DESKTOP_STATS_PATH_GRAPHICS || f->graphics?DESKTOP_STATS_PATH_GRAPHICS:DESKTOP_STATS_PATH_COMPUTE;
+    if(path==DESKTOP_STATS_PATH_QUAD)++s->quad;else if(path==DESKTOP_STATS_PATH_GRAPHICS)++s->graphics;else ++s->compute;
     s->directLayers+=f->direct;
     struct DesktopStatsClass *c=&s->cls[f->direct?DESKTOP_STATS_DIRECT:DESKTOP_STATS_NONDIRECT];
     ++c->frames;
     if(f->gpuValid)desktop_stats_duration(&c->gpuTimestamp,f->gpuNs);
     desktop_stats_span(&c->submitToFence,f->submitStartNs,f->fenceNs);
     desktop_stats_span(&c->prepare,f->startNs,f->submitStartNs);
+    struct DesktopStatsWork *w=&c->work;
+    ++w->frames;w->layersDrawn+=f->layersDrawn;w->draws+=f->draws;w->pixelsShaded+=f->pixelsShaded;w->damagePixels+=f->damagePixels;
+    if(f->layersDrawn>w->maxLayersDrawn)w->maxLayersDrawn=f->layersDrawn;
+    if(f->pixelsShaded>w->maxPixelsShaded)w->maxPixelsShaded=f->pixelsShaded;
+    s->last.path=path;s->last.direct=f->direct;s->last.partial=f->partial!=0;s->last.layersDrawn=f->layersDrawn;
+    s->last.draws=f->draws;s->last.pixelsShaded=f->pixelsShaded;s->last.damagePixels=f->damagePixels;
+    s->last.submitToFenceNs=f->submitStartNs && f->fenceNs>=f->submitStartNs?f->fenceNs-f->submitStartNs:0;
+    s->last.gpuNs=f->gpuValid?f->gpuNs:0;
     const unsigned n=f->count<=BROOK_DESKTOP_LAYER_LIMIT?f->count:BROOK_DESKTOP_LAYER_LIMIT;
     for(unsigned i=0;f->sources && i<n;++i)desktop_stats_source(s,&f->sources[i],f->presentedNs);
 }
@@ -132,18 +157,32 @@ static inline size_t desktop_stats_format(const struct DesktopStats *s,const str
     for(unsigned i=0;i<DESKTOP_STATS_BUCKETS-1;++i)desktop_stats_put(&b,"%u,",desktop_stats_bucket_ms[i]);
     desktop_stats_put(&b,"null],");
     desktop_stats_put(&b,"\"presents\":{\"completed\":%llu,\"full\":%llu,\"partial\":%llu,\"graphics\":%llu,\"compute\":%llu,"
-        "\"failed\":%llu,\"stale\":%llu,\"busy_retries\":%llu,\"prepare_failures\":%llu,\"direct_layers\":%llu},",
+        "\"quad\":%llu,\"failed\":%llu,\"stale\":%llu,\"busy_retries\":%llu,\"prepare_failures\":%llu,\"direct_layers\":%llu},",
         (unsigned long long)s->presents,(unsigned long long)s->full,(unsigned long long)s->partial,
-        (unsigned long long)s->graphics,(unsigned long long)s->compute,(unsigned long long)s->presentFailures,
+        (unsigned long long)s->graphics,(unsigned long long)s->compute,(unsigned long long)s->quad,(unsigned long long)s->presentFailures,
         (unsigned long long)s->presentStale,(unsigned long long)s->presentBusy,(unsigned long long)s->prepareFailures,
         (unsigned long long)s->directLayers);
+    static const char *const paths[3]={"compute","graphics","quad"};
+    desktop_stats_put(&b,"\"idle\":{\"skipped_polls\":%llu,\"keepalive_presents\":%llu},",
+        (unsigned long long)s->idleSkips,(unsigned long long)s->keepalives);
+    desktop_stats_put(&b,"\"last_frame\":{\"path\":\"%s\",\"direct\":%u,\"partial\":%u,\"layers_drawn\":%u,\"draws\":%u,"
+        "\"pixels_shaded\":%llu,\"damage_pixels\":%llu,\"cpu_submit_to_fence_ns\":%llu,\"gpu_ns\":%llu},",
+        paths[s->last.path<3?s->last.path:0],s->last.direct,s->last.partial,s->last.layersDrawn,s->last.draws,
+        (unsigned long long)s->last.pixelsShaded,(unsigned long long)s->last.damagePixels,
+        (unsigned long long)s->last.submitToFenceNs,(unsigned long long)s->last.gpuNs);
     desktop_stats_put(&b,"\"classes\":{");
     static const char *const names[2]={"direct","nondirect"};
     for(unsigned i=0;i<2;++i){const struct DesktopStatsClass *c=&s->cls[i];
         desktop_stats_put(&b,"%s\"%s\":{\"frames\":%llu,",i?",":"",names[i],(unsigned long long)c->frames);
         desktop_stats_put_duration(&b,"gpu_timestamp",&c->gpuTimestamp);desktop_stats_put(&b,",");
         desktop_stats_put_duration(&b,"cpu_submit_to_fence_observed",&c->submitToFence);desktop_stats_put(&b,",");
-        desktop_stats_put_duration(&b,"cpu_prepare",&c->prepare);desktop_stats_put(&b,"}");
+        desktop_stats_put_duration(&b,"cpu_prepare",&c->prepare);
+        const struct DesktopStatsWork *w=&c->work;
+        desktop_stats_put(&b,",\"composition\":{\"frames\":%llu,\"layers_drawn\":%llu,\"draws\":%llu,\"pixels_shaded\":%llu,"
+            "\"damage_pixels\":%llu,\"max_layers_drawn\":%llu,\"max_pixels_shaded\":%llu}}",
+            (unsigned long long)w->frames,(unsigned long long)w->layersDrawn,(unsigned long long)w->draws,
+            (unsigned long long)w->pixelsShaded,(unsigned long long)w->damagePixels,(unsigned long long)w->maxLayersDrawn,
+            (unsigned long long)w->maxPixelsShaded);
     }
     desktop_stats_put(&b,"},\"overlay\":{\"captures\":%llu,\"failures\":%llu,\"polls\":%llu,\"max_polls\":%llu,",
         (unsigned long long)s->overlayCaptures,(unsigned long long)s->overlayFailures,

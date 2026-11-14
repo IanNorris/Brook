@@ -34,7 +34,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | M0 | Diagnostics: `gpu worker stats` (kernel), `/tmp/brook-desktop-stats.json` + `scripts/desktop_stats_diff.py` (renderer), `scripts/dell_quake_measure.py` | done: gen 357 results below |
 | M2 | Event-driven waylandd, channel ABI v2 (retain + PRESENTED), release on SAFE without CPU copy, present-driven callbacks | done: `aac9e79c`, `af3626c9`; gen 361 with overlay |
 | — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
-| M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
+| M1 | Change-based damage, idle polls, quad pass with occlusion and bit-exact shader blending (compute fallback via `BROOK_RENDER_COMPOSE=compute`) | done: `4330fd74`; gen 362: displayed ~29 fps (2 buffers) / ~24 (8), swaps 46/85, compositor job ~10.5 ms, worker 37–42% idle |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
 | M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | code on `work/m3-flip` (both options OFF by default, runtime-gated off at boot); host tests and default QEMU check pass; Dell untested, staged plan in `docs/bdw-page-flip.md` |
 | M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
@@ -63,6 +63,12 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **Worker:** idle only 8–13% (compositor 45–47%, present 26%).
 - **Non-game composites now cost ~18 ms each at 12–20/s.** Composite cost doesn't scale with damage, so M1 (damage-proportional composition) is next, then M3.
 - The rollback after the M4a loop used `scripts/hardware_promote_slot.py` from the USB maintenance boot (gen 358 → gen 360).
+
+**Perceptual check (gen 363, `dell-m1-volume-20261114`, 14 Nov):**
+- **Run:** plain yquake2 attract demo (default 640×480 shown 2×, GL3 via patched Iris, default buffering).
+- **Ian:** "very playable"; yquake2's own counter read 46 fps (21.9 ms), "quite erratic" but frame pacing visually acceptable.
+- **Renderer counters over 14 s:** 45.0 distinct displayed frames/s (every swap shown). Intervals p50 19.5, p90 29.8, p99 44.6 ms. Game-frame submit→fence 9 ms, prepare 3 ms.
+- **The remaining jitter** is the 33–50 ms tail (serial one-frame pipeline plus BCS copy), so M3 and pipelining are next.
 
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
@@ -135,6 +141,13 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+
+- **Keyboard shortcuts:**
+  - the Windows (Super) key opens the app launcher and always releases pointer capture; today a captured mouse can't be released without closing the app;
+  - Alt+F4 closes the focused window.
+- **Dell application audio for yquake2:** the gen 363 boot has no `/dev/dsp`, and the OSS OpenAL store path (`59h20vp…-openal-soft-oss-brook-1.24.3`) is present but has no `lib/`. Restore the gated Dell HDA path (`/etc/dell-hda-audible`; see `docs/xps9343-bringup.md`) and stage OpenAL, then verify audibly with Ian. The SDL build has no OSS backend, so OpenAL is required. The `/data/home` yquake2 config also had a stale absolute `al_driver`.
+- **Boot-menu wait:** key input during the bootloader wait isn't recognised. The default wait is being reduced to 0.5 s in `work/boot-timing`.
+- **Volume persistence:** taskbar volume changes apply live but are only saved by Settings' Apply. Decide whether taskbar changes should persist automatically.
 
 - **Automatic slot rollback in the guard:** after N consecutive desktop panics on a newly activated generation, select the previous verified slot instead of looping in recovery-only mode. Also expose a slot-select operation in the recovery-only bridge.
 - **Split `src/kernel/src/syscall.cpp`** (17k lines) by area: memory, files, process/signal, sockets, epoll/timers and Brook-specific.

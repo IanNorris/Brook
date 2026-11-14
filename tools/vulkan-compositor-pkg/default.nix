@@ -23,6 +23,8 @@ pkgs.stdenv.mkDerivation {
     glslangValidator -V --target-env vulkan1.1 graphics_layers.frag -o graphics_layers.spv
     glslangValidator -V --target-env vulkan1.1 graphics_scene.frag -o graphics_scene.spv
     glslangValidator -V --target-env vulkan1.1 graphics_pass.vert -o graphics_pass_vertex.spv
+    glslangValidator -V --target-env vulkan1.1 quad.vert -o quad_vertex.spv
+    glslangValidator -V --target-env vulkan1.1 quad.frag -o quad_fragment.spv
     python3 - <<'PY'
     import struct
     from pathlib import Path
@@ -48,12 +50,23 @@ pkgs.stdenv.mkDerivation {
         words = struct.unpack('<'+'I'*(len(data)//4),data)
         text += 'static const uint32_t '+symbol+'[] = {\n'+',\n'.join('0x%08xu' % word for word in words)+'\n};\n'
     Path('graphics_pass_spv.h').write_text(text)
+    text = ""
+    for name,symbol in (('quad_vertex','quadVertexCode'),('quad_fragment','quadFragmentCode')):
+        data = Path(name+'.spv').read_bytes()
+        words = struct.unpack('<'+'I'*(len(data)//4),data)
+        text += 'static const uint32_t '+symbol+'[] = {\n'+',\n'.join('0x%08xu' % word for word in words)+'\n};\n'
+    Path('quad_pass_spv.h').write_text(text)
     PY
     $CC -std=c11 -O2 -Wall -Wextra -Werror -c renderer.c -o renderer.o
     $CC -std=c11 -O2 -Wall -Wextra -Werror intel_sdl_same_title_probe.c -ldl -o brook-same-title-gpu-probe
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_pair_pixel_probe.c -o brook-pair-pixel-probe
     $CC -std=c11 -O2 -Wall -Wextra -Werror -c graphics_image.c -o graphics_image.o
     $CC -std=c11 -O2 -Wall -Wextra -Werror -c graphics_pass.c -o graphics_pass.o
+    $CC -std=c11 -O2 -Wall -Wextra -Werror -c quad_pass.c -o quad_pass.o
+    $CC -std=c11 -O2 -Wall -Wextra -Werror quad_plan_test.c -o brook-quad-plan-test
+    ./brook-quad-plan-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_track_test.c -o brook-desktop-track-test
+    ./brook-desktop-track-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror graphics_layers_test.c -o brook-graphics-layers-test
     ./brook-graphics-layers-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_graphics_damage_test.c -o brook-desktop-graphics-damage-test
@@ -61,7 +74,7 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror import_cache_test.c -lvulkan -o brook-import-cache-test
     ./brook-import-cache-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror -c surface.c -o surface.o
-    $AR rcs libbrook-vulkan-compositor.a renderer.o surface.o graphics_image.o graphics_pass.o
+    $AR rcs libbrook-vulkan-compositor.a renderer.o surface.o graphics_image.o graphics_pass.o quad_pass.o
     $CC -std=c11 -O2 -Wall -Wextra -Werror renderer_test.c renderer.o -lvulkan -o brook-vulkan-compositor-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror renderer_timeout_test.c renderer.o -lvulkan -o brook-vulkan-timeout-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror external_renderer_test.c renderer.o -lvulkan -o brook-vulkan-external-compositor-test
@@ -97,10 +110,12 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_test.c -o brook-desktop-chrome-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation desktop_chrome_present_test.c -o brook-desktop-chrome-present-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_layers_vulkan_test.c renderer.o -lvulkan -o brook-desktop-layers-vulkan-test
-    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer.c renderer.o graphics_image.o graphics_pass.o -lvulkan -o brook-desktop-renderer
+    $CC -std=c11 -O2 -Wall -Wextra -Werror quad_pass_host_test.c renderer.o quad_pass.o -lvulkan -o brook-quad-pass-host-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer_host_test.c renderer.o graphics_image.o graphics_pass.o quad_pass.o -lvulkan -o brook-desktop-renderer-host-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer.c renderer.o graphics_image.o graphics_pass.o quad_pass.o -lvulkan -o brook-desktop-renderer
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_DIAGNOSTIC_REUSE_BACKDROP=1 desktop_supervisor.c -o brook-desktop-supervisor-reuse-backdrop
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_DIAGNOSTIC_BARE=1 desktop_supervisor.c -o brook-desktop-supervisor-bare
-    $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_RENDER_TEST_SOURCE_CRASH=1 desktop_renderer.c renderer.o graphics_image.o graphics_pass.o -lvulkan -o brook-desktop-renderer-test-source-crash
+    $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_RENDER_TEST_SOURCE_CRASH=1 desktop_renderer.c renderer.o graphics_image.o graphics_pass.o quad_pass.o -lvulkan -o brook-desktop-renderer-test-source-crash
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_renderer_client_test.c -o brook-desktop-renderer-client-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_present_test.c -o brook-desktop-present-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_same_title_test.c -o brook-desktop-same-title-test
@@ -151,6 +166,7 @@ pkgs.stdenv.mkDerivation {
     cp brook-desktop-chrome-test $out/bin/
     cp brook-desktop-chrome-present-test $out/bin/
     cp brook-desktop-layers-vulkan-test $out/bin/
+    cp brook-quad-pass-host-test brook-desktop-renderer-host-test $out/bin/
     cp brook-desktop-renderer $out/bin/
     cp brook-desktop-supervisor-bare brook-desktop-supervisor-reuse-backdrop $out/bin/
     cp brook-desktop-renderer-test-source-crash $out/bin/
@@ -164,6 +180,6 @@ pkgs.stdenv.mkDerivation {
     cp brook-desktop-legacy-present-test $out/bin/
     cp brook-desktop-occlusion-present-test $out/bin/
     cp libbrook-vulkan-compositor.a $out/lib/
-    cp renderer.h scene.h surface.h graphics_image.h graphics_layers.h graphics_pass.h $out/include/
+    cp renderer.h scene.h surface.h graphics_image.h graphics_layers.h graphics_pass.h quad_pass.h quad_plan.h $out/include/
   '';
 }
