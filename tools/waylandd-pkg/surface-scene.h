@@ -15,6 +15,12 @@ struct brook_image {
     int pending_cpu,pending_fd;
     int producer_fence,producer_fence_required,direct_attempted;
     int offer_state;
+    /* Version 2 GPU channel: the renderer reported a frame sampling this
+     * offer (gpu_presented); want_pixels requests a CPU snapshot while the
+     * renderer still retains it. offer_ms/offer_geometry describe the offer. */
+    int gpu_presented,want_pixels;
+    uint32_t offer_ms;
+    struct brook_geometry offer_geometry;
     uint32_t offer_sent_ms,offer_ack_ms;
     uint32_t trace_queued_ms,trace_first_poll_ms,trace_fence_ms;
     struct BrookGpuWindowIdentity offer_identity;
@@ -267,7 +273,15 @@ static int surface_render(struct brook_surface *root) {
     if (!surface_layers(root,draws,&count)) return 0;
     /* Keep the previously published frame until every current producer is
      * ready. The queue owns pending images even if their surface is removed. */
-    for(unsigned i=0;i<count;++i)if(draws[i].view->image->pending_cpu)return 1;
+    for(unsigned i=0;i<count;++i)if(draws[i].view->image->pending_cpu){
+        /* An offered GPU source can stand for the window only as its sole,
+         * unchanged root layer. Anything else needs CPU pixels now, without
+         * waiting for the renderer to give the source back. */
+        struct brook_image *held=draws[i].view->image;
+        if(held->offer_state==1 && (count!=1 || draws[0].view!=base ||
+           memcmp(&base->geometry,&held->offer_geometry,sizeof(base->geometry))))intel_image_want_pixels(held);
+        return 1;
+    }
     if (!surface_window(root,base)) return 0;
     if (!root->wm_id || !root->vfb) return 1;
     if (!scene_ensure(root)) return 0;
