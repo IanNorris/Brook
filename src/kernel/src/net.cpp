@@ -5852,6 +5852,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"last_refusal\":\"");r.text(BdwVideoRefusalName(g.lastRefusal()));r.text("\"");
             r.text(",\"advertised\":");r.text(g.advertiseBsd()?"true":"false");
             r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
+            r.text(",");r.field("retries",g.retries());
+            r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");
             const auto& v=g.sample();
             r.text(",\"vcs\":{\"sampled\":");r.text(v.sampled?"true":"false");
             r.text(",\"idle\":");r.text(v.idle?"true":"false");
@@ -5876,6 +5878,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("ggtt_writes",st.ggttWriteAttempts);r.text(",");r.field("elsp_writes",st.portWriteAttempts);
             if(st.engineSampled){r.text(",");r.field("head",st.head);r.text(",");r.field("tail",st.tail);
                 r.text(",");r.field("acthd",st.acthd);r.text(",");r.field("ipehr",st.ipehr);r.text(",");r.field("execlist",st.execlist);}
+            r.text(",");r.field("refusal_step",st.refusalStep);r.text(",");r.field("adapter_refusal",fw.refusal);
             r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
         r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest = reset VCS, init execlists, one-shot submission (PPGTT batch MI_STORE_DATA_IMM plus ring breadcrumb) with CSB retirement, reset after and unbind; failures after an engine write quarantine VCS for the boot, uncertain GT reset/PAT/forcewake state panics; user submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
         r.send();

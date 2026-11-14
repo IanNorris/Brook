@@ -761,14 +761,17 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         // The audited MMIO page contains the diagnostic's fixed slots and
         // the separate scanout reservation. Their PTE writes stay disjoint.
         if(!scratchDma || ((scanoutCopy || vcsSelftest)?(!copyResult || scratchIndex<65536 || scratchIndex>65536+512-8):scratchIndex!=65536) ||
-           (scanoutCopy && vcsSelftest))
-            return false;
+           (scanoutCopy && vcsSelftest)){
+            if(copyResult)copyResult->refusalStep=1;
+            return false;}
         const uint64_t scratchPages[]={0xf6880000ull,(scratchResult || copyResult)?0xf6101000ull:BdwResetPage,BdwResetPage};
         for(uint64_t page:scratchPages) {
-            DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e))return false;
+            DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e)){if(copyResult)copyResult->refusalStep=2;return false;}
         }
+        if(vcsSelftest){DellI2cCriticalEvidence e{};
+            if(!held.evidence(BdwOtherEnginePages[1],e) || !BdwGttEvidenceValid(e)){copyResult->refusalStep=6;return false;}}
         if(copyResult) {
-            if(!copyToken)return false;
+            if(!copyToken){copyResult->refusalStep=3;return false;}
             struct CopyOwner {
                 Io& io;uint32_t khz,line;uint64_t origin;uint32_t budget=4000000;
                 bool patActive=false,scanout=false;
@@ -851,10 +854,10 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             uint32_t a,b,c,d;__asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
             owner.line=((b>>8)&255)*8;
             if(!(d&(1u<<19)) || owner.line<16 || owner.line>4096 || (owner.line&(owner.line-1)) ||
-               4096%owner.line || !held.tsc(owner.origin))return false;
+               4096%owner.line || !held.tsc(owner.origin)){copyResult->refusalStep=4;return false;}
             copyResult->resetBeforeAttempted=true;copyResult->resetBefore=owner.resetBcs();
             copyResult->resetUncertain=owner.resetWasUncertain;
-            if(!copyResult->resetBefore)return false;
+            if(!copyResult->resetBefore){copyResult->refusalStep=5;return false;}
             BdwPatMmio<CopyOwner> patMmio(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),scanoutCopy);
             BdwPatLease pat;copyResult->patEstablished=pat.Establish(patMmio,0x119,scanoutCopy);
             if(!copyResult->patEstablished){copyResult->patUncertain=pat.State()==BdwPatLeaseState::Quarantined;return false;}
@@ -881,7 +884,13 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 copyResult->patUncertain=!copyResult->resetAfter || !copyResult->patRestored || !copyResult->scanoutRetired;
                 copyResult->resetUncertain=owner.resetWasUncertain;
                 owner.patActive=false;
-                return ran && !copyResult->patUncertain;
+                // The callback's result is the transaction's cleanliness: VCS was
+                // stopped, the PAT restored and the lease unbound. Whether the
+                // self-test itself passed is reported through copyResult (ran ->
+                // copyComplete/contextComplete), so a failed but cleanly
+                // recovered self-test does not leave the shared claim uncertain.
+                (void)ran;
+                return !copyResult->patUncertain && !copyResult->resetUncertain;
             }
 #else
             if(vcsSelftest)return false;
@@ -981,6 +990,17 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
     if(renderResult && result.sequence.workAttempted && !result.sequence.workComplete &&
        renderResult->entryRefusal!=BdwRenderRefusalNone && !renderResult->attempted && !renderResult->gtWrites &&
        !renderResult->transaction.patReady && !renderResult->transaction.resetAttempted && !renderResult->pollYieldFailed)
+        result.workRefusedUntouched=true;
+    // VCS (VA-API phase 1) work that refused before any engine write leaves
+    // nothing to recover: a VCS reset that reported NotStarted (or failed
+    // evidence) with no Uncertain outcome, or a self-test that stopped at a
+    // precondition or at a NotStarted reset-before. Never mark the claim
+    // uncertain for those, or every later GPU job would refuse.
+    if(vcsReset && result.sequence.workAttempted && !result.sequence.workComplete && !vcsReset->uncertain && !vcsReset->complete)
+        result.workRefusedUntouched=true;
+    if(vcsSelftest && copyResult && result.sequence.workAttempted && !result.sequence.workComplete &&
+       copyResult->refusalStep && !copyResult->resetUncertain && !copyResult->portWriteAttempts && !copyResult->ggttWriteAttempts &&
+       !copyResult->patEstablished)
         result.workRefusedUntouched=true;
     VmmKernelPtCriticalExit(irq);
     claim.finish(result);

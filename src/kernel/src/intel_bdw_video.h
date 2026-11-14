@@ -68,7 +68,8 @@ struct BdwVcsSample {
 class BdwVideoGate {
     BdwVideoStage stage_=BdwVideoStage::Off;
     BdwVideoRefusal last_=BdwVideoRefusal::None;
-    uint32_t probes_=0,resets_=0,refusals_=0,selftests_=0,selftestPasses_=0;
+    uint32_t probes_=0,resets_=0,refusals_=0,selftests_=0,selftestPasses_=0,retries_=0;
+    const char* detail_="none"; // static string: the precise sub-reason of the last refusal
     BdwVcsSample sample_{};
     void refuse(BdwVideoRefusal r){last_=r;++refusals_;}
 public:
@@ -78,6 +79,10 @@ public:
     uint32_t resets()const{return resets_;}
     uint32_t refusals()const{return refusals_;}
     uint32_t selftests()const{return selftests_;}
+    uint32_t retries()const{return retries_;}
+    const char* detail()const{return detail_;}
+    void setDetail(const char* d){detail_=d?d:"none";}
+    void addRetries(uint32_t n){retries_+=n;}
     uint32_t selftestPasses()const{return selftestPasses_;}
     const BdwVcsSample& sample()const{return sample_;}
     bool enabled()const{return stage_!=BdwVideoStage::Off && stage_!=BdwVideoStage::Quarantined;}

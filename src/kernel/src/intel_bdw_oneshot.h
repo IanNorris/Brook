@@ -44,6 +44,7 @@ struct BdwBcsRunResult {
     bool resetBeforeAttempted=false,resetBefore=false,patEstablished=false,patUncertain=false,resetAfter=false,patRestored=false;
     bool scanoutRetired=false;
     bool resetUncertain=false; // a reset reported Uncertain (a write may have reached GDRST unverified)
+    uint8_t refusalStep=0;     // copy work item: first precondition that refused before any engine write
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;
     bool engineSampled=false;
     uint32_t head=0,tail=0,mode=0,control=0,acthd=0,ipeir=0,ipehr=0,execlist=0;
