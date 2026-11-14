@@ -81,6 +81,12 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **Fix in progress (`work/tsc-clock`):** TSC-backed time. Re-baseline after it lands.
 - **Boot timing on the Dell (old loader):** firmware 4.27 s (FPDT), kernel 2.79 s; loader and menu need the new bootloader, a supervised step pending with Ian.
 
+**Pipelining A/B (gen 366, `dell-pipeline-20261114`, same boot):**
+- **8 buffers:** serial → pipelined took the displayed mean from 41.6 to 33.3 ms, but swaps fell from 86 to 59 and worker idle from 42% to 7%.
+- **Bug:** the next game window incarnation (2-buffer arm) got zero direct frames, and the renderer submitted ~13k frames continuously.
+- **State:** stays off (serial default) until fixed in `work/pipelining`. The Dell is back on the serial supervisor (job, same boot).
+- **Process slip:** this image was deployed although its QEMU check reported `passed:false` (both attempts were OVMF load stalls; the recheck passed). New `scripts/dell_deploy.py` refuses to deploy without a passing verdict; use it for all deploys.
+
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
 - Eliminate CPU copies in the pipeline.
