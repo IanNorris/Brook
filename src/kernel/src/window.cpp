@@ -460,9 +460,11 @@ void WmLaunchFeedbackPoll()
         entry = g_launches.entries[i];
         SpinLockRelease(&g_launchLock);
         if (entry.phase == LaunchPhase::Empty) continue;
+        // Scheduler lock only, outside the feedback spinlock. Absence of
+        // tagged processes ends the spinner as Exited, never as Failed.
+        const bool live = entry.phase != LaunchPhase::Waiting || SchedulerLaunchHasLiveProcesses(entry.token);
         SpinLockAcquire(&g_launchLock);
-        // Absence of tagged processes is not a failed single-instance handoff.
-        g_launches.Advance(entry.token, now, true);
+        g_launches.Advance(entry.token, now, live);
         SpinLockRelease(&g_launchLock);
     }
     bool busy = false;
@@ -2239,7 +2241,8 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             }
             if (r.contains(mouseX, mouseY)) {
                 WmStrCopy(launchTitle, e.busy() ? "Starting: " :
-                    e.phase == LaunchPhase::TimedOut ? "Still waiting: " : "Launch failed: ", sizeof(launchTitle));
+                    e.phase == LaunchPhase::TimedOut ? "Still waiting: " :
+                    e.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(launchTitle));
                 size_t n = strlen(launchTitle);
                 WmStrCopy(launchTitle + n, e.title, sizeof(launchTitle) - n);
                 hoverTitle = launchTitle;

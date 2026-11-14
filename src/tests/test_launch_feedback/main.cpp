@@ -45,6 +45,27 @@ int main(){
     CHECK(t.Take(61)==a);t.Complete(empty,true,62);t.Advance(empty,63,false);
     CHECK(t.entries[a].phase==LaunchPhase::Waiting); // no live tag is not a failed handoff
     CHECK(t.Window(0,1,"none")); // late single-instance window resolves it
+    {
+        // Every tagged process exits without a window: Exited after the grace,
+        // not a 300 s spinner; a live descendant resets the grace.
+        LaunchFeedbackTable x;int s=x.Begin(0,0,"Steam","brook-steam","brook-run");auto tok=x.entries[s].token;
+        CHECK(x.Take(1)==s);x.Complete(tok,true,2);
+        x.Advance(tok,3,false);CHECK(x.entries[s].phase==LaunchPhase::Waiting&&x.entries[s].busy());
+        x.Advance(tok,3+LaunchFeedbackTable::ExitGraceMs-1,true);   // descendant appeared: reset
+        x.Advance(tok,3+LaunchFeedbackTable::ExitGraceMs+1,false);CHECK(x.entries[s].phase==LaunchPhase::Waiting);
+        x.Advance(tok,6+2*LaunchFeedbackTable::ExitGraceMs,false);
+        CHECK(x.entries[s].phase==LaunchPhase::Exited&&!x.entries[s].busy()&&x.entries[s].present());
+        CHECK(x.Window(0,1,"brook-steam"));CHECK(x.Find(tok)<0); // late window still resolves it
+        s=x.Begin(10,0,"Gone","gone","gone");tok=x.entries[s].token;CHECK(x.Take(11)==s);x.Complete(tok,true,12);
+        x.Advance(tok,13,false);x.Advance(tok,13+LaunchFeedbackTable::ExitGraceMs,false);
+        CHECK(x.entries[s].phase==LaunchPhase::Exited);
+        auto at=x.entries[s].changed;x.Advance(tok,at+LaunchFeedbackTable::NoticeMs,false);CHECK(x.Find(tok)<0); // notice expires
+        // A failed dispatch stays Failed; an un-dispatched entry never becomes Exited.
+        s=x.Begin(20,0,"Bad","bad","bad");tok=x.entries[s].token;CHECK(x.Take(21)==s);
+        x.Advance(tok,21+2*LaunchFeedbackTable::ExitGraceMs,false);CHECK(x.entries[s].phase==LaunchPhase::Dispatching);
+        x.Complete(tok,false,22+2*LaunchFeedbackTable::ExitGraceMs);
+        x.Advance(tok,23+4*LaunchFeedbackTable::ExitGraceMs,false);CHECK(x.entries[s].phase==LaunchPhase::Failed);
+    }
     for(unsigned i=0;i<t.Capacity;++i){char id[]={'a',char('0'+i),0};CHECK(t.Begin(70,0,id,id,id)>=0);}
     CHECK(t.Begin(71,0,"Extra","extra","extra")<0);
     {
@@ -62,5 +83,5 @@ int main(){
         CHECK(exact.Begin(LaunchFeedbackTable::TimeoutMs+2,0,"Editor","org.editor","editor","exact-id","spec-a",&created,1)==slot&&!created);
         exact.Complete(token,true,LaunchFeedbackTable::TimeoutMs+3);CHECK(exact.Find(token)<0);
     }
-    std::puts("launch feedback: identity, coalescing, completion races, reuse, exhaustion, timeout PASS");
+    std::puts("launch feedback: identity, coalescing, completion races, reuse, exhaustion, timeout, exited-without-window PASS");
 }
