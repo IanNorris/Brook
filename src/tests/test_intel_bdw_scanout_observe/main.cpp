@@ -11,6 +11,7 @@
 #include "acpi.h"
 #include "vfs.h"
 #include <cassert>
+#include <csignal>
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 using namespace brook;
 static unsigned scenario=0,reads=0,ackReads=0,pageChecks=0,wakeRuns=0,prepares=0,renderPrepares=0,retains=0,renderRetains=0,ggttReads=0,heapFrees=0;static Vnode marker;
 static unsigned gemReleases=0,gemFailures=0,contendersRefused=0,workerPrepared=0,workerRetired=0;
+static bool prepareRefuse=false,reprepareFail=false,reprepareUnwindable=false;static unsigned refusalLogs=0;
 static uint32_t contextValues[2]{},reprepareValues[3]{};static bool contextActive[2]{},contextPoisoned[2]{};static unsigned reprepareCount=0;
 namespace brook {
 extern "C" [[noreturn]] void KernelPanic(const char* format,...){
@@ -66,10 +68,18 @@ bool BdwGpuContextFinish(BdwGpuContext* context,const uint32_t (*saved)[20*1024]
     if(stopped && saved)contextValues[n-1]=(*saved)[0];return stopped;
 }
 bool BdwReprepareRetainedSubmission(const uint32_t (*saved)[20*1024],uint32_t nonce){
+    if(reprepareFail)return false;
     if(scenario>=84 && saved && reprepareCount<3)reprepareValues[reprepareCount++]=(*saved)[0];
     return scenario>=82 && saved && (scenario>=84 || (*saved)[0]==0x1234) && nonce>0x42525000;
 }
 bool BdwPrepareRetainedSubmission(BdwExecSnapshot* s){++workerPrepared;return scenario>=82 && scenario!=85 && s;}
+BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* s,const char*& reason){
+    ++workerPrepared;
+    if(prepareRefuse){reason="address space needs more than 512 page tables";return BdwPrepareOutcome::Refused;}
+    if(scenario>=82 && scenario!=85 && s){reason=nullptr;return BdwPrepareOutcome::Ready;}
+    reason="prepare";return BdwPrepareOutcome::Uncertain;
+}
+bool BdwUnwindFailedReprepare(){return reprepareUnwindable;}
 bool BdwRetireRetainedSubmission(BdwExecSnapshot* s){++workerRetired;return scenario>=82 && s;}
 bool BdwReuseRetainedRenderScratch(BdwOwnedPage& p,BdwGgttReservation& r){p={0x600000,reinterpret_cast<uint8_t*>(0x600000)};r={65544,29,2};return scenario>=81;}
 bool BdwRetainedBcsScratch(BdwOwnedPage& p){if(scenario<48)return false;p={0x400000,reinterpret_cast<uint8_t*>(0x400000)};return true;}
@@ -119,6 +129,7 @@ extern "C" void* kmalloc(uint64_t size){return scenario==30?nullptr:std::malloc(
 extern "C" void kfree(void* p){++heapFrees;std::free(p);}
 extern "C" void SerialPuts(const char*){}
 extern "C" void SerialPrintf(const char*,...){}
+extern "C" void KPrintf(const char* format,...){if(!std::strncmp(format,"gpu-submit: job refused",23))++refusalLogs;}
 extern "C" Vnode* VfsOpen(const char* p,int){if(scenario>=86 && (!std::strcmp(p,"/etc/dell-gpu-render-experiment") || !std::strcmp(p,"/etc/dell-gpu-exec-store-test") || !std::strcmp(p,"/etc/dell-gpu-intel-user-test")))return &marker;if(scenario>=84 && !std::strcmp(p,"/etc/dell-gpu-rcs-context-test"))return &marker;if(scenario>=82 && (!std::strcmp(p,"/etc/dell-gpu-rcs-worker-test") || !std::strcmp(p,"/etc/dell-gpu-rcs-external-tables")))return &marker;if(scenario==81 && (!std::strcmp(p,"/etc/dell-gpu-rcs-repeat-test") || !std::strcmp(p,"/etc/dell-gpu-rcs-external-tables")))return &marker;if(scenario==76 && !std::strcmp(p,"/etc/dell-gpu-rcs-reset-test"))return &marker;if(scenario>=76 && (!std::strcmp(p,"/etc/dell-gpu-rcs-run-test") || !std::strcmp(p,"/etc/dell-gpu-rcs-gem-probe") || !std::strcmp(p,"/etc/dell-gpu-pat-probe") || (scenario!=80 && !std::strcmp(p,"/etc/dell-gpu-rcs-release-after-reset"))))return &marker;if(scenario>=74 && !std::strcmp(p,"/etc/dell-gpu-rcs-clear-after-reset"))return &marker;return ((scenario>=4 && scenario<=13 && !std::strcmp(p,"/etc/dell-gpu-gtt-probe")) || (scenario>=14 && scenario<=18 && !std::strcmp(p,"/etc/dell-gpu-forcewake-ack")) || (scenario>=19 && scenario<=22 && !std::strcmp(p,"/etc/dell-gpu-forcewake-run")) || (scenario>=23 && scenario<=26 && !std::strcmp(p,"/etc/dell-gpu-engines-run")) || (scenario>=27 && scenario<=28 && !std::strcmp(p,"/etc/dell-gpu-prepare-only")) || (scenario>=29 && scenario<=31 && !std::strcmp(p,"/etc/dell-gpu-render-prepare-only")) || (scenario>=32 && scenario<=36 && !std::strcmp(p,"/etc/dell-gpu-retain-bcs")) || (((scenario>=40 && scenario<=57) || (scenario>=60 && scenario<=71)) && !std::strcmp(p,"/etc/dell-gpu-pat-probe")) || ((scenario==58 || scenario==59) && !std::strcmp(p,"/etc/dell-gpu-retain-rcs")) || ((scenario==60 || scenario==62 || scenario==63) && !std::strcmp(p,"/etc/dell-gpu-rcs-reset-test")) || ((scenario==64 || scenario==66) && !std::strcmp(p,"/etc/dell-gpu-rcs-gt-init")) || ((scenario==67 || scenario==69 || scenario==70 || scenario==71) && !std::strcmp(p,"/etc/dell-gpu-rcs-run-test")) || (scenario==71 && !std::strcmp(p,"/etc/dell-gpu-rcs-rebase-test")) || (scenario==72 && !std::strcmp(p,"/etc/dell-gpu-intel-user-test")) || (scenario==44 && !std::strcmp(p,"/etc/dell-gpu-tlb-test")) || (scenario==46 && !std::strcmp(p,"/etc/dell-gpu-bcs-reset-test")) || (scenario>=48 && scenario!=52 && !std::strcmp(p,"/etc/dell-gpu-scratch-takeover")) || (scenario>=48 && !std::strcmp(p,"/etc/dell-gpu-crossboot-safe")) || (scenario==48 && !std::strcmp(p,"/etc/dell-gpu-bcs-init-test")) || (scenario==53 && !std::strcmp(p,"/etc/dell-gpu-pat-transition-test")) || ((scenario==55 || scenario==57) && !std::strcmp(p,"/etc/dell-gpu-bcs-copy-test")))?&marker:nullptr;}
 void VfsRelease(Vnode*){}
 int VfsStat(Vnode*,VnodeStat* s){*s={};s->size=2;return 0;}
@@ -358,6 +369,30 @@ int main(){
         (void)BdwExecuteRetainedContextWorkerSnapshot(nullptr,a);
         _exit(0);}
         int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==91);}
+    // gen 386: a job the kernel cannot map is refused cleanly (fence error,
+    // context returned unchanged, no retire, no panic) and the next job runs.
+    {pid_t child=fork();assert(child>=0);if(!child){scenario=84;BdwGopObserveConfigure(&boot);wakeRuns=0;
+        BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};assert(BdwTestRenderRun(out,run));
+        auto* a=reinterpret_cast<BdwExecSnapshot*>(uintptr_t{2});
+        prepareRefuse=true;const unsigned retiredBefore=workerRetired;
+        auto refused=BdwExecuteRetainedContextWorkerSnapshot(nullptr,a);
+        assert(!refused.success && refused.safelyStopped && refused.skipped && workerRetired==retiredBefore);
+        assert(!contextActive[0] && !contextPoisoned[0] && refusalLogs==1);
+        prepareRefuse=false;assert(BdwExecuteRetainedContextWorkerSnapshot(nullptr,a).success);
+        // No pages for the private render image: refused when unwindable.
+        reprepareFail=true;reprepareUnwindable=true;
+        auto noPages=BdwExecuteRetainedContextWorkerSnapshot(nullptr,a);
+        assert(!noPages.success && noPages.safelyStopped && noPages.skipped && !contextActive[0] && !contextPoisoned[0] && refusalLogs==2);
+        reprepareFail=false;assert(BdwExecuteRetainedContextWorkerSnapshot(nullptr,a).success);
+        _exit(0);}
+        int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);}
+    // A reprepare failure that cannot be unwound still panics.
+    {pid_t child=fork();assert(child>=0);if(!child){scenario=84;BdwGopObserveConfigure(&boot);wakeRuns=0;
+        BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};assert(BdwTestRenderRun(out,run));
+        reprepareFail=true;reprepareUnwindable=false;
+        (void)BdwExecuteRetainedContextWorkerSnapshot(nullptr,reinterpret_cast<BdwExecSnapshot*>(uintptr_t{2}));
+        _exit(0);}
+        int status=0;assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGABRT);}
     {pid_t child=fork();assert(child>=0);if(!child){scenario=86;BdwGopObserveConfigure(&boot);wakeRuns=0;
         assert(!BdwRenderExperimentEnabled());BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};
         assert(BdwTestRenderRun(out,run) && run.gemReleased && BdwRenderExperimentEnabled());_exit(0);}

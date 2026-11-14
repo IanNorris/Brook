@@ -34,7 +34,7 @@ inline bool BdwExecAddressSpaceTableCount(const BdwExecMemoryObject* objects,uin
             needed+=lastPrefix-firstPrefix+1;
             if(prior && ((priorEnd-1)>>shift)==firstPrefix)--needed;
         }
-        if(needed>128)return false;
+        if(needed>BdwPpgttMaxTables)return false;
         priorEnd=o.address+bytes;prior=true;
     }
     out=static_cast<uint32_t>(needed);return true;
@@ -45,7 +45,7 @@ inline bool BdwBuildExecAddressSpace(const BdwPpgttPage (&scratch)[4],
                                      BdwPpgttMapping* workspace,uint32_t workspaceCount) {
     constexpr uint64_t limit=uint64_t{1}<<48,dmaLimit=uint64_t{1}<<39;
     if(!objects || !objectCount || objectCount>65536 || !workspace || !workspaceCount || workspaceCount>65536 ||
-       !tables || !tableCount || tableCount>128)return false;
+       !tables || !tableCount || tableCount>BdwPpgttMaxTables)return false;
     auto overlaps=[](uintptr_t a,uint64_t bytes,uintptr_t b,uint64_t other){
         return bytes>~uintptr_t{0}-a || other>~uintptr_t{0}-b || (a<b+other && b<a+bytes);
     };

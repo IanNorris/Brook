@@ -7,6 +7,10 @@ namespace brook {
 // publishes the pages, and retains them until all GPU users have retired.
 // This function never touches hardware or makes the image GPU-visible.
 struct BdwPpgttPage { uint64_t dma; uint8_t* cpu; };
+// Largest private table set for one image (root, intermediate and leaf
+// tables). 512 tables map at least 1 GiB densely (65,536 pages need about
+// 130); sparser or larger sets are refused, never truncated.
+constexpr uint32_t BdwPpgttMaxTables=512;
 enum class BdwPpgttCache : uint8_t { WriteBack, Uncached };
 struct BdwPpgttMapping {
     uint64_t address, dma;
@@ -55,7 +59,7 @@ inline bool BdwBuildPpgttImage(const BdwPpgttPage (&scratch)[4],
                                const BdwPpgttMapping* maps,uint32_t mapCount,bool sorted=false,
                                const BdwPpgttLeaf* leaves=nullptr,uint32_t leafCount=0) {
     constexpr uint64_t gpuLimit=uint64_t{1}<<48, dmaLimit=uint64_t{1}<<39;
-    constexpr uint32_t maxTables=128,maxUnsortedMappings=1024,maxSortedMappings=65536;
+    constexpr uint32_t maxTables=BdwPpgttMaxTables,maxUnsortedMappings=1024,maxSortedMappings=65536;
     if(!tables || !tableCount || tableCount>maxTables || !maps || !mapCount ||
        mapCount>(sorted?maxSortedMappings:maxUnsortedMappings) ||
        (leafCount && !leaves) || leafCount>BdwPpgttMaxLeaves)return false;

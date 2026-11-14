@@ -60,7 +60,33 @@ static void DifferentialTest() {
     assert(built>100);
     for(auto* p:owned)std::free(p);
 }
+// The gen 386 Chromium job: 68 objects, 65,451 pages (~256 MiB). It needs
+// more than the old 128-table limit (so preparation failed and the worker
+// panicked) and fits the 512-table limit; the builder maps it completely.
+static void LargeBufferSetTest() {
+    constexpr uint32_t objects=68,total=65451;
+    static BdwExecMemoryObject set[objects];static std::vector<uint64_t> dmas[objects];
+    uint64_t address=0x100000000ull;uint32_t left=total;
+    for(uint32_t i=0;i<objects;++i){
+        // A few large textures and many small buffers, 64 KiB aligned.
+        const uint32_t n=i==objects-1?left:(i%9==0?6000:(left>objects*64?((total-6000*8)/60):16));
+        dmas[i].resize(n);for(uint32_t j=0;j<n;++j)dmas[i][j]=0x200000000ull+(uint64_t(i)<<26)+uint64_t(j)*4096;
+        set[i]={address,dmas[i].data(),n,true,false};left-=n;
+        address+=(uint64_t(n)*4096+0xffff)&~uint64_t{0xffff};
+    }
+    assert(left==0);
+    uint32_t count=0;assert(BdwExecAddressSpaceTableCount(set,objects,count));
+    assert(count>128 && count<=BdwPpgttMaxTables);
+    std::vector<uint8_t*> owned;auto page=[&]{void* p=nullptr;assert(!posix_memalign(&p,4096,4096));owned.push_back(static_cast<uint8_t*>(p));return static_cast<uint8_t*>(p);};
+    BdwPpgttPage s4[4];for(unsigned i=0;i<4;++i)s4[i]={0x100000000ull+4096ull*i,page()};
+    std::vector<BdwPpgttPage> tables(count);for(uint32_t i=0;i<count;++i)tables[i]={0x180000000ull+4096ull*i,page()};
+    std::vector<BdwPpgttMapping> workspace(total);
+    assert(BdwBuildExecAddressSpace(s4,tables.data(),count,set,objects,workspace.data(),total));
+    assert(!BdwBuildExecAddressSpace(s4,tables.data(),count-1,set,objects,workspace.data(),total));
+    for(auto* p:owned)std::free(p);
+}
 int main() {
+    LargeBufferSetTest();
     DifferentialTest();
     BdwPpgttPage scratch[4],tables[16];
     for(unsigned i=0;i<4;++i)scratch[i]={0x100000+4096ull*i,memory[i]};
@@ -131,9 +157,11 @@ int main() {
      assert(!BdwExecAddressSpaceTableCount(objects,5,count) && count==99);
      objects[1].address=maps[1].address;objects[4].address=(1ull<<48)-4096;objects[4].pageCount=2;
      assert(!BdwExecAddressSpaceTableCount(objects,5,count) && count==99);
-     uint64_t sparseDma[43]{};BdwExecMemoryObject sparse[43]{};
-     for(unsigned i=0;i<43;++i){sparseDma[i]=0x800000+4096ull*i;sparse[i]={uint64_t(i)<<39,&sparseDma[i],1,false};}
-     assert(!BdwExecAddressSpaceTableCount(sparse,43,count) && count==99);
-     assert(BdwExecAddressSpaceTableCount(sparse,42,count) && count==127);
+     // One page per 512 GiB region costs 3 tables each plus the root: 170
+     // fit the 512-table limit (511), 171 do not (514).
+     static uint64_t sparseDma[171]{};static BdwExecMemoryObject sparse[171]{};
+     for(unsigned i=0;i<171;++i){sparseDma[i]=0x800000+4096ull*i;sparse[i]={uint64_t(i)<<39,&sparseDma[i],1,false};}
+     assert(!BdwExecAddressSpaceTableCount(sparse,171,count) && count==99);
+     assert(BdwExecAddressSpaceTableCount(sparse,170,count) && count==511);
     }
 }

@@ -64,7 +64,7 @@ struct PrivatePages {
         if(!PanicRecoveryResetArmed())return BdwDmaResetUnarmed;
         // Each VT-d read validates aliases and memory types on the CPU that
         // executes it under the page-table lock with interrupts disabled.
-        if(!prior.sampled || !prior.topology || !prior.inventory || !prior.bootMap || !pages || !count || count>128)return BdwDmaMissingVtdEvidence;
+        if(!prior.sampled || !prior.topology || !prior.inventory || !prior.bootMap || !pages || !count || count>BdwPpgttMaxTables+4)return BdwDmaMissingVtdEvidence;
         auto acceptable=[](const DellGpuVtdStatus& s) {
             constexpr uint64_t protectedRegions=(1ull<<5)|(1ull<<6);
             return !(s.globalStatus&(1u<<31)) &&
@@ -1205,13 +1205,32 @@ void BdwPpgttCacheStatsRead(BdwPpgttCacheStats& out,uint32_t& cachedSets){cached
 // only by that build, so reuse needs no clearing). Grow-only.
 static BdwPpgttMapping* reusableWorkspace=nullptr;
 static uint32_t reusableWorkspacePages=0;
-bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
-    if(!snapshot || retainedRender.State()!=BdwOneShotState::Prepared)return false;
+// Undo a preparation that never reached the device, leaving the render
+// image and tables Released exactly as after a retired job, so the next job's
+// BdwReprepareRetainedSubmission recycles them normally.
+static bool UnwindRetainedPreparation(){
+    if(retainedRender.State()!=BdwOneShotState::Prepared)return false;
+    (void)retainedRender.DetachSnapshot(retainedRenderAllocator);
+    return gemProbeTables.AbandonUnsubmitted(retainedRenderAllocator) &&
+        retainedRender.ReleasePrepared(retainedRenderAllocator);
+}
+BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,const char*& reason) {
+    reason="render image not prepared";
+    if(!snapshot || retainedRender.State()!=BdwOneShotState::Prepared)return BdwPrepareOutcome::Uncertain;
+    // Deterministic, size-driven limits: refuse the job and keep the device.
+    auto refuse=[&](const char* why){reason=why;
+        return UnwindRetainedPreparation()?BdwPrepareOutcome::Refused:BdwPrepareOutcome::Uncertain;};
     const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
-    if(!pages || pages>65536)return false;
+    if(!pages || pages>65536)return refuse("more than 65536 pages");
+    uint32_t tableCount=0;
+    if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
+        return refuse("address space needs more than 512 page tables");
     uint64_t mark=BdwOverheadTicks();
     auto step=[&mark](BdwOverheadStep st){const uint64_t now=BdwOverheadTicks();BdwOverheadAdd(st,now>mark?now-mark:0);mark=now;};
-    if(!gemProbeTables.Prepare(retainedRenderAllocator,snapshot))return false;
+    if(!gemProbeTables.Prepare(retainedRenderAllocator,snapshot)){
+        if(gemProbeTables.Quarantined()){reason="table page allocation returned an unsafe page";return BdwPrepareOutcome::Uncertain;}
+        return refuse("page table allocation failed");
+    }
     step(BdwOhTables);
     // A reused table set needs no expansion workspace: the snapshot is
     // compared directly against the retained mapping list.
@@ -1228,7 +1247,7 @@ bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
             }else BdwOverheadCount(BdwOverhead().counters.workspaceReuses);
             workspace=reusableWorkspace;shared=true;
         }else workspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(pages)*sizeof(BdwPpgttMapping)));
-        if(!workspace){(void)gemProbeTables.ReleaseUnsubmitted(retainedRenderAllocator);return false;}
+        if(!workspace)return refuse("mapping workspace allocation failed");
     }
     step(BdwOhWorkspace);
     const uint64_t buildStart=TscClockReadNs();
@@ -1246,18 +1265,39 @@ bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
         reusableWorkspace=nullptr;reusableWorkspacePages=0;
     }
     uint32_t status=BdwDmaNotPrepared;
-    if(!attached)return false;
-    if(!gemProbeTables.InspectDma(retainedRenderAllocator,status) || status!=BdwDmaSnapshotOk)return false;
+    // The builder rejects only from its inputs (sizes, collisions, layout);
+    // nothing is published yet, so this is a clean refusal too.
+    if(!attached)return refuse("page table build rejected the buffer set");
+    // From here on a failure concerns DMA/ownership evidence or published
+    // device-visible state: keep treating it as uncertain.
+    reason="page table DMA inspection";
+    if(!gemProbeTables.InspectDma(retainedRenderAllocator,status) || status!=BdwDmaSnapshotOk)return BdwPrepareOutcome::Uncertain;
     step(BdwOhInspectTables);
-    if(!gemProbeTables.Publish(retainedRenderAllocator) || !retainedRender.PublishPrepared(retainedRenderAllocator))return false;
+    reason="publish";
+    if(!gemProbeTables.Publish(retainedRenderAllocator) || !retainedRender.PublishPrepared(retainedRenderAllocator))return BdwPrepareOutcome::Uncertain;
     step(BdwOhPublish);
-    if(!BdwExecSnapshotSyncForDevice(snapshot))return false;
+    reason="device cache sync";
+    if(!BdwExecSnapshotSyncForDevice(snapshot))return BdwPrepareOutcome::Uncertain;
     step(BdwOhSyncDevice);
-    if(BdwExecSnapshotInspectDma(snapshot)!=BdwDmaSnapshotOk)return false;
+    reason="buffer DMA inspection";
+    if(BdwExecSnapshotInspectDma(snapshot)!=BdwDmaSnapshotOk)return BdwPrepareOutcome::Uncertain;
     step(BdwOhSnapshotDma);
+    reason="arm";
     const bool armed=retainedRender.ArmExternalSnapshot(retainedRenderAllocator,retainedRenderAllocator);
     step(BdwOhArm);
-    return armed;
+    if(!armed)return BdwPrepareOutcome::Uncertain;
+    reason=nullptr;return BdwPrepareOutcome::Ready;
+}
+// After a failed BdwReprepareRetainedSubmission: only the clean allocation
+// failure (the image freed its pages and is Released, the tables were just
+// recycled to Fresh) can be undone, by returning the tables to Released so the
+// next job reprepares normally. Any other failure leaves state for a panic.
+bool BdwUnwindFailedReprepare(){
+    return retainedRender.State()==BdwOneShotState::Released && gemProbeTables.Fresh() &&
+        gemProbeTables.AbandonUnsubmitted(retainedRenderAllocator);
+}
+bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
+    const char* reason=nullptr;return BdwPrepareRetainedSubmissionChecked(snapshot,reason)==BdwPrepareOutcome::Ready;
 }
 // Detach only this stopped snapshot; the caller retains it until queue
 // completion has synchronized the buffers and dropped their use counts.
