@@ -212,6 +212,12 @@ struct BdwBcsRunResult;
 // Never call while relying on PMM locks; retained pages stay pinned even on
 // success, because a context-complete result alone does not reclaim them.
 bool BdwRunRetainedBcs(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result);
+// VCS diagnostics serviced on the CPU0 application worker between jobs
+// (BROOK_BDW_VIDEO_ENGINE builds only).
+bool BdwVideoWorkerPending();
+bool BdwVideoWorkerService();
+bool BdwVideoWakeWorker();
+void BdwVideoWorkerCounts(uint64_t& serviced,uint64_t& leaseBusy,uint64_t& timeouts);
 // VCS0 self-test image (VA-API phase 1b; BROOK_BDW_VIDEO_ENGINE builds only).
 bool BdwPrepareVcsSelftest(uint32_t nonce,uint32_t data,BdwGgttReservation& reservation,BdwOwnedPage& scratch);
 bool BdwRunPreparedVcsSelftest(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result);

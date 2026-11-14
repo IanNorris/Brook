@@ -170,3 +170,21 @@ Both need **relocation-free submission** from Brook's point of view: Brook's exe
   6. if it still sags: (a), (b), (d), each followed by yquake.
 
   Try (e) first, since it follows directly from the snapshot data.
+
+### Gen 392: clock sag root cause, and the renderer stall (p1b5)
+
+- **Root cause of the sag:** the GEN6_GRDOM_MEDIA reset returns VCS `RING_MAX_IDLE` (`0x12054`) from firmware's **10** to the hardware default **64**. The GT then never enters RC6: 99% before, 0% after. The clock rose to 400 MHz under load and power budgeting changed. `pm engine-restore` (one write) brought back RC6 99% and the normal clock. stop-start, idle-ring and rps-rewrite had no effect.
+  - **Fix:** after **every** acknowledged VCS reset (the standalone reset, and both resets around the self-test), the firmware values of the VCS engine registers are written back within the same critical section, with readback. The values come from the boot's first snapshot: MAX_IDLE, IMR and HWSTAM (plain); PSMI_CTL and INSTPM (masked).
+  - After a reset or self-test, the gpu-video thread samples RC6 residency over ~300 ms and reports `rc6_checked`, `rc6_pct` and `rc6_resumed` (RC6 entered at all), plus boot totals `engine_restores` and `engine_restore_failures`.
+  - `pm engine-restore` remains as a debug command.
+- **Renderer stall after `gpu video reset` (gen 392):** the renderer looped on `DESKTOP_ASYNC_RETRY errno=16 stage=quad_reserve` (`reserve: no free handoff slot, output still reserved, or zero-copy image busy`, count 4096). Compositor jobs dropped to 0 and zero-copy showed "software takeover".
+  - **Mechanism, from the code:** render-job preparation (`DiagnosticLease lease; if(!lease.held) return {false,true};`) and every present (`BdwExecuteBcsScanout`, which takes the lease before the zero-copy hook) both require the shared diagnostic lease. p1b2–p1b4 held that lease on the gpu-video thread across bounded retries and sleeps: up to 0.5 s of retries for reset and self-test, and over 1 s for `pm sample`. Every present and render prepare in that window was refused.
+    - With zero-copy armed, a present refused before the zero-copy hook leaves the ring image's accounting incomplete, and the renderer then cannot reserve a handoff output.
+    - On gen 391 the reset held the lease only briefly. I have not reproduced the exact stranding sequence on the host; the code path is the evidence.
+  - **Fix:** VCS diagnostics no longer take the diagnostic lease on the gpu-video thread at all. Every device step (reset, self-test prepare, run and release, PM ops and samples) is queued to the CPU0 application worker (`BdwVideoStepSlot`). The worker services it in `ServiceScanout`, between RCS jobs and presents, taking the lease only for the step itself. A step can therefore never overlap a render prepare or a present.
+    - If the lease is busy, the step stays queued, untouched.
+    - A step not started within 2 s is withdrawn; nothing ran.
+    - Retries and sleeps happen on the gpu-video thread with no lease held.
+    - Status reports `worker_steps` (serviced, lease_busy, timeouts).
+  - **Regression test:** `TestStepSlot` checks that the caller side never holds the lease, that a busy lease requeues without running, that a started step cannot be withdrawn, and that a timed-out step never runs.
+  - **Separate issue for the zero-copy owner:** any present refused at the diagnostic-lease check (`Unavailable`) while zero-copy is armed can strand a ring image. Other diagnostics (`gpu flip probe`, store probes and so on) can still trigger it. It should be fixed in the present path, by not refusing zero-copy presents on the lease, or by unwinding the image reservation.

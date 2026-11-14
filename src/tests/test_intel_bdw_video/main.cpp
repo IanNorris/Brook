@@ -170,7 +170,35 @@ static void TestPmRestore(){
     assert(BdwGtPmRegRestorable(0xa090) && !BdwGtPmRegRestorable(0xa01c) && !BdwGtPmRegRestorable(0x1209c));
 }
 
+// Regression for the gen 392 stall: the caller side of a VCS step never holds
+// the diagnostic lease; only the worker takes it, for the step itself, and a
+// busy lease leaves the step queued and untouched.
+static void TestStepSlot(){
+    uint32_t diagnosticOwner=0;unsigned deviceSteps=0;
+    BdwVideoStepSlot slot;
+    auto workerService=[&](){
+        if(!slot.claim())return false;
+        uint32_t e=0;
+        if(!__atomic_compare_exchange_n(&diagnosticOwner,&e,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)){slot.requeue();return false;}
+        ++deviceSteps;                                  // the device step, under the lease
+        __atomic_store_n(&diagnosticOwner,0,__ATOMIC_RELEASE);
+        slot.complete();return true;};
+    assert(!slot.claim() && !slot.pending());           // nothing queued
+    assert(slot.begin() && !slot.begin());              // one request at a time
+    slot.publish();assert(slot.pending() && diagnosticOwner==0);
+    diagnosticOwner=1;                                   // a present/render prepare holds the lease
+    assert(!workerService() && slot.pending() && !deviceSteps); // requeued, untouched
+    diagnosticOwner=0;
+    assert(workerService() && deviceSteps==1 && slot.state()==BdwVideoStepSlot::Done && diagnosticOwner==0);
+    assert(!slot.withdraw());                            // a started step cannot be withdrawn
+    slot.finish();assert(slot.state()==BdwVideoStepSlot::Idle);
+    // Timeout before the worker started: withdrawn, never runs.
+    assert(slot.begin());slot.publish();assert(slot.withdraw());
+    assert(!workerService() && deviceSteps==1 && slot.state()==BdwVideoStepSlot::Idle);
+}
+
 int main(){
+    TestStepSlot();
     TestPmRestore();
     TestVcsContext();
     TestVcsSubmission();

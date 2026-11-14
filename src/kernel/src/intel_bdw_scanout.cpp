@@ -418,6 +418,73 @@ bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
     if(!videoGate.setEnabled(on)){refusal=videoGate.lastRefusal();return false;}
     KPrintf("gpu-video: gate %s\n",on?"on":"off");return true;
 }
+// (forward) release of the prepared self-test image through the worker
+namespace {[[maybe_unused]] bool VideoWorkerRelease();}
+// One device step of a VCS diagnostic, executed by the CPU0 application
+// worker between RCS jobs and presents (ServiceScanout). The orchestration
+// (gate, preconditions, retries, sleeps) stays on the gpu-video thread and
+// never holds the diagnostic lease: gen 392 showed that holding it across
+// retries and sleeps starved render-job preparation and presents and stranded
+// a zero-copy handoff for the rest of the boot.
+namespace {
+enum class VwKind : uint8_t {Reset,Prepare,Run,Release,Pm};
+struct VideoWorkerStep {
+    BdwVideoStepSlot slot{};VwKind kind=VwKind::Reset;uint8_t pmOp=0;
+    uint32_t nonce=0,data=0;BdwGgttReservation reservation{};BdwOwnedPage scratch{};
+    BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult reset{};BdwBcsRunResult run{};bool ok=false;
+} videoStep [[maybe_unused]];
+[[maybe_unused]] uint64_t videoStepServiced=0,videoStepLeaseBusy=0,videoStepTimeouts=0;
+}
+bool BdwVideoWorkerPending(){return videoStep.slot.pending();}
+void BdwVideoWorkerCounts(uint64_t& serviced,uint64_t& leaseBusy,uint64_t& timeouts){
+    serviced=videoStepServiced;leaseBusy=videoStepLeaseBusy;timeouts=videoStepTimeouts;}
+bool BdwVideoWorkerService(){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    if(!videoStep.slot.claim())return false;
+    DiagnosticLease lease;
+    if(!lease.held){++videoStepLeaseBusy;videoStep.slot.requeue();return false;}
+    const auto& tsc=NativeTscObserveRead();
+    auto& v=videoStep;v.ok=false;v.fw={};
+    if(SmpCurrentCpuIndex()==0 && tsc.capable && tsc.measured && tsc.consistent && tsc.khz){
+        switch(v.kind){
+        case VwKind::Reset:VmmDellVcsReset(tsc.khz,v.fw,v.reset);v.ok=v.reset.complete;break;
+        case VwKind::Prepare:v.ok=BdwPrepareVcsSelftest(v.nonce,v.data,v.reservation,v.scratch);break;
+        case VwKind::Run:VmmDellVcsSelftest(tsc.khz,v.reservation.first,v.reservation.token,v.scratch.dma,v.fw,v.run);v.ok=true;break;
+        case VwKind::Release:v.ok=BdwReleasePreparedVcsSelftest();break;
+        case VwKind::Pm:VmmDellVcsPmOp(tsc.khz,v.pmOp,v.fw,v.reset);v.ok=v.reset.attempted;break;
+        }
+    }
+    ++videoStepServiced;
+    videoStep.slot.complete();
+    BdwGpuEventSignal(BdwGpuEvent::Retire);
+    return true;
+#else
+    return false;
+#endif
+}
+namespace {
+// Queue one step and wait for the worker (bounded). Returns false if the step
+// never started (timeout while queued: it is withdrawn, nothing touched).
+[[maybe_unused]] bool VideoWorkerCall(VwKind kind,uint8_t pmOp=0){
+    if(!videoStep.slot.begin())return false;
+    videoStep.kind=kind;videoStep.pmOp=pmOp;videoStep.fw={};videoStep.ok=false;
+    if(kind==VwKind::Reset || kind==VwKind::Pm)videoStep.reset={};
+    if(kind==VwKind::Run)videoStep.run={};
+    videoStep.slot.publish();
+    if(!BdwVideoWakeWorker() && videoStep.slot.withdraw())return false;
+    const uint64_t start=ApicTickCount();
+    for(;;){
+        const uint32_t st=videoStep.slot.state();
+        if(st==BdwVideoStepSlot::Done)break;
+        if(st==BdwVideoStepSlot::Queued && ApicTickCount()-start>=2000 && videoStep.slot.withdraw()){++videoStepTimeouts;return false;}
+        SchedulerSleepMs(1);(void)BdwVideoWakeWorker();
+    }
+    return true; // caller reads videoStep, then calls VideoWorkerFinish()
+}
+[[maybe_unused]] void VideoWorkerFinish(){videoStep.slot.finish();}
+// RC6 entered at all over ~300 ms after a reset or self-test (worker-serviced samples).
+[[maybe_unused]] void VideoRc6Check();
+}
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal){
     refusal=BdwVideoRefusal::None;
     if(!BdwVideoBuilt()){refusal=BdwVideoRefusal::NotImplemented;return false;}
@@ -447,7 +514,6 @@ bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,B
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
     VideoLease video;if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
     refusal=videoGate.mayReset();if(refusal!=BdwVideoRefusal::None)return false;
-    DiagnosticLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
     if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
        !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
         refusal=BdwVideoRefusal::ResetRefused;return false;}
@@ -460,8 +526,10 @@ bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,B
         const auto& d=entry.device;if(d.bus!=0 || d.dev!=2 || d.fn!=0)continue;
         if(!LiveGpuMatches(entry) || !PowerD0(d))break;
         unsigned attempts=0;
-        for(;;){++attempts;VmmDellVcsReset(tsc.khz,out,reset);
-            if(reset.attempted || !VideoTransient(out) || attempts>=250)break;
+        for(;;){++attempts;bool ran=false;
+            if(VideoWorkerCall(VwKind::Reset)){out=videoStep.fw;reset=videoStep.reset;ran=true;VideoWorkerFinish();}
+            if(ran && (reset.attempted || !VideoTransient(out)))break;
+            if(attempts>=250)break;
             SchedulerSleepMs(2);}
         videoGate.addRetries(attempts-1);
         videoGate.setDetail(reset.complete?"none":!out.sequence.workAttempted?VideoAdapterDetail(out):"reset-not-started");
@@ -476,6 +544,7 @@ bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,B
         }
         KPrintf("gpu-video: VCS reset %s\n",reset.complete?"acknowledged":"refused before any write");
         if(!reset.complete){refusal=BdwVideoRefusal::ResetRefused;return false;}
+        VideoRc6Check();
         return out.sequence.workComplete && out.clearDelivered && out.sequence.released && LiveGpuMatches(entry) && PowerD0(d);
     }
     refusal=BdwVideoRefusal::ResetRefused;return false;
@@ -489,9 +558,6 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     RetryLease video(&videoOwner,200);
     if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
     refusal=videoGate.maySelftest();if(refusal!=BdwVideoRefusal::None){videoGate.setDetail("gate");return false;}
-    RetryLease lease(&diagnosticOwner,500);
-    videoGate.addRetries(lease.tries);
-    if(!lease.held){refusal=BdwVideoRefusal::Busy;videoGate.setDetail("diagnostic-lease-busy");return false;}
     auto refuseEarly=[&](BdwVideoRefusal r,const char* detail){refusal=r;videoGate.setDetail(detail);videoGate.selftestDone(false,false,r);return false;};
     if(!PanicRecoveryResetArmed())return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-recovery-unarmed");
     if(SmpCurrentCpuIndex()!=0)return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-not-cpu0");
@@ -518,13 +584,25 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     BdwGgttReservation reservation{};BdwOwnedPage scratch{};
     // Deterministic preparation failures (allocation, reservation window, DMA
     // snapshot) touch no device state: refuse without quarantine.
-    if(!BdwPrepareVcsSelftest(nonce,data,reservation,scratch))return refuseEarly(BdwVideoRefusal::PrepareFailed,"prepare");
+    {
+        bool prepared=false;
+        for(unsigned i=0;i<50 && !prepared;++i){
+            videoStep.nonce=nonce;videoStep.data=data;
+            if(!VideoWorkerCall(VwKind::Prepare)){SchedulerSleepMs(2);continue;}
+            prepared=true;const bool ok=videoStep.ok;reservation=videoStep.reservation;scratch=videoStep.scratch;VideoWorkerFinish();
+            if(!ok)return refuseEarly(BdwVideoRefusal::PrepareFailed,"prepare");
+        }
+        if(!prepared)return refuseEarly(BdwVideoRefusal::Busy,"worker-not-servicing");
+    }
     // Retry refusals that touched nothing (claim busy, engines not idle, or a
     // callback precondition), up to ~0.5 s. The image stays prepared.
     unsigned attempts=0;
     for(;;){
         ++attempts;
-        VmmDellVcsSelftest(tsc.khz,reservation.first,reservation.token,scratch.dma,out,run);
+        videoStep.reservation=reservation;videoStep.scratch=scratch;
+        if(!VideoWorkerCall(VwKind::Run)){out={};run={};
+            if(attempts>=250)break;SchedulerSleepMs(2);continue;}
+        out=videoStep.fw;run=videoStep.run;VideoWorkerFinish();
         const bool untouched=!run.resetBeforeAttempted || (run.refusalStep==5 && !run.resetUncertain);
         const bool transient=VideoTransient(out) ||
             (out.sequence.workAttempted && untouched && run.refusalStep && run.refusalStep!=5);
@@ -553,7 +631,7 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
         run.attempted || run.ggttWriteAttempts || run.portWriteAttempts;
     if(!touched){
         // Nothing reached VCS: give the prepared image back and report why.
-        const bool released=BdwReleasePreparedVcsSelftest();
+        const bool released=VideoWorkerRelease();
         const char* detail=!out.sequence.workAttempted?VideoAdapterDetail(out):VideoStepDetail(run.refusalStep);
         refusal=run.refusalStep==5?BdwVideoRefusal::ResetRefused:BdwVideoRefusal::Busy;
         videoGate.setDetail(detail);
@@ -566,7 +644,7 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     // The engine was reset and the PAT restored. If the lease could not be
     // unbound, or the pages not released, they stay retained for the boot
     // (never reused) and VCS is quarantined; RCS/BCS are unaffected.
-    const bool released=run.scanoutRetired && BdwReleasePreparedVcsSelftest();
+    const bool released=run.scanoutRetired && VideoWorkerRelease();
     const bool ok=released && run.copyComplete && run.contextComplete && out.sequence.workComplete && readback==data;
     BdwVideoRefusal reason=BdwVideoRefusal::None;const char* detail="none";
     if(!ok){
@@ -578,6 +656,7 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     }
     videoGate.setDetail(detail);
     videoGate.selftestDone(ok,true,reason);
+    if(ok)VideoRc6Check();
     refusal=reason;
     KPrintf("gpu-video: VCS self-test %s (%s) nonce=%x data=%x readback=%x ctx=%u ggtt=%u elsp=%u attempts=%u\n",ok?"ok":BdwVideoRefusalName(reason),
         detail,nonce,data,readback,unsigned(run.contextComplete),run.ggttWriteAttempts,run.portWriteAttempts,attempts);
@@ -600,8 +679,6 @@ bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResul
     // sampling only needs the gate.
     refusal=pmOp==BdwVcsPmOp::Sample?videoGate.mayProbe():videoGate.mayReset();
     if(refusal!=BdwVideoRefusal::None){videoGate.setDetail("gate");return false;}
-    RetryLease lease(&diagnosticOwner,500);
-    if(!lease.held){refusal=BdwVideoRefusal::Busy;videoGate.setDetail("diagnostic-lease-busy");return false;}
     if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
        !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
         refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition");return false;}
@@ -611,8 +688,10 @@ bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResul
     if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-tsc");return false;}
     auto once=[&](uint8_t which){
         unsigned attempts=0;
-        for(;;){++attempts;VmmDellVcsPmOp(tsc.khz,which,out,r);
-            if(r.attempted || !VideoTransient(out) || attempts>=250)break;
+        for(;;){++attempts;bool ran=false;
+            if(VideoWorkerCall(VwKind::Pm,which)){out=videoStep.fw;r=videoStep.reset;ran=true;VideoWorkerFinish();}
+            if(ran && (r.attempted || !VideoTransient(out)))break;
+            if(attempts>=250)break;
             SchedulerSleepMs(2);}
         videoGate.addRetries(attempts-1);
         return r.attempted;
@@ -642,6 +721,41 @@ bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResul
 #endif
 }
 void BdwVideoPmSamples(BdwGtPmSnapshot& a,BdwGtPmSnapshot& b,uint64_t& us){a=videoSampleA;b=videoSampleB;us=videoSampleUs;}
+namespace {
+bool VideoWorkerRelease(){
+    for(unsigned i=0;i<250;++i){
+        if(VideoWorkerCall(VwKind::Release)){const bool ok=videoStep.ok;VideoWorkerFinish();return ok;}
+        SchedulerSleepMs(2);
+    }
+    return false;
+}
+void VideoRc6Check(){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    const auto& tsc=NativeTscObserveRead();
+    auto sample=[&](BdwGtPmSnapshot& out){
+        for(unsigned i=0;i<100;++i){
+            if(VideoWorkerCall(VwKind::Pm,uint8_t(BdwVcsPmOp::Sample))){const bool ok=videoStep.reset.attempted;VideoWorkerFinish();
+                if(ok){uint32_t w=0,f=0;VmmDellVcsPmSample(out,w,f);return out.valid;}}
+            SchedulerSleepMs(2);
+        }
+        return false;
+    };
+    BdwGtPmSnapshot a{},b{};uint32_t lo,hi;
+    if(!tsc.khz || !sample(a)){videoGate.setRc6(false,0);return;}
+    __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));const uint64_t t0=(uint64_t(hi)<<32)|lo;
+    SchedulerSleepMs(300);
+    if(!sample(b)){videoGate.setRc6(false,0);return;}
+    __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));const uint64_t t1=(uint64_t(hi)<<32)|lo;
+    const uint64_t us=t1>t0?(t1-t0)*1000/tsc.khz:0;
+    const int i=BdwGtPmIndex(0x138108);
+    const uint32_t delta=i<0?0:b.value[i]-a.value[i];
+    // Residency counts 1.28 us units: percent = delta*128/us.
+    const uint32_t pct=us?uint32_t(uint64_t(delta)*128/us):0;
+    videoGate.setRc6(true,pct>100?100:pct);
+    KPrintf("gpu-video: RC6 after VCS op %u%% (%s)\n",pct>100?100u:pct,delta?"resumed":"NOT resumed");
+#endif
+}
+}
 // Run a VCS operation on a CPU0-pinned kernel thread: the critical section
 // and the PAT/forcewake transaction are CPU0-only, and the debug channel's
 // thread may be scheduled anywhere (gen 390: precondition-not-cpu0). Same

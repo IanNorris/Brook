@@ -5864,6 +5864,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
             r.text(",");r.field("retries",g.retries());
             r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");
+            r.text(",\"rc6_checked\":");r.text(g.rc6Checked()?"true":"false");
+            r.text(",");r.field("rc6_pct",g.rc6Pct());
+            r.text(",\"rc6_resumed\":");r.text(g.rc6Resumed()?"true":"false");
+            {uint32_t restores=0,failures=0;VmmDellVcsEngineRestoreCounts(restores,failures);
+             r.text(",");r.field("engine_restores",restores);r.text(",");r.field("engine_restore_failures",failures);}
+            {uint64_t serviced=0,leaseBusy=0,timeouts=0;BdwVideoWorkerCounts(serviced,leaseBusy,timeouts);
+             r.text(",\"worker_steps\":{");r.field("serviced",serviced);r.text(",");r.field("lease_busy",leaseBusy);
+             r.text(",");r.field("timeouts",timeouts);r.text("}");}
             const auto& v=g.sample();
             r.text(",\"vcs\":{\"sampled\":");r.text(v.sampled?"true":"false");
             r.text(",\"idle\":");r.text(v.idle?"true":"false");

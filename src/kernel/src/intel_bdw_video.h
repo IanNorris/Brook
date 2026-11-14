@@ -70,6 +70,7 @@ class BdwVideoGate {
     BdwVideoRefusal last_=BdwVideoRefusal::None;
     uint32_t probes_=0,resets_=0,refusals_=0,selftests_=0,selftestPasses_=0,retries_=0;
     const char* detail_="none"; // static string: the precise sub-reason of the last refusal
+    uint32_t rc6Pct_=0;bool rc6Resumed_=false,rc6Checked_=false;
     BdwVcsSample sample_{};
     void refuse(BdwVideoRefusal r){last_=r;++refusals_;}
 public:
@@ -81,6 +82,12 @@ public:
     uint32_t selftests()const{return selftests_;}
     uint32_t retries()const{return retries_;}
     const char* detail()const{return detail_;}
+    // RC6 residency over a short idle window right after the last reset or
+    // self-test (gen 392: a media reset without the MAX_IDLE restore left RC6 at 0%).
+    uint32_t rc6Pct()const{return rc6Pct_;}
+    bool rc6Resumed()const{return rc6Resumed_;}
+    bool rc6Checked()const{return rc6Checked_;}
+    void setRc6(bool checked,uint32_t pct){rc6Checked_=checked;rc6Pct_=pct;rc6Resumed_=checked && pct>0;}
     void setDetail(const char* d){detail_=d?d:"none";}
     void addRetries(uint32_t n){retries_+=n;}
     uint32_t selftestPasses()const{return selftestPasses_;}
@@ -258,4 +265,28 @@ template<class Io> void BdwGtPmRestore(Io& io,BdwGtPmRecord& r){
     }
 }
 static_assert(BdwGtPmRegCount<=32,"mask width");
+
+// Single-slot hand-off of one VCS device step from the gpu-video thread to the
+// CPU0 application worker (serviced between RCS jobs and presents). The caller
+// side never holds the diagnostic lease: it queues, waits and reads results;
+// only the worker takes the lease, for the step itself.
+class BdwVideoStepSlot {
+    uint32_t state_=0; // 0 idle, 1 filling, 2 queued, 3 running, 4 done
+public:
+    enum : uint32_t {Idle=0,Filling=1,Queued=2,Running=3,Done=4};
+    uint32_t state()const{return __atomic_load_n(&state_,__ATOMIC_ACQUIRE);}
+    // Caller: reserve the slot to fill in the request; false if busy.
+    bool begin(){uint32_t e=Idle;return __atomic_compare_exchange_n(&state_,&e,Filling,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);}
+    void publish(){__atomic_store_n(&state_,Queued,__ATOMIC_RELEASE);}
+    // Caller: take back a step the worker has not started (timeout). Nothing ran.
+    bool withdraw(){uint32_t e=Queued;return __atomic_compare_exchange_n(&state_,&e,Idle,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);}
+    // Caller: results read; free the slot.
+    void finish(){__atomic_store_n(&state_,Idle,__ATOMIC_RELEASE);}
+    // Worker: claim a queued step.
+    bool claim(){uint32_t e=Queued;return __atomic_compare_exchange_n(&state_,&e,Running,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);}
+    // Worker: could not take the diagnostic lease; leave it queued, untouched.
+    void requeue(){__atomic_store_n(&state_,Queued,__ATOMIC_RELEASE);}
+    void complete(){__atomic_store_n(&state_,Done,__ATOMIC_RELEASE);}
+    bool pending()const{return state()==Queued;}
+};
 }

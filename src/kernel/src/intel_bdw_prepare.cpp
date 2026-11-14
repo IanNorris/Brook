@@ -732,12 +732,24 @@ static bool ScanoutPending(void*){
     // Worker thread, between jobs: observe an armed flip and arm a queued one.
     BdwScanoutFlipPoll();
 #endif
-    return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued;
+    return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+        || BdwVideoWorkerPending()
+#endif
+        ;
 }
 // This runs between RCS submissions on the same BSP kernel worker. The
 // presenter holds the scene and framebuffer locks. The worker takes neither.
 static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
-    if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutQueued || queue.Poisoned())return false;
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+    // VCS diagnostics run here, between RCS jobs and presents on this one
+    // CPU0 worker, so they can never overlap a render job's preparation or a
+    // present (both take the diagnostic lease); see BdwVideoWorkerService.
+    const bool video=!queue.Poisoned() && BdwVideoWorkerService();
+#else
+    const bool video=false;
+#endif
+    if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutQueued || queue.Poisoned())return video;
     uint32_t queued=ScanoutQueued;
     if(!__atomic_compare_exchange_n(&scanoutWork.state,&queued,ScanoutRunning,false,
                                     __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
@@ -926,6 +938,10 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
         BdwGpuEventWaitTick(BdwGpuEvent::Retire,seen);
     }
 }
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+// Wake the application worker so it services a queued VCS diagnostic.
+bool BdwVideoWakeWorker(){if(InitApplicationWorker())return false;applicationWorker.Wake();return true;}
+#endif
 static int64_t SubmitApplicationSnapshot(BdwExecSnapshot* snapshot){
     if(!snapshot || !BdwExecSnapshotContext(snapshot))return -22;
     const auto ready=InitApplicationWorker();return ready?ready:applicationWorker.Submit(snapshot);

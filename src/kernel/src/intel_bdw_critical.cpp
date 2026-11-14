@@ -58,6 +58,29 @@ template<class Held> static void BdwVcsPmBegin(Held& held){
     (void)BdwVcsPmSnapshot(held,vcsPmRecord.before);
     if(!vcsPmRecord.first.valid)vcsPmRecord.first=vcsPmRecord.before;
 }
+// A GEN6_GRDOM_MEDIA reset returns VCS engine-block registers to hardware
+// defaults. Firmware programmed RING_MAX_IDLE to 10 (hardware default 64);
+// at 64 the GT never enters RC6 and the render clock sags for the boot (gen
+// 392). Restore every engine register in BdwVcsEngineRestoreRegs to its value
+// in the first snapshot of the boot, with readback, right after each reset.
+static uint32_t vcsEngineRestores=0,vcsEngineRestoreFailures=0;
+template<class Rw> static bool BdwVcsRestoreFirmwareEngine(Rw& io){
+    const auto& first=vcsPmRecord.first;
+    if(!first.valid)return false;
+    bool ok=true;
+    for(const auto& r:BdwVcsEngineRestoreRegs){
+        const int i=BdwGtPmIndex(r.reg);if(i<0){ok=false;continue;}
+        uint32_t now=0;if(!io.read32(BdwDellBar0+r.reg,now) || now==0xffffffffu){ok=false;continue;}
+        const uint32_t target=r.masked?(first.value[i]&0xffffu):first.value[i];
+        if((r.masked?(now&0xffffu):now)==target)continue;
+        const uint32_t value=r.masked?(0xffff0000u|target):target;uint32_t back=0;
+        ++vcsEngineRestores;
+        if(!io.write32(BdwDellBar0+r.reg,value) || !io.read32(BdwDellBar0+r.reg,back) ||
+           (r.masked?(back&0xffffu):back)!=target){++vcsEngineRestoreFailures;ok=false;}
+    }
+    return ok;
+}
+void VmmDellVcsEngineRestoreCounts(uint32_t& restores,uint32_t& failures){restores=vcsEngineRestores;failures=vcsEngineRestoreFailures;}
 static BdwGtPmSnapshot vcsPmSample{};
 static uint32_t vcsPmOpWrites=0,vcsPmOpFailures=0;
 void VmmDellVcsPmRecord(BdwGtPmRecord& out){out=vcsPmRecord;}
@@ -783,6 +806,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             const auto outcome=reset.reset();
             vcsReset->complete=outcome==BdwBcsResetResult::DomainAcknowledged;
             vcsReset->uncertain=outcome==BdwBcsResetResult::Uncertain;
+            if(vcsReset->complete)(void)BdwVcsRestoreFirmwareEngine(held);
             BdwVcsPmFinish(held,1);
             return vcsReset->complete;
         }
@@ -888,6 +912,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                             reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwResetPage));
                         const auto outcome=reset.reset(intent);
                         if(outcome==BdwBcsResetResult::Uncertain)resetWasUncertain=true;
+                        if(outcome==BdwBcsResetResult::DomainAcknowledged)(void)BdwVcsRestoreFirmwareEngine(io);
                         return outcome==BdwBcsResetResult::DomainAcknowledged;
                     }
                     BdwBcsResetMmio<CopyOwner> reset(*this,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6022000ull),

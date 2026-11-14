@@ -47,6 +47,8 @@ struct BdwGtPmSnapshot;
 // snapshot and the write counts of the last op.
 void VmmDellVcsPmOp(uint32_t khz,uint8_t op,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& r);
 void VmmDellVcsPmSample(BdwGtPmSnapshot& out,uint32_t& writes,uint32_t& failures);
+// Engine-register writes made to restore firmware values after VCS resets (boot totals).
+void VmmDellVcsEngineRestoreCounts(uint32_t& restores,uint32_t& failures);
 // VCS0 self-test submission (VA-API phase 1b) of the prepared video image.
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run);
 void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
