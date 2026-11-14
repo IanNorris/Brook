@@ -42,6 +42,21 @@ public:
     uint64_t SpunTicks()const{return spun_;}
 };
 
+// One spin slice between Unlock and Lock. A yield that actually switches
+// returns with IF=0: the scheduler saves RFLAGS after its own cli and the
+// resumed thread restores that (SchedulerBlock re-enables explicitly; plain
+// SchedulerYield does not). Without restoring IF here the spin would run
+// with interrupts disabled and the following Lock would record IF=0, so the
+// next MayYield fails and the job is declared uncertain. Cpu supplies
+// flags(), yield(), enableInterrupts(), tsc(uint64_t&) and relax().
+template<class Cpu> void BdwSpinSlice(Cpu& cpu,uint64_t ticks){
+    const bool enabled=(cpu.flags()&0x200)!=0;
+    uint64_t start=0,now=0;cpu.tsc(start);
+    cpu.yield();
+    if(enabled && !(cpu.flags()&0x200))cpu.enableInterrupts();
+    do{cpu.relax();cpu.tsc(now);}while(now>=start && now-start<ticks);
+}
+
 // Per-submitter completion-latency estimate (first completion poll to the
 // poll that saw the breadcrumb). Worker-thread only. Falls fast and rises
 // slowly, so the spin window opens early rather than late; an early window

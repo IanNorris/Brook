@@ -283,8 +283,14 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         // slice (yielding first to any ready CPU-0 work) instead of a tick.
         void Wait(){
             if(spinTicks){
-                uint64_t start=0,now=0;tsc(start);SchedulerYield();
-                do{relax();tsc(now);}while(now>=start && now-start<spinTicks);
+                struct Cpu {Io& io;
+                    uint64_t flags(){uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");return f;}
+                    void yield(){SchedulerYield();}
+                    void enableInterrupts(){__asm__ volatile("sti":::"memory");}
+                    bool tsc(uint64_t& v){return io.tsc(v);}
+                    void relax(){io.relax();}
+                } cpu{*this};
+                BdwSpinSlice(cpu,spinTicks);
             }else SchedulerSleepMs(1);
             tsc(waitEnd);
         }

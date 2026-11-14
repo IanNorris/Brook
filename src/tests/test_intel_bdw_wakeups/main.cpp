@@ -61,6 +61,33 @@ int main(){
         BdwPollPacer p;p.Begin({1000,100,50,0},0,0,~uint64_t{0});p.Spun(1,~uint64_t{0});
         assert(p.Next(0)==~uint64_t{0}-1);
     }
+    // Spin slice: a yield that switched away returns with IF clear (as the
+    // kernel's SchedulerYield does). The slice must restore IF before
+    // spinning, so the relock captures IF=1 and the next yield is allowed.
+    {
+        struct Cpu {uint64_t rflags=0x202,now=0;unsigned yields=0,stis=0;bool switched=true,spunWithIrqsOff=false;
+            uint64_t flags(){return rflags;}
+            void yield(){++yields;if(switched)rflags&=~uint64_t{0x200};}
+            void enableInterrupts(){++stis;rflags|=0x200;}
+            bool tsc(uint64_t& v){v=now;return true;}
+            void relax(){if(!(rflags&0x200))spunWithIrqsOff=true;now+=10;}
+        };
+        // Model the BdwYieldGpuWait sequence: Unlock restores the saved IF,
+        // Wait runs the slice, Lock records the current IF as the new saved
+        // flags and MayYield requires it.
+        Cpu cpu;uint64_t saved=0x202;
+        for(unsigned i=0;i<3;++i){
+            assert(saved&0x200);              // MayYield
+            cpu.rflags=saved;                 // Unlock
+            BdwSpinSlice(cpu,50);
+            saved=cpu.rflags;                 // Lock: VmmKernelPtCriticalEnter's flags
+        }
+        assert(cpu.yields==3 && cpu.stis==3 && !cpu.spunWithIrqsOff && (saved&0x200) && cpu.now>=150);
+        // No switch: IF untouched, no redundant sti.
+        Cpu idle;idle.switched=false;BdwSpinSlice(idle,20);assert(idle.stis==0 && (idle.rflags&0x200));
+        // A caller that entered with IF clear is never given interrupts.
+        Cpu off;off.rflags=0x2;BdwSpinSlice(off,20);assert(off.stis==0 && !(off.rflags&0x200));
+    }
     // Completion predictor: falls immediately, rises by a quarter, LRU-replaces.
     {
         BdwCompletionPredictor<2> c;
