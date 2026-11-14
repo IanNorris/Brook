@@ -5833,14 +5833,23 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const bool on=NetStrEq(cmd,"gpu video on"),off=NetStrEq(cmd,"gpu video off");
         const bool probe=NetStrEq(cmd,"gpu video probe"),reset=NetStrEq(cmd,"gpu video reset");
         const bool selftest=NetStrEq(cmd,"gpu video selftest"),status=NetStrEq(cmd,"gpu video status");
-        if(!on && !off && !probe && !reset && !selftest && !status){
-            DebugChannelSend("Usage: gpu video on|off|status|probe|reset|selftest\n");return;}
+        // VCS power-management experiments (gen 391 clock sag): sample, (a)..(e).
+        uint8_t pmOp=0;
+        if(NetStrEq(cmd,"gpu video pm sample"))pmOp=uint8_t(BdwVcsPmOp::Sample);
+        else if(NetStrEq(cmd,"gpu video pm stop-start"))pmOp=uint8_t(BdwVcsPmOp::StopStart);
+        else if(NetStrEq(cmd,"gpu video pm idle-ring"))pmOp=uint8_t(BdwVcsPmOp::IdleRing);
+        else if(NetStrEq(cmd,"gpu video pm rps-rewrite"))pmOp=uint8_t(BdwVcsPmOp::RpsRewrite);
+        else if(NetStrEq(cmd,"gpu video pm engine-restore"))pmOp=uint8_t(BdwVcsPmOp::EngineRestore);
+        if(!on && !off && !probe && !reset && !selftest && !status && !pmOp){
+            DebugChannelSend("Usage: gpu video on|off|status|probe|reset|selftest|pm sample|pm stop-start|pm idle-ring|pm rps-rewrite|pm engine-restore\n");return;}
         BdwVideoRefusal refusal=BdwVideoRefusal::None;bool ok=true;
         BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult rs{};
         BdwBcsRunResult st{};uint32_t readback=0,expected=0;bool pending=false;
         if(on || off)ok=BdwVideoSetEnabled(on,refusal);
         else if(probe || reset || selftest)
             ok=BdwVideoRunOnCpu0(probe?1:reset?2:3,fw,rs,st,readback,expected,refusal,pending);
+        else if(pmOp)
+            ok=BdwVideoRunOnCpu0(uint8_t(10+pmOp),fw,rs,st,readback,expected,refusal,pending);
         BdwVideoGate g{};const bool have=BdwVideoStatus(g);
         BdwGtPmRecord pm{};VmmDellVcsPmRecord(pm);
         BridgeReply r;r.text("{\"built\":");r.text(BdwVideoBuilt()?"true":"false");
@@ -5865,7 +5874,30 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("execlist_hi",v.execlistHi);r.text(",");r.field("gfx_mode",v.submissionMode);r.text("}");
         }
         if(pending){r.text(",\"pending\":true");}
-        if(pm.op){
+        if(pmOp==uint8_t(BdwVcsPmOp::Sample)){
+            BdwGtPmSnapshot a{},b{};uint64_t us=0;BdwVideoPmSamples(a,b,us);
+            auto at=[](const BdwGtPmSnapshot& x,uint32_t reg){const int i=BdwGtPmIndex(reg);return i<0?0u:x.value[i];};
+            auto pct=[&](uint32_t reg){const uint32_t d=at(b,reg)-at(a,reg);return us?uint64_t(d)*128/(us)/1:0;};
+            // RC6 residency counters count in 1.28 us units: percent = delta*1.28/us*100 = delta*128/us.
+            r.text(",\"sample\":{");r.field("interval_us",us);
+            r.text(",");r.field("rc6_delta",at(b,0x138108)-at(a,0x138108));r.text(",");r.field("rc6_pct",pct(0x138108));
+            r.text(",");r.field("rc6p_delta",at(b,0x13810c)-at(a,0x13810c));r.text(",");r.field("rc6p_pct",pct(0x13810c));
+            r.text(",");r.field("rc6pp_delta",at(b,0x138110)-at(a,0x138110));r.text(",");r.field("rc6pp_pct",pct(0x138110));
+            r.text(",");r.field("rc_state",at(b,0xa094));r.text(",");r.field("rc_control",at(b,0xa090));
+            r.text(",");r.field("cagf_a_mhz",BdwGtCagfMhz(at(a,0xa01c)));r.text(",");r.field("cagf_b_mhz",BdwGtCagfMhz(at(b,0xa01c)));
+            r.text(",");r.field("thread_status",at(b,0x13805c));
+            r.text(",");r.field("vcs_mi_mode",at(b,0x1209c));r.text(",");r.field("vcs_max_idle",at(b,0x12054));
+            r.text(",");r.field("bcs_max_idle",at(b,0x22054));r.text(",");r.field("rcs_max_idle",at(b,0x2054));
+            r.text(",");r.field("vcs_psmi",at(b,0x12050));r.text("}");
+        }
+        if(pmOp && pmOp!=uint8_t(BdwVcsPmOp::Sample)){
+            BdwGtPmSnapshot after{};uint32_t writes=0,failures=0;VmmDellVcsPmSample(after,writes,failures);
+            r.text(",\"pm_op\":{\"op\":\"");r.text(BdwVcsPmOpName(BdwVcsPmOp(pmOp)));r.text("\"");
+            r.text(",\"attempted\":");r.text(rs.attempted?"true":"false");
+            r.text(",\"complete\":");r.text(rs.complete?"true":"false");
+            r.text(",");r.field("writes",writes);r.text(",");r.field("failures",failures);r.text("}");
+        }
+        if(pm.op && (status || reset || selftest)){
             // GT PM before/after the last VCS operation (gen 390 clock-sag investigation).
             r.text(",\"pm\":{\"op\":\"");r.text(pm.op==1?"reset":"selftest");r.text("\"");
             r.text(",\"valid\":");r.text(pm.before.valid && pm.after.valid?"true":"false");
@@ -5875,7 +5907,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("cagf_after_mhz",BdwGtCagfMhz(pm.after.value[4]));
             r.text(",\"regs\":[");
             for(unsigned i=0;i<BdwGtPmRegCount;++i){if(i)r.text(",");
-                r.text("{");r.field("r",BdwGtPmRegs[i]);r.text(",");r.field("b",pm.before.value[i]);
+                r.text("{");r.field("r",BdwGtPmRegs[i]);r.text(",");r.field("f",pm.first.value[i]);r.text(",");r.field("b",pm.before.value[i]);
                 r.text(",");r.field("a",pm.after.value[i]);r.text("}");}
             r.text("]}");
         }

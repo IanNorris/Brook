@@ -266,7 +266,12 @@ bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
 bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal);
 bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal);
-// op 1 probe, 2 reset, 3 self-test, run on a CPU0-pinned kernel thread (10 s wait).
+struct BdwGtPmSnapshot;
+// VCS PM experiment (BdwVcsPmOp value); run through BdwVideoRunOnCpu0 as op 10+value.
+bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& r,BdwVideoRefusal& refusal);
+// The last `pm sample` pair and the TSC-measured interval between them.
+void BdwVideoPmSamples(BdwGtPmSnapshot& a,BdwGtPmSnapshot& b,uint64_t& us);
+// op 1 probe, 2 reset, 3 self-test, 10+BdwVcsPmOp PM experiments, on a CPU0-pinned kernel thread (10 s wait).
 bool BdwVideoRunOnCpu0(uint8_t op,BdwForcewakeAdapterResult& fw,BdwRcsResetTestResult& reset,BdwBcsRunResult& run,
         uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal,bool& pending);
 struct BdwRenderGtInitResult;

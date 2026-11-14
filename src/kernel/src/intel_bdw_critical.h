@@ -42,6 +42,11 @@ void VmmDellVcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetT
 struct BdwGtPmRecord;
 // GT PM before/after record of the last VCS reset or self-test.
 void VmmDellVcsPmRecord(BdwGtPmRecord& out);
+struct BdwGtPmSnapshot;
+// VCS PM experiment (BdwVcsPmOp) under the forcewake claim; the post-op
+// snapshot and the write counts of the last op.
+void VmmDellVcsPmOp(uint32_t khz,uint8_t op,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& r);
+void VmmDellVcsPmSample(BdwGtPmSnapshot& out,uint32_t& writes,uint32_t& failures);
 // VCS0 self-test submission (VA-API phase 1b) of the prepared video image.
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run);
 void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);

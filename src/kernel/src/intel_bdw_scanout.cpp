@@ -586,6 +586,62 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
 #endif
 }
+// VCS power-management experiments and residency sampling (gen 391 clock sag).
+namespace {
+BdwGtPmSnapshot videoSampleA{},videoSampleB{};uint64_t videoSampleUs=0;
+}
+bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& r,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;r={};
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    const auto pmOp=BdwVcsPmOp(op);
+    RetryLease video(&videoOwner,200);
+    if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    // Writes need the same proof as a reset (gate on, probed idle, not quarantined);
+    // sampling only needs the gate.
+    refusal=pmOp==BdwVcsPmOp::Sample?videoGate.mayProbe():videoGate.mayReset();
+    if(refusal!=BdwVideoRefusal::None){videoGate.setDetail("gate");return false;}
+    RetryLease lease(&diagnosticOwner,500);
+    if(!lease.held){refusal=BdwVideoRefusal::Busy;videoGate.setDetail("diagnostic-lease-busy");return false;}
+    if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
+       !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
+        refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition");return false;}
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-forcewake-pages");return false;}
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-engine-pages");return false;}
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-tsc");return false;}
+    auto once=[&](uint8_t which){
+        unsigned attempts=0;
+        for(;;){++attempts;VmmDellVcsPmOp(tsc.khz,which,out,r);
+            if(r.attempted || !VideoTransient(out) || attempts>=250)break;
+            SchedulerSleepMs(2);}
+        videoGate.addRetries(attempts-1);
+        return r.attempted;
+    };
+    if(pmOp==BdwVcsPmOp::Sample){
+        uint32_t w=0,f=0;
+        if(!once(op)){refusal=BdwVideoRefusal::Busy;videoGate.setDetail(VideoAdapterDetail(out));return false;}
+        VmmDellVcsPmSample(videoSampleA,w,f);
+        uint64_t t0=0,t1=0;uint32_t lo,hi;
+        __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));t0=(uint64_t(hi)<<32)|lo;
+        SchedulerSleepMs(1000);
+        if(!once(op)){refusal=BdwVideoRefusal::Busy;videoGate.setDetail(VideoAdapterDetail(out));return false;}
+        __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));t1=(uint64_t(hi)<<32)|lo;
+        VmmDellVcsPmSample(videoSampleB,w,f);
+        videoSampleUs=t1>t0?(t1-t0)*1000/tsc.khz:0;
+        videoGate.setDetail("none");
+        return videoSampleA.valid && videoSampleB.valid;
+    }
+    if(!once(op)){refusal=BdwVideoRefusal::Busy;videoGate.setDetail(VideoAdapterDetail(out));return false;}
+    uint32_t writes=0,failures=0;BdwGtPmSnapshot after{};VmmDellVcsPmSample(after,writes,failures);
+    KPrintf("gpu-video: pm %s %s writes=%u failures=%u\n",BdwVcsPmOpName(pmOp),r.complete?"ok":"failed",writes,failures);
+    videoGate.setDetail(r.complete?"none":"pm-op-write-or-wait-failed");
+    if(!r.complete)refusal=BdwVideoRefusal::SubmitFailed;
+    return r.complete;
+#else
+    (void)op;(void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
+#endif
+}
+void BdwVideoPmSamples(BdwGtPmSnapshot& a,BdwGtPmSnapshot& b,uint64_t& us){a=videoSampleA;b=videoSampleB;us=videoSampleUs;}
 // Run a VCS operation on a CPU0-pinned kernel thread: the critical section
 // and the PAT/forcewake transaction are CPU0-only, and the debug channel's
 // thread may be scheduled anywhere (gen 390: precondition-not-cpu0). Same
@@ -604,6 +660,7 @@ struct VideoJob {
     if(job->op==1)job->ok=BdwVideoProbe(job->fw,job->refusal);
     else if(job->op==2)job->ok=BdwVideoReset(job->fw,job->reset,job->refusal);
     else if(job->op==3)job->ok=BdwVideoSelftest(job->fw,job->run,job->readback,job->expected,job->refusal);
+    else if(job->op>=10)job->ok=BdwVideoPmOp(uint8_t(job->op-10),job->fw,job->reset,job->refusal);
     __atomic_store_n(&job->state,2,__ATOMIC_RELEASE);
 }
 }
@@ -614,7 +671,7 @@ bool BdwVideoRunOnCpu0(uint8_t op,BdwForcewakeAdapterResult& fw,BdwRcsResetTestR
     (void)op;(void)fw;(void)reset;(void)run;(void)readback;(void)expected;
     refusal=BdwVideoRefusal::NotImplemented;return false;
 #else
-    if(op<1 || op>3){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    if((op<1 || op>3) && (op<11 || op>15)){refusal=BdwVideoRefusal::NotImplemented;return false;}
     uint32_t idle=0,done=2;
     // A previous job that outlived its wait finishes in the background; collect it first.
     __atomic_compare_exchange_n(&videoJob.state,&done,0,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);

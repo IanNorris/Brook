@@ -186,6 +186,13 @@ constexpr uint32_t BdwGtPmRegs[]={
     0x12050, // VCS RING_PSMI_CTL (idle messaging)
     0x12080, // VCS HWS_PGA
     0x12098, // VCS HWSTAM
+    0x12054, // VCS RING_MAX_IDLE (PWRCTX_MAXCNT: idle count before power-context save)
+    0x120a8, // VCS RING_IMR
+    0x120c0, // VCS INSTPM
+    0x22054, // BCS RING_MAX_IDLE (comparison)
+    0x2054,  // RCS RING_MAX_IDLE (comparison)
+    0x138110, // GEN6_GT_GFX_RC6pp residency
+    0x13805c, // GEN6_GT_THREAD_STATUS
 };
 constexpr unsigned BdwGtPmRegCount=sizeof(BdwGtPmRegs)/sizeof(BdwGtPmRegs[0]);
 // Restored (exact previous value, write then verified readback) if a VCS
@@ -196,6 +203,7 @@ constexpr uint32_t BdwGtPmRestorable[]={0xa008,0xa00c,0xa010,0xa014,0xa024,0xa02
 inline bool BdwGtPmRegRestorable(uint32_t reg){for(auto r:BdwGtPmRestorable)if(r==reg)return true;return false;}
 struct BdwGtPmSnapshot {bool valid=false;uint32_t value[BdwGtPmRegCount]{};};
 struct BdwGtPmRecord {
+    BdwGtPmSnapshot first{};  // before the first VCS operation of this boot (firmware state)
     BdwGtPmSnapshot before{},after{};
     uint32_t changedMask=0;   // bit i: BdwGtPmRegs[i] differs after the operation
     uint32_t restoredMask=0;  // restored to the before value and verified
@@ -204,6 +212,37 @@ struct BdwGtPmRecord {
 };
 // RPSTAT1 CAGF (bits 13:7 on Gen8) in MHz (50 MHz units).
 inline uint32_t BdwGtCagfMhz(uint32_t rpstat1){return ((rpstat1>>7)&0x7f)*50;}
+inline int BdwGtPmIndex(uint32_t reg){for(unsigned i=0;i<BdwGtPmRegCount;++i)if(BdwGtPmRegs[i]==reg)return int(i);return -1;}
+
+// VCS power-management experiments (gen 391: a GEN6_GRDOM_MEDIA reset alone
+// leaves the render clock at 400-430 MHz for the boot). Each is a debug
+// subcommand run once, live, under the forcewake claim.
+enum class BdwVcsPmOp : uint8_t {
+    None=0,
+    Sample,       // read-only snapshot (two, ~1 s apart, for residency deltas)
+    StopStart,    // (a) MI_MODE STOP_RING set, wait for ring idle, clear (i915 legacy stop/init)
+    IdleRing,     // (b) RING_CTL=0, RING_HEAD=0, RING_TAIL=0: a valid idle legacy ring
+    RpsRewrite,   // (d) rewrite RP_* thresholds/EI/limits/control and PMINTRMSK with their current values
+    EngineRestore,// (e) VCS MAX_IDLE, IMR, HWSTAM (plain) and PSMI_CTL, INSTPM (masked) back to first-boot values
+};
+inline const char* BdwVcsPmOpName(BdwVcsPmOp op){
+    switch(op){
+    case BdwVcsPmOp::Sample:return "sample";
+    case BdwVcsPmOp::StopStart:return "stop-start";
+    case BdwVcsPmOp::IdleRing:return "idle-ring";
+    case BdwVcsPmOp::RpsRewrite:return "rps-rewrite";
+    case BdwVcsPmOp::EngineRestore:return "engine-restore";
+    default:return "none";
+    }
+}
+// Registers EngineRestore may write, and whether they are masked (upper 16 bits
+// select which lower bits a write changes).
+struct BdwVcsRestoreReg {uint32_t reg;bool masked;};
+constexpr BdwVcsRestoreReg BdwVcsEngineRestoreRegs[]={
+    {0x12054,false},{0x120a8,false},{0x12098,false},{0x12050,true},{0x120c0,true}};
+// RPS registers RpsRewrite rewrites with their current values (i915 gen8 RPS
+// enable order: limits, timeouts, EI, thresholds, then control, then mask).
+constexpr uint32_t BdwRpsRewriteRegs[]={0xa014,0xa010,0xa068,0xa06c,0xa02c,0xa030,0xa024,0xa168};
 // Pure decision for the restore step; Io provides read(reg,v) and write(reg,v).
 template<class Io> void BdwGtPmRestore(Io& io,BdwGtPmRecord& r){
     r.changedMask=r.restoredMask=r.restoreFailedMask=0;

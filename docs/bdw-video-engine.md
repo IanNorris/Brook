@@ -133,3 +133,40 @@ Both need **relocation-free submission** from Brook's point of view: Brook's exe
     2. **The GEN6_GRDOM_MEDIA reset altered an RPS or RC control register.** The restore would now correct it, and `changed_mask` will show it.
     3. **PSMI idle messaging changed on VCS.**
   - **Next Dell check:** on a fresh boot, run the 2-buffer yquake demo (baseline mhz), then `gpu video on`, `probe`, `reset` (read `pm`), `selftest` (read `pm`), then yquake again (mhz). Then `reset` only on another fresh boot, to separate the reset from the self-test.
+
+### Gen 391 bisect and the experiment subcommands (p1b4)
+
+- **Bisect:**
+  - base: displayed 19.9 ms, mhz 500;
+  - after `gpu video reset` alone: 24.7 ms, mhz avg 431 (min 400);
+  - after the self-test as well: unchanged.
+
+  **The GEN6_GRDOM_MEDIA reset alone causes it.** Across the reset only `RPSTAT1` changed; no RPS/RC control register and no VCS mode register (`GFX_MODE` stayed 0), so the restore cannot help.
+- **Snapshot additions** (29 registers):
+  - VCS `RING_MAX_IDLE` (`0x12054`, the power-context idle count i915 programs per engine for RC6), `RING_IMR` and `INSTPM`;
+  - BCS and RCS `RING_MAX_IDLE` for comparison;
+  - RC6pp residency and `GT_THREAD_STATUS`;
+  - `pm.regs[].f`: the first snapshot of the boot (firmware state).
+
+  Suspect: a domain reset returns VCS engine-block registers such as `RING_MAX_IDLE` to hardware defaults. Firmware may have programmed them, and RC6 entry depends on them.
+- **`gpu video pm sample`:** two snapshots about 1 s apart, reporting RC6, RC6p and RC6pp residency deltas and percentages (1.28 µs units), RC state and control, CAGF, thread status, and the VCS/BCS/RCS MAX_IDLE and PSMI values. Run it before and after `gpu video reset`, at idle.
+- **Experiments**, each a one-shot debug subcommand under the forcewake claim:
+
+  | Subcommand | What it does | Guard |
+  |---|---|---|
+  | (a) `gpu video pm stop-start` | MI_MODE STOP_RING set, wait up to 100 ms for ring idle, clear | needs gate on and an idle probe |
+  | (b) `gpu video pm idle-ring` | RING_CTL, RING_HEAD and RING_TAIL set to 0 | refuses an enabled ring |
+  | (c) `gpu video reset` | a second domain reset | needs gate on and an idle probe |
+  | (d) `gpu video pm rps-rewrite` | RP limits, timeout, EI, thresholds, control and PMINTRMSK rewritten with their current values, in i915's order | needs gate on and an idle probe |
+  | (e) `gpu video pm engine-restore` | VCS MAX_IDLE, IMR and HWSTAM (plain), PSMI_CTL and INSTPM (masked) written back to their **first-boot** values where they differ | needs gate on and an idle probe |
+
+  Every write is read back. The callback keeps the forcewake claim clean, because these registers hold no engine, GGTT or PAT ownership. The result reports `writes` and `failures`.
+- **Suggested order on one boot:**
+  1. yquake baseline;
+  2. `gpu video on`, `probe`, `pm sample`;
+  3. `reset`, `pm sample` (compare RC6 % and MAX_IDLE);
+  4. yquake (sag);
+  5. `pm engine-restore`, `pm sample`, yquake;
+  6. if it still sags: (a), (b), (d), each followed by yquake.
+
+  Try (e) first, since it follows directly from the snapshot data.

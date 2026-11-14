@@ -53,7 +53,15 @@ template<class Held> static void BdwVcsPmFinish(Held& held,uint8_t op){
     if(!BdwVcsPmSnapshot(held,vcsPmRecord.after))return;
     BdwGtPmRestore(rw,vcsPmRecord);
 }
+template<class Held> static void BdwVcsPmBegin(Held& held){
+    const auto first=vcsPmRecord.first;vcsPmRecord={};vcsPmRecord.first=first;
+    (void)BdwVcsPmSnapshot(held,vcsPmRecord.before);
+    if(!vcsPmRecord.first.valid)vcsPmRecord.first=vcsPmRecord.before;
+}
+static BdwGtPmSnapshot vcsPmSample{};
+static uint32_t vcsPmOpWrites=0,vcsPmOpFailures=0;
 void VmmDellVcsPmRecord(BdwGtPmRecord& out){out=vcsPmRecord;}
+void VmmDellVcsPmSample(BdwGtPmSnapshot& out,uint32_t& writes,uint32_t& failures){out=vcsPmSample;writes=vcsPmOpWrites;failures=vcsPmOpFailures;}
 template<class F> static bool BdwTimedTransaction(BdwRenderRunResult& result,unsigned stage,F f){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const auto start=BdwTimingNow();
@@ -256,7 +264,7 @@ bool VmmDellForcewakeAckCriticalRead(uint32_t& result) {
 // bounded observation; an uncertain release permanently blocks further use.
 // The page-table lock prevents mapping changes throughout each operation.
 static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines,bool patRequested,bool tlbRequested,bool resetRequested,bool scopeCheck,
-                                        uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false,BdwRcsResetTestResult* vcsReset=nullptr,bool vcsSelftest=false) {
+                                        uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false,BdwRcsResetTestResult* vcsReset=nullptr,bool vcsSelftest=false,uint8_t vcsPmOp=0,BdwRcsResetTestResult* vcsPmResult=nullptr) {
     static BdwForcewakeClaim claim;result={};
     if(!claim.acquire()){result.refusal=claim.state()==2?BdwFwRefusalClaimUncertain:BdwFwRefusalClaimBusy;return;}
     struct Io {
@@ -366,7 +374,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         }
         void Poison(){mappingsValid=false;}
         uint64_t spinTicks=0,waitEnd=0;
-    } io{tlbRequested,resetRequested,scratchResult!=nullptr,initResult!=nullptr,patResult!=nullptr,copyResult!=nullptr,rcsReset!=nullptr,gtInit!=nullptr,renderResult!=nullptr,vcsReset!=nullptr,vcsSelftest};
+    } io{tlbRequested,resetRequested,scratchResult!=nullptr,initResult!=nullptr,patResult!=nullptr,copyResult!=nullptr,rcsReset!=nullptr,gtInit!=nullptr,renderResult!=nullptr,vcsReset!=nullptr,vcsSelftest || (vcsPmResult && vcsPmOp>uint8_t(BdwVcsPmOp::Sample))};
     uint64_t irq=VmmKernelPtCriticalEnter();io.irq=&irq;
     // Read-only exercise of the callback boundary. The callback remains under
     // the same page-table lock and forcewake claim as the initial samples.
@@ -690,6 +698,64 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             gtInit->selector=owner.selector;gtInit->fuse2=owner.fuse;gtInit->topologySampled=owner.sampled;
             return gtInit->status==BdwRenderGtInitStatus::Applied;
         }
+        if(vcsPmResult) {
+            // VCS power-management experiments (gen 391 clock-sag bisect). Only
+            // engine-idle registers and the RPS block are written, always with
+            // readback; no ring is started, no GGTT or PAT state changes.
+            vcsPmResult->attempted=true;vcsPmOpWrites=vcsPmOpFailures=0;
+            const auto op=BdwVcsPmOp(vcsPmOp);
+            if(op!=BdwVcsPmOp::Sample){
+                DellI2cCriticalEvidence v{};
+                if(!held.evidence(BdwOtherEnginePages[1],v) || !BdwGttEvidenceValid(v)){vcsPmResult->attempted=false;return false;}
+            }
+            auto rd=[&](uint32_t reg,uint32_t& val){return held.read32(BdwDellBar0+reg,val) && val!=0xffffffffu;};
+            auto wr=[&](uint32_t reg,uint32_t val,uint32_t expectMask,uint32_t expect){
+                ++vcsPmOpWrites;uint32_t back=0;
+                if(!held.write32(BdwDellBar0+reg,val) || !rd(reg,back) || (back&expectMask)!=expect){++vcsPmOpFailures;return false;}
+                return true;};
+            auto waitIdle=[&](bool wantIdle){
+                uint64_t start=0,now=0;if(!held.tsc(start))return false;
+                for(unsigned i=0;i<1000000;++i){uint32_t mi=0;if(!rd(0x1209c,mi) || !held.tsc(now))return false;
+                    if(bool(mi&0x200)==wantIdle)return true;
+                    if((now-start)/khz>=100)return false;held.relax();}
+                return false;};
+            bool ok=true;
+            BdwGtPmSnapshot before{};(void)BdwVcsPmSnapshot(held,before);
+            switch(op){
+            case BdwVcsPmOp::Sample:break;
+            case BdwVcsPmOp::StopStart:
+                // STOP_RING (bit 8) set; the ring reports idle (bit 9); then clear.
+                ok=wr(0x1209c,0x01000100u,0x100u,0x100u) && waitIdle(true) && wr(0x1209c,0x01000000u,0x100u,0);
+                break;
+            case BdwVcsPmOp::IdleRing:{
+                uint32_t ctl=0;
+                ok=rd(0x1203c,ctl) && !(ctl&1u) &&  // never touch an enabled ring
+                   wr(0x1203c,0,~0u,0) && wr(0x12034,0,0x001ffffcu,0) && wr(0x12030,0,0x001ffff8u,0);
+                break;}
+            case BdwVcsPmOp::RpsRewrite:
+                for(auto reg:BdwRpsRewriteRegs){const int i=BdwGtPmIndex(reg);
+                    if(i<0 || !before.valid){ok=false;break;}
+                    if(!wr(reg,before.value[i],~0u,before.value[i]))ok=false;}
+                break;
+            case BdwVcsPmOp::EngineRestore:{
+                const auto& first=vcsPmRecord.first;
+                if(!first.valid){ok=false;break;}
+                for(const auto& r:BdwVcsEngineRestoreRegs){const int i=BdwGtPmIndex(r.reg);
+                    if(i<0 || !before.valid){ok=false;break;}
+                    if(before.value[i]==first.value[i])continue;
+                    const uint32_t target=r.masked?(first.value[i]&0xffffu):first.value[i];
+                    const uint32_t value=r.masked?(0xffff0000u|target):target;
+                    if(!wr(r.reg,value,r.masked?0xffffu:~0u,target))ok=false;}
+                break;}
+            default:ok=false;break;
+            }
+            (void)BdwVcsPmSnapshot(held,vcsPmSample);
+            vcsPmResult->complete=ok;
+            // These registers do not hold engine, GGTT or PAT ownership: report the
+            // outcome and keep the shared claim clean (an uncertain claim would
+            // stop every later GPU job).
+            return true;
+        }
         if(vcsReset) {
             // VCS0 domain reset (VA-API phase 1). Same narrow owner as the RCS
             // test: forcewake is held and every engine, VCS included, was sampled
@@ -710,7 +776,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 void relax(){io.relax();}
             } owner{held,khz,0};
             if(!held.tsc(owner.origin))return false;
-            vcsPmRecord={};(void)BdwVcsPmSnapshot(held,vcsPmRecord.before);
+            BdwVcsPmBegin(held);
             vcsReset->attempted=true;
             BdwVcsResetMmio<VcsOwner> reset(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwOtherEnginePages[1]),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwResetPage));
@@ -873,7 +939,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             owner.line=((b>>8)&255)*8;
             if(!(d&(1u<<19)) || owner.line<16 || owner.line>4096 || (owner.line&(owner.line-1)) ||
                4096%owner.line || !held.tsc(owner.origin)){copyResult->refusalStep=4;return false;}
-            if(vcsSelftest){vcsPmRecord={};(void)BdwVcsPmSnapshot(held,vcsPmRecord.before);}
+            if(vcsSelftest)BdwVcsPmBegin(held);
             copyResult->resetBeforeAttempted=true;copyResult->resetBefore=owner.resetBcs();
             copyResult->resetUncertain=owner.resetWasUncertain;
             if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsSelftest)BdwVcsPmFinish(held,2);return false;}
@@ -1005,7 +1071,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         }
         return scratchResult->complete;
     };
-    result=BdwDellForcewakeCriticalWithWork(io,khz,work,scopeCheck || scratchResult || initResult || patResult || copyResult || rcsReset || gtInit || renderResult || vcsReset,otherEngines,patRequested,tlbRequested,resetRequested);
+    result=BdwDellForcewakeCriticalWithWork(io,khz,work,scopeCheck || scratchResult || initResult || patResult || copyResult || rcsReset || gtInit || renderResult || vcsReset || vcsPmResult,otherEngines,patRequested,tlbRequested,resetRequested);
     // A render callback that refused before its first device write (entry
     // checks, or GT init NotStarted with no writes) leaves nothing to recover;
     // the worker reruns the still-armed job. Anything later stays uncertain.
@@ -1019,6 +1085,10 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
     // precondition or at a NotStarted reset-before. Never mark the claim
     // uncertain for those, or every later GPU job would refuse.
     if(vcsReset && result.sequence.workAttempted && !result.sequence.workComplete && !vcsReset->uncertain && !vcsReset->complete)
+        result.workRefusedUntouched=true;
+    // The PM experiment callback returns false only when it refused at its page
+    // evidence check, before any write.
+    if(vcsPmResult && result.sequence.workAttempted && !result.sequence.workComplete && !vcsPmResult->attempted)
         result.workRefusedUntouched=true;
     if(vcsSelftest && copyResult && result.sequence.workAttempted && !result.sequence.workComplete &&
        copyResult->refusalStep && !copyResult->resetUncertain && !copyResult->portWriteAttempts && !copyResult->ggttWriteAttempts &&
@@ -1130,6 +1200,10 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run) {
     run={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,false,nullptr,token,&run,
         nullptr,nullptr,nullptr,nullptr,false,nullptr,true);
+}
+void VmmDellVcsPmOp(uint32_t khz,uint8_t op,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& r) {
+    r={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,0,0,nullptr,nullptr,nullptr,false,nullptr,0,nullptr,
+        nullptr,nullptr,nullptr,nullptr,false,nullptr,false,op,&r);
 }
 void VmmDellVcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset) {
     reset={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,0,0,nullptr,nullptr,nullptr,false,nullptr,0,nullptr,
