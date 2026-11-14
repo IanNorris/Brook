@@ -52,6 +52,11 @@ bool KMutexTryLock(KMutex* m){if(m->locked)return false;m->locked=1;return true;
 void KMutexUnlock(KMutex* m){assert(m->locked);m->locked=0;}
 extern "C" bool AudioRegister(const AudioDriver* d){++registerCalls;if(scenario==45)return false;registered=d;return true;}
 uint32_t AudioOutputControl(){return fakeOutput;}
+static bool fakeStaging=false;static uint32_t fakeStagingLimit=1024;
+void AudioMixerStagingEnable(bool on){fakeStaging=on;}
+bool AudioMixerStagingEnabled(){return fakeStaging;}
+bool AudioMixerStagingSetFrameLimit(uint32_t f){if(!f || f>4096)return false;fakeStagingLimit=f;return true;}
+uint32_t AudioMixerStagingFrameLimit(){return fakeStagingLimit;}
 bool AudioUserUnmuteRequested(){return fakeAuthorized;}
 uint32_t AudioOutputControlSnapshot(){return fakeOutput|(fakeAuthorized?AudioUserUnmuteBit:0u);}
 uint32_t PciBootInventoryCount(){return scenario>=20?16:scenario>=9 && scenario<=15?2:1;}
@@ -166,6 +171,7 @@ static void one(int which){
  if(which==42 || which==43){assert(o.streamRequested && o.streamAttempted && !o.streamFinished && o.streamQuarantined && !toneFrees && cmd==2);}
  if(which==44){assert(o.runtimeRequested && o.runtimePrepared && !o.runtimeRegistered && toneAllocations==17 && o.runtimePagesValidated==17 && cmd==2);
   HdaRuntimeRegister();assert(o.runtimeRegistered && registered && registerCalls==1);
+  assert(fakeStaging && fakeStagingLimit==HdaRuntimeDefaultStagingFrames); // Dell default downstream allowance
   assert(HdaRuntimeDrainClockAvailable() && HdaRuntimeDrainClockNs()>0);
   unsigned char samples[1764]{};const auto receipt=registered->trySubmit(samples,sizeof(samples));
   assert(receipt.accepted==sizeof(samples) && !receipt.error && !chip.sawQuietUnmute);
@@ -179,7 +185,7 @@ static void one(int which){
   assert(!HdaRuntimeDrainClockNs());
   assert(!registered->restart(again.epoch) && registered->trySubmit(samples,sizeof(samples)).error);
   HdaRuntimeRegister();assert(registerCalls==1);}
- if(which==45){assert(o.runtimePrepared);HdaRuntimeRegister();assert(!o.runtimePrepared && !o.runtimeRegistered && toneFrees==17 && cmd==0);
+ if(which==45){assert(o.runtimePrepared);HdaRuntimeRegister();assert(!o.runtimePrepared && !o.runtimeRegistered && toneFrees==17 && cmd==0 && !fakeStaging);
   HdaRuntimeRegister();HdaRuntimeShutdown();assert(registerCalls==1 && !registered && !o.runtimeQuarantined && !o.runtimeShutdown);}
  if(which==46){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0);HdaRuntimeRegister();assert(!registerCalls);}
  if(which==47){assert(o.runtimeRequested && !o.runtimePrepared && !toneAllocations && cmd==0 && !std::strcmp(o.runtimeReason,"all-CPU cache admission unavailable"));

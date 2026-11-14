@@ -20,6 +20,9 @@
 #include "apic.h"
 #include "kvmclock.h"
 #ifndef BROOK_HOST_TEST
+#include "tsc_clock.h"
+#endif
+#ifndef BROOK_HOST_TEST
 #include "vfs.h"
 #endif
 
@@ -31,7 +34,13 @@ extern "C" uint64_t AudioClockNowNs()
     // Delivered LAPIC ticks can undercount a CPU stall. Do not present that
     // fallback as a bound on elapsed DMA time. Add a hardware clock separately.
     uint64_t now = 0;
-    return KvmClockReadStableNs(&now) ? now : 0;
+    if (KvmClockReadStableNs(&now)) return now;
+#ifndef BROOK_HOST_TEST
+    // Bare metal: the invariant TSC is calibrated and cross-CPU consistent
+    // (tsc_clock.cpp). Without it, diagnostics/controls report an invalid clock.
+    if (TscClockAvailable()) return TscClockReadNs();
+#endif
+    return 0;
 }
 
 static SpinLock g_dspProducerLock;

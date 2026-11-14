@@ -1,7 +1,7 @@
 # Candidate normal-launcher audio integration. Guest acceptance is still required.
-{ pkgs ? import ../../nix/nixpkgs.nix {} }:
+{ pkgs ? import ../../nix/nixpkgs.nix {}, downstreamStaging ? false }:
 let
-  audio = import ../alsa-oss-pkg { inherit pkgs; };
+  audio = import ../alsa-oss-pkg { inherit pkgs downstreamStaging; };
   config = pkgs.writeText "brook-firefox-asound.conf" ''
     pcm_type.oss {
       lib "${audio}/lib/alsa-lib/libasound_module_pcm_oss.so"
