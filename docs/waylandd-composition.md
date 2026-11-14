@@ -79,3 +79,36 @@ On the Dell's Broadwell the absolute times are higher.
 ## Damage
 
 `wl_surface.damage` and `damage_buffer` are accepted but ignored (`waylandd.c`), so each repaint recomposes the whole window. Tracking damage through the surface tree, and recomposing and copying only the union, is the next CPU-path step after the layer offer.
+
+## Deploying to the Dell (not executed)
+
+There are two binaries:
+
+| Binary | Where it comes from | What it gets from this branch |
+|---|---|---|
+| **`INTLWL.ELF`** (the boot provider, which owns `wayland-0`) | built from `tools/waylandd-pkg --arg enableVulkanCompositor true` and embedded in the boot pair | the fast CPU path and the socket guard |
+| **`/nix/profile/bin/waylandd`** (started by the launcher) | the hardware profile package (currently `4p01fkxz…`) | **the socket guard, which needs this binary** |
+
+Until the profile binary is updated, the launcher's second server keeps stealing the socket.
+
+1. **Boot pair.** `build/dell/pair-waylandd-compose`, then `scripts/dell_deploy.py --session S --pair build/dell/pair-waylandd-compose --output build/dell/deploy-waylandd-compose`, with `BROOK_ROOT` set to the registry worktree. This alone fixes apps that connect before any launcher start.
+2. **Profile waylandd** (a persistent `/nix` change, so it needs Ian's authorization).
+   - New path: `nix-build tools/waylandd-pkg` (plain variant) gives `/nix/store/7gaxddpisyk93yxjs0wk3wp9jvv6mvh2-waylandd-brook-0.1-brook` (236 KiB: `bin/waylandd`, `bin/brook-xwm`). Rebuild and use the printed path if the branch changes.
+   - Its runtime closure is identical to the installed `4p01fkxz…` apart from itself (`nix-store -qR` diff), so nothing else is needed.
+   1. Read-only check (root job): `readlink /nix/profile/bin/waylandd /nix/profile/bin/brook-xwm` should point into `4p01…`, `/nix/profile/bin` should be a real directory (profiles are materialized; see `scripts/prepare_hardware_store.py`), and there should be no `/nix/store/7gax…`.
+   2. Upload a tar of the store path with `BulkRun put`. Extract it to `/nix/store/.brook-waylandd-stage/`, check the file hashes against the host, `chmod -R a-w`, and `mv` it to `/nix/store/7gax…`, as `stage-openal.sh canonical` does.
+   3. Atomically repoint both links:
+
+      ```
+      ln -s /nix/store/7gax…/bin/waylandd /nix/profile/bin/.waylandd.new && mv -T /nix/profile/bin/.waylandd.new /nix/profile/bin/waylandd
+      ```
+
+      Do the same for `brook-xwm`. `sync`.
+   4. **Verify:**
+      - Checked restart.
+      - Launch Chromium from the launcher.
+      - `procs` should show no `waylandd` besides `INTLWL.ELF`, and the launcher log should show `already has a live server; exiting`.
+      - The Chromium window should be served by INTLWL: its process takes the CPU in a profile.
+      - Repeat the gen 371 capture (`capture.py`) and compare the waylandd share and app stats ms.
+   5. **Rollback:** repoint both links to `4p01…`, which is left in place.
+3. **Pair-only alternative, if the store change is deferred.** Make the kernel launcher's `run --once waylandd` also count a running `INTLWL.ELF` (`src/kernel/src/window.cpp` around `ShellExecString("…run --service --once waylandd…")`). Not done on this branch.
