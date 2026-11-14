@@ -42,6 +42,7 @@ volatile uint32_t g_epbValue = 0;
 volatile int32_t g_epbTarget = -1;
 volatile uint64_t g_sampleGen = 0;
 volatile bool g_auto = false;
+volatile bool g_bootDefaultDone = false;
 volatile int64_t g_autoChoice[uint32_t(CpuIdleState::Count)] = {-1, -1, -1, -1, -1};
 volatile uint32_t g_autoDeepest = 0;
 volatile uint32_t g_khz = 0;
@@ -103,6 +104,14 @@ const Platform& Plat() {
 
 void CpuIdleEnter(uint32_t cpu) {
     const auto& plat = Plat();
+    // Boot default: the governor (gen 396 A/B: -22% idle package power, no
+    // yquake frame-time penalty). Selected once, by CPU 0's first idle entry;
+    // `cpu idle state hlt` (or any explicit state) overrides it. VMs and parts
+    // without usable MWAIT states stay on HLT (CpuIdleRequestAuto declines).
+    if (cpu == 0 && !__atomic_load_n(&g_bootDefaultDone, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_bootDefaultDone, true, __ATOMIC_RELEASE);
+        CpuIdleRequestAuto();
+    }
     CpuIdlePerCpu* pc = cpu < CpuIdleMaxCpus ? &g_cpu[cpu] : nullptr;
     if (pc) {
         pc->seen = true;

@@ -1,6 +1,6 @@
 # CPU idle C-states and energy bias (Broadwell-U)
 
-This is the first step of `docs/cpu-power-management-scope.md`. All of it is off by default: the boot behaviour is still `sti; hlt` (C1).
+This is the first step of `docs/cpu-power-management-scope.md`. The boot default is the `auto` governor, with EPB 6 when firmware left 0. `cpu idle state hlt` restores the old `sti; hlt` (C1) behaviour.
 
 ## Commands (debug channel)
 
@@ -64,4 +64,40 @@ On one boot, with the yquake demo and zero-copy wt:
 
 **Boot defaults:**
 - EPB becomes 6 when the firmware left 0 or 15 (Linux behaviour). The Dell's firmware value is 0, so this now applies at boot. Status shows `epb_firmware` and `epb_boot_applied`.
-- The idle state stays `hlt` by default until the governor has been A/B tested on the Dell.
+- **Idle state: `auto` at boot** (CPU 0 selects it at its first idle entry), after the gen 396 Dell A/B. VMs fall back to HLT.
+
+## Gen 396 Dell A/B (`pair-cpu-idle-gov`)
+
+| | 60 s idle, package | 2-buffer yquake displayed p50 / mean | yquake package peak |
+|---|---|---|---|
+| hlt | 4.57 W, 63 °C | 19.19 / 20.25 ms | 90 °C |
+| auto | **3.57 W, 59 °C** | **18.75 / 19.67 ms** | 87 °C |
+
+There were no audio gaps.
+
+| CPU0 under auto | c6 | c1e | c3 | holds | hit |
+|---|---|---|---|---|---|
+| Idle | 59,174 | 1,797 | 325 | 1,345 | 96% |
+| During the game | 94,359 | 122,685 | — | 117,803 | 97% |
+
+`pkg_pct` at idle showed c2 at 39%, with c3, c6 and c7 at 0%.
+
+## Why the package stops at PC2 (scoping, not yet tested)
+
+The cores reach C6, but the package never gets past PC2. Candidates, most likely first:
+
+1. **No PSR, display active.** The eDP panel is scanned out every refresh. Without Panel Self Refresh the display engine keeps fetching from memory, and on Broadwell-U that generally keeps the package out of PC3 and deeper (PC7+ in particular needs PSR). Brook leaves PSR off (`gpu flip probe` shows `PSR_CTL` 0x100001, not enabled), and the panel has been sensitive.
+   - **Test:** blank the panel (backlight off doesn't count, only the pipe), or bring up PSR later.
+2. **Periodic 1 ms LAPIC tick on every CPU.** Package C3+ needs every core idle at once. Unsynchronised 1 kHz ticks on four CPUs leave short common-idle windows, and each tick wakes a core and its uncore path.
+   - **Test:** a tickless-idle experiment that stops the tick on idle CPUs with no timers due, or at least aligns ticks across CPUs.
+3. **Audio DMA and other bus masters.** The HDA stream runs continuously once audio is open: the mixer publishes silence and "empty after" bytes. xHCI, AHCI and the network can also hold the package in PC2 through LTR or snoop traffic.
+   - **Test:** compare `pkg_pct` with no audio client open and the HDA stream stopped.
+4. **Not the C-state limit.** `PKG_CST_CONFIG_CONTROL` = 0x1e008408 decodes as:
+   - bits 3:0 = 8: package C-state limit **C10, i.e. unrestricted**;
+   - bit 10: I/O MWAIT redirection enabled;
+   - bit 15: **locked** (CFG Lock, so the limit can't be changed, though it doesn't need to be);
+   - bits 25–28: C3 and C1 auto-demotion and un-demotion all enabled.
+
+   Auto-demotion lets the hardware demote C6 or C3 requests when it predicts short residency. That's harmless here, but it's another reason core residency can fall short of the request.
+
+**Suggested order:** (3) costs nothing to check; then (2); then (1), which is the biggest and riskiest.

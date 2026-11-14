@@ -5134,7 +5134,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
             "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
-            "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default hlt; auto = menu governor)\n"
+            "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
             "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
