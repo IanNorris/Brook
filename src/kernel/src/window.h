@@ -88,7 +88,7 @@ bool WmCopyDesktopLayers(const WmDesktopLayers& layers,const WmDesktopLayerCopy*
 void WmReleaseDesktopLayers(WmDesktopLayers* layers);
 // Offscreen opaque-chrome prototype, one independent surface per window.
 // It excludes glass effects and does not yet version theme, title or hover.
-struct WmDesktopChrome {int32_t x,y;uint32_t width,height;};
+struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;}; // key: WmChromeKey of the rendered pixels
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
                                int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false);

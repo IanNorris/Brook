@@ -95,6 +95,7 @@
 #include "../../shared/brook_debug_frame.h"
 #include "ahci_readonly.h"
 #include "compositor_scene.h"
+#include "wm_chrome_key.h"
 #include "window.h"
 #include "gpu_app.h"
 #include "gpu_compositor.h"
@@ -12920,6 +12921,7 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
 
 static_assert(BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_HANDOFF_CTL && BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_OUTPUT_ALLOC,
               "desktop layers syscall must be distinct");
+WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {
@@ -12927,8 +12929,11 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
     auto* snapshot=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
     if(!wire || !snapshot){kfree(wire);kfree(snapshot);return -ENOMEM;}
     int64_t result=-EFAULT;
+    const bool keep=op==BROOK_DESKTOP_CHROME_TRACKED_KEEP;
+    const bool keyed=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED;
     if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
-        if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || wire->reserved || !wire->layers[0].window)result=-EINVAL;
+        const uint64_t heldKey=wire->reserved;
+        if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || (keep?!heldKey:wire->reserved!=0) || !wire->layers[0].window)result=-EINVAL;
         else if(!brook::WmAcquireDesktopLayers(snapshot))result=-95;
         else {
             auto& layer=wire->layers[0];uint32_t index=0;
@@ -12936,11 +12941,28 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
             if(index==snapshot->count)result=-ENOENT;
             else {
                 brook::WmDesktopChrome chrome{};
-                const bool tracked=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
-                result=brook::WmDesktopChromeCapture(*snapshot,index,&chrome,nullptr,0,-1,-1,tracked);
+                const bool tracked=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || keyed || keep;
+                int32_t keyMouseX=-1,keyMouseY=-1;
+                if(keep)MouseGetPosition(&keyMouseX,&keyMouseY);
+                result=brook::WmDesktopChromeCapture(*snapshot,index,&chrome,nullptr,0,keyMouseX,keyMouseY,tracked);
                 const uint64_t bytes=uint64_t(chrome.width)*chrome.height*4;
-                const bool capture=op!=BROOK_DESKTOP_CHROME_QUERY;
+                const bool capture=op!=BROOK_DESKTOP_CHROME_QUERY && !keep;
                 const auto& source=snapshot->layers[index];
+                uint64_t renderedKey=0;
+                if(!result && keep){
+                    // Unchanged chrome: the caller's buffer already holds these
+                    // exact pixels. Anything else (content, size, hover, focus,
+                    // title, theme) means recapture.
+                    if(wire->count!=1 || layer.incarnation!=source.incarnation || layer.width!=chrome.width ||
+                       layer.height!=chrome.height || layer.bytes!=bytes || chrome.key!=heldKey){
+                        __atomic_add_fetch(&brook::g_chromeCaptureStats.keepMisses,1,__ATOMIC_RELAXED);result=-116;
+                    }else if(!brook::WmDesktopLayersCaptureCurrent(*snapshot))result=-EAGAIN;
+                    else {
+                        renderedKey=heldKey;
+                        __atomic_add_fetch(&brook::g_chromeCaptureStats.keeps,1,__ATOMIC_RELAXED);
+                        __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesKept,bytes,__ATOMIC_RELAXED);
+                    }
+                }
                 if(!result && capture && (wire->count!=1 || layer.incarnation!=source.incarnation ||
                    (!tracked && layer.generation!=source.generation) || layer.width!=chrome.width || layer.height!=chrome.height ||
                    layer.clientX!=chrome.x || layer.clientY!=chrome.y || layer.bytes!=bytes))result=-EAGAIN;
@@ -12956,16 +12978,24 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
                         result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked);
                         if(!result && (current.x!=chrome.x || current.y!=chrome.y || current.width!=chrome.width || current.height!=chrome.height))result=-EAGAIN;
                         if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
+                        if(!result){
+                            renderedKey=current.key;
+                            __atomic_add_fetch(&brook::g_chromeCaptureStats.captures,1,__ATOMIC_RELAXED);
+                            __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesCopied,bytes,__ATOMIC_RELAXED);
+                        }
                         if(!result && !(tracked?brook::WmDesktopLayersCaptureCurrent(*snapshot):brook::WmDesktopLayersCurrent(*snapshot)))result=-EAGAIN;
                     }
                 }
                 kfree(pixels);
-                if(!result && op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE)
+                if(!result && (op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || keyed || keep))
                     result=brook::BdwOffscreenRegisterChrome(owner,source);
                 if(!result){
                     layer.incarnation=source.incarnation;layer.generation=source.generation;layer.bytes=bytes;
                     layer.width=layer.stride=layer.clientWidth=chrome.width;layer.height=layer.clientHeight=chrome.height;
                     layer.clientX=chrome.x;layer.clientY=chrome.y;layer.upscale=1;layer.flags=0;wire->count=1;
+                    // A chrome-less window has no pixels; its key is still
+                    // meaningful (0 bytes) so the caller can keep it too.
+                    wire->reserved=(keyed||keep)?(renderedKey?renderedKey:chrome.key):0;
                     if(!CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
                 }
             }
@@ -13025,7 +13055,8 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
-    if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE) &&
+    if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE ||
+        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
     if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
