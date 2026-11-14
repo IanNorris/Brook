@@ -34,7 +34,7 @@ one window's content as another window after slot reuse. Sources may be written
 without publication, so captured producer pixels are not necessarily immutable
 snapshots. Per-window opacity, client alpha, clipping and integer scaling are
 supported in the Vulkan scene; backdrop blur is not and currently makes the
-renderer yield to the OS path. See `agent/HANDOVER.md` for exact test scope,
+renderer yield to the OS path. See `agent/AGENT_JOURNAL.md` for exact test scope,
 current deployment, hardware and recovery state.
 
 The Intel implementation supports multiple shared buffers, fences, protected
