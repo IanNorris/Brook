@@ -92,6 +92,22 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Night of 14 Nov, unattended (gens 387–393):**
+- **Gen 387 panic** while unattended, during yquake with idle windows open: `Broadwell worker uncertain … gt=0 … sampled=0` on a compositor job. Five early-exit paths before any device access were classified uncertain, and two also poisoned the forcewake claim. Fixed in `work/worker-refusal` 2bbe1ef1: classified as RefusedUntouched, retried up to 16×, with the reason logged.
+- **Gen 386 panic** (GPU Chromium, 65k-page job): fixed in `work/worker-overhead` 67a27e3d. The table limit went 128 → 512, and unmappable jobs are refused (`ENOSPC`, or "job refused"), never panicked.
+- **Gen 388 soak** (`work/worker-refusal` = integration5 + fix), ~25 min unattended: **no panics, restarts or refusals.**
+  - Benchmark alone: mean 19.9 / p50 18.3 ms. With Gallery + Settings open: 21.7 / 21.3 ms (6,648 keeps / 103 captures).
+  - GPU Chromium YouTube for 90 s: 3,492 app jobs, fine.
+  - 15 min live demo: 74–79 °C, ~10 W, CPU pinned at ~2.9 GHz; **package max 100 °C since boot**.
+- **Worker overhead per job** (gen 387): prepare 0.56 ms (attach 0.22, publish 0.16, snapshot DMA 0.17), reprepare 0.20 ms, audit 15 µs; batch fallbacks 0.
+- **VA-API phase 1 complete** (`work/vaapi` 2693a25b, gen 393, `BROOK_BDW_VIDEO_ENGINE=ON`, runtime `gpu video on|probe|reset|selftest|pm …`):
+  - The VCS self-test passes 3/3 with zero-copy armed and no effect on desktop fps or clock.
+  - Found along the way:
+    - **a VCS media reset resets RING_MAX_IDLE 10 → 64, so RC6 drops to 0% and the GPU clock sags;** firmware values are now restored after every reset;
+    - holding the diagnostic lease across VCS retries starved presents and stranded a zero-copy ring image; VCS steps now run as short queued steps on the CPU0 worker.
+  - **Open (zero-copy path):** any diagnostic holding the lease while zero-copy is armed (e.g. `gpu flip probe`) can still strand an image.
+- **Next:** VA-API 1c (user BSD submission) then 2a (libdrm_intel softpin patch, packaging); MWAIT idle and energy bias (thermal safety); merge the integration chain to main.
+
 **Late 14 Nov (gens 385–387, Ian present until ~20:45):**
 - **PPGTT builder made linear** (`work/ppgtt-cache` d90993bf). Gen 385, 2-buffer demo: prepare 2.0 → 1.04 ms, compositor 12.9 → 11.6 ms, swaps 57/s, displayed mean 19.9 / **p50 17.6** ms. The table-reuse cache gives no gain (132 hits of ~1.5k); leave it off.
 - **Chrome keep** (`work/chrome-capture` 389b0d69): window chrome is cached by content key, so steady frames copy 0 bytes (~15 MB per frame before).
