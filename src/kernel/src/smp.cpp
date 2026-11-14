@@ -2,6 +2,7 @@
 #include "panic.h"
 #include "smp.h"
 #include "native_tsc_policy.h"
+#include "tsc_clock.h"
 #include "cache_snapshot_collect.h"
 #include "acpi.h"
 #include "apic.h"
@@ -96,12 +97,18 @@ static void InstallPanicNmiHandler();
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
 static NativeTscMailbox g_nativeTscMailbox[MAX_CPUS]{};
 static uint32_t g_nativeTscArmed=0;static bool g_nativeTscAttempted=false;
+// The rendezvous runs once (a timed-out mailbox is never reused); later callers
+// (the clock selection, then the marker-gated observation) share its result.
+static NativeTscCpuObservation g_nativeTscResults[MAX_CPUS]{};static uint32_t g_nativeTscResultCount=0;
 static CpuCacheSnapshot g_cacheSnapshots[MAX_CPUS]{};
 static uint32_t g_cacheSnapshotStatus[MAX_CPUS]{},g_cacheSnapshotArmed=0;
 static bool g_cacheSnapshotAttempted=false;
 struct NativeTscExchangeIo {
-    bool capable(){return NativeTscCapabilities([](uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
-        __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(0));});}
+    // Ordered RDTSCP on an invariant TSC. A hypervisor bit does not prevent a
+    // measurement; clock admission policy decides what to do with it.
+    bool capable(){const auto f=TscReadCpuFeatures([](uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
+        __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(0));});
+        return f.tsc && f.rdtscp && f.invariant;}
     bool tsc(uint64_t& value){uint32_t lo,hi,aux;__asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
         value=(uint64_t(hi)<<32)|lo;return true;}
     void pause(){__asm__ volatile("pause");}
@@ -253,6 +260,7 @@ void ApEntryFunction()
     if (KvmClockAvailable() && !KvmClockInitOnCpu(myCpuIndex))
         KernelPanic("SMP: pvclock registration failed before scheduler entry");
     KvmStealInit(myCpuIndex);
+    TscClockInitOnCpu(myCpuIndex);
 
     // Start LAPIC timer on this AP.
     ApicInitTimerOnAp();
@@ -610,8 +618,12 @@ uint32_t SmpGetCpuCount()
 
 uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* out,uint32_t capacity)
 {
-    if(!out || SmpCurrentCpuIndex()!=0 || g_nativeTscAttempted)return 0;
+    if(!out || SmpCurrentCpuIndex()!=0)return 0;
     const uint32_t count=SmpGetCpuCount();if(!count || count>MAX_CPUS || capacity<count-1)return 0;
+    if(g_nativeTscAttempted){
+        for(uint32_t i=0;i<g_nativeTscResultCount;++i)out[i]=g_nativeTscResults[i];
+        return g_nativeTscResultCount;
+    }
     for(uint32_t cpu=1;cpu<count;++cpu)if(__atomic_load_n(&g_apActivate[cpu],__ATOMIC_ACQUIRE))return 0;
     NativeTscExchangeIo io;if(!io.capable())return 0;g_nativeTscAttempted=true;
     __atomic_store_n(&g_nativeTscArmed,1u,__ATOMIC_RELEASE);
@@ -625,7 +637,9 @@ uint32_t SmpObserveNativeTsc(NativeTscCpuObservation* out,uint32_t capacity)
             ++item.exchanges;
         }
     }
-    __atomic_store_n(&g_nativeTscArmed,0u,__ATOMIC_RELEASE);return count-1;
+    __atomic_store_n(&g_nativeTscArmed,0u,__ATOMIC_RELEASE);
+    for(uint32_t i=0;i+1<count;++i)g_nativeTscResults[i]=out[i];
+    g_nativeTscResultCount=count-1;return count-1;
 }
 
 bool SmpObserveCacheSnapshots(CpuCacheSnapshot* out,uint32_t capacity)

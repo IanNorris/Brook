@@ -77,6 +77,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "fw_cfg.h"
 #include "rtc.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "vmware_clock.h"
 #include "vdso.h"
 #include "watchdog.h"
@@ -612,6 +613,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     {
         uint32_t cpuCount = brook::SmpInit();
         brook::KPrintf("SMP          %u CPU(s) online\n", cpuCount);
+        // APs now wait in their bootstrap loop and can answer the TSC
+        // rendezvous. Decide the elapsed clock before any user process.
+        brook::TscClockSelect();
     }
     brook::BootLogoProgress(30, "SMP");
 

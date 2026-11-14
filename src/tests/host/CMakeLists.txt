@@ -844,6 +844,8 @@ add_host_test(test_native_tsc_pit)
 add_host_test(test_native_tsc_observe "${BROOK_ROOT}/src/kernel/src/native_tsc_observe.cpp")
 add_host_test(test_native_tsc_rendezvous)
 add_host_test(test_native_tsc_audio_clock)
+add_host_test(test_tsc_clock)
+target_compile_options(test_tsc_clock PRIVATE -UNDEBUG)
 target_compile_options(test_native_tsc_observe PRIVATE -DBROOK_HOST_TEST "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_compile_options(test_vmware_clock PRIVATE -UNDEBUG)
 

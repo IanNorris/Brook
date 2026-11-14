@@ -100,6 +100,7 @@
 #include "net.h"
 #include "rtc.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "audio.h"
 #include "hda_observe.h"
 #include "dsp_write_plan.h"
@@ -6195,11 +6196,12 @@ struct timeval {
 // Coarse clocks retain their corresponding epoch. Higher precision is safe;
 // returning uptime for REALTIME_COARSE makes absolute realtime waits expire.
 // CLOCK_REALTIME=0, REALTIME_COARSE=5; MONOTONIC=1, RAW=4, COARSE=6, BOOTTIME=7.
+// Monotonic: KVM pvclock, else the invariant TSC, else delivered LAPIC ticks
+// (tsc_clock.h). Realtime is the boot RTC epoch plus that elapsed time.
 static uint64_t ClockNowNs(uint64_t clockid)
 {
     if (clockid == 0 || clockid == 5 || clockid == 8) return RtcNowNs();
-    return KvmClockAvailable() ? KvmClockReadNs()
-                               : ApicTickCount() * 1000000ULL;
+    return ElapsedClockNs();
 }
 
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
@@ -6225,7 +6227,7 @@ static int64_t sys_clock_getres(uint64_t clockid, uint64_t tsAddr, uint64_t,
     timespec value{};auto* ts=&value;
 
     ts->tv_sec = 0;
-    ts->tv_nsec = clockid == 2 || clockid == 3 ? 1000000 : (KvmClockAvailable() ? 1 : 1000000);
+    ts->tv_nsec = clockid == 2 || clockid == 3 ? 1000000 : (ElapsedClockNsResolution() ? 1 : 1000000);
     return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
 }
 

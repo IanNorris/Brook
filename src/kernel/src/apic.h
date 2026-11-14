@@ -99,7 +99,8 @@ void IoApicMaskIrq(uint8_t irq);
 void ApicInitTimerOnAp();
 
 // Monotonic elapsed milliseconds. Stable KVM pvclock is selected after its
-// initialization; otherwise this is an approximate delivered-IRQ clock.
+// initialization, the invariant TSC on admitted bare metal (TscClockSelect);
+// otherwise this is an approximate delivered-IRQ clock.
 uint64_t ApicTickCount();
 // Diagnostic raw BSP timer interrupt count. Unlike ApicTickCount this never
 // switches to a paravirtual or VMware elapsed clock and can undercount stalls.
@@ -108,10 +109,15 @@ uint64_t ApicRawBspIrqCount();
 // BSP only. Preserve the existing origin when selecting stable elapsed time.
 // A BSP timer interrupt retries if the initial elapsed-source sample is unavailable.
 bool ApicInitElapsedClock();
+// TscClockSelect only, interrupts disabled: elapsed ms follow the TSC clock.
+void ApicSelectTscElapsedClock();
+// The five per-window TSC rates from the boot LAPIC/PIT calibration.
+void ApicGetTscKhzSamples(uint32_t (&samples)[5]);
 
 struct ApicClockSnapshot {
     bool pvclock;
     bool vmwareTsc;
+    bool nativeTsc;
     uint64_t elapsedMs;
     uint64_t rawBspIrqs;
     uint64_t originNs;
