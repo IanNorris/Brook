@@ -3,11 +3,13 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <string>
 #include "intel_bdw_video.h"
 #include "intel_bdw_bcs_reset.h"
 #include "intel_bdw_bcs_init.h"
 #include "intel_bdw_context.h"
 #include "intel_bdw_submission.h"
+#include "intel_bdw_ioctl_trace.h"
 
 using namespace brook;
 
@@ -197,7 +199,22 @@ static void TestStepSlot(){
     assert(!workerService() && deviceSteps==1 && slot.state()==BdwVideoStepSlot::Idle);
 }
 
+namespace brook {BdwIoctlTrace& BdwIoctlTraceState(){static BdwIoctlTrace t;return t;}}
+static void TestIoctlTrace(){
+    auto& t=BdwIoctlTraceState();
+    t.record(1,0x46,16,5,0);assert(t.next==0);              // disabled: nothing recorded
+    t.enabled=1;
+    for(uint32_t i=0;i<300;++i)t.record(7,0x69,64,0x802u|i,-22);
+    assert(t.next==300 && t.dropped==44);
+    const auto& last=t.entries[299%BdwIoctlTraceCapacity];
+    assert(last.seq==300 && last.pid==7 && last.nr==0x69 && last.detail==(0x802u|299) && last.result==-22);
+    t.reset();assert(t.next==0 && t.dropped==0 && t.entries[0].seq==0);
+    assert(std::string(BdwIoctlName(0x69))=="I915_GEM_EXECBUFFER2" && std::string(BdwIoctlName(0x46))=="I915_GETPARAM");
+    assert(!BdwVideoUserSubmissionReady());                 // no executor in this build
+}
+
 int main(){
+    TestIoctlTrace();
     TestStepSlot();
     TestPmRestore();
     TestVcsContext();

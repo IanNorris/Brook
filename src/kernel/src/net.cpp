@@ -11,6 +11,7 @@
 #include "intel_bdw_worker_stats.h"
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_video.h"
+#include "intel_bdw_ioctl_trace.h"
 #include "intel_bdw_critical.h"
 #include "intel_bdw_forcewake_adapter.h"
 #include "intel_bdw_oneshot.h"
@@ -5826,6 +5827,33 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"BROOK_BDW_RPS_TRIAL kernel required\"}\n");
 #endif
+    }
+    else if(StrStartsWith(cmd,"gpu ioctl trace")) {
+        // VA-API phase 2: which i915 ioctls a userspace driver uses on Brook.
+        auto& t=BdwIoctlTraceState();
+        if(NetStrEq(cmd,"gpu ioctl trace on")){t.reset();__atomic_store_n(&t.enabled,1u,__ATOMIC_RELEASE);}
+        else if(NetStrEq(cmd,"gpu ioctl trace off"))__atomic_store_n(&t.enabled,0u,__ATOMIC_RELEASE);
+        else if(NetStrEq(cmd,"gpu ioctl trace reset"))t.reset();
+        else if(!NetStrEq(cmd,"gpu ioctl trace dump") && !NetStrEq(cmd,"gpu ioctl trace status")){
+            DebugChannelSend("Usage: gpu ioctl trace on|off|reset|status|dump\n");return;}
+        const uint32_t next=__atomic_load_n(&t.next,__ATOMIC_ACQUIRE);
+        BridgeReply r;r.text("{\"enabled\":");r.text(t.enabled?"true":"false");
+        r.text(",");r.field("recorded",next);r.text(",");r.field("dropped",__atomic_load_n(&t.dropped,__ATOMIC_RELAXED));
+        if(NetStrEq(cmd,"gpu ioctl trace dump")){
+            r.text(",\"entries\":[");
+            const uint32_t count=next<BdwIoctlTraceCapacity?next:BdwIoctlTraceCapacity;
+            const uint32_t first=next-count;
+            for(uint32_t k=0;k<count;++k){const auto& e=t.entries[(first+k)%BdwIoctlTraceCapacity];
+                if(k)r.text(",");
+                r.text("{");r.field("seq",e.seq);r.text(",");r.field("pid",e.pid);r.text(",");r.field("nr",e.nr);
+                r.text(",\"name\":\"");r.text(BdwIoctlName(e.nr));r.text("\"");
+                r.text(",");r.field("size",e.size);r.text(",");r.field("detail",e.detail);
+                r.text(",\"result\":");if(e.result<0){r.text("-");r.number(uint64_t(-e.result));}else r.number(uint64_t(e.result));
+                r.text("}");}
+            r.text("]");
+        }
+        r.text(",\"scope\":\"i915 ioctls seen by Brook since trace on: nr (core DRM or 0x40+i915 nr), size, detail = GETPARAM id or execbuffer2 flags, result; 256-entry ring\"}\n");
+        r.send();
     }
     else if(StrStartsWith(cmd,"gpu video")) {
         // VA-API phase 1: VCS0 (video engine) bring-up. Build option

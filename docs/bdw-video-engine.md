@@ -188,3 +188,37 @@ Both need **relocation-free submission** from Brook's point of view: Brook's exe
     - Status reports `worker_steps` (serviced, lease_busy, timeouts).
   - **Regression test:** `TestStepSlot` checks that the caller side never holds the lease, that a busy lease requeues without running, that a started step cannot be withdrawn, and that a timed-out step never runs.
   - **Separate issue for the zero-copy owner:** any present refused at the diagnostic-lease check (`Unavailable`) while zero-copy is armed can strand a ring image. Other diagnostics (`gpu flip probe`, store probes and so on) can still trigger it. It should be fixed in the present path, by not refusing zero-copy presents on the lease, or by unwinding the image reservation.
+
+## Status after gen 393, and phase 1c / 2a progress (p1c0)
+
+**Phase 1 (1a, 1b) passes on the Dell (gen 393).**
+- `gpu video reset`: RC6 resumed (95%), engine_restores 1.
+- 3 self-tests pass, RC6 97%.
+- yquake shows no regression: 19.8 ms base, 20.2–20.4 ms after; mhz 500; zero-copy stays active.
+- No quad_reserve loops; worker_steps 20 serviced, 0 lease_busy, 0 timeouts.
+
+**Done in this round:**
+- **HAS_BSD and BSD admission:** both are now driven by `BdwVideoUserSubmissionReady()` (`intel_bdw_video.h`), which only a kernel with the VCS user-job executor will set, after a self-test on that boot with the gate on. This build has no executor, so `HAS_BSD`=0. An `I915_EXEC_BSD` execbuffer is refused with the recorded reason `execbuffer: I915_EXEC_BSD video engine submission not available`.
+- **ioctl trace harness:** `gpu ioctl trace on|off|reset|status|dump` records, for every i915-compatible ioctl, the pid, nr (with name), size, detail and result, in a 256-entry ring. Detail is the GETPARAM id or the execbuffer2 flags. Running `vainfo` with tracing on shows exactly what i965 and libdrm_intel ask for and what Brook refuses, which is the phase 2 gap list measured instead of inferred.
+- **Packaging:** `tools/vaapi-brook-pkg` is a buildEnv of `libva`, `intel-vaapi-driver` (i965, `i965_drv_video.so`), `libva-utils` (`vainfo`) and `ffmpeg` with the VAAPI hwaccel, from the pinned nixpkgs. It builds on the host. i965 links `libdrm_intel` from `libdrm-2.4.131`.
+
+**Not done: the phase 1c VCS user-job executor.** The plan, from the code:
+- **Page tables:** reuse the engine-independent page-table build (`BdwExecTables` / `gemProbeTables.Prepare` plus the snapshot DMA inspection and publication in `BdwPrepareRetainedSubmissionChecked`). Use a **second** `BdwExecTables` instance and a VCS-private GGTT reservation, never the RCS ones (65544/29).
+- **One-shot:** a `BdwVcsUserOneShot`, modelled on `BdwRenderOneShot::AttachExternalSnapshot`/`ArmExternalSnapshot` without render state. It needs:
+  - a fresh, restore-inhibited xCS context per job from `BdwBuildVcsContext64`, with PML4 from the snapshot's tables;
+  - a ring of `MI_BATCH_BUFFER_START` (PPGTT) to the user batch, then the breadcrumb;
+  - its own HWS/CSB.
+
+  Media state is fully re-emitted per batch by i965, so no context persistence is needed.
+- **Run:** the existing `vcsSelftest` copy-work-item flow: reset with firmware engine restore, PAT lease, takeover bind, execlist init, ELSP, CSB, reset, unbind. Device step via `BdwVideoStepSlot`.
+- **Worker routing:** an execbuffer with engine 2 becomes a snapshot tagged VCS. The application worker routes VCS snapshots to the VCS executor, between RCS jobs, so RCS presents are never blocked longer than one VCS job. Fences use the existing snapshot retirement.
+- **Failure policy:**
+  - size or resource limits refuse the job (fence error);
+  - a breadcrumb or CSB deadline (hang) means VCS reset, then fail the job's fence, then quarantine VCS for the boot;
+  - panic only on uncertain GDRST, PAT or forcewake, as in 1b.
+
+**Phase 2a, still to do:**
+- the libdrm_intel softpin patch: per-process VA allocator at BO creation, `drm_intel_bo_set_softpin_offset`, execbuffer with `NO_RELOC | HANDLE_LUT`, as an override of `libdrm` for the i965 driver only;
+- truthful GETPARAMs;
+- `SET_TILING`/`GET_TILING` metadata and `GEM_MMAP` WC;
+- confirming the list with `gpu ioctl trace` while running `vainfo`.

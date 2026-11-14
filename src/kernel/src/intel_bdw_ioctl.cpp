@@ -1,4 +1,9 @@
 #include "intel_bdw_refusal.h"
+#include "intel_bdw_ioctl_trace.h"
+#include "intel_bdw_video.h"
+#if !defined(BROOK_HOST_TEST)
+#include "process.h"
+#endif
 #include "intel_bdw_ioctl.h"
 #include "profiler.h"
 #include "intel_bdw_file.h"
@@ -78,6 +83,9 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
     ExecBuffer request{};if(!u.read(u.context,&request,arg,sizeof(request)))return fault;
     constexpr uint64_t noReloc=uint64_t{1}<<11,handleLut=uint64_t{1}<<12,batchFirst=uint64_t{1}<<18,fenceArray=uint64_t{1}<<19,useExtensions=uint64_t{1}<<21;
     const uint64_t engine=request.flags&63;
+    // I915_EXEC_BSD (2): VCS user submission (VA-API phase 1c) is not wired
+    // into the worker yet; refuse it explicitly with a recorded reason.
+    if(engine==2 && !BdwVideoUserSubmissionReady()){BdwNoteRefusal("execbuffer: I915_EXEC_BSD video engine submission not available");return invalid;}
     if(!request.count || request.count>8192 || !request.objects ||
        (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>1 ||
        request.dr1 || request.dr4 || request.context>0xffffffffull || request.fences ||
@@ -146,7 +154,25 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
 int64_t BdwIntelCopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserAccess& u,BdwExecSnapshot** out){
     return CopyExecSnapshot(file,arg,u,out,nullptr);
 }
+BdwIoctlTrace& BdwIoctlTraceState(){static BdwIoctlTrace trace;return trace;}
+static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& u);
+// Traced entry: records the ioctl, the GETPARAM id or execbuffer flags, and the result.
 int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& u){
+    const int64_t result=RenderIoctl(file,cmd,arg,u);
+    auto& trace=BdwIoctlTraceState();
+    if(__atomic_load_n(&trace.enabled,__ATOMIC_ACQUIRE) && ((cmd>>8)&255)=='d'){
+        const uint32_t nr=uint32_t(cmd&255),size=uint32_t((cmd>>16)&0x3fff);uint64_t detail=0;
+        if(nr==0x46 && size==16 && u.read){int32_t param=0;if(u.read(u.context,&param,arg,4))detail=uint32_t(param);}
+        else if(nr==0x69 && size>=48 && u.read){uint64_t flags=0;if(u.read(u.context,&flags,arg+40,8))detail=flags;}
+        uint32_t pid=0;
+#if !defined(BROOK_HOST_TEST)
+        if(const auto* p=ProcessCurrent())pid=p->pid;
+#endif
+        trace.record(pid,nr,size,detail,result);
+    }
+    return result;
+}
+static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& u){
     constexpr int64_t badfd=-9,notty=-25,fault=-14,invalid=-22,noent=-2,nomem=-12;
     if(!file)return badfd;
     if(!u.read || !u.writable || !u.write)return fault;
@@ -186,7 +212,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         // HAS_BSD: VCS submission is not implemented (VA-API phase 1b). Answer 0
         // explicitly so libva/i965 probe the engine as absent instead of seeing
         // an error. I915_EXEC_BSD stays refused by execbuffer (engine>1).
-        case 5: value=0;break;
+        case 5: value=BdwVideoUserSubmissionReady()?1:0;break;
         case 19: value=(u.nowNs && u.sleepNs)?1:0;break; // HAS_WAIT_TIMEOUT
         // Iris can use the implemented WB mmap-offset path in this explicit
         // bring-up mode. Other cache modes still fail the mmap-offset ioctl.

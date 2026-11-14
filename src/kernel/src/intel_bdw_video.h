@@ -289,4 +289,11 @@ public:
     void complete(){__atomic_store_n(&state_,Done,__ATOMIC_RELEASE);}
     bool pending()const{return state()==Queued;}
 };
+
+// VCS user submission (I915_EXEC_BSD) readiness, read by the i915 ioctl layer
+// for HAS_BSD and execbuffer admission. Set only by a kernel with the VCS
+// user-job executor (phase 1c), with the gate on and a self-test passed this
+// boot. This build has no executor, so it is never set.
+inline uint32_t& BdwVideoUserSubmissionStorage(){static uint32_t ready=0;return ready;}
+inline bool BdwVideoUserSubmissionReady(){return __atomic_load_n(&BdwVideoUserSubmissionStorage(),__ATOMIC_ACQUIRE)!=0;}
 }
