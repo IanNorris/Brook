@@ -18,6 +18,7 @@
 #include "source_size_policy.h"
 #include "desktop_gpu_channel.h"
 #include "desktop_async_source_barrier.h"
+#include "desktop_stats.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -52,7 +53,7 @@ struct RenderContext {
 struct PendingDesktopFrame {
     long ticket;uint64_t frame,started,nextReport,skippedBytes;uint32_t width,height,visible,skippedLayers;unsigned direct;
     int partial,graphics,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
-    uint64_t traceStart,traceSubmitStart,traceReceived,traceCompleted;uint32_t traceWindow;uint64_t traceIncarnation,traceCommit;
+    uint64_t traceStart,traceSubmitStart,traceReceived,traceCompleted,statsSubmitStart,statsFence;uint32_t traceWindow;uint64_t traceIncarnation,traceCommit;
     uint64_t traceChannel,traceQuery,traceClients,traceBackdrop,traceChrome,traceOverlay,tracePixels;
     uint32_t traceLayers,traceRegions;
     struct AsyncWindowSource sources[BROOK_DESKTOP_LAYER_LIMIT];
@@ -72,6 +73,10 @@ static uint64_t g_gpuDirectTraced[BROOK_DESKTOP_LAYER_LIMIT];
 static struct {uint64_t sum[6],maxTotal;unsigned frames;} g_stageTiming;
 static int g_presentFrame,g_asyncPresent,g_dependentPartial;
 static long g_presentingTicket;
+/* Always-on counters (desktop_stats.h), published by stats_tick(). */
+static struct DesktopStats g_stats;
+static volatile sig_atomic_t g_statsRequested;
+static void stats_request_signal(int signalNumber){(void)signalNumber;g_statsRequested=1;}
 
 static int present_full(uint64_t ticket,uint32_t width,uint32_t height){
     if(g_presentFrame){
@@ -168,8 +173,8 @@ static int batch_output_ensure(struct RenderContext *ctx,uint64_t bytes){
 static uint64_t monotonic_ns(void);
 static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t height,
                            struct BrookDesktopOverlayBands *bands){
-    uint64_t start=monotonic_ns(),ready=0;unsigned polls=0;
-    long token=syscall(BROOK_SYS_DESKTOP_OVERLAY,0,0,0,0,0,0);if(token<=0)return -1;
+    uint64_t start=monotonic_ns(),ready=0,pollEnd=0;unsigned polls=0;
+    long token=syscall(BROOK_SYS_DESKTOP_OVERLAY,0,0,0,0,0,0);if(token<=0){desktop_stats_overlay(&g_stats,0,0,0);return -1;}
     struct BrookDebugFrameInfo info={0};int result=-1;
     for(unsigned retry=0;retry<500;++retry){
         ++polls;
@@ -177,6 +182,7 @@ static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t
         if(info.state!=1)break;
         usleep(10000);
     }
+    pollEnd=monotonic_ns();
     if(info.state!=2 || info.width!=width || info.height!=height || info.stride!=width ||
        info.bytes!=(uint64_t)width*height*4)goto done;
     ready=monotonic_ns();
@@ -193,6 +199,8 @@ static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t
     }
     result=0;
 done: (void)syscall(BROOK_SYS_DESKTOP_OVERLAY,3,token,0,0,0,0);
+    if(!pollEnd)pollEnd=monotonic_ns();
+    desktop_stats_overlay(&g_stats,!result,polls,start && pollEnd>=start?pollEnd-start:0);
     if(getenv("BROOK_RENDER_TIMING") && ready>=start && start){uint64_t end=monotonic_ns();
         if(end>=ready)fprintf(stderr,"DESKTOP_OVERLAY_TIMING wait_ms=%lu copy_ms=%lu polls=%u bands=%u\n",
             (unsigned long)((ready-start)/1000000ull),(unsigned long)((end-ready)/1000000ull),polls,bands->count);}
@@ -247,7 +255,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct AsyncWindowSource frameSources[BROOK_DESKTOP_LAYER_LIMIT]={{0}};
     unsigned clientSourceIndex[BROOK_DESKTOP_LAYER_LIMIT]={0};
     uint64_t traceReceived=0,traceIncarnation=0,traceCommit=0,traceSubmitStart=0;uint32_t traceWindow=0;
-    uint32_t scene[SCENE_HEADER]={0};long ticket=-1;int result=-1,attemptPartial=0,savedErrno=0;unsigned frameDirect=0;const char *stage="query";
+    uint32_t scene[SCENE_HEADER]={0};long ticket=-1;int result=-1,attemptPartial=0,savedErrno=0,presentFailed=0;unsigned frameDirect=0;const char *stage="query";
+    uint64_t statsSubmitStart=0;
     if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_LAYERS_QUERY,&layers,sizeof(layers),0,0,0) ||
        layers.count>BROOK_DESKTOP_LAYER_LIMIT ||
        syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_BACKDROP_QUERY,&backdrop,sizeof(backdrop),0,0,0))goto done;
@@ -445,7 +454,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,baselineTicket?BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:BROOK_GPU_HANDOFF_RESERVE,
                     ctx->output,baselineTicket,0,0,0);if(ticket<=0)goto done;
                 struct BrookVkGraphicsBuffer output={ctx->output,-1,width,height,0,width,(uint64_t)width*height*4u};
-                if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=monotonic_ns();
+                statsSubmitStart=monotonic_ns();
+                if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
                 status=brook_vk_graphics_pass_submit_regions(ctx->graphics,culledScene,SCENE_HEADER,inputs,batchCount,&output,regions,damage.count);
                 if(status==BROOK_VK_PENDING){graphicsUsed=1;++g_graphicsSubmitted;}
                 else if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_PARTIAL_UNCERTAIN resources retained\n");for(;;)pause();}
@@ -471,7 +481,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         stage="batch_reserve";ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,baselineTicket?BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:BROOK_GPU_HANDOFF_RESERVE,ctx->batchOutput,baselineTicket,0,0,0);if(ticket<=0)goto done;
         stage="batch_test_arm";testArmed=arm_test_block(ticket);if(testArmed<0)goto done;
         stage="batch_compose";
-        if(pending && getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=monotonic_ns();
+        statsSubmitStart=monotonic_ns();
+        if(pending && getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
         status=pending?brook_vk_renderer_submit_batch_output(ctx->batchRenderer,ctx->batchScenes,(size_t)damage.count*BROOK_VK_TILE_STRIDE,
                    damage.count,batchSources,batchCount,ctx->batchOutput,ctx->batchOutputBytes/4):
             brook_vk_renderer_compose_batch_output(ctx->batchRenderer,ctx->batchScenes,(size_t)damage.count*BROOK_VK_TILE_STRIDE,
@@ -482,7 +493,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         stage="full_reserve";ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,ctx->output,0,0,0,0);if(ticket<=0)goto done;
         stage="full_test_arm";testArmed=arm_test_block(ticket);if(testArmed<0)goto done;
         stage="full_compose";
-        if(pending && getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=monotonic_ns();
+        statsSubmitStart=monotonic_ns();
+        if(pending && getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
         status=BROOK_VK_REJECTED;
         if(pending && ctx->graphics && !testArmed && count<=BROOK_VK_GRAPHICS_MAX_LAYERS){
             struct BrookVkGraphicsBuffer inputs[BROOK_VK_GRAPHICS_MAX_LAYERS];
@@ -509,7 +521,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         for(unsigned i=0;i<layers.count;++i)if(skipMask&(1u<<i)){++skipped;skippedBytes+=layers.layers[i].bytes;}
         uint64_t now=monotonic_ns();
         *pending=(struct PendingDesktopFrame){.ticket=ticket,.frame=frame,.started=now,.traceStart=timing[0],
-            .traceSubmitStart=traceSubmitStart,.traceReceived=traceReceived,.traceWindow=traceWindow,.traceIncarnation=traceIncarnation,.traceCommit=traceCommit,
+            .traceSubmitStart=traceSubmitStart,.statsSubmitStart=statsSubmitStart,.traceReceived=traceReceived,.traceWindow=traceWindow,.traceIncarnation=traceIncarnation,.traceCommit=traceCommit,
             .traceChannel=traceChannel,.traceQuery=traceQuery,.traceClients=timing[1],.traceBackdrop=timing[2],.traceChrome=chromeEndNs,.traceOverlay=timing[3],
             .tracePixels=attemptPartial?damagePixels:(uint64_t)width*height,.traceLayers=traceLayers,.traceRegions=attemptPartial?damage.count:1,
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
@@ -570,9 +582,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     stage=attemptPartial?"region_present":"full_present";
     presentStartNs=monotonic_ns();
     if(attemptPartial){regionBatch.ticket=(uint64_t)ticket;
-        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&regionBatch,0,0,0,0))goto done;
-    }else if(present_full((uint64_t)ticket,width,height))goto done;
+        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
+    }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
+    desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){frameSources,layers.count,frameDirect,attemptPartial,graphicsUsed,
+        *presentedNs,timing[0],statsSubmitStart,timing[4],0,0});
     desktop_gpu_channel_presented(&g_gpuChannel,frame);
     if(getenv("BROOK_RENDER_TRACE_OCCLUSION"))for(unsigned i=0;i<count;++i){
         const struct DesktopGpuOffer *offer=directOffer[i];if(!offer || offer->state!=2)continue;
@@ -634,6 +648,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             (unsigned long)((timing[5]-timing[4])/1000000ull));
 done:
     savedErrno=errno;
+    if(result){if(presentFailed){++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}else ++g_stats.prepareFailures;}
     desktop_gpu_channel_finish(&g_gpuChannel,frame);
     if(ticket>0)(void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0);
     if(attemptPartial && result)ctx->damage=(struct DesktopDamageState){0};
@@ -669,7 +684,7 @@ static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer
         fprintf(stderr,"DESKTOP_ASYNC_UNCERTAIN stage=%d vk_result=%d resources retained\n",failure.stage,failure.result);
         for(;;)pause();
     }
-    p->compositionReady=1;
+    p->compositionReady=1;p->statsFence=monotonic_ns();
     p->traceCompleted=getenv("BROOK_RENDER_TIMELINE")?monotonic_ns():0;
     return 1;
 }
@@ -712,7 +727,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
         result=submit_present(p);
         if(g_asyncPresent){
             if(!result){g_presentingTicket=p->ticket;return 0;}
-            if(errno==EBUSY)return 0;
+            if(errno==EBUSY){++g_stats.presentBusy;return 0;}
         }
     }
     int savedErrno=errno;
@@ -722,11 +737,16 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
         async_sources_committed(g_asyncSourceBarriers,p->sources,p->visible);
         desktop_gpu_channel_presented(&g_gpuChannel,p->frame);
         g_gpuDirectLayers+=p->direct;g_gpuSkippedLayers+=p->skippedLayers;g_gpuSkippedBytes+=p->skippedBytes;
+        uint64_t gpuNs=0;const int gpuValid=p->graphics?brook_vk_graphics_pass_gpu_timestamp_ns(ctx->graphics,&gpuNs):
+            brook_vk_renderer_gpu_timestamp_ns(renderer,&gpuNs);
+        desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){p->sources,p->visible,p->direct,p->partial,p->graphics,
+            *presented,p->traceStart,p->statsSubmitStart,p->statsFence,gpuNs,gpuValid});
         if(getenv("BROOK_RENDER_ASYNC_TRACE"))for(unsigned i=0;i<p->visible;++i){const struct AsyncWindowSource *s=&p->sources[i];
             fprintf(stderr,"DESKTOP_ASYNC_SOURCE ticket=%ld window=%u incarnation=%llu generation=%llu source=%s commit=%llu snapshot_commit=%llu omitted=%u\n",
                 p->ticket,s->window,(unsigned long long)s->incarnation,(unsigned long long)s->generation,
                 s->commit?"gpu":"cpu",(unsigned long long)s->commit,(unsigned long long)s->snapshotCommit,s->omitted);}
-    }else {if(!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)
+    }else {++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;
+        if(!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)
             desktop_async_damage_retire(displayedDamage,p->damage,p->partial,0);
         (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,p->ticket,0,0,0,0);}
     desktop_gpu_channel_finish(&g_gpuChannel,p->frame);
@@ -757,6 +777,38 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
     }
     *p=(struct PendingDesktopFrame){0};errno=savedErrno;return result?-1:1;
 }
+/* Publish the counters as JSON: write a sibling temporary file and rename it
+ * over the target, at most about once per second, on SIGUSR1, and at exit.
+ * BROOK_RENDER_STATS_PATH overrides the path; an empty value disables it. */
+static struct {const char *path;char temporary[256];uint64_t seq,startedNs,lastNs,failures;unsigned depth;int ready,enabled;} g_statsOutput;
+static char g_statsJson[32768];
+static void stats_init(unsigned depth){
+    const char *path=getenv("BROOK_RENDER_STATS_PATH");if(!path)path="/tmp/brook-desktop-stats.json";
+    g_statsOutput.path=path;g_statsOutput.depth=depth;g_statsOutput.startedNs=monotonic_ns();g_statsOutput.ready=1;
+    const int n=snprintf(g_statsOutput.temporary,sizeof(g_statsOutput.temporary),"%s.tmp",path);
+    g_statsOutput.enabled=*path && n>0 && (size_t)n<sizeof(g_statsOutput.temporary);
+    struct sigaction request={0};request.sa_handler=stats_request_signal;request.sa_flags=SA_RESTART;sigemptyset(&request.sa_mask);
+    (void)sigaction(SIGUSR1,&request,NULL);
+}
+static void stats_publish(uint64_t now){
+    const struct DesktopStatsMeta meta={++g_statsOutput.seq,now,g_statsOutput.startedNs,g_statsOutput.failures,(long)getpid(),
+        g_statsOutput.depth,g_asyncPresent,getenv("BROOK_RENDER_GPU_TIMESTAMPS")!=NULL};
+    const size_t length=desktop_stats_format(&g_stats,&meta,g_statsJson,sizeof(g_statsJson));
+    const int fd=length?open(g_statsOutput.temporary,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644):-1;
+    int ok=fd>=0;
+    for(size_t done=0;ok && done<length;){const ssize_t n=write(fd,g_statsJson+done,length-done);
+        if(n>0)done+=(size_t)n;else if(n<0 && errno==EINTR)continue;else ok=0;}
+    if(fd>=0 && close(fd))ok=0;
+    if(ok && rename(g_statsOutput.temporary,g_statsOutput.path))ok=0;
+    if(!ok){++g_statsOutput.failures;if(fd>=0)(void)unlink(g_statsOutput.temporary);}
+}
+static void stats_tick(int force){
+    if(!g_statsOutput.ready || !g_statsOutput.enabled)return;
+    const uint64_t now=monotonic_ns();
+    if(!force && !g_statsRequested && g_statsOutput.lastNs && now>=g_statsOutput.lastNs && now-g_statsOutput.lastNs<1000000000ull)return;
+    const int savedErrno=errno;
+    g_statsRequested=0;g_statsOutput.lastNs=now;stats_publish(now);errno=savedErrno;
+}
 static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     struct RenderContext ctx[BROOK_GPU_HANDOFF_MAX_DEPTH];
     struct PendingDesktopFrame pending[BROOK_GPU_HANDOFF_MAX_DEPTH]={{0}};
@@ -770,6 +822,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     uint64_t fullWaitNs=0;unsigned fullWaits=0;
     unsigned frames=0,partialFrames=0,retries=0,unsupportedRetries=0,idleBusyRetries=0,active=0,maxActive=0;uint64_t previous=0,maxInterval=0,failureStart=0;unsigned gaps=0;
     while((!g_asyncStop && (!limit || frames<limit)) || active){
+        stats_tick(0);
         const uint64_t fullSince=active==depth?monotonic_ns():0;
         int progress=0;
         for(unsigned i=0;i<depth;++i)if(pending[i].ticket){
@@ -829,6 +882,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         }
     }
     for(unsigned i=0;i<depth;++i)context_close(drm,&ctx[i]);
+    stats_tick(1);
     if(getenv("BROOK_RENDER_GRAPHICS_SCENE"))fprintf(stderr,"DESKTOP_GRAPHICS_COUNTS submitted=%llu fallback=%llu\n",
         (unsigned long long)g_graphicsSubmitted,(unsigned long long)g_graphicsFallback);
     if(getenv("BROOK_RENDER_TIMELINE")){
@@ -873,6 +927,7 @@ int main(int argc,char **argv){
     g_asyncPresent=depth && asyncPresent && !strcmp(asyncPresent,"1") &&
         caps>0 && (caps&BROOK_GPU_PRESENT_CAP_ASYNC);
     desktop_gpu_channel_init(&g_gpuChannel);
+    stats_init(depth);
     if(depth){
         struct sigaction stop={0};stop.sa_handler=async_stop_signal;sigemptyset(&stop.sa_mask);
         if(sigaction(SIGTERM,&stop,NULL) || sigaction(SIGINT,&stop,NULL))return 1;
@@ -883,6 +938,7 @@ int main(int argc,char **argv){
     unsigned frames=0,failures=0,gaps=0,retries=0;uint64_t previous=0,maxInterval=0,failureStart=0;
     while(!limit || frames<limit){
         uint32_t visible=0;uint64_t presented=0;
+        stats_tick(0);
         if(!render_frame(drm,&ctx,&visible,&presented,NULL,0,0)){
             ++frames;failures=0;failureStart=0;
             uint64_t interval=previous && presented>=previous?(presented-previous)/1000000ull:0;
@@ -904,7 +960,7 @@ int main(int argc,char **argv){
             usleep(desktop_sync_retry_delay_us(failure));
         }
     }
-    context_close(drm,&ctx);
+    context_close(drm,&ctx);stats_tick(1);
     desktop_gpu_channel_close(&g_gpuChannel);
     (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_DETACH,0,0,0,0,0);close(drm);
     fprintf(stderr,"DESKTOP_RENDERER_STOP frames=%u failures=%u retries=%u interval_over_250ms=%u max_interval_ms=%lu\n",frames,failures,retries,gaps,(unsigned long)maxInterval);

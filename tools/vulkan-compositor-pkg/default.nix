@@ -72,6 +72,9 @@ pkgs.stdenv.mkDerivation {
     ./brook-desktop-gpu-channel-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_async_source_barrier_test.c -o brook-desktop-async-source-barrier-test
     ./brook-desktop-async-source-barrier-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_stats_test.c -o brook-desktop-stats-test
+    ./brook-desktop-stats-test > desktop-stats-sample.json
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["schema"]=="brook-desktop-stats/1" and len(d["windows"])==16' desktop-stats-sample.json
     $CC -std=c11 -O2 -Wall -Wextra -Werror multi_renderer_test.c renderer.o surface.o -lvulkan -o brook-vulkan-multi-compositor-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror async_pair_test.c renderer.o -lvulkan -o brook-vulkan-async-pair-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_bench.c renderer.o -lvulkan -o brook-desktop-chrome-bench
