@@ -201,3 +201,12 @@ remains on its separate WIP branch, not part of the milestone integration.
 | Firefox, stock plugin, 4416 | 44.1k | 0 |
 | Chrome, stock plugin, 1920 + staging | 35.8k | 18.8% |
 | Chrome, downstream plugin + staging | 44.1k | 0 |
+
+**Dell result (gen 372, `dell-audio-fix-20261114`, session `1cebac30…`).** `audio staging status` reports enabled with 4096 frames at boot. The test clip was a local 60 s VP9 + Opus 440 Hz tone, played in Chromium with the plugin path set by `ALSA_CONFIG_PATH` from `/tmp`; the store was not modified. Over 10 s per arm:
+
+| Arm | Source frames/s | later_gap_bytes/s | Gap events/s | In flight |
+|---|---|---|---|---|
+| Stock plugin (installed wrapper) | 33,746 | 41,341 | 26.9 | 1,845 |
+| Downstream plugin | **44,101** | **0** | **0** | 4,945 |
+
+`audio timing status` now counts cycles on bare metal (2,297–2,486 per run, `invalid_clock` 0). The maximum mixer sleep was 29.8–59.7 ms, a separate scheduling finding. Firefox launched from the bridge crashed in its tab subprocess (exit 11), so the control is the earlier fullscreen YouTube run at 44.24k frames/s with no gaps. The Chromium and Firefox wrappers have not yet been installed into the Dell store or profile.
