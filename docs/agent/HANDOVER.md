@@ -64,6 +64,12 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **Non-game composites now cost ~18 ms each at 12–20/s.** Composite cost doesn't scale with damage, so M1 (damage-proportional composition) is next, then M3.
 - The rollback after the M4a loop used `scripts/hardware_promote_slot.py` from the USB maintenance boot (gen 358 → gen 360).
 
+**Perceptual check (gen 363, `dell-m1-volume-20261114`, 14 Nov):**
+- **Run:** plain yquake2 attract demo (default 640×480 shown 2×, GL3 via patched Iris, default buffering).
+- **Ian:** "very playable"; yquake2's own counter read 46 fps (21.9 ms), "quite erratic" but frame pacing visually acceptable.
+- **Renderer counters over 14 s:** 45.0 distinct displayed frames/s (every swap shown). Intervals p50 19.5, p90 29.8, p99 44.6 ms. Game-frame submit→fence 9 ms, prepare 3 ms.
+- **The remaining jitter** is the 33–50 ms tail (serial one-frame pipeline plus BCS copy), so M3 and pipelining are next.
+
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
 - Eliminate CPU copies in the pipeline.
