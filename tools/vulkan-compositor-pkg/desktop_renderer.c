@@ -100,7 +100,10 @@ static long g_presentingTicket;
  * partial present when nothing changes. */
 static struct DesktopTrackState *g_trackDisplayed;
 static uint64_t g_lastPresentNs;
-static uint64_t g_idlePollNs=8000000ull;
+/* Each poll recaptures the desktop on the CPU (window chrome is rendered
+ * by the kernel on request), so idle polling stays near the display rate;
+ * producer offers wake the renderer at once. */
+static uint64_t g_idlePollNs=16000000ull;
 enum { DESKTOP_KEEPALIVE_NS=200000000ull };
 static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
 /* Bounded runs (--frames N) present a minimal frame instead of idling. */

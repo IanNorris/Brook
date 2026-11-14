@@ -7,7 +7,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-enum { QUAD_CACHE_SLOTS=48, QUAD_CACHE_MAX_AGE=8, QUAD_FRAME_SLOTS=BROOK_VK_MAX_LAYERS+1 };
+/* An entry unused for QUAD_CACHE_MAX_AGE submissions (about two seconds of
+ * frames) is dropped, so a replaced buffer is not pinned for long while the
+ * wallpaper survives long runs of game-only frames that never sample it. */
+enum { QUAD_CACHE_SLOTS=48, QUAD_CACHE_MAX_AGE=120, QUAD_FRAME_SLOTS=BROOK_VK_MAX_LAYERS+1 };
 enum { QUAD_MODE_STRAIGHT=1, QUAD_MODE_OPAQUE=2, QUAD_MODE_OVER_ZERO=4, QUAD_MODE_SAMPLER=8, QUAD_MODE_DIVIDE=16, QUAD_MODE_READ=32 };
 enum { QUAD_PIPELINE_STRAIGHT=0, QUAD_PIPELINE_PREMULTIPLIED=1, QUAD_PIPELINE_NONE=2, QUAD_PIPELINES=3 };
 struct QuadPush {int32_t rect[4];float invHalf[2];int32_t dst[2];uint32_t dstSize[2],src[2],srcSize[2];float scale[2];uint32_t opacity,mode;};

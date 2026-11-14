@@ -108,7 +108,8 @@ static void advance(void){
     case 12:break;
     case 13:K.cursorVisible=0;break;
     case 14:K.cursorVisible=1;K.cursorX=FW-8;K.cursorY=FH-8;break;   /* partly off screen */
-    default:{
+    default:if(s<40)break;                                           /* a quiet stretch: idle polls, then a keepalive */
+    {
         struct FakeWindow *w=K.count?&K.win[K.order[pick(K.count)]]:NULL;
         switch(pick(8)){
         case 0:K.cursorX=(int32_t)pick(FW)-4;K.cursorY=(int32_t)pick(FH)-4;break;

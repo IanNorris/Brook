@@ -12,7 +12,7 @@
  * Imports of renderer-owned buffers (cache=1) persist across submissions:
  * the image, view, descriptor set and, for the output, the framebuffer are
  * keyed by the buffer's dev/inode, size and layout and pinned with a
- * duplicate fd. Entries unused for a few submissions are dropped. Other
+ * duplicate fd. Entries unused for about two seconds of frames are dropped. Other
  * sources (producer-offered buffers) are imported for one submission.
  *
  * Device and queue remain caller-owned; the device needs dma-buf import and,

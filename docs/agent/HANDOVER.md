@@ -34,7 +34,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | M0 | Diagnostics: `gpu worker stats` (kernel), `/tmp/brook-desktop-stats.json` + `scripts/desktop_stats_diff.py` (renderer), `scripts/dell_quake_measure.py` | done: gen 357 results below |
 | M2 | Event-driven waylandd, channel ABI v2 (retain + PRESENTED), release on SAFE without CPU copy, present-driven callbacks | done: `aac9e79c`, `af3626c9`; gen 361 with overlay |
 | — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
-| M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
+| M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | implemented on `work/m1-compose` (quad pass default for async frames, change-based damage, idle polls skip GPU work); bit-exact vs compute on the host UHD 630; awaiting a Dell run (check `presents.quad`, `classes.*.composition`, `idle` in the stats) |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
 | M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | todo |
 | M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
