@@ -50,8 +50,7 @@ static int surface_vulkan_direct(struct brook_surface *root,struct brook_image *
         (uint64_t)currentSource.st_dev,(uint64_t)currentSource.st_ino};
     if(!brook_gpu_window_identity_equal(&identity,&confirmed))return 0;
     if(!surface_begin_source_write(root,NULL))return 0;
-    for(unsigned y=0;y<root->vfb_h;++y)for(unsigned x=0;x<root->vfb_w;++x)
-        root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(root->composite[(size_t)y*root->vfb_w+x]);
+    brook_straight_rows(root->vfb,root->vfb_stride,root->composite,root->vfb_w,root->vfb_w,root->vfb_h);
     wm_signal_dirty(root->wm_id);return 1;
 }
 
