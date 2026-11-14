@@ -23,6 +23,7 @@
 #include "desktop_gpu_channel.h"
 #include "desktop_async_source_barrier.h"
 #include "desktop_stats.h"
+#include "desktop_pipeline.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -66,6 +67,9 @@ struct RenderContext {
 struct PendingDesktopFrame {
     long ticket;uint64_t frame,started,nextReport,skippedBytes;uint32_t width,height,visible,skippedLayers;unsigned direct;
     int partial,graphics,quad,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
+    /* Pipelined: an older in-flight frame failed, so this frame's success
+     * must not re-establish the change-tracking baseline. */
+    int tainted;
     uint32_t statsLayers,statsDraws;uint64_t statsShaded,statsDamage;
     struct DesktopOverlayFrameState overlay;
     uint64_t traceStart,traceSubmitStart,traceReceived,traceCompleted,statsSubmitStart,statsFence;uint32_t traceWindow;uint64_t traceIncarnation,traceCommit;
@@ -109,6 +113,16 @@ static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
 /* Bounded runs (--frames N) present a minimal frame instead of idling. */
 static int g_neverIdle;
 static uint64_t g_quadSubmitted,g_quadFallback;
+/* Frames in flight (desktop_pipeline.h): 1 serial admission, 2 pipelined. */
+static unsigned g_pipeline=DESKTOP_PIPELINE_SERIAL;
+/* Baseline of a pipelined frame: the latest submitted frame's tracking and
+ * overlay state, and, while that frame is still in flight, its present
+ * regions (carried into this frame's damage) and its ticket (the dependent
+ * reservation is retried on it if the kernel accepted it meanwhile). */
+struct PipelineBase {
+    const struct DesktopTrackState *track;const struct DesktopOverlayFrameState *overlay;
+    const struct BrookGpuPresentRegions *carry;long rebase;
+};
 /* Always-on counters (desktop_stats.h), published by stats_tick(). */
 static struct DesktopStats g_stats;
 static volatile sig_atomic_t g_statsRequested;
@@ -157,7 +171,10 @@ static void context_close(int drm,struct RenderContext *ctx){
 }
 static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint32_t height,size_t words){
     if(ctx->renderer && ctx->width==width && ctx->height==height)return 0;
-    context_close(drm,ctx);
+    /* The damage baseline describes the screen, not this context's
+     * resources; keep it (identity and size are checked on use). */
+    const struct DesktopDamageState baseline=ctx->damage;
+    context_close(drm,ctx);ctx->damage=baseline;
     ctx->output=(int)syscall(BROOK_SYS_GPU_OUTPUT_ALLOC,(long)((uint64_t)width*height*4),0L,0L,0L,0L,0L);
     if(ctx->output<0)return -1;
     {const off_t size=lseek(ctx->output,0,SEEK_END);
@@ -279,6 +296,30 @@ static uint64_t overlay_generation(void){
     if(g_overlayTracked<0)g_overlayTracked=generation>0;
     return generation>0?(uint64_t)generation:0;
 }
+/* Buffered contexts, so one can adopt another's overlay capture. */
+static struct RenderContext *g_contexts;static unsigned g_contextCount;
+/* A capture re-renders the kernel overlay, and its content (the compositor
+ * cadence graph) changes with every present, so capturing bumps the
+ * generation. Two contexts that each recapture the generation the other one
+ * produced would then damage the taskbar on every frame forever. Copy the
+ * current generation's bands from the context that captured them instead
+ * (CPU reads only; that context's GPU work merely samples them). */
+static int overlay_adopt(int drm,struct RenderContext *ctx,uint64_t generation,uint32_t width,uint32_t height){
+    for(unsigned k=0;k<g_contextCount;++k){const struct RenderContext *peer=&g_contexts[k];
+        if(peer==ctx || !desktop_overlay_cache_valid(peer->overlayGeneration,peer->overlayWidth,peer->overlayHeight,generation,width,height))continue;
+        const struct BrookDesktopOverlayBands *bands=&peer->overlayBands;
+        if(bands->count>BROOK_DESKTOP_OVERLAY_MAX_BANDS)return 0;
+        ctx->overlayGeneration=0;
+        for(uint32_t i=0;i<bands->count;++i){const struct BrookDesktopOverlayBand *b=&bands->bands[i];
+            const uint64_t bytes=(uint64_t)b->width*4*b->height;
+            if(!peer->overlay[i].map || peer->overlay[i].size<bytes || source_ensure(drm,bytes,&ctx->overlay[i]))return 0;
+            memcpy(ctx->overlay[i].map,peer->overlay[i].map,bytes);
+        }
+        ctx->overlayBands=*bands;ctx->overlayGeneration=generation;ctx->overlayWidth=width;ctx->overlayHeight=height;
+        ++g_stats.pipeline.overlayAdopted;return 1;
+    }
+    return 0;
+}
 /* Pointer layer state; refreshes the context's 64x64 image on a new serial. */
 static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state){
     *state=(struct DesktopOverlayCursorState){0};
@@ -326,12 +367,32 @@ static int arm_test_block(long ticket){
     const int fd=open(marker,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd<0)return -1;
     close(fd);fprintf(stderr,"DESKTOP_TEST_BLOCKED_FENCE_ARMED\n");return 1;
 }
+/* Reserve a handoff ticket for output, dependent on the last accepted
+ * ticket when baseline is nonzero. A queued present of the in-flight frame
+ * may have been accepted after this frame chose its baseline; the carried
+ * damage covers that frame too, so it is an equally valid baseline. */
+static long reserve_output(int output,uint64_t baseline,const struct PipelineBase *pipe,int *rebased){
+    long ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,baseline?BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:BROOK_GPU_HANDOFF_RESERVE,output,(long)baseline,0,0,0);
+    if(ticket<=0 && baseline && errno==ESTALE && pipe && pipe->rebase>0 && (uint64_t)pipe->rebase!=baseline){
+        ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE_DEPENDENT,output,pipe->rebase,0,0,0);
+        if(ticket>0){++g_stats.pipeline.rebased;*rebased=1;}
+    }
+    /* Nothing in flight: a plain reservation is equivalent (the session is
+     * idle), so never let a baseline disagreement stall the renderer. */
+    if(ticket<=0 && baseline && errno==ESTALE && pipe && !pipe->carry)
+        ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,output,0,0,0,0);
+    return ticket;
+}
 /* Returns 0 for a presented frame, 1 for a submitted asynchronous frame,
  * 2 when nothing changed since the displayed frame (no GPU work; poll
  * again later) and -1 for a safe retry. quiescent: no other frame is in
- * flight, so the displayed frame is the baseline for change tracking. */
+ * flight, so the displayed frame is the baseline for change tracking.
+ * pipe (pipelined admission only): the baseline to compare with instead. */
 static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint64_t *presentedNs,struct PendingDesktopFrame *pending,
-                        int asyncPartial,uint64_t baselineTicket,int quiescent){
+                        int asyncPartial,uint64_t baselineTicket,int quiescent,const struct PipelineBase *pipe){
+    const struct DesktopTrackState *trackBase=pipe?pipe->track:g_trackDisplayed;
+    const struct DesktopOverlayFrameState *overlayBase=pipe?pipe->overlay:&g_overlayDisplayed;
+    int carried=0;
     const int traceEnabled=getenv("BROOK_RENDER_TIMELINE")!=NULL;
     const uint64_t traceStart=traceEnabled?monotonic_ns():0;
     desktop_gpu_channel_poll(&g_gpuChannel);
@@ -479,7 +540,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     stage="overlay_capture";
     /* Recapture only when the kernel's overlay content generation changed. */
     const uint64_t overlayGeneration=overlay_generation();
-    if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height)){
+    if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height) &&
+       !overlay_adopt(drm,ctx,overlayGeneration,width,height)){
         uint64_t captured=0;ctx->overlayGeneration=0;
         if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&captured))goto done;
         ctx->overlayGeneration=captured;ctx->overlayWidth=width;ctx->overlayHeight=height;
@@ -499,20 +561,25 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             c->x,c->y,c->width,c->height,0,0,width,height,255|BROOK_VK_STRAIGHT_ALPHA};
         if(push(scene,&count,sources,&ctx->cursor,&layer))goto done;
     }
-    desktop_overlay_damage(&g_overlayDisplayed,&frameOverlay,&footprint);
+    desktop_overlay_damage(overlayBase,&frameOverlay,&footprint);
     scene[2]=count;
     struct DesktopDamageSet damage=desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
     /* Change-based damage against the displayed frame, when that frame is
-     * known and no other frame can present first. */
+     * known and no other frame can present first; pipelined, against the
+     * latest submitted frame (its in-flight regions are carried below). */
     int tracked=0;
-    if(quiescent && !baselineTicket && track->valid && g_trackDisplayed && ctx->damage.display==identity.display &&
-       ctx->damage.backdrop==identity.generation && ctx->damage.width==width && ctx->damage.height==height){
+    const int baselineOk=ctx->damage.display==identity.display && ctx->damage.backdrop==identity.generation &&
+        ctx->damage.width==width && ctx->damage.height==height;
+    if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
         struct DesktopDamageSet changes={0};
-        if(desktop_track_diff(g_trackDisplayed,track,&changes)){
-            desktop_overlay_damage(&g_overlayDisplayed,&frameOverlay,&changes);
+        if(desktop_track_diff(trackBase,track,&changes)){
+            desktop_overlay_damage(overlayBase,&frameOverlay,&changes);
             damage=changes;tracked=1;
         }
     }
+    /* Nothing new relative to an in-flight frame: it will present on its
+     * own and keeps the lease, so stay idle. */
+    if(tracked && !damage.count && pipe && pipe->carry){++g_stats.idleSkips;result=2;stage="idle";goto done;}
     if(tracked && !damage.count){
         const uint64_t now=monotonic_ns();
         if(!g_neverIdle && g_lastPresentNs && now>=g_lastPresentNs && now-g_lastPresentNs<DESKTOP_KEEPALIVE_NS){
@@ -521,8 +588,16 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         /* Renew the presentation lease with a minimal, exact partial frame. */
         damage.count=1;damage.rects[0]=(struct DesktopDamageRect){0,0,width<16?width:16,1};++g_stats.keepalives;
     }
+    /* The in-flight frame's writes may land after this frame is reserved;
+     * cover them (the kernel's dependent reservation verifies it). */
+    const struct DesktopDamageSet own=damage;int rebased=0;
+    if(pipe && pipe->carry){
+        if(!desktop_pipeline_carry(&damage,pipe->carry,width,height)){errno=EINVAL;goto done;}
+        carried=1;
+    }
     uint64_t damagePixels=0;for(uint32_t i=0;i<damage.count;++i){const struct DesktopDamageRect *r=&damage.rects[i];
         damagePixels+=(uint64_t)(r->right-r->left)*(uint64_t)(r->bottom-r->top);}
+    const uint64_t wantPixels=damagePixels;
     if(getenv("BROOK_RENDER_TIMING")){
         uint64_t overlayBytes=0;
         for(unsigned i=0;i<bands.count;++i)overlayBytes+=overlay[i].size;
@@ -565,9 +640,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(quad_plan_build_auto(scene,words,holes,&qdamage,g_quadOcclusion,plan) &&
            async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,plan->used,count)){
             stage="quad_reserve";
-            const int dependent=qpartial && baselineTicket;
-            ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,dependent?BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:BROOK_GPU_HANDOFF_RESERVE,
-                           ctx->output,dependent?baselineTicket:0,0,0,0);
+            ticket=reserve_output(ctx->output,qpartial?baselineTicket:0,pipe,&rebased);
             if(ticket<=0)goto done;
             struct BrookVkQuadSource inputs[BROOK_VK_MAX_LAYERS];
             for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
@@ -591,8 +664,13 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                         frameSources[j].incarnation==id->incarnation && frameSources[j].commit==id->commit)frameSources[j].commit=0;
                     desktop_gpu_channel_unselect(&g_gpuChannel,directOffer[i],frame);
                 }
-                if(qpartial){regionBatch.count=damage.count;
-                    for(uint32_t i=0;i<damage.count;++i){const struct DesktopDamageRect *r=&damage.rects[i];
+                /* Rebased: the carried frame is already on screen and no
+                 * younger write can precede this one, so present only this
+                 * frame's own (aligned) changes; they were drawn too. */
+                struct DesktopDamageSet presentDamage=damage,ownAligned;
+                if(rebased && own.count && desktop_graphics_damage(&own,width,height,&ownAligned))presentDamage=ownAligned;
+                if(qpartial){regionBatch.count=presentDamage.count;
+                    for(uint32_t i=0;i<presentDamage.count;++i){const struct DesktopDamageRect *r=&presentDamage.rects[i];
                         regionBatch.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,
                             (uint32_t)r->left,(uint32_t)r->top,(uint32_t)(r->right-r->left),(uint32_t)(r->bottom-r->top),width,0};}
                 }
@@ -687,7 +765,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         regionBatch.count=damage.count;
         for(uint32_t i=0;i<damage.count;++i){const struct DesktopPackedTile *t=&tiles[i];
             regionBatch.regions[i]=(struct BrookGpuPresentRegion){t->offsetBytes,t->x,t->y,t->width,t->height,t->width,0};}
-        stage="batch_reserve";ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,baselineTicket?BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:BROOK_GPU_HANDOFF_RESERVE,ctx->batchOutput,baselineTicket,0,0,0);if(ticket<=0)goto done;
+        stage="batch_reserve";ticket=reserve_output(ctx->batchOutput,baselineTicket,pipe,&rebased);if(ticket<=0)goto done;
         stage="batch_test_arm";testArmed=arm_test_block(ticket);if(testArmed<0)goto done;
         stage="batch_compose";
         statsSubmitStart=monotonic_ns();
@@ -730,6 +808,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     const uint64_t statsDamage=attemptPartial?damagePixels:(uint64_t)width*height;
     if(!quadUsed)statsShaded=statsDamage*traceLayers;
     if(pending && status==BROOK_VK_PENDING){
+        desktop_stats_submitted(&g_stats,pipe && pipe->carry?1u:pipe?0u:quiescent?0u:1u,carried,
+            desktop_pipeline_full_reason(!attemptPartial,baselineOk,!pending || asyncPartial,wantPixels,(uint64_t)width*height));
         uint32_t skipped=0;uint64_t skippedBytes=0;
         for(unsigned i=0;i<layers.count;++i)if(skipMask&(1u<<i)){++skipped;skippedBytes+=layers.layers[i].bytes;}
         uint64_t now=monotonic_ns();
@@ -960,7 +1040,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
         desktop_async_damage_retire(displayedDamage,p->damage,p->partial,1);
         g_lastPresentNs=*presented;
         if(g_trackDisplayed){
-            if(ctx->track->valid && (!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)){
+            if(ctx->track->valid && !p->tainted && (!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)){
                 struct DesktopTrackState *shown=g_trackDisplayed;g_trackDisplayed=ctx->track;ctx->track=shown;
             }else g_trackDisplayed->valid=0;
         }
@@ -979,7 +1059,9 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
                 p->ticket,s->window,(unsigned long long)s->incarnation,(unsigned long long)s->generation,
                 s->commit?"gpu":"cpu",(unsigned long long)s->commit,(unsigned long long)s->snapshotCommit,s->omitted);}
     }else {++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;
-        if(g_trackDisplayed)g_trackDisplayed->valid=0;
+        /* An older ticket refused behind a newer accepted one left the
+         * screen alone (pipelined frames never present out of order). */
+        if(g_trackDisplayed && !(g_pipeline>1 && lastPresentedTicket && (uint64_t)p->ticket<lastPresentedTicket))g_trackDisplayed->valid=0;
         if(!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)
             desktop_async_damage_retire(displayedDamage,p->damage,p->partial,0);
         (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,p->ticket,0,0,0,0);}
@@ -1027,7 +1109,7 @@ static void stats_init(unsigned depth){
 }
 static void stats_publish(uint64_t now){
     const struct DesktopStatsMeta meta={++g_statsOutput.seq,now,g_statsOutput.startedNs,g_statsOutput.failures,(long)getpid(),
-        g_statsOutput.depth,g_asyncPresent,getenv("BROOK_RENDER_GPU_TIMESTAMPS")!=NULL};
+        g_statsOutput.depth,g_asyncPresent,getenv("BROOK_RENDER_GPU_TIMESTAMPS")!=NULL,g_pipeline};
     const size_t length=desktop_stats_format(&g_stats,&meta,g_statsJson,sizeof(g_statsJson));
     const int fd=length?open(g_statsOutput.temporary,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644):-1;
     int ok=fd>=0;
@@ -1058,23 +1140,46 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     struct DesktopDamageState displayedDamage={0};
     struct DesktopRetry retry={0};
     const char *partialGrace=getenv("BROOK_RENDER_ASYNC_PARTIAL_GRACE");
-    const int overlapPartial=g_dependentPartial && getenv("BROOK_RENDER_EXPERIMENTAL_OVERLAP_PARTIAL")!=NULL &&
+    const int pipelined=g_pipeline>1;
+    const int overlapPartial=!pipelined && g_dependentPartial && getenv("BROOK_RENDER_EXPERIMENTAL_OVERLAP_PARTIAL")!=NULL &&
         getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL;
     uint64_t lastPresentedTicket=0;
     for(unsigned i=0;i<depth;++i)context_init(&ctx[i]);
+    g_contexts=ctx;g_contextCount=depth;
     uint64_t fullWaitNs=0;unsigned fullWaits=0;
     unsigned frames=0,partialFrames=0,retries=0,unsupportedRetries=0,idleBusyRetries=0,active=0,maxActive=0;uint64_t previous=0,maxInterval=0,failureStart=0;unsigned gaps=0;
-    uint64_t idleUntil=0;unsigned idlePolls=0;
+    uint64_t idleUntil=0;unsigned idlePolls=0;long waitedTicket=0;
     while((!g_asyncStop && (!limit || frames<limit)) || active){
         stats_tick(0);
         const uint64_t fullSince=active==depth?monotonic_ns():0;
         int progress=0;
-        for(unsigned i=0;i<depth;++i)if(pending[i].ticket){
+        /* Pipelined frames retire strictly in ticket order: a younger frame
+         * waits (its composition may complete) until the older presented. */
+        for(unsigned n=0;n<depth;++n){
+            unsigned i=n;
+            if(pipelined){long tickets[BROOK_GPU_HANDOFF_MAX_DEPTH];
+                for(unsigned j=0;j<depth;++j)tickets[j]=pending[j].ticket;
+                i=desktop_pipeline_oldest(tickets,depth);if(i>=depth)break;}
+            else if(!pending[i].ticket)continue;
             uint64_t presented=0;const int wasPartial=pending[i].partial;const uint64_t retiringTicket=(uint64_t)pending[i].ticket;
             int result=retire_async_frame(&ctx[i],&pending[i],&presented,&displayedDamage,lastPresentedTicket);
-            if(!result)continue;
-            --active;progress=1;
-            if(result<0){++retries;continue;}
+            if(!result){
+                if(!pipelined)continue;
+                /* Record the younger frame's fence time while it waits. */
+                for(unsigned j=0;j<depth;++j)if(j!=i && pending[j].ticket)
+                    (void)composition_ready(&ctx[j],pending[j].partial?ctx[j].batchRenderer:ctx[j].renderer,&pending[j]);
+                break;
+            }
+            --active;progress=1;desktop_stats_in_flight(&g_stats,active);
+            if(result<0){++retries;
+                /* Younger frames were compared with the failed one. They
+                 * still cover the screen's difference, but must not become
+                 * the change-tracking baseline, nor the damage baseline of
+                 * a further overlapped frame: admission waits for them, so
+                 * the reset baseline (a full frame if the kernel needs one,
+                 * e.g. after a window closed) is reached. */
+                if(pipelined)for(unsigned j=0;j<depth;++j)if(pending[j].ticket)pending[j].tainted=1;
+                continue;}
             lastPresentedTicket=retiringTicket;
             ++frames;if(wasPartial)++partialFrames;uint64_t interval=previous && presented>=previous?(presented-previous)/1000000ull:0;
             if(interval>maxInterval)maxInterval=interval;
@@ -1090,7 +1195,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         // so a completed frame can release its producer without waiting for
         // an unrelated frame's preparation. Pending frames may still overlap.
         int grace=0;
-        if(!overlapPartial && partialGrace && strcmp(partialGrace,"0")){
+        if(!pipelined && !overlapPartial && partialGrace && strcmp(partialGrace,"0")){
             const uint64_t now=monotonic_ns();
             for(unsigned i=0;i<depth;++i)if(pending[i].ticket &&
                 desktop_async_damage_grace(1,pending[i].partial,pending[i].started,now))grace=1;
@@ -1101,17 +1206,53 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         const uint64_t loopNow=monotonic_ns();
         if(idleUntil && (loopNow>=idleUntil || desktop_channel_wait(&g_gpuChannel,0)))idleUntil=0;
         for(unsigned i=0;i<depth && !g_asyncStop && (!limit || frames+active<limit) && !idleUntil &&
-            !g_presentingTicket && !grace && !retryWaiting && (overlapPartial || !getenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL") || !active);++i)if(!pending[i].ticket){
+            (pipelined || !g_presentingTicket) && !grace && !retryWaiting &&
+            (pipelined || overlapPartial || !getenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL") || !active);++i)if(!pending[i].ticket){
             uint32_t visible=0;uint64_t presented=0;
+            if(pipelined){
+                struct DesktopPipelineInFlight flights[BROOK_GPU_HANDOFF_MAX_DEPTH];unsigned older=depth;
+                for(unsigned j=0;j<depth;++j){flights[j]=(struct DesktopPipelineInFlight){pending[j].ticket,pending[j].partial,
+                    pending[j].regions.count,pending[j].ticket && ctx[j].track && ctx[j].track->valid && !pending[j].tainted};
+                    if(pending[j].ticket)older=j;}
+                const enum DesktopPipelineAdmit admit=desktop_pipeline_admit(g_pipeline,flights,depth,lastPresentedTicket);
+                /* Count each in-flight frame waited behind once. */
+                if(admit==DESKTOP_PIPELINE_WAIT_FULL || admit==DESKTOP_PIPELINE_WAIT_BASELINE){
+                    if(older<depth && waitedTicket!=pending[older].ticket){waitedTicket=pending[older].ticket;
+                        if(admit==DESKTOP_PIPELINE_WAIT_FULL)++g_stats.pipeline.waitFull;else ++g_stats.pipeline.waitBaseline;}
+                    break;
+                }
+                if(admit==DESKTOP_PIPELINE_WAIT_DEPTH)break;
+                struct PipelineBase base={g_trackDisplayed,&g_overlayDisplayed,NULL,0};
+                if(admit==DESKTOP_PIPELINE_OVERLAP){
+                    base=(struct PipelineBase){ctx[older].track,&pending[older].overlay,&pending[older].regions,
+                        g_asyncPresent?pending[older].ticket:0};
+                    ctx[i].damage=pending[older].damage;
+                }else ctx[i].damage=displayedDamage;
+                const unsigned before=active;
+                /* Reservations are dependent on the last accepted ticket
+                 * even when nothing is in flight, so a present still
+                 * retiring in the kernel cannot make this frame full-only. */
+                int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],1,lastPresentedTicket,!before,&base);
+                if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
+                if(result==1){++active;if(active>maxActive)maxActive=active;desktop_stats_in_flight(&g_stats,active);
+                    failureStart=0;desktop_retry_success(&retry);progress=1;break;}
+                const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
+                if(failure==ENOTSUP)++unsupportedRetries;
+                if(failure==EBUSY && !active)++idleBusyRetries;
+                desktop_retry_failure(&retry,failure,active,now);
+                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d\n",failure);
+                break;
+            }
             ctx[i].damage=displayedDamage;
             int overlapSafe=overlapPartial && active && lastPresentedTicket;
             for(unsigned j=0;j<depth && overlapSafe;++j)if(pending[j].ticket &&
                 !desktop_damage_include_pending(&ctx[i].damage,pending[j].damage))overlapSafe=0;
             if(overlapPartial && active && !overlapSafe)break;
             const int partial=getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL && (!active || overlapSafe);
-            int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],partial,overlapSafe?lastPresentedTicket:0,!active);
+            int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],partial,overlapSafe?lastPresentedTicket:0,!active,NULL);
             if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
-            if(result==1){++active;if(active>maxActive)maxActive=active;failureStart=0;desktop_retry_success(&retry);progress=1;break;}
+            if(result==1){++active;if(active>maxActive)maxActive=active;desktop_stats_in_flight(&g_stats,active);
+                failureStart=0;desktop_retry_success(&retry);progress=1;break;}
             else if(result<0){const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
                 if(failure==ENOTSUP)++unsupportedRetries;
                 if(failure==EBUSY && !active)++idleBusyRetries;
@@ -1133,6 +1274,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         }
     }
     for(unsigned i=0;i<depth;++i)context_close(drm,&ctx[i]);
+    g_contexts=NULL;g_contextCount=0;
     stats_tick(1);
     if(getenv("BROOK_RENDER_GRAPHICS_SCENE"))fprintf(stderr,"DESKTOP_GRAPHICS_COUNTS submitted=%llu fallback=%llu\n",
         (unsigned long long)g_graphicsSubmitted,(unsigned long long)g_graphicsFallback);
@@ -1154,6 +1296,11 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     }
     fprintf(stderr,"DESKTOP_ASYNC_STOP frames=%u partial=%u retries=%u max_active=%u interval_over_250ms=%u max_interval_ms=%lu unsupported_retries=%u idle_busy_retries=%u depth=%u full_waits=%u full_wait_ns=%llu\n",
         frames,partialFrames,retries,maxActive,gaps,(unsigned long)maxInterval,unsupportedRetries,idleBusyRetries,depth,fullWaits,(unsigned long long)fullWaitNs);
+    fprintf(stderr,"DESKTOP_PIPELINE_COUNTS pipeline=%u async_present=%d submitted_in_flight=%llu/%llu/%llu carried=%llu rebased=%llu wait_full=%llu wait_baseline=%llu overlay_adopted=%llu full_forced=%llu no_baseline=%llu in_flight=%llu other=%llu\n",
+        g_pipeline,g_asyncPresent,(unsigned long long)g_stats.pipeline.submitted[0],(unsigned long long)g_stats.pipeline.submitted[1],
+        (unsigned long long)g_stats.pipeline.submitted[2],(unsigned long long)g_stats.pipeline.carried,(unsigned long long)g_stats.pipeline.rebased,
+        (unsigned long long)g_stats.pipeline.waitFull,(unsigned long long)g_stats.pipeline.waitBaseline,(unsigned long long)g_stats.pipeline.overlayAdopted,(unsigned long long)g_stats.fullForced.total,
+        (unsigned long long)g_stats.fullForced.noBaseline,(unsigned long long)g_stats.fullForced.inFlight,(unsigned long long)g_stats.fullForced.other);
     return limit && frames!=limit?1:0;
 }
 int main(int argc,char **argv){
@@ -1176,9 +1323,23 @@ int main(int argc,char **argv){
     const long caps=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_CAPS,0,0,0,0,0);
     g_presentFrame=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_FRAME);
     g_dependentPartial=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_DEPENDENT);
+    /* Pipelined admission (the default; BROOK_RENDER_PIPELINE=1 or
+     * "serial" opts out) prepares the next frame while the previous one
+     * composes or presents. It needs the buffered partial renderer and
+     * dependent reservations, and queues presents (unless
+     * BROOK_RENDER_ASYNC_PRESENT=0) so preparation overlaps the blit. */
+    const char *pipelineEnv=getenv("BROOK_RENDER_PIPELINE");
+    const unsigned pipeline=desktop_pipeline_parse(pipelineEnv);
+    if(!pipeline){fprintf(stderr,"BROOK_RENDER_PIPELINE must be 1, serial or 2\n");close(drm);return 2;}
+    g_pipeline=pipeline>1 && depth && g_dependentPartial && getenv("BROOK_RENDER_ASYNC_PARTIAL")?pipeline:DESKTOP_PIPELINE_SERIAL;
+    /* Report only an explicit request that cannot be honoured. */
+    if(pipelineEnv && *pipelineEnv && pipeline>1 && g_pipeline<pipeline)fprintf(stderr,"DESKTOP_PIPELINE_UNAVAILABLE depth=%u dependent=%d async_partial=%d serial admission\n",
+        depth,g_dependentPartial,getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL);
     const char *asyncPresent=getenv("BROOK_RENDER_ASYNC_PRESENT");
+    if(!asyncPresent && g_pipeline>1)asyncPresent="1";
     g_asyncPresent=depth && asyncPresent && !strcmp(asyncPresent,"1") &&
         caps>0 && (caps&BROOK_GPU_PRESENT_CAP_ASYNC);
+    if(g_pipeline>1)fprintf(stderr,"DESKTOP_PIPELINE depth=%u async_present=%d\n",g_pipeline,g_asyncPresent);
     desktop_gpu_channel_init(&g_gpuChannel);
     stats_init(depth);
     /* Composition: per-layer quads by default (asynchronous frames only);
@@ -1204,7 +1365,7 @@ int main(int argc,char **argv){
     while(!limit || frames<limit){
         uint32_t visible=0;uint64_t presented=0;
         stats_tick(0);
-        const int rendered=render_frame(drm,&ctx,&visible,&presented,NULL,0,0,1);
+        const int rendered=render_frame(drm,&ctx,&visible,&presented,NULL,0,0,1,NULL);
         if(rendered==2){(void)desktop_channel_wait(&g_gpuChannel,(int)(g_idlePollNs/1000000ull));continue;}
         if(!rendered){
             ++frames;failures=0;failureStart=0;

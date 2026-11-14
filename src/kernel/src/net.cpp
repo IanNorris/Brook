@@ -65,6 +65,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "timer_irq_arrivals.h"
 #include "wake_scan_handoff.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "sched_lock_trace.h"
 #include "vfs.h"
 #include "input.h"
@@ -5116,8 +5117,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
             "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
             "  audio coalesce on|off|reset|status - experimental HDA 12-KiB refill grace (default off)\n"
-            "  clock status - elapsed source, raw IRQs and timer calibration\n"
-            "  clock sample - compact stable pvclock nanoseconds, or explicit error\n"
+            "  clock status - elapsed source (CLOCK_SOURCE decision), raw IRQs and timer calibration\n"
+            "  clock sample - compact stable pvclock or invariant-TSC nanoseconds, or explicit error\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
             "  sched lock-yield on|off|status - bounded owner hint (default off; requires lock-owner)\n"
@@ -5393,7 +5394,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         // bracket actual command/reply; connection latency is not clock precision.
         // Failure is explicit; IRQ-count time is not a stable-ns substitute.
         uint64_t ns = 0;
-        if (!KvmClockReadStableNs(&ns)) {
+        if (TscClockAvailable()) ns = TscClockReadNs();
+        if (!ns && !KvmClockReadStableNs(&ns)) {
             DebugChannelSend("{\"error\":\"stable clock unavailable\"}\n");
         } else {
             BridgeReply reply;
@@ -5403,8 +5405,21 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     else if (NetStrEq(cmd, "clock status")) {
         const auto clock = ApicGetClockSnapshot();
         BridgeReply reply;
-        reply.text("{\"source\":\""); reply.text(clock.pvclock ? "pvclock" : clock.vmwareTsc ? "vmware-tsc" : "lapic-irqs");
-        reply.text("\","); reply.field("elapsed_ms", clock.elapsedMs);
+        const auto tsc = TscClockReadStatus();
+        reply.text("{\"source\":\""); reply.text(clock.pvclock ? "pvclock" : clock.vmwareTsc ? "vmware-tsc" : clock.nativeTsc ? "tsc" : "lapic-irqs");
+        reply.text("\",\"clock_source\":\""); reply.text(ClockSourceName(tsc.kind));
+        reply.text("\",\"clock_reason\":\""); reply.text(tsc.reason ? tsc.reason : "");
+        reply.text("\","); reply.field("monotonic_ns", ElapsedClockNs());
+        reply.text(","); reply.field("tsc_clock_khz", tsc.khz);
+        reply.text(","); reply.field("tsc_sync_max_ns", tsc.syncMaxNs);
+        reply.text(","); reply.field("tsc_sync_max_ticks", tsc.syncMaxTicks);
+        reply.text(","); reply.field("tsc_sync_cpus", tsc.syncCpus);
+        reply.text(","); reply.field("tsc_floor_returns", tsc.floorHits);
+        reply.text(",\"tsc_vdso\":"); reply.text(tsc.vdso ? "true" : "false");
+        reply.text(",\"tsc_sync_warp_free\":"); reply.text(tsc.warpFree ? "true" : "false");
+        reply.text(",\"tsc_invariant\":"); reply.text(tsc.invariant ? "true" : "false");
+        reply.text(",\"hypervisor\":"); reply.text(tsc.hypervisor ? "true" : "false");
+        reply.text(","); reply.field("elapsed_ms", clock.elapsedMs);
         reply.text(","); reply.field("raw_bsp_irqs", clock.rawBspIrqs);
         reply.text(","); reply.field("pvclock_cpu_mask",KvmClockRegisteredCpuMask());
         reply.text(","); reply.field("origin_ns", clock.originNs);
@@ -6469,6 +6484,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             if (sc == 0x2A) { if (isDown) s_injectMods |= INPUT_MOD_LSHIFT; else s_injectMods &= ~INPUT_MOD_LSHIFT; }
             if (sc == 0x36) { if (isDown) s_injectMods |= INPUT_MOD_RSHIFT; else s_injectMods &= ~INPUT_MOD_RSHIFT; }
             if (sc == 0x38) { if (isDown) s_injectMods |= INPUT_MOD_ALT; else s_injectMods &= ~INPUT_MOD_ALT; }
+            if (sc == SC_LSUPER || sc == SC_RSUPER) { if (isDown) s_injectMods |= INPUT_MOD_SUPER; else s_injectMods &= ~INPUT_MOD_SUPER; }
 
             InputEvent ev = {};
             ev.type = isDown ? InputEventType::KeyPress : InputEventType::KeyRelease;

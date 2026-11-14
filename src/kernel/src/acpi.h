@@ -53,6 +53,10 @@ const MadtInfo& AcpiGetMadt();
 // Find a table by its 4-character signature (e.g. "HPET", "FACP").
 // Returns the physical address of the table header, or 0 if not found/invalid. Tables have bounded lengths and checked checksums.
 uint64_t AcpiFindTable(const char* signature);
+// Firmware Basic Boot Performance record via FPDT -> FBPT. The FBPT must lie
+// in firmware-reserved/ACPI memory from the boot map. False if absent/invalid.
+struct FpdtBootRecord;
+bool AcpiReadBootPerformance(FpdtBootRecord& out);
 // Kernel-internal NVS validation/read helpers. These are not debug commands;
 // consumers must select audited fields and never accept caller addresses.
 bool AcpiNvsContains(uint64_t address,uint32_t bytes);

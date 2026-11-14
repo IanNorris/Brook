@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "apic.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 
 namespace brook {
 
@@ -20,7 +21,9 @@ static uint64_t g_bootEpochSec = 0;
 // CMOS read has one-second precision; fractional time must share its epoch.
 static uint64_t g_wallEpochNs = 0;
 static uint64_t g_wallStarted = 0;
-static bool g_wallUsesPvclock = false;
+// g_wallStarted is in the ElapsedClockNs() domain. That domain may switch from
+// delivered ticks (ms*1e6) to the invariant TSC after RtcInit, but the TSC
+// clock is anchored at the tick count at the switch, so the anchor stays valid.
 
 // Timezone offset in seconds east of UTC.
 static int32_t g_tzOffsetSec = 0;
@@ -170,8 +173,7 @@ void RtcInit()
     uint32_t fullYear = (yr < 70) ? 2000 + yr : 1900 + yr;
 
     g_bootEpochSec = DateToEpoch(fullYear, mon, day, hr, min, sec);
-    g_wallUsesPvclock = KvmClockAvailable();
-    g_wallStarted = g_wallUsesPvclock ? KvmClockReadNs() : ApicTickCount();
+    g_wallStarted = ElapsedClockNs();
     g_wallEpochNs = g_bootEpochSec * 1000000000ULL;
     g_lastRtcSec = g_bootEpochSec;
     g_lastRateSec = 0;
@@ -262,12 +264,12 @@ void RtcRecalibrateLapic()
 
 uint64_t RtcNowNs()
 {
-    const uint64_t now = g_wallUsesPvclock ? KvmClockReadNs() : ApicTickCount();
+    const uint64_t now = ElapsedClockNs();
     // Never combine integer seconds from one clock with another clock's phase.
     // The millisecond elapsed API also covers VMware's virtual TSC. Raw
     // delivered IRQs are a diagnostic count, not that platform's wall clock.
     const uint64_t elapsed = now >= g_wallStarted ? now - g_wallStarted : 0;
-    return g_wallEpochNs + elapsed * (g_wallUsesPvclock ? 1ULL : 1000000ULL);
+    return g_wallEpochNs + elapsed;
 }
 
 uint64_t RtcNow()

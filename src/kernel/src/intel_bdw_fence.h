@@ -4,6 +4,7 @@
 #ifndef BROOK_HOST_TEST
 #include "apic.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #endif
 #include "sync/kmutex.h"
 namespace brook {
@@ -16,7 +17,7 @@ struct BdwFence {uint32_t references,state,dependencyDepth,resolved,orderedPrede
 }; // pending=0, complete=1, failed=2, publishing=3
 inline uint64_t BdwFenceClockNs(){
 #ifndef BROOK_HOST_TEST
-    const uint64_t now=KvmClockAvailable()?KvmClockReadNs():ApicTickCount()*1000000ULL;
+    const uint64_t now=ElapsedClockNs();
     return now?now:1;
 #else
     return 0;

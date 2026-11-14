@@ -6,10 +6,12 @@
 #include "panic.h"
 #include "serial.h"
 #include "string.h"
+#include "pvclock_page.h"
 
 namespace brook {
 extern const uint8_t g_vdsoCodePage[4096];
 static PhysicalAddress codePage, clockPage;
+static bool privateClockPage = false;
 
 void VdsoInit() {
     codePage = PmmAllocPage(MemTag::KernelData);
@@ -21,10 +23,32 @@ void VdsoInit() {
         if (!clockPage) { PmmUnrefPage(codePage); codePage = {}; return; }
         // Unsupported hosts still get the same ELF ABI, using syscall fallback.
         memset(reinterpret_cast<void*>(PhysToVirt(clockPage).raw()), 0, 4096);
+        privateClockPage = true;
     }
     // Both initial references remain pinned for the kernel's lifetime. KVM
     // retains the clock reference even when no process maps the helper.
     SerialPuts("vDSO: clock helper ready\n");
+}
+
+bool VdsoPublishTscClock(uint64_t originTsc, uint64_t originNs, uint32_t mul, int8_t shift) {
+    // Only the kernel-owned fallback page; a KVM-registered page is host-written.
+    if (!clockPage || !privateClockPage || !mul) return false;
+    auto* slots = reinterpret_cast<volatile BrookPvclockSlot*>(PhysToVirt(clockPage).raw());
+    // Identical immutable records for every CPU (boot-verified synchronised
+    // TSCs). Even version: never updated afterwards, so readers never retry.
+    for (unsigned cpu = 0; cpu < BROOK_PVCLOCK_CPUS; ++cpu) {
+        auto& c = slots[cpu].clock;
+        c.tsc_timestamp = originTsc; c.system_time = originNs;
+        c.tsc_to_system_mul = mul; c.tsc_shift = shift; c.flags = 1; // stable
+        __atomic_store_n(&c.version, 2u, __ATOMIC_RELEASE);
+    }
+    auto* metadata = reinterpret_cast<volatile BrookPvclockMetadata*>(slots[0].reserved);
+    metadata->stride = BROOK_PVCLOCK_STRIDE; metadata->cpus = BROOK_PVCLOCK_CPUS;
+    metadata->features = BROOK_PVCLOCK_RDTSCP; metadata->version = BROOK_PVCLOCK_VERSION;
+    // The helper validates magic last-to-first; publish it after everything.
+    __atomic_store_n(&metadata->magic, uint32_t(BROOK_PVCLOCK_MAGIC), __ATOMIC_RELEASE);
+    SerialPuts("vDSO: invariant-TSC clock records published\n");
+    return true;
 }
 
 uint64_t VdsoInstall(AddressSpaceState* space, uint64_t random) {

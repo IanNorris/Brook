@@ -26,6 +26,7 @@
 #include "intel_bdw_bootstrap_gate.h"
 #include "hda_observe.h"
 #include "native_tsc_observe.h"
+#include "tsc_clock.h"
 #include "kprintf.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
@@ -44,6 +45,9 @@
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "ac_shutdown_record.h"
 #include "guard_checker_runner.h"
+#endif
+#if !defined(BROOK_HOST_TEST)
+#include "apic.h"
 #endif
 #include "../../drivers/intel_hda/hda_probe.h"
 namespace brook {
@@ -333,6 +337,28 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             if(status.result==DellI2cIdResult::Identified || status.result==DellI2cIdResult::Unknown){r.text(",");r.field("value",status.value);}}
         r.text(",\"pci_extent_ownership\":\"unresolved\"}\n");r.send();return true;
     }
+#if !defined(BROOK_HOST_TEST)
+    if(!strcmp(command,"bridge hardware clock-compare")) {
+        // Read-only: one adjacent sample of the clock applications see
+        // (monotonic_ns is CLOCK_MONOTONIC; monotonic_ms is ApicTickCount(),
+        // both invariant-TSC derived when clock_source is "tsc"), the raw
+        // native TSC scaled by its observed calibration, and the admitted Dell
+        // HDA drain clock. Two samples bracketed by host time give each rate.
+        const auto& tsc=NativeTscObserveRead();uint32_t lo=0,hi=0,aux=0;
+        const uint64_t monotonic=ElapsedClockNs();
+        const uint64_t ticks=ApicTickCount(),raw=ApicRawBspIrqCount();
+        __asm__ volatile("rdtscp; lfence":"=a"(lo),"=d"(hi),"=c"(aux)::"memory");
+        const uint64_t cycles=(uint64_t(hi)<<32)|lo,drain=HdaRuntimeDrainClockNs();
+        const uint64_t tscNs=tsc.consistent && tsc.khz?cycles/tsc.khz*1000000ULL+cycles%tsc.khz*1000000ULL/tsc.khz:0;
+        Reply r;r.text("{\"clock_compare_api\":1,");r.field("monotonic_ms",ticks);r.text(",");r.field("bsp_irqs",raw);
+        r.text(",");r.field("tsc",cycles);r.text(",");r.field("tsc_khz",tsc.consistent?tsc.khz:0u);r.text(",");r.field("tsc_ns",tscNs);
+        r.text(",");r.field("hda_drain_ns",drain);r.text(",");r.field("cpu",aux&0xfff);
+        const auto clock=TscClockReadStatus();
+        r.text(",");r.field("monotonic_ns",monotonic);r.text(",\"clock_source\":");r.quoted(ClockSourceName(clock.kind));
+        r.text(",");r.field("clock_tsc_khz",clock.khz);
+        r.text(",\"scope\":\"adjacent reads, not simultaneous; tsc_ns uses the boot PIT calibration\"}\n");r.send();return true;
+    }
+#endif
     if(!strcmp(command,"bridge hardware native-tsc-observe")) {
         const auto& o=NativeTscObserveRead();Reply r;r.text("{\"native_tsc_observe_api\":1,\"requested\":");r.text(o.requested?"true":"false");
         r.text(",\"attempted\":");r.text(o.attempted?"true":"false");r.text(",\"capable\":");r.text(o.capable?"true":"false");

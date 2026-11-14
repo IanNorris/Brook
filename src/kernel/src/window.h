@@ -501,6 +501,9 @@ bool WmPointerCaptureActive();
 uint64_t WmPointerCaptureRevision();
 uint32_t WmPointerSuppressedButtons();
 void WmPointerCaptureRefresh();
+// User-initiated revoke (the Super key): same as the provider losing its lease,
+// so waylandd unlocks and stays inhibited until a fresh click in the window.
+bool WmPointerCaptureReleaseByUser();
 bool WmRouteCapturedPointer(const InputEvent& event);
 bool WmInputPushRelative(Window* window,const InputEvent& event);
 

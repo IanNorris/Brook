@@ -58,6 +58,8 @@ extern "C" uint8_t ApicGetId();
 // Return the calibrated LAPIC timer ticks per millisecond.
 // Valid only after ApicInit().
 uint32_t ApicGetTimerTicksPerMs();
+// Boot CPU TSC rate (median of the LAPIC calibration PIT windows), 0 if unknown.
+uint32_t ApicGetTscKhz();
 
 // Adjust LAPIC periodic timer rate. `observedTicksPerSec` is ISR increments
 // observed in the last real wall-clock second (measured against CMOS RTC).
@@ -97,7 +99,8 @@ void IoApicMaskIrq(uint8_t irq);
 void ApicInitTimerOnAp();
 
 // Monotonic elapsed milliseconds. Stable KVM pvclock is selected after its
-// initialization; otherwise this is an approximate delivered-IRQ clock.
+// initialization, the invariant TSC on admitted bare metal (TscClockSelect);
+// otherwise this is an approximate delivered-IRQ clock.
 uint64_t ApicTickCount();
 // Diagnostic raw BSP timer interrupt count. Unlike ApicTickCount this never
 // switches to a paravirtual or VMware elapsed clock and can undercount stalls.
@@ -106,10 +109,15 @@ uint64_t ApicRawBspIrqCount();
 // BSP only. Preserve the existing origin when selecting stable elapsed time.
 // A BSP timer interrupt retries if the initial elapsed-source sample is unavailable.
 bool ApicInitElapsedClock();
+// TscClockSelect only, interrupts disabled: elapsed ms follow the TSC clock.
+void ApicSelectTscElapsedClock();
+// The five per-window TSC rates from the boot LAPIC/PIT calibration.
+void ApicGetTscKhzSamples(uint32_t (&samples)[5]);
 
 struct ApicClockSnapshot {
     bool pvclock;
     bool vmwareTsc;
+    bool nativeTsc;
     uint64_t elapsedMs;
     uint64_t rawBspIrqs;
     uint64_t originNs;

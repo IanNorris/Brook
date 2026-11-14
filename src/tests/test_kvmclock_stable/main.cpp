@@ -60,6 +60,9 @@ void KvmClockTestRegister(uint32_t cpu,uint64_t address,bool aux) {
 volatile uint64_t g_lapicTickCount = 0;
 volatile uint64_t g_lapicRawTickCount = 0;
 uint64_t ApicTickCount() { return g_lapicTickCount; }
+bool testTscClock=false;uint64_t testTscNs=0;
+bool TscClockAvailable() { return testTscClock; }
+uint64_t TscClockReadNs() { return testTscClock?testTscNs:0; }
 uint8_t RtcTestCmosRead(uint8_t reg) {
     switch(reg) {
     case 0x00: return cmosSeconds;
@@ -331,6 +334,14 @@ int main() {
     // delivered timer IRQs. Raw IRQ changes cannot advance the RTC epoch.
     g_lapicRawTickCount+=1234567;
     CHECK(RtcNowNs()==fallbackEpoch+1000000000);
+    // Invariant-TSC selection after RtcInit continues the tick domain
+    // (origin = ticks*1e6), so the anchor stays valid and gains ns resolution.
+    testTscClock=true;testTscNs=1700ULL*1000000ULL;
+    CHECK(RtcNowNs()==fallbackEpoch+1000000000);
+    testTscNs+=123;CHECK(RtcNowNs()==fallbackEpoch+1000000123);
+    g_lapicTickCount=1;testTscNs+=2000000000ULL; // delivered ticks no longer matter
+    CHECK(RtcNowNs()==fallbackEpoch+3000000123ULL);
+    testTscClock=false;g_lapicTickCount=1700;
 
     // RTC frequency discipline must not rewrite the elapsed deadline domain.
     // A backwards step postpones already-armed wakeups; a forwards step can

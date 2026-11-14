@@ -658,6 +658,8 @@ add_host_test(test_cursor_composition)
 target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_desktop_metrics)
+add_host_test(test_global_shortcuts)
+target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_taskbar_volume)
@@ -844,6 +846,8 @@ add_host_test(test_native_tsc_pit)
 add_host_test(test_native_tsc_observe "${BROOK_ROOT}/src/kernel/src/native_tsc_observe.cpp")
 add_host_test(test_native_tsc_rendezvous)
 add_host_test(test_native_tsc_audio_clock)
+add_host_test(test_tsc_clock)
+target_compile_options(test_tsc_clock PRIVATE -UNDEBUG)
 target_compile_options(test_native_tsc_observe PRIVATE -DBROOK_HOST_TEST "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_compile_options(test_vmware_clock PRIVATE -UNDEBUG)
 
@@ -948,3 +952,7 @@ add_host_test(test_intel_bdw_csb)
 target_compile_options(test_intel_bdw_csb PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_pte_owner_sidecars)
 target_compile_options(test_pte_owner_sidecars PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+
+add_host_test(test_boot_timing)
+target_compile_options(test_boot_timing PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared")

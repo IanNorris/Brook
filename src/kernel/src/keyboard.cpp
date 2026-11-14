@@ -522,9 +522,10 @@ extern "C" void KbdIrqHandlerInner(void)
             return;
         case 0x5B: // Left Super (GUI)
         case 0x5C: // Right Super (GUI)
+            // Published (not just tracked) so the desktop can act on a tap.
             g_superHeld = !release;
-            ApicSendEoi();
-            return;
+            key = key == 0x5B ? SC_LSUPER : SC_RSUPER;
+            break;
         default:
             // Unknown E0 key — ignore
             ApicSendEoi();
@@ -568,7 +569,7 @@ extern "C" void KbdIrqHandlerInner(void)
 
         // Translate to ASCII for press events on non-modifier keys.
         ev.ascii = 0;
-        if (!release && key < 128)
+        if (!release && key < 128 && !isExtended)
         {
             bool shifted = g_shiftHeld ^ g_capsLock;
             if (g_capsLock && !g_shiftHeld)
@@ -588,7 +589,7 @@ extern "C" void KbdIrqHandlerInner(void)
     }
 
     // Also push ASCII to the legacy ring buffer (for kernel shell / KbdGetChar).
-    if (!release && key < 128)
+    if (!release && key < 128 && !isExtended)
     {
         const char* tblNormal = (g_kbdLayout == KbdLayout::UK) ? g_scancodeToAscii_UK : g_scancodeToAscii_US;
         const char* tblShift  = (g_kbdLayout == KbdLayout::UK) ? g_scancodeToAsciiShift_UK : g_scancodeToAsciiShift_US;

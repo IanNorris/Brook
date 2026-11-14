@@ -138,7 +138,7 @@ void WmDrawBuildIdSpan(uint32_t* pixels,uint32_t left,uint32_t count,uint32_t ro
 bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* width,uint32_t* height) {
     const uint64_t ready=CompositorDesktopReadyTick(),now=ApicTickCount();
     if(!ready||now<ready||now-ready>7000)return false;
-    const uint32_t margin=WmMetric(16),w=WmMetric(480),h=WmDesktopFont().lineHeight*4+WmMetric(28);
+    const uint32_t margin=WmMetric(16),w=WmMetric(480),h=WmDesktopFont().lineHeight*5+WmMetric(28);
     if(sw<margin*2+WmMetric(100)||sh<h+margin+WmMetric(WM_TASKBAR_HEIGHT))return false;
     *width=w<sw-margin*2?w:sw-margin*2;*height=h;*x=sw-*width-margin;*y=margin;return true;
 }
@@ -148,10 +148,22 @@ void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t s
     WmFillRect(pixels,stride,sw,sh,x,y,w,WmMetric(3),0x68acff);
     int py=y+WmMetric(11);const int line=WmDesktopFont().lineHeight;
     auto text=[&](const char* s,uint32_t color){WmRenderString(pixels,stride,sw,sh,x+WmMetric(12),py,s,color,p.taskbar,w-WmMetric(24));py+=line;};
-    char number[16],row[96];const uint64_t duration=CompositorBootDurationMs();
-    WmStrCopy(row,"Desktop ready in ",sizeof(row));DesktopNumber(number,duration/1000);
-    size_t n=strlen(row);WmStrCopy(row+n,number,sizeof(row)-n);n=strlen(row);row[n++]='.';row[n++]='0'+(duration/100)%10;row[n++]='0'+(duration/10)%10;row[n]=0;
-    WmStrCopy(row+n,KvmClockStableAvailable()?" s (VM start)":" s (kernel clock)",sizeof(row)-n);text(row,p.text);
+    char number[16],row[96];
+    if(const BootTimingSummary* timing=BootTimingRead()) {
+        // Firmware | boot menu | loader | kernel; fold the loader into the
+        // kernel bucket when the full row would be clipped.
+        BootTimingHeadline(row,sizeof(row),*timing);text(row,p.text);
+        BootTimingRow(row,sizeof(row),*timing,false);
+        if(WmTextWidth(row)>int(w)-int(WmMetric(24)))BootTimingRow(row,sizeof(row),*timing,true);
+        text(row,p.secondaryText);
+    } else {
+        const uint64_t duration=CompositorBootDurationMs();
+        WmStrCopy(row,"Desktop ready in ",sizeof(row));DesktopNumber(number,duration/1000);
+        size_t n=strlen(row);WmStrCopy(row+n,number,sizeof(row)-n);n=strlen(row);row[n++]='.';row[n++]='0'+(duration/100)%10;row[n++]='0'+(duration/10)%10;row[n]=0;
+        WmStrCopy(row+n,KvmClockStableAvailable()?" s (VM start)":" s (kernel clock)",sizeof(row)-n);text(row,p.text);
+        text("Boot timing n/a",p.secondaryText);
+    }
+    size_t n=0;
     DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores | ",sizeof(row)-n);n=strlen(row);DesktopNumber(number,PmmGetFreePageCount()*4096/1048576);WmStrCopy(row+n,number,sizeof(row)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(row)-n);text(row,p.secondaryText);
     text(CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",p.secondaryText);
     WmStrCopy(row,"Build ",sizeof(row));WmStrCopy(row+6,BuildGitHash(),sizeof(row)-6);text(row,p.mutedText);

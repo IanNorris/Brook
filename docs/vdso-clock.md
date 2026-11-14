@@ -14,6 +14,18 @@ retry loop, not the entire request: the existing kernel clock reader may retry
 indefinitely. Fast-path bad output pointers can fault directly in userspace,
 as with Linux's vDSO; fallback returns raw negative errno to libc.
 
+## Bare-metal invariant TSC
+
+Without KVM, `TscClockSelect` (src/kernel/src/tsc_clock.cpp) can select the
+invariant TSC. In that case the kernel fills the private fallback page with 64
+identical, immutable pvclock-format records (even version, stable flag,
+pvclock mul/shift, origin = the delivered-tick count at selection) and then
+the metadata. The helper's existing fast path then computes exactly the value
+that `clock_gettime` returns from the syscall path. The records are published
+only when no boot rendezvous exchange observed a cross-CPU warp. The syscall
+path additionally keeps a global monotonic floor. The boot log records the
+decision as `CLOCK_SOURCE tsc ... vdso=1`.
+
 ## Layout and lifetime
 
 One ELF `PT_LOAD` describes an 8 KiB extent: a code page followed by zero-sized

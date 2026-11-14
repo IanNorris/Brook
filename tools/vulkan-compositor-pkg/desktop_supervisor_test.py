@@ -80,6 +80,36 @@ with tempfile.TemporaryDirectory(prefix="brook-supervisor-async-") as tmp:
 assert subprocess.run([sys.argv[1],"--async-partial","--partial","/bin/true"],capture_output=True).returncode==2
 print("DESKTOP_SUPERVISOR_ASYNC_PARTIAL_PASS")
 
+# The boot (serial) supervisor passes BROOK_RENDER_PIPELINE through, so a
+# live A/B needs only a restart with a different environment.
+if len(sys.argv)>2:
+    with tempfile.TemporaryDirectory(prefix="brook-supervisor-pipeline-") as tmp:
+        root=Path(tmp);child=root/"renderer";seen=root/"seen"
+        child.write_text('#!/bin/sh\nprintf "%s %s %s\\n" "$BROOK_RENDER_PIPELINE" "$BROOK_RENDER_ASYNC_PARTIAL_SERIAL" "$BROOK_RENDER_BUFFER_COUNT" > "$BROOK_TEST_SEEN"\nexec sleep 30\n')
+        child.chmod(0o755)
+        base=dict(os.environ,BROOK_TEST_SEEN=str(seen));base.pop("BROOK_RENDER_PIPELINE",None)
+        proc=subprocess.Popen([sys.argv[2],"--async-partial",str(child)],env=dict(base,BROOK_RENDER_PIPELINE="2"),stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline and not seen.exists():time.sleep(0.05)
+            assert seen.read_text().strip()=="2 1 2"
+            proc.send_signal(signal.SIGTERM);assert proc.wait(timeout=5)==0
+        finally:
+            if proc.poll() is None:proc.kill();proc.wait()
+            proc.stderr.close()
+        seen.unlink()
+        proc=subprocess.Popen([sys.argv[2],"--async-partial","--pipeline",str(child)],env=base,stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline and not seen.exists():time.sleep(0.05)
+            assert seen.read_text().strip()=="2 1 2"
+            proc.send_signal(signal.SIGTERM);assert proc.wait(timeout=5)==0
+        finally:
+            if proc.poll() is None:proc.kill();proc.wait()
+            proc.stderr.close()
+    assert subprocess.run([sys.argv[2],"--pipeline","/bin/true"],capture_output=True).returncode==2
+    print("DESKTOP_SUPERVISOR_PIPELINE_ENV_PASS")
+
 with tempfile.TemporaryDirectory(prefix="brook-supervisor-source-") as tmp:
     root=Path(tmp);child=root/"renderer";seen=root/"seen"
     child.write_text('#!/bin/sh\nprintf "%s %s %s %s\\n" "$BROOK_RENDER_PARTIAL" "$BROOK_DESKTOP_GPU_SOCKET" "$BROOK_RENDER_SELECTIVE_CAPTURE" "$BROOK_RENDER_GPU_SOURCE_TRACE" > "$BROOK_TEST_SEEN"\nexec sleep 30\n')

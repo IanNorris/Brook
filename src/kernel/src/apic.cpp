@@ -1,5 +1,6 @@
 #include "ioapic_route_policy.h"
 #include "apic.h"
+#include "boot_timing.h"
 #include "idt.h"
 #include "gs_paranoid.h"
 #include "fpu_irq.h"
@@ -12,6 +13,7 @@
 #include "spinlock.h"
 #include "panic.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "vmware_clock.h"
 #include "vmware_clock_policy.h"
 #include "tick_clock.h"
@@ -190,7 +192,7 @@ static void SoftEnableLapic()
 // Stable elapsed samples publish a global monotonic floor; IRQ counts remain
 // separate and are never interpreted as precise service/wall time on KVM.
 volatile uint64_t g_lapicTickCount = 0;
-enum TickElapsedSource : uint32_t { TickIrqs, TickPvclock, TickVmwareTsc };
+enum TickElapsedSource : uint32_t { TickIrqs, TickPvclock, TickVmwareTsc, TickNativeTsc };
 static uint32_t g_tickSource = TickIrqs;
 static uint64_t g_tickOriginNs = 0;
 static uint64_t g_tickOriginTsc = 0;
@@ -223,6 +225,17 @@ bool ApicInitElapsedClock()
     }
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
     return selected;
+}
+
+// Called by TscClockSelect with interrupts disabled, after the TSC clock has
+// been anchored to the current delivered-tick count. Delivered ticks keep
+// driving the scheduler; elapsed milliseconds now follow the TSC.
+void ApicSelectTscElapsedClock()
+{
+    if (__atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)!=TickIrqs || !TscClockAvailable()) return;
+    g_tickOriginMs = __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_tickSource, uint32_t(TickNativeTsc), __ATOMIC_RELEASE);
+    SerialPrintf("APIC: elapsed clock invariant TSC (origin_ms=%lu)\n", g_tickOriginMs);
 }
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
@@ -594,7 +607,16 @@ static void LapicTimerHandler(void)
 
 static constexpr uint32_t PIT_FREQUENCY      = 1193182;   // Hz
 
-static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs)
+static uint32_t g_tscKhzSamples[5] = {};
+static uint32_t g_tscKhz = 0;
+static inline uint64_t CalibrationTsc()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs, uint32_t* tscKhz = nullptr)
 {
     LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);
 
@@ -608,10 +630,18 @@ static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs)
     outb(0x42, static_cast<uint8_t>(pitTicks >> 8));
 
     LapicWrite(LapicReg::TIMER_INIT_CNT, 0xFFFFFFFF);
+    const uint64_t tscStart = CalibrationTsc();
 
     while (!(inb(0x61) & 0x20)) {}
 
+    const uint64_t tscEnd = CalibrationTsc();
     uint32_t remaining = LapicRead(LapicReg::TIMER_CUR_CNT);
+    if (tscKhz) {
+        // The same PIT one-shot window also yields the boot CPU's TSC rate.
+        const uint64_t delta = tscEnd > tscStart ? tscEnd - tscStart : 0;
+        const uint64_t khz = delta * PIT_FREQUENCY / (static_cast<uint64_t>(pitTicks) * 1000);
+        *tscKhz = khz <= 0xFFFFFFFFu ? static_cast<uint32_t>(khz) : 0;
+    }
     LapicWrite(LapicReg::TIMER_INIT_CNT, 0);
 
     outb(0x61, prev61);
@@ -633,13 +663,17 @@ static uint32_t CalibrateLapicTimer()
     uint32_t samples[5] = {};
     for (int i = 0; i < 5; ++i)
     {
-        uint32_t s = CalibrateLapicTimerOnce(25);
+        uint32_t s = CalibrateLapicTimerOnce(25, &g_tscKhzSamples[i]);
         samples[i] = s;
         if (s > best) best = s;
     }
 
     SerialPrintf("APIC: LAPIC calibrated %u ticks/ms (samples %u %u %u %u %u)\n",
                  best, samples[0], samples[1], samples[2], samples[3], samples[4]);
+    g_tscKhz = BootTimingMedianKhz(g_tscKhzSamples);
+    SerialPrintf("APIC: TSC %u kHz (samples %u %u %u %u %u)\n", g_tscKhz,
+                 g_tscKhzSamples[0], g_tscKhzSamples[1], g_tscKhzSamples[2],
+                 g_tscKhzSamples[3], g_tscKhzSamples[4]);
     return best;
 }
 
@@ -731,6 +765,16 @@ void ApicSendEoi()
 uint8_t ApicGetId()
 {
     return static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
+}
+
+uint32_t ApicGetTscKhz()
+{
+    return g_tscKhz;
+}
+
+void ApicGetTscKhzSamples(uint32_t (&samples)[5])
+{
+    for (unsigned i = 0; i < 5; ++i) samples[i] = g_tscKhzSamples[i];
 }
 
 uint32_t ApicGetTimerTicksPerMs()
@@ -1782,9 +1826,15 @@ uint64_t ApicTickCount()
     const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);
     if (source!=TickIrqs) {
         uint64_t now = 0, sample = 0;
-        const bool valid=source==TickPvclock ?
-            (KvmClockReadStableNs(&now) && TickClockElapsedMs(g_tickOriginNs,g_tickOriginMs,now,&sample)) :
-            (VmwareClockReadTicks(&now) && VmwareTscElapsedMs(g_tickOriginTsc,g_tickOriginMs,now,VmwareClockTscKhz(),&sample));
+        bool valid=false;
+        if (source==TickPvclock)
+            valid=KvmClockReadStableNs(&now) && TickClockElapsedMs(g_tickOriginNs,g_tickOriginMs,now,&sample);
+        else if (source==TickVmwareTsc)
+            valid=VmwareClockReadTicks(&now) && VmwareTscElapsedMs(g_tickOriginTsc,g_tickOriginMs,now,VmwareClockTscKhz(),&sample);
+        else {
+            // Same ns domain as CLOCK_MONOTONIC; anchored at origin_ms*1e6.
+            now=TscClockReadNs();sample=now/1000000ULL;valid=now!=0;
+        }
         if (valid)
             return TickClockPublishFloor(&g_lapicTickCount, sample);
         // Retain the last published floor through an unavailable/regressing
@@ -1801,10 +1851,16 @@ ApicClockSnapshot ApicGetClockSnapshot()
     const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);
     snapshot.pvclock = source==TickPvclock;
     snapshot.vmwareTsc = source==TickVmwareTsc;
+    snapshot.nativeTsc = source==TickNativeTsc;
     snapshot.rawBspIrqs = __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
     if (snapshot.pvclock) {
         snapshot.originNs = g_tickOriginNs;
         snapshot.originMs = g_tickOriginMs;
+    }
+    if (snapshot.nativeTsc) {
+        const auto tsc=TscClockReadStatus();
+        snapshot.originMs=g_tickOriginMs;snapshot.originNs=tsc.originNs;
+        snapshot.originTsc=tsc.originTsc;snapshot.tscKhz=tsc.khz;
     }
     if (snapshot.vmwareTsc) {
         snapshot.originMs=g_tickOriginMs;

@@ -1,3 +1,5 @@
+#include "boot_timing.h"
+#include "boot_timing_runtime.h"
 #include "chrome_material.h"
 #include "fw_cfg.h"
 #include "audio.h"
@@ -281,6 +283,11 @@ void WmPointerCaptureRefresh() {
         g_pointerOrphanedReleases|=recovered;
         __atomic_fetch_and(&g_pointerQuarantinedButtons,~recovered,__ATOMIC_ACQ_REL);
     }
+}
+bool WmPointerCaptureReleaseByUser() {
+    VfbGuard guard;
+    if(g_pointerCaptureIndex<0)return false;
+    PointerCaptureReleaseLocked();return true;
 }
 int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint32_t token) {
     if(!provider || !wmId || wmId>WM_MAX_WINDOWS)return -22;

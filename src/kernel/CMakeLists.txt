@@ -319,6 +319,7 @@ add_executable(kernel
     src/rtc.cpp
     src/kvmclock.cpp
     src/vmware_clock.cpp
+    src/tsc_clock.cpp
     src/vdso.cpp
     src/display.cpp
     src/display_power.cpp
@@ -380,6 +381,7 @@ add_executable(kernel
     src/virtio_blk.cpp
     src/gpt.cpp
     src/acpi.cpp
+    src/boot_timing.cpp
     src/apic.cpp
     src/tlb_test.cpp
     src/tty.cpp
@@ -591,6 +593,7 @@ set_source_files_properties(
     src/gpu_completion.cpp
     src/kvmclock.cpp
     src/vmware_clock.cpp
+    src/tsc_clock.cpp
     src/apic.cpp
     src/tlb_test.cpp
     src/scheduler.cpp

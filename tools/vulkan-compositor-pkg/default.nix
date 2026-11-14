@@ -87,7 +87,9 @@ pkgs.stdenv.mkDerivation {
     ./brook-desktop-async-source-barrier-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_stats_test.c -o brook-desktop-stats-test
     ./brook-desktop-stats-test > desktop-stats-sample.json
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["schema"]=="brook-desktop-stats/1" and len(d["windows"])==16' desktop-stats-sample.json
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["schema"]=="brook-desktop-stats/1" and len(d["windows"])==16 and d["pipeline"]["depth"]==2 and d["full_forced"]["in_flight"]==1' desktop-stats-sample.json
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_pipeline_test.c -o brook-desktop-pipeline-test
+    ./brook-desktop-pipeline-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror multi_renderer_test.c renderer.o surface.o -lvulkan -o brook-vulkan-multi-compositor-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror async_pair_test.c renderer.o -lvulkan -o brook-vulkan-async-pair-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_bench.c renderer.o -lvulkan -o brook-desktop-chrome-bench
@@ -105,7 +107,7 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_GPU_SOURCE=1 desktop_supervisor.c -o brook-desktop-supervisor-test-gpu-source
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_SELECTIVE_CAPTURE=1 desktop_supervisor.c -o brook-desktop-supervisor-test-selective-capture
     $CC -std=c11 -O2 -Wall -Wextra -Werror -DBROOK_SUPERVISOR_TEST_SELECTIVE_TIMING=1 desktop_supervisor.c -o brook-desktop-supervisor-test-selective-timing
-    python3 desktop_supervisor_test.py ./brook-desktop-supervisor
+    python3 desktop_supervisor_test.py ./brook-desktop-supervisor ./brook-desktop-supervisor-serial
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_backdrop_test.c -o brook-desktop-backdrop-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_test.c -o brook-desktop-chrome-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation desktop_chrome_present_test.c -o brook-desktop-chrome-present-test

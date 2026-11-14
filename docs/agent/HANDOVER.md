@@ -36,7 +36,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
 | M1 | Change-based damage, idle polls, quad pass with occlusion and bit-exact shader blending (compute fallback via `BROOK_RENDER_COMPOSE=compute`) | done: `4330fd74`; gen 362: displayed ~29 fps (2 buffers) / ~24 (8), swaps 46/85, compositor job ~10.5 ms, worker 37–42% idle |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
-| M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | code on `work/m3-flip` (both options OFF by default, runtime-gated off at boot); host tests and default QEMU check pass; Dell untested, staged plan in `docs/bdw-page-flip.md` |
+| M3 | Page flip (`BROOK_BDW_SCANOUT_FLIP`) and persistent BCS scanout map (`BROOK_BDW_PERSISTENT_SCANOUT_MAP`), runtime-gated (`gpu flip probe/arm/off/status`, `gpu scanout map on/off/status`) | in progress, `work/m3-flip`. Gen 364: probe 3/3 pass (pipe A → eDP, PSR off, stride 12800, 60 Hz). Persistent map: present prep 2.7 → 0.4 ms, 2-buffer interval 35.5 → 33.9 ms. `gpu flip arm` refused with `ggtt-bind` (safe fallback); fixed in `8c146e19` (take over inherited GGTT entries), Dell retest pending |
 | M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
 
 **M0 results (gen 357, console visible, 14 Nov):**
@@ -69,6 +69,35 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **Ian:** "very playable"; yquake2's own counter read 46 fps (21.9 ms), "quite erratic" but frame pacing visually acceptable.
 - **Renderer counters over 14 s:** 45.0 distinct displayed frames/s (every swap shown). Intervals p50 19.5, p90 29.8, p99 44.6 ms. Game-frame submit→fence 9 ms, prepare 3 ms.
 - **The remaining jitter** is the 33–50 ms tail (serial one-frame pipeline plus BCS copy), so M3 and pipelining are next.
+
+**Clock finding (gen 365, `dell-batch1-20261114`, 14 Nov night):**
+- **On the Dell, CLOCK_MONOTONIC/REALTIME count LAPIC ticks** (no kvmclock).
+- **`bridge hardware clock-compare`:**
+  - idle: monotonic = TSC = HDA = host within 0.2% over 20 s;
+  - **under the Quake benchmark, monotonic ran 11.5% slow** (8.05 s vs host 9.09 s), while TSC and HDA tracked the host.
+- **Consequences:**
+  - browser A/V drift (Chromium audio slow, Firefox fast);
+  - **all clock_gettime-based fps figures above are inflated by ~10% under load.**
+- **Fix in progress (`work/tsc-clock`):** TSC-backed time. Re-baseline after it lands.
+- **Boot timing on the Dell (old loader):** firmware 4.27 s (FPDT), kernel 2.79 s; loader and menu need the new bootloader, a supervised step pending with Ian.
+
+**Pipelining A/B (gen 366, `dell-pipeline-20261114`, same boot):**
+- **8 buffers:** serial → pipelined took the displayed mean from 41.6 to 33.3 ms, but swaps fell from 86 to 59 and worker idle from 42% to 7%.
+- **Bug:** the next game window incarnation (2-buffer arm) got zero direct frames, and the renderer submitted ~13k frames continuously.
+- **State:** stays off (serial default) until fixed in `work/pipelining`. The Dell is back on the serial supervisor (job, same boot).
+- **Process slip:** this image was deployed although its QEMU check reported `passed:false` (both attempts were OVMF load stalls; the recheck passed). New `scripts/dell_deploy.py` refuses to deploy without a passing verdict; use it for all deploys.
+
+**TSC clock (gen 367, `dell-batch2-tsc-20261114`):**
+- `clock status` reports `tsc`/`invariant-tsc`. Under load, monotonic tracks TSC; LAPIC ticks lose ~7%, which no longer matters.
+- **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
+- **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
+
+**Pipelining default (gen 369, `dell-pipeline-default-20261114`, boot default):**
+- **2 buffers:** displayed mean 33.2 ms (≈30 fps real time), p50 30.0, p99 49.7; swaps 31.7.
+- **8 buffers:** 37.4 ms mean, p99 83.5.
+- **vs serial on the TSC clock:** 42.5 ms mean and p99 95.
+- **Opt-out:** `BROOK_RENDER_PIPELINE=1`.
+- **Gotcha:** a supervisor started by hand as a bridge job blocks a checked restart in "closing apps". Stop the job (cancel the restart first if it's already stuck), then restart.
 
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
@@ -142,10 +171,13 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 
 ## Backlog (outside the immediate goal)
 
-- **Keyboard shortcuts:**
-  - the Windows (Super) key opens the app launcher and always releases pointer capture; today a captured mouse can't be released without closing the app;
-  - Alt+F4 closes the focused window.
+- **Keyboard shortcuts (implemented on `work/shortcuts`, QEMU-verified, not yet on Dell):** Super tap toggles the launcher (Escape closes it), Super key-down revokes pointer capture, Alt+F4 sends the normal advisory close. State machine `src/kernel/src/global_shortcuts.h`, host test `test_global_shortcuts`; evidence `build/shortcuts-check/`. Wayland lock release on hardware with a current waylandd and yquake2 is still unobserved (the QEMU seed's waylandd predates pointer constraints).
 - **Dell application audio for yquake2:** the gen 363 boot has no `/dev/dsp`, and the OSS OpenAL store path (`59h20vp…-openal-soft-oss-brook-1.24.3`) is present but has no `lib/`. Restore the gated Dell HDA path (`/etc/dell-hda-audible`; see `docs/xps9343-bringup.md`) and stage OpenAL, then verify audibly with Ian. The SDL build has no OSS backend, so OpenAL is required. The `/data/home` yquake2 config also had a stale absolute `al_driver`.
+- **Browser video and audio on the Dell (Ian, gen 363, 14 Nov):**
+  - **Chromium YouTube:** audible, but music plays SLOW; frame-time p80 ~90 ms.
+  - **Firefox YouTube:** video and audio both run FAST, with no obvious audible stutter; ~3–4 fps, frame-time p80 ~174 ms.
+  - **Suspicion:** the playback clock or position reported to apps (GETOPTR/GETODELAY or the bridge) is wrong; see `docs/audio-clock.md`. Being investigated in `work/dell-audio`.
+  - **Acceptance check to add:** fullscreen YouTube with no audio stutter, judged from renderer frame pacing plus all-zero packets in mixer output.
 - **Boot-menu wait:** key input during the bootloader wait isn't recognised. The default wait is being reduced to 0.5 s in `work/boot-timing`.
 - **Volume persistence:** taskbar volume changes apply live but are only saved by Settings' Apply. Decide whether taskbar changes should persist automatically.
 
