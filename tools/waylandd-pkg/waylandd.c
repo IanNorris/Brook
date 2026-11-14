@@ -1,4 +1,5 @@
 #include "toplevel-size.h"
+#include "socket-guard.h"
 /*
  * waylandd.c — Brook OS Wayland server (Phase D rewrite).
  *
@@ -3280,6 +3281,15 @@ int main(int argc, char **argv)
         memset(&a, 0, sizeof(a));
         a.sun_family = AF_UNIX;
         snprintf(a.sun_path, sizeof(a.sun_path), "/tmp/%s", sock_name);
+        /* Never take the socket from a live server: a second instance used to
+         * unlink and re-bind it, silently moving every later client (on the
+         * GPU desktop, from INTLWL.ELF) to this CPU-composited server. Only a
+         * stale path, where nobody accepts, is replaced. */
+        if (wayland_socket_live(&a)) {
+            fprintf(stderr, "[waylandd] %s is served by another compositor; exiting\n", a.sun_path);
+            close(lfd);
+            return 0;
+        }
         unlink(a.sun_path);
         if (bind(lfd, (struct sockaddr*)&a, sizeof(a)) < 0) {
             fprintf(stderr, "[waylandd] FAIL: bind %s: %s\n", a.sun_path, strerror(errno));

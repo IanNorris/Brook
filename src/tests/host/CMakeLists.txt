@@ -662,6 +662,9 @@ add_host_test(test_global_shortcuts)
 target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
+add_host_test(test_wayland_provider)
+target_compile_options(test_wayland_provider PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
 add_host_test(test_taskbar_volume)
 target_compile_options(test_taskbar_volume PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 

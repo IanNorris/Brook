@@ -73,6 +73,8 @@ stdenv.mkDerivation {
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o output-identity-test
     ./output-identity-test
+    $CC -O2 -UNDEBUG -Wall -Wextra socket-guard-test.c -o socket-guard-test
+    ./socket-guard-test
     $CC -O2 -UNDEBUG -Wall -Wextra surface-tree-test.c -o surface-tree-test
     ./surface-tree-test
     $CC -O2 -Wall -Wextra -I${wayland.dev}/include -I. \

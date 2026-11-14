@@ -20,5 +20,9 @@ user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
 user_pref("browser.sessionstore.resume_from_crash", false);
 EOF
 fi
-exec /nix/profile/bin/brook-run /nix/profile/bin/firefox \
+# GPU rendering (WebRender on EGL) through the opt-in patched Iris stack;
+# BROOK_BROWSER_SOFTWARE=1, or an image without brook-iris-run, keeps software.
+gpu=(/nix/profile/bin/brook-iris-run)
+if [ -n "${BROOK_BROWSER_SOFTWARE:-}" ] || [ ! -x "${gpu[0]}" ]; then gpu=(); fi
+exec /nix/profile/bin/brook-run "${gpu[@]}" /nix/profile/bin/firefox \
   --no-remote --profile "$HOME/.mozilla/brook" "$@"
