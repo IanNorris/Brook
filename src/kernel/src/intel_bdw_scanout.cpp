@@ -5,6 +5,7 @@
 #include "boot_protocol/boot_protocol.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_display_probe.h"
+#include "intel_bdw_scanout_target.h"
 #include "intel_bdw_forcewake_ack.h"
 #include "intel_bdw_forcewake_adapter.h"
 #include "intel_bdw_oneshot.h"
@@ -105,6 +106,23 @@ bool BdwObserveDisplayLive(BdwDisplaySnapshot& out) {
 #else
     (void)out;
 #endif
+    return false;
+}
+// Display state admissible for GPU work: the GOP mode with the GOP surface
+// or a mapped kernel flip buffer on plane A. A flip can latch between the
+// two stable reads of a snapshot, so flip builds retry a few times.
+bool BdwObserveDisplayAccepted(BdwDisplaySnapshot& out,unsigned registers) {
+#if defined(BROOK_BDW_SCANOUT_FLIP)
+    constexpr unsigned attempts=4;
+#else
+    constexpr unsigned attempts=1;
+#endif
+    for(unsigned i=0;i<attempts;++i){
+        BdwDisplaySnapshot display{};
+        if(!BdwObserveDisplayLive(display))continue;
+        if(!BdwDisplayCompatible(display,[](uint32_t surface){return BdwScanoutSurfaceAccepted(surface);},registers))return false;
+        out=display;return true;
+    }
     return false;
 }
 bool BdwObserveForcewakeLive(BdwForcewakeAdapterResult& out,bool otherEngines,bool scopeCheck) {
@@ -512,10 +530,9 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page))return {false,true};
     const auto& tsc=NativeTscObserveRead();
     if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz)return {false,true};
+    // Accepts the GOP surface or a mapped kernel flip buffer on plane A.
     BdwDisplaySnapshot display{};
-    if(!BdwObserveDisplayLive(display) || display.regs[0][0]!=0x98000000u || display.regs[0][1]!=12800)return {false,true};
-    for(unsigned pipe=0;pipe<3;++pipe)for(unsigned reg=0;reg<10;++reg)
-        if((pipe || reg>1) && display.regs[pipe][reg])return {false,true};
+    if(!BdwObserveDisplayAccepted(display,10))return {false,true};
     PciBootEntry entry{};bool found=false;
     for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry e{};if(!PciBootInventoryRead(i,&e))return {false,true};
         const auto& d=e.device;if(d.bus==0 && d.dev==2 && d.fn==0){entry=e;found=true;break;}}
@@ -841,14 +858,14 @@ bool BdwObserveGopBacking(BdwGopBacking& out) {
             return LiveGpuMatches(entry) && PowerD0(d) && PciConfigRead32(0,2,0,0x5c)==firmware.stolenBase;
         };
         BdwDisplaySnapshot display{};
-        if(!stable() || !BdwObserveDisplayLive(display) || !BdwDisplayUsesGop(display))return false;
+        if(!stable() || !BdwObserveDisplayAccepted(display))return false;
         BdwGopBacking sample{};
         const auto readPage=[](uint32_t first,uint32_t count,uint64_t& physical) {
             const auto address=BdwDellGgttBase+uint64_t(first)*8;
             return PageAdmitted(address) && VmmDellGopBackingPage(first,count,physical);
         };
         if(!BdwGopBackingSnapshot(observation.plan,BdwDecodeStolenRange(firmware),readPage,sample) ||
-           !BdwObserveDisplayLive(display) || !BdwDisplayUsesGop(display) || !stable())return false;
+           !BdwObserveDisplayAccepted(display) || !stable())return false;
         BootResourceClassification classification{};
         constexpr uint32_t allowed=(1u<<uint32_t(MemoryType::Reserved))|(1u<<uint32_t(MemoryType::Framebuffer));
         if(!AcpiClassifyBootRange(sample.physicalBase,uint32_t(sample.bytes),classification) ||
@@ -870,7 +887,10 @@ BdwScanoutCopyStats BdwReadScanoutCopyStats(){
         __atomic_load_n(&copyStats.lastStage,__ATOMIC_RELAXED)};
 }
 bool BdwBcsScanoutEnabled(){return observation.bcsPresentRequested && observation.planned && observation.inventory;}
-bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
+#if defined(BROOK_BDW_PERSISTENT_SCANOUT_MAP) || defined(BROOK_BDW_SCANOUT_FLIP)
+#define BROOK_BDW_SCANOUT_TARGETS 1
+#endif
+BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
     __atomic_add_fetch(&copyStats.requested,1,__ATOMIC_RELAXED);
     auto stage=[](uint32_t value){__atomic_store_n(&copyStats.lastStage,value,__ATOMIC_RELAXED);};
     stage(1);
@@ -884,18 +904,40 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     DiagnosticLease lease;
     if(!lease.held || !BdwBcsScanoutEnabled() || !BdwRenderExperimentEnabled() || SmpCurrentCpuIndex()!=0 ||
        !PanicRecoveryResetArmed() || !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) ||
-       !PageAdmitted(BdwResetPage) || !PageAdmitted(0xf6880000ull) || !PageAdmitted(0xf6101000ull))return false;
-    for(auto page:BdwForcewakePages)if(!PageAdmitted(page))return false;
-    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page))return false;
+       !PageAdmitted(BdwResetPage) || !PageAdmitted(0xf6880000ull) || !PageAdmitted(0xf6101000ull))return BdwScanoutStatus::Unavailable;
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page))return BdwScanoutStatus::Unavailable;
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page))return BdwScanoutStatus::Unavailable;
     const auto& tsc=NativeTscObserveRead();
-    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz || !(PciConfigRead16(0,2,0,4)&4))return false;
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz || !(PciConfigRead16(0,2,0,4)&4))return BdwScanoutStatus::Unavailable;
     stage(2);
-    BdwGopBacking backing{};
-    if(!BdwObserveGopBacking(backing))return false;
-    stage(3);
     BdwGgttReservation reservation{};
     BdwOwnedPage scratch{};
-    if(!BdwPrepareBcsScanout(source,token,backing,regions,count,reservation,scratch))return false;
+#if defined(BROOK_BDW_SCANOUT_TARGETS)
+    // Persistent GOP map or page flip, both runtime-gated off by default.
+    BdwTargetPlan plan{};
+    if(BdwScanoutTargetSelect(regions,count,plan)==BdwTargetSelect::RepairRequired)return BdwScanoutStatus::RepairRequired;
+    const bool flip=plan.kind==BdwTargetKind::Flip;
+    bool prepared=false;
+    if(plan.kind==BdwTargetKind::Legacy){
+        BdwGopBacking backing{};
+        if(!BdwObserveGopBacking(backing))return BdwScanoutStatus::Unavailable;
+        stage(3);
+        prepared=BdwPrepareBcsScanout(source,token,backing,regions,count,reservation,scratch);
+    }else{
+        stage(3);
+        prepared=BdwPrepareBcsScanoutTarget(source,token,plan.leaves,plan.leafCount,plan.repairs,plan.repairCount,
+                                            plan.destination,regions,count,reservation,scratch);
+    }
+    if(!prepared){
+        if(flip){(void)BdwScanoutTargetFinish(plan,false);return BdwScanoutStatus::RepairRequired;}
+        return BdwScanoutStatus::Unavailable;
+    }
+#else
+    BdwGopBacking backing{};
+    if(!BdwObserveGopBacking(backing))return BdwScanoutStatus::Unavailable;
+    stage(3);
+    if(!BdwPrepareBcsScanout(source,token,backing,regions,count,reservation,scratch))return BdwScanoutStatus::Unavailable;
+#endif
     stage(4);
     BdwForcewakeAdapterResult wake{};
     BdwBcsRunResult copy{};
@@ -918,7 +960,17 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     const auto statsRetired=BdwTimingNow();
     ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);
 #endif
-    if(!copy.copyComplete || !copy.contextComplete || !copy.scanoutRetired || !wake.sequence.workComplete)return false;
+    const bool copied=copy.copyComplete && copy.contextComplete && copy.scanoutRetired && wake.sequence.workComplete;
+#if defined(BROOK_BDW_SCANOUT_TARGETS)
+    // Commit (and arm) a flip only after the copy retired; anything else
+    // freezes the chain and asks the compositor for a full software repair.
+    if(flip && !BdwScanoutTargetFinish(plan,copied))return BdwScanoutStatus::RepairRequired;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    BdwWorkerStatsScanout(flip?BdwWorkerScanoutEvent::TargetFlip:plan.kind==BdwTargetKind::PersistentGop?
+        BdwWorkerScanoutEvent::TargetPersistent:BdwWorkerScanoutEvent::TargetLegacy);
+#endif
+#endif
+    if(!copied)return BdwScanoutStatus::Unavailable;
     const bool full=count==1 && !regions[0].x && !regions[0].y && regions[0].width==3200 && regions[0].height==1800;
     __atomic_add_fetch(full?&copyStats.full:&copyStats.partial,1,__ATOMIC_RELAXED);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
@@ -931,7 +983,7 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     }
 #endif
     stage(5);
-    return true;
+    return BdwScanoutStatus::Completed;
 }
 #endif
 void BdwGopObserveConfigure(const BootProtocol* boot) {

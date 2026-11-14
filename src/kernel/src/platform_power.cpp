@@ -1,4 +1,7 @@
 #include "platform_power.h"
+#if !defined(BROOK_HOST_TEST)
+#include "intel_bdw_scanout_target.h"
+#endif
 #include "acpi.h"
 #include "fw_cfg.h"
 #include "portio.h"
@@ -80,7 +83,13 @@ void PlatformPowerConfigure() {
     SerialPrintf("power: reset=%s poweroff=%s reason=%s\n",plan.ResetMethod(),plan.PowerOffMethod(),plan.PowerOffReason());
 }
 const PlatformPowerPlan& PlatformPowerGetPlan(){return plan;}
-bool PlatformPowerIssue(bool restart){return plan.Issue(restart,{nullptr,Write8,Write16
+bool PlatformPowerIssue(bool restart){
+#if !defined(BROOK_HOST_TEST)
+    // Leave plane A on the firmware GOP surface for firmware and the next
+    // (possibly recovery) kernel; a no-op unless a flip path was activated.
+    BdwScanoutPanicRestore();
+#endif
+    return plan.Issue(restart,{nullptr,Write8,Write16
 #if !defined(BROOK_HOST_TEST)
     ,EfiTestOff
 #endif

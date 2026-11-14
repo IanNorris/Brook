@@ -6,6 +6,7 @@
 #include "sched_decision_trace.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
+#include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
 #endif
@@ -5718,9 +5719,70 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 r.text("\"");r.text(names[p]);r.text("\":[");r.number(v.samples);r.text(",");r.number(v.minMhz);
                 r.text(",");r.number(v.samples?v.sumMhz/v.samples:0);r.text(",");r.number(v.maxMhz);r.text("],");}
             r.field("rising",f.rising);r.text(",");r.field("missing",f.missing);r.text("}");}
-        r.text("},\"scope\":\"gpu-submit worker since reset; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; sleep_us includes unlock, sleep and re-audit; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
+        r.text("},\"scanout\":{\"targets\":[");
+        for(unsigned i=0;i<3;++i){if(i)r.text(",");r.number(s.presentTarget[i]);}
+        r.text("],");r.field("flip_armed",s.flipArmed);r.text(",");r.field("flip_queued",s.flipQueued);
+        r.text(",");r.field("flip_latched",s.flipLatched);r.text(",");r.field("missed_vblanks",s.flipMissedVblanks);
+        r.text(",");r.field("flip_uncertain",s.flipUncertain);
+        r.text(",\"latch_us\":[");r.number(s.flipLatch.count?us(s.flipLatch.ticks)/s.flipLatch.count:0);
+        r.text(",");r.number(us(s.flipLatch.maxTicks));r.text("],\"latch_frames\":[");
+        for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(s.flipLatchFrames[i]);}
+        r.text("],");r.field("map_hits",s.mapHits);r.text(",");r.field("map_full",s.mapFull);
+        r.text(",");r.field("map_failed",s.mapFailed);
+        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; sleep_us includes unlock, sleep and re-audit; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(StrStartsWith(cmd,"gpu flip ") || StrStartsWith(cmd,"gpu scanout map ")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // Runtime gates for the Broadwell scanout targets. They live in RAM
+        // only: every boot starts with the default per-present BCS copy.
+        const char* note="";bool ok=true;
+        if(NetStrEq(cmd,"gpu flip probe")){
+            BdwFlipProbe probe{};BdwFlipRefusal refusal{};ok=BdwScanoutFlipProbe(probe,refusal);
+            note=ok?BdwFlipRefusalName(refusal):"unavailable (not built, preconditions, or plane not on the GOP)";
+        }else if(NetStrEq(cmd,"gpu flip arm"))ok=BdwScanoutFlipArm(note);
+        else if(NetStrEq(cmd,"gpu flip off")){BdwScanoutFlipDisarm();note="leaving flip mode at the next present";}
+        else if(NetStrEq(cmd,"gpu scanout map on") || NetStrEq(cmd,"gpu scanout map off")){
+            ok=BdwScanoutMapEnable(NetStrEq(cmd,"gpu scanout map on"));note=ok?"applied":"not built";
+        }else if(!NetStrEq(cmd,"gpu flip status") && !NetStrEq(cmd,"gpu scanout map status")){
+            DebugChannelSend("{\"error\":\"usage: gpu flip probe|arm|off|status, gpu scanout map on|off|status\"}\n");return;
+        }
+        BdwScanoutTargetStatus t{};BdwScanoutTargetReadStatus(t);
+        BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
+        r.text(",\"flip_built\":");r.text(t.flipBuilt?"true":"false");
+        r.text(",\"map_built\":");r.text(t.mapBuilt?"true":"false");
+        r.text(",\"map_enabled\":");r.text(t.mapEnabled?"true":"false");
+        r.text(",\"flip\":{\"requested\":");r.text(t.flipRequested?"true":"false");
+        r.text(",\"active\":");r.text(t.flipActive?"true":"false");
+        r.text(",\"disabled\":");r.text(t.flipDisabled?"true":"false");
+        r.text(",\"reason\":");r.quoted(t.reason?t.reason:"");
+        r.text(",");r.field("front",t.front);r.text(",");r.field("latest",t.latest);
+        r.text(",");r.field("armed",t.armed);r.text(",");r.field("queued",t.queued);
+        r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwFlipMaxSlots-1;++i){if(i)r.text(",");r.number(t.surfaces[i]);}
+        r.text("],");r.field("gop_returns",t.gopReturns);r.text(",");r.field("setup_us",t.activationUs);
+        r.text(",\"activation_step\":");r.quoted(t.activationStep?t.activationStep:"");
+        const auto& g=t.ggtt;
+        r.text(",\"ggtt\":{\"stage\":");r.quoted(BdwFlipGgttStageName(g.stage));
+        r.text(",");r.field("buffer",g.buffer);r.text(",");r.field("first",g.first);r.text(",");r.field("count",g.count);
+        r.text(",");r.field("entries",g.entries);r.text(",");r.field("audit_page",g.auditPage);
+        r.text(",");r.field("zero",g.zero);r.text(",");r.field("valid",g.valid);r.text(",");r.field("other",g.other);
+        r.text(",");r.field("first_nonzero",g.firstNonzero);r.text(",\"first_nonzero_value\":\"0x");
+        r.number(g.firstNonzeroValue,true);r.text("\",\"takeover\":");r.text(g.takeover?"true":"false");r.text("}");
+        r.text("},\"probe\":{\"sampled\":");r.text(t.probeSampled?"true":"false");
+        r.text(",\"refusal\":");r.quoted(BdwFlipRefusalName(t.refusal));
+        const auto& p=t.probe;
+        const uint32_t values[]={p.pipeSource,p.ddiEdp,p.psr,p.pipeConfA,p.pipeConfEdp,p.control,p.linearOffset,
+            p.stride,p.surface,p.tileOffset,p.surfaceLive,p.controlB,p.controlC,p.frame0,p.frame1,p.flipCount};
+        const char* names[]={"pipesrc_a","ddi_edp","psr_ctl","pipeconf_a","pipeconf_edp","dspacntr","dspalinoff",
+            "dspastride","dspasurf","dspatileoff","dspasurflive","dspbcntr","dspccntr","frame0","frame1","flipcount_a"};
+        for(unsigned i=0;i<16;++i){r.text(",");r.field(names[i],values[i]);}
+        r.text(",");r.field("elapsed_us",p.elapsedUs);
+        r.text("},\"scope\":\"read-only probe of pipe A, eDP transcoder and plane A; arm requires a passing probe on this boot; off returns to the GOP at the next present\"}\n");
+        r.send();
+#else
+        DebugChannelSend("{\"error\":\"guarded Dell kernel required\"}\n");
 #endif
     }
     else if(NetStrEq(cmd,"gpu completion wake on") || NetStrEq(cmd,"gpu completion wake off") ||

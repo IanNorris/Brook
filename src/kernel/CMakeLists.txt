@@ -7,6 +7,8 @@ option(BROOK_GPU_CAPTURE_FAULT_TEST "Enable exact-signature GPU capture panic te
 option(BROOK_BDW_COHERENT_RENDER "Qualify coherent Broadwell LLC render data" OFF)
 option(BROOK_BDW_RPS_TRIAL "Enable the bounded Broadwell 500 MHz render-clock trial" OFF)
 option(BROOK_BDW_CACHE_PROBE "Enable a root-only disposable Broadwell cache-coherency probe" OFF)
+option(BROOK_BDW_PERSISTENT_SCANOUT_MAP "Build the runtime-gated persistent GOP map for Broadwell BCS presents" OFF)
+option(BROOK_BDW_SCANOUT_FLIP "Build the runtime-gated Broadwell primary-plane page flip (read-only probe first)" OFF)
 option(BROOK_GPU_SUBMISSION_TIMING "Record bounded GPU submission timing (diagnostic kernels only)" OFF)
 option(BROOK_GPU_BLOCKED_RECOVERY_TEST "Allow synthetic pending GPU fences (test kernels only)" OFF)
 option(BROOK_EFI_SHUTDOWN_TEST "Enable disposable QEMU-only early UEFI shutdown experiment" OFF)
@@ -332,6 +334,7 @@ add_executable(kernel
     src/dell_i2c_probe.cpp
     src/intel_vtd_observe.cpp
     src/intel_bdw_scanout.cpp
+    src/intel_bdw_scanout_target.cpp
     src/intel_bdw_prepare.cpp
     src/intel_bdw_buffer.cpp
     src/intel_bdw_file.cpp
@@ -532,6 +535,18 @@ if(BROOK_BDW_RPS_TRIAL)
     endif()
     target_compile_definitions(kernel PRIVATE BROOK_BDW_RPS_TRIAL=1)
 endif()
+if(BROOK_BDW_PERSISTENT_SCANOUT_MAP)
+    if(NOT BROOK_SSD_GUARDED_DESKTOP_RESET)
+        message(FATAL_ERROR "Broadwell persistent scanout map requires guarded desktop recovery")
+    endif()
+    target_compile_definitions(kernel PRIVATE BROOK_BDW_PERSISTENT_SCANOUT_MAP=1)
+endif()
+if(BROOK_BDW_SCANOUT_FLIP)
+    if(NOT BROOK_SSD_GUARDED_DESKTOP_RESET)
+        message(FATAL_ERROR "Broadwell page flip requires guarded desktop recovery")
+    endif()
+    target_compile_definitions(kernel PRIVATE BROOK_BDW_SCANOUT_FLIP=1)
+endif()
 if(BROOK_BDW_CACHE_PROBE)
     if(NOT BROOK_SSD_GUARDED_DESKTOP_RESET)
         message(FATAL_ERROR "Broadwell cache probe requires guarded desktop recovery")
@@ -594,6 +609,8 @@ set_source_files_properties(
     src/profiler.cpp
     src/smp.cpp
     src/ksym_addrs.cpp
+    # BdwScanoutPanicRestore runs on every panic and exception path.
+    src/intel_bdw_scanout_target.cpp
     PROPERTIES COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath="
 )
 

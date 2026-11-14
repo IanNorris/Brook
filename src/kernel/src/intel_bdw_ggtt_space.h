@@ -30,6 +30,7 @@ public:
         limit_=entries;return true;
     }
     bool configuredFor(uint32_t entries) const {return limit_ && limit_==entries;}
+    uint32_t Limit() const {return limit_;}
     bool owns(const BdwGgttReservation& r) const {
         if(!r.token || !r.count)return false;
         for(const auto& current:reservations_)

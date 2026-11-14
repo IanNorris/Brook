@@ -33,7 +33,21 @@ bool BdwBcsScanoutEnabled();
 bool BdwSetScanoutFairness(bool enabled);
 bool BdwScanoutFairness();
 void BdwScanoutFairnessCounts(uint64_t&,uint64_t&,uint64_t&,uint64_t&);
-bool BdwExecuteBcsScanout(BdwGpuBuffer*,uint64_t token,const CompositorPresentRegion*,uint32_t count);
+// Completed: the frame reached the scanout (copied, or flipped/queued).
+// Unavailable: nothing was committed; the caller may use the CPU fallback.
+// RepairRequired: a kernel flip buffer may be live or the flip chain is no
+// longer trustworthy; the compositor must repaint the GOP in full.
+enum class BdwScanoutStatus : uint8_t {Completed,Unavailable,RepairRequired};
+BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer*,uint64_t token,const CompositorPresentRegion*,uint32_t count);
+#if defined(BROOK_BDW_PERSISTENT_SCANOUT_MAP) || defined(BROOK_BDW_SCANOUT_FLIP)
+struct BdwPpgttLeaf;struct BdwBlitRegion;struct BdwBlitBuffer;
+bool BdwPrepareBcsScanoutTarget(BdwGpuBuffer* source,uint64_t token,const BdwPpgttLeaf* leaves,uint32_t leafCount,
+    const BdwBlitRegion* repairs,uint32_t repairCount,const BdwBlitBuffer& destination,
+    const CompositorPresentRegion* regions,uint32_t count,BdwGgttReservation& reservation,BdwOwnedPage& scratch);
+bool BdwPrivatePageAlloc(BdwOwnedPage& out,bool zero=true);
+bool BdwPrivatePagesPublish(BdwOwnedPage* pages,unsigned count);
+bool BdwPrivatePageOwned(const BdwOwnedPage& page);
+#endif
 struct BdwScanoutCopyStats {uint64_t requested=0,submitted=0,full=0,partial=0;uint32_t lastStage=0;};
 BdwScanoutCopyStats BdwReadScanoutCopyStats();
 #endif
@@ -198,6 +212,9 @@ bool BdwObserveGopPtesLive(BdwGopPtes& out);
 struct BdwGopBacking;
 bool BdwObserveGopBacking(BdwGopBacking& out);
 struct BdwDisplaySnapshot;
+// BdwObserveDisplayLive plus the GOP-mode check, accepting a mapped kernel
+// flip buffer as the plane A surface; see BdwDisplayCompatible.
+bool BdwObserveDisplayAccepted(BdwDisplaySnapshot& out,unsigned registers=11);
 struct BdwGgttSurvey;
 bool BdwObserveGgttSurvey(uint32_t first,BdwGgttSurvey& out);
 bool BdwObserveDisplayLive(BdwDisplaySnapshot& out);

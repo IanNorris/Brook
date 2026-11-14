@@ -54,6 +54,18 @@ int main() {
     m.Begin(BdwWorkerApplication,1200);m.End(1100);
     CHECK(m.Read(s) && s.elapsedTicks==300 && s.classes[BdwWorkerApplication].count==1 &&
           s.classes[BdwWorkerApplication].ticks==0);
+    // Flip and persistent-map counters may be recorded between intervals;
+    // Flush publishes them without charging any class.
+    m.PresentTarget(2);m.PresentTarget(1);m.PresentTarget(7);
+    m.FlipArmed(false);m.FlipArmed(true);m.FlipLatched(1,40);m.FlipLatched(3,90);m.FlipLatched(9,10);
+    m.FlipUncertain();m.PersistentMap(true,true);m.PersistentMap(false,true);m.PersistentMap(true,false);
+    m.Flush();
+    CHECK(m.Read(s) && s.elapsedTicks==300 && s.presentTarget[0]==0 && s.presentTarget[1]==1 && s.presentTarget[2]==1);
+    CHECK(s.flipArmed==1 && s.flipQueued==1 && s.flipLatched==3 && s.flipUncertain==1);
+    CHECK(s.flipLatch.count==3 && s.flipLatch.ticks==140 && s.flipLatch.maxTicks==90);
+    CHECK(s.flipLatchFrames[0]==1 && s.flipLatchFrames[1]==0 && s.flipLatchFrames[2]==1 && s.flipLatchFrames[3]==1);
+    CHECK(s.flipMissedVblanks==2+8);
+    CHECK(s.mapHits==1 && s.mapFull==1 && s.mapFailed==1);
     if(failures)std::fprintf(stderr,"%u failure(s)\n",failures);
     return failures?1:0;
 }

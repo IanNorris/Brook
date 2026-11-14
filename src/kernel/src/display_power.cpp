@@ -1,4 +1,5 @@
 #include "display_power.h"
+#include "intel_bdw_scanout_target.h"
 #include "pci.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -109,5 +110,8 @@ void DisplayPowerTick(uint64_t now,uint64_t inputSequence) {
     controller.Tick(io,now,inputSequence);
     SpinLockRelease(&lock);
 }
-void DisplayPowerPanicRestore(){backlight.PanicRestore(io);}
+// Every panic and exception path calls this before drawing: first re-arm the
+// firmware GOP surface if a flip path moved plane A (MMIO only, lock-free,
+// bounded wait for the latch), then restore a dimmed backlight.
+void DisplayPowerPanicRestore(){BdwScanoutPanicRestore();backlight.PanicRestore(io);}
 }

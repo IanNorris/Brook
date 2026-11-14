@@ -8,6 +8,8 @@
 #include "intel_vtd_probe_policy.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_ggtt_mmio.h"
+#include "intel_bdw_ggtt_extent_mmio.h"
+#include "intel_bdw_display_flip.h"
 #include "intel_bdw_display_probe.h"
 #include "intel_bdw_forcewake_ack.h"
 #include "intel_bdw_forcewake_adapter.h"
@@ -817,6 +819,82 @@ void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,
 void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy) {
     copy={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,
         false,nullptr,token,&copy,nullptr,nullptr,nullptr,nullptr,true);
+}
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
+                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag) {
+    constexpr uint32_t maxPages=16;
+    const auto& r=lease.reservation;
+    diag.first=r.first;diag.count=r.count;diag.stage=BdwFlipGgttStage::Precondition;
+    if(!r.token || !r.count || r.first<65536 || r.count>maxPages*512-(r.first&511u) || SmpCurrentCpuIndex()!=0 ||
+       !snapshot || !takeoverScratch || (takeoverScratch&4095) || takeoverScratch>=(uint64_t{1}<<39))return false;
+    const uint32_t pageCount=((r.first&511u)+r.count+511u)/512u;
+    volatile uint64_t* pages[maxPages]{};
+    for(uint32_t i=0;i<pageCount;++i)
+        pages[i]=reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+BdwDellGgttBase+(uint64_t((r.first>>9)+i)<<12));
+    auto* flush=reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwDellBar0+0x101008);
+    struct Owner {
+        uint32_t firstPage=0;uint32_t audited=0;bool valid=true;uint64_t scratch=0;uint32_t failedPage=0;
+        static bool Audit(uint64_t page){
+            KernelAliasMapping identity{},direct{},current{};
+            DellI2cCriticalEvidence e{};
+            e.aliasesValid=VmmKernelPtAuditPage(page,identity,direct,current) && current.writable;
+            e.identityPresent=identity.present;e.identityMatches=identity.physical==page;e.identityPat=identity.patIndex;
+            e.directPresent=direct.present;e.directMatches=direct.physical==page;e.directPat=direct.patIndex;
+            e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==page;e.currentDirectPat=current.patIndex;
+            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(page,page,cpu) && cpu.cpu==0;
+            e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
+            return BdwGttEvidenceValid(e);
+        }
+        // Each PTE page is audited once per critical section (the page-table
+        // lock is held throughout), not on every one of ~5,700 accesses.
+        bool auditPtePage(uint32_t page,volatile uint64_t* p){
+            const uint32_t n=page-firstPage;
+            if(!valid || n>=32 || p!=reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+BdwDellGgttBase+(uint64_t(page)<<12)))return false;
+            if(!(audited&(1u<<n))){if(!Audit(BdwDellGgttBase+(uint64_t(page)<<12))){valid=false;failedPage=page;return false;}audited|=1u<<n;}
+            return true;
+        }
+        bool owned(){return valid && SmpCurrentCpuIndex()==0;}
+        bool readable(){return valid;}
+        bool validateLease(const BdwGgttExtentLease& l){
+            return BdwGlobalGgttSpace().owns(l.reservation) && !(l.reservation.first&63u) &&
+                l.reservation.count>BdwFlipRegs::GuardPages;
+        }
+        // The extent lies above the 256 MiB CPU aperture (index >= 65536),
+        // outside every Brook reservation and the GOP/guard range, and no
+        // display plane or Brook engine context references it, so inherited
+        // entries are passive translations nobody can use (cf. i915, which
+        // rewrites all unreserved GGTT entries at load).
+        bool quiescent(){return valid;}
+        bool validateTakeover(const BdwGgttExtentLease& l,uint64_t s){return s==scratch && validateLease(l);}
+        // GFX_FLSH_CNTL posts the PTE writes, which is what i915 relies on
+        // for GGTT updates; the display fetches through them only after a
+        // later DSPASURF write and no engine context references them.
+        bool invalidateGpuTranslations(){return valid;}
+    } owner{r.first>>9,0,true,takeoverScratch,0};
+    BdwGgttExtentMmio<Owner> io(owner,lease,pages,pageCount,flush,takeoverScratch);
+    return VmmWithKernelPtCritical([&](){
+        if(!Owner::Audit(BdwDellBar0+0x101000)){diag.stage=BdwFlipGgttStage::FlushAudit;return false;}
+        // Stable twice-read snapshot of the inherited entries.
+        for(unsigned pass=0;pass<2;++pass)for(uint32_t i=0;i<r.count;++i){
+            uint64_t v=0;
+            if(!io.read(r.first+i,v)){
+                diag.stage=owner.failedPage?BdwFlipGgttStage::PteAudit:BdwFlipGgttStage::Unstable;
+                diag.auditPage=owner.failedPage;return false;
+            }
+            if(!pass)snapshot[i]=v;
+            else if(snapshot[i]!=v){diag.stage=BdwFlipGgttStage::Unstable;diag.firstNonzero=r.first+i;return false;}
+        }
+        BdwFlipGgttClassify(snapshot,r.first,r.count,diag);
+        // All-zero ranges use the plain binder; anything inherited is taken
+        // over against the exact snapshot (BindTakenOver re-reads it first).
+        const bool ok=diag.takeover?bind.BindTakenOver(lease,io,snapshot,takeoverScratch):bind.Bind(lease,io);
+        if(ok){diag.stage=BdwFlipGgttStage::Bound;return true;}
+        diag.stage=bind.State()==BdwGgttExtentState::Fresh?BdwFlipGgttStage::Refused:BdwFlipGgttStage::Uncertain;
+        if(owner.failedPage){diag.auditPage=owner.failedPage;}
+        return false;
+    });
 }
 #endif
 void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset) {

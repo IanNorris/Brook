@@ -20,6 +20,21 @@ inline bool BdwDisplayUsesGop(const BdwDisplaySnapshot& display) {
     return true;
 }
 
+// As BdwDisplayUsesGop, but the primary surface and its live value may be
+// any surface accept() admits (the GOP or a mapped kernel flip buffer).
+// registers limits the checked set (the per-job check historically ignores
+// the trailing primary tile offset of pipes B and C).
+template<class Accept> bool BdwDisplayCompatible(const BdwDisplaySnapshot& display,Accept accept,
+                                                 unsigned registers=BdwDisplaySnapshot::RegisterCount) {
+    const auto& primary=display.regs[0];
+    if(registers<4 || registers>BdwDisplaySnapshot::RegisterCount)return false;
+    if(primary[0]!=0x98000000u || primary[1]!=12800 || !accept(primary[2]) || !accept(primary[3]))return false;
+    for(unsigned pipe=0;pipe<3;++pipe)
+        for(unsigned reg=pipe?0:4;reg<registers;++reg)
+            if(display.regs[pipe][reg])return false;
+    return true;
+}
+
 template<class Io> bool BdwDisplayCriticalRead(Io& io,BdwDisplaySnapshot& out) {
     constexpr uint64_t base=0xf6070000ull;
     // Primary control/stride/surface/live, sprite control/surface/live, and

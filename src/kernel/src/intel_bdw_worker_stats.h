@@ -43,6 +43,18 @@ struct BdwWorkerStats {
     BdwWorkerYields yields[3];
     // [0]=application RCS, [1]=compositor RCS.
     BdwWorkerJobFrequency frequency[2];
+    // Page flip (BROOK_BDW_SCANOUT_FLIP). latch = DSPASURF write to the
+    // first observation of DSPASURFLIVE (worker polls about every 1 ms);
+    // latchFrames buckets 1,2,3,>3 vblanks; missed = vblanks beyond the first.
+    uint64_t flipArmed,flipQueued,flipLatched,flipMissedVblanks,flipUncertain,flipGopReturns;
+    BdwWorkerSpan flipLatch;
+    uint64_t flipLatchFrames[4];
+    // Persistent scanout map (BROOK_BDW_PERSISTENT_SCANOUT_MAP and flip):
+    // hits used the cached GOP map after a cheap check; full = complete GOP
+    // PTE revalidation; failed = fell back to the per-present PPGTT build.
+    uint64_t mapHits,mapFull,mapFailed;
+    // Presents per destination: [0]=GOP per-present map, [1]=GOP persistent, [2]=flip buffer.
+    uint64_t presentTarget[3];
 };
 static_assert(sizeof(BdwWorkerStats)%8==0,"word-wise publication");
 
@@ -107,6 +119,19 @@ public:
         auto& y=local_.yields[2];++y.jobs;y.yields+=yields;++y.buckets[BdwWorkerYieldBucket(yields)];
     }
     void PresentFailed(){if(current_==BdwWorkerPresent)++local_.presentFailed;}
+    // Worker thread, any interval (the flip poll also runs between jobs).
+    void PresentTarget(unsigned target){if(target<3)++local_.presentTarget[target];}
+    void FlipArmed(bool queued){if(queued)++local_.flipQueued;else ++local_.flipArmed;}
+    void FlipLatched(uint32_t frames,uint64_t ticks){
+        ++local_.flipLatched;BdwWorkerSpanAdd(local_.flipLatch,ticks);
+        ++local_.flipLatchFrames[frames<=1?0:frames==2?1:frames==3?2:3];
+        if(frames>1)local_.flipMissedVblanks+=frames-1;
+    }
+    void FlipUncertain(){++local_.flipUncertain;}
+    void FlipGopReturn(){++local_.flipGopReturns;}
+    void PersistentMap(bool hit,bool ok){if(!ok)++local_.mapFailed;else if(hit)++local_.mapHits;else ++local_.mapFull;}
+    // Publish counters recorded outside a Begin/End interval.
+    void Flush(){if(mark_)Publish();}
     // Any thread. Applied by the worker at its next boundary.
     void RequestReset(){__atomic_store_n(&resetRequested_,1u,__ATOMIC_RELEASE);}
     // Any thread. False only if the worker kept publishing throughout.
@@ -131,5 +156,10 @@ void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sle
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields);
 bool BdwWorkerStatsRead(BdwWorkerStats& out);
 void BdwWorkerStatsReset();
+// Flip and persistent-map counters; ignored off the worker thread.
+enum class BdwWorkerScanoutEvent : uint8_t {TargetLegacy,TargetPersistent,TargetFlip,FlipArmed,FlipQueued,
+    FlipUncertain,FlipGopReturn,MapHit,MapFull,MapFailed};
+void BdwWorkerStatsScanout(BdwWorkerScanoutEvent event);
+void BdwWorkerStatsFlipLatched(uint32_t frames,uint64_t ticks);
 #endif
 }
