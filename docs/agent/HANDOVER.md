@@ -87,6 +87,11 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **State:** stays off (serial default) until fixed in `work/pipelining`. The Dell is back on the serial supervisor (job, same boot).
 - **Process slip:** this image was deployed although its QEMU check reported `passed:false` (both attempts were OVMF load stalls; the recheck passed). New `scripts/dell_deploy.py` refuses to deploy without a passing verdict; use it for all deploys.
 
+**TSC clock (gen 367, `dell-batch2-tsc-20261114`):**
+- `clock status` reports `tsc`/`invariant-tsc`. Under load, monotonic tracks TSC; LAPIC ticks lose ~7%, which no longer matters.
+- **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
+- **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
+
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
 - Eliminate CPU copies in the pipeline.
