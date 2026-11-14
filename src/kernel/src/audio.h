@@ -125,6 +125,11 @@ using AudioStreamId = uint64_t;
 static constexpr uint32_t MIXER_MAX_STREAMS = 8;
 // Zero means unavailable/exhausted. Identities include slot generations.
 AudioStreamId AudioMixerOpen();
+// A short system cue (e.g. the volume pop). Its frames are summed into the
+// mix alongside other streams but never extend a mix batch while another
+// stream is actively producing, so a burst cue cannot run ahead of live audio
+// and push it later (which would make the cue replace it).
+AudioStreamId AudioMixerOpenCue();
 bool AudioMixerClose(AudioStreamId stream);
 bool AudioMixerReset(AudioStreamId stream);
 bool AudioMixerSetEnabled(AudioStreamId stream, bool enabled);

@@ -2014,7 +2014,7 @@ static void WmVolumePopPlay(uint64_t nowMs)
     const uint32_t frames = static_cast<uint32_t>((g_volumePopPcmEnd - g_volumePopPcm) / MIXER_FRAME_BYTES);
     if (!frames) return;
     if (g_volumePopStream && !AudioMixerReset(g_volumePopStream)) { AudioMixerClose(g_volumePopStream); g_volumePopStream = 0; }
-    if (!g_volumePopStream) g_volumePopStream = AudioMixerOpen();
+    if (!g_volumePopStream) g_volumePopStream = AudioMixerOpenCue();
     if (!g_volumePopStream) return; // all mixer slots in use: skip the cue
     AudioMixerSubmit(pcm, frames, g_volumePopStream);
     g_volumePopStartMs = nowMs;
