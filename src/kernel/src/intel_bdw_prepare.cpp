@@ -383,16 +383,23 @@ bool BdwRetainPrivateRenderImages(uint32_t ggttEntries,bool ppgttProbe,bool stor
     retainedRenderScratchValid=true;return true;
 }
 #ifndef BROOK_HOST_TEST
+static void IdleWorkerWait(void*,uint64_t seen){BdwGpuEventWaitTick(BdwGpuEvent::Work,seen);}
 static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
                               BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly,
                               bool (*service)(void*,BdwSubmissionQueue&),bool (*servicePending)(void*),
-                              void (*sleep)(void*)) {
+                              void (*sleep)(void*),void (*idle)(void*,uint64_t)=IdleWorkerWait) {
     BdwSubmissionWorker::Hooks hooks{};hooks.context=context;hooks.execute=execute;hooks.service=service;hooks.servicePending=servicePending;
     hooks.launch=[](void*,void (*entry)(void*),void* arg,uint32_t cpu){
         auto* thread=KernelThreadCreate("gpu-submit",entry,arg);if(!thread)return false;
         thread->cpuAffinity=cpu;SchedulerAddProcess(thread);return true;
     };
     hooks.sleep=sleep;
+    // Prompt wake replaces the fixed 1 ms idle poll. The idle wait keeps a
+    // one-tick timeout, so an unsignalled source (or a lost wake) still sees
+    // the previous polling latency; Step itself is unchanged.
+    hooks.wakeGeneration=[](void*){return BdwGpuEventGeneration(BdwGpuEvent::Work);};
+    hooks.idle=idle;
+    hooks.wake=[](void*){BdwGpuEventSignal(BdwGpuEvent::Work);};
     hooks.recover=[](void*){KernelPanic("Broadwell submission worker requires recovery");};
     return worker.Start(hooks,0,knownOwnersOnly);
 }
@@ -417,8 +424,10 @@ static bool OnWorkerStatsThread(){
 }
 [[maybe_unused]] static void WorkerStatsEnd(){if(OnWorkerStatsThread())workerStats.End(BdwTimingNow());}
 void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                          uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                           bool frequencySampled,uint32_t issueStatus,uint32_t endStatus){
-    if(OnWorkerStatsThread())workerStats.Render(yields,breadcrumbYields,sleepTicks,frequencySampled,issueStatus,endStatus);
+    if(OnWorkerStatsThread())workerStats.Render(yields,breadcrumbYields,sleepTicks,spins,breadcrumbSpins,spinTicks,
+                                                frequencySampled,issueStatus,endStatus);
 }
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields){
     if(OnWorkerStatsThread())workerStats.Present(full,pixels,ticks,yields);
@@ -551,6 +560,7 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
     if(!scanoutWork.completed && OnWorkerStatsThread())workerStats.PresentFailed();
 #endif
     __atomic_store_n(&scanoutWork.state,ScanoutDone,__ATOMIC_RELEASE);
+    BdwGpuEventSignal(BdwGpuEvent::Retire); // PresentOnBcs waits on Retire
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     WorkerStatsEnd();
 #endif
@@ -669,6 +679,11 @@ static void AccountedApplicationSleep(void*){
     SchedulerSleepMs(1);
     WorkerStatsEnd();
 }
+static void AccountedApplicationIdle(void*,uint64_t seen){
+    WorkerStatsBegin(BdwWorkerIdle);
+    BdwGpuEventWaitTick(BdwGpuEvent::Work,seen);
+    WorkerStatsEnd();
+}
 #endif
 static int64_t InitApplicationWorker(){
     static uint32_t state=0;
@@ -676,7 +691,7 @@ static int64_t InitApplicationWorker(){
     if(!current){uint32_t expected=0;
         if(__atomic_compare_exchange_n(&state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
-            const bool ok=StartKernelWorker(applicationWorker,nullptr,AccountedApplicationExecute,true,ServiceScanout,ScanoutPending,AccountedApplicationSleep);
+            const bool ok=StartKernelWorker(applicationWorker,nullptr,AccountedApplicationExecute,true,ServiceScanout,ScanoutPending,AccountedApplicationSleep,AccountedApplicationIdle);
 #else
             const bool ok=BdwStartKernelSubmissionWorker(applicationWorker,nullptr,BdwExecuteRetainedContextWorkerSnapshot,true,ServiceScanout,ScanoutPending);
 #endif
@@ -697,8 +712,10 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
     scanoutWork.source=source;scanoutWork.token=token;scanoutWork.count=count;
     for(uint32_t i=0;i<count;++i)scanoutWork.regions[i]=regions[i];
     __atomic_store_n(&scanoutWork.state,ScanoutQueued,__ATOMIC_RELEASE);
+    applicationWorker.Wake();
     const auto deadline=ApicTickCount()+32;
     for(;;){
+        const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
         if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutDone){
             const bool result=scanoutWork.completed;
             scanoutWork.source=nullptr;
@@ -713,7 +730,7 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
                 return BdwPresentCopy::Expired;
             }
         }
-        SchedulerSleepMs(1);
+        BdwGpuEventWaitTick(BdwGpuEvent::Retire,seen);
     }
 }
 static int64_t SubmitApplicationSnapshot(BdwExecSnapshot* snapshot){

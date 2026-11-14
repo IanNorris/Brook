@@ -110,7 +110,13 @@ struct BdwRenderRunResult {
     bool gemIoctlDecoded=false;
     bool gemIoctlSubmitted=false;
     bool pollYieldRequested=false,pollYieldFailed=false;
-    uint32_t pollYields=0;
+    // pollYields counts one-tick sleeps only; pollSpins counts the short
+    // interrupts-enabled spin slices chosen by BdwPollPacer (opt-in below).
+    uint32_t pollYields=0,pollSpins=0;
+    bool pollSpinRequested=false;
+    // Input: predicted first-poll-to-breadcrumb TSC ticks (0 = unknown).
+    // Output: TSC at the first completion poll and at the observing poll.
+    uint64_t expectedCompletionTicks=0,completionStartTicks=0,completionEndTicks=0;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     // Diagnostic TSC durations for GT, PAT setup, run, save, reset/unbind,
     // PAT restore. Zero or backwards-clock intervals are omitted.
@@ -134,8 +140,8 @@ struct BdwRenderRunResult {
     // the poll that observed the breadcrumb, from the existing sample site.
     bool statsFrequency=false;
     uint32_t statsFrequencySamples=0,statsIssueStatus=0,statsEndStatus=0;
-    uint32_t completionPollYields=0;
-    uint64_t pollYieldTicks=0;
+    uint32_t completionPollYields=0,completionPollSpins=0;
+    uint64_t pollYieldTicks=0,pollSpinTicks=0;
 #endif
     BdwRenderTransactionResult transaction{};
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;

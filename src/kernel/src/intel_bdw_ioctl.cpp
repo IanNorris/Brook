@@ -44,6 +44,20 @@ struct FencePlan {
 static_assert(sizeof(Version)==64 && sizeof(GetParam)==16 && sizeof(GemCreate)==16 && sizeof(GemWait)==16 && sizeof(MmapOffset)==32,"i915 ABI layout");
 static_assert(sizeof(ExecBuffer)==64 && sizeof(ExecObject)==56,"i915 exec ABI layout");
 }
+// One bounded step of a CPU-side GPU wait. The caller's interruptible sleep
+// (at most 1 ms, returning false on a signal) is kept as the timeout and
+// interrupt path; arming on the Retire event only ends it early when a fence
+// completes, buffer use is released or a sync object is published. seen
+// must be read before the caller tests its condition, so a retirement in
+// between is reported as stale and re-checked instead of slept through.
+static bool RetireWait(const BdwI915UserAccess& u,uint64_t seen,uint64_t ns){
+    BdwGpuWaiter waiter{};
+    const auto armed=BdwGpuEventArm(BdwGpuEvent::Retire,seen,waiter);
+    if(armed==BdwWaitArm::Stale)return true;
+    const bool ok=u.sleepNs(u.context,ns);
+    if(armed==BdwWaitArm::Armed)BdwGpuEventDisarm(waiter);
+    return ok;
+}
 bool BdwIntelSyncReplaceAdmitted(BdwGpuSync* sync,BdwFence* fence){
     KMutexLock(&timelineAdmission);const bool ok=BdwGpuSyncReplace(sync,fence);KMutexUnlock(&timelineAdmission);return ok;
 }
@@ -210,10 +224,10 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         auto* buffer=BdwGpuFileGetBuffer(file,d.handle);if(!buffer)return noent;
         if(!u.sleepNs){BdwGpuBufferUnref(buffer);return notty;}
         int64_t result=0;
-        for(;;){const auto attempt=BdwGpuBufferTryCpuTransition(buffer);
+        for(;;){const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);const auto attempt=BdwGpuBufferTryCpuTransition(buffer);
             if(attempt==BdwCpuTransitionResult::Ready)break;
             if(attempt==BdwCpuTransitionResult::Failed){result=-5;break;}
-            if(!u.sleepNs(u.context,1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,1000000)){result=-4;break;}
         }
         BdwGpuBufferUnref(buffer);return result;
     }
@@ -277,6 +291,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         int64_t result=0;
         if(acquired!=request.count)result=noent;
         else for(;;){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             bool all=true,any=false,missing=false;uint32_t first=0;
             for(uint32_t i=0;i<request.count;++i){
                 if(!fences[i])fences[i]=BdwGpuSyncAcquire(objects[i]);
@@ -294,7 +309,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
                     ProfilerTraceGpu(static_cast<uint16_t>(u.submitterPid),FrameFenceWait,
                                      fences[i]?fences[i]->traceId:0,handles[i]);
 #endif
-            if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         for(uint32_t i=0;i<acquired;++i){BdwFenceUnref(fences[i]);BdwGpuSyncUnref(objects[i]);}
         return u.write(u.context,arg,&request,sizeof(request))?result:fault;
@@ -316,6 +331,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         int64_t result=0;
         if(acquired!=request.count)result=noent;
         else for(;;){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             bool all=true,any=false,missing=false;uint32_t first=0;
             for(uint32_t i=0;i<request.count;++i){
                 if(!fences[i])fences[i]=points[i]?BdwGpuSyncFindTimeline(objects[i],points[i]):BdwGpuSyncAcquire(objects[i]);
@@ -333,7 +349,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
                     ProfilerTraceGpu(static_cast<uint16_t>(u.submitterPid),FrameFenceWait,
                                      fences[i]?fences[i]->traceId:0,handles[i]);
 #endif
-            if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         for(uint32_t i=0;i<acquired;++i){BdwFenceUnref(fences[i]);BdwGpuSyncUnref(objects[i]);}
         return u.write(u.context,arg,&request,sizeof(request))?result:fault;
@@ -353,12 +369,13 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
             const uint64_t now=u.nowNs(u.context);deadline=now>~uint64_t{0}-5000000000ull?~uint64_t{0}:now+5000000000ull;
         }
         while(!result && !fence){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             fence=request.sourcePoint?BdwGpuSyncFindTimeline(source,request.sourcePoint):BdwGpuSyncAcquire(source);
             if(fence)break;
             if(!(request.flags&2)){result=invalid;break;}
             const uint64_t now=u.nowNs(u.context);if(now>=deadline){result=-62;break;}
             const uint64_t remaining=deadline-now;
-            if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         if(!result && !request.destinationPoint){if(!BdwIntelSyncReplaceAdmitted(destination,fence))result=invalid;}
         else if(!result && !BdwIntelSyncPointAdmitted(destination,request.destinationPoint,fence))result=invalid;
@@ -472,13 +489,14 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
             ? ~uint64_t{0} : original>0 ? start+uint64_t(original) : start;
         int64_t result=0;uint64_t now=start;
         for(;;){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             uint32_t uses=0;bool failed=false;BdwGpuBufferGpuStatus(buffer,uses,failed);
             if(failed){result=-5;break;} // EIO: failed/uncertain GPU use
             if(!uses)break;
             now=u.nowNs(u.context);if(now<start){result=-5;break;}
             if(original>=0 && (original==0 || now>=deadline)){result=-62;break;} // ETIME
             const uint64_t wait=original<0?1000000ull:(deadline-now<1000000ull?deadline-now:1000000ull);
-            if(!u.sleepNs(u.context,wait)){result=-4;break;} // EINTR
+            if(!RetireWait(u,seen,wait)){result=-4;break;} // EINTR
         }
         now=u.nowNs(u.context);
         if(original>0)w.timeout=now<start?0:now>=deadline?0:static_cast<int64_t>(deadline-now);

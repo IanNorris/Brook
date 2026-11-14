@@ -552,6 +552,7 @@ bool BdwExecSnapshotRetireSynced(BdwExecSnapshot* s){
     if(expected!=1 && expected!=3)return false;
     if(!__atomic_compare_exchange_n(&s->state,&expected,4,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
     for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
+    BdwGpuEventSignal(BdwGpuEvent::Retire); // GEM_WAIT/SET_DOMAIN observe released uses
     return true;
 }
 bool BdwExecSnapshotRetire(BdwExecSnapshot* s,bool safelyStopped){
@@ -565,7 +566,9 @@ bool BdwExecSnapshotRelease(BdwExecSnapshot* s,bool safelyStopped){
     uint32_t expected=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
     for(;;){if((expected!=0 && expected!=1 && expected!=3 && expected!=4) || (expected==1 && !safelyStopped))return false;
         if(__atomic_compare_exchange_n(&s->state,&expected,2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;}
-    if(expected==1 || expected==3)for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
+    const bool used=expected==1 || expected==3;
+    if(used)for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
+    if(used)BdwGpuEventSignal(BdwGpuEvent::Retire);
     Release(s);return true;
 }
 }

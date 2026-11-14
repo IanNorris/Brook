@@ -25,6 +25,7 @@
 #include "intel_bdw_submission_timing.h"
 #endif
 #include "intel_bdw_wait_yield.h"
+#include "intel_bdw_poll_pacer.h"
 #include "scheduler.h"
 #include "smp.h"
 
@@ -277,7 +278,16 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         void relax(){__asm__ volatile("pause");}
         bool MayYield(){return mappingsValid && irq && (*irq&0x200) && SmpCurrentCpuIndex()==0;}
         void Unlock(){VmmKernelPtCriticalExit(*irq);}
-        void Wait(){SchedulerSleepMs(1);}
+        // Runs between Unlock and Lock: interrupts are enabled and no device
+        // or page-table state is touched. spinTicks selects a short spin
+        // slice (yielding first to any ready CPU-0 work) instead of a tick.
+        void Wait(){
+            if(spinTicks){
+                uint64_t start=0,now=0;tsc(start);SchedulerYield();
+                do{relax();tsc(now);}while(now>=start && now-start<spinTicks);
+            }else SchedulerSleepMs(1);
+            tsc(waitEnd);
+        }
         void Lock(){*irq=VmmKernelPtCriticalEnter();}
         bool Audit(){
             if(SmpCurrentCpuIndex()!=0)return false;
@@ -288,6 +298,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             return true;
         }
         void Poison(){mappingsValid=false;}
+        uint64_t spinTicks=0,waitEnd=0;
     } io{tlbRequested,resetRequested,scratchResult!=nullptr,initResult!=nullptr,patResult!=nullptr,copyResult!=nullptr,rcsReset!=nullptr,gtInit!=nullptr,renderResult!=nullptr};
     uint64_t irq=VmmKernelPtCriticalEnter();io.irq=&irq;
     // Read-only exercise of the callback boundary. The callback remains under
@@ -339,18 +350,35 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool allEnginesQuiescent(){return quiescent();} // others held idle under claim
                 bool monotonicMs(uint64_t& ms){uint64_t t=0;if(!io.tsc(t) || t<origin)return false;ms=(t-origin)/khz;return true;}
                 bool inTime(){uint64_t ms=0;return budget && --budget && monotonicMs(ms) && ms<2000;}
+                BdwPollPacer completionPacer{},retirementPacer{};BdwPollPacer* pacer=nullptr;
+                void beginPacer(BdwPollPacer& p,uint64_t expected,uint64_t spinBudget){
+                    uint64_t now=0;io.tsc(now);
+                    const uint64_t k=khz;
+                    p.Begin({k,k/10,k/20,k/4},now,expected,result.pollSpinRequested?spinBudget:0);
+                    pacer=&p;
+                }
                 bool pollContinue(){
                     if(!owned() || !inTime())return false;
                     if(result.pollYieldRequested){
+                        uint64_t start=0;io.tsc(start);
+                        const uint64_t slice=pacer?pacer->Next(start):0;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                         const auto yieldStart=BdwTimingNow();
 #endif
-                        if(!BdwYieldGpuWait(io)){result.pollYieldFailed=true;fault=true;return false;}
+                        io.spinTicks=slice;io.waitEnd=0;
+                        const bool yielded=BdwYieldGpuWait(io);
+                        io.spinTicks=0;
+                        if(!yielded){result.pollYieldFailed=true;fault=true;return false;}
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                         const auto yieldEnd=BdwTimingNow();
-                        if(yieldEnd>yieldStart)result.pollYieldTicks+=yieldEnd-yieldStart;
+                        const uint64_t spent=yieldEnd>yieldStart?yieldEnd-yieldStart:0;
+                        if(slice)result.pollSpinTicks+=spent;else result.pollYieldTicks+=spent;
 #endif
-                        ++result.pollYields;
+                        if(slice){
+                            uint64_t end=0;io.tsc(end);
+                            pacer->Spun(end>start?end-start:0,io.waitEnd && end>io.waitEnd?end-io.waitEnd:0);
+                            ++result.pollSpins;
+                        }else ++result.pollYields;
                     }
                     return owned() && inTime();
                 }
@@ -382,18 +410,34 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 }
 #endif
                 bool completionContinue(){
+                    if(firstCompletionPoll){
+                        const uint64_t k=khz;
+                        beginPacer(completionPacer,result.expectedCompletionTicks,
+                            result.expectedCompletionTicks?2*k:k/4);
+                        io.tsc(result.completionStartTicks);
+                    }
+                    pacer=&completionPacer;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                     const auto yieldsBefore=result.pollYields;
+                    const auto spinsBefore=result.pollSpins;
                     const bool more=BdwFirstGpuPoll(*this,firstCompletionPoll);
                     result.completionPollYields+=result.pollYields-yieldsBefore;
+                    result.completionPollSpins+=result.pollSpins-spinsBefore;
                     if(!more)return false;
                     sampleRenderFrequency();
 #else
                     if(!BdwFirstGpuPoll(*this,firstCompletionPoll))return false;
 #endif
+                    // The breadcrumb check follows; on success this is the
+                    // observing poll, which feeds the completion predictor.
+                    io.tsc(result.completionEndTicks);
                     return true;
                 }
-                bool retirementContinue(){return BdwFirstGpuPoll(*this,firstRetirementPoll);}
+                bool retirementContinue(){
+                    if(firstRetirementPoll)beginPacer(retirementPacer,0,khz/2);
+                    pacer=&retirementPacer;
+                    return BdwFirstGpuPoll(*this,firstRetirementPoll);
+                }
                 void relax(){io.relax();}
                 bool renderStateReady(){return owned() && gtReady;}
                 bool restoreRenderState(){

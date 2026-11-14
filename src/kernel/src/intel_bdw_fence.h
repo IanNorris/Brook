@@ -6,6 +6,7 @@
 #include "kvmclock.h"
 #endif
 #include "sync/kmutex.h"
+#include "intel_bdw_wait_queue.h"
 namespace brook {
 // One immutable fence identity: state changes exactly once. A sync object may
 // replace its current fence without changing references held by queued work.
@@ -103,6 +104,7 @@ inline bool BdwFenceComplete(BdwFence* f,bool success,uint64_t signalNs=0){
     if(!__atomic_compare_exchange_n(&f->state,&expected,3,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))return false;
     f->signalNs=signalNs?signalNs:BdwFenceClockNs();
     __atomic_store_n(&f->state,success?1u:2u,__ATOMIC_RELEASE);
+    BdwGpuFenceSignalled(); // after publication: woken waiters re-check state
     return true;
 }
 // Prepare a timeline node after an unpublished predecessor from the same

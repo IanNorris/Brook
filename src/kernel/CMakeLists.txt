@@ -336,6 +336,7 @@ add_executable(kernel
     src/intel_bdw_file.cpp
     src/intel_bdw_exec_snapshot.cpp
     src/intel_bdw_ioctl.cpp
+    src/intel_bdw_wait_queue.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

@@ -5692,7 +5692,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<3;++i){const auto& y=s.yields[i];
             if(i)r.text(",");r.text("\"");r.text(jobs[i]);r.text("\":{");r.field("jobs",y.jobs);
             r.text(",");r.field("yields",y.yields);r.text(",");r.field("breadcrumb_yields",y.breadcrumbYields);
-            r.text(",");r.field("sleep_us",us(y.sleepTicks));r.text(",\"hist\":[");
+            r.text(",");r.field("sleep_us",us(y.sleepTicks));
+            r.text(",");r.field("spins",y.spins);r.text(",");r.field("breadcrumb_spins",y.breadcrumbSpins);
+            r.text(",");r.field("spin_us",us(y.spinTicks));r.text(",\"hist\":[");
             for(unsigned b=0;b<BdwWorkerYieldBuckets;++b){if(b)r.text(",");r.number(y.buckets[b]);}
             r.text("]}");}
         r.text("},\"mhz\":{");
@@ -5703,7 +5705,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 r.text("\"");r.text(names[p]);r.text("\":[");r.number(v.samples);r.text(",");r.number(v.minMhz);
                 r.text(",");r.number(v.samples?v.sumMhz/v.samples:0);r.text(",");r.number(v.maxMhz);r.text("],");}
             r.field("rising",f.rising);r.text(",");r.field("missing",f.missing);r.text("}");}
-        r.text("},\"scope\":\"gpu-submit worker since reset; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; sleep_us includes unlock, sleep and re-audit; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
+        r.text("},\"scope\":\"gpu-submit worker since reset; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
