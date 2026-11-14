@@ -1892,9 +1892,11 @@ static bool XhciQueueInterruptIn(XhciController& ctrl, XhciDevice& dev,
 static constexpr uint8_t MOD_LEFT_CTRL   = 0x01;
 static constexpr uint8_t MOD_LEFT_SHIFT  = 0x02;
 static constexpr uint8_t MOD_LEFT_ALT    = 0x04;
+static constexpr uint8_t MOD_LEFT_GUI    = 0x08;
 static constexpr uint8_t MOD_RIGHT_CTRL  = 0x10;
 static constexpr uint8_t MOD_RIGHT_SHIFT = 0x20;
 static constexpr uint8_t MOD_RIGHT_ALT   = 0x40;
+static constexpr uint8_t MOD_RIGHT_GUI   = 0x80;
 
 // USB HID usage ID → Linux input event code (KEY_* from linux/input-event-codes.h)
 // Only covers the basic alphanumeric + common keys
@@ -1986,6 +1988,7 @@ static void XhciProcessKeyboardReport(const uint8_t* report)
     if (mods & MOD_RIGHT_SHIFT) brookMods |= INPUT_MOD_RSHIFT;
     if (mods & (MOD_LEFT_CTRL | MOD_RIGHT_CTRL)) brookMods |= INPUT_MOD_CTRL;
     if (mods & (MOD_LEFT_ALT | MOD_RIGHT_ALT))   brookMods |= INPUT_MOD_ALT;
+    if (mods & (MOD_LEFT_GUI | MOD_RIGHT_GUI))   brookMods |= INPUT_MOD_SUPER;
 
     // Check each modifier for press/release
     struct { uint8_t mask; uint8_t sc; } modMap[] = {
@@ -1995,6 +1998,8 @@ static void XhciProcessKeyboardReport(const uint8_t* report)
         { MOD_RIGHT_CTRL,  97 },  // KEY_RIGHTCTRL
         { MOD_RIGHT_SHIFT, 54 },  // KEY_RIGHTSHIFT
         { MOD_RIGHT_ALT,   100 }, // KEY_RIGHTALT
+        { MOD_LEFT_GUI,    SC_LSUPER }, // KEY_LEFTMETA
+        { MOD_RIGHT_GUI,   SC_RSUPER }, // KEY_RIGHTMETA
     };
 
     for (auto& m : modMap) {

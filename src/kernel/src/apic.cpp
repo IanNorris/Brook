@@ -13,6 +13,7 @@
 #include "spinlock.h"
 #include "panic.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "vmware_clock.h"
 #include "vmware_clock_policy.h"
 #include "tick_clock.h"
@@ -191,7 +192,7 @@ static void SoftEnableLapic()
 // Stable elapsed samples publish a global monotonic floor; IRQ counts remain
 // separate and are never interpreted as precise service/wall time on KVM.
 volatile uint64_t g_lapicTickCount = 0;
-enum TickElapsedSource : uint32_t { TickIrqs, TickPvclock, TickVmwareTsc };
+enum TickElapsedSource : uint32_t { TickIrqs, TickPvclock, TickVmwareTsc, TickNativeTsc };
 static uint32_t g_tickSource = TickIrqs;
 static uint64_t g_tickOriginNs = 0;
 static uint64_t g_tickOriginTsc = 0;
@@ -224,6 +225,17 @@ bool ApicInitElapsedClock()
     }
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
     return selected;
+}
+
+// Called by TscClockSelect with interrupts disabled, after the TSC clock has
+// been anchored to the current delivered-tick count. Delivered ticks keep
+// driving the scheduler; elapsed milliseconds now follow the TSC.
+void ApicSelectTscElapsedClock()
+{
+    if (__atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)!=TickIrqs || !TscClockAvailable()) return;
+    g_tickOriginMs = __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_tickSource, uint32_t(TickNativeTsc), __ATOMIC_RELEASE);
+    SerialPrintf("APIC: elapsed clock invariant TSC (origin_ms=%lu)\n", g_tickOriginMs);
 }
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
@@ -758,6 +770,11 @@ uint8_t ApicGetId()
 uint32_t ApicGetTscKhz()
 {
     return g_tscKhz;
+}
+
+void ApicGetTscKhzSamples(uint32_t (&samples)[5])
+{
+    for (unsigned i = 0; i < 5; ++i) samples[i] = g_tscKhzSamples[i];
 }
 
 uint32_t ApicGetTimerTicksPerMs()
@@ -1809,9 +1826,15 @@ uint64_t ApicTickCount()
     const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);
     if (source!=TickIrqs) {
         uint64_t now = 0, sample = 0;
-        const bool valid=source==TickPvclock ?
-            (KvmClockReadStableNs(&now) && TickClockElapsedMs(g_tickOriginNs,g_tickOriginMs,now,&sample)) :
-            (VmwareClockReadTicks(&now) && VmwareTscElapsedMs(g_tickOriginTsc,g_tickOriginMs,now,VmwareClockTscKhz(),&sample));
+        bool valid=false;
+        if (source==TickPvclock)
+            valid=KvmClockReadStableNs(&now) && TickClockElapsedMs(g_tickOriginNs,g_tickOriginMs,now,&sample);
+        else if (source==TickVmwareTsc)
+            valid=VmwareClockReadTicks(&now) && VmwareTscElapsedMs(g_tickOriginTsc,g_tickOriginMs,now,VmwareClockTscKhz(),&sample);
+        else {
+            // Same ns domain as CLOCK_MONOTONIC; anchored at origin_ms*1e6.
+            now=TscClockReadNs();sample=now/1000000ULL;valid=now!=0;
+        }
         if (valid)
             return TickClockPublishFloor(&g_lapicTickCount, sample);
         // Retain the last published floor through an unavailable/regressing
@@ -1828,10 +1851,16 @@ ApicClockSnapshot ApicGetClockSnapshot()
     const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);
     snapshot.pvclock = source==TickPvclock;
     snapshot.vmwareTsc = source==TickVmwareTsc;
+    snapshot.nativeTsc = source==TickNativeTsc;
     snapshot.rawBspIrqs = __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
     if (snapshot.pvclock) {
         snapshot.originNs = g_tickOriginNs;
         snapshot.originMs = g_tickOriginMs;
+    }
+    if (snapshot.nativeTsc) {
+        const auto tsc=TscClockReadStatus();
+        snapshot.originMs=g_tickOriginMs;snapshot.originNs=tsc.originNs;
+        snapshot.originTsc=tsc.originTsc;snapshot.tscKhz=tsc.khz;
     }
     if (snapshot.vmwareTsc) {
         snapshot.originMs=g_tickOriginMs;

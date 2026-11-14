@@ -4,6 +4,7 @@
 #include "scheduler.h"
 #include "spinlock.h"
 #include "kvmclock.h"
+#include "tsc_clock.h"
 #include "rtc.h"
 #include "timeout_value.h"
 
@@ -35,7 +36,7 @@ uint64_t Now(int clock)
     // Realtime's seconds and fraction must share the RTC driver's immutable
     // epoch. Pvclock's fractional phase is unrelated to that epoch.
     if (clock == 0) return RtcNowNs();
-    return KvmClockAvailable() ? KvmClockReadNs() : ApicTickCount() * 1000000ULL;
+    return ElapsedClockNs();
 }
 uint64_t OwnerIncarnation(Process* p)
 {
