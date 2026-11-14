@@ -92,6 +92,13 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Pipelining default (gen 369, `dell-pipeline-default-20261114`, boot default):**
+- **2 buffers:** displayed mean 33.2 ms (≈30 fps real time), p50 30.0, p99 49.7; swaps 31.7.
+- **8 buffers:** 37.4 ms mean, p99 83.5.
+- **vs serial on the TSC clock:** 42.5 ms mean and p99 95.
+- **Opt-out:** `BROOK_RENDER_PIPELINE=1`.
+- **Gotcha:** a supervisor started by hand as a bridge job blocks a checked restart in "closing apps". Stop the job (cancel the restart first if it's already stuck), then restart.
+
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
 - Eliminate CPU copies in the pipeline.
