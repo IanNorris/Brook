@@ -853,6 +853,7 @@ add_host_test(test_compositor_handoff)
 target_compile_options(test_compositor_handoff PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_cpu_memory_type)
+add_host_test(test_cpu_memory_type_batch)
 add_host_test(test_cpu_execute_disable)
 target_compile_options(test_cpu_execute_disable PRIVATE -UNDEBUG)
 add_host_test(test_vmware_clock)

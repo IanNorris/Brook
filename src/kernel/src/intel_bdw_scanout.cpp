@@ -1,3 +1,4 @@
+#include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_submission_timing.h"
@@ -524,6 +525,8 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FramePrepBegin);
 #endif
+    uint64_t ohMark=BdwOverheadTicks();
+    auto ohStep=[&ohMark](BdwOverheadStep step){const uint64_t now=BdwOverheadTicks();BdwOverheadAdd(step,now>ohMark?now-ohMark:0);ohMark=now;};
     DiagnosticLease lease;if(!lease.held)return {false,true};
     auto* owner=snapshot?BdwExecSnapshotContext(snapshot):nullptr;
     if(!snapshot || (contextTest?!owner:owner!=nullptr) || !PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 ||
@@ -546,6 +549,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
        !(PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4)&4))return {false,true};
     static uint32_t nonce=0x42525000;
     if(nonce==~uint32_t{0})return {false,true};
+    ohStep(BdwOhEntry);
     auto* memory=static_cast<uint32_t*>(kmalloc(20*4096));if(!memory)return {false,true};
     auto& context=*reinterpret_cast<uint32_t (*)[20*1024]>(memory);
     struct ContextGuard {BdwGpuContext* owner;bool active=false;
@@ -553,6 +557,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     bool present=false;
     if(owner && !BdwGpuContextBegin(owner,context,present)){kfree(memory);return {false,true};}
     guard.active=owner!=nullptr;
+    ohStep(BdwOhContextBegin);
 #if defined(BROOK_GPU_CAPTURE_FAULT_TEST)
     // Test kernels only: the dedicated probe uses this exact six-word batch.
     // Panic before device submission, so this tests the capture/reboot path
@@ -568,8 +573,10 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     const uint64_t startTicks=tick();
 #endif
     if(!BdwReprepareRetainedSubmission(saved,++nonce)){kfree(memory);PanicWorkerStage("reprepare",snapshot);}
+    ohStep(BdwOhReprepare);
     const uint32_t dmaStatus=BdwInspectPrivateRenderDma();
     if(dmaStatus!=BdwDmaSnapshotOk){kfree(memory);PanicWorkerStage("private-dma",snapshot,dmaStatus);}
+    ohStep(BdwOhPrivateDma);
     BdwGgttReservation reservation{};
     if(!BdwRetainedRenderReservation(reservation) || reservation.first!=65544 || reservation.count!=29){kfree(memory);PanicWorkerStage("reservation",snapshot);}
 #ifdef BROOK_BDW_COHERENT_RENDER
@@ -577,13 +584,16 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     // that installs and verifies the WB LLC/eLLC PPGTT policy.
     if(!BdwExecSnapshotUseCoherentRender(snapshot)){kfree(memory);PanicWorkerStage("cache policy",snapshot);}
 #endif
+    ohStep(BdwOhReservation);
     if(!BdwPrepareRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("prepare",snapshot);}
+    ohStep(BdwOhPrepare);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t preparedTicks=tick();
 #endif
     BdwOwnedPage scratch{};BdwGgttReservation pinned{};
     if(!BdwReuseRetainedRenderScratch(scratch,pinned) || pinned.first!=reservation.first ||
        pinned.count!=reservation.count || pinned.token!=reservation.token){kfree(memory);PanicWorkerStage("scratch",snapshot);}
+    ohStep(BdwOhScratch);
     BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};
     run.ggttClearRequested=true;run.pollYieldRequested=true;
     uint32_t originPid=0,originContext=0;BdwExecSnapshotOrigin(snapshot,originPid,originContext);
@@ -612,7 +622,9 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     run.uncachedScanout=scanoutImages && BdwZeroCopyUncachedRender();
     run.scanoutPat=BdwZeroCopyScanoutPat();
 #endif
+    ohMark=BdwOverheadTicks();
     VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+    ohStep(BdwOhRenderRun);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && defined(BROOK_BDW_RPS_TRIAL) && !defined(BROOK_HOST_TEST)
     if(run.trialFrequencyCaps && run.trialFrequencyCaps!=0xffffffffu)BdwClock().lastCaps=run.trialFrequencyCaps;
 #endif
@@ -658,6 +670,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
         run.portWriteAttempts,unsigned(run.pollYieldFailed),run.pollYields,unsigned(run.engineSampled),run.head,run.tail,run.mode,run.control,run.acthd,run.ipeir,run.ipehr,run.execlist,
         current.bytes,current.words[0],current.words[1],current.words[2],current.words[3],current.words[4],current.words[5],current.words[6],current.words[7],sample.bytes,sample.words[0],sample.words[1],sample.words[2],sample.words[3],sample.words[4],sample.words[5],sample.words[6],sample.words[7]);}
     if(!BdwRetireRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("retire",snapshot);}
+    ohStep(BdwOhRetire);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t retiredTicks=tick();
     if(tsc.khz && preparedTicks>=startTicks && deviceTicks>=preparedTicks && retiredTicks>=deviceTicks){
@@ -685,9 +698,9 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #endif
     if(owner){
         if(!BdwGpuContextFinish(owner,&context,true)){kfree(memory);PanicWorkerStage("context-finish",snapshot);}
-        guard.active=false;kfree(memory);return {true,true};
+        guard.active=false;kfree(memory);ohStep(BdwOhFinish);return {true,true};
     }
-    kfree(retainedRenderContext);retainedRenderContext=memory;return {true,true};
+    kfree(retainedRenderContext);retainedRenderContext=memory;ohStep(BdwOhFinish);return {true,true};
 }
 BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* snapshot){return ExecuteRetainedWorker(snapshot,false);}
 BdwSubmissionOutcome BdwExecuteRetainedContextWorkerSnapshot(void*,BdwExecSnapshot* snapshot){return ExecuteRetainedWorker(snapshot,true);}

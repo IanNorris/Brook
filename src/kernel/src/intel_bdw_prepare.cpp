@@ -1,3 +1,4 @@
+#include "intel_bdw_worker_overhead.h"
 #include "kprintf.h"
 #include "serial.h"
 #include "intel_bdw_oneshot.h"
@@ -1199,31 +1200,64 @@ static void FreePpgttList(BdwPpgttMapping* list){kfree(list);}
 void BdwPpgttCacheSetEnabled(bool on){gemProbeTables.SetCacheEnabled(on,FreePpgttList);}
 bool BdwPpgttCacheEnabled(){return gemProbeTables.CacheEnabled();}
 void BdwPpgttCacheStatsRead(BdwPpgttCacheStats& out,uint32_t& cachedSets){cachedSets=gemProbeTables.CachedSets();out=gemProbeTables.Stats();}
+// Worker-thread-only expansion workspace, reused across jobs whenever the
+// table cache does not keep it (it is fully rewritten by each build and read
+// only by that build, so reuse needs no clearing). Grow-only.
+static BdwPpgttMapping* reusableWorkspace=nullptr;
+static uint32_t reusableWorkspacePages=0;
 bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
     if(!snapshot || retainedRender.State()!=BdwOneShotState::Prepared)return false;
     const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
     if(!pages || pages>65536)return false;
+    uint64_t mark=BdwOverheadTicks();
+    auto step=[&mark](BdwOverheadStep st){const uint64_t now=BdwOverheadTicks();BdwOverheadAdd(st,now>mark?now-mark:0);mark=now;};
     if(!gemProbeTables.Prepare(retainedRenderAllocator,snapshot))return false;
+    step(BdwOhTables);
     // A reused table set needs no expansion workspace: the snapshot is
     // compared directly against the retained mapping list.
-    BdwPpgttMapping* workspace=nullptr;
+    BdwPpgttMapping* workspace=nullptr;bool shared=false;
     if(!gemProbeTables.Reused()){
-        workspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(pages)*sizeof(BdwPpgttMapping)));
+        if(!gemProbeTables.CacheEnabled()){
+            if(reusableWorkspacePages<pages){
+                kfree(reusableWorkspace);reusableWorkspacePages=0;
+                // Round up to limit regrowth as buffer sets vary.
+                const uint32_t want=pages<65536-1024?((pages+1023)&~1023u):65536;
+                reusableWorkspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(want)*sizeof(BdwPpgttMapping)));
+                if(reusableWorkspace)reusableWorkspacePages=want;
+                BdwOverheadCount(BdwOverhead().counters.workspaceAllocs);
+            }else BdwOverheadCount(BdwOverhead().counters.workspaceReuses);
+            workspace=reusableWorkspace;shared=true;
+        }else workspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(pages)*sizeof(BdwPpgttMapping)));
         if(!workspace){(void)gemProbeTables.ReleaseUnsubmitted(retainedRenderAllocator);return false;}
     }
+    step(BdwOhWorkspace);
     const uint64_t buildStart=TscClockReadNs();
     const bool attached=retainedRender.AttachExternalSnapshot(retainedRenderAllocator,gemProbeTables,retainedRenderAllocator,
                                                               snapshot,workspace,workspace?pages:0);
     gemProbeTables.RecordTiming((TscClockReadNs()-buildStart)/1000);
+    step(BdwOhAttach);
     // On a fresh build with reuse enabled the tables keep the workspace as
-    // their exact mapping list; otherwise it is temporary.
-    if(workspace && !gemProbeTables.KeepsWorkspace())kfree(workspace);
+    // their exact mapping list; otherwise it is temporary. The shared
+    // workspace is only used while the cache is off, so it is never kept.
+    if(workspace && !shared && !gemProbeTables.KeepsWorkspace())kfree(workspace);
+    if(shared && gemProbeTables.KeepsWorkspace()){
+        // Defensive: the cache was enabled between Prepare and attach. The
+        // tables now own this allocation; never reuse it.
+        reusableWorkspace=nullptr;reusableWorkspacePages=0;
+    }
     uint32_t status=BdwDmaNotPrepared;
-    return attached &&
-        gemProbeTables.InspectDma(retainedRenderAllocator,status) && status==BdwDmaSnapshotOk &&
-        gemProbeTables.Publish(retainedRenderAllocator) && retainedRender.PublishPrepared(retainedRenderAllocator) &&
-        BdwExecSnapshotSyncForDevice(snapshot) && BdwExecSnapshotInspectDma(snapshot)==BdwDmaSnapshotOk &&
-        retainedRender.ArmExternalSnapshot(retainedRenderAllocator,retainedRenderAllocator);
+    if(!attached)return false;
+    if(!gemProbeTables.InspectDma(retainedRenderAllocator,status) || status!=BdwDmaSnapshotOk)return false;
+    step(BdwOhInspectTables);
+    if(!gemProbeTables.Publish(retainedRenderAllocator) || !retainedRender.PublishPrepared(retainedRenderAllocator))return false;
+    step(BdwOhPublish);
+    if(!BdwExecSnapshotSyncForDevice(snapshot))return false;
+    step(BdwOhSyncDevice);
+    if(BdwExecSnapshotInspectDma(snapshot)!=BdwDmaSnapshotOk)return false;
+    step(BdwOhSnapshotDma);
+    const bool armed=retainedRender.ArmExternalSnapshot(retainedRenderAllocator,retainedRenderAllocator);
+    step(BdwOhArm);
+    return armed;
 }
 // Detach only this stopped snapshot; the caller retains it until queue
 // completion has synchronized the buffers and dropped their use counts.

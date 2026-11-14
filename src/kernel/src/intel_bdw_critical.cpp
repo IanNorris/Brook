@@ -1,6 +1,8 @@
 // Dell/Broadwell GPU critical-section work, moved verbatim from
 // memory/virtual_memory.cpp. The VMM supplies only the kernel page-table
 // critical section and the alias audit; all device logic lives here.
+#include "cpu_memory_type_batch.h"
+#include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_critical.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
@@ -260,10 +262,31 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             e.identityPresent=identity.present;e.identityMatches=identity.physical==page;e.identityPat=identity.patIndex;
             e.directPresent=direct.present;e.directMatches=direct.physical==page;e.directPat=direct.patIndex;
             e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==page;e.currentDirectPat=current.patIndex;
-            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(page,page,cpu) && cpu.cpu==0;
+            CpuMemoryTypeObservation cpu{};
+            const auto* batched=typedFor(page);
+            if(batched){cpu=*batched;e.cpuValid=cpu.cpu==0;}
+            else e.cpuValid=CpuObserveMemoryTypes(page,page,cpu) && cpu.cpu==0;
             e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
             return true;
         }
+        // One stable MTRR/PAT/CR0 window for a whole audit page set; see
+        // cpu_memory_type_batch.h. Valid only until clearTypes(), and only
+        // inside the same interrupts-off critical section as the evidence.
+        uint64_t typedPages[16]{};CpuMemoryTypeObservation typed[16]{};unsigned typedCount=0;
+        const CpuMemoryTypeObservation* typedFor(uint64_t page) const {
+            for(unsigned i=0;i<typedCount;++i)if(typedPages[i]==page)return &typed[i];
+            return nullptr;
+        }
+        void observeTypes(const uint64_t* pages,unsigned count){
+            typedCount=0;
+            if(!BdwAuditBatchEnabled() || count>16)return;
+            const uint64_t start=BdwOverheadTicks();
+            for(unsigned i=0;i<count;++i)typedPages[i]=pages[i];
+            if(CpuObserveMemoryTypesBatch(typedPages,count,typed)){typedCount=count;BdwOverheadCount(BdwOverhead().counters.auditBatches);}
+            else BdwOverheadCount(BdwOverhead().counters.auditBatchFallbacks);
+            const uint64_t end=BdwOverheadTicks();BdwOverheadAdd(BdwOhAuditTypes,end>start?end-start:0);
+        }
+        void clearTypes(){typedCount=0;}
         bool read32(uint64_t address,uint32_t& value){
             if(!mappingsValid)return false;
             __asm__ volatile("lfence":::"memory");
@@ -285,6 +308,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         // or page-table state is touched. spinTicks selects a short spin
         // slice (yielding first to any ready CPU-0 work) instead of a tick.
         void Wait(){
+            BdwOverheadScope waitScope(BdwOhYieldWait);
             if(spinTicks){
                 struct Cpu {Io& io;
                     uint64_t flags(){uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");return f;}
@@ -307,11 +331,17 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         void Lock(){*irq=VmmKernelPtCriticalEnter();}
         bool Audit(){
             if(SmpCurrentCpuIndex()!=0)return false;
-            for(auto page:BdwForcewakePages){DellI2cCriticalEvidence e{};if(!evidence(page,e) || !BdwGttEvidenceValid(e))return false;}
-            for(auto page:BdwOtherEnginePages){DellI2cCriticalEvidence e{};if(!evidence(page,e) || !BdwGttEvidenceValid(e))return false;}
+            BdwOverheadScope scope(BdwOhAudit);
             constexpr uint64_t extra[]={BdwDellBar0,BdwPrivatePatPage,BdwResetPage,BdwDellBar0+0xb000,0xf6880000ull,0xf6101000ull};
-            for(auto page:extra){DellI2cCriticalEvidence e{};if(!evidence(page,e) || !BdwGttEvidenceValid(e))return false;}
-            return true;
+            uint64_t all[sizeof(BdwForcewakePages)/8+sizeof(BdwOtherEnginePages)/8+sizeof(extra)/8];unsigned n=0;
+            for(auto page:BdwForcewakePages)all[n++]=page;
+            for(auto page:BdwOtherEnginePages)all[n++]=page;
+            for(auto page:extra)all[n++]=page;
+            observeTypes(all,n);
+            bool ok=true;
+            for(unsigned i=0;i<n && ok;++i){DellI2cCriticalEvidence e{};ok=evidence(all[i],e) && BdwGttEvidenceValid(e);}
+            clearTypes();
+            return ok;
         }
         void Poison(){mappingsValid=false;}
         uint64_t spinTicks=0,waitEnd=0;
@@ -351,7 +381,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             const bool rebased=scratchIndex==65573;
             constexpr uint64_t pages[]={BdwDellBar0,BdwOtherEnginePages[0],BdwPrivatePatPage,BdwResetPage,
                 BdwDellBar0+0xb000,0xf6880000ull,0xf6101000ull};
-            for(auto page:pages){DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e))return false;}
+            held.observeTypes(pages,sizeof(pages)/8);
+            for(auto page:pages){DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e)){held.clearTypes();return false;}}
+            held.clearTypes();
             GtOwner gt{held,khz};
             struct RenderOwner {
                 Io& io;GtOwner& gt;BdwRenderRunResult& result;uint32_t khz,line;uint64_t origin;uint32_t budget=4000000;

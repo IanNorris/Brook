@@ -1,3 +1,5 @@
+#include "intel_bdw_worker_overhead.h"
+#include "native_tsc_observe.h"
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
 #include "sched_lock_owner.h"
@@ -5122,6 +5124,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
+            "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
             "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
@@ -5782,6 +5786,34 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
+    }
+    else if(NetStrEq(cmd,"gpu worker overhead") || NetStrEq(cmd,"gpu worker overhead reset")) {
+        if(NetStrEq(cmd,"gpu worker overhead reset")){BdwOverheadRequestReset();
+            DebugChannelSend("{\"reset\":\"requested\",\"scope\":\"applied at the worker's next recorded step\"}\n");return;}
+        const auto& tsc=NativeTscObserveRead();
+        const uint64_t khz=tsc.capable && tsc.measured && tsc.consistent?tsc.khz:0;
+        auto us=[khz](uint64_t t){return khz?t*1000/khz:0;};
+        auto& st=BdwOverhead();
+        BridgeReply r;r.text("{");r.field("khz",khz);r.text(",\"audit_batch\":");r.text(BdwAuditBatchEnabled()?"true":"false");
+        r.text(",\"steps\":{");
+        for(unsigned i=0;i<BdwOhStepCount;++i){
+            const uint64_t c=__atomic_load_n(&st.steps[i].count,__ATOMIC_RELAXED),t=__atomic_load_n(&st.steps[i].ticks,__ATOMIC_RELAXED),
+                m=__atomic_load_n(&st.steps[i].maxTicks,__ATOMIC_RELAXED);
+            if(i)r.text(",");r.text("\"");r.text(BdwOverheadStepName(i));r.text("\":[");
+            r.number(c);r.text(",");r.number(us(t));r.text(",");r.number(c?us(t)*1000/c:0);r.text(",");r.number(us(m));r.text("]");
+        }
+        r.text("},");r.field("audit_batches",__atomic_load_n(&st.counters.auditBatches,__ATOMIC_RELAXED));
+        r.text(",");r.field("audit_batch_fallbacks",__atomic_load_n(&st.counters.auditBatchFallbacks,__ATOMIC_RELAXED));
+        r.text(",");r.field("workspace_reuses",__atomic_load_n(&st.counters.workspaceReuses,__ATOMIC_RELAXED));
+        r.text(",");r.field("workspace_allocs",__atomic_load_n(&st.counters.workspaceAllocs,__ATOMIC_RELAXED));
+        r.text(",\"scope\":\"gpu-submit worker fixed per-job costs since boot or reset; steps=[count,total_us,avg_ns,max_us]; prepare includes tables..arm; render_run is the forcewake critical section including GPU time, audit and yield_wait; audit = one critical-section re-audit after a GPU-wait yield (interrupts off), audit_types its MTRR/PAT observation; relaxed reads may mix two jobs\"}\n");
+        r.send();
+    }
+    else if(NetStrEq(cmd,"gpu audit batch on") || NetStrEq(cmd,"gpu audit batch off") || NetStrEq(cmd,"gpu audit batch status")) {
+        if(NetStrEq(cmd,"gpu audit batch on"))BdwAuditBatchSet(true);
+        else if(NetStrEq(cmd,"gpu audit batch off"))BdwAuditBatchSet(false);
+        BridgeReply r;r.text("{\"enabled\":");r.text(BdwAuditBatchEnabled()?"true":"false");
+        r.text(",\"scope\":\"on (default) = one MTRR/PAT/CR0 observation window per critical-section audit; off = the previous per-page observation; results are identical by construction\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu worker stats") || NetStrEq(cmd,"gpu worker stats reset")) {
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
