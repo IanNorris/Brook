@@ -266,6 +266,9 @@ bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
 bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal);
 bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal);
+// op 1 probe, 2 reset, 3 self-test, run on a CPU0-pinned kernel thread (10 s wait).
+bool BdwVideoRunOnCpu0(uint8_t op,BdwForcewakeAdapterResult& fw,BdwRcsResetTestResult& reset,BdwBcsRunResult& run,
+        uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal,bool& pending);
 struct BdwRenderGtInitResult;
 bool BdwTestRenderGtInit(BdwForcewakeAdapterResult& out,BdwRenderGtInitResult& init);
 struct BdwPatTestResult;

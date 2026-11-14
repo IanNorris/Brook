@@ -157,4 +157,66 @@ inline unsigned BdwBuildVcsSelftestBatch(uint32_t* out,unsigned capacity,uint64_
     out[5]=BdwMiBatchBufferEnd;
     return 6;
 }
+
+// GT power-management and VCS register snapshot taken inside the forcewake
+// critical section immediately before and after each VCS operation (reset,
+// self-test). Investigates the render-clock sag seen on gen 390 after VCS use.
+// All registers lie in pages the critical section already audits:
+// BAR0+0xa000 (RPS/RC), BAR0+0x138000 (RC6 residency) and BAR0+0x12000 (VCS).
+constexpr uint32_t BdwGtPmRegs[]={
+    0xa008, // GEN6_RPNSWREQ: software frequency request
+    0xa00c, // GEN6_RC_VIDEO_FREQ
+    0xa010, // GEN6_RP_DOWN_TIMEOUT
+    0xa014, // GEN6_RP_INTERRUPT_LIMITS
+    0xa01c, // GEN6_RPSTAT1 (CAGF = current actual frequency)
+    0xa024, // GEN6_RP_CONTROL
+    0xa02c, // GEN6_RP_UP_THRESHOLD
+    0xa030, // GEN6_RP_DOWN_THRESHOLD
+    0xa068, // GEN6_RP_UP_EI
+    0xa06c, // GEN6_RP_DOWN_EI
+    0xa090, // GEN6_RC_CONTROL
+    0xa094, // GEN6_RC_STATE
+    0xa168, // GEN6_PMINTRMSK
+    0x138108, // GEN6_GT_GFX_RC6 residency
+    0x13810c, // GEN6_GT_GFX_RC6p residency
+    0x1209c, // VCS MI_MODE
+    0x1229c, // VCS GFX_MODE (execlist enable)
+    0x1203c, // VCS RING_CTL
+    0x12234, // VCS EXECLIST_STATUS
+    0x12050, // VCS RING_PSMI_CTL (idle messaging)
+    0x12080, // VCS HWS_PGA
+    0x12098, // VCS HWSTAM
+};
+constexpr unsigned BdwGtPmRegCount=sizeof(BdwGtPmRegs)/sizeof(BdwGtPmRegs[0]);
+// Restored (exact previous value, write then verified readback) if a VCS
+// operation changed them: plain GT power-management controls only. Status and
+// counters (RPSTAT1, RC_STATE, residencies) and the masked VCS engine registers
+// are reported, never written.
+constexpr uint32_t BdwGtPmRestorable[]={0xa008,0xa00c,0xa010,0xa014,0xa024,0xa02c,0xa030,0xa068,0xa06c,0xa090,0xa168};
+inline bool BdwGtPmRegRestorable(uint32_t reg){for(auto r:BdwGtPmRestorable)if(r==reg)return true;return false;}
+struct BdwGtPmSnapshot {bool valid=false;uint32_t value[BdwGtPmRegCount]{};};
+struct BdwGtPmRecord {
+    BdwGtPmSnapshot before{},after{};
+    uint32_t changedMask=0;   // bit i: BdwGtPmRegs[i] differs after the operation
+    uint32_t restoredMask=0;  // restored to the before value and verified
+    uint32_t restoreFailedMask=0;
+    uint8_t op=0;             // 1 reset, 2 self-test
+};
+// RPSTAT1 CAGF (bits 13:7 on Gen8) in MHz (50 MHz units).
+inline uint32_t BdwGtCagfMhz(uint32_t rpstat1){return ((rpstat1>>7)&0x7f)*50;}
+// Pure decision for the restore step; Io provides read(reg,v) and write(reg,v).
+template<class Io> void BdwGtPmRestore(Io& io,BdwGtPmRecord& r){
+    r.changedMask=r.restoredMask=r.restoreFailedMask=0;
+    if(!r.before.valid || !r.after.valid)return;
+    for(unsigned i=0;i<BdwGtPmRegCount;++i){
+        if(r.before.value[i]==r.after.value[i])continue;
+        r.changedMask|=1u<<i;
+        const uint32_t reg=BdwGtPmRegs[i];
+        if(!BdwGtPmRegRestorable(reg))continue;
+        uint32_t back=0;
+        if(io.write(reg,r.before.value[i]) && io.read(reg,back) && back==r.before.value[i])r.restoredMask|=1u<<i;
+        else r.restoreFailedMask|=1u<<i;
+    }
+}
+static_assert(BdwGtPmRegCount<=32,"mask width");
 }

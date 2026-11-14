@@ -11,6 +11,7 @@
 #include "intel_bdw_worker_stats.h"
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_video.h"
+#include "intel_bdw_critical.h"
 #include "intel_bdw_forcewake_adapter.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_exec_tables.h"
@@ -5836,12 +5837,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             DebugChannelSend("Usage: gpu video on|off|status|probe|reset|selftest\n");return;}
         BdwVideoRefusal refusal=BdwVideoRefusal::None;bool ok=true;
         BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult rs{};
+        BdwBcsRunResult st{};uint32_t readback=0,expected=0;bool pending=false;
         if(on || off)ok=BdwVideoSetEnabled(on,refusal);
-        else if(probe)ok=BdwVideoProbe(fw,refusal);
-        else if(reset)ok=BdwVideoReset(fw,rs,refusal);
-        BdwBcsRunResult st{};uint32_t readback=0,expected=0;
-        if(selftest)ok=BdwVideoSelftest(fw,st,readback,expected,refusal);
+        else if(probe || reset || selftest)
+            ok=BdwVideoRunOnCpu0(probe?1:reset?2:3,fw,rs,st,readback,expected,refusal,pending);
         BdwVideoGate g{};const bool have=BdwVideoStatus(g);
+        BdwGtPmRecord pm{};VmmDellVcsPmRecord(pm);
         BridgeReply r;r.text("{\"built\":");r.text(BdwVideoBuilt()?"true":"false");
         r.text(",\"ok\":");r.text(ok?"true":"false");
         r.text(",\"refusal\":\"");r.text(BdwVideoRefusalName(refusal));r.text("\"");
@@ -5862,6 +5863,21 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("mi_mode",v.mode);r.text(",");r.field("start",v.start);
             r.text(",");r.field("control",v.control);r.text(",");r.field("execlist_lo",v.execlistLo);
             r.text(",");r.field("execlist_hi",v.execlistHi);r.text(",");r.field("gfx_mode",v.submissionMode);r.text("}");
+        }
+        if(pending){r.text(",\"pending\":true");}
+        if(pm.op){
+            // GT PM before/after the last VCS operation (gen 390 clock-sag investigation).
+            r.text(",\"pm\":{\"op\":\"");r.text(pm.op==1?"reset":"selftest");r.text("\"");
+            r.text(",\"valid\":");r.text(pm.before.valid && pm.after.valid?"true":"false");
+            r.text(",");r.field("changed_mask",pm.changedMask);r.text(",");r.field("restored_mask",pm.restoredMask);
+            r.text(",");r.field("restore_failed_mask",pm.restoreFailedMask);
+            r.text(",");r.field("cagf_before_mhz",BdwGtCagfMhz(pm.before.value[4]));
+            r.text(",");r.field("cagf_after_mhz",BdwGtCagfMhz(pm.after.value[4]));
+            r.text(",\"regs\":[");
+            for(unsigned i=0;i<BdwGtPmRegCount;++i){if(i)r.text(",");
+                r.text("{");r.field("r",BdwGtPmRegs[i]);r.text(",");r.field("b",pm.before.value[i]);
+                r.text(",");r.field("a",pm.after.value[i]);r.text("}");}
+            r.text("]}");
         }
         if(reset){r.text(",\"reset\":{\"attempted\":");r.text(rs.attempted?"true":"false");
             r.text(",\"complete\":");r.text(rs.complete?"true":"false");

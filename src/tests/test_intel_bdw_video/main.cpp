@@ -145,7 +145,33 @@ static void TestSelftestGate(){
     assert(g.stage()==BdwVideoStage::Quarantined && g.maySelftest()==BdwVideoRefusal::Quarantined && !g.setEnabled(true));
 }
 
+static void TestPmRestore(){
+    struct Io {uint32_t regs[0x140000/4+16]{};bool failWrite=false;
+        bool read(uint32_t r,uint32_t& v){v=regs[r/4];return true;}
+        bool write(uint32_t r,uint32_t v){if(failWrite)return true;regs[r/4]=v;return true;}};
+    static Io io;BdwGtPmRecord rec{};
+    for(unsigned i=0;i<BdwGtPmRegCount;++i){rec.before.value[i]=0x1000+i;io.regs[BdwGtPmRegs[i]/4]=0x1000+i;}
+    rec.before.valid=true;rec.after=rec.before;
+    // A VCS operation changed RP_CONTROL (restorable), RPSTAT1 (status) and VCS GFX_MODE (engine, report only).
+    auto index=[](uint32_t reg){for(unsigned i=0;i<BdwGtPmRegCount;++i)if(BdwGtPmRegs[i]==reg)return i;assert(false);return 0u;};
+    const unsigned rp=index(0xa024),st=index(0xa01c),gm=index(0x1229c);
+    rec.after.value[rp]=0xdead;rec.after.value[st]=0x1234;rec.after.value[gm]=0x8000;
+    io.regs[0xa024/4]=0xdead;
+    BdwGtPmRestore(io,rec);
+    assert(rec.changedMask==((1u<<rp)|(1u<<st)|(1u<<gm)));
+    assert(rec.restoredMask==(1u<<rp) && !rec.restoreFailedMask && io.regs[0xa024/4]==0x1000+rp);
+    assert(io.regs[0x1229c/4]==0x1000+gm); // engine register never written
+    // A write that does not take is reported as failed.
+    io.failWrite=true;io.regs[0xa024/4]=0xdead;BdwGtPmRestore(io,rec);
+    assert(rec.restoreFailedMask==(1u<<rp) && !rec.restoredMask);
+    // Invalid snapshots restore nothing.
+    BdwGtPmRecord none{};BdwGtPmRestore(io,none);assert(!none.changedMask);
+    assert(BdwGtCagfMhz(10u<<7)==500 && BdwGtCagfMhz(8u<<7)==400);
+    assert(BdwGtPmRegRestorable(0xa090) && !BdwGtPmRegRestorable(0xa01c) && !BdwGtPmRegRestorable(0x1209c));
+}
+
 int main(){
+    TestPmRestore();
     TestVcsContext();
     TestVcsSubmission();
     TestSelftestGate();

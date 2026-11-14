@@ -38,6 +38,22 @@
 #include "smp.h"
 
 namespace brook {
+// Last VCS operation's GT PM before/after record (written only under the
+// forcewake claim; read by the debug command after the operation returns).
+static BdwGtPmRecord vcsPmRecord;
+template<class Held> static bool BdwVcsPmSnapshot(Held& held,BdwGtPmSnapshot& out){
+    out={};
+    for(unsigned i=0;i<BdwGtPmRegCount;++i)if(!held.read32(BdwDellBar0+BdwGtPmRegs[i],out.value[i]))return false;
+    out.valid=true;return true;
+}
+template<class Held> static void BdwVcsPmFinish(Held& held,uint8_t op){
+    struct Rw {Held& h;bool read(uint32_t r,uint32_t& v){return h.read32(BdwDellBar0+r,v);}
+        bool write(uint32_t r,uint32_t v){return h.write32(BdwDellBar0+r,v);}} rw{held};
+    vcsPmRecord.op=op;
+    if(!BdwVcsPmSnapshot(held,vcsPmRecord.after))return;
+    BdwGtPmRestore(rw,vcsPmRecord);
+}
+void VmmDellVcsPmRecord(BdwGtPmRecord& out){out=vcsPmRecord;}
 template<class F> static bool BdwTimedTransaction(BdwRenderRunResult& result,unsigned stage,F f){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const auto start=BdwTimingNow();
@@ -694,12 +710,14 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 void relax(){io.relax();}
             } owner{held,khz,0};
             if(!held.tsc(owner.origin))return false;
+            vcsPmRecord={};(void)BdwVcsPmSnapshot(held,vcsPmRecord.before);
             vcsReset->attempted=true;
             BdwVcsResetMmio<VcsOwner> reset(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwOtherEnginePages[1]),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwResetPage));
             const auto outcome=reset.reset();
             vcsReset->complete=outcome==BdwBcsResetResult::DomainAcknowledged;
             vcsReset->uncertain=outcome==BdwBcsResetResult::Uncertain;
+            BdwVcsPmFinish(held,1);
             return vcsReset->complete;
         }
         if(rcsReset) {
@@ -855,9 +873,10 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             owner.line=((b>>8)&255)*8;
             if(!(d&(1u<<19)) || owner.line<16 || owner.line>4096 || (owner.line&(owner.line-1)) ||
                4096%owner.line || !held.tsc(owner.origin)){copyResult->refusalStep=4;return false;}
+            if(vcsSelftest){vcsPmRecord={};(void)BdwVcsPmSnapshot(held,vcsPmRecord.before);}
             copyResult->resetBeforeAttempted=true;copyResult->resetBefore=owner.resetBcs();
             copyResult->resetUncertain=owner.resetWasUncertain;
-            if(!copyResult->resetBefore){copyResult->refusalStep=5;return false;}
+            if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsSelftest)BdwVcsPmFinish(held,2);return false;}
             BdwPatMmio<CopyOwner> patMmio(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),scanoutCopy);
             BdwPatLease pat;copyResult->patEstablished=pat.Establish(patMmio,0x119,scanoutCopy);
             if(!copyResult->patEstablished){copyResult->patUncertain=pat.State()==BdwPatLeaseState::Quarantined;return false;}
@@ -884,6 +903,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 copyResult->patUncertain=!copyResult->resetAfter || !copyResult->patRestored || !copyResult->scanoutRetired;
                 copyResult->resetUncertain=owner.resetWasUncertain;
                 owner.patActive=false;
+                // After the PAT lease is released: compare GT PM state with the
+                // pre-test snapshot and restore any changed plain PM control.
+                BdwVcsPmFinish(held,2);
                 // The callback's result is the transaction's cleanliness: VCS was
                 // stopped, the PAT restored and the lease unbound. Whether the
                 // self-test itself passed is reported through copyResult (ran ->

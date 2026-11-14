@@ -586,6 +586,53 @@ bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32
     (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
 #endif
 }
+// Run a VCS operation on a CPU0-pinned kernel thread: the critical section
+// and the PAT/forcewake transaction are CPU0-only, and the debug channel's
+// thread may be scheduled anywhere (gen 390: precondition-not-cpu0). Same
+// pattern as the RCS debug jobs in debug_hardware.cpp.
+namespace {
+struct VideoJob {
+    uint32_t state=0; // 0 idle, 1 running, 2 done
+    uint8_t op=0;bool ok=false;
+    BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult reset{};BdwBcsRunResult run{};
+    uint32_t readback=0,expected=0;BdwVideoRefusal refusal=BdwVideoRefusal::None;
+};
+[[maybe_unused]] VideoJob videoJob;
+[[maybe_unused]] void VideoJobWorker(void* opaque){
+    auto* job=static_cast<VideoJob*>(opaque);
+    job->refusal=BdwVideoRefusal::None;
+    if(job->op==1)job->ok=BdwVideoProbe(job->fw,job->refusal);
+    else if(job->op==2)job->ok=BdwVideoReset(job->fw,job->reset,job->refusal);
+    else if(job->op==3)job->ok=BdwVideoSelftest(job->fw,job->run,job->readback,job->expected,job->refusal);
+    __atomic_store_n(&job->state,2,__ATOMIC_RELEASE);
+}
+}
+bool BdwVideoRunOnCpu0(uint8_t op,BdwForcewakeAdapterResult& fw,BdwRcsResetTestResult& reset,BdwBcsRunResult& run,
+        uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal,bool& pending){
+    pending=false;refusal=BdwVideoRefusal::None;
+#if !(defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY))
+    (void)op;(void)fw;(void)reset;(void)run;(void)readback;(void)expected;
+    refusal=BdwVideoRefusal::NotImplemented;return false;
+#else
+    if(op<1 || op>3){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    uint32_t idle=0,done=2;
+    // A previous job that outlived its wait finishes in the background; collect it first.
+    __atomic_compare_exchange_n(&videoJob.state,&done,0,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+    if(!__atomic_compare_exchange_n(&videoJob.state,&idle,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+        refusal=BdwVideoRefusal::Busy;pending=true;return false;}
+    videoJob.op=op;videoJob.ok=false;videoJob.fw={};videoJob.reset={};videoJob.run={};videoJob.readback=videoJob.expected=0;
+    auto* worker=KernelThreadCreate("gpu-video",VideoJobWorker,&videoJob);
+    if(!worker){__atomic_store_n(&videoJob.state,0,__ATOMIC_RELEASE);refusal=BdwVideoRefusal::Busy;return false;}
+    worker->cpuAffinity=0;SchedulerAddProcess(worker);
+    const uint64_t deadline=ApicTickCount()+10000;
+    while(__atomic_load_n(&videoJob.state,__ATOMIC_ACQUIRE)!=2 && ApicTickCount()<deadline)SchedulerSleepMs(5);
+    if(__atomic_load_n(&videoJob.state,__ATOMIC_ACQUIRE)!=2){pending=true;refusal=BdwVideoRefusal::Busy;return false;}
+    fw=videoJob.fw;reset=videoJob.reset;run=videoJob.run;readback=videoJob.readback;expected=videoJob.expected;
+    refusal=videoJob.refusal;const bool ok=videoJob.ok;
+    __atomic_store_n(&videoJob.state,0,__ATOMIC_RELEASE);
+    return ok;
+#endif
+}
 bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     DiagnosticLease lease;if(!lease.held)return false;

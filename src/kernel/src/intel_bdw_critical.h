@@ -39,6 +39,9 @@ void VmmDellRenderGtInit(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRende
 void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
 // VCS0 (video engine) domain reset, IdleTakeover only. VA-API phase 1.
 void VmmDellVcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
+struct BdwGtPmRecord;
+// GT PM before/after record of the last VCS reset or self-test.
+void VmmDellVcsPmRecord(BdwGtPmRecord& out);
 // VCS0 self-test submission (VA-API phase 1b) of the prepared video image.
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run);
 void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
