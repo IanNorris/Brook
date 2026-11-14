@@ -19,6 +19,11 @@ set(CMAKE_LINKER ${LD_LLD})
 set(KERNEL_FLAGS
     "--target=x86_64-elf --no-default-config -Wno-unused-command-line-argument -ffreestanding -fno-builtin -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -fno-omit-frame-pointer -mcmodel=kernel -nostdlib")
 
+# Freestanding builtin headers for the pinned unwrapped Clang (see shell.nix).
+if(DEFINED ENV{BROOK_CLANG_RESOURCE_DIR})
+    string(APPEND KERNEL_FLAGS " -resource-dir=$ENV{BROOK_CLANG_RESOURCE_DIR}")
+endif()
+
 set(CMAKE_C_FLAGS_INIT   "${KERNEL_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${KERNEL_FLAGS} -fno-exceptions -fno-rtti")
 

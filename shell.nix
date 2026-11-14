@@ -65,6 +65,9 @@ pkgs.mkShellNoCC {
     # Kernel cross-compilation compiler (unwrapped, no Linux-specific flags)
     export CC="${llvm.clang-unwrapped}/bin/clang"
     export CXX="${llvm.clang-unwrapped}/bin/clang++"
+    # Unwrapped Clang's own resource dir lacks its builtin headers (stdarg.h,
+    # stddef.h, ...); they live in the separate lib output.
+    export BROOK_CLANG_RESOURCE_DIR="${llvm.clang-unwrapped.lib}/lib/clang/${pkgs.lib.versions.major llvm.clang-unwrapped.version}"
 
     # Host-target compiler (wrapped Clang+libc++ for native builds)
     export HOST_CC="${hostCC}/bin/cc"
