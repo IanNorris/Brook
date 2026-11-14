@@ -1,6 +1,7 @@
 // Dell/Broadwell GPU critical-section work, moved verbatim from
 // memory/virtual_memory.cpp. The VMM supplies only the kernel page-table
 // critical section and the alias audit; all device logic lives here.
+#include "intel_bdw_render_refusal.h"
 #include "cpu_memory_type_batch.h"
 #include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_critical.h"
@@ -239,7 +240,7 @@ bool VmmDellForcewakeAckCriticalRead(uint32_t& result) {
 static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines,bool patRequested,bool tlbRequested,bool resetRequested,bool scopeCheck,
                                         uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false) {
     static BdwForcewakeClaim claim;result={};
-    if(!claim.acquire())return;
+    if(!claim.acquire()){result.refusal=claim.state()==2?BdwFwRefusalClaimUncertain:BdwFwRefusalClaimBusy;return;}
     struct Io {
         bool tlbRequested,resetRequested,scratchRequested,initRequested,patChangeRequested,copyRequested,rcsResetRequested,gtInitRequested,renderRequested;
         uint64_t* irq=nullptr;bool mappingsValid=true;
@@ -353,7 +354,10 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         uint32_t ack=0,lo=0,hi=0;
         if(!(held.read32(BdwDellBar0+0x130044,ack) && ack!=0xffffffffu && (ack&1) &&
             held.read32(BdwDellBar0+0x40e0,lo) && held.read32(BdwDellBar0+0x40e4,hi) &&
-            lo==initial.patLo && hi==initial.patHi))return false;
+            lo==initial.patLo && hi==initial.patHi)){
+            if(renderResult)renderResult->entryRefusal=BdwRenderRefusalAckOrPat;
+            return false;
+        }
         struct GtOwner {
                 Io& io;uint32_t khz;uint32_t selector=0,fuse=0;bool sampled=false;
                 bool owned(){uint32_t a=0;return io.owned() && io.read32(BdwDellBar0+0x130044,a) && a!=0xffffffffu && (a&1);}
@@ -377,18 +381,22 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 }
         };
         if(renderResult) {
-            if(!snapshot || (scratchIndex!=65544 && scratchIndex!=65573) || !scratchDma || !copyToken)return false;
+            if(!snapshot || (scratchIndex!=65544 && scratchIndex!=65573) || !scratchDma || !copyToken){
+                renderResult->entryRefusal=BdwRenderRefusalArguments;return false;}
             const bool rebased=scratchIndex==65573;
             constexpr uint64_t pages[]={BdwDellBar0,BdwOtherEnginePages[0],BdwPrivatePatPage,BdwResetPage,
                 BdwDellBar0+0xb000,0xf6880000ull,0xf6101000ull};
             held.observeTypes(pages,sizeof(pages)/8);
-            for(auto page:pages){DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e)){held.clearTypes();return false;}}
+            {uint8_t index=0;
+            for(auto page:pages){DellI2cCriticalEvidence e{};if(!held.evidence(page,e) || !BdwGttEvidenceValid(e)){held.clearTypes();
+                renderResult->entryRefusal=BdwRenderRefusalPageEvidence;renderResult->entryDetail=index;return false;}++index;}}
             held.clearTypes();
             GtOwner gt{held,khz};
             struct RenderOwner {
                 Io& io;GtOwner& gt;BdwRenderRunResult& result;uint32_t khz,line;uint64_t origin;uint32_t budget=4000000;
                 bool patActive=false,gtReady=false,fault=false;
                 bool firstCompletionPoll=true,firstRetirementPoll=true;
+                unsigned gtInitCalls=0;
                 bool owned(){return gt.owned();}
                 bool quiescent(){
                     struct Reader {RenderOwner& o;bool owned(){return o.owned();}
@@ -493,6 +501,12 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwResetPage));
                     const auto r=BdwInitializeRenderGt(mmio);gtReady=r.status==BdwRenderGtInitStatus::Applied;
                     if(r.status==BdwRenderGtInitStatus::Uncertain)fault=true;
+                    result.gtWrites+=r.writes;
+                    // The transaction's first stage refused before writing
+                    // anything: nothing else has run yet (see the refusal
+                    // classifier). Later re-initialisations never count.
+                    if(!gtInitCalls++ && r.status==BdwRenderGtInitStatus::NotStarted && !r.writes && !result.attempted){
+                        result.entryRefusal=BdwRenderRefusalGtNotStarted;result.entryDetail=r.refusal;}
                     return gtReady;
                 }
                 bool gpuPatLease(){return patActive && owned();}
@@ -890,6 +904,13 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         return scratchResult->complete;
     };
     result=BdwDellForcewakeCriticalWithWork(io,khz,work,scopeCheck || scratchResult || initResult || patResult || copyResult || rcsReset || gtInit || renderResult,otherEngines,patRequested,tlbRequested,resetRequested);
+    // A render callback that refused before its first device write (entry
+    // checks, or GT init NotStarted with no writes) leaves nothing to recover;
+    // the worker reruns the still-armed job. Anything later stays uncertain.
+    if(renderResult && result.sequence.workAttempted && !result.sequence.workComplete &&
+       renderResult->entryRefusal!=BdwRenderRefusalNone && !renderResult->attempted && !renderResult->gtWrites &&
+       !renderResult->transaction.patReady && !renderResult->transaction.resetAttempted && !renderResult->pollYieldFailed)
+        result.workRefusedUntouched=true;
     VmmKernelPtCriticalExit(irq);
     claim.finish(result);
 }

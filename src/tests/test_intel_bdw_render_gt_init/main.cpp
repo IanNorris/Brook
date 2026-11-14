@@ -45,7 +45,14 @@ int main(){
     {Fake io;io.safe=false;const auto result=BdwInitializeRenderGt(io);
      assert(result.status==BdwRenderGtInitStatus::NotStarted && !result.writes && !io.writes);}
     {Fake io;io.unstable=true;const auto result=BdwInitializeRenderGt(io);
-     assert(result.status==BdwRenderGtInitStatus::NotStarted && !io.writes);}
+     assert(result.status==BdwRenderGtInitStatus::NotStarted && !io.writes);
+     assert(result.refusal==2 && !result.writes);} // first register read twice differed
+    {Fake io;io.safe=false;assert(BdwInitializeRenderGt(io).refusal==1);}
+    {Fake io;io.regs[3]=0xffffffffu;const auto r=BdwInitializeRenderGt(io);
+     assert(r.status==BdwRenderGtInitStatus::NotStarted && r.refusal==5 && !io.writes);}
+    {Fake io;io.l3=0xffffffffu;const auto r=BdwInitializeRenderGt(io);
+     assert(r.status==BdwRenderGtInitStatus::NotStarted && r.refusal==8 && !io.writes);}
+    {Fake io;const auto r=BdwInitializeRenderGt(io);assert(r.status==BdwRenderGtInitStatus::Applied && r.refusal==0);}
     {Fake io;io.failWrite=6;const auto result=BdwInitializeRenderGt(io);
      assert(result.status==BdwRenderGtInitStatus::Uncertain && result.dopRestoreAttempted && result.dopRestored);
      assert(!io.mcrWrites && !io.delays && io.regs[5]==1);}

@@ -19,6 +19,13 @@ constexpr uint64_t BdwResetPage=0xf6009000ull;
 struct BdwForcewakeAdapterResult {
     bool aliases=false,clock=false,clearDelivered=false;
     BdwForcewakeResult sequence{};
+    // Why the adapter stopped before writing the request bit
+    // (BdwForcewakeRefusal in intel_bdw_render_refusal.h), with the page
+    // index for evidence refusals.
+    uint8_t refusal=0,refusalDetail=0;
+    // The callback ran but refused before any device write (its caller
+    // proves this); the claim is then not left uncertain.
+    bool workRefusedUntouched=false;
 };
 class BdwForcewakeClaim {
     uint32_t state_=0; // available, held, uncertain
@@ -26,33 +33,35 @@ public:
     BdwForcewakeClaim()=default;BdwForcewakeClaim(const BdwForcewakeClaim&)=delete;
     BdwForcewakeClaim& operator=(const BdwForcewakeClaim&)=delete;
     bool acquire(){uint32_t expected=0;return __atomic_compare_exchange_n(&state_,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);}
+    uint32_t state()const{return __atomic_load_n(&state_,__ATOMIC_ACQUIRE);}
     void finish(const BdwForcewakeAdapterResult& r){
         const bool clean=(!r.sequence.requested || (r.clearDelivered && r.sequence.released)) &&
             (!r.sequence.tlbAttempted || r.sequence.tlbComplete) &&
             (!r.sequence.resetAttempted || r.sequence.resetComplete) &&
-            (!r.sequence.workAttempted || r.sequence.workComplete);
+            (!r.sequence.workAttempted || r.sequence.workComplete || r.workRefusedUntouched);
         uint32_t held=1;__atomic_compare_exchange_n(&state_,&held,clean?0u:2u,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
     }
 };
 template<class Backend,class Work> BdwForcewakeAdapterResult BdwDellForcewakeCriticalWithWork(Backend& b,uint32_t khz,Work& work,bool workRequested,
         bool otherEngines=false,bool patRequested=false,bool tlbRequested=false,bool resetRequested=false) {
     BdwForcewakeAdapterResult result{};
+    auto refuse=[&result](uint8_t code,uint8_t detail=0){result.refusal=code;result.refusalDetail=detail;return result;};
     if(!b.owned() || !khz || khz>20000000 || ((tlbRequested || resetRequested) && (!otherEngines || !patRequested)) ||
-       (tlbRequested && resetRequested))return result;
-    for(auto page:BdwForcewakePages){DellI2cCriticalEvidence e{};
-        if(!b.evidence(page,e) || !BdwGttEvidenceValid(e))return result;}
-    if(otherEngines)for(auto page:BdwOtherEnginePages){DellI2cCriticalEvidence e{};
-        if(!b.evidence(page,e) || !BdwGttEvidenceValid(e))return result;}
+       (tlbRequested && resetRequested))return refuse(3);
+    {uint8_t i=0;for(auto page:BdwForcewakePages){DellI2cCriticalEvidence e{};
+        if(!b.evidence(page,e) || !BdwGttEvidenceValid(e))return refuse(4,i);++i;}}
+    if(otherEngines){uint8_t i=0;for(auto page:BdwOtherEnginePages){DellI2cCriticalEvidence e{};
+        if(!b.evidence(page,e) || !BdwGttEvidenceValid(e))return refuse(5,i);++i;}}
     if(patRequested){DellI2cCriticalEvidence e{};
-        if(!b.evidence(BdwPrivatePatPage,e) || !BdwGttEvidenceValid(e))return result;}
+        if(!b.evidence(BdwPrivatePatPage,e) || !BdwGttEvidenceValid(e))return refuse(6);}
     if(resetRequested){DellI2cCriticalEvidence e{};
-        if(!b.evidence(BdwResetPage,e) || !BdwGttEvidenceValid(e))return result;}
+        if(!b.evidence(BdwResetPage,e) || !BdwGttEvidenceValid(e))return refuse(7);}
     result.aliases=true;
-    uint64_t origin=0,now=0;if(!b.tsc(origin))return result;
+    uint64_t origin=0,now=0;if(!b.tsc(origin))return refuse(8);
     bool advancing=false;
-    for(unsigned i=0;i<100000;++i){if(!b.tsc(now) || now<origin)return result;
+    for(unsigned i=0;i<100000;++i){if(!b.tsc(now) || now<origin)return refuse(8);
         if(now>origin){advancing=true;break;}b.relax();}
-    if(!advancing)return result;
+    if(!advancing)return refuse(9);
     result.clock=true;
     struct Io {
         Backend& b;uint32_t khz;uint64_t origin;bool& clearDelivered;bool otherEngines,patRequested;
