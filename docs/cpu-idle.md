@@ -44,3 +44,24 @@ On one boot, with the yquake demo and zero-copy wt:
    - no new HDA later gaps.
 4. **If audio gaps or frame-pacing tails rise,** try `cpu idle state c1e` (exit about 10 µs) and compare.
 5. **Back out** with `cpu idle mwait off` or a reboot; nothing persists.
+
+## Governor (`cpu idle state auto`)
+
+**Why it's needed:** the gen 394 A/B showed fixed C6 saves about 30% of idle package power (4.67 → 3.22 W) but adds about 3 ms to yquake's p50 (C6 exit latency on the busy GPU-worker and renderer paths).
+
+**How it chooses:** per CPU, the last 8 idle intervals (TSC-timed) predict the next one conservatively, using the second-shortest of the window:
+- C6 at 400 µs or more;
+- C3 at 100 µs or more;
+- C1E otherwise, and also on a fresh CPU with fewer than two samples.
+
+**Latency hold:** the GPU submission worker calls `CpuIdleLatencyHint(4000)` each time it yields while a job is in flight, so that CPU stays at C1E for 4 ms after GPU activity. A busy CPU stays shallow, and a quiet one converges to C6.
+
+**Status per CPU:** auto selection counts, holds, the last prediction, and hits / too_deep / too_shallow with `hit_pct`:
+- too_deep: woke before the state's target residency;
+- too_shallow: slept long enough for a deeper state, not counting holds.
+
+**Package residency:** `pkg_pct` gives package residency as a percentage of the TSC interval since the previous status call.
+
+**Boot defaults:**
+- EPB becomes 6 when the firmware left 0 or 15 (Linux behaviour). The Dell's firmware value is 0, so this now applies at boot. Status shows `epb_firmware` and `epb_boot_applied`.
+- The idle state stays `hlt` by default until the governor has been A/B tested on the Dell.

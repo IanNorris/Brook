@@ -91,4 +91,70 @@ inline int32_t CpuEpbBootTarget(uint64_t current) {
     return (v == 0 || v == 15) ? 6 : -1;
 }
 
+
+// ---------------------------------------------------------------------------
+// Menu-style governor (`cpu idle state auto`). Per CPU it keeps the last
+// CpuIdleHistoryLen idle intervals and predicts the next one conservatively
+// (the second-shortest of the window), so a CPU that is waking often under
+// load stays shallow while a quiet CPU drops to C6. A latency hold (set by
+// latency-critical kernel paths, e.g. the GPU submission worker while a job
+// is in flight) forces C1E regardless of the prediction.
+// ---------------------------------------------------------------------------
+constexpr uint32_t CpuIdleHistoryLen = 8;
+
+struct CpuIdleGovernorConfig {
+    uint32_t c3TargetUs = 100;   // C3 exit ~33 us on Broadwell; worth it above ~100 us
+    uint32_t c6TargetUs = 400;   // C6 exit ~133 us; target residency ~3x the exit latency
+};
+
+struct CpuIdleHistory {
+    uint32_t us[CpuIdleHistoryLen] = {};
+    uint32_t count = 0, pos = 0;
+};
+
+inline void CpuIdleHistoryPush(CpuIdleHistory& h, uint32_t us) {
+    h.us[h.pos] = us;
+    h.pos = (h.pos + 1) % CpuIdleHistoryLen;
+    if (h.count < CpuIdleHistoryLen) ++h.count;
+}
+
+// Second-shortest interval of a full window (shortest when only 2-7 samples);
+// 0 until two samples exist, which keeps a fresh CPU shallow.
+inline uint32_t CpuIdlePredictUs(const CpuIdleHistory& h) {
+    if (h.count < 2) return 0;
+    uint32_t a = 0xffffffffu, b = 0xffffffffu;
+    for (uint32_t i = 0; i < h.count; ++i) {
+        const uint32_t v = h.us[i];
+        if (v < a) { b = a; a = v; } else if (v < b) b = v;
+    }
+    return h.count < CpuIdleHistoryLen ? a : b;
+}
+
+inline CpuIdleState CpuIdleGovern(uint32_t predictedUs, bool latencyHold, const CpuIdleGovernorConfig& cfg = {}) {
+    if (latencyHold) return CpuIdleState::C1E;
+    if (predictedUs >= cfg.c6TargetUs) return CpuIdleState::C6;
+    if (predictedUs >= cfg.c3TargetUs) return CpuIdleState::C3;
+    return CpuIdleState::C1E;
+}
+
+inline uint32_t CpuIdleTargetUs(CpuIdleState s, const CpuIdleGovernorConfig& cfg = {}) {
+    return s == CpuIdleState::C6 ? cfg.c6TargetUs : s == CpuIdleState::C3 ? cfg.c3TargetUs : 0u;
+}
+
+enum class CpuIdleOutcome : uint8_t { Hit, TooDeep, TooShallow };
+
+// Was the state chosen for an interval right in hindsight? Too deep: the CPU
+// woke before the state's target residency. Too shallow: it slept long enough
+// for a deeper available state (ignoring latency holds, which are deliberate).
+inline CpuIdleOutcome CpuIdleJudge(CpuIdleState chosen, uint32_t actualUs, bool held,
+                                   CpuIdleState deepest, const CpuIdleGovernorConfig& cfg = {}) {
+    if (actualUs < CpuIdleTargetUs(chosen, cfg)) return CpuIdleOutcome::TooDeep;
+    if (!held) {
+        const CpuIdleState ideal = CpuIdleGovern(actualUs, false, cfg);
+        const CpuIdleState capped = int(ideal) > int(deepest) ? deepest : ideal;
+        if (int(capped) > int(chosen)) return CpuIdleOutcome::TooShallow;
+    }
+    return CpuIdleOutcome::Hit;
+}
+
 } // namespace brook

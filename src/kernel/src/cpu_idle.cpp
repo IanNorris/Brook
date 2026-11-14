@@ -11,6 +11,8 @@
 // The invariant TSC keeps counting in every C-state used here.
 #include "cpu_idle.h"
 #include "cpu.h"
+#include "smp.h"
+#include "tsc_clock.h"
 
 namespace brook {
 namespace {
@@ -19,6 +21,7 @@ struct alignas(64) MonitorLine { volatile uint64_t word; uint8_t pad[56]; };
 
 struct Platform {
     bool decided = false, bareIntel = false, residency = false, epb = false;
+    int32_t epbFirmware = -1;
     CpuIdleCaps caps;
 };
 
@@ -38,6 +41,19 @@ volatile uint64_t g_epbGen = 0;
 volatile uint32_t g_epbValue = 0;
 volatile int32_t g_epbTarget = -1;
 volatile uint64_t g_sampleGen = 0;
+volatile bool g_auto = false;
+volatile int64_t g_autoChoice[uint32_t(CpuIdleState::Count)] = {-1, -1, -1, -1, -1};
+volatile uint32_t g_autoDeepest = 0;
+volatile uint32_t g_khz = 0;
+bool g_epbBootApplied = false;
+uint64_t g_prevTsc = 0, g_prevPkg[4] = {};
+
+int64_t Pack(const CpuIdleChoice& c) { return c.hint < 0 ? -1 : int64_t((uint64_t(c.ecx) << 32) | uint32_t(c.hint)); }
+uint32_t Khz() {
+    uint32_t k = __atomic_load_n(&g_khz, __ATOMIC_RELAXED);
+    if (!k) { k = TscClockReadStatus().khz; if (k) __atomic_store_n(&g_khz, k, __ATOMIC_RELAXED); }
+    return k;
+}
 
 const Platform& Plat() {
     if (__atomic_load_n(&g_platform.decided, __ATOMIC_ACQUIRE)) return g_platform;
@@ -69,6 +85,14 @@ const Platform& Plat() {
         }
         // Core/package residency MSRs: Broadwell client (0x3d U/Y, 0x47 H).
         p.residency = p.bareIntel && (model == 0x3d || model == 0x47);
+        if (p.bareIntel && p.epb) {
+            p.epbFirmware = int32_t(ReadMsr(0x1b0) & 0xfu);
+            // Linux behaviour: firmware 0 (performance) or 15 becomes 6 (normal).
+            const int32_t target = CpuEpbBootTarget(uint64_t(p.epbFirmware));
+            if (target >= 0) {
+                g_epbValue = uint32_t(target); g_epbTarget = target; g_epbGen = 1; g_epbBootApplied = true;
+            }
+        }
     }
     g_platform = p;
     __atomic_store_n(&g_platform.decided, true, __ATOMIC_RELEASE);
@@ -98,24 +122,55 @@ void CpuIdleEnter(uint32_t cpu) {
             pc->sampleGen = sg;
         }
     }
-    const int64_t choice = __atomic_load_n(&g_choice, __ATOMIC_ACQUIRE);
+    int64_t choice = __atomic_load_n(&g_choice, __ATOMIC_ACQUIRE);
+    uint32_t state = __atomic_load_n(&g_requested, __ATOMIC_RELAXED);
+    const bool govern = pc && __atomic_load_n(&g_auto, __ATOMIC_ACQUIRE);
+    bool held = false;
     const uint64_t t0 = Rdtsc();
+    if (govern) {
+        held = t0 < pc->holdUntilTsc;
+        const uint32_t predicted = CpuIdlePredictUs(pc->history);
+        pc->lastPredictUs = predicted;
+        uint32_t want = uint32_t(CpuIdleGovern(predicted, held));
+        const uint32_t deepest = __atomic_load_n(&g_autoDeepest, __ATOMIC_RELAXED);
+        if (want > deepest) want = deepest;
+        // Step down to the deepest pre-validated choice at or below `want`.
+        while (want > 0 && __atomic_load_n(&g_autoChoice[want], __ATOMIC_RELAXED) < 0) --want;
+        state = want;
+        choice = want ? __atomic_load_n(&g_autoChoice[want], __ATOMIC_RELAXED) : -1;
+        pc->autoSelected[state]++;
+        if (held) pc->holds++;
+    }
     if (choice < 0 || !pc) {
         __asm__ volatile("sti\n\thlt" ::: "memory");
         if (pc) pc->entries[uint32_t(CpuIdleState::Hlt)]++;
+        if (govern) state = uint32_t(CpuIdleState::Hlt);
     } else {
         const uint32_t hint = uint32_t(choice & 0xffffffffu);
         const uint32_t ecx = uint32_t(uint64_t(choice) >> 32);
         __asm__ volatile("cli" ::: "memory");
         __asm__ volatile("monitor" :: "a"(&g_monitor[cpu].word), "c"(0u), "d"(0u) : "memory");
         __asm__ volatile("sti\n\tmwait" :: "a"(hint), "c"(ecx) : "memory");
-        const uint32_t state = __atomic_load_n(&g_requested, __ATOMIC_RELAXED);
         pc->entries[state < uint32_t(CpuIdleState::Count) ? state : 0]++;
     }
-    if (pc) pc->idleTsc += Rdtsc() - t0;
+    if (!pc) return;
+    const uint64_t dt = Rdtsc() - t0;
+    pc->idleTsc += dt;
+    if (govern) {
+        const uint32_t khz = Khz();
+        const uint64_t us64 = khz ? dt * 1000 / khz : 0;
+        const uint32_t us = us64 > 0xffffffffull ? 0xffffffffu : uint32_t(us64);
+        CpuIdleHistoryPush(pc->history, us);
+        const auto outcome = CpuIdleJudge(CpuIdleState(state), us, held,
+                                          CpuIdleState(__atomic_load_n(&g_autoDeepest, __ATOMIC_RELAXED)));
+        if (outcome == CpuIdleOutcome::Hit) pc->hits++;
+        else if (outcome == CpuIdleOutcome::TooDeep) pc->tooDeep++;
+        else pc->tooShallow++;
+    }
 }
 
 CpuIdleChoice CpuIdleRequest(CpuIdleState state) {
+    __atomic_store_n(&g_auto, false, __ATOMIC_RELEASE);
     const auto choice = CpuIdleSelect(Plat().caps, state);
     __atomic_store_n(&g_requested, uint32_t(choice.state), __ATOMIC_RELAXED);
     const int64_t packed = choice.hint < 0 ? -1 : int64_t((uint64_t(choice.ecx) << 32) | uint32_t(choice.hint));
@@ -123,6 +178,32 @@ CpuIdleChoice CpuIdleRequest(CpuIdleState state) {
     // Wake idle CPUs parked in MWAIT so they pick up the new hint promptly.
     for (uint32_t i = 0; i < CpuIdleMaxCpus; ++i) __atomic_add_fetch(&g_monitor[i].word, 1, __ATOMIC_RELEASE);
     return choice;
+}
+
+void CpuIdleRequestAuto() {
+    const auto& caps = Plat().caps;
+    uint32_t deepest = 0;
+    for (uint32_t i = 1; i < uint32_t(CpuIdleState::Count); ++i) {
+        const auto c = CpuIdleSelect(caps, CpuIdleState(i));
+        // Only exact (unclamped) states are offered to the governor.
+        const bool exact = c.hint >= 0 && uint32_t(c.state) == i;
+        __atomic_store_n(&g_autoChoice[i], exact ? Pack(c) : int64_t(-1), __ATOMIC_RELAXED);
+        if (exact) deepest = i;
+    }
+    // The governor never picks plain C1; C1E is its shallowest MWAIT state.
+    __atomic_store_n(&g_autoDeepest, deepest, __ATOMIC_RELAXED);
+    Khz();
+    __atomic_store_n(&g_auto, deepest > 0, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < CpuIdleMaxCpus; ++i) __atomic_add_fetch(&g_monitor[i].word, 1, __ATOMIC_RELEASE);
+}
+
+void CpuIdleLatencyHint(uint32_t us) {
+    if (!__atomic_load_n(&g_auto, __ATOMIC_RELAXED)) return;
+    const uint32_t cpu = SmpCurrentCpuIndex();
+    const uint32_t khz = Khz();
+    if (cpu >= CpuIdleMaxCpus || !khz) return;
+    const uint64_t until = Rdtsc() + uint64_t(us) * khz / 1000;
+    if (until > g_cpu[cpu].holdUntilTsc) g_cpu[cpu].holdUntilTsc = until;
 }
 
 bool CpuIdleRequestEpb(uint32_t value) {
@@ -150,6 +231,9 @@ void CpuIdleReadStatus(CpuIdleStatus& out) {
     out.choice = CpuIdleSelect(plat.caps, out.requested);
     if (__atomic_load_n(&g_choice, __ATOMIC_ACQUIRE) < 0) out.choice = CpuIdleChoice{};
     out.epbTarget = __atomic_load_n(&g_epbTarget, __ATOMIC_RELAXED);
+    out.epbFirmware = plat.epbFirmware;
+    out.epbBootApplied = g_epbBootApplied;
+    out.autoMode = __atomic_load_n(&g_auto, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < CpuIdleMaxCpus; ++i) {
         out.cpus[i] = g_cpu[i];
         if (g_cpu[i].seen) out.cpuCount = i + 1;
@@ -160,13 +244,18 @@ void CpuIdleReadStatus(CpuIdleStatus& out) {
         out.pkgCstConfig = ReadMsr(0xe2);
         out.turboRatioLimit = ReadMsr(0x1ad);
     }
+    out.prevTsc = g_prevTsc; out.prevPkgC2 = g_prevPkg[0]; out.prevPkgC3 = g_prevPkg[1];
+    out.prevPkgC6 = g_prevPkg[2]; out.prevPkgC7 = g_prevPkg[3];
+    g_prevTsc = out.tsc; g_prevPkg[0] = out.pkgC2; g_prevPkg[1] = out.pkgC3; g_prevPkg[2] = out.pkgC6; g_prevPkg[3] = out.pkgC7;
     if (plat.bareIntel) out.miscEnable = ReadMsr(0x1a0);
 }
 
 void CpuIdleResetCounters() {
     for (uint32_t i = 0; i < CpuIdleMaxCpus; ++i) {
         for (auto& e : g_cpu[i].entries) e = 0;
+        for (auto& e : g_cpu[i].autoSelected) e = 0;
         g_cpu[i].idleTsc = 0;
+        g_cpu[i].hits = g_cpu[i].tooDeep = g_cpu[i].tooShallow = g_cpu[i].holds = 0;
     }
 }
 

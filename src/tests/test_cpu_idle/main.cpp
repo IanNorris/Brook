@@ -61,6 +61,70 @@ int main() {
     assert(CpuEpbBootTarget(0) == 6 && CpuEpbBootTarget(15) == 6);
     assert(CpuEpbBootTarget(6) == -1 && CpuEpbBootTarget(4) == -1 && CpuEpbBootTarget(0x70) == 6);
 
+
+    // ---- Governor ----
+    CpuIdleGovernorConfig cfg{};
+    CpuIdleHistory hh{};
+    assert(CpuIdlePredictUs(hh) == 0);                       // fresh CPU: shallow
+    assert(CpuIdleGovern(CpuIdlePredictUs(hh), false) == CpuIdleState::C1E);
+    CpuIdleHistoryPush(hh, 900);
+    assert(CpuIdlePredictUs(hh) == 0);                       // one sample is not enough
+    CpuIdleHistoryPush(hh, 950);
+    assert(CpuIdlePredictUs(hh) == 900);                     // partial window: shortest
+    // A quiet CPU (ticks every ~1 ms) goes to C6.
+    for (int i = 0; i < 8; ++i) CpuIdleHistoryPush(hh, 980);
+    assert(CpuIdlePredictUs(hh) == 980 && CpuIdleGovern(980, false) == CpuIdleState::C6);
+    // One short wake in the window does not change the prediction (second-shortest)...
+    CpuIdleHistoryPush(hh, 30);
+    assert(CpuIdlePredictUs(hh) == 980);
+    // ...two do: a busy CPU stays shallow.
+    CpuIdleHistoryPush(hh, 40);
+    assert(CpuIdlePredictUs(hh) == 40 && CpuIdleGovern(40, false) == CpuIdleState::C1E);
+    // Medium intervals pick C3.
+    CpuIdleHistory mh{};
+    for (int i = 0; i < 8; ++i) CpuIdleHistoryPush(mh, 200);
+    assert(CpuIdleGovern(CpuIdlePredictUs(mh), false) == CpuIdleState::C3);
+    // Thresholds are inclusive at the target residency.
+    assert(CpuIdleGovern(cfg.c6TargetUs, false) == CpuIdleState::C6);
+    assert(CpuIdleGovern(cfg.c6TargetUs - 1, false) == CpuIdleState::C3);
+    assert(CpuIdleGovern(cfg.c3TargetUs - 1, false) == CpuIdleState::C1E);
+    // A latency hold always wins.
+    assert(CpuIdleGovern(5000, true) == CpuIdleState::C1E);
+    // The window really is a ring of the last 8 samples.
+    CpuIdleHistory rh{};
+    for (int i = 0; i < 8; ++i) CpuIdleHistoryPush(rh, 10);
+    for (int i = 0; i < 7; ++i) CpuIdleHistoryPush(rh, 700);
+    assert(CpuIdlePredictUs(rh) == 700);   // [10, 700 x7]: second-shortest
+    CpuIdleHistoryPush(rh, 700);
+    assert(CpuIdlePredictUs(rh) == 700);
+
+    // ---- Judging ----
+    assert(CpuIdleJudge(CpuIdleState::C6, 100, false, CpuIdleState::C6) == CpuIdleOutcome::TooDeep);
+    assert(CpuIdleJudge(CpuIdleState::C6, 900, false, CpuIdleState::C6) == CpuIdleOutcome::Hit);
+    assert(CpuIdleJudge(CpuIdleState::C1E, 900, false, CpuIdleState::C6) == CpuIdleOutcome::TooShallow);
+    assert(CpuIdleJudge(CpuIdleState::C1E, 900, true, CpuIdleState::C6) == CpuIdleOutcome::Hit);   // hold is deliberate
+    assert(CpuIdleJudge(CpuIdleState::C1E, 50, false, CpuIdleState::C6) == CpuIdleOutcome::Hit);
+    assert(CpuIdleJudge(CpuIdleState::C3, 900, false, CpuIdleState::C3) == CpuIdleOutcome::Hit);    // capped by deepest
+    assert(CpuIdleJudge(CpuIdleState::C3, 50, false, CpuIdleState::C6) == CpuIdleOutcome::TooDeep);
+
+    // Simulated load: alternating short GPU-poll wakes and long ticks keeps
+    // the conservative predictor shallow; pure idle converges to C6.
+    CpuIdleHistory load{};
+    int deep = 0;
+    for (int i = 0; i < 200; ++i) {
+        const CpuIdleState s = CpuIdleGovern(CpuIdlePredictUs(load), false);
+        if (s == CpuIdleState::C6) ++deep;
+        CpuIdleHistoryPush(load, (i % 3) ? 80 : 1000);
+    }
+    assert(deep == 0);
+    CpuIdleHistory quiet{};
+    int quietDeep = 0;
+    for (int i = 0; i < 200; ++i) {
+        if (CpuIdleGovern(CpuIdlePredictUs(quiet), false) == CpuIdleState::C6) ++quietDeep;
+        CpuIdleHistoryPush(quiet, 990);
+    }
+    assert(quietDeep >= 198);
+
     for (uint32_t i = 0; i < uint32_t(CpuIdleState::Count); ++i) assert(CpuIdleStateName(CpuIdleState(i))[0] != '?');
     puts("test_cpu_idle: ok");
     return 0;
