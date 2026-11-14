@@ -62,7 +62,7 @@ int main() {
 
     // New loader, TSC-only firmware time, wait ran.
     BootTimingInputs in{};
-    in.protocolVersion=6;in.tscKhz=khz;
+    in.protocolVersion=5;in.loaderTimingPresent=true;in.tscKhz=khz;
     in.loader.flags=BootTimingValid|BootTimingWaitRan;in.loader.waitConfiguredMs=500;
     in.loader.loaderEntryTsc=T(3200);in.loader.waitStartTsc=T(3300);in.loader.waitEndTsc=T(3800);
     in.loader.exitBootServicesTsc=T(3990);in.loader.kernelJumpTsc=T(3999);
@@ -83,7 +83,7 @@ int main() {
     char log[160];
     static_assert(sizeof(BootTiming)==56);
     BootTimingLogLine(log,sizeof(log),s,in);
-    assert(!strcmp(log,"BOOT_TIMING firmware_ms=3200 src=tsc wait_ms=500 loader_ms=300 kernel_ms=4100 total_ms=8100 tsc_khz=2000000 proto=6"));
+    assert(!strcmp(log,"BOOT_TIMING firmware_ms=3200 src=tsc wait_ms=500 loader_ms=300 kernel_ms=4100 total_ms=8100 tsc_khz=2000000 proto=5 ext=1"));
     BootTimingDetailLine(log,sizeof(log),s,in);
     assert(!strcmp(log,"BOOT_TIMING_DETAIL tsc_fw_ms=3200 fpdt_fw_ms=na fpdt_reset_ms=na fpdt_ebs_ms=na flags=0x3 wait_cfg_ms=500 wait_keys=0 last_key=0x00000000"));
 
@@ -108,7 +108,28 @@ int main() {
     BootTimingHeadline(row,sizeof(row),s);
     assert(!strcmp(row,"Desktop ready in 4.00 s from kernel start"));
 
-    // Old (v5) loader: no stamps read even if memory past the struct is garbage.
+    // Handoff marker: the loader stays at version 5 and announces the timing
+    // block through `extensions`; an older loader zero-initialises it.
+    static_assert(BootProtocolVersion==5, "existing kernels accept only version 5 handoffs");
+    static_assert(BootProtocolV5Size==__builtin_offsetof(BootProtocol,timing));
+    {
+        BootProtocol fresh{};fresh.magic=BootProtocolMagic;fresh.version=BootProtocolVersion;
+        fresh.timing.flags=BootTimingValid;fresh.timing.loaderEntryTsc=123; // stale stack bytes
+        assert(!BootHasTiming(&fresh));            // older loader: marker 0
+        fresh.extensions=BootExtensionTimingMagic;
+        assert(BootHasTiming(&fresh));             // new loader
+        fresh.version=4;assert(!BootHasTiming(&fresh));
+        assert(!BootHasTiming(nullptr));
+    }
+    // Inputs with the marker absent but a non-zero `loader` block (it is only
+    // copied when present, but the computation must not trust it either way).
+    {
+        BootTimingInputs noMarker=in;noMarker.loaderTimingPresent=false;
+        s=BootTimingCompute(noMarker);
+        assert(!s.loaderStamps && !s.firmware.valid && !s.wait.valid && !s.loader.valid);
+    }
+
+    // Older loader (no extension): no stamps read even if memory past the struct is garbage.
     BootTimingInputs old{};
     old.protocolVersion=5;old.tscKhz=khz;old.kernelEntryTsc=T(4000);old.desktopReadyTsc=T(9000);
     s=BootTimingCompute(old);
@@ -118,7 +139,7 @@ int main() {
     BootTimingRow(row,sizeof(row),s,true);
     assert(!strcmp(row,"Firmware n/a | Menu n/a | Kernel 5.0 s"));
     BootTimingLogLine(log,sizeof(log),s,old);
-    assert(!strcmp(log,"BOOT_TIMING firmware_ms=na src=none wait_ms=na loader_ms=na kernel_ms=5000 total_ms=na tsc_khz=2000000 proto=5"));
+    assert(!strcmp(log,"BOOT_TIMING firmware_ms=na src=none wait_ms=na loader_ms=na kernel_ms=5000 total_ms=na tsc_khz=2000000 proto=5 ext=0"));
 
     // Unknown TSC rate: kernel falls back to the kernel clock.
     old.tscKhz=0;old.fallbackKernelValid=true;old.fallbackKernelMs=3456;

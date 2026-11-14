@@ -92,6 +92,12 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**M3 copy-based flip on the Dell (gen 370, `dell-m3-flip-20261114`, `work/m3-flip` `f103889e`):**
+- The GGTT takeover fix (`8c146e19`) worked: probe passed and `gpu flip arm` went active (3 kernel surfaces, 5,753 inherited PTEs taken over, 32 ms setup, 0 GOP returns, still active after both arms).
+- **It is slower.** 2 buffers: displayed mean 39.5 ms (p50 41.5, p99 56), present 16.3 ms (blit 15.5) against 33.2 ms and 10.9 ms on gen 369. 8 buffers: 45.8 ms mean.
+- **Cause (by design):** each present still BCS-copies the renderer output, plus repair rectangles, into a kernel scanout buffer before writing DSPASURF. The copy got bigger rather than going away.
+- **Decision:** leave flip runtime-off (`gpu flip off`); don't tune it. The next structural step is **zero-copy scanout**: DSPASURF points at renderer output images allocated and imported so they can be scanned out, removing the per-present copy and its BCS overhead. Evidence: `/data/Programming/Brook/display-perf/build/m3-flip-gen370/`.
+
 **Pipelining default (gen 369, `dell-pipeline-default-20261114`, boot default):**
 - **2 buffers:** displayed mean 33.2 ms (≈30 fps real time), p50 30.0, p99 49.7; swaps 31.7.
 - **8 buffers:** 37.4 ms mean, p99 83.5.
@@ -178,8 +184,8 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
   - **Firefox YouTube:** video and audio both run FAST, with no obvious audible stutter; ~3–4 fps, frame-time p80 ~174 ms.
   - **Suspicion:** the playback clock or position reported to apps (GETOPTR/GETODELAY or the bridge) is wrong; see `docs/audio-clock.md`. Being investigated in `work/dell-audio`.
   - **Acceptance check to add:** fullscreen YouTube with no audio stutter, judged from renderer frame pacing plus all-zero packets in mixer output.
-- **Boot-menu wait:** key input during the bootloader wait isn't recognised. The default wait is being reduced to 0.5 s in `work/boot-timing`.
 - **Volume persistence:** taskbar volume changes apply live but are only saved by Settings' Apply. Decide whether taskbar changes should persist automatically.
+- **Loader F5 wait ignores input on the Dell:** works in QEMU/OVMF. Boot the timing loader (branch `work/boot-timing`), press keys during the wait and read `BOOT_TIMING_DETAIL wait_keys=`; zero suggests ConIn isn't connected on the fast-boot path. See `src/bootloader/src/DOCS.md`.
 
 - **Automatic slot rollback in the guard:** after N consecutive desktop panics on a newly activated generation, select the previous verified slot instead of looping in recovery-only mode. Also expose a slot-select operation in the recovery-only bridge.
 - **Split `src/kernel/src/syscall.cpp`** (17k lines) by area: memory, files, process/signal, sockets, epoll/timers and Brook-specific.
