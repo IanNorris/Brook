@@ -222,6 +222,7 @@ struct BdwZeroCopyStats {
     uint64_t presents=0,armedNow=0,queued=0,replaced=0,latched=0,missedVblanks=0,uncertain=0,refusedReserve=0;
     uint64_t fallback[uint32_t(BdwZeroCopyFallback::Count_)]{};
     uint64_t latchUsSum=0,latchUsMax=0;
+    uint64_t flushes=0,fullFlushes=0,flushBytes=0,flushUsSum=0,flushUsMax=0; // "flush" cache mode
     uint64_t latchFrames[4]{}; // 1, 2, 3, >3
     void Latch(uint32_t frames,uint64_t us){
         ++latched;latchUsSum+=us;if(us>latchUsMax)latchUsMax=us;

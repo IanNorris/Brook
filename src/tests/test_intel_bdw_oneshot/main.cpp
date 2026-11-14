@@ -201,6 +201,17 @@ int main(){
       BdwPatMmio<MmioOwner> scanout(owner,regs,true);BdwPatLease lease;
       assert(lease.Establish(scanout,0x11000013dull,true) && regs[0xe0/4]==0x00030307);
       assert(lease.Release(scanout) && regs[0xe0/4]==0x03030303 && regs[0xe4/4]==0x03030303); }
+    { // Zero-copy "wt" mode: slot 3 leased write-through (2) instead of UC (0).
+      uint32_t regs[1024]{};regs[0xe0/4]=regs[0xe4/4]=0x03030303;MmioOwner owner;
+      BdwPatMmio<MmioOwner> wt(owner,regs,true,2);BdwPatLease lease;
+      assert(lease.Establish(wt,0x11000013dull,true,2) && regs[0xe0/4]==0x02030307);
+      assert(lease.Release(wt) && regs[0xe0/4]==0x03030303);
+      BdwPatMmio<MmioOwner> mismatch(owner,regs,true,0);BdwPatLease wrong;   // Mmio authorised for UC only
+      assert(!wrong.Establish(mismatch,0x11000013dull,true,2) && regs[0xe0/4]==0x03030303);
+      BdwPatMmio<MmioOwner> wc(owner,regs,true,1);BdwPatLease other;         // only UC and WT are permitted
+      assert(!other.Establish(wc,0x11000013dull,true,1) && regs[0xe0/4]==0x03030303);
+      assert(BdwLegacyBcsPatCompatible(0x11000013dull,0x02030307,0x0303030b,true,2) &&
+             !BdwLegacyBcsPatCompatible(0x11000013dull,0x02030307,0x0303030b,true,0)); }
     { PatIo io;BdwPatLease lease;assert(lease.Establish(io,0x11000013dull));
       assert(lease.State()==BdwPatLeaseState::Active && io.low==0x03030307 && io.high==0x0303030b && io.drains==1);
       assert(lease.Release(io) && lease.State()==BdwPatLeaseState::Restored && io.low==0x03030303 && io.high==0x03030303 && io.drains==2);

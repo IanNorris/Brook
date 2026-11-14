@@ -594,6 +594,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     // (inherited: WB, invisible to the non-snooping display engine).
     const bool scanoutImages=BdwExecSnapshotHasUncached(snapshot);
     run.uncachedScanout=scanoutImages && BdwZeroCopyUncachedRender();
+    run.scanoutPat=BdwZeroCopyScanoutPat();
 #endif
     VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
@@ -925,7 +926,7 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
     // Zero-copy: the source is a registered renderer image; arm DSPASURF to
     // it (or queue it) instead of copying. Runtime-gated off by default.
-    switch(BdwZeroCopyPresentSource(source)){
+    switch(BdwZeroCopyPresentSource(source,regions,count)){
     case BdwZeroCopyOutcome::Presented:
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
         ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);

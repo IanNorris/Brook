@@ -337,6 +337,11 @@ const char* zcReason="not requested";const char* zcPendingLog=nullptr;
 BdwZeroCopyStats zcStats{};BdwZeroCopyFallback zcLast=BdwZeroCopyFallback::Disarmed;
 BdwZeroCopyRefusal zcRefusal=BdwZeroCopyRefusal::None;
 BdwFlipGgttDiag zcGgtt{};uint64_t zcSetupUs=0,zcGopReturns=0;
+// Cache policy for render writes to images (runtime, "gpu zerocopy cache"):
+// flush = write-back + CLFLUSH of drawn lines before arming (default),
+// uc = PPAT slot 3 uncached for jobs writing images, wt = write-through.
+enum : uint32_t {ZcCacheFlush=0,ZcCacheUc=1,ZcCacheWt=2};
+uint32_t zcCacheMode=ZcCacheFlush;uint32_t zcFlushedOnce=0;
 
 uint32_t ZcSlotOf(const BdwGpuBuffer* b){
     if(!b)return 0;
@@ -436,7 +441,7 @@ bool ZcActivate(){
     const uint64_t f=IrqSpinLockAcquire(&lock);
     bool ok=!zcDisabled && !flipActive && zcRequested;
     if(ok){
-        zcRing=BdwZeroCopyRing{};
+        zcRing=BdwZeroCopyRing{};zcFlushedOnce=0;
         ok=zcRing.Configure(surfaces,identities,zcCount);
         if(ok){
             // Publish before the first DSPASURF write: the per-job display
@@ -757,7 +762,44 @@ void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer){
     if(slot && zcActive)zcRing.AbandonWrite(slot);
     IrqSpinLockRelease(&lock,f);
 }
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source){
+// "flush" cache mode: render writes stay write-back (fast); before an image
+// is armed, every line the renderer drew this frame (the present regions,
+// which in ring mode cover the buffer-age repair too) is CLFLUSHed so the
+// non-snooping display reads memory. CLFLUSH writes a line back from every
+// cache level, the shared LLC included, which the GT writes reach at the
+// end-of-batch render-target flush that precedes the fence. An image's
+// first present after activation is flushed in full.
+void ZcFlushLines(BdwGpuBuffer* buffer,uint64_t start,uint64_t bytes){
+    const uint64_t end=start+bytes;
+    for(uint64_t line=start&~uint64_t{63};line<end;line+=64){
+        const uint64_t page=line>>12;if(page>=SurfacePages)break;
+        const uint64_t base=BdwGpuBufferPageKernelAddress(buffer,uint32_t(page));if(!base)continue;
+        __asm__ volatile("clflush (%0)"::"r"(base+(line&4095)):"memory");
+    }
+}
+void ZcFlushForScanout(BdwGpuBuffer* buffer,uint32_t slot,const CompositorPresentRegion* regions,uint32_t count){
+    const uint64_t start=Rdtsc();uint64_t bytes=0;
+    bool full=!regions || !count;
+    {const uint64_t f=IrqSpinLockAcquire(&lock);if(slot && slot<=BdwZeroCopyMaxImages && !(zcFlushedOnce&(1u<<slot)))full=true;
+     IrqSpinLockRelease(&lock,f);}
+    if(full){ZcFlushLines(buffer,0,BdwZeroCopyImageBytes);bytes=BdwZeroCopyImageBytes;}
+    else for(uint32_t i=0;i<count;++i){const auto& r=regions[i];
+        if(!r.width || !r.height || r.x+r.width>BdwZeroCopyWidth || r.y+r.height>BdwZeroCopyHeight){
+            ZcFlushLines(buffer,0,BdwZeroCopyImageBytes);bytes=BdwZeroCopyImageBytes;break;} // unexpected geometry: be safe
+        for(uint32_t row=0;row<r.height;++row){
+            const uint64_t at=uint64_t(r.y+row)*BdwZeroCopyStride+uint64_t(r.x)*4;
+            ZcFlushLines(buffer,at,uint64_t(r.width)*4);bytes+=uint64_t(r.width)*4;
+        }
+    }
+    __asm__ volatile("mfence":::"memory");
+    const uint64_t us=tscKhz?(Rdtsc()-start)*1000/tscKhz:0;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    if(slot && slot<=BdwZeroCopyMaxImages)zcFlushedOnce|=1u<<slot;
+    ++zcStats.flushes;zcStats.flushBytes+=bytes;zcStats.flushUsSum+=us;if(us>zcStats.flushUsMax)zcStats.flushUsMax=us;
+    if(full)++zcStats.fullFlushes;
+    IrqSpinLockRelease(&lock,f);
+}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t regionCount){
     bool requested=false,active=false,disabled=false;uint32_t registered=0;
     {const uint64_t f=IrqSpinLockAcquire(&lock);ZcPollLocked();
      registered=zcCount;requested=zcRequested;active=zcActive;disabled=zcDisabled;IrqSpinLockRelease(&lock,f);}
@@ -791,6 +833,7 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source){
          if(!requested || flip)ZcFallback(BdwZeroCopyFallback::Disarmed);IrqSpinLockRelease(&lock,f);}
         if(!requested || flip || !ZcActivate())return BdwZeroCopyOutcome::Copy; // the BCS copy from the image is exact
     }
+    if(__atomic_load_n(&zcCacheMode,__ATOMIC_ACQUIRE)==ZcCacheFlush)ZcFlushForScanout(source,ZcSlotOf(source),regions,regionCount);
     const uint64_t f=IrqSpinLockAcquire(&lock);
     const uint32_t slot=ZcSlotOf(source);
     if(!zcActive || zcDisabled){IrqSpinLockRelease(&lock,f);return BdwZeroCopyOutcome::Copy;}
@@ -813,9 +856,20 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source){
     IrqSpinLockRelease(&lock,f);ZcLogPending();
     return outcome;
 }
-bool zcUncachedRender=true;uint64_t zcRenderUc=0,zcRenderWb=0;
-bool BdwZeroCopyUncachedRender(){return __atomic_load_n(&zcUncachedRender,__ATOMIC_ACQUIRE);}
-void BdwZeroCopySetUncachedRender(bool on){__atomic_store_n(&zcUncachedRender,on,__ATOMIC_RELEASE);}
+uint64_t zcRenderUc=0,zcRenderWb=0;
+bool BdwZeroCopyUncachedRender(){return __atomic_load_n(&zcCacheMode,__ATOMIC_ACQUIRE)!=ZcCacheFlush;}
+uint8_t BdwZeroCopyScanoutPat(){return __atomic_load_n(&zcCacheMode,__ATOMIC_ACQUIRE)==ZcCacheWt?2:0;}
+void BdwZeroCopySetUncachedRender(bool on){__atomic_store_n(&zcCacheMode,on?uint32_t(ZcCacheUc):uint32_t(ZcCacheFlush),__ATOMIC_RELEASE);}
+bool BdwZeroCopySetCacheMode(uint32_t mode){
+    if(mode>ZcCacheWt)return false;
+    // Images rendered under another policy may hold dirty WB lines: flush
+    // each in full at its next present.
+    const uint64_t f=IrqSpinLockAcquire(&lock);__atomic_store_n(&zcCacheMode,mode,__ATOMIC_RELEASE);zcFlushedOnce=0;IrqSpinLockRelease(&lock,f);
+    return true;
+}
+const char* BdwZeroCopyCacheModeName(){
+    switch(__atomic_load_n(&zcCacheMode,__ATOMIC_ACQUIRE)){case ZcCacheUc:return "uc";case ZcCacheWt:return "wt";default:return "flush";}
+}
 void BdwZeroCopyNoteRender(bool uncached){__atomic_add_fetch(uncached?&zcRenderUc:&zcRenderWb,1,__ATOMIC_RELAXED);}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){
     out={};out.result="inactive";
@@ -901,11 +955,14 @@ void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOutcome::Copy;}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
 bool BdwZeroCopyUncachedRender(){return false;}
+uint8_t BdwZeroCopyScanoutPat(){return 0;}
+bool BdwZeroCopySetCacheMode(uint32_t){return false;}
+const char* BdwZeroCopyCacheModeName(){return "not built";}
 void BdwZeroCopySetUncachedRender(bool){}
 void BdwZeroCopyNoteRender(bool){}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
@@ -915,11 +972,14 @@ int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOutcome::Copy;}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
 bool BdwZeroCopyUncachedRender(){return false;}
+uint8_t BdwZeroCopyScanoutPat(){return 0;}
+bool BdwZeroCopySetCacheMode(uint32_t){return false;}
+const char* BdwZeroCopyCacheModeName(){return "not built";}
 void BdwZeroCopySetUncachedRender(bool){}
 void BdwZeroCopyNoteRender(bool){}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
@@ -940,11 +1000,14 @@ void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out){out={};out.reason="
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOutcome::Copy;}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
 bool BdwZeroCopyUncachedRender(){return false;}
+uint8_t BdwZeroCopyScanoutPat(){return 0;}
+bool BdwZeroCopySetCacheMode(uint32_t){return false;}
+const char* BdwZeroCopyCacheModeName(){return "not built";}
 void BdwZeroCopySetUncachedRender(bool){}
 void BdwZeroCopyNoteRender(bool){}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}

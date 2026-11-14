@@ -155,7 +155,11 @@ static void renderer_exit_for_restart(const char *cause,long detail){
 /* Zero-copy scanout ring size (0 = off): the kernel advertises
  * BROOK_GPU_PRESENT_CAP_SCANOUT; BROOK_RENDER_SCANOUT_IMAGES=0|3|4 overrides. */
 static unsigned g_scanoutImages;
-static const char *g_failStage="none"; /* render_frame stage of the last failure, for DESKTOP_ASYNC_RETRY */
+static const char *g_failStage="none";
+/* Zero-copy active at the last pick: presents then name every region drawn
+ * into the image (own damage plus buffer-age repair), which the kernel's
+ * "flush" cache mode writes back before scanning the image out. */
+static int g_scanoutActive; /* render_frame stage of the last failure, for DESKTOP_ASYNC_RETRY */
 static uint64_t g_scanoutPicks,g_scanoutWaits,g_scanoutStarved,g_scanoutFullDraws,g_scanoutPartialDraws,g_scanoutRepairPixels;
 /* The ring is process-wide: registered once (the kernel accepts one
  * registration per boot) and used by every render context. */
@@ -209,6 +213,7 @@ static int scanout_pick(void){
         struct BrookGpuScanoutStatus status;memset(&status,0,sizeof(status));
         if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_STATUS,&status,0,0,0,0))return -1;
         const int image=desktop_scanout_ring_pick(&g_ring,status.freeMask);
+        g_scanoutActive=(status.flags&BROOK_GPU_SCANOUT_ACTIVE)!=0;
         if(image>=0){++g_scanoutPicks;return image;}
         ++g_scanoutWaits;usleep(1000);
         if(attempt==25){
@@ -780,6 +785,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                  * frame's own (aligned) changes; they were drawn too. */
                 struct DesktopDamageSet presentDamage=damage,ownAligned;
                 if(rebased && own.count && desktop_graphics_damage(&own,width,height,&ownAligned))presentDamage=ownAligned;
+                if(ringImage>=0 && g_scanoutActive)
+                    presentDamage=ringDrawPartial?ringDraw:(struct DesktopDamageSet){1,{{0,0,width,height}}};
                 if(qpartial){regionBatch.count=presentDamage.count;
                     for(uint32_t i=0;i<presentDamage.count;++i){const struct DesktopDamageRect *r=&presentDamage.rects[i];
                         regionBatch.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,

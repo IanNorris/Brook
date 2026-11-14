@@ -85,7 +85,7 @@ void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer);
 // inactive (do the normal BCS copy from it), Presented = armed or queued
 // with no copy, RepairRequired = fail the present with a software repair.
 enum class BdwZeroCopyOutcome : uint8_t {Copy,Presented,RepairRequired};
-BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source);
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t regionCount);
 struct BdwZeroCopyStatus {
     bool built,registered,requested,active,disabled;uint32_t images,freeMask,front,armed,queued;
     uint64_t owner,sequence,setupUs,gopReturns,ages[BdwZeroCopyMaxImages];uint32_t surfaces[BdwZeroCopyMaxImages];
@@ -102,6 +102,10 @@ void BdwZeroCopyDisarm();
 // Render jobs writing images lease PPAT slot 3 UC (default on). The toggle
 // exists only to A/B the coherency fix ("gpu zerocopy uc on|off").
 bool BdwZeroCopyUncachedRender();
+uint8_t BdwZeroCopyScanoutPat();
+// 0 "flush" (default), 1 "uc", 2 "wt"; false for an unknown mode.
+bool BdwZeroCopySetCacheMode(uint32_t mode);
+const char* BdwZeroCopyCacheModeName();
 void BdwZeroCopySetUncachedRender(bool on);
 void BdwZeroCopyNoteRender(bool uncached);
 // "gpu zerocopy verify": objective coherency check of the front image with

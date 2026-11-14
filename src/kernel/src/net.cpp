@@ -5753,9 +5753,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);
         else if(NetStrEq(cmd,"gpu zerocopy off")){BdwZeroCopyDisarm();note="leaving at the next present";}
         else if(NetStrEq(cmd,"gpu zerocopy uc on") || NetStrEq(cmd,"gpu zerocopy uc off")){
-            BdwZeroCopySetUncachedRender(NetStrEq(cmd,"gpu zerocopy uc on"));note="render jobs writing images lease PPAT slot 3 UC: applied";
+            BdwZeroCopySetUncachedRender(NetStrEq(cmd,"gpu zerocopy uc on"));note="cache mode set (uc on = uc, uc off = flush)";
+        }else if(NetStrEq(cmd,"gpu zerocopy cache flush") || NetStrEq(cmd,"gpu zerocopy cache uc") || NetStrEq(cmd,"gpu zerocopy cache wt")){
+            ok=BdwZeroCopySetCacheMode(NetStrEq(cmd,"gpu zerocopy cache uc")?1u:NetStrEq(cmd,"gpu zerocopy cache wt")?2u:0u);
+            note=ok?"cache mode applied; each image is flushed in full at its next present":"not built";
         }else if(!NetStrEq(cmd,"gpu zerocopy status")){
-            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|uc on|uc off\"}\n");return;
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|cache flush|cache uc|cache wt\"}\n");return;
         }
         BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
         BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
@@ -5771,6 +5774,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("sequence",z.sequence);r.text(",");r.field("setup_us",z.setupUs);
         r.text(",");r.field("gop_returns",z.gopReturns);
         r.text(",\"uncached_render\":");r.text(z.uncachedRender?"true":"false");
+        r.text(",\"cache_mode\":");r.quoted(BdwZeroCopyCacheModeName());
         r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
         r.text("],\"ages\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.ages[i]);}
@@ -5779,6 +5783,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("queued",st.queued);r.text(",");r.field("replaced",st.replaced);
         r.text(",");r.field("latched",st.latched);r.text(",");r.field("missed_vblanks",st.missedVblanks);
         r.text(",");r.field("uncertain",st.uncertain);r.text(",");r.field("refused_reserve",st.refusedReserve);
+        r.text(",");r.field("flushes",st.flushes);r.text(",");r.field("full_flushes",st.fullFlushes);
+        r.text(",");r.field("flush_bytes",st.flushBytes);
+        r.text(",\"flush_us\":[");r.number(st.flushes?st.flushUsSum/st.flushes:0);r.text(",");r.number(st.flushUsMax);r.text("]");
         r.text(",\"latch_us\":[");r.number(st.latched?st.latchUsSum/st.latched:0);r.text(",");r.number(st.latchUsMax);
         r.text("],\"latch_frames\":[");for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(st.latchFrames[i]);}
         r.text("],\"fallback\":{");

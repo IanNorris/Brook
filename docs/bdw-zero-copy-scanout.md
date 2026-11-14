@@ -165,6 +165,19 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
 - **Host test:** the GPU test (`quad_pass_host_test`, `ring_targets`) checks that no target import survives a retired frame, that cached targets accumulate, and that switching to uncached evicts them.
 - **Related, not yet fixed:** cached *source* imports (client buffers) are in every execbuffer for the same reason. The CPU-transition wait and the failed-buffer skip cover the transient case, but an unused cached import of a sticky-failed client buffer would still be refused until the cache evicts it after about 120 submissions.
 
+**Cache modes (runtime, `gpu zerocopy cache flush|uc|wt`, default `flush`).** Gen 377/378: UC render writes cost about +8 ms per compositor job (13.6 → 21.9 ms), so latches slipped to a second vblank (p50 41.5 ms). That cancelled the removed copy.
+
+| Mode | Render writes | Coherency for the non-snooping display |
+|---|---|---|
+| `flush` | write-back (PPAT slot 3 inherited WB) | before an image is armed, the kernel CLFLUSHes every line in the present regions; an image's first present after activation or a mode change is flushed in full |
+| `uc` | PPAT slot 3 leased UC for jobs writing images (previous behaviour) | memory is always current |
+| `wt` | slot 3 leased write-through (`0x02`) | memory is always current, reads stay cached |
+
+- **Why CLFLUSH suffices:** it writes a line back from every cache level, including the shared LLC. The GT's writes reach the LLC through the end-of-batch render-target flush that precedes the fence, and the present runs after the fence.
+- **Renderer:** while zero-copy is active it presents the regions it actually drew (own damage plus buffer-age repair), so the flushed set covers every written line.
+- **Stats:** `gpu zerocopy status` reports `cache_mode`, `flushes`, `full_flushes`, `flush_bytes` and `flush_us` [avg, max].
+- **Correctness check:** `gpu zerocopy verify` (pipe CRC before and after a full CLFLUSH) proves coherency in each mode.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:
