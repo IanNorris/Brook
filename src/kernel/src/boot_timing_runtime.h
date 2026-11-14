@@ -4,7 +4,7 @@
 namespace brook {
 struct BootProtocol;
 struct BootTimingSummary;
-// Copy the loader's v6 stamps (if any) and the kernel-entry TSC. Call first
+// Copy the loader's timing-extension stamps (if any) and the kernel-entry TSC. Call first
 // in KernelMainBody, while the loader's stack-resident handoff is intact.
 void BootTimingCaptureHandoff(const BootProtocol* protocol);
 // Read the ACPI FPDT boot record. Call after AcpiInit().

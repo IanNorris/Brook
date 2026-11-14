@@ -264,6 +264,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     timing.flags |= brook::BootTimingValid;
     timing.kernelJumpTsc = ReadTsc();
     bootProtocol.timing = timing;
+    bootProtocol.extensions = brook::BootExtensionTimingMagic;
 
     // --- Jump to kernel at virtual address ---
     // Use inline asm to ensure SysV calling convention:

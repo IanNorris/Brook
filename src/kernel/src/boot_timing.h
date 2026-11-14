@@ -89,7 +89,8 @@ inline bool BootParseFbpt(const uint8_t* fbpt, uint32_t available, FpdtBootRecor
 
 struct BootTimingInputs {
     uint32_t protocolVersion = 0;
-    BootTiming loader{};            // zero for a pre-v6 loader
+    bool loaderTimingPresent = false; // BootHasTiming(): extension marker set
+    BootTiming loader{};            // zero for a loader without the extension
     uint64_t kernelEntryTsc = 0, desktopReadyTsc = 0;
     uint32_t tscKhz = 0;
     FpdtBootRecord fpdt{};
@@ -103,7 +104,7 @@ struct BootTimingSummary {
     BootTimingValue firmware, wait, loader, kernel, total;
     BootTimingValue tscFirmware, fpdtFirmware; // both candidates, for the log
     const char* firmwareSource = "none";       // "fpdt", "tsc" or "none"
-    bool loaderStamps = false;                 // v6 loader stamps present
+    bool loaderStamps = false;                 // loader timing extension present
 };
 
 // TSC-since-reset is only meaningful after a clean reset; anything above ten
@@ -115,7 +116,7 @@ inline BootTimingSummary BootTimingCompute(const BootTimingInputs& in)
     BootTimingSummary s{};
     const uint32_t khz = in.tscKhz;
     const BootTiming& t = in.loader;
-    s.loaderStamps = in.protocolVersion >= 6 && (t.flags & BootTimingValid) && t.loaderEntryTsc &&
+    s.loaderStamps = in.loaderTimingPresent && (t.flags & BootTimingValid) && t.loaderEntryTsc &&
         t.loaderEntryTsc <= in.kernelEntryTsc && (!t.kernelJumpTsc || t.kernelJumpTsc <= in.kernelEntryTsc);
     uint64_t ms = 0;
     if (BootTscToMs(in.kernelEntryTsc, in.desktopReadyTsc, khz, ms) && in.kernelEntryTsc) s.kernel = {true, ms};
@@ -209,6 +210,7 @@ inline void BootTimingLogLine(char* out, size_t cap, const BootTimingSummary& s,
     t.Add(" ");t.Ms("total_ms", s.total);
     t.Add(" tsc_khz=");t.Number(in.tscKhz);
     t.Add(" proto=");t.Number(in.protocolVersion);
+    t.Add(" ext=");t.Number(in.loaderTimingPresent ? 1 : 0);
 }
 
 // Supporting detail: both firmware candidates and the FPDT exit timestamp.

@@ -6,7 +6,15 @@ namespace brook
 {
 
 constexpr uint32_t BootProtocolMagic   = 0xB007B007u;
-constexpr uint32_t BootProtocolVersion = 6u;
+// Stays 5: existing kernels (installed slots and recovery pairs) reject or
+// degrade on any other value (EFI runtime inventory and EFI power-off accept
+// only 3..5 / exactly 5). Later additions are appended and announced through
+// BootProtocol::extensions instead of a version bump.
+constexpr uint32_t BootProtocolVersion = 5u;
+
+// BootProtocol::extensions value when the appended `timing` block is valid.
+// Older loaders zero-initialise the struct, so they leave this 0.
+constexpr uint32_t BootExtensionTimingMagic = 0x54494D45u; // 'TIME'
 
 // Our own memory type enum - does NOT use UEFI types (kernel has no UEFI dependency)
 enum class MemoryType : uint32_t
@@ -134,13 +142,26 @@ struct BootProtocol
     // Version 5: fingerprint of the boot CPU's firmware MTRR registers.
     uint64_t efiRuntimeMtrrFingerprint;
     uint32_t efiRuntimeMtrrValid;
-    uint32_t efiRuntimeMtrrReserved;
-    // Version 6: raw boot-CPU TSC values taken by the loader. A version-5
-    // handoff ends above; consumers must check version before reading these.
+    // Formerly efiRuntimeMtrrReserved (always 0). Equals
+    // BootExtensionTimingMagic when `timing` below is present.
+    uint32_t extensions;
+    // Extension (extensions == BootExtensionTimingMagic): raw boot-CPU TSC
+    // values taken by the loader. An older loader's handoff ends above;
+    // consumers must check `extensions` before reading these.
     // A zero stamp was not taken. The kernel converts them with its own
     // calibrated TSC frequency; the loader performs no conversion.
     BootTiming timing;
 };
+
+// Size of the handoff every version-5 loader provides; never read past it
+// unless BootHasTiming() says the appended block exists.
+constexpr uint64_t BootProtocolV5Size = __builtin_offsetof(BootProtocol, timing);
+static_assert(BootProtocolV5Size == 152, "version-5 BootProtocol layout changed (152 bytes in every older loader)");
+
+inline bool BootHasTiming(const BootProtocol* p)
+{
+    return p && p->version >= 5 && p->extensions == BootExtensionTimingMagic;
+}
 
 constexpr bool BootEfiRuntimeCodeContains(const MemoryDescriptor* map, uint32_t count, uint64_t address)
 {

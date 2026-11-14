@@ -88,9 +88,10 @@ bool PlatformPowerIssue(bool restart){return plan.Issue(restart,{nullptr,Write8,
 #if !defined(BROOK_HOST_TEST)
 void PlatformPowerSetEfiCandidate(const BootProtocol* boot){
     const auto inventory=InspectEfiRuntime(boot);
-    if(!inventory.valid || boot->version!=5 || boot->efiRuntimeCacheValid!=1 ||
-       boot->efiRuntimeMtrrValid!=1 || boot->memoryMapCount>4096)return;
-    efiTestBoot=*boot;
+    if(!PlatformPowerEfiHandoffAccepted(boot,inventory.valid))return;
+    // Copy only what every version-5 loader provides; an older loader's
+    // handoff ends before the appended timing extension.
+    __builtin_memcpy(&efiTestBoot,boot,BootProtocolV5Size);
     for(uint32_t i=0;i<boot->memoryMapCount;++i)efiTestMap[i]=boot->memoryMap[i];
     efiTestBoot.memoryMap=efiTestMap;efiTestCandidate=inventory.resetSystem;
 }

@@ -27,8 +27,10 @@ void BootTimingCaptureHandoff(const BootProtocol* protocol)
     g_inputs.kernelEntryTsc = g_kernelEntryTsc;
     if (!protocol) return;
     g_inputs.protocolVersion = protocol->version;
-    // Older loaders end the handoff before `timing`; never read past it.
-    if (protocol->version >= 6) g_inputs.loader = protocol->timing;
+    // Older loaders end the handoff before `timing` and leave `extensions`
+    // zero; never read past the version-5 fields unless the marker says so.
+    g_inputs.loaderTimingPresent = BootHasTiming(protocol);
+    if (g_inputs.loaderTimingPresent) g_inputs.loader = protocol->timing;
 }
 
 void BootTimingCaptureFirmware()
