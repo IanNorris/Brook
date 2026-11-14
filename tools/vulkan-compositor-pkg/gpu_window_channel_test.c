@@ -21,6 +21,16 @@ int main(void){
     assert(received.type==BROOK_GPU_WINDOW_SAFE && !brook_gpu_window_identity_equal(&offer.identity,&received.identity));
     assert(brook_gpu_window_send_safe(socket[1],&offer.identity)==1 && brook_gpu_window_receive(socket[0],&received,fds)==1);
     assert(brook_gpu_window_identity_equal(&offer.identity,&received.identity));
+    /* Version 2 replies: PRESENTED is valid only in version 2. */
+    assert(brook_gpu_window_send_reply(socket[1],BROOK_GPU_WINDOW_WIRE_VERSION,BROOK_GPU_WINDOW_PRESENTED,&offer.identity)==-1);
+    assert(brook_gpu_window_send_reply(socket[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&offer.identity)==1);
+    assert(brook_gpu_window_receive(socket[0],&received,fds)==1 && received.type==BROOK_GPU_WINDOW_PRESENTED &&
+           received.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && brook_gpu_window_identity_equal(&offer.identity,&received.identity));
+    assert(brook_gpu_window_send_reply(socket[1],3,BROOK_GPU_WINDOW_SAFE,&offer.identity)==-1);
+    struct BrookGpuWindowPacket retained=offer;retained.version=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN;
+    assert(brook_gpu_window_send_offer(socket[0],&retained,source,pipefd[0])==1);
+    assert(brook_gpu_window_receive(socket[1],&received,fds)==1 && received.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN);
+    close(fds[0]);close(fds[1]);
     struct BrookGpuWindowPacket invalid=offer;invalid.stride=1;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==-1);
     invalid=offer;++invalid.identity.inode;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==-1);
     invalid=offer;invalid.offset=1024;assert(brook_gpu_window_send_offer(socket[0],&invalid,source,pipefd[0])==-1);

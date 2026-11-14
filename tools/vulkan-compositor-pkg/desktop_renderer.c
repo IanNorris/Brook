@@ -278,7 +278,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     stage="client_capture";
     if(syscall(BROOK_SYS_DESKTOP_LAYERS,skipMask?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE:BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED,
                &layers,sizeof(layers),skipMask,0,0))goto done;
-    for(unsigned i=0;i<layers.count;++i)if(preselected[i])preselected[i]->state=1;
+    for(unsigned i=0;i<layers.count;++i)desktop_gpu_channel_unselect(&g_gpuChannel,preselected[i],frame);
     timing[1]=monotonic_ns();
     struct BackdropIdentity identity={backdrop.layers[0].incarnation,backdrop.layers[0].generation,
         backdrop.layers[0].bytes,backdrop.layers[0].width,backdrop.layers[0].height};
@@ -427,7 +427,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             for(unsigned j=0;j<layers.count;++j)if(frameSources[j].window==id->window &&
                 frameSources[j].incarnation==id->incarnation && frameSources[j].commit==id->commit)
                 frameSources[j].commit=0;
-            directOffer[i]->state=1;
+            desktop_gpu_channel_unselect(&g_gpuChannel,directOffer[i],frame);
         }
         status=BROOK_VK_REJECTED;
         if(pending && ctx->graphics && getenv("BROOK_RENDER_GRAPHICS_PARTIAL") && !(width&15u) &&
