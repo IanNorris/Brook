@@ -983,3 +983,4 @@ target_compile_options(test_pte_owner_sidecars PRIVATE -UNDEBUG "-iquote${BROOK_
 add_host_test(test_boot_timing)
 target_compile_options(test_boot_timing PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared")
+add_host_test(test_intel_bdw_node_cache)

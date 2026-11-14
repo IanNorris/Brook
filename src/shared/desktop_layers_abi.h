@@ -47,11 +47,23 @@
 // recaptures into the same buffer.
 #define BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED 11
 #define BROOK_DESKTOP_CHROME_TRACKED_KEEP 12
+// Change-based client layers. As CAPTURE_TRACKED_SELECTIVE (a = skip mask),
+// plus b = a 32-bit mask of layers whose pixels the caller already holds.
+// For a keep layer the caller sets generation/bytes/width/height/stride to
+// the values of the capture that filled its buffer and still supplies that
+// buffer in pixels/capacity. If the window's published content generation
+// and geometry are unchanged (and no terminal caret is overlaid) the kernel
+// copies nothing and sets BROOK_DESKTOP_LAYER_KEPT in the returned flags;
+// otherwise it copies as usual. A client write the producer has not yet
+// published is not reflected, exactly as with the CPU compositor.
+#define BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP 13
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u
 #define BROOK_DESKTOP_LAYER_OPACITY_SHIFT 8u
 #define BROOK_DESKTOP_LAYER_OPACITY_MASK (255u<<BROOK_DESKTOP_LAYER_OPACITY_SHIFT)
+// Output only (CAPTURE_TRACKED_KEEP): the caller's held pixels are current.
+#define BROOK_DESKTOP_LAYER_KEPT (1u<<16)
 struct BrookDesktopLayer {
     uint64_t pixels,capacity,incarnation,generation,bytes;
     uint32_t window,width,height,stride,clientWidth,clientHeight;

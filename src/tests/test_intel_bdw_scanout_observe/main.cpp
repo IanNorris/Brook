@@ -23,6 +23,7 @@ static unsigned scenario=0,reads=0,ackReads=0,pageChecks=0,wakeRuns=0,prepares=0
 static unsigned gemReleases=0,gemFailures=0,contendersRefused=0,workerPrepared=0,workerRetired=0;
 static uint32_t contextValues[2]{},reprepareValues[3]{};static bool contextActive[2]{},contextPoisoned[2]{};static unsigned reprepareCount=0;
 namespace brook {
+uint64_t ApicTickCount(){static uint64_t t;return t+=1000;} // node-check cache clock: always expired
 extern "C" [[noreturn]] void KernelPanic(const char* format,...){
     if(scenario==85 && !std::strncmp(format,"Broadwell worker recovery stage=%s",34)){
         va_list args;va_start(args,format);

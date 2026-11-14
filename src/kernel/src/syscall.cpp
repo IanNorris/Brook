@@ -12922,6 +12922,7 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
 static_assert(BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_HANDOFF_CTL && BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_OUTPUT_ALLOC,
               "desktop layers syscall must be distinct");
 WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
+DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {
@@ -13063,9 +13064,11 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
         op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopBackdrop(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
-    if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED &&
-        op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE) ||
-       size!=sizeof(BrookDesktopLayers) || (op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE && a) || a>0xffffffffULL || b || c || address>~uint64_t{0}-size)return -EINVAL;
+    const bool keepOp=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP;
+    const bool tracked=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE || keepOp;
+    if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && !tracked) ||
+       size!=sizeof(BrookDesktopLayers) || (op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE && !keepOp && a) ||
+       a>0xffffffffULL || (!keepOp && b) || b>0xffffffffULL || c || address>~uint64_t{0}-size)return -EINVAL;
     const bool capture=op!=BROOK_DESKTOP_LAYERS_QUERY;
     auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
     auto* layers=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
@@ -13086,14 +13089,19 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
                 brook::DesktopInvertCaret(layer,offset,scratch,bytes);
                 return CopyToUser(destination,scratch,bytes);
             };
+            brook::DesktopCaptureCounters tally{};
             result=brook::ExportDesktopLayers(*layers,*wire,capture,sink,
-                [op](const brook::WmDesktopLayers& current){
-                    return (op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE)
+                [tracked](const brook::WmDesktopLayers& current){
+                    return tracked
                         ?brook::WmDesktopLayersCaptureCurrent(current)
                         :brook::WmDesktopLayersCurrent(current);
-                },scratchBytes,static_cast<uint32_t>(a));
+                },scratchBytes,static_cast<uint32_t>(a),static_cast<uint32_t>(b),&tally);
+            if(!result && tally.calls){auto& g=brook::g_desktopCaptureStats;
+                __atomic_add_fetch(&g.calls,tally.calls,__ATOMIC_RELAXED);__atomic_add_fetch(&g.keeps,tally.keeps,__ATOMIC_RELAXED);
+                __atomic_add_fetch(&g.keepMisses,tally.keepMisses,__ATOMIC_RELAXED);__atomic_add_fetch(&g.captures,tally.captures,__ATOMIC_RELAXED);
+                __atomic_add_fetch(&g.bytesCopied,tally.bytesCopied,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesKept,tally.bytesKept,__ATOMIC_RELAXED);}
             bool adopted=false;
-            if(!result && (op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE)){
+            if(!result && tracked){
                 const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
                 result=brook::BdwOffscreenRegisterScene(owner,layers,&wire->reserved);adopted=!result;
             }

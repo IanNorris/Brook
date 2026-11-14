@@ -1,3 +1,4 @@
+#include "desktop_layers_export.h"
 #include "intel_bdw_worker_overhead.h"
 #include "native_tsc_observe.h"
 #include "irq_accounting.h"
@@ -11,6 +12,7 @@
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_exec_tables.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_node_cache.h"
 #if defined(BROOK_BDW_RPS_TRIAL)
 #include "intel_bdw_render_clock.h"
 #include "intel_bdw_render_clock_runtime.h"
@@ -6048,6 +6050,23 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{");r.field("keeps",keeps);r.text(",");r.field("keep_misses",misses);
         r.text(",");r.field("captures",captures);r.text(",");r.field("bytes_copied",copied);r.text(",");r.field("bytes_kept",kept);
         r.text(",\"scope\":\"renderer window-chrome requests since boot or reset; keeps reuse the renderer's held pixels (no render, no copy); keep_misses are keeps refused because the chrome changed; captures render and copy the outer surface\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu node cache on") || NetStrEq(cmd,"gpu node cache off") || NetStrEq(cmd,"gpu node cache status")) {
+        auto& c=BdwIntelNodeCache();
+        if(NetStrEq(cmd,"gpu node cache on"))BdwNodeCacheSetEnabled(c,true);
+        else if(NetStrEq(cmd,"gpu node cache off"))BdwNodeCacheSetEnabled(c,false);
+        BridgeReply r;r.text("{\"enabled\":");r.text(__atomic_load_n(&c.disabled,__ATOMIC_RELAXED)?"false":"true");
+        r.text(",");r.field("hits",__atomic_load_n(&c.hits,__ATOMIC_RELAXED));r.text(",");r.field("checks",__atomic_load_n(&c.checks,__ATOMIC_RELAXED));
+        r.text(",");r.field("ttl_ms",BdwNodeCacheTtlMs);
+        r.text(",\"scope\":\"Intel GPU ioctl admission gate; checks = live PCI identity/BAR/D0 reads, hits = reuse of a passing check younger than ttl_ms; the submission worker still checks live around every job\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"desktop capture status") || NetStrEq(cmd,"desktop capture reset")) {
+        auto& g=g_desktopCaptureStats;
+        auto take=[&](uint64_t& v){return NetStrEq(cmd,"desktop capture reset")?__atomic_exchange_n(&v,0,__ATOMIC_RELAXED):__atomic_load_n(&v,__ATOMIC_RELAXED);};
+        const uint64_t calls=take(g.calls),keeps=take(g.keeps),misses=take(g.keepMisses),captures=take(g.captures),copied=take(g.bytesCopied),kept=take(g.bytesKept);
+        BridgeReply r;r.text("{");r.field("calls",calls);r.text(",");r.field("keeps",keeps);r.text(",");r.field("keep_misses",misses);
+        r.text(",");r.field("captures",captures);r.text(",");r.field("bytes_copied",copied);r.text(",");r.field("bytes_kept",kept);
+        r.text(",\"scope\":\"renderer client-layer captures since boot or reset; keeps = CPU window layers whose published content generation was unchanged, so nothing was copied; keep_misses = keeps requested but recopied because the window published; captures = layers copied (GPU-source windows are not counted)\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu uploads")) {
         const auto s=CompositorReadUploads();BridgeReply r;r.text("{\"layers\":[");

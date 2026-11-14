@@ -21,6 +21,7 @@
 #include "overlay_copy.h"
 #include "desktop_overlay_cache.h"
 #include "desktop_chrome_cache.h"
+#include "desktop_client_cache.h"
 #include "source_size_policy.h"
 #include "desktop_gpu_channel.h"
 #include "desktop_async_source_barrier.h"
@@ -59,6 +60,7 @@ struct RenderContext {
     struct Source client[BROOK_DESKTOP_LAYER_LIMIT],chrome[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source chromeSpan[BROOK_DESKTOP_LAYER_LIMIT][4];
     struct DesktopChromeHeld chromeHeld[BROOK_DESKTOP_LAYER_LIMIT];
+    struct DesktopClientHeld clientHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source background,overlay[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
     /* Retained overlay capture: reused while the kernel generation matches. */
     uint64_t overlayGeneration;uint32_t overlayWidth,overlayHeight;
@@ -125,6 +127,12 @@ static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
 /* Keep unchanged window chrome (kernel keyed capture); BROOK_RENDER_CHROME_KEEP=0 disables. */
 static int g_chromeKeep=1;
 static struct {unsigned long long keeps,keepMisses,captures,bytesCopied;} g_chromeStats;
+/* Keep unchanged CPU client windows (kernel CAPTURE_TRACKED_KEEP);
+ * BROOK_RENDER_CLIENT_KEEP=0 disables. g_clientKeepAccepted: the kernel
+ * has accepted the op at least once (an EINVAL before that means an older
+ * kernel, which disables keeping for good). */
+static int g_clientKeep=1,g_clientKeepAccepted;
+static struct {unsigned long long keeps,keepMisses,captures,bytesCopied,bytesKept,bandReuses;} g_clientStats;
 /* Bounded runs (--frames N) present a minimal frame instead of idling. */
 static int g_neverIdle;
 static uint64_t g_quadSubmitted,g_quadFallback;
@@ -519,7 +527,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct BrookVkExternalSource sources[BROOK_VK_MAX_LAYERS];
     uint8_t directSource[BROOK_VK_MAX_LAYERS]={0};
     struct DesktopGpuOffer *directOffer[BROOK_VK_MAX_LAYERS]={0};
-    struct DesktopGpuOffer *preselected[BROOK_DESKTOP_LAYER_LIMIT]={0};uint32_t skipMask=0;
+    struct DesktopGpuOffer *preselected[BROOK_DESKTOP_LAYER_LIMIT]={0};uint32_t skipMask=0,keepMask=0,keptMask=0;
     struct AsyncWindowSource frameSources[BROOK_DESKTOP_LAYER_LIMIT]={{0}};
     unsigned clientSourceIndex[BROOK_DESKTOP_LAYER_LIMIT]={0};
     uint64_t traceReceived=0,traceIncarnation=0,traceCommit=0,traceSubmitStart=0;uint32_t traceWindow=0;
@@ -545,11 +553,41 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             if(preselected[i]){skipMask|=1u<<i;layers.layers[i].pixels=layers.layers[i].capacity=0;continue;}
         }
         if(source_ensure(drm,layers.layers[i].bytes,&client[i]))goto done;
+        if(g_clientKeep && desktop_client_can_keep(&ctx->clientHeld[i],&layers.layers[i],client[i].serial)){
+            keepMask|=1u<<i;desktop_client_keep_request(&ctx->clientHeld[i],&layers.layers[i]);
+        }else desktop_client_forget(&ctx->clientHeld[i]);
         layers.layers[i].pixels=(uintptr_t)client[i].map;layers.layers[i].capacity=client[i].size;
     }
     stage="client_capture";
-    if(syscall(BROOK_SYS_DESKTOP_LAYERS,skipMask?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE:BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED,
-               &layers,sizeof(layers),skipMask,0,0))goto done;
+    {
+        const long legacyOp=skipMask?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE:BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED;
+        const struct BrookDesktopLayers request=layers;
+        long captureResult=syscall(BROOK_SYS_DESKTOP_LAYERS,g_clientKeep?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP:legacyOp,
+                                   &layers,sizeof(layers),skipMask,g_clientKeep?keepMask:0,0);
+        if(captureResult && g_clientKeep && !g_clientKeepAccepted && errno==EINVAL){
+            /* Older kernel: no client keep. Fall back for good. */
+            g_clientKeep=0;keepMask=0;layers=request;
+            for(unsigned i=0;i<layers.count;++i)desktop_client_forget(&ctx->clientHeld[i]);
+            captureResult=syscall(BROOK_SYS_DESKTOP_LAYERS,legacyOp,&layers,sizeof(layers),skipMask,0,0);
+        }
+        if(captureResult){
+            /* A failed copy may have partly overwritten held buffers. */
+            for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i)desktop_client_forget(&ctx->clientHeld[i]);
+            goto done;
+        }
+        if(g_clientKeep)g_clientKeepAccepted=1;
+        for(unsigned i=0;i<layers.count;++i){
+            if(skipMask&(1u<<i))continue;
+            struct BrookDesktopLayer *l=&layers.layers[i];
+            if(l->flags&BROOK_DESKTOP_LAYER_KEPT){
+                l->flags&=~BROOK_DESKTOP_LAYER_KEPT;keptMask|=1u<<i;++g_clientStats.keeps;g_clientStats.bytesKept+=l->bytes;
+            }else{
+                if(keepMask&(1u<<i))++g_clientStats.keepMisses;
+                ++g_clientStats.captures;g_clientStats.bytesCopied+=l->bytes;
+                if(g_clientKeep)desktop_client_hold(&ctx->clientHeld[i],l,client[i].serial);
+            }
+        }
+    }
     for(unsigned i=0;i<layers.count;++i)desktop_gpu_channel_unselect(&g_gpuChannel,preselected[i],frame);
     timing[1]=monotonic_ns();
     struct BackdropIdentity identity={backdrop.layers[0].incarnation,backdrop.layers[0].generation,
@@ -603,8 +641,17 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         *trackWindow=(struct DesktopTrackWindow){.window=l->window,.incarnation=l->incarnation,.direct=direct!=NULL,
             .commit=direct?direct->packet.identity.commit:0};
         memcpy(trackWindow->layer,&content,sizeof(content));
-        if(trackOk && !direct && !desktop_track_bands(&trackWindow->content,client[i].map,client[i].size/4,content.sourceStrideWords,
-                content.sourceX,content.sourceY,content.sourceWidthUsed,content.sourceHeightUsed,NULL))trackOk=0;
+        if(trackOk && !direct){
+            struct DesktopClientHeld *held=&ctx->clientHeld[i];
+            /* Kept pixels are unchanged: reuse their band hashes. */
+            if((keptMask&(1u<<i)) && desktop_client_bands_match(held,content.sourceStrideWords,content.sourceX,content.sourceY,
+                                                                content.sourceWidthUsed,content.sourceHeightUsed)){
+                trackWindow->content=held->bands;++g_clientStats.bandReuses;
+            }else if(!desktop_track_bands(&trackWindow->content,client[i].map,client[i].size/4,content.sourceStrideWords,
+                    content.sourceX,content.sourceY,content.sourceWidthUsed,content.sourceHeightUsed,NULL))trackOk=0;
+            else desktop_client_store_bands(held,&trackWindow->content,content.sourceStrideWords,content.sourceX,content.sourceY,
+                                            content.sourceWidthUsed,content.sourceHeightUsed);
+        }
         struct BrookDesktopLayers decor={.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
         struct BrookDesktopLayer *c=&decor.layers[0];
         struct DesktopChromeHeld *held=&ctx->chromeHeld[i];
@@ -1323,14 +1370,16 @@ static void stats_publish(uint64_t now){
      * closing brace. */
     if(length){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
-        if(end){char tail[512];
+        if(end){char tail[1024];
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
                 "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,"
-                "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu}}\n",g_ring.count,
+                "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu},"
+                "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
                 (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
                 (unsigned long long)g_overlayOnlySkips,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
-                g_chromeStats.captures,g_chromeStats.bytesCopied);
+                g_chromeStats.captures,g_chromeStats.bytesCopied,g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
+                g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
             char rows[DESKTOP_TIMELINE*120+64];size_t used=0;
@@ -1608,6 +1657,7 @@ int main(int argc,char **argv){
     g_quadOcclusion=!getenv("BROOK_RENDER_QUAD_NO_OCCLUSION");
     g_chromeHoles=!getenv("BROOK_RENDER_CHROME_FULL");
     {const char *keep=getenv("BROOK_RENDER_CHROME_KEEP");g_chromeKeep=!(keep && keep[0]=='0');}
+    {const char *keep=getenv("BROOK_RENDER_CLIENT_KEEP");g_clientKeep=!(keep && keep[0]=='0');}
     g_trackDamage=!getenv("BROOK_RENDER_FOOTPRINT_DAMAGE");
     const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");
     if(idlePoll){char *end=NULL;unsigned long ms=strtoul(idlePoll,&end,10);if(end && !*end && ms && ms<=100)g_idlePollNs=ms*1000000ull;}
