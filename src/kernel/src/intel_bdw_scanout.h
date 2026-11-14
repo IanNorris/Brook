@@ -241,6 +241,13 @@ bool BdwObserveDisplayLive(BdwDisplaySnapshot& out);
 struct BdwForcewakeAdapterResult;
 struct BdwRcsResetTestResult {bool attempted=false,complete=false,uncertain=false;};
 bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset);
+// VA-API phase 1: VCS0 bring-up behind BROOK_BDW_VIDEO_ENGINE and a runtime gate.
+class BdwVideoGate;enum class BdwVideoRefusal : uint8_t;
+bool BdwVideoBuilt();
+bool BdwVideoStatus(BdwVideoGate& out);
+bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
+bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
+bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal);
 struct BdwRenderGtInitResult;
 bool BdwTestRenderGtInit(BdwForcewakeAdapterResult& out,BdwRenderGtInitResult& init);
 struct BdwPatTestResult;

@@ -38,6 +38,8 @@
 #include "intel_bdw_file.h"
 #include "compositor.h"
 #include "panic_qr.h"
+#include "intel_bdw_video.h"
+#include "kprintf.h"
 extern "C" [[noreturn]] void KernelPanic(const char*,...);
 namespace brook {
 namespace {
@@ -331,6 +333,84 @@ bool BdwTestPrivatePat(BdwForcewakeAdapterResult& out,BdwPatTestResult& pat) {
     (void)out;(void)pat;
 #endif
     return false;
+}
+// ---- VA-API phase 1: VCS0 video engine bring-up (docs/bdw-video-engine.md) ----
+namespace {
+BdwVideoGate videoGate;
+uint32_t videoOwner=0;
+struct VideoLease {
+    bool held=false;
+    VideoLease(){uint32_t expected=0;held=__atomic_compare_exchange_n(&videoOwner,&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED);}
+    ~VideoLease(){if(held)__atomic_store_n(&videoOwner,0,__ATOMIC_RELEASE);}
+};
+}
+bool BdwVideoBuilt(){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    return true;
+#else
+    return false;
+#endif
+}
+bool BdwVideoStatus(BdwVideoGate& out){VideoLease lease;if(!lease.held)return false;out=videoGate;return true;}
+bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;
+    if(!BdwVideoBuilt()){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    VideoLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    if(!videoGate.setEnabled(on)){refusal=videoGate.lastRefusal();return false;}
+    KPrintf("gpu-video: gate %s\n",on?"on":"off");return true;
+}
+bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;
+    if(!BdwVideoBuilt()){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    VideoLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    refusal=videoGate.mayProbe();if(refusal!=BdwVideoRefusal::None)return false;
+    // Read-only: the shared forcewake observation samples VCS0 (other[1]) twice.
+    const bool ok=BdwObserveForcewakeLive(out,true,false);
+    const auto& e=out.sequence.other[1];
+    BdwVcsSample sample{};
+    sample.sampled=ok && e.sampled;sample.idle=e.idle;sample.quiescent=e.submissionQuiescent;
+    sample.head=e.first.head;sample.tail=e.first.tail;sample.mode=e.first.mode;sample.start=e.first.start;
+    sample.control=e.first.control;sample.execlistLo=e.first.execlistLo;sample.execlistHi=e.first.execlistHi;
+    sample.submissionMode=e.first.submissionMode;
+    videoGate.probed(ok,sample);
+    if(!ok || !sample.sampled){refusal=BdwVideoRefusal::ProbeFailed;return false;}
+    return true;
+}
+bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;reset={};
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    VideoLease video;if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    refusal=videoGate.mayReset();if(refusal!=BdwVideoRefusal::None)return false;
+    DiagnosticLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
+       !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
+        refusal=BdwVideoRefusal::ResetRefused;return false;}
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;return false;}
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;return false;}
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz){refusal=BdwVideoRefusal::ResetRefused;return false;}
+    for(uint32_t i=0;i<PciBootInventoryCount();++i){
+        PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))break;
+        const auto& d=entry.device;if(d.bus!=0 || d.dev!=2 || d.fn!=0)continue;
+        if(!LiveGpuMatches(entry) || !PowerD0(d))break;
+        VmmDellVcsReset(tsc.khz,out,reset);
+        videoGate.resetDone(reset.complete && out.sequence.workComplete,reset.uncertain);
+        if(reset.uncertain){
+            // GDRST is shared with the per-job RCS resets; an unverified media
+            // reset may leave the GT reset domain in an unknown state. Follow the
+            // RCS-reset policy: stop here. The runtime gate defaults off, so the
+            // recovery reboot does not repeat this.
+            KernelPanic("Broadwell video (VCS) reset uncertain: attempted=%u wake=%u released=%u",
+                unsigned(reset.attempted),unsigned(out.sequence.acquired),unsigned(out.sequence.released));
+        }
+        KPrintf("gpu-video: VCS reset %s\n",reset.complete?"acknowledged":"refused before any write");
+        if(!reset.complete){refusal=BdwVideoRefusal::ResetRefused;return false;}
+        return out.sequence.workComplete && out.clearDelivered && out.sequence.released && LiveGpuMatches(entry) && PowerD0(d);
+    }
+    refusal=BdwVideoRefusal::ResetRefused;return false;
+#else
+    (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
+#endif
 }
 bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)

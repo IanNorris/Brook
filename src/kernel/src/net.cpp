@@ -10,6 +10,8 @@
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
 #include "intel_bdw_prompt_wake.h"
+#include "intel_bdw_video.h"
+#include "intel_bdw_forcewake_adapter.h"
 #include "intel_bdw_exec_tables.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_node_cache.h"
@@ -5126,6 +5128,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
             "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
@@ -5768,6 +5771,46 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"BROOK_BDW_RPS_TRIAL kernel required\"}\n");
 #endif
+    }
+    else if(StrStartsWith(cmd,"gpu video")) {
+        // VA-API phase 1: VCS0 (video engine) bring-up. Build option
+        // BROOK_BDW_VIDEO_ENGINE plus this runtime gate (boot default off).
+        const bool on=NetStrEq(cmd,"gpu video on"),off=NetStrEq(cmd,"gpu video off");
+        const bool probe=NetStrEq(cmd,"gpu video probe"),reset=NetStrEq(cmd,"gpu video reset");
+        const bool selftest=NetStrEq(cmd,"gpu video selftest"),status=NetStrEq(cmd,"gpu video status");
+        if(!on && !off && !probe && !reset && !selftest && !status){
+            DebugChannelSend("Usage: gpu video on|off|status|probe|reset|selftest\n");return;}
+        BdwVideoRefusal refusal=BdwVideoRefusal::None;bool ok=true;
+        BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult rs{};
+        if(on || off)ok=BdwVideoSetEnabled(on,refusal);
+        else if(probe)ok=BdwVideoProbe(fw,refusal);
+        else if(reset)ok=BdwVideoReset(fw,rs,refusal);
+        else if(selftest){ok=false;refusal=BdwVideoRefusal::NotImplemented;}
+        BdwVideoGate g{};const bool have=BdwVideoStatus(g);
+        BridgeReply r;r.text("{\"built\":");r.text(BdwVideoBuilt()?"true":"false");
+        r.text(",\"ok\":");r.text(ok?"true":"false");
+        r.text(",\"refusal\":\"");r.text(BdwVideoRefusalName(refusal));r.text("\"");
+        if(have){
+            r.text(",\"stage\":\"");r.text(BdwVideoStageName(g.stage()));r.text("\"");
+            r.text(",");r.field("probes",g.probes());r.text(",");r.field("resets",g.resets());
+            r.text(",");r.field("refusals",g.refusals());
+            r.text(",\"last_refusal\":\"");r.text(BdwVideoRefusalName(g.lastRefusal()));r.text("\"");
+            r.text(",\"advertised\":");r.text(g.advertiseBsd()?"true":"false");
+            const auto& v=g.sample();
+            r.text(",\"vcs\":{\"sampled\":");r.text(v.sampled?"true":"false");
+            r.text(",\"idle\":");r.text(v.idle?"true":"false");
+            r.text(",\"quiescent\":");r.text(v.quiescent?"true":"false");
+            r.text(",");r.field("head",v.head);r.text(",");r.field("tail",v.tail);
+            r.text(",");r.field("mi_mode",v.mode);r.text(",");r.field("start",v.start);
+            r.text(",");r.field("control",v.control);r.text(",");r.field("execlist_lo",v.execlistLo);
+            r.text(",");r.field("execlist_hi",v.execlistHi);r.text(",");r.field("gfx_mode",v.submissionMode);r.text("}");
+        }
+        if(reset){r.text(",\"reset\":{\"attempted\":");r.text(rs.attempted?"true":"false");
+            r.text(",\"complete\":");r.text(rs.complete?"true":"false");
+            r.text(",\"uncertain\":");r.text(rs.uncertain?"true":"false");
+            r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
+        r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest and execbuffer submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
+        r.send();
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)

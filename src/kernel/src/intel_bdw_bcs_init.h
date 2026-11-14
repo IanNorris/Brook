@@ -8,7 +8,7 @@ struct BdwBcsInitResult {bool attempted=false,resetComplete=false,initComplete=f
 // write is attempted, failure leaves hardware state uncertain; the caller
 // must quarantine all referenced pages until a proven engine reset.
 template<uint32_t EngineBase,class Io> bool BdwInitializeEngineExeclists(Io& io,uint64_t hws) {
-    static_assert(EngineBase==0x22000 || EngineBase==0x2000,"unsupported engine");
+    static_assert(EngineBase==0x22000 || EngineBase==0x2000 || EngineBase==0x12000,"unsupported engine");
     constexpr uint32_t hwstam=EngineBase+0x98,mode=EngineBase+0x29c,miMode=EngineBase+0x9c,hwsPga=EngineBase+0x80;
     if(!hws || (hws&4095) || hws>0xfffff000ull || !io.owned() || !io.quiescent() || !io.csbPrepared(hws))return false;
     uint32_t value=0;
@@ -29,5 +29,10 @@ template<class Io> bool BdwInitializeBcsExeclists(Io& io,uint64_t hws) {
 // mappings, forcewake and safe retirement remain the owner's responsibility.
 template<class Io> bool BdwInitializeRcsExeclists(Io& io,uint64_t hws) {
     return BdwInitializeEngineExeclists<0x2000>(io,hws);
+}
+// VCS0 (BSD video engine). Same engine-wide execlist setup; see
+// docs/bdw-video-engine.md. Media state and contexts remain the owner's.
+template<class Io> bool BdwInitializeVcsExeclists(Io& io,uint64_t hws) {
+    return BdwInitializeEngineExeclists<0x12000>(io,hws);
 }
 }

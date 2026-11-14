@@ -183,6 +183,10 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         // Publication is restricted to the matching live Dell PCI function.
         case 4: value=0x1616;break; // CHIPSET_ID
         case 32: value=9;break;     // REVISION
+        // HAS_BSD: VCS submission is not implemented (VA-API phase 1b). Answer 0
+        // explicitly so libva/i965 probe the engine as absent instead of seeing
+        // an error. I915_EXEC_BSD stays refused by execbuffer (engine>1).
+        case 5: value=0;break;
         case 19: value=(u.nowNs && u.sleepNs)?1:0;break; // HAS_WAIT_TIMEOUT
         // Iris can use the implemented WB mmap-offset path in this explicit
         // bring-up mode. Other cache modes still fail the mmap-offset ioctl.

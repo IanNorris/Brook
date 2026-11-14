@@ -962,6 +962,8 @@ target_compile_options(test_intel_bdw_zero_copy PRIVATE -UNDEBUG "-iquote${BROOK
 target_compile_options(test_intel_bdw_display_flip PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_render_clock)
 target_compile_options(test_intel_bdw_render_clock PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_video)
+target_compile_options(test_intel_bdw_video PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_wakeups)
 target_compile_definitions(test_intel_bdw_wakeups PRIVATE BROOK_HOST_TEST)
 target_compile_options(test_intel_bdw_wakeups PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
