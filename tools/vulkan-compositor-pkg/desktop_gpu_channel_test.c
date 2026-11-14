@@ -4,8 +4,96 @@ static long test_syscall(long number,...);
 #include "desktop_gpu_channel.h"
 #undef syscall
 #include <assert.h>
-static int owner_valid=1;
-static long test_syscall(long number,...){assert(number==BROOK_SYS_GPU_WINDOW_VALIDATE);return owner_valid?0:-1;}
+#include <stdarg.h>
+static int owner_valid=1,snapshot_tagged=0;static uint64_t snapshot_commit=0;static unsigned snapshot_queries=0;
+static long test_syscall(long number,...){
+    if(number==BROOK_SYS_WM_QUERY_SOURCE_COMMIT){
+        va_list args;va_start(args,number);(void)va_arg(args,long);(void)va_arg(args,long);(void)va_arg(args,long);
+        uint64_t *out=(uint64_t *)(uintptr_t)va_arg(args,long);va_end(args);++snapshot_queries;
+        if(!snapshot_tagged){errno=ESTALE;return -1;}
+        *out=snapshot_commit;return 0;
+    }
+    assert(number==BROOK_SYS_GPU_WINDOW_VALIDATE);return owner_valid?0:-1;}
+static void expect_reply(int socket,uint32_t type,uint64_t commit){
+    struct BrookGpuWindowPacket reply;int fds[2];
+    assert(brook_gpu_window_receive(socket,&reply,fds)==1);
+    assert(reply.type==type && reply.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && reply.identity.commit==commit);
+}
+static void expect_quiet(int socket){struct BrookGpuWindowPacket reply;int fds[2];assert(brook_gpu_window_receive(socket,&reply,fds)==0);}
+/* Version 2: the newest presented offer stays selectable; SAFE follows a
+ * newer presentation, supersession, a newer CPU snapshot or window loss. */
+static void check_retained(void){
+    struct DesktopGpuChannel c;desktop_gpu_channel_init(&c);
+    int pair[2],fence[2];assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,pair) && !pipe(fence));
+    c.peer=pair[1];c.listener=dup(pair[1]);assert(c.listener>=0);
+    int buffers[2];struct stat st[2];
+    for(unsigned i=0;i<2;++i){char path[]="/tmp/brook-desktop-retain-XXXXXX";buffers[i]=mkstemp(path);assert(buffers[i]>=0);
+        unlink(path);assert(!ftruncate(buffers[i],4096) && !fstat(buffers[i],&st[i]));}
+    struct BrookGpuWindowPacket base={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,.type=BROOK_GPU_WINDOW_OFFER,
+        .words=1024,.stride=16,.width=16,.height=16,.fourcc=0x34325258};
+#define OFFER(commit_,index_) do{struct BrookGpuWindowPacket p_=base;p_.identity=(struct BrookGpuWindowIdentity){4,0,400,(commit_),\
+        (uint64_t)st[index_].st_dev,(uint64_t)st[index_].st_ino};assert(brook_gpu_window_send_offer(pair[0],&p_,buffers[index_],fence[0])==1);\
+        desktop_gpu_channel_poll(&c);}while(0)
+    struct BrookDesktopLayer layer={.window=4,.incarnation=400,.generation=9,.width=16,.height=16,.clientWidth=16,.clientHeight=16,.upscale=1};
+    struct BrookVkSceneLayer scene;struct DesktopGpuOffer *o;
+    OFFER(1,0);
+    uint64_t f=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,f);
+    assert(o && o->packet.identity.commit==1);
+    desktop_gpu_channel_presented(&c,f);desktop_gpu_channel_finish(&c,f);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_PRESENTED,1);expect_quiet(pair[0]);
+    /* Later frames keep sampling it without another notification. */
+    f=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,f);
+    assert(o && o->packet.identity.commit==1 && o->current);
+    desktop_gpu_channel_presented(&c,f);desktop_gpu_channel_finish(&c,f);expect_quiet(pair[0]);
+    /* An untagged CPU buffer never displaces the retained source. */
+    assert(snapshot_queries>=1);
+    /* A newer presentation releases the old source only after its frame. */
+    OFFER(2,1);
+    f=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,f);
+    assert(o && o->packet.identity.commit==2);
+    desktop_gpu_channel_presented(&c,f);desktop_gpu_channel_finish(&c,f);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_PRESENTED,2);expect_reply(pair[0],BROOK_GPU_WINDOW_SAFE,1);expect_quiet(pair[0]);
+    /* Overlapping frames: the older frame still samples commit 2. */
+    uint64_t older=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,older);
+    assert(o && o->packet.identity.commit==2);
+    OFFER(3,0);
+    uint64_t later=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,later);
+    assert(o && o->packet.identity.commit==3);
+    desktop_gpu_channel_presented(&c,later);desktop_gpu_channel_finish(&c,later);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_PRESENTED,3);expect_quiet(pair[0]);
+    desktop_gpu_channel_presented(&c,older);desktop_gpu_channel_finish(&c,older);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_SAFE,2);expect_quiet(pair[0]);
+    /* While the window is not composed, an older unpresented offer is
+     * superseded by a newer one; the current and newest offers are kept. */
+    OFFER(4,1);OFFER(5,1);
+    f=desktop_gpu_channel_begin_frame(&c);desktop_gpu_channel_finish(&c,f);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_SAFE,4);expect_quiet(pair[0]);
+    /* A selection undone before submission leaves the offer available. */
+    f=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,f);
+    assert(o && o->packet.identity.commit==5);desktop_gpu_channel_unselect(&c,o,f);assert(o->state==1);
+    desktop_gpu_channel_finish(&c,f);expect_quiet(pair[0]);
+    f=desktop_gpu_channel_begin_frame(&c);o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,f);
+    assert(o && o->packet.identity.commit==5);desktop_gpu_channel_presented(&c,f);desktop_gpu_channel_finish(&c,f);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_PRESENTED,5);expect_reply(pair[0],BROOK_GPU_WINDOW_SAFE,3);expect_quiet(pair[0]);
+    /* An older tagged CPU snapshot is ignored; one at least as new wins. */
+    snapshot_tagged=1;snapshot_commit=4;
+    f=desktop_gpu_channel_begin_frame(&c);assert(desktop_gpu_channel_select(&c,&layer,100,100,&scene,f));
+    desktop_gpu_channel_presented(&c,f);desktop_gpu_channel_finish(&c,f);expect_quiet(pair[0]);
+    snapshot_commit=5;
+    f=desktop_gpu_channel_begin_frame(&c);assert(!desktop_gpu_channel_select(&c,&layer,100,100,&scene,f));
+    desktop_gpu_channel_finish(&c,f);expect_reply(pair[0],BROOK_GPU_WINDOW_SAFE,5);expect_quiet(pair[0]);
+    snapshot_tagged=0;
+    /* A closed incarnation releases its current source without a frame. */
+    OFFER(6,0);
+    f=desktop_gpu_channel_begin_frame(&c);assert(desktop_gpu_channel_select(&c,&layer,100,100,&scene,f));
+    desktop_gpu_channel_presented(&c,f);desktop_gpu_channel_finish(&c,f);expect_reply(pair[0],BROOK_GPU_WINDOW_PRESENTED,6);
+    f=desktop_gpu_channel_begin_frame(&c);desktop_gpu_channel_finish(&c,f);expect_quiet(pair[0]);
+    owner_valid=0;f=desktop_gpu_channel_begin_frame(&c);desktop_gpu_channel_finish(&c,f);
+    expect_reply(pair[0],BROOK_GPU_WINDOW_SAFE,6);expect_quiet(pair[0]);owner_valid=1;
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)assert(!c.offers[i].state);
+#undef OFFER
+    desktop_gpu_channel_close(&c);close(pair[0]);close(buffers[0]);close(buffers[1]);close(fence[0]);close(fence[1]);
+}
 int main(void){
     char dir[]="/tmp/brook-channel-restart-XXXXXX";assert(mkdtemp(dir));
     char socketPath[108];assert(snprintf(socketPath,sizeof(socketPath),"%s/socket",dir)>0);
@@ -105,5 +193,6 @@ int main(void){
     receiver.nextFrame=UINT64_MAX;assert(!desktop_gpu_channel_begin_frame(&receiver));
     close(buffer2);
     desktop_gpu_channel_close(&receiver);close(pair[0]);close(buffer);close(fence[0]);close(fence[1]);
+    check_retained();
     puts("DESKTOP_GPU_CHANNEL_PASS");return 0;
 }

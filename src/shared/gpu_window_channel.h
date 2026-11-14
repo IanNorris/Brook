@@ -14,8 +14,24 @@
 #include <unistd.h>
 #define BROOK_GPU_WINDOW_WIRE_MAGIC 0x42575047u
 #define BROOK_GPU_WINDOW_WIRE_VERSION 1u
+/* Version 2 (retained sources). The provider marks each OFFER with version 2
+ * to request these semantics; a renderer that answers keeps every reply in
+ * the version of the offer it refers to:
+ *  - The renderer may keep sampling the newest presented offer of a window in
+ *    later frames. It sends SAFE only once no in-flight GPU work reads the
+ *    offer AND the offer can no longer be shown: a newer commit of the window
+ *    was presented, a newer offer superseded it before use, the provider's
+ *    tagged CPU snapshot is at least as new, or the window incarnation ended.
+ *    SAFE keeps its version 1 meaning: no remaining renderer GPU use.
+ *  - PRESENTED is sent at most once per offer, before its SAFE, after the OS
+ *    accepted the first frame that sampled it. It carries no fds and grants
+ *    nothing; the provider may use it to pace frame callbacks.
+ * Version 1 offers keep the original behaviour: SAFE after the frame that
+ * received them, no PRESENTED. */
+#define BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN 2u
 #define BROOK_GPU_WINDOW_OFFER 1u
 #define BROOK_GPU_WINDOW_SAFE 2u
+#define BROOK_GPU_WINDOW_PRESENTED 3u
 struct BrookGpuWindowPacket {
     uint32_t magic,version,type,reserved;
     struct BrookGpuWindowIdentity identity;
@@ -23,9 +39,12 @@ struct BrookGpuWindowPacket {
     uint32_t offset,stride,width,height,fourcc,reserved2;
 };
 static inline int brook_gpu_window_packet_valid(const struct BrookGpuWindowPacket *p){
-    if(!p || p->magic!=BROOK_GPU_WINDOW_WIRE_MAGIC || p->version!=BROOK_GPU_WINDOW_WIRE_VERSION ||
+    if(!p || p->magic!=BROOK_GPU_WINDOW_WIRE_MAGIC ||
+       (p->version!=BROOK_GPU_WINDOW_WIRE_VERSION && p->version!=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN) ||
        p->reserved || p->reserved2 || !brook_gpu_window_identity_valid(&p->identity))return 0;
-    if(p->type==BROOK_GPU_WINDOW_SAFE)return !p->words && !p->offset && !p->stride && !p->width && !p->height && !p->fourcc;
+    if(p->type==BROOK_GPU_WINDOW_PRESENTED && p->version<BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN)return 0;
+    if(p->type==BROOK_GPU_WINDOW_SAFE || p->type==BROOK_GPU_WINDOW_PRESENTED)
+        return !p->words && !p->offset && !p->stride && !p->width && !p->height && !p->fourcc;
     if(p->type!=BROOK_GPU_WINDOW_OFFER || !p->words || p->words>UINT32_MAX || !p->width || !p->height ||
        p->width>16384 || p->height>16384 || p->stride<p->width || p->stride>16384 ||
        (p->fourcc!=0x34325241 && p->fourcc!=0x34325258))return 0;
@@ -47,6 +66,16 @@ static inline int brook_gpu_window_send_offer(int socket,const struct BrookGpuWi
     int fds[2]={buffer,fence};memcpy(CMSG_DATA(c),fds,sizeof(fds));
     ssize_t n=sendmsg(socket,&msg,MSG_DONTWAIT|MSG_NOSIGNAL);
     if(n==(ssize_t)sizeof(*p))return 1;
+    if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR))return 0;
+    return -1;
+}
+/* Renderer replies (SAFE or PRESENTED) without fds, in the offer's version. */
+static inline int brook_gpu_window_send_reply(int socket,uint32_t version,uint32_t type,const struct BrookGpuWindowIdentity *identity){
+    struct BrookGpuWindowPacket p={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=version,.type=type};
+    if(identity)p.identity=*identity;
+    if((type!=BROOK_GPU_WINDOW_SAFE && type!=BROOK_GPU_WINDOW_PRESENTED) || !brook_gpu_window_packet_valid(&p)){errno=EINVAL;return -1;}
+    ssize_t n=send(socket,&p,sizeof(p),MSG_DONTWAIT|MSG_NOSIGNAL);
+    if(n==(ssize_t)sizeof(p))return 1;
     if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR))return 0;
     return -1;
 }

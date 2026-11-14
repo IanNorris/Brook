@@ -252,6 +252,99 @@ static void check_gpu_window_offer(int mode)
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
+/* Version 2: frame callbacks follow PRESENTED, a superseded source is
+ * released without a CPU copy, and pixels are taken only on demand. */
+static unsigned count_events(int socket,uint32_t object,uint32_t opcode){
+    uint32_t wire[512];ssize_t bytes=recv(socket,wire,sizeof(wire),MSG_DONTWAIT);unsigned found=0;
+    if(bytes>0)for(size_t i=0;i<(size_t)bytes/4;){
+        uint32_t id=wire[i],op=wire[i+1]&65535,size=wire[i+1]>>16;assert(size>=8 && i*4+size<=(size_t)bytes);
+        if(id==object && op==opcode)++found;
+        assert(!(id==1 && op==WL_DISPLAY_ERROR));
+        i+=size/4;
+    }
+    return found;
+}
+static struct wl_resource *retained_test_buffer(struct wl_client *client,uint32_t id){
+    struct brook_dmabuf_buffer *db=calloc(1,sizeof(*db));assert(db);
+    db->refs=1;db->width=db->height=1;db->stride=4;db->bo_handle=123;db->fourcc=0x34325258;
+    struct wl_resource *resource=wl_resource_create(client,&wl_buffer_interface,1,id);assert(resource);
+    wl_resource_set_implementation(resource,&dmabuf_buffer_impl,db,dmabuf_buffer_destroy);
+    return resource;
+}
+static void check_gpu_window_retained(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *resources[2];struct brook_buffer *held[2];
+    /* New object ids must be allocated in order: 2 buffer, 3 surface,
+     * 4 toplevel, 5 buffer, then the two frame callbacks. */
+    resources[0]=retained_test_buffer(client,2);
+    struct brook_surface surface={0};surface_tree_init(&surface);
+    surface.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(surface.resource);
+    wl_resource_set_user_data(surface.resource,&surface);
+    surface.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(surface.xdg_toplevel);
+    resources[1]=retained_test_buffer(client,5);
+    surface.xdg_acked=surface.xdg_initial_commit_done=1;
+    const uint32_t sentinel=0xff445566;
+    uint32_t vfb=sentinel;surface.wm_id=1;surface.vfb=&vfb;surface.vfb_w=surface.vfb_h=surface.vfb_stride=1;
+    surface.scene_disabled=1;g_surfaces=&surface;
+    char path[]="/tmp/brook-retain-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    struct brook_image *images[2];struct BrookGpuWindowPacket offers[2];
+    for(unsigned i=0;i<2;++i){
+        surface_frame(client,surface.resource,6+i);
+        surface_attach(client,surface.resource,resources[i],0,0);surface_commit(client,surface.resource);
+        struct brook_view *view=surface.tree.current->value;images[i]=view->image;held[i]=view->image->source;++held[i]->refs;
+        assert(wl_list_length(&surface.committed_frames)==1);
+        intel_pending_poll();assert(images[i]->offer_state==1 && held[i]->uses==1 && images[i]->pending_cpu==1);
+        int fds[2];assert(brook_gpu_window_receive(channel[1],&offers[i],fds)==1);close(fds[0]);close(fds[1]);
+        assert(offers[i].version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN);
+        /* Offered and not yet presented: the clock withholds the callback
+         * until the renderer reports it, or until the fallback delay. */
+        const uint32_t now=g_now_ms();assert(!image_callbacks_due(images[i],now));
+        assert(image_callbacks_due(images[i],now+GPU_CALLBACK_FALLBACK_MS));
+        wl_display_flush_clients(display);assert(!count_events(clientSockets[1],6+i,WL_CALLBACK_DONE));
+        assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&offers[i].identity)==1);
+        if(i)assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&offers[0].identity)==1);
+        intel_pending_poll();
+        assert(images[i]->gpu_presented && wl_list_empty(&surface.committed_frames) && image_callbacks_due(images[i],now));
+        wl_display_flush_clients(display);
+        /* The presented source stays retained; the superseded one is
+         * released without a CPU copy into the window buffer. */
+        uint32_t wire[512];ssize_t bytes=recv(clientSockets[1],wire,sizeof(wire),MSG_DONTWAIT);assert(bytes>0);
+        unsigned done=0,released[2]={0};
+        for(size_t k=0;k<(size_t)bytes/4;){uint32_t id=wire[k],op=wire[k+1]&65535,size=wire[k+1]>>16;
+            assert(size>=8 && k*4+size<=(size_t)bytes);assert(!(id==1 && op==WL_DISPLAY_ERROR));
+            if(id==6+i && op==WL_CALLBACK_DONE)++done;
+            if((id==2 || id==5) && op==WL_BUFFER_RELEASE)++released[id==5];
+            k+=size/4;}
+        assert(done==1 && released[1]==0 && released[0]==(unsigned)i);
+        assert(vfb==sentinel && held[i]->uses==1);
+        if(i)assert(!held[0]->uses);
+    }
+    /* A metadata-only commit of the presented source is paced by the clock. */
+    assert(image_callbacks_due(images[1],g_now_ms()));
+    /* A scene the GPU source cannot represent takes pixels on demand while
+     * the renderer still holds the source; release still waits for SAFE. */
+    const int tags=source_tags;
+    intel_image_want_pixels(images[1]);intel_pending_poll();
+    assert(images[1]->offer_state==1 && !images[1]->pending_cpu && images[1]->pixels && held[1]->uses==1);
+    assert(vfb!=sentinel && source_tags==tags+1 && g_intel_retained_snapshots>=1);
+    wl_display_flush_clients(display);assert(!count_events(clientSockets[1],5,WL_BUFFER_RELEASE));
+    vfb=sentinel;
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&offers[1].identity)==1);
+    intel_pending_poll();assert(!g_intel_pending_count && !held[1]->uses && vfb==sentinel);
+    wl_display_flush_clients(display);assert(count_events(clientSockets[1],5,WL_BUFFER_RELEASE)==1);
+    bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
+    free(surface.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
 static void check_intel_direct(int mode)
 {
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
@@ -391,6 +484,7 @@ int main(void)
     source_begins=source_tags=0;check_gpu_window_offer(0);
     assert(source_begins>0 && source_tags>0);
     check_gpu_window_offer(1);check_gpu_window_offer(2);
+    check_gpu_window_retained();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif
     {
