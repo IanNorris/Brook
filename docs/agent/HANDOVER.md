@@ -92,6 +92,14 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Timing loader promoted on the Dell (14 Nov, with Ian):**
+- **Problem caught before deploy:** the boot-timing loader's protocol version bump to 6 would have disabled EFI power-off on every existing kernel; `efi_runtime_inventory.h` and `platform_power.cpp` accept only v5. Fixed in `992e0879`: the handoff stays at v5 and the timing block sits behind an `extensions` marker. QEMU tested every old/new loader and kernel pairing.
+- **Promotion:** from the USB maintenance boot via `scripts/dell_loader_promotion.py` (runbook `docs/dell-loader-promotion.md`). The inventory matched the 7 Nov hashes. `BROOKT6.EFI` (`a42be35c…`) was staged and promoted with `GUARD_DEFAULT_OK`. The old v5 default is kept as `BROOKP5.EFI` (`c717c048…`). F5, RECOV2, RECOVERY and the guards are unchanged.
+- **Booted the SSD first time:** on gen 370, then gen 371 `dell-main-timing-20261114` (main). EFI power-off is still `efi-runtime`.
+- **Gen 371 `BOOT_TIMING`:** firmware 5,079 ms (FPDT), menu wait 500 ms, **loader 3,724 ms**, kernel 2,863 ms, total 12.2 s; no keys seen during the wait (`wait_keys=0`, Ian didn't press any).
+- **Next:** the loader's 3.7 s (32 MiB initrd plus kernel read and guard hashing) is now the largest controllable boot cost; profile it.
+- **Rollback:** promote `BROOKP5.EFI` back with the macro variant described in the runbook, or boot F5 or the USB stick.
+
 **M3 copy-based flip on the Dell (gen 370, `dell-m3-flip-20261114`, `work/m3-flip` `f103889e`):**
 - The GGTT takeover fix (`8c146e19`) worked: probe passed and `gpu flip arm` went active (3 kernel surfaces, 5,753 inherited PTEs taken over, 32 ms setup, 0 GOP returns, still active after both arms).
 - **It is slower.** 2 buffers: displayed mean 39.5 ms (p50 41.5, p99 56), present 16.3 ms (blit 15.5) against 33.2 ms and 10.9 ms on gen 369. 8 buffers: 45.8 ms mean.
