@@ -92,6 +92,23 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Late 14 Nov (gens 385–387, Ian present until ~20:45):**
+- **PPGTT builder made linear** (`work/ppgtt-cache` d90993bf). Gen 385, 2-buffer demo: prepare 2.0 → 1.04 ms, compositor 12.9 → 11.6 ms, swaps 57/s, displayed mean 19.9 / **p50 17.6** ms. The table-reuse cache gives no gain (132 hits of ~1.5k); leave it off.
+- **Chrome keep** (`work/chrome-capture` 389b0d69): window chrome is cached by content key, so steady frames copy 0 bytes (~15 MB per frame before).
+- **Live yquake attract demo** (Ian): **65–70 fps** on gen 386/387 with no other windows.
+  - With App Gallery plus Settings open it drops to 49 fps: VKRENDER at 18.8% CPU re-copying idle CPU windows every frame.
+  - Fixed in `work/capture-keep` ca5ee5d1 (gen 387). Ian: "a lot faster once it settles"; the windows A/B isn't measured yet.
+  - The ~4 s settle at Quake start is I/O: AHCI reads plus FAT mutex contention (`FatObjectStat`/`Child`), machine 85% idle; profile in `display-perf/build/prof-q2-startup/`.
+  - yquake2's fps counter is a 60-frame rolling mean.
+- **Chromium on the GPU path** (ANGLE/GLES via the staged brook-iris-run; flags from `work/browser-gpu` data/nix-wrappers/brook-chromium): YouTube is "miles better" windowed, maximised and fullscreen. The APP graph was blank for GPU clients; fixed in `work/thermal`.
+- **PANIC on gen 386 with GPU Chromium:** `Broadwell worker recovery stage=prepare … pid=294 objects=68 pages=65451` (`PanicWorkerStage` < `ExecuteRetainedWorker`). A 256 MB job exceeds a prepare limit (likely the 128-page table inspection), and prepare failure panics instead of failing the job.
+  - The guard reset to recovery, the panic was retrieved (`display-perf/build/panic-gen386/`, decode with `tools/crash_decoder.py --packet … --elf`), and it rebooted automatically.
+  - Fix in progress with the PPGTT agent. **Don't run GPU Chromium until it lands.**
+- **Thermal** (`work/thermal` 729be038): per-CPU sampler, taskbar TEMP graph, the `hw_thermal` bridge tool and `thermal status|history|graph|power`. Idle is `sti;hlt` only (C1); the next step is MWAIT C6 behind a switch (`docs/cpu-power-management-scope.md`). Ian: the fan spins gently, the laptop is warm but not hot. Package 77–85 °C sustained under yquake, peak 99 °C since boot.
+- **Worker overhead** (`work/worker-overhead` 0c2c291e): batched memory-type audit and `gpu worker overhead` breakdown. Not measured on the Dell.
+- **VA-API milestone started** (`work/vaapi`): phase 1 is the VCS engine (estimated 1.5–3 weeks total). Broadwell decodes H.264/VP8 only, so YouTube needs an H.264 preference.
+- **Ian's next big direction:** a fully GPU-driven shell, i.e. the kernel sends draw descriptions (rects, glyph runs, icons) instead of CPU-rasterised overlay and chrome.
+
 **M4a and GPU clock on the zero-copy base (gens 382–383, 14 Nov night):**
 - **M4a wakeups** (`work/m4a-zc`, runtime switch `gpu wakeups on|off`, default off):
   - stable: 0 IF restores over 100k+ wakes, no panic;
