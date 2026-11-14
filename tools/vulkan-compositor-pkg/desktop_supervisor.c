@@ -89,18 +89,23 @@ int main(int argc,char **argv){
             execl(renderer,renderer,"--watch",(char*)NULL);_exit(127);
         }
         (void)sigprocmask(SIG_SETMASK,&previous,NULL);
+        int status=0;
         if(pid<0){fprintf(stderr,"DESKTOP_SUPERVISOR_FORK_FAILED errno=%d\n",forkError);}
         else{
-            int status=0;pid_t done;
+            pid_t done;
             if(stopping)(void)kill(pid,SIGTERM);
             do {done=waitpid(pid,&status,0);if(done<0 && errno==EINTR && stopping)(void)kill(pid,SIGTERM);}
             while(done<0 && errno==EINTR);
             if(done<0){fprintf(stderr,"DESKTOP_SUPERVISOR_WAIT_FAILED errno=%d\n",errno);return 1;}
             if(stopping)break;
-            fprintf(stderr,"DESKTOP_SUPERVISOR_EXIT status=%d retry_s=%u\n",status,delay);
+            fprintf(stderr,"DESKTOP_SUPERVISOR_EXIT status=%d retry_s=%u\n",status,WIFEXITED(status) && WEXITSTATUS(status)==76?1u:delay);
         }
         (void)clock_gettime(CLOCK_MONOTONIC,&finished);
         if(finished.tv_sec-started.tv_sec>=30)delay=1;
+        /* Status 76: the renderer exited deliberately after a GPU/handoff
+         * failure it cannot recover in-process (DESKTOP_RENDERER_EXIT_FOR_RESTART);
+         * the kernel has reclaimed its work, so restart promptly. */
+        if(pid>0 && WIFEXITED(status) && WEXITSTATUS(status)==76){if(stopping)break;sleep_seconds(1);delay=1;continue;}
         sleep_seconds(delay);if(delay<30)delay=delay>15?30:delay*2;
     }
     return 0;

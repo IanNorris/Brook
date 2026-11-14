@@ -93,4 +93,10 @@ if __name__ == '__main__':
         sys.exit(main())
     except (OSError, RuntimeError) as error:
         print(f'Steam: {error}', file=sys.stderr)
+        # The desktop launcher discards stderr; keep the reason with the log.
+        try:
+            with (Path('/data/home/.local/share/brook') / 'steam-launcher.log').open('a') as log:
+                log.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} Steam: {error}\n')
+        except OSError:
+            pass
         sys.exit(1)

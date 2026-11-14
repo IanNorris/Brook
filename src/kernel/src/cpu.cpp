@@ -1,3 +1,4 @@
+#include "cpu_memory_type_batch.h"
 #include "cpu.h"
 #include "gdt.h"
 #include "serial.h"
@@ -161,6 +162,22 @@ bool CpuObserveMemoryTypes(uint64_t page0,uint64_t page1,brook::CpuMemoryTypeObs
     result.cacheDisabled=(cr0&(1ull<<30))!=0;result.notWriteThrough=(cr0&(1ull<<29))!=0;
     if(!brook::MtrrObservePage(before,page0,result.page0) || !brook::MtrrObservePage(before,page1,result.page1))return false;
     out=result;return true;
+}
+
+bool CpuObserveMemoryTypesBatch(const uint64_t* pages,unsigned count,brook::CpuMemoryTypeObservation* out)
+{
+    struct InterruptGuard {
+        uint64_t flags;
+        InterruptGuard(){__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");}
+        ~InterruptGuard(){if(flags&(1ull<<9))__asm__ volatile("sti":::"memory");}
+    } guard;
+    struct Hw {
+        uint64_t cr0(){return ReadCr0();}
+        uint64_t pat(){return ReadMsr(0x277);}
+        uint32_t cpu(){return brook::SmpCurrentCpuIndex();}
+        bool mtrrs(brook::FramebufferMtrrs& m){return ReadFramebufferMtrrs(m);}
+    } hw;
+    return brook::CpuObserveMemoryTypesBatchWith(hw,pages,count,out);
 }
 
 void CpuInitFpu()

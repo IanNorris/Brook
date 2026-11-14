@@ -59,6 +59,41 @@
 // if the baseline changed before reservation. Existing RESERVE is unchanged.
 #define BROOK_GPU_HANDOFF_RESERVE_DEPENDENT 19
 #define BROOK_GPU_PRESENT_CAP_DEPENDENT 4
+// Zero-copy scanout (kernels built with BROOK_BDW_ZERO_COPY_SCANOUT; runtime
+// gate "gpu zerocopy arm"). The renderer registers 3-4 of its protected
+// outputs, each exactly the panel mode (3200x1800 XRGB8888, stride 12800),
+// once per boot. Presents (regions or frame) whose ticket names a registered
+// image then arm the display plane to it instead of copying; the renderer
+// must keep every image complete (buffer age) and write only images in
+// freeMask. Reserving an image the display may fetch fails. Without the gate
+// the same presents use the normal copy, so the ring is always correct.
+#define BROOK_GPU_PRESENT_CAP_SCANOUT 8
+#define BROOK_GPU_HANDOFF_SCANOUT_REGISTER 20
+#define BROOK_GPU_HANDOFF_SCANOUT_STATUS 21
+/* A restarted renderer adopts the images its predecessor registered (the
+ * kernel keeps one registration per boot): out = struct BrookGpuScanoutImages
+ * with count, mode and fresh fds. -ENOENT none registered (register new
+ * ones), -EPERM not the attached owner, -EBUSY an image is still in use. */
+#define BROOK_GPU_HANDOFF_SCANOUT_ADOPT 22
+/* Argument: an Intel PRIME fd. Returns 1 when its buffer failed on the GPU
+ * (sticky: any job referencing it is refused), else 0. The compositor checks
+ * a client's buffer before sampling it, so one failed client frame cannot
+ * make the compositor's submission fail. */
+#define BROOK_GPU_HANDOFF_BUFFER_FAILED 23
+#define BROOK_GPU_SCANOUT_MAX_IMAGES 4
+#define BROOK_GPU_SCANOUT_FOURCC_XRGB8888 0x34325258u
+#define BROOK_GPU_SCANOUT_REGISTERED 1u
+#define BROOK_GPU_SCANOUT_REQUESTED 2u
+#define BROOK_GPU_SCANOUT_ACTIVE 4u
+#define BROOK_GPU_SCANOUT_DISABLED 8u
+struct BrookGpuScanoutImages {
+    uint32_t count,width,height,stride,fourcc,reserved;
+    int32_t fds[BROOK_GPU_SCANOUT_MAX_IMAGES];
+};
+struct BrookGpuScanoutStatus {
+    uint32_t flags,images,freeMask,front,armed,queued,refusal,reserved;
+    uint64_t sequence,presents,latched,missedVblanks;
+};
 #define BROOK_GPU_RECOVERY_QUEUED 1
 #define BROOK_GPU_RECOVERY_ACTIVE 2
 #define BROOK_GPU_RECOVERY_QUARANTINED 4

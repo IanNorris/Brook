@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "desktop_layers_abi.h"
 #include "gpu_output_abi.h"
+#include "desktop_buffer_age.h"
 #include "brook_debug_frame.h"
 #include "renderer.h"
 #include "graphics_pass.h"
@@ -19,6 +20,8 @@
 #include "desktop_tile.h"
 #include "overlay_copy.h"
 #include "desktop_overlay_cache.h"
+#include "desktop_chrome_cache.h"
+#include "desktop_client_cache.h"
 #include "source_size_policy.h"
 #include "desktop_gpu_channel.h"
 #include "desktop_async_source_barrier.h"
@@ -43,7 +46,7 @@ struct create {uint64_t size;uint32_t handle,pad;};
 struct map_offset {uint32_t handle,pad;uint64_t offset,flags,extensions;};
 struct prime {uint32_t handle,flags;int32_t fd;};
 struct gem_close {uint32_t handle,pad;};
-struct Source {uint32_t handle;int fd;uint64_t size;void *map;unsigned smallUses;};
+struct Source {uint32_t handle;int fd;uint64_t size;void *map;unsigned smallUses;uint64_t serial;};
 struct RenderContext {
     BrookVkRenderer *renderer;int output;uint32_t width,height;uint64_t outputBytes;
     BrookVkGraphicsPass *graphics;
@@ -56,6 +59,8 @@ struct RenderContext {
     uint64_t lastPresentNs;
     struct Source client[BROOK_DESKTOP_LAYER_LIMIT],chrome[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source chromeSpan[BROOK_DESKTOP_LAYER_LIMIT][4];
+    struct DesktopChromeHeld chromeHeld[BROOK_DESKTOP_LAYER_LIMIT];
+    struct DesktopClientHeld clientHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source background,overlay[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
     /* Retained overlay capture: reused while the kernel generation matches. */
     uint64_t overlayGeneration;uint32_t overlayWidth,overlayHeight;
@@ -63,10 +68,19 @@ struct RenderContext {
     struct Source cursor;uint64_t cursorSerial;
     struct BackdropIdentity backdropIdentity;
     struct DesktopDamageState damage;
+    /* Zero-copy scanout ring (g_ring, shared by every context): when set,
+     * this context owns no output; ctx->output names the ring image picked
+     * for the frame being prepared. */
+    unsigned scanoutCount;int scanoutImage;
 };
 struct PendingDesktopFrame {
     long ticket;uint64_t frame,started,nextReport,skippedBytes;uint32_t width,height,visible,skippedLayers;unsigned direct;
     int partial,graphics,quad,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
+    int ringImage; /* 1 + ring image in flight for this frame, 0 = none */
+    /* Regions handed to the kernel when they differ from the frame's own
+     * damage (zero-copy: everything drawn into the image). */
+    struct BrookGpuPresentRegions kernelRegions;int hasKernelRegions;
+    uint64_t presentCallNs,drawPixels;int drawPartial;
     /* Pipelined: an older in-flight frame failed, so this frame's success
      * must not re-establish the change-tracking baseline. */
     int tainted;
@@ -110,6 +124,15 @@ static uint64_t g_lastPresentNs;
 static uint64_t g_idlePollNs=16000000ull;
 enum { DESKTOP_KEEPALIVE_NS=200000000ull };
 static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
+/* Keep unchanged window chrome (kernel keyed capture); BROOK_RENDER_CHROME_KEEP=0 disables. */
+static int g_chromeKeep=1;
+static struct {unsigned long long keeps,keepMisses,captures,bytesCopied;} g_chromeStats;
+/* Keep unchanged CPU client windows (kernel CAPTURE_TRACKED_KEEP);
+ * BROOK_RENDER_CLIENT_KEEP=0 disables. g_clientKeepAccepted: the kernel
+ * has accepted the op at least once (an EINVAL before that means an older
+ * kernel, which disables keeping for good). */
+static int g_clientKeep=1,g_clientKeepAccepted;
+static struct {unsigned long long keeps,keepMisses,captures,bytesCopied,bytesKept,bandReuses;} g_clientStats;
 /* Bounded runs (--frames N) present a minimal frame instead of idling. */
 static int g_neverIdle;
 static uint64_t g_quadSubmitted,g_quadFallback;
@@ -138,8 +161,115 @@ static int present_full(uint64_t ticket,uint32_t width,uint32_t height){
 }
 
 static void source_close(int drm,struct Source *s);
+/* The desktop path never parks: a GPU or handoff failure is logged and the
+ * renderer exits so the supervisor restarts it. Process exit is the kernel's
+ * designed recovery: it quarantines or reclaims any in-flight GPU work and
+ * the buffers it references, so nothing is freed under the device. */
+static uint64_t plan_draw_pixels(const struct QuadPlan *plan){return plan?plan->pixelsShaded:0;}
+static void renderer_exit_for_restart(const char *cause,long detail){
+    fprintf(stderr,"DESKTOP_RENDERER_EXIT_FOR_RESTART cause=%s detail=%ld\n",cause,detail);
+    fflush(stderr);_exit(76);
+}
+/* Zero-copy scanout ring size (0 = off): the kernel advertises
+ * BROOK_GPU_PRESENT_CAP_SCANOUT; BROOK_RENDER_SCANOUT_IMAGES=0|3|4 overrides. */
+static unsigned g_scanoutImages;
+static const char *g_failStage="none";
+#define DESKTOP_OVERLAY_ONLY_NS 250000000ull
+static uint64_t g_lastOverlayOnlyNs,g_overlayOnlySkips;
+/* Per presented frame timeline (CLOCK_MONOTONIC us; on the Dell the same TSC
+ * as the kernel's "gpu zerocopy timeline"): start, quad submit, fence,
+ * present call, present done; ring image, drawn partial/full, drawn pixels,
+ * newest game commit sampled. */
+enum { DESKTOP_TIMELINE=32 };
+/* Report each new GPU-source client commit once so the kernel taskbar's APP
+ * cadence covers GPU clients (their frames never pass the CPU publication
+ * path). A retained offer sampled again is not re-reported; an older kernel
+ * (EINVAL/ENODEV) disables the report. */
+static int g_clientFrameReports=1;
+static uint64_t g_clientFrameIncarnation[BROOK_DESKTOP_LAYER_LIMIT],g_clientFrameCommit[BROOK_DESKTOP_LAYER_LIMIT];
+static void desktop_note_client_frame(uint32_t window,uint64_t incarnation,uint64_t commit){
+    if(!g_clientFrameReports || !window || window>BROOK_DESKTOP_LAYER_LIMIT || !incarnation || !commit)return;
+    const unsigned slot=window-1;
+    if(g_clientFrameIncarnation[slot]==incarnation && g_clientFrameCommit[slot]>=commit)return;
+    g_clientFrameIncarnation[slot]=incarnation;g_clientFrameCommit[slot]=commit;
+    if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CLIENT_FRAME,0L,0L,(long)window,(long)incarnation,(long)commit) &&
+       (errno==EINVAL || errno==ENODEV))g_clientFrameReports=0;
+}
+struct DesktopTimelineRow {uint64_t start,submit,fence,presentCall,presented,commit,drawPixels;int image,partial;};
+static struct DesktopTimelineRow g_timeline[DESKTOP_TIMELINE];static uint64_t g_timelineCount;
+/* Zero-copy active at the last pick: presents then name every region drawn
+ * into the image (own damage plus buffer-age repair), which the kernel's
+ * "flush" cache mode writes back before scanning the image out. */
+static int g_scanoutActive; /* render_frame stage of the last failure, for DESKTOP_ASYNC_RETRY */
+static uint64_t g_scanoutPicks,g_scanoutWaits,g_scanoutStarved,g_scanoutFullDraws,g_scanoutPartialDraws,g_scanoutRepairPixels;
+/* The ring is process-wide: registered once (the kernel accepts one
+ * registration per boot) and used by every render context. */
+static struct DesktopScanoutRing g_ring;static int g_ringFds[DESKTOP_AGE_MAX_IMAGES]={-1,-1,-1,-1};
+static int g_ringTried;static uint64_t g_ringBytes;
+static int scanout_ring_open(uint32_t width,uint32_t height){
+    if(g_ring.count)return 0;
+    if(g_ringTried || width!=3200 || height!=1800 || g_scanoutImages<3 || g_scanoutImages>DESKTOP_AGE_MAX_IMAGES)return -1;
+    g_ringTried=1;
+    /* A previous renderer's ring survives our restart: adopt it (contents
+     * unknown, so every image's first use is a full draw). */
+    {struct BrookGpuScanoutImages adopted;memset(&adopted,0,sizeof(adopted));
+     if(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_ADOPT,&adopted,0,0,0,0)){
+         if(adopted.count<3 || adopted.count>DESKTOP_AGE_MAX_IMAGES || adopted.width!=width || adopted.height!=height){
+             for(unsigned i=0;i<adopted.count && i<DESKTOP_AGE_MAX_IMAGES;++i)if(adopted.fds[i]>=0)close(adopted.fds[i]);
+             fprintf(stderr,"DESKTOP_SCANOUT_ADOPT_MISMATCH count=%u %ux%u single outputs\n",adopted.count,adopted.width,adopted.height);
+             return -1;
+         }
+         const uint64_t bytes=(uint64_t)width*height*4;
+         for(unsigned i=0;i<adopted.count;++i){g_ringFds[i]=adopted.fds[i];
+             const off_t size=lseek(adopted.fds[i],0,SEEK_END);(void)lseek(adopted.fds[i],0,SEEK_SET);
+             g_ringBytes=size>=(off_t)bytes?(uint64_t)size:bytes;}
+         g_ring.count=adopted.count;
+         fprintf(stderr,"DESKTOP_SCANOUT_RING images=%u adopted=1\n",g_ring.count);
+         return 0;
+     }
+     if(errno!=ENOENT){fprintf(stderr,"DESKTOP_SCANOUT_ADOPT_FAILED errno=%d single outputs\n",errno);return -1;}}
+    struct BrookGpuScanoutImages images={g_scanoutImages,width,height,width*4,BROOK_GPU_SCANOUT_FOURCC_XRGB8888,0,{-1,-1,-1,-1}};
+    const uint64_t bytes=(uint64_t)width*height*4;
+    for(unsigned i=0;i<g_scanoutImages;++i){
+        const int fd=(int)syscall(BROOK_SYS_GPU_OUTPUT_ALLOC,(long)bytes,0L,0L,0L,0L,0L);
+        const off_t size=fd>=0?lseek(fd,0,SEEK_END):-1;
+        if(fd<0 || size<(off_t)bytes || lseek(fd,0,SEEK_SET)!=0){if(fd>=0)close(fd);
+            for(unsigned j=0;j<i;++j){close(g_ringFds[j]);g_ringFds[j]=-1;}return -1;}
+        g_ringFds[i]=images.fds[i]=fd;g_ringBytes=(uint64_t)size;
+    }
+    if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_REGISTER,&images,0,0,0,0)){
+        fprintf(stderr,"DESKTOP_SCANOUT_REGISTER_FAILED errno=%d single outputs\n",errno);
+        for(unsigned j=0;j<g_scanoutImages;++j){close(g_ringFds[j]);g_ringFds[j]=-1;}
+        return -1;
+    }
+    g_ring.count=g_scanoutImages;
+    fprintf(stderr,"DESKTOP_SCANOUT_RING images=%u\n",g_ring.count);
+    return 0;
+}
+/* Pick the image for the next frame: free per the kernel (not displayed,
+ * armed, queued or reserved), not in flight here, and youngest. Waits up to
+ * about 25 ms for a latch or a retirement. */
+static int scanout_pick(void){
+    for(unsigned attempt=0;attempt<26;++attempt){
+        struct BrookGpuScanoutStatus status;memset(&status,0,sizeof(status));
+        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_STATUS,&status,0,0,0,0))return -1;
+        const int image=desktop_scanout_ring_pick(&g_ring,status.freeMask);
+        g_scanoutActive=(status.flags&BROOK_GPU_SCANOUT_ACTIVE)!=0;
+        if(image>=0){++g_scanoutPicks;return image;}
+        ++g_scanoutWaits;usleep(1000);
+        if(attempt==25){
+            ++g_scanoutStarved;
+            if(g_scanoutStarved<=8 || !(g_scanoutStarved&(g_scanoutStarved-1)))
+                fprintf(stderr,"DESKTOP_SCANOUT_STARVED kernel_free=0x%x in_flight=0x%x flags=0x%x front=%u armed=%u queued=%u count=%llu\n",
+                    status.freeMask,desktop_scanout_ring_busy(&g_ring),status.flags,status.front,status.armed,status.queued,
+                    (unsigned long long)g_scanoutStarved);
+        }
+    }
+    errno=EAGAIN;return -1;
+}
 static void context_init(struct RenderContext *ctx){
     memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;ctx->cursor.fd=-1;
+    ctx->scanoutImage=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)ctx->overlay[i].fd=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){ctx->client[i].fd=-1;ctx->chrome[i].fd=-1;
         for(unsigned j=0;j<4;++j)ctx->chromeSpan[i][j].fd=-1;}
@@ -147,21 +277,21 @@ static void context_init(struct RenderContext *ctx){
 
 static void context_close(int drm,struct RenderContext *ctx){
     if(ctx->quad && !brook_vk_quad_pass_destroy(ctx->quad)){
-        fprintf(stderr,"DESKTOP_QUAD_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_QUAD_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("quad_destroy_uncertain",0);
     }
     free(ctx->plan);free(ctx->track);
     if(ctx->graphics && !brook_vk_graphics_pass_destroy(ctx->graphics)){
-        fprintf(stderr,"DESKTOP_GRAPHICS_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_GRAPHICS_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_destroy_uncertain",0);
     }
     if(ctx->renderer && !brook_vk_renderer_destroy(ctx->renderer)){
-        fprintf(stderr,"DESKTOP_RENDERER_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_RENDERER_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("renderer_destroy_uncertain",0);
     }
     if(ctx->batchRenderer && !brook_vk_renderer_destroy(ctx->batchRenderer)){
-        fprintf(stderr,"DESKTOP_BATCH_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+        fprintf(stderr,"DESKTOP_BATCH_DESTROY_UNCERTAIN resources retained\n");renderer_exit_for_restart("batch_destroy_uncertain",0);
     }
     free(ctx->batchScenes);source_close(drm,&ctx->batchBackdrop);
     if(ctx->batchOutput>=0)close(ctx->batchOutput);
-    if(ctx->output>=0)close(ctx->output);
+    if(!ctx->scanoutCount && ctx->output>=0)close(ctx->output); /* ring images are process-wide */
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)source_close(drm,&ctx->overlay[i]);
     source_close(drm,&ctx->cursor);
     source_close(drm,&ctx->background);
@@ -175,11 +305,15 @@ static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint
      * resources; keep it (identity and size are checked on use). */
     const struct DesktopDamageState baseline=ctx->damage;
     context_close(drm,ctx);ctx->damage=baseline;
+    if(g_scanoutImages && !scanout_ring_open(width,height)){
+        ctx->scanoutCount=g_ring.count;ctx->output=g_ringFds[0];ctx->outputBytes=g_ringBytes;
+    }else{
     ctx->output=(int)syscall(BROOK_SYS_GPU_OUTPUT_ALLOC,(long)((uint64_t)width*height*4),0L,0L,0L,0L,0L);
     if(ctx->output<0)return -1;
     {const off_t size=lseek(ctx->output,0,SEEK_END);
      if(size<(off_t)((uint64_t)width*height*4) || lseek(ctx->output,0,SEEK_SET)!=0){context_close(drm,ctx);return -1;}
      ctx->outputBytes=(uint64_t)size;}
+    }
     ctx->renderer=brook_vk_renderer_create_multi_output(words,0);
     ctx->plan=calloc(1,sizeof(*ctx->plan));ctx->track=calloc(1,sizeof(*ctx->track));
     if(!ctx->renderer || !ctx->plan || !ctx->track){context_close(drm,ctx);return -1;}
@@ -220,6 +354,7 @@ static int source_open(int drm,uint64_t size,struct Source *out){
     if(out->map==MAP_FAILED)goto fail;
     struct prime prime={gem.handle,O_CLOEXEC|O_RDWR,-1};
     if(ioctl(drm,IOC(0x2d,sizeof(prime)),&prime))goto fail;
+    static uint64_t serials;out->serial=++serials;
     out->fd=prime.fd;return 0;
 fail: source_close(drm,out);return -1;
 }
@@ -406,7 +541,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct BrookVkExternalSource sources[BROOK_VK_MAX_LAYERS];
     uint8_t directSource[BROOK_VK_MAX_LAYERS]={0};
     struct DesktopGpuOffer *directOffer[BROOK_VK_MAX_LAYERS]={0};
-    struct DesktopGpuOffer *preselected[BROOK_DESKTOP_LAYER_LIMIT]={0};uint32_t skipMask=0;
+    struct DesktopGpuOffer *preselected[BROOK_DESKTOP_LAYER_LIMIT]={0};uint32_t skipMask=0,keepMask=0,keptMask=0;
     struct AsyncWindowSource frameSources[BROOK_DESKTOP_LAYER_LIMIT]={{0}};
     unsigned clientSourceIndex[BROOK_DESKTOP_LAYER_LIMIT]={0};
     uint64_t traceReceived=0,traceIncarnation=0,traceCommit=0,traceSubmitStart=0;uint32_t traceWindow=0;
@@ -432,11 +567,41 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             if(preselected[i]){skipMask|=1u<<i;layers.layers[i].pixels=layers.layers[i].capacity=0;continue;}
         }
         if(source_ensure(drm,layers.layers[i].bytes,&client[i]))goto done;
+        if(g_clientKeep && desktop_client_can_keep(&ctx->clientHeld[i],&layers.layers[i],client[i].serial)){
+            keepMask|=1u<<i;desktop_client_keep_request(&ctx->clientHeld[i],&layers.layers[i]);
+        }else desktop_client_forget(&ctx->clientHeld[i]);
         layers.layers[i].pixels=(uintptr_t)client[i].map;layers.layers[i].capacity=client[i].size;
     }
     stage="client_capture";
-    if(syscall(BROOK_SYS_DESKTOP_LAYERS,skipMask?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE:BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED,
-               &layers,sizeof(layers),skipMask,0,0))goto done;
+    {
+        const long legacyOp=skipMask?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE:BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED;
+        const struct BrookDesktopLayers request=layers;
+        long captureResult=syscall(BROOK_SYS_DESKTOP_LAYERS,g_clientKeep?BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP:legacyOp,
+                                   &layers,sizeof(layers),skipMask,g_clientKeep?keepMask:0,0);
+        if(captureResult && g_clientKeep && !g_clientKeepAccepted && errno==EINVAL){
+            /* Older kernel: no client keep. Fall back for good. */
+            g_clientKeep=0;keepMask=0;layers=request;
+            for(unsigned i=0;i<layers.count;++i)desktop_client_forget(&ctx->clientHeld[i]);
+            captureResult=syscall(BROOK_SYS_DESKTOP_LAYERS,legacyOp,&layers,sizeof(layers),skipMask,0,0);
+        }
+        if(captureResult){
+            /* A failed copy may have partly overwritten held buffers. */
+            for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i)desktop_client_forget(&ctx->clientHeld[i]);
+            goto done;
+        }
+        if(g_clientKeep)g_clientKeepAccepted=1;
+        for(unsigned i=0;i<layers.count;++i){
+            if(skipMask&(1u<<i))continue;
+            struct BrookDesktopLayer *l=&layers.layers[i];
+            if(l->flags&BROOK_DESKTOP_LAYER_KEPT){
+                l->flags&=~BROOK_DESKTOP_LAYER_KEPT;keptMask|=1u<<i;++g_clientStats.keeps;g_clientStats.bytesKept+=l->bytes;
+            }else{
+                if(keepMask&(1u<<i))++g_clientStats.keepMisses;
+                ++g_clientStats.captures;g_clientStats.bytesCopied+=l->bytes;
+                if(g_clientKeep)desktop_client_hold(&ctx->clientHeld[i],l,client[i].serial);
+            }
+        }
+    }
     for(unsigned i=0;i<layers.count;++i)desktop_gpu_channel_unselect(&g_gpuChannel,preselected[i],frame);
     timing[1]=monotonic_ns();
     struct BackdropIdentity identity={backdrop.layers[0].incarnation,backdrop.layers[0].generation,
@@ -465,6 +630,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         desktop_damage_add(&footprint,(struct DesktopDamageRect){
             content.x,content.y,(int64_t)content.x+content.width,(int64_t)content.y+content.height},width,height);
         struct DesktopGpuOffer *direct=desktop_gpu_channel_select(&g_gpuChannel,l,width,height,&content,frame);
+        if(direct)desktop_note_client_frame(l->window,l->incarnation,direct->packet.identity.commit);
         if(direct && getenv("BROOK_RENDER_SOURCE_GEOMETRY")){
             static unsigned samples;
             if(samples++<16)fprintf(stderr,"DESKTOP_SOURCE_GEOMETRY window=%u incarnation=%llu commit=%llu source=%ux%u destination=%ux%u fourcc=%08x offset_words=%u stride_words=%u size_words=%llu\n",
@@ -490,16 +656,51 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         *trackWindow=(struct DesktopTrackWindow){.window=l->window,.incarnation=l->incarnation,.direct=direct!=NULL,
             .commit=direct?direct->packet.identity.commit:0};
         memcpy(trackWindow->layer,&content,sizeof(content));
-        if(trackOk && !direct && !desktop_track_bands(&trackWindow->content,client[i].map,client[i].size/4,content.sourceStrideWords,
-                content.sourceX,content.sourceY,content.sourceWidthUsed,content.sourceHeightUsed,NULL))trackOk=0;
-        struct BrookDesktopLayers decor={.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
-        if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_QUERY,&decor,sizeof(decor),0,0,0))goto done;
-        struct BrookDesktopLayer *c=&decor.layers[0];
-        if(c->bytes){
-            if(source_ensure(drm,c->bytes,&chrome[i]))goto done;
-            c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;
+        if(trackOk && !direct){
+            struct DesktopClientHeld *held=&ctx->clientHeld[i];
+            /* Kept pixels are unchanged: reuse their band hashes. */
+            if((keptMask&(1u<<i)) && desktop_client_bands_match(held,content.sourceStrideWords,content.sourceX,content.sourceY,
+                                                                content.sourceWidthUsed,content.sourceHeightUsed)){
+                trackWindow->content=held->bands;++g_clientStats.bandReuses;
+            }else if(!desktop_track_bands(&trackWindow->content,client[i].map,client[i].size/4,content.sourceStrideWords,
+                    content.sourceX,content.sourceY,content.sourceWidthUsed,content.sourceHeightUsed,NULL))trackOk=0;
+            else desktop_client_store_bands(held,&trackWindow->content,content.sourceStrideWords,content.sourceX,content.sourceY,
+                                            content.sourceWidthUsed,content.sourceHeightUsed);
         }
-        if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&decor,sizeof(decor),0,0,0))goto done;
+        struct BrookDesktopLayers decor={.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
+        struct BrookDesktopLayer *c=&decor.layers[0];
+        struct DesktopChromeHeld *held=&ctx->chromeHeld[i];
+        int keptChrome=0;
+        /* Unchanged chrome: keep the pixels this context's buffer already
+         * holds instead of having the kernel re-render and copy the whole
+         * outer window surface every frame. */
+        if(g_chromeKeep && desktop_chrome_can_keep(held,l->window,l->incarnation,chrome[i].serial)){
+            desktop_chrome_keep_request(held,&decor);
+            if(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_KEEP,&decor,sizeof(decor),0,0,0)){
+                keptChrome=1;c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;++g_chromeStats.keeps;
+            }else{
+                ++g_chromeStats.keepMisses;desktop_chrome_forget(held);
+                decor=(struct BrookDesktopLayers){.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
+            }
+        }
+        if(!keptChrome){
+            desktop_chrome_forget(held);
+            if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_QUERY,&decor,sizeof(decor),0,0,0))goto done;
+            if(c->bytes){
+                if(source_ensure(drm,c->bytes,&chrome[i]))goto done;
+                c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;
+            }
+            decor.reserved=0;
+            long keyedOp=g_chromeKeep?BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED:BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
+            if(syscall(BROOK_SYS_DESKTOP_LAYERS,keyedOp,&decor,sizeof(decor),0,0,0)){
+                /* Older kernel: no keyed chrome. Fall back for good. */
+                if(keyedOp!=BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || errno!=EINVAL)goto done;
+                g_chromeKeep=0;decor.reserved=0;
+                if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&decor,sizeof(decor),0,0,0))goto done;
+            }
+            if(c->bytes){++g_chromeStats.captures;g_chromeStats.bytesCopied+=c->bytes;}
+            if(g_chromeKeep && c->bytes)desktop_chrome_hold(held,&decor,chrome[i].serial);
+        }
         if(c->bytes){
             uint32_t opacity=0;if(!desktop_layer_opacity(l,&opacity))goto done;
             /* The OS leaves the client interior of the chrome transparent. */
@@ -573,8 +774,20 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
         struct DesktopDamageSet changes={0};
         if(desktop_track_diff(trackBase,track,&changes)){
+            const uint32_t sceneChanges=changes.count;
             desktop_overlay_damage(overlayBase,&frameOverlay,&changes);
             damage=changes;tracked=1;
+            /* The kernel overlay carries the compositor cadence graph, which
+             * changes with every present: a frame whose only change is the
+             * overlay would cause the next one forever. Present such frames
+             * at most every DESKTOP_OVERLAY_ONLY_NS (clock and indicators
+             * still update); scene, client and cursor changes are immediate. */
+            const int overlayOnly=!sceneChanges && changes.count &&
+                desktop_overlay_cursor_equal(&overlayBase->cursor,&frameOverlay.cursor);
+            if(overlayOnly){const uint64_t now=monotonic_ns();
+                if(g_lastOverlayOnlyNs && now>=g_lastOverlayOnlyNs && now-g_lastOverlayOnlyNs<DESKTOP_OVERLAY_ONLY_NS){
+                    ++g_stats.idleSkips;++g_overlayOnlySkips;result=2;stage="idle";goto done;}
+                g_lastOverlayOnlyNs=now;}
         }
     }
     /* Nothing new relative to an in-flight frame: it will present on its
@@ -620,7 +833,17 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
     BrookVkResult status=BROOK_VK_REJECTED;int testArmed=0,graphicsUsed=0,quadUsed=0;uint32_t traceLayers=count;
     uint32_t statsDraws=0;uint64_t statsShaded=0;
-    struct BrookGpuPresentRegions regionBatch={0};
+    struct BrookGpuPresentRegions regionBatch={0},kernelRegions={0};int hasKernelRegions=0;
+    /* Zero-copy ring: draw into a free image; it must end up complete, so
+     * the draw covers this frame's damage plus every change since the image
+     * last held a frame (buffer age). Presents still name only this frame's
+     * damage, which is exact for the kernel's copy fallback. */
+    int ringImage=-1,ringDrawPartial=0;struct DesktopDamageSet ringDraw={0};
+    if(ctx->scanoutCount){
+        desktop_buffer_age_bind(&g_ring.age,identity.display,identity.generation,width,height);
+        stage="scanout_pick";ringImage=scanout_pick();if(ringImage<0)goto done;
+        ctx->scanoutImage=ringImage;ctx->output=g_ringFds[ringImage];
+    }
     /* Default path: per-layer quads limited to the (16-pixel aligned)
      * damage, drawn into the full-size output; present only those regions.
      * Rejection falls back to the compute paths below. */
@@ -635,9 +858,15 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             qpartial=pixels<(uint64_t)width*height;
         }
         if(!qpartial)qdamage=(struct DesktopDamageSet){1,{{0,0,width,height}}};
+        struct DesktopDamageSet drawDamage=qdamage;
+        if(ringImage>=0){
+            ringDrawPartial=qpartial && desktop_buffer_age_damage(&g_ring.age,(unsigned)ringImage,&qdamage,&drawDamage);
+            if(!ringDrawPartial)drawDamage=(struct DesktopDamageSet){1,{{0,0,width,height}}};
+            ringDraw=drawDamage;
+        }
         struct QuadPlan *plan=ctx->plan;
         stage="quad_plan";
-        if(quad_plan_build_auto(scene,words,holes,&qdamage,g_quadOcclusion,plan) &&
+        if(quad_plan_build_auto(scene,words,holes,&drawDamage,g_quadOcclusion,plan) &&
            async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,plan->used,count)){
             stage="quad_reserve";
             ticket=reserve_output(ctx->output,qpartial?baselineTicket:0,pipe,&rebased);
@@ -646,12 +875,19 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
                 inputs[i]=(struct BrookVkQuadSource){{sources[i].fd,sources[i].syncFd,l[2],l[3],l[0],l[1],(uint64_t)sources[i].words*4u},
                     !directSource[i]};}
-            const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},1};
+            /* Ring images are imported for the frame only (see quad_pass.h). */
+            const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},ctx->scanoutCount?0:1};
             stage="quad_submit";
             statsSubmitStart=monotonic_ns();
             if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
             status=brook_vk_quad_pass_submit(ctx->quad,scene,words,inputs,count,&output,plan);
-            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN resources retained\n");for(;;)pause();}
+            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN stage=submit vk_result=%d (the kernel refused the submission or the device is lost)\n",
+                brook_vk_quad_pass_last_result(ctx->quad));
+                {uint64_t inodes[8];const unsigned n=brook_vk_quad_pass_target_imports(ctx->quad,inodes,8);
+                 struct stat target;const int known=!fstat(ctx->output,&target);
+                 fprintf(stderr,"DESKTOP_QUAD_TARGET_IMPORTS count=%u target_ino=%llu imports=",n,known?(unsigned long long)target.st_ino:0ull);
+                 for(unsigned k=0;k<n && k<8;++k)fprintf(stderr,"%s%llu",k?",":"",(unsigned long long)inodes[k]);
+                 fprintf(stderr,"\n");}renderer_exit_for_restart("quad_submit",brook_vk_quad_pass_last_result(ctx->quad));}
             if(status==BROOK_VK_PENDING){
                 quadUsed=1;++g_quadSubmitted;attemptPartial=qpartial;damage=qdamage;damagePixels=plan->damagePixels;
                 traceLayers=plan->layersDrawn;statsDraws=plan->drawCount;statsShaded=plan->pixelsShaded;
@@ -673,11 +909,24 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                     for(uint32_t i=0;i<presentDamage.count;++i){const struct DesktopDamageRect *r=&presentDamage.rects[i];
                         regionBatch.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,
                             (uint32_t)r->left,(uint32_t)r->top,(uint32_t)(r->right-r->left),(uint32_t)(r->bottom-r->top),width,0};}
+                    /* Zero-copy: the kernel is told every region drawn into the
+                     * image (own damage plus buffer-age repair) so its "flush"
+                     * mode writes them all back. regionBatch keeps the frame's
+                     * own damage: the pipeline carries it as the next frame's
+                     * damage, and carrying the repair (or a full draw) made
+                     * every other frame full (gen 380). */
+                    if(ringImage>=0 && g_scanoutActive){
+                        const struct DesktopDamageSet drawn=ringDrawPartial?ringDraw:(struct DesktopDamageSet){1,{{0,0,width,height}}};
+                        kernelRegions.count=drawn.count;hasKernelRegions=1;
+                        for(uint32_t i=0;i<drawn.count;++i){const struct DesktopDamageRect *r=&drawn.rects[i];
+                            kernelRegions.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,
+                                (uint32_t)r->left,(uint32_t)r->top,(uint32_t)(r->right-r->left),(uint32_t)(r->bottom-r->top),width,0};}
+                    }
                 }
             }else{
                 ++g_quadFallback;
                 if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0)){
-                    fprintf(stderr,"DESKTOP_QUAD_RELEASE_UNCERTAIN resources retained\n");for(;;)pause();}
+                    fprintf(stderr,"DESKTOP_QUAD_RELEASE_UNCERTAIN resources retained\n");renderer_exit_for_restart("quad_release_uncertain",0);}
                 ticket=-1;
                 if(getenv("BROOK_RENDER_DIAGNOSTIC"))fprintf(stderr,"DESKTOP_QUAD_REJECTED compute fallback\n");
             }
@@ -745,11 +994,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
                 status=brook_vk_graphics_pass_submit_regions(ctx->graphics,culledScene,SCENE_HEADER,inputs,batchCount,&output,regions,damage.count);
                 if(status==BROOK_VK_PENDING){graphicsUsed=1;++g_graphicsSubmitted;}
-                else if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_PARTIAL_UNCERTAIN resources retained\n");for(;;)pause();}
+                else if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_PARTIAL_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_partial_uncertain",0);}
                 else {
                     ++g_graphicsFallback;
                     if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0)){
-                        fprintf(stderr,"DESKTOP_GRAPHICS_RELEASE_UNCERTAIN resources retained\n");for(;;)pause();}
+                        fprintf(stderr,"DESKTOP_GRAPHICS_RELEASE_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_release_uncertain",0);}
                     ticket=-1;
                 }
             }
@@ -797,12 +1046,24 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             if(validInputs)status=brook_vk_graphics_pass_submit_scene(ctx->graphics,scene,words,inputs,count,&output);
             if(status==BROOK_VK_PENDING){graphicsUsed=1;++g_graphicsSubmitted;}
             else if(status==BROOK_VK_REJECTED)++g_graphicsFallback;
-            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_SUBMIT_UNCERTAIN resources retained\n");for(;;)pause();}
+            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_GRAPHICS_SUBMIT_UNCERTAIN resources retained\n");renderer_exit_for_restart("graphics_submit_uncertain",0);}
             if(status==BROOK_VK_REJECTED && getenv("BROOK_RENDER_DIAGNOSTIC"))fprintf(stderr,"DESKTOP_GRAPHICS_REJECTED compute fallback\n");
         }
         if(status==BROOK_VK_REJECTED)
             status=pending?brook_vk_renderer_submit_batch_output(ctx->renderer,scene,words,1,sources,count,ctx->output,(size_t)width*height):
                 brook_vk_renderer_compose_multi_output(ctx->renderer,scene,words,sources,count,ctx->output,(size_t)width*height,testArmed?100000000ULL:10000000000ULL);
+    }
+    if(ringImage>=0 && (status==BROOK_VK_PENDING || status==BROOK_VK_COMPLETE)){
+        if(quadUsed || !attemptPartial){
+            /* The image was written: complete for this frame. */
+            desktop_buffer_age_commit(&g_ring.age,(unsigned)ringImage,&damage,!(quadUsed && attemptPartial));
+            if(pending && status==BROOK_VK_PENDING)desktop_scanout_ring_begin(&g_ring,(unsigned)ringImage);
+            else ringImage=-1; /* synchronous: retired below, not in flight */
+            if(quadUsed && ringDrawPartial){++g_scanoutPartialDraws;
+                for(uint32_t i=0;i<ringDraw.count;++i)g_scanoutRepairPixels+=(uint64_t)(ringDraw.rects[i].right-ringDraw.rects[i].left)*
+                    (uint64_t)(ringDraw.rects[i].bottom-ringDraw.rects[i].top);}
+            else ++g_scanoutFullDraws;
+        }else{desktop_buffer_age_reset(&g_ring.age);ringImage=-1;} /* a non-image frame: the images missed its damage */
     }
     /* Compute shades every layer at every damaged pixel. */
     const uint64_t statsDamage=attemptPartial?damagePixels:(uint64_t)width*height;
@@ -819,7 +1080,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .tracePixels=attemptPartial?damagePixels:(uint64_t)width*height,.traceLayers=traceLayers,.traceRegions=attemptPartial?damage.count:1,
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
             .skippedBytes=skippedBytes,.width=width,.height=height,.visible=layers.count,.skippedLayers=skipped,.direct=frameDirect,
-            .partial=attemptPartial,.graphics=graphicsUsed,.quad=quadUsed,.regions=regionBatch,
+            .partial=attemptPartial,.graphics=graphicsUsed,.quad=quadUsed,.regions=regionBatch,.ringImage=ringImage+1,
+            .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,
+            .drawPixels=quadUsed?plan_draw_pixels(ctx->plan):0,.drawPartial=ringImage>=0?ringDrawPartial:attemptPartial,
             .statsLayers=traceLayers,.statsDraws=statsDraws,.statsShaded=statsShaded,.statsDamage=statsDamage,
             .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
@@ -843,7 +1106,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             }
             if(recovery==DESKTOP_FENCE_RETAIN){
                 fprintf(stderr,"DESKTOP_RENDERER_RELEASE_UNCERTAIN result=%ld errno=%d resources retained\n",pending.released,pending.releaseErrno);
-                for(;;)pause();
+                renderer_exit_for_restart("renderer_release_uncertain",0);
             }
             uint64_t now=monotonic_ns();
             if(nextReport && now>=nextReport){
@@ -870,13 +1133,14 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     long observed=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,ticket,0,0,0,0);
     if(observed!=1){
         const int observeErrno=observed<0?errno:0;
-        fprintf(stderr,"DESKTOP_RENDERER_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,observeErrno);for(;;)pause();
+        fprintf(stderr,"DESKTOP_RENDERER_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,observeErrno);renderer_exit_for_restart("renderer_fence_unknown",0);
     }
     timing[4]=monotonic_ns();
     stage=attemptPartial?"region_present":"full_present";
     presentStartNs=monotonic_ns();
     if(attemptPartial){regionBatch.ticket=(uint64_t)ticket;
-        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
+        if(hasKernelRegions)kernelRegions.ticket=(uint64_t)ticket;
+        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,hasKernelRegions?&kernelRegions:&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
     }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
     desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){frameSources,layers.count,frameDirect,attemptPartial,graphicsUsed,
@@ -949,6 +1213,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             (unsigned long)((timing[5]-timing[4])/1000000ull));
 done:
     savedErrno=errno;
+    if(result<0)g_failStage=stage;
     if(result<0){if(presentFailed){++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}else ++g_stats.prepareFailures;}
     /* A failed present may have changed what is on screen. */
     if(result<0 && presentFailed && g_trackDisplayed)g_trackDisplayed->valid=0;
@@ -983,10 +1248,11 @@ static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer
         return 0;
     }
     if(status!=BROOK_VK_COMPLETE){
-        if(p->graphics || p->quad){fprintf(stderr,"DESKTOP_%s_UNCERTAIN result=%d resources retained\n",p->quad?"QUAD":"GRAPHICS",status);for(;;)pause();}
+        if(p->graphics || p->quad){fprintf(stderr,"DESKTOP_%s_UNCERTAIN stage=fence result=%d vk_result=%d\n",p->quad?"QUAD":"GRAPHICS",status,
+            p->quad?brook_vk_quad_pass_last_result(ctx->quad):0);renderer_exit_for_restart("quad_or_graphics_uncertain",0);}
         struct BrookVkFailure failure=brook_vk_renderer_failure(renderer);
         fprintf(stderr,"DESKTOP_ASYNC_UNCERTAIN stage=%d vk_result=%d resources retained\n",failure.stage,failure.result);
-        for(;;)pause();
+        renderer_exit_for_restart("async_uncertain",0);
     }
     p->compositionReady=1;p->statsFence=monotonic_ns();
     p->traceCompleted=getenv("BROOK_RENDER_TIMELINE")?monotonic_ns():0;
@@ -995,15 +1261,15 @@ static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer
 
 static int submit_present(struct PendingDesktopFrame *p){
     long observed=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_OBSERVE,p->ticket,0,0,0,0);
-    if(observed!=1){fprintf(stderr,"DESKTOP_ASYNC_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,errno);for(;;)pause();}
+    if(observed!=1){fprintf(stderr,"DESKTOP_ASYNC_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,errno);renderer_exit_for_restart("async_fence_unknown",0);}
     if(!async_sources_presentable(g_asyncSourceBarriers,p->sources,p->visible)){
         if(getenv("BROOK_RENDER_ASYNC_TRACE"))fprintf(stderr,"DESKTOP_ASYNC_STALE_CPU ticket=%ld\n",p->ticket);
         errno=ESTALE;return -1;
     }
-    p->regions.ticket=(uint64_t)p->ticket;
+    p->regions.ticket=(uint64_t)p->ticket;p->kernelRegions.ticket=(uint64_t)p->ticket;p->presentCallNs=monotonic_ns();
     if(p->partial){
         const long op=g_asyncPresent?BROOK_GPU_HANDOFF_QUEUE_REGIONS:BROOK_GPU_HANDOFF_PRESENT_REGIONS;
-        return (int)syscall(BROOK_SYS_GPU_HANDOFF_CTL,op,&p->regions,0,0,0,0);
+        return (int)syscall(BROOK_SYS_GPU_HANDOFF_CTL,op,p->hasKernelRegions?&p->kernelRegions:&p->regions,0,0,0,0);
     }
     if(!g_asyncPresent)return present_full((uint64_t)p->ticket,p->width,p->height);
     struct BrookGpuPresentFrame frame={(uint64_t)p->ticket,p->width,p->height,p->width,0};
@@ -1022,7 +1288,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
         if(!status)return 0;
         if(status<0){
             fprintf(stderr,"DESKTOP_ASYNC_PRESENT_UNKNOWN ticket=%ld errno=%d resources retained\n",p->ticket,errno);
-            for(;;)pause();
+            renderer_exit_for_restart("async_present_unknown",0);
         }
         g_presentingTicket=0;
         result=status==1?0:-1;
@@ -1066,6 +1332,10 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
             desktop_async_damage_retire(displayedDamage,p->damage,p->partial,0);
         (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,p->ticket,0,0,0,0);}
     desktop_gpu_channel_finish(&g_gpuChannel,p->frame);
+    if(!result){struct DesktopTimelineRow *t=&g_timeline[g_timelineCount++%DESKTOP_TIMELINE];
+        *t=(struct DesktopTimelineRow){p->traceStart,p->statsSubmitStart,p->statsFence,p->presentCallNs,*presented,
+            p->direct?p->traceCommit:0,p->drawPixels,p->ringImage-1,p->drawPartial};}
+    if(p->ringImage){desktop_scanout_ring_end(&g_ring,(unsigned)(p->ringImage-1));p->ringImage=0;}
     if(!result && p->graphics && getenv("BROOK_RENDER_GRAPHICS_TIMING") && p->traceStart && p->traceSubmitStart &&
        p->traceSubmitStart>=p->traceStart && p->started>=p->traceSubmitStart && p->traceCompleted>=p->started && *presented>=p->traceCompleted){
         static unsigned samples;
@@ -1110,7 +1380,37 @@ static void stats_init(unsigned depth){
 static void stats_publish(uint64_t now){
     const struct DesktopStatsMeta meta={++g_statsOutput.seq,now,g_statsOutput.startedNs,g_statsOutput.failures,(long)getpid(),
         g_statsOutput.depth,g_asyncPresent,getenv("BROOK_RENDER_GPU_TIMESTAMPS")!=NULL,g_pipeline};
-    const size_t length=desktop_stats_format(&g_stats,&meta,g_statsJson,sizeof(g_statsJson));
+    size_t length=desktop_stats_format(&g_stats,&meta,g_statsJson,sizeof(g_statsJson));
+    /* Zero-copy ring counters and the frame timeline, spliced in before the
+     * closing brace. */
+    if(length){
+        size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
+        if(end){char tail[1024];
+            const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
+                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,"
+                "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu},"
+                "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
+                (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
+                (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
+                (unsigned long long)g_overlayOnlySkips,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
+                g_chromeStats.captures,g_chromeStats.bytesCopied,g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
+                g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
+            if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
+            /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
+            char rows[DESKTOP_TIMELINE*120+64];size_t used=0;
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
+            const uint64_t first=g_timelineCount>DESKTOP_TIMELINE?g_timelineCount-DESKTOP_TIMELINE:0;
+            for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-128;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
+                used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s[%llu,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu]",k>first?",":"",
+                    (unsigned long long)(t->start/1000),(unsigned long long)(t->submit/1000),(unsigned long long)(t->fence/1000),
+                    (unsigned long long)(t->presentCall/1000),(unsigned long long)(t->presented/1000),t->image,t->partial,
+                    (unsigned long long)t->drawPixels,(unsigned long long)t->commit);}
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"]}\n");
+            /* replace the final "}\n" of the spliced block with the timeline */
+            if(length>=2 && g_statsJson[length-2]=='}' && length-2+used<sizeof(g_statsJson)){
+                memcpy(g_statsJson+length-2,rows,used);length=length-2+used;}
+        }
+    }
     const int fd=length?open(g_statsOutput.temporary,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644):-1;
     int ok=fd>=0;
     for(size_t done=0;ok && done<length;){const ssize_t n=write(fd,g_statsJson+done,length-done);
@@ -1149,8 +1449,21 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     uint64_t fullWaitNs=0;unsigned fullWaits=0;
     unsigned frames=0,partialFrames=0,retries=0,unsupportedRetries=0,idleBusyRetries=0,active=0,maxActive=0;uint64_t previous=0,maxInterval=0,failureStart=0;unsigned gaps=0;
     uint64_t idleUntil=0;unsigned idlePolls=0;long waitedTicket=0;
+    uint64_t stopSince=0;
     while((!g_asyncStop && (!limit || frames<limit)) || active){
         stats_tick(0);
+        /* A stop request drains in-flight frames, but only for a bounded
+         * time: a present the kernel never completes must not hold a
+         * checked shutdown. Leaving without destroying anything is the
+         * same as the tested crash path; the kernel quarantines and
+         * releases the owner's GPU work on exit. */
+        if(g_asyncStop && active){
+            const uint64_t now=monotonic_ns();if(!stopSince)stopSince=now;
+            if(desktop_stop_drain_expired(stopSince,now)){
+                fprintf(stderr,"DESKTOP_RENDERER_STOP_ABANDON active=%u presenting=%ld\n",active,g_presentingTicket);
+                fflush(stderr);_exit(0);
+            }
+        }
         const uint64_t fullSince=active==depth?monotonic_ns():0;
         int progress=0;
         /* Pipelined frames retire strictly in ticket order: a younger frame
@@ -1240,7 +1553,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                 if(failure==ENOTSUP)++unsupportedRetries;
                 if(failure==EBUSY && !active)++idleBusyRetries;
                 desktop_retry_failure(&retry,failure,active,now);
-                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d\n",failure);
+                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d stage=%s\n",failure,g_failStage);
                 break;
             }
             ctx[i].damage=displayedDamage;
@@ -1257,7 +1570,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                 if(failure==ENOTSUP)++unsupportedRetries;
                 if(failure==EBUSY && !active)++idleBusyRetries;
                 desktop_retry_failure(&retry,failure,active,now);
-                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d\n",failure);
+                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d stage=%s\n",failure,g_failStage);
                 if(failure==ENOTSUP || (failure==EBUSY && !active))break;}
         }
         if(limit && !active && failureStart){uint64_t now=monotonic_ns();
@@ -1323,6 +1636,15 @@ int main(int argc,char **argv){
     const long caps=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_CAPS,0,0,0,0,0);
     g_presentFrame=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_FRAME);
     g_dependentPartial=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_DEPENDENT);
+    /* Zero-copy ring: only where the kernel can scan out renderer images.
+     * Until "gpu zerocopy arm" the kernel copies from the images as before. */
+    {const char *ring=getenv("BROOK_RENDER_SCANOUT_IMAGES");
+     g_scanoutImages=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_SCANOUT)?4u:0u;
+     if(ring && g_scanoutImages){
+         if(!strcmp(ring,"0"))g_scanoutImages=0;
+         else if(!strcmp(ring,"3"))g_scanoutImages=3;
+         else if(strcmp(ring,"4")){fprintf(stderr,"BROOK_RENDER_SCANOUT_IMAGES must be 0, 3 or 4\n");close(drm);return 2;}
+     }}
     /* Pipelined admission (the default; BROOK_RENDER_PIPELINE=1 or
      * "serial" opts out) prepares the next frame while the previous one
      * composes or presents. It needs the buffered partial renderer and
@@ -1349,6 +1671,8 @@ int main(int argc,char **argv){
     g_quadMode=!(compose && !strcmp(compose,"compute"));
     g_quadOcclusion=!getenv("BROOK_RENDER_QUAD_NO_OCCLUSION");
     g_chromeHoles=!getenv("BROOK_RENDER_CHROME_FULL");
+    {const char *keep=getenv("BROOK_RENDER_CHROME_KEEP");g_chromeKeep=!(keep && keep[0]=='0');}
+    {const char *keep=getenv("BROOK_RENDER_CLIENT_KEEP");g_clientKeep=!(keep && keep[0]=='0');}
     g_trackDamage=!getenv("BROOK_RENDER_FOOTPRINT_DAMAGE");
     const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");
     if(idlePoll){char *end=NULL;unsigned long ms=strtoul(idlePoll,&end,10);if(end && !*end && ms && ms<=100)g_idlePollNs=ms*1000000ull;}

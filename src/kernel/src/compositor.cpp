@@ -7,6 +7,7 @@
 #include "scene_damage.h"
 #include "desktop_backdrop.h"
 #include "compositor_present_lease.h"
+#include "compositor_row_filter.h"
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
@@ -94,6 +95,20 @@ static uint32_t           g_physFbStride = 0; // in pixels
 // via memcpy is much faster than scattered pixel writes.
 static uint32_t* g_backBuffer     = nullptr;
 static uint32_t  g_backBufStride  = 0; // in pixels (matches physFb stride)
+
+// Cached copy of what the software path last wrote to the firmware framebuffer
+// (compositor_row_filter.h). Only trusted after a complete software frame; any
+// other framebuffer writer invalidates it. Guarded by g_scanoutMappingLock.
+static uint32_t* g_gopShadow=nullptr;
+static uint64_t  g_gopShadowPages=0;
+static uint32_t  g_gopShadowWidth=0,g_gopShadowHeight=0;
+static bool      g_gopShadowValid=false;
+static CompositorIdleStats g_idleStats{};
+// Set while this frame's back buffer was drawn without the CPU overlay (a
+// renderer held the lease); software scanout waits for the full repaint that
+// lease expiry or release triggers.
+static bool g_backBufferOverlayOmitted=false;
+static void GopShadowInvalidate(){g_gopShadowValid=false;++g_idleStats.shadowInvalidations;}
 
 // Dirty-region tracking: only copy scanlines that changed to MMIO.
 // At 1920×1080×4, a full flip is ~8MB of MMIO writes.  With dirty tracking
@@ -1897,7 +1912,9 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
     for(uint32_t i=0;i<rectCount;++i)g_debugFrameDirty[i]=rects[i];
     g_debugFrameDirtyCount=rectCount;
     const uint64_t hash=OverlayHashRects(pixels,width,height,rects,rectCount);
+    ++g_idleStats.overlayRenders;
     if(!g_overlayHashValid || hash!=g_overlayHash){
+        ++g_idleStats.overlayBumps;
         g_overlayHash=hash;g_overlayHashValid=true;
         __atomic_add_fetch(&g_overlayGeneration,1,__ATOMIC_ACQ_REL);
     }
@@ -2072,10 +2089,15 @@ static void CompositorLoopWM()
     // The taskbar (drawn every pass, like the clock) reads only this cache.
     WmNetworkIndicatorRefresh(now);
     WmVolumeIndicatorRefresh();
+    WmVolumeFeedbackTick(now);
     // Opening or closing the volume popup exposes or covers scene pixels, so
     // repaint once on the transition (both the CPU and overlay-layer paths).
     static bool volumePopupShown=false;
     if(WmVolumePopupVisible()!=volumePopupShown){volumePopupShown=!volumePopupShown;CompositorMarkDirty();}
+    // The CPU path marks only the launcher's rows while it is open, so its
+    // disappearance (or appearance) repaints the scene underneath once.
+    static bool launcherShown=false;
+    if(WmLauncherVisible()!=launcherShown){launcherShown=!launcherShown;CompositorMarkDirty();}
     // Likewise when the floating tray tooltip appears, moves or goes away.
     {
         static DesktopOverlayRect tooltipShown{};
@@ -2090,7 +2112,17 @@ static void CompositorLoopWM()
     int32_t summaryX=0,summaryY=0;uint32_t summaryW=0,summaryH=0;
     const bool showSummary=WmBootSummaryRect(g_physFbWidth,g_physFbHeight,&summaryX,&summaryY,&summaryW,&summaryH);
     if(summaryShown && !showSummary)CompositorMarkDirty();
-    bool forceAll = !CompositorGpuActive() && (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
+    // A renderer holding the present lease owns the screen: the back buffer is
+    // not scanned out, so the periodic forced CPU repaint and CPU-path overlay
+    // drawing are skipped. Expiry or release forces a full repaint first.
+    bool rendererLeased=false;
+    if(!CompositorGpuActive()){
+        CompositorMutexGuard lease(&g_scanoutMappingLock);
+        rendererLeased=g_presentLease.Active(now) || g_gopWriter;
+    }
+    if(rendererLeased)++g_idleStats.leaseActiveLoops;
+    g_backBufferOverlayOmitted=rendererLeased;
+    bool forceAll = !CompositorGpuActive() && !rendererLeased && (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
     // Determine if we need a full scene repaint (wallpaper + all windows)
@@ -2329,6 +2361,7 @@ static void CompositorLoopWM()
 
     // 3. Render taskbar at bottom of screen + launcher popup if open.
     uint32_t tbY = WmDesktopHeight(g_physFbHeight);
+    const bool cpuOverlayLeased=!drawOverlayLayer && rendererLeased;
     if (drawOverlayLayer)
     {
         // GPU DRAW: render into the overlay layer (composited on top of windows
@@ -2378,8 +2411,16 @@ static void CompositorLoopWM()
             MarkDirtyRows(ty > 0 ? (uint32_t)ty : 0, (uint32_t)(ty + (int)th));
         }
     }
+    else if (g_backBuffer && cpuOverlayLeased)
+    {
+        // A renderer holds the present lease and captures the taskbar and
+        // popups itself (RenderDesktopOverlay); nothing scans this buffer out.
+        // Lease expiry or release forces a full repaint, which draws them.
+        ++g_idleStats.cpuOverlaySkips;
+    }
     else if (g_backBuffer)
     {
+        ++g_idleStats.cpuOverlayDraws;
         WmRenderTaskbar(g_backBuffer, g_backBufStride,
                         g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
         MarkDirtyRows(tbY, g_physFbHeight);
@@ -2391,7 +2432,10 @@ static void CompositorLoopWM()
                              g_physFbWidth, g_physFbHeight,
                              chromeMx, chromeMy);
             // Mark the launcher area dirty (it's above the taskbar)
-            MarkDirtyRows(0, g_physFbHeight);
+            int32_t lx, ly; uint32_t lw, lh;
+            WmLauncherGetRect(g_physFbWidth, g_physFbHeight, &lx, &ly, &lw, &lh);
+            const uint32_t top=ly>0?uint32_t(ly):0;
+            MarkDirtyRows(top, uint32_t(int64_t(ly)+lh)>g_physFbHeight?g_physFbHeight:uint32_t(int64_t(ly)+lh));
         }
         if (WmVolumePopupVisible())
         {
@@ -3830,6 +3874,20 @@ static void CompositorExpirePresentLease()
     {CompositorMutexGuard geometry(&g_scanoutMappingLock);expired=g_presentLease.Expire(ApicTickCount());}
     if(expired)CompositorMarkDirty();
 }
+static bool GopShadowEnsure()
+{
+    const uint64_t pages=(uint64_t(g_physFbWidth)*g_physFbHeight*4+4095)/4096;
+    if(g_gopShadow && g_gopShadowWidth==g_physFbWidth && g_gopShadowHeight==g_physFbHeight)return true;
+    g_gopShadowValid=false;
+    if(pages>g_gopShadowPages){
+        auto buffer=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
+        if(!buffer)return false;
+        if(g_gopShadowPages)VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(g_gopShadow)),g_gopShadowPages);
+        g_gopShadow=reinterpret_cast<uint32_t*>(buffer.raw());g_gopShadowPages=pages;
+    }
+    g_gopShadowWidth=g_physFbWidth;g_gopShadowHeight=g_physFbHeight;
+    return true;
+}
 static void CompositorFlipSoftware()
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -3837,13 +3895,22 @@ static void CompositorFlipSoftware()
     // A kernel flip buffer may be on screen: the GOP must receive a complete
     // frame before it is re-armed (no GPU present is in flight here).
     const bool flipAway=!g_gopWriter && !g_presentLease.Active(ApicTickCount()) && brook::BdwScanoutFlipAwayFromGop();
-    const bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair || flipAway;
+    bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair || flipAway;
 #else
-    const bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair;
+    bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair;
 #endif
     const uint64_t tick=ApicTickCount();
-    if(g_gopWriter || g_presentLease.Active(tick) || !g_physFb || !g_backBuffer ||
-       (!full && g_dirtyMinY>=g_dirtyMaxY))return;
+    // Another writer owns the framebuffer: what it holds is no longer ours.
+    if(g_gopWriter || g_presentLease.Active(tick)){if(g_gopShadowValid)GopShadowInvalidate();return;}
+    if(!g_physFb || !g_backBuffer || (!full && g_dirtyMinY>=g_dirtyMaxY))return;
+    // The lease ended during this frame: its back buffer lacks the taskbar.
+    // Keep the dirty span; the next frame repaints fully before scanout.
+    if(g_backBufferOverlayOmitted)return;
+    const bool shadow=GopShadowEnsure();
+    if(!shadow)++g_idleStats.shadowUnavailable;
+    // An untrusted shadow is refreshed by one complete frame, after which only
+    // rows whose pixels changed reach the framebuffer.
+    if(shadow && !g_gopShadowValid)full=true;
     // The scanout still contains the renderer's frame if its lease expired
     // during this loop. Replace the whole frame on software takeover.
     uint32_t minY=full?0:g_dirtyMinY;
@@ -3851,14 +3918,28 @@ static void CompositorFlipSoftware()
     if(maxY>g_physFbHeight)maxY=g_physFbHeight;
     g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
     if(minY>=maxY)return;
-    for(uint32_t y=minY;y<maxY;++y)
-        __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),
-                         g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
+    ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
+    const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
+    auto copyRow=[&](uint32_t y){
+        __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),g_backBuffer+y*g_backBufStride,rowBytes);
+    };
+    uint32_t flushMin=minY,flushMax=maxY;
+    if(shadow){
+        const auto r=GopRowFilterCopy(g_backBuffer,g_backBufStride,g_gopShadow,g_physFbWidth,g_physFbWidth,
+                                      minY,maxY,!full,copyRow);
+        g_idleStats.rowsCopied+=r.copied;g_idleStats.rowsSkipped+=r.skipped;g_idleStats.bytesCopied+=r.copied*rowBytes;
+        flushMin=r.minY;flushMax=r.maxY;
+        if(full && minY==0 && maxY==g_physFbHeight)g_gopShadowValid=true;
+    }else{
+        for(uint32_t y=minY;y<maxY;++y)copyRow(y);
+        g_idleStats.rowsCopied+=maxY-minY;g_idleStats.bytesCopied+=(maxY-minY)*rowBytes;
+    }
+    if(full)++g_idleStats.fullFlips;
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     // The GOP now holds the complete software frame; arm it (latched at vblank).
     if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
 #endif
-    brook::DisplayFlush(minY,maxY);
+    if(flushMin<flushMax)brook::DisplayFlush(flushMin,flushMax);
     if(g_scanoutContainsLeasedFrame){
         ++g_softwareTakeover.count;
         g_softwareTakeover.lastAgeMs=tick-g_leasedFrameTick;
@@ -3866,12 +3947,19 @@ static void CompositorFlipSoftware()
     g_scanoutContainsLeasedFrame=false;
     if(minY==0 && maxY==g_physFbHeight)g_scanoutNeedsRepair=false;
 }
+CompositorIdleStats CompositorReadIdleStats(bool reset)
+{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const auto s=g_idleStats;if(reset)g_idleStats={};return s;
+}
 static void CompositorLoop()
 {
     FrameTimingScope framePhase(FramePhase::Preparation);
     if (!g_physFb)
         return;
     CompositorExpirePresentLease();
+    ++g_idleStats.loops;
+    g_backBufferOverlayOmitted=false;
     // Apply material changes at a frame boundary so chrome and GPU backdrops agree.
     const auto material=WmGetAppearance();
     if(material!=__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)){
@@ -3886,6 +3974,7 @@ static void CompositorLoop()
             previous=stage;BootLogoProgress(stage,pending?"Desktop assets":"Ready");
             if(g_backBuffer)for(uint32_t y=0;y<g_physFbHeight;++y)
                 memcpy(const_cast<uint32_t*>(g_physFb)+y*g_physFbStride,g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
+            {CompositorMutexGuard geometry(&g_scanoutMappingLock);GopShadowInvalidate();}
             DisplayFlush(0,g_physFbHeight);
             if(!pending) SchedulerSleepMs(50);
         }
@@ -4283,7 +4372,7 @@ int CompositorReserveGopWrite(CompositorGopWrite& write,const CompositorPresentR
         if(r.y+r.height>maxY)maxY=r.y+r.height;
     }
     if(g_nextGopWriter==~uint64_t{0})return -75;
-    g_gopWriter=++g_nextGopWriter;
+    g_gopWriter=++g_nextGopWriter;GopShadowInvalidate();
     g_gopWriterOwner=owner;
     g_gopWriterRevoked=false;
     write={g_gopWriter,display,backdrop,owner,minY,maxY,partial};
@@ -4365,7 +4454,7 @@ int CompositorPresentProbe(uint32_t x,uint32_t y,uint32_t width,uint32_t height,
            width>g_physFbWidth-x || height>g_physFbHeight-y)return -22;
         for(uint32_t row=0;row<height;++row){
             void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(y+row)*g_physFbStride+x);
-            touched=true;
+            touched=true;if(g_gopShadowValid)GopShadowInvalidate();
             if(!copy(source,uint64_t(row)*stride*4,dest,uint64_t(width)*4)){result=-5;break;}
         }
         if(!result){
@@ -4429,7 +4518,7 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
             const auto& r=regions[i];
             for(uint32_t row=0;row<r.height;++row){
                 void* dest=const_cast<uint32_t*>(g_physFb+uint64_t(r.y+row)*g_physFbStride+r.x);
-                touched=true;
+                touched=true;if(g_gopShadowValid)GopShadowInvalidate();
                 if(!copy(source,r.offset+uint64_t(row)*r.stride*4,dest,uint64_t(r.width)*4)){result=-5;break;}
             }
         }
@@ -4541,6 +4630,7 @@ void CompositorRemap(uint64_t fbPhys,uint32_t w,uint32_t h,uint32_t stridePixels
     // Previous backbuffers remain allocated for existing scanout aliases.
     // Commit storage and geometry together only after successful preparation.
     g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
+    GopShadowInvalidate();
     g_backBuffer=buffer;g_backBufStride=stridePixels;
     if(g_displayGeneration)++g_displayGeneration;
     TtyRedirectToBackbuffer(buffer);
@@ -4605,6 +4695,7 @@ int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
     if (maxY > g_physFbHeight) maxY = g_physFbHeight;
     if (minY >= maxY) return 0; // nothing to do
 
+    GopShadowInvalidate();
     // Copy dirty rows from cached backbuffer to MMIO framebuffer.
     // This is the expensive part — MMIO writes are uncacheable.
     uint32_t rowBytes = g_physFbWidth * 4;

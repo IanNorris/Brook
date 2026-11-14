@@ -7,6 +7,10 @@ namespace brook {
 // publishes the pages, and retains them until all GPU users have retired.
 // This function never touches hardware or makes the image GPU-visible.
 struct BdwPpgttPage { uint64_t dma; uint8_t* cpu; };
+// Largest private table set for one image (root, intermediate and leaf
+// tables). 512 tables map at least 1 GiB densely (65,536 pages need about
+// 130); sparser or larger sets are refused, never truncated.
+constexpr uint32_t BdwPpgttMaxTables=512;
 enum class BdwPpgttCache : uint8_t { WriteBack, Uncached };
 struct BdwPpgttMapping {
     uint64_t address, dma;
@@ -55,7 +59,7 @@ inline bool BdwBuildPpgttImage(const BdwPpgttPage (&scratch)[4],
                                const BdwPpgttMapping* maps,uint32_t mapCount,bool sorted=false,
                                const BdwPpgttLeaf* leaves=nullptr,uint32_t leafCount=0) {
     constexpr uint64_t gpuLimit=uint64_t{1}<<48, dmaLimit=uint64_t{1}<<39;
-    constexpr uint32_t maxTables=128,maxUnsortedMappings=1024,maxSortedMappings=65536;
+    constexpr uint32_t maxTables=BdwPpgttMaxTables,maxUnsortedMappings=1024,maxSortedMappings=65536;
     if(!tables || !tableCount || tableCount>maxTables || !maps || !mapCount ||
        mapCount>(sorted?maxSortedMappings:maxUnsortedMappings) ||
        (leafCount && !leaves) || leafCount>BdwPpgttMaxLeaves)return false;
@@ -76,12 +80,25 @@ inline bool BdwBuildPpgttImage(const BdwPpgttPage (&scratch)[4],
            overlaps(addr,4096,reinterpret_cast<uintptr_t>(maps),sizeof(*maps)*mapCount))return false;
         for(uint32_t j=0;j<i;++j)if(p.dma==page(j).dma || p.cpu==page(j).cpu)return false;
     }
+    // Sorted copy of the table/scratch DMA addresses: each mapping is checked
+    // against them with a binary search instead of a linear scan.
+    uint64_t tableDma[maxTables+4];const uint32_t tableDmaCount=tableCount+4;
+    for(uint32_t i=0;i<tableDmaCount;++i){
+        const uint64_t v=page(i).dma;uint32_t j=i;
+        while(j && tableDma[j-1]>v){tableDma[j]=tableDma[j-1];--j;}
+        tableDma[j]=v;
+    }
+    auto isTableDma=[&](uint64_t dma){
+        uint32_t lo=0,hi=tableDmaCount;
+        while(lo<hi){const uint32_t mid=lo+(hi-lo)/2;if(tableDma[mid]<dma)lo=mid+1;else hi=mid;}
+        return lo<tableDmaCount && tableDma[lo]==dma;
+    };
     uint32_t needed=1;
     for(uint32_t i=0;i<mapCount;++i) {
         const auto& m=maps[i];
         if((m.address&4095) || m.address>=gpuLimit || !m.dma || (m.dma&4095) || m.dma>=dmaLimit ||
            (m.cache!=BdwPpgttCache::WriteBack && m.cache!=BdwPpgttCache::Uncached))return false;
-        for(uint32_t j=0;j<tableCount+4;++j)if(m.dma==page(j).dma)return false;
+        if(isTableDma(m.dma))return false;
         bool l4=false,l3=false,l2=false;
         if(sorted && i) {
             // For a sorted set only the immediate predecessor can share a
@@ -129,11 +146,17 @@ inline bool BdwBuildPpgttImage(const BdwPpgttPage (&scratch)[4],
     fill(scratch[0],0);fill(scratch[1],scratch[0].dma|0x81);
     fill(scratch[2],scratch[1].dma|3);fill(scratch[3],scratch[2].dma|3);
     fill(tables[0],scratch[3].dma|3);uint32_t used=1;
+    // Path cache: the table reached below each level for the previous
+    // mapping. Sorted mappings revisit a prefix only consecutively, so a
+    // matching prefix reuses that table without walking from the root.
+    uint64_t pathPrefix[4]={~uint64_t{0},~uint64_t{0},~uint64_t{0},~uint64_t{0}};uint32_t pathTable[4]={0,0,0,0};
     for(uint32_t i=0;i<mapCount;++i) {
         const auto& m=maps[i];uint32_t current=0;
         for(unsigned level=3;level>0;--level) {
+            const unsigned shift=12+9*level;const uint64_t prefix=m.address>>shift;
+            if(pathPrefix[level]==prefix){current=pathTable[level];continue;}
             auto* words=reinterpret_cast<uint64_t*>(tables[current].cpu);
-            const unsigned index=unsigned((m.address>>(12+9*level))&511);
+            const unsigned index=unsigned(prefix&511);
             const uint64_t empty=scratch[level].dma|3;
             if(words[index]==empty) {
                 const uint32_t next=used++;
@@ -144,6 +167,8 @@ inline bool BdwBuildPpgttImage(const BdwPpgttPage (&scratch)[4],
                 uint32_t next=1;while(next<used && tables[next].dma!=child)++next;
                 current=next;
             }
+            pathPrefix[level]=prefix;pathTable[level]=current;
+            for(unsigned lower=level-1;lower>0;--lower)pathPrefix[lower]=~uint64_t{0};
         }
         // The owner verifies private PAT index 4 (PAT) for WB and index
         // 3 (PCD | PWT) for UC before publishing these leaf mappings.

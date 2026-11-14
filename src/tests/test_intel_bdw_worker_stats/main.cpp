@@ -16,13 +16,13 @@ int main() {
     m.End(5); // no boundary yet: ignored
     m.Begin(BdwWorkerIdle,100);m.End(200);                 // idle 100
     m.Begin(BdwWorkerApplication,250);                      // other 50
-    m.Render(3,2,40,true,6u<<7,10u<<7);m.End(400);          // app 150
+    m.Render(3,2,40,7,5,21,true,6u<<7,10u<<7);m.End(400);          // app 150
     m.Begin(BdwWorkerCompositor,400);                       // other 0
-    m.Render(0,0,0,false,0,0);m.End(450);                   // compositor 50
+    m.Render(0,0,0,0,0,0,false,0,0);m.End(450);                   // compositor 50
     m.Begin(BdwWorkerPresent,460);                          // other 10
     const uint64_t ticks[BdwPresentStageCount]={1,2,3,4,10};
     m.Present(false,64,ticks,0);
-    m.Render(9,9,9,true,0,0); // ignored outside an RCS interval
+    m.Render(9,9,9,0,0,0,true,0,0); // ignored outside an RCS interval
     m.PresentFailed();m.End(470);                           // present 10
     CHECK(m.Read(s));
     CHECK(s.elapsedTicks==370);
@@ -32,6 +32,8 @@ int main() {
           s.classes[BdwWorkerOther].ticks==60 && s.classes[BdwWorkerOther].count==3);
     CHECK(s.yields[0].jobs==1 && s.yields[0].yields==3 && s.yields[0].breadcrumbYields==2 &&
           s.yields[0].sleepTicks==40 && s.yields[0].buckets[3]==1);
+    CHECK(s.yields[0].spins==7 && s.yields[0].breadcrumbSpins==5 && s.yields[0].spinTicks==21 &&
+          s.yields[1].spins==0 && s.yields[2].spins==0);
     CHECK(s.yields[1].jobs==1 && s.yields[1].buckets[0]==1 && s.frequency[1].missing==1);
     CHECK(s.frequency[0].issue.samples==1 && s.frequency[0].issue.minMhz==300 && s.frequency[0].end.maxMhz==500 &&
           s.frequency[0].rising==1);
@@ -39,7 +41,7 @@ int main() {
           s.present[1][BdwPresentBlit].maxTicks==3 && s.presentPixels[1]==64 && s.present[0][BdwPresentTotal].count==0);
     CHECK(s.presentFailed==1 && s.yields[2].jobs==1 && s.yields[2].buckets[0]==1);
 
-    m.Begin(BdwWorkerApplication,500);m.Render(0,0,0,true,8u<<7,8u<<7);m.End(600);
+    m.Begin(BdwWorkerApplication,500);m.Render(0,0,0,0,0,0,true,8u<<7,8u<<7);m.End(600);
     CHECK(m.Read(s) && s.frequency[0].issue.samples==2 && s.frequency[0].issue.minMhz==300 &&
           s.frequency[0].issue.maxMhz==400 && s.frequency[0].issue.sumMhz==700 && s.frequency[0].rising==1);
 

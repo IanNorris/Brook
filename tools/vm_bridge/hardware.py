@@ -238,6 +238,18 @@ class Hardware:
         if audio_details:result['audio']=replies[1]
         return result
 
+    def thermal(self,session,history=False,graph=False,power=False,**_):
+        # Read-only CPU/GPU temperature, power and frequency from the kernel
+        # thermal sampler; history = last 60 s of 250 ms samples, graph = last
+        # 2 min of 1 s points, power = P-state/C-state scoping registers.
+        if any(not isinstance(v,bool) for v in (history,graph,power)):raise ValueError('history, graph and power are booleans')
+        if history and graph:raise ValueError('Request history or graph, not both')
+        commands=['thermal history' if history else 'thermal graph' if graph else 'thermal status']+(['thermal power'] if power else [])
+        with self.session_lock(session) as data:replies=self.guest_batch(data,commands)
+        result={'session':session,'guest_boot_id':data['guest_boot_id'],**replies[0]}
+        if power:result['power']=replies[1]
+        return result
+
     def logs(self,session,cursor=0,limit=64,**_):
         if any(isinstance(n,bool) or not isinstance(n,int) for n in (cursor,limit)) or not 0<=cursor<=0xffffffff or not 1<=limit<=64:raise ValueError('Use uint32 line cursor and limit 1..64')
         with self.session_lock(session) as data:reply=self.guest(data,f'bridge hardware logs {cursor} {limit}')

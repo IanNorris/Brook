@@ -78,7 +78,7 @@ struct Fake : BdwBcsExecutionBackend {
     unsigned csbAcks=0,csbAckSlots[6]{};bool csbFailAck=false,csbFailTail=false,csbFailEntry=false;
     bool handoff=true,execlist=true,modeReadable=true,modeStable=true,ringRunning=true,csbReady=true,csbSynced=true;
     bool admitted=true,pat=true,published=false,failHws=false,complete=true,idle=true,corruptSource=false,takeover=true,portReady=true;
-    bool scanout=false;unsigned cpuVisibilityChecks=0;
+    bool scanout=false,video=false,videoCorrupt=false;unsigned cpuVisibilityChecks=0;
     BdwBcsOneShot* reentrant=nullptr;unsigned aliasAt=0,aliasKind=0;
     ~Fake(){for(auto p:live)std::free(p.cpu);}
     bool alloc(BdwOwnedPage& out){if(++allocations==failAlloc)return false;void* p=nullptr;assert(!posix_memalign(&p,4096,4096));
@@ -148,6 +148,16 @@ struct Fake : BdwBcsExecutionBackend {
             read32(ring,1)==0xd0 && read32(ring,2)==0 && read32(ring,3)==0 && read32(ring,4)==0x04000000 &&
             read32(ring,5)==0x18800101 && read32(ring,8)==0x13004002);
         auto* batch=translate(pml4,uint64_t(read32(ring,6))|(uint64_t(read32(ring,7))<<32),false);
+        if(video){
+            // VCS0 self-test: VCS context registers, then the batch's one store.
+            assert(read32(context,2)==0x12244 && read32(context,4)==0x12034 && read32(context,66)==0x12200);
+            assert(read32(batch,0)==0 && read32(batch,1)==0x10000002 && read32(batch,5)==0x05000000);
+            uint64_t target=uint64_t(read32(batch,2))|(uint64_t(read32(batch,3))<<32);assert(target==0x11000);
+            uint32_t data=read32(batch,4)^(videoCorrupt?1u:0u);
+            std::memcpy(translate(pml4,target,true),&data,4);
+            auto* done=ggtt(read32(ring,9)&~7u);uint32_t written=read32(ring,11);assert(written==nonce);std::memcpy(done,&written,4);
+            return true;
+        }
         assert(read32(batch,0)==0x54f00008 && read32(batch,10)==0x05000000);
         if(corruptSource){uint32_t changed=read32(batch,8)+256;std::memcpy(batch+32,&changed,4);}
         uint64_t src=uint64_t(read32(batch,8))|(uint64_t(read32(batch,9))<<32);
@@ -201,6 +211,17 @@ int main(){
       BdwPatMmio<MmioOwner> scanout(owner,regs,true);BdwPatLease lease;
       assert(lease.Establish(scanout,0x11000013dull,true) && regs[0xe0/4]==0x00030307);
       assert(lease.Release(scanout) && regs[0xe0/4]==0x03030303 && regs[0xe4/4]==0x03030303); }
+    { // Zero-copy "wt" mode: slot 3 leased write-through (2) instead of UC (0).
+      uint32_t regs[1024]{};regs[0xe0/4]=regs[0xe4/4]=0x03030303;MmioOwner owner;
+      BdwPatMmio<MmioOwner> wt(owner,regs,true,2);BdwPatLease lease;
+      assert(lease.Establish(wt,0x11000013dull,true,2) && regs[0xe0/4]==0x02030307);
+      assert(lease.Release(wt) && regs[0xe0/4]==0x03030303);
+      BdwPatMmio<MmioOwner> mismatch(owner,regs,true,0);BdwPatLease wrong;   // Mmio authorised for UC only
+      assert(!wrong.Establish(mismatch,0x11000013dull,true,2) && regs[0xe0/4]==0x03030303);
+      BdwPatMmio<MmioOwner> wc(owner,regs,true,1);BdwPatLease other;         // only UC and WT are permitted
+      assert(!other.Establish(wc,0x11000013dull,true,1) && regs[0xe0/4]==0x03030303);
+      assert(BdwLegacyBcsPatCompatible(0x11000013dull,0x02030307,0x0303030b,true,2) &&
+             !BdwLegacyBcsPatCompatible(0x11000013dull,0x02030307,0x0303030b,true,0)); }
     { PatIo io;BdwPatLease lease;assert(lease.Establish(io,0x11000013dull));
       assert(lease.State()==BdwPatLeaseState::Active && io.low==0x03030307 && io.high==0x0303030b && io.drains==1);
       assert(lease.Release(io) && lease.State()==BdwPatLeaseState::Restored && io.low==0x03030303 && io.high==0x03030303 && io.drains==2);
@@ -410,6 +431,22 @@ int main(){
         if(failure==4)f.csbFailTail=true;
         if(failure==5)f.csbFailEntry=true;
         assert(x.PollContextSwitch(f)==BdwCsbPoll::Fault && x.State()==BdwOneShotState::Quarantined && f.live.size()==19);}
+    // VCS0 self-test image (VA-API phase 1b): same lease/execlist/CSB flow.
+    {Fake f;BdwBcsOneShot x;
+        assert(!x.PrepareVideoSelftest(f,65536,99,0x1234,0,staging) && !f.allocations);
+        assert(!x.PrepareVideoSelftest(f,65536,99,0x1234,0x1234,staging) && !f.allocations);}
+    for(unsigned round=0;round<2;++round){Fake f;f.video=true;BdwBcsOneShot x;
+        assert(x.PrepareVideoSelftest(f,65536,99,0x1234+round,0xabcd0000u+round,staging) && f.live.size()==19);
+        assert(x.ExecuteTakenOver(f,0x600000) && f.ggttWrites==8 && f.portWrites==4);
+        assert(x.VideoReadback()==0xabcd0000u+round && !x.ReleasePrepared(f));
+        f.event(0,1);f.event(1,0x0000000100000018ull);f.tail(1);
+        assert(x.PollContextSwitch(f)==BdwCsbPoll::Complete && !x.ReleasePrepared(f));
+        assert(x.RetireScanout(f));
+        for(const auto slot:f.slots)assert(!slot);
+        assert(x.ReleasePrepared(f) && f.live.empty() && x.Recycle() && x.State()==BdwOneShotState::Fresh);}
+    {Fake f;f.video=true;f.videoCorrupt=true;BdwBcsOneShot x;
+        assert(x.PrepareVideoSelftest(f,65536,99,0x1234,0xabcd0000u,staging));
+        assert(!x.ExecuteTakenOver(f,0x600000) && x.State()==BdwOneShotState::Quarantined && f.live.size()==19 && !x.ReleasePrepared(f));}
     {
         BdwBcsOneShot image;
         const BdwBlitRegion region{{BdwBcsSourceAddress,64,64},{BdwBcsScanoutAddress,4096,64},0,0,0,0,16,1};

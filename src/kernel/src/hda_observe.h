@@ -35,6 +35,10 @@ struct HdaObservation {
 void HdaObserveConfigure(const BootProtocol* boot);
 const HdaObservation& HdaObserveRead();
 // Called on the BSP after AudioMixerInit/ConfigureBoot and before modules.
+// On success it also enables the mixer's downstream allowance (default
+// HdaRuntimeDefaultStagingFrames) unless /etc/audio-staging-off exists or a
+// boot option already configured staging.
+inline constexpr uint32_t HdaRuntimeDefaultStagingFrames=4096;
 void HdaRuntimeRegister();
 // Final teardown; unlike ordinary AudioStop, cannot be restarted afterward.
 void HdaRuntimeShutdown();

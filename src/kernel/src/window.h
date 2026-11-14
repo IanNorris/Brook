@@ -88,7 +88,7 @@ bool WmCopyDesktopLayers(const WmDesktopLayers& layers,const WmDesktopLayerCopy*
 void WmReleaseDesktopLayers(WmDesktopLayers* layers);
 // Offscreen opaque-chrome prototype, one independent surface per window.
 // It excludes glass effects and does not yet version theme, title or hover.
-struct WmDesktopChrome {int32_t x,y;uint32_t width,height;};
+struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;}; // key: WmChromeKey of the rendered pixels
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
                                int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false);
@@ -109,6 +109,8 @@ uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
 void WmObserveDesktopTick(uint64_t now);
+// The renderer composited a GPU-source frame for window identity/commit.
+void WmNoteClientFrame(uint64_t identity,uint64_t commit);
 using WmRect = DesktopRect;
 void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
 void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
@@ -379,6 +381,8 @@ bool WmNetworkIndicatorRefresh(uint64_t now);
 // in it; the wheel steps 5%; a right click toggles mute. The input helpers
 // return true when they consumed the event.
 bool WmVolumeIndicatorRefresh();
+// Plays the volume-change pop when a user change is observed (compositor loop).
+void WmVolumeFeedbackTick(uint64_t nowMs);
 bool WmVolumePopupVisible();
 void WmVolumePopupClose();
 void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,

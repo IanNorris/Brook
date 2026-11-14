@@ -60,6 +60,8 @@
 #include "intel_bdw_file.h"
 #include "intel_bdw_ioctl.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_scanout_target.h"
+#include "intel_bdw_refusal.h"
 #include "debug_hardware.h"
 #include "sync/ksemaphore.h"
 #include "exec_image.h"
@@ -93,6 +95,7 @@
 #include "../../shared/brook_debug_frame.h"
 #include "ahci_readonly.h"
 #include "compositor_scene.h"
+#include "wm_chrome_key.h"
 #include "window.h"
 #include "gpu_app.h"
 #include "gpu_compositor.h"
@@ -7507,7 +7510,20 @@ static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t ar
         // closes: removing it could revoke a concurrent successful import.
         return CopyToUser(arg,&request,sizeof(request))?0:-EFAULT;
     }
-    return brook::BdwIntelRenderIoctl(file,cmd,arg,user);
+    const int64_t result=brook::BdwIntelRenderIoctl(file,cmd,arg,user);
+    // An execbuffer refusal becomes VK_ERROR_DEVICE_LOST in Mesa: name it.
+    if(result<0 && (cmd&0xff)==0x69){
+        static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
+        if(brook::BdwRefusalLogDue(refusals))
+            KPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,
+                why?why:"unrecorded",refusals);
+    }else if((cmd&0xff)==0x69)(void)brook::BdwTakeRefusal();
+    else if((cmd&0xff)==0x72){
+        static uint64_t losses=0;
+        if(const char* why=brook::BdwTakeRefusal())
+            if(brook::BdwRefusalLogDue(losses))KPrintf("gpu-exec: pid=%u %s count=%lu\n",user.submitterPid,why,losses);
+    }
+    return result;
 }
 
 static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
@@ -12791,7 +12807,68 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
     if((a && op!=BROOK_GPU_HANDOFF_RESERVE_DEPENDENT) || b || c || d)return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==BROOK_GPU_HANDOFF_PRESENT_CAPS)
-        return arg?-EINVAL:(BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_ASYNC|BROOK_GPU_PRESENT_CAP_DEPENDENT);
+        return arg?-EINVAL:(BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_ASYNC|BROOK_GPU_PRESENT_CAP_DEPENDENT
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+            |BROOK_GPU_PRESENT_CAP_SCANOUT
+#endif
+            );
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    if(op==BROOK_GPU_HANDOFF_SCANOUT_REGISTER){
+        BrookGpuScanoutImages wire{};
+        if(!CopyFromUser(&wire,arg,sizeof(wire)))return -EFAULT;
+        if(wire.reserved || !wire.count || wire.count>BROOK_GPU_SCANOUT_MAX_IMAGES)return -EINVAL;
+        static_assert(BROOK_GPU_SCANOUT_MAX_IMAGES==brook::BdwZeroCopyMaxImages,"zero-copy image limits must match");
+        // Hold a buffer reference (not the fd) across registration.
+        brook::BdwGpuBuffer* buffers[BROOK_GPU_SCANOUT_MAX_IMAGES]{};
+        auto drop=[&](){for(auto* b:buffers)brook::BdwGpuBufferUnref(b);};
+        for(uint32_t i=0;i<wire.count;++i){
+            if(wire.fds[i]<0 || uint32_t(wire.fds[i])>=uint32_t(MAX_FDS)){drop();return -EBADF;}
+            FdRef ref(proc,wire.fds[i]);
+            if(!ref || ref->type!=FdType::IntelPrime || !ref->handle){drop();return -EBADF;}
+            buffers[i]=static_cast<brook::BdwGpuBuffer*>(ref->handle);brook::BdwGpuBufferRef(buffers[i]);
+        }
+        brook::BdwZeroCopyRefusal refusal{};
+        const brook::BdwZeroCopyGeometry geometry{wire.width,wire.height,wire.stride,wire.fourcc};
+        const int64_t result=brook::BdwZeroCopyRegister(owner,buffers,wire.count,geometry,refusal);
+        drop();return result;
+    }
+    if(op==BROOK_GPU_HANDOFF_SCANOUT_ADOPT){
+        if(!UserBufferWritable(arg,sizeof(BrookGpuScanoutImages)))return -EFAULT;
+        brook::BdwGpuBuffer* images[BROOK_GPU_SCANOUT_MAX_IMAGES]{};uint32_t count=0;
+        const int64_t adopted=brook::BdwZeroCopyAdopt(owner,images,count);
+        if(adopted)return adopted==-2?-ENOENT:adopted==-1?-EPERM:adopted;
+        BrookGpuScanoutImages wire{count,brook::BdwZeroCopyWidth,brook::BdwZeroCopyHeight,brook::BdwZeroCopyStride,
+            BROOK_GPU_SCANOUT_FOURCC_XRGB8888,0,{-1,-1,-1,-1}};
+        int64_t result=0;
+        for(uint32_t i=0;i<count;++i){
+            if(result){brook::BdwGpuBufferUnref(images[i]);continue;}
+            FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=images[i];owned.fdFlags=1;
+            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            if(fd<0){brook::BdwGpuBufferUnref(images[i]);result=fd;continue;}
+            wire.fds[i]=fd; // the fd table now holds the reference
+        }
+        if(!result && !CopyToUser(arg,&wire,sizeof(wire)))result=-EFAULT;
+        if(result)for(uint32_t i=0;i<count;++i)if(wire.fds[i]>=0)(void)CloseProcessFd(proc,wire.fds[i]);
+        return result;
+    }
+    if(op==BROOK_GPU_HANDOFF_SCANOUT_STATUS){
+        brook::BdwZeroCopyStatus s{};brook::BdwZeroCopyReadStatus(s);
+        BrookGpuScanoutStatus wire{};
+        wire.flags=(s.registered?BROOK_GPU_SCANOUT_REGISTERED:0u)|(s.requested?BROOK_GPU_SCANOUT_REQUESTED:0u)|
+            (s.active?BROOK_GPU_SCANOUT_ACTIVE:0u)|(s.disabled?BROOK_GPU_SCANOUT_DISABLED:0u);
+        wire.images=s.images;wire.freeMask=s.freeMask;wire.front=s.front;wire.armed=s.armed;wire.queued=s.queued;
+        wire.refusal=uint32_t(s.refusal);wire.sequence=s.sequence;wire.presents=s.stats.presents;
+        wire.latched=s.stats.latched;wire.missedVblanks=s.stats.missedVblanks;
+        if(!UserBufferWritable(arg,sizeof(wire)) || !CopyToUser(arg,&wire,sizeof(wire)))return -EFAULT;
+        return 0;
+    }
+#endif
+    if(op==BROOK_GPU_HANDOFF_BUFFER_FAILED){
+        if(arg>=MAX_FDS)return -EBADF;
+        FdRef ref(proc,static_cast<int>(arg));
+        if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
+        return brook::BdwGpuBufferGpuFailed(static_cast<brook::BdwGpuBuffer*>(ref->handle))?1:0;
+    }
     if(op==BROOK_GPU_HANDOFF_PRESENT_RESULT)return brook::BdwOffscreenPresentResult(owner,arg);
     if(op==BROOK_GPU_HANDOFF_PRESENT_FRAME || op==BROOK_GPU_HANDOFF_QUEUE_FRAME){
         BrookGpuPresentFrame wire{};
@@ -12828,7 +12905,13 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
         if(arg>=MAX_FDS)return -EBADF;
         FdRef ref(proc,static_cast<int>(arg));
         if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
-        return brook::BdwOffscreenHandoffControl(owner,op,arg,static_cast<brook::BdwGpuBuffer*>(ref->handle),a);
+        const int64_t result=brook::BdwOffscreenHandoffControl(owner,op,arg,static_cast<brook::BdwGpuBuffer*>(ref->handle),a);
+        if(result<0 && result!=-116){ // -116 (ESTALE): a dependent baseline moved, the renderer's normal retry
+            static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
+            if(brook::BdwRefusalLogDue(refusals))
+                KPrintf("gpu-handoff: reserve refused pid=%u errno=%ld reason=%s count=%lu\n",proc->pid,-result,why?why:"unrecorded",refusals);
+        }else (void)brook::BdwTakeRefusal();
+        return result;
     }
     return brook::BdwOffscreenHandoffControl(owner,op,arg,nullptr);
 #else
@@ -12838,6 +12921,8 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
 
 static_assert(BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_HANDOFF_CTL && BROOK_SYS_DESKTOP_LAYERS!=BROOK_SYS_GPU_OUTPUT_ALLOC,
               "desktop layers syscall must be distinct");
+WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
+DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {
@@ -12845,8 +12930,11 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
     auto* snapshot=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
     if(!wire || !snapshot){kfree(wire);kfree(snapshot);return -ENOMEM;}
     int64_t result=-EFAULT;
+    const bool keep=op==BROOK_DESKTOP_CHROME_TRACKED_KEEP;
+    const bool keyed=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED;
     if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
-        if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || wire->reserved || !wire->layers[0].window)result=-EINVAL;
+        const uint64_t heldKey=wire->reserved;
+        if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || (keep?!heldKey:wire->reserved!=0) || !wire->layers[0].window)result=-EINVAL;
         else if(!brook::WmAcquireDesktopLayers(snapshot))result=-95;
         else {
             auto& layer=wire->layers[0];uint32_t index=0;
@@ -12854,11 +12942,28 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
             if(index==snapshot->count)result=-ENOENT;
             else {
                 brook::WmDesktopChrome chrome{};
-                const bool tracked=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
-                result=brook::WmDesktopChromeCapture(*snapshot,index,&chrome,nullptr,0,-1,-1,tracked);
+                const bool tracked=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || keyed || keep;
+                int32_t keyMouseX=-1,keyMouseY=-1;
+                if(keep)MouseGetPosition(&keyMouseX,&keyMouseY);
+                result=brook::WmDesktopChromeCapture(*snapshot,index,&chrome,nullptr,0,keyMouseX,keyMouseY,tracked);
                 const uint64_t bytes=uint64_t(chrome.width)*chrome.height*4;
-                const bool capture=op!=BROOK_DESKTOP_CHROME_QUERY;
+                const bool capture=op!=BROOK_DESKTOP_CHROME_QUERY && !keep;
                 const auto& source=snapshot->layers[index];
+                uint64_t renderedKey=0;
+                if(!result && keep){
+                    // Unchanged chrome: the caller's buffer already holds these
+                    // exact pixels. Anything else (content, size, hover, focus,
+                    // title, theme) means recapture.
+                    if(wire->count!=1 || layer.incarnation!=source.incarnation || layer.width!=chrome.width ||
+                       layer.height!=chrome.height || layer.bytes!=bytes || chrome.key!=heldKey){
+                        __atomic_add_fetch(&brook::g_chromeCaptureStats.keepMisses,1,__ATOMIC_RELAXED);result=-116;
+                    }else if(!brook::WmDesktopLayersCaptureCurrent(*snapshot))result=-EAGAIN;
+                    else {
+                        renderedKey=heldKey;
+                        __atomic_add_fetch(&brook::g_chromeCaptureStats.keeps,1,__ATOMIC_RELAXED);
+                        __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesKept,bytes,__ATOMIC_RELAXED);
+                    }
+                }
                 if(!result && capture && (wire->count!=1 || layer.incarnation!=source.incarnation ||
                    (!tracked && layer.generation!=source.generation) || layer.width!=chrome.width || layer.height!=chrome.height ||
                    layer.clientX!=chrome.x || layer.clientY!=chrome.y || layer.bytes!=bytes))result=-EAGAIN;
@@ -12874,16 +12979,24 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
                         result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked);
                         if(!result && (current.x!=chrome.x || current.y!=chrome.y || current.width!=chrome.width || current.height!=chrome.height))result=-EAGAIN;
                         if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
+                        if(!result){
+                            renderedKey=current.key;
+                            __atomic_add_fetch(&brook::g_chromeCaptureStats.captures,1,__ATOMIC_RELAXED);
+                            __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesCopied,bytes,__ATOMIC_RELAXED);
+                        }
                         if(!result && !(tracked?brook::WmDesktopLayersCaptureCurrent(*snapshot):brook::WmDesktopLayersCurrent(*snapshot)))result=-EAGAIN;
                     }
                 }
                 kfree(pixels);
-                if(!result && op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE)
+                if(!result && (op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || keyed || keep))
                     result=brook::BdwOffscreenRegisterChrome(owner,source);
                 if(!result){
                     layer.incarnation=source.incarnation;layer.generation=source.generation;layer.bytes=bytes;
                     layer.width=layer.stride=layer.clientWidth=chrome.width;layer.height=layer.clientHeight=chrome.height;
                     layer.clientX=chrome.x;layer.clientY=chrome.y;layer.upscale=1;layer.flags=0;wire->count=1;
+                    // A chrome-less window has no pixels; its key is still
+                    // meaningful (0 bytes) so the caller can keep it too.
+                    wire->reserved=(keyed||keep)?(renderedKey?renderedKey:chrome.key):0;
                     if(!CopyToUser(address,wire,sizeof(*wire)))result=-EFAULT;
                 }
             }
@@ -12943,16 +13056,23 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
-    if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE) &&
+    if(op==BROOK_DESKTOP_CLIENT_FRAME){
+        if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
+        brook::WmNoteClientFrame(b,c);return 0;
+    }
+    if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE ||
+        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
     if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
         op==BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE || op==BROOK_DESKTOP_BACKDROP_TRACKED_BIND) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopBackdrop(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
-    if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED &&
-        op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE) ||
-       size!=sizeof(BrookDesktopLayers) || (op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE && a) || a>0xffffffffULL || b || c || address>~uint64_t{0}-size)return -EINVAL;
+    const bool keepOp=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP;
+    const bool tracked=op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE || keepOp;
+    if((op!=BROOK_DESKTOP_LAYERS_QUERY && op!=BROOK_DESKTOP_LAYERS_CAPTURE && !tracked) ||
+       size!=sizeof(BrookDesktopLayers) || (op!=BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE && !keepOp && a) ||
+       a>0xffffffffULL || (!keepOp && b) || b>0xffffffffULL || c || address>~uint64_t{0}-size)return -EINVAL;
     const bool capture=op!=BROOK_DESKTOP_LAYERS_QUERY;
     auto* wire=static_cast<BrookDesktopLayers*>(kmalloc(sizeof(BrookDesktopLayers)));
     auto* layers=static_cast<brook::WmDesktopLayers*>(kmalloc(sizeof(brook::WmDesktopLayers)));
@@ -12973,14 +13093,19 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
                 brook::DesktopInvertCaret(layer,offset,scratch,bytes);
                 return CopyToUser(destination,scratch,bytes);
             };
+            brook::DesktopCaptureCounters tally{};
             result=brook::ExportDesktopLayers(*layers,*wire,capture,sink,
-                [op](const brook::WmDesktopLayers& current){
-                    return (op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE)
+                [tracked](const brook::WmDesktopLayers& current){
+                    return tracked
                         ?brook::WmDesktopLayersCaptureCurrent(current)
                         :brook::WmDesktopLayersCurrent(current);
-                },scratchBytes,static_cast<uint32_t>(a));
+                },scratchBytes,static_cast<uint32_t>(a),static_cast<uint32_t>(b),&tally);
+            if(!result && tally.calls){auto& g=brook::g_desktopCaptureStats;
+                __atomic_add_fetch(&g.calls,tally.calls,__ATOMIC_RELAXED);__atomic_add_fetch(&g.keeps,tally.keeps,__ATOMIC_RELAXED);
+                __atomic_add_fetch(&g.keepMisses,tally.keepMisses,__ATOMIC_RELAXED);__atomic_add_fetch(&g.captures,tally.captures,__ATOMIC_RELAXED);
+                __atomic_add_fetch(&g.bytesCopied,tally.bytesCopied,__ATOMIC_RELAXED);__atomic_add_fetch(&g.bytesKept,tally.bytesKept,__ATOMIC_RELAXED);}
             bool adopted=false;
-            if(!result && (op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED || op==BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_SELECTIVE)){
+            if(!result && tracked){
                 const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
                 result=brook::BdwOffscreenRegisterScene(owner,layers,&wire->reserved);adopted=!result;
             }

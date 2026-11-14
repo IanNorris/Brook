@@ -37,11 +37,38 @@
 // Bind current display/backdrop identity for a renderer that draws a clear
 // or a procedural backdrop. Returns the same metadata as QUERY.
 #define BROOK_DESKTOP_BACKDROP_TRACKED_BIND 10
+// Change-based chrome. TRACKED_CAPTURE_KEYED is TRACKED_CAPTURE that also
+// returns, in BrookDesktopLayers.reserved, a nonzero content key of exactly
+// the pixels it wrote (input reserved must be zero). TRACKED_KEEP takes the
+// metadata a keyed capture returned plus that key in reserved and no pixels:
+// if the window's chrome would render identically it binds the chrome to
+// the tracked scene and refreshes the metadata (position may move) without
+// rendering or copying; otherwise it fails with ESTALE and the caller
+// recaptures into the same buffer.
+#define BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED 11
+#define BROOK_DESKTOP_CHROME_TRACKED_KEEP 12
+// Change-based client layers. As CAPTURE_TRACKED_SELECTIVE (a = skip mask),
+// plus b = a 32-bit mask of layers whose pixels the caller already holds.
+// For a keep layer the caller sets generation/bytes/width/height/stride to
+// the values of the capture that filled its buffer and still supplies that
+// buffer in pixels/capacity. If the window's published content generation
+// and geometry are unchanged (and no terminal caret is overlaid) the kernel
+// copies nothing and sets BROOK_DESKTOP_LAYER_KEPT in the returned flags;
+// otherwise it copies as usual. A client write the producer has not yet
+// published is not reflected, exactly as with the CPU compositor.
+#define BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP 13
+// Renderer report for the taskbar APP cadence: it composited a GPU-source
+// client frame. address=0, size=0, a=window, b=window incarnation (layer
+// incarnation), c=client commit. Diagnostic only; the kernel counts each new
+// commit once for the focused window.
+#define BROOK_DESKTOP_CLIENT_FRAME 14
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u
 #define BROOK_DESKTOP_LAYER_OPACITY_SHIFT 8u
 #define BROOK_DESKTOP_LAYER_OPACITY_MASK (255u<<BROOK_DESKTOP_LAYER_OPACITY_SHIFT)
+// Output only (CAPTURE_TRACKED_KEEP): the caller's held pixels are current.
+#define BROOK_DESKTOP_LAYER_KEPT (1u<<16)
 struct BrookDesktopLayer {
     uint64_t pixels,capacity,incarnation,generation,bytes;
     uint32_t window,width,height,stride,clientWidth,clientHeight;

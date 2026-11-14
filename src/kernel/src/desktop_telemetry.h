@@ -23,6 +23,20 @@ template<unsigned Capacity=128> struct DesktopIntervals {
         return n?Summary{n,values[(n*80+99)/100-1],values[(n*95+99)/100-1],values[n-1]}:Summary{};
     }
 };
+// GPU-source client frames reach the compositor as offers the renderer
+// reports (window identity + commit). Count each new commit once for the
+// focused window: a retained offer sampled again, or a stale report from a
+// previous window, is ignored.
+struct DesktopClientFrameFilter {
+    uint64_t identity=0,commit=0;
+    void Reset(uint64_t focused){identity=focused;commit=0;}
+    bool Accept(uint64_t focused,uint64_t reportIdentity,uint64_t reportCommit){
+        if(!focused || reportIdentity!=focused || !reportCommit)return false;
+        if(identity!=focused){identity=focused;commit=0;}
+        if(reportCommit<=commit)return false;
+        commit=reportCommit;return true;
+    }
+};
 struct DesktopTelemetry {
     uint64_t tick,readBytesPerSecond,writeBytesPerSecond,downBytesPerSecond,upBytesPerSecond;
     uint32_t cpuPercent,memoryPercent;

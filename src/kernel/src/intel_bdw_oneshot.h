@@ -43,6 +43,8 @@ struct BdwBcsRunResult {
     bool attempted=false,copyComplete=false,contextComplete=false;
     bool resetBeforeAttempted=false,resetBefore=false,patEstablished=false,patUncertain=false,resetAfter=false,patRestored=false;
     bool scanoutRetired=false;
+    bool resetUncertain=false; // a reset reported Uncertain (a write may have reached GDRST unverified)
+    uint8_t refusalStep=0;     // copy work item: first precondition that refused before any engine write
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;
     bool engineSampled=false;
     uint32_t head=0,tail=0,mode=0,control=0,acthd=0,ipeir=0,ipehr=0,execlist=0;
@@ -66,6 +68,7 @@ class BdwBcsOneShot {
     BdwOneShotState state_=BdwOneShotState::Fresh;const void* owner_=nullptr;const void* executionOwner_=nullptr;
     BdwGgttLease lease_{};BdwGgttBind bind_{};uint64_t descriptor_=0;uint32_t nonce_=0;bool attempted_=false,scanout_=false;
     uint8_t csbHead_=5;bool csbActivated_=false;
+    bool video_=false;uint32_t videoData_=0; // VCS0 self-test (VA-API phase 1b)
     template<class Io> void ReleasePages(Io& io){while(allocated_)io.free(pages_[--allocated_]);}
     static void Zero(BdwOwnedPage& p){for(unsigned i=0;i<4096;++i)p.cpu[i]=0;}
     static void Store32(BdwOwnedPage& p,unsigned offset,uint32_t v){for(unsigned i=0;i<4;++i)p.cpu[offset+i]=uint8_t(v>>(8*i));}
@@ -223,6 +226,25 @@ public:
         StoreImages(staging,batch,count*10+2,ring);
         return true;
     }
+    // VCS0 self-test image (VA-API phase 1b): same private page layout, PPGTT,
+    // GGTT lease and execlist flow as the BCS one-shot, with the VCS context,
+    // a one-store batch at 0x10000 and its data target (the Source page) at
+    // 0x11000. Execute verifies the ring nonce and the batch's store.
+    template<class Io> bool PrepareVideoSelftest(Io& io,uint32_t firstIndex,uint64_t token,uint32_t nonce,uint32_t data,
+            uint32_t (&staging)[2048]) {
+        if(!data || data==nonce)return false;
+        if(!Allocate(io,firstIndex,token,nonce,Count))return false;
+        const BdwPpgttMapping maps[]={{0x10000,pages_[Batch].dma,false},{0x11000,pages_[Source].dma,true}};
+        if(!BuildTables(maps,2,false))return PrepareFailed(io);
+        uint32_t batch[8]{},ring[14]{};
+        if(!BdwBuildVcsSelftest(Launch(),0x11000,data,staging,batch,ring,descriptor_))return PrepareFailed(io);
+        video_=true;videoData_=data;
+        StoreImages(staging,batch,8,ring);
+        return true;
+    }
+    // CPU view of the self-test's data word after a completed run. Meaningful
+    // only after Execute made the pages CPU-visible.
+    uint32_t VideoReadback()const{return video_ && allocated_>Source?Load32(pages_[Source],0):0;}
     template<class Io> bool ReleasePrepared(Io& io) {
         if(owner_!=static_cast<const void*>(&io) ||
            (state_!=BdwOneShotState::Prepared && state_!=BdwOneShotState::StoppedRetained) || !bind_.SafeToRelease())return false;
@@ -293,7 +315,8 @@ private:
         if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.waitCompletion(nonce_) ||
            !io.exclusiveHandoff() || !io.gpuPatLease() || (!scanout_ && !io.cpuVisible(pages_,allocated_)) ||
            Load32(pages_[Completion],0)!=nonce_)return false;
-        for(unsigned i=0;!scanout_ && i<4096;++i) {
+        if(video_ && Load32(pages_[Source],0)!=videoData_)return false;
+        for(unsigned i=0;!scanout_ && !video_ && i<4096;++i) {
             if(pages_[Source].cpu[i]!=Pattern(i))return false;
             if(pages_[Destination].cpu[i]!=(i<256?pages_[Source].cpu[i]:0xa5))return false;
         }
@@ -305,7 +328,7 @@ public:
     // The hardware owner calls this only after an acknowledged BCS domain
     // reset. A failed or uncertain unbind retains every referenced page.
     template<class Io> bool RetireScanout(Io& io){
-        if(!scanout_ || (executionOwner_ && executionOwner_!=static_cast<const void*>(&io)))return false;
+        if((!scanout_ && !video_) || (executionOwner_ && executionOwner_!=static_cast<const void*>(&io)))return false;
         if(bind_.State()==BdwGgttBindState::Bound && !bind_.RetireToInvalid(io))return false;
         if(!bind_.SafeToRelease())return false;
         state_=BdwOneShotState::StoppedRetained;
@@ -314,7 +337,7 @@ public:
     bool Recycle(){
         if(state_!=BdwOneShotState::Released || !bind_.Recycle())return false;
         state_=BdwOneShotState::Fresh;owner_=executionOwner_=nullptr;
-        descriptor_=0;nonce_=0;attempted_=scanout_=csbActivated_=false;csbHead_=5;
+        descriptor_=0;nonce_=0;attempted_=scanout_=csbActivated_=video_=false;videoData_=0;csbHead_=5;
         return true;
     }
     template<class Io> bool Execute(Io& io) {

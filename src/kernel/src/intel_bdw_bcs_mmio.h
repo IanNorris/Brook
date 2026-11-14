@@ -7,7 +7,7 @@ namespace brook {
 // pin the already-bound HWS.
 // This class does not establish those rights or submit a batch by itself.
 template<class Owner,uint32_t EngineBase> class BdwEngineMmio {
-    static_assert(EngineBase==0x22000 || EngineBase==0x2000,"unsupported engine");
+    static_assert(EngineBase==0x22000 || EngineBase==0x2000 || EngineBase==0x12000,"unsupported engine");
     Owner& owner_;volatile uint32_t* page_;uint64_t descriptor_=0;uint8_t portState_=0;
     bool mapped()const{return page_ && !(reinterpret_cast<uintptr_t>(page_)&3);}
 public:
@@ -81,6 +81,7 @@ public:
 };
 template<class Owner> using BdwBcsMmio=BdwEngineMmio<Owner,0x22000>;
 template<class Owner> using BdwRcsMmio=BdwEngineMmio<Owner,0x2000>;
+template<class Owner> using BdwVcsMmio=BdwEngineMmio<Owner,0x12000>;
 // Separate, narrowly scoped reset accessor. engine and gt map BAR0+0x22000
 // and BAR0+0x9000 respectively. Both mappings and all ownership
 // guarantees must be established by the caller; this type does not establish

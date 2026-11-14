@@ -9,6 +9,8 @@ option(BROOK_BDW_RPS_TRIAL "Enable the bounded Broadwell 500 MHz render-clock tr
 option(BROOK_BDW_CACHE_PROBE "Enable a root-only disposable Broadwell cache-coherency probe" OFF)
 option(BROOK_BDW_PERSISTENT_SCANOUT_MAP "Build the runtime-gated persistent GOP map for Broadwell BCS presents" OFF)
 option(BROOK_BDW_SCANOUT_FLIP "Build the runtime-gated Broadwell primary-plane page flip (read-only probe first)" OFF)
+option(BROOK_BDW_ZERO_COPY_SCANOUT "Build runtime-gated zero-copy scanout of renderer images (requires BROOK_BDW_SCANOUT_FLIP)" OFF)
+option(BROOK_BDW_VIDEO_ENGINE "Build runtime-gated Broadwell VCS0 video engine bring-up (VA-API phase 1)" OFF)
 option(BROOK_GPU_SUBMISSION_TIMING "Record bounded GPU submission timing (diagnostic kernels only)" OFF)
 option(BROOK_GPU_BLOCKED_RECOVERY_TEST "Allow synthetic pending GPU fences (test kernels only)" OFF)
 option(BROOK_EFI_SHUTDOWN_TEST "Enable disposable QEMU-only early UEFI shutdown experiment" OFF)
@@ -128,6 +130,7 @@ add_custom_command(
 )
 
 # Bake branding from the tracked source rather than a stale checked-in array.
+set(BROOK_VOLUME_POP_ASSET "${CMAKE_CURRENT_SOURCE_DIR}/assets/volume-pop.s16le")
 set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
 add_custom_command(
     OUTPUT "${BOOT_LOGO_HEADER}"
@@ -259,6 +262,7 @@ endif()
 # ---------------------------------------------------------------------------
 
 add_executable(kernel
+    src/volume_pop.cpp
     "${BOOT_LOGO_HEADER}"
     src/kernel.cpp
     src/cpu.cpp
@@ -340,6 +344,7 @@ add_executable(kernel
     src/intel_bdw_file.cpp
     src/intel_bdw_exec_snapshot.cpp
     src/intel_bdw_ioctl.cpp
+    src/intel_bdw_wait_queue.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp
@@ -347,6 +352,7 @@ add_executable(kernel
     src/mouse.cpp
     src/shell.cpp
     src/audio.cpp
+    src/thermal_sampler.cpp
     src/syscall_timing.cpp
     src/sched_decision_trace.cpp
     src/boot_logo.cpp
@@ -546,6 +552,18 @@ if(BROOK_BDW_SCANOUT_FLIP)
         message(FATAL_ERROR "Broadwell page flip requires guarded desktop recovery")
     endif()
     target_compile_definitions(kernel PRIVATE BROOK_BDW_SCANOUT_FLIP=1)
+endif()
+if(BROOK_BDW_ZERO_COPY_SCANOUT)
+    if(NOT BROOK_BDW_SCANOUT_FLIP)
+        message(FATAL_ERROR "Zero-copy scanout requires BROOK_BDW_SCANOUT_FLIP (shared probe, display mapping and GOP restore)")
+    endif()
+    target_compile_definitions(kernel PRIVATE BROOK_BDW_ZERO_COPY_SCANOUT=1)
+endif()
+if(BROOK_BDW_VIDEO_ENGINE)
+    if(NOT BROOK_SSD_AUTO_RECOVERY)
+        message(FATAL_ERROR "Broadwell video engine bring-up requires guarded auto recovery (BROOK_SSD_AUTO_RECOVERY)")
+    endif()
+    target_compile_definitions(kernel PRIVATE BROOK_BDW_VIDEO_ENGINE=1)
 endif()
 if(BROOK_BDW_CACHE_PROBE)
     if(NOT BROOK_SSD_GUARDED_DESKTOP_RESET)
@@ -810,3 +828,8 @@ add_custom_target(check_module_symbols ALL
 if(BROOK_MODULE_TARGETS)
     add_dependencies(check_module_symbols ${BROOK_MODULE_TARGETS})
 endif()
+
+# Volume-change feedback clip, embedded with .incbin (see assets/README.md).
+set_source_files_properties(src/volume_pop.cpp PROPERTIES
+    COMPILE_DEFINITIONS "BROOK_VOLUME_POP_PATH=\"${BROOK_VOLUME_POP_ASSET}\""
+    OBJECT_DEPENDS "${BROOK_VOLUME_POP_ASSET}")

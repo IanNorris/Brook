@@ -1,6 +1,12 @@
+#include "scheduler.h"
+#include "intel_bdw_render_refusal.h"
+#include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_node_cache.h"
+#include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
+#include "intel_bdw_poll_pacer.h"
 #include "hda_dell_inventory.h"
 #include "boot_protocol/boot_protocol.h"
 #include "intel_bdw_gtt_probe.h"
@@ -18,20 +24,22 @@
 #include "acpi.h"
 #include "smp.h"
 #include "serial.h"
-#if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "kprintf.h"
-#endif
 #include "vfs.h"
 #include "panic_test_reset.h"
 #include "intel_bdw_submission_worker.h"
 #include "profiler.h"
 #if defined(BROOK_BDW_RPS_TRIAL)
 #include "shutdown.h"
+#include "intel_bdw_render_clock.h"
+#include "intel_bdw_render_clock_runtime.h"
 #endif
 #include "process.h"
 #include "intel_bdw_file.h"
 #include "compositor.h"
 #include "panic_qr.h"
+#include "intel_bdw_video.h"
+#include "kprintf.h"
 extern "C" [[noreturn]] void KernelPanic(const char*,...);
 namespace brook {
 namespace {
@@ -53,6 +61,8 @@ uint32_t firstReleased=0;
 struct RuntimeBootOptions {
     bool execStore=false, contextWorker=false, renderWorker=false;
     bool intelNode=false, renderExperiment=false, autoBootstrap=false;
+    // Kill switch for the RCS completion spin slices (BdwPollPacer).
+    bool pollSpinDisabled=false;
 };
 RuntimeBootOptions runtimeBootOptions{};
 uint32_t* retainedRenderContext=nullptr;
@@ -324,6 +334,476 @@ bool BdwTestPrivatePat(BdwForcewakeAdapterResult& out,BdwPatTestResult& pat) {
 #endif
     return false;
 }
+// ---- VA-API phase 1: VCS0 video engine bring-up (docs/bdw-video-engine.md) ----
+namespace {
+BdwVideoGate videoGate;
+uint32_t videoOwner=0;
+// A diagnostic-slot lease that waits briefly (1 ms steps) instead of failing
+// immediately when another diagnostic holds the slot.
+struct RetryLease {
+    uint32_t* owner;bool held=false;uint32_t tries=0;
+    RetryLease(uint32_t* o,uint32_t limit):owner(o){
+        for(;;){uint32_t expected=0;
+            if(__atomic_compare_exchange_n(owner,&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)){held=true;return;}
+            if(++tries>=limit)return;
+            SchedulerSleepMs(1);}
+    }
+    ~RetryLease(){if(held)__atomic_store_n(owner,0,__ATOMIC_RELEASE);}
+    RetryLease(const RetryLease&)=delete;RetryLease& operator=(const RetryLease&)=delete;
+};
+struct VideoLease {
+    bool held=false;
+    VideoLease(){uint32_t expected=0;held=__atomic_compare_exchange_n(&videoOwner,&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED);}
+    ~VideoLease(){if(held)__atomic_store_n(&videoOwner,0,__ATOMIC_RELEASE);}
+};
+}
+namespace {
+// Precise sub-reasons (static strings) for `gpu video status` detail.
+[[maybe_unused]] const char* VideoAdapterDetail(const BdwForcewakeAdapterResult& out){
+    switch(out.refusal){
+    case BdwFwRefusalClaimBusy:return "forcewake-claim-busy";
+    case BdwFwRefusalClaimUncertain:return "forcewake-claim-uncertain";
+    case BdwFwRefusalArguments:return "forcewake-arguments";
+    case BdwFwRefusalForcewakePage:return "forcewake-page-evidence";
+    case BdwFwRefusalEnginePage:return "engine-page-evidence";
+    case BdwFwRefusalPatPage:return "pat-page-evidence";
+    case BdwFwRefusalResetPage:return "reset-page-evidence";
+    case BdwFwRefusalClock:return "tsc-read";
+    case BdwFwRefusalClockStalled:return "tsc-stalled";
+    default:break;
+    }
+    const auto& q=out.sequence;
+    if(!q.requested)return "forcewake-not-requested";
+    if(!q.acquired)return "forcewake-not-acknowledged";
+    if(!q.threadReady)return "forcewake-thread-not-ready";
+    if(!q.sampled)return "bcs-not-sampled";
+    if(!q.patSampled)return "pat-not-sampled";
+    if(!q.submissionQuiescent)return "bcs-not-quiescent";
+    if(!q.otherEnginesSampled)return "engines-not-sampled";
+    if(!q.other[0].submissionQuiescent)return "rcs-not-quiescent";
+    if(!q.other[1].submissionQuiescent)return "vcs-not-quiescent";
+    if(!q.other[2].submissionQuiescent)return "vecs-not-quiescent";
+    return "work-not-attempted";
+}
+[[maybe_unused]] const char* VideoStepDetail(uint8_t step){
+    switch(step){
+    case 1:return "callback-lease-window";
+    case 2:return "callback-gtt-page-evidence";
+    case 3:return "callback-no-token";
+    case 4:return "callback-cpu-or-clock";
+    case 5:return "callback-reset-before-refused";
+    case 6:return "callback-vcs-page-evidence";
+    default:return "callback-refused";
+    }
+}
+// The diagnostic runs on the debug thread and contends with the GPU worker for
+// the shared forcewake claim (and with the worker's idle-engine requirement).
+// Those refusals touch nothing, so retry them for a bounded time.
+[[maybe_unused]] bool VideoTransient(const BdwForcewakeAdapterResult& out){
+    return out.refusal==BdwFwRefusalClaimBusy || (out.sequence.requested && !out.sequence.workAttempted);
+}
+}
+bool BdwVideoBuilt(){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    return true;
+#else
+    return false;
+#endif
+}
+bool BdwVideoStatus(BdwVideoGate& out){VideoLease lease;if(!lease.held)return false;out=videoGate;return true;}
+bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;
+    if(!BdwVideoBuilt()){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    VideoLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    if(!videoGate.setEnabled(on)){refusal=videoGate.lastRefusal();return false;}
+    KPrintf("gpu-video: gate %s\n",on?"on":"off");return true;
+}
+// (forward) release of the prepared self-test image through the worker
+namespace {[[maybe_unused]] bool VideoWorkerRelease();}
+// One device step of a VCS diagnostic, executed by the CPU0 application
+// worker between RCS jobs and presents (ServiceScanout). The orchestration
+// (gate, preconditions, retries, sleeps) stays on the gpu-video thread and
+// never holds the diagnostic lease: gen 392 showed that holding it across
+// retries and sleeps starved render-job preparation and presents and stranded
+// a zero-copy handoff for the rest of the boot.
+namespace {
+enum class VwKind : uint8_t {Reset,Prepare,Run,Release,Pm};
+struct VideoWorkerStep {
+    BdwVideoStepSlot slot{};VwKind kind=VwKind::Reset;uint8_t pmOp=0;
+    uint32_t nonce=0,data=0;BdwGgttReservation reservation{};BdwOwnedPage scratch{};
+    BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult reset{};BdwBcsRunResult run{};bool ok=false;
+} videoStep [[maybe_unused]];
+[[maybe_unused]] uint64_t videoStepServiced=0,videoStepLeaseBusy=0,videoStepTimeouts=0;
+}
+bool BdwVideoWorkerPending(){return videoStep.slot.pending();}
+void BdwVideoWorkerCounts(uint64_t& serviced,uint64_t& leaseBusy,uint64_t& timeouts){
+    serviced=videoStepServiced;leaseBusy=videoStepLeaseBusy;timeouts=videoStepTimeouts;}
+bool BdwVideoWorkerService(){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    if(!videoStep.slot.claim())return false;
+    DiagnosticLease lease;
+    if(!lease.held){++videoStepLeaseBusy;videoStep.slot.requeue();return false;}
+    const auto& tsc=NativeTscObserveRead();
+    auto& v=videoStep;v.ok=false;v.fw={};
+    if(SmpCurrentCpuIndex()==0 && tsc.capable && tsc.measured && tsc.consistent && tsc.khz){
+        switch(v.kind){
+        case VwKind::Reset:VmmDellVcsReset(tsc.khz,v.fw,v.reset);v.ok=v.reset.complete;break;
+        case VwKind::Prepare:v.ok=BdwPrepareVcsSelftest(v.nonce,v.data,v.reservation,v.scratch);break;
+        case VwKind::Run:VmmDellVcsSelftest(tsc.khz,v.reservation.first,v.reservation.token,v.scratch.dma,v.fw,v.run);v.ok=true;break;
+        case VwKind::Release:v.ok=BdwReleasePreparedVcsSelftest();break;
+        case VwKind::Pm:VmmDellVcsPmOp(tsc.khz,v.pmOp,v.fw,v.reset);v.ok=v.reset.attempted;break;
+        }
+    }
+    ++videoStepServiced;
+    videoStep.slot.complete();
+    BdwGpuEventSignal(BdwGpuEvent::Retire);
+    return true;
+#else
+    return false;
+#endif
+}
+namespace {
+// Queue one step and wait for the worker (bounded). Returns false if the step
+// never started (timeout while queued: it is withdrawn, nothing touched).
+[[maybe_unused]] bool VideoWorkerCall(VwKind kind,uint8_t pmOp=0){
+    if(!videoStep.slot.begin())return false;
+    videoStep.kind=kind;videoStep.pmOp=pmOp;videoStep.fw={};videoStep.ok=false;
+    if(kind==VwKind::Reset || kind==VwKind::Pm)videoStep.reset={};
+    if(kind==VwKind::Run)videoStep.run={};
+    videoStep.slot.publish();
+    if(!BdwVideoWakeWorker() && videoStep.slot.withdraw())return false;
+    const uint64_t start=ApicTickCount();
+    for(;;){
+        const uint32_t st=videoStep.slot.state();
+        if(st==BdwVideoStepSlot::Done)break;
+        if(st==BdwVideoStepSlot::Queued && ApicTickCount()-start>=2000 && videoStep.slot.withdraw()){++videoStepTimeouts;return false;}
+        SchedulerSleepMs(1);(void)BdwVideoWakeWorker();
+    }
+    return true; // caller reads videoStep, then calls VideoWorkerFinish()
+}
+[[maybe_unused]] void VideoWorkerFinish(){videoStep.slot.finish();}
+// RC6 entered at all over ~300 ms after a reset or self-test (worker-serviced samples).
+[[maybe_unused]] void VideoRc6Check();
+}
+bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;
+    if(!BdwVideoBuilt()){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    VideoLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    refusal=videoGate.mayProbe();if(refusal!=BdwVideoRefusal::None)return false;
+    // Read-only: the shared forcewake observation samples VCS0 (other[1]) twice.
+    // The observation contends with the GPU worker for the forcewake claim and
+    // the diagnostic slot; both refusals touch nothing, so retry briefly.
+    bool ok=false;unsigned attempts=0;
+    for(;;){++attempts;out={};ok=BdwObserveForcewakeLive(out,true,false);
+        if(ok || attempts>=100)break;
+        SchedulerSleepMs(2);}
+    videoGate.addRetries(attempts-1);
+    videoGate.setDetail(ok?"none":out.refusal || out.sequence.requested?VideoAdapterDetail(out):"diagnostic-lease-or-precondition");
+    const auto& e=out.sequence.other[1];
+    BdwVcsSample sample{};
+    sample.sampled=ok && e.sampled;sample.idle=e.idle;sample.quiescent=e.submissionQuiescent;
+    sample.head=e.first.head;sample.tail=e.first.tail;sample.mode=e.first.mode;sample.start=e.first.start;
+    sample.control=e.first.control;sample.execlistLo=e.first.execlistLo;sample.execlistHi=e.first.execlistHi;
+    sample.submissionMode=e.first.submissionMode;
+    videoGate.probed(ok,sample);
+    if(!ok || !sample.sampled){refusal=BdwVideoRefusal::ProbeFailed;return false;}
+    return true;
+}
+bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;reset={};
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    VideoLease video;if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    refusal=videoGate.mayReset();if(refusal!=BdwVideoRefusal::None)return false;
+    if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
+       !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
+        refusal=BdwVideoRefusal::ResetRefused;return false;}
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;return false;}
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;return false;}
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz){refusal=BdwVideoRefusal::ResetRefused;return false;}
+    for(uint32_t i=0;i<PciBootInventoryCount();++i){
+        PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))break;
+        const auto& d=entry.device;if(d.bus!=0 || d.dev!=2 || d.fn!=0)continue;
+        if(!LiveGpuMatches(entry) || !PowerD0(d))break;
+        unsigned attempts=0;
+        for(;;){++attempts;bool ran=false;
+            if(VideoWorkerCall(VwKind::Reset)){out=videoStep.fw;reset=videoStep.reset;ran=true;VideoWorkerFinish();}
+            if(ran && (reset.attempted || !VideoTransient(out)))break;
+            if(attempts>=250)break;
+            SchedulerSleepMs(2);}
+        videoGate.addRetries(attempts-1);
+        videoGate.setDetail(reset.complete?"none":!out.sequence.workAttempted?VideoAdapterDetail(out):"reset-not-started");
+        videoGate.resetDone(reset.complete && out.sequence.workComplete,reset.uncertain);
+        if(reset.uncertain){
+            // GDRST is shared with the per-job RCS resets; an unverified media
+            // reset may leave the GT reset domain in an unknown state. Follow the
+            // RCS-reset policy: stop here. The runtime gate defaults off, so the
+            // recovery reboot does not repeat this.
+            KernelPanic("Broadwell video (VCS) reset uncertain: attempted=%u wake=%u released=%u",
+                unsigned(reset.attempted),unsigned(out.sequence.acquired),unsigned(out.sequence.released));
+        }
+        KPrintf("gpu-video: VCS reset %s\n",reset.complete?"acknowledged":"refused before any write");
+        if(!reset.complete){refusal=BdwVideoRefusal::ResetRefused;return false;}
+        VideoRc6Check();
+        return out.sequence.workComplete && out.clearDelivered && out.sequence.released && LiveGpuMatches(entry) && PowerD0(d);
+    }
+    refusal=BdwVideoRefusal::ResetRefused;return false;
+#else
+    (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
+#endif
+}
+bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;run={};readback=expected=0;
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    RetryLease video(&videoOwner,200);
+    if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    refusal=videoGate.maySelftest();if(refusal!=BdwVideoRefusal::None){videoGate.setDetail("gate");return false;}
+    auto refuseEarly=[&](BdwVideoRefusal r,const char* detail){refusal=r;videoGate.setDetail(detail);videoGate.selftestDone(false,false,r);return false;};
+    if(!PanicRecoveryResetArmed())return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-recovery-unarmed");
+    if(SmpCurrentCpuIndex()!=0)return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-not-cpu0");
+    if(!observation.inventory || !observation.planned || !observation.patRequested)
+        return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-observation");
+    if(!PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage))return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-pat-or-reset-page");
+    if(!PageAdmitted(0xf6880000ull) || !PageAdmitted(0xf6101000ull))return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-ggtt-pages");
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page))return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-forcewake-pages");
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page))return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-engine-pages");
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz)return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-tsc");
+    if(!(PciConfigRead16(0,2,0,4)&4))return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-pci-bus-master");
+    bool gpu=false;
+    for(uint32_t i=0;i<PciBootInventoryCount() && !gpu;++i){
+        PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))break;
+        const auto& d=entry.device;if(d.bus!=0 || d.dev!=2 || d.fn!=0)continue;
+        gpu=LiveGpuMatches(entry) && PowerD0(d);
+        if(!gpu)break;
+    }
+    if(!gpu)return refuseEarly(BdwVideoRefusal::ResetRefused,"precondition-gpu-identity-or-d0");
+    static uint32_t sequence=0x56435300; // "VCS\0"
+    const uint32_t nonce=++sequence,data=nonce^0xa5a5a5a5u;
+    expected=data;
+    BdwGgttReservation reservation{};BdwOwnedPage scratch{};
+    // Deterministic preparation failures (allocation, reservation window, DMA
+    // snapshot) touch no device state: refuse without quarantine.
+    {
+        bool prepared=false;
+        for(unsigned i=0;i<50 && !prepared;++i){
+            videoStep.nonce=nonce;videoStep.data=data;
+            if(!VideoWorkerCall(VwKind::Prepare)){SchedulerSleepMs(2);continue;}
+            prepared=true;const bool ok=videoStep.ok;reservation=videoStep.reservation;scratch=videoStep.scratch;VideoWorkerFinish();
+            if(!ok)return refuseEarly(BdwVideoRefusal::PrepareFailed,"prepare");
+        }
+        if(!prepared)return refuseEarly(BdwVideoRefusal::Busy,"worker-not-servicing");
+    }
+    // Retry refusals that touched nothing (claim busy, engines not idle, or a
+    // callback precondition), up to ~0.5 s. The image stays prepared.
+    unsigned attempts=0;
+    for(;;){
+        ++attempts;
+        videoStep.reservation=reservation;videoStep.scratch=scratch;
+        if(!VideoWorkerCall(VwKind::Run)){out={};run={};
+            if(attempts>=250)break;SchedulerSleepMs(2);continue;}
+        out=videoStep.fw;run=videoStep.run;VideoWorkerFinish();
+        const bool untouched=!run.resetBeforeAttempted || (run.refusalStep==5 && !run.resetUncertain);
+        const bool transient=VideoTransient(out) ||
+            (out.sequence.workAttempted && untouched && run.refusalStep && run.refusalStep!=5);
+        if(!transient || attempts>=250)break;
+        SchedulerSleepMs(2);
+    }
+    videoGate.addRetries(attempts-1);
+    readback=BdwVcsSelftestReadback();
+    // Genuinely uncertain device state: the GT reset after submission did not
+    // complete, the shared private PAT was not restored, or forcewake was not
+    // released. Every RCS/BCS job depends on these, so stop (as the scanout
+    // path does). The gate is off at boot: recovery does not repeat this.
+    const bool forcewakeUncertain=out.sequence.requested && (!out.clearDelivered || !out.sequence.released);
+    // A reset that reported Uncertain (GDRST state unknown), or a submission
+    // whose engine could not be stopped afterwards (the private PAT then stays
+    // leased and cannot be restored for RCS/BCS).
+    const bool resetUncertain=run.resetUncertain || (run.attempted && !run.resetAfter);
+    const bool patUncertain=run.patEstablished && !run.patRestored;
+    if(forcewakeUncertain || resetUncertain || patUncertain){
+        videoGate.selftestDone(false,true,BdwVideoRefusal::ResetUncertain);
+        KernelPanic("Broadwell video (VCS) self-test uncertain: reset=%u/%u pat=%u/%u ggtt=%u elsp=%u wake=%u head=%x tail=%x acthd=%x ipehr=%x",
+            unsigned(run.resetBefore),unsigned(run.resetAfter),unsigned(run.patEstablished),unsigned(run.patRestored),
+            run.ggttWriteAttempts,run.portWriteAttempts,unsigned(out.sequence.released),run.head,run.tail,run.acthd,run.ipehr);
+    }
+    const bool touched=(run.resetBeforeAttempted && !(run.refusalStep==5 && !run.resetUncertain)) ||
+        run.attempted || run.ggttWriteAttempts || run.portWriteAttempts;
+    if(!touched){
+        // Nothing reached VCS: give the prepared image back and report why.
+        const bool released=VideoWorkerRelease();
+        const char* detail=!out.sequence.workAttempted?VideoAdapterDetail(out):VideoStepDetail(run.refusalStep);
+        refusal=run.refusalStep==5?BdwVideoRefusal::ResetRefused:BdwVideoRefusal::Busy;
+        videoGate.setDetail(detail);
+        if(!released){videoGate.selftestDone(false,true,BdwVideoRefusal::RetireFailed);refusal=BdwVideoRefusal::RetireFailed;
+            videoGate.setDetail("prepared-image-not-released");}
+        else videoGate.selftestDone(false,false,refusal);
+        KPrintf("gpu-video: VCS self-test refused before any engine write after %u attempts: %s\n",attempts,detail);
+        return false;
+    }
+    // The engine was reset and the PAT restored. If the lease could not be
+    // unbound, or the pages not released, they stay retained for the boot
+    // (never reused) and VCS is quarantined; RCS/BCS are unaffected.
+    const bool released=run.scanoutRetired && VideoWorkerRelease();
+    const bool ok=released && run.copyComplete && run.contextComplete && out.sequence.workComplete && readback==data;
+    BdwVideoRefusal reason=BdwVideoRefusal::None;const char* detail="none";
+    if(!ok){
+        if(!released){reason=BdwVideoRefusal::RetireFailed;detail=run.scanoutRetired?"release":"retire";}
+        else if(run.copyComplete && readback!=data){reason=BdwVideoRefusal::Mismatch;detail="readback";}
+        else if(!run.copyComplete){reason=BdwVideoRefusal::SubmitFailed;detail=run.portWriteAttempts<4?"execlist-init-or-elsp":"breadcrumb-timeout";}
+        else {reason=BdwVideoRefusal::SubmitFailed;detail="csb-context-complete";}
+        if(!released)KPrintf("gpu-video: self-test pages retained for the boot (retire=%u)\n",unsigned(run.scanoutRetired));
+    }
+    videoGate.setDetail(detail);
+    videoGate.selftestDone(ok,true,reason);
+    if(ok)VideoRc6Check();
+    refusal=reason;
+    KPrintf("gpu-video: VCS self-test %s (%s) nonce=%x data=%x readback=%x ctx=%u ggtt=%u elsp=%u attempts=%u\n",ok?"ok":BdwVideoRefusalName(reason),
+        detail,nonce,data,readback,unsigned(run.contextComplete),run.ggttWriteAttempts,run.portWriteAttempts,attempts);
+    return ok;
+#else
+    (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
+#endif
+}
+// VCS power-management experiments and residency sampling (gen 391 clock sag).
+namespace {
+BdwGtPmSnapshot videoSampleA{},videoSampleB{};uint64_t videoSampleUs=0;
+}
+bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& r,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;r={};
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    const auto pmOp=BdwVcsPmOp(op);
+    RetryLease video(&videoOwner,200);
+    if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    // Writes need the same proof as a reset (gate on, probed idle, not quarantined);
+    // sampling only needs the gate.
+    refusal=pmOp==BdwVcsPmOp::Sample?videoGate.mayProbe():videoGate.mayReset();
+    if(refusal!=BdwVideoRefusal::None){videoGate.setDetail("gate");return false;}
+    if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
+       !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage)){
+        refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition");return false;}
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-forcewake-pages");return false;}
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page)){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-engine-pages");return false;}
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz){refusal=BdwVideoRefusal::ResetRefused;videoGate.setDetail("precondition-tsc");return false;}
+    auto once=[&](uint8_t which){
+        unsigned attempts=0;
+        for(;;){++attempts;bool ran=false;
+            if(VideoWorkerCall(VwKind::Pm,which)){out=videoStep.fw;r=videoStep.reset;ran=true;VideoWorkerFinish();}
+            if(ran && (r.attempted || !VideoTransient(out)))break;
+            if(attempts>=250)break;
+            SchedulerSleepMs(2);}
+        videoGate.addRetries(attempts-1);
+        return r.attempted;
+    };
+    if(pmOp==BdwVcsPmOp::Sample){
+        uint32_t w=0,f=0;
+        if(!once(op)){refusal=BdwVideoRefusal::Busy;videoGate.setDetail(VideoAdapterDetail(out));return false;}
+        VmmDellVcsPmSample(videoSampleA,w,f);
+        uint64_t t0=0,t1=0;uint32_t lo,hi;
+        __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));t0=(uint64_t(hi)<<32)|lo;
+        SchedulerSleepMs(1000);
+        if(!once(op)){refusal=BdwVideoRefusal::Busy;videoGate.setDetail(VideoAdapterDetail(out));return false;}
+        __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));t1=(uint64_t(hi)<<32)|lo;
+        VmmDellVcsPmSample(videoSampleB,w,f);
+        videoSampleUs=t1>t0?(t1-t0)*1000/tsc.khz:0;
+        videoGate.setDetail("none");
+        return videoSampleA.valid && videoSampleB.valid;
+    }
+    if(!once(op)){refusal=BdwVideoRefusal::Busy;videoGate.setDetail(VideoAdapterDetail(out));return false;}
+    uint32_t writes=0,failures=0;BdwGtPmSnapshot after{};VmmDellVcsPmSample(after,writes,failures);
+    KPrintf("gpu-video: pm %s %s writes=%u failures=%u\n",BdwVcsPmOpName(pmOp),r.complete?"ok":"failed",writes,failures);
+    videoGate.setDetail(r.complete?"none":"pm-op-write-or-wait-failed");
+    if(!r.complete)refusal=BdwVideoRefusal::SubmitFailed;
+    return r.complete;
+#else
+    (void)op;(void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
+#endif
+}
+void BdwVideoPmSamples(BdwGtPmSnapshot& a,BdwGtPmSnapshot& b,uint64_t& us){a=videoSampleA;b=videoSampleB;us=videoSampleUs;}
+namespace {
+bool VideoWorkerRelease(){
+    for(unsigned i=0;i<250;++i){
+        if(VideoWorkerCall(VwKind::Release)){const bool ok=videoStep.ok;VideoWorkerFinish();return ok;}
+        SchedulerSleepMs(2);
+    }
+    return false;
+}
+void VideoRc6Check(){
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    const auto& tsc=NativeTscObserveRead();
+    auto sample=[&](BdwGtPmSnapshot& out){
+        for(unsigned i=0;i<100;++i){
+            if(VideoWorkerCall(VwKind::Pm,uint8_t(BdwVcsPmOp::Sample))){const bool ok=videoStep.reset.attempted;VideoWorkerFinish();
+                if(ok){uint32_t w=0,f=0;VmmDellVcsPmSample(out,w,f);return out.valid;}}
+            SchedulerSleepMs(2);
+        }
+        return false;
+    };
+    BdwGtPmSnapshot a{},b{};uint32_t lo,hi;
+    if(!tsc.khz || !sample(a)){videoGate.setRc6(false,0);return;}
+    __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));const uint64_t t0=(uint64_t(hi)<<32)|lo;
+    SchedulerSleepMs(300);
+    if(!sample(b)){videoGate.setRc6(false,0);return;}
+    __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi));const uint64_t t1=(uint64_t(hi)<<32)|lo;
+    const uint64_t us=t1>t0?(t1-t0)*1000/tsc.khz:0;
+    const int i=BdwGtPmIndex(0x138108);
+    const uint32_t delta=i<0?0:b.value[i]-a.value[i];
+    // Residency counts 1.28 us units: percent = delta*128/us.
+    const uint32_t pct=us?uint32_t(uint64_t(delta)*128/us):0;
+    videoGate.setRc6(true,pct>100?100:pct);
+    KPrintf("gpu-video: RC6 after VCS op %u%% (%s)\n",pct>100?100u:pct,delta?"resumed":"NOT resumed");
+#endif
+}
+}
+// Run a VCS operation on a CPU0-pinned kernel thread: the critical section
+// and the PAT/forcewake transaction are CPU0-only, and the debug channel's
+// thread may be scheduled anywhere (gen 390: precondition-not-cpu0). Same
+// pattern as the RCS debug jobs in debug_hardware.cpp.
+namespace {
+struct VideoJob {
+    uint32_t state=0; // 0 idle, 1 running, 2 done
+    uint8_t op=0;bool ok=false;
+    BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult reset{};BdwBcsRunResult run{};
+    uint32_t readback=0,expected=0;BdwVideoRefusal refusal=BdwVideoRefusal::None;
+};
+[[maybe_unused]] VideoJob videoJob;
+[[maybe_unused]] void VideoJobWorker(void* opaque){
+    auto* job=static_cast<VideoJob*>(opaque);
+    job->refusal=BdwVideoRefusal::None;
+    if(job->op==1)job->ok=BdwVideoProbe(job->fw,job->refusal);
+    else if(job->op==2)job->ok=BdwVideoReset(job->fw,job->reset,job->refusal);
+    else if(job->op==3)job->ok=BdwVideoSelftest(job->fw,job->run,job->readback,job->expected,job->refusal);
+    else if(job->op>=10)job->ok=BdwVideoPmOp(uint8_t(job->op-10),job->fw,job->reset,job->refusal);
+    __atomic_store_n(&job->state,2,__ATOMIC_RELEASE);
+}
+}
+bool BdwVideoRunOnCpu0(uint8_t op,BdwForcewakeAdapterResult& fw,BdwRcsResetTestResult& reset,BdwBcsRunResult& run,
+        uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal,bool& pending){
+    pending=false;refusal=BdwVideoRefusal::None;
+#if !(defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY))
+    (void)op;(void)fw;(void)reset;(void)run;(void)readback;(void)expected;
+    refusal=BdwVideoRefusal::NotImplemented;return false;
+#else
+    if((op<1 || op>3) && (op<11 || op>15)){refusal=BdwVideoRefusal::NotImplemented;return false;}
+    uint32_t idle=0,done=2;
+    // A previous job that outlived its wait finishes in the background; collect it first.
+    __atomic_compare_exchange_n(&videoJob.state,&done,0,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+    if(!__atomic_compare_exchange_n(&videoJob.state,&idle,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+        refusal=BdwVideoRefusal::Busy;pending=true;return false;}
+    videoJob.op=op;videoJob.ok=false;videoJob.fw={};videoJob.reset={};videoJob.run={};videoJob.readback=videoJob.expected=0;
+    auto* worker=KernelThreadCreate("gpu-video",VideoJobWorker,&videoJob);
+    if(!worker){__atomic_store_n(&videoJob.state,0,__ATOMIC_RELEASE);refusal=BdwVideoRefusal::Busy;return false;}
+    worker->cpuAffinity=0;SchedulerAddProcess(worker);
+    const uint64_t deadline=ApicTickCount()+10000;
+    while(__atomic_load_n(&videoJob.state,__ATOMIC_ACQUIRE)!=2 && ApicTickCount()<deadline)SchedulerSleepMs(5);
+    if(__atomic_load_n(&videoJob.state,__ATOMIC_ACQUIRE)!=2){pending=true;refusal=BdwVideoRefusal::Busy;return false;}
+    fw=videoJob.fw;reset=videoJob.reset;run=videoJob.run;readback=videoJob.readback;expected=videoJob.expected;
+    refusal=videoJob.refusal;const bool ok=videoJob.ok;
+    __atomic_store_n(&videoJob.state,0,__ATOMIC_RELEASE);
+    return ok;
+#endif
+}
 bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     DiagnosticLease lease;if(!lease.held)return false;
@@ -514,10 +994,23 @@ static void CaptureWorkerObjects(const BdwExecSnapshot* snapshot){
         stage,detail,pid,context,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotBatchLength(snapshot),
         BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),current.bytes,current.words[0],current.words[1],current.words[2],current.words[3],current.words[4],current.words[5],current.words[6],current.words[7],sample.bytes,sample.words[0],sample.words[1],sample.words[2],sample.words[3],sample.words[4],sample.words[5],sample.words[6],sample.words[7]);
 }
+static BdwRenderAttemptView BdwRenderAttemptViewOf(const BdwForcewakeAdapterResult& out,const BdwRenderRunResult& run){
+    BdwRenderAttemptView v{};
+    v.adapterRefusal=out.refusal;v.requested=out.sequence.requested;v.released=out.sequence.released;
+    v.clearDelivered=out.clearDelivered;v.workAttempted=out.sequence.workAttempted;
+    v.entryRefusal=run.entryRefusal;v.gtWrites=run.gtWrites;
+    const auto& t=run.transaction;
+    v.gtReady=t.gtReady;v.patReady=t.patReady;v.runComplete=t.runComplete;v.contextSaved=t.contextSaved;
+    v.resetAttempted=t.resetAttempted;v.patRestored=t.patRestored;v.uncertain=t.uncertain;
+    v.executeAttempted=run.attempted;v.pollYieldFailed=run.pollYieldFailed;
+    return v;
+}
 static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool contextTest){
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FramePrepBegin);
 #endif
+    uint64_t ohMark=BdwOverheadTicks();
+    auto ohStep=[&ohMark](BdwOverheadStep step){const uint64_t now=BdwOverheadTicks();BdwOverheadAdd(step,now>ohMark?now-ohMark:0);ohMark=now;};
     DiagnosticLease lease;if(!lease.held)return {false,true};
     auto* owner=snapshot?BdwExecSnapshotContext(snapshot):nullptr;
     if(!snapshot || (contextTest?!owner:owner!=nullptr) || !PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 ||
@@ -540,6 +1033,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
        !(PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4)&4))return {false,true};
     static uint32_t nonce=0x42525000;
     if(nonce==~uint32_t{0})return {false,true};
+    ohStep(BdwOhEntry);
     auto* memory=static_cast<uint32_t*>(kmalloc(20*4096));if(!memory)return {false,true};
     auto& context=*reinterpret_cast<uint32_t (*)[20*1024]>(memory);
     struct ContextGuard {BdwGpuContext* owner;bool active=false;
@@ -547,6 +1041,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     bool present=false;
     if(owner && !BdwGpuContextBegin(owner,context,present)){kfree(memory);return {false,true};}
     guard.active=owner!=nullptr;
+    ohStep(BdwOhContextBegin);
 #if defined(BROOK_GPU_CAPTURE_FAULT_TEST)
     // Test kernels only: the dedicated probe uses this exact six-word batch.
     // Panic before device submission, so this tests the capture/reboot path
@@ -561,9 +1056,29 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     auto tick=[](){uint32_t lo,hi;__asm__ volatile("lfence; rdtsc":"=a"(lo),"=d"(hi)::"memory");return (uint64_t(hi)<<32)|lo;};
     const uint64_t startTicks=tick();
 #endif
-    if(!BdwReprepareRetainedSubmission(saved,++nonce)){kfree(memory);PanicWorkerStage("reprepare",snapshot);}
+    // A job the kernel cannot serve for deterministic resource reasons is
+    // refused: nothing was published to the GPU, the render image and tables
+    // are unwound to Released, the context is returned unchanged (not lost)
+    // and the client sees a fence error. Uncertain state still panics.
+    auto refuseJob=[&](const char* reason)->BdwSubmissionOutcome{
+        static uint32_t refusals=0;const uint32_t n=++refusals;
+        if(n<=16 || !(n&(n-1))){uint32_t pid=0,ctx=0;BdwExecSnapshotOrigin(snapshot,pid,ctx);
+            KPrintf("gpu-submit: job refused pid=%u context=%u objects=%u pages=%u reason=%s count=%u\n",pid,ctx,
+                BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),reason?reason:"?",n);}
+        kfree(memory);
+        if(guard.active){(void)BdwGpuContextFinish(owner,nullptr,true);guard.active=false;}
+        return {false,true,true};
+    };
+    if(!BdwReprepareRetainedSubmission(saved,++nonce)){
+        // Only the clean case (no pages for the private render image, e.g.
+        // under memory pressure) is undone; anything else is uncertain.
+        if(!BdwUnwindFailedReprepare()){kfree(memory);PanicWorkerStage("reprepare",snapshot);}
+        return refuseJob("private render image allocation failed");
+    }
+    ohStep(BdwOhReprepare);
     const uint32_t dmaStatus=BdwInspectPrivateRenderDma();
     if(dmaStatus!=BdwDmaSnapshotOk){kfree(memory);PanicWorkerStage("private-dma",snapshot,dmaStatus);}
+    ohStep(BdwOhPrivateDma);
     BdwGgttReservation reservation{};
     if(!BdwRetainedRenderReservation(reservation) || reservation.first!=65544 || reservation.count!=29){kfree(memory);PanicWorkerStage("reservation",snapshot);}
 #ifdef BROOK_BDW_COHERENT_RENDER
@@ -571,25 +1086,79 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     // that installs and verifies the WB LLC/eLLC PPGTT policy.
     if(!BdwExecSnapshotUseCoherentRender(snapshot)){kfree(memory);PanicWorkerStage("cache policy",snapshot);}
 #endif
-    if(!BdwPrepareRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("prepare",snapshot);}
+    ohStep(BdwOhReservation);
+    {
+        // Too many pages or page tables, or an allocation failure: refused.
+        const char* reason=nullptr;
+        const auto prepared=BdwPrepareRetainedSubmissionChecked(snapshot,reason);
+        if(prepared==BdwPrepareOutcome::Refused)return refuseJob(reason);
+        if(prepared!=BdwPrepareOutcome::Ready){kfree(memory);PanicWorkerStage(reason?reason:"prepare",snapshot);}
+    }
+    ohStep(BdwOhPrepare);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t preparedTicks=tick();
 #endif
     BdwOwnedPage scratch{};BdwGgttReservation pinned{};
     if(!BdwReuseRetainedRenderScratch(scratch,pinned) || pinned.first!=reservation.first ||
        pinned.count!=reservation.count || pinned.token!=reservation.token){kfree(memory);PanicWorkerStage("scratch",snapshot);}
+    ohStep(BdwOhScratch);
     BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};
     run.ggttClearRequested=true;run.pollYieldRequested=true;
+    uint32_t originPid=0,originContext=0;BdwExecSnapshotOrigin(snapshot,originPid,originContext);
+    // Worker-thread-only completion estimate per submitter context; it only
+    // moves where completion polling switches from ticks to spin slices.
+    static BdwCompletionPredictor<8> completionPredictor;
+    const uint64_t predictionKey=originPid?(uint64_t(originPid)<<32)|originContext:0;
+    run.pollSpinRequested=!runtimeBootOptions.pollSpinDisabled && BdwPromptWakeEnabled();
+    run.expectedCompletionTicks=completionPredictor.Predict(predictionKey);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     run.sampleFrequency=ProfilerFrameTraceActive();
     run.statsFrequency=true;
 #if defined(BROOK_BDW_RPS_TRIAL)
     run.tryFrequency=ShutdownGetAcStatus().source==AcPowerSource::Online &&
         PageAdmitted(BdwRenderFrequencyCapsPage);
+    BdwClockSampleThermal(tsc.khz);
+    run.trialBin=BdwClockEffectiveBin(BdwClock());
+    BdwClock().lastRequestedBin=run.trialBin;
 #endif
     BdwTraceSnapshot(snapshot,FrameDeviceBegin);
 #endif
-    VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    // Zero-copy images are mapped with PPAT slot 3; lease it UC for this job
+    // (inherited: WB, invisible to the non-snooping display engine).
+    const bool scanoutImages=BdwExecSnapshotHasUncached(snapshot);
+    run.uncachedScanout=scanoutImages && BdwZeroCopyUncachedRender();
+    run.scanoutPat=BdwZeroCopyScanoutPat();
+#endif
+    ohMark=BdwOverheadTicks();
+    // gen 387: a run can end before any device write (forcewake claim busy,
+    // entry evidence, engines not yet idle, GT init NotStarted). The job is
+    // still Prepared and armed, so rerun it a bounded number of times after a
+    // tick; only genuine device uncertainty reaches the panic below.
+    const BdwRenderRunResult request=run;
+    BdwRenderAttemptView attemptView{};
+    BdwRenderAttemptClass attemptClass=BdwRenderAttemptClass::Ran;
+    for(unsigned attempt=1;;++attempt){
+        VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+        attemptView=BdwRenderAttemptViewOf(out,run);
+        attemptClass=BdwClassifyRenderAttempt(attemptView);
+        if(attemptClass!=BdwRenderAttemptClass::RefusedUntouched)break;
+        static uint32_t refusals=0;const uint32_t n=++refusals;
+        if(n<=16 || !(n&(n-1)))
+            KPrintf("gpu-submit: render run refused before device access pid=%u context=%u reason=%s detail=%u gt_refusal=%u attempt=%u count=%u\n",
+                originPid,originContext,BdwRenderAttemptReason(attemptView),
+                unsigned(attemptView.adapterRefusal?out.refusalDetail:run.entryDetail),unsigned(run.entryDetail),attempt,n);
+        if(attempt>=BdwRenderRefusalRetries)break;
+        SchedulerSleepMs(1);
+        run=request;
+    }
+    ohStep(BdwOhRenderRun);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && defined(BROOK_BDW_RPS_TRIAL) && !defined(BROOK_HOST_TEST)
+    if(run.trialFrequencyCaps && run.trialFrequencyCaps!=0xffffffffu)BdwClock().lastCaps=run.trialFrequencyCaps;
+#endif
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    if(scanoutImages)BdwZeroCopyNoteRender(run.uncachedScanout);
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t deviceTicks=tick();
 #endif
@@ -620,14 +1189,25 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     const bool ok=t.contextSaved && t.resetComplete && t.patRestored && !t.uncertain && run.ggttCleared &&
         !run.pollYieldFailed && out.sequence.workComplete && out.clearDelivered && out.sequence.released &&
         LiveGpuMatches(entry) && PowerD0(entry.device);
-    uint32_t originPid=0,originContext=0;BdwExecSnapshotOrigin(snapshot,originPid,originContext);
+    if(ok && run.completionEndTicks>run.completionStartTicks)
+        completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
     const auto sample=BdwExecSnapshotBatchSample(snapshot);
-    if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);KernelPanic("Broadwell worker uncertain: pid=%u context=%u batch=%lx length=%lu objects=%u pages=%u gt=%u pat=%u reset=%u restore=%u ggtt=%u port=%u yield=%u/%u sampled=%u head=%x tail=%x mode=%x ctl=%x acthd=%x ipeir=%x ipehr=%x elsp=%x current_bytes=%u current_words=%x,%x,%x,%x,%x,%x,%x,%x admission_bytes=%u admission_words=%x,%x,%x,%x,%x,%x,%x,%x",
+    if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
+        KPrintf("gpu-submit: render run failed class=%u reason=%s fw_refusal=%u/%u requested=%u acquired=%u idle=%u quiescent=%u/%u released=%u clear=%u work=%u/%u entry=%u/%u gt_writes=%u\n",
+            unsigned(attemptClass),BdwRenderAttemptReason(attemptView),unsigned(out.refusal),unsigned(out.refusalDetail),
+            unsigned(out.sequence.requested),unsigned(out.sequence.acquired),unsigned(out.sequence.idle),
+            unsigned(out.sequence.submissionQuiescent),unsigned(out.sequence.otherEnginesQuiescent),unsigned(out.sequence.released),
+            unsigned(out.clearDelivered),unsigned(out.sequence.workAttempted),unsigned(out.sequence.workComplete),
+            unsigned(run.entryRefusal),unsigned(run.entryDetail),run.gtWrites);
+        KernelPanic("Broadwell worker uncertain: fw=%u/%u/%u/%u entry=%u/%u reason=%s pid=%u context=%u batch=%lx length=%lu objects=%u pages=%u gt=%u pat=%u reset=%u restore=%u ggtt=%u port=%u yield=%u/%u sampled=%u head=%x tail=%x mode=%x ctl=%x acthd=%x ipeir=%x ipehr=%x elsp=%x current_bytes=%u current_words=%x,%x,%x,%x,%x,%x,%x,%x admission_bytes=%u admission_words=%x,%x,%x,%x,%x,%x,%x,%x",
+        unsigned(out.refusal),unsigned(out.sequence.requested),unsigned(out.sequence.workAttempted),unsigned(out.clearDelivered && out.sequence.released),
+        unsigned(run.entryRefusal),unsigned(run.entryDetail),BdwRenderAttemptReason(attemptView),
         originPid,originContext,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotBatchLength(snapshot),BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
         unsigned(t.gtReady),unsigned(t.patReady),unsigned(t.resetComplete),unsigned(t.patRestored),run.ggttWriteAttempts,
         run.portWriteAttempts,unsigned(run.pollYieldFailed),run.pollYields,unsigned(run.engineSampled),run.head,run.tail,run.mode,run.control,run.acthd,run.ipeir,run.ipehr,run.execlist,
         current.bytes,current.words[0],current.words[1],current.words[2],current.words[3],current.words[4],current.words[5],current.words[6],current.words[7],sample.bytes,sample.words[0],sample.words[1],sample.words[2],sample.words[3],sample.words[4],sample.words[5],sample.words[6],sample.words[7]);}
     if(!BdwRetireRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("retire",snapshot);}
+    ohStep(BdwOhRetire);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t retiredTicks=tick();
     if(tsc.khz && preparedTicks>=startTicks && deviceTicks>=preparedTicks && retiredTicks>=deviceTicks){
@@ -650,13 +1230,14 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FrameRetired);
     BdwWorkerStatsRender(run.pollYields,run.completionPollYields,run.pollYieldTicks,
+        run.pollSpins,run.completionPollSpins,run.pollSpinTicks,
         run.statsFrequencySamples!=0,run.statsIssueStatus,run.statsEndStatus);
 #endif
     if(owner){
         if(!BdwGpuContextFinish(owner,&context,true)){kfree(memory);PanicWorkerStage("context-finish",snapshot);}
-        guard.active=false;kfree(memory);return {true,true};
+        guard.active=false;kfree(memory);ohStep(BdwOhFinish);return {true,true};
     }
-    kfree(retainedRenderContext);retainedRenderContext=memory;return {true,true};
+    kfree(retainedRenderContext);retainedRenderContext=memory;ohStep(BdwOhFinish);return {true,true};
 }
 BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* snapshot){return ExecuteRetainedWorker(snapshot,false);}
 BdwSubmissionOutcome BdwExecuteRetainedContextWorkerSnapshot(void*,BdwExecSnapshot* snapshot){return ExecuteRetainedWorker(snapshot,true);}
@@ -669,12 +1250,15 @@ bool BdwRenderExperimentEnabled(){
     return BdwStoreProbeEnabled() && runtimeBootOptions.renderExperiment;
 }
 #endif
+static BdwNodeCache g_intelNodeCache{};
+BdwNodeCache& BdwIntelNodeCache(){return g_intelNodeCache;}
 bool BdwIntelUserNodeEnabled(){
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     if(!PanicRecoveryResetArmed() || !observation.inventory || !observation.planned || !runtimeBootOptions.intelNode)return false;
-    for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))return false;
-        const auto& d=entry.device;if(d.bus==0 && d.dev==2 && d.fn==0)return LiveGpuMatches(entry) && PowerD0(d);}
-    return false;
+    return BdwNodeCachedCheck(g_intelNodeCache,ApicTickCount(),[]{
+        for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))return false;
+            const auto& d=entry.device;if(d.bus==0 && d.dev==2 && d.fn==0)return LiveGpuMatches(entry) && PowerD0(d);}
+        return false;});
 #else
     return false;
 #endif
@@ -913,6 +1497,19 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
     BdwGgttReservation reservation{};
     BdwOwnedPage scratch{};
 #if defined(BROOK_BDW_SCANOUT_TARGETS)
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    // Zero-copy: the source is a registered renderer image; arm DSPASURF to
+    // it (or queue it) instead of copying. Runtime-gated off by default.
+    switch(BdwZeroCopyPresentSource(source,regions,count)){
+    case BdwZeroCopyOutcome::Presented:
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+        ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);
+#endif
+        stage(5);return BdwScanoutStatus::Completed;
+    case BdwZeroCopyOutcome::RepairRequired:return BdwScanoutStatus::RepairRequired;
+    case BdwZeroCopyOutcome::Copy:break;
+    }
+#endif
     // Persistent GOP map or page flip, both runtime-gated off by default.
     BdwTargetPlan plan{};
     if(BdwScanoutTargetSelect(regions,count,plan)==BdwTargetSelect::RepairRequired)return BdwScanoutStatus::RepairRequired;
@@ -1014,7 +1611,13 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
             OptedIn("/etc/dell-gpu-intel-user-test"),
             OptedIn("/etc/dell-gpu-render-experiment"),
             OptedIn("/etc/dell-gpu-auto-bootstrap"),
+            OptedIn("/etc/dell-gpu-no-poll-spin"),
         };
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // M4a prompt wakeups stay off unless explicitly opted in at boot or
+        // enabled later with `gpu wakeups on`.
+        if(OptedIn("/etc/dell-gpu-prompt-wake"))BdwPromptWakeSet(true);
 #endif
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");

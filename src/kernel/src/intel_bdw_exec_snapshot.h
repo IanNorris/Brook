@@ -67,6 +67,12 @@ bool BdwExecSnapshotShadowStoreProbe(BdwExecSnapshot* snapshot);
 uint64_t BdwExecSnapshotTestBatchKernelAddress(const BdwExecSnapshot* snapshot);
 #endif
 uint64_t BdwExecSnapshotBatchAddress(const BdwExecSnapshot* snapshot);
+// The job maps a zero-copy scanout image (uncached PTE, PPAT slot 3).
+bool BdwExecSnapshotHasUncached(const BdwExecSnapshot* snapshot);
+// A non-output buffer of the job is in a transient CPU transition.
+bool BdwExecSnapshotInCpuTransition(const BdwExecSnapshot* snapshot);
+// Why reserving the job's buffers would fail now, or nullptr.
+const char* BdwExecSnapshotUseRefusal(const BdwExecSnapshot* snapshot);
 uint64_t BdwExecSnapshotBatchLength(const BdwExecSnapshot* snapshot);
 uint32_t BdwExecSnapshotPageCount(const BdwExecSnapshot* snapshot);
 // Immutable admission metadata suitable for bounded failure reporting. This
@@ -94,6 +100,15 @@ bool BdwExecSnapshotTableCount(const BdwExecSnapshot* snapshot,uint32_t& out);
 bool BdwExecSnapshotBuildPpgtt(BdwExecSnapshot* snapshot,const BdwPpgttPage (&scratch)[4],
                                const BdwPpgttPage* tables,uint32_t tableCount,
                                BdwPpgttMapping* workspace,uint32_t workspaceCount);
+// True only if expanding this snapshot's objects page by page yields exactly
+// the given mapping list (address, DMA, writable, cache) in order. Used to
+// prove that a previously built PPGTT image would be rebuilt byte-for-byte.
+bool BdwExecSnapshotMatchesMappings(const BdwExecSnapshot* snapshot,const BdwPpgttMapping* list,uint32_t count);
+// Adopt previously built, unchanged PPGTT tables for this snapshot: verifies
+// the exact mapping match itself, then builds only the per-job RCS ring. The
+// caller must still prove the table pages are unchanged and republish them.
+bool BdwExecSnapshotAdoptRenderImage(BdwExecSnapshot* snapshot,const BdwPpgttMapping* cached,uint32_t cachedCount,
+                                     uint64_t completionGgtt,uint32_t nonce,bool gt3,uint32_t (&ring)[56]);
 // Prepare matching PPGTT tables and an RCS ring from the same retained
 // snapshot. The caller still owns every page, must publish them and establish
 // command safety, device ownership, cache/DMA safety and reset handling.

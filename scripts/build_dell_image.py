@@ -44,6 +44,8 @@ VERIFY_ALLOW = {
     # Compiled in but runtime-gated off at every boot (debug-channel commands).
     'BROOK_BDW_PERSISTENT_SCANOUT_MAP': '--allow-bdw-persistent-scanout-map',
     'BROOK_BDW_SCANOUT_FLIP': '--allow-bdw-scanout-flip',
+    'BROOK_BDW_ZERO_COPY_SCANOUT': '--allow-bdw-zero-copy-scanout',  # requires BROOK_BDW_SCANOUT_FLIP
+    'BROOK_BDW_VIDEO_ENGINE': '--allow-bdw-video-engine',  # VCS0 bring-up, runtime gate off at boot
 }
 
 

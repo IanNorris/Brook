@@ -1,6 +1,10 @@
 #define _GNU_SOURCE
 static long test_syscall(long number,...);
 #define syscall test_syscall
+static int failed_fence=-1;
+#define DESKTOP_GPU_FENCE_FAILED(fd) ((fd)>=0 && (fd)==failed_fence)
+static int failed_buffer=-1;
+#define DESKTOP_GPU_BUFFER_FAILED(fd) ((fd)>=0 && (fd)==failed_buffer)
 #include "desktop_gpu_channel.h"
 #undef syscall
 #include <assert.h>
@@ -94,7 +98,46 @@ static void check_retained(void){
 #undef OFFER
     desktop_gpu_channel_close(&c);close(pair[0]);close(buffers[0]);close(buffers[1]);close(fence[0]);close(fence[1]);
 }
-int main(void){
+/* gen 375: a producer frame whose fence failed is never sampled (a
+ * compositor job waiting on it would fail and park the renderer); the
+ * window falls back to its CPU source until a newer good offer arrives. */
+static void check_failed_fence(void){
+    struct DesktopGpuChannel c;desktop_gpu_channel_init(&c);
+    int pair[2],bad[2],good[2];assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,pair) && !pipe(bad) && !pipe(good));
+    c.peer=pair[1];c.listener=dup(pair[1]);assert(c.listener>=0);
+    int buffers[2];struct stat st[2];
+    for(unsigned i=0;i<2;++i){char path[]="/tmp/brook-desktop-failed-XXXXXX";buffers[i]=mkstemp(path);assert(buffers[i]>=0);
+        unlink(path);assert(!ftruncate(buffers[i],4096) && !fstat(buffers[i],&st[i]));}
+    struct BrookGpuWindowPacket base={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,.type=BROOK_GPU_WINDOW_OFFER,
+        .words=1024,.stride=16,.width=16,.height=16,.fourcc=0x34325258};
+    struct BrookDesktopLayer layer={.window=5,.incarnation=500,.generation=9,.width=16,.height=16,.clientWidth=16,.clientHeight=16,.upscale=1};
+    struct BrookVkSceneLayer scene;
+    struct BrookGpuWindowPacket p=base;p.identity=(struct BrookGpuWindowIdentity){5,0,500,1,(uint64_t)st[0].st_dev,(uint64_t)st[0].st_ino};
+    assert(brook_gpu_window_send_offer(pair[0],&p,buffers[0],bad[0])==1);desktop_gpu_channel_poll(&c);
+    /* The received fence fd is a duplicate; mark whichever fd the offer holds. */
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)if(c.offers[i].state==1 && c.offers[i].packet.identity.window==5)failed_fence=c.offers[i].fence;
+    uint64_t f=desktop_gpu_channel_begin_frame(&c);
+    assert(!desktop_gpu_channel_select(&c,&layer,100,100,&scene,f));
+    desktop_gpu_channel_finish(&c,f);
+    f=desktop_gpu_channel_begin_frame(&c);
+    assert(!desktop_gpu_channel_select(&c,&layer,100,100,&scene,f)); /* stays excluded */
+    desktop_gpu_channel_finish(&c,f);
+    p.identity.commit=2;p.identity.device=(uint64_t)st[1].st_dev;p.identity.inode=(uint64_t)st[1].st_ino;
+    assert(brook_gpu_window_send_offer(pair[0],&p,buffers[1],good[0])==1);desktop_gpu_channel_poll(&c);
+    f=desktop_gpu_channel_begin_frame(&c);
+    struct DesktopGpuOffer *o=desktop_gpu_channel_select(&c,&layer,100,100,&scene,f);
+    assert(o && o->packet.identity.commit==2);
+    desktop_gpu_channel_finish(&c,f);
+    failed_fence=-1;
+    /* A sticky-failed buffer behind an offer whose fence succeeded (the
+     * gen 377 retained-offer case) is excluded the same way. */
+    failed_buffer=o->buffer;
+    f=desktop_gpu_channel_begin_frame(&c);
+    assert(!desktop_gpu_channel_select(&c,&layer,100,100,&scene,f) && o->failed);
+    desktop_gpu_channel_finish(&c,f);
+    failed_buffer=-1;
+}
+int main(void){check_failed_fence();
     char dir[]="/tmp/brook-channel-restart-XXXXXX";assert(mkdtemp(dir));
     char socketPath[108];assert(snprintf(socketPath,sizeof(socketPath),"%s/socket",dir)>0);
     assert(!setenv("BROOK_DESKTOP_GPU_SOCKET",socketPath,1));

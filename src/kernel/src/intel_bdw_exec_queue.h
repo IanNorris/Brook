@@ -139,22 +139,24 @@ public:
     // Only the engine owner may call Finish. The service can perform cache
     // synchronization before acquiring its admission mutex while the active
     // snapshot remains pinned. Other users keep the synchronous path.
-    bool Finish(uint64_t id,bool success,bool safelyStopped){
+    // skipped: never executed (a wait dependency failed); its fences fail but
+    // its context and buffers are not poisoned. Requires a safe stop.
+    bool Finish(uint64_t id,bool success,bool safelyStopped,bool skipped=false){
         auto* e=find(id);
-        if(!e || e->state!=BdwExecRequestState::Active || active_!=id)return false;
-        return FinishImpl(id,success,safelyStopped,false,false);
+        if(!e || e->state!=BdwExecRequestState::Active || active_!=id || (skipped && (success || !safelyStopped)))return false;
+        return FinishImpl(id,success,safelyStopped,false,false,skipped);
     }
     bool FinishWithCacheResult(uint64_t id,bool success,bool safelyStopped,bool cacheReady){
         return FinishImpl(id,success,safelyStopped,true,cacheReady);
     }
 private:
-    bool FinishImpl(uint64_t id,bool success,bool safelyStopped,bool cacheChecked,bool cacheReady){
+    bool FinishImpl(uint64_t id,bool success,bool safelyStopped,bool cacheChecked,bool cacheReady,bool skipped=false){
         auto* e=find(id);if(!e || e->state!=BdwExecRequestState::Active || active_!=id)return false;
         // Publish failure before any use count can fall, so waiters cannot
         // mistake failed work for successful idle buffers. An unsafe engine
         // cannot process its queued requests; fail them while retaining their
         // snapshots until the owner reaps and releases them.
-        if((!success || !safelyStopped) && !BdwExecSnapshotMarkFailed(e->snapshot))return false;
+        if((!success || !safelyStopped) && !skipped && !BdwExecSnapshotMarkFailed(e->snapshot))return false;
         if(!safelyStopped)for(auto& pending:entries_)if(pending.state==BdwExecRequestState::Queued){
             if(!BdwExecSnapshotMarkFailed(pending.snapshot,true))return false;
             if(!BdwExecSnapshotRetire(pending.snapshot,false))return false;

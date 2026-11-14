@@ -1,3 +1,6 @@
+#include "desktop_layers_export.h"
+#include "intel_bdw_worker_overhead.h"
+#include "native_tsc_observe.h"
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
 #include "sched_lock_owner.h"
@@ -6,6 +9,21 @@
 #include "sched_decision_trace.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
+#include "intel_bdw_prompt_wake.h"
+#include "intel_bdw_video.h"
+#include "intel_bdw_ioctl_trace.h"
+#include "intel_bdw_critical.h"
+#include "intel_bdw_forcewake_adapter.h"
+#include "intel_bdw_oneshot.h"
+#include "intel_bdw_exec_tables.h"
+#include "intel_bdw_scanout.h"
+#include "intel_bdw_node_cache.h"
+#if defined(BROOK_BDW_RPS_TRIAL)
+#include "intel_bdw_render_clock.h"
+#include "intel_bdw_render_clock_runtime.h"
+#endif
+#include "intel_bdw_wait_queue.h"
+#include "thermal_runtime.h"
 #include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
@@ -72,6 +90,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "mouse.h"
 #include "shell.h"
 #include "compositor.h"
+#include "wm_chrome_key.h"
 #include "compositor_scene.h"
 #include "debug_jobs.h"
 #include "debug_epoch.h"
@@ -5112,6 +5131,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
+            "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
+            "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
+            "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
+            "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
+            "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
+            "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -5677,6 +5703,318 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
     }
+    else if(NetStrEq(cmd,"gpu ppgtt cache on") || NetStrEq(cmd,"gpu ppgtt cache off") || NetStrEq(cmd,"gpu ppgtt cache status")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // M5 part 1 kill switch: reuse of exact-match PPGTT table sets across
+        // retained submissions (boot default off). Applies at the next job.
+        if(NetStrEq(cmd,"gpu ppgtt cache on"))BdwPpgttCacheSetEnabled(true);
+        else if(NetStrEq(cmd,"gpu ppgtt cache off"))BdwPpgttCacheSetEnabled(false);
+        BdwPpgttCacheStats s{};uint32_t sets=0;BdwPpgttCacheStatsRead(s,sets);
+        BridgeReply r;r.text("{\"enabled\":");r.text(BdwPpgttCacheEnabled()?"true":"false");
+        r.text(",");r.field("cached_sets",sets);
+        r.text(",");r.field("builds",s.builds);r.text(",");r.field("hits",s.hits);
+        r.text(",");r.field("miss_disabled",s.missDisabled);r.text(",");r.field("miss_empty",s.missEmpty);
+        r.text(",");r.field("miss_signature",s.missSignature);r.text(",");r.field("miss_checksum",s.missChecksum);
+        r.text(",");r.field("evictions",s.evictions);r.text(",");r.field("dropped",s.dropped);
+        r.text(",");r.field("built_pages",s.builtPages);r.text(",");r.field("build_us",s.buildUs);
+        r.text(",");r.field("adopt_us",s.adoptUs);r.text(",");r.field("last_build_us",s.lastBuildUs);
+        r.text(",\"scope\":\"retained-submission PPGTT tables; builds=fresh table builds (with the cache on, each keeps its own scratch and mapping list), hits=jobs that adopted an unchanged table set after an exact address/DMA/permission/cache match plus a checksum of every table word; build_us/adopt_us = time attaching the image (build or adopt plus ring), worker-thread counters, read without locking\"}\n");
+        r.send();
+#else
+        DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(NetStrEq(cmd,"thermal status") || NetStrEq(cmd,"thermal history") || NetStrEq(cmd,"thermal graph") ||
+            NetStrEq(cmd,"thermal power") || NetStrEq(cmd,"thermal reset")) {
+        // CPU/GPU temperature and power from the per-CPU thermal sampler
+        // (250 ms); `power` reads the P-state/C-state scoping MSRs once.
+        auto sfield=[](BridgeReply& r,const char* name,int64_t v){r.text("\"");r.text(name);r.text("\":");if(v<0){r.text("-");v=-v;}r.number(uint64_t(v));};
+        auto sample=[&](BridgeReply& r,const ThermalSample& v){
+            r.text("{");r.field("tick_ms",v.tick);r.text(",");sfield(r,"pkg_c",v.pkgC);r.text(",");sfield(r,"core_max_c",v.maxCoreC);
+            r.text(",");r.field("pkg_mw",v.pkgMw);r.text(",");r.field("cores_mw",v.coreMw);r.text(",");r.field("gt_mw",v.gtMw);
+            r.text(",");r.field("cpu_mhz",v.cpuMhz);r.text(",");r.field("c0_pct",v.c0Percent);r.text(",");r.field("gpu_mhz",v.gpuMhz);r.text("}");
+        };
+        BridgeReply r;
+        if(NetStrEq(cmd,"thermal reset")){ThermalResetMaxima();DebugChannelSend("{\"ok\":true,\"note\":\"maxima reset\"}\n");}
+        else if(NetStrEq(cmd,"thermal power")){
+            const auto p=ThermalReadPowerRegs();
+            r.text("{\"valid\":");r.text(p.valid?"true":"false");r.text(",");r.field("model",p.model);r.text(",");r.field("cpu",p.cpu);
+            r.text(",\"hwp_supported\":");r.text(p.hwpSupported?"true":"false");r.text(",\"epb_supported\":");r.text(p.epbSupported?"true":"false");
+            auto hex=[&](const char* name,uint64_t v){r.text(",\"");r.text(name);r.text("\":\"0x");r.number(v,true);r.text("\"");};
+            hex("misc_enable",p.miscEnable);hex("perf_ctl",p.perfCtl);hex("perf_status",p.perfStatus);hex("energy_perf_bias",p.epb);
+            hex("platform_info",p.platformInfo);hex("turbo_ratio_limit",p.turboRatioLimit);hex("pkg_cst_config_control",p.pkgCstConfig);
+            hex("pkg_power_limit",p.pkgPowerLimit);hex("pkg_power_info",p.pkgPowerInfo);hex("cpuid5_edx",p.mwaitLeaf5Edx);
+            r.text(",");r.field("tsc",p.tsc);
+            r.text(",\"residency\":{");r.field("pkg_c2",p.pkgC2);r.text(",");r.field("pkg_c3",p.pkgC3);r.text(",");r.field("pkg_c6",p.pkgC6);
+            r.text(",");r.field("pkg_c7",p.pkgC7);r.text(",");r.field("pkg_c8",p.pkgC8);r.text(",");r.field("pkg_c9",p.pkgC9);r.text(",");r.field("pkg_c10",p.pkgC10);
+            r.text(",");r.field("core_c3",p.coreC3);r.text(",");r.field("core_c6",p.coreC6);r.text(",");r.field("core_c7",p.coreC7);r.text("}");
+            r.text(",\"scope\":\"raw P-state/C-state/RAPL-limit MSRs read on the calling CPU (residency counters count at TSC rate since reset; core counters are this CPU's core); IdleLoop uses sti;hlt (C1) today\"}\n");r.send();
+        } else {
+            ThermalSnapshot snap{};ThermalReadSnapshot(snap);
+            r.text("{\"available\":");r.text(snap.available?"true":"false");r.text(",\"rapl\":");r.text(snap.rapl?"true":"false");
+            r.text(",\"aperf\":");r.text(snap.aperf?"true":"false");r.text(",");r.field("tjmax_c",snap.tjmax);r.text(",");r.field("base_mhz",snap.baseMhz);
+            r.text(",");r.field("samples",snap.samples);r.text(",");r.field("misplaced",snap.misplaced);r.text(",");r.field("period_ms",ThermalPeriodMs);
+            r.text(",\"latest\":");sample(r,snap.latest);
+            r.text(",\"max\":{");sfield(r,"pkg_c",snap.maxima.pkgC);r.text(",");sfield(r,"core_c",snap.maxima.coreC);
+            r.text(",");r.field("pkg_mw",snap.maxima.pkgMw);r.text(",");r.field("gt_mw",snap.maxima.gtMw);
+            r.text(",");r.field("cpu_mhz",snap.maxima.cpuMhz);r.text(",");r.field("gpu_mhz",snap.maxima.gpuMhz);r.text("}");
+            r.text(",\"cpus\":[");
+            for(uint32_t i=0;i<snap.cpuCount;++i){if(i)r.text(",");const auto& c=snap.cpus[i];
+                r.text("{");sfield(r,"temp_c",c.tempC);r.text(",");r.field("mhz",c.mhz);r.text(",");r.field("c0_pct",c.c0Percent);
+                r.text(",");r.field("ratio",c.ratio);r.text(",\"valid\":");r.text(c.valid?"true":"false");r.text("}");}
+            r.text("]");
+            const bool graph=NetStrEq(cmd,"thermal graph");
+            if(NetStrEq(cmd,"thermal history") || graph){
+                static ThermalSample rows[ThermalHistory];
+                const uint32_t n=graph?ThermalReadGraph(rows,ThermalGraphHistory):ThermalReadHistory(rows,ThermalHistory);
+                r.text(graph?",\"graph\":[":",\"history\":[");
+                for(uint32_t i=0;i<n;++i){if(i)r.text(",");sample(r,rows[i]);}
+                r.text("]");
+            }
+            r.text(",\"scope\":\"per-CPU pinned sampler every period_ms: pkg_c=IA32_PACKAGE_THERM_STATUS DTS, core temps IA32_THERM_STATUS per logical CPU (siblings share a core), mhz=base*dAPERF/dMPERF (C0 average), c0_pct=dMPERF/dTSC, ratio=IA32_PERF_STATUS, power=RAPL PKG/PP0/PP1 energy deltas, gpu_mhz=last render-job RPSTAT1 CAGF within 2 s (0 = GPU idle); max since boot or 'thermal reset'; history=60 s of samples, graph=1 s points (max temp, mean power)\"}\n");
+            r.send();
+        }
+    }
+    else if(StrStartsWith(cmd,"gpu clock")) {
+#if defined(BROOK_BDW_RPS_TRIAL)
+        // Runtime render-clock request. Only the per-job GEN6_RPNSWREQ ratio
+        // changes; it is clamped to the fused caps and falls back to 500 MHz
+        // (latched) at the package thermal limit.
+        auto& st=BdwClock();
+        const char* arg=cmd+9;while(*arg==' ')++arg;
+        bool bad=false;
+        if(*arg && !NetStrEq(arg,"status")){
+            uint32_t mhz=0;
+            if(ParseUint(arg,&mhz)<=0 || mhz<100 || mhz>2000)bad=true;
+            else BdwClockSetMhz(st,mhz);
+        }
+        if(bad){DebugChannelSend("{\"error\":\"usage: gpu clock <MHz>|status\"}\n");}
+        else {
+            static BdwClockEnergy prev{};
+            const auto now=BdwClockReadEnergy();
+            const auto caps=BdwClockDecodeCaps(st.lastCaps);
+            const int32_t temp=BdwClockReadTempC();
+            BridgeReply r;
+            r.text("{");r.field("requested_mhz",st.requestedMhz);
+            r.text(",");r.field("effective_mhz",BdwClockEffectiveBin(st)*BdwClockBinMhz);
+            r.text(",");r.field("last_job_mhz",st.lastRequestedBin*BdwClockBinMhz);
+            r.text(",\"caps_valid\":");r.text(caps.valid?"true":"false");
+            r.text(",");r.field("rpn_mhz",caps.rpn*BdwClockBinMhz);
+            r.text(",");r.field("rp1_mhz",caps.rp1*BdwClockBinMhz);
+            r.text(",");r.field("rp0_mhz",caps.rp0*BdwClockBinMhz);
+            r.text(",");r.field("caps_raw",st.lastCaps);
+            r.text(",\"thermal_available\":");r.text(BdwClockPlatformInfo().thermal?"true":"false");
+            r.text(",");r.field("temp_c",temp<0?0:uint64_t(temp));
+            r.text(",");r.field("max_temp_c",st.maxTempC<0?0:uint64_t(st.maxTempC));
+            r.text(",");r.field("limit_c",uint64_t(st.limitC));
+            r.text(",\"tripped\":");r.text(st.tripped?"true":"false");
+            r.text(",");r.field("trips",st.trips);
+            r.text(",");r.field("thermal_samples",st.samples);
+            r.text(",\"rapl_available\":");r.text(now.valid?"true":"false");
+            if(now.valid && prev.valid && now.tsc>prev.tsc){
+                const auto t=TscClockReadStatus();
+                const uint64_t us=t.khz?(now.tsc-prev.tsc)*1000/t.khz:0;
+                if(us){
+                    r.text(",");r.field("pkg_mw",BdwClockEnergyDeltaUj(prev.pkg,now.pkg,now.unit)*1000/us);
+                    r.text(",");r.field("gt_mw",BdwClockEnergyDeltaUj(prev.pp1,now.pp1,now.unit)*1000/us);
+                    r.text(",");r.field("power_window_ms",us/1000);
+                }
+            }
+            if(now.valid)prev=now;
+            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; trip latches 500 until the next gpu clock command; pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
+            r.send();
+        }
+#else
+        DebugChannelSend("{\"error\":\"BROOK_BDW_RPS_TRIAL kernel required\"}\n");
+#endif
+    }
+    else if(StrStartsWith(cmd,"gpu ioctl trace")) {
+        // VA-API phase 2: which i915 ioctls a userspace driver uses on Brook.
+        auto& t=BdwIoctlTraceState();
+        if(NetStrEq(cmd,"gpu ioctl trace on")){t.reset();__atomic_store_n(&t.enabled,1u,__ATOMIC_RELEASE);}
+        else if(NetStrEq(cmd,"gpu ioctl trace off"))__atomic_store_n(&t.enabled,0u,__ATOMIC_RELEASE);
+        else if(NetStrEq(cmd,"gpu ioctl trace reset"))t.reset();
+        else if(!NetStrEq(cmd,"gpu ioctl trace dump") && !NetStrEq(cmd,"gpu ioctl trace status")){
+            DebugChannelSend("Usage: gpu ioctl trace on|off|reset|status|dump\n");return;}
+        const uint32_t next=__atomic_load_n(&t.next,__ATOMIC_ACQUIRE);
+        BridgeReply r;r.text("{\"enabled\":");r.text(t.enabled?"true":"false");
+        r.text(",");r.field("recorded",next);r.text(",");r.field("dropped",__atomic_load_n(&t.dropped,__ATOMIC_RELAXED));
+        if(NetStrEq(cmd,"gpu ioctl trace dump")){
+            r.text(",\"entries\":[");
+            const uint32_t count=next<BdwIoctlTraceCapacity?next:BdwIoctlTraceCapacity;
+            const uint32_t first=next-count;
+            for(uint32_t k=0;k<count;++k){const auto& e=t.entries[(first+k)%BdwIoctlTraceCapacity];
+                if(k)r.text(",");
+                r.text("{");r.field("seq",e.seq);r.text(",");r.field("pid",e.pid);r.text(",");r.field("nr",e.nr);
+                r.text(",\"name\":\"");r.text(BdwIoctlName(e.nr));r.text("\"");
+                r.text(",");r.field("size",e.size);r.text(",");r.field("detail",e.detail);
+                r.text(",\"result\":");if(e.result<0){r.text("-");r.number(uint64_t(-e.result));}else r.number(uint64_t(e.result));
+                r.text("}");}
+            r.text("]");
+        }
+        r.text(",\"scope\":\"i915 ioctls seen by Brook since trace on: nr (core DRM or 0x40+i915 nr), size, detail = GETPARAM id or execbuffer2 flags, result; 256-entry ring\"}\n");
+        r.send();
+    }
+    else if(StrStartsWith(cmd,"gpu video")) {
+        // VA-API phase 1: VCS0 (video engine) bring-up. Build option
+        // BROOK_BDW_VIDEO_ENGINE plus this runtime gate (boot default off).
+        const bool on=NetStrEq(cmd,"gpu video on"),off=NetStrEq(cmd,"gpu video off");
+        const bool probe=NetStrEq(cmd,"gpu video probe"),reset=NetStrEq(cmd,"gpu video reset");
+        const bool selftest=NetStrEq(cmd,"gpu video selftest"),status=NetStrEq(cmd,"gpu video status");
+        // VCS power-management experiments (gen 391 clock sag): sample, (a)..(e).
+        uint8_t pmOp=0;
+        if(NetStrEq(cmd,"gpu video pm sample"))pmOp=uint8_t(BdwVcsPmOp::Sample);
+        else if(NetStrEq(cmd,"gpu video pm stop-start"))pmOp=uint8_t(BdwVcsPmOp::StopStart);
+        else if(NetStrEq(cmd,"gpu video pm idle-ring"))pmOp=uint8_t(BdwVcsPmOp::IdleRing);
+        else if(NetStrEq(cmd,"gpu video pm rps-rewrite"))pmOp=uint8_t(BdwVcsPmOp::RpsRewrite);
+        else if(NetStrEq(cmd,"gpu video pm engine-restore"))pmOp=uint8_t(BdwVcsPmOp::EngineRestore);
+        if(!on && !off && !probe && !reset && !selftest && !status && !pmOp){
+            DebugChannelSend("Usage: gpu video on|off|status|probe|reset|selftest|pm sample|pm stop-start|pm idle-ring|pm rps-rewrite|pm engine-restore\n");return;}
+        BdwVideoRefusal refusal=BdwVideoRefusal::None;bool ok=true;
+        BdwForcewakeAdapterResult fw{};BdwRcsResetTestResult rs{};
+        BdwBcsRunResult st{};uint32_t readback=0,expected=0;bool pending=false;
+        if(on || off)ok=BdwVideoSetEnabled(on,refusal);
+        else if(probe || reset || selftest)
+            ok=BdwVideoRunOnCpu0(probe?1:reset?2:3,fw,rs,st,readback,expected,refusal,pending);
+        else if(pmOp)
+            ok=BdwVideoRunOnCpu0(uint8_t(10+pmOp),fw,rs,st,readback,expected,refusal,pending);
+        BdwVideoGate g{};const bool have=BdwVideoStatus(g);
+        BdwGtPmRecord pm{};VmmDellVcsPmRecord(pm);
+        BridgeReply r;r.text("{\"built\":");r.text(BdwVideoBuilt()?"true":"false");
+        r.text(",\"ok\":");r.text(ok?"true":"false");
+        r.text(",\"refusal\":\"");r.text(BdwVideoRefusalName(refusal));r.text("\"");
+        if(have){
+            r.text(",\"stage\":\"");r.text(BdwVideoStageName(g.stage()));r.text("\"");
+            r.text(",");r.field("probes",g.probes());r.text(",");r.field("resets",g.resets());
+            r.text(",");r.field("refusals",g.refusals());
+            r.text(",\"last_refusal\":\"");r.text(BdwVideoRefusalName(g.lastRefusal()));r.text("\"");
+            r.text(",\"advertised\":");r.text(g.advertiseBsd()?"true":"false");
+            r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
+            r.text(",");r.field("retries",g.retries());
+            r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");
+            r.text(",\"rc6_checked\":");r.text(g.rc6Checked()?"true":"false");
+            r.text(",");r.field("rc6_pct",g.rc6Pct());
+            r.text(",\"rc6_resumed\":");r.text(g.rc6Resumed()?"true":"false");
+            {uint32_t restores=0,failures=0;VmmDellVcsEngineRestoreCounts(restores,failures);
+             r.text(",");r.field("engine_restores",restores);r.text(",");r.field("engine_restore_failures",failures);}
+            {uint64_t serviced=0,leaseBusy=0,timeouts=0;BdwVideoWorkerCounts(serviced,leaseBusy,timeouts);
+             r.text(",\"worker_steps\":{");r.field("serviced",serviced);r.text(",");r.field("lease_busy",leaseBusy);
+             r.text(",");r.field("timeouts",timeouts);r.text("}");}
+            const auto& v=g.sample();
+            r.text(",\"vcs\":{\"sampled\":");r.text(v.sampled?"true":"false");
+            r.text(",\"idle\":");r.text(v.idle?"true":"false");
+            r.text(",\"quiescent\":");r.text(v.quiescent?"true":"false");
+            r.text(",");r.field("head",v.head);r.text(",");r.field("tail",v.tail);
+            r.text(",");r.field("mi_mode",v.mode);r.text(",");r.field("start",v.start);
+            r.text(",");r.field("control",v.control);r.text(",");r.field("execlist_lo",v.execlistLo);
+            r.text(",");r.field("execlist_hi",v.execlistHi);r.text(",");r.field("gfx_mode",v.submissionMode);r.text("}");
+        }
+        if(pending){r.text(",\"pending\":true");}
+        if(pmOp==uint8_t(BdwVcsPmOp::Sample)){
+            BdwGtPmSnapshot a{},b{};uint64_t us=0;BdwVideoPmSamples(a,b,us);
+            auto at=[](const BdwGtPmSnapshot& x,uint32_t reg){const int i=BdwGtPmIndex(reg);return i<0?0u:x.value[i];};
+            auto pct=[&](uint32_t reg){const uint32_t d=at(b,reg)-at(a,reg);return us?uint64_t(d)*128/(us)/1:0;};
+            // RC6 residency counters count in 1.28 us units: percent = delta*1.28/us*100 = delta*128/us.
+            r.text(",\"sample\":{");r.field("interval_us",us);
+            r.text(",");r.field("rc6_delta",at(b,0x138108)-at(a,0x138108));r.text(",");r.field("rc6_pct",pct(0x138108));
+            r.text(",");r.field("rc6p_delta",at(b,0x13810c)-at(a,0x13810c));r.text(",");r.field("rc6p_pct",pct(0x13810c));
+            r.text(",");r.field("rc6pp_delta",at(b,0x138110)-at(a,0x138110));r.text(",");r.field("rc6pp_pct",pct(0x138110));
+            r.text(",");r.field("rc_state",at(b,0xa094));r.text(",");r.field("rc_control",at(b,0xa090));
+            r.text(",");r.field("cagf_a_mhz",BdwGtCagfMhz(at(a,0xa01c)));r.text(",");r.field("cagf_b_mhz",BdwGtCagfMhz(at(b,0xa01c)));
+            r.text(",");r.field("thread_status",at(b,0x13805c));
+            r.text(",");r.field("vcs_mi_mode",at(b,0x1209c));r.text(",");r.field("vcs_max_idle",at(b,0x12054));
+            r.text(",");r.field("bcs_max_idle",at(b,0x22054));r.text(",");r.field("rcs_max_idle",at(b,0x2054));
+            r.text(",");r.field("vcs_psmi",at(b,0x12050));r.text("}");
+        }
+        if(pmOp && pmOp!=uint8_t(BdwVcsPmOp::Sample)){
+            BdwGtPmSnapshot after{};uint32_t writes=0,failures=0;VmmDellVcsPmSample(after,writes,failures);
+            r.text(",\"pm_op\":{\"op\":\"");r.text(BdwVcsPmOpName(BdwVcsPmOp(pmOp)));r.text("\"");
+            r.text(",\"attempted\":");r.text(rs.attempted?"true":"false");
+            r.text(",\"complete\":");r.text(rs.complete?"true":"false");
+            r.text(",");r.field("writes",writes);r.text(",");r.field("failures",failures);r.text("}");
+        }
+        if(pm.op && (status || reset || selftest)){
+            // GT PM before/after the last VCS operation (gen 390 clock-sag investigation).
+            r.text(",\"pm\":{\"op\":\"");r.text(pm.op==1?"reset":"selftest");r.text("\"");
+            r.text(",\"valid\":");r.text(pm.before.valid && pm.after.valid?"true":"false");
+            r.text(",");r.field("changed_mask",pm.changedMask);r.text(",");r.field("restored_mask",pm.restoredMask);
+            r.text(",");r.field("restore_failed_mask",pm.restoreFailedMask);
+            r.text(",");r.field("cagf_before_mhz",BdwGtCagfMhz(pm.before.value[4]));
+            r.text(",");r.field("cagf_after_mhz",BdwGtCagfMhz(pm.after.value[4]));
+            r.text(",\"regs\":[");
+            for(unsigned i=0;i<BdwGtPmRegCount;++i){if(i)r.text(",");
+                r.text("{");r.field("r",BdwGtPmRegs[i]);r.text(",");r.field("f",pm.first.value[i]);r.text(",");r.field("b",pm.before.value[i]);
+                r.text(",");r.field("a",pm.after.value[i]);r.text("}");}
+            r.text("]}");
+        }
+        if(reset){r.text(",\"reset\":{\"attempted\":");r.text(rs.attempted?"true":"false");
+            r.text(",\"complete\":");r.text(rs.complete?"true":"false");
+            r.text(",\"uncertain\":");r.text(rs.uncertain?"true":"false");
+            r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
+        if(selftest){r.text(",\"selftest\":{\"attempted\":");r.text(st.attempted?"true":"false");
+            r.text(",\"reset_before\":");r.text(st.resetBefore?"true":"false");
+            r.text(",\"breadcrumb\":");r.text(st.copyComplete?"true":"false");
+            r.text(",\"context_complete\":");r.text(st.contextComplete?"true":"false");
+            r.text(",\"reset_after\":");r.text(st.resetAfter?"true":"false");
+            r.text(",\"retired\":");r.text(st.scanoutRetired?"true":"false");
+            r.text(",\"pat_restored\":");r.text(st.patRestored?"true":"false");
+            r.text(",");r.field("expected",expected);r.text(",");r.field("readback",readback);
+            r.text(",");r.field("ggtt_writes",st.ggttWriteAttempts);r.text(",");r.field("elsp_writes",st.portWriteAttempts);
+            if(st.engineSampled){r.text(",");r.field("head",st.head);r.text(",");r.field("tail",st.tail);
+                r.text(",");r.field("acthd",st.acthd);r.text(",");r.field("ipehr",st.ipehr);r.text(",");r.field("execlist",st.execlist);}
+            r.text(",");r.field("refusal_step",st.refusalStep);r.text(",");r.field("adapter_refusal",fw.refusal);
+            r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
+        r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest = reset VCS, init execlists, one-shot submission (PPGTT batch MI_STORE_DATA_IMM plus ring breadcrumb) with CSB retirement, reset after and unbind; failures after an engine write quarantine VCS for the boot, uncertain GT reset/PAT/forcewake state panics; user submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
+        r.send();
+    }
+    else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // M4a kill switch: off (the boot default) keeps 1 ms polling for every
+        // GPU wait and disables RCS completion spin slices.
+        if(NetStrEq(cmd,"gpu wakeups on"))BdwPromptWakeSet(true);
+        else if(NetStrEq(cmd,"gpu wakeups off"))BdwPromptWakeSet(false);
+        const auto& w=BdwPromptWake();
+        BridgeReply r;r.text("{\"enabled\":");r.text(BdwPromptWakeEnabled()?"true":"false");
+        r.text(",");r.field("armed",__atomic_load_n(&w.armed,__ATOMIC_RELAXED));
+        r.text(",");r.field("stale",__atomic_load_n(&w.stale,__ATOMIC_RELAXED));
+        r.text(",");r.field("refused_while_off",__atomic_load_n(&w.refused,__ATOMIC_RELAXED));
+        r.text(",");r.field("if_restores",__atomic_load_n(&w.ifRestores,__ATOMIC_RELAXED));
+        r.text(",");r.field("work_generation",BdwGpuEventGeneration(BdwGpuEvent::Work));
+        r.text(",");r.field("retire_generation",BdwGpuEventGeneration(BdwGpuEvent::Retire));
+        r.text(",\"scope\":\"M4a prompt GPU wakeups; off = pre-M4a 1 ms polling (boot default unless /etc/dell-gpu-prompt-wake); on = wait-registry wakes plus RCS completion spin slices (spins also need no /etc/dell-gpu-no-poll-spin); new waits follow the switch immediately, armed waits end at their one-tick timeout; if_restores counts worker waits that returned with IF=0 and were re-enabled (should stay 0 outside spin slices)\"}\n");
+        r.send();
+#else
+        DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(NetStrEq(cmd,"gpu worker overhead") || NetStrEq(cmd,"gpu worker overhead reset")) {
+        if(NetStrEq(cmd,"gpu worker overhead reset")){BdwOverheadRequestReset();
+            DebugChannelSend("{\"reset\":\"requested\",\"scope\":\"applied at the worker's next recorded step\"}\n");return;}
+        const auto& tsc=NativeTscObserveRead();
+        const uint64_t khz=tsc.capable && tsc.measured && tsc.consistent?tsc.khz:0;
+        auto us=[khz](uint64_t t){return khz?t*1000/khz:0;};
+        auto& st=BdwOverhead();
+        BridgeReply r;r.text("{");r.field("khz",khz);r.text(",\"audit_batch\":");r.text(BdwAuditBatchEnabled()?"true":"false");
+        r.text(",\"steps\":{");
+        for(unsigned i=0;i<BdwOhStepCount;++i){
+            const uint64_t c=__atomic_load_n(&st.steps[i].count,__ATOMIC_RELAXED),t=__atomic_load_n(&st.steps[i].ticks,__ATOMIC_RELAXED),
+                m=__atomic_load_n(&st.steps[i].maxTicks,__ATOMIC_RELAXED);
+            if(i)r.text(",");r.text("\"");r.text(BdwOverheadStepName(i));r.text("\":[");
+            r.number(c);r.text(",");r.number(us(t));r.text(",");r.number(c?us(t)*1000/c:0);r.text(",");r.number(us(m));r.text("]");
+        }
+        r.text("},");r.field("audit_batches",__atomic_load_n(&st.counters.auditBatches,__ATOMIC_RELAXED));
+        r.text(",");r.field("audit_batch_fallbacks",__atomic_load_n(&st.counters.auditBatchFallbacks,__ATOMIC_RELAXED));
+        r.text(",");r.field("workspace_reuses",__atomic_load_n(&st.counters.workspaceReuses,__ATOMIC_RELAXED));
+        r.text(",");r.field("workspace_allocs",__atomic_load_n(&st.counters.workspaceAllocs,__ATOMIC_RELAXED));
+        r.text(",\"scope\":\"gpu-submit worker fixed per-job costs since boot or reset; steps=[count,total_us,avg_ns,max_us]; prepare includes tables..arm; render_run is the forcewake critical section including GPU time, audit and yield_wait; audit = one critical-section re-audit after a GPU-wait yield (interrupts off), audit_types its MTRR/PAT observation; relaxed reads may mix two jobs\"}\n");
+        r.send();
+    }
+    else if(NetStrEq(cmd,"gpu audit batch on") || NetStrEq(cmd,"gpu audit batch off") || NetStrEq(cmd,"gpu audit batch status")) {
+        if(NetStrEq(cmd,"gpu audit batch on"))BdwAuditBatchSet(true);
+        else if(NetStrEq(cmd,"gpu audit batch off"))BdwAuditBatchSet(false);
+        BridgeReply r;r.text("{\"enabled\":");r.text(BdwAuditBatchEnabled()?"true":"false");
+        r.text(",\"scope\":\"on (default) = one MTRR/PAT/CR0 observation window per critical-section audit; off = the previous per-page observation; results are identical by construction\"}\n");r.send();
+    }
     else if(NetStrEq(cmd,"gpu worker stats") || NetStrEq(cmd,"gpu worker stats reset")) {
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         if(NetStrEq(cmd,"gpu worker stats reset")){
@@ -5708,7 +6046,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<3;++i){const auto& y=s.yields[i];
             if(i)r.text(",");r.text("\"");r.text(jobs[i]);r.text("\":{");r.field("jobs",y.jobs);
             r.text(",");r.field("yields",y.yields);r.text(",");r.field("breadcrumb_yields",y.breadcrumbYields);
-            r.text(",");r.field("sleep_us",us(y.sleepTicks));r.text(",\"hist\":[");
+            r.text(",");r.field("sleep_us",us(y.sleepTicks));
+            r.text(",");r.field("spins",y.spins);r.text(",");r.field("breadcrumb_spins",y.breadcrumbSpins);
+            r.text(",");r.field("spin_us",us(y.spinTicks));r.text(",\"hist\":[");
             for(unsigned b=0;b<BdwWorkerYieldBuckets;++b){if(b)r.text(",");r.number(y.buckets[b]);}
             r.text("]}");}
         r.text("},\"mhz\":{");
@@ -5729,9 +6069,89 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(s.flipLatchFrames[i]);}
         r.text("],");r.field("map_hits",s.mapHits);r.text(",");r.field("map_full",s.mapFull);
         r.text(",");r.field("map_failed",s.mapFailed);
-        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; sleep_us includes unlock, sleep and re-audit; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
+        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(StrStartsWith(cmd,"gpu zerocopy ")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // Zero-copy scanout of renderer images (docs/bdw-zero-copy-scanout.md).
+        // RAM-only runtime gate: every boot starts with the BCS copy.
+        const char* note="";bool ok=true;
+        if(NetStrEq(cmd,"gpu zerocopy verify")){
+            BdwZeroCopyVerify v{};const bool done=BdwZeroCopyVerifyFront(v);
+            BridgeReply r;r.text("{\"ok\":");r.text(done?"true":"false");r.text(",\"result\":");r.quoted(v.result?v.result:"");
+            r.text(",");r.field("front",v.front);r.text(",");r.field("sequence",v.sequence);
+            r.text(",\"crc_before\":[");r.number(v.before[0]);r.text(",");r.number(v.before[1]);
+            r.text("],\"crc_after_flush\":[");r.number(v.after[0]);r.text(",");r.number(v.after[1]);
+            r.text("],");r.field("flushed_pages",v.flushedPages);
+            r.text(",\"uncached_render\":");r.text(BdwZeroCopyUncachedRender()?"true":"false");
+            r.text(",\"scope\":\"pipe A CRC (primary plane) of the front image, twice before and twice after a CLFLUSH of every line of it; a change means the display was scanning stale memory. Keep the desktop idle.\"}\n");
+            r.send();return;
+        }
+        if(NetStrEq(cmd,"gpu zerocopy timeline")){
+            static BdwZeroCopyTimelineEntry entries[64];uint64_t khz=0;
+            const uint32_t n=BdwZeroCopyReadTimeline(entries,64,khz);
+            auto us=[&](uint64_t tsc){return khz && tsc?tsc*1000/khz:0;};
+            BridgeReply r;r.text("{");r.field("count",n);r.text(",\"columns\":[\"sequence\",\"image\",\"queued\",\"present_us\",\"arm_us\",\"latch_us\",\"vblanks\"],\"rows\":[");
+            for(uint32_t i=0;i<n;++i){const auto& e=entries[i];if(i)r.text(",");
+                r.text("[");r.number(e.sequence);r.text(",");r.number(e.slot);r.text(",");r.number(e.queued);r.text(",");
+                r.number(us(e.presentTsc));r.text(",");r.number(us(e.armTsc));r.text(",");r.number(us(e.latchTsc));r.text(",");r.number(e.frames);r.text("]");}
+            r.text("],\"scope\":\"zero-copy presents, oldest first; times are TSC microseconds since boot (CLOCK_MONOTONIC on the Dell uses the same TSC); present=worker present call, arm=DSPASURF write (0 if replaced in the mailbox), latch=first poll that saw it live\"}\n");
+            r.send();return;
+        }
+        if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);
+        else if(NetStrEq(cmd,"gpu zerocopy off")){BdwZeroCopyDisarm();note="leaving at the next present";}
+        else if(NetStrEq(cmd,"gpu zerocopy uc on") || NetStrEq(cmd,"gpu zerocopy uc off")){
+            BdwZeroCopySetUncachedRender(NetStrEq(cmd,"gpu zerocopy uc on"));note="cache mode set (uc on = uc, uc off = flush)";
+        }else if(NetStrEq(cmd,"gpu zerocopy cache flush") || NetStrEq(cmd,"gpu zerocopy cache uc") || NetStrEq(cmd,"gpu zerocopy cache wt")){
+            ok=BdwZeroCopySetCacheMode(NetStrEq(cmd,"gpu zerocopy cache uc")?1u:NetStrEq(cmd,"gpu zerocopy cache wt")?2u:0u);
+            note=ok?"cache mode applied; each image is flushed in full at its next present":"not built";
+        }else if(!NetStrEq(cmd,"gpu zerocopy status")){
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|cache flush|cache uc|cache wt\"}\n");return;
+        }
+        BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
+        BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
+        r.text(",\"built\":");r.text(z.built?"true":"false");
+        r.text(",\"registered\":");r.text(z.registered?"true":"false");
+        r.text(",\"requested\":");r.text(z.requested?"true":"false");
+        r.text(",\"active\":");r.text(z.active?"true":"false");
+        r.text(",\"disabled\":");r.text(z.disabled?"true":"false");
+        r.text(",\"reason\":");r.quoted(z.reason?z.reason:"");
+        r.text(",\"registration_refusal\":");r.quoted(BdwZeroCopyRefusalName(z.refusal));
+        r.text(",");r.field("images",z.images);r.text(",");r.field("free_mask",z.freeMask);
+        r.text(",");r.field("front",z.front);r.text(",");r.field("armed",z.armed);r.text(",");r.field("queued",z.queued);
+        r.text(",");r.field("sequence",z.sequence);r.text(",");r.field("setup_us",z.setupUs);
+        r.text(",");r.field("gop_returns",z.gopReturns);
+        r.text(",\"uncached_render\":");r.text(z.uncachedRender?"true":"false");
+        r.text(",\"cache_mode\":");r.quoted(BdwZeroCopyCacheModeName());
+        r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
+        r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
+        r.text("],\"ages\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.ages[i]);}
+        const auto& st=z.stats;
+        r.text("],\"stats\":{");r.field("presents",st.presents);r.text(",");r.field("armed_now",st.armedNow);
+        r.text(",");r.field("queued",st.queued);r.text(",");r.field("replaced",st.replaced);
+        r.text(",");r.field("latched",st.latched);r.text(",");r.field("missed_vblanks",st.missedVblanks);
+        r.text(",");r.field("uncertain",st.uncertain);r.text(",");r.field("refused_reserve",st.refusedReserve);
+        r.text(",");r.field("flushes",st.flushes);r.text(",");r.field("full_flushes",st.fullFlushes);
+        r.text(",");r.field("flush_bytes",st.flushBytes);
+        r.text(",\"flush_us\":[");r.number(st.flushes?st.flushUsSum/st.flushes:0);r.text(",");r.number(st.flushUsMax);r.text("]");
+        r.text(",\"latch_us\":[");r.number(st.latched?st.latchUsSum/st.latched:0);r.text(",");r.number(st.latchUsMax);
+        r.text("],\"latch_frames\":[");for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(st.latchFrames[i]);}
+        r.text("],\"fallback\":{");
+        for(unsigned i=0;i<unsigned(BdwZeroCopyFallback::Count_);++i){if(i)r.text(",");
+            r.quoted(BdwZeroCopyFallbackName(BdwZeroCopyFallback(i)));r.text(":");r.number(st.fallback[i]);}
+        r.text("}},\"last_fallback\":");r.quoted(BdwZeroCopyFallbackName(z.last));
+        const auto& g=z.ggtt;
+        r.text(",\"ggtt\":{\"stage\":");r.quoted(BdwFlipGgttStageName(g.stage));
+        r.text(",");r.field("image",g.buffer);r.text(",");r.field("first",g.first);r.text(",");r.field("count",g.count);
+        r.text(",");r.field("zero",g.zero);r.text(",");r.field("valid",g.valid);r.text(",");r.field("other",g.other);
+        r.text(",");r.field("audit_page",g.auditPage);r.text(",\"takeover\":");r.text(g.takeover?"true":"false");
+        r.text("},\"scope\":\"presents=image presents armed or queued without a copy; latch_us=[avg,max] DSPASURF write to observed DSPASURFLIVE (about 1 ms poll); latch_frames=vblanks 1,2,3,>3; fallback=presents that used the BCS copy or left zero-copy, by reason; refused_reserve=GPU reservations of a displayed image refused\"}\n");
+        r.send();
+#else
+        DebugChannelSend("{\"error\":\"guarded Dell kernel required\"}\n");
 #endif
     }
     else if(StrStartsWith(cmd,"gpu flip ") || StrStartsWith(cmd,"gpu scanout map ")) {
@@ -5809,6 +6229,42 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(NetStrEq(cmd,"gpu scene wake off"))SceneCompletionWakeEnable(false);
         BridgeReply r;r.text("{\"enabled\":");r.text(SceneCompletionWakeEnabled()?"true":"false");
         r.text(",\"scope\":\"default-off scene completion wake experiment; per-wait snapshot, existing registrations retained\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"compositor idle status") || NetStrEq(cmd,"compositor idle reset")) {
+        const auto s=CompositorReadIdleStats(NetStrEq(cmd,"compositor idle reset"));BridgeReply r;r.text("{");
+        r.field("loops",s.loops);r.text(",");r.field("lease_active_loops",s.leaseActiveLoops);
+        r.text(",");r.field("software_flips",s.softwareFlips);r.text(",");r.field("full_flips",s.fullFlips);
+        r.text(",");r.field("rows_dirty",s.rowsDirty);r.text(",");r.field("rows_copied",s.rowsCopied);
+        r.text(",");r.field("rows_skipped",s.rowsSkipped);r.text(",");r.field("bytes_copied",s.bytesCopied);
+        r.text(",");r.field("shadow_invalidations",s.shadowInvalidations);r.text(",");r.field("shadow_unavailable",s.shadowUnavailable);
+        r.text(",");r.field("cpu_overlay_draws",s.cpuOverlayDraws);r.text(",");r.field("cpu_overlay_skips",s.cpuOverlaySkips);
+        r.text(",");r.field("overlay_renders",s.overlayRenders);r.text(",");r.field("overlay_bumps",s.overlayBumps);
+        r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay capture renders and generation bumps\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"desktop chrome status") || NetStrEq(cmd,"desktop chrome reset")) {
+        auto& g=g_chromeCaptureStats;
+        auto take=[&](uint64_t& v){return NetStrEq(cmd,"desktop chrome reset")?__atomic_exchange_n(&v,0,__ATOMIC_RELAXED):__atomic_load_n(&v,__ATOMIC_RELAXED);};
+        const uint64_t keeps=take(g.keeps),misses=take(g.keepMisses),captures=take(g.captures),copied=take(g.bytesCopied),kept=take(g.bytesKept);
+        BridgeReply r;r.text("{");r.field("keeps",keeps);r.text(",");r.field("keep_misses",misses);
+        r.text(",");r.field("captures",captures);r.text(",");r.field("bytes_copied",copied);r.text(",");r.field("bytes_kept",kept);
+        r.text(",\"scope\":\"renderer window-chrome requests since boot or reset; keeps reuse the renderer's held pixels (no render, no copy); keep_misses are keeps refused because the chrome changed; captures render and copy the outer surface\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu node cache on") || NetStrEq(cmd,"gpu node cache off") || NetStrEq(cmd,"gpu node cache status")) {
+        auto& c=BdwIntelNodeCache();
+        if(NetStrEq(cmd,"gpu node cache on"))BdwNodeCacheSetEnabled(c,true);
+        else if(NetStrEq(cmd,"gpu node cache off"))BdwNodeCacheSetEnabled(c,false);
+        BridgeReply r;r.text("{\"enabled\":");r.text(__atomic_load_n(&c.disabled,__ATOMIC_RELAXED)?"false":"true");
+        r.text(",");r.field("hits",__atomic_load_n(&c.hits,__ATOMIC_RELAXED));r.text(",");r.field("checks",__atomic_load_n(&c.checks,__ATOMIC_RELAXED));
+        r.text(",");r.field("ttl_ms",BdwNodeCacheTtlMs);
+        r.text(",\"scope\":\"Intel GPU ioctl admission gate; checks = live PCI identity/BAR/D0 reads, hits = reuse of a passing check younger than ttl_ms; the submission worker still checks live around every job\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"desktop capture status") || NetStrEq(cmd,"desktop capture reset")) {
+        auto& g=g_desktopCaptureStats;
+        auto take=[&](uint64_t& v){return NetStrEq(cmd,"desktop capture reset")?__atomic_exchange_n(&v,0,__ATOMIC_RELAXED):__atomic_load_n(&v,__ATOMIC_RELAXED);};
+        const uint64_t calls=take(g.calls),keeps=take(g.keeps),misses=take(g.keepMisses),captures=take(g.captures),copied=take(g.bytesCopied),kept=take(g.bytesKept);
+        BridgeReply r;r.text("{");r.field("calls",calls);r.text(",");r.field("keeps",keeps);r.text(",");r.field("keep_misses",misses);
+        r.text(",");r.field("captures",captures);r.text(",");r.field("bytes_copied",copied);r.text(",");r.field("bytes_kept",kept);
+        r.text(",\"scope\":\"renderer client-layer captures since boot or reset; keeps = CPU window layers whose published content generation was unchanged, so nothing was copied; keep_misses = keeps requested but recopied because the window published; captures = layers copied (GPU-source windows are not counted)\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu uploads")) {
         const auto s=CompositorReadUploads();BridgeReply r;r.text("{\"layers\":[");

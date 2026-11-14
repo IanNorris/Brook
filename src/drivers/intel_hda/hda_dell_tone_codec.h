@@ -40,6 +40,13 @@ public:
                setAmp(p.dac,true,true,p.dacGain) && setAmp(p.dac,true,false,p.dacGain) &&
                setAmp(p.mixer,false,true,0) && setAmp(p.mixer,false,false,0) && pinMuted(p);
     }
+    // Live DAC gain change (the DAC has no mute; the pin stays as it is).
+    // Both channels are attempted; false means the gain is uncertain.
+    bool setDacGainAndVerify(const HdaDellTonePlan& p,uint8_t step) {
+        if(step>0x7f)return false;
+        const bool l=setAmp(p.dac,true,true,step),r=setAmp(p.dac,true,false,step);
+        return l && r;
+    }
     bool unmuteAndVerify(const HdaDellTonePlan& p) {
         if(!pinMuted(p))return false;
         return setAmp(p.pin,true,true,0) && setAmp(p.pin,true,false,0);

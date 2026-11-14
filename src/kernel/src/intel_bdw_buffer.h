@@ -20,6 +20,17 @@ void BdwGpuBufferPrimeCacheProbe(BdwGpuBuffer*);
 // Kernel-owned output: CPU mappings through Intel DRM are forbidden from
 // creation for its entire lifetime, including after PRIME/GEM import.
 BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes);
+// Zero-copy scanout registration (protected buffers only, idle): permanent
+// for the buffer's life; render submissions then map it uncached.
+bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b);
+bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b);
+// No GPU use, handoff reservation or failure: a retained image may change owner.
+bool BdwGpuBufferIdle(const BdwGpuBuffer* b);
+// Transient CPU-visibility transition (TRY_CPU_READ, handoff retirement):
+// GPU use is refused only while it lasts.
+bool BdwGpuBufferInCpuTransition(const BdwGpuBuffer* b);
+// Why BeginGpuUse would refuse this buffer now, or nullptr.
+const char* BdwGpuBufferUseRefusal(const BdwGpuBuffer* b);
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* buffer);
 void BdwGpuBufferRef(BdwGpuBuffer* buffer);
 void BdwGpuBufferUnref(BdwGpuBuffer* buffer);

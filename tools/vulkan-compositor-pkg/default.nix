@@ -126,12 +126,18 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation desktop_occlusion_present_test.c -o brook-desktop-occlusion-present-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_damage_test.c -o brook-desktop-damage-test
     ./brook-desktop-damage-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_buffer_age_test.c -o brook-desktop-buffer-age-test
+    ./brook-desktop-buffer-age-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_scanout_ring_test.c -o brook-desktop-scanout-ring-test
+    ./brook-desktop-scanout-ring-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_overlay_cache_test.c -o brook-desktop-overlay-cache-test
     ./brook-desktop-overlay-cache-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror source_size_policy_test.c -o brook-desktop-source-size-policy-test
     ./brook-desktop-source-size-policy-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_content_layer_test.c -o brook-desktop-content-layer-test
     ./brook-desktop-content-layer-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_client_cache_test.c -o brook-desktop-client-cache-test
+    ./brook-desktop-client-cache-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_spans_test.c -o brook-desktop-chrome-spans-test
     ./brook-desktop-chrome-spans-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_fence_recovery_test.c -o brook-desktop-fence-recovery-test

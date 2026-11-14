@@ -18,7 +18,8 @@ enum class BdwBcsResetIntent { IdleTakeover, StopOwnedWork };
 template<uint32_t EngineBase,uint32_t DomainBit,class Io>
 BdwBcsResetResult BdwResetEngineDomain(Io& io,BdwBcsResetIntent intent) {
     static_assert((EngineBase==0x22000 && DomainBit==8) ||
-                  (EngineBase==0x2000 && DomainBit==2),"unsupported engine");
+                  (EngineBase==0x2000 && DomainBit==2) ||
+                  (EngineBase==0x12000 && DomainBit==4),"unsupported engine");
     constexpr uint32_t resetCtl=EngineBase+0xd0, domain=0x941c,miMode=EngineBase+0x9c;
     constexpr uint32_t ready=2, catastrophic=4;
     if(!io.owned() || (intent==BdwBcsResetIntent::IdleTakeover && !io.quiescent()))return BdwBcsResetResult::NotStarted;
@@ -78,5 +79,10 @@ template<class Io> BdwBcsResetResult BdwResetBcsDomain(Io& io,BdwBcsResetIntent 
 // state, retire workloads, or prove that any backing pages may be reclaimed.
 template<class Io> BdwBcsResetResult BdwResetRcsDomain(Io& io,BdwBcsResetIntent intent=BdwBcsResetIntent::IdleTakeover) {
     return BdwResetEngineDomain<0x2000,2>(io,intent);
+}
+// VCS0 uses GEN6_GRDOM_MEDIA (bit 2 of GDRST, value 4). Gen8 has a single
+// forcewake domain (FORCEWAKE_MT), so the caller's render forcewake covers it.
+template<class Io> BdwBcsResetResult BdwResetVcsDomain(Io& io,BdwBcsResetIntent intent=BdwBcsResetIntent::IdleTakeover) {
+    return BdwResetEngineDomain<0x12000,4>(io,intent);
 }
 }

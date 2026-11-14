@@ -1,14 +1,93 @@
 #include "../../kernel/src/intel_bdw_ppgtt.h"
 #include "../../kernel/src/intel_bdw_exec_address_space.h"
+#include "reference_ppgtt.h"
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 using namespace brook;
 alignas(4096) static uint8_t memory[20][4096];
 static BdwPpgttMapping largeMaps[1025];
 static uint64_t entry(const BdwPpgttPage& page,unsigned index) {
     return reinterpret_cast<const uint64_t*>(page.cpu)[index];
 }
+// The optimized builder (sorted DMA set, per-level path cache) must accept
+// and reject exactly the same inputs as the original and write identical
+// table and scratch bytes, for sorted and unsorted mapping sets.
+static void DifferentialTest() {
+    srand(7);std::vector<uint8_t*> owned;
+    auto page=[&]{void* p=nullptr;assert(!posix_memalign(&p,4096,4096));std::memset(p,0xcc,4096);owned.push_back(static_cast<uint8_t*>(p));return static_cast<uint8_t*>(p);};
+    constexpr unsigned tableMax=128;
+    BdwPpgttPage sa[4];brook_reference::BdwPpgttPage sb[4];
+    std::vector<BdwPpgttPage> ta(tableMax);std::vector<brook_reference::BdwPpgttPage> tb(tableMax);
+    for(unsigned i=0;i<4;++i){sa[i]={0x100000000ull+4096ull*i,page()};sb[i]={sa[i].dma,page()};}
+    for(unsigned i=0;i<tableMax;++i){ta[i]={0x180000000ull+4096ull*i,page()};tb[i]={ta[i].dma,page()};}
+    unsigned built=0;
+    for(int trial=0;trial<400;++trial){
+        const bool sorted=trial%4!=3;
+        const unsigned n=1+unsigned(rand())%(sorted?(trial<250?96:9000):1000);
+        std::vector<BdwPpgttMapping> a;std::vector<brook_reference::BdwPpgttMapping> b;
+        uint64_t address=uint64_t(rand()%64)<<21;
+        for(unsigned i=0;i<n;++i){
+            address+=4096ull*(1+(rand()%3==0?unsigned(rand())%600:0));if(rand()%60==0)address+=uint64_t(rand()%4)<<30;
+            const uint64_t dma=0x200000000ull+uint64_t(rand()%8000000)*4096;const bool w=rand()&1;
+            const auto cache=rand()%5==0?BdwPpgttCache::Uncached:BdwPpgttCache::WriteBack;
+            a.push_back({address,dma,w,cache});b.push_back({address,dma,w,cache==BdwPpgttCache::Uncached?
+                brook_reference::BdwPpgttCache::Uncached:brook_reference::BdwPpgttCache::WriteBack});
+        }
+        if(!sorted)for(unsigned i=n;i>1;--i){const unsigned j=unsigned(rand())%i;std::swap(a[i-1],a[j]);std::swap(b[i-1],b[j]);}
+        if(trial%13==0 && n>2){a[n/2].dma=b[n/2].dma=sa[1].dma;}        // collides with scratch
+        if(trial%17==0 && n>2){a[n/3].dma=b[n/3].dma=ta[2].dma;}        // collides with a table page
+        if(trial%19==0 && n>3 && sorted){a[2].address=b[2].address=a[1].address;} // duplicate address
+        // Acceptance is monotone in the table count, so binary-search the
+        // exact count the reference needs (0 if it rejects regardless).
+        unsigned exact=0;
+        if(brook_reference::BdwBuildPpgttImage(sb,tb.data(),tableMax,b.data(),n,sorted)){
+            unsigned lo=1,hi=tableMax;
+            while(lo<hi){const unsigned mid=(lo+hi)/2;
+                if(brook_reference::BdwBuildPpgttImage(sb,tb.data(),mid,b.data(),n,sorted))hi=mid;else lo=mid+1;}
+            exact=lo;
+        }
+        for(unsigned t:{exact?exact:1u,exact?exact+1:2u,exact>1?exact-1:1u}){
+            const bool rb=brook_reference::BdwBuildPpgttImage(sb,tb.data(),t,b.data(),n,sorted);
+            const bool ra=BdwBuildPpgttImage(sa,ta.data(),t,a.data(),n,sorted);
+            assert(ra==rb);
+            if(!ra)continue;++built;
+            for(unsigned i=0;i<4;++i)assert(!std::memcmp(sa[i].cpu,sb[i].cpu,4096));
+            for(unsigned i=0;i<t;++i)assert(!std::memcmp(ta[i].cpu,tb[i].cpu,4096));
+        }
+    }
+    assert(built>100);
+    for(auto* p:owned)std::free(p);
+}
+// The gen 386 Chromium job: 68 objects, 65,451 pages (~256 MiB). It needs
+// more than the old 128-table limit (so preparation failed and the worker
+// panicked) and fits the 512-table limit; the builder maps it completely.
+static void LargeBufferSetTest() {
+    constexpr uint32_t objects=68,total=65451;
+    static BdwExecMemoryObject set[objects];static std::vector<uint64_t> dmas[objects];
+    uint64_t address=0x100000000ull;uint32_t left=total;
+    for(uint32_t i=0;i<objects;++i){
+        // A few large textures and many small buffers, 64 KiB aligned.
+        const uint32_t n=i==objects-1?left:(i%9==0?6000:(left>objects*64?((total-6000*8)/60):16));
+        dmas[i].resize(n);for(uint32_t j=0;j<n;++j)dmas[i][j]=0x200000000ull+(uint64_t(i)<<26)+uint64_t(j)*4096;
+        set[i]={address,dmas[i].data(),n,true,false};left-=n;
+        address+=(uint64_t(n)*4096+0xffff)&~uint64_t{0xffff};
+    }
+    assert(left==0);
+    uint32_t count=0;assert(BdwExecAddressSpaceTableCount(set,objects,count));
+    assert(count>128 && count<=BdwPpgttMaxTables);
+    std::vector<uint8_t*> owned;auto page=[&]{void* p=nullptr;assert(!posix_memalign(&p,4096,4096));owned.push_back(static_cast<uint8_t*>(p));return static_cast<uint8_t*>(p);};
+    BdwPpgttPage s4[4];for(unsigned i=0;i<4;++i)s4[i]={0x100000000ull+4096ull*i,page()};
+    std::vector<BdwPpgttPage> tables(count);for(uint32_t i=0;i<count;++i)tables[i]={0x180000000ull+4096ull*i,page()};
+    std::vector<BdwPpgttMapping> workspace(total);
+    assert(BdwBuildExecAddressSpace(s4,tables.data(),count,set,objects,workspace.data(),total));
+    assert(!BdwBuildExecAddressSpace(s4,tables.data(),count-1,set,objects,workspace.data(),total));
+    for(auto* p:owned)std::free(p);
+}
 int main() {
+    LargeBufferSetTest();
+    DifferentialTest();
     BdwPpgttPage scratch[4],tables[16];
     for(unsigned i=0;i<4;++i)scratch[i]={0x100000+4096ull*i,memory[i]};
     for(unsigned i=0;i<16;++i)tables[i]={0x200000+4096ull*i,memory[i+4]};
@@ -78,9 +157,11 @@ int main() {
      assert(!BdwExecAddressSpaceTableCount(objects,5,count) && count==99);
      objects[1].address=maps[1].address;objects[4].address=(1ull<<48)-4096;objects[4].pageCount=2;
      assert(!BdwExecAddressSpaceTableCount(objects,5,count) && count==99);
-     uint64_t sparseDma[43]{};BdwExecMemoryObject sparse[43]{};
-     for(unsigned i=0;i<43;++i){sparseDma[i]=0x800000+4096ull*i;sparse[i]={uint64_t(i)<<39,&sparseDma[i],1,false};}
-     assert(!BdwExecAddressSpaceTableCount(sparse,43,count) && count==99);
-     assert(BdwExecAddressSpaceTableCount(sparse,42,count) && count==127);
+     // One page per 512 GiB region costs 3 tables each plus the root: 170
+     // fit the 512-table limit (511), 171 do not (514).
+     static uint64_t sparseDma[171]{};static BdwExecMemoryObject sparse[171]{};
+     for(unsigned i=0;i<171;++i){sparseDma[i]=0x800000+4096ull*i;sparse[i]={uint64_t(i)<<39,&sparseDma[i],1,false};}
+     assert(!BdwExecAddressSpaceTableCount(sparse,171,count) && count==99);
+     assert(BdwExecAddressSpaceTableCount(sparse,170,count) && count==511);
     }
 }

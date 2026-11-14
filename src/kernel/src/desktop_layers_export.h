@@ -22,19 +22,41 @@ inline void DesktopInvertCaret(const WmDesktopLayer& layer,uint64_t offset,void*
         for(uint64_t i=begin;i<stop;++i)words[i-first]^=0x00ffffffu;
     }
 }
+struct DesktopCaptureCounters { uint64_t calls,keeps,keepMisses,captures,bytesCopied,bytesKept; };
+// Client-layer capture totals for `desktop capture status` (syscall.cpp).
+extern DesktopCaptureCounters g_desktopCaptureStats;
+// The caller holds a copy of exactly this publication: same window identity,
+// published content generation and geometry. Terminal carets are inverted
+// into the copy on a timer, independent of publications, so never kept.
+inline bool DesktopLayerKeepable(const WmDesktopLayer& l,const BrookDesktopLayer& held){
+    if(!l.height || uint64_t(l.stride)>~uint64_t{0}/4/l.height)return false;
+    const uint64_t bytes=uint64_t(l.stride)*l.height*4;
+    return held.window==l.window && held.incarnation==l.incarnation && l.generation!=~uint64_t{0} &&
+        held.generation==l.generation && held.bytes==bytes && held.width==l.width && held.height==l.height &&
+        held.stride==l.stride && !l.caretWidth && !l.caretHeight;
+}
 // Snapshot is retained by the caller. Sink reads a bounded range of pinned pages and
 // copies to a user destination; current rechecks the actual window state.
 // A failed capture must never publish its metadata as a completed frame.
 template<class Sink,class Current>
 int64_t ExportDesktopLayers(const WmDesktopLayers& source,BrookDesktopLayers& wire,
-                            bool capture,Sink sink,Current current,uint64_t chunkLimit=4096,uint32_t skipMask=0) {
+                            bool capture,Sink sink,Current current,uint64_t chunkLimit=4096,uint32_t skipMask=0,
+                            uint32_t keepMask=0,DesktopCaptureCounters* counters=nullptr) {
     constexpr uint64_t maxBytes=64ull*1024*1024;
     if(!chunkLimit || chunkLimit>65536)return -22;
     if(wire.version!=BROOK_DESKTOP_LAYERS_VERSION || wire.reserved || source.count>BROOK_DESKTOP_LAYER_LIMIT)return -22;
     if(capture && wire.count!=source.count)return -11;
     if(skipMask && (!capture || (source.count<32 && (skipMask>>source.count))))return -22;
-    if(skipMask)for(uint32_t i=0;i<source.count;++i)
-        if(wire.layers[i].window!=source.layers[i].window || wire.layers[i].incarnation!=source.layers[i].incarnation)return -11;
+    if(keepMask && (!capture || (keepMask&skipMask) || (source.count<32 && (keepMask>>source.count))))return -22;
+    if(skipMask|keepMask)for(uint32_t i=0;i<source.count;++i)
+        if((wire.layers[i].window!=source.layers[i].window || wire.layers[i].incarnation!=source.layers[i].incarnation))return -11;
+    // A keep layer's input metadata describes the pixels the caller holds.
+    // Decide before the metadata below is overwritten with current values.
+    uint32_t kept=0;DesktopCaptureCounters tally{};
+    for(uint32_t i=0;keepMask && i<source.count;++i){
+        if(!(keepMask&(uint32_t{1}<<i)))continue;
+        if(DesktopLayerKeepable(source.layers[i],wire.layers[i]))kept|=uint32_t{1}<<i;
+    }
     uint64_t total=0;
     for(uint32_t i=0;i<source.count;++i){
         const auto& l=source.layers[i];auto& o=wire.layers[i];
@@ -51,6 +73,7 @@ int64_t ExportDesktopLayers(const WmDesktopLayers& source,BrookDesktopLayers& wi
         o.window=l.window;o.width=l.width;o.height=l.height;o.stride=l.stride;
         o.clientWidth=l.clientWidth;o.clientHeight=l.clientHeight;o.clientX=l.clientX;o.clientY=l.clientY;
         o.upscale=l.upscale;o.flags=l.legacyOpaque?BROOK_DESKTOP_LAYER_LEGACY_OPAQUE:0;
+        if(kept&(uint32_t{1}<<i))o.flags|=BROOK_DESKTOP_LAYER_KEPT;
         if(l.opacity!=255)o.flags|=BROOK_DESKTOP_LAYER_HAS_OPACITY | (uint32_t(l.opacity)<<BROOK_DESKTOP_LAYER_OPACITY_SHIFT);
     }
     if(capture)for(uint32_t i=0;i<source.count;++i)for(uint32_t j=0;j<i;++j){
@@ -62,6 +85,8 @@ int64_t ExportDesktopLayers(const WmDesktopLayers& source,BrookDesktopLayers& wi
     if(capture)for(uint32_t i=0;i<source.count;++i){
         if(skipMask&(uint32_t{1}<<i))continue;
         const auto& l=source.layers[i];const auto& o=wire.layers[i];
+        if(kept&(uint32_t{1}<<i)){++tally.keeps;tally.bytesKept+=o.bytes;continue;}
+        ++tally.captures;tally.bytesCopied+=o.bytes;if(keepMask&(uint32_t{1}<<i))++tally.keepMisses;
         for(uint64_t offset=0;offset<o.bytes;){
             const uint64_t chunk=o.bytes-offset<chunkLimit?o.bytes-offset:chunkLimit;
             if(!sink(l,offset,o.pixels+offset,chunk))return -14;
@@ -69,6 +94,8 @@ int64_t ExportDesktopLayers(const WmDesktopLayers& source,BrookDesktopLayers& wi
         }
     }
     if(!current(source))return -11;
+    if(counters && capture){++counters->calls;counters->keeps+=tally.keeps;counters->keepMisses+=tally.keepMisses;
+        counters->captures+=tally.captures;counters->bytesCopied+=tally.bytesCopied;counters->bytesKept+=tally.bytesKept;}
     wire.count=source.count;return 0;
 }
 }

@@ -95,6 +95,8 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
                                          bool fromQueue=false);
 void BdwOffscreenHandoffOwnerExit(uint64_t owner);
 bool BdwOffscreenHandoffSubmit(void*,BdwExecSnapshot*,int64_t* result);
+// The owner currently attached to the offscreen handoff (zero-copy adoption).
+bool BdwOffscreenHandoffAttached(uint64_t owner);
 // Fixed-test worker executor. The worker retains the snapshot; no userspace
 // submission is authorized by this entry point.
 BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* snapshot);
@@ -103,7 +105,20 @@ BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* sna
 BdwSubmissionOutcome BdwExecuteRetainedContextWorkerSnapshot(void*,BdwExecSnapshot* snapshot);
 // Caller owns the serialized render/device lease and retains the snapshot.
 // These helpers do not validate commands or authorize a userspace submission.
+// Ready: armed. Refused: a deterministic limit (size, table count, an
+// allocation) stopped it before anything became device-visible; the image and
+// tables are back to Released and the job can fail without a reset.
+// Uncertain: DMA/ownership evidence or published state failed.
+enum class BdwPrepareOutcome : uint8_t { Ready, Refused, Uncertain };
+bool BdwUnwindFailedReprepare();
+BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,const char*& reason);
 bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot);
+// PPGTT table-set reuse across retained submissions (default off). Worker
+// state; the switch takes effect at the next job's preparation.
+struct BdwPpgttCacheStats;
+void BdwPpgttCacheSetEnabled(bool on);
+bool BdwPpgttCacheEnabled();
+void BdwPpgttCacheStatsRead(BdwPpgttCacheStats& out,uint32_t& cachedSets);
 bool BdwRetireRetainedSubmission(BdwExecSnapshot* snapshot);
 bool BdwSetupRetainedGemProbe(bool externalTables);
 bool BdwFinishRetainedGemProbe(bool safelyStopped);
@@ -116,7 +131,16 @@ bool BdwReuseRetainedRenderScratch(BdwOwnedPage& out,BdwGgttReservation& reserva
 struct BdwRenderExecutionBackend;
 struct BdwForcewakeAdapterResult;
 struct BdwRenderRunResult {
+    // Input: the job writes zero-copy scanout images (uncached PTEs, PPAT
+    // slot 3). The PAT lease then also makes slot 3 UC for the job, as the
+    // BCS scanout copy does; the inherited policy has every slot WB.
+    bool uncachedScanout=false;
+    uint8_t scanoutPat=0; // slot-3 value while uncachedScanout: 0 UC, 2 WT
     bool admitted=false,attempted=false,breadcrumb=false,contextComplete=false;
+    // Output: the callback refused before any device write
+    // (BdwRenderEntryRefusal, intel_bdw_render_refusal.h); detail is the page
+    // index for evidence and the GT init refusal code for GT NotStarted.
+    uint8_t entryRefusal=0,entryDetail=0;uint32_t gtWrites=0;
     bool ggttClearRequested=false,ggttCleared=false;
     bool gemReleaseRequested=false,gemReleased=false;
     bool externalTablesRequested=false;
@@ -124,7 +148,13 @@ struct BdwRenderRunResult {
     bool gemIoctlDecoded=false;
     bool gemIoctlSubmitted=false;
     bool pollYieldRequested=false,pollYieldFailed=false;
-    uint32_t pollYields=0;
+    // pollYields counts one-tick sleeps only; pollSpins counts the short
+    // interrupts-enabled spin slices chosen by BdwPollPacer (opt-in below).
+    uint32_t pollYields=0,pollSpins=0;
+    bool pollSpinRequested=false;
+    // Input: predicted first-poll-to-breadcrumb TSC ticks (0 = unknown).
+    // Output: TSC at the first completion poll and at the observing poll.
+    uint64_t expectedCompletionTicks=0,completionStartTicks=0,completionEndTicks=0;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     // Diagnostic TSC durations for GT, PAT setup, run, save, reset/unbind,
     // PAT restore. Zero or backwards-clock intervals are omitted.
@@ -138,6 +168,7 @@ struct BdwRenderRunResult {
     bool sampleFrequency=false;
 #if defined(BROOK_BDW_RPS_TRIAL)
     bool tryFrequency=false;
+    uint32_t trialBin=10; // requested render ratio, 50 MHz units (intel_bdw_render_clock.h)
     uint32_t trialFrequencyCaps=0;
     uint32_t trialFrequencyOriginal=0,trialFrequencyPosted=~uint32_t{0};
 #endif
@@ -148,8 +179,8 @@ struct BdwRenderRunResult {
     // the poll that observed the breadcrumb, from the existing sample site.
     bool statsFrequency=false;
     uint32_t statsFrequencySamples=0,statsIssueStatus=0,statsEndStatus=0;
-    uint32_t completionPollYields=0;
-    uint64_t pollYieldTicks=0;
+    uint32_t completionPollYields=0,completionPollSpins=0;
+    uint64_t pollYieldTicks=0,pollSpinTicks=0;
 #endif
     BdwRenderTransactionResult transaction{};
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;
@@ -181,6 +212,18 @@ struct BdwBcsRunResult;
 // Never call while relying on PMM locks; retained pages stay pinned even on
 // success, because a context-complete result alone does not reclaim them.
 bool BdwRunRetainedBcs(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result);
+// VCS diagnostics serviced on the CPU0 application worker between jobs
+// (BROOK_BDW_VIDEO_ENGINE builds only).
+bool BdwVideoWorkerPending();
+bool BdwVideoWorkerService();
+bool BdwVideoWakeWorker();
+void BdwVideoWorkerCounts(uint64_t& serviced,uint64_t& leaseBusy,uint64_t& timeouts);
+// VCS0 self-test image (VA-API phase 1b; BROOK_BDW_VIDEO_ENGINE builds only).
+bool BdwPrepareVcsSelftest(uint32_t nonce,uint32_t data,BdwGgttReservation& reservation,BdwOwnedPage& scratch);
+bool BdwRunPreparedVcsSelftest(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result);
+bool BdwRetirePreparedVcsSelftest(BdwBcsExecutionBackend& backend);
+uint32_t BdwVcsSelftestReadback();
+bool BdwReleasePreparedVcsSelftest();
 // Snapshot only. It does not grant GPU access or release the retained page.
 bool BdwRetainedBcsScratch(BdwOwnedPage& out);
 // Caller serializes against retain/release; this is a one-way boot-lifetime
@@ -221,6 +264,22 @@ bool BdwObserveDisplayLive(BdwDisplaySnapshot& out);
 struct BdwForcewakeAdapterResult;
 struct BdwRcsResetTestResult {bool attempted=false,complete=false,uncertain=false;};
 bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset);
+// VA-API phase 1: VCS0 bring-up behind BROOK_BDW_VIDEO_ENGINE and a runtime gate.
+class BdwVideoGate;enum class BdwVideoRefusal : uint8_t;
+bool BdwVideoBuilt();
+bool BdwVideoStatus(BdwVideoGate& out);
+bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
+bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
+bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal);
+bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal);
+struct BdwGtPmSnapshot;
+// VCS PM experiment (BdwVcsPmOp value); run through BdwVideoRunOnCpu0 as op 10+value.
+bool BdwVideoPmOp(uint8_t op,BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& r,BdwVideoRefusal& refusal);
+// The last `pm sample` pair and the TSC-measured interval between them.
+void BdwVideoPmSamples(BdwGtPmSnapshot& a,BdwGtPmSnapshot& b,uint64_t& us);
+// op 1 probe, 2 reset, 3 self-test, 10+BdwVcsPmOp PM experiments, on a CPU0-pinned kernel thread (10 s wait).
+bool BdwVideoRunOnCpu0(uint8_t op,BdwForcewakeAdapterResult& fw,BdwRcsResetTestResult& reset,BdwBcsRunResult& run,
+        uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal,bool& pending);
 struct BdwRenderGtInitResult;
 bool BdwTestRenderGtInit(BdwForcewakeAdapterResult& out,BdwRenderGtInitResult& init);
 struct BdwPatTestResult;

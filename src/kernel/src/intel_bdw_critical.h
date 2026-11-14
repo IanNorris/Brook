@@ -37,6 +37,20 @@ void VmmDellRenderRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratc
                       uint32_t (&snapshot)[20*1024],BdwForcewakeAdapterResult& result,BdwRenderRunResult& render);
 void VmmDellRenderGtInit(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRenderGtInitResult& init);
 void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
+// VCS0 (video engine) domain reset, IdleTakeover only. VA-API phase 1.
+void VmmDellVcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
+struct BdwGtPmRecord;
+// GT PM before/after record of the last VCS reset or self-test.
+void VmmDellVcsPmRecord(BdwGtPmRecord& out);
+struct BdwGtPmSnapshot;
+// VCS PM experiment (BdwVcsPmOp) under the forcewake claim; the post-op
+// snapshot and the write counts of the last op.
+void VmmDellVcsPmOp(uint32_t khz,uint8_t op,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& r);
+void VmmDellVcsPmSample(BdwGtPmSnapshot& out,uint32_t& writes,uint32_t& failures);
+// Engine-register writes made to restore firmware values after VCS resets (boot totals).
+void VmmDellVcsEngineRestoreCounts(uint32_t& restores,uint32_t& failures);
+// VCS0 self-test submission (VA-API phase 1b) of the prepared video image.
+void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run);
 void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
 class BdwGgttExtentBind;struct BdwGgttExtentLease;struct BdwFlipGgttDiag;

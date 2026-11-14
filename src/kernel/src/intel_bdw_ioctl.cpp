@@ -1,3 +1,9 @@
+#include "intel_bdw_refusal.h"
+#include "intel_bdw_ioctl_trace.h"
+#include "intel_bdw_video.h"
+#if !defined(BROOK_HOST_TEST)
+#include "process.h"
+#endif
 #include "intel_bdw_ioctl.h"
 #include "profiler.h"
 #include "intel_bdw_file.h"
@@ -44,6 +50,20 @@ struct FencePlan {
 static_assert(sizeof(Version)==64 && sizeof(GetParam)==16 && sizeof(GemCreate)==16 && sizeof(GemWait)==16 && sizeof(MmapOffset)==32,"i915 ABI layout");
 static_assert(sizeof(ExecBuffer)==64 && sizeof(ExecObject)==56,"i915 exec ABI layout");
 }
+// One bounded step of a CPU-side GPU wait. The caller's interruptible sleep
+// (at most 1 ms, returning false on a signal) is kept as the timeout and
+// interrupt path; arming on the Retire event only ends it early when a fence
+// completes, buffer use is released or a sync object is published. seen
+// must be read before the caller tests its condition, so a retirement in
+// between is reported as stale and re-checked instead of slept through.
+static bool RetireWait(const BdwI915UserAccess& u,uint64_t seen,uint64_t ns){
+    BdwGpuWaiter waiter{};
+    const auto armed=BdwGpuEventArm(BdwGpuEvent::Retire,seen,waiter);
+    if(armed==BdwWaitArm::Stale)return true;
+    const bool ok=u.sleepNs(u.context,ns);
+    if(armed==BdwWaitArm::Armed)BdwGpuEventDisarm(waiter);
+    return ok;
+}
 bool BdwIntelSyncReplaceAdmitted(BdwGpuSync* sync,BdwFence* fence){
     KMutexLock(&timelineAdmission);const bool ok=BdwGpuSyncReplace(sync,fence);KMutexUnlock(&timelineAdmission);return ok;
 }
@@ -63,6 +83,9 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
     ExecBuffer request{};if(!u.read(u.context,&request,arg,sizeof(request)))return fault;
     constexpr uint64_t noReloc=uint64_t{1}<<11,handleLut=uint64_t{1}<<12,batchFirst=uint64_t{1}<<18,fenceArray=uint64_t{1}<<19,useExtensions=uint64_t{1}<<21;
     const uint64_t engine=request.flags&63;
+    // I915_EXEC_BSD (2): VCS user submission (VA-API phase 1c) is not wired
+    // into the worker yet; refuse it explicitly with a recorded reason.
+    if(engine==2 && !BdwVideoUserSubmissionReady()){BdwNoteRefusal("execbuffer: I915_EXEC_BSD video engine submission not available");return invalid;}
     if(!request.count || request.count>8192 || !request.objects ||
        (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>1 ||
        request.dr1 || request.dr4 || request.context>0xffffffffull || request.fences ||
@@ -131,7 +154,25 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
 int64_t BdwIntelCopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserAccess& u,BdwExecSnapshot** out){
     return CopyExecSnapshot(file,arg,u,out,nullptr);
 }
+BdwIoctlTrace& BdwIoctlTraceState(){static BdwIoctlTrace trace;return trace;}
+static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& u);
+// Traced entry: records the ioctl, the GETPARAM id or execbuffer flags, and the result.
 int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& u){
+    const int64_t result=RenderIoctl(file,cmd,arg,u);
+    auto& trace=BdwIoctlTraceState();
+    if(__atomic_load_n(&trace.enabled,__ATOMIC_ACQUIRE) && ((cmd>>8)&255)=='d'){
+        const uint32_t nr=uint32_t(cmd&255),size=uint32_t((cmd>>16)&0x3fff);uint64_t detail=0;
+        if(nr==0x46 && size==16 && u.read){int32_t param=0;if(u.read(u.context,&param,arg,4))detail=uint32_t(param);}
+        else if(nr==0x69 && size>=48 && u.read){uint64_t flags=0;if(u.read(u.context,&flags,arg+40,8))detail=flags;}
+        uint32_t pid=0;
+#if !defined(BROOK_HOST_TEST)
+        if(const auto* p=ProcessCurrent())pid=p->pid;
+#endif
+        trace.record(pid,nr,size,detail,result);
+    }
+    return result;
+}
+static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& u){
     constexpr int64_t badfd=-9,notty=-25,fault=-14,invalid=-22,noent=-2,nomem=-12;
     if(!file)return badfd;
     if(!u.read || !u.writable || !u.write)return fault;
@@ -168,6 +209,10 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         // Publication is restricted to the matching live Dell PCI function.
         case 4: value=0x1616;break; // CHIPSET_ID
         case 32: value=9;break;     // REVISION
+        // HAS_BSD: VCS submission is not implemented (VA-API phase 1b). Answer 0
+        // explicitly so libva/i965 probe the engine as absent instead of seeing
+        // an error. I915_EXEC_BSD stays refused by execbuffer (engine>1).
+        case 5: value=BdwVideoUserSubmissionReady()?1:0;break;
         case 19: value=(u.nowNs && u.sleepNs)?1:0;break; // HAS_WAIT_TIMEOUT
         // Iris can use the implemented WB mmap-offset path in this explicit
         // bring-up mode. Other cache modes still fail the mmap-offset ioctl.
@@ -210,10 +255,10 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         auto* buffer=BdwGpuFileGetBuffer(file,d.handle);if(!buffer)return noent;
         if(!u.sleepNs){BdwGpuBufferUnref(buffer);return notty;}
         int64_t result=0;
-        for(;;){const auto attempt=BdwGpuBufferTryCpuTransition(buffer);
+        for(;;){const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);const auto attempt=BdwGpuBufferTryCpuTransition(buffer);
             if(attempt==BdwCpuTransitionResult::Ready)break;
             if(attempt==BdwCpuTransitionResult::Failed){result=-5;break;}
-            if(!u.sleepNs(u.context,1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,1000000)){result=-4;break;}
         }
         BdwGpuBufferUnref(buffer);return result;
     }
@@ -277,6 +322,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         int64_t result=0;
         if(acquired!=request.count)result=noent;
         else for(;;){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             bool all=true,any=false,missing=false;uint32_t first=0;
             for(uint32_t i=0;i<request.count;++i){
                 if(!fences[i])fences[i]=BdwGpuSyncAcquire(objects[i]);
@@ -294,7 +340,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
                     ProfilerTraceGpu(static_cast<uint16_t>(u.submitterPid),FrameFenceWait,
                                      fences[i]?fences[i]->traceId:0,handles[i]);
 #endif
-            if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         for(uint32_t i=0;i<acquired;++i){BdwFenceUnref(fences[i]);BdwGpuSyncUnref(objects[i]);}
         return u.write(u.context,arg,&request,sizeof(request))?result:fault;
@@ -316,6 +362,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         int64_t result=0;
         if(acquired!=request.count)result=noent;
         else for(;;){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             bool all=true,any=false,missing=false;uint32_t first=0;
             for(uint32_t i=0;i<request.count;++i){
                 if(!fences[i])fences[i]=points[i]?BdwGpuSyncFindTimeline(objects[i],points[i]):BdwGpuSyncAcquire(objects[i]);
@@ -333,7 +380,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
                     ProfilerTraceGpu(static_cast<uint16_t>(u.submitterPid),FrameFenceWait,
                                      fences[i]?fences[i]->traceId:0,handles[i]);
 #endif
-            if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         for(uint32_t i=0;i<acquired;++i){BdwFenceUnref(fences[i]);BdwGpuSyncUnref(objects[i]);}
         return u.write(u.context,arg,&request,sizeof(request))?result:fault;
@@ -353,12 +400,13 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
             const uint64_t now=u.nowNs(u.context);deadline=now>~uint64_t{0}-5000000000ull?~uint64_t{0}:now+5000000000ull;
         }
         while(!result && !fence){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             fence=request.sourcePoint?BdwGpuSyncFindTimeline(source,request.sourcePoint):BdwGpuSyncAcquire(source);
             if(fence)break;
             if(!(request.flags&2)){result=invalid;break;}
             const uint64_t now=u.nowNs(u.context);if(now>=deadline){result=-62;break;}
             const uint64_t remaining=deadline-now;
-            if(!u.sleepNs(u.context,remaining<1000000?remaining:1000000)){result=-4;break;}
+            if(!RetireWait(u,seen,remaining<1000000?remaining:1000000)){result=-4;break;}
         }
         if(!result && !request.destinationPoint){if(!BdwIntelSyncReplaceAdmitted(destination,fence))result=invalid;}
         else if(!result && !BdwIntelSyncPointAdmitted(destination,request.destinationPoint,fence))result=invalid;
@@ -417,6 +465,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         // active/pending loss; the global counter is hidden as in an
         // unprivileged i915 query, rather than inventing reset history.
         stats.resetCount=0;stats.batchActive=(loss&1)?1:0;stats.batchPending=(loss&2)?1:0;
+        if(loss)BdwNoteRefusal("reset stats: context reports lost batches (Mesa marks the device lost)");
         return u.write(u.context,arg,&stats,sizeof(stats))?0:fault;
     }
     if(nr==0x6e && size==sizeof(ContextCreate)){
@@ -472,13 +521,14 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
             ? ~uint64_t{0} : original>0 ? start+uint64_t(original) : start;
         int64_t result=0;uint64_t now=start;
         for(;;){
+            const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
             uint32_t uses=0;bool failed=false;BdwGpuBufferGpuStatus(buffer,uses,failed);
             if(failed){result=-5;break;} // EIO: failed/uncertain GPU use
             if(!uses)break;
             now=u.nowNs(u.context);if(now<start){result=-5;break;}
             if(original>=0 && (original==0 || now>=deadline)){result=-62;break;} // ETIME
             const uint64_t wait=original<0?1000000ull:(deadline-now<1000000ull?deadline-now:1000000ull);
-            if(!u.sleepNs(u.context,wait)){result=-4;break;} // EINTR
+            if(!RetireWait(u,seen,wait)){result=-4;break;} // EINTR
         }
         now=u.nowNs(u.context);
         if(original>0)w.timeout=now<start?0:now>=deadline?0:static_cast<int64_t>(deadline-now);
@@ -504,7 +554,8 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         if(!u.submit)return notty;
         if(bool(u.beginExec)!=bool(u.endExec))return invalid;
         BdwSubmissionPreparation preparation{};
-        if(u.beginExec){const auto started=u.beginExec(u.context,u.submitterIncarnation,preparation);if(started)return started;}
+        if(u.beginExec){const auto started=u.beginExec(u.context,u.submitterIncarnation,preparation);
+            if(started){if(!g_bdwRefusal)BdwNoteRefusal("prepare: submission worker not ready or admission refused");return started;}}
         struct PreparationGuard {const BdwI915UserAccess& u;BdwSubmissionPreparation& p;
             ~PreparationGuard(){if(u.endExec)u.endExec(u.context,p);}} preparationGuard{u,preparation};
         // Serialize preparation, admission and publication so another
@@ -523,7 +574,23 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
  #if defined(BROOK_GPU_SUBMISSION_TIMING)
         BdwTimingOwnerElapsed(u.submitterIncarnation,BdwTimingSnapshotBuild,admissionAcquired,BdwTimingNow());
  #endif
-        if(decoded)return decoded;
+        if(decoded){BdwNoteRefusal("execbuffer decode: object, relocation, fence or context validation");return decoded;}
+        // The worker can map at most 65536 pages through 512 page tables. A
+        // larger or sparser buffer set is a normal application request the
+        // kernel cannot serve: refuse it here with ENOSPC instead of failing
+        // later (the worker also refuses it, as a backstop).
+        {uint32_t tables=0;
+            if(BdwExecSnapshotPageCount(snapshot)>65536 || !BdwExecSnapshotTableCount(snapshot,tables) || tables>BdwPpgttMaxTables){
+                plan.release();if(!BdwExecSnapshotRelease(snapshot,false))__builtin_trap();
+                BdwNoteRefusal("execbuffer: buffer set needs more than 65536 pages or 512 page tables");return -28;
+            }}
+        // A referenced buffer in a CPU-visibility transition (another process's
+        // TRY_CPU_READ flushing it, or a handoff retirement) refuses GPU use
+        // only while that lasts - milliseconds for a large window buffer.
+        // Refusing would become VK_ERROR_DEVICE_LOST in Mesa, so wait it out
+        // (bounded, about 100 ms) before admission.
+        if(u.sleepNs)for(unsigned i=0;i<100 && BdwExecSnapshotInCpuTransition(snapshot);++i)
+            if(!u.sleepNs(u.context,1000000))break;
         int64_t submitted=0;
         const bool claimed=u.handoffSubmit && u.handoffSubmit(u.context,snapshot,&submitted);
         if(!claimed)submitted=u.submit(u.context,snapshot);
@@ -531,6 +598,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         plan.release();
         // A failed callback is contractually unarmed and retains no owner.
         if(!BdwExecSnapshotRelease(snapshot,false))__builtin_trap();
+        if(!g_bdwRefusal)BdwNoteRefusal(claimed?"handoff submit refused":"application submit refused");
         return submitted<0?submitted:-5;
     }
     return notty;

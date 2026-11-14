@@ -10,8 +10,10 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "wm_chrome_key.h"
 #include "desktop_telemetry.h"
 #include "taskbar_volume.h"
+#include "volume_feedback.h"
 #include "debug_hardware.h"
 #include "device.h"
 #include "virtio_blk.h"
@@ -38,6 +40,7 @@
 #include "display.h"
 #include "vfs.h"
 #include "vfs_path.h"
+#include "thermal_runtime.h"
 #include "memory/virtual_memory.h"
 #include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
@@ -460,9 +463,11 @@ void WmLaunchFeedbackPoll()
         entry = g_launches.entries[i];
         SpinLockRelease(&g_launchLock);
         if (entry.phase == LaunchPhase::Empty) continue;
+        // Scheduler lock only, outside the feedback spinlock. Absence of
+        // tagged processes ends the spinner as Exited, never as Failed.
+        const bool live = entry.phase != LaunchPhase::Waiting || SchedulerLaunchHasLiveProcesses(entry.token);
         SpinLockAcquire(&g_launchLock);
-        // Absence of tagged processes is not a failed single-instance handoff.
-        g_launches.Advance(entry.token, now, true);
+        g_launches.Advance(entry.token, now, live);
         SpinLockRelease(&g_launchLock);
     }
     bool busy = false;
@@ -1820,7 +1825,7 @@ struct TaskbarLayout
 {
     int y, textY;
     WmRect apps, terminal, next, clock, network, volume;
-    WmRect metrics[6];
+    WmRect metrics[7];
     WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int count, nextIndex;
@@ -1854,9 +1859,9 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     reserve(l.clock, WmTextWidth(l.clockText));
     reserve(l.network, WmMetric(16));
     reserve(l.volume, WmMetric(16));
-    const int widths[6]={64,64,112,112,240,240};
+    const int widths[7]={64,64,112,112,240,240,150};
     const uint32_t enabledMetrics=WmGetTaskbarMetrics();
-    for(int i=5;i>=0;--i)if(enabledMetrics&(1u<<i)){
+    for(int i=6;i>=0;--i)if(enabledMetrics&(1u<<i)){
         reserve(l.metrics[i],WmMetric(widths[i]));
         if(l.metrics[i].w){
             // Two 19-pixel text lines do not fit the 32-pixel task buttons.
@@ -1992,6 +1997,47 @@ bool WmVolumeIndicatorRefresh()
     g_volumeControl = control;
     g_volumeAvailable = available;
     return true;
+}
+
+// Volume-change feedback ("pop", src/kernel/assets/README.md). Played once at
+// the new level through a short kernel-owned mixer stream, so it follows the
+// master volume and mute; policy in volume_feedback.h. Compositor thread only.
+extern "C" const uint8_t g_volumePopPcm[], g_volumePopPcmEnd[];
+static VolumeFeedback g_volumeFeedback;
+static uint32_t g_volumeFeedbackSerial = 0, g_volumeFeedbackControl = 0;
+static bool g_volumeFeedbackPrimed = false;
+static AudioStreamId g_volumePopStream = 0;
+static uint64_t g_volumePopStartMs = 0;
+
+static void WmVolumePopPlay(uint64_t nowMs)
+{
+    if (!AudioAvailable()) return;
+    const auto* pcm = reinterpret_cast<const int16_t*>(g_volumePopPcm);
+    const uint32_t frames = static_cast<uint32_t>((g_volumePopPcmEnd - g_volumePopPcm) / MIXER_FRAME_BYTES);
+    if (!frames) return;
+    if (g_volumePopStream && !AudioMixerReset(g_volumePopStream)) { AudioMixerClose(g_volumePopStream); g_volumePopStream = 0; }
+    if (!g_volumePopStream) g_volumePopStream = AudioMixerOpenCue();
+    if (!g_volumePopStream) return; // all mixer slots in use: skip the cue
+    AudioMixerSubmit(pcm, frames, g_volumePopStream);
+    g_volumePopStartMs = nowMs;
+}
+
+void WmVolumeFeedbackTick(uint64_t nowMs)
+{
+    const uint32_t serial = AudioUserOutputControlSerial();
+    const uint32_t control = AudioOutputControl();
+    if (!g_volumeFeedbackPrimed) {
+        g_volumeFeedbackPrimed = true; g_volumeFeedbackSerial = serial; g_volumeFeedbackControl = control;
+        return;
+    }
+    if (serial != g_volumeFeedbackSerial) {
+        g_volumeFeedback.Change(g_volumeFeedbackControl, control);
+        g_volumeFeedbackSerial = serial;
+    }
+    g_volumeFeedbackControl = control;
+    if (g_volumeFeedback.Tick(nowMs)) WmVolumePopPlay(nowMs);
+    // Release the slot once the 80 ms clip has certainly drained.
+    if (g_volumePopStream && nowMs - g_volumePopStartMs > 1000) { AudioMixerClose(g_volumePopStream); g_volumePopStream = 0; }
 }
 
 static void WmVolumeApply(uint32_t control)
@@ -2239,7 +2285,8 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             }
             if (r.contains(mouseX, mouseY)) {
                 WmStrCopy(launchTitle, e.busy() ? "Starting: " :
-                    e.phase == LaunchPhase::TimedOut ? "Still waiting: " : "Launch failed: ", sizeof(launchTitle));
+                    e.phase == LaunchPhase::TimedOut ? "Still waiting: " :
+                    e.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(launchTitle));
                 size_t n = strlen(launchTitle);
                 WmStrCopy(launchTitle + n, e.title, sizeof(launchTitle) - n);
                 hoverTitle = launchTitle;
@@ -2260,7 +2307,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // Use the already-reserved tray for the hover label. Geometry stays fixed
     // and no additional empty strip is reserved when nothing is hovered.
     int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.volume,l.network,l.clock};
+    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.metrics[6],l.volume,l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
@@ -2275,7 +2322,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
     DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
     DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
-    for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
+    for(unsigned i=0;i<7;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
 }
 
 // Volume and network tooltips float in a small panel just above the
@@ -2290,6 +2337,9 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     if (l.volume.contains(mx, my)) {
         anchor = &l.volume;
         TaskbarVolumeTooltip(text, g_volumeControl, g_volumeAvailable);
+    } else if (l.metrics[6].w && l.metrics[6].contains(mx, my)) {
+        anchor = &l.metrics[6];
+        DesktopThermalTooltip(text);
     } else if (l.network.contains(mx, my)) {
         anchor = &l.network;
         const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
@@ -3580,6 +3630,25 @@ int64_t WmDesktopLayersUseIfBothPresentable(const WmDesktopLayers& base,const Wm
     if(!DesktopLayersPresentableLocked(base) || !DesktopLayersPresentableLocked(next))return -116;
     return use(context);
 }
+static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Window& origin0,int32_t mouseX,int32_t mouseY) {
+    // origin0 has x=y=0, exactly as RenderWindowChrome sees it in a capture.
+    int32_t hover=-1;
+    for(int button=0;button<3 && hover<0;++button)if(CaptionRect(origin0,button).contains(mouseX,mouseY))hover=button;
+    WmChromeKeyInput in{};
+    in.title=origin0.title;in.titleCapacity=sizeof(origin0.title);
+    in.appId=origin0.appId;in.appIdCapacity=sizeof(origin0.appId);
+    in.windowIdentity=origin0.creationIdentity;in.metricsIdentity=reinterpret_cast<uintptr_t>(origin0.metrics);
+    in.outerWidth=origin0.outerWidth();in.outerHeight=origin0.outerHeight();
+    in.clientWidth=origin0.clientW;in.clientHeight=origin0.clientH;
+    in.clientOffsetX=origin0.clientX();in.clientOffsetY=origin0.clientY();
+    in.state=static_cast<uint32_t>(origin0.state);
+    in.focused=origin0.focused;in.visible=origin0.visible;in.noChrome=origin0.noChrome;
+    in.hoverButton=hover;
+    in.theme=static_cast<uint32_t>(layers.theme);in.appearance=static_cast<uint32_t>(layers.appearance);
+    in.scale=static_cast<uint32_t>(layers.scale);
+    in.settingsEpoch=layers.settingsGeneration;in.launcherEpoch=layers.launcherGeneration;
+    return WmChromeKey(in);
+}
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
                                int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges) {
@@ -3591,10 +3660,19 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         if(!g_wmActive || CompositorGlassActive())return -95;
         int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
         const Window& source=g_windows[sorted[index]];
-        if(source.noChrome){*info={source.x,source.y,0,0};return 0;}
+        if(source.noChrome){*info={source.x,source.y,0,0,0};return 0;}
         width=source.outerWidth();height=source.outerHeight();
         if(!width || !height || uint64_t(width)*height>64ull*1024*1024/4)return -7;
-        *info={source.x,source.y,width,height};
+        {
+            Window origin0=source;origin0.x=0;origin0.y=0;
+            const bool noMouseKey=mouseX==-1 && mouseY==-1;
+            auto rel=[](int32_t value,int16_t origin){
+                const int64_t n=int64_t(value)-origin;
+                return n<(-2147483647ll-1)?int32_t(-2147483647-1):n>2147483647ll?int32_t(2147483647):int32_t(n);
+            };
+            *info={source.x,source.y,width,height,
+                DesktopChromeKeyLocked(layers,origin0,noMouseKey?-1:rel(mouseX,source.x),noMouseKey?-1:rel(mouseY,source.y))};
+        }
         if(!pixels)return 0;
         if(capacity<uint64_t(width)*height*4)return -22;
         local=source;originX=source.x;originY=source.y;ProcessRef(local.proc);

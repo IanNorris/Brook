@@ -24,6 +24,9 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <functional>
+#include <initializer_list>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -31,7 +34,7 @@
 #include <unistd.h>
 using namespace brook;
 struct Allocation {void* ptr;uint64_t pages,dma;};
-static Allocation allocations[16]{};
+static Allocation allocations[256]{};
 static unsigned frees=0,allocated=0,failAt=0;
 static bool failVmm=false,failBacking=false,badDma=false;
 static bool resetArmed=true,translated=false,wrongOwner=false,changingVtd=false;
@@ -95,7 +98,7 @@ struct RenderBackend {
     BdwOwnedPage* pages=nullptr;uint64_t ptes[29]{};
     bool exclusiveHandoff(){return true;} bool renderStateReady(){return true;}
     bool admitPages(BdwOwnedPage* p,unsigned n){pages=p;return n==37;}
-    bool admitExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=128;}bool publishExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=128;}
+    bool admitExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=BdwPpgttMaxTables+4;}bool publishExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=BdwPpgttMaxTables+4;}
     bool gpuPatLease(){return true;} bool preparePrivatePat(uint64_t){return true;}
     bool readPrivatePat(uint32_t& lo,uint32_t& hi){lo=7;hi=11;return true;}
     bool publish(BdwOwnedPage* p,unsigned n){return p==pages && n==37;}
@@ -121,7 +124,7 @@ extern "C" void* kmalloc(uint64_t n){if(failHeapOnce){failHeapOnce=false;return 
 extern "C" void kfree(void* p){std::free(p);}
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){
     if(failVmm || (failAt && allocated+1==failAt))return VirtualAddress{};
-    assert(allocated<16 && n<=256);auto& a=allocations[allocated];
+    assert(allocated<256 && n<=256);auto& a=allocations[allocated];
     assert(!posix_memalign(&a.ptr,4096,n*4096));a.pages=n;a.dma=0x100000+uint64_t(allocated)*0x200000;
     ++allocated;std::memset(a.ptr,0xaa,n*4096);return VirtualAddress(reinterpret_cast<uint64_t>(a.ptr));
 }
@@ -632,6 +635,62 @@ int main(){
         for(auto expected:expectedIds){assert(queue.StartNext(id,item) && id==expected && queue.Finish(id,true,true));
             auto* retired=queue.Reap(1,id,state);assert(retired && BdwExecSnapshotRelease(retired,false));}
         BdwFenceUnref(wait);BdwGpuContextUnref(aCtx);BdwGpuContextUnref(bCtx);BdwGpuContextUnref(cCtx);BdwGpuFileUnref(thirdFile);
+    }
+    {
+        // gen 375: a job skipped because a wait dependency failed (a client's
+        // failed frame) must fail its own fences without poisoning its
+        // context or buffers; an executed failure still poisons both.
+        // Own file and buffer: the executed-failure contrast poisons both.
+        auto* own=BdwGpuFileCreate();uint64_t ownRounded=0;assert(own);
+        const uint32_t ownBuffer=BdwGpuFileCreateBuffer(own,4096,ownRounded);assert(ownBuffer);
+        auto* ctx=BdwGpuFileGetDefaultContext(own);assert(ctx && !BdwGpuContextLoss(ctx));
+        BdwExecObjectInput object{ownBuffer,0x10000,4096,16};
+        auto* skipped=BdwExecSnapshotCreate(own,&object,1,0,0,8);auto* wait=BdwFenceCreate();auto* out=BdwFenceCreate();
+        assert(skipped && wait && out && BdwExecSnapshotBindContext(skipped,ctx));
+        BdwExecSnapshotSetOrigin(skipped,9,0,76);
+        assert(BdwExecSnapshotAddWaitFence(skipped,wait) && BdwExecSnapshotAddSignalFence(skipped,out));
+        BdwExecQueue queue;uint64_t sid=0,id=0;BdwExecSnapshot* item=nullptr;BdwExecRequestState state{};
+        assert(queue.Enqueue(1,skipped,sid) && BdwFenceComplete(wait,false));
+        assert(BdwExecSnapshotDependencies(skipped)==2);
+        assert(queue.StartNext(id,item) && id==sid);
+        assert(!queue.Finish(id,true,true,true));         // skipped requires a failure outcome
+        assert(queue.Finish(id,false,true,true));
+        assert(BdwFenceState(out)==2);                     // error propagates to dependents
+        assert(BdwGpuContextLoss(ctx)==0);                 // the context is still usable
+        assert(queue.Reap(1,sid,state)==skipped && state==BdwExecRequestState::Failed && BdwExecSnapshotRelease(skipped,false));
+        // The same buffer and context still run the next job.
+        auto* next=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(next && BdwExecSnapshotBindContext(next,ctx));
+        BdwExecSnapshotSetOrigin(next,9,0,76);uint64_t nid=0;
+        assert(queue.Enqueue(1,next,nid) && queue.StartNext(id,item) && id==nid && queue.Finish(id,true,true));
+        assert(queue.Reap(1,nid,state)==next && state==BdwExecRequestState::Complete && BdwExecSnapshotRelease(next,false));
+        // gen 376/377: a compositor job sampling a client buffer while another
+        // process's TRY_CPU_READ holds its CPU-transition gate was refused at
+        // admission, which Mesa reports as VK_ERROR_DEVICE_LOST. The ioctl now
+        // waits the transition out; the refusal reason names the state.
+        {auto* buffer=BdwGpuFileGetBuffer(own,ownBuffer);assert(buffer);
+         auto* job=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(job && BdwExecSnapshotBindContext(job,ctx));
+         BdwExecSnapshotSetOrigin(job,9,0,76);
+         assert(!BdwExecSnapshotInCpuTransition(job) && !BdwExecSnapshotUseRefusal(job));
+         assert(BdwGpuBufferBeginCpuTransition(buffer));            // another process flushing it for a CPU read
+         assert(BdwGpuBufferInCpuTransition(buffer) && BdwExecSnapshotInCpuTransition(job));
+         const char* why=BdwExecSnapshotUseRefusal(job);assert(why && strstr(why,"CPU transition"));
+         uint64_t jid=0;
+         assert(!queue.Enqueue(1,job,jid));                          // the refusal Mesa saw as device loss
+         assert(BdwGpuBufferEndCpuTransition(buffer) && !BdwExecSnapshotInCpuTransition(job));
+         assert(queue.Enqueue(1,job,jid) && queue.StartNext(id,item) && id==jid && queue.Finish(id,true,true));
+         assert(queue.Reap(1,jid,state)==job && BdwExecSnapshotRelease(job,false));
+         BdwGpuBufferUnref(buffer);}
+        // Contrast: an executed failure poisons the context (hasvk then reports
+        // the device lost) - the path that parked the renderer.
+        auto* failed=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(failed && BdwExecSnapshotBindContext(failed,ctx));
+        BdwExecSnapshotSetOrigin(failed,9,0,76);uint64_t fid=0;
+        assert(queue.Enqueue(1,failed,fid) && queue.StartNext(id,item) && id==fid && queue.Finish(id,false,true));
+        assert(BdwGpuContextLoss(ctx)==1);
+        assert(queue.Reap(1,fid,state)==failed && BdwExecSnapshotRelease(failed,false));
+        {auto* again=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(again);  // the buffer is now sticky-failed
+         const char* why=BdwExecSnapshotUseRefusal(again);assert(why && strstr(why,"failed"));
+         uint64_t aid=0;assert(!queue.Enqueue(1,again,aid) && BdwExecSnapshotRelease(again,false));}
+        BdwFenceUnref(wait);BdwFenceUnref(out);BdwGpuContextUnref(ctx);BdwGpuFileUnref(own);
     }
     {pid_t child=fork();assert(child>=0);if(!child){
         auto* output=BdwGpuFileGetBuffer(f,protectedHandle);auto* snapshot=BdwExecSnapshotCreate(f,protectedExec,2,0,8,64);auto* fence=BdwFenceCreate();
@@ -1469,6 +1528,25 @@ int main(){
         assert(failedWorker.Submit(rejected)==-19 && BdwExecSnapshotRelease(rejected,false));
     }
     {
+        // Prompt wake: admitted work, a thaw and an explicit Wake signal the
+        // worker; rejected work and a worker that never started do not.
+        static unsigned wakes=0;wakes=0;
+        FakeWorker host;BdwSubmissionWorker worker;auto hooks=host.Hooks();
+        hooks.wakeGeneration=[](void*){return uint64_t{wakes};};
+        hooks.idle=[](void*,uint64_t){};hooks.wake=[](void*){++wakes;};
+        worker.Wake();assert(wakes==0);
+        assert(worker.Start(hooks,0,true));
+        auto* unowned=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(unowned);
+        assert(worker.Submit(unowned)==-22 && wakes==0 && BdwExecSnapshotRelease(unowned,false));
+        auto* owned=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(owned);
+        BdwExecSnapshotSetOrigin(owned,7,0,41);assert(BdwExecSnapshotOwner(owned)==41);
+        assert(worker.Submit(owned)==0 && wakes==1);
+        BdwExecOwnerWork work{};assert(worker.FreezeOwner(41,work) && wakes==1);
+        assert(worker.ThawOwner(41) && wakes==2 && !worker.ThawOwner(41) && wakes==2);
+        worker.Wake();assert(wakes==3);
+        assert(worker.Step()==BdwSubmissionStep::Finished && host.executions==1 && worker.Step()==BdwSubmissionStep::Idle);
+    }
+    {
         FakeWorker host;BdwSubmissionWorker worker;auto* wait=BdwFenceCreate();auto* done=BdwFenceCreate();
         auto* snapshot=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(wait && done && snapshot);
         assert(BdwExecSnapshotAddWaitFence(snapshot,wait) && BdwExecSnapshotAddWaitFence(snapshot,wait));
@@ -1697,6 +1775,120 @@ int main(){
         assert(!tables.ReleaseUnsubmitted(alloc) && !tables.ReleaseStopped(alloc,false));
         assert(tables.ReleaseStopped(alloc,true) && alloc.freed==6 && !tables.RootDma());
         assert(BdwExecSnapshotRelease(snapshot,false));
+    }
+    {
+        // PPGTT table-set reuse (M5 part 1): exact-match adoption, mismatch,
+        // invalidation of changed backing, checksum, eviction and kill switch.
+        struct TrackingAllocator:TableAllocator {
+            std::vector<BdwOwnedPage> live;
+            bool alloc(BdwOwnedPage& p){if(!TableAllocator::alloc(p))return false;live.push_back(p);return true;}
+            void free(BdwOwnedPage p){for(size_t i=0;i<live.size();++i)if(live[i].dma==p.dma){live.erase(live.begin()+long(i));break;}
+                TableAllocator::free(p);}
+            uint8_t* cpu(uint64_t dma){for(auto& p:live)if(p.dma==dma)return p.cpu;return nullptr;}
+        };
+        uint64_t r2=0;
+        const uint32_t ha=BdwGpuFileCreateBuffer(f,8192,r2),hb=BdwGpuFileCreateBuffer(f,4096,r2),hc=BdwGpuFileCreateBuffer(f,4096,r2);
+        assert(ha && hb && hc);
+        auto make=[&](uint32_t first,uint64_t at){BdwExecObjectInput in[]={{first,at,4096,16},{hb,0x40010000,4096,16|64}};
+            auto* s=BdwExecSnapshotCreate(f,in,2,0,8,64);assert(s);return s;};
+        TrackingAllocator alloc;BdwExecTables tables;
+        tables.SetCacheEnabled(true,[](BdwPpgttMapping* p){std::free(p);});
+        uint64_t lastRoot=0;
+        // Walk every present PTE of the prepared image and require it to map
+        // either a page of this snapshot or the image's own scratch.
+        auto onlyOwnPages=[&](BdwExecSnapshot* s,std::initializer_list<uint32_t> handles)->bool{
+            std::vector<uint64_t> allowed;
+            for(uint32_t h:handles){auto* b=BdwGpuFileGetBuffer(f,h);uint32_t n=0;const auto* pg=BdwGpuBufferPages(b,n);
+                for(uint32_t i=0;i<n;++i)allowed.push_back(pg[i]);BdwGpuBufferUnref(b);}
+            (void)s;
+            // Each table page is visited once, so shared scratch tables are cheap.
+            std::vector<uint64_t> seen;bool fine=true;
+            std::function<void(uint64_t,unsigned)> walk=[&](uint64_t dma,unsigned level){
+                for(auto v:seen)if(v==dma)return;seen.push_back(dma);
+                uint8_t* page=alloc.cpu(dma);for(auto& sp:scratch)if(sp.dma==dma)page=sp.cpu;
+                auto* w=reinterpret_cast<uint64_t*>(page);if(!w){fine=false;return;}
+                for(unsigned i=0;i<512 && fine;++i){const uint64_t e=w[i];if(!(e&1))continue;
+                    const uint64_t child=e&~uint64_t{4095}&((uint64_t{1}<<39)-1);
+                    if(level>1){walk(child,level-1);continue;}
+                    bool ok=false;for(auto v:allowed)if(v==child)ok=true;
+                    // Otherwise only the image's own (read-only) scratch data page.
+                    bool scratchPage=alloc.cpu(child)!=nullptr;for(auto& sp:scratch)if(sp.dma==child)scratchPage=true;
+                    if(!ok && scratchPage && !(e&2))ok=true;
+                    if(!ok)fine=false;}
+            };
+            walk(tables.RootDma(),4);if(!fine)return false;
+            return true;
+        };
+        auto cycle=[&](BdwExecSnapshot* s,std::initializer_list<uint32_t> handles)->bool{
+            if(!tables.Prepare(alloc,s))return false;
+            const bool reused=tables.Reused();const uint32_t n=BdwExecSnapshotPageCount(s);
+            BdwPpgttMapping* ws=reused?nullptr:static_cast<BdwPpgttMapping*>(std::malloc(n*sizeof(BdwPpgttMapping)));
+            uint32_t ring[56]{};
+            const bool built=tables.Build(alloc,s,scratch,ws,reused?0:n,0x30000000,99,false,ring);
+            if(ws && !tables.KeepsWorkspace())std::free(ws);
+            if(!built)return false;
+            assert(onlyOwnPages(s,handles));
+            lastRoot=tables.RootDma();uint32_t st=9;
+            return tables.InspectDma(alloc,st) && st==0 && tables.Publish(alloc) && tables.BeginUse(alloc) &&
+                tables.ReleaseStopped(alloc,true) && tables.Recycle();
+        };
+        auto* s1=make(ha,0x20000);assert(cycle(s1,{ha,hb}));
+        auto st=tables.Stats();assert(st.builds==1 && st.hits==0 && st.missEmpty==1 && tables.CachedSets()==1);
+        const uint64_t firstRoot=lastRoot;
+        // Same objects, same backing: adopted without a build.
+        auto* s2=make(ha,0x20000);assert(cycle(s2,{ha,hb}));
+        st=tables.Stats();assert(st.builds==1 && st.hits==1 && lastRoot==firstRoot && tables.CachedSets()==1);
+        // A different address is a different buffer set: fresh build, second slot.
+        auto* s3=make(ha,0x80000);assert(cycle(s3,{ha,hb}));
+        st=tables.Stats();assert(st.builds==2 && st.missSignature==1 && tables.CachedSets()==2);
+        auto* s4=make(ha,0x20000);assert(cycle(s4,{ha,hb}));
+        st=tables.Stats();assert(st.hits==2 && lastRoot==firstRoot);
+        // Different backing at the same address (a freed and replaced
+        // buffer): the cached set that maps ha's pages must not be adopted.
+        auto* s5=make(hc,0x20000);assert(cycle(s5,{hc,hb}));
+        st=tables.Stats();assert(st.builds==3 && st.hits==2 && lastRoot!=firstRoot);
+        // A changed word in a cached set forces a rebuild, never adoption.
+        auto* corrupt=reinterpret_cast<uint64_t*>(alloc.cpu(firstRoot));assert(corrupt);corrupt[7]^=0x1000;
+        auto* s6=make(ha,0x20000);assert(cycle(s6,{ha,hb}));
+        st=tables.Stats();assert(st.missChecksum==1 && st.builds==4 && st.hits==2);
+        // Eviction keeps at most CacheSlots sets.
+        for(uint64_t at:{0xa0000ull,0xc0000ull,0xe0000ull}){auto* s=make(ha,at);assert(cycle(s,{ha,hb}));assert(BdwExecSnapshotRelease(s,false));}
+        st=tables.Stats();assert(tables.CachedSets()==BdwExecTables::CacheSlots && st.evictions>=1);
+        // Kill switch: the next preparation drops every cached set (no leak).
+        tables.SetCacheEnabled(false,nullptr);
+        auto* s7=make(ha,0x20000);assert(cycle(s7,{ha,hb}));
+        st=tables.Stats();assert(st.dropped==1 && st.missDisabled==1 && tables.CachedSets()==0);
+        assert(alloc.live.empty() && alloc.allocated==alloc.freed);
+        for(auto* s:{s1,s2,s3,s4,s5,s6,s7})assert(BdwExecSnapshotRelease(s,false));
+        assert(BdwGpuFileCloseBuffer(f,ha) && BdwGpuFileCloseBuffer(f,hb) && BdwGpuFileCloseBuffer(f,hc));
+    }
+    {
+        // Worker refusal unwinding (gen 386 panic): a preparation abandoned
+        // before arming leaves the render image and tables Released, so the
+        // next job's reprepare recycles them and runs normally.
+        uint64_t r3=0;const uint32_t ua=BdwGpuFileCreateBuffer(f,4096,r3),ub=BdwGpuFileCreateBuffer(f,4096,r3);assert(ua && ub);
+        BdwExecObjectInput in[]={{ua,0x20000,4096,16},{ub,0x40010000,4096,16|64}};
+        auto* job=BdwExecSnapshotCreate(f,in,2,0,8,64);assert(job);
+        RenderAllocator renderAlloc;TableAllocator tableAlloc;BdwRenderOneShot shot;BdwExecTables tables;
+        BdwPpgttMapping workspace[2]{};
+        // Refused before the tables were prepared (too large, say).
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging));
+        assert(!shot.DetachSnapshot(renderAlloc) && tables.AbandonUnsubmitted(tableAlloc) && shot.ReleasePrepared(renderAlloc));
+        assert(tables.Released() && shot.Recycle(renderAlloc) && tables.Recycle());
+        // Refused after the image was attached (the builder rejected it).
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging) && tables.Prepare(tableAlloc,job));
+        assert(shot.AttachExternalSnapshot(renderAlloc,tables,tableAlloc,job,workspace,2));
+        assert(shot.DetachSnapshot(renderAlloc)==job && tables.AbandonUnsubmitted(tableAlloc) && shot.ReleasePrepared(renderAlloc));
+        assert(shot.Recycle(renderAlloc) && tables.Recycle() && tableAlloc.freed==tableAlloc.allocated);
+        // The next job prepares and publishes normally.
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging) && tables.Prepare(tableAlloc,job));
+        assert(shot.AttachExternalSnapshot(renderAlloc,tables,tableAlloc,job,workspace,2));
+        uint32_t status=9;assert(tables.InspectDma(tableAlloc,status) && status==0 && tables.Publish(tableAlloc) && shot.PublishPrepared(renderAlloc));
+        // Device-visible tables are never abandoned.
+        assert(tables.BeginUse(tableAlloc) && !tables.AbandonUnsubmitted(tableAlloc));
+        assert(tables.ReleaseStopped(tableAlloc,true));
+        assert(shot.DetachSnapshot(renderAlloc)==job && shot.ReleasePrepared(renderAlloc) && shot.Recycle(renderAlloc) && tables.Recycle());
+        assert(BdwExecSnapshotRelease(job,false) && BdwGpuFileCloseBuffer(f,ua) && BdwGpuFileCloseBuffer(f,ub));
     }
     {
         BdwExecObjectInput spaced[]={{replacement,0x20000,4096,16},{next,0x40010000,4096,16|4}};
@@ -2047,6 +2239,27 @@ int main(){
             BdwFenceUnref(fence);BdwGpuSyncUnref(output);
             assert(BdwGpuFileDestroySync(f,inputId) && BdwGpuFileDestroySync(f,outputId));
             eb.flags=1u<<11;eb.clipCount=0;eb.clips=0;fake.request=0;
+        }
+        {
+            // A buffer set the worker cannot map (more than 512 page tables)
+            // is refused at execbuffer with ENOSPC, before anything is queued;
+            // the largest set that fits (511 tables) is admitted.
+            static uint32_t handles[170];static ExecObject many[171];
+            for(unsigned i=0;i<170;++i){handles[i]=BdwGpuFileCreateBuffer(f,4096,rounded);assert(handles[i]);
+                many[i]={handles[i],0,0,4096,uint64_t(i+1)<<39,16|8,0,0};}
+            many[170]={fresh,0,0,4096,0x20000,16,0,0};
+            ExecBuffer big{reinterpret_cast<uint64_t>(many),171,8,64,0,0,0,0,1u<<11,0,0};
+            const auto bigArg=reinterpret_cast<uint64_t>(&big);
+            fake.request=0;assert(BdwIntelRenderIoctl(f,ioctlCommand(0x69,sizeof(big)),bigArg,user)==-28 && !fake.request);
+            auto* first=BdwGpuFileGetBuffer(f,handles[0]);assert(first && BdwGpuBufferGpuUses(first)==0);BdwGpuBufferUnref(first);
+            many[169]=many[170];big.count=170;
+            assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x69,sizeof(big)),bigArg,user) && fake.request);
+            uint64_t active=0;BdwExecSnapshot* item=nullptr;BdwExecRequestState state{};
+            assert(queue.StartNext(active,item) && active==fake.request);
+            uint32_t tables=0;assert(BdwExecSnapshotTableCount(item,tables) && tables==511);
+            assert(queue.Finish(active,true,true) && queue.Reap(9,active,state)==item && BdwExecSnapshotRelease(item,false));
+            for(unsigned i=0;i<170;++i)assert(BdwGpuFileCloseBuffer(f,handles[i]));
+            fake.request=0;
         }
         {
             const auto syncId=BdwGpuFileCreateSync(f,false);assert(syncId);

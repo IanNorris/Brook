@@ -8,11 +8,14 @@
 #include "gpu_window_channel.h"
 #include "desktop_layers_abi.h"
 #include "scene.h"
+#include "gpu_output_abi.h"
 #include <sys/un.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <limits.h>
+#include <sys/ioctl.h>
+#include <string.h>
 #define DESKTOP_GPU_OFFERS 64
 /* Frames that may sample one retained offer concurrently; at least the
  * handoff's maximum depth, plus the selective-capture preselection. */
@@ -21,7 +24,28 @@
  * presented offer of its window, kept for later frames. notify: 1 queued,
  * 2 sent PRESENTED. */
 struct DesktopGpuOffer {struct BrookGpuWindowPacket packet;int buffer,fence,state;uint64_t frame,receivedNs;
-    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify;};
+    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed;};
+/* A producer fence that completed with an error (SYNC_IOC_FILE_INFO status
+ * < 0). Its frame never rendered, and a compositor job sampling or waiting
+ * on it would fail too, so such offers are never selected; the window falls
+ * back to its CPU source. 0 = pending/ok, 1 = failed. */
+struct DesktopSyncFileInfo {char name[32];int32_t status;uint32_t flags,numFences,pad;uint64_t fences;};
+#define DESKTOP_SYNC_IOC_FILE_INFO 0xc0383e04u
+static inline int desktop_gpu_fence_failed(int fd){
+    if(fd<0)return 0;
+    struct DesktopSyncFileInfo info;memset(&info,0,sizeof(info));
+    return !ioctl(fd,DESKTOP_SYNC_IOC_FILE_INFO,&info) && info.status<0;
+}
+#ifndef DESKTOP_GPU_FENCE_FAILED
+#define DESKTOP_GPU_FENCE_FAILED(fd) desktop_gpu_fence_failed(fd)
+#endif
+/* A producer buffer that a later GPU job failed on is sticky-failed in the
+ * kernel even when the offer's own fence succeeded (a retained offer whose
+ * buffer the client rendered into again). Any job referencing it is
+ * refused, so the compositor must not sample it. Older kernels: 0. */
+#ifndef DESKTOP_GPU_BUFFER_FAILED
+#define DESKTOP_GPU_BUFFER_FAILED(fd) ((fd)>=0 && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_BUFFER_FAILED,(long)(fd),0,0,0,0)==1)
+#endif
 static inline int desktop_gpu_offer_retained(const struct DesktopGpuOffer *o){
     return o->packet.version>=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN;
 }
@@ -138,7 +162,7 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
        l->width!=l->clientWidth || l->height!=l->clientHeight)return NULL;
     struct DesktopGpuOffer *best=NULL;
     for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];
-        if(o->packet.identity.window!=l->window || o->packet.identity.incarnation!=l->incarnation)continue;
+        if(o->packet.identity.window!=l->window || o->packet.identity.incarnation!=l->incarnation || o->failed)continue;
         const int newer=c->presented[l->window-1].incarnation!=l->incarnation || o->packet.identity.commit>c->presented[l->window-1].commit;
         if(desktop_gpu_offer_retained(o)){
             /* In-flight offers stay selectable so consecutive frames never
@@ -148,6 +172,12 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
         if(!best || o->packet.identity.commit>best->packet.identity.commit)best=o;
     }
     if(!best)return NULL;
+    if(DESKTOP_GPU_FENCE_FAILED(best->fence) || DESKTOP_GPU_BUFFER_FAILED(best->buffer)){
+        best->failed=1;best->current=0;
+        fprintf(stderr,"DESKTOP_GPU_SOURCE_FAILED window=%u incarnation=%llu commit=%llu (producer fence or buffer failed; CPU source)\n",
+            best->packet.identity.window,(unsigned long long)best->packet.identity.incarnation,(unsigned long long)best->packet.identity.commit);
+        return NULL;
+    }
     if(desktop_gpu_offer_retained(best) && best->current){
         /* The provider repaints its CPU buffer only when the GPU source can
          * no longer represent the window (for example a new subsurface or a

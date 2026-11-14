@@ -1,3 +1,6 @@
+#include "intel_bdw_worker_overhead.h"
+#include "kprintf.h"
+#include "serial.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_gtt_probe.h"
@@ -35,6 +38,7 @@
 #include "panic.h"
 #include "apic.h"
 #include "sync/ksemaphore.h"
+#include "tsc_clock.h"
 #endif
 #include "panic_test_reset.h"
 
@@ -60,7 +64,7 @@ struct PrivatePages {
         if(!PanicRecoveryResetArmed())return BdwDmaResetUnarmed;
         // Each VT-d read validates aliases and memory types on the CPU that
         // executes it under the page-table lock with interrupts disabled.
-        if(!prior.sampled || !prior.topology || !prior.inventory || !prior.bootMap || !pages || !count || count>128)return BdwDmaMissingVtdEvidence;
+        if(!prior.sampled || !prior.topology || !prior.inventory || !prior.bootMap || !pages || !count || count>BdwPpgttMaxTables+4)return BdwDmaMissingVtdEvidence;
         auto acceptable=[](const DellGpuVtdStatus& s) {
             constexpr uint64_t protectedRegions=(1ull<<5)|(1ull<<6);
             return !(s.globalStatus&(1u<<31)) &&
@@ -433,6 +437,60 @@ bool BdwRetirePreparedBcsScanout(BdwBcsExecutionBackend& backend){return scanout
 bool BdwReleasePreparedBcsScanout(){
     return scanoutImage.ReleasePrepared(retainedAllocator) && scanoutImage.Recycle();
 }
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+// VCS0 self-test (VA-API phase 1b): its own boot-lifetime GGTT reservation
+// (never the BCS diagnostic slot or the scanout reservation) and scratch page,
+// the same allocator and publication as the BCS one-shots.
+namespace {
+BdwBcsOneShot videoImage;
+BdwGgttReservation videoReservation;
+BdwOwnedPage videoScratch{};
+uint32_t videoStaging[2048];
+}
+bool BdwPrepareVcsSelftest(uint32_t nonce,uint32_t data,BdwGgttReservation& reservation,BdwOwnedPage& scratch){
+    if(!nonce || !data || nonce==data)return false;
+    if(!videoReservation.token){
+        auto& space=BdwGlobalGgttSpace();
+        if(!space.reserve(8,videoReservation))return false;
+        // The PTE window mapped for one-shots covers GGTT indices 65536..66047.
+        if(videoReservation.first<65536 || videoReservation.first>65536+512-8 ||
+           !retainedAllocator.alloc(videoScratch)){
+            space.release(videoReservation);videoReservation={};return false;
+        }
+        for(unsigned i=0;i<4096;++i)videoScratch.cpu[i]=0;
+    }
+    if(videoImage.State()!=BdwOneShotState::Fresh)return false;
+    if(!videoImage.PrepareVideoSelftest(retainedAllocator,videoReservation.first,videoReservation.token,nonce,data,videoStaging)){
+        if(videoImage.State()==BdwOneShotState::Released)(void)videoImage.Recycle();
+        return false;
+    }
+    if(videoImage.InspectPreparedDma(retainedAllocator)!=BdwDmaSnapshotOk || !videoImage.DistinctPage(videoScratch)){
+        if(videoImage.ReleasePrepared(retainedAllocator))(void)videoImage.Recycle();
+        return false;
+    }
+    reservation=videoReservation;scratch=videoScratch;
+    return true;
+}
+bool BdwRunPreparedVcsSelftest(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result){
+    if(scratchDma!=videoScratch.dma || !BdwGlobalGgttSpace().owns(videoReservation))return false;
+    result.attempted=true;
+    if(!videoImage.ExecuteTakenOverWithBackend(retainedAllocator,backend,scratchDma))return false;
+    result.copyComplete=true;
+    while(backend.retirementContinue()){
+        const auto status=videoImage.PollContextSwitch(backend);
+        if(status==BdwCsbPoll::Fault)return false;
+        if(status==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
+    }
+    return false;
+}
+// Only after an acknowledged VCS reset: unbinds the lease back to scratch.
+bool BdwRetirePreparedVcsSelftest(BdwBcsExecutionBackend& backend){return videoImage.RetireScanout(backend);}
+uint32_t BdwVcsSelftestReadback(){return videoImage.VideoReadback();}
+// Fails (and keeps every page) unless the image never ran or was retired.
+bool BdwReleasePreparedVcsSelftest(){
+    return videoImage.ReleasePrepared(retainedAllocator) && videoImage.Recycle();
+}
+#endif
 #endif
 uint32_t BdwInspectPrivateBcsDma() {
     if(retainedBcs.State()==BdwOneShotState::Prepared && !BdwGlobalGgttSpace().owns(retainedReservation))
@@ -481,17 +539,32 @@ bool BdwRetainPrivateRenderImages(uint32_t ggttEntries,bool ppgttProbe,bool stor
     retainedRenderScratchValid=true;return true;
 }
 #ifndef BROOK_HOST_TEST
+static void IdleWorkerWait(void*,uint64_t seen){BdwGpuEventWaitTick(BdwGpuEvent::Work,seen);}
 static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
                               BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly,
                               bool (*service)(void*,BdwSubmissionQueue&),bool (*servicePending)(void*),
-                              void (*sleep)(void*)) {
+                              void (*sleep)(void*),void (*idle)(void*,uint64_t)=IdleWorkerWait) {
     BdwSubmissionWorker::Hooks hooks{};hooks.context=context;hooks.execute=execute;hooks.service=service;hooks.servicePending=servicePending;
     hooks.launch=[](void*,void (*entry)(void*),void* arg,uint32_t cpu){
         auto* thread=KernelThreadCreate("gpu-submit",entry,arg);if(!thread)return false;
         thread->cpuAffinity=cpu;SchedulerAddProcess(thread);return true;
     };
     hooks.sleep=sleep;
+    // Prompt wake replaces the fixed 1 ms idle poll. The idle wait keeps a
+    // one-tick timeout, so an unsignalled source (or a lost wake) still sees
+    // the previous polling latency; Step itself is unchanged.
+    hooks.wakeGeneration=[](void*){return BdwGpuEventGeneration(BdwGpuEvent::Work);};
+    hooks.idle=idle;
+    hooks.wake=[](void*){BdwGpuEventSignal(BdwGpuEvent::Work);};
     hooks.recover=[](void*){KernelPanic("Broadwell submission worker requires recovery");};
+    // Log the first failures of each kind: a failed job fails its fences and
+    // (unless skipped) poisons its context and buffers, so name the owner.
+    hooks.failure=[](void*,BdwExecSnapshot* snapshot,unsigned kind,uint64_t n){
+        if(n>8 && n!=64 && n!=1024)return;
+        uint32_t pid=0,context=0;BdwExecSnapshotOrigin(snapshot,pid,context);
+        static const char* const names[]={"skipped (a wait dependency failed)","failed (executed, safely stopped)","unsafe stop"};
+        KPrintf("gpu-submit: job %s pid=%u context=%u count=%lu\n",names[kind<3?kind:2],pid,context,n);
+    };
     return worker.Start(hooks,0,knownOwnersOnly);
 }
 bool BdwStartKernelSubmissionWorker(BdwSubmissionWorker& worker,void* context,
@@ -515,8 +588,10 @@ static bool OnWorkerStatsThread(){
 }
 [[maybe_unused]] static void WorkerStatsEnd(){if(OnWorkerStatsThread())workerStats.End(BdwTimingNow());}
 void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                          uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                           bool frequencySampled,uint32_t issueStatus,uint32_t endStatus){
-    if(OnWorkerStatsThread())workerStats.Render(yields,breadcrumbYields,sleepTicks,frequencySampled,issueStatus,endStatus);
+    if(OnWorkerStatsThread())workerStats.Render(yields,breadcrumbYields,sleepTicks,spins,breadcrumbSpins,spinTicks,
+                                                frequencySampled,issueStatus,endStatus);
 }
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields){
     if(OnWorkerStatsThread())workerStats.Present(full,pixels,ticks,yields);
@@ -657,12 +732,24 @@ static bool ScanoutPending(void*){
     // Worker thread, between jobs: observe an armed flip and arm a queued one.
     BdwScanoutFlipPoll();
 #endif
-    return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued;
+    return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+        || BdwVideoWorkerPending()
+#endif
+        ;
 }
 // This runs between RCS submissions on the same BSP kernel worker. The
 // presenter holds the scene and framebuffer locks. The worker takes neither.
 static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
-    if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutQueued || queue.Poisoned())return false;
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+    // VCS diagnostics run here, between RCS jobs and presents on this one
+    // CPU0 worker, so they can never overlap a render job's preparation or a
+    // present (both take the diagnostic lease); see BdwVideoWorkerService.
+    const bool video=!queue.Poisoned() && BdwVideoWorkerService();
+#else
+    const bool video=false;
+#endif
+    if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutQueued || queue.Poisoned())return video;
     uint32_t queued=ScanoutQueued;
     if(!__atomic_compare_exchange_n(&scanoutWork.state,&queued,ScanoutRunning,false,
                                     __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
@@ -674,6 +761,7 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
     if(scanoutWork.status!=BdwScanoutStatus::Completed && OnWorkerStatsThread())workerStats.PresentFailed();
 #endif
     __atomic_store_n(&scanoutWork.state,ScanoutDone,__ATOMIC_RELEASE);
+    BdwGpuEventSignal(BdwGpuEvent::Retire); // PresentOnBcs waits on Retire
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     WorkerStatsEnd();
 #endif
@@ -792,6 +880,11 @@ static void AccountedApplicationSleep(void*){
     SchedulerSleepMs(1);
     WorkerStatsEnd();
 }
+static void AccountedApplicationIdle(void*,uint64_t seen){
+    WorkerStatsBegin(BdwWorkerIdle);
+    BdwGpuEventWaitTick(BdwGpuEvent::Work,seen);
+    WorkerStatsEnd();
+}
 #endif
 static int64_t InitApplicationWorker(){
     static uint32_t state=0;
@@ -799,7 +892,7 @@ static int64_t InitApplicationWorker(){
     if(!current){uint32_t expected=0;
         if(__atomic_compare_exchange_n(&state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
-            const bool ok=StartKernelWorker(applicationWorker,nullptr,AccountedApplicationExecute,true,ServiceScanout,ScanoutPending,AccountedApplicationSleep);
+            const bool ok=StartKernelWorker(applicationWorker,nullptr,AccountedApplicationExecute,true,ServiceScanout,ScanoutPending,AccountedApplicationSleep,AccountedApplicationIdle);
 #else
             const bool ok=BdwStartKernelSubmissionWorker(applicationWorker,nullptr,BdwExecuteRetainedContextWorkerSnapshot,true,ServiceScanout,ScanoutPending);
 #endif
@@ -817,11 +910,16 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
     if(!source || !token || !regions || !count || count>COMPOSITOR_MAX_REGIONS ||
        !BdwBcsScanoutEnabled() || InitApplicationWorker() ||
        __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)!=ScanoutIdle)return BdwPresentCopy::Unavailable;
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    BdwZeroCopyPrepareScanout(source,regions,count);
+#endif
     scanoutWork.source=source;scanoutWork.token=token;scanoutWork.count=count;
     for(uint32_t i=0;i<count;++i)scanoutWork.regions[i]=regions[i];
     __atomic_store_n(&scanoutWork.state,ScanoutQueued,__ATOMIC_RELEASE);
+    applicationWorker.Wake();
     const auto deadline=ApicTickCount()+32;
     for(;;){
+        const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
         if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutDone){
             const auto result=scanoutWork.status;
             scanoutWork.source=nullptr;
@@ -837,9 +935,13 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
                 return BdwPresentCopy::Expired;
             }
         }
-        SchedulerSleepMs(1);
+        BdwGpuEventWaitTick(BdwGpuEvent::Retire,seen);
     }
 }
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+// Wake the application worker so it services a queued VCS diagnostic.
+bool BdwVideoWakeWorker(){if(InitApplicationWorker())return false;applicationWorker.Wake();return true;}
+#endif
 static int64_t SubmitApplicationSnapshot(BdwExecSnapshot* snapshot){
     if(!snapshot || !BdwExecSnapshotContext(snapshot))return -22;
     const auto ready=InitApplicationWorker();return ready?ready:applicationWorker.Submit(snapshot);
@@ -1142,6 +1244,11 @@ void BdwOffscreenHandoffOwnerExit(uint64_t owner){
     CompositorReleasePresentLease(owner);KMutexUnlock(&offscreenMutex);FreeOffscreenScene(old);FreeOffscreenScene(oldBase);
     for(unsigned i=0;i<retiredCount;++i)FreeOffscreenScene(retired[i]);
 }
+bool BdwOffscreenHandoffAttached(uint64_t owner){
+    if(!owner || !InitOffscreenMutex())return false;
+    KMutexLock(&offscreenMutex);const bool attached=offscreenSession.OwnedBy(owner);KMutexUnlock(&offscreenMutex);
+    return attached;
+}
 bool BdwOffscreenHandoffSubmit(void*,BdwExecSnapshot* snapshot,int64_t* result){
     // Every reserved output has immutable non-mappable backing. Keep the
     // session check for all aliases of protected buffers, including foreign
@@ -1159,20 +1266,108 @@ bool BdwOffscreenHandoffSubmit(void*,BdwExecSnapshot* snapshot,int64_t* result){
 // The caller owns the render reservation, serialized device lease and the
 // snapshot throughout. This builds a private image only; it does not validate
 // arbitrary commands, authorize DMA, or submit work.
-bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
-    if(!snapshot || retainedRender.State()!=BdwOneShotState::Prepared)return false;
+static void FreePpgttList(BdwPpgttMapping* list){kfree(list);}
+void BdwPpgttCacheSetEnabled(bool on){gemProbeTables.SetCacheEnabled(on,FreePpgttList);}
+bool BdwPpgttCacheEnabled(){return gemProbeTables.CacheEnabled();}
+void BdwPpgttCacheStatsRead(BdwPpgttCacheStats& out,uint32_t& cachedSets){cachedSets=gemProbeTables.CachedSets();out=gemProbeTables.Stats();}
+// Worker-thread-only expansion workspace, reused across jobs whenever the
+// table cache does not keep it (it is fully rewritten by each build and read
+// only by that build, so reuse needs no clearing). Grow-only.
+static BdwPpgttMapping* reusableWorkspace=nullptr;
+static uint32_t reusableWorkspacePages=0;
+// Undo a preparation that never reached the device, leaving the render
+// image and tables Released exactly as after a retired job, so the next job's
+// BdwReprepareRetainedSubmission recycles them normally.
+static bool UnwindRetainedPreparation(){
+    if(retainedRender.State()!=BdwOneShotState::Prepared)return false;
+    (void)retainedRender.DetachSnapshot(retainedRenderAllocator);
+    return gemProbeTables.AbandonUnsubmitted(retainedRenderAllocator) &&
+        retainedRender.ReleasePrepared(retainedRenderAllocator);
+}
+BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,const char*& reason) {
+    reason="render image not prepared";
+    if(!snapshot || retainedRender.State()!=BdwOneShotState::Prepared)return BdwPrepareOutcome::Uncertain;
+    // Deterministic, size-driven limits: refuse the job and keep the device.
+    auto refuse=[&](const char* why){reason=why;
+        return UnwindRetainedPreparation()?BdwPrepareOutcome::Refused:BdwPrepareOutcome::Uncertain;};
     const uint32_t pages=BdwExecSnapshotPageCount(snapshot);
-    if(!pages || pages>65536)return false;
-    auto* workspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(pages)*sizeof(BdwPpgttMapping)));
-    if(!workspace)return false;
+    if(!pages || pages>65536)return refuse("more than 65536 pages");
+    uint32_t tableCount=0;
+    if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
+        return refuse("address space needs more than 512 page tables");
+    uint64_t mark=BdwOverheadTicks();
+    auto step=[&mark](BdwOverheadStep st){const uint64_t now=BdwOverheadTicks();BdwOverheadAdd(st,now>mark?now-mark:0);mark=now;};
+    if(!gemProbeTables.Prepare(retainedRenderAllocator,snapshot)){
+        if(gemProbeTables.Quarantined()){reason="table page allocation returned an unsafe page";return BdwPrepareOutcome::Uncertain;}
+        return refuse("page table allocation failed");
+    }
+    step(BdwOhTables);
+    // A reused table set needs no expansion workspace: the snapshot is
+    // compared directly against the retained mapping list.
+    BdwPpgttMapping* workspace=nullptr;bool shared=false;
+    if(!gemProbeTables.Reused()){
+        if(!gemProbeTables.CacheEnabled()){
+            if(reusableWorkspacePages<pages){
+                kfree(reusableWorkspace);reusableWorkspacePages=0;
+                // Round up to limit regrowth as buffer sets vary.
+                const uint32_t want=pages<65536-1024?((pages+1023)&~1023u):65536;
+                reusableWorkspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(want)*sizeof(BdwPpgttMapping)));
+                if(reusableWorkspace)reusableWorkspacePages=want;
+                BdwOverheadCount(BdwOverhead().counters.workspaceAllocs);
+            }else BdwOverheadCount(BdwOverhead().counters.workspaceReuses);
+            workspace=reusableWorkspace;shared=true;
+        }else workspace=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(pages)*sizeof(BdwPpgttMapping)));
+        if(!workspace)return refuse("mapping workspace allocation failed");
+    }
+    step(BdwOhWorkspace);
+    const uint64_t buildStart=TscClockReadNs();
+    const bool attached=retainedRender.AttachExternalSnapshot(retainedRenderAllocator,gemProbeTables,retainedRenderAllocator,
+                                                              snapshot,workspace,workspace?pages:0);
+    gemProbeTables.RecordTiming((TscClockReadNs()-buildStart)/1000);
+    step(BdwOhAttach);
+    // On a fresh build with reuse enabled the tables keep the workspace as
+    // their exact mapping list; otherwise it is temporary. The shared
+    // workspace is only used while the cache is off, so it is never kept.
+    if(workspace && !shared && !gemProbeTables.KeepsWorkspace())kfree(workspace);
+    if(shared && gemProbeTables.KeepsWorkspace()){
+        // Defensive: the cache was enabled between Prepare and attach. The
+        // tables now own this allocation; never reuse it.
+        reusableWorkspace=nullptr;reusableWorkspacePages=0;
+    }
     uint32_t status=BdwDmaNotPrepared;
-    const bool prepared=gemProbeTables.Prepare(retainedRenderAllocator,snapshot) &&
-        retainedRender.AttachExternalSnapshot(retainedRenderAllocator,gemProbeTables,retainedRenderAllocator,snapshot,workspace,pages) &&
-        gemProbeTables.InspectDma(retainedRenderAllocator,status) && status==BdwDmaSnapshotOk &&
-        gemProbeTables.Publish(retainedRenderAllocator) && retainedRender.PublishPrepared(retainedRenderAllocator) &&
-        BdwExecSnapshotSyncForDevice(snapshot) && BdwExecSnapshotInspectDma(snapshot)==BdwDmaSnapshotOk &&
-        retainedRender.ArmExternalSnapshot(retainedRenderAllocator,retainedRenderAllocator);
-    kfree(workspace);return prepared;
+    // The builder rejects only from its inputs (sizes, collisions, layout);
+    // nothing is published yet, so this is a clean refusal too.
+    if(!attached)return refuse("page table build rejected the buffer set");
+    // From here on a failure concerns DMA/ownership evidence or published
+    // device-visible state: keep treating it as uncertain.
+    reason="page table DMA inspection";
+    if(!gemProbeTables.InspectDma(retainedRenderAllocator,status) || status!=BdwDmaSnapshotOk)return BdwPrepareOutcome::Uncertain;
+    step(BdwOhInspectTables);
+    reason="publish";
+    if(!gemProbeTables.Publish(retainedRenderAllocator) || !retainedRender.PublishPrepared(retainedRenderAllocator))return BdwPrepareOutcome::Uncertain;
+    step(BdwOhPublish);
+    reason="device cache sync";
+    if(!BdwExecSnapshotSyncForDevice(snapshot))return BdwPrepareOutcome::Uncertain;
+    step(BdwOhSyncDevice);
+    reason="buffer DMA inspection";
+    if(BdwExecSnapshotInspectDma(snapshot)!=BdwDmaSnapshotOk)return BdwPrepareOutcome::Uncertain;
+    step(BdwOhSnapshotDma);
+    reason="arm";
+    const bool armed=retainedRender.ArmExternalSnapshot(retainedRenderAllocator,retainedRenderAllocator);
+    step(BdwOhArm);
+    if(!armed)return BdwPrepareOutcome::Uncertain;
+    reason=nullptr;return BdwPrepareOutcome::Ready;
+}
+// After a failed BdwReprepareRetainedSubmission: only the clean allocation
+// failure (the image freed its pages and is Released, the tables were just
+// recycled to Fresh) can be undone, by returning the tables to Released so the
+// next job reprepares normally. Any other failure leaves state for a panic.
+bool BdwUnwindFailedReprepare(){
+    return retainedRender.State()==BdwOneShotState::Released && gemProbeTables.Fresh() &&
+        gemProbeTables.AbandonUnsubmitted(retainedRenderAllocator);
+}
+bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot) {
+    const char* reason=nullptr;return BdwPrepareRetainedSubmissionChecked(snapshot,reason)==BdwPrepareOutcome::Ready;
 }
 // Detach only this stopped snapshot; the caller retains it until queue
 // completion has synchronized the buffers and dropped their use counts.

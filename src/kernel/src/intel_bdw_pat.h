@@ -5,13 +5,16 @@ namespace brook {
 // with the policy expected by Brook's legacy 48-bit BCS page tables. It does
 // not read hardware, claim GT ownership, establish cache coherency or pin the
 // policy against changes. The owner must hold those guarantees through use.
-inline bool BdwLegacyBcsPatCompatible(uint64_t descriptor,uint32_t low,uint32_t high,bool uncachedDestination=false) {
+// slot3: the private PAT slot-3 value used while uncachedDestination holds:
+// 0 = UC (the BCS scanout copy, zero-copy "uc"), 2 = WT (zero-copy "wt").
+inline bool BdwPatScanoutSlotAllowed(uint32_t slot3){return slot3==0 || slot3==2;}
+inline bool BdwLegacyBcsPatCompatible(uint64_t descriptor,uint32_t low,uint32_t high,bool uncachedDestination=false,uint32_t slot3=0) {
     constexpr uint64_t legacy48Ppgtt=0x119; // valid, legacy, 48-bit, PPGTT
     constexpr uint32_t tableWbLlc=0x07,leafWbLlcEllc=0x0b;
     if((descriptor&legacy48Ppgtt)!=legacy48Ppgtt)return false;
     // PPGTT directory entries use index 0; cached leaf PTEs use index 4.
     return (low&0xffu)==tableWbLlc && (high&0xffu)==leafWbLlcEllc &&
-        (!uncachedDestination || (low>>24)==0); // private PAT slot 3
+        (!uncachedDestination || ((low>>24)==slot3 && BdwPatScanoutSlotAllowed(slot3))); // private PAT slot 3
 }
 
 enum class BdwPatLeaseState : uint8_t { Fresh, Working, Active, Restored, Quarantined };
@@ -48,16 +51,17 @@ public:
     BdwPatLease(const BdwPatLease&)=delete;
     BdwPatLease& operator=(const BdwPatLease&)=delete;
     BdwPatLeaseState State()const{return state_;}
-    template<class Io> bool Establish(Io& io,uint64_t descriptor,bool uncachedDestination=false) {
+    template<class Io> bool Establish(Io& io,uint64_t descriptor,bool uncachedDestination=false,uint32_t slot3=0) {
         if(state_!=BdwPatLeaseState::Fresh)return false;
         state_=BdwPatLeaseState::Working;owner_=&io;
         uint32_t lo=0,hi=0;
         if(!io.owned() || !io.allEnginesQuiescent() || !stable(io,lo,hi)) {
             state_=BdwPatLeaseState::Fresh;owner_=nullptr;return false;
         }
-        const uint32_t targetLo=(lo&(uncachedDestination?0x00ffff00u:0xffffff00u))|0x07u;
+        if(uncachedDestination && !BdwPatScanoutSlotAllowed(slot3)){state_=BdwPatLeaseState::Fresh;owner_=nullptr;return false;}
+        const uint32_t targetLo=(lo&(uncachedDestination?0x00ffff00u:0xffffff00u))|0x07u|(uncachedDestination?slot3<<24:0u);
         const uint32_t targetHi=(hi&~0xffu)|0x0bu;
-        if(!BdwLegacyBcsPatCompatible(descriptor,targetLo,targetHi,uncachedDestination) ||
+        if(!BdwLegacyBcsPatCompatible(descriptor,targetLo,targetHi,uncachedDestination,slot3) ||
            !io.safePatTransition(lo,hi,targetLo,targetHi)) {
             state_=BdwPatLeaseState::Fresh;owner_=nullptr;return false;
         }
@@ -93,12 +97,12 @@ public:
 // Only the approved old/new low and high halves can be written.
 template<class Owner> class BdwPatMmio {
     Owner& owner_;volatile uint32_t* page_;bool authorized_=false;
-    bool uncachedDestination_;
+    bool uncachedDestination_;uint32_t scanoutSlot_;
     uint32_t oldLo_=0,oldHi_=0,newLo_=0,newHi_=0;
     bool mapped()const{return page_ && !(reinterpret_cast<uintptr_t>(page_)&3);}
 public:
-    BdwPatMmio(Owner& owner,volatile uint32_t* page,bool uncachedDestination=false)
-        :owner_(owner),page_(page),uncachedDestination_(uncachedDestination){}
+    BdwPatMmio(Owner& owner,volatile uint32_t* page,bool uncachedDestination=false,uint32_t scanoutSlot=0)
+        :owner_(owner),page_(page),uncachedDestination_(uncachedDestination),scanoutSlot_(scanoutSlot){}
     BdwPatMmio(const BdwPatMmio&)=delete;
     BdwPatMmio& operator=(const BdwPatMmio&)=delete;
     bool owned(){return mapped() && owner_.owned();}
@@ -112,7 +116,8 @@ public:
         const uint32_t lowChanges=lo^nextLo;
         const bool changedScanoutSlot=(lowChanges&0xff000000u)!=0;
         if(authorized_ || !owned() || (lowChanges&0x00ffff00u) || ((hi^nextHi)&~0xffu) ||
-           (changedScanoutSlot && (!uncachedDestination_ || (lo>>24)!=3 || (nextLo>>24)!=0)) ||
+           (changedScanoutSlot && (!uncachedDestination_ || (lo>>24)!=3 || (nextLo>>24)!=scanoutSlot_ ||
+                                   !BdwPatScanoutSlotAllowed(scanoutSlot_))) ||
            (nextLo&0xffu)!=7 || (nextHi&0xffu)!=11 ||
            !owner_.safePatTransition(lo,hi,nextLo,nextHi))return false;
         oldLo_=lo;oldHi_=hi;newLo_=nextLo;newHi_=nextHi;authorized_=true;return true;

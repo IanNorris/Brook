@@ -1,4 +1,5 @@
 #pragma once
+#include "intel_bdw_refusal.h"
 #include "intel_bdw_submission_worker.h"
 
 namespace brook {
@@ -52,7 +53,7 @@ public:
         if(resources_.policy.owner!=owner || !owner)return -1;
         if(resources_.policy.nextTicket>=0x7fffffffffffffffull || nextToken_==~uint64_t{0})return -75;
         HandoffTicket ticket{};const uint64_t token=++nextToken_;
-        if(!BdwHandoffReserve(resources_,owner,scene,display,buffer,token,ticket))return -16;
+        if(!BdwHandoffReserve(resources_,owner,scene,display,buffer,token,ticket)){BdwNoteRefusal("reserve: no free handoff slot, output still reserved, or zero-copy image busy");return -16;}
         return static_cast<int64_t>(ticket.ticket);
     }
     // 0 pending, 1 completed, 2 failure; negative values are errors.
@@ -118,14 +119,17 @@ public:
     bool Submit(uint64_t owner,BdwSubmissionWorker& worker,BdwExecSnapshot* snapshot,int64_t& result){
         HandoffTicket ticket{BROOK_GPU_HANDOFF_MAX_DEPTH,0};
         for(uint32_t i=0;i<BROOK_GPU_HANDOFF_MAX_DEPTH;++i)if(resources_.buffers[i] && BdwExecSnapshotContainsBuffer(snapshot,resources_.buffers[i])){
-            if(ticket.ticket){result=-16;return true;}
+            if(ticket.ticket){BdwNoteRefusal("submit: job references the outputs of two handoff tickets");result=-16;return true;}
             ticket={i,resources_.policy.slots[i].ticket};
         }
         if(!ticket.ticket)return false;
         auto* slot=HandoffFind(resources_.policy,ticket);
-        if(!slot || !owner || resources_.policy.owner!=owner || slot->owner!=owner || slot->state!=HandoffSlotState::Reserved){result=-16;return true;}
+        if(!slot || !owner || resources_.policy.owner!=owner || slot->owner!=owner || slot->state!=HandoffSlotState::Reserved){
+            BdwNoteRefusal(!slot?"submit: handoff ticket not found":resources_.policy.owner!=owner || slot->owner!=owner?
+                "submit: protected output owned by another handoff owner":"submit: job references an output whose ticket is not reserved (in flight, ready or presenting)");
+            result=-16;return true;}
         auto* fence=BdwExecSnapshotAcquireWriteSignal(snapshot,resources_.buffers[ticket.slot]);
-        if(!fence){result=-22;return true;}
+        if(!fence){BdwNoteRefusal("submit: protected output not written with a signal fence");result=-22;return true;}
 #ifdef BROOK_GPU_BLOCKED_RECOVERY_TEST
         if(testBlockedOwner_==owner && testBlockedTicket_==ticket.ticket){
             testBlockedOwner_=testBlockedTicket_=0;auto* dependency=BdwFenceCreate();

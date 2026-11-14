@@ -36,6 +36,25 @@ inline bool BdwBuildBcsContext64(const BdwContext64& c,uint32_t (&image)[2048],u
     descriptor=(uint64_t(c.contextId)<<32)|c.contextGgtt|0x13d;
     return true;
 }
+// The same fresh non-render context for VCS0 (BSD video engine, VA-API
+// phase 1b). Gen8 xCS logical ring contexts share the BCS layout; only the
+// engine MMIO base of each LRI register differs (0x22000 -> 0x12000). Not yet
+// submitted on hardware; see docs/bdw-video-engine.md.
+inline bool BdwBuildVcsContext64(const BdwContext64& c,uint32_t (&image)[2048],uint64_t& descriptor) {
+    if(!BdwBuildBcsContext64(c,image,descriptor))return false;
+    auto* reg=image+1024;
+    auto relocate=[&](unsigned first,unsigned count){
+        for(unsigned i=0;i<count;++i){uint32_t& r=reg[first+2*i];
+            if((r&0xff000u)!=0x22000u)return false;r=(r&~0xff000u)|0x12000u;}
+        return true;};
+    if(!relocate(2,11) || !relocate(34,9))return false;
+    // reg[66]/reg[68] are the GPGPU/indirect-context pointers of the BCS
+    // template (0x22200 RING_BBADDR-adjacent and 0x22028 MI_PREDICATE). They
+    // are engine-relative as well.
+    if(reg[66]!=0x22200u || reg[68]!=0x22028u)return false;
+    reg[66]=0x12200u;reg[68]=0x12028u;
+    return true;
+}
 
 // Initial private register template for the Gen8 render engine. A real
 // backend must allocate/pin the full 20-page context and establish the GPU's

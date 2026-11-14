@@ -343,7 +343,7 @@ struct RuntimeLock {KMutex mutex{};void init(){KMutexInit(&mutex);}void lock(){K
     bool tryLock(){return KMutexTryLock(&mutex);}void unlock(){KMutexUnlock(&mutex);}};
 using RuntimeOwner=HdaDellStreamOwner<TonePlatform>;using RuntimeBridge=HdaDellAudioBridge<RuntimeOwner,RuntimeLock,true,true>;
 RuntimeOwner* runtimeOwner=nullptr;RuntimeBridge* runtimeBridge=nullptr;
-bool runtimeAudibleEnabled=false;
+bool runtimeAudibleEnabled=false,runtimeVolumeHardware=false;
 int RuntimePlay(const void* p,uint32_t n,uint32_t hz,uint8_t ch,uint8_t bits,bool){return runtimeBridge?runtimeBridge->play(p,n,hz,ch,bits):-19;}
 void RuntimeStop(){if(runtimeBridge){const bool ok=runtimeBridge->stop();
     __atomic_fetch_add(&observation.runtimeStops,1u,__ATOMIC_RELAXED);
@@ -352,7 +352,7 @@ bool RuntimePlaying(){return runtimeBridge && runtimeBridge->isPlaying();}
 uint32_t RuntimePosition(){AudioDeviceProgress p{};return runtimeBridge && runtimeBridge->progress(&p)?uint32_t(p.completed):0;}
 void RuntimeService(){if(runtimeBridge){runtimeBridge->service();
     if(runtimeAudibleEnabled)runtimeBridge->reconcileOutput([]{const auto value=AudioOutputControlSnapshot();
-        return HdaDellOutputRequest{(value&AudioUserUnmuteBit)!=0,value&~AudioUserUnmuteBit};});}}
+        return HdaDellOutputRequest{(value&AudioUserUnmuteBit)!=0,value&~AudioUserUnmuteBit};},runtimeVolumeHardware);}}
 AudioSubmitReceipt RuntimeSubmit(const void* p,uint32_t n){return runtimeBridge?runtimeBridge->submit(p,n):AudioSubmitReceipt{0,0,0,-19};}
 bool RuntimeProgress(AudioDeviceProgress* p){return runtimeBridge && runtimeBridge->progress(p);}
 bool RuntimeRestart(uint64_t epoch){if(!runtimeBridge)return false;const bool ok=runtimeBridge->restart(epoch);
@@ -510,6 +510,26 @@ void HdaRuntimeRegister(){
     }
     observation.runtimeRegistered=true;observation.runtimeReason="registered muted (experimental)";
     SerialPrintf("HDA_RUNTIME registered muted experimental\n");
+    // Audible runtimes drive the DAC gain from the master volume; the mixer
+    // then applies only the sub-0.5 dB residual (hda_dell_volume.h).
+    // /etc/dell-hda-software-volume keeps the old fixed -23.5 dB DAC.
+    if(RuntimeBridge::HardwareVolume && runtimeAudibleEnabled && !Marker("/etc/dell-hda-software-volume")){
+        runtimeVolumeHardware=true;AudioSetHardwareVolumeResidual(HdaDellVolumeResidualQ15);
+        SerialPrintf("audio: Dell DAC master volume (cap step %u = %d.%u dB)\n",unsigned(HdaDellDacMaxStep),
+            -int((HdaDellDacZeroDbStep-HdaDellDacMaxStep)/2),unsigned(((HdaDellDacZeroDbStep-HdaDellDacMaxStep)&1)*5));
+    }
+    // The Dell queue needs guard+burst+2 lines (~5.2 KiB, ~30 ms) of published
+    // lead ahead of the DMA cursor. Charging that hardware-resident source
+    // against a small client FIFO (Chromium/ALSA: 1920 frames) leaves less than
+    // one mixer period of slack, so submissions land behind the guard, the
+    // queue pads silence and the source drains at ~0.78x real time (gen 371:
+    // 34.5k source frames/s, 9.4k gap frames/s). A downstream allowance lets
+    // the client FIFO refill while its copy is in hardware; delay and drain
+    // still follow physical completion. Opt out with /etc/audio-staging-off.
+    if(!Marker("/etc/audio-staging-off") && !AudioMixerStagingEnabled()) {
+        if(AudioMixerStagingSetFrameLimit(HdaRuntimeDefaultStagingFrames))AudioMixerStagingEnable(true);
+        SerialPrintf("audio: Dell downstream allowance %u frames (default)\n",AudioMixerStagingFrameLimit());
+    }
 }
 void HdaRuntimeShutdown(){
     if(!runtimeBridge || !observation.runtimeRegistered)return;

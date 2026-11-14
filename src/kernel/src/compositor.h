@@ -135,6 +135,22 @@ int CompositorCopyGopWrite(const CompositorGopWrite& write,const CompositorPrese
                            uint32_t count,void* source,bool (*copy)(void*,uint64_t,void*,uint64_t));
 void CompositorSampleGopWrite(const CompositorGopWrite& write,uint32_t samples[4]);
 struct CompositorSoftwareTakeoverStats {uint64_t count,lastAgeMs;};
+// Idle-cost counters (cumulative since boot or the last reset).
+struct CompositorIdleStats {
+    uint64_t loops;               // compositor thread frames (wakes)
+    uint64_t softwareFlips;       // software flips that had rows to consider
+    uint64_t fullFlips;           // of which copied a complete frame
+    uint64_t rowsDirty,rowsCopied,rowsSkipped; // software flip rows
+    uint64_t bytesCopied;         // bytes written to the firmware framebuffer
+    uint64_t shadowInvalidations; // framebuffer touched by another writer
+    uint64_t shadowUnavailable;   // flips without a shadow (allocation failed)
+    uint64_t cpuOverlayDraws;     // CPU-path taskbar/launcher draws
+    uint64_t cpuOverlaySkips;     // skipped: a renderer holds the present lease
+    uint64_t overlayRenders;      // renderer overlay capture renders
+    uint64_t overlayBumps;        // of which changed the overlay generation
+    uint64_t leaseActiveLoops;    // loops while a renderer held the lease
+};
+CompositorIdleStats CompositorReadIdleStats(bool reset);
 CompositorSoftwareTakeoverStats CompositorReadSoftwareTakeoverStats();
 void CompositorLockScanoutForDisplayChange();
 void CompositorUnlockScanoutForDisplayChange();

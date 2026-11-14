@@ -167,6 +167,27 @@ uint32_t BdwExecSnapshotDependencies(const BdwExecSnapshot* s){
         if(state==2)return 2;if(!state)pending=true;}
     return pending?0:1;
 }
+bool BdwExecSnapshotInCpuTransition(const BdwExecSnapshot* s){
+    if(!s)return false;
+    for(uint32_t i=0;i<s->count;++i)if(s->buffers[i]!=s->handoffBuffer && BdwGpuBufferInCpuTransition(s->buffers[i]))return true;
+    return false;
+}
+const char* BdwExecSnapshotUseRefusal(const BdwExecSnapshot* s){
+    if(!s)return "missing snapshot";
+    for(uint32_t i=0;i<s->count;++i){
+        if(s->buffers[i]==s->handoffBuffer){
+            if(!BdwGpuBufferHandoffMatches(s->buffers[i],s->handoffToken))return "the job's protected output is not reserved for its ticket";
+            continue;
+        }
+        if(const char* why=BdwGpuBufferUseRefusal(s->buffers[i]))return why;
+    }
+    return nullptr;
+}
+bool BdwExecSnapshotHasUncached(const BdwExecSnapshot* s){
+    if(!s || !s->objects)return false;
+    for(uint32_t i=0;i<s->count;++i)if(s->objects[i].uncached)return true;
+    return false;
+}
 bool BdwExecSnapshotShadowStoreProbe(BdwExecSnapshot* s){
     if(!s || __atomic_load_n(&s->state,__ATOMIC_ACQUIRE)!=0 || s->probeShadowed || s->count!=2 ||
        s->batchIndex>=s->count || s->batchOffset || s->batchLength!=24)return false;
@@ -241,7 +262,7 @@ BdwExecSnapshot* BdwExecSnapshotCreate(BdwGpuFile* file,const BdwExecObjectInput
         // ASYNC opts out of implicit object synchronization; it does not
         // declare the object read-only. Explicitly synchronized clients
         // such as HasVK may write it without setting EXEC_OBJECT_WRITE.
-        s->pages+=pages;s->objects[i]={low,dma,pages,(in.flags&(4|64))!=0};
+        s->pages+=pages;s->objects[i]={low,dma,pages,(in.flags&(4|64))!=0,BdwGpuBufferIsScanoutImage(s->buffers[i])};
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         // These are input hints, not proven access directions: ASYNC objects
         // may be written without WRITE, and duplicate backing is counted again.
@@ -352,13 +373,35 @@ bool BdwExecSnapshotBuildPpgtt(BdwExecSnapshot* s,const BdwPpgttPage (&scratch)[
     if(!BdwBuildExecAddressSpace(scratch,tables,tableCount,s->objects,s->count,workspace,workspaceCount))return false;
     s->preparedFlags|=1u;return true;
 }
+bool BdwExecSnapshotMatchesMappings(const BdwExecSnapshot* s,const BdwPpgttMapping* list,uint32_t count){
+    if(!s || !list || !count || s->pages!=count || !s->objects || !s->count)return false;
+    uint32_t n=0;
+    for(uint32_t i=0;i<s->count;++i){const auto& o=s->objects[i];
+        const BdwPpgttCache cache=o.uncached?BdwPpgttCache::Uncached:BdwPpgttCache::WriteBack;
+        if(!o.pageDma || o.pageCount>count-n)return false;
+        for(uint32_t j=0;j<o.pageCount;++j,++n){const auto& m=list[n];
+            if(m.address!=o.address+uint64_t(j)*4096 || m.dma!=o.pageDma[j] || m.writable!=o.writable || m.cache!=cache)return false;
+        }
+    }
+    return n==count;
+}
+bool BdwExecSnapshotAdoptRenderImage(BdwExecSnapshot* s,const BdwPpgttMapping* cached,uint32_t cachedCount,
+                                     uint64_t completion,uint32_t nonce,bool gt3,uint32_t (&ring)[56]){
+    if(!Preparing(s))return false;
+    s->preparedFlags&=~1u;
+    if(!BdwExecSnapshotMatchesMappings(s,cached,cachedCount))return false;
+    uint32_t next[56]{};
+    if(!BdwBuildRenderRing(BdwExecSnapshotBatchAddress(s),completion,nonce,true,gt3,next))return false;
+    for(unsigned i=0;i<56;++i)ring[i]=next[i];
+    s->preparedFlags|=1u;return true;
+}
 bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* s,const BdwPpgttPage (&scratch)[4],
                                     const BdwPpgttPage* tables,uint32_t tableCount,
                                     BdwPpgttMapping* workspace,uint32_t workspaceCount,
                                     uint64_t completion,uint32_t nonce,bool gt3,uint32_t (&ring)[56]){
     if(!Preparing(s))return false;
     s->preparedFlags&=~1u;
-    if(!tables || !tableCount || tableCount>128 || !workspace || !workspaceCount || workspaceCount>65536)return false;
+    if(!tables || !tableCount || tableCount>BdwPpgttMaxTables || !workspace || !workspaceCount || workspaceCount>65536)return false;
     const uintptr_t start=reinterpret_cast<uintptr_t>(ring);
     auto overlaps=[&](uintptr_t address,uint64_t size){
         return start>~uintptr_t{0}-sizeof(ring) || address>~uintptr_t{0}-size ||
@@ -552,6 +595,7 @@ bool BdwExecSnapshotRetireSynced(BdwExecSnapshot* s){
     if(expected!=1 && expected!=3)return false;
     if(!__atomic_compare_exchange_n(&s->state,&expected,4,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
     for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
+    BdwGpuEventSignal(BdwGpuEvent::Retire); // GEM_WAIT/SET_DOMAIN observe released uses
     return true;
 }
 bool BdwExecSnapshotRetire(BdwExecSnapshot* s,bool safelyStopped){
@@ -565,7 +609,9 @@ bool BdwExecSnapshotRelease(BdwExecSnapshot* s,bool safelyStopped){
     uint32_t expected=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
     for(;;){if((expected!=0 && expected!=1 && expected!=3 && expected!=4) || (expected==1 && !safelyStopped))return false;
         if(__atomic_compare_exchange_n(&s->state,&expected,2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;}
-    if(expected==1 || expected==3)for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
+    const bool used=expected==1 || expected==3;
+    if(used)for(uint32_t i=0;i<s->count;++i)if(!BdwGpuBufferEndGpuUse(s->buffers[i]))__builtin_trap();
+    if(used)BdwGpuEventSignal(BdwGpuEvent::Retire);
     Release(s);return true;
 }
 }

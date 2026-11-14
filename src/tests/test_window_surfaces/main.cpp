@@ -405,6 +405,67 @@ int main() {
     wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
     wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
     CHECK(ExportDesktopLayers(layers,wire,true,sink,current,65536,1)==-22);
+    {
+        // Client keep: unchanged publications copy nothing and are flagged
+        // KEPT; a newer generation, a resize or a caret is copied.
+        wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
+        wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
+        CHECK(!ExportDesktopLayers(layers,wire,true,sink,current));
+        const BrookDesktopLayer held0=wire.layers[0],held1=wire.layers[1];
+        DesktopCaptureCounters counters{};
+        __builtin_memset(outputA,0,sizeof(outputA));__builtin_memset(outputB,0,sizeof(outputB));
+        CHECK(!ExportDesktopLayers(layers,wire,true,sink,current,65536,0,3,&counters));
+        CHECK(outputA[0]==0 && outputB[8191]==0);                           // nothing copied
+        CHECK((wire.layers[0].flags&BROOK_DESKTOP_LAYER_KEPT) && (wire.layers[1].flags&BROOK_DESKTOP_LAYER_KEPT));
+        CHECK(counters.calls==1 && counters.keeps==2 && !counters.captures && counters.bytesKept==16384 && !counters.bytesCopied);
+        // Held metadata older than the publication: copied, not kept.
+        wire.layers[0]=held0;wire.layers[0].generation=held0.generation-1;wire.layers[1]=held1;
+        wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
+        wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
+        counters={};
+        CHECK(!ExportDesktopLayers(layers,wire,true,sink,current,65536,0,3,&counters));
+        CHECK(outputA[0]==0x51 && outputB[8191]==0 && !(wire.layers[0].flags&BROOK_DESKTOP_LAYER_KEPT));
+        CHECK(wire.layers[0].generation==held0.generation);                 // returns the current publication
+        CHECK(counters.keeps==1 && counters.captures==1 && counters.keepMisses==1 && counters.bytesCopied==8192);
+        // Geometry change while generation matches is never kept.
+        wire.layers[0]=held0;wire.layers[0].stride=held0.stride+1;wire.layers[1]=held1;
+        wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
+        wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
+        __builtin_memset(outputA,0,sizeof(outputA));
+        CHECK(!ExportDesktopLayers(layers,wire,true,sink,current,65536,0,1) && outputA[0]==0x51);
+        // A terminal caret is inverted into each copy, so never kept.
+        wire.layers[0]=held0;wire.layers[1]=held1;
+        wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
+        wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
+        layers.layers[0].caretWidth=1;layers.layers[0].caretHeight=1;__builtin_memset(outputA,0,sizeof(outputA));
+        CHECK(!ExportDesktopLayers(layers,wire,true,sink,current,65536,0,1) && !(wire.layers[0].flags&BROOK_DESKTOP_LAYER_KEPT));
+        layers.layers[0].caretWidth=layers.layers[0].caretHeight=0;
+        // Masks: keep and skip may not overlap; keep beyond the layer count,
+        // or with a query (no capture), is invalid; identities must match.
+        wire.layers[0]=held0;wire.layers[1]=held1;
+        wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
+        wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
+        CHECK(ExportDesktopLayers(layers,wire,true,sink,current,65536,1,1)==-22);
+        CHECK(ExportDesktopLayers(layers,wire,true,sink,current,65536,0,4)==-22);
+        CHECK(ExportDesktopLayers(layers,wire,false,sink,current,65536,0,1)==-22);
+        ++wire.layers[1].incarnation;CHECK(ExportDesktopLayers(layers,wire,true,sink,current,65536,0,1)==-11);--wire.layers[1].incarnation;
+        // A failing copy publishes no counters.
+        auto failAll=[](const WmDesktopLayer&,uint64_t,uint64_t,uint64_t){return false;};
+        wire.layers[0].generation=held0.generation-1;counters={};
+        CHECK(ExportDesktopLayers(layers,wire,true,failAll,current,65536,0,3,&counters)==-14 && !counters.calls && !counters.captures);
+        // A publication racing the keep decision fails the capture (retry).
+        wire.layers[0]=held0;wire.layers[1]=held1;
+        wire.layers[0].pixels=reinterpret_cast<uint64_t>(outputA);wire.layers[0].capacity=8192;
+        wire.layers[1].pixels=reinterpret_cast<uint64_t>(outputB);wire.layers[1].capacity=8192;
+        auto captureCurrent0=[](const WmDesktopLayers& snapshot){return WmDesktopLayersCaptureCurrent(snapshot);};
+        bool bumped=false;
+        auto racingSink=[&](const WmDesktopLayer& l,uint64_t offset,uint64_t address,uint64_t bytes){
+            if(!bumped){++window.publishedGeneration;bumped=true;}return sink(l,offset,address,bytes);};
+        wire.layers[1].generation=held1.generation-1;   // layer 1 copies, layer 0 keeps
+        CHECK(ExportDesktopLayers(layers,wire,true,racingSink,captureCurrent0,65536,0,3)==-11 && bumped);
+        --window.publishedGeneration;
+        wire.layers[0].flags=wire.layers[1].flags=0;
+    }
     unsigned batchedCalls=0;
     auto batchedSink=[&](const WmDesktopLayer& l,uint64_t offset,uint64_t destination,uint64_t bytes){
         ++batchedCalls;CHECK(bytes<=65536);return sink(l,offset,destination,bytes);

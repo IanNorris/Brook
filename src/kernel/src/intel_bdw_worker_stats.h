@@ -16,6 +16,10 @@ constexpr unsigned BdwWorkerYieldBuckets=6; // 0, 1, 2, 3-4, 5-8, >8
 inline unsigned BdwWorkerYieldBucket(uint64_t yields){return yields<3?unsigned(yields):yields<=4?3u:yields<=8?4u:5u;}
 // Broadwell RPSTAT1 CAGF (bits 13:7), in 50 MHz units, as i915 decodes it.
 inline uint64_t BdwRpstatMhz(uint32_t status){return uint64_t((status>>7)&0x7f)*50;}
+// Last CAGF (MHz) a render job sampled at its breadcrumb, and a sequence that
+// advances with every sample, for the thermal sampler's GPU readout.
+inline uint32_t& BdwLastGpuMhz(){static uint32_t v=0;return v;}
+inline uint64_t& BdwGpuMhzSequence(){static uint64_t v=0;return v;}
 inline uint64_t BdwWorkerTicksToUs(uint64_t ticks,uint64_t khz){
     if(!khz)return 0;
     return ticks<=~uint64_t{0}/1000?ticks*1000/khz:ticks/khz*1000;
@@ -25,7 +29,10 @@ struct BdwWorkerSpan {uint64_t count,ticks,maxTicks;};
 inline void BdwWorkerSpanAdd(BdwWorkerSpan& s,uint64_t ticks){
     ++s.count;s.ticks+=ticks;if(ticks>s.maxTicks)s.maxTicks=ticks;
 }
-struct BdwWorkerYields {uint64_t jobs,yields,breadcrumbYields,sleepTicks,buckets[BdwWorkerYieldBuckets];};
+// yields/sleepTicks: one-tick sleeps; spins/spinTicks: short interrupts-enabled
+// spin slices (BdwPollPacer). Buckets count sleeps per job, as before.
+struct BdwWorkerYields {uint64_t jobs,yields,breadcrumbYields,sleepTicks,buckets[BdwWorkerYieldBuckets];
+    uint64_t spins,breadcrumbSpins,spinTicks;};
 struct BdwWorkerFrequency {uint64_t samples,sumMhz,minMhz,maxMhz;};
 inline void BdwWorkerFrequencyAdd(BdwWorkerFrequency& f,uint64_t mhz){
     if(!f.samples || mhz<f.minMhz)f.minMhz=mhz;
@@ -98,16 +105,20 @@ public:
     BdwWorkerClass Current()const{return current_;}
     // Worker thread, between Begin and End of an RCS job.
     void Render(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                 bool frequencySampled,uint32_t issueStatus,uint32_t endStatus){
         if(current_!=BdwWorkerApplication && current_!=BdwWorkerCompositor)return;
         const unsigned c=current_==BdwWorkerCompositor?1:0;
         auto& y=local_.yields[c];
         ++y.jobs;y.yields+=yields;y.breadcrumbYields+=breadcrumbYields;y.sleepTicks+=sleepTicks;
+        y.spins+=spins;y.breadcrumbSpins+=breadcrumbSpins;y.spinTicks+=spinTicks;
         ++y.buckets[BdwWorkerYieldBucket(yields)];
         auto& f=local_.frequency[c];
         if(!frequencySampled){++f.missing;return;}
         const auto issue=BdwRpstatMhz(issueStatus),end=BdwRpstatMhz(endStatus);
         BdwWorkerFrequencyAdd(f.issue,issue);BdwWorkerFrequencyAdd(f.end,end);
+        __atomic_store_n(&BdwLastGpuMhz(),uint32_t(end),__ATOMIC_RELAXED);
+        __atomic_add_fetch(&BdwGpuMhzSequence(),1,__ATOMIC_RELEASE);
         if(end>issue)++f.rising;
     }
     // Worker thread, between Begin and End of a BCS present.
@@ -152,6 +163,7 @@ public:
 // Kernel glue (intel_bdw_prepare.cpp). Recorders are ignored unless called
 // on the application submission worker thread inside the matching interval.
 void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                          uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                           bool frequencySampled,uint32_t issueStatus,uint32_t endStatus);
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields);
 bool BdwWorkerStatsRead(BdwWorkerStats& out);

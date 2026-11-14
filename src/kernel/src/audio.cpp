@@ -20,6 +20,9 @@
 #include "apic.h"
 #include "kvmclock.h"
 #ifndef BROOK_HOST_TEST
+#include "tsc_clock.h"
+#endif
+#ifndef BROOK_HOST_TEST
 #include "vfs.h"
 #endif
 
@@ -31,7 +34,13 @@ extern "C" uint64_t AudioClockNowNs()
     // Delivered LAPIC ticks can undercount a CPU stall. Do not present that
     // fallback as a bound on elapsed DMA time. Add a hardware clock separately.
     uint64_t now = 0;
-    return KvmClockReadStableNs(&now) ? now : 0;
+    if (KvmClockReadStableNs(&now)) return now;
+#ifndef BROOK_HOST_TEST
+    // Bare metal: the invariant TSC is calibrated and cross-CPU consistent
+    // (tsc_clock.cpp). Without it, diagnostics/controls report an invalid clock.
+    if (TscClockAvailable()) return TscClockReadNs();
+#endif
+    return 0;
 }
 
 static SpinLock g_dspProducerLock;
@@ -90,12 +99,24 @@ extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEven
 static const AudioDriver* g_audioDriver = nullptr;
 static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
 uint32_t AudioOutputControlSnapshot(){return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE);}
+static const uint16_t* g_hardwareVolumeResidual=nullptr;
+void AudioSetHardwareVolumeResidual(const uint16_t* table){__atomic_store_n(&g_hardwareVolumeResidual,table,__ATOMIC_RELEASE);}
+const uint16_t* AudioHardwareVolumeResidual(){return __atomic_load_n(&g_hardwareVolumeResidual,__ATOMIC_ACQUIRE);}
+// Master level for one mixed sample: linear software percent, or only the
+// residual when the device's hardware gain carries the rest.
+static inline int16_t ScaleOutput(int32_t sample,uint32_t control,const uint16_t* residual){
+    if(!residual)return brook_audio_scale(sample,control);
+    const unsigned v=brook_audio_volume(control);
+    return brook_audio_scale_q15(sample,control,residual[v>100?100:v]);
+}
 uint32_t AudioOutputControl() { return AudioOutputControlSnapshot() & ~AudioUserUnmuteBit; }
 bool AudioSetOutputControl(uint32_t control) {
     if (!brook_audio_control_valid(control)) return false;
     __atomic_store_n(&g_outputControl,control,__ATOMIC_RELEASE);
     return true;
 }
+static uint32_t g_userControlSerial=0;
+uint32_t AudioUserOutputControlSerial(){return __atomic_load_n(&g_userControlSerial,__ATOMIC_ACQUIRE);}
 bool AudioSetUserOutputControl(uint32_t control,bool explicitUnmute) {
     if(!brook_audio_control_valid(control))return false;
     uint32_t previous=__atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE),desired;
@@ -106,6 +127,7 @@ bool AudioSetUserOutputControl(uint32_t control,bool explicitUnmute) {
             (explicitUnmute || (previous&BROOK_AUDIO_MUTED) || (previous&AudioUserUnmuteBit));
         desired=control|(authorized?AudioUserUnmuteBit:0u);
     } while(!__atomic_compare_exchange_n(&g_outputControl,&previous,desired,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    if((previous&~AudioUserUnmuteBit)!=control)__atomic_add_fetch(&g_userControlSerial,1u,__ATOMIC_RELEASE);
     return true;
 }
 bool AudioUserUnmuteRequested(){return (AudioOutputControlSnapshot()&AudioUserUnmuteBit)!=0;}
@@ -159,6 +181,8 @@ struct MixerStream {
     uint32_t stagingFrames = 0;
     bool discontinuity = false;
     bool coalesceUsed = false; // one grace per empty software-queue episode
+    bool cue = false;          // AudioMixerOpenCue: never extends a batch past live audio
+    uint64_t lastSubmitNs = 0; // last non-empty submit (clocked), for cue pacing
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
 static uint64_t g_nextStreamIdentity = 1;
@@ -476,10 +500,18 @@ AudioStreamId AudioMixerOpen()
             if (stream.identity) continue;
             identity = (g_nextStreamIdentity++ << 4) | (i + 1);
             ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES;
-            stream.writableFrames = stream.fragmentFrames = 1; stream.stagingFrames=0;stream.identity = identity;
+            stream.writableFrames = stream.fragmentFrames = 1; stream.stagingFrames=0;stream.cue=false;stream.lastSubmitNs=0;stream.identity = identity;
             break;
         }
     }
+    SpinLockRelease(&g_mixerLock);
+    return identity;
+}
+AudioStreamId AudioMixerOpenCue()
+{
+    const AudioStreamId identity=AudioMixerOpen();if(!identity)return 0;
+    SpinLockAcquire(&g_mixerLock);
+    if(auto* stream=FindStream(identity))stream->cue=true;
     SpinLockRelease(&g_mixerLock);
     return identity;
 }
@@ -544,6 +576,7 @@ uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
 uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId identity)
 {
     if (!samples || !frames) return 0;
+    const uint64_t submitNs = AudioClockNowNs();
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     if (!stream || stream->discontinuity) { SpinLockRelease(&g_mixerLock); return 0; }
@@ -562,7 +595,7 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
     }
     stream->write += frames;
     stream->submittedFrames += frames;
-    if (frames) stream->coalesceUsed = false;
+    if (frames) { stream->coalesceUsed = false; stream->lastSubmitNs = submitNs; }
     SpinLockRelease(&g_mixerLock);
     return frames;
 }
@@ -582,10 +615,23 @@ static void Consume(const Contribution* contributions, uint32_t frames, bool clo
 static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* prepared,
                         const AudioDeviceProgress& device,uint64_t sampledBefore,SharedPrefixAttempt& prefix)
 {
-    uint32_t frames = 0;
-    for (const auto& stream : g_streams)
-        if (stream.identity && stream.enabled && !stream.discontinuity && stream.write - stream.read > frames)
-            frames = static_cast<uint32_t>(stream.write - stream.read);
+    // Cue streams (AudioMixerOpenCue) are summed into batches sized by the
+    // other streams. While another stream is producing (submitted within
+    // CueHoldNs) the cue waits for its frames; mixing the cue ahead alone
+    // would push the live stream's next frames after it, so the cue would
+    // replace rather than overlay it. With no live stream it plays alone.
+    constexpr uint64_t CueHoldNs = 50000000;
+    const uint64_t nowNs = AudioClockNowNs();
+    uint32_t frames = 0, cueFrames = 0;bool liveStream = false;
+    for (const auto& stream : g_streams) {
+        if (!stream.identity || !stream.enabled || stream.discontinuity) continue;
+        const uint32_t queued = static_cast<uint32_t>(stream.write - stream.read);
+        if (stream.cue) { if (queued > cueFrames) cueFrames = queued; continue; }
+        if (queued > frames) frames = queued;
+        if (stream.submittedFrames && stream.lastSubmitNs && nowNs >= stream.lastSubmitNs &&
+            nowNs - stream.lastSubmitNs <= CueHoldNs) liveStream = true;
+    }
+    if (!frames && !liveStream) frames = cueFrames;
     if (frames > MIXER_BATCH_FRAMES) frames = MIXER_BATCH_FRAMES;
     if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
     const uint32_t normalFrames=frames;
@@ -635,6 +681,7 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
                 stream.stagingFrames};
     }
     const uint32_t outputControl=AudioOutputControl();
+    const uint16_t* residual=AudioHardwareVolumeResidual();
     for (uint32_t i = 0; i < frames; ++i) {
         int32_t left = 0, right = 0;
         for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
@@ -644,8 +691,8 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
             left += g_streams[slot].samples[index * 2];
             right += g_streams[slot].samples[index * 2 + 1];
         }
-        g_flushBuf[i * 2] = brook_audio_scale(left,outputControl);
-        g_flushBuf[i * 2 + 1] = brook_audio_scale(right,outputControl);
+        g_flushBuf[i * 2] = ScaleOutput(left,outputControl,residual);
+        g_flushBuf[i * 2 + 1] = ScaleOutput(right,outputControl,residual);
     }
     return frames;
 }
@@ -969,7 +1016,8 @@ int AudioPlay(const void* samples, uint32_t byteCount,
 {
     if (!g_audioDriver || !g_audioDriver->play) return -1;
     const auto control=AudioOutputControl();
-    if (control==BROOK_AUDIO_DEFAULT)
+    const uint16_t* residual=AudioHardwareVolumeResidual();
+    if (control==BROOK_AUDIO_DEFAULT && !residual)
         return g_audioDriver->play(samples,byteCount,sampleRate,channels,bitsPerSample,nonblock);
     // Legacy diagnostic tones bypass the mixer. Apply the same master level
     // to a private copy, never mutate caller memory or its unaccepted suffix.
@@ -981,10 +1029,10 @@ int AudioPlay(const void* samples, uint32_t byteCount,
     for (uint32_t i=0;i<byteCount;) {
         if (bitsPerSample==16) {
             const auto sample=static_cast<int16_t>(uint16_t(input[i])|(uint16_t(input[i+1])<<8));
-            const auto result=static_cast<uint16_t>(brook_audio_scale(sample,control));
+            const auto result=static_cast<uint16_t>(ScaleOutput(sample,control,residual));
             scaled[i++]=result&255;scaled[i++]=result>>8;
         } else {
-            scaled[i]=static_cast<uint8_t>(brook_audio_scale((int(input[i])-128)*256,control)/256+128);
+            scaled[i]=static_cast<uint8_t>(ScaleOutput((int(input[i])-128)*256,control,residual)/256+128);
             ++i;
         }
     }
