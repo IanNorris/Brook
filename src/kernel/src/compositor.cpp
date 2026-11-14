@@ -363,9 +363,31 @@ static uint32_t g_debugFrameNextToken;
 static uint64_t g_debugFrameDeadline;
 static uint64_t g_debugFrameOwner;
 static bool g_debugFrameOverlay=false;
+static bool g_debugFrameOverlayCursor=true;
 static DesktopOverlayBands g_debugOverlayBands{};
 static VirtualAddress g_debugFrameBuffer{};
 static uint64_t g_debugFramePages;
+// One blocked op-7 waiter (referenced), woken when its capture leaves Pending.
+static Process* g_debugFrameWaiter;
+// Overlay content generation, pointer excluded: bumped whenever the hash of
+// the rendered overlay rectangles (pixels plus geometry) changes. Writers hold
+// g_debugFrameLock; readers load it atomically.
+static uint64_t g_overlayGeneration=1;
+static uint64_t g_overlayHash;
+static bool g_overlayHashValid;
+// Last op-6 query; change detection runs only while a renderer is polling.
+static uint64_t g_overlayQueryTick;
+static constexpr uint64_t OVERLAY_SUBSCRIPTION_MS=3000,OVERLAY_RECHECK_MS=100;
+static uint64_t g_overlayCheckTick,g_overlayCheckInput;
+static int32_t g_overlayCheckX=-1,g_overlayCheckY=-1;
+static bool g_overlayChecked;
+// g_debugFrameBuffer is all zero outside these rectangles while its address
+// and geometry match (a full debug screenshot invalidates this), so overlay
+// captures clear only what was drawn before and full-image reads stay exact.
+static uint64_t g_debugFrameCleanAddress;
+static uint32_t g_debugFrameCleanWidth,g_debugFrameCleanHeight;
+static DesktopOverlayRect g_debugFrameDirty[4];
+static uint32_t g_debugFrameDirtyCount;
 static constexpr uint64_t DEBUG_FRAME_LEASE_MS=30000;
 
 static void ExpireDebugFrameLocked()
@@ -374,7 +396,7 @@ static void ExpireDebugFrameLocked()
         g_debugFrame={};
 }
 
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay)
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool overlayCursor)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
@@ -387,7 +409,7 @@ DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay)
     }
     g_debugFrame={};g_debugOverlayBands={};g_debugFrame.token=++g_debugFrameNextToken;
     g_debugFrameOwner=owner;
-    g_debugFrameOverlay=overlay;
+    g_debugFrameOverlay=overlay;g_debugFrameOverlayCursor=overlayCursor;
     g_debugFrame.state=DebugFrameState::Pending;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     CompositorWake();
@@ -410,6 +432,34 @@ int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& ba
     if(!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner)return -116;
     if(!g_debugFrameOverlay || g_debugFrame.state!=DebugFrameState::Ready)return -11;
     bands=g_debugOverlayBands;return 0;
+}
+
+int CompositorWaitDebugFrame(uint32_t token,uint64_t owner,uint32_t timeoutMs,DebugFrameSnapshot& out)
+{
+    Process* self=ProcessCurrent();
+    const uint64_t deadline=ApicTickCount()+timeoutMs;
+    for(;;){
+        bool registered=false;
+        {
+            CompositorMutexGuard guard(&g_debugFrameLock);
+            ExpireDebugFrameLocked();
+            const bool valid=token && token==g_debugFrame.token && owner==g_debugFrameOwner;
+            const bool done=!valid || g_debugFrame.state!=DebugFrameState::Pending || !self || ApicTickCount()>=deadline;
+            if(done){
+                if(g_debugFrameWaiter==self && self){g_debugFrameWaiter=nullptr;ProcessUnref(self);}
+                if(!valid)return -116;
+                out=g_debugFrame;return 0;
+            }
+            if(!g_debugFrameWaiter){ProcessRef(self);g_debugFrameWaiter=self;}
+            registered=g_debugFrameWaiter==self;
+        }
+        // No lock is held while blocked. Another waiter in the slot falls back
+        // to 1 ms sleeps; the completion wake is latched if it arrives early.
+        const uint64_t now=ApicTickCount();
+        self->wakeupTick=registered?deadline:(now+1<deadline?now+1:deadline);
+        SchedulerBlock(self);
+        self->wakeupTick=0;
+    }
 }
 
 bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner)
@@ -474,6 +524,7 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
         g_debugFrameBuffer=buffer;g_debugFramePages=pages;
     }
     auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
+    g_debugFrameCleanAddress=0; // full-image copy: overlay must clear fully next time
     for (uint32_t y=0;y<height;++y)
         memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
@@ -1751,28 +1802,62 @@ static void OverlaySetAlphaRect(int x, int y, int w, int h,bool opaque=false)
     }
 }
 
-// Runs only on the compositor thread, so taskbar/launcher state is sampled at
-// the same frame boundary as ordinary software rendering. The debug-frame
-// lease prevents replacement while a client copies its pixels.
-static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,bool cursorVisible)
+// Overlay rendering into g_debugFrameBuffer. Caller holds g_debugFrameLock and
+// g_scanoutMappingLock and has checked that no lease uses the buffer (or that
+// it is this thread's pending overlay capture).
+static uint32_t* OverlayBufferPrepare(uint32_t width,uint32_t height)
 {
-    CompositorMutexGuard capture(&g_debugFrameLock);
-    ExpireDebugFrameLocked();
-    if(g_debugFrame.state!=DebugFrameState::Pending || !g_debugFrameOverlay)return;
-    g_debugFrame.state=DebugFrameState::Failed;
-    CompositorMutexGuard geometry(&g_scanoutMappingLock);
-    const uint32_t width=g_physFbWidth,height=g_physFbHeight;
-    if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
     const uint64_t bytes=uint64_t(width)*height*4,pages=(bytes+4095)/4096;
     if(pages>g_debugFramePages){
         auto buffer=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
-        if(!buffer)return;
+        if(!buffer)return nullptr;
         if(g_debugFramePages)VmmFreePages(g_debugFrameBuffer,g_debugFramePages);
         g_debugFrameBuffer=buffer;g_debugFramePages=pages;
     }
     auto* pixels=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
-    __builtin_memset(pixels,0,bytes);
-    DesktopOverlayRect rects[4]{};uint32_t rectCount=0;
+    if(g_debugFrameCleanAddress!=g_debugFrameBuffer.raw() || g_debugFrameCleanWidth!=width || g_debugFrameCleanHeight!=height){
+        __builtin_memset(pixels,0,bytes);
+        g_debugFrameCleanAddress=g_debugFrameBuffer.raw();g_debugFrameCleanWidth=width;g_debugFrameCleanHeight=height;
+    }else for(uint32_t i=0;i<g_debugFrameDirtyCount;++i){
+        const auto& r=g_debugFrameDirty[i];
+        const int64_t left=r.x<0?0:r.x,top=r.y<0?0:r.y;
+        const int64_t right=int64_t(r.x)+r.width>width?width:int64_t(r.x)+r.width;
+        const int64_t bottom=int64_t(r.y)+r.height>height?height:int64_t(r.y)+r.height;
+        if(right<=left || bottom<=top)continue;
+        for(int64_t row=top;row<bottom;++row)
+            __builtin_memset(pixels+uint64_t(row)*width+left,0,size_t(right-left)*4);
+    }
+    g_debugFrameDirtyCount=0;
+    return pixels;
+}
+
+static uint64_t OverlayHashRects(const uint32_t* pixels,uint32_t width,uint32_t height,
+                                 const DesktopOverlayRect* rects,uint32_t count)
+{
+    constexpr uint64_t prime=0x100000001b3ull;
+    uint64_t h=0xcbf29ce484222325ull^(uint64_t(width)<<32|height);
+    for(uint32_t i=0;i<count;++i){
+        const auto& r=rects[i];
+        h=(h^(uint64_t(uint32_t(r.x))<<32|uint32_t(r.y)))*prime;
+        h=(h^(uint64_t(r.width)<<32|r.height))*prime;
+        const int64_t left=r.x<0?0:r.x,top=r.y<0?0:r.y;
+        const int64_t right=int64_t(r.x)+r.width>width?width:int64_t(r.x)+r.width;
+        const int64_t bottom=int64_t(r.y)+r.height>height?height:int64_t(r.y)+r.height;
+        for(int64_t row=top;row<bottom;++row){
+            const uint32_t* line=pixels+uint64_t(row)*width;int64_t col=left;
+            for(;col+1<right;col+=2){uint64_t pair;__builtin_memcpy(&pair,line+col,8);h=(h^pair)*prime;}
+            if(col<right)h=(h^line[col])*prime;
+        }
+    }
+    return h;
+}
+
+// Draw the taskbar, launcher and boot summary (never the pointer), then fold
+// their hash into the content generation. Returns the rectangle count.
+static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t now,
+                                     int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects)
+{
+    uint32_t rectCount=0;
     auto opaque=[&](int32_t x,int32_t y,uint32_t w,uint32_t h){
         int64_t left=x,top=y,right=left+w,bottom=top+h;
         if(left<0)left=0;if(top<0)top=0;
@@ -1793,7 +1878,104 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
         WmRenderBootSummary(pixels,width,width,height);opaque(x,y,w,h);
         rects[rectCount++]={x,y,w,h};
     }
-    if(cursorVisible){
+    for(uint32_t i=0;i<rectCount;++i)g_debugFrameDirty[i]=rects[i];
+    g_debugFrameDirtyCount=rectCount;
+    const uint64_t hash=OverlayHashRects(pixels,width,height,rects,rectCount);
+    if(!g_overlayHashValid || hash!=g_overlayHash){
+        g_overlayHash=hash;g_overlayHashValid=true;
+        __atomic_add_fetch(&g_overlayGeneration,1,__ATOMIC_ACQ_REL);
+    }
+    return rectCount;
+}
+
+uint64_t CompositorOverlayGeneration()
+{
+    const uint64_t now=ApicTickCount();
+    if(__atomic_exchange_n(&g_overlayQueryTick,now?now:1,__ATOMIC_ACQ_REL)==0)CompositorWake();
+    return __atomic_load_n(&g_overlayGeneration,__ATOMIC_ACQUIRE);
+}
+
+// Compositor thread: while a renderer polls op 6, re-render the overlay when
+// input arrived or the pointer moved (hover), and at least every 100 ms
+// (clock, network, animations, launcher), so the generation tracks content.
+// Skipped while any lease holds the shared buffer; retried next loop.
+static void CheckDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY)
+{
+    const uint64_t queried=__atomic_load_n(&g_overlayQueryTick,__ATOMIC_ACQUIRE);
+    if(!queried || now<queried || now-queried>OVERLAY_SUBSCRIPTION_MS)return;
+    // Input to a pointer-capturing client (a game) cannot change hover, so it
+    // does not trigger re-rendering; the periodic check still covers shortcuts.
+    const uint64_t input=InputLatestSequence();
+    const bool inputChanged=input!=g_overlayCheckInput && !WmPointerCaptureActive();
+    if(g_overlayChecked && !inputChanged && mouseX==g_overlayCheckX && mouseY==g_overlayCheckY &&
+       now>=g_overlayCheckTick && now-g_overlayCheckTick<OVERLAY_RECHECK_MS)return;
+    CompositorMutexGuard capture(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if(g_debugFrame.token)return;
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint32_t width=g_physFbWidth,height=g_physFbHeight;
+    if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
+    uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
+    DesktopOverlayRect rects[4]{};
+    (void)RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects);
+    g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=input;g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
+}
+
+// The compositor-thread copy of the pointer image used by op 8; positions are
+// read live by the caller. Serial changes whenever the image changes.
+static SpinLock g_overlayCursorLock;
+static CursorImage g_overlayCursorImage;
+static uint64_t g_overlayCursorSerial;
+static bool g_overlayCursorVisible;
+static void PublishOverlayCursor(uint64_t now,bool visible)
+{
+    const uint64_t queried=__atomic_load_n(&g_overlayQueryTick,__ATOMIC_ACQUIRE);
+    if(!queried || now<queried || now-queried>OVERLAY_SUBSCRIPTION_MS)return;
+    SpinLockAcquire(&g_overlayCursorLock);
+    g_overlayCursorVisible=visible;
+    if(!g_overlayCursorSerial || memcmp(&g_overlayCursorImage,&g_cursorFrame,sizeof(CursorImage))){
+        g_overlayCursorImage=g_cursorFrame;++g_overlayCursorSerial;
+    }
+    SpinLockRelease(&g_overlayCursorLock);
+}
+
+void CompositorOverlayCursor(BrookDesktopOverlayCursor& out,uint64_t knownSerial)
+{
+    int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
+    SpinLockAcquire(&g_overlayCursorLock);
+    const CursorImage& image=g_overlayCursorImage;
+    const uint32_t w=image.width<CURSOR_MAX?image.width:CURSOR_MAX,h=image.height<CURSOR_MAX?image.height:CURSOR_MAX;
+    out.visible=g_overlayCursorSerial && g_overlayCursorVisible && w && h;
+    out.width=w;out.height=h;out.stride=CURSOR_MAX;
+    out.x=int32_t(int64_t(mx)-image.hotX);out.y=int32_t(int64_t(my)-image.hotY);
+    out.serial=g_overlayCursorSerial;
+    if(knownSerial!=g_overlayCursorSerial)
+        __builtin_memcpy(out.pixels,image.pixels,sizeof(out.pixels));
+    SpinLockRelease(&g_overlayCursorLock);
+}
+
+// Runs only on the compositor thread, so taskbar/launcher state is sampled at
+// the same frame boundary as ordinary software rendering. The debug-frame
+// lease prevents replacement while a client copies its pixels.
+static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,bool cursorVisible)
+{
+    Process* waiter=nullptr;
+    {
+    CompositorMutexGuard capture(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if(g_debugFrame.state!=DebugFrameState::Pending || !g_debugFrameOverlay)return;
+    g_debugFrame.state=DebugFrameState::Failed;
+    waiter=g_debugFrameWaiter;g_debugFrameWaiter=nullptr;
+    [&]{
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint32_t width=g_physFbWidth,height=g_physFbHeight;
+    if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
+    uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
+    DesktopOverlayRect rects[4]{};
+    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects);
+    g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=InputLatestSequence();
+    g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
+    if(cursorVisible && g_debugFrameOverlayCursor){
         const int64_t left=int64_t(mouseX)-g_cursorFrame.hotX,top=int64_t(mouseY)-g_cursorFrame.hotY;
         // Clamp before narrowing so even an invalid off-screen input cannot
         // wrap into a spurious region.
@@ -1803,6 +1985,7 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
         if(clippedLeft<int64_t(width) && clippedTop<int64_t(height) && cursorRight>clippedLeft && cursorBottom>clippedTop){
             const int64_t right=cursorRight>width?width:cursorRight,bottom=cursorBottom>height?height:cursorBottom;
             rects[rectCount++]={int32_t(clippedLeft),int32_t(clippedTop),uint32_t(right-clippedLeft),uint32_t(bottom-clippedTop)};
+            g_debugFrameDirty[g_debugFrameDirtyCount++]=rects[rectCount-1];
         }
         for(uint32_t row=0;row<g_cursorFrame.height && row<CURSOR_MAX;++row){
             const int64_t py=top+row;if(py<0 || py>=height)continue;
@@ -1824,7 +2007,11 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
     g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=now;
     g_debugFrame.epoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
+    g_debugFrame.overlayGeneration=__atomic_load_n(&g_overlayGeneration,__ATOMIC_ACQUIRE);
     g_debugFrameDeadline=now+DEBUG_FRAME_LEASE_MS;g_debugFrame.state=DebugFrameState::Ready;
+    }();
+    }
+    if(waiter){SchedulerUnblock(waiter);ProcessUnref(waiter);}
 }
 
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
@@ -2171,7 +2358,9 @@ static void CompositorLoopWM()
     summaryShown=showSummary;
     const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
         __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0;
+    PublishOverlayCursor(now,overlayCursor);
     CaptureDesktopOverlay(now,chromeMx,chromeMy,overlayCursor);
+    CheckDesktopOverlay(now,chromeMx,chromeMy);
 }
 
 static DesktopPointerGate g_desktopPointerGate;

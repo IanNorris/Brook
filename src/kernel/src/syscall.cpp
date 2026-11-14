@@ -13234,8 +13234,8 @@ static int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t des
     if(reserved || token>0xffffffffULL)return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==0){
-        if(token || destination || length || offset)return -EINVAL;
-        const auto frame=CompositorRequestDebugFrame(owner,true);
+        if(token || destination || length || (offset & ~uint64_t(BROOK_DESKTOP_OVERLAY_NO_CURSOR)))return -EINVAL;
+        const auto frame=CompositorRequestDebugFrame(owner,true,!(offset&BROOK_DESKTOP_OVERLAY_NO_CURSOR));
         if(frame.state==DebugFrameState::Busy)return -16;
         return frame.token?int64_t(frame.token):-EIO;
     }
@@ -13265,6 +13265,29 @@ static int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t des
         BrookDesktopOverlayBands info{};info.count=bands.count;
         for(uint32_t i=0;i<bands.count;++i)info.bands[i]={bands.bands[i].x,bands.bands[i].y,bands.bands[i].width,bands.bands[i].height};
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==BROOK_DESKTOP_OVERLAY_GENERATION){
+        if(token || destination || length || offset)return -EINVAL;
+        return int64_t(CompositorOverlayGeneration()&0x7fffffffffffffffULL);
+    }
+    if(op==BROOK_DESKTOP_OVERLAY_WAIT){
+        if(length!=sizeof(BrookDesktopOverlayInfo) || offset>BROOK_DESKTOP_OVERLAY_WAIT_MAX_MS)return -EINVAL;
+        DebugFrameSnapshot frame{};
+        if(CompositorWaitDebugFrame(uint32_t(token),owner,uint32_t(offset),frame))return -116;
+        BrookDesktopOverlayInfo info{};
+        info.frame={frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch};
+        info.generation=frame.state==DebugFrameState::Ready?frame.overlayGeneration:0;
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==BROOK_DESKTOP_OVERLAY_CURSOR){
+        if(token || length!=sizeof(BrookDesktopOverlayCursor))return -EINVAL;
+        auto* cursor=static_cast<BrookDesktopOverlayCursor*>(kmalloc(sizeof(BrookDesktopOverlayCursor)));
+        if(!cursor)return -ENOMEM;
+        CompositorOverlayCursor(*cursor,offset);
+        const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
+        const bool copied=CopyToUser(destination,cursor,bytes);
+        kfree(cursor);return copied?0:-EFAULT;
     }
     if(op==BROOK_DESKTOP_OVERLAY_READ_BAND){
         DesktopOverlayBands bands{};int result=CompositorOverlayBands(uint32_t(token),owner,bands);

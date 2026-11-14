@@ -1,5 +1,6 @@
 #pragma once
 #include "desktop_overlay_regions.h"
+#include "../../shared/brook_debug_frame.h"
 
 #include <stdint.h>
 
@@ -59,8 +60,18 @@ struct DebugFrameSnapshot {
     uint64_t address, tick, epoch;
     DebugFrameState state;
     uint32_t source,presentationMode;
+    uint64_t overlayGeneration; // overlay captures: content generation (pointer excluded)
 };
-DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false);
+// An overlay request with overlayCursor=false omits the pointer image.
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0,bool overlay=false,bool overlayCursor=true);
+// Block (no locks held) while the owner's capture is pending, at most
+// timeoutMs. Returns -116 for an unknown/expired token, else 0 with status.
+int CompositorWaitDebugFrame(uint32_t token,uint64_t owner,uint32_t timeoutMs,DebugFrameSnapshot& out);
+// Overlay content generation, pointer excluded. Also arms change detection.
+uint64_t CompositorOverlayGeneration();
+// Latest compositor pointer image/visibility; position is sampled live.
+// Pixels are written only when knownSerial differs from the current serial.
+void CompositorOverlayCursor(struct ::BrookDesktopOverlayCursor& out,uint64_t knownSerial);
 DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner=0);
 int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& bands);
 bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner=0);

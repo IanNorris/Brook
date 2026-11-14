@@ -15,6 +15,7 @@
 #include "desktop_retry.h"
 #include "desktop_tile.h"
 #include "overlay_copy.h"
+#include "desktop_overlay_cache.h"
 #include "source_size_policy.h"
 #include "desktop_gpu_channel.h"
 #include "desktop_async_source_barrier.h"
@@ -47,12 +48,17 @@ struct RenderContext {
     struct Source client[BROOK_DESKTOP_LAYER_LIMIT],chrome[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source chromeSpan[BROOK_DESKTOP_LAYER_LIMIT][4];
     struct Source background,overlay[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
+    /* Retained overlay capture: reused while the kernel generation matches. */
+    uint64_t overlayGeneration;uint32_t overlayWidth,overlayHeight;
+    struct BrookDesktopOverlayBands overlayBands;
+    struct Source cursor;uint64_t cursorSerial;
     struct BackdropIdentity backdropIdentity;
     struct DesktopDamageState damage;
 };
 struct PendingDesktopFrame {
     long ticket;uint64_t frame,started,nextReport,skippedBytes;uint32_t width,height,visible,skippedLayers;unsigned direct;
     int partial,graphics,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
+    struct DesktopOverlayFrameState overlay;
     uint64_t traceStart,traceSubmitStart,traceReceived,traceCompleted,statsSubmitStart,statsFence;uint32_t traceWindow;uint64_t traceIncarnation,traceCommit;
     uint64_t traceChannel,traceQuery,traceClients,traceBackdrop,traceChrome,traceOverlay,tracePixels;
     uint32_t traceLayers,traceRegions;
@@ -72,6 +78,12 @@ static uint64_t g_gpuSkippedBytes,g_gpuSkippedLayers;
 static uint64_t g_gpuDirectTraced[BROOK_DESKTOP_LAYER_LIMIT];
 static struct {uint64_t sum[6],maxTotal;unsigned frames;} g_stageTiming;
 static int g_presentFrame,g_asyncPresent,g_dependentPartial;
+/* Overlay state of the last presented frame (damage baseline), and whether
+ * the kernel tracks overlay generations and exports the pointer (op 6/8);
+ * otherwise the pointer stays in every per-frame overlay capture. */
+static struct DesktopOverlayFrameState g_overlayDisplayed;static uint64_t g_overlayDisplayedTicket;
+static int g_overlayTracked=-1;
+static struct BrookDesktopOverlayCursor g_cursorInfo;
 static long g_presentingTicket;
 /* Always-on counters (desktop_stats.h), published by stats_tick(). */
 static struct DesktopStats g_stats;
@@ -89,7 +101,7 @@ static int present_full(uint64_t ticket,uint32_t width,uint32_t height){
 
 static void source_close(int drm,struct Source *s);
 static void context_init(struct RenderContext *ctx){
-    memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;
+    memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;ctx->cursor.fd=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)ctx->overlay[i].fd=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){ctx->client[i].fd=-1;ctx->chrome[i].fd=-1;
         for(unsigned j=0;j<4;++j)ctx->chromeSpan[i][j].fd=-1;}
@@ -109,6 +121,7 @@ static void context_close(int drm,struct RenderContext *ctx){
     if(ctx->batchOutput>=0)close(ctx->batchOutput);
     if(ctx->output>=0)close(ctx->output);
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)source_close(drm,&ctx->overlay[i]);
+    source_close(drm,&ctx->cursor);
     source_close(drm,&ctx->background);
     for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){source_close(drm,&ctx->chrome[i]);source_close(drm,&ctx->client[i]);
         for(unsigned j=0;j<4;++j)source_close(drm,&ctx->chromeSpan[i][j]);}
@@ -171,16 +184,30 @@ static int batch_output_ensure(struct RenderContext *ctx,uint64_t bytes){
     ctx->batchOutput=fd;ctx->batchOutputBytes=(uint64_t)size;return 0;
 }
 static uint64_t monotonic_ns(void);
+/* Returns the generation of the captured content (0 if untracked) through
+ * generation. Waits in the kernel for completion where supported. */
 static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t height,
-                           struct BrookDesktopOverlayBands *bands){
-    uint64_t start=monotonic_ns(),ready=0,pollEnd=0;unsigned polls=0;
-    long token=syscall(BROOK_SYS_DESKTOP_OVERLAY,0,0,0,0,0,0);if(token<=0){desktop_stats_overlay(&g_stats,0,0,0);return -1;}
-    struct BrookDebugFrameInfo info={0};int result=-1;
-    for(unsigned retry=0;retry<500;++retry){
+                           struct BrookDesktopOverlayBands *bands,uint64_t *generation){
+    uint64_t start=monotonic_ns(),ready=0,pollEnd=0;unsigned polls=0;*generation=0;
+    long token=syscall(BROOK_SYS_DESKTOP_OVERLAY,0,0,0,0,g_overlayTracked==1?BROOK_DESKTOP_OVERLAY_NO_CURSOR:0,0);
+    if(token<=0){desktop_stats_overlay(&g_stats,0,0,0);return -1;}
+    struct BrookDesktopOverlayInfo overlayInfo={{0},0};
+    struct BrookDebugFrameInfo info={0};int result=-1,blocking=1;
+    for(unsigned retry=0;retry<5000;++retry){
         ++polls;
+        if(blocking){
+            if(!syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_WAIT,token,&overlayInfo,sizeof(overlayInfo),100,0)){
+                info=overlayInfo.frame;
+                if(info.state!=1)break;
+                if(retry>=50)break; /* about 5 s, as before */
+                continue;
+            }
+            if(errno!=EINVAL)goto done;
+            blocking=0; /* older kernel: short backoff polling */
+        }
         if(syscall(BROOK_SYS_DESKTOP_OVERLAY,1,token,&info,sizeof(info),0,0))goto done;
         if(info.state!=1)break;
-        usleep(10000);
+        usleep(1000);
     }
     pollEnd=monotonic_ns();
     if(info.state!=2 || info.width!=width || info.height!=height || info.stride!=width ||
@@ -197,6 +224,7 @@ static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t
         if(source_ensure(drm,rowBytes*b->height,&output[i]))goto done;
         if(desktop_overlay_copy_band(token,i,output[i].map,width,height,b))goto done;
     }
+    if(blocking && g_overlayTracked==1)*generation=overlayInfo.generation;
     result=0;
 done: (void)syscall(BROOK_SYS_DESKTOP_OVERLAY,3,token,0,0,0,0);
     if(!pollEnd)pollEnd=monotonic_ns();
@@ -205,6 +233,29 @@ done: (void)syscall(BROOK_SYS_DESKTOP_OVERLAY,3,token,0,0,0,0);
         if(end>=ready)fprintf(stderr,"DESKTOP_OVERLAY_TIMING wait_ms=%lu copy_ms=%lu polls=%u bands=%u\n",
             (unsigned long)((ready-start)/1000000ull),(unsigned long)((end-ready)/1000000ull),polls,bands->count);}
     return result;
+}
+/* Kernel overlay generation (op 6), or 0 when untracked (older kernel). */
+static uint64_t overlay_generation(void){
+    if(!g_overlayTracked)return 0;
+    long generation=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_GENERATION,0,0,0,0,0);
+    if(g_overlayTracked<0)g_overlayTracked=generation>0;
+    return generation>0?(uint64_t)generation:0;
+}
+/* Pointer layer state; refreshes the context's 64x64 image on a new serial. */
+static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state){
+    *state=(struct DesktopOverlayCursorState){0};
+    if(g_overlayTracked!=1)return 0;
+    const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
+    if(syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0))return -1;
+    const struct BrookDesktopOverlayCursor *c=&g_cursorInfo;
+    if(!c->visible || !c->width || !c->height || c->width>BROOK_DESKTOP_CURSOR_MAX ||
+       c->height>BROOK_DESKTOP_CURSOR_MAX || c->stride!=BROOK_DESKTOP_CURSOR_MAX)return 0;
+    if(!ctx->cursor.handle || c->serial!=known){
+        if(source_ensure(drm,sizeof(c->pixels),&ctx->cursor))return -1;
+        memcpy(ctx->cursor.map,c->pixels,sizeof(c->pixels));ctx->cursorSerial=c->serial;
+    }
+    *state=(struct DesktopOverlayCursorState){1,c->width,c->height,c->x,c->y,c->serial};
+    return 0;
 }
 static int push(uint32_t *scene,unsigned *count,struct BrookVkExternalSource *sources,
                 const struct Source *source,const struct BrookVkSceneLayer *layer){
@@ -342,7 +393,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             unsigned n=getenv("BROOK_RENDER_CHROME_SPANS")?desktop_chrome_spans(l,c,spans):0;
             /* Reserve the worst case for later clients/chrome and overlays;
              * otherwise retain the existing full-chrome path. */
-            if(n && count+n+2*(layers.count-i-1)+BROOK_DESKTOP_OVERLAY_MAX_BANDS<=BROOK_VK_MAX_LAYERS){
+            if(n && count+n+2*(layers.count-i-1)+BROOK_DESKTOP_OVERLAY_MAX_BANDS+1<=BROOK_VK_MAX_LAYERS){
                 for(unsigned j=0;j<n;++j){const struct DesktopChromeSpan *s=&spans[j];
                     const uint64_t bytes=(uint64_t)s->width*s->height*4;
                     struct Source *part=&ctx->chromeSpan[i][j];if(source_ensure(drm,bytes,part))goto done;
@@ -361,17 +412,31 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 c->clientX,c->clientY,(int64_t)c->clientX+c->width,(int64_t)c->clientY+c->height},width,height);
         }
     }
-    struct BrookDesktopOverlayBands bands={0};
     chromeEndNs=monotonic_ns();
     stage="overlay_capture";
-    if(capture_overlay(drm,overlay,width,height,&bands))goto done;
+    /* Recapture only when the kernel's overlay content generation changed. */
+    const uint64_t overlayGeneration=overlay_generation();
+    if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height)){
+        uint64_t captured=0;ctx->overlayGeneration=0;
+        if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&captured))goto done;
+        ctx->overlayGeneration=captured;ctx->overlayWidth=width;ctx->overlayHeight=height;
+    }
+    const struct BrookDesktopOverlayBands bands=ctx->overlayBands;
+    struct DesktopOverlayFrameState frameOverlay={1,width,height,ctx->overlayGeneration,bands,{0}};
+    stage="overlay_cursor";
+    if(overlay_cursor(drm,ctx,&frameOverlay.cursor))goto done;
     timing[3]=monotonic_ns();
     for(uint32_t i=0;i<bands.count;++i){const struct BrookDesktopOverlayBand *b=&bands.bands[i];
         struct BrookVkSceneLayer layer={0,b->width,b->width,b->height,0,0,b->width,b->height,
             b->x,b->y,b->width,b->height,0,0,width,height,255|BROOK_VK_STRAIGHT_ALPHA};
         if(push(scene,&count,sources,&overlay[i],&layer))goto done;
-        desktop_damage_add(&footprint,(struct DesktopDamageRect){b->x,b->y,(int64_t)b->x+b->width,(int64_t)b->y+b->height},width,height);
     }
+    if(frameOverlay.cursor.visible){const struct DesktopOverlayCursorState *c=&frameOverlay.cursor;
+        struct BrookVkSceneLayer layer={0,BROOK_DESKTOP_CURSOR_MAX,c->width,c->height,0,0,c->width,c->height,
+            c->x,c->y,c->width,c->height,0,0,width,height,255|BROOK_VK_STRAIGHT_ALPHA};
+        if(push(scene,&count,sources,&ctx->cursor,&layer))goto done;
+    }
+    desktop_overlay_damage(&g_overlayDisplayed,&frameOverlay,&footprint);
     scene[2]=count;
     struct DesktopDamageSet damage=desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
     uint64_t damagePixels=0;for(uint32_t i=0;i<damage.count;++i){const struct DesktopDamageRect *r=&damage.rects[i];
@@ -527,7 +592,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
             .skippedBytes=skippedBytes,.width=width,.height=height,.visible=layers.count,.skippedLayers=skipped,.direct=frameDirect,
             .partial=attemptPartial,.graphics=graphicsUsed,.regions=regionBatch,
-            .damage={identity.display,identity.generation,width,height,footprint}};
+            .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
         return 1;
     }
@@ -614,6 +679,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
 #endif
     desktop_damage_commit(&ctx->damage,identity.display,identity.generation,width,height,footprint);
+    desktop_overlay_presented(&g_overlayDisplayed,&g_overlayDisplayedTicket,&frameOverlay,0);
     ctx->lastPartial=attemptPartial;
     if(getenv("BROOK_RENDER_TIMING_AGGREGATE") && timing[0] && timing[5]>=timing[4]){
         const uint64_t stageNs[6]={timing[1]-timing[0],timing[2]-timing[1],chromeEndNs-timing[2],
@@ -734,6 +800,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
     if(!result){
         *presented=monotonic_ns();ctx->lastPresentNs=*presented;ctx->lastPartial=p->partial;
         desktop_async_damage_retire(displayedDamage,p->damage,p->partial,1);
+        desktop_overlay_presented(&g_overlayDisplayed,&g_overlayDisplayedTicket,&p->overlay,(uint64_t)p->ticket);
         async_sources_committed(g_asyncSourceBarriers,p->sources,p->visible);
         desktop_gpu_channel_presented(&g_gpuChannel,p->frame);
         g_gpuDirectLayers+=p->direct;g_gpuSkippedLayers+=p->skippedLayers;g_gpuSkippedBytes+=p->skippedBytes;
