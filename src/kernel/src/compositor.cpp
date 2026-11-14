@@ -1,3 +1,4 @@
+#include "boot_timing_runtime.h"
 #include "chrome_material.h"
 #include "keyboard.h"
 #include "kprintf.h"
@@ -4065,6 +4066,8 @@ static void CompositorLoop()
     if(BootLogoActive() && WmIsActive()) {
         uint64_t ns=0;const uint64_t now=ApicTickCount();
         __atomic_store_n(&g_bootDurationMs,KvmClockReadStableNs(&ns)?ns/1000000:now,__ATOMIC_RELEASE);
+        // Before publishing the ready tick, so the toast never sees it without timing.
+        BootTimingDesktopReady(true,now);
         __atomic_store_n(&g_desktopReadyTick,now?now:1,__ATOMIC_RELEASE);
         BootLogoFinish();SerialPrintf("BOOT: desktop presented in %lu ms\n",CompositorBootDurationMs());
     }

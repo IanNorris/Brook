@@ -1,5 +1,6 @@
 #include "acpi.h"
 #include "acpi_tables.h"
+#include "boot_timing.h"
 #include "boot_resource_map.h"
 #include "boot_protocol/boot_protocol.h"
 #include "serial.h"
@@ -252,6 +253,21 @@ bool AcpiFirmwareRange(uint64_t address,uint32_t bytes) {
 }
 #endif
 uint64_t AcpiFindTable(const char* signature){return g_tables.Find(signature);}
+bool AcpiReadBootPerformance(FpdtBootRecord& out) {
+    out={};
+    if(!g_acpiReady)return false;
+    AcpiSdtHeader header{};
+    const uint64_t fpdt=g_tables.Find("FPDT",&header);
+    // Find() checked the complete span and checksum.
+    if(!fpdt || header.length>4096)return false;
+    const uint64_t fbpt=BootFpdtFbptAddress(reinterpret_cast<const uint8_t*>(fpdt),header.length);
+    uint8_t head[8]{};
+    if(!fbpt || !ReadFirmware(nullptr,fbpt,head,sizeof(head)))return false;
+    const uint32_t length=BootLe32(head+4);
+    static uint8_t table[1024];
+    if(length<8 || length>sizeof(table) || !ReadFirmware(nullptr,fbpt,table,length))return false;
+    return BootParseFbpt(table,length,out);
+}
 bool AcpiNvsContains(uint64_t address,uint32_t bytes){return ContainsFirmware(address,bytes,true);}
 bool AcpiMmioMapValid(){return g_mmioMapValid;}
 bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassification& result) {

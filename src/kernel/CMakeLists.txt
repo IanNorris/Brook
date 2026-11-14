@@ -377,6 +377,7 @@ add_executable(kernel
     src/virtio_blk.cpp
     src/gpt.cpp
     src/acpi.cpp
+    src/boot_timing.cpp
     src/apic.cpp
     src/tlb_test.cpp
     src/tty.cpp

@@ -83,6 +83,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "debug_overlay.h"
 #endif
+#include "boot_timing_runtime.h"
 #include "string.h"
 
 // All kernel initialization and runtime — called by KernelMain after stack switch.
@@ -374,6 +375,9 @@ namespace brook { void GuardTestPrepareDesktopHome() { PrepareDesktopHome(); } }
 // Non-static so the scheduler can update syscallStack on context switch.
 KernelCpuEnv* g_kernelEnv = nullptr;
 
+// TSC at the first kernel instruction; read by boot_timing.cpp.
+extern "C" { uint64_t g_kernelEntryTsc = 0; }
+
 // Kernel entry point. Called by the bootloader via SysV ABI (argument in RDI).
 // Immediately switches to a dedicated kernel stack, then tail-calls KernelMainBody.
 extern "C" __attribute__((sysv_abi, noreturn)) void KernelMain(brook::BootProtocol* bootProtocol)
@@ -382,6 +386,11 @@ extern "C" __attribute__((sysv_abi, noreturn)) void KernelMain(brook::BootProtoc
     // Switch RSP before the compiler can spill bootProtocol anywhere on the old stack.
     // bootProtocol lives in RDI throughout; "noreturn" prevents the compiler generating
     // any callee-save/restore code that would reference the old stack after this.
+    // Clobbers only RAX/RDX; RDI (bootProtocol) is untouched.
+    __asm__ volatile("rdtsc\n\t"
+                     "shlq $32, %%rdx\n\t"
+                     "orq %%rdx, %%rax\n\t"
+                     "movq %%rax, g_kernelEntryTsc(%%rip)\n\t" ::: "rax", "rdx", "memory");
     extern void* g_kernelStackTop;
     void* newSp = g_kernelStackTop;
     __asm__ volatile("movq %0, %%rsp\n\t" :: "r"(newSp) : "memory");
@@ -405,6 +414,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                     bootProtocol ? static_cast<unsigned long>(bootProtocol->magic) : 0UL,
                     static_cast<unsigned long>(brook::BootProtocolMagic));
     }
+    brook::BootTimingCaptureHandoff(bootProtocol);
 
     GdtInit();
     CpuInitFpu();
@@ -501,6 +511,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // ACPI: parse tables to get LAPIC/IOAPIC addresses.
     bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical,bootProtocol->memoryMap,bootProtocol->memoryMapCount);
+    if(acpiOk)brook::BootTimingCaptureFirmware();
     if(acpiOk && efiRuntime.valid) {
         auto probe=[](uint64_t address,brook::KernelAliasMapping& identity) {
             brook::KernelAliasMapping direct{};return brook::VmmInspectKernelAliases(address,identity,direct);
