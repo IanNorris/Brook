@@ -57,6 +57,11 @@
 // otherwise it copies as usual. A client write the producer has not yet
 // published is not reflected, exactly as with the CPU compositor.
 #define BROOK_DESKTOP_LAYERS_CAPTURE_TRACKED_KEEP 13
+// Renderer report for the taskbar APP cadence: it composited a GPU-source
+// client frame. address=0, size=0, a=window, b=window incarnation (layer
+// incarnation), c=client commit. Diagnostic only; the kernel counts each new
+// commit once for the focused window.
+#define BROOK_DESKTOP_CLIENT_FRAME 14
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u

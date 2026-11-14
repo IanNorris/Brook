@@ -109,6 +109,8 @@ uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
 void WmObserveDesktopTick(uint64_t now);
+// The renderer composited a GPU-source frame for window identity/commit.
+void WmNoteClientFrame(uint64_t identity,uint64_t commit);
 using WmRect = DesktopRect;
 void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
 void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);

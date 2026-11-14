@@ -27,7 +27,7 @@ struct BdwPpgttCacheStats {
 // re-inspected and republished for each job.
 class BdwExecTables {
 public:
-    static constexpr uint32_t Max=128, ScratchPages=4, CacheSlots=4;
+    static constexpr uint32_t Max=BdwPpgttMaxTables, ScratchPages=4, CacheSlots=4;
     using ListFree=void(*)(BdwPpgttMapping*);
 private:
     struct Entry {BdwOwnedPage pages[Max+ScratchPages];uint32_t count=0,tables=0;BdwPpgttMapping* list=nullptr;
@@ -159,6 +159,20 @@ public:
         if(allocator_!=static_cast<const void*>(&a) || (state_!=State::Prepared && state_!=State::Published))return false;
         state_=State::Released;Free(a);FreeList();return true;
     }
+    // Refusal before any GPU use: leave the owner Released (as after a
+    // retired job) from Fresh, Prepared or Published. False for InUse or
+    // Quarantined, whose pages may be visible to the device.
+    template<class Allocator> bool AbandonUnsubmitted(Allocator& a){
+        if(state_==State::Released)return true;
+        if(state_==State::Fresh){if(count_)return false;state_=State::Released;return true;}
+        if(state_==State::Prepared || state_==State::Published){
+            if(allocator_!=static_cast<const void*>(&a))return false;
+            state_=State::Released;Free(a);FreeList();return true;
+        }
+        return false;
+    }
+    bool Quarantined()const{return state_==State::Quarantined;}
+    bool Fresh()const{return state_==State::Fresh;}
     template<class Allocator> bool ReleaseStopped(Allocator& a,bool verifiedStopped){
         if(allocator_!=static_cast<const void*>(&a) || state_!=State::InUse || !verifiedStopped)return false;
         state_=State::Released;

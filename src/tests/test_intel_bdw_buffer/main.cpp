@@ -34,7 +34,7 @@
 #include <unistd.h>
 using namespace brook;
 struct Allocation {void* ptr;uint64_t pages,dma;};
-static Allocation allocations[32]{};
+static Allocation allocations[256]{};
 static unsigned frees=0,allocated=0,failAt=0;
 static bool failVmm=false,failBacking=false,badDma=false;
 static bool resetArmed=true,translated=false,wrongOwner=false,changingVtd=false;
@@ -98,7 +98,7 @@ struct RenderBackend {
     BdwOwnedPage* pages=nullptr;uint64_t ptes[29]{};
     bool exclusiveHandoff(){return true;} bool renderStateReady(){return true;}
     bool admitPages(BdwOwnedPage* p,unsigned n){pages=p;return n==37;}
-    bool admitExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=128;}bool publishExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=128;}
+    bool admitExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=BdwPpgttMaxTables+4;}bool publishExtraTables(BdwOwnedPage*,unsigned n){return n>=4 && n<=BdwPpgttMaxTables+4;}
     bool gpuPatLease(){return true;} bool preparePrivatePat(uint64_t){return true;}
     bool readPrivatePat(uint32_t& lo,uint32_t& hi){lo=7;hi=11;return true;}
     bool publish(BdwOwnedPage* p,unsigned n){return p==pages && n==37;}
@@ -124,7 +124,7 @@ extern "C" void* kmalloc(uint64_t n){if(failHeapOnce){failHeapOnce=false;return 
 extern "C" void kfree(void* p){std::free(p);}
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){
     if(failVmm || (failAt && allocated+1==failAt))return VirtualAddress{};
-    assert(allocated<32 && n<=256);auto& a=allocations[allocated];
+    assert(allocated<256 && n<=256);auto& a=allocations[allocated];
     assert(!posix_memalign(&a.ptr,4096,n*4096));a.pages=n;a.dma=0x100000+uint64_t(allocated)*0x200000;
     ++allocated;std::memset(a.ptr,0xaa,n*4096);return VirtualAddress(reinterpret_cast<uint64_t>(a.ptr));
 }
@@ -1863,6 +1863,34 @@ int main(){
         assert(BdwGpuFileCloseBuffer(f,ha) && BdwGpuFileCloseBuffer(f,hb) && BdwGpuFileCloseBuffer(f,hc));
     }
     {
+        // Worker refusal unwinding (gen 386 panic): a preparation abandoned
+        // before arming leaves the render image and tables Released, so the
+        // next job's reprepare recycles them and runs normally.
+        uint64_t r3=0;const uint32_t ua=BdwGpuFileCreateBuffer(f,4096,r3),ub=BdwGpuFileCreateBuffer(f,4096,r3);assert(ua && ub);
+        BdwExecObjectInput in[]={{ua,0x20000,4096,16},{ub,0x40010000,4096,16|64}};
+        auto* job=BdwExecSnapshotCreate(f,in,2,0,8,64);assert(job);
+        RenderAllocator renderAlloc;TableAllocator tableAlloc;BdwRenderOneShot shot;BdwExecTables tables;
+        BdwPpgttMapping workspace[2]{};
+        // Refused before the tables were prepared (too large, say).
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging));
+        assert(!shot.DetachSnapshot(renderAlloc) && tables.AbandonUnsubmitted(tableAlloc) && shot.ReleasePrepared(renderAlloc));
+        assert(tables.Released() && shot.Recycle(renderAlloc) && tables.Recycle());
+        // Refused after the image was attached (the builder rejected it).
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging) && tables.Prepare(tableAlloc,job));
+        assert(shot.AttachExternalSnapshot(renderAlloc,tables,tableAlloc,job,workspace,2));
+        assert(shot.DetachSnapshot(renderAlloc)==job && tables.AbandonUnsubmitted(tableAlloc) && shot.ReleasePrepared(renderAlloc));
+        assert(shot.Recycle(renderAlloc) && tables.Recycle() && tableAlloc.freed==tableAlloc.allocated);
+        // The next job prepares and publishes normally.
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging) && tables.Prepare(tableAlloc,job));
+        assert(shot.AttachExternalSnapshot(renderAlloc,tables,tableAlloc,job,workspace,2));
+        uint32_t status=9;assert(tables.InspectDma(tableAlloc,status) && status==0 && tables.Publish(tableAlloc) && shot.PublishPrepared(renderAlloc));
+        // Device-visible tables are never abandoned.
+        assert(tables.BeginUse(tableAlloc) && !tables.AbandonUnsubmitted(tableAlloc));
+        assert(tables.ReleaseStopped(tableAlloc,true));
+        assert(shot.DetachSnapshot(renderAlloc)==job && shot.ReleasePrepared(renderAlloc) && shot.Recycle(renderAlloc) && tables.Recycle());
+        assert(BdwExecSnapshotRelease(job,false) && BdwGpuFileCloseBuffer(f,ua) && BdwGpuFileCloseBuffer(f,ub));
+    }
+    {
         BdwExecObjectInput spaced[]={{replacement,0x20000,4096,16},{next,0x40010000,4096,16|4}};
         struct ExecObject {uint32_t handle,relocCount;uint64_t relocs,alignment,offset,flags,reserved1,reserved2;};
         struct ExecBuffer {uint64_t objects;uint32_t count,start,length,dr1,dr4,clipCount;uint64_t clips,flags,context,fences;};
@@ -2211,6 +2239,27 @@ int main(){
             BdwFenceUnref(fence);BdwGpuSyncUnref(output);
             assert(BdwGpuFileDestroySync(f,inputId) && BdwGpuFileDestroySync(f,outputId));
             eb.flags=1u<<11;eb.clipCount=0;eb.clips=0;fake.request=0;
+        }
+        {
+            // A buffer set the worker cannot map (more than 512 page tables)
+            // is refused at execbuffer with ENOSPC, before anything is queued;
+            // the largest set that fits (511 tables) is admitted.
+            static uint32_t handles[170];static ExecObject many[171];
+            for(unsigned i=0;i<170;++i){handles[i]=BdwGpuFileCreateBuffer(f,4096,rounded);assert(handles[i]);
+                many[i]={handles[i],0,0,4096,uint64_t(i+1)<<39,16|8,0,0};}
+            many[170]={fresh,0,0,4096,0x20000,16,0,0};
+            ExecBuffer big{reinterpret_cast<uint64_t>(many),171,8,64,0,0,0,0,1u<<11,0,0};
+            const auto bigArg=reinterpret_cast<uint64_t>(&big);
+            fake.request=0;assert(BdwIntelRenderIoctl(f,ioctlCommand(0x69,sizeof(big)),bigArg,user)==-28 && !fake.request);
+            auto* first=BdwGpuFileGetBuffer(f,handles[0]);assert(first && BdwGpuBufferGpuUses(first)==0);BdwGpuBufferUnref(first);
+            many[169]=many[170];big.count=170;
+            assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x69,sizeof(big)),bigArg,user) && fake.request);
+            uint64_t active=0;BdwExecSnapshot* item=nullptr;BdwExecRequestState state{};
+            assert(queue.StartNext(active,item) && active==fake.request);
+            uint32_t tables=0;assert(BdwExecSnapshotTableCount(item,tables) && tables==511);
+            assert(queue.Finish(active,true,true) && queue.Reap(9,active,state)==item && BdwExecSnapshotRelease(item,false));
+            for(unsigned i=0;i<170;++i)assert(BdwGpuFileCloseBuffer(f,handles[i]));
+            fake.request=0;
         }
         {
             const auto syncId=BdwGpuFileCreateSync(f,false);assert(syncId);

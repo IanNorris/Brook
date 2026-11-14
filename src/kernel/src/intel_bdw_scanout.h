@@ -105,6 +105,13 @@ BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* sna
 BdwSubmissionOutcome BdwExecuteRetainedContextWorkerSnapshot(void*,BdwExecSnapshot* snapshot);
 // Caller owns the serialized render/device lease and retains the snapshot.
 // These helpers do not validate commands or authorize a userspace submission.
+// Ready: armed. Refused: a deterministic limit (size, table count, an
+// allocation) stopped it before anything became device-visible; the image and
+// tables are back to Released and the job can fail without a reset.
+// Uncertain: DMA/ownership evidence or published state failed.
+enum class BdwPrepareOutcome : uint8_t { Ready, Refused, Uncertain };
+bool BdwUnwindFailedReprepare();
+BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,const char*& reason);
 bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot);
 // PPGTT table-set reuse across retained submissions (default off). Worker
 // state; the switch takes effect at the next job's preparation.

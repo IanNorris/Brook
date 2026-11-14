@@ -531,7 +531,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 // before taking the page-table lock; recheck direct-map
                 // geometry here while the audited device lease is held.
                 bool admitExtraTables(BdwOwnedPage* p,unsigned count){
-                    if(!owned() || !p || !count || count>128)return false;
+                    if(!owned() || !p || !count || count>BdwPpgttMaxTables+4)return false;
                     for(unsigned i=0;i<count;++i){const auto dma=p[i].dma;
                         if(!dma || (dma&4095) || dma>=(uint64_t{16}<<30) || p[i].cpu!=reinterpret_cast<uint8_t*>(DIRECT_MAP_BASE+dma))return false;
                     }return true;
@@ -546,7 +546,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool syncForDevice(const BdwOwnedPage& p){return flushPage(p);}
                 bool publish(BdwOwnedPage* p,unsigned count){if(!owned() || !p || count!=37)return false;
                     for(unsigned i=0;i<count;++i)if(!flushPage(p[i]))return false;return true;}
-                bool publishExtraTables(BdwOwnedPage* p,unsigned count){if(!owned() || !p || !count || count>128)return false;
+                bool publishExtraTables(BdwOwnedPage* p,unsigned count){if(!owned() || !p || !count || count>BdwPpgttMaxTables+4)return false;
                     for(unsigned i=0;i<count;++i)if(!flushPage(p[i]))return false;return true;}
                 bool validateLease(const BdwGgttLease&){return owned();}
                 bool validateTakeover(const BdwGgttLease&,uint64_t){return owned();}

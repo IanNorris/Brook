@@ -15,13 +15,30 @@ int main(){
     clicks.Reset();assert(!clicks.Press(8,100,30,400,6));
     clicks.Motion(140,30);assert(!clicks.Press(8,100,30,500,6));
     assert(!clicks.Press(8,100,30,1000,6));assert(clicks.Press(8,100,30,1300,6));
-    assert(BROOK_TASKBAR_DEFAULT==(BROOK_TASKBAR_CPU|BROOK_TASKBAR_MEMORY));
+    assert(BROOK_TASKBAR_DEFAULT==(BROOK_TASKBAR_CPU|BROOK_TASKBAR_MEMORY|BROOK_TASKBAR_THERMAL));
     for(unsigned mask=0;mask<=BROOK_TASKBAR_ALL;++mask)assert(brook_taskbar_metrics_valid(mask));
-    assert(!brook_taskbar_metrics_valid(64) && !brook_taskbar_metrics_valid(0xffffffffu));
+    assert(brook_taskbar_metrics_valid(64) && !brook_taskbar_metrics_valid(128) && !brook_taskbar_metrics_valid(0xffffffffu));
     assert(brook_taskbar_metrics_setting(3,"taskbar_metrics=0")==0);
     assert(brook_taskbar_metrics_setting(3,"taskbar_metrics=63\r")==63);
-    for(const char* invalid:{"taskbar_metrics=64","taskbar_metrics=-1","taskbar_metrics=1000","taskbar_metrics=","taskbar_metrics=3junk","theme=1"})
+    assert(brook_taskbar_metrics_setting(3,"taskbar_metrics=127")==127);
+    for(const char* invalid:{"taskbar_metrics=128","taskbar_metrics=-1","taskbar_metrics=1000","taskbar_metrics=","taskbar_metrics=3junk","theme=1"})
         assert(brook_taskbar_metrics_setting(BROOK_TASKBAR_DEFAULT,invalid)==BROOK_TASKBAR_DEFAULT);
+    {
+        // GPU-source client frames: each new commit of the focused window
+        // counts once; retained re-samples, other windows and stale or zero
+        // commits do not; a focus change starts afresh.
+        brook::DesktopClientFrameFilter f;
+        f.Reset(7);
+        assert(f.Accept(7,7,1) && !f.Accept(7,7,1) && f.Accept(7,7,2) && !f.Accept(7,7,1));
+        assert(!f.Accept(7,8,9) && !f.Accept(7,7,0) && !f.Accept(0,7,3));
+        assert(f.Accept(7,7,5));
+        f.Reset(8);
+        assert(!f.Accept(8,7,6) && f.Accept(8,8,1));
+        assert(f.Accept(9,9,1)); // an unseen focus resets implicitly
+        brook::DesktopIntervals<> d;brook::DesktopClientFrameFilter g;g.Reset(3);
+        uint64_t t=1000;for(uint64_t commit=1;commit<=20;++commit){for(int repeat=0;repeat<3;++repeat){if(g.Accept(3,3,commit))d.Record(t);}t+=20;}
+        auto sum=d.Read(t);assert(sum.count==19 && sum.p80==20 && sum.max==20);
+    }
     assert(brook_appearance_valid(BROOK_APPEARANCE_DEFAULT));
     for(unsigned dark:{0u,1u})for(unsigned perf:{0u,1u})for(unsigned opacity:{40u,80u,100u})for(unsigned blur=0;blur<4;++blur){
         auto value=brook_appearance_pack(dark,perf,opacity,blur);assert(brook_appearance_valid(value));

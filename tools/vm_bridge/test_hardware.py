@@ -50,6 +50,7 @@ class Endpoint:
                             result={'job_api':2}
                         elif command=='bridge ui caps':result={'ui_api':1,'apps_api':1,'boot_id':self.epoch}
                         elif command=='bridge stats':result={'process_count':7}
+                        elif command.startswith('thermal '):result={'available':True,'mode':command.split(' ',1)[1],'latest':{'pkg_c':81}}
                         elif command.startswith(('bridge hardware recovery-panic ','bridge hardware recovery-panic-previous ')):
                             previous=command.startswith('bridge hardware recovery-panic-previous ')
                             offset,count=map(int,command.split()[-2:]);payload=getattr(self,'previous_panic_packet' if previous else 'panic_packet',b'')
@@ -103,6 +104,15 @@ class HardwareTests(unittest.TestCase):
             self.assertTrue(doctor['capabilities']['command_jobs']);self.assertTrue(doctor['capabilities']['semantic_windows'])
             self.assertEqual(self.hardware.stats(session)['process_count'],7)
             logs=self.hardware.logs(session);self.assertEqual(logs['next_cursor'],2);self.assertEqual(logs['dropped_lines'],1)
+    def test_thermal_is_read_only_and_selects_mode(self):
+        session=self.attach()
+        r=self.hardware.thermal(session);self.assertEqual(r['mode'],'status');self.assertEqual(r['latest']['pkg_c'],81);self.assertNotIn('power',r)
+        self.assertEqual(self.hardware.thermal(session,history=True)['mode'],'history')
+        self.assertEqual(self.hardware.thermal(session,graph=True)['mode'],'graph')
+        r=self.hardware.thermal(session,power=True);self.assertEqual(r['power']['mode'],'power')
+        with self.assertRaises(ValueError):self.hardware.thermal(session,history=True,graph=True)
+        with self.assertRaises(ValueError):self.hardware.thermal(session,history=1)
+        self.assertFalse(any(c.endswith('thermal reset') for c in self.endpoint.commands))
     def test_snapshot_support_does_not_imply_snapshot_readiness(self):
         session=self.attach()
         self.assertFalse(self.hardware.doctor(session)['capabilities']['ram_application_snapshot'])

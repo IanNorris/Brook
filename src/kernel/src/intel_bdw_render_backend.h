@@ -14,7 +14,7 @@ namespace brook {
 // perform failure recovery. Those are mandatory owner responsibilities.
 template<class Owner> class BdwRenderDeviceBackend final : public BdwRenderExecutionBackend {
     Owner& owner_;uint32_t first_,contextId_;uint64_t token_,scratch_;BdwOwnedPage* pages_=nullptr;
-    BdwOwnedPage* extra_=nullptr;unsigned extraCount_=0;BdwOwnedPage extraEvidence_[128]{};
+    BdwOwnedPage* extra_=nullptr;unsigned extraCount_=0;BdwOwnedPage extraEvidence_[BdwPpgttMaxTables+4]{};
     uint32_t ggttWrites_=0,portWrites_=0;bool resetDone_=false;const BdwOwnedPage* hws_=nullptr;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     uint64_t issuedTicks_=0,breadcrumbTicks_=0;
@@ -41,7 +41,7 @@ public:
     }
     bool publish(BdwOwnedPage* pages,unsigned count){return pages==pages_ && count==37 && owned() && owner_.publish(pages,count);}
     bool admitExtraTables(BdwOwnedPage* pages,unsigned count){
-        if(!owned() || !pages_ || extra_ || !pages || !count || count>128)return false;
+        if(!owned() || !pages_ || extra_ || !pages || !count || count>BdwPpgttMaxTables+4)return false;
         for(unsigned i=0;i<count;++i){
             if(!pages[i].cpu || !pages[i].dma || pages[i].dma==scratch_)return false;
             for(unsigned j=0;j<37;++j)if(pages[i].dma==pages_[j].dma || pages[i].cpu==pages_[j].cpu)return false;

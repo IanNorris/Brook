@@ -401,7 +401,7 @@ bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* s,const BdwPpgttPage (&scr
                                     uint64_t completion,uint32_t nonce,bool gt3,uint32_t (&ring)[56]){
     if(!Preparing(s))return false;
     s->preparedFlags&=~1u;
-    if(!tables || !tableCount || tableCount>128 || !workspace || !workspaceCount || workspaceCount>65536)return false;
+    if(!tables || !tableCount || tableCount>BdwPpgttMaxTables || !workspace || !workspaceCount || workspaceCount>65536)return false;
     const uintptr_t start=reinterpret_cast<uintptr_t>(ring);
     auto overlaps=[&](uintptr_t address,uint64_t size){
         return start>~uintptr_t{0}-sizeof(ring) || address>~uintptr_t{0}-size ||

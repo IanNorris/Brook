@@ -9,10 +9,11 @@ enum {
     BROOK_TASKBAR_NETWORK = 8u,
     BROOK_TASKBAR_COMPOSITOR = 16u,
     BROOK_TASKBAR_APP = 32u,
-    BROOK_TASKBAR_ALL = 63u,
-    BROOK_TASKBAR_DEFAULT = BROOK_TASKBAR_CPU | BROOK_TASKBAR_MEMORY
+    BROOK_TASKBAR_THERMAL = 64u,
+    BROOK_TASKBAR_ALL = 127u,
+    BROOK_TASKBAR_DEFAULT = BROOK_TASKBAR_CPU | BROOK_TASKBAR_MEMORY | BROOK_TASKBAR_THERMAL
 };
-static inline int brook_taskbar_metrics_valid(uint32_t value) { return !(value & ~63u); }
+static inline int brook_taskbar_metrics_valid(uint32_t value) { return !(value & ~127u); }
 /* Strict bounded settings parser; preserve defaults for absent/invalid keys. */
 static inline uint32_t brook_taskbar_metrics_setting(uint32_t prior, const char *line) {
     const char *key = "taskbar_metrics=";

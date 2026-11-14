@@ -13056,6 +13056,10 @@ static int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t si
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    if(op==BROOK_DESKTOP_CLIENT_FRAME){
+        if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
+        brook::WmNoteClientFrame(b,c);return 0;
+    }
     if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE ||
         op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)

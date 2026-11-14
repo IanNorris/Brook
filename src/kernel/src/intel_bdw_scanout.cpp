@@ -22,9 +22,7 @@
 #include "acpi.h"
 #include "smp.h"
 #include "serial.h"
-#if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "kprintf.h"
-#endif
 #include "vfs.h"
 #include "panic_test_reset.h"
 #include "intel_bdw_submission_worker.h"
@@ -724,7 +722,25 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     auto tick=[](){uint32_t lo,hi;__asm__ volatile("lfence; rdtsc":"=a"(lo),"=d"(hi)::"memory");return (uint64_t(hi)<<32)|lo;};
     const uint64_t startTicks=tick();
 #endif
-    if(!BdwReprepareRetainedSubmission(saved,++nonce)){kfree(memory);PanicWorkerStage("reprepare",snapshot);}
+    // A job the kernel cannot serve for deterministic resource reasons is
+    // refused: nothing was published to the GPU, the render image and tables
+    // are unwound to Released, the context is returned unchanged (not lost)
+    // and the client sees a fence error. Uncertain state still panics.
+    auto refuseJob=[&](const char* reason)->BdwSubmissionOutcome{
+        static uint32_t refusals=0;const uint32_t n=++refusals;
+        if(n<=16 || !(n&(n-1))){uint32_t pid=0,ctx=0;BdwExecSnapshotOrigin(snapshot,pid,ctx);
+            KPrintf("gpu-submit: job refused pid=%u context=%u objects=%u pages=%u reason=%s count=%u\n",pid,ctx,
+                BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),reason?reason:"?",n);}
+        kfree(memory);
+        if(guard.active){(void)BdwGpuContextFinish(owner,nullptr,true);guard.active=false;}
+        return {false,true,true};
+    };
+    if(!BdwReprepareRetainedSubmission(saved,++nonce)){
+        // Only the clean case (no pages for the private render image, e.g.
+        // under memory pressure) is undone; anything else is uncertain.
+        if(!BdwUnwindFailedReprepare()){kfree(memory);PanicWorkerStage("reprepare",snapshot);}
+        return refuseJob("private render image allocation failed");
+    }
     ohStep(BdwOhReprepare);
     const uint32_t dmaStatus=BdwInspectPrivateRenderDma();
     if(dmaStatus!=BdwDmaSnapshotOk){kfree(memory);PanicWorkerStage("private-dma",snapshot,dmaStatus);}
@@ -737,7 +753,13 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     if(!BdwExecSnapshotUseCoherentRender(snapshot)){kfree(memory);PanicWorkerStage("cache policy",snapshot);}
 #endif
     ohStep(BdwOhReservation);
-    if(!BdwPrepareRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("prepare",snapshot);}
+    {
+        // Too many pages or page tables, or an allocation failure: refused.
+        const char* reason=nullptr;
+        const auto prepared=BdwPrepareRetainedSubmissionChecked(snapshot,reason);
+        if(prepared==BdwPrepareOutcome::Refused)return refuseJob(reason);
+        if(prepared!=BdwPrepareOutcome::Ready){kfree(memory);PanicWorkerStage(reason?reason:"prepare",snapshot);}
+    }
     ohStep(BdwOhPrepare);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t preparedTicks=tick();

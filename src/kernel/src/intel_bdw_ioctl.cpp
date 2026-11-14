@@ -549,6 +549,15 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         BdwTimingOwnerElapsed(u.submitterIncarnation,BdwTimingSnapshotBuild,admissionAcquired,BdwTimingNow());
  #endif
         if(decoded){BdwNoteRefusal("execbuffer decode: object, relocation, fence or context validation");return decoded;}
+        // The worker can map at most 65536 pages through 512 page tables. A
+        // larger or sparser buffer set is a normal application request the
+        // kernel cannot serve: refuse it here with ENOSPC instead of failing
+        // later (the worker also refuses it, as a backstop).
+        {uint32_t tables=0;
+            if(BdwExecSnapshotPageCount(snapshot)>65536 || !BdwExecSnapshotTableCount(snapshot,tables) || tables>BdwPpgttMaxTables){
+                plan.release();if(!BdwExecSnapshotRelease(snapshot,false))__builtin_trap();
+                BdwNoteRefusal("execbuffer: buffer set needs more than 65536 pages or 512 page tables");return -28;
+            }}
         // A referenced buffer in a CPU-visibility transition (another process's
         // TRY_CPU_READ flushing it, or a handoff retirement) refuses GPU use
         // only while that lasts - milliseconds for a large window buffer.
