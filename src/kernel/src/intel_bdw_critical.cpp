@@ -8,6 +8,8 @@
 #include "intel_vtd_probe_policy.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_ggtt_mmio.h"
+#include "intel_bdw_ggtt_extent_mmio.h"
+#include "intel_bdw_display_flip.h"
 #include "intel_bdw_display_probe.h"
 #include "intel_bdw_forcewake_ack.h"
 #include "intel_bdw_forcewake_adapter.h"
@@ -817,6 +819,58 @@ void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,
 void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy) {
     copy={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,
         false,nullptr,token,&copy,nullptr,nullptr,nullptr,nullptr,true);
+}
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,bool retire,bool displayQuiescent) {
+    constexpr uint32_t maxPages=16;
+    const auto& r=lease.reservation;
+    if(!r.token || !r.count || r.first<65536 || r.count>maxPages*512-(r.first&511u) || SmpCurrentCpuIndex()!=0)return false;
+    const uint32_t pageCount=((r.first&511u)+r.count+511u)/512u;
+    volatile uint64_t* pages[maxPages]{};
+    for(uint32_t i=0;i<pageCount;++i)
+        pages[i]=reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+BdwDellGgttBase+(uint64_t((r.first>>9)+i)<<12));
+    auto* flush=reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwDellBar0+0x101008);
+    struct Owner {
+        uint32_t firstPage=0;uint32_t audited=0;bool valid=true,quiet=false;
+        static bool Audit(uint64_t page){
+            KernelAliasMapping identity{},direct{},current{};
+            DellI2cCriticalEvidence e{};
+            e.aliasesValid=VmmKernelPtAuditPage(page,identity,direct,current) && current.writable;
+            e.identityPresent=identity.present;e.identityMatches=identity.physical==page;e.identityPat=identity.patIndex;
+            e.directPresent=direct.present;e.directMatches=direct.physical==page;e.directPat=direct.patIndex;
+            e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==page;e.currentDirectPat=current.patIndex;
+            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(page,page,cpu) && cpu.cpu==0;
+            e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
+            return BdwGttEvidenceValid(e);
+        }
+        // Each PTE page is audited once per critical section (the page-table
+        // lock is held throughout), not on every one of ~5,700 accesses.
+        bool auditPtePage(uint32_t page,volatile uint64_t* p){
+            const uint32_t n=page-firstPage;
+            if(!valid || n>=32 || p!=reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+BdwDellGgttBase+(uint64_t(page)<<12)))return false;
+            if(!(audited&(1u<<n))){if(!Audit(BdwDellGgttBase+(uint64_t(page)<<12))){valid=false;return false;}audited|=1u<<n;}
+            return true;
+        }
+        bool owned(){return valid && SmpCurrentCpuIndex()==0;}
+        bool readable(){return valid;}
+        bool validateLease(const BdwGgttExtentLease& l){
+            return BdwGlobalGgttSpace().owns(l.reservation) && !(l.reservation.first&63u) &&
+                l.reservation.count>BdwFlipRegs::GuardPages;
+        }
+        bool quiescent(){return quiet;}
+        bool validateTakeover(const BdwGgttExtentLease&,uint64_t){return false;}
+        // These indices were invalid before the bind and no engine context
+        // references them (BCS uses its private PPGTT); the display fetches
+        // through them only after a later DSPASURF write. GFX_FLSH_CNTL posts
+        // the PTE writes, which is what i915 relies on for GGTT updates.
+        bool invalidateGpuTranslations(){return valid;}
+    } owner{r.first>>9,0,true,displayQuiescent};
+    BdwGgttExtentMmio<Owner> io(owner,lease,pages,pageCount,flush);
+    return VmmWithKernelPtCritical([&](){
+        if(!Owner::Audit(BdwDellBar0+0x101000))return false;
+        return retire?bind.Retire(io):bind.Bind(lease,io);
+    });
 }
 #endif
 void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset) {

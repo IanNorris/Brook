@@ -62,7 +62,8 @@ static void Rotation(){
     // Frame 1 into slot 1: needs a full repair from the GOP (latest==0).
     uint32_t b=c.AcquireBack();assert(b==1 && c.Latest()==0 && c.Stale(1).full);
     assert(c.AcquireBack()==0); // one acquisition at a time
-    assert(c.Commit(b,d)==1 && c.Latest()==1);
+    bool arm=false;
+    assert(c.Commit(b,d,arm) && arm && c.Latest()==1);
     assert(c.Stale(1).Empty() && c.Stale(0).count==1 && c.Stale(2).full);
     assert(!c.Armed(2,10,100) && c.Armed(1,10,100));
     assert(c.Retained(0) && c.Retained(1) && !c.Reusable(1));
@@ -73,20 +74,20 @@ static void Rotation(){
     assert(c.Front()==1 && !c.Retained(0) && c.Retained(1) && c.Poll(12,A,140,latch)==BdwFlipPoll::Idle);
     // Frame 2 into slot 2 while 1 is front; then frame 3 queued behind it.
     b=c.AcquireBack();assert(b==2);
-    assert(c.Commit(b,d)==2 && c.Armed(2,12,150));
+    assert(c.Commit(b,d,arm) && arm && c.Armed(2,12,150));
     b=c.AcquireBack();assert(b==3 && c.Stale(3).full);
-    assert(c.Commit(b,d)==0 && c.HasQueued() && c.QueuedSlot()==3); // queued, not armed
-    assert(c.TakeQueued()==0); // still armed
+    assert(c.Commit(b,d,arm) && !arm && c.HasQueued() && c.QueuedSlot()==3); // queued, not armed
+    uint32_t q=0;assert(!c.TakeQueued(q)); // still armed
     // Mailbox: a fourth frame takes the queued buffer back (front 1 and armed 2 retained).
     b=c.AcquireBack();assert(b==3 && !c.HasQueued() && c.Stale(3).Empty());
     BdwFlipDamage d2{};d2.Add({500,500,10,10});
-    assert(c.Commit(b,d2)==0 && c.HasQueued());
+    assert(c.Commit(b,d2,arm) && !arm && c.HasQueued());
     assert(c.Stale(1).count==2 && c.Stale(2).count==2); // d then d2 relative to latest 3
     assert(!c.Reusable(1) && !c.Reusable(2) && !c.Reusable(3) && c.AcquireBack()==3);
-    assert(c.Commit(3,BdwFlipDamage{})==0);
+    assert(c.Commit(3,BdwFlipDamage{},arm) && !arm);
     assert(c.Poll(13,B,160,latch)==BdwFlipPoll::Latched && latch.slot==2);
     assert(c.Reusable(1) && !c.Reusable(3)); // the queued slot is not free
-    assert(c.TakeQueued()==3 && c.AcquireBack()==0); // arm before more work
+    assert(c.TakeQueued(q) && q==3 && c.AcquireBack()==0); // arm before more work
     assert(c.Armed(3,13,170) && c.AcquireBack()==1);
     assert(c.Poll(16,B,200,latch)==BdwFlipPoll::Uncertain && c.Uncertain()); // 3 frames, wrong surface
     assert(c.AcquireBack()==0 && !c.Reusable(2));
@@ -95,16 +96,26 @@ static void SoftwareTakeover(){
     BdwFlipChain c;const uint32_t s2[]={A,B};assert(c.Configure(0,s2,2));
     BdwFlipDamage d{};d.Add({0,0,10,10});BdwFlipLatch latch{};
     assert(!c.RequestGop()); // already live: nothing to write
-    uint32_t b=c.AcquireBack();assert(c.Commit(b,d)==b && c.Armed(b,1,0));
+    bool arm=false;uint32_t b=c.AcquireBack();assert(c.Commit(b,d,arm) && arm && c.Armed(b,1,0));
     assert(c.Poll(2,A,1,latch)==BdwFlipPoll::Latched);
-    b=c.AcquireBack();assert(b==2 && c.Commit(b,d)==2 && c.Armed(2,2,2));
+    assert(!c.Retained(0)); // the GOP is released once a buffer latched
+    b=c.AcquireBack();assert(b==2 && c.Commit(b,d,arm) && arm && c.Armed(2,2,2));
     // Takeover while 2 is armed and may already have latched: retain 1, 2 and the GOP.
     assert(c.RequestGop() && c.Latest()==0 && c.Stale(1).full && c.Stale(2).full && c.Stale(0).Empty());
     assert(c.AcquireBack()==0 && c.Armed(0,2,3));
-    assert(c.Retained(0) && c.Retained(1) && c.Retained(2) && !c.Reusable(1) && !c.Reusable(2));
+    assert(c.Retained(0) && c.Retained(1) && c.Retained(2) && !c.Reusable(1) && !c.Reusable(2) && c.GopCurrent());
     assert(c.Poll(3,B,4,latch)==BdwFlipPoll::Pending);       // 2 latched first; GOP still pending
     assert(c.Poll(4,0,5,latch)==BdwFlipPoll::Latched && latch.slot==0 && c.Front()==0);
     assert(c.Reusable(1) && c.Reusable(2));
+    // Leaving flip mode through the GOP itself: it is written like a back
+    // buffer (repair from latest, then damage) once nothing scans it out.
+    b=c.AcquireBack();assert(b==1 && c.Stale(1).full && c.Commit(b,d,arm) && arm && c.Armed(1,4,6));
+    assert(c.Poll(5,A,7,latch)==BdwFlipPoll::Latched && !c.Retained(0));
+    assert(c.AcquireGop() && c.Stale(0).count==1 && !c.AcquireGop());
+    assert(c.Commit(0,d,arm) && arm && c.Latest()==0 && c.Armed(0,5,8));
+    assert(c.GopCurrent());
+    assert(c.Poll(6,0,9,latch)==BdwFlipPoll::Latched && c.Front()==0 && c.Reusable(1) && c.GopCurrent());
+    c.GopWritten();assert(c.Stale(1).full && c.Stale(2).full && c.Stale(0).Empty());
     // Abandoned copies freeze the chain.
     b=c.AcquireBack();c.Abandon(b);assert(c.Uncertain() && c.AcquireBack()==0);
 }

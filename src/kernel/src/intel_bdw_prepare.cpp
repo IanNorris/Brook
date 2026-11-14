@@ -20,6 +20,7 @@
 #include "desktop_chrome_binding.h"
 #include "desktop_frame_scenes.h"
 #include "intel_bdw_ioctl.h"
+#include "intel_bdw_scanout_target.h"
 #include "intel_bdw_ggtt_space.h"
 #include "intel_bdw_csb.h"
 #include "memory/physical_memory.h"
@@ -318,6 +319,103 @@ bool BdwPrepareBcsScanout(BdwGpuBuffer* source,uint64_t token,const BdwGopBackin
     return true;
 }
 
+#if defined(BROOK_BDW_PERSISTENT_SCANOUT_MAP) || defined(BROOK_BDW_SCANOUT_FLIP)
+// Boot-lifetime private pages for persistent scanout tables and buffers.
+// Same allocator, ownership checks and cache publication as the one-shot.
+bool BdwPrivatePageAlloc(BdwOwnedPage& out,bool zero){
+    BdwOwnedPage page{};if(!retainedAllocator.alloc(page))return false;
+    if(!page.cpu || !page.dma || (page.dma&4095) || page.dma>=(uint64_t{1}<<39) ||
+       (page.dma<0xdf800000ull && page.dma+4096>0xdd000000ull)){retainedAllocator.free(page);return false;}
+    if(zero)for(unsigned i=0;i<4096;++i)page.cpu[i]=0;
+    out=page;return true;
+}
+bool BdwPrivatePagesPublish(BdwOwnedPage* pages,unsigned count){
+    // publish() pins the CPU with interrupts disabled; keep each slice short.
+    for(unsigned done=0;done<count;){
+        const unsigned n=count-done<64?count-done:64;
+        if(!retainedAllocator.publish(pages+done,n))return false;
+        done+=n;
+    }
+    return true;
+}
+bool BdwPrivatePageOwned(const BdwOwnedPage& page){return retainedAllocator.statusPagePrivate(page);}
+// Present into a persistent target: only the batch and the renderer source
+// are mapped per present; the destination and any repair source are the
+// caller's persistent leaves. repairs come first so newer damage wins (the
+// blitter executes the batch in order).
+bool BdwPrepareBcsScanoutTarget(BdwGpuBuffer* source,uint64_t token,const BdwPpgttLeaf* leaves,uint32_t leafCount,
+        const BdwBlitRegion* repairs,uint32_t repairCount,const BdwBlitBuffer& destination,
+        const CompositorPresentRegion* regions,uint32_t count,BdwGgttReservation& reservation,BdwOwnedPage& scratch){
+    static uint32_t nonce=0x42535400;
+    if(!source || !BdwGpuBufferHandoffCompleted(source,token) || !regions || !count || count>COMPOSITOR_MAX_REGIONS ||
+       repairCount>BdwBcsTargetMaxRegions-count || (repairCount && !repairs) || !leaves || !leafCount ||
+       destination.pitchBytes!=12800 || destination.allocationBytes<uint64_t(BdwDellGopPages)*4096 ||
+       nonce==~uint32_t{0})return false;
+    uint32_t bufferPages=0;
+    const uint64_t* sourcePages=BdwGpuBufferPages(source,bufferPages);
+    const uint64_t capacity=BdwGpuBufferBytes(source);
+    if(!sourcePages || !bufferPages)return false;
+    BdwBlitRegion copies[BdwBcsTargetMaxRegions]{};
+    for(uint32_t i=0;i<repairCount;++i){
+        const auto& r=repairs[i];
+        if(r.destination.gpuAddress!=destination.gpuAddress || r.destination.allocationBytes!=destination.allocationBytes ||
+           r.destination.pitchBytes!=destination.pitchBytes)return false;
+        copies[i]=r;
+    }
+    uint64_t end=0;
+    for(uint32_t i=0;i<count;++i){
+        const auto& region=regions[i];
+        if(!region.width || !region.height || region.stride<region.width || region.stride>=8192 ||
+           region.offset>=capacity || region.offset>=uint64_t(BdwBcsOperandPages)*4096 ||
+           (region.offset&63) || region.x>=3200 || region.y>=1800 ||
+           region.width>3200-region.x || region.height>1800-region.y)return false;
+        const uint64_t bytes=(uint64_t(region.height-1)*region.stride+region.width)*4;
+        if(bytes>capacity-region.offset)return false;
+        if(region.offset+bytes>end)end=region.offset+bytes;
+        copies[repairCount+i]={{BdwBcsSourceAddress+region.offset,bytes,region.stride*4},destination,0,0,
+                               region.x,region.y,region.width,region.height};
+    }
+    const uint32_t pages=uint32_t((end+4095)/4096);
+    if(!pages || pages>bufferPages || pages>BdwBcsOperandPages)return false;
+    if(!scanoutReservation.token){
+        auto& space=BdwGlobalGgttSpace();
+        if(!space.reserve(8,scanoutReservation))return false;
+        if(scanoutReservation.first<65536 || scanoutReservation.first>65536+512-8 ||
+           !retainedAllocator.alloc(scanoutScratch)){
+            space.release(scanoutReservation);scanoutReservation={};return false;
+        }
+        for(unsigned i=0;i<4096;++i)scanoutScratch.cpu[i]=0;
+    }
+    if(!retainedAllocator.statusPagePrivate(scanoutScratch) || !retainedAllocator.publish(&scanoutScratch,1))return false;
+    for(uint32_t i=0;i<pages;++i)
+        if(sourcePages[i]==scanoutScratch.dma || sourcePages[i]>=(uint64_t{16}<<30))return false;
+    for(uint32_t i=0;i<leafCount;++i)if(leaves[i].dma==scanoutScratch.dma)return false;
+    const uint32_t mappingCount=1+pages;
+    auto* mappings=static_cast<BdwPpgttMapping*>(kmalloc(uint64_t(mappingCount)*sizeof(BdwPpgttMapping)));
+    if(!mappings)return false;
+    const bool prepared=scanoutImage.PrepareScanoutLeaves(retainedAllocator,scanoutReservation.first,scanoutReservation.token,
+        ++nonce,sourcePages,pages,leaves,leafCount,copies,repairCount+count,mappings,mappingCount,scanoutStaging);
+    kfree(mappings);
+    if(!prepared){
+        if(scanoutImage.State()==BdwOneShotState::Released)(void)scanoutImage.Recycle();
+        return false;
+    }
+    if(scanoutImage.InspectPreparedDma(retainedAllocator)!=BdwDmaSnapshotOk ||
+       !scanoutImage.DistinctPage(scanoutScratch)){
+        if(scanoutImage.ReleasePrepared(retainedAllocator))(void)scanoutImage.Recycle();
+        return false;
+    }
+    for(uint32_t i=0;i<leafCount;++i){
+        const BdwOwnedPage leaf{leaves[i].dma,reinterpret_cast<uint8_t*>(PhysToVirt(PhysicalAddress(leaves[i].dma)).raw())};
+        if(!scanoutImage.DistinctPage(leaf)){
+            if(scanoutImage.ReleasePrepared(retainedAllocator))(void)scanoutImage.Recycle();
+            return false;
+        }
+    }
+    reservation=scanoutReservation;scratch=scanoutScratch;
+    return true;
+}
+#endif
 bool BdwRunPreparedBcsScanout(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result){
     if(scratchDma!=scanoutScratch.dma || !BdwGlobalGgttSpace().owns(scanoutReservation))return false;
     result.attempted=true;
@@ -422,6 +520,25 @@ void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sle
 }
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields){
     if(OnWorkerStatsThread())workerStats.Present(full,pixels,ticks,yields);
+}
+void BdwWorkerStatsScanout(BdwWorkerScanoutEvent event){
+    if(!OnWorkerStatsThread())return;
+    switch(event){
+    case BdwWorkerScanoutEvent::TargetLegacy:workerStats.PresentTarget(0);break;
+    case BdwWorkerScanoutEvent::TargetPersistent:workerStats.PresentTarget(1);break;
+    case BdwWorkerScanoutEvent::TargetFlip:workerStats.PresentTarget(2);break;
+    case BdwWorkerScanoutEvent::FlipArmed:workerStats.FlipArmed(false);break;
+    case BdwWorkerScanoutEvent::FlipQueued:workerStats.FlipArmed(true);break;
+    case BdwWorkerScanoutEvent::FlipUncertain:workerStats.FlipUncertain();break;
+    case BdwWorkerScanoutEvent::FlipGopReturn:workerStats.FlipGopReturn();break;
+    case BdwWorkerScanoutEvent::MapHit:workerStats.PersistentMap(true,true);break;
+    case BdwWorkerScanoutEvent::MapFull:workerStats.PersistentMap(false,true);break;
+    case BdwWorkerScanoutEvent::MapFailed:workerStats.PersistentMap(false,false);break;
+    }
+}
+void BdwWorkerStatsFlipLatched(uint32_t frames,uint64_t ticks){
+    // Latches are observed by the idle poll, outside any interval: publish now.
+    if(OnWorkerStatsThread()){workerStats.FlipLatched(frames,ticks);workerStats.Flush();}
 }
 bool BdwWorkerStatsRead(BdwWorkerStats& out){return workerStats.Read(out);}
 void BdwWorkerStatsReset(){workerStats.RequestReset();}
@@ -533,9 +650,15 @@ static struct {
     uint64_t token=0;
     CompositorPresentRegion regions[COMPOSITOR_MAX_REGIONS]{};
     uint32_t count=0;
-    bool completed=false;
+    BdwScanoutStatus status=BdwScanoutStatus::Unavailable;
 } scanoutWork;
-static bool ScanoutPending(void*){return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued;}
+static bool ScanoutPending(void*){
+#if defined(BROOK_BDW_SCANOUT_FLIP)
+    // Worker thread, between jobs: observe an armed flip and arm a queued one.
+    BdwScanoutFlipPoll();
+#endif
+    return __atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutQueued;
+}
 // This runs between RCS submissions on the same BSP kernel worker. The
 // presenter holds the scene and framebuffer locks. The worker takes neither.
 static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
@@ -546,9 +669,9 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     WorkerStatsBegin(BdwWorkerPresent);
 #endif
-    scanoutWork.completed=BdwExecuteBcsScanout(scanoutWork.source,scanoutWork.token,scanoutWork.regions,scanoutWork.count);
+    scanoutWork.status=BdwExecuteBcsScanout(scanoutWork.source,scanoutWork.token,scanoutWork.regions,scanoutWork.count);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
-    if(!scanoutWork.completed && OnWorkerStatsThread())workerStats.PresentFailed();
+    if(scanoutWork.status!=BdwScanoutStatus::Completed && OnWorkerStatsThread())workerStats.PresentFailed();
 #endif
     __atomic_store_n(&scanoutWork.state,ScanoutDone,__ATOMIC_RELEASE);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -689,7 +812,7 @@ static int64_t InitApplicationWorker(){
 // offscreenMutex serializes the producer and holds the exact completed
 // source until the worker finishes. Cancellation can win only before the
 // worker claims the request.
-enum class BdwPresentCopy { Completed, Unavailable, Expired };
+enum class BdwPresentCopy { Completed, Unavailable, Expired, RepairRequired };
 static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const CompositorPresentRegion* regions,uint32_t count){
     if(!source || !token || !regions || !count || count>COMPOSITOR_MAX_REGIONS ||
        !BdwBcsScanoutEnabled() || InitApplicationWorker() ||
@@ -700,10 +823,11 @@ static BdwPresentCopy PresentOnBcs(BdwGpuBuffer* source,uint64_t token,const Com
     const auto deadline=ApicTickCount()+32;
     for(;;){
         if(__atomic_load_n(&scanoutWork.state,__ATOMIC_ACQUIRE)==ScanoutDone){
-            const bool result=scanoutWork.completed;
+            const auto result=scanoutWork.status;
             scanoutWork.source=nullptr;
             __atomic_store_n(&scanoutWork.state,ScanoutIdle,__ATOMIC_RELEASE);
-            return result?BdwPresentCopy::Completed:BdwPresentCopy::Unavailable;
+            return result==BdwScanoutStatus::Completed?BdwPresentCopy::Completed:
+                   result==BdwScanoutStatus::RepairRequired?BdwPresentCopy::RepairRequired:BdwPresentCopy::Unavailable;
         }
         if(ApicTickCount()>=deadline){
             uint32_t queued=ScanoutQueued;
@@ -881,9 +1005,19 @@ static int64_t PresentGopWrite(const WmDesktopLayers& scene,const WmDesktopLayer
     const auto admitted=base?WmDesktopLayersUseIfBothPresentable(*base,scene,&admission,reserve):
                              WmDesktopLayersUseIfPresentable(scene,&admission,reserve);
     if(admitted)return admitted;
-    const auto copied=PresentOnBcs(source,token,regions,count);
+    auto copied=PresentOnBcs(source,token,regions,count);
+#if defined(BROOK_BDW_SCANOUT_FLIP)
+    // With a kernel buffer live, a CPU copy into the GOP would be invisible.
+    if(copied==BdwPresentCopy::Unavailable && BdwScanoutFlipAwayFromGop())copied=BdwPresentCopy::RepairRequired;
+#endif
     bool touched=copied==BdwPresentCopy::Completed;
     int result=copied==BdwPresentCopy::Expired?-62:0;
+    if(copied==BdwPresentCopy::RepairRequired){
+        // A kernel flip buffer may be live, or the chain is frozen: a CPU
+        // copy into the GOP would not be what the panel shows. Fail and let
+        // the software compositor repaint the whole frame, then rearm the GOP.
+        touched=true;result=-5;
+    }
     if(copied==BdwPresentCopy::Unavailable){
         // The worker may have reached the framebuffer before reporting that
         // the accelerated path could not complete. A failing fallback

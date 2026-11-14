@@ -209,25 +209,33 @@ public:
             const uint32_t s=(latest_+n-1)%(slots_-1)+1; // round-robin after latest
             if(Reusable(s)){acquired_|=Bit(s);return s;}
         }
-        if(hasQueued_){hasQueued_=false;acquired_|=Bit(queued_);return queued_;}
+        if(hasQueued_ && queued_){hasQueued_=false;acquired_|=Bit(queued_);return queued_;}
         return 0;
     }
-    // The copy into slot retired: slot now holds latest + damage. Returns the
-    // slot to arm immediately, or 0 when it is queued behind an armed flip.
-    uint32_t Commit(uint32_t slot,const BdwFlipDamage& damage){
-        if(!slot || slot>=slots_ || uncertain_ || !(acquired_&Bit(slot)))return 0;
+    // Leaving flip mode: the GOP becomes the next target once the display
+    // has stopped reading it (it is neither front, armed nor retained).
+    bool AcquireGop(){
+        if(!slots_ || uncertain_ || acquired_ || hasToArm_ || (retained_&Bit(0)) || (hasQueued_ && !queued_))return false;
+        acquired_|=Bit(0);return true;
+    }
+    // The copy into slot retired: slot now holds latest + damage. armNow
+    // tells the caller to write DSPASURF at once; otherwise the frame is
+    // queued behind the armed flip (and replaces any older queued frame).
+    bool Commit(uint32_t slot,const BdwFlipDamage& damage,bool& armNow){
+        armNow=false;
+        if(slot>=slots_ || uncertain_ || !(acquired_&Bit(slot)))return false;
         acquired_&=~Bit(slot);
         for(uint32_t s=0;s<slots_;++s){if(s==slot)stale_[s].Clear();else stale_[s].Merge(damage);}
         latest_=slot;
-        if(hasArmed_){queued_=slot;hasQueued_=true;return 0;}
-        toArm_=slot;hasToArm_=true;return slot;
+        if(hasArmed_){queued_=slot;hasQueued_=true;return true;}
+        toArm_=slot;hasToArm_=true;armNow=true;return true;
     }
     // A copy that did not retire cleanly leaves the chain unknowable.
     void Abandon(uint32_t slot){if(slot<slots_){acquired_&=~Bit(slot);stale_[slot].SetFull();}uncertain_=true;}
     // After a latch, the queued frame (if any) becomes the one to arm.
-    uint32_t TakeQueued(){
-        if(uncertain_ || hasArmed_ || !hasQueued_ || hasToArm_)return 0;
-        hasQueued_=false;toArm_=queued_;hasToArm_=true;return toArm_;
+    bool TakeQueued(uint32_t& slot){
+        if(uncertain_ || hasArmed_ || !hasQueued_ || hasToArm_)return false;
+        hasQueued_=false;toArm_=slot=queued_;hasToArm_=true;return true;
     }
     // Software takeover: the CPU fully rewrote the GOP, which becomes latest.
     // Returns true when DSPASURF must be written (then call Armed(0,...)).
@@ -261,6 +269,11 @@ public:
         return BdwFlipPoll::Latched;
     }
     void MarkUncertain(){if(slots_)uncertain_=true;}
+    // The GOP (already latest) was written outside the chain, e.g. by the
+    // per-present BCS path after leaving flip mode: buffers lost track of it.
+    void GopWritten(){if(latest_==0)for(uint32_t s=1;s<slots_;++s)stale_[s].SetFull();}
+    // Will the panel show the newest frame from the GOP (front or armed)?
+    bool GopCurrent()const{return latest_==0 && (hasArmed_?armed_==0:front_==0);}
 };
 
 // Minimal panic/reset restore of the firmware surface. Lock-free and

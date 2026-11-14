@@ -33,6 +33,9 @@
 #include "net.h"
 #include "display.h"
 #include "display_power.h"
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+#include "intel_bdw_scanout_target.h"
+#endif
 #include "gpu_compositor.h"
 #include "gpu_quad_math.h"
 #include "frame_timing.h"
@@ -3722,7 +3725,14 @@ static void CompositorExpirePresentLease()
 static void CompositorFlipSoftware()
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+    // A kernel flip buffer may be on screen: the GOP must receive a complete
+    // frame before it is re-armed (no GPU present is in flight here).
+    const bool flipAway=!g_gopWriter && !g_presentLease.Active(ApicTickCount()) && brook::BdwScanoutFlipAwayFromGop();
+    const bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair || flipAway;
+#else
     const bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair;
+#endif
     const uint64_t tick=ApicTickCount();
     if(g_gopWriter || g_presentLease.Active(tick) || !g_physFb || !g_backBuffer ||
        (!full && g_dirtyMinY>=g_dirtyMaxY))return;
@@ -3736,6 +3746,10 @@ static void CompositorFlipSoftware()
     for(uint32_t y=minY;y<maxY;++y)
         __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),
                          g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+    // The GOP now holds the complete software frame; arm it (latched at vblank).
+    if(full && minY==0 && maxY==g_physFbHeight)brook::BdwScanoutFlipReturnToGop();
+#endif
     brook::DisplayFlush(minY,maxY);
     if(g_scanoutContainsLeasedFrame){
         ++g_softwareTakeover.count;
