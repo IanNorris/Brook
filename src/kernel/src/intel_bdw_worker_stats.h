@@ -25,7 +25,10 @@ struct BdwWorkerSpan {uint64_t count,ticks,maxTicks;};
 inline void BdwWorkerSpanAdd(BdwWorkerSpan& s,uint64_t ticks){
     ++s.count;s.ticks+=ticks;if(ticks>s.maxTicks)s.maxTicks=ticks;
 }
-struct BdwWorkerYields {uint64_t jobs,yields,breadcrumbYields,sleepTicks,buckets[BdwWorkerYieldBuckets];};
+// yields/sleepTicks: one-tick sleeps; spins/spinTicks: short interrupts-enabled
+// spin slices (BdwPollPacer). Buckets count sleeps per job, as before.
+struct BdwWorkerYields {uint64_t jobs,yields,breadcrumbYields,sleepTicks,buckets[BdwWorkerYieldBuckets];
+    uint64_t spins,breadcrumbSpins,spinTicks;};
 struct BdwWorkerFrequency {uint64_t samples,sumMhz,minMhz,maxMhz;};
 inline void BdwWorkerFrequencyAdd(BdwWorkerFrequency& f,uint64_t mhz){
     if(!f.samples || mhz<f.minMhz)f.minMhz=mhz;
@@ -98,11 +101,13 @@ public:
     BdwWorkerClass Current()const{return current_;}
     // Worker thread, between Begin and End of an RCS job.
     void Render(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                 bool frequencySampled,uint32_t issueStatus,uint32_t endStatus){
         if(current_!=BdwWorkerApplication && current_!=BdwWorkerCompositor)return;
         const unsigned c=current_==BdwWorkerCompositor?1:0;
         auto& y=local_.yields[c];
         ++y.jobs;y.yields+=yields;y.breadcrumbYields+=breadcrumbYields;y.sleepTicks+=sleepTicks;
+        y.spins+=spins;y.breadcrumbSpins+=breadcrumbSpins;y.spinTicks+=spinTicks;
         ++y.buckets[BdwWorkerYieldBucket(yields)];
         auto& f=local_.frequency[c];
         if(!frequencySampled){++f.missing;return;}
@@ -152,6 +157,7 @@ public:
 // Kernel glue (intel_bdw_prepare.cpp). Recorders are ignored unless called
 // on the application submission worker thread inside the matching interval.
 void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                          uint64_t spins,uint64_t breadcrumbSpins,uint64_t spinTicks,
                           bool frequencySampled,uint32_t issueStatus,uint32_t endStatus);
 void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields);
 bool BdwWorkerStatsRead(BdwWorkerStats& out);

@@ -26,6 +26,13 @@ public:
         bool (*servicePending)(void*)=nullptr;
         // Optional: a job failed (kind 0 skipped, 1 failed, 2 unsafe; n-th of its kind).
         void (*failure)(void*,BdwExecSnapshot*,unsigned kind,uint64_t n)=nullptr;
+        // Optional prompt wake. wakeGeneration is sampled before each Step;
+        // idle then blocks until wake has been called since that sample or
+        // its own bounded timeout expires, replacing sleep. wake is called
+        // after work is admitted and may run on any submitting thread.
+        uint64_t (*wakeGeneration)(void*)=nullptr;
+        void (*idle)(void*,uint64_t)=nullptr;
+        void (*wake)(void*)=nullptr;
     };
 private:
     BdwSubmissionQueue queue_;Hooks hooks_{};uint32_t state_=0; // fresh, starting, ready, failed
@@ -34,10 +41,17 @@ private:
     uint64_t failures_[3]{};
     static void Run(void* opaque){
         auto& self=*static_cast<BdwSubmissionWorker*>(opaque);
+        const bool prompt=self.hooks_.wakeGeneration && self.hooks_.idle;
         for(;;){
+            // Sample before Step so work admitted after Step's queue check
+            // is never slept through; at worst it costs one extra Step.
+            const uint64_t seen=prompt?self.hooks_.wakeGeneration(self.hooks_.context):0;
             const auto step=self.Step();
             if(step==BdwSubmissionStep::Recover){self.hooks_.recover(self.hooks_.context);__builtin_trap();}
-            if(step==BdwSubmissionStep::Idle)self.hooks_.sleep(self.hooks_.context);
+            if(step==BdwSubmissionStep::Idle){
+                if(prompt)self.hooks_.idle(self.hooks_.context,seen);
+                else self.hooks_.sleep(self.hooks_.context);
+            }
         }
     }
 public:
@@ -56,8 +70,12 @@ public:
     }
     int64_t Submit(BdwExecSnapshot* snapshot){
         if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)!=2)return -19;
-        return queue_.Submit(snapshot);
+        const auto result=queue_.Submit(snapshot);
+        if(!result)Wake();
+        return result;
     }
+    // Any thread: new work or service requests may be ready.
+    void Wake(){if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2 && hooks_.wake)hooks_.wake(hooks_.context);}
     BdwFence* AcquireBufferFence(BdwGpuBuffer* buffer){
         return __atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2?queue_.AcquireBufferFence(buffer):nullptr;
     }
@@ -69,7 +87,9 @@ public:
     int64_t SubmitHandoff(BdwHandoffResources& handoff,uint64_t owner,HandoffTicket ticket,
                           BdwExecSnapshot* snapshot,BdwFence* fence,uint64_t gateToken){
         if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)!=2)return -19;
-        return queue_.SubmitHandoff(handoff,owner,ticket,snapshot,fence,gateToken);
+        const auto result=queue_.SubmitHandoff(handoff,owner,ticket,snapshot,fence,gateToken);
+        if(!result)Wake();
+        return result;
     }
     int64_t CancelBlockedHandoff(BdwHandoffResources& handoff,uint64_t owner,HandoffTicket ticket){
         if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)!=2)return -19;
@@ -82,7 +102,9 @@ public:
         return __atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2 && queue_.InspectOwner(owner,out);
     }
     bool ThawOwner(uint64_t owner){
-        return __atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2 && queue_.ThawOwner(owner);
+        const bool thawed=__atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2 && queue_.ThawOwner(owner);
+        if(thawed)Wake();
+        return thawed;
     }
     bool IsFrozenOwner(uint64_t owner){
         return __atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2 && queue_.IsFrozenOwner(owner);

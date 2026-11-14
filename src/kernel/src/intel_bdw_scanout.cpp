@@ -1,6 +1,8 @@
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
+#include "intel_bdw_poll_pacer.h"
 #include "hda_dell_inventory.h"
 #include "boot_protocol/boot_protocol.h"
 #include "intel_bdw_gtt_probe.h"
@@ -53,6 +55,8 @@ uint32_t firstReleased=0;
 struct RuntimeBootOptions {
     bool execStore=false, contextWorker=false, renderWorker=false;
     bool intelNode=false, renderExperiment=false, autoBootstrap=false;
+    // Kill switch for the RCS completion spin slices (BdwPollPacer).
+    bool pollSpinDisabled=false;
 };
 RuntimeBootOptions runtimeBootOptions{};
 uint32_t* retainedRenderContext=nullptr;
@@ -580,6 +584,13 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
        pinned.count!=reservation.count || pinned.token!=reservation.token){kfree(memory);PanicWorkerStage("scratch",snapshot);}
     BdwForcewakeAdapterResult out{};BdwRenderRunResult run{};
     run.ggttClearRequested=true;run.pollYieldRequested=true;
+    uint32_t originPid=0,originContext=0;BdwExecSnapshotOrigin(snapshot,originPid,originContext);
+    // Worker-thread-only completion estimate per submitter context; it only
+    // moves where completion polling switches from ticks to spin slices.
+    static BdwCompletionPredictor<8> completionPredictor;
+    const uint64_t predictionKey=originPid?(uint64_t(originPid)<<32)|originContext:0;
+    run.pollSpinRequested=!runtimeBootOptions.pollSpinDisabled && BdwPromptWakeEnabled();
+    run.expectedCompletionTicks=completionPredictor.Predict(predictionKey);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     run.sampleFrequency=ProfilerFrameTraceActive();
     run.statsFrequency=true;
@@ -630,7 +641,8 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     const bool ok=t.contextSaved && t.resetComplete && t.patRestored && !t.uncertain && run.ggttCleared &&
         !run.pollYieldFailed && out.sequence.workComplete && out.clearDelivered && out.sequence.released &&
         LiveGpuMatches(entry) && PowerD0(entry.device);
-    uint32_t originPid=0,originContext=0;BdwExecSnapshotOrigin(snapshot,originPid,originContext);
+    if(ok && run.completionEndTicks>run.completionStartTicks)
+        completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
     const auto sample=BdwExecSnapshotBatchSample(snapshot);
     if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);KernelPanic("Broadwell worker uncertain: pid=%u context=%u batch=%lx length=%lu objects=%u pages=%u gt=%u pat=%u reset=%u restore=%u ggtt=%u port=%u yield=%u/%u sampled=%u head=%x tail=%x mode=%x ctl=%x acthd=%x ipeir=%x ipehr=%x elsp=%x current_bytes=%u current_words=%x,%x,%x,%x,%x,%x,%x,%x admission_bytes=%u admission_words=%x,%x,%x,%x,%x,%x,%x,%x",
         originPid,originContext,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotBatchLength(snapshot),BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
@@ -660,6 +672,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FrameRetired);
     BdwWorkerStatsRender(run.pollYields,run.completionPollYields,run.pollYieldTicks,
+        run.pollSpins,run.completionPollSpins,run.pollSpinTicks,
         run.statsFrequencySamples!=0,run.statsIssueStatus,run.statsEndStatus);
 #endif
     if(owner){
@@ -1037,7 +1050,13 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
             OptedIn("/etc/dell-gpu-intel-user-test"),
             OptedIn("/etc/dell-gpu-render-experiment"),
             OptedIn("/etc/dell-gpu-auto-bootstrap"),
+            OptedIn("/etc/dell-gpu-no-poll-spin"),
         };
+#endif
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // M4a prompt wakeups stay off unless explicitly opted in at boot or
+        // enabled later with `gpu wakeups on`.
+        if(OptedIn("/etc/dell-gpu-prompt-wake"))BdwPromptWakeSet(true);
 #endif
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");

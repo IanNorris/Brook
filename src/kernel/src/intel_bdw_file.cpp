@@ -70,9 +70,12 @@ bool BdwGpuFileDestroySync(BdwGpuFile* f,uint32_t id){
     if(!s)return false;BdwGpuSyncUnref(s);return true;
 }
 BdwFence* BdwGpuSyncAcquire(BdwGpuSync* s){return s?s->timeline.Find(0):nullptr;}
-bool BdwGpuSyncReplace(BdwGpuSync* s,BdwFence* f){return s && s->timeline.Replace(f);}
+// Publication can satisfy WAIT_FOR_SUBMIT waits and transfer waits.
+bool BdwGpuSyncReplace(BdwGpuSync* s,BdwFence* f){
+    const bool ok=s && s->timeline.Replace(f);if(ok)BdwGpuEventSignal(BdwGpuEvent::Retire);return ok;}
 BdwFence* BdwGpuSyncPrepareTimeline(BdwGpuSync* s,uint64_t point,BdwFence* dependency){return s?s->timeline.Prepare(point,dependency):nullptr;}
-bool BdwGpuSyncPublishTimeline(BdwGpuSync* s,BdwFence* fence){return s && s->timeline.Publish(fence);}
+bool BdwGpuSyncPublishTimeline(BdwGpuSync* s,BdwFence* fence){
+    const bool ok=s && s->timeline.Publish(fence);if(ok)BdwGpuEventSignal(BdwGpuEvent::Retire);return ok;}
 BdwFence* BdwGpuSyncFindTimeline(BdwGpuSync* s,uint64_t point){return s?s->timeline.Find(point):nullptr;}
 uint64_t BdwGpuSyncQueryTimeline(BdwGpuSync* s,bool lastSubmitted){return s?s->timeline.Query(lastSubmitted):0;}
 void BdwGpuContextRef(BdwGpuContext* c){if(c)__atomic_fetch_add(&c->references,1,__ATOMIC_RELAXED);}

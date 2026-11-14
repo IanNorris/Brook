@@ -6,6 +6,8 @@
 #include "sched_decision_trace.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
+#include "intel_bdw_prompt_wake.h"
+#include "intel_bdw_wait_queue.h"
 #include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
@@ -5112,6 +5114,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
+            "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -5677,6 +5680,26 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
     }
+    else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // M4a kill switch: off (the boot default) keeps 1 ms polling for every
+        // GPU wait and disables RCS completion spin slices.
+        if(NetStrEq(cmd,"gpu wakeups on"))BdwPromptWakeSet(true);
+        else if(NetStrEq(cmd,"gpu wakeups off"))BdwPromptWakeSet(false);
+        const auto& w=BdwPromptWake();
+        BridgeReply r;r.text("{\"enabled\":");r.text(BdwPromptWakeEnabled()?"true":"false");
+        r.text(",");r.field("armed",__atomic_load_n(&w.armed,__ATOMIC_RELAXED));
+        r.text(",");r.field("stale",__atomic_load_n(&w.stale,__ATOMIC_RELAXED));
+        r.text(",");r.field("refused_while_off",__atomic_load_n(&w.refused,__ATOMIC_RELAXED));
+        r.text(",");r.field("if_restores",__atomic_load_n(&w.ifRestores,__ATOMIC_RELAXED));
+        r.text(",");r.field("work_generation",BdwGpuEventGeneration(BdwGpuEvent::Work));
+        r.text(",");r.field("retire_generation",BdwGpuEventGeneration(BdwGpuEvent::Retire));
+        r.text(",\"scope\":\"M4a prompt GPU wakeups; off = pre-M4a 1 ms polling (boot default unless /etc/dell-gpu-prompt-wake); on = wait-registry wakes plus RCS completion spin slices (spins also need no /etc/dell-gpu-no-poll-spin); new waits follow the switch immediately, armed waits end at their one-tick timeout; if_restores counts worker waits that returned with IF=0 and were re-enabled (should stay 0 outside spin slices)\"}\n");
+        r.send();
+#else
+        DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
     else if(NetStrEq(cmd,"gpu worker stats") || NetStrEq(cmd,"gpu worker stats reset")) {
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         if(NetStrEq(cmd,"gpu worker stats reset")){
@@ -5708,7 +5731,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<3;++i){const auto& y=s.yields[i];
             if(i)r.text(",");r.text("\"");r.text(jobs[i]);r.text("\":{");r.field("jobs",y.jobs);
             r.text(",");r.field("yields",y.yields);r.text(",");r.field("breadcrumb_yields",y.breadcrumbYields);
-            r.text(",");r.field("sleep_us",us(y.sleepTicks));r.text(",\"hist\":[");
+            r.text(",");r.field("sleep_us",us(y.sleepTicks));
+            r.text(",");r.field("spins",y.spins);r.text(",");r.field("breadcrumb_spins",y.breadcrumbSpins);
+            r.text(",");r.field("spin_us",us(y.spinTicks));r.text(",\"hist\":[");
             for(unsigned b=0;b<BdwWorkerYieldBuckets;++b){if(b)r.text(",");r.number(y.buckets[b]);}
             r.text("]}");}
         r.text("},\"mhz\":{");
@@ -5729,7 +5754,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(s.flipLatchFrames[i]);}
         r.text("],");r.field("map_hits",s.mapHits);r.text(",");r.field("map_full",s.mapFull);
         r.text(",");r.field("map_failed",s.mapFailed);
-        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; sleep_us includes unlock, sleep and re-audit; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
+        r.text("},\"scope\":\"gpu-submit worker since reset; scanout targets=[gop per-present map,gop persistent map,flip buffer] presents, latch_us=[avg,max] from DSPASURF write to first observed DSPASURFLIVE (about 1 ms poll), latch_frames=vblanks 1,2,3,>3, missed_vblanks=vblanks beyond the first; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; yields/sleep_us count one-tick sleeps and include unlock, sleep and re-audit; spins/spin_us count interrupts-enabled spin slices near predicted completion, also including unlock and re-audit; hist counts sleeps; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif

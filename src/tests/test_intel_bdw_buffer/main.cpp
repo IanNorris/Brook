@@ -1525,6 +1525,25 @@ int main(){
         assert(failedWorker.Submit(rejected)==-19 && BdwExecSnapshotRelease(rejected,false));
     }
     {
+        // Prompt wake: admitted work, a thaw and an explicit Wake signal the
+        // worker; rejected work and a worker that never started do not.
+        static unsigned wakes=0;wakes=0;
+        FakeWorker host;BdwSubmissionWorker worker;auto hooks=host.Hooks();
+        hooks.wakeGeneration=[](void*){return uint64_t{wakes};};
+        hooks.idle=[](void*,uint64_t){};hooks.wake=[](void*){++wakes;};
+        worker.Wake();assert(wakes==0);
+        assert(worker.Start(hooks,0,true));
+        auto* unowned=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(unowned);
+        assert(worker.Submit(unowned)==-22 && wakes==0 && BdwExecSnapshotRelease(unowned,false));
+        auto* owned=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(owned);
+        BdwExecSnapshotSetOrigin(owned,7,0,41);assert(BdwExecSnapshotOwner(owned)==41);
+        assert(worker.Submit(owned)==0 && wakes==1);
+        BdwExecOwnerWork work{};assert(worker.FreezeOwner(41,work) && wakes==1);
+        assert(worker.ThawOwner(41) && wakes==2 && !worker.ThawOwner(41) && wakes==2);
+        worker.Wake();assert(wakes==3);
+        assert(worker.Step()==BdwSubmissionStep::Finished && host.executions==1 && worker.Step()==BdwSubmissionStep::Idle);
+    }
+    {
         FakeWorker host;BdwSubmissionWorker worker;auto* wait=BdwFenceCreate();auto* done=BdwFenceCreate();
         auto* snapshot=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(wait && done && snapshot);
         assert(BdwExecSnapshotAddWaitFence(snapshot,wait) && BdwExecSnapshotAddWaitFence(snapshot,wait));
