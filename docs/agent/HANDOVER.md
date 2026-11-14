@@ -33,12 +33,21 @@ Target: at least 60 **displayed** frames/s for the yquake2 GL3 matched demo (128
 - **The binding limit is the presentation path** (compositor cost, serialization and copy to scanout), not game rendering.
 - **What a normal launch uses:** the installed launcher still selects stock Mesa, at about 26–33 swaps/s. The patched Iris build and 8-buffer setting are opt-in (`brook-iris-run`, `BROOK_MESA_WAYLAND_BUFFERS=8`).
 
-### In progress (14 November)
+### Review outcome and plan (14 November)
 
-- Two independent code reviews, of the compositor/presentation path and of the Intel submission/memory path. Each will also request targeted Dell measurements.
-- The reviews and measurements then go to a Fable reviewer for a combined verdict, and from that to a strategy for 60+ fps.
-- No code changes until that strategy is agreed with Ian.
-- **Measurement rule:** count distinct displayed frames (direct commits), not only completed swaps.
+Two independent code reviews (compositor and driver), Dell measurements on the gen 355 baseline, and a Fable senior review are in `build/review-20261114/`. Start with `fable-verdict.md`.
+
+- **Dominant costs per displayed frame:** the composite pass for game-damaged frames (15–30 ms), the BCS copy to GOP (about 7 ms inferred), and the game's own job (6.7 ms, about 10× Linux GPU time). Timer-driven pacing in waylandd wastes most game frames when the client has 8 buffers.
+- **Per-job driver setup and reset is small** (about 0.25 ms) and stays for now.
+- **Proposed milestones:**
+  - M0: counters for distinct displayed frames, BCS stage timing and worker busy time;
+  - M1: rewrite composition as per-layer quads;
+  - M2: present-driven pacing in waylandd;
+  - M4a: wake instead of 1 ms sleeps;
+  - M3: page flip instead of the BCS copy;
+  - M5 (deferred): persistent contexts and residency.
+- **Before any code milestone:** a scripted, reproducible Dell image build from `main`.
+- **Rules:** awaiting Ian's go-ahead. Code changes go on a branch. Count displayed frames, not only swaps.
 
 ## Dell state (14 November)
 
