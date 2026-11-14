@@ -1,3 +1,5 @@
+#include "boot_timing.h"
+#include "boot_timing_runtime.h"
 #include "chrome_material.h"
 #include "fw_cfg.h"
 #include "audio.h"

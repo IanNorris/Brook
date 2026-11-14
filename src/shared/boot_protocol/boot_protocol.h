@@ -6,7 +6,7 @@ namespace brook
 {
 
 constexpr uint32_t BootProtocolMagic   = 0xB007B007u;
-constexpr uint32_t BootProtocolVersion = 5u;
+constexpr uint32_t BootProtocolVersion = 6u;
 
 // Our own memory type enum - does NOT use UEFI types (kernel has no UEFI dependency)
 enum class MemoryType : uint32_t
@@ -85,6 +85,24 @@ struct AcpiInfo
     uint64_t rsdpPhysical;      // Physical address of ACPI 2.0 RSDP
 };
 
+constexpr uint32_t BootTimingValid      = 1u << 0; // stamps below were taken
+constexpr uint32_t BootTimingWaitRan    = 1u << 1; // the boot-menu wait ran
+constexpr uint32_t BootTimingWaitKey    = 1u << 2; // a recovery key ended the wait
+constexpr uint32_t BootTimingRecovery   = 1u << 3; // recovery pair selected (key or guard)
+
+struct BootTiming
+{
+    uint64_t loaderEntryTsc;     // first instruction of EfiMain
+    uint64_t waitStartTsc;       // boot-menu wait start (0 when it did not run)
+    uint64_t waitEndTsc;         // boot-menu wait end   (0 when it did not run)
+    uint64_t exitBootServicesTsc;// immediately before ExitBootServices
+    uint64_t kernelJumpTsc;      // immediately before the jump to the kernel
+    uint32_t flags;              // BootTiming* bits
+    uint32_t waitConfiguredMs;   // configured wait (0 when the menu is disabled)
+    uint32_t waitKeyCount;       // keystrokes ConIn returned during the wait
+    uint32_t waitLastKey;        // last one: ScanCode | UnicodeChar << 16
+};
+
 struct BootProtocol
 {
     uint32_t magic;              // Must equal BootProtocolMagic
@@ -117,6 +135,11 @@ struct BootProtocol
     uint64_t efiRuntimeMtrrFingerprint;
     uint32_t efiRuntimeMtrrValid;
     uint32_t efiRuntimeMtrrReserved;
+    // Version 6: raw boot-CPU TSC values taken by the loader. A version-5
+    // handoff ends above; consumers must check version before reading these.
+    // A zero stamp was not taken. The kernel converts them with its own
+    // calibrated TSC frequency; the loader performs no conversion.
+    BootTiming timing;
 };
 
 constexpr bool BootEfiRuntimeCodeContains(const MemoryDescriptor* map, uint32_t count, uint64_t address)

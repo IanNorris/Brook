@@ -58,6 +58,8 @@ extern "C" uint8_t ApicGetId();
 // Return the calibrated LAPIC timer ticks per millisecond.
 // Valid only after ApicInit().
 uint32_t ApicGetTimerTicksPerMs();
+// Boot CPU TSC rate (median of the LAPIC calibration PIT windows), 0 if unknown.
+uint32_t ApicGetTscKhz();
 
 // Adjust LAPIC periodic timer rate. `observedTicksPerSec` is ISR increments
 // observed in the last real wall-clock second (measured against CMOS RTC).
