@@ -70,6 +70,17 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **Renderer counters over 14 s:** 45.0 distinct displayed frames/s (every swap shown). Intervals p50 19.5, p90 29.8, p99 44.6 ms. Game-frame submit→fence 9 ms, prepare 3 ms.
 - **The remaining jitter** is the 33–50 ms tail (serial one-frame pipeline plus BCS copy), so M3 and pipelining are next.
 
+**Clock finding (gen 365, `dell-batch1-20261114`, 14 Nov night):**
+- **On the Dell, CLOCK_MONOTONIC/REALTIME count LAPIC ticks** (no kvmclock).
+- **`bridge hardware clock-compare`:**
+  - idle: monotonic = TSC = HDA = host within 0.2% over 20 s;
+  - **under the Quake benchmark, monotonic ran 11.5% slow** (8.05 s vs host 9.09 s), while TSC and HDA tracked the host.
+- **Consequences:**
+  - browser A/V drift (Chromium audio slow, Firefox fast);
+  - **all clock_gettime-based fps figures above are inflated by ~10% under load.**
+- **Fix in progress (`work/tsc-clock`):** TSC-backed time. Re-baseline after it lands.
+- **Boot timing on the Dell (old loader):** firmware 4.27 s (FPDT), kernel 2.79 s; loader and menu need the new bootloader, a supervised step pending with Ian.
+
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
 - Eliminate CPU copies in the pipeline.
