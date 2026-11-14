@@ -51,19 +51,17 @@ namespace brook {
 uint16_t PchWatchdogTestRead16(uint16_t port);
 uint32_t PchWatchdogTestRead32(uint16_t port);
 #endif
-namespace {
-using Reply=BridgeReplyBuffer<DebugChannelSend>;
-
-void HardwarePayloadId(Reply& reply) {
-    // Same newline-terminated initrd marker used by HWSTATUS.ELF. Treat a
-    // missing or malformed marker as unknown rather than a build identity.
-    char id[96]{};
+// Same newline-terminated initrd marker used by HWSTATUS.ELF. A missing or
+// malformed marker reads as false (unknown) rather than a build identity.
+bool HardwarePayloadIdRead(char* id,uint32_t capacity) {
+    if(!id || capacity<2)return false;
+    id[0]=0;
     bool valid=false;
     if(auto* file=VfsOpen("/etc/hardware-payload-id",VFS_O_STREAM)) {
         VnodeStat stat{};
         uint64_t offset=0;
         if(!VfsStat(file,&stat) && !stat.isDir && !stat.isSymlink &&
-           stat.size>=2 && stat.size<=sizeof(id) &&
+           stat.size>=2 && stat.size<=capacity &&
            VfsRead(file,id,stat.size,&offset)==static_cast<int>(stat.size) &&
            id[stat.size-1]=='\n') {
             valid=true;
@@ -78,6 +76,15 @@ void HardwarePayloadId(Reply& reply) {
         }
         VfsRelease(file);
     }
+    if(!valid)id[0]=0;
+    return valid;
+}
+namespace {
+using Reply=BridgeReplyBuffer<DebugChannelSend>;
+
+void HardwarePayloadId(Reply& reply) {
+    char id[96]{};
+    const bool valid=HardwarePayloadIdRead(id,sizeof(id));
     reply.text(",\"payload_id\":");
     if(valid)reply.quoted(id);else reply.text("null");
 }
