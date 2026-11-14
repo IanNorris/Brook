@@ -63,12 +63,16 @@ def main():
                 '--skip-bootstrap', '--display', display]
     log = brook / 'steam-launcher.log'
     with log.open('a') as output:
-        # -nolock: the X server creates its lock with link(), which Brook's
-        # volatile /tmp does not support ("Linking lock file ... Operation not
-        # supported"). The launcher's own X14 existence check above stands in.
-        server = subprocess.Popen([str(xephyr), display, '-screen', '1280x800',
-                                   '-resizeable', '-nolisten', 'tcp', '-nolock'],
-                                  env=env, stdout=output, stderr=output)
+        # The X server's lock is published with link(), which Brook's volatile
+        # /tmp does not support ("Linking lock file ... Operation not
+        # supported"), and -nolock is root-only. Like waylandd's Xwayland,
+        # pass -displayfd, which skips the lock file; the launcher's own X14
+        # existence check above stands in for it.
+        ready_read, ready_write = os.pipe()
+        server = subprocess.Popen([str(xephyr), display, '-displayfd', str(ready_write),
+                                   '-screen', '1280x800', '-resizeable', '-nolisten', 'tcp'],
+                                  env=env, stdout=output, stderr=output, pass_fds=(ready_write,))
+        os.close(ready_write)  # keep ready_read open so the server's write succeeds
         try:
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline and server.poll() is None:
@@ -82,6 +86,7 @@ def main():
                         return subprocess.call(command, env=child_env, stdout=output, stderr=output)
             raise RuntimeError(f'Steam display did not start; see {log}')
         finally:
+            os.close(ready_read)
             if server.poll() is None:
                 server.terminate()
                 try:
