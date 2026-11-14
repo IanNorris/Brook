@@ -16,6 +16,10 @@ constexpr unsigned BdwWorkerYieldBuckets=6; // 0, 1, 2, 3-4, 5-8, >8
 inline unsigned BdwWorkerYieldBucket(uint64_t yields){return yields<3?unsigned(yields):yields<=4?3u:yields<=8?4u:5u;}
 // Broadwell RPSTAT1 CAGF (bits 13:7), in 50 MHz units, as i915 decodes it.
 inline uint64_t BdwRpstatMhz(uint32_t status){return uint64_t((status>>7)&0x7f)*50;}
+// Last CAGF (MHz) a render job sampled at its breadcrumb, and a sequence that
+// advances with every sample, for the thermal sampler's GPU readout.
+inline uint32_t& BdwLastGpuMhz(){static uint32_t v=0;return v;}
+inline uint64_t& BdwGpuMhzSequence(){static uint64_t v=0;return v;}
 inline uint64_t BdwWorkerTicksToUs(uint64_t ticks,uint64_t khz){
     if(!khz)return 0;
     return ticks<=~uint64_t{0}/1000?ticks*1000/khz:ticks/khz*1000;
@@ -113,6 +117,8 @@ public:
         if(!frequencySampled){++f.missing;return;}
         const auto issue=BdwRpstatMhz(issueStatus),end=BdwRpstatMhz(endStatus);
         BdwWorkerFrequencyAdd(f.issue,issue);BdwWorkerFrequencyAdd(f.end,end);
+        __atomic_store_n(&BdwLastGpuMhz(),uint32_t(end),__ATOMIC_RELAXED);
+        __atomic_add_fetch(&BdwGpuMhzSequence(),1,__ATOMIC_RELEASE);
         if(end>issue)++f.rising;
     }
     // Worker thread, between Begin and End of a BCS present.

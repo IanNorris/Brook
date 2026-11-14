@@ -21,7 +21,7 @@ static GtkWidget *dark_switch,*opacity_slider,*opacity_value,*blur_choice,*perfo
 static BrookGtkAppearance *appearance_style;
 static uint32_t selected_appearance=BROOK_APPEARANCE_DEFAULT;
 static uint32_t selected_metrics=BROOK_TASKBAR_DEFAULT;
-static GtkWidget *metric_choices[6];
+static GtkWidget *metric_choices[7];
 static GtkWidget *technical_details;
 static char *settings_path;
 static unsigned selected;
@@ -178,7 +178,7 @@ static void apply(GtkButton *button,gpointer unused) {
     long previous_appearance=syscall(BROOK_SYS_WM_APPEARANCE,0L,0L);
     long previous_metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,0L,0L);
     selected_metrics=0;
-    for(unsigned i=0;i<6;++i)if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(metric_choices[i])))selected_metrics|=1u<<i;
+    for(unsigned i=0;i<7;++i)if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(metric_choices[i])))selected_metrics|=1u<<i;
     if(previous<0||previous_scale<0||previous_appearance<0||previous_metrics<0){gtk_label_set_text(GTK_LABEL(status),"Appearance controls need a matching Brook kernel.");return;}
     int applied=syscall(0xB02L,1L,(long)selected)==0 && syscall(0xB04L,1L,(long)selected_scale)==0 &&
         syscall(BROOK_SYS_WM_APPEARANCE,1L,(long)selected_appearance)==0 &&
@@ -323,8 +323,8 @@ int main(int argc,char **argv) {
 
     GtkWidget *metrics_panel=gtk_expander_new("Taskbar statistics");
     GtkWidget *metrics_grid=gtk_grid_new();gtk_grid_set_column_spacing(GTK_GRID(metrics_grid),12);gtk_grid_set_row_spacing(GTK_GRID(metrics_grid),6);
-    const char *metric_names[]={"CPU usage","Memory usage","Disk throughput","Network throughput","Compositor frames","Focused app frames"};
-    for(unsigned i=0;i<6;++i){
+    const char *metric_names[]={"CPU usage","Memory usage","Disk throughput","Network throughput","Compositor frames","Focused app frames","Temperature and power"};
+    for(unsigned i=0;i<7;++i){
         metric_choices[i]=gtk_check_button_new_with_label(metric_names[i]);
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(metric_choices[i]),(selected_metrics&(1u<<i))!=0);
         gtk_grid_attach(GTK_GRID(metrics_grid),metric_choices[i],i%2,i/2,1,1);

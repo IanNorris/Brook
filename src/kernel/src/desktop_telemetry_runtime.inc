@@ -3,6 +3,10 @@ static DesktopIntervals<> g_desktopCadence,g_appCadence;
 static DesktopTelemetry g_desktopStats{};
 static uint64_t g_metricsBusy=0,g_metricsIdle=0,g_metricsRead=0,g_metricsWrite=0,g_metricsDown=0,g_metricsUp=0;
 static uint64_t g_metricsAppIdentity=0,g_metricsAppGeneration=0;
+// App cadence is fed by the compositor tick (CPU-path publications) and by
+// the renderer's GPU-source frame reports, on different threads.
+static SpinLock g_appCadenceLock;
+static DesktopClientFrameFilter g_appClientFrames;
 static void SampleDesktopMetrics(uint64_t now) {
     if(g_desktopStats.tick && now-g_desktopStats.tick<500)return;
     uint64_t busy=0,idle=0;
@@ -27,13 +31,28 @@ void WmObserveDesktopTick(uint64_t now) {
     g_desktopCadence.Record(now);SampleDesktopMetrics(now);
     Window* w=WmGetWindow(WmGetFocusedWindow());
     const uint64_t identity=w && w->visible && !w->minimized?w->creationIdentity:0;
-    if(identity!=g_metricsAppIdentity){g_metricsAppIdentity=identity;g_appCadence.Reset();g_metricsAppGeneration=0;}
-    if(!identity)return;
-    const bool dirty=!w->vfb && !w->externalCaptured && w->proc && w->proc->fbDirty;
-    if(dirty || w->publishedGeneration!=g_metricsAppGeneration) {
-        // Observed client publication cadence; not the app's internal CPU/GPU cost.
-        g_appCadence.Record(now);g_metricsAppGeneration=w->publishedGeneration;
+    SpinLockAcquire(&g_appCadenceLock);
+    if(identity!=__atomic_load_n(&g_metricsAppIdentity,__ATOMIC_RELAXED)){
+        __atomic_store_n(&g_metricsAppIdentity,identity,__ATOMIC_RELAXED);
+        g_appCadence.Reset();g_metricsAppGeneration=0;g_appClientFrames.Reset(identity);
     }
+    if(identity){
+        const bool dirty=!w->vfb && !w->externalCaptured && w->proc && w->proc->fbDirty;
+        if(dirty || w->publishedGeneration!=g_metricsAppGeneration) {
+            // Observed client publication cadence; not the app's internal CPU/GPU cost.
+            g_appCadence.Record(now);g_metricsAppGeneration=w->publishedGeneration;
+        }
+    }
+    SpinLockRelease(&g_appCadenceLock);
+}
+// Renderer report: a GPU-source frame (window identity, client commit) was
+// composited. Counted once per new commit for the focused window, so GPU
+// clients (yquake, Chromium/ANGLE, any dmabuf producer) show APP cadence.
+void WmNoteClientFrame(uint64_t identity,uint64_t commit) {
+    const uint64_t now=ApicTickCount();
+    SpinLockAcquire(&g_appCadenceLock);
+    if(g_appClientFrames.Accept(__atomic_load_n(&g_metricsAppIdentity,__ATOMIC_RELAXED),identity,commit))g_appCadence.Record(now);
+    SpinLockRelease(&g_appCadenceLock);
 }
 static void DesktopNumber(char* out,unsigned value) {
     char rev[12];unsigned n=0;do{rev[n++]='0'+value%10;value/=10;}while(value && n<sizeof(rev));
@@ -69,6 +88,31 @@ static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint3
         char value[12];DesktopNumber(value,percent);size_t n=strlen(value);value[n]='%';value[n+1]=0;
         text(r.x+WmMetric(3),bottom,value,p.taskText);return;
     }
+    if(kind==6){
+        // Package temperature graph (1 s points, coloured against TjMax) and
+        // the current temperature / package power. Changes at most once a
+        // second, so it never forces per-frame overlay recaptures.
+        ThermalSnapshot snap{};
+        if(!ThermalReadSnapshot(snap) || snap.latest.pkgC<0){text(r.x,top,"TEMP",p.secondaryText);text(r.x,bottom,"n/a",p.mutedText);return;}
+        static ThermalSample points[ThermalGraphHistory];
+        const uint32_t n=ThermalReadGraph(points,ThermalGraphHistory);
+        const ThermalSample& now1s=n?points[n-1]:snap.latest;
+        text(r.x,top,"TEMP",p.secondaryText);
+        const int gx=r.x+WmMetric(44),gw=r.w-WmMetric(44),gh=line-2;
+        if(gw>0){
+            const unsigned shown=n<unsigned(gw)?n:unsigned(gw);
+            const int floorC=40,ceilC=int(snap.tjmax?snap.tjmax:100);
+            for(unsigned i=0;i<shown;++i){const auto& v=points[n-shown+i];if(v.pkgC<0)continue;
+                int t=v.pkgC<floorC?floorC:v.pkgC>ceilC?ceilC:v.pkgC;
+                int bar=(t-floorC)*gh/(ceilC-floorC);if(bar<1)bar=1;
+                WmFillRect(pixels,stride,sw,sh,gx+gw-int(shown)+int(i),top+gh-bar,1,bar,ThermalColour(v.pkgC,snap.tjmax)|0xff000000u);}
+        }
+        char value[48]{};unsigned used=0;
+        auto append=[&](const char* v){while(*v && used+1<sizeof(value))value[used++]=*v++;value[used]=0;};
+        char num[12];DesktopNumber(num,unsigned(now1s.pkgC));append(num);append("C");
+        if(snap.rapl){append("  ");DesktopNumber(num,now1s.pkgMw/1000);append(num);append(".");DesktopNumber(num,(now1s.pkgMw/100)%10);append(num);append("W");}
+        text(r.x,bottom,value,ThermalColour(now1s.pkgC,snap.tjmax));return;
+    }
     if(kind<4){
         char first[20],second[20],number[12];const bool net=kind==3;
         WmStrCopy(first,net?"D ":"R ",sizeof(first));DesktopRate(number,net?g_desktopStats.downBytesPerSecond:g_desktopStats.readBytesPerSecond);
@@ -77,7 +121,9 @@ static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint3
         WmStrCopy(second+2,number,sizeof(second)-2);n=strlen(second);WmStrCopy(second+n," MB/s",sizeof(second)-n);
         text(r.x,top,first,p.secondaryText);text(r.x,bottom,second,p.secondaryText);return;
     }
-    const auto& history=kind==4?g_desktopCadence:g_appCadence;
+    static DesktopIntervals<> appCopy;
+    if(kind==5){SpinLockAcquire(&g_appCadenceLock);appCopy=g_appCadence;SpinLockRelease(&g_appCadenceLock);}
+    const auto& history=kind==4?g_desktopCadence:appCopy;
     const auto summary=history.Read(now);
     text(r.x,top,kind==4?"COMP":"APP",p.secondaryText);
     DrawMetricGraph(pixels,stride,sw,sh,r.x+WmMetric(48),top,r.w-WmMetric(48),line-2,history,now);
@@ -167,4 +213,17 @@ void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t s
     DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores | ",sizeof(row)-n);n=strlen(row);DesktopNumber(number,PmmGetFreePageCount()*4096/1048576);WmStrCopy(row+n,number,sizeof(row)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(row)-n);text(row,p.secondaryText);
     text(CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",p.secondaryText);
     WmStrCopy(row,"Build ",sizeof(row));WmStrCopy(row+6,BuildGitHash(),sizeof(row)-6);text(row,p.mutedText);
+}
+
+// Tray tooltip for the TEMP metric (fits the 48-byte tooltip buffer).
+static void DesktopThermalTooltip(char (&text)[48]) {
+    ThermalSnapshot snap{};
+    if(!ThermalReadSnapshot(snap) || snap.latest.pkgC<0){WmStrCopy(text,"Temperature: unavailable",sizeof(text));return;}
+    const auto& v=snap.latest;unsigned used=0;text[0]=0;
+    auto append=[&](const char* s){while(*s && used+1<sizeof(text))text[used++]=*s++;text[used]=0;};
+    char n[12];
+    append("Pkg ");DesktopNumber(n,unsigned(v.pkgC));append(n);append("C max ");DesktopNumber(n,unsigned(snap.maxima.pkgC<0?0:snap.maxima.pkgC));append(n);append("C");
+    if(snap.rapl){append(" ");DesktopNumber(n,v.pkgMw/1000);append(n);append(".");DesktopNumber(n,(v.pkgMw/100)%10);append(n);append("W");}
+    append(" CPU ");DesktopNumber(n,v.cpuMhz);append(n);
+    append(" GPU ");DesktopNumber(n,v.gpuMhz);append(n);append("MHz");
 }
