@@ -5739,10 +5739,23 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         // Zero-copy scanout of renderer images (docs/bdw-zero-copy-scanout.md).
         // RAM-only runtime gate: every boot starts with the BCS copy.
         const char* note="";bool ok=true;
+        if(NetStrEq(cmd,"gpu zerocopy verify")){
+            BdwZeroCopyVerify v{};const bool done=BdwZeroCopyVerifyFront(v);
+            BridgeReply r;r.text("{\"ok\":");r.text(done?"true":"false");r.text(",\"result\":");r.quoted(v.result?v.result:"");
+            r.text(",");r.field("front",v.front);r.text(",");r.field("sequence",v.sequence);
+            r.text(",\"crc_before\":[");r.number(v.before[0]);r.text(",");r.number(v.before[1]);
+            r.text("],\"crc_after_flush\":[");r.number(v.after[0]);r.text(",");r.number(v.after[1]);
+            r.text("],");r.field("flushed_pages",v.flushedPages);
+            r.text(",\"uncached_render\":");r.text(BdwZeroCopyUncachedRender()?"true":"false");
+            r.text(",\"scope\":\"pipe A CRC (primary plane) of the front image, twice before and twice after a CLFLUSH of every line of it; a change means the display was scanning stale memory. Keep the desktop idle.\"}\n");
+            r.send();return;
+        }
         if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);
         else if(NetStrEq(cmd,"gpu zerocopy off")){BdwZeroCopyDisarm();note="leaving at the next present";}
-        else if(!NetStrEq(cmd,"gpu zerocopy status")){
-            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status\"}\n");return;
+        else if(NetStrEq(cmd,"gpu zerocopy uc on") || NetStrEq(cmd,"gpu zerocopy uc off")){
+            BdwZeroCopySetUncachedRender(NetStrEq(cmd,"gpu zerocopy uc on"));note="render jobs writing images lease PPAT slot 3 UC: applied";
+        }else if(!NetStrEq(cmd,"gpu zerocopy status")){
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|uc on|uc off\"}\n");return;
         }
         BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
         BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
@@ -5757,6 +5770,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("front",z.front);r.text(",");r.field("armed",z.armed);r.text(",");r.field("queued",z.queued);
         r.text(",");r.field("sequence",z.sequence);r.text(",");r.field("setup_us",z.setupUs);
         r.text(",");r.field("gop_returns",z.gopReturns);
+        r.text(",\"uncached_render\":");r.text(z.uncachedRender?"true":"false");
+        r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
         r.text("],\"ages\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.ages[i]);}
         const auto& st=z.stats;

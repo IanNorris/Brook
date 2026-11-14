@@ -1243,8 +1243,21 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     uint64_t fullWaitNs=0;unsigned fullWaits=0;
     unsigned frames=0,partialFrames=0,retries=0,unsupportedRetries=0,idleBusyRetries=0,active=0,maxActive=0;uint64_t previous=0,maxInterval=0,failureStart=0;unsigned gaps=0;
     uint64_t idleUntil=0;unsigned idlePolls=0;long waitedTicket=0;
+    uint64_t stopSince=0;
     while((!g_asyncStop && (!limit || frames<limit)) || active){
         stats_tick(0);
+        /* A stop request drains in-flight frames, but only for a bounded
+         * time: a present the kernel never completes must not hold a
+         * checked shutdown. Leaving without destroying anything is the
+         * same as the tested crash path; the kernel quarantines and
+         * releases the owner's GPU work on exit. */
+        if(g_asyncStop && active){
+            const uint64_t now=monotonic_ns();if(!stopSince)stopSince=now;
+            if(desktop_stop_drain_expired(stopSince,now)){
+                fprintf(stderr,"DESKTOP_RENDERER_STOP_ABANDON active=%u presenting=%ld\n",active,g_presentingTicket);
+                fflush(stderr);_exit(0);
+            }
+        }
         const uint64_t fullSince=active==depth?monotonic_ns():0;
         int progress=0;
         /* Pipelined frames retire strictly in ticket order: a younger frame

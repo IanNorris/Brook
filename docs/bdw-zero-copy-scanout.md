@@ -105,6 +105,28 @@ Mesa (hasvk) programs *external* buffers with the "use PTE" MOCS on Gen8, so the
 
 This is the part most likely to need Dell evidence: stale or garbled 64-byte lines on the panel mean the MOCS is not "use PTE". A second risk: uncached render-target writes, and any destination reads during blending, could slow the quad pass.
 
+**Second Dell finding (integration image), which was the coherency risk.** The images' PTEs select PPAT slot 3, but the render-job PAT lease (`intel_bdw_critical.cpp`, `RenderOwner`) changed only slots 0 and 4. The inherited private PAT is `0x03030303/0x03030303` (every slot WB), so render writes to the images went write-back into the LLC, which the display does not snoop. That produced the taskbar flicker, which is in the region rewritten every frame.
+
+hasvk's Gen8 MOCS for external buffers is 0x18 (target cache "L3, defer to PAT"; memory type from the PTE: `src/intel/isl/isl.c`), so the PTE does decide.
+
+**Fix:** a render job that maps an image (`BdwExecSnapshotHasUncached`) sets `BdwRenderRunResult::uncachedScanout`. Its lease then also makes slot 3 UC (`0x00030307`), exactly as the BCS scanout copy's lease already does, and restores `0x03030303` afterwards.
+
+`gpu zerocopy uc on|off` toggles this, for A/B only. `render_jobs_uc` and `render_jobs_wb` in `gpu zerocopy status` count jobs that wrote images under each policy.
+
+**Objective check: `gpu zerocopy verify`** (zero-copy active, idle desktop).
+1. Enable the pipe A CRC (primary-plane source, `PIPE_CRC_CTL_A` 0x60050, result 0x60064).
+2. Take two CRCs, each after two vblanks.
+3. CLFLUSH every line of the front image, which writes LLC-resident pixels back to memory.
+4. Take two more CRCs.
+
+| Result | Meaning |
+|---|---|
+| `coherent` | Stable and unchanged CRCs |
+| `stale-memory` | The flush changed what the panel shows |
+| `crc-unstable` / `front-changed` | Inconclusive (the desktop changed) |
+
+A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it always sees the newest pixels.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:

@@ -116,6 +116,10 @@ bool BdwReuseRetainedRenderScratch(BdwOwnedPage& out,BdwGgttReservation& reserva
 struct BdwRenderExecutionBackend;
 struct BdwForcewakeAdapterResult;
 struct BdwRenderRunResult {
+    // Input: the job writes zero-copy scanout images (uncached PTEs, PPAT
+    // slot 3). The PAT lease then also makes slot 3 UC for the job, as the
+    // BCS scanout copy does; the inherited policy has every slot WB.
+    bool uncachedScanout=false;
     bool admitted=false,attempted=false,breadcrumb=false,contextComplete=false;
     bool ggttClearRequested=false,ggttCleared=false;
     bool gemReleaseRequested=false,gemReleased=false;

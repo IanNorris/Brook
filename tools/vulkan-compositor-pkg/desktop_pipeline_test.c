@@ -72,6 +72,11 @@ static void model(void){
     printf("DESKTOP_PIPELINE_MODEL_PASS steps=%u after=%u rebased=%u refused=%u\n",STEPS,outcomes[0],outcomes[1],outcomes[2]);
 }
 int main(void){
+    /* Bounded stop drain: never before a stop, expires at 2.5 s. */
+    assert(!desktop_stop_drain_expired(0,UINT64_MAX));
+    assert(!desktop_stop_drain_expired(1000,1000+DESKTOP_STOP_DRAIN_NS-1));
+    assert(desktop_stop_drain_expired(1000,1000+DESKTOP_STOP_DRAIN_NS));
+    assert(!desktop_stop_drain_expired(5000,4000));
     assert(desktop_pipeline_parse(NULL)==2 && desktop_pipeline_parse("")==2 && desktop_pipeline_parse("2")==2);
     assert(desktop_pipeline_parse("1")==1 && desktop_pipeline_parse("serial")==1);
     assert(!desktop_pipeline_parse("3") && !desktop_pipeline_parse("22") && !desktop_pipeline_parse("x") && !desktop_pipeline_parse("serialx"));
