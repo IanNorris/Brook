@@ -31,13 +31,25 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | 0a | Clean workspace builds from a fresh clone (`d668a832`) | done |
 | 0b | Move the Dell GPU critical-section code out of `memory/virtual_memory.cpp` into `intel_bdw_critical.cpp` (pure move) | done: `2831dbbd`; Dell stage timings unchanged vs gen 355 |
 | 0c | Reproducible Dell image build: `scripts/build_dell_image.py --qemu-check` (guarded QEMU repair-to-desktop via `scripts/check_dell_image_qemu.py`) | done: `74342a6b`, `e8680304`, `56fbc88b` |
-| M0 | Diagnostics: distinct displayed-frame counter, BCS stage timing, per-class worker busy time, compositor job split by direct layer, plus anything else missing | todo |
+| M0 | Diagnostics: `gpu worker stats` (kernel), `/tmp/brook-desktop-stats.json` + `scripts/desktop_stats_diff.py` (renderer), `scripts/dell_quake_measure.py` | done: gen 357 results below |
 | M2 | Release the previous client buffer as soon as the compositor has consumed it; remove the CPU copies on the GPU path (waylandd snapshot); present-driven frame callbacks; drop the 8-buffer workaround | todo |
 | — | Close the Kernel Console at startup on the GPU desktop (no CPU console writes) and add a network up/down indicator near the taskbar clock | done on `work/desktop-ui`: `build_dell_image.py` hides it by default (`--show-kernel-console` keeps it; Apps > Kernel Console reopens it); taskbar bars left of the clock show primary-interface IPv4 state |
 | M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
 | M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | todo |
 | M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
+
+**M0 results (gen 357, console visible, 14 Nov):**
+- **Displayed Quake frames ≈ 12.5/s** (mean 79 ms between frames) at 2, 4 and 8 client buffers alike. Completed swaps were 35–69/s.
+- **The gpu-submit worker is only 74–77% busy,** so this is latency-bound: one frame in flight, serialized.
+- **Per displayed game frame:**
+  - renderer CPU prepare ~23–25 ms, of which overlay polling is ~10 ms (2 × `usleep(10000)`);
+  - compositor job ~19–23 ms on the worker, ~17 ms of it 1 ms poll sleeps while the GPU composites;
+  - BCS present ~8 ms (2.4 ms setup plus a ~5.5 ms blit of 2.4–2.9 Mpx; a full screen is 15 ms);
+  - Quake job ~6.6 ms, ~4 ms of it 1 ms poll sleeps.
+- **The GPU clock stays at 500 MHz from issue to end,** so the ramp hypothesis is refuted.
+- **Non-game presents run at ~13–17/s** (console and cursor) and each costs a full compositor job.
+- Evidence: `/data/Programming/Brook/display-perf/build/dell/measure-m0/`.
 
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
