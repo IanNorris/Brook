@@ -37,6 +37,16 @@
 // Bind current display/backdrop identity for a renderer that draws a clear
 // or a procedural backdrop. Returns the same metadata as QUERY.
 #define BROOK_DESKTOP_BACKDROP_TRACKED_BIND 10
+// Change-based chrome. TRACKED_CAPTURE_KEYED is TRACKED_CAPTURE that also
+// returns, in BrookDesktopLayers.reserved, a nonzero content key of exactly
+// the pixels it wrote (input reserved must be zero). TRACKED_KEEP takes the
+// metadata a keyed capture returned plus that key in reserved and no pixels:
+// if the window's chrome would render identically it binds the chrome to
+// the tracked scene and refreshes the metadata (position may move) without
+// rendering or copying; otherwise it fails with ESTALE and the caller
+// recaptures into the same buffer.
+#define BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED 11
+#define BROOK_DESKTOP_CHROME_TRACKED_KEEP 12
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u

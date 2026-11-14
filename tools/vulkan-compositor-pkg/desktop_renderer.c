@@ -20,6 +20,7 @@
 #include "desktop_tile.h"
 #include "overlay_copy.h"
 #include "desktop_overlay_cache.h"
+#include "desktop_chrome_cache.h"
 #include "source_size_policy.h"
 #include "desktop_gpu_channel.h"
 #include "desktop_async_source_barrier.h"
@@ -44,7 +45,7 @@ struct create {uint64_t size;uint32_t handle,pad;};
 struct map_offset {uint32_t handle,pad;uint64_t offset,flags,extensions;};
 struct prime {uint32_t handle,flags;int32_t fd;};
 struct gem_close {uint32_t handle,pad;};
-struct Source {uint32_t handle;int fd;uint64_t size;void *map;unsigned smallUses;};
+struct Source {uint32_t handle;int fd;uint64_t size;void *map;unsigned smallUses;uint64_t serial;};
 struct RenderContext {
     BrookVkRenderer *renderer;int output;uint32_t width,height;uint64_t outputBytes;
     BrookVkGraphicsPass *graphics;
@@ -57,6 +58,7 @@ struct RenderContext {
     uint64_t lastPresentNs;
     struct Source client[BROOK_DESKTOP_LAYER_LIMIT],chrome[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source chromeSpan[BROOK_DESKTOP_LAYER_LIMIT][4];
+    struct DesktopChromeHeld chromeHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source background,overlay[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
     /* Retained overlay capture: reused while the kernel generation matches. */
     uint64_t overlayGeneration;uint32_t overlayWidth,overlayHeight;
@@ -120,6 +122,9 @@ static uint64_t g_lastPresentNs;
 static uint64_t g_idlePollNs=16000000ull;
 enum { DESKTOP_KEEPALIVE_NS=200000000ull };
 static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
+/* Keep unchanged window chrome (kernel keyed capture); BROOK_RENDER_CHROME_KEEP=0 disables. */
+static int g_chromeKeep=1;
+static struct {unsigned long long keeps,keepMisses,captures,bytesCopied;} g_chromeStats;
 /* Bounded runs (--frames N) present a minimal frame instead of idling. */
 static int g_neverIdle;
 static uint64_t g_quadSubmitted,g_quadFallback;
@@ -327,6 +332,7 @@ static int source_open(int drm,uint64_t size,struct Source *out){
     if(out->map==MAP_FAILED)goto fail;
     struct prime prime={gem.handle,O_CLOEXEC|O_RDWR,-1};
     if(ioctl(drm,IOC(0x2d,sizeof(prime)),&prime))goto fail;
+    static uint64_t serials;out->serial=++serials;
     out->fd=prime.fd;return 0;
 fail: source_close(drm,out);return -1;
 }
@@ -600,13 +606,39 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(trackOk && !direct && !desktop_track_bands(&trackWindow->content,client[i].map,client[i].size/4,content.sourceStrideWords,
                 content.sourceX,content.sourceY,content.sourceWidthUsed,content.sourceHeightUsed,NULL))trackOk=0;
         struct BrookDesktopLayers decor={.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
-        if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_QUERY,&decor,sizeof(decor),0,0,0))goto done;
         struct BrookDesktopLayer *c=&decor.layers[0];
-        if(c->bytes){
-            if(source_ensure(drm,c->bytes,&chrome[i]))goto done;
-            c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;
+        struct DesktopChromeHeld *held=&ctx->chromeHeld[i];
+        int keptChrome=0;
+        /* Unchanged chrome: keep the pixels this context's buffer already
+         * holds instead of having the kernel re-render and copy the whole
+         * outer window surface every frame. */
+        if(g_chromeKeep && desktop_chrome_can_keep(held,l->window,l->incarnation,chrome[i].serial)){
+            desktop_chrome_keep_request(held,&decor);
+            if(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_KEEP,&decor,sizeof(decor),0,0,0)){
+                keptChrome=1;c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;++g_chromeStats.keeps;
+            }else{
+                ++g_chromeStats.keepMisses;desktop_chrome_forget(held);
+                decor=(struct BrookDesktopLayers){.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
+            }
         }
-        if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&decor,sizeof(decor),0,0,0))goto done;
+        if(!keptChrome){
+            desktop_chrome_forget(held);
+            if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_QUERY,&decor,sizeof(decor),0,0,0))goto done;
+            if(c->bytes){
+                if(source_ensure(drm,c->bytes,&chrome[i]))goto done;
+                c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;
+            }
+            decor.reserved=0;
+            long keyedOp=g_chromeKeep?BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED:BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
+            if(syscall(BROOK_SYS_DESKTOP_LAYERS,keyedOp,&decor,sizeof(decor),0,0,0)){
+                /* Older kernel: no keyed chrome. Fall back for good. */
+                if(keyedOp!=BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || errno!=EINVAL)goto done;
+                g_chromeKeep=0;decor.reserved=0;
+                if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&decor,sizeof(decor),0,0,0))goto done;
+            }
+            if(c->bytes){++g_chromeStats.captures;g_chromeStats.bytesCopied+=c->bytes;}
+            if(g_chromeKeep && c->bytes)desktop_chrome_hold(held,&decor,chrome[i].serial);
+        }
         if(c->bytes){
             uint32_t opacity=0;if(!desktop_layer_opacity(l,&opacity))goto done;
             /* The OS leaves the client interior of the chrome transparent. */
@@ -1293,10 +1325,12 @@ static void stats_publish(uint64_t now){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
         if(end){char tail[512];
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
-                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu}\n",g_ring.count,
+                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,"
+                "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
                 (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
-                (unsigned long long)g_overlayOnlySkips);
+                (unsigned long long)g_overlayOnlySkips,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
+                g_chromeStats.captures,g_chromeStats.bytesCopied);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
             char rows[DESKTOP_TIMELINE*120+64];size_t used=0;
@@ -1573,6 +1607,7 @@ int main(int argc,char **argv){
     g_quadMode=!(compose && !strcmp(compose,"compute"));
     g_quadOcclusion=!getenv("BROOK_RENDER_QUAD_NO_OCCLUSION");
     g_chromeHoles=!getenv("BROOK_RENDER_CHROME_FULL");
+    {const char *keep=getenv("BROOK_RENDER_CHROME_KEEP");g_chromeKeep=!(keep && keep[0]=='0');}
     g_trackDamage=!getenv("BROOK_RENDER_FOOTPRINT_DAMAGE");
     const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");
     if(idlePoll){char *end=NULL;unsigned long ms=strtoul(idlePoll,&end,10);if(end && !*end && ms && ms<=100)g_idlePollNs=ms*1000000ull;}

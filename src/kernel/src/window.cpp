@@ -10,6 +10,7 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "wm_chrome_key.h"
 #include "desktop_telemetry.h"
 #include "taskbar_volume.h"
 #include "volume_feedback.h"
@@ -3625,6 +3626,25 @@ int64_t WmDesktopLayersUseIfBothPresentable(const WmDesktopLayers& base,const Wm
     if(!DesktopLayersPresentableLocked(base) || !DesktopLayersPresentableLocked(next))return -116;
     return use(context);
 }
+static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Window& origin0,int32_t mouseX,int32_t mouseY) {
+    // origin0 has x=y=0, exactly as RenderWindowChrome sees it in a capture.
+    int32_t hover=-1;
+    for(int button=0;button<3 && hover<0;++button)if(CaptionRect(origin0,button).contains(mouseX,mouseY))hover=button;
+    WmChromeKeyInput in{};
+    in.title=origin0.title;in.titleCapacity=sizeof(origin0.title);
+    in.appId=origin0.appId;in.appIdCapacity=sizeof(origin0.appId);
+    in.windowIdentity=origin0.creationIdentity;in.metricsIdentity=reinterpret_cast<uintptr_t>(origin0.metrics);
+    in.outerWidth=origin0.outerWidth();in.outerHeight=origin0.outerHeight();
+    in.clientWidth=origin0.clientW;in.clientHeight=origin0.clientH;
+    in.clientOffsetX=origin0.clientX();in.clientOffsetY=origin0.clientY();
+    in.state=static_cast<uint32_t>(origin0.state);
+    in.focused=origin0.focused;in.visible=origin0.visible;in.noChrome=origin0.noChrome;
+    in.hoverButton=hover;
+    in.theme=static_cast<uint32_t>(layers.theme);in.appearance=static_cast<uint32_t>(layers.appearance);
+    in.scale=static_cast<uint32_t>(layers.scale);
+    in.settingsEpoch=layers.settingsGeneration;in.launcherEpoch=layers.launcherGeneration;
+    return WmChromeKey(in);
+}
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
                                int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges) {
@@ -3636,10 +3656,19 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         if(!g_wmActive || CompositorGlassActive())return -95;
         int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
         const Window& source=g_windows[sorted[index]];
-        if(source.noChrome){*info={source.x,source.y,0,0};return 0;}
+        if(source.noChrome){*info={source.x,source.y,0,0,0};return 0;}
         width=source.outerWidth();height=source.outerHeight();
         if(!width || !height || uint64_t(width)*height>64ull*1024*1024/4)return -7;
-        *info={source.x,source.y,width,height};
+        {
+            Window origin0=source;origin0.x=0;origin0.y=0;
+            const bool noMouseKey=mouseX==-1 && mouseY==-1;
+            auto rel=[](int32_t value,int16_t origin){
+                const int64_t n=int64_t(value)-origin;
+                return n<(-2147483647ll-1)?int32_t(-2147483647-1):n>2147483647ll?int32_t(2147483647):int32_t(n);
+            };
+            *info={source.x,source.y,width,height,
+                DesktopChromeKeyLocked(layers,origin0,noMouseKey?-1:rel(mouseX,source.x),noMouseKey?-1:rel(mouseY,source.y))};
+        }
         if(!pixels)return 0;
         if(capacity<uint64_t(width)*height*4)return -22;
         local=source;originX=source.x;originY=source.y;ProcessRef(local.proc);

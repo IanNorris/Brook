@@ -74,6 +74,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "mouse.h"
 #include "shell.h"
 #include "compositor.h"
+#include "wm_chrome_key.h"
 #include "compositor_scene.h"
 #include "debug_jobs.h"
 #include "debug_epoch.h"
@@ -5925,6 +5926,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("cpu_overlay_draws",s.cpuOverlayDraws);r.text(",");r.field("cpu_overlay_skips",s.cpuOverlaySkips);
         r.text(",");r.field("overlay_renders",s.overlayRenders);r.text(",");r.field("overlay_bumps",s.overlayBumps);
         r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay capture renders and generation bumps\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"desktop chrome status") || NetStrEq(cmd,"desktop chrome reset")) {
+        auto& g=g_chromeCaptureStats;
+        auto take=[&](uint64_t& v){return NetStrEq(cmd,"desktop chrome reset")?__atomic_exchange_n(&v,0,__ATOMIC_RELAXED):__atomic_load_n(&v,__ATOMIC_RELAXED);};
+        const uint64_t keeps=take(g.keeps),misses=take(g.keepMisses),captures=take(g.captures),copied=take(g.bytesCopied),kept=take(g.bytesKept);
+        BridgeReply r;r.text("{");r.field("keeps",keeps);r.text(",");r.field("keep_misses",misses);
+        r.text(",");r.field("captures",captures);r.text(",");r.field("bytes_copied",copied);r.text(",");r.field("bytes_kept",kept);
+        r.text(",\"scope\":\"renderer window-chrome requests since boot or reset; keeps reuse the renderer's held pixels (no render, no copy); keep_misses are keeps refused because the chrome changed; captures render and copy the outer surface\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu uploads")) {
         const auto s=CompositorReadUploads();BridgeReply r;r.text("{\"layers\":[");
