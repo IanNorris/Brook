@@ -92,6 +92,24 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Early 15 Nov (gens 394–395):**
+- **Merged to main:** `d26b3612` (vaapi chain plus steam), then `8611cda1` (browser-gpu).
+- **GPU browsers are the default on the Dell:**
+  - new store path `p0mwsladz…-brook-hardware-network-launchers`; `/nix/profile/bin/{brook-chromium,brook-firefox,brook-iris-run}` relinked; rollback `/nix/.brook-profile-rollback-42b6c3acfe4b.json`;
+  - Chromium ANGLE and Firefox hardware WebRender confirmed via the normal launch path.
+  - **Firefox VP9 plays at 0.16× in both GPU and software modes** (Chromium plays the same clip in real time), so it's a Firefox media-path issue.
+- **CPU idle A/B** (`work/cpu-idle` 7f94cea6, gen 394):
+  - firmware EPB=0; MWAIT, ARAT and interrupt-break supported.
+  - Idle package power: HLT 4.67 W → EPB6 4.05 → C1E 4.02 → C3 3.29 → **C6 3.22 W** (57 °C vs 63).
+  - yquake p50: HLT 18.0, C1E 18.7, C3 21.2, C6 20.9 ms. Zero audio gaps throughout.
+  - Next: a menu-style idle governor (`cpu idle state auto`) plus EPB 6 at boot.
+- **VA-API 1c passes on the Dell** (`work/vaapi` 29818357, gen 395, `vcs_store_probe` tool):
+  - 5,503 user `I915_EXEC_BSD` jobs, 0 failures (mean ~2 ms per round trip);
+  - no effect on yquake (19.8 ms with VCS load) or zero-copy;
+  - the gate toggles correctly;
+  - an injected hang is detected at 2 s and quarantined, no panic.
+  - Next: phase 2a (libdrm_intel softpin, GETPARAMs, tiling metadata, WC mmap). The `vainfo` trace on the Dell needs Ian's approval for the store write.
+
 **Night of 14 Nov, unattended (gens 387–393):**
 - **Gen 387 panic** while unattended, during yquake with idle windows open: `Broadwell worker uncertain … gt=0 … sampled=0` on a compositor job. Five early-exit paths before any device access were classified uncertain, and two also poisoned the forcewake claim. Fixed in `work/worker-refusal` 2bbe1ef1: classified as RefusedUntouched, retried up to 16×, with the reason logged.
 - **Gen 386 panic** (GPU Chromium, 65k-page job): fixed in `work/worker-overhead` 67a27e3d. The table limit went 128 → 512, and unmappable jobs are refused (`ENOSPC`, or "job refused"), never panicked.
