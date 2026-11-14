@@ -95,6 +95,8 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
                                          bool fromQueue=false);
 void BdwOffscreenHandoffOwnerExit(uint64_t owner);
 bool BdwOffscreenHandoffSubmit(void*,BdwExecSnapshot*,int64_t* result);
+// The owner currently attached to the offscreen handoff (zero-copy adoption).
+bool BdwOffscreenHandoffAttached(uint64_t owner);
 // Fixed-test worker executor. The worker retains the snapshot; no userspace
 // submission is authorized by this entry point.
 BdwSubmissionOutcome BdwExecuteRetainedWorkerSnapshot(void*,BdwExecSnapshot* snapshot);

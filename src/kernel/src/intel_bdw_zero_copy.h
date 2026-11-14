@@ -64,6 +64,18 @@ inline BdwZeroCopyRefusal BdwZeroCopyEligible(const BdwZeroCopyGeometry& g,const
     return BdwZeroCopyRefusal::None;
 }
 
+// A restarted renderer cannot register new images (phase 1 keeps the first
+// registration and its GGTT extents for the boot), so it adopts the retained
+// ones instead. Only the owner attached to the handoff (the old renderer has
+// detached, so it is gone) may adopt, and only images no GPU job, handoff
+// ticket or failure still holds; any active zero-copy returns to the GOP.
+enum class BdwZeroCopyAdoption : uint8_t {Adopt,NotRegistered,NotAttached,Busy};
+inline BdwZeroCopyAdoption BdwZeroCopyAdoptDecision(uint32_t registered,bool callerAttached,const bool* idle){
+    if(!registered)return BdwZeroCopyAdoption::NotRegistered;
+    if(!callerAttached)return BdwZeroCopyAdoption::NotAttached;
+    for(uint32_t i=0;i<registered;++i)if(!idle || !idle[i])return BdwZeroCopyAdoption::Busy;
+    return BdwZeroCopyAdoption::Adopt;
+}
 enum class BdwZeroCopyPresent : uint8_t {Rejected,ArmNow,Queued};
 class BdwZeroCopyRing {
     uint32_t surfaces_[BdwZeroCopyMaxImages+1]{};

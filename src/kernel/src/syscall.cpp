@@ -61,6 +61,7 @@
 #include "intel_bdw_ioctl.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_scanout_target.h"
+#include "intel_bdw_refusal.h"
 #include "debug_hardware.h"
 #include "sync/ksemaphore.h"
 #include "exec_image.h"
@@ -7508,7 +7509,20 @@ static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t ar
         // closes: removing it could revoke a concurrent successful import.
         return CopyToUser(arg,&request,sizeof(request))?0:-EFAULT;
     }
-    return brook::BdwIntelRenderIoctl(file,cmd,arg,user);
+    const int64_t result=brook::BdwIntelRenderIoctl(file,cmd,arg,user);
+    // An execbuffer refusal becomes VK_ERROR_DEVICE_LOST in Mesa: name it.
+    if(result<0 && (cmd&0xff)==0x69){
+        static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
+        if(brook::BdwRefusalLogDue(refusals))
+            SerialPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,
+                why?why:"unrecorded",refusals);
+    }else if((cmd&0xff)==0x69)(void)brook::BdwTakeRefusal();
+    else if((cmd&0xff)==0x72){
+        static uint64_t losses=0;
+        if(const char* why=brook::BdwTakeRefusal())
+            if(brook::BdwRefusalLogDue(losses))SerialPrintf("gpu-exec: pid=%u %s count=%lu\n",user.submitterPid,why,losses);
+    }
+    return result;
 }
 
 static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
@@ -12817,6 +12831,25 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
         const int64_t result=brook::BdwZeroCopyRegister(owner,buffers,wire.count,geometry,refusal);
         drop();return result;
     }
+    if(op==BROOK_GPU_HANDOFF_SCANOUT_ADOPT){
+        if(!UserBufferWritable(arg,sizeof(BrookGpuScanoutImages)))return -EFAULT;
+        brook::BdwGpuBuffer* images[BROOK_GPU_SCANOUT_MAX_IMAGES]{};uint32_t count=0;
+        const int64_t adopted=brook::BdwZeroCopyAdopt(owner,images,count);
+        if(adopted)return adopted==-2?-ENOENT:adopted==-1?-EPERM:adopted;
+        BrookGpuScanoutImages wire{count,brook::BdwZeroCopyWidth,brook::BdwZeroCopyHeight,brook::BdwZeroCopyStride,
+            BROOK_GPU_SCANOUT_FOURCC_XRGB8888,0,{-1,-1,-1,-1}};
+        int64_t result=0;
+        for(uint32_t i=0;i<count;++i){
+            if(result){brook::BdwGpuBufferUnref(images[i]);continue;}
+            FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=images[i];owned.fdFlags=1;
+            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            if(fd<0){brook::BdwGpuBufferUnref(images[i]);result=fd;continue;}
+            wire.fds[i]=fd; // the fd table now holds the reference
+        }
+        if(!result && !CopyToUser(arg,&wire,sizeof(wire)))result=-EFAULT;
+        if(result)for(uint32_t i=0;i<count;++i)if(wire.fds[i]>=0)(void)CloseProcessFd(proc,wire.fds[i]);
+        return result;
+    }
     if(op==BROOK_GPU_HANDOFF_SCANOUT_STATUS){
         brook::BdwZeroCopyStatus s{};brook::BdwZeroCopyReadStatus(s);
         BrookGpuScanoutStatus wire{};
@@ -12865,7 +12898,13 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
         if(arg>=MAX_FDS)return -EBADF;
         FdRef ref(proc,static_cast<int>(arg));
         if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
-        return brook::BdwOffscreenHandoffControl(owner,op,arg,static_cast<brook::BdwGpuBuffer*>(ref->handle),a);
+        const int64_t result=brook::BdwOffscreenHandoffControl(owner,op,arg,static_cast<brook::BdwGpuBuffer*>(ref->handle),a);
+        if(result<0 && result!=-116){ // -116 (ESTALE): a dependent baseline moved, the renderer's normal retry
+            static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
+            if(brook::BdwRefusalLogDue(refusals))
+                SerialPrintf("gpu-handoff: reserve refused pid=%u errno=%ld reason=%s count=%lu\n",proc->pid,-result,why?why:"unrecorded",refusals);
+        }else (void)brook::BdwTakeRefusal();
+        return result;
     }
     return brook::BdwOffscreenHandoffControl(owner,op,arg,nullptr);
 #else

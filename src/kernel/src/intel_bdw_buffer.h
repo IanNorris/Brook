@@ -24,6 +24,8 @@ BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes);
 // for the buffer's life; render submissions then map it uncached.
 bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b);
 bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b);
+// No GPU use, handoff reservation or failure: a retained image may change owner.
+bool BdwGpuBufferIdle(const BdwGpuBuffer* b);
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* buffer);
 void BdwGpuBufferRef(BdwGpuBuffer* buffer);
 void BdwGpuBufferUnref(BdwGpuBuffer* buffer);

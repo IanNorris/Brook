@@ -1,4 +1,5 @@
 #pragma once
+#include "intel_bdw_refusal.h"
 #include "intel_bdw_exec_queue.h"
 #include "intel_bdw_handoff.h"
 #include "intel_bdw_preparation.h"
@@ -51,7 +52,7 @@ public:
     bool Init(bool knownOwnersOnly=false){if(initialized_)return false;KMutexInit(&mutex_);knownOwnersOnly_=knownOwnersOnly;initialized_=true;return true;}
     int64_t BeginPreparation(uint64_t owner,BdwSubmissionPreparation& entry){
         if(!initialized_)return -19;if(knownOwnersOnly_ && !owner)return -22;KMutexLock(&mutex_);
-        if(frozenOwner_ && (!owner || owner==frozenOwner_)){KMutexUnlock(&mutex_);return -16;}
+        if(frozenOwner_ && (!owner || owner==frozenOwner_)){KMutexUnlock(&mutex_);BdwNoteRefusal("prepare: owner admission frozen (blocked recovery)");return -16;}
         entry.owner=owner;entry.next=preparing_;preparing_=&entry;KMutexUnlock(&mutex_);return 0;
     }
     void EndPreparation(BdwSubmissionPreparation& entry){
@@ -99,6 +100,7 @@ public:
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         if(accepted)BdwTimingQueued(snapshot);
 #endif
+        if(!accepted)BdwNoteRefusal(poisoned?"submit: queue poisoned":blocked?"submit: owner admission frozen":"submit: exec queue full (32 entries)");
         KMutexUnlock(&mutex_);return accepted?0:poisoned?-5:-16;
     }
     // Caller holds the sleepable handoff mutex before entering the queue lock.
@@ -107,17 +109,19 @@ public:
                           BdwExecSnapshot* snapshot,BdwFence* fence,uint64_t gateToken){
         if(!initialized_ || !snapshot || (knownOwnersOnly_ && (!owner || BdwExecSnapshotOwner(snapshot)!=owner)))return -22;
         KMutexLock(&mutex_);uint64_t id=0;
-        if(queue_.Poisoned()){KMutexUnlock(&mutex_);return -5;}
-        if((frozenOwner_ && owner==frozenOwner_) || AdmissionBlocked(snapshot)){KMutexUnlock(&mutex_);return -16;}
-        if(!BdwHandoffArm(handoff,owner,ticket,snapshot,fence,gateToken)){KMutexUnlock(&mutex_);return -22;}
+        if(queue_.Poisoned()){KMutexUnlock(&mutex_);BdwNoteRefusal("handoff submit: queue poisoned");return -5;}
+        if((frozenOwner_ && owner==frozenOwner_) || AdmissionBlocked(snapshot)){KMutexUnlock(&mutex_);BdwNoteRefusal("handoff submit: owner admission frozen");return -16;}
+        if(!BdwHandoffArm(handoff,owner,ticket,snapshot,fence,gateToken)){KMutexUnlock(&mutex_);
+            BdwNoteRefusal("handoff submit: arm refused (output not written with the signal fence, or its gate token changed)");return -22;}
         const bool accepted=queue_.Enqueue(1,snapshot,id);
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         if(accepted)BdwTimingQueued(snapshot);
 #endif
         if(!accepted && !BdwHandoffAbortUndelivered(handoff,owner,ticket,snapshot)){
-            KMutexUnlock(&mutex_);return -5; // retained/quarantined; never retry
+            KMutexUnlock(&mutex_);BdwNoteRefusal("handoff submit: undelivered abort failed (quarantined)");return -5; // retained/quarantined; never retry
         }
         if(accepted)handoff.requests[ticket.slot]=id;
+        else BdwNoteRefusal("handoff submit: exec queue full (32 entries)");
         KMutexUnlock(&mutex_);return accepted?0:-16;
     }
     // The handoff owner holds its mutex. The queue lock makes the queued vs

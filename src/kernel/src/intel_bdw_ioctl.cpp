@@ -1,3 +1,4 @@
+#include "intel_bdw_refusal.h"
 #include "intel_bdw_ioctl.h"
 #include "profiler.h"
 #include "intel_bdw_file.h"
@@ -417,6 +418,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         // active/pending loss; the global counter is hidden as in an
         // unprivileged i915 query, rather than inventing reset history.
         stats.resetCount=0;stats.batchActive=(loss&1)?1:0;stats.batchPending=(loss&2)?1:0;
+        if(loss)BdwNoteRefusal("reset stats: context reports lost batches (Mesa marks the device lost)");
         return u.write(u.context,arg,&stats,sizeof(stats))?0:fault;
     }
     if(nr==0x6e && size==sizeof(ContextCreate)){
@@ -504,7 +506,8 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         if(!u.submit)return notty;
         if(bool(u.beginExec)!=bool(u.endExec))return invalid;
         BdwSubmissionPreparation preparation{};
-        if(u.beginExec){const auto started=u.beginExec(u.context,u.submitterIncarnation,preparation);if(started)return started;}
+        if(u.beginExec){const auto started=u.beginExec(u.context,u.submitterIncarnation,preparation);
+            if(started){if(!g_bdwRefusal)BdwNoteRefusal("prepare: submission worker not ready or admission refused");return started;}}
         struct PreparationGuard {const BdwI915UserAccess& u;BdwSubmissionPreparation& p;
             ~PreparationGuard(){if(u.endExec)u.endExec(u.context,p);}} preparationGuard{u,preparation};
         // Serialize preparation, admission and publication so another
@@ -523,7 +526,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
  #if defined(BROOK_GPU_SUBMISSION_TIMING)
         BdwTimingOwnerElapsed(u.submitterIncarnation,BdwTimingSnapshotBuild,admissionAcquired,BdwTimingNow());
  #endif
-        if(decoded)return decoded;
+        if(decoded){BdwNoteRefusal("execbuffer decode: object, relocation, fence or context validation");return decoded;}
         int64_t submitted=0;
         const bool claimed=u.handoffSubmit && u.handoffSubmit(u.context,snapshot,&submitted);
         if(!claimed)submitted=u.submit(u.context,snapshot);
@@ -531,6 +534,7 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         plan.release();
         // A failed callback is contractually unarmed and retains no owner.
         if(!BdwExecSnapshotRelease(snapshot,false))__builtin_trap();
+        if(!g_bdwRefusal)BdwNoteRefusal(claimed?"handoff submit refused":"application submit refused");
         return submitted<0?submitted:-5;
     }
     return notty;

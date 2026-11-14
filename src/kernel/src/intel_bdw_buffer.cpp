@@ -129,6 +129,9 @@ BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes){
 }
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* b){return b && b->userMappingAllowed;}
 bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b){return b && __atomic_load_n(&b->scanoutImage,__ATOMIC_ACQUIRE);}
+bool BdwGpuBufferIdle(const BdwGpuBuffer* b){
+    return b && !__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE) && !__atomic_load_n(&b->handoffToken,__ATOMIC_ACQUIRE);
+}
 bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b){
     // Only protected handoff buffers, and only while no GPU job uses them, so
     // no in-flight submission keeps a write-back mapping of a scanout image.

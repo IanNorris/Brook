@@ -93,6 +93,10 @@ struct BdwZeroCopyStatus {
     bool uncachedRender;uint64_t renderJobsUc,renderJobsWb;
 };
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out);
+// Syscall context: hand the retained images to a restarted renderer. On 0
+// out[0..count) carry a reference each (the caller publishes fds and drops
+// them). -2 none registered, -1 not the attached owner, -16 still in use.
+int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count);
 bool BdwZeroCopyArm(const char*& reason);
 void BdwZeroCopyDisarm();
 // Render jobs writing images lease PPAT slot 3 UC (default on). The toggle

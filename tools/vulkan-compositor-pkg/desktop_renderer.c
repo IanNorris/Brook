@@ -155,6 +155,7 @@ static void renderer_exit_for_restart(const char *cause,long detail){
 /* Zero-copy scanout ring size (0 = off): the kernel advertises
  * BROOK_GPU_PRESENT_CAP_SCANOUT; BROOK_RENDER_SCANOUT_IMAGES=0|3|4 overrides. */
 static unsigned g_scanoutImages;
+static const char *g_failStage="none"; /* render_frame stage of the last failure, for DESKTOP_ASYNC_RETRY */
 static uint64_t g_scanoutPicks,g_scanoutWaits,g_scanoutStarved,g_scanoutFullDraws,g_scanoutPartialDraws,g_scanoutRepairPixels;
 /* The ring is process-wide: registered once (the kernel accepts one
  * registration per boot) and used by every render context. */
@@ -164,6 +165,24 @@ static int scanout_ring_open(uint32_t width,uint32_t height){
     if(g_ring.count)return 0;
     if(g_ringTried || width!=3200 || height!=1800 || g_scanoutImages<3 || g_scanoutImages>DESKTOP_AGE_MAX_IMAGES)return -1;
     g_ringTried=1;
+    /* A previous renderer's ring survives our restart: adopt it (contents
+     * unknown, so every image's first use is a full draw). */
+    {struct BrookGpuScanoutImages adopted;memset(&adopted,0,sizeof(adopted));
+     if(!syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_SCANOUT_ADOPT,&adopted,0,0,0,0)){
+         if(adopted.count<3 || adopted.count>DESKTOP_AGE_MAX_IMAGES || adopted.width!=width || adopted.height!=height){
+             for(unsigned i=0;i<adopted.count && i<DESKTOP_AGE_MAX_IMAGES;++i)if(adopted.fds[i]>=0)close(adopted.fds[i]);
+             fprintf(stderr,"DESKTOP_SCANOUT_ADOPT_MISMATCH count=%u %ux%u single outputs\n",adopted.count,adopted.width,adopted.height);
+             return -1;
+         }
+         const uint64_t bytes=(uint64_t)width*height*4;
+         for(unsigned i=0;i<adopted.count;++i){g_ringFds[i]=adopted.fds[i];
+             const off_t size=lseek(adopted.fds[i],0,SEEK_END);(void)lseek(adopted.fds[i],0,SEEK_SET);
+             g_ringBytes=size>=(off_t)bytes?(uint64_t)size:bytes;}
+         g_ring.count=adopted.count;
+         fprintf(stderr,"DESKTOP_SCANOUT_RING images=%u adopted=1\n",g_ring.count);
+         return 0;
+     }
+     if(errno!=ENOENT){fprintf(stderr,"DESKTOP_SCANOUT_ADOPT_FAILED errno=%d single outputs\n",errno);return -1;}}
     struct BrookGpuScanoutImages images={g_scanoutImages,width,height,width*4,BROOK_GPU_SCANOUT_FOURCC_XRGB8888,0,{-1,-1,-1,-1}};
     const uint64_t bytes=(uint64_t)width*height*4;
     for(unsigned i=0;i<g_scanoutImages;++i){
@@ -192,8 +211,15 @@ static int scanout_pick(void){
         const int image=desktop_scanout_ring_pick(&g_ring,status.freeMask);
         if(image>=0){++g_scanoutPicks;return image;}
         ++g_scanoutWaits;usleep(1000);
+        if(attempt==25){
+            ++g_scanoutStarved;
+            if(g_scanoutStarved<=8 || !(g_scanoutStarved&(g_scanoutStarved-1)))
+                fprintf(stderr,"DESKTOP_SCANOUT_STARVED kernel_free=0x%x in_flight=0x%x flags=0x%x front=%u armed=%u queued=%u count=%llu\n",
+                    status.freeMask,desktop_scanout_ring_busy(&g_ring),status.flags,status.front,status.armed,status.queued,
+                    (unsigned long long)g_scanoutStarved);
+        }
     }
-    ++g_scanoutStarved;return -1;
+    errno=EAGAIN;return -1;
 }
 static void context_init(struct RenderContext *ctx){
     memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;ctx->cursor.fd=-1;
@@ -1040,6 +1066,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             (unsigned long)((timing[5]-timing[4])/1000000ull));
 done:
     savedErrno=errno;
+    if(result<0)g_failStage=stage;
     if(result<0){if(presentFailed){++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}else ++g_stats.prepareFailures;}
     /* A failed present may have changed what is on screen. */
     if(result<0 && presentFailed && g_trackDisplayed)g_trackDisplayed->valid=0;
@@ -1357,7 +1384,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                 if(failure==ENOTSUP)++unsupportedRetries;
                 if(failure==EBUSY && !active)++idleBusyRetries;
                 desktop_retry_failure(&retry,failure,active,now);
-                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d\n",failure);
+                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d stage=%s\n",failure,g_failStage);
                 break;
             }
             ctx[i].damage=displayedDamage;
@@ -1374,7 +1401,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                 if(failure==ENOTSUP)++unsupportedRetries;
                 if(failure==EBUSY && !active)++idleBusyRetries;
                 desktop_retry_failure(&retry,failure,active,now);
-                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d\n",failure);
+                if(retries==1 || retries%100==0)fprintf(stderr,"DESKTOP_ASYNC_RETRY errno=%d stage=%s\n",failure,g_failStage);
                 if(failure==ENOTSUP || (failure==EBUSY && !active))break;}
         }
         if(limit && !active && failureStart){uint64_t now=monotonic_ns();

@@ -714,6 +714,33 @@ int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* images,uint32_t 
     SerialPrintf("gpu-zerocopy: registered %u renderer images (owner %lx)\n",imageCount,owner);
     return 0;
 }
+int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count){
+    count=0;
+    uint32_t registered=0;BdwGpuBuffer* images[BdwZeroCopyMaxImages]{};
+    {const uint64_t f=IrqSpinLockAcquire(&lock);registered=zcCount;
+     for(uint32_t i=0;i<registered;++i)images[i]=zcImages[i].buffer;IrqSpinLockRelease(&lock,f);}
+    bool idle[BdwZeroCopyMaxImages]{};
+    for(uint32_t i=0;i<registered;++i)idle[i]=BdwGpuBufferIdle(images[i]);
+    switch(BdwZeroCopyAdoptDecision(registered,BdwOffscreenHandoffAttached(owner),idle)){
+    case BdwZeroCopyAdoption::NotRegistered:return -2;
+    case BdwZeroCopyAdoption::NotAttached:return -1;
+    case BdwZeroCopyAdoption::Busy:return -16;
+    case BdwZeroCopyAdoption::Adopt:break;
+    }
+    // The previous owner is gone. If its images may still be on the panel,
+    // return to the GOP first (bounded wait for the latch); the software
+    // compositor's repaint or the new renderer's first full frame follows.
+    bool active=false;{const uint64_t f=IrqSpinLockAcquire(&lock);active=zcActive;IrqSpinLockRelease(&lock,f);}
+    if(active)ZcLeave();
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    if(zcActive || zcCount!=registered){IrqSpinLockRelease(&lock,f);return -16;}
+    const uint64_t previous=zcOwner;zcOwner=owner;
+    for(uint32_t i=0;i<registered;++i){BdwGpuBufferRef(images[i]);out[i]=images[i];}
+    count=registered;
+    IrqSpinLockRelease(&lock,f);
+    SerialPrintf("gpu-zerocopy: %u retained images adopted by owner %lx (was %lx)\n",registered,owner,previous);
+    return 0;
+}
 bool BdwZeroCopyOnReserve(BdwGpuBuffer* buffer){
     if(!BdwGpuBufferIsScanoutImage(buffer))return true;
     const uint64_t f=IrqSpinLockAcquire(&lock);
@@ -881,6 +908,7 @@ bool BdwZeroCopyUncachedRender(){return false;}
 void BdwZeroCopySetUncachedRender(bool){}
 void BdwZeroCopyNoteRender(bool){}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
+int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return -38;}
 #endif
 #else
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
@@ -894,6 +922,7 @@ bool BdwZeroCopyUncachedRender(){return false;}
 void BdwZeroCopySetUncachedRender(bool){}
 void BdwZeroCopyNoteRender(bool){}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
+int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return -38;}
 #endif
 #elif defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 // Neither option built: the default per-present BCS copy is unchanged.
@@ -918,5 +947,6 @@ bool BdwZeroCopyUncachedRender(){return false;}
 void BdwZeroCopySetUncachedRender(bool){}
 void BdwZeroCopyNoteRender(bool){}
 bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
+int64_t BdwZeroCopyAdopt(uint64_t,BdwGpuBuffer**,uint32_t& count){count=0;return -38;}
 #endif
 }

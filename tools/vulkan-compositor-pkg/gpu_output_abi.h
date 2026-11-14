@@ -70,6 +70,11 @@
 #define BROOK_GPU_PRESENT_CAP_SCANOUT 8
 #define BROOK_GPU_HANDOFF_SCANOUT_REGISTER 20
 #define BROOK_GPU_HANDOFF_SCANOUT_STATUS 21
+/* A restarted renderer adopts the images its predecessor registered (the
+ * kernel keeps one registration per boot): out = struct BrookGpuScanoutImages
+ * with count, mode and fresh fds. -ENOENT none registered (register new
+ * ones), -EPERM not the attached owner, -EBUSY an image is still in use. */
+#define BROOK_GPU_HANDOFF_SCANOUT_ADOPT 22
 #define BROOK_GPU_SCANOUT_MAX_IMAGES 4
 #define BROOK_GPU_SCANOUT_FOURCC_XRGB8888 0x34325258u
 #define BROOK_GPU_SCANOUT_REGISTERED 1u

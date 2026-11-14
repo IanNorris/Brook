@@ -139,6 +139,14 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
 - **Tests:** `test_intel_bdw_buffer` (skipped versus executed failure) and `desktop_gpu_channel_test` (failed-fence offer excluded, newer good offer selected).
 - **Not established:** what made the first client job fail. The new log line names it next time.
 
+**Fourth Dell finding (gen 376).** The recovery worked. The cause was not the dependency poison: `vkQueueSubmit` returned `VK_ERROR_DEVICE_LOST` (-4) with no job failure logged, during the first matched Quake run, with zero-copy unarmed.
+- **Why the reason was invisible:** Mesa turns *any* execbuffer error into DEVICE_LOST, and the kernel logged none of its refusal reasons.
+- **Diagnostics added:**
+  - Every refusal site (handoff reserve/submit, queue full or frozen, arm, decode, prepare) records a reason (`intel_bdw_refusal.h`).
+  - The syscall layer logs `gpu-exec: execbuffer refused pid=… errno=… reason=…` and `gpu-handoff: reserve refused …` (first 16, then powers of two), plus `gpu-exec: pid=… reset stats: context reports lost batches` when Mesa is told a context is lost.
+  - The renderer's `DESKTOP_ASYNC_RETRY` now names the failing stage. Ring starvation logs `DESKTOP_SCANOUT_STARVED kernel_free=… in_flight=…` and sets EAGAIN, where it previously left a stale errno: the gen 376 `errno=11` was such a failure.
+- **Ring re-adoption:** `BROOK_GPU_HANDOFF_SCANOUT_ADOPT` (22) hands the retained images to a restarted renderer. It is allowed only for the owner attached to the handoff, only when every image is idle (`BdwZeroCopyAdoptDecision`, host-tested), and only after any active zero-copy returns to the GOP. The renderer adopts first and registers new images only when none exist (`DESKTOP_SCANOUT_RING images=4 adopted=1`).
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:

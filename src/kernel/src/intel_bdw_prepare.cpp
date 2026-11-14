@@ -1151,6 +1151,11 @@ void BdwOffscreenHandoffOwnerExit(uint64_t owner){
     CompositorReleasePresentLease(owner);KMutexUnlock(&offscreenMutex);FreeOffscreenScene(old);FreeOffscreenScene(oldBase);
     for(unsigned i=0;i<retiredCount;++i)FreeOffscreenScene(retired[i]);
 }
+bool BdwOffscreenHandoffAttached(uint64_t owner){
+    if(!owner || !InitOffscreenMutex())return false;
+    KMutexLock(&offscreenMutex);const bool attached=offscreenSession.OwnedBy(owner);KMutexUnlock(&offscreenMutex);
+    return attached;
+}
 bool BdwOffscreenHandoffSubmit(void*,BdwExecSnapshot* snapshot,int64_t* result){
     // Every reserved output has immutable non-mappable backing. Keep the
     // session check for all aliases of protected buffers, including foreign

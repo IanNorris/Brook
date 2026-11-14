@@ -139,7 +139,17 @@ static void Stats(){
     assert(s.latched==3 && s.latchFrames[0]==1 && s.latchFrames[1]==1 && s.latchFrames[3]==1);
     assert(s.missedVblanks==1+6 && s.latchUsMax==90000 && s.latchUsSum==110500);
 }
+static void Adoption(){
+    const bool idle[4]={true,true,true,true},busy[4]={true,false,true,true};
+    assert(BdwZeroCopyAdoptDecision(0,true,idle)==BdwZeroCopyAdoption::NotRegistered);
+    assert(BdwZeroCopyAdoptDecision(4,false,idle)==BdwZeroCopyAdoption::NotAttached); // the old renderer is still attached
+    assert(BdwZeroCopyAdoptDecision(4,true,busy)==BdwZeroCopyAdoption::Busy);         // a job or ticket still holds one
+    assert(BdwZeroCopyAdoptDecision(4,true,nullptr)==BdwZeroCopyAdoption::Busy);
+    assert(BdwZeroCopyAdoptDecision(4,true,idle)==BdwZeroCopyAdoption::Adopt);
+    const bool three[3]={true,true,true};assert(BdwZeroCopyAdoptDecision(3,true,three)==BdwZeroCopyAdoption::Adopt);
+}
 int main(){
+    Adoption();
     Eligibility();Configure();Rotation();NeverWriteDisplayed();Latch();Leave();Abandon();Stats();
     return 0;
 }
