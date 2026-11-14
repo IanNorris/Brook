@@ -30,9 +30,31 @@ static bool ConfiguredDataIsClean(EFI_HANDLE image,EFI_BOOT_SERVICES* services) 
 }
 #endif
 
+static inline uint64_t ReadTsc()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+// Decimal seconds with up to two fractional digits, e.g. "0.5", "2", "1.25".
+static void PrintSeconds(uint32_t ms)
+{
+    using namespace brook::bootloader;
+    ConsolePrintDec(ms / 1000);
+    const uint32_t centis = (ms % 1000) / 10;
+    if (!centis) return;
+    char16_t frac[4] = {u'.', static_cast<char16_t>(u'0' + centis / 10),
+                        static_cast<char16_t>(u'0' + centis % 10), 0};
+    if (frac[2] == u'0') frac[2] = 0;
+    ConsolePrint(frac);
+}
+
 extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
 {
     using namespace brook::bootloader;
+    brook::BootTiming timing{};
+    timing.loaderEntryTsc = ReadTsc();
 
     ConsoleInit(systemTable->ConOut);
     ConsoleSetQuiet(true);
@@ -85,20 +107,34 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 #endif
     if (guardDenied) recoveryRequested = true;
 #endif
-    if (!recoveryRequested && g_bootConfig.recoveryMenu && systemTable->ConIn) {
+    if (!recoveryRequested && g_bootConfig.recoveryMenu && systemTable->ConIn &&
+        g_bootConfig.recoveryMenuMs) {
+        const uint32_t waitMs = g_bootConfig.recoveryMenuMs;
+        timing.waitConfiguredMs = waitMs;
         ConsoleSetQuiet(false);
-        ConsolePrintLine(u"Press F5 for Brook recovery; normal boot continues in 2 seconds.");
+        ConsolePrint(u"Press F5 for Brook recovery; normal boot continues in ");
+        PrintSeconds(waitMs);
+        ConsolePrintLine(u" s.");
         ConsoleSetQuiet(!g_bootConfig.debugText);
-        for (unsigned n=0;n<40;++n) {
+        timing.waitStartTsc = ReadTsc();
+        // Poll in 10 ms steps so short waits stay close to the configured length.
+        for (uint32_t elapsed = 0; elapsed < waitMs; elapsed += 10) {
             EFI_INPUT_KEY key{};
             EFI_STATUS status=systemTable->ConIn->ReadKeyStroke(systemTable->ConIn,&key);
-            if (!EFI_ERROR(status) && key.ScanCode==SCAN_F5) {
-                recoveryRequested=true;break;
+            if (!EFI_ERROR(status)) {
+                ++timing.waitKeyCount;
+                timing.waitLastKey = key.ScanCode | (static_cast<uint32_t>(key.UnicodeChar) << 16);
             }
-            systemTable->BootServices->Stall(50000);
+            if (!EFI_ERROR(status) && key.ScanCode==SCAN_F5) {
+                recoveryRequested=true;timing.flags|=brook::BootTimingWaitKey;break;
+            }
+            systemTable->BootServices->Stall(10000);
         }
+        timing.waitEndTsc = ReadTsc();
+        timing.flags |= brook::BootTimingWaitRan;
     }
     if (recoveryRequested) {
+        timing.flags |= brook::BootTimingRecovery;
         ConsoleSetQuiet(false);
 #if defined(BROOK_RECOVERY_GUARD_REQUIRED)
         if (guardDenied) ConsolePrintLine(u"Recovery required; normal boot blocked.");
@@ -180,6 +216,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     ConsolePrintLine(u"Brook UEFI: leaving firmware and entering kernel");
 
     // --- Exit boot services ---
+    timing.exitBootServicesTsc = ReadTsc();
     EFI_STATUS status = systemTable->BootServices->ExitBootServices(imageHandle, mapKey);
     if (EFI_ERROR(status))
     {
@@ -224,6 +261,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     bootProtocol.efiRuntimeCacheValid = firmwareRuntimeCache.fingerprint.valid ? 1 : 0;
     bootProtocol.efiRuntimeMtrrFingerprint = firmwareRuntimeCache.mtrr;
     bootProtocol.efiRuntimeMtrrValid = firmwareRuntimeCache.mtrr ? 1 : 0;
+    timing.flags |= brook::BootTimingValid;
+    timing.kernelJumpTsc = ReadTsc();
+    bootProtocol.timing = timing;
 
     // --- Jump to kernel at virtual address ---
     // Use inline asm to ensure SysV calling convention:

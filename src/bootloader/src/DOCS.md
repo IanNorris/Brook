@@ -70,3 +70,41 @@ correctly. The identity-map-all-RAM approach is simple and intentional.
 Main risks are in the crash dump user-pointer dereference and missing
 ELF entry validation — both are defense-in-depth concerns rather than
 likely failure modes.
+
+## Boot timing handoff (BootProtocol v6)
+
+The loader records raw boot-CPU TSC values in `BootProtocol::timing`
+(`src/shared/boot_protocol/boot_protocol.h`): EfiMain entry, F5-wait start
+and end, just before ExitBootServices and just before the kernel jump, plus
+flags, the configured wait and the keystrokes ConIn returned during the wait.
+The kernel reads them only when `version >= 6`, so a new kernel booted by an
+older loader shows "n/a" for firmware, menu and loader. An older kernel ignores
+the appended fields.
+
+The kernel (`src/kernel/src/boot_timing.*`) converts with the TSC rate it
+measures during LAPIC calibration and logs one `BOOT_TIMING` line plus a
+`BOOT_TIMING_DETAIL` line when the desktop is first presented:
+
+- **firmware:** ACPI FPDT `OsLoaderStartImageStart` when an FBPT is present
+  (`src=fpdt`), else loader-entry TSC since reset (`src=tsc`, valid only below
+  ten minutes, i.e. after a clean reset). OVMF publishes no FPDT.
+- **wait:** the measured F5 wait (0 when `RECOVERY_MENU` is off).
+- **loader:** loader entry to kernel entry, minus the wait. In the guarded
+  loader this includes the guard-record check, the optional data-disk
+  inspection and reading/verifying the payload.
+- **kernel:** kernel entry to the first presented desktop frame. In a guarded
+  desktop kernel this includes the in-kernel guard checker and desktop handoff.
+  After an automatic repair, the recovery kernel resets the machine; the TSC
+  restarts, so every number describes only the final boot.
+
+## Recovery wait
+
+`RECOVERY_MENU=1` enables the F5 prompt; `RECOVERY_MENU_MS` (0–10000,
+default 500) sets its length, polled every 10 ms. In QEMU/OVMF a PS/2 F5 sent
+during the prompt selects recovery. On the Dell the wait reportedly ignores
+input: unconfirmed, but the likely cause is that a fast-boot firmware path does
+not connect the keyboard to ConIn for the default boot entry (F5 worked after a
+firmware-menu selection). `BOOT_TIMING_DETAIL wait_keys=` / `last_key=` now
+show whether ConIn delivered any key during the wait; if it reports zero while
+keys are pressed, connecting the console controllers before the wait is the
+next step (not done: it needs physical testing).

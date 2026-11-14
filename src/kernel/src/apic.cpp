@@ -1,5 +1,6 @@
 #include "ioapic_route_policy.h"
 #include "apic.h"
+#include "boot_timing.h"
 #include "idt.h"
 #include "gs_paranoid.h"
 #include "fpu_irq.h"
@@ -594,7 +595,16 @@ static void LapicTimerHandler(void)
 
 static constexpr uint32_t PIT_FREQUENCY      = 1193182;   // Hz
 
-static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs)
+static uint32_t g_tscKhzSamples[5] = {};
+static uint32_t g_tscKhz = 0;
+static inline uint64_t CalibrationTsc()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs, uint32_t* tscKhz = nullptr)
 {
     LapicWrite(LapicReg::TIMER_DIVIDE, 0x3);
 
@@ -608,10 +618,18 @@ static uint32_t CalibrateLapicTimerOnce(uint32_t windowMs)
     outb(0x42, static_cast<uint8_t>(pitTicks >> 8));
 
     LapicWrite(LapicReg::TIMER_INIT_CNT, 0xFFFFFFFF);
+    const uint64_t tscStart = CalibrationTsc();
 
     while (!(inb(0x61) & 0x20)) {}
 
+    const uint64_t tscEnd = CalibrationTsc();
     uint32_t remaining = LapicRead(LapicReg::TIMER_CUR_CNT);
+    if (tscKhz) {
+        // The same PIT one-shot window also yields the boot CPU's TSC rate.
+        const uint64_t delta = tscEnd > tscStart ? tscEnd - tscStart : 0;
+        const uint64_t khz = delta * PIT_FREQUENCY / (static_cast<uint64_t>(pitTicks) * 1000);
+        *tscKhz = khz <= 0xFFFFFFFFu ? static_cast<uint32_t>(khz) : 0;
+    }
     LapicWrite(LapicReg::TIMER_INIT_CNT, 0);
 
     outb(0x61, prev61);
@@ -633,13 +651,17 @@ static uint32_t CalibrateLapicTimer()
     uint32_t samples[5] = {};
     for (int i = 0; i < 5; ++i)
     {
-        uint32_t s = CalibrateLapicTimerOnce(25);
+        uint32_t s = CalibrateLapicTimerOnce(25, &g_tscKhzSamples[i]);
         samples[i] = s;
         if (s > best) best = s;
     }
 
     SerialPrintf("APIC: LAPIC calibrated %u ticks/ms (samples %u %u %u %u %u)\n",
                  best, samples[0], samples[1], samples[2], samples[3], samples[4]);
+    g_tscKhz = BootTimingMedianKhz(g_tscKhzSamples);
+    SerialPrintf("APIC: TSC %u kHz (samples %u %u %u %u %u)\n", g_tscKhz,
+                 g_tscKhzSamples[0], g_tscKhzSamples[1], g_tscKhzSamples[2],
+                 g_tscKhzSamples[3], g_tscKhzSamples[4]);
     return best;
 }
 
@@ -731,6 +753,11 @@ void ApicSendEoi()
 uint8_t ApicGetId()
 {
     return static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
+}
+
+uint32_t ApicGetTscKhz()
+{
+    return g_tscKhz;
 }
 
 uint32_t ApicGetTimerTicksPerMs()
