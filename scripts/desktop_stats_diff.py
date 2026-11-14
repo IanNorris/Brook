@@ -105,7 +105,7 @@ def main():
 
     p_after, p_before = after['presents'], (before or {}).get('presents')
     print('\nglobal rates (per second)')
-    for key in ('completed', 'full', 'partial', 'graphics', 'compute', 'failed', 'stale', 'busy_retries',
+    for key in ('completed', 'full', 'partial', 'graphics', 'compute', 'quad', 'failed', 'stale', 'busy_retries',
                 'prepare_failures', 'direct_layers'):
         value = delta(p_after, p_before, key)
         print(f'  presents.{key:<17} {value / seconds:>9.2f}/s  ({value})')
@@ -119,6 +119,16 @@ def main():
             mean, count = duration_mean_ms(c_after[key], c_before[key] if c_before else None)
             parts.append(f'{label} {fmt(mean)} (n={count})')
         print('  ' + '  '.join(parts))
+        work_after = c_after.get('composition')
+        if work_after:
+            work_before = c_before.get('composition') if c_before else None
+            n = delta(work_after, work_before, 'frames')
+            if n > 0:
+                per = {k: delta(work_after, work_before, k) / n for k in
+                       ('layers_drawn', 'draws', 'pixels_shaded', 'damage_pixels')}
+                print(f'  {"":<9} per frame: layers {per["layers_drawn"]:.2f}  draws {per["draws"]:.1f}  '
+                      f'shaded {per["pixels_shaded"] / 1e6:.3f} Mpx  damage {per["damage_pixels"] / 1e6:.3f} Mpx  '
+                      f'(max shaded {work_after["max_pixels_shaded"] / 1e6:.3f} Mpx lifetime)')
     o_after, o_before = after['overlay'], (before or {}).get('overlay')
     captures = delta(o_after, o_before, 'captures')
     mean, _ = duration_mean_ms(o_after['wait'], o_before['wait'] if o_before else None)
@@ -126,6 +136,15 @@ def main():
     print(f'  overlay captures {captures / seconds:.2f}/s ({captures}) failures {delta(o_after, o_before, "failures")} '
           f'mean_wait {fmt(mean)} polls/capture {polls / captures if captures else 0:.2f} '
           f'max_polls(lifetime) {o_after["max_polls"]}')
+    if 'idle' in after:
+        i_after, i_before = after['idle'], (before or {}).get('idle')
+        print(f'  idle polls skipped {delta(i_after, i_before, "skipped_polls") / seconds:.2f}/s  '
+              f'keepalive presents {delta(i_after, i_before, "keepalive_presents")}')
+    if 'last_frame' in after:
+        last = after['last_frame']
+        print(f'  last frame: path={last["path"]} direct={last["direct"]} partial={last["partial"]} '
+              f'layers={last["layers_drawn"]} draws={last["draws"]} shaded={last["pixels_shaded"]} '
+              f'damage={last["damage_pixels"]} submit->fence={last["cpu_submit_to_fence_ns"] / 1e6:.2f}ms')
     evictions = after['window_evictions'] - (before['window_evictions'] if before else 0)
     print(f'  window table evictions {evictions}  publish_failures {after["publish_failures"]}')
     return 0

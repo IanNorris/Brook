@@ -4,6 +4,9 @@
 #include "brook_debug_frame.h"
 #include "renderer.h"
 #include "graphics_pass.h"
+#include "quad_pass.h"
+#include "quad_plan.h"
+#include "desktop_track.h"
 #include "desktop_fence_recovery.h"
 #include "desktop_blocked_recovery.h"
 #include "scene.h"
@@ -30,6 +33,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <signal.h>
+#include <poll.h>
 #include <unistd.h>
 
 #define IOC(n,s) ((3u<<30)|((unsigned)(s)<<16)|('d'<<8)|(n))
@@ -40,8 +44,12 @@ struct prime {uint32_t handle,flags;int32_t fd;};
 struct gem_close {uint32_t handle,pad;};
 struct Source {uint32_t handle;int fd;uint64_t size;void *map;unsigned smallUses;};
 struct RenderContext {
-    BrookVkRenderer *renderer;int output;uint32_t width,height;
+    BrookVkRenderer *renderer;int output;uint32_t width,height;uint64_t outputBytes;
     BrookVkGraphicsPass *graphics;
+    /* Per-layer quad compositor (default for asynchronous frames), its
+     * draw plan, and this context's change-tracking state of the frame it
+     * prepared (swapped with g_trackDisplayed when that frame presents). */
+    BrookVkQuadPass *quad;struct QuadPlan *plan;struct DesktopTrackState *track;
     BrookVkRenderer *batchRenderer;int batchOutput;uint64_t batchOutputBytes;unsigned batchOutputSmallUses;
     uint32_t *batchScenes;struct Source batchBackdrop;int lastPartial,expiryInjected;
     uint64_t lastPresentNs;
@@ -57,7 +65,8 @@ struct RenderContext {
 };
 struct PendingDesktopFrame {
     long ticket;uint64_t frame,started,nextReport,skippedBytes;uint32_t width,height,visible,skippedLayers;unsigned direct;
-    int partial,graphics,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
+    int partial,graphics,quad,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
+    uint32_t statsLayers,statsDraws;uint64_t statsShaded,statsDamage;
     struct DesktopOverlayFrameState overlay;
     uint64_t traceStart,traceSubmitStart,traceReceived,traceCompleted,statsSubmitStart,statsFence;uint32_t traceWindow;uint64_t traceIncarnation,traceCommit;
     uint64_t traceChannel,traceQuery,traceClients,traceBackdrop,traceChrome,traceOverlay,tracePixels;
@@ -85,6 +94,18 @@ static struct DesktopOverlayFrameState g_overlayDisplayed;static uint64_t g_over
 static int g_overlayTracked=-1;
 static struct BrookDesktopOverlayCursor g_cursorInfo;
 static long g_presentingTicket;
+/* Change tracking: the state of the frame on screen (valid=0: unknown),
+ * the last successful present, and the idle poll / lease keepalive policy.
+ * The kernel's presentation lease lasts 500 ms; keep it with a minimal
+ * partial present when nothing changes. */
+static struct DesktopTrackState *g_trackDisplayed;
+static uint64_t g_lastPresentNs;
+static uint64_t g_idlePollNs=8000000ull;
+enum { DESKTOP_KEEPALIVE_NS=200000000ull };
+static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
+/* Bounded runs (--frames N) present a minimal frame instead of idling. */
+static int g_neverIdle;
+static uint64_t g_quadSubmitted,g_quadFallback;
 /* Always-on counters (desktop_stats.h), published by stats_tick(). */
 static struct DesktopStats g_stats;
 static volatile sig_atomic_t g_statsRequested;
@@ -108,6 +129,10 @@ static void context_init(struct RenderContext *ctx){
 }
 
 static void context_close(int drm,struct RenderContext *ctx){
+    if(ctx->quad && !brook_vk_quad_pass_destroy(ctx->quad)){
+        fprintf(stderr,"DESKTOP_QUAD_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
+    }
+    free(ctx->plan);free(ctx->track);
     if(ctx->graphics && !brook_vk_graphics_pass_destroy(ctx->graphics)){
         fprintf(stderr,"DESKTOP_GRAPHICS_DESTROY_UNCERTAIN resources retained\n");for(;;)pause();
     }
@@ -132,8 +157,18 @@ static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint
     context_close(drm,ctx);
     ctx->output=(int)syscall(BROOK_SYS_GPU_OUTPUT_ALLOC,(long)((uint64_t)width*height*4),0L,0L,0L,0L,0L);
     if(ctx->output<0)return -1;
+    {const off_t size=lseek(ctx->output,0,SEEK_END);
+     if(size<(off_t)((uint64_t)width*height*4) || lseek(ctx->output,0,SEEK_SET)!=0){context_close(drm,ctx);return -1;}
+     ctx->outputBytes=(uint64_t)size;}
     ctx->renderer=brook_vk_renderer_create_multi_output(words,0);
-    if(!ctx->renderer){context_close(drm,ctx);return -1;}
+    ctx->plan=calloc(1,sizeof(*ctx->plan));ctx->track=calloc(1,sizeof(*ctx->track));
+    if(!ctx->renderer || !ctx->plan || !ctx->track){context_close(drm,ctx);return -1;}
+    if(g_quadMode && !getenv("BROOK_RENDER_GRAPHICS_SCENE")){
+        VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
+        if(brook_vk_renderer_graphics_context(ctx->renderer,&physical,&device,&queue,&family))
+            ctx->quad=brook_vk_quad_pass_create(physical,device,queue,family);
+        if(!ctx->quad)fprintf(stderr,"DESKTOP_QUAD_UNAVAILABLE compute fallback\n");
+    }
     if(getenv("BROOK_RENDER_GRAPHICS_SCENE")){
         VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
         if(brook_vk_renderer_graphics_context(ctx->renderer,&physical,&device,&queue,&family))
@@ -288,7 +323,12 @@ static int arm_test_block(long ticket){
     const int fd=open(marker,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd<0)return -1;
     close(fd);fprintf(stderr,"DESKTOP_TEST_BLOCKED_FENCE_ARMED\n");return 1;
 }
-static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint64_t *presentedNs,struct PendingDesktopFrame *pending,int asyncPartial,uint64_t baselineTicket){
+/* Returns 0 for a presented frame, 1 for a submitted asynchronous frame,
+ * 2 when nothing changed since the displayed frame (no GPU work; poll
+ * again later) and -1 for a safe retry. quiescent: no other frame is in
+ * flight, so the displayed frame is the baseline for change tracking. */
+static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint64_t *presentedNs,struct PendingDesktopFrame *pending,
+                        int asyncPartial,uint64_t baselineTicket,int quiescent){
     const int traceEnabled=getenv("BROOK_RENDER_TIMELINE")!=NULL;
     const uint64_t traceStart=traceEnabled?monotonic_ns():0;
     desktop_gpu_channel_poll(&g_gpuChannel);
@@ -316,6 +356,10 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     const size_t words=SCENE_HEADER;
     if(context_prepare(drm,ctx,width,height,words))goto done;
     if(traceEnabled)traceQuery=monotonic_ns();
+    struct DesktopTrackState *track=ctx->track;int trackOk=g_trackDamage;
+    track->valid=0;track->count=0;track->width=width;track->height=height;
+    /* Output rectangles a scene layer leaves unchanged (chrome interiors). */
+    struct QuadRect holes[BROOK_VK_MAX_LAYERS];memset(holes,0,sizeof(holes));
     scene[0]=width;scene[1]=height;
     for(unsigned i=0;i<layers.count;++i){
         if(getenv("BROOK_RENDER_SELECTIVE_CAPTURE")){
@@ -342,6 +386,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_BACKDROP_TRACKED_CAPTURE,&backdrop,sizeof(backdrop),0,0,0))goto done;
         ctx->backdropIdentity=identity;
     }
+    track->display=identity.display;track->backdrop=identity.generation;
     timing[2]=monotonic_ns();
     stage="chrome_capture";
     unsigned count=0;uint64_t clientBytes=0,chromeBytes=0;
@@ -377,6 +422,12 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             memcpy(scene+BROOK_VK_SCENE_HEADER+count*BROOK_VK_LAYER_WORDS,&content,sizeof(content));++count;
         }else if(push(scene,&count,sources,&client[i],&content))goto done;
         clientBytes+=client[i].size;
+        struct DesktopTrackWindow *trackWindow=&track->windows[i];
+        *trackWindow=(struct DesktopTrackWindow){.window=l->window,.incarnation=l->incarnation,.direct=direct!=NULL,
+            .commit=direct?direct->packet.identity.commit:0};
+        memcpy(trackWindow->layer,&content,sizeof(content));
+        if(trackOk && !direct && !desktop_track_bands(&trackWindow->content,client[i].map,client[i].size/4,content.sourceStrideWords,
+                content.sourceX,content.sourceY,content.sourceWidthUsed,content.sourceHeightUsed,NULL))trackOk=0;
         struct BrookDesktopLayers decor={.version=BROOK_DESKTOP_LAYERS_VERSION};decor.layers[0].window=l->window;
         if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_QUERY,&decor,sizeof(decor),0,0,0))goto done;
         struct BrookDesktopLayer *c=&decor.layers[0];
@@ -387,6 +438,11 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&decor,sizeof(decor),0,0,0))goto done;
         if(c->bytes){
             uint32_t opacity=0;if(!desktop_layer_opacity(l,&opacity))goto done;
+            /* The OS leaves the client interior of the chrome transparent. */
+            const struct DesktopTrackHole hole=desktop_track_chrome_hole(l,c);
+            trackWindow->hasChrome=1;trackWindow->chromeOpacity=opacity;trackWindow->chromeX=c->clientX;trackWindow->chromeY=c->clientY;
+            trackWindow->chromeWidth=c->width;trackWindow->chromeHeight=c->height;
+            if(trackOk && !desktop_track_bands(&trackWindow->chrome,chrome[i].map,chrome[i].size/4,c->stride,0,0,c->width,c->height,&hole))trackOk=0;
             struct BrookVkSceneLayer layer={0,c->stride,c->width,c->height,0,0,c->width,c->height,
                 c->clientX,c->clientY,c->width,c->height,0,0,width,height,opacity|BROOK_VK_STRAIGHT_ALPHA};
             struct DesktopChromeSpan spans[4];
@@ -405,6 +461,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                     chromeBytes+=part->size;
                 }
             }else{
+                if(g_chromeHoles && hole.width && hole.height && count<BROOK_VK_MAX_LAYERS)holes[count]=(struct QuadRect){
+                    (int32_t)((int64_t)c->clientX+hole.x),(int32_t)((int64_t)c->clientY+hole.y),
+                    (int32_t)((int64_t)c->clientX+hole.x+hole.width),(int32_t)((int64_t)c->clientY+hole.y+hole.height)};
                 if(push(scene,&count,sources,&chrome[i],&layer))goto done;
                 chromeBytes+=chrome[i].size;
             }
@@ -413,6 +472,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         }
     }
     chromeEndNs=monotonic_ns();
+    track->count=layers.count;track->valid=trackOk;
     stage="overlay_capture";
     /* Recapture only when the kernel's overlay content generation changed. */
     const uint64_t overlayGeneration=overlay_generation();
@@ -439,6 +499,25 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     desktop_overlay_damage(&g_overlayDisplayed,&frameOverlay,&footprint);
     scene[2]=count;
     struct DesktopDamageSet damage=desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
+    /* Change-based damage against the displayed frame, when that frame is
+     * known and no other frame can present first. */
+    int tracked=0;
+    if(quiescent && !baselineTicket && track->valid && g_trackDisplayed && ctx->damage.display==identity.display &&
+       ctx->damage.backdrop==identity.generation && ctx->damage.width==width && ctx->damage.height==height){
+        struct DesktopDamageSet changes={0};
+        if(desktop_track_diff(g_trackDisplayed,track,&changes)){
+            desktop_overlay_damage(&g_overlayDisplayed,&frameOverlay,&changes);
+            damage=changes;tracked=1;
+        }
+    }
+    if(tracked && !damage.count){
+        const uint64_t now=monotonic_ns();
+        if(!g_neverIdle && g_lastPresentNs && now>=g_lastPresentNs && now-g_lastPresentNs<DESKTOP_KEEPALIVE_NS){
+            ++g_stats.idleSkips;result=2;stage="idle";goto done;
+        }
+        /* Renew the presentation lease with a minimal, exact partial frame. */
+        damage.count=1;damage.rects[0]=(struct DesktopDamageRect){0,0,width<16?width:16,1};++g_stats.keepalives;
+    }
     uint64_t damagePixels=0;for(uint32_t i=0;i<damage.count;++i){const struct DesktopDamageRect *r=&damage.rects[i];
         damagePixels+=(uint64_t)(r->right-r->left)*(uint64_t)(r->bottom-r->top);}
     if(getenv("BROOK_RENDER_TIMING")){
@@ -461,9 +540,71 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 damagePixels+=(uint64_t)(r->right-r->left)*(uint64_t)(r->bottom-r->top);}
         }
     }
-    BrookVkResult status;int testArmed=0,graphicsUsed=0;uint32_t traceLayers=count;
+    BrookVkResult status=BROOK_VK_REJECTED;int testArmed=0,graphicsUsed=0,quadUsed=0;uint32_t traceLayers=count;
+    uint32_t statsDraws=0;uint64_t statsShaded=0;
     struct BrookGpuPresentRegions regionBatch={0};
-    if(attemptPartial){
+    /* Default path: per-layer quads limited to the (16-pixel aligned)
+     * damage, drawn into the full-size output; present only those regions.
+     * Rejection falls back to the compute paths below. */
+    if(pending && ctx->quad && !getenv("BROOK_RENDER_TEST_BLOCKED_FENCE")){
+        const int partialEligible=(!pending || asyncPartial) && ctx->damage.display==identity.display &&
+            ctx->damage.backdrop==identity.generation && ctx->damage.width==width && ctx->damage.height==height &&
+            damage.count && damagePixels<(uint64_t)width*height;
+        struct DesktopDamageSet qdamage={1,{{0,0,width,height}}};int qpartial=0;
+        if(partialEligible && desktop_graphics_damage(&damage,width,height,&qdamage)){
+            uint64_t pixels=0;for(uint32_t i=0;i<qdamage.count;++i){const struct DesktopDamageRect *r=&qdamage.rects[i];
+                pixels+=(uint64_t)(r->right-r->left)*(uint64_t)(r->bottom-r->top);}
+            qpartial=pixels<(uint64_t)width*height;
+        }
+        if(!qpartial)qdamage=(struct DesktopDamageSet){1,{{0,0,width,height}}};
+        struct QuadPlan *plan=ctx->plan;
+        stage="quad_plan";
+        if(quad_plan_build_auto(scene,words,holes,&qdamage,g_quadOcclusion,plan) &&
+           async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,plan->used,count)){
+            stage="quad_reserve";
+            const int dependent=qpartial && baselineTicket;
+            ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,dependent?BROOK_GPU_HANDOFF_RESERVE_DEPENDENT:BROOK_GPU_HANDOFF_RESERVE,
+                           ctx->output,dependent?baselineTicket:0,0,0,0);
+            if(ticket<=0)goto done;
+            struct BrookVkQuadSource inputs[BROOK_VK_MAX_LAYERS];
+            for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
+                inputs[i]=(struct BrookVkQuadSource){{sources[i].fd,sources[i].syncFd,l[2],l[3],l[0],l[1],(uint64_t)sources[i].words*4u},
+                    !directSource[i]};}
+            const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},1};
+            stage="quad_submit";
+            statsSubmitStart=monotonic_ns();
+            if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
+            status=brook_vk_quad_pass_submit(ctx->quad,scene,words,inputs,count,&output,plan);
+            if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN resources retained\n");for(;;)pause();}
+            if(status==BROOK_VK_PENDING){
+                quadUsed=1;++g_quadSubmitted;attemptPartial=qpartial;damage=qdamage;damagePixels=plan->damagePixels;
+                traceLayers=plan->layersDrawn;statsDraws=plan->drawCount;statsShaded=plan->pixelsShaded;
+                /* Only content actually sampled advances commit barriers;
+                 * release culled (for example occluded) direct offers. */
+                for(unsigned i=0;i<count;++i){frameDirect+=directSource[i] && plan->used[i];
+                    if(!directOffer[i] || plan->used[i])continue;
+                    const struct BrookGpuWindowIdentity *id=&directOffer[i]->packet.identity;
+                    for(unsigned j=0;j<layers.count;++j)if(frameSources[j].window==id->window &&
+                        frameSources[j].incarnation==id->incarnation && frameSources[j].commit==id->commit)frameSources[j].commit=0;
+                    desktop_gpu_channel_unselect(&g_gpuChannel,directOffer[i],frame);
+                }
+                if(qpartial){regionBatch.count=damage.count;
+                    for(uint32_t i=0;i<damage.count;++i){const struct DesktopDamageRect *r=&damage.rects[i];
+                        regionBatch.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,
+                            (uint32_t)r->left,(uint32_t)r->top,(uint32_t)(r->right-r->left),(uint32_t)(r->bottom-r->top),width,0};}
+                }
+            }else{
+                ++g_quadFallback;
+                if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0)){
+                    fprintf(stderr,"DESKTOP_QUAD_RELEASE_UNCERTAIN resources retained\n");for(;;)pause();}
+                ticket=-1;
+                if(getenv("BROOK_RENDER_DIAGNOSTIC"))fprintf(stderr,"DESKTOP_QUAD_REJECTED compute fallback\n");
+            }
+        }else ++g_quadFallback;
+        if(!quadUsed)for(unsigned i=0;i<layers.count;++i)frameSources[i].omitted=0;
+    }
+    if(quadUsed){}
+    else if(attemptPartial){
         stage="batch_prepare";
         const uint64_t bytes=(damagePixels+(uint64_t)(damage.count-1)*(DESKTOP_TILE_ALIGNMENT_WORDS-1))*4;
         size_t sourceWords[BROOK_VK_MAX_LAYERS],culledWords[BROOK_VK_MAX_LAYERS];
@@ -494,7 +635,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 frameSources[j].commit=0;
             desktop_gpu_channel_unselect(&g_gpuChannel,directOffer[i],frame);
         }
-        status=BROOK_VK_REJECTED;
+        status=BROOK_VK_REJECTED;statsDraws=damage.count;
         if(pending && ctx->graphics && getenv("BROOK_RENDER_GRAPHICS_PARTIAL") && !(width&15u) &&
            batchCount<=BROOK_VK_GRAPHICS_MAX_LAYERS && !getenv("BROOK_RENDER_TEST_BLOCKED_FENCE")){
             struct BrookVkGraphicsBuffer inputs[BROOK_VK_GRAPHICS_MAX_LAYERS];
@@ -555,6 +696,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         }
     }else{
         for(unsigned i=0;i<count;++i)frameDirect+=directSource[i];
+        statsDraws=1;
         stage="full_reserve";ticket=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RESERVE,ctx->output,0,0,0,0);if(ticket<=0)goto done;
         stage="full_test_arm";testArmed=arm_test_block(ticket);if(testArmed<0)goto done;
         stage="full_compose";
@@ -581,6 +723,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             status=pending?brook_vk_renderer_submit_batch_output(ctx->renderer,scene,words,1,sources,count,ctx->output,(size_t)width*height):
                 brook_vk_renderer_compose_multi_output(ctx->renderer,scene,words,sources,count,ctx->output,(size_t)width*height,testArmed?100000000ULL:10000000000ULL);
     }
+    /* Compute shades every layer at every damaged pixel. */
+    const uint64_t statsDamage=attemptPartial?damagePixels:(uint64_t)width*height;
+    if(!quadUsed)statsShaded=statsDamage*traceLayers;
     if(pending && status==BROOK_VK_PENDING){
         uint32_t skipped=0;uint64_t skippedBytes=0;
         for(unsigned i=0;i<layers.count;++i)if(skipMask&(1u<<i)){++skipped;skippedBytes+=layers.layers[i].bytes;}
@@ -591,7 +736,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .tracePixels=attemptPartial?damagePixels:(uint64_t)width*height,.traceLayers=traceLayers,.traceRegions=attemptPartial?damage.count:1,
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
             .skippedBytes=skippedBytes,.width=width,.height=height,.visible=layers.count,.skippedLayers=skipped,.direct=frameDirect,
-            .partial=attemptPartial,.graphics=graphicsUsed,.regions=regionBatch,
+            .partial=attemptPartial,.graphics=graphicsUsed,.quad=quadUsed,.regions=regionBatch,
+            .statsLayers=traceLayers,.statsDraws=statsDraws,.statsShaded=statsShaded,.statsDamage=statsDamage,
             .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
         return 1;
@@ -651,7 +797,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
     desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){frameSources,layers.count,frameDirect,attemptPartial,graphicsUsed,
-        *presentedNs,timing[0],statsSubmitStart,timing[4],0,0});
+        *presentedNs,timing[0],statsSubmitStart,timing[4],0,0,graphicsUsed?DESKTOP_STATS_PATH_GRAPHICS:DESKTOP_STATS_PATH_COMPUTE,
+        traceLayers,statsDraws,statsShaded,statsDamage});
+    g_lastPresentNs=*presentedNs;
     desktop_gpu_channel_presented(&g_gpuChannel,frame);
     if(getenv("BROOK_RENDER_TRACE_OCCLUSION"))for(unsigned i=0;i<count;++i){
         const struct DesktopGpuOffer *offer=directOffer[i];if(!offer || offer->state!=2)continue;
@@ -679,6 +827,10 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
 #endif
     desktop_damage_commit(&ctx->damage,identity.display,identity.generation,width,height,footprint);
+    if(g_trackDisplayed){
+        if(track->valid){struct DesktopTrackState *shown=g_trackDisplayed;g_trackDisplayed=ctx->track;ctx->track=shown;}
+        else g_trackDisplayed->valid=0;
+    }
     desktop_overlay_presented(&g_overlayDisplayed,&g_overlayDisplayedTicket,&frameOverlay,0);
     ctx->lastPartial=attemptPartial;
     if(getenv("BROOK_RENDER_TIMING_AGGREGATE") && timing[0] && timing[5]>=timing[4]){
@@ -714,11 +866,13 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             (unsigned long)((timing[5]-timing[4])/1000000ull));
 done:
     savedErrno=errno;
-    if(result){if(presentFailed){++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}else ++g_stats.prepareFailures;}
+    if(result<0){if(presentFailed){++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;}else ++g_stats.prepareFailures;}
+    /* A failed present may have changed what is on screen. */
+    if(result<0 && presentFailed && g_trackDisplayed)g_trackDisplayed->valid=0;
     desktop_gpu_channel_finish(&g_gpuChannel,frame);
     if(ticket>0)(void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,ticket,0,0,0,0);
-    if(attemptPartial && result)ctx->damage=(struct DesktopDamageState){0};
-    if(result && getenv("BROOK_RENDER_DIAGNOSTIC")){
+    if(attemptPartial && result<0)ctx->damage=(struct DesktopDamageState){0};
+    if(result<0 && getenv("BROOK_RENDER_DIAGNOSTIC")){
         uint64_t now=monotonic_ns(),age=ctx->lastPresentNs && now>=ctx->lastPresentNs?(now-ctx->lastPresentNs)/1000000ull:0;
         uint64_t startAge=ctx->lastPresentNs && presentStartNs>=ctx->lastPresentNs?
             (presentStartNs-ctx->lastPresentNs)/1000000ull:0;
@@ -730,7 +884,8 @@ done:
 }
 static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer,struct PendingDesktopFrame *p){
     if(p->compositionReady)return 1;
-    BrookVkResult status=p->graphics?brook_vk_graphics_pass_poll(ctx->graphics):brook_vk_renderer_poll(renderer);
+    BrookVkResult status=p->quad?brook_vk_quad_pass_poll(ctx->quad):p->graphics?brook_vk_graphics_pass_poll(ctx->graphics):
+        brook_vk_renderer_poll(renderer);
     if(status==BROOK_VK_PENDING){
         uint64_t now=monotonic_ns();
         if(!g_presentingTicket && p->nextReport && now>=p->nextReport){
@@ -745,7 +900,7 @@ static int composition_ready(struct RenderContext *ctx,BrookVkRenderer *renderer
         return 0;
     }
     if(status!=BROOK_VK_COMPLETE){
-        if(p->graphics){fprintf(stderr,"DESKTOP_GRAPHICS_UNCERTAIN result=%d resources retained\n",status);for(;;)pause();}
+        if(p->graphics || p->quad){fprintf(stderr,"DESKTOP_%s_UNCERTAIN result=%d resources retained\n",p->quad?"QUAD":"GRAPHICS",status);for(;;)pause();}
         struct BrookVkFailure failure=brook_vk_renderer_failure(renderer);
         fprintf(stderr,"DESKTOP_ASYNC_UNCERTAIN stage=%d vk_result=%d resources retained\n",failure.stage,failure.result);
         for(;;)pause();
@@ -800,19 +955,28 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
     if(!result){
         *presented=monotonic_ns();ctx->lastPresentNs=*presented;ctx->lastPartial=p->partial;
         desktop_async_damage_retire(displayedDamage,p->damage,p->partial,1);
+        g_lastPresentNs=*presented;
+        if(g_trackDisplayed){
+            if(ctx->track->valid && (!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)){
+                struct DesktopTrackState *shown=g_trackDisplayed;g_trackDisplayed=ctx->track;ctx->track=shown;
+            }else g_trackDisplayed->valid=0;
+        }
         desktop_overlay_presented(&g_overlayDisplayed,&g_overlayDisplayedTicket,&p->overlay,(uint64_t)p->ticket);
         async_sources_committed(g_asyncSourceBarriers,p->sources,p->visible);
         desktop_gpu_channel_presented(&g_gpuChannel,p->frame);
         g_gpuDirectLayers+=p->direct;g_gpuSkippedLayers+=p->skippedLayers;g_gpuSkippedBytes+=p->skippedBytes;
-        uint64_t gpuNs=0;const int gpuValid=p->graphics?brook_vk_graphics_pass_gpu_timestamp_ns(ctx->graphics,&gpuNs):
-            brook_vk_renderer_gpu_timestamp_ns(renderer,&gpuNs);
+        uint64_t gpuNs=0;const int gpuValid=p->quad?brook_vk_quad_pass_gpu_timestamp_ns(ctx->quad,&gpuNs):
+            p->graphics?brook_vk_graphics_pass_gpu_timestamp_ns(ctx->graphics,&gpuNs):brook_vk_renderer_gpu_timestamp_ns(renderer,&gpuNs);
         desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){p->sources,p->visible,p->direct,p->partial,p->graphics,
-            *presented,p->traceStart,p->statsSubmitStart,p->statsFence,gpuNs,gpuValid});
+            *presented,p->traceStart,p->statsSubmitStart,p->statsFence,gpuNs,gpuValid,
+            p->quad?DESKTOP_STATS_PATH_QUAD:p->graphics?DESKTOP_STATS_PATH_GRAPHICS:DESKTOP_STATS_PATH_COMPUTE,
+            p->statsLayers,p->statsDraws,p->statsShaded,p->statsDamage});
         if(getenv("BROOK_RENDER_ASYNC_TRACE"))for(unsigned i=0;i<p->visible;++i){const struct AsyncWindowSource *s=&p->sources[i];
             fprintf(stderr,"DESKTOP_ASYNC_SOURCE ticket=%ld window=%u incarnation=%llu generation=%llu source=%s commit=%llu snapshot_commit=%llu omitted=%u\n",
                 p->ticket,s->window,(unsigned long long)s->incarnation,(unsigned long long)s->generation,
                 s->commit?"gpu":"cpu",(unsigned long long)s->commit,(unsigned long long)s->snapshotCommit,s->omitted);}
     }else {++g_stats.presentFailures;if(savedErrno==ESTALE)++g_stats.presentStale;
+        if(g_trackDisplayed)g_trackDisplayed->valid=0;
         if(!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)
             desktop_async_damage_retire(displayedDamage,p->damage,p->partial,0);
         (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,p->ticket,0,0,0,0);}
@@ -833,13 +997,14 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
     if(!result && p->traceSubmitStart && p->traceCompleted &&
        ((p->direct==1 && p->traceReceived) || (timelineAll && g_asyncTimelineAllArmed))){
         const uint64_t finish=monotonic_ns();
-        uint64_t gpuNs=0;const int gpuValid=p->graphics?brook_vk_graphics_pass_gpu_timestamp_ns(ctx->graphics,&gpuNs):
-            brook_vk_renderer_gpu_timestamp_ns(renderer,&gpuNs);
+        uint64_t gpuNs=0;const int gpuValid=p->quad?brook_vk_quad_pass_gpu_timestamp_ns(ctx->quad,&gpuNs):
+            p->graphics?brook_vk_graphics_pass_gpu_timestamp_ns(ctx->graphics,&gpuNs):brook_vk_renderer_gpu_timestamp_ns(renderer,&gpuNs);
         const unsigned limit=timelineAll?512:64;
         if(g_asyncTimelineCount<limit)g_asyncTimeline[g_asyncTimelineCount++]=(struct AsyncTimelineRow){
             p->frame,(uint64_t)p->ticket,p->traceWindow,p->traceIncarnation,p->traceCommit,p->traceReceived,
             p->traceStart,p->traceSubmitStart,p->started,p->traceCompleted,*presented,finish,gpuNs,(uint64_t)gpuValid,
-            p->traceChannel,p->traceQuery,p->traceClients,p->traceBackdrop,p->traceChrome,p->traceOverlay,p->tracePixels,p->traceLayers,p->traceRegions,(uint32_t)p->graphics,(uint32_t)p->partial};
+            p->traceChannel,p->traceQuery,p->traceClients,p->traceBackdrop,p->traceChrome,p->traceOverlay,p->tracePixels,p->traceLayers,p->traceRegions,
+            p->quad?2u:(uint32_t)p->graphics,(uint32_t)p->partial};
         else ++g_asyncTimelineDropped;
     }
     *p=(struct PendingDesktopFrame){0};errno=savedErrno;return result?-1:1;
@@ -876,6 +1041,14 @@ static void stats_tick(int force){
     const int savedErrno=errno;
     g_statsRequested=0;g_statsOutput.lastNs=now;stats_publish(now);errno=savedErrno;
 }
+/* Wait up to timeoutMs for a producer connection or message. */
+static int desktop_channel_wait(const struct DesktopGpuChannel *c,int timeoutMs){
+    struct pollfd fds[2];nfds_t n=0;
+    if(c->peer>=0)fds[n++]=(struct pollfd){.fd=c->peer,.events=POLLIN};
+    else if(c->listener>=0)fds[n++]=(struct pollfd){.fd=c->listener,.events=POLLIN};
+    if(!n){if(timeoutMs>0)usleep((useconds_t)timeoutMs*1000u);return 0;}
+    return poll(fds,n,timeoutMs)>0;
+}
 static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     struct RenderContext ctx[BROOK_GPU_HANDOFF_MAX_DEPTH];
     struct PendingDesktopFrame pending[BROOK_GPU_HANDOFF_MAX_DEPTH]={{0}};
@@ -888,6 +1061,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     for(unsigned i=0;i<depth;++i)context_init(&ctx[i]);
     uint64_t fullWaitNs=0;unsigned fullWaits=0;
     unsigned frames=0,partialFrames=0,retries=0,unsupportedRetries=0,idleBusyRetries=0,active=0,maxActive=0;uint64_t previous=0,maxInterval=0,failureStart=0;unsigned gaps=0;
+    uint64_t idleUntil=0;unsigned idlePolls=0;
     while((!g_asyncStop && (!limit || frames<limit)) || active){
         stats_tick(0);
         const uint64_t fullSince=active==depth?monotonic_ns():0;
@@ -919,7 +1093,11 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                 desktop_async_damage_grace(1,pending[i].partial,pending[i].started,now))grace=1;
         }
         const int retryWaiting=desktop_retry_waiting(&retry,monotonic_ns());
-        for(unsigned i=0;i<depth && !g_asyncStop && (!limit || frames+active<limit) &&
+        /* After a poll found nothing to draw, wait for the next poll or a
+         * producer offer instead of recapturing the desktop at once. */
+        const uint64_t loopNow=monotonic_ns();
+        if(idleUntil && (loopNow>=idleUntil || desktop_channel_wait(&g_gpuChannel,0)))idleUntil=0;
+        for(unsigned i=0;i<depth && !g_asyncStop && (!limit || frames+active<limit) && !idleUntil &&
             !g_presentingTicket && !grace && !retryWaiting && (overlapPartial || !getenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL") || !active);++i)if(!pending[i].ticket){
             uint32_t visible=0;uint64_t presented=0;
             ctx[i].damage=displayedDamage;
@@ -928,7 +1106,8 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                 !desktop_damage_include_pending(&ctx[i].damage,pending[j].damage))overlapSafe=0;
             if(overlapPartial && active && !overlapSafe)break;
             const int partial=getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL && (!active || overlapSafe);
-            int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],partial,overlapSafe?lastPresentedTicket:0);
+            int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],partial,overlapSafe?lastPresentedTicket:0,!active);
+            if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
             if(result==1){++active;if(active>maxActive)maxActive=active;failureStart=0;desktop_retry_success(&retry);progress=1;break;}
             else if(result<0){const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
                 if(failure==ENOTSUP)++unsupportedRetries;
@@ -940,7 +1119,9 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         if(limit && !active && failureStart){uint64_t now=monotonic_ns();
             if(now>=failureStart && now-failureStart>=5000000000ull)break;}
         if(!progress){
-            usleep(!active && retryWaiting?10000:1000);
+            if(!active && idleUntil){const uint64_t t=monotonic_ns();
+                (void)desktop_channel_wait(&g_gpuChannel,t<idleUntil?(int)((idleUntil-t+999999ull)/1000000ull):0);}
+            else usleep(!active && retryWaiting?10000:1000);
             if(fullSince){
                 const uint64_t now=monotonic_ns();
                 if(now>=fullSince)fullWaitNs+=now-fullSince;
@@ -952,6 +1133,8 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     stats_tick(1);
     if(getenv("BROOK_RENDER_GRAPHICS_SCENE"))fprintf(stderr,"DESKTOP_GRAPHICS_COUNTS submitted=%llu fallback=%llu\n",
         (unsigned long long)g_graphicsSubmitted,(unsigned long long)g_graphicsFallback);
+    fprintf(stderr,"DESKTOP_QUAD_COUNTS submitted=%llu fallback=%llu idle_polls=%u keepalives=%llu\n",(unsigned long long)g_quadSubmitted,
+        (unsigned long long)g_quadFallback,idlePolls,(unsigned long long)g_stats.keepalives);
     if(getenv("BROOK_RENDER_TIMELINE")){
         for(unsigned i=0;i<g_asyncTimelineCount;++i){const struct AsyncTimelineRow *r=&g_asyncTimeline[i];
             fprintf(stderr,"DESKTOP_TIMELINE frame=%llu ticket=%llu window=%llu incarnation=%llu commit=%llu received=%llu start=%llu submit_start=%llu submitted=%llu completed=%llu presented=%llu finish=%llu gpu_ns=%llu gpu_valid=%llu\n",
@@ -995,6 +1178,18 @@ int main(int argc,char **argv){
         caps>0 && (caps&BROOK_GPU_PRESENT_CAP_ASYNC);
     desktop_gpu_channel_init(&g_gpuChannel);
     stats_init(depth);
+    /* Composition: per-layer quads by default (asynchronous frames only);
+     * BROOK_RENDER_COMPOSE=compute keeps the compute shader. Damage is
+     * change-based unless BROOK_RENDER_FOOTPRINT_DAMAGE is set. */
+    const char *compose=getenv("BROOK_RENDER_COMPOSE");
+    g_quadMode=!(compose && !strcmp(compose,"compute"));
+    g_quadOcclusion=!getenv("BROOK_RENDER_QUAD_NO_OCCLUSION");
+    g_chromeHoles=!getenv("BROOK_RENDER_CHROME_FULL");
+    g_trackDamage=!getenv("BROOK_RENDER_FOOTPRINT_DAMAGE");
+    const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");
+    if(idlePoll){char *end=NULL;unsigned long ms=strtoul(idlePoll,&end,10);if(end && !*end && ms && ms<=100)g_idlePollNs=ms*1000000ull;}
+    g_trackDisplayed=calloc(1,sizeof(*g_trackDisplayed));
+    g_neverIdle=limit!=0 && !getenv("BROOK_RENDER_ALLOW_IDLE");
     if(depth){
         struct sigaction stop={0};stop.sa_handler=async_stop_signal;sigemptyset(&stop.sa_mask);
         if(sigaction(SIGTERM,&stop,NULL) || sigaction(SIGINT,&stop,NULL))return 1;
@@ -1006,7 +1201,9 @@ int main(int argc,char **argv){
     while(!limit || frames<limit){
         uint32_t visible=0;uint64_t presented=0;
         stats_tick(0);
-        if(!render_frame(drm,&ctx,&visible,&presented,NULL,0,0)){
+        const int rendered=render_frame(drm,&ctx,&visible,&presented,NULL,0,0,1);
+        if(rendered==2){(void)desktop_channel_wait(&g_gpuChannel,(int)(g_idlePollNs/1000000ull));continue;}
+        if(!rendered){
             ++frames;failures=0;failureStart=0;
             uint64_t interval=previous && presented>=previous?(presented-previous)/1000000ull:0;
             if(interval>maxInterval)maxInterval=interval;
