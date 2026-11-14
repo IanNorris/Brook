@@ -56,7 +56,7 @@ static void gem_new(uint64_t bytes,struct Gem *g){
 static void gem_free(struct Gem *g){munmap(g->map,g->size);close(g->fd);struct {uint32_t h,pad;} c={g->handle,0};(void)ioctl(drm,IOC(9,sizeof(c)),&c);*g=(struct Gem){0};}
 static void gem_cpu(struct Gem *g,int write){struct domain d={g->handle,1,write?1u:0u};CHECK(!ioctl(drm,IOC(0x5f,sizeof(d)),&d));}
 
-static BrookVkRenderer *compute,*batch;static BrookVkQuadPass *quad;
+static BrookVkRenderer *compute,*batch;static BrookVkQuadPass *quad;static int g_outputCache=1;
 static uint64_t compute_full(const uint32_t *scene,size_t words,struct Gem *src,unsigned count,struct Gem *out){
     struct BrookVkExternalSource s[BROOK_VK_MAX_LAYERS];
     for(unsigned i=0;i<count;++i)s[i]=(struct BrookVkExternalSource){src[i].fd,src[i].size/4,-1};
@@ -70,7 +70,7 @@ static uint64_t quad_run(const uint32_t *scene,size_t words,struct Gem *src,cons
     for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
         s[i]=(struct BrookVkQuadSource){{src[i].fd,-1,l[2],l[3],l[0],l[1],src[i].size},1};}
     (void)widths;
-    const struct BrookVkQuadSource o={{out->fd,-1,scene[0],scene[1],0,scene[0],out->size},1};
+    const struct BrookVkQuadSource o={{out->fd,-1,scene[0],scene[1],0,scene[0],out->size},g_outputCache};
     const uint64_t start=now_ns();
     const BrookVkResult submitted=brook_vk_quad_pass_submit(quad,scene,words,s,count,&o,plan);
     if(submitted!=BROOK_VK_PENDING){fprintf(stderr,"QUAD_HOST_SUBMIT result=%d draws=%u clears=%u\n",submitted,plan->drawCount,plan->clearCount);
@@ -251,6 +251,35 @@ static void desktop(void){
     gem_free(&outCompute);gem_free(&outQuad);gem_free(&packed);gem_free(&batchOut);
 }
 
+/* gen 378: hasvk adds every live VkDeviceMemory to each execbuffer, so a
+ * cached import of another zero-copy ring image made the kernel refuse jobs
+ * ("outputs of two handoff tickets"). Uncached ring targets must leave no
+ * render-target import alive once their frame retires. */
+static void ring_targets(void){
+    enum {W=64,H=32};
+    static struct Gem ring[4],src;gem_new(W*H*4,&src);for(unsigned i=0;i<4;++i)gem_new(W*H*4,&ring[i]);
+    uint32_t scene[BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS]={W,H,1,0};
+    struct BrookVkSceneLayer l={0,W,W,H,0,0,W,H,0,0,W,H,0,0,W,H,255|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE};
+    memcpy(scene+BROOK_VK_SCENE_HEADER,&l,sizeof(l));
+    struct DesktopDamageSet damage={1,{{0,0,W,H}}};struct QuadPlan plan;
+    CHECK(quad_plan_build_auto(scene,BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS,NULL,&damage,1,&plan));
+    const unsigned before=brook_vk_quad_pass_target_imports(quad,NULL,0);
+    g_outputCache=0;
+    for(unsigned frame=0;frame<8;++frame){
+        (void)quad_run(scene,BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS,&src,NULL,1,&ring[frame%4],&plan,NULL);
+        CHECK(brook_vk_quad_pass_target_imports(quad,NULL,0)==0); /* retired: nothing kept alive */
+    }
+    /* The hazard itself: cached targets accumulate one import per image. */
+    g_outputCache=1;
+    for(unsigned frame=0;frame<4;++frame)(void)quad_run(scene,BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS,&src,NULL,1,&ring[frame],&plan,NULL);
+    CHECK(brook_vk_quad_pass_target_imports(quad,NULL,0)>=4);
+    /* Switching to uncached drops every cached target before the next job. */
+    g_outputCache=0;
+    (void)quad_run(scene,BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS,&src,NULL,1,&ring[0],&plan,NULL);
+    CHECK(brook_vk_quad_pass_target_imports(quad,NULL,0)==0 && brook_vk_quad_pass_stats(quad).targetEvictions>=4);
+    g_outputCache=1;(void)before;
+    printf("QUAD_HOST_RING_TARGETS_PASS\n");
+}
 int main(int argc,char **argv){
     const unsigned iterations=argc>1?(unsigned)strtoul(argv[1],NULL,10):300;
     setenv("BROOK_RENDER_GPU_TIMESTAMPS","1",0);
@@ -261,6 +290,7 @@ int main(int argc,char **argv){
     VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
     CHECK(brook_vk_renderer_graphics_context(compute,&physical,&device,&queue,&family));
     quad=brook_vk_quad_pass_create(physical,device,queue,family);CHECK(quad);
+    ring_targets();
     for(unsigned i=0;i<iterations;++i)random_scene(i);
     printf("QUAD_HOST_RANDOM_EXACT iterations=%u\n",iterations);
     desktop();

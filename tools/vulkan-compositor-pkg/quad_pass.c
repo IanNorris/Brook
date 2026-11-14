@@ -367,6 +367,11 @@ BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene
     /* Nothing is pending, so idle cache entries can be dropped. */
     for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)if(p->cache[i].live && p->cache[i].lastUse+QUAD_CACHE_MAX_AGE<p->clock){
         image_destroy(p,&p->cache[i]);++p->stats.evictions;}
+    /* Uncached target (zero-copy ring): no other render-target import may
+     * stay alive in this device (see brook_vk_quad_pass_target_imports). */
+    if(!output->cache)for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)
+        if(p->cache[i].live && (p->cache[i].usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)){
+            image_destroy(p,&p->cache[i]);++p->stats.targetEvictions;}
     struct QuadImage *target=image_get(p,output,&outputId,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
     struct QuadImage *images[BROOK_VK_MAX_LAYERS]={0};
     if(!target)goto reject;
@@ -495,6 +500,16 @@ BrookVkResult brook_vk_quad_pass_wait(BrookVkQuadPass *p,uint64_t timeoutNs){
     return retire(p,vkWaitForFences(p->device,1,&p->fence,VK_TRUE,timeoutNs));
 }
 int brook_vk_quad_pass_last_result(const BrookVkQuadPass *p){return p?(int)p->lastResult:0;}
+unsigned brook_vk_quad_pass_target_imports(const BrookVkQuadPass *p,uint64_t *inodes,unsigned max){
+    unsigned n=0;if(!p)return 0;
+    for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)if(p->cache[i].live && (p->cache[i].usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)){
+        if(inodes && n<max)inodes[n]=(uint64_t)p->cache[i].ino;
+        ++n;}
+    for(unsigned i=0;i<p->frameCount;++i)if(p->frame[i].live && (p->frame[i].usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)){
+        if(inodes && n<max)inodes[n]=(uint64_t)p->frame[i].ino;
+        ++n;}
+    return n;
+}
 int brook_vk_quad_pass_gpu_timestamp_ns(const BrookVkQuadPass *p,uint64_t *ns){
     if(!p || !ns || !p->gpuValid)return 0;
     *ns=p->gpuNs;return 1;

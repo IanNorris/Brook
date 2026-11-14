@@ -156,6 +156,15 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
 - **Supervisor:** it restarts a renderer that exited with status 76 after 1 s, without backoff.
 - **Tests:** `test_intel_bdw_buffer` reproduces the refusal: a job in CPU transition is refused, then admitted once the transition ends, and a sticky-failed buffer is refused and named. `desktop_gpu_channel_test` covers the failed-buffer offer.
 
+**Sixth Dell finding (gen 378): the actual cause of the submit failures.** With `KPrintf` the log named it: `gpu-exec: execbuffer refused … reason=submit: job references the outputs of two handoff tickets`.
+- **Mesa side:** hasvk (softpin, Gen8) adds the BO of *every* live `VkDeviceMemory` of the device to each execbuffer (`anv_batch_chain.c`, "Add the BOs for all user allocated memory objects"), not only those the batch uses.
+- **Renderer side:** the quad pass cached its target imports, so once a context had rendered into several ring images, every later job referenced all of them. That includes the image the other pipelined context had reserved.
+- **Why it only appeared now:** before the ring each context had one output.
+- **Fix:** ring targets are imported for the frame only (`output.cache=0`). Any cached render-target import is dropped before such a job.
+- **Diagnostics:** `brook_vk_quad_pass_target_imports` reports what is alive, and a failed submit logs `DESKTOP_QUAD_TARGET_IMPORTS`.
+- **Host test:** the GPU test (`quad_pass_host_test`, `ring_targets`) checks that no target import survives a retired frame, that cached targets accumulate, and that switching to uncached evicts them.
+- **Related, not yet fixed:** cached *source* imports (client buffers) are in every execbuffer for the same reason. The CPU-transition wait and the failed-buffer skip cover the transient case, but an unused cached import of a sticky-failed client buffer would still be refused until the cache evicts it after about 120 submissions.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:

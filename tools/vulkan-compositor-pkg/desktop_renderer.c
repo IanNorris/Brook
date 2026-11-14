@@ -750,13 +750,19 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
                 inputs[i]=(struct BrookVkQuadSource){{sources[i].fd,sources[i].syncFd,l[2],l[3],l[0],l[1],(uint64_t)sources[i].words*4u},
                     !directSource[i]};}
-            const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},1};
+            /* Ring images are imported for the frame only (see quad_pass.h). */
+            const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},ctx->scanoutCount?0:1};
             stage="quad_submit";
             statsSubmitStart=monotonic_ns();
             if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
             status=brook_vk_quad_pass_submit(ctx->quad,scene,words,inputs,count,&output,plan);
             if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN stage=submit vk_result=%d (the kernel refused the submission or the device is lost)\n",
-                brook_vk_quad_pass_last_result(ctx->quad));renderer_exit_for_restart("quad_submit",brook_vk_quad_pass_last_result(ctx->quad));}
+                brook_vk_quad_pass_last_result(ctx->quad));
+                {uint64_t inodes[8];const unsigned n=brook_vk_quad_pass_target_imports(ctx->quad,inodes,8);
+                 struct stat target;const int known=!fstat(ctx->output,&target);
+                 fprintf(stderr,"DESKTOP_QUAD_TARGET_IMPORTS count=%u target_ino=%llu imports=",n,known?(unsigned long long)target.st_ino:0ull);
+                 for(unsigned k=0;k<n && k<8;++k)fprintf(stderr,"%s%llu",k?",":"",(unsigned long long)inodes[k]);
+                 fprintf(stderr,"\n");}renderer_exit_for_restart("quad_submit",brook_vk_quad_pass_last_result(ctx->quad));}
             if(status==BROOK_VK_PENDING){
                 quadUsed=1;++g_quadSubmitted;attemptPartial=qpartial;damage=qdamage;damagePixels=plan->damagePixels;
                 traceLayers=plan->layersDrawn;statsDraws=plan->drawCount;statsShaded=plan->pixelsShaded;
