@@ -2072,6 +2072,7 @@ static void CompositorLoopWM()
     // The taskbar (drawn every pass, like the clock) reads only this cache.
     WmNetworkIndicatorRefresh(now);
     WmVolumeIndicatorRefresh();
+    WmVolumeFeedbackTick(now);
     // Opening or closing the volume popup exposes or covers scene pixels, so
     // repaint once on the transition (both the CPU and overlay-layer paths).
     static bool volumePopupShown=false;

@@ -115,6 +115,8 @@ bool AudioSetOutputControl(uint32_t control) {
     __atomic_store_n(&g_outputControl,control,__ATOMIC_RELEASE);
     return true;
 }
+static uint32_t g_userControlSerial=0;
+uint32_t AudioUserOutputControlSerial(){return __atomic_load_n(&g_userControlSerial,__ATOMIC_ACQUIRE);}
 bool AudioSetUserOutputControl(uint32_t control,bool explicitUnmute) {
     if(!brook_audio_control_valid(control))return false;
     uint32_t previous=__atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE),desired;
@@ -125,6 +127,7 @@ bool AudioSetUserOutputControl(uint32_t control,bool explicitUnmute) {
             (explicitUnmute || (previous&BROOK_AUDIO_MUTED) || (previous&AudioUserUnmuteBit));
         desired=control|(authorized?AudioUserUnmuteBit:0u);
     } while(!__atomic_compare_exchange_n(&g_outputControl,&previous,desired,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    if((previous&~AudioUserUnmuteBit)!=control)__atomic_add_fetch(&g_userControlSerial,1u,__ATOMIC_RELEASE);
     return true;
 }
 bool AudioUserUnmuteRequested(){return (AudioOutputControlSnapshot()&AudioUserUnmuteBit)!=0;}

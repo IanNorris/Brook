@@ -379,6 +379,8 @@ bool WmNetworkIndicatorRefresh(uint64_t now);
 // in it; the wheel steps 5%; a right click toggles mute. The input helpers
 // return true when they consumed the event.
 bool WmVolumeIndicatorRefresh();
+// Plays the volume-change pop when a user change is observed (compositor loop).
+void WmVolumeFeedbackTick(uint64_t nowMs);
 bool WmVolumePopupVisible();
 void WmVolumePopupClose();
 void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,

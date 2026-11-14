@@ -104,6 +104,8 @@ const uint16_t* AudioHardwareVolumeResidual();
 // ordinary setter so it cannot authorize an initially muted hardware output.
 bool     AudioSetUserOutputControl(uint32_t control,bool explicitUnmute=false);
 bool     AudioUserUnmuteRequested();
+// Increments on every user-originated level/mute change (feedback sounds).
+uint32_t AudioUserOutputControlSerial();
 // One atomic snapshot: control in low bits, explicit user authorization bit.
 static constexpr uint32_t AudioUserUnmuteBit=1u<<16;
 uint32_t AudioOutputControlSnapshot();

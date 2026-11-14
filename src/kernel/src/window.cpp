@@ -12,6 +12,7 @@
 #include "window.h"
 #include "desktop_telemetry.h"
 #include "taskbar_volume.h"
+#include "volume_feedback.h"
 #include "debug_hardware.h"
 #include "device.h"
 #include "virtio_blk.h"
@@ -1994,6 +1995,47 @@ bool WmVolumeIndicatorRefresh()
     g_volumeControl = control;
     g_volumeAvailable = available;
     return true;
+}
+
+// Volume-change feedback ("pop", src/kernel/assets/README.md). Played once at
+// the new level through a short kernel-owned mixer stream, so it follows the
+// master volume and mute; policy in volume_feedback.h. Compositor thread only.
+extern "C" const uint8_t g_volumePopPcm[], g_volumePopPcmEnd[];
+static VolumeFeedback g_volumeFeedback;
+static uint32_t g_volumeFeedbackSerial = 0, g_volumeFeedbackControl = 0;
+static bool g_volumeFeedbackPrimed = false;
+static AudioStreamId g_volumePopStream = 0;
+static uint64_t g_volumePopStartMs = 0;
+
+static void WmVolumePopPlay(uint64_t nowMs)
+{
+    if (!AudioAvailable()) return;
+    const auto* pcm = reinterpret_cast<const int16_t*>(g_volumePopPcm);
+    const uint32_t frames = static_cast<uint32_t>((g_volumePopPcmEnd - g_volumePopPcm) / MIXER_FRAME_BYTES);
+    if (!frames) return;
+    if (g_volumePopStream && !AudioMixerReset(g_volumePopStream)) { AudioMixerClose(g_volumePopStream); g_volumePopStream = 0; }
+    if (!g_volumePopStream) g_volumePopStream = AudioMixerOpen();
+    if (!g_volumePopStream) return; // all mixer slots in use: skip the cue
+    AudioMixerSubmit(pcm, frames, g_volumePopStream);
+    g_volumePopStartMs = nowMs;
+}
+
+void WmVolumeFeedbackTick(uint64_t nowMs)
+{
+    const uint32_t serial = AudioUserOutputControlSerial();
+    const uint32_t control = AudioOutputControl();
+    if (!g_volumeFeedbackPrimed) {
+        g_volumeFeedbackPrimed = true; g_volumeFeedbackSerial = serial; g_volumeFeedbackControl = control;
+        return;
+    }
+    if (serial != g_volumeFeedbackSerial) {
+        g_volumeFeedback.Change(g_volumeFeedbackControl, control);
+        g_volumeFeedbackSerial = serial;
+    }
+    g_volumeFeedbackControl = control;
+    if (g_volumeFeedback.Tick(nowMs)) WmVolumePopPlay(nowMs);
+    // Release the slot once the 80 ms clip has certainly drained.
+    if (g_volumePopStream && nowMs - g_volumePopStartMs > 1000) { AudioMixerClose(g_volumePopStream); g_volumePopStream = 0; }
 }
 
 static void WmVolumeApply(uint32_t control)
