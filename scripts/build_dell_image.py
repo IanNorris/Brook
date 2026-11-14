@@ -13,6 +13,8 @@ Steps (each is deterministic for a given checkout and asset set):
   4. verify_guarded_desktop_candidate.py checks the result independently.
   5. build-manifest.json records the commit, options, store paths, hashes and the runtime store
      paths the boot binaries need on the target.
+  6. With --qemu-check, scripts/check_dell_image_qemu.py runs the guarded recovery-to-desktop
+     QEMU/KVM test on the exact pair (the pre-deployment gate).
 
 This prepares private files only. Deployment is separate (scripts/hardware_update_device.py) and needs
 the target to already contain the runtime store paths listed in the manifest.
@@ -89,6 +91,8 @@ def main():
     p.add_argument('--supervisor', default='brook-desktop-supervisor-serial',
                    help='supervisor variant from the vulkan-compositor package')
     p.add_argument('--allow-dirty', action='store_true', help='permit uncommitted changes (recorded)')
+    p.add_argument('--qemu-check', action='store_true',
+                   help='then run scripts/check_dell_image_qemu.py on the pair (results in <output>/qemu-check)')
     a = p.parse_args()
     a.output, a.shared = a.output.resolve(), a.shared.resolve()
 
@@ -169,6 +173,13 @@ def main():
     }
     (a.output / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({k: manifest[k] for k in ('payload_id', 'commit', 'dirty', 'kernel_sha256', 'initrd_sha256')}, indent=2))
+
+    # 6. Optional guarded recovery-to-desktop QEMU/KVM check of the exact pair
+    if a.qemu_check:
+        check = subprocess.run([sys.executable, ROOT / 'scripts/check_dell_image_qemu.py', '--pair', a.output,
+                                '--kernel-build', build, '--shared', a.shared])
+        if check.returncode:
+            sys.exit(f'QEMU check failed; see {a.output}/qemu-check/verdict.json')
 
 
 if __name__ == '__main__':
