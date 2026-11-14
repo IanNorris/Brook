@@ -100,7 +100,8 @@ public:
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         if(accepted)BdwTimingQueued(snapshot);
 #endif
-        if(!accepted)BdwNoteRefusal(poisoned?"submit: queue poisoned":blocked?"submit: owner admission frozen":"submit: exec queue full (32 entries)");
+        if(!accepted){const char* use=BdwExecSnapshotUseRefusal(snapshot);
+            BdwNoteRefusal(poisoned?"submit: queue poisoned":blocked?"submit: owner admission frozen":use?use:"submit: exec queue full (32 entries)");}
         KMutexUnlock(&mutex_);return accepted?0:poisoned?-5:-16;
     }
     // Caller holds the sleepable handoff mutex before entering the queue lock.
@@ -121,7 +122,7 @@ public:
             KMutexUnlock(&mutex_);BdwNoteRefusal("handoff submit: undelivered abort failed (quarantined)");return -5; // retained/quarantined; never retry
         }
         if(accepted)handoff.requests[ticket.slot]=id;
-        else BdwNoteRefusal("handoff submit: exec queue full (32 entries)");
+        else{const char* use=BdwExecSnapshotUseRefusal(snapshot);BdwNoteRefusal(use?use:"handoff submit: exec queue full (32 entries)");}
         KMutexUnlock(&mutex_);return accepted?0:-16;
     }
     // The handoff owner holds its mutex. The queue lock makes the queued vs

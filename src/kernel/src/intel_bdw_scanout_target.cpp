@@ -1,3 +1,4 @@
+#include "kprintf.h"
 // Persistent scanout targets for the Dell Broadwell BCS present path:
 //  - BROOK_BDW_PERSISTENT_SCANOUT_MAP: map the firmware GOP into the private
 //    BCS address space once (persistent leaf tables) instead of rebuilding
@@ -353,7 +354,7 @@ void ZcDisableLocked(const char* why){
 }
 void ZcLogPending(){
     if(const char* why=__atomic_exchange_n(&zcPendingLog,static_cast<const char*>(nullptr),__ATOMIC_ACQ_REL))
-        SerialPrintf("gpu-zerocopy: disabled for this boot (%s); BCS copy to the GOP resumes after a full repaint\n",why);
+        KPrintf("gpu-zerocopy: disabled for this boot (%s); BCS copy to the GOP resumes after a full repaint\n",why);
 }
 bool ZcArmLocked(uint32_t slot){
     if(Read(BdwFlipRegs::PlaneControl)!=BdwFlipRegs::GopControl || Read(BdwFlipRegs::Stride)!=BdwZeroCopyStride){
@@ -385,7 +386,7 @@ bool ZcBind(){
     if(zcBound)return true;
     auto fail=[](const char* why){
         const uint64_t f=IrqSpinLockAcquire(&lock);ZcFallback(BdwZeroCopyFallback::Bind);ZcDisableLocked(why);IrqSpinLockRelease(&lock,f);
-        SerialPrintf("gpu-zerocopy: bind failed at %s; ggtt %s image=%u first=%u count=%u zero=%u valid=%u other=%u page=%u\n",
+        KPrintf("gpu-zerocopy: bind failed at %s; ggtt %s image=%u first=%u count=%u zero=%u valid=%u other=%u page=%u\n",
             why,BdwFlipGgttStageName(zcGgtt.stage),zcGgtt.buffer,zcGgtt.first,zcGgtt.count,zcGgtt.zero,zcGgtt.valid,
             zcGgtt.other,zcGgtt.auditPage);
         ZcLogPending();return false;
@@ -449,7 +450,7 @@ bool ZcActivate(){
         }else ZcDisableLocked("ring");
     }
     IrqSpinLockRelease(&lock,f);ZcLogPending();
-    if(ok)SerialPrintf("gpu-zerocopy: active; %u images; surfaces %x %x %x %x; setup %u us\n",zcCount,
+    if(ok)KPrintf("gpu-zerocopy: active; %u images; surfaces %x %x %x %x; setup %u us\n",zcCount,
         surfaces[0],surfaces[1],surfaces[2],surfaces[3],unsigned(zcSetupUs));
     return ok;
 }
@@ -711,7 +712,7 @@ int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* images,uint32_t 
     }
     zcCount=imageCount;zcOwner=owner;
     IrqSpinLockRelease(&lock,f);
-    SerialPrintf("gpu-zerocopy: registered %u renderer images (owner %lx)\n",imageCount,owner);
+    KPrintf("gpu-zerocopy: registered %u renderer images (owner %lx)\n",imageCount,owner);
     return 0;
 }
 int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count){
@@ -738,7 +739,7 @@ int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count){
     for(uint32_t i=0;i<registered;++i){BdwGpuBufferRef(images[i]);out[i]=images[i];}
     count=registered;
     IrqSpinLockRelease(&lock,f);
-    SerialPrintf("gpu-zerocopy: %u retained images adopted by owner %lx (was %lx)\n",registered,owner,previous);
+    KPrintf("gpu-zerocopy: %u retained images adopted by owner %lx (was %lx)\n",registered,owner,previous);
     return 0;
 }
 bool BdwZeroCopyOnReserve(BdwGpuBuffer* buffer){

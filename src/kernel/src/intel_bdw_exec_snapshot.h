@@ -69,6 +69,10 @@ uint64_t BdwExecSnapshotTestBatchKernelAddress(const BdwExecSnapshot* snapshot);
 uint64_t BdwExecSnapshotBatchAddress(const BdwExecSnapshot* snapshot);
 // The job maps a zero-copy scanout image (uncached PTE, PPAT slot 3).
 bool BdwExecSnapshotHasUncached(const BdwExecSnapshot* snapshot);
+// A non-output buffer of the job is in a transient CPU transition.
+bool BdwExecSnapshotInCpuTransition(const BdwExecSnapshot* snapshot);
+// Why reserving the job's buffers would fail now, or nullptr.
+const char* BdwExecSnapshotUseRefusal(const BdwExecSnapshot* snapshot);
 uint64_t BdwExecSnapshotBatchLength(const BdwExecSnapshot* snapshot);
 uint32_t BdwExecSnapshotPageCount(const BdwExecSnapshot* snapshot);
 // Immutable admission metadata suitable for bounded failure reporting. This

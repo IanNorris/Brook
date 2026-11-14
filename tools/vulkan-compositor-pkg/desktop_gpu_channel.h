@@ -8,6 +8,7 @@
 #include "gpu_window_channel.h"
 #include "desktop_layers_abi.h"
 #include "scene.h"
+#include "gpu_output_abi.h"
 #include <sys/un.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -37,6 +38,13 @@ static inline int desktop_gpu_fence_failed(int fd){
 }
 #ifndef DESKTOP_GPU_FENCE_FAILED
 #define DESKTOP_GPU_FENCE_FAILED(fd) desktop_gpu_fence_failed(fd)
+#endif
+/* A producer buffer that a later GPU job failed on is sticky-failed in the
+ * kernel even when the offer's own fence succeeded (a retained offer whose
+ * buffer the client rendered into again). Any job referencing it is
+ * refused, so the compositor must not sample it. Older kernels: 0. */
+#ifndef DESKTOP_GPU_BUFFER_FAILED
+#define DESKTOP_GPU_BUFFER_FAILED(fd) ((fd)>=0 && syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_BUFFER_FAILED,(long)(fd),0,0,0,0)==1)
 #endif
 static inline int desktop_gpu_offer_retained(const struct DesktopGpuOffer *o){
     return o->packet.version>=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN;
@@ -164,9 +172,9 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
         if(!best || o->packet.identity.commit>best->packet.identity.commit)best=o;
     }
     if(!best)return NULL;
-    if(DESKTOP_GPU_FENCE_FAILED(best->fence)){
+    if(DESKTOP_GPU_FENCE_FAILED(best->fence) || DESKTOP_GPU_BUFFER_FAILED(best->buffer)){
         best->failed=1;best->current=0;
-        fprintf(stderr,"DESKTOP_GPU_SOURCE_FAILED window=%u incarnation=%llu commit=%llu (producer fence error; CPU source)\n",
+        fprintf(stderr,"DESKTOP_GPU_SOURCE_FAILED window=%u incarnation=%llu commit=%llu (producer fence or buffer failed; CPU source)\n",
             best->packet.identity.window,(unsigned long long)best->packet.identity.incarnation,(unsigned long long)best->packet.identity.commit);
         return NULL;
     }

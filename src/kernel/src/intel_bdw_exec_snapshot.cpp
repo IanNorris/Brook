@@ -167,6 +167,22 @@ uint32_t BdwExecSnapshotDependencies(const BdwExecSnapshot* s){
         if(state==2)return 2;if(!state)pending=true;}
     return pending?0:1;
 }
+bool BdwExecSnapshotInCpuTransition(const BdwExecSnapshot* s){
+    if(!s)return false;
+    for(uint32_t i=0;i<s->count;++i)if(s->buffers[i]!=s->handoffBuffer && BdwGpuBufferInCpuTransition(s->buffers[i]))return true;
+    return false;
+}
+const char* BdwExecSnapshotUseRefusal(const BdwExecSnapshot* s){
+    if(!s)return "missing snapshot";
+    for(uint32_t i=0;i<s->count;++i){
+        if(s->buffers[i]==s->handoffBuffer){
+            if(!BdwGpuBufferHandoffMatches(s->buffers[i],s->handoffToken))return "the job's protected output is not reserved for its ticket";
+            continue;
+        }
+        if(const char* why=BdwGpuBufferUseRefusal(s->buffers[i]))return why;
+    }
+    return nullptr;
+}
 bool BdwExecSnapshotHasUncached(const BdwExecSnapshot* s){
     if(!s || !s->objects)return false;
     for(uint32_t i=0;i<s->count;++i)if(s->objects[i].uncached)return true;

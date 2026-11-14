@@ -1,3 +1,4 @@
+#include "kprintf.h"
 #include "serial.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_scanout.h"
@@ -499,7 +500,7 @@ static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
         if(n>8 && n!=64 && n!=1024)return;
         uint32_t pid=0,context=0;BdwExecSnapshotOrigin(snapshot,pid,context);
         static const char* const names[]={"skipped (a wait dependency failed)","failed (executed, safely stopped)","unsafe stop"};
-        SerialPrintf("gpu-submit: job %s pid=%u context=%u count=%lu\n",names[kind<3?kind:2],pid,context,n);
+        KPrintf("gpu-submit: job %s pid=%u context=%u count=%lu\n",names[kind<3?kind:2],pid,context,n);
     };
     return worker.Start(hooks,0,knownOwnersOnly);
 }

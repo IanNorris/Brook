@@ -75,6 +75,11 @@
  * with count, mode and fresh fds. -ENOENT none registered (register new
  * ones), -EPERM not the attached owner, -EBUSY an image is still in use. */
 #define BROOK_GPU_HANDOFF_SCANOUT_ADOPT 22
+/* Argument: an Intel PRIME fd. Returns 1 when its buffer failed on the GPU
+ * (sticky: any job referencing it is refused), else 0. The compositor checks
+ * a client's buffer before sampling it, so one failed client frame cannot
+ * make the compositor's submission fail. */
+#define BROOK_GPU_HANDOFF_BUFFER_FAILED 23
 #define BROOK_GPU_SCANOUT_MAX_IMAGES 4
 #define BROOK_GPU_SCANOUT_FOURCC_XRGB8888 0x34325258u
 #define BROOK_GPU_SCANOUT_REGISTERED 1u

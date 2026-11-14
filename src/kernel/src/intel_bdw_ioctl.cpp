@@ -527,6 +527,13 @@ int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const Bdw
         BdwTimingOwnerElapsed(u.submitterIncarnation,BdwTimingSnapshotBuild,admissionAcquired,BdwTimingNow());
  #endif
         if(decoded){BdwNoteRefusal("execbuffer decode: object, relocation, fence or context validation");return decoded;}
+        // A referenced buffer in a CPU-visibility transition (another process's
+        // TRY_CPU_READ flushing it, or a handoff retirement) refuses GPU use
+        // only while that lasts - milliseconds for a large window buffer.
+        // Refusing would become VK_ERROR_DEVICE_LOST in Mesa, so wait it out
+        // (bounded, about 100 ms) before admission.
+        if(u.sleepNs)for(unsigned i=0;i<100 && BdwExecSnapshotInCpuTransition(snapshot);++i)
+            if(!u.sleepNs(u.context,1000000))break;
         int64_t submitted=0;
         const bool claimed=u.handoffSubmit && u.handoffSubmit(u.context,snapshot,&submitted);
         if(!claimed)submitted=u.submit(u.context,snapshot);

@@ -3,6 +3,8 @@ static long test_syscall(long number,...);
 #define syscall test_syscall
 static int failed_fence=-1;
 #define DESKTOP_GPU_FENCE_FAILED(fd) ((fd)>=0 && (fd)==failed_fence)
+static int failed_buffer=-1;
+#define DESKTOP_GPU_BUFFER_FAILED(fd) ((fd)>=0 && (fd)==failed_buffer)
 #include "desktop_gpu_channel.h"
 #undef syscall
 #include <assert.h>
@@ -127,6 +129,13 @@ static void check_failed_fence(void){
     assert(o && o->packet.identity.commit==2);
     desktop_gpu_channel_finish(&c,f);
     failed_fence=-1;
+    /* A sticky-failed buffer behind an offer whose fence succeeded (the
+     * gen 377 retained-offer case) is excluded the same way. */
+    failed_buffer=o->buffer;
+    f=desktop_gpu_channel_begin_frame(&c);
+    assert(!desktop_gpu_channel_select(&c,&layer,100,100,&scene,f) && o->failed);
+    desktop_gpu_channel_finish(&c,f);
+    failed_buffer=-1;
 }
 int main(void){check_failed_fence();
     char dir[]="/tmp/brook-channel-restart-XXXXXX";assert(mkdtemp(dir));

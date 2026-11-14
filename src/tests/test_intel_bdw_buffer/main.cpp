@@ -660,6 +660,23 @@ int main(){
         BdwExecSnapshotSetOrigin(next,9,0,76);uint64_t nid=0;
         assert(queue.Enqueue(1,next,nid) && queue.StartNext(id,item) && id==nid && queue.Finish(id,true,true));
         assert(queue.Reap(1,nid,state)==next && state==BdwExecRequestState::Complete && BdwExecSnapshotRelease(next,false));
+        // gen 376/377: a compositor job sampling a client buffer while another
+        // process's TRY_CPU_READ holds its CPU-transition gate was refused at
+        // admission, which Mesa reports as VK_ERROR_DEVICE_LOST. The ioctl now
+        // waits the transition out; the refusal reason names the state.
+        {auto* buffer=BdwGpuFileGetBuffer(own,ownBuffer);assert(buffer);
+         auto* job=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(job && BdwExecSnapshotBindContext(job,ctx));
+         BdwExecSnapshotSetOrigin(job,9,0,76);
+         assert(!BdwExecSnapshotInCpuTransition(job) && !BdwExecSnapshotUseRefusal(job));
+         assert(BdwGpuBufferBeginCpuTransition(buffer));            // another process flushing it for a CPU read
+         assert(BdwGpuBufferInCpuTransition(buffer) && BdwExecSnapshotInCpuTransition(job));
+         const char* why=BdwExecSnapshotUseRefusal(job);assert(why && strstr(why,"CPU transition"));
+         uint64_t jid=0;
+         assert(!queue.Enqueue(1,job,jid));                          // the refusal Mesa saw as device loss
+         assert(BdwGpuBufferEndCpuTransition(buffer) && !BdwExecSnapshotInCpuTransition(job));
+         assert(queue.Enqueue(1,job,jid) && queue.StartNext(id,item) && id==jid && queue.Finish(id,true,true));
+         assert(queue.Reap(1,jid,state)==job && BdwExecSnapshotRelease(job,false));
+         BdwGpuBufferUnref(buffer);}
         // Contrast: an executed failure poisons the context (hasvk then reports
         // the device lost) - the path that parked the renderer.
         auto* failed=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(failed && BdwExecSnapshotBindContext(failed,ctx));
@@ -667,6 +684,9 @@ int main(){
         assert(queue.Enqueue(1,failed,fid) && queue.StartNext(id,item) && id==fid && queue.Finish(id,false,true));
         assert(BdwGpuContextLoss(ctx)==1);
         assert(queue.Reap(1,fid,state)==failed && BdwExecSnapshotRelease(failed,false));
+        {auto* again=BdwExecSnapshotCreate(own,&object,1,0,0,8);assert(again);  // the buffer is now sticky-failed
+         const char* why=BdwExecSnapshotUseRefusal(again);assert(why && strstr(why,"failed"));
+         uint64_t aid=0;assert(!queue.Enqueue(1,again,aid) && BdwExecSnapshotRelease(again,false));}
         BdwFenceUnref(wait);BdwFenceUnref(out);BdwGpuContextUnref(ctx);BdwGpuFileUnref(own);
     }
     {pid_t child=fork();assert(child>=0);if(!child){

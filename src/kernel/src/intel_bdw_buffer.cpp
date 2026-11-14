@@ -129,6 +129,18 @@ BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes){
 }
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* b){return b && b->userMappingAllowed;}
 bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b){return b && __atomic_load_n(&b->scanoutImage,__ATOMIC_ACQUIRE);}
+bool BdwGpuBufferInCpuTransition(const BdwGpuBuffer* b){
+    return b && ((__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE)>>62)&1);
+}
+const char* BdwGpuBufferUseRefusal(const BdwGpuBuffer* b){
+    if(!b)return "missing buffer";
+    const uint64_t s=__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE);
+    if(s>>63)return "a referenced buffer failed on the GPU (sticky)";
+    if((s>>62)&1)return "a referenced buffer is in a CPU transition (TRY_CPU_READ or handoff retirement)";
+    if((s>>60)&3)return "a referenced buffer is another handoff ticket's protected output";
+    if(uint32_t(s)==~uint32_t{0})return "a referenced buffer's GPU use count overflowed";
+    return nullptr;
+}
 bool BdwGpuBufferIdle(const BdwGpuBuffer* b){
     return b && !__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE) && !__atomic_load_n(&b->handoffToken,__ATOMIC_ACQUIRE);
 }

@@ -147,6 +147,15 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
   - The renderer's `DESKTOP_ASYNC_RETRY` now names the failing stage. Ring starvation logs `DESKTOP_SCANOUT_STARVED kernel_free=… in_flight=…` and sets EAGAIN, where it previously left a stale errno: the gen 376 `errno=11` was such a failure.
 - **Ring re-adoption:** `BROOK_GPU_HANDOFF_SCANOUT_ADOPT` (22) hands the retained images to a restarted renderer. It is allowed only for the owner attached to the handoff, only when every image is idle (`BdwZeroCopyAdoptDecision`, host-tested), and only after any active zero-copy returns to the GOP. The renderer adopts first and registers new images only when none exist (`DESKTOP_SCANOUT_RING images=4 adopted=1`).
 
+**Fifth Dell finding (gen 377): the recurring submit failure, probable cause.**
+- **Correction:** `SerialPrintf` lines (including the `gpu-submit: job …` failure log) never reach `hw_logs`, so "no job failed" was not established. All `gpu-exec`, `gpu-handoff`, `gpu-submit` and `gpu-zerocopy` diagnostics now use `KPrintf`, which the bridge log captures.
+- **Candidate found in code:** `BdwExecSnapshotReserve` → `BdwGpuBufferBeginGpuUse` refuses a job outright when a referenced client buffer is in its CPU-transition gate (bit 62). `TRY_CPU_READ`, used by waylandd's GPU provider, holds that gate while flushing the *whole* buffer, which takes milliseconds for a 2560×1440 Quake frame. A renderer quad job sampling that buffer in the window gets -16, and Mesa reports `VK_ERROR_DEVICE_LOST`. This matches periodic hitches, happening unarmed (gen 376) and recurring within minutes.
+- **Fix:** the execbuffer ioctl waits out a transition before admission (bounded, about 100 × 1 ms).
+- **Refusal reasons:** they name the exact buffer state (`BdwExecSnapshotUseRefusal`): sticky-failed, CPU transition, another ticket's output, or count overflow.
+- **Sticky-failed client buffers:** the renderer also skips any client buffer the kernel reports sticky-failed (`BROOK_GPU_HANDOFF_BUFFER_FAILED`, 23). This covers a retained offer whose buffer a later job failed on, while the offer's own fence still reports success.
+- **Supervisor:** it restarts a renderer that exited with status 76 after 1 s, without backoff.
+- **Tests:** `test_intel_bdw_buffer` reproduces the refusal: a job in CPU transition is refused, then admitted once the transition ends, and a sticky-failed buffer is refused and named. `desktop_gpu_channel_test` covers the failed-buffer offer.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:

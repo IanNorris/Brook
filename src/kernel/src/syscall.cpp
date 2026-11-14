@@ -7514,13 +7514,13 @@ static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t ar
     if(result<0 && (cmd&0xff)==0x69){
         static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
         if(brook::BdwRefusalLogDue(refusals))
-            SerialPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,
+            KPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,
                 why?why:"unrecorded",refusals);
     }else if((cmd&0xff)==0x69)(void)brook::BdwTakeRefusal();
     else if((cmd&0xff)==0x72){
         static uint64_t losses=0;
         if(const char* why=brook::BdwTakeRefusal())
-            if(brook::BdwRefusalLogDue(losses))SerialPrintf("gpu-exec: pid=%u %s count=%lu\n",user.submitterPid,why,losses);
+            if(brook::BdwRefusalLogDue(losses))KPrintf("gpu-exec: pid=%u %s count=%lu\n",user.submitterPid,why,losses);
     }
     return result;
 }
@@ -12862,6 +12862,12 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
         return 0;
     }
 #endif
+    if(op==BROOK_GPU_HANDOFF_BUFFER_FAILED){
+        if(arg>=MAX_FDS)return -EBADF;
+        FdRef ref(proc,static_cast<int>(arg));
+        if(!ref || ref->type!=FdType::IntelPrime || !ref->handle)return -EBADF;
+        return brook::BdwGpuBufferGpuFailed(static_cast<brook::BdwGpuBuffer*>(ref->handle))?1:0;
+    }
     if(op==BROOK_GPU_HANDOFF_PRESENT_RESULT)return brook::BdwOffscreenPresentResult(owner,arg);
     if(op==BROOK_GPU_HANDOFF_PRESENT_FRAME || op==BROOK_GPU_HANDOFF_QUEUE_FRAME){
         BrookGpuPresentFrame wire{};
@@ -12902,7 +12908,7 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
         if(result<0 && result!=-116){ // -116 (ESTALE): a dependent baseline moved, the renderer's normal retry
             static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
             if(brook::BdwRefusalLogDue(refusals))
-                SerialPrintf("gpu-handoff: reserve refused pid=%u errno=%ld reason=%s count=%lu\n",proc->pid,-result,why?why:"unrecorded",refusals);
+                KPrintf("gpu-handoff: reserve refused pid=%u errno=%ld reason=%s count=%lu\n",proc->pid,-result,why?why:"unrecorded",refusals);
         }else (void)brook::BdwTakeRefusal();
         return result;
     }

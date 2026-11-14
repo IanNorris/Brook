@@ -26,6 +26,11 @@ bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b);
 bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b);
 // No GPU use, handoff reservation or failure: a retained image may change owner.
 bool BdwGpuBufferIdle(const BdwGpuBuffer* b);
+// Transient CPU-visibility transition (TRY_CPU_READ, handoff retirement):
+// GPU use is refused only while it lasts.
+bool BdwGpuBufferInCpuTransition(const BdwGpuBuffer* b);
+// Why BeginGpuUse would refuse this buffer now, or nullptr.
+const char* BdwGpuBufferUseRefusal(const BdwGpuBuffer* b);
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* buffer);
 void BdwGpuBufferRef(BdwGpuBuffer* buffer);
 void BdwGpuBufferUnref(BdwGpuBuffer* buffer);
