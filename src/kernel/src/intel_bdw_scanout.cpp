@@ -412,6 +412,77 @@ bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,B
     (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
 #endif
 }
+bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal){
+    refusal=BdwVideoRefusal::None;run={};readback=expected=0;
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    VideoLease video;if(!video.held){refusal=BdwVideoRefusal::Busy;return false;}
+    refusal=videoGate.maySelftest();if(refusal!=BdwVideoRefusal::None)return false;
+    DiagnosticLease lease;if(!lease.held){refusal=BdwVideoRefusal::Busy;return false;}
+    auto refuseEarly=[&](BdwVideoRefusal r){refusal=r;videoGate.selftestDone(false,false,r);return false;};
+    if(!PanicRecoveryResetArmed() || SmpCurrentCpuIndex()!=0 || !observation.inventory || !observation.planned ||
+       !observation.patRequested || !PageAdmitted(BdwPrivatePatPage) || !PageAdmitted(BdwResetPage) ||
+       !PageAdmitted(0xf6880000ull) || !PageAdmitted(0xf6101000ull))return refuseEarly(BdwVideoRefusal::ResetRefused);
+    for(auto page:BdwForcewakePages)if(!PageAdmitted(page))return refuseEarly(BdwVideoRefusal::ResetRefused);
+    for(auto page:BdwOtherEnginePages)if(!PageAdmitted(page))return refuseEarly(BdwVideoRefusal::ResetRefused);
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.capable || !tsc.measured || !tsc.consistent || !tsc.khz || !(PciConfigRead16(0,2,0,4)&4))
+        return refuseEarly(BdwVideoRefusal::ResetRefused);
+    bool gpu=false;
+    for(uint32_t i=0;i<PciBootInventoryCount() && !gpu;++i){
+        PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))break;
+        const auto& d=entry.device;if(d.bus!=0 || d.dev!=2 || d.fn!=0)continue;
+        gpu=LiveGpuMatches(entry) && PowerD0(d);
+        if(!gpu)break;
+    }
+    if(!gpu)return refuseEarly(BdwVideoRefusal::ResetRefused);
+    static uint32_t sequence=0x56435300; // "VCS\0"
+    const uint32_t nonce=++sequence,data=nonce^0xa5a5a5a5u;
+    expected=data;
+    BdwGgttReservation reservation{};BdwOwnedPage scratch{};
+    // Deterministic preparation failures (allocation, reservation window, DMA
+    // snapshot) touch no device state: refuse without quarantine.
+    if(!BdwPrepareVcsSelftest(nonce,data,reservation,scratch))return refuseEarly(BdwVideoRefusal::PrepareFailed);
+    VmmDellVcsSelftest(tsc.khz,reservation.first,reservation.token,scratch.dma,out,run);
+    readback=BdwVcsSelftestReadback();
+    // Genuinely uncertain device state: the GT reset after submission did not
+    // complete, the shared private PAT was not restored, or forcewake was not
+    // released. Every RCS/BCS job depends on these, so stop (as the scanout
+    // path does). The gate is off at boot: recovery does not repeat this.
+    const bool forcewakeUncertain=run.attempted && (!out.clearDelivered || !out.sequence.released);
+    // A reset that reported Uncertain (GDRST state unknown), or a submission
+    // whose engine could not be stopped afterwards (the private PAT then stays
+    // leased and cannot be restored for RCS/BCS).
+    const bool resetUncertain=run.resetUncertain || (run.attempted && !run.resetAfter);
+    const bool patUncertain=run.patEstablished && !run.patRestored;
+    if(forcewakeUncertain || resetUncertain || patUncertain){
+        videoGate.selftestDone(false,true,BdwVideoRefusal::ResetUncertain);
+        KernelPanic("Broadwell video (VCS) self-test uncertain: reset=%u/%u pat=%u/%u ggtt=%u elsp=%u wake=%u head=%x tail=%x acthd=%x ipehr=%x",
+            unsigned(run.resetBefore),unsigned(run.resetAfter),unsigned(run.patEstablished),unsigned(run.patRestored),
+            run.ggttWriteAttempts,run.portWriteAttempts,unsigned(out.sequence.released),run.head,run.tail,run.acthd,run.ipehr);
+    }
+    // The engine was reset and the PAT restored. If the lease could not be
+    // unbound, or the pages not released, they stay retained for the boot
+    // (never reused) and VCS is quarantined; RCS/BCS are unaffected.
+    const bool released=run.scanoutRetired && BdwReleasePreparedVcsSelftest();
+    const bool touched=run.resetBeforeAttempted || run.attempted || run.ggttWriteAttempts || run.portWriteAttempts;
+    const bool ok=released && run.copyComplete && run.contextComplete && out.sequence.workComplete && readback==data;
+    BdwVideoRefusal reason=BdwVideoRefusal::None;
+    if(!ok){
+        if(!run.resetBefore && !run.attempted)reason=BdwVideoRefusal::ResetRefused;
+        else if(!released)reason=BdwVideoRefusal::RetireFailed;
+        else if(run.copyComplete && readback!=data)reason=BdwVideoRefusal::Mismatch;
+        else reason=BdwVideoRefusal::SubmitFailed;
+        if(!released)KPrintf("gpu-video: self-test pages retained for the boot (retire=%u)\n",unsigned(run.scanoutRetired));
+    }
+    videoGate.selftestDone(ok,touched,reason);
+    refusal=reason;
+    KPrintf("gpu-video: VCS self-test %s nonce=%x data=%x readback=%x ctx=%u ggtt=%u elsp=%u\n",ok?"ok":BdwVideoRefusalName(reason),
+        nonce,data,readback,unsigned(run.contextComplete),run.ggttWriteAttempts,run.portWriteAttempts);
+    return ok;
+#else
+    (void)out;refusal=BdwVideoRefusal::NotImplemented;return false;
+#endif
+}
 bool BdwTestRcsReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     DiagnosticLease lease;if(!lease.held)return false;

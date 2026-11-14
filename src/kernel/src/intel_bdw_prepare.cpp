@@ -437,6 +437,60 @@ bool BdwRetirePreparedBcsScanout(BdwBcsExecutionBackend& backend){return scanout
 bool BdwReleasePreparedBcsScanout(){
     return scanoutImage.ReleasePrepared(retainedAllocator) && scanoutImage.Recycle();
 }
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+// VCS0 self-test (VA-API phase 1b): its own boot-lifetime GGTT reservation
+// (never the BCS diagnostic slot or the scanout reservation) and scratch page,
+// the same allocator and publication as the BCS one-shots.
+namespace {
+BdwBcsOneShot videoImage;
+BdwGgttReservation videoReservation;
+BdwOwnedPage videoScratch{};
+uint32_t videoStaging[2048];
+}
+bool BdwPrepareVcsSelftest(uint32_t nonce,uint32_t data,BdwGgttReservation& reservation,BdwOwnedPage& scratch){
+    if(!nonce || !data || nonce==data)return false;
+    if(!videoReservation.token){
+        auto& space=BdwGlobalGgttSpace();
+        if(!space.reserve(8,videoReservation))return false;
+        // The PTE window mapped for one-shots covers GGTT indices 65536..66047.
+        if(videoReservation.first<65536 || videoReservation.first>65536+512-8 ||
+           !retainedAllocator.alloc(videoScratch)){
+            space.release(videoReservation);videoReservation={};return false;
+        }
+        for(unsigned i=0;i<4096;++i)videoScratch.cpu[i]=0;
+    }
+    if(videoImage.State()!=BdwOneShotState::Fresh)return false;
+    if(!videoImage.PrepareVideoSelftest(retainedAllocator,videoReservation.first,videoReservation.token,nonce,data,videoStaging)){
+        if(videoImage.State()==BdwOneShotState::Released)(void)videoImage.Recycle();
+        return false;
+    }
+    if(videoImage.InspectPreparedDma(retainedAllocator)!=BdwDmaSnapshotOk || !videoImage.DistinctPage(videoScratch)){
+        if(videoImage.ReleasePrepared(retainedAllocator))(void)videoImage.Recycle();
+        return false;
+    }
+    reservation=videoReservation;scratch=videoScratch;
+    return true;
+}
+bool BdwRunPreparedVcsSelftest(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result){
+    if(scratchDma!=videoScratch.dma || !BdwGlobalGgttSpace().owns(videoReservation))return false;
+    result.attempted=true;
+    if(!videoImage.ExecuteTakenOverWithBackend(retainedAllocator,backend,scratchDma))return false;
+    result.copyComplete=true;
+    while(backend.retirementContinue()){
+        const auto status=videoImage.PollContextSwitch(backend);
+        if(status==BdwCsbPoll::Fault)return false;
+        if(status==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
+    }
+    return false;
+}
+// Only after an acknowledged VCS reset: unbinds the lease back to scratch.
+bool BdwRetirePreparedVcsSelftest(BdwBcsExecutionBackend& backend){return videoImage.RetireScanout(backend);}
+uint32_t BdwVcsSelftestReadback(){return videoImage.VideoReadback();}
+// Fails (and keeps every page) unless the image never ran or was retired.
+bool BdwReleasePreparedVcsSelftest(){
+    return videoImage.ReleasePrepared(retainedAllocator) && videoImage.Recycle();
+}
+#endif
 #endif
 uint32_t BdwInspectPrivateBcsDma() {
     if(retainedBcs.State()==BdwOneShotState::Prepared && !BdwGlobalGgttSpace().owns(retainedReservation))

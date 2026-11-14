@@ -12,6 +12,7 @@
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_video.h"
 #include "intel_bdw_forcewake_adapter.h"
+#include "intel_bdw_oneshot.h"
 #include "intel_bdw_exec_tables.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_node_cache.h"
@@ -5785,7 +5786,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(on || off)ok=BdwVideoSetEnabled(on,refusal);
         else if(probe)ok=BdwVideoProbe(fw,refusal);
         else if(reset)ok=BdwVideoReset(fw,rs,refusal);
-        else if(selftest){ok=false;refusal=BdwVideoRefusal::NotImplemented;}
+        BdwBcsRunResult st{};uint32_t readback=0,expected=0;
+        if(selftest)ok=BdwVideoSelftest(fw,st,readback,expected,refusal);
         BdwVideoGate g{};const bool have=BdwVideoStatus(g);
         BridgeReply r;r.text("{\"built\":");r.text(BdwVideoBuilt()?"true":"false");
         r.text(",\"ok\":");r.text(ok?"true":"false");
@@ -5796,6 +5798,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("refusals",g.refusals());
             r.text(",\"last_refusal\":\"");r.text(BdwVideoRefusalName(g.lastRefusal()));r.text("\"");
             r.text(",\"advertised\":");r.text(g.advertiseBsd()?"true":"false");
+            r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
             const auto& v=g.sample();
             r.text(",\"vcs\":{\"sampled\":");r.text(v.sampled?"true":"false");
             r.text(",\"idle\":");r.text(v.idle?"true":"false");
@@ -5809,7 +5812,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"complete\":");r.text(rs.complete?"true":"false");
             r.text(",\"uncertain\":");r.text(rs.uncertain?"true":"false");
             r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
-        r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest and execbuffer submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
+        if(selftest){r.text(",\"selftest\":{\"attempted\":");r.text(st.attempted?"true":"false");
+            r.text(",\"reset_before\":");r.text(st.resetBefore?"true":"false");
+            r.text(",\"breadcrumb\":");r.text(st.copyComplete?"true":"false");
+            r.text(",\"context_complete\":");r.text(st.contextComplete?"true":"false");
+            r.text(",\"reset_after\":");r.text(st.resetAfter?"true":"false");
+            r.text(",\"retired\":");r.text(st.scanoutRetired?"true":"false");
+            r.text(",\"pat_restored\":");r.text(st.patRestored?"true":"false");
+            r.text(",");r.field("expected",expected);r.text(",");r.field("readback",readback);
+            r.text(",");r.field("ggtt_writes",st.ggttWriteAttempts);r.text(",");r.field("elsp_writes",st.portWriteAttempts);
+            if(st.engineSampled){r.text(",");r.field("head",st.head);r.text(",");r.field("tail",st.tail);
+                r.text(",");r.field("acthd",st.acthd);r.text(",");r.field("ipehr",st.ipehr);r.text(",");r.field("execlist",st.execlist);}
+            r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
+        r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest = reset VCS, init execlists, one-shot submission (PPGTT batch MI_STORE_DATA_IMM plus ring breadcrumb) with CSB retirement, reset after and unbind; failures after an engine write quarantine VCS for the boot, uncertain GT reset/PAT/forcewake state panics; user submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
         r.send();
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {

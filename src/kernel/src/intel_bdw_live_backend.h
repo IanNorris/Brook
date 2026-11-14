@@ -9,18 +9,21 @@ namespace brook {
 // the actual forcewake/engine/PAT lease, page admission, reset, cache
 // synchronization, bounded clock and CSB register acknowledgement.
 // This class alone neither grants ownership nor touches hardware until called.
-template<class Owner> class BdwBcsDeviceBackend final : public BdwBcsExecutionBackend {
+// EngineBase selects the xCS: 0x22000 (BCS, every existing caller through the
+// BdwBcsDeviceBackend alias) or 0x12000 (VCS0 self-test, VA-API phase 1b). The
+// owner's resetBcs() resets the engine it owns.
+template<class Owner,uint32_t EngineBase> class BdwEngineDeviceBackend final : public BdwBcsExecutionBackend {
     Owner& owner_;uint32_t first_;uint64_t token_,scratch_;BdwOwnedPage* pages_=nullptr;unsigned pageCount_=0;
     uint32_t ggttWrites_=0,portWrites_=0;
     bool resetDone_=false;const BdwOwnedPage* hws_=nullptr;
-    BdwGgttMmio<BdwBcsDeviceBackend> ggtt_;
-    BdwBcsMmio<BdwBcsDeviceBackend> bcs_;
+    BdwGgttMmio<BdwEngineDeviceBackend> ggtt_;
+    BdwEngineMmio<BdwEngineDeviceBackend,EngineBase> bcs_;
 public:
-    BdwBcsDeviceBackend(Owner& owner,volatile uint64_t* ptes,volatile uint32_t* flush,
+    BdwEngineDeviceBackend(Owner& owner,volatile uint64_t* ptes,volatile uint32_t* flush,
                         volatile uint32_t* engine,uint32_t first,uint64_t token,uint64_t scratch)
         :owner_(owner),first_(first),token_(token),scratch_(scratch),ggtt_(*this,ptes,flush,first,8),bcs_(*this,engine){}
-    BdwBcsDeviceBackend(const BdwBcsDeviceBackend&)=delete;
-    BdwBcsDeviceBackend& operator=(const BdwBcsDeviceBackend&)=delete;
+    BdwEngineDeviceBackend(const BdwEngineDeviceBackend&)=delete;
+    BdwEngineDeviceBackend& operator=(const BdwEngineDeviceBackend&)=delete;
     bool owned(){return owner_.owned();}
     bool readable(){return owned();}
     bool exclusiveHandoff() override{return owned();}
@@ -88,4 +91,6 @@ public:
     bool csbAcknowledge(unsigned slot) override{return slot<6 && owned() && owner_.acknowledgeCsb(slot);}
     bool retirementContinue() override{return owned() && owner_.retirementContinue();}
 };
+template<class Owner> using BdwBcsDeviceBackend=BdwEngineDeviceBackend<Owner,0x22000>;
+template<class Owner> using BdwVcsDeviceBackend=BdwEngineDeviceBackend<Owner,0x12000>;
 }

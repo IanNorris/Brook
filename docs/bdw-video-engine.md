@@ -1,6 +1,6 @@
 # Broadwell video engine (VCS0) and VA-API
 
-Status: **phase 1a implemented** (VCS0 probe and domain reset behind a build option and a runtime gate; nothing advertised to userspace). Phase 1b (VCS execlist init, context, self-test submission) and later phases are designed below but not implemented. Branch `work/vaapi`.
+Status: **phases 1a and 1b implemented**: VCS0 probe, domain reset and a submission self-test, behind a build option and a runtime gate; nothing is advertised to userspace. None of it has run on hardware yet. Phase 1c onwards is designed below but not implemented. Branch `work/vaapi`.
 
 ## Why
 
@@ -11,7 +11,7 @@ Brook's browsers now render on the GPU, but video decode is software (dav1d/ffmp
 | Phase | Scope | Status |
 |---|---|---|
 | 1a | VCS0 constants, probe, domain reset, runtime gate, debug commands, explicit `HAS_BSD=0` | done (this branch) |
-| 1b | VCS0 HWS/CSB, execlist init, logical context, one-shot submission, `gpu video selftest` (MI_STORE_DATA_IMM breadcrumb) | designed; batch and context builders host-tested |
+| 1b | VCS0 HWS/CSB, execlist init, logical context, one-shot submission, `gpu video selftest` | done (this branch), host-tested; untested on hardware |
 | 1c | VCS jobs in the submission worker (separate queue), `I915_EXEC_BSD`, `HAS_BSD=1` once the self-test passes | designed |
 | 2 | libva + intel-vaapi-driver (i965) running `vainfo` and `ffmpeg -hwaccel vaapi` H.264 | scoped below |
 | 3 | Chrome VA-API (Ozone/Wayland, NV12 dma-buf into ANGLE), Firefox (ffmpeg VA-API), H.264 preference for YouTube | not started |
@@ -44,18 +44,35 @@ Brook's browsers now render on the GPU, but video decode is software (dav1d/ffmp
   - self-test batch encoding;
   - the VCS context image.
 
-## Phase 1b design: self-test submission
+## Phase 1b: self-test submission (implemented)
 
-Mirror the BCS one-shot (`BdwBcsOneShot`, `BdwBcsDeviceBackend`, `BdwRunRetainedBcs`), parameterised on engine base:
+Implemented by reusing the proven BCS one-shot flow rather than a parallel copy:
+- **One-shot:** `BdwBcsOneShot::PrepareVideoSelftest` keeps the same private page layout, PPGTT, 8-page GGTT lease, takeover binding, PAT checks and CSB state machine. Execute additionally verifies the batch's store, and `RetireScanout`/`Recycle` accept the video image.
+- **Backend:** `BdwEngineDeviceBackend<Owner,EngineBase>` is the old BCS backend parameterised on engine base. `BdwBcsDeviceBackend` is now an alias for base 0x22000, so every BCS caller is unchanged; `BdwVcsDeviceBackend` uses 0x12000.
+- **Critical section:** the run is a `vcsSelftest` variant of the existing copy work item. Its `CopyOwner` gains an engine base (VCS quiescence, CSB acknowledgement at `0x123a0`, and VCS reset via `BdwVcsResetMmio`).
+- **Prepare, run, retire, release:** `BdwPrepareVcsSelftest`, `BdwRunPreparedVcsSelftest`, `BdwRetirePreparedVcsSelftest` and `BdwReleasePreparedVcsSelftest` live in `intel_bdw_prepare.cpp`.
+
+The steps:
 
 1. **GGTT reservation:** its own private reservation, like `BdwRetainedBcsReservation`, never shared with the BCS diagnostic scratch slot (65536 / `0x10000000`). It holds the HWS page, the 8 KiB context, a 4 KiB ring and a batch page.
 2. **Reset VCS** (1a), then `BdwInitializeVcsExeclists(hws)`: HWSTAM, GFX_MODE execlist enable, MI_MODE, HWS_PGA, and the CSB cursor synchronisation already proven for BCS.
 3. **Context and descriptor:** build the context with `BdwBuildVcsContext64`, PPGTT tables for the one batch page, and the descriptor (privilege and addressing bits as BCS, `0x13d`).
-4. **Batch:** `BdwBuildVcsSelftestBatch` writes `MI_NOOP; MI_STORE_DATA_IMM (GGTT) hws+0x100 ← nonce; MI_BATCH_BUFFER_END`. The ring holds `MI_BATCH_BUFFER_START` plus the breadcrumb, as in the BCS ring template.
+4. **Batch and ring:** the nonprivileged batch at PPGTT `0x10000` runs `MI_NOOP; MI_STORE_DATA_IMM (PPGTT) 0x11000 ← data; MI_BATCH_BUFFER_END`. Its data page is the Source page. The privileged ring is byte-identical to the BCS ring template (host-checked): `MI_FLUSH_DW`, `ARB off`, `BB_START`, then `MI_FLUSH_DW` post-sync GGTT nonce write to the Completion page and `ARB on`. `data = nonce ^ 0xa5a5a5a5`.
 5. **Submit and retire:** submit through ELSP (`+0x230`, four dwords) and poll CSB for context-complete with a deadline (2 s), as `CopyOwner` does. Check the nonce. Reset VCS (`StopOwnedWork`) afterwards.
-6. **Uncertainty:** any uncertain step quarantines VCS for the boot and retains every page. It panics only if the GT reset domain itself is in an unknown state.
+6. **Failure policy** (`BdwVideoSelftest`, `intel_bdw_scanout.cpp`):
+   - **Refused before any engine write** (stage unchanged, no quarantine): gate or probe preconditions, page admission, PCI/D0, preparation (reservation window, allocation, DMA snapshot).
+   - **Failed after an engine write**, with VCS reset, PAT restored and forcewake released: VCS is quarantined for the boot. This covers a bad breadcrumb, a readback mismatch, a CSB fault, and retire or release failure; in the last case the pages and lease are retained for the boot and never reused. RCS and BCS are unaffected.
+   - **Genuinely uncertain:** a reset that reported Uncertain (GDRST state unknown), an engine that could not be stopped after submission (the shared private PAT then cannot be restored), PAT not restored, or forcewake not released. The kernel panics, as the scanout and RCS paths do. The gate is off at boot, so the recovery reboot does not repeat it.
 
-**First Dell check for 1b:** `gpu video on`, then `probe`, `reset`, `selftest`. Expect `selftest ok`, the nonce read back, CSB context-complete, and RCS presents unaffected throughout.
+**Dell check for 1a+1b, one boot:**
+1. `gpu video status`: expect `built:true`, stage `off`.
+2. `gpu video selftest` with the gate off: expect refusal `gate-off`.
+3. `gpu video on`, then `gpu video probe`: expect stage `probed`, VCS idle and quiescent.
+4. `gpu video reset`: expect `reset.complete:true`.
+5. `gpu video selftest`: expect stage `selftest-ok`, and in the `selftest` block `reset_before`, `breadcrumb`, `context_complete`, `reset_after`, `retired` and `pat_restored` all true, `readback==expected`, `ggtt_writes` 16 (8 bind, 8 retire) and `elsp_writes` 4. Serial shows `gpu-video: VCS self-test ok …`.
+6. Repeat `selftest` 3 times, since the image recycles.
+7. Run the 2-buffer yquake demo straight after: expect 0 renderer restarts and unchanged frame times.
+8. `gpu video off`.
 
 ## Phase 1c design: user submission
 
@@ -94,3 +111,11 @@ i965 talks to the kernel through **libdrm_intel** (`drm_intel_bufmgr_gem`), not 
 - **Phase 1b and 1c are the risky parts:** a mistaken VCS submission or reset path on real hardware. Mitigations: build option off, runtime gate off at boot, one engine owner via the shared forcewake claim, IdleTakeover only, quarantine on uncertainty, and the guard's panic-reset recovery.
 - **Relocations** (phase 2) is the largest unknown in effort.
 - **YouTube:** the payoff depends on the H.264 preference (phase 3).
+
+## Driver choice: i965 versus iHD (intel-media-driver)
+
+Both need **relocation-free submission** from Brook's point of view: Brook's execbuffer accepts only softpinned, NO_RELOC submissions.
+- **i965 (intel-vaapi-driver):** submits through libdrm_intel, which emits a relocation for every surface. libdrm_intel already has softpin support (`drm_intel_bo_set_softpin_offset`, softpin targets in the exec list without relocation entries). Patching it so every BO gets a fixed address from a per-process VA allocator and submits `NO_RELOC | HANDLE_LUT` is a userspace change, estimated at 1–2 days, with **no kernel relocation code**.
+- **iHD (intel-media-driver):** submits through its own MOS buffer manager, also derived from libdrm_intel. As far as I know its softpin path is enabled only on newer platforms; Gen8 runs the relocation path. It is also a much larger C++ code base. Gen8 support is legacy there and may be absent from recent releases, which needs checking against the nixpkgs version (its `GEN8` build option). It also needs at least the same GETPARAMs, plus context engine parameters.
+
+**Recommendation: i965 plus a small libdrm_intel softpin/NO_RELOC patch.** It needs the least kernel work: the kernel side is then `I915_EXEC_BSD`, truthful GETPARAMs, tiling metadata and the mmap modes, which both drivers need anyway. Kernel-side relocation processing stays a fallback if the patch proves fragile. Confirm both before committing to one: run `vainfo` and a one-frame H.264 decode under `strace -e ioctl` on a Linux Broadwell (or any Gen8 machine) with each driver, and list the ioctls, flags and GETPARAMs actually used.

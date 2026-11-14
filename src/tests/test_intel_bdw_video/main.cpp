@@ -7,6 +7,7 @@
 #include "intel_bdw_bcs_reset.h"
 #include "intel_bdw_bcs_init.h"
 #include "intel_bdw_context.h"
+#include "intel_bdw_submission.h"
 
 using namespace brook;
 
@@ -115,8 +116,39 @@ static void TestVcsContext(){
     assert(!BdwBuildVcsContext64(bad,vcs,dv));
 }
 
+static void TestVcsSubmission(){
+    BdwBcsLaunch l{{0x10002000,0x10010000,0x123000,16384,56,1},0x10000,0x10007000,0x1234};
+    static uint32_t ctx[2048],bctx[2048];uint32_t batch[8]{},ring[14]{},bbatch[12]{},bring[14]{};uint64_t d=0,bd=0;
+    assert(BdwBuildVcsSelftest(l,0x11000,0x5555,ctx,batch,ring,d));
+    // Ring identical to the BCS template for the same launch.
+    const BdwBlitRegion region{{0x11000,4096,64},{0x12000,4096,64},0,0,0,0,16,4};
+    assert(BdwBuildBcsRegions(l,&region,1,bctx,bbatch,bring,bd) && bd==d);
+    for(unsigned i=0;i<14;++i)assert(ring[i]==bring[i]);
+    assert(batch[0]==0 && batch[1]==0x10000002u && batch[2]==0x11000 && batch[3]==0 && batch[4]==0x5555 && batch[5]==0x05000000u);
+    assert(ctx[1024+2]==0x12244 && bctx[1024+2]==0x22244);
+    assert(!BdwBuildVcsSelftest(l,0x11000,0,ctx,batch,ring,d));        // zero data
+    assert(!BdwBuildVcsSelftest(l,0x11000,0x1234,ctx,batch,ring,d));   // data == nonce
+    assert(!BdwBuildVcsSelftest(l,0x10000,0x5555,ctx,batch,ring,d));   // data on the batch page
+    assert(!BdwBuildVcsSelftest(l,0x11004,0x5555,ctx,batch,ring,d));   // unaligned
+}
+static void TestSelftestGate(){
+    BdwVideoGate g;BdwVcsSample idle{};idle.sampled=idle.idle=idle.quiescent=true;
+    assert(g.maySelftest()==BdwVideoRefusal::GateOff);
+    g.setEnabled(true);assert(g.maySelftest()==BdwVideoRefusal::ProbeFailed);
+    g.probed(true,idle);assert(g.maySelftest()==BdwVideoRefusal::None);
+    g.selftestDone(false,false,BdwVideoRefusal::PrepareFailed);       // refused before any write
+    assert(g.stage()==BdwVideoStage::Probed && g.lastRefusal()==BdwVideoRefusal::PrepareFailed);
+    g.selftestDone(true,true,BdwVideoRefusal::None);
+    assert(g.stage()==BdwVideoStage::SelftestOk && g.selftests()==2 && g.selftestPasses()==1 && !g.advertiseBsd());
+    assert(g.maySelftest()==BdwVideoRefusal::None);                   // repeatable
+    g.selftestDone(false,true,BdwVideoRefusal::Mismatch);             // engine touched: quarantine
+    assert(g.stage()==BdwVideoStage::Quarantined && g.maySelftest()==BdwVideoRefusal::Quarantined && !g.setEnabled(true));
+}
+
 int main(){
     TestVcsContext();
+    TestVcsSubmission();
+    TestSelftestGate();
     TestResetSequence();
     TestGate();
     TestBatch();

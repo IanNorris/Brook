@@ -19,11 +19,13 @@ enum class BdwVideoStage : uint8_t {
     Enabled,      // gate on, not yet probed this boot
     Probed,       // read-only engine sample taken and looked sane
     ResetOk,      // a VCS domain reset was acknowledged
+    SelftestOk,   // a VCS submission self-test completed and verified
     Quarantined,  // an operation failed in a way that leaves VCS state unknown
 };
 
 enum class BdwVideoRefusal : uint8_t {
     None, GateOff, Quarantined, Busy, ProbeFailed, NotQuiescent, ResetRefused, ResetUncertain, NotImplemented,
+    PrepareFailed, SubmitFailed, Mismatch, RetireFailed,
 };
 inline const char* BdwVideoRefusalName(BdwVideoRefusal r){
     switch(r){
@@ -36,6 +38,10 @@ inline const char* BdwVideoRefusalName(BdwVideoRefusal r){
     case BdwVideoRefusal::ResetRefused:return "reset-refused";
     case BdwVideoRefusal::ResetUncertain:return "reset-uncertain";
     case BdwVideoRefusal::NotImplemented:return "not-implemented";
+    case BdwVideoRefusal::PrepareFailed:return "prepare-failed";
+    case BdwVideoRefusal::SubmitFailed:return "submit-failed";
+    case BdwVideoRefusal::Mismatch:return "readback-mismatch";
+    case BdwVideoRefusal::RetireFailed:return "retire-failed";
     }
     return "unknown";
 }
@@ -45,6 +51,7 @@ inline const char* BdwVideoStageName(BdwVideoStage s){
     case BdwVideoStage::Enabled:return "enabled";
     case BdwVideoStage::Probed:return "probed";
     case BdwVideoStage::ResetOk:return "reset-ok";
+    case BdwVideoStage::SelftestOk:return "selftest-ok";
     case BdwVideoStage::Quarantined:return "quarantined";
     }
     return "unknown";
@@ -61,7 +68,7 @@ struct BdwVcsSample {
 class BdwVideoGate {
     BdwVideoStage stage_=BdwVideoStage::Off;
     BdwVideoRefusal last_=BdwVideoRefusal::None;
-    uint32_t probes_=0,resets_=0,refusals_=0;
+    uint32_t probes_=0,resets_=0,refusals_=0,selftests_=0,selftestPasses_=0;
     BdwVcsSample sample_{};
     void refuse(BdwVideoRefusal r){last_=r;++refusals_;}
 public:
@@ -70,6 +77,8 @@ public:
     uint32_t probes()const{return probes_;}
     uint32_t resets()const{return resets_;}
     uint32_t refusals()const{return refusals_;}
+    uint32_t selftests()const{return selftests_;}
+    uint32_t selftestPasses()const{return selftestPasses_;}
     const BdwVcsSample& sample()const{return sample_;}
     bool enabled()const{return stage_!=BdwVideoStage::Off && stage_!=BdwVideoStage::Quarantined;}
     // Turning the gate on is allowed unless quarantined (quarantine lasts the boot).
@@ -106,8 +115,21 @@ public:
         if(!complete){refuse(BdwVideoRefusal::ResetRefused);return;}
         stage_=BdwVideoStage::ResetOk;
     }
-    // Submission (self-test and execbuffer) is phase 1b and not implemented:
-    // userspace is never told VCS exists.
+    // The self-test resets VCS itself before submitting, so it needs the same
+    // proof as a reset: a probe this boot that saw VCS idle and unowned.
+    BdwVideoRefusal maySelftest()const{return mayReset();}
+    // ok: completed, nonce and data verified, engine reset and lease retired.
+    // A refusal before any engine write leaves the stage unchanged. Any failure
+    // after the engine was touched quarantines VCS for the boot (the caller
+    // panics instead only if the GT reset or PAT state itself is uncertain).
+    void selftestDone(bool ok,bool engineTouched,BdwVideoRefusal reason){
+        ++selftests_;
+        if(ok){++selftestPasses_;stage_=BdwVideoStage::SelftestOk;return;}
+        refuse(reason==BdwVideoRefusal::None?BdwVideoRefusal::SubmitFailed:reason);
+        if(engineTouched)stage_=BdwVideoStage::Quarantined;
+    }
+    // User submission (execbuffer I915_EXEC_BSD) is phase 1c and not
+    // implemented: userspace is never told VCS exists, even after a self-test.
     bool advertiseBsd()const{return false;}
 };
 

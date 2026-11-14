@@ -201,6 +201,12 @@ struct BdwBcsRunResult;
 // Never call while relying on PMM locks; retained pages stay pinned even on
 // success, because a context-complete result alone does not reclaim them.
 bool BdwRunRetainedBcs(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result);
+// VCS0 self-test image (VA-API phase 1b; BROOK_BDW_VIDEO_ENGINE builds only).
+bool BdwPrepareVcsSelftest(uint32_t nonce,uint32_t data,BdwGgttReservation& reservation,BdwOwnedPage& scratch);
+bool BdwRunPreparedVcsSelftest(BdwBcsExecutionBackend& backend,uint64_t scratchDma,BdwBcsRunResult& result);
+bool BdwRetirePreparedVcsSelftest(BdwBcsExecutionBackend& backend);
+uint32_t BdwVcsSelftestReadback();
+bool BdwReleasePreparedVcsSelftest();
 // Snapshot only. It does not grant GPU access or release the retained page.
 bool BdwRetainedBcsScratch(BdwOwnedPage& out);
 // Caller serializes against retain/release; this is a one-way boot-lifetime
@@ -248,6 +254,7 @@ bool BdwVideoStatus(BdwVideoGate& out);
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
 bool BdwVideoReset(BdwForcewakeAdapterResult& out,BdwRcsResetTestResult& reset,BdwVideoRefusal& refusal);
+bool BdwVideoSelftest(BdwForcewakeAdapterResult& out,BdwBcsRunResult& run,uint32_t& readback,uint32_t& expected,BdwVideoRefusal& refusal);
 struct BdwRenderGtInitResult;
 bool BdwTestRenderGtInit(BdwForcewakeAdapterResult& out,BdwRenderGtInitResult& init);
 struct BdwPatTestResult;
