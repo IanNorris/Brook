@@ -1,6 +1,6 @@
 # Broadwell video engine (VCS0) and VA-API
 
-Status: **phases 1a and 1b implemented**: VCS0 probe, domain reset and a submission self-test, behind a build option and a runtime gate; nothing is advertised to userspace. None of it has run on hardware yet. Phase 1c onwards is designed below but not implemented. Branch `work/vaapi`.
+Status: **phase 1 (1a, 1b) passes on the Dell (gen 393); phase 1c (VCS user jobs, `I915_EXEC_BSD`) is implemented and host/QEMU-tested (pair `pair-vaapi-p1c1`), not yet run on hardware.** Everything stays behind the build option `BROOK_BDW_VIDEO_ENGINE` and a runtime gate that is off at boot. Branch `work/vaapi`.
 
 ## Why
 
@@ -12,7 +12,7 @@ Brook's browsers now render on the GPU, but video decode is software (dav1d/ffmp
 |---|---|---|
 | 1a | VCS0 constants, probe, domain reset, runtime gate, debug commands, explicit `HAS_BSD=0` | done (this branch) |
 | 1b | VCS0 HWS/CSB, execlist init, logical context, one-shot submission, `gpu video selftest` | done (this branch), host-tested; untested on hardware |
-| 1c | VCS jobs in the submission worker (separate queue), `I915_EXEC_BSD`, `HAS_BSD=1` once the self-test passes | designed |
+| 1c | VCS jobs in the submission worker, `I915_EXEC_BSD`, `HAS_BSD=1` once the self-test passes | implemented (p1c1), untested on hardware |
 | 2 | libva + intel-vaapi-driver (i965) running `vainfo` and `ffmpeg -hwaccel vaapi` H.264 | scoped below |
 | 3 | Chrome VA-API (Ozone/Wayland, NV12 dma-buf into ANGLE), Firefox (ffmpeg VA-API), H.264 preference for YouTube | not started |
 | 4 | Soak, hang recovery, A/V sync, multiple streams | not started |
@@ -222,3 +222,66 @@ Both need **relocation-free submission** from Brook's point of view: Brook's exe
 - truthful GETPARAMs;
 - `SET_TILING`/`GET_TILING` metadata and `GEM_MMAP` WC;
 - confirming the list with `gpu ioctl trace` while running `vainfo`.
+
+## Phase 1c executor (p1c1, commit 29818357)
+
+**Path of an `I915_EXEC_BSD` execbuffer:**
+1. `CopyExecSnapshot` admits engine 2 only while `BdwVideoUserSubmissionReady()`. Otherwise it is refused (EINVAL, reason `execbuffer: I915_EXEC_BSD video engine submission not available`). Engines above 2 stay refused. The snapshot is tagged `BdwExecEngineVideo`.
+2. It is queued on the normal application queue. On the CPU0 worker, `ExecuteRetainedWorker` hands tagged snapshots to `ExecuteVcsUserJob` (`intel_bdw_scanout.cpp`) before any render-path state is touched. VCS jobs therefore run one at a time, between RCS jobs. There is no separate VCS queue yet: a VCS job delays the next RCS job by its own duration.
+3. `BdwPrepareVcsUserJob` (`intel_bdw_prepare.cpp`) uses objects that the RCS path never touches:
+   - **Tables:** its own `BdwExecTables` instance with a table-only `BuildTables`. There is no render ring and no table cache.
+   - **One-shot:** its own `BdwVcsUserOneShot` (`intel_bdw_vcs_user.h`). Each job gets a fresh, restore-inhibited VCS context with PML4 set to the job's table root, and a ring of `MI_BATCH_BUFFER_START` (PPGTT, 48-bit, 8-byte aligned) to the user batch followed by the GGTT breadcrumb.
+   - **GGTT:** its own 8-entry reservation in the one-shot window, plus a scratch page.
+
+   Snapshots containing scanout (uncached) or protected buffers are refused. After a clean build, DMA inspection, publication and cache sync, the snapshot is armed.
+4. `VmmDellVcsUserRun` runs the 1b sequence in the forcewake critical section:
+   1. VCS reset, with the firmware engine values (RING_MAX_IDLE etc.) restored;
+   2. PAT lease;
+   3. a check and flush of the table pages under the lease;
+   4. takeover bind, execlist init, ELSP;
+   5. breadcrumb and CSB completion within the 2 s budget;
+   6. VCS reset, unbind.
+5. Fences complete or fail through the queue's normal snapshot retirement.
+
+**Failure policy:**
+
+| Outcome (`BdwClassifyVcsUserRun`) | Job | VCS |
+|---|---|---|
+| Refused before any VCS write: gate, preconditions, size or allocation limits, claim busy (retried 20× at 1 ms) | fence fails (skipped), buffers not poisoned | unchanged |
+| Touched and failed (hang: no breadcrumb/CSB in 2 s; CSB fault), reset acknowledged | fence fails, buffers marked failed (GEM_WAIT returns EIO) | quarantined for the boot, `HAS_BSD`→0 |
+| Stopped but the lease could not be unbound | fence fails, pages retained for the boot | quarantined |
+| Uncertain GDRST, PAT or forcewake | — | kernel panic (guard recovery), as in 1b |
+
+**Readiness:** `HAS_BSD` and BSD admission are published only by a video-build kernel when all of these hold:
+- the gate is on;
+- a self-test has passed this boot;
+- VCS is not quarantined.
+
+Gate off withdraws them, and gate on again restores them without a new self-test. The worker reports a quarantine through an atomic flag, because a running self-test holds the video lease while it waits on that same worker. Holders of the lease fold the flag into the gate. `gpu video status` now reports `user_ready` and `user_jobs {jobs, completed, refused, failed, retries, last_us, max_us, quarantined, quarantine_detail}`.
+
+**Probe tool:** `tools/vcs-store-probe/vcs_store_probe.c` is static and has no libdrm dependency. Build it with:
+
+```
+$MUSL_CC -static -O2 -Wall -Wextra -Werror tools/vcs-store-probe/vcs_store_probe.c -o build/vcs-store-probe/vcs_store_probe
+```
+
+It finds the i915 render node and reads `HAS_BSD`. It then submits a softpinned `MI_STORE_DATA_IMM` batch with `I915_EXEC_BSD | NO_RELOC | FENCE_ARRAY`, using a signalling syncobj. It waits on the syncobj and `GEM_WAIT`, then checks the value. Modes:
+- `--count N`: run N jobs.
+- `--high`: place the objects above 4 GiB.
+- `--expect-refused`: requires `HAS_BSD=0` and an EINVAL refusal.
+- `--hang`: destructive for the boot. A self-looping batch; it expects EIO on the BO and `HAS_BSD=0` afterwards.
+
+**Known costs, left for phase 4:**
+- Every job does two media resets and full execlist init. That is fine for correctness, but per-job latency will matter for decode throughput; persistent VCS execlist state is the phase 4 fix.
+- A hang stalls the CPU0 worker, and so the desktop, for up to the 2 s budget once before the quarantine.
+
+**Tests:**
+- Host tests:
+  - user ring encoding and its refusals;
+  - every classifier outcome;
+  - advertisement and quarantine;
+  - `BdwVcsUserOneShot` complete, hang and refusal flows on the fake backend;
+  - decoder tagging and refusal of engines 2, 3 and 4.
+- The full host suite passes (352 tests).
+- `pair-vaapi-p1c1` passes the guarded QEMU check on the first attempt.
+
