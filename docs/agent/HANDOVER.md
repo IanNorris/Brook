@@ -36,7 +36,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
 | M1 | Change-based damage, idle polls, quad pass with occlusion and bit-exact shader blending (compute fallback via `BROOK_RENDER_COMPOSE=compute`) | done: `4330fd74`; gen 362: displayed ~29 fps (2 buffers) / ~24 (8), swaps 46/85, compositor job ~10.5 ms, worker 37–42% idle |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
-| M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | todo |
+| M3 | Page flip (`BROOK_BDW_SCANOUT_FLIP`) and persistent BCS scanout map (`BROOK_BDW_PERSISTENT_SCANOUT_MAP`), runtime-gated (`gpu flip probe/arm/off/status`, `gpu scanout map on/off/status`) | in progress, `work/m3-flip`. Gen 364: probe 3/3 pass (pipe A → eDP, PSR off, stride 12800, 60 Hz). Persistent map: present prep 2.7 → 0.4 ms, 2-buffer interval 35.5 → 33.9 ms. `gpu flip arm` refused with `ggtt-bind` (safe fallback); diagnosing |
 | M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
 
 **M0 results (gen 357, console visible, 14 Nov):**
