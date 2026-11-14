@@ -92,6 +92,19 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**M4a and GPU clock on the zero-copy base (gens 382–383, 14 Nov night):**
+- **M4a wakeups** (`work/m4a-zc`, runtime switch `gpu wakeups on|off`, default off):
+  - stable: 0 IF restores over 100k+ wakes, no panic;
+  - no clear gain: displayed 21.2–23.1 ms vs 21.8 off; game queue wait 8.9–9.1 ms either way, because it waits behind the serial compositor job.
+- **Profile** (wakeups on):
+  - gpu-submit spends ~1/3 in `BdwBuildPpgttImage` (per-job PPGTT rebuild, 2 ms prepare) → `work/ppgtt-cache`;
+  - VKRENDER is mostly in `sys_brook_desktop_layers` (window chrome re-rendered and copied each frame) → `work/chrome-capture`.
+  - The profile filled `/boot` (32 MB FAT) after ~1/3 of 12 s; keep profiles ≤ 8 s or free `/boot` first.
+- **GPU clock** (`work/gpu-clock`, `gpu clock <MHz>`, caps 300/300/950 MHz, thermal fallback at 90 °C):
+  - at ~870 MHz achieved: compositor job 10.1 ms (12.9 at 500), game 60.2 swaps/s;
+  - **but the package reached 92–94 °C under yquake even at 500 MHz**, so the fallback tripped at every setting.
+  - **Safety:** Brook has no CPU P-state/C-state or fan management. Ask Ian whether the fans run. Don't run sustained high-clock tests unattended.
+
 **Zero-copy reaches ~45 displayed fps (gen 381, `dell-zero-copy-carry-20261114`, `work/zero-copy-fix3` `1c66453f`):**
 - **Bug fixed:** the cache-mode change had fed full-draw regions back as the next frame's damage, so most frames were full redraws.
 - **Matched 2-buffer demo, wt armed:**
