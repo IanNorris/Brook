@@ -36,7 +36,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
 | M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
-| M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | todo |
+| M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | code on `work/m3-flip` (both options OFF by default, runtime-gated off at boot); host tests and default QEMU check pass; Dell untested, staged plan in `docs/bdw-page-flip.md` |
 | M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
 
 **M0 results (gen 357, console visible, 14 Nov):**
