@@ -2040,7 +2040,11 @@ static void DrawVolumeIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, 
 static TaskbarVolumePopupLayout WmVolumePopupLayout(uint32_t screenW, uint32_t screenH)
 {
     const TaskbarLayout t = GetTaskbarLayout(screenW, screenH);
-    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), WmTextWidth("100%"));
+    char label[100];
+    WmRect badge{};
+    const bool hasBadge = WmBuildIdLayout(screenW, screenH, label, badge);
+    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), WmTextWidth("100%"),
+                              hasBadge ? &badge : nullptr);
 }
 
 static bool WmVolumeIconContains(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
@@ -2189,7 +2193,10 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     char netTitle[48]{};
     const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
         l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
+    // Tray tooltips are centred on their icon; other labels use the tray.
+    const WmRect* trayAnchor = nullptr;
     if (l.network.contains(mouseX, mouseY)) {
+        trayAnchor = &l.network;
         if (netAddress) {
             const uint8_t* o = reinterpret_cast<const uint8_t*>(&netAddress);
             WmStrCopy(netTitle, "Network: ", sizeof(netTitle));
@@ -2207,6 +2214,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     if (l.volume.contains(mouseX, mouseY) && !g_volumePopupOpen) {
         TaskbarVolumeTooltip(volumeTitle, g_volumeControl, g_volumeAvailable);
         hoverTitle = volumeTitle;
+        trayAnchor = &l.volume;
     }
     for (int i = 0; i < l.count; ++i)
     {
@@ -2263,6 +2271,8 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     int labelX = static_cast<int>(screenW);
     const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.volume,l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
+    const char* trayTitle = trayAnchor ? hoverTitle : nullptr;
+    if (trayTitle) hoverTitle = nullptr;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
         WmRenderString(backBuffer, stride, screenW, screenH, labelX, l.textY,
@@ -2277,6 +2287,16 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
     DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
     for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
+    if (!trayTitle) return;
+    // A tray tooltip covers only its own box, centred on the icon and kept
+    // on screen; the rest of the tray stays visible.
+    const int pad = static_cast<int>(WmMetric(8));
+    const DesktopRect box = TaskbarTooltipBox(*trayAnchor, WmTextWidth(trayTitle) + 2 * pad,
+                                              static_cast<int>(screenW), static_cast<int>(WmMetric(8)));
+    WmFillRect(backBuffer, stride, screenW, screenH, box.x, l.y + 1, box.w, static_cast<int>(screenH) - l.y - 1,
+               WmMaterialColor(WmCurrentPalette().taskbar));
+    WmRenderString(backBuffer, stride, screenW, screenH, box.x + pad, l.textY, trayTitle,
+                   WmCurrentPalette().text, WmCurrentPalette().taskbar, box.w - pad);
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

@@ -72,12 +72,27 @@ static void checkPopup() {
         CHECK(TaskbarVolumePopupHit(*m,l,l.panel.x+l.panel.w-2,l.panel.y+1)==TaskbarVolumeHit::Panel);
         CHECK(TaskbarVolumePopupHit(*m,l,l.panel.x-1,l.panel.y)==TaskbarVolumeHit::Outside);
         CHECK(TaskbarVolumePopupHit(*m,l,icon.x+1,icon.y+1)==TaskbarVolumeHit::Outside); // icon closes
+        // The build label beside the icon lifts the panel above it.
+        const DesktopRect label{screenW-m->pixels(200),taskbarY-m->pixels(30),m->pixels(192),m->pixels(24)};
+        l=TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36),&label);
+        CHECK(l.panel.y+l.panel.h<=label.y && l.mute.y>l.panel.y);
+        const DesktopRect far{0,taskbarY-m->pixels(30),m->pixels(50),m->pixels(24)};
+        CHECK(TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36),&far).panel.y==
+              TaskbarVolumePopup(*m,icon,taskbarY,screenW,m->pixels(36)).panel.y);
         // Narrow screens keep the left margin.
         l=TaskbarVolumePopup(*m,{0,taskbarY,10,10},taskbarY,screenW,m->pixels(36));
         CHECK(l.panel.x==m->pixels(4));
     }
 }
 
+static void checkTooltipBox() {
+    const DesktopRect icon{1690,1040,16,36};
+    auto b=TaskbarTooltipBox(icon,200,1920,8);
+    CHECK(b.x+b.w/2==icon.x+icon.w/2 && b.y==icon.y && b.h==icon.h);
+    b=TaskbarTooltipBox({1900,1040,16,36},200,1920,8);CHECK(b.x+b.w==1912);
+    b=TaskbarTooltipBox({0,1040,16,36},200,1920,8);CHECK(b.x==8);
+    b=TaskbarTooltipBox({0,1040,16,36},400,300,8);CHECK(b.x==8);
+}
 static void checkTooltip() {
     char text[32];
     TaskbarVolumeTooltip(text,45,true);CHECK(!std::strcmp(text,"Volume: 45%"));
@@ -89,7 +104,7 @@ static void checkTooltip() {
 }
 
 int main() {
-    checkGlyph();checkWheel();checkSlider();checkPopup();checkTooltip();
+    checkGlyph();checkWheel();checkSlider();checkPopup();checkTooltipBox();checkTooltip();
     std::puts("test_taskbar_volume: ok");
     return 0;
 }

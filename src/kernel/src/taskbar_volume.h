@@ -59,9 +59,11 @@ struct TaskbarVolumePopupLayout {
 };
 
 // A panel above the taskbar centred on the icon and kept on screen:
-// [mute button] [slider track] [percent text].
+// [mute button] [slider track] [percent text]. When it would overlap the
+// avoid rectangle (the desktop build label), it is lifted above it.
 inline TaskbarVolumePopupLayout TaskbarVolumePopup(const DesktopMetrics& m, const DesktopRect& icon,
-                                                   int taskbarY, int screenW, int valueTextW) {
+                                                   int taskbarY, int screenW, int valueTextW,
+                                                   const DesktopRect* avoid = nullptr) {
     TaskbarVolumePopupLayout l{};
     const int pad = m.pixels(10), button = m.pixels(32);
     const int w = m.pixels(240), h = button + 2 * pad;
@@ -70,6 +72,9 @@ inline TaskbarVolumePopupLayout TaskbarVolumePopup(const DesktopMetrics& m, cons
     if (x + w > screenW - margin) x = screenW - margin - w;
     if (x < margin) x = margin;
     int y = taskbarY - h - m.pixels(2);
+    if (avoid && avoid->w > 0 && avoid->h > 0 && x < avoid->x + avoid->w && avoid->x < x + w &&
+        y < avoid->y + avoid->h && avoid->y < y + h)
+        y = avoid->y - h - m.pixels(2);
     if (y < 0) y = 0;
     l.panel = {x, y, w, h};
     l.mute = {x + pad, y + pad, button, button};
@@ -79,6 +84,15 @@ inline TaskbarVolumePopupLayout TaskbarVolumePopup(const DesktopMetrics& m, cons
     const int trackRight = l.value.x - pad - m.pixels(6);
     l.track = {trackX, y + pad, trackRight > trackX ? trackRight - trackX : 0, button};
     return l;
+}
+
+// Horizontal box of width w centred on a tray icon, kept margin pixels
+// inside the screen (left-aligned at the margin when it cannot fit).
+inline DesktopRect TaskbarTooltipBox(const DesktopRect& icon, int w, int screenW, int margin) {
+    int x = icon.x + icon.w / 2 - w / 2;
+    if (x + w > screenW - margin) x = screenW - margin - w;
+    if (x < margin) x = margin;
+    return {x, icon.y, w, icon.h};
 }
 
 enum class TaskbarVolumeHit : uint8_t { Outside, Panel, Mute, Slider };
