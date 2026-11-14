@@ -41,6 +41,9 @@ class Marionette:
 work, wrapper = Path(sys.argv[1]), sys.argv[2]
 secs = float(sys.argv[3]) if len(sys.argv) > 3 else 15
 work.mkdir(parents=True, exist_ok=True)
+# A private profile, so the user's Firefox profile and lock are never touched.
+import os
+os.environ['BROOK_FIREFOX_PROFILE'] = str(work / 'firefox-profile')
 
 
 class Page(http.server.BaseHTTPRequestHandler):

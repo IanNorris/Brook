@@ -69,7 +69,9 @@ class Page(http.server.BaseHTTPRequestHandler):
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Page)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 url = f'http://127.0.0.1:{server.server_port}/'
-profile = Path(os.environ.get('XDG_CONFIG_HOME', '/data/home/.config')) / 'chromium-brook'
+# A private profile: never attach to (and later close) the user's running browser.
+profile = work / 'chromium-profile'
+os.environ['BROOK_CHROMIUM_PROFILE'] = str(profile)
 port_file = profile / 'DevToolsActivePort'
 if port_file.exists(): port_file.unlink()
 result = {'wrapper': wrapper}

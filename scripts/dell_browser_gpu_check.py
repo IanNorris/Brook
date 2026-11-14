@@ -23,6 +23,8 @@ out.mkdir(parents=True, exist_ok=False)
 h = Hardware()
 KEY = '/data/Programming/Brook/shared/dell/hardware-update-key'
 work = '/tmp/brook-browser-gpu-' + uuid.uuid4().hex[:8]
+# The installed profile may lack brook-iris-run; the staged patched Iris launcher (yquake2 uses it).
+IRIS = '/nix/store/998k7n885vyvxlsckcc5nf9avj3d540n-mesa-26.0.6/bin/brook-iris-run'
 
 bundle = out / 'bundle.tar'
 with tarfile.open(bundle, 'w') as tar:
@@ -37,7 +39,7 @@ def save(name, value):
 
 
 def job(argv, uid=1000, timeout=180, name=None):
-    r = h.guest_run(session, uuid.uuid4().hex, argv, cwd='/tmp', uid=uid, wait_s=2, task_limit=200)
+    r = h.guest_run(session, uuid.uuid4().hex, argv, cwd='/tmp', uid=uid, wait_s=2, task_limit=1000)
     end = time.monotonic() + timeout
     while r['state'] not in ('completed', 'failed') and time.monotonic() < end:
         r = h.job(session, r['operation_id'], wait_s=4, output_limit=16384)
@@ -50,15 +52,16 @@ save('doctor', h.doctor(session))
 xfer = BulkRun(h, out / 'bundle-transfer').execute(session, KEY, 'put', source=bundle, request_id=uuid.uuid4().hex)
 setup = job([bash, '-c', f'set -e; mkdir -p {work}; cd {work}; tar -xf {xfer["transfer"]["guest_path"]}; '
              f'chmod 755 brook-chromium brook-firefox; chown -R 1000 {work}; '
-             'ls -la /nix/profile/bin/brook-iris-run; readlink -f /nix/profile/bin/brook-iris-run'], uid=0, name='setup')
+             f'ls -la /nix/profile/bin/brook-iris-run {IRIS}'], uid=0, name='setup')
 print('setup', setup['state'], setup['stdout']['text'].strip()[-400:], setup['stderr']['text'][-400:])
 save('providers-before', h.command(session, 'procs'))
 for browser in browsers:
     for mode in modes:
         label = f'{browser}-{mode}'
         probe = 'browser_gpu_probe.py' if browser == 'chromium' else 'firefox_gpu_probe.py'
-        env = '' if mode == 'gpu' else 'BROOK_BROWSER_SOFTWARE=1 '
-        h.command(session, 'gpu worker stats reset')
+        env = f'BROOK_IRIS_RUN={IRIS} ' if mode == 'gpu' else 'BROOK_BROWSER_SOFTWARE=1 '
+        # Never reset the shared worker counters (other agents capture them); diff instead.
+        save(label + '-worker-before', h.command(session, 'gpu worker stats'))
         r = job([bash, '-c', f'{env}/nix/profile/bin/python3 {work}/{probe} {work}/{label} {work}/brook-{browser} {secs}'],
                 name=label + '-job')
         save(label + '-worker', h.command(session, 'gpu worker stats'))
@@ -67,8 +70,10 @@ for browser in browsers:
         result = json.loads(line.split(' ', 1)[1]) if line else {'error': 'no result', 'stderr': r['stderr']['text'][-2000:]}
         save(label + '-result', result)
         log = job([bash, '-c', f'tail -c 6000 {work}/{label}/browser.log'], name=label + '-log')
-        app = json.loads((out / f'{label}-worker.json').read_text()).get('class', {}).get('app', [0])
-        print(label, 'exit', r.get('exit'), 'app_jobs', app[0], 'frames', result.get('frames'),
+        before = json.loads((out / f'{label}-worker-before.json').read_text()).get('class', {}).get('app', [0, 0])
+        after = json.loads((out / f'{label}-worker.json').read_text()).get('class', {}).get('app', [0, 0])
+        app = [after[0] - before[0], after[1] - before[1]] if after[0] >= before[0] else ['counters reset', after]
+        print(label, 'exit', r.get('exit'), 'app_jobs_us', app, 'frames', result.get('frames'),
               'status', (result.get('gpu') or {}).get('featureStatus', {}).get('gpu_compositing') or
               ((result.get('gfx') or {}).get('layerManager')), 'error', result.get('error'), flush=True)
 save('providers-after', h.command(session, 'procs'))
