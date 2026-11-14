@@ -9,15 +9,17 @@ level after a user volume change (`src/kernel/src/volume_feedback.h`,
 
 - **Format:** raw PCM, 44.1 kHz, stereo, signed 16-bit little-endian, 3540
   frames (80 ms), 14,160 bytes.
-- **SHA-256:** `7754a085879c0b6ef6394e18619aeb8e1d3f4f8f15fd812645fdd19122d3b192`.
+- **SHA-256:** `a5a85788a58763428a63470b8e19bda8231a2b71aa77f67ba458c792d05aa95a`.
 - **Source:** "Sound Effect by linhmitto
   (https://pixabay.com/users/linhmitto-46708238/) from Pixabay
   (https://pixabay.com/sound-effects/)", item 254773, under the Pixabay
   Content License. The original MP3 has SHA-256 `5b534a1541aeba6bbe43080a960f9f83164ce72f0cf917caec81aa3bdeea0cd9`.
-- **Conversion:**
-  1. Decode the MP3 to 44.1 kHz stereo s16le.
-  2. Trim the 105 ms leading silence and the MP3 decoder delay.
-  3. Apply a 2 ms linear fade-in and a 10 ms fade-out.
-  4. Attenuate by −6 dB.
+- **Conversion:** decode the MP3 to 44.1 kHz stereo s16le (`raw.pcm`), then:
+  1. Take 3540 frames starting at frame 4626, which skips the 105 ms leading
+     silence and the MP3 decoder delay.
+  2. Apply a linear 2 ms (88-frame) fade-in and 10 ms (441-frame) fade-out.
+  3. Normalise the peak to −0.1 dBFS (×1.0576; source peak 30629, peak 32392).
 
-  The peak is 15314 (about −6.6 dBFS).
+  It is played at full scale on purpose, so that the pop represents the new
+  volume level. The mixer's master volume, applied in hardware on the Dell,
+  sets how loud it is.

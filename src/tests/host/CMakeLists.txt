@@ -247,6 +247,8 @@ target_compile_options(test_hda_dell_volume PRIVATE -DBROOK_HOST_TEST -ffunction
 target_link_options(test_hda_dell_volume PRIVATE -Wl,--gc-sections)
 add_host_test(test_hda_dell_tone_plan)
 add_host_test(test_volume_feedback)
+add_host_test(test_volume_pop_asset)
+target_compile_definitions(test_volume_pop_asset PRIVATE BROOK_VOLUME_POP_PATH="${BROOK_ROOT}/src/kernel/assets/volume-pop.s16le")
 target_compile_options(test_volume_feedback PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_hda_dell_tone_transaction)
 add_host_test(test_hda_dell_tone_buffer)
