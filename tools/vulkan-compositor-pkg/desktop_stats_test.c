@@ -95,7 +95,7 @@ int main(void){
     stats.last.pixelsShaded=stats.last.damagePixels=stats.last.submitToFenceNs=stats.last.gpuNs=UINT64_MAX;
     stats.idleSkips=stats.keepalives=stats.quad=UINT64_MAX;
     stats.pipeline.inFlight=UINT32_MAX;stats.pipeline.maxInFlight=stats.pipeline.carried=stats.pipeline.rebased=stats.pipeline.waitFull=
-        stats.pipeline.waitBaseline=UINT64_MAX;for(unsigned i=0;i<3;++i)stats.pipeline.submitted[i]=UINT64_MAX;
+        stats.pipeline.waitBaseline=stats.pipeline.overlayAdopted=UINT64_MAX;for(unsigned i=0;i<3;++i)stats.pipeline.submitted[i]=UINT64_MAX;
     stats.fullForced.total=stats.fullForced.noBaseline=stats.fullForced.inFlight=stats.fullForced.other=UINT64_MAX;
     static char worst[32768];assert(desktop_stats_format(&stats,&meta,worst,sizeof(worst)));
     fputs(json,stdout);

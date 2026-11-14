@@ -55,7 +55,7 @@ struct DesktopStats {
      * older frame's regions, dependent reservations retried on the newly
      * accepted ticket, and admissions that waited behind a full-screen frame
      * or for a usable baseline. */
-    struct {uint32_t inFlight;uint64_t maxInFlight,submitted[3],carried,rebased,waitFull,waitBaseline;} pipeline;
+    struct {uint32_t inFlight;uint64_t maxInFlight,submitted[3],carried,rebased,waitFull,waitBaseline,overlayAdopted;} pipeline;
     /* Submitted full-screen frames whose damage did not cover the output. */
     struct {uint64_t total,noBaseline,inFlight,other;} fullForced;
 };
@@ -189,11 +189,11 @@ static inline size_t desktop_stats_format(const struct DesktopStats *s,const str
     desktop_stats_put(&b,"\"idle\":{\"skipped_polls\":%llu,\"keepalive_presents\":%llu},",
         (unsigned long long)s->idleSkips,(unsigned long long)s->keepalives);
     desktop_stats_put(&b,"\"pipeline\":{\"depth\":%u,\"in_flight\":%u,\"max_in_flight\":%llu,\"submitted_by_in_flight\":[%llu,%llu,%llu],"
-        "\"carried_damage\":%llu,\"rebased_reserves\":%llu,\"waits_behind_full\":%llu,\"waits_baseline\":%llu},",
+        "\"carried_damage\":%llu,\"rebased_reserves\":%llu,\"waits_behind_full\":%llu,\"waits_baseline\":%llu,\"overlay_adopted\":%llu},",
         m->pipeline?m->pipeline:1u,s->pipeline.inFlight,(unsigned long long)s->pipeline.maxInFlight,
         (unsigned long long)s->pipeline.submitted[0],(unsigned long long)s->pipeline.submitted[1],(unsigned long long)s->pipeline.submitted[2],
         (unsigned long long)s->pipeline.carried,(unsigned long long)s->pipeline.rebased,
-        (unsigned long long)s->pipeline.waitFull,(unsigned long long)s->pipeline.waitBaseline);
+        (unsigned long long)s->pipeline.waitFull,(unsigned long long)s->pipeline.waitBaseline,(unsigned long long)s->pipeline.overlayAdopted);
     desktop_stats_put(&b,"\"full_forced\":{\"total\":%llu,\"no_baseline\":%llu,\"in_flight\":%llu,\"other\":%llu},",
         (unsigned long long)s->fullForced.total,(unsigned long long)s->fullForced.noBaseline,
         (unsigned long long)s->fullForced.inFlight,(unsigned long long)s->fullForced.other);

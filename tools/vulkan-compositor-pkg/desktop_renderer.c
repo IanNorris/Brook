@@ -296,6 +296,30 @@ static uint64_t overlay_generation(void){
     if(g_overlayTracked<0)g_overlayTracked=generation>0;
     return generation>0?(uint64_t)generation:0;
 }
+/* Buffered contexts, so one can adopt another's overlay capture. */
+static struct RenderContext *g_contexts;static unsigned g_contextCount;
+/* A capture re-renders the kernel overlay, and its content (the compositor
+ * cadence graph) changes with every present, so capturing bumps the
+ * generation. Two contexts that each recapture the generation the other one
+ * produced would then damage the taskbar on every frame forever. Copy the
+ * current generation's bands from the context that captured them instead
+ * (CPU reads only; that context's GPU work merely samples them). */
+static int overlay_adopt(int drm,struct RenderContext *ctx,uint64_t generation,uint32_t width,uint32_t height){
+    for(unsigned k=0;k<g_contextCount;++k){const struct RenderContext *peer=&g_contexts[k];
+        if(peer==ctx || !desktop_overlay_cache_valid(peer->overlayGeneration,peer->overlayWidth,peer->overlayHeight,generation,width,height))continue;
+        const struct BrookDesktopOverlayBands *bands=&peer->overlayBands;
+        if(bands->count>BROOK_DESKTOP_OVERLAY_MAX_BANDS)return 0;
+        ctx->overlayGeneration=0;
+        for(uint32_t i=0;i<bands->count;++i){const struct BrookDesktopOverlayBand *b=&bands->bands[i];
+            const uint64_t bytes=(uint64_t)b->width*4*b->height;
+            if(!peer->overlay[i].map || peer->overlay[i].size<bytes || source_ensure(drm,bytes,&ctx->overlay[i]))return 0;
+            memcpy(ctx->overlay[i].map,peer->overlay[i].map,bytes);
+        }
+        ctx->overlayBands=*bands;ctx->overlayGeneration=generation;ctx->overlayWidth=width;ctx->overlayHeight=height;
+        ++g_stats.pipeline.overlayAdopted;return 1;
+    }
+    return 0;
+}
 /* Pointer layer state; refreshes the context's 64x64 image on a new serial. */
 static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state){
     *state=(struct DesktopOverlayCursorState){0};
@@ -516,7 +540,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     stage="overlay_capture";
     /* Recapture only when the kernel's overlay content generation changed. */
     const uint64_t overlayGeneration=overlay_generation();
-    if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height)){
+    if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height) &&
+       !overlay_adopt(drm,ctx,overlayGeneration,width,height)){
         uint64_t captured=0;ctx->overlayGeneration=0;
         if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&captured))goto done;
         ctx->overlayGeneration=captured;ctx->overlayWidth=width;ctx->overlayHeight=height;
@@ -1120,6 +1145,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL;
     uint64_t lastPresentedTicket=0;
     for(unsigned i=0;i<depth;++i)context_init(&ctx[i]);
+    g_contexts=ctx;g_contextCount=depth;
     uint64_t fullWaitNs=0;unsigned fullWaits=0;
     unsigned frames=0,partialFrames=0,retries=0,unsupportedRetries=0,idleBusyRetries=0,active=0,maxActive=0;uint64_t previous=0,maxInterval=0,failureStart=0;unsigned gaps=0;
     uint64_t idleUntil=0;unsigned idlePolls=0;long waitedTicket=0;
@@ -1148,7 +1174,10 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
             if(result<0){++retries;
                 /* Younger frames were compared with the failed one. They
                  * still cover the screen's difference, but must not become
-                 * the change-tracking baseline. */
+                 * the change-tracking baseline, nor the damage baseline of
+                 * a further overlapped frame: admission waits for them, so
+                 * the reset baseline (a full frame if the kernel needs one,
+                 * e.g. after a window closed) is reached. */
                 if(pipelined)for(unsigned j=0;j<depth;++j)if(pending[j].ticket)pending[j].tainted=1;
                 continue;}
             lastPresentedTicket=retiringTicket;
@@ -1183,7 +1212,8 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
             if(pipelined){
                 struct DesktopPipelineInFlight flights[BROOK_GPU_HANDOFF_MAX_DEPTH];unsigned older=depth;
                 for(unsigned j=0;j<depth;++j){flights[j]=(struct DesktopPipelineInFlight){pending[j].ticket,pending[j].partial,
-                    pending[j].regions.count,pending[j].ticket && ctx[j].track && ctx[j].track->valid};if(pending[j].ticket)older=j;}
+                    pending[j].regions.count,pending[j].ticket && ctx[j].track && ctx[j].track->valid && !pending[j].tainted};
+                    if(pending[j].ticket)older=j;}
                 const enum DesktopPipelineAdmit admit=desktop_pipeline_admit(g_pipeline,flights,depth,lastPresentedTicket);
                 /* Count each in-flight frame waited behind once. */
                 if(admit==DESKTOP_PIPELINE_WAIT_FULL || admit==DESKTOP_PIPELINE_WAIT_BASELINE){
@@ -1244,6 +1274,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
         }
     }
     for(unsigned i=0;i<depth;++i)context_close(drm,&ctx[i]);
+    g_contexts=NULL;g_contextCount=0;
     stats_tick(1);
     if(getenv("BROOK_RENDER_GRAPHICS_SCENE"))fprintf(stderr,"DESKTOP_GRAPHICS_COUNTS submitted=%llu fallback=%llu\n",
         (unsigned long long)g_graphicsSubmitted,(unsigned long long)g_graphicsFallback);
@@ -1265,10 +1296,10 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     }
     fprintf(stderr,"DESKTOP_ASYNC_STOP frames=%u partial=%u retries=%u max_active=%u interval_over_250ms=%u max_interval_ms=%lu unsupported_retries=%u idle_busy_retries=%u depth=%u full_waits=%u full_wait_ns=%llu\n",
         frames,partialFrames,retries,maxActive,gaps,(unsigned long)maxInterval,unsupportedRetries,idleBusyRetries,depth,fullWaits,(unsigned long long)fullWaitNs);
-    fprintf(stderr,"DESKTOP_PIPELINE_COUNTS pipeline=%u async_present=%d submitted_in_flight=%llu/%llu/%llu carried=%llu rebased=%llu wait_full=%llu wait_baseline=%llu full_forced=%llu no_baseline=%llu in_flight=%llu other=%llu\n",
+    fprintf(stderr,"DESKTOP_PIPELINE_COUNTS pipeline=%u async_present=%d submitted_in_flight=%llu/%llu/%llu carried=%llu rebased=%llu wait_full=%llu wait_baseline=%llu overlay_adopted=%llu full_forced=%llu no_baseline=%llu in_flight=%llu other=%llu\n",
         g_pipeline,g_asyncPresent,(unsigned long long)g_stats.pipeline.submitted[0],(unsigned long long)g_stats.pipeline.submitted[1],
         (unsigned long long)g_stats.pipeline.submitted[2],(unsigned long long)g_stats.pipeline.carried,(unsigned long long)g_stats.pipeline.rebased,
-        (unsigned long long)g_stats.pipeline.waitFull,(unsigned long long)g_stats.pipeline.waitBaseline,(unsigned long long)g_stats.fullForced.total,
+        (unsigned long long)g_stats.pipeline.waitFull,(unsigned long long)g_stats.pipeline.waitBaseline,(unsigned long long)g_stats.pipeline.overlayAdopted,(unsigned long long)g_stats.fullForced.total,
         (unsigned long long)g_stats.fullForced.noBaseline,(unsigned long long)g_stats.fullForced.inFlight,(unsigned long long)g_stats.fullForced.other);
     return limit && frames!=limit?1:0;
 }

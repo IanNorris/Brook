@@ -21,6 +21,13 @@
  * (retained) GPU sources for windows 2 and 3 over the renderer's socket and
  * poisons each buffer as soon as its SAFE arrives, so a source released
  * while any in-flight frame samples it shows up as a screen mismatch.
+ * HOST_E2E_OVERLAY_FEEDBACK=1 models the kernel overlay's compositor cadence
+ * graph: a capture after any present re-renders it with new content and a
+ * new generation. HOST_E2E_STALE_BASE=1 models the kernel refusing partial
+ * presents while a window of the last full frame's scene is gone (closed),
+ * until a full frame replaces that base scene. HOST_E2E_MIN_IDLE and
+ * HOST_E2E_MAX_FAILURES bound idle polls from below and failed presents
+ * from above.
  * HOST_E2E_EXPECT_PIPELINE=1 also requires overlapped submissions, no
  * full frame forced by an in-flight frame and no failed presents.
  * Usage: brook-desktop-renderer-host-test [frames]   (env as for the renderer) */
@@ -53,11 +60,12 @@ int fake_open(const char *path,int flags,...);
 #undef open
 #include "quad_reference.h"
 
-enum {FW=640,FH=384,BAND=32,CURSOR=16,MAXW=4,TICKETS=8,DEPS=32,POOL=6};
+enum {FW=640,FH=384,BAND=32,CURSOR=16,MAXW=4,TICKETS=8,DEPS=32,POOL=16};
 struct FakeTicket {long ticket;int fd,fullOnly,depsFull;uint32_t depCount;struct BrookGpuPresentRegion deps[DEPS];uint32_t *expected;int expectedValid;
     /* GPU sources the frame selected, and whether the renderer has observed
      * its completion (OBSERVE follows the composition fence). */
-    unsigned samples,observed;struct {uint32_t window;uint64_t commit;} sampled[8];};
+    unsigned samples,observed;struct {uint32_t window;uint64_t commit;} sampled[8];
+    unsigned sceneCount;struct {uint32_t window;uint64_t incarnation;} scene[MAXW];};
 /* One provider buffer: a GEM object exported as a DMA-BUF. */
 struct FakeBuffer {uint32_t handle;int fd;uint64_t bytes;uint32_t *map;int busy;uint32_t window;uint64_t commit;int presented;};
 struct FakeWindow {int live;uint32_t window,w,h,stride,opacity,chromeW,chromeH;uint64_t incarnation,generation;
@@ -79,6 +87,8 @@ static struct {
     int direct,peer;char socketPath[108];struct FakeBuffer pool[POOL];uint64_t nextCommit;
     struct {uint64_t sent,visible;int sentBuffer,visibleBuffer;uint32_t *pixels[2];} offer[MAXW+1];
     unsigned offers,safes,presentedReplies,badReplies,poisoned,earlySafes;
+    int overlayFeedback,staleBase,lateClose;uint64_t overlayRenderedNs;unsigned overlayBumps,baseCount,staleBaseRejects;
+    struct {uint32_t window;uint64_t incarnation;} base[MAXW];
 } K;
 static uint32_t rng=0x2545f491u;
 static uint32_t next(void){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;return rng;}
@@ -231,11 +241,16 @@ static void advance(void){
         default:break;
         }}
     }
+    /* HOST_E2E_LATE_CLOSE: close the GPU window 3 mid-run and open a new
+     * GPU window 4 that commits every frame (a game restarted). */
+    if(K.lateClose && s==60){for(unsigned i=0;i<K.count;++i)if(K.win[K.order[i]].window==3){window_close(K.order[i]);break;}}
+    if(K.lateClose && s==61 && !K.win[1].live){window_open(1,4,200,150,180,120,0);provider_window(4,180,120);}
     /* GPU commits: window 2 until it closes, then a burst and random
      * commits of window 3 (retained sources survive moves and restacks). */
     if(K.direct){
         if(s>=1 && s<=8 && (s&1 || s==4))provider_offer(window_by_id(2));
         if((s>=12 && s<15) || (s>=16 && s<=24) || (s>=40 && pick(3)==0))provider_offer(window_by_id(3));
+        if(K.lateClose && s>61)provider_offer(window_by_id(4));
     }
     reference();
 }
@@ -299,7 +314,15 @@ static long layers_call(long op,struct BrookDesktopLayers *L,long a){
 static long overlay_call(long op,long token,void *p,long size,long a){
     (void)token;(void)size;
     if(op==BROOK_DESKTOP_OVERLAY_GENERATION)return (long)K.overlayGeneration;
-    if(op==0)return 1;
+    if(op==0){
+        /* The capture renders the overlay; its compositor cadence graph
+         * moves with time (the kernel samples every compositor tick). */
+        if(K.overlayFeedback && now_ns()-K.overlayRenderedNs>=4000000ull){
+            K.overlayRenderedNs=now_ns();
+            for(uint32_t x=FW-40;x<FW;++x)K.band[2*FW+x]=x-(FW-40)==K.overlayBumps%40?0xff68acffu:0xff202020u;
+            ++K.overlayGeneration;++K.overlayBumps;reference();
+        }
+        return 1;}
     if(op==3)return 0;
     if(op==BROOK_DESKTOP_OVERLAY_WAIT){struct BrookDesktopOverlayInfo *info=p;
         *info=(struct BrookDesktopOverlayInfo){{1,2,FW,FH,FW,1,(uint64_t)FW*FH*4,0,0},K.overlayGeneration};return 0;}
@@ -328,6 +351,9 @@ static long present_now(long ticket,const struct BrookGpuPresentRegions *r,const
     struct FakeTicket *t=ticket_find(ticket);if(!t)return -EINVAL;
     if((uint64_t)ticket<=K.lastPresented){++K.rejected;return -ESTALE;}
     if(r && (t->fullOnly || !deps_covered(t,r))){++K.rejected;return -ESTALE;}
+    if(r && K.staleBase)for(unsigned i=0;i<K.baseCount;++i){const struct FakeWindow *w=window_by_id(K.base[i].window);
+        if(!w || w->incarnation!=K.base[i].incarnation){++K.rejected;++K.staleBaseRejects;return -ESTALE;}}
+    if(!r){K.baseCount=t->sceneCount;memcpy(K.base,t->scene,sizeof(K.base));}
     uint64_t bytes=0;uint32_t *m=map_fd(t->fd,&bytes);if(!m)return -EINVAL;
     dma_sync(t->fd,1);uint64_t pixels=0;
     if(r)for(uint32_t i=0;i<r->count;++i){const struct BrookGpuPresentRegion *g=&r->regions[i];
@@ -363,6 +389,8 @@ static long handoff_call(long op,long arg,long a){
             *t=(struct FakeTicket){.ticket=(long)++K.nextTicket,.fd=(int)arg,.fullOnly=!dependent && K.outstanding>0,.expected=expected,.expectedValid=K.expectedValid};
             memcpy(t->expected,K.expected,sizeof(K.expected));
             if(t->fullOnly)++K.fullOnlyReserves;
+            for(unsigned j=0;j<K.count && j<MAXW;++j){t->scene[j].window=K.win[K.order[j]].window;t->scene[j].incarnation=K.win[K.order[j]].incarnation;}
+            t->sceneCount=K.count<MAXW?K.count:MAXW;
             /* The frame being prepared is the channel's newest frame. */
             for(unsigned j=0;j<DESKTOP_GPU_OFFERS && t->samples<8;++j){const struct DesktopGpuOffer *o=&g_gpuChannel.offers[j];
                 if(o->state==2 && desktop_gpu_offer_in_frame(o,g_gpuChannel.nextFrame)){
@@ -429,6 +457,8 @@ int main(int argc,char **argv){
     for(uint32_t i=0;i<FW*BAND;++i)K.band[i]=(i%3?0xc0000000u:0xff000000u)|(i*40503u&0xffffffu);
     for(uint32_t i=0;i<64*64;++i)K.cursor[i]=(i&1)?0x80ffffffu:0xff102030u;
     const char *delay=getenv("HOST_E2E_PRESENT_DELAY_US");K.presentDelayNs=delay?strtoull(delay,NULL,10)*1000ull:2000000ull;
+    K.overlayFeedback=getenv("HOST_E2E_OVERLAY_FEEDBACK")!=NULL;K.staleBase=getenv("HOST_E2E_STALE_BASE")!=NULL;
+    K.lateClose=getenv("HOST_E2E_LATE_CLOSE")!=NULL;
     K.peer=-1;K.direct=getenv("HOST_E2E_DIRECT") && strcmp(getenv("HOST_E2E_DIRECT"),"0");
     if(K.direct){snprintf(K.socketPath,sizeof(K.socketPath),"/tmp/brook-host-e2e-%d.sock",(int)getpid());
         setenv("BROOK_DESKTOP_GPU_SOCKET",K.socketPath,1);}
@@ -455,11 +485,20 @@ int main(int argc,char **argv){
         /* Overlap really happened, nothing was forced full or refused because
          * a frame was in flight, and the kernel never rejected a present. */
         if(g_pipeline!=2 || K.maxOutstanding<2 || !K.overlapReserves || !g_stats.pipeline.submitted[1] || !g_stats.pipeline.carried ||
-           g_stats.fullForced.inFlight || K.fullOnlyReserves>K.fulls || K.rejected || g_stats.presentFailures)++bad;
+           g_stats.fullForced.inFlight || K.fullOnlyReserves>K.fulls || (!K.staleBase && (K.rejected || g_stats.presentFailures)))++bad;
         /* Full frames only where no partial baseline exists: the first frame
          * and the backdrop change. */
-        if(K.fulls>2)++bad;
+        if(K.fulls>(K.staleBase?3u:2u))++bad;
     }
+    printf("HOST_E2E_IDLE idle_polls=%llu overlay_bumps=%u overlay_captures=%llu stale_base_rejects=%u present_failures=%llu\n",
+        (unsigned long long)g_stats.idleSkips,K.overlayBumps,(unsigned long long)g_stats.overlayCaptures,K.staleBaseRejects,(unsigned long long)g_stats.presentFailures);
+    if(K.lateClose){uint64_t shown=0;
+        for(unsigned i=0;i<DESKTOP_STATS_WINDOWS;++i)if(g_stats.windows[i].lastUse && g_stats.windows[i].window==4 && g_stats.windows[i].lastGpu)
+            shown=g_stats.windows[i].displayed;
+        printf("HOST_E2E_LATE_WINDOW gpu_displayed=%llu\n",(unsigned long long)shown);
+        if(shown<5)++bad;}
+    if(getenv("HOST_E2E_MIN_IDLE") && g_stats.idleSkips<strtoull(getenv("HOST_E2E_MIN_IDLE"),NULL,10))++bad;
+    if(getenv("HOST_E2E_MAX_FAILURES") && g_stats.presentFailures>strtoull(getenv("HOST_E2E_MAX_FAILURES"),NULL,10))++bad;
     if(bad)printf("HOST_E2E_EXPECTATION_FAILED\n");
     else if(!K.failures && !result)printf("HOST_E2E_PASS\n");
     if(K.direct)unlink(K.socketPath);
