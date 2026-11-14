@@ -173,6 +173,20 @@ static uint64_t g_lastOverlayOnlyNs,g_overlayOnlySkips;
  * present call, present done; ring image, drawn partial/full, drawn pixels,
  * newest game commit sampled. */
 enum { DESKTOP_TIMELINE=32 };
+/* Report each new GPU-source client commit once so the kernel taskbar's APP
+ * cadence covers GPU clients (their frames never pass the CPU publication
+ * path). A retained offer sampled again is not re-reported; an older kernel
+ * (EINVAL/ENODEV) disables the report. */
+static int g_clientFrameReports=1;
+static uint64_t g_clientFrameIncarnation[BROOK_DESKTOP_LAYER_LIMIT],g_clientFrameCommit[BROOK_DESKTOP_LAYER_LIMIT];
+static void desktop_note_client_frame(uint32_t window,uint64_t incarnation,uint64_t commit){
+    if(!g_clientFrameReports || !window || window>BROOK_DESKTOP_LAYER_LIMIT || !incarnation || !commit)return;
+    const unsigned slot=window-1;
+    if(g_clientFrameIncarnation[slot]==incarnation && g_clientFrameCommit[slot]>=commit)return;
+    g_clientFrameIncarnation[slot]=incarnation;g_clientFrameCommit[slot]=commit;
+    if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CLIENT_FRAME,0L,0L,(long)window,(long)incarnation,(long)commit) &&
+       (errno==EINVAL || errno==ENODEV))g_clientFrameReports=0;
+}
 struct DesktopTimelineRow {uint64_t start,submit,fence,presentCall,presented,commit,drawPixels;int image,partial;};
 static struct DesktopTimelineRow g_timeline[DESKTOP_TIMELINE];static uint64_t g_timelineCount;
 /* Zero-copy active at the last pick: presents then name every region drawn
@@ -578,6 +592,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         desktop_damage_add(&footprint,(struct DesktopDamageRect){
             content.x,content.y,(int64_t)content.x+content.width,(int64_t)content.y+content.height},width,height);
         struct DesktopGpuOffer *direct=desktop_gpu_channel_select(&g_gpuChannel,l,width,height,&content,frame);
+        if(direct)desktop_note_client_frame(l->window,l->incarnation,direct->packet.identity.commit);
         if(direct && getenv("BROOK_RENDER_SOURCE_GEOMETRY")){
             static unsigned samples;
             if(samples++<16)fprintf(stderr,"DESKTOP_SOURCE_GEOMETRY window=%u incarnation=%llu commit=%llu source=%ux%u destination=%ux%u fourcc=%08x offset_words=%u stride_words=%u size_words=%llu\n",

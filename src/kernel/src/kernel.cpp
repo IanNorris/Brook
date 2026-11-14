@@ -11,6 +11,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "platform_power.h"
 #include "serial.h"
 #include "kprintf.h"
+#include "thermal_runtime.h"
 #include "panic.h"
 #include "cpu.h"
 #include "gdt.h"
@@ -1185,6 +1186,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the audio mixer drain thread.
         brook::AudioMixerThreadStart();
+
+        // CPU/GPU temperature and power sampler (bare-metal Intel only).
+        brook::ThermalSamplerStart();
 
         // Start debug channel kernel thread (connects asynchronously).
 #if !defined(BROOK_SSD_GUARD_CHECK)

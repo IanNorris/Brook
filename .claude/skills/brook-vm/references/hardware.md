@@ -18,6 +18,13 @@ On an authorized inspection, use `hw_doctor` and distinguish:
 
 For a focused host-side connection diagnosis, `scripts/probe_hardware_link.py TARGET_IPV4` reports route, neighbor state, ping and a framed capabilities request. It sends guest/network traffic, so it is not needed for offline onboarding. Use one bounded probe unless another sample could change the diagnosis. The debug listener processes one connection at a time: avoid concurrent/redundant guest probes that compete with an existing command. A zero boot ID before attach is not a pinned identity.
 
+`hw_thermal` (read-only) reports CPU/GPU thermals from the kernel sampler (one pinned thread per CPU, 250 ms):
+- **Fields:** package and per-core temperature with TjMax, RAPL package/cores/GT power, CPU C0 frequency and residency, the last GPU clock (CAGF) a render job saw, and maxima since boot.
+- **Options:** `history: true` returns the last 60 s of samples, `graph: true` the last 2 min of 1 s points, `power: true` adds the raw P-state/C-state/RAPL-limit MSRs and residency counters.
+- **Debug commands behind it:** `thermal status|history|graph|power`; `thermal reset` (via `hw_command`) clears the maxima.
+- **Availability:** bare-metal Intel only (VMs report `available: false`).
+- **Thermal limit:** the Dell has reached 99 °C package under load, against TjMax 100. Watch `max.pkg_c` during sustained GPU-clock or game tests and stop well before TjMax.
+
 `hw_logs` uses completed-line cursors, not VM byte offsets. Follow `next_cursor` and report retention loss. `hw_stats`, `hw_apps` and `hw_windows` provide bounded metrics and references. `hw_command` sends a boot-guarded kernel debug command, not a POSIX shell command; use structured jobs for guest programs.
 
 Connection loss can be link failure, reboot, panic or a guest hang. Recover operation state without replay where the transport still works; otherwise retain the uncertainty and arrange a local observation. Physical panic handling halts CPUs, so the debug socket is not a panic recovery channel. Brook's optical route uses `tools/panic_receiver.py` and `tools/panic_scanner.html`. Inspect the current receiver/service and pin its decoder to the exact last-confirmed guest kernel ELF before interpreting stacks; do not assume an old scanner's symbols match a new kernel. Changing the scanner/service is a separate authorized action.

@@ -16,6 +16,7 @@
 #include "intel_bdw_render_clock_runtime.h"
 #endif
 #include "intel_bdw_wait_queue.h"
+#include "thermal_runtime.h"
 #include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
@@ -5128,6 +5129,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
             "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
+            "  thermal status|history|graph|power|reset - CPU/GPU temperature, power and frequency sampler\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -5713,6 +5715,57 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
+    }
+    else if(NetStrEq(cmd,"thermal status") || NetStrEq(cmd,"thermal history") || NetStrEq(cmd,"thermal graph") ||
+            NetStrEq(cmd,"thermal power") || NetStrEq(cmd,"thermal reset")) {
+        // CPU/GPU temperature and power from the per-CPU thermal sampler
+        // (250 ms); `power` reads the P-state/C-state scoping MSRs once.
+        auto sfield=[](BridgeReply& r,const char* name,int64_t v){r.text("\"");r.text(name);r.text("\":");if(v<0){r.text("-");v=-v;}r.number(uint64_t(v));};
+        auto sample=[&](BridgeReply& r,const ThermalSample& v){
+            r.text("{");r.field("tick_ms",v.tick);r.text(",");sfield(r,"pkg_c",v.pkgC);r.text(",");sfield(r,"core_max_c",v.maxCoreC);
+            r.text(",");r.field("pkg_mw",v.pkgMw);r.text(",");r.field("cores_mw",v.coreMw);r.text(",");r.field("gt_mw",v.gtMw);
+            r.text(",");r.field("cpu_mhz",v.cpuMhz);r.text(",");r.field("c0_pct",v.c0Percent);r.text(",");r.field("gpu_mhz",v.gpuMhz);r.text("}");
+        };
+        BridgeReply r;
+        if(NetStrEq(cmd,"thermal reset")){ThermalResetMaxima();DebugChannelSend("{\"ok\":true,\"note\":\"maxima reset\"}\n");}
+        else if(NetStrEq(cmd,"thermal power")){
+            const auto p=ThermalReadPowerRegs();
+            r.text("{\"valid\":");r.text(p.valid?"true":"false");r.text(",");r.field("model",p.model);r.text(",");r.field("cpu",p.cpu);
+            r.text(",\"hwp_supported\":");r.text(p.hwpSupported?"true":"false");r.text(",\"epb_supported\":");r.text(p.epbSupported?"true":"false");
+            auto hex=[&](const char* name,uint64_t v){r.text(",\"");r.text(name);r.text("\":\"0x");r.number(v,true);r.text("\"");};
+            hex("misc_enable",p.miscEnable);hex("perf_ctl",p.perfCtl);hex("perf_status",p.perfStatus);hex("energy_perf_bias",p.epb);
+            hex("platform_info",p.platformInfo);hex("turbo_ratio_limit",p.turboRatioLimit);hex("pkg_cst_config_control",p.pkgCstConfig);
+            hex("pkg_power_limit",p.pkgPowerLimit);hex("pkg_power_info",p.pkgPowerInfo);hex("cpuid5_edx",p.mwaitLeaf5Edx);
+            r.text(",");r.field("tsc",p.tsc);
+            r.text(",\"residency\":{");r.field("pkg_c2",p.pkgC2);r.text(",");r.field("pkg_c3",p.pkgC3);r.text(",");r.field("pkg_c6",p.pkgC6);
+            r.text(",");r.field("pkg_c7",p.pkgC7);r.text(",");r.field("pkg_c8",p.pkgC8);r.text(",");r.field("pkg_c9",p.pkgC9);r.text(",");r.field("pkg_c10",p.pkgC10);
+            r.text(",");r.field("core_c3",p.coreC3);r.text(",");r.field("core_c6",p.coreC6);r.text(",");r.field("core_c7",p.coreC7);r.text("}");
+            r.text(",\"scope\":\"raw P-state/C-state/RAPL-limit MSRs read on the calling CPU (residency counters count at TSC rate since reset; core counters are this CPU's core); IdleLoop uses sti;hlt (C1) today\"}\n");r.send();
+        } else {
+            ThermalSnapshot snap{};ThermalReadSnapshot(snap);
+            r.text("{\"available\":");r.text(snap.available?"true":"false");r.text(",\"rapl\":");r.text(snap.rapl?"true":"false");
+            r.text(",\"aperf\":");r.text(snap.aperf?"true":"false");r.text(",");r.field("tjmax_c",snap.tjmax);r.text(",");r.field("base_mhz",snap.baseMhz);
+            r.text(",");r.field("samples",snap.samples);r.text(",");r.field("misplaced",snap.misplaced);r.text(",");r.field("period_ms",ThermalPeriodMs);
+            r.text(",\"latest\":");sample(r,snap.latest);
+            r.text(",\"max\":{");sfield(r,"pkg_c",snap.maxima.pkgC);r.text(",");sfield(r,"core_c",snap.maxima.coreC);
+            r.text(",");r.field("pkg_mw",snap.maxima.pkgMw);r.text(",");r.field("gt_mw",snap.maxima.gtMw);
+            r.text(",");r.field("cpu_mhz",snap.maxima.cpuMhz);r.text(",");r.field("gpu_mhz",snap.maxima.gpuMhz);r.text("}");
+            r.text(",\"cpus\":[");
+            for(uint32_t i=0;i<snap.cpuCount;++i){if(i)r.text(",");const auto& c=snap.cpus[i];
+                r.text("{");sfield(r,"temp_c",c.tempC);r.text(",");r.field("mhz",c.mhz);r.text(",");r.field("c0_pct",c.c0Percent);
+                r.text(",");r.field("ratio",c.ratio);r.text(",\"valid\":");r.text(c.valid?"true":"false");r.text("}");}
+            r.text("]");
+            const bool graph=NetStrEq(cmd,"thermal graph");
+            if(NetStrEq(cmd,"thermal history") || graph){
+                static ThermalSample rows[ThermalHistory];
+                const uint32_t n=graph?ThermalReadGraph(rows,ThermalGraphHistory):ThermalReadHistory(rows,ThermalHistory);
+                r.text(graph?",\"graph\":[":",\"history\":[");
+                for(uint32_t i=0;i<n;++i){if(i)r.text(",");sample(r,rows[i]);}
+                r.text("]");
+            }
+            r.text(",\"scope\":\"per-CPU pinned sampler every period_ms: pkg_c=IA32_PACKAGE_THERM_STATUS DTS, core temps IA32_THERM_STATUS per logical CPU (siblings share a core), mhz=base*dAPERF/dMPERF (C0 average), c0_pct=dMPERF/dTSC, ratio=IA32_PERF_STATUS, power=RAPL PKG/PP0/PP1 energy deltas, gpu_mhz=last render-job RPSTAT1 CAGF within 2 s (0 = GPU idle); max since boot or 'thermal reset'; history=60 s of samples, graph=1 s points (max temp, mean power)\"}\n");
+            r.send();
+        }
     }
     else if(StrStartsWith(cmd,"gpu clock")) {
 #if defined(BROOK_BDW_RPS_TRIAL)

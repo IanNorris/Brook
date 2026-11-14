@@ -40,6 +40,7 @@
 #include "display.h"
 #include "vfs.h"
 #include "vfs_path.h"
+#include "thermal_runtime.h"
 #include "memory/virtual_memory.h"
 #include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
@@ -1824,7 +1825,7 @@ struct TaskbarLayout
 {
     int y, textY;
     WmRect apps, terminal, next, clock, network, volume;
-    WmRect metrics[6];
+    WmRect metrics[7];
     WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int count, nextIndex;
@@ -1858,9 +1859,9 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     reserve(l.clock, WmTextWidth(l.clockText));
     reserve(l.network, WmMetric(16));
     reserve(l.volume, WmMetric(16));
-    const int widths[6]={64,64,112,112,240,240};
+    const int widths[7]={64,64,112,112,240,240,150};
     const uint32_t enabledMetrics=WmGetTaskbarMetrics();
-    for(int i=5;i>=0;--i)if(enabledMetrics&(1u<<i)){
+    for(int i=6;i>=0;--i)if(enabledMetrics&(1u<<i)){
         reserve(l.metrics[i],WmMetric(widths[i]));
         if(l.metrics[i].w){
             // Two 19-pixel text lines do not fit the 32-pixel task buttons.
@@ -2306,7 +2307,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // Use the already-reserved tray for the hover label. Geometry stays fixed
     // and no additional empty strip is reserved when nothing is hovered.
     int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.volume,l.network,l.clock};
+    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.metrics[6],l.volume,l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
@@ -2321,7 +2322,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
     DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
     DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
-    for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
+    for(unsigned i=0;i<7;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
 }
 
 // Volume and network tooltips float in a small panel just above the
@@ -2336,6 +2337,9 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     if (l.volume.contains(mx, my)) {
         anchor = &l.volume;
         TaskbarVolumeTooltip(text, g_volumeControl, g_volumeAvailable);
+    } else if (l.metrics[6].w && l.metrics[6].contains(mx, my)) {
+        anchor = &l.metrics[6];
+        DesktopThermalTooltip(text);
     } else if (l.network.contains(mx, my)) {
         anchor = &l.network;
         const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
