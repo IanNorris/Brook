@@ -654,6 +654,8 @@ target_compile_options(test_exec_page_cache PRIVATE
 )
 set_tests_properties(test_exec_page_cache PROPERTIES TIMEOUT 30)
 
+add_host_test(test_shutdown_service_escalation)
+target_compile_options(test_shutdown_service_escalation PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_launch_feedback)
 target_compile_options(test_launch_feedback PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 

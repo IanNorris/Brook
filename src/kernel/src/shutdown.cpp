@@ -20,6 +20,7 @@
 #include "klog.h"
 #include "serial.h"
 #include "string.h"
+#include "shutdown_service_escalation.h"
 #if defined(BROOK_SSD_GUARDED_DESKTOP)
 #include "debug_epoch.h"
 #include "guard_checker_runner.h"
@@ -50,6 +51,7 @@ struct ClientIdentity {uint32_t pid;uint64_t incarnation;};
 ClientIdentity closeClients[MAX_PROCESSES]{};uint32_t closeClientCount=0;
 CloseTarget closeTargets[WM_MAX_WINDOWS]{};uint32_t closeCount=0,guiRemaining=0;
 DebugTaskSnapshot tasks[MAX_PROCESSES];uint32_t taskCount=0;
+ServiceStopPolicy serviceStop{};
 void RequestDesktopPower(bool restart,bool acLoss);
 const char* Name(Phase phase) {
     switch(phase) {
@@ -76,7 +78,24 @@ uint32_t Census(uint32_t* applications) {
     }
     return users;
 }
-void StopServices() {
+// Names the first service still alive in the Services phase (under lock).
+char servicesStatus[96]{};
+void FormatServicesStatus(uint64_t now) {
+    uint32_t unused=0;Census(&unused);
+    const DebugTaskSnapshot* blocker=nullptr;uint32_t remaining=0;
+    for(uint32_t i=0;i<taskCount;++i)if(!tasks[i].kernel&&tasks[i].state!=ProcessState::Terminated){++remaining;if(!blocker||tasks[i].pid==tasks[i].tgid&&blocker->pid!=blocker->tgid)blocker=&tasks[i];}
+    char text[96];uint32_t n=0;
+    auto put=[&](const char* x){while(*x&&n<sizeof(text)-1)text[n++]=*x++;};
+    auto num=[&](uint64_t v){char d[21];int k=0;do{d[k++]=char('0'+v%10);v/=10;}while(v&&k<20);while(k&&n<sizeof(text)-1)text[n++]=d[--k];};
+    put("Stopping desktop services");
+    if(blocker){put(" - waiting for ");put(blocker->name);put(" pid ");num(blocker->tgid);
+        if(remaining>1){put(" (+");num(remaining-1);put(" tasks)");}
+        const uint64_t left=serviceStop.MsUntilKill(now);
+        if(left){put(", forcing in ");num((left+999)/1000);put(" s");}else put(", forced");}
+    text[n]=0;
+    SpinLockAcquire(&lock);memcpy(servicesStatus,text,n+1);SpinLockRelease(&lock);
+}
+void StopServices(int signal=15) {
     uint32_t unused=0;Census(&unused);
     for(uint32_t i=0;i<taskCount;++i) {
         const auto& t=tasks[i];if(!t.pid||t.kernel||!t.systemService||t.state==ProcessState::Terminated)continue;
@@ -94,7 +113,9 @@ void StopServices() {
             if(!recipient||unmasked){if(recipient)ProcessUnref(recipient);recipient=p;}else ProcessUnref(p);
             if(unmasked)break;
         }
-        if(recipient){ProcessSendSignal(recipient,15);ProcessUnref(recipient);}
+        if(recipient){
+            SerialPrintf("shutdown: service %s pid=%u signal=%d\n",t.name,t.tgid,signal);
+            ProcessSendSignal(recipient,signal);ProcessUnref(recipient);}
     }
 }
 void Worker(void*) {
@@ -132,11 +153,21 @@ void Worker(void*) {
                     SpinLockAcquire(&lock);
                     if(!operations[selected].cancel&&!closePolling){operations[selected].phase=Phase::Services;irreversible=true;}
                     const bool proceed=operations[selected].phase==Phase::Services;SpinLockRelease(&lock);
-                    if(proceed){StopServices();CompositorMarkDirty();}
+                    if(proceed){serviceStop.Begin(ApicTickCount());StopServices();FormatServicesStatus(ApicTickCount());CompositorMarkDirty();}
                 }
             }
         }else if(op.phase==Phase::Services) {
-            uint32_t apps=0;if(!Census(&apps))SetPhase(selected,Phase::Cleanup);
+            uint32_t apps=0;
+            if(!Census(&apps))SetPhase(selected,Phase::Cleanup);
+            else {
+                // Bounded escalation: a service that never exits must not
+                // hold a checked restart in this phase indefinitely.
+                const uint64_t now=ApicTickCount();
+                const auto action=serviceStop.Poll(now);
+                if(action==ServiceStopPolicy::Action::Term)StopServices(15);
+                else if(action==ServiceStopPolicy::Action::Kill){KLog("shutdown: services did not stop; sending SIGKILL");StopServices(9);}
+                FormatServicesStatus(now);
+            }
         }else if(op.phase==Phase::Cleanup) {
             bool closed=false;uint32_t births=0;SchedulerUserBirthStatus(&closed,&births);
             const auto cleanup=ProcessGetCleanupStatus();uint32_t apps=0;
@@ -314,7 +345,7 @@ void ShutdownDesktopCancel() {
 static const char* DescribePhase(Phase phase,bool restart) {
     switch(phase) {
     case Phase::Closing:return "Closing apps - resolve save dialogs, or Cancel";
-    case Phase::Services:return "Stopping desktop services";
+    case Phase::Services:return servicesStatus[0]?servicesStatus:"Stopping desktop services";
     case Phase::Cleanup:return "Waiting for process cleanup";
     case Phase::Syncing:return "Saving filesystem changes";
     case Phase::Ready:return restart?"Ready to restart":powerOff?"Ready to power off":"Safe to power off manually";

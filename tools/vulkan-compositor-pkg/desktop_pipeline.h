@@ -107,3 +107,10 @@ static inline enum DesktopPipelineFull desktop_pipeline_full_reason(int full,int
     if(damagePixels>=screenPixels)return DESKTOP_FULL_NOT_FORCED;
     return DESKTOP_FULL_OTHER;
 }
+
+/* After SIGTERM the renderer drains in-flight frames for at most this long
+ * (below the kernel's 3 s SIGTERM resend and 8 s SIGKILL during shutdown). */
+#define DESKTOP_STOP_DRAIN_NS 2500000000ull
+static inline int desktop_stop_drain_expired(uint64_t stopSinceNs,uint64_t nowNs){
+    return stopSinceNs && nowNs>=stopSinceNs && nowNs-stopSinceNs>=DESKTOP_STOP_DRAIN_NS;
+}
