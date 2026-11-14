@@ -151,6 +151,7 @@ struct BdwRenderRunResult {
     bool sampleFrequency=false;
 #if defined(BROOK_BDW_RPS_TRIAL)
     bool tryFrequency=false;
+    uint32_t trialBin=10; // requested render ratio, 50 MHz units (intel_bdw_render_clock.h)
     uint32_t trialFrequencyCaps=0;
     uint32_t trialFrequencyOriginal=0,trialFrequencyPosted=~uint32_t{0};
 #endif

@@ -540,7 +540,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 uint32_t savedFrequency=0;
                 void requestTrialFrequency(){
                     constexpr uint32_t requestReg=0xa008; // GEN6_RPNSWREQ
-                    constexpr uint32_t trialBin=10; // 500 MHz, in 50 MHz bins
+                    uint32_t trialBin=result.trialBin; // chosen by the worker (gpu clock), 50 MHz bins
                     constexpr uint32_t ratioMask=0x7f000000u;
                     if(!result.tryFrequency || !o.owned())return;
                     DellI2cCriticalEvidence evidence{};
@@ -549,6 +549,10 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     const uint32_t caps=result.trialFrequencyCaps;
                     const uint32_t minBin=(caps>>16)&0xff;
                     const uint32_t maxBin=caps&0xff;
+                    // Never request outside the fused [RPn, RP0] range.
+                    if(trialBin>maxBin)trialBin=maxBin;
+                    if(trialBin<minBin)trialBin=minBin;
+                    result.trialBin=trialBin;
                     uint32_t control=0;
                     if(caps==0xffffffffu || !minBin || minBin>trialBin || maxBin<trialBin ||
                        !o.io.read32(BdwDellBar0+0xa024,control) || control==0xffffffffu || !(control&(1u<<7)) ||

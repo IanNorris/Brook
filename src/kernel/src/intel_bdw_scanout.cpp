@@ -29,6 +29,8 @@
 #include "profiler.h"
 #if defined(BROOK_BDW_RPS_TRIAL)
 #include "shutdown.h"
+#include "intel_bdw_render_clock.h"
+#include "intel_bdw_render_clock_runtime.h"
 #endif
 #include "process.h"
 #include "intel_bdw_file.h"
@@ -597,6 +599,9 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #if defined(BROOK_BDW_RPS_TRIAL)
     run.tryFrequency=ShutdownGetAcStatus().source==AcPowerSource::Online &&
         PageAdmitted(BdwRenderFrequencyCapsPage);
+    BdwClockSampleThermal(tsc.khz);
+    run.trialBin=BdwClockEffectiveBin(BdwClock());
+    BdwClock().lastRequestedBin=run.trialBin;
 #endif
     BdwTraceSnapshot(snapshot,FrameDeviceBegin);
 #endif
@@ -608,6 +613,9 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     run.scanoutPat=BdwZeroCopyScanoutPat();
 #endif
     VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && defined(BROOK_BDW_RPS_TRIAL) && !defined(BROOK_HOST_TEST)
+    if(run.trialFrequencyCaps && run.trialFrequencyCaps!=0xffffffffu)BdwClock().lastCaps=run.trialFrequencyCaps;
+#endif
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
     if(scanoutImages)BdwZeroCopyNoteRender(run.uncachedScanout);
 #endif
