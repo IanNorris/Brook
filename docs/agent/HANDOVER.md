@@ -32,7 +32,7 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | 0b | Move the Dell GPU critical-section code out of `memory/virtual_memory.cpp` into `intel_bdw_critical.cpp` (pure move) | done: `2831dbbd`; Dell stage timings unchanged vs gen 355 |
 | 0c | Reproducible Dell image build: `scripts/build_dell_image.py --qemu-check` (guarded QEMU repair-to-desktop via `scripts/check_dell_image_qemu.py`) | done: `74342a6b`, `e8680304`, `56fbc88b` |
 | M0 | Diagnostics: `gpu worker stats` (kernel), `/tmp/brook-desktop-stats.json` + `scripts/desktop_stats_diff.py` (renderer), `scripts/dell_quake_measure.py` | done: gen 357 results below |
-| M2 | Release the previous client buffer as soon as the compositor has consumed it; remove the CPU copies on the GPU path (waylandd snapshot); present-driven frame callbacks; drop the 8-buffer workaround | todo |
+| M2 | Event-driven waylandd, channel ABI v2 (retain + PRESENTED), release on SAFE without CPU copy, present-driven callbacks | done: `aac9e79c`, `af3626c9`; gen 361 with overlay |
 | — | Kernel Console hidden at startup on the Dell (`--hide-kernel-console`, Apps > Kernel Console to reopen) plus a taskbar network indicator | done: `f20af824`; gen 358: displayed interval 79 → 68–71 ms |
 | M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
 | M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
@@ -50,6 +50,14 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **The GPU clock stays at 500 MHz from issue to end,** so the ramp hypothesis is refuted.
 - **Non-game presents run at ~13–17/s** (console and cursor) and each costs a full compositor job.
 - Evidence: `/data/Programming/Brook/display-perf/build/dell/measure-m0/`.
+
+**Gen 361 (M2 + overlay caching, `6a560d68`):**
+- **Displayed:** mean interval 69 ms with 8 buffers and 60 ms with 2 (was 68–71).
+- **Swaps fell:** 53 and 26/s (were 69 and 40).
+- **Overlay:** captures 30 → 8/s, wait 10 → 2 ms; non-game prep 10 → 0.5 ms.
+- **Worker:** idle only 8–13% (compositor 45–47%, present 26%).
+- **Non-game composites now cost ~18 ms each at 12–20/s.** Composite cost doesn't scale with damage, so M1 (damage-proportional composition) is next, then M3.
+- The rollback after the M4a loop used `scripts/hardware_promote_slot.py` from the USB maintenance boot (gen 358 → gen 360).
 
 Ian's direction (14 Nov):
 - Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
