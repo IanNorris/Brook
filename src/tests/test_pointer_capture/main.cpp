@@ -156,6 +156,19 @@ int main() {
     CHECK(WmRouteCapturedPointer(event)); // Key-repeat Escape is quarantined too.
     event.type=InputEventType::KeyRelease;CHECK(WmRouteCapturedPointer(event));
     CHECK(!WmRouteCapturedPointer(event));
+    // Super-key release: the provider's lease query fails, the pointer returns
+    // to its anchor, and re-locking needs a fresh physical click.
+    mouseX=100;mouseY=100;lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    mouseX=5;mouseY=6;
+    const auto beforeUser=WmPointerCapture(owner,id,3,0);
+    CHECK(WmPointerCaptureReleaseByUser() && !WmPointerCaptureActive());
+    CHECK(!WmPointerCaptureReleaseByUser()); // Idempotent when nothing is captured.
+    CHECK(!WmPointerCapture(owner,id,0,lease) && WmPointerCapture(owner,id,2,lease)==-116);
+    CHECK(mouseX==100 && mouseY==100 && WmPointerCapture(owner,id,3,0)==beforeUser);
+    held.type=InputEventType::MouseButtonDown;held.scanCode=0;held.sequence=++sequence;
+    CHECK(!WmRouteCapturedPointer(held) && WmPointerCapture(owner,id,3,0)==beforeUser+1);
+    held.type=InputEventType::MouseButtonUp;held.sequence=++sequence;
+    CHECK(!WmRouteCapturedPointer(held));
     lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     mouseButtons=1;
     event={};event.type=InputEventType::MouseRelativeMove;event.sequence=++sequence;
@@ -174,5 +187,5 @@ int main() {
     CHECK(WmPointerCapture(owner,id,1,0)==-75 && !WmPointerCaptureActive());
     w->vfb=nullptr;WmDestroyWindowById(owner,id);WmDestroyWindow(other);
     std::free(owner);std::free(stranger);CHECK(!lockDepth);
-    std::puts("POINTER_CAPTURE PASS: ownership, ordering, signed totals, focus/death/reuse, overflow, emergency release");
+    std::puts("POINTER_CAPTURE PASS: ownership, ordering, signed totals, focus/death/reuse, overflow, emergency and Super release");
 }

@@ -62,6 +62,12 @@ static constexpr uint8_t SC_EXT_DELETE = 0x87;
 static constexpr uint8_t SC_EXT_PGUP   = 0x88;
 static constexpr uint8_t SC_EXT_PGDN   = 0x89;
 
+// Super/Windows keys (PS/2 E0 5B/5C, USB GUI modifiers). Values are the evdev
+// KEY_LEFTMETA/KEY_RIGHTMETA codes, which the USB path already uses for its
+// other non-typing keys; set-1 0x7D/0x7E are otherwise unused here.
+static constexpr uint8_t SC_LSUPER = 125;
+static constexpr uint8_t SC_RSUPER = 126;
+
 // Per-device event ring buffer size (must be power of 2).
 static constexpr uint32_t INPUT_RING_SIZE = 64;
 
