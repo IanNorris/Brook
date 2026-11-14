@@ -20,6 +20,10 @@ void BdwGpuBufferPrimeCacheProbe(BdwGpuBuffer*);
 // Kernel-owned output: CPU mappings through Intel DRM are forbidden from
 // creation for its entire lifetime, including after PRIME/GEM import.
 BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes);
+// Zero-copy scanout registration (protected buffers only, idle): permanent
+// for the buffer's life; render submissions then map it uncached.
+bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b);
+bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b);
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* buffer);
 void BdwGpuBufferRef(BdwGpuBuffer* buffer);
 void BdwGpuBufferUnref(BdwGpuBuffer* buffer);

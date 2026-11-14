@@ -12,6 +12,9 @@ struct BdwExecMemoryObject {
     const uint64_t* pageDma;
     uint32_t pageCount;
     bool writable;
+    // Zero-copy scanout images: render writes must bypass the LLC, which the
+    // display engine does not snoop on Broadwell (i915: I915_CACHE_NONE).
+    bool uncached=false;
 };
 // Count the root and distinct intermediate-table prefixes without expanding
 // objects into one entry per page. Objects must already be sorted and pinned.
@@ -64,7 +67,8 @@ inline bool BdwBuildExecAddressSpace(const BdwPpgttPage (&scratch)[4],
     }
     uint32_t n=0;
     for(uint32_t i=0;i<objectCount;++i)for(uint32_t j=0;j<objects[i].pageCount;++j)
-        workspace[n++]={objects[i].address+uint64_t(j)*4096,objects[i].pageDma[j],objects[i].writable};
+        workspace[n++]={objects[i].address+uint64_t(j)*4096,objects[i].pageDma[j],objects[i].writable,
+            objects[i].uncached?BdwPpgttCache::Uncached:BdwPpgttCache::WriteBack};
     return BdwBuildPpgttImage(scratch,tables,tableCount,workspace,n,true);
 }
 }

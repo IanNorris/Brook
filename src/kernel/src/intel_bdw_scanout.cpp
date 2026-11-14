@@ -913,6 +913,19 @@ BdwScanoutStatus BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const 
     BdwGgttReservation reservation{};
     BdwOwnedPage scratch{};
 #if defined(BROOK_BDW_SCANOUT_TARGETS)
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    // Zero-copy: the source is a registered renderer image; arm DSPASURF to
+    // it (or queue it) instead of copying. Runtime-gated off by default.
+    switch(BdwZeroCopyPresentSource(source)){
+    case BdwZeroCopyOutcome::Presented:
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+        ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);
+#endif
+        stage(5);return BdwScanoutStatus::Completed;
+    case BdwZeroCopyOutcome::RepairRequired:return BdwScanoutStatus::RepairRequired;
+    case BdwZeroCopyOutcome::Copy:break;
+    }
+#endif
     // Persistent GOP map or page flip, both runtime-gated off by default.
     BdwTargetPlan plan{};
     if(BdwScanoutTargetSelect(regions,count,plan)==BdwTargetSelect::RepairRequired)return BdwScanoutStatus::RepairRequired;

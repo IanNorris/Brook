@@ -18,6 +18,8 @@ struct BdwGpuBuffer {
     uint64_t gpuState; // 63 failure; 62 CPU transition; 61/60 handoff/consumed; 59 scanout map; low 32 GPU uses
     uint64_t handoffToken;
     bool userMappingAllowed;
+    bool scanoutImage; // registered for zero-copy scanout: render maps it uncached
+    bool gpuEverUsed;  // sticky: a write-back GPU mapping may have left LLC lines
 #ifdef BROOK_BDW_CACHE_PROBE
     bool cacheProbe;
     uint32_t cacheProbeOmit;
@@ -126,6 +128,16 @@ BdwGpuBuffer* BdwGpuBufferCreateHandoff(uint64_t bytes){
     return buffer;
 }
 bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* b){return b && b->userMappingAllowed;}
+bool BdwGpuBufferIsScanoutImage(const BdwGpuBuffer* b){return b && __atomic_load_n(&b->scanoutImage,__ATOMIC_ACQUIRE);}
+bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b){
+    // Only protected handoff buffers, and only while no GPU job uses them, so
+    // no in-flight submission keeps a write-back mapping of a scanout image.
+    // Never used by the GPU: its CPU zeroing was flushed at creation, so no
+    // write-back line can later land on top of uncached render writes.
+    if(!b || b->userMappingAllowed || __atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE) ||
+       __atomic_load_n(&b->gpuEverUsed,__ATOMIC_ACQUIRE))return false;
+    __atomic_store_n(&b->scanoutImage,true,__ATOMIC_RELEASE);return true;
+}
 void BdwGpuBufferRef(BdwGpuBuffer* b){if(b)MappingBackingRef(b->backing);}
 void BdwGpuBufferUnref(BdwGpuBuffer* b){if(b)MappingBackingUnref(b->backing);}
 uint64_t BdwGpuBufferBytes(const BdwGpuBuffer* b){return b?b->bytes:0;}
@@ -140,6 +152,7 @@ bool BdwGpuBufferBeginGpuUse(BdwGpuBuffer* b){
     uint64_t current=__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE);
     do {if((current>>60) || uint32_t(current)==~uint32_t{0})return false;}
     while(!__atomic_compare_exchange_n(&b->gpuState,&current,current+1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&b->gpuEverUsed,true,__ATOMIC_RELEASE);
     return true;
 }
 bool BdwGpuBufferReserveHandoff(BdwGpuBuffer* b,uint64_t token){
@@ -153,7 +166,9 @@ bool BdwGpuBufferReserveHandoff(BdwGpuBuffer* b,uint64_t token){
 bool BdwGpuBufferBeginHandoffGpuUse(BdwGpuBuffer* b,uint64_t token){
     if(!b || !token || __atomic_load_n(&b->handoffToken,__ATOMIC_ACQUIRE)!=token)return false;
     uint64_t reserved=uint64_t{1}<<61;
-    return __atomic_compare_exchange_n(&b->gpuState,&reserved,reserved+(uint64_t{1}<<60)+1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+    if(!__atomic_compare_exchange_n(&b->gpuState,&reserved,reserved+(uint64_t{1}<<60)+1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
+    __atomic_store_n(&b->gpuEverUsed,true,__ATOMIC_RELEASE);
+    return true;
 }
 bool BdwGpuBufferHandoffMatches(const BdwGpuBuffer* b,uint64_t token){
     return b && token && __atomic_load_n(&b->handoffToken,__ATOMIC_ACQUIRE)==token &&

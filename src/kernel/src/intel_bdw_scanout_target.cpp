@@ -9,6 +9,7 @@
 // gates are debug-channel commands and live only in RAM). See
 // docs/bdw-page-flip.md for the evidence, the state machine and the plan.
 #include "intel_bdw_scanout_target.h"
+#include "intel_bdw_buffer.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_gtt_probe.h"
@@ -316,6 +317,153 @@ void FlipPlan(uint32_t slot,const CompositorPresentRegion* regions,uint32_t coun
     }
     for(uint32_t i=0;i<count;++i)plan.damage.Add({regions[i].x,regions[i].y,regions[i].width,regions[i].height});
 }
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+// Zero-copy scanout: DSPASURF points at the renderer's own protected output
+// images (docs/bdw-zero-copy-scanout.md). Shares the flip lock, the display
+// mapping, the probe and the takeover scratch page with the M3 flip; the two
+// are mutually exclusive at runtime. Images and their GGTT extents are
+// retained for the boot once registered (phase 1: one registration per boot,
+// because the extent binder can only retire through the Io that bound it).
+constexpr uint32_t ZcExtentPages=SurfacePages+BdwFlipRegs::GuardPages;
+static_assert(BdwZeroCopyImageBytes==SurfaceBytes,"zero-copy images are exactly the GOP mode");
+struct ZcImage {BdwGpuBuffer* buffer=nullptr;uint64_t identity=0;uint64_t* dma=nullptr;uint64_t* snapshot=nullptr;
+    BdwGgttReservation reservation{};BdwGgttExtentBind bind;bool bound=false;};
+ZcImage zcImages[BdwZeroCopyMaxImages];
+uint32_t zcCount=0;uint64_t zcOwner=0;
+BdwZeroCopyRing zcRing;
+bool zcRequested=false,zcActive=false,zcDisabled=false,zcRepairOwed=false,zcBound=false;
+const char* zcReason="not requested";const char* zcPendingLog=nullptr;
+BdwZeroCopyStats zcStats{};BdwZeroCopyFallback zcLast=BdwZeroCopyFallback::Disarmed;
+BdwZeroCopyRefusal zcRefusal=BdwZeroCopyRefusal::None;
+BdwFlipGgttDiag zcGgtt{};uint64_t zcSetupUs=0,zcGopReturns=0;
+
+uint32_t ZcSlotOf(const BdwGpuBuffer* b){
+    if(!b)return 0;
+    for(uint32_t i=0;i<zcCount;++i)if(zcImages[i].buffer==b)return i+1;
+    return 0;
+}
+void ZcFallback(BdwZeroCopyFallback f){zcLast=f;++zcStats.fallback[uint32_t(f)];}
+// Permanent for the boot. Best effort, never waits: re-arm the GOP; the
+// caller returns RepairRequired so the compositor repaints it in full.
+void ZcDisableLocked(const char* why){
+    if(!zcDisabled){zcDisabled=true;zcReason=why;zcPendingLog=why;zcRepairOwed=zcActive;}
+    zcRing.MarkUncertain();zcActive=false;
+    if(displayMapped){PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);}
+    ++zcStats.uncertain;
+}
+void ZcLogPending(){
+    if(const char* why=__atomic_exchange_n(&zcPendingLog,static_cast<const char*>(nullptr),__ATOMIC_ACQ_REL))
+        SerialPrintf("gpu-zerocopy: disabled for this boot (%s); BCS copy to the GOP resumes after a full repaint\n",why);
+}
+bool ZcArmLocked(uint32_t slot){
+    if(Read(BdwFlipRegs::PlaneControl)!=BdwFlipRegs::GopControl || Read(BdwFlipRegs::Stride)!=BdwZeroCopyStride){
+        ZcFallback(BdwZeroCopyFallback::PlaneChanged);ZcDisableLocked("plane-changed");return false;
+    }
+    PlaneIo io{displayRegs[2]};
+    const uint32_t frame=io.read32(BdwFlipRegs::FrameCountA);
+    io.write32(BdwFlipRegs::Surface,zcRing.Surface(slot));
+    (void)io.read32(BdwFlipRegs::Surface);
+    if(!zcRing.Armed(slot,frame,Rdtsc())){ZcDisableLocked("arm-rejected");return false;}
+    return true;
+}
+void ZcPollLocked(){
+    if(!zcActive || zcDisabled)return;
+    if(zcRing.HasArmed()){
+        const uint32_t frame=Read(BdwFlipRegs::FrameCountA),live=Read(BdwFlipRegs::SurfaceLive);
+        BdwFlipLatch latch{};
+        switch(zcRing.Poll(frame,live,Rdtsc(),latch)){
+        case BdwFlipPoll::Latched:zcStats.Latch(latch.frames,tscKhz?latch.ticks*1000/tscKhz:0);break;
+        case BdwFlipPoll::Uncertain:ZcFallback(BdwZeroCopyFallback::Uncertain);ZcDisableLocked("latch-uncertain");return;
+        default:return;
+        }
+    }
+    uint32_t queued=0;
+    if(zcRing.TakeQueued(queued))(void)ZcArmLocked(queued);
+}
+// Worker only, outside the lock: GGTT-bind every registered image once.
+bool ZcBind(){
+    if(zcBound)return true;
+    auto fail=[](const char* why){
+        const uint64_t f=IrqSpinLockAcquire(&lock);ZcFallback(BdwZeroCopyFallback::Bind);ZcDisableLocked(why);IrqSpinLockRelease(&lock,f);
+        SerialPrintf("gpu-zerocopy: bind failed at %s; ggtt %s image=%u first=%u count=%u zero=%u valid=%u other=%u page=%u\n",
+            why,BdwFlipGgttStageName(zcGgtt.stage),zcGgtt.buffer,zcGgtt.first,zcGgtt.count,zcGgtt.zero,zcGgtt.valid,
+            zcGgtt.other,zcGgtt.auditPage);
+        ZcLogPending();return false;
+    };
+    if(!MapDisplay())return fail("display-map");
+    if(!ValidateGop())return false; // transient: retried by the next present
+    if(!EnsureZero())return fail("alloc");
+    if(!takeoverReady){
+        if(!BdwPrivatePageAlloc(takeoverScratch) || !BdwPrivatePagesPublish(&takeoverScratch,1))return fail("alloc");
+        takeoverReady=true;
+    }
+    for(uint32_t i=0;i<zcCount;++i){
+        auto& image=zcImages[i];
+        if(image.bound)continue;
+        uint32_t pages=0;const uint64_t* source=BdwGpuBufferPages(image.buffer,pages);
+        if(!source || pages<SurfacePages)return fail("image-pages");
+        if(!image.dma){
+            auto* dma=static_cast<uint64_t*>(kmalloc(uint64_t(ZcExtentPages)*sizeof(uint64_t)));
+            if(!dma)return fail("alloc");
+            // The buffer is retained for the boot, so these pages stay pinned.
+            for(uint32_t p=0;p<SurfacePages;++p)dma[p]=source[p];
+            for(uint32_t p=SurfacePages;p<ZcExtentPages;++p)dma[p]=zeroPage.dma; // display guard PTEs
+            image.dma=dma;
+        }
+        if(!image.snapshot && !(image.snapshot=static_cast<uint64_t*>(kmalloc(uint64_t(ZcExtentPages)*sizeof(uint64_t)))))
+            return fail("alloc");
+        zcGgtt={};zcGgtt.buffer=i;zcGgtt.entries=BdwGlobalGgttSpace().Limit();zcGgtt.count=ZcExtentPages;
+        if(!image.reservation.token &&
+           !BdwGlobalGgttSpace().reserveExtent(ZcExtentPages,BdwFlipRegs::SurfaceAlignment/4096,image.reservation)){
+            zcGgtt.stage=BdwFlipGgttStage::Reserve;return fail("ggtt-space");
+        }
+        {
+            const BdwGgttExtentLease lease{image.reservation,image.dma};
+            image.bound=VmmDellFlipGgttBind(image.bind,lease,image.snapshot,takeoverScratch.dma,zcGgtt);
+        }
+        if(!image.bound && zcGgtt.stage==BdwFlipGgttStage::Uncertain)return fail("ggtt-bind-uncertain");
+        if(!image.bound)return fail("ggtt-bind");
+    }
+    zcBound=true;return true;
+}
+// Worker only: bind (first time) and start a fresh ring on the GOP.
+bool ZcActivate(){
+    const uint64_t start=Rdtsc();
+    if(!ZcBind())return false;
+    uint32_t surfaces[BdwZeroCopyMaxImages]{};uint64_t identities[BdwZeroCopyMaxImages]{};
+    for(uint32_t i=0;i<zcCount;++i){surfaces[i]=zcImages[i].reservation.first*4096;identities[i]=zcImages[i].identity;}
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    bool ok=!zcDisabled && !flipActive && zcRequested;
+    if(ok){
+        zcRing=BdwZeroCopyRing{};
+        ok=zcRing.Configure(surfaces,identities,zcCount);
+        if(ok){
+            // Publish before the first DSPASURF write: the per-job display
+            // invariant accepts these surfaces and panic/reset restores the GOP.
+            for(uint32_t i=0;i<zcCount;++i)
+                __atomic_store_n(&g_bdwScanoutSurfaces[BdwScanoutFlipSurfaceSlots+i],surfaces[i],__ATOMIC_RELEASE);
+            __atomic_store_n(&g_restoreBudgetTicks,tscKhz*50,__ATOMIC_RELAXED);
+            __atomic_store_n(&g_planePage,displayRegs[2],__ATOMIC_RELEASE);
+            zcActive=true;zcReason="active";
+            zcSetupUs=tscKhz?(Rdtsc()-start)*1000/tscKhz:0;
+        }else ZcDisableLocked("ring");
+    }
+    IrqSpinLockRelease(&lock,f);ZcLogPending();
+    if(ok)SerialPrintf("gpu-zerocopy: active; %u images; surfaces %x %x %x %x; setup %u us\n",zcCount,
+        surfaces[0],surfaces[1],surfaces[2],surfaces[3],unsigned(zcSetupUs));
+    return ok;
+}
+// "gpu zerocopy off": return to the GOP, waiting (bounded) for the latch so
+// the renderer never writes an image the display still fetches.
+void ZcLeave(){
+    PlaneIo io{displayRegs[2]};
+    const auto restored=BdwFlipRestoreGop(io,0,__atomic_load_n(&g_restoreBudgetTicks,__ATOMIC_RELAXED));
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    if(restored.latched){zcActive=false;zcRing=BdwZeroCopyRing{};zcRepairOwed=true;++zcGopReturns;zcReason="off";}
+    else ZcDisableLocked("leave-latch-timeout");
+    IrqSpinLockRelease(&lock,f);ZcLogPending();
+}
+#endif
 #endif
 }
 
@@ -384,6 +532,11 @@ bool BdwScanoutTargetFinish(BdwTargetPlan& plan,bool copied){
 }
 void BdwScanoutFlipPoll(){
 #if defined(BROOK_BDW_SCANOUT_FLIP)
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    if(__atomic_load_n(&zcActive,__ATOMIC_ACQUIRE)){
+        const uint64_t f=IrqSpinLockAcquire(&lock);ZcPollLocked();IrqSpinLockRelease(&lock,f);ZcLogPending();
+    }
+#endif
     if(!__atomic_load_n(&flipActive,__ATOMIC_ACQUIRE))return;
     const uint64_t f=IrqSpinLockAcquire(&lock);PollLocked();IrqSpinLockRelease(&lock,f);
     LogPending();
@@ -391,6 +544,16 @@ void BdwScanoutFlipPoll(){
 }
 bool BdwScanoutFlipAwayFromGop(){
 #if defined(BROOK_BDW_SCANOUT_FLIP)
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    // A renderer image is (or may soon be) on the panel: the software frame
+    // must be complete before ReturnToGop arms the GOP again.
+    if(__atomic_load_n(&zcActive,__ATOMIC_ACQUIRE)){
+        const uint64_t f=IrqSpinLockAcquire(&lock);
+        const bool away=zcActive && (zcRing.Front()!=0 || zcRing.HasArmed() || zcRing.Uncertain());
+        IrqSpinLockRelease(&lock,f);
+        if(away)return true;
+    }
+#endif
     if(!__atomic_load_n(&flipActive,__ATOMIC_ACQUIRE))return false;
     const uint64_t f=IrqSpinLockAcquire(&lock);
     const bool away=flipDisabled?!(Read(BdwFlipRegs::Surface)==0 && Read(BdwFlipRegs::SurfaceLive)==0):!chain.GopCurrent();
@@ -402,6 +565,17 @@ bool BdwScanoutFlipAwayFromGop(){
 }
 void BdwScanoutFlipReturnToGop(){
 #if defined(BROOK_BDW_SCANOUT_FLIP)
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    // Software takeover (lease expiry or renderer exit): the GOP was fully
+    // rewritten. Arm it without waiting; the renderer's next image present
+    // re-activates zero-copy on a fresh ring (front = GOP).
+    if(__atomic_load_n(&zcActive,__ATOMIC_ACQUIRE)){
+        const uint64_t f=IrqSpinLockAcquire(&lock);
+        if(zcActive){PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);
+            zcActive=false;zcRing=BdwZeroCopyRing{};++zcGopReturns;if(!zcDisabled)zcReason="software takeover";}
+        IrqSpinLockRelease(&lock,f);
+    }
+#endif
     if(!__atomic_load_n(&flipActive,__ATOMIC_ACQUIRE))return;
     const uint64_t f=IrqSpinLockAcquire(&lock);
     if(flipDisabled){PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);}
@@ -455,6 +629,10 @@ bool BdwScanoutFlipProbe(BdwFlipProbe& probe,BdwFlipRefusal& refusal){
 bool BdwScanoutFlipArm(const char*& reason){
 #if defined(BROOK_BDW_SCANOUT_FLIP)
     if(!BdwBcsScanoutEnabled()){reason="bcs-present-disabled";return false;}
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    {const uint64_t f=IrqSpinLockAcquire(&lock);const bool zc=zcRequested || zcActive;IrqSpinLockRelease(&lock,f);
+     if(zc){reason="zerocopy-armed";return false;}}
+#endif
     {const uint64_t f=IrqSpinLockAcquire(&lock);const bool active=flipActive,disabled=flipDisabled;
      if(disabled)reason=flipReason;
      if(active && !disabled)flipRequested=true;
@@ -506,6 +684,162 @@ void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out){
     out.reason="not built";
 #endif
 }
+#if defined(BROOK_BDW_SCANOUT_FLIP)
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+namespace {constexpr int64_t ErrBadf=-9,ErrBusy=-16,ErrInval=-22;}
+int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* images,uint32_t imageCount,const BdwZeroCopyGeometry& geometry,
+                            BdwZeroCopyRefusal& refusal){
+    refusal=BdwZeroCopyRefusal::Count;
+    if(!images || !imageCount || imageCount>BdwZeroCopyMaxImages)return ErrInval;
+    BdwZeroCopyCandidate c[BdwZeroCopyMaxImages]{};
+    for(uint32_t i=0;i<imageCount;++i){
+        if(!images[i])return ErrBadf;
+        c[i]={BdwGpuBufferIdentity(images[i]),BdwGpuBufferBytes(images[i]),BdwGpuBufferAllowsUserMapping(images[i])};
+    }
+    refusal=BdwZeroCopyEligible(geometry,c,imageCount);
+    {const uint64_t f=IrqSpinLockAcquire(&lock);zcRefusal=refusal;const bool busy=zcCount!=0;IrqSpinLockRelease(&lock,f);
+     if(refusal!=BdwZeroCopyRefusal::None)return ErrInval;
+     if(busy)return ErrBusy;}
+    // Atomic, outside the spin lock. A later failure leaves earlier marks set,
+    // which only makes those images render uncached: still correct.
+    for(uint32_t i=0;i<imageCount;++i)if(!BdwGpuBufferMarkScanoutImage(images[i]))return ErrBusy;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    if(zcCount){IrqSpinLockRelease(&lock,f);return ErrBusy;}
+    for(uint32_t i=0;i<imageCount;++i){
+        BdwGpuBufferRef(images[i]); // retained for the boot (phase 1)
+        zcImages[i].buffer=images[i];zcImages[i].identity=c[i].identity;
+    }
+    zcCount=imageCount;zcOwner=owner;
+    IrqSpinLockRelease(&lock,f);
+    SerialPrintf("gpu-zerocopy: registered %u renderer images (owner %lx)\n",imageCount,owner);
+    return 0;
+}
+bool BdwZeroCopyOnReserve(BdwGpuBuffer* buffer){
+    if(!BdwGpuBufferIsScanoutImage(buffer))return true;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    bool ok=true;const uint32_t slot=ZcSlotOf(buffer);
+    if(slot && zcActive && !zcDisabled){ok=zcRing.BeginWrite(slot);if(!ok)++zcStats.refusedReserve;}
+    IrqSpinLockRelease(&lock,f);
+    return ok;
+}
+void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer){
+    if(!BdwGpuBufferIsScanoutImage(buffer))return;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const uint32_t slot=ZcSlotOf(buffer);
+    if(slot && zcActive)zcRing.AbandonWrite(slot);
+    IrqSpinLockRelease(&lock,f);
+}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source){
+    bool requested=false,active=false,disabled=false;uint32_t registered=0;
+    {const uint64_t f=IrqSpinLockAcquire(&lock);ZcPollLocked();
+     registered=zcCount;requested=zcRequested;active=zcActive;disabled=zcDisabled;IrqSpinLockRelease(&lock,f);}
+    ZcLogPending();
+    if(!registered)return BdwZeroCopyOutcome::Copy;
+    const bool image=BdwGpuBufferIsScanoutImage(source) && ZcSlotOf(source);
+    if(disabled){
+        // As the M3 flip: the GOP must be live again and owes one full repaint.
+        const uint64_t f=IrqSpinLockAcquire(&lock);
+        const bool onGop=displayMapped && Read(BdwFlipRegs::Surface)==0 && Read(BdwFlipRegs::SurfaceLive)==0;
+        if(!onGop && displayMapped){PlaneIo io{displayRegs[2]};(void)BdwFlipRestoreGop(io,0,0);}
+        const bool repair=!onGop || zcRepairOwed;
+        if(onGop)zcRepairOwed=false;
+        IrqSpinLockRelease(&lock,f);
+        return repair?BdwZeroCopyOutcome::RepairRequired:BdwZeroCopyOutcome::Copy;
+    }
+    if(active && (!requested || !image)){
+        // Leaving (gpu zerocopy off) or a non-image present (a renderer
+        // fallback path): back to the GOP, which is stale, so this present
+        // is refused and the compositor repaints in full. Re-armed by the
+        // next image present while requested.
+        {const uint64_t f=IrqSpinLockAcquire(&lock);ZcFallback(image?BdwZeroCopyFallback::Disarmed:BdwZeroCopyFallback::NotImage);
+         IrqSpinLockRelease(&lock,f);}
+        ZcLeave();
+        return BdwZeroCopyOutcome::RepairRequired;
+    }
+    if(!active){
+        if(!image)return BdwZeroCopyOutcome::Copy;
+        bool flip=false;
+        {const uint64_t f=IrqSpinLockAcquire(&lock);flip=flipActive || flipRequested;
+         if(!requested || flip)ZcFallback(BdwZeroCopyFallback::Disarmed);IrqSpinLockRelease(&lock,f);}
+        if(!requested || flip || !ZcActivate())return BdwZeroCopyOutcome::Copy; // the BCS copy from the image is exact
+    }
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const uint32_t slot=ZcSlotOf(source);
+    if(!zcActive || zcDisabled){IrqSpinLockRelease(&lock,f);return BdwZeroCopyOutcome::Copy;}
+    auto p=zcRing.Present(slot);
+    if(p==BdwZeroCopyPresent::Rejected && zcRing.BeginWrite(slot)){
+        // Reserved before activation: not tracked as written, but provably not
+        // displayed, armed or queued now, so it may be presented.
+        ZcFallback(BdwZeroCopyFallback::NotWriting);p=zcRing.Present(slot);
+    }
+    BdwZeroCopyOutcome outcome=BdwZeroCopyOutcome::Presented;
+    if(p==BdwZeroCopyPresent::Rejected){
+        ZcFallback(zcRing.Uncertain()?BdwZeroCopyFallback::Uncertain:BdwZeroCopyFallback::NotWriting);
+        ZcDisableLocked("image-busy");outcome=BdwZeroCopyOutcome::RepairRequired;
+    }else{
+        ++zcStats.presents;
+        if(p==BdwZeroCopyPresent::ArmNow){++zcStats.armedNow;if(!ZcArmLocked(slot))outcome=BdwZeroCopyOutcome::RepairRequired;}
+        else ++zcStats.queued;
+        zcStats.replaced=zcRing.Replaced();zcLast=BdwZeroCopyFallback::None;
+    }
+    IrqSpinLockRelease(&lock,f);ZcLogPending();
+    return outcome;
+}
+bool BdwZeroCopyArm(const char*& reason){
+    if(!BdwBcsScanoutEnabled()){reason="bcs-present-disabled";return false;}
+    {const uint64_t f=IrqSpinLockAcquire(&lock);
+     const bool disabled=zcDisabled,flip=flipRequested || flipActive,already=zcRequested;
+     if(disabled)reason=zcReason;else if(flip)reason="m3-flip-armed";
+     IrqSpinLockRelease(&lock,f);
+     if(disabled || flip)return false;
+     if(already){reason="armed";return true;}}
+    BdwFlipProbe probe{};BdwFlipRefusal refusal{};
+    if(!BdwScanoutFlipProbe(probe,refusal)){reason="probe-unavailable";return false;}
+    if(refusal!=BdwFlipRefusal::None){reason=BdwFlipRefusalName(refusal);return false;}
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const bool ok=!zcDisabled && !flipRequested && !flipActive;
+    if(ok){zcRequested=true;zcReason=zcCount?"armed; activates at the next image present":"armed; waiting for renderer registration";}
+    reason=zcReason;
+    IrqSpinLockRelease(&lock,f);
+    return ok;
+}
+void BdwZeroCopyDisarm(){
+    const uint64_t f=IrqSpinLockAcquire(&lock);zcRequested=false;if(!zcDisabled)zcReason="leaving at the next present";
+    IrqSpinLockRelease(&lock,f);
+}
+void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){
+    out={};out.built=true;
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    out.registered=zcCount!=0;out.requested=zcRequested;out.active=zcActive;out.disabled=zcDisabled;
+    out.images=zcCount;out.freeMask=zcActive?zcRing.FreeMask():(zcDisabled?0:(1u<<zcCount)-1u);
+    out.front=zcActive?zcRing.Front():0;out.armed=zcActive && zcRing.HasArmed()?zcRing.ArmedSlot():~0u;
+    out.queued=zcActive && zcRing.HasQueued()?zcRing.QueuedSlot():~0u;
+    out.owner=zcOwner;out.sequence=zcRing.Sequence();out.setupUs=zcSetupUs;out.gopReturns=zcGopReturns;
+    for(uint32_t i=0;i<BdwZeroCopyMaxImages;++i){
+        out.ages[i]=zcActive?zcRing.Age(i+1):0;
+        out.surfaces[i]=__atomic_load_n(&g_bdwScanoutSurfaces[BdwScanoutFlipSurfaceSlots+i],__ATOMIC_ACQUIRE);
+    }
+    out.reason=zcReason;out.last=zcLast;out.refusal=zcRefusal;out.stats=zcStats;out.ggtt=zcGgtt;
+    IrqSpinLockRelease(&lock,f);
+}
+#else
+int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
+bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
+void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOutcome::Copy;}
+void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
+bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
+void BdwZeroCopyDisarm(){}
+#endif
+#else
+int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
+bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
+void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOutcome::Copy;}
+void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
+bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
+void BdwZeroCopyDisarm(){}
+#endif
 #elif defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 // Neither option built: the default per-present BCS copy is unchanged.
 BdwTargetSelect BdwScanoutTargetSelect(const CompositorPresentRegion*,uint32_t,BdwTargetPlan& plan){plan={};return BdwTargetSelect::Ok;}
@@ -518,5 +852,12 @@ bool BdwScanoutFlipArm(const char*& reason){reason="not built";return false;}
 void BdwScanoutFlipDisarm(){}
 bool BdwScanoutMapEnable(bool){return false;}
 void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out){out={};out.reason="not built";}
+int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
+bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
+void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOutcome::Copy;}
+void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
+bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
+void BdwZeroCopyDisarm(){}
 #endif
 }

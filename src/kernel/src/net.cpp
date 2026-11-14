@@ -5734,6 +5734,53 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
     }
+    else if(StrStartsWith(cmd,"gpu zerocopy ")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // Zero-copy scanout of renderer images (docs/bdw-zero-copy-scanout.md).
+        // RAM-only runtime gate: every boot starts with the BCS copy.
+        const char* note="";bool ok=true;
+        if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);
+        else if(NetStrEq(cmd,"gpu zerocopy off")){BdwZeroCopyDisarm();note="leaving at the next present";}
+        else if(!NetStrEq(cmd,"gpu zerocopy status")){
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status\"}\n");return;
+        }
+        BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
+        BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);
+        r.text(",\"built\":");r.text(z.built?"true":"false");
+        r.text(",\"registered\":");r.text(z.registered?"true":"false");
+        r.text(",\"requested\":");r.text(z.requested?"true":"false");
+        r.text(",\"active\":");r.text(z.active?"true":"false");
+        r.text(",\"disabled\":");r.text(z.disabled?"true":"false");
+        r.text(",\"reason\":");r.quoted(z.reason?z.reason:"");
+        r.text(",\"registration_refusal\":");r.quoted(BdwZeroCopyRefusalName(z.refusal));
+        r.text(",");r.field("images",z.images);r.text(",");r.field("free_mask",z.freeMask);
+        r.text(",");r.field("front",z.front);r.text(",");r.field("armed",z.armed);r.text(",");r.field("queued",z.queued);
+        r.text(",");r.field("sequence",z.sequence);r.text(",");r.field("setup_us",z.setupUs);
+        r.text(",");r.field("gop_returns",z.gopReturns);
+        r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
+        r.text("],\"ages\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.ages[i]);}
+        const auto& st=z.stats;
+        r.text("],\"stats\":{");r.field("presents",st.presents);r.text(",");r.field("armed_now",st.armedNow);
+        r.text(",");r.field("queued",st.queued);r.text(",");r.field("replaced",st.replaced);
+        r.text(",");r.field("latched",st.latched);r.text(",");r.field("missed_vblanks",st.missedVblanks);
+        r.text(",");r.field("uncertain",st.uncertain);r.text(",");r.field("refused_reserve",st.refusedReserve);
+        r.text(",\"latch_us\":[");r.number(st.latched?st.latchUsSum/st.latched:0);r.text(",");r.number(st.latchUsMax);
+        r.text("],\"latch_frames\":[");for(unsigned i=0;i<4;++i){if(i)r.text(",");r.number(st.latchFrames[i]);}
+        r.text("],\"fallback\":{");
+        for(unsigned i=0;i<unsigned(BdwZeroCopyFallback::Count_);++i){if(i)r.text(",");
+            r.quoted(BdwZeroCopyFallbackName(BdwZeroCopyFallback(i)));r.text(":");r.number(st.fallback[i]);}
+        r.text("}},\"last_fallback\":");r.quoted(BdwZeroCopyFallbackName(z.last));
+        const auto& g=z.ggtt;
+        r.text(",\"ggtt\":{\"stage\":");r.quoted(BdwFlipGgttStageName(g.stage));
+        r.text(",");r.field("image",g.buffer);r.text(",");r.field("first",g.first);r.text(",");r.field("count",g.count);
+        r.text(",");r.field("zero",g.zero);r.text(",");r.field("valid",g.valid);r.text(",");r.field("other",g.other);
+        r.text(",");r.field("audit_page",g.auditPage);r.text(",\"takeover\":");r.text(g.takeover?"true":"false");
+        r.text("},\"scope\":\"presents=image presents armed or queued without a copy; latch_us=[avg,max] DSPASURF write to observed DSPASURFLIVE (about 1 ms poll); latch_frames=vblanks 1,2,3,>3; fallback=presents that used the BCS copy or left zero-copy, by reason; refused_reserve=GPU reservations of a displayed image refused\"}\n");
+        r.send();
+#else
+        DebugChannelSend("{\"error\":\"guarded Dell kernel required\"}\n");
+#endif
+    }
     else if(StrStartsWith(cmd,"gpu flip ") || StrStartsWith(cmd,"gpu scanout map ")) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
         // Runtime gates for the Broadwell scanout targets. They live in RAM

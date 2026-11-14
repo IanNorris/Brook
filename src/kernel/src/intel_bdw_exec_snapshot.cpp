@@ -241,7 +241,7 @@ BdwExecSnapshot* BdwExecSnapshotCreate(BdwGpuFile* file,const BdwExecObjectInput
         // ASYNC opts out of implicit object synchronization; it does not
         // declare the object read-only. Explicitly synchronized clients
         // such as HasVK may write it without setting EXEC_OBJECT_WRITE.
-        s->pages+=pages;s->objects[i]={low,dma,pages,(in.flags&(4|64))!=0};
+        s->pages+=pages;s->objects[i]={low,dma,pages,(in.flags&(4|64))!=0,BdwGpuBufferIsScanoutImage(s->buffers[i])};
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
         // These are input hints, not proven access directions: ASYNC objects
         // may be written without WRITE, and duplicate backing is counted again.
