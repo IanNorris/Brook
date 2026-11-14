@@ -142,6 +142,21 @@ static void audio_changed(GtkWidget *widget,gpointer unused){
         ((value&BROOK_AUDIO_MUTED)?"Muted. Apply settings to remember this level.":"Output level changed. Apply settings to remember it."):
         "No audio device available. Level is ready for a future device.");
 }
+/* The taskbar volume control changes the same kernel value; follow it while
+ * open so Apply saves what the user last chose from either place. */
+static gboolean audio_follow(gpointer unused){
+    (void)unused;
+    long output=syscall(BROOK_SYS_AUDIO_CONTROL,0L,0L);
+    if(output<0 || !brook_audio_control_valid((uint32_t)output) || (uint32_t)output==audio_control)return G_SOURCE_CONTINUE;
+    audio_control=(uint32_t)output;
+    g_signal_handlers_block_by_func(volume_slider,G_CALLBACK(audio_changed),NULL);
+    g_signal_handlers_block_by_func(mute_check,G_CALLBACK(audio_changed),NULL);
+    gtk_range_set_value(GTK_RANGE(volume_slider),brook_audio_volume(audio_control));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mute_check),(audio_control&BROOK_AUDIO_MUTED)!=0);
+    g_signal_handlers_unblock_by_func(mute_check,G_CALLBACK(audio_changed),NULL);
+    g_signal_handlers_unblock_by_func(volume_slider,G_CALLBACK(audio_changed),NULL);
+    return G_SOURCE_CONTINUE;
+}
 static int saved_matches_selection(void){
     GKeyFile *file=g_key_file_new();int matches=g_key_file_load_from_file(file,settings_path,0,NULL);
     const char* names[]={"theme","scale","dark","performance","opacity","blur","taskbar_metrics"};
@@ -254,6 +269,7 @@ int main(int argc,char **argv) {
     gtk_style_context_add_class(gtk_widget_get_style_context(audio_status),"muted");gtk_box_pack_start(GTK_BOX(audio_box),audio_status,FALSE,FALSE,0);
     gtk_widget_set_sensitive(volume_slider,audio_supported);gtk_widget_set_sensitive(mute_check,audio_supported);
     g_signal_connect(volume_slider,"value-changed",G_CALLBACK(audio_changed),NULL);g_signal_connect(mute_check,"toggled",G_CALLBACK(audio_changed),NULL);
+    if(audio_supported)g_timeout_add(500,audio_follow,NULL);
     GtkWidget *eyebrow=gtk_label_new("APPEARANCE");gtk_widget_set_halign(eyebrow,GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(eyebrow),"eyebrow");gtk_box_pack_start(GTK_BOX(box),eyebrow,FALSE,FALSE,0);
     GtkWidget *heading=gtk_label_new("Choose your\nmaterial.");gtk_label_set_justify(GTK_LABEL(heading),GTK_JUSTIFY_LEFT);gtk_widget_set_halign(heading,GTK_ALIGN_START);

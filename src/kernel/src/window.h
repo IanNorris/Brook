@@ -373,6 +373,25 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut);
 // second from stack state (no device access). Returns true when it changed.
 bool WmNetworkIndicatorRefresh(uint64_t now);
 
+// Taskbar volume (compositor thread only). Refresh copies the master gain
+// shared with Settings (BROOK_SYS_AUDIO_CONTROL) into the render cache and
+// returns true when it changed. A left press opens/closes the popup or acts
+// in it; the wheel steps 5%; a right click toggles mute. The input helpers
+// return true when they consumed the event.
+bool WmVolumeIndicatorRefresh();
+bool WmVolumePopupVisible();
+void WmVolumePopupClose();
+void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,
+                          int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH);
+void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mouseX, int32_t mouseY);
+bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+bool WmVolumeDragActive();
+void WmVolumeDrag(int32_t mx, bool held, uint32_t screenW, uint32_t screenH);
+bool WmVolumeScroll(int32_t mx, int32_t my, int delta, uint32_t screenW, uint32_t screenH);
+bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+void WmLauncherClose();
+
 // Render the taskbar (bottom of screen) with window buttons and clock.
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,

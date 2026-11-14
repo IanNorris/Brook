@@ -1872,6 +1872,11 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
         int32_t x=0,y=0;uint32_t w=0,h=0;WmLauncherGetRect(width,height,&x,&y,&w,&h);
         WmLauncherRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
         rects[rectCount++]={x,y,w,h};
+    }else if(WmVolumePopupVisible()){
+        // Exclusive with the launcher, so the four-rectangle budget holds.
+        int32_t x=0,y=0;uint32_t w=0,h=0;WmVolumePopupGetRect(width,height,&x,&y,&w,&h);
+        WmVolumePopupRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
+        rects[rectCount++]={x,y,w,h};
     }
     int32_t x=0,y=0;uint32_t w=0,h=0;
     if(WmBootSummaryRect(width,height,&x,&y,&w,&h)){
@@ -2055,6 +2060,11 @@ static void CompositorLoopWM()
     uint64_t now = ApicTickCount();
     // The taskbar (drawn every pass, like the clock) reads only this cache.
     WmNetworkIndicatorRefresh(now);
+    WmVolumeIndicatorRefresh();
+    // Opening or closing the volume popup exposes or covers scene pixels, so
+    // repaint once on the transition (both the CPU and overlay-layer paths).
+    static bool volumePopupShown=false;
+    if(WmVolumePopupVisible()!=volumePopupShown){volumePopupShown=!volumePopupShown;CompositorMarkDirty();}
     static bool summaryShown=false;
     int32_t summaryX=0,summaryY=0;uint32_t summaryW=0,summaryH=0;
     const bool showSummary=WmBootSummaryRect(g_physFbWidth,g_physFbHeight,&summaryX,&summaryY,&summaryW,&summaryH);
@@ -2327,6 +2337,16 @@ static void CompositorLoopWM()
             MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
             g_overlayLauncherShown = false;
         }
+        if (WmVolumePopupVisible())
+        {
+            int32_t vx, vy; uint32_t vw, vh;
+            WmVolumePopupGetRect(g_physFbWidth, g_physFbHeight, &vx, &vy, &vw, &vh);
+            OverlayClearRect(vx, vy, (int)vw, (int)vh);
+            WmVolumePopupRender(g_overlayBuffer, g_backBufStride,
+                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
+            OverlaySetAlphaRect(vx, vy, (int)vw, (int)vh);
+            MarkDirtyRows(vy > 0 ? (uint32_t)vy : 0, (uint32_t)(vy + (int)vh));
+        }
     }
     else if (g_backBuffer)
     {
@@ -2342,6 +2362,14 @@ static void CompositorLoopWM()
                              chromeMx, chromeMy);
             // Mark the launcher area dirty (it's above the taskbar)
             MarkDirtyRows(0, g_physFbHeight);
+        }
+        if (WmVolumePopupVisible())
+        {
+            int32_t vx, vy; uint32_t vw, vh;
+            WmVolumePopupGetRect(g_physFbWidth, g_physFbHeight, &vx, &vy, &vw, &vh);
+            WmVolumePopupRender(g_backBuffer, g_backBufStride,
+                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
+            MarkDirtyRows(vy > 0 ? (uint32_t)vy : 0, (uint32_t)(vy + (int)vh));
         }
     }
     if(showSummary) {
@@ -2392,7 +2420,8 @@ static void CompositorInputWM()
         if(pointer) {
             int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
             const bool launcher=WmLauncherVisible();
-            const bool overlay=launcher || my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight));
+            const bool overlay=launcher || WmVolumePopupVisible() ||
+                               my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight));
             const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
                             ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
                             ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
@@ -2402,6 +2431,11 @@ static void CompositorInputWM()
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Up)g_wmBtnReleaseLatch=true;
                 if(kind==DesktopPointerEvent::Scroll && launcher)
                     WmLauncherScroll(static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
+                else if(kind==DesktopPointerEvent::Scroll)
+                    WmVolumeScroll(mx,my,static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
+                // Right click on the volume icon (or its popup) toggles mute.
+                if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && !launcher)
+                    WmVolumeToggleMuteAt(mx,my,g_physFbWidth,g_physFbHeight);
                 if(__atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)==0) {
                     __atomic_store_n(&g_defaultCursorVisible,1u,__ATOMIC_RELEASE);
                     CompositorSetCursorImage(nullptr,0,0,0,0);
@@ -2556,6 +2590,12 @@ static void CompositorInputWM()
         // --- Global hotkeys (work regardless of focus state) ---
         if (ev.type == InputEventType::KeyPress)
         {
+            // Escape dismisses the volume popup before focused-window delivery.
+            if (ev.scanCode == 0x01 && WmVolumePopupVisible())
+            {
+                WmVolumePopupClose();
+                continue;
+            }
             // Alt+Tab — cycle focus to next window by sending current
             // to back of z-order, then focusing the new top window.
             if ((ev.modifiers & INPUT_MOD_ALT) && ev.scanCode == 0x0F) // Tab
@@ -2842,6 +2882,12 @@ static void CompositorHandleMouseWM()
         if(WmLauncherVisible()||my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight))||
            captionHit.zone!=WmHitZone::TitleBar)g_titleClicks.Reset();
         DbgPrintf("WM: click at (%d,%d)\n", mx, my);
+        // The volume popup owns every press while open (outside closes it).
+        if (WmVolumeLeftPress(mx, my, g_physFbWidth, g_physFbHeight))
+        {
+            g_wmLastBtnDown = btnDown;
+            return;
+        }
         // If launcher is open, check launcher panel first
         if (WmLauncherVisible())
         {
@@ -2979,6 +3025,10 @@ static void CompositorHandleMouseWM()
             }
         }
         } // end else (desktop hit test)
+    }
+    else if (WmVolumeDragActive())
+    {
+        WmVolumeDrag(mx, btnDown, g_physFbWidth, g_physFbHeight);
     }
     else if (btnDown && g_wmDragging)
     {
@@ -3669,6 +3719,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             gpu->BlurBarrier(CompositorMaterialBlur());
             GpuComposeRectBlur(gpu,0,scrH-WmMetric(WM_TASKBAR_HEIGHT),scrW,WmMetric(WM_TASKBAR_HEIGHT));
             if(WmLauncherVisible()) {int32_t x,y;uint32_t w,h;WmLauncherGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
+            if(WmVolumePopupVisible()) {int32_t x,y;uint32_t w,h;WmVolumePopupGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
         }
         GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WmMetric(WM_TASKBAR_HEIGHT),
                           (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), overlayOpacity, true);
@@ -3677,6 +3728,13 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             int32_t lx, ly; uint32_t lw, lh;
             WmLauncherGetRect(scrW, scrH, &lx, &ly, &lw, &lh);
             GpuComposeSrcRect(gpu, g_overlayTex, lx, ly, (int)lw, (int)lh,
+                              overlayOpacity, true);
+        }
+        if (WmVolumePopupVisible())
+        {
+            int32_t vx, vy; uint32_t vw, vh;
+            WmVolumePopupGetRect(scrW, scrH, &vx, &vy, &vw, &vh);
+            GpuComposeSrcRect(gpu, g_overlayTex, vx, vy, (int)vw, (int)vh,
                               overlayOpacity, true);
         }
     }

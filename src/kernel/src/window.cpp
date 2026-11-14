@@ -9,6 +9,7 @@
 
 #include "window.h"
 #include "desktop_telemetry.h"
+#include "taskbar_volume.h"
 #include "device.h"
 #include "virtio_blk.h"
 #include "net.h"
@@ -1803,7 +1804,7 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
 struct TaskbarLayout
 {
     int y, textY;
-    WmRect apps, terminal, next, clock, network;
+    WmRect apps, terminal, next, clock, network, volume;
     WmRect metrics[6];
     WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
@@ -1837,6 +1838,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     };
     reserve(l.clock, WmTextWidth(l.clockText));
     reserve(l.network, WmMetric(16));
+    reserve(l.volume, WmMetric(16));
     const int widths[6]={64,64,112,112,240,240};
     const uint32_t enabledMetrics=WmGetTaskbarMetrics();
     for(int i=5;i>=0;--i)if(enabledMetrics&(1u<<i)){
@@ -1954,6 +1956,200 @@ static void DrawNetworkIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw,
     }
 }
 
+// Taskbar volume. The control is the same atomic master gain the Settings app
+// reads and writes through BROOK_SYS_AUDIO_CONTROL (AudioOutputControl and
+// AudioSetUserOutputControl). The compositor thread copies it into this cache
+// once per loop (two relaxed loads, no device access); rendering reads only
+// the cache, so a change from either side appears on the next overlay check.
+// Popup and drag state are owned by the compositor thread.
+static uint32_t g_volumeControl = BROOK_AUDIO_DEFAULT;
+static bool g_volumeAvailable = false;
+static bool g_volumeSampled = false;
+static bool g_volumePopupOpen = false;
+static bool g_volumeDragging = false;
+
+bool WmVolumeIndicatorRefresh()
+{
+    const uint32_t control = AudioOutputControl();
+    const bool available = AudioAvailable();
+    if (g_volumeSampled && control == g_volumeControl && available == g_volumeAvailable) return false;
+    g_volumeSampled = true;
+    g_volumeControl = control;
+    g_volumeAvailable = available;
+    return true;
+}
+
+static void WmVolumeApply(uint32_t control)
+{
+    control &= 0x17fu;
+    if (control == g_volumeControl || !AudioSetUserOutputControl(control)) return;
+    g_volumeControl = AudioOutputControl();
+    SerialPrintf("WM: volume %u%s\n", brook_audio_volume(g_volumeControl),
+                 (g_volumeControl & BROOK_AUDIO_MUTED) ? " muted" : "");
+}
+
+// Speaker body and cone, then one to three ")" waves for the level, on a
+// 16x16 design grid scaled like the network bars. Muted draws a small cross
+// where the waves go; no device dims the speaker and crosses it like the
+// disconnected network bars.
+static void DrawVolumeGlyph(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
+                            int x0, int y0, int size, uint32_t control, bool available, uint32_t bg)
+{
+    const uint32_t fg = WmCurrentPalette().secondaryText;
+    const uint32_t ink = available ? fg : WmBlendColor(fg, bg, 90);
+    auto u = [&](int v) { return v * size / 16; };
+    auto cell = [&](int x, int y, int w, int h) {
+        WmFillRect(pixels, stride, sw, sh, x0 + u(x), y0 + u(y), u(x + w) - u(x), u(y + h) - u(y), ink);
+    };
+    cell(0, 5, 3, 6);
+    for (int c = 0; c < 3; ++c) cell(3 + c, 4 - c, 1, 8 + 2 * c);
+    const TaskbarVolumeGlyph glyph = TaskbarVolumeGlyphFor(control);
+    if (glyph == TaskbarVolumeGlyph::Muted) {
+        const int span = u(6), t = u(2) > 0 ? u(2) : 1, left = x0 + u(9), top = y0 + u(5);
+        for (int i = 0; i + t <= span; ++i) {
+            WmFillRect(pixels, stride, sw, sh, left + i, top + i, t, t, ink);
+            WmFillRect(pixels, stride, sw, sh, left + span - t - i, top + i, t, t, ink);
+        }
+    } else {
+        const int waves = glyph == TaskbarVolumeGlyph::Low ? 1 : glyph == TaskbarVolumeGlyph::Medium ? 2 : 3;
+        for (int i = 0; i < waves; ++i) {
+            const int x = 8 + 3 * i, half = 2 + 2 * i, cap = i ? 2 : 1;
+            cell(x, 8 - half, 2, 2 * half);
+            cell(x - 1, 8 - half - cap, 2, cap);
+            cell(x - 1, 8 + half, 2, cap);
+        }
+    }
+    if (available) return;
+    const int span = size * 5 / 8, ct = static_cast<int>(WmMetric(2));
+    for (int i = 0; i + ct <= span; ++i) {
+        WmFillRect(pixels, stride, sw, sh, x0 + i, y0 + i, ct, ct, fg);
+        WmFillRect(pixels, stride, sw, sh, x0 + span - ct - i, y0 + i, ct, ct, fg);
+    }
+}
+
+static void WmMaterialRect(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect& r,uint32_t color);
+
+static void DrawVolumeIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh, const WmRect& r)
+{
+    if (r.w <= 0) return;
+    const int size = static_cast<int>(WmMetric(16));
+    DrawVolumeGlyph(pixels, stride, sw, sh, r.x, r.y + (r.h - size) / 2, size,
+                    g_volumeControl, g_volumeAvailable, WmCurrentPalette().taskbar);
+}
+
+static TaskbarVolumePopupLayout WmVolumePopupLayout(uint32_t screenW, uint32_t screenH)
+{
+    const TaskbarLayout t = GetTaskbarLayout(screenW, screenH);
+    return TaskbarVolumePopup(WmDesktopMetrics(), t.volume, t.y, static_cast<int>(screenW), WmTextWidth("100%"));
+}
+
+static bool WmVolumeIconContains(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
+{
+    return GetTaskbarLayout(screenW, screenH).volume.contains(mx, my);
+}
+
+bool WmVolumePopupVisible() { return g_volumePopupOpen; }
+
+void WmVolumePopupClose()
+{
+    g_volumePopupOpen = false;
+    g_volumeDragging = false;
+}
+
+void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,
+                          int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH)
+{
+    const DesktopRect p = WmVolumePopupLayout(screenW, screenH).panel;
+    *outX = p.x; *outY = p.y;
+    *outW = p.w > 0 ? static_cast<uint32_t>(p.w) : 0;
+    *outH = p.h > 0 ? static_cast<uint32_t>(p.h) : 0;
+}
+
+bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
+{
+    if (!g_volumePopupOpen) {
+        if (!WmVolumeIconContains(mx, my, screenW, screenH)) return false;
+        WmLauncherClose();
+        g_volumePopupOpen = true;
+        return true;
+    }
+    const TaskbarVolumePopupLayout l = WmVolumePopupLayout(screenW, screenH);
+    switch (TaskbarVolumePopupHit(WmDesktopMetrics(), l, mx, my)) {
+    case TaskbarVolumeHit::Mute: WmVolumeApply(TaskbarVolumeToggleMute(g_volumeControl)); break;
+    case TaskbarVolumeHit::Slider:
+        g_volumeDragging = true;
+        WmVolumeApply(TaskbarVolumeSliderValue(l.track, mx));
+        break;
+    case TaskbarVolumeHit::Panel: break;
+    case TaskbarVolumeHit::Outside: WmVolumePopupClose(); break; // includes the icon itself
+    }
+    return true;
+}
+
+bool WmVolumeDragActive() { return g_volumeDragging; }
+
+void WmVolumeDrag(int32_t mx, bool held, uint32_t screenW, uint32_t screenH)
+{
+    if (!g_volumeDragging) return;
+    if (!held || !g_volumePopupOpen) { g_volumeDragging = false; return; }
+    WmVolumeApply(TaskbarVolumeSliderValue(WmVolumePopupLayout(screenW, screenH).track, mx));
+}
+
+bool WmVolumeScroll(int32_t mx, int32_t my, int delta, uint32_t screenW, uint32_t screenH)
+{
+    if (!delta) return false;
+    const bool overPopup = g_volumePopupOpen && WmVolumePopupLayout(screenW, screenH).panel.contains(mx, my);
+    if (!overPopup && !WmVolumeIconContains(mx, my, screenW, screenH)) return false;
+    WmVolumeApply(TaskbarVolumeWheel(g_volumeControl, delta));
+    return true;
+}
+
+bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
+{
+    const bool overPopup = g_volumePopupOpen && WmVolumePopupLayout(screenW, screenH).panel.contains(mx, my);
+    if (!overPopup && !WmVolumeIconContains(mx, my, screenW, screenH)) return false;
+    WmVolumeApply(TaskbarVolumeToggleMute(g_volumeControl));
+    return true;
+}
+
+void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mouseX, int32_t mouseY)
+{
+    if (!g_volumePopupOpen || !pixels) return;
+    const TaskbarVolumePopupLayout l = WmVolumePopupLayout(screenW, screenH);
+    const WmPalette& pal = WmCurrentPalette();
+    const DesktopRect& p = l.panel;
+    if (p.w <= 2 || p.h <= 2) return;
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, p.h, WmMaterialColor(pal.launcher));
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, 1, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y + p.h - 1, p.w, 1, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, 1, p.h, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, p.x + p.w - 1, p.y, 1, p.h, pal.launcherBorder);
+    const bool muted = (g_volumeControl & BROOK_AUDIO_MUTED) != 0;
+    const uint32_t buttonBg = l.mute.contains(mouseX, mouseY) ? pal.taskHover : pal.taskButton;
+    WmMaterialRect(pixels, stride, screenW, screenH, l.mute, buttonBg);
+    const int size = static_cast<int>(WmMetric(16));
+    DrawVolumeGlyph(pixels, stride, screenW, screenH, l.mute.x + (l.mute.w - size) / 2,
+                    l.mute.y + (l.mute.h - size) / 2, size, g_volumeControl, g_volumeAvailable, buttonBg);
+    const uint32_t level = brook_audio_volume(g_volumeControl);
+    const int barH = static_cast<int>(WmMetric(4)), barY = l.track.y + (l.track.h - barH) / 2;
+    const int knobX = TaskbarVolumeSliderX(l.track, level);
+    const uint32_t fill = muted || !g_volumeAvailable ? WmBlendColor(pal.secondaryText, pal.launcher, 110) : 0x68acff;
+    WmFillRect(pixels, stride, screenW, screenH, l.track.x, barY, l.track.w, barH, pal.launcherBorder);
+    WmFillRect(pixels, stride, screenW, screenH, l.track.x, barY, knobX - l.track.x + 1, barH, fill);
+    const int knob = static_cast<int>(WmMetric(12));
+    WmMaterialRect(pixels, stride, screenW, screenH, {knobX - knob / 2, l.track.y + (l.track.h - knob) / 2, knob, knob},
+                   g_volumeDragging ? 0x68acff : pal.text);
+    char value[8]{};
+    char* out = value;
+    DesktopNumber(out, level);
+    while (*out) ++out;
+    *out++ = '%'; *out = 0;
+    const int textY = l.value.y + (l.value.h - WmDesktopFont().lineHeight) / 2;
+    WmRenderMaterialString(pixels, stride, screenW, screenH, l.value.x + l.value.w - WmTextWidth(value), textY,
+                           value, muted ? pal.secondaryText : pal.text, pal.launcher, l.value.w);
+}
+
 static void WmMaterialRect(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect& r,uint32_t color){
     const unsigned radius=CompositorGlassActive()?WmMetric(4):0;
     for(int y=0;y<r.h;++y){const unsigned row=y<r.h/2?y:r.h-1-y;
@@ -2006,6 +2202,11 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             *out = 0;
             hoverTitle = netTitle;
         } else hoverTitle = "Network: disconnected";
+    }
+    char volumeTitle[32]{};
+    if (l.volume.contains(mouseX, mouseY) && !g_volumePopupOpen) {
+        TaskbarVolumeTooltip(volumeTitle, g_volumeControl, g_volumeAvailable);
+        hoverTitle = volumeTitle;
     }
     for (int i = 0; i < l.count; ++i)
     {
@@ -2060,7 +2261,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // Use the already-reserved tray for the hover label. Geometry stays fixed
     // and no additional empty strip is reserved when nothing is hovered.
     int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.network,l.clock};
+    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.volume,l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
@@ -2074,6 +2275,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     };
     trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
     DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
+    DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
     for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
 }
 
@@ -2608,12 +2810,15 @@ void WmLauncherLoad()
     g_launcherLoaded = true;
 }
 
+void WmLauncherClose() { g_launcherOpen = false; }
+
 void WmLauncherToggle()
 {
     // Loading belongs to WmSetActive (shell context), never the input/render thread.
     if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
     if (g_launcherOpen) {
+        WmVolumePopupClose(); // the two popups share one overlay slot
         g_launcherError = 0;
         g_launcherScroll = 0;
         WmRequestLauncherRefresh(); // also catches installs/removals outside the installer

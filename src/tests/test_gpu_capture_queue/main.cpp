@@ -54,6 +54,10 @@ void SchedulerBlock(Process* p){
 }
 void WmLauncherGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=1;*y=1;*w=2;*h=2;}
 void WmLauncherRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=1;x<3;++x)p[y*stride+x]=0x00654321;}
+bool volumeVisible=false;
+bool WmVolumePopupVisible(){return volumeVisible;}
+void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=4;*y=1;*w=2;*h=2;}
+void WmVolumePopupRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=4;x<6;++x)p[y*stride+x]=0x00777777;}
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
 void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t){std::abort();}
 extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::calloc(1,bytes); }
@@ -389,14 +393,19 @@ int main() {
         CHECK(CompositorOverlayGeneration()==g0+2);
         CheckDesktopOverlay(now+2,1,0);CHECK(CompositorOverlayGeneration()==g0+3); // pointer moved (hover)
         launcherVisible=true;CheckDesktopOverlay(now+2+OVERLAY_RECHECK_MS,1,0);CHECK(CompositorOverlayGeneration()==g0+4); // periodic
+        // The volume popup takes the launcher's rectangle slot and is hashed.
+        launcherVisible=false;volumeVisible=true;CheckDesktopOverlay(now+3+2*OVERLAY_RECHECK_MS,1,0);
+        CHECK(CompositorOverlayGeneration()==g0+5 && overlayPixels[1*8+4]==0xff777777 && overlayPixels[9]==0);
+        launcherVisible=true;volumeVisible=false;CheckDesktopOverlay(now+3+3*OVERLAY_RECHECK_MS,1,0);
+        CHECK(CompositorOverlayGeneration()==g0+6 && overlayPixels[1*8+4]==0);
         // A held lease blocks detection; it resumes once released.
         launcherVisible=false;overlay=CompositorRequestDebugFrame(77,true,false);
-        CheckDesktopOverlay(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+4);
+        CheckDesktopOverlay(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+6);
         // Op-7 wait: blocks without locks, woken by completion.
         waiterProc=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(waiterProc);
         DebugFrameSnapshot waited{};captureOnBlock=true;blockCalls=0;
         CHECK(!CompositorWaitDebugFrame(overlay.token,77,100,waited));
-        CHECK(blockCalls==1 && waiterWakes==1 && waited.state==DebugFrameState::Ready && waited.overlayGeneration==g0+5 && !g_debugFrameWaiter);
+        CHECK(blockCalls==1 && waiterWakes==1 && waited.state==DebugFrameState::Ready && waited.overlayGeneration==g0+7 && !g_debugFrameWaiter);
         CHECK(!CompositorWaitDebugFrame(overlay.token,77,100,waited) && blockCalls==1); // ready: no block
         CHECK(CompositorWaitDebugFrame(overlay.token,78,100,waited)==-116);
         CHECK(CompositorReleaseDebugFrame(overlay.token,77));
