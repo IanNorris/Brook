@@ -156,6 +156,8 @@ static void renderer_exit_for_restart(const char *cause,long detail){
  * BROOK_GPU_PRESENT_CAP_SCANOUT; BROOK_RENDER_SCANOUT_IMAGES=0|3|4 overrides. */
 static unsigned g_scanoutImages;
 static const char *g_failStage="none";
+#define DESKTOP_OVERLAY_ONLY_NS 250000000ull
+static uint64_t g_lastOverlayOnlyNs,g_overlayOnlySkips;
 /* Zero-copy active at the last pick: presents then name every region drawn
  * into the image (own damage plus buffer-age repair), which the kernel's
  * "flush" cache mode writes back before scanning the image out. */
@@ -666,8 +668,20 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
         struct DesktopDamageSet changes={0};
         if(desktop_track_diff(trackBase,track,&changes)){
+            const uint32_t sceneChanges=changes.count;
             desktop_overlay_damage(overlayBase,&frameOverlay,&changes);
             damage=changes;tracked=1;
+            /* The kernel overlay carries the compositor cadence graph, which
+             * changes with every present: a frame whose only change is the
+             * overlay would cause the next one forever. Present such frames
+             * at most every DESKTOP_OVERLAY_ONLY_NS (clock and indicators
+             * still update); scene, client and cursor changes are immediate. */
+            const int overlayOnly=!sceneChanges && changes.count &&
+                desktop_overlay_cursor_equal(&overlayBase->cursor,&frameOverlay.cursor);
+            if(overlayOnly){const uint64_t now=monotonic_ns();
+                if(g_lastOverlayOnlyNs && now>=g_lastOverlayOnlyNs && now-g_lastOverlayOnlyNs<DESKTOP_OVERLAY_ONLY_NS){
+                    ++g_stats.idleSkips;++g_overlayOnlySkips;result=2;stage="idle";goto done;}
+                g_lastOverlayOnlyNs=now;}
         }
     }
     /* Nothing new relative to an in-flight frame: it will present on its
@@ -1249,9 +1263,10 @@ static void stats_publish(uint64_t now){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
         if(end){char tail[512];
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
-                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu}}\n",g_ring.count,
+                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
-                (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels);
+                (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
+                (unsigned long long)g_overlayOnlySkips);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
         }
     }

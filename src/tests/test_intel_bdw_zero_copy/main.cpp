@@ -148,7 +148,25 @@ static void Adoption(){
     assert(BdwZeroCopyAdoptDecision(4,true,idle)==BdwZeroCopyAdoption::Adopt);
     const bool three[3]={true,true,true};assert(BdwZeroCopyAdoptDecision(3,true,three)==BdwZeroCopyAdoption::Adopt);
 }
+// "gpu zerocopy verify" holds the panel still: an ArmNow present is left
+// pending, later presents mailbox behind it, and nothing the display may
+// fetch becomes writable; on release the pending frame is armed first.
+static void Hold(){
+    auto r=Ring();uint32_t counter=10,pending=0,q=0;BdwFlipLatch l{};
+    Frame(r,1,counter);
+    assert(!r.PendingArm(pending));
+    assert(r.BeginWrite(2) && r.Present(2)==BdwZeroCopyPresent::ArmNow);  // held: not written to DSPASURF
+    assert(r.PendingArm(pending) && pending==2 && r.Front()==1);
+    assert(r.BeginWrite(3) && r.Present(3)==BdwZeroCopyPresent::Queued);
+    assert(r.BeginWrite(4) && r.Present(4)==BdwZeroCopyPresent::Queued && r.Replaced()==1); // mailbox
+    assert(r.FreeMask()==0x4);                     // only 3 (replaced) is free: 1 front, 2 pending, 4 queued
+    assert(!r.TakeQueued(q));                      // nothing jumps ahead of the pending frame
+    assert(r.Armed(pending,counter,0));            // release
+    ++counter;assert(r.Poll(counter,S[1],0,l)==BdwFlipPoll::Latched && r.Front()==2);
+    assert(r.TakeQueued(q) && q==4 && r.Armed(4,counter,0));
+}
 int main(){
+    Hold();
     Adoption();
     Eligibility();Configure();Rotation();NeverWriteDisplayed();Latch();Leave();Abandon();Stats();
     return 0;

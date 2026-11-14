@@ -172,6 +172,8 @@ public:
         front_=armed_;hasArmed_=false;
         return BdwFlipPoll::Latched;
     }
+    // A frame ArmNow designated but not yet written to DSPASURF (held).
+    bool PendingArm(uint32_t& slot)const{if(uncertain_ || hasArmed_ || !hasToArm_)return false;slot=toArm_;return true;}
     // After a latch, the queued frame (if any) is the next to arm.
     bool TakeQueued(uint32_t& slot){
         if(uncertain_ || hasArmed_ || hasToArm_ || !hasQueued_)return false;

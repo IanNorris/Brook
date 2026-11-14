@@ -86,6 +86,9 @@ void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer);
 // with no copy, RepairRequired = fail the present with a software repair.
 enum class BdwZeroCopyOutcome : uint8_t {Copy,Presented,RepairRequired};
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t regionCount);
+// Present thread, before handing a present to the worker: in "flush" cache
+// mode CLFLUSH the image's drawn lines there, off the gpu-submit worker.
+void BdwZeroCopyPrepareScanout(BdwGpuBuffer* source,const CompositorPresentRegion* regions,uint32_t count);
 struct BdwZeroCopyStatus {
     bool built,registered,requested,active,disabled;uint32_t images,freeMask,front,armed,queued;
     uint64_t owner,sequence,setupUs,gopReturns,ages[BdwZeroCopyMaxImages];uint32_t surfaces[BdwZeroCopyMaxImages];

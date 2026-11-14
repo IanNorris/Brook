@@ -178,6 +178,22 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
 - **Stats:** `gpu zerocopy status` reports `cache_mode`, `flushes`, `full_flushes`, `flush_bytes` and `flush_us` [avg, max].
 - **Correctness check:** `gpu zerocopy verify` (pipe CRC before and after a full CLFLUSH) proves coherency in each mode.
 
+**Gen 379 results and follow-ups.**
+- **Restarts:** the restart fix held (0 restarts in 4 runs).
+- **Cache modes, matched 2-buffer yquake:**
+
+  | Mode | Displayed mean | Compositor job | Notes |
+  |---|---|---|---|
+  | wt | 31.4 ms | 16.0 ms | latch_frames [1726, 19, 0, 0] |
+  | uc | 31.3 ms | 16.0 ms | |
+  | flush | 38.6 ms | 16.0 ms | 7.6 ms of CLFLUSH (8.5 MB average) on the gpu-submit worker |
+  | off | 33.4 ms | 12.6 ms | |
+
+- **Default is now `wt`; `flush` is opt-in** and runs its CLFLUSH on the `gpu-present` thread (`BdwZeroCopyPrepareScanout`, called from `PresentOnBcs`), not on the CPU0 worker. Images are flushed from the arm request onwards, each in full the first time.
+- **About 33 ms displayed with about 98% one-vblank latches:** the live status showed `replaced` 0, so it isn't mailbox pacing. The single gpu-submit worker is saturated: per displayed frame it runs a 16 ms compositor job plus about 1.5 game jobs of about 6.7 ms each, roughly 26 ms. On a 60 Hz panel that alternates 1- and 2-vblank intervals (p50 33 ms). Getting to 60 Hz needs the compositor job back near 12.6 ms (WB with off-worker flush is the candidate) and less worker time per game frame (M4a/M5).
+- **`gpu zerocopy verify`** now holds the panel still for the measurement. Presents are accepted and mailboxed but not armed (`BdwZeroCopyRing::PendingArm`, host-tested) until it ends, so the cadence graph no longer makes it inconclusive.
+- **Idle:** the overlay's cadence graph changes with every present, so a frame whose only change is the overlay caused the next one forever. Such frames are now presented at most every 250 ms (`overlay_only_skips` in the desktop stats); scene, client and cursor changes are immediate.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:
