@@ -3,6 +3,7 @@
 #include "hda_dell_tone_codec.h"
 #include "hda_dell_tone_ici.h"
 #include "hda_dell_tone_stream.h"
+#include "hda_dell_volume.h"
 
 namespace brook {
 // Exclusively owns one Dell controller and its 64 KiB streaming ring. This is
@@ -24,6 +25,7 @@ template<class Platform> class HdaDellStreamOwner {
     } streamIo_;
     HdaDellToneStream<StreamIo> stream_;HdaDellTonePlan plan_{};
     uint32_t base_=0,stage_=0,failureStage_=0,failedStreamStage_=0,failedStreamDetail_=0;bool active_=false,prepared_=false,stopped_=false,retained_=false,held_=false,codecTouched_=false,muted_=false;
+    uint8_t gain_=0;
     void stage(uint32_t n){__atomic_store_n(&stage_,n,__ATOMIC_RELAXED);}
     void noteFailure(uint32_t n){uint32_t empty=0;__atomic_compare_exchange_n(&failureStage_,&empty,n,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);}
     bool hold(){if(!held_){
@@ -40,7 +42,7 @@ template<class Platform> class HdaDellStreamOwner {
         if(!codec_.configureMuted(plan_) || !ici_.setFormat(format) || !ici_.getFormat(value) || value!=format ||
            !ici_.set8(3,0x706,0x10) || !ici_.get8(3,0xf06,value) || value!=0x10 ||
            !stream_.prepare(saved_.controller.gcap,memory_.bdlPhysical(),format,65536))return hold();
-        base_=0x80+((saved_.controller.gcap>>8)&15)*0x20;prepared_=true;stopped_=retained_=false;stage(33);return true;
+        gain_=plan_.dacGain;base_=0x80+((saved_.controller.gcap>>8)&15)*0x20;prepared_=true;stopped_=retained_=false;stage(33);return true;
     }
 public:
     HdaDellStreamOwner(Platform& p,const HdaSessionReport& saved,uint32_t line):p_(p),saved_(saved),memory_(p,line),
@@ -81,6 +83,18 @@ public:
     bool unmute(){
         if(!active_ || !prepared_ || held_ || stopped_ || !muted_ || p_.command()!=6)return false;
         stage(40);muted_=false;if(!codec_.unmuteAndVerify(plan_)){noteFailure(40);return false;}return true;
+    }
+    // Process context only, serialized with every other call. Writes the DAC
+    // output amplifier (both channels, read back) for the master volume. The
+    // step is capped at HdaDellDacMaxStep (Linux's 100%). A failure leaves
+    // the gain uncertain; the caller must stop and quarantine.
+    uint8_t outputGain()const{return gain_;}
+    bool setOutputGain(uint8_t step){
+        if(step>HdaDellDacMaxStep || !active_ || !prepared_ || held_ || stopped_ ||
+           (p_.command()!=2 && p_.command()!=6))return false;
+        if(step==gain_)return true;
+        stage(41);if(!codec_.setDacGainAndVerify(plan_,step)){noteFailure(41);return false;}
+        gain_=step;return true;
     }
     bool stop(){
         stage(10);

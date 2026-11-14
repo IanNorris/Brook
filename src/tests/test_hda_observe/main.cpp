@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "../../drivers/intel_hda/hda_dell_volume.h"
 #include <cassert>
 #include <cstring>
 #include <sys/mman.h>
@@ -54,6 +55,7 @@ extern "C" bool AudioRegister(const AudioDriver* d){++registerCalls;if(scenario=
 uint32_t AudioOutputControl(){return fakeOutput;}
 static bool fakeStaging=false;static uint32_t fakeStagingLimit=1024;
 void AudioMixerStagingEnable(bool on){fakeStaging=on;}
+static const uint16_t* fakeResidual=nullptr;void AudioSetHardwareVolumeResidual(const uint16_t* t){fakeResidual=t;}
 bool AudioMixerStagingEnabled(){return fakeStaging;}
 bool AudioMixerStagingSetFrameLimit(uint32_t f){if(!f || f>4096)return false;fakeStagingLimit=f;return true;}
 uint32_t AudioMixerStagingFrameLimit(){return fakeStagingLimit;}
@@ -172,6 +174,7 @@ static void one(int which){
  if(which==44){assert(o.runtimeRequested && o.runtimePrepared && !o.runtimeRegistered && toneAllocations==17 && o.runtimePagesValidated==17 && cmd==2);
   HdaRuntimeRegister();assert(o.runtimeRegistered && registered && registerCalls==1);
   assert(fakeStaging && fakeStagingLimit==HdaRuntimeDefaultStagingFrames); // Dell default downstream allowance
+  assert(!fakeResidual); // muted-only runtime keeps software volume
   assert(HdaRuntimeDrainClockAvailable() && HdaRuntimeDrainClockNs()>0);
   unsigned char samples[1764]{};const auto receipt=registered->trySubmit(samples,sizeof(samples));
   assert(receipt.accepted==sizeof(samples) && !receipt.error && !chip.sawQuietUnmute);
@@ -208,9 +211,14 @@ static void one(int which){
   else {assert(!registered->restart(terminal.epoch) && o.runtimeQuarantined && HdaRuntimeFailureStage()==21 && !toneFrees && cmd==2);rejectRetainedMapping=false;
    assert(!registered->restart(terminal.epoch));}}
  if(which==60){assert(o.runtimePrepared && o.runtimeAudibleEnabled);HdaRuntimeRegister();assert(registered);
+  assert(fakeResidual==HdaDellVolumeResidualQ15); // master volume now drives the DAC
+  chip.unmuteCeiling=chip.liveDacCeiling=HdaDellDacMaxStep;
   unsigned char samples[128]{};fakeOutput=20;registered->service();assert(!chip.sawQuietUnmute);
   assert(registered->trySubmit(samples,sizeof(samples)).accepted==sizeof(samples));registered->service();assert(!chip.sawQuietUnmute);
   fakeAuthorized=true;registered->service();assert(chip.sawQuietUnmute && chip.pin[0]==0 && chip.pin[1]==0);
+  assert(chip.dac[0]==HdaDellVolumeFor(20).dacStep && chip.dac[1]==chip.dac[0] && !chip.liveDacWrites); // set before unmute
+  fakeOutput=100;registered->service();assert(chip.dac[0]==127 && chip.dac[1]==127 && chip.liveDacWrites==2 && chip.pin[0]==0);
+  fakeOutput=5;registered->service();assert(chip.dac[0]==HdaDellVolumeFor(5).dacStep && chip.liveDacWrites==4);
   fakeOutput=BROOK_AUDIO_MUTED|20;registered->service();assert(chip.pin[0]==0x80 && chip.pin[1]==0x80);
   registered->stop();assert(chip.pin[0]==0x80 && chip.pin[1]==0x80);AudioDeviceProgress stopped{};
   assert(registered->progress(&stopped) && registered->restart(stopped.epoch));fakeOutput=20;registered->service();
@@ -218,6 +226,7 @@ static void one(int which){
   registered->service();assert(chip.pin[0]==0 && chip.pin[1]==0);
   HdaRuntimeShutdown();assert(!o.runtimeQuarantined && toneFrees==17 && cmd==0);}
  if(which==61){assert(o.runtimePrepared && o.runtimeAudibleEnabled);HdaRuntimeRegister();assert(registered);
+  chip.unmuteCeiling=HdaDellDacMaxStep;
   unsigned char samples[128]{};assert(registered->trySubmit(samples,sizeof(samples)).accepted==sizeof(samples));
   fakeOutput=20;fakeAuthorized=true;chip.dropPinUnmuteRight=true;registered->service();
   assert(o.runtimeQuarantined && !toneFrees && cmd==2 && chip.pin[0]==0x80 && chip.pin[1]==0x80 && HdaRuntimeFailureStage()==40);

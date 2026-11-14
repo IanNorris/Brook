@@ -1,6 +1,7 @@
 #pragma once
 #include "hda_dell_stream_queue.h"
 #include "../../kernel/src/audio.h"
+#include "hda_dell_volume.h"
 
 namespace brook {
 // Serialized mixer-facing adapter for an already prepared owner. The default
@@ -10,6 +11,11 @@ namespace brook {
 // interrupts over codec operations.
 // Admission, AudioRegister() and object lifetime remain the caller's job.
 struct HdaDellOutputRequest {bool authorized=false;uint32_t control=BROOK_AUDIO_MUTED;};
+// Owners that expose setOutputGain(step) get the master volume as DAC gain;
+// the mixer then applies only the residual (see hda_dell_volume.h).
+template<class T,class=void> struct HdaDellHasOutputGain {static constexpr bool value=false;};
+template<class T> struct HdaDellHasOutputGain<T,decltype(void(static_cast<T*>(nullptr)->setOutputGain(uint8_t(0))))> {
+    static constexpr bool value=true;};
 template<class Owner,class Lock,bool AllowCleanRestart=false,bool AllowAudible=false> class HdaDellAudioBridge {
     Owner& owner_;Lock& lock_;HdaDellStreamQueue<Owner> queue_;uint32_t capacity_;
     bool started_=false,closed_=false,retiredClean_=false,terminal_=false,hardwareMuted_=true,epochHasData_=false;
@@ -43,16 +49,26 @@ public:
     void service(){lock_.lock();Guard guard{lock_};if(started_ && !closed_ && !queue_.failed())queue_.service();}
     // The reader runs after taking the bridge lock so a stale queued control
     // snapshot cannot be applied after a stop/restart. Hardware changes are
-    // deferred to process context; master volume remains software gain.
-    template<class Read> bool reconcileOutput(Read read){
+    // deferred to process context. With a gain-capable owner the master
+    // volume drives the DAC step (set before the pin unmutes, and on every
+    // later change); otherwise it remains software gain.
+    static constexpr bool HardwareVolume=AllowAudible && HdaDellHasOutputGain<Owner>::value;
+    template<class Read> bool reconcileOutput(Read read,bool hardwareVolume=HardwareVolume){
         if constexpr(!AllowAudible){(void)read;return false;}
         else {
             lock_.lock();Guard guard{lock_};if(closed_ || terminal_ || queue_.failed())return false;
             const auto wantsOutput=[](const HdaDellOutputRequest& request){return request.authorized &&
                 !(request.control&BROOK_AUDIO_MUTED) && brook_audio_volume(request.control)!=0;};
-            const bool audible=wantsOutput(read());
+            const auto request=read();const bool audible=wantsOutput(request);
+            const auto applyGain=[&](const HdaDellOutputRequest& r){
+                if constexpr(HardwareVolume){
+                    if(hardwareVolume && !owner_.setOutputGain(HdaDellVolumeFor(brook_audio_volume(r.control)).dacStep)){queue_.abort();closed_=true;return false;}
+                } else (void)r;
+                return true;};
             if(!audible && !hardwareMuted_){if(!owner_.mute()){queue_.abort();closed_=true;return false;}hardwareMuted_=true;}
+            else if(audible && !hardwareMuted_){if(!applyGain(request))return false;}
             else if(audible && started_ && epochHasData_ && queue_.progress().running && hardwareMuted_){
+                if(!applyGain(request))return false;
                 if(!owner_.unmute()){queue_.abort();closed_=true;return false;}hardwareMuted_=false;
                 // If a mute raced with the codec writes, apply it before
                 // releasing the bridge lock. Later changes are reconciled at

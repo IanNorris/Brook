@@ -99,6 +99,16 @@ extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEven
 static const AudioDriver* g_audioDriver = nullptr;
 static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
 uint32_t AudioOutputControlSnapshot(){return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE);}
+static const uint16_t* g_hardwareVolumeResidual=nullptr;
+void AudioSetHardwareVolumeResidual(const uint16_t* table){__atomic_store_n(&g_hardwareVolumeResidual,table,__ATOMIC_RELEASE);}
+const uint16_t* AudioHardwareVolumeResidual(){return __atomic_load_n(&g_hardwareVolumeResidual,__ATOMIC_ACQUIRE);}
+// Master level for one mixed sample: linear software percent, or only the
+// residual when the device's hardware gain carries the rest.
+static inline int16_t ScaleOutput(int32_t sample,uint32_t control,const uint16_t* residual){
+    if(!residual)return brook_audio_scale(sample,control);
+    const unsigned v=brook_audio_volume(control);
+    return brook_audio_scale_q15(sample,control,residual[v>100?100:v]);
+}
 uint32_t AudioOutputControl() { return AudioOutputControlSnapshot() & ~AudioUserUnmuteBit; }
 bool AudioSetOutputControl(uint32_t control) {
     if (!brook_audio_control_valid(control)) return false;
@@ -644,6 +654,7 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
                 stream.stagingFrames};
     }
     const uint32_t outputControl=AudioOutputControl();
+    const uint16_t* residual=AudioHardwareVolumeResidual();
     for (uint32_t i = 0; i < frames; ++i) {
         int32_t left = 0, right = 0;
         for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
@@ -653,8 +664,8 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
             left += g_streams[slot].samples[index * 2];
             right += g_streams[slot].samples[index * 2 + 1];
         }
-        g_flushBuf[i * 2] = brook_audio_scale(left,outputControl);
-        g_flushBuf[i * 2 + 1] = brook_audio_scale(right,outputControl);
+        g_flushBuf[i * 2] = ScaleOutput(left,outputControl,residual);
+        g_flushBuf[i * 2 + 1] = ScaleOutput(right,outputControl,residual);
     }
     return frames;
 }
@@ -978,7 +989,8 @@ int AudioPlay(const void* samples, uint32_t byteCount,
 {
     if (!g_audioDriver || !g_audioDriver->play) return -1;
     const auto control=AudioOutputControl();
-    if (control==BROOK_AUDIO_DEFAULT)
+    const uint16_t* residual=AudioHardwareVolumeResidual();
+    if (control==BROOK_AUDIO_DEFAULT && !residual)
         return g_audioDriver->play(samples,byteCount,sampleRate,channels,bitsPerSample,nonblock);
     // Legacy diagnostic tones bypass the mixer. Apply the same master level
     // to a private copy, never mutate caller memory or its unaccepted suffix.
@@ -990,10 +1002,10 @@ int AudioPlay(const void* samples, uint32_t byteCount,
     for (uint32_t i=0;i<byteCount;) {
         if (bitsPerSample==16) {
             const auto sample=static_cast<int16_t>(uint16_t(input[i])|(uint16_t(input[i+1])<<8));
-            const auto result=static_cast<uint16_t>(brook_audio_scale(sample,control));
+            const auto result=static_cast<uint16_t>(ScaleOutput(sample,control,residual));
             scaled[i++]=result&255;scaled[i++]=result>>8;
         } else {
-            scaled[i]=static_cast<uint8_t>(brook_audio_scale((int(input[i])-128)*256,control)/256+128);
+            scaled[i]=static_cast<uint8_t>(ScaleOutput((int(input[i])-128)*256,control,residual)/256+128);
             ++i;
         }
     }

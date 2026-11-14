@@ -4,12 +4,12 @@
 using namespace brook;
 struct Fake {
     uint8_t pin[2]{0,0},dac[2]{0x7f,0x7f},mixer[2]{0,0};uint8_t sel=0;
-    unsigned operations=0,failAt=0,badReadAt=0;bool initialRestoreExpected=false;
+    unsigned operations=0,failAt=0,badReadAt=0;bool initialRestoreExpected=false,liveDac=false;
     bool ok(){return ++operations!=failAt;}
     uint8_t* amp(uint8_t n,bool output){if(n==0x14 && output)return pin;if(n==3 && output)return dac;if(n==0x0d && !output)return mixer;assert(false);return nullptr;}
     bool getAmp(uint8_t n,bool output,bool left,uint8_t index,uint32_t& v){assert(index==0);v=amp(n,output)[left?0:1];bool result=ok();if(operations==badReadAt)v^=1;return result;}
     bool setAmp(uint8_t n,bool output,bool left,uint8_t index,uint8_t v){assert(index==0);
-        if(n!=0x14)assert(pin[0]==0x80 && pin[1]==0x80);
+        if(n!=0x14 && !(liveDac && n==3))assert(pin[0]==0x80 && pin[1]==0x80);
         if(n==0x14 && v==0 && initialRestoreExpected)assert(sel==0 && dac[0]==0x7f && dac[1]==0x7f);
         amp(n,output)[left?0:1]=v;return ok();}
     bool set8(uint8_t n,uint16_t verb,uint8_t v){assert(n==0x14 && verb==0x701 && pin[0]==0x80 && pin[1]==0x80);sel=v;return ok();}
@@ -36,4 +36,14 @@ int main(){
       f.failAt=f.operations+failure;assert(!x.restoreAndVerify(p,old));f.failAt=0;assert(x.muteAndVerify(p));assert(f.pin[0]==0x80 && f.pin[1]==0x80);}}
     {Fake f;HdaDellToneCodec<Fake> c(f);assert(c.muteAndVerify(p));f.badReadAt=f.operations+6;
      assert(!c.configureMuted(p));f.badReadAt=0;assert(c.muteAndVerify(p));}
+    // Master volume: live DAC gain writes (both channels, read back) while the
+    // pin is unmuted; out-of-range steps are refused before any verb.
+    {Fake f;HdaDellToneCodec<Fake> c(f);assert(c.muteAndVerify(p) && c.configureMuted(p) && c.unmuteAndVerify(p));
+     f.liveDac=true;const auto before=f.operations;
+     assert(c.setDacGainAndVerify(p,127) && f.dac[0]==127 && f.dac[1]==127 && f.pin[0]==0 && f.pin[1]==0);
+     assert(f.operations-before==4); // SET+GET per channel
+     assert(c.setDacGainAndVerify(p,47) && f.dac[0]==47 && f.dac[1]==47);
+     const auto refused=f.operations;assert(!c.setDacGainAndVerify(p,0x80) && f.operations==refused);
+     for(unsigned failure=1;failure<=4;++failure){f.failAt=f.operations+failure;assert(!c.setDacGainAndVerify(p,100));f.failAt=0;}
+     f.badReadAt=f.operations+2;assert(!c.setDacGainAndVerify(p,90));f.badReadAt=0;}
 }
