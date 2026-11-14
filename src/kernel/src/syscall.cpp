@@ -60,6 +60,7 @@
 #include "intel_bdw_file.h"
 #include "intel_bdw_ioctl.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_scanout_target.h"
 #include "debug_hardware.h"
 #include "sync/ksemaphore.h"
 #include "exec_image.h"
@@ -12791,7 +12792,43 @@ static int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uin
     if((a && op!=BROOK_GPU_HANDOFF_RESERVE_DEPENDENT) || b || c || d)return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==BROOK_GPU_HANDOFF_PRESENT_CAPS)
-        return arg?-EINVAL:(BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_ASYNC|BROOK_GPU_PRESENT_CAP_DEPENDENT);
+        return arg?-EINVAL:(BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_ASYNC|BROOK_GPU_PRESENT_CAP_DEPENDENT
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+            |BROOK_GPU_PRESENT_CAP_SCANOUT
+#endif
+            );
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    if(op==BROOK_GPU_HANDOFF_SCANOUT_REGISTER){
+        BrookGpuScanoutImages wire{};
+        if(!CopyFromUser(&wire,arg,sizeof(wire)))return -EFAULT;
+        if(wire.reserved || !wire.count || wire.count>BROOK_GPU_SCANOUT_MAX_IMAGES)return -EINVAL;
+        static_assert(BROOK_GPU_SCANOUT_MAX_IMAGES==brook::BdwZeroCopyMaxImages,"zero-copy image limits must match");
+        // Hold a buffer reference (not the fd) across registration.
+        brook::BdwGpuBuffer* buffers[BROOK_GPU_SCANOUT_MAX_IMAGES]{};
+        auto drop=[&](){for(auto* b:buffers)brook::BdwGpuBufferUnref(b);};
+        for(uint32_t i=0;i<wire.count;++i){
+            if(wire.fds[i]<0 || uint32_t(wire.fds[i])>=uint32_t(MAX_FDS)){drop();return -EBADF;}
+            FdRef ref(proc,wire.fds[i]);
+            if(!ref || ref->type!=FdType::IntelPrime || !ref->handle){drop();return -EBADF;}
+            buffers[i]=static_cast<brook::BdwGpuBuffer*>(ref->handle);brook::BdwGpuBufferRef(buffers[i]);
+        }
+        brook::BdwZeroCopyRefusal refusal{};
+        const brook::BdwZeroCopyGeometry geometry{wire.width,wire.height,wire.stride,wire.fourcc};
+        const int64_t result=brook::BdwZeroCopyRegister(owner,buffers,wire.count,geometry,refusal);
+        drop();return result;
+    }
+    if(op==BROOK_GPU_HANDOFF_SCANOUT_STATUS){
+        brook::BdwZeroCopyStatus s{};brook::BdwZeroCopyReadStatus(s);
+        BrookGpuScanoutStatus wire{};
+        wire.flags=(s.registered?BROOK_GPU_SCANOUT_REGISTERED:0u)|(s.requested?BROOK_GPU_SCANOUT_REQUESTED:0u)|
+            (s.active?BROOK_GPU_SCANOUT_ACTIVE:0u)|(s.disabled?BROOK_GPU_SCANOUT_DISABLED:0u);
+        wire.images=s.images;wire.freeMask=s.freeMask;wire.front=s.front;wire.armed=s.armed;wire.queued=s.queued;
+        wire.refusal=uint32_t(s.refusal);wire.sequence=s.sequence;wire.presents=s.stats.presents;
+        wire.latched=s.stats.latched;wire.missedVblanks=s.stats.missedVblanks;
+        if(!UserBufferWritable(arg,sizeof(wire)) || !CopyToUser(arg,&wire,sizeof(wire)))return -EFAULT;
+        return 0;
+    }
+#endif
     if(op==BROOK_GPU_HANDOFF_PRESENT_RESULT)return brook::BdwOffscreenPresentResult(owner,arg);
     if(op==BROOK_GPU_HANDOFF_PRESENT_FRAME || op==BROOK_GPU_HANDOFF_QUEUE_FRAME){
         BrookGpuPresentFrame wire{};

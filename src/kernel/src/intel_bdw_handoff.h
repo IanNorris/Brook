@@ -3,6 +3,9 @@
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_fence.h"
 #include "intel_bdw_exec_snapshot.h"
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT) && defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+#include "intel_bdw_scanout_target.h"
+#endif
 
 namespace brook {
 // Intel resource adapter for the policy. Every operation is serialized by the
@@ -22,6 +25,9 @@ struct BdwHandoffResources {
 };
 inline bool BdwHandoffReleaseFree(BdwHandoffResources& h,uint32_t i,const HandoffSlot& previous) {
     if(h.policy.slots[i].state!=HandoffSlotState::Free)return true;
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT) && defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    if(h.tokens[i])BdwZeroCopyOnRelease(h.buffers[i]); // an unpresented image write is abandoned
+#endif
     if(h.tokens[i] && !BdwGpuBufferReleaseHandoff(h.buffers[i],h.tokens[i])){
         // A state transition must never make a still-pinned/unsafe slot free.
         h.policy.slots[i]=previous;h.policy.slots[i].state=HandoffSlotState::Quarantined;return false;
@@ -38,6 +44,13 @@ inline bool BdwHandoffReserve(BdwHandoffResources& h,uint64_t owner,uint64_t sce
     if(!BdwGpuBufferReserveHandoff(buffer,gateToken)){
         HandoffCancelReservation(h.policy,owner,ticket);BdwGpuBufferUnref(buffer);h.buffers[ticket.slot]=nullptr;return false;
     }
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT) && defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+    // Never let the GPU write a zero-copy image the display may be fetching.
+    if(!BdwZeroCopyOnReserve(buffer)){
+        (void)BdwGpuBufferReleaseHandoff(buffer,gateToken);
+        HandoffCancelReservation(h.policy,owner,ticket);BdwGpuBufferUnref(buffer);h.buffers[ticket.slot]=nullptr;return false;
+    }
+#endif
     h.tokens[ticket.slot]=gateToken;return true;
 }
 // gateToken is kernel-generated and never reused for this buffer. If binding

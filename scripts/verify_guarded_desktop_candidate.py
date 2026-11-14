@@ -27,7 +27,7 @@ DERIVED={'BROOK_SSD_GUARD_TRANSACTION','BROOK_SSD_GUARD_REPAIR','BROOK_SSD_GUARD
 
 def sha(data):return hashlib.sha256(data).hexdigest()
 
-def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, allow_bdw_persistent_scanout_map=False, allow_bdw_scanout_flip=False):
+def verify(candidate, source, reference, build, expected_kernel, expected_source, expected_reference, abi, allow_gpu_capture_test=False, allow_gpu_submission_timing=False, allow_vulkan_desktop=False, expected_vulkan_supervisor=None, expected_vulkan_renderer=None, allow_vulkan_partial=False, allow_gpu_blocked_recovery_test=False, expected_gpu_provider=None, allow_gpu_source_trace=False, allow_dell_acpi_monitor=False, allow_ac_loss_poweroff=False, allow_dell_bcs_present=False, allow_vulkan_async_partial=False, allow_bdw_cache_probe=False, allow_bdw_rps_trial=False, allow_bdw_coherent_render=False, allow_irq_signal_probe=False, allow_hidden_kernel_console=False, allow_bdw_persistent_scanout_map=False, allow_bdw_scanout_flip=False, allow_bdw_zero_copy_scanout=False):
     if (allow_vulkan_partial or allow_vulkan_async_partial) and not allow_vulkan_desktop:
         raise ValueError('partial rendering requires Vulkan desktop opt-in')
     if allow_dell_bcs_present and not allow_vulkan_desktop:raise ValueError('Dell BCS presentation requires Vulkan desktop opt-in')
@@ -57,7 +57,8 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
         expected_options[coherent_option]='ON' if allow_bdw_coherent_render else 'OFF'
     # Runtime-gated Broadwell scanout targets: OFF unless explicitly allowed.
     for option,allowed in (('BROOK_BDW_PERSISTENT_SCANOUT_MAP',allow_bdw_persistent_scanout_map),
-                           ('BROOK_BDW_SCANOUT_FLIP',allow_bdw_scanout_flip)):
+                           ('BROOK_BDW_SCANOUT_FLIP',allow_bdw_scanout_flip),
+                           ('BROOK_BDW_ZERO_COPY_SCANOUT',allow_bdw_zero_copy_scanout)):
         if allowed or f'{option}:BOOL=' in cache:
             expected_options[option]='ON' if allowed else 'OFF'
     if allow_gpu_capture_test:expected_options['BROOK_GPU_CAPTURE_FAULT_TEST']='ON'
@@ -163,6 +164,7 @@ def main():
     p.add_argument('--allow-bdw-rps-trial',action='store_true',help='explicitly permit the bounded Broadwell clock trial')
     p.add_argument('--allow-bdw-persistent-scanout-map',action='store_true',help='explicitly permit the runtime-gated persistent GOP map')
     p.add_argument('--allow-bdw-scanout-flip',action='store_true',help='explicitly permit the runtime-gated Broadwell page flip')
+    p.add_argument('--allow-bdw-zero-copy-scanout',action='store_true',help='explicitly permit runtime-gated zero-copy scanout of renderer images')
     p.add_argument('--allow-bdw-cache-probe',action='store_true',help='explicitly permit the root-only Broadwell cache oracle')
     p.add_argument('--allow-gpu-capture-test',action='store_true',help='explicitly permit the dedicated fault-injection kernel')
     p.add_argument('--allow-gpu-submission-timing',action='store_true',help='explicitly permit bounded diagnostic GPU timings')
@@ -180,6 +182,6 @@ def main():
     p.add_argument('--allow-irq-signal-probe',action='store_true',help='expect experimental interrupt-return signal delivery')
     p.add_argument('--allow-hidden-kernel-console',action='store_true',
                    help='expect the boot kconsole line removed and the Kernel Console Apps entry added')
-    a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe,a.allow_hidden_kernel_console,a.allow_bdw_persistent_scanout_map,a.allow_bdw_scanout_flip),indent=2))
+    a=p.parse_args();print(json.dumps(verify(a.candidate,a.source,a.reference,a.build,a.expected_kernel,a.expected_source,a.expected_reference,a.abi,a.allow_gpu_capture_test,a.allow_gpu_submission_timing,a.allow_vulkan_desktop,a.expected_vulkan_supervisor,a.expected_vulkan_renderer,a.allow_vulkan_partial,a.allow_gpu_blocked_recovery_test,a.expected_gpu_provider,a.allow_gpu_source_trace,a.allow_dell_acpi_monitor,a.allow_ac_loss_poweroff,a.allow_dell_bcs_present,a.allow_vulkan_async_partial,a.allow_bdw_cache_probe,a.allow_bdw_rps_trial,a.allow_bdw_coherent_render,a.allow_irq_signal_probe,a.allow_hidden_kernel_console,a.allow_bdw_persistent_scanout_map,a.allow_bdw_scanout_flip,a.allow_bdw_zero_copy_scanout),indent=2))
 
 if __name__=='__main__':main()

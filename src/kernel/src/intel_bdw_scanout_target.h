@@ -3,6 +3,7 @@
 #include "intel_bdw_blitter.h"
 #include "intel_bdw_ppgtt.h"
 #include "intel_bdw_display_flip.h"
+#include "intel_bdw_zero_copy.h"
 
 namespace brook {
 struct CompositorPresentRegion;
@@ -10,7 +11,10 @@ struct CompositorPresentRegion;
 // surface (GGTT offset 0) is always accepted; kernel flip buffers are added
 // once mapped and stay for the boot (their GGTT mapping is boot-lifetime).
 // Read lock-free by the per-job display invariant checks.
-inline uint32_t g_bdwScanoutSurfaces[BdwFlipMaxSlots-1]{};
+// Slots 0..2: M3 flip buffers; 3..6: zero-copy renderer images.
+constexpr uint32_t BdwScanoutFlipSurfaceSlots=BdwFlipMaxSlots-1;
+constexpr uint32_t BdwScanoutSurfaceSlots=BdwScanoutFlipSurfaceSlots+BdwZeroCopyMaxImages;
+inline uint32_t g_bdwScanoutSurfaces[BdwScanoutSurfaceSlots]{};
 inline bool BdwScanoutSurfaceAccepted(uint32_t surface){
     if(!surface)return true;
     for(auto& s:g_bdwScanoutSurfaces)if(__atomic_load_n(&s,__ATOMIC_ACQUIRE)==surface)return true;
@@ -64,5 +68,31 @@ bool BdwScanoutFlipArm(const char*& reason);
 void BdwScanoutFlipDisarm();
 bool BdwScanoutMapEnable(bool on);
 void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out);
+
+// Zero-copy scanout of renderer images (BROOK_BDW_ZERO_COPY_SCANOUT, which
+// requires BROOK_BDW_SCANOUT_FLIP; runtime gate "gpu zerocopy arm").
+// See docs/bdw-zero-copy-scanout.md.
+struct BdwGpuBuffer;
+// Syscall context. Validates and retains the ring for the boot (one
+// registration per boot in phase 1). Returns 0 or a negative errno.
+int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* buffers,uint32_t count,const BdwZeroCopyGeometry& geometry,
+                            BdwZeroCopyRefusal& refusal);
+// Handoff reservation hooks (sleepable handoff mutex held). Reserve refuses
+// to let the GPU write an image the display may fetch.
+bool BdwZeroCopyOnReserve(BdwGpuBuffer* buffer);
+void BdwZeroCopyOnRelease(BdwGpuBuffer* buffer);
+// Present worker, after the BCS admission: Copy = not an image or zero-copy
+// inactive (do the normal BCS copy from it), Presented = armed or queued
+// with no copy, RepairRequired = fail the present with a software repair.
+enum class BdwZeroCopyOutcome : uint8_t {Copy,Presented,RepairRequired};
+BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source);
+struct BdwZeroCopyStatus {
+    bool built,registered,requested,active,disabled;uint32_t images,freeMask,front,armed,queued;
+    uint64_t owner,sequence,setupUs,gopReturns,ages[BdwZeroCopyMaxImages];uint32_t surfaces[BdwZeroCopyMaxImages];
+    const char* reason;BdwZeroCopyFallback last;BdwZeroCopyRefusal refusal;BdwZeroCopyStats stats;BdwFlipGgttDiag ggtt;
+};
+void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out);
+bool BdwZeroCopyArm(const char*& reason);
+void BdwZeroCopyDisarm();
 #endif
 }
