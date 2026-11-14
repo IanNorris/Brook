@@ -1,5 +1,6 @@
 #include "../../kernel/src/intel_bdw_display_flip.h"
 #include "../../kernel/src/intel_bdw_ppgtt.h"
+#include "../../kernel/src/intel_bdw_ggtt_extent_mmio.h"
 #include <cassert>
 #include <cstring>
 #include <vector>
@@ -190,7 +191,50 @@ static void Leaves(){
     assert(!BdwBuildPpgttImage(scratch,tables,5,maps,2,true,far,1));
     assert(BdwBuildPpgttImage(scratch,tables,6,maps,2,true,far,1));
 }
+// The Dell's GGTT above the GOP holds leftovers from an earlier OS (gen 186
+// survey: no zero entries). The zero-only binder refuses such a range before
+// writing; the takeover bind against a stable snapshot installs it, and a
+// failed bind restores touched entries to the owned scratch page.
+alignas(4096) static uint64_t ptePages[2][512];
+struct GgttOwner {
+    bool failWrites=false;unsigned writes=0;uint64_t scratch=0;
+    bool auditPtePage(uint32_t,volatile uint64_t*){return true;}
+    bool owned(){return true;}
+    bool readable(){return true;}
+    bool validateLease(const BdwGgttExtentLease&){return true;}
+    bool quiescent(){return true;}
+    bool validateTakeover(const BdwGgttExtentLease&,uint64_t s){return s==scratch;}
+    bool invalidateGpuTranslations(){return true;}
+};
+static void GgttTakeover(){
+    constexpr uint32_t first=65536+448,count=200; // spans two PTE pages
+    uint64_t dma[count];for(uint32_t i=0;i<count;++i)dma[i]=0x10000000ull+uint64_t(i)*4096;
+    for(uint32_t i=0;i<count;++i){const uint32_t index=first+i;
+        ptePages[(index>>9)-(first>>9)][index&511]=(i%3==0)?(0x7269001ull+i*4096):(i%3==1)?0x5000ull:0;}
+    BdwGgttSpace space;assert(space.configure(1u<<20));
+    const BdwGgttReservation reservation{first,count,7};
+    const BdwGgttExtentLease lease{reservation,dma};
+    volatile uint64_t* pages[2]={ptePages[0],ptePages[1]};
+    volatile uint32_t flush=0;
+    GgttOwner owner{};owner.scratch=0x900000;
+    BdwGgttExtentMmio<GgttOwner> io(owner,lease,pages,2,&flush,owner.scratch);
+    uint64_t snapshot[count];
+    for(uint32_t i=0;i<count;++i)assert(io.read(first+i,snapshot[i]));
+    BdwFlipGgttDiag d{};BdwFlipGgttClassify(snapshot,first,count,d);
+    assert(d.takeover && d.valid==67 && d.other==67 && d.zero==66 && d.firstNonzero==first && d.firstNonzeroValue==0x7269001ull);
+    BdwGgttExtentBind zeroOnly;assert(!zeroOnly.Bind(lease,io) && zeroOnly.State()==BdwGgttExtentState::Fresh);
+    for(uint32_t i=0;i<count;++i){uint64_t v=0;assert(io.read(first+i,v) && v==snapshot[i]);} // nothing written
+    BdwGgttExtentBind takeover;assert(takeover.BindTakenOver(lease,io,snapshot,owner.scratch));
+    for(uint32_t i=0;i<count;++i){uint64_t v=0;assert(io.read(first+i,v) && v==(dma[i]|1));}
+    // A snapshot that no longer matches the hardware is refused before writing.
+    for(uint32_t i=0;i<count;++i){const uint32_t index=first+i;ptePages[(index>>9)-(first>>9)][index&511]=snapshot[i];}
+    snapshot[5]^=0x1000;BdwGgttExtentBind stale;
+    assert(!stale.BindTakenOver(lease,io,snapshot,owner.scratch) && stale.State()==BdwGgttExtentState::Fresh);
+    assert(!stale.BindTakenOver(lease,io,snapshot,dma[3])); // scratch aliasing a buffer page
+    assert(std::strcmp(BdwFlipGgttStageName(BdwFlipGgttStage::Refused),"bind-refused")==0);
+}
 int main(){
+    GgttTakeover();
     Probe();Damage();Rotation();SoftwareTakeover();PanicRestore();Persistent();Leaves();
     return 0;
 }

@@ -86,7 +86,7 @@ The flip path falls back to the existing BCS copy, and logs `gpu-flip: disabled 
 
 - **The probe refuses.** Probe refusal reasons: `edp-transcoder-disabled`, `edp-input-not-pipe-a`, `transcoder-disabled`, `psr-enabled`, `plane-disabled`, `tiled`, `plane-control`, `stride`, `surface-not-gop`, `surface-not-latched`, `plane-offset`, `other-pipe-plane-enabled`, `pipe-source-size`, `frame-counter-stalled`, `frame-rate`. The frame-rate check accepts 45–125 Hz.
 - **The plane changes before any arm** (`plane-changed`).
-- **A GGTT bind is uncertain.** A range that still holds valid entries from an earlier boot is refused before any write. It is quarantined, and the next aligned extent is tried.
+- **A GGTT bind fails.** The GGTT lives in stolen memory and survives warm resets. On the Dell every entry above the GOP holds leftovers from an earlier OS (gen 186 survey; no zero entries from 66048). The first Dell arm (gen 364) failed with `ggtt-bind` for exactly this reason: the first binder accepted only all-zero ranges. The bind now twice-reads a snapshot of the extent and takes over inherited values against that exact snapshot, as i915 does at load. The extent is above the 256 MiB CPU aperture and outside every Brook reservation, and nothing references it. A failed bind restores touched entries to an owned scratch page. `gpu flip status` reports `activation_step` and a `ggtt` object: stage (`reserve`, `flush-page-audit`, `pte-page-audit`, `snapshot-unstable`, `bind-refused`, `bind-uncertain`, `bound`), buffer, first, count, total entries, the failing PTE page, zero/valid/other counts, and the first nonzero index and value.
 - **A copy fails to retire.**
 - **The latch is uncertain.**
 

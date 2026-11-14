@@ -131,7 +131,10 @@ void PersistentGopPlan(BdwTargetPlan& plan){
 IrqSpinLock lock{};
 constexpr uint32_t FlipBuffers=3,ExtentPages=SurfacePages+BdwFlipRegs::GuardPages;
 static_assert(FlipBuffers+1<=BdwFlipMaxSlots && (FlipBuffers+1)*LeafTables<=BdwPpgttMaxLeaves);
-struct FlipBuffer {uint64_t* dma=nullptr;Leaves leaves;BdwGgttReservation reservation{};BdwGgttExtentBind bind;bool bound=false;};
+struct FlipBuffer {uint64_t* dma=nullptr;uint64_t* snapshot=nullptr;Leaves leaves;BdwGgttReservation reservation{};
+    BdwGgttExtentBind bind;bool bound=false;};
+BdwOwnedPage takeoverScratch{};bool takeoverReady=false;
+BdwFlipGgttDiag ggttDiag{};const char* activationStep="none";
 FlipBuffer buffers[FlipBuffers];
 BdwFlipChain chain;
 BdwPpgttLeaf allLeaves[BdwPpgttMaxLeaves]{};uint32_t allLeafCount=0;
@@ -222,11 +225,20 @@ void PollLocked(){
 bool Activate(){
     const uint64_t start=Rdtsc();
     auto fail=[](const char* why){
-        const uint64_t f=IrqSpinLockAcquire(&lock);DisableLocked(why);IrqSpinLockRelease(&lock,f);LogPending();return false;
+        const uint64_t f=IrqSpinLockAcquire(&lock);DisableLocked(why);activationStep=why;IrqSpinLockRelease(&lock,f);
+        SerialPrintf("gpu-flip: activation failed at %s; ggtt %s buffer=%u first=%u count=%u entries=%u zero=%u valid=%u other=%u nonzero@%u=%lx page=%u\n",
+            why,BdwFlipGgttStageName(ggttDiag.stage),ggttDiag.buffer,ggttDiag.first,ggttDiag.count,ggttDiag.entries,
+            ggttDiag.zero,ggttDiag.valid,ggttDiag.other,ggttDiag.firstNonzero,ggttDiag.firstNonzeroValue,ggttDiag.auditPage);
+        LogPending();return false;
     };
     if(!MapDisplay())return fail("display-map");
     if(!ValidateGop())return false; // transient: retried by the next present
     if(!EnsureZero())return fail("alloc");
+    // Distinct from the guard/zero page, which every buffer maps as data.
+    if(!takeoverReady){
+        if(!BdwPrivatePageAlloc(takeoverScratch) || !BdwPrivatePagesPublish(&takeoverScratch,1))return fail("alloc");
+        takeoverReady=true;
+    }
     uint32_t surfaces[FlipBuffers]{};
     for(uint32_t b=0;b<FlipBuffers;++b){
         auto& buffer=buffers[b];
@@ -247,18 +259,23 @@ bool Activate(){
         }
         const uint64_t* pages=buffer.dma;
         if(!BuildLeaves(buffer.leaves,AddressOf(b+1),[pages](uint32_t i){return pages[i];},SurfacePages))return fail("leaves");
-        // A range left valid by an earlier boot is refused before any write;
-        // keep that reservation forever (never reuse stale indices) and try
-        // the next aligned extent.
-        for(unsigned attempt=0;!buffer.bound && attempt<3;++attempt){
-            if(!buffer.reservation.token &&
-               !BdwGlobalGgttSpace().reserveExtent(ExtentPages,BdwFlipRegs::SurfaceAlignment/4096,buffer.reservation))return fail("ggtt-space");
-            const BdwGgttExtentLease lease{buffer.reservation,buffer.dma};
-            if(VmmDellFlipGgttBind(buffer.bind,lease,false,true)){buffer.bound=true;break;}
-            if(buffer.bind.State()!=BdwGgttExtentState::Fresh)return fail("ggtt-bind-uncertain");
-            SerialPrintf("gpu-flip: GGTT extent %u+%u not free; quarantined\n",buffer.reservation.first,ExtentPages);
-            buffer.reservation={};(void)buffer.bind.Recycle();
+        // The GGTT lives in stolen memory and survives warm resets: on the
+        // Dell every entry above the GOP holds leftovers from an earlier OS
+        // (gen 186 survey: no zero entries at 66048+). Bind against a stable
+        // snapshot, taking over inherited values as i915 does at load.
+        if(!buffer.snapshot && !(buffer.snapshot=static_cast<uint64_t*>(kmalloc(uint64_t(ExtentPages)*sizeof(uint64_t)))))
+            return fail("alloc");
+        ggttDiag={};ggttDiag.buffer=b;ggttDiag.entries=BdwGlobalGgttSpace().Limit();ggttDiag.count=ExtentPages;
+        if(!buffer.reservation.token &&
+           !BdwGlobalGgttSpace().reserveExtent(ExtentPages,BdwFlipRegs::SurfaceAlignment/4096,buffer.reservation)){
+            ggttDiag.stage=BdwFlipGgttStage::Reserve;return fail("ggtt-space");
         }
+        {
+            const BdwGgttExtentLease lease{buffer.reservation,buffer.dma};
+            buffer.bound=VmmDellFlipGgttBind(buffer.bind,lease,buffer.snapshot,takeoverScratch.dma,ggttDiag);
+        }
+        ggttDiag.entries=BdwGlobalGgttSpace().Limit();
+        if(!buffer.bound && ggttDiag.stage==BdwFlipGgttStage::Uncertain)return fail("ggtt-bind-uncertain");
         if(!buffer.bound)return fail("ggtt-bind");
         surfaces[b]=buffer.reservation.first*4096;
     }
@@ -278,6 +295,7 @@ bool Activate(){
     }
     IrqSpinLockRelease(&lock,f);
     if(!configured)return fail("chain");
+    {const uint64_t g=IrqSpinLockAcquire(&lock);activationStep="active";IrqSpinLockRelease(&lock,g);}
     SerialPrintf("gpu-flip: active; surfaces %x %x %x; setup %u us\n",surfaces[0],surfaces[1],surfaces[2],unsigned(activationUs));
     return true;
 }
@@ -482,7 +500,7 @@ void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out){
     out.front=chain.Front();out.latest=chain.Latest();
     out.armed=chain.HasArmed()?chain.ArmedSlot():~0u;out.queued=chain.HasQueued()?chain.QueuedSlot():~0u;
     for(uint32_t i=0;i<BdwFlipMaxSlots-1;++i)out.surfaces[i]=__atomic_load_n(&g_bdwScanoutSurfaces[i],__ATOMIC_ACQUIRE);
-    out.gopReturns=gopReturns;out.activationUs=activationUs;
+    out.gopReturns=gopReturns;out.activationUs=activationUs;out.activationStep=activationStep;out.ggtt=ggttDiag;
     IrqSpinLockRelease(&lock,f);
 #else
     out.reason="not built";

@@ -5747,6 +5747,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("armed",t.armed);r.text(",");r.field("queued",t.queued);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwFlipMaxSlots-1;++i){if(i)r.text(",");r.number(t.surfaces[i]);}
         r.text("],");r.field("gop_returns",t.gopReturns);r.text(",");r.field("setup_us",t.activationUs);
+        r.text(",\"activation_step\":");r.quoted(t.activationStep?t.activationStep:"");
+        const auto& g=t.ggtt;
+        r.text(",\"ggtt\":{\"stage\":");r.quoted(BdwFlipGgttStageName(g.stage));
+        r.text(",");r.field("buffer",g.buffer);r.text(",");r.field("first",g.first);r.text(",");r.field("count",g.count);
+        r.text(",");r.field("entries",g.entries);r.text(",");r.field("audit_page",g.auditPage);
+        r.text(",");r.field("zero",g.zero);r.text(",");r.field("valid",g.valid);r.text(",");r.field("other",g.other);
+        r.text(",");r.field("first_nonzero",g.firstNonzero);r.text(",\"first_nonzero_value\":\"0x");
+        r.number(g.firstNonzeroValue,true);r.text("\",\"takeover\":");r.text(g.takeover?"true":"false");r.text("}");
         r.text("},\"probe\":{\"sampled\":");r.text(t.probeSampled?"true":"false");
         r.text(",\"refusal\":");r.quoted(BdwFlipRefusalName(t.refusal));
         const auto& p=t.probe;

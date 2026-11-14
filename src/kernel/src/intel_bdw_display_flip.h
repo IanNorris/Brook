@@ -276,6 +276,44 @@ public:
     bool GopCurrent()const{return latest_==0 && (hasArmed_?armed_==0:front_==0);}
 };
 
+// Diagnostics for binding one flip buffer's GGTT extent (reported by
+// "gpu flip status"). Stage names the step that stopped the bind.
+enum class BdwFlipGgttStage : uint8_t {
+    None,Reserve,Precondition,FlushAudit,PteAudit,Unstable,Refused,Uncertain,Bound,
+};
+inline const char* BdwFlipGgttStageName(BdwFlipGgttStage s){
+    switch(s){
+    case BdwFlipGgttStage::None:return "none";
+    case BdwFlipGgttStage::Reserve:return "reserve";
+    case BdwFlipGgttStage::Precondition:return "precondition";
+    case BdwFlipGgttStage::FlushAudit:return "flush-page-audit";
+    case BdwFlipGgttStage::PteAudit:return "pte-page-audit";
+    case BdwFlipGgttStage::Unstable:return "snapshot-unstable";
+    case BdwFlipGgttStage::Refused:return "bind-refused";
+    case BdwFlipGgttStage::Uncertain:return "bind-uncertain";
+    case BdwFlipGgttStage::Bound:return "bound";
+    }
+    return "unknown";
+}
+struct BdwFlipGgttDiag {
+    BdwFlipGgttStage stage=BdwFlipGgttStage::None;
+    uint32_t buffer=0,first=0,count=0,entries=0,auditPage=0;
+    // Snapshot of the inherited entries (twice-read): zero, valid (bit 0),
+    // other nonzero; the first nonzero index and its value.
+    uint32_t zero=0,valid=0,other=0,firstNonzero=0;uint64_t firstNonzeroValue=0;
+    bool takeover=false;
+};
+// Classify a stable snapshot of the extent before binding.
+inline void BdwFlipGgttClassify(const uint64_t* values,uint32_t first,uint32_t count,BdwFlipGgttDiag& d){
+    d.zero=d.valid=d.other=0;d.firstNonzero=0;d.firstNonzeroValue=0;
+    for(uint32_t i=0;i<count;++i){const uint64_t v=values[i];
+        if(!v){++d.zero;continue;}
+        if(v&1)++d.valid;else ++d.other;
+        if(!d.firstNonzeroValue){d.firstNonzero=first+i;d.firstNonzeroValue=v;}
+    }
+    d.takeover=d.valid || d.other;
+}
+
 // Minimal panic/reset restore of the firmware surface. Lock-free and
 // MMIO-only: one store arms the GOP surface; then a bounded spin waits for
 // DSPASURFLIVE to report it so subsequent panic drawing into the firmware

@@ -57,6 +57,7 @@ struct BdwScanoutTargetStatus {
     const char* reason;BdwFlipProbe probe;BdwFlipRefusal refusal;
     uint32_t front,latest,armed,queued,surfaces[BdwFlipMaxSlots-1];
     uint64_t gopReturns,activationUs;
+    const char* activationStep;BdwFlipGgttDiag ggtt;
 };
 bool BdwScanoutFlipProbe(BdwFlipProbe& probe,BdwFlipRefusal& refusal);
 bool BdwScanoutFlipArm(const char*& reason);

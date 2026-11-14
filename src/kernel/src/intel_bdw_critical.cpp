@@ -822,17 +822,20 @@ void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scrat
 }
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,bool retire,bool displayQuiescent) {
+bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
+                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag) {
     constexpr uint32_t maxPages=16;
     const auto& r=lease.reservation;
-    if(!r.token || !r.count || r.first<65536 || r.count>maxPages*512-(r.first&511u) || SmpCurrentCpuIndex()!=0)return false;
+    diag.first=r.first;diag.count=r.count;diag.stage=BdwFlipGgttStage::Precondition;
+    if(!r.token || !r.count || r.first<65536 || r.count>maxPages*512-(r.first&511u) || SmpCurrentCpuIndex()!=0 ||
+       !snapshot || !takeoverScratch || (takeoverScratch&4095) || takeoverScratch>=(uint64_t{1}<<39))return false;
     const uint32_t pageCount=((r.first&511u)+r.count+511u)/512u;
     volatile uint64_t* pages[maxPages]{};
     for(uint32_t i=0;i<pageCount;++i)
         pages[i]=reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+BdwDellGgttBase+(uint64_t((r.first>>9)+i)<<12));
     auto* flush=reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwDellBar0+0x101008);
     struct Owner {
-        uint32_t firstPage=0;uint32_t audited=0;bool valid=true,quiet=false;
+        uint32_t firstPage=0;uint32_t audited=0;bool valid=true;uint64_t scratch=0;uint32_t failedPage=0;
         static bool Audit(uint64_t page){
             KernelAliasMapping identity{},direct{},current{};
             DellI2cCriticalEvidence e{};
@@ -849,7 +852,7 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
         bool auditPtePage(uint32_t page,volatile uint64_t* p){
             const uint32_t n=page-firstPage;
             if(!valid || n>=32 || p!=reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+BdwDellGgttBase+(uint64_t(page)<<12)))return false;
-            if(!(audited&(1u<<n))){if(!Audit(BdwDellGgttBase+(uint64_t(page)<<12))){valid=false;return false;}audited|=1u<<n;}
+            if(!(audited&(1u<<n))){if(!Audit(BdwDellGgttBase+(uint64_t(page)<<12))){valid=false;failedPage=page;return false;}audited|=1u<<n;}
             return true;
         }
         bool owned(){return valid && SmpCurrentCpuIndex()==0;}
@@ -858,18 +861,39 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
             return BdwGlobalGgttSpace().owns(l.reservation) && !(l.reservation.first&63u) &&
                 l.reservation.count>BdwFlipRegs::GuardPages;
         }
-        bool quiescent(){return quiet;}
-        bool validateTakeover(const BdwGgttExtentLease&,uint64_t){return false;}
-        // These indices were invalid before the bind and no engine context
-        // references them (BCS uses its private PPGTT); the display fetches
-        // through them only after a later DSPASURF write. GFX_FLSH_CNTL posts
-        // the PTE writes, which is what i915 relies on for GGTT updates.
+        // The extent lies above the 256 MiB CPU aperture (index >= 65536),
+        // outside every Brook reservation and the GOP/guard range, and no
+        // display plane or Brook engine context references it, so inherited
+        // entries are passive translations nobody can use (cf. i915, which
+        // rewrites all unreserved GGTT entries at load).
+        bool quiescent(){return valid;}
+        bool validateTakeover(const BdwGgttExtentLease& l,uint64_t s){return s==scratch && validateLease(l);}
+        // GFX_FLSH_CNTL posts the PTE writes, which is what i915 relies on
+        // for GGTT updates; the display fetches through them only after a
+        // later DSPASURF write and no engine context references them.
         bool invalidateGpuTranslations(){return valid;}
-    } owner{r.first>>9,0,true,displayQuiescent};
-    BdwGgttExtentMmio<Owner> io(owner,lease,pages,pageCount,flush);
+    } owner{r.first>>9,0,true,takeoverScratch,0};
+    BdwGgttExtentMmio<Owner> io(owner,lease,pages,pageCount,flush,takeoverScratch);
     return VmmWithKernelPtCritical([&](){
-        if(!Owner::Audit(BdwDellBar0+0x101000))return false;
-        return retire?bind.Retire(io):bind.Bind(lease,io);
+        if(!Owner::Audit(BdwDellBar0+0x101000)){diag.stage=BdwFlipGgttStage::FlushAudit;return false;}
+        // Stable twice-read snapshot of the inherited entries.
+        for(unsigned pass=0;pass<2;++pass)for(uint32_t i=0;i<r.count;++i){
+            uint64_t v=0;
+            if(!io.read(r.first+i,v)){
+                diag.stage=owner.failedPage?BdwFlipGgttStage::PteAudit:BdwFlipGgttStage::Unstable;
+                diag.auditPage=owner.failedPage;return false;
+            }
+            if(!pass)snapshot[i]=v;
+            else if(snapshot[i]!=v){diag.stage=BdwFlipGgttStage::Unstable;diag.firstNonzero=r.first+i;return false;}
+        }
+        BdwFlipGgttClassify(snapshot,r.first,r.count,diag);
+        // All-zero ranges use the plain binder; anything inherited is taken
+        // over against the exact snapshot (BindTakenOver re-reads it first).
+        const bool ok=diag.takeover?bind.BindTakenOver(lease,io,snapshot,takeoverScratch):bind.Bind(lease,io);
+        if(ok){diag.stage=BdwFlipGgttStage::Bound;return true;}
+        diag.stage=bind.State()==BdwGgttExtentState::Fresh?BdwFlipGgttStage::Refused:BdwFlipGgttStage::Uncertain;
+        if(owner.failedPage){diag.auditPage=owner.failedPage;}
+        return false;
     });
 }
 #endif

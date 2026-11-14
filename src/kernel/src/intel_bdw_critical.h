@@ -39,12 +39,16 @@ void VmmDellRenderGtInit(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRende
 void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
 void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-class BdwGgttExtentBind;struct BdwGgttExtentLease;
-// Bind (or retire) one kernel flip buffer's GGTT extent through audited UC
-// direct-map aliases of its PTE pages, under the page-table lock. Caller is
-// the present worker on the BSP (the only GPU owner), owns the reservation
-// and pinned pages, and for retire proves the display no longer reads it.
-bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,bool retire,bool displayQuiescent);
+class BdwGgttExtentBind;struct BdwGgttExtentLease;struct BdwFlipGgttDiag;
+// Bind one kernel flip buffer's GGTT extent through audited UC direct-map
+// aliases of its PTE pages, under the page-table lock. Caller is the present
+// worker on the BSP (the only GPU owner) and owns the reservation, the
+// pinned pages, the snapshot buffer (count entries, kept for the bind's
+// lifetime) and the takeover scratch page. Inherited nonzero entries (left
+// by an earlier OS in stolen memory) are taken over from a stable snapshot;
+// a failed bind restores touched entries to the scratch page.
+bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
+                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag);
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
