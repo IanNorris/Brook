@@ -5872,6 +5872,17 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{\"enabled\":");r.text(SceneCompletionWakeEnabled()?"true":"false");
         r.text(",\"scope\":\"default-off scene completion wake experiment; per-wait snapshot, existing registrations retained\"}\n");r.send();
     }
+    else if(NetStrEq(cmd,"compositor idle status") || NetStrEq(cmd,"compositor idle reset")) {
+        const auto s=CompositorReadIdleStats(NetStrEq(cmd,"compositor idle reset"));BridgeReply r;r.text("{");
+        r.field("loops",s.loops);r.text(",");r.field("lease_active_loops",s.leaseActiveLoops);
+        r.text(",");r.field("software_flips",s.softwareFlips);r.text(",");r.field("full_flips",s.fullFlips);
+        r.text(",");r.field("rows_dirty",s.rowsDirty);r.text(",");r.field("rows_copied",s.rowsCopied);
+        r.text(",");r.field("rows_skipped",s.rowsSkipped);r.text(",");r.field("bytes_copied",s.bytesCopied);
+        r.text(",");r.field("shadow_invalidations",s.shadowInvalidations);r.text(",");r.field("shadow_unavailable",s.shadowUnavailable);
+        r.text(",");r.field("cpu_overlay_draws",s.cpuOverlayDraws);r.text(",");r.field("cpu_overlay_skips",s.cpuOverlaySkips);
+        r.text(",");r.field("overlay_renders",s.overlayRenders);r.text(",");r.field("overlay_bumps",s.overlayBumps);
+        r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay capture renders and generation bumps\"}\n");r.send();
+    }
     else if(NetStrEq(cmd,"gpu uploads")) {
         const auto s=CompositorReadUploads();BridgeReply r;r.text("{\"layers\":[");
         const char* names[]={"desktop","chrome","overlay","cursor"};
