@@ -43,4 +43,32 @@ struct BrookDesktopOverlayBands {
     uint32_t count,reserved;
     struct BrookDesktopOverlayBand bands[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
 };
+/* Overlay change tracking (all optional; older kernels return -EINVAL).
+ * Op 6 returns the current overlay content generation (> 0). It changes
+ * whenever any taskbar, launcher or boot-summary pixel changes; the pointer
+ * is excluded. Querying keeps the compositor's change detection armed for a
+ * few seconds; detection runs on input and at least every 100 ms.
+ * Op 0 with offset=BROOK_DESKTOP_OVERLAY_NO_CURSOR requests a capture
+ * without the pointer (the caller draws it from op 8).
+ * Op 7 blocks while the token is pending, for at most offset milliseconds
+ * (<= 250), then fills BrookDesktopOverlayInfo (exact length). generation
+ * is the content generation of a Ready capture; state may still be pending.
+ * Op 8 fills BrookDesktopOverlayCursor (exact length). offset is the serial
+ * the caller already holds: when it matches, pixels are left unwritten.
+ * x/y are the top-left of the image (pointer minus hotspot); pixels are
+ * straight-alpha B,G,R,A rows of stride BROOK_DESKTOP_CURSOR_MAX. */
+enum { BROOK_DESKTOP_OVERLAY_GENERATION=6, BROOK_DESKTOP_OVERLAY_WAIT=7,
+       BROOK_DESKTOP_OVERLAY_CURSOR=8 };
+enum { BROOK_DESKTOP_OVERLAY_NO_CURSOR=1, BROOK_DESKTOP_OVERLAY_WAIT_MAX_MS=250 };
+enum { BROOK_DESKTOP_CURSOR_MAX=64 };
+struct BrookDesktopOverlayInfo {
+    struct BrookDebugFrameInfo frame;
+    uint64_t generation;
+};
+struct BrookDesktopOverlayCursor {
+    uint32_t visible,width,height,stride;
+    int32_t x,y;
+    uint64_t serial;
+    uint32_t pixels[BROOK_DESKTOP_CURSOR_MAX*BROOK_DESKTOP_CURSOR_MAX];
+};
 #endif

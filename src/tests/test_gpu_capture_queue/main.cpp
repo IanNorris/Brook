@@ -42,7 +42,16 @@ uint32_t WmDesktopHeight(uint32_t h) { return h-1; }
 void WmRenderTaskbar(uint32_t* p,uint32_t stride,uint32_t w,uint32_t h,uint64_t,int32_t,int32_t) {
     for(uint32_t x=0;x<w;++x)p[(h-1)*stride+x]=0x00123456;
 }
-bool WmLauncherVisible() {return true;}
+bool launcherVisible=true;
+bool WmLauncherVisible() {return launcherVisible;}
+uint64_t InputLatestSequence(){return 0;}
+Process* waiterProc;int blockCalls=0;bool captureOnBlock=false;unsigned waiterWakes=0;
+Process* ProcessCurrent(){return waiterProc;}
+void SchedulerBlock(Process* p){
+    CHECK(!locks && p==waiterProc);++blockCalls;
+    if(captureOnBlock){captureOnBlock=false;CaptureDesktopOverlay(g_lapicTickCount,0,0,false);}
+    else g_lapicTickCount=p->wakeupTick;
+}
 void WmLauncherGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,uint32_t* h){*x=1;*y=1;*w=2;*h=2;}
 void WmLauncherRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=1;x<3;++x)p[y*stride+x]=0x00654321;}
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
@@ -51,7 +60,7 @@ extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::c
 extern "C" void kfree(void* p) { std::free(p); }
 void MappingBackingRef(MappingBacking*) { ++leases; }
 void MappingBackingUnref(MappingBacking*) { --leases; }
-void SchedulerUnblock(Process* p) { CHECK(p==g_compositorProcess);++wakeRequests; }
+void SchedulerUnblock(Process* p) { if(p && p==waiterProc){++waiterWakes;return;} CHECK(p==g_compositorProcess);++wakeRequests; }
 void DisplayFlush(uint32_t first,uint32_t last) { CHECK(first<last); }
 uint64_t DisplayGetFramebufferPhys(){return 0;}
 bool BootLogoActive(){return false;}
@@ -352,7 +361,53 @@ int main() {
     overlay=CompositorRequestDebugFrame(77,true);CaptureDesktopOverlay(402,4,5,true);
     const uint32_t red=(255u*128u+0x12u*127u)/255u,green=0x34u*127u/255u,blue=0x56u*127u/255u;
     CHECK(overlayPixels[44]==(0xff000000u|(red<<16)|(green<<8)|blue));
-    CHECK(CompositorReleaseDebugFrame(overlay.token,77));g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};
+    CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+    {
+        // The generation excludes the pointer: a pointer-free capture of the
+        // same content keeps it, and the pointer pixels are cleared.
+        const uint64_t g0=CompositorOverlayGeneration();CHECK(g0>1);
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(403,6,1,true);
+        auto status=CompositorDebugFrameStatus(overlay.token,77);
+        CHECK(status.state==DebugFrameState::Ready && status.overlayGeneration==g0 && overlayPixels[1*8+6]==0);
+        CHECK(overlayPixels[44]==0xff123456); // the previous pointer was cleared, not blended
+        CHECK(!CompositorOverlayBands(overlay.token,77,overlayBands));
+        for(unsigned i=0;i<overlayBands.count;++i){const auto& b=overlayBands.bands[i];CHECK(!(6>=b.x && 6<b.x+b.width && 1>=b.y && 1<b.y+b.height));}
+        CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+        // Closing the launcher bumps the generation; only previously drawn
+        // rectangles are cleared (a marker outside them survives).
+        launcherVisible=false;overlayPixels[0]=0xdeadbeef;
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(404,0,0,false);
+        status=CompositorDebugFrameStatus(overlay.token,77);
+        CHECK(status.state==DebugFrameState::Ready && status.overlayGeneration==g0+1 && CompositorOverlayGeneration()==g0+1);
+        CHECK(overlayPixels[9]==0 && overlayPixels[0]==0xdeadbeef && overlayPixels[47]==0xff123456);
+        overlayPixels[0]=0;CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+        // Change detection: while subscribed and unleased, content changes
+        // update the generation without a capture request.
+        launcherVisible=true;const uint64_t now=ApicTickCount();(void)CompositorOverlayGeneration();
+        CheckDesktopOverlay(now+1,0,0);CHECK(CompositorOverlayGeneration()==g0+2 && overlayPixels[9]==0xff654321);
+        launcherVisible=false;CheckDesktopOverlay(now+2,0,0); // same input, too soon: not rechecked
+        CHECK(CompositorOverlayGeneration()==g0+2);
+        CheckDesktopOverlay(now+2,1,0);CHECK(CompositorOverlayGeneration()==g0+3); // pointer moved (hover)
+        launcherVisible=true;CheckDesktopOverlay(now+2+OVERLAY_RECHECK_MS,1,0);CHECK(CompositorOverlayGeneration()==g0+4); // periodic
+        // A held lease blocks detection; it resumes once released.
+        launcherVisible=false;overlay=CompositorRequestDebugFrame(77,true,false);
+        CheckDesktopOverlay(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+4);
+        // Op-7 wait: blocks without locks, woken by completion.
+        waiterProc=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(waiterProc);
+        DebugFrameSnapshot waited{};captureOnBlock=true;blockCalls=0;
+        CHECK(!CompositorWaitDebugFrame(overlay.token,77,100,waited));
+        CHECK(blockCalls==1 && waiterWakes==1 && waited.state==DebugFrameState::Ready && waited.overlayGeneration==g0+5 && !g_debugFrameWaiter);
+        CHECK(!CompositorWaitDebugFrame(overlay.token,77,100,waited) && blockCalls==1); // ready: no block
+        CHECK(CompositorWaitDebugFrame(overlay.token,78,100,waited)==-116);
+        CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+        // Timeout: still pending after the deadline, waiter slot released.
+        overlay=CompositorRequestDebugFrame(77,true,false);blockCalls=0;
+        CHECK(!CompositorWaitDebugFrame(overlay.token,77,20,waited) && waited.state==DebugFrameState::Pending && blockCalls==1 && !g_debugFrameWaiter);
+        CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+        std::free(waiterProc);waiterProc=nullptr;launcherVisible=true;
+        CHECK(g_debugFrameCleanAddress==g_debugFrameBuffer.raw());
+    }
+    g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};
     auto fail=[](void*,uint64_t,void*,uint64_t){return false;};
     g_needsFullRepaint=false;CHECK(CompositorPresentProbe(2,1,3,2,4,source,fail,samples)==-5 && g_needsFullRepaint);
     g_debugFrameBuffer=VirtualAddress(reinterpret_cast<uint64_t>(capturedPixels));g_debugFramePages=1;
@@ -362,6 +417,7 @@ int main() {
     CaptureCompletedDebugFrame(51,{g_physFb,8,6,8});
     CHECK(CompositorDebugFrameStatus(frame.token,77).state==DebugFrameState::Ready &&
           CompositorDebugFrameStatus(frame.token,77).source==BROOK_DEBUG_FRAME_SOURCE_FRONT && capturedPixels[0]==0xdeadbeef);
+    CHECK(!g_debugFrameCleanAddress); // full-image copy: next overlay capture clears fully
     CHECK(CompositorReleaseDebugFrame(frame.token,77));g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};g_backBuffer=nullptr;
     g_compositorProcess=nullptr;const auto finalWakes=wakeRequests.load();CompositorWake();CHECK(wakeRequests==finalWakes);
     std::free(compositor);
