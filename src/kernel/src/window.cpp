@@ -27,6 +27,7 @@
 #include "shell.h"
 #include "process.h"
 #include "scheduler.h"
+#include "wayland_provider.h"
 #include "apic.h"
 #include "spinlock.h"
 #include "compositor.h"
@@ -2863,7 +2864,13 @@ static void LauncherWorker(void*)
             else if (desktop) {
                 char script[512];
                 // Helpers can fail independently of a successful app spawn.
-                ShellExecString("set wm\nset vfb none\nrun --service --once waylandd\n");
+                // Start the CPU waylandd only when no provider (including the
+                // GPU desktop's INTLWL.ELF) already serves the socket; see
+                // wayland_provider.h.
+                if (WaylandProviderRunning([](const char* base) { return SchedulerFindProcessByBaseName(base) != nullptr; }))
+                    ShellExecString("set wm\nset vfb none\n");
+                else
+                    ShellExecString("set wm\nset vfb none\nrun --service --once waylandd\n");
                 const char* hdr = "run ";
                 uint32_t si = 0;
                 while (*hdr && si < sizeof(script) - 2) script[si++] = *hdr++;
