@@ -297,6 +297,7 @@ static void KernelConsoleThread(void* /*arg*/)
     uint32_t lastVisibleHeight = 0;
     uint64_t incarnation = 0;
     ConsoleViewport view;
+    bool scrollPending = false;
 
     for (;;)
     {
@@ -336,9 +337,15 @@ static void KernelConsoleThread(void* /*arg*/)
             view.Scroll(lines,nowTotal,RING_LINES-1,visibleLines);
             scrolled=true;
         }
-        if (nowTotal != lastTotal || width!=nextW || height!=nextH || scale!=lastScale ||
-            visibleHeight!=lastVisibleHeight || scrolled)
+        // A minimized or hidden console renders nothing; the change stays
+        // pending (lastTotal is not advanced) until it is shown again.
+        const bool shown=(geometry.flags&BROOK_WINDOW_STATE_VISIBLE) &&
+                         !(geometry.flags&BROOK_WINDOW_STATE_MINIMIZED);
+        if(scrolled)scrollPending=true;
+        if (shown && (nowTotal != lastTotal || width!=nextW || height!=nextH || scale!=lastScale ||
+            visibleHeight!=lastVisibleHeight || scrollPending))
         {
+            scrollPending=false;
             width=nextW;height=nextH;
             // New content available — re-render the VFB.
             // Read all available lines from ring (up to visible count).

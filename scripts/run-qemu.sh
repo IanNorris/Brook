@@ -231,6 +231,7 @@ fi
 #   BROOK_USB_KBD=1            — attach USB keyboard (off by default; PS/2 is primary)
 #   BROOK_USB_MOUSE=1          — attach USB mouse (off by default; virtio-tablet is primary)
 #   BROOK_NET_DEVICE=usb-ecm    — use QEMU USB Ethernet instead of virtio-net
+#   BROOK_NET_DEVICE=none       — no guest NIC (bridge unavailable)
 DISK_IMG="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
 if [ ! -f "${DISK_IMG}" ]; then
     echo "Creating persistent disk image..."
@@ -626,7 +627,10 @@ NET_DEVICE_OPTS=()
 case "${BROOK_NET_DEVICE:-virtio}" in
     virtio) NET_DEVICE_OPTS=(-device "virtio-net-pci,netdev=net0${NIC_MAC_ARG}") ;;
     usb-ecm) NET_DEVICE_OPTS=(-device "usb-net,bus=xhci.0,netdev=net0${NIC_MAC_ARG}") ;;
-    *) echo "BROOK_NET_DEVICE must be virtio or usb-ecm" >&2; exit 2 ;;
+    # No guest NIC (e.g. to check the disconnected taskbar indicator); the
+    # debug bridge needs a NIC and is unavailable.
+    none) NETDEV_OPT="" ;;
+    *) echo "BROOK_NET_DEVICE must be virtio, usb-ecm or none" >&2; exit 2 ;;
 esac
 
 QEMU_COMMAND=("${QEMU_BIN:-qemu-system-x86_64}")

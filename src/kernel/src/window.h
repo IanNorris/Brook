@@ -369,6 +369,10 @@ void WmSetActive(bool active);
 // Returns count; fills outIndices with window indices in z-order.
 uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut);
 
+// Compositor thread: refresh the cached taskbar network state at most once per
+// second from stack state (no device access). Returns true when it changed.
+bool WmNetworkIndicatorRefresh(uint64_t now);
+
 // Render the taskbar (bottom of screen) with window buttons and clock.
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,

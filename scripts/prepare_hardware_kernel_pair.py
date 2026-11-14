@@ -35,6 +35,28 @@ VULKAN_OLD_STARTS = (b'run --service --once --uid 1000 /boot/VKSUP.ELF /boot/VKR
                      b'run --service --once --uid 1000 /boot/VKSUP.ELF --partial /boot/VKRENDER.ELF')
 GPU_SOCKET = b'/tmp/brook-desktop-gpu.sock'
 GPU_PROVIDER = b'run --service --once --uid 1000 /boot/INTLWL.ELF'
+KERNEL_CONSOLE_START = b'kconsole'
+# With --hide-kernel-console the log window is not opened at boot; this Apps
+# menu entry (the repository's data/shortcuts/kernel_console.rc) reopens it.
+KERNEL_CONSOLE_SHORTCUT_PATH = 'BOOT/SHORTCUTS/KCONSOLE.RC'
+KERNEL_CONSOLE_SHORTCUT = (Path(__file__).resolve().parents[1] / 'data/shortcuts/kernel_console.rc').read_bytes()
+
+
+def hide_kernel_console(script):
+    """Remove the single boot-time `kconsole` line, keeping everything else."""
+    lines=script.splitlines()
+    if lines.count(KERNEL_CONSOLE_START)!=1:
+        raise ValueError('hiding Kernel Console requires exactly one kconsole startup line')
+    lines.remove(KERNEL_CONSOLE_START)
+    return b'\n'.join(lines)+b'\n'
+
+
+def desktop_startup(script, hide_console=False, vulkan=False, partial=False, gpu_source=False,
+                    gpu_source_trace=False, async_partial=False):
+    """The exact startup script prepared (and later verified) for these options."""
+    if hide_console:script=hide_kernel_console(script)
+    if vulkan:script=add_vulkan_desktop_start(script,partial,gpu_source,gpu_source_trace,async_partial)
+    return script
 
 def add_vulkan_desktop_start(script, partial=False, gpu_source=False, gpu_source_trace=False, async_partial=False):
     if gpu_source_trace and not gpu_source:
@@ -87,7 +109,8 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
             enable_efi_poweroff=False, enable_usb_boot_poweroff=False, enable_vulkan_desktop=False,
             vulkan_supervisor=None,vulkan_renderer=None,enable_vulkan_partial=False,
             gpu_source_provider=None,enable_gpu_source_trace=False,enable_ac_loss_poweroff=False,
-            enable_dell_acpi_monitor=False,enable_dell_bcs_present=False,enable_vulkan_async_partial=False, enable_irq_signal_probe=False):
+            enable_dell_acpi_monitor=False,enable_dell_bcs_present=False,enable_vulkan_async_partial=False, enable_irq_signal_probe=False,
+            hide_kernel_console_window=False):
     if enable_gpu_source_trace and not gpu_source_provider:
         raise ValueError('GPU source trace requires GPU source opt-in')
     if gpu_source_provider and not enable_vulkan_desktop:
@@ -159,18 +182,30 @@ def prepare(source, build, abi, payload_id, output, expected_kernel_sha256, pani
                 if subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INTLWL.ELF'])!=data:
                     raise RuntimeError('INTLWL.ELF readback mismatch')
                 vulkan_files['INTLWL.ELF']=digest(data)
-            original=subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])
-            startup=add_vulkan_desktop_start(original,enable_vulkan_partial,bool(gpu_source_provider),
-                                             enable_gpu_source_trace,enable_vulkan_async_partial)
-            startup_path=output/'INIT.RC';startup_path.write_bytes(startup)
-            subprocess.run(['mcopy','-o','-i',str(image),str(startup_path),'::/BOOT/INIT.RC'],check=True)
-            if subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])!=startup:
-                raise RuntimeError('desktop startup script readback mismatch')
             enabled.append('vulkan-desktop')
             if enable_vulkan_partial:enabled.append('vulkan-partial')
             if enable_vulkan_async_partial:enabled.append('vulkan-async-partial')
             if gpu_source_provider:enabled.append('gpu-source')
             if enable_gpu_source_trace:enabled.append('gpu-source-trace')
+        if enable_vulkan_desktop or hide_kernel_console_window:
+            original=subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])
+            startup=desktop_startup(original,hide_kernel_console_window,enable_vulkan_desktop,enable_vulkan_partial,
+                                    bool(gpu_source_provider),enable_gpu_source_trace,enable_vulkan_async_partial)
+            startup_path=output/'INIT.RC';startup_path.write_bytes(startup)
+            subprocess.run(['mcopy','-o','-i',str(image),str(startup_path),'::/BOOT/INIT.RC'],check=True)
+            if subprocess.check_output(['mtype','-i',str(image),'::/BOOT/INIT.RC'])!=startup:
+                raise RuntimeError('desktop startup script readback mismatch')
+        if hide_kernel_console_window:
+            existing=subprocess.run(['mtype','-i',str(image),'::/'+KERNEL_CONSOLE_SHORTCUT_PATH],capture_output=True)
+            if existing.returncode==0 and existing.stdout!=KERNEL_CONSOLE_SHORTCUT:
+                raise ValueError('source initrd has a different '+KERNEL_CONSOLE_SHORTCUT_PATH)
+            if subprocess.run(['mdir','-i',str(image),'::/BOOT/SHORTCUTS'],capture_output=True).returncode:
+                subprocess.run(['mmd','-i',str(image),'::/BOOT/SHORTCUTS'],check=True)
+            shortcut=output/'KCONSOLE.RC';shortcut.write_bytes(KERNEL_CONSOLE_SHORTCUT)
+            subprocess.run(['mcopy','-o','-i',str(image),str(shortcut),'::/'+KERNEL_CONSOLE_SHORTCUT_PATH],check=True)
+            if subprocess.check_output(['mtype','-i',str(image),'::/'+KERNEL_CONSOLE_SHORTCUT_PATH])!=KERNEL_CONSOLE_SHORTCUT:
+                raise RuntimeError('Kernel Console shortcut readback mismatch')
+            enabled.append('hidden-kernel-console')
         for selected,name in ((enable_efi_poweroff,'efi-poweroff'),
                               (enable_usb_boot_poweroff,'usb-boot-poweroff'),
                               (enable_dell_acpi_monitor,'dell-acpi-monitor'),
@@ -244,13 +279,16 @@ def main():
     p.add_argument('--gpu-source-provider',type=Path,help='Embed and explicitly enable the paired direct-source Wayland provider')
     p.add_argument('--enable-gpu-source-trace',action='store_true',help='Log the first direct presentation per window incarnation')
     p.add_argument('--enable-irq-signal-probe',action='store_true',help='Enable experimental interrupt-return signal delivery')
+    p.add_argument('--hide-kernel-console',action='store_true',
+                   help='Do not open the Kernel Console window at boot; add an Apps menu entry that opens it')
     a = p.parse_args()
     print(json.dumps(prepare(a.source_initrd, a.build, a.abi, a.payload_id, a.output,
                              a.expected_kernel_sha256, a.panic_exporter, a.fat_checker,
                              a.enable_efi_poweroff, a.enable_usb_boot_poweroff, a.enable_vulkan_desktop,
                              a.vulkan_supervisor,a.vulkan_renderer,a.enable_vulkan_partial,a.gpu_source_provider,
                              a.enable_gpu_source_trace,a.enable_ac_loss_poweroff,a.enable_dell_acpi_monitor,
-                             a.enable_dell_bcs_present,a.enable_vulkan_async_partial,a.enable_irq_signal_probe), indent=2))
+                             a.enable_dell_bcs_present,a.enable_vulkan_async_partial,a.enable_irq_signal_probe,
+                             a.hide_kernel_console), indent=2))
 
 
 if __name__ == '__main__':
