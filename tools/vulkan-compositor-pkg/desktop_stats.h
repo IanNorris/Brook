@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "desktop_async_source_barrier.h"
+#include "desktop_pipeline.h"
 
 enum {DESKTOP_STATS_WINDOWS=16,DESKTOP_STATS_BUCKETS=9};
 /* Inclusive upper edges in ms; the final bucket is >100 ms. */
@@ -49,6 +50,14 @@ struct DesktopStats {
     struct DesktopStatsClass cls[2];
     uint64_t overlayCaptures,overlayFailures,overlayPolls,overlayMaxPolls;
     struct DesktopStatsDuration overlayWait;
+    /* Frames in flight (desktop_pipeline.h): submissions by the number of
+     * other frames already in flight, overlapped submissions that carried an
+     * older frame's regions, dependent reservations retried on the newly
+     * accepted ticket, and admissions that waited behind a full-screen frame
+     * or for a usable baseline. */
+    struct {uint32_t inFlight;uint64_t maxInFlight,submitted[3],carried,rebased,waitFull,waitBaseline;} pipeline;
+    /* Submitted full-screen frames whose damage did not cover the output. */
+    struct {uint64_t total,noBaseline,inFlight,other;} fullForced;
 };
 /* One successfully presented composition. Timestamps are CLOCK_MONOTONIC ns;
  * zero means unknown and the dependent duration is not recorded. */
@@ -123,6 +132,19 @@ static inline void desktop_stats_presented(struct DesktopStats *s,const struct D
     const unsigned n=f->count<=BROOK_DESKTOP_LAYER_LIMIT?f->count:BROOK_DESKTOP_LAYER_LIMIT;
     for(unsigned i=0;f->sources && i<n;++i)desktop_stats_source(s,&f->sources[i],f->presentedNs);
 }
+/* inFlight: frames still in flight when this one was submitted. reason:
+ * enum DesktopPipelineFull (0: partial, or a genuine full-screen change). */
+static inline void desktop_stats_submitted(struct DesktopStats *s,unsigned inFlight,int carried,unsigned reason){
+    ++s->pipeline.submitted[inFlight<2?inFlight:2];
+    if(carried)++s->pipeline.carried;
+    if(!reason)return;
+    ++s->fullForced.total;
+    if(reason==DESKTOP_FULL_NO_BASELINE)++s->fullForced.noBaseline;
+    else if(reason==DESKTOP_FULL_IN_FLIGHT)++s->fullForced.inFlight;else ++s->fullForced.other;
+}
+static inline void desktop_stats_in_flight(struct DesktopStats *s,unsigned n){
+    s->pipeline.inFlight=n;if(n>s->pipeline.maxInFlight)s->pipeline.maxInFlight=n;
+}
 static inline void desktop_stats_overlay(struct DesktopStats *s,int ok,unsigned polls,uint64_t waitNs){
     ++s->overlayCaptures;if(!ok)++s->overlayFailures;
     s->overlayPolls+=polls;if(polls>s->overlayMaxPolls)s->overlayMaxPolls=polls;
@@ -143,7 +165,8 @@ static inline void desktop_stats_put_duration(struct DesktopStatsBuffer *b,const
     desktop_stats_put(b,"\"%s\":{\"count\":%llu,\"sum_ns\":%llu,\"min_ns\":%llu,\"max_ns\":%llu}",name,
         (unsigned long long)d->count,(unsigned long long)d->sumNs,(unsigned long long)d->minNs,(unsigned long long)d->maxNs);
 }
-struct DesktopStatsMeta {uint64_t seq,nowNs,startedNs,publishFailures;long pid;unsigned depth;int asyncPresent,gpuTimestamps;};
+/* pipeline: configured frames in flight (1 serial, 2 pipelined). */
+struct DesktopStatsMeta {uint64_t seq,nowNs,startedNs,publishFailures;long pid;unsigned depth;int asyncPresent,gpuTimestamps;unsigned pipeline;};
 /* Returns the JSON length, or 0 when the buffer is too small. */
 static inline size_t desktop_stats_format(const struct DesktopStats *s,const struct DesktopStatsMeta *m,char *data,size_t size){
     struct DesktopStatsBuffer b={data,size,0,0};
@@ -165,6 +188,15 @@ static inline size_t desktop_stats_format(const struct DesktopStats *s,const str
     static const char *const paths[3]={"compute","graphics","quad"};
     desktop_stats_put(&b,"\"idle\":{\"skipped_polls\":%llu,\"keepalive_presents\":%llu},",
         (unsigned long long)s->idleSkips,(unsigned long long)s->keepalives);
+    desktop_stats_put(&b,"\"pipeline\":{\"depth\":%u,\"in_flight\":%u,\"max_in_flight\":%llu,\"submitted_by_in_flight\":[%llu,%llu,%llu],"
+        "\"carried_damage\":%llu,\"rebased_reserves\":%llu,\"waits_behind_full\":%llu,\"waits_baseline\":%llu},",
+        m->pipeline?m->pipeline:1u,s->pipeline.inFlight,(unsigned long long)s->pipeline.maxInFlight,
+        (unsigned long long)s->pipeline.submitted[0],(unsigned long long)s->pipeline.submitted[1],(unsigned long long)s->pipeline.submitted[2],
+        (unsigned long long)s->pipeline.carried,(unsigned long long)s->pipeline.rebased,
+        (unsigned long long)s->pipeline.waitFull,(unsigned long long)s->pipeline.waitBaseline);
+    desktop_stats_put(&b,"\"full_forced\":{\"total\":%llu,\"no_baseline\":%llu,\"in_flight\":%llu,\"other\":%llu},",
+        (unsigned long long)s->fullForced.total,(unsigned long long)s->fullForced.noBaseline,
+        (unsigned long long)s->fullForced.inFlight,(unsigned long long)s->fullForced.other);
     desktop_stats_put(&b,"\"last_frame\":{\"path\":\"%s\",\"direct\":%u,\"partial\":%u,\"layers_drawn\":%u,\"draws\":%u,"
         "\"pixels_shaded\":%llu,\"damage_pixels\":%llu,\"cpu_submit_to_fence_ns\":%llu,\"gpu_ns\":%llu},",
         paths[s->last.path<3?s->last.path:0],s->last.direct,s->last.partial,s->last.layersDrawn,s->last.draws,

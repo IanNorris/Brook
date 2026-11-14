@@ -68,7 +68,16 @@ int main(void){
      assert(stats.cls[DESKTOP_STATS_NONDIRECT].work.maxLayersDrawn>=2 && stats.last.path==DESKTOP_STATS_PATH_QUAD);
      assert(stats.last.pixelsShaded==20000 && stats.last.damagePixels==10240 && stats.last.draws==3);
      stats.idleSkips=5;stats.keepalives=1;}
-    const struct DesktopStatsMeta meta={7,base+900000000,base,0,42,2,1,0};
+    /* Pipeline depth and forced full frames. */
+    desktop_stats_in_flight(&stats,1);desktop_stats_in_flight(&stats,2);desktop_stats_in_flight(&stats,1);
+    desktop_stats_submitted(&stats,0,0,DESKTOP_FULL_NO_BASELINE);
+    desktop_stats_submitted(&stats,1,1,DESKTOP_FULL_NOT_FORCED);
+    desktop_stats_submitted(&stats,1,1,DESKTOP_FULL_IN_FLIGHT);
+    desktop_stats_submitted(&stats,5,0,DESKTOP_FULL_OTHER);
+    assert(stats.pipeline.inFlight==1 && stats.pipeline.maxInFlight==2 && stats.pipeline.carried==2);
+    assert(stats.pipeline.submitted[0]==1 && stats.pipeline.submitted[1]==2 && stats.pipeline.submitted[2]==1);
+    assert(stats.fullForced.total==3 && stats.fullForced.noBaseline==1 && stats.fullForced.inFlight==1 && stats.fullForced.other==1);
+    const struct DesktopStatsMeta meta={7,base+900000000,base,0,42,2,1,0,2};
     char small[64];assert(!desktop_stats_format(&stats,&meta,small,sizeof(small)));
     static char json[32768];
     const size_t length=desktop_stats_format(&stats,&meta,json,sizeof(json));
@@ -76,6 +85,8 @@ int main(void){
     assert(strstr(json,"\"seq\":7,") && strstr(json,"\"window\":3,\"incarnation\":9,"));
     assert(strstr(json,"\"quad\":2,") && strstr(json,"\"skipped_polls\":5,") && strstr(json,"\"last_frame\":{\"path\":\"quad\""));
     assert(strstr(json,"\"composition\":{\"frames\":"));
+    assert(strstr(json,"\"pipeline\":{\"depth\":2,\"in_flight\":1,\"max_in_flight\":2,\"submitted_by_in_flight\":[1,2,1],\"carried_damage\":2,"));
+    assert(strstr(json,"\"full_forced\":{\"total\":3,\"no_baseline\":1,\"in_flight\":1,\"other\":1}"));
     /* Worst case: every table entry populated with large values still fits. */
     for(unsigned i=0;i<DESKTOP_STATS_WINDOWS;++i){stats.windows[i].displayed=UINT64_MAX;stats.windows[i].lastCommit=UINT64_MAX;
         stats.windows[i].incarnation=UINT64_MAX;stats.windows[i].window=UINT32_MAX;for(unsigned j=0;j<DESKTOP_STATS_BUCKETS;++j)stats.windows[i].hist[j]=UINT64_MAX;}
@@ -83,6 +94,9 @@ int main(void){
         w->damagePixels=w->maxLayersDrawn=w->maxPixelsShaded=UINT64_MAX;}
     stats.last.pixelsShaded=stats.last.damagePixels=stats.last.submitToFenceNs=stats.last.gpuNs=UINT64_MAX;
     stats.idleSkips=stats.keepalives=stats.quad=UINT64_MAX;
+    stats.pipeline.inFlight=UINT32_MAX;stats.pipeline.maxInFlight=stats.pipeline.carried=stats.pipeline.rebased=stats.pipeline.waitFull=
+        stats.pipeline.waitBaseline=UINT64_MAX;for(unsigned i=0;i<3;++i)stats.pipeline.submitted[i]=UINT64_MAX;
+    stats.fullForced.total=stats.fullForced.noBaseline=stats.fullForced.inFlight=stats.fullForced.other=UINT64_MAX;
     static char worst[32768];assert(desktop_stats_format(&stats,&meta,worst,sizeof(worst)));
     fputs(json,stdout);
     return 0;

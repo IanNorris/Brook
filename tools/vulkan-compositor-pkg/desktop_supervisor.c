@@ -18,17 +18,18 @@ static void sleep_seconds(unsigned seconds){
     while(!stopping && nanosleep(&remaining,&remaining) && errno==EINTR){}
 }
 int main(int argc,char **argv){
-    int partial=0,asyncPartial=0,traceSource=0;const char *socketPath=NULL,*renderer=NULL;
+    int partial=0,asyncPartial=0,traceSource=0,pipeline=0;const char *socketPath=NULL,*renderer=NULL;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--partial") && !partial && !asyncPartial)partial=1;
         else if(!strcmp(argv[i],"--async-partial") && !partial && !asyncPartial)asyncPartial=1;
         else if(!strcmp(argv[i],"--trace-gpu-source") && !traceSource)traceSource=1;
+        else if(!strcmp(argv[i],"--pipeline") && !pipeline)pipeline=1;
         else if(!strcmp(argv[i],"--gpu-source") && !socketPath && i+1<argc)socketPath=argv[++i];
         else if(!renderer && argv[i][0]!='-')renderer=argv[i];
         else return 2;
     }
-    if(!renderer || renderer[0]!='/' || (socketPath && socketPath[0]!='/') || (traceSource && !socketPath)){
-        fprintf(stderr,"usage: brook-desktop-supervisor [--partial | --async-partial] [--gpu-source /socket] [--trace-gpu-source] /absolute/path/to/brook-desktop-renderer\n");return 2;
+    if(!renderer || renderer[0]!='/' || (socketPath && socketPath[0]!='/') || (traceSource && !socketPath) || (pipeline && !asyncPartial)){
+        fprintf(stderr,"usage: brook-desktop-supervisor [--partial | --async-partial [--pipeline]] [--gpu-source /socket] [--trace-gpu-source] /absolute/path/to/brook-desktop-renderer\n");return 2;
     }
 #ifdef BROOK_SUPERVISOR_DIAGNOSTIC_REUSE_BACKDROP
     if(setenv("BROOK_RENDER_REUSE_TILE_BACKDROP","1",1))return 1;
@@ -40,6 +41,9 @@ int main(int argc,char **argv){
     if(asyncPartial && (setenv("BROOK_RENDER_ASYNC_PARTIAL","1",1) ||
        setenv("BROOK_RENDER_BUFFER_COUNT","2",1) ||
        setenv("BROOK_RENDER_ASYNC_PARTIAL_GRACE","1",0)))return 1;
+    /* Two frames in flight (desktop_pipeline.h); an explicit environment
+     * value, including BROOK_RENDER_PIPELINE=1, wins. */
+    if(pipeline && setenv("BROOK_RENDER_PIPELINE","2",0))return 1;
 #ifdef BROOK_SUPERVISOR_SERIAL
     if(!asyncPartial || setenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL","1",1))return 1;
 #endif
