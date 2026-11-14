@@ -8,7 +8,7 @@ intervals on the same local animation page as browser_gpu_probe.py. Prints BROWS
 import http.server, json, socket, subprocess, sys, threading, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_gpu_probe_page import PAGE  # noqa: E402
+from browser_gpu_probe_page import PAGES  # noqa: E402
 
 
 class Marionette:
@@ -40,6 +40,9 @@ class Marionette:
 
 work, wrapper = Path(sys.argv[1]), sys.argv[2]
 secs = float(sys.argv[3]) if len(sys.argv) > 3 else 15
+page_name = sys.argv[4] if len(sys.argv) > 4 else 'anim'
+clip = sys.argv[5] if len(sys.argv) > 5 else None
+PAGE = PAGES[page_name]
 work.mkdir(parents=True, exist_ok=True)
 # A private profile, so the user's Firefox profile and lock are never touched.
 import os
@@ -48,6 +51,10 @@ os.environ['BROOK_FIREFOX_PROFILE'] = str(work / 'firefox-profile')
 
 class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/clip.webm' and clip:
+            data = open(clip, 'rb').read()
+            self.send_response(200); self.send_header('Content-Type', 'video/webm'); self.send_header('Content-Length', str(len(data)))
+            self.end_headers(); self.wfile.write(data); return
         self.send_response(200); self.send_header('Content-Type', 'text/html'); self.end_headers(); self.wfile.write(PAGE)
 
     def log_message(self, *a):
@@ -64,7 +71,7 @@ let log={};try{log=g.getFeatureLog();}catch(e){}
 return {layerManager:w?w.windowUtils.layerManagerType:null, webrender:w?w.windowUtils.layerManagerRemote:null,
  adapter:g.adapterDescription, vendor:g.adapterVendorID, driver:g.adapterDriver, version:g.adapterDriverVersion,
  windowProtocol:g.windowProtocol, features:features, log:log};"""
-result = {'wrapper': wrapper}
+result = {'wrapper': wrapper, 'page': page_name}
 with (work / 'browser.log').open('w') as log:
     proc = subprocess.Popen([wrapper, '--marionette', '-remote-allow-system-access', '--new-window', 'about:blank'], stdout=log, stderr=log)
     try:

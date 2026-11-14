@@ -10,7 +10,7 @@ import urllib.parse, urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_gpu_probe_page import PAGE  # noqa: E402
+from browser_gpu_probe_page import PAGES  # noqa: E402
 
 
 
@@ -55,11 +55,18 @@ class DevTools:
 
 work, wrapper = Path(sys.argv[1]), sys.argv[2]
 secs = float(sys.argv[3]) if len(sys.argv) > 3 else 15
+page_name = sys.argv[4] if len(sys.argv) > 4 else 'anim'
+clip = sys.argv[5] if len(sys.argv) > 5 else None
+PAGE = PAGES[page_name]
 work.mkdir(parents=True, exist_ok=True)
 
 
 class Page(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/clip.webm' and clip:
+            data = open(clip, 'rb').read()
+            self.send_response(200); self.send_header('Content-Type', 'video/webm'); self.send_header('Content-Length', str(len(data)))
+            self.end_headers(); self.wfile.write(data); return
         self.send_response(200); self.send_header('Content-Type', 'text/html'); self.end_headers(); self.wfile.write(PAGE)
 
     def log_message(self, *a):
@@ -74,7 +81,7 @@ profile = work / 'chromium-profile'
 os.environ['BROOK_CHROMIUM_PROFILE'] = str(profile)
 port_file = profile / 'DevToolsActivePort'
 if port_file.exists(): port_file.unlink()
-result = {'wrapper': wrapper}
+result = {'wrapper': wrapper, 'page': page_name}
 with (work / 'browser.log').open('w') as log:
     proc = subprocess.Popen([wrapper, '--remote-debugging-port=0', '--window-size=1340,850', '--new-window', url],
                             stdout=log, stderr=log)

@@ -7,7 +7,10 @@ and saves the worker stats (the `app` class counts GPU jobs from applications) a
 
 Usage (repo root, BROOK_ROOT = the registry holding SESSION):
   python3 scripts/dell_browser_gpu_check.py SESSION OUTDIR [chromium,firefox] [gpu,software] [seconds]
+Environment: BROWSER_INSTALLED=1 runs the installed /nix/profile/bin/brook-{chromium,firefox} with no
+launcher override; BROWSER_PAGES=anim,webgl,video selects probe pages; BROWSER_CLIP=host .webm for video.
 """
+import os
 import json, sys, tarfile, time, uuid
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +35,10 @@ with tarfile.open(bundle, 'w') as tar:
         tar.add(ROOT / 'scripts/workloads' / name, arcname=name)
     for name in ('brook-chromium', 'brook-firefox'):
         tar.add(ROOT / 'data/nix-wrappers' / name, arcname=name)
+    if os.environ.get('BROWSER_CLIP'):
+        tar.add(os.environ['BROWSER_CLIP'], arcname='clip.webm')
+installed = os.environ.get('BROWSER_INSTALLED') == '1'
+pages = os.environ.get('BROWSER_PAGES', 'anim').split(',')
 
 
 def save(name, value):
@@ -56,13 +63,15 @@ setup = job([bash, '-c', f'set -e; mkdir -p {work}; cd {work}; tar -xf {xfer["tr
 print('setup', setup['state'], setup['stdout']['text'].strip()[-400:], setup['stderr']['text'][-400:])
 save('providers-before', h.command(session, 'procs'))
 for browser in browsers:
+  for page in pages:
     for mode in modes:
-        label = f'{browser}-{mode}'
+        label = f'{browser}-{mode}-{page}'
+        wrapper = f'/nix/profile/bin/brook-{browser}' if installed else f'{work}/brook-{browser}'
         probe = 'browser_gpu_probe.py' if browser == 'chromium' else 'firefox_gpu_probe.py'
-        env = f'BROOK_IRIS_RUN={IRIS} ' if mode == 'gpu' else 'BROOK_BROWSER_SOFTWARE=1 '
+        env = ('' if installed else f'BROOK_IRIS_RUN={IRIS} ') if mode == 'gpu' else 'BROOK_BROWSER_SOFTWARE=1 '
         # Never reset the shared worker counters (other agents capture them); diff instead.
         save(label + '-worker-before', h.command(session, 'gpu worker stats'))
-        r = job([bash, '-c', f'{env}/nix/profile/bin/python3 {work}/{probe} {work}/{label} {work}/brook-{browser} {secs}'],
+        r = job([bash, '-c', f'{env}/nix/profile/bin/python3 {work}/{probe} {work}/{label} {wrapper} {secs} {page} {work}/clip.webm'],
                 name=label + '-job')
         save(label + '-worker', h.command(session, 'gpu worker stats'))
         text = r['stdout']['text']
@@ -73,6 +82,10 @@ for browser in browsers:
         before = json.loads((out / f'{label}-worker-before.json').read_text()).get('class', {}).get('app', [0, 0])
         after = json.loads((out / f'{label}-worker.json').read_text()).get('class', {}).get('app', [0, 0])
         app = [after[0] - before[0], after[1] - before[1]] if after[0] >= before[0] else ['counters reset', after]
+        dumps = job([bash, '-c', 'ls -1 /data/home/.mozilla/brook/minidumps /data/home/.config/chromium-brook/Crash\\ Reports/pending 2>/dev/null | wc -l; '
+                     f'ls -1 {work}/{label}/firefox-profile/minidumps 2>/dev/null'], name=label + '-dumps')
+        result['crash_files'] = dumps['stdout']['text'].split()
+        save(label + '-result', result)
         print(label, 'exit', r.get('exit'), 'app_jobs_us', app, 'frames', result.get('frames'),
               'status', (result.get('gpu') or {}).get('featureStatus', {}).get('gpu_compositing') or
               ((result.get('gfx') or {}).get('layerManager')), 'error', result.get('error'), flush=True)

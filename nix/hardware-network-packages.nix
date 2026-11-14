@@ -67,6 +67,6 @@ let
   '';
   packages = [ (pkgs.lib.hiPrio launchers) intelVulkan desktopCompositor firefox chromium gallery graphics.mesaRuntime pkgs.xz.bin pkgs.zstd.bin ] ++ base.packages ++ [ (pkgs.lib.lowPrio intelGl) ];
 in {
-  inherit packages firefox chromium gallery intelVulkanDriver;
+  inherit packages firefox chromium gallery intelVulkanDriver launchers intelGl;
   profile = pkgs.buildEnv { name = "brook-network-hardware-desktop"; paths = packages; ignoreCollisions = true; };
 }
