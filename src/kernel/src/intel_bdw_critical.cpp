@@ -5,6 +5,7 @@
 #include "cpu_memory_type_batch.h"
 #include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_critical.h"
+#include "cpu_idle.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include "dell_i2c_id_policy.h"
@@ -473,6 +474,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         const auto yieldStart=BdwTimingNow();
 #endif
                         io.spinTicks=slice;io.waitEnd=0;
+                        // A job is in flight: keep this CPU out of deep
+                        // C-states for its completion polls (governor only).
+                        CpuIdleLatencyHint(4000);
                         const bool yielded=BdwYieldGpuWait(io);
                         io.spinTicks=0;
                         if(!yielded){result.pollYieldFailed=true;fault=true;return false;}
