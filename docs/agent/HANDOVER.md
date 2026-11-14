@@ -92,6 +92,22 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Browser and audio captures (gen 371, 14 Nov, Ian watching):**
+- **Chrome YouTube** (windowed; slow, fluttering audio):
+  - mixer stream 34.5k frames/s against the HDA's 44.1k;
+  - 22% of output is silence (later gaps 9.4k frames/s, 26 events/s);
+  - stream capacity 1920, fragment 64, queue ~77% full.
+  - The mixer starves this stream (10 ms / 12.8 ms = 0.78). Being fixed in `work/dell-audio`.
+- **Firefox YouTube** (fullscreen; audio fine): 44.24k frames/s, zero gaps, capacity 4416. This is the healthy control.
+- **Both browsers render in software:** `gpu worker stats` class `app` = 0 jobs during playback.
+- **The CPU bottleneck is the user waylandd** (`/nix/profile/bin/waylandd`, `4p01fkxz…`), at ~24% of all CPU (one core). The hot spot is its CPU scene composition (`surface-scene.h` `pixel_over` plus per-pixel `idiv` scaling); multi-layer and scaled windows take this path.
+- **Frame times:** ~170 ms windowed (~5 fps), ~2 fps fullscreen.
+- **Work started:** `work/browser-gpu` (why software) and `work/waylandd-compose` (fast CPU path plus multi-layer GPU publication).
+- **Evidence:** `display-perf/build/{chrome-audio-gen371,firefox-fs-gen371}/`.
+- **Volume ceiling:** the Dell stream reuses the speaker test's fixed DAC gain (`hda_dell_tone_plan.h:38`, step 80); taskbar volume is software-only. Proposed: drive the DAC gain from the volume control, tested with Ian present.
+- **Mouse judder:** the frame time drops 17 → 8 ms while the mouse moves; the compositor renders at ~125 Hz into an unsynced 60 Hz GOP. Zero-copy flips or a refresh cap should fix it.
+- **Zero-copy scanout** (`work/zero-copy`) is the primary display milestone.
+
 **Timing loader promoted on the Dell (14 Nov, with Ian):**
 - **Problem caught before deploy:** the boot-timing loader's protocol version bump to 6 would have disabled EFI power-off on every existing kernel; `efi_runtime_inventory.h` and `platform_power.cpp` accept only v5. Fixed in `992e0879`: the handoff stays at v5 and the timing block sits behind an `extensions` marker. QEMU tested every old/new loader and kernel pairing.
 - **Promotion:** from the USB maintenance boot via `scripts/dell_loader_promotion.py` (runbook `docs/dell-loader-promotion.md`). The inventory matched the 7 Nov hashes. `BROOKT6.EFI` (`a42be35c…`) was staged and promoted with `GUARD_DEFAULT_OK`. The old v5 default is kept as `BROOKP5.EFI` (`c717c048…`). F5, RECOV2, RECOVERY and the guards are unchanged.
