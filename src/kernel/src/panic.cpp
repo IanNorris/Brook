@@ -611,3 +611,10 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     // Spin forever (don't use hlt — it causes QEMU to exit when all CPUs halt)
     for (;;) { __asm__ volatile("pause"); }
 }
+
+// C++ ABI hook: called if a pure virtual function is invoked (an object used
+// during construction/destruction). Debug builds keep these vtable slots.
+extern "C" __attribute__((noreturn)) void __cxa_pure_virtual()
+{
+    KernelPanic("pure virtual function called");
+}
