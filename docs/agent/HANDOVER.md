@@ -29,8 +29,8 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 | # | Milestone | State |
 |---|---|---|
 | 0a | Clean workspace builds from a fresh clone (`d668a832`) | done |
-| 0b | Move the Dell GPU critical-section code out of `memory/virtual_memory.cpp` into the Intel driver (pure move: same lock and IRQ behaviour) | todo |
-| 0c | Scripted, reproducible Dell image build from source (`scripts/` and assets in `/data/Programming/Brook/shared/dell`) | todo |
+| 0b | Move the Dell GPU critical-section code out of `memory/virtual_memory.cpp` into `intel_bdw_critical.cpp` (pure move) | done: `2831dbbd`; Dell stage timings unchanged vs gen 355 |
+| 0c | Reproducible Dell image build: `scripts/build_dell_image.py --qemu-check` (guarded QEMU repair-to-desktop via `scripts/check_dell_image_qemu.py`) | done: `74342a6b`, `e8680304`, `56fbc88b` |
 | M0 | Diagnostics: distinct displayed-frame counter, BCS stage timing, per-class worker busy time, compositor job split by direct layer, plus anything else missing | todo |
 | M2 | Release the previous client buffer as soon as the compositor has consumed it; remove the CPU copies on the GPU path (waylandd snapshot); present-driven frame callbacks; drop the 8-buffer workaround | todo |
 | — | Close the Kernel Console at startup on the GPU desktop (no CPU console writes) and add a network up/down indicator near the taskbar clock | todo |
@@ -83,6 +83,8 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Rules:** awaiting Ian's go-ahead. Code changes go on a branch. Count displayed frames, not only swaps.
 
 ## Dell state (14 November)
+
+- **Current (supersedes the gen 355 line below):** generation 356, slot 1, payload `dell-vmm-move-20261114`, built from `2831dbbd` by `build_dell_image.py`; bridge session `79b1dcaaaffc4d2a80f9589683d65802`. Baseline measurements: 68.6 swaps/s with 8 buffers and 39.5 with 2 (`display-perf/build/dell/measure-vmm-move/`). Slot 0 holds gen 355 for rollback.
 
 - **Target:** Dell XPS 13 9343 at `192.168.85.106:1234`. Generation 355, slot 0: boot `7f78aa2b8ea24c17816b5b80eff04a26`, session `bccc100914d547f095a4d01834494c93`.
 - **Boot payload:** the restored gen 338 baseline `dell-short-lock-serial-20261113` (receipt `build/hardware/dell-baseline-restore-20261114/receipt.json`). It was built with BROOK_GPU_SUBMISSION_TIMING, the coherent LLC render path and the 500 MHz on-AC clock trial. Pair: `build/hardware/dell-present-ownership-20261113/pair-short-lock-serial/`.
