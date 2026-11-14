@@ -7,6 +7,7 @@
 #include "desktop_backdrop.h"
 #include "compositor_present_lease.h"
 #include "desktop_pointer_route.h"
+#include "global_shortcuts.h"
 #include "compositor.h"
 #include "../../shared/brook_debug_frame.h"
 #include "boot_logo.h"
@@ -2424,7 +2425,60 @@ static void CompositorLoopWM()
 }
 
 static DesktopPointerGate g_desktopPointerGate;
+static GlobalShortcuts g_globalShortcuts;
 static void CompositorReconcilePointerCapture();
+
+// Desktop shortcuts run before the raw grabber, pointer-capture routing and
+// focused delivery, so they work over any client, including a captured game.
+static void CompositorRunShortcut(const GlobalShortcutResult& r)
+{
+    if(r.releasePointer) {
+        const bool released=WmPointerCaptureReleaseByUser();
+        if(__atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)==0) {
+            __atomic_store_n(&g_defaultCursorVisible,1u,__ATOMIC_RELEASE);
+            CompositorSetCursorImage(nullptr,0,0,0,0);
+        }
+        if(released)SerialPuts("WM: shortcut Super released pointer capture\n");
+    }
+    switch(r.action) {
+    case GlobalShortcutAction::None:break;
+    case GlobalShortcutAction::ToggleLauncher:
+        WmLauncherToggle();
+        SerialPrintf("WM: shortcut Super launcher %s\n",WmLauncherVisible()?"open":"closed");
+        break;
+    case GlobalShortcutAction::CloseLauncher:
+        if(WmLauncherVisible())WmLauncherToggle();
+        SerialPuts("WM: shortcut Escape launcher closed\n");
+        break;
+    case GlobalShortcutAction::CloseVolumePopup:WmVolumePopupClose();break;
+    case GlobalShortcutAction::CloseFocusedWindow: {
+        // The same advisory close as the title-bar button and semantic action:
+        // xdg_toplevel.close, WM_DELETE_WINDOW via the XWM, or a native signal.
+        const int cur=WmGetFocusedWindow();
+        Window* w=cur>=0?WmGetWindow(cur):nullptr;
+        if(w && w->proc) {
+            SerialPrintf("WM: shortcut close window %d '%s'\n",cur,w->title);
+            WmRequestCloseWindow(cur);
+        }
+        break;
+    }
+    case GlobalShortcutAction::CycleFocus: {
+        // Send the frontmost window back and focus the next one.
+        int zOrder[WM_MAX_WINDOWS];
+        const uint32_t zCount=WmGetZOrder(zOrder,WM_MAX_WINDOWS);
+        if(zCount>1) {
+            WmSendToBack(zOrder[zCount-1]);
+            WmSetFocus(zOrder[zCount-2]);
+        }
+        break;
+    }
+    case GlobalShortcutAction::SpawnTerminal:WmSpawnTerminal();break;
+    case GlobalShortcutAction::ToggleGlass:WmToggleFocusedWindowGlass();break;
+    }
+    if(r.releasePointer || r.action!=GlobalShortcutAction::None) {
+        CompositorMarkDirty();CompositorWake();
+    }
+}
 
 static void CompositorInputWM()
 {
@@ -2439,6 +2493,21 @@ static void CompositorInputWM()
         const bool captured=WmRouteCapturedPointer(ev);
         CompositorReconcilePointerCapture();
         if(captured)continue;
+        if(ev.type==InputEventType::KeyPress || ev.type==InputEventType::KeyRelease) {
+            if(__atomic_load_n(&g_hardwareProbe,__ATOMIC_ACQUIRE))
+                KPrintf("HWKEY: %s sc=0x%x mods=0x%x\n",
+                        ev.type==InputEventType::KeyPress?"down":"up",ev.scanCode,ev.modifiers);
+            GlobalShortcutContext context{};
+            context.launcherVisible=WmLauncherVisible();
+            context.volumePopupVisible=WmVolumePopupVisible();
+            const GlobalShortcutResult shortcut=g_globalShortcuts.Key(
+                ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
+            CompositorRunShortcut(shortcut);
+            if(shortcut.releasePointer)CompositorReconcilePointerCapture();
+            if(!shortcut.deliver)continue;
+        } else if(ev.type==InputEventType::MouseButtonDown) {
+            g_globalShortcuts.PointerButton();
+        }
         const bool rawRelative=ev.type==InputEventType::MouseRelativeMove;
         const InputEvent raw=ev;
         if(rawRelative)ev.type=InputEventType::MouseMove;
@@ -2615,66 +2684,6 @@ static void CompositorInputWM()
 
         if (ev.type != InputEventType::KeyPress && ev.type != InputEventType::KeyRelease)
             continue;
-
-        if(__atomic_load_n(&g_hardwareProbe,__ATOMIC_ACQUIRE))
-            KPrintf("HWKEY: %s sc=0x%x mods=0x%x\n",
-                    ev.type==InputEventType::KeyPress?"down":"up",ev.scanCode,ev.modifiers);
-        // --- Global hotkeys (work regardless of focus state) ---
-        if (ev.type == InputEventType::KeyPress)
-        {
-            // Escape dismisses the volume popup before focused-window delivery.
-            if (ev.scanCode == 0x01 && WmVolumePopupVisible())
-            {
-                WmVolumePopupClose();
-                continue;
-            }
-            // Alt+Tab — cycle focus to next window by sending current
-            // to back of z-order, then focusing the new top window.
-            if ((ev.modifiers & INPUT_MOD_ALT) && ev.scanCode == 0x0F) // Tab
-            {
-                int zOrder[WM_MAX_WINDOWS];
-                uint32_t zCount = WmGetZOrder(zOrder, WM_MAX_WINDOWS);
-                if (zCount > 1) {
-                    // zOrder is back-to-front: [0]=backmost, [n-1]=frontmost
-                    int topIdx = zOrder[zCount - 1];
-                    WmSendToBack(topIdx);
-                    // Focus the new frontmost (was second from top)
-                    int newTop = zOrder[zCount - 2];
-                    WmSetFocus(newTop);
-                }
-                continue;
-            }
-
-            // Super+Enter — spawn a terminal; leave Ctrl+T to applications.
-            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x1C) // Enter
-            {
-                WmSpawnTerminal();
-                continue;
-            }
-
-            // Super+Q — close focused window
-            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x10) // Q
-            {
-                int cur = WmGetFocusedWindow();
-                if (cur >= 0) {
-                    Window* w = WmGetWindow(cur);
-                    if (w && w->proc) {
-                        WmRequestCloseWindow(cur);
-                    }
-                }
-                continue;
-            }
-
-            // Super+G — toggle frosted-glass on the focused window (a real
-            // per-window option; uses the same per-window opacity+blur the
-            // 0xB00 syscall exposes). Cycles glass on (translucent + backdrop
-            // blur) <-> off (opaque). Only meaningful on the GPU DRAW path.
-            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x22) // G
-            {
-                WmToggleFocusedWindowGlass();
-                continue;
-            }
-        }
 
         // Find the focused window (needed for both press and release)
         Window* focused = nullptr;

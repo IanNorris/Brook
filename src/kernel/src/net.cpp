@@ -6407,6 +6407,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             if (sc == 0x2A) { if (isDown) s_injectMods |= INPUT_MOD_LSHIFT; else s_injectMods &= ~INPUT_MOD_LSHIFT; }
             if (sc == 0x36) { if (isDown) s_injectMods |= INPUT_MOD_RSHIFT; else s_injectMods &= ~INPUT_MOD_RSHIFT; }
             if (sc == 0x38) { if (isDown) s_injectMods |= INPUT_MOD_ALT; else s_injectMods &= ~INPUT_MOD_ALT; }
+            if (sc == SC_LSUPER || sc == SC_RSUPER) { if (isDown) s_injectMods |= INPUT_MOD_SUPER; else s_injectMods &= ~INPUT_MOD_SUPER; }
 
             InputEvent ev = {};
             ev.type = isDown ? InputEventType::KeyPress : InputEventType::KeyRelease;
