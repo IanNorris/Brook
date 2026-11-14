@@ -200,6 +200,9 @@ public:
     void GopObserved(){if(slots_){uncertain_=false;leaving_=true;front_=0;hasArmed_=hasQueued_=hasToArm_=false;}}
 };
 
+// One zero-copy present: request (worker), DSPASURF write and observed latch
+// (TSC; 0 = not reached, e.g. replaced in the mailbox).
+struct BdwZeroCopyTimelineEntry {uint64_t sequence;uint32_t slot,queued;uint64_t presentTsc,armTsc,latchTsc;uint32_t frames;};
 // Per-present diagnostics, reported by "gpu zerocopy status".
 enum class BdwZeroCopyFallback : uint8_t {
     None,NotBuilt,Disarmed,NotRegistered,NotImage,NotWriting,Uncertain,Leaving,PlaneChanged,Bind,Count_

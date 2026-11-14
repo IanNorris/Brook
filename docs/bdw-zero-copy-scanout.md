@@ -194,6 +194,19 @@ A CPU read cannot do this alone: the CPU shares the LLC with the GT, so it alway
 - **`gpu zerocopy verify`** now holds the panel still for the measurement. Presents are accepted and mailboxed but not armed (`BdwZeroCopyRing::PendingArm`, host-tested) until it ends, so the cadence graph no longer makes it inconclusive.
 - **Idle:** the overlay's cadence graph changes with every present, so a frame whose only change is the overlay caused the next one forever. Such frames are now presented at most every 250 ms (`overlay_only_skips` in the desktop stats); scene, client and cursor changes are immediate.
 
+**Gen 380: full-draw feedback loop (my bug, from the cache-mode change).** Presenting the *drawn* regions while zero-copy was active also changed the regions the pipeline carries as the next frame's damage (`base.carry = &pending[older].regions`).
+- **The loop:** one full draw (a new image of unknown age) made the next frame's damage the full screen, and so on.
+- **Armed-run evidence:** `full_draws` +501 against `partial_draws` +40; `presents.full` 250 = `waits_behind_full` 250; `full_forced` only 2.
+- **Effects:**
+  - the compositor job rose to 16.6 ms (WB and WT alike);
+  - flush mode wrote back about 18 MB per present;
+  - the pipeline waited behind a full frame on every other frame, so p50 was 33 ms;
+  - fewer frames were composited (539 against 706 presents).
+- **Fix:** the carried regions stay the frame's own damage; the drawn regions travel separately (`kernelRegions`) to the kernel only.
+- **Timelines added:**
+  - Desktop stats `timeline`: the last 32 frames as `[start, submit, fence, present_call, presented (µs), image, partial, draw_pixels, commit]`.
+  - `gpu zerocopy timeline`: the last 64 presents as `[sequence, image, queued, present_us, arm_us, latch_us, vblanks]`, on the same TSC-based microsecond clock.
+
 ### Present path and fallbacks
 
 `BdwZeroCopyPresentSource(source)` runs after the existing BCS admission. Its outcomes:

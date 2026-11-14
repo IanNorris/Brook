@@ -5750,6 +5750,17 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",\"scope\":\"pipe A CRC (primary plane) of the front image, twice before and twice after a CLFLUSH of every line of it; a change means the display was scanning stale memory. Keep the desktop idle.\"}\n");
             r.send();return;
         }
+        if(NetStrEq(cmd,"gpu zerocopy timeline")){
+            static BdwZeroCopyTimelineEntry entries[64];uint64_t khz=0;
+            const uint32_t n=BdwZeroCopyReadTimeline(entries,64,khz);
+            auto us=[&](uint64_t tsc){return khz && tsc?tsc*1000/khz:0;};
+            BridgeReply r;r.text("{");r.field("count",n);r.text(",\"columns\":[\"sequence\",\"image\",\"queued\",\"present_us\",\"arm_us\",\"latch_us\",\"vblanks\"],\"rows\":[");
+            for(uint32_t i=0;i<n;++i){const auto& e=entries[i];if(i)r.text(",");
+                r.text("[");r.number(e.sequence);r.text(",");r.number(e.slot);r.text(",");r.number(e.queued);r.text(",");
+                r.number(us(e.presentTsc));r.text(",");r.number(us(e.armTsc));r.text(",");r.number(us(e.latchTsc));r.text(",");r.number(e.frames);r.text("]");}
+            r.text("],\"scope\":\"zero-copy presents, oldest first; times are TSC microseconds since boot (CLOCK_MONOTONIC on the Dell uses the same TSC); present=worker present call, arm=DSPASURF write (0 if replaced in the mailbox), latch=first poll that saw it live\"}\n");
+            r.send();return;
+        }
         if(NetStrEq(cmd,"gpu zerocopy arm"))ok=BdwZeroCopyArm(note);
         else if(NetStrEq(cmd,"gpu zerocopy off")){BdwZeroCopyDisarm();note="leaving at the next present";}
         else if(NetStrEq(cmd,"gpu zerocopy uc on") || NetStrEq(cmd,"gpu zerocopy uc off")){
@@ -5758,7 +5769,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             ok=BdwZeroCopySetCacheMode(NetStrEq(cmd,"gpu zerocopy cache uc")?1u:NetStrEq(cmd,"gpu zerocopy cache wt")?2u:0u);
             note=ok?"cache mode applied; each image is flushed in full at its next present":"not built";
         }else if(!NetStrEq(cmd,"gpu zerocopy status")){
-            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|cache flush|cache uc|cache wt\"}\n");return;
+            DebugChannelSend("{\"error\":\"usage: gpu zerocopy arm|off|status|verify|timeline|cache flush|cache uc|cache wt\"}\n");return;
         }
         BdwZeroCopyStatus z{};BdwZeroCopyReadStatus(z);
         BridgeReply r;r.text("{\"ok\":");r.text(ok?"true":"false");r.text(",\"note\":");r.quoted(note);

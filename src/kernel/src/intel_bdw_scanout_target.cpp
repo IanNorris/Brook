@@ -344,6 +344,14 @@ enum : uint32_t {ZcCacheFlush=0,ZcCacheUc=1,ZcCacheWt=2};
 // Default wt (gen 379: equal to uc, no flush cost); flush is opt-in.
 uint32_t zcCacheMode=ZcCacheWt;uint32_t zcFlushedOnce=0;
 bool zcVerifyHold=false; // "gpu zerocopy verify": keep the front image still
+// Per-present timeline (TSC), "gpu zerocopy timeline": present request,
+// DSPASURF write, observed latch. Indexed by present sequence.
+constexpr uint32_t ZcTimelineSize=64;
+BdwZeroCopyTimelineEntry zcTimeline[ZcTimelineSize]{};uint64_t zcSlotSequence[BdwZeroCopyMaxImages+1]{};
+BdwZeroCopyTimelineEntry* ZcTimelineFor(uint32_t slot){
+    if(!slot || slot>BdwZeroCopyMaxImages || !zcSlotSequence[slot])return nullptr;
+    auto& e=zcTimeline[zcSlotSequence[slot]%ZcTimelineSize];return e.sequence==zcSlotSequence[slot]?&e:nullptr;
+}
 
 uint32_t ZcSlotOf(const BdwGpuBuffer* b){
     if(!b)return 0;
@@ -371,7 +379,9 @@ bool ZcArmLocked(uint32_t slot){
     const uint32_t frame=io.read32(BdwFlipRegs::FrameCountA);
     io.write32(BdwFlipRegs::Surface,zcRing.Surface(slot));
     (void)io.read32(BdwFlipRegs::Surface);
-    if(!zcRing.Armed(slot,frame,Rdtsc())){ZcDisableLocked("arm-rejected");return false;}
+    const uint64_t armed=Rdtsc();
+    if(!zcRing.Armed(slot,frame,armed)){ZcDisableLocked("arm-rejected");return false;}
+    if(auto* e=ZcTimelineFor(slot))e->armTsc=armed;
     return true;
 }
 void ZcPollLocked(){
@@ -380,7 +390,9 @@ void ZcPollLocked(){
         const uint32_t frame=Read(BdwFlipRegs::FrameCountA),live=Read(BdwFlipRegs::SurfaceLive);
         BdwFlipLatch latch{};
         switch(zcRing.Poll(frame,live,Rdtsc(),latch)){
-        case BdwFlipPoll::Latched:zcStats.Latch(latch.frames,tscKhz?latch.ticks*1000/tscKhz:0);break;
+        case BdwFlipPoll::Latched:zcStats.Latch(latch.frames,tscKhz?latch.ticks*1000/tscKhz:0);
+            if(auto* e=ZcTimelineFor(latch.slot)){e->latchTsc=Rdtsc();e->frames=latch.frames;}
+            break;
         case BdwFlipPoll::Uncertain:ZcFallback(BdwZeroCopyFallback::Uncertain);ZcDisableLocked("latch-uncertain");return;
         default:return;
         }
@@ -863,6 +875,8 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         ZcDisableLocked("image-busy");outcome=BdwZeroCopyOutcome::RepairRequired;
     }else{
         ++zcStats.presents;
+        {const uint64_t seq=zcRing.Sequence();auto& e=zcTimeline[seq%ZcTimelineSize];
+         e={seq,slot,p==BdwZeroCopyPresent::Queued,Rdtsc(),0,0,0};zcSlotSequence[slot]=seq;}
         if(p==BdwZeroCopyPresent::ArmNow){++zcStats.armedNow;
             if(!zcVerifyHold && !ZcArmLocked(slot))outcome=BdwZeroCopyOutcome::RepairRequired;}
         else ++zcStats.queued;
@@ -938,6 +952,13 @@ bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){
         out.changed?"stale-memory (display saw pixels the CPU flush changed)":"coherent";
     return true;
 }
+uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry* out,uint32_t max,uint64_t& khz){
+    const uint64_t f=IrqSpinLockAcquire(&lock);khz=tscKhz;
+    const uint64_t last=zcRing.Sequence();uint32_t n=0;
+    for(uint64_t s=last>=ZcTimelineSize?last-ZcTimelineSize+1:1;s<=last && n<max;++s){
+        const auto& e=zcTimeline[s%ZcTimelineSize];if(e.sequence==s)out[n++]=e;}
+    IrqSpinLockRelease(&lock,f);return n;
+}
 bool BdwZeroCopyArm(const char*& reason){
     if(!BdwBcsScanoutEnabled()){reason="bcs-present-disabled";return false;}
     {const uint64_t f=IrqSpinLockAcquire(&lock);
@@ -983,6 +1004,7 @@ bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
+uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
@@ -1001,6 +1023,7 @@ bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
+uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
@@ -1030,6 +1053,7 @@ bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
+uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}

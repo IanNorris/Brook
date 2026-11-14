@@ -73,6 +73,10 @@ struct PendingDesktopFrame {
     long ticket;uint64_t frame,started,nextReport,skippedBytes;uint32_t width,height,visible,skippedLayers;unsigned direct;
     int partial,graphics,quad,compositionReady;struct BrookGpuPresentRegions regions;struct DesktopDamageState damage;
     int ringImage; /* 1 + ring image in flight for this frame, 0 = none */
+    /* Regions handed to the kernel when they differ from the frame's own
+     * damage (zero-copy: everything drawn into the image). */
+    struct BrookGpuPresentRegions kernelRegions;int hasKernelRegions;
+    uint64_t presentCallNs,drawPixels;int drawPartial;
     /* Pipelined: an older in-flight frame failed, so this frame's success
      * must not re-establish the change-tracking baseline. */
     int tainted;
@@ -148,6 +152,7 @@ static void source_close(int drm,struct Source *s);
  * renderer exits so the supervisor restarts it. Process exit is the kernel's
  * designed recovery: it quarantines or reclaims any in-flight GPU work and
  * the buffers it references, so nothing is freed under the device. */
+static uint64_t plan_draw_pixels(const struct QuadPlan *plan){return plan?plan->pixelsShaded:0;}
 static void renderer_exit_for_restart(const char *cause,long detail){
     fprintf(stderr,"DESKTOP_RENDERER_EXIT_FOR_RESTART cause=%s detail=%ld\n",cause,detail);
     fflush(stderr);_exit(76);
@@ -158,6 +163,13 @@ static unsigned g_scanoutImages;
 static const char *g_failStage="none";
 #define DESKTOP_OVERLAY_ONLY_NS 250000000ull
 static uint64_t g_lastOverlayOnlyNs,g_overlayOnlySkips;
+/* Per presented frame timeline (CLOCK_MONOTONIC us; on the Dell the same TSC
+ * as the kernel's "gpu zerocopy timeline"): start, quad submit, fence,
+ * present call, present done; ring image, drawn partial/full, drawn pixels,
+ * newest game commit sampled. */
+enum { DESKTOP_TIMELINE=32 };
+struct DesktopTimelineRow {uint64_t start,submit,fence,presentCall,presented,commit,drawPixels;int image,partial;};
+static struct DesktopTimelineRow g_timeline[DESKTOP_TIMELINE];static uint64_t g_timelineCount;
 /* Zero-copy active at the last pick: presents then name every region drawn
  * into the image (own damage plus buffer-age repair), which the kernel's
  * "flush" cache mode writes back before scanning the image out. */
@@ -727,7 +739,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
     BrookVkResult status=BROOK_VK_REJECTED;int testArmed=0,graphicsUsed=0,quadUsed=0;uint32_t traceLayers=count;
     uint32_t statsDraws=0;uint64_t statsShaded=0;
-    struct BrookGpuPresentRegions regionBatch={0};
+    struct BrookGpuPresentRegions regionBatch={0},kernelRegions={0};int hasKernelRegions=0;
     /* Zero-copy ring: draw into a free image; it must end up complete, so
      * the draw covers this frame's damage plus every change since the image
      * last held a frame (buffer age). Presents still name only this frame's
@@ -799,12 +811,23 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                  * frame's own (aligned) changes; they were drawn too. */
                 struct DesktopDamageSet presentDamage=damage,ownAligned;
                 if(rebased && own.count && desktop_graphics_damage(&own,width,height,&ownAligned))presentDamage=ownAligned;
-                if(ringImage>=0 && g_scanoutActive)
-                    presentDamage=ringDrawPartial?ringDraw:(struct DesktopDamageSet){1,{{0,0,width,height}}};
                 if(qpartial){regionBatch.count=presentDamage.count;
                     for(uint32_t i=0;i<presentDamage.count;++i){const struct DesktopDamageRect *r=&presentDamage.rects[i];
                         regionBatch.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,
                             (uint32_t)r->left,(uint32_t)r->top,(uint32_t)(r->right-r->left),(uint32_t)(r->bottom-r->top),width,0};}
+                    /* Zero-copy: the kernel is told every region drawn into the
+                     * image (own damage plus buffer-age repair) so its "flush"
+                     * mode writes them all back. regionBatch keeps the frame's
+                     * own damage: the pipeline carries it as the next frame's
+                     * damage, and carrying the repair (or a full draw) made
+                     * every other frame full (gen 380). */
+                    if(ringImage>=0 && g_scanoutActive){
+                        const struct DesktopDamageSet drawn=ringDrawPartial?ringDraw:(struct DesktopDamageSet){1,{{0,0,width,height}}};
+                        kernelRegions.count=drawn.count;hasKernelRegions=1;
+                        for(uint32_t i=0;i<drawn.count;++i){const struct DesktopDamageRect *r=&drawn.rects[i];
+                            kernelRegions.regions[i]=(struct BrookGpuPresentRegion){((uint64_t)r->top*width+(uint64_t)r->left)*4u,
+                                (uint32_t)r->left,(uint32_t)r->top,(uint32_t)(r->right-r->left),(uint32_t)(r->bottom-r->top),width,0};}
+                    }
                 }
             }else{
                 ++g_quadFallback;
@@ -964,6 +987,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
             .skippedBytes=skippedBytes,.width=width,.height=height,.visible=layers.count,.skippedLayers=skipped,.direct=frameDirect,
             .partial=attemptPartial,.graphics=graphicsUsed,.quad=quadUsed,.regions=regionBatch,.ringImage=ringImage+1,
+            .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,
+            .drawPixels=quadUsed?plan_draw_pixels(ctx->plan):0,.drawPartial=ringImage>=0?ringDrawPartial:attemptPartial,
             .statsLayers=traceLayers,.statsDraws=statsDraws,.statsShaded=statsShaded,.statsDamage=statsDamage,
             .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
@@ -1020,7 +1045,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     stage=attemptPartial?"region_present":"full_present";
     presentStartNs=monotonic_ns();
     if(attemptPartial){regionBatch.ticket=(uint64_t)ticket;
-        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
+        if(hasKernelRegions)kernelRegions.ticket=(uint64_t)ticket;
+        if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,hasKernelRegions?&kernelRegions:&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
     }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
     desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){frameSources,layers.count,frameDirect,attemptPartial,graphicsUsed,
@@ -1146,10 +1172,10 @@ static int submit_present(struct PendingDesktopFrame *p){
         if(getenv("BROOK_RENDER_ASYNC_TRACE"))fprintf(stderr,"DESKTOP_ASYNC_STALE_CPU ticket=%ld\n",p->ticket);
         errno=ESTALE;return -1;
     }
-    p->regions.ticket=(uint64_t)p->ticket;
+    p->regions.ticket=(uint64_t)p->ticket;p->kernelRegions.ticket=(uint64_t)p->ticket;p->presentCallNs=monotonic_ns();
     if(p->partial){
         const long op=g_asyncPresent?BROOK_GPU_HANDOFF_QUEUE_REGIONS:BROOK_GPU_HANDOFF_PRESENT_REGIONS;
-        return (int)syscall(BROOK_SYS_GPU_HANDOFF_CTL,op,&p->regions,0,0,0,0);
+        return (int)syscall(BROOK_SYS_GPU_HANDOFF_CTL,op,p->hasKernelRegions?&p->kernelRegions:&p->regions,0,0,0,0);
     }
     if(!g_asyncPresent)return present_full((uint64_t)p->ticket,p->width,p->height);
     struct BrookGpuPresentFrame frame={(uint64_t)p->ticket,p->width,p->height,p->width,0};
@@ -1212,6 +1238,9 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
             desktop_async_damage_retire(displayedDamage,p->damage,p->partial,0);
         (void)syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_RELEASE,p->ticket,0,0,0,0);}
     desktop_gpu_channel_finish(&g_gpuChannel,p->frame);
+    if(!result){struct DesktopTimelineRow *t=&g_timeline[g_timelineCount++%DESKTOP_TIMELINE];
+        *t=(struct DesktopTimelineRow){p->traceStart,p->statsSubmitStart,p->statsFence,p->presentCallNs,*presented,
+            p->direct?p->traceCommit:0,p->drawPixels,p->ringImage-1,p->drawPartial};}
     if(p->ringImage){desktop_scanout_ring_end(&g_ring,(unsigned)(p->ringImage-1));p->ringImage=0;}
     if(!result && p->graphics && getenv("BROOK_RENDER_GRAPHICS_TIMING") && p->traceStart && p->traceSubmitStart &&
        p->traceSubmitStart>=p->traceStart && p->started>=p->traceSubmitStart && p->traceCompleted>=p->started && *presented>=p->traceCompleted){
@@ -1258,7 +1287,8 @@ static void stats_publish(uint64_t now){
     const struct DesktopStatsMeta meta={++g_statsOutput.seq,now,g_statsOutput.startedNs,g_statsOutput.failures,(long)getpid(),
         g_statsOutput.depth,g_asyncPresent,getenv("BROOK_RENDER_GPU_TIMESTAMPS")!=NULL,g_pipeline};
     size_t length=desktop_stats_format(&g_stats,&meta,g_statsJson,sizeof(g_statsJson));
-    /* Zero-copy ring counters, spliced in before the closing brace. */
+    /* Zero-copy ring counters and the frame timeline, spliced in before the
+     * closing brace. */
     if(length){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
         if(end){char tail[512];
@@ -1268,6 +1298,19 @@ static void stats_publish(uint64_t now){
                 (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
                 (unsigned long long)g_overlayOnlySkips);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
+            /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
+            char rows[DESKTOP_TIMELINE*120+64];size_t used=0;
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
+            const uint64_t first=g_timelineCount>DESKTOP_TIMELINE?g_timelineCount-DESKTOP_TIMELINE:0;
+            for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-128;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
+                used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s[%llu,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu]",k>first?",":"",
+                    (unsigned long long)(t->start/1000),(unsigned long long)(t->submit/1000),(unsigned long long)(t->fence/1000),
+                    (unsigned long long)(t->presentCall/1000),(unsigned long long)(t->presented/1000),t->image,t->partial,
+                    (unsigned long long)t->drawPixels,(unsigned long long)t->commit);}
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"]}\n");
+            /* replace the final "}\n" of the spliced block with the timeline */
+            if(length>=2 && g_statsJson[length-2]=='}' && length-2+used<sizeof(g_statsJson)){
+                memcpy(g_statsJson+length-2,rows,used);length=length-2+used;}
         }
     }
     const int fd=length?open(g_statsOutput.temporary,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644):-1;

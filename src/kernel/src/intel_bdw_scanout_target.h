@@ -96,6 +96,8 @@ struct BdwZeroCopyStatus {
     bool uncachedRender;uint64_t renderJobsUc,renderJobsWb;
 };
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out);
+// Copies up to max recent timeline entries, oldest first; khz converts TSC.
+uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry* out,uint32_t max,uint64_t& khz);
 // Syscall context: hand the retained images to a restarted renderer. On 0
 // out[0..count) carry a reference each (the caller publishes fds and drops
 // them). -2 none registered, -1 not the attached owner, -16 still in use.
