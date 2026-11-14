@@ -1,5 +1,6 @@
 #ifndef BROOK_SURFACE_SCENE_H
 #define BROOK_SURFACE_SCENE_H
+#include "surface-blit.h"
 /* Single-threaded Wayland adapter. Pixel contents are immutable. The optional
  * GPU storage cache can migrate only after a verified clone; scene snapshots
  * retain logical images and never retain producer resource numbers alone. */
@@ -8,6 +9,9 @@ struct brook_image {
     unsigned refs;
     uint32_t width,height,format;
     uint32_t *pixels;
+    /* Every pixel has alpha 255 (XRGB SHM snapshots force it), so CPU
+     * composition may copy instead of blending. */
+    int opaque;
     struct brook_buffer *source;
     struct brook_scene_owner *owner;
     uint64_t version;
@@ -54,7 +58,7 @@ static struct brook_image *image_snapshot(const uint8_t *src,int w,int h,int str
     struct brook_image *image=calloc(1,sizeof(*image));if (!image) return NULL;
     image->pixels=malloc((size_t)w*h*4);
     if (!image->pixels) { free(image);return NULL; }
-    image->refs=1;image->width=w;image->height=h;image->format=format==WL_SHM_FORMAT_ARGB8888?1:2;
+    image->refs=1;image->width=w;image->height=h;image->format=format==WL_SHM_FORMAT_ARGB8888?1:2;image->opaque=image->format==2;
     for (int y=0;y<h;++y) {
         const uint32_t *row=(const uint32_t *)(src+(size_t)y*stride);
         uint32_t *out=image->pixels+(size_t)y*w;
@@ -220,7 +224,8 @@ static int surface_layers(struct brook_surface *root,struct brook_draw *draw,uns
     }
     return 1;
 }
-static uint32_t pixel_over(uint32_t src, uint32_t dst) {
+/* Reference implementations, kept for tests; composition uses surface-blit.h. */
+__attribute__((unused)) static uint32_t pixel_over(uint32_t src, uint32_t dst) {
     unsigned a = src >> 24, inv = 255 - a;
     if (a == 255) return src;
     if (!a) return dst;
@@ -231,7 +236,7 @@ static uint32_t pixel_over(uint32_t src, uint32_t dst) {
     }
     return out;
 }
-static uint32_t pixel_straight(uint32_t px) {
+__attribute__((unused)) static uint32_t pixel_straight(uint32_t px) {
     unsigned a = px >> 24;
     if (!a || a == 255) return a ? px : 0;
     uint32_t out = px & 0xff000000u;
@@ -323,8 +328,7 @@ static int surface_render(struct brook_surface *root) {
            g->w*scale==image->width && g->h*scale==image->height &&
            root->vfb_w==image->width && root->vfb_h==image->height){
             writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
-            for(unsigned y=0;y<root->vfb_h;++y)for(unsigned x=0;x<root->vfb_w;++x)
-                root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(image->pixels[(size_t)y*image->width+x]);
+            brook_straight_rows(root->vfb,root->vfb_stride,image->pixels,image->width,root->vfb_w,root->vfb_h);
             goto publish;
         }
     }
@@ -345,19 +349,15 @@ static int surface_render(struct brook_surface *root) {
         if (!image->pixels) return 0; // Never read back a GPU producer as a fallback.
         int64_t dx=d->x*scale,dy=d->y*scale;
         struct brook_geometry physical=*g;physical.w*=scale;physical.h*=scale;
-        int64_t x0=dx<0?-dx:0,y0=dy<0?-dy:0,x1=physical.w,y1=physical.h;
-        if (dx+x1>root->vfb_w) x1=(int64_t)root->vfb_w-dx;
-        if (dy+y1>root->vfb_h) y1=(int64_t)root->vfb_h-dy;
-        for (int64_t y=y0;y<y1;++y) for (int64_t x=x0;x<x1;++x) {
-            uint32_t *out=&root->composite[(size_t)(dy+y)*root->vfb_w+dx+x];
-            uint32_t px,py;brook_geometry_pixel(&physical,image->width,image->height,x,y,&px,&py);
-            *out=pixel_over(image->pixels[(size_t)py*image->width+px],*out);
-        }
+        /* Bit-exact with pixel_over over brook_geometry_pixel samples; see
+         * surface-blit.h. The first layer lands on the cleared composite. */
+        unsigned flags=(image->opaque?BROOK_BLIT_OPAQUE:0)|(i==0?BROOK_BLIT_DST_CLEAR:0);
+        if (!brook_blit_draw(root->composite,root->vfb_w,root->vfb_h,&physical,image->pixels,
+                             image->width,image->height,dx,dy,flags)) return 0;
     }
     }
     writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
-    for (unsigned y=0;y<root->vfb_h;++y) for (unsigned x=0;x<root->vfb_w;++x)
-        root->vfb[(size_t)y*root->vfb_stride+x]=pixel_straight(root->composite[(size_t)y*root->vfb_w+x]);
+    brook_straight_rows(root->vfb,root->vfb_stride,root->composite,root->vfb_w,root->vfb_w,root->vfb_h);
 publish:;
     int tagged=0;
 #ifdef BROOK_WAYLAND_SOURCE_COMMIT_TAG
