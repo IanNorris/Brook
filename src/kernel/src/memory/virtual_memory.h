@@ -143,50 +143,27 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snap
 bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& identity,KernelAliasMapping& direct);
 // Locked diagnostic page-table walk for a kernel virtual address.
 bool VmmInspectKernelAddress(uint64_t address,KernelAliasMapping& mapping);
-// Restricted Dell diagnostic; caller must enforce audited opt-in, firmware,
-// boot-map and PCI preconditions before entering this critical section.
-bool VmmDellI2cIdCriticalRead(uint32_t& value);
-struct DellGpuVtdStatus;
-// Internal diagnostic only. Caller must prove exact PCI identity, one unique
-// audited DMAR for this boot, no conflicting resources across the register
-// page, and an opted-in single BSP attempt. Output is unchanged on failure.
-bool VmmDellGpuVtdCriticalRead(DellGpuVtdStatus& status);
-struct BdwGopPtePlan;struct BdwGopPtes;
-struct BdwDisplaySnapshot;
-bool VmmDellDisplayCriticalRead(BdwDisplaySnapshot& result);
-// Caller proves audited Dell/GOP identity, BAR extents, GPU D0 and opt-in.
-bool VmmDellGopPtesCriticalRead(const BdwGopPtePlan& plan,BdwGopPtes& result);
-bool VmmDellGopBackingPage(uint32_t first,uint32_t count,uint64_t& physicalBase);
-struct BdwGgttReservedPtes;
-struct BdwGgttSurvey;
-bool VmmDellGgttSurveyCriticalRead(uint32_t first,BdwGgttSurvey& result);
-bool VmmDellReservedGgttCriticalRead(uint32_t first,BdwGgttReservedPtes& result);
-// Caller proves audited Dell identity, BAR extent, D0 and opt-in.
-bool VmmDellForcewakeAckCriticalRead(uint32_t& value);
-struct BdwForcewakeAdapterResult;
-struct BdwPatTestResult;
-struct BdwBcsRunResult;
-struct BdwRcsResetTestResult;
-struct BdwRenderGtInitResult;
-struct BdwRenderRunResult;
-void VmmDellRenderRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,
-                      uint32_t (&snapshot)[20*1024],BdwForcewakeAdapterResult& result,BdwRenderRunResult& render);
-void VmmDellRenderGtInit(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRenderGtInitResult& init);
-void VmmDellRcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset);
-void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
-#if defined(BROOK_SSD_AUTO_RECOVERY)
-void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
-#endif
-void VmmDellForcewakePatTest(uint32_t khz,BdwForcewakeAdapterResult& result,BdwPatTestResult& pat);
-void VmmDellForcewakeCriticalRun(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines=false,bool patRequested=false,bool tlbRequested=false,bool resetRequested=false,bool scopeCheck=false);
-struct BdwScratchTakeoverResult;
-// Caller pins the exact scratch page/range and establishes device admission;
-// an attempted PTE write leaves both pinned, even if this returns failure.
-void VmmDellForcewakeScratchRun(uint32_t khz,uint32_t index,uint64_t dma,BdwForcewakeAdapterResult& result,BdwScratchTakeoverResult& scratch);
-void VmmDellForcewakeClearStale(uint32_t khz,uint64_t expected,BdwForcewakeAdapterResult& result,BdwScratchTakeoverResult& clear);
-struct BdwBcsInitResult;
-void VmmDellForcewakeBcsInit(uint32_t khz,uint32_t index,uint64_t dma,uint8_t* cpu,
-                             BdwForcewakeAdapterResult& result,BdwBcsInitResult& init);
+// Kernel page-table critical section for device MMIO through the direct map.
+// Enter acquires the kernel page-table lock with interrupts disabled and
+// returns the saved RFLAGS; Exit releases the lock and restores that state.
+// While held, no kernel mapping can change, so a direct-map alias audited
+// inside the section stays valid until Exit. A caller may Exit and re-Enter
+// (for example to sleep), but must re-audit every alias before touching the
+// device again. Callers must not nest or call other Vmm locking functions.
+// The call site is recorded for lock diagnostics, as IrqSpinLockAcquire does.
+uint64_t VmmKernelPtCriticalEnter(const char* file=__builtin_FILE(),uint32_t line=__builtin_LINE());
+void VmmKernelPtCriticalExit(uint64_t irq);
+// Run f() inside one critical section and return its result.
+template<class F> bool VmmWithKernelPtCritical(F f,const char* file=__builtin_FILE(),uint32_t line=__builtin_LINE()) {
+    const uint64_t irq=VmmKernelPtCriticalEnter(file,line);
+    const bool ok=f();
+    VmmKernelPtCriticalExit(irq);return ok;
+}
+// Requires the critical section. Walks the kernel root for the identity and
+// direct-map aliases of an aligned physical page, and the active root for its
+// direct-map alias. False unless the active root is the kernel root and every
+// walk succeeds; walks after the first failure leave their outputs unchanged.
+bool VmmKernelPtAuditPage(uint64_t page,KernelAliasMapping& identity,KernelAliasMapping& direct,KernelAliasMapping& current);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.

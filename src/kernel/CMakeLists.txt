@@ -394,6 +394,8 @@ add_executable(kernel
     "${BROOK_ROOT}/src/modules/sched_rr.cpp"
     # Memory subsystem
     src/memory/virtual_memory.cpp
+    # Dell/Broadwell GPU work inside the VMM kernel page-table critical section
+    src/intel_bdw_critical.cpp
     src/memory/physical_memory.cpp
     src/memory/heap.cpp
     src/ksym_addrs.cpp

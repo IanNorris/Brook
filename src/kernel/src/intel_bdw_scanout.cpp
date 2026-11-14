@@ -11,6 +11,7 @@
 #include "intel_bdw_render_gt_init.h"
 #include "native_tsc_observe.h"
 #include "memory/virtual_memory.h"
+#include "intel_bdw_critical.h"
 #include "memory/heap.h"
 #include "acpi.h"
 #include "smp.h"

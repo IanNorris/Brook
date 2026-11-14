@@ -20,6 +20,7 @@
 #include "intel_bdw_csb.h"
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
+#include "intel_bdw_critical.h"
 #include "memory/heap.h"
 #include "intel_vtd_observe.h"
 #include "smp.h"

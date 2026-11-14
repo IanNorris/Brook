@@ -4,6 +4,7 @@
 #include "acpi.h"
 #include "boot_protocol/boot_protocol.h"
 #include "memory/virtual_memory.h"
+#include "intel_bdw_critical.h"
 #include "smp.h"
 #include "vfs.h"
 #include "serial.h"

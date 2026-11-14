@@ -8,6 +8,7 @@
 #include "intel_vtd_observe.h"
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
+#include "intel_bdw_critical.h"
 #include "panic_test_reset.h"
 #include "smp.h"
 #include "profiler.h"

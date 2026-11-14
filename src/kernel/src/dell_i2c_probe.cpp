@@ -4,6 +4,7 @@
 #include "pci.h"
 #include "vfs.h"
 #include "memory/virtual_memory.h"
+#include "intel_bdw_critical.h"
 namespace brook {
 namespace {
 DellI2cIdOneShot once;
