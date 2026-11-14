@@ -4,6 +4,17 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 
 _Last updated: 14 November 2026, by a Claude Code session started after the Codex agent was retired._
 
+## Workspace
+
+- **Root:** `/data/Programming/Brook/`. `main/` is a fresh GitHub clone kept on `main`. Each agent or task gets its own worktree, `git worktree add ../<task> -b <branch>`, with its own `build/`. Never share a build directory or drive the Dell from two agents at once.
+- **Shared private assets:** `/data/Programming/Brook/shared/dell/` (mode 700, never commit), with `SHA256SUMS`:
+  - `hardware-update-key`;
+  - `source-initrd-cc876d82.img`;
+  - `rollback-gen355/` (the known-good pair);
+  - `quake-probe-bundle.tar` (demo timing script, swap trace library and paks).
+- **Legacy checkout:** `/data/Programming/Codex/Brook` and its `build/hardware/` evidence are reference only. Old disk images are being cleaned up separately.
+- **Build:** `nix-shell --run './scripts/build.sh Release'` from a clean checkout, then `ctest --test-dir build/release/host_tests`. `test_audio_delivery` can time out under parallel load; rerun it alone.
+
 ## Repository
 
 - Work from `main` (`dc12f39e` at the time of writing). On 13 November at about 23:31 UTC it absorbed both lines of the previous agent's work: the main checkout's long-uncommitted changes (`d6724e11`), and the private checkout `/tmp/brook-main-BrURO4` (`dcb99b97`, `bd0ae24b`).
@@ -11,7 +22,29 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - The detached worktrees `Brook-gpu-lock-control`, `Brook-pre-timing-7d005ae0` and `Brook-timing-bisect`, and `/tmp/brook-main-BrURO4`, are historical. Their contents are in main. Do not develop in them.
 - The `build/` tree holds hundreds of GB, mostly disk images. Never copy it wholesale.
 
-## Immediate goal: 60 fps displayed on the Dell
+## Active goal (set 14 November 2026)
+
+**Reach at least 60 distinct displayed frames/s for the matched yquake2 GL3 demo on the Dell's GPU desktop, with the panel, recovery paths and normal boot intact.** Work through the milestones in order, iterating as the measurements direct. Ian has authorized autonomous iteration, including Dell reboots and AC power cycling. Stop when the goal is verified, or when a decision needs Ian.
+
+| # | Milestone | State |
+|---|---|---|
+| 0a | Clean workspace builds from a fresh clone (`d668a832`) | done |
+| 0b | Move the Dell GPU critical-section code out of `memory/virtual_memory.cpp` into the Intel driver (pure move: same lock and IRQ behaviour) | todo |
+| 0c | Scripted, reproducible Dell image build from source (`scripts/` and assets in `/data/Programming/Brook/shared/dell`) | todo |
+| M0 | Diagnostics: distinct displayed-frame counter, BCS stage timing, per-class worker busy time, compositor job split by direct layer, plus anything else missing | todo |
+| M2 | Release the previous client buffer as soon as the compositor has consumed it; remove the CPU copies on the GPU path (waylandd snapshot); present-driven frame callbacks; drop the 8-buffer workaround | todo |
+| — | Close the Kernel Console at startup on the GPU desktop (no CPU console writes) and add a network up/down indicator near the taskbar clock | todo |
+| M1 | Composition as per-layer scissored quads with sampler scaling and occlusion | todo |
+| M4a | Wake the submission worker on submit and present, with fence wait queues instead of 1 ms sleeps | todo |
+| M3 | Page flip (DSPASURF) instead of the BCS copy, or a cheap persistent GOP map if M0 shows the copy is small | todo |
+| M5 | Deferred: PPGTT residency, persistent contexts, interrupts | backlog |
+
+Ian's direction (14 Nov):
+- Don't use extra client buffers. Relinquish the earlier buffer once the OS has consumed it.
+- Eliminate CPU copies in the pipeline.
+- Avoid CPU writes for the kernel shell in GPU mode. Transparent rendering interfaces can come later.
+
+## Background: 60 fps displayed on the Dell
 
 Target: at least 60 **displayed** frames/s for the yquake2 GL3 matched demo (1280×720 window, uncapped, 600 records) on the Dell's HD Graphics 5500. This is the first step toward smooth games and video on the Dell, with Steam and Stardew to follow.
 
@@ -75,5 +108,9 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+
+- **Split `src/kernel/src/syscall.cpp`** (17k lines) by area: memory, files, process/signal, sockets, epoll/timers and Brook-specific.
+- **Remove or declare the twelve orphaned `tools/netsurf-build/*` gitlinks** (they have no `.gitmodules` entries).
+- **Transparent kernel rendering interfaces,** so console and shell output uses the GPU path.
 
 Smooth Chromium/YouTube playback (about 90% frame drops at 720p60), a Dell Steam client launch with audio, the bridge-loss watchdog (design only), the Xwayland `setitimer` interface, and promotion of the patched Iris build to the default launcher.
