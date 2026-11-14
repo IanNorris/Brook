@@ -4,6 +4,8 @@
 #include "cpu.h"
 #include "module.h"
 #include "intel_bdw_scanout.h"
+#include "scheduler.h"
+#include "smp.h"
 
 extern "C" uint8_t __text_start[], __kernel_end[];
 
@@ -15,6 +17,8 @@ bool BdwRetireRetainedRenderAfterReset(BdwRenderExecutionBackend&) {return false
 bool BdwRunRebasedRender(BdwRenderExecutionBackend&,uint64_t,BdwRenderRunResult&) {return false;}
 bool BdwCopyRetainedRenderContext(BdwRenderExecutionBackend&,uint32_t (&)[20*1024]) {return false;}
 bool BdwCopyRebasedRenderContext(BdwRenderExecutionBackend&,uint32_t (&)[20*1024]) {return false;}
+// Single-CPU harness; GPU polling paths that sleep are unreachable without hardware.
+uint32_t SmpCurrentCpuIndex() {return 0;}
 bool ModuleRetainAddresses(const uintptr_t* addresses, uint32_t count)
 {
     if (!addresses || !count) return false;
@@ -31,6 +35,7 @@ bool AcpiClassifyBootRange(uint64_t, uint32_t, BootResourceClassification& resul
 }
 }
 
+extern "C" void SchedulerSleepMs(uint32_t) {}
 extern "C" bool CpuWriteCombiningReady() { return false; }
 bool CpuPrepareFramebufferWc(uint64_t, uint64_t) { return false; }
 bool CpuObserveMemoryTypes(uint64_t, uint64_t, brook::CpuMemoryTypeObservation& out)

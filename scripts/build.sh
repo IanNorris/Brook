@@ -63,10 +63,12 @@ echo "Building host tests..."
 HOST_TEST_DIR="${BUILD_DIR}/host_tests"
 mkdir -p "${HOST_TEST_DIR}"
 HOST_COMPILER="${HOST_CXX:-${CXX:-c++}}"
+HOST_C_COMPILER="${HOST_CC:-${CC:-cc}}"
 if cmake \
     -S "${ROOT_DIR}/src/tests/host" \
     -B "${HOST_TEST_DIR}" \
     -DCMAKE_CXX_COMPILER="${HOST_COMPILER}" \
+    -DCMAKE_C_COMPILER="${HOST_C_COMPILER}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DBROOK_ROOT="${ROOT_DIR}" \
     -G Ninja >"${HOST_TEST_DIR}/configure.log" 2>&1
