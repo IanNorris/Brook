@@ -136,6 +136,8 @@ pkgs.stdenv.mkDerivation {
     ./brook-desktop-source-size-policy-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_content_layer_test.c -o brook-desktop-content-layer-test
     ./brook-desktop-content-layer-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_client_cache_test.c -o brook-desktop-client-cache-test
+    ./brook-desktop-client-cache-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_chrome_spans_test.c -o brook-desktop-chrome-spans-test
     ./brook-desktop-chrome-spans-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_fence_recovery_test.c -o brook-desktop-fence-recovery-test

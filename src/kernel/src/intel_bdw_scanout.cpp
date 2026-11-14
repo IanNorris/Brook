@@ -1,5 +1,6 @@
 #include "intel_bdw_worker_overhead.h"
 #include "intel_bdw_scanout.h"
+#include "intel_bdw_node_cache.h"
 #include "intel_bdw_prompt_wake.h"
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
@@ -735,12 +736,15 @@ bool BdwRenderExperimentEnabled(){
     return BdwStoreProbeEnabled() && runtimeBootOptions.renderExperiment;
 }
 #endif
+static BdwNodeCache g_intelNodeCache{};
+BdwNodeCache& BdwIntelNodeCache(){return g_intelNodeCache;}
 bool BdwIntelUserNodeEnabled(){
 #if defined(BROOK_SSD_AUTO_RECOVERY)
     if(!PanicRecoveryResetArmed() || !observation.inventory || !observation.planned || !runtimeBootOptions.intelNode)return false;
-    for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))return false;
-        const auto& d=entry.device;if(d.bus==0 && d.dev==2 && d.fn==0)return LiveGpuMatches(entry) && PowerD0(d);}
-    return false;
+    return BdwNodeCachedCheck(g_intelNodeCache,ApicTickCount(),[]{
+        for(uint32_t i=0;i<PciBootInventoryCount();++i){PciBootEntry entry{};if(!PciBootInventoryRead(i,&entry))return false;
+            const auto& d=entry.device;if(d.bus==0 && d.dev==2 && d.fn==0)return LiveGpuMatches(entry) && PowerD0(d);}
+        return false;});
 #else
     return false;
 #endif
