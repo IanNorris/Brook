@@ -928,6 +928,7 @@ target_compile_options(test_intel_bdw_buffer PRIVATE -UNDEBUG "-iquote${BROOK_RO
 add_host_test(test_intel_bdw_render_gt_init)
 target_compile_options(test_intel_bdw_render_gt_init PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_submission)
+add_host_test(test_intel_bdw_worker_stats)
 target_compile_options(test_intel_bdw_submission PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_oneshot)
 target_compile_options(test_intel_bdw_oneshot PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")

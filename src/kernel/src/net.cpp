@@ -5,6 +5,10 @@
 #include "syscall_timing.h"
 #include "sched_decision_trace.h"
 #include "intel_bdw_submission_timing.h"
+#include "intel_bdw_worker_stats.h"
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+#include "native_tsc_observe.h"
+#endif
 #include "bridge_reply.h"
 #include "debug_hardware.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -5653,6 +5657,53 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             if(i)row.text(",");row.text("{");row.field("count",b.count);row.text(",");row.field("total_us",b.totalUs);
             row.text(",");row.field("max_us",b.maxUs);row.text(",");row.field("total_pages",b.totalPages);row.text("}");row.send();}
         DebugChannelSend("],\"scope\":\"queue, device sync, preparation including device sync, device including reset, retirement, CPU sync, admission lock wait, snapshot build, WRITE pages, ASYNC pages, GT init, PAT setup, render run, context save, reset and unbind, PAT restore, issue to breadcrumb observation, breadcrumb observation to context retirement, unique buffer-object pages, repeated buffer-object pages; duplicate counts are within a submission and do not detect distinct objects aliasing pages; WRITE/ASYNC are overlapping hints, not access directions; later intervals nest inside device and render run; observed times include polling and scheduling, not GPU timestamps; cross-CPU TSC requires validation\"}\n");
+#else
+        DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(NetStrEq(cmd,"gpu worker stats") || NetStrEq(cmd,"gpu worker stats reset")) {
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+        if(NetStrEq(cmd,"gpu worker stats reset")){
+            BdwWorkerStatsReset();DebugChannelSend("{\"reset\":\"requested\",\"scope\":\"applied at the worker's next boundary, within about 1 ms when idle\"}\n");return;
+        }
+        BdwWorkerStats s{};
+        if(!BdwWorkerStatsRead(s)){DebugChannelSend("{\"error\":\"worker stats busy\"}\n");return;}
+        const auto& tsc=NativeTscObserveRead();
+        const uint64_t khz=tsc.capable && tsc.measured && tsc.consistent?tsc.khz:0;
+        auto us=[khz](uint64_t ticks){return BdwWorkerTicksToUs(ticks,khz);};
+        BridgeReply r;r.text("{");r.field("khz",khz);r.text(",");r.field("elapsed_us",us(s.elapsedTicks));
+        r.text(",");r.field("resets",s.resets);r.text(",\"class\":{");
+        const char* classes[]={"app","compositor","present","other","idle"};
+        for(unsigned i=0;i<BdwWorkerClassCount;++i){const auto& c=s.classes[i];
+            if(i)r.text(",");r.text("\"");r.text(classes[i]);r.text("\":[");
+            r.number(c.count);r.text(",");r.number(us(c.ticks));r.text(",");r.number(us(c.maxTicks));r.text("]");}
+        r.text("},\"present\":{");r.field("failed",s.presentFailed);
+        const char* kinds[]={"full","partial"};
+        for(unsigned k=0;k<2;++k){
+            r.text(",\"");r.text(kinds[k]);r.text("\":{");r.field("count",s.present[k][BdwPresentTotal].count);
+            r.text(",");r.field("pixels",s.presentPixels[k]);
+            const char* stages[]={"prepare","device","blit","retire","total"};
+            for(unsigned i=0;i<BdwPresentStageCount;++i){const auto& b=s.present[k][i];
+                r.text(",\"");r.text(stages[i]);r.text("\":[");r.number(us(b.ticks));r.text(",");r.number(us(b.maxTicks));r.text("]");}
+            r.text("}");
+        }
+        r.text("},\"yields\":{");
+        const char* jobs[]={"app","compositor","present"};
+        for(unsigned i=0;i<3;++i){const auto& y=s.yields[i];
+            if(i)r.text(",");r.text("\"");r.text(jobs[i]);r.text("\":{");r.field("jobs",y.jobs);
+            r.text(",");r.field("yields",y.yields);r.text(",");r.field("breadcrumb_yields",y.breadcrumbYields);
+            r.text(",");r.field("sleep_us",us(y.sleepTicks));r.text(",\"hist\":[");
+            for(unsigned b=0;b<BdwWorkerYieldBuckets;++b){if(b)r.text(",");r.number(y.buckets[b]);}
+            r.text("]}");}
+        r.text("},\"mhz\":{");
+        for(unsigned i=0;i<2;++i){const auto& f=s.frequency[i];
+            if(i)r.text(",");r.text("\"");r.text(jobs[i]);r.text("\":{");
+            const BdwWorkerFrequency* points[]={&f.issue,&f.end};const char* names[]={"issue","end"};
+            for(unsigned p=0;p<2;++p){const auto& v=*points[p];
+                r.text("\"");r.text(names[p]);r.text("\":[");r.number(v.samples);r.text(",");r.number(v.minMhz);
+                r.text(",");r.number(v.samples?v.sumMhz/v.samples:0);r.text(",");r.number(v.maxMhz);r.text("],");}
+            r.field("rising",f.rising);r.text(",");r.field("missing",f.missing);r.text("}");}
+        r.text("},\"scope\":\"gpu-submit worker since reset; class=[count,us,max_us], class us sum to elapsed_us; compositor=RCS job referencing a protected (non-user-mappable) buffer; present stage=[us,max_us], prepare=CPU checks, GOP backing and PPGTT build, device=forcewake critical section incl. resets, blit=run inside it, retire=release; hist buckets 0,1,2,3-4,5-8,>8 yields per job; sleep_us includes unlock, sleep and re-audit; BCS completion spins and never yields; mhz=[samples,min,avg,max] RPSTAT1 CAGF at first completion poll and at breadcrumb poll; rising=end above issue; TSC wall time\"}\n");r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif

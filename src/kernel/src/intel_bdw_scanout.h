@@ -130,6 +130,12 @@ struct BdwRenderRunResult {
     unsigned frequencySamples=0;
     FrequencySample frequency[FrequencySampleLimit]{};
     uint32_t frequencyRequest=~uint32_t{0},rpsControl=~uint32_t{0},rc6Control=~uint32_t{0};
+    // Worker statistics: RPSTAT1 at the first completion poll (issue) and at
+    // the poll that observed the breadcrumb, from the existing sample site.
+    bool statsFrequency=false;
+    uint32_t statsFrequencySamples=0,statsIssueStatus=0,statsEndStatus=0;
+    uint32_t completionPollYields=0;
+    uint64_t pollYieldTicks=0;
 #endif
     BdwRenderTransactionResult transaction{};
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;

@@ -46,6 +46,9 @@ struct BdwBcsRunResult {
     uint32_t ggttWriteAttempts=0,portWriteAttempts=0;
     bool engineSampled=false;
     uint32_t head=0,tail=0,mode=0,control=0,acthd=0,ipeir=0,ipehr=0,execlist=0;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    uint64_t runTicks=0; // diagnostic TSC interval of the prepared blit run
+#endif
 };
 // Caller must serialize all operations; intermediate states reject reentrant callbacks.
 enum class BdwOneShotState : uint8_t {Fresh,Preparing,Prepared,Executing,CompleteRetained,Polling,ContextCompleteRetained,Quarantined,StoppedRetained,Released};

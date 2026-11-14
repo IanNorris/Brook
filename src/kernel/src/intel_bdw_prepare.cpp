@@ -8,6 +8,10 @@
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_submission_queue.h"
 #include "intel_bdw_submission_worker.h"
+#include "intel_bdw_worker_stats.h"
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+#include "intel_bdw_submission_timing.h"
+#endif
 #include "intel_bdw_handoff_session.h"
 #include "intel_bdw_present_queue.h"
 #include "../../shared/gpu_output_abi.h"
@@ -379,18 +383,49 @@ bool BdwRetainPrivateRenderImages(uint32_t ggttEntries,bool ppgttProbe,bool stor
     retainedRenderScratchValid=true;return true;
 }
 #ifndef BROOK_HOST_TEST
-bool BdwStartKernelSubmissionWorker(BdwSubmissionWorker& worker,void* context,
-                                    BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly,
-                                    bool (*service)(void*,BdwSubmissionQueue&),bool (*servicePending)(void*)) {
+static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
+                              BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly,
+                              bool (*service)(void*,BdwSubmissionQueue&),bool (*servicePending)(void*),
+                              void (*sleep)(void*)) {
     BdwSubmissionWorker::Hooks hooks{};hooks.context=context;hooks.execute=execute;hooks.service=service;hooks.servicePending=servicePending;
     hooks.launch=[](void*,void (*entry)(void*),void* arg,uint32_t cpu){
         auto* thread=KernelThreadCreate("gpu-submit",entry,arg);if(!thread)return false;
         thread->cpuAffinity=cpu;SchedulerAddProcess(thread);return true;
     };
-    hooks.sleep=[](void*){SchedulerSleepMs(1);};
+    hooks.sleep=sleep;
     hooks.recover=[](void*){KernelPanic("Broadwell submission worker requires recovery");};
     return worker.Start(hooks,0,knownOwnersOnly);
 }
+bool BdwStartKernelSubmissionWorker(BdwSubmissionWorker& worker,void* context,
+                                    BdwSubmissionOutcome (*execute)(void*,BdwExecSnapshot*),bool knownOwnersOnly,
+                                    bool (*service)(void*,BdwSubmissionQueue&),bool (*servicePending)(void*)) {
+    return StartKernelWorker(worker,context,execute,knownOwnersOnly,service,servicePending,[](void*){SchedulerSleepMs(1);});
+}
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+// Application-worker occupancy. Model mutation is confined to the worker
+// thread recorded at its first accounted boundary; see intel_bdw_worker_stats.h.
+static BdwWorkerStatsModel workerStats;
+static const void* workerStatsThread=nullptr;
+static bool OnWorkerStatsThread(){
+    const void* thread=__atomic_load_n(&workerStatsThread,__ATOMIC_ACQUIRE);
+    return thread && thread==static_cast<const void*>(ProcessCurrent());
+}
+[[maybe_unused]] static void WorkerStatsBegin(BdwWorkerClass next){
+    if(!__atomic_load_n(&workerStatsThread,__ATOMIC_ACQUIRE))
+        __atomic_store_n(&workerStatsThread,static_cast<const void*>(ProcessCurrent()),__ATOMIC_RELEASE);
+    if(OnWorkerStatsThread())workerStats.Begin(next,BdwTimingNow());
+}
+[[maybe_unused]] static void WorkerStatsEnd(){if(OnWorkerStatsThread())workerStats.End(BdwTimingNow());}
+void BdwWorkerStatsRender(uint64_t yields,uint64_t breadcrumbYields,uint64_t sleepTicks,
+                          bool frequencySampled,uint32_t issueStatus,uint32_t endStatus){
+    if(OnWorkerStatsThread())workerStats.Render(yields,breadcrumbYields,sleepTicks,frequencySampled,issueStatus,endStatus);
+}
+void BdwWorkerStatsPresent(bool full,uint64_t pixels,const uint64_t (&ticks)[BdwPresentStageCount],uint64_t yields){
+    if(OnWorkerStatsThread())workerStats.Present(full,pixels,ticks,yields);
+}
+bool BdwWorkerStatsRead(BdwWorkerStats& out){return workerStats.Read(out);}
+void BdwWorkerStatsReset(){workerStats.RequestReset();}
+#endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 // Fixed kernel-authored jobs only. Retain everything for the boot on error.
 static bool TestSubmissionWorker(BdwWorkerProbeResult& result,bool contexts) {
@@ -508,8 +543,17 @@ static bool ServiceScanout(void*,BdwSubmissionQueue& queue){
     uint32_t queued=ScanoutQueued;
     if(!__atomic_compare_exchange_n(&scanoutWork.state,&queued,ScanoutRunning,false,
                                     __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    WorkerStatsBegin(BdwWorkerPresent);
+#endif
     scanoutWork.completed=BdwExecuteBcsScanout(scanoutWork.source,scanoutWork.token,scanoutWork.regions,scanoutWork.count);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    if(!scanoutWork.completed && OnWorkerStatsThread())workerStats.PresentFailed();
+#endif
     __atomic_store_n(&scanoutWork.state,ScanoutDone,__ATOMIC_RELEASE);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+    WorkerStatsEnd();
+#endif
     return true;
 }
 static void FreeOffscreenScene(WmDesktopLayers* scene){if(scene){WmReleaseDesktopLayers(scene);kfree(scene);}}
@@ -610,12 +654,32 @@ bool BdwOffscreenRendererOwnedBy(uint64_t owner){
     if(!owner || !InitOffscreenMutex())return false;
     KMutexLock(&offscreenMutex);const bool result=offscreenSession.OwnedBy(owner);KMutexUnlock(&offscreenMutex);return result;
 }
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+// Same work and order as the plain hooks; only boundary timestamps are added.
+// Protected-output jobs are the compositor's, matching the queue's
+// application-only selection in BdwExecQueue::StartNext.
+static BdwSubmissionOutcome AccountedApplicationExecute(void* context,BdwExecSnapshot* snapshot){
+    WorkerStatsBegin(BdwExecSnapshotHasProtectedBuffer(snapshot)?BdwWorkerCompositor:BdwWorkerApplication);
+    const auto outcome=BdwExecuteRetainedContextWorkerSnapshot(context,snapshot);
+    WorkerStatsEnd();
+    return outcome;
+}
+static void AccountedApplicationSleep(void*){
+    WorkerStatsBegin(BdwWorkerIdle);
+    SchedulerSleepMs(1);
+    WorkerStatsEnd();
+}
+#endif
 static int64_t InitApplicationWorker(){
     static uint32_t state=0;
     uint32_t current=__atomic_load_n(&state,__ATOMIC_ACQUIRE);
     if(!current){uint32_t expected=0;
         if(__atomic_compare_exchange_n(&state,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+            const bool ok=StartKernelWorker(applicationWorker,nullptr,AccountedApplicationExecute,true,ServiceScanout,ScanoutPending,AccountedApplicationSleep);
+#else
             const bool ok=BdwStartKernelSubmissionWorker(applicationWorker,nullptr,BdwExecuteRetainedContextWorkerSnapshot,true,ServiceScanout,ScanoutPending);
+#endif
             __atomic_store_n(&state,ok?2u:3u,__ATOMIC_RELEASE);current=ok?2u:3u;
         }else current=expected;
     }

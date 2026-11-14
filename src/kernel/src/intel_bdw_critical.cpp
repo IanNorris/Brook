@@ -342,7 +342,14 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool pollContinue(){
                     if(!owned() || !inTime())return false;
                     if(result.pollYieldRequested){
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+                        const auto yieldStart=BdwTimingNow();
+#endif
                         if(!BdwYieldGpuWait(io)){result.pollYieldFailed=true;fault=true;return false;}
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+                        const auto yieldEnd=BdwTimingNow();
+                        if(yieldEnd>yieldStart)result.pollYieldTicks+=yieldEnd-yieldStart;
+#endif
                         ++result.pollYields;
                     }
                     return owned() && inTime();
@@ -350,14 +357,21 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool immediatePollAllowed(){return owned() && inTime();}
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                 void sampleRenderFrequency(){
-                    if(!result.sampleFrequency || result.frequencySamples==result.FrequencySampleLimit)return;
+                    const bool trace=result.sampleFrequency && result.frequencySamples!=result.FrequencySampleLimit;
+                    if(!trace && !result.statsFrequency)return;
                     uint64_t now=0;
                     if(!io.tsc(now))return;
                     const auto count=result.frequencySamples;
-                    if(count && now-result.frequency[count-1].ticks<uint64_t{khz}*5)return;
+                    const bool traceDue=trace && !(count && now-result.frequency[count-1].ticks<uint64_t{khz}*5);
+                    if(!traceDue && !result.statsFrequency)return;
                     // The forcewake claim already audits the 0xa000 MMIO page.
                     uint32_t status=~uint32_t{0};
                     if(!io.read32(BdwDellBar0+0xa01c,status))return; // GEN6_RPSTAT1
+                    if(result.statsFrequency){
+                        if(!result.statsFrequencySamples++)result.statsIssueStatus=status;
+                        result.statsEndStatus=status;
+                    }
+                    if(!traceDue)return;
                     result.frequency[count]={now,status};
                     ++result.frequencySamples;
                     if(!count){
@@ -368,9 +382,14 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 }
 #endif
                 bool completionContinue(){
-                    if(!BdwFirstGpuPoll(*this,firstCompletionPoll))return false;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
+                    const auto yieldsBefore=result.pollYields;
+                    const bool more=BdwFirstGpuPoll(*this,firstCompletionPoll);
+                    result.completionPollYields+=result.pollYields-yieldsBefore;
+                    if(!more)return false;
                     sampleRenderFrequency();
+#else
+                    if(!BdwFirstGpuPoll(*this,firstCompletionPoll))return false;
 #endif
                     return true;
                 }
@@ -688,8 +707,14 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6022000ull),scratchIndex,copyToken,scratchDma);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+            const auto runStart=BdwTimingNow();
+#endif
             const bool copied=scanoutCopy?BdwRunPreparedBcsScanout(backend,scratchDma,*copyResult):
                 BdwRunRetainedBcs(backend,scratchDma,*copyResult);
+#if defined(BROOK_GPU_SUBMISSION_TIMING)
+            const auto runEnd=BdwTimingNow();if(runEnd>runStart)copyResult->runTicks=runEnd-runStart;
+#endif
 #else
             const bool copied=BdwRunRetainedBcs(backend,scratchDma,*copyResult);
 #endif

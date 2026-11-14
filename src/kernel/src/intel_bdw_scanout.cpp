@@ -1,5 +1,6 @@
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_submission_timing.h"
+#include "intel_bdw_worker_stats.h"
 #include "hda_dell_inventory.h"
 #include "boot_protocol/boot_protocol.h"
 #include "intel_bdw_gtt_probe.h"
@@ -564,6 +565,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     run.ggttClearRequested=true;run.pollYieldRequested=true;
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     run.sampleFrequency=ProfilerFrameTraceActive();
+    run.statsFrequency=true;
 #if defined(BROOK_BDW_RPS_TRIAL)
     run.tryFrequency=ShutdownGetAcStatus().source==AcPowerSource::Online &&
         PageAdmitted(BdwRenderFrequencyCapsPage);
@@ -630,6 +632,8 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     BdwTraceSnapshot(snapshot,FrameRetired);
+    BdwWorkerStatsRender(run.pollYields,run.completionPollYields,run.pollYieldTicks,
+        run.statsFrequencySamples!=0,run.statsIssueStatus,run.statsEndStatus);
 #endif
     if(owner){
         if(!BdwGpuContextFinish(owner,&context,true)){kfree(memory);PanicWorkerStage("context-finish",snapshot);}
@@ -875,6 +879,7 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     const uint16_t pid=current?current->pid:0;
     const auto sourceId=BdwGpuBufferIdentity(source);
     ProfilerTraceGpu(pid,FrameBlitBegin,token,sourceId);
+    const auto statsStart=BdwTimingNow();
 #endif
     DiagnosticLease lease;
     if(!lease.held || !BdwBcsScanoutEnabled() || !BdwRenderExperimentEnabled() || SmpCurrentCpuIndex()!=0 ||
@@ -896,8 +901,12 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
     BdwBcsRunResult copy{};
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     ProfilerTraceGpu(pid,FrameBlitIssue,token,sourceId);
+    const auto statsPrepared=BdwTimingNow();
 #endif
     VmmDellBcsScanout(tsc.khz,reservation.first,reservation.token,scratch.dma,wake,copy);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    const auto statsDevice=BdwTimingNow();
+#endif
     if(copy.portWriteAttempts)__atomic_add_fetch(&copyStats.submitted,1,__ATOMIC_RELAXED);
     if((copy.resetBeforeAttempted && !copy.resetBefore) || copy.patUncertain ||
        (copy.attempted && (!wake.clearDelivered || !wake.sequence.released)) ||
@@ -906,11 +915,21 @@ bool BdwExecuteBcsScanout(BdwGpuBuffer* source,uint64_t token,const CompositorPr
             unsigned(copy.resetBefore),unsigned(copy.resetAfter),unsigned(copy.patRestored),
             copy.ggttWriteAttempts,copy.portWriteAttempts,copy.head,copy.tail,copy.acthd,copy.ipeir,copy.ipehr);
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    const auto statsRetired=BdwTimingNow();
     ProfilerTraceGpu(pid,FrameBlitEnd,token,sourceId);
 #endif
     if(!copy.copyComplete || !copy.contextComplete || !copy.scanoutRetired || !wake.sequence.workComplete)return false;
     const bool full=count==1 && !regions[0].x && !regions[0].y && regions[0].width==3200 && regions[0].height==1800;
     __atomic_add_fetch(full?&copyStats.full:&copyStats.partial,1,__ATOMIC_RELAXED);
+#if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
+    {
+        uint64_t pixels=0;for(uint32_t i=0;i<count;++i)pixels+=uint64_t(regions[i].width)*regions[i].height;
+        auto span=[](uint64_t a,uint64_t b){return b>a?b-a:0;};
+        const uint64_t ticks[BdwPresentStageCount]={span(statsStart,statsPrepared),span(statsPrepared,statsDevice),
+            copy.runTicks,span(statsDevice,statsRetired),span(statsStart,statsRetired)};
+        BdwWorkerStatsPresent(full,pixels,ticks,0); // BCS completion spins; it never yields
+    }
+#endif
     stage(5);
     return true;
 }
