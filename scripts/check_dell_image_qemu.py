@@ -105,6 +105,9 @@ def main():
     p.add_argument('--kernel-build-flags', type=Path,
                    help='JSON with kernel_build_flags, for a pair whose build directory is gone')
     p.add_argument('--shared', type=Path, default=DEFAULT_SHARED)
+    p.add_argument('--efi', type=Path,
+                   help='QEMU-identity guarded loader to test instead of the pinned v5 one (e.g. a '
+                        'build_dell_loader.py build with --shared <dir holding the QEMU fixture options>)')
     p.add_argument('--firmware', type=Path, help='OVMF FV directory (default: dirname of $OVMF_CODE)')
     p.add_argument('--output', type=Path, help='result directory (default: <pair>/qemu-check)')
     p.add_argument('--force', action='store_true', help='replace an existing result directory')
@@ -135,13 +138,16 @@ def main():
     scratch.mkdir(parents=True)
     verdict = {'pair': str(pair), 'kernel_sha256': kernel_sha, 'initrd_sha256': initrd_sha,
                'kernel_build_flags_source': flag_source, 'kernel_build_flags': flags, 'mode_flags': MODE_FLAGS,
-               'pinned_inputs': {'image': IMAGE[1], 'efi': EFI[1], 'recovery_pair': RECOVERY,
+               'pinned_inputs': {'image': IMAGE[1], 'efi': sha(a.efi) if a.efi else EFI[1], 'recovery_pair': RECOVERY,
                                  'ovmf_code_sha256': sha(firmware / 'OVMF_CODE.fd'), 'ovmf_dir': str(firmware)}}
     try:
         image = scratch / 'fixture.raw'
         pinned(shared / IMAGE[0], image, IMAGE[1])
         efi = scratch / 'BROOKGUARD.efi'
-        pinned(shared / EFI[0], efi, EFI[1])
+        if a.efi:
+            shutil.copyfile(a.efi, efi)  # caller-supplied loader; its hash is in the verdict
+        else:
+            pinned(shared / EFI[0], efi, EFI[1])
         recovery = scratch / 'recovery-pair'
         recovery.mkdir()
         for name, digest in RECOVERY.items():

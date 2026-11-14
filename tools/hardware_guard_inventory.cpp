@@ -37,6 +37,15 @@ int main(int argc,char **argv) {
         "RECOV2/KERNEL.ELF","RECOV2/INITRD.IMG","RECOV2/SELECT.BIN"};
     for(unsigned i=0;i<sizeof(paths)/sizeof(paths[0]);++i)
         if(inventory(root,paths[i],NULL))return 1;
+    /* Later loader generations: reported when present, never required. */
+    const char *optional[]={"EFI/BOOT/BROOKV4.EFI","EFI/BOOT/BROOKV5.EFI","EFI/BOOT/BROOKT6.EFI",
+        "EFI/BOOT/BROOKP5.EFI","EFI/BOOT/BROOKNEW.EFI","RECOVERY/KERNEL.ELF","RECOVERY/INITRD.IMG",
+        "RECOVERY/POWER.BIN"};
+    for(unsigned i=0;i<sizeof(optional)/sizeof(optional[0]);++i){
+        struct stat st;
+        if(fstatat(root,optional[i],&st,AT_SYMLINK_NOFOLLOW)){printf("%s absent\n",optional[i]);continue;}
+        if(inventory(root,optional[i],NULL))printf("%s unreadable\n",optional[i]);
+    }
     uint8_t a[128],b[128];
     if(inventory(root,"RECOVERY/GUARD0.BIN",a)||inventory(root,"RECOVERY/GUARD1.BIN",b)||
        !BrookRecoveryGuardAllowsNormal(a,sizeof(a),b,sizeof(b),argv[1]))return 1;

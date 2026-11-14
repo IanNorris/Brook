@@ -42,6 +42,8 @@ def main():
     parser.add_argument('--guard-default-stage-test', type=Path,
                         help='Exercise guarded default-loader promotion')
     parser.add_argument('--guard-repromote',action='store_true',help='Exercise promotion while preserving earlier loader backups')
+    parser.add_argument('--guard-repromote-next',action='store_true',
+                        help='Exercise the BROOKT6 -> default promotion that keeps the current default as BROOKP5 (BROOK_GUARD_REPROMOTE_NEXT)')
     parser.add_argument('--recovery-promote-test', type=Path,
                         help='Exercise checked recovery-directory promotion')
     parser.add_argument('--panic-journal-provision-test', type=Path,
@@ -72,6 +74,7 @@ def main():
                         help='Inject the documented Dell reset failure and wait for automatic shutdown')
     parser.add_argument('--inventory-efi', type=Path)
     parser.add_argument('--guard-efi-stage',action='store_true',help='Expect the separately staged guarded EFI name')
+    parser.add_argument('--guard-t6-stage',action='store_true',help='Expect the BROOKT6.EFI staged name (BROOK_EFI_GUARD_T6_STAGE)')
     parser.add_argument('--ram-exec-stage',action='store_true',help='Expect the maintenance RAM executable helper')
     parser.add_argument('--timeout', type=int, default=100)
     args = parser.parse_args()
@@ -89,6 +92,12 @@ def main():
         parser.error('EFI staging requires --inventory-efi and is exclusive with guard provisioning')
     if args.guard_default_stage_test and not args.inventory_efi:
         parser.error('default staging requires --inventory-efi')
+    if args.guard_repromote and args.guard_repromote_next:
+        parser.error('choose one repromotion variant')
+    if args.guard_repromote_next and not args.guard_default_stage_test:
+        parser.error('guard repromotion requires --guard-default-stage-test')
+    if args.guard_t6_stage and (not args.efi_inventory_stage_test or args.guard_efi_stage or args.ram_exec_stage):
+        parser.error('T6 staging requires the EFI staging fixture alone')
     if args.guard_repromote and not args.guard_default_stage_test:
         parser.error('guard repromotion requires --guard-default-stage-test')
     if args.guard_efi_stage and not args.efi_inventory_stage_test:
@@ -222,10 +231,14 @@ def main():
             media=f'{sata}@@{esp_part["start"]*512}'
             original=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/BOOTX64.EFI'])
             files=[original,candidate.read_bytes(),original,b'fixture kernel',b'fixture initrd',b'fixture selector',b'g'*128,b'g'*128]
-            targets=['::/EFI/BOOT/BOOTX64.EFI','::/EFI/BOOT/'+('BROOKV5.EFI' if args.guard_repromote else 'BROOKG2.EFI'),'::/EFI/BOOT/BROOKF5.EFI',
+            staged='BROOKT6.EFI' if args.guard_repromote_next else 'BROOKV5.EFI' if args.guard_repromote else 'BROOKG2.EFI'
+            targets=['::/EFI/BOOT/BOOTX64.EFI','::/EFI/BOOT/'+staged,'::/EFI/BOOT/BROOKF5.EFI',
                      '::/RECOV2/KERNEL.ELF','::/RECOV2/INITRD.IMG','::/RECOV2/SELECT.BIN',
                      '::/RECOVERY/GUARD0.BIN','::/RECOVERY/GUARD1.BIN']
-            if args.guard_repromote:
+            if args.guard_repromote_next:
+                files += [original]*4
+                targets += ['::/EFI/BOOT/BROOKOLD.EFI','::/EFI/BOOT/BROOKG2.EFI','::/EFI/BOOT/BROOKV4.EFI','::/EFI/BOOT/BROOKV5.EFI']
+            elif args.guard_repromote:
                 files += [original,original]
                 targets += ['::/EFI/BOOT/BROOKOLD.EFI','::/EFI/BOOT/BROOKG2.EFI']
             for directory in ('::/RECOV2','::/RECOVERY'):
@@ -284,7 +297,7 @@ def main():
         variables = d / 'vars.fd'
         shutil.copyfile(firmware / 'OVMF_VARS.fd', variables)
         serial = d / 'serial.log'
-        accelerated=bool(args.efi_shutdown_loader or args.guard_repromote)
+        accelerated=bool(args.efi_shutdown_loader or args.guard_repromote or args.guard_repromote_next)
         command = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm' if accelerated else 'tcg', '-cpu', 'host' if accelerated else 'max',
                    '-smp', '2', '-m', '1024', '-nodefaults',
                    '-drive', f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE.fd"}',
@@ -512,7 +525,10 @@ quit
             return
         if args.guard_default_stage_test:
             media=f'{sata}@@{esp_part["start"]*512}'
-            expected_loaders=(('BOOTX64.EFI',candidate.read_bytes()),('BROOKV4.EFI',original),
+            expected_loaders=(('BOOTX64.EFI',candidate.read_bytes()),('BROOKT6.EFI',candidate.read_bytes()),
+                              ('BROOKP5.EFI',original),('BROOKV4.EFI',original),('BROOKV5.EFI',original),
+                              ('BROOKOLD.EFI',original),('BROOKG2.EFI',original),('BROOKF5.EFI',original)) if args.guard_repromote_next else (
+                              ('BOOTX64.EFI',candidate.read_bytes()),('BROOKV4.EFI',original),
                               ('BROOKV5.EFI',candidate.read_bytes()),('BROOKOLD.EFI',original),
                               ('BROOKG2.EFI',original),('BROOKF5.EFI',original)) if args.guard_repromote else (
                               ('BOOTX64.EFI',candidate.read_bytes()),('BROOKOLD.EFI',original),
@@ -532,7 +548,7 @@ quit
             return
         if args.efi_inventory_stage_test:
             media=f'{sata}@@{esp_part["start"]*512}'
-            staged_name='BRKMODE.ELF' if args.ram_exec_stage else ('BROOKG2.EFI' if args.guard_efi_stage else 'BROOKINV.EFI')
+            staged_name='BRKMODE.ELF' if args.ram_exec_stage else 'BROOKT6.EFI' if args.guard_t6_stage else ('BROOKG2.EFI' if args.guard_efi_stage else 'BROOKINV.EFI')
             actual=subprocess.check_output(['mtype','-i',media,'::/EFI/BOOT/'+staged_name])
             if actual!=candidate.read_bytes():raise RuntimeError('offline inventory EFI differs')
             original=subprocess.check_output(['mtype','-i',str(source)+'@@1048576','::/EFI/BOOT/BOOTX64.EFI'])

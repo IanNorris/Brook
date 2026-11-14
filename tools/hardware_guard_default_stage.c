@@ -28,7 +28,20 @@ static int create_copy(int dir,const char *name,const uint8_t *data,size_t bytes
     return err?-1:0;
 }
 int main(int argc,char **argv) {
-#if defined(BROOK_GUARD_REPROMOTE)
+#if defined(BROOK_GUARD_REPROMOTE_NEXT)
+    /* Promote a later staged loader (default BROOKT6.EFI) and keep the current default as
+     * BROOK_GUARD_NEXT_BACKUP (default BROOKP5.EFI). Every earlier loader is hash-checked and preserved. */
+#ifndef BROOK_GUARD_NEXT_STAGE
+#define BROOK_GUARD_NEXT_STAGE "BROOKT6.EFI"
+#endif
+#ifndef BROOK_GUARD_NEXT_BACKUP
+#define BROOK_GUARD_NEXT_BACKUP "BROOKP5.EFI"
+#endif
+    if(argc!=13||geteuid()!=0){fprintf(stderr,"usage: guard-repromote-next old new f5 kernel initrd selector guard0 guard1 oldbackup g2 v4 v5 hashes\n");return 2;}
+    const char *names[]={"BOOTX64.EFI",BROOK_GUARD_NEXT_STAGE,"BROOKF5.EFI","KERNEL.ELF","INITRD.IMG","SELECT.BIN","GUARD0.BIN","GUARD1.BIN",
+                         "BROOKOLD.EFI","BROOKG2.EFI","BROOKV4.EFI","BROOKV5.EFI"};
+    const int itemCount=12;const char *backupName=BROOK_GUARD_NEXT_BACKUP;
+#elif defined(BROOK_GUARD_REPROMOTE)
     /* Preserve both the first original backup and its separately staged loader. */
     if(argc!=11||geteuid()!=0){fprintf(stderr,"usage: guard-repromote old new f5 kernel initrd selector guard0 guard1 oldbackup oldstage hashes\n");return 2;}
     const char *names[]={"BOOTX64.EFI","BROOKV5.EFI","BROOKF5.EFI","KERNEL.ELF","INITRD.IMG","SELECT.BIN","GUARD0.BIN","GUARD1.BIN","BROOKOLD.EFI","BROOKG2.EFI"};
@@ -40,7 +53,7 @@ int main(int argc,char **argv) {
     const int itemCount=8;const char *backupName="BROOKOLD.EFI";
 #endif
     int root=-1,efi=-1,boot=-1,rec=-1,legacy=-1,lock=-1,result=1,mutated=0;
-    uint8_t *data[10]={0};size_t sizes[10]={0};struct stat rst,st;
+    uint8_t *data[12]={0};size_t sizes[12]={0};struct stat rst,st;
     root=open("/media/system",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(root<0||ioctl(root,BROOK_IOCTL_VERIFY_SYSTEM_ESP_ROOT,0)||fstat(root,&rst))goto done;
     lock=open("/tmp/hardware-update.lock",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);if(lock<0)goto done;
@@ -65,7 +78,7 @@ int main(int argc,char **argv) {
     {uint8_t *check=NULL;size_t n=0;int err=read_checked(boot,backupName,argv[1],&check,&n);free(check);if(err||n!=sizes[0])goto done;}
     result=0;
 done:
-    for(int i=0;i<10;++i)free(data[i]);
+    for(int i=0;i<12;++i)free(data[i]);
     if(legacy>=0)close(legacy);
     if(rec>=0)close(rec);
     if(boot>=0)close(boot);
