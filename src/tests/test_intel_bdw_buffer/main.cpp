@@ -24,6 +24,9 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <functional>
+#include <initializer_list>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -31,7 +34,7 @@
 #include <unistd.h>
 using namespace brook;
 struct Allocation {void* ptr;uint64_t pages,dma;};
-static Allocation allocations[16]{};
+static Allocation allocations[32]{};
 static unsigned frees=0,allocated=0,failAt=0;
 static bool failVmm=false,failBacking=false,badDma=false;
 static bool resetArmed=true,translated=false,wrongOwner=false,changingVtd=false;
@@ -121,7 +124,7 @@ extern "C" void* kmalloc(uint64_t n){if(failHeapOnce){failHeapOnce=false;return 
 extern "C" void kfree(void* p){std::free(p);}
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){
     if(failVmm || (failAt && allocated+1==failAt))return VirtualAddress{};
-    assert(allocated<16 && n<=256);auto& a=allocations[allocated];
+    assert(allocated<32 && n<=256);auto& a=allocations[allocated];
     assert(!posix_memalign(&a.ptr,4096,n*4096));a.pages=n;a.dma=0x100000+uint64_t(allocated)*0x200000;
     ++allocated;std::memset(a.ptr,0xaa,n*4096);return VirtualAddress(reinterpret_cast<uint64_t>(a.ptr));
 }
@@ -1772,6 +1775,92 @@ int main(){
         assert(!tables.ReleaseUnsubmitted(alloc) && !tables.ReleaseStopped(alloc,false));
         assert(tables.ReleaseStopped(alloc,true) && alloc.freed==6 && !tables.RootDma());
         assert(BdwExecSnapshotRelease(snapshot,false));
+    }
+    {
+        // PPGTT table-set reuse (M5 part 1): exact-match adoption, mismatch,
+        // invalidation of changed backing, checksum, eviction and kill switch.
+        struct TrackingAllocator:TableAllocator {
+            std::vector<BdwOwnedPage> live;
+            bool alloc(BdwOwnedPage& p){if(!TableAllocator::alloc(p))return false;live.push_back(p);return true;}
+            void free(BdwOwnedPage p){for(size_t i=0;i<live.size();++i)if(live[i].dma==p.dma){live.erase(live.begin()+long(i));break;}
+                TableAllocator::free(p);}
+            uint8_t* cpu(uint64_t dma){for(auto& p:live)if(p.dma==dma)return p.cpu;return nullptr;}
+        };
+        uint64_t r2=0;
+        const uint32_t ha=BdwGpuFileCreateBuffer(f,8192,r2),hb=BdwGpuFileCreateBuffer(f,4096,r2),hc=BdwGpuFileCreateBuffer(f,4096,r2);
+        assert(ha && hb && hc);
+        auto make=[&](uint32_t first,uint64_t at){BdwExecObjectInput in[]={{first,at,4096,16},{hb,0x40010000,4096,16|64}};
+            auto* s=BdwExecSnapshotCreate(f,in,2,0,8,64);assert(s);return s;};
+        TrackingAllocator alloc;BdwExecTables tables;
+        tables.SetCacheEnabled(true,[](BdwPpgttMapping* p){std::free(p);});
+        uint64_t lastRoot=0;
+        // Walk every present PTE of the prepared image and require it to map
+        // either a page of this snapshot or the image's own scratch.
+        auto onlyOwnPages=[&](BdwExecSnapshot* s,std::initializer_list<uint32_t> handles)->bool{
+            std::vector<uint64_t> allowed;
+            for(uint32_t h:handles){auto* b=BdwGpuFileGetBuffer(f,h);uint32_t n=0;const auto* pg=BdwGpuBufferPages(b,n);
+                for(uint32_t i=0;i<n;++i)allowed.push_back(pg[i]);BdwGpuBufferUnref(b);}
+            (void)s;
+            // Each table page is visited once, so shared scratch tables are cheap.
+            std::vector<uint64_t> seen;bool fine=true;
+            std::function<void(uint64_t,unsigned)> walk=[&](uint64_t dma,unsigned level){
+                for(auto v:seen)if(v==dma)return;seen.push_back(dma);
+                uint8_t* page=alloc.cpu(dma);for(auto& sp:scratch)if(sp.dma==dma)page=sp.cpu;
+                auto* w=reinterpret_cast<uint64_t*>(page);if(!w){fine=false;return;}
+                for(unsigned i=0;i<512 && fine;++i){const uint64_t e=w[i];if(!(e&1))continue;
+                    const uint64_t child=e&~uint64_t{4095}&((uint64_t{1}<<39)-1);
+                    if(level>1){walk(child,level-1);continue;}
+                    bool ok=false;for(auto v:allowed)if(v==child)ok=true;
+                    // Otherwise only the image's own (read-only) scratch data page.
+                    bool scratchPage=alloc.cpu(child)!=nullptr;for(auto& sp:scratch)if(sp.dma==child)scratchPage=true;
+                    if(!ok && scratchPage && !(e&2))ok=true;
+                    if(!ok)fine=false;}
+            };
+            walk(tables.RootDma(),4);if(!fine)return false;
+            return true;
+        };
+        auto cycle=[&](BdwExecSnapshot* s,std::initializer_list<uint32_t> handles)->bool{
+            if(!tables.Prepare(alloc,s))return false;
+            const bool reused=tables.Reused();const uint32_t n=BdwExecSnapshotPageCount(s);
+            BdwPpgttMapping* ws=reused?nullptr:static_cast<BdwPpgttMapping*>(std::malloc(n*sizeof(BdwPpgttMapping)));
+            uint32_t ring[56]{};
+            const bool built=tables.Build(alloc,s,scratch,ws,reused?0:n,0x30000000,99,false,ring);
+            if(ws && !tables.KeepsWorkspace())std::free(ws);
+            if(!built)return false;
+            assert(onlyOwnPages(s,handles));
+            lastRoot=tables.RootDma();uint32_t st=9;
+            return tables.InspectDma(alloc,st) && st==0 && tables.Publish(alloc) && tables.BeginUse(alloc) &&
+                tables.ReleaseStopped(alloc,true) && tables.Recycle();
+        };
+        auto* s1=make(ha,0x20000);assert(cycle(s1,{ha,hb}));
+        auto st=tables.Stats();assert(st.builds==1 && st.hits==0 && st.missEmpty==1 && tables.CachedSets()==1);
+        const uint64_t firstRoot=lastRoot;
+        // Same objects, same backing: adopted without a build.
+        auto* s2=make(ha,0x20000);assert(cycle(s2,{ha,hb}));
+        st=tables.Stats();assert(st.builds==1 && st.hits==1 && lastRoot==firstRoot && tables.CachedSets()==1);
+        // A different address is a different buffer set: fresh build, second slot.
+        auto* s3=make(ha,0x80000);assert(cycle(s3,{ha,hb}));
+        st=tables.Stats();assert(st.builds==2 && st.missSignature==1 && tables.CachedSets()==2);
+        auto* s4=make(ha,0x20000);assert(cycle(s4,{ha,hb}));
+        st=tables.Stats();assert(st.hits==2 && lastRoot==firstRoot);
+        // Different backing at the same address (a freed and replaced
+        // buffer): the cached set that maps ha's pages must not be adopted.
+        auto* s5=make(hc,0x20000);assert(cycle(s5,{hc,hb}));
+        st=tables.Stats();assert(st.builds==3 && st.hits==2 && lastRoot!=firstRoot);
+        // A changed word in a cached set forces a rebuild, never adoption.
+        auto* corrupt=reinterpret_cast<uint64_t*>(alloc.cpu(firstRoot));assert(corrupt);corrupt[7]^=0x1000;
+        auto* s6=make(ha,0x20000);assert(cycle(s6,{ha,hb}));
+        st=tables.Stats();assert(st.missChecksum==1 && st.builds==4 && st.hits==2);
+        // Eviction keeps at most CacheSlots sets.
+        for(uint64_t at:{0xa0000ull,0xc0000ull,0xe0000ull}){auto* s=make(ha,at);assert(cycle(s,{ha,hb}));assert(BdwExecSnapshotRelease(s,false));}
+        st=tables.Stats();assert(tables.CachedSets()==BdwExecTables::CacheSlots && st.evictions>=1);
+        // Kill switch: the next preparation drops every cached set (no leak).
+        tables.SetCacheEnabled(false,nullptr);
+        auto* s7=make(ha,0x20000);assert(cycle(s7,{ha,hb}));
+        st=tables.Stats();assert(st.dropped==1 && st.missDisabled==1 && tables.CachedSets()==0);
+        assert(alloc.live.empty() && alloc.allocated==alloc.freed);
+        for(auto* s:{s1,s2,s3,s4,s5,s6,s7})assert(BdwExecSnapshotRelease(s,false));
+        assert(BdwGpuFileCloseBuffer(f,ha) && BdwGpuFileCloseBuffer(f,hb) && BdwGpuFileCloseBuffer(f,hc));
     }
     {
         BdwExecObjectInput spaced[]={{replacement,0x20000,4096,16},{next,0x40010000,4096,16|4}};

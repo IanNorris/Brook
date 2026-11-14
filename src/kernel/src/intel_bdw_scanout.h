@@ -106,6 +106,12 @@ BdwSubmissionOutcome BdwExecuteRetainedContextWorkerSnapshot(void*,BdwExecSnapsh
 // Caller owns the serialized render/device lease and retains the snapshot.
 // These helpers do not validate commands or authorize a userspace submission.
 bool BdwPrepareRetainedSubmission(BdwExecSnapshot* snapshot);
+// PPGTT table-set reuse across retained submissions (default off). Worker
+// state; the switch takes effect at the next job's preparation.
+struct BdwPpgttCacheStats;
+void BdwPpgttCacheSetEnabled(bool on);
+bool BdwPpgttCacheEnabled();
+void BdwPpgttCacheStatsRead(BdwPpgttCacheStats& out,uint32_t& cachedSets);
 bool BdwRetireRetainedSubmission(BdwExecSnapshot* snapshot);
 bool BdwSetupRetainedGemProbe(bool externalTables);
 bool BdwFinishRetainedGemProbe(bool safelyStopped);

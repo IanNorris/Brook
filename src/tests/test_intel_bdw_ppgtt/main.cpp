@@ -1,14 +1,67 @@
 #include "../../kernel/src/intel_bdw_ppgtt.h"
 #include "../../kernel/src/intel_bdw_exec_address_space.h"
+#include "reference_ppgtt.h"
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 using namespace brook;
 alignas(4096) static uint8_t memory[20][4096];
 static BdwPpgttMapping largeMaps[1025];
 static uint64_t entry(const BdwPpgttPage& page,unsigned index) {
     return reinterpret_cast<const uint64_t*>(page.cpu)[index];
 }
+// The optimized builder (sorted DMA set, per-level path cache) must accept
+// and reject exactly the same inputs as the original and write identical
+// table and scratch bytes, for sorted and unsorted mapping sets.
+static void DifferentialTest() {
+    srand(7);std::vector<uint8_t*> owned;
+    auto page=[&]{void* p=nullptr;assert(!posix_memalign(&p,4096,4096));std::memset(p,0xcc,4096);owned.push_back(static_cast<uint8_t*>(p));return static_cast<uint8_t*>(p);};
+    constexpr unsigned tableMax=128;
+    BdwPpgttPage sa[4];brook_reference::BdwPpgttPage sb[4];
+    std::vector<BdwPpgttPage> ta(tableMax);std::vector<brook_reference::BdwPpgttPage> tb(tableMax);
+    for(unsigned i=0;i<4;++i){sa[i]={0x100000000ull+4096ull*i,page()};sb[i]={sa[i].dma,page()};}
+    for(unsigned i=0;i<tableMax;++i){ta[i]={0x180000000ull+4096ull*i,page()};tb[i]={ta[i].dma,page()};}
+    unsigned built=0;
+    for(int trial=0;trial<400;++trial){
+        const bool sorted=trial%4!=3;
+        const unsigned n=1+unsigned(rand())%(sorted?(trial<250?96:9000):1000);
+        std::vector<BdwPpgttMapping> a;std::vector<brook_reference::BdwPpgttMapping> b;
+        uint64_t address=uint64_t(rand()%64)<<21;
+        for(unsigned i=0;i<n;++i){
+            address+=4096ull*(1+(rand()%3==0?unsigned(rand())%600:0));if(rand()%60==0)address+=uint64_t(rand()%4)<<30;
+            const uint64_t dma=0x200000000ull+uint64_t(rand()%8000000)*4096;const bool w=rand()&1;
+            const auto cache=rand()%5==0?BdwPpgttCache::Uncached:BdwPpgttCache::WriteBack;
+            a.push_back({address,dma,w,cache});b.push_back({address,dma,w,cache==BdwPpgttCache::Uncached?
+                brook_reference::BdwPpgttCache::Uncached:brook_reference::BdwPpgttCache::WriteBack});
+        }
+        if(!sorted)for(unsigned i=n;i>1;--i){const unsigned j=unsigned(rand())%i;std::swap(a[i-1],a[j]);std::swap(b[i-1],b[j]);}
+        if(trial%13==0 && n>2){a[n/2].dma=b[n/2].dma=sa[1].dma;}        // collides with scratch
+        if(trial%17==0 && n>2){a[n/3].dma=b[n/3].dma=ta[2].dma;}        // collides with a table page
+        if(trial%19==0 && n>3 && sorted){a[2].address=b[2].address=a[1].address;} // duplicate address
+        // Acceptance is monotone in the table count, so binary-search the
+        // exact count the reference needs (0 if it rejects regardless).
+        unsigned exact=0;
+        if(brook_reference::BdwBuildPpgttImage(sb,tb.data(),tableMax,b.data(),n,sorted)){
+            unsigned lo=1,hi=tableMax;
+            while(lo<hi){const unsigned mid=(lo+hi)/2;
+                if(brook_reference::BdwBuildPpgttImage(sb,tb.data(),mid,b.data(),n,sorted))hi=mid;else lo=mid+1;}
+            exact=lo;
+        }
+        for(unsigned t:{exact?exact:1u,exact?exact+1:2u,exact>1?exact-1:1u}){
+            const bool rb=brook_reference::BdwBuildPpgttImage(sb,tb.data(),t,b.data(),n,sorted);
+            const bool ra=BdwBuildPpgttImage(sa,ta.data(),t,a.data(),n,sorted);
+            assert(ra==rb);
+            if(!ra)continue;++built;
+            for(unsigned i=0;i<4;++i)assert(!std::memcmp(sa[i].cpu,sb[i].cpu,4096));
+            for(unsigned i=0;i<t;++i)assert(!std::memcmp(ta[i].cpu,tb[i].cpu,4096));
+        }
+    }
+    assert(built>100);
+    for(auto* p:owned)std::free(p);
+}
 int main() {
+    DifferentialTest();
     BdwPpgttPage scratch[4],tables[16];
     for(unsigned i=0;i<4;++i)scratch[i]={0x100000+4096ull*i,memory[i]};
     for(unsigned i=0;i<16;++i)tables[i]={0x200000+4096ull*i,memory[i+4]};

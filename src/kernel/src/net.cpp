@@ -7,6 +7,8 @@
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
 #include "intel_bdw_prompt_wake.h"
+#include "intel_bdw_exec_tables.h"
+#include "intel_bdw_scanout.h"
 #include "intel_bdw_wait_queue.h"
 #include "intel_bdw_scanout_target.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -5115,6 +5117,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -5676,6 +5679,27 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             if(i)row.text(",");row.text("{");row.field("count",b.count);row.text(",");row.field("total_us",b.totalUs);
             row.text(",");row.field("max_us",b.maxUs);row.text(",");row.field("total_pages",b.totalPages);row.text("}");row.send();}
         DebugChannelSend("],\"scope\":\"queue, device sync, preparation including device sync, device including reset, retirement, CPU sync, admission lock wait, snapshot build, WRITE pages, ASYNC pages, GT init, PAT setup, render run, context save, reset and unbind, PAT restore, issue to breadcrumb observation, breadcrumb observation to context retirement, unique buffer-object pages, repeated buffer-object pages; duplicate counts are within a submission and do not detect distinct objects aliasing pages; WRITE/ASYNC are overlapping hints, not access directions; later intervals nest inside device and render run; observed times include polling and scheduling, not GPU timestamps; cross-CPU TSC requires validation\"}\n");
+#else
+        DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
+#endif
+    }
+    else if(NetStrEq(cmd,"gpu ppgtt cache on") || NetStrEq(cmd,"gpu ppgtt cache off") || NetStrEq(cmd,"gpu ppgtt cache status")) {
+#if defined(BROOK_SSD_AUTO_RECOVERY)
+        // M5 part 1 kill switch: reuse of exact-match PPGTT table sets across
+        // retained submissions (boot default off). Applies at the next job.
+        if(NetStrEq(cmd,"gpu ppgtt cache on"))BdwPpgttCacheSetEnabled(true);
+        else if(NetStrEq(cmd,"gpu ppgtt cache off"))BdwPpgttCacheSetEnabled(false);
+        BdwPpgttCacheStats s{};uint32_t sets=0;BdwPpgttCacheStatsRead(s,sets);
+        BridgeReply r;r.text("{\"enabled\":");r.text(BdwPpgttCacheEnabled()?"true":"false");
+        r.text(",");r.field("cached_sets",sets);
+        r.text(",");r.field("builds",s.builds);r.text(",");r.field("hits",s.hits);
+        r.text(",");r.field("miss_disabled",s.missDisabled);r.text(",");r.field("miss_empty",s.missEmpty);
+        r.text(",");r.field("miss_signature",s.missSignature);r.text(",");r.field("miss_checksum",s.missChecksum);
+        r.text(",");r.field("evictions",s.evictions);r.text(",");r.field("dropped",s.dropped);
+        r.text(",");r.field("built_pages",s.builtPages);r.text(",");r.field("build_us",s.buildUs);
+        r.text(",");r.field("adopt_us",s.adoptUs);r.text(",");r.field("last_build_us",s.lastBuildUs);
+        r.text(",\"scope\":\"retained-submission PPGTT tables; builds=fresh table builds (with the cache on, each keeps its own scratch and mapping list), hits=jobs that adopted an unchanged table set after an exact address/DMA/permission/cache match plus a checksum of every table word; build_us/adopt_us = time attaching the image (build or adopt plus ring), worker-thread counters, read without locking\"}\n");
+        r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif

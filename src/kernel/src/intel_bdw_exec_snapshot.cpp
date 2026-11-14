@@ -373,6 +373,28 @@ bool BdwExecSnapshotBuildPpgtt(BdwExecSnapshot* s,const BdwPpgttPage (&scratch)[
     if(!BdwBuildExecAddressSpace(scratch,tables,tableCount,s->objects,s->count,workspace,workspaceCount))return false;
     s->preparedFlags|=1u;return true;
 }
+bool BdwExecSnapshotMatchesMappings(const BdwExecSnapshot* s,const BdwPpgttMapping* list,uint32_t count){
+    if(!s || !list || !count || s->pages!=count || !s->objects || !s->count)return false;
+    uint32_t n=0;
+    for(uint32_t i=0;i<s->count;++i){const auto& o=s->objects[i];
+        const BdwPpgttCache cache=o.uncached?BdwPpgttCache::Uncached:BdwPpgttCache::WriteBack;
+        if(!o.pageDma || o.pageCount>count-n)return false;
+        for(uint32_t j=0;j<o.pageCount;++j,++n){const auto& m=list[n];
+            if(m.address!=o.address+uint64_t(j)*4096 || m.dma!=o.pageDma[j] || m.writable!=o.writable || m.cache!=cache)return false;
+        }
+    }
+    return n==count;
+}
+bool BdwExecSnapshotAdoptRenderImage(BdwExecSnapshot* s,const BdwPpgttMapping* cached,uint32_t cachedCount,
+                                     uint64_t completion,uint32_t nonce,bool gt3,uint32_t (&ring)[56]){
+    if(!Preparing(s))return false;
+    s->preparedFlags&=~1u;
+    if(!BdwExecSnapshotMatchesMappings(s,cached,cachedCount))return false;
+    uint32_t next[56]{};
+    if(!BdwBuildRenderRing(BdwExecSnapshotBatchAddress(s),completion,nonce,true,gt3,next))return false;
+    for(unsigned i=0;i<56;++i)ring[i]=next[i];
+    s->preparedFlags|=1u;return true;
+}
 bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* s,const BdwPpgttPage (&scratch)[4],
                                     const BdwPpgttPage* tables,uint32_t tableCount,
                                     BdwPpgttMapping* workspace,uint32_t workspaceCount,
