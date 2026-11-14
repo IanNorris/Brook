@@ -40,11 +40,13 @@ Target: at least 60 **displayed** frames/s for the yquake2 GL3 matched demo (128
 - No code changes until that strategy is agreed with Ian.
 - **Measurement rule:** count distinct displayed frames (direct commits), not only completed swaps.
 
-## Dell state (14 November, about 00:05 UTC)
+## Dell state (14 November)
 
-- **Target:** Dell XPS 13 9343 at `192.168.85.106:1234`, bridge session `20a98c45446041a3a5665e6e9df58f57`, boot `ef7ec88269af43b39a842540d8cec026`. Ian restarted it into a clean state.
-- **Boot payload:** `dell-scanout-fair-counts-20261113` (build `254ad5ed+9beb71f6`). Check which slot this is before assuming the gen 338/354 images are the default.
-- **Health:** doctor verified, writable desktop ready (dirty session flag set), job table fresh (256 slots).
+- **Target:** Dell XPS 13 9343 at `192.168.85.106:1234`. Generation 355, slot 0: boot `7f78aa2b8ea24c17816b5b80eff04a26`, session `bccc100914d547f095a4d01834494c93`.
+- **Boot payload:** the restored gen 338 baseline `dell-short-lock-serial-20261113` (receipt `build/hardware/dell-baseline-restore-20261114/receipt.json`). It was built with BROOK_GPU_SUBMISSION_TIMING, the coherent LLC render path and the 500 MHz on-AC clock trial. Pair: `build/hardware/dell-present-ownership-20261113/pair-short-lock-serial/`.
+- **Previous payload:** `dell-scanout-fair-counts-20261113`, the boot Ian started after the previous agent's last image.
+- **Build recipe gap:** the exact recipe for building a Dell pair from source isn't recorded (it was assembled in a private checkout). The gen 338 kernel came from a guard-timing CMake configuration (cache SHA `34df12a0…`) with source initrd `build/hardware/dell-packed-overlay-candidate-20261111/INITRD.IMG`. A scripted, reproducible "Dell image from main" build is the first code task.
+- **Review measurements on this boot:** `build/review-20261114/dell-gen355-data.md`.
 - **Power:**
   - checked power-off via EFI runtime, with reset via ACPI io8;
   - the Tasmota AC relay reports `Power1: ON` (config `~/.config/dellpower.txt`, private);
