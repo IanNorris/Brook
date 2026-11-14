@@ -41,6 +41,9 @@ VERIFY_ALLOW = {
     'BROOK_BDW_COHERENT_RENDER': '--allow-bdw-coherent-render',
     'BROOK_BDW_RPS_TRIAL': '--allow-bdw-rps-trial',
     'BROOK_DELL_ACPI_MONITOR': '--allow-dell-acpi-monitor',
+    # Compiled in but runtime-gated off at every boot (debug-channel commands).
+    'BROOK_BDW_PERSISTENT_SCANOUT_MAP': '--allow-bdw-persistent-scanout-map',
+    'BROOK_BDW_SCANOUT_FLIP': '--allow-bdw-scanout-flip',
 }
 
 
