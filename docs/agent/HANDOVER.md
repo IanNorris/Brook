@@ -146,6 +146,11 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
   - the Windows (Super) key opens the app launcher and always releases pointer capture; today a captured mouse can't be released without closing the app;
   - Alt+F4 closes the focused window.
 - **Dell application audio for yquake2:** the gen 363 boot has no `/dev/dsp`, and the OSS OpenAL store path (`59h20vp…-openal-soft-oss-brook-1.24.3`) is present but has no `lib/`. Restore the gated Dell HDA path (`/etc/dell-hda-audible`; see `docs/xps9343-bringup.md`) and stage OpenAL, then verify audibly with Ian. The SDL build has no OSS backend, so OpenAL is required. The `/data/home` yquake2 config also had a stale absolute `al_driver`.
+- **Browser video and audio on the Dell (Ian, gen 363, 14 Nov):**
+  - **Chromium YouTube:** audible, but music plays SLOW; frame-time p80 ~90 ms.
+  - **Firefox YouTube:** video and audio both run FAST, with no obvious audible stutter; ~3–4 fps, frame-time p80 ~174 ms.
+  - **Suspicion:** the playback clock or position reported to apps (GETOPTR/GETODELAY or the bridge) is wrong; see `docs/audio-clock.md`. Being investigated in `work/dell-audio`.
+  - **Acceptance check to add:** fullscreen YouTube with no audio stutter, judged from renderer frame pacing plus all-zero packets in mixer output.
 - **Boot-menu wait:** key input during the bootloader wait isn't recognised. The default wait is being reduced to 0.5 s in `work/boot-timing`.
 - **Volume persistence:** taskbar volume changes apply live but are only saved by Settings' Apply. Decide whether taskbar changes should persist automatically.
 
