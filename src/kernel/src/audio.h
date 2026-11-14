@@ -94,10 +94,18 @@ uint32_t AudioGetPosition();
 bool     AudioAvailable();
 uint32_t AudioOutputControl();
 bool     AudioSetOutputControl(uint32_t control);
+// A driver whose hardware applies most of the master volume (Dell DAC gain)
+// supplies a 101-entry Q15 residual table indexed by volume percent; the
+// mixer then applies only that residual. nullptr restores linear software
+// volume. The table must outlive its registration.
+void     AudioSetHardwareVolumeResidual(const uint16_t* q15ByPercent);
+const uint16_t* AudioHardwareVolumeResidual();
 // User-facing control entry point; internal settings restoration must use the
 // ordinary setter so it cannot authorize an initially muted hardware output.
 bool     AudioSetUserOutputControl(uint32_t control,bool explicitUnmute=false);
 bool     AudioUserUnmuteRequested();
+// Increments on every user-originated level/mute change (feedback sounds).
+uint32_t AudioUserOutputControlSerial();
 // One atomic snapshot: control in low bits, explicit user authorization bit.
 static constexpr uint32_t AudioUserUnmuteBit=1u<<16;
 uint32_t AudioOutputControlSnapshot();

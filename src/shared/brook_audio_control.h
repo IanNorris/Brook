@@ -30,4 +30,12 @@ static inline int16_t brook_audio_scale(int32_t sample,uint32_t control) {
     if (scaled < -32768) scaled = -32768;
     return (int16_t)scaled;
 }
+/* Q15 software gain (0..32768) for devices whose hardware applies the rest of
+ * the master volume; muted output is silent. Saturating, never above unity. */
+static inline int16_t brook_audio_scale_q15(int32_t sample,uint32_t control,uint16_t q15) {
+    int64_t scaled = (control & BROOK_AUDIO_MUTED) ? 0 : ((int64_t)sample * q15) >> 15;
+    if (scaled > 32767) scaled = 32767;
+    if (scaled < -32768) scaled = -32768;
+    return (int16_t)scaled;
+}
 #endif

@@ -129,6 +129,7 @@ add_custom_command(
 )
 
 # Bake branding from the tracked source rather than a stale checked-in array.
+set(BROOK_VOLUME_POP_ASSET "${CMAKE_CURRENT_SOURCE_DIR}/assets/volume-pop.s16le")
 set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
 add_custom_command(
     OUTPUT "${BOOT_LOGO_HEADER}"
@@ -260,6 +261,7 @@ endif()
 # ---------------------------------------------------------------------------
 
 add_executable(kernel
+    src/volume_pop.cpp
     "${BOOT_LOGO_HEADER}"
     src/kernel.cpp
     src/cpu.cpp
@@ -817,3 +819,8 @@ add_custom_target(check_module_symbols ALL
 if(BROOK_MODULE_TARGETS)
     add_dependencies(check_module_symbols ${BROOK_MODULE_TARGETS})
 endif()
+
+# Volume-change feedback clip, embedded with .incbin (see assets/README.md).
+set_source_files_properties(src/volume_pop.cpp PROPERTIES
+    COMPILE_DEFINITIONS "BROOK_VOLUME_POP_PATH=\"${BROOK_VOLUME_POP_ASSET}\""
+    OBJECT_DEPENDS "${BROOK_VOLUME_POP_ASSET}")
