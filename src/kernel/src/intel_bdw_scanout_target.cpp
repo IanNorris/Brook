@@ -785,6 +785,51 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source){
     IrqSpinLockRelease(&lock,f);ZcLogPending();
     return outcome;
 }
+bool zcUncachedRender=true;uint64_t zcRenderUc=0,zcRenderWb=0;
+bool BdwZeroCopyUncachedRender(){return __atomic_load_n(&zcUncachedRender,__ATOMIC_ACQUIRE);}
+void BdwZeroCopySetUncachedRender(bool on){__atomic_store_n(&zcUncachedRender,on,__ATOMIC_RELEASE);}
+void BdwZeroCopyNoteRender(bool uncached){__atomic_add_fetch(uncached?&zcRenderUc:&zcRenderWb,1,__ATOMIC_RELAXED);}
+bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){
+    out={};out.result="inactive";
+    uint32_t front=0;uint64_t sequence=0;BdwGpuBuffer* buffer=nullptr;
+    auto snap=[&](uint32_t& f,uint64_t& q){const uint64_t g=IrqSpinLockAcquire(&lock);
+        const bool ok=zcActive && !zcDisabled && displayMapped;f=ok?zcRing.Front():0;q=zcRing.Sequence();
+        IrqSpinLockRelease(&lock,g);return ok;};
+    if(!snap(front,sequence))return false;
+    out.front=front;out.sequence=sequence;
+    if(!front){out.result="gop-front";return false;}
+    buffer=zcImages[front-1].buffer; // retained for the boot
+    // Pipe A CRC, primary plane source (i915 ivb/hsw/bdw: PIPE_CRC_CTL_A
+    // 0x60050, bit 31 enable, source bits 30:29 = 0; result 0x60064).
+    constexpr uint32_t CrcControl=0x60050,CrcResult=0x60064;
+    PlaneIo crc{displayRegs[0]};
+    auto sample=[&](){
+        // Wait two vblanks so the result covers a whole frame after the change.
+        const uint32_t start=Read(BdwFlipRegs::FrameCountA);
+        for(unsigned i=0;i<40 && Read(BdwFlipRegs::FrameCountA)-start<2;++i)SchedulerSleepMs(5);
+        return crc.read32(CrcResult);
+    };
+    crc.write32(CrcControl,1u<<31);
+    out.before[0]=sample();out.before[1]=sample();
+    uint32_t f2=0;uint64_t q2=0;
+    if(!snap(f2,q2) || f2!=front || q2!=sequence){crc.write32(CrcControl,0);out.result="front-changed (keep the desktop idle)";return false;}
+    // Write back every line of the front image (the display only reads memory).
+    uint32_t pages=0;(void)BdwGpuBufferPages(buffer,pages);
+    for(uint32_t page=0;page<pages && page<SurfacePages;++page){
+        const uint64_t base=BdwGpuBufferPageKernelAddress(buffer,page);if(!base)continue;
+        for(uint32_t line=0;line<4096;line+=64)__asm__ volatile("clflush (%0)"::"r"(base+line):"memory");
+        ++out.flushedPages;
+    }
+    __asm__ volatile("mfence":::"memory");
+    out.after[0]=sample();out.after[1]=sample();
+    crc.write32(CrcControl,0);
+    if(!snap(f2,q2) || f2!=front || q2!=sequence){out.result="front-changed (keep the desktop idle)";return false;}
+    out.stableBefore=out.before[0]==out.before[1];out.stableAfter=out.after[0]==out.after[1];
+    out.changed=out.before[1]!=out.after[0];
+    out.result=!out.stableBefore || !out.stableAfter?"crc-unstable (inconclusive)":
+        out.changed?"stale-memory (display saw pixels the CPU flush changed)":"coherent";
+    return true;
+}
 bool BdwZeroCopyArm(const char*& reason){
     if(!BdwBcsScanoutEnabled()){reason="bcs-present-disabled";return false;}
     {const uint64_t f=IrqSpinLockAcquire(&lock);
@@ -821,6 +866,8 @@ void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){
     }
     out.reason=zcReason;out.last=zcLast;out.refusal=zcRefusal;out.stats=zcStats;out.ggtt=zcGgtt;
     IrqSpinLockRelease(&lock,f);
+    out.uncachedRender=BdwZeroCopyUncachedRender();
+    out.renderJobsUc=__atomic_load_n(&zcRenderUc,__ATOMIC_RELAXED);out.renderJobsWb=__atomic_load_n(&zcRenderWb,__ATOMIC_RELAXED);
 }
 #else
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
@@ -830,6 +877,10 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOut
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
+bool BdwZeroCopyUncachedRender(){return false;}
+void BdwZeroCopySetUncachedRender(bool){}
+void BdwZeroCopyNoteRender(bool){}
+bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
 #endif
 #else
 int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZeroCopyGeometry&,BdwZeroCopyRefusal& r){r=BdwZeroCopyRefusal::None;return -38;}
@@ -839,6 +890,10 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOut
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
+bool BdwZeroCopyUncachedRender(){return false;}
+void BdwZeroCopySetUncachedRender(bool){}
+void BdwZeroCopyNoteRender(bool){}
+bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
 #endif
 #elif defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 // Neither option built: the default per-present BCS copy is unchanged.
@@ -859,5 +914,9 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*){return BdwZeroCopyOut
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
+bool BdwZeroCopyUncachedRender(){return false;}
+void BdwZeroCopySetUncachedRender(bool){}
+void BdwZeroCopyNoteRender(bool){}
+bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out){out={};out.result="not built";return false;}
 #endif
 }

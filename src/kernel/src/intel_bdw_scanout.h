@@ -136,6 +136,10 @@ struct BdwRenderRunResult {
     };
     static constexpr unsigned FrequencySampleLimit=12;
     bool sampleFrequency=false;
+    // Input: the job writes zero-copy scanout images (uncached PTEs, PPAT
+    // slot 3). The PAT lease then also makes slot 3 UC for the job, as the
+    // BCS scanout copy does; the inherited policy has every slot WB.
+    bool uncachedScanout=false;
 #if defined(BROOK_BDW_RPS_TRIAL)
     bool tryFrequency=false;
     uint32_t trialFrequencyCaps=0;
