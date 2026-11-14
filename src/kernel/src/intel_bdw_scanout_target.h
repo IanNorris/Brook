@@ -90,9 +90,26 @@ struct BdwZeroCopyStatus {
     bool built,registered,requested,active,disabled;uint32_t images,freeMask,front,armed,queued;
     uint64_t owner,sequence,setupUs,gopReturns,ages[BdwZeroCopyMaxImages];uint32_t surfaces[BdwZeroCopyMaxImages];
     const char* reason;BdwZeroCopyFallback last;BdwZeroCopyRefusal refusal;BdwZeroCopyStats stats;BdwFlipGgttDiag ggtt;
+    bool uncachedRender;uint64_t renderJobsUc,renderJobsWb;
 };
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out);
 bool BdwZeroCopyArm(const char*& reason);
 void BdwZeroCopyDisarm();
+// Render jobs writing images lease PPAT slot 3 UC (default on). The toggle
+// exists only to A/B the coherency fix ("gpu zerocopy uc on|off").
+bool BdwZeroCopyUncachedRender();
+void BdwZeroCopySetUncachedRender(bool on);
+void BdwZeroCopyNoteRender(bool uncached);
+// "gpu zerocopy verify": objective coherency check of the front image with
+// the pipe A CRC (primary plane source). Two stable CRCs, then a CLFLUSH of
+// every line of the front image, then two more. A display that already saw
+// the CPU-coherent pixels gives the same CRC; a changed CRC proves the panel
+// was scanning stale memory. Needs zero-copy active and an idle desktop
+// (the front image must not change during the ~0.25 s measurement).
+struct BdwZeroCopyVerify {
+    const char* result;uint32_t front;uint64_t sequence;
+    uint32_t before[2],after[2],flushedPages;bool stableBefore,stableAfter,changed;
+};
+bool BdwZeroCopyVerifyFront(BdwZeroCopyVerify& out);
 #endif
 }

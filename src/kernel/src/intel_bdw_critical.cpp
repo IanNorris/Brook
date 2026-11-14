@@ -409,7 +409,8 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool preparePrivatePat(uint64_t descriptor){return gpuPatLease() && (descriptor&0x119)==0x119;}
                 bool readPrivatePat(uint32_t& l,uint32_t& h){return owned() && io.read32(BdwDellBar0+0x40e0,l) && io.read32(BdwDellBar0+0x40e4,h);}
                 bool safePatTransition(uint32_t l,uint32_t h,uint32_t nl,uint32_t nh){
-                    return owned() && l==0x03030303u && h==0x03030303u && nl==0x03030307u && nh==0x0303030bu;
+                    return owned() && l==0x03030303u && h==0x03030303u &&
+                        nl==(result.uncachedScanout?0x00030307u:0x03030307u) && nh==0x0303030bu;
                 }
                 bool drainAndInvalidate(){
                     uint32_t l=0,h=0;if(!readPrivatePat(l,h) || l==0xffffffffu || h==0xffffffffu)return false;
@@ -471,9 +472,10 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 uint64_t scratch;uint32_t (&snapshot)[20*1024];bool rebased;BdwPatLease lease;
                 BdwPatMmio<RenderOwner> pat;
                 Transaction(RenderOwner& owner,BdwRenderDeviceBackend<RenderOwner>& b,BdwRenderRunResult& r,uint64_t s,uint32_t (&snap)[20*1024],bool second)
-                    :o(owner),backend(b),result(r),scratch(s),snapshot(snap),rebased(second),pat(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage)){}
+                    :o(owner),backend(b),result(r),scratch(s),snapshot(snap),rebased(second),
+                     pat(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),r.uncachedScanout){}
                 bool initializeGt(){return BdwTimedTransaction(result,0,[&](){return o.restoreRenderState();});}
-                bool establishPat(){return BdwTimedTransaction(result,1,[&](){const bool ok=lease.Establish(pat,0x119);o.patActive=ok;
+                bool establishPat(){return BdwTimedTransaction(result,1,[&](){const bool ok=lease.Establish(pat,0x119,result.uncachedScanout);o.patActive=ok;
                     if(lease.State()==BdwPatLeaseState::Quarantined)o.fault=true;return ok;});}
 #if defined(BROOK_BDW_RPS_TRIAL)
                 bool restoreFrequency=false;

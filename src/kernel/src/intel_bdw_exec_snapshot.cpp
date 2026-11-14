@@ -167,6 +167,11 @@ uint32_t BdwExecSnapshotDependencies(const BdwExecSnapshot* s){
         if(state==2)return 2;if(!state)pending=true;}
     return pending?0:1;
 }
+bool BdwExecSnapshotHasUncached(const BdwExecSnapshot* s){
+    if(!s || !s->objects)return false;
+    for(uint32_t i=0;i<s->count;++i)if(s->objects[i].uncached)return true;
+    return false;
+}
 bool BdwExecSnapshotShadowStoreProbe(BdwExecSnapshot* s){
     if(!s || __atomic_load_n(&s->state,__ATOMIC_ACQUIRE)!=0 || s->probeShadowed || s->count!=2 ||
        s->batchIndex>=s->count || s->batchOffset || s->batchLength!=24)return false;

@@ -589,7 +589,16 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
 #endif
     BdwTraceSnapshot(snapshot,FrameDeviceBegin);
 #endif
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    // Zero-copy images are mapped with PPAT slot 3; lease it UC for this job
+    // (inherited: WB, invisible to the non-snooping display engine).
+    const bool scanoutImages=BdwExecSnapshotHasUncached(snapshot);
+    run.uncachedScanout=scanoutImages && BdwZeroCopyUncachedRender();
+#endif
     VmmDellRenderRun(tsc.khz,pinned.first,pinned.token,scratch.dma,context,out,run);
+#if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+    if(scanoutImages)BdwZeroCopyNoteRender(run.uncachedScanout);
+#endif
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     const uint64_t deviceTicks=tick();
 #endif
