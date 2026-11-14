@@ -510,6 +510,18 @@ void HdaRuntimeRegister(){
     }
     observation.runtimeRegistered=true;observation.runtimeReason="registered muted (experimental)";
     SerialPrintf("HDA_RUNTIME registered muted experimental\n");
+    // The Dell queue needs guard+burst+2 lines (~5.2 KiB, ~30 ms) of published
+    // lead ahead of the DMA cursor. Charging that hardware-resident source
+    // against a small client FIFO (Chromium/ALSA: 1920 frames) leaves less than
+    // one mixer period of slack, so submissions land behind the guard, the
+    // queue pads silence and the source drains at ~0.78x real time (gen 371:
+    // 34.5k source frames/s, 9.4k gap frames/s). A downstream allowance lets
+    // the client FIFO refill while its copy is in hardware; delay and drain
+    // still follow physical completion. Opt out with /etc/audio-staging-off.
+    if(!Marker("/etc/audio-staging-off") && !AudioMixerStagingEnabled()) {
+        if(AudioMixerStagingSetFrameLimit(HdaRuntimeDefaultStagingFrames))AudioMixerStagingEnable(true);
+        SerialPrintf("audio: Dell downstream allowance %u frames (default)\n",AudioMixerStagingFrameLimit());
+    }
 }
 void HdaRuntimeShutdown(){
     if(!runtimeBridge || !observation.runtimeRegistered)return;

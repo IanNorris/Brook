@@ -175,3 +175,29 @@ startup staging default(off) and default ALSA package selection remain unchanged
 the tested downstream bridge is an explicit package option until mixed-workload
 and lifecycle acceptance is complete. The incomplete GPU delayed-vertex recovery
 remains on its separate WIP branch, not part of the milestone integration.
+
+## Dell default (14 Nov 2026, gen 371 diagnosis)
+
+**Symptom.** Chromium YouTube on the Dell played slow with audible flutter. Over 10.5 s of live playback, the single mixer stream (capacity 1920, fragment 64) submitted and completed about 34.5k source frames/s. The Dell queue published the same 34.5k frames/s, plus about 9.4k frames/s of reserved silence (`later_gap_bytes`, 26 events/s). Firefox on the same boot (capacity 4416) ran at 44.24k frames/s with no gaps.
+
+**Cause.**
+- The Dell HDA queue publishes a submission only at least guard + burst + 2 lines ahead of the DMA cursor. That is 4096 + 1024 + 128 bytes, about 1,312 frames (30 ms) (`hda_dell_stream_queue.h`, `minBegin`).
+- The stock ALSA OSS plugin bounds its outstanding source (delay, which includes the hardware-resident copy) by its logical ring.
+- Chromium's 1920-frame ring leaves about 600 frames for one 10 ms callback plus the 12.8 ms mixer period, which isn't enough. Most submissions arrive behind the guard, so the queue pads silence and the source drains at about 0.8× real time.
+- Firefox's 4416-frame ring covers the lead.
+- Kernel staging alone does not help the stock plugin, because the plugin still charges physical delay against its own ring.
+
+**Fix.**
+- `HdaRuntimeRegister` enables a 4096-frame downstream allowance by default. Opt out with `/etc/audio-staging-off`; a boot option that already configured staging takes precedence.
+- The Dell package set (`nix/hardware-network-packages.nix`) builds Chromium and Firefox with the downstream-aware plugin (`downstreamStaging = true`).
+- Delay, drain and GETOPTR still follow physical completion.
+- `AudioClockNowNs` falls back to the invariant TSC on bare metal, so audio timing diagnostics no longer report only `invalid_clock`.
+
+**Host model** (`test_hda_dell_audio_pacing`): the real mixer and Dell bridge with a 12.8 ms mixer period and 10 ms client callbacks.
+
+| Case | Source frames/s | Gaps |
+|---|---|---|
+| Chrome, stock plugin, 1920 | 35.8k | 18.8% |
+| Firefox, stock plugin, 4416 | 44.1k | 0 |
+| Chrome, stock plugin, 1920 + staging | 35.8k | 18.8% |
+| Chrome, downstream plugin + staging | 44.1k | 0 |

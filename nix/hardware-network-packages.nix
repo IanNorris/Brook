@@ -5,8 +5,10 @@ let
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
   graphics = import ./runtime-graphics.nix { inherit pkgs; };
-  firefox = import ../tools/firefox-brook-pkg { inherit pkgs; };
-  chromium = import ../tools/chromium-brook-pkg { inherit pkgs; };
+  # The Dell kernel enables a 4096-frame downstream allowance with its HDA
+  # runtime; the downstream-aware OSS plugin is the matching client half.
+  firefox = import ../tools/firefox-brook-pkg { inherit pkgs; downstreamStaging = true; };
+  chromium = import ../tools/chromium-brook-pkg { inherit pkgs; downstreamStaging = true; };
   gallery = import ../tools/brook-gallery-pkg { inherit pkgs; };
   intelVulkan = import ../tools/mesa-hasvk-brook-pkg/launcher.nix { inherit pkgs; };
   intelVulkanDriver = import ../tools/mesa-hasvk-brook-pkg/default.nix { inherit pkgs; };
