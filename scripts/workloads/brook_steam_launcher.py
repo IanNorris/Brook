@@ -63,8 +63,11 @@ def main():
                 '--skip-bootstrap', '--display', display]
     log = brook / 'steam-launcher.log'
     with log.open('a') as output:
+        # -nolock: the X server creates its lock with link(), which Brook's
+        # volatile /tmp does not support ("Linking lock file ... Operation not
+        # supported"). The launcher's own X14 existence check above stands in.
         server = subprocess.Popen([str(xephyr), display, '-screen', '1280x800',
-                                   '-resizeable', '-nolisten', 'tcp'],
+                                   '-resizeable', '-nolisten', 'tcp', '-nolock'],
                                   env=env, stdout=output, stderr=output)
         try:
             deadline = time.monotonic() + 12
