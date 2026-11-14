@@ -1201,7 +1201,12 @@ static int ExecCommand(int argc, const char* const* argv)
             const char* base = resolved;
             for (const char* q = resolved; *q; ++q)
                 if (*q == '/') base = q + 1;
-            if (SchedulerFindProcessByBaseName(base))
+            // The boot GPU provider is the same waylandd built with the Vulkan
+            // compositor but runs as INTLWL.ELF; a second server would steal
+            // /tmp/wayland-0 and route every later app to CPU composition.
+            const bool providerRunning = StrEq(base, "waylandd") &&
+                SchedulerFindProcessByBaseName("INTLWL.ELF");
+            if (providerRunning || SchedulerFindProcessByBaseName(base))
             {
                 KPrintf("shell: '%s' already running, skipping\n", base);
                 return 0;
