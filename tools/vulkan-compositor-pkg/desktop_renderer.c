@@ -1323,14 +1323,17 @@ int main(int argc,char **argv){
     const long caps=syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_CAPS,0,0,0,0,0);
     g_presentFrame=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_FRAME);
     g_dependentPartial=caps>0 && (caps&BROOK_GPU_PRESENT_CAP_DEPENDENT);
-    /* BROOK_RENDER_PIPELINE=2 prepares the next frame while the previous
-     * one composes or presents. It needs the buffered partial renderer and
+    /* Pipelined admission (the default; BROOK_RENDER_PIPELINE=1 or
+     * "serial" opts out) prepares the next frame while the previous one
+     * composes or presents. It needs the buffered partial renderer and
      * dependent reservations, and queues presents (unless
      * BROOK_RENDER_ASYNC_PRESENT=0) so preparation overlaps the blit. */
-    const unsigned pipeline=desktop_pipeline_parse(getenv("BROOK_RENDER_PIPELINE"));
-    if(!pipeline){fprintf(stderr,"BROOK_RENDER_PIPELINE must be 1 or 2\n");close(drm);return 2;}
+    const char *pipelineEnv=getenv("BROOK_RENDER_PIPELINE");
+    const unsigned pipeline=desktop_pipeline_parse(pipelineEnv);
+    if(!pipeline){fprintf(stderr,"BROOK_RENDER_PIPELINE must be 1, serial or 2\n");close(drm);return 2;}
     g_pipeline=pipeline>1 && depth && g_dependentPartial && getenv("BROOK_RENDER_ASYNC_PARTIAL")?pipeline:DESKTOP_PIPELINE_SERIAL;
-    if(pipeline>1 && g_pipeline<pipeline)fprintf(stderr,"DESKTOP_PIPELINE_UNAVAILABLE depth=%u dependent=%d async_partial=%d serial admission\n",
+    /* Report only an explicit request that cannot be honoured. */
+    if(pipelineEnv && *pipelineEnv && pipeline>1 && g_pipeline<pipeline)fprintf(stderr,"DESKTOP_PIPELINE_UNAVAILABLE depth=%u dependent=%d async_partial=%d serial admission\n",
         depth,g_dependentPartial,getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL);
     const char *asyncPresent=getenv("BROOK_RENDER_ASYNC_PRESENT");
     if(!asyncPresent && g_pipeline>1)asyncPresent="1";

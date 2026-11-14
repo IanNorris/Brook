@@ -13,7 +13,7 @@
  * needs the last accepted ticket as its baseline, an accepted present adds
  * its writes to every younger ticket's dependencies, which a partial present
  * must cover, and an older ticket never presents after a newer one. Queued
- * presents (BROOK_RENDER_ASYNC_PRESENT / BROOK_RENDER_PIPELINE=2) complete
+ * presents (BROOK_RENDER_ASYNC_PRESENT, or the default pipelined mode) complete
  * HOST_E2E_PRESENT_DELAY_US after queueing, checked at every fake call, so
  * the next frame is prepared while the previous one "blits".
  *

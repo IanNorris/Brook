@@ -19,13 +19,14 @@
  *  - Frames retire strictly in ticket order, so the older frame is never
  *    discarded as stale behind its successor.
  *
- * Enabling: BROOK_RENDER_PIPELINE=2 (or the supervisor's --pipeline, which
- * sets it unless already set) with the buffered partial renderer
- * (--async-partial). It turns on queued presents unless
- * BROOK_RENDER_ASYNC_PRESENT=0 keeps them inline. Serial admission stays
- * the default; the boot supervisor passes the variable through, so a live
- * A/B only restarts it:
- *   /boot/VKSUP.ELF --async-partial --pipeline --gpu-source /tmp/brook-desktop-gpu.sock /boot/VKRENDER.ELF
+ * Default: pipelined whenever the buffered partial renderer runs
+ * (--async-partial) and the kernel offers dependent reservations
+ * (validated on the Dell, gen 366+). BROOK_RENDER_PIPELINE=1 (or "serial")
+ * opts out; =2, or the supervisor's --pipeline, requests it explicitly. It
+ * turns on queued presents unless BROOK_RENDER_ASYNC_PRESENT=0 keeps them
+ * inline. The supervisor passes the variable through, so a live serial A/B
+ * only restarts it with BROOK_RENDER_PIPELINE=1:
+ *   /boot/VKSUP.ELF --async-partial --gpu-source /tmp/brook-desktop-gpu.sock /boot/VKRENDER.ELF
  * The stats JSON reports "pipeline" (depth, in flight, submissions by
  * frames in flight, carried/rebased) and "full_forced".
  *
@@ -33,14 +34,15 @@
 #include "desktop_damage.h"
 #include "gpu_output_abi.h"
 #include <stdint.h>
+#include <string.h>
 
 enum { DESKTOP_PIPELINE_SERIAL=1, DESKTOP_PIPELINE_MAX=2 };
 
-/* BROOK_RENDER_PIPELINE: unset or "1" serial, "2" two frames in flight.
- * Returns 0 for an invalid value. */
+/* BROOK_RENDER_PIPELINE: unset or "2" two frames in flight (the default),
+ * "1" or "serial" serial admission. Returns 0 for an invalid value. */
 static inline unsigned desktop_pipeline_parse(const char *value){
-    if(!value || !*value || (value[0]=='1' && !value[1]))return DESKTOP_PIPELINE_SERIAL;
-    if(value[0]=='2' && !value[1])return DESKTOP_PIPELINE_MAX;
+    if(!value || !*value || (value[0]=='2' && !value[1]))return DESKTOP_PIPELINE_MAX;
+    if((value[0]=='1' && !value[1]) || !strcmp(value,"serial"))return DESKTOP_PIPELINE_SERIAL;
     return 0;
 }
 

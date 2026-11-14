@@ -41,8 +41,9 @@ int main(int argc,char **argv){
     if(asyncPartial && (setenv("BROOK_RENDER_ASYNC_PARTIAL","1",1) ||
        setenv("BROOK_RENDER_BUFFER_COUNT","2",1) ||
        setenv("BROOK_RENDER_ASYNC_PARTIAL_GRACE","1",0)))return 1;
-    /* Two frames in flight (desktop_pipeline.h); an explicit environment
-     * value, including BROOK_RENDER_PIPELINE=1, wins. */
+    /* Two frames in flight (desktop_pipeline.h). Now the renderer's default;
+     * kept as an explicit, harmless request. An explicit environment value,
+     * including BROOK_RENDER_PIPELINE=1, wins. */
     if(pipeline && setenv("BROOK_RENDER_PIPELINE","2",0))return 1;
 #ifdef BROOK_SUPERVISOR_SERIAL
     if(!asyncPartial || setenv("BROOK_RENDER_ASYNC_PARTIAL_SERIAL","1",1))return 1;

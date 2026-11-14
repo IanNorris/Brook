@@ -72,8 +72,9 @@ static void model(void){
     printf("DESKTOP_PIPELINE_MODEL_PASS steps=%u after=%u rebased=%u refused=%u\n",STEPS,outcomes[0],outcomes[1],outcomes[2]);
 }
 int main(void){
-    assert(desktop_pipeline_parse(NULL)==1 && desktop_pipeline_parse("")==1 && desktop_pipeline_parse("1")==1);
-    assert(desktop_pipeline_parse("2")==2 && !desktop_pipeline_parse("3") && !desktop_pipeline_parse("22") && !desktop_pipeline_parse("x"));
+    assert(desktop_pipeline_parse(NULL)==2 && desktop_pipeline_parse("")==2 && desktop_pipeline_parse("2")==2);
+    assert(desktop_pipeline_parse("1")==1 && desktop_pipeline_parse("serial")==1);
+    assert(!desktop_pipeline_parse("3") && !desktop_pipeline_parse("22") && !desktop_pipeline_parse("x") && !desktop_pipeline_parse("serialx"));
 
     struct DesktopPipelineInFlight f[3]={{0}};
     assert(desktop_pipeline_admit(2,f,3,0)==DESKTOP_PIPELINE_START);
