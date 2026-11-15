@@ -4,6 +4,15 @@
 is the chrome style, with a customisable accent. The other styles stay in
 Settings › Lab and in this document as future options.
 
+A follow-up the same day made two changes:
+
+- The chosen hue now tints the whole chrome, and the palette that does it is
+  called **Tinted** in the UI. This is part of the design. See
+  [Hue and accent colours](#hue-and-accent-colours).
+- The drawer concept gained a **top dock**, which is now its recommended
+  variant. It is still a concept and is not scheduled. See
+  [Dock and side drawer](#dock-and-side-drawer).
+
 A browser-rendered design proposal that builds on
 the [October glass study](../glass/README.md). Nothing here is a Brook guest
 capture or a native change. Main, the VM and the Dell are untouched.
@@ -18,7 +27,7 @@ scaled to fit the browser. The bar above it is study chrome, not part of Brook.
 Contents:
 
 1. [What you can try](#what-you-can-try)
-2. [Second-pass changes](#second-pass-changes) and [Accent colours](#accent-colours)
+2. [Second-pass changes](#second-pass-changes), [follow-up changes](#follow-up-changes) and [Hue and accent colours](#hue-and-accent-colours)
 3. [Design summary](#design-summary)
 4. [Hit targets and the WmHitTest spec](#hit-targets-and-the-wmhittest-spec)
 5. [Launcher organisation](#launcher-organisation)
@@ -27,7 +36,7 @@ Contents:
 8. [A pluggable, user-mode chrome architecture](#a-pluggable-user-mode-chrome-architecture)
 9. [Token sheet](#token-sheet)
 10. [Implementation order](#implementation-order) and the [full change list](#native-implementation-in-priority-order)
-11. [Ideas backlog](#ideas-backlog): the [side drawer](#side-drawer) concept, not scheduled
+11. [Ideas backlog](#ideas-backlog): the [dock and side drawer](#dock-and-side-drawer) concept, not scheduled
 12. [Limitations](#limitations) and [Files](#files)
 
 All figures in the prototype are illustrative: boot times, frame times,
@@ -41,8 +50,9 @@ cached textures, and the user-mode Vulkan renderer composites GPU quads.
 
 ## What you can try
 
-- **Look.** Palette, accent, mode (Light / Mixed / Dark), opacity, blur and Performance
-  mode, from the study bar or Settings. Settings previews live; Apply saves to
+- **Look.** Palette (Tinted, Smoked, Opal), hue, mode (Light / Mixed / Dark),
+  opacity, blur and Performance mode, from the study bar or Settings. Under
+  Tinted the hue recolours the whole chrome. Settings previews live; Apply saves to
   browser storage and Revert restores the saved look.
 - **Launcher.** Click the B. Type to search. Drag an app onto a category, between
   rows, onto the pinned row or onto “New category”. Drag categories to reorder.
@@ -59,15 +69,18 @@ cached textures, and the user-mode Vulkan renderer composites GPU quads.
   draws the resize bands.
 - **Lab.** Settings › Lab has the four alternative chrome styles, a reactive rim
   light and touch targets.
-- **Side drawer (concept).** Off by default. Settings › Lab › Side drawer, or the
-  Drawer group in the study bar. See [Side drawer](#side-drawer).
+- **Dock (concept).** Off by default. Settings › Lab › Dock and drawer, or the
+  Dock group in the study bar. Top dock is the first choice there; the three
+  side variants are kept for comparison. Drag a window onto the dock, right-click
+  a title bar or task button for “Send to dock”, and drag the dock's lower edge
+  to resize it. See [Dock and side drawer](#dock-and-side-drawer).
 
 URL parameters drive the screenshots: `?shot=1` plus any of `palette`, `mode`,
 `perf`, `opacity`, `blur`, `hud`, `tab`, `focus`, `accent`, `style`, `rim`, `touch`,
 `hits` and `scene` (`boot`, `toasts`, `launcher`, `search`, `organise`, `menu`,
 `drag`, `reorder`, `newcat`, `unsorted`, `empty`, `net`, `vol`, `temp`). The
-drawer concept adds `drawer`, `dedge`, `dapp`, `dstash` and its own scenes,
-listed under [Side drawer](#in-the-prototype).
+dock concept adds `drawer`, `dockh`, `dfs`, `dedge`, `dapp`, `dstash` and its
+own scenes, listed under [Dock and drawer in the prototype](#dock-and-drawer-in-the-prototype).
 
 ## Second-pass changes
 
@@ -89,22 +102,109 @@ One tension to know about: Opal in Mixed mode now pairs green glass with the
 teal accent of Opal light's content. It reads as two related greens, not a clash,
 but it is the one place the palette is not a single hue.
 
-## Accent colours
+## Follow-up changes
 
-The accent is now a setting, separate from the palette. Settings › Appearance has
-a swatch row: **Palette default**, eleven fixed hues, and **Wallpaper**.
+Ian's feedback on the settled design and on the drawer concept, 15 November.
 
-- Each accent has two values. The bright one is used on dark glass and dark
-  content with dark text on it. The deep one is used on light glass and light
-  content with white text on it. Mixed mode therefore uses the bright value in the
-  chrome and the deep value inside apps.
-- Phosphor is the green from the Phosphor style, as a colour only.
-- Wallpaper is sampled when the wallpaper is set. The value here is for
-  `brook-dawn.png`.
-- Palette default keeps each palette's own accent: Clearwater blue, Smoked steel,
-  Opal green (dark) and teal (light).
+| Request | What changed |
+| --- | --- |
+| The accent should apply to the rest of the chrome | Under the Tinted palette the hue now drives every chrome and app surface: glass, title bars, taskbar, launcher, panels, rims, ink, hairlines, shadows and the content colours. See [What the hue drives](#what-the-hue-drives). |
+| Rename “Clearwater” in the UI so it has no colour association | The palette is **Tinted**. Clearwater stays as the name of the design. See [The palette is called Tinted](#the-palette-is-called-tinted). |
+| Buttons along the top, opposite the taskbar | A fourth variant, the top dock, now the recommended one. |
+| Combine the active buttons with the window info | Each docked app is one tile: icon, name, count and a preview line. The open app's tile is its title bar. |
+| Let the dock be resized, changing the fullscreen dimensions | Drag its lower edge, 36 to 96 px. The dock is outside the work area, so maximised windows fit below it. True fullscreen covers it, with a setting to keep it. |
+| Drag windows onto the dock | The dock is a drop target for a title bar drag, with a slot that shows where the tile will land. |
+| Right-click, send to dock | “Send to dock” on the title bar and the task button; “Return to desktop” on the tile. |
+
+## Hue and accent colours
+
+Settings › Appearance has three palette cards and a row of thirteen swatches: a
+default, eleven fixed hues, and **Wallpaper**.
+
+![Palette cards and the hue row, Hot pink chosen](screenshots/hue-row@2x.png)
+
+![Hot pink, Phosphor, Amber and Violet in Mixed mode](screenshots/hue-mixed.png)
+
+### The palette is called Tinted
+
+- The palette that was labelled Clearwater is now **Tinted**. It has no colour
+  of its own. Under it the swatch row is labelled **Hue**, and the hue you pick
+  tints everything.
+- Why Tinted, and not Vibrant as first suggested:
+  - It says what the palette does, and it stays true for the quiet hues. Slate
+    and the dawn wallpaper's peach are not vibrant.
+  - The three cards now read as three kinds of glass: tinted, smoked and opal.
+- Clearwater remains the name of the design: this document, its folder and the
+  Glass chrome style. No control in the UI uses it for a colour, and the swatch
+  that was “Clearwater blue” is “Blue”.
+- The default hue is Blue, so the default desktop is the one already approved.
+  The first swatch means “Blue (default)” under Tinted and “Palette default”
+  under the other two.
+- Natively the setting is `palette=tinted`. `clearwater` is read as an alias, so
+  an existing `BROOK.CFG` keeps working. The prototype does the same for saved
+  state and URLs.
+
+### What the other palettes are for now
+
+- **Smoked stays.** It is neutral glass with the hue on details only, which is
+  how every palette behaved before this change. Under Smoked and Opal the row
+  is labelled Accent.
+- **Opal is now mostly redundant.** Tinted with Pine green gives Opal dark
+  (glass `0 44 30` against Opal's `12 40 30`, and the same accent). Tinted with
+  Teal gives Opal light. What only Opal has is the pairing: green in the dark,
+  teal in the light. I left it in because Opal light was approved as it is. If
+  the palette list should be shorter, Opal is the one to drop.
+
+### What the hue drives
+
+Under Tinted every row follows the hue. Under Smoked and Opal only the last row
+does.
+
+| On screen | Token | From the hue |
+| --- | --- | --- |
+| Taskbar, inactive title bars, launcher, flyouts, HUD, toasts, the dock | Glass tint | The Blue value, rotated to the hue |
+| Active title bar | Active title top, over the glass tint | same |
+| Performance mode frames, menus, the undo bar, drop chips | Flat fill | same |
+| Text and icons on the chrome | Ink, with its secondary and tertiary alphas | same; it stays near white or near black with a trace of the hue |
+| Hairlines, dividers, hover and pressed fills on light glass | Line and hover tints | same |
+| Window and panel shadows | Shadow colour | same |
+| App surfaces: backgrounds, cards, sidebars, lines, text | Content background, raised, sunken, line, ink, dim ink | same |
+| Accent line, focus ring, active rim, selection, switches, sliders, primary buttons, badges, task indicator | Accent and its derived tokens | The hue's bright and deep values, as before |
+
+Not driven by the hue: the wallpaper, app icons, category colours, the ok, warm
+and hot colours, the red Close hover, the boot bar segments and the Terminal's
+own colour scheme.
+
+### How a hue becomes a token set
+
+The Blue set is the reference. It is the look that was approved. For any other
+hue:
+
+1. Convert the hue's bright accent to OKLCH and take its hue angle and chroma.
+   Blue's `#6aaeff` has hue 254° and chroma 0.14.
+2. For each reference token, keep its lightness, add the difference in hue
+   angle, and multiply its chroma by min(1, accent chroma ÷ Blue's chroma).
+3. Reduce chroma until the colour is inside sRGB.
+4. Check the contrast targets below. If a surface fails, move its lightness
+   away from the text in steps of 0.004 until it passes.
+
+What follows from that:
+
+- Blue reproduces the reference exactly. The default has not moved.
+- Lightness is the same for every hue, so the glass is as dark, and the text on
+  it as readable, in Hot pink as in Blue.
+- A greyish hue gives greyish glass. Slate has a factor of 0.31 and lands close
+  to Smoked. The dawn wallpaper has 0.68 and gives a soft brown, not orange.
+- Warm hues give dark browns: Amber glass is `48 34 0` and Orange is `58 27 1`.
+  That is what a dark amber is. Judge them in `screenshots/hue-all.png`.
+- Teal and Pine green run out of gamut in the dark, so their glass has a zero
+  red channel. Step 3 handles it.
+
+![All twelve hues: Files in Mixed and Dark, and the taskbar](screenshots/hue-all.png)
 
 ### Derived tokens
+
+Unchanged from the accent row, and used by all three palettes.
 
 | Token | On dark surfaces | On light surfaces |
 | --- | --- | --- |
@@ -118,53 +218,156 @@ a swatch row: **Palette default**, eleven fixed hues, and **Wallpaper**.
 | HUD APP colour | Accent. For Orange, Red and Hot pink it is neutral secondary ink, because over-budget bars are red. | same |
 | HUD COMP colour | Teal `#5fd6c8`; blue `#7db8ff` when the accent is itself green or teal | Teal `#0a7f8a`; blue `#1f6fe0` |
 
-### Values and computed contrast
+- Each hue has two values. The bright one is used on dark glass and dark
+  content with dark text on it. The deep one is used on light glass and light
+  content with white text on it. Mixed mode uses the bright value in the chrome
+  and the deep value inside apps.
+- Phosphor is the green from the Phosphor style, as a colour only.
+- Wallpaper is sampled when the wallpaper is set. The value here is for
+  `brook-dawn.png`.
 
-Contrast is the WCAG 2 ratio, computed by script. “Worst” is the lowest ratio
-across all three palettes. The targets were 4.5 for anything used as or under
-text and 3.0 for the accent line on the active title gradient. Every row meets
-them. The script nudged a starting hue lighter or darker until it did; Hot pink
-and the light-surface Blue, Teal, Pine, Lime, Orange and Wallpaper values moved
-slightly.
+### Tinted: values per hue
 
-The dark-surface backgrounds tested were each palette's opaque glass fill and
-raised content colour, and the top of each active title gradient. The
-light-surface backgrounds were each palette's light glass tint, its sunken
-content colour, and white. Glass is translucent, so real contrast varies with the
-wallpaper behind it; the opaque fill is the reference.
+RGB triplets are glass tints; the opacity setting supplies alpha. “Chroma” is
+the factor from step 2.
 
-| Accent | On dark: accent | hover | pressed | text on it | text contrast | on glass/raised (worst) | on active title (worst) | On light: accent | hover | pressed | white text contrast | on light surfaces (worst) | white on hover |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Clearwater blue | `#6aaeff` | `#7fb9ff` | `#5b96db` | `#101e2e` | 7.3 | 6.3 | 3.5 | `#1c65cc` | `#1959b4` | `#154d9b` | 5.6 | 4.7 | 6.7 |
-| Teal | `#4fd3c4` | `#68d9cc` | `#44b5a9` | `#0d2227` | 9.0 | 7.9 | 4.4 | `#09747e` | `#08666f` | `#075860` | 5.5 | 4.7 | 6.7 |
-| Pine green | `#62d6a0` | `#78dcad` | `#54b88a` | `#0f2223` | 9.1 | 8.1 | 4.5 | `#1b7650` | `#186846` | `#155a3d` | 5.6 | 4.7 | 6.8 |
-| Phosphor | `#7dff9b` | `#8fffa9` | `#6cdb85` | `#132722` | 12.4 | 11.6 | 6.4 | `#0f7a33` | `#0d6b2d` | `#0b5d27` | 5.5 | 4.6 | 6.6 |
-| Lime | `#b4e04a` | `#bee463` | `#9bc140` | `#192419` | 10.5 | 9.5 | 5.3 | `#53710c` | `#49630b` | `#3f5609` | 5.6 | 4.7 | 6.8 |
-| Amber | `#f2bb4e` | `#f4c567` | `#d0a143` | `#211f19` | 9.4 | 8.3 | 4.6 | `#8a5a00` | `#794f00` | `#694400` | 5.9 | 5.0 | 7.1 |
-| Orange | `#ff9a57` | `#ffa86f` | `#db844b` | `#221b1a` | 8.1 | 7.0 | 3.8 | `#ae4e0f` | `#99450d` | `#843b0b` | 5.4 | 4.6 | 6.6 |
-| Red | `#ff7a72` | `#ff8d86` | `#db6962` | `#22171e` | 6.8 | 5.7 | 3.2 | `#c4302b` | `#ac2a26` | `#952421` | 5.5 | 4.7 | 6.7 |
-| Hot pink | `#ff6cba` | `#ff81c4` | `#db5da0` | `#221626` | 6.7 | 5.6 | 3.1 | `#c81e7c` | `#b01a6d` | `#98175e` | 5.3 | 4.5 | 6.5 |
-| Violet | `#b79cff` | `#c1aaff` | `#9d86db` | `#191c2e` | 7.4 | 6.4 | 3.5 | `#6a43d6` | `#5d3bbc` | `#5133a3` | 6.2 | 5.2 | 7.4 |
-| Slate | `#a9bdd6` | `#b5c6dc` | `#91a3b8` | `#181f2a` | 8.6 | 7.6 | 4.2 | `#47607f` | `#3e5470` | `#364961` | 6.5 | 5.5 | 7.7 |
-| Wallpaper (dawn) | `#f6b98a` | `#f7c39a` | `#d49f77` | `#211f20` | 9.5 | 8.5 | 4.7 | `#a8511d` | `#94471a` | `#803e16` | 5.4 | 4.6 | 6.6 |
+| Hue | Angle | Chroma | Dark glass | Dark title top | Dark flat fill | Dark app background | Dark app raised | Light glass | Light title top | Light app background | Light app sunken |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Blue | 254° | 1.00 | 16 36 66 | 40 80 138 | 22 40 68 | `#111c2b` | `#18263a` | 226 237 251 | 186 213 248 | `#f5f8fc` | `#eaf0f8` |
+| Teal | 185° | 0.85 | 0 43 41 | 0 94 89 | 0 47 45 | `#0a201e` | `#0d2b29` | 223 240 237 | 176 221 215 | `#f4f9f8` | `#e8f2f0` |
+| Pine green | 161° | 0.96 | 0 44 30 | 0 96 68 | 2 49 34 | `#0c2017` | `#102c20` | 224 241 231 | 179 222 200 | `#f4f9f6` | `#e9f2ed` |
+| Phosphor | 149° | 1.00 | 3 45 22 | 11 97 51 | 12 48 27 | `#0f2014` | `#142b1b` | 226 240 228 | 185 222 191 | `#f5f9f6` | `#eaf2eb` |
+| Lime | 124° | 1.00 | 27 42 4 | 63 91 13 | 31 45 12 | `#171e0d` | `#202912` | 232 239 223 | 201 218 177 | `#f7f9f4` | `#edf1e8` |
+| Amber | 82° | 1.00 | 48 34 0 | 102 76 0 | 52 38 0 | `#231a08` | `#2f240b` | 243 235 219 | 229 208 169 | `#faf7f3` | `#f3efe6` |
+| Orange | 52° | 1.00 | 58 27 1 | 123 62 0 | 61 32 7 | `#28170c` | `#352010` | 249 232 222 | 241 201 176 | `#fbf7f4` | `#f7ede8` |
+| Red | 25° | 1.00 | 61 23 17 | 129 54 44 | 64 28 22 | `#291513` | `#381d19` | 251 231 228 | 246 197 191 | `#fcf6f5` | `#f8eceb` |
+| Hot pink | 350° | 1.00 | 59 22 38 | 124 52 85 | 62 27 41 | `#28151d` | `#361d27` | 248 230 238 | 241 196 215 | `#fbf6f8` | `#f7ecf0` |
+| Violet | 295° | 1.00 | 41 28 62 | 90 65 130 | 45 33 64 | `#1d1829` | `#282137` | 237 233 250 | 214 203 244 | `#f8f7fc` | `#f0eef7` |
+| Slate | 254° | 0.31 | 31 37 46 | 70 81 99 | 35 40 49 | `#181c20` | `#22262c` | 233 236 240 | 203 211 222 | `#f7f8f9` | `#eeeff2` |
+| Wallpaper (dawn) | 59° | 0.68 | 51 31 13 | 109 71 35 | 54 36 19 | `#231910` | `#302217` | 244 234 226 | 230 205 186 | `#faf7f5` | `#f4eeea` |
 
-Palette defaults, same tests: Smoked steel passes everything (9.4, 7.8, 4.3 on
-dark; 6.2 and 5.3 on light). Opal passes on dark (8.8, 8.1, 4.5), and its light
-teal `#0a7f8a` gives 4.8 for white text but 4.0 against Opal's own sunken
-surface. That is above 3.0 for a graphic and below 4.5 for text. I left it
-because Opal light was approved as it is; the Teal swatch (`#09747e`) is the
-compliant version if it matters.
+The full set per hue (ink, lines, shadow, sunken and line colours for both
+modes) is in the generated block of `index.html` under “Tinted palette”.
 
-Hover and pressed keep white-text contrast above 4.5 on light surfaces (the last
-column shows hover). On dark surfaces the pressed value is darker than the accent,
-so dark text on it has less contrast than the figure shown. I did not compute
-that state.
+### Tinted: computed contrast
+
+Contrast is the WCAG 2 ratio, computed by script and floored to one decimal, so
+no figure is flattered by rounding. The targets are 4.5 for anything used as or
+under text and 3.0 for the accent line on the active title gradient.
+
+Glass is translucent, so real contrast varies with the wallpaper behind it. The
+opaque fill is the reference, as before.
+
+On dark glass, and in dark apps (Dark mode):
+
+| Hue | Accent | Ink on glass | Secondary ink | Tertiary ink | Ink on title top | Accent on glass and flat fill (worst) | Accent line on title top | Text on accent | App ink (worst surface) | App dim ink (worst) | Accent on app surfaces (worst) | Ok / warm / hot on glass |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Blue | `#6aaeff` | 14.0 | 8.2 | 4.8 | 7.2 | 6.4 | 3.4 | 7.3 | 12.9 | 6.0 | 6.6 | 7.9 / 8.3 / 5.7 |
+| Teal | `#4fd3c4` | 13.8 | 8.1 | 4.7 | 6.9 | 7.9 | 4.1 | 8.9 | 12.7 | 6.0 | 8.2 | 7.8 / 8.2 / 5.6 |
+| Pine green | `#62d6a0` | 13.8 | 8.1 | 4.7 | 6.9 | 7.9 | 4.2 | 9.1 | 12.7 | 5.9 | 8.2 | 7.8 / 8.1 / 5.6 |
+| Phosphor | `#7dff9b` | 13.7 | 8.0 | 4.7 | 6.8 | 11.4 | 6.0 | 12.4 | 12.9 | 6.0 | 11.9 | 7.7 / 8.1 / 5.5 |
+| Lime | `#b4e04a` | 13.7 | 8.1 | 4.7 | 7.0 | 9.5 | 5.0 | 10.4 | 12.9 | 6.0 | 9.8 | 7.8 / 8.1 / 5.6 |
+| Amber | `#f2bb4e` | 14.0 | 8.2 | 4.8 | 7.2 | 8.4 | 4.6 | 9.4 | 12.9 | 5.9 | 8.7 | 7.9 / 8.3 / 5.7 |
+| Orange | `#ff9a57` | 14.1 | 8.2 | 4.7 | 7.4 | 7.1 | 3.9 | 8.0 | 13.0 | 5.9 | 7.3 | 8.0 / 8.4 / 5.7 |
+| Red | `#ff7a72` | 14.1 | 8.2 | 4.7 | 7.5 | 5.9 | 3.3 | 6.8 | 13.0 | 5.9 | 6.0 | 8.1 / 8.5 / 5.8 |
+| Hot pink | `#ff6cba` | 14.2 | 8.3 | 4.7 | 7.6 | 5.8 | 3.2 | 6.6 | 12.9 | 5.9 | 5.9 | 8.1 / 8.5 / 5.8 |
+| Violet | `#b79cff` | 14.2 | 8.3 | 4.8 | 7.5 | 6.5 | 3.6 | 7.3 | 12.9 | 6.0 | 6.7 | 8.1 / 8.4 / 5.8 |
+| Slate | `#a9bdd6` | 13.8 | 8.2 | 4.8 | 7.2 | 7.7 | 4.1 | 8.6 | 12.8 | 5.9 | 7.9 | 7.9 / 8.2 / 5.6 |
+| Wallpaper (dawn) | `#f6b98a` | 14.0 | 8.2 | 4.8 | 7.3 | 8.6 | 4.7 | 9.5 | 13.0 | 5.9 | 8.9 | 8.0 / 8.4 / 5.7 |
+
+On light glass, and in light apps (Light and Mixed modes):
+
+| Hue | Accent | Ink on glass | Secondary ink | Tertiary ink | Ink on title top | Accent on glass and flat fill (worst) | Accent line on title top | White on accent | App ink (worst surface) | App dim ink (worst) | Accent on app background and sunken (worst) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Blue | `#1c65cc` | 12.9 | 6.7 | **4.1** | 10.1 | 4.6 | 3.6 | 5.5 | 12.4 | 4.6 | 4.8 |
+| Teal | `#09747e` | 12.7 | 6.7 | **4.1** | 10.1 | 4.6 | 3.7 | 5.5 | 12.3 | 4.5 | 4.8 |
+| Pine green | `#1b7650` | 12.8 | 6.7 | **4.1** | 10.2 | 4.6 | 3.7 | 5.5 | 12.2 | 4.5 | 4.8 |
+| Phosphor | `#0f7a33` | 12.7 | 6.6 | **4.1** | 10.2 | 4.5 | 3.7 | 5.4 | 12.3 | 4.5 | 4.7 |
+| Lime | `#53710c` | 12.7 | 6.6 | **4.1** | 10.1 | 4.7 | 3.7 | 5.6 | 12.3 | 4.5 | 4.9 |
+| Amber | `#8a5a00` | 12.9 | 6.7 | **4.1** | 10.1 | 4.9 | 3.9 | 5.9 | 12.5 | 4.6 | 5.1 |
+| Orange | `#ae4e0f` | 12.9 | 6.8 | **4.2** | 10.0 | 4.5 | 3.5 | 5.3 | 12.5 | 4.6 | 4.6 |
+| Red | `#c4302b` | 13.0 | 6.9 | **4.2** | 10.1 | 4.5 | 3.5 | 5.5 | 12.5 | 4.6 | 4.7 |
+| Hot pink | `#c71d7b` | 12.9 | 6.8 | **4.2** | 10.0 | 4.5 | 3.5 | 5.3 | 12.7 | 4.7 | 4.6 |
+| Violet | `#6a43d6` | 12.9 | 6.7 | **4.1** | 10.0 | 5.1 | 4.0 | 6.2 | 12.5 | 4.6 | 5.3 |
+| Slate | `#47607f` | 12.8 | 6.6 | **4.1** | 10.0 | 5.3 | 4.2 | 6.4 | 12.4 | 4.6 | 5.6 |
+| Wallpaper (dawn) | `#a8511d` | 12.9 | 6.7 | **4.1** | 10.1 | 4.5 | 3.5 | 5.4 | 12.5 | 4.6 | 4.7 |
+
+Every cell meets its target except the column in bold, which is discussed
+below. `index.html?selftest=1` reads the live tokens back from the page and
+measures the ink, accent, text-on-accent and app-surface pairs again for all
+twelve hues in both glass modes. It does not repeat the secondary and tertiary
+ink or the signal colours.
+
+### Smoked and Opal: accent contrast
+
+The same accents on the two fixed palettes. “Worst” is the lower of Smoked and
+Opal. The dark surfaces tested are each palette's glass tint, flat fill and
+raised content colour. The light surfaces are each palette's glass tint, flat
+fill, sunken content colour, and white.
+
+| Accent | On dark: accent | hover | pressed | text on it | text contrast | text on pressed | on glass, flat fill and raised (worst) | on active title (worst) | On light: accent | hover | pressed | white text contrast | on light surfaces (worst) | on light title top (worst) | white on hover |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Blue | `#6aaeff` | `#7fb9ff` | `#5b96db` | `#101e2e` | 7.3 | 5.4 | 6.3 | 3.7 | `#1c65cc` | `#1959b4` | `#154d9b` | 5.5 | 4.6 | 3.8 | 6.7 |
+| Teal | `#4fd3c4` | `#68d9cc` | `#44b5a9` | `#0d2227` | 8.9 | 6.6 | 7.9 | 4.6 | `#09747e` | `#08666f` | `#075860` | 5.5 | 4.6 | 3.8 | 6.6 |
+| Pine green | `#62d6a0` | `#78dcad` | `#54b88a` | `#0f2223` | 9.1 | 6.7 | 8.0 | 4.7 | `#1b7650` | `#186846` | `#155a3d` | 5.5 | 4.6 | 3.8 | 6.7 |
+| Phosphor | `#7dff9b` | `#8fffa9` | `#6cdb85` | `#132722` | 12.4 | 9.0 | 11.5 | 6.7 | `#0f7a33` | `#0d6b2d` | `#0b5d27` | 5.4 | 4.5 | 3.7 | 6.6 |
+| Lime | `#b4e04a` | `#bee463` | `#9bc140` | `#192419` | 10.4 | 7.7 | 9.5 | 5.5 | `#53710c` | `#49630b` | `#3f5609` | 5.6 | 4.7 | 3.8 | 6.8 |
+| Amber | `#f2bb4e` | `#f4c567` | `#d0a143` | `#211f19` | 9.4 | 6.9 | 8.3 | 4.8 | `#8a5a00` | `#794f00` | `#694400` | 5.9 | 4.9 | 4.0 | 7.1 |
+| Orange | `#ff9a57` | `#ffa86f` | `#db844b` | `#221b1a` | 8.0 | 5.9 | 6.9 | 4.0 | `#ae4e0f` | `#99450d` | `#843b0b` | 5.3 | 4.5 | 3.7 | 6.5 |
+| Red | `#ff7a72` | `#ff8d86` | `#db6962` | `#22171e` | 6.8 | 5.1 | 5.7 | 3.3 | `#c4302b` | `#ac2a26` | `#952421` | 5.5 | 4.6 | 3.8 | 6.7 |
+| Hot pink | `#ff6cba` | `#ff81c4` | `#db5da0` | `#221626` | 6.6 | 5.0 | 5.6 | 3.3 | `#c71d7b` | `#af1a6c` | `#97165d` | 5.3 | 4.5 | 3.7 | 6.5 |
+| Violet | `#b79cff` | `#c1aaff` | `#9d86db` | `#191c2e` | 7.3 | 5.5 | 6.3 | 3.7 | `#6a43d6` | `#5d3bbc` | `#5133a3` | 6.2 | 5.1 | 4.2 | 7.4 |
+| Slate | `#a9bdd6` | `#b5c6dc` | `#91a3b8` | `#181f2a` | 8.6 | 6.4 | 7.5 | 4.4 | `#47607f` | `#3e5470` | `#364961` | 6.4 | 5.4 | 4.4 | 7.7 |
+| Wallpaper (dawn) | `#f6b98a` | `#f7c39a` | `#d49f77` | `#211f20` | 9.5 | 7.0 | 8.4 | 4.9 | `#a8511d` | `#94471a` | `#803e16` | 5.4 | 4.5 | 3.7 | 6.6 |
+
+Palette defaults, against their own surfaces:
+
+- Smoked passes everything: 9.3 for text on its accent, 8.5 on its glass and
+  5.7 on its title top; on light, 6.2 for white text and 5.2 at worst.
+- Opal passes on dark: 8.7, 8.0 and 4.7. Its light teal `#0a7f8a` gives 4.7 for
+  white text but 4.1 against Opal's own flat fill and sunken surface. That is
+  above 3.0 for a graphic and below 4.5 for text. I left it because Opal light
+  was approved as it is. The Teal swatch (`#09747e`) is the compliant version.
+
+### What moved, and what still falls short
+
+Adjusted in this pass:
+
+- **Hot pink's deep value went from `#c81e7c` to `#c71d7b`.** The old value gave
+  4.46 against Smoked's light flat fill, which is the Performance mode surface.
+  The earlier pass did not test flat fills. The new value gives 4.5.
+- **Orange and Hot pink: the Tinted light flat fill was lightened by one step**
+  (0.004 in OKLCH lightness) to reach 4.5 under their deep accents.
+- No dark surface needed to move for any hue, and no hue was dropped.
+- Text on a pressed accent is now computed. The lowest is 5.0, for Hot pink.
+
+Still short, and not changed:
+
+- **Tertiary ink on light glass is 4.1 to 4.2 for every hue, including the
+  approved Blue.** It is also 4.2 on Smoked light and 4.3 on Opal light. It is
+  the 62% ink used for eyebrows, hints, key caps and counts. It is above 3.0
+  and below 4.5. The hue did not cause it and does not change it. Raising the
+  alpha from 62% to 66% gives 4.6 on Blue. I recommend that, and did not make
+  the change because the light glass was approved as it is.
+- Opal's own light accent, as above.
+
+Not a contrast failure, but worth seeing before choosing a warm hue:
+
+- On Red, Orange and Hot pink glass, the warm and hot signals keep their
+  contrast (5.7 or more) but lose their separation by hue. A hot tray
+  temperature is red text on dark red glass. The HUD already switches its APP
+  bars to neutral ink for these three hues. The red Close hover is in the same
+  position.
+- The lowest accent line is Hot pink at 3.2 on its own title top, against a
+  target of 3.0. Red is 3.3 and Blue is 3.4.
+
+![Hot pink, Phosphor, Orange and Teal in Dark mode, with the top dock open](screenshots/hue-dark.png)
 
 ### HUD colours
 
 | Accent | HUD APP colour | HUD COMP colour (dark / light) |
 | --- | --- | --- |
-| Clearwater blue | accent | `#5fd6c8` / `#0a7f8a` |
+| Blue | accent | `#5fd6c8` / `#0a7f8a` |
 | Teal | accent | `#7db8ff` / `#1f6fe0` |
 | Pine green | accent | `#7db8ff` / `#1f6fe0` |
 | Phosphor | accent | `#7db8ff` / `#1f6fe0` |
@@ -179,14 +382,27 @@ that state.
 
 ### Native notes
 
-- Store `accent=<name>` in `[Desktop]`, default `auto`. A table of 12 rows × 2
-  values lives beside the palettes in `brook_theme.h`. Hover, pressed, rim and
-  selection are computed at material-cache rebuild, which an accent change
-  triggers once.
+- `[Desktop]` holds `palette=tinted`, `smoked` or `opal`, with `clearwater`
+  read as `tinted`, and `accent=<name>`, default `auto`. Under Tinted, `auto`
+  means Blue.
+- `brook_theme.h` keeps the 12 rows × 2 accent values, and gains the Blue
+  reference set and the derivation above. Hover, pressed, rim and selection
+  are computed at material-cache rebuild, as before. So is the Tinted set. It
+  is about thirty tokens of floating-point maths, once per hue change.
+- The derivation has to exist in code and not only as a table, because the
+  Wallpaper row is not known until a wallpaper is set. The tables in this
+  section are its test vectors: a host test derives the twelve hues, compares
+  them with these values and asserts the contrast targets.
 - The Wallpaper row is filled at wallpaper-set time: take the most saturated
   cluster of a downsampled histogram, then run the same lighten-or-darken loop
   until it meets 4.5 on both surface sets.
-- Cost: cheap. It is token work plus one GTK swatch row.
+- App surfaces follow the hue, so the content colours have to reach apps at
+  runtime. Settings is GTK3: write them as `@define-color` lines in a small
+  generated CSS file and reload it on change. Native Brook apps read them from
+  the theme. Before this change six fixed sets would have done.
+- A painter that hard-codes a blue will show up at once under any other hue.
+  That is a reason to land the hue before the chrome repaint.
+- Cost: cheap to moderate. It was cheap when the hue touched only details.
 
 ## Design summary
 
@@ -214,8 +430,10 @@ This carries over from the first pass, updated for the new sizes.
   a proportional Firmware / Menu / Loader / Kernel bar. No countdown bar.
 - **Type and icons.** DejaVu Sans and Hack, Regular and Bold only, 11 px minimum.
   One icon set on a 16 px grid with a 1.5 px stroke.
-- **Palettes.** A palette is a hue and a mode is a lightness. Each palette has its
-  own accent: Clearwater blue, Opal green (dark) and teal (light), Smoked steel.
+- **Palettes.** Tinted takes one hue from the swatch row and applies it to
+  everything; its default hue is Blue. Smoked is neutral glass with the hue on
+  details only. Opal pairs green glass in the dark with teal in the light. A
+  mode is a lightness.
 
 ## Hit targets and the WmHitTest spec
 
@@ -488,12 +706,16 @@ Settings › Lab.
 - **In Brook.** When the wallpaper is set, sample its most vivid hue and use it for
   the accent: focus rim, accent line, selection, switches, primary buttons. With
   the dawn wallpaper that is a warm peach (`#f6b98a` on dark glass, `#a8511d` on
-  light content) against blue glass. Glass tints stay with the palette.
+  light content). Under Smoked the glass stays neutral and only the accent
+  changes. Under Tinted the glass follows it too, as a soft brown.
 - **Why it works.** A warm accent on cool glass has far more life than blue on
-  blue, and changing the wallpaper refreshes the whole desktop. Limiting it to one
-  colour avoids Material You's tendency to tint everything into mud.
+  blue, and changing the wallpaper refreshes the whole desktop. One hue with
+  fixed lightness, capped chroma and checked contrast avoids Material You's
+  tendency to tint everything into mud. See
+  [How a hue becomes a token set](#how-a-hue-becomes-a-token-set).
 - **Native cost.** Cheap. One histogram over a downsampled wallpaper when it
-  changes, then two contrast-clamped accent values and a material-cache rebuild.
+  changes, then two contrast-clamped accent values, the hue derivation and a
+  material-cache rebuild.
 - **Status.** Adopted as the last swatch of the accent row. The value is hard-coded
   for this wallpaper in the prototype.
 
@@ -741,17 +963,25 @@ Values are logical pixels at 200%. Double them for device pixels.
 
 RGB triplets are tints; the opacity setting supplies alpha.
 
-| Token | Clearwater dark | Smoked dark | Opal dark | Clearwater light | Smoked light | Opal light |
+| Token | Tinted (Blue) dark | Smoked dark | Opal dark | Tinted (Blue) light | Smoked light | Opal light |
 | --- | --- | --- | --- | --- | --- | --- |
 | Glass tint | 16 36 66 | 22 26 34 | 12 40 30 | 226 237 251 | 235 238 243 | 234 247 247 |
 | Active title top | 40 80 138 | 54 62 78 | 28 86 62 | 186 213 248 | 208 215 226 | 190 231 231 |
 | Flat fill (Performance) | 22 40 68 | 30 34 43 | 17 46 36 | 226 235 247 | 232 235 240 | 230 243 243 |
-| Accent | `#6aaeff` | `#a6c0e2` | `#62d6a0` | `#1f6fe0` | `#44628c` | `#0a7f8a` |
-| Text on accent | `#06213f` | `#101a28` | `#05281a` | `#ffffff` | `#ffffff` | `#ffffff` |
+| Accent | `#6aaeff` | `#a6c0e2` | `#62d6a0` | `#1c65cc` | `#44628c` | `#0a7f8a` |
+| Text on accent | `#101e2e` | `#101a28` | `#05281a` | `#ffffff` | `#ffffff` | `#ffffff` |
 | Second graph colour | `#5fd6c8` | `#8fd0c6` | `#7db8ff` | `#0a7f8a` | `#2f7d78` | `#1f6fe0` |
-| Active rim | 188 214 255 / 62% | 214 224 240 / 55% | 178 240 208 / 58% | 48 110 210 / 60% | 70 96 136 / 60% | 10 127 138 / 58% |
+| Active rim | 106 174 255 / 62% | 214 224 240 / 55% | 178 240 208 / 58% | 28 101 204 / 60% | 70 96 136 / 60% | 10 127 138 / 58% |
 
 Mixed mode uses the dark glass column with the light content column.
+
+The Tinted columns show its default hue, Blue. The other eleven hues replace
+the glass, ink, line and shadow rows; their values are in
+[Tinted: values per hue](#tinted-values-per-hue). Tinted has no accent of its
+own, so its accent rows are the Blue row of the accent table. That moved two
+values slightly from the old Clearwater defaults: text on accent from `#06213f`
+to `#101e2e`, and the light accent from `#1f6fe0` to the contrast-corrected
+`#1c65cc`.
 
 Shared by all palettes:
 
@@ -768,11 +998,15 @@ Shared by all palettes:
 | Opacity floor | 40% | 55% |
 | Shadow colour | 3 10 22 | 20 34 56 |
 
+Under Tinted, the ink, the light-glass hairline, divider, hover and pressed
+tints, and the shadow colour are rotated to the hue with everything else. The
+values in this table are the Blue ones, and the ones Smoked and Opal use.
+
 Alpha: the taskbar and inactive titlebars use the opacity setting. Active
 titlebars add 8 points. Text-heavy panels add 10. All cap at 100%.
 
-The accent rows above are the palette defaults. The selectable accents are in
-[Accent colours](#accent-colours).
+The accent rows above are the palette defaults. The selectable hues are in
+[Hue and accent colours](#hue-and-accent-colours).
 
 Category colours: blue `#6aaeff`, teal `#5fd6c8`, green `#6fd08c`, amber
 `#f0b35a`, coral `#ff8a73`, pink `#ee8fc0`, violet `#b9a6f5`, slate `#a9b8cc`.
@@ -780,7 +1014,7 @@ Category icons sit on these as `#0b1a2b` glyphs, which reads on both glass modes
 
 ### Content, by palette and mode
 
-| Token | Clearwater dark | Smoked dark | Opal dark | Clearwater light | Smoked light | Opal light |
+| Token | Tinted (Blue) dark | Smoked dark | Opal dark | Tinted (Blue) light | Smoked light | Opal light |
 | --- | --- | --- | --- | --- | --- | --- |
 | Background | `#111c2b` | `#16181d` | `#0f201a` | `#f5f8fc` | `#f6f7f9` | `#f3fafa` |
 | Raised | `#18263a` | `#1f2229` | `#152b23` | `#ffffff` | `#ffffff` | `#ffffff` |
@@ -790,7 +1024,8 @@ Category icons sit on these as `#0b1a2b` glyphs, which reads on both glass modes
 | Dim ink | `#93a4bb` | `#9aa1ad` | `#8fada0` | `#5c6d84` | `#626a77` | `#557072` |
 | Selection | accent 16% | accent 15% | accent 14% | accent 11% | accent 12% | accent 11% |
 
-Content accents equal the glass accent of the same lightness.
+Content accents equal the glass accent of the same lightness. Under Tinted the
+content colours follow the hue as well.
 
 Semantic: ok `#5fcf8f`, warm `#f0b35a`, hot `#ff6f6a`, close hover `#c8414f`.
 Boot segments: Firmware `#7db8ff`, Menu `#b9a6f5`, Loader `#5fd6c8`, Kernel `#f0b35a`.
@@ -866,9 +1101,15 @@ leaves a usable desktop.
    buttons reach the top and right outer edges; the conformance test lands with
    it. Then the new metrics: titlebar 40, taskbar 48 with full-height targets.
 2. **Tokens.** Opal dark green, the re-spaced blur ramp, panels 10 points more
-   solid, Mixed as the default, and the three-way mode setting.
-3. **Accent.** The 12-row accent table, `accent=` in `[Desktop]`, derived tokens
-   at cache rebuild, and the swatch row in Settings. Wallpaper sampling can follow.
+   solid, Mixed as the default, the three-way mode setting, and the palette
+   renamed to Tinted with `clearwater` read as an alias.
+3. **Hue.** The 12-row accent table, `accent=` in `[Desktop]`, and the
+   derivation that turns a hue into the full Tinted token set at cache rebuild,
+   with the tables in this document as its test vectors. Then the swatch row in
+   Settings and the content colours handed to apps. Wallpaper sampling can
+   follow. This step grew: it was accent details only. It now has to land
+   before step 4, so the repaint is checked against several hues and no blue is
+   left hard-coded in the painters.
 4. **Glass chrome repaint.** Sheen, fading accent line, active rim, caption glyphs
    and hover pills, radii and the three shadows.
 5. **Taskbar.** Task button states, tray group with temperature, build chip, clock.
@@ -891,12 +1132,12 @@ The full change list, with costs.
 | --- | --- | --- | --- |
 | 1 | Caption buttons edge to edge, with the hit-test zones above | Cheap | WmHitTest plus the conformance test. This is milestone T0's first use. |
 | 2 | New metrics: titlebar 40, taskbar 48 with full-height targets, launcher button in the corner | Cheap | Layout constants. |
-| 3 | Token values: Opal dark green, per-palette accents, rim colours; Mixed as default | Cheap | `brook_theme.h`. One material-cache rebuild per change. |
+| 3 | Token values: Opal dark green, per-palette accents, rim colours; Mixed as default; palette renamed Tinted, `clearwater` kept as an alias | Cheap | `brook_theme.h`. One material-cache rebuild per change. |
 | 4 | Blur ramp re-spaced; panels 10 points more solid | Cheap | Pass counts per level, tuned by eye. |
 | 5 | Titlebar repaint: smooth sheen, 2 px fading accent line, active rim, inactive at equal opacity | Cheap | Baked into the chrome texture. |
 | 6 | Caption glyphs and hover pill; radii 8 and 12; three-shadow set | Cheap | Regenerates masks and nine-slices. |
 | 7 | Task button states, build chip, tray temperature with warm and hot colours | Cheap | A few quads each. |
-| 8 | Selectable accent: 12-row table, derived tokens, swatch row; wallpaper sampling | Cheap | Token work plus a histogram at wallpaper-set time. |
+| 8 | Selectable hue: 12-row accent table and derived accent tokens; the full Tinted token set derived from the hue; swatch row; content colours handed to GTK and native apps at runtime; wallpaper sampling | Cheap to moderate (was cheap) | OKLCH maths at cache rebuild only, a host test against the tables here, a generated colour file for GTK, and a histogram at wallpaper-set time. Do it before row 5. |
 | 9 | Launcher layout model and `[Launcher]` persistence, category rail, Unsorted, suggestions | Cheap to moderate | Data first; drawable with today's launcher painter. |
 | 10 | Launcher search with text input and ranking over category names | Moderate | Needs text input in a shell surface. |
 | 11 | Launcher ⋯ menu, keyboard reorder, Undo | Moderate | Needs a popup menu component. |
@@ -921,6 +1162,10 @@ The full change list, with costs.
 - **A toast queue** with timers.
 - **Sample history** for temperature and power, and frame-time percentiles.
 - **A wallpaper colour sample**: one accent, and eight rim samples per window.
+- **Hue derivation in the theme code**: sRGB to OKLCH and back, a gamut clamp
+  and the contrast loop, run at material-cache rebuild.
+- **Content colours published at runtime**, so Settings and native apps follow
+  the hue. Today they could be six fixed sets.
 - **A three-way mode setting** and the `[Launcher]` section.
 - **Touch events delivered to the shell**, for auto touch density.
 
@@ -947,7 +1192,7 @@ corner clipping, or a new blur level.
 Ideas raised after the design was settled. Nothing in this section is in the
 implementation order or the change list above.
 
-### Side drawer
+### Dock and side drawer
 
 **Status: concept, not scheduled.** Mocked in the prototype and written up
 here so it can be judged. No native work is planned for it.
@@ -955,49 +1200,409 @@ here so it can be judged. No native work is planned for it.
 Ian's idea (15 Nov): “a side drawer for Socials, messaging apps and so on where
 you can stash other windows for quick access.”
 
-To see it, open Settings › Lab › Side drawer, or use the Drawer group in the
-study bar. It is off by default, and with it off the desktop is the settled
-design: `scene=boot` and `scene=launcher` capture pixel-identical with and
-without this change.
+His follow-up after seeing three side variants: put the buttons along the top,
+opposite the taskbar. Horizontal space is valuable, so combine the active
+buttons with the window info. Let the dock be resized, which changes the space
+a maximised window gets. Drag windows onto the dock, and offer a right-click
+“send to dock”.
 
-![Rail and peek](screenshots/drawer-rail-peek.png)
+That is the **top dock**, and it is now the recommended variant. The three
+side variants stay in Settings › Lab for comparison.
+
+To see it, open Settings › Lab › Dock and drawer, or use the Dock group in the
+study bar. It is off by default. With it off nothing of the dock is drawn and
+the work area is the whole screen above the taskbar; the self-test checks
+that.
+
+![Top dock with Chat open, Terminal docked as a guest](screenshots/dock-open.png)
 
 #### The model
 
-- The drawer holds **entries**, one per app. There are two kinds.
-  - A **resident** lives in the drawer: chat, mail, music, a social feed. It is
-    saved in `[Drawer]`, keeps its entry when it is closed, and starts in the
-    drawer the next time it is launched.
-  - A **guest** is any other window stashed for now. Its entry goes when the
+All four variants share it.
+
+- The dock holds **entries**, one per app. There are two kinds.
+  - A **resident** lives in the dock: chat, mail, music, a social feed. It is
+    saved in `[Dock]`, keeps its entry when it is closed, and starts in the
+    dock the next time it is launched.
+  - A **guest** is any other window docked for now. Its entry goes when the
     window is closed or returned to the desktop.
-  - Residents come first, then a divider, then guests. “Keep in drawer” turns a
+  - Residents come first, then a divider, then guests. “Keep in dock” turns a
     guest into a resident.
-- A **stashed** window keeps running. It leaves the taskbar and Alt+Tab, and
-  the compositor does not draw it.
-- An entry can be **peeked** (shown beside the drawer, which stays open),
+- A **docked** window keeps running. It leaves the taskbar and Alt+Tab, and
+  the compositor does not draw it. The side variants call this “stashed”. It
+  is the same state.
+- An entry can be **opened** (shown below the dock, or beside the rail),
   **returned to the desktop** (an ordinary window again) or **removed**.
 - The closest precedents are the scratchpad in i3 and sway, which has no
-  visible list or badges, and the side panels in Vivaldi and Opera, which hold
-  web pages only.
+  visible list or badges; the side panels in Vivaldi and Opera, which hold web
+  pages only; and menu-bar apps on macOS, which drop a panel from the top edge
+  but are not ordinary windows.
 
-#### Three variants
+#### Four variants
 
-All three are in the prototype and share the model above.
+All four are in the prototype.
 
-| | A. Rail and peek | B. Card shelf | C. Edge tabs |
-| --- | --- | --- | --- |
-| At rest | A 5 px tab on the edge and a count on the taskbar button | The same | One 16 px tab per app, always on screen |
-| Open | A 64 px icon rail, flush to the edge | A 336 px list of cards, each with a preview line and a thumbnail | The tabs widen to 52 px under the pointer |
-| Choosing an app | It opens beside the rail. The rail stays, so the next app is one click | Its window returns to the desktop where it was. There is no peek | It opens beside the tabs |
-| Reply and go back | Open, pick, type, click away | Open, pick, type, stash again | Pick, type, click away |
-| Glass | One strip, 64×852 | One panel, 336×852: 5.25 times the blurred area | None. Flat fill |
-| Needs from apps | An attention count, or just the urgency hint | The same, plus a text summary to preview | The same as A |
-| Needs from Brook | A stashed state and a docked placement | A stashed state and a thumbnail captured at stash time | The same as A |
-| Weakness | Icons only: you learn which app, not what it says | The widest, the most to build, and every use moves a window in and out | A strip sits over the edge of every window, all the time |
+| | T. Top dock | A. Rail and peek | B. Card shelf | C. Edge tabs |
+| --- | --- | --- | --- | --- |
+| At rest | A strip on the top edge, 56 px by default. One tile per app with its name, count and a preview line | A 5 px tab on a side edge and a count on a taskbar button | The same as A | One 16 px tab per app, always on screen |
+| Seeing what is new | Nothing to do. It is on screen | Open the rail, and then icons and counts only | Open the shelf | Hover the tabs |
+| Choosing an app | One click on its tile. It opens below | Two: open the rail, then pick. It opens beside the rail | Two. Its window returns to the desktop; there is no peek | One. It opens beside the tabs |
+| Title bar of the open app | None. Its tile is its title bar | Its own, 40 px | Its own, on the desktop | Its own |
+| Screen taken at rest | 1600×56 off the top of the work area; 36 at Compact | 10×112 | 10×112 | 16×48 per app, over the edge of every window |
+| Width taken when open | Only the app | 64 plus the app | 336 | 52 plus the app |
+| Glass | One strip, always on. Only the wallpaper is ever behind it, so its backdrop can be cached | One strip, 64×852, while open | One panel, 336×852: 5.25 times the rail | None. Flat fill |
+| Needs from apps | An attention count, or just the urgency hint. A summary line is optional; the window title stands in | The same, without the summary | The same, plus a summary to preview | The same as A |
+| Needs from Brook | A docked state, a top inset on the work area and an undecorated placement | A docked state and a docked placement | A docked state and a thumbnail captured at stash time | The same as A |
+| Weakness | It costs height all the time, and a maximised window's Close leaves the top edge | Icons only: you learn which app, not what it says | The widest, the most to build, and every use moves a window in and out | A strip sits over the edge of every window, all the time |
 
-![The three variants](screenshots/drawer-variants.png)
+![The three side variants](screenshots/drawer-variants.png)
 
-#### Recommendation: A, on the left edge
+#### Recommendation: the top dock
+
+For it:
+
+1. **The information is on screen before you ask.** Every docked app shows its
+   name, its unread count and a line of text, with no key and no click. The
+   rail shows one total at rest and icons when open.
+2. **Text wants width.** Names and previews are horizontal text. A strip along
+   the top gives each app 264 px of it. A side rail would have to be about that
+   wide to do the same, and that is the card shelf.
+3. **It takes no width.** Nothing ever sits beside the desktop, so two windows
+   tiled side by side keep 800 px each. The open app covers its own width, not
+   64 px more.
+4. **One surface, one click.** The tile is the button, the unread indicator and
+   the title bar. The open app has no title bar of its own, so it gets back 40
+   of the dock's 56 px.
+5. **It is opposite the taskbar.** The launcher, flyouts and HUD grow up from
+   the bottom. Dock apps drop from the top. They never compete for a corner.
+6. **Its glass is the cheapest in the design.** See
+   [GPU cost](#gpu-cost-and-the-glass-budget).
+
+Against it:
+
+1. **Height is the scarce dimension on this panel.** The stage is 1600×900.
+   The taskbar takes 48, so a maximised window has 852. The dock at 56 leaves
+   796, which is 6.6% less. Compact, at 36, costs 4.2%. The rail costs nothing
+   at rest. This is the real price. The resize handle is how the user sets it.
+2. **A maximised window's caption buttons leave the top edge.** The hit-target
+   spec puts Close in the screen corner. With the dock on, Close keeps the
+   right screen edge, but its top edge is now the dock's lower edge. The corner
+   pixel belongs to the dock's + button, which is harmless to hit by mistake.
+   This weakens the rule that spec leans on hardest. One possible fix is under
+   [Open questions](#open-questions).
+3. **It is there even when it is empty.** Natively an empty dock should hide
+   and give its height back, and appear again when a window is dragged to the
+   top edge. The prototype shows a hint instead.
+
+I looked for a reason strong enough to keep the rail as the recommendation and
+did not find one. The first cost is real but adjustable, down to 36 px. The
+second is real and bounded. Against them, the rail never shows what a message
+says without being opened, and that is the job.
+
+If the dock is turned down for its height, A is still the best of the side
+variants, for the reasons under
+[Among the side variants](#among-the-side-variants-a-on-the-left-edge).
+
+#### The tile
+
+One tile per app. It is the whole target and the whole display.
+
+| Dock height | Tile shows |
+| --- | --- |
+| Compact, 36 to 47 | 22 px icon, name, count. One line |
+| Standard, 48 to 79 | 30 px icon, name, time, count, and one preview line |
+| Tall, 80 to 96 | 40 px icon, name, time, count, and two preview lines |
+
+![Compact, Standard and Tall](screenshots/dock-heights.png)
+
+- **Line two** is the app's summary if it publishes one, and its window title
+  if it does not. A window title needs no protocol and is often enough: “Mira
+  Okafor - Chat”, “Inbox (12) - Mail”. A guest always shows its window title.
+  The residents in the prototype assume a summary.
+- **Width.** 264 px preferred. Tiles shrink evenly to 132 px as more are
+  docked. Past that, the last tile becomes an overflow menu, which is not
+  mocked.
+- **The open tile** takes a tab shape with an accent underline. Its second
+  line becomes the window title, and its right end holds Return to desktop and
+  Close. Clicking the tile again hides the app, which is its Minimise. There
+  is no Maximise.
+- **State marker.** A short bar on the top edge, in the same grammar as the
+  task indicator: short for running, wide and accent for open, hollow for out
+  on the desktop.
+
+#### Opening an app
+
+- Click a tile. The app appears below the dock, with its left edge under its
+  tile, moved left if it would leave the screen.
+- It is the real window at its own width, 360 to 720 px, reaching down to the
+  taskbar. It has no title bar. It takes keyboard focus.
+- It is an overlay. It does not change the work area, and a click anywhere
+  else closes it. Only the strip reserves space.
+- A grip in its lower corner resizes it, 360 to 720 wide and at least 320
+  high. The size is kept per app. Natively this is an ordinary window resize
+  from the right and bottom edges.
+- Switching from one app to another is a cut.
+
+| Input | Action |
+| --- | --- |
+| Click a tile | Opens it. Click again to hide |
+| Super+S | Moves focus to the first tile, or back to where it was |
+| ← → | Move between tiles |
+| Enter, or 1 to 9 | Opens that tile |
+| Alt+← → | Reorders, within residents or within guests |
+| Alt+Enter, Menu key, right-click, long-press | The tile menu |
+| Shift+Enter | Returns that window to the desktop |
+| Delete | Removes the entry |
+| Esc | Unwinds one level: menu, then the open app, then dock focus |
+
+Esc reaches the dock only when a tile has focus. When the open app has focus,
+Esc belongs to the app.
+
+#### Docking a window
+
+![A window dragged onto the dock](screenshots/dock-drag.png)
+
+- **Drag it onto the dock.** A title bar cannot be placed above the dock's
+  lower edge, so a pointer inside the dock during a window drag can mean only
+  one thing.
+  - As soon as the drag starts, a dashed slot labelled “Drop to dock” appears
+    after the last tile. It says that the dock takes windows, and where this
+    one will land.
+  - When the pointer enters the dock, the slot fills with the accent, the
+    dock's lower edge lights, and a soft glow hangs below it.
+  - Release to dock it as a guest. Move back down to cancel.
+  - The window remembers where the drag began, and returns there.
+- **Right-click → Send to dock**, on the title bar and on the task button.
+  Long-press on touch. The menu is Send to dock, Minimise, Maximise,
+  Fullscreen and Close.
+- **Key.** Super+Shift+S docks the focused window.
+- **The + at the right end** docks the focused window.
+- **Caption button.** Only residents get one, and only while they are out on
+  the desktop: a fourth 48×40 button at the left of the run.
+- **Feedback.** The window fades and moves 10 px up, and its new tile pulses.
+  Nothing opens, because docking means “out of my way”.
+
+Many desktops maximise a window dragged to the top edge. Brook maximises by
+double-click, so the edge is free. If drag-to-maximise is ever wanted, the two
+would have to share it.
+
+#### Returning to the desktop
+
+![Title bar menu, tile menu and task button menu](screenshots/dock-menus.png)
+
+- The button in the open tile.
+- **Tile menu → Return to desktop.** The menu is Open or Hide, Return to
+  desktop, Move left, Move right, Keep in dock or Remove from dock, and Close.
+- Drag the tile down off the dock and drop it where the window should go.
+- Shift+Enter on the tile, or Super+Shift+S while the app is open.
+- A returned resident keeps its tile, marked as out; clicking it focuses the
+  window, and its title bar menu and caption button send it back. A returned
+  guest's tile goes.
+- **Remove from dock** (or Delete) drops the entry and returns a running
+  window. **Close** closes the app; a resident's tile stays, dimmed.
+
+Every drag has a menu path and a keyboard path.
+
+#### Resizing, and the work area
+
+![The resize guide over a maximised window](screenshots/dock-resize.png)
+
+- **The dock is outside the work area**, like the taskbar. A maximised window
+  runs from the dock's lower edge to the taskbar. Tiled windows do the same.
+  Floating windows cannot be placed under it, and new windows open below it.
+- **Drag its lower edge** to set the height, from 36 to 96 px. It snaps to 36,
+  56 and 80 within 5 px. Double-click the edge for 56. Settings has the same
+  three as Compact, Standard and Tall.
+- **The height is applied on release.** While dragging there is only a guide
+  line and a chip that reads “80 px · three lines”. Each maximised or tiled
+  client then gets one configure, and the dock's glass is rebuilt once. A live
+  resize would reconfigure every maximised client on every frame.
+- **The handle is the lowest 4 px of the dock**, across its whole width, with
+  a 44×3 grip to mark it. It is inside the dock, so the window below keeps all
+  40 px of its title bar and caption buttons.
+- In touch density the handle is 10 px and the minimum height is 44.
+- Toasts sit 16 px below the dock.
+- The height is saved in `[Dock]`.
+
+#### Fullscreen
+
+- **True fullscreen covers the dock and the taskbar.** A game, a video or F11
+  gets the whole 1600×900. The dock is not drawn and costs nothing.
+- Why: fullscreen is the user saying “only this”. Games want the native
+  resolution, and a strip above a film is the thing fullscreen exists to
+  remove.
+- While a window is fullscreen, attention arrives as a toast, as it does
+  today. Super+S should bring the dock over the fullscreen window until it is
+  dismissed, without resizing the client. The prototype does not show that.
+- **The toggle** is Settings › “Keep the dock over fullscreen”, off by
+  default. With it on, fullscreen means the screen below the dock, and the
+  client is told the smaller size. The taskbar is still covered. It is for
+  watching something while waiting for a message.
+- Maximised is not fullscreen. A maximised window always fits below the dock.
+
+#### States
+
+| Tile state | Shown as |
+| --- | --- |
+| Docked and running | Icon, name, preview, and a 6×3 marker on the top edge |
+| Open | Tab shape with an accent underline, a 24 px accent marker, the window title, and the window's buttons |
+| Out on the desktop | Hollow marker, and “On the desktop” as line two |
+| Not running | Icon at 42%, “Not running”, no marker |
+| Attention with a count | Accent badge with the number, capped at 99+. The preview line turns to full ink |
+| Attention without a count | 10 px accent dot |
+| Playing | A neutral play badge. It is state, not attention, so it never uses the accent |
+| Guest | After the divider. Line two is its window title |
+
+| Dock state | Shown as |
+| --- | --- |
+| Resting | The strip and its tiles |
+| A window is being dragged | A dashed slot after the last tile |
+| Drop target | The slot filled with the accent, the lower edge lit, a glow below |
+| Resizing | A guide line and a chip; the dock itself does not move |
+| Empty | A hint and the +. Natively, hidden |
+| Fullscreen | Not drawn, unless kept |
+
+Badges, the slot and the guide use the accent and its text-on-accent colour, so
+they follow all twelve hues in all three modes with contrast already checked.
+
+#### Sizes and hit targets
+
+| Part | Pointer | Touch density |
+| --- | --- | --- |
+| Dock | Full width; 56 high by default, 36 to 96 | 44 to 96 |
+| Tile | 264 wide, down to 132; from y = 0 to the handle | same |
+| Buttons in the open tile | 36×36; 36×30 at Compact | 44×44 from Standard up |
+| + button | 48 wide, full height, including the top-right corner pixel | same |
+| Resize handle | Full width × 4, inside the dock | × 10 |
+| Drop target | The whole dock. The slot is 172 wide | same |
+| Grip on the open app | 18×18 | 28×28 |
+| Menu item | 36 | 44 |
+
+- Tiles sit edge to edge with no gaps and own y = 0, so pushing the pointer to
+  the top of the screen always lands on one. The first tile includes the
+  top-left corner pixel and the + includes the top-right one.
+- The dock is a shell surface, tested before any window zone.
+- A maximised window below the dock keeps Close on the right screen edge and
+  loses the top one, as noted under the recommendation.
+- At Compact the buttons in the open tile are 36×30, below the 36×36 the size
+  table asks of an icon button. That is the cost of a 36 px dock.
+
+#### Motion
+
+| What | Motion |
+| --- | --- |
+| The dock | None. It never slides, shows or hides |
+| An app opens or hides | The window's fade plus 10 px, 140 ms |
+| Switching the open app | A cut |
+| Docking a window | Fade plus 10 px up, 140 ms; the new tile pulses for 220 ms, twice |
+| Slot and lit edge | 90 ms |
+| Resize | A guide while dragging; the new height is a cut on release |
+
+Nothing animates at rest. Performance mode and reduced motion remove all of
+it.
+
+#### GPU cost and the glass budget
+
+- **Docked means not drawn.** The window is removed from the compositor's quad
+  list and its frame callbacks are withheld, so the client stops rendering, as
+  it would when minimised. Its last buffer is kept so it has a frame to show
+  at once.
+- **The strip is one glass surface, always on**: one of the 16 barriers,
+  permanently. It is 1600×56, a little more than the taskbar's 1600×48. The
+  rail was 64×852 and only while open.
+- **Its backdrop is static.** Windows cannot be placed under it, maximised
+  windows stop at its edge, and fullscreen replaces it. Only the wallpaper is
+  ever behind it. So its blurred backdrop can be rendered once, when the
+  wallpaper, the material or the height changes, and kept as a texture. It
+  needs no blur pass per frame. A window just below it casts a few pixels of
+  shadow behind the strip; leaving that out of the cached backdrop would not
+  be seen.
+- **The open app adds no glass.** It has no title bar. It is one opaque client
+  quad and a shadow. So the open state is one barrier, where rail plus peek was
+  two.
+- **Tiles are part of the strip's cached texture**, like task buttons. A new
+  message re-rasterises one tile, once.
+- **Flat parts.** Menus, the slot, the guide, its chip and the badges use flat
+  fills. The drop glow is one gradient quad.
+- **Worst case.** Dock, taskbar, the launcher or a flyout, the HUD panel and
+  three toasts are seven barriers before any title bar. Toasts and the HUD
+  remain first to fall back to the flat fill.
+
+#### Native capabilities needed
+
+For the top dock. Items marked † are already on the main list for the launcher.
+
+- **A docked window state** in the window manager: out of the taskbar, Alt+Tab
+  and the quad list, frame callbacks withheld, floating geometry and open size
+  remembered.
+- **A top inset on the work area**, set by the dock, and re-applied to
+  maximised and tiled windows when the height changes. I did not read how the
+  taskbar reserves the bottom today.
+- **A dock shell surface** with a cached raster, and hit rectangles for each
+  tile, the buttons in the open tile, the + and the handle.
+- **An undecorated placement** for the open window, anchored under its tile.
+  With the part-based hit table† this is a window with no parts.
+- **A drop target during a window drag**: the drag loop asks the shell whether
+  the pointer is in the dock.
+- **A popup menu component**†, also reachable from title bars and task
+  buttons.
+- **Pointer capture for drags inside a shell surface**†, with a ghost quad.
+- **An attention signal.** The urgency hint or xdg-activation gives the dot. A
+  count, and the optional summary line, need an app-side protocol that Brook
+  does not have yet. The window title is already available.
+- **Launch into the dock:** match a new window's app id against `[Dock]`
+  before it is first mapped, so a resident never flashes on the desktop.
+- **A `[Dock]` section** beside `[Launcher]`: the height, the fullscreen
+  toggle and the ordered list of residents. Guests are not saved.
+- **A fullscreen rule:** the dock leaves the quad list while a fullscreen
+  window is on top, unless the toggle is on.
+- **Two global keys**, Super+S and Super+Shift+S.
+
+Not required: edge gestures (the dock is always on screen, so touch just taps
+a tile), thumbnail capture, media controls, or any new blur level.
+
+#### Cost
+
+Moderate overall, as an estimate on the same basis as the rest of this
+document. It is about the same as the rail: it adds the work-area inset and
+drops the edge gestures and the second surface.
+
+| Part | Cost |
+| --- | --- |
+| Docked state, `[Dock]`, keys | Cheap to moderate |
+| Work-area inset and resize | Cheap to moderate, if the work area is already one rectangle that the taskbar insets. Not checked |
+| Dock surface, tiles, the undecorated open placement | Moderate |
+| Drag onto the dock, tile drag, menus | Moderate, and mostly shared with the launcher's drag and menu work |
+| Fullscreen rule and toggle | Cheap |
+| Attention counts and summaries | Unknown until a protocol is chosen. The dot and the window title are cheap |
+
+If it is ever scheduled it should follow the launcher's menu and drag work,
+because it reuses both.
+
+#### Open questions
+
+- Should a maximised window's caption buttons be drawn in the dock's right
+  end? Close would be back in the screen corner and the window would not need
+  a title bar. It would also tie window chrome to a shell surface.
+- Should an empty dock hide and give its height back? I would say yes.
+- Is auto-hide wanted as an option? It removes the height cost and also the
+  main advantage.
+- Should the open app be pinnable, so a click elsewhere does not close it? I
+  left it out. An app that should stay visible is a window: return it to the
+  desktop and tile it.
+- Should a drop choose its position among the guests? Today it always lands
+  at the end.
+- Should Minimise on a resident dock it, so the dock is simply where those
+  apps go?
+- One entry per app or per window, when an app has two windows?
+- A toast from a docked app: should clicking it open the app in the dock? I
+  would say yes.
+- Which protocol carries the count and the summary?
+
+#### Among the side variants: A, on the left edge
+
+Before the top dock, this was the recommendation. It still holds among the
+three side variants.
 
 1. **It fits the job.** The job is to glance, reply and return. With A that is
    Super+S, a digit, type, and a click away. The window you were in never
@@ -1028,9 +1633,10 @@ the open drawer.
 One thing worth taking from C if A is ever built: a flat tooltip naming the app
 and its count when the pointer rests on a rail icon.
 
-The rest of this section describes A.
+The sections headed “Rail” below describe A as it was designed. They use its
+wording: stash, peek and drawer.
 
-#### Opening and closing
+#### Rail: opening and closing
 
 | Input | Action |
 | --- | --- |
@@ -1048,7 +1654,7 @@ The rest of this section describes A.
   focus, Esc belongs to the app, and Super+S or a click outside closes.
 - The edge tab is hidden while a window is fullscreen. The key still works.
 
-#### Stashing a window
+#### Rail: stashing a window
 
 ![Resting state, drag to the edge, title bar menu](screenshots/drawer-rest-stash.png)
 
@@ -1066,7 +1672,7 @@ The rest of this section describes A.
   Minimise. The taskbar button and edge tab pulse once. The drawer does not
   open, because stashing means “out of my way”.
 
-#### Peeking and returning
+#### Rail: peeking and returning
 
 - A peek is the real window, placed by the window manager beside the rail. It
   keeps its own width, clamped to 360 to 720 px, and takes the full height of
@@ -1082,7 +1688,7 @@ The rest of this section describes A.
 - A returned resident keeps its entry, marked as out. Clicking that entry
   focuses the window. A returned guest's entry goes.
 
-#### Reordering and removing
+#### Rail: reordering and removing
 
 ![Entry menu, reorder drag, a resident out on the desktop](screenshots/drawer-manage.png)
 
@@ -1097,7 +1703,7 @@ The rest of this section describes A.
 - **Close** closes the app. A resident's entry stays, dimmed.
 - Every drag has a menu path and a keyboard path.
 
-#### States
+#### Rail: states
 
 | Entry state | Shown as |
 | --- | --- |
@@ -1122,11 +1728,12 @@ The rest of this section describes A.
 Badges use the accent and its text-on-accent colour from the accent table, so
 they follow all twelve accents in all three modes with contrast already
 checked. `screenshots/drawer-themes.png` shows Opal dark with amber and
-Clearwater light with hot pink on the right edge.
+light glass with a hot pink accent on the right edge. It was captured before
+the hue tinted the glass.
 
 ![Dark Opal with amber; Light with hot pink on the right edge](screenshots/drawer-themes.png)
 
-#### Sizes and hit targets
+#### Rail: sizes and hit targets
 
 | Part | Pointer | Touch density |
 | --- | --- | --- |
@@ -1148,7 +1755,7 @@ Clearwater light with hot pink on the right edge.
 - The peeked window is flush to the top of the screen, so its caption buttons
   own y = 0 like a maximised window's.
 
-#### Motion
+#### Rail: motion
 
 | What | Motion |
 | --- | --- |
@@ -1165,7 +1772,7 @@ Clearwater light with hot pink on the right edge.
   bounce.
 - Performance mode and reduced motion remove all of it.
 
-#### GPU cost and the glass budget
+#### Rail: GPU cost and the glass budget
 
 - **Stashed means not drawn.** The window is removed from the compositor's quad
   list and its frame callbacks are withheld, so the client stops rendering, as
@@ -1186,7 +1793,7 @@ Clearwater light with hot pink on the right edge.
   in an atlas.
 - **Variant C** would keep a strip in the quad list above every window, always.
 
-#### Native capabilities needed
+#### Rail: native capabilities needed
 
 For variant A. Items marked † are already on the main list for the launcher.
 
@@ -1212,7 +1819,7 @@ For variant A. Items marked † are already on the main list for the launcher.
 Not required for A: thumbnail capture, a text-summary protocol, media
 controls, or any new blur level.
 
-#### Cost
+#### Rail: cost
 
 Moderate overall, as an estimate on the same basis as the rest of this
 document.
@@ -1228,46 +1835,56 @@ document.
 If it is ever scheduled it should follow the launcher's menu and drag work,
 because it reuses both.
 
-#### Open questions
+#### Dock and drawer in the prototype
 
-- Should Minimise on a resident stash it, so the drawer is simply where those
-  apps go?
-- One entry per app or per window, when an app has two windows?
-- A toast from a stashed app: should clicking it open the peek? I would say
-  yes.
-- Which protocol carries the count?
-- Should the tab hide under touch density, where the edge swipe replaces it?
-
-#### In the prototype
-
-- **Turn it on:** Settings › Lab › Side drawer, or the Drawer group in the
-  study bar. Choose Rail, Cards or Tabs, and Left or Right.
-- **Try:** click the taskbar button or the edge tab; click an entry to peek;
-  press 1 to 4; drag a title bar to the edge; right-click a title bar, task
-  button or entry; drag an entry along the rail, or off it; use the pop-out
-  caption button on a peek. “Message” in the study bar raises attention on
-  Chat.
+- **Turn it on:** Settings › Lab › Dock and drawer, or the Dock group in the
+  study bar. Top dock is the first choice; Rail, Cards and Tabs follow, with
+  Left or Right for those three.
+- **Try, in the top dock:** click a tile, then its Return and Close buttons;
+  drag a title bar up onto the dock; right-click a title bar, a task button or
+  a tile; drag a tile along the dock, or down off it; drag the dock's lower
+  edge, or double-click it; maximise a window; drag the grip in the corner of
+  the open app; choose Fullscreen from a title bar menu, with and without
+  “Keep the dock over fullscreen”. “Message” in the study bar raises attention
+  on Chat.
+- **Try, in the side variants:** click the taskbar button or the edge tab;
+  press 1 to 4; drag a title bar to the edge; drag an entry along the rail, or
+  off it; use the pop-out caption button on a peek.
 - **Keys:** Alt+S stands in for Super+S, because a browser may not receive
-  Super. Alt+Shift+S stashes.
-- **URL:** `drawer=rail`, `cards` or `tabs`; `dedge=left` or `right`;
-  `scene=drawer`, `dpeek`, `dout`, `dmenu`, `dwinmenu`, `dreorder` or `ddrag`;
-  `dapp=chat`, `mail`, `music` or `feed`; `dstash=terminal` (a comma-separated
-  list of windows to stash first).
-- **Self-test:** `index.html?dtest=1` runs 26 checks with real events and
-  writes pass or fail to the tab title: opening, peeking, Esc order, the three
-  ways to stash, reordering by key and by drag, returning, removing, closing,
-  each variant, the right edge and Off. All 26 pass in headless Chromium.
+  Super. Alt+Shift+S docks the focused window. F11 toggles fullscreen while
+  the concept is on.
+- **URL:** `drawer=dock`, `rail`, `cards` or `tabs`; `dockh=36` to `96`;
+  `dfs=1`; `dedge=left` or `right` for the side variants.
+  `scene=drawer`, `dpeek`, `dout`, `dmenu`, `dwinmenu`, `dtaskmenu`,
+  `dreorder`, `ddrag`, `dmax`, `dresize` or `dfull`; `dapp=chat`, `mail`,
+  `music` or `feed`; `dstash=terminal` (a comma-separated list of windows to
+  dock first); `dwin=files` for the window that `dmax`, `dresize` and `dfull`
+  act on; `dto=80` for the height the resize guide shows. A scene turns the
+  top dock on unless `drawer=` names another variant.
+- **Self-test:** `index.html?dtest=1` runs 43 checks with real events and
+  writes pass or fail to the tab title. The first 25 cover the side variants
+  as before. The next 17 cover the top dock: the reserved strip, tile
+  contents, docked windows not being drawn, a maximised window fitting below,
+  opening with no title bar, the three menus, drag onto the dock with its
+  slot and lit state, reordering, dragging a tile off, resize on release with
+  a snap, Compact, fullscreen with and without the toggle, and Esc. The last
+  checks that Off restores the settled desktop. All 43 pass in headless
+  Chromium.
 
 What the prototype does not show:
 
 - Chat, Mail, Music and Feed are invented apps with invented content. They are
   not in the launcher.
-- Touch and touchpad gestures. Pulling the edge tab stands in for the swipe.
-- Persistence. The drawer's contents reset on reload and when it is turned off.
-- Launching a resident from the launcher, and dragging a peeked window out by
-  its title bar.
-- The browser still lays out stashed windows. It only hides them.
-- With the drawer on the right, the expanded HUD panel sits under it.
+- Touch and touchpad gestures. Pulling the edge tab stands in for the swipe in
+  the side variants.
+- Persistence of the dock's contents. They reset on reload and when the
+  concept is turned off. The dock's height is saved with the other settings.
+- The overflow menu, an empty dock hiding itself, and Super+S bringing the
+  dock over a fullscreen window.
+- Cancelling a window drag with Esc.
+- Launching a resident from the launcher.
+- The browser still lays out docked windows. It only hides them.
+- With the rail on the right, the expanded HUD panel sits under it.
 
 ## Limitations
 
@@ -1276,13 +1893,20 @@ What the prototype does not show:
 - Checked with headless Chromium only. `index.html?selftest=1` drives real
   pointer events through twelve launcher operations (drag to a category, reorder,
   pins, category reorder, multi-drag to a new category, keyboard steps, delete,
-  suggestion, search by category, undo back to defaults) and writes pass or fail
-  to the tab title. All twelve pass. Nothing was tried by hand in a live browser,
-  so feel and timing are unjudged.
-- The side drawer has its own headless self-test, `index.html?dtest=1`, with 26
-  checks. Its gestures, feel and timing are equally unjudged.
+  suggestion, search by category, undo back to defaults), then six hue checks:
+  the default, the hue reaching the taskbar, title bars, panels and app
+  surfaces, contrast for twelve hues in two glass modes, Smoked keeping its
+  glass, and the old palette name. It writes pass or fail to the tab title. All
+  eighteen pass. Nothing was tried by hand in a live browser, so feel and
+  timing are unjudged.
+- The dock and drawer have their own headless self-test, `index.html?dtest=1`,
+  with 43 checks. Their gestures, feel and timing are equally unjudged.
 - Window resizing is not interactive; only the zones are drawn.
-- Contrast was judged by eye from the screenshots, not measured.
+- Contrast is computed for opaque reference fills. Glass at 80% over a
+  wallpaper is not measured, and neither is any hue on a wallpaper other than
+  the dawn one.
+- The hue derivation was tuned on twelve hues. A wallpaper hue outside them
+  goes through the same steps and checks, and has not been looked at.
 - The wallpaper accent is hard-coded for `brook-dawn.png`.
 - Tide, Sketchbook, Crisp, flavour packs and Instrument HUD are described, not
   mocked.
@@ -1296,16 +1920,12 @@ What the prototype does not show:
 - `assets/brook-dawn.png`, `assets/brook-mark.png`, `assets/icons/*.svg`: copies
   of `data/wallpaper/brook-dawn.png`, `data/branding/brook-mark.png` and
   `data/icons/*.svg`.
-- `screenshots/`: headless Chromium captures of the final prototype. The set is
-  kept small on purpose: twelve at 1600×900 and two at 2×.
+- `screenshots/`: headless Chromium captures of the prototype. The set is kept
+  small on purpose.
 
 | Screenshot | Shows |
 | --- | --- |
-| `desktop-mixed.png`, `desktop-mixed@2x.png` | The default: Clearwater in Mixed mode, boot toast, compact HUD, accent row in Settings |
-| `accent-row@2x.png` | The accent swatch row with Hot pink chosen (crop at 2×) |
-| `accent-all.png` | One strip per accent: the search highlight on dark glass beside the Apply button on light content |
-| `accent-pink-mixed.png` | Hot pink in Mixed mode, launcher open |
-| `accent-phosphor-dark.png` | Phosphor in Dark mode, HUD panel and boot toast |
+| `desktop-mixed.png`, `desktop-mixed@2x.png` | The default: Tinted with the Blue hue in Mixed mode, boot toast, compact HUD, hue row in Settings |
 | `launcher.png` | Launcher with the pinned row and category rail |
 | `launcher-organise.png` | Organise mode with three apps ticked and the selection bar |
 | `launcher-drag.png` | A drag in progress over a category |
@@ -1315,8 +1935,38 @@ What the prototype does not show:
 | `hud-panel.png` | HUD panel, Settings › Taskbar |
 | `opal-light.png` | Opal light |
 
-The side drawer concept adds five more, all 1600×900, each under 0.75 MB and
-3.1 MB together. Four are strips cropped from several views.
+`desktop-mixed.png` was retaken for this pass. The other captures in the table
+above, and `desktop-mixed@2x.png`, are from before the rename: their Settings
+window still labels the first palette card Clearwater and the swatch row
+Accent. The desktop in them is otherwise the current default.
+
+The hue pass adds six, each under 0.75 MB. They replace the four `accent-*`
+captures, which showed the hue on details only. The four whole-desktop ones
+are reduced to a 256-colour palette to keep them small, so gradients in the
+wallpaper are slightly dithered.
+
+| Screenshot | Shows |
+| --- | --- |
+| `hue-mixed.png` | Hot pink, Phosphor, Amber and Violet in Mixed mode, launcher open (four views at half size) |
+| `hue-dark.png` | Hot pink, Phosphor, Orange and Teal in Dark mode, top dock on with Mail open (four views at half size) |
+| `hue-all.png` | All twelve hues: the Files title bar and toolbar in Mixed and in Dark, and the taskbar |
+| `hue-pink-mixed.png` | Hot pink in Mixed mode at full size, three toasts and the HUD panel |
+| `hue-phosphor-dark.png` | Phosphor in Dark mode at full size, launcher and HUD panel |
+| `hue-row@2x.png` | The palette cards and the hue row with Hot pink chosen (crop at 2×) |
+
+The top dock adds five, each under 0.75 MB.
+
+| Screenshot | Shows |
+| --- | --- |
+| `dock-open.png` | The recommended variant: Chat open under its tile, Terminal docked as a guest |
+| `dock-heights.png` | The dock at rest at Compact, Standard and Tall (three strips) |
+| `dock-resize.png` | The resize guide and chip, with a maximised Files window fitted below the dock |
+| `dock-drag.png` | A window dragged onto the dock: the filled slot and the lit edge |
+| `dock-menus.png` | The title bar menu, the tile menu and the task button menu (three crops) |
+
+The side variants have five, all 1600×900, each under 0.75 MB. Four are strips
+cropped from several views. They were captured before the hue tinted the glass
+and before the top dock existed.
 
 | Screenshot | Shows |
 | --- | --- |
@@ -1324,7 +1974,7 @@ The side drawer concept adds five more, all 1600×900, each under 0.75 MB and
 | `drawer-variants.png` | Rail and peek, card shelf and edge tabs side by side |
 | `drawer-rest-stash.png` | Resting state with the edge tab and count; a window dragged to the edge; the title bar menu |
 | `drawer-manage.png` | Entry menu; a reorder drag; a resident out on the desktop with its stash button |
-| `drawer-themes.png` | Opal dark with amber, and Clearwater light with hot pink on the right edge |
+| `drawer-themes.png` | Opal dark with amber, and light glass with a hot pink accent on the right edge |
 
 ### Regenerating any other view
 
@@ -1343,7 +1993,7 @@ Use `--force-device-scale-factor=2` for 3200×1800. Parameters combine with `&`.
 | --- | --- |
 | Dark, Light | `mode=dark`, `mode=light` |
 | Opal dark (the greener one), Smoked | `palette=opal&mode=dark`, `palette=smoked` |
-| Any accent | `accent=teal`; also `auto`, `blue`, `pine`, `phosphor`, `lime`, `amber`, `orange`, `red`, `pink`, `violet`, `slate`, `wallpaper` |
+| Any hue | `accent=teal`; also `auto`, `blue`, `pine`, `phosphor`, `lime`, `amber`, `orange`, `red`, `pink`, `violet`, `slate`, `wallpaper`. Under the default palette it tints everything; add `palette=smoked` for details only |
 | Blur levels | `blur=none`, `light`, `moderate`, `heavy` |
 | Performance mode | `perf=1` |
 | Launcher states | `scene=launcher`, `organise`, `menu`, `drag`, `reorder`, `newcat`, `unsorted`, `empty`, `search&q=ga` |
@@ -1351,5 +2001,6 @@ Use `--force-device-scale-factor=2` for 3200×1800. Parameters combine with `&`.
 | HUD panel | `hud=expanded` |
 | Hit overlay, touch density | `hits=1`, `touch=1` |
 | Lab styles and rim light | `style=tabs`, `alloy`, `phosphor`, `neon`; `rim=1` |
-| Side drawer (concept) | `scene=dpeek&dstash=terminal`; `scene=drawer&drawer=cards`; `scene=dpeek&drawer=tabs&dapp=mail`; `drawer=rail`; `scene=ddrag`, `dwinmenu`, `dmenu&dapp=mail`, `dreorder`, `dout`; add `dedge=right` |
+| Top dock (concept) | `scene=dpeek&dstash=terminal`; `scene=drawer&dockh=36`, `56`, `80`; `scene=dresize`; `scene=dmax&dapp=chat`; `scene=ddrag`; `scene=dwinmenu`, `dtaskmenu`, `dmenu&dapp=mail`; `scene=dreorder`, `dout`; `scene=dfull`, and with `dfs=1` |
+| Side variants (concept) | `drawer=rail&scene=dpeek&dstash=terminal`; `drawer=cards&scene=drawer`; `drawer=tabs&scene=dpeek&dapp=mail`; `drawer=rail` with `scene=ddrag`, `dwinmenu`, `dmenu&dapp=mail`, `dreorder`, `dout`; add `dedge=right` |
 | Settings tab, focused window | `tab=appearance`, `taskbar`, `lab`, `about`; `focus=files`, `terminal`, `settings` |
