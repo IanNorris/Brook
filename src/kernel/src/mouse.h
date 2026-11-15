@@ -50,3 +50,18 @@ extern "C" void MouseSetButtons(uint8_t buttons);
 extern "C" void MouseSetAvailable(bool available);
 
 } // namespace brook
+
+namespace brook {
+// Synaptics touchpad (absolute PS/2 mode, two-finger scroll). Boot default:
+// enabled when the pad identifies as Synaptics; otherwise relative PS/2.
+struct MouseTouchpadStatus {
+    bool wanted, active, identified, clickpad, natural;
+    const char* reason;
+    uint8_t major, minor, model, mode, modeReadback, packetLen, relativeId;
+    uint32_t caps, ext, ext0c, packets, resyncs, scrollTicks;
+    uint32_t fingers[4];
+};
+bool MouseTouchpadSet(bool synaptics);
+void MouseTouchpadSetNatural(bool natural);
+MouseTouchpadStatus MouseTouchpadGetStatus();
+}

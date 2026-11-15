@@ -5133,6 +5133,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  input touchpad synaptics on|off|status | natural on|off - Synaptics two-finger scroll touchpad\n"
             "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
@@ -6047,6 +6048,33 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("refusal_step",st.refusalStep);r.text(",");r.field("adapter_refusal",fw.refusal);
             r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
         r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest = reset VCS, init execlists, one-shot submission (PPGTT batch MI_STORE_DATA_IMM plus ring breadcrumb) with CSB retirement, reset after and unbind; failures after an engine write quarantine VCS for the boot, uncertain GT reset/PAT/forcewake state panics; user submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
+        r.send();
+    }
+    else if(StrStartsWith(cmd,"input touchpad ")) {
+        // Synaptics touchpad: absolute mode with two-finger scroll (boot default
+        // on when detected), or plain relative PS/2.
+        if(NetStrEq(cmd,"input touchpad synaptics on"))MouseTouchpadSet(true);
+        else if(NetStrEq(cmd,"input touchpad synaptics off"))MouseTouchpadSet(false);
+        else if(NetStrEq(cmd,"input touchpad natural on"))MouseTouchpadSetNatural(true);
+        else if(NetStrEq(cmd,"input touchpad natural off"))MouseTouchpadSetNatural(false);
+        else if(!NetStrEq(cmd,"input touchpad status") && !NetStrEq(cmd,"input touchpad synaptics status")){
+            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off\"}\n");return;}
+        const auto st=MouseTouchpadGetStatus();
+        BridgeReply r;
+        r.text("{\"wanted\":");r.text(st.wanted?"true":"false");
+        r.text(",\"active\":");r.text(st.active?"true":"false");
+        r.text(",\"reason\":\"");r.text(st.reason?st.reason:"");r.text("\"");
+        r.text(",\"identified\":");r.text(st.identified?"true":"false");
+        r.text(",");r.field("major",st.major);r.text(",");r.field("minor",st.minor);r.text(",");r.field("model",st.model);
+        r.text(",");r.field("caps",st.caps);r.text(",");r.field("ext",st.ext);r.text(",");r.field("ext0c",st.ext0c);
+        r.text(",\"clickpad\":");r.text(st.clickpad?"true":"false");
+        r.text(",");r.field("mode",st.mode);r.text(",");r.field("mode_readback",st.modeReadback);
+        r.text(",");r.field("packet_len",st.packetLen);r.text(",");r.field("relative_id",st.relativeId);
+        r.text(",");r.field("packets",st.packets);r.text(",");r.field("resyncs",st.resyncs);
+        r.text(",");r.field("scroll_ticks",st.scrollTicks);
+        r.text(",\"fingers\":[");for(int i=0;i<4;++i){if(i)r.text(",");r.number(st.fingers[i]);}r.text("]");
+        r.text(",\"natural\":");r.text(st.natural?"true":"false");
+        r.text(",\"scope\":\"fingers = packets seen with 0,1,2,3+ fingers; resyncs = bytes failing Synaptics packet sync; off renegotiates relative IntelliMouse PS/2\"}\n");
         r.send();
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
