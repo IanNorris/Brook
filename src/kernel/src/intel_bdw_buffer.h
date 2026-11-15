@@ -35,6 +35,10 @@ bool BdwGpuBufferAllowsUserMapping(const BdwGpuBuffer* buffer);
 void BdwGpuBufferRef(BdwGpuBuffer* buffer);
 void BdwGpuBufferUnref(BdwGpuBuffer* buffer);
 uint64_t BdwGpuBufferBytes(const BdwGpuBuffer* buffer);
+// i915 tiling metadata shared by every handle of the buffer (0 none, 1 X,
+// 2 Y). Metadata only: no fence or detiling exists, mappings stay linear.
+bool BdwGpuBufferSetTiling(BdwGpuBuffer* buffer,uint32_t mode,uint32_t stride);
+void BdwGpuBufferTiling(const BdwGpuBuffer* buffer,uint32_t& mode,uint32_t& stride);
 // Boot-local, immutable identity, shared by every PRIME alias of this buffer.
 uint64_t BdwGpuBufferIdentity(const BdwGpuBuffer* buffer);
 // One page at a time; a buffer's kernel virtual addresses are not guaranteed

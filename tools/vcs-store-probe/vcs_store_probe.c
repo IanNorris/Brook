@@ -90,7 +90,7 @@ int main(int argc,char** argv){
     if(!count || count>100000)count=1;
     char path[32];int fd=open_i915(path,sizeof(path));
     if(fd<0){printf("VCSPROBE FAIL no i915 render node\n");return 1;}
-    int hasBsd=-1;const int gp=getparam(fd,5,&hasBsd);
+    int hasBsd=-1;const int gp=getparam(fd,10,&hasBsd);
     printf("VCSPROBE node=%s has_bsd=%d getparam=%d errno=%d\n",path,hasBsd,gp,gp?errno:0);
     if(gp){printf("VCSPROBE FAIL getparam HAS_BSD\n");return 1;}
     if(!expectRefused && hasBsd!=1){printf("VCSPROBE SKIP has_bsd=%d (gate off or no self-test this boot)\n",hasBsd);return 3;}
@@ -138,7 +138,7 @@ int main(int argc,char** argv){
         if(hang){
             printf("VCSPROBE hang job: fence_wait=%d/%d bo_wait=%d/%d value=%08x elapsed_ms=%llu\n",wr,werr,gr,gerr,got,
                 (unsigned long long)(dt/1000000));
-            int after=-1;getparam(fd,5,&after);
+            int after=-1;getparam(fd,10,&after);
             const int ok=!wr && gr && gerr==EIO && after==0;
             printf("VCSPROBE %s hang-detected=%d has_bsd_after=%d\n",ok?"PASS":"FAIL",ok,after);
             return ok?0:1;
@@ -150,7 +150,7 @@ int main(int argc,char** argv){
         struct syncobj del={so.handle,0};xioctl(fd,SYNCOBJ_DESTROY,&del);
         if(!ok){++failures;break;}
     }
-    int after=-1;getparam(fd,5,&after);
+    int after=-1;getparam(fd,10,&after);
     printf("VCSPROBE %s jobs=%u failures=%u mean_us=%llu worst_us=%llu has_bsd_after=%d high=%d\n",failures?"FAIL":"PASS",count,failures,
         (unsigned long long)(totalNs/1000/count),(unsigned long long)(worstNs/1000),after,high);
     munmap(d,4096);munmap(b,4096);

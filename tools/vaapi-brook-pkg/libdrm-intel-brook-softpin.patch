@@ -1,0 +1,462 @@
+--- a/intel/intel_bufmgr_gem.c	2026-11-14 23:09:30.677058282 +0000
++++ b/intel/intel_bufmgr_gem.c	2026-11-15 00:41:32.826677530 +0000
+@@ -152,6 +152,14 @@
+ 		uint32_t handle;
+ 	} userptr_active;
+ 
++	/* Brook OS: every BO is softpinned at a per-bufmgr GPU VA chosen here,
++	 * so execbuffer never carries relocations (I915_EXEC_NO_RELOC). The
++	 * free list is address-sorted [start, end) ranges, first fit, so BOs
++	 * pack densely and an execbuffer needs few page tables. */
++	bool brook_softpin;
++	uint64_t brook_va_base, brook_va_limit;
++	struct brook_va_range { uint64_t start, end; } *brook_va_free;
++	int brook_va_count, brook_va_size;
+ } drm_intel_bufmgr_gem;
+ 
+ #define DRM_INTEL_RELOC_FENCE (1<<0)
+@@ -209,6 +217,9 @@
+ 	int softpin_target_count;
+ 	/** Maximum amount of softpinned BOs that are referenced by this buffer */
+ 	int softpin_target_size;
++	/** Brook OS: per softpin target, whether that reference writes it
++	 * (EXEC_OBJECT_WRITE; Brook maps unwritten objects read-only). */
++	uint8_t *brook_softpin_write;
+ 
+ 	/** Mapped address for the buffer, saved across map/unmap cycles */
+ 	void *mem_virtual;
+@@ -280,8 +291,19 @@
+ 
+ 	/** Flags that we may need to do the SW_FINISH ioctl on unmap. */
+ 	bool mapped_cpu_write;
++
++	/* Brook OS softpin: the VA range owned by this BO (size 0 if none). */
++	uint64_t brook_va, brook_va_size;
++	/* Brook OS has no GTT aperture or fence detiling: a GTT map of a tiled
++	 * BO is a linear CPU shadow, detiled from the WB CPU mapping on map
++	 * and written back (retiled) when the last mapping goes away. */
++	void *brook_shadow;
++	bool brook_shadow_mapped;
+ };
+ 
++static int brook_cpu_mapping(drm_intel_bufmgr_gem *bufmgr_gem, drm_intel_bo_gem *bo_gem);
++static void brook_va_release(drm_intel_bufmgr_gem *bufmgr_gem, drm_intel_bo_gem *bo_gem);
++
+ static unsigned int
+ drm_intel_gem_estimate_batch_space(drm_intel_bo ** bo_array, int count);
+ 
+@@ -661,6 +683,177 @@
+ 	}
+ }
+ 
++/* ---- Brook OS softpin VA allocator ---- */
++static int
++brook_va_insert(drm_intel_bufmgr_gem *g, int at, uint64_t start, uint64_t end)
++{
++	if (g->brook_va_count == g->brook_va_size) {
++		int n = g->brook_va_size ? g->brook_va_size * 2 : 64;
++		void *p = realloc(g->brook_va_free, n * sizeof(*g->brook_va_free));
++		if (!p)
++			return -ENOMEM;
++		g->brook_va_free = p;
++		g->brook_va_size = n;
++	}
++	memmove(&g->brook_va_free[at + 1], &g->brook_va_free[at],
++		(g->brook_va_count - at) * sizeof(*g->brook_va_free));
++	g->brook_va_free[at].start = start;
++	g->brook_va_free[at].end = end;
++	g->brook_va_count++;
++	return 0;
++}
++
++static uint64_t
++brook_va_alloc(drm_intel_bufmgr_gem *g, uint64_t size, uint64_t align)
++{
++	int i;
++	if (align < 4096)
++		align = 4096;
++	size = (size + 4095) & ~(uint64_t)4095;
++	for (i = 0; i < g->brook_va_count; i++) {
++		struct brook_va_range *r = &g->brook_va_free[i];
++		uint64_t start = (r->start + align - 1) & ~(align - 1);
++		if (start < r->start || start > r->end || r->end - start < size)
++			continue;
++		if (start != r->start) {
++			/* Keep the alignment gap as its own free range. */
++			uint64_t gap = r->start;
++			r->start = start;
++			if (brook_va_insert(g, i, gap, start))
++				return 0;
++			r = &g->brook_va_free[i + 1];
++		}
++		r->start += size;
++		if (r->start == r->end) {
++			int at = r - g->brook_va_free;
++			memmove(r, r + 1, (g->brook_va_count - at - 1) * sizeof(*r));
++			g->brook_va_count--;
++		}
++		return start;
++	}
++	return 0;
++}
++
++static void
++brook_va_free_range(drm_intel_bufmgr_gem *g, uint64_t start, uint64_t size)
++{
++	uint64_t end = start + size;
++	int i = 0;
++	while (i < g->brook_va_count && g->brook_va_free[i].start < start)
++		i++;
++	/* Coalesce with the previous and next free ranges. */
++	if (i > 0 && g->brook_va_free[i - 1].end == start) {
++		g->brook_va_free[i - 1].end = end;
++		if (i < g->brook_va_count && g->brook_va_free[i].start == end) {
++			g->brook_va_free[i - 1].end = g->brook_va_free[i].end;
++			memmove(&g->brook_va_free[i], &g->brook_va_free[i + 1],
++				(g->brook_va_count - i - 1) * sizeof(*g->brook_va_free));
++			g->brook_va_count--;
++		}
++		return;
++	}
++	if (i < g->brook_va_count && g->brook_va_free[i].start == end) {
++		g->brook_va_free[i].start = start;
++		return;
++	}
++	(void)brook_va_insert(g, i, start, end);
++}
++
++/* Caller holds bufmgr_gem->lock. Gives the BO a softpinned VA (or keeps a
++ * suitably aligned one it already has). Returns 0 or a negative errno. */
++static int
++brook_va_assign(drm_intel_bufmgr_gem *g, drm_intel_bo_gem *bo_gem)
++{
++	drm_intel_bo *bo = &bo_gem->bo;
++	uint64_t align = bo->align > 4096 ? bo->align : 4096, va;
++
++	if (!g->brook_softpin)
++		return 0;
++	/* A BO reused from the cache keeps its VA, but unreference_final
++	 * cleared kflags: re-establish the pin below. */
++	if (bo_gem->brook_va_size && (bo_gem->brook_va & (align - 1)) != 0)
++		brook_va_release(g, bo_gem);
++	if (bo_gem->brook_va_size) {
++		va = bo_gem->brook_va;
++	} else {
++		va = brook_va_alloc(g, bo->size, align);
++		if (!va)
++			return -ENOSPC;
++		bo_gem->brook_va = va;
++		bo_gem->brook_va_size = (bo->size + 4095) & ~(uint64_t)4095;
++	}
++	bo->offset64 = va;
++	bo->offset = va;
++	bo_gem->kflags |= EXEC_OBJECT_PINNED;
++	if (va + bo_gem->brook_va_size > (1ull << 32))
++		bo_gem->kflags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
++	return 0;
++}
++
++static void
++brook_va_release(drm_intel_bufmgr_gem *g, drm_intel_bo_gem *bo_gem)
++{
++	if (!bo_gem->brook_va_size)
++		return;
++	brook_va_free_range(g, bo_gem->brook_va, bo_gem->brook_va_size);
++	bo_gem->brook_va = bo_gem->brook_va_size = 0;
++	bo_gem->kflags &= ~(uint64_t)EXEC_OBJECT_PINNED;
++}
++
++static void
++brook_softpin_init(drm_intel_bufmgr_gem *g)
++{
++	const char *env = getenv("BROOK_LIBDRM_SOFTPIN");
++	const char *high = getenv("BROOK_LIBDRM_SOFTPIN_48B");
++	if (env && !strcmp(env, "0"))
++		return;
++	/* Default: [1 MiB, 4 GiB) so 32-bit relocation fields in i965 (which
++	 * writes bo->offset + delta itself) stay valid. BROOK_LIBDRM_SOFTPIN_48B=1
++	 * places every BO at or above 4 GiB to exercise 48-bit addressing. */
++	if (high && !strcmp(high, "1")) {
++		g->brook_va_base = 1ull << 32;
++		g->brook_va_limit = 1ull << 47;
++	} else {
++		g->brook_va_base = 1ull << 20;
++		g->brook_va_limit = (1ull << 32) - 4096;
++	}
++	g->brook_va_count = 0;
++	if (brook_va_insert(g, 0, g->brook_va_base, g->brook_va_limit))
++		return;
++	g->brook_softpin = true;
++}
++
++/* Y tiles are 128 bytes x 32 rows of 16-byte columns; X tiles 512 x 8. */
++static void
++brook_tile_copy(uint8_t *tiled, uint8_t *linear, uint32_t mode, uint32_t stride,
++		uint64_t size, bool to_linear)
++{
++	uint64_t rows = size / stride, y, x;
++	for (y = 0; y < rows; y++) {
++		if (mode == I915_TILING_Y) {
++			uint64_t tile_row = (y / 32) * (stride / 128) * 4096 + (y % 32) * 16;
++			for (x = 0; x < stride; x += 16) {
++				uint8_t *t = tiled + tile_row + (x / 128) * 4096 + ((x % 128) / 16) * 512;
++				uint8_t *l = linear + y * stride + x;
++				if (to_linear) memcpy(l, t, 16); else memcpy(t, l, 16);
++			}
++		} else {
++			uint64_t tile_row = (y / 8) * (stride / 512) * 4096 + (y % 8) * 512;
++			for (x = 0; x < stride; x += 512) {
++				uint8_t *t = tiled + tile_row + (x / 512) * 4096;
++				uint8_t *l = linear + y * stride + x;
++				if (to_linear) memcpy(l, t, 512); else memcpy(t, l, 512);
++			}
++		}
++	}
++}
++
++static bool
++brook_needs_shadow(drm_intel_bufmgr_gem *g, drm_intel_bo_gem *bo_gem)
++{
++	return g->brook_softpin && bo_gem->tiling_mode != I915_TILING_NONE;
++}
++
+ static drm_intel_bo *
+ drm_intel_gem_bo_alloc_internal(drm_intel_bufmgr *bufmgr,
+ 				const char *name,
+@@ -798,6 +991,8 @@
+ 	bo_gem->reusable = true;
+ 
+ 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, alignment);
++	if (brook_va_assign(bufmgr_gem, bo_gem))
++		goto err_free;
+ 	pthread_mutex_unlock(&bufmgr_gem->lock);
+ 
+ 	DBG("bo_create: buf %d (%s) %ldb\n",
+@@ -1135,6 +1330,8 @@
+ 
+ 	/* XXX stride is unknown */
+ 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
++	if (brook_va_assign(bufmgr_gem, bo_gem))
++		goto err_unref;
+ 	DBG("bo_create_from_handle: %d (%s)\n", handle, bo_gem->name);
+ 
+ out:
+@@ -1170,6 +1367,9 @@
+ 		bufmgr_gem->vma_count--;
+ 	}
+ 
++	free(bo_gem->brook_shadow);
++	brook_va_release(bufmgr_gem, bo_gem);
++
+ 	if (bo_gem->global_name)
+ 		HASH_DELETE(name_hh, bufmgr_gem->name_table, bo_gem);
+ 	HASH_DELETE(handle_hh, bufmgr_gem->handle_table, bo_gem);
+@@ -1340,6 +1540,8 @@
+ 		free(bo_gem->softpin_target);
+ 		bo_gem->softpin_target = NULL;
+ 		bo_gem->softpin_target_size = 0;
++		free(bo_gem->brook_softpin_write);
++		bo_gem->brook_softpin_write = NULL;
+ 	}
+ 
+ 	/* Clear any left-over mappings */
+@@ -1419,6 +1621,15 @@
+ 	if (bo_gem->map_count++ == 0)
+ 		drm_intel_gem_bo_open_vma(bufmgr_gem, bo_gem);
+ 
++	if (!bo_gem->mem_virtual && bufmgr_gem->brook_softpin) {
++		ret = brook_cpu_mapping(bufmgr_gem, bo_gem);
++		if (ret != 0) {
++			if (--bo_gem->map_count == 0)
++				drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
++			pthread_mutex_unlock(&bufmgr_gem->lock);
++			return ret;
++		}
++	}
+ 	if (!bo_gem->mem_virtual) {
+ 		struct drm_i915_gem_mmap mmap_arg;
+ 
+@@ -1474,6 +1685,36 @@
+ 	return 0;
+ }
+ 
++/* Caller holds bufmgr_gem->lock. Brook OS: GEM_MMAP first, then the
++ * MMAP_OFFSET (write-back) path for kernels without legacy GEM_MMAP. */
++static int
++brook_cpu_mapping(drm_intel_bufmgr_gem *bufmgr_gem, drm_intel_bo_gem *bo_gem)
++{
++	struct drm_i915_gem_mmap mmap_arg;
++	struct drm_i915_gem_mmap_offset off;
++	void *p;
++
++	if (bo_gem->mem_virtual)
++		return 0;
++	memclear(mmap_arg);
++	mmap_arg.handle = bo_gem->gem_handle;
++	mmap_arg.size = bo_gem->bo.size;
++	if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GEM_MMAP, &mmap_arg) == 0) {
++		bo_gem->mem_virtual = (void *)(uintptr_t)mmap_arg.addr_ptr;
++		return 0;
++	}
++	memclear(off);
++	off.handle = bo_gem->gem_handle;
++	off.flags = I915_MMAP_OFFSET_WB;
++	if (drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &off))
++		return -errno;
++	p = drm_mmap(0, bo_gem->bo.size, PROT_READ | PROT_WRITE, MAP_SHARED, bufmgr_gem->fd, off.offset);
++	if (p == MAP_FAILED)
++		return -errno;
++	bo_gem->mem_virtual = p;
++	return 0;
++}
++
+ static int
+ map_gtt(drm_intel_bo *bo)
+ {
+@@ -1484,6 +1725,26 @@
+ 	if (bo_gem->is_userptr)
+ 		return -EINVAL;
+ 
++	if (brook_needs_shadow(bufmgr_gem, bo_gem)) {
++		/* Stride is unknown for imported BOs: no linear view exists. */
++		if (!bo_gem->stride || bo_gem->bo.size % bo_gem->stride ||
++		    (bo_gem->tiling_mode == I915_TILING_Y ? bo_gem->stride % 128 : bo_gem->stride % 512))
++			return -EINVAL;
++		if (bo_gem->map_count++ == 0)
++			drm_intel_gem_bo_open_vma(bufmgr_gem, bo_gem);
++		ret = brook_cpu_mapping(bufmgr_gem, bo_gem);
++		if (ret == 0 && !bo_gem->brook_shadow &&
++		    posix_memalign(&bo_gem->brook_shadow, 4096, bo_gem->bo.size))
++			ret = -ENOMEM;
++		if (ret != 0) {
++			if (--bo_gem->map_count == 0)
++				drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
++			return ret;
++		}
++		bo->virtual = bo_gem->brook_shadow;
++		return 0;
++	}
++
+ 	if (bo_gem->map_count++ == 0)
+ 		drm_intel_gem_bo_open_vma(bufmgr_gem, bo_gem);
+ 
+@@ -1574,6 +1835,11 @@
+ 		    __FILE__, __LINE__, bo_gem->gem_handle,
+ 		    strerror(errno));
+ 	}
++	if (brook_needs_shadow(bufmgr_gem, bo_gem) && !bo_gem->brook_shadow_mapped) {
++		brook_tile_copy(bo_gem->mem_virtual, bo_gem->brook_shadow, bo_gem->tiling_mode,
++				bo_gem->stride, bo_gem->bo.size, true);
++		bo_gem->brook_shadow_mapped = true;
++	}
+ 
+ 	drm_intel_gem_bo_mark_mmaps_incoherent(bo);
+ 	VG(VALGRIND_MAKE_MEM_DEFINED(bo_gem->gtt_virtual, bo->size));
+@@ -1618,6 +1884,12 @@
+ 	pthread_mutex_lock(&bufmgr_gem->lock);
+ 
+ 	ret = map_gtt(bo);
++	if (ret == 0 && brook_needs_shadow(bufmgr_gem, (drm_intel_bo_gem *)bo) &&
++	    !((drm_intel_bo_gem *)bo)->brook_shadow_mapped) {
++		drm_intel_bo_gem *s = (drm_intel_bo_gem *)bo;
++		brook_tile_copy(s->mem_virtual, s->brook_shadow, s->tiling_mode, s->stride, bo->size, true);
++		s->brook_shadow_mapped = true;
++	}
+ 	if (ret == 0) {
+ 		drm_intel_gem_bo_mark_mmaps_incoherent(bo);
+ 		VG(VALGRIND_MAKE_MEM_DEFINED(bo_gem->gtt_virtual, bo->size));
+@@ -1676,6 +1948,11 @@
+ 	 * limits and cause later failures.
+ 	 */
+ 	if (--bo_gem->map_count == 0) {
++		if (bo_gem->brook_shadow_mapped) {
++			brook_tile_copy(bo_gem->mem_virtual, bo_gem->brook_shadow, bo_gem->tiling_mode,
++					bo_gem->stride, bo->size, false);
++			bo_gem->brook_shadow_mapped = false;
++		}
+ 		drm_intel_gem_bo_close_vma(bufmgr_gem, bo_gem);
+ 		drm_intel_gem_bo_mark_mmaps_incoherent(bo);
+ 		bo->virtual = NULL;
+@@ -2095,8 +2372,17 @@
+ }
+ 
+ static int
++drm_intel_gem_bo_add_softpin_target_write(drm_intel_bo *bo, drm_intel_bo *target_bo, bool write);
++
++static int
+ drm_intel_gem_bo_add_softpin_target(drm_intel_bo *bo, drm_intel_bo *target_bo)
+ {
++	return drm_intel_gem_bo_add_softpin_target_write(bo, target_bo, false);
++}
++
++static int
++drm_intel_gem_bo_add_softpin_target_write(drm_intel_bo *bo, drm_intel_bo *target_bo, bool write)
++{
+ 	drm_intel_bufmgr_gem *bufmgr_gem = (drm_intel_bufmgr_gem *) bo->bufmgr;
+ 	drm_intel_bo_gem *bo_gem = (drm_intel_bo_gem *) bo;
+ 	drm_intel_bo_gem *target_bo_gem = (drm_intel_bo_gem *) target_bo;
+@@ -2122,10 +2408,14 @@
+ 				sizeof(drm_intel_bo *));
+ 		if (!bo_gem->softpin_target)
+ 			return -ENOMEM;
++		bo_gem->brook_softpin_write = realloc(bo_gem->brook_softpin_write, new_size);
++		if (!bo_gem->brook_softpin_write)
++			return -ENOMEM;
+ 
+ 		bo_gem->softpin_target_size = new_size;
+ 	}
+ 	bo_gem->softpin_target[bo_gem->softpin_target_count] = target_bo;
++	bo_gem->brook_softpin_write[bo_gem->softpin_target_count] = write;
+ 	drm_intel_gem_bo_reference(target_bo);
+ 	bo_gem->softpin_target_count++;
+ 
+@@ -2141,7 +2431,7 @@
+ 	drm_intel_bo_gem *target_bo_gem = (drm_intel_bo_gem *)target_bo;
+ 
+ 	if (target_bo_gem->kflags & EXEC_OBJECT_PINNED)
+-		return drm_intel_gem_bo_add_softpin_target(bo, target_bo);
++		return drm_intel_gem_bo_add_softpin_target_write(bo, target_bo, write_domain != 0);
+ 	else
+ 		return do_bo_emit_reloc(bo, offset, target_bo, target_offset,
+ 					read_domains, write_domain,
+@@ -2258,6 +2548,10 @@
+ 		drm_intel_gem_bo_mark_mmaps_incoherent(bo);
+ 		drm_intel_gem_bo_process_reloc2(target_bo);
+ 		drm_intel_add_validate_buffer2(target_bo, false);
++		if (bo_gem->brook_softpin_write && bo_gem->brook_softpin_write[i]) {
++			drm_intel_bufmgr_gem *g = (drm_intel_bufmgr_gem *)bo->bufmgr;
++			g->exec2_objects[to_bo_gem(target_bo)->validate_index].flags |= EXEC_OBJECT_WRITE;
++		}
+ 	}
+ }
+ 
+@@ -2349,6 +2643,8 @@
+ 	execbuf.DR1 = 0;
+ 	execbuf.DR4 = DR4;
+ 	execbuf.flags = flags;
++	if (bufmgr_gem->brook_softpin)
++		execbuf.flags |= I915_EXEC_NO_RELOC;
+ 	if (ctx == NULL)
+ 		i915_execbuffer2_set_context_id(execbuf, 0);
+ 	else
+@@ -2638,6 +2934,8 @@
+ 
+ 	/* XXX stride is unknown */
+ 	drm_intel_bo_gem_set_in_aperture_size(bufmgr_gem, bo_gem, 0);
++	if (brook_va_assign(bufmgr_gem, bo_gem))
++		goto err;
+ 
+ out:
+ 	pthread_mutex_unlock(&bufmgr_gem->lock);
+@@ -3654,8 +3952,10 @@
+ 
+ 	gp.param = I915_PARAM_HAS_EXEC_SOFTPIN;
+ 	ret = drmIoctl(bufmgr_gem->fd, DRM_IOCTL_I915_GETPARAM, &gp);
+-	if (ret == 0 && *gp.value > 0)
++	if (ret == 0 && *gp.value > 0) {
+ 		bufmgr_gem->bufmgr.bo_set_softpin_offset = drm_intel_gem_bo_set_softpin_offset;
++		brook_softpin_init(bufmgr_gem);
++	}
+ 
+ 	if (bufmgr_gem->gen < 4) {
+ 		gp.param = I915_PARAM_NUM_FENCES_AVAIL;

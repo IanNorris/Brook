@@ -20,6 +20,9 @@ struct BdwGpuBuffer {
     bool userMappingAllowed;
     bool scanoutImage; // registered for zero-copy scanout: render maps it uncached
     bool gpuEverUsed;  // sticky: a write-back GPU mapping may have left LLC lines
+    // i915 tiling metadata (SET/GET_TILING, VA-API phase 2a). Recorded for
+    // userspace only: Brook programs no fences and maps every buffer linearly.
+    uint32_t tilingStride; // (stride << 2) | mode, updated atomically
 #ifdef BROOK_BDW_CACHE_PROBE
     bool cacheProbe;
     uint32_t cacheProbeOmit;
@@ -156,6 +159,13 @@ bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b){
 void BdwGpuBufferRef(BdwGpuBuffer* b){if(b)MappingBackingRef(b->backing);}
 void BdwGpuBufferUnref(BdwGpuBuffer* b){if(b)MappingBackingUnref(b->backing);}
 uint64_t BdwGpuBufferBytes(const BdwGpuBuffer* b){return b?b->bytes:0;}
+bool BdwGpuBufferSetTiling(BdwGpuBuffer* b,uint32_t mode,uint32_t stride){
+    if(!b || mode>2 || stride>(1u<<29))return false;
+    __atomic_store_n(&b->tilingStride,mode?(stride<<2)|mode:0u,__ATOMIC_RELEASE);return true;
+}
+void BdwGpuBufferTiling(const BdwGpuBuffer* b,uint32_t& mode,uint32_t& stride){
+    const uint32_t v=b?__atomic_load_n(&b->tilingStride,__ATOMIC_ACQUIRE):0;mode=v&3;stride=v>>2;
+}
 uint64_t BdwGpuBufferIdentity(const BdwGpuBuffer* b){return b?b->identity:0;}
 uint64_t BdwGpuBufferPageKernelAddress(const BdwGpuBuffer* b,uint32_t page){
     return b && page<b->count ? b->chunks[page/BdwGpuBufferChunkPages]+uint64_t(page%BdwGpuBufferChunkPages)*4096 : 0;
