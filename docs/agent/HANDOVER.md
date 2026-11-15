@@ -92,6 +92,17 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, morning (gen 403, autonomous):**
+- **Main is `aac1d429`** = everything through `work/multilayer-int9`: multilayer v3 + the gen 402 freeze fix (offers superseded by CPU snapshots are retired; frame callbacks are released ≤100 ms after queueing whatever the offer state), touchpad, popup fix, worker recovery/containment, proc-cleanup, the Chrome warning policy and VA-API 4 tuning. Release build plus 355/356 host tests pass.
+- **Dell: gen 403** `dell-multilayer-int9-20261115`.
+  - Before this deploy it was unreachable after the usage-limit pause, with no new panic record (seq 40 is old); AC-cycled.
+  - A private-profile Chrome probe showed offers 416/416 presented and no layered waits, but stalled on the YouTube consent page, so ad overlays are untested.
+- **Chrome opaque region:** Chrome sends a single 1050×880 rect over an 832×642 logical surface; `opaque_single` stayed 0 (exact-match check). Being relaxed to "covers the surface" on `work/multilayer`.
+- **Clearwater Next is final and on main** (`513a78d9`, squash-merged): glass chrome, Mixed default, a 13-choice accent row (incl. hot pink and phosphor), launcher organisation, the edge-to-edge caption hit spec, the theme architecture T0–T5 and the implementation order. Files: `docs/design/clearwater-next/`.
+- **syscall.cpp split** started on `work/syscall-split`: pure moves, issues logged in `docs/agent/REFACTOR_ISSUES.md`, `net.cpp` debug commands next. Rebase in-flight kernel branches onto it after merge.
+- **VA-API 4 measurements** and the async-lane decision are with the VA-API agent.
+- **Worker site=2:** waiting for a recurrence; there are 3-line diagnostics now.
+
 **15 Nov, gens 398–402 (with Ian):**
 - **Running on the Dell:** gen 402 `dell-integration9b-20261115` = `work/integration9` 51fa9401. It contains:
   - multilayer v3 + opaque-region culling;
