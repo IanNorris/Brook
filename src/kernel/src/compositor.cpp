@@ -2101,22 +2101,24 @@ static void CompositorLoopWM()
     WmAgentIndicatorRefresh(now);
     WmVolumeIndicatorRefresh();
     WmVolumeFeedbackTick(now);
-    // Opening or closing the volume popup exposes or covers scene pixels, so
-    // repaint once on the transition (both the CPU and overlay-layer paths).
-    static bool volumePopupShown=false;
-    if(WmVolumePopupVisible()!=volumePopupShown){volumePopupShown=!volumePopupShown;CompositorMarkDirty();}
-    // The CPU path marks only the launcher's rows while it is open, so its
-    // disappearance (or appearance) repaints the scene underneath once.
-    static bool launcherShown=false;
-    if(WmLauncherVisible()!=launcherShown){launcherShown=!launcherShown;CompositorMarkDirty();}
-    // Likewise when the floating tray tooltip appears, moves or goes away.
+    // A shell surface that appears, moves or goes away exposes or covers scene
+    // pixels the paths mark only by the surface's own rows, so repaint once on
+    // the transition (both the CPU and overlay-layer paths). The boot summary
+    // has its own transition below.
     {
-        static DesktopOverlayRect tooltipShown{};
-        int32_t tmx=0,tmy=0;MouseGetPosition(&tmx,&tmy);
-        DesktopOverlayRect tip{};
-        if(!WmTrayTooltipGetRect(g_physFbWidth,g_physFbHeight,tmx,tmy,&tip.x,&tip.y,&tip.width,&tip.height))tip={};
-        if(tip.x!=tooltipShown.x||tip.y!=tooltipShown.y||tip.width!=tooltipShown.width||tip.height!=tooltipShown.height){
-            tooltipShown=tip;CompositorMarkDirty();
+        static WmShellSurface shown[WM_SHELL_SURFACE_LIMIT]{};
+        static uint32_t shownCount=0;
+        int32_t smx=0,smy=0;MouseGetPosition(&smx,&smy);
+        WmShellSurface current[WM_SHELL_SURFACE_LIMIT];
+        uint32_t count=WmShellSurfaces(g_physFbWidth,g_physFbHeight,smx,smy,current);
+        if(count && current[count-1].kind==WmShellSurfaceKind::BootSummary)--count;
+        bool changed=count!=shownCount;
+        for(uint32_t i=0;i<count && !changed;++i)
+            changed=current[i].kind!=shown[i].kind || current[i].x!=shown[i].x || current[i].y!=shown[i].y ||
+                    current[i].w!=shown[i].w || current[i].h!=shown[i].h;
+        if(changed){
+            for(uint32_t i=0;i<count;++i)shown[i]=current[i];
+            shownCount=count;CompositorMarkDirty();
         }
     }
     static bool summaryShown=false;
