@@ -64,6 +64,8 @@ enum class FdType : uint8_t
     DevIntelDri,   // Intel render file; not published until backend admission
     IntelPrime,    // Capability retaining one Intel GEM buffer
     IntelSyncObj,  // Capability retaining an Intel DRM sync object
+    DevZero,       // /dev/zero (1:5) — zero-filled reads, discarded writes
+    DevFull,       // /dev/full (1:7) — zero-filled reads, writes fail ENOSPC
 };
 
 // One descriptor slot. type/handle/flags are the immutable identity of the
@@ -94,7 +96,8 @@ inline void FdDiagnosticPath(const FdEntry& fd,char* out,uint32_t capacity)
     static const char* names[]={"none","file","fb","kbd","pipe","/dev/null","/dev/urandom",
         "mem","socket","tty","eventfd","dsp","epoll","timerfd","memfd","unix","klog"};
     const auto type=static_cast<uint8_t>(fd.type);
-    const char* text=fd.dirPath[0]?fd.dirPath:(type<sizeof(names)/sizeof(names[0])?names[type]:"?");
+    const char* text=fd.dirPath[0]?fd.dirPath:fd.type==FdType::DevZero?"/dev/zero":
+        fd.type==FdType::DevFull?"/dev/full":(type<sizeof(names)/sizeof(names[0])?names[type]:"?");
     const uint32_t limit=fd.dirPath[0]?sizeof(fd.dirPath)-1:capacity-1;
     uint32_t i=0;for(;i+1<capacity && i<limit && text[i];++i)out[i]=text[i];out[i]=0;
 }

@@ -303,7 +303,8 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& inputTarget,
     if(!ns->life.Published())return -3;
     VfsMountTargetLease lease;if(int error=lease.Follow(inputTarget))return error;
     const auto& target=lease.value;
-    if(attributes && (attributes!=6 || !StrEq(fsName,"tmpfs")))return -95;
+    // tmpfs: NODEV|NOSUID, or NOSUID alone for the boot device directory.
+    if(attributes && ((attributes!=6 && attributes!=2) || !StrEq(fsName,"tmpfs")))return -95;
     // Registered tables/callbacks are permanently provider-pinned. Unregistered
     // or mismatched tables cannot become a backing through this entry point.
     if(FindFsDriver(fsName)!=ops || !ops->root_object || !ops->unmount)return -95;
@@ -490,8 +491,12 @@ static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,
     if(sourceStat.isDir!=targetStat.isDir)return -20;
     if(!sourceStat.isDir) {
         const auto sourceType=sourceStat.mode&0170000,targetType=targetStat.mode&0170000;
-        if((sourceType!=0100000 && sourceType!=0140000 && sourceType!=0010000) ||
-           (targetType!=0100000 && targetType!=0140000 && targetType!=0010000))return -95;
+        // Character devices bind like files (bubblewrap --dev binds each
+        // canonical node onto a regular file in its own /dev tmpfs).
+        auto fileLike=[](uint32_t type) {
+            return type==0100000 || type==0140000 || type==0010000 || type==0020000;
+        };
+        if(!fileLike(sourceType) || !fileLike(targetType))return -95;
         // File crossing and mutation gates distinguish exact parent/name from
         // a sibling hard link; inode identity alone is insufficient.
         const bool alreadyUniqueFileMount=parent->coveredParent.object && target.object->identity==parent->rootIdentity && target.object->ops==parent->rootObjectOps;

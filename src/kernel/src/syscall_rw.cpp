@@ -200,8 +200,11 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     }
 
     // /dev/null — discard all writes
-    if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom)
+    if (fde->type == FdType::DevNull || fde->type == FdType::DevUrandom ||
+        fde->type == FdType::DevZero)
         return static_cast<int64_t>(count);
+    if (fde->type == FdType::DevFull)
+        return -28; // ENOSPC
 
     // /dev/dsp — pass PCM data through the audio mixer.
     // All streams are resampled to 44100 Hz stereo 16-bit, then submitted
@@ -613,6 +616,16 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/null — always EOF
     if (fde->type == FdType::DevNull)
         return 0;
+
+    // /dev/zero, /dev/full — zero-filled reads
+    if (fde->type == FdType::DevZero || fde->type == FdType::DevFull)
+    {
+        if (count > 0x7ffff000) count = 0x7ffff000;
+        ReadStage out(bufAddr);
+        for (uint64_t i = 0; i < count; ++i)
+            if (!out.Put(0)) return out.Result();
+        return out.Result();
+    }
 
     // /dev/urandom — fill buffer with RDRAND random bytes
     if (fde->type == FdType::DevUrandom)

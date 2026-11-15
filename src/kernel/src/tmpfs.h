@@ -32,6 +32,13 @@ const VfsFsOps *TmpfsOperations();
 Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error,
                    uint16_t rootMode=01777, uint64_t byteLimit=TmpfsDefaultBytes);
 int TmpfsDestroy(Tmpfs *);
+// Boot-only device directory (devtmpfs equivalent): root-owned 0755, reports
+// nosuid, and is the only kind of instance that accepts character devices.
+Tmpfs *TmpfsCreateDeviceDirectory(int *error, uint64_t byteLimit = 64 * 1024);
+// Kernel seeding of one root entry before the instance is mounted: a
+// directory, a character device (mode S_IFCHR|perm, Linux-encoded rdev) or a
+// symlink (target). Userspace mknod remains FIFO-only.
+int TmpfsSeedEntry(Tmpfs *, const char *name, uint16_t mode, uint64_t rdev = 0, const char *target = nullptr);
 struct TmpfsUsage
 {
     uint64_t bytes, inodes, mounts;

@@ -26,7 +26,8 @@ uint64_t GlobalBytes = 256ULL * 1024 * 1024;
 // Allow ordinary application profiles more entries while keeping the global
 // inode bound and a per-mount ceiling on directory traversal work.
 constexpr uint64_t InstanceInodes = 4096, GlobalInodes = 16384, GlobalMounts = 128;
-constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, Socket = 0140000, TypeMask = 0170000;
+constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, Socket = 0140000, CharDevice = 0020000,
+                   TypeMask = 0170000;
 struct Node;
 // A directory entry names one inode. Non-directory inodes may have several
 // entries (hard links); each owns one object reference and sits both on its
@@ -64,6 +65,8 @@ struct Tmpfs
     uint64_t device = 0, nextInode = 1, bytes = 0, inodes = 0;
     uint64_t flags = 0;
     uint64_t byteLimit = TmpfsDefaultBytes;
+    // Boot device directory only: may hold kernel-seeded character devices.
+    bool devices = false;
 };
 namespace
 {
@@ -76,6 +79,7 @@ struct Node
     // Reachable from the root: the root, or a node with at least one alias.
     bool linked;
     uint64_t ino, size;
+    uint64_t rdev; // Linux-encoded device number; character devices only
     VnodeTime atime, mtime, ctime;
     // Directories only: the containing directory, held (and retained after
     // removal) for '..' traversal. Non-directory names live in aliases.
@@ -386,6 +390,7 @@ void Fill(Node *n, VnodeStat *out)
     out->size = n->size;
     out->isDir = (n->mode & TypeMask) == Directory;
     out->isSymlink = (n->mode & TypeMask) == Link;
+    out->rdev = n->rdev;
     out->atime = n->atime;
     out->mtime = n->mtime;
     out->ctime = n->ctime;
@@ -893,7 +898,7 @@ Vnode *MakeVnode(Node *n, int *error)
     *vn = {};
     vn->ops = (n->mode & TypeMask) == Regular ? &regularOps : &metadataOps;
     vn->type = (n->mode & TypeMask) == Directory ? VnodeType::Dir :
-        (n->mode & TypeMask) == Fifo ? VnodeType::Device : VnodeType::File;
+        ((n->mode & TypeMask) == Fifo || (n->mode & TypeMask) == CharDevice) ? VnodeType::Device : VnodeType::File;
     vn->refCount = 1;
     vn->backendObject = o;
     return vn;
@@ -1385,6 +1390,59 @@ int TmpfsConfigureByteBudget(uint64_t bytes)
 uint64_t TmpfsMaximumBytes()
 {
     return __atomic_load_n(&GlobalBytes,__ATOMIC_ACQUIRE);
+}
+Tmpfs *TmpfsCreateDeviceDirectory(int *error, uint64_t byteLimit)
+{
+    auto *fs = TmpfsCreate(0, 0, nullptr, 6, error, 0755, byteLimit);
+    if (fs)
+    {
+        // Reported as nosuid only; the mount attributes carry enforcement.
+        fs->flags = 2;
+        fs->devices = true;
+    }
+    return fs;
+}
+int TmpfsSeedEntry(Tmpfs *fs, const char *name, uint16_t mode, uint64_t rdev, const char *target)
+{
+    if (!fs || !name)
+        return -22;
+    if (int e = Leaf(name))
+        return e;
+    const uint16_t type = mode & TypeMask;
+    if (type == CharDevice ? !fs->devices : type == Link ? !target || !target[0] : type != Directory)
+        return -22;
+    if (type != CharDevice && rdev)
+        return -22;
+    const uint64_t length = type == Link ? strlen(target) : 0;
+    if (length >= 4096)
+        return -36;
+    Guard g(fs);
+    auto *parent = fs->root;
+    if (*Find(parent, name))
+        return -17;
+    auto *n = NewNode(fs, type == Link ? uint16_t(Link | 0777) : mode, 0, 0);
+    if (!n)
+        return -28;
+    if (type == Link)
+    {
+        n->target = static_cast<char *>(Allocate(fs, length + 1));
+        if (!n->target)
+        {
+            Drop(n);
+            return -12;
+        }
+        memcpy(n->target, target, length + 1);
+        n->size = length;
+    }
+    n->rdev = rdev;
+    auto *e = PrepareEntry(parent, name, n);
+    if (!e)
+    {
+        Drop(n);
+        return -12;
+    }
+    Publish(parent, e);
+    return 0;
 }
 TmpfsUsage TmpfsGlobalUsage()
 {

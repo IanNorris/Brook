@@ -821,7 +821,8 @@ int VfsAccess(Vnode* vn,uint8_t required,bool realIds)
     if((required&2) && VfsMountReadOnly(vn)) {
         VnodeStat stat{};if(int error=VfsStat(vn,&stat))return error;
         // Connecting sends data to the listener, without modifying its inode.
-        if((stat.mode&0170000)!=0140000 && (stat.mode&0170000)!=0010000)return -30;
+        const uint16_t type=stat.mode&0170000;
+        if(type!=0140000 && type!=0010000 && type!=0020000)return -30;
     }
     if (vn->ops && vn->ops->access) return vn->ops->access(vn,required,realIds);
     return required ? -95 : 0;

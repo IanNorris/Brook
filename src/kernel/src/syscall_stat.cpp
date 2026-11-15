@@ -446,12 +446,15 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
 
     if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
         fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp ||
+        fde->type == FdType::DevZero || fde->type == FdType::DevFull ||
         fde->type == FdType::DebugSerial || fde->type == FdType::DebugConsole) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
                       (fde->type == FdType::DevUrandom) ? 0x0109 :
+                      (fde->type == FdType::DevZero) ? 0x0105 :
+                      (fde->type == FdType::DevFull) ? 0x0107 :
                       (fde->type == FdType::DevDsp) ? 0x0E03 :
                       (fde->type == FdType::DebugSerial) ? 0x0440 : 0x0400; // 4,64 = UART
         st->st_blksize = 4096;
