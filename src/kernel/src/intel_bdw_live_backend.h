@@ -16,6 +16,8 @@ template<class Owner,uint32_t EngineBase> class BdwEngineDeviceBackend final : p
     Owner& owner_;uint32_t first_;uint64_t token_,scratch_;BdwOwnedPage* pages_=nullptr;unsigned pageCount_=0;
     uint32_t ggttWrites_=0,portWrites_=0;
     bool resetDone_=false;const BdwOwnedPage* hws_=nullptr;
+    uint64_t initStart_=0,initEnd_=0,waitStart_=0,waitEnd_=0; // TSC, diagnostics only
+    static uint64_t Tsc(){return __builtin_ia32_rdtsc();}
     BdwGgttMmio<BdwEngineDeviceBackend> ggtt_;
     BdwEngineMmio<BdwEngineDeviceBackend,EngineBase> bcs_;
 public:
@@ -55,8 +57,8 @@ public:
     bool programHws(uint64_t) override{return false;}
     bool initializeExeclists(uint64_t address,const BdwOwnedPage& hws) override {
         if(!pages_ || &hws!=&pages_[6] || address!=(uint64_t(first_)+6)*4096 || !quiescent())return false;
-        hws_=&hws;resetDone_=owner_.resetBcs();
-        return resetDone_ && bcs_.initializeExeclists(address);
+        hws_=&hws;initStart_=Tsc();resetDone_=owner_.resetBcs();
+        const bool ok=resetDone_ && bcs_.initializeExeclists(address);initEnd_=Tsc();return ok;
     }
     bool resetVerified(){return resetDone_ && owned();}
     bool csbPrepared(uint64_t hws){return resetVerified() && hws_ && hws==(uint64_t(first_)+6)*4096;}
@@ -66,13 +68,18 @@ public:
     bool prepareSubmission(uint64_t descriptor) override{return bcs_.prepareSubmission(descriptor);}
     bool submitDword(uint32_t value) override{++portWrites_;return bcs_.submitDword(value);}
     uint32_t ggttWriteAttempts()const{return ggttWrites_;}
+    uint64_t initStartTicks()const{return initStart_;}
+    uint64_t initEndTicks()const{return initEnd_;}
+    uint64_t waitStartTicks()const{return waitStart_;}
+    uint64_t waitEndTicks()const{return waitEnd_;}
     uint32_t portWriteAttempts()const{return portWrites_;}
     bool waitCompletion(uint32_t nonce) override {
         if(!pages_ || !nonce)return false;
+        waitStart_=Tsc();
         while(owner_.completionContinue()) {
             if(!exclusiveHandoff() || !gpuPatLease() || !owner_.syncForCpu(pages_[7]))return false;
             const uint32_t value=__atomic_load_n(reinterpret_cast<const uint32_t*>(pages_[7].cpu),__ATOMIC_RELAXED);
-            if(value==nonce)return true;
+            if(value==nonce){waitEnd_=Tsc();return true;}
             owner_.relax();
         }
         return false;

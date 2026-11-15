@@ -162,7 +162,25 @@ int64_t ShimSubmit(void*,BdwExecSnapshot* s){
     if(!BdwExecSnapshotRetire(s,true) || !BdwExecSnapshotSignalFences(s,true) || !BdwExecSnapshotRelease(s,true))abort();
     return 0;
 }
+// PRIME emulation (Brook serves these in syscall.cpp, outside the shared
+// ioctl code): a dmabuf is an eventfd standing for the buffer.
+BdwGpuBuffer* primes[MaxFd]{};
+int64_t Prime(int fd,unsigned nr,void* arg){
+    struct Handle {uint32_t handle,flags;int32_t fd;};auto* h=static_cast<Handle*>(arg);
+    if(nr==0x2d){
+        if(h->flags&~(0x80000u|2u))return -EINVAL;
+        auto* buffer=BdwGpuFileGetBuffer(files[fd],h->handle);if(!buffer)return -ENOENT;
+        const int dmabuf=int(syscall(SYS_eventfd2,0,(h->flags&0x80000u)?O_CLOEXEC:0));
+        if(dmabuf<0 || dmabuf>=MaxFd){BdwGpuBufferUnref(buffer);return -EMFILE;}
+        primes[dmabuf]=buffer;h->fd=dmabuf;Log("prime export handle=%u -> fd=%d\n",h->handle,dmabuf);return 0;
+    }
+    if(h->flags || h->fd<0 || h->fd>=MaxFd || !primes[h->fd])return -EINVAL;
+    h->handle=BdwGpuFileImportBuffer(files[fd],primes[h->fd]);return h->handle?0:-ENOMEM;
+}
 int64_t Dispatch(int fd,unsigned long request,void* arg){
+    {const unsigned pnr=unsigned(request&255);
+     if(((request>>8)&255)=='d' && ((request>>16)&0x3fff)==12 && (pnr==0x2d || pnr==0x2e)){
+         const int64_t r=Prime(fd,pnr,arg);Log("ioctl %s -> %ld\n",pnr==0x2d?"PRIME_HANDLE_TO_FD":"PRIME_FD_TO_HANDLE",long(r));return r;}}
     BdwI915UserAccess user{nullptr,UserRead,UserWritable,UserWrite,UserNow,UserSleep};
     uint64_t context=uint64_t(fd);user.context=&context;
     user.submit=ShimSubmit;user.renderExperiment=true;user.mapBuffer=ShimMapBuffer;
@@ -220,6 +238,14 @@ int open64(const char* path,int flags,...){
     mode_t mode=0;if(flags&(O_CREAT|O_TMPFILE)){va_list a;va_start(a,flags);mode=mode_t(va_arg(a,int));va_end(a);}
     return open(path,flags,mode);
 }
+// _FORTIFY_SOURCE builds call the checked variants.
+// (Call the real open directly: `open` here may itself be fortified into
+// __open_2, which would recurse forever.)
+int __open_2(const char* path,int flags){
+    static auto real=Real<int(*)(const char*,int,...)>("open");
+    const int fd=real(path,flags,0);if(fd>=0 && IsNode(path))Track(fd);return fd;
+}
+int __open64_2(const char* path,int flags){return __open_2(path,flags);}
 int openat(int dir,const char* path,int flags,...){
     static auto real=Real<int(*)(int,const char*,int,...)>("openat");
     mode_t mode=0;if(flags&(O_CREAT|O_TMPFILE)){va_list a;va_start(a,flags);mode=mode_t(va_arg(a,int));va_end(a);}
@@ -232,6 +258,7 @@ int openat64(int dir,const char* path,int flags,...){
 int close(int fd){
     static auto real=Real<int(*)(int)>("close");
     if(Ours(fd)){pthread_mutex_lock(&lock);BdwGpuFileUnref(files[fd]);files[fd]=nullptr;pthread_mutex_unlock(&lock);}
+    if(fd>=0 && fd<MaxFd && primes[fd]){BdwGpuBufferUnref(primes[fd]);primes[fd]=nullptr;}
     return real(fd);
 }
 int dup(int fd){static auto real=Real<int(*)(int)>("dup");const int r=real(fd);if(r>=0)TrackDup(fd,r);return r;}
