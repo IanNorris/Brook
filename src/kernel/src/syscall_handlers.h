@@ -186,4 +186,45 @@ int64_t sys_faccessat2(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
                         uint64_t, uint64_t, uint64_t);
 
+// syscall_path.cpp
+int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz,
+                      uint64_t, uint64_t, uint64_t);
+int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
+                        uint64_t bufsiz, uint64_t, uint64_t);
+int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_mkdir(uint64_t pathAddr, uint64_t mode, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_mknodat(uint64_t dirfd,uint64_t pathAddr,uint64_t mode,uint64_t device,uint64_t,uint64_t);
+int64_t sys_mknod(uint64_t path,uint64_t mode,uint64_t device,uint64_t,uint64_t,uint64_t);
+int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
+                      uint64_t, uint64_t, uint64_t);
+int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
+                      uint64_t newdirfd, uint64_t newAddr,
+                      uint64_t, uint64_t);
+int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
+                       uint64_t newdirfd, uint64_t newAddr,
+                       uint64_t flags, uint64_t);
+int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
+                    uint64_t newdirfd, uint64_t newAddr,
+                    uint64_t flags, uint64_t);
+int64_t sys_link(uint64_t oldAddr, uint64_t newAddr, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
