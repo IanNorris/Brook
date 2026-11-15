@@ -30,8 +30,18 @@ int main() {
     const uint8_t notSyn[3] = {0x00, 0x03, 0x64};   // plain PS/2 status reply
     CHECK(!SynapticsDecodeIdentify(notSyn).valid);
     const uint8_t cap[3] = {0xd0, 0x47, 0x23};
-    auto caps = SynapticsDecodeCaps(cap);
+    auto caps = SynapticsDecodeCaps(cap, ident);
     CHECK(caps.valid && caps.extended() && caps.extRequests() == 5 && caps.multiFinger());
+    // Firmware >= 7.5: the middle byte is a submodel, not the 0x47 magic.
+    const uint8_t capNew[3] = {0xd0, 0x01, 0x23};
+    auto cn = SynapticsDecodeCaps(capNew, ident);
+    CHECK(cn.valid && cn.extended() && cn.caps == 0xd00123u);
+    SynapticsIdentity old; old.valid = true; old.major = 6; old.minor = 2;
+    CHECK(!SynapticsDecodeCaps(capNew, old).valid && SynapticsDecodeCaps(cap, old).valid);
+    // No capExtended: flags ignored (absolute mode without W).
+    const uint8_t capNoExt[3] = {0x00, 0x01, 0x23};
+    auto ne = SynapticsDecodeCaps(capNoExt, ident);
+    CHECK(ne.valid && ne.caps == 0 && !ne.extended() && !(SynapticsModeByte(ne) & SynModeW));
     caps.ext0c = 1u << 20;
     CHECK(caps.clickpad());
     CHECK(SynapticsModeByte(caps) == (SynModeAbsolute | SynModeHighRate | SynModeDisableGesture | SynModeW));

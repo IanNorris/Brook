@@ -60,8 +60,11 @@ struct MouseTouchpadStatus {
     uint8_t major, minor, model, mode, modeReadback, packetLen, relativeId;
     uint32_t caps, ext, ext0c, packets, resyncs, scrollTicks;
     uint32_t fingers[4];
+    uint8_t rawValid;      // bit i: raw[i] read (identify, caps, ext 0x09, ext 0x0c, modes)
+    uint8_t raw[5][3];
 };
 bool MouseTouchpadSet(bool synaptics);
+bool MouseTouchpadProbe();
 void MouseTouchpadSetNatural(bool natural);
 MouseTouchpadStatus MouseTouchpadGetStatus();
 }

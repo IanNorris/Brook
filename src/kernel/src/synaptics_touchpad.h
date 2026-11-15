@@ -53,10 +53,16 @@ struct SynapticsCaps {
 inline uint32_t SynapticsWord(const uint8_t r[3]) {
     return (uint32_t(r[0]) << 16) | (uint32_t(r[1]) << 8) | r[2];
 }
-inline SynapticsCaps SynapticsDecodeCaps(const uint8_t r[3]) {
+// Linux synaptics_capability(): firmware older than 7.5 has the submodel byte
+// fixed at 0x47 and anything else means "not a Synaptics capability reply";
+// newer firmware (e.g. the XPS 13 9343's 8.1) reports a real submodel there.
+// Without capExtended (bit 23) the remaining flags must be ignored.
+inline SynapticsCaps SynapticsDecodeCaps(const uint8_t r[3], const SynapticsIdentity& id) {
     SynapticsCaps c;
-    c.caps = SynapticsWord(r);
-    c.valid = ((c.caps >> 8) & 0xff) == 0x47;
+    const uint32_t raw = SynapticsWord(r);
+    const unsigned full = (unsigned(id.major) << 8) | id.minor;
+    c.valid = full >= 0x705 || ((raw >> 8) & 0xff) == 0x47;
+    c.caps = (raw & (1u << 23)) ? raw : 0;
     return c;
 }
 
