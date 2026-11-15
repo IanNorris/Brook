@@ -253,6 +253,9 @@ static int g_pointerCaptureIndex=-1;
 static uint64_t g_pointerCaptureIdentity=0,g_pointerCaptureSequence=0,g_pointerCaptureDrops=0;
 static uint64_t g_pointerReleaseSequence=0,g_pointerCaptureRevision=0;
 static uint64_t g_pointerInteractionSerial=0;
+// Creation identity of the window whose client area receives pointer input;
+// zero over shell surfaces, chrome and desktop. Written by WM routing.
+static uint64_t g_pointerHoverIdentity=0;
 static uint32_t g_pointerQuarantinedButtons=0;
 // Physical-up recovery must retain ownership of a delayed or queued release.
 static uint32_t g_pointerOrphanedReleases=0;
@@ -261,8 +264,14 @@ static int32_t g_pointerAnchorX=0,g_pointerAnchorY=0;
 static int16_t g_pointerLocalX=0,g_pointerLocalY=0;
 static bool g_pointerEscapeHeld=false;
 
-static void PointerCaptureReleaseLocked() {
+static void PointerCaptureReleaseLocked(bool voluntary=false) {
     if(g_pointerCaptureIndex<0)return;
+    // Anything but the provider's own release is a user/WM revoke. The window
+    // must not reacquire until it is explicitly clicked again, so a persistent
+    // lock or a recreated oneshot cannot grab the pointer back mid-taskbar.
+    Window& owner=g_windows[g_pointerCaptureIndex];
+    if(!voluntary && owner.proc && owner.creationIdentity==g_pointerCaptureIdentity)
+        owner.pointerDisengaged=true;
     g_pointerReleaseSequence=InputLatestSequence();
     __atomic_fetch_or(&g_pointerQuarantinedButtons,static_cast<uint32_t>(MouseGetButtons()),__ATOMIC_ACQ_REL);
     g_pointerCaptureIndex=-1;g_pointerCaptureIdentity=0;g_pointerCaptureToken=0;
@@ -277,7 +286,7 @@ static void PointerCaptureValidateLocked() {
     if(!g_wmActive || !w.proc || !w.vfb || !w.visible || w.minimized ||
        !w.focused || g_focusedIdx!=g_pointerCaptureIndex ||
        w.creationIdentity!=g_pointerCaptureIdentity ||
-       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible())
+       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible() || WmVolumePopupVisible())
         PointerCaptureReleaseLocked();
 }
 bool WmPointerCaptureActive() {
@@ -297,6 +306,19 @@ void WmPointerCaptureRefresh() {
         __atomic_fetch_and(&g_pointerQuarantinedButtons,~recovered,__ATOMIC_ACQ_REL);
     }
 }
+void WmPointerSetHover(int idx) {
+    const uint64_t identity=idx>=0 && idx<static_cast<int>(WM_MAX_WINDOWS) && g_windows[idx].proc
+        ?g_windows[idx].creationIdentity:0;
+    __atomic_store_n(&g_pointerHoverIdentity,identity,__ATOMIC_RELEASE);
+}
+void WmPointerEngage(int idx) {
+    if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS))return;
+    VfbGuard guard;
+    Window& w=g_windows[idx];
+    if(!w.proc)return;
+    if(g_pointerInteractionSerial<0x7fffffffffffffffull)++g_pointerInteractionSerial;
+    w.pointerEngageSerial=g_pointerInteractionSerial;w.pointerDisengaged=false;
+}
 bool WmPointerCaptureReleaseByUser() {
     VfbGuard guard;
     if(g_pointerCaptureIndex<0)return false;
@@ -308,20 +330,23 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     Window* w=WmFindWindowById(provider,wmId);
     if(!w)return -2;
     // Physical interaction proof for providers: queued WM events and new
-    // protocol resources cannot manufacture a fresh post-release click.
-    if(operation==3 && !token)return static_cast<int64_t>(g_pointerInteractionSerial);
+    // protocol resources cannot manufacture a fresh post-release click, and
+    // clicks on the taskbar, launcher or another window do not count.
+    if(operation==3 && !token)return static_cast<int64_t>(w->pointerEngageSerial);
     const bool owned=g_pointerCaptureIndex==static_cast<int>(wmId)-1 &&
                      g_pointerCaptureIdentity==w->creationIdentity;
     if(operation==0)return owned && (!token || token==g_pointerCaptureToken)?g_pointerCaptureToken:0;
     if(operation==2) {
         if(!owned || !token || token!=g_pointerCaptureToken)return -116;
-        PointerCaptureReleaseLocked();return 0;
+        PointerCaptureReleaseLocked(true);return 0;
     }
     if(operation!=1 || token)return -22;
     if(owned)return g_pointerCaptureToken;
     if(g_pointerCaptureIndex>=0)return -16;
     if(!g_wmActive || !w->vfb || !w->visible || w->minimized || !w->focused ||
-       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmPointerSuppressedButtons())return -11;
+       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() ||
+       WmPointerSuppressedButtons() || w->pointerDisengaged ||
+       __atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE)!=w->creationIdentity)return -11;
     if(g_nextPointerCaptureToken==0xffffffffu)return -75;
     MouseGetPosition(&g_pointerAnchorX,&g_pointerAnchorY);
     g_pointerLocalX=static_cast<int16_t>(g_pointerAnchorX-w->clientX());
@@ -374,11 +399,7 @@ bool WmRouteCapturedPointer(const InputEvent& event) {
         if(event.type==InputEventType::KeyRelease)g_pointerEscapeHeld=false;
         return true;
     }
-    if(g_pointerCaptureIndex<0) {
-        if(event.type==InputEventType::MouseButtonDown && event.scanCode==0 &&
-           g_pointerInteractionSerial<0x7fffffffffffffffull)++g_pointerInteractionSerial;
-        return false;
-    }
+    if(g_pointerCaptureIndex<0)return false;
     if(event.type==InputEventType::KeyPress && event.scanCode==1 &&
        (event.modifiers&(INPUT_MOD_CTRL|INPUT_MOD_ALT))==(INPUT_MOD_CTRL|INPUT_MOD_ALT)) {
         g_pointerEscapeHeld=true;PointerCaptureReleaseLocked();return true;
@@ -867,6 +888,8 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.proc = proc;
     w.metrics = &WmDesktopMetrics();
     w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
+    w.pointerEngageSerial = 0;
+    w.pointerDisengaged = false;
     w.publicationGeneration=w.publishedGeneration=1;
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;

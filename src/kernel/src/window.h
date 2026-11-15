@@ -138,6 +138,11 @@ struct Window
 {
     const DesktopMetrics* metrics; // Immutable decoration geometry for this window.
     uint64_t    creationIdentity; // Monotonic identity across reused window slots.
+    // Pointer-lock engagement (g_vfbLock). A capture revoked by the user or WM
+    // (Super, Ctrl+Alt+Esc, focus/launcher/minimise) disengages the window; only
+    // a physical primary press delivered to its client area re-engages it.
+    uint64_t    pointerEngageSerial;
+    bool        pointerDisengaged;
     Process*    proc;           // owning process (nullptr = unused slot)
     uint16_t    clientPid;      // Connection-origin TGID; never signal authority.
     uint64_t    clientIncarnation;
@@ -515,8 +520,12 @@ int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
 // client-local for mouse events.  Drops on overflow.
 bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY,
                  uint32_t captureToken = 0);
-// WM_POINTER_CAPTURE: query=0, acquire=1, release=2, physical-click serial=3.
+// WM_POINTER_CAPTURE: query=0, acquire=1, release=2, engage serial=3.
 // Positive leases never identify a later incarnation of the same window slot.
+// Acquire also requires the pointer to be over the window's own client area
+// (never the taskbar, launcher, volume popup, chrome or another window) and,
+// after an involuntary revoke, a fresh physical click in that client area.
+// The engage serial is per window: it advances only on such clicks.
 int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint32_t token);
 bool WmPointerCaptureActive();
 uint64_t WmPointerCaptureRevision();
@@ -526,6 +535,12 @@ void WmPointerCaptureRefresh();
 // so waylandd unlocks and stays inhibited until a fresh click in the window.
 bool WmPointerCaptureReleaseByUser();
 bool WmRouteCapturedPointer(const InputEvent& event);
+// WM routing publishes where pointer input is currently delivered: the client
+// area of window `idx`, or -1 for shell surfaces (taskbar, launcher, popups),
+// chrome and desktop. Acquire is refused unless it names the requester.
+void WmPointerSetHover(int idx);
+// A physical primary press was delivered to window `idx`'s client area.
+void WmPointerEngage(int idx);
 bool WmInputPushRelative(Window* window,const InputEvent& event);
 
 // Drain up to `max` events from the window's queue into `out`.  Returns
