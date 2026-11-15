@@ -973,6 +973,8 @@ set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)
 
 add_host_test(test_intel_bdw_forcewake_adapter)
 add_host_test(test_real_interval_timer)
+add_host_test(test_synthetic_system_files)
+target_compile_options(test_synthetic_system_files PRIVATE -UNDEBUG)
 add_host_test(test_kcmp)
 target_compile_options(test_kcmp PRIVATE -DBROOK_HOST_TEST -UNDEBUG
     -ffunction-sections -fdata-sections -Wno-unused-function -Wno-missing-field-initializers

@@ -14,6 +14,8 @@
 #include "syscall_internal.h"
 #include "syscall_maintenance_block.h"
 #include "syscall_drm.h"
+#include "synthetic_system_files.h"
+#include "smp.h"
 #include "syscall_open.h"
 #include "syscall_rw.h"
 #include "syscall_netlink.h"
@@ -228,6 +230,16 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         return true;
     }
 #endif
+    if (const char* cpus = SysfsCpuAttribute(path, SmpGetCpuCount(), MAX_CPUS))
+    {
+        uint64_t len = 0; while (cpus[len]) ++len;
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0100444; // S_IFREG | r--r--r--
+        st->st_nlink = 1;
+        st->st_size = static_cast<int64_t>(len);
+        st->st_blksize = 4096;
+        return true;
+    }
     const bool virt=brook::GpuAppGet()!=nullptr,intel=brook::BdwIntelUserNodeEnabled();
     if(!virt && !intel)return false;
     if ((virt && StrEq(path, "/dev/dri/renderD128")) || (intel && StrEq(path,"/dev/dri/renderD129")))
