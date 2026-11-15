@@ -378,4 +378,10 @@ int64_t sys_getpriority(uint64_t, uint64_t, uint64_t,
 int64_t sys_setpriority(uint64_t, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t);
 
+// syscall_futex.cpp
+int64_t sys_set_robust_list(uint64_t head,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_get_robust_list(uint64_t pid,uint64_t headOut,uint64_t lengthOut,uint64_t,uint64_t,uint64_t);
+int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
+                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
 } // namespace brook

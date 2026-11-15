@@ -313,6 +313,7 @@ add_executable(kernel
     src/syscall_process.cpp
     src/syscall_exec.cpp
     src/syscall_sched.cpp
+    src/syscall_futex.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
