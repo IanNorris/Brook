@@ -11,6 +11,7 @@
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
+#include "input_grab_policy.h"
 #include "../../shared/brook_debug_frame.h"
 #include "boot_logo.h"
 #include "kvmclock.h"
@@ -280,6 +281,8 @@ bool CompositorSetInputGrabber(Process* proc, bool enable)
 {
     if (!proc) return false;
     if (enable) {
+        if (!InputGrabTakeoverAllowed(__atomic_load_n(&g_inputGrabber, __ATOMIC_ACQUIRE), proc))
+            return false;
         __atomic_store_n(&g_inputGrabber, proc, __ATOMIC_RELEASE);
         SerialPrintf("COMPOSITOR: input grabber set pid=%u '%s'\n",
                      proc->pid, proc->name);

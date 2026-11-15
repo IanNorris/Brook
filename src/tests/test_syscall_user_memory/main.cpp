@@ -179,6 +179,7 @@ int main() {
     RunWaitTests();
     RunValidateRaceTests();
     RunIoctlTests();
+    RunGrabTests();
     if(harness::Failures()) { fprintf(stderr,"%u failure(s)\n",harness::Failures());return 1; }
     printf("test_syscall_user_memory: all passed\n");
     return 0;

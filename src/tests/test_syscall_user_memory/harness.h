@@ -96,3 +96,4 @@ void RunMemfdTests();
 void RunWaitTests();
 void RunValidateRaceTests();
 void RunIoctlTests();
+void RunGrabTests();
