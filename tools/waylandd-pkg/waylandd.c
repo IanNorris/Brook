@@ -2129,12 +2129,15 @@ static void surface_apply_decoration(struct brook_surface *s, int csd) {
  * and that support server-side decoration well. Answering their CLIENT_SIDE
  * request with SERVER_SIDE (the protocol lets the compositor choose) makes
  * the window opaque, so the renderer can cull beneath it, and Brook's WM
- * draws the chrome. BROOK_WAYLAND_SSD_APPS (comma list of app_id prefixes;
- * empty disables) overrides the default. */
+ * draws the chrome. Opt-in: BROOK_WAYLAND_SSD_APPS is a comma list of
+ * app_id prefixes (unset or empty: honour the client's request). */
 static int deco_force_server_side(const struct brook_surface *s){
     if(!s || !s->app_id[0])return 0;
     const char *list=getenv("BROOK_WAYLAND_SSD_APPS");
-    if(!list)list="chromium,Chromium,google-chrome";
+    /* Off by default: Chromium keeps drawing its custom frame inside the
+     * server-side one (gen 405: a double frame with a transparent shadow
+     * margin). Its "use system title bar" preference is the working fix. */
+    if(!list)return 0;
     for(const char *p=list;*p;){
         const char *e=strchr(p,',');size_t n=e?(size_t)(e-p):strlen(p);
         if(n && !strncmp(s->app_id,p,n))return 1;
