@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 
+namespace brook { extern bool g_pendingSignals; }
 namespace harness {
 namespace {
 uint8_t* g_arena;
@@ -20,6 +21,8 @@ unsigned g_failures;
 KernelCanary g_kernel;
 unsigned g_refusedKernelCopies;
 void (*g_userCopyHook)(uint64_t,uint64_t,bool);
+void (*g_wakeHook)(brook::Process*);
+void (*g_blockInterruptibleHook)(brook::Process*);
 unsigned g_userCopies;
 
 void KernelCanary::Fill() { for(uint64_t i=0;i<Size;++i)bytes[i]=static_cast<uint8_t>(0xA5^i); }
@@ -39,6 +42,7 @@ void Reset() {
     g_kernel.Fill();
     g_refusedKernelCopies=0;
     g_userCopyHook=nullptr;g_userCopies=0;
+    g_wakeHook=nullptr;g_blockInterruptibleHook=nullptr;brook::g_pendingSignals=false;
 }
 uint64_t UserBase() { return reinterpret_cast<uint64_t>(g_arena); }
 uint64_t UserAddress(uint64_t offset) { return UserBase()+offset; }
@@ -134,12 +138,12 @@ bool StrEq(const char* a,const char* b) {
 bool g_pendingSignals;
 bool HasPendingSignals() { return g_pendingSignals; }
 bool HasReadInterruptSignal() { return g_pendingSignals; }
-void WakeProcess(Process*) {}
+void WakeProcess(Process* p) { if(harness::g_wakeHook)harness::g_wakeHook(p); }
 }
 void (*g_schedulerBlockHook)(brook::Process*);
 namespace brook {
 void SchedulerBlock(Process* p) { if(g_schedulerBlockHook)g_schedulerBlockHook(p);else g_pendingSignals=true; }
-void SchedulerBlockInterruptible(Process*) { g_pendingSignals=true; }
+void SchedulerBlockInterruptible(Process* p) { if(harness::g_blockInterruptibleHook)harness::g_blockInterruptibleHook(p);else g_pendingSignals=true; }
 void SchedulerUnblock(Process*) {}
 void KMutexInit(KMutex*) {}
 void KMutexLock(KMutex*) {}
@@ -159,6 +163,7 @@ int main() {
     RunUnixTests();
     RunProcessTests();
     RunMemfdTests();
+    RunWaitTests();
     if(harness::Failures()) { fprintf(stderr,"%u failure(s)\n",harness::Failures());return 1; }
     printf("test_syscall_user_memory: all passed\n");
     return 0;

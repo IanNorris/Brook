@@ -311,6 +311,8 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         if (!CopyFromUser(&val, bufAddr, sizeof(val))) return -EFAULT;
         if (val == 0xFFFFFFFFFFFFFFFFULL) return -EINVAL;
         auto* efd = static_cast<EventFdData*>(fde->handle);
+        EventFdWaitGroup waiters;
+        bool registered = false;
         for (;;) {
             bool accepted = false;
             {
@@ -319,28 +321,20 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                     efd->counter += val;
                     ++efd->inGeneration; // every write, including zero
                     accepted = true;
+                    // Every blocked reader, poller and epoll waiter wakes.
+                    EventFdWakeLocked(efd);
                 }
             }
             if (accepted) break;
             if (fde->statusFlags & EFD_NONBLOCK) return -EAGAIN;
-            // Existing eventfd wait hooks have one slot; bounded polling also
-            // supplies progress to writers waiting for counter capacity.
+            // Register, then recheck before blocking: a read that frees
+            // capacity in between wakes this writer (or leaves the wake
+            // pending). The timeout only covers an allocation failure.
             Process* self = ProcessCurrent();
-            self->wakeupTick = ApicTickCount() + 10;
+            if (!registered && (registered = waiters.add(efd, self))) continue;
+            self->wakeupTick = ApicTickCount() + (registered ? 100 : 10);
             SchedulerBlockInterruptible(self);
             if (HasPendingSignals()) return -EINTR;
-        }
-        // Wake blocked reader
-        Process* reader = efd->readerWaiter;
-        if (reader) {
-            efd->readerWaiter = nullptr;
-            WakeProcess(reader);
-        }
-        // Wake epoll waiter watching this eventfd for readability
-        Process* ew = efd->epollWaiter;
-        if (ew) {
-            efd->epollWaiter = nullptr;
-            WakeProcess(ew);
         }
         return 8;
     }
@@ -952,6 +946,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         if (count < 8) return -EINVAL;
         auto* efd = static_cast<EventFdData*>(fde->handle);
+        EventFdWaitGroup waiters;
+        bool registered = false;
 
         for (;;)
         {
@@ -967,21 +963,20 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     efd->counter = semaphore ? efd->counter - 1 : 0;
                     ++efd->outGeneration;
                     consumed = true;
+                    // Capacity changed: wake writers and POLLOUT pollers.
+                    EventFdWakeLocked(efd);
                 }
             }
-            if (consumed) {
-                Process* ew = efd->epollWaiter;
-                if (ew) { efd->epollWaiter = nullptr; WakeProcess(ew); }
-                return 8;
-            }
+            if (consumed) return 8;
             // Non-blocking: return EAGAIN
             if (fde->statusFlags & 0x800)
                 return -EAGAIN;
 
-            // Block until counter becomes non-zero
+            // Register, recheck, then block until the counter is non-zero.
+            // Concurrent readers and pollers each hold their own registration.
             Process* self = ProcessCurrent();
-            efd->readerWaiter = self;
-            self->wakeupTick = ApicTickCount() + 10;
+            if (!registered && (registered = waiters.add(efd, self))) continue;
+            self->wakeupTick = ApicTickCount() + (registered ? 100 : 10);
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return -EINTR;

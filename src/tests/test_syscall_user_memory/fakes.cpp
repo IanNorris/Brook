@@ -6,6 +6,11 @@
 #include "syscall_memfd.h"
 #include "syscall_pipe.h"
 #include "syscall_poll.h"
+#include "syscall_epoll.h"
+#include "audio.h"
+#include "syscall_dsp.h"
+#include "dsp_producer_timing.h"
+#include "serial_writer.h"
 #include "syscall_unix_socket.h"
 #include "syscall_netlink.h"
 #include "syscall_timerfd.h"
@@ -43,6 +48,7 @@ void FsSnapshotRelease(FsSnapshot*) {}
 void VfsPathRetain(const VfsPath&) {}
 void VfsPathRelease(VfsPath) {}
 bool VfsPathSame(const VfsPath&,const VfsPath&) { return false; }
+bool VfsPathSameObject(const VfsPath&,const VfsPath&) { return false; }
 int VfsPathBrokerAllowed(const VfsPath&,const char*,bool* allowed) {
     if(!harness::g_syntheticPathsOnly)return -ENOENT;
     *allowed=true;return 0;
@@ -58,12 +64,6 @@ Vnode* VfsCreateSocketAt(const VfsPath&,const VfsPath&,const char*,uint16_t,uint
 void VfsRelease(Vnode*) {}
 int VfsStat(Vnode*,VnodeStat*) { return -ENOENT; }
 Vnode* GuardCheckerOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
-int NamedFifoAttach(Vnode*,uint32_t) { return -1; }
-NamedFifoOpen* FdNamedFifo(const FdEntry*) { return nullptr; }
-PipeBuffer* FdPipe(const FdEntry*) { return nullptr; }
-bool FdPipeRead(const FdEntry*) { return false; }
-void PipePollNotify(PipeBuffer*,uint32_t) {}
-void PipeReleaseEnd(PipeBuffer*,bool) {}
 
 // Devices and GPU: absent.
 const char* DrmSysAttrContent(const char*) { return nullptr; }
@@ -96,8 +96,6 @@ void TtyPutChar(char) {}
 bool WmIsActive() { return true; }
 int64_t SignalFdRead(Process*,SignalFd*,uint64_t,uint64_t,bool) { return -EBADF; }
 uint64_t TimerFdDeadline(TimerFdData*,uint64_t*) { return 0; }
-uint64_t WaitWakeupTick(uint64_t,uint64_t) { return 0; }
-int64_t PollWait(pollfd*,uint64_t,uint64_t,bool) { return -EINTR; }
 uint32_t NetInterfaceViews(InterfaceView*,uint32_t) { return 0; }
 FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace*,bool) { return {}; }
 void ProcessGroupsRelease(SupplementaryGroups*) {}
@@ -105,6 +103,28 @@ CredentialIds ProcessReadIds(Process*,bool) { return {}; }
 int ProcessSendSignal(Process*,int,const SignalInfo*) { return 0; }
 int VfsAccess(Vnode*,uint8_t,bool) { return -13; }
 uint32_t ProcessReportId(Process*,bool,uint32_t canonical) { return canonical; }
+
+bool AudioMixerGetProgress(AudioStreamId,AudioStreamProgress*) { return false; }
+int EpollPollReady(Process*,EpollInstance*) { return 0; }
+FdEntry* FdGet(Process* proc,int fd) { return fd>=0 && fd<static_cast<int>(MAX_FDS) && proc->fds[fd].type!=FdType::None?&proc->fds[fd]:nullptr; }
+uint64_t NetTcpPoolWaitRegister(Process*) { return 0; }
+void NetTcpPoolWaitUnregister(uint64_t) {}
+uint32_t SignalFdReady(Process*,SignalFd*,uint32_t) { return 0; }
+bool SockPollReady(int,bool,bool) { return false; }
+bool SockPollHangup(int) { return false; }
+void SockSetPollWaiter(int,Process*) {}
+bool TimerFdReady(TimerFdData*) { return false; }
+
+// write() backends not exercised by these tests.
+uint32_t AudioMixerSubmit(const int16_t*,uint32_t,AudioStreamId) { return 0; }
+uint32_t AudioMixerAvailableFrames(AudioStreamId) { return 0; }
+uint64_t DspProducerTimingToken() { return 0; }
+void DspProducerTimingRecord(uint64_t,const DspProducerEvent&) {}
+bool DspRecoverStreamLocked(DspState*,AudioStreamProgress&) { return false; }
+Process* SchedulerCurrentProcess() { return ProcessCurrent(); }
+void SerialWriterEnqueue(const char*,uint32_t) {}
+int SockSend(int,const void*,uint32_t) { return -EIO; }
+int VfsFsync(Vnode*) { return 0; }
 
 // Inet sockets: one fake UDP/TCP socket, observable through g_net. The
 // stack only ever receives kernel buffers.
@@ -143,5 +163,11 @@ void SockUnref(int) {}
 bool SockGetIdentity(int,SocketIdentity* identity) { identity->inode=77;return true; }
 }
 extern "C" bool InputPollEvent(brook::InputEvent*) { return false; }
+extern "C" bool InputHasEvents() { return false; }
+extern "C" uint64_t AudioClockNowNs() { return 0; }
+extern "C" void CompositorWake() {}
+extern "C" void KPuts(const char*) {}
+extern "C" int VfsWrite(brook::Vnode*,const void*,uint64_t,uint64_t*) { return -brook::EIO; }
+extern "C" int VfsAppend(brook::Vnode*,const void*,uint64_t,uint64_t*) { return -brook::EIO; }
 extern "C" int VfsRead(brook::Vnode*,void*,uint64_t,uint64_t*) { return -brook::EIO; }
 extern "C" void VfsClose(brook::Vnode*) {}

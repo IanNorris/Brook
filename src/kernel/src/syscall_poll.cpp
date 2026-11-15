@@ -305,6 +305,8 @@ retry_poll:
         NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup pipeWaiters;
+        EventFdWaitGroup eventWaiters;
+        SyncFileWait syncWait;
         // Allocate pipe subscriptions before installing legacy wait hooks, so
         // ENOMEM unwinds only RAII-owned exact registrations, never stale hooks.
         for (uint64_t i = 0; i < waiterCap; ++i) {
@@ -321,6 +323,11 @@ retry_poll:
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
                 if (!(fde->flags & 1)) // read end
                     if (!pipeWaiters.add(pb, self, POLLIN)) return -ENOMEM;
+            }
+            // Write end: a reader draining (or closing) notifies POLLOUT.
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLOUT) && fde->flags == 1)
+            {
+                if (!pipeWaiters.add(static_cast<PipeBuffer*>(fde->handle), self, POLLOUT)) return -ENOMEM;
             }
             if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
             {
@@ -366,12 +373,18 @@ retry_poll:
                 if ((fds[i].events & POLLIN) && usd->state == UnixSocketData::State::Listening)
                     usd->epollWaiter = self;
             }
-            if (fde->type == FdType::EventFd && fde->handle)
-            {
-                auto* efd = static_cast<EventFdData*>(fde->handle);
-                efd->readerWaiter = self;
-            }
+            if (fde->type == FdType::EventFd && fde->handle &&
+                !eventWaiters.add(static_cast<EventFdData*>(fde->handle), self))
+                safetyMs = 5;
+            if (fde->type == FdType::SyncFile && fde->handle && (fds[i].events & POLLIN))
+                syncWait.Want(*static_cast<SyncFileData*>(fde->handle));
+            // No wake source yet: signals aimed at another thread of the
+            // process, and nested epoll readiness. Poll these more often.
+            if ((fde->type == FdType::SignalFd || fde->type == FdType::EpollFd) && safetyMs > 10)
+                safetyMs = 10;
         }
+        // A fence that retired since the snapshot means: rescan, don't sleep.
+        if (syncWait.Arm()) ready++;
 
         // Re-check data availability after registration.
         // If data arrived between the initial scan and registration,
@@ -395,6 +408,15 @@ retry_poll:
                 if (!(fde->flags & 1) && (pb->count() > 0 || pb->writers == 0))
                 { ready++; break; }
             }
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLOUT) && fde->flags == 1)
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (pb->space() > 0 || __atomic_load_n(&pb->readers, __ATOMIC_ACQUIRE) == 0)
+                { ready++; break; }
+            }
+            if (fde->type == FdType::SyncFile && fde->handle && (fds[i].events & POLLIN) &&
+                SyncFileReady(*static_cast<SyncFileData*>(fde->handle), POLLIN))
+            { ready++; break; }
             if (fde->type == FdType::Socket && fde->handle)
             {
                 int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
@@ -435,6 +457,7 @@ retry_poll:
             // checks also service timerfds and descriptors without wait hooks.
             const uint64_t timerDeadline = timerWaiters.deadline(deadline);
             if (timerWaiters.allocationFailed) safetyMs = 5;
+            safetyMs = syncWait.SafetyMs(safetyMs);
             self->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
                 SchedulerBlockInterruptible(self);
@@ -457,12 +480,6 @@ retry_poll:
                     usd->state == UnixSocketData::State::Listening &&
                     usd->epollWaiter == self)
                     usd->epollWaiter = nullptr;
-            }
-            if (fde->type == FdType::EventFd && fde->handle)
-            {
-                auto* efd = static_cast<EventFdData*>(fde->handle);
-                if (efd->readerWaiter == self)
-                    efd->readerWaiter = nullptr;
             }
             if (fde->type == FdType::Socket && fde->handle)
             {
