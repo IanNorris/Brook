@@ -74,10 +74,11 @@ static inline void MemFdUnref(MemFdData* mfd)
 
 void MemFdReleaseMapping(void* object);
 int MemFdInstall(Process* proc, MemFdData* mfd, uint32_t flags);
-int64_t MemFdReadAt(MemFdData* mfd, void* buffer, uint64_t count, uint64_t* offset);
-
-int64_t MemFdWriteAt(MemFdData* mfd, const void* buffer, uint64_t count,
-                     uint64_t* offset, bool append);
+// `user` selects a user address (checked copies, never under MfdLock) or a
+// trusted kernel buffer passed as an address.
+int64_t MemFdReadAt(MemFdData* mfd, uint64_t destination, uint64_t count, uint64_t* offset, bool user);
+int64_t MemFdWriteAt(MemFdData* mfd, uint64_t source, uint64_t count,
+                     uint64_t* offset, bool append, bool user);
 
 int NamedShmOpen(Process* proc,const char* name,uint32_t flags);
 int NamedShmUnlink(const char* name);

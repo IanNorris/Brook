@@ -77,12 +77,8 @@ void SyncFileUnref(SyncFileData*) {}
 void SceneHandleUnref(SceneHandle*) {}
 void SignalFdUnref(SignalFd*) {}
 void MappingBackingUnref(MappingBacking*) {}
-void PmmFreePage(PhysicalAddress) {}
 void FinalizeClosedFd(const FdClaimResult&) {}
 int FdAlloc(Process*,FdType,void*) { return -1; }
-int MemFdInstall(Process*,MemFdData*,uint32_t) { return -1; }
-int64_t MemFdReadAt(MemFdData*,void*,uint64_t,uint64_t*) { return -EBADF; }
-int NamedShmOpen(Process*,const char*,uint32_t) { return -1; }
 AudioStreamId AudioMixerOpen() { return 0; }
 bool AudioMixerClose(AudioStreamId) { return true; }
 bool AudioMixerSetCapacity(AudioStreamId,uint32_t,uint32_t) { return false; }

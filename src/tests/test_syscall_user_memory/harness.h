@@ -45,6 +45,12 @@ extern KernelCanary g_kernel;
 brook::Process* CurrentProcess();   // zeroed, PROCESS_MAGIC, pid 7
 void ResetProcess();
 
+// Called before every checked user copy (address, length, true = to user).
+// Tests use it to assert no spinlock is held across user memory access.
+extern void (*g_userCopyHook)(uint64_t address,uint64_t length,bool toUser);
+extern unsigned g_userCopies;
+inline bool SpinLockHeld(const brook::SpinLock& lock) { return lock.next!=lock.serving; }
+
 // Count of user-copy calls that were refused because they hit kernel memory.
 extern unsigned g_refusedKernelCopies;
 
@@ -74,3 +80,4 @@ void RunRwTests();
 void RunSocketTests();
 void RunUnixTests();
 void RunProcessTests();
+void RunMemfdTests();

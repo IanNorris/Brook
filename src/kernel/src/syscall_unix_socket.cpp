@@ -403,10 +403,24 @@ uint32_t UnixSocketReady(UnixSocketData* socket,uint32_t events)
         ((events&0x2000)&&readClosed?0x2000u:0u) | (readClosed&&writeClosed?0x10u:0u);
 }
 
+// User payloads never reach the ring copies, which run under pipe->lock: a
+// demand fault would sleep under the spinlock and a raced unmap would fault
+// the kernel. Small transfers use the inline buffer, larger ones kmalloc.
+// Kernel callers (recvmsg/sendmsg vector staging) pass upper-half pointers.
 struct UnixSocketStage {
     char* bytes=nullptr;
-    ~UnixSocketStage(){if(bytes)kfree(bytes);}
+    char inline_[2048];
+    bool owned=false;
+    char* Get(uint64_t length) {
+        if(length<=sizeof(inline_)) return bytes=inline_;
+        bytes=static_cast<char*>(kmalloc(length));owned=bytes!=nullptr;return bytes;
+    }
+    ~UnixSocketStage(){if(owned)kfree(bytes);}
 };
+static bool UnixUserPointer(const void* bytes)
+{
+    return reinterpret_cast<uint64_t>(bytes)<0x0000800000000000ULL;
+}
 int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
                             const char* bytes,uint64_t length,
                             const UnixFdSnap* descriptors,int count,bool noSignal,
@@ -414,13 +428,14 @@ int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
     if(socket->state!=UnixSocketData::State::Connected || !socket->txPipe)return -ENOTCONN;
     auto* pipe=socket->txPipe;
     UnixSocketStage staged;
-    if(socket->socketType==5) {
-        if(length>=pipe->capacity)return -90;
-        if(length && reinterpret_cast<uint64_t>(bytes)<0x0000800000000000ULL) {
-            staged.bytes=static_cast<char*>(kmalloc(length));if(!staged.bytes)return -ENOMEM;
-            if(!CopyFromUser(staged.bytes,reinterpret_cast<uint64_t>(bytes),length))return -EFAULT;
-            bytes=staged.bytes;
-        }
+    if(socket->socketType==5 && length>=pipe->capacity)return -90;
+    if(length && UnixUserPointer(bytes)) {
+        // A record is staged whole; a stream write takes at most one ring's
+        // worth per call and may return short, as before.
+        if(socket->socketType!=5 && length>=pipe->capacity)length=pipe->capacity-1;
+        if(!staged.Get(length))return -ENOMEM;
+        if(!CopyFromUser(staged.bytes,reinterpret_cast<uint64_t>(bytes),length))return -EFAULT;
+        bytes=staged.bytes;
     }
     for(;;) {
         auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count,explicitCredentials,socket->socketType==5);
@@ -452,9 +467,10 @@ int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
     auto* pipe=socket->rxPipe;
     UnixSocketStage staged;
     char* userTarget=nullptr;
-    if(socket->socketType==5 && length && reinterpret_cast<uint64_t>(bytes)<0x0000800000000000ULL) {
+    if(length && UnixUserPointer(bytes)) {
+        // The ring holds at most capacity-1 bytes, so no read returns more.
         if(length>=pipe->capacity)length=pipe->capacity-1;
-        staged.bytes=static_cast<char*>(kmalloc(length));if(!staged.bytes)return -ENOMEM;
+        if(!staged.Get(length))return -ENOMEM;
         userTarget=bytes;bytes=staged.bytes;
     }
     for(;;) {

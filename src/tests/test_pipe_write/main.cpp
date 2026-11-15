@@ -39,7 +39,17 @@ static void SchedulerBlock(Process *) {
     onBlock();
 }
 #include "../../kernel/src/pipe_poll.inc"
-static int64_t writePipe(FdEntry *fde, const char *data, uint64_t count) {
+// User sources reach the pipe only through CopyFromUser (H-11): the ring copy
+// runs under pipe->lock. A faultAt address makes the copy fail there.
+static unsigned userCopies;
+static uint64_t faultAt;
+static bool CopyFromUser(void* target, uint64_t source, uint64_t length) {
+    ++userCopies;
+    if (faultAt && faultAt >= source && faultAt < source + length) return false;
+    std::memcpy(target, reinterpret_cast<const void*>(source), length);
+    return true;
+}
+static int64_t writePipe(FdEntry *fde, const char *data, uint64_t count, bool userSource = true) {
     [[maybe_unused]] Process *proc = &current;
     uint64_t bufAddr = reinterpret_cast<uint64_t>(data);
 #include "../../kernel/src/pipe_write.inc"
@@ -167,6 +177,20 @@ int main() {
     CHECK(writePipe(&fd,payload,8192)==4096);failPacketAllocation=false;
     PipeBufferDestroy(packetPipe);
     CHECK(!allocationHolds && !processHolds);
+
+    // H-11: user bytes are staged with CopyFromUser before the locked ring
+    // copy. A fault on the first chunk is EFAULT with nothing queued; a fault
+    // on a later chunk keeps the bytes already written. Kernel sources
+    // (sendfile) skip the user copy.
+    reset(true);
+    fd.flags=1;
+    userCopies=0;faultAt=0;
+    CHECK(writePipe(&fd,samples,10)==10 && userCopies==1 && pipe.count()==10);
+    char sink[64];CHECK(pipe.read(sink,sizeof(sink))==10);
+    faultAt=reinterpret_cast<uint64_t>(samples)+3;
+    CHECK(writePipe(&fd,samples,10)==-EFAULT && pipe.empty());
+    faultAt=0;userCopies=0;
+    CHECK(writePipe(&fd,samples,5,false)==5 && userCopies==0);
     std::printf("PIPE_WRITE_ACTUAL_BODY %s failures=%u\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;
 }

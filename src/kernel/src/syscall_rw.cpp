@@ -65,6 +65,20 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
     return result;
 }
 
+// Copy one chunk of a write() source into kernel memory before it reaches a
+// backend that copies under a spinlock (serial, pipe rings). Kernel sources
+// (sendfile's bounce buffer) are used in place. Returns the bytes staged,
+// 0 on a fault.
+static uint32_t StageWriteChunk(char* stage, uint32_t capacity, uint64_t address,
+                                uint64_t remaining, bool userSource, const char** chunk)
+{
+    const uint32_t n = static_cast<uint32_t>(remaining < capacity ? remaining : capacity);
+    if (!userSource) { *chunk = reinterpret_cast<const char*>(address); return n; }
+    if (!CopyFromUser(stage, address, n)) return 0;
+    *chunk = stage;
+    return n;
+}
+
 static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                                      uint64_t bufAddr,uint64_t count,bool userSource)
 {
@@ -101,14 +115,22 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     }
     if (fde->type == FdType::DebugSerial)
     {
-        const char* buf = reinterpret_cast<const char*>(bufAddr);
-        brook::SerialLock();
-        for (uint64_t i = 0; i < count; i++)
+        // Stage each chunk before taking the serial lock.
+        char stage[512];
+        for (uint64_t offset = 0; offset < count;)
         {
-            if (buf[i]) // skip null bytes (binary padding in buffers)
-                brook::SerialPutChar(buf[i]);
+            const char* buf = nullptr;
+            const uint32_t n = StageWriteChunk(stage, sizeof(stage), bufAddr + offset, count - offset, userSource, &buf);
+            if (!n) return offset ? static_cast<int64_t>(offset) : -EFAULT;
+            brook::SerialLock();
+            for (uint32_t i = 0; i < n; i++)
+            {
+                if (buf[i]) // skip null bytes (binary padding in buffers)
+                    brook::SerialPutChar(buf[i]);
+            }
+            brook::SerialUnlock();
+            offset += n;
         }
-        brook::SerialUnlock();
         return static_cast<int64_t>(count);
     }
 
@@ -119,19 +141,15 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         // Default: Vnode with null handle = serial output
         if (fde->type == FdType::Vnode && !fde->handle)
         {
-            const char* buf = reinterpret_cast<const char*>(bufAddr);
-            if (count > 0)
+            // The serial writer copies into its queue; give it kernel bytes.
+            char stage[4096];
+            for (uint64_t offset = 0; offset < count;)
             {
-                uint64_t remaining = count;
-                while (remaining > 0)
-                {
-                    uint32_t chunk = remaining > 0xffffffffULL
-                        ? 0xffffffffU
-                        : static_cast<uint32_t>(remaining);
-                    brook::SerialWriterEnqueue(buf, chunk);
-                    buf += chunk;
-                    remaining -= chunk;
-                }
+                const char* buf = nullptr;
+                const uint32_t chunk = StageWriteChunk(stage, sizeof(stage), bufAddr + offset, count - offset, userSource, &buf);
+                if (!chunk) return offset ? static_cast<int64_t>(offset) : -EFAULT;
+                brook::SerialWriterEnqueue(buf, chunk);
+                offset += chunk;
             }
             return static_cast<int64_t>(count);
         }
@@ -263,15 +281,19 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
     if (fde->type == FdType::DevKeyboard)
     {
-        const char* buf = reinterpret_cast<const char*>(bufAddr);
-        if (count > 0)
+        char stage[512];
+        for (uint64_t offset = 0; offset < count;)
         {
+            const char* buf = nullptr;
+            const uint32_t n = StageWriteChunk(stage, sizeof(stage), bufAddr + offset, count - offset, userSource, &buf);
+            if (!n) return offset ? static_cast<int64_t>(offset) : -EFAULT;
             brook::SerialLock();
-            for (uint64_t i = 0; i < count; i++)
+            for (uint32_t i = 0; i < n; i++)
                 brook::SerialPutChar(buf[i]);
             brook::SerialUnlock();
-            for (uint64_t i = 0; i < count; i++)
+            for (uint32_t i = 0; i < n; i++)
                 TtyPutChar(buf[i]);
+            offset += n;
         }
         return static_cast<int64_t>(count);
     }
@@ -348,16 +370,19 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     {
         auto* pair = static_cast<TtyDevicePair*>(fde->handle);
         auto* pipe = static_cast<PipeBuffer*>(pair->writePipe);
-        const char* src = reinterpret_cast<const char*>(bufAddr);
         uint64_t written = 0;
+        char stage[4096];
 
         while (written < count)
         {
             if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
                 return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
 
-            uint32_t chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            // The ring copy runs under pipe->lock; stage the chunk first.
+            const char* staged = nullptr;
+            const uint32_t want = StageWriteChunk(stage, sizeof(stage), bufAddr + written, count - written, userSource, &staged);
+            if (!want) return written > 0 ? static_cast<int64_t>(written) : -EFAULT;
+            uint32_t chunk = pipe->write(staged, want);
             written += chunk;
             if (written > 0)
             {
@@ -373,8 +398,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
             // Re-check after registering waiter
-            chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            chunk = pipe->write(staged, want);
             if (chunk > 0)
             {
                 pipe->writerWaiter = nullptr;
@@ -395,8 +419,8 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 0) return -EBADF;
         return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<const void*>(bufAddr), count, &fde->seekPos,
-            (fde->statusFlags & 0x400) != 0);
+            bufAddr, count, &fde->seekPos,
+            (fde->statusFlags & 0x400) != 0, userSource);
     }
 
     // Write to AF_UNIX connected socket.
@@ -1024,7 +1048,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 1) return -EBADF;
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<void*>(bufAddr), count, &fde->seekPos);
+            bufAddr, count, &fde->seekPos, true);
     }
 
     // Read from /dev/tty — reads from stdin pipe
@@ -1032,14 +1056,15 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         auto* pair = static_cast<TtyDevicePair*>(fde->handle);
         auto* pipe = static_cast<PipeBuffer*>(pair->readPipe);
-        auto* dst = reinterpret_cast<char*>(bufAddr);
+        // The ring copy runs under pipe->lock; read into kernel memory first.
+        char staged[4096];
 
         for (;;)
         {
-            uint32_t got = pipe->read(dst, static_cast<uint32_t>(
+            uint32_t got = pipe->read(staged, static_cast<uint32_t>(
                 count > 4096 ? 4096 : count));
             if (got > 0)
-                return static_cast<int64_t>(got);
+                return CopyToUser(bufAddr, staged, got) ? static_cast<int64_t>(got) : -EFAULT;
 
             uint32_t wr = __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE);
             if (wr == 0) return 0;
@@ -1287,7 +1312,7 @@ int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
         uint64_t remaining=count-static_cast<uint64_t>(total),amount=remaining<chunk?remaining:chunk;
         uint64_t readOffset=offset;
         int64_t read=in_fde->type==FdType::MemFd?
-            MemFdReadAt(static_cast<MemFdData*>(in_fde->handle),bounce,amount,&readOffset):
+            MemFdReadAt(static_cast<MemFdData*>(in_fde->handle),reinterpret_cast<uint64_t>(bounce),amount,&readOffset,false):
             VfsRead(static_cast<Vnode*>(in_fde->handle),bounce,amount,&readOffset);
         if(read<=0) {error=read;break;}
         int64_t written=WriteToPinnedFdByType(proc,output.get(),out_fd,reinterpret_cast<uint64_t>(bounce),static_cast<uint64_t>(read),false);
@@ -1329,8 +1354,8 @@ int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if ((fde->statusFlags & 3) == 0) return -EBADF;
         if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
         return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<const void*>(bufAddr), count, &offset,
-            (fde->statusFlags & 0x400) != 0);
+            bufAddr, count, &offset,
+            (fde->statusFlags & 0x400) != 0, true);
     }
     if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
     if ((fde->statusFlags & 3) == 0) return -EBADF;
@@ -1375,7 +1400,7 @@ int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 1) return -EBADF;
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<void*>(bufAddr), count, &offset);
+            bufAddr, count, &offset, true);
     }
     if (fde->type == FdType::Vnode && fde->handle)
     {

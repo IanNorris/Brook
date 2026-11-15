@@ -19,6 +19,8 @@ unsigned g_failures;
 }
 KernelCanary g_kernel;
 unsigned g_refusedKernelCopies;
+void (*g_userCopyHook)(uint64_t,uint64_t,bool);
+unsigned g_userCopies;
 
 void KernelCanary::Fill() { for(uint64_t i=0;i<Size;++i)bytes[i]=static_cast<uint8_t>(0xA5^i); }
 bool KernelCanary::Intact() const {
@@ -36,6 +38,7 @@ void Reset() {
     for(auto& page:g_pages)page=Access::ReadWrite;
     g_kernel.Fill();
     g_refusedKernelCopies=0;
+    g_userCopyHook=nullptr;g_userCopies=0;
 }
 uint64_t UserBase() { return reinterpret_cast<uint64_t>(g_arena); }
 uint64_t UserAddress(uint64_t offset) { return UserBase()+offset; }
@@ -101,10 +104,12 @@ bool UserBufferWritable(uint64_t address,uint64_t length) {
     return harness::InArena(address,length,Access::ReadWrite) || harness::Refuse(address);
 }
 uint64_t CopyFromUserBytes(void* destination,uint64_t source,uint64_t length) {
+    ++harness::g_userCopies;if(harness::g_userCopyHook)harness::g_userCopyHook(source,length,false);
     if(!length || !harness::InArena(source,length,Access::Read)) { if(length)harness::Refuse(source);return 0; }
     __builtin_memcpy(destination,reinterpret_cast<const void*>(source),length);return length;
 }
 uint64_t CopyToUserBytes(uint64_t destination,const void* source,uint64_t length) {
+    ++harness::g_userCopies;if(harness::g_userCopyHook)harness::g_userCopyHook(destination,length,true);
     if(!length || !harness::InArena(destination,length,Access::ReadWrite)) { if(length)harness::Refuse(destination);return 0; }
     __builtin_memcpy(reinterpret_cast<void*>(destination),source,length);return length;
 }
@@ -153,6 +158,7 @@ int main() {
     RunSocketTests();
     RunUnixTests();
     RunProcessTests();
+    RunMemfdTests();
     if(harness::Failures()) { fprintf(stderr,"%u failure(s)\n",harness::Failures());return 1; }
     printf("test_syscall_user_memory: all passed\n");
     return 0;
