@@ -195,7 +195,39 @@ static void check_layers(void){
     desktop_gpu_channel_close(&c);assert(open_fds()==before-2);
     close(page);close(video);close(fence[0]);close(fence[1]);close(pair[0]);
 }
-int main(void){check_failed_fence();check_layers();
+/* Gen 402 freeze: a layered offer that was never presented, followed only
+ * by tagged CPU snapshots, must still be retired (SAFE), or the client
+ * never gets its buffers back. */
+static void check_unpresented_superseded_by_cpu(void){
+    struct DesktopGpuChannel c;desktop_gpu_channel_init(&c);
+    int pair[2],fence[2];assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,pair) && !pipe(fence));
+    c.peer=pair[1];c.listener=dup(pair[1]);
+    char a[]="/tmp/brook-unpresented-XXXXXX",b[]="/tmp/brook-unpresented-XXXXXX";
+    int page=mkstemp(a),ad=mkstemp(b);assert(page>=0 && ad>=0);unlink(a);unlink(b);
+    assert(!ftruncate(page,16*16*4) && !ftruncate(ad,8*8*4));
+    struct stat sp,sa;assert(!fstat(page,&sp) && !fstat(ad,&sa));
+    struct BrookGpuWindowLayersPacket w;memset(&w,0,sizeof(w));
+    w.header=(struct BrookGpuWindowPacket){.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,
+        .type=BROOK_GPU_WINDOW_OFFER,.identity={6,0,600,7,(uint64_t)sp.st_dev,(uint64_t)sp.st_ino},
+        .words=256,.stride=16,.width=16,.height=16,.fourcc=0x34325241};
+    w.count=2;
+    w.layers[0]=(struct BrookGpuWindowLayer){256,(uint64_t)sp.st_dev,(uint64_t)sp.st_ino,0,16,16,16,0x34325241,0,0,0,16,16,0,0,16,16};
+    w.layers[1]=(struct BrookGpuWindowLayer){64,(uint64_t)sa.st_dev,(uint64_t)sa.st_ino,0,8,8,8,0x34325241,0,0,0,8,8,2,2,8,8};
+    int buffers[2]={page,ad},fences[2]={fence[0],fence[0]};
+    assert(brook_gpu_window_send_layers(pair[0],&w,buffers,fences)==1);desktop_gpu_channel_poll(&c);
+    /* The provider then fell back to CPU composition: snapshot tagged 8. */
+    snapshot_tagged=1;snapshot_commit=8;
+    struct BrookDesktopLayer l={.window=6,.incarnation=600,.width=16,.height=16,.clientWidth=16,.clientHeight=16,.upscale=1};
+    uint64_t frame=desktop_gpu_channel_begin_frame(&c);struct BrookVkSceneLayer out;
+    assert(!desktop_gpu_channel_select(&c,&l,100,100,&out,frame));
+    desktop_gpu_channel_finish(&c,frame);
+    struct BrookGpuWindowPacket reply;int fds[2];
+    assert(brook_gpu_window_receive(pair[0],&reply,fds)==1 && reply.type==BROOK_GPU_WINDOW_SAFE && reply.identity.commit==7);
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)assert(!c.offers[i].state);
+    snapshot_tagged=0;snapshot_commit=0;
+    desktop_gpu_channel_close(&c);close(page);close(ad);close(fence[0]);close(fence[1]);close(pair[0]);
+}
+int main(void){check_failed_fence();check_layers();check_unpresented_superseded_by_cpu();
     char dir[]="/tmp/brook-channel-restart-XXXXXX";assert(mkdtemp(dir));
     char socketPath[108];assert(snprintf(socketPath,sizeof(socketPath),"%s/socket",dir)>0);
     assert(!setenv("BROOK_DESKTOP_GPU_SOCKET",socketPath,1));
