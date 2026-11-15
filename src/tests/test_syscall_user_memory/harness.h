@@ -73,3 +73,4 @@ void RunDirOpenTests();
 void RunRwTests();
 void RunSocketTests();
 void RunUnixTests();
+void RunProcessTests();

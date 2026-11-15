@@ -356,7 +356,9 @@ struct Process
     uint32_t robustExitState;   // 0 idle/registered, 1 queued, 2 cleaning, 3 done.
     Process* robustExitNext;    // Cleanup queue owns a process reference.
     uint64_t parentSetTid;       // User address where parent's clone() stores child TID (CLONE_PARENT_SETTID)
-    Process* vforkParent;        // If non-null, wake this process when we exec/exit (CLONE_VFORK)
+    Process* vforkParent;        // If non-null, wake this process when we exec/exit (CLONE_VFORK); holds a reference
+    uint32_t vforkWaiting;       // Parent side: 1 while blocked in vfork until the child releases it
+    uint64_t setChildTid;        // CLONE_CHILD_SETTID: child stores its TID here before first user entry
 
     // Crash-dump hook: when set, an unhandled synchronous fault in this
     // process is redirected to a user-mode writer thread entered at this VA.
@@ -700,6 +702,11 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);
+// CLONE_VFORK: release the parent blocked on this child, exactly once, on
+// exec or exit (whichever comes first). Drops the child's parent reference.
+void ProcessVforkRelease(Process* child);
+// FS/GS bases must be canonical user addresses: context_switch wrmsrs them.
+inline bool UserSegmentBaseValid(uint64_t base) { return base < 0x0000800000000000ULL; }
 // Synchronous unwind before SchedulerAddProcess; never use for published tasks.
 void ProcessDiscardUnpublished(Process* proc);
 

@@ -130,7 +130,10 @@ bool g_pendingSignals;
 bool HasPendingSignals() { return g_pendingSignals; }
 bool HasReadInterruptSignal() { return g_pendingSignals; }
 void WakeProcess(Process*) {}
-void SchedulerBlock(Process*) { g_pendingSignals=true; }
+}
+void (*g_schedulerBlockHook)(brook::Process*);
+namespace brook {
+void SchedulerBlock(Process* p) { if(g_schedulerBlockHook)g_schedulerBlockHook(p);else g_pendingSignals=true; }
 void SchedulerBlockInterruptible(Process*) { g_pendingSignals=true; }
 void SchedulerUnblock(Process*) {}
 void KMutexInit(KMutex*) {}
@@ -149,6 +152,7 @@ int main() {
     RunRwTests();
     RunSocketTests();
     RunUnixTests();
+    RunProcessTests();
     if(harness::Failures()) { fprintf(stderr,"%u failure(s)\n",harness::Failures());return 1; }
     printf("test_syscall_user_memory: all passed\n");
     return 0;

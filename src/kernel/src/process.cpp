@@ -1095,6 +1095,9 @@ void ProcessCloseAllFds(Process* proc)
 
 void ProcessDestroy(Process* proc)
 {
+    // A child torn down without reaching exit or exec must not strand its
+    // vfork parent.
+    if (proc) ProcessVforkRelease(proc);
     if (proc) ProcessQueueDestroy(proc);
 }
 
@@ -1151,6 +1154,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->robustListHead=0;child->robustExitState=0;child->robustExitNext=nullptr;
     child->parentSetTid = 0;
     child->vforkParent = nullptr;
+    child->vforkWaiting = 0;
+    child->setChildTid = 0;
     child->blockedOnRwLock = nullptr;
     child->heldWriteLock = nullptr;
     child->heldReadLock = nullptr;
@@ -1422,6 +1427,8 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->pendingWakeup = 0;
     thread->wakeAfterSwitch = false;
     thread->vforkParent = nullptr;
+    thread->vforkWaiting = 0;
+    thread->setChildTid = 0;
     thread->blockedOnRwLock = nullptr;
     thread->heldWriteLock = nullptr;
     thread->heldReadLock = nullptr;

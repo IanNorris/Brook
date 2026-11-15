@@ -512,11 +512,7 @@ resolve_path:
     __asm__ volatile("push %0; popfq" :: "r"(segmentFlags) : "memory", "cc");
 
     // Wake vfork parent — exec is complete, parent can resume
-    if (proc->vforkParent)
-    {
-        SchedulerUnblock(proc->vforkParent);
-        proc->vforkParent = nullptr;
-    }
+    ProcessVforkRelease(proc);
 
     // Enter user mode — this does NOT return
     SwitchToUserMode(newStackPtr, newEntry);
