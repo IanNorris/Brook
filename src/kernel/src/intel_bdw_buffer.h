@@ -84,6 +84,13 @@ bool BdwGpuBufferBeginHandoffGpuUse(BdwGpuBuffer*,uint64_t token);
 bool BdwGpuBufferReleaseHandoff(BdwGpuBuffer*,uint64_t token);
 uint32_t BdwGpuBufferGpuUses(const BdwGpuBuffer* buffer);
 void BdwGpuBufferMarkGpuFailed(BdwGpuBuffer* buffer);
+// Failure after a verified engine reset: contents unknown, no device state.
+void BdwGpuBufferMarkGpuFailedRecoverable(BdwGpuBuffer* buffer);
+bool BdwGpuBufferGpuFailedRecoverable(const BdwGpuBuffer* buffer);
+// Clears a recoverable failure only while no GPU use is outstanding.
+bool BdwGpuBufferClearRecoverableFailure(BdwGpuBuffer* buffer);
+void BdwGpuBufferSetCreator(BdwGpuBuffer* buffer,const void* creator);
+const void* BdwGpuBufferCreator(const BdwGpuBuffer* buffer);
 bool BdwGpuBufferGpuFailed(const BdwGpuBuffer* buffer);
 // One atomic sample prevents a completion/failure race from appearing idle.
 void BdwGpuBufferGpuStatus(const BdwGpuBuffer* buffer,uint32_t& uses,bool& failed);

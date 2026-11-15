@@ -743,6 +743,13 @@ int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count){
     {const uint64_t f=IrqSpinLockAcquire(&lock);registered=zcCount;
      for(uint32_t i=0;i<registered;++i)images[i]=zcImages[i].buffer;IrqSpinLockRelease(&lock,f);}
     bool idle[BdwZeroCopyMaxImages]{};
+    // gen 401: a renderer job that failed after a verified engine reset marks
+    // its ring images recoverably failed. Once that job has retired (no GPU
+    // use left) their contents are merely unknown, and the adopting renderer
+    // fully redraws each image before it is shown, so the failure is cleared.
+    uint32_t cleared=0;
+    for(uint32_t i=0;i<registered;++i)if(BdwGpuBufferClearRecoverableFailure(images[i]))++cleared;
+    if(cleared)KPrintf("gpu-zerocopy: cleared recoverable failure on %u retained images before adoption\n",cleared);
     for(uint32_t i=0;i<registered;++i)idle[i]=BdwGpuBufferIdle(images[i]);
     switch(BdwZeroCopyAdoptDecision(registered,BdwOffscreenHandoffAttached(owner),idle)){
     case BdwZeroCopyAdoption::NotRegistered:return -2;

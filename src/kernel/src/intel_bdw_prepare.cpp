@@ -1642,7 +1642,9 @@ bool BdwRunRetainedRender(BdwRenderExecutionBackend& backend,uint64_t scratchDma
        retainedRenderScratchAmbiguous || scratchDma!=retainedRenderScratch.dma ||
        !BdwGlobalGgttSpace().owns(retainedRenderReservation)){result.runFailSite=1;return false;}
     result.attempted=true;
-    if(!retainedRender.ExecuteTakenOver(retainedRenderAllocator,backend,scratchDma)){result.runFailSite=2;return false;}
+    if(!retainedRender.ExecuteTakenOver(retainedRenderAllocator,backend,scratchDma)){
+        result.runFailSite=2;result.submitSite=retainedRender.LastSubmitSite();result.completionNonce=retainedRender.Nonce();
+        backend.completionDiag(result.completionSeen,result.completionPolls);return false;}
     result.breadcrumb=true;
     while(backend.retirementContinue()){
         const auto state=retainedRender.PollContextSwitch(backend);

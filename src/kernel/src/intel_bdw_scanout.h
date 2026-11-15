@@ -146,6 +146,11 @@ struct BdwRenderRunResult {
     // context-status poll fault (csb* fields), 4 retirement wait ended.
     uint8_t runFailSite=0,csbSite=0,csbTail=0,csbHead=0,csbEvents=0;uint64_t csbEvent=0;
     uint32_t eir=0,esr=0;
+    // Submission diagnostics (gen 401, site 2): submitSite names the first
+    // failed step in ExecuteTakenOver (see BdwRenderOneShot::SubmitDiag);
+    // completionSeen/Nonce the last breadcrumb value read and the expected
+    // one; completionPolls the breadcrumb polls made.
+    uint8_t submitSite=0;uint32_t completionSeen=0,completionNonce=0,completionPolls=0;
     // The run failed but the engine was reset (verified) and this run's GGTT
     // binding retired: device state is known and the job can just fail.
     bool retiredAfterFailedRun=false;

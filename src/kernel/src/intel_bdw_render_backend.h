@@ -91,11 +91,15 @@ public:
         return ok;}
     uint32_t ggttWriteAttempts()const{return ggttWrites_;}
     uint32_t portWriteAttempts()const{return portWrites_;}
+    uint32_t completionSeen_=0,completionPolls_=0;
+    void completionDiag(uint32_t& seen,uint32_t& polls)const{seen=completionSeen_;polls=completionPolls_;}
     bool waitCompletion(uint32_t nonce){
         if(!pages_ || !nonce)return false;
         while(owner_.completionContinue()){
             if(!exclusiveHandoff() || !gpuPatLease() || !owner_.syncForCpu(pages_[25]))return false;
-            if(__atomic_load_n(reinterpret_cast<const uint32_t*>(pages_[25].cpu),__ATOMIC_RELAXED)==nonce){
+            ++completionPolls_;
+            completionSeen_=__atomic_load_n(reinterpret_cast<const uint32_t*>(pages_[25].cpu),__ATOMIC_RELAXED);
+            if(completionSeen_==nonce){
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                 breadcrumbTicks_=BdwTimingNow();
 #endif

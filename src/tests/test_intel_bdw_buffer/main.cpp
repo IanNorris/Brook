@@ -422,6 +422,47 @@ int main(){
         assert(BdwGpuBufferEndCpuTransition(busy) && BdwGpuBufferReleaseHandoff(output,200));
         assert(BdwExecSnapshotRelease(snapshot,false));BdwFenceUnref(fence);BdwGpuBufferUnref(output);BdwGpuBufferUnref(busy);
     }
+    // gen 401: a renderer job that failed after a verified engine reset must
+    // only mark what it may have written. A client buffer it merely sampled
+    // (created by another file and imported) stays usable, and the written
+    // buffers' failure is recoverable and clears once their uses are gone.
+    {
+        uint64_t r=0;const uint32_t clientHandle=BdwGpuFileCreateBuffer(other,4096,r);assert(clientHandle);
+        auto* client=BdwGpuFileGetBuffer(other,clientHandle);assert(client);
+        const uint32_t sampled=BdwGpuFileImportBuffer(f,client);assert(sampled);
+        BdwExecObjectInput mixed[]={{replacement,0x20000,4096,16},{next,0x10000,4096,16|4},{sampled,0x30000,4096,16}};
+        auto* own=BdwGpuFileGetBuffer(f,next);auto* batch=BdwGpuFileGetBuffer(f,replacement);assert(batch);
+        auto* snapshot=BdwExecSnapshotCreate(f,mixed,3,0,8,64);assert(snapshot && own);
+        assert(BdwExecSnapshotReserve(snapshot));
+        assert(BdwExecSnapshotScopeFailureToWritten(snapshot) && BdwExecSnapshotMarkFailed(snapshot));
+        assert(BdwGpuBufferGpuFailed(own) && BdwGpuBufferGpuFailedRecoverable(own));
+        assert(!BdwGpuBufferGpuFailed(client));
+        assert(!BdwGpuBufferClearRecoverableFailure(own)); // still in use by the job
+        assert(BdwExecSnapshotRetire(snapshot,false) && BdwExecSnapshotSignalFences(snapshot,false));
+        assert(BdwExecSnapshotRelease(snapshot,false));
+        assert(BdwGpuBufferClearRecoverableFailure(own) && !BdwGpuBufferGpuFailed(own));
+        assert(BdwGpuBufferGpuFailedRecoverable(batch) && BdwGpuBufferClearRecoverableFailure(batch)); // own batch too
+        assert(!BdwGpuBufferClearRecoverableFailure(own)); // nothing left to clear
+        // An unscoped failure marks everything, including the sampled client
+        // buffer, unrecoverably (fresh buffers: the fixtures above stay usable).
+        {uint64_t r2=0;const uint32_t fb=BdwGpuFileCreateBuffer(f,4096,r2),c2=BdwGpuFileCreateBuffer(other,4096,r2);assert(fb && c2);
+         auto* client2=BdwGpuFileGetBuffer(other,c2);const uint32_t s2=BdwGpuFileImportBuffer(f,client2);assert(client2 && s2);
+         BdwExecObjectInput plainExec[]={{fb,0x40000,4096,16},{s2,0x50000,4096,16}};
+         auto* plain=BdwExecSnapshotCreate(f,plainExec,2,0,8,64);assert(plain && BdwExecSnapshotReserve(plain));
+         assert(BdwExecSnapshotMarkFailed(plain));
+         assert(BdwGpuBufferGpuFailed(client2) && !BdwGpuBufferGpuFailedRecoverable(client2));
+         assert(BdwExecSnapshotRetire(plain,false) && BdwExecSnapshotSignalFences(plain,false) && BdwExecSnapshotRelease(plain,false));
+         assert(!BdwGpuBufferClearRecoverableFailure(client2) && BdwGpuBufferGpuFailed(client2));
+         BdwGpuBufferUnref(client2);}
+        // A later recoverable mark never weakens an unrecoverable failure.
+        {auto* x=BdwGpuBufferCreate(4096);assert(x);BdwGpuBufferMarkGpuFailed(x);BdwGpuBufferMarkGpuFailedRecoverable(x);
+         assert(BdwGpuBufferGpuFailed(x) && !BdwGpuBufferGpuFailedRecoverable(x) && !BdwGpuBufferClearRecoverableFailure(x));
+         BdwGpuBufferUnref(x);}
+        // Predicate: handoff outputs, zero-copy images and own buffers only.
+        assert(BdwExecSnapshotFailureCovers(true,false,false) && BdwExecSnapshotFailureCovers(false,true,false) &&
+               BdwExecSnapshotFailureCovers(false,false,true) && !BdwExecSnapshotFailureCovers(false,false,false));
+        BdwGpuBufferUnref(own);BdwGpuBufferUnref(client);
+    }
     {
         auto* output=BdwGpuFileGetBuffer(f,next);auto* snapshot=BdwExecSnapshotCreate(f,exec,2,0,8,64);
         auto* rival=BdwExecSnapshotCreate(f,exec,2,0,8,64);auto* fence=BdwFenceCreate();auto* wrong=BdwFenceCreate();
