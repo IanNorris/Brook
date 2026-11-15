@@ -92,6 +92,24 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov (Dell gen 417, `dell-int16-20261116`, session `f7b40b4bb49041aa9ea8301f6466b518`; main `d95e1b22`):**
+- **Main now has:**
+  - `work/bin-sh` (/bin/sh, /usr/bin/env);
+  - `work/compat-batch1` (setitimer/alarm, kcmp, madvise DONTFORK/WIPEONFORK, sysfs cpu lists and /proc/<pid>/cgroup, TCP_INFO, quiet census set);
+  - `work/pipe-poll-uaf` (the gen 415 panic was a memfd_create double free at EMFILE, an H-20 regression; also all-or-nothing pipe/socketpair publication, and live/dead markers on pipe poll nodes);
+  - `work/steam-container` (/dev is a boot tmpfs with real char-device inodes, so bwrap `--dev-bind /dev /dev` works, nested too);
+  - `work/chrome-csd` (Chromium tab strip plus Brook caption overlay sized to the 40-unit strip).
+  - The new brook-chromium launcher is staged on the Dell (store `svypzdsv…-brook-hardware-network-launchers`; rollback `/nix/.brook-profile-rollback-csd1116a.json`).
+- **Steam opens on the Dell, in Xephyr; Ian launched Stardew.**
+  - The final blocker was libpulse autospawn: a fork/exec loop of a missing `libpulseaudio-17.0/.bin-unwrapped/pulseaudio` at ~25/s, ending in fd exhaustion.
+  - Worked around by starting a private uid-1000 `pulseaudio -n` (native socket `/tmp/brook-pulse/native`, null sink) and launching `brook-steam` with `PULSE_SERVER=unix:/tmp/brook-pulse/native`. Script: scratchpad `steam_pulse.py`.
+- **Next:**
+  1. A proper desktop PulseAudio session server (Dell HDA output; Chromium also logs "PulseAudio is not available").
+  2. Move the Dell Steam launcher to the rootless Xwayland path (as in the QEMU review, `docs/xwayland-window-integration.md`) now that the Dell has GPU Xwayland.
+  3. `prof start [ms] [path]` with output to the writable store (/boot is full, Ian).
+  4. VSCodium needs `--no-sandbox` (Electron SUID sandbox abort): launcher, argv.json, or a working Chromium namespace sandbox — Ian to choose.
+- **Census on Steam:** netlink uevent sockets (EPROTONOSUPPORT ×555), /dev/input, /dev/bus/usb, /sys/kernel/tracing/trace_marker, /sys/class/net, SIOCGIFHWADDR ioctl.
+
 **16 Nov early (Dell gen 415, `dell-int14-20261116` = main + `work/bin-sh`, session `a9eefa8322d248edb6e96789ba3785ba`):**
 - **/bin/sh and /usr/bin/env now exist** (kernel tmpfs mounts). Steam's nested Xephyr starts, xkbcomp works, and the client starts inside pressure-vessel; processes reached 156.
 - **Kernel panic ~90 s into Steam:** #PF CR2=0x21 in `PipePollGroup::~PipePollGroup` ← PollWait ← sys_ppoll. A pipe poll-waiter node was linked after being freed (use-after-free).
