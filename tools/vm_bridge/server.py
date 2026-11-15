@@ -1127,6 +1127,11 @@ def serve():
             print(json.dumps(value,separators=(",",":")),flush=True)
     def handle(message,cancel):
         ident=message.get("id");method=message.get("method");params=message.get("params",{})
+        def respond(value):
+            # Retire the ID before replying: a client may reuse it as soon as
+            # it reads the response.
+            with pending_lock:pending.pop(ident,None)
+            emit(value)
         try:
             if method=="initialize":
                 requested=params.get("protocolVersion")
@@ -1138,10 +1143,10 @@ def serve():
                 try:result=call_tool(params["name"],params.get("arguments",{}),cancel)
                 except Exception as error:result={"content":[{"type":"text","text":str(error)}],"isError":True}
             else:
-                emit({"jsonrpc":"2.0","id":ident,"error":{"code":-32601,"message":"Method not found"}});return
-            emit({"jsonrpc":"2.0","id":ident,"result":result})
+                respond({"jsonrpc":"2.0","id":ident,"error":{"code":-32601,"message":"Method not found"}});return
+            respond({"jsonrpc":"2.0","id":ident,"result":result})
         except Exception as error:
-            emit({"jsonrpc":"2.0","id":ident,"error":{"code":-32602,"message":str(error)}})
+            respond({"jsonrpc":"2.0","id":ident,"error":{"code":-32602,"message":str(error)}})
         finally:
             with pending_lock:pending.pop(ident,None)
     try:
