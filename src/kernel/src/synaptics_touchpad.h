@@ -128,6 +128,9 @@ struct SynapticsGestureConfig {
     int32_t clickSuppressPackets = 10; // ~125 ms at 80 Hz after press and release: no pointer motion
     int32_t clickDeadzoneUnits = 40;   // while held, travel from the press point must exceed this
     int32_t pressureJumpZ = 30;        // a pressure step this large is a press shift, not motion
+    // Phantom-scroll guards (Ian, gen 400: "scrolled without me near it"):
+    int32_t scrollStablePackets = 3;   // consecutive two-finger packets before scrolling starts
+    int32_t scrollJumpUnits = 250;     // per-packet two-finger motion above this is not a scroll
 };
 constexpr int32_t SynapticsSpeedMin = 25, SynapticsSpeedMax = 300;
 // Base gain multiplier: 80% of the original tuning (Ian: "a tiny bit fast").
@@ -148,6 +151,17 @@ public:
     void SetConfig(const SynapticsGestureConfig& c) { cfg_ = c; }
     const SynapticsGestureConfig& Config() const { return cfg_; }
     unsigned fingerHistogram[4] = {0, 0, 0, 0}; // packets seen with 0,1,2,3+ fingers
+    unsigned scrollTicksLowZ = 0;   // ticks emitted while either packet's Z was under 2x the touch threshold
+    unsigned scrollRejected = 0;    // two-finger packets dropped by the stability/jump guards
+    unsigned resets = 0;            // state resets (resync, lift-off)
+
+    // Forget all contact state (used on packet resync): the next packets must
+    // re-establish a stable touch before any motion or scroll.
+    void Reset() {
+        ++resets;
+        lastFingers_ = 0; haveAnchor_ = false; haveAgm_ = false; stable_ = 0;
+        fracX_ = fracY_ = scrollAccX_ = scrollAccY_ = 0; lastZ_ = 0;
+    }
 
     SynapticsOutput Feed(const SynapticsPacket& p) {
         SynapticsOutput o;
@@ -180,7 +194,9 @@ public:
         o.buttons = buttons_;
         if (fingers < 2) haveAgm_ = false;
 
+        if (fingers == 0 && lastFingers_ != 0) ++resets;  // lift-off clears everything below
         if (fingers != lastFingers_) {           // re-anchor on any count change
+            stable_ = 0;
             haveAnchor_ = fingers != 0 && fingers < 3;
             ax_ = p.x; ay_ = p.y; lastZ_ = p.z;
             fracX_ = fracY_ = 0; scrollAccX_ = scrollAccY_ = 0;
@@ -191,7 +207,9 @@ public:
         int32_t dx = p.x - ax_, dy = p.y - ay_;   // pad: y up
         ax_ = p.x; ay_ = p.y;
         const int32_t zStep = Abs(p.z - lastZ_);
+        const int32_t prevZ = lastZ_;
         lastZ_ = p.z;
+        if (stable_ < 1000) ++stable_;
         // Pointer-motion jitter filters (scrolling is unaffected): the window
         // after a button transition, a pressure step (the contact centroid
         // shifts as the finger presses), and the held-button dead zone.
@@ -210,10 +228,22 @@ public:
             // contributes nothing. Never scroll or right-click in this state.
             if (!quiet && (Abs(dx) >= cfg_.dragNoiseUnits || Abs(dy) >= cfg_.dragNoiseUnits)) Pointer(dx, dy, o);
         } else if (fingers == 2 && !clickDown_) {
+            // Scroll only from a stable two-finger contact: both this and the
+            // previous packet pressed, a few consecutive packets since touch
+            // down, and plausible per-packet travel. Anything else is dropped
+            // and the accumulators cleared so no stale fraction can fire later.
+            if (prevZ < cfg_.touchZ || stable_ < cfg_.scrollStablePackets ||
+                Abs(dx) > cfg_.scrollJumpUnits || Abs(dy) > cfg_.scrollJumpUnits) {
+                if (stable_ >= cfg_.scrollStablePackets) ++scrollRejected;
+                scrollAccX_ = scrollAccY_ = 0;
+                return o;
+            }
             const int32_t sy = cfg_.naturalScroll ? -dy : dy;
             const int32_t sx = cfg_.naturalScroll ? -dx : dx;
             o.scrollY = Ticks(scrollAccY_, sy);
             o.scrollX = Ticks(scrollAccX_, sx);
+            if ((o.scrollY || o.scrollX) && (p.z < 2 * cfg_.touchZ || prevZ < 2 * cfg_.touchZ))
+                scrollTicksLowZ += unsigned(Abs(o.scrollY) + Abs(o.scrollX));
         }
         return o;
     }
@@ -265,7 +295,7 @@ private:
     bool clickDown_ = false, clickAsRight_ = false;
     bool haveAgm_ = false;
     int32_t agmX_ = 0, agmY_ = 0;
-    int32_t suppress_ = 0, pressX_ = 0, pressY_ = 0, lastZ_ = 0;
+    int32_t suppress_ = 0, pressX_ = 0, pressY_ = 0, lastZ_ = 0, stable_ = 0;
     bool deadzone_ = false;
     uint8_t buttons_ = 0;
 };

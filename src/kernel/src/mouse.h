@@ -57,6 +57,7 @@ namespace brook {
 struct MouseTouchpadStatus {
     bool wanted, active, identified, clickpad, natural, agm;
     uint32_t speed;
+    uint32_t scrollLowZ, scrollRejected, gestureResets;
     const char* reason;
     uint8_t major, minor, model, mode, modeReadback, packetLen, relativeId;
     uint32_t caps, ext, ext0c, packets, resyncs, scrollTicks;

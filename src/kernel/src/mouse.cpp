@@ -189,7 +189,9 @@ static void SynapticsByte(uint8_t data)
     if (!SynapticsByteValid(g_packetIdx, data))
     {
         ++g_synResyncs;
-        // A rejected byte may be the start of the next packet.
+        // A rejected byte may be the start of the next packet. Contact state
+        // from before the loss is no longer trustworthy.
+        g_synGesture.Reset();
         g_packetIdx = 0;
         if (!SynapticsByteValid(0, data)) return;
     }
@@ -749,6 +751,9 @@ MouseTouchpadStatus MouseTouchpadGetStatus()
     for (int i = 0; i < 4; ++i) st.fingers[i] = g_synGesture.fingerHistogram[i];
     st.natural = g_synGesture.Config().naturalScroll;
     st.agm = g_synAgm;
+    st.scrollLowZ = g_synGesture.scrollTicksLowZ;
+    st.scrollRejected = g_synGesture.scrollRejected;
+    st.gestureResets = g_synGesture.resets;
     st.speed = uint32_t(g_synGesture.Config().speedPercent);
     st.rawValid = g_synRawValid;
     for (int i = 0; i < 5; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];

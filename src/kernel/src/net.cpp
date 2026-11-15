@@ -6080,6 +6080,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"natural\":");r.text(st.natural?"true":"false");
         r.text(",\"agm\":");r.text(st.agm?"true":"false");
         r.text(",");r.field("speed",st.speed);
+        r.text(",");r.field("scroll_ticks_low_z",st.scrollLowZ);
+        r.text(",");r.field("scroll_rejected",st.scrollRejected);
+        r.text(",");r.field("gesture_resets",st.gestureResets);
         {static const char* const names[5]={"identify","caps","ext09","ext0c","modes"};
          r.text(",\"raw\":{");bool first=true;
          for(int i=0;i<5;++i){if(!(st.rawValid&(1u<<i)))continue;if(!first)r.text(",");first=false;

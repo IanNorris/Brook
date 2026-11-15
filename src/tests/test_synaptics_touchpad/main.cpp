@@ -76,7 +76,7 @@ int main() {
 
     // Two fingers: vertical scroll with fractional accumulation, no pointer motion.
     SynapticsGesture s;
-    s.Feed(P(3000, 2000, 70, 0));
+    for (int i = 0; i < 3; ++i) s.Feed(P(3000, 2000, 70, 0));   // touch-down + stability
     int ticks = 0, moved = 0;
     for (int i = 1; i <= 10; ++i) { auto r = s.Feed(P(3000, 2000 + 30 * i, 70, 0)); ticks += r.scrollY; moved += r.dx + r.dy; }
     CHECK(ticks == 3 && moved == 0);          // 300 units up / 100 per tick
@@ -84,11 +84,11 @@ int main() {
     CHECK(ticks == 3);
     // Natural scrolling flips the direction.
     SynapticsGestureConfig nc; nc.naturalScroll = true; SynapticsGesture n(nc);
-    n.Feed(P(3000, 2000, 70, 0)); int nt = 0;
+    for (int i = 0; i < 3; ++i) n.Feed(P(3000, 2000, 70, 0)); int nt = 0;
     for (int i = 1; i <= 4; ++i) nt += n.Feed(P(3000, 2000 + 50 * i, 70, 0)).scrollY;
     CHECK(nt == -2);
     // Horizontal scroll.
-    SynapticsGesture hz; hz.Feed(P(3000, 2000, 70, 0)); int hx = 0;
+    SynapticsGesture hz; for (int i = 0; i < 3; ++i) hz.Feed(P(3000, 2000, 70, 0)); int hx = 0;
     for (int i = 1; i <= 4; ++i) hx += hz.Feed(P(3000 + 50 * i, 2000, 70, 0)).scrollX;
     CHECK(hx == 2);
     // Switching 1 -> 2 fingers re-anchors, so the second finger landing is not a scroll.
@@ -153,7 +153,8 @@ int main() {
         for (int i = 1; i <= 10; ++i) { auto r = d.Feed(P(3000, 1500 + 30 * i, 70, 0, true)); my += r.dy; sy += r.scrollY; }
         CHECK(my < 0 && sy == 0);                                  // pad up = screen up
         CHECK(d.Feed(P(3000, 1800, 70, 0, false)).buttons == 0);   // release
-        // After release, two fingers scroll again.
+        // After release, two fingers scroll again (after settling).
+        for (int i = 0; i < 3; ++i) d.Feed(P(3000, 1800, 70, 0));
         int st = 0; for (int i = 1; i <= 6; ++i) st += d.Feed(P(3000, 1800 + 50 * i, 70, 0)).scrollY;
         CHECK(st == 3);
     }
@@ -194,6 +195,38 @@ int main() {
         // A pressure step alone (no button) is not motion.
         SynapticsGesture z; z.Feed(P(3000, 2000, 40, 6)); z.Feed(P(3000, 2000, 40, 6));
         CHECK(Abs2(z.Feed(P(3020, 1980, 90, 6))) == 0);
+    }
+
+    // Phantom-scroll guards.
+    {
+        // Lift-off: Z drops to 0 with W still 0 (no finger); no scroll even if x/y wander.
+        SynapticsGesture l; for (int i = 0; i < 3; ++i) l.Feed(P(3000, 2000, 70, 0));
+        int t = 0; for (int i = 1; i <= 4; ++i) t += l.Feed(P(3000, 2000 + 40 * i, 70, 0)).scrollY;
+        CHECK(t > 0);
+        int ph = 0;
+        for (int i = 1; i <= 20; ++i) ph += l.Feed(P(3000, 2200 + 60 * i, 0, 0)).scrollY;        // Z=0 noise
+        for (int i = 1; i <= 20; ++i) ph += l.Feed(P(3000, 3500 - 60 * i, 20, 0)).scrollY;       // just under threshold
+        CHECK(ph == 0);
+        // A brief two-finger blip (fewer than 3 stable packets) never scrolls.
+        for (int k = 0; k < 10; ++k) {
+            ph += l.Feed(P(3000, 2000 + 90 * k, 40, 0)).scrollY;
+            ph += l.Feed(P(3000, 2090 + 90 * k, 40, 0)).scrollY;
+            ph += l.Feed(P(3000, 2000, 0, 0)).scrollY;
+        }
+        CHECK(ph == 0);
+        // Implausible jumps during a stable two-finger contact are dropped.
+        SynapticsGesture jg; for (int i = 0; i < 4; ++i) jg.Feed(P(3000, 2000, 70, 0));
+        CHECK(jg.Feed(P(3000, 2600, 70, 0)).scrollY == 0 && jg.scrollRejected == 1);
+        // Resync reset: state is forgotten; a garbage packet after it can't scroll.
+        SynapticsGesture rs; for (int i = 0; i < 4; ++i) rs.Feed(P(3000, 2000, 70, 0));
+        rs.Reset();
+        CHECK(rs.Feed(P(3000, 2200, 70, 0)).scrollY == 0);
+        CHECK(rs.Feed(P(3000, 2240, 70, 0)).scrollY == 0);
+        CHECK(rs.resets >= 1);
+        // Low-pressure ticks are counted (diagnostic for the Dell report).
+        SynapticsGesture lz; for (int i = 0; i < 3; ++i) lz.Feed(P(3000, 2000, 30, 0));
+        int lt = 0; for (int i = 1; i <= 4; ++i) lt += lz.Feed(P(3000, 2000 + 50 * i, 30, 0)).scrollY;
+        CHECK(lt == 2 && lz.scrollTicksLowZ == 2);
     }
     // Palms and light touches produce nothing; extended packets are ignored.
     SynapticsGesture pm; pm.Feed(P(3000, 2000, 60, 14));
