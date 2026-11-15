@@ -298,6 +298,7 @@ add_executable(kernel
     src/syscall_drm.cpp
     src/syscall_memory.cpp
     src/syscall_time.cpp
+    src/syscall_poll.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp

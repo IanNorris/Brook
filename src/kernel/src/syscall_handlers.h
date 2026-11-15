@@ -100,4 +100,14 @@ int64_t sys_timer_getoverrun(uint64_t id, uint64_t, uint64_t,
 int64_t sys_timer_delete(uint64_t id, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t);
 
+// syscall_poll.cpp
+int64_t sys_poll(uint64_t fdsAddr, uint64_t nfds, uint64_t timeout,
+                uint64_t, uint64_t, uint64_t);
+int64_t sys_ppoll(uint64_t fdsAddr, uint64_t nfds, uint64_t tspecAddr,
+                 uint64_t sigmaskAddr, uint64_t sigsetsize, uint64_t);
+int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
+                  uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t);
+int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
+                   uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t sigmaskAddr);
+
 } // namespace brook

@@ -16,7 +16,7 @@ void NetlinkUnref(NetlinkSocket* s) {
     SpinLockRelease(&g_netlinkRegistryLock);
     while(s->head){auto* p=s->head;s->head=p->next;kfree(p);}kfree(s);
 }
-static uint32_t NetlinkReady(NetlinkSocket* s,uint32_t events) {
+uint32_t NetlinkReady(NetlinkSocket* s,uint32_t events) {
     SpinLockAcquire(&s->lock);const uint32_t ready=(events&4)|((s->head && (events&1))?1u:0u);SpinLockRelease(&s->lock);return ready;
 }
 static uint32_t NetlinkAvailable(NetlinkSocket* s) {

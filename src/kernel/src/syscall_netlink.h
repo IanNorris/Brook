@@ -11,5 +11,6 @@
 namespace brook {
 
 #include "syscall_netlink_types.inc"
+uint32_t NetlinkReady(NetlinkSocket* s,uint32_t events);
 
 } // namespace brook
