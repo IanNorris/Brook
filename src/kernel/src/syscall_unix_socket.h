@@ -116,7 +116,20 @@ struct UnixNameGuard {
     ~UnixNameGuard() { KMutexUnlock(&g_unixNameLock); }
 };
 
-UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node = nullptr);
+// Abstract names (sun_path[0] == 0) are the whole address, including any
+// NUL bytes, compared with its length; they never match a filesystem name.
+inline bool UnixAddressIsAbstract(const uint8_t* address, uint32_t length)
+{
+    return length > 2 && address[2] == 0;
+}
+// A filesystem socket is matched by inode; an abstract one by its full
+// address bytes. Pins and returns the listener, or nullptr.
+UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node = nullptr,
+                               const uint8_t* abstractAddress = nullptr,
+                               uint32_t abstractLength = 0);
+// Callers hold g_unixNameLock, so a check followed by bind or listen is
+// atomic with respect to other name operations.
+bool UnixAbstractNameInUse(const uint8_t* address, uint32_t length, const UnixSocketData* except);
 bool UnixRegisterServer(UnixSocketData* usd);
 void UnixSocketHandleUnref(void* handle);
 

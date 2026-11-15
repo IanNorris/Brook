@@ -100,17 +100,10 @@ int64_t PollWait(pollfd*,uint64_t,uint64_t,bool) { return -EINTR; }
 uint32_t NetInterfaceViews(InterfaceView*,uint32_t) { return 0; }
 FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace*,bool) { return {}; }
 void ProcessGroupsRelease(SupplementaryGroups*) {}
+CredentialIds ProcessReadIds(Process*,bool) { return {}; }
+int ProcessSendSignal(Process*,int,const SignalInfo*) { return 0; }
+int VfsAccess(Vnode*,uint8_t,bool) { return -13; }
 uint32_t ProcessReportId(Process*,bool,uint32_t canonical) { return canonical; }
-void UnixLifePublished(int,const FdEntry&) {}
-
-// AF_UNIX: no sockets in these tests.
-SpinLock g_unixRegistryLock;
-KMutex g_unixNameLock;
-void UnixLife(UnixLifeEvent,void*,uint32_t,uint32_t,int,uint64_t,uint64_t) {}
-void UnixSocketHandleUnref(void*) {}
-int UnixInstallSocket(Process*,UnixSocketData*,uint32_t,const char*) { return -EMFILE; }
-int64_t UnixSocketReadSome(UnixSocketData*,bool,char*,uint64_t,UnixFdSnap*,int&,UnixCredentials*,uint64_t*,bool*) { return -EBADF; }
-int64_t UnixSocketWriteSome(UnixSocketData*,bool,const char*,uint64_t,const UnixFdSnap*,int,bool,const UnixCredentials*) { return -EBADF; }
 
 // Inet sockets: one fake UDP/TCP socket, observable through g_net. The
 // stack only ever receives kernel buffers.
@@ -124,6 +117,9 @@ int SockSendTo(int,const void* buffer,uint32_t length,const SockAddrIn* destinat
     return static_cast<int>(length);
 }
 int SockSendUser(int,uint64_t,uint32_t) { return -EIO; }
+int SockConnect(int,const SockAddrIn*) { return -ECONNREFUSED; }
+int SockGetType(int) { return 2; }
+int SockListen(int,int) { return -1; }
 int SockRecvFrom(int,void* buffer,uint32_t length,SockAddrIn* source) {
     if(!g_net.datagramReady)return -EAGAIN;
     ++g_net.receives;g_net.datagramReady=false;

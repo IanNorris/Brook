@@ -210,16 +210,26 @@ static UnixSocketData* g_unixServers[UNIX_MAX_SERVERS];
 // lock; never retain the registry spinlock across lookup or inode creation.
 KMutex g_unixNameLock;
 
-UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node)
+static bool UnixAbstractMatch(const UnixSocketData* candidate, const uint8_t* address, uint32_t length)
+{
+    return !candidate->boundNode && candidate->localAddressLength == length &&
+           UnixAddressIsAbstract(candidate->localAddress, candidate->localAddressLength) &&
+           memcmp(candidate->localAddress, address, length) == 0;
+}
+
+UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node,
+                               const uint8_t* abstractAddress, uint32_t abstractLength)
 {
     SpinLockAcquire(&g_unixRegistryLock);
     UnixSocketData* found = nullptr;
     for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
         auto* candidate = g_unixServers[i];
         if (!candidate || candidate->state != UnixSocketData::State::Listening) continue;
+        // An empty path names nothing; it must not match an unnamed listener.
         const bool match = node ? candidate->boundNode &&
             candidate->boundDev == node->dev && candidate->boundIno == node->ino :
-            !candidate->boundNode && strcmp(candidate->path, path) == 0;
+            abstractAddress ? UnixAbstractMatch(candidate, abstractAddress, abstractLength) :
+            path && path[0] && !candidate->boundNode && strcmp(candidate->path, path) == 0;
         if (match) {
             uint32_t previous = __atomic_fetch_add(&candidate->refCount, 1, __ATOMIC_RELAXED);
             UNIX_LIFE(RegistryPin, candidate, previous, previous + 1, -1);
@@ -230,6 +240,21 @@ UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node)
     SpinLockRelease(&g_unixRegistryLock);
 
     return found;
+}
+
+bool UnixAbstractNameInUse(const uint8_t* address, uint32_t length, const UnixSocketData* except)
+{
+    if (!UnixAddressIsAbstract(address, length)) return false;
+    SpinLockAcquire(&g_unixRegistryLock);
+    bool used = false;
+    for (int i = 0; i < UNIX_MAX_SERVERS && !used; i++) {
+        auto* candidate = g_unixServers[i];
+        used = candidate && candidate != except &&
+               candidate->state == UnixSocketData::State::Listening &&
+               UnixAbstractMatch(candidate, address, length);
+    }
+    SpinLockRelease(&g_unixRegistryLock);
+    return used;
 }
 
 bool UnixRegisterServer(UnixSocketData* usd)

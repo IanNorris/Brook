@@ -148,6 +148,22 @@ int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         if (!CopyFromUser(&address,addrVal,addrLen)) return -EFAULT;
         if (address.sun_family != AF_UNIX) return -EINVAL;
         UnixNameGuard nameGuard;
+        auto* addressBytes=reinterpret_cast<const uint8_t*>(&address);
+        if (addrLen==2) {
+            // Linux autobind: a unique abstract name "\0" + five hex digits.
+            static uint32_t nextAutobind;
+            bool found=false;
+            for (uint32_t attempt=0;attempt<0x100000 && !found;++attempt) {
+                const uint32_t value=(nextAutobind++)&0xfffff;
+                static const char hex[]="0123456789abcdef";
+                address.sun_path[0]=0;
+                for (int digit=0;digit<5;++digit)address.sun_path[1+digit]=hex[(value>>(16-4*digit))&15];
+                found=!UnixAbstractNameInUse(addressBytes,8,usd);
+            }
+            if (!found) return -98; // EADDRINUSE
+            addrLen=8;
+        }
+        if (UnixAbstractNameInUse(addressBytes,static_cast<uint32_t>(addrLen),usd)) return -98; // EADDRINUSE
         SpinLockAcquire(&g_unixRegistryLock);
         if (usd->localAddressLength || usd->state!=UnixSocketData::State::Unbound) {
             SpinLockRelease(&g_unixRegistryLock);return -EINVAL;
@@ -241,7 +257,10 @@ int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
             if ((error = VfsStat(lookup.node, &identity))) return error;
             if ((identity.mode & 0170000) != 0140000) return -ECONNREFUSED;
         }
-        UnixSocketData* server = UnixFindServer(path, lookup.node ? &identity : nullptr);
+        const auto* addressBytes = reinterpret_cast<const uint8_t*>(&address);
+        const bool abstract = UnixAddressIsAbstract(addressBytes, static_cast<uint32_t>(addrLen));
+        UnixSocketData* server = UnixFindServer(path, lookup.node ? &identity : nullptr,
+            abstract ? addressBytes : nullptr, abstract ? static_cast<uint32_t>(addrLen) : 0);
         if (!server) return -ECONNREFUSED;
         struct ServerReference {
             UnixSocketData* value;
@@ -708,6 +727,9 @@ int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
         UnixNameGuard nameGuard;
         if (usd->state == UnixSocketData::State::Connected) return -EINVAL;
         if (!usd->localAddressLength) return -EINVAL;
+        // A second socket bound to the same abstract name before either
+        // listened is caught here.
+        if (UnixAbstractNameInUse(usd->localAddress, usd->localAddressLength, usd)) return -98; // EADDRINUSE
         SpinLockAcquire(&g_unixRegistryLock);
         // Linux captures listener identity on the first listen, not at accept.
         if (usd->state != UnixSocketData::State::Listening) {
