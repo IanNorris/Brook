@@ -100,6 +100,27 @@ int main() {
         changed=ReframeDesktopWindow(original,old,next,1920,1080-next.taskbar());
         CHECK(changed.x==original.x&&changed.y==original.y);
         CHECK(DesktopCaptionRect(changed,next,0).w==0);
+        CHECK(DesktopCaptionOverlayRect(changed,next).w==0);
+        // Overlaid captions sit inside the client surface, right of its shadow inset.
+        DesktopWindowGeometry overlay{100,50,800,600,true,true,12,8};
+        auto block=DesktopCaptionOverlayRect(overlay,next);
+        CHECK(block.w==3*next.captionButton()&&block.h==next.title());
+        CHECK(block.x+block.w==100+800-12&&block.y==50+8);
+        for(int i=0;i<3;++i) {
+            auto r=DesktopCaptionRect(overlay,next,i);
+            CHECK(r.w==next.captionButton()&&block.contains(r.x,r.y)&&block.contains(r.x+r.w-1,r.y+r.h-1));
+            for(int j=i+1;j<3;++j){auto other=DesktopCaptionRect(overlay,next,j);CHECK(!other.contains(r.x,r.y));}
+        }
+        CHECK(DesktopCaptionRect(overlay,next,0).x>DesktopCaptionRect(overlay,next,2).x);
+        auto tight=DesktopCaptionOverlayRect({0,0,60,20,true,true,0,0},next);
+        CHECK(tight.w<=60&&tight.h<=20);
+        CHECK(DesktopCaptionOverlayRect({0,0,60,20,true,true,0,20},next).w==0);
+        // A client title strip taller than the native title: the block spans it.
+        DesktopWindowGeometry strip{100,50,800,600,true,true,12,8,next.pixels(40)};
+        auto tall=DesktopCaptionOverlayRect(strip,next);
+        CHECK(tall.h==next.pixels(40)&&tall.y==58&&tall.w==block.w);
+        for(int i=0;i<3;++i)CHECK(DesktopCaptionRect(strip,next,i).h==next.pixels(40));
+        CHECK(DesktopCaptionOverlayRect({0,0,300,30,true,true,0,0,40},next).h==30);
         auto top=ReframeDesktopWindow({0,0,800,600,false},old,next,1920,1080-next.taskbar());
         CHECK(top.y>=0);
         auto small=DesktopCaptionRect({0,0,80,40,false},next,0);
@@ -113,5 +134,5 @@ int main() {
             CHECK(close.x<screen && close.x+close.w>0);
         }
     }
-    std::puts("desktop metrics: scale transitions, physical client origins, CSD, captions and screen bounds PASS");
+    std::puts("desktop metrics: scale transitions, physical client origins, CSD, captions, caption overlay and screen bounds PASS");
 }

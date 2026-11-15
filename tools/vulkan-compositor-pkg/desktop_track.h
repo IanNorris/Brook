@@ -189,6 +189,9 @@ static inline struct DesktopTrackHole desktop_track_chrome_hole(const struct Bro
     const uint32_t l=DESKTOP_TRACK_CLIP(x,chrome->width),r=DESKTOP_TRACK_CLIP(x+client->clientWidth,chrome->width);
     const uint32_t t=DESKTOP_TRACK_CLIP(y,chrome->height),b=DESKTOP_TRACK_CLIP(y+client->clientHeight,chrome->height);
 #undef DESKTOP_TRACK_CLIP
+    /* A chrome surface the client covers entirely is an overlay drawn over
+     * the client (caption buttons on a client-decorated window): no hole. */
+    if(l==0 && t==0 && r==chrome->width && b==chrome->height)return hole;
     if(r>l && b>t)hole=(struct DesktopTrackHole){l,t,r-l,b-t};
     return hole;
 }

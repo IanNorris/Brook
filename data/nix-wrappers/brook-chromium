@@ -13,6 +13,40 @@ export TMPDIR=$XDG_CACHE_HOME/chromium-brook/tmp
 # BROOK_CHROMIUM_PROFILE selects another profile (tests use a private one).
 profile=${BROOK_CHROMIUM_PROFILE:-$XDG_CONFIG_HOME/chromium-brook}
 mkdir -p "$profile" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$TMPDIR"
+# Chromium draws its tab strip in the title area and takes its caption-button
+# layout from GTK, i.e. GNOME's button-layout setting. Brook has no dconf, so
+# GTK falls back to 'appmenu:close' (close only). A GSettings keyfile, used only
+# by this process tree, asks for all three: Chromium then keeps its tabs clear
+# of the top-right corner, where Brook's WM overlays its own minimise, maximise
+# and close (waylandd BROOK_WAYLAND_CAPTION_APPS). Without that overlay,
+# Chromium's own three buttons show and work. BROOK_CHROMIUM_BUTTON_LAYOUT
+# overrides the layout (':' draws none); empty leaves GSettings alone.
+brook_button_layout() { # keyfile layout: set button-layout, keep other keys
+  local file=$1 want="button-layout='$2'" header='[org/gnome/desktop/wm/preferences]'
+  local line section= out= found= old=
+  if [ -r "$file" ]; then
+    old=$(<"$file")
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [[ $line == \[*\] ]]; then
+        [ "$section" = "$header" ] && [ -z "$found" ] && { out+=$want$'\n'; found=1; }
+        section=$line
+      elif [ "$section" = "$header" ] && [[ $line == button-layout=* ]]; then
+        line=$want; found=1
+      fi
+      out+=$line$'\n'
+    done < "$file"
+  fi
+  if [ -z "$found" ]; then
+    [ "$section" = "$header" ] || out+=$header$'\n'
+    out+=$want$'\n'
+  fi
+  [ "$out" = "$old"$'\n' ] && return 0
+  mkdir -p "${file%/*}" && printf '%s' "$out" > "$file.brook-tmp" && mv -f "$file.brook-tmp" "$file"
+}
+layout=${BROOK_CHROMIUM_BUTTON_LAYOUT-:minimize,maximize,close}
+if [ -n "$layout" ] && brook_button_layout "$XDG_CONFIG_HOME/glib-2.0/settings/keyfile" "$layout"; then
+  export GSETTINGS_BACKEND=keyfile
+fi
 unset DISPLAY
 # GPU rendering through the opt-in patched Iris stack (ANGLE on GLES: GPU
 # compositing and rasterization on the HD 5500). Video decode stays in software:

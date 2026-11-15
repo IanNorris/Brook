@@ -569,9 +569,18 @@ bool WmLauncherApplyPending()
 
 // Index 0 is close, 1 maximize/restore, 2 minimize. Rendering and input
 // intentionally use the same full-height rectangular control cells.
+static DesktopWindowGeometry CaptionGeometry(const Window& w)
+{
+    return {w.x,w.y,w.clientW,w.clientH,w.noChrome,w.noChrome && w.captionOverlay,
+            w.captionInsetRight,w.captionInsetTop,w.captionHeight};
+}
 static WmRect CaptionRect(const Window& w, int index)
 {
-    return DesktopCaptionRect({w.x,w.y,w.clientW,w.clientH,w.noChrome},w.desktopMetrics(),index);
+    return DesktopCaptionRect(CaptionGeometry(w),w.desktopMetrics(),index);
+}
+WmRect WmCaptionOverlayRect(const Window& w)
+{
+    return DesktopCaptionOverlayRect(CaptionGeometry(w),w.desktopMetrics());
 }
 
 static int WmTextWidth(const char* text)
@@ -877,6 +886,8 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.visible = true;
     w.minimized = false;
     w.noChrome = false;
+    w.captionOverlay = false;
+    w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0;
     w.focusable = focusable;
     w.savedX = x;
     w.savedY = y;
@@ -1038,11 +1049,18 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         if (mx < wx - grab || my < wy || mx >= wx + ww + grab || my >= wy + wh + grab)
             continue;
 
-        // CSD: no chrome zones, no edge resize.  The whole window is client.
+        // CSD: no chrome zones, no edge resize.  The whole window is client,
+        // except for caption buttons the WM overlays on it.
         if (w.noChrome)
         {
             result.windowIndex = idx;
             result.zone = WmHitZone::ClientArea;
+            const WmHitZone overlayZones[] = {WmHitZone::CloseButton,
+                WmHitZone::MaximizeButton, WmHitZone::MinimizeButton};
+            if (w.captionOverlay)
+                for (int button = 0; button < 3; ++button)
+                    if (CaptionRect(w, button).contains(mx, my))
+                        result.zone = overlayZones[button];
             return result;
         }
 
@@ -1213,18 +1231,30 @@ Window* WmGetWindow(int idx)
     return &g_windows[idx];
 }
 
-void WmSetClientSideDecoration(int idx, bool enable)
+void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
+                               uint16_t insetRight, uint16_t insetTop, uint16_t captionHeight)
 {
     VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
-    if (w.noChrome == enable) return;
+    captionOverlay = enable && captionOverlay;
+    if (!captionOverlay) insetRight = insetTop = captionHeight = 0;
+    if (w.noChrome == enable && w.captionOverlay == captionOverlay &&
+        w.captionInsetRight == insetRight && w.captionInsetTop == insetTop &&
+        w.captionHeight == captionHeight) return;
+    const bool modeChanged = w.noChrome != enable || w.captionOverlay != captionOverlay;
     w.noChrome = enable;
+    w.captionOverlay = captionOverlay;
+    w.captionInsetRight = insetRight;
+    w.captionInsetTop = insetTop;
+    w.captionHeight = captionHeight;
+    if (!modeChanged) { extern void CompositorMarkDirty(); CompositorMarkDirty(); return; }
     // Mark compositor dirty so the chrome region repaints/clears next frame.
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
-    SerialPrintf("WM: window %d CSD=%d\n", idx, (int)enable);
+    SerialPrintf("WM: window %d CSD=%d caption_overlay=%d inset=%u,%u height=%u\n", idx, (int)enable,
+                 (int)captionOverlay, insetRight, insetTop, captionHeight);
 }
 
 // Set per-window display properties (opacity and/or backdrop blur radius). `mask`
@@ -1708,17 +1738,73 @@ const ChromeMaterialCache& WmChromeMaterial(){
 }
 uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
 
+static void RenderCaptionButtons(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                                 const Window& w, uint32_t bg, uint32_t fg, bool material,
+                                 int32_t mouseX, int32_t mouseY)
+{
+    for (int button = 0; button < 3; ++button)
+    {
+        const WmRect r = CaptionRect(w, button);
+        const bool hover = r.contains(mouseX, mouseY);
+        if(material)WmFillRect(buf,stride,screenW,screenH,r.x,r.y,1,r.h,ChromeMix(bg,0xffffff,20));
+        if (hover) WmFillRect(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
+                             button == 0 ? WmCurrentPalette().closeHover : WmCurrentPalette().captionHover);
+        if (r.w < static_cast<int>(WmMetric(14))) continue;
+        const uint32_t ink = hover && button == 0 ? WmCurrentPalette().closeText :
+                             hover ? WmCurrentPalette().text : fg;
+        const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+        if (button == 0)
+        {
+            for (int d = -static_cast<int>(WmMetric(4)); d <= static_cast<int>(WmMetric(4)); ++d)
+            {
+                WmFillRect(buf, stride, screenW, screenH, cx+d,cy+d,WmMetric(1),WmMetric(1),ink);
+                WmFillRect(buf, stride, screenW, screenH, cx+d,cy-d,WmMetric(1),WmMetric(1),ink);
+            }
+        }
+        else if (button == 1)
+        {
+            auto box = [&](int x, int y, int width, int height) {
+                WmFillRect(buf, stride, screenW, screenH, x, y, width, WmMetric(1), ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y + height - 1, width, WmMetric(1), ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y, WmMetric(1), height, ink);
+                WmFillRect(buf, stride, screenW, screenH, x + width - 1, y, WmMetric(1), height, ink);
+            };
+            if (w.state == WindowState::Maximized)
+            {
+                box(cx - WmMetric(2), cy - WmMetric(5), WmMetric(8), WmMetric(8));
+                WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8),
+                           hover ? WmCurrentPalette().captionHover : bg);
+                box(cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8));
+            }
+            else box(cx - WmMetric(5), cy - WmMetric(4), WmMetric(11), WmMetric(9));
+        }
+        else WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy + WmMetric(3), WmMetric(11), WmMetric(1), ink);
+    }
+}
+
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
                                 int32_t mouseX = -1, int32_t mouseY = -1)
 {
-    if (!buf || !stride || !screenW || !screenH || w.noChrome || !w.proc || !w.visible) return;
+    if (!buf || !stride || !screenW || !screenH || !w.proc || !w.visible) return;
+    if (w.noChrome && !w.captionOverlay) return;
     const int border = WmMetric(WM_BORDER_WIDTH);
     const int ow = w.outerWidth(), oh = w.outerHeight();
     const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().titleInactive;
     const uint32_t bg = WmMaterialColor(w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive);
     const uint32_t fg = w.focused ? WmCurrentPalette().text : WmCurrentPalette().mutedText;
+    if (w.noChrome)
+    {
+        // Overlaid captions: only the button block, in the native title
+        // material, over the client's own title area. The client keeps the
+        // rest of its top edge (Chromium's tab strip).
+        const WmRect block = WmCaptionOverlayRect(w);
+        if (block.w <= 0 || block.h <= 0) return;
+        WmFillRect(buf, stride, screenW, screenH, block.x, block.y, block.w, block.h, bg);
+        RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, false, mouseX, mouseY);
+        return;
+    }
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y, ow, border, edge);
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y, border, oh, edge);
     WmFillRect(buf, stride, screenW, screenH, w.x + ow - border, w.y, border, oh, edge);
@@ -1759,44 +1845,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
         WmRenderString(buf, stride, screenW, screenH, textX,
             ty + (static_cast<int>(WmMetric(WM_TITLE_BAR_HEIGHT)) - WmDesktopFont().lineHeight) / 2,
             w.title, fg, bg, textW);
-    for (int button = 0; button < 3; ++button)
-    {
-        const WmRect r = CaptionRect(w, button);
-        const bool hover = r.contains(mouseX, mouseY);
-        if(material)WmFillRect(buf,stride,screenW,screenH,r.x,r.y,1,r.h,ChromeMix(bg,0xffffff,20));
-        if (hover) WmFillRect(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
-                             button == 0 ? WmCurrentPalette().closeHover : WmCurrentPalette().captionHover);
-        if (r.w < static_cast<int>(WmMetric(14))) continue;
-        const uint32_t ink = hover && button == 0 ? WmCurrentPalette().closeText :
-                             hover ? WmCurrentPalette().text : fg;
-        const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
-        if (button == 0)
-        {
-            for (int d = -static_cast<int>(WmMetric(4)); d <= static_cast<int>(WmMetric(4)); ++d)
-            {
-                WmFillRect(buf, stride, screenW, screenH, cx+d,cy+d,WmMetric(1),WmMetric(1),ink);
-                WmFillRect(buf, stride, screenW, screenH, cx+d,cy-d,WmMetric(1),WmMetric(1),ink);
-            }
-        }
-        else if (button == 1)
-        {
-            auto box = [&](int x, int y, int width, int height) {
-                WmFillRect(buf, stride, screenW, screenH, x, y, width, WmMetric(1), ink);
-                WmFillRect(buf, stride, screenW, screenH, x, y + height - 1, width, WmMetric(1), ink);
-                WmFillRect(buf, stride, screenW, screenH, x, y, WmMetric(1), height, ink);
-                WmFillRect(buf, stride, screenW, screenH, x + width - 1, y, WmMetric(1), height, ink);
-            };
-            if (w.state == WindowState::Maximized)
-            {
-                box(cx - WmMetric(2), cy - WmMetric(5), WmMetric(8), WmMetric(8));
-                WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8),
-                           hover ? WmCurrentPalette().captionHover : bg);
-                box(cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8));
-            }
-            else box(cx - WmMetric(5), cy - WmMetric(4), WmMetric(11), WmMetric(9));
-        }
-        else WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy + WmMetric(3), WmMetric(11), WmMetric(1), ink);
-    }
+    RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, material, mouseX, mouseY);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -3651,7 +3700,7 @@ static bool DesktopLayerLocked(const Window& w,WmDesktopLayer& out,bool retain) 
     }
     out={backing,w.creationIdentity,generation,bytes,w.wmId,width,height,stride,w.clientW,w.clientH,
          w.clientX(),w.clientY(),w.upscale,uint8_t(legacy),0,0,0,0,0,{}, {},0,0,0,0,0,0};
-    out.focused=w.focused;out.noChrome=w.noChrome;out.state=uint8_t(w.state);
+    out.focused=w.focused;out.noChrome=w.noChrome?(w.captionOverlay?2:1):0;out.state=uint8_t(w.state);
     out.opacity=w.opacity;out.blurRadius=w.blurRadius;
     __builtin_memcpy(out.title,w.title,sizeof(out.title));__builtin_memcpy(out.appId,w.appId,sizeof(out.appId));
     out.ownerPid=w.proc->pid;out.ownerIncarnation=w.proc->incarnation;
@@ -3764,6 +3813,8 @@ static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Windo
     in.clientOffsetX=origin0.clientX();in.clientOffsetY=origin0.clientY();
     in.state=static_cast<uint32_t>(origin0.state);
     in.focused=origin0.focused;in.visible=origin0.visible;in.noChrome=origin0.noChrome;
+    in.captionOverlay=origin0.noChrome && origin0.captionOverlay ?
+        (1ull<<63)|(uint64_t(origin0.captionHeight)<<32)|(uint64_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
     in.hoverButton=hover;
     in.theme=static_cast<uint32_t>(layers.theme);in.appearance=static_cast<uint32_t>(layers.appearance);
     in.scale=static_cast<uint32_t>(layers.scale);
@@ -3781,8 +3832,13 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         if(!g_wmActive || CompositorGlassActive())return -95;
         int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
         const Window& source=g_windows[sorted[index]];
-        if(source.noChrome){*info={source.x,source.y,0,0,0};return 0;}
-        width=source.outerWidth();height=source.outerHeight();
+        if(source.noChrome && !source.captionOverlay){*info={source.x,source.y,0,0,0};return 0;}
+        // Overlaid captions: a surface covering only the button block, placed
+        // over the client (renderers draw chrome after the client).
+        const WmRect block=source.noChrome?WmCaptionOverlayRect(source):WmRect{source.x,source.y,0,0};
+        if(source.noChrome && (block.w<=0 || block.h<=0)){*info={source.x,source.y,0,0,0};return 0;}
+        width=source.noChrome?uint32_t(block.w):source.outerWidth();
+        height=source.noChrome?uint32_t(block.h):source.outerHeight();
         if(!width || !height || uint64_t(width)*height>64ull*1024*1024/4)return -7;
         {
             Window origin0=source;origin0.x=0;origin0.y=0;
@@ -3791,15 +3847,25 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                 const int64_t n=int64_t(value)-origin;
                 return n<(-2147483647ll-1)?int32_t(-2147483647-1):n>2147483647ll?int32_t(2147483647):int32_t(n);
             };
-            *info={source.x,source.y,width,height,
+            *info={source.noChrome?block.x:source.x,source.noChrome?block.y:source.y,width,height,
                 DesktopChromeKeyLocked(layers,origin0,noMouseKey?-1:rel(mouseX,source.x),noMouseKey?-1:rel(mouseY,source.y))};
         }
         if(!pixels)return 0;
         if(capacity<uint64_t(width)*height*4)return -22;
-        local=source;originX=source.x;originY=source.y;ProcessRef(local.proc);
+        local=source;originX=source.noChrome?int16_t(block.x):source.x;originY=source.noChrome?int16_t(block.y):source.y;
+        ProcessRef(local.proc);
     }
     const uint64_t bytes=uint64_t(width)*height*4;
     __builtin_memset(pixels,0,bytes);
+    if(local.noChrome){
+        // Render the window so its button block lands at the surface origin.
+        local.x=int16_t(local.x-originX);local.y=int16_t(local.y-originY);
+        RenderWindowChrome(pixels,width,width,height,local,mouseX==-1 && mouseY==-1?-1:int32_t(mouseX-originX),
+                           mouseX==-1 && mouseY==-1?-1:int32_t(mouseY-originY));
+        for(uint64_t i=0;i<uint64_t(width)*height;++i)pixels[i]|=0xff000000u;
+        ProcessUnref(local.proc);
+        return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
+    }
     local.x=0;local.y=0;
     auto relative=[](int32_t value,int16_t origin){
         const int64_t n=int64_t(value)-origin;

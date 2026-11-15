@@ -7425,7 +7425,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 for (int j = 0; f[j]; j++) buf[p++] = f[j];
             }
             if (w->noChrome) {
-                const char* f = " [csd]";
+                const char* f = w->captionOverlay ? " [csd+captions]" : " [csd]";
                 for (int j = 0; f[j]; j++) buf[p++] = f[j];
             }
             buf[p++] = '\n';

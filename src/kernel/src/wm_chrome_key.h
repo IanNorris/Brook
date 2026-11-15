@@ -19,6 +19,7 @@ struct WmChromeKeyInput {
     int32_t clientOffsetX,clientOffsetY;
     uint32_t state;
     bool focused,visible,noChrome;
+    uint64_t captionOverlay;      // 0, or bit 63 | height << 32 | top inset << 16 | right inset
     int32_t hoverButton;          // -1 none, else caption button index
     uint32_t theme,appearance,scale;
     uint64_t settingsEpoch,launcherEpoch;
@@ -45,6 +46,7 @@ inline uint64_t WmChromeKey(const WmChromeKeyInput& in) {
     k.u64((uint64_t(uint32_t(in.clientOffsetX))<<32)|uint32_t(in.clientOffsetY));
     k.u64(in.state);
     k.byte(uint8_t(in.focused)|uint8_t(in.visible)<<1|uint8_t(in.noChrome)<<2);
+    k.u64(in.captionOverlay);
     k.u64(uint64_t(int64_t(in.hoverButton)));
     k.u64((uint64_t(in.theme)<<32)|in.appearance);k.u64(in.scale);
     k.u64(in.settingsEpoch);k.u64(in.launcherEpoch);
