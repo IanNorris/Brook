@@ -352,4 +352,30 @@ int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
 int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,
                     uint64_t, uint64_t, uint64_t);
 
+// syscall_sched.cpp
+int64_t sys_sched_yield(uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t);
+int64_t sys_membarrier(uint64_t command,uint64_t flags,uint64_t,
+                       uint64_t,uint64_t,uint64_t);
+int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
+                               uint64_t maskAddr, uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_setaffinity(uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_setparam(uint64_t, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_getparam(uint64_t, uint64_t paramAddr, uint64_t,
+                            uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_setscheduler(uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_getscheduler(uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_get_priority_max(uint64_t policy, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t);
+int64_t sys_sched_get_priority_min(uint64_t policy, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t);
+int64_t sys_getpriority(uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t);
+int64_t sys_setpriority(uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
