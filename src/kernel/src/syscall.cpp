@@ -574,6 +574,7 @@ void SyscallTableInit()
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
     g_syscallTable[BROOK_SYS_WM_TASKBAR_METRICS] = sys_brook_wm_taskbar_metrics;
     g_syscallTable[BROOK_SYS_POINTER_SPEED] = sys_brook_pointer_speed;
+    g_syscallTable[BROOK_SYS_TOUCHPAD_TAP] = sys_brook_touchpad_tap;
     g_syscallTable[BROOK_SYS_AUDIO_CONTROL] = sys_brook_audio_control;
 #ifdef BROOK_MAPPING_TEST_HOOKS
     g_syscallTable[0xB30]                = MappingFaultTestControl;

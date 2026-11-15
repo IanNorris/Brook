@@ -15,6 +15,7 @@
 #include "window.h"
 #include "serial.h"
 #include "net.h"
+#include "debug_presence.h"
 #include "kprintf.h"
 #include "string.h"
 #include "tty.h"
@@ -533,10 +534,15 @@ static void DebugTcpThread(void* /*arg*/)
                     if (c == '\n' || c == '\r') {
                         if (cmdLen > 0) {
                             cmdBuf[cmdLen] = '\0';
-                            if(cmdBuf[0]=='@')framedClient=true;
+                            const bool framed=cmdBuf[0]=='@';
+                            if(framed)framedClient=true;
+                            // Framed requests come only from bridge clients;
+                            // they refresh (never create) agent presence.
+                            if(framed)DebugPresenceRequestBegin(peer.sin_addr);
                             DebugChannelSetReplySock(clientSock);
                             DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
                             DebugChannelClearReplySock();
+                            if(framed)DebugPresenceRequestEnd();
                             cmdLen = 0;
                             partialDeadline = 0;
                         }

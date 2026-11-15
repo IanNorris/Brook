@@ -20,6 +20,7 @@
 #include "runtime_accounting.h"
 #include "timer_irq_arrivals.h"
 #include "process.h"
+#include "mouse.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
@@ -487,6 +488,18 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
         {
             LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);
             g_lastSeenRateEpoch[cpuId] = curEpoch;
+        }
+    }
+
+    // Touchpad tap-to-click: release a tap whose drag window closed while the
+    // pad sent no packets. A single load per BSP tick when nothing is pending.
+    if (cpuId == 0)
+    {
+        const uint64_t tapDeadline = __atomic_load_n(&g_touchpadTapDeadline, __ATOMIC_ACQUIRE);
+        if (tapDeadline)
+        {
+            const uint64_t now = ApicTickCount();
+            if (now >= tapDeadline) MouseTouchpadTapPoll(now);
         }
     }
 

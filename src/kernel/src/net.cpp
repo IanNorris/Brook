@@ -95,6 +95,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "compositor_scene.h"
 #include "debug_jobs.h"
 #include "debug_epoch.h"
+#include "debug_presence.h"
 #include "debug_ui.h"
 #include "drm_backing_diagnostics.h"
 #include "frame_timing.h"
@@ -4925,6 +4926,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #endif
     if (DebugHardwareHandleCommand(cmd,len)) return;
     if (DebugEpochHandleCommand(cmd)) return;
+    if (DebugPresenceHandleCommand(cmd)) return;
     if (DebugJobHandleCommand(cmd)) return;
     if (DebugUiHandleCommand(cmd)) return;
     // Guarded frame leases bind request/status/release to one guest boot.
@@ -5133,7 +5135,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
-            "  input touchpad synaptics on|off|status | natural on|off | speed N | probe - Synaptics two-finger scroll touchpad (probe: raw query replies)\n"
+            "  input touchpad synaptics on|off|status | natural on|off | tap on|off | speed N | probe - Synaptics two-finger scroll touchpad (probe: raw query replies)\n"
             "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
@@ -6080,12 +6082,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if(NetStrEq(cmd,"input touchpad synaptics off"))MouseTouchpadSet(false);
         else if(NetStrEq(cmd,"input touchpad natural on"))MouseTouchpadSetNatural(true);
         else if(NetStrEq(cmd,"input touchpad natural off"))MouseTouchpadSetNatural(false);
+        else if(NetStrEq(cmd,"input touchpad tap on"))MouseTouchpadSetTap(true);
+        else if(NetStrEq(cmd,"input touchpad tap off"))MouseTouchpadSetTap(false);
         else if(NetStrEq(cmd,"input touchpad probe"))MouseTouchpadProbe();
         else if(StrStartsWith(cmd,"input touchpad speed ")){
             const char* v=cmd+21;uint32_t n=0,d=0;while(*v>='0'&&*v<='9'&&d<4){n=n*10+uint32_t(*v++-'0');++d;}
             if(!d||*v||!MouseTouchpadSetSpeed(n)){DebugChannelSend("{\"error\":\"usage: input touchpad speed <25-300>\"}\n");return;}}
         else if(!NetStrEq(cmd,"input touchpad status") && !NetStrEq(cmd,"input touchpad synaptics status")){
-            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | speed <25-300> | probe\"}\n");return;}
+            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | tap on|off | speed <25-300> | probe\"}\n");return;}
         const auto st=MouseTouchpadGetStatus();
         BridgeReply r;
         r.text("{\"wanted\":");r.text(st.wanted?"true":"false");
@@ -6103,6 +6107,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"natural\":");r.text(st.natural?"true":"false");
         r.text(",\"agm\":");r.text(st.agm?"true":"false");
         r.text(",");r.field("speed",st.speed);
+        r.text(",\"tap\":");r.text(st.tap?"true":"false");
+        r.text(",\"taps\":{");r.field("left",st.tapLeft);r.text(",");r.field("right",st.tapRight);
+        r.text(",");r.field("drags",st.tapDrags);r.text(",");r.field("double",st.tapDoubles);
+        r.text(",");r.field("rejected_physical",st.tapRejectedPhysical);r.text(",");r.field("rejected_palm",st.tapRejectedPalm);
+        r.text(",");r.field("rejected_phantom",st.tapRejectedPhantom);r.text("}");
         r.text(",");r.field("scroll_ticks_low_z",st.scrollLowZ);
         r.text(",");r.field("scroll_rejected",st.scrollRejected);
         r.text(",");r.field("gesture_resets",st.gestureResets);
@@ -6112,7 +6121,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
           r.text("\"");r.text(names[i]);r.text("\":[");
           for(int j=0;j<3;++j){if(j)r.text(",");r.number(st.raw[i][j]);}r.text("]");}
          r.text("}");}
-        r.text(",\"scope\":\"fingers = packets seen with 0,1,2,3+ fingers; resyncs = bytes failing Synaptics packet sync; off renegotiates relative IntelliMouse PS/2\"}\n");
+        r.text(",\"scope\":\"fingers = packets seen with 0,1,2,3+ fingers; resyncs = bytes failing Synaptics packet sync; off renegotiates relative IntelliMouse PS/2; tap on|off is live only (Settings persists [Desktop] touchpad_tap)\"}\n");
         r.send();
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {

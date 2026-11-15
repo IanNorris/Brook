@@ -417,6 +417,7 @@ add_executable(kernel
     src/usb_boot_health.cpp
     src/lifecycle_channel.cpp
     src/debug_epoch.cpp
+    src/debug_presence.cpp
     src/debug_hardware.cpp
     src/debug_jobs.cpp
     src/debug_ui.cpp

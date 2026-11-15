@@ -707,6 +707,8 @@ target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/k
 
 add_host_test(test_synaptics_touchpad)
 target_compile_options(test_synaptics_touchpad PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_synaptics_tap)
+target_compile_options(test_synaptics_tap PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_wayland_provider)
@@ -771,6 +773,7 @@ target_compile_options(test_debug_hardware_recovery PRIVATE -UNDEBUG -DBROOK_HOS
     "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
 
+add_host_test(test_bridge_presence)
 add_host_test(test_debug_epoch "${BROOK_ROOT}/src/kernel/src/debug_epoch.cpp")
 target_compile_options(test_debug_epoch PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"

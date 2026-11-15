@@ -247,6 +247,14 @@ int64_t sys_brook_pointer_speed(uint64_t op,uint64_t value,uint64_t,uint64_t,uin
     if(op!=1||value>0xffffffffULL)return -EINVAL;
     return MouseTouchpadSetSpeed(static_cast<uint32_t>(value))?0:-EINVAL;
 }
+// 0xB23: touchpad tap-to-click (0 off, 1 on).
+int64_t sys_brook_touchpad_tap(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
+    if(!ProcessCurrent())return -ESRCH;
+    if(op==0)return MouseTouchpadTap()?1:0;
+    if(op!=1||value>1)return -EINVAL;
+    MouseTouchpadSetTap(value!=0);
+    return 0;
+}
 int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
     if(!ProcessCurrent())return -ESRCH;
     if(op==0)return WmGetTaskbarMetrics();
