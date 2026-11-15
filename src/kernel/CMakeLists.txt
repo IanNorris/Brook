@@ -311,6 +311,7 @@ add_executable(kernel
     src/syscall_ioctl.cpp
     src/syscall_socket.cpp
     src/syscall_process.cpp
+    src/syscall_exec.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
