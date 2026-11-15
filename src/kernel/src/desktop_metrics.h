@@ -31,14 +31,36 @@ struct DesktopRect {
 struct DesktopWindowGeometry {
     int x,y,clientW,clientH;
     bool clientDecorated;
+    // A client-decorated window may still show the native caption buttons over
+    // the top-right of its own surface (a browser tab strip owns the rest of
+    // the top edge). Insets exclude the client's transparent shadow margin.
+    bool captionOverlay=false;
+    int captionInsetRight=0,captionInsetTop=0;
     int clientX(const DesktopMetrics& m) const { return x+(clientDecorated?0:m.border()); }
     int clientY(const DesktopMetrics& m) const { return y+(clientDecorated?0:m.border()+m.title()); }
 };
 inline DesktopRect DesktopCaptionRect(const DesktopWindowGeometry& g,const DesktopMetrics& m,int button) {
-    if(g.clientDecorated || button<0 || button>=3) return {};
+    if(button<0 || button>=3) return {};
+    if(g.clientDecorated) {
+        if(!g.captionOverlay) return {};
+        const int right=g.captionInsetRight>0?g.captionInsetRight:0,top=g.captionInsetTop>0?g.captionInsetTop:0;
+        const int span=g.clientW-right;
+        int width=m.captionButton();
+        if(width*3>span) width=span/3;
+        if(width<=0 || top>=g.clientH) return {};
+        const int height=m.title()<g.clientH-top?m.title():g.clientH-top;
+        return {g.x+span-(button+1)*width,g.y+top,width,height};
+    }
     int width=m.captionButton();
     if(width*3>g.clientW) width=g.clientW/3;
     return {g.x+g.clientW+m.border()-(button+1)*width,g.y+m.border(),width,m.title()};
+}
+// The union of the three overlaid caption buttons (empty unless overlaid).
+inline DesktopRect DesktopCaptionOverlayRect(const DesktopWindowGeometry& g,const DesktopMetrics& m) {
+    if(!g.clientDecorated || !g.captionOverlay) return {};
+    const DesktopRect close=DesktopCaptionRect(g,m,0),minimize=DesktopCaptionRect(g,m,2);
+    if(close.w<=0 || close.h<=0) return {};
+    return {minimize.x,close.y,close.x+close.w-minimize.x,close.h};
 }
 // Preserve client pixels and origin while changing native decorations. Keep the
 // caption reachable when a larger title would otherwise extend above the screen.

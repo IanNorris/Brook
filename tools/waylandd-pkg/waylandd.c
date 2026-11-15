@@ -173,8 +173,10 @@ static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
                           struct brook_wm_create_out* out) {
     return syscall(BROOK_SYS_WM_RESIZE_VFB, (long)id, (long)w, (long)h, (long)out);
 }
-static long wm_set_decoration_mode(uint32_t id, int csd) {
-    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)csd);
+/* mode 0 server side, 1 client side, 2 client side with Brook's caption
+ * buttons overlaid at the top-right; insets = right | top << 16 (VFB px). */
+static long wm_set_decoration_mode(uint32_t id, int mode, uint32_t insets) {
+    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode, (long)insets);
 }
 static long wm_begin_move(uint32_t id) {
     return syscall(BROOK_SYS_WM_BEGIN_MOVE, (long)id);
@@ -352,6 +354,8 @@ struct brook_surface {
     uint32_t configure_size_serial;
     int32_t window_geometry_w, window_geometry_h;
     int32_t pending_geometry_w, pending_geometry_h;
+    int32_t window_geometry_x, window_geometry_y;
+    int32_t pending_geometry_x, pending_geometry_y;
     int window_geometry_pending;
     struct brook_geometry_state geometry;
     struct wl_resource *viewport;
@@ -390,6 +394,9 @@ struct brook_surface {
      * decided by app_id (which may arrive later) can reconfigure it. */
     struct wl_resource *deco_resource;
     int deco_requested_csd;
+    /* Mode and insets last sent to the kernel WM (-1: nothing sent yet). */
+    int deco_sent_mode;
+    uint32_t deco_sent_insets;
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -438,6 +445,7 @@ static int32_t pointer_fixed_floor(wl_fixed_t value) {
 #define BROOK_WAYLAND_SOURCE_COMMIT_TAG 1
 struct brook_image;
 static void intel_image_want_pixels(struct brook_image *image);
+static void surface_sync_decoration(struct brook_surface *s, int force);
 #include "surface-scene.h"
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
@@ -737,6 +745,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
     if (s->window_geometry_pending) {
         s->window_geometry_w=s->pending_geometry_w;s->window_geometry_h=s->pending_geometry_h;s->window_geometry_pending=0;
+        s->window_geometry_x=s->pending_geometry_x;s->window_geometry_y=s->pending_geometry_y;
 
     }
     if(s->size_hints_pending){
@@ -828,6 +837,8 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     if (!committed) wl_client_post_no_memory(c);
     else if (committed>0 && s->is_cursor) surface_cursor_commit(s);
     else if (committed>0 && !bt_effective_sync(&s->tree)) published=surface_repaint(s);
+    /* Window geometry (the CSD shadow margin) places overlaid captions. */
+    if (committed>0 && s->xdg_toplevel && s->deco_sent_mode==2) surface_sync_decoration(s,0);
     if (committed>0 && published && configure_committed) {
         s->configure_size_pending=s->configure_size_acked=0;
         if(s->toplevel_resizing && s->wm_id) {
@@ -945,6 +956,7 @@ static void compositor_create_surface(struct wl_client *client,
                                       uint32_t id) {
     struct brook_surface *s = calloc(1, sizeof(*s));
     if (!s) { wl_client_post_no_memory(client); return; }
+    s->deco_sent_mode = -1;
     if (g_trace_frames) s->trace_id = ++g_trace_surface_id;
     struct wl_resource *sr = wl_resource_create(client, &wl_surface_interface,
                                                 wl_resource_get_version(res), id);
@@ -1032,6 +1044,7 @@ static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
     /* The decoration request may precede the app_id: apply the policy now. */
     if (s->deco_resource && s->deco_csd && s->deco_requested_csd && deco_force_server_side(s))
         deco_apply_mode(s->deco_resource, 1);
+    else if (s->wm_id && s->deco_csd) surface_sync_decoration(s, 0);
 }
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
@@ -1224,7 +1237,7 @@ static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
 static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resource *r,
                                               int32_t x, int32_t y,
                                               int32_t w, int32_t h) {
-    (void)c; (void)x; (void)y;
+    (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (w <= 0 || h <= 0) {
         wl_resource_post_error(r, XDG_SURFACE_ERROR_INVALID_SIZE,
@@ -1232,6 +1245,7 @@ static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resou
         return;
     }
     s->pending_geometry_w = w; s->pending_geometry_h = h;
+    s->pending_geometry_x = x; s->pending_geometry_y = y;
     s->window_geometry_pending = 1;
 }
 static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r,
@@ -2109,15 +2123,68 @@ static void deco_resource_destroyed(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (s && s->deco_resource==r) s->deco_resource=NULL;
 }
+/* Chromium-family browsers draw their tab strip in the title area when they
+ * decorate client-side; Brook keeps its own caption buttons over the top-right
+ * of that surface (the launcher asks Chromium to draw none, via GTK's button
+ * layout). BROOK_WAYLAND_CAPTION_APPS is a comma list of app_id prefixes;
+ * empty disables the overlay. */
+static int deco_caption_overlay_app(const struct brook_surface *s) {
+    if (!s || !s->app_id[0]) return 0;
+    const char *list = getenv("BROOK_WAYLAND_CAPTION_APPS");
+    if (!list) list = "chromium,google-chrome";
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && !strncmp(s->app_id, p, n)) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+static int g_caption_overlay_unsupported;
+/* The kernel needs the client's shadow margin to place the buttons on its
+ * visible frame: the surface's right/top edges to the window geometry. */
+static uint32_t deco_caption_insets(const struct brook_surface *s) {
+    if (s->window_geometry_w <= 0 || s->window_geometry_h <= 0 || !s->vfb_w) return 0;
+    const int64_t scale = surface_output_scale(s);
+    int64_t right = (int64_t)s->vfb_w - ((int64_t)s->window_geometry_x + s->window_geometry_w) * scale;
+    int64_t top = (int64_t)s->window_geometry_y * scale;
+    if (right < 0) right = 0;
+    if (top < 0) top = 0;
+    if (right > 0xFFFF) right = 0xFFFF;
+    if (top > 0xFFFF) top = 0xFFFF;
+    return (uint32_t)right | ((uint32_t)top << 16);
+}
+static void surface_sync_decoration(struct brook_surface *s, int force) {
+    if (!s || !s->wm_id) return;
+    int mode = s->deco_csd ? 1 : 0;
+    uint32_t insets = 0;
+    if (mode && !s->xdg_popup && s->xdg_toplevel && s->deco_resource && s->deco_requested_csd &&
+        !g_caption_overlay_unsupported && deco_caption_overlay_app(s)) {
+        mode = 2;
+        insets = deco_caption_insets(s);
+    }
+    if (!force && mode == s->deco_sent_mode && insets == s->deco_sent_insets) return;
+    long rc = wm_set_decoration_mode(s->wm_id, mode, insets);
+    if (mode == 2 && rc == 0) {
+        /* An older kernel treats mode 2 as plain CSD: stop asking. */
+        g_caption_overlay_unsupported = 1;
+        fprintf(stderr, "[waylandd] caption overlay unsupported by kernel; plain client-side\n");
+    }
+    if (force || mode != s->deco_sent_mode)
+        fprintf(stderr, "[waylandd] decoration wm=%u mode=%s insets=%u,%u rc=%ld\n", s->wm_id,
+                mode == 2 ? "client_side+captions" : mode ? "client_side" : "server_side",
+                insets & 0xFFFF, insets >> 16, rc);
+    s->deco_sent_mode = mode;
+    s->deco_sent_insets = insets;
+}
 static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;
     /* Popups never acquire toplevel chrome, irrespective of negotiation. */
     csd = csd || s->xdg_popup != NULL;
     s->deco_csd = csd;
     if (s->wm_id) {
-        long rc = wm_set_decoration_mode(s->wm_id, csd);
-        fprintf(stderr, "[waylandd] decoration wm=%u mode=%s rc=%ld\n",
-                s->wm_id, csd ? "client_side" : "server_side", rc);
+        surface_sync_decoration(s, 1);
         s->deco_pending = 0;
     } else {
         fprintf(stderr, "[waylandd] decoration pending mode=%s\n",
@@ -2136,7 +2203,8 @@ static int deco_force_server_side(const struct brook_surface *s){
     const char *list=getenv("BROOK_WAYLAND_SSD_APPS");
     /* Off by default: Chromium keeps drawing its custom frame inside the
      * server-side one (gen 405: a double frame with a transparent shadow
-     * margin). Its "use system title bar" preference is the working fix. */
+     * margin). Chromium keeps its own frame; Brook overlays its caption
+     * buttons on it instead (deco_caption_overlay_app). */
     if(!list)return 0;
     for(const char *p=list;*p;){
         const char *e=strchr(p,',');size_t n=e?(size_t)(e-p):strlen(p);

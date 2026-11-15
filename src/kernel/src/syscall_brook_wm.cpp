@@ -410,23 +410,32 @@ int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
     return CopyCreateOut(outPtr, res);
 }
 
-// 512: WM_SET_DECORATION_MODE(wmId, csdEnabled)
+// 512: WM_SET_DECORATION_MODE(wmId, mode, insets)
 //   Toggle CSD (client-side decoration) mode for a waylandd-hosted window.
-//   Used to honour zxdg_toplevel_decoration_v1.set_mode.  When enabled,
-//   the kernel WM stops drawing chrome and the whole outer area is client.
+//   Used to honour zxdg_toplevel_decoration_v1.set_mode.  mode 0 is server
+//   side; any other value is CSD: the kernel WM stops drawing chrome and the
+//   whole outer area is client.  mode 2 additionally keeps the WM's caption
+//   buttons over the client's top-right corner; insets packs the client's
+//   right (bits 0-15) and top (bits 16-31) shadow margins in VFB pixels.
+//   Returns 2 when the caption overlay is in effect (older kernels return 0
+//   and treat mode 2 as plain CSD), otherwise 0.
 int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
-                                          uint64_t, uint64_t,
+                                          uint64_t insets, uint64_t,
                                           uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
     if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
+    if (insets > 0xFFFFFFFFull) return -EINVAL;
 
     brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
     if (!w) return -EINVAL;
     int idx = static_cast<int>(wmId) - 1;
-    brook::WmSetClientSideDecoration(idx, csd != 0);
-    return 0;
+    const bool overlay = csd == 2;
+    brook::WmSetClientSideDecoration(idx, csd != 0, overlay,
+                                     static_cast<uint16_t>(overlay ? insets & 0xFFFFu : 0),
+                                     static_cast<uint16_t>(overlay ? insets >> 16 : 0));
+    return overlay ? 2 : 0;
 }
 
 // 0xB00 (2816): WM_SET_WINDOW_PROPERTIES(wmId, mask, opacity, blurRadius)

@@ -14,7 +14,7 @@ struct FakeWin {
     char title[64]="Quake II",appId[128]="yquake2";
     uint64_t identity=7,metrics=0x1000,incarnation=42;
     uint32_t clientW=1280,clientH=720,border=2,titleH=32,state=0;
-    bool focused=true,visible=true,noChrome=false;
+    bool focused=true,visible=true,noChrome=false;uint32_t overlay=0;
     int32_t hover=-1;uint32_t theme=1,appearance=0,scale=100;uint64_t settings=3,launcher=5;
     int32_t x=100,y=80; // position: never part of the key
     uint32_t outerW()const{return clientW+2*border;}
@@ -27,7 +27,7 @@ static uint64_t Key(const FakeWin& w){
     in.windowIdentity=w.identity;in.metricsIdentity=w.metrics;
     in.outerWidth=w.outerW();in.outerHeight=w.outerH();in.clientWidth=w.clientW;in.clientHeight=w.clientH;
     in.clientOffsetX=int32_t(w.border);in.clientOffsetY=int32_t(w.titleH+w.border);in.state=w.state;
-    in.focused=w.focused;in.visible=w.visible;in.noChrome=w.noChrome;in.hoverButton=w.hover;
+    in.focused=w.focused;in.visible=w.visible;in.noChrome=w.noChrome;in.captionOverlay=w.overlay;in.hoverButton=w.hover;
     in.theme=w.theme;in.appearance=w.appearance;in.scale=w.scale;in.settingsEpoch=w.settings;in.launcherEpoch=w.launcher;
     return WmChromeKey(in);
 }
@@ -48,6 +48,9 @@ static void KeyChanges(){
     { FakeWin w=base;w.launcher=6;assert(Key(w)!=k); }                       // icon snapshot
     { FakeWin w=base;w.identity=8;assert(Key(w)!=k); }                       // recycled slot
     { FakeWin w=base;std::strcpy(w.appId,"other");assert(Key(w)!=k); }       // icon identity
+    // Overlaid caption buttons: mode and the client's shadow insets move the block.
+    { FakeWin w=base;w.noChrome=true;const uint64_t csd=Key(w);w.overlay=1u<<31;const uint64_t o=Key(w);
+      assert(o!=csd);w.overlay|=12;assert(Key(w)!=o);FakeWin v=w;v.overlay|=8u<<16;assert(Key(v)!=Key(w)); }
     // Adjacent strings cannot alias: ("ab","c") vs ("a","bc").
     { FakeWin a=base,b=base;std::strcpy(a.title,"ab");std::strcpy(a.appId,"c");
       std::strcpy(b.title,"a");std::strcpy(b.appId,"bc");assert(Key(a)!=Key(b)); }

@@ -174,9 +174,46 @@ Captures: `display-perf/build/ssd-probe-frame/` (double frame) and `ssd-pref-fra
 
 **Recommendation:** use the system title bar for Chromium on Brook. A proposed launcher default exists on `work/chromium-frame` (`14287f38`), **not installed**: `brook-chromium` would set the pref only when it is absent from the profile, keeping any later user choice. For now Ian can flip the setting himself; the wrapper default is his decision.
 
+**Superseded for the look (Ian, 15 Nov):** the system title bar puts Brook's blue bar above Chromium's light tab strip, which looks wrong. Chromium's own frame (the default) is kept; see the next section.
+
 **How opacity is decided (`surface_opaque_covers`):** a single added rectangle, clamped to the surface, that covers the whole surface marks the view opaque. The comparison is in logical surface units, against the view's destination size before output scale. Multi-rectangle regions stay non-opaque (conservative).
 
 **Diagnostics in the status file:**
 - `opaque_regions`: counts of NULL / infinite / by-number-of-ops calls, the last call's kind and first op, and `opaque_views`;
 - per window: the root's `opaque_region` `[set,x,y,w,h]`;
 - per layer: `opaque` bit 0 = XRGB pixels, bit 1 = view marked opaque.
+
+## Chromium's tab strip in the title area, with Brook's caption buttons (`work/chrome-csd`, 15 Nov 2026)
+
+**Goal (Ian):** Chromium draws its tabs at the top of the window, as on Linux desktops, with Brook's own minimise/maximise/close at the right instead of a Brook title bar above the tab strip.
+
+**What Chromium does:**
+- **No `zxdg_decoration_manager_v1`, or the compositor answers `CLIENT_SIDE`:** Chromium draws its custom frame: tab strip at the top, its own caption buttons, rounded corners and a translucent shadow margin. It reports the visible frame with `xdg_surface.set_window_geometry` (on Brook: 16 px right, 10 px top inset in QEMU while restored, none while maximised). This was already Brook's default.
+- **`SERVER_SIDE`:** Chromium keeps drawing its custom frame inside Brook's frame (gen 405 double frame). Only the *Use system title bar and borders* preference drops it.
+- **Its caption buttons** follow GTK's `gtk-decoration-layout`, which GTK on Wayland takes from GSettings `org.gnome.desktop.wm.preferences button-layout`. Brook has no dconf, so GTK reads the schema default `appmenu:close`: that is why Chromium showed only a close button. With `GSETTINGS_BACKEND=keyfile` and a keyfile in `$XDG_CONFIG_HOME/glib-2.0/settings/keyfile`, Chromium honours any layout. `:` draws no buttons; `:minimize,maximize,close` draws all three. Window Controls Overlay is for installed web apps only, and no command-line switch hides the buttons.
+- **Chromium's own buttons** call `xdg_toplevel.set_minimized`/`set_maximized`/`unset_maximized` and close itself; waylandd already forwards these to the WM. Empty tab-strip space calls `xdg_toplevel.move` (and a double-click toggles maximise).
+
+**What Brook does now:**
+- **Kernel WM:** a client-decorated window can carry a *caption overlay* (`Window::captionOverlay` plus right/top insets in VFB pixels). The WM draws only its caption-button block, in the title material, at the top-right of the client's window geometry (`DesktopCaptionOverlayRect`, `desktop_metrics.h`), and hit-tests the three buttons there; the rest of the surface stays client area. The block uses the normal caption code (hover, close red, restore glyph when maximised). The CSD "drag the top 36 px" heuristic is skipped for these windows so tab drags reach Chromium.
+  - Paths: CPU compositor (drawn after the client), the GPU chrome layer (`SetChromeDecorAlpha`/`GpuComposeChrome`), and the desktop renderer's chrome capture, which returns a surface covering just the block. The renderer draws chrome after the client; `desktop_track_chrome_hole` now treats a chrome surface the client fully covers as an overlay with no hole.
+  - The chrome key includes the overlay and its insets.
+- **Syscall 512** `WM_SET_DECORATION_MODE(wmId, mode, insets)`: mode 2 is CSD with the overlay; `insets` packs right | top << 16. It returns 2 when the overlay is in effect. Older kernels return 0 and treat mode 2 as plain CSD, and waylandd then stops asking.
+- **waylandd:** when an xdg-decoration client asks for `CLIENT_SIDE` and its app_id starts with an entry in `BROOK_WAYLAND_CAPTION_APPS` (default `chromium,google-chrome`; empty disables it), it uses mode 2. It also re-sends the insets when the window geometry or size changes (shadow added or dropped on restore and maximise). Popups, GTK/KDE-decorated clients and other apps are unchanged.
+- **Launcher (`data/nix-wrappers/brook-chromium`, on this branch only, not installed):** exports `GSETTINGS_BACKEND=keyfile` and sets only `button-layout` to `:minimize,maximize,close` in `$XDG_CONFIG_HOME/glib-2.0/settings/keyfile`, keeping any other keys and leaving the file untouched once it is correct. `BROOK_CHROMIUM_BUTTON_LAYOUT` overrides the layout; empty leaves GSettings alone. Without this launcher change, Chromium keeps its close-only default: its X is hidden under the block, but its tabs can run under the minimise and maximise buttons.
+
+**Results (QEMU, software Chromium 148, private profile under `/tmp`):**
+- **Layout `:`** (Chromium draws no buttons): tab strip at the top, Brook's block at the top-right, insets 16,10 restored and 0 maximised. With 15 tabs, though, the tabs and the new-tab button run under the block, because Chromium reserves no space.
+- **Layout `:minimize,maximize,close`** (the launcher default on this branch): the same look, but Chromium keeps its tabs and new-tab button left of the block. Its own buttons (about 100 px wide) sit entirely under Brook's 138 px block; a transient frame during maximise, before Chromium redrew, showed them in the old buffer.
+- **Behaviour:**
+  - Dragging empty tab-strip space moves the window (Chromium's `xdg_toplevel.move`).
+  - A double-click there maximises (Chromium's `set_maximized`, honoured).
+  - Brook's maximise/restore, minimise (with restore from the taskbar) and close all work, and hover shows the normal caption colours (close red).
+  - Popups and tooltips get no block, and a native terminal keeps its normal title bar.
+- **Speed:** QEMU on a heavily loaded host was very slow (Chromium's first window took about 30 minutes; WM clicks were sometimes delayed by seconds), which says nothing about Dell speed.
+- **Evidence:** `chrome-csd/build/csd-qemu/evidence/` (screenshots 01–15, serial logs).
+
+**Not done / limits:**
+- The block is Brook's title colour over Chromium's light tab strip; it does not adopt Chromium's frame colour.
+- Block height is Brook's title height (36 px at 100%); Chromium's restored strip is about 40 px, so a 4 px light strip shows under the block.
+- Pre-existing: restoring a client-decorated window configures the VFB size, which includes the shadow margin, so Chromium grows by its shadow (800×600 to 832×642 geometry) on each maximise/restore.
+- The Dell desktop renderer path (chrome capture plus no-hole rule) is covered by host/package tests, not yet exercised on hardware.

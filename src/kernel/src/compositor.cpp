@@ -1719,7 +1719,20 @@ static bool EnsureChromeBuffer()
 // a glassy hint of transparency; the frame borders stay solid (0xFF).
 static void SetChromeDecorAlpha(const Window& w, bool glass)
 {
-    if (!g_chromeBuffer || w.noChrome) return;
+    if (!g_chromeBuffer) return;
+    if (w.noChrome)
+    {
+        // Overlaid caption buttons are an opaque block over the client.
+        const WmRect block = WmCaptionOverlayRect(w);
+        for (int y = block.y; y < block.y + block.h; ++y)
+        {
+            if (y < 0 || y >= static_cast<int>(g_physFbHeight)) continue;
+            uint32_t* row = g_chromeBuffer + static_cast<uint32_t>(y) * g_backBufStride;
+            for (int x = block.x; x < block.x + block.w; ++x)
+                if (x >= 0 && x < static_cast<int>(g_physFbWidth)) row[x] |= 0xFF000000u;
+        }
+        return;
+    }
     int ox = w.x, oy = w.y;
     int ow = (int)w.outerWidth(), oh = (int)w.outerHeight();
     int cx = w.clientX(), cy = w.clientY();
@@ -2347,7 +2360,7 @@ static void CompositorLoopWM()
         if (drawChromeLayer)
         {
             Window* cw = WmGetWindow(sorted[i]);
-            if (cw && !cw->noChrome)
+            if (cw && (!cw->noChrome || cw->captionOverlay))
             {
                 WmRenderChromeForWindow(g_chromeBuffer, g_backBufStride,
                                          g_physFbWidth, g_physFbHeight, sorted[i],
@@ -3053,7 +3066,9 @@ static void CompositorHandleMouseWM()
         {
             WmSetFocus(hit.windowIndex);
             Window* hitWindow = WmGetWindow(hit.windowIndex);
-            if (hitWindow && hitWindow->noChrome)
+            // Overlaid captions mean the client implements xdg_toplevel.move
+            // from its own title area (Chromium tab strip): never steal it.
+            if (hitWindow && hitWindow->noChrome && !hitWindow->captionOverlay)
             {
                 int32_t localX = mx - hitWindow->x;
                 int32_t localY = my - hitWindow->y;
@@ -3476,7 +3491,14 @@ static void GpuComposeShadow(const GpuCompositorOps* gpu,const Window* w) {
 // so a translucent window's frame blends over whatever is behind it.
 static void GpuComposeChrome(const GpuCompositorOps* gpu, const Window* w, uint32_t opacity)
 {
-    if (!g_chromeTex || w->noChrome) return;
+    if (!g_chromeTex) return;
+    if (w->noChrome)
+    {
+        const WmRect block = WmCaptionOverlayRect(*w);
+        if (block.w > 0 && block.h > 0)
+            GpuComposeSrcRect(gpu, g_chromeTex, block.x, block.y, block.w, block.h, opacity, true);
+        return;
+    }
     int ox = w->x, oy = w->y;
     int ow = (int)w->outerWidth(), oh = (int)w->outerHeight();
     int cx = w->clientX(), cy = w->clientY();
