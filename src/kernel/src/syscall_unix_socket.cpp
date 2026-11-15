@@ -357,10 +357,9 @@ int UnixInstallSocket(Process* process, UnixSocketData* socket, uint32_t flags,
     FdEntry owned{};
     owned.type = FdType::UnixSocket;
     owned.handle = socket;
-    owned.statusFlags = flags & 0x800;
     owned.fdFlags = (flags & 0x80000) ? 1 : 0;
     (void)site;
-    int fd = FdTablePublishOwned(process->fds, ProcessFdLock(process), owned, 0, -1, nullptr, UnixLifePublished);
+    int fd = FdPublishNew(process,owned,flags & 0x800,false,UnixLifePublished);
     return fd;
 }
 

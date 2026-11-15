@@ -3,8 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -418,6 +420,230 @@ static void indexedMappedQuota()
     assert(!FileObjectTruncateUnmapped(object,f,0) && frames.empty());
     VfsClose(f);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();mappingTest=false;
 }
+static Vnode *openObject(VfsObject *o, int flags = VFS_O_WRITE | VFS_O_READWRITE)
+{
+    int e = 0;
+    auto *v = o->ops->open(o, flags, &e);
+    assert(v && !e);
+    return v;
+}
+static VnodeStat statOf(VfsObject *o)
+{
+    VnodeStat s{};
+    assert(!o->ops->stat(o, &s));
+    return s;
+}
+static std::vector<std::string> names(Vnode *directory)
+{
+    std::vector<std::string> out;
+    uint32_t cookie = 0;
+    DirEntry entry{};
+    while (directory->ops->readdir(directory, &entry, &cookie) == 1)
+        out.emplace_back(entry.name);
+    return out;
+}
+// Hard links: one inode (pages, FileObject, identity) shared by several names.
+static void hardLinks()
+{
+    auto *fs = make();
+    auto *r = root(fs);
+    char text[64]{};
+    uint64_t off = 0;
+    auto *a = create(r, "a");
+    assert(a->ops->write(a, "hello", 5, &off) == 5);
+    auto *aObject = child(r, "a");
+    assert(statOf(aObject).nlink == 1);
+    const auto bytesBefore = TmpfsGlobalUsage().bytes, inodesBefore = TmpfsGlobalUsage().inodes;
+    assert(!r->ops->link(r, aObject, "b"));
+    // Only a name is charged; no new inode is allocated.
+    assert(TmpfsGlobalUsage().inodes == inodesBefore && TmpfsGlobalUsage().bytes > bytesBefore);
+    auto *bObject = child(r, "b");
+    auto sa = statOf(aObject), sb = statOf(bObject);
+    assert(sa.nlink == 2 && sb.nlink == 2 && sa.ino == sb.ino && sa.dev == sb.dev && sb.size == 5);
+    assert(aObject->identity == bObject->identity);
+    // Writing through one name is visible through the other, and both names
+    // share one FileObject so mappings stay coherent.
+    auto *b = openObject(bObject);
+    assert(b->ops->file_object(b) == a->ops->file_object(a));
+    off = 0;
+    assert(b->ops->write(b, "HE", 2, &off) == 2);
+    off = 0;
+    assert(a->ops->read(a, text, sizeof(text), &off) == 5 && !memcmp(text, "HEllo", 5));
+    {
+        auto *listing = openObject(r, 0);
+        auto seen = names(listing);
+        assert(std::count(seen.begin(), seen.end(), "a") == 1 && std::count(seen.begin(), seen.end(), "b") == 1);
+        VfsClose(listing);
+    }
+    // Reporting uses the oldest surviving name; exact provenance refuses to guess.
+    char path[256];
+    assert(!bObject->ops->object_path(bObject, path, sizeof(path)) && !strcmp(path, "/a"));
+    VfsObject *entryParent = nullptr;
+    char leaf[256];
+    assert(aObject->ops->entry_parent(aObject, &entryParent, leaf, sizeof(leaf)) == -95 && !entryParent);
+    // Error cases: existing name, directory source, other instance, missing parent.
+    assert(r->ops->link(r, aObject, "b") == -17);
+    assert(r->ops->link(r, aObject, "a") == -17);
+    assert(r->ops->link(r, r, "rootlink") == -1);
+    assert(!r->ops->mkdir(r, "dir", 0755));
+    auto *dir = child(r, "dir");
+    assert(r->ops->link(r, dir, "dirlink") == -1);
+    assert(r->ops->link(r, aObject, "bad/name") == -22 && r->ops->link(r, aObject, "..") == -22);
+    auto *otherFs = make();
+    auto *otherRoot = root(otherFs);
+    assert(otherRoot->ops->link(otherRoot, aObject, "cross") == -18);
+    assert(r->ops->link(r, otherRoot, "cross") == -18);
+    // Cross-directory link reports and survives independently.
+    assert(!dir->ops->link(dir, aObject, "c"));
+    assert(statOf(aObject).nlink == 3);
+    // Unlink the original: data survives through the remaining names.
+    assert(!r->ops->remove(r, "a", false));
+    assert(statOf(bObject).nlink == 2);
+    VfsObject *gone = nullptr;
+    assert(r->ops->lookup(r, "a", &gone, false) == -2 && !gone);
+    assert(!aObject->ops->object_path(aObject, path, sizeof(path)) && !strcmp(path, "/b"));
+    assert(!dir->ops->remove(dir, "c", false));
+    assert(statOf(bObject).nlink == 1);
+    // Single name again: exact provenance is available.
+    assert(!aObject->ops->entry_parent(aObject, &entryParent, leaf, sizeof(leaf)));
+    assert(entryParent && entryParent->identity == r->identity && !strcmp(leaf, "b"));
+    VfsObjectRelease(entryParent);
+    off = 0;
+    memset(text, 0, sizeof(text));
+    assert(b->ops->read(b, text, sizeof(text), &off) == 5 && !memcmp(text, "HEllo", 5));
+    // Relink, then unlink both names with descriptors open: data until close,
+    // and an unlinked inode is never resurrected (AT_EMPTY_PATH source).
+    assert(!r->ops->link(r, bObject, "a"));
+    assert(!r->ops->remove(r, "a", false) && !r->ops->remove(r, "b", false));
+    assert(!statOf(bObject).nlink && !a->ops->stat(a, &sa) && !sa.nlink);
+    assert(r->ops->link(r, bObject, "revived") == -2);
+    assert(bObject->ops->object_path(bObject, path, sizeof(path)) == -2);
+    off = 0;
+    assert(a->ops->read(a, text, sizeof(text), &off) == 5 && !memcmp(text, "HEllo", 5));
+    const auto heldBytes = TmpfsGlobalUsage().bytes;
+    VfsClose(b);
+    VfsObjectRelease(bObject);
+    VfsObjectRelease(aObject);
+    assert(TmpfsGlobalUsage().bytes < heldBytes && fs->inodes == 3); // root, dir, held inode
+    VfsClose(a);
+    assert(fs->inodes == 2);
+    // A linked-from-open-vnode source (linkat AT_EMPTY_PATH uses the retained object).
+    auto *temp = create(r, "fd-source");
+    assert(!r->ops->link(r, temp->backendObject, "fd-alias"));
+    assert(!r->ops->remove(r, "fd-source", false));
+    VfsClose(temp);
+    auto *alias = child(r, "fd-alias");
+    assert(statOf(alias).nlink == 1);
+    VfsObjectRelease(alias);
+    assert(!r->ops->remove(r, "fd-alias", false));
+    // Rename over a hard link removes one name only; rename between two names
+    // of one inode is a successful no-op that keeps both names.
+    auto *x = create(r, "x");
+    off = 0;
+    assert(x->ops->write(x, "X", 1, &off) == 1);
+    auto *y = create(r, "y");
+    off = 0;
+    assert(y->ops->write(y, "Y", 1, &off) == 1);
+    assert(!r->ops->link(r, x->backendObject, "x2"));
+    assert(!r->ops->rename(r, "x", r, "x2"));
+    assert(!x->ops->stat(x, &sa) && sa.nlink == 2);
+    auto *x2 = child(r, "x2");
+    auto *xAgain = child(r, "x");
+    assert(x2->identity == xAgain->identity);
+    VfsObjectRelease(xAgain);
+    VfsObjectRelease(x2);
+    assert(!r->ops->rename(r, "y", r, "x2"));
+    assert(!x->ops->stat(x, &sa) && sa.nlink == 1);
+    x2 = child(r, "x2");
+    assert(x2->identity == y->backendObject->identity && statOf(x2).nlink == 1);
+    VfsObjectRelease(x2);
+    // Moving one name to another directory keeps the inode's other name.
+    assert(!r->ops->link(r, x->backendObject, "x3"));
+    assert(!r->ops->rename(r, "x3", dir, "moved"));
+    assert(!x->ops->stat(x, &sa) && sa.nlink == 2);
+    assert(!r->ops->remove(r, "x", false));
+    assert(!x->backendObject->ops->object_path(x->backendObject, path, sizeof(path)) && !strcmp(path, "/dir/moved"));
+    off = 0;
+    assert(x->ops->read(x, text, 1, &off) == 1 && text[0] == 'X');
+    VfsClose(x);
+    VfsClose(y);
+    assert(!dir->ops->remove(dir, "moved", false) && !r->ops->remove(r, "x2", false));
+    // Xorg lock pattern: write a temporary, link into place, unlink temporary;
+    // a second server loses the race with EEXIST and reads the winner's PID.
+    {
+        auto *lock = create(r, ".tX14-lock");
+        const char pid[] = "      1234\n";
+        off = 0;
+        assert(lock->ops->write(lock, pid, 11, &off) == 11);
+        assert(!r->ops->link(r, lock->backendObject, ".X14-lock"));
+        assert(!r->ops->remove(r, ".tX14-lock", false));
+        VfsClose(lock);
+        auto *loser = create(r, ".tX14-lock");
+        assert(r->ops->link(r, loser->backendObject, ".X14-lock") == -17);
+        assert(!r->ops->remove(r, ".tX14-lock", false));
+        VfsClose(loser);
+        auto *placed = child(r, ".X14-lock");
+        assert(statOf(placed).nlink == 1 && statOf(placed).size == 11);
+        auto *reader = openObject(placed, 0);
+        off = 0;
+        memset(text, 0, sizeof(text));
+        assert(reader->ops->read(reader, text, sizeof(text), &off) == 11 && !strcmp(text, pid));
+        VfsClose(reader);
+        VfsObjectRelease(placed);
+        assert(!r->ops->remove(r, ".X14-lock", false));
+    }
+    // Special files may be hard linked too.
+    assert(!r->ops->symlink(r, "target", "sym"));
+    auto *sym = child(r, "sym");
+    assert(!r->ops->link(r, sym, "sym2") && statOf(sym).nlink == 2);
+    VfsObjectRelease(sym);
+    int error = 0;
+    auto *socket = r->ops->create_socket(r, "sock", 0600, &error);
+    assert(socket && !error && !r->ops->link(r, socket->backendObject, "sock2"));
+    assert(!socket->ops->stat(socket, &sa) && sa.nlink == 2);
+    VfsClose(socket);
+    // Protected hard links: an unrelated user needs an ordinary non-set-ID
+    // regular file it may read and write; ownership always suffices.
+    auto *owned = create(r, "owned");
+    identity(2000);
+    assert(r->ops->link(r, owned->backendObject, "steal") == -1);
+    identity(1000);
+    assert(!owned->ops->chmod(owned, 0666));
+    identity(2000);
+    assert(!r->ops->link(r, owned->backendObject, "shared"));
+    // Sticky root: the linker owns neither the directory nor the inode.
+    assert(r->ops->remove(r, "shared", false) == -1);
+    identity(1000);
+    assert(!owned->ops->chmod(owned, 04666));
+    identity(2000);
+    assert(r->ops->link(r, owned->backendObject, "setid") == -1);
+    identity(1000);
+    assert(!r->ops->link(r, owned->backendObject, "mine"));
+    VfsClose(owned);
+    // Allocation failure publishes nothing and leaves the count unchanged.
+    auto *quota = create(r, "quota");
+    failAllocation = 0;
+    assert(r->ops->link(r, quota->backendObject, "quota2") == -28);
+    failAllocation = -1;
+    assert(!quota->ops->stat(quota, &sa) && sa.nlink == 1);
+    assert(r->ops->lookup(r, "quota2", &gone, false) == -2 && !gone);
+    assert(!r->ops->link(r, quota->backendObject, "quota2"));
+    VfsClose(quota);
+    // A removed directory cannot gain names.
+    auto *held = create(dir, "held");
+    VfsClose(held);
+    assert(!dir->ops->remove(dir, "held", false) && !r->ops->remove(r, "dir", true));
+    auto *keep = child(r, "quota");
+    assert(dir->ops->link(dir, keep, "late") == -2);
+    VfsObjectRelease(keep);
+    VfsObjectRelease(dir);
+    // Teardown with several names outstanding releases every alias reference.
+    VfsObjectRelease(otherRoot);
+    assert(!TmpfsDestroy(otherFs));
+    VfsObjectRelease(r);
+    assert(!TmpfsDestroy(fs));
+    clean();
+}
 int main()
 {
     // Profiles are lazy aggregate ceilings derived from boot-available pages;
@@ -446,6 +672,7 @@ int main()
     lookupUnlinkRace();
     indexedSparsePages();
     indexedMappedQuota();
+    hardLinks();
     {
         auto* fs=make();auto* r=root(fs);int error=0;
         auto* fifo=r->ops->create_fifo(r,"fifo",0640,&error);assert(fifo && !error && fifo->type==VnodeType::Device);

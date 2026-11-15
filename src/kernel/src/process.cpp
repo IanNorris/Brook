@@ -120,7 +120,8 @@ static void CopyParentProcess(Process* child, Process* parent) {
 
 // Immediately after memcpy: the copied pointer is borrowed until this retains
 // it. This same lock protects a concurrently running remote-thread target.
-// Copies own references before publication; implemented with fd finalizers.
+// Copies own references (handle and shared open file description) before
+// publication; implemented with fd finalizers.
 bool FdRetainCopy(FdEntry* copy);
 
 
@@ -259,17 +260,34 @@ static FdEntry* AllocFdTable()
     return table;
 }
 
-int FdAlloc(Process* proc, FdType type, void* handle)
+int FdPublishNew(Process* proc, const FdEntry& owned, uint32_t openFlags,
+                 bool pinned, void (*published)(int, const FdEntry&))
 {
     ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return -24; // EMFILE
-    int fd = FdTableAlloc(proc->fds, ProcessFdLock(proc), type, handle);
+    OpenFile* file = OpenFileCreate(openFlags);
+    if (!file) return -12; // ENOMEM
+    FdEntry entry = owned;
+    entry.file = file;
+    int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), entry, 0, -1, nullptr,
+                                 published, nullptr, nullptr, pinned);
     if (fd < 0)
     {
-        SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
-        return -24; // EMFILE
+        OpenFileRelease(file);
+        if (fd == -24) SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
     }
     return fd;
+}
+
+int FdAlloc(Process* proc, FdType type, void* handle, uint32_t openFlags,
+            uint8_t flags, uint8_t fdFlags)
+{
+    FdEntry owned{};
+    owned.type = type;
+    owned.handle = handle;
+    owned.flags = flags;
+    owned.fdFlags = fdFlags;
+    return FdPublishNew(proc, owned, openFlags);
 }
 
 void FdFree(Process* proc, int fd)
@@ -919,6 +937,19 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     }
     proc->stackTop=userSP;
 
+    // Each standard descriptor is its own open file description (H-20):
+    // stdin O_RDONLY, stdout O_WRONLY, the default serial stderr O_RDWR and
+    // the debug serial O_WRONLY. Allocate them before accepting caller FDs.
+    const uint32_t standardStatus[4] = {0, 1, stdFds ? 1u : 2u, 1};
+    OpenFile* standardFiles[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
+        standardFiles[i] = OpenFileCreate(standardStatus[i]);
+        if (standardFiles[i]) continue;
+        for (uint32_t j = 0; j < i; ++j) OpenFileRelease(standardFiles[j]);
+        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase),KERNEL_STACK_PAGES);
+        kfree(proc->fds);SchedulerFreePid(proc->pid);FreeProcessStruct(proc);return nullptr;
+    }
+
     // Set up standard file descriptors
     if (stdFds)
     {
@@ -932,14 +963,15 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
         // Default: fd 0 = keyboard, fd 1/2 = serial
         proc->fds[0].type = FdType::DevKeyboard;
         proc->fds[1].type = FdType::Vnode; // treated as serial stdout in syscall
-        proc->fds[1].statusFlags = 1; // O_WRONLY
         proc->fds[2].type = FdType::Vnode; // treated as serial stderr in syscall
-        proc->fds[2].statusFlags = 2; // O_RDWR
     }
     // Initially provide debug serial at fd 3. Closing/reusing the slot must
     // obey the replacement descriptor's type, just like any other fd.
     proc->fds[3].type = FdType::DebugSerial;
-    proc->fds[3].statusFlags = 1; // O_WRONLY
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (proc->fds[i].type == FdType::None) OpenFileRelease(standardFiles[i]);
+        else proc->fds[i].file = standardFiles[i];
+    }
 
     // Default TTY mode: canonical with echo
     proc->ttyCanonical = true;

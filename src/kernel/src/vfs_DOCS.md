@@ -217,11 +217,18 @@ Virtual filesystem generating process and system information on the fly.
 
 1. **Max 8 mounts**: Fixed table size. Adequate for current use.
 2. **No inotify/dnotify**: No filesystem change notifications.
-3. **No hard links**: Ext2 driver doesn't implement hard link creation.
+3. **Hard links**: `link`/`linkat` are implemented by the retained-object
+   `link` callback on ext2 and tmpfs only (others return EOPNOTSUPP). tmpfs
+   separates names (`Entry`) from inodes (`Node`): every entry owns one inode
+   reference, `nlink` counts non-directory names, and data lives until the
+   last name and the last open reference are gone. Directory hard links are
+   refused (EPERM); cross-attachment links return EXDEV. A hard-linked tmpfs
+   inode reports its oldest surviving name via `object_path`, while
+   `entry_parent` refuses (EOPNOTSUPP) rather than guess between names.
 4. **No file locking**: No flock/fcntl advisory locks.
 5. **Single ext2 lock**: All ext2 operations serialize globally. Performance
    impact mitigated by block cache but heavy concurrent I/O will bottleneck.
-6. **No tmpfs**: `/tmp` is not memory-backed; writes go to ext2 on disk.
+6. **tmpfs**: `/tmp` and other tmpfs mounts are memory-backed (`tmpfs.cpp`).
 
 ### Security Notes
 - No permission checks on /proc — any process can read any `/proc/[pid]/*`

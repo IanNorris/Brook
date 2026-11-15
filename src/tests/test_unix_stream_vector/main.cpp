@@ -10,6 +10,7 @@
 struct iovec { uint64_t iov_base,iov_len; };
 struct UnixSocketData {};
 struct FdEntry { void* handle;uint32_t statusFlags; };
+static uint32_t FdStatus(const FdEntry* entry) { return entry->statusFlags; }
 static constexpr uint64_t PIPE_BUF_UNIX_SIZE=65536;
 static std::map<uint64_t,uint64_t> allocations,readable;
 static uint64_t copiedBytes,copyCalls,allocationCalls,failAllocation;

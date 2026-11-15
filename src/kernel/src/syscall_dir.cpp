@@ -57,7 +57,8 @@ int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if(brook::GpuAppGet())driEntries[entries++]="renderD128";
         if(brook::BdwIntelUserNodeEnabled())driEntries[entries++]="renderD129";
         uint64_t opos = 0;
-        uint32_t ck = static_cast<uint32_t>(fde->seekPos);
+        FdPosition position(fde);
+        uint32_t ck = static_cast<uint32_t>(position.value());
         while (ck < entries)
         {
             const char* nm = driEntries[ck];
@@ -74,14 +75,17 @@ int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
             opos += reclen;
             ++ck;
         }
-        fde->seekPos = ck;
+        position.set(ck);
         return static_cast<int64_t>(opos);
     }
 
     if (fde->type != FdType::Vnode || !fde->handle) return -EBADF;
     auto* vn = static_cast<Vnode*>(fde->handle);
     uint64_t pos = 0;
-    uint32_t cookie = static_cast<uint32_t>(fde->seekPos);
+    // The directory cookie is the shared description offset (H-20), held
+    // across the whole batch as Linux holds f_pos_lock for getdents64.
+    FdPosition position(fde);
+    uint32_t cookie = static_cast<uint32_t>(position.value());
 
     DirEntry de; de.name[0] = 0; de.size = 0; de.isDir = false;
     while (pos < count) {
@@ -113,7 +117,7 @@ int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         pos += reclen;
     }
 
-    fde->seekPos = cookie;
+    position.set(cookie);
     return static_cast<int64_t>(pos);
 }
 

@@ -115,7 +115,7 @@ void Worker(void* argument) {
     out->readers=out->writers=1;err->readers=err->writers=1;
     FdEntry fds[3]{};fds[0].type=FdType::DevNull;
     fds[1].type=fds[2].type=FdType::Pipe;
-    fds[1].flags=fds[2].flags=1;fds[1].statusFlags=fds[2].statusFlags=1;
+    fds[1].flags=fds[2].flags=1; // ProcessCreate opens fd 1/2 O_WRONLY
     fds[1].handle=out;fds[2].handle=err;
     auto* child=ShellCreateDebugJob(request.argc,request.argv,request.cwd,
                                   request.envc,request.env,request.uid,fds,job.tag);

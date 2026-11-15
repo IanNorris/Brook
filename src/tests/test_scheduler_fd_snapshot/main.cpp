@@ -43,7 +43,10 @@ int main()
     FdEntry slots[MAX_FDS]{};
     Process process{42, 123, ProcessState::Ready, slots, {}};
     g_allProcesses[0] = &process; g_processCount = 1; owner = &process;
-    slots[7].type = FdType::Socket; slots[7].statusFlags = 0x800; slots[7].seekPos = 19;
+    // Status and offset belong to the shared open file description (H-20).
+    OpenFile description{};
+    description.refs = 1; description.statusFlags = 0x800; description.offset = 19;
+    slots[7].type = FdType::Socket; slots[7].file = &description;
     FdSnapshot snapshot{}; int fd = -1;
     assert(SchedulerGetFdInfo(42, 7, &snapshot, 123));
     assert(snapshot.type == static_cast<uint8_t>(FdType::Socket));

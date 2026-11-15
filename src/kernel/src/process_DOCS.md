@@ -64,12 +64,11 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 | Field | Type | Description |
 |-------|------|-------------|
 | `type` | FdType | None, Vnode, Pipe, Socket, DevNull, MemFd, UnixSocket, etc. |
-| `flags` | uint8_t | O_NONBLOCK, pipe direction |
-| `fdFlags` | uint8_t | FD_CLOEXEC (bit 0) |
-| `refCount` | uint32_t | Reference count |
-| `statusFlags` | uint32_t | O_* flags from open |
-| `handle` | void* | Backend-specific handle |
-| `seekPos` | uint64_t | File offset |
+| `flags` | uint8_t | Immutable per description: pipe direction, TTY-pipe marker |
+| `fdFlags` | uint8_t | FD_CLOEXEC (bit 0), per descriptor |
+| `closing` / `pinCount` | uint8_t / uint32_t | Deferred-close and fget/fput pin state |
+| `handle` | void* | Backend-specific handle (one reference per slot) |
+| `file` | OpenFile* | Shared open file description: offset, O_* status flags, posLock (`open_file.h`); dup/fork/SCM_RIGHTS aliases share it |
 | `dirPath[64]` | char | Bounded diagnostic label; relative directory lookup uses the retained vnode |
 
 ### Address Space Layout (User)

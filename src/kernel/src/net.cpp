@@ -100,6 +100,8 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "drm_backing_diagnostics.h"
 #include "frame_timing.h"
 #include "frame_timing_reply.h"
+#include "compat_census_runtime.h"
+#include "lastlog.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -5169,6 +5171,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
+            "  lastlog status|on|off|flush | lastlog previous OFFSET COUNT - on-disk kernel log tail + census (/nix/var/log/brook), previous boot's record\n"
+            "  compat census [N (default 128, max 512)] | compat census reset - ENOSYS and unsupported ioctl/fcntl/prctl/sockopt/socket/clone/mmap/path hits, sorted by count\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  mem drm         - cumulative DRM backing mapping counters\n"
             "  uptime          - system uptime + wall clock\n"
@@ -6171,6 +6175,16 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if(NetStrEq(cmd,"gpu audit batch off"))BdwAuditBatchSet(false);
         BridgeReply r;r.text("{\"enabled\":");r.text(BdwAuditBatchEnabled()?"true":"false");
         r.text(",\"scope\":\"on (default) = one MTRR/PAT/CR0 observation window per critical-section audit; off = the previous per-page observation; results are identical by construction\"}\n");r.send();
+    }
+    else if(LastLogHandleCommand(cmd)) {}
+    else if(NetStrEq(cmd,"compat census reset")) {
+        CompatCensusReset();
+        DebugChannelSend("{\"reset\":true,\"scope\":\"compat census tables cleared; concurrent hits may be lost\"}\n");
+    }
+    else if(NetStrEq(cmd,"compat census") || StrStartsWith(cmd,"compat census ")) {
+        uint32_t limit=0;
+        for(const char* p=cmd+14;*p>='0' && *p<='9';++p)limit=limit*10+static_cast<uint32_t>(*p-'0');
+        CompatCensusReplyJson(limit);
     }
     else if(NetStrEq(cmd,"gpu worker stats") || NetStrEq(cmd,"gpu worker stats reset")) {
 #if defined(BROOK_GPU_SUBMISSION_TIMING)

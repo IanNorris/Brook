@@ -370,11 +370,9 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
     ep->refCount = 1;
     ep->waiter = nullptr;
 
-    int fd = FdAlloc(proc, FdType::EpollFd, ep);
-    if (fd < 0) { kfree(ep); return -EMFILE; }
-
-    if (flagsVal & 0x80000) // EPOLL_CLOEXEC
-        proc->fds[fd].fdFlags |= 1;
+    // Published complete with EPOLL_CLOEXEC (L-57).
+    int fd = FdAlloc(proc, FdType::EpollFd, ep, 2, 0, (flagsVal & 0x80000) ? 1 : 0);
+    if (fd < 0) { kfree(ep); return fd; }
 
     DbgPrintf("EPOLL: create fd=%d pid=%u tgid=%u flags=0x%lx ep=0x%lx\n",
               fd, proc->pid, proc->tgid, flagsVal,

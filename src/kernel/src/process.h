@@ -763,7 +763,17 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
                      uint64_t* outStackPtr);
 
 // File descriptor operations
-int       FdAlloc(Process* proc, FdType type, void* handle);
+// Publish a NEW open file description (H-20) naming `handle`: status from the
+// open(2) flags (call-only bits stripped), immutable `flags` (pipe direction)
+// and per-descriptor `fdFlags` (FD_CLOEXEC), all set before the slot is
+// visible. The handle stays the caller's on failure. Returns the fd, -EMFILE
+// (-24) when the table is full or -ENOMEM (-12).
+int       FdAlloc(Process* proc, FdType type, void* handle, uint32_t openFlags = 0,
+                  uint8_t flags = 0, uint8_t fdFlags = 0);
+// As FdAlloc for a fully built entry (owned.file must be null). With `pinned`
+// the caller adopts the publication pin (see FdTablePublishOwnedPinned).
+int       FdPublishNew(Process* proc, const FdEntry& owned, uint32_t openFlags,
+                       bool pinned = false, void (*published)(int, const FdEntry&) = nullptr);
 void      FdFree(Process* proc, int fd);
 FdEntry*  FdGet(Process* proc, int fd);
 

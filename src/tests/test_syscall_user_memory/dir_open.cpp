@@ -32,31 +32,31 @@ static void Open() {
 static void Getdents() {
     Reset();ResetProcess();
     auto* proc=CurrentProcess();
-    static int node;
-    proc->fds[3].type=brook::FdType::Vnode;proc->fds[3].handle=&node;
+    static brook::Vnode node{};
+    proc->fds[3].type=brook::FdType::Vnode;proc->fds[3].handle=&node;Describe(proc->fds[3],0);
     // Kernel or unmapped destinations fail without writing or advancing.
     CHECK(brook::sys_getdents64(3,g_kernel.Address(),4096,0,0,0)==-brook::EFAULT);
     CHECK(g_kernel.Intact());
-    CHECK(proc->fds[3].seekPos==0);
+    CHECK(brook::OpenFileOffset(proc->fds[3].file)==0);
     Protect(0,PageSize,Access::None);
     CHECK(brook::sys_getdents64(3,UserAddress(0),4096,0,0,0)==-brook::EFAULT);
     CHECK(brook::sys_getdents64(3,0,4096,0,0,0)==-brook::EFAULT);
-    CHECK(proc->fds[3].seekPos==0);
+    CHECK(brook::OpenFileOffset(proc->fds[3].file)==0);
     // A buffer that straddles into an unmapped page returns the records that
     // fit before it and resumes at the next one.
     const uint64_t edge=UserAddress(2*PageSize-32);
     Protect(2*PageSize,PageSize,Access::None);
     CHECK(brook::sys_getdents64(3,edge,4096,0,0,0)==32);
-    CHECK(proc->fds[3].seekPos==1);
+    CHECK(brook::OpenFileOffset(proc->fds[3].file)==1);
     CHECK(brook::StrEq(reinterpret_cast<const char*>(edge+19),"alpha"));
     // A good buffer gets the rest.
     const uint64_t good=UserAddress(4*PageSize);
     CHECK(brook::sys_getdents64(3,good,4096,0,0,0)==56);
     CHECK(brook::StrEq(reinterpret_cast<const char*>(good+19),"beta"));
     CHECK(brook::StrEq(reinterpret_cast<const char*>(good+24+19),"gamma"));
-    CHECK(proc->fds[3].seekPos==3);
+    CHECK(brook::OpenFileOffset(proc->fds[3].file)==3);
     // The synthetic /dev/dri directory follows the same rules.
-    proc->fds[4].type=brook::FdType::SyntheticMem;proc->fds[4].handle=const_cast<char*>(brook::g_drmDriDirTag);
+    proc->fds[4].type=brook::FdType::SyntheticMem;proc->fds[4].handle=const_cast<char*>(brook::g_drmDriDirTag);Describe(proc->fds[4],0);
     CHECK(brook::sys_getdents64(4,g_kernel.Address(),4096,0,0,0)==-brook::EFAULT);
     CHECK(g_kernel.Intact());
     CHECK(brook::sys_getdents64(4,good,4096,0,0,0)==48);
@@ -77,7 +77,7 @@ static void DevTty() {
     CHECK(fd==2);
     if(fd==2) {
         CHECK(proc->fds[2].type==brook::FdType::DevTty);
-        CHECK(proc->fds[2].statusFlags==2 && proc->fds[2].fdFlags==1);
+        CHECK(brook::FdStatus(&proc->fds[2])==2 && proc->fds[2].fdFlags==1);
         auto* pair=static_cast<brook::TtyDevicePair*>(proc->fds[2].handle);
         CHECK(pair->readPipe==in && pair->writePipe==out);
     }
@@ -85,7 +85,9 @@ static void DevTty() {
     CHECK(proc->fds[0].pinCount==0 && proc->fds[1].pinCount==0);
     // A stdin slot that a sibling is closing is not borrowed.
     proc->fds[0].closing=1;
-    CHECK(brook::sys_openat(static_cast<uint64_t>(-100),UserAddress(0),2,0,0,0)==-brook::EMFILE);
+    // It falls back to the keyboard, published complete (M-45).
+    const int64_t keyboard=brook::sys_openat(static_cast<uint64_t>(-100),UserAddress(0),2,0,0,0);
+    CHECK(keyboard==3 && proc->fds[3].type==brook::FdType::DevKeyboard && brook::FdStatus(&proc->fds[3])==2);
     CHECK(in->readers==2);
     g_syntheticPathsOnly=false;
 }

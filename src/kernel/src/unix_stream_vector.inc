@@ -31,5 +31,5 @@ static int64_t UnixStreamWriteVector(FdEntry* entry,uint64_t address,uint64_t co
         copied+=part;
     }
     return UnixSocketWriteSome(static_cast<UnixSocketData*>(entry->handle),
-        (entry->statusFlags&0x800)!=0,stage.bytes,copied);
+        (FdStatus(entry)&0x800)!=0,stage.bytes,copied);
 }

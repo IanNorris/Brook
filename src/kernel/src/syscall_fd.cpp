@@ -64,6 +64,9 @@ void* DevTtyDeepCopy(void* handle)
 void FinalizeClosedFd(const FdClaimResult& c)
 {
     KernelOperationGuard operation(ProcessCurrent());
+    // The slot's reference to its open file description (H-20). The handle
+    // reference below is per slot, so the two are independent.
+    OpenFileRelease(c.file);
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(c.type==FdType::BlockDevice && c.handle) {
         auto* block=static_cast<MaintenanceBlockFd*>(c.handle);
@@ -205,7 +208,7 @@ int64_t CloseProcessFd(Process* proc, int fd)
 // it is safe to claim-and-clear the slot unconditionally and finalize now.
 void FdReleaseOwnedEntry(const FdEntry& entry)
 {
-    FinalizeClosedFd({entry.type, entry.handle, entry.flags});
+    FinalizeClosedFd({entry.type, entry.handle, entry.flags, entry.file});
 }
 
 int64_t CloseProcessFdForced(Process* proc, int fd)
@@ -245,11 +248,15 @@ int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
 
     for (uint64_t fd = first; fd <= last; ++fd)
     {
+        if (flags & CLOSE_RANGE_CLOEXEC) {
+            // Ordered against publication and close of the same slot.
+            SpinLockAcquire(ProcessFdLock(proc));
+            if (proc->fds[fd].type != FdType::None) proc->fds[fd].fdFlags = 1;
+            SpinLockRelease(ProcessFdLock(proc));
+            continue;
+        }
         if (proc->fds[fd].type == FdType::None) continue;
-        if (flags & CLOSE_RANGE_CLOEXEC)
-            proc->fds[fd].fdFlags = 1;
-        else
-            CloseProcessFd(proc, static_cast<int>(fd));
+        CloseProcessFd(proc, static_cast<int>(fd));
     }
     return 0;
 }
@@ -330,8 +337,10 @@ void FdBumpRefcount(const FdEntry* fde)
     }
 }
 
-// A successful copy owns its handle before it can become visible in any table.
-// Deep-copy-only handle types must never be published with the source pointer.
+// A successful copy owns its handle and a reference to the shared open file
+// description before it can become visible in any table (dup, fork, exec
+// unshare, SCM_RIGHTS). Deep-copy-only handle types must never be published
+// with the source pointer. Allocation-free except for those deep copies.
 bool FdRetainCopy(FdEntry* copy)
 {
     if (copy->type == FdType::UnixSocket)
@@ -347,6 +356,7 @@ bool FdRetainCopy(FdEntry* copy)
     } else {
         FdBumpRefcount(copy);
     }
+    OpenFileRetain(copy->file);
     return true;
 }
 
@@ -370,7 +380,7 @@ static int64_t DuplicateFd(Process* proc, int oldfd, int target,
                                      minimum, target, &retired, UnixLifePublished,
                                      FileLockCloseContext::Closing,&lockClose);
     if (result < 0)
-        FinalizeClosedFd({owned.type, owned.handle, owned.flags});
+        FinalizeClosedFd({owned.type, owned.handle, owned.flags, owned.file});
     else if (retired.type != FdType::None) {
         UnixLifeClaim(result, retired);
         FinalizeClosedFd(retired);
@@ -424,8 +434,8 @@ int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if (!proc) return -EBADF;
     // BRO-156: pin the slot for the whole op. SEEK_END dereferences fde->handle
     // across VfsStat, which can block on disk I/O — a bare FdGet would let a
-    // sibling close() free the handle mid-stat. The pin also keeps the slot
-    // alive for the seekPos read-modify-write below.
+    // sibling close() free the handle mid-stat. The offset belongs to the
+    // shared open file description and is updated under its posLock.
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     FdEntry* fde = ref.get();
@@ -442,8 +452,14 @@ int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
         KMutexUnlock(&block->lock);return ok?int64_t(result):-EINVAL;
     }
 #endif
-    if(fde->type==FdType::SignalFd)return whence<=4?0:-EINVAL; // Linux noop_llseek
-    if(fde->type==FdType::SyncFile)return -29; // ESPIPE
+    // Linux noop_llseek: the position of these objects is always 0.
+    if(fde->type==FdType::SignalFd || fde->type==FdType::EventFd ||
+       fde->type==FdType::TimerFd || fde->type==FdType::EpollFd)return whence<=4?0:-EINVAL;
+    // Streams and terminals: no_llseek (L-63).
+    if(fde->type==FdType::SyncFile || fde->type==FdType::Socket ||
+       fde->type==FdType::UnixSocket || fde->type==FdType::NetlinkSocket ||
+       fde->type==FdType::DevTty || fde->type==FdType::DevKeyboard ||
+       (fde->type==FdType::Vnode && !fde->handle))return -29; // ESPIPE
     // DMA-BUF exposes its immutable size through SEEK_END, not arbitrary seeks.
     if(fde->type==FdType::IntelPrime) {
         if(!fde->handle || offset!=0)return -EINVAL;
@@ -454,34 +470,35 @@ int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if(fde->type==FdType::Path)return -EBADF;
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)return -29;
     int64_t soff = static_cast<int64_t>(offset);
+    if (whence > SEEK_END) return -EINVAL;
 
+    FdPosition position(fde);
+    uint64_t base = 0;
     switch (static_cast<int>(whence))
     {
     case SEEK_SET:
-        if(!SeekPosition(0,soff,fde->seekPos))return -EINVAL;
         break;
     case SEEK_CUR:
-        if(!SeekPosition(fde->seekPos,soff,fde->seekPos))return -EINVAL;
+        base = position.value();
         break;
     case SEEK_END:
     {
         if (fde->type == FdType::MemFd && fde->handle) {
-            auto* mfd = static_cast<MemFdData*>(fde->handle);
-            if(!SeekPosition(mfd->size,soff,fde->seekPos))return -EINVAL;
+            base = static_cast<MemFdData*>(fde->handle)->size;
             break;
         }
         if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
         auto* vn = static_cast<Vnode*>(fde->handle);
         VnodeStat st{};
-        if (VfsStat(vn, &st) < 0) return -EINVAL;
-        if(!SeekPosition(st.size,soff,fde->seekPos))return -EINVAL;
+        if (int error = VfsStat(vn, &st); error < 0) return error;
+        base = st.size;
         break;
     }
-    default:
-        return -EINVAL;
     }
-
-    return static_cast<int64_t>(fde->seekPos);
+    uint64_t next = 0;
+    if (!SeekPosition(base, soff, next)) return -EINVAL;
+    position.set(next);
+    return static_cast<int64_t>(next);
 }
 
 // ---------------------------------------------------------------------------
@@ -528,9 +545,9 @@ static int64_t FileRecordLock(Process* proc,FdEntry* entry,uint64_t cmd,uint64_t
     // replacement, including close of a different FD for this inode.
     SpinLockAcquire(ProcessFdLock(proc));
     int result=entry->closing?-EBADF:RecordLockNormalize(input.whence,input.start,input.length,
-                                                       entry->seekPos,size,&range);
+                                                       OpenFileOffset(entry->file),size,&range);
     if(!result && cmd!=5 && input.type!=2) {
-        const auto mode=entry->statusFlags&3;
+        const auto mode=FdStatus(entry)&3;
         if((input.type==0 && mode!=0 && mode!=2) || (input.type==1 && mode!=1 && mode!=2))result=-EBADF;
     }
     bool found=false;
@@ -586,7 +603,7 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     case 1034: { // F_GET_SEALS
         if(fde->type!=FdType::MemFd || !fde->handle)return -EINVAL;
         auto* mfd=static_cast<MemFdData*>(fde->handle);MfdLock(mfd);
-        int result=cmd==1034?static_cast<int>(mfd->seals.bits):MemFdAddSeals(mfd->seals,static_cast<uint32_t>(arg),(fde->statusFlags&3)!=0);
+        int result=cmd==1034?static_cast<int>(mfd->seals.bits):MemFdAddSeals(mfd->seals,static_cast<uint32_t>(arg),(FdStatus(fde)&3)!=0);
         MfdUnlock(mfd);return result;
     }
     case F_DUPFD:
@@ -601,34 +618,34 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     case F_GETFD:
         return fde->fdFlags;
     case F_SETFD:
+        // FD_CLOEXEC is per descriptor; it never reaches dup/fork aliases.
         fde->fdFlags = static_cast<uint8_t>(arg & FD_CLOEXEC);
         return 0;
     case F_GETFL:
     {
-        SpinLockAcquire(ProcessFdLock(proc));
-        uint32_t status = fde->statusFlags;
+        // Status flags belong to the open file description shared by every
+        // dup/fork/SCM_RIGHTS alias (H-20).
+        uint32_t status = FdStatus(fde);
         // INET status is shared by dup/fork aliases through the socket object.
         if (fde->type == FdType::Socket && fde->handle) {
             const int index = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
             status = (status & ~0x800u) | (brook::SockIsNonblock(index) ? 0x800u : 0);
         }
         if(fde->type==FdType::NetlinkSocket)status=(status&~0x800u)|(__atomic_load_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,__ATOMIC_ACQUIRE)?0x800u:0u);
-        SpinLockRelease(ProcessFdLock(proc));
         return status;
     }
     case F_SETFL:
     {
         // Allocate packet metadata before publishing O_DIRECT on a pipe.
         if ((arg & 0x4000) && FdPipe(fde) && !FdPipe(fde)->enablePackets()) return -ENOMEM;
-        // Preserve the existing mutable flags and access-mode policy.
-        // Access mode bits (O_RDONLY/O_WRONLY/O_RDWR) are preserved from open.
-        SpinLockAcquire(ProcessFdLock(proc));
-        fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
-        if(fde->type==FdType::NetlinkSocket)__atomic_store_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,(fde->statusFlags&0x800)!=0,__ATOMIC_RELEASE);
+        // Linux SETFL_MASK (M-50): the access mode and open-only flags are
+        // fixed at open. The change reaches every alias of the description.
+        const uint32_t status = OpenFileUpdateStatus(fde->file, OPEN_FILE_SETFL_MASK,
+                                                     static_cast<uint32_t>(arg));
+        if(fde->type==FdType::NetlinkSocket)__atomic_store_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,(status&0x800)!=0,__ATOMIC_RELEASE);
         if (fde->type == FdType::Socket && fde->handle)
             brook::SockSetNonblock(static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1,
-                                  (fde->statusFlags & 0x800) != 0);
-        SpinLockRelease(ProcessFdLock(proc));
+                                  (status & 0x800) != 0);
         return 0;
     }
     default:

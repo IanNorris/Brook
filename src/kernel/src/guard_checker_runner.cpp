@@ -110,11 +110,10 @@ int RunExt2Checker(Device* device,bool writable) {
     const char* verify[]={path,"-f","-n","/dev/brook-guard-data",nullptr};
     const char* env[]={"PATH=/boot","LANG=C",nullptr};
     FdEntry fds[3]{};fds[0].type=FdType::DevNull;fds[1].type=fds[2].type=FdType::DebugConsole;
-    fds[1].statusFlags=fds[2].statusFlags=1;
     Process* child=ProcessCreateExecutable(image,writable?3:4,writable?preen:verify,2,env,fds,0,0);
     FreeExecutableImage(&image);
     if(!child)return -12;
-    child->parentPid=ProcessCurrent()->tgid;child->fds[3]={};
+    child->parentPid=ProcessCurrent()->tgid;FdReleaseOwnedEntry(child->fds[3]);child->fds[3]={};
     const uint16_t pid=child->pid;const uint64_t incarnation=child->incarnation;
     if(!GuardRepairBeginTracked(device,child,writable)) {ProcessDiscardUnpublished(child);return -13;}
     SchedulerAddProcess(child);child=nullptr;
@@ -166,12 +165,11 @@ void Worker(void* arg) {
     const char* env[]={"PATH=/boot","LANG=C",nullptr};
     FdEntry fds[3]{};fds[0].type=FdType::DevNull;
     fds[1].type=fds[2].type=FdType::DebugConsole;
-    fds[1].statusFlags=fds[2].statusFlags=1;
     Process* child=ProcessCreateExecutable(image,4,argv,2,env,fds,0,0);
     FreeExecutableImage(&image);
     if(!child) {GuardCheckerAbort();KPuts("GUARD_CHECK_INCOMPLETE create\n");return;}
     child->parentPid=ProcessCurrent()->tgid;
-    child->fds[3]={};
+    FdReleaseOwnedEntry(child->fds[3]);child->fds[3]={};
     const uint16_t pid=child->pid;const uint64_t incarnation=child->incarnation;
     if(!GuardCheckerBeginTracked(device,child)) {
         GuardCheckerAbort();ProcessDiscardUnpublished(child);

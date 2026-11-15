@@ -289,8 +289,8 @@ int64_t sys_signalfd4(uint64_t descriptor,uint64_t maskAddress,uint64_t size,uin
     KernelOperationGuard guard(p);
     auto* object=SignalFdCreate(mask);if(!object)return -ENOMEM;
     FdEntry entry{};entry.type=FdType::SignalFd;entry.handle=object;
-    entry.statusFlags=flags&0x800;entry.fdFlags=(flags&0x80000)?1:0;
-    int fd=FdTablePublishOwned(p->fds,ProcessFdLock(p),entry,0,-1,nullptr,nullptr);
+    entry.fdFlags=(flags&0x80000)?1:0;
+    int fd=FdPublishNew(p,entry,flags&0x800);
     if(fd<0){SignalFdUnref(object);return -EMFILE;}return fd;
 }
 int64_t sys_signalfd(uint64_t descriptor,uint64_t mask,uint64_t size,uint64_t,uint64_t,uint64_t)

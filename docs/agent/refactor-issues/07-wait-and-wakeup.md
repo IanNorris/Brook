@@ -4,7 +4,7 @@ _15 open entries (10 medium, 5 low). Part of the split refactor issue log; index
 
 - **Scope:** Remaining single-slot waiters, epoll semantics (fd-keyed entries, starvation, `EPOLLONESHOT`/`EPOLLET`, locking and allocation cost), `poll` fd re-resolution, futex requeue, `select` details, and eventfd write limits.
 - **Why it matters:** Directly relevant to the 60 fps goal: any waiter that falls back to the 10 ms safety tick costs frames, and epoll allocating about 78 KB per walk (M-60) burns time on every wait. H-26, M-18 and the sync-file/pipe/eventfd wakeups are fixed.
-- **Dependencies:** M-19 and M-58 should be redone on top of H-20 (03) if that lands first; otherwise key by the fd's handle identity. M-20 (duplicated readiness code) is best done before M-21/M-22.
+- **Dependencies:** M-19 and M-58 should be redone on top of H-20 (03), which landed on `work/open-file`: key registrations by the slot's `OpenFile*` description, as Linux keys epoll by `struct file`. M-20 (duplicated readiness code) is best done before M-21/M-22.
 - **Suggested order:** M-60 (cheap, measurable), M-20, M-21, M-22, M-59, M-19/M-58, then M-64/L-60/M-61 (finish waiter lists), M-55, then the L entries.
 - **Test approach:** `test_syscall_user_memory/wait.cpp` (hooks observe every wake and block), `test_pipe_poll`, `test_signal_fd`, `test_signal_wait`, `test_futex_pool`, `test_epoll_diag_guest`. Frame-pacing effects need the Dell measurements (see HANDOVER).
 - **Size:** Large: 15 entries, 2 branches (epoll rework; waiter lists).

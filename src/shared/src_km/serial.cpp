@@ -87,9 +87,37 @@ void SerialInit()
 // Normal output must stop even if it entered its lock before panic began.
 static volatile uint32_t g_panicInProgress = 0;
 
+static constexpr uint32_t kSerialTailBytes = 65536;
+static char g_serialTail[kSerialTailBytes];
+static uint64_t g_serialTailHead;   // total bytes ever recorded
+
+uint64_t SerialTailTotal()
+{
+    return __atomic_load_n(&g_serialTailHead, __ATOMIC_ACQUIRE);
+}
+
+uint32_t SerialTailSnapshot(char* out, uint32_t capacity)
+{
+    if (!out || !capacity) return 0;
+    const uint64_t head = __atomic_load_n(&g_serialTailHead, __ATOMIC_ACQUIRE);
+    // Leave slack so writers racing the copy rarely reach the bytes copied.
+    uint64_t n = head < kSerialTailBytes - 4096 ? head : kSerialTailBytes - 4096;
+    if (n > capacity) n = capacity;
+    const uint64_t start = head - n;
+    uint32_t skip = 0;
+    if (start) {
+        while (skip < n && g_serialTail[(start + skip) & (kSerialTailBytes - 1)] != '\n') ++skip;
+        if (skip < n) ++skip; else skip = 0;
+    }
+    uint32_t used = 0;
+    for (uint64_t i = start + skip; i < head; ++i) out[used++] = g_serialTail[i & (kSerialTailBytes - 1)];
+    return used;
+}
+
 void SerialPutChar(char c)
 {
     if (__atomic_load_n(&g_panicInProgress,__ATOMIC_ACQUIRE)) return;
+    g_serialTail[__atomic_fetch_add(&g_serialTailHead, 1, __ATOMIC_RELAXED) & (kSerialTailBytes - 1)] = c;
     if (c == '\n') {
         // QEMU serial stdio expects CRLF
         while ((inb(COM1_LSR) & 0x20) == 0)

@@ -18,15 +18,15 @@ static constexpr int UNIX_ACCEPT_QUEUE  = 8;
 static constexpr int UNIX_FD_QUEUE_CAP  = 64;
 
 // Snapshot of an FdEntry passed across an AF_UNIX connection via SCM_RIGHTS.
-// The handle refcount is bumped on send (via the type-specific Ref helper),
-// transferred to the receiver on recv (no net refcount change), or dropped
-// on socket close (matching refcount decrement).
+// The handle and open file description references are taken on send (as by
+// dup), transferred to the receiver on recv (no net refcount change), or
+// dropped on socket close. The receiver shares the sender's description.
 struct UnixFdSnap {
-    FdType   type;
-    uint8_t  flags;
-    uint8_t  fdFlags;
-    uint32_t statusFlags;
-    void*    handle;
+    FdType    type;
+    uint8_t   flags;
+    uint8_t   fdFlags;
+    OpenFile* file;
+    void*     handle;
 };
 
 UnixCredentials UnixCurrentCredentials(Process* process);

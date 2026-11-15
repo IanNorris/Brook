@@ -17,6 +17,15 @@ void SerialPanicPuts(const char* str);
 extern "C" void SerialPrintf(const char* fmt, ...);
 extern "C" void SerialVPrintf(const char* fmt, __builtin_va_list args);
 
+// Every byte accepted by SerialPutChar is also kept in a 64 KiB in-memory
+// tail, so machines without a usable UART (the Dell) still retain recent
+// serial diagnostics for the last-log record. Lock-free; a snapshot taken
+// while writers lap it may contain a few torn bytes near the oldest end.
+uint64_t SerialTailTotal();
+// Copy up to capacity newest bytes, oldest first, starting after the first
+// newline in the window when one exists. Returns bytes copied (no NUL).
+uint32_t SerialTailSnapshot(char* out, uint32_t capacity);
+
 // Lock/unlock for callers that want to do atomic multi-call sequences
 // (e.g. KPrintf serialises serial + TTY output together).
 void SerialLock();
