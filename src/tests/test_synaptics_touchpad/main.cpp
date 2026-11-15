@@ -62,7 +62,8 @@ int main() {
     int sumX = 0, sumY = 0;
     for (int i = 1; i <= 20; ++i) { o = g.Feed(P(3000 + 10 * i, 3000 + 10 * i, 60, 6)); sumX += o.dx; sumY += o.dy; }
     CHECK(sumX > 0 && sumY < 0);              // pad up = screen up (dy negative)
-    CHECK(sumX >= 200 * 42 / 256 - 1);        // fractional accumulation keeps slow motion
+    CHECK(sumX >= 200 * 42 * 80 / 100 / 256 - 1);   // fractional accumulation keeps slow motion (80% base)
+    CHECK(sumX <= 200 * 42 / 256);                    // ~20% slower than the original tuning
     // Faster motion gets more gain per unit.
     SynapticsGesture f; f.Feed(P(2000, 2000, 60, 6)); int fast = 0;
     for (int i = 1; i <= 2; ++i) fast += f.Feed(P(2000 + 100 * i, 2000, 60, 6)).dx;
@@ -103,6 +104,66 @@ int main() {
     CHECK(c.Feed(P(3000, 2000, 60, 6, true)).buttons == 2);  // stays right until release
     CHECK(c.Feed(P(3000, 2000, 60, 6, false)).buttons == 0);
 
+
+    // Pointer speed setting scales motion; default 100 = the 80% base tuning.
+    {
+        auto run = [](int speed) {
+            SynapticsGestureConfig sc; sc.speedPercent = speed; SynapticsGesture sg(sc);
+            sg.Feed(P(2000, 2000, 60, 6)); int sum = 0;
+            for (int i = 1; i <= 40; ++i) sum += sg.Feed(P(2000 + 10 * i, 2000, 60, 6)).dx;
+            return sum;
+        };
+        const int s100 = run(100), s200 = run(200), s50 = run(50);
+        CHECK(s200 >= 2 * s100 - 2 && s200 <= 2 * s100 + 2);
+        CHECK(s50 >= s100 / 2 - 2 && s50 <= s100 / 2 + 2);
+        CHECK(run(10) == run(25));                    // clamped to the minimum
+    }
+
+    // AGM packet decode (W=2, type 1): second finger, half resolution scaled up.
+    {
+        uint8_t b[6] = {0x80 | 0x04, 0x34, 0x56, 0xC0 | 0x10, 0x87, 0x10 | 0x05};
+        // w: ((b0&0x30)>>2)|((b0&0x04)>>1)|((b3&0x04)>>2) = 2
+        auto p = SynapticsDecodePacket(b, true);
+        CHECK(p.w == 2 && p.agm);
+        CHECK(p.agmX == (((0x87 & 0x0f) << 8 | 0x34) << 1) && p.agmY == (((0x87 & 0xf0) << 4 | 0x56) << 1));
+        CHECK(p.agmZ == (((0xC0 | 0x10) & 0x30) | 0x05) << 1);
+    }
+    auto AGM = [](int x, int y, int z) {
+        SynapticsPacket p; p.w = 2; p.agm = true; p.agmX = x; p.agmY = y; p.agmZ = z; return p;
+    };
+
+    // Click-drag with a second finger: press with one finger (left), add a
+    // second finger; motion follows whichever finger moves, never scrolls.
+    {
+        SynapticsGesture d;
+        d.Feed(P(3000, 1500, 60, 6));
+        CHECK(d.Feed(P(3000, 1500, 60, 6, true)).buttons == 1);   // left press
+        d.Feed(P(3000, 1500, 70, 0, true));                       // second finger lands (re-anchor)
+        int mx = 0, sy = 0, sx = 0;
+        // Primary (holding) finger resting: tiny jitter only.
+        for (int i = 1; i <= 5; ++i) { auto r = d.Feed(P(3000 + (i & 1), 1500, 70, 0, true)); mx += r.dx; sy += r.scrollY; sx += r.scrollX; CHECK(r.buttons == 1); }
+        CHECK(mx == 0 && sy == 0 && sx == 0);
+        // The moving finger arrives in AGM packets.
+        d.Feed(AGM(4000, 3000, 60));
+        for (int i = 1; i <= 10; ++i) { auto r = d.Feed(AGM(4000 + 30 * i, 3000 + 30 * i, 60)); mx += r.dx; sy += r.scrollY; CHECK(r.buttons == 1); }
+        CHECK(mx > 0 && sy == 0);
+        // Without AGM, motion reported in the W=0 packets also drags.
+        int my = 0;
+        for (int i = 1; i <= 10; ++i) { auto r = d.Feed(P(3000, 1500 + 30 * i, 70, 0, true)); my += r.dy; sy += r.scrollY; }
+        CHECK(my < 0 && sy == 0);                                  // pad up = screen up
+        CHECK(d.Feed(P(3000, 1800, 70, 0, false)).buttons == 0);   // release
+        // After release, two fingers scroll again.
+        int st = 0; for (int i = 1; i <= 6; ++i) st += d.Feed(P(3000, 1800 + 50 * i, 70, 0)).scrollY;
+        CHECK(st == 3);
+    }
+    // A press that starts with two fingers resting is still a right click and
+    // does not drag or scroll while held.
+    {
+        SynapticsGesture rc; rc.Feed(P(3000, 2000, 70, 0)); rc.Feed(P(3000, 2000, 70, 0));
+        CHECK(rc.Feed(P(3000, 2000, 70, 0, true)).buttons == 2);
+        int sc = 0; for (int i = 1; i <= 5; ++i) sc += rc.Feed(P(3000, 2000 + 50 * i, 70, 0, true)).scrollY;
+        CHECK(sc == 0);
+    }
     // Palms and light touches produce nothing; extended packets are ignored.
     SynapticsGesture pm; pm.Feed(P(3000, 2000, 60, 14));
     CHECK(pm.Feed(P(3300, 2300, 60, 14)).dx == 0);

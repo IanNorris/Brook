@@ -5133,7 +5133,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
-            "  input touchpad synaptics on|off|status | natural on|off | probe - Synaptics two-finger scroll touchpad (probe: raw query replies)\n"
+            "  input touchpad synaptics on|off|status | natural on|off | speed N | probe - Synaptics two-finger scroll touchpad (probe: raw query replies)\n"
             "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
@@ -6058,8 +6058,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if(NetStrEq(cmd,"input touchpad natural on"))MouseTouchpadSetNatural(true);
         else if(NetStrEq(cmd,"input touchpad natural off"))MouseTouchpadSetNatural(false);
         else if(NetStrEq(cmd,"input touchpad probe"))MouseTouchpadProbe();
+        else if(StrStartsWith(cmd,"input touchpad speed ")){
+            const char* v=cmd+21;uint32_t n=0,d=0;while(*v>='0'&&*v<='9'&&d<4){n=n*10+uint32_t(*v++-'0');++d;}
+            if(!d||*v||!MouseTouchpadSetSpeed(n)){DebugChannelSend("{\"error\":\"usage: input touchpad speed <25-300>\"}\n");return;}}
         else if(!NetStrEq(cmd,"input touchpad status") && !NetStrEq(cmd,"input touchpad synaptics status")){
-            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | probe\"}\n");return;}
+            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | speed <25-300> | probe\"}\n");return;}
         const auto st=MouseTouchpadGetStatus();
         BridgeReply r;
         r.text("{\"wanted\":");r.text(st.wanted?"true":"false");
@@ -6075,6 +6078,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("scroll_ticks",st.scrollTicks);
         r.text(",\"fingers\":[");for(int i=0;i<4;++i){if(i)r.text(",");r.number(st.fingers[i]);}r.text("]");
         r.text(",\"natural\":");r.text(st.natural?"true":"false");
+        r.text(",\"agm\":");r.text(st.agm?"true":"false");
+        r.text(",");r.field("speed",st.speed);
         {static const char* const names[5]={"identify","caps","ext09","ext0c","modes"};
          r.text(",\"raw\":{");bool first=true;
          for(int i=0;i<5;++i){if(!(st.rawValid&(1u<<i)))continue;if(!first)r.text(",");first=false;

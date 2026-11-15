@@ -49,6 +49,8 @@ struct SynapticsCaps {
     bool multiFinger() const { return caps & (1u << 1); }
     bool palmDetect() const { return caps & (1u << 0); }
     bool clickpad() const { return (ext0c & (1u << 20)) || (ext0c & (1u << 8)); }
+    // Advanced gesture mode / image sensor: W=2 packets carry the second finger.
+    bool agm() const { return (ext0c & (1u << 19)) || (ext0c & (1u << 11)); }
 };
 inline uint32_t SynapticsWord(const uint8_t r[3]) {
     return (uint32_t(r[0]) << 16) | (uint32_t(r[1]) << 8) | r[2];
@@ -91,6 +93,9 @@ struct SynapticsPacket {
     int32_t z = 0;          // pressure, 0 = no finger
     int32_t w = 0;          // 0: two fingers, 1: three+, 2: extended packet, 4..15: width
     bool left = false, right = false;
+    // W=2 AGM packet (type 1): second finger at half resolution, scaled up.
+    bool agm = false;
+    int32_t agmX = 0, agmY = 0, agmZ = 0;
 };
 inline SynapticsPacket SynapticsDecodePacket(const uint8_t b[6], bool clickpad) {
     SynapticsPacket p;
@@ -101,6 +106,12 @@ inline SynapticsPacket SynapticsDecodePacket(const uint8_t b[6], bool clickpad) 
     // Clickpads report the physical click as left XOR the mirror bit in byte 3.
     p.left = clickpad ? ((b[0] ^ b[3]) & 0x01) : (b[0] & 0x01);
     p.right = !clickpad && (b[0] & 0x02);
+    if (p.w == 2 && ((b[5] & 0x30) >> 4) == 1) {   // Linux synaptics_parse_agm, type 1
+        p.agm = true;
+        p.agmX = (((b[4] & 0x0f) << 8) | b[1]) << 1;
+        p.agmY = (((b[4] & 0xf0) << 4) | b[2]) << 1;
+        p.agmZ = ((b[3] & 0x30) | (b[5] & 0x0f)) << 1;
+    }
     return p;
 }
 
@@ -111,7 +122,12 @@ struct SynapticsGestureConfig {
     int32_t jumpUnits = 800;      // per-packet motion larger than this is a reposition
     int32_t scrollUnitsPerTick = 100; // ~2 mm of two-finger travel per wheel tick
     bool naturalScroll = false;   // false: fingers up scrolls up (wheel convention)
+    int32_t speedPercent = 100;   // user pointer speed; 100 = default (25..300)
+    int32_t dragNoiseUnits = 3;   // per-packet motion below this is a resting finger
 };
+constexpr int32_t SynapticsSpeedMin = 25, SynapticsSpeedMax = 300;
+// Base gain multiplier: 80% of the original tuning (Ian: "a tiny bit fast").
+constexpr int32_t SynapticsBaseGainPercent = 80;
 
 struct SynapticsOutput {
     int32_t dx = 0, dy = 0;       // pointer motion in PS/2-style counts; dy positive = down
@@ -131,15 +147,27 @@ public:
 
     SynapticsOutput Feed(const SynapticsPacket& p) {
         SynapticsOutput o;
-        if (p.w == 2) { o.buttons = buttons_; return o; } // extended (AGM) packet: ignored
+        if (p.w == 2) {                          // extended packet: second finger only
+            o.buttons = buttons_;
+            if (!p.agm) return o;
+            if (p.agmZ < cfg_.touchZ) { haveAgm_ = false; return o; }
+            if (haveAgm_ && Dragging()) {
+                const int32_t dx = p.agmX - agmX_, dy = p.agmY - agmY_;
+                if (Abs(dx) <= cfg_.jumpUnits && Abs(dy) <= cfg_.jumpUnits) Pointer(dx, dy, o);
+            }
+            agmX_ = p.agmX; agmY_ = p.agmY; haveAgm_ = true;
+            return o;
+        }
         const int fingers = Fingers(p);
         ++fingerHistogram[fingers > 3 ? 3 : fingers];
-        // Buttons: the physical click maps to right while two fingers rest.
+        // Buttons: the physical click maps to right only when two fingers were
+        // already resting as the press started; it stays as chosen until release.
         const bool click = p.left;
         if (click && !clickDown_) clickAsRight_ = (fingers == 2);
         clickDown_ = click;
         buttons_ = uint8_t((click ? (clickAsRight_ ? 2 : 1) : 0) | (p.right ? 2 : 0));
         o.buttons = buttons_;
+        if (fingers < 2) haveAgm_ = false;
 
         if (fingers != lastFingers_) {           // re-anchor on any count change
             haveAnchor_ = fingers != 0 && fingers < 3;
@@ -151,14 +179,16 @@ public:
         if (!haveAnchor_) return o;
         int32_t dx = p.x - ax_, dy = p.y - ay_;   // pad: y up
         ax_ = p.x; ay_ = p.y;
-        if (dx > cfg_.jumpUnits || dx < -cfg_.jumpUnits || dy > cfg_.jumpUnits || dy < -cfg_.jumpUnits) return o;
+        if (Abs(dx) > cfg_.jumpUnits || Abs(dy) > cfg_.jumpUnits) return o;
         if (fingers == 1) {
-            // Speed-dependent gain: ~1/6 count per pad unit when slow, up to ~1/2 fast.
-            const int32_t speed = Abs(dx) > Abs(dy) ? Abs(dx) : Abs(dy);
-            const int32_t gainQ8 = 42 + (speed > 80 ? 80 : speed) * 11 / 10; // 42..130 (/256)
-            o.dx = Scale(dx, gainQ8, fracX_);
-            o.dy = Scale(-dy, gainQ8, fracY_);
-        } else if (fingers == 2) {
+            Pointer(dx, dy, o);
+        } else if (fingers == 2 && Dragging()) {
+            // Click-drag with a second finger: one finger holds the button, the
+            // other moves. Each finger's own deltas drive the pointer (the
+            // primary here, the secondary from AGM packets); a resting finger
+            // contributes nothing. Never scroll or right-click in this state.
+            if (Abs(dx) >= cfg_.dragNoiseUnits || Abs(dy) >= cfg_.dragNoiseUnits) Pointer(dx, dy, o);
+        } else if (fingers == 2 && !clickDown_) {
             const int32_t sy = cfg_.naturalScroll ? -dy : dy;
             const int32_t sx = cfg_.naturalScroll ? -dx : dx;
             o.scrollY = Ticks(scrollAccY_, sy);
@@ -166,6 +196,9 @@ public:
         }
         return o;
     }
+
+    // A one-finger press is held: extra fingers move the pointer, not scroll.
+    bool Dragging() const { return clickDown_ && !clickAsRight_; }
 
     int Fingers(const SynapticsPacket& p) const {
         if (p.z < cfg_.touchZ) return 0;
@@ -177,6 +210,19 @@ public:
 
 private:
     static int32_t Abs(int32_t v) { return v < 0 ? -v : v; }
+    void Pointer(int32_t dx, int32_t dy, SynapticsOutput& o) {
+        // Speed-dependent gain: ~1/6 count per pad unit when slow, up to ~1/2
+        // fast, scaled by the base tuning and the user's speed setting.
+        const int32_t speed = Abs(dx) > Abs(dy) ? Abs(dx) : Abs(dy);
+        int32_t gainQ8 = 42 + (speed > 80 ? 80 : speed) * 11 / 10;
+        int32_t user = cfg_.speedPercent;
+        if (user < SynapticsSpeedMin) user = SynapticsSpeedMin;
+        if (user > SynapticsSpeedMax) user = SynapticsSpeedMax;
+        gainQ8 = gainQ8 * SynapticsBaseGainPercent / 100 * user / 100;
+        if (gainQ8 < 1) gainQ8 = 1;
+        o.dx += Scale(dx, gainQ8, fracX_);
+        o.dy += Scale(-dy, gainQ8, fracY_);
+    }
     static int32_t Scale(int32_t d, int32_t gainQ8, int32_t& frac) {
         const int32_t total = d * gainQ8 + frac;
         const int32_t out = total / 256;           // truncates toward zero
@@ -196,6 +242,8 @@ private:
     bool haveAnchor_ = false;
     int32_t ax_ = 0, ay_ = 0, fracX_ = 0, fracY_ = 0, scrollAccX_ = 0, scrollAccY_ = 0;
     bool clickDown_ = false, clickAsRight_ = false;
+    bool haveAgm_ = false;
+    int32_t agmX_ = 0, agmY_ = 0;
     uint8_t buttons_ = 0;
 };
 

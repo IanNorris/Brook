@@ -11,10 +11,13 @@
 #include "brook_audio_control.h"
 #include "brook_gtk_appearance.h"
 #include "brook_taskbar.h"
+#include "brook_pointer.h"
 #include "brook_user_experience.h"
 
 static GtkWidget *scale_choice,*preview,*status,*swatches[3];
 static GtkWidget *volume_slider,*mute_check,*audio_status;
+static GtkWidget *pointer_slider,*pointer_status;
+static long pointer_speed=-1;
 static uint32_t audio_control=BROOK_AUDIO_DEFAULT;
 static int audio_supported;
 static GtkWidget *dark_switch,*opacity_slider,*opacity_value,*blur_choice,*performance;
@@ -101,6 +104,7 @@ static int save_appearance(unsigned theme,unsigned scale,uint32_t appearance,GEr
     g_key_file_set_integer(settings,"Desktop","opacity",brook_appearance_opacity(appearance));
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
     g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
+    if(pointer_speed>0)g_key_file_set_integer(settings,"Desktop","pointer_speed",(int)pointer_speed);
     if(audio_supported)g_key_file_set_integer(settings,"Audio","output",audio_control);
     g_key_file_set_boolean(settings,"Experience","technical_details",gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details)));
     gsize length=0;char *contents=g_key_file_to_data(settings,&length,error);
@@ -141,6 +145,16 @@ static void audio_changed(GtkWidget *widget,gpointer unused){
         syscall(BROOK_SYS_AUDIO_CONTROL,2L,0L)>0?
         ((value&BROOK_AUDIO_MUTED)?"Muted. Apply settings to remember this level.":"Output level changed. Apply settings to remember it."):
         "No audio device available. Level is ready for a future device.");
+}
+/* Pointer speed applies live; Apply saves it with the other settings. */
+static void pointer_changed(GtkWidget *widget,gpointer unused){
+    (void)widget;(void)unused;
+    const long value=(long)(gtk_range_get_value(GTK_RANGE(pointer_slider))+.5);
+    if(syscall(BROOK_SYS_POINTER_SPEED,1L,value)<0){
+        gtk_label_set_text(GTK_LABEL(pointer_status),"Could not change pointer speed.");return;
+    }
+    pointer_speed=value;
+    gtk_label_set_text(GTK_LABEL(pointer_status),"Pointer speed changed. Apply settings to remember it.");
 }
 /* The taskbar volume control changes the same kernel value; follow it while
  * open so Apply saves what the user last chose from either place. */
@@ -270,6 +284,21 @@ int main(int argc,char **argv) {
     gtk_widget_set_sensitive(volume_slider,audio_supported);gtk_widget_set_sensitive(mute_check,audio_supported);
     g_signal_connect(volume_slider,"value-changed",G_CALLBACK(audio_changed),NULL);g_signal_connect(mute_check,"toggled",G_CALLBACK(audio_changed),NULL);
     if(audio_supported)g_timeout_add(500,audio_follow,NULL);
+    pointer_speed=syscall(BROOK_SYS_POINTER_SPEED,0L,0L);
+    GtkWidget *pointer_panel=gtk_frame_new("Touchpad");
+    GtkWidget *pointer_box=gtk_box_new(GTK_ORIENTATION_VERTICAL,6);gtk_container_set_border_width(GTK_CONTAINER(pointer_box),12);
+    gtk_container_add(GTK_CONTAINER(pointer_panel),pointer_box);gtk_box_pack_start(GTK_BOX(box),pointer_panel,FALSE,FALSE,0);
+    GtkWidget *pointer_label=gtk_label_new("Pointer speed (%)");gtk_widget_set_halign(pointer_label,GTK_ALIGN_START);gtk_box_pack_start(GTK_BOX(pointer_box),pointer_label,FALSE,FALSE,0);
+    pointer_slider=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,BROOK_POINTER_SPEED_MIN,BROOK_POINTER_SPEED_MAX,5);
+    gtk_scale_set_digits(GTK_SCALE(pointer_slider),0);gtk_scale_set_value_pos(GTK_SCALE(pointer_slider),GTK_POS_RIGHT);
+    gtk_scale_add_mark(GTK_SCALE(pointer_slider),BROOK_POINTER_SPEED_DEFAULT,GTK_POS_BOTTOM,"default");
+    gtk_range_set_value(GTK_RANGE(pointer_slider),pointer_speed>0?pointer_speed:BROOK_POINTER_SPEED_DEFAULT);
+    gtk_box_pack_start(GTK_BOX(pointer_box),pointer_slider,FALSE,FALSE,0);
+    pointer_status=gtk_label_new(pointer_speed>0?"Two-finger scroll; click with two fingers resting for right-click.":"Pointer speed needs a matching Brook kernel.");
+    gtk_label_set_line_wrap(GTK_LABEL(pointer_status),TRUE);gtk_label_set_xalign(GTK_LABEL(pointer_status),0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(pointer_status),"muted");gtk_box_pack_start(GTK_BOX(pointer_box),pointer_status,FALSE,FALSE,0);
+    gtk_widget_set_sensitive(pointer_slider,pointer_speed>0);
+    g_signal_connect(pointer_slider,"value-changed",G_CALLBACK(pointer_changed),NULL);
     GtkWidget *eyebrow=gtk_label_new("APPEARANCE");gtk_widget_set_halign(eyebrow,GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(eyebrow),"eyebrow");gtk_box_pack_start(GTK_BOX(box),eyebrow,FALSE,FALSE,0);
     GtkWidget *heading=gtk_label_new("Choose your\nmaterial.");gtk_label_set_justify(GTK_LABEL(heading),GTK_JUSTIFY_LEFT);gtk_widget_set_halign(heading,GTK_ALIGN_START);

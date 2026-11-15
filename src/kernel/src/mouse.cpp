@@ -123,6 +123,7 @@ static SynapticsIdentity    g_synId;
 static SynapticsCaps        g_synCaps;
 static uint8_t              g_synMode = 0;
 static uint8_t              g_synModeReadback = 0;
+static bool                 g_synAgm = false;
 // Raw 3-byte replies: identify, capabilities, ext 0x09, ext 0x0c, modes; bit i of g_synRawValid set when reply i was read.
 static uint8_t              g_synRaw[5][3];
 static uint8_t              g_synRawValid = 0;
@@ -462,10 +463,14 @@ static bool SynapticsTryEnable()
     g_synModeReadback = r[2];
     if (!(r[2] & SynModeAbsolute)) { g_synReason = "absolute mode not confirmed"; (void)SynSetMode(0); return false; }
     g_synMode = mode;
+    // Advanced gesture mode (image-sensor pads): W=2 packets then report the
+    // second finger, used for click-drag with the moving finger. Linux
+    // synaptics_set_advanced_gesture_mode: sliced 0x03, then F3 0xC8.
+    g_synAgm = caps.agm() && SynSpecial(0x03) && AuxCommand(0xF3) && AuxCommand(0xC8);
     g_synReason = caps.extended() ? "active" : "active (no W: two-finger scroll unavailable)";
-    SerialPrintf("MOUSE: Synaptics %u.%u model %u caps=0x%06x ext=0x%06x ext0c=0x%06x clickpad=%u mode=0x%02x\n",
+    SerialPrintf("MOUSE: Synaptics %u.%u model %u caps=0x%06x ext=0x%06x ext0c=0x%06x clickpad=%u agm=%u mode=0x%02x\n",
                  g_synId.major, g_synId.minor, g_synId.model, caps.caps, caps.ext, caps.ext0c,
-                 caps.clickpad() ? 1u : 0u, mode);
+                 caps.clickpad() ? 1u : 0u, g_synAgm ? 1u : 0u, mode);
     return true;
 }
 
@@ -711,6 +716,16 @@ bool MouseTouchpadProbe()
     return ok;
 }
 
+bool MouseTouchpadSetSpeed(uint32_t percent)
+{
+    if (percent < uint32_t(SynapticsSpeedMin) || percent > uint32_t(SynapticsSpeedMax)) return false;
+    auto cfg = g_synGesture.Config();
+    cfg.speedPercent = int32_t(percent);
+    g_synGesture.SetConfig(cfg);
+    return true;
+}
+uint32_t MouseTouchpadSpeed() { return uint32_t(g_synGesture.Config().speedPercent); }
+
 void MouseTouchpadSetNatural(bool natural)
 {
     auto cfg = g_synGesture.Config();
@@ -733,6 +748,8 @@ MouseTouchpadStatus MouseTouchpadGetStatus()
     st.packets = g_synPackets; st.resyncs = g_synResyncs; st.scrollTicks = g_synScrollTicks;
     for (int i = 0; i < 4; ++i) st.fingers[i] = g_synGesture.fingerHistogram[i];
     st.natural = g_synGesture.Config().naturalScroll;
+    st.agm = g_synAgm;
+    st.speed = uint32_t(g_synGesture.Config().speedPercent);
     st.rawValid = g_synRawValid;
     for (int i = 0; i < 5; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];
     return st;

@@ -1889,11 +1889,19 @@ static void dispatch_surface_event(struct brook_surface *s,
             pointer_enter_if_needed(sc, target, lx, ly);
         }
             int32_t dy = (int8_t)e->scan;
+            /* Horizontal ticks travel in the ascii byte, positive right, which
+             * matches Wayland's horizontal axis (positive = right). */
+            int32_t dx = (int8_t)e->ascii;
             /* Brook wheel ticks are positive upward; Wayland axis values
              * are positive downward. */
-            wl_pointer_send_axis(sc->pointer, now,
-                                 WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                 wl_fixed_from_int(-dy * 10));
+            if (dy)
+                wl_pointer_send_axis(sc->pointer, now,
+                                     WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                     wl_fixed_from_int(-dy * 10));
+            if (dx)
+                wl_pointer_send_axis(sc->pointer, now,
+                                     WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+                                     wl_fixed_from_int(dx * 10));
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         break;
