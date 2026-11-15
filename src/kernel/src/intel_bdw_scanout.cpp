@@ -439,6 +439,10 @@ void BdwVideoUserCountsRead(BdwVcsUserCounts& out){
     out.refused=__atomic_load_n(&vcsUserCounts.refused,__ATOMIC_RELAXED);out.failed=__atomic_load_n(&vcsUserCounts.failed,__ATOMIC_RELAXED);
     out.retries=__atomic_load_n(&vcsUserCounts.retries,__ATOMIC_RELAXED);out.lastUs=__atomic_load_n(&vcsUserCounts.lastUs,__ATOMIC_RELAXED);
     out.maxUs=__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED);
+    {const auto& c=vcsUserCounts;out.timed=c.timed;out.prepUs=c.prepUs;out.runUs=c.runUs;out.releaseUs=c.releaseUs;
+     out.resetBeforeUs=c.resetBeforeUs;out.patUs=c.patUs;out.initUs=c.initUs;out.decodeUs=c.decodeUs;out.csbUs=c.csbUs;
+     out.tailUs=c.tailUs;out.maxRunUs=c.maxRunUs;out.skippedResetsBefore=c.skippedResetsBefore;
+     out.skippedResetsAfter=c.skippedResetsAfter;out.firstJobNs=c.firstJobNs;out.lastJobNs=c.lastJobNs;}
     out.quarantined=__atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE)!=0;out.detail=vcsUserQuarantineDetail;
 }
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
@@ -770,6 +774,7 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
         // state: refuse this job and every later one.
         VcsUserQuarantine("prepare-uncertain");return refuse(reason?reason:"prepare");
     }
+    const uint64_t preparedNs=TscClockReadNs();
     BdwForcewakeAdapterResult out{};BdwBcsRunResult run{};
     BdwVcsUserClass result=BdwVcsUserClass::RefusedUntouched;
     unsigned attempt=0;
@@ -781,7 +786,8 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
         SchedulerSleepMs(1);
     }
     if(attempt>1)__atomic_add_fetch(&vcsUserCounts.retries,attempt-1,__ATOMIC_RELAXED);
-    const uint64_t us=(TscClockReadNs()-startNs)/1000;
+    const uint64_t ranNs=TscClockReadNs();
+    const uint64_t us=(ranNs-startNs)/1000;
     __atomic_store_n(&vcsUserCounts.lastUs,us,__ATOMIC_RELAXED);
     if(us>__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED))__atomic_store_n(&vcsUserCounts.maxUs,us,__ATOMIC_RELAXED);
     switch(result){
@@ -823,6 +829,22 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
         VcsUserQuarantine("release-after-completion");
     }
     __atomic_add_fetch(&vcsUserCounts.completed,1,__ATOMIC_RELAXED);
+    {   // Phase 4 timing of this completed job (single CPU0 writer).
+        const uint64_t doneNs=TscClockReadNs();
+        auto d=[&](unsigned a,unsigned b)->uint64_t{const uint64_t x=run.stamps[a],y=run.stamps[b];
+            return x && y>x?(y-x)*1000/tsc.khz:0;};
+        auto& c=vcsUserCounts;
+        const uint64_t runUs=(ranNs-preparedNs)/1000;
+        ++c.timed;c.prepUs+=(preparedNs-startNs)/1000;c.runUs+=runUs;c.releaseUs+=(doneNs-ranNs)/1000;
+        if(runUs>c.maxRunUs)c.maxRunUs=runUs;
+        c.resetBeforeUs+=d(BdwVcsStampWorkStart,BdwVcsStampResetBefore);c.patUs+=d(BdwVcsStampResetBefore,BdwVcsStampPat);
+        c.initUs+=d(BdwVcsStampInitStart,BdwVcsStampInitEnd);c.decodeUs+=d(BdwVcsStampWaitStart,BdwVcsStampBreadcrumb);
+        c.csbUs+=d(BdwVcsStampBreadcrumb,BdwVcsStampCsb);c.tailUs+=d(BdwVcsStampCsb,BdwVcsStampWorkEnd);
+        if(!run.resetBeforeAttempted)++c.skippedResetsBefore;
+        if(run.resetAfterSkipped)++c.skippedResetsAfter;
+        if(!c.firstJobNs)c.firstJobNs=startNs;
+        c.lastJobNs=doneNs;
+    }
     return {true,true};
 }
 #endif

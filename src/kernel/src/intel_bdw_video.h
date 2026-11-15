@@ -299,5 +299,18 @@ public:
 // user-job executor (phase 1c), with the gate on and a self-test passed this
 // boot. This build has no executor, so it is never set.
 inline uint32_t& BdwVideoUserSubmissionStorage(){static uint32_t ready=0;return ready;}
+// VA-API phase 4 tuning for VCS user jobs (`gpu video tune ...`), read by the
+// CPU0 worker for each job.
+//  bit 0 (minimal resets, default on): skip the GDRST before a job when the
+//        previous VCS operation ended in a verified clean stop and VCS is
+//        observed quiescent, and accept a CSB context-complete + quiescent
+//        engine as the stop after a job (GDRST only on failure or hang). The
+//        execlist (re)initialization still resets VCS once per job.
+//  bit 1 (coherent, default on): map ordinary job buffers through the leased
+//        WB LLC PAT without CPU cache flushes before and after the job, as
+//        the RCS coherent-render path does.
+constexpr uint32_t BdwVcsTuneMinimalResets=1u,BdwVcsTuneCoherent=2u;
+inline uint32_t& BdwVideoUserTuningStorage(){static uint32_t tune=BdwVcsTuneMinimalResets|BdwVcsTuneCoherent;return tune;}
+inline uint32_t BdwVideoUserTuning(){return __atomic_load_n(&BdwVideoUserTuningStorage(),__ATOMIC_ACQUIRE);}
 inline bool BdwVideoUserSubmissionReady(){return __atomic_load_n(&BdwVideoUserSubmissionStorage(),__ATOMIC_ACQUIRE)!=0;}
 }

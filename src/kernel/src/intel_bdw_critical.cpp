@@ -66,6 +66,9 @@ template<class Held> static void BdwVcsPmBegin(Held& held){
 // 392). Restore every engine register in BdwVcsEngineRestoreRegs to its value
 // in the first snapshot of the boot, with readback, right after each reset.
 static uint32_t vcsEngineRestores=0,vcsEngineRestoreFailures=0;
+// Phase 4: the last VCS user job ended with VCS verifiably stopped and its
+// lease retired. Any other VCS operation clears it (the next job resets).
+static bool vcsCleanStop=false;
 template<class Rw> static bool BdwVcsRestoreFirmwareEngine(Rw& io){
     const auto& first=vcsPmRecord.first;
     if(!first.valid)return false;
@@ -972,13 +975,25 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             if(!(d&(1u<<19)) || owner.line<16 || owner.line>4096 || (owner.line&(owner.line-1)) ||
                4096%owner.line || !held.tsc(owner.origin)){copyResult->refusalStep=4;return false;}
             if(vcsCopy)BdwVcsPmBegin(held);
-            copyResult->resetBeforeAttempted=true;copyResult->resetBefore=owner.resetBcs();
+            if(vcsCopy)copyResult->stamps[BdwVcsStampWorkStart]=__builtin_ia32_rdtsc();
+            // Phase 4: a user job may skip this GDRST when the previous VCS
+            // user job ended in a verified clean stop and VCS is observed
+            // quiescent now; the execlist init below still resets it.
+            const bool minimalResets=vcsUser && (BdwVideoUserTuning()&BdwVcsTuneMinimalResets);
+            if(minimalResets && vcsCleanStop && owner.quiescent()){
+                copyResult->resetBeforeAttempted=false;copyResult->resetBefore=true;
+            }else{
+                copyResult->resetBeforeAttempted=true;copyResult->resetBefore=owner.resetBcs();
+            }
+            vcsCleanStop=false;
             copyResult->resetUncertain=owner.resetWasUncertain;
+            if(vcsCopy)copyResult->stamps[BdwVcsStampResetBefore]=__builtin_ia32_rdtsc();
             if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsCopy)BdwVcsPmFinish(held,2);return false;}
             BdwPatMmio<CopyOwner> patMmio(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),scanoutCopy);
             BdwPatLease pat;copyResult->patEstablished=pat.Establish(patMmio,0x119,scanoutCopy);
             if(!copyResult->patEstablished){copyResult->patUncertain=pat.State()==BdwPatLeaseState::Quarantined;return false;}
             owner.patActive=true;
+            if(vcsCopy)copyResult->stamps[BdwVcsStampPat]=__builtin_ia32_rdtsc();
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
             if(vcsCopy){
                 // Same takeover, PAT lease, execlist and CSB flow as the BCS
@@ -1013,8 +1028,15 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     held.read32(BdwDellBar0+BdwVcsBase+0x3c,copyResult->control) && held.read32(BdwDellBar0+BdwVcsBase+0x74,copyResult->acthd) &&
                     held.read32(BdwDellBar0+BdwVcsBase+0x64,copyResult->ipeir) && held.read32(BdwDellBar0+BdwVcsBase+0x68,copyResult->ipehr) &&
                     held.read32(BdwDellBar0+BdwVcsBase+0x234,copyResult->execlist);
-                // Stop the owned engine whatever happened, then unbind.
-                copyResult->resetAfter=owner.resetBcs(BdwBcsResetIntent::StopOwnedWork);
+                copyResult->stamps[BdwVcsStampInitStart]=vcs.initStartTicks();copyResult->stamps[BdwVcsStampInitEnd]=vcs.initEndTicks();
+                copyResult->stamps[BdwVcsStampWaitStart]=vcs.waitStartTicks();copyResult->stamps[BdwVcsStampBreadcrumb]=vcs.waitEndTicks();
+                // Stop the owned engine whatever happened, then unbind. Phase 4:
+                // after a CSB context-complete (the context switched out and
+                // the engine went idle) on a quiescent engine, that is the
+                // verified stop; GDRST only for anything else.
+                const bool cleanlyIdle=minimalResets && ran && copyResult->contextComplete && owner.quiescent();
+                copyResult->resetAfterSkipped=cleanlyIdle;
+                copyResult->resetAfter=cleanlyIdle || owner.resetBcs(BdwBcsResetIntent::StopOwnedWork);
                 if(copyResult->resetAfter)copyResult->scanoutRetired=vcsUser?BdwRetirePreparedVcsUser(vcs):BdwRetirePreparedVcsSelftest(vcs);
                 if(copyResult->resetAfter)copyResult->patRestored=pat.Release(patMmio);
                 copyResult->patUncertain=!copyResult->resetAfter || !copyResult->patRestored || !copyResult->scanoutRetired;
@@ -1023,6 +1045,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 // After the PAT lease is released: compare GT PM state with the
                 // pre-test snapshot and restore any changed plain PM control.
                 BdwVcsPmFinish(held,2);
+                copyResult->stamps[BdwVcsStampWorkEnd]=__builtin_ia32_rdtsc();
+                vcsCleanStop=vcsUser && ran && copyResult->resetAfter && copyResult->scanoutRetired &&
+                    copyResult->patRestored && !copyResult->resetUncertain;
                 // The callback's result is the transaction's cleanliness: VCS was
                 // stopped, the PAT restored and the lease unbound. Whether the
                 // self-test itself passed is reported through copyResult (ran ->
@@ -1249,6 +1274,7 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
 }
 #endif
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run) {
+    vcsCleanStop=false;
     run={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,false,nullptr,token,&run,
         nullptr,nullptr,nullptr,nullptr,false,nullptr,true);
 }
@@ -1258,10 +1284,12 @@ void VmmDellVcsUserRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scrat
         nullptr,nullptr,nullptr,nullptr,false,nullptr,false,0,nullptr,true);
 }
 void VmmDellVcsPmOp(uint32_t khz,uint8_t op,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& r) {
+    vcsCleanStop=false;
     r={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,0,0,nullptr,nullptr,nullptr,false,nullptr,0,nullptr,
         nullptr,nullptr,nullptr,nullptr,false,nullptr,false,op,&r);
 }
 void VmmDellVcsReset(uint32_t khz,BdwForcewakeAdapterResult& result,BdwRcsResetTestResult& reset) {
+    vcsCleanStop=false;
     reset={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,0,0,nullptr,nullptr,nullptr,false,nullptr,0,nullptr,
         nullptr,nullptr,nullptr,nullptr,false,&reset);
 }

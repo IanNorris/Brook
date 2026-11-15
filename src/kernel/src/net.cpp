@@ -5931,6 +5931,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     else if(StrStartsWith(cmd,"gpu video")) {
         // VA-API phase 1: VCS0 (video engine) bring-up. Build option
         // BROOK_BDW_VIDEO_ENGINE plus this runtime gate (boot default off).
+        // Phase 4 tuning of VCS user jobs: `gpu video tune resets min|full`,
+        // `gpu video tune coherent on|off` (read by the worker per job).
+        {struct {const char* c;uint32_t bit;bool on;} knobs[]={
+             {"gpu video tune resets min",BdwVcsTuneMinimalResets,true},{"gpu video tune resets full",BdwVcsTuneMinimalResets,false},
+             {"gpu video tune coherent on",BdwVcsTuneCoherent,true},{"gpu video tune coherent off",BdwVcsTuneCoherent,false}};
+         for(const auto& k:knobs)if(NetStrEq(cmd,k.c)){
+             if(k.on)__atomic_or_fetch(&BdwVideoUserTuningStorage(),k.bit,__ATOMIC_ACQ_REL);
+             else __atomic_and_fetch(&BdwVideoUserTuningStorage(),~k.bit,__ATOMIC_ACQ_REL);
+             BridgeReply r;r.text("{");r.field("tune",BdwVideoUserTuning());r.text("}\n");r.send();return;}}
         const bool on=NetStrEq(cmd,"gpu video on"),off=NetStrEq(cmd,"gpu video off");
         const bool probe=NetStrEq(cmd,"gpu video probe"),reset=NetStrEq(cmd,"gpu video reset");
         const bool selftest=NetStrEq(cmd,"gpu video selftest"),status=NetStrEq(cmd,"gpu video status");
@@ -5970,7 +5979,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
              r.text(",");r.field("refused",c.refused);r.text(",");r.field("failed",c.failed);
              r.text(",");r.field("retries",c.retries);r.text(",");r.field("last_us",c.lastUs);r.text(",");r.field("max_us",c.maxUs);
              r.text(",\"quarantined\":");r.text(c.quarantined?"true":"false");
-             r.text(",\"quarantine_detail\":\"");r.text(c.detail);r.text("\"}");}
+             r.text(",\"quarantine_detail\":\"");r.text(c.detail);r.text("\"");
+             r.text(",");r.field("tune",BdwVideoUserTuning());r.text(",");r.field("timed",c.timed);
+             r.text(",");r.field("prep_us",c.prepUs);r.text(",");r.field("run_us",c.runUs);r.text(",");r.field("release_us",c.releaseUs);
+             r.text(",");r.field("reset_before_us",c.resetBeforeUs);r.text(",");r.field("pat_us",c.patUs);
+             r.text(",");r.field("init_us",c.initUs);r.text(",");r.field("decode_us",c.decodeUs);r.text(",");r.field("csb_us",c.csbUs);
+             r.text(",");r.field("tail_us",c.tailUs);r.text(",");r.field("max_run_us",c.maxRunUs);
+             r.text(",");r.field("skipped_resets_before",c.skippedResetsBefore);r.text(",");r.field("skipped_resets_after",c.skippedResetsAfter);
+             r.text(",");r.field("span_ms",c.lastJobNs>c.firstJobNs?(c.lastJobNs-c.firstJobNs)/1000000:0);r.text("}");}
             r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
             r.text(",");r.field("retries",g.retries());
             r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");
