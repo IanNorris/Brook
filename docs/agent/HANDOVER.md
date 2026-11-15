@@ -116,7 +116,7 @@ _Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall f
   - Move the remaining direct user dereferences (VfsRead/VfsWrite on regular files, iovecs, sockopts, WM get_* and GPU submit) to `Copy*User`.
 
 **15 Nov, afternoon (syscall fix pass, merged above):**
-- **Branch head `ea753d08` plus a docs commit.** It has 11 fix commits on top of `7f5638aa`. Each issue's status is in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), under "Fix pass status" and the per-entry **Status** lines.
+- **Branch head `ea753d08` plus a docs commit.** It has 11 fix commits on top of `7f5638aa`. The index and fix-pass summary are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) ("Fix pass status"); each issue's **Status** line is in its chunk file under [refactor-issues/](refactor-issues/) (open) or in [refactor-issues/done.md](refactor-issues/done.md) (fixed).
 - **Fixed:** 23 of the 27 high entries:
   - raw user pointers: input/WM, getdents64, open, inet sockets, the keyboard read at count 0;
   - abstract AF_UNIX names;
@@ -454,7 +454,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Loader F5 wait ignores input on the Dell:** works in QEMU/OVMF. Boot the timing loader (branch `work/boot-timing`), press keys during the wait and read `BOOT_TIMING_DETAIL wait_keys=`; zero suggests ConIn isn't connected on the fast-boot path. See `src/bootloader/src/DOCS.md`.
 
 - **Automatic slot rollback in the guard:** after N consecutive desktop panics on a newly activated generation, select the previous verified slot instead of looping in recovery-only mode. Also expose a slot-select operation in the recovery-only bridge.
-- **Split `src/kernel/src/syscall.cpp`:** done as a pure move and merged to main (`f4b508f8`, 15 Nov). It produced 36 single-responsibility `syscall_*.cpp` files plus internal headers; see [syscall-split-plan.md](syscall-split-plan.md) for the map and old→new line table. The 182 problems found along the way (27 high) are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), which drives the separate fix pass. Not done yet: moving the debug channel and commands out of `net.cpp`, which the issue log describes.
+- **Split `src/kernel/src/syscall.cpp`:** done as a pure move and merged to main (`f4b508f8`, 15 Nov). It produced 36 single-responsibility `syscall_*.cpp` files plus internal headers; see [syscall-split-plan.md](syscall-split-plan.md) for the map and old→new line table. The 182 problems found along the way (27 high) are indexed in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) and split into work chunks under [refactor-issues/](refactor-issues/), which drive the separate fix pass. Not done yet: moving the debug channel and commands out of `net.cpp`, which [refactor-issues/14-single-responsibility-refactors.md](refactor-issues/14-single-responsibility-refactors.md) describes.
 - **Remove or declare the twelve orphaned `tools/netsurf-build/*` gitlinks** (they have no `.gitmodules` entries).
 - **Transparent kernel rendering interfaces,** so console and shell output uses the GPU path.
 

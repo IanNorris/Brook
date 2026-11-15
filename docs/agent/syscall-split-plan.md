@@ -10,7 +10,7 @@ Ian's instruction: "At this point we should aim for just moving code, recording 
 
 - no behaviour changes, no renames, no logic edits and no opportunistic fixes;
 - no syscall numbers, ABI structs, error codes or locking change;
-- anything that looks wrong is recorded in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) for a separate fix pass with tests.
+- anything that looks wrong is recorded in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) (an index of work chunks in [refactor-issues/](refactor-issues/)) for a separate fix pass with tests.
 
 The only edits to moved text are the ones a split forces. Each is listed under "Edits the split requires" below.
 
@@ -450,4 +450,4 @@ The details below are from the original verification on `aac1d429`. They apply u
 
 ## Not done in this pass
 
-The `net.cpp` debug-channel and debug-command move (phase 2) was not started. The proposed pure-move split, and the caveat that `DebugHandleCommand` is one 2,623-line function, are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) under "Single-responsibility candidates".
+The `net.cpp` debug-channel and debug-command move (phase 2) was not started. The proposed pure-move split, and the caveat that `DebugHandleCommand` is one 2,623-line function, are in [refactor-issues/14-single-responsibility-refactors.md](refactor-issues/14-single-responsibility-refactors.md).
