@@ -27,7 +27,8 @@ Contents:
 8. [A pluggable, user-mode chrome architecture](#a-pluggable-user-mode-chrome-architecture)
 9. [Token sheet](#token-sheet)
 10. [Implementation order](#implementation-order) and the [full change list](#native-implementation-in-priority-order)
-11. [Limitations](#limitations) and [Files](#files)
+11. [Ideas backlog](#ideas-backlog): the [side drawer](#side-drawer) concept, not scheduled
+12. [Limitations](#limitations) and [Files](#files)
 
 All figures in the prototype are illustrative: boot times, frame times,
 temperatures, addresses, file listings, the build label and the three
@@ -58,11 +59,15 @@ cached textures, and the user-mode Vulkan renderer composites GPU quads.
   draws the resize bands.
 - **Lab.** Settings › Lab has the four alternative chrome styles, a reactive rim
   light and touch targets.
+- **Side drawer (concept).** Off by default. Settings › Lab › Side drawer, or the
+  Drawer group in the study bar. See [Side drawer](#side-drawer).
 
 URL parameters drive the screenshots: `?shot=1` plus any of `palette`, `mode`,
 `perf`, `opacity`, `blur`, `hud`, `tab`, `focus`, `accent`, `style`, `rim`, `touch`,
 `hits` and `scene` (`boot`, `toasts`, `launcher`, `search`, `organise`, `menu`,
-`drag`, `reorder`, `newcat`, `unsorted`, `empty`, `net`, `vol`, `temp`).
+`drag`, `reorder`, `newcat`, `unsorted`, `empty`, `net`, `vol`, `temp`). The
+drawer concept adds `drawer`, `dedge`, `dapp`, `dstash` and its own scenes,
+listed under [Side drawer](#in-the-prototype).
 
 ## Second-pass changes
 
@@ -939,29 +944,330 @@ corner clipping, or a new blur level.
 
 ## Ideas backlog
 
-Ideas raised after the design was settled. None is mocked yet.
+Ideas raised after the design was settled. Nothing in this section is in the
+implementation order or the change list above.
 
-- **Side drawer** (Ian, 15 Nov). A drawer on one screen edge for social and
-  messaging apps (chat, mail, music and the like). Any window can be stashed
-  there for quick access and recalled without hunting through the taskbar.
-  - **Opening it:** a tab on the edge, a hotkey, or a touchpad edge or
-    three-finger swipe. It slides over the desktop rather than reflowing it,
-    and closes on Escape or a click outside.
-  - **Stashed windows** keep running, but the compositor skips them while the
-    drawer is shut, which costs no GPU time. Each one shows a thumbnail captured
-    at stash time plus a live icon, with an unread or attention badge.
-  - **Recalling one** shows it as a tall panel in the drawer. Pinning it brings
-    it back as a normal window.
-  - **Persistence:** the drawer's apps are saved in `[Drawer]`, alongside the
-    `[Launcher]` section.
-  - **Needed:**
-    - a "stashed" window state in the WM, with a hit table and focus rules;
-    - thumbnail capture, which already exists for the client-layer capture
-      keep;
-    - an attention signal, for example xdg-activation or the urgency hint;
-    - edge gestures from the touchpad path.
-  - **Cost:** moderate. The slide must follow the motion budget above, and the
-    drawer is one more glass surface against the barrier budget.
+### Side drawer
+
+**Status: concept, not scheduled.** Mocked in the prototype and written up
+here so it can be judged. No native work is planned for it.
+
+Ian's idea (15 Nov): “a side drawer for Socials, messaging apps and so on where
+you can stash other windows for quick access.”
+
+To see it, open Settings › Lab › Side drawer, or use the Drawer group in the
+study bar. It is off by default, and with it off the desktop is the settled
+design: `scene=boot` and `scene=launcher` capture pixel-identical with and
+without this change.
+
+![Rail and peek](screenshots/drawer-rail-peek.png)
+
+#### The model
+
+- The drawer holds **entries**, one per app. There are two kinds.
+  - A **resident** lives in the drawer: chat, mail, music, a social feed. It is
+    saved in `[Drawer]`, keeps its entry when it is closed, and starts in the
+    drawer the next time it is launched.
+  - A **guest** is any other window stashed for now. Its entry goes when the
+    window is closed or returned to the desktop.
+  - Residents come first, then a divider, then guests. “Keep in drawer” turns a
+    guest into a resident.
+- A **stashed** window keeps running. It leaves the taskbar and Alt+Tab, and
+  the compositor does not draw it.
+- An entry can be **peeked** (shown beside the drawer, which stays open),
+  **returned to the desktop** (an ordinary window again) or **removed**.
+- The closest precedents are the scratchpad in i3 and sway, which has no
+  visible list or badges, and the side panels in Vivaldi and Opera, which hold
+  web pages only.
+
+#### Three variants
+
+All three are in the prototype and share the model above.
+
+| | A. Rail and peek | B. Card shelf | C. Edge tabs |
+| --- | --- | --- | --- |
+| At rest | A 5 px tab on the edge and a count on the taskbar button | The same | One 16 px tab per app, always on screen |
+| Open | A 64 px icon rail, flush to the edge | A 336 px list of cards, each with a preview line and a thumbnail | The tabs widen to 52 px under the pointer |
+| Choosing an app | It opens beside the rail. The rail stays, so the next app is one click | Its window returns to the desktop where it was. There is no peek | It opens beside the tabs |
+| Reply and go back | Open, pick, type, click away | Open, pick, type, stash again | Pick, type, click away |
+| Glass | One strip, 64×852 | One panel, 336×852: 5.25 times the blurred area | None. Flat fill |
+| Needs from apps | An attention count, or just the urgency hint | The same, plus a text summary to preview | The same as A |
+| Needs from Brook | A stashed state and a docked placement | A stashed state and a thumbnail captured at stash time | The same as A |
+| Weakness | Icons only: you learn which app, not what it says | The widest, the most to build, and every use moves a window in and out | A strip sits over the edge of every window, all the time |
+
+![The three variants](screenshots/drawer-variants.png)
+
+#### Recommendation: A, on the left edge
+
+1. **It fits the job.** The job is to glance, reply and return. With A that is
+   Super+S, a digit, type, and a click away. The window you were in never
+   moves. B turns each reply into taking a window out and putting it back.
+2. **It is the cheapest surface.** One narrow glass strip, no thumbnails and
+   no previews. It works with nothing more than the urgency hint.
+3. **It asks nothing of the screen at rest.** C's tabs cover 16 px of the left
+   edge of every maximised window, 48 px per app, permanently. A's tab is
+   10×112 px in total.
+4. **B's strengths need protocols Brook does not have.** A card is only better
+   than an icon if the app publishes a summary. A static thumbnail of a chat
+   window is mostly stale.
+
+Why the left edge:
+
+- The launcher is at the bottom left, and the drawer and launcher are
+  exclusive. Opening one closes the other, so the drawer's glass replaces the
+  launcher's and never adds to it.
+- The right edge already holds toasts, flyouts and the HUD panel. On a
+  maximised window it is also the Close column and the scrollbar.
+- The left edge of a maximised window is usually a sidebar, with nothing that
+  relies on the edge itself.
+
+Right remains a setting. The drawer button then moves to the bottom-right
+corner, which the hit-target spec left unclaimed, and toasts move inboard of
+the open drawer.
+
+One thing worth taking from C if A is ever built: a flat tooltip naming the app
+and its count when the pointer rests on a rail icon.
+
+The rest of this section describes A.
+
+#### Opening and closing
+
+| Input | Action |
+| --- | --- |
+| Taskbar button, beside the launcher | Toggles the drawer. It carries the total unread count, so it is also the resting indicator. |
+| Edge tab | Click it, or pull it 16 px inward. It turns the accent colour when any entry wants attention. |
+| Super+S | Toggles the drawer and puts focus on the first entry. |
+| 1 to 9, with the drawer open | Peeks that entry. |
+| Touch | Swipe in from the drawer's edge. The swipe starts off-screen, so it needs no target. |
+| Touchpad | Three fingers towards the centre opens; back towards the edge closes. |
+| Esc | Unwinds one level: menu, then peek, then drawer. |
+| Click outside, Super+S, opening the launcher or a flyout | Closes the drawer. |
+
+- There is no scrim. The desktop stays visible and live behind the drawer.
+- Esc reaches the drawer only when the rail has focus. When the peeked app has
+  focus, Esc belongs to the app, and Super+S or a click outside closes.
+- The edge tab is hidden while a window is fullscreen. The key still works.
+
+#### Stashing a window
+
+![Resting state, drag to the edge, title bar menu](screenshots/drawer-rest-stash.png)
+
+- **Drag.** Drag a window by its title bar to the drawer's edge. Within 28 px
+  the edge lights up with a “Stash in drawer” chip. Release to stash. The
+  window later returns to where the drag began.
+- **Menu.** Right-click or long-press the title bar or the task button, then
+  “Stash in drawer”.
+- **Key.** Super+Shift+S stashes the focused window.
+- **Rail.** The + at the foot of the rail stashes the focused window.
+- **Caption button.** Only residents get one, and only while they are out on
+  the desktop: a fourth 48×40 button at the left of the run. Every other
+  window keeps three buttons.
+- **Feedback.** The window fades and moves 10 px towards the edge, like
+  Minimise. The taskbar button and edge tab pulse once. The drawer does not
+  open, because stashing means “out of my way”.
+
+#### Peeking and returning
+
+- A peek is the real window, placed by the window manager beside the rail. It
+  keeps its own width, clamped to 360 to 720 px, and takes the full height of
+  the work area. It keeps that size while stashed, so later peeks do not send a
+  configure.
+- It keeps its normal title bar. The caption run becomes Return to desktop,
+  Hide and Close. There is no Maximise.
+- The peeked window takes keyboard focus, so you can type at once. The app
+  clears its own attention when it is seen.
+- **Return to desktop:** the caption button, the entry menu, Shift+Enter on the
+  entry, Super+Shift+S, or drag the entry off the drawer and drop it where the
+  window should go.
+- A returned resident keeps its entry, marked as out. Clicking that entry
+  focuses the window. A returned guest's entry goes.
+
+#### Reordering and removing
+
+![Entry menu, reorder drag, a resident out on the desktop](screenshots/drawer-manage.png)
+
+- **Reorder:** drag an entry along the rail; a 2 px accent line shows where it
+  will land. Or Alt+↑ and Alt+↓, the same keys as the launcher. Or “Move up” and
+  “Move down” in the menu. Entries stay within their group.
+- **Entry menu** (right-click, long-press, Alt+Enter or the Menu key): Peek or
+  Hide, Return to desktop, Move up, Move down, Keep in drawer or Remove from
+  drawer, Close.
+- **Remove from drawer** (or Delete) drops the entry. If the app is running,
+  its window returns to the desktop as an ordinary window.
+- **Close** closes the app. A resident's entry stays, dimmed.
+- Every drag has a menu path and a keyboard path.
+
+#### States
+
+| Entry state | Shown as |
+| --- | --- |
+| Stashed and running | Icon, with a 3×6 marker on the edge side |
+| Peeked | Pressed pill behind the icon, and the marker grows to 3×24 in the accent |
+| Out on the desktop | Hollow marker, as on a minimised task button |
+| Not running | Icon at 42%, no marker |
+| Attention with a count | Accent badge with the number, capped at 99+ |
+| Attention without a count | 10 px accent dot |
+| Playing | A neutral play badge at the bottom. It is state, not attention, so it never uses the accent |
+| Guest | Below the divider |
+
+| Drawer state | Shown as |
+| --- | --- |
+| Resting | Edge tab in the flat fill; taskbar button with no badge |
+| Resting, attention | Edge tab in the accent; count on the taskbar button |
+| Open | Rail; edge tab hidden; taskbar button pressed |
+| Open with a peek | Rail plus the docked window |
+| Drop target | Accent gradient on the edge with a chip, while a window is dragged near |
+| Empty | The + and a flat hint beside it |
+
+Badges use the accent and its text-on-accent colour from the accent table, so
+they follow all twelve accents in all three modes with contrast already
+checked. `screenshots/drawer-themes.png` shows Opal dark with amber and
+Clearwater light with hot pink on the right edge.
+
+![Dark Opal with amber; Light with hot pink on the right edge](screenshots/drawer-themes.png)
+
+#### Sizes and hit targets
+
+| Part | Pointer | Touch density |
+| --- | --- | --- |
+| Rail | 64 wide, from the top of the screen to the taskbar, flush to the edge | same |
+| Rail entry | 64×56 cell, 52×48 pill, 36 icon | 64×60 |
+| Stash (+) button | 64×52, down to the taskbar | same |
+| Edge tab | 5×72 visual, 10×112 target | not needed: edge swipe |
+| Taskbar button | 52 wide, full bar height | 52 high |
+| Peek caption buttons | 48×40, as on any window | 52×44 |
+| Menu item | 36 | 44 |
+| Card (variant B) | Full 336 width, about 150 high | same |
+| Edge tab (variant C) | 16 at rest, 52×48 under the pointer | 52×52 |
+
+- Entries tile with no gaps and each owns its stretch of the screen edge, so
+  pushing the pointer to the edge always lands on one.
+- The rail and the tab are shell surfaces, tested before any window zone.
+- The tab takes 10×112 px from whatever is under it. On a maximised or
+  left-tiled window that is client edge.
+- The peeked window is flush to the top of the screen, so its caption buttons
+  own y = 0 like a maximised window's.
+
+#### Motion
+
+| What | Motion |
+| --- | --- |
+| Rail opens | Fade plus an 8 px slide from the edge, 140 ms. Closes in 90 ms |
+| Peek appears, hides | The window's fade plus 10 px, 140 ms |
+| Switching the peeked app | A cut. No slide |
+| Stash | Fade plus 10 px towards the edge, 140 ms |
+| Tab hover, variant C widening | 90 ms, flat fill |
+| Attention pulse | 220 ms, twice, on the taskbar button and tab |
+
+- The rail never slides its full width. A blurred surface that moves resamples
+  its backdrop every frame.
+- Nothing animates at rest. The playing badge is static and badges do not
+  bounce.
+- Performance mode and reduced motion remove all of it.
+
+#### GPU cost and the glass budget
+
+- **Stashed means not drawn.** The window is removed from the compositor's quad
+  list and its frame callbacks are withheld, so the client stops rendering, as
+  it would when minimised. Its last buffer is kept so a peek has a frame to
+  show at once.
+- **At rest the drawer costs no glass.** The tab is a flat quad and the count is
+  part of the taskbar's cached texture.
+- **Open, it is one glass surface**, 64×852, against the 16-barrier cap.
+- **A peek adds no shell glass.** It adds the window's own title bar, which the
+  window would have had on the desktop, and one opaque client quad.
+- **Worst case.** The launcher and flyouts close when the drawer opens, so rail
+  plus peek (two barriers) replaces the launcher (one). Toasts can still sit
+  alongside and remain first to fall back to the flat fill.
+- **Flat parts.** Menus, the drop chip, the empty hint and the badges use the
+  flat fill, like the launcher's menus. The drop highlight is one gradient
+  quad.
+- **Variant B** would add 5.25 times the blurred area and a thumbnail per entry
+  in an atlas.
+- **Variant C** would keep a strip in the quad list above every window, always.
+
+#### Native capabilities needed
+
+For variant A. Items marked † are already on the main list for the launcher.
+
+- **A stashed window state** in the window manager: out of the taskbar, Alt+Tab
+  and the quad list, frame callbacks withheld, floating geometry and drawer
+  size remembered.
+- **A docked placement** for the peeked window, with focus rules and a caption
+  part table for Return, Hide and Close. This uses the part-based hit table†.
+- **A drawer shell surface** (rail and tab) and a count on a taskbar button.
+- **A screen-edge drop target** during a window drag.
+- **Pointer capture for drags inside a shell surface**†, with a ghost quad.
+- **A popup menu component**†, also reachable from title bars and task buttons.
+- **An attention signal.** The urgency hint or xdg-activation gives the dot. A
+  count needs an app-side protocol, which Brook does not have yet.
+- **Launch into the drawer:** match a new window's app id against `[Drawer]`
+  before it is first mapped, so a resident never flashes on the desktop.
+- **A `[Drawer]` section** beside `[Launcher]`: the edge and the ordered list
+  of residents. Guests are not saved.
+- **Two global keys**, Super+S and Super+Shift+S.
+- **Edge gestures:** a touch swipe from the bezel and a three-finger touchpad
+  swipe.
+
+Not required for A: thumbnail capture, a text-summary protocol, media
+controls, or any new blur level.
+
+#### Cost
+
+Moderate overall, as an estimate on the same basis as the rest of this
+document.
+
+| Part | Cost |
+| --- | --- |
+| Stashed state, `[Drawer]`, keys, taskbar button and count | Cheap to moderate |
+| Rail surface, docked peek, caption parts | Moderate |
+| Drag to the edge, entry drag, menus | Moderate, and mostly shared with the launcher's drag and menu work |
+| Attention counts | Unknown until a protocol is chosen. The dot is cheap |
+| Edge gestures | Depends on the touchpad path |
+
+If it is ever scheduled it should follow the launcher's menu and drag work,
+because it reuses both.
+
+#### Open questions
+
+- Should Minimise on a resident stash it, so the drawer is simply where those
+  apps go?
+- One entry per app or per window, when an app has two windows?
+- A toast from a stashed app: should clicking it open the peek? I would say
+  yes.
+- Which protocol carries the count?
+- Should the tab hide under touch density, where the edge swipe replaces it?
+
+#### In the prototype
+
+- **Turn it on:** Settings › Lab › Side drawer, or the Drawer group in the
+  study bar. Choose Rail, Cards or Tabs, and Left or Right.
+- **Try:** click the taskbar button or the edge tab; click an entry to peek;
+  press 1 to 4; drag a title bar to the edge; right-click a title bar, task
+  button or entry; drag an entry along the rail, or off it; use the pop-out
+  caption button on a peek. “Message” in the study bar raises attention on
+  Chat.
+- **Keys:** Alt+S stands in for Super+S, because a browser may not receive
+  Super. Alt+Shift+S stashes.
+- **URL:** `drawer=rail`, `cards` or `tabs`; `dedge=left` or `right`;
+  `scene=drawer`, `dpeek`, `dout`, `dmenu`, `dwinmenu`, `dreorder` or `ddrag`;
+  `dapp=chat`, `mail`, `music` or `feed`; `dstash=terminal` (a comma-separated
+  list of windows to stash first).
+- **Self-test:** `index.html?dtest=1` runs 26 checks with real events and
+  writes pass or fail to the tab title: opening, peeking, Esc order, the three
+  ways to stash, reordering by key and by drag, returning, removing, closing,
+  each variant, the right edge and Off. All 26 pass in headless Chromium.
+
+What the prototype does not show:
+
+- Chat, Mail, Music and Feed are invented apps with invented content. They are
+  not in the launcher.
+- Touch and touchpad gestures. Pulling the edge tab stands in for the swipe.
+- Persistence. The drawer's contents reset on reload and when it is turned off.
+- Launching a resident from the launcher, and dragging a peeked window out by
+  its title bar.
+- The browser still lays out stashed windows. It only hides them.
+- With the drawer on the right, the expanded HUD panel sits under it.
 
 ## Limitations
 
@@ -973,6 +1279,8 @@ Ideas raised after the design was settled. None is mocked yet.
   suggestion, search by category, undo back to defaults) and writes pass or fail
   to the tab title. All twelve pass. Nothing was tried by hand in a live browser,
   so feel and timing are unjudged.
+- The side drawer has its own headless self-test, `index.html?dtest=1`, with 26
+  checks. Its gestures, feel and timing are equally unjudged.
 - Window resizing is not interactive; only the zones are drawn.
 - Contrast was judged by eye from the screenshots, not measured.
 - The wallpaper accent is hard-coded for `brook-dawn.png`.
@@ -1007,6 +1315,17 @@ Ideas raised after the design was settled. None is mocked yet.
 | `hud-panel.png` | HUD panel, Settings › Taskbar |
 | `opal-light.png` | Opal light |
 
+The side drawer concept adds five more, all 1600×900, each under 0.75 MB and
+3.1 MB together. Four are strips cropped from several views.
+
+| Screenshot | Shows |
+| --- | --- |
+| `drawer-rail-peek.png` | The recommended variant: rail open, Chat peeked, Terminal stashed as a guest |
+| `drawer-variants.png` | Rail and peek, card shelf and edge tabs side by side |
+| `drawer-rest-stash.png` | Resting state with the edge tab and count; a window dragged to the edge; the title bar menu |
+| `drawer-manage.png` | Entry menu; a reorder drag; a resident out on the desktop with its stash button |
+| `drawer-themes.png` | Opal dark with amber, and Clearwater light with hot pink on the right edge |
+
 ### Regenerating any other view
 
 Every state is reachable from the URL, so captures are cheap to remake. From
@@ -1032,4 +1351,5 @@ Use `--force-device-scale-factor=2` for 3200×1800. Parameters combine with `&`.
 | HUD panel | `hud=expanded` |
 | Hit overlay, touch density | `hits=1`, `touch=1` |
 | Lab styles and rim light | `style=tabs`, `alloy`, `phosphor`, `neon`; `rim=1` |
+| Side drawer (concept) | `scene=dpeek&dstash=terminal`; `scene=drawer&drawer=cards`; `scene=dpeek&drawer=tabs&dapp=mail`; `drawer=rail`; `scene=ddrag`, `dwinmenu`, `dmenu&dapp=mail`, `dreorder`, `dout`; add `dedge=right` |
 | Settings tab, focused window | `tab=appearance`, `taskbar`, `lab`, `about`; `focus=files`, `terminal`, `settings` |

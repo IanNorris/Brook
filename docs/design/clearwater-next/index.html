@@ -553,6 +553,147 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 #hitkey{position:absolute;left:16px;top:16px;z-index:980;padding:10px 12px;border-radius:var(--r-win);background:rgb(8 12 20/.88);color:#e8eef8;font-size:var(--t-cap);line-height:1.7}
 #hitkey i{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
 
+/* ---------- Side drawer (concept, not scheduled; Settings > Lab). See DESIGN.md "Side drawer". ----------
+   Three variants share one model: rail (glass icon rail, app peeks beside it), cards (wide shelf, a card
+   returns its window to the desktop) and tabs (always-visible flat edge tabs). Native: the rail is one
+   glass surface; a stashed window is not composited until it is peeked. */
+#stage{--d-w:64px;--d-used:0px}
+#drawer{position:absolute;top:0;bottom:var(--h-bar);left:0;width:var(--d-w);z-index:891;display:flex;flex-direction:column;border-width:0 1px 0 0;
+  transition:opacity var(--m-base) var(--ease),transform var(--m-base) var(--ease)}
+#drawer.glass{--a:min(1,calc(max(var(--op),var(--a-floor)) + .1))}
+#drawer.shut{opacity:0;transform:translateX(-8px);pointer-events:none;visibility:hidden;transition:opacity var(--m-fast),transform var(--m-fast),visibility 0s var(--m-fast)}   /* 8 px and a fade, never a full-width slide of a blurred surface */
+.d-list{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden auto;scrollbar-width:none}
+.d-it{position:relative;flex:none;width:100%;height:56px;display:grid;place-items:center;color:var(--ink-2);cursor:pointer;touch-action:none}   /* hit area: the whole 64x56 cell, out to the screen edge, no gaps between cells */
+.d-it::before{content:"";position:absolute;inset:4px 6px;border-radius:var(--r-win);transition:background var(--m-fast)}   /* visual pill */
+.d-it:hover::before{background:var(--hover)}
+.d-it:active::before,.d-it.sel::before{background:var(--press)}
+.d-it::after{content:"";position:absolute;left:0;top:50%;width:3px;height:6px;margin-top:-3px;border-radius:0 2px 2px 0;background:var(--ink-3);transition:height var(--m-base) var(--ease),margin var(--m-base) var(--ease)}   /* same grammar as the task pill */
+.d-it.sel::after{height:24px;margin-top:-12px;background:var(--accent)}
+.d-it.out::after{background:none;box-shadow:inset 0 0 0 1px var(--ink-3)}
+.d-it.off::after{display:none}
+.d-it.off .d-ic>:first-child{opacity:.42}
+.d-it.ins-t{box-shadow:inset 0 2px 0 var(--accent)} .d-it.ins-b{box-shadow:inset 0 -2px 0 var(--accent)}
+.d-it:focus-visible{outline-offset:-3px}
+#drawer.dragging .d-it.src{opacity:.35}
+.d-ic{position:relative;width:36px;height:36px;display:grid;flex:none}
+.d-ic>img,.d-ic>.mg{width:100%;height:100%}
+#stage .mg svg.i{width:62%;height:62%}
+.d-bdg{position:absolute;right:-7px;top:-5px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--accent);color:var(--on-accent);font-size:var(--t-cap);font-weight:700;line-height:18px;text-align:center;box-shadow:0 0 0 2px rgb(var(--g-flat))}
+.d-bdg.dot{min-width:10px;width:10px;height:10px;padding:0;right:-3px;top:-3px}
+.d-bdg.st{top:auto;bottom:-5px;background:rgb(var(--g-flat));color:var(--ink);padding:0;width:18px;display:grid;place-items:center;box-shadow:0 0 0 1px var(--rim-out)}   /* state (playing), not attention: never accent */
+#stage .d-bdg svg.i{width:10px;height:10px;stroke-width:2}
+.d-sep{flex:none;height:1px;margin:6px 14px;background:var(--rim-out)}
+.d-add{flex:none;height:52px;display:grid;place-items:center;color:var(--ink-3);border-top:1px solid var(--rim-out)}
+.d-add span{width:36px;height:36px;border-radius:var(--r-win);border:1px dashed var(--ink-3);display:grid;place-items:center;transition:background var(--m-fast)}
+.d-add:hover{color:var(--ink)} .d-add:hover span{background:var(--hover)}
+.d-empty{position:absolute;left:calc(100% + 8px);top:8px;width:236px;padding:10px 12px;border-radius:var(--r-win);background:rgb(var(--g-flat)/.98);border:1px solid var(--rim-out);font-size:var(--t-sm);color:var(--ink-2);white-space:normal}
+/* Resting state: a 5 px tab on the edge. Flat fill, so it costs no backdrop. Hit area 10x112 including the edge column. */
+#d-tab{position:absolute;left:0;top:calc((900px - var(--h-bar))/2 - 56px);width:10px;height:112px;z-index:889;touch-action:none}
+#d-tab::before{content:"";position:absolute;left:0;top:20px;width:5px;height:72px;border-radius:0 4px 4px 0;background:rgb(var(--g-flat)/.97);box-shadow:0 0 0 1px var(--rim-out);transition:width var(--m-fast),background var(--m-fast)}
+#d-tab:hover::before{width:9px}
+#d-tab.att::before{background:var(--accent);box-shadow:0 0 0 1px rgb(var(--g-flat)/.6)}
+#dbtn{width:52px;justify-content:center;padding:0}
+#dbtn .d-bdg{position:absolute;right:2px;top:6px}
+#dbtn .d-bdg.dot{right:10px;top:11px}
+#dbtn.pulse::before,#d-tab.pulse::before{animation:dpulse var(--m-slow) var(--ease) 2}
+@keyframes dpulse{50%{background:color-mix(in srgb,var(--accent) 55%,transparent)}}
+/* Variant: card shelf */
+#drawer[data-v="cards"] .d-hd{flex:none;height:48px;display:flex;align-items:center;gap:var(--sp-2);padding:0 6px 0 var(--sp-4);border-bottom:1px solid var(--rim-out)}
+.d-hd small{flex:1;font-size:var(--t-cap);color:var(--ink-3)}
+#drawer[data-v="cards"] .d-list{padding:5px 0}
+#drawer[data-v="cards"] .d-it{height:auto;display:block;place-items:normal;padding:5px 10px}
+#drawer[data-v="cards"] .d-it::before{inset:5px 10px;background:var(--well);box-shadow:inset 0 0 0 1px var(--rim-out)}
+#drawer[data-v="cards"] .d-it:hover::before{background:var(--hover)}
+.d-card{position:relative;display:grid;grid-template-columns:32px 1fr auto;gap:1px 10px;padding:10px 10px 10px 12px;align-items:center;color:var(--ink)}
+.d-card .d-ic{width:32px;height:32px;grid-row:1/3}
+.d-card b{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-card time{font-size:var(--t-cap);color:var(--ink-3);margin-right:34px}
+.d-card .pv{grid-column:2/4;font-size:var(--t-sm);color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-th{grid-column:1/4;height:76px;margin-top:8px;border-radius:5px;overflow:hidden;position:relative;background:var(--c-bg);box-shadow:0 0 0 1px var(--rim-out)}
+.d-th>.client{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none}
+.d-it .more{position:absolute;right:14px;top:11px;height:36px;z-index:1}
+.d-none{margin:var(--sp-4);padding:var(--sp-5) var(--sp-4);border:1px dashed var(--rim-out);border-radius:var(--r-win);text-align:center;font-size:var(--t-sm);color:var(--ink-3)}
+/* Variant: edge tabs. Always on screen, so flat and narrow: 16 px at rest, 52 px under the pointer. */
+#drawer[data-v="tabs"]{top:calc((900px - var(--h-bar))/2);bottom:auto;transform:translateY(-50%);width:16px;overflow:hidden;border-radius:0 10px 10px 0;
+  background:rgb(var(--g-flat)/.97);border:1px solid var(--rim-out);border-left:0;box-shadow:0 6px 16px rgb(var(--sh)/.35);color:var(--ink);transition:width var(--m-fast) var(--ease)}
+#drawer[data-v="tabs"]:is(:hover,.open,.dragging,:focus-within){width:52px}
+#drawer[data-v="tabs"] .d-it{width:52px;height:48px}
+#drawer[data-v="tabs"] .d-ic{width:28px;height:28px;opacity:0;transition:opacity var(--m-fast)}
+#drawer[data-v="tabs"]:is(:hover,.open,.dragging,:focus-within) .d-ic{opacity:1}
+#drawer[data-v="tabs"] .d-it::after{display:none}
+.d-chip{position:absolute;left:5px;top:10px;width:6px;height:28px;border-radius:3px;transition:opacity var(--m-fast)}
+.d-chip.att::after{content:"";position:absolute;right:-4px;top:-4px;width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 1.5px rgb(var(--g-flat))}
+#drawer[data-v="tabs"]:is(:hover,.open,.dragging,:focus-within) .d-chip{opacity:0}
+#drawer[data-v="tabs"] .d-it.sel::before{box-shadow:inset 3px 0 0 var(--accent)}
+/* Peeked window: the real window, docked beside the drawer at full work-area height. */
+.win.peek{z-index:890!important;border-radius:0;box-shadow:14px 0 32px rgb(var(--sh)/.45)}
+.win.gone.stashed{transform:translateX(-10px);visibility:hidden;transition:opacity var(--m-base) var(--ease),transform var(--m-base) var(--ease),visibility 0s var(--m-base)}   /* hidden, not just transparent: nothing of a stashed window is drawn */
+.caps [data-act="stash"]{display:none}
+#stage:not([data-drawer="off"]) .win.dpin .caps [data-act="stash"],.win.peek .caps [data-act="stash"]{display:grid}
+.win.peek .caps [data-act="max"]{display:none}
+.tb .mg{width:16px;height:16px;flex:none;opacity:.7} .win.active .tb .mg{opacity:1}
+/* Drop zone while a window is dragged to the drawer edge: a gradient quad and a flat chip. */
+#d-drop{position:absolute;left:0;top:0;bottom:var(--h-bar);width:200px;z-index:892;display:flex;align-items:center;pointer-events:none;opacity:0;transition:opacity var(--m-fast);
+  background:linear-gradient(90deg,color-mix(in srgb,var(--accent) 42%,transparent),transparent);border-left:3px solid var(--accent)}
+#d-drop.on{opacity:1}
+#d-drop span{margin-left:14px;display:flex;align-items:center;gap:var(--sp-2);height:32px;padding:0 12px;border-radius:var(--r-sm);background:var(--accent);color:var(--on-accent);font-size:var(--t-sm);font-weight:700;white-space:nowrap}
+#d-menu{z-index:970}
+/* Right edge: mirror everything that touches the edge. */
+#stage[data-dedge="right"] :is(#drawer,#d-tab,#d-drop){left:auto;right:0}
+#stage[data-dedge="right"] #drawer{border-width:0 0 0 1px}
+#stage[data-dedge="right"] #drawer.shut{transform:translateX(8px)}
+#stage[data-dedge="right"] .d-it::after{left:auto;right:0;border-radius:2px 0 0 2px}
+#stage[data-dedge="right"] .d-empty{left:auto;right:calc(100% + 8px)}
+#stage[data-dedge="right"] #d-tab::before{left:auto;right:0;border-radius:4px 0 0 4px}
+#stage[data-dedge="right"] #drawer[data-v="tabs"]{border-radius:10px 0 0 10px;border:1px solid var(--rim-out);border-right:0}
+#stage[data-dedge="right"] #drawer[data-v="tabs"] .d-list{align-items:flex-end}
+#stage[data-dedge="right"] .d-chip{left:auto;right:5px}
+#stage[data-dedge="right"] #drawer[data-v="tabs"] .d-it.sel::before{box-shadow:inset -3px 0 0 var(--accent)}
+#stage[data-dedge="right"] .win.peek{box-shadow:-14px 0 32px rgb(var(--sh)/.45)}
+#stage[data-dedge="right"] .win.gone.stashed{transform:translateX(10px)}
+#stage[data-dedge="right"] #d-drop{background:linear-gradient(270deg,color-mix(in srgb,var(--accent) 42%,transparent),transparent);border-left:0;border-right:3px solid var(--accent);justify-content:flex-end}
+#stage[data-dedge="right"] #d-drop span{margin:0 14px 0 0}
+#stage[data-dedge="right"] .flipx svg{transform:scaleX(-1)}
+#stage[data-dedge="right"] #taskbar{padding-right:0}                                   /* the drawer button owns the bottom-right corner */
+#stage[data-dopen="1"]:not([data-dedge="right"]) #hitkey{left:calc(var(--d-used) + 16px)}
+#stage[data-dedge="right"][data-dopen="1"] #toasts{right:calc(var(--d-used) + 16px)}   /* toasts move inboard of the open drawer */
+#stage[data-touch="1"] #drawer[data-v="rail"] .d-it{height:60px}
+#stage[data-touch="1"] #drawer[data-v="tabs"] .d-it{height:52px}
+/* Illustrative clients for the four drawer apps. Content tokens only, like any other app. */
+.tag{font-weight:400;letter-spacing:.04em;border:1px solid var(--c-line);border-radius:9px;padding:1px 7px;margin-left:6px}
+.x-hd{flex:none;min-height:52px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16px;border-bottom:1px solid var(--c-line);background:var(--c-raise)}
+.x-hd>div{flex:1;min-width:0} .x-hd b{display:block} .x-hd small{display:block;font-size:var(--t-cap);color:var(--c-dim)}
+.x-av{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:var(--h);color:#fff;font-weight:700;flex:none}
+.x-ib{width:36px;height:36px;border-radius:var(--r-sm);display:grid;place-items:center;color:var(--c-dim);flex:none}
+.x-ib:hover{background:var(--c-sink);color:var(--c-ink)}
+.x-body{flex:1;min-height:0;overflow:hidden}
+.x-thread{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;gap:6px;padding:var(--sp-4)}
+.x-day{align-self:center;font-size:var(--t-cap);color:var(--c-dim);margin:4px 0}
+.x-day.new{color:var(--c-accent);font-weight:700}
+.x-msg{margin:0;max-width:80%;padding:8px 12px;border-radius:12px 12px 12px 4px;background:var(--c-raise);border:1px solid var(--c-line);align-self:flex-start;user-select:text}
+.x-msg.me{align-self:flex-end;border-radius:12px 12px 4px 12px;background:var(--c-accent);color:var(--c-on-accent);border-color:transparent}
+.x-msg time{display:block;font-size:var(--t-cap);opacity:.72;margin-top:2px}
+.x-compose{flex:none;display:flex;gap:var(--sp-2);padding:var(--sp-3);border-top:1px solid var(--c-line);background:var(--c-raise)}
+.x-in{flex:1;height:36px;display:flex;align-items:center;padding:0 12px;border-radius:var(--r-sm);background:var(--c-sink);border:1px solid var(--c-line);color:var(--c-dim)}
+.x-row{display:grid;grid-template-columns:8px 1fr auto;gap:1px 10px;padding:10px 16px;border-bottom:1px solid var(--c-line)}
+.x-row:hover{background:var(--c-sink)}
+.x-row i{width:8px;height:8px;border-radius:50%;margin-top:5px;grid-row:1/4}
+.x-row.un i{background:var(--c-accent)} .x-row.un b{font-weight:700}
+.x-row b{font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .x-row time{font-size:var(--t-cap);color:var(--c-dim)}
+.x-row span{grid-column:2/4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .x-row span+span{color:var(--c-dim);font-size:var(--t-sm)}
+.x-now{flex:none;display:flex;flex-direction:column;align-items:center;gap:8px;padding:24px 28px 16px;border-bottom:1px solid var(--c-line)}
+.x-art{width:196px;height:196px;border-radius:var(--r-win);background:url("assets/brook-dawn.png") 30% 60%/520px;box-shadow:0 6px 16px rgb(0 0 0/.25);margin-bottom:6px}
+.x-now b{font-size:var(--t-lead)} .x-now small{color:var(--c-dim)}
+.x-prog{width:100%;height:4px;border-radius:2px;background:var(--c-line);margin-top:6px} .x-prog i{display:block;height:100%;width:38%;border-radius:2px;background:var(--c-accent)}
+.x-times{width:100%;display:flex;justify-content:space-between;font-size:var(--t-cap);color:var(--c-dim)}
+.x-tr{display:flex;gap:var(--sp-3);align-items:center}
+.x-tr button{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;color:var(--c-ink)}
+.x-tr button:hover{background:var(--c-sink)}
+.x-tr .pp,.x-tr .pp:hover{background:var(--c-accent);color:var(--c-on-accent)}
+.x-post{display:grid;grid-template-columns:32px 1fr;gap:2px 10px;padding:12px 16px;border-bottom:1px solid var(--c-line)}
+.x-post .x-av{grid-row:1/4} .x-post b small{font-weight:400;color:var(--c-dim);margin-left:6px} .x-post p{margin:0;user-select:text}
+.x-post footer{display:flex;gap:18px;color:var(--c-dim);font-size:var(--t-sm);margin-top:4px} .x-post footer span{display:flex;gap:5px;align-items:center}
+
 @media (prefers-reduced-motion:reduce){#stage *{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -570,6 +711,9 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
   <button class="one" data-toggle="hits">Hit areas</button>
   <span class="lbl">Show</span>
   <div class="grp"><button data-do="launcher">Launcher</button><button data-do="organise">Organise</button><button data-do="install">Install app</button><button data-do="hud">HUD</button><button data-do="boot">Boot toast</button><button data-do="thermal">Thermal toast</button><button data-do="net">Network toast</button></div>
+  <span class="lbl">Drawer</span>
+  <div class="grp" data-key="drawer"><button data-v="off">Off</button><button data-v="rail">Rail</button><button data-v="cards">Cards</button><button data-v="tabs">Tabs</button></div>
+  <div class="grp"><button data-do="drawer">Open</button><button data-do="dmsg">Message</button></div>
   <span class="sp"></span>
   <button class="one" data-do="reset">Reset</button>
 </div>
@@ -654,6 +798,16 @@ performance_mode=off material_cache_rebuilds=1</span>
         </section>
       </div>
       <div class="set-body" id="set-lab" role="tabpanel" hidden>
+        <section><h3>Side drawer<span class="tag">Concept</span></h3>
+          <div class="radios" data-key="drawer">
+            <button data-v="off"><b>Off</b><small>The settled design, unchanged.</small></button>
+            <button data-v="rail"><b>Rail and peek</b><small>An icon rail on the edge. An app opens beside it. Recommended.</small></button>
+            <button data-v="cards"><b>Card shelf</b><small>A wide list with previews. A card returns its window to the desktop.</small></button>
+            <button data-v="tabs"><b>Edge tabs</b><small>One tab per app, always on the edge. Click to peek.</small></button>
+          </div>
+          <div class="row"><div class="lab">Edge</div><div class="seg" data-key="dedge"><button data-v="left">Left</button><button data-v="right">Right</button></div></div>
+          <span class="hint">Super+S, or Alt+S in a browser, opens the drawer. Super+Shift+S stashes the focused window. Right-click a title bar or task button, or drag a window to the drawer's edge.</span>
+        </section>
         <section><h3>Chrome style</h3>
           <div class="radios" data-key="style">
             <button data-v="glass"><b>Glass</b><small>Clearwater as designed.</small></button>
@@ -682,6 +836,13 @@ performance_mode=off material_cache_rebuilds=1</span>
 
   <div id="toasts" aria-live="polite"></div>
   <div id="hitkey" hidden><i style="background:rgb(255 0 200/.6)"></i>Click target<br><i style="border:1px dashed rgb(255 196 0)"></i>Titlebar drag<br><i style="background:rgb(0 220 255/.9)"></i>Resize, 2 px inside the frame<br><i style="background:rgb(0 220 255/.38)"></i>Resize, 6 px outside the frame</div>
+
+  <!-- Side drawer (concept). The demo app windows are generated in the script. -->
+  <button id="d-tab" aria-label="Open drawer" title="Drawer (Super+S)" hidden></button>
+  <aside id="drawer" aria-label="Drawer" hidden></aside>
+  <div id="d-drop" aria-hidden="true"><span class="flipx"><i data-i="stash"></i>Stash in drawer</span></div>
+  <div class="menu" id="d-menu" role="menu" hidden></div>
+  <div class="sr" id="d-live" aria-live="polite"></div>
 
   <!-- Launcher -->
   <section class="panel glass shut" id="launcher" aria-label="Launcher">
@@ -727,6 +888,7 @@ performance_mode=off material_cache_rebuilds=1</span>
   <!-- Taskbar -->
   <footer class="glass" id="taskbar">
     <button class="tk" id="start" aria-label="Launcher" aria-expanded="false"><img src="assets/brook-mark.png" alt=""></button>
+    <button class="tk flipx" id="dbtn" aria-label="Drawer" aria-expanded="false" title="Drawer (Super+S)" hidden></button>
     <span class="vsep"></span>
     <div id="tasks"></div>
     <span class="grow"></span>
@@ -776,14 +938,20 @@ const ICON = {
   music:'<path d="M6 11.5V4l6-1.500V10"/><circle cx="4.5" cy="11.5" r="1.5"/><circle cx="10.5" cy="10" r="1.5"/>', tool:'<path d="M3 13l5.500-5.500M9 3.500a3 3 0 0 0 3.500 3.500l-1.500-1.500 1-2z"/>',
   inbox:'<path d="m2.5 9 1.800-5h7.400l1.800 5v3.500h-11zm0 0h3.200l.8 1.500h3l.8-1.500h3.200"/>', pin:'<path d="M6 2.500h4l-.5 4 2 2.500h-7l2-2.500zM8 9v4.500"/>',
   undo:'<path d="M5 4 2.500 6.500 5 9M2.500 6.500h7a3.500 3.500 0 0 1 0 7H7"/>', trash:'<path d="M3.500 4.500h9m-6 0V3h3v1.500m-5 0 .6 8.500h5.800l.6-8.500"/>',
-  ret:'<path d="M12 4v4.5a1 1 0 0 1-1 1H4.5m0 0 2.2-2.2M4.5 9.5l2.2 2.2"/>'
+  ret:'<path d="M12 4v4.5a1 1 0 0 1-1 1H4.5m0 0 2.2-2.2M4.5 9.5l2.2 2.2"/>',
+  chat:'<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h7A1.5 1.5 0 0 1 13 4.5V9a1.5 1.5 0 0 1-1.5 1.5H7.5l-3 2.5v-2.5A1.5 1.5 0 0 1 3 9z"/>',
+  mail:'<rect x="2.5" y="4" width="11" height="8.5" rx="1.5"/><path d="m3.2 5.2 4.8 3.8 4.8-3.8"/>',
+  feed:'<circle cx="4.3" cy="11.7" r=".9"/><path d="M3.5 7.5a5 5 0 0 1 5 5M3.5 3.5a9 9 0 0 1 9 9"/>',
+  drawer:'<rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6.5 3v10"/>',
+  stash:'<path d="M3 3v10M13.5 8h-7m0 0L9 5.5M6.5 8 9 10.5"/>', popout:'<path d="M3 3v10M6.5 8h7m0 0L11 5.5M13.5 8 11 10.5"/>',
+  prev:'<path d="M11.5 4v8l-6-4zM4.5 4v8"/>', next:'<path d="M4.5 4v8l6-4zM11.5 4v8"/>', pause:'<path d="M5.5 4v8m5-8v8"/>'
 };
 const ic = n => `<svg class="i" viewBox="0 0 16 16" aria-hidden="true">${ICON[n]}</svg>`;
 $$('i[data-i]').forEach(e => e.outerHTML = ic(e.dataset.i));
 
 /* ---------- State (what native Settings persists in [Desktop]) ---------- */
 const DEF = {palette:'clearwater', mode:'mixed', opacity:80, blur:'light', perf:false, scale:'200', hud:'compact', build:true, temp:true, h24:true, date:true, labels:true,
-  accent:'auto', style:'glass', rim:false, touch:false, hits:false};
+  accent:'auto', style:'glass', rim:false, touch:false, hits:false, drawer:'off', dedge:'left'};
 const BLUR = {none:'0px', light:'3px', moderate:'9px', heavy:'18px'};   // roughly x3 then x2: each step reads as a different material
 const KEY = 'brook.clearwater-next.v3';
 const ACCENTS = {"blue": "Clearwater blue", "teal": "Teal", "pine": "Pine green", "phosphor": "Phosphor", "lime": "Lime", "amber": "Amber", "orange": "Orange", "red": "Red", "pink": "Hot pink", "violet": "Violet", "slate": "Slate", "wallpaper": "Wallpaper (dawn)"};
@@ -822,7 +990,7 @@ function apply() {
   const dirty = JSON.stringify(S) !== JSON.stringify(saved);
   $('#set-foot').classList.toggle('dirty', dirty); $('#set-state').textContent = dirty ? 'Previewing changes' : 'Saved';
   $('#apply').disabled = $('#revert').disabled = !dirty;
-  tick(); drawHud();
+  tick(); drawHud(); drawerApply();
 }
 const set = (k, v) => { S[k] = v; apply(); };
 document.addEventListener('click', e => {
@@ -850,16 +1018,60 @@ const APPS = [
 // Not installed at first. 'Install app' in the study bar adds them to Unsorted. hint = the category the package declares.
 const EXTRA = [['inkscape','Inkscape','Vector drawing','graphics'], ['audacity','Audacity','Record and edit audio','media'], ['htop','htop','Process viewer','system']].map(([id, name, desc, hint]) => ({id, name, desc, hint}));
 const HUES = ['#3f7fd6','#2f9b93','#7a6cd0','#c2793a','#b7506a','#5a8f4a'];
-const iconOf = a => a.icon ? `<img src="assets/icons/${a.icon}.svg" alt="">`
+const iconOf = a => a.icon ? `<img src="assets/icons/${a.icon}.svg" alt="">` : a.glyph ? `<span class="mg" style="background:${a.hue}">${ic(a.glyph)}</span>`
   : `<span class="mg" style="background:${HUES[[...a.id].reduce((n, c) => n + c.charCodeAt(0), 0) % HUES.length]}">${a.name[0]}</span>`;
-const byId = id => APPS.find(a => a.id === id) || EXTRA.find(a => a.id === id);
+const byId = id => APPS.find(a => a.id === id) || EXTRA.find(a => a.id === id) || DAPPS.find(a => a.id === id);
 let recent = ['files','settings','terminal','firefox','quake'];
+
+/* ---------- Side drawer, part 1: the four illustrative residents and the drawer's state ----------
+   Kept out of APPS so the launcher's lists and its self-test stay as they were. All names and text are invented. */
+const DAPPS = [['chat','Chat','Mira Okafor - Chat','#2f9b93'], ['mail','Mail','Inbox - Mail','#3f7fd6'], ['music','Music','Music','#b7506a'], ['feed','Feed','Home - Feed','#7a6cd0']]
+  .map(([id, name, title, hue]) => ({id, name, title, hue, glyph:id}));
+const xrow = (un, from, time, subj, snip) => `<div class="x-row${un ? ' un' : ''}"><i></i><b>${from}</b><time class="num">${time}</time><span>${subj}</span><span>${snip}</span></div>`;
+const xpost = (h, who, at, when, text, r, b, f) => `<div class="x-post"><span class="x-av" style="--h:${h}">${who[0]}</span><b>${who}<small>${at} · ${when}</small></b><p>${text}</p><footer><span>${ic('ret')}${r}</span><span>${ic('restart')}${b}</span><span>${ic('star')}${f}</span></footer></div>`;
+const DX = {
+  chat:`<div class="x-hd"><span class="x-av" style="--h:#c2793a">M</span><div><b>Mira Okafor</b><small>Active now</small></div><button class="x-ib" aria-label="Search">${ic('search')}</button><button class="x-ib" aria-label="More">${ic('more')}</button></div>
+    <div class="x-thread"><div class="x-day">Today</div>
+      <p class="x-msg">Morning! Did the Dell hit 60 last night?<time class="num">09:12</time></p>
+      <p class="x-msg me">Close. 58 to 60 with the glass on, steady 60 in Performance mode.<time class="num">09:20</time></p>
+      <p class="x-msg">That is better than I expected for the blur.<time class="num">09:21</time></p>
+      <div class="x-day new">3 new</div>
+      <p class="x-msg">Pushed a fix for the chrome atlas upload.<time class="num">10:36</time></p>
+      <p class="x-msg">It should stop the repaint while dragging.<time class="num">10:37</time></p>
+      <p class="x-msg">Are we still on for the build review at 3?<time class="num">10:39</time></p></div>
+    <div class="x-compose"><span class="x-in">Message Mira</span><button class="c-btn primary">Send</button></div>`,
+  mail:`<div class="x-hd"><div><b>Inbox</b><small>12 unread</small></div><button class="x-ib" aria-label="Search">${ic('search')}</button><button class="c-btn primary">Compose</button></div>
+    <div class="x-body">${[[1,'Build bot','10:12','Nightly 3a4b909e passed','All 214 tests green. Boot to desktop in 8.12 s.'], [1,'Priya Raman','09:47','Re: Touchpad edge gestures','Three fingers sideways works, but the threshold feels'],
+      [1,'Tomasz Lind','09:30','Wallpaper candidates','Six more from the river walk. The dawn one is still my'], [1,'brook-dev','08:55','[brook-dev] Hit-test conformance table','Draft attached. It covers the top-right pixel in all'],
+      [0,'Mira Okafor','Sat','Review notes','Thanks for the write-up. Two small things on the rim'], [0,'Build bot','Sat','Nightly 29117654 passed','All 212 tests green.'],
+      [0,'Priya Raman','Fri','Panel calibration','The 200% scale looks right on mine. I measured the'], [0,'Hana Sato','Fri','Icons, second pass','The 16 px grid is holding up. I redrew the folder and'],
+      [0,'brook-dev','Thu','[brook-dev] Opal dark, greener','Moved the glass from teal to pine. Screenshots in the'], [0,'Tomasz Lind','Thu','Lunch?','There is a new place by the weir.']].map(r => xrow(...r)).join('')}</div>`,
+  music:`<div class="x-now"><div class="x-art"></div><b>Low Tide</b><small>Harbour Lights · Slow Water</small><div class="x-prog"><i></i></div><div class="x-times num"><span>1:42</span><span>4:27</span></div>
+      <div class="x-tr"><button aria-label="Previous">${ic('prev')}</button><button class="pp" aria-label="Pause">${ic('pause')}</button><button aria-label="Next">${ic('next')}</button></div></div>
+    <div class="x-body">${[['Up next','','Millrace','Harbour Lights · 3:58'], ['','','Stepping Stones','Harbour Lights · 5:10'], ['','','Heron','Ada Winter · 2:49'], ['','','Morning on the Brook','Ada Winter · 6:02'], ['','','Weir','Slow Water Ensemble · 4:15']].map((r, i) => xrow(0, r[2], i ? '' : 'Up next', r[3], '')).join('')}</div>`,
+  feed:`<div class="x-hd"><div><b>Home</b><small>New activity</small></div><button class="x-ib" aria-label="Search">${ic('search')}</button><button class="c-btn primary">Post</button></div>
+    <div class="x-body">${xpost('#5a8f4a','Tomasz Lind','@tomasz','12 min','Boosted: a hobby OS that boots to a glass desktop in eight seconds. The taskbar graphs are a nice touch.',4,18,52) +
+      xpost('#c2793a','Mira Okafor','@mira','40 min','Edge-to-edge caption buttons are the kind of detail you stop noticing after a day, which is the point.',2,6,31) +
+      xpost('#3f7fd6','Hana Sato','@hana','1 h','One icon grid, one stroke weight. Everything else is negotiable.',7,22,90) +
+      xpost('#7a6cd0','Priya Raman','@priya','2 h','Measured the panel again. 3200 by 1800 at 200% is exactly as sharp as it sounds.',1,3,17) +
+      xpost('#b7506a','Ada Winter','@ada','3 h','New record out today: six tracks named after parts of a river.',9,41,120) +
+      xpost('#2f9b93','brook-dev','@brookdev','5 h','Opal dark is now pine green. Teal lives on as an accent.',3,9,44)}</div>`
+};
+// Attention and preview data. Native: n and dot come from the app's attention signal; pv needs the app to publish a summary.
+const DMETA = {chat:{n:3, pv:'Mira: Are we still on for the build review at 3?', t:'10:39'}, mail:{n:12, pv:'Build bot: Nightly 3a4b909e passed', t:'10:12'},
+  music:{play:true, pv:'Low Tide · Harbour Lights', t:'1:42'}, feed:{dot:true, pv:'Tomasz boosted your post', t:'09:58'}};
+// pin: lives in the drawer and is saved in [Drawer]. Without it the entry is a guest: a window stashed for now.
+const DR = {open:false, peek:null, kb:null, menuId:null, items:DAPPS.map(a => ({id:a.id, pin:true}))};
+DAPPS.forEach((a, i) => $('#w-settings').insertAdjacentHTML('afterend', `<section class="win gone" id="w-${a.id}" data-app="${a.id}" style="left:${330 + i * 46}px;top:${96 + i * 28}px;width:420px;height:640px" aria-label="${a.name} window">
+  <header class="tb">${iconOf(a)}<span class="title">${a.title}</span><div class="caps">${[['min','Minimise',''], ['max','Maximise',''], ['close','Close',' class="x"']].map(c => `<button data-act="${c[0]}"${c[2]} aria-label="${c[1]}"><span>${ic(c[0])}</span></button>`).join('')}</div></header>
+  <div class="client">${DX[a.id]}</div></section>`));
 
 /* ---------- Windows ---------- */
 const WIN = {files:{z:1}, terminal:{z:2}, settings:{z:3}};
+DAPPS.forEach(a => WIN[a.id] = {z:0, stash:true});                   // the residents start stashed
 let zTop = 3;
 const wEl = id => $('#w-' + id);
-const visible = id => WIN[id] && !WIN[id].closed && !WIN[id].min;
+const visible = id => WIN[id] && !WIN[id].closed && !WIN[id].min && (!WIN[id].stash || DR.peek === id);   // a stashed window is drawn only while it is peeked
 function focusWin(id) {
   if (id && visible(id)) { WIN[id].z = ++zTop; wEl(id).style.zIndex = WIN[id].z; }
   const top = Object.keys(WIN).filter(visible).sort((a, b) => WIN[b].z - WIN[a].z)[0];
@@ -870,32 +1082,36 @@ function setGone(id) { wEl(id).classList.toggle('gone', !visible(id)); }
 function openWin(id) { WIN[id].closed = WIN[id].min = false; setGone(id); focusWin(id); }
 function winAct(id, act) {
   const w = WIN[id];
+  if (drawerAct(id, act)) return;
   if (act === 'min') w.min = true; else if (act === 'close') w.closed = true;
   else if (act === 'max') { w.max = !w.max; wEl(id).classList.toggle('max', w.max); $('[data-act=max] span', wEl(id)).innerHTML = ic(w.max ? 'restore' : 'max'); wpos(wEl(id)); return focusWin(id); }
-  setGone(id); focusWin();
+  setGone(id); focusWin(); renderDrawer();
 }
 function renderTasks() {
-  $('#tasks').innerHTML = Object.keys(WIN).filter(k => !WIN[k].closed).map(k => { const a = byId(k), act = wEl(k).classList.contains('active');
+  $('#tasks').innerHTML = Object.keys(WIN).filter(k => !WIN[k].closed && !WIN[k].stash).map(k => { const a = byId(k), act = wEl(k).classList.contains('active');
     return `<button class="tk task${act ? ' active' : ''}${WIN[k].min ? ' min' : ''}" data-task="${k}" title="${a.name}" aria-pressed="${act}">${iconOf(a)}<span class="t">${a.name}</span></button>`; }).join('');
 }
+$('#tasks').addEventListener('contextmenu', e => { const b = e.target.closest('[data-task]'); if (!b || !dOn()) return; e.preventDefault(); winMenu(b.dataset.task, e); });
 $('#tasks').addEventListener('click', e => { const b = e.target.closest('[data-task]'); if (!b) return; const id = b.dataset.task;
   if (WIN[id].min) openWin(id); else if (wEl(id).classList.contains('active')) winAct(id, 'min'); else focusWin(id); });
 const scale = () => stage.getBoundingClientRect().width / 1600;
 const wpos = w => { w.style.setProperty('--wx', -w.offsetLeft + 'px'); w.style.setProperty('--wy', -w.offsetTop + 'px'); };   // screen position, for the rim and alloy highlight
 $$('.win').forEach(w => {
   const id = w.dataset.app; w.style.zIndex = WIN[id].z; wpos(w);
-  const tl = document.createElement('span'); tl.className = 'tl'; tl.append($('.tb img', w), $('.tb .title', w)); $('.tb', w).prepend(tl);
+  const tl = document.createElement('span'); tl.className = 'tl'; tl.append($('.tb img,.tb .mg', w), $('.tb .title', w)); $('.tb', w).prepend(tl);
+  $('.caps', w).insertAdjacentHTML('afterbegin', `<button data-act="stash" class="flipx" aria-label="Stash in drawer" title="Stash in drawer"><span>${ic('stash')}</span></button>`);   // shown only on drawer apps; see drawerSync
   w.addEventListener('pointerdown', () => focusWin(id), true);
   $$('[data-act]', w).forEach(b => b.onclick = e => { e.stopPropagation(); winAct(id, b.dataset.act); });
   const tb = $('.tb', w);
   tb.ondblclick = e => { if (!e.target.closest('button')) winAct(id, 'max'); };
-  tb.onpointerdown = e => { if (e.target.closest('button') || WIN[id].max) return; dragEl(e, w, 36 - w.offsetWidth, 1564, 0, 820); };
+  tb.onpointerdown = e => { if (e.button || e.target.closest('button') || WIN[id].max || DR.peek === id) return; dragEl(e, w, 36 - w.offsetWidth, 1564, 0, 820, dOn() && stashDrag(id)); };
+  tb.oncontextmenu = e => { if (!dOn() || e.target.closest('button')) return; e.preventDefault(); DR.peek === id ? entryMenu(id, null, e) : winMenu(id, e); };
 });
-function dragEl(e, el, x0, x1, y0, y1) {
+function dragEl(e, el, x0, x1, y0, y1, hook) {
   const s = scale(), ox = e.clientX / s - el.offsetLeft, oy = e.clientY / s - el.offsetTop;
-  e.currentTarget.setPointerCapture(e.pointerId);
-  const mv = m => { el.style.left = Math.max(x0, Math.min(x1, m.clientX / s - ox)) + 'px'; el.style.top = Math.max(y0, Math.min(y1, m.clientY / s - oy)) + 'px'; el.style.right = el.style.bottom = 'auto'; if (el.classList.contains('win')) wpos(el); };
-  const up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}   // synthetic events in the self-tests have no live pointer
+  const mv = m => { el.style.left = Math.max(x0, Math.min(x1, m.clientX / s - ox)) + 'px'; el.style.top = Math.max(y0, Math.min(y1, m.clientY / s - oy)) + 'px'; el.style.right = el.style.bottom = 'auto'; if (el.classList.contains('win')) wpos(el); hook && hook.mv(m); };
+  const up = m => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); hook && hook.up(m); };
   addEventListener('pointermove', mv); addEventListener('pointerup', up);
 }
 $('#hud header').onpointerdown = e => { if (!e.target.closest('button')) dragEl(e, $('#hud'), 0, 1252, 0, 600); };
@@ -903,7 +1119,7 @@ $('#hud header').onpointerdown = e => { if (!e.target.closest('button')) dragEl(
 function launch(id) {
   const a = byId(id); recent = [id, ...recent.filter(r => r !== id)].slice(0, 5);
   closePanels();
-  if (WIN[id]) openWin(id); else toast({icon:'info', title:a.name, body:'Not part of this prototype. Files, Terminal and Settings open real windows.'});
+  if (WIN[id] && WIN[id].stash && dOn()) dPick(id); else if (WIN[id]) openWin(id); else toast({icon:'info', title:a.name, body:'Not part of this prototype. Files, Terminal and Settings open real windows.'});
 }
 
 /* ---------- Files rows ---------- */
@@ -1209,6 +1425,7 @@ function stageDrag(ids, pick) {                                         // freez
 function closePanels(except) {
   $$('.fly').forEach(f => f !== except && f.classList.add('shut')); $$('[data-fly]').forEach(b => b.classList.toggle('on', !!except && except.id === 'fly-' + b.dataset.fly));
   if (except !== L) { L.classList.add('shut'); $('#start').classList.remove('on'); closeMenus(); }
+  if (except !== DRW) shutDrawer();
 }
 function fly(name) {
   const f = $('#fly-' + name), open = f.classList.contains('shut'); closePanels(open ? f : null);
@@ -1218,7 +1435,7 @@ function fly(name) {
   f.style.right = Math.max(8, 1600 - mid - 152) + 'px'; f.classList.remove('shut');
 }
 $$('[data-fly]').forEach(b => b.onclick = e => { e.stopPropagation(); fly(b.dataset.fly); });
-stage.addEventListener('pointerdown', e => { if (!e.target.closest('.panel:not(#hud),#taskbar')) closePanels(); });
+stage.addEventListener('pointerdown', e => { if (!e.target.closest('.panel:not(#hud),#taskbar,#drawer,#d-tab,#d-menu,.win.peek')) closePanels(); });
 let vol = 62, muted = false;
 function drawVol() {
   const v = $('#vol'); v.value = vol; v.style.setProperty('--pct', vol + '%'); $('#volv').textContent = muted ? 'Off' : vol;
@@ -1303,20 +1520,241 @@ function tick() {
 }
 if (!SHOT) setInterval(tick, 15000);
 
+/* ---------- Side drawer, part 2 (concept, not scheduled; see DESIGN.md "Side drawer") ----------
+   One model, three presentations. An entry is pinned (it lives in the drawer) or a guest (a window stashed for now).
+   A stashed window is hidden and, natively, dropped from the compositor's quad list until it is peeked. */
+const DRW = $('#drawer'), dOn = () => S.drawer !== 'off', dItem = id => DR.items.find(i => i.id === id), isDemo = id => DAPPS.some(a => a.id === id);
+const railW = () => ({rail:64, cards:336, tabs:52}[S.drawer] || 0);
+const stagePt = (cx, cy) => { const s = scale(), r = stage.getBoundingClientRect(); return [(cx - r.left) / s, (cy - r.top) / s]; };
+const dState = id => WIN[id].closed ? 'off' : !WIN[id].stash ? 'out' : DR.peek === id ? 'sel' : '';
+const dMeta = id => DMETA[id] || {pv:$('.title', wEl(id)).textContent + ' window', t:'Stashed'};
+const topDesk = () => Object.keys(WIN).filter(k => visible(k) && !WIN[k].stash).sort((a, b) => WIN[b].z - WIN[a].z)[0];
+const say = t => $('#d-live').textContent = t;
+function pulse() { [$('#dbtn'), $('#d-tab')].forEach(b => { b.classList.remove('pulse'); void b.offsetWidth; b.classList.add('pulse'); }); }
+function closeDMenu() { $('#d-menu').hidden = true; }
+
+function renderDrawer() {
+  const v = S.drawer, on = dOn(), had = DRW.contains(document.activeElement), btn = $('#dbtn'), tabv = $('#d-tab'), right = S.dedge === 'right';
+  Object.assign(stage.dataset, {drawer:v, dedge:S.dedge, dopen:DR.open ? '1' : '0'}); stage.style.setProperty('--d-w', railW() + 'px');
+  const n = DR.items.reduce((s, i) => s + (DMETA[i.id]?.n || 0), 0), att = n || DR.items.some(i => DMETA[i.id]?.dot);
+  btn.hidden = !on; btn.innerHTML = ic('drawer') + (n ? `<b class="d-bdg num">${n > 99 ? '99+' : n}</b>` : att ? '<b class="d-bdg dot"></b>' : '');
+  btn.classList.toggle('on', DR.open); btn.setAttribute('aria-expanded', DR.open); btn.setAttribute('aria-label', 'Drawer' + (n ? `, ${n} unread` : ''));
+  if (on && right && btn.nextElementSibling) $('#taskbar').append(btn); else if (!(on && right) && btn.previousElementSibling !== $('#start')) $('#start').after(btn);   // left: beside the launcher. Right: the bottom-right corner.
+  tabv.hidden = !on || v === 'tabs' || DR.open; tabv.classList.toggle('att', !!att);
+  DRW.hidden = !on || (v === 'tabs' && !DR.items.length); if (!on) return;
+  DRW.dataset.v = v; DRW.className = (v === 'tabs' ? '' : 'glass') + (v !== 'tabs' && !DR.open ? ' shut' : '') + (DR.open ? ' open' : '');
+  const cell = it => {
+    const id = it.id, a = byId(id), m = dMeta(id), st = dState(id);
+    const bdg = m.n ? `<b class="d-bdg num">${m.n > 99 ? '99+' : m.n}</b>` : m.dot ? '<b class="d-bdg dot"></b>' : m.play && st !== 'off' ? `<b class="d-bdg st">${ic('play')}</b>` : '';
+    const label = a.name + (m.n ? `, ${m.n} unread` : m.dot ? ', new activity' : '') + ({off:', not running', out:', on the desktop', sel:', showing'}[st] || '') + (it.pin ? '' : ', stashed for now');
+    const icn = `<span class="d-ic">${iconOf(a)}${bdg}</span>`;
+    if (v === 'cards') return `<div class="d-it ${st}" role="button" tabindex="0" data-d="${id}" aria-label="${label}"><span class="d-card">${icn}<b>${a.name}</b><time class="num">${st === 'off' ? 'Not running' : st === 'out' ? 'On the desktop' : m.t}</time>` +
+      `<span class="pv">${esc(m.pv)}</span>${st ? '' : `<div class="d-th" data-th="${id}" inert></div>`}</span><button class="more" data-dmore="${id}" aria-label="More for ${a.name}">${ic('more')}</button></div>`;
+    return `<button class="d-it ${st}" data-d="${id}" title="${label}" aria-label="${label}">${v === 'tabs' ? `<i class="d-chip${m.n || m.dot ? ' att' : ''}" style="background:${a.hue || '#a9b8cc'}"></i>` : ''}${icn}</button>`;
+  };
+  const pins = DR.items.filter(i => i.pin), guests = DR.items.filter(i => !i.pin);
+  const list = pins.map(cell).join('') + (pins.length && guests.length ? '<i class="d-sep"></i>' : '') + guests.map(cell).join('');
+  const add = `<button class="${v === 'cards' ? 'ibtn' : 'd-add'} flipx" data-dadd aria-label="Stash the focused window" title="Stash the focused window (Super+Shift+S)">${v === 'cards' ? ic('stash') : `<span>${ic('plus')}</span>`}</button>`;
+  const none = 'Nothing stashed. Drag a window to this edge, right-click its title bar, or press Super+Shift+S.';
+  DRW.innerHTML = v === 'cards'
+    ? `<header class="d-hd"><span class="eyebrow">Drawer</span><small>${DR.items.length} ${DR.items.length === 1 ? 'app' : 'apps'}${n ? ` · ${n} unread` : ''}</small>${add}<button class="ibtn" data-dclose aria-label="Close drawer">${ic('close')}</button></header><div class="d-list">${list || `<div class="d-none">${none}</div>`}</div>`
+    : `<div class="d-list" role="group" aria-label="Stashed apps">${list}</div>` + (v === 'rail' ? add + (list ? '' : `<div class="d-empty">${none}</div>`) : '');
+  // Card thumbnails: a static copy, as captured at stash time. Never live.
+  $$('.d-th', DRW).forEach(th => { const el = wEl(th.dataset.th), c = $('.client', el).cloneNode(true), w = el.offsetWidth; $$('[id]', c).forEach(e => e.removeAttribute('id'));
+    Object.assign(c.style, {width:w + 'px', height:el.offsetHeight - 40 + 'px', transform:`scale(${th.clientWidth / w})`}); th.append(c); });
+  if (had && DR.kb && !SHOT) $(`.d-it[data-d="${DR.kb}"]`, DRW)?.focus();
+}
+// A peek docks the real window beside the drawer: its own width (360 to 720), the full work-area height. Its floating geometry is kept for the return.
+function dock(id) {
+  const w = WIN[id], el = wEl(id); if (!w.geo) w.geo = ['left','top','width','height'].map(k => el.style[k]);
+  const wd = Math.max(360, Math.min(720, parseFloat(w.geo[2])));
+  Object.assign(el.style, {left:(S.dedge === 'right' ? 1600 - railW() - wd : railW()) + 'px', top:'0px', width:wd + 'px', height:'calc(900px - var(--h-bar))'}); wpos(el);
+}
+function undock(id) { const w = WIN[id], el = wEl(id); if (!w.geo) return; ['left','top','width','height'].forEach((k, i) => el.style[k] = w.geo[i]); w.geo = null; wpos(el); }
+function drawerSync() {
+  for (const id in WIN) { const el = wEl(id), pk = DR.peek === id, b = $('[data-act=stash]', el);
+    el.classList.toggle('peek', pk); el.classList.toggle('stashed', !!WIN[id].stash && !pk); el.classList.toggle('dpin', !!dItem(id) && !WIN[id].stash);
+    $('span', b).innerHTML = ic(pk ? 'popout' : 'stash'); b.title = pk ? 'Return to desktop' : 'Stash in drawer'; b.setAttribute('aria-label', b.title); setGone(id); }
+  stage.style.setProperty('--d-used', (DR.open ? railW() : 0) + (DR.peek ? wEl(DR.peek).offsetWidth : 0) + 'px');
+  focusWin(DR.peek || undefined); renderDrawer();
+}
+function drawerApply() {                                              // called from apply(): variant or edge changed
+  if (!dOn()) { DR.open = false; DR.peek = null; DR.items = DAPPS.map(a => ({id:a.id, pin:true})); for (const id in WIN) { undock(id); WIN[id].stash = isDemo(id); } closeDMenu(); }   // Off also resets the demo
+  else if (S.drawer === 'cards') DR.peek = null; else if (DR.peek) dock(DR.peek);
+  drawerSync();
+}
+function setDrawer(open, peek = null) {
+  if (!dOn()) return;
+  if (open) closePanels(DRW);                                         // launcher and flyouts close: the drawer never adds to their glass
+  closeDMenu(); DR.open = !!open; DR.peek = open ? peek : null; if (DR.peek) dock(DR.peek);
+  drawerSync();
+}
+function shutDrawer() { if (DR.open || DR.peek) setDrawer(false); }
+function dPick(id) {                                                  // click, Enter or a digit on an entry
+  const w = WIN[id], m = DMETA[id]; DR.kb = id;
+  if (!w.stash && !w.closed) { setDrawer(false); return openWin(id); }   // out on the desktop: focus it there
+  w.closed = w.min = false; w.stash = true; if (m) m.n = 0, m.dot = false;   // the app clears its own attention once it is seen
+  if (S.drawer === 'cards') return unstash(id);                       // the shelf has no peek: a card returns its window
+  setDrawer(true, DR.peek === id ? null : id);
+}
+function stash(id) {
+  const w = WIN[id]; if (!dOn() || !w || w.closed || w.stash) return;
+  if (w.max) winAct(id, 'max'); w.stash = true; w.min = false; if (!dItem(id)) DR.items.push({id, pin:false});
+  drawerSync(); pulse(); say(byId(id).name + ' stashed in the drawer');
+}
+function unstash(id, at) {                                            // back to an ordinary window; a guest's entry goes with it
+  const w = WIN[id], it = dItem(id), el = wEl(id); w.stash = w.closed = w.min = false; undock(id);
+  if (at) { el.style.left = Math.max(0, Math.min(1600 - el.offsetWidth, at[0] - 90)) + 'px'; el.style.top = Math.max(0, Math.min(780, at[1] - 20)) + 'px'; wpos(el); }
+  if (it && !it.pin) DR.items.splice(DR.items.indexOf(it), 1);
+  DR.open = false; DR.peek = null; closeDMenu(); drawerSync(); focusWin(id); say(byId(id).name + ' returned to the desktop');
+}
+function dClose(id) { const w = WIN[id], it = dItem(id); w.closed = true; if (DR.peek === id) DR.peek = null; if (it && !it.pin) { DR.items.splice(DR.items.indexOf(it), 1); w.stash = false; undock(id); } drawerSync(); }
+function dRemove(id) { const it = dItem(id), w = WIN[id]; if (!it) return; it.pin = false; if (w.stash && !w.closed) return unstash(id);
+  DR.items.splice(DR.items.indexOf(it), 1); if (w.closed) { w.stash = false; undock(id); } drawerSync(); }
+function dKeep(id) { const it = dItem(id); DR.items.splice(DR.items.indexOf(it), 1); it.pin = true; DR.items.splice(DR.items.filter(i => i.pin).length, 0, it); renderDrawer(); }
+function dMove(id, d) { const i = DR.items.findIndex(x => x.id === id), j = i + d; if (i < 0 || !DR.items[j] || DR.items[j].pin !== DR.items[i].pin) return;   // reordering stays inside its group
+  [DR.items[i], DR.items[j]] = [DR.items[j], DR.items[i]]; DR.kb = id; renderDrawer(); say(`${byId(id).name}, position ${j + 1} of ${DR.items.length}`); }
+function drawerAct(id, act) {                                         // caption buttons on drawer windows; true means handled
+  if (act === 'stash') { DR.peek === id ? unstash(id) : stash(id); return true; }
+  if (DR.peek !== id) return false;
+  if (act === 'min') setDrawer(true, null); else if (act === 'close') dClose(id);
+  return true;                                                        // a peek does not maximise
+}
+function drawerEsc() {                                                // Esc unwinds: menu, drag, peek, drawer
+  if (!$('#d-menu').hidden) { closeDMenu(); return true; }
+  if (dd && dd.active) { endDD(false); return true; }
+  if (DR.peek) { DR.kb = DR.peek; setDrawer(true, null); if (!SHOT) $(`.d-it[data-d="${DR.kb}"]`, DRW)?.focus(); return true; }
+  if (DR.open) { setDrawer(false); return true; }
+  return false;
+}
+function stashFocused() { if (DR.peek) return unstash(DR.peek); const id = topDesk(); id ? stash(id) : say('No window to stash'); }
+function stashDrag(id) {                                              // hook for a titlebar drag: the drawer's edge is a drop target
+  const el = wEl(id), from = [el.style.left, el.style.top], zone = m => { const [x] = stagePt(m.clientX, 0); return S.dedge === 'right' ? x > 1572 : x < 28; };
+  return {mv:m => $('#d-drop').classList.toggle('on', zone(m)),
+    up:() => { const z = $('#d-drop').classList.contains('on'); $('#d-drop').classList.remove('on'); if (z) { WIN[id].geo = [...from, el.style.width, el.style.height]; stash(id); } }};   // it returns to where the drag began
+}
+
+/* ---- menus: every drag has a menu and a keyboard path ---- */
+function dMenu(title, items, x, y, right) {
+  const m = $('#d-menu');
+  m.innerHTML = `<header>${esc(title)}</header>` + items.filter(Boolean).map(i => i === '-' ? '<hr>' : `<button class="mi${/stash|popout/.test(i[1]) ? ' flipx' : ''}" role="menuitem" data-dm="${i[0]}" data-arg="${i[3] ?? ''}"${i[4] ? ' disabled' : ''}>${ic(i[1])}<span>${i[2]}</span></button>`).join('');
+  m.hidden = false; m.style.left = Math.max(8, Math.min(1592 - m.offsetWidth, right ? x - m.offsetWidth : x)) + 'px'; m.style.top = Math.max(8, Math.min(844 - m.offsetHeight, y)) + 'px';
+  if (!SHOT) $('.mi:not(:disabled)', m).focus();
+}
+function entryMenu(id, anchor, e) {
+  const it = dItem(id); if (!it) return; const st = dState(id), i = DR.items.indexOf(it), same = j => DR.items[j] && DR.items[j].pin === it.pin, right = S.dedge === 'right', cards = S.drawer === 'cards';
+  let x, y; if (anchor) { const r = anchor.getBoundingClientRect(); [x, y] = stagePt(right ? r.left - 6 : r.right + 6, r.top); } else [x, y] = stagePt(e.clientX, e.clientY);
+  DR.menuId = id;
+  dMenu(byId(id).name, [
+    st === 'off' ? ['pick','ret','Open in the drawer'] : st === 'out' ? ['pick','ret','Show window'] : cards ? ['pick','popout','Return to desktop'] : ['pick','ret', st === 'sel' ? 'Hide' : 'Peek'],
+    st === 'out' ? ['stash','stash','Stash again'] : st !== 'off' && !cards ? ['out','popout','Return to desktop'] : null,
+    '-', ['mv','up','Move up',-1,!same(i - 1)], ['mv','down','Move down',1,!same(i + 1)], '-',
+    it.pin ? ['unpin','trash','Remove from drawer'] : ['pin','pin','Keep in drawer'], st !== 'off' ? ['close','close','Close'] : null], x, y, anchor && right);
+}
+function winMenu(id, e) {                                             // title bar or task button, right-click or long press
+  const w = WIN[id], [x, y] = stagePt(e.clientX, e.clientY); DR.menuId = id;
+  dMenu(byId(id).name, [['stash','stash','Stash in drawer'], '-', ['wmin','min', w.min ? 'Restore' : 'Minimise'], ['wmax','max', w.max ? 'Restore size' : 'Maximise'], ['close','close','Close']], x, y);
+}
+$('#d-menu').addEventListener('click', e => { const b = e.target.closest('[data-dm]'); if (!b) return; const id = DR.menuId; closeDMenu();
+  ({pick:() => dPick(id), out:() => unstash(id), stash:() => stash(id), mv:() => dMove(id, +b.dataset.arg), pin:() => dKeep(id), unpin:() => dRemove(id), close:() => dClose(id),
+    wmin:() => WIN[id].min ? openWin(id) : winAct(id, 'min'), wmax:() => winAct(id, 'max')})[b.dataset.dm](); });
+$('#d-menu').addEventListener('keydown', e => { const it = $$('.mi:not(:disabled)', e.currentTarget), i = it.indexOf(document.activeElement), d = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
+  if (d) { it[(i + d + it.length) % it.length].focus(); e.preventDefault(); } });
+stage.addEventListener('pointerdown', e => { if (!e.target.closest('#d-menu')) closeDMenu(); }, true);
+
+/* ---- opening: taskbar button, edge tab (click or pull), Super+S ---- */
+$('#dbtn').onclick = () => setDrawer(!DR.open);
+$('#d-tab').onclick = () => setDrawer(true);
+$('#d-tab').onpointerdown = e => {                                    // pull the tab inward: the pointer and touch version of the edge swipe
+  const x0 = e.clientX, mv = m => { if (Math.abs(m.clientX - x0) > 16 * scale()) { up(); setDrawer(true); } }, up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+};
+let dd = null, dJust = false;
+DRW.addEventListener('click', e => {
+  if (dJust) return; const t = e.target; let m;
+  if (m = t.closest('[data-dmore]')) return entryMenu(m.dataset.dmore, m);
+  if (t.closest('[data-dadd]')) return DR.peek ? unstash(DR.peek) : topDesk() ? stash(topDesk()) : say('No window to stash');
+  if (t.closest('[data-dclose]')) return setDrawer(false);
+  if (m = t.closest('[data-d]')) dPick(m.dataset.d);
+});
+DRW.addEventListener('contextmenu', e => { const m = e.target.closest('[data-d]'); if (!m) return; e.preventDefault(); entryMenu(m.dataset.d, m); });
+DRW.addEventListener('focusin', e => { const m = e.target.closest('.d-it'); if (m) DR.kb = m.dataset.d; });
+DRW.addEventListener('keydown', e => {                                // same keys as the launcher: arrows move, Alt+arrows reorder, Alt+Enter opens the menu
+  const it = $$('.d-it', DRW), i = it.indexOf(e.target.closest('.d-it')); if (i < 0 || e.target.closest('.more')) return;
+  const id = it[i].dataset.d, up = e.key === 'ArrowUp', down = e.key === 'ArrowDown';
+  if (e.altKey && (up || down)) dMove(id, up ? -1 : 1);
+  else if (up || down) it[(i + (down ? 1 : -1) + it.length) % it.length].focus();
+  else if ((e.altKey && e.key === 'Enter') || e.key === 'ContextMenu') entryMenu(id, it[i]);
+  else if (e.shiftKey && e.key === 'Enter') { if (WIN[id].stash && !WIN[id].closed) unstash(id); }
+  else if (e.key === 'Delete') dRemove(id);
+  else if ((e.key === 'Enter' || e.key === ' ') && it[i].tagName !== 'BUTTON') dPick(id);
+  else return;
+  e.preventDefault();
+});
+/* ---- dragging an entry: along the drawer to reorder, off it to return the window to the desktop ---- */
+DRW.addEventListener('pointerdown', e => {
+  const it = e.target.closest('.d-it'); if (!it || e.button || e.target.closest('.more')) return;
+  dd = {id:it.dataset.d, x:e.clientX, y:e.clientY};
+  if (e.pointerType === 'touch') dd.hold = setTimeout(() => { if (dd && !dd.active) { entryMenu(dd.id, it); dd = null; dJust = true; setTimeout(() => dJust = false, 400); } }, 500);   // long press opens the menu
+});
+addEventListener('pointermove', e => { if (!dd || dd.staged) return; if (!dd.active) { if (Math.hypot(e.clientX - dd.x, e.clientY - dd.y) < 6) return; startDD(); } moveDD(e.clientX, e.clientY); });
+addEventListener('pointerup', e => { if (!dd || dd.staged) return; clearTimeout(dd.hold); if (!dd.active) return void (dd = null); endDD(true, e); dJust = true; setTimeout(() => dJust = false, 0); });
+function startDD() {
+  clearTimeout(dd.hold); dd.active = true; const a = byId(dd.id), g = document.createElement('div'); g.id = 'ghost'; g.className = 'glass'; g.innerHTML = iconOf(a) + `<span class="gl">${a.name}</span>`;
+  stage.append(g); dd.ghost = g; DRW.classList.add('dragging'); $(`.d-it[data-d="${dd.id}"]`, DRW).classList.add('src');
+}
+function moveDD(cx, cy) {
+  ghostTo(dd.ghost, cx, cy); $$('.ins-t,.ins-b', DRW).forEach(e => e.classList.remove('ins-t', 'ins-b'));
+  const r = DRW.getBoundingClientRect(), a = byId(dd.id), live = WIN[dd.id].stash && !WIN[dd.id].closed;
+  dd.out = cx < r.left - 12 || cx > r.right + 12 || cy < r.top || cy > r.bottom; dd.before = dd.id;
+  $('.gl', dd.ghost).textContent = dd.out && live ? a.name + ' · return to desktop' : a.name;
+  if (dd.out) return;
+  const its = $$('.d-it', DRW).filter(e => dItem(e.dataset.d).pin === dItem(dd.id).pin), t = its.find(e => { const b = e.getBoundingClientRect(); return cy < b.top + b.height / 2; });
+  dd.before = t ? t.dataset.d : null; (t || its.at(-1)).classList.add(t ? 'ins-t' : 'ins-b');
+}
+function endDD(drop, e) {
+  const d = dd, it = dItem(d.id); dd = null; d.ghost.remove(); DRW.classList.remove('dragging');
+  if (drop && d.out && WIN[d.id].stash && !WIN[d.id].closed) return unstash(d.id, stagePt(e.clientX, e.clientY));
+  if (drop && !d.out && d.before !== d.id) { DR.items.splice(DR.items.indexOf(it), 1);
+    DR.items.splice(d.before ? DR.items.findIndex(x => x.id === d.before) : it.pin ? DR.items.filter(x => x.pin).length : DR.items.length, 0, it); }
+  renderDrawer();
+}
+function dMsg() {                                                     // study bar: an app raises attention while stashed
+  if (!dOn()) set('drawer', 'rail'); const m = DMETA.chat; if (DR.peek !== 'chat') m.n++; m.pv = 'Mira: Pushed. Can you take a look?'; m.t = 'now';
+  toast({icon:'chat', title:'Chat', body:'Mira Okafor: Pushed. Can you take a look?'}); renderDrawer(); pulse();
+}
+const CURSOR = '<svg class="cur" viewBox="0 0 18 18"><path d="M3 2v12l3.2-3 2 4.5 2-.9-2-4.4h4.300z" fill="#fff" stroke="#111" stroke-width="1"/></svg>';
+function drawerScene(scene) {                                         // staged states for the screenshots
+  const app = Q.get('dapp') || 'chat', right = S.dedge === 'right';
+  (Q.get('dstash') || '').split(',').filter(k => WIN[k]).forEach(stash);
+  if (scene === 'drawer') setDrawer(true);
+  if (scene === 'dpeek') dPick(app);
+  if (scene === 'dout') { unstash(app); setDrawer(true); }
+  if (scene === 'dmenu') { setDrawer(true); entryMenu(app, $(`.d-it[data-d="${app}"]`, DRW)); }
+  if (scene === 'dwinmenu') { const r = $('.tb', wEl('files')).getBoundingClientRect(); focusWin('files'); winMenu('files', {clientX:r.left + r.width * .3, clientY:r.top + r.height * .7}); }
+  if (scene === 'dreorder') { setDrawer(true); dd = {id:'music', staged:true}; startDD(); const r = $('.d-it[data-d="mail"]', DRW).getBoundingClientRect(); moveDD(r.left + r.width * .62, r.top + r.height * .3); dd.ghost.insertAdjacentHTML('afterbegin', CURSOR); }
+  if (scene === 'ddrag') { const el = wEl('files'); focusWin('files'); el.style.left = (right ? 1010 : -210) + 'px'; el.style.top = '150px'; wpos(el); $('#d-drop').classList.add('on');
+    stage.insertAdjacentHTML('beforeend', CURSOR.replace('class="cur"', `style="position:absolute;z-index:999;width:18px;height:18px;top:164px;${right ? 'right:2px' : 'left:14px'}"`)); }
+}
+
 /* ---------- Study bar, keys, fit ---------- */
 $('#study').addEventListener('click', e => {
   const t = e.target.closest('[data-toggle]'); if (t) return set(t.dataset.toggle, !S[t.dataset.toggle]);
   const d = e.target.closest('[data-do]'); if (!d) return;
   const k = d.dataset.do;
   if (k === 'launcher') toggleLauncher(); else if (k === 'organise') { toggleLauncher(true); org = true; renderLauncher(); } else if (k === 'install') install(); else if (k === 'hud') set('hud', {off:'compact', compact:'expanded', expanded:'off'}[S.hud]);
+  else if (k === 'drawer') { if (!dOn()) set('drawer', 'rail'); setDrawer(!DR.open); } else if (k === 'dmsg') dMsg();
   else if (k === 'reset') { try { localStorage.removeItem(KEY); localStorage.removeItem(LKEY); } catch {} location.href = location.pathname; } else T[k]();
 });
 addEventListener('pointerdown', e => { if (e.pointerType === 'touch' && !S.touch) set('touch', true); }, true);
 addEventListener('keydown', e => {
-  if (e.key === 'Escape') { if (!launcherEsc()) closePanels(); }
+  if (e.key === 'Escape') { if (!drawerEsc() && !launcherEsc()) closePanels(); }
+  else if ((e.metaKey || e.altKey) && e.key.toLowerCase() === 's' && dOn()) { e.preventDefault(); chord = e.metaKey; e.shiftKey ? stashFocused() : (setDrawer(!DR.open), DR.open && !SHOT && $('.d-it', DRW)?.focus()); }
+  else if (DR.open && /^[1-9]$/.test(e.key) && !e.target.closest('input') && DR.items[e.key - 1]) dPick(DR.items[e.key - 1].id);
   else if (e.altKey && e.key.toLowerCase() === 'p') { e.preventDefault(); set('hud', {off:'compact', compact:'expanded', expanded:'off'}[S.hud]); }
 });
-addEventListener('keyup', e => { if (e.key === 'Meta') toggleLauncher(); });
+let chord = false;                                                     // Super used as a modifier must not also open the launcher
+addEventListener('keyup', e => { if (e.key === 'Meta') { if (chord) chord = false; else toggleLauncher(); } });
 function fit() {
   const bar = SHOT ? 0 : $('#study').offsetHeight, s = Math.min(innerWidth / 1600, (innerHeight - bar) / 900), f = $('#fit');
   stage.style.transform = `scale(${s})`; f.style.width = 1600 * s + 'px'; f.style.height = 900 * s + 'px';
@@ -1340,6 +1778,8 @@ if (scene === 'newcat') { toggleLauncher(true); addCat(['edit','mousepad'], 'Wri
 if (scene === 'unsorted') { EXTRA.forEach(a => { LAY.extra.push(a.id); LAY.fresh.push(a.id); }); toggleLauncher(true); view = 'unsorted'; renderLauncher(); change('Moved htop to System', () => moveApps(['htop'], 'system')); }
 if (scene === 'empty') { toggleLauncher(true); LAY.pins = []; addCat([], 'Work'); closeMenus(); }
 if (['net','vol','temp'].includes(scene)) fly(scene);
+if (/^d(rawer|peek|out|menu|winmenu|reorder|drag)$/.test(scene)) { if (!dOn()) { S.drawer = 'rail'; if (SHOT) saved = {...S}; apply(); } drawerScene(scene); }
+else if (Q.has('dstash') && dOn()) drawerScene('');
 
 /* ---------- Self-test: index.html?selftest=1 drives real pointer events and writes the results to the tab title ---------- */
 if (Q.has('selftest')) {
@@ -1361,6 +1801,43 @@ if (Q.has('selftest')) {
   justDragged = false; $('[data-sug="edit"]')?.click(); ok('suggestion files an app', catOf('edit')?.id === 'office');
   q.value = 'games'; renderLauncher(); ok('search by category name', kbItems().map(b => b.dataset.app).join() === 'doom,quake');
   const n = UNDO.length; while (UNDO.length) undo(); ok(`undo all ${n} steps restores defaults`, JSON.stringify(LAY.cats) === JSON.stringify(defaults().cats));
+  document.title = out.join(' | ');
+}
+/* ---------- Drawer self-test: index.html?dtest=1. Same idea: real events where the browser allows, results in the tab title. ---------- */
+if (Q.has('dtest')) {
+  const out = [], ok = (n, c) => out.push((c ? 'PASS ' : 'FAIL ') + n), it = id => $(`.d-it[data-d="${id}"]`, DRW), order = () => DR.items.map(i => i.id).join();
+  const at = (el, fx = .5, fy = .5) => { const r = el.getBoundingClientRect(); return {clientX:r.left + r.width * fx, clientY:r.top + r.height * fy, button:0, bubbles:true, cancelable:true}; };
+  const pe = (el, t, o) => el.dispatchEvent(new PointerEvent(t, o)), key = (k, o = {}, el = document.body) => el.dispatchEvent(new KeyboardEvent('keydown', {key:k, bubbles:true, ...o}));
+  const pull = (from, to) => { pe(from, 'pointerdown', at(from)); pe(window, 'pointermove', {...at(from), clientX:at(from).clientX + 20}); pe(window, 'pointermove', to); pe(window, 'pointerup', to); dJust = false; };   // the click guard clears on a timer, which a synchronous test never reaches
+  const edge = y => { const r = stage.getBoundingClientRect(); return {clientX:r.left + 4 * scale(), clientY:r.top + y * scale(), button:0, bubbles:true}; };
+  S.drawer = 'rail'; S.dedge = 'left'; apply();
+  ok('resting: tab shown, drawer shut, residents not drawn', !$('#d-tab').hidden && DRW.classList.contains('shut') && DAPPS.every(a => !visible(a.id)));
+  $('#d-tab').click(); ok('edge tab opens', DR.open && !DRW.classList.contains('shut') && $('#d-tab').hidden);
+  it('chat').click(); ok('click peeks and clears the badge', DR.peek === 'chat' && wEl('chat').classList.contains('peek') && visible('chat') && !DMETA.chat.n);
+  ok('only the peeked window is drawn', ['mail','music','feed'].every(k => !visible(k)));
+  key('Escape'); ok('Esc hides the peek first', DR.open && !DR.peek && !visible('chat')); key('Escape'); ok('then the drawer', !DR.open);
+  key('s', {altKey:true}); ok('hotkey opens', DR.open); key('2'); ok('digit peeks the second entry', DR.peek === 'mail');
+  pe(wEl('settings'), 'pointerdown', at(wEl('settings'), .5, .9)); ok('click outside closes', !DR.open && !DR.peek);
+  focusWin('files'); key('S', {altKey:true, shiftKey:true});
+  ok('hotkey stashes the focused window as a guest', WIN.files.stash && !visible('files') && dItem('files') && !dItem('files').pin && !$('[data-task=files]'));
+  $('.tb', wEl('terminal')).dispatchEvent(new MouseEvent('contextmenu', at($('.tb', wEl('terminal')), .3))); $('#d-menu [data-dm=stash]').click(); ok('title bar menu stashes', WIN.terminal.stash && order().endsWith('files,terminal'));
+  const stb = $('.tb', wEl('settings')); pe(stb, 'pointerdown', at(stb, .3)); pe(window, 'pointermove', edge(300)); const lit = $('#d-drop').classList.contains('on'); pe(window, 'pointerup', edge(300));
+  ok('drag to the edge stashes', lit && WIN.settings.stash && !$('#d-drop').classList.contains('on'));
+  $('#dbtn').click(); it('mail').focus(); key('ArrowUp', {altKey:true}, it('mail')); ok('Alt+Up reorders', order().startsWith('mail,chat'));
+  key('ArrowUp', {altKey:true}, it('files')); ok('reordering stays inside its group', order() === 'mail,chat,music,feed,files,terminal,settings');
+  pull(it('music'), at(it('mail'), .5, .2)); ok('drag reorders', order().startsWith('music,mail,chat'));
+  pull(it('files'), {clientX:at(stage).clientX, clientY:at(stage, .5, .3).clientY, button:0, bubbles:true}); ok('drag off the drawer returns a guest and drops its entry', !WIN.files.stash && visible('files') && !dItem('files'));
+  $('#dbtn').click(); it('chat').click(); $('[data-act=stash]', wEl('chat')).click();
+  ok('a resident returns to the desktop but keeps its entry', !WIN.chat.stash && visible('chat') && dState('chat') === 'out' && !!$('[data-task=chat]') && wEl('chat').classList.contains('dpin'));
+  $('[data-act=stash]', wEl('chat')).click(); ok('its caption button stashes it again', WIN.chat.stash && !visible('chat') && !$('[data-task=chat]'));
+  $('#dbtn').click(); it('feed').dispatchEvent(new MouseEvent('contextmenu', at(it('feed')))); $('#d-menu [data-dm=unpin]').click(); ok('Remove from drawer returns the window', !dItem('feed') && visible('feed') && !wEl('feed').classList.contains('dpin'));
+  $('#dbtn').click(); it('mail').click(); $('[data-act=close]', wEl('mail')).click(); ok('closing a resident leaves a not-running entry', dState('mail') === 'off' && !DR.peek && DR.open);
+  it('mail').click(); ok('which starts it in the drawer again', DR.peek === 'mail' && visible('mail'));
+  S.drawer = 'tabs'; apply(); ok('edge tabs: always present, peek survives the switch', !DRW.hidden && $('#d-tab').hidden && DR.peek === 'mail');
+  S.drawer = 'cards'; apply(); $('#dbtn').click(); ok('cards: thumbnails are static copies', $$('.d-th .client', DRW).length > 0 && !DR.peek);
+  it('music').click(); ok('cards: a card returns its window', !WIN.music.stash && visible('music') && !DR.open);
+  S.dedge = 'right'; apply(); $('#dbtn').click(); ok('right edge: button in the corner', DR.open && !$('#dbtn').nextElementSibling && Math.round(DRW.getBoundingClientRect().right) === Math.round(stage.getBoundingClientRect().right));
+  S.drawer = 'off'; apply(); ok('off restores the settled desktop', DRW.hidden && $('#dbtn').hidden && DAPPS.every(a => !visible(a.id)) && ['files','terminal','settings'].every(k => !WIN[k].stash));
   document.title = out.join(' | ');
 }
 })();
