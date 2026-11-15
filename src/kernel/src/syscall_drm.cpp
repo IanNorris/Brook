@@ -461,8 +461,7 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             !UserBufferWritable(arg, sizeof(DrmVersion)))
             return -EFAULT;
         DrmVersion v;
-        for (uint64_t i = 0; i < sizeof(v); ++i)
-            reinterpret_cast<char*>(&v)[i] = reinterpret_cast<char*>(arg)[i];
+        if (!CopyFromUser(&v, arg, sizeof(v))) return -EFAULT;
         v.version_major = VIRTGPU_DRIVER_MAJOR;
         v.version_minor = VIRTGPU_DRIVER_MINOR;
         v.version_patchlevel = VIRTGPU_DRIVER_PATCH;
@@ -477,7 +476,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmGetCap)) ||
             !UserBufferWritable(arg, sizeof(DrmGetCap)))
             return -EFAULT;
-        DrmGetCap c = *reinterpret_cast<DrmGetCap*>(arg);
+        DrmGetCap c;
+        if (!CopyFromUser(&c, arg, sizeof(c))) return -EFAULT;
         // Advertise PRIME import+export so Mesa enables the dmabuf sharing path
         // (windowed GL presentation). Everything else (dumb buffers, etc.) stays
         // unadvertised — we only support the GPU-resource dmabuf path.
@@ -490,7 +490,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     {
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetparam)))
             return -EFAULT;
-        DrmVirtgpuGetparam p = *reinterpret_cast<DrmVirtgpuGetparam*>(arg);
+        DrmVirtgpuGetparam p;
+        if (!CopyFromUser(&p, arg, sizeof(p))) return -EFAULT;
         const auto* ga = GpuAppGet();
         if (!ga || !ga->Capabilities) return -ENODEV;
         const auto caps = ga->Capabilities();
@@ -515,24 +516,28 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     {
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetCaps)))
             return -EFAULT;
-        DrmVirtgpuGetCaps gc = *reinterpret_cast<DrmVirtgpuGetCaps*>(arg);
+        DrmVirtgpuGetCaps gc;
+        if (!CopyFromUser(&gc, arg, sizeof(gc))) return -EFAULT;
         if (gc.size == 0 || gc.size > 64u * 1024) return -EINVAL;
         if (!UserBufferWritable(gc.addr, gc.size)) return -EFAULT;
         // Fetch the REAL virgl capset blob from the host so Mesa binds the
         // hardware virgl screen (instead of falling back to llvmpipe). The
-        // driver issues VIRTIO_GPU_CMD_GET_CAPSET(id, version) and copies the
-        // blob into the user buffer. Zero the tail so any bytes the host didn't
-        // supply read as 0 (Mesa reads a fixed-size union virgl_caps).
+        // driver issues VIRTIO_GPU_CMD_GET_CAPSET(id, version) into a zeroed
+        // kernel buffer, which is then copied out, so bytes the host didn't
+        // supply read as 0 (Mesa reads a fixed-size union virgl_caps) and the
+        // driver never writes user memory.
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->GetCapset || !ga->Capabilities) return -ENODEV;
         if (gc.cap_set_id >= 64 ||
             !(ga->Capabilities().capsetMask & (uint64_t{1} << gc.cap_set_id))) return -EINVAL;
-        for (uint32_t i = 0; i < gc.size; ++i)
-            reinterpret_cast<char*>(gc.addr)[i] = 0;
-        int32_t n = ga->GetCapset(gc.cap_set_id, gc.cap_set_ver,
-                                  reinterpret_cast<void*>(gc.addr), gc.size);
+        auto* blob = static_cast<uint8_t*>(kmalloc(gc.size));
+        if (!blob) return -ENOMEM;
+        memset(blob, 0, gc.size);
+        int32_t n = ga->GetCapset(gc.cap_set_id, gc.cap_set_ver, blob, gc.size);
+        const bool copied = n >= 0 && CopyToUser(gc.addr, blob, gc.size);
+        kfree(blob);
         if (n < 0) return -EINVAL;
-        return 0;
+        return copied ? 0 : -EFAULT;
     }
     // --- M1: resource / submit path (per-fd GEM table -> host virgl ids) ---
     case DRM_NR_VIRTGPU_CONTEXT_INIT:
@@ -608,7 +613,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceCreate)) ||
             !UserBufferWritable(arg, sizeof(DrmVirtgpuResourceCreate)))
             return -EFAULT;
-        DrmVirtgpuResourceCreate rc = *reinterpret_cast<DrmVirtgpuResourceCreate*>(arg);
+        DrmVirtgpuResourceCreate rc;
+        if (!CopyFromUser(&rc, arg, sizeof(rc))) return -EFAULT;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->ResourceCreate3D) return -ENODEV;
         // Context is created lazily if the client skipped CONTEXT_INIT.
@@ -674,7 +680,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceInfo)) ||
             !UserBufferWritable(arg, sizeof(DrmVirtgpuResourceInfo)))
             return -EFAULT;
-        DrmVirtgpuResourceInfo ri = *reinterpret_cast<DrmVirtgpuResourceInfo*>(arg);
+        DrmVirtgpuResourceInfo ri;
+        if (!CopyFromUser(&ri, arg, sizeof(ri))) return -EFAULT;
         DrmGemObj* g = DrmGemGet(dctx, ri.bo_handle);
         if (!g) return -ENOENT;
         ri.res_handle = g->resource->gres;
@@ -687,7 +694,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     {
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpu3dTransfer)))
             return -EFAULT;
-        DrmVirtgpu3dTransfer t = *reinterpret_cast<DrmVirtgpu3dTransfer*>(arg);
+        DrmVirtgpu3dTransfer t;
+        if (!CopyFromUser(&t, arg, sizeof(t))) return -EFAULT;
         DrmGemObj* g = DrmGemGet(dctx, t.bo_handle);
         if (!g) return -ENOENT;
         if (g->resource->owner->ctxId <= 0 || g->resource->hostBlob) return -EINVAL;
@@ -706,7 +714,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     {
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuExecbuffer)))
             return -EFAULT;
-        DrmVirtgpuExecbuffer eb = *reinterpret_cast<DrmVirtgpuExecbuffer*>(arg);
+        DrmVirtgpuExecbuffer eb;
+        if (!CopyFromUser(&eb, arg, sizeof(eb))) return -EFAULT;
         if (dctx->owner->ctxId <= 0) return -EINVAL;
         if (dctx->owner->config.capsetId==4) {
             if ((eb.flags&~6u) || !(eb.flags&4u) || eb.ring_idx>=dctx->owner->config.numRings ||
@@ -821,7 +830,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmPrimeHandle)) ||
             !UserBufferWritable(arg, sizeof(DrmPrimeHandle)))
             return -EFAULT;
-        DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
+        DrmPrimeHandle ph;
+        if (!CopyFromUser(&ph, arg, sizeof(ph))) return -EFAULT;
         DrmGemObj* g = DrmGemGet(dctx, ph.handle);
         if (!g) return -ENOENT;
         Process* proc = ProcessCurrent();
@@ -851,7 +861,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmPrimeHandle)) ||
             !UserBufferWritable(arg, sizeof(DrmPrimeHandle)))
             return -EFAULT;
-        DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
+        DrmPrimeHandle ph;
+        if (!CopyFromUser(&ph, arg, sizeof(ph))) return -EFAULT;
         Process* proc = ProcessCurrent();
         if (!proc) return -ESRCH;
         // Keep the capability alive across metadata lookup and GEM creation.
@@ -896,7 +907,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     case DRM_NR_GEM_CLOSE:
     {
         if (!UserBufferReadable(arg, sizeof(DrmGemClose))) return -EFAULT;
-        DrmGemClose gc = *reinterpret_cast<DrmGemClose*>(arg);
+        DrmGemClose gc;
+        if (!CopyFromUser(&gc, arg, sizeof(gc))) return -EFAULT;
         DrmGemObj* g = DrmGemGet(dctx, gc.handle);
         if (!g) return -ENOENT;
         // Drop this alias; other handles, PRIME capabilities and VMAs retain
@@ -919,7 +931,8 @@ int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuMap)) ||
             !UserBufferWritable(arg, sizeof(DrmVirtgpuMap)))
             return -EFAULT;
-        DrmVirtgpuMap m = *reinterpret_cast<DrmVirtgpuMap*>(arg);
+        DrmVirtgpuMap m;
+        if (!CopyFromUser(&m, arg, sizeof(m))) return -EFAULT;
         DrmGemObj* g = DrmGemGet(dctx, m.handle);
         if (!g) return -ENOENT;
         if (g->resource->hostBlob && !g->resource->hostMapping.length) return -EINVAL;

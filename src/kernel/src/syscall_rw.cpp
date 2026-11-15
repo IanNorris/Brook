@@ -65,6 +65,20 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
     return result;
 }
 
+// Copy one chunk of a write() source into kernel memory before it reaches a
+// backend that copies under a spinlock (serial, pipe rings). Kernel sources
+// (sendfile's bounce buffer) are used in place. Returns the bytes staged,
+// 0 on a fault.
+static uint32_t StageWriteChunk(char* stage, uint32_t capacity, uint64_t address,
+                                uint64_t remaining, bool userSource, const char** chunk)
+{
+    const uint32_t n = static_cast<uint32_t>(remaining < capacity ? remaining : capacity);
+    if (!userSource) { *chunk = reinterpret_cast<const char*>(address); return n; }
+    if (!CopyFromUser(stage, address, n)) return 0;
+    *chunk = stage;
+    return n;
+}
+
 static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                                      uint64_t bufAddr,uint64_t count,bool userSource)
 {
@@ -101,14 +115,22 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     }
     if (fde->type == FdType::DebugSerial)
     {
-        const char* buf = reinterpret_cast<const char*>(bufAddr);
-        brook::SerialLock();
-        for (uint64_t i = 0; i < count; i++)
+        // Stage each chunk before taking the serial lock.
+        char stage[512];
+        for (uint64_t offset = 0; offset < count;)
         {
-            if (buf[i]) // skip null bytes (binary padding in buffers)
-                brook::SerialPutChar(buf[i]);
+            const char* buf = nullptr;
+            const uint32_t n = StageWriteChunk(stage, sizeof(stage), bufAddr + offset, count - offset, userSource, &buf);
+            if (!n) return offset ? static_cast<int64_t>(offset) : -EFAULT;
+            brook::SerialLock();
+            for (uint32_t i = 0; i < n; i++)
+            {
+                if (buf[i]) // skip null bytes (binary padding in buffers)
+                    brook::SerialPutChar(buf[i]);
+            }
+            brook::SerialUnlock();
+            offset += n;
         }
-        brook::SerialUnlock();
         return static_cast<int64_t>(count);
     }
 
@@ -119,19 +141,15 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         // Default: Vnode with null handle = serial output
         if (fde->type == FdType::Vnode && !fde->handle)
         {
-            const char* buf = reinterpret_cast<const char*>(bufAddr);
-            if (count > 0)
+            // The serial writer copies into its queue; give it kernel bytes.
+            char stage[4096];
+            for (uint64_t offset = 0; offset < count;)
             {
-                uint64_t remaining = count;
-                while (remaining > 0)
-                {
-                    uint32_t chunk = remaining > 0xffffffffULL
-                        ? 0xffffffffU
-                        : static_cast<uint32_t>(remaining);
-                    brook::SerialWriterEnqueue(buf, chunk);
-                    buf += chunk;
-                    remaining -= chunk;
-                }
+                const char* buf = nullptr;
+                const uint32_t chunk = StageWriteChunk(stage, sizeof(stage), bufAddr + offset, count - offset, userSource, &buf);
+                if (!chunk) return offset ? static_cast<int64_t>(offset) : -EFAULT;
+                brook::SerialWriterEnqueue(buf, chunk);
+                offset += chunk;
             }
             return static_cast<int64_t>(count);
         }
@@ -263,15 +281,19 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
     if (fde->type == FdType::DevKeyboard)
     {
-        const char* buf = reinterpret_cast<const char*>(bufAddr);
-        if (count > 0)
+        char stage[512];
+        for (uint64_t offset = 0; offset < count;)
         {
+            const char* buf = nullptr;
+            const uint32_t n = StageWriteChunk(stage, sizeof(stage), bufAddr + offset, count - offset, userSource, &buf);
+            if (!n) return offset ? static_cast<int64_t>(offset) : -EFAULT;
             brook::SerialLock();
-            for (uint64_t i = 0; i < count; i++)
+            for (uint32_t i = 0; i < n; i++)
                 brook::SerialPutChar(buf[i]);
             brook::SerialUnlock();
-            for (uint64_t i = 0; i < count; i++)
+            for (uint32_t i = 0; i < n; i++)
                 TtyPutChar(buf[i]);
+            offset += n;
         }
         return static_cast<int64_t>(count);
     }
@@ -289,6 +311,8 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         if (!CopyFromUser(&val, bufAddr, sizeof(val))) return -EFAULT;
         if (val == 0xFFFFFFFFFFFFFFFFULL) return -EINVAL;
         auto* efd = static_cast<EventFdData*>(fde->handle);
+        EventFdWaitGroup waiters;
+        bool registered = false;
         for (;;) {
             bool accepted = false;
             {
@@ -297,28 +321,20 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                     efd->counter += val;
                     ++efd->inGeneration; // every write, including zero
                     accepted = true;
+                    // Every blocked reader, poller and epoll waiter wakes.
+                    EventFdWakeLocked(efd);
                 }
             }
             if (accepted) break;
             if (fde->statusFlags & EFD_NONBLOCK) return -EAGAIN;
-            // Existing eventfd wait hooks have one slot; bounded polling also
-            // supplies progress to writers waiting for counter capacity.
+            // Register, then recheck before blocking: a read that frees
+            // capacity in between wakes this writer (or leaves the wake
+            // pending). The timeout only covers an allocation failure.
             Process* self = ProcessCurrent();
-            self->wakeupTick = ApicTickCount() + 10;
+            if (!registered && (registered = waiters.add(efd, self))) continue;
+            self->wakeupTick = ApicTickCount() + (registered ? 100 : 10);
             SchedulerBlockInterruptible(self);
             if (HasPendingSignals()) return -EINTR;
-        }
-        // Wake blocked reader
-        Process* reader = efd->readerWaiter;
-        if (reader) {
-            efd->readerWaiter = nullptr;
-            WakeProcess(reader);
-        }
-        // Wake epoll waiter watching this eventfd for readability
-        Process* ew = efd->epollWaiter;
-        if (ew) {
-            efd->epollWaiter = nullptr;
-            WakeProcess(ew);
         }
         return 8;
     }
@@ -348,16 +364,19 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     {
         auto* pair = static_cast<TtyDevicePair*>(fde->handle);
         auto* pipe = static_cast<PipeBuffer*>(pair->writePipe);
-        const char* src = reinterpret_cast<const char*>(bufAddr);
         uint64_t written = 0;
+        char stage[4096];
 
         while (written < count)
         {
             if (__atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0)
                 return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
 
-            uint32_t chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            // The ring copy runs under pipe->lock; stage the chunk first.
+            const char* staged = nullptr;
+            const uint32_t want = StageWriteChunk(stage, sizeof(stage), bufAddr + written, count - written, userSource, &staged);
+            if (!want) return written > 0 ? static_cast<int64_t>(written) : -EFAULT;
+            uint32_t chunk = pipe->write(staged, want);
             written += chunk;
             if (written > 0)
             {
@@ -373,8 +392,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
             Process* self = ProcessCurrent();
             pipe->writerWaiter = self;
             // Re-check after registering waiter
-            chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+            chunk = pipe->write(staged, want);
             if (chunk > 0)
             {
                 pipe->writerWaiter = nullptr;
@@ -395,8 +413,8 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 0) return -EBADF;
         return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<const void*>(bufAddr), count, &fde->seekPos,
-            (fde->statusFlags & 0x400) != 0);
+            bufAddr, count, &fde->seekPos,
+            (fde->statusFlags & 0x400) != 0, userSource);
     }
 
     // Write to AF_UNIX connected socket.
@@ -452,6 +470,31 @@ int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count, bool don
     return result;
 }
 
+int64_t ReceiveUdpToUser(int sockIdx, uint64_t address, uint64_t count, SockAddrIn* source)
+{
+    // A UDP datagram is at most 64 KiB; longer reads cannot receive more.
+    const uint32_t size = static_cast<uint32_t>(count < 65536 ? count : 65536);
+    if (size && !UserBufferWritable(address, size)) return -EFAULT;
+    auto* staged = static_cast<uint8_t*>(kmalloc(size ? size : 1));
+    if (!staged) return -ENOMEM;
+    int result = SockRecvFrom(sockIdx, staged, size, source);
+    if (result > 0 && !CopyToUser(address, staged, static_cast<uint32_t>(result)))
+        result = -EFAULT;
+    kfree(staged);
+    return result;
+}
+
+int64_t CopySockAddrToUser(uint64_t address, uint64_t addrLen, const void* value, uint32_t actual)
+{
+    uint32_t requested = 0;
+    if (!CopyFromUser(&requested, addrLen, sizeof(requested))) return -EFAULT;
+    if (requested > 0x7fffffffu) return -EINVAL;
+    const uint32_t copied = requested < actual ? requested : actual;
+    if ((copied && !CopyToUser(address, value, copied)) ||
+        !CopyToUser(addrLen, &actual, sizeof(actual))) return -EFAULT;
+    return 0;
+}
+
 static int64_t PipeReadSome(Process* proc,FdEntry* fde,char* dst,uint64_t count)
 {
     KernelOperationGuard operation(proc);
@@ -489,6 +532,35 @@ static int64_t PipeReadSome(Process* proc,FdEntry* fde,char* dst,uint64_t count)
         }
 }
 
+// Bytes a device read produces are collected in kernel memory and flushed
+// with the checked user copy, so a raced unmap returns -EFAULT (or the bytes
+// already delivered) instead of faulting the kernel.
+struct ReadStage {
+    uint64_t address;
+    uint64_t done = 0;
+    uint32_t used = 0;
+    bool failed = false;
+    uint8_t bytes[256];
+    explicit ReadStage(uint64_t destination) : address(destination) {}
+    bool Put(uint8_t value) {
+        if (failed) return false;
+        bytes[used++] = value;
+        return used < sizeof(bytes) || Flush();
+    }
+    bool Flush() {
+        if (failed) return false;
+        if (!used) return true;
+        if (!CopyToUser(address + done, bytes, used)) { failed = true; return false; }
+        done += used; used = 0;
+        return true;
+    }
+    uint64_t Total() const { return done + used; }
+    int64_t Result() {
+        Flush();
+        return failed && !done ? -EFAULT : static_cast<int64_t>(done);
+    }
+};
+
 int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                   uint64_t, uint64_t, uint64_t)
 {
@@ -522,6 +594,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 #endif
     if (fde->type == FdType::Vnode && fde->handle && !FdNamedFifo(fde))
     {
+        // A write-only descriptor cannot read, whatever the file mode.
+        if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
                               static_cast<uint32_t>(count), &fde->seekPos);
@@ -536,13 +610,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/urandom — fill buffer with RDRAND random bytes
     if (fde->type == FdType::DevUrandom)
     {
-        // Validate user buffer is in user address space
-        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL)
-            return -EFAULT;
-        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL)
-            return -EFAULT;
-
-        auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
+        ReadStage out(bufAddr);
         uint64_t filled = 0;
         while (filled < count) {
             uint64_t rval;
@@ -551,27 +619,22 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint64_t remain = count - filled;
             uint64_t chunk = (remain < 8) ? remain : 8;
             for (uint64_t i = 0; i < chunk; i++)
-                dst[filled + i] = static_cast<uint8_t>(rval >> (i * 8));
+                if (!out.Put(static_cast<uint8_t>(rval >> (i * 8)))) return out.Result();
             filled += chunk;
         }
-        return static_cast<int64_t>(count);
+        return out.Result();
     }
 
     // /dev/klog — read new lines from the kernel log ring buffer
     if (fde->type == FdType::DevKlog && fde->handle)
     {
-        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL) return -EFAULT;
-        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL) return -EFAULT;
-
         auto* cursor = static_cast<uint32_t*>(fde->handle);
-        auto* dst = reinterpret_cast<char*>(bufAddr);
+        ReadStage out(bufAddr);
 
         // Read available lines from the ring buffer into a temp buffer
         static constexpr uint32_t KLOG_LINE_LEN = 161; // 160 chars + null
         static constexpr uint32_t KLOG_BATCH    = 8;  // 8 × 161 = ~1.3KB stack
         char lineBuf[KLOG_BATCH][KLOG_LINE_LEN];
-
-        uint64_t written = 0;
 
         for (;;) {
             uint32_t nread = DebugOverlayReadFrom(cursor, reinterpret_cast<char*>(lineBuf),
@@ -583,16 +646,16 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 while (len < KLOG_LINE_LEN - 1 && lineBuf[i][len]) len++;
 
                 // Need space for line + newline
-                if (written + len + 1 > count) goto done;
+                if (out.Total() + len + 1 > count) goto done;
 
                 for (uint32_t j = 0; j < len; j++)
-                    dst[written++] = lineBuf[i][j];
-                dst[written++] = '\n';
+                    if (!out.Put(static_cast<uint8_t>(lineBuf[i][j]))) return out.Result();
+                if (!out.Put('\n')) return out.Result();
             }
         }
 
     done:
-        if (written == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
+        if (out.Total() == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
             // Blocking mode: sleep briefly and retry once
             Process* self = ProcessCurrent();
             self->wakeupTick = ApicTickCount() + 100;
@@ -603,14 +666,14 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             for (uint32_t i = 0; i < nread; i++) {
                 uint32_t len = 0;
                 while (len < KLOG_LINE_LEN - 1 && lineBuf[i][len]) len++;
-                if (written + len + 1 > count) break;
+                if (out.Total() + len + 1 > count) break;
                 for (uint32_t j = 0; j < len; j++)
-                    dst[written++] = lineBuf[i][j];
-                dst[written++] = '\n';
+                    if (!out.Put(static_cast<uint8_t>(lineBuf[i][j]))) return out.Result();
+                if (!out.Put('\n')) return out.Result();
             }
         }
 
-        return static_cast<int64_t>(written);
+        return out.Result();
     }
 
     // Synthetic in-memory files (/etc/passwd, /etc/group, etc.)
@@ -625,22 +688,22 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         uint64_t avail = contentLen - pos;
         uint64_t toRead = (count < avail) ? count : avail;
-        auto* dst = reinterpret_cast<char*>(bufAddr);
-        for (uint64_t i = 0; i < toRead; i++)
-            dst[i] = content[pos + i];
+        if (!CopyToUser(bufAddr, content + pos, toRead)) return -EFAULT;
         fde->seekPos += toRead;
         return static_cast<int64_t>(toRead);
     }
 
     if (fde->type == FdType::DevKeyboard)
     {
-        auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
+        // read(fd, buf, 0) neither blocks nor consumes input. The buffer is
+        // unchecked for count 0, so nothing below may store through it.
+        if (count == 0) return 0;
+        ReadStage out(bufAddr);
 
         // Non-blocking raw scancode mode (DOOM uses ioctl cmd=1 to enable this)
         if (fde->flags & 1)
         {
-            uint64_t bytesRead = 0;
-            while (bytesRead < count)
+            while (out.Total() < count)
             {
                 InputEvent ev{};
                 bool got;
@@ -670,19 +733,21 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 case SC_EXT_PGDN:   ps2 = 0x51; break;
                 }
 
+                bool stored;
                 if (ps2)
                 {
                     // Emit single-byte scancode (no E0 prefix) for compatibility
                     // with apps that read 1 byte at a time (DOOM, etc.)
-                    buf[bytesRead++] = release ? (ps2 | 0x80) : ps2;
+                    stored = out.Put(release ? (ps2 | 0x80) : ps2);
                 }
                 else
                 {
                     if (release) sc |= 0x80;
-                    buf[bytesRead++] = sc;
+                    stored = out.Put(sc);
                 }
+                if (!stored) break;
             }
-            return static_cast<int64_t>(bytesRead);
+            return out.Result();
         }
 
         // Non-canonical (raw) terminal mode: return ASCII chars as they arrive.
@@ -690,15 +755,14 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (!proc->ttyCanonical)
         {
             bool wmMode = WmIsActive();
-            uint64_t bytesRead = 0;
-            while (bytesRead < count)
+            while (out.Total() < count)
             {
                 InputEvent ev{};
                 bool got = wmMode ? ProcessInputPop(proc, &ev)
                                   : InputPollEvent(&ev);
                 if (!got)
                 {
-                    if (bytesRead > 0) break; // return what we have
+                    if (out.Total() > 0) break; // return what we have
                     // Register as waiter BEFORE re-checking, to close the
                     // race where a key arrives between the poll and block.
                     InputAddWaiter(proc);
@@ -713,7 +777,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     }
                     SchedulerBlock(proc);
                     if (HasPendingSignals())
-                        return bytesRead > 0 ? static_cast<int64_t>(bytesRead) : -EINTR;
+                        return out.Total() > 0 ? out.Result() : -EINTR;
                     continue;
                 }
             got_event_nc:
@@ -731,17 +795,17 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 // Ctrl+D → EOF
                 if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x20))
                 {
-                    if (bytesRead == 0) return 0; // EOF
+                    if (out.Total() == 0) return 0; // EOF
                     break;
                 }
 
-                buf[bytesRead++] = static_cast<uint8_t>(c);
+                if (!out.Put(static_cast<uint8_t>(c))) break;
 
                 // Don't echo here — bash handles its own echo in
                 // non-canonical mode by redisplaying the line on Enter.
                 // Kernel echo would duplicate every character.
             }
-            return static_cast<int64_t>(bytesRead);
+            return out.Result();
         }
 
         // Cooked terminal mode: blocking, ASCII translation, line buffering, echo.
@@ -787,8 +851,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 // Echo ^C and return empty line
                 brook::SerialLock(); brook::SerialPutChar('^'); brook::SerialPutChar('C'); brook::SerialPutChar('\n'); brook::SerialUnlock();
                 TtyPutChar('^'); TtyPutChar('C'); TtyPutChar('\n');
-                buf[0] = '\n';
-                return 1;
+                const char newline = '\n';
+                return CopyToUser(bufAddr, &newline, 1) ? 1 : -EFAULT;
             }
 
             // Ctrl+D → EOF
@@ -851,7 +915,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // Copy line buffer to user buffer
         uint64_t copyLen = lineLen;
         if (copyLen > count) copyLen = count;
-        __builtin_memcpy(buf, lineBuf, copyLen);
+        if (copyLen && !CopyToUser(bufAddr, lineBuf, copyLen)) return -EFAULT;
         return static_cast<int64_t>(copyLen);
     }
 
@@ -882,6 +946,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         if (count < 8) return -EINVAL;
         auto* efd = static_cast<EventFdData*>(fde->handle);
+        EventFdWaitGroup waiters;
+        bool registered = false;
 
         for (;;)
         {
@@ -897,21 +963,20 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     efd->counter = semaphore ? efd->counter - 1 : 0;
                     ++efd->outGeneration;
                     consumed = true;
+                    // Capacity changed: wake writers and POLLOUT pollers.
+                    EventFdWakeLocked(efd);
                 }
             }
-            if (consumed) {
-                Process* ew = efd->epollWaiter;
-                if (ew) { efd->epollWaiter = nullptr; WakeProcess(ew); }
-                return 8;
-            }
+            if (consumed) return 8;
             // Non-blocking: return EAGAIN
             if (fde->statusFlags & 0x800)
                 return -EAGAIN;
 
-            // Block until counter becomes non-zero
+            // Register, recheck, then block until the counter is non-zero.
+            // Concurrent readers and pollers each hold their own registration.
             Process* self = ProcessCurrent();
-            efd->readerWaiter = self;
-            self->wakeupTick = ApicTickCount() + 10;
+            if (!registered && (registered = waiters.add(efd, self))) continue;
+            self->wakeupTick = ApicTickCount() + (registered ? 100 : 10);
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return -EINTR;
@@ -935,11 +1000,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // blocking sockets spin-poll briefly (matches existing TCP behaviour).
         SockAddrIn unused = {};
         for (;;) {
-            int ret = SockRecvFrom(sockIdx,
-                                    reinterpret_cast<void*>(bufAddr),
-                                    static_cast<uint32_t>(count),
-                                    &unused);
-            if (ret >= 0) return ret;
+            const int64_t ret = ReceiveUdpToUser(sockIdx, bufAddr, count, &unused);
+            if (ret >= 0 || ret == -EFAULT || ret == -ENOMEM) return ret;
             if (nonblock) return -EAGAIN;
             if (HasPendingSignals()) return -EINTR;
             // Yield briefly so the NIC ISR / poll path can deliver packets.
@@ -981,7 +1043,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 1) return -EBADF;
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<void*>(bufAddr), count, &fde->seekPos);
+            bufAddr, count, &fde->seekPos, true);
     }
 
     // Read from /dev/tty — reads from stdin pipe
@@ -989,14 +1051,15 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         auto* pair = static_cast<TtyDevicePair*>(fde->handle);
         auto* pipe = static_cast<PipeBuffer*>(pair->readPipe);
-        auto* dst = reinterpret_cast<char*>(bufAddr);
+        // The ring copy runs under pipe->lock; read into kernel memory first.
+        char staged[4096];
 
         for (;;)
         {
-            uint32_t got = pipe->read(dst, static_cast<uint32_t>(
+            uint32_t got = pipe->read(staged, static_cast<uint32_t>(
                 count > 4096 ? 4096 : count));
             if (got > 0)
-                return static_cast<int64_t>(got);
+                return CopyToUser(bufAddr, staged, got) ? static_cast<int64_t>(got) : -EFAULT;
 
             uint32_t wr = __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE);
             if (wr == 0) return 0;
@@ -1244,7 +1307,7 @@ int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
         uint64_t remaining=count-static_cast<uint64_t>(total),amount=remaining<chunk?remaining:chunk;
         uint64_t readOffset=offset;
         int64_t read=in_fde->type==FdType::MemFd?
-            MemFdReadAt(static_cast<MemFdData*>(in_fde->handle),bounce,amount,&readOffset):
+            MemFdReadAt(static_cast<MemFdData*>(in_fde->handle),reinterpret_cast<uint64_t>(bounce),amount,&readOffset,false):
             VfsRead(static_cast<Vnode*>(in_fde->handle),bounce,amount,&readOffset);
         if(read<=0) {error=read;break;}
         int64_t written=WriteToPinnedFdByType(proc,output.get(),out_fd,reinterpret_cast<uint64_t>(bounce),static_cast<uint64_t>(read),false);
@@ -1286,8 +1349,8 @@ int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if ((fde->statusFlags & 3) == 0) return -EBADF;
         if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
         return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<const void*>(bufAddr), count, &offset,
-            (fde->statusFlags & 0x400) != 0);
+            bufAddr, count, &offset,
+            (fde->statusFlags & 0x400) != 0, true);
     }
     if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
     if ((fde->statusFlags & 3) == 0) return -EBADF;
@@ -1332,10 +1395,11 @@ int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 1) return -EBADF;
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
-            reinterpret_cast<void*>(bufAddr), count, &offset);
+            bufAddr, count, &offset, true);
     }
     if (fde->type == FdType::Vnode && fde->handle)
     {
+        if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
         uint64_t pos = offset;
         return VfsRead(vn, reinterpret_cast<void*>(bufAddr),

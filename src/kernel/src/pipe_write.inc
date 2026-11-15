@@ -8,7 +8,11 @@
             ? reinterpret_cast<PipeBuffer*>(fde->seekPos)
             : static_cast<PipeBuffer*>(fde->handle);
         KernelOperationGuard operation(proc);
+        // PipeBuffer::write copies under pipe->lock, so a user source is
+        // staged one chunk at a time first (a fault returns EFAULT, or the
+        // bytes already written). Kernel sources are used in place.
         const char* src = reinterpret_cast<const char*>(bufAddr);
+        char stage[4096];
         uint64_t written = 0;
         SpinLockAcquire(ProcessFdLock(proc));
         const bool packet = (fde->statusFlags & 0x4000) != 0 && fde->flags != 2;
@@ -28,8 +32,14 @@
                 return written > 0 ? static_cast<int64_t>(written) : -EPIPE;
             }
 
-            uint32_t chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written),
+            const uint32_t want = static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written);
+            const char* chunkSource = src + written;
+            if (userSource) {
+                if (!CopyFromUser(stage, bufAddr + written, want))
+                    return written > 0 ? static_cast<int64_t>(written) : -EFAULT;
+                chunkSource = stage;
+            }
+            uint32_t chunk = pipe->write(chunkSource, want,
                 (fde->flags&0x10) && count<=4096, packet);
             written += chunk;
             if (chunk > 0)
@@ -55,8 +65,7 @@
             if(!writerWaiters.add(pipe,self,4|8))return written ? static_cast<int64_t>(written) : -ENOMEM;
             // Re-check after registering waiter to close the race where
             // a reader drained space between our write() and waiter set.
-            chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written),
+            chunk = pipe->write(chunkSource, want,
                 (fde->flags&0x10) && count<=4096, packet);
             if (chunk > 0)
             {

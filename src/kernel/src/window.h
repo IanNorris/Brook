@@ -516,6 +516,9 @@ bool WmInputPushRelative(Window* window,const InputEvent& event);
 uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max);
 int WmInputPopOwned(Process* proc, uint32_t wmId, uint64_t incarnation,
                     Window::WmInputEvent* out, uint32_t max);
+// Same, for the legacy id-only syscall: finds and drains the caller's window
+// under the window lock into a kernel buffer. Returns -ENOENT (-2) if absent.
+int WmInputPopById(Process* proc, uint32_t wmId, Window::WmInputEvent* out, uint32_t max);
 
 // Phase C — synthetic "WM event" types.  These share the same ring as
 // input events; clients distinguish via the `type` byte.  Values >= 0x80

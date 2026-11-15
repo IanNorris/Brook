@@ -37,7 +37,7 @@ int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
     {
         // Restrict bases to the canonical user half, even if not mapped yet.
         // High GS would also defeat the interrupt-entry kernel GS discriminator.
-        if (addr >= 0x0000800000000000ULL) return -EPERM;
+        if (!UserSegmentBaseValid(addr)) return -EPERM;
         Process* proc = ProcessCurrent();
         if (!proc) return -EINVAL;
         uint64_t flags;
@@ -56,18 +56,15 @@ int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
     }
     case ARCH_GET_GS:
     {
-        if (!UserBufferWritable(addr, sizeof(uint64_t))) return -EFAULT;
-        *reinterpret_cast<uint64_t*>(addr) = ReadMsr(MSR_KERNEL_GS_BASE);
-        return 0;
+        const uint64_t gsBase = ReadMsr(MSR_KERNEL_GS_BASE);
+        return CopyToUser(addr, &gsBase, sizeof(gsBase)) ? 0 : -EFAULT;
     }
     case ARCH_GET_FS:
     {
-        if (!UserBufferWritable(addr, sizeof(uint64_t))) return -EFAULT;
         uint32_t lo, hi;
         __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100U));
         uint64_t fsBase = (static_cast<uint64_t>(hi) << 32) | lo;
-        *reinterpret_cast<uint64_t*>(addr) = fsBase;
-        return 0;
+        return CopyToUser(addr, &fsBase, sizeof(fsBase)) ? 0 : -EFAULT;
     }
     case ARCH_CET_STATUS:
         return -EINVAL; // CET not supported
@@ -96,15 +93,20 @@ int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
 
     // Wake vfork parent if child exits without exec
-    if (proc && proc->vforkParent)
-    {
-        SchedulerUnblock(proc->vforkParent);
-        proc->vforkParent = nullptr;
-    }
+    if (proc) ProcessVforkRelease(proc);
 
     SchedulerExitCurrentProcess(static_cast<int>(status));
     // never reached
     return 0;
+}
+
+void ProcessVforkRelease(Process* child)
+{
+    Process* parent = __atomic_exchange_n(&child->vforkParent, nullptr, __ATOMIC_ACQ_REL);
+    if (!parent) return;
+    __atomic_store_n(&parent->vforkWaiting, 0, __ATOMIC_RELEASE);
+    SchedulerUnblock(parent);
+    ProcessUnref(parent);
 }
 
 int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
@@ -120,11 +122,7 @@ int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
         SchedulerKillThreadGroup(proc->tgid, proc, static_cast<int>(status));
 
     // Wake vfork parent if child exits without exec
-    if (proc && proc->vforkParent)
-    {
-        SchedulerUnblock(proc->vforkParent);
-        proc->vforkParent = nullptr;
-    }
+    if (proc) ProcessVforkRelease(proc);
 
     SchedulerExitCurrentProcess(static_cast<int>(status));
     // never reached
@@ -205,6 +203,7 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
     static constexpr uint64_t CLONE_SETTLS          = 0x00080000;
     static constexpr uint64_t CLONE_PARENT_SETTID   = 0x00100000;
     static constexpr uint64_t CLONE_CHILD_CLEARTID  = 0x00200000;
+    static constexpr uint64_t CLONE_CHILD_SETTID    = 0x01000000;
     static constexpr uint64_t CLONE_VFORK           = 0x00004000;
     static constexpr uint64_t CLONE_CLEAR_SIGHAND   = 0x100000000ULL;
     static constexpr uint64_t CLONE_NEWNS           = 0x00020000ULL;
@@ -229,6 +228,9 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
 
     if ((flags & CLONE_THREAD) && (flags & CLONE_PARENT_SETTID) &&
         !UserBufferWritable(parentTidAddr, sizeof(int32_t))) return -EFAULT;
+    // context_switch loads the FS base with wrmsr; a non-canonical or kernel
+    // base would #GP in the kernel. Same rule as arch_prctl(ARCH_SET_FS).
+    if ((flags & CLONE_SETTLS) && !UserSegmentBaseValid(tlsAddr)) return -EPERM;
 
     uint64_t userRip = parent->syscallUserRip;
     uint64_t userRsp = parent->syscallUserRsp;
@@ -247,9 +249,6 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         child = ProcessCreateThread(parent, userRip, userRsp, userRflags, tls,(flags & CLONE_FS)!=0);
         if (!child) return -ENOMEM;
 
-        // CLONE_CHILD_CLEARTID: store address for thread exit cleanup
-        if (flags & CLONE_CHILD_CLEARTID)
-            child->clearChildTid = childTidAddr;
     }
     else
     {
@@ -257,6 +256,14 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         child = ProcessFork(parent, userRip, userRsp, userRflags,(flags & CLONE_FS)!=0);
         if (!child) return -ENOMEM;
     }
+    // CLONE_CHILD_CLEARTID: cleared and woken when the child exits, for
+    // threads and forks alike (glibc's _Fork relies on both TID flags).
+    if (flags & CLONE_CHILD_CLEARTID)
+        child->clearChildTid = childTidAddr;
+    // CLONE_CHILD_SETTID: stored in the child's own memory by the child
+    // itself (ForkChildTrampoline) before it first returns to user mode.
+    if (flags & CLONE_CHILD_SETTID)
+        child->setChildTid = childTidAddr;
 
     if(flags&CLONE_NEWUSER) {
         if(int error=ProcessUserNamespaceCreate(child)) {ProcessDiscardUnpublished(child);return error;}
@@ -269,8 +276,17 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         ProcessDiscardUnpublished(child);
         return error;
     }
-    if ((flags & CLONE_THREAD) && (flags & CLONE_PARENT_SETTID))
-        *reinterpret_cast<volatile int32_t*>(parentTidAddr)=static_cast<int32_t>(child->pid);
+    if (flags & CLONE_PARENT_SETTID) {
+        // Threads checked the address above. For a fork, Linux stores into
+        // the parent only and ignores a failed store.
+        const int32_t tid = static_cast<int32_t>(child->pid);
+        const bool stored = CopyToUser(parentTidAddr, &tid, sizeof(tid));
+        if (!stored && (flags & CLONE_THREAD)) {
+            SysvSemExit(child);
+            ProcessDiscardUnpublished(child);
+            return -EFAULT;
+        }
+    }
 
     child->forkRbx = parent->syscallUserRbx;  child->forkRbp = parent->syscallUserRbp;
     child->forkR12 = parent->syscallUserR12;  child->forkR13 = parent->syscallUserR13;
@@ -288,6 +304,15 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
         if (childPid < MAX_PROCESSES)ResetSignalActions(childPid);
     }
 
+    // CLONE_VFORK: publish the (referenced) parent before the child can run,
+    // so an exec or exit that happens first still releases it.
+    const bool vfork = (flags & CLONE_VFORK) && !(flags & CLONE_THREAD);
+    if (vfork) {
+        ProcessRef(parent);
+        __atomic_store_n(&parent->vforkWaiting, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&child->vforkParent, parent, __ATOMIC_RELEASE);
+    }
+
     SchedulerAddProcess(child);
 
     {
@@ -301,11 +326,14 @@ int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
               (flags & CLONE_THREAD) ? "THREAD" : "FORK");
 
     // CLONE_VFORK: parent blocks until child calls exec or exit.
-    if ((flags & CLONE_VFORK) && !(flags & CLONE_THREAD))
+    // SchedulerBlock returns on any wake, so wait for the release itself. A
+    // release between the check and the block leaves a pending wakeup, so
+    // the block returns at once. Termination of the parent ends the wait.
+    if (vfork)
     {
-        child->vforkParent = parent;
-        SchedulerBlock(parent);
-        // Parent resumes here after child exec/exit wakes us
+        while (__atomic_load_n(&parent->vforkWaiting, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&parent->terminalPending, __ATOMIC_ACQUIRE))
+            SchedulerBlock(parent);
     }
 
     return static_cast<int64_t>(child->pid);
@@ -351,7 +379,8 @@ int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
         return -EFAULT;
 
     CloneArgs copied{};
-    __builtin_memcpy(&copied,reinterpret_cast<const void*>(argsPtr),size<sizeof(copied)?size:sizeof(copied));
+    if (!CopyFromUser(&copied, argsPtr, size < sizeof(copied) ? size : sizeof(copied)))
+        return -EFAULT;
     const CloneArgs* ca = &copied;
     const uint64_t cloneFlags=ca->flags;
     // CLONE_NEWTIME occupies an exit-signal bit in legacy clone, but it is an
@@ -366,8 +395,11 @@ int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
     if(cloneFlags&(0x00020000|0x10000000)) {
-        for(uint64_t i=sizeof(CloneArgs);i<size;++i)
-            if(reinterpret_cast<const uint8_t*>(argsPtr)[i])return -E2BIG;
+        for(uint64_t i=sizeof(CloneArgs);i<size;++i) {
+            uint8_t byte=0;
+            if(!CopyFromUser(&byte,argsPtr+i,1))return -EFAULT;
+            if(byte)return -E2BIG;
+        }
         if((cloneFlags&0xff) || ca->exit_signal!=17 || ca->pidfd || ca->set_tid || ca->set_tid_size || ca->cgroup)return -EINVAL;
         if(ca->stack && ca->stack_size>~uint64_t{0}-ca->stack)return -EINVAL;
         return sys_clone(cloneFlags|ca->exit_signal,stackTop,ca->parent_tid,ca->child_tid,ca->tls,0);
@@ -400,15 +432,17 @@ static_assert(sizeof(WaitSiginfo) == 128, "Linux siginfo size");
 static_assert(__builtin_offsetof(WaitSiginfo, pid) == 16, "Linux SIGCHLD pid");
 static_assert(__builtin_offsetof(WaitSiginfo, status) == 24, "Linux SIGCHLD status");
 
-static void CopyWaitUsage(uint64_t address, const ChildWaitSnapshot& event)
+// Like Linux, the child is already reaped when the outputs are copied, so a
+// raced unmap reports -EFAULT but cannot undo the wait.
+static bool CopyWaitUsage(uint64_t address, const ChildWaitSnapshot& event)
 {
-    if (!address) return;
+    if (!address) return true;
     int64_t usage[18]{}; // Linux x86-64 rusage (144 bytes), tracked CPU ticks.
     usage[0] = event.userTicks / 1000;
     usage[1] = (event.userTicks % 1000) * 1000;
     usage[2] = event.sysTicks / 1000;
     usage[3] = (event.sysTicks % 1000) * 1000;
-    memcpy(reinterpret_cast<void*>(address), usage, sizeof(usage));
+    return CopyToUser(address, usage, sizeof(usage));
 }
 
 static bool ChildWaitInterrupted(Process* caller)
@@ -458,8 +492,9 @@ int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t rawOptions,
     ChildWaitSnapshot event{};
     int result = WaitChildEvent(parent, selector, id, options | WEXITED, &event);
     if (result <= 0) return result;
-    if (statusAddr) *reinterpret_cast<int32_t*>(statusAddr) = event.status;
-    CopyWaitUsage(usageAddr, event);
+    const int32_t status = event.status;
+    if (statusAddr && !CopyToUser(statusAddr, &status, sizeof(status))) return -EFAULT;
+    if (!CopyWaitUsage(usageAddr, event)) return -EFAULT;
     return event.pid;
 }
 
@@ -492,9 +527,9 @@ int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAddr,
                       event.code == 6 ? 18 : event.status & 0x7f;
         info.userTime = event.userTicks / 10; // Linux USER_HZ = 100.
         info.systemTime = event.sysTicks / 10;
-        CopyWaitUsage(usageAddr, event);
+        if (!CopyWaitUsage(usageAddr, event)) return -EFAULT;
     }
-    if (infoAddr) memcpy(reinterpret_cast<void*>(infoAddr), &info, sizeof(info));
+    if (infoAddr && !CopyToUser(infoAddr, &info, sizeof(info))) return -EFAULT;
     return 0;
 }
 

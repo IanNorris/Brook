@@ -11,12 +11,20 @@
 namespace brook {
 
 bool IsTerminalFd(const FdEntry* fde);
+// O_ACCMODE check shared by the read paths: O_WRONLY descriptors are EBADF.
+inline bool FdOpenForReading(const FdEntry* fde) { return (fde->statusFlags & 3) != 1; }
 
 // Backend/VFS byte results are signed int. Bound ordinary writes rather than
 // narrowing a 64-bit request (which can wrap to zero or a negative result).
 static constexpr uint64_t VnodeWriteLimit = 0x7ffff000ULL;
 
+struct SockAddrIn;
 int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count, bool dontwait);
+// One UDP datagram, staged in kernel memory and copied out. Returns the
+// SockRecvFrom result (-EAGAIN when the queue is empty) or -EFAULT.
+int64_t ReceiveUdpToUser(int sockIdx, uint64_t address, uint64_t count, SockAddrIn* source);
+// Linux sockaddr output: copy min(*addrLen, actual) bytes, then store actual.
+int64_t CopySockAddrToUser(uint64_t address, uint64_t addrLen, const void* value, uint32_t actual);
 
 struct iovec {
     uint64_t iov_base;

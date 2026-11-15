@@ -53,11 +53,9 @@ int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
 {
     (void)pid;
     if (cpusetsize < 8) return -EINVAL;
-    if (!UserBufferWritable(maskAddr, 8)) return -EFAULT;
-
     // Report all 8 CPUs available
-    auto* mask = reinterpret_cast<uint64_t*>(maskAddr);
-    *mask = 0xFF; // 8 CPUs
+    const uint64_t mask = 0xFF; // 8 CPUs
+    if (!CopyToUser(maskAddr, &mask, sizeof(mask))) return -EFAULT;
     return 8; // size of mask in bytes
 }
 
@@ -86,10 +84,12 @@ int64_t sys_sched_setparam(uint64_t, uint64_t, uint64_t,
 int64_t sys_sched_getparam(uint64_t, uint64_t paramAddr, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
-    // Return sched_priority = 0 (default for SCHED_OTHER)
-    if (paramAddr && UserBufferReadable(paramAddr, 4))
-        *reinterpret_cast<int32_t*>(paramAddr) = 0;
-    return 0;
+    // Return sched_priority = 0 (default for SCHED_OTHER). The old check
+    // tested readability and then wrote, so a read-only page was written
+    // and a bad pointer reported success.
+    if (!paramAddr) return -EINVAL;
+    const int32_t priority = 0;
+    return CopyToUser(paramAddr, &priority, sizeof(priority)) ? 0 : -EFAULT;
 }
 
 int64_t sys_sched_setscheduler(uint64_t, uint64_t, uint64_t,

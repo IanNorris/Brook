@@ -409,8 +409,7 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     if (watchref->type == FdType::EpollFd && watchref->handle == ep) return -EINVAL;
     EpollEvent ev{};
     if (op != EPOLL_CTL_DEL) {
-        if (!UserBufferReadable(eventAddr, sizeof(ev))) return -EFAULT;
-        __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
+        if (!CopyFromUser(&ev, eventAddr, sizeof(ev))) return -EFAULT;
     }
     // Regular files have poll() readiness but cannot be watched by epoll.
     // Accepting them produces perpetual readiness and prevents async runtimes
@@ -493,6 +492,13 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup namedWaiters;bool namedWaitFailed=false;
+        // Pipes, AF_UNIX streams and eventfds use per-object waiter lists, so
+        // several epoll_wait/poll/read callers each get their wake. Without
+        // a registration (allocation failure) the wait polls every 5 ms.
+        PipePollGroup pipeWaiters;
+        EventFdWaitGroup eventWaiters;
+        SyncFileWait syncWait;
+        bool fallbackTick=false;
         uint64_t tcpPoolWaitToken=0;
         auto registerWaiters = [&]() {
             for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
@@ -504,9 +510,11 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 } else if(FdNamedFifo(fde)) {
                     if(!namedWaiters.add(FdPipe(fde),proc,walk->masks[wfd]|16|8))namedWaitFailed=true;
                 } else if (fde->type == FdType::Pipe) {
-                    static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
+                    if(!pipeWaiters.add(static_cast<PipeBuffer*>(fde->handle),proc,walk->masks[wfd]|EPOLLHUP|EPOLLERR))fallbackTick=true;
                 } else if (fde->type == FdType::EventFd) {
-                    static_cast<EventFdData*>(fde->handle)->epollWaiter = proc;
+                    if(!eventWaiters.add(static_cast<EventFdData*>(fde->handle),proc))fallbackTick=true;
+                } else if (fde->type == FdType::SyncFile) {
+                    if (walk->masks[wfd] & EPOLLIN) syncWait.Want(*static_cast<SyncFileData*>(fde->handle));
                 } else if (fde->type == FdType::TimerFd) {
                     if (walk->masks[wfd] & EPOLLIN)
                         timerWaiters.add(static_cast<TimerFdData*>(fde->handle), proc);
@@ -522,11 +530,11 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                         usd->epollWaiter = proc;
                     } else if ((events & (EPOLLIN | EPOLLRDHUP)) &&
                                usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
-                        usd->rxPipe->epollWaiter = proc;
+                        if(!pipeWaiters.add(usd->rxPipe,proc,EPOLLIN))fallbackTick=true;
                     }
                     if ((events & EPOLLOUT) &&
                         usd->state == UnixSocketData::State::Connected && usd->txPipe)
-                        usd->txPipe->epollWaiter = proc;
+                        if(!pipeWaiters.add(usd->txPipe,proc,EPOLLOUT))fallbackTick=true;
                 }
             }
         };
@@ -536,33 +544,25 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 FdEntry* fde = walk->pins[wfd];
                 if (!walk->masks[wfd]) continue;
                 if (!fde || !fde->handle) continue;
-                if (fde->type == FdType::Pipe) {
-                    auto* pb = static_cast<PipeBuffer*>(fde->handle);
-                    if (pb->epollWaiter == proc) pb->epollWaiter = nullptr;
-                } else if (fde->type == FdType::EventFd) {
-                    auto* efd = static_cast<EventFdData*>(fde->handle);
-                    if (efd->epollWaiter == proc) efd->epollWaiter = nullptr;
-                } else if (fde->type == FdType::Socket) {
+                if (fde->type == FdType::Socket) {
                     int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                     brook::SockClearPollWaiter(si, proc);
                 } else if (fde->type == FdType::UnixSocket) {
                     auto* usd = static_cast<UnixSocketData*>(fde->handle);
                     if (usd->epollWaiter == proc) usd->epollWaiter = nullptr;
-                    if (usd->rxPipe && usd->rxPipe->epollWaiter == proc)
-                        usd->rxPipe->epollWaiter = nullptr;
-                    if (usd->txPipe && usd->txPipe->epollWaiter == proc)
-                        usd->txPipe->epollWaiter = nullptr;
                 }
             }
         };
 
         registerWaiters();
         if(namedWaitFailed) {unregisterWaiters();return -ENOMEM;}
+        // A fence retired since the snapshot: rescan without sleeping.
+        const bool fenceRetired = syncWait.Arm();
         // The graph mutex can sleep. Arm the timeout only after this scan:
         // SchedulerUnblock clears wakeupTick when granting a contended mutex.
         n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
-        if (!n && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
-            uint64_t safetyMs = timerWaiters.allocationFailed ? 5 : 100;
+        if (!n && !fenceRetired && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
+            uint64_t safetyMs = (timerWaiters.allocationFailed || fallbackTick) ? 5 : 100;
             for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) {
                 auto* fde = walk->pins[fd];
                 if (!walk->masks[fd] || !fde) continue;
@@ -570,7 +570,10 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                     safetyMs = 5;
                     continue;
                 }
+                // Signals aimed at another thread have no wake source yet.
+                if (fde->type == FdType::SignalFd && safetyMs > 10) safetyMs = 10;
             }
+            safetyMs = syncWait.SafetyMs(safetyMs);
             const uint64_t timerDeadline = timerWaiters.deadline(deadline);
             proc->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             EpollDiagAdd(diag, EpBlocks);

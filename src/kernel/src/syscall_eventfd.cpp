@@ -17,6 +17,41 @@ static void EventFdInit(EventFdData* efd, uint64_t counter, uint32_t flags) {
     efd->refCount = 1;
     efd->identity = __atomic_add_fetch(&g_eventFdIdentity, 1, __ATOMIC_RELAXED);
 }
+void EventFdWakeLocked(EventFdData* efd) {
+    for (auto* n = efd->waiters; n; n = n->next) WakeProcess(n->process);
+}
+
+bool EventFdWaitGroup::add(EventFdData* efd, Process* process) {
+    for (auto* n = nodes; n; n = n->nextGroup) if (n->efd == efd) return true;
+    auto* n = static_cast<EventFdWaitNode*>(kmalloc(sizeof(EventFdWaitNode)));
+    if (!n) return false;
+    EventFdRef(efd);
+    ProcessRef(process);
+    {
+        EventFdGuard guard(efd);
+        *n = {efd, process, efd->waiters, nodes};
+        efd->waiters = n;
+    }
+    nodes = n;
+    return true;
+}
+
+EventFdWaitGroup::~EventFdWaitGroup() {
+    while (nodes) {
+        auto* n = nodes;
+        nodes = n->nextGroup;
+        {
+            EventFdGuard guard(n->efd);
+            auto** link = &n->efd->waiters;
+            while (*link && *link != n) link = &(*link)->next;
+            if (*link) *link = n->next;
+        }
+        ProcessUnref(n->process);
+        EventFdUnref(n->efd);
+        kfree(n);
+    }
+}
+
 EventFdSnapshot EventFdReady(EventFdData* efd, uint32_t events) {
     EventFdGuard guard(efd);
     uint32_t ready = 0;

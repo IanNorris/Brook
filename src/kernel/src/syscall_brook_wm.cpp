@@ -43,6 +43,24 @@ struct BrookWmCreateOut {
     uint64_t vfbUser;
 };
 
+// Window titles are bounded at 63 bytes. A longer user string is truncated
+// (the terminated prefix is kept), as the byte loop did before; an
+// inaccessible or kernel pointer is -EFAULT.
+static int64_t CopyWindowTitle(uint64_t address, char (&title)[64])
+{
+    const int result = CopyUserCStringResult(address, title, sizeof(title));
+    return result == -36 ? 0 : result;
+}
+
+static int64_t CopyCreateOut(uint64_t outPtr, const WmCreateWindowResult& res)
+{
+    BrookWmCreateOut out{};
+    out.wmId      = res.wmId;
+    out.vfbStride = res.vfbStride;
+    out.vfbUser   = reinterpret_cast<uint64_t>(res.vfbUser);
+    return CopyToUser(outPtr, &out, sizeof(out)) ? 0 : -EFAULT;
+}
+
 int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
                                     uint64_t titlePtr, uint64_t outPtr,
                                     uint64_t flags, uint64_t)
@@ -54,16 +72,13 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
 
     char titleBuf[64] = {};
     if (titlePtr) {
-        const char* utp = reinterpret_cast<const char*>(titlePtr);
-        for (uint32_t i = 0; i < sizeof(titleBuf) - 1; ++i) {
-            char c = utp[i];
-            titleBuf[i] = c;
-            if (!c) break;
-        }
-        titleBuf[sizeof(titleBuf) - 1] = '\0';
+        if (int64_t error = CopyWindowTitle(titlePtr, titleBuf)) return error;
     }
 
     if (flags & ~7ull) return -EINVAL;
+    // Check the result buffer before creating anything; a raced unmap after
+    // creation is rolled back below.
+    if (!UserBufferWritable(outPtr, sizeof(BrookWmCreateOut))) return -EFAULT;
     bool focusable = (flags & 2u) == 0;
     auto res = brook::WmCreateWindowForProcess(proc,
                                                  static_cast<uint16_t>(cW),
@@ -75,10 +90,10 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
         brook::WmSetClientSideDecoration(static_cast<int>(res.wmId) - 1, true);
     }
 
-    auto* uo = reinterpret_cast<BrookWmCreateOut*>(outPtr);
-    uo->wmId      = res.wmId;
-    uo->vfbStride = res.vfbStride;
-    uo->vfbUser   = reinterpret_cast<uint64_t>(res.vfbUser);
+    if (int64_t error = CopyCreateOut(outPtr, res)) {
+        brook::WmDestroyWindowById(proc, res.wmId);
+        return error;
+    }
     return 0;
 }
 
@@ -298,13 +313,7 @@ int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     if (!proc) return -ESRCH;
     if (wmId == 0 || !titlePtr) return -EINVAL;
     char buf[64] = {};
-    const char* utp = reinterpret_cast<const char*>(titlePtr);
-    for (uint32_t i = 0; i < sizeof(buf) - 1; ++i) {
-        char c = utp[i];
-        buf[i] = c;
-        if (!c) break;
-    }
-    buf[sizeof(buf) - 1] = '\0';
+    if (int64_t error = CopyWindowTitle(titlePtr, buf)) return error;
     {
         extern volatile uint64_t g_blockCacheHits;
         extern volatile uint64_t g_blockCacheMisses;
@@ -344,10 +353,25 @@ int64_t sys_brook_wm_pop_input(uint64_t wmId, uint64_t bufPtr,
     if (!proc) return -ESRCH;
     if (wmId == 0 || !bufPtr || !max) return -EINVAL;
     if (max > 256) max = 256;
-    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
-    if (!w) return -ENOENT;
-    auto* uo = reinterpret_cast<brook::Window::WmInputEvent*>(bufPtr);
-    return static_cast<int64_t>(brook::WmInputPop(w, uo, static_cast<uint32_t>(max)));
+    using Event = brook::Window::WmInputEvent;
+    // Check before popping so a bad buffer does not discard events. Pop
+    // into kernel memory under the window lock, then copy with it dropped.
+    if (!UserBufferWritable(bufPtr, max * sizeof(Event))) return -EFAULT;
+    static constexpr uint32_t Batch = 64;
+    Event staged[Batch];
+    uint64_t produced = 0;
+    while (produced < max) {
+        const uint32_t want = static_cast<uint32_t>(max - produced < Batch ? max - produced : Batch);
+        const int got = brook::WmInputPopById(proc, static_cast<uint32_t>(wmId), staged, want);
+        if (got < 0) return produced ? static_cast<int64_t>(produced) : got;
+        if (!got) break;
+        // A raced unmap loses only this batch; report what already landed.
+        if (!CopyToUser(bufPtr + produced * sizeof(Event), staged, static_cast<uint64_t>(got) * sizeof(Event)))
+            return produced ? static_cast<int64_t>(produced) : -EFAULT;
+        produced += static_cast<uint64_t>(got);
+        if (static_cast<uint32_t>(got) < want) break;
+    }
+    return static_cast<int64_t>(produced);
 }
 
 // 511: WM_RESIZE_VFB(wmId, newW, newH, outPtr)
@@ -365,6 +389,9 @@ int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
     if (wmId == 0 || wmId > 0xFFFFFFFFu) return -EINVAL;
     if (newW == 0 || newH == 0 || newW > 0xFFFF || newH > 0xFFFF) return -EINVAL;
     if (!outPtr) return -EFAULT;
+    // The old mapping is gone once the resize succeeds, so check the result
+    // buffer first. A raced unmap afterwards still reports -EFAULT.
+    if (!UserBufferWritable(outPtr, sizeof(BrookWmCreateOut))) return -EFAULT;
 
     brook::WmCreateWindowResult res = {};
     int rc = brook::WmResizeVfbForProcess(proc, static_cast<uint32_t>(wmId),
@@ -372,12 +399,7 @@ int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
                                            static_cast<uint16_t>(newH),
                                            &res);
     if (rc != 0) return rc;
-
-    auto* uo = reinterpret_cast<BrookWmCreateOut*>(outPtr);
-    uo->wmId      = res.wmId;
-    uo->vfbStride = res.vfbStride;
-    uo->vfbUser   = reinterpret_cast<uint64_t>(res.vfbUser);
-    return 0;
+    return CopyCreateOut(outPtr, res);
 }
 
 // 512: WM_SET_DECORATION_MODE(wmId, csdEnabled)

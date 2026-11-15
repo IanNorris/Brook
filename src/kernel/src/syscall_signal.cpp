@@ -34,10 +34,10 @@ int InstallWaitSignalMask(uint64_t address, uint64_t size)
 {
     if (!address) return 0;
     if (size != sizeof(uint64_t)) return -EINVAL;
-    if (!UserBufferReadable(address, sizeof(uint64_t))) return -EFAULT;
+    uint64_t mask;
+    if (!CopyFromUser(&mask, address, sizeof(mask))) return -EFAULT;
     Process* proc = ProcessCurrent();
     if (!proc || proc->pid >= MAX_PROCESSES) return -ESRCH;
-    uint64_t mask = *reinterpret_cast<const uint64_t*>(address);
     // SIGKILL and SIGSTOP cannot be blocked, including through these APIs.
     mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
     auto& saved = g_waitSignalMasks[proc->pid];
@@ -145,15 +145,15 @@ int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
     if (sigsetsize != 8) return -EINVAL;
-    if (!UserBufferReadable(setAddr, sizeof(uint64_t))) return -EFAULT;
     // Linux dequeues first and only then copies siginfo to the user buffer.
     // A bad output pointer therefore consumes the selected signal.
-    uint64_t waitSet = *reinterpret_cast<const uint64_t*>(setAddr);
+    uint64_t waitSet;
+    if (!CopyFromUser(&waitSet, setAddr, sizeof(waitSet))) return -EFAULT;
     waitSet &= ~((1ULL << 8) | (1ULL << 18));
     uint64_t deadline = 0;
     if (timeoutAddr) {
-        if (!UserBufferReadable(timeoutAddr, sizeof(timespec))) return -EFAULT;
-        timespec ts = *reinterpret_cast<const timespec*>(timeoutAddr);
+        timespec ts;
+        if (!CopyFromUser(&ts, timeoutAddr, sizeof(ts))) return -EFAULT;
         uint64_t duration;
         if (!TimeoutNanoseconds(ts.tv_sec, ts.tv_nsec, &duration)) return -EINVAL;
         deadline = TimeoutAddSafe(ClockNowNs(1), duration);
@@ -235,18 +235,25 @@ int64_t sys_rt_sigprocmask(uint64_t how, uint64_t setAddr, uint64_t oldAddr,
     if (!proc) return -ESRCH;
     if (sigsetsize != 8) return -EINVAL;
 
+    // Read and validate the new set before reporting the old mask, as Linux
+    // does: a bad set or how must not clobber oldset (M-23).
+    uint64_t newSet = 0;
+    if (setAddr)
+    {
+        if (!CopyFromUser(&newSet, setAddr, sizeof(newSet))) return -EFAULT;
+        if (how > 2) return -EINVAL;
+    }
+
     // Return old mask
     if (oldAddr)
     {
-        if (!UserBufferWritable(oldAddr, sizeof(uint64_t))) return -EFAULT;
-        *reinterpret_cast<uint64_t*>(oldAddr) = proc->sigMask;
+        const uint64_t old = proc->sigMask;
+        if (!CopyToUser(oldAddr, &old, sizeof(old))) return -EFAULT;
     }
 
     // Modify mask
     if (setAddr)
     {
-        if (!UserBufferReadable(setAddr, sizeof(uint64_t))) return -EFAULT;
-        uint64_t newSet = *reinterpret_cast<const uint64_t*>(setAddr);
         // Can't block SIGKILL (9) or SIGSTOP (19)
         uint64_t unblockable = (1ULL << 8) | (1ULL << 18);
         newSet &= ~unblockable;

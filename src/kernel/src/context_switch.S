@@ -92,15 +92,15 @@ context_switch:
     movq %rax, %cr3
 .Lsame_cr3:
 
-    // Set FS base (IA32_FS_BASE = 0xC0000100)
+    // Set FS base (IA32_FS_BASE = 0xC0000100). Always, including zero: a
+    // task whose base is 0 (ARCH_SET_FS 0, kernel threads) must not inherit
+    // the previous task's FS. Bases are validated as canonical user
+    // addresses at every entry (arch_prctl, clone), so wrmsr cannot #GP.
     movq 80(%rsi), %rax
-    testq %rax, %rax
-    jz .Lskip_fsbase
     movl $0xC0000100, %ecx
     movq %rax, %rdx
     shrq $32, %rdx
     wrmsr
-.Lskip_fsbase:
 
     // Always restore user GS, including zero; never migrate kernel GS.
     movq 88(%rsi), %rax

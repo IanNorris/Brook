@@ -1,4 +1,5 @@
 #include "process_fs.h"
+#include "user_copy.h"
 #include "scheduler.h"
 #include "cpu_idle.h"
 #include "scheduler_affinity.h"
@@ -1276,6 +1277,16 @@ static void ForkChildTrampoline()
     uint64_t userR10 = proc->forkR10;
     proc->isForkChild = false;
 
+    // CLONE_CHILD_SETTID: the child stores its TID in its own address space
+    // before user code runs. The copy may fault pages in, so run it with
+    // interrupts on, as ProcessTrampoline does before entering user mode.
+    if (const uint64_t tidAddress = proc->setChildTid) {
+        proc->setChildTid = 0;
+        const int32_t tid = static_cast<int32_t>(proc->pid);
+        __asm__ volatile("sti" ::: "memory");
+        (void)CopyToUser(tidAddress, &tid, sizeof(tid));
+    }
+
     // Enter user mode via IRETQ with ALL registers restored.
     // Linux preserves every register across fork except RAX (0 for child).
     // We use IRETQ instead of SYSRET because SYSRET faults are delivered in
@@ -2342,6 +2353,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     // Release any held kernel rwlocks / remove from wait queues.
     KRwLockCleanupOnExit(proc);
+    // A vfork child killed by a signal never reaches sys_exit or exec.
+    ProcessVforkRelease(proc);
 
     char procName[33];
     CopyProcessNameForLog(proc, procName);

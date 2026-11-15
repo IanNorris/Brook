@@ -113,29 +113,51 @@ int MemFdInstall(Process* proc, MemFdData* mfd, uint32_t flags)
     return fd < 0 ? -EMFILE : fd;
 }
 
-int64_t MemFdReadAt(MemFdData* mfd, void* buffer, uint64_t count, uint64_t* offset)
+// Data moves one page at a time: the page is resolved and copied to or from
+// a kernel bounce page under MfdLock, and user memory is touched only with
+// the lock dropped. Copying user memory under the spinlock let a demand
+// fault sleep under it, a raced unmap fault the kernel, and a read into the
+// memfd's own unfaulted MAP_SHARED mapping self-deadlock in
+// MemFdGetOrAllocPage. Kernel buffers (sendfile) are copied in place.
+static uint8_t* MemFdBounce(bool user, bool* failed)
 {
-    MfdLock(mfd);
-    uint64_t pos = *offset;
-    uint64_t available = pos < mfd->size ? mfd->size - pos : 0;
-    uint64_t total = count < available ? count : available;
-    auto* dst = static_cast<uint8_t*>(buffer);
-    for (uint64_t done = 0; done < total;) {
-        uint64_t index = pos / 4096, inPage = pos & 4095;
-        uint64_t n = 4096 - inPage;
-        if (n > total - done) n = total - done;
-        uint64_t raw = index < mfd->pageMapCount ? mfd->pageMap[index] : 0;
-        if (raw) memcpy(dst + done, reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(raw)).raw() + inPage), n);
-        else memset(dst + done, 0, n);
-        pos += n; done += n;
-    }
-    *offset = pos;
-    MfdUnlock(mfd);
-    return total;
+    if (!user) return nullptr;
+    auto* page = static_cast<uint8_t*>(kmalloc(4096));
+    *failed = page == nullptr;
+    return page;
 }
 
-int64_t MemFdWriteAt(MemFdData* mfd, const void* buffer, uint64_t count,
-                     uint64_t* offset, bool append)
+int64_t MemFdReadAt(MemFdData* mfd, uint64_t destination, uint64_t count, uint64_t* offset, bool user)
+{
+    if (!count) return 0;
+    bool noMemory = false;
+    uint8_t* bounce = MemFdBounce(user, &noMemory);
+    if (noMemory) return -ENOMEM;
+    uint64_t pos = *offset, done = 0;
+    bool faulted = false;
+    while (done < count) {
+        MfdLock(mfd);
+        const uint64_t available = pos < mfd->size ? mfd->size - pos : 0;
+        uint64_t n = 4096 - (pos & 4095);
+        if (n > count - done) n = count - done;
+        if (n > available) n = available;
+        if (!n) { MfdUnlock(mfd); break; }
+        const uint64_t index = pos / 4096, inPage = pos & 4095;
+        const uint64_t raw = index < mfd->pageMapCount ? mfd->pageMap[index] : 0;
+        uint8_t* target = user ? bounce : reinterpret_cast<uint8_t*>(destination + done);
+        if (raw) memcpy(target, reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(raw)).raw() + inPage), n);
+        else memset(target, 0, n);
+        MfdUnlock(mfd);
+        if (user && !CopyToUser(destination + done, bounce, n)) { faulted = true; break; }
+        pos += n; done += n;
+    }
+    if (bounce) kfree(bounce);
+    *offset = pos;
+    return faulted && !done ? -EFAULT : static_cast<int64_t>(done);
+}
+
+int64_t MemFdWriteAt(MemFdData* mfd, uint64_t source, uint64_t count,
+                     uint64_t* offset, bool append, bool user)
 {
     if (!count) return 0;
     MfdLock(mfd);
@@ -143,27 +165,41 @@ int64_t MemFdWriteAt(MemFdData* mfd, const void* buffer, uint64_t count,
     if (pos > 0x7fffffffffffffffULL || count > 0x7fffffffffffffffULL - pos) { MfdUnlock(mfd); return -EINVAL; }
     if(int error=MemFdSealedWrite(mfd->seals,mfd->size,pos+count)) {MfdUnlock(mfd);return error;}
     if (!MemFdGrowLocked(mfd, pos + count)) { MfdUnlock(mfd); return -ENOMEM; }
-    auto* src = static_cast<const uint8_t*>(buffer);
+    MfdUnlock(mfd);
+    bool noMemory = false;
+    uint8_t* bounce = MemFdBounce(user, &noMemory);
+    if (noMemory) return -ENOMEM;
     uint64_t done = 0;
+    int64_t error = 0;
     while (done < count) {
-        uint64_t index = pos / 4096, inPage = pos & 4095;
+        const uint64_t index = pos / 4096, inPage = pos & 4095;
         uint64_t n = 4096 - inPage;
         if (n > count - done) n = count - done;
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(source + done);
+        if (user) {
+            if (!CopyFromUser(bounce, source + done, n)) { error = -EFAULT; break; }
+            bytes = bounce;
+        }
+        MfdLock(mfd);
+        // Seals and size can change between chunks; recheck this one.
+        if ((error = MemFdSealedWrite(mfd->seals, mfd->size, pos + n)) ||
+            (!MemFdGrowLocked(mfd, pos + n) && (error = -ENOMEM))) { MfdUnlock(mfd); break; }
         uint64_t raw = mfd->pageMap[index];
         if (!raw) {
             PhysicalAddress page = PmmAllocPage(MemTag::User, 0);
-            if (!page) break;
+            if (!page) { MfdUnlock(mfd); error = -ENOMEM; break; }
             raw = page.raw();
             memset(reinterpret_cast<void*>(PhysToVirt(page).raw()), 0, 4096);
             mfd->pageMap[index] = raw;
         }
-        memcpy(reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(raw)).raw() + inPage), src + done, n);
+        memcpy(reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(raw)).raw() + inPage), bytes, n);
+        if (pos + n > mfd->size) mfd->size = pos + n;
+        MfdUnlock(mfd);
         pos += n; done += n;
     }
-    if (pos > mfd->size) mfd->size = pos;
+    if (bounce) kfree(bounce);
     *offset = pos;
-    MfdUnlock(mfd);
-    return done || !count ? static_cast<int64_t>(done) : -ENOMEM;
+    return done ? static_cast<int64_t>(done) : error;
 }
 
 // External wrappers for fork() in process.cpp, which doesn't see MemFdData.

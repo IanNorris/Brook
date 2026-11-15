@@ -305,6 +305,8 @@ retry_poll:
         NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup pipeWaiters;
+        EventFdWaitGroup eventWaiters;
+        SyncFileWait syncWait;
         // Allocate pipe subscriptions before installing legacy wait hooks, so
         // ENOMEM unwinds only RAII-owned exact registrations, never stale hooks.
         for (uint64_t i = 0; i < waiterCap; ++i) {
@@ -321,6 +323,11 @@ retry_poll:
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
                 if (!(fde->flags & 1)) // read end
                     if (!pipeWaiters.add(pb, self, POLLIN)) return -ENOMEM;
+            }
+            // Write end: a reader draining (or closing) notifies POLLOUT.
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLOUT) && fde->flags == 1)
+            {
+                if (!pipeWaiters.add(static_cast<PipeBuffer*>(fde->handle), self, POLLOUT)) return -ENOMEM;
             }
             if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
             {
@@ -366,12 +373,18 @@ retry_poll:
                 if ((fds[i].events & POLLIN) && usd->state == UnixSocketData::State::Listening)
                     usd->epollWaiter = self;
             }
-            if (fde->type == FdType::EventFd && fde->handle)
-            {
-                auto* efd = static_cast<EventFdData*>(fde->handle);
-                efd->readerWaiter = self;
-            }
+            if (fde->type == FdType::EventFd && fde->handle &&
+                !eventWaiters.add(static_cast<EventFdData*>(fde->handle), self))
+                safetyMs = 5;
+            if (fde->type == FdType::SyncFile && fde->handle && (fds[i].events & POLLIN))
+                syncWait.Want(*static_cast<SyncFileData*>(fde->handle));
+            // No wake source yet: signals aimed at another thread of the
+            // process, and nested epoll readiness. Poll these more often.
+            if ((fde->type == FdType::SignalFd || fde->type == FdType::EpollFd) && safetyMs > 10)
+                safetyMs = 10;
         }
+        // A fence that retired since the snapshot means: rescan, don't sleep.
+        if (syncWait.Arm()) ready++;
 
         // Re-check data availability after registration.
         // If data arrived between the initial scan and registration,
@@ -395,6 +408,15 @@ retry_poll:
                 if (!(fde->flags & 1) && (pb->count() > 0 || pb->writers == 0))
                 { ready++; break; }
             }
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLOUT) && fde->flags == 1)
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (pb->space() > 0 || __atomic_load_n(&pb->readers, __ATOMIC_ACQUIRE) == 0)
+                { ready++; break; }
+            }
+            if (fde->type == FdType::SyncFile && fde->handle && (fds[i].events & POLLIN) &&
+                SyncFileReady(*static_cast<SyncFileData*>(fde->handle), POLLIN))
+            { ready++; break; }
             if (fde->type == FdType::Socket && fde->handle)
             {
                 int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
@@ -435,6 +457,7 @@ retry_poll:
             // checks also service timerfds and descriptors without wait hooks.
             const uint64_t timerDeadline = timerWaiters.deadline(deadline);
             if (timerWaiters.allocationFailed) safetyMs = 5;
+            safetyMs = syncWait.SafetyMs(safetyMs);
             self->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
                 SchedulerBlockInterruptible(self);
@@ -457,12 +480,6 @@ retry_poll:
                     usd->state == UnixSocketData::State::Listening &&
                     usd->epollWaiter == self)
                     usd->epollWaiter = nullptr;
-            }
-            if (fde->type == FdType::EventFd && fde->handle)
-            {
-                auto* efd = static_cast<EventFdData*>(fde->handle);
-                if (efd->readerWaiter == self)
-                    efd->readerWaiter = nullptr;
             }
             if (fde->type == FdType::Socket && fde->handle)
             {
@@ -501,8 +518,8 @@ static int ParseWaitTimeout(uint64_t address, bool nanoseconds, uint64_t* timeou
 {
     *timeoutMs = ~0ULL;
     if (!address) return 0;
-    if (!UserBufferReadable(address, 2 * sizeof(int64_t))) return -EFAULT;
-    auto* value = reinterpret_cast<const int64_t*>(address);
+    int64_t value[2];
+    if (!CopyFromUser(value, address, sizeof(value))) return -EFAULT;
     int64_t sec = value[0], fraction = value[1];
     int64_t scale = nanoseconds ? 1000000000LL : 1000000LL;
     if (sec < 0 || fraction < 0 || fraction >= scale) return -EINVAL;
@@ -520,13 +537,11 @@ static int64_t PollUser(uint64_t fdsAddr, uint64_t nfds, uint64_t timeoutMs)
     if (bytes && (!UserBufferReadable(fdsAddr, bytes) || !UserBufferWritable(fdsAddr, bytes)))
         return -EFAULT;
     pollfd fds[MAX_FDS];
-    if (bytes) memcpy(fds, reinterpret_cast<const void*>(fdsAddr), bytes);
+    if (bytes && !CopyFromUser(fds, fdsAddr, bytes)) return -EFAULT;
     int64_t result = PollWait(fds, nfds, timeoutMs);
-    if (result >= 0 && bytes) {
-        if (!UserBufferWritable(fdsAddr, bytes)) return -EFAULT;
-        auto* user = reinterpret_cast<pollfd*>(fdsAddr);
-        for (uint64_t i = 0; i < nfds; ++i) user[i].revents = fds[i].revents;
-    }
+    // One checked copy of the whole array: fd and events are written back
+    // unchanged from the snapshot taken above, revents with the results.
+    if (result >= 0 && bytes && !CopyToUser(fdsAddr, fds, bytes)) return -EFAULT;
     return result;
 }
 
@@ -563,9 +578,8 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     uint64_t bytes = ((nfds + 63) / 64) * sizeof(uint64_t);
     for (uint32_t set = 0; set < 3; ++set) {
         if (!addresses[set] || !bytes) continue;
-        if (!UserBufferReadable(addresses[set], bytes) ||
-            !UserBufferWritable(addresses[set], bytes)) return -EFAULT;
-        memcpy(inputs[set], reinterpret_cast<const void*>(addresses[set]), bytes);
+        if (!UserBufferWritable(addresses[set], bytes) ||
+            !CopyFromUser(inputs[set], addresses[set], bytes)) return -EFAULT;
     }
     uint64_t timeoutMs;
     int error = ParseWaitTimeout(timeoutAddr, nanoseconds, &timeoutMs);
@@ -588,12 +602,11 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     uint64_t started = ClockNowNs(1);
     int64_t result = PollWait(fds, count, timeoutMs, true);
     if (timeoutAddr && !nanoseconds) {
-        if (!UserBufferWritable(timeoutAddr, 16)) return -EFAULT;
         uint64_t elapsed = (ClockNowNs(1) - started) / 1000000ULL;
         uint64_t remaining = elapsed < timeoutMs ? timeoutMs - elapsed : 0;
-        auto* value = reinterpret_cast<int64_t*>(timeoutAddr);
-        value[0] = static_cast<int64_t>(remaining / 1000);
-        value[1] = static_cast<int64_t>((remaining % 1000) * 1000);
+        const int64_t value[2] = {static_cast<int64_t>(remaining / 1000),
+                                  static_cast<int64_t>((remaining % 1000) * 1000)};
+        if (!CopyToUser(timeoutAddr, value, sizeof(value))) return -EFAULT;
     }
     if (result < 0) return result;
     int readyBits = 0;
@@ -611,8 +624,7 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     }
     for (uint32_t set = 0; set < 3; ++set) {
         if (!addresses[set] || !bytes) continue;
-        if (!UserBufferWritable(addresses[set], bytes)) return -EFAULT;
-        memcpy(reinterpret_cast<void*>(addresses[set]), outputs[set], bytes);
+        if (!CopyToUser(addresses[set], outputs[set], bytes)) return -EFAULT;
     }
     return readyBits;
 }
@@ -630,8 +642,7 @@ int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
         // The sixth Linux argument points to {sigset pointer, sigset size},
         // rather than directly to a sigset as in ppoll/epoll_pwait.
         struct MaskArgument { uint64_t address; uint64_t size; } argument;
-        if (!UserBufferReadable(sigmaskAddr, sizeof(argument))) return -EFAULT;
-        memcpy(&argument, reinterpret_cast<const void*>(sigmaskAddr), sizeof(argument));
+        if (!CopyFromUser(&argument, sigmaskAddr, sizeof(argument))) return -EFAULT;
         int error = InstallWaitSignalMask(argument.address, argument.size);
         if (error) return error;
     }

@@ -272,10 +272,10 @@ static bool DrmAccessResult(const char* path,uint8_t mode,bool realIds,int64_t* 
 
 // Internal stat helper — takes a kernel-space path directly (no user copy).
 // statAddr is the user-space address of the stat buffer.
-static int64_t do_stat_internal(const char* path, uint64_t statAddr,int dirfd=-100)
+// Fills a kernel LinuxStat; the wrapper below copies it out once, so VFS
+// work never writes user memory directly.
+static int64_t StatPathFill(const char* path, LinuxStat* st, int dirfd)
 {
-    if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
-    auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
     // Resolve relative paths (including ".") against CWD
     AtLookup at;if(int error=at.Init(dirfd,path))return error;
@@ -320,12 +320,19 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr,int dirfd=-1
     FillStat(st, vs);
     return 0;
 }
-
-// Internal lstat helper — takes a kernel-space path directly.
-static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-100)
+static int64_t do_stat_internal(const char* path, uint64_t statAddr,int dirfd=-100)
 {
     if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
-    auto* st = reinterpret_cast<LinuxStat*>(statAddr);
+    LinuxStat st{};
+    if (int64_t error = StatPathFill(path, &st, dirfd)) return error;
+    return CopyToUser(statAddr, &st, sizeof(st)) ? 0 : -EFAULT;
+}
+
+// Internal lstat helper — takes a kernel-space path directly.
+// Fills a kernel LinuxStat; the wrapper below copies it out once, so VFS
+// work never writes user memory directly.
+static int64_t LstatPathFill(const char* path, LinuxStat* st, int dirfd)
+{
 
     AtLookup at;if(int error=at.Init(dirfd,path))return error;
     char resolved[512];bool hasSyntheticName=!at.SyntheticName(path,resolved,sizeof(resolved));
@@ -367,6 +374,13 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-
 
     FillStat(st, vs);
     return 0;
+}
+static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-100)
+{
+    if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
+    LinuxStat st{};
+    if (int64_t error = LstatPathFill(path, &st, dirfd)) return error;
+    return CopyToUser(statAddr, &st, sizeof(st)) ? 0 : -EFAULT;
 }
 
 int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
@@ -664,7 +678,10 @@ int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     } else if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     if (!UserBufferWritable(bufAddr, sizeof(linux_statx))) return -EFAULT;
     const char* path = pathBuf;
-    auto* stx = reinterpret_cast<linux_statx*>(bufAddr);
+    // Filled in kernel memory; copyOut writes the user buffer once.
+    linux_statx staged{};
+    auto* stx = &staged;
+    auto copyOut = [&]() -> int64_t { return CopyToUser(bufAddr, &staged, sizeof(staged)) ? 0 : -EFAULT; };
 
     auto fillStatxFromLinuxStat = [&](const LinuxStat& st) {
         auto* raw = reinterpret_cast<uint8_t*>(stx);
@@ -699,7 +716,7 @@ int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
             : FstatKernel(dirfd,&st);
         if (ret < 0) return ret;
         fillStatxFromLinuxStat(st);
-        return 0;
+        return copyOut();
     }
 
     VnodeStat st{};
@@ -708,7 +725,7 @@ int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     char resolved[512];
     if(!at.SyntheticName(path,resolved,sizeof(resolved))) {
         LinuxStat dst;
-        if(DrmStatFill(resolved,&dst)) {fillStatxFromLinuxStat(dst);return 0;}
+        if(DrmStatFill(resolved,&dst)) {fillStatxFromLinuxStat(dst);return copyOut();}
     }
     int ret=VfsStatAt(at.fs.root,at.start(),path,&st,!(flags&0x100));
     if(ret)return ret==-1?-ENOENT:ret;
@@ -719,7 +736,7 @@ int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     FillStat(&dst, st);
     fillStatxFromLinuxStat(dst);
 
-    return 0;
+    return copyOut();
 }
 
 // ---------------------------------------------------------------------------

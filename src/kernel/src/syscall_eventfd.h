@@ -9,6 +9,8 @@
 
 namespace brook {
 
+struct EventFdWaitNode;
+
 // EventFd data structure (used in read/write/poll/close)
 struct EventFdData {
     KMutex lock; // graph -> eventfd; never acquire graph while holding this
@@ -18,8 +20,33 @@ struct EventFdData {
     uint64_t identity;
     uint32_t flags;
     volatile uint32_t refCount;
-    Process* readerWaiter;
-    Process* epollWaiter;  // process blocked in epoll_wait watching this eventfd
+    // Every blocked read, write, poll and epoll_wait on this eventfd, under
+    // lock. A list rather than single slots: concurrent waiters each get the
+    // wake instead of the last registration winning.
+    EventFdWaitNode* waiters;
+};
+
+struct EventFdWaitNode {
+    EventFdData* efd;
+    Process* process;
+    EventFdWaitNode* next;      // efd->waiters
+    EventFdWaitNode* nextGroup; // owning EventFdWaitGroup
+};
+
+// Wake every registered waiter; any counter change can satisfy readers
+// (POLLIN) or writers (POLLOUT). Caller holds efd->lock.
+void EventFdWakeLocked(EventFdData* efd);
+
+// Registrations owned by one blocking operation. Each holds a reference on
+// the eventfd and the process; the destructor unregisters all of them.
+struct EventFdWaitGroup {
+    EventFdWaitNode* nodes = nullptr;
+    EventFdWaitGroup() = default;
+    EventFdWaitGroup(const EventFdWaitGroup&) = delete;
+    EventFdWaitGroup& operator=(const EventFdWaitGroup&) = delete;
+    // Register before the final readiness check; false on allocation failure.
+    bool add(EventFdData* efd, Process* process);
+    ~EventFdWaitGroup();
 };
 
 extern uint64_t g_eventFdIdentity;

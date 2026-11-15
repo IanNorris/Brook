@@ -35,9 +35,9 @@ static int64_t CopyExecVector(uint64_t vectorAddr, const char** values,
     if (!vectorAddr) return 0;
     for (;;) {
         uint64_t slot;
+        uint64_t source;
         if (__builtin_add_overflow(vectorAddr, static_cast<uint64_t>(count) * 8, &slot) ||
-            !UserBufferReadable(slot, sizeof(uint64_t))) return -EFAULT;
-        uint64_t source = *reinterpret_cast<const uint64_t*>(slot);
+            !CopyFromUser(&source, slot, sizeof(source))) return -EFAULT;
         if (!source) return 0;
         if (count == maxCount) return -E2BIG;
         uint32_t start = used;
@@ -46,12 +46,11 @@ static int64_t CopyExecVector(uint64_t vectorAddr, const char** values,
             if (used == capacity) return -E2BIG;
             uint32_t chunk = 4096 - (source & 4095);
             if (chunk > capacity - used) chunk = capacity - used;
-            if (!UserBufferReadable(source, chunk)) return -EFAULT;
-            const char* bytes = reinterpret_cast<const char*>(source);
+            // Copy the chunk (never past this page) into storage, then find
+            // the terminator; bytes after it are overwritten by the next value.
+            if (!CopyFromUser(storage + used, source, chunk)) return -EFAULT;
             for (uint32_t i = 0; i < chunk; ++i) {
-                char c = bytes[i];
-                storage[used++] = c;
-                if (!c) { terminated = true; break; }
+                if (!storage[used++]) { terminated = true; break; }
             }
             source += chunk;
         }
@@ -512,11 +511,7 @@ resolve_path:
     __asm__ volatile("push %0; popfq" :: "r"(segmentFlags) : "memory", "cc");
 
     // Wake vfork parent — exec is complete, parent can resume
-    if (proc->vforkParent)
-    {
-        SchedulerUnblock(proc->vforkParent);
-        proc->vforkParent = nullptr;
-    }
+    ProcessVforkRelease(proc);
 
     // Enter user mode — this does NOT return
     SwitchToUserMode(newStackPtr, newEntry);

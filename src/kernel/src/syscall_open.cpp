@@ -77,26 +77,15 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
 
     UserAccessScope pathAccess(proc);
     char pathBuf[512];
-    const char* path = nullptr;
-    if (pathAddr < 0x0000800000000000ULL)
-    {
-        if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
-            Process* p = ProcessCurrent();
-            SerialPrintf("sys_open: EFAULT pathAddr=0x%lx pid=%u (%s)\n",
-                         pathAddr, p ? p->pid : 0, p ? p->name : "?");
-            return -EFAULT;
-        }
-        path = pathBuf;
-    }
-    else if ((pathAddr >> 47) == 0x1FFFFULL)
-    {
-        // Internal callers such as openat() pass kernel-built absolute paths.
-        path = reinterpret_cast<const char*>(pathAddr);
-    }
-    else
-    {
+    // The path is always a user pointer. There are no in-kernel callers, so
+    // an upper-half address is never trusted as a kernel string.
+    if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
+        Process* p = ProcessCurrent();
+        SerialPrintf("sys_open: EFAULT pathAddr=0x%lx pid=%u (%s)\n",
+                     pathAddr, p ? p->pid : 0, p ? p->name : "?");
         return -EFAULT;
     }
+    const char* path = pathBuf;
 
     AtLookup at;if(int error=at.Init(dirfd,path))return error;
     char resolvedPath[512];
@@ -226,21 +215,34 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // raw keyboard events from the input subsystem.
     if (StrEq(syntheticPath, "/dev/tty") || StrEq(syntheticPath, "/dev/console"))
     {
-        if (proc->fds[0].type == FdType::Pipe && proc->fds[0].handle &&
-            proc->fds[1].type == FdType::Pipe && proc->fds[1].handle)
+        // Pin fds 0 and 1 so a sibling's close or dup2 cannot free the pipes
+        // while they are borrowed, retain both ends, and only then publish
+        // the complete descriptor (with its access mode and O_CLOEXEC).
+        FdRef input(proc, 0), output(proc, 1);
+        if (input && input->type == FdType::Pipe && input->handle &&
+            output && output->type == FdType::Pipe && output->handle)
         {
             // Terminal mode: /dev/tty reads from stdin pipe, writes to stdout pipe
             auto* pair = static_cast<TtyDevicePair*>(kmalloc(sizeof(TtyDevicePair)));
             if (!pair) return -ENOMEM;
-            pair->readPipe = proc->fds[0].handle;
-            pair->writePipe = proc->fds[1].handle;
-            int fd = FdAlloc(proc, FdType::DevTty, pair);
-            if (fd < 0) { kfree(pair); return -EMFILE; }
-            proc->fds[fd].statusFlags = 2; // O_RDWR
+            pair->readPipe = input->handle;
+            pair->writePipe = output->handle;
             auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
             auto* wp = static_cast<PipeBuffer*>(pair->writePipe);
             __atomic_fetch_add(&rp->readers, 1, __ATOMIC_RELEASE);
             __atomic_fetch_add(&wp->writers, 1, __ATOMIC_RELEASE);
+            FdEntry entry{};
+            entry.type = FdType::DevTty;
+            entry.handle = pair;
+            entry.statusFlags = 2; // O_RDWR
+            entry.fdFlags = (flags & 0x80000) ? 1 : 0;
+            int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), entry, 0, -1, nullptr);
+            if (fd < 0) {
+                PipeReleaseEnd(rp, false);
+                PipeReleaseEnd(wp, true);
+                kfree(pair);
+                return -EMFILE;
+            }
             return fd;
         }
         int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);

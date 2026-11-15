@@ -94,8 +94,8 @@ int64_t sys_time(uint64_t tloc, uint64_t, uint64_t,
 int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t)
 {
-    if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
-    timespec req = *reinterpret_cast<const timespec*>(reqAddr);
+    timespec req;
+    if (!CopyFromUser(&req, reqAddr, sizeof(req))) return -EFAULT;
     uint64_t duration;
     if (!TimeoutNanoseconds(req.tv_sec, req.tv_nsec, &duration)) return -EINVAL;
     const uint64_t deadline = TimeoutAddSafe(ClockNowNs(1), duration);
@@ -109,11 +109,11 @@ int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         {
             if (remAddr)
             {
-                if (!UserBufferWritable(remAddr, sizeof(timespec))) return -EFAULT;
-                auto* rem = reinterpret_cast<timespec*>(remAddr);
                 uint64_t remaining = deadline - now;
-                rem->tv_sec = static_cast<int64_t>(remaining / 1000000000ULL);
-                rem->tv_nsec = static_cast<int64_t>(remaining % 1000000000ULL);
+                timespec rem{};
+                rem.tv_sec = static_cast<int64_t>(remaining / 1000000000ULL);
+                rem.tv_nsec = static_cast<int64_t>(remaining % 1000000000ULL);
+                if (!CopyToUser(remAddr, &rem, sizeof(rem))) return -EFAULT;
             }
             return -EINTR;
         }
@@ -127,11 +127,11 @@ int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         now = ClockNowNs(1);
     }
 
-    if (remAddr && UserBufferWritable(remAddr, sizeof(timespec)))
+    if (remAddr)
     {
-        auto* rem = reinterpret_cast<timespec*>(remAddr);
-        rem->tv_sec = 0;
-        rem->tv_nsec = 0;
+        // Best effort, as before: a completed sleep never fails on rem.
+        const timespec rem{};
+        (void)CopyToUser(remAddr, &rem, sizeof(rem));
     }
     return 0;
 }
@@ -141,8 +141,8 @@ int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t reqAddr,
 {
     if (clockid != 0 && clockid != 1 && clockid != 7) return -EINVAL;
     if (flags & ~1ULL) return -EINVAL;
-    if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
-    timespec req = *reinterpret_cast<const timespec*>(reqAddr);
+    timespec req;
+    if (!CopyFromUser(&req, reqAddr, sizeof(req))) return -EFAULT;
     uint64_t requested;
     if (!TimeoutNanoseconds(req.tv_sec, req.tv_nsec, &requested)) return -EINVAL;
     if (flags & 1) { // TIMER_ABSTIME: convert from the requested clock domain.
@@ -173,13 +173,14 @@ int64_t sys_timer_create(uint64_t clock, uint64_t eventAddr, uint64_t idAddr,
 {
     if (!UserBufferWritable(idAddr, sizeof(int32_t))) return -EFAULT;
     PosixSigevent event{};
-    if (eventAddr) {
-        if (!UserBufferReadable(eventAddr, sizeof(event))) return -EFAULT;
-        __builtin_memcpy(&event, reinterpret_cast<void*>(eventAddr), sizeof(event));
-    }
+    if (eventAddr && !CopyFromUser(&event, eventAddr, sizeof(event))) return -EFAULT;
     int32_t id;
     int result = PosixTimerCreate(ProcessCurrent(), (int)clock, eventAddr ? &event : nullptr, &id);
-    if (!result) __builtin_memcpy(reinterpret_cast<void*>(idAddr), &id, sizeof(id));
+    // A raced unmap of the id buffer must not leak the new timer.
+    if (!result && !CopyToUser(idAddr, &id, sizeof(id))) {
+        (void)PosixTimerDelete(ProcessCurrent(), id);
+        return -EFAULT;
+    }
     return result;
 }
 int64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t valueAddr,
@@ -187,8 +188,7 @@ int64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t valueAddr,
 {
     PosixItimerspec value, old;
     if (!valueAddr) return -EINVAL;
-    if (!UserBufferReadable(valueAddr, sizeof(value))) return -EFAULT;
-    __builtin_memcpy(&value, reinterpret_cast<void*>(valueAddr), sizeof(value));
+    if (!CopyFromUser(&value, valueAddr, sizeof(value))) return -EFAULT;
     int result = PosixTimerSet(ProcessCurrent(), (int32_t)id, (unsigned)flags, value, oldAddr ? &old : nullptr);
     if (!result && oldAddr && !CopyToUser(oldAddr, &old, sizeof(old))) return -EFAULT;
     return result;
@@ -199,7 +199,7 @@ int64_t sys_timer_gettime(uint64_t id, uint64_t valueAddr, uint64_t,
     PosixItimerspec value;
     if (!UserBufferWritable(valueAddr, sizeof(value))) return -EFAULT;
     int result = PosixTimerGet(ProcessCurrent(), (int32_t)id, &value);
-    if (!result) __builtin_memcpy(reinterpret_cast<void*>(valueAddr), &value, sizeof(value));
+    if (!result && !CopyToUser(valueAddr, &value, sizeof(value))) return -EFAULT;
     return result;
 }
 int64_t sys_timer_getoverrun(uint64_t id, uint64_t, uint64_t,

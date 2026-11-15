@@ -588,9 +588,15 @@ int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
         if (!present) return -ENOMEM;
     }
 
-    auto* vec = reinterpret_cast<uint8_t*>(vecAddr);
-    for (uint64_t i = 0; i < pages; ++i)
-        vec[i] = 1; // all mapped pages are treated as resident (no swap)
+    // All mapped pages are treated as resident (no swap). Fill in bounded
+    // kernel chunks and copy them out with the checked user copy.
+    uint8_t ones[256];
+    __builtin_memset(ones, 1, sizeof(ones));
+    for (uint64_t done = 0; done < pages;) {
+        const uint64_t n = pages - done < sizeof(ones) ? pages - done : sizeof(ones);
+        if (!CopyToUser(vecAddr + done, ones, n)) return -EFAULT;
+        done += n;
+    }
     return 0;
 }
 

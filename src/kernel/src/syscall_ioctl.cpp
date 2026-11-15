@@ -89,6 +89,77 @@ struct FbFixScreeninfo {
     uint16_t reserved[2];
 };
 
+// Terminal ioctls (keyboard and terminal-pipe descriptors). Results are
+// built in kernel memory and copied once with the checked user copy.
+// termios (TCGETS) is 36 bytes; termios2 (TCGETS2) appends two speeds.
+static int64_t CopyTermiosOut(const Process* proc, uint64_t arg, bool termios2)
+{
+    uint8_t out[44] = {};
+    uint32_t flags[4] = {0x0500,  // c_iflag: ICRNL | IXON
+                         0x0005,  // c_oflag: OPOST | ONLCR
+                         0x00BF,  // c_cflag: CS8 | CREAD | HUPCL | B38400
+                         0x8A31}; // c_lflag base: ECHOE|ECHOK|ISIG|IEXTEN|ECHOCTL|ECHOKE
+    if (proc->ttyCanonical) flags[3] |= 0x0002; // ICANON
+    if (proc->ttyEcho)      flags[3] |= 0x0008; // ECHO
+    memcpy(out, flags, sizeof(flags));
+    // out[16] is c_line (N_TTY); c_cc (19 bytes) starts at offset 17:
+    // VINTR ^C, VQUIT ^\, VERASE DEL, VKILL ^U, VEOF ^D, VTIME 0, VMIN 1,
+    // VSWTC, VSTART ^Q, VSTOP ^S, VSUSP ^Z, VEOL, VREPRINT ^R, VDISCARD ^O,
+    // VWERASE ^W, VLNEXT ^V, VEOL2.
+    static const uint8_t cc[17] = {0x03,0x1C,0x7F,0x15,0x04,0,1,0,0x11,0x13,0x1A,0,0x12,0x0F,0x17,0x16,0};
+    memcpy(out + 17, cc, sizeof(cc));
+    if (termios2) {
+        const uint32_t speed = 38400; // c_ispeed, c_ospeed
+        memcpy(out + 36, &speed, sizeof(speed));
+        memcpy(out + 40, &speed, sizeof(speed));
+    }
+    return CopyToUser(arg, out, termios2 ? 44 : 36) ? 0 : -EFAULT;
+}
+
+// TCSETS/TCSETSW/TCSETSF: track ICANON and ECHO.
+static int64_t SetTermiosFrom(uint64_t arg)
+{
+    uint32_t flags[4];
+    if (!CopyFromUser(flags, arg, sizeof(flags))) return -EFAULT;
+    if (Process* cur = ProcessCurrent()) {
+        cur->ttyCanonical = (flags[3] & 0x0002) != 0; // ICANON
+        cur->ttyEcho      = (flags[3] & 0x0008) != 0; // ECHO
+    }
+    return 0;
+}
+
+static int64_t CopyPgrpOut(uint64_t arg)
+{
+    int pgrp = 1;
+    if (Process* cur = ProcessCurrent()) {
+        Terminal* term = TerminalFindByProcess(cur);
+        pgrp = term ? static_cast<int>(term->foregroundPgid) : static_cast<int>(cur->pgid);
+    }
+    return CopyToUser(arg, &pgrp, sizeof(pgrp)) ? 0 : -EFAULT;
+}
+
+static int64_t SetPgrpFrom(uint64_t arg)
+{
+    int newPgid;
+    if (!CopyFromUser(&newPgid, arg, sizeof(newPgid))) return -EFAULT;
+    if (Process* cur = ProcessCurrent()) {
+        if (Terminal* term = TerminalFindByProcess(cur)) {
+            term->foregroundPgid = static_cast<uint16_t>(newPgid);
+            DbgPrintf("TIOCSPGRP: pid %u set fg pgid to %d\n", cur->pid, newPgid);
+        }
+    }
+    return 0;
+}
+
+static int64_t CopyWinsizeOut(Process* proc, uint64_t arg)
+{
+    TerminalGeometry geometry{25,80,0,0};
+    TerminalSnapshotGeometry(proc,&geometry);
+    const uint16_t ws[4] = {static_cast<uint16_t>(geometry.rows), static_cast<uint16_t>(geometry.cols),
+                            static_cast<uint16_t>(geometry.width), static_cast<uint16_t>(geometry.height)};
+    return CopyToUser(arg, ws, sizeof(ws)) ? 0 : -EFAULT;
+}
+
 int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                    uint64_t, uint64_t, uint64_t)
 {
@@ -227,8 +298,9 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // live in the same 0x54xx range as terminal ioctls.
     if (cmd == 0x5421) // FIONBIO
     {
-        if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
-        bool nonblock = *reinterpret_cast<int*>(arg) != 0;
+        int requested = 0;
+        if (!CopyFromUser(&requested, arg, sizeof(requested))) return -EFAULT;
+        bool nonblock = requested != 0;
         if (fde->type == FdType::Socket || fde->type == FdType::NetlinkSocket || fde->type == FdType::UnixSocket ||
             FdPipe(fde) || fde->type == FdType::DevTty || fde->type == FdType::DevDsp) {
             SpinLockAcquire(ProcessFdLock(proc));
@@ -266,8 +338,7 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         } else {
             return -25; // ENOTTY
         }
-        *reinterpret_cast<int*>(arg) = available;
-        return 0;
+        return CopyToUser(arg, &available, sizeof(available)) ? 0 : -EFAULT;
     }
 
     if(fde->type==FdType::DevIntelDri)return IntelRenderIoctl(static_cast<brook::BdwGpuFile*>(fde->handle),cmd,arg,fd);
@@ -324,10 +395,8 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
 
         if (cmd == FBIOGET_VSCREENINFO)
         {
-            if (!UserBufferWritable(arg, sizeof(FbVarScreeninfo))) return -EFAULT;
-            auto* info = reinterpret_cast<FbVarScreeninfo*>(arg);
-            auto* raw = reinterpret_cast<uint8_t*>(info);
-            memset(raw, 0, sizeof(FbVarScreeninfo));
+            FbVarScreeninfo staged{};
+            auto* info = &staged;
 
             info->xres = repW;
             info->yres = repH;
@@ -339,15 +408,13 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             info->green_offset = 8;  info->green_length = 8;
             info->red_offset   = 16; info->red_length   = 8;
             info->transp_offset = 24; info->transp_length = 8;
-            return 0;
+            return CopyToUser(arg, &staged, sizeof(staged)) ? 0 : -EFAULT;
         }
 
         if (cmd == FBIOGET_FSCREENINFO)
         {
-            if (!UserBufferWritable(arg, sizeof(FbFixScreeninfo))) return -EFAULT;
-            auto* info = reinterpret_cast<FbFixScreeninfo*>(arg);
-            auto* raw = reinterpret_cast<uint8_t*>(info);
-            memset(raw, 0, sizeof(FbFixScreeninfo));
+            FbFixScreeninfo staged{};
+            auto* info = &staged;
 
             const char* name = "brook_fb";
             for (int i = 0; name[i] && i < 15; ++i) info->id[i] = name[i];
@@ -359,15 +426,16 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             info->line_length = repStride;
             info->mmio_start  = physBase;
             info->mmio_len    = repStride * repH;
-            return 0;
+            return CopyToUser(arg, &staged, sizeof(staged)) ? 0 : -EFAULT;
         }
 
         if (cmd == FBIOPUT_VSCREENINFO)
         {
             // Honor requested xres/yres: resize the process VFB and its
             // associated WM window so the renderer blits 1:1.
-            const auto* info = reinterpret_cast<const FbVarScreeninfo*>(arg);
-            if (!UserBufferReadable(arg, sizeof(FbVarScreeninfo))) return -EFAULT;
+            FbVarScreeninfo requested{};
+            if (!CopyFromUser(&requested, arg, sizeof(requested))) return -EFAULT;
+            const auto* info = &requested;
             uint32_t newW = info->xres;
             uint32_t newH = info->yres;
             if (newW == 0 || newH == 0) return -EINVAL;
@@ -409,96 +477,25 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TCGETS — return current termios state
         if (cmd == 0x5401)
         {
-            // termios struct: 4 × uint32_t + 1 byte c_line + 19 bytes c_cc = 36 bytes
-            if (!UserBufferWritable(arg, 36)) return -EFAULT;
-            auto* t = reinterpret_cast<uint32_t*>(arg);
-            t[0] = 0x0500;   // c_iflag: ICRNL | IXON
-            t[1] = 0x0005;   // c_oflag: OPOST | ONLCR
-            t[2] = 0x00BF;   // c_cflag: CS8 | CREAD | HUPCL | B38400
-            // Build c_lflag from actual state
-            uint32_t lflag = 0x8A31; // base: ECHOE|ECHOK|ISIG|IEXTEN|ECHOCTL|ECHOKE
-            if (proc->ttyCanonical) lflag |= 0x0002; // ICANON
-            if (proc->ttyEcho)      lflag |= 0x0008; // ECHO
-            t[3] = lflag;
-            // c_line at offset 16
-            auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
-            raw[0] = 0;  // c_line = N_TTY
-            // c_cc starts at offset 17 (raw[1])
-            auto* cc = &raw[1];
-            __builtin_memset(cc, 0, 19); // NCCS = 19 for old termios
-            cc[0]  = 0x03;  // VINTR  = Ctrl+C
-            cc[1]  = 0x1C;  // VQUIT  = Ctrl+backslash
-            cc[2]  = 0x7F;  // VERASE = DEL
-            cc[3]  = 0x15;  // VKILL  = Ctrl+U
-            cc[4]  = 0x04;  // VEOF   = Ctrl+D
-            cc[5]  = 0;     // VTIME  = 0
-            cc[6]  = 1;     // VMIN   = 1
-            cc[7]  = 0;     // VSWTC
-            cc[8]  = 0x11;  // VSTART = Ctrl+Q (XON)
-            cc[9]  = 0x13;  // VSTOP  = Ctrl+S (XOFF)
-            cc[10] = 0x1A;  // VSUSP  = Ctrl+Z
-            cc[11] = 0;     // VEOL
-            cc[12] = 0x12;  // VREPRINT = Ctrl+R
-            cc[13] = 0x0F;  // VDISCARD = Ctrl+O
-            cc[14] = 0x17;  // VWERASE = Ctrl+W
-            cc[15] = 0x16;  // VLNEXT  = Ctrl+V
-            cc[16] = 0;     // VEOL2
-            return 0;
+            return CopyTermiosOut(proc, arg, false);
         }
 
         // TCSETS/TCSETSW/TCSETSF — track ICANON and ECHO flags
         if (cmd >= 0x5402 && cmd <= 0x5404)
         {
-            if (!UserBufferReadable(arg, 16)) return -EFAULT;
-            auto* t = reinterpret_cast<const uint32_t*>(arg);
-            Process* cur = ProcessCurrent();
-            if (cur)
-            {
-                uint32_t lflag = t[3];
-                cur->ttyCanonical = (lflag & 0x0002) != 0; // ICANON
-                cur->ttyEcho      = (lflag & 0x0008) != 0; // ECHO
-            }
-            return 0;
+            return SetTermiosFrom(arg);
         }
 
         // TIOCGPGRP
         if (cmd == 0x540F)
         {
-            if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
-            auto* pgrp = reinterpret_cast<int*>(arg);
-            Process* cur = ProcessCurrent();
-            if (cur)
-            {
-                Terminal* term = TerminalFindByProcess(cur);
-                if (term)
-                    *pgrp = static_cast<int>(term->foregroundPgid);
-                else
-                    *pgrp = static_cast<int>(cur->pgid);
-            }
-            else
-            {
-                *pgrp = 1;
-            }
-            return 0;
+            return CopyPgrpOut(arg);
         }
 
         // TIOCSPGRP
         if (cmd == 0x5410)
         {
-            if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
-            auto* pgrpPtr = reinterpret_cast<const int*>(arg);
-            int newPgid = *pgrpPtr;
-            Process* cur = ProcessCurrent();
-            if (cur)
-            {
-                Terminal* term = TerminalFindByProcess(cur);
-                if (term)
-                {
-                    term->foregroundPgid = static_cast<uint16_t>(newPgid);
-                    DbgPrintf("TIOCSPGRP: pid %u set fg pgid to %d\n", cur->pid, newPgid);
-                }
-            }
-            return 0;
+            return SetPgrpFrom(arg);
         }
 
         // TIOCSCTTY
@@ -508,15 +505,7 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         // TIOCGWINSZ
         if (cmd == 0x5413)
         {
-            if (!UserBufferWritable(arg, 4 * sizeof(uint16_t))) return -EFAULT;
-            auto* ws = reinterpret_cast<uint16_t*>(arg);
-            TerminalGeometry geometry{25,80,0,0};
-            TerminalSnapshotGeometry(proc,&geometry);
-            ws[0] = static_cast<uint16_t>(geometry.rows);
-            ws[1] = static_cast<uint16_t>(geometry.cols);
-            ws[2] = static_cast<uint16_t>(geometry.width);
-            ws[3] = static_cast<uint16_t>(geometry.height);
-            return 0;
+            return CopyWinsizeOut(proc, arg);
         }
 
         return 0;
@@ -532,90 +521,23 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     bool isTtyFd = IsTerminalFd(fde);
     if (isTtyFd && cmd == 0x5401)
     {
-        if (!UserBufferWritable(arg, 36)) return -EFAULT;
-        auto* t = reinterpret_cast<uint32_t*>(arg);
-        t[0] = 0x0500;   // c_iflag: ICRNL | IXON
-        t[1] = 0x0005;   // c_oflag: OPOST | ONLCR
-        t[2] = 0x00BF;   // c_cflag: CS8 | CREAD | HUPCL | B38400
-        uint32_t lflag = 0x8A31; // base: ECHOE|ECHOK|ISIG|IEXTEN|ECHOCTL|ECHOKE
-        if (proc->ttyCanonical) lflag |= 0x0002; // ICANON
-        if (proc->ttyEcho)      lflag |= 0x0008; // ECHO
-        t[3] = lflag;
-        auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
-        raw[0] = 0;  // c_line = N_TTY
-        auto* cc = &raw[1];
-        __builtin_memset(cc, 0, 19);
-        cc[0]  = 0x03;  // VINTR  = Ctrl+C
-        cc[1]  = 0x1C;  // VQUIT  = Ctrl+backslash
-        cc[2]  = 0x7F;  // VERASE = DEL
-        cc[3]  = 0x15;  // VKILL  = Ctrl+U
-        cc[4]  = 0x04;  // VEOF   = Ctrl+D
-        cc[5]  = 0;     // VTIME  = 0
-        cc[6]  = 1;     // VMIN   = 1
-        cc[7]  = 0;     // VSWTC
-        cc[8]  = 0x11;  // VSTART = Ctrl+Q
-        cc[9]  = 0x13;  // VSTOP  = Ctrl+S
-        cc[10] = 0x1A;  // VSUSP  = Ctrl+Z
-        cc[11] = 0;     // VEOL
-        cc[12] = 0x12;  // VREPRINT = Ctrl+R
-        cc[13] = 0x0F;  // VDISCARD = Ctrl+O
-        cc[14] = 0x17;  // VWERASE = Ctrl+W
-        cc[15] = 0x16;  // VLNEXT  = Ctrl+V
-        cc[16] = 0;     // VEOL2
-        return 0;
+        return CopyTermiosOut(proc, arg, false);
     }
     if (isTtyFd && cmd >= 0x5402 && cmd <= 0x5404)
     {
-        if (!UserBufferReadable(arg, 16)) return -EFAULT;
-        auto* t = reinterpret_cast<const uint32_t*>(arg);
-        Process* cur = ProcessCurrent();
-        if (cur)
-        {
-            uint32_t lflag = t[3];
-            cur->ttyCanonical = (lflag & 0x0002) != 0; // ICANON
-            cur->ttyEcho      = (lflag & 0x0008) != 0; // ECHO
-        }
-        return 0;
+        return SetTermiosFrom(arg);
     }
 
     // TIOCGPGRP = 0x540F — get foreground process group
     if (isTtyFd && cmd == 0x540F)
     {
-        if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
-        auto* pgrp = reinterpret_cast<int*>(arg);
-        Process* cur = ProcessCurrent();
-        if (cur)
-        {
-            Terminal* term = TerminalFindByProcess(cur);
-            if (term)
-                *pgrp = static_cast<int>(term->foregroundPgid);
-            else
-                *pgrp = static_cast<int>(cur->pgid);
-        }
-        else
-        {
-            *pgrp = 1;
-        }
-        return 0;
+        return CopyPgrpOut(arg);
     }
 
     // TIOCSPGRP = 0x5410 — set foreground process group
     if (isTtyFd && cmd == 0x5410)
     {
-        if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
-        auto* pgrpPtr = reinterpret_cast<const int*>(arg);
-        int newPgid = *pgrpPtr;
-        Process* cur = ProcessCurrent();
-        if (cur)
-        {
-            Terminal* term = TerminalFindByProcess(cur);
-            if (term)
-            {
-                term->foregroundPgid = static_cast<uint16_t>(newPgid);
-                DbgPrintf("TIOCSPGRP: pid %u set fg pgid to %d\n", cur->pid, newPgid);
-            }
-        }
-        return 0;
+        return SetPgrpFrom(arg);
     }
 
     // TIOCSCTTY = 0x540E — set controlling terminal
@@ -625,16 +547,7 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     // TIOCGWINSZ = 0x5413 — terminal window size
     if (isTtyFd && cmd == 0x5413)
     {
-        struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
-        if (!UserBufferWritable(arg, sizeof(winsize))) return -EFAULT;
-        auto* ws = reinterpret_cast<winsize*>(arg);
-        TerminalGeometry geometry{25,80,0,0};
-        TerminalSnapshotGeometry(proc,&geometry);
-        ws->ws_row = static_cast<uint16_t>(geometry.rows);
-        ws->ws_col = static_cast<uint16_t>(geometry.cols);
-        ws->ws_xpixel = static_cast<uint16_t>(geometry.width);
-        ws->ws_ypixel = static_cast<uint16_t>(geometry.height);
-        return 0;
+        return CopyWinsizeOut(proc, arg);
     }
 
     // TIOCSWINSZ = 0x5414 — set terminal window size (accept but ignore)
@@ -848,28 +761,7 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     if (isTtyFd && cmd == 0x802c542aUL)
     {
         // termios2: 4 × uint32 flags + 1 c_line + 19 c_cc + 2 × uint32 speeds = 44 bytes
-        if (!UserBufferWritable(arg, 44)) return -EFAULT;
-        auto* t = reinterpret_cast<uint32_t*>(arg);
-        t[0] = 0x0500;
-        t[1] = 0x0005;
-        t[2] = 0x00BF;
-        uint32_t lflag = 0x8A31;
-        if (proc->ttyCanonical) lflag |= 0x0002;
-        if (proc->ttyEcho)      lflag |= 0x0008;
-        t[3] = lflag;
-        auto* raw = reinterpret_cast<uint8_t*>(&t[4]);
-        raw[0] = 0;
-        auto* cc = &raw[1];
-        __builtin_memset(cc, 0, 19);
-        cc[0]=0x03; cc[1]=0x1C; cc[2]=0x7F; cc[3]=0x15; cc[4]=0x04;
-        cc[5]=0;    cc[6]=1;    cc[7]=0;    cc[8]=0x11; cc[9]=0x13;
-        cc[10]=0x1A;cc[11]=0;   cc[12]=0x12;cc[13]=0x0F;cc[14]=0x17;
-        cc[15]=0x16;cc[16]=0;
-        // termios2 appends c_ispeed, c_ospeed (uint32 each) at offset 20 in cc-block
-        uint32_t* speeds = reinterpret_cast<uint32_t*>(&raw[20]);
-        speeds[0] = 38400;
-        speeds[1] = 38400;
-        return 0;
+        return CopyTermiosOut(proc, arg, true);
     }
 
     // Any unhandled 'T'-type ioctl (termios family) on a non-tty or for

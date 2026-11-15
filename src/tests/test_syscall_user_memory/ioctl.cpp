@@ -1,0 +1,100 @@
+// H-05 / H-06: ioctl and virtio DRM handlers copy their argument structs,
+// and the GPU driver only ever sees kernel buffers.
+#include "harness.h"
+#include "syscall_ioctl.cpp"
+#include "syscall_drm.cpp"
+#include <stdlib.h>
+
+using namespace harness;
+namespace {
+bool g_capsetSawUserPointer;
+int32_t FakeGetCapset(uint32_t,uint32_t,void* out,uint32_t bytes) {
+    if(InArena(reinterpret_cast<uint64_t>(out),1,Access::Read))g_capsetSawUserPointer=true;
+    __builtin_memset(out,0x77,bytes<8?bytes:8);
+    return 8;
+}
+brook::GpuAppCapabilities FakeCapabilities() { brook::GpuAppCapabilities caps{};caps.capsetMask=2;return caps; }
+uint64_t Patterned(uint64_t offset,uint64_t length) {
+    __builtin_memset(reinterpret_cast<void*>(UserAddress(offset)),0x5a,length);return UserAddress(offset);
+}
+bool Untouched(uint64_t address,uint64_t length) {
+    for(uint64_t i=0;i<length;++i)if(reinterpret_cast<const uint8_t*>(address)[i]!=0x5a)return false;
+    return true;
+}
+bool RaceSafe(int64_t result,uint64_t address,uint64_t length) {
+    return !g_racedUnmaps || (result==-brook::EFAULT && Untouched(address,length));
+}
+}
+
+static void Termios() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    proc->fds[0].type=brook::FdType::DevKeyboard;proc->ttyCanonical=true;
+    CHECK(brook::sys_ioctl(0,0x5401,g_kernel.Address(),0,0,0)==-brook::EFAULT);
+    CHECK(brook::sys_ioctl(0,0x5413,g_kernel.Address(),0,0,0)==-brook::EFAULT);
+    CHECK(brook::sys_ioctl(0,0x540F,g_kernel.Address(),0,0,0)==-brook::EFAULT);
+    CHECK(brook::sys_ioctl(0,0x5402,g_kernel.Address(),0,0,0)==-brook::EFAULT);
+    CHECK(g_kernel.Intact());
+    const uint64_t t=UserAddress(0);
+    CHECK(brook::sys_ioctl(0,0x5401,t,0,0,0)==0);
+    const auto* flags=reinterpret_cast<const uint32_t*>(t);
+    CHECK(flags[0]==0x0500 && flags[3]==(0x8A31|0x0002));
+    CHECK(reinterpret_cast<const uint8_t*>(t)[17]==0x03 && reinterpret_cast<const uint8_t*>(t)[17+6]==1);
+    // TCSETS clears ICANON.
+    uint32_t set[4]={0,0,0,0x8A31};__builtin_memcpy(reinterpret_cast<void*>(UserAddress(64)),set,sizeof(set));
+    CHECK(brook::sys_ioctl(0,0x5402,UserAddress(64),0,0,0)==0 && !proc->ttyCanonical);
+    CHECK(brook::sys_ioctl(0,0x5413,UserAddress(128),0,0,0)==0);
+    CHECK(reinterpret_cast<const uint16_t*>(UserAddress(128))[1]==80);
+    // A raced unmap after validation never sees a raw store.
+    Reset();ResetProcess();proc=CurrentProcess();proc->fds[0].type=brook::FdType::DevKeyboard;
+    g_raceUnmapAfterCheck=true;
+    const uint64_t raced=Patterned(0,36);
+    CHECK(RaceSafe(brook::sys_ioctl(0,0x5401,raced,0,0,0),raced,36));
+}
+
+static void Fionread() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    auto* pipe=brook::PipeBufferCreate(64);pipe->readers=pipe->writers=1;
+    CHECK(pipe->write("abc",3)==3);
+    proc->fds[3].type=brook::FdType::Pipe;proc->fds[3].handle=pipe;proc->fds[3].flags=0;
+    CHECK(brook::sys_ioctl(3,0x541B,UserAddress(0),0,0,0)==0);
+    CHECK(*reinterpret_cast<const int*>(UserAddress(0))==3);
+    g_raceUnmapAfterCheck=true;
+    const uint64_t raced=Patterned(PageSize,4);
+    CHECK(RaceSafe(brook::sys_ioctl(3,0x541B,raced,0,0,0),raced,4));
+    // FIONBIO reads its argument with a checked copy.
+    g_raceUnmapAfterCheck=false;
+    CHECK(brook::sys_ioctl(3,0x5421,g_kernel.Address(),0,0,0)==-brook::EFAULT);
+}
+
+static void VirtioGetCaps() {
+    Reset();ResetProcess();
+    static brook::GpuAppOps ops{};ops.GetCapset=FakeGetCapset;ops.Capabilities=FakeCapabilities;
+    g_gpuApp=&ops;g_capsetSawUserPointer=false;
+    auto* context=static_cast<brook::DrmCtx*>(calloc(1,sizeof(brook::DrmCtx)));
+    const uint64_t out=UserAddress(PageSize);
+    __builtin_memset(reinterpret_cast<void*>(out),0x11,64);
+    brook::DrmVirtgpuGetCaps request{1,1,out,64,0};
+    __builtin_memcpy(reinterpret_cast<void*>(UserAddress(0)),&request,sizeof(request));
+    CHECK(brook::DrmRenderIoctl(context,brook::DRM_NR_VIRTGPU_GET_CAPS,UserAddress(0))==0);
+    // The driver filled a kernel buffer; the caller got its bytes and a zero tail.
+    CHECK(!g_capsetSawUserPointer);
+    CHECK(reinterpret_cast<const uint8_t*>(out)[7]==0x77 && reinterpret_cast<const uint8_t*>(out)[8]==0);
+    // Kernel destination and kernel request pointers are refused.
+    request.addr=g_kernel.Address();
+    __builtin_memcpy(reinterpret_cast<void*>(UserAddress(0)),&request,sizeof(request));
+    CHECK(brook::DrmRenderIoctl(context,brook::DRM_NR_VIRTGPU_GET_CAPS,UserAddress(0))==-brook::EFAULT);
+    CHECK(brook::DrmRenderIoctl(context,brook::DRM_NR_GET_CAP,g_kernel.Address())==-brook::EFAULT);
+    CHECK(g_kernel.Intact());
+    // GET_CAP's validate-then-read window.
+    g_raceUnmapAfterCheck=true;
+    const uint64_t cap=Patterned(2*PageSize,16);
+    CHECK(RaceSafe(brook::DrmRenderIoctl(context,brook::DRM_NR_GET_CAP,cap),cap,16));
+    g_gpuApp=nullptr;
+    free(context);
+}
+
+void RunIoctlTests() {
+    Termios();
+    Fionread();
+    VirtioGetCaps();
+}
