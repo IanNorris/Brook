@@ -328,6 +328,10 @@ struct brook_surface {
      * layered offer or tagged CPU snapshot). Independent of tree commits so
      * a desynchronised subsurface update still publishes a newer source. */
     uint64_t publish_commit;
+    /* wl_surface.set_opaque_region, kept only when it is one added rectangle
+     * (the exact, conservative case); applied on commit. */
+    int opaque_set,pending_opaque_set,opaque_pending;
+    int32_t opaque_x,opaque_y,opaque_w,opaque_h,pending_opaque_x,pending_opaque_y,pending_opaque_w,pending_opaque_h;
 
     /* xdg-shell role state. */
     struct wl_resource *xdg_surface;
@@ -652,7 +656,13 @@ static void trace_frames_report(uint32_t now) {
 }
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
-    (void)c; (void)r; (void)reg;
+    (void)c;
+    struct brook_surface *s=wl_resource_get_user_data(r);
+    const struct pointer_region *region=reg?wl_resource_get_user_data(reg):NULL;
+    s->pending_opaque_set=region && !region->infinite && region->count==1 && region->ops[0].add;
+    if(s->pending_opaque_set){s->pending_opaque_x=region->ops[0].x;s->pending_opaque_y=region->ops[0].y;
+        s->pending_opaque_w=region->ops[0].w;s->pending_opaque_h=region->ops[0].h;}
+    s->opaque_pending=1;
 }
 static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *reg) {
@@ -697,6 +707,10 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
 }
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
+    if(s->opaque_pending){
+        s->opaque_set=s->pending_opaque_set;s->opaque_x=s->pending_opaque_x;s->opaque_y=s->pending_opaque_y;
+        s->opaque_w=s->pending_opaque_w;s->opaque_h=s->pending_opaque_h;s->opaque_pending=0;
+    }
     if(s->input_region_pending) {
         pointer_region_clear(&s->input_region);s->input_region=s->pending_input_region;
         memset(&s->pending_input_region,0,sizeof(s->pending_input_region));s->input_region_pending=0;
@@ -2632,7 +2646,7 @@ static struct wl_event_source *g_gpu_window_source;
 static uint64_t g_gpu_window_offers,g_gpu_window_acks,g_gpu_window_recovered,g_gpu_window_presented;
 /* Aggregate failures instead of logging each frame; the latter perturbs pacing. */
 static uint64_t g_gpu_offer_no_channel,g_gpu_offer_no_root,g_gpu_offer_layers,g_gpu_offer_geometry,g_gpu_offer_window,g_gpu_offer_metadata;
-static uint64_t g_gpu_offer_size_mismatch;
+static uint64_t g_gpu_offer_size_mismatch,g_gpu_opaque_offers;
 static uint64_t g_gpu_connect_fail,g_gpu_auth_fail;
 static int g_gpu_connect_errno,g_gpu_auth_errno;
 struct GpuWindowTiming {uint64_t count,sum,buckets[10];uint32_t max;};
@@ -2791,7 +2805,20 @@ static int gpu_window_offer(struct brook_image *image){
         .type=BROOK_GPU_WINDOW_OFFER,.identity={root->wm_id,0,window.incarnation,root->publish_commit+1,
             (uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=(uint64_t)st.st_size/4,.offset=db->offset/4,
         .stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
-    int sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
+    int sent;
+    if(view->opaque && db->fourcc==0x34325241 && gpu_layers_enabled()){
+        /* An ARGB buffer the client declared opaque: a one-layer version 3
+         * offer carries the opaque flag, so the renderer can cull beneath
+         * the window instead of blending everything under it. */
+        struct BrookGpuWindowLayersPacket one;memset(&one,0,sizeof(one));
+        one.header=offer;one.header.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS;one.count=1;
+        one.layers[0]=(struct BrookGpuWindowLayer){.words=offer.words,.device=offer.identity.device,.inode=offer.identity.inode,
+            .offset=offer.offset,.stride=offer.stride,.width=offer.width,.height=offer.height,.fourcc=offer.fourcc,
+            .flags=BROOK_GPU_WINDOW_LAYER_OPAQUE,.srcWidth=offer.width,.srcHeight=offer.height,
+            .dstWidth=g->w*scale,.dstHeight=g->h*scale};
+        sent=brook_gpu_window_send_layers(g_gpu_window_channel,&one,&image->pending_fd,&image->producer_fence);
+        if(sent==1)++g_gpu_opaque_offers;
+    }else sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
     if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
         image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
@@ -2905,14 +2932,15 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
             if(image->producer_fence<0){++g_gpu_group_wait;return 2;}
             if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3)){++g_gpu_group_skip_buffer;return 0;}
             *l=(struct BrookGpuWindowLayer){.words=(uint64_t)st.st_size/4,.device=(uint64_t)st.st_dev,.inode=(uint64_t)st.st_ino,
-                .offset=db->offset/4,.stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
+                .offset=db->offset/4,.stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc,
+                .flags=view->opaque?BROOK_GPU_WINDOW_LAYER_OPAQUE:0};
             buffers[i]=image->pending_fd;fences[i]=image->producer_fence;
         }else if(image->pixels && !image->pending_cpu){
             if(!image_gem_upload(image)){++g_gpu_group_skip_upload;return 0;}
             if(fstat(image->gem_fd,&st) || !st.st_ino){++g_gpu_group_skip_upload;return 0;}
             *l=(struct BrookGpuWindowLayer){.words=(uint64_t)st.st_size/4,.device=(uint64_t)st.st_dev,.inode=(uint64_t)st.st_ino,
                 .stride=image->width,.width=image->width,.height=image->height,.fourcc=image->format==2?0x34325258u:0x34325241u,
-                .flags=image->opaque?BROOK_GPU_WINDOW_LAYER_OPAQUE:0};
+                .flags=(image->opaque || view->opaque)?BROOK_GPU_WINDOW_LAYER_OPAQUE:0};
             buffers[i]=image->gem_fd;fences[i]=image->gem_fence;
         }else{++g_gpu_group_skip_buffer;return 0;}
         /* Source rectangle: Wayland 24.8 in transformed buffer units; with no
@@ -3440,10 +3468,11 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
         (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
     fprintf(f,"\"layered\":{\"enabled\":%d,\"offers\":%llu,\"safe\":%llu,\"presented\":%llu,\"wait\":%llu,\"full\":%llu,"
-        "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu},",gpu_layers_enabled(),
+        "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu},",gpu_layers_enabled(),
         (unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_safe,(unsigned long long)g_gpu_group_presented,
         (unsigned long long)g_gpu_group_wait,(unsigned long long)g_gpu_group_full,(unsigned long long)g_gpu_group_skip_shape,
-        (unsigned long long)g_gpu_group_skip_buffer,(unsigned long long)g_gpu_group_skip_upload,(unsigned long long)g_gpu_group_uploads);
+        (unsigned long long)g_gpu_group_skip_buffer,(unsigned long long)g_gpu_group_skip_upload,(unsigned long long)g_gpu_group_uploads,
+        (unsigned long long)g_gpu_opaque_offers);
     fprintf(f,"\"intel\":{\"queued\":%llu,\"ready\":%llu,\"discarded\":%llu,\"busy\":%llu,\"failed\":%llu,\"fences\":%llu,"
         "\"fence_pending\":%llu,\"pending\":%u,\"direct\":%llu},\"readback_bytes\":%llu,\"paths\":{",
         (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_discarded,

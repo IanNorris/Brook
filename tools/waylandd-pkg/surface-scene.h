@@ -81,6 +81,9 @@ struct brook_view {
     unsigned refs;
     struct brook_image *image;
     struct brook_geometry geometry;
+    /* The client's opaque region covers the whole surface: the compositor
+     * may ignore alpha (wl_surface.set_opaque_region). */
+    int opaque;
 };
 static void view_ref(void *value) { if(value) ++((struct brook_view *)value)->refs; }
 static void view_unref(void *value) {
@@ -119,6 +122,8 @@ static int surface_tree_commit(struct brook_surface *s,struct brook_image *image
     if (image) {
         view=calloc(1,sizeof(*view));if (!view) return 0;
         view->refs=1;view->image=image;view->geometry=geometry;image_ref(image);
+        view->opaque=s->opaque_set && s->opaque_x<=0 && s->opaque_y<=0 &&
+            (int64_t)s->opaque_x+s->opaque_w>=(int64_t)geometry.w && (int64_t)s->opaque_y+s->opaque_h>=(int64_t)geometry.h;
     }
     struct brook_frame_callback *frame;
     uint32_t now=g_trace_frames?g_now_ms():0;

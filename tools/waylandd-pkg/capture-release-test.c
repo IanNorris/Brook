@@ -489,6 +489,54 @@ static void check_gpu_window_layers_shm(void)
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
+/* An ARGB DMA-BUF whose opaque region covers the surface is offered as a
+ * one-layer version 3 commit with the opaque flag; without the region it is
+ * an ordinary version 2 offer. */
+static void check_gpu_window_opaque(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *buffers[2]={retained_test_buffer(client,2),NULL};
+    ((struct brook_dmabuf_buffer *)wl_resource_get_user_data(buffers[0]))->fourcc=0x34325241;
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    root.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(root.xdg_toplevel);
+    buffers[1]=retained_test_buffer(client,5);
+    ((struct brook_dmabuf_buffer *)wl_resource_get_user_data(buffers[1]))->fourcc=0x34325241;
+    struct pointer_rect rect={0,0,1,1,1};struct pointer_region region={&rect,1,0};
+    struct wl_resource *reg=wl_resource_create(client,&wl_region_interface,1,6);assert(reg);wl_resource_set_user_data(reg,&region);
+    root.xdg_acked=root.xdg_initial_commit_done=1;
+    uint32_t vfb=0;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
+    root.scene_disabled=1;g_surfaces=&root;
+    char path[]="/tmp/brook-opaque-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    struct brook_buffer *held[2];struct BrookGpuWindowLayersPacket got;int fds[16];unsigned nfds=0;
+    for(unsigned i=0;i<2;++i){
+        if(i)surface_set_opaque_region(client,root.resource,reg);
+        surface_attach(client,root.resource,buffers[i],0,0);surface_commit(client,root.resource);
+        struct brook_view *view=root.tree.current->value;held[i]=view->image->source;++held[i]->refs;
+        assert(view->opaque==(int)i);
+        intel_pending_poll();
+        assert(brook_gpu_window_receive_layers(channel[1],&got,fds,&nfds)==1 && nfds==2);
+        for(unsigned k=0;k<nfds;++k)close(fds[k]);
+        if(!i)assert(got.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && !got.count);
+        else assert(got.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS && got.count==1 &&
+                    (got.layers[0].flags&BROOK_GPU_WINDOW_LAYER_OPAQUE) && got.layers[0].dstWidth==1);
+        assert(brook_gpu_window_send_reply(channel[1],got.header.version,BROOK_GPU_WINDOW_SAFE,&got.header.identity)==1);
+        intel_pending_poll();assert(g_gpu_window_channel>=0);
+    }
+    wl_resource_set_user_data(reg,NULL);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
+    free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
 static void check_intel_direct(int mode)
 {
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
@@ -631,6 +679,7 @@ int main(void)
     check_gpu_window_retained();
     check_gpu_window_layers();
     check_gpu_window_layers_shm();
+    check_gpu_window_opaque();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif
     {
