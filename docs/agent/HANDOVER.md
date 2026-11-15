@@ -2,7 +2,7 @@
 
 Current state and immediate goal. Keep this short and current: replace stale lines rather than appending. Put detailed run records in [AGENT_JOURNAL.md](AGENT_JOURNAL.md), the previous agent's ~1 MB append-only log (newest entries at the top). Decisions belong in [DECISIONS.md](DECISIONS.md), and working preferences in [WORKING_STYLE.md](WORKING_STYLE.md).
 
-_Last updated: 14 November 2026, by a Claude Code session started after the Codex agent was retired._
+_Last updated: 15 November 2026 (midday), by a Claude Code session._
 
 ## Workspace
 
