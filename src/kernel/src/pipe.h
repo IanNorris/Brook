@@ -23,8 +23,15 @@ static constexpr uint32_t PIPE_BUF_UNIX_SIZE    = 65536;
 
 enum class PipeReadWait { Retry, Eof, WouldBlock, Registered };
 
+// Live/dead markers. A pipe or poll subscription reached through a stale
+// pointer traps at the first touch instead of corrupting a reused block, so
+// the panic RIP names the stale user (crash decoder) rather than a later victim.
+static constexpr uint32_t PipeBufferLive = 0x45504950u; // "PIPE"
+static constexpr uint32_t PipeBufferDead = 0x44414544u; // "DEAD"
+
 struct PipeBuffer
 {
+    uint32_t magic = PipeBufferLive;
     char*    data = nullptr;
     uint32_t capacity = 0;
     // Optional packet length at each ring offset. Zero means stream data.
@@ -200,6 +207,7 @@ static inline PipeBuffer* PipeBufferCreate(uint32_t capacity)
     auto* pipe = static_cast<PipeBuffer*>(kmalloc(sizeof(PipeBuffer)));
     if (!pipe) return nullptr;
     memset(pipe, 0, sizeof(PipeBuffer));
+    pipe->magic = PipeBufferLive;
 
     pipe->data = static_cast<char*>(kmalloc(capacity));
     if (!pipe->data)
@@ -213,9 +221,17 @@ static inline PipeBuffer* PipeBufferCreate(uint32_t capacity)
     return pipe;
 }
 
+// Any use of a pipe after its storage was released is a lifetime bug.
+static inline void PipeBufferCheck(const PipeBuffer* pipe)
+{
+    if (__atomic_load_n(&pipe->magic, __ATOMIC_RELAXED) != PipeBufferLive) __builtin_trap();
+}
+
 static inline void PipeBufferFree(PipeBuffer* pipe)
 {
     if (!pipe) return;
+    PipeBufferCheck(pipe);
+    __atomic_store_n(&pipe->magic, PipeBufferDead, __ATOMIC_RELAXED);
     if (pipe->data)
         kfree(pipe->data);
     if (pipe->packets) kfree(pipe->packets);
@@ -225,6 +241,7 @@ static inline void PipeBufferFree(PipeBuffer* pipe)
 // Callers must own a live endpoint or storage hold when acquiring another hold.
 static inline void PipeBufferHold(PipeBuffer* pipe)
 {
+    PipeBufferCheck(pipe);
     SpinLockAcquire(&pipe->lock);
     // Corrupted/wrapped ownership must never make live storage reclaimable.
     if (pipe->pollHolds == ~0ULL) __builtin_trap();
@@ -234,6 +251,7 @@ static inline void PipeBufferHold(PipeBuffer* pipe)
 
 static inline void PipeBufferDrop(PipeBuffer* pipe, bool destroy = false)
 {
+    PipeBufferCheck(pipe);
     SpinLockAcquire(&pipe->lock);
     if (!pipe->pollHolds) __builtin_trap();
     --pipe->pollHolds;
@@ -246,6 +264,7 @@ static inline void PipeBufferDrop(PipeBuffer* pipe, bool destroy = false)
 static inline void PipeBufferDestroy(PipeBuffer* pipe)
 {
     if (!pipe) return;
+    PipeBufferCheck(pipe);
     SpinLockAcquire(&pipe->lock);
     pipe->destroyPending = true;
     const bool release = !pipe->pollHolds;

@@ -90,7 +90,51 @@ static void EventFdWakesEveryWaiter() {
     g_wakeHook=nullptr;
 }
 
+// Steam gen 415: pipe2() with only one free slot must publish neither end
+// (no half-published read end to roll back by number while a sibling can
+// dup/fork/close it); with two free slots both ends appear together.
+static void PipeAtFullTable() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    for(unsigned fd=0;fd<brook::MAX_FDS;++fd)proc->fds[fd].type=brook::FdType::DevNull;
+    proc->fds[700].type=brook::FdType::None;
+    const uint64_t out=UserAddress(0);
+    __builtin_memset(reinterpret_cast<void*>(out),0xff,8);
+    CHECK(brook::sys_pipe2(out,0x80000,0,0,0,0)==-brook::EMFILE);
+    CHECK(proc->fds[700].type==brook::FdType::None && proc->fds[700].file==nullptr);
+    CHECK(*reinterpret_cast<const int32_t*>(out)==-1); // nothing reported
+    proc->fds[900].type=brook::FdType::None;
+    CHECK(brook::sys_pipe2(out,0x80000|0x800,0,0,0,0)==0);
+    const auto* fds=reinterpret_cast<const int32_t*>(out);
+    CHECK(fds[0]==700 && fds[1]==900);
+    auto& r=proc->fds[700];auto& w=proc->fds[900];
+    CHECK(r.type==brook::FdType::Pipe && w.type==brook::FdType::Pipe && r.handle==w.handle);
+    CHECK(r.flags==0 && w.flags==1 && r.fdFlags==1 && w.fdFlags==1);
+    CHECK(r.file && w.file && r.file!=w.file);
+    CHECK(brook::FdStatus(&r)==0x800 && brook::FdStatus(&w)==(1|0x800));
+    auto* pipe=static_cast<brook::PipeBuffer*>(r.handle);
+    CHECK(pipe->readers==1 && pipe->writers==1 && pipe->magic==brook::PipeBufferLive);
+}
+
+// Poll subscriptions keep a pipe's storage; the last release frees it only
+// after every subscriber unlinked, and freed storage is marked dead.
+static void PollHoldOutlivesEndpoints() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    auto* pipe=brook::PipeBufferCreate(16);pipe->readers=pipe->writers=1;
+    {
+        brook::PipePollGroup a,b;
+        CHECK(a.add(pipe,proc,1) && b.add(pipe,OtherProcess(),4) && a.add(pipe,proc,4));
+        CHECK(pipe->pollHolds==2);
+        brook::PipeReleaseEnd(pipe,false);
+        brook::PipeReleaseEnd(pipe,true);
+        CHECK(pipe->destroyPending && pipe->magic==brook::PipeBufferLive);
+    }
+    // Both groups unlinked and dropped their holds: the storage was freed
+    // (host malloc), so only the counters observed above are checked.
+}
+
 void RunWaitTests() {
+    PipeAtFullTable();
+    PollHoldOutlivesEndpoints();
     PollSyncFile();
     PollPipeWriteEnd();
     EventFdWakesEveryWaiter();

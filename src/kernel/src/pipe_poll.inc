@@ -18,6 +18,7 @@ void PipePollNotify(PipeBuffer* pipe, uint32_t events) {
         Process* process = nullptr;
         SpinLockAcquire(&pipe->lock);
         for (auto* n = pipe->pollWaiters; n; n = n->nextPipe) {
+            PipePollGroup::Check(n);
             if (n->sequence > cursor || !(n->events & events)) continue;
             cursor = n->sequence - 1;
             process = n->process;

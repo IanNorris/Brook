@@ -133,6 +133,11 @@ bool UnixAbstractNameInUse(const uint8_t* address, uint32_t length, const UnixSo
 bool UnixRegisterServer(UnixSocketData* usd);
 void UnixSocketHandleUnref(void* handle);
 
+// Both endpoints of a socketpair, published together or not at all.
+int UnixInstallSocketPair(Process* process, UnixSocketData* first, UnixSocketData* second,
+                          uint32_t flags, int out[2]);
+// accept(): publish with a description created before the registry lock.
+int UnixInstallSocketPrepared(Process* process, UnixSocketData* socket, uint32_t flags, OpenFile* file);
 int UnixInstallSocket(Process* process, UnixSocketData* socket, uint32_t flags,
                       const char* site);
 

@@ -752,8 +752,56 @@ static void TestOpenFileDescriptions()
     std::printf("open file descriptions: dup/fork/replace/close sharing and offset serialization passed\n");
 }
 
+// pipe()/socketpair() publication: both slots or neither, and a concurrent
+// fork snapshot sees either no end or both ends (never a lone read end).
+static std::atomic<int> g_pairRetains{0};
+static bool PairRetain(FdEntry*) { g_pairRetains.fetch_add(1); return true; }
+static void TestPublishPair()
+{
+    static FdEntry fds[MAX_FDS];
+    SpinLock lock;
+    for (uint32_t i = 0; i < MAX_FDS; ++i) { fds[i] = FdEntry{}; fds[i].type = FdType::DevNull; }
+    fds[500].type = FdType::None;
+    FdEntry readEnd{}; readEnd.type = FdType::Pipe; readEnd.handle = TokenHandle(7);
+    FdEntry writeEnd = readEnd; writeEnd.flags = 1;
+    int out[2] = {-1, -1};
+    CHECK(brook::FdTablePublishPair(fds, &lock, readEnd, writeEnd, out) == -24, "one free slot: pair refused");
+    CHECK(fds[500].type == FdType::None && out[0] == -1, "refused pair publishes nothing");
+    fds[3].type = FdType::None;
+    CHECK(brook::FdTablePublishPair(fds, &lock, readEnd, writeEnd, out) == 0, "two free slots: pair published");
+    CHECK(out[0] == 3 && out[1] == 500 && fds[3].flags == 0 && fds[500].flags == 1, "lowest slots, in order");
+
+    // Race publication against fork snapshots of the same table.
+    static FdEntry table[MAX_FDS], child[MAX_FDS];
+    std::atomic<bool> stopRace{false};
+    std::atomic<int> torn{0};
+    std::thread forker([&] {
+        while (!stopRace.load()) {
+            for (auto& e : child) e = FdEntry{};
+            brook::FdTableForkSnapshot(child, table, &lock, PairRetain);
+            int pipes = 0;
+            for (auto& e : child) if (e.type == FdType::Pipe) ++pipes;
+            if (pipes & 1) torn.fetch_add(1);
+        }
+    });
+    for (int round = 0; round < 2000; ++round) {
+        int ends[2];
+        for (int pair = 0; pair < 32; ++pair)
+            (void)brook::FdTablePublishPair(table, &lock, readEnd, writeEnd, ends);
+        // Retire every pair in one critical section (the snapshot invariant
+        // is about publication; per-fd close is separately atomic).
+        brook::SpinLockAcquire(&lock);
+        for (auto& e : table) brook::FdSlotClear(e);
+        brook::SpinLockRelease(&lock);
+    }
+    stopRace.store(true);
+    forker.join();
+    CHECK(torn.load() == 0, "fork never observes half of a published pair");
+}
+
 int main()
 {
+    TestPublishPair();
     TestOpenFileDescriptions();
     TestPipeReadRegistration();
     TestUnixLifeCore();

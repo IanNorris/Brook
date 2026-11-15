@@ -217,6 +217,33 @@ inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owne
     return target;
 }
 
+// Publish two already-owned descriptors (pipe(), socketpair()) in the two
+// lowest free slots under one lock: both become visible or neither does, so
+// a full table never leaves a half-published pair to roll back by number.
+// Returns 0 with the numbers in out[0..1], or -24 (EMFILE) with ownership of
+// both entries left with the caller.
+inline int FdTablePublishPair(FdEntry* fds, SpinLock* lock, const FdEntry& first,
+                              const FdEntry& second, int out[2],
+                              void (*published)(int, const FdEntry&) = nullptr)
+{
+    SpinLockAcquire(lock);
+    int slots[2] = {-1, -1};
+    for (uint32_t i = 0, found = 0; i < MAX_FDS && found < 2; ++i)
+        if (fds[i].type == FdType::None) slots[found++] = static_cast<int>(i);
+    if (slots[1] < 0) { SpinLockRelease(lock); return -24; }
+    const FdEntry* owned[2] = {&first, &second};
+    for (int k = 0; k < 2; ++k) {
+        FdEntry copy = *owned[k];
+        copy.pinCount = 0;
+        copy.closing = 0;
+        fds[slots[k]] = copy;
+        if (published) published(slots[k], copy);
+        out[k] = slots[k];
+    }
+    SpinLockRelease(lock);
+    return 0;
+}
+
 // The caller adopts the publication pin and must unpin exactly once. This
 // prevents close/reuse between publishing an fd and copying it to userspace.
 inline int FdTablePublishOwnedPinned(FdEntry* fds, SpinLock* lock, const FdEntry& owned)

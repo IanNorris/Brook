@@ -97,6 +97,20 @@ int FdPublishNew(Process* proc,const FdEntry& owned,uint32_t openFlags,bool pinn
     if(fd<0)OpenFileRelease(file);
     return fd;
 }
+int FdPublishPrepared(Process* proc,const FdEntry& owned,OpenFile* file,
+                      void (*published)(int,const FdEntry&)) {
+    FdEntry entry=owned;entry.file=file;
+    return FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr,published);
+}
+int FdPublishNewPair(Process* proc,const FdEntry& first,uint32_t firstFlags,const FdEntry& second,
+                     uint32_t secondFlags,int out[2],void (*published)(int,const FdEntry&)) {
+    OpenFile* a=OpenFileCreate(firstFlags);OpenFile* b=a?OpenFileCreate(secondFlags):nullptr;
+    if(!b){OpenFileRelease(a);return -12;}
+    FdEntry entries[2]={first,second};entries[0].file=a;entries[1].file=b;
+    int result=FdTablePublishPair(proc->fds,ProcessFdLock(proc),entries[0],entries[1],out,published);
+    if(result<0){OpenFileRelease(a);OpenFileRelease(b);}
+    return result;
+}
 int FdAlloc(Process* proc,FdType type,void* handle,uint32_t openFlags,uint8_t flags,uint8_t fdFlags) {
     FdEntry owned{};owned.type=type;owned.handle=handle;owned.flags=flags;owned.fdFlags=fdFlags;
     return FdPublishNew(proc,owned,openFlags);

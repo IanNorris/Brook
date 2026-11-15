@@ -623,7 +623,16 @@ void kfree(void* ptr)
     UnixLifeHeap(ptr, 0, UnixLifeEvent::HeapAttempt, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 #endif
     if (!IsValidHeader(h)) { timing.Unlock(); return; }
-    if (h->free) { timing.Unlock(); return; }
+    if (h->free) {
+        timing.Unlock();
+        // A second kfree of the same pointer is ignored only while the block
+        // is still free; once reused it would free a live object. Report the
+        // caller so double frees surface before they corrupt anything.
+        static uint32_t reported = 0;
+        if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 32)
+            SerialPrintf("HEAP: double free of %p from %p\n", ptr, __builtin_return_address(0));
+        return;
+    }
 
     g_freeBytes += h->size - OVERHEAD;
 

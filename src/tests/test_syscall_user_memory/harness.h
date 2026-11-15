@@ -70,6 +70,9 @@ extern bool g_raceUnmapAfterCheck;
 extern unsigned g_racedUnmaps;
 inline bool SpinLockHeld(const brook::SpinLock& lock) { return lock.next!=lock.serving; }
 
+// kfree calls on pointers that were not live (double frees); see main.cpp.
+extern unsigned g_invalidFrees;
+
 // Count of user-copy calls that were refused because they hit kernel memory.
 extern unsigned g_refusedKernelCopies;
 

@@ -351,6 +351,27 @@ void UnixSocketHandleUnref(void* handle)
     kfree(usd);
 }
 
+static FdEntry UnixSocketEntry(UnixSocketData* socket, uint32_t flags)
+{
+    FdEntry owned{};
+    owned.type = FdType::UnixSocket;
+    owned.handle = socket;
+    owned.fdFlags = (flags & 0x80000) ? 1 : 0;
+    return owned;
+}
+
+int UnixInstallSocketPair(Process* process, UnixSocketData* first, UnixSocketData* second,
+                          uint32_t flags, int out[2])
+{
+    return FdPublishNewPair(process, UnixSocketEntry(first, flags), flags & 0x800,
+                            UnixSocketEntry(second, flags), flags & 0x800, out, UnixLifePublished);
+}
+
+int UnixInstallSocketPrepared(Process* process, UnixSocketData* socket, uint32_t flags, OpenFile* file)
+{
+    return FdPublishPrepared(process, UnixSocketEntry(socket, flags), file, UnixLifePublished);
+}
+
 int UnixInstallSocket(Process* process, UnixSocketData* socket, uint32_t flags,
                       const char* site)
 {
@@ -480,7 +501,13 @@ int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
         if(n || received) {
             if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
             PipeWakeEpoll(pipe);
-            if(userTarget && n && !CopyToUser(reinterpret_cast<uint64_t>(userTarget),bytes,n))return -EFAULT;
+            if(userTarget && n && !CopyToUser(reinterpret_cast<uint64_t>(userTarget),bytes,n)) {
+                // Callers release rights only from successful reads; the
+                // dequeued rights of a faulting read are dropped here.
+                for(int i=0;i<count;++i)UnixFdSnapRelease(&descriptors[i]);
+                count=0;
+                return -EFAULT;
+            }
             return n;
         }
         if(!__atomic_load_n(&pipe->writers,__ATOMIC_ACQUIRE) ||

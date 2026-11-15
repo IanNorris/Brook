@@ -178,8 +178,26 @@ static void TcpInfo() {
     CHECK(brook::sys_getsockopt(SocketFd,6,1,value,length,0)==-92);
 }
 
+// socketpair() with one free slot publishes neither end (no rollback that
+// closes a possibly reused number) and releases both endpoints.
+static void SocketpairAtFullTable() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    for(unsigned fd=0;fd<brook::MAX_FDS;++fd)proc->fds[fd].type=brook::FdType::DevNull;
+    proc->fds[10].type=brook::FdType::None;
+    const uint64_t out=UserAddress(0);
+    CHECK(brook::sys_socketpair(1,1,0,out,0,0)==-brook::EMFILE);
+    CHECK(proc->fds[10].type==brook::FdType::None);
+    proc->fds[20].type=brook::FdType::None;
+    CHECK(brook::sys_socketpair(1,1|0x80000,0,out,0,0)==0);
+    const auto* fds=reinterpret_cast<const int32_t*>(out);
+    CHECK(fds[0]==10 && fds[1]==20);
+    CHECK(proc->fds[10].type==brook::FdType::UnixSocket && proc->fds[20].type==brook::FdType::UnixSocket);
+    CHECK(proc->fds[10].fdFlags==1 && proc->fds[10].file && proc->fds[10].file!=proc->fds[20].file);
+}
+
 void RunSocketTests() {
     TcpInfo();
+    SocketpairAtFullTable();
     RightsShareDescription();
     Bind();
     SendTo();
