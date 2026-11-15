@@ -122,8 +122,10 @@
 #include "syscall_internal.h"
 #include "syscall_signal.h"
 #include "syscall_eventfd.h"
+#include "syscall_timerfd.h"
 #include "syscall_pipe.h"
 #include "syscall_time.h"
+#include "syscall_poll.h"
 #include "syscall_netlink.h"
 #include "syscall_handlers.h"
 
@@ -360,44 +362,6 @@ namespace brook {
 
 static void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
 static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1){BdwFenceUnref(file->intelFence);kfree(file);} }
-
-// timerfd constants and data — defined here so sys_read/sys_poll can use them
-static constexpr int TFD_NONBLOCK     = 0x800;
-static constexpr int TFD_CLOEXEC      = 0x80000;
-static constexpr int TFD_TIMER_ABSTIME = 1;
-uint64_t ClockNowNs(uint64_t clockid);
-static uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs);
-struct TimerWaitNode;
-struct TimerFdData {
-    KMutex lock; // graph -> timer; no graph acquisition under this mutex
-    brook::TimerFdState state;
-    int clockId;
-    volatile uint32_t refCount;
-    TimerWaitNode* waiters;
-    uint64_t rearmGeneration;
-};
-struct TimerFdGuard {
-    TimerFdData* timer;
-    explicit TimerFdGuard(TimerFdData* t) : timer(t) { KMutexLock(&t->lock); }
-    ~TimerFdGuard() { KMutexUnlock(&timer->lock); }
-};
-static bool TimerFdReady(TimerFdData* timer) {
-    TimerFdGuard guard(timer);
-    timer->state.refresh(ClockNowNs(timer->clockId));
-    return timer->state.pending != 0;
-}
-// A selected-clock deadline is never a LAPIC tick or a monotonic timestamp.
-static uint64_t TimerFdDeadline(TimerFdData* timer, uint64_t* generation = nullptr) {
-    TimerFdGuard guard(timer);
-    const uint64_t now = ClockNowNs(timer->clockId);
-    timer->state.refresh(now);
-    if (generation) *generation = __atomic_load_n(&timer->rearmGeneration, __ATOMIC_RELAXED);
-    const uint64_t mono = ClockNowNs(1);
-    if (timer->state.pending) return mono;
-    if (!timer->state.armed) return ~0ULL;
-    const uint64_t remaining = timer->state.deadline - now;
-    return remaining > ~0ULL - mono ? ~0ULL : mono + remaining;
-}
 
 struct EpollEvent {
     uint32_t events;
@@ -692,73 +656,6 @@ void MemFdHandleStat(void* handle, VnodeStat* out)
     out->exactDescriptorMetadata = true;
 }
 
-static inline void TimerFdRef(TimerFdData* tfd)
-{
-    if (tfd) __atomic_fetch_add(&tfd->refCount, 1, __ATOMIC_RELEASE);
-}
-
-static inline bool TimerFdUnref(TimerFdData* tfd)
-{
-    if (!tfd) return false;
-    uint32_t prev = __atomic_fetch_sub(&tfd->refCount, 1, __ATOMIC_ACQ_REL);
-    if (prev <= 1) {
-        kfree(tfd);
-        return true;
-    }
-    return false;
-}
-
-// Each syscall owns its registrations and retains the timer independently of
-// numeric fd reuse. Rearm/disarm wakes every reader, poller and epoll waiter.
-struct TimerWaitNode {
-    TimerFdData* timer;
-    Process* process;
-    TimerWaitNode* nextTimer;
-    TimerWaitNode* nextGroup;
-    uint64_t observedGeneration;
-};
-struct TimerWaitGroup {
-    TimerWaitNode* nodes = nullptr;
-    bool allocationFailed = false;
-    void add(TimerFdData* timer, Process* process) {
-        for (auto* n = nodes; n; n = n->nextGroup) if (n->timer == timer) return;
-        auto* n = static_cast<TimerWaitNode*>(kmalloc(sizeof(TimerWaitNode)));
-        if (!n) { allocationFailed = true; return; }
-        TimerFdRef(timer);
-        TimerFdGuard guard(timer);
-        *n = {timer, process, timer->waiters, nodes, 0};
-        timer->waiters = n; nodes = n;
-    }
-    uint64_t deadline(uint64_t outer) {
-        for (auto* n = nodes; n; n = n->nextGroup) {
-            const uint64_t candidate = TimerFdDeadline(n->timer, &n->observedGeneration);
-            if (candidate < outer) outer = candidate;
-        }
-        // A rearm wake can be consumed while acquiring a later timer's
-        // contended mutex. Check every snapshot again without sleeping locks.
-        // A rearm after this pass leaves pendingWakeup set until the block.
-        for (auto* n = nodes; n; n = n->nextGroup)
-            if (__atomic_load_n(&n->timer->rearmGeneration, __ATOMIC_ACQUIRE) != n->observedGeneration)
-                return ClockNowNs(1);
-        return outer;
-    }
-    ~TimerWaitGroup() {
-        while (nodes) {
-            auto* n = nodes; nodes = n->nextGroup;
-            {
-                TimerFdGuard guard(n->timer);
-                auto** link = &n->timer->waiters;
-                while (*link && *link != n) link = &(*link)->nextTimer;
-                if (*link) *link = n->nextTimer;
-            }
-            TimerFdUnref(n->timer); kfree(n);
-        }
-    }
-};
-static void TimerFdWakeLocked(TimerFdData* timer) {
-    for (auto* n = timer->waiters; n; n = n->nextTimer) WakeProcess(n->process);
-}
-
 static inline void EpollFdRef(EpollInstance* ep)
 {
     if (ep) __atomic_fetch_add(&ep->refCount, 1, __ATOMIC_RELEASE);
@@ -775,7 +672,6 @@ static inline bool EpollFdUnref(EpollInstance* ep)
     return false;
 }
 void EpollFdHandleRef(void* handle) { EpollFdRef(static_cast<EpollInstance*>(handle)); }
-void TimerFdHandleRef(void* handle) { TimerFdRef(static_cast<TimerFdData*>(handle)); }
 
 // DspState defined here so DspHandleRef can access refCount.
 // /dev/dsp ioctl constants and handling code are further below.
@@ -9022,7 +8918,7 @@ static uint64_t WaitDeadlineNs(uint64_t timeoutMs)
     return now + timeoutMs * 1000000ULL;
 }
 
-static uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs)
+uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs)
 {
     uint64_t now = ClockNowNs(1);
     uint64_t remaining = deadlineNs > now ? deadlineNs - now : 0;
@@ -10303,113 +10199,6 @@ static int64_t sys_epoll_pwait(uint64_t epfd, uint64_t eventsAddr,
     int error = InstallWaitSignalMask(sigmaskAddr, sigsetsize);
     if (error) return error;
     return sys_epoll_wait(epfd, eventsAddr, maxevents, timeout_ms, 0, 0);
-}
-
-// ---------------------------------------------------------------------------
-// timerfd — timerfd_create / timerfd_settime / timerfd_gettime
-// ---------------------------------------------------------------------------
-//
-// Used by Wayland clients for frame pacing and animation timers.
-// We implement a simple periodic/one-shot timer using LAPIC tick count.
-
-static constexpr int CLOCK_REALTIME  = 0;
-static constexpr int CLOCK_MONOTONIC = 1;
-
-struct ITimerSpec {
-    struct {
-        int64_t tv_sec;
-        int64_t tv_nsec;
-    } it_interval; // period (0 = one-shot)
-    struct {
-        int64_t tv_sec;
-        int64_t tv_nsec;
-    } it_value;    // initial expiry (0 = disarmed)
-};
-
-static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
-                                   uint64_t, uint64_t, uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EMFILE;
-
-    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
-        return -EINVAL;
-
-    if (flags & ~(TFD_NONBLOCK | TFD_CLOEXEC)) return -EINVAL;
-    auto* tfd = static_cast<TimerFdData*>(kmalloc(sizeof(TimerFdData)));
-    if (!tfd) return -ENOMEM;
-    __builtin_memset(tfd, 0, sizeof(*tfd));
-    tfd->clockId = static_cast<int>(clockid);
-    tfd->refCount = 1;
-
-    int fd = FdAlloc(proc, FdType::TimerFd, tfd);
-    if (fd < 0) { kfree(tfd); return -EMFILE; }
-
-    if (flags & TFD_NONBLOCK)
-        proc->fds[fd].statusFlags = 0x800;
-    if (flags & TFD_CLOEXEC)
-        proc->fds[fd].fdFlags |= 1;
-
-    return fd;
-}
-
-static ITimerSpec TimerFdSnapshotLocked(TimerFdData* timer) {
-    const uint64_t now = ClockNowNs(timer->clockId);
-    timer->state.refresh(now);
-    const uint64_t remaining = timer->state.armed ? timer->state.deadline - now : 0;
-    ITimerSpec value{};
-    value.it_value.tv_sec = remaining / 1000000000ULL;
-    value.it_value.tv_nsec = remaining % 1000000000ULL;
-    value.it_interval.tv_sec = timer->state.interval / 1000000000ULL;
-    value.it_interval.tv_nsec = timer->state.interval % 1000000000ULL;
-    return value;
-}
-static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flagsVal,
-                                    uint64_t newValAddr, uint64_t oldValAddr,
-                                    uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdRef pin(proc, static_cast<int>(fd));
-    auto* fde = pin.get();
-    if (!fde) return -EBADF;
-    if (fde->type != FdType::TimerFd || !fde->handle) return -EINVAL;
-    // Wall-clock setting/cancellation is not implemented. Reject unsupported
-    // flags rather than claiming CANCEL_ON_SET behavior.
-    if (flagsVal & ~static_cast<uint64_t>(TFD_TIMER_ABSTIME)) return -EINVAL;
-    ITimerSpec value{};
-    if (!CopyFromUser(&value, newValAddr, sizeof(value))) return -EFAULT;
-    uint64_t initial, interval;
-    if (!brook::TimerFdNanoseconds(value.it_value.tv_sec, value.it_value.tv_nsec, &initial) ||
-        !brook::TimerFdNanoseconds(value.it_interval.tv_sec, value.it_interval.tv_nsec, &interval))
-        return -EINVAL;
-    auto* timer = static_cast<TimerFdData*>(fde->handle);
-    TimerFdGuard guard(timer);
-    const uint64_t now = ClockNowNs(timer->clockId);
-    const ITimerSpec old = TimerFdSnapshotLocked(timer);
-    if (oldValAddr && !CopyToUser(oldValAddr, &old, sizeof(old))) return -EFAULT;
-    timer->state.interval = interval;
-    timer->state.pending = 0;
-    timer->state.armed = initial != 0;
-    timer->state.deadline = !initial ? 0 : (flagsVal & TFD_TIMER_ABSTIME) ? initial : TimeoutAddSafe(now, initial);
-    __atomic_fetch_add(&timer->rearmGeneration, 1, __ATOMIC_RELEASE);
-    TimerFdWakeLocked(timer);
-    return 0;
-}
-
-static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
-                                    uint64_t, uint64_t, uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdRef pin(proc, static_cast<int>(fd));
-    auto* fde = pin.get();
-    if (!fde) return -EBADF;
-    if (fde->type != FdType::TimerFd || !fde->handle) return -EINVAL;
-    auto* timer = static_cast<TimerFdData*>(fde->handle);
-    TimerFdGuard guard(timer);
-    const ITimerSpec value = TimerFdSnapshotLocked(timer);
-    return CopyToUser(currValAddr, &value, sizeof(value)) ? 0 : -EFAULT;
 }
 
 // ---------------------------------------------------------------------------

@@ -41,4 +41,13 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
 int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
                        uint64_t, uint64_t, uint64_t);
 
+// syscall_timerfd.cpp
+int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
+                            uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_timerfd_settime(uint64_t fd, uint64_t flagsVal,
+                             uint64_t newValAddr, uint64_t oldValAddr,
+                             uint64_t, uint64_t);
+int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
+                             uint64_t, uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
