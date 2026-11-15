@@ -40,6 +40,9 @@ public:
         // job if its device work is done. True with the final outcome in out;
         // false while still in flight. Runs on the worker thread.
         bool (*pollParked)(void*,BdwExecSnapshot*,BdwSubmissionOutcome& out)=nullptr;
+        // Optional: idle with a parked job. True if it waited (e.g. a yield
+        // for a quicker breadcrumb poll); false uses the ordinary idle wait.
+        bool (*parkedIdle)(void*)=nullptr;
     };
 private:
     BdwSubmissionQueue queue_;Hooks hooks_{};uint32_t state_=0; // fresh, starting, ready, failed
@@ -58,7 +61,8 @@ private:
             const auto step=self.Step();
             if(step==BdwSubmissionStep::Recover){self.hooks_.recover(self.hooks_.context);__builtin_trap();}
             if(step==BdwSubmissionStep::Idle){
-                if(prompt)self.hooks_.idle(self.hooks_.context,seen);
+                if(self.parkedId_ && self.hooks_.parkedIdle && self.hooks_.parkedIdle(self.hooks_.context)){}
+                else if(prompt)self.hooks_.idle(self.hooks_.context,seen);
                 else self.hooks_.sleep(self.hooks_.context);
             }
         }

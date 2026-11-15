@@ -313,7 +313,10 @@ inline uint32_t& BdwVideoUserSubmissionStorage(){static uint32_t ready=0;return 
 //        critical section and left running; the CPU0 worker parks it and runs
 //        independent RCS/BCS work, then retires it in a second critical
 //        section once the breadcrumb lands (or the 2 s deadline passes).
-constexpr uint32_t BdwVcsTuneMinimalResets=1u,BdwVcsTuneCoherent=2u,BdwVcsTuneAsync=4u;
+//  bit 3 (lane-spin, default off): with a lane job parked and nothing else to
+//        run, the worker yields instead of the 1-tick idle wait, polling the
+//        breadcrumb sooner at the cost of CPU0 time.
+constexpr uint32_t BdwVcsTuneMinimalResets=1u,BdwVcsTuneCoherent=2u,BdwVcsTuneAsync=4u,BdwVcsTuneLaneSpin=8u;
 // VA-API phase 4 VCS lane state, shared with every GPU critical section.
 // While busy: VCS runs a Brook-owned user job between critical sections, so
 // the forcewake observation accepts VCS as non-quiescent, and the private PAT
