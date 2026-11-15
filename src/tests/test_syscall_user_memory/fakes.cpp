@@ -8,6 +8,12 @@
 #include "syscall_poll.h"
 #include "syscall_epoll.h"
 #include "audio.h"
+#include "ahci_system_volume.h"
+#include "hda_observe.h"
+#include "intel_bdw_ioctl.h"
+#include "terminal.h"
+#include "compositor.h"
+#include "sync/ksemaphore.h"
 #include "posix_timer.h"
 #include "kvmclock.h"
 #include "tsc_clock.h"
@@ -41,6 +47,7 @@ namespace harness {
 FakeNet g_net;
 unsigned g_snapshots;
 bool g_syntheticPathsOnly;
+const brook::GpuAppOps* g_gpuApp;
 }
 using harness::g_net;
 
@@ -70,19 +77,12 @@ int VfsStat(Vnode*,VnodeStat*) { return -ENOENT; }
 Vnode* GuardCheckerOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
 
 // Devices and GPU: absent.
-const char* DrmSysAttrContent(const char*) { return nullptr; }
-bool DrmSysIsDir(const char*) { return false; }
-const char* IntelDrmSysAttrContent(const char*) { return nullptr; }
-bool IntelDrmSysIsDir(const char*) { return false; }
-void DrmOwnerUnref(DrmGpuOwner*) {}
-const char g_drmDriDirTag[]="dri";
-const GpuAppOps* GpuAppGet() { return nullptr; }
+const GpuAppOps* GpuAppGet() { return harness::g_gpuApp; }
 bool BdwIntelUserNodeEnabled() { return false; }
 BdwGpuFile* BdwGpuFileCreate() { return nullptr; }
 void BdwGpuFileUnref(BdwGpuFile*) {}
 void BdwGpuBufferUnref(BdwGpuBuffer*) {}
 void BdwGpuSyncUnref(BdwGpuSync*) {}
-void SyncFileUnref(SyncFileData*) {}
 void SceneHandleUnref(SceneHandle*) {}
 void SignalFdUnref(SignalFd*) {}
 void MappingBackingUnref(MappingBacking*) {}
@@ -142,6 +142,37 @@ void SchedulerGetLoadAvg(uint32_t& a,uint32_t& b,uint32_t& c) { a=b=c=0; }
 void SchedulerGetProcessCounts(uint32_t& total,uint32_t& running) { total=running=1; }
 void SchedulerGetReapedTicks(uint64_t& user,uint64_t& system) { user=system=0; }
 
+// ioctl/DRM neighbours: devices, audio, windows and memory not under test.
+bool AhciSystemVolumeOwnsRoot(Vnode*) { return false; }
+bool AhciSystemVolumeOwnsMember(Vnode*) { return false; }
+uint32_t AudioGetPosition() { return 0; }
+bool AudioMixerHorizonEnabled() { return false; }
+void AudioMixerRefresh() {}
+bool AudioMixerSetEnabled(AudioStreamId,bool) { return false; }
+bool AudioMixerSetWritableFrames(AudioStreamId,uint32_t) { return false; }
+int64_t BdwIntelRenderIoctl(BdwGpuFile*,uint64_t,uint64_t,const BdwI915UserAccess&) { return -EINVAL; }
+int64_t CloseProcessFd(Process*,int) { return 0; }
+bool CompositorResizeVfb(Process*,uint32_t,uint32_t) { return false; }
+bool CompositorSetupProcess(Process*,int16_t,int16_t,uint32_t,uint32_t,uint8_t) { return false; }
+int DspChangeFormat(DspState*,const AudioStreamProgress&,uint32_t,uint8_t,uint8_t) { return -EINVAL; }
+bool DspResetStreamLocked(DspState*) { return false; }
+bool HdaRuntimeDrainClockAvailable() { return false; }
+uint64_t HdaRuntimeDrainClockNs() { return 0; }
+Process* KernelThreadCreate(const char*,KernelThreadFn,void*,uint8_t) { return nullptr; }
+void KSemaphoreSignal(KSemaphore*) {}
+void KSemaphoreWait(KSemaphore*) {}
+MappingBacking* MappingBackingCreate(void*,void (*)(void*)) { return nullptr; }
+void MappingBackingRef(MappingBacking*) {}
+int64_t sys_mmap(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) { return -ENOMEM; }
+Terminal* TerminalFindByProcess(Process*) { return nullptr; }
+bool TerminalSnapshotGeometry(Process*,TerminalGeometry* geometry) { geometry->rows=24;geometry->cols=80;return true; }
+VirtualAddress VmmAllocPages(uint64_t,uint64_t,MemTag,uint16_t) { return VirtualAddress(0); }
+void VmmFreePages(VirtualAddress,uint64_t) {}
+int WmCreateWindow(Process*,int16_t,int16_t,uint16_t,uint16_t,const char*,uint8_t,bool,bool) { return -1; }
+int WmFindWindowForProcess(Process*) { return -1; }
+uint32_t WmMetric(uint32_t base) { return base; }
+bool WmResizeWindow(int,uint16_t,uint16_t) { return false; }
+
 // Inet sockets: one fake UDP/TCP socket, observable through g_net. The
 // stack only ever receives kernel buffers.
 bool SockIsNonblock(int) { return true; }
@@ -183,6 +214,8 @@ extern "C" bool InputHasEvents() { return false; }
 extern "C" uint64_t AudioClockNowNs() { return 0; }
 extern "C" void CompositorWake() {}
 extern "C" void KPuts(const char*) {}
+extern "C" void KPrintf(const char*,...) {}
+extern "C" bool TtyGetFramebufferPhys(uint64_t*,uint32_t*,uint32_t*,uint32_t*) { return false; }
 extern "C" int VfsWrite(brook::Vnode*,const void*,uint64_t,uint64_t*) { return -brook::EIO; }
 extern "C" int VfsAppend(brook::Vnode*,const void*,uint64_t,uint64_t*) { return -brook::EIO; }
 extern "C" int VfsRead(brook::Vnode*,void*,uint64_t,uint64_t*) { return -brook::EIO; }

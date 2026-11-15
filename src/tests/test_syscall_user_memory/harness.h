@@ -75,6 +75,10 @@ struct FakeNet {
 extern FakeNet g_net;
 extern unsigned g_snapshots;   // ProcessFsSnapshot calls (open lookups)
 extern bool g_syntheticPathsOnly; // lookups succeed for brokered synthetic names
+}
+namespace brook { struct GpuAppOps; }
+namespace harness {
+extern const brook::GpuAppOps* g_gpuApp; // GpuAppGet() result (default: no GPU)
 
 void Check(bool condition,const char* expression,const char* file,int line);
 unsigned Failures();
@@ -91,3 +95,4 @@ void RunProcessTests();
 void RunMemfdTests();
 void RunWaitTests();
 void RunValidateRaceTests();
+void RunIoctlTests();
