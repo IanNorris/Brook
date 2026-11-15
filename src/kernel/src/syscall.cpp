@@ -119,6 +119,10 @@
 #include "user_copy.h"
 #include "gs_paranoid.h"
 
+#include "syscall_internal.h"
+#include "syscall_pipe.h"
+#include "syscall_netlink.h"
+
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
 extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode);
@@ -128,35 +132,6 @@ using brook::UserBufferReadable;
 using brook::UserBufferWritable;
 using brook::CopyToUser;
 using brook::CopyUserCString;
-
-// ---------------------------------------------------------------------------
-// Random helpers: RDRAND with TSC fallback
-// ---------------------------------------------------------------------------
-
-// Software PRNG fallback using TSC + LCG mixing (used when rdrand unavailable).
-static uint64_t SoftRandU64()
-{
-    uint64_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    uint64_t tsc = (hi << 32) | lo;
-    tsc ^= tsc << 13;
-    tsc ^= tsc >> 7;
-    tsc ^= tsc << 17;
-    return tsc * 6364136223846793005ULL + 1442695040888963407ULL;
-}
-
-static bool RdrandU64(uint64_t* out)
-{
-    if (!CpuHasRdrand()) return false;
-    uint64_t val;
-    uint8_t ok;
-    for (int i = 0; i < 10; i++)
-    {
-        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-        if (ok) { *out = val; return true; }
-    }
-    return false;
-}
 
 // ---------------------------------------------------------------------------
 // C dispatch wrapper — reads syscall number from GS:120, applies strace.
@@ -375,48 +350,7 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         ::: "memory"
     );
 }
-
 namespace brook {
-
-// ---------------------------------------------------------------------------
-// Profiling counters (atomic, dumped on title changes)
-// ---------------------------------------------------------------------------
-static volatile uint64_t g_profOpenCount = 0;
-static volatile uint64_t g_profMmapCount = 0;
-extern volatile uint64_t g_profFaultCount;  // defined in idt.cpp
-static volatile uint64_t g_profCacheHit = 0;
-static volatile uint64_t g_profCacheMiss = 0;
-static volatile uint64_t g_profPreloadPages = 0;
-
-// ---------------------------------------------------------------------------
-// Error codes (Linux)
-// ---------------------------------------------------------------------------
-
-static constexpr int64_t ENOENT  = 2;
-static constexpr int64_t EEXIST  = 17;
-static constexpr int64_t ESRCH   = 3;
-static constexpr int64_t E2BIG   = 7;
-static constexpr int64_t EPERM   = 1;
-static constexpr int64_t EBADF   = 9;
-static constexpr int64_t ENOMEM  = 12;
-static constexpr int64_t EFAULT  = 14;
-static constexpr int64_t ENODEV  = 19;
-static constexpr int64_t EINVAL  = 22;
-static constexpr int64_t ENOEXEC = 8;
-static constexpr int64_t EMFILE  = 24;
-static constexpr int64_t EPIPE   = 32;
-static constexpr int64_t ERANGE  = 34;
-static constexpr int64_t ENOSYS  = 38;
-static constexpr int64_t EAGAIN  = 11;
-static constexpr int64_t EINTR   = 4;
-static constexpr int64_t ENOTDIR = 20;
-static constexpr int64_t EIO     = 5;
-static constexpr int64_t ENOTSOCK = 88;
-static constexpr int64_t ENOTCONN = 107;
-static constexpr int64_t EAFNOSUPPORT = 97;
-static constexpr int64_t ECONNREFUSED = 111;
-static constexpr int64_t ETIMEDOUT    = 110;
-static constexpr int64_t ELOOP       = 40;
 
 // Temporary masks survive the blocking C handler until signal selection on
 // syscall return. A PID can be reused after a killed waiter, so pair each slot
@@ -457,42 +391,6 @@ extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original)
     saved.active = false;
     if (active) *original = saved.original;
     return active;
-}
-
-// Check if the current process has deliverable signals pending.
-// Call after SchedulerBlock() returns to decide whether to return -EINTR.
-static bool HasPendingSignals()
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return false;
-    return __atomic_load_n(&proc->terminalPending, __ATOMIC_ACQUIRE) ||
-           ((ProcessPendingSignals(proc) | PosixTimerPending(proc)) & ~proc->sigMask) != 0;
-}
-
-// Child exit also queues default-ignored SIGCHLD to wake wait4. Blocking
-// reads may discard that notification only when no user handler needs it.
-// In particular, libuv's exec-handshake read must preserve caught SIGCHLD
-// so its handler can notify the event loop and reap the exited child.
-static bool HasReadInterruptSignal()
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return false;
-    constexpr uint64_t childBit = 1ULL << (17 - 1);
-    if ((ProcessPendingSignals(proc) & ~proc->sigMask & childBit) && proc->tgid < MAX_PROCESSES) {
-        uint64_t handler = ReadSignalAction(proc->tgid,17 - 1).handler;
-        if (handler == 0 || handler == 1)
-            ProcessDequeueSignal(proc, 17, nullptr);
-    }
-    return HasPendingSignals();
-}
-
-static void WakeProcess(Process* proc)
-{
-    uint64_t addr = reinterpret_cast<uint64_t>(proc);
-    if (!proc || (addr >> 47) != 0x1FFFFULL) return;
-    if (proc->magic != PROCESS_MAGIC) return;
-    __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
-    SchedulerUnblock(proc);
 }
 
 #include "pipe_poll.inc"
@@ -752,12 +650,6 @@ static void MemFdReleaseMapping(void* object) {
     MemFdUnref(mfd);
 }
 
-struct KernelOperationGuard {
-    Process* proc;
-    explicit KernelOperationGuard(Process* p) : proc(p) { if (proc) SchedulerKernelRegionEnter(proc); }
-    ~KernelOperationGuard() { if (proc) SchedulerKernelRegionLeave(proc); }
-};
-
 // Read-only per-user retained system events. A failed user copy never consumes
 // an event; the caller advances its own cursor only after receiving the record.
 static int64_t sys_brook_system_message(uint64_t after,uint64_t output,uint64_t size,
@@ -850,32 +742,6 @@ static int64_t MemFdWriteAt(MemFdData* mfd, const void* buffer, uint64_t count,
     *offset = pos;
     MfdUnlock(mfd);
     return done || !count ? static_cast<int64_t>(done) : -ENOMEM;
-}
-
-static inline void VnodeRef(Vnode* vn)
-{
-    if (!vn) return;
-    // Detect use-after-free: kfree poisons memory with 0xDF bytes.
-    // If the ops pointer is the poison pattern, the vnode was already freed.
-    uintptr_t opsVal = reinterpret_cast<uintptr_t>(vn->ops);
-    if (opsVal == 0xdfdfdfdfdfdfdfdfULL || vn->refCount == 0) {
-        SerialPrintf("BUG: VnodeRef on freed/zero-ref vnode %p (ops=%p refCount=%u)\n",
-                     vn, vn->ops, vn->refCount);
-        return; // refuse to ref a dead vnode
-    }
-    VfsRetain(vn);
-}
-
-// Try to take a reference on a vnode that might be concurrently freed.
-// Returns true if the ref was taken (refCount was > 0 and is now +1).
-// Returns false if refCount was already 0 (vnode is being freed).
-
-static inline void VnodeUnref(Vnode* vn)
-{
-    if (!vn) return;
-    uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
-    if (prev <= 1)
-        VfsClose(vn);
 }
 
 // User #PF demand-paging hook for memfd MAP_SHARED mappings. Returns true
@@ -1882,29 +1748,6 @@ static int DspChangeFormat(DspState* dsp, const AudioStreamProgress& progress,
     return 0;
 }
 
-// RAII guard for the pinned fget/fput path (BRO-156). Constructing it pins the
-// fd; destruction (on *every* return path, including the blocking ones) runs
-// the matching FdPut, which performs any deferred-close teardown. Use this
-// instead of a bare FdGet anywhere the handle is dereferenced across a point
-// where the operation can sleep — a sibling thread could otherwise close() the
-// fd and free the handle mid-use.
-struct FdRef
-{
-    Process* proc;
-    int      fd;
-    FdEntry* fde;
-
-    FdRef(Process* p, int f) : proc(p), fd(f), fde(FdGetRef(p, f)) {}
-    ~FdRef() { if (fde) FdPut(proc, fd); }
-
-    FdRef(const FdRef&)            = delete;
-    FdRef& operator=(const FdRef&) = delete;
-
-    explicit operator bool() const { return fde != nullptr; }
-    FdEntry* operator->() const     { return fde; }
-    FdEntry* get() const            { return fde; }
-};
-
 struct UnixSocketStage {
     char* bytes=nullptr;
     ~UnixSocketStage(){if(bytes)kfree(bytes);}
@@ -2557,7 +2400,6 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
     return WriteToFdByType(fd, bufAddr, count);
 }
 
-
 // ---------------------------------------------------------------------------
 // sys_read (0)
 // ---------------------------------------------------------------------------
@@ -3155,17 +2997,6 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     return -EBADF;
 }
 
-// ---------------------------------------------------------------------------
-// sys_open (2)
-// ---------------------------------------------------------------------------
-
-// Simple string comparison helper
-static bool StrEq(const char* a, const char* b)
-{
-    while (*a && *b) { if (*a++ != *b++) return false; }
-    return *a == *b;
-}
-
 // A name owns one backing reference independently of descriptors/mappings.
 // Open and unlink serialize the name-to-object binding; final backing release
 // happens after dropping this namespace lock. Names are dynamically allocated.
@@ -3568,7 +3399,6 @@ struct AtLookup {
     AtLookup()=default;AtLookup(const AtLookup&)=delete;AtLookup& operator=(const AtLookup&)=delete;
 };
 
-
 static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_t mode)
 {
     Process* proc = ProcessCurrent();
@@ -3917,7 +3747,6 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             }
         }
 
-
     }
 
     // /proc/self/exe → return ENOENT for now (readlink handles it)
@@ -4074,7 +3903,6 @@ static int64_t sys_open(uint64_t path,uint64_t flags,uint64_t mode,uint64_t,uint
 {
     return OpenAtInternal(-100,path,flags,mode);
 }
-
 
 // Linux creat is precisely open(O_WRONLY|O_CREAT|O_TRUNC), including mode,
 // umask, descriptor access and the regular-file truncate/mapping safeguards.
@@ -9902,7 +9730,6 @@ retry_poll:
             self->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
                 SchedulerBlockInterruptible(self);
-
 
         }
 
@@ -16070,7 +15897,6 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     const bool closed=!usd->txPipe->readers || usd->txPipe->unixReadShutdown || usd->txPipe->unixWriteShutdown;
     SpinLockRelease(&usd->txPipe->lock);
     if(closed) {if(!(flagsVal&0x4000))ProcessSendSignal(proc,13);return -EPIPE;}
-
 
     // Parse SCM_RIGHTS cmsg (if any) BEFORE writing payload. If cmsg parsing
     // fails (bad pointer, wrong type, fd full) we refuse the whole sendmsg

@@ -286,6 +286,7 @@ add_executable(kernel
     src/writable_desktop.cpp
     src/runtime.cpp
     src/syscall.cpp
+    src/syscall_common.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
