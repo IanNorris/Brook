@@ -611,7 +611,11 @@ static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t
 enum { GPU_CALLBACK_FALLBACK_MS=100 };
 static int image_callbacks_due(const struct brook_image *image, uint32_t now) {
     if (!image->pending_cpu || image->gpu_presented) return 1;
-    return image->offer_state==1 && image->offer_ms && (int32_t)(now-image->offer_ms)>=GPU_CALLBACK_FALLBACK_MS;
+    if (image->offer_state==1 && image->offer_ms && (int32_t)(now-image->offer_ms)>=GPU_CALLBACK_FALLBACK_MS) return 1;
+    /* Never hold callbacks indefinitely on a missing PRESENTED, a slow
+     * producer fence, a layered wait or channel recovery: after the same
+     * delay from queueing, release them regardless of offer state. */
+    return image->queued_ms && (int32_t)(now-image->queued_ms)>=GPU_CALLBACK_FALLBACK_MS;
 }
 static struct wl_event_source *g_frame_timer;
 static int frame_clock_tick(void *unused) {
@@ -2985,6 +2989,7 @@ static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer){
     image->refs=1;image->width=db->width;image->height=db->height;image->format=db->fourcc==0x34325258?2:1;
     image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
     image->pending_cpu=1;image->pending_fd=prime.fd;image->producer_fence=-1;
+    image->queued_ms=g_now_ms();if(!image->queued_ms)image->queued_ms=1;
     if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->trace_queued_ms=g_now_ms();
     const char *fenced=getenv("BROOK_WAYLAND_SNAPSHOT_FENCE");
     image->producer_fence_required=fenced && !strcmp(fenced,"1");

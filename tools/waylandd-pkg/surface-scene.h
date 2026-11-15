@@ -32,7 +32,7 @@ struct brook_image {
     /* Version 3 layered offers: groups currently holding this image, the
      * tree commit the offer stood for, and, for CPU pixels, a GEM copy
      * uploaded once (gem_fd prime fd, gem_handle) and its idle fence. */
-    unsigned group_refs;uint32_t group_wait_ms;
+    unsigned group_refs;uint32_t group_wait_ms,queued_ms;
     uint64_t offer_tree_commit;
     int gem_fd,gem_fence;uint32_t gem_handle;uint64_t gem_words;
 };

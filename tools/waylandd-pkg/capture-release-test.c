@@ -411,6 +411,10 @@ static void check_gpu_window_layers(void)
     assert(g_gpu_group_offers==groupsBefore+1 && rootImage->group_refs==1 && childImage->group_refs==1);
     assert(childImage->offer_state==1 && rootImage->offer_state==1 && g_layer_readback_bytes==readbackBefore);
     /* Never presented: frame callbacks are still released after the fallback delay. */
+    /* Any pending image, whatever its offer state, is due after the delay from queueing. */
+    {const int saved=childImage->offer_state;childImage->offer_state=3;
+     assert(!image_callbacks_due(childImage,childImage->queued_ms) &&
+            image_callbacks_due(childImage,childImage->queued_ms+GPU_CALLBACK_FALLBACK_MS));childImage->offer_state=saved;}
     {const uint32_t now=g_now_ms();assert(!image_callbacks_due(childImage,now));
      assert(image_callbacks_due(childImage,now+GPU_CALLBACK_FALLBACK_MS) && image_callbacks_due(rootImage,now+GPU_CALLBACK_FALLBACK_MS));}
     /* 3. SAFE for the superseded single offer keeps the root held by the group. */
