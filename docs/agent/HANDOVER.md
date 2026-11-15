@@ -92,6 +92,16 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov afternoon (Dell gen 419, `dell-int17-20261116` = main + `work/prof-path` + `work/gpu-queue-wait`, session `26fb3e21dbc4414f8b3cde5e5022f349`):**
+- **Quake II audio works (Ian confirmed). Launch recipe:**
+  - `brook-run <brook-iris-run> <yquake2 quake2> -datadir /data/home/quake2 +set s_openal 1 +set al_driver libopenal.so.1`
+  - env `LD_LIBRARY_PATH=/nix/store/.brook-audio-stage/59h20vp…-openal-soft-oss-brook-1.24.3/lib` and `ALSOFT_CONF` = the stage's `alsoft-oss.conf` (oss, 44100, stereo int16, periods 4 × 1024).
+  - Without the conf, OSS `SNDCTL_DSP_SPEED` after SETFRAGMENT fails with EOPNOTSUPP (only the 48 kHz hardware rate is allowed once the ring is sized; deliberate since c86c7d43). Without the library, OpenAL is not found and SDL falls back to ALSA, which fails.
+  - Ian wants a Quake II Apps launcher.
+- **The matched demo regression (48–49 vs 52) was boot state, not code.** A fresh boot gives 52.2 (lastlog on) and 51.2 (off). On the post-Steam boot, bridge polling flooded serial (about 6 lines per bridge connection: DEBUG_TCP plus the tcp TX/RX traces), and the lastlog writer then rewrote and fsynced every 5 s, costing about 3–4 swaps/s. Backlog: make the per-connection bridge logging a debug category, off by default.
+- **Profiler:** `prof start MS /nix/var/log/brook` saves PROF_*.TXT to the writable store.
+- **Pointer re-grab after Super** (Q2 re-locks before taskbar clicks): `work/pointer-relock` in progress.
+
 **16 Nov (Dell gen 417, `dell-int16-20261116`, session `f7b40b4bb49041aa9ea8301f6466b518`; main `d95e1b22`):**
 - **Main now has:**
   - `work/bin-sh` (/bin/sh, /usr/bin/env);
