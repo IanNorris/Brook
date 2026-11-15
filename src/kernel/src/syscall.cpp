@@ -121,6 +121,7 @@
 
 #include "syscall_internal.h"
 #include "syscall_signal.h"
+#include "syscall_eventfd.h"
 #include "syscall_pipe.h"
 #include "syscall_time.h"
 #include "syscall_netlink.h"
@@ -359,46 +360,6 @@ namespace brook {
 
 static void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
 static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1){BdwFenceUnref(file->intelFence);kfree(file);} }
-
-// EventFd data structure (used in read/write/poll/close)
-struct EventFdData {
-    KMutex lock; // graph -> eventfd; never acquire graph while holding this
-    uint64_t counter;
-    uint64_t inGeneration;
-    uint64_t outGeneration;
-    uint64_t identity;
-    uint32_t flags;
-    volatile uint32_t refCount;
-    Process* readerWaiter;
-    Process* epollWaiter;  // process blocked in epoll_wait watching this eventfd
-};
-static uint64_t g_eventFdIdentity = 0;
-static void EventFdInit(EventFdData* efd, uint64_t counter, uint32_t flags) {
-    __builtin_memset(efd, 0, sizeof(*efd));
-    efd->counter = counter;
-    efd->flags = flags;
-    efd->refCount = 1;
-    efd->identity = __atomic_add_fetch(&g_eventFdIdentity, 1, __ATOMIC_RELAXED);
-}
-struct EventFdGuard {
-    EventFdData* efd;
-    explicit EventFdGuard(EventFdData* value) : efd(value) { KMutexLock(&efd->lock); }
-    ~EventFdGuard() { KMutexUnlock(&efd->lock); }
-};
-struct EventFdSnapshot {
-    uint64_t identity, inGeneration, outGeneration;
-    uint32_t ready;
-};
-static EventFdSnapshot EventFdReady(EventFdData* efd, uint32_t events) {
-    EventFdGuard guard(efd);
-    uint32_t ready = 0;
-    if (efd->counter && (events & 1)) ready |= 1;
-    if (efd->counter < ~0ULL - 1 && (events & 4)) ready |= 4;
-    return {efd->identity, efd->inGeneration, efd->outGeneration, ready};
-}
-static constexpr uint32_t EFD_SEMAPHORE = 0x01;
-static constexpr uint32_t EFD_CLOEXEC = 0x80000;
-static constexpr uint32_t EFD_NONBLOCK  = 0x800;
 
 // timerfd constants and data — defined here so sys_read/sys_poll can use them
 static constexpr int TFD_NONBLOCK     = 0x800;
@@ -731,22 +692,6 @@ void MemFdHandleStat(void* handle, VnodeStat* out)
     out->exactDescriptorMetadata = true;
 }
 
-static inline void EventFdRef(EventFdData* efd)
-{
-    if (efd) __atomic_fetch_add(&efd->refCount, 1, __ATOMIC_RELEASE);
-}
-
-static inline bool EventFdUnref(EventFdData* efd)
-{
-    if (!efd) return false;
-    uint32_t prev = __atomic_fetch_sub(&efd->refCount, 1, __ATOMIC_ACQ_REL);
-    if (prev <= 1) {
-        kfree(efd);
-        return true;
-    }
-    return false;
-}
-
 static inline void TimerFdRef(TimerFdData* tfd)
 {
     if (tfd) __atomic_fetch_add(&tfd->refCount, 1, __ATOMIC_RELEASE);
@@ -829,8 +774,6 @@ static inline bool EpollFdUnref(EpollInstance* ep)
     }
     return false;
 }
-
-void EventFdHandleRef(void* handle) { EventFdRef(static_cast<EventFdData*>(handle)); }
 void EpollFdHandleRef(void* handle) { EpollFdRef(static_cast<EpollInstance*>(handle)); }
 void TimerFdHandleRef(void* handle) { TimerFdRef(static_cast<TimerFdData*>(handle)); }
 
@@ -9743,35 +9686,6 @@ static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
     constexpr uint64_t PIPE2_ALLOWED = O_CLOEXEC | O_NONBLOCK | 0x4000;
     if (flags & ~PIPE2_ALLOWED) return -EINVAL;
     return CreatePipe(pipefdAddr,flags);
-}
-
-// ---------------------------------------------------------------------------
-// sys_eventfd2 (290) — event notification file descriptor
-// ---------------------------------------------------------------------------
-
-static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
-                              uint64_t, uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EMFILE;
-
-    const uint32_t flags=static_cast<uint32_t>(flagsVal);
-    if(flags & ~(EFD_SEMAPHORE|EFD_CLOEXEC|EFD_NONBLOCK))return -EINVAL;
-    KernelOperationGuard operation(proc);
-
-    auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
-    if (!efd) return -ENOMEM;
-
-    EventFdInit(efd, static_cast<uint32_t>(initval), flags);
-
-    FdEntry entry{};entry.type=FdType::EventFd;entry.handle=efd;
-    entry.statusFlags=2u|((flags&EFD_NONBLOCK)?0x800u:0u);
-    entry.fdFlags=(flags&EFD_CLOEXEC)?1:0;
-    int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
-    if (fd < 0) { kfree(efd); return -EMFILE; }
-
-    DbgPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);
-    return fd;
 }
 
 // ---------------------------------------------------------------------------

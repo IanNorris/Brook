@@ -288,6 +288,7 @@ add_executable(kernel
     src/syscall.cpp
     src/syscall_common.cpp
     src/syscall_signal.cpp
+    src/syscall_eventfd.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp

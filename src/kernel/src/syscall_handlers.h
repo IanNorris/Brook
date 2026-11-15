@@ -37,4 +37,8 @@ int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t,
 int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
                   uint64_t, uint64_t, uint64_t);
 
+// syscall_eventfd.cpp
+int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
