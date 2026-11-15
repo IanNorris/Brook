@@ -1,5 +1,17 @@
 # Brook project handover
 
+**Caption block sized to Chromium's tab strip; launcher bundle; rebased (`work/chrome-csd` `d53bc0ed`, QEMU only):**
+- **Rebased** onto main `2f3372e0`; the earlier HANDOVER line was dropped.
+- **Sliver fix:** Chromium's tab strip is 40 surface units restored and maximised: 40 px in QEMU, 80 px on the Dell at scale 2. Syscall 512's 4th argument now carries the client strip height, and waylandd's `BROOK_WAYLAND_CAPTION_APPS` entries take `:height` (default `chromium:40,google-chrome:40`).
+- **QEMU v3:**
+  - Restored: block 50–89, toolbar from 90.
+  - Maximised: block 0–39, toolbar from 40.
+  - The 4 px sliver is gone. Before/after crops are `build/csd-qemu/evidence/2{0,1,3,5}-sliver-*.png`.
+- **Host tests:** 360/361 under load; `test_audio_delivery` passed alone.
+- **Launcher bundle:** `build/chrome-launcher-stage/bundle.tar`, built by `tools/launcher-stage/make_bundle.py`. It installs `svypzdsv…-brook-hardware-network-launchers` and swaps only `/nix/profile/bin/brook-chromium`, writing a rollback record. The installer was checked on the host in a user namespace.
+- **Dell pair (not deployed):** `build/dell/pair-chrome-csd-20261116` (payload `dell-chrome-csd-20261116`, kernel `46e7b93f…`, initrd `3aa9087d…`) passed `check_dell_image_qemu.py --attempts 4` (attempt 1 stalled in firmware, attempt 2 passed).
+- **Note:** in this busy guest, a click sent in the same instant as the pointer move sometimes missed the button; a hover-then-click worked.
+
 **Chromium tabs in the title area, with Brook's caption buttons overlaid (`work/chrome-csd` `78ce6db0`; QEMU only):**
 - **Finding:** Chromium already decorates client-side by default (tab strip at the top). It showed only a close button because GTK reads GNOME `button-layout` from GSettings, and with no dconf that is the schema default `appmenu:close`.
 - **Kernel WM:** new caption overlay. A CSD window carries right/top shadow insets; the WM draws and hit-tests only its min/max/close block at the top-right of the window geometry. Implemented across the CPU compositor, GPU chrome layer and desktop-renderer chrome capture, and the renderer gives an overlay chrome surface no hole.
