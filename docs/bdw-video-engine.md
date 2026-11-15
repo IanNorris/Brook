@@ -506,3 +506,55 @@ A **persistent execlist context** comes with it: a lane-owned HWS page and GGTT 
 4. Desktop and yquake regression, with zero-copy active, while VA-API plays.
 5. The `--hang` probe with `async on`: quarantine, and the desktop stays responsive.
 
+## Lane results on the Dell (integration10-lane, gen 407–408)
+
+**Lane fix:** the lane backend's ELSP port accessor is single-use. Reusing it failed every lane job after the first (`execlist-init-or-elsp`); VCS was reset cleanly and quarantined, with no panic. 42c84994 rebuilds the backend in place for each submit.
+
+**ffmpeg, async on:**
+- framemd5 bit-exact: **300/300** at 720p and 300/300 at 1080p.
+- 600 jobs, all through the lane, 0 failures.
+- Worker blocked **555 µs per job**, against 1941 µs (720p) and 3756 µs (1080p) synchronous.
+
+**Chromium, 20 s runs:**
+
+| run | dropped / total | p50 / p90 ms | CPU | worker blocked µs/job | lane submit→retired µs |
+|---|---|---|---|---|---|
+| async 720p | 38 / 520 | 32.8 / 47.7 | 17.2% | 497 | 6564 |
+| sync 720p | 48 / 519 | 33.3 / 52.5 | 17.2% | 1927 | — |
+| software 720p | 7 / 518 | 31.3 / 47.3 | 19.7% | — | — |
+| async 1080p (×3) | 40–47 / ~510 | 32.9–33.1 / 50–52 | 16.5–17.5% | 500–506 | 8963–9677 |
+| sync 1080p (×2) | 76–77 / ~514 | 33.4–34.0 / 56–58 | 17.7–17.8% | 3759–3761 | — |
+| software 1080p (×2) | 7 / ~505 | 31.9 / 47 | 21.1–22.2% | — | — |
+
+- **Async against sync:** it halves the drops and cuts worker blocking 7×.
+- **Against software:** it uses 4–5 points less CPU, but still drops about 40 frames per 20 s where software drops 7.
+- **Where the time goes:** the instrumented build shows `lane_crumb_us` of about 8.7 ms from submit to the first breadcrumb sighting, against about 3.3 ms of actual decode, with only about 3 polls per job. The worker polls only between jobs, so a long RCS job delays the sighting.
+
+**Quake II 600-record demo, with 1080p video playing in Chromium** (single runs, noisy):
+
+| condition | demo interval |
+|---|---|
+| no video | 13.64 s |
+| software video | 17.45 s |
+| sync VA-API video | 15.07 s |
+| async VA-API video | 19.09 s, then 14.35 s |
+
+In the overlap runs, CPU was 22.8% with async VA-API against 28.1% with software video. Zero-copy stayed registered.
+
+**`--hang` with async on:**
+- Detected at 2002 ms; VCS quarantined (`breadcrumb-timeout`); `HAS_BSD` back to 0.
+- **The desktop never stalled:** compositor frame interval max 18 ms throughout, where the synchronous hang froze the worker for 2 s.
+
+**Panic (gen 408, sequence 41):** during the `spin on` 1080p run (yield idle while a lane job is parked), on `pair-int10-lane2`, the worker panicked.
+- **Panic message:** "Broadwell worker uncertain … pid=542 objects=20 pages=7314 gt=1 pat=1 reset=1 restore=0 … head=0 tail=e0 acthd=0".
+- **What happened:** an **RCS** Chromium job was submitted (port=4) but produced no CSB event and no breadcrumb (`render run failed site=2 csb=0/0/0/0 event=0 breadcrumb=0`). The PAT restore after it did not complete. The guard recovered.
+- **Unknown:** whether a VCS lane job was in flight. On gen 407, async without spin ran 6754 lane jobs, 3371 of them overlapped with RCS work, without this.
+- **Decoded packet:** `build/hardware/vcs-lane-int10c/recovery-panic` (decoded against int10-lane BROOK.elf).
+
+**Recommendation:**
+- **Keep `async` default off.** VA-API itself stays off by default, and `spin` must stay off, until it is shown whether the RCS failure is caused by the lane (RCS running while VCS is busy, or the lane PAT base) or by spin.
+- **Next:**
+  1. Long async-only and sync-only Chromium soaks, to see whether the RCS failure recurs with the lane alone.
+  2. Record lane state in the RCS failure panic message.
+  3. Poll the lane breadcrumb from inside the RCS completion wait, to cut the 8.7 ms sighting delay.
+
