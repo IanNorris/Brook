@@ -28,10 +28,15 @@ uint64_t GlobalBytes = 256ULL * 1024 * 1024;
 constexpr uint64_t InstanceInodes = 4096, GlobalInodes = 16384, GlobalMounts = 128;
 constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, Socket = 0140000, TypeMask = 0170000;
 struct Node;
+// A directory entry names one inode. Non-directory inodes may have several
+// entries (hard links); each owns one object reference and sits both on its
+// directory's child list (next) and on the inode's alias list (alias).
 struct Entry
 {
     Entry *next;
+    Entry *alias;
     Node *node;
+    Node *dir;
     char name[256];
 };
 struct Page
@@ -68,17 +73,23 @@ struct Node
     VfsObject object;
     uint32_t uid, gid, nlink;
     uint16_t mode;
+    // Reachable from the root: the root, or a node with at least one alias.
     bool linked;
     uint64_t ino, size;
     VnodeTime atime, mtime, ctime;
+    // Directories only: the containing directory, held (and retained after
+    // removal) for '..' traversal. Non-directory names live in aliases.
     Node *parent;
+    // Directory children (this node's own entries).
     Entry *entries;
+    // Names referring to this inode, oldest first; the head is the reported
+    // name. A directory has at most one; the root has none.
+    Entry *aliases;
     Page *pages;
     Page **pageBuckets;
     uint64_t pageCount;
     uint32_t pageBucketCount;
     char *target;
-    char name[256];
     FileObject file;
 };
 PhysicalAddress PinCoherentPage(void* context,uint64_t index,void** token,int* error);
@@ -193,7 +204,7 @@ void DestroyNode(Node *n)
 {
     while (n)
     {
-        if (n->entries)
+        if (n->entries || n->aliases)
             __builtin_trap();
         auto *fs = n->fs;
         auto *parent = (n->mode & TypeMask) == Directory ? n->parent : nullptr;
@@ -452,19 +463,21 @@ int ObjectPath(VfsObject *o, char *out, uint32_t capacity)
     char path[512];
     uint32_t cursor = sizeof(path) - 1;
     path[cursor] = 0;
-    for (unsigned depth = 0; n->parent; ++depth)
+    // Reporting only: a hard-linked inode reports its oldest surviving name.
+    for (unsigned depth = 0; n != n->fs->root; ++depth)
     {
         if (depth >= 256)
             return -40;
-        if (!n->linked)
+        auto *e = n->aliases;
+        if (!n->linked || !e)
             return -2;
-        uint32_t length = strlen(n->name);
+        uint32_t length = strlen(e->name);
         if (length + 1 > cursor)
             return -36;
         cursor -= length;
-        memcpy(path + cursor, n->name, length);
+        memcpy(path + cursor, e->name, length);
         path[--cursor] = '/';
-        n = n->parent;
+        n = e->dir;
     }
     if (cursor == sizeof(path) - 1)
         path[--cursor] = '/';
@@ -480,13 +493,15 @@ int EntryParent(VfsObject *o,VfsObject **out,char *leaf,uint32_t capacity)
     *out=nullptr;leaf[0]=0;
     auto *n=Object(o);
     Guard g(n->fs);
-    if(!n->linked || !n->parent || !n->parent->linked)return -2;
-    auto *entry=*Find(n->parent,n->name);
-    if(!entry || entry->node!=n)return -2;
-    auto length=strlen(n->name);
+    auto *entry=n->aliases;
+    if(!n->linked || !entry || !entry->dir->linked)return -2;
+    // The inode alone cannot choose between hard-link names (exact provenance
+    // contract): refuse rather than guess, as ext2 does for inode-only objects.
+    if(entry->alias)return -95;
+    auto length=strlen(entry->name);
     if(length>=capacity)return -36;
-    int error=MakeObject(n->parent,out);
-    if(!error)memcpy(leaf,n->name,length+1);
+    int error=MakeObject(entry->dir,out);
+    if(!error)memcpy(leaf,entry->name,length+1);
     return error;
 }
 int DirectoryPath(VfsObject *o, char *out, uint32_t capacity)
@@ -940,15 +955,22 @@ Entry *PrepareEntry(Node *parent, const char *name, Node *child)
     e->node = child;
     return e;
 }
+// The caller has accounted the entry's object reference and the inode's nlink.
 void Publish(Node *parent, Entry *entry)
 {
     auto *n = entry->node;
+    entry->dir = parent;
     entry->next = parent->entries;
     parent->entries = entry;
-    n->parent = parent;
-    strcpy(n->name, entry->name);
+    entry->alias = nullptr;
+    auto **tail = &n->aliases;
+    while (*tail)
+        tail = &(*tail)->alias;
+    *tail = entry;
+    n->linked = true;
     if ((n->mode & TypeMask) == Directory)
     {
+        n->parent = parent;
         Hold(parent);
         ++parent->nlink;
     }
@@ -1101,6 +1123,45 @@ int Symlink(VfsObject *o, const char *target, const char *name)
     Publish(p, e);
     return 0;
 }
+// Publish another name for an existing non-directory inode (link/linkat).
+// The inode, its pages, FileObject and identity are shared by every name.
+constexpr uint32_t MaximumLinks = 65000;
+int LinkObject(VfsObject *parentObject, VfsObject *sourceObject, const char *name)
+{
+    if (!sourceObject || sourceObject->ops != parentObject->ops)
+        return -18;
+    auto *p = Object(parentObject);
+    auto *n = Object(sourceObject);
+    if (p->fs != n->fs)
+        return -18;
+    Actor actor(p->fs);
+    Guard g(p->fs);
+    if (int e = ParentCheck(p, name, actor))
+        return e;
+    const uint16_t type = n->mode & TypeMask;
+    if (type == Directory)
+        return -1;
+    // An open-but-unlinked inode is never resurrected.
+    if (!n->linked || !n->nlink)
+        return -2;
+    if (*Find(p, name))
+        return -17;
+    if (n->nlink >= MaximumLinks)
+        return -31;
+    // Linux protected_hardlinks: owner/CAP_FOWNER, or an ordinary regular
+    // file that is not set-ID and that the caller may both read and write.
+    if (!actor.Own(n) &&
+        (type != Regular || (n->mode & 04000) || ((n->mode & 02010) == 02010) || actor.Access(n, 6)))
+        return -1;
+    auto *e = PrepareEntry(p, name, n);
+    if (!e)
+        return -28;
+    Hold(n);
+    ++n->nlink;
+    n->ctime = Now();
+    Publish(p, e);
+    return 0;
+}
 // Entry owns one link reference. Removed directories retain their parent hold
 // for already-open '..' traversal; iterative Drop releases that chain finally.
 void RemoveEntry(Node *parent, Entry **slot)
@@ -1108,13 +1169,28 @@ void RemoveEntry(Node *parent, Entry **slot)
     auto *e = *slot;
     *slot = e->next;
     auto *n = e->node;
-    n->linked = false;
-    n->nlink = 0;
+    auto **alias = &n->aliases;
+    while (*alias != e)
+    {
+        if (!*alias)
+            __builtin_trap();
+        alias = &(*alias)->alias;
+    }
+    *alias = e->alias;
     n->ctime = Now();
     if ((n->mode & TypeMask) == Directory)
+    {
+        n->nlink = 0;
         --parent->nlink;
+    }
     else
-        n->parent = nullptr;
+    {
+        if (!n->nlink)
+            __builtin_trap();
+        --n->nlink;
+    }
+    // Data and identity survive while another name or any open reference remains.
+    n->linked = n->aliases != nullptr;
     Free(parent->fs, e);
     Drop(n);
     parent->mtime = parent->ctime = Now();
@@ -1227,29 +1303,25 @@ depth_checked:
     source = Find(p, oldName);
     *source = entry->next;
     strcpy(entry->name, newName);
-    strcpy(n->name, newName);
+    entry->dir = q;
     entry->next = q->entries;
     q->entries = entry;
-    if (p != q)
+    if (p != q && dir)
     {
-        if (dir)
-        {
-            Hold(q);
-            auto *oldParent = n->parent;
-            n->parent = q;
-            --p->nlink;
-            ++q->nlink;
-            Drop(oldParent);
-        }
-        else
-            n->parent = q;
+        Hold(q);
+        auto *oldParent = n->parent;
+        n->parent = q;
+        --p->nlink;
+        ++q->nlink;
+        Drop(oldParent);
     }
     n->ctime = p->mtime = p->ctime = q->mtime = q->ctime = Now();
     return 0;
 }
 const VfsObjectOps objectOps = {DestroyObject, StatObject, AccessObject, Child,  Parent,       Readlink,
                                 OpenObject,    Create,     Mkdir,        Remove, Rename,       Symlink,
-                                CreateSocket,  Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo, EntryParent};
+                                CreateSocket,  Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo, EntryParent,
+                                LinkObject};
 const VfsObjectOps *ObjectOperations()
 {
     return &objectOps;
