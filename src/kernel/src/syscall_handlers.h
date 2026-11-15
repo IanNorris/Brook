@@ -384,4 +384,30 @@ int64_t sys_get_robust_list(uint64_t pid,uint64_t headOut,uint64_t lengthOut,uin
 int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
+// syscall_cred.cpp
+int64_t sys_getuid(uint64_t, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_getgid(uint64_t, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_geteuid(uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_getegid(uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_setuid(uint64_t id, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_setgid(uint64_t id, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_setreuid(uint64_t real, uint64_t effective, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_setregid(uint64_t real, uint64_t effective, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_setresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
+int64_t sys_setresgid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
+int64_t sys_capget(uint64_t header, uint64_t data, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
+int64_t sys_getresgid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
