@@ -112,3 +112,44 @@ Until the profile binary is updated, the launcher's second server keeps stealing
       - Repeat the gen 371 capture (`capture.py`) and compare the waylandd share and app stats ms.
    5. **Rollback:** repoint both links to `4p01…`, which is left in place.
 3. **Pair-only alternative, if the store change is deferred.** Make the kernel launcher's `run --once waylandd` also count a running `INTLWL.ELF` (`src/kernel/src/window.cpp` around `ShellExecString("…run --service --once waylandd…")`). Not done on this branch.
+
+## Status, 15 Nov 2026 (branch `work/multilayer`)
+
+**Client-size mismatch fixed** (gen 400, Chrome on YouTube: offers presented, windowed ~45 ms):
+- waylandd and the renderer used to refuse a GPU source whenever the WM client size differed from the VFB.
+- The renderer now draws an offer that *is* the VFB 1:1, cropped to the client rectangle, exactly as the CPU source path does.
+
+**Wire version 3 layered offers are implemented:**
+- **Wire** (`src/shared/gpu_window_channel.h`): `BrookGpuWindowLayersPacket` is the v2 header (describing layer 0) plus up to 8 `BrookGpuWindowLayer` records:
+  - buffer identity, size, offset, stride, format;
+  - an `OPAQUE` flag;
+  - a source rectangle in buffer pixels;
+  - a destination rectangle in window VFB pixels.
+
+  `SCM_RIGHTS` carries buffer and fence per layer. SAFE and PRESENTED cover the whole commit. `brook_gpu_window_receive` refuses v3 offers, so an old renderer drops the channel rather than misreading one.
+- **Renderer:**
+  - `desktop_gpu_channel.h` stores every layer's fds and closes them on SAFE or disconnect.
+  - SAFE is withheld while any selected offer shares a buffer with any layer.
+  - `desktop_gpu_offer_scene_layer` places layer i at the client origin, clipped to the client rectangle (cropped to the VFB and to the screen).
+  - `desktop_renderer.c` expands a layered offer into one scene layer and one external source per layer. An offer counts as used if any of its slots is drawn.
+- **waylandd** (`gpu_window_offer_layers`):
+  - **Eligible windows:** 2–8 layers with integer source rectangles and no transform.
+  - **Buffers:** DMA-BUF layers come from the Intel queue (prime fd plus producer fence). CPU-pixel layers (SHM or earlier snapshots) are copied once into a GEM buffer owned by the image, using an already-signalled fence.
+  - **Holding:** an image may be held by several groups and is released only after every holding group's SAFE.
+  - **Commit numbers:** every published source uses a per-window `publish_commit` counter: single offers, layered offers and tagged CPU snapshots. A desynchronised subsurface update therefore always publishes a newer source than the tree commit alone would.
+  - **Frame callbacks:** all surfaces in the window follow the layered commit's PRESENTED.
+  - **Fallbacks to the CPU path:** a DMA-BUF layer's fence pending longer than 50 ms, unsupported geometry, or any failure.
+  - **Switches:** `BROOK_WAYLAND_GPU_LAYERS=0` disables it. The status file reports a `layered` block and the `gpu_layers` path count.
+
+**Tests:**
+- `gpu_window_channel_test`: v3 wire validation, fd ownership, old-receive refusal.
+- `desktop_gpu_channel_test`: selection, placement and clipping, and that SAFE closes every fd.
+- `capture-release-test`:
+  - DMA-BUF root plus DMA-BUF subsurface: layered offer with no readback; group holding across the older single offer's SAFE.
+  - SHM root plus DMA-BUF subsurface: GEM upload, re-offer, release.
+- **Renderer e2e on a real Intel GPU,** compared pixel-exact against the CPU reference (`HOST_E2E_DIRECT=1 HOST_E2E_LAYERS=1 brook-desktop-renderer-host-test`): each offer carries a second, 2×-scaled opaque layer, and it passes in full, partial, async-partial and pipelined modes.
+
+**Not done:**
+- Fractional source rectangles and buffer transforms stay on the CPU path.
+- Damage is still ignored.
+- Scaling a layer uses the quad shader's nearest sampling, which matches the CPU reference in the e2e test for integer ratios. Fractional ratios aren't proved bit-exact.

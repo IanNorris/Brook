@@ -29,7 +29,14 @@ struct brook_image {
     uint32_t trace_queued_ms,trace_first_poll_ms,trace_fence_ms;
     struct BrookGpuWindowIdentity offer_identity;
     struct brook_image *pending_next;
+    /* Version 3 layered offers: groups currently holding this image, the
+     * tree commit the offer stood for, and, for CPU pixels, a GEM copy
+     * uploaded once (gem_fd prime fd, gem_handle) and its idle fence. */
+    unsigned group_refs;uint32_t group_wait_ms;
+    uint64_t offer_tree_commit;
+    int gem_fd,gem_fence;uint32_t gem_handle;uint64_t gem_words;
 };
+static void image_gem_free(struct brook_image *image);
 static long scene_ctl(int fd,unsigned op,const void *arg,size_t size) {
     errno=0;
     long result=syscall(0xB07,(long)fd,(long)op,(long)arg,(long)size,0L,0L);
@@ -50,6 +57,7 @@ static void image_unref(void *value) {
         if (!image->uncertain) buffer_release(image->source);
         buffer_drop(image->source);
     }
+    image_gem_free(image);
     free(image->pixels);free(image);
 }
 static struct brook_image *image_snapshot(const uint8_t *src,int w,int h,int stride,uint32_t format) {
@@ -204,6 +212,7 @@ static int image_gpu(struct brook_image *image,struct brook_scene_owner *owner) 
     return 1;
 }
 struct brook_draw { struct brook_view *view;int64_t x,y; };
+static int gpu_window_offer_layers(struct brook_surface *root,const struct brook_draw *draws,unsigned count);
 /* Every traversed node is mapped and contributes a layer. Thus the backend's
  * 64-layer bound also bounds this stack, independently of protocol tree depth. */
 static int surface_layers(struct brook_surface *root,struct brook_draw *draw,unsigned *count) {
@@ -274,9 +283,9 @@ static int surface_begin_source_write(struct brook_surface *root,uint64_t *incar
  * and, with BROOK_WAYLAND_LAYER_TRACE=1, logged once per second per window or
  * whenever the layer signature changes. Diagnostic only. */
 static unsigned long long g_layer_readback_bytes,g_layer_offer_frames;
-enum {LAYER_PATH_SCENE,LAYER_PATH_SINGLE,LAYER_PATH_GENERAL,LAYER_PATH_VULKAN,LAYER_PATH_PENDING,LAYER_PATHS};
+enum {LAYER_PATH_SCENE,LAYER_PATH_SINGLE,LAYER_PATH_GENERAL,LAYER_PATH_VULKAN,LAYER_PATH_PENDING,LAYER_PATH_GPU_LAYERS,LAYER_PATHS};
 static unsigned long long g_layer_paths[LAYER_PATHS];
-static const char *const g_layer_path_names[LAYER_PATHS]={"scene","cpu_single","cpu_general","vulkan_compose","pending"};
+static const char *const g_layer_path_names[LAYER_PATHS]={"scene","cpu_single","cpu_general","vulkan_compose","pending","gpu_layers"};
 struct layer_summary {uint32_t wm,count,vfb_w,vfb_h,scale,ms;int path;uint64_t sig;
     struct {char kind;uint32_t w,h,dw,dh,fmt;int opaque,offer;int64_t x,y;uint32_t sw,sh;} l[4];};
 static struct layer_summary g_layer_windows[16];
@@ -316,6 +325,14 @@ static int surface_render(struct brook_surface *root) {
     if (root->role==4 && base && !xwayland_accept_view(root,base->geometry.w,base->geometry.h)) return 1;
     struct brook_draw draws[64];unsigned count=0;
     if (!surface_layers(root,draws,&count)) return 0;
+    /* Several layers: offer them to the renderer as one layered commit
+     * (version 3). 2 means a DMA-BUF layer's producer fence is not known
+     * yet; the Intel queue offers the commit when it is. */
+    if(count>=2 && root->wm_id && root->vfb){
+        const int layered=gpu_window_offer_layers(root,draws,count);
+        if(layered==1){surface_layer_trace(root,draws,count,LAYER_PATH_GPU_LAYERS);return 1;}
+        if(layered==2)return 1;
+    }
     /* Keep the previously published frame until every current producer is
      * ready. The queue owns pending images even if their surface is removed. */
     for(unsigned i=0;i<count;++i)if(draws[i].view->image->pending_cpu){
@@ -324,7 +341,7 @@ static int surface_render(struct brook_surface *root) {
          * unchanged root layer. Anything else needs CPU pixels now, without
          * waiting for the renderer to give the source back. */
         struct brook_image *held=draws[i].view->image;
-        if(held->offer_state==1 && (count!=1 || draws[0].view!=base ||
+        if(held->offer_state==1 && !held->group_refs && (count!=1 || draws[0].view!=base ||
            memcmp(&base->geometry,&held->offer_geometry,sizeof(base->geometry))))intel_image_want_pixels(held);
         return 1;
     }
@@ -412,7 +429,7 @@ publish:;
         int includesRoot=0;
         for(unsigned i=0;i<count;++i)if(draws[i].view==root->tree.current->value){includesRoot=1;break;}
         if(includesRoot && !syscall(BROOK_SYS_WM_PUBLISH_SOURCE_COMMIT,(long)root->wm_id,(long)writeIncarnation,
-                                    (long)root->tree.current->commit,0L,0L,0L))tagged=1;
+                                    (long)(root->publish_commit+1),0L,0L,0L)){tagged=1;++root->publish_commit;}
     }
 #endif
     if(!tagged)wm_signal_dirty(root->wm_id);

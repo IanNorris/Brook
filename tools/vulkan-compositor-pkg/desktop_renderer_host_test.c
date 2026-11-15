@@ -87,7 +87,8 @@ static struct {
     /* Provider (HOST_E2E_DIRECT). visible: the newest offer of each window
      * the renderer has received by this frame's query. */
     int direct,peer;char socketPath[108];struct FakeBuffer pool[POOL];uint64_t nextCommit;
-    struct {uint64_t sent,visible;int sentBuffer,visibleBuffer;uint32_t *pixels[2];} offer[MAXW+1];
+    struct {uint64_t sent,visible;int sentBuffer,visibleBuffer;uint32_t *pixels[2],*over[2];int hasOver[2];} offer[MAXW+1];
+    int layers;unsigned layeredOffers;
     unsigned offers,safes,presentedReplies,badReplies,poisoned,earlySafes;
     int overlayFeedback,staleBase,lateClose;uint64_t overlayRenderedNs;unsigned overlayBumps,baseCount,staleBaseRejects;
     struct {uint32_t window;uint64_t incarnation;} base[MAXW];
@@ -125,8 +126,18 @@ static void reference(void){
     LAYER(K.backdrop,0,FW,FW,FH,0,0,FW,FH,0,0,FW,FH,0,0,FW,FH,255);
     for(unsigned i=0;i<K.count;++i){const struct FakeWindow *w=&K.win[K.order[i]];
         if(w->window<=MAXW && K.offer[w->window].visible)
-            LAYER(K.offer[w->window].pixels[1],0,w->w,w->w,w->h,0,0,w->w,w->h,w->x,w->y,w->w,w->h,0,0,FW,FH,
+        {LAYER(K.offer[w->window].pixels[1],0,w->w,w->w,w->h,0,0,w->w,w->h,w->x,w->y,w->w,w->h,0,0,FW,FH,
                   w->opacity|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE);
+            /* Layered offer: a quarter-size opaque buffer drawn at 2x inside
+             * the window, clipped to its client rectangle. */
+            if(K.offer[w->window].hasOver[1]){
+                int32_t cx0=w->x<0?0:w->x,cy0=w->y<0?0:w->y,cx1=w->x+(int32_t)w->w,cy1=w->y+(int32_t)w->h;
+                if(cx1>FW)cx1=FW;
+                if(cy1>FH)cy1=FH;
+                if(cx1<cx0)cx1=cx0;
+                if(cy1<cy0)cy1=cy0;
+                LAYER(K.offer[w->window].over[1],0,w->w/4,w->w/4,w->h/4,0,0,w->w/4,w->h/4,w->x+(int32_t)(w->w/8),w->y+(int32_t)(w->h/8),
+                      (w->w/4)*2,(w->h/4)*2,cx0,cy0,(uint32_t)(cx1-cx0),(uint32_t)(cy1-cy0),w->opacity|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE);}}
         else LAYER(w->pixels,0,w->stride,w->w,w->h,0,0,w->w,w->h,w->x,w->y,w->w,w->h,0,0,FW,FH,w->opacity|BROOK_VK_STRAIGHT_ALPHA);
         LAYER(w->chrome,0,w->chromeW,w->chromeW,w->chromeH,0,0,w->chromeW,w->chromeH,w->x-2,w->y-10,w->chromeW,w->chromeH,0,0,FW,FH,
               w->opacity|BROOK_VK_STRAIGHT_ALPHA);}
@@ -161,18 +172,22 @@ static void provider_drain(void){
     if(K.peer<0)return;
     for(;;){struct BrookGpuWindowPacket p;int fds[2];const int got=brook_gpu_window_receive(K.peer,&p,fds);
         if(got<=0)return;
-        struct FakeBuffer *b=NULL;
-        for(unsigned i=0;i<POOL;++i)if(K.pool[i].busy && K.pool[i].window==p.identity.window && K.pool[i].commit==p.identity.commit)b=&K.pool[i];
-        if(!b || p.version!=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN){++K.badReplies;continue;}
-        if(p.type==BROOK_GPU_WINDOW_PRESENTED){if(b->presented)++K.badReplies;b->presented=1;++K.presentedReplies;continue;}
+        struct FakeBuffer *b=NULL;struct FakeBuffer *group[2]={0};unsigned members=0;
+        for(unsigned i=0;i<POOL;++i)if(K.pool[i].busy && K.pool[i].window==p.identity.window && K.pool[i].commit==p.identity.commit){
+            b=&K.pool[i];if(members<2)group[members++]=b;}
+        const uint32_t expect=K.layers?BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS:BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN;
+        if(!b || p.version!=expect){++K.badReplies;continue;}
+        if(p.type==BROOK_GPU_WINDOW_PRESENTED){if(b->presented)++K.badReplies;
+            for(unsigned m=0;m<members;++m){group[m]->presented=1;}
+            ++K.presentedReplies;continue;}
         /* SAFE: the renderer promises no remaining GPU use, so no frame that
          * sampled the source may still be composing. Then poison it. */
         for(unsigned i=0;i<TICKETS;++i){const struct FakeTicket *t=&K.tickets[i];if(!t->ticket || t->observed)continue;
             for(unsigned j=0;j<t->samples;++j)if(t->sampled[j].window==p.identity.window && t->sampled[j].commit==p.identity.commit){
                 fprintf(stderr,"HOST_E2E_EARLY_SAFE window=%u commit=%llu ticket=%ld\n",p.identity.window,(unsigned long long)p.identity.commit,t->ticket);
                 ++K.earlySafes;}}
-        for(uint64_t i=0;i<b->bytes/4;++i)b->map[i]=0xffff00ffu;
-        b->busy=0;++K.safes;++K.poisoned;
+        for(unsigned m=0;m<members;++m){for(uint64_t i=0;i<group[m]->bytes/4;++i)group[m]->map[i]=0xffff00ffu;group[m]->busy=0;}
+        ++K.safes;++K.poisoned;
     }
 }
 static void provider_offer(struct FakeWindow *w){
@@ -190,14 +205,39 @@ static void provider_offer(struct FakeWindow *w){
     struct BrookGpuWindowPacket p={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,.type=BROOK_GPU_WINDOW_OFFER,
         .identity={w->window,0,w->incarnation,commit,(uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=bytes/4,
         .offset=0,.stride=w->w,.width=w->w,.height=w->h,.fourcc=0x34325258};
-    const int sent=brook_gpu_window_send_offer(K.peer,&p,b->fd,sync.fd);close(sync.fd);
+    int sent;struct FakeBuffer *o=NULL;
+    const uint32_t ow=w->w/4,oh=w->h/4;
+    if(K.layers && ow && oh){
+        b->busy=1; /* keep pool_get from returning it again */
+        const uint64_t obytes=((uint64_t)ow*oh*4+4095)&~4095ull;o=pool_get(obytes);b->busy=0;
+        if(!o){close(sync.fd);return;}
+        uint32_t *ocopy=K.offer[w->window].over[0];
+        for(uint32_t y=0;y<oh;++y)for(uint32_t x=0;x<ow;++x){
+            const uint32_t v=0xff000000u|((uint32_t)(commit*0x27d4eb2du)^(x*0x165667b1u)^(y*0xd3a2646cu));
+            o->map[y*ow+x]=v;ocopy[y*ow+x]=v;}
+        struct dma_buf_export_sync_file_wire osync={1,-1};
+        if(ioctl(o->fd,_IOWR('b',2,struct dma_buf_export_sync_file_wire),&osync) || osync.fd<0){fprintf(stderr,"HOST_E2E_NO_SYNC_FILE\n");exit(2);}
+        struct stat os;fstat(o->fd,&os);
+        struct BrookGpuWindowLayersPacket lp;memset(&lp,0,sizeof(lp));
+        lp.header=p;lp.header.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS;lp.count=2;
+        lp.layers[0]=(struct BrookGpuWindowLayer){p.words,p.identity.device,p.identity.inode,0,w->w,w->w,w->h,p.fourcc,0,
+            0,0,w->w,w->h,0,0,w->w,w->h};
+        lp.layers[1]=(struct BrookGpuWindowLayer){obytes/4,(uint64_t)os.st_dev,(uint64_t)os.st_ino,0,ow,ow,oh,0x34325258,
+            BROOK_GPU_WINDOW_LAYER_OPAQUE,0,0,ow,oh,(int32_t)(w->w/8),(int32_t)(w->h/8),ow*2,oh*2};
+        const int buffers[2]={b->fd,o->fd},fences[2]={sync.fd,osync.fd};
+        sent=brook_gpu_window_send_layers(K.peer,&lp,buffers,fences);close(osync.fd);
+        if(sent==1){K.offer[w->window].hasOver[0]=1;++K.layeredOffers;}
+    }else{sent=brook_gpu_window_send_offer(K.peer,&p,b->fd,sync.fd);K.offer[w->window].hasOver[0]=0;}
+    close(sync.fd);
     if(sent!=1)return;
     *b=(struct FakeBuffer){b->handle,b->fd,b->bytes,b->map,1,w->window,commit,0};
+    if(o)*o=(struct FakeBuffer){o->handle,o->fd,o->bytes,o->map,1,w->window,commit,0};
     K.offer[w->window].sent=commit;++K.offers;
 }
 static void provider_window(uint32_t id,uint32_t w,uint32_t h){
     if(!K.direct)return;
-    for(unsigned i=0;i<2;++i){free(K.offer[id].pixels[i]);K.offer[id].pixels[i]=calloc((size_t)w*h,4);}
+    for(unsigned i=0;i<2;++i){free(K.offer[id].pixels[i]);K.offer[id].pixels[i]=calloc((size_t)w*h,4);
+        free(K.offer[id].over[i]);K.offer[id].over[i]=calloc((size_t)(w/4+1)*(h/4+1),4);K.offer[id].hasOver[i]=0;}
     K.offer[id].sent=K.offer[id].visible=0;
 }
 /* One scripted change per frame (applied when the renderer queries). */
@@ -208,6 +248,8 @@ static void advance(void){
     for(unsigned id=1;id<=MAXW;++id)if(K.offer[id].sent!=K.offer[id].visible && K.offer[id].pixels[0]){
         struct FakeWindow *w=window_by_id(id);
         if(w)memcpy(K.offer[id].pixels[1],K.offer[id].pixels[0],(size_t)w->w*w->h*4);
+        if(w && K.offer[id].over[0]){memcpy(K.offer[id].over[1],K.offer[id].over[0],(size_t)(w->w/4)*(w->h/4)*4);
+            K.offer[id].hasOver[1]=K.offer[id].hasOver[0];}
         K.offer[id].visible=K.offer[id].sent;}
     struct FakeWindow *a=window_by_id(1),*b=window_by_id(2);
     switch(s){
@@ -488,6 +530,7 @@ int main(int argc,char **argv){
     K.lateClose=getenv("HOST_E2E_LATE_CLOSE")!=NULL;
     K.noClientKeep=getenv("HOST_E2E_OLD_KERNEL_NO_CLIENT_KEEP")!=NULL;
     K.peer=-1;K.direct=getenv("HOST_E2E_DIRECT") && strcmp(getenv("HOST_E2E_DIRECT"),"0");
+    K.layers=K.direct && getenv("HOST_E2E_LAYERS") && strcmp(getenv("HOST_E2E_LAYERS"),"0");
     if(K.direct){snprintf(K.socketPath,sizeof(K.socketPath),"/tmp/brook-host-e2e-%d.sock",(int)getpid());
         setenv("BROOK_DESKTOP_GPU_SOCKET",K.socketPath,1);}
     char *args[]={"brook-desktop-renderer","--frames",(char*)frames,NULL};
@@ -504,6 +547,7 @@ int main(int argc,char **argv){
         printf("HOST_E2E_DIRECT offers=%u safes=%u presented=%u bad_replies=%u early_safes=%u closed_window_held=%u direct_layers=%llu\n",
             K.offers,K.safes,K.presentedReplies,K.badReplies,K.earlySafes,held,(unsigned long long)g_gpuDirectLayers);
         if(K.badReplies || K.earlySafes || held || !g_gpuDirectLayers || !K.safes || !K.presentedReplies)++bad;
+        if(K.layers){printf("HOST_E2E_LAYERS layered_offers=%u\n",K.layeredOffers);if(!K.layeredOffers)++bad;}
     }
     printf("HOST_E2E_STATS pipeline=%u submitted_in_flight=%llu/%llu carried=%llu rebased=%llu wait_full=%llu full_forced=%llu forced_in_flight=%llu present_failures=%llu\n",
         g_pipeline,(unsigned long long)g_stats.pipeline.submitted[0],(unsigned long long)g_stats.pipeline.submitted[1],
