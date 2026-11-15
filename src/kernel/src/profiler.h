@@ -47,6 +47,9 @@ void ProfilerInit();
 
 // Start profiling for 'durationMs' milliseconds (0 = until ProfilerStop).
 void ProfilerStart(uint32_t durationMs);
+// Directory for capture files (default "/boot"); absolute, no trailing slash needed.
+bool ProfilerSetOutputDir(const char* dir);
+const char* ProfilerOutputDir();
 
 // Stop profiling early and flush remaining samples.
 void ProfilerStop();

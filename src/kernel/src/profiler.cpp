@@ -524,17 +524,36 @@ static constexpr uint32_t kProfBufSize = 16384;
 // steady-state recordings keep most of that commit's I/O reduction.
 static constexpr uint32_t kProfSyncDrains = 5;
 
-// Generate a timestamped profile path: /boot/PROF_YYYYMMDD_HHMMSS.TXT
-// Falls back to /boot/PROFILE.TXT if RTC is unavailable.
+// Output directory for captures. "/boot" by default; `prof start MS DIR`
+// selects another (e.g. the writable store on the Dell, whose /boot is a full
+// RAM FAT image). Set from the debug command before the capture starts.
+static constexpr uint32_t kProfDirMax = 96;
+static char g_profileDir[kProfDirMax] = "/boot";
+
+bool ProfilerSetOutputDir(const char* dir)
+{
+    if (!dir || dir[0] != '/') return false;
+    uint32_t n = 0;
+    while (dir[n] && dir[n] != ' ' && dir[n] != '\n') { if (++n >= kProfDirMax) return false; }
+    while (n > 1 && dir[n - 1] == '/') --n;
+    for (uint32_t i = 0; i < n; ++i) g_profileDir[i] = dir[i];
+    g_profileDir[n] = '\0';
+    return true;
+}
+
+const char* ProfilerOutputDir() { return g_profileDir; }
+
+// Generate a timestamped profile path: <dir>/PROF_YYYYMMDD_HHMMSS.TXT
+// Falls back to <dir>/profile.txt if RTC is unavailable.
 static void BuildProfilePath(char* out, uint32_t outLen)
 {
+    uint32_t i = 0;
+    for (const char* p = g_profileDir; *p && i + 1 < outLen; p++) out[i++] = *p;
     uint64_t epoch = RtcNow();
-    if (epoch == 0 || outLen < 40)
+    if (epoch == 0 || outLen < i + 40)
     {
-        // Fallback
-        const char* fb = "/boot/profile.txt";
-        uint32_t i = 0;
-        while (fb[i] && i + 1 < outLen) { out[i] = fb[i]; i++; }
+        const char* fb = "/profile.txt";
+        for (uint32_t k = 0; fb[k] && i + 1 < outLen; ++k) out[i++] = fb[k];
         out[i] = '\0';
         return;
     }
@@ -574,9 +593,8 @@ static void BuildProfilePath(char* out, uint32_t outLen)
         p[2] = '0' + (v / 10) % 10;
         p[3] = '0' + v % 10;
     };
-    //           /boot/PROF_YYYYMMDD_HHMMSS.TXT
-    const char prefix[] = "/boot/PROF_";
-    uint32_t i = 0;
+    //           <dir>/PROF_YYYYMMDD_HHMMSS.TXT
+    const char prefix[] = "/PROF_";
     for (const char* p = prefix; *p; p++) out[i++] = *p;
     d4(out + i, yr);     i += 4;
     d2(out + i, mon);    i += 2;
@@ -626,7 +644,7 @@ static void ProfileWriterAppend(ProfileWriter& pw, const char* src, uint32_t len
 // Open the profile file and write the PROF_BEGIN header.
 static bool ProfileWriterOpen(ProfileWriter& pw)
 {
-    char profPath[64];
+    char profPath[kProfDirMax + 48];
     BuildProfilePath(profPath, sizeof(profPath));
     pw.file     = VfsOpen(profPath, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
     pw.buf      = nullptr;

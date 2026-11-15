@@ -7046,6 +7046,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         uint32_t durationMs = 0;
         if (*rest == ' ') {
             ParseUint(rest + 1, &durationMs);
+            // Optional output directory: prof start MS /abs/dir
+            const char* dir = rest + 1;
+            while (*dir >= '0' && *dir <= '9') ++dir;
+            while (*dir == ' ') ++dir;
+            if (*dir && !ProfilerSetOutputDir(dir)) {
+                DebugChannelSend("ERR: prof start [ms] [/absolute/dir]\n");
+                return;
+            }
         }
         ProfilerStart(durationMs);
         if (durationMs > 0) {
