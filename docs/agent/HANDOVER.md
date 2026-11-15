@@ -397,7 +397,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Loader F5 wait ignores input on the Dell:** works in QEMU/OVMF. Boot the timing loader (branch `work/boot-timing`), press keys during the wait and read `BOOT_TIMING_DETAIL wait_keys=`; zero suggests ConIn isn't connected on the fast-boot path. See `src/bootloader/src/DOCS.md`.
 
 - **Automatic slot rollback in the guard:** after N consecutive desktop panics on a newly activated generation, select the previous verified slot instead of looping in recovery-only mode. Also expose a slot-select operation in the recovery-only bridge.
-- **Split `src/kernel/src/syscall.cpp`** (17k lines) by area: memory, files, process/signal, sockets, epoll/timers and Brook-specific.
+- **Split `src/kernel/src/syscall.cpp`:** done as a pure move on `work/syscall-split` (15 Nov), awaiting Ian's review and merge. It produced 36 single-responsibility `syscall_*.cpp` files plus internal headers; see [syscall-split-plan.md](syscall-split-plan.md) for the map and old→new line table. The 182 problems found along the way (27 high) are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), which drives the separate fix pass. Not done yet: moving the debug channel and commands out of `net.cpp`, which the issue log describes.
 - **Remove or declare the twelve orphaned `tools/netsurf-build/*` gitlinks** (they have no `.gitmodules` entries).
 - **Transparent kernel rendering interfaces,** so console and shell output uses the GPU path.
 

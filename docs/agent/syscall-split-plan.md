@@ -413,3 +413,33 @@ To rebase a branch that edits `syscall.cpp`:
 2. **Dispatch table.** Decode `SyscallTableInit` in both ELFs into (slot → function symbol) pairs, and require them to be identical.
 3. **Text.** Compare normalised lines of the original against the new files (ignoring `static`, includes and generated declarations). Use `git diff --color-moved=zebra` to inspect the moves.
 4. **Builds.** Release and Debug builds; host tests; the Dell image build with `BROOK_BDW_SCANOUT_FLIP`, `BROOK_BDW_PERSISTENT_SCANOUT_MAP`, `BROOK_BDW_ZERO_COPY_SCANOUT` and `BROOK_BDW_VIDEO_ENGINE`; and its `--qemu-check` boot to the desktop.
+
+## Verification results (15 November)
+
+These are for `b0f1011c` (the last split commit) against the baseline `aac1d429`.
+
+- **Symbols (Release `BROOK.elf`, `nm -C --defined-only`).**
+  - 311 symbols changed binding only (`t→T`, `b→B`, `d→D`). Every one is an item the split shared on purpose: all 311 are in the generator's export manifest, and none is unexplained.
+  - 14 symbols are gone and 37 are new. They break down as:
+    - the DRM anonymous-namespace types becoming `brook::` types (11 symbols renamed);
+    - 3 static helpers now inlined away (`TimerFdWakeLocked`, `UnixListenWakeEpoll`, `TimerWaitGroup::deadline`);
+    - formerly inlined helpers that now have an out-of-line copy because they are called from another file (`WakeProcess`, `StrEq`, `EventFdReady` and others).
+  - 5 header `static inline` helpers gained per-file local copies (`MfdLock`, `MfdUnlock`, `MemFdUnref`, `PipeBufferDestroy`, `strncmp`).
+  - `.init_array` is still 0x18 bytes from `net.cpp`/`apic.cpp`/`serial_writer.cpp`. None of the new objects has one.
+- **Dispatch table.** The `SyscallTableInit` stores were decoded from the disassembly of both ELFs into (slot → function symbol) pairs: 269 slots plus the `sys_not_implemented` fill. The two lists are **identical**.
+- **Text.** The normalised line multiset of the original (`syscall.cpp` plus its six `.inc` fragments, ignoring `static`, includes and namespace lines) was compared with the new files. Only 8 original lines are absent, and they are exactly the definitions whose default arguments moved to header declarations. The only extra lines are prototypes, extern declarations, file banners and one `#if` guard in a header.
+- **`git diff --color-moved=zebra --color-moved-ws=allow-indentation-change aac1d429..HEAD -- src/kernel/src`.** Of 16,812 non-blank removed lines, 16,377 are detected as moved. The rest are:
+  - 356 declaration lines that lost `static`;
+  - 39 removed `#include` lines;
+  - about 40 short or duplicate lines (braces, banners) that git does not pair as moves.
+- **Include pruning.** For every split `.cpp` and in three option configurations, the pruned file's object code is byte-identical to the unpruned one. The two exceptions are `syscall_futex.cpp` and `syscall_unix_socket.cpp`: `IrqSpinLockAcquire` embeds `__LINE__`/`__FILE__`, so they were compared with line padding and differ only in the source-path string.
+- **Per commit.** All 39 commits build Release, including the entry-state and scheduler-start audits. Each commit passed the five host tests that compile kernel fragments (`test_pipe_poll`, `test_pipe_write`, `test_netlink_endpoint`, `test_unix_stream_vector`, `test_socket_lifetime`). No other host test compiles syscall sources, so those binaries are unchanged by the split. Each step was also compile-checked in all three option configurations.
+- **Final.**
+  - Full Release host suite: 356/356 passed. `test_audio_delivery` passed in this run; it times out only under load.
+  - Debug kernel builds. `build.sh`'s entry-state audit then rejects `TlbShootdownHandler` (`sub rsp, 0x10`, unmodelled at -O0). That handler is in `apic.cpp`, which this branch does not touch, so the failure is not caused by the split.
+- **Dell pair.** `scripts/build_dell_image.py --payload-id dell-syscall-split-20261115 --kernel-option BROOK_BDW_SCANOUT_FLIP=ON --kernel-option BROOK_BDW_PERSISTENT_SCANOUT_MAP=ON --kernel-option BROOK_BDW_ZERO_COPY_SCANOUT=ON --kernel-option BROOK_BDW_VIDEO_ENGINE=ON --qemu-check` built the Dell kernel with the full baseline option set plus these four. The guarded recovery-to-desktop QEMU check **passed** (`build/dell/pair-syscall-split/qemu-check/verdict.json`; kernel sha256 `288e81c5…`, commit `b0f1011c`, clean tree). Nothing was deployed to the Dell.
+- **Merging.** `main` has moved to `255d4b15` (18 commits), but none of those commits touch `syscall.cpp`, the fragments or `src/kernel/CMakeLists.txt`. `git merge-tree` merges the branch cleanly.
+
+## Not done in this pass
+
+The `net.cpp` debug-channel and debug-command move (phase 2) was not started. The proposed pure-move split, and the caveat that `DebugHandleCommand` is one 2,623-line function, are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) under "Single-responsibility candidates".
