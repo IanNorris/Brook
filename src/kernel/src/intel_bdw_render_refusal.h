@@ -68,6 +68,19 @@ inline const char* BdwRenderAttemptReason(const BdwRenderAttemptView& v){
     }
     return "none";
 }
+// gen 400: a run that was submitted but whose completion was not observed
+// cleanly is recoverable when the engine reset was verified, the run's GGTT
+// binding was retired after it, PAT was restored, the forcewake request bit
+// was cleared and drained, and the GPU is still the same device in D0. The
+// job then fails (fence error, context lost) instead of panicking.
+struct BdwRenderFailureView {
+    bool ok=false,retiredAfterFailedRun=false,resetComplete=false,patRestored=false,uncertain=false;
+    bool ggttCleared=false,pollYieldFailed=false,clearDelivered=false,released=false,liveGpu=false;
+};
+inline bool BdwRenderFailureRecoverable(const BdwRenderFailureView& v){
+    return !v.ok && v.retiredAfterFailedRun && v.resetComplete && v.patRestored && !v.uncertain && v.ggttCleared &&
+        !v.pollYieldFailed && v.clearDelivered && v.released && v.liveGpu;
+}
 // Bounded retry of an untouched refusal: the job stays armed; the worker
 // waits a tick (outside every critical section) and runs it again.
 constexpr unsigned BdwRenderRefusalRetries=16;

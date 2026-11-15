@@ -54,5 +54,20 @@ int main(){
      r.workRefusedUntouched=false;claim.finish(r);CHECK(claim.state()==2);CHECK(!claim.acquire());}
     {BdwForcewakeClaim claim;CHECK(claim.acquire());BdwForcewakeAdapterResult r{};claim.finish(r);CHECK(claim.state()==0);}
     CHECK(BdwRenderRefusalRetries>=2 && BdwRenderRefusalRetries<=64);
+    // gen 400: a submitted run whose completion was not observed is recoverable
+    // only with a verified reset, retired binding, restored PAT, cleared
+    // forcewake and the same live device; every missing proof keeps it uncertain.
+    {BdwRenderFailureView v{};v.retiredAfterFailedRun=v.resetComplete=v.patRestored=v.ggttCleared=v.clearDelivered=v.released=v.liveGpu=true;
+     CHECK(BdwRenderFailureRecoverable(v));
+     auto w=v;w.ok=true;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.retiredAfterFailedRun=false;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.resetComplete=false;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.patRestored=false;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.uncertain=true;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.ggttCleared=false;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.pollYieldFailed=true;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.clearDelivered=false;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.released=false;CHECK(!BdwRenderFailureRecoverable(w));
+     w=v;w.liveGpu=false;CHECK(!BdwRenderFailureRecoverable(w));}
     std::puts("BDW_RENDER_REFUSAL_PASS untouched refusals rerun; device-visible failures stay uncertain; claim not poisoned by untouched refusals");
 }

@@ -698,6 +698,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         o.io.read32(BdwDellBar0+0x203c,result.control) && o.io.read32(BdwDellBar0+0x2074,result.acthd) &&
                         o.io.read32(BdwDellBar0+0x2064,result.ipeir) && o.io.read32(BdwDellBar0+0x2068,result.ipehr) &&
                         o.io.read32(BdwDellBar0+0x2234,result.execlist);
+                    if(result.engineSampled){(void)o.io.read32(BdwDellBar0+0x20b0,result.eir);(void)o.io.read32(BdwDellBar0+0x20b8,result.esr);}
                     return ok;});}
                 bool saveContext(){return BdwTimedTransaction(result,3,[&](){return rebased?BdwCopyRebasedRenderContext(backend,snapshot):BdwCopyRetainedRenderContext(backend,snapshot);});}
                 bool resetAfter(){return BdwTimedTransaction(result,4,[&](){
@@ -705,6 +706,16 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     if(result.ggttClearRequested && result.contextComplete){
                         result.ggttCleared=BdwRetireRetainedRenderAfterReset(backend);
                         if(!result.ggttCleared){o.fault=true;return false;}
+                    }else if(result.ggttClearRequested && result.attempted && !o.fault &&
+                             BdwRetainedRenderRetirableAfterFailedRun()){
+                        // gen 400: the run was submitted but did not complete
+                        // cleanly (e.g. an unexpected context-status event).
+                        // The verified reset above stopped the engine, so this
+                        // run's binding is retired exactly as after success;
+                        // the job then fails instead of retaining everything.
+                        result.ggttCleared=BdwRetireRetainedRenderAfterReset(backend);
+                        if(!result.ggttCleared){o.fault=true;return false;}
+                        result.retiredAfterFailedRun=true;
                     }
                     return true;
                 });}
@@ -1155,6 +1166,13 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
        renderResult->entryRefusal!=BdwRenderRefusalNone && !renderResult->attempted && !renderResult->gtWrites &&
        !renderResult->transaction.patReady && !renderResult->transaction.resetAttempted && !renderResult->pollYieldFailed)
         result.workRefusedUntouched=true;
+    // A failed run that was reset (verified), had its binding retired and its
+    // PAT restored leaves no device state to recover either.
+    if(renderResult && result.sequence.workAttempted && !result.sequence.workComplete && renderResult->retiredAfterFailedRun){
+        const auto& t=renderResult->transaction;
+        if(t.resetComplete && t.patRestored && !t.uncertain && renderResult->ggttCleared && !renderResult->pollYieldFailed)
+            result.workRefusedUntouched=true;
+    }
     // VCS (VA-API phase 1) work that refused before any engine write leaves
     // nothing to recover: a VCS reset that reported NotStarted (or failed
     // evidence) with no Uncertain outcome, or a self-test that stopped at a

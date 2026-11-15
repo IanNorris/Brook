@@ -55,6 +55,15 @@ class BdwRenderOneShot {
     const void* allocator_=nullptr;const void* backend_=nullptr;
     BdwRenderPlan plan_{};BdwGgttBind bind_{};uint32_t nonce_=0;
     uint8_t csbHead_=5;bool activated_=false,attempted_=false,storeProbe_=false,gt3_=false;
+public:
+    // Diagnostics of the last context-status poll fault (gen 400): site
+    // 1 ownership, 2 tail invalid, 3 entry read, 4 first event lacks
+    // idle-to-active, 5 unexpected later event or context id or not last,
+    // 6 acknowledge; plus the event, tail and head at the fault.
+    struct CsbDiag {uint8_t site=0,tail=0,head=0,events=0;uint64_t event=0;};
+    CsbDiag LastCsbDiag()const{return csbDiag_;}
+private:
+    CsbDiag csbDiag_{};
     BdwExecSnapshot* execSnapshot_=nullptr;BdwExecTables* execExternal_=nullptr;
     bool execPublished_=false,execArmed_=false,execDetached_=false;
     template<class Io> void freePages(Io& io){while(allocated_)io.free(pages_[--allocated_]);}
@@ -74,7 +83,7 @@ public:
     template<class Allocator> bool Recycle(Allocator& io){
         if(allocator_!=static_cast<const void*>(&io) || state_!=BdwOneShotState::Released || allocated_ || execSnapshot_ ||
            (execExternal_ && !execExternal_->Released()) || !bind_.Recycle())return false;
-        allocator_=backend_=nullptr;execExternal_=nullptr;plan_={};nonce_=0;csbHead_=5;
+        allocator_=backend_=nullptr;execExternal_=nullptr;plan_={};nonce_=0;csbHead_=5;csbDiag_={};
         activated_=attempted_=storeProbe_=gt3_=false;execPublished_=execArmed_=execDetached_=false;
         state_=BdwOneShotState::Fresh;return true;
     }
@@ -272,25 +281,25 @@ public:
         if(state_==BdwOneShotState::ContextCompleteRetained)return BdwCsbPoll::Complete;
         if(state_!=BdwOneShotState::CompleteRetained)return BdwCsbPoll::Fault;
         state_=BdwOneShotState::Polling;
-        if(!io.exclusiveHandoff() || !io.gpuPatLease()){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+        auto fault=[&](uint8_t site,uint32_t tail,uint64_t event){csbDiag_.site=site;csbDiag_.tail=uint8_t(tail);csbDiag_.head=csbHead_;
+            csbDiag_.event=event;state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;};
+        if(!io.exclusiveHandoff() || !io.gpuPatLease())return fault(1,0,0);
         uint32_t tail=0;
-        if(!io.csbReadTail(pages_[Hws],tail) || tail>=6){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+        if(!io.csbReadTail(pages_[Hws],tail) || tail>=6)return fault(2,tail,0);
         while(csbHead_!=tail) {
-            if(!io.exclusiveHandoff() || !io.gpuPatLease()){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+            if(!io.exclusiveHandoff() || !io.gpuPatLease())return fault(1,tail,0);
             const uint8_t next=(csbHead_+1)%6;uint64_t event=0;
-            if(!io.csbReadEntry(pages_[Hws],next,event)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+            if(!io.csbReadEntry(pages_[Hws],next,event))return fault(3,tail,0);
+            ++csbDiag_.events;
             if(event==~uint64_t{0}){state_=BdwOneShotState::CompleteRetained;return BdwCsbPoll::Pending;}
             bool terminal=false;
-            if(!activated_){if(!(event&1)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}activated_=true;}
+            if(!activated_){if(!(event&1))return fault(4,tail,event);activated_=true;}
             else {
-                if((uint32_t(event)&0xffff07ffu)!=0x18 || uint32_t(event>>32)!=uint32_t(plan_.descriptor>>32) || next!=tail){
-                    state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;
-                }
+                if((uint32_t(event)&0xffff07ffu)!=0x18 || uint32_t(event>>32)!=uint32_t(plan_.descriptor>>32) || next!=tail)
+                    return fault(5,tail,event);
                 terminal=true;
             }
-            if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.csbAcknowledge(next)){
-                state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;
-            }
+            if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.csbAcknowledge(next))return fault(6,tail,event);
             csbHead_=next;
             if(terminal){state_=BdwOneShotState::ContextCompleteRetained;return BdwCsbPoll::Complete;}
         }

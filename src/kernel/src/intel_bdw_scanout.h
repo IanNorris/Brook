@@ -141,6 +141,14 @@ struct BdwRenderRunResult {
     // (BdwRenderEntryRefusal, intel_bdw_render_refusal.h); detail is the page
     // index for evidence and the GT init refusal code for GT NotStarted.
     uint8_t entryRefusal=0,entryDetail=0;uint32_t gtWrites=0;
+    // Output (gen 400): why an attempted run did not complete. runFailSite:
+    // 1 scratch/reservation precheck, 2 submission (ExecuteTakenOver), 3
+    // context-status poll fault (csb* fields), 4 retirement wait ended.
+    uint8_t runFailSite=0,csbSite=0,csbTail=0,csbHead=0,csbEvents=0;uint64_t csbEvent=0;
+    uint32_t eir=0,esr=0;
+    // The run failed but the engine was reset (verified) and this run's GGTT
+    // binding retired: device state is known and the job can just fail.
+    bool retiredAfterFailedRun=false;
     bool ggttClearRequested=false,ggttCleared=false;
     bool gemReleaseRequested=false,gemReleased=false;
     bool externalTablesRequested=false;
@@ -191,6 +199,7 @@ struct BdwRenderRunResult {
 };
 bool BdwRunRetainedRender(BdwRenderExecutionBackend& backend,uint64_t scratchDma,BdwRenderRunResult& result);
 bool BdwRetireRetainedRenderAfterReset(BdwRenderExecutionBackend& backend);
+bool BdwRetainedRenderRetirableAfterFailedRun();
 bool BdwTestRenderRun(BdwForcewakeAdapterResult& out,BdwRenderRunResult& result);
 // Explicitly opted-in first-use bootstrap; this does not initialize the GPU.
 bool BdwAutomaticRenderRequested();

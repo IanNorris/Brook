@@ -212,7 +212,12 @@ int main(){
      assert(!shot.ExecuteTakenOver(a,b,0x800000) && b.writes==29 && b.portWrites==0 && shot.State()==BdwOneShotState::Quarantined);}
     {Allocator a;Backend b;BdwRenderOneShot shot;assert(shot.Prepare(a,65536,42,99,staging));
      assert(shot.ExecuteTakenOver(a,b,0x800000));b.badEvent=true;
-     assert(shot.PollContextSwitch(b)==BdwCsbPoll::Fault && b.acks==1 && shot.State()==BdwOneShotState::Quarantined);}
+     assert(shot.PollContextSwitch(b)==BdwCsbPoll::Fault && b.acks==1 && shot.State()==BdwOneShotState::Quarantined);
+     // gen 400: the fault is recorded, and after a verified engine reset the
+     // binding retires exactly as after a completed run, so the image recycles.
+     const auto d=shot.LastCsbDiag();assert(d.site==5 && d.events==2 && d.event!=0);
+     assert(shot.RetireAfterReset(b,true) && shot.State()==BdwOneShotState::StoppedRetained);
+     assert(shot.ReleaseStopped(a) && shot.State()==BdwOneShotState::Released && shot.Recycle(a) && shot.LastCsbDiag().site==0);}
     {Allocator a;uint64_t ptes[512]{};uint32_t flush=0,engine[1024]{};DeviceOwner owner{engine};
      BdwRenderDeviceBackend<DeviceOwner> b(owner,ptes,&flush,engine,65536,42,0x800000);BdwRenderOneShot shot;
      BdwRenderExecutionBackend& device=b;

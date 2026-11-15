@@ -1379,8 +1379,35 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
         LiveGpuMatches(entry) && PowerD0(entry.device);
     if(ok && run.completionEndTicks>run.completionStartTicks)
         completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
+    // gen 400: the job ran but its completion was not observed cleanly (for
+    // example an unexpected context-status event). If the engine reset was
+    // verified, this run's GGTT binding retired and PAT restored, nothing on
+    // the device is uncertain: retire the job as failed (fence error, its
+    // buffers marked failed, its context lost) instead of panicking.
+    BdwRenderFailureView failure{};
+    failure.ok=ok;failure.retiredAfterFailedRun=run.retiredAfterFailedRun;failure.resetComplete=t.resetComplete;
+    failure.patRestored=t.patRestored;failure.uncertain=t.uncertain;failure.ggttCleared=run.ggttCleared;
+    failure.pollYieldFailed=run.pollYieldFailed;failure.clearDelivered=out.clearDelivered;failure.released=out.sequence.released;
+    failure.liveGpu=!ok && LiveGpuMatches(entry) && PowerD0(entry.device);
+    const bool recoveredFailure=BdwRenderFailureRecoverable(failure);
+    if(recoveredFailure){
+        static uint32_t recovered=0;const uint32_t n=++recovered;
+        if(n<=16 || !(n&(n-1)))
+            KPrintf("gpu-submit: job failed after verified reset pid=%u context=%u objects=%u pages=%u site=%u csb_site=%u csb_events=%u csb_tail=%u csb_head=%u csb_event=%lx breadcrumb=%u ctx_complete=%u head=%x tail=%x acthd=%x elsp=%x eir=%x esr=%x ipehr=%x count=%u\n",
+                originPid,originContext,BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
+                unsigned(run.runFailSite),unsigned(run.csbSite),unsigned(run.csbEvents),unsigned(run.csbTail),unsigned(run.csbHead),run.csbEvent,
+                unsigned(run.breadcrumb),unsigned(run.contextComplete),run.head,run.tail,run.acthd,run.execlist,run.eir,run.esr,run.ipehr,n);
+        if(!BdwRetireRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("retire after failed run",snapshot);}
+        kfree(memory);
+        if(owner){BdwGpuContextFinish(owner,nullptr,false);guard.active=false;} // marks the context lost
+        return {false,true,false};
+    }
     const auto sample=BdwExecSnapshotBatchSample(snapshot);
     if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
+        KPrintf("gpu-submit: render run failed site=%u csb=%u/%u/%u/%u event=%lx breadcrumb=%u ctx_complete=%u saved=%u run=%u ggtt_cleared=%u retired_after_failure=%u uncertain=%u eir=%x esr=%x\n",
+            unsigned(run.runFailSite),unsigned(run.csbSite),unsigned(run.csbEvents),unsigned(run.csbTail),unsigned(run.csbHead),run.csbEvent,
+            unsigned(run.breadcrumb),unsigned(run.contextComplete),unsigned(t.contextSaved),unsigned(t.runComplete),unsigned(run.ggttCleared),
+            unsigned(run.retiredAfterFailedRun),unsigned(t.uncertain),run.eir,run.esr);
         KPrintf("gpu-submit: render run failed class=%u reason=%s fw_refusal=%u/%u requested=%u acquired=%u idle=%u quiescent=%u/%u released=%u clear=%u work=%u/%u entry=%u/%u gt_writes=%u\n",
             unsigned(attemptClass),BdwRenderAttemptReason(attemptView),unsigned(out.refusal),unsigned(out.refusalDetail),
             unsigned(out.sequence.requested),unsigned(out.sequence.acquired),unsigned(out.sequence.idle),
