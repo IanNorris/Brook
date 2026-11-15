@@ -372,8 +372,8 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if (autoH > fbH) autoH = fbH;
 
             CompositorSetupProcess(proc,
-                                   winX + static_cast<int16_t>(WmMetric(WM_BORDER_WIDTH)),
-                                   winY + static_cast<int16_t>(WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH)),
+                                   winX + static_cast<int16_t>(WmDesktopMetrics().clientOffsetX()),
+                                   winY + static_cast<int16_t>(WmDesktopMetrics().clientOffsetY()),
                                    autoW, autoH, 1);
 
             WmCreateWindow(proc, winX, winY,

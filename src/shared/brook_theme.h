@@ -2,8 +2,21 @@
 #define BROOK_THEME_H
 #include <stdint.h>
 
-/* Shared by kernel chrome and the Settings app's actual-palette preview.
- * Packed colors are 0x00RRGGBB. Palettes are immutable; settings persist IDs. */
+/* The one source of desktop chrome colours, shared by the kernel chrome
+ * painters and the Settings app's actual-palette preview. Painters take every
+ * colour from here (a palette field, or a named constant below for colours no
+ * theme varies), never from a literal, so a theme or hue change reaches every
+ * element. Packed colors are 0x00RRGGBB. Palettes are immutable; settings
+ * persist IDs. */
+
+/* Theme-independent chrome colours (artwork and fallbacks). */
+#define BROOK_CHROME_SHADE        0x00071526u /* material shading and shadow tint */
+#define BROOK_WALLPAPER_FALLBACK  0x00001A3Au /* backdrop where no wallpaper covers */
+#define BROOK_CURSOR_BUSY_IDLE    0x0053677Bu /* busy-ring dots other than the lit one */
+#define BROOK_AGENT_ICON_EYE      0x004CD38Au /* taskbar agent indicator: present */
+#define BROOK_AGENT_ICON_BADGE    0x00F0A020u /* taskbar agent indicator: stale badge */
+#define BROOK_AGENT_ICON_MARK     0x001A1A1Au /* ... and the mark on it */
+
 enum {
     BROOK_THEME_BROOK = 0,
     BROOK_THEME_DAWN = 1,
@@ -34,6 +47,13 @@ typedef struct BrookThemePalette {
     uint32_t gpu3d;
     uint32_t gpu2d;
     uint32_t gpuInactive;
+    uint32_t accent;       /* focus stroke, active task, slider fill, graph bars */
+    uint32_t halo;         /* outline behind pale text over translucent material */
+    uint32_t ok;           /* load and temperature levels */
+    uint32_t warm;
+    uint32_t hot;
+    uint32_t badgeText;    /* build label */
+    uint32_t badgeFill;
 } BrookThemePalette;
 
 static inline const BrookThemePalette* brook_theme_palette(uint32_t id)
@@ -63,6 +83,13 @@ static inline const BrookThemePalette* brook_theme_palette(uint32_t id)
             0x0068ACFFu, /* gpu3d */
             0x008CBAFFu, /* gpu2d */
             0x00708198u, /* gpuInactive */
+            0x0068ACFFu, /* accent */
+            0x00071526u, /* halo */
+            0x0063B782u, /* ok */
+            0x00E5BF69u, /* warm */
+            0x00E06C75u, /* hot */
+            0x00A4B2C7u, /* badgeText */
+            0x00172335u, /* badgeFill */
         },
         { /* Dawn */
             0x00D4E3F5u, /* titleActive */
@@ -88,6 +115,13 @@ static inline const BrookThemePalette* brook_theme_palette(uint32_t id)
             0x00377CC0u, /* gpu3d */
             0x004C87BAu, /* gpu2d */
             0x006F8099u, /* gpuInactive */
+            0x0068ACFFu, /* accent */
+            0x00071526u, /* halo */
+            0x0063B782u, /* ok */
+            0x00E5BF69u, /* warm */
+            0x00E06C75u, /* hot */
+            0x00A4B2C7u, /* badgeText */
+            0x00172335u, /* badgeFill */
         },
         { /* Midnight */
             0x0024364Fu, /* titleActive */
@@ -113,6 +147,13 @@ static inline const BrookThemePalette* brook_theme_palette(uint32_t id)
             0x0068ACFFu, /* gpu3d */
             0x008CBAFFu, /* gpu2d */
             0x00708198u, /* gpuInactive */
+            0x0068ACFFu, /* accent */
+            0x00071526u, /* halo */
+            0x0063B782u, /* ok */
+            0x00E5BF69u, /* warm */
+            0x00E06C75u, /* hot */
+            0x00A4B2C7u, /* badgeText */
+            0x00172335u, /* badgeFill */
         },
     };
     return id < BROOK_THEME_COUNT ? &palettes[id] : 0;

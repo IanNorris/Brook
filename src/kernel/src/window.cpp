@@ -757,10 +757,10 @@ static void WmRenderMaterialString(uint32_t* buf,uint32_t stride,uint32_t sw,uin
     const unsigned brightness=(((fg>>16)&255)+((fg>>8)&255)+(fg&255))/3;
     if(CompositorGlassActive() && CompositorMaterialOpacity()<180 && brightness>128){
         const int offset=WmMetric(1);
-        WmRenderString(buf,stride,sw,sh,x-offset,y,text,0x071526,bg,width);
-        WmRenderString(buf,stride,sw,sh,x+offset,y,text,0x071526,bg,width);
-        WmRenderString(buf,stride,sw,sh,x,y-offset,text,0x071526,bg,width);
-        WmRenderString(buf,stride,sw,sh,x,y+offset,text,0x071526,bg,width);
+        WmRenderString(buf,stride,sw,sh,x-offset,y,text,WmCurrentPalette().halo,bg,width);
+        WmRenderString(buf,stride,sw,sh,x+offset,y,text,WmCurrentPalette().halo,bg,width);
+        WmRenderString(buf,stride,sw,sh,x,y-offset,text,WmCurrentPalette().halo,bg,width);
+        WmRenderString(buf,stride,sw,sh,x,y+offset,text,WmCurrentPalette().halo,bg,width);
     }
     WmRenderString(buf,stride,sw,sh,x,y,text,fg,bg,width);
 }
@@ -2191,14 +2191,14 @@ static void DrawAgentIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, u
     box(1, 6, 2, 8, ink);
     box(13, 6, 2, 8, ink);
     if (!stale) {
-        const uint32_t eye = 0x4cd38a;
+        const uint32_t eye = BROOK_AGENT_ICON_EYE;
         box(4, 8, 3, 3, eye);
         box(9, 8, 3, 3, eye);
         return;
     }
     box(4, 9, 3, 1, ink);           // closed eyes
     box(9, 9, 3, 1, ink);
-    const uint32_t badge = 0xf0a020, mark = 0x1a1a1a;
+    const uint32_t badge = BROOK_AGENT_ICON_BADGE, mark = BROOK_AGENT_ICON_MARK;
     box(10, 9, 6, 7, badge);
     box(12, 10, 2, 3, mark);
     box(12, 14, 2, 1, mark);
@@ -2460,12 +2460,12 @@ void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, ui
     const uint32_t level = brook_audio_volume(g_volumeControl);
     const int barH = static_cast<int>(WmMetric(4)), barY = l.track.y + (l.track.h - barH) / 2;
     const int knobX = TaskbarVolumeSliderX(l.track, level);
-    const uint32_t fill = muted || !g_volumeAvailable ? WmBlendColor(pal.secondaryText, pal.launcher, 110) : 0x68acff;
+    const uint32_t fill = muted || !g_volumeAvailable ? WmBlendColor(pal.secondaryText, pal.launcher, 110) : pal.accent;
     WmFillRect(pixels, stride, screenW, screenH, l.track.x, barY, l.track.w, barH, pal.launcherBorder);
     WmFillRect(pixels, stride, screenW, screenH, l.track.x, barY, knobX - l.track.x + 1, barH, fill);
     const int knob = static_cast<int>(WmMetric(12));
     WmMaterialRect(pixels, stride, screenW, screenH, {knobX - knob / 2, l.track.y + (l.track.h - knob) / 2, knob, knob},
-                   g_volumeDragging ? 0x68acff : pal.text);
+                   g_volumeDragging ? pal.accent : pal.text);
     char value[8]{};
     char* out = value;
     DesktopNumber(out, level);
@@ -2500,7 +2500,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
         WmMaterialRect(backBuffer,stride,screenW,screenH,r,bg);
         if (active || minimized)
             WmFillRect(backBuffer, stride, screenW, screenH, r.x + WmMetric(6), r.y + r.h - WmMetric(2),
-                       r.w - WmMetric(12), WmMetric(2), active ? 0x68acff : WmCurrentPalette().minimized);
+                       r.w - WmMetric(12), WmMetric(2), active ? WmCurrentPalette().accent : WmCurrentPalette().minimized);
         if (r.w > static_cast<int>(WmMetric(12))) WmRenderString(backBuffer, stride, screenW, screenH,
             r.x + WmMetric(6), l.textY, title, WmCurrentPalette().taskText, bg, r.w - WmMetric(12));
     };

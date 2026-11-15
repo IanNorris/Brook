@@ -28,10 +28,10 @@ bool WmSetScale(uint32_t percent);
 // Called by the compositor after old-frame input and before new-frame drawing.
 bool WmApplyScalePending();
 
-// Window manager constants
-static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 36;
-static constexpr uint32_t WM_BORDER_WIDTH     = 2;
-static constexpr uint32_t WM_BUTTON_WIDTH     = 46;
+// Window manager constants. Frame and taskbar sizes come from DesktopMetrics.
+static constexpr uint32_t WM_TITLE_BAR_HEIGHT = DesktopMetrics::TitleBase;
+static constexpr uint32_t WM_BORDER_WIDTH     = DesktopMetrics::BorderBase;
+static constexpr uint32_t WM_BUTTON_WIDTH     = DesktopMetrics::CaptionButtonBase;
 static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
 static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
@@ -92,7 +92,7 @@ struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;}; // key
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
                                int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false);
-static constexpr uint32_t WM_TASKBAR_HEIGHT   = 44;   // bottom taskbar height
+static constexpr uint32_t WM_TASKBAR_HEIGHT   = DesktopMetrics::TaskbarBase; // bottom taskbar height
 
 // Chrome layout constants
 static constexpr uint32_t WM_TITLE_TEXT_PAD_X  = 12;   // left padding before title text

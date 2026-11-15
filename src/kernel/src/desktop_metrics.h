@@ -11,12 +11,24 @@ struct DesktopMetrics {
         return base>=0 ? static_cast<int>((static_cast<int64_t>(base)*percent+50)/100)
                        : -static_cast<int>((-static_cast<int64_t>(base)*percent+50)/100);
     }
-    constexpr int border() const { return pixels(2); }
-    constexpr int title() const { return pixels(36); }
-    constexpr int captionButton() const { return pixels(46); }
-    constexpr int taskbar() const { return pixels(44); }
-    constexpr int icon() const { return pixels(24); }
-    constexpr int fontPixels() const { return pixels(16); }
+    // The one source of the frame and taskbar metrics, in logical pixels at
+    // 100%. window.h's WM_* constants are defined from these.
+    static constexpr int BorderBase = 2;
+    static constexpr int TitleBase = 36;
+    static constexpr int CaptionButtonBase = 46;
+    static constexpr int TaskbarBase = 44;
+    static constexpr int IconBase = 24;
+    static constexpr int FontBase = 16;
+    constexpr int border() const { return pixels(BorderBase); }
+    constexpr int title() const { return pixels(TitleBase); }
+    constexpr int captionButton() const { return pixels(CaptionButtonBase); }
+    constexpr int taskbar() const { return pixels(TaskbarBase); }
+    constexpr int icon() const { return pixels(IconBase); }
+    constexpr int fontPixels() const { return pixels(FontBase); }
+    // Offset of a natively decorated window's client area from its outer
+    // origin, for code outside the WM that positions client buffers.
+    constexpr int clientOffsetX() const { return border(); }
+    constexpr int clientOffsetY() const { return border() + title(); }
 };
 inline constexpr DesktopMetrics DesktopMetric100{100}, DesktopMetric150{150}, DesktopMetric200{200};
 inline constexpr const DesktopMetrics* DesktopMetricsFor(uint32_t percent) {

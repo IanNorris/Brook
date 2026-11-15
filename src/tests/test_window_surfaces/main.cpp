@@ -591,5 +591,27 @@ int main() {
         for(uint32_t i=2;i<n;++i)CHECK(s[i].kind==WmShellSurfaceKind::BootSummary);
         g_launcherOpen=false;g_volumePopupOpen=false;
     }
+    // One metrics source: the WM constants are DesktopMetrics' bases, and the
+    // client offset used outside the WM equals the WM's own arithmetic.
+    {
+        static_assert(WM_TITLE_BAR_HEIGHT==uint32_t(DesktopMetrics::TitleBase) &&
+                      WM_BORDER_WIDTH==uint32_t(DesktopMetrics::BorderBase) &&
+                      WM_BUTTON_WIDTH==uint32_t(DesktopMetrics::CaptionButtonBase) &&
+                      WM_TASKBAR_HEIGHT==uint32_t(DesktopMetrics::TaskbarBase),"WM metrics");
+        for(const auto* metrics:{&DesktopMetric100,&DesktopMetric150,&DesktopMetric200}){
+            g_desktopMetrics=metrics;
+            CHECK(uint32_t(metrics->clientOffsetX())==WmMetric(WM_BORDER_WIDTH));
+            CHECK(uint32_t(metrics->clientOffsetY())==WmMetric(WM_TITLE_BAR_HEIGHT)+WmMetric(WM_BORDER_WIDTH));
+            CHECK(uint32_t(metrics->taskbar())==WmMetric(WM_TASKBAR_HEIGHT));
+        }
+        g_desktopMetrics=&DesktopMetric100;
+    }
+    // Chrome tokens: until the Clearwater hue derivation, every theme keeps
+    // the values the painters previously hard-coded (no visual change).
+    for(uint32_t id=0;id<BROOK_THEME_COUNT;++id){
+        const auto& p=*brook_theme_palette(id);
+        CHECK(p.accent==0x0068ACFFu && p.halo==0x00071526u && p.ok==0x0063B782u && p.warm==0x00E5BF69u &&
+              p.hot==0x00E06C75u && p.badgeText==0x00A4B2C7u && p.badgeFill==0x00172335u);
+    }
     std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry and chrome");
 }
