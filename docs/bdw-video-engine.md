@@ -366,3 +366,47 @@ The patch uses only standard UAPI, so it also runs on Linux i915.
 - It never overwrites, removes or touches `/nix/profile`.
 - A gen 396 inventory (job in `build/hardware/vaapi-stage-gen396/`) found 120 of 126 closure paths already on the Dell. The bundle carries the 6 missing ones (15 MB): libdrm-brook-softpin, i965, libva-utils, ffmpeg-headless bin and man, and the env.
 
+## Phase 3: Chromium VA-API (work/browser-vaapi, in progress)
+
+**Probe:** `scripts/workloads/browser_vaapi_probe.py`. It runs on the Dell as uid 1000 with a private profile and closes the browser afterwards.
+- It serves a clip in an autoplaying `<video>` and launches Chromium (or Firefox) through `brook-run` and `brook-iris-run`.
+- For Chromium it reads the DevTools Media domain (`kVideoDecoderName`, the player messages), `SystemInfo.getInfo`, the playback quality, and aggregate CPU from `/proc/stat`.
+- VA-API flags:
+  - `--enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL`;
+  - `--disable-features=Vulkan,UseChromeOSDirectVideoDecoder`;
+  - `--render-node-override=/dev/dri/renderD129`.
+
+  The environment sets `LIBVA_DRIVER_NAME=i965` and `LIBVA_DRIVERS_PATH`.
+
+**Two bugs found and fixed in the package (`brook-vaapi-0.3`, not yet staged):**
+1. **Frame-pool export.** Chromium's VaapiVideoDecoder creates surfaces without a pixel-format attribute and exports them (`vaExportSurfaceHandle`) before decoding. i965 allocates a surface's BO lazily, so the export failed with "invalid VASurfaceID" and Chromium fell back to FFmpeg.
+   - Fix: `i965-brook-export-alloc.patch` allocates NV12 or P010, tiled, on export.
+   - The export carries modifier `I915_FORMAT_MOD_Y_TILED` (0x0100000000000002), NV12 as R8 plus GR88 layers, pitch 1280, UV offset 942080 for 1280×720.
+   - Host check: `tools/vaapi-brook-pkg/host-shim/va_export_check.c` under the shim.
+2. **Stock libdrm_intel shadowed the softpin one: the green frames.** Chromium's GPU process loads Mesa's libgallium, which links stock `libdrm_intel.so.1`. When libva later loaded i965, the loader reused that object for i965's `libdrm_intel.so.1`.
+   - Every BSD execbuffer then went out stock (no NO_RELOC, unpinned objects with relocations), and Brook refused hundreds of them. The surfaces were never decoded into, so the video showed solid green. `gpu video status` user_jobs did not move.
+   - `exec_logger.so` (`tools/vaapi-brook-pkg/exec-logger/`) captured the refused requests on the Dell.
+   - The host shim reproduces it: LD_PRELOAD stock `libdrm_intel` makes 31 of 31 ffmpeg execbuffers refused.
+   - Fix: i965 links the softpin `libdrm_intel` **statically**, with its symbols made local (`--exclude-libs`). The build fails if i965 still needs or exports `libdrm_intel`.
+   - With stock `libdrm_intel` preloaded, the host shim then admits all 31 of 31.
+
+**Dell results (gen 398, `dell-integration7`), private profiles, 20 s each.** The patched i965 was loaded from a RAM copy (`LIBVA_DRIVERS_PATH`), with no store write.
+
+| Run | Decoder | VCS jobs | Frames presented / total / dropped | Frame p50 / p90 | CPU busy |
+|---|---|---|---|---|---|
+| 720p H.264, VA-API | VaapiVideoDecoder | 515 completed, 0 refused or failed, ~4.9 ms each (max 7.5) | 270 / 505 / 243 | 55 / 104 ms | 25.3% |
+| 720p H.264, software | FFmpegVideoDecoder | — | 382 / 519 / 141 | 40 / 69 ms | 22.1% |
+| 1080p H.264, software | FFmpegVideoDecoder | — | 325 / 512 / 175 | 44 / 77 ms | 23.0% |
+| 1080p H.264, VA-API | — | — | browser crashed at start twice (SIGTRAP after "Corruption detected in shared-memory segment"), before any decode; not yet understood | | |
+
+**VA-API decode works end to end in Chromium, but it is slower than software today.**
+- Each VCS job holds the CPU0 submission worker for about 5 ms: two media resets, execlist init, and polling for the breadcrumb. RCS composition and Chromium's own GL work queue behind it.
+- That is the phase 4 item: keep VCS state between jobs and do not block the worker for the decode time.
+- Software decode at 720p and 1080p also drops frames here (the package was near 90 °C with the clock capped during these runs), so these are relative numbers.
+
+**Not done yet:**
+- the Firefox VA-API path and its VP9 0.16× issue;
+- the YouTube H.264 preference;
+- the launcher proposal;
+- the 1080p VA-API crash.
+
