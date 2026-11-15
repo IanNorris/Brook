@@ -1,7 +1,8 @@
 # Compositor refactor: describe Clearwater chrome once
 
-15 November 2026. Status: proposal for Ian, with stage 0.1 implemented on
-`work/compositor-refactor`. It covers the [Clearwater Next design](DESIGN.md)
+15 November 2026. Status: accepted by Ian, with his answers recorded in
+[Decisions (Ian)](#decisions-ian-15-november). Stages 0.1, 0.2 and 0.5 are
+implemented on `work/compositor-refactor`. It covers the [Clearwater Next design](DESIGN.md)
 and the [compositor direction](../../compositor-direction.md).
 
 Line numbers refer to `main` at `0ae38b0d`, before stage 0.1.
@@ -10,7 +11,7 @@ Line numbers refer to `main` at `0ae38b0d`, before stage 0.1.
 menus, toasts, cursor and theme) once. Every compositor backend consumes that
 one description, and nothing adds per-frame cost on the Dell.
 
-## Decisions proposed
+## Architecture decisions
 
 1. **One description, three kinds of consumer.** The chrome is described as
    - theme tokens;
@@ -285,10 +286,10 @@ check. Stages 0 and 1 change no pixels unless a step says otherwise.
 | Step | Change | Exit check |
 | --- | --- | --- |
 | **0.1 (done)** | One shell-surface list: `WmShellSurfaces()` and `WmRenderShellSurface()`. The VKRENDER capture, CPU draw, virgl overlay draw, virgl blur and virgl compose all iterate it. | Host test (`test_window_surfaces`), QEMU CPU screenshots pixel-identical (see Phase 1 evidence) |
-| 0.2 | Tokens:<br>• add `accent`, `halo`, `ok/warm/hot`, badge and cursor colours to the palette and replace every chrome literal;<br>• one metrics source, with `WM_*` defined from `DesktopMetrics`;<br>• export `WmClientOffset()` for the console, shell and ioctl call sites. | Host tests; QEMU screenshots identical; `grep` gate: no `0x..RRGGBB` literal in chrome painters |
+| **0.2 (done)** | Tokens:<br>• `brook_theme.h` gains palette fields `accent`, `halo`, `ok/warm/hot` and `badgeText/badgeFill`, plus named constants for theme-independent colours (material shade, wallpaper fallback, cursor busy dots, agent icon). Every theme keeps the old literal values.<br>• Painters, telemetry, `chrome_material.h`, `cursor_composition.h` and `desktop_backdrop.h` read tokens.<br>• One metrics source: `WM_TITLE_BAR_HEIGHT`/`BORDER`/`BUTTON`/`TASKBAR` come from `DesktopMetrics::*Base`.<br>• `DesktopMetrics::clientOffsetX/Y()` replaces the frame-offset arithmetic in the shell, ioctl and Kernel Console code.<br>**Held for 0.4**, because chrome-csd edits those functions: the accent stroke literal in `RenderWindowChrome` and the colour key in `SetChromeDecorAlpha`. | `test_window_surfaces` pins the metric equivalence and the token values; QEMU screenshots identical (see Stage 0.2/0.5 evidence) |
 | 0.3 | Split window.cpp:<br>• shell layout and painters to `desktop_shell.cpp`;<br>• raster primitives to `chrome_raster.{h,cpp}` (freestanding, host-buildable). | Build, host tests, identical screenshots |
 | 0.4 | One alpha rule: painters write real alpha. Delete `SetChromeDecorAlpha`'s colour key and the capture's span loop; keep one helper for interior transparency and corner masks. | Virgl screenshot identical; `desktop_chrome_test` mask check |
-| 0.5 | Damage triggers (compositor.cpp:2095) use the surface list | Same |
+| **0.5 (done)** | Damage triggers use the surface list: one comparison of the shell surfaces (kind and rect, boot summary excluded) replaces the separate launcher, volume-popup and tooltip triggers. A surface that resizes while it is open now also repaints the scene under it. | Same |
 
 Steps 0.3 and 0.4 touch `RenderWindowChrome`. Land them **after
 `work/chrome-csd` merges** (see [Interactions](#interactions)).
@@ -313,16 +314,25 @@ builder and theme only, and every backend picks it up.
    the old palette and Performance settings.
 3. Hue derivation in `BrookTheme` with the DESIGN.md tables as test
    vectors, plus content colours for GTK and native apps.
-4. **VKRENDER backdrop blur** under the glass budget above. Until it lands
-   and is measured, the Dell resolves Glass to its Opaque stand-in.
+4. **VKRENDER backdrop blur** under the glass budget above. Until it lands,
+   the Dell resolves Glass to its Opaque stand-in. Once it exists, run the
+   **Glass-on-Dell experiment** (Ian, decision 1):
+   - matched yquake2 runs with Glass on and with Opaque;
+   - a maximised game and an idle desktop with glass panels open;
+   - measure displayed fps and compositor GPU ms per class.
+
+   Whether Glass is the Dell default follows from that measurement, not
+   from an assumption.
 5. Glass repaint: sheen, accent line, rim, caption pills, radii, three
    shadows. Taskbar states and tray.
 6. Toasts, flyouts and HUD as surfaces in the list.
 
-### Stage 3: shell process (decide before launcher work)
+### Stage 3: shell process (before launcher organisation)
 
 The taskbar, launcher, toasts and HUD move to a user-mode shell that
-submits surfaces through the stage 1.3 ABI. The kernel keeps a minimal
+submits surfaces through the stage 1.3 ABI. Launcher organisation
+(DESIGN.md steps 6–7) waits for this process (Ian, decision 3); it is not
+built in the kernel painter first. The kernel keeps a minimal
 taskbar and frame for when the shell is down (DESIGN.md T3).
 
 ## Tests
@@ -361,7 +371,8 @@ taskbar and frame for when the shell is down (DESIGN.md T3).
     from `desktop_stats` per class, chrome keeps and misses, overlay
     captures/s, and worker idle %.
   - **Idle desktop:** compositor jobs/s while hovering the taskbar.
-  - **Glass:** the same workload with Glass on and off.
+  - **Glass:** the Glass-on-Dell experiment (stage 2.4), the same workload
+    with Glass on and off.
   - **Accept if:** compositor GPU time per displayed frame is no worse than
     baseline (Opaque), and Glass costs ≤ 1.0 ms per frame with a maximised
     game.
@@ -406,23 +417,21 @@ taskbar and frame for when the shell is down (DESIGN.md T3).
 - **`work/ui-drawer` (Clearwater):** stage 2 is that work. Its native
   steps should target the builder and theme, not the painters directly.
 
-## Open questions for Ian
+## Decisions (Ian, 15 November)
 
-1. **Glass on the Dell.** Should the Dell stay on an Opaque theme until the
-   60 fps milestone is met, with VKRENDER blur (stage 2.4) scheduled after
-   it? Or is Glass on the Dell part of this milestone?
-2. **Golden images in the repository.** Are a few MB of PNG goldens under
-   `src/tests/goldens/` acceptable? The alternative is hashes plus
-   regenerate-on-demand.
-3. **Shell process timing.** Should launcher organisation (DESIGN.md steps
-   6–7) wait for the user-mode shell (stage 3)? Or should it land in the
-   kernel painter first and be moved later?
-4. **Double raster under lease.** Is giving up an always-current CPU back
-   buffer acceptable while VKRENDER holds the lease? Fallback would then
-   cost one full repaint frame, about 15 ms, at lease expiry.
-5. **Second palette.** Should the app-content palette in
-   `brook_appearance.h` (`brook_surface_palette`) be folded into
-   `BrookTheme` now (stage 0.2) or with the hue work (stage 2.3)?
+1. **Glass on the Dell: measure it.** Once VKRENDER blur exists (stage
+   2.4), run the Glass-on-Dell experiment and decide from the numbers. The
+   Dell does not stay Opaque by assumption until 60 fps.
+2. **Golden images in the repository are fine.** A few MB of reference PNGs
+   go under `src/tests/goldens/chrome/`.
+3. **Launcher organisation waits for the user-mode shell process** (stage
+   3).
+4. **Stop drawing everything twice.** While VKRENDER holds the lease, skip
+   the CPU raster of windows and chrome (stage 1.4). The one-off full
+   repaint of about 15 ms at fallback is acceptable.
+5. **App-content colours** (`brook_surface_palette` in
+   `brook_appearance.h`) fold into the theme whenever it makes sense as the
+   work progresses. There is no fixed stage. Stage 0.2 does not move them.
 
 ## Phase 1 evidence (stage 0.1)
 
@@ -483,3 +492,51 @@ no blocking, and in the second boot the compositor kept drawing. This looks
 like a pre-existing network/scheduler-lock issue under host contention, not
 this change. It was not investigated further. Evidence:
 `build/refactor-evidence/qemu-hang-virtio-net/`.
+
+## Stage 0.2 and 0.5 evidence
+
+The branch was rebased onto `main` at `02e48c76`. A trial merge with
+`work/chrome-csd` (`git merge-tree`) is clean.
+
+**Host tests:** 361/361 pass. `test_audio_delivery` timed out under
+parallel load and passed when rerun alone. `test_window_surfaces` now pins:
+- the `WM_*` constants against the `DesktopMetrics` bases;
+- `clientOffsetX/Y()` against the WM arithmetic at 100/150/200%;
+- the new token values for all three themes.
+
+**QEMU CPU path (`gpu=software`)** compares the same seven scenes on the
+`main` baseline (`02e48c76`) and the stage 0.2+0.5 build (`d54bf370`). All
+seven are **pixel-identical** outside the masks for the clock, telemetry,
+build label and caret (`compare-0205.txt`). Every scene was checked to be in
+its intended state.
+
+How each side was booted and captured:
+- **Kernel source:** the kernel boots from the build directory's ESP, not
+  from the disk image. The baseline was therefore booted with
+  `BROOK_BUILD_DIR` pointing at a separate copy of the `main` build.
+- **Capture method:** scenes are bridge frames, except candidate scene 5,
+  which is a QMP screendump. A later bridge capture of scene 5 is also
+  identical.
+- **Input:** driving input straight over QMP `input-send-event` was not
+  reliable for clicks after the first one, so input went through the bridge
+  (`vm_input`).
+
+**QEMU stalls, again under heavy host load (load around 40):**
+- **The 0.2/0.5 candidate froze once,** at scene 5: the clock stopped and
+  all eight vCPUs were in `SchedLockWaitForTicket`. A heuristic stack scan
+  shows LAPIC-timer `SchedulerTimerTick` spinning for the scheduler lock
+  over `SchedulerBlockImpl` and the network poll thread
+  (`build/refactor-evidence/qemu-hang-sched/`).
+- **The record so far:**
+  - one freeze among the two stage 0.1 candidate boots;
+  - one freeze among the two stage 0.2/0.5 candidate boots;
+  - no freezes in the 0ae38b0d baseline boot or the three main-baseline
+    boots.
+- **The changes don't touch the scheduler.** The new per-frame work takes
+  only the launcher and launch spinlocks, which these paths already took.
+- **The pattern is still worth a soak on an idle host** before integration.
+
+**Follow-up pass.** A second full seven-scene pass on the re-booted
+candidate completed without a stall once host load fell (load about 8).
+That is consistent with stalls triggered by contention. It does not
+replace the idle-host soak.
