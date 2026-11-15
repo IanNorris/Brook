@@ -96,6 +96,20 @@ class Hardware:
         return {'session':session,'generation':data['generation'],'guest_boot_id':boot,'endpoint':f'{host}:{port}',
             'guest':caps,'note':'Pinned to this guest boot. Attach explicitly again after reboot; old operation IDs remain historical.'}
 
+    def detach(self,session,**_):
+        """Explicitly end this attachment: clear the guest agent indicator and
+        mark the descriptor detached. Idempotent; attach again to resume."""
+        with self.session_lock(session,live=False) as data:
+            result={'session':session,'guest_boot_id':data['guest_boot_id'],'previous_state':data.get('state')}
+            try:
+                reply=self.guest(data,'bridge presence detach',3)
+                result['guest_presence']=reply.get('state') if reply.get('presence_api')==1 else 'unsupported'
+            except HardwareBootChanged:result['guest_presence']='boot_changed'
+            except (OSError,ValueError) as error:result.update(guest_presence='unreachable',error=str(error))
+            data['state']='detached';write_json(self.registry/session/'session.json',data)
+        result['note']='Detached; later calls on this session are refused. Use hw_attach to start a new pinned session.'
+        return result
+
     def sessions(self,**_):
         rows=[]
         for path in sorted(self.registry.glob('*/session.json')):

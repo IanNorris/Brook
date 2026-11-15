@@ -2091,6 +2091,7 @@ static void CompositorLoopWM()
     uint64_t now = ApicTickCount();
     // The taskbar (drawn every pass, like the clock) reads only this cache.
     WmNetworkIndicatorRefresh(now);
+    WmAgentIndicatorRefresh(now);
     WmVolumeIndicatorRefresh();
     WmVolumeFeedbackTick(now);
     // Opening or closing the volume popup exposes or covers scene pixels, so

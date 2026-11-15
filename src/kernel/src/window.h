@@ -375,6 +375,10 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut);
 // second from stack state (no device access). Returns true when it changed.
 bool WmNetworkIndicatorRefresh(uint64_t now);
 
+// Compositor thread: sample debug-bridge agent presence at most once per
+// second into the taskbar cache. Returns true when the shown state changed.
+bool WmAgentIndicatorRefresh(uint64_t now);
+
 // Taskbar volume (compositor thread only). Refresh copies the master gain
 // shared with Settings (BROOK_SYS_AUDIO_CONTROL) into the render cache and
 // returns true when it changed. A left press opens/closes the popup or acts
