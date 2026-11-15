@@ -4,6 +4,8 @@ namespace brook {
 struct Process;
 struct SignalInfo;
 bool ProcessCanSignal(Process* sender,Process* target);
+// PTRACE_MODE_READ_REALCREDS-style inspection permission (kcmp).
+bool ProcessCanPtraceRead(Process* viewer,Process* target);
 void ProcessSignalInfoToUser(Process* viewer,SignalInfo* info);
 UserNamespace* ProcessUserNamespaceAcquire(Process* process);
 int ProcessUserNamespaceCreate(Process* unpublishedChild);

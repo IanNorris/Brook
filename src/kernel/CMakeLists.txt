@@ -311,6 +311,7 @@ add_executable(kernel
     src/syscall_ioctl.cpp
     src/syscall_socket.cpp
     src/syscall_process.cpp
+    src/syscall_kcmp.cpp
     src/syscall_exec.cpp
     src/syscall_sched.cpp
     src/syscall_futex.cpp

@@ -106,6 +106,7 @@ implements a large subset of the Linux-compatible system call surface plus Brook
 | 218 | set_tid_address | ⚠️ Stored, validated later | |
 | 231 | exit_group | ✅ | |
 | 435 | clone3 | ❌ No args validation | BRO-004 |
+| 312 | kcmp | ✅ | FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM; EPOLL_TFD EOPNOTSUPP; ptrace-read REALCREDS check |
 
 ### Signal Handling
 | # | Name | Validation | Notes |

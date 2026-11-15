@@ -202,6 +202,12 @@ int SysvSemClone(Process* parent,Process* child,bool share) {
     }
     IrqSpinLockRelease(&semLock,f);return result;
 }
+uintptr_t SysvSemUndoIdentity(Process* p) {
+    if(!p)return 0;
+    auto f=IrqSpinLockAcquire(&semLock);
+    const auto identity=reinterpret_cast<uintptr_t>(SemGroup(p,false));
+    IrqSpinLockRelease(&semLock,f);return identity;
+}
 void SysvSemExit(Process* p) {
     if(!p || p->pid>=MAX_PROCESSES)return;
     auto f=IrqSpinLockAcquire(&semLock);auto& a=semAliases[p->pid];

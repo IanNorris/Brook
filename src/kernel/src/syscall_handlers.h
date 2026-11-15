@@ -7,12 +7,18 @@
 #include <stdint.h>
 
 namespace brook {
+struct Process;
 
 // syscall_signal.cpp
 int64_t sys_alarm(uint64_t seconds, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
 int64_t sys_pause(uint64_t, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
+// syscall_kcmp.cpp
+int64_t sys_kcmp(uint64_t pid1, uint64_t pid2, uint64_t type,
+                 uint64_t index1, uint64_t index2, uint64_t);
+int64_t KcmpTasks(Process* self, Process* first, Process* second, uint64_t type,
+                  uint64_t index1, uint64_t index2);
 int64_t sys_getitimer(uint64_t which, uint64_t valueAddr, uint64_t,
                       uint64_t, uint64_t, uint64_t);
 int64_t sys_setitimer(uint64_t which, uint64_t valueAddr, uint64_t oldAddr,

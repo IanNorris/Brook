@@ -121,7 +121,7 @@ const char* SyscallNameOrNull(uint64_t num)
     case 128: return "rt_sigtimedwait"; case 131: return "sigaltstack"; case 130: return "rt_sigsuspend";
     case 134: return "statfs";
     case 34: return "pause"; case 37: return "alarm";
-    case 36: return "getitimer"; case 38: return "setitimer";
+    case 36: return "getitimer"; case 38: return "setitimer"; case 312: return "kcmp";
     case 135: return "fstatfs";   case 157: return "prctl";
     case 158: return "arch_prctl"; case 186: return "gettid";
     case 200: return "tkill";     case 201: return "time";       case 217: return "getdents64";

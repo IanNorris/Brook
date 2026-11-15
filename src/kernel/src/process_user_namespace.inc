@@ -134,6 +134,25 @@ uint32_t ProcessUserMapRead(UserNamespace* ns,UserNamespace* viewer,bool group,b
     buffer[size-1]='\n';if(capacity<size)return 0;memcpy(out,buffer,size);return size;
 }
 
+// Linux ptrace_may_access(PTRACE_MODE_READ_REALCREDS) without dumpable/LSM
+// checks: same thread group, or the viewer's real IDs match every target ID
+// and the target holds no capability the viewer lacks, or CAP_SYS_PTRACE in
+// the target's user namespace.
+bool ProcessCanPtraceRead(Process* viewer,Process* target) {
+    if(!viewer || !target)return false;
+    if(viewer->tgid==target->tgid &&
+       (viewer->isThread?viewer->leaderIncarnation:viewer->incarnation)==
+       (target->isThread?target->leaderIncarnation:target->incarnation))return true;
+    ProcessOperationGuard operation(ProcessCurrent());SpinLockAcquire(&g_credentialsLock);
+    const uint32_t uid=viewer->uid,gid=viewer->gid;
+    const bool sameOwner=viewer->userNamespace==target->userNamespace &&
+        uid==target->uid && uid==target->euid && uid==target->suid &&
+        gid==target->gid && gid==target->egid && gid==target->sgid &&
+        !(target->capabilities.permitted & ~viewer->capabilities.effective);
+    const bool result=sameOwner ||
+        UserNamespaceCapable(UserAuthorityLocked(viewer),target->userNamespace,19); // CAP_SYS_PTRACE
+    SpinLockRelease(&g_credentialsLock);return result;
+}
 bool ProcessCanSignal(Process* sender,Process* target) {
     if(!sender || !target)return false;
     ProcessOperationGuard operation(ProcessCurrent());SpinLockAcquire(&g_credentialsLock);

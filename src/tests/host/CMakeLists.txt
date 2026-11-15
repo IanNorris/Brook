@@ -973,6 +973,11 @@ set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)
 
 add_host_test(test_intel_bdw_forcewake_adapter)
 add_host_test(test_real_interval_timer)
+add_host_test(test_kcmp)
+target_compile_options(test_kcmp PRIVATE -DBROOK_HOST_TEST -UNDEBUG
+    -ffunction-sections -fdata-sections -Wno-unused-function -Wno-missing-field-initializers
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_kcmp PRIVATE -Wl,--gc-sections)
 add_host_test(test_signal_context)
 target_compile_options(test_signal_context PRIVATE -DBROOK_HOST_TEST -UNDEBUG
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
