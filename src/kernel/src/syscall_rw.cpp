@@ -84,11 +84,11 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
 {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
-        if((fde->statusFlags&3)==0)return -EBADF;
+        if((FdStatus(fde)&3)==0)return -EBADF;
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         KMutexLock(&block->lock);
         int64_t result=MaintenanceBlockTransfer(block,bufAddr,count,&block->position,true,userSource);
-        if(result>0 && (fde->statusFlags&0x1000)) {const int error=DeviceFlush(block->device);if(error)result=error;}
+        if(result>0 && (FdStatus(fde)&0x1000)) {const int error=DeviceFlush(block->device);if(error)result=error;}
         KMutexUnlock(&block->lock);return result;
     }
 #endif
@@ -162,7 +162,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     }
 
     if(auto* opened=FdNamedFifo(fde)) {
-        if((fde->statusFlags&3)==0)return -EBADF;
+        if((FdStatus(fde)&3)==0)return -EBADF;
         FdEntry endpoint=*fde;endpoint.type=FdType::Pipe;endpoint.handle=opened->state->pipe;endpoint.flags=1|0x10;
         return WriteToPinnedFdByType(proc,&endpoint,fd,bufAddr,count,userSource);
     }
@@ -170,19 +170,24 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     // destructor performs any deferred-close teardown on every return path.
     if (fde->type == FdType::Vnode && fde->handle)
     {
-        if ((fde->statusFlags & 3) == 0) return -EBADF;
+        if ((FdStatus(fde) & 3) == 0) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
-        int64_t ret = (fde->statusFlags & 0x400)
-            ? AppendUserBuffer(vn, bufAddr, count, &fde->seekPos)
+        // The offset is shared by every dup/fork alias (H-20); hold the
+        // description's position across the backend update. O_APPEND is
+        // additionally atomic against other descriptions in the backend.
+        const uint32_t status = FdStatus(fde);
+        FdPosition position(fde);
+        int64_t ret = (status & 0x400)
+            ? AppendUserBuffer(vn, bufAddr, count, position.get())
             : VfsWrite(vn, reinterpret_cast<const void*>(bufAddr),
-                       count < VnodeWriteLimit ? count : VnodeWriteLimit, &fde->seekPos);
+                       count < VnodeWriteLimit ? count : VnodeWriteLimit, position.get());
         // O_SYNC includes O_DSYNC (0x1000). A stronger full-file sync is valid
         // for either flag and must complete before reporting a durable write.
-        if (ret > 0 && (fde->statusFlags & 0x1000)) {
+        if (ret > 0 && (FdStatus(fde) & 0x1000)) {
             int error = VfsFsync(vn);
             if (error) return error;
         }
-        // Note: VfsWrite already updates *offset (fde->seekPos), don't double-update
+        // Note: VfsWrite already updates *offset (the shared position)
         return ret;
     }
 
@@ -214,7 +219,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         };
         for (;;) {
             SpinLockAcquire(ProcessFdLock(proc));
-            const bool nonblock = (fde->statusFlags & 0x800) != 0;
+            const bool nonblock = (FdStatus(fde) & 0x800) != 0;
             SpinLockRelease(ProcessFdLock(proc));
             {
                 const auto mutexBefore=timing.Mark();
@@ -326,7 +331,7 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                 }
             }
             if (accepted) break;
-            if (fde->statusFlags & EFD_NONBLOCK) return -EAGAIN;
+            if (FdStatus(fde) & EFD_NONBLOCK) return -EAGAIN;
             // Register, then recheck before blocking: a read that frees
             // capacity in between wakes this writer (or leaves the wake
             // pending). The timeout only covers an allocation failure.
@@ -411,16 +416,17 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     }
 
     if (fde->type == FdType::MemFd && fde->handle) {
-        if ((fde->statusFlags & 3) == 0) return -EBADF;
+        if ((FdStatus(fde) & 3) == 0) return -EBADF;
+        const bool append = (FdStatus(fde) & 0x400) != 0;
+        FdPosition position(fde);
         return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
-            bufAddr, count, &fde->seekPos,
-            (fde->statusFlags & 0x400) != 0, userSource);
+            bufAddr, count, position.get(), append, userSource);
     }
 
     // Write to AF_UNIX connected socket.
     if (fde->type == FdType::UnixSocket && fde->handle) {
         auto* socket=static_cast<UnixSocketData*>(fde->handle);
-        return UnixSocketWriteSome(socket,(fde->statusFlags&0x800)!=0,
+        return UnixSocketWriteSome(socket,(FdStatus(fde)&0x800)!=0,
             reinterpret_cast<const char*>(bufAddr),count);
     }
 
@@ -515,7 +521,7 @@ static int64_t PipeReadSome(Process* proc,FdEntry* fde,char* dst,uint64_t count)
             }
 
             Process* self = ProcessCurrent();
-            switch (pipe->prepareReadWait(self, (fde->statusFlags & 0x800) != 0)) {
+            switch (pipe->prepareReadWait(self, (FdStatus(fde) & 0x800) != 0)) {
                 case PipeReadWait::Retry: continue;
                 case PipeReadWait::Eof: return 0;
                 case PipeReadWait::WouldBlock: return -EAGAIN;
@@ -585,7 +591,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
-        if((fde->statusFlags&3)==1)return -EBADF;
+        if((FdStatus(fde)&3)==1)return -EBADF;
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         KMutexLock(&block->lock);
         const int64_t result=MaintenanceBlockTransfer(block,bufAddr,count,&block->position,false,true);
@@ -597,9 +603,10 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // A write-only descriptor cannot read, whatever the file mode.
         if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
+        FdPosition position(fde);
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
-                              static_cast<uint32_t>(count), &fde->seekPos);
-        // VfsRead already updates seekPos via the offset pointer; don't double-add.
+                              static_cast<uint32_t>(count), position.get());
+        // VfsRead already updates the shared offset through the pointer.
         return ret;
     }
 
@@ -655,7 +662,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         }
 
     done:
-        if (out.Total() == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
+        if (out.Total() == 0 && !(FdStatus(fde) & 0x800)) { // O_NONBLOCK
             // Blocking mode: sleep briefly and retry once
             Process* self = ProcessCurrent();
             self->wakeupTick = ApicTickCount() + 100;
@@ -683,13 +690,14 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         uint64_t contentLen = 0;
         while (content[contentLen]) contentLen++;
 
-        uint64_t pos = fde->seekPos;
+        FdPosition position(fde);
+        uint64_t pos = position.value();
         if (pos >= contentLen) return 0; // EOF
 
         uint64_t avail = contentLen - pos;
         uint64_t toRead = (count < avail) ? count : avail;
         if (!CopyToUser(bufAddr, content + pos, toRead)) return -EFAULT;
-        fde->seekPos += toRead;
+        position.set(pos + toRead);
         return static_cast<int64_t>(toRead);
     }
 
@@ -937,7 +945,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
 
     if(fde->type==FdType::SignalFd && fde->handle)
-        return SignalFdRead(proc,static_cast<SignalFd*>(fde->handle),bufAddr,count,(fde->statusFlags&0x800)!=0);
+        return SignalFdRead(proc,static_cast<SignalFd*>(fde->handle),bufAddr,count,(FdStatus(fde)&0x800)!=0);
 
     // Read from eventfd — returns counter as uint64, resets to 0
     if (fde->type == FdType::SyncFile) return -EINVAL;
@@ -969,7 +977,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
             if (consumed) return 8;
             // Non-blocking: return EAGAIN
-            if (fde->statusFlags & 0x800)
+            if (FdStatus(fde) & 0x800)
                 return -EAGAIN;
 
             // Register, recheck, then block until the counter is non-zero.
@@ -1014,7 +1022,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     {
         if (count < 8) return -EINVAL;
         auto* tfd = static_cast<TimerFdData*>(fde->handle);
-        bool nonblock = (fde->statusFlags & 0x800) != 0;
+        bool nonblock = (FdStatus(fde) & 0x800) != 0;
 
         TimerWaitGroup waiters;
         if (!nonblock) waiters.add(tfd, proc);
@@ -1041,9 +1049,10 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
 
     if (fde->type == FdType::MemFd && fde->handle) {
-        if ((fde->statusFlags & 3) == 1) return -EBADF;
+        if ((FdStatus(fde) & 3) == 1) return -EBADF;
+        FdPosition position(fde);
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
-            bufAddr, count, &fde->seekPos, true);
+            bufAddr, count, position.get(), true);
     }
 
     // Read from /dev/tty — reads from stdin pipe
@@ -1080,7 +1089,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if(!count)return 0; // read(fd, ..., 0) does not consume a record.
         auto* socket=static_cast<UnixSocketData*>(fde->handle);
         UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
-        auto result=UnixSocketReadSome(socket,(fde->statusFlags&0x800)!=0,
+        auto result=UnixSocketReadSome(socket,(FdStatus(fde)&0x800)!=0,
             reinterpret_cast<char*>(bufAddr),count,descriptors,received);
         for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
         return result;
@@ -1098,9 +1107,9 @@ static int64_t UnixRecordVectorIo(FdEntry* entry,uint64_t address,uint64_t count
     UnixRecordVector stage;if(int error=stage.Init(address,count,writing))return error;
     if(!stage.length)return 0; // readv/writev with an empty vector are no-ops.
     auto* socket=static_cast<UnixSocketData*>(entry->handle);
-    if(writing)return UnixSocketWriteSome(socket,(entry->statusFlags&0x800)!=0,stage.bytes,stage.length);
+    if(writing)return UnixSocketWriteSome(socket,(FdStatus(entry)&0x800)!=0,stage.bytes,stage.length);
     UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
-    auto result=UnixSocketReadSome(socket,(entry->statusFlags&0x800)!=0,stage.bytes,stage.capacity,descriptors,received);
+    auto result=UnixSocketReadSome(socket,(FdStatus(entry)&0x800)!=0,stage.bytes,stage.capacity,descriptors,received);
     for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
     if(result>0)if(int error=stage.Scatter(result))return error;
     return result;
@@ -1225,10 +1234,10 @@ int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
             return result;
         }
     }
-    if(FdPipe(entry) && (entry->statusFlags&0x4000))
+    if(FdPipe(entry) && (FdStatus(entry)&0x4000))
         return PipeVectorIo(proc,entry,fd,iovAddr,iovcnt,true);
-    if (entry->type == FdType::Vnode && entry->handle && (entry->statusFlags & 0x400)) {
-        if ((entry->statusFlags & 3) == 0) return -EBADF;
+    if (entry->type == FdType::Vnode && entry->handle && (FdStatus(entry) & 0x400)) {
+        if ((FdStatus(entry) & 3) == 0) return -EBADF;
         // Snapshot descriptors before validation: users may change the array.
         auto* vectors = static_cast<iovec*>(kmalloc(iovcnt ? iovcnt * sizeof(iovec) : 1));
         if (!vectors) return -ENOMEM;
@@ -1255,9 +1264,13 @@ int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
         }
         kfree(vectors);
         auto* vn = static_cast<Vnode*>(entry->handle);
-        int64_t result = VfsAppend(vn, staged, capacity, &entry->seekPos);
+        int64_t result;
+        {
+            FdPosition position(entry);
+            result = VfsAppend(vn, staged, capacity, position.get());
+        }
         kfree(staged);
-        if (result > 0 && (entry->statusFlags & 0x1000)) {
+        if (result > 0 && (FdStatus(entry) & 0x1000)) {
             int error = VfsFsync(vn);if (error) return error;
         }
         return result;
@@ -1287,13 +1300,15 @@ int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
     if(!input || !output)return -EBADF;
     auto* out_fde=output.get();
     if(out_fde->type==FdType::Path)return -EBADF;
-    if(out_fde->statusFlags&0x400u)return -EINVAL; // Linux forbids append output.
+    if(FdStatus(out_fde)&0x400u)return -EINVAL; // Linux forbids append output.
     if((out_fde->type==FdType::MemFd || (out_fde->type==FdType::Vnode && out_fde->handle)) &&
-       (out_fde->statusFlags&3)==0)return -EBADF;
+       (FdStatus(out_fde)&3)==0)return -EBADF;
     auto* in_fde=input.get();
-    if(in_fde->type==FdType::Path || (in_fde->statusFlags&3)==1)return -EBADF;
+    if(in_fde->type==FdType::Path || (FdStatus(in_fde)&3)==1)return -EBADF;
     if((in_fde->type!=FdType::Vnode && in_fde->type!=FdType::MemFd) || !in_fde->handle)return -EINVAL;
-    uint64_t offset=in_fde->seekPos;
+    // Like Linux, sendfile reads and stores the shared offset without
+    // f_pos_lock (the output may be the same description).
+    uint64_t offset=OpenFileOffset(in_fde->file);
     if(offsetAddr) {
         if(!UserBufferWritable(offsetAddr,8) || !CopyFromUser(&offset,offsetAddr,8))return -EFAULT;
     }
@@ -1317,7 +1332,7 @@ int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
     }
     kfree(bounce);
     if(offsetAddr) {if(!CopyToUser(offsetAddr,&offset,8))return -EFAULT;}
-    else in_fde->seekPos=offset;
+    else OpenFileSetOffset(in_fde->file,offset);
     return total?total:error;
 }
 
@@ -1337,33 +1352,33 @@ int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
-        if((fde->statusFlags&3)==0)return -EBADF;
+        if((FdStatus(fde)&3)==0)return -EBADF;
         if(count && !UserBufferReadable(bufAddr,count))return -EFAULT;
         auto* block=static_cast<MaintenanceBlockFd*>(fde->handle);
         int64_t result=MaintenanceBlockTransfer(block,bufAddr,count,&offset,true,true);
-        if(result>0 && (fde->statusFlags&0x1000)) {const int error=DeviceFlush(block->device);if(error)result=error;}
+        if(result>0 && (FdStatus(fde)&0x1000)) {const int error=DeviceFlush(block->device);if(error)result=error;}
         return result;
     }
 #endif
     if (fde->type == FdType::MemFd && fde->handle) {
-        if ((fde->statusFlags & 3) == 0) return -EBADF;
+        if ((FdStatus(fde) & 3) == 0) return -EBADF;
         if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
         return MemFdWriteAt(static_cast<MemFdData*>(fde->handle),
             bufAddr, count, &offset,
-            (fde->statusFlags & 0x400) != 0, true);
+            (FdStatus(fde) & 0x400) != 0, true);
     }
     if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
-    if ((fde->statusFlags & 3) == 0) return -EBADF;
+    if ((FdStatus(fde) & 3) == 0) return -EBADF;
     if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
 
     auto* vn = static_cast<Vnode*>(fde->handle);
     const void* buf = reinterpret_cast<const void*>(bufAddr);
     uint64_t off = offset;
     // Linux pwrite on O_APPEND chooses EOF but leaves the FD offset unchanged.
-    int64_t result = (fde->statusFlags & 0x400)
+    int64_t result = (FdStatus(fde) & 0x400)
         ? AppendUserBuffer(vn, bufAddr, count, &off)
         : VfsWrite(vn, buf, count < VnodeWriteLimit ? count : VnodeWriteLimit, &off);
-    if (result > 0 && (fde->statusFlags & 0x1000)) {
+    if (result > 0 && (FdStatus(fde) & 0x1000)) {
         int error = VfsFsync(vn);
         if (error) return error;
     }
@@ -1388,12 +1403,12 @@ int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (count && !UserBufferWritable(bufAddr, count)) return -EFAULT;
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
     if(fde->type==FdType::BlockDevice && fde->handle) {
-        if((fde->statusFlags&3)==1)return -EBADF;
+        if((FdStatus(fde)&3)==1)return -EBADF;
         return MaintenanceBlockTransfer(static_cast<MaintenanceBlockFd*>(fde->handle),bufAddr,count,&offset,false,true);
     }
 #endif
     if (fde->type == FdType::MemFd && fde->handle) {
-        if ((fde->statusFlags & 3) == 1) return -EBADF;
+        if ((FdStatus(fde) & 3) == 1) return -EBADF;
         return MemFdReadAt(static_cast<MemFdData*>(fde->handle),
             bufAddr, count, &offset, true);
     }

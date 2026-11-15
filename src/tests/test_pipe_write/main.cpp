@@ -12,7 +12,9 @@
 namespace brook {
 
 enum class FdType { Pipe, Other };
-struct FdEntry { FdType type=FdType::Pipe; void *handle=nullptr; uint64_t seekPos=0; unsigned flags=1, statusFlags=1; };
+struct FdEntry { FdType type=FdType::Pipe; void *handle=nullptr; unsigned flags=1, statusFlags=1; };
+// Stand-in for the shared open file description's status (H-20).
+static uint32_t FdStatus(const FdEntry* fd) { return fd->statusFlags; }
 struct Process { uint64_t wakeupTick=0; SpinLock fdLock{}; };
 static Process current;
 static unsigned blocks, signals, wakes, notifications, processHolds;
@@ -83,15 +85,10 @@ int main() {
     pipe.writerWaiter=&other;
     CHECK(writePipe(&fd,samples,1)==-EAGAIN && pipe.writerWaiter==&other && !blocks);
 
-    // The legacy bidirectional pipe representation writes to seekPos, not
-    // the read-direction handle. Reject against the full direction only.
-    char readStorage[64]{};
-    PipeBuffer readPipe;readPipe.data=readStorage;readPipe.capacity=sizeof(readStorage);
-    readPipe.readers=readPipe.writers=1;
-    fd.flags=2;fd.handle=&readPipe;fd.seekPos=reinterpret_cast<uint64_t>(&pipe);
-    CHECK(writePipe(&fd,samples,1)==-EAGAIN && readPipe.empty() && pipe.count()==63);
-    CHECK(pipe.writerWaiter==&other && !blocks);
-    fd.flags=1;fd.seekPos=0;
+    // A read end is never written.
+    fd.flags=0;
+    CHECK(writePipe(&fd,samples,1)==-EBADF && pipe.count()==63 && !blocks);
+    fd.flags=1;
 
     // Prefix admission remains valid for requests larger than PIPE_BUF.
     reset(true);

@@ -3,10 +3,7 @@
     if (fde->type == FdType::Pipe && fde->handle)
     {
         if(fde->flags==0)return -EBADF;
-        // For bidirectional socketpair (flags==2), write goes to the write pipe
-        auto* pipe = (fde->flags == 2)
-            ? reinterpret_cast<PipeBuffer*>(fde->seekPos)
-            : static_cast<PipeBuffer*>(fde->handle);
+        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
         KernelOperationGuard operation(proc);
         // PipeBuffer::write copies under pipe->lock, so a user source is
         // staged one chunk at a time first (a fault returns EFAULT, or the
@@ -14,9 +11,8 @@
         const char* src = reinterpret_cast<const char*>(bufAddr);
         char stage[4096];
         uint64_t written = 0;
-        SpinLockAcquire(ProcessFdLock(proc));
-        const bool packet = (fde->statusFlags & 0x4000) != 0 && fde->flags != 2;
-        SpinLockRelease(ProcessFdLock(proc));
+        // O_DIRECT is a shared status flag of the description (H-20).
+        const bool packet = (FdStatus(fde) & 0x4000) != 0;
         if (!count) return 0;
         if (packet && !pipe->enablePackets()) return -ENOMEM;
 
@@ -56,7 +52,7 @@
             // A control/self-pipe may be drained only by this same caller.
             // Blocking here despite O_NONBLOCK can deadlock its event loop.
             SpinLockAcquire(ProcessFdLock(proc));
-            const bool nonblock = (fde->statusFlags & 0x800) != 0;
+            const bool nonblock = (FdStatus(fde) & 0x800) != 0;
             SpinLockRelease(ProcessFdLock(proc));
             if (nonblock) return written ? static_cast<int64_t>(written) : -EAGAIN;
             // Buffer full — block until reader drains some

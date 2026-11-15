@@ -87,7 +87,21 @@ void SceneHandleUnref(SceneHandle*) {}
 void SignalFdUnref(SignalFd*) {}
 void MappingBackingUnref(MappingBacking*) {}
 void FinalizeClosedFd(const FdClaimResult&) {}
-int FdAlloc(Process*,FdType,void*) { return -1; }
+// Real publication of a new open file description (process.cpp mirror).
+int FdPublishNew(Process* proc,const FdEntry& owned,uint32_t openFlags,bool pinned,
+                 void (*published)(int,const FdEntry&)) {
+    OpenFile* file=OpenFileCreate(openFlags);if(!file)return -12;
+    FdEntry entry=owned;entry.file=file;
+    int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr,published,nullptr,nullptr,pinned);
+    if(fd<0)OpenFileRelease(file);
+    return fd;
+}
+int FdAlloc(Process* proc,FdType type,void* handle,uint32_t openFlags,uint8_t flags,uint8_t fdFlags) {
+    FdEntry owned{};owned.type=type;owned.handle=handle;owned.flags=flags;owned.fdFlags=fdFlags;
+    return FdPublishNew(proc,owned,openFlags);
+}
+// dup()-style retain of the description; handle references are not modelled.
+bool FdRetainCopy(FdEntry* copy) { OpenFileRetain(copy->file);return true; }
 AudioStreamId AudioMixerOpen() { return 0; }
 bool AudioMixerClose(AudioStreamId) { return true; }
 bool AudioMixerSetCapacity(AudioStreamId,uint32_t,uint32_t) { return false; }
@@ -216,7 +230,25 @@ extern "C" void CompositorWake() {}
 extern "C" void KPuts(const char*) {}
 extern "C" void KPrintf(const char*,...) {}
 extern "C" bool TtyGetFramebufferPhys(uint64_t*,uint32_t*,uint32_t*,uint32_t*) { return false; }
-extern "C" int VfsWrite(brook::Vnode*,const void*,uint64_t,uint64_t*) { return -brook::EIO; }
-extern "C" int VfsAppend(brook::Vnode*,const void*,uint64_t,uint64_t*) { return -brook::EIO; }
-extern "C" int VfsRead(brook::Vnode*,void*,uint64_t,uint64_t*) { return -brook::EIO; }
+static harness::MemoryFile* FakeFile(brook::Vnode* vn) {
+    return vn ? static_cast<harness::MemoryFile*>(vn->priv) : nullptr;
+}
+extern "C" int VfsWrite(brook::Vnode* vn,const void* buf,uint64_t len,uint64_t* offset) {
+    auto* file=FakeFile(vn);if(!file)return -brook::EIO;
+    if(*offset>sizeof(file->bytes) || len>sizeof(file->bytes)-*offset)return -28; // ENOSPC
+    __builtin_memcpy(file->bytes+*offset,buf,len);*offset+=len;
+    if(*offset>file->size)file->size=*offset;
+    return static_cast<int>(len);
+}
+extern "C" int VfsAppend(brook::Vnode* vn,const void* buf,uint64_t len,uint64_t* offset) {
+    auto* file=FakeFile(vn);if(!file)return -brook::EIO;
+    *offset=file->size;return VfsWrite(vn,buf,len,offset);
+}
+extern "C" int VfsRead(brook::Vnode* vn,void* buf,uint64_t len,uint64_t* offset) {
+    auto* file=FakeFile(vn);if(!file)return -brook::EIO;
+    if(*offset>=file->size)return 0;
+    if(len>file->size-*offset)len=file->size-*offset;
+    __builtin_memcpy(buf,file->bytes+*offset,len);*offset+=len;
+    return static_cast<int>(len);
+}
 extern "C" void VfsClose(brook::Vnode*) {}

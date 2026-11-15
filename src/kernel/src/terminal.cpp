@@ -1022,13 +1022,11 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     stdFds[0].handle = stdinPipe;
 
     stdFds[1].type = FdType::Pipe;
-    stdFds[1].flags = 0x01 | 0x04; // write end, TTY-pipe
-    stdFds[1].statusFlags = 1; // O_WRONLY
+    stdFds[1].flags = 0x01 | 0x04; // write end, TTY-pipe (ProcessCreate: O_WRONLY)
     stdFds[1].handle = stdoutPipe;
 
     stdFds[2].type = FdType::Pipe;
-    stdFds[2].flags = 0x01 | 0x04; // write end, TTY-pipe
-    stdFds[2].statusFlags = 1; // O_WRONLY
+    stdFds[2].flags = 0x01 | 0x04; // write end, TTY-pipe (ProcessCreate: O_WRONLY)
     stdFds[2].handle = stdoutPipe;
 
     // Load bash ELF — try multiple known paths

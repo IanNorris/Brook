@@ -2,8 +2,9 @@
 static void FillFdSnapshot(FdSnapshot* out, const FdEntry& fde)
 {
     out->type = static_cast<uint8_t>(fde.type);
-    out->flags = fde.statusFlags;
-    out->seekPos = fde.seekPos;
+    // The fd lock keeps the slot, and so its description reference, alive.
+    out->flags = FdStatus(&fde);
+    out->seekPos = OpenFileOffset(fde.file);
     FdDiagnosticPath(fde,out->path,sizeof(out->path));
 }
 

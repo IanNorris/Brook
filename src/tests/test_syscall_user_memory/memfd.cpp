@@ -65,7 +65,7 @@ static void MemfdUnlockedCopies() {
     CHECK(kernel[5]==static_cast<uint8_t>(5*7));
     // sys_read on the descriptor uses the user path.
     auto* proc=CurrentProcess();
-    proc->fds[3].type=brook::FdType::MemFd;proc->fds[3].handle=g_mfd;proc->fds[3].statusFlags=2;
+    proc->fds[3].type=brook::FdType::MemFd;proc->fds[3].handle=g_mfd;Describe(proc->fds[3],2);
     g_userCopies=0;g_userCopyHook=MemfdCopyHook;
     CHECK(brook::sys_read(3,UserAddress(8*PageSize),64,0,0,0)==64);
     CHECK(g_userCopies>0 && g_copiesUnderLock==0);
@@ -79,7 +79,7 @@ static void TtyAndUnixStreamUnlockedCopies() {
     auto* in=brook::PipeBufferCreate(4096);auto* out=brook::PipeBufferCreate(4096);
     in->readers=in->writers=1;out->readers=out->writers=1;
     brook::TtyDevicePair pair{in,out};
-    proc->fds[4].type=brook::FdType::DevTty;proc->fds[4].handle=&pair;proc->fds[4].statusFlags=2;
+    proc->fds[4].type=brook::FdType::DevTty;proc->fds[4].handle=&pair;Describe(proc->fds[4],2);
     CHECK(in->write("hello",5)==5);
     g_copiesUnderLock=0;g_watchedPipe=in;g_userCopies=0;g_userCopyHook=PipeCopyHook;
     CHECK(brook::sys_read(4,UserAddress(0),16,0,0,0)==5);

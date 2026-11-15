@@ -23,6 +23,7 @@
 #include <stdint.h>
 
 #include "spinlock.h"
+#include "open_file.h"
 
 namespace brook {
 
@@ -65,21 +66,26 @@ enum class FdType : uint8_t
     IntelSyncObj,  // Capability retaining an Intel DRM sync object
 };
 
+// One descriptor slot. type/handle/flags are the immutable identity of the
+// open file description and are copied into every alias; the shared mutable
+// state (offset, status flags) lives in *file (H-20, see open_file.h).
 struct FdEntry
 {
     FdType   type;
-    uint8_t  flags;        // O_NONBLOCK, pipe direction, etc.
-    uint8_t  fdFlags;      // FD-level flags: FD_CLOEXEC (bit 0)
+    uint8_t  flags;        // Immutable per description: pipe direction, TTY-pipe marker
+    uint8_t  fdFlags;      // Per-descriptor flags: FD_CLOEXEC (bit 0)
     uint8_t  closing;      // BRO-156: a close() raced an active pin; the slot's
                            // teardown is deferred to the last FdPut. While set,
                            // FdGetRef/Pin refuses the slot (no new users).
-    uint32_t statusFlags;  // Linux O_* flags from open (for F_GETFL/F_SETFL)
     uint32_t pinCount;     // BRO-156: active fget/fput pins. A slot with pinCount>0
                            // must not be cleared or reused; close() defers until 0.
     void*    handle;       // VFS Vnode* or device-specific state
-    uint64_t seekPos;      // Current file offset (for lseek)
+    OpenFile* file;        // Shared description state; one reference per live slot
     char     dirPath[64];  // Bounded diagnostic label only; directory resolution uses retained vnode
 };
+
+// Linux O_* status flags of the slot's open file description (F_GETFL view).
+inline uint32_t FdStatus(const FdEntry* fd) { return OpenFileStatus(fd->file); }
 
 // Scalar reporting only; the caller protects the descriptor against reuse.
 inline void FdDiagnosticPath(const FdEntry& fd,char* out,uint32_t capacity)
@@ -111,6 +117,7 @@ struct FdClaimResult
     FdType   type;
     void*    handle;
     uint8_t  flags;
+    OpenFile* file;   // the slot's description reference, released with the handle
 };
 
 // Runs at logical close under the FD lock, before the slot becomes closing or
@@ -124,16 +131,16 @@ inline void FdSlotClear(FdEntry& e)
     e.flags       = 0;
     e.fdFlags     = 0;
     e.closing     = 0;
-    e.statusFlags = 0;
     e.handle      = nullptr;
     e.pinCount    = 0;
-    e.seekPos     = 0;
+    e.file        = nullptr;
     e.dirPath[0]  = '\0';
 }
 
 // Allocate the lowest free slot for (type, handle). Returns the fd index, or
-// -1 if the table is full (caller maps to -EMFILE).
-inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle)
+// -1 if the table is full (caller maps to -EMFILE). The slot adopts `file`.
+inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle,
+                        OpenFile* file = nullptr)
 {
     SpinLockAcquire(lock);
     for (uint32_t i = 0; i < MAX_FDS; ++i)
@@ -144,10 +151,9 @@ inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle)
             fds[i].flags       = 0;
             fds[i].fdFlags     = 0;
             fds[i].closing     = 0;
-            fds[i].statusFlags = 0;
             fds[i].pinCount    = 0;
             fds[i].handle      = handle;
-            fds[i].seekPos     = 0;
+            fds[i].file        = file;
             fds[i].dirPath[0]  = '\0';
             SpinLockRelease(lock);
             return static_cast<int>(i);
@@ -157,8 +163,9 @@ inline int FdTableAlloc(FdEntry* fds, SpinLock* lock, FdType type, void* handle)
     return -1;
 }
 
-// The caller pins source. Retain its handle before making a fully initialized
-// duplicate visible, under the same lock as allocation and close operations.
+// The caller pins source. Retain its handle and open file description before
+// making a fully initialized duplicate visible, under the same lock as
+// allocation and close operations. The duplicate shares source->file.
 inline int FdTableDuplicatePinned(FdEntry* fds, SpinLock* lock, const FdEntry* source,
                                  uint32_t minimum, uint8_t fdFlags,
                                  void (*retain)(FdEntry*))
@@ -199,7 +206,7 @@ inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owne
     if (fds[target].pinCount || fds[target].closing) {
         SpinLockRelease(lock); return -16;
     }
-    if (retired) *retired = {fds[target].type, fds[target].handle, fds[target].flags};
+    if (retired) *retired = {fds[target].type, fds[target].handle, fds[target].flags, fds[target].file};
     if (closing && fds[target].type!=FdType::None) closing(fds[target],context);
     FdEntry copy = owned;
     copy.pinCount = pinAtPublication ? 1 : 0;
@@ -219,7 +226,8 @@ inline int FdTablePublishOwnedPinned(FdEntry* fds, SpinLock* lock, const FdEntry
 }
 
 // The destination is private and initially empty. Retain each immutable copy
-// under the source lock; callers unwind any completed copies on failure.
+// (handle and shared open file description) under the source lock; callers
+// unwind any completed copies on failure.
 inline bool FdTableForkSnapshot(FdEntry* dst, FdEntry* src, SpinLock* lock,
                                 bool (*retain)(FdEntry*),
                                 void (*published)(int, const FdEntry&) = nullptr)
@@ -285,6 +293,7 @@ inline bool FdTableClaim(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* ou
         out->type   = fds[fd].type;
         out->handle = fds[fd].handle;
         out->flags  = fds[fd].flags;
+        out->file   = fds[fd].file;
     }
     FdSlotClear(fds[fd]);
     SpinLockRelease(lock);
@@ -350,6 +359,7 @@ inline bool FdTableUnpin(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* ou
             out->type   = fds[fd].type;
             out->handle = fds[fd].handle;
             out->flags  = fds[fd].flags;
+            out->file   = fds[fd].file;
         }
         FdSlotClear(fds[fd]);
         finalize = true;
@@ -386,6 +396,7 @@ inline FdCloseResult FdTableClose(FdEntry* fds, SpinLock* lock, int fd, FdClaimR
         out->type   = fds[fd].type;
         out->handle = fds[fd].handle;
         out->flags  = fds[fd].flags;
+        out->file   = fds[fd].file;
     }
     FdSlotClear(fds[fd]);
     SpinLockRelease(lock);

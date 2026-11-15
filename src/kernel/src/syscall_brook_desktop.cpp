@@ -230,7 +230,7 @@ int64_t sys_brook_scene_create(uint64_t window,uint64_t abi,uint64_t flags,
     if (!handle) return error;
     FdEntry owned{};owned.type=FdType::CompositorScene;owned.handle=handle;owned.fdFlags=1;
     SceneHandleRef(handle); // FD publication owns a reference independently of this call.
-    const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+    const int fd=FdPublishNew(proc,owned,0);
     if (fd<0) { SceneHandleUnref(handle);SceneHandleUnref(handle);return fd; }
     const bool activated=SceneActivate(handle);
     if (!activated) {

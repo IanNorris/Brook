@@ -303,18 +303,14 @@ int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         bool nonblock = requested != 0;
         if (fde->type == FdType::Socket || fde->type == FdType::NetlinkSocket || fde->type == FdType::UnixSocket ||
             FdPipe(fde) || fde->type == FdType::DevTty || fde->type == FdType::DevDsp) {
-            SpinLockAcquire(ProcessFdLock(proc));
-            if (nonblock)
-                fde->statusFlags |= 0x800; // O_NONBLOCK
-            else
-                fde->statusFlags &= ~0x800u;
+            // O_NONBLOCK of the shared open file description (H-20).
+            OpenFileUpdateStatus(fde->file, 0x800u, nonblock ? 0x800u : 0u);
             if(fde->type==FdType::NetlinkSocket && fde->handle)
                 __atomic_store_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,nonblock,__ATOMIC_RELEASE);
             if (fde->type == FdType::UnixSocket && fde->handle)
                 static_cast<UnixSocketData*>(fde->handle)->nonblock = nonblock;
             if (fde->type == FdType::Socket && fde->handle)
                 brook::SockSetNonblock(static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1, nonblock);
-            SpinLockRelease(ProcessFdLock(proc));
             return 0;
         }
         return -25; // ENOTTY

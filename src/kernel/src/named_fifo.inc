@@ -86,8 +86,8 @@ NamedFifoOpen* FdNamedFifo(const FdEntry* entry) {
     return entry && entry->type==FdType::Vnode && entry->handle && static_cast<Vnode*>(entry->handle)->streamPipe
         ?static_cast<NamedFifoOpen*>(static_cast<Vnode*>(entry->handle)->streamOwner):nullptr;
 }
-bool FdPipeRead(const FdEntry* entry) {return FdNamedFifo(entry)?(entry->statusFlags&3)!=1:!(entry->flags&1);}
-static bool FdPipeWrite(const FdEntry* entry) {return FdNamedFifo(entry)?(entry->statusFlags&3)!=0:(entry->flags&1)!=0;}
+bool FdPipeRead(const FdEntry* entry) {return FdNamedFifo(entry)?(FdStatus(entry)&3)!=1:!(entry->flags&1);}
+static bool FdPipeWrite(const FdEntry* entry) {return FdNamedFifo(entry)?(FdStatus(entry)&3)!=0:(entry->flags&1)!=0;}
 uint32_t NamedFifoReady(const FdEntry* entry,uint32_t events) {
     auto* opened=FdNamedFifo(entry);if(!opened)return 0;
     auto* pipe=opened->state->pipe;uint32_t ready=0;
