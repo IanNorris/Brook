@@ -70,9 +70,8 @@ int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
 
     if (oldlimitAddr)
     {
-        if (!UserBufferWritable(oldlimitAddr, sizeof(rlimit64))) return -EFAULT;
-        auto* old = reinterpret_cast<rlimit64*>(oldlimitAddr);
-        *old = ReportedResourceLimit(resource);
+        const rlimit64 old = ReportedResourceLimit(resource);
+        if (!CopyToUser(oldlimitAddr, &old, sizeof(old))) return -EFAULT;
     }
     return 0;
 }
@@ -112,15 +111,15 @@ int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
 int64_t sys_getrusage(uint64_t who, uint64_t usageAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t)
 {
-    if (!UserBufferWritable(usageAddr, 144)) return -EFAULT;
-    __builtin_memset(reinterpret_cast<void*>(usageAddr), 0, 144);
+    // Built in kernel memory, copied out once (144-byte struct rusage).
+    int64_t ru[18] = {};
+    if (!UserBufferWritable(usageAddr, sizeof(ru))) return -EFAULT;
 
     Process* proc = ProcessCurrent();
-    if (!proc) return 0;
+    if (!proc) return CopyToUser(usageAddr, ru, sizeof(ru)) ? 0 : -EFAULT;
 
     // struct rusage: first two fields are struct timeval (utime, stime)
     // timeval = { int64_t tv_sec; int64_t tv_usec; }
-    auto* ru = reinterpret_cast<int64_t*>(usageAddr);
 
     uint64_t uticks = proc->userTicks;
     uint64_t sticks = proc->sysTicks;
@@ -142,7 +141,7 @@ int64_t sys_getrusage(uint64_t who, uint64_t usageAddr, uint64_t,
         ru[2] = static_cast<int64_t>(reapedSys / 1000);
         ru[3] = static_cast<int64_t>((reapedSys % 1000) * 1000);
     }
-    return 0;
+    return CopyToUser(usageAddr, ru, sizeof(ru)) ? 0 : -EFAULT;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +167,8 @@ int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
         uint64_t freehigh;
         uint32_t mem_unit;
     };
-    if (!UserBufferWritable(infoAddr, sizeof(sysinfo_s))) return -EFAULT;
-    auto* info = reinterpret_cast<sysinfo_s*>(infoAddr);
-    __builtin_memset(info, 0, sizeof(sysinfo_s));
+    sysinfo_s staged{};
+    auto* info = &staged;
 
     info->uptime = static_cast<int64_t>(ApicTickCount() / 1000);
 
@@ -193,7 +191,7 @@ int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
     info->loads[2] = static_cast<uint64_t>(avg15) * 65536 / 1000;
 
     info->mem_unit = 1;
-    return 0;
+    return CopyToUser(infoAddr, &staged, sizeof(staged)) ? 0 : -EFAULT;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,8 +205,7 @@ int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
     // clock_t is int64_t on x86_64, 4 fields = 32 bytes
     if (bufAddr)
     {
-        if (!UserBufferWritable(bufAddr, 32)) return -EFAULT;
-        auto* tms = reinterpret_cast<int64_t*>(bufAddr);
+        int64_t tms[4] = {};
 
         Process* proc = ProcessCurrent();
         if (proc)
@@ -226,6 +223,7 @@ int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
         SchedulerGetReapedTicks(reapedUser, reapedSys);
         tms[2] = static_cast<int64_t>(reapedUser); // tms_cutime
         tms[3] = static_cast<int64_t>(reapedSys);  // tms_cstime
+        if (!CopyToUser(bufAddr, tms, sizeof(tms))) return -EFAULT;
     }
 
     // Return value: clock ticks since boot
@@ -239,9 +237,8 @@ int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
 int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t)
 {
-    if (!UserBufferWritable(rlimAddr, 16)) return -EFAULT;
-    *reinterpret_cast<rlimit64*>(rlimAddr) = ReportedResourceLimit(resource);
-    return 0;
+    const rlimit64 limit = ReportedResourceLimit(resource);
+    return CopyToUser(rlimAddr, &limit, sizeof(limit)) ? 0 : -EFAULT;
 }
 
 } // namespace brook

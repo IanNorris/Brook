@@ -518,8 +518,8 @@ static int ParseWaitTimeout(uint64_t address, bool nanoseconds, uint64_t* timeou
 {
     *timeoutMs = ~0ULL;
     if (!address) return 0;
-    if (!UserBufferReadable(address, 2 * sizeof(int64_t))) return -EFAULT;
-    auto* value = reinterpret_cast<const int64_t*>(address);
+    int64_t value[2];
+    if (!CopyFromUser(value, address, sizeof(value))) return -EFAULT;
     int64_t sec = value[0], fraction = value[1];
     int64_t scale = nanoseconds ? 1000000000LL : 1000000LL;
     if (sec < 0 || fraction < 0 || fraction >= scale) return -EINVAL;
@@ -537,13 +537,11 @@ static int64_t PollUser(uint64_t fdsAddr, uint64_t nfds, uint64_t timeoutMs)
     if (bytes && (!UserBufferReadable(fdsAddr, bytes) || !UserBufferWritable(fdsAddr, bytes)))
         return -EFAULT;
     pollfd fds[MAX_FDS];
-    if (bytes) memcpy(fds, reinterpret_cast<const void*>(fdsAddr), bytes);
+    if (bytes && !CopyFromUser(fds, fdsAddr, bytes)) return -EFAULT;
     int64_t result = PollWait(fds, nfds, timeoutMs);
-    if (result >= 0 && bytes) {
-        if (!UserBufferWritable(fdsAddr, bytes)) return -EFAULT;
-        auto* user = reinterpret_cast<pollfd*>(fdsAddr);
-        for (uint64_t i = 0; i < nfds; ++i) user[i].revents = fds[i].revents;
-    }
+    // One checked copy of the whole array: fd and events are written back
+    // unchanged from the snapshot taken above, revents with the results.
+    if (result >= 0 && bytes && !CopyToUser(fdsAddr, fds, bytes)) return -EFAULT;
     return result;
 }
 
@@ -580,9 +578,8 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     uint64_t bytes = ((nfds + 63) / 64) * sizeof(uint64_t);
     for (uint32_t set = 0; set < 3; ++set) {
         if (!addresses[set] || !bytes) continue;
-        if (!UserBufferReadable(addresses[set], bytes) ||
-            !UserBufferWritable(addresses[set], bytes)) return -EFAULT;
-        memcpy(inputs[set], reinterpret_cast<const void*>(addresses[set]), bytes);
+        if (!UserBufferWritable(addresses[set], bytes) ||
+            !CopyFromUser(inputs[set], addresses[set], bytes)) return -EFAULT;
     }
     uint64_t timeoutMs;
     int error = ParseWaitTimeout(timeoutAddr, nanoseconds, &timeoutMs);
@@ -605,12 +602,11 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     uint64_t started = ClockNowNs(1);
     int64_t result = PollWait(fds, count, timeoutMs, true);
     if (timeoutAddr && !nanoseconds) {
-        if (!UserBufferWritable(timeoutAddr, 16)) return -EFAULT;
         uint64_t elapsed = (ClockNowNs(1) - started) / 1000000ULL;
         uint64_t remaining = elapsed < timeoutMs ? timeoutMs - elapsed : 0;
-        auto* value = reinterpret_cast<int64_t*>(timeoutAddr);
-        value[0] = static_cast<int64_t>(remaining / 1000);
-        value[1] = static_cast<int64_t>((remaining % 1000) * 1000);
+        const int64_t value[2] = {static_cast<int64_t>(remaining / 1000),
+                                  static_cast<int64_t>((remaining % 1000) * 1000)};
+        if (!CopyToUser(timeoutAddr, value, sizeof(value))) return -EFAULT;
     }
     if (result < 0) return result;
     int readyBits = 0;
@@ -628,8 +624,7 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
     }
     for (uint32_t set = 0; set < 3; ++set) {
         if (!addresses[set] || !bytes) continue;
-        if (!UserBufferWritable(addresses[set], bytes)) return -EFAULT;
-        memcpy(reinterpret_cast<void*>(addresses[set]), outputs[set], bytes);
+        if (!CopyToUser(addresses[set], outputs[set], bytes)) return -EFAULT;
     }
     return readyBits;
 }
@@ -647,8 +642,7 @@ int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
         // The sixth Linux argument points to {sigset pointer, sigset size},
         // rather than directly to a sigset as in ppoll/epoll_pwait.
         struct MaskArgument { uint64_t address; uint64_t size; } argument;
-        if (!UserBufferReadable(sigmaskAddr, sizeof(argument))) return -EFAULT;
-        memcpy(&argument, reinterpret_cast<const void*>(sigmaskAddr), sizeof(argument));
+        if (!CopyFromUser(&argument, sigmaskAddr, sizeof(argument))) return -EFAULT;
         int error = InstallWaitSignalMask(argument.address, argument.size);
         if (error) return error;
     }

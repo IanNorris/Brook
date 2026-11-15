@@ -379,7 +379,8 @@ int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
         return -EFAULT;
 
     CloneArgs copied{};
-    __builtin_memcpy(&copied,reinterpret_cast<const void*>(argsPtr),size<sizeof(copied)?size:sizeof(copied));
+    if (!CopyFromUser(&copied, argsPtr, size < sizeof(copied) ? size : sizeof(copied)))
+        return -EFAULT;
     const CloneArgs* ca = &copied;
     const uint64_t cloneFlags=ca->flags;
     // CLONE_NEWTIME occupies an exit-signal bit in legacy clone, but it is an
@@ -394,8 +395,11 @@ int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
     if(cloneFlags&(0x00020000|0x10000000)) {
-        for(uint64_t i=sizeof(CloneArgs);i<size;++i)
-            if(reinterpret_cast<const uint8_t*>(argsPtr)[i])return -E2BIG;
+        for(uint64_t i=sizeof(CloneArgs);i<size;++i) {
+            uint8_t byte=0;
+            if(!CopyFromUser(&byte,argsPtr+i,1))return -EFAULT;
+            if(byte)return -E2BIG;
+        }
         if((cloneFlags&0xff) || ca->exit_signal!=17 || ca->pidfd || ca->set_tid || ca->set_tid_size || ca->cgroup)return -EINVAL;
         if(ca->stack && ca->stack_size>~uint64_t{0}-ca->stack)return -EINVAL;
         return sys_clone(cloneFlags|ca->exit_signal,stackTop,ca->parent_tid,ca->child_tid,ca->tls,0);
@@ -428,15 +432,17 @@ static_assert(sizeof(WaitSiginfo) == 128, "Linux siginfo size");
 static_assert(__builtin_offsetof(WaitSiginfo, pid) == 16, "Linux SIGCHLD pid");
 static_assert(__builtin_offsetof(WaitSiginfo, status) == 24, "Linux SIGCHLD status");
 
-static void CopyWaitUsage(uint64_t address, const ChildWaitSnapshot& event)
+// Like Linux, the child is already reaped when the outputs are copied, so a
+// raced unmap reports -EFAULT but cannot undo the wait.
+static bool CopyWaitUsage(uint64_t address, const ChildWaitSnapshot& event)
 {
-    if (!address) return;
+    if (!address) return true;
     int64_t usage[18]{}; // Linux x86-64 rusage (144 bytes), tracked CPU ticks.
     usage[0] = event.userTicks / 1000;
     usage[1] = (event.userTicks % 1000) * 1000;
     usage[2] = event.sysTicks / 1000;
     usage[3] = (event.sysTicks % 1000) * 1000;
-    memcpy(reinterpret_cast<void*>(address), usage, sizeof(usage));
+    return CopyToUser(address, usage, sizeof(usage));
 }
 
 static bool ChildWaitInterrupted(Process* caller)
@@ -486,8 +492,9 @@ int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t rawOptions,
     ChildWaitSnapshot event{};
     int result = WaitChildEvent(parent, selector, id, options | WEXITED, &event);
     if (result <= 0) return result;
-    if (statusAddr) *reinterpret_cast<int32_t*>(statusAddr) = event.status;
-    CopyWaitUsage(usageAddr, event);
+    const int32_t status = event.status;
+    if (statusAddr && !CopyToUser(statusAddr, &status, sizeof(status))) return -EFAULT;
+    if (!CopyWaitUsage(usageAddr, event)) return -EFAULT;
     return event.pid;
 }
 
@@ -520,9 +527,9 @@ int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAddr,
                       event.code == 6 ? 18 : event.status & 0x7f;
         info.userTime = event.userTicks / 10; // Linux USER_HZ = 100.
         info.systemTime = event.sysTicks / 10;
-        CopyWaitUsage(usageAddr, event);
+        if (!CopyWaitUsage(usageAddr, event)) return -EFAULT;
     }
-    if (infoAddr) memcpy(reinterpret_cast<void*>(infoAddr), &info, sizeof(info));
+    if (infoAddr && !CopyToUser(infoAddr, &info, sizeof(info))) return -EFAULT;
     return 0;
 }
 

@@ -514,7 +514,7 @@ static int64_t FileRecordLock(Process* proc,FdEntry* entry,uint64_t cmd,uint64_t
     if(!object)return -95;
     if(!UserBufferReadable(address,sizeof(LinuxFlock)) ||
        (cmd==5 && !UserBufferWritable(address,sizeof(LinuxFlock))))return -EFAULT;
-    LinuxFlock input;memcpy(&input,reinterpret_cast<void*>(address),sizeof(input));
+    LinuxFlock input;if(!CopyFromUser(&input,address,sizeof(input)))return -EFAULT;
     if(input.type<0 || input.type>2 || (cmd==5 && input.type==2))return -EINVAL;
     uint64_t size=0;
     if(input.whence==2) {
@@ -551,7 +551,7 @@ static int64_t FileRecordLock(Process* proc,FdEntry* entry,uint64_t cmd,uint64_t
                          conflict.range.end-conflict.range.begin+1;
             input.pid=conflict.owner.pid;
         } else input.type=2;
-        memcpy(reinterpret_cast<void*>(address),&input,sizeof(input));
+        if(!CopyToUser(address,&input,sizeof(input)))return -EFAULT;
     }
     return 0;
 }

@@ -409,8 +409,7 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     if (watchref->type == FdType::EpollFd && watchref->handle == ep) return -EINVAL;
     EpollEvent ev{};
     if (op != EPOLL_CTL_DEL) {
-        if (!UserBufferReadable(eventAddr, sizeof(ev))) return -EFAULT;
-        __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
+        if (!CopyFromUser(&ev, eventAddr, sizeof(ev))) return -EFAULT;
     }
     // Regular files have poll() readiness but cannot be watched by epoll.
     // Accepting them produces perpetual readiness and prevents async runtimes

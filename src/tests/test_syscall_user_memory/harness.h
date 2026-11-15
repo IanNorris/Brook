@@ -53,6 +53,9 @@ extern unsigned g_userCopies;
 // and an interruptible block that returns with a pending signal).
 extern void (*g_wakeHook)(brook::Process*);
 extern void (*g_blockInterruptibleHook)(brook::Process*);
+// Simulate a sibling munmap between UserBuffer* validation and the access.
+extern bool g_raceUnmapAfterCheck;
+extern unsigned g_racedUnmaps;
 inline bool SpinLockHeld(const brook::SpinLock& lock) { return lock.next!=lock.serving; }
 
 // Count of user-copy calls that were refused because they hit kernel memory.
@@ -87,3 +90,4 @@ void RunUnixTests();
 void RunProcessTests();
 void RunMemfdTests();
 void RunWaitTests();
+void RunValidateRaceTests();

@@ -437,6 +437,7 @@ add_host_test(test_syscall_user_memory
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/process.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/memfd.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/wait.cpp"
+    "${BROOK_ROOT}/src/tests/test_syscall_user_memory/race.cpp"
     "${BROOK_ROOT}/src/tests/test_syscall_user_memory/fakes.cpp")
 target_compile_options(test_syscall_user_memory PRIVATE -DBROOK_HOST_TEST
     -ffunction-sections -fdata-sections -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter

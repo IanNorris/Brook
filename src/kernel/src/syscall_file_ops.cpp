@@ -222,8 +222,8 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAddr,
     VnodeTime times[2] = {{0, VFS_UTIME_NOW}, {0, VFS_UTIME_NOW}};
     if (timesAddr) {
         struct UserTime { int64_t sec, nsec; };
-        if (!UserBufferReadable(timesAddr, 2 * sizeof(UserTime))) return -EFAULT;
-        const auto* userTimes = reinterpret_cast<const UserTime*>(timesAddr);
+        UserTime userTimes[2];
+        if (!CopyFromUser(userTimes, timesAddr, sizeof(userTimes))) return -EFAULT;
         for (int i = 0; i < 2; ++i) {
             UserTime value = userTimes[i];
             if (value.nsec != VFS_UTIME_NOW && value.nsec != VFS_UTIME_OMIT &&

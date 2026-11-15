@@ -22,6 +22,8 @@ KernelCanary g_kernel;
 unsigned g_refusedKernelCopies;
 void (*g_userCopyHook)(uint64_t,uint64_t,bool);
 void (*g_wakeHook)(brook::Process*);
+bool g_raceUnmapAfterCheck;
+unsigned g_racedUnmaps;
 void (*g_blockInterruptibleHook)(brook::Process*);
 unsigned g_userCopies;
 
@@ -42,7 +44,8 @@ void Reset() {
     g_kernel.Fill();
     g_refusedKernelCopies=0;
     g_userCopyHook=nullptr;g_userCopies=0;
-    g_wakeHook=nullptr;g_blockInterruptibleHook=nullptr;brook::g_pendingSignals=false;
+    g_wakeHook=nullptr;g_blockInterruptibleHook=nullptr;
+    g_raceUnmapAfterCheck=false;g_racedUnmaps=0;brook::g_pendingSignals=false;
 }
 uint64_t UserBase() { return reinterpret_cast<uint64_t>(g_arena); }
 uint64_t UserAddress(uint64_t offset) { return UserBase()+offset; }
@@ -101,11 +104,21 @@ void SchedulerKernelRegionLeave(Process*) {}
 UserAccessScope::UserAccessScope(Process*) {}
 UserAccessScope::~UserAccessScope() {}
 
+// With g_raceUnmapAfterCheck set, a successful validation is followed by a
+// simulated sibling munmap of the range: a handler that dereferences after
+// validating then "writes into unmapped memory", which the tests detect.
+static bool RaceAfterCheck(uint64_t address,uint64_t length) {
+    if(harness::g_raceUnmapAfterCheck && length) {
+        harness::Protect(address-harness::UserBase(),length,Access::None);
+        ++harness::g_racedUnmaps;
+    }
+    return true;
+}
 bool UserBufferReadable(uint64_t address,uint64_t length) {
-    return harness::InArena(address,length,Access::Read) || harness::Refuse(address);
+    return (harness::InArena(address,length,Access::Read) && RaceAfterCheck(address,length)) || harness::Refuse(address);
 }
 bool UserBufferWritable(uint64_t address,uint64_t length) {
-    return harness::InArena(address,length,Access::ReadWrite) || harness::Refuse(address);
+    return (harness::InArena(address,length,Access::ReadWrite) && RaceAfterCheck(address,length)) || harness::Refuse(address);
 }
 uint64_t CopyFromUserBytes(void* destination,uint64_t source,uint64_t length) {
     ++harness::g_userCopies;if(harness::g_userCopyHook)harness::g_userCopyHook(source,length,false);
@@ -164,6 +177,7 @@ int main() {
     RunProcessTests();
     RunMemfdTests();
     RunWaitTests();
+    RunValidateRaceTests();
     if(harness::Failures()) { fprintf(stderr,"%u failure(s)\n",harness::Failures());return 1; }
     printf("test_syscall_user_memory: all passed\n");
     return 0;

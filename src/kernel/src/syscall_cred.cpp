@@ -77,14 +77,12 @@ static bool EmptyCapabilitiesSupported(Process* proc) {
     return ids.real != 0 && ids.effective != 0 && ids.saved != 0;
 }
 static int CapabilityWords(uint64_t header, bool queryOnly) {
-    if (!UserBufferReadable(header, sizeof(uint32_t))) return -EFAULT;
     uint32_t version;
-    memcpy(&version, reinterpret_cast<const void*>(header), sizeof(version));
+    if (!CopyFromUser(&version, header, sizeof(version))) return -EFAULT;
     if (version == 0x19980330U) return 3; // V1: one 3-word structure.
     if (version == 0x20071026U || version == 0x20080522U) return 6; // V2/V3.
-    if (!UserBufferWritable(header, sizeof(uint32_t))) return -EFAULT;
     version = 0x20080522U;
-    memcpy(reinterpret_cast<void*>(header), &version, sizeof(version));
+    if (!CopyToUser(header, &version, sizeof(version))) return -EFAULT;
     // Linux permits version discovery using capget(header, NULL).
     return queryOnly ? 0 : -EINVAL;
 }
@@ -97,17 +95,15 @@ int64_t sys_capget(uint64_t header, uint64_t data, uint64_t,
     int words = CapabilityWords(header, !data);
     if (words <= 0) return words;
     if (!data) return 0; // Valid-version null data does not require the PID field.
-    if (!UserBufferReadable(header + sizeof(uint32_t), sizeof(int32_t))) return -EFAULT;
     int32_t pid;
-    memcpy(&pid, reinterpret_cast<const void*>(header + sizeof(uint32_t)), sizeof(pid));
+    if (!CopyFromUser(&pid, header + sizeof(uint32_t), sizeof(pid))) return -EFAULT;
     if (pid < 0) return -EINVAL;
     if (pid && pid != proc->pid) return -ENOSYS; // Foreign queries not implemented.
-    if (!UserBufferWritable(data, words * sizeof(uint32_t))) return -EFAULT;
     uint32_t values[6]={};
     if(privateCaps)for(unsigned i=0;i<unsigned(words/3);++i) {
         values[i*3]=capabilities.effective>>(i*32);values[i*3+1]=capabilities.permitted>>(i*32);values[i*3+2]=capabilities.inheritable>>(i*32);
     }
-    memcpy(reinterpret_cast<void*>(data),values,words*sizeof(uint32_t));return 0;
+    return CopyToUser(data,values,words*sizeof(uint32_t))?0:-EFAULT;
 }
 int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
                    uint64_t, uint64_t, uint64_t) {
@@ -117,13 +113,11 @@ int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
     if (!privateCaps && !EmptyCapabilitiesSupported(proc)) return -ENOSYS;
     int words = CapabilityWords(header, false);
     if (words < 0) return words;
-    if (!UserBufferReadable(header + sizeof(uint32_t), sizeof(int32_t))) return -EFAULT;
     int32_t pid;
-    memcpy(&pid, reinterpret_cast<const void*>(header + sizeof(uint32_t)), sizeof(pid));
+    if (!CopyFromUser(&pid, header + sizeof(uint32_t), sizeof(pid))) return -EFAULT;
     if (pid && pid != proc->pid) return -EPERM;
     uint32_t values[6] = {};
-    if (!UserBufferReadable(data, words * sizeof(uint32_t))) return -EFAULT;
-    memcpy(values, reinterpret_cast<const void*>(data), words * sizeof(uint32_t));
+    if (!CopyFromUser(values, data, words * sizeof(uint32_t))) return -EFAULT;
     if(privateCaps) {
         const uint64_t effective=values[0]|(uint64_t{values[3]}<<32),permitted=values[1]|(uint64_t{values[4]}<<32),inheritable=values[2]|(uint64_t{values[5]}<<32);
         return ProcessSetCapabilities(proc,effective,permitted,inheritable);
@@ -145,7 +139,10 @@ int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
     if (capacity < 0 || (capacity && static_cast<uint32_t>(capacity) < count)) return -EINVAL;
     if (!capacity) return count;
     if (!UserBufferWritable(listAddr, uint64_t(count) * sizeof(uint32_t))) return -EFAULT;
-    for(uint32_t i=0;i<count;++i)reinterpret_cast<uint32_t*>(listAddr)[i]=ProcessReportId(proc,true,snapshot.groups->ids[i]);
+    for(uint32_t i=0;i<count;++i) {
+        const uint32_t id=ProcessReportId(proc,true,snapshot.groups->ids[i]);
+        if(!CopyToUser(listAddr+uint64_t(i)*sizeof(id),&id,sizeof(id)))return -EFAULT;
+    }
     return count;
 }
 static void SortGroupIds(uint32_t* ids, uint32_t count) {
@@ -177,7 +174,7 @@ int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
         groups = static_cast<SupplementaryGroups*>(kmalloc(sizeof(SupplementaryGroups) + (count - 1) * sizeof(uint32_t)));
         if (!groups) return -ENOMEM;
         groups->references = 1; groups->count = count;
-        memcpy(groups->ids, reinterpret_cast<const void*>(listAddr), count * sizeof(uint32_t));
+        if (!CopyFromUser(groups->ids, listAddr, count * sizeof(uint32_t))) { kfree(groups); return -EFAULT; }
         for (uint32_t i = 0; i < count; ++i) {
             groups->ids[i]=ProcessResolveId(proc,true,groups->ids[i]);
             if (groups->ids[i] == CredentialUnchanged) { kfree(groups); return -EINVAL; }
@@ -197,9 +194,10 @@ static int64_t GetResIds(bool group, uint64_t real, uint64_t effective, uint64_t
     if (!UserBufferWritable(real, 4) || !UserBufferWritable(effective, 4) || !UserBufferWritable(saved, 4))
         return -EFAULT;
     const auto ids = ProcessReadIds(proc, group);
-    *reinterpret_cast<uint32_t*>(real) = ProcessReportId(proc,group,ids.real);
-    *reinterpret_cast<uint32_t*>(effective) = ProcessReportId(proc,group,ids.effective);
-    *reinterpret_cast<uint32_t*>(saved) = ProcessReportId(proc,group,ids.saved);
+    const uint32_t values[3] = {ProcessReportId(proc,group,ids.real),
+        ProcessReportId(proc,group,ids.effective),ProcessReportId(proc,group,ids.saved)};
+    if (!CopyToUser(real, &values[0], 4) || !CopyToUser(effective, &values[1], 4) ||
+        !CopyToUser(saved, &values[2], 4)) return -EFAULT;
     return 0;
 }
 int64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t) {

@@ -8,6 +8,10 @@
 #include "syscall_poll.h"
 #include "syscall_epoll.h"
 #include "audio.h"
+#include "posix_timer.h"
+#include "kvmclock.h"
+#include "tsc_clock.h"
+#include "rtc.h"
 #include "syscall_dsp.h"
 #include "dsp_producer_timing.h"
 #include "serial_writer.h"
@@ -88,7 +92,6 @@ AudioStreamId AudioMixerOpen() { return 0; }
 bool AudioMixerClose(AudioStreamId) { return true; }
 bool AudioMixerSetCapacity(AudioStreamId,uint32_t,uint32_t) { return false; }
 bool AudioAvailable() { return false; }
-uint64_t ClockNowNs(uint64_t) { return 0; }
 uint32_t DebugOverlayReadFrom(uint32_t*,char*,uint32_t,uint32_t) { return 0; }
 void InputAddWaiter(Process*) {}
 void InputRemoveWaiter(Process*) {}
@@ -125,6 +128,19 @@ Process* SchedulerCurrentProcess() { return ProcessCurrent(); }
 void SerialWriterEnqueue(const char*,uint32_t) {}
 int SockSend(int,const void*,uint32_t) { return -EIO; }
 int VfsFsync(Vnode*) { return 0; }
+
+// Clocks and system counters (for syscall_time.cpp / syscall_sysinfo.cpp).
+bool KvmClockAvailable() { return false; }
+uint64_t KvmClockReadNs() { return 0; }
+bool TscClockAvailable() { return false; }
+uint64_t TscClockReadNs() { return 0; }
+uint64_t RtcNowNs() { return 0; }
+int PosixTimerGet(Process*,int32_t,PosixItimerspec*) { return -EINVAL; }
+uint64_t PmmGetFreePageCount() { return 1; }
+uint64_t PmmGetRamPageCount() { return 2; }
+void SchedulerGetLoadAvg(uint32_t& a,uint32_t& b,uint32_t& c) { a=b=c=0; }
+void SchedulerGetProcessCounts(uint32_t& total,uint32_t& running) { total=running=1; }
+void SchedulerGetReapedTicks(uint64_t& user,uint64_t& system) { user=system=0; }
 
 // Inet sockets: one fake UDP/TCP socket, observable through g_net. The
 // stack only ever receives kernel buffers.
