@@ -64,7 +64,7 @@ uint32_t SyscallCategory(uint64_t num)
     }
 }
 
-static const char* SyscallName(uint64_t num)
+const char* SyscallNameOrNull(uint64_t num)
 {
     switch (num) {
     case 0: return "read";        case 1: return "write";
@@ -159,7 +159,7 @@ int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
                                uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     Process* proc = ProcessCurrent();
-    const char* name = SyscallName(num);
+    const char* name = SyscallNameOrNull(num);
 
     // Rate-limit: suppress repeated identical error syscalls to prevent
     // stack/serial flood (e.g. writes to a closed fd in a tight loop).

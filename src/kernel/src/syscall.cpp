@@ -22,6 +22,8 @@
 #include "syscall_strace.h"
 #include "syscall_dispatch.h"
 #include "syscall_handlers.h"
+#include "compat_census.h"
+#include "compat_census_runtime.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
@@ -271,6 +273,8 @@ static int64_t sys_not_implemented(uint64_t, uint64_t, uint64_t,
     if (n < 8 || (n & 0xFF) == 0)
         SerialPrintf("UNIMPL: syscall %lu from pid %u ('%s') [#%u]\n",
                      syscallNum, proc ? proc->pid : 0, proc ? proc->name : "?", n);
+    // Every hit is also counted per syscall and process in the compat
+    // census (compat_census.cpp), which the dispatcher feeds.
     return -ENOSYS;
 }
 
@@ -631,8 +635,8 @@ uint64_t SyscallGetEntryPoint()
     return reinterpret_cast<uint64_t>(&BrookSyscallDispatcher);
 }
 
-int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
-                                 uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+static int64_t SyscallDispatchBody(uint64_t num, uint64_t a0, uint64_t a1,
+                                   uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     Process* proc = ProcessCurrent();
     SyscallTimingCall timing(proc?proc->pid:0,proc?proc->incarnation:0,num,a0,SyscallTimingPhase::Dispatch,num==SYS_IOCTL?a1:0);
@@ -664,6 +668,29 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
     // RequestServer uses the same explicitly enabled, filtered strace path
     // as every other process; no process-name-specific logging here.
     return timing.Result(fn(a0, a1, a2, a3, a4, a5));
+}
+
+static uint64_t SyscallCensusOrigin(uint64_t num)
+{
+    if (num >= SYSCALL_MAX) return CompatOriginOutOfRange;
+    const SyscallFn fn = g_syscallTable[num];
+    if (fn == sys_not_implemented) return CompatOriginUnimplemented;
+    if (fn == sys_enosys_quiet) return CompatOriginQuiet;
+    return CompatOriginHandler;
+}
+
+int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
+                                 uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    const int64_t result = SyscallDispatchBody(num, a0, a1, a2, a3, a4, a5);
+    // Success path: one compare. rt_sigreturn returns the restored user RAX,
+    // which is not a syscall result.
+    if (__builtin_expect(static_cast<uint64_t>(result) >= static_cast<uint64_t>(-4095), 0) &&
+        num != SYS_RT_SIGRETURN) {
+        const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
+        CompatCensusObserve(num, result, args, SyscallCensusOrigin(num));
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

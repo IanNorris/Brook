@@ -316,6 +316,8 @@ add_executable(kernel
     src/syscall_futex.cpp
     src/syscall_cred.cpp
     src/syscall_sysinfo.cpp
+    src/compat_census.cpp
+    src/lastlog.cpp
     src/syscall_sysv_ipc.cpp
     src/syscall_brook_system.cpp
     src/syscall_brook_wm.cpp

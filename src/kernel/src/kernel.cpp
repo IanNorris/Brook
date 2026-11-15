@@ -1,3 +1,4 @@
+#include "lastlog.h"
 #include "desktop_identity.h"
 namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart(); }
 #ifdef BROOK_DELL_ACPI_MONITOR
@@ -1168,6 +1169,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the profiler kernel thread (sampling disabled until ProfilerStart).
         brook::ProfilerInit();
+
+        // Persist the kernel log tail and compat census for post-hang reading.
+        brook::LastLogStart();
 
         // Execute the boot script if present.
         // This may call ProfilerStart() via the "profile" command,
