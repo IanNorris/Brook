@@ -123,6 +123,9 @@ static SynapticsIdentity    g_synId;
 static SynapticsCaps        g_synCaps;
 static uint8_t              g_synMode = 0;
 static uint8_t              g_synModeReadback = 0;
+// Raw 3-byte replies: identify, capabilities, ext 0x09, ext 0x0c, modes; bit i of g_synRawValid set when reply i was read.
+static uint8_t              g_synRaw[5][3];
+static uint8_t              g_synRawValid = 0;
 static const char*          g_synReason = "not attempted";
 static SynapticsGesture     g_synGesture;
 static volatile uint32_t    g_synPackets = 0, g_synResyncs = 0, g_synScrollTicks = 0;
@@ -421,26 +424,45 @@ static void NegotiateRelative()
     MouseCmd(0x03);
 }
 
+static bool SynRawQuery(unsigned slot, uint8_t query, uint8_t r[3])
+{
+    if (!SynQuery(query, r)) return false;
+    for (int i = 0; i < 3; ++i) g_synRaw[slot][i] = r[i];
+    g_synRawValid |= uint8_t(1u << slot);
+    return true;
+}
+
+// Identify and capability queries only (no mode change).
+static bool SynapticsQueryAll(SynapticsCaps& caps)
+{
+    uint8_t r[3];
+    g_synRawValid = 0;
+    if (!SynRawQuery(0, SynQueryIdentify, r)) { g_synReason = "identify query failed"; return false; }
+    g_synId = SynapticsDecodeIdentify(r);
+    if (!g_synId.valid) { g_synReason = "not a Synaptics pad"; return false; }
+    if (!SynRawQuery(1, SynQueryCapabilities, r)) { g_synReason = "capabilities query failed"; return false; }
+    caps = SynapticsDecodeCaps(r, g_synId);
+    g_synCaps = caps;
+    if (!caps.valid) { g_synReason = "capabilities invalid"; return false; }
+    if (caps.extRequests() >= 1 && SynRawQuery(2, SynQueryExtCap, r)) caps.ext = SynapticsWord(r);
+    if (caps.extRequests() >= 4 && SynRawQuery(3, SynQueryExtCap0C, r)) caps.ext0c = SynapticsWord(r);
+    g_synCaps = caps;
+    return true;
+}
+
 static bool SynapticsTryEnable()
 {
     uint8_t r[3];
     g_synModeReadback = 0;
-    if (!SynQuery(SynQueryIdentify, r)) { g_synReason = "identify query failed"; return false; }
-    g_synId = SynapticsDecodeIdentify(r);
-    if (!g_synId.valid) { g_synReason = "not a Synaptics pad"; return false; }
-    if (!SynQuery(SynQueryCapabilities, r)) { g_synReason = "capabilities query failed"; return false; }
-    SynapticsCaps caps = SynapticsDecodeCaps(r);
-    if (!caps.valid) { g_synReason = "capabilities invalid"; return false; }
-    if (caps.extRequests() >= 1 && SynQuery(SynQueryExtCap, r)) caps.ext = SynapticsWord(r);
-    if (caps.extRequests() >= 4 && SynQuery(SynQueryExtCap0C, r)) caps.ext0c = SynapticsWord(r);
-    g_synCaps = caps;
+    SynapticsCaps caps;
+    if (!SynapticsQueryAll(caps)) return false;
     const uint8_t mode = SynapticsModeByte(caps);
     if (!SynSetMode(mode)) { g_synReason = "mode set failed"; (void)SynSetMode(0); return false; }
-    if (!SynQuery(SynQueryModes, r) || r[1] != 0x47) { g_synReason = "modes query failed"; (void)SynSetMode(0); return false; }
+    if (!SynRawQuery(4, SynQueryModes, r)) { g_synReason = "modes query failed"; (void)SynSetMode(0); return false; }
     g_synModeReadback = r[2];
     if (!(r[2] & SynModeAbsolute)) { g_synReason = "absolute mode not confirmed"; (void)SynSetMode(0); return false; }
     g_synMode = mode;
-    g_synReason = "active";
+    g_synReason = caps.extended() ? "active" : "active (no W: two-finger scroll unavailable)";
     SerialPrintf("MOUSE: Synaptics %u.%u model %u caps=0x%06x ext=0x%06x ext0c=0x%06x clickpad=%u mode=0x%02x\n",
                  g_synId.major, g_synId.minor, g_synId.model, caps.caps, caps.ext, caps.ext0c,
                  caps.clickpad() ? 1u : 0u, mode);
@@ -663,6 +685,32 @@ bool MouseTouchpadSet(bool synaptics)
     return ok;
 }
 
+// Read-only diagnostic: pause reporting, rerun the identify/capability/modes
+// queries and record the raw replies, then resume in the current mode.
+bool MouseTouchpadProbe()
+{
+    if (!g_mouseInit) return false;
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
+    IoApicMaskIrq(12);
+    IoApicMaskIrq(1);
+    (void)AuxCommand(0xF5);
+    for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
+    const char* reason = g_synReason;
+    SynapticsCaps caps;
+    bool ok = SynapticsQueryAll(caps);
+    uint8_t r[3];
+    if (ok) ok = SynRawQuery(4, SynQueryModes, r);
+    if (g_synActive) g_synReason = reason;      // keep the live state's reason
+    (void)AuxCommand(0xF4);
+    for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
+    g_packetIdx = 0;
+    IoApicUnmaskIrq(1, KBD_IRQ_VECTOR);
+    IoApicUnmaskIrq(12, MOUSE_IRQ_VECTOR);
+    if (flags & (1ull << 9)) __asm__ volatile("sti":::"memory");
+    return ok;
+}
+
 void MouseTouchpadSetNatural(bool natural)
 {
     auto cfg = g_synGesture.Config();
@@ -685,6 +733,8 @@ MouseTouchpadStatus MouseTouchpadGetStatus()
     st.packets = g_synPackets; st.resyncs = g_synResyncs; st.scrollTicks = g_synScrollTicks;
     for (int i = 0; i < 4; ++i) st.fingers[i] = g_synGesture.fingerHistogram[i];
     st.natural = g_synGesture.Config().naturalScroll;
+    st.rawValid = g_synRawValid;
+    for (int i = 0; i < 5; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];
     return st;
 }
 
