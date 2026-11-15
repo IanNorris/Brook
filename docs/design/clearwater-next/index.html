@@ -1,0 +1,1369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clearwater Next</title>
+<style>
+/* Layout: a fixed 1600x900 logical desktop (the Dell panel at 2x), scaled to fit the
+   viewport, with a slim study bar above it. Everything inside #stage uses only
+   effects Brook's compositor has: rounded rects, linear gradients, cached shadows,
+   fixed-level backdrop blur and alpha. */
+
+/* ---------- Tokens: geometry, type, motion (palette-independent) ---------- */
+:root{
+  color-scheme:dark;
+  --font-ui:"DejaVu Sans","Noto Sans",Verdana,sans-serif;      /* Brook's desktop face */
+  --font-mono:"Hack","DejaVu Sans Mono",ui-monospace,monospace;
+  --t-cap:11px; --t-sm:12px; --t-body:13px; --t-lead:15px; --t-head:20px; --t-disp:28px;
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px; --sp-8:32px;
+  --r-xs:4px; --r-sm:6px; --r-win:8px; --r-shell:12px;
+  --h-bar:48px; --h-title:40px; --h-ctl:36px; --h-row:40px;
+  --m-fast:90ms; --m-base:140ms; --m-slow:220ms; --ease:cubic-bezier(.2,0,0,1);
+  --ok:#5fcf8f; --warn:#f0b35a; --hot:#ff6f6a;
+  --page:#0a1018; --page-ink:#c9d6e6; --page-dim:#7f90a6; --page-line:#1e2a3a;
+}
+
+/* ---------- Glass tokens: palette x glass mode ---------- */
+#stage{
+  --op:.8; --blur:3px; --a-floor:.40;
+  --g:16 36 66; --g-hi:40 80 138; --g-flat:22 40 68;
+  --ink:#eef4fc; --ink-2:rgb(238 244 252/.74); --ink-3:rgb(238 244 252/.52);
+  --rim-out:rgb(255 255 255/.14); --rim-hi:rgb(255 255 255/.20); --rim-act:rgb(188 214 255/.62);
+  --sheen:rgb(255 255 255/.09); --divide:rgb(0 0 0/.28);
+  --hover:rgb(255 255 255/.10); --press:rgb(255 255 255/.17); --well:rgb(0 0 0/.22);
+  --accent:#6aaeff; --on-accent:#06213f; --accent-2:#5fd6c8;
+  --sh:3 10 22;
+  /* derived from the accent, whichever one is chosen */
+  --accent-hover:color-mix(in srgb,var(--accent) 86%,#fff); --accent-press:color-mix(in srgb,var(--accent) 86%,#000);
+  --c-accent-hover:color-mix(in srgb,var(--c-accent) 86%,#fff); --c-accent-press:color-mix(in srgb,var(--c-accent) 86%,#000);
+  --hud-1:var(--accent); --hud-2:var(--accent-2);
+}
+#stage[data-glass="light"]{--accent-hover:color-mix(in srgb,var(--accent) 88%,#000);--accent-press:color-mix(in srgb,var(--accent) 76%,#000)}
+#stage[data-content="light"]{--c-accent-hover:color-mix(in srgb,var(--c-accent) 88%,#000);--c-accent-press:color-mix(in srgb,var(--c-accent) 76%,#000)}
+#stage[data-palette="smoked"]{--g:22 26 34;--g-hi:54 62 78;--g-flat:30 34 43;--rim-act:rgb(214 224 240/.55);--accent:#a6c0e2;--on-accent:#101a28;--accent-2:#8fd0c6}
+#stage[data-palette="opal"]{--g:12 40 30;--g-hi:28 86 62;--g-flat:17 46 36;--rim-act:rgb(178 240 208/.58);--accent:#62d6a0;--on-accent:#05281a;--accent-2:#7db8ff}
+#stage[data-glass="light"]{
+  --a-floor:.55;
+  --g:226 237 251; --g-hi:186 213 248; --g-flat:226 235 247;
+  --ink:#14263d; --ink-2:rgb(20 38 61/.78); --ink-3:rgb(20 38 61/.62);
+  --rim-out:rgb(20 44 80/.24); --rim-hi:rgb(255 255 255/.75); --rim-act:rgb(48 110 210/.60);
+  --sheen:rgb(255 255 255/.34); --divide:rgb(20 44 80/.13);
+  --hover:rgb(20 50 100/.08); --press:rgb(20 50 100/.14); --well:rgb(255 255 255/.5);
+  --accent:#1f6fe0; --on-accent:#fff; --accent-2:#0a7f8a;
+  --sh:20 34 56;
+}
+#stage[data-glass="light"][data-palette="smoked"]{--g:235 238 243;--g-hi:208 215 226;--g-flat:232 235 240;--rim-act:rgb(70 96 136/.6);--accent:#44628c;--accent-2:#2f7d78}
+#stage[data-glass="light"][data-palette="opal"]{--g:234 247 247;--g-hi:190 231 231;--g-flat:230 243 243;--rim-act:rgb(10 127 138/.58);--accent:#0a7f8a;--accent-2:#1f6fe0}
+
+/* ---------- Content tokens: palette x content mode (opaque app surfaces) ---------- */
+#stage{
+  --c-bg:#111c2b; --c-raise:#18263a; --c-sink:#0c1522; --c-line:#26374f;
+  --c-ink:#e6edf7; --c-dim:#93a4bb; --c-accent:#6aaeff; --c-on-accent:#06213f; --c-sel:rgb(106 174 255/.16);
+}
+#stage[data-palette="smoked"]{--c-bg:#16181d;--c-raise:#1f2229;--c-sink:#101216;--c-line:#2d323c;--c-ink:#e8eaee;--c-dim:#9aa1ad;--c-accent:#a6c0e2;--c-on-accent:#101a28;--c-sel:rgb(166 192 226/.15)}
+#stage[data-palette="opal"]{--c-bg:#0f201a;--c-raise:#152b23;--c-sink:#0a1813;--c-line:#223f34;--c-ink:#e4f1ea;--c-dim:#8fada0;--c-accent:#62d6a0;--c-on-accent:#05281a;--c-sel:rgb(98 214 160/.14)}
+#stage[data-content="light"]{--c-bg:#f5f8fc;--c-raise:#fff;--c-sink:#eaf0f8;--c-line:#d7e0ed;--c-ink:#1c2b3f;--c-dim:#5c6d84;--c-accent:#1f6fe0;--c-on-accent:#fff;--c-sel:rgb(31 111 224/.11)}
+#stage[data-content="light"][data-palette="smoked"]{--c-bg:#f6f7f9;--c-raise:#fff;--c-sink:#eceef2;--c-line:#dadde4;--c-ink:#20242b;--c-dim:#626a77;--c-accent:#44628c;--c-sel:rgb(68 98 140/.12)}
+#stage[data-content="light"][data-palette="opal"]{--c-bg:#f3fafa;--c-raise:#fff;--c-sink:#e6f2f2;--c-line:#d2e5e5;--c-ink:#17302f;--c-dim:#557072;--c-accent:#0a7f8a;--c-sel:rgb(10 127 138/.11)}
+
+/* ---------- Page and study bar ---------- */
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{margin:0;background:var(--page);color:var(--page-ink);font:13px/1.4 var(--font-ui);overflow:hidden}
+button,input{font:inherit;color:inherit}
+button{border:0;background:none;padding:0;cursor:pointer}
+#study{height:44px;display:flex;align-items:center;gap:14px;padding:0 max(16px,env(safe-area-inset-right,0px)) 0 max(16px,env(safe-area-inset-left,0px));border-bottom:1px solid var(--page-line);white-space:nowrap;overflow-x:auto}
+#study b{font-weight:700;color:#e8f0fa}
+#study .lbl{color:var(--page-dim);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+#study .grp{display:flex;gap:2px;padding:2px;border:1px solid var(--page-line);border-radius:7px}
+#study .grp button,#study .one{height:26px;padding:0 10px;border-radius:5px;color:var(--page-ink);font-size:12px}
+#study .one{border:1px solid var(--page-line)}
+#study button:hover{background:#16212f}
+#study button.on{background:#22344b;color:#fff}
+#study .sp{flex:1}
+#study button:focus-visible{outline:2px solid #6aaeff;outline-offset:1px}
+#fit{position:relative;margin:0 auto;overflow:hidden}
+html.shot #study{display:none}
+html.shot *{transition:none!important;animation:none!important}
+
+/* ---------- Stage ---------- */
+#stage{position:absolute;left:0;top:0;width:1600px;height:900px;transform-origin:0 0;overflow:hidden;
+  font:var(--t-body)/1.35 var(--font-ui);color:var(--ink);user-select:none;
+  background:#6f8ea8 url("assets/brook-dawn.png") center 46%/cover}
+#stage svg.i{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+#stage :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#stage .client :focus-visible{outline-color:var(--c-accent)}
+.num{font-variant-numeric:tabular-nums}
+.mono{font-family:var(--font-mono)}
+
+/* Glass: backdrop blur quad + tint quad + sheen gradient + 1px rim. One cached shadow. */
+.glass{
+  --a:max(var(--op),var(--a-floor));
+  background:linear-gradient(180deg,var(--sheen),transparent 60%),rgb(var(--g)/var(--a));
+  -webkit-backdrop-filter:blur(var(--blur));backdrop-filter:blur(var(--blur));
+  border:1px solid var(--rim-out);
+  box-shadow:inset 0 1px 0 var(--rim-hi),0 10px 24px rgb(var(--sh)/.40),0 1px 3px rgb(0 0 0/.30);
+  color:var(--ink);
+}
+#stage[data-perf="1"] .glass,#stage[data-perf="1"] .tb{background:rgb(var(--g-flat));-webkit-backdrop-filter:none;backdrop-filter:none;box-shadow:none}
+#stage[data-perf="1"] .win{box-shadow:none}
+#stage[data-perf="1"] *{transition:none!important;animation:none!important}
+
+/* ---------- Windows ---------- */
+.win{position:absolute;display:flex;flex-direction:column;border-radius:var(--r-win) var(--r-win) 2px 2px;overflow:hidden;
+  box-shadow:0 6px 16px rgb(var(--sh)/.30),0 1px 3px rgb(0 0 0/.30);
+  transition:opacity var(--m-base) var(--ease),transform var(--m-base) var(--ease),box-shadow var(--m-base)}
+.win::after{content:"";position:absolute;inset:0;border:1px solid var(--rim-out);border-radius:inherit;pointer-events:none;z-index:3}
+.win.active::after{border-color:var(--rim-act)}
+.win.max::after{display:none}
+.win.active{box-shadow:0 14px 32px rgb(var(--sh)/.50),0 2px 6px rgb(0 0 0/.40)}
+.win.gone{opacity:0;transform:translateY(10px) scale(.985);pointer-events:none}
+.win.max{left:0!important;top:0!important;width:1600px!important;height:calc(900px - var(--h-bar))!important;border-radius:0;box-shadow:none}
+.tb{--a:max(var(--op),var(--a-floor));position:relative;flex:none;height:var(--h-title);display:flex;align-items:center;gap:var(--sp-2);padding-left:var(--sp-3);
+  background:rgb(var(--g)/var(--a));-webkit-backdrop-filter:blur(var(--blur));backdrop-filter:blur(var(--blur));
+  border-bottom:1px solid var(--divide);color:var(--ink-3);cursor:default}
+.win.active .tb{--a:min(1,calc(max(var(--op),var(--a-floor)) + .08));color:var(--ink);
+  background:linear-gradient(180deg,rgb(var(--g-hi)/var(--a)),rgb(var(--g)/var(--a)));box-shadow:inset 0 1px 0 var(--rim-hi)}
+/* Active accent: a 2px light on the top rim that fades out, replacing the 160x4 block. */
+.win.active .tb::before{content:"";position:absolute;left:10px;top:0;width:176px;height:2px;border-radius:0 0 2px 2px;
+  background:linear-gradient(90deg,var(--accent) 0 45%,transparent)}
+.win.max .tb::before{left:0}
+.tl{display:flex;align-items:center;gap:var(--sp-2);min-width:0}
+.tb img{width:16px;height:16px;flex:none;opacity:.7}
+.win.active .tb img{opacity:1}
+.tb .title{font-size:var(--t-body);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.caps{margin-left:auto;display:flex;height:var(--h-title);flex:none}
+.caps button{width:48px;height:var(--h-title);display:grid;place-items:center;color:inherit}   /* 48x40, flush to the top and right outer edges, no gaps */
+.caps button span{width:36px;height:26px;border-radius:var(--r-sm);display:grid;place-items:center;transition:background var(--m-fast)}
+.caps button:hover span{background:var(--hover);color:var(--ink)}
+.caps button:active span{background:var(--press)}
+.caps button.x:hover span{background:#c8414f;color:#fff}
+.caps button:focus-visible{outline-offset:-4px}
+.client{flex:1;min-height:0;background:var(--c-bg);color:var(--c-ink);display:flex;flex-direction:column}
+
+/* ---------- Content controls (Settings is GTK3: all of this is plain GTK CSS) ---------- */
+.c-btn{height:var(--h-ctl);padding:0 14px;border-radius:var(--r-sm);border:1px solid var(--c-line);background:var(--c-raise);color:var(--c-ink);font-size:var(--t-body);transition:background var(--m-fast)}
+.c-btn:hover{background:var(--c-sink)}
+.c-btn.primary{background:var(--c-accent);border-color:transparent;color:var(--c-on-accent);font-weight:700}
+.c-btn.primary:hover{background:var(--c-accent-hover)}
+.c-btn.primary:active{background:var(--c-accent-press)}
+.c-btn:disabled{opacity:.45;cursor:default}
+.seg{display:flex;padding:2px;gap:2px;border-radius:var(--r-sm);background:var(--c-sink);border:1px solid var(--c-line)}
+.seg button{flex:1;height:32px;padding:0 12px;border-radius:var(--r-xs);font-size:var(--t-sm);color:var(--c-dim);transition:background var(--m-fast),color var(--m-fast)}
+.seg button:hover{color:var(--c-ink)}
+.seg button[aria-pressed="true"]{background:var(--c-raise);color:var(--c-ink);box-shadow:0 0 0 1px var(--c-line),0 1px 2px rgb(0 0 0/.18)}
+.sw{width:44px;height:24px;border-radius:12px;background:var(--c-line);position:relative;flex:none;transition:background var(--m-base)}
+.sw::after{content:"";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:var(--c-raise);box-shadow:0 1px 2px rgb(0 0 0/.35);transition:transform var(--m-base) var(--ease)}
+.sw[aria-checked="true"]{background:var(--c-accent)}
+.sw[aria-checked="true"]::after{transform:translateX(20px);background:var(--c-on-accent)}
+input[type=range]{-webkit-appearance:none;appearance:none;height:32px;background:none;margin:0;width:100%;cursor:pointer}
+input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:linear-gradient(90deg,var(--trk-on) var(--pct,50%),var(--trk-off) var(--pct,50%))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;margin-top:-8px;background:var(--thumb);border:2px solid var(--trk-on);box-shadow:0 1px 3px rgb(0 0 0/.4)}
+input[type=range]::-moz-range-track{height:4px;border-radius:2px;background:linear-gradient(90deg,var(--trk-on) var(--pct,50%),var(--trk-off) var(--pct,50%))}
+input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:var(--thumb);border:2px solid var(--trk-on)}
+.client input[type=range]{--trk-on:var(--c-accent);--trk-off:var(--c-line);--thumb:var(--c-raise)}
+.glass input[type=range]{--trk-on:var(--accent);--trk-off:var(--well);--thumb:#fff}
+
+/* ---------- Settings ---------- */
+.set-tabs{flex:none;display:flex;gap:var(--sp-1);padding:var(--sp-3) var(--sp-5) 0;border-bottom:1px solid var(--c-line)}
+.set-tabs button{height:40px;padding:0 12px;color:var(--c-dim);border-bottom:2px solid transparent;margin-bottom:-1px}
+.set-tabs button:hover{color:var(--c-ink)}
+.set-tabs button[aria-selected="true"]{color:var(--c-ink);font-weight:700;border-bottom-color:var(--c-accent)}
+.set-body{flex:1;min-height:0;overflow:auto;padding:var(--sp-4) var(--sp-5) var(--sp-2)}
+.set-body section{display:flex;flex-direction:column;gap:var(--sp-2);padding-bottom:var(--sp-4)}
+.set-body section+section{border-top:1px solid var(--c-line);padding-top:var(--sp-3)}
+.set-body h3{margin:0;font-size:var(--t-cap);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--c-dim)}
+.row{display:flex;align-items:center;gap:var(--sp-3);min-height:44px}
+.row:has(.sw){cursor:pointer;margin:0 -8px;padding:0 8px;border-radius:var(--r-sm)}
+.row:has(.sw):hover{background:var(--c-sink)}
+.radios{display:flex;flex-direction:column;gap:2px;margin:0 -8px}
+.radios button{min-height:44px;text-align:left;padding:5px 10px 5px 38px;border-radius:var(--r-sm);position:relative;color:var(--c-ink)}
+.radios button small{display:block;font-size:var(--t-sm);color:var(--c-dim)}
+.radios button b{font-weight:400}
+.radios button:hover{background:var(--c-sink)}
+.radios button::before{content:"";position:absolute;left:10px;top:50%;width:16px;height:16px;margin-top:-9px;border-radius:50%;border:2px solid var(--c-dim)}
+.radios button[aria-pressed="true"]::before{border:5px solid var(--c-accent)}
+.row>.lab{flex:1;min-width:0}
+.row .lab small,.hint{display:block;font-size:var(--t-sm);color:var(--c-dim);margin-top:2px}
+.row .val{color:var(--c-dim);font-size:var(--t-sm)}
+.row .seg{flex:none}
+.dis{opacity:.42;pointer-events:none}
+.pals{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-2)}
+.pal{border:1px solid var(--c-line);border-radius:var(--r-win);padding:6px 6px 8px;text-align:center;font-size:var(--t-sm);color:var(--c-dim);background:var(--c-raise);transition:border-color var(--m-fast)}
+.pal:hover{border-color:var(--c-dim)}
+.pal[aria-pressed="true"]{border-color:var(--c-accent);box-shadow:0 0 0 1px var(--c-accent);color:var(--c-ink)}
+.pal .mini{display:block;height:40px;border-radius:5px;overflow:hidden;margin-bottom:6px;position:relative;background:url("assets/brook-dawn.png") center 62%/420px}
+.pal .mini i{position:absolute;left:10px;right:10px;top:10px;bottom:-4px;border-radius:4px 4px 0 0;background:var(--pc);box-shadow:0 3px 8px rgb(0 0 0/.4)}
+.pal .mini i::before{content:"";position:absolute;inset:0 0 auto 0;height:11px;border-radius:4px 4px 0 0;background:linear-gradient(180deg,var(--ph),var(--pg))}
+.pal .mini i::after{content:"";position:absolute;left:4px;top:0;width:26px;height:2px;background:var(--pa)}
+.accs{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin:0 -6px}
+.accs button{height:36px;border-radius:var(--r-sm);display:grid;place-items:center}
+.accs button:hover{background:var(--c-sink)}
+.accs i{width:22px;height:22px;border-radius:50%;background:var(--sd);display:grid;place-items:center;color:var(--c-on-accent)}
+#stage[data-content="light"] .accs i{background:var(--sl)}
+#stage .accs i.wp{background:url("assets/brook-dawn.png") 50% 30%/90px}
+.accs button[aria-pressed="true"] i{box-shadow:0 0 0 2px var(--c-bg),0 0 0 4px var(--c-accent)}
+#stage .accs svg.i{width:12px;height:12px;stroke-width:2.2;display:none}
+#stage .accs button[aria-pressed="true"] svg.i{display:block}
+#stage #acc-auto{background:none;box-shadow:inset 0 0 0 6px var(--sd)}
+#stage[data-content="light"] #acc-auto{box-shadow:inset 0 0 0 6px var(--sl)}
+#stage .accs button[aria-pressed="true"] #acc-auto{box-shadow:inset 0 0 0 6px var(--c-accent),0 0 0 2px var(--c-bg),0 0 0 4px var(--c-accent)}
+#stage #acc-auto svg.i{display:none}
+.about-id{display:flex;gap:var(--sp-4);align-items:center}
+.about-id img{height:52px}
+.about-id strong{font-size:var(--t-head);font-weight:700;display:block}
+.kv{display:grid;grid-template-columns:104px 1fr;gap:6px var(--sp-3);font-size:var(--t-sm)}
+.kv dt{color:var(--c-dim)} .kv dd{margin:0;user-select:text}
+.set-foot{flex:none;display:flex;align-items:center;gap:var(--sp-2);padding:var(--sp-3) var(--sp-5);border-top:1px solid var(--c-line);background:var(--c-raise)}
+.set-foot .state{flex:1;font-size:var(--t-sm);color:var(--c-dim);display:flex;align-items:center;gap:6px}
+.set-foot .state::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--c-line)}
+.set-foot.dirty .state::before{background:var(--warn)}
+
+/* Boot/segment bar (toast and About) */
+.bootbar{display:flex;height:6px;gap:2px;border-radius:3px;overflow:hidden}
+.bootbar i{display:block;height:100%}
+.bootleg{display:grid;grid-template-columns:repeat(4,auto);justify-content:space-between;font-size:var(--t-cap)}
+.bootleg span{display:grid;grid-template-columns:6px auto;gap:1px 5px;align-items:center}
+.bootleg span::before{content:"";width:6px;height:6px;border-radius:2px;background:var(--k)}
+.bootleg b{grid-column:2;font-weight:400;font-size:var(--t-sm)}
+.toast .bootleg b{color:var(--ink)} .client .bootleg b{color:var(--c-ink)}
+
+/* ---------- Files ---------- */
+.f-bar{flex:none;height:48px;display:flex;align-items:center;gap:var(--sp-1);padding:0 var(--sp-3);border-bottom:1px solid var(--c-line);background:var(--c-raise)}
+.f-bar button{width:36px;height:36px;border-radius:var(--r-sm);display:grid;place-items:center;color:var(--c-dim)}
+.f-bar button:hover{background:var(--c-sink);color:var(--c-ink)}
+.f-path{flex:1;height:32px;margin-left:var(--sp-2);display:flex;align-items:center;gap:6px;padding:0 10px;border-radius:var(--r-sm);background:var(--c-sink);border:1px solid var(--c-line);font-size:var(--t-sm);color:var(--c-dim)}
+.f-path b{color:var(--c-ink);font-weight:400}
+.f-main{flex:1;min-height:0;display:flex}
+.f-side{width:176px;flex:none;padding:var(--sp-3) var(--sp-2);border-right:1px solid var(--c-line);background:var(--c-sink);display:flex;flex-direction:column;gap:1px}
+.f-side h4{margin:var(--sp-2) var(--sp-2) 6px;font-size:var(--t-cap);letter-spacing:.08em;text-transform:uppercase;color:var(--c-dim);font-weight:700}
+.f-side button{height:36px;display:flex;align-items:center;gap:10px;padding:0 var(--sp-2);border-radius:var(--r-sm);text-align:left;color:var(--c-ink)}
+.f-side button svg{color:var(--c-dim)}
+.f-side button:hover{background:var(--c-sel)}
+.f-side button.sel{background:var(--c-sel);box-shadow:inset 2px 0 0 var(--c-accent)}
+.f-side button.sel svg{color:var(--c-accent)}
+.f-list{flex:1;min-width:0;overflow:auto}
+.f-row{display:grid;grid-template-columns:1fr 84px 150px;align-items:center;height:36px;padding:0 var(--sp-4);gap:var(--sp-3)}
+.f-row.head{height:30px;font-size:var(--t-cap);letter-spacing:.06em;text-transform:uppercase;color:var(--c-dim);border-bottom:1px solid var(--c-line);position:sticky;top:0;background:var(--c-bg)}
+.f-row .n{display:flex;align-items:center;gap:10px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.f-row .n img{width:16px;height:16px}
+.f-row .n svg{color:var(--c-dim)}
+.f-row span+span{color:var(--c-dim);font-size:var(--t-sm)}
+.f-row:not(.head):hover{background:var(--c-sink)}
+.f-row.sel{background:var(--c-sel)}
+.f-stat{flex:none;height:26px;display:flex;align-items:center;gap:var(--sp-4);padding:0 var(--sp-4);border-top:1px solid var(--c-line);font-size:var(--t-cap);color:var(--c-dim)}
+
+/* ---------- Terminal (always dark content) ---------- */
+.term{flex:1;background:#0b111a;color:#c8d6e8;font:12px/1.55 var(--font-mono);padding:10px 14px;white-space:pre;overflow:hidden;user-select:text}
+.term .p{color:#6aaeff} .term .o{color:#8fa3bd} .term .g{color:#5fd6c8}
+.term .cur{display:inline-block;width:7px;height:14px;background:#c8d6e8;vertical-align:-2px}
+
+/* ---------- Taskbar ---------- */
+#taskbar{position:absolute;left:0;right:0;bottom:0;height:var(--h-bar);display:flex;align-items:center;gap:0;padding:0 4px 0 0;
+  border-width:1px 0 0;box-shadow:inset 0 1px 0 var(--rim-hi);z-index:900}
+.tk{height:var(--h-bar);display:flex;align-items:center;gap:var(--sp-2);padding:0 12px;position:relative;color:var(--ink-2);transition:color var(--m-fast)}   /* hit area: full bar height, down to the screen edge */
+.tk::before{content:"";position:absolute;inset:5px 2px;border-radius:var(--r-sm);z-index:-1;transition:background var(--m-fast)}   /* visual pill */
+.tk:hover{color:var(--ink)} .tk:hover::before{background:var(--hover)}
+.tk:active::before{background:var(--press)}
+.tk.on{color:var(--ink)} .tk.on::before{background:var(--press)}
+#start{width:56px;justify-content:center;padding:0}   /* includes the bottom-left screen corner */
+#start img{height:22px;width:auto}
+.vsep{width:1px;height:20px;background:var(--rim-out);margin:0 var(--sp-1);flex:none}
+#tasks{display:flex;gap:0;min-width:0}
+.task{max-width:188px;min-width:48px}
+.task img,.task .mg{width:20px;height:20px;flex:none}
+.task .t{font-size:var(--t-sm);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#stage[data-labels="0"] .task .t{display:none}
+.task::after{content:"";position:absolute;left:50%;bottom:7px;width:6px;height:3px;border-radius:2px;margin-left:-3px;background:var(--ink-3);transition:width var(--m-base) var(--ease),margin var(--m-base) var(--ease),background var(--m-base)}
+.task.active{color:var(--ink)} .task.active::before{background:var(--hover)}
+.task.active::after{width:20px;margin-left:-10px;background:var(--accent)}
+.task.min{color:var(--ink-3)}
+.task.min img{opacity:.6}
+.task.min::after{background:none;box-shadow:inset 0 0 0 1px var(--ink-3)}
+.grow{flex:1}
+#hudchip{gap:var(--sp-3);padding:0 var(--sp-2)}
+.hc{display:flex;align-items:center;gap:6px;font-size:var(--t-cap)}
+.hc em{font-style:normal;color:var(--ink-3);letter-spacing:.04em}
+.hc b{font-weight:400;color:var(--ink);font-size:var(--t-sm);min-width:26px;text-align:right}
+.hc svg{display:block}
+#build{font-size:var(--t-cap);color:var(--ink-3);padding:0 var(--sp-2);user-select:text;white-space:nowrap}
+#tray{display:flex;gap:0}
+#tray .tk{padding:0 12px;min-width:44px;justify-content:center;gap:6px;font-size:var(--t-sm)}
+#tray .tk.warm{color:var(--warn)} #tray .tk.hot{color:var(--hot)}
+#clock{flex-direction:column;align-items:flex-end;justify-content:center;gap:0;line-height:1.25;padding:0 var(--sp-2) 0 var(--sp-3);cursor:default}
+#clock:hover::before{background:none}
+#clock b{font-weight:400;font-size:var(--t-sm);color:var(--ink)}
+#clock small{font-size:var(--t-cap);color:var(--ink-2)}
+
+/* ---------- Shell panels: launcher, flyouts, HUD, toasts ---------- */
+.panel{position:absolute;border-radius:var(--r-shell);z-index:950;transition:opacity var(--m-base) var(--ease),transform var(--m-base) var(--ease)}
+.panel.glass{--a:min(1,calc(max(var(--op),var(--a-floor)) + .1))}   /* text-heavy panels sit 10 points more solid than the bar and titlebars */
+.panel.shut{opacity:0;transform:translateY(8px);pointer-events:none;visibility:hidden;transition:opacity var(--m-fast),transform var(--m-fast),visibility 0s var(--m-fast)}
+.eyebrow{font-size:var(--t-cap);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.ibtn{width:36px;height:36px;border-radius:var(--r-sm);display:grid;place-items:center;color:var(--ink-2);flex:none;transition:background var(--m-fast)}
+.ibtn:hover{background:var(--hover);color:var(--ink)}
+
+#launcher{left:8px;bottom:calc(var(--h-bar) + 8px);width:680px;height:648px;display:flex;flex-direction:column}
+.l-search{flex:none;margin:var(--sp-3) var(--sp-3) 0;height:44px;display:flex;align-items:center;gap:10px;padding:0 var(--sp-3);border-radius:var(--r-win);background:var(--well);border:1px solid var(--rim-out)}
+.l-search:focus-within{border-color:var(--accent)}
+.l-search input{flex:1;min-width:0;background:none;border:0;outline:0;font-size:var(--t-lead);color:var(--ink)}
+.l-search input::placeholder{color:var(--ink-3)}
+kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--rim-out);border-radius:var(--r-xs);padding:1px 5px}
+.l-top{flex:none;padding:var(--sp-2) var(--sp-3)}
+.l-toptabs{display:flex;gap:2px;padding-bottom:var(--sp-1)}
+.l-toptabs button{height:32px;padding:0 10px;border-radius:var(--r-sm);font-size:var(--t-cap);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.l-toptabs button:hover{color:var(--ink)}
+.l-toptabs button[aria-pressed="true"]{color:var(--ink);background:var(--hover)}
+.l-tiles{display:grid;grid-template-columns:repeat(5,1fr);gap:var(--sp-1);min-height:76px;border-radius:var(--r-win)}
+.l-tile{display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 4px 8px;border-radius:var(--r-win);font-size:var(--t-sm);color:var(--ink-2);min-width:0;position:relative;cursor:pointer}
+.l-tile span{max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.l-tile img,.l-tile .mg{width:32px;height:32px}
+.l-tile:hover{background:var(--hover);color:var(--ink)}
+.l-none{grid-column:1/-1;align-self:center;text-align:center;color:var(--ink-3);font-size:var(--t-sm);border:1px dashed var(--rim-out);border-radius:var(--r-win);padding:var(--sp-5) var(--sp-4);margin:var(--sp-1)}
+.l-mid{flex:1;min-height:0;display:flex;border-top:1px solid var(--rim-out)}
+.l-rail{width:180px;flex:none;padding:var(--sp-2);display:flex;flex-direction:column;border-right:1px solid var(--rim-out);overflow:auto;scrollbar-width:none}
+.rb{height:40px;flex:none;border-radius:var(--r-sm);display:flex;align-items:center;gap:10px;padding:0 4px 0 8px;color:var(--ink-2);cursor:pointer;position:relative}
+.rb .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rb small{font-size:var(--t-cap);color:var(--ink-3);margin-right:6px}
+.rb small.badge{background:var(--accent);color:var(--on-accent);border-radius:9px;padding:1px 7px;font-weight:700}
+.rb:hover{background:var(--hover);color:var(--ink)}
+.rb[aria-pressed="true"]{background:var(--press);color:var(--ink)}
+.rb.new{color:var(--ink-3);margin-top:auto;padding-left:11px}
+.ct{width:22px;height:22px;border-radius:var(--r-sm);display:grid;place-items:center;background:var(--cc);color:#0b1a2b;flex:none}
+#stage .ct svg.i{width:14px;height:14px}
+.ct.plain{background:var(--well);color:var(--ink-2)}
+.more{width:32px;height:40px;display:grid;place-items:center;border-radius:var(--r-sm);color:var(--ink-3);flex:none}
+.more:hover{background:var(--hover);color:var(--ink)}
+.l-pane{flex:1;min-width:0;display:flex;flex-direction:column;position:relative}
+.l-bar{flex:none;min-height:48px;display:flex;align-items:center;gap:6px;padding:var(--sp-1) var(--sp-2) var(--sp-1) var(--sp-4);border-bottom:1px solid var(--rim-out);font-size:var(--t-sm);color:var(--ink-2)}
+.l-bar span{flex:1;min-width:0}
+.gbtn{height:36px;padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--rim-out);font-size:var(--t-sm);color:var(--ink);display:inline-flex;align-items:center;gap:6px;white-space:nowrap;flex:none}
+.gbtn:hover{background:var(--hover)}
+.gbtn.pri{background:var(--accent);color:var(--on-accent);border-color:transparent;font-weight:700}
+.gbtn.pri:hover{background:var(--accent-hover)}
+.gbtn.pri:active{background:var(--accent-press)}
+.gbtn:disabled{opacity:.4;cursor:default}
+.gbtn.danger{color:var(--hot)}
+.l-list{flex:1;min-height:0;overflow:auto;padding:var(--sp-2);scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
+.l-list h5{display:flex;align-items:center;gap:var(--sp-2);margin:2px 0;padding:0 var(--sp-2);height:36px;border-radius:var(--r-sm);font-size:var(--t-cap);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.l-list h5 .dot{width:8px;height:8px;border-radius:3px;background:var(--cc)}
+.l-list h5 small{font-weight:400;letter-spacing:0}
+.l-list h5 .gbtn{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;height:32px}
+.l-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 var(--sp-1)}
+.l-grid.flat{grid-template-columns:1fr}
+.l-chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 var(--sp-2) var(--sp-2)}
+.app{height:48px;display:flex;align-items:center;gap:10px;padding:0 2px 0 8px;border-radius:var(--r-sm);min-width:0;color:var(--ink);cursor:pointer;position:relative}
+.app img,.app .mg{width:28px;height:28px;flex:none}
+.app .tx{min-width:0;flex:1}
+.app .tx b{display:block;font-weight:400;font-size:var(--t-body);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app .tx small{display:block;font-size:var(--t-cap);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app mark{background:none;color:var(--accent);font-weight:700}
+.app .new{font-style:normal;font-size:var(--t-cap);font-weight:700;color:var(--accent);margin-left:6px}
+.app .run{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:none}
+.app .more{opacity:0}
+.app:hover .more,.app.kb .more,#launcher.org .app .more{opacity:1}
+.app:hover{background:var(--hover)}
+.app.kb{background:var(--press);box-shadow:inset 0 0 0 1px var(--rim-out)}
+.app.sel{background:color-mix(in srgb,var(--accent) 18%,transparent)}
+.ck{width:18px;height:18px;border-radius:5px;border:1.5px solid var(--ink-3);display:grid;place-items:center;flex:none}
+#stage .ck svg.i{width:12px;height:12px;stroke-width:2}
+.app.sel .ck{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.chip{font-size:var(--t-cap);padding:2px 8px;border-radius:9px;background:var(--well);display:inline-flex;align-items:center;gap:5px;color:var(--ink-2);white-space:nowrap;flex:none}
+.chip::before{content:"";width:6px;height:6px;border-radius:2px;background:var(--cc)}
+.l-empty{padding:48px var(--sp-5);text-align:center;color:var(--ink-2)}
+.l-empty small{display:block;color:var(--ink-3);margin-top:6px;font-size:var(--t-sm)}
+/* drag and drop: a ghost quad plus accent outlines and insertion bars */
+#launcher.dragging .src{opacity:.35}
+#launcher .drop{box-shadow:inset 0 0 0 2px var(--accent);background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--ink)}
+.ins-l::before,.ins-r::before{content:"";position:absolute;top:6px;bottom:6px;width:3px;border-radius:2px;background:var(--accent)}
+.ins-l::before{left:-3px} .ins-r::before{right:-3px}
+.ins-t::before,.ins-b::before{content:"";position:absolute;left:6px;right:6px;height:3px;border-radius:2px;background:var(--accent)}
+.ins-t::before{top:-2px} .ins-b::before{bottom:-2px}
+#ghost{position:absolute;z-index:999;pointer-events:none;height:40px;padding:0 12px 0 8px;border-radius:var(--r-win);display:flex;align-items:center;gap:var(--sp-2);transform:translate(12px,10px)}
+#ghost img,#ghost .mg{width:24px;height:24px}
+#ghost .n{background:var(--accent);color:var(--on-accent);border-radius:9px;padding:1px 7px;font-size:var(--t-cap)}
+#ghost .cur{position:absolute;left:-13px;top:-11px;width:18px;height:18px}
+.l-undo{position:absolute;left:var(--sp-3);right:var(--sp-3);bottom:10px;height:48px;border-radius:var(--r-win);display:flex;align-items:center;gap:var(--sp-2);padding:0 6px 0 14px;background:rgb(var(--g-flat)/.97);border:1px solid var(--rim-out);box-shadow:0 6px 16px rgb(var(--sh)/.4);font-size:var(--t-sm)}
+.l-undo span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.menu{position:absolute;z-index:5;min-width:228px;padding:6px;border-radius:var(--r-win);background:rgb(var(--g-flat)/.98);border:1px solid var(--rim-out);box-shadow:0 10px 24px rgb(var(--sh)/.45);display:flex;flex-direction:column;color:var(--ink)}
+.menu header{padding:6px 10px 4px;font-weight:700;font-size:var(--t-sm)}
+.menu h6{margin:6px 10px 2px;font-size:var(--t-cap);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.mi{height:36px;border-radius:var(--r-sm);display:flex;align-items:center;gap:10px;padding:0 10px;text-align:left;flex:none}
+.mi span:not(.ct){flex:1}
+.mi:hover,.mi:focus-visible{background:var(--hover)}
+.mi:disabled{opacity:.5;cursor:default}
+.menu hr{border:0;border-top:1px solid var(--rim-out);margin:4px 6px;width:auto}
+#l-edit{width:292px;padding:var(--sp-3);gap:10px}
+#l-edit input{height:36px;border-radius:var(--r-sm);border:1px solid var(--rim-out);background:var(--well);padding:0 10px;color:var(--ink);outline:0}
+#l-edit input:focus{border-color:var(--accent)}
+.pick{display:grid;gap:2px}
+.pick.c8{grid-template-columns:repeat(8,1fr)} .pick.c6{grid-template-columns:repeat(6,1fr)}
+.pick button{height:32px;border-radius:var(--r-sm);display:grid;place-items:center}
+.pick button:hover{background:var(--hover)}
+.pick button[aria-pressed="true"]{box-shadow:inset 0 0 0 2px var(--accent)}
+.pick .swc{width:16px;height:16px;border-radius:50%;background:var(--cc)}
+.ed-acts{display:flex;gap:6px}
+.ed-acts .gbtn{padding:0 8px}
+.hint2{font-size:var(--t-cap);color:var(--ink-3)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+.l-foot{flex:none;height:52px;display:flex;align-items:center;gap:var(--sp-1);padding:0 var(--sp-2) 0 var(--sp-3);border-top:1px solid var(--rim-out)}
+.l-foot .who{flex:1;min-width:0;display:flex;align-items:center;gap:10px}
+.l-foot .av{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;background:var(--press);font-size:var(--t-sm)}
+.l-foot .who small{display:block;font-size:var(--t-cap);color:var(--ink-3)}
+.l-foot .keys{font-size:var(--t-cap);color:var(--ink-3);display:flex;gap:10px;align-items:center;margin-right:var(--sp-2)}
+#l-org.on{background:var(--accent);color:var(--on-accent);border-color:transparent}
+.mg{border-radius:22%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:13px;line-height:1}
+.l-tile .mg{font-size:15px} .task .mg,#ghost .mg{font-size:10px}
+
+.fly{right:8px;bottom:calc(var(--h-bar) + 8px);width:304px;padding:var(--sp-4);display:flex;flex-direction:column;gap:var(--sp-3)}
+.fly header{display:flex;align-items:center;gap:var(--sp-2)}
+.fly header b{font-size:var(--t-lead);font-weight:700;flex:1}
+.fly .big{font-size:var(--t-disp);line-height:1.1}
+.fly .big small{font-size:var(--t-body);color:var(--ink-2);margin-left:6px}
+.fly dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:5px var(--sp-4);font-size:var(--t-sm)}
+.fly dt{color:var(--ink-3)} .fly dd{margin:0;text-align:right;user-select:text}
+.pill{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 8px;border-radius:10px;font-size:var(--t-cap);background:var(--well)}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--k,var(--ok))}
+.volrow{display:flex;align-items:center;gap:var(--sp-2)}
+.volrow output{width:34px;text-align:right;font-size:var(--t-sm);color:var(--ink-2)}
+.gbox{border-radius:var(--r-sm);background:var(--well);padding:6px 6px 4px}
+.gbox svg{display:block;width:100%}
+
+#hud{right:8px;bottom:calc(var(--h-bar) + 8px);width:348px;padding:var(--sp-3);display:flex;flex-direction:column;gap:var(--sp-2);z-index:940}
+#hud header{display:flex;align-items:center;gap:var(--sp-2);cursor:grab;padding-left:var(--sp-1)}
+#hud header b{font-weight:700;flex:1}
+#hud header .fps{font-size:var(--t-sm);color:var(--ink-2)}
+.hg{display:flex;flex-direction:column;gap:4px}
+.hg .top{display:flex;align-items:baseline;gap:var(--sp-2);padding:0 2px;font-size:var(--t-cap);color:var(--ink-3)}
+.hg .top em{font-style:normal;font-weight:700;letter-spacing:.08em;color:var(--ink-2)}
+.hg .top b{font-weight:400;font-size:var(--t-body);color:var(--ink)}
+.hg .top span{margin-left:auto}
+#hud footer{font-size:var(--t-cap);color:var(--ink-3);padding:2px 2px 0;display:flex;justify-content:space-between;gap:var(--sp-2);user-select:text}
+
+#toasts{position:absolute;right:16px;top:16px;width:360px;display:flex;flex-direction:column;gap:var(--sp-2);z-index:960}
+.toast{border-radius:var(--r-shell);padding:var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-4);display:grid;grid-template-columns:20px 1fr 30px;gap:2px var(--sp-3);align-items:start;
+  animation:tin var(--m-slow) var(--ease)}
+.toast.out{opacity:0;transform:translateX(12px);transition:opacity var(--m-base),transform var(--m-base)}
+@keyframes tin{from{opacity:0;transform:translateY(-10px)}}
+.toast>svg{margin-top:2px;color:var(--k,var(--accent))}
+.toast .ttl{font-weight:700;font-size:var(--t-body)}
+.toast .ttl small{font-weight:400;font-size:var(--t-cap);color:var(--ink-3);margin-left:6px}
+.toast .bd{grid-column:2/4;font-size:var(--t-sm);color:var(--ink-2);display:flex;flex-direction:column;gap:var(--sp-2)}
+.toast .ibtn{margin:-6px -6px 0 0;width:36px;height:36px}
+.toast .hero{font-size:var(--t-head);color:var(--ink);line-height:1.2}
+.toast .hero small{font-size:var(--t-sm);color:var(--ink-2);margin-left:4px}
+.toast .meta{font-size:var(--t-cap);color:var(--ink-3);user-select:text}
+
+/* ---------- Effects (Settings > Lab) ---------- */
+/* ---------- Accent choices (Settings > Appearance). Generated with contrast checks; see DESIGN.md. ---------- */
+/* 'wallpaper' is sampled when the wallpaper is set; hardcoded here for brook-dawn. */
+#stage[data-accent="blue"][data-glass]{--accent:#6aaeff;--on-accent:#101e2e;--rim-act:rgb(106 174 255/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="blue"][data-glass="light"][data-palette]{--accent:#1c65cc;--on-accent:#fff;--rim-act:rgb(28 101 204/.6);--accent-2:#0a7f8a}
+#stage[data-accent="blue"][data-content]{--c-accent:#6aaeff;--c-on-accent:#101e2e;--c-sel:rgb(106 174 255/.16)}
+#stage[data-accent="blue"][data-content="light"][data-palette]{--c-accent:#1c65cc;--c-on-accent:#fff;--c-sel:rgb(28 101 204/.11)}
+#stage[data-accent="teal"][data-glass]{--accent:#4fd3c4;--on-accent:#0d2227;--rim-act:rgb(79 211 196/.62);--accent-2:#7db8ff;}
+#stage[data-accent="teal"][data-glass="light"][data-palette]{--accent:#09747e;--on-accent:#fff;--rim-act:rgb(9 116 126/.6);--accent-2:#1f6fe0}
+#stage[data-accent="teal"][data-content]{--c-accent:#4fd3c4;--c-on-accent:#0d2227;--c-sel:rgb(79 211 196/.16)}
+#stage[data-accent="teal"][data-content="light"][data-palette]{--c-accent:#09747e;--c-on-accent:#fff;--c-sel:rgb(9 116 126/.11)}
+#stage[data-accent="pine"][data-glass]{--accent:#62d6a0;--on-accent:#0f2223;--rim-act:rgb(98 214 160/.62);--accent-2:#7db8ff;}
+#stage[data-accent="pine"][data-glass="light"][data-palette]{--accent:#1b7650;--on-accent:#fff;--rim-act:rgb(27 118 80/.6);--accent-2:#1f6fe0}
+#stage[data-accent="pine"][data-content]{--c-accent:#62d6a0;--c-on-accent:#0f2223;--c-sel:rgb(98 214 160/.16)}
+#stage[data-accent="pine"][data-content="light"][data-palette]{--c-accent:#1b7650;--c-on-accent:#fff;--c-sel:rgb(27 118 80/.11)}
+#stage[data-accent="phosphor"][data-glass]{--accent:#7dff9b;--on-accent:#132722;--rim-act:rgb(125 255 155/.62);--accent-2:#7db8ff;}
+#stage[data-accent="phosphor"][data-glass="light"][data-palette]{--accent:#0f7a33;--on-accent:#fff;--rim-act:rgb(15 122 51/.6);--accent-2:#1f6fe0}
+#stage[data-accent="phosphor"][data-content]{--c-accent:#7dff9b;--c-on-accent:#132722;--c-sel:rgb(125 255 155/.16)}
+#stage[data-accent="phosphor"][data-content="light"][data-palette]{--c-accent:#0f7a33;--c-on-accent:#fff;--c-sel:rgb(15 122 51/.11)}
+#stage[data-accent="lime"][data-glass]{--accent:#b4e04a;--on-accent:#192419;--rim-act:rgb(180 224 74/.62);--accent-2:#7db8ff;}
+#stage[data-accent="lime"][data-glass="light"][data-palette]{--accent:#53710c;--on-accent:#fff;--rim-act:rgb(83 113 12/.6);--accent-2:#1f6fe0}
+#stage[data-accent="lime"][data-content]{--c-accent:#b4e04a;--c-on-accent:#192419;--c-sel:rgb(180 224 74/.16)}
+#stage[data-accent="lime"][data-content="light"][data-palette]{--c-accent:#53710c;--c-on-accent:#fff;--c-sel:rgb(83 113 12/.11)}
+#stage[data-accent="amber"][data-glass]{--accent:#f2bb4e;--on-accent:#211f19;--rim-act:rgb(242 187 78/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="amber"][data-glass="light"][data-palette]{--accent:#8a5a00;--on-accent:#fff;--rim-act:rgb(138 90 0/.6);--accent-2:#0a7f8a}
+#stage[data-accent="amber"][data-content]{--c-accent:#f2bb4e;--c-on-accent:#211f19;--c-sel:rgb(242 187 78/.16)}
+#stage[data-accent="amber"][data-content="light"][data-palette]{--c-accent:#8a5a00;--c-on-accent:#fff;--c-sel:rgb(138 90 0/.11)}
+#stage[data-accent="orange"][data-glass]{--accent:#ff9a57;--on-accent:#221b1a;--rim-act:rgb(255 154 87/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
+#stage[data-accent="orange"][data-glass="light"][data-palette]{--accent:#ae4e0f;--on-accent:#fff;--rim-act:rgb(174 78 15/.6);--accent-2:#0a7f8a}
+#stage[data-accent="orange"][data-content]{--c-accent:#ff9a57;--c-on-accent:#221b1a;--c-sel:rgb(255 154 87/.16)}
+#stage[data-accent="orange"][data-content="light"][data-palette]{--c-accent:#ae4e0f;--c-on-accent:#fff;--c-sel:rgb(174 78 15/.11)}
+#stage[data-accent="red"][data-glass]{--accent:#ff7a72;--on-accent:#22171e;--rim-act:rgb(255 122 114/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
+#stage[data-accent="red"][data-glass="light"][data-palette]{--accent:#c4302b;--on-accent:#fff;--rim-act:rgb(196 48 43/.6);--accent-2:#0a7f8a}
+#stage[data-accent="red"][data-content]{--c-accent:#ff7a72;--c-on-accent:#22171e;--c-sel:rgb(255 122 114/.16)}
+#stage[data-accent="red"][data-content="light"][data-palette]{--c-accent:#c4302b;--c-on-accent:#fff;--c-sel:rgb(196 48 43/.11)}
+#stage[data-accent="pink"][data-glass]{--accent:#ff6cba;--on-accent:#221626;--rim-act:rgb(255 108 186/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
+#stage[data-accent="pink"][data-glass="light"][data-palette]{--accent:#c81e7c;--on-accent:#fff;--rim-act:rgb(200 30 124/.6);--accent-2:#0a7f8a}
+#stage[data-accent="pink"][data-content]{--c-accent:#ff6cba;--c-on-accent:#221626;--c-sel:rgb(255 108 186/.16)}
+#stage[data-accent="pink"][data-content="light"][data-palette]{--c-accent:#c81e7c;--c-on-accent:#fff;--c-sel:rgb(200 30 124/.11)}
+#stage[data-accent="violet"][data-glass]{--accent:#b79cff;--on-accent:#191c2e;--rim-act:rgb(183 156 255/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="violet"][data-glass="light"][data-palette]{--accent:#6a43d6;--on-accent:#fff;--rim-act:rgb(106 67 214/.6);--accent-2:#0a7f8a}
+#stage[data-accent="violet"][data-content]{--c-accent:#b79cff;--c-on-accent:#191c2e;--c-sel:rgb(183 156 255/.16)}
+#stage[data-accent="violet"][data-content="light"][data-palette]{--c-accent:#6a43d6;--c-on-accent:#fff;--c-sel:rgb(106 67 214/.11)}
+#stage[data-accent="slate"][data-glass]{--accent:#a9bdd6;--on-accent:#181f2a;--rim-act:rgb(169 189 214/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="slate"][data-glass="light"][data-palette]{--accent:#47607f;--on-accent:#fff;--rim-act:rgb(71 96 127/.6);--accent-2:#0a7f8a}
+#stage[data-accent="slate"][data-content]{--c-accent:#a9bdd6;--c-on-accent:#181f2a;--c-sel:rgb(169 189 214/.16)}
+#stage[data-accent="slate"][data-content="light"][data-palette]{--c-accent:#47607f;--c-on-accent:#fff;--c-sel:rgb(71 96 127/.11)}
+#stage[data-accent="wallpaper"][data-glass]{--accent:#f6b98a;--on-accent:#211f20;--rim-act:rgb(246 185 138/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="wallpaper"][data-glass="light"][data-palette]{--accent:#a8511d;--on-accent:#fff;--rim-act:rgb(168 81 29/.6);--accent-2:#0a7f8a}
+#stage[data-accent="wallpaper"][data-content]{--c-accent:#f6b98a;--c-on-accent:#211f20;--c-sel:rgb(246 185 138/.16)}
+#stage[data-accent="wallpaper"][data-content="light"][data-palette]{--c-accent:#a8511d;--c-on-accent:#fff;--c-sel:rgb(168 81 29/.11)}
+/* Reactive rim: the active rim shows the wallpaper under it, brightened. Native: per-vertex colours from the blur target. */
+#stage[data-rim="1"] .win.active:not(.max)::after{border:0;padding:2px;background:url("assets/brook-dawn.png") var(--wx,0) var(--wy,0)/1600px 900.5px;filter:saturate(2.6) brightness(1.3);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
+
+/* ---------- Chrome styles (Settings > Lab) ---------- */
+/* Brook tabs: title and controls are two tabs; the wallpaper shows between them. */
+#stage[data-style="tabs"] .win:not(.max){overflow:visible;box-shadow:none}
+#stage[data-style="tabs"] .win:not(.max)::after{display:none}
+#stage[data-style="tabs"] .win:not(.max) .tb{background:none;-webkit-backdrop-filter:none;backdrop-filter:none;border:0;box-shadow:none;padding:0}
+#stage[data-style="tabs"] .win:not(.max) :is(.tl,.caps){height:100%;background:rgb(var(--g)/var(--a));-webkit-backdrop-filter:blur(var(--blur));backdrop-filter:blur(var(--blur));border:1px solid var(--rim-out);border-bottom:0;border-radius:var(--r-win) var(--r-win) 0 0}
+#stage[data-style="tabs"] .win:not(.max) .tl{padding:0 18px 0 12px}
+#stage[data-style="tabs"] .win.active:not(.max) :is(.tl,.caps){background:linear-gradient(180deg,rgb(var(--g-hi)/var(--a)),rgb(var(--g)/var(--a)));border-color:var(--rim-act)}
+#stage[data-style="tabs"] .win:not(.max) .client{border:1px solid var(--rim-out);border-radius:0 0 2px 2px;box-shadow:0 6px 16px rgb(var(--sh)/.30)}
+#stage[data-style="tabs"] .win.active:not(.max) .client{border-color:var(--rim-act);box-shadow:0 14px 32px rgb(var(--sh)/.50)}
+/* Alloy: brushed metal. The highlight band is fixed to the screen, so it slides across a window as it moves. */
+#stage[data-style="alloy"][data-glass][data-palette]{--ink:#1b2129;--ink-2:rgb(27 33 41/.8);--ink-3:rgb(27 33 41/.6);--hover:rgb(0 0 0/.09);--press:rgb(0 0 0/.16);--well:rgb(255 255 255/.36);--rim-out:rgb(0 0 0/.34);--rim-hi:rgb(255 255 255/.7);--rim-act:rgb(255 255 255/.85);--divide:rgb(0 0 0/.34);--g-flat:176 182 191;--accent:#1f5fc4;--on-accent:#fff;--accent-2:#0a7f8a}
+#stage[data-style="alloy"] :is(.tb,.glass){-webkit-backdrop-filter:none;backdrop-filter:none;background:linear-gradient(100deg,transparent 28%,rgb(255 255 255/.6) 45%,transparent 60%) var(--wx,0) 0/1600px 100%,repeating-linear-gradient(0deg,rgb(255 255 255/.12) 0 1px,rgb(0 0 0/.05) 1px 2px),linear-gradient(180deg,#cfd4db,#a2a9b4)}
+#stage[data-style="alloy"] .win:not(.active) .tb{filter:brightness(.9)}
+/* Phosphor: monochrome CRT chrome. Scanlines are a tiled quad; the glow is a baked glyph shadow. */
+#stage[data-style="phosphor"][data-glass][data-palette]{--g:4 16 8;--g-hi:8 36 17;--g-flat:5 18 9;--ink:#7dff9b;--ink-2:rgb(125 255 155/.8);--ink-3:rgb(125 255 155/.56);--accent:#c8ffd2;--on-accent:#02140a;--accent-2:#ffc857;--rim-out:rgb(125 255 155/.36);--rim-hi:rgb(125 255 155/.2);--rim-act:rgb(150 255 175/.95);--sheen:transparent;--divide:rgb(125 255 155/.3);--hover:rgb(125 255 155/.12);--press:rgb(125 255 155/.22);--well:rgb(0 0 0/.42);--font-ui:var(--font-mono)}
+#stage[data-style="phosphor"] :is(.tb,.glass),#stage[data-style="phosphor"] .win.active .tb{text-shadow:0 0 6px rgb(125 255 155/.7);background-color:rgb(var(--g)/var(--a));background-image:repeating-linear-gradient(0deg,rgb(0 0 0/.3) 0 1px,transparent 1px 3px)}
+#stage[data-style="phosphor"] .win.active{box-shadow:0 0 16px rgb(125 255 155/.35),0 14px 32px rgb(0 0 0/.55)}
+/* Neon: synthwave. The glow is one coloured nine-slice; the grid is a tiled quad. */
+#stage[data-style="neon"][data-glass][data-palette]{--g:22 10 46;--g-hi:62 20 98;--g-flat:26 12 52;--ink:#fdeaff;--ink-2:rgb(253 234 255/.78);--ink-3:rgb(253 234 255/.56);--accent:#ff4fd8;--on-accent:#1b0326;--accent-2:#38e8ff;--rim-out:rgb(255 79 216/.38);--rim-act:#38e8ff;--rim-hi:rgb(255 255 255/.18);--divide:rgb(255 79 216/.3);--hover:rgb(255 79 216/.16);--press:rgb(255 79 216/.28);--well:rgb(0 0 0/.32)}
+#stage[data-style="neon"] .win.active{box-shadow:0 0 20px rgb(56 232 255/.6),0 14px 32px rgb(20 0 40/.6)}
+#stage[data-style="neon"] .win.active .tb::before{left:0;width:100%;border-radius:0;background:linear-gradient(90deg,#ff4fd8,#38e8ff)}
+#stage[data-style="neon"] #taskbar{background-color:rgb(var(--g)/var(--a));background-image:linear-gradient(rgb(255 79 216/.2) 1px,transparent 1px),linear-gradient(90deg,rgb(255 79 216/.2) 1px,transparent 1px);background-size:24px 12px}
+
+/* ---------- Touch density: 44 px minimum targets ---------- */
+#stage[data-touch="1"]{--h-title:44px;--h-bar:52px;--h-ctl:44px}
+#stage[data-touch="1"] .caps button{width:52px}
+#stage[data-touch="1"] .seg button{height:40px}
+#stage[data-touch="1"] :is(.rb,.f-side button,.f-row:not(.head),.mi,.gbtn,.set-tabs button){height:44px}
+#stage[data-touch="1"] .app{height:52px}
+#stage[data-touch="1"] :is(.ibtn,.f-bar button,.more){width:44px;height:44px}
+#stage[data-touch="1"] .row{min-height:48px}
+
+/* ---------- Hit-area overlay (study aid) ---------- */
+#stage[data-hits="1"] :is(button,[role=button],.app,input,.row:has(.sw),.f-row:not(.head)){outline:1px solid rgb(255 0 200/.95);outline-offset:-1px;background-image:linear-gradient(rgb(255 0 200/.16),rgb(255 0 200/.16))}
+#stage[data-hits="1"] .tb{outline:1px dashed rgb(255 196 0/.95);outline-offset:-1px}
+#stage[data-hits="1"] .win:not(.max){outline:6px solid rgb(0 220 255/.38)}
+#stage[data-hits="1"] .win:not(.max)::before{content:"";position:absolute;inset:0;border:2px solid rgb(0 220 255/.9);pointer-events:none;z-index:2}
+#stage[data-hits="1"] .caps{position:relative;z-index:4}
+#hitkey{position:absolute;left:16px;top:16px;z-index:980;padding:10px 12px;border-radius:var(--r-win);background:rgb(8 12 20/.88);color:#e8eef8;font-size:var(--t-cap);line-height:1.7}
+#hitkey i{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+
+@media (prefers-reduced-motion:reduce){#stage *{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+
+<div id="study" role="toolbar" aria-label="Study controls">
+  <b>Clearwater Next</b>
+  <span class="lbl">Palette</span>
+  <div class="grp" data-key="palette"><button data-v="clearwater">Clearwater</button><button data-v="smoked">Smoked</button><button data-v="opal">Opal</button></div>
+  <span class="lbl">Mode</span>
+  <div class="grp" data-key="mode"><button data-v="light">Light</button><button data-v="mixed">Mixed</button><button data-v="dark">Dark</button></div>
+  <button class="one" data-toggle="perf">Performance mode</button>
+  <span class="lbl">Style</span>
+  <div class="grp" data-key="style"><button data-v="glass">Glass</button><button data-v="tabs">Tabs</button><button data-v="alloy">Alloy</button><button data-v="phosphor">Phosphor</button><button data-v="neon">Neon</button></div>
+  <button class="one" data-toggle="hits">Hit areas</button>
+  <span class="lbl">Show</span>
+  <div class="grp"><button data-do="launcher">Launcher</button><button data-do="organise">Organise</button><button data-do="install">Install app</button><button data-do="hud">HUD</button><button data-do="boot">Boot toast</button><button data-do="thermal">Thermal toast</button><button data-do="net">Network toast</button></div>
+  <span class="sp"></span>
+  <button class="one" data-do="reset">Reset</button>
+</div>
+
+<div id="fit">
+<main id="stage" data-palette="clearwater" data-glass="dark" data-content="light" data-perf="0" data-labels="1" data-style="glass" aria-label="Brook desktop prototype, 1600 by 900 logical pixels">
+
+  <!-- Files -->
+  <section class="win" id="w-files" data-app="files" style="left:250px;top:64px;width:800px;height:500px" aria-label="Files window">
+    <header class="tb"><img src="assets/icons/files.svg" alt=""><span class="title">Files</span>
+      <div class="caps"><button data-act="min" aria-label="Minimise"><span><i data-i="min"></i></span></button><button data-act="max" aria-label="Maximise"><span><i data-i="max"></i></span></button><button data-act="close" class="x" aria-label="Close"><span><i data-i="close"></i></span></button></div></header>
+    <div class="client">
+      <div class="f-bar"><button aria-label="Back"><i data-i="back"></i></button><button aria-label="Forward"><i data-i="fwd"></i></button><button aria-label="Up"><i data-i="up"></i></button>
+        <div class="f-path"><i data-i="home"></i><span>brook</span><span>/</span><b>Home</b></div><button aria-label="Search this folder"><i data-i="search"></i></button></div>
+      <div class="f-main">
+        <nav class="f-side" aria-label="Places"><h4>Places</h4>
+          <button class="sel"><i data-i="home"></i>Home</button><button><i data-i="folder"></i>Documents</button><button><i data-i="folder"></i>Downloads</button><button><i data-i="folder"></i>Pictures</button><button><i data-i="folder"></i>Videos</button>
+          <h4>Devices</h4><button><i data-i="disk"></i>BROOK</button><button><i data-i="disk"></i>Data disk</button></nav>
+        <div class="f-list" id="flist"></div>
+      </div>
+      <div class="f-stat"><span>9 items</span><span>1 selected</span><span style="margin-left:auto">48 GB free of 64 GB</span></div>
+    </div>
+  </section>
+
+  <!-- Terminal -->
+  <section class="win" id="w-terminal" data-app="terminal" style="left:70px;top:430px;width:600px;height:372px" aria-label="Terminal window">
+    <header class="tb"><img src="assets/icons/terminal.svg" alt=""><span class="title">Terminal</span>
+      <div class="caps"><button data-act="min" aria-label="Minimise"><span><i data-i="min"></i></span></button><button data-act="max" aria-label="Maximise"><span><i data-i="max"></i></span></button><button data-act="close" class="x" aria-label="Close"><span><i data-i="close"></i></span></button></div></header>
+    <div class="client"><div class="term"><span class="p">brook:/ $</span> ls
+<span class="g">BOOT  DEV  DRIVERS  ETC  SYS  TEST  TMP  USR  data  nix  proc</span>
+BROOK.CFG
+<span class="p">brook:/ $</span> gpu glass status
+<span class="o">palette=clearwater mode=mixed opacity=80 blur=light
+performance_mode=off material_cache_rebuilds=1</span>
+<span class="p">brook:/ $</span> <span class="cur"></span></div></div>
+  </section>
+
+  <!-- Settings (440 px inspector) -->
+  <section class="win active" id="w-settings" data-app="settings" style="left:1000px;top:172px;width:440px;height:672px" aria-label="Settings window">
+    <header class="tb"><img src="assets/icons/settings.svg" alt=""><span class="title">Settings</span>
+      <div class="caps"><button data-act="min" aria-label="Minimise"><span><i data-i="min"></i></span></button><button data-act="max" aria-label="Maximise"><span><i data-i="max"></i></span></button><button data-act="close" class="x" aria-label="Close"><span><i data-i="close"></i></span></button></div></header>
+    <div class="client">
+      <div class="set-tabs" role="tablist"><button role="tab" data-tab="appearance">Appearance</button><button role="tab" data-tab="taskbar">Taskbar</button><button role="tab" data-tab="lab">Lab</button><button role="tab" data-tab="about">About</button></div>
+      <div class="set-body" id="set-appearance" role="tabpanel">
+        <section><h3>Palette</h3>
+          <div class="pals" data-key="palette">
+            <button class="pal" data-v="clearwater"><span class="mini"><i></i></span>Clearwater</button>
+            <button class="pal" data-v="smoked"><span class="mini"><i></i></span>Smoked</button>
+            <button class="pal" data-v="opal"><span class="mini"><i></i></span>Opal</button></div>
+          <div class="row" style="min-height:28px"><div class="lab">Accent</div><span class="val" id="acc-name"></span></div>
+          <div class="accs" data-key="accent"><button data-v="auto" aria-label="Palette default" title="Palette default"><i id="acc-auto"><i data-i="check"></i></i></button><button data-v="blue" aria-label="Clearwater blue" title="Clearwater blue"><i style="--sd:#6aaeff;--sl:#1c65cc"><i data-i="check"></i></i></button><button data-v="teal" aria-label="Teal" title="Teal"><i style="--sd:#4fd3c4;--sl:#09747e"><i data-i="check"></i></i></button><button data-v="pine" aria-label="Pine green" title="Pine green"><i style="--sd:#62d6a0;--sl:#1b7650"><i data-i="check"></i></i></button><button data-v="phosphor" aria-label="Phosphor" title="Phosphor"><i style="--sd:#7dff9b;--sl:#0f7a33"><i data-i="check"></i></i></button><button data-v="lime" aria-label="Lime" title="Lime"><i style="--sd:#b4e04a;--sl:#53710c"><i data-i="check"></i></i></button><button data-v="amber" aria-label="Amber" title="Amber"><i style="--sd:#f2bb4e;--sl:#8a5a00"><i data-i="check"></i></i></button><button data-v="orange" aria-label="Orange" title="Orange"><i style="--sd:#ff9a57;--sl:#ae4e0f"><i data-i="check"></i></i></button><button data-v="red" aria-label="Red" title="Red"><i style="--sd:#ff7a72;--sl:#c4302b"><i data-i="check"></i></i></button><button data-v="pink" aria-label="Hot pink" title="Hot pink"><i style="--sd:#ff6cba;--sl:#c81e7c"><i data-i="check"></i></i></button><button data-v="violet" aria-label="Violet" title="Violet"><i style="--sd:#b79cff;--sl:#6a43d6"><i data-i="check"></i></i></button><button data-v="slate" aria-label="Slate" title="Slate"><i style="--sd:#a9bdd6;--sl:#47607f"><i data-i="check"></i></i></button><button data-v="wallpaper" aria-label="Wallpaper (dawn)" title="Wallpaper (dawn)"><i class="wp" style="--sd:#f6b98a;--sl:#a8511d"><i data-i="check"></i></i></button></div>
+          <div class="row"><div class="lab">Mode<small id="mode-hint"></small></div>
+            <div class="seg" data-key="mode"><button data-v="light">Light</button><button data-v="mixed">Mixed</button><button data-v="dark">Dark</button></div></div>
+        </section>
+        <section><h3>Glass</h3>
+          <div id="glassrows">
+            <div class="row"><label class="lab" for="s-op">Opacity</label><span class="val num" id="s-opv">80%</span></div>
+            <input type="range" id="s-op" min="40" max="100" step="5" value="80" aria-label="Glass opacity">
+            <div class="row" style="margin-top:4px"><div class="lab">Backdrop blur</div>
+              <div class="seg" data-key="blur"><button data-v="none">None</button><button data-v="light">Light</button><button data-v="moderate">Moderate</button><button data-v="heavy">Heavy</button></div></div>
+          </div>
+          <div class="row"><div class="lab">Performance mode<small>Opaque flat frames. No blur, shadows or motion.</small></div><button class="sw" role="switch" data-key="perf" aria-label="Performance mode"></button></div>
+        </section>
+        <section><h3>Display</h3>
+          <div class="row"><div class="lab">Scale</div>
+            <div class="seg" data-key="scale"><button data-v="100">100%</button><button data-v="150">150%</button><button data-v="200">200%</button></div></div>
+        </section>
+      </div>
+      <div class="set-body" id="set-taskbar" role="tabpanel" hidden>
+        <section><h3>Performance HUD</h3>
+          <div class="row"><div class="lab">Frame-time graphs<small>APP, COMP and TEMP. Alt+P cycles.</small></div>
+            <div class="seg" data-key="hud"><button data-v="off">Off</button><button data-v="compact">Compact</button><button data-v="expanded">Panel</button></div></div>
+          <div class="row"><div class="lab">Build label<small>Kernel build and payload, beside the tray.</small></div><button class="sw" role="switch" data-key="build" aria-label="Build label"></button></div>
+        </section>
+        <section><h3>Tray</h3>
+          <div class="row"><div class="lab">Temperature<small>Package temperature next to volume.</small></div><button class="sw" role="switch" data-key="temp" aria-label="Temperature in tray"></button></div>
+          <div class="row"><div class="lab">24-hour clock</div><button class="sw" role="switch" data-key="h24" aria-label="24-hour clock"></button></div>
+          <div class="row"><div class="lab">Date under the clock</div><button class="sw" role="switch" data-key="date" aria-label="Date under the clock"></button></div>
+        </section>
+        <section><h3>Tasks</h3>
+          <div class="row"><div class="lab">Window titles<small>Off shows icons only.</small></div><button class="sw" role="switch" data-key="labels" aria-label="Window titles on task buttons"></button></div>
+        </section>
+      </div>
+      <div class="set-body" id="set-lab" role="tabpanel" hidden>
+        <section><h3>Chrome style</h3>
+          <div class="radios" data-key="style">
+            <button data-v="glass"><b>Glass</b><small>Clearwater as designed.</small></button>
+            <button data-v="tabs"><b>Brook tabs</b><small>Title and controls as two tabs on the frame.</small></button>
+            <button data-v="alloy"><b>Alloy</b><small>Brushed metal with a screen-fixed highlight.</small></button>
+            <button data-v="phosphor"><b>Phosphor</b><small>Green CRT chrome with scanlines.</small></button>
+            <button data-v="neon"><b>Neon</b><small>Synthwave rim glow and a grid taskbar.</small></button>
+          </div></section>
+        <section><h3>Effects</h3>
+          <div class="row"><div class="lab">Reactive rim light<small>The active rim picks up the wallpaper behind it.</small></div><button class="sw" role="switch" data-key="rim" aria-label="Reactive rim light"></button></div>
+        </section>
+        <section><h3>Input</h3>
+          <div class="row"><div class="lab">Touch targets<small>44 px minimum. Turns on at the first touch.</small></div><button class="sw" role="switch" data-key="touch" aria-label="Touch targets"></button></div>
+        </section>
+      </div>
+      <div class="set-body" id="set-about" role="tabpanel" hidden>
+        <section><div class="about-id"><img src="assets/brook-mark.png" alt=""><div><strong>Brook</strong><span class="hint">Dell XPS 13 9343</span></div></div>
+          <dl class="kv"><dt>Build</dt><dd class="mono">3a4b909e</dd><dt>Payload</dt><dd class="mono">29117654</dd><dt>Display</dt><dd>3200×1800 at 200%</dd><dt>Compositor</dt><dd>GPU, glass on</dd></dl></section>
+        <section><h3>Last boot</h3>
+          <div class="row"><div class="lab">Desktop ready in <b class="num">8.12 s</b><small>From power-on.</small></div><button class="c-btn" id="again">Show again</button></div>
+          <div class="bootbar" data-boot></div><div class="bootleg" data-bootleg style="color:var(--c-dim)"></div></section>
+      </div>
+      <div class="set-foot" id="set-foot"><span class="state" id="set-state">Saved</span><button class="c-btn" id="revert" disabled>Revert</button><button class="c-btn primary" id="apply" disabled>Apply</button></div>
+    </div>
+  </section>
+
+  <div id="toasts" aria-live="polite"></div>
+  <div id="hitkey" hidden><i style="background:rgb(255 0 200/.6)"></i>Click target<br><i style="border:1px dashed rgb(255 196 0)"></i>Titlebar drag<br><i style="background:rgb(0 220 255/.9)"></i>Resize, 2 px inside the frame<br><i style="background:rgb(0 220 255/.38)"></i>Resize, 6 px outside the frame</div>
+
+  <!-- Launcher -->
+  <section class="panel glass shut" id="launcher" aria-label="Launcher">
+    <label class="l-search"><i data-i="search"></i><input id="q" type="text" placeholder="Search apps and categories" autocomplete="off" spellcheck="false" aria-label="Search apps and categories"><kbd>Esc</kbd></label>
+    <div class="l-top" id="l-top"><div class="l-toptabs"><button data-top="pins">Pinned</button><button data-top="recent">Recent</button></div><div class="l-tiles" id="l-tiles"></div></div>
+    <div class="l-mid"><nav class="l-rail" id="l-rail" aria-label="Categories"></nav>
+      <div class="l-pane"><div class="l-bar" id="l-bar" hidden></div><div class="l-list" id="l-list" role="listbox" aria-label="Apps"></div><div class="l-undo" id="l-undo" hidden></div></div></div>
+    <div class="l-foot"><div class="who"><span class="av">b</span><div>brook<small class="mono">3a4b909e</small></div></div>
+      <span class="keys"><span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd> open</span><span><kbd>Alt</kbd>+<kbd>↑</kbd> <kbd>↓</kbd> reorder</span></span>
+      <button class="gbtn" id="l-org" aria-pressed="false"><i data-i="grid"></i>Organise</button>
+      <button class="ibtn" data-launch="settings" aria-label="Settings" title="Settings"><i data-i="sliders"></i></button><button class="ibtn" aria-label="Restart" title="Restart"><i data-i="restart"></i></button><button class="ibtn" aria-label="Shut down" title="Shut down"><i data-i="power"></i></button></div>
+    <div class="menu" id="l-menu" role="menu" hidden></div>
+    <div class="menu" id="l-edit" role="dialog" aria-label="Edit category" hidden></div>
+    <div class="sr" id="l-live" aria-live="polite"></div>
+  </section>
+
+  <!-- Tray flyouts -->
+  <section class="panel glass fly shut" id="fly-net" aria-label="Network">
+    <header><i data-i="net"></i><b>Network</b><span class="pill">Connected</span></header>
+    <dl><dt>Interface</dt><dd class="mono">eth0</dd><dt>Address</dt><dd class="mono">192.168.1.42</dd><dt>Gateway</dt><dd class="mono">192.168.1.1</dd><dt>Link</dt><dd>1 Gb/s, full duplex</dd></dl>
+  </section>
+  <section class="panel glass fly shut" id="fly-vol" aria-label="Volume">
+    <header><i data-i="vol"></i><b>Volume</b></header>
+    <div class="volrow"><button class="ibtn" id="mute" aria-label="Mute"><i data-i="vol"></i></button><input type="range" id="vol" min="0" max="100" value="62" aria-label="Volume"><output class="num" id="volv">62</output></div>
+    <dl><dt>Output</dt><dd>Speakers</dd></dl>
+  </section>
+  <section class="panel glass fly shut" id="fly-temp" aria-label="Temperature and power">
+    <header><i data-i="temp"></i><b>Temperature</b><span class="pill" id="temp-pill">Cool</span></header>
+    <div class="big num"><span id="temp-big">52</span> °C<small id="pow-big">6.1 W</small></div>
+    <div class="gbox" id="temp-g"></div>
+    <dl><dt>Sensor</dt><dd>CPU package</dd><dt>Last minute</dt><dd class="num" id="temp-range">48–56 °C</dd><dt>Warm from</dt><dd class="num">75 °C</dd><dt>Hot from</dt><dd class="num">90 °C</dd></dl>
+  </section>
+
+  <!-- Performance HUD (expanded) -->
+  <section class="panel glass shut" id="hud" aria-label="Performance HUD">
+    <header><b>Performance</b><span class="fps num" id="hud-fps">60.0 fps</span><button class="ibtn" data-hud="compact" aria-label="Collapse to taskbar" title="Collapse to taskbar"><i data-i="down"></i></button><button class="ibtn" data-hud="off" aria-label="Hide HUD" title="Hide"><i data-i="close"></i></button></header>
+    <div class="hg"><div class="top"><em>APP</em><b class="num" id="h-app">4.1 ms</b><span class="num" id="h-app-p"></span></div><div class="gbox" id="g-app"></div></div>
+    <div class="hg"><div class="top"><em>COMP</em><b class="num" id="h-comp">2.3 ms</b><span class="num" id="h-comp-p"></span></div><div class="gbox" id="g-comp"></div></div>
+    <div class="hg"><div class="top"><em>TEMP</em><b class="num" id="h-temp">52 °C</b><span class="num" id="h-temp-p"></span></div><div class="gbox" id="g-temp"></div></div>
+    <footer><span class="mono">Brook 3a4b909e+29117654</span><span>3200×1800 · 60 Hz</span></footer>
+  </section>
+
+  <!-- Taskbar -->
+  <footer class="glass" id="taskbar">
+    <button class="tk" id="start" aria-label="Launcher" aria-expanded="false"><img src="assets/brook-mark.png" alt=""></button>
+    <span class="vsep"></span>
+    <div id="tasks"></div>
+    <span class="grow"></span>
+    <button class="tk" id="hudchip" aria-label="Performance HUD. Open panel" title="Open performance panel"></button>
+    <span class="mono" id="build" title="Kernel build + payload">3a4b909e+29117654</span>
+    <span class="vsep"></span>
+    <div id="tray">
+      <button class="tk" data-fly="net" aria-label="Network: connected" title="Network"><i data-i="net"></i></button>
+      <button class="tk" data-fly="vol" id="t-vol" aria-label="Volume" title="Volume"><i data-i="vol"></i></button>
+      <button class="tk" data-fly="temp" id="t-temp" aria-label="Temperature" title="Temperature"><i data-i="temp"></i><span class="num" id="t-tempv">52°</span></button>
+    </div>
+    <div class="tk" id="clock"><b class="num" id="c-time">10:42</b><small id="c-date">Sun 15 Nov</small></div>
+  </footer>
+</main>
+</div>
+
+<script>
+(() => {
+'use strict';
+const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const stage = $('#stage'), Q = new URLSearchParams(location.search), SHOT = Q.has('shot');
+if (SHOT) document.documentElement.classList.add('shot');
+
+/* ---------- Icons: one 16 px grid, 1.5 px stroke. Native: A8 masks tinted at draw time. ---------- */
+const ICON = {
+  search:'<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>', min:'<path d="M4 8h8"/>',
+  max:'<rect x="4" y="4" width="8" height="8" rx="1.5"/>',
+  restore:'<rect x="3.5" y="5.5" width="7" height="7" rx="1.5"/><path d="M6 5.5v-1a1 1 0 0 1 1-1h4.5a1 1 0 0 1 1 1V9a1 1 0 0 1-1 1h-1"/>',
+  close:'<path d="m4.5 4.5 7 7m0-7-7 7"/>', back:'<path d="M10 4 6 8l4 4"/>', fwd:'<path d="m6 4 4 4-4 4"/>', up:'<path d="m4 10 4-4 4 4"/>', down:'<path d="m4 6 4 4 4-4"/>',
+  net:'<path d="M5 13V3m0 0L2.5 5.5M5 3l2.5 2.5M11 3v10m0 0-2.5-2.5M11 13l2.5-2.5"/>',
+  vol:'<path d="M2.5 6.5h2l3-2.5v8l-3-2.5h-2zM10 6a3 3 0 0 1 0 4m1.8-5.8a5.5 5.5 0 0 1 0 7.6"/>',
+  mute:'<path d="M2.5 6.5h2l3-2.5v8l-3-2.5h-2zm8 0 3 3m0-3-3 3"/>',
+  temp:'<path d="M8 2.5A1.5 1.5 0 0 0 6.5 4v5.2a2.8 2.8 0 1 0 3 0V4A1.5 1.5 0 0 0 8 2.5zM8 7v4.5"/>',
+  power:'<path d="M8 2.5v5M4.6 4.8a5 5 0 1 0 6.8 0"/>', restart:'<path d="M12.5 8a4.5 4.5 0 1 1-1.3-3.2M12.5 2.6v2.6H9.9"/>',
+  sliders:'<path d="M2.5 5h4m3.2 0h3.8M2.5 11h3.8m3.2 0h4"/><circle cx="8.1" cy="5" r="1.6"/><circle cx="7.9" cy="11" r="1.6"/>',
+  home:'<path d="M3 7.5 8 3l5 4.5V13H9.5v-3h-3v3H3z"/>',
+  folder:'<path d="M2.5 4.5a1 1 0 0 1 1-1h2.8l1.2 1.5h5a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/>',
+  file:'<path d="M4.5 2.5H9l3 3V13a.5.5 0 0 1-.5.5h-7A.5.5 0 0 1 4 13V3a.5.5 0 0 1 .5-.5zM9 2.5v3h3"/>',
+  disk:'<rect x="2.5" y="4" width="11" height="8" rx="1.5"/><path d="M5 9.8h3m3.2 0h.1"/>',
+  bolt:'<path d="M9 2 4 9h3.5L7 14l5-7H8.5z"/>', info:'<circle cx="8" cy="8" r="5.5"/><path d="M8 7.4v3.4M8 5.2v.1"/>',
+  more:'<circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/>', check:'<path d="m3.5 8.5 3 3 6-7"/>', plus:'<path d="M8 3.5v9M3.5 8h9"/>',
+  grid:'<rect x="3" y="3" width="4" height="4" rx="1"/><rect x="9" y="3" width="4" height="4" rx="1"/><rect x="3" y="9" width="4" height="4" rx="1"/><rect x="9" y="9" width="4" height="4" rx="1"/>',
+  globe:'<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11M8 2.5c-2.2 2-2.2 9 0 11m0-11c2.2 2 2.2 9 0 11"/>', play:'<path d="M5.5 3.5v9l7-4.5z"/>',
+  doc:'<path d="M4.5 2.5h7v11h-7zM6.5 5.5h3m-3 2.5h3m-3 2.5h2"/>', brush:'<path d="m10.5 2.5 3 3-7 7H3.5v-3z"/>',
+  pad:'<rect x="2" y="5" width="12" height="7" rx="3"/><path d="M5 8.5h2M6 7.5v2m4.8-1h.1"/>', spark:'<path d="M8 2.5v3m0 5v3M2.5 8h3m5 0h3"/>',
+  star:'<path d="m8 2.5 1.7 3.5 3.8.5-2.8 2.6.7 3.8L8 11.1l-3.4 1.8.7-3.8L2.5 6.5l3.8-.5z"/>', code:'<path d="M6 4.5 2.5 8 6 11.5m4-7L13.500 8 10 11.5"/>',
+  music:'<path d="M6 11.5V4l6-1.500V10"/><circle cx="4.5" cy="11.5" r="1.5"/><circle cx="10.5" cy="10" r="1.5"/>', tool:'<path d="M3 13l5.500-5.500M9 3.500a3 3 0 0 0 3.500 3.500l-1.500-1.500 1-2z"/>',
+  inbox:'<path d="m2.5 9 1.800-5h7.400l1.800 5v3.500h-11zm0 0h3.200l.8 1.500h3l.8-1.500h3.200"/>', pin:'<path d="M6 2.500h4l-.5 4 2 2.500h-7l2-2.500zM8 9v4.500"/>',
+  undo:'<path d="M5 4 2.500 6.500 5 9M2.500 6.500h7a3.500 3.500 0 0 1 0 7H7"/>', trash:'<path d="M3.500 4.500h9m-6 0V3h3v1.500m-5 0 .6 8.500h5.800l.6-8.500"/>',
+  ret:'<path d="M12 4v4.5a1 1 0 0 1-1 1H4.5m0 0 2.2-2.2M4.5 9.5l2.2 2.2"/>'
+};
+const ic = n => `<svg class="i" viewBox="0 0 16 16" aria-hidden="true">${ICON[n]}</svg>`;
+$$('i[data-i]').forEach(e => e.outerHTML = ic(e.dataset.i));
+
+/* ---------- State (what native Settings persists in [Desktop]) ---------- */
+const DEF = {palette:'clearwater', mode:'mixed', opacity:80, blur:'light', perf:false, scale:'200', hud:'compact', build:true, temp:true, h24:true, date:true, labels:true,
+  accent:'auto', style:'glass', rim:false, touch:false, hits:false};
+const BLUR = {none:'0px', light:'3px', moderate:'9px', heavy:'18px'};   // roughly x3 then x2: each step reads as a different material
+const KEY = 'brook.clearwater-next.v3';
+const ACCENTS = {"blue": "Clearwater blue", "teal": "Teal", "pine": "Pine green", "phosphor": "Phosphor", "lime": "Lime", "amber": "Amber", "orange": "Orange", "red": "Red", "pink": "Hot pink", "violet": "Violet", "slate": "Slate", "wallpaper": "Wallpaper (dawn)"};
+const load = () => { try { return {...DEF, ...JSON.parse(localStorage.getItem(KEY) || '{}')}; } catch { return {...DEF}; } };
+let saved = SHOT ? {...DEF} : load(), S = {...saved};
+for (const k of Object.keys(DEF)) if (Q.has(k)) { const v = Q.get(k); S[k] = typeof DEF[k] === 'boolean' ? v !== '0' : typeof DEF[k] === 'number' ? +v : v; }
+if (SHOT) saved = {...S};
+
+const PAL = {   // palette-card miniatures: [glass, title highlight, accent] per glass mode
+  clearwater:{dark:['#10244a','#28508a','#6aaeff'], light:['#e2edfb','#bad5f8','#1f6fe0']},
+  smoked:{dark:['#161a22','#363e4e','#a6c0e2'], light:['#ebeef3','#d0d7e2','#44628c']},
+  opal:{dark:['#0c281e','#1c563e','#62d6a0'], light:['#eaf7f7','#bee7e7','#0a7f8a']}
+};
+const MODE_HINT = {light:'Light glass, light apps.', mixed:'Dark glass around light apps.', dark:'Dark glass, dark apps.'};
+
+function apply() {
+  const glass = S.mode === 'light' ? 'light' : 'dark', content = S.mode === 'dark' ? 'dark' : 'light';
+  Object.assign(stage.dataset, {palette:S.palette, glass, content, perf:S.perf ? '1' : '0', labels:S.labels ? '1' : '0', style:S.style,
+    accent:S.accent, rim:S.rim ? '1' : '0', touch:S.touch ? '1' : '0', hits:S.hits ? '1' : '0'});
+  $('#hitkey').hidden = !S.hits; $('[data-toggle=hits]').classList.toggle('on', S.hits);
+  stage.style.setProperty('--op', S.opacity / 100);
+  stage.style.setProperty('--blur', BLUR[S.blur]);
+  $$('[data-key]').forEach(g => {
+    if (g.matches('.sw')) return g.setAttribute('aria-checked', String(!!S[g.dataset.key]));
+    $$('button', g).forEach(b => { const on = String(S[g.dataset.key]) === b.dataset.v; b.setAttribute('aria-pressed', on); b.classList.toggle('on', on); });
+  });
+  $('[data-toggle=perf]').classList.toggle('on', S.perf);
+  $$('.pal').forEach(p => { const c = PAL[p.dataset.v][glass]; p.style.setProperty('--pg', c[0]); p.style.setProperty('--ph', c[1]); p.style.setProperty('--pa', c[2]); p.style.setProperty('--pc', content === 'dark' ? '#111c2b' : '#f5f8fc'); });
+  const op = $('#s-op'); op.value = S.opacity; op.style.setProperty('--pct', (S.opacity - 40) / 60 * 100 + '%'); $('#s-opv').textContent = S.opacity + '%';
+  $('#glassrows').classList.toggle('dis', S.perf);
+  $('#mode-hint').textContent = MODE_HINT[S.mode];
+  $('#acc-name').textContent = S.accent === 'auto' ? 'Palette default' : ACCENTS[S.accent];
+  $('#acc-auto').style.setProperty('--sd', PAL[S.palette].dark[2]); $('#acc-auto').style.setProperty('--sl', PAL[S.palette].light[2]);
+  $('#build').hidden = !S.build; $('#t-temp').hidden = !S.temp; $('#c-date').hidden = !S.date;
+  $('#hudchip').hidden = S.hud !== 'compact'; $('#hud').classList.toggle('shut', S.hud !== 'expanded');
+  const dirty = JSON.stringify(S) !== JSON.stringify(saved);
+  $('#set-foot').classList.toggle('dirty', dirty); $('#set-state').textContent = dirty ? 'Previewing changes' : 'Saved';
+  $('#apply').disabled = $('#revert').disabled = !dirty;
+  tick(); drawHud();
+}
+const set = (k, v) => { S[k] = v; apply(); };
+document.addEventListener('click', e => {
+  const sw = e.target.closest('.sw[data-key]') || e.target.closest('.row')?.querySelector('.sw[data-key]'); if (sw) return set(sw.dataset.key, !S[sw.dataset.key]);   // the whole row toggles
+  const b = e.target.closest('[data-key] > button[data-v]'); if (b) return set(b.parentElement.dataset.key, b.dataset.v);
+});
+$('#s-op').addEventListener('input', e => set('opacity', +e.target.value));
+$('#apply').onclick = () => { saved = {...S}; try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch {} apply(); };
+$('#revert').onclick = () => { S = {...saved}; apply(); };
+$$('.set-tabs button').forEach(b => b.onclick = () => tab(b.dataset.tab));
+function tab(t) { $$('.set-tabs button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === t)); $$('.set-body').forEach(p => p.hidden = p.id !== 'set-' + t); }
+
+/* ---------- Apps ---------- */
+const APPS = [
+  ['files','Files','Browse files and directories','System','files'], ['terminal','Terminal','Shell on the Brook console','System','terminal'],
+  ['settings','Settings','Appearance and taskbar','System','settings'], ['kconsole','Kernel Console','Read-only kernel log','System','kernel_console'],
+  ['gallery','App Gallery','Find and install applications','System','applications'],
+  ['firefox','Firefox','Web browser','Internet'], ['ladybird','Ladybird','Ladybird browser','Internet'], ['netsurf','NetSurf','Lightweight web browser','Internet'],
+  ['player','Video Player','Brook video player','Media','video_player'], ['vlc','VLC media player','Plays most media files','Media'],
+  ['edit','Text Editor','Open, edit, save','Office','text_editor'], ['mousepad','Mousepad','Simple text editor','Office'], ['libreoffice','LibreOffice','Documents, sheets and slides','Office'],
+  ['calc','Calculator','Brook native calculator','Office','calculator'], ['qalc','Qalculate','Units and symbolic maths','Office'], ['gimp','GIMP','Image manipulation','Graphics'],
+  ['doom','DOOM','The classic','Games'], ['quake','Quake','id Software, 1996','Games'], ['quake2','Quake II','id Software, 1997','Games'],
+  ['flower','Flower Demo','Weston animated flower','Demos'], ['fbtest','FB Test','Framebuffer stress test','Demos']
+].map(([id, name, desc, cat, icon]) => ({id, name, desc, hint:cat.toLowerCase(), icon}));
+// Not installed at first. 'Install app' in the study bar adds them to Unsorted. hint = the category the package declares.
+const EXTRA = [['inkscape','Inkscape','Vector drawing','graphics'], ['audacity','Audacity','Record and edit audio','media'], ['htop','htop','Process viewer','system']].map(([id, name, desc, hint]) => ({id, name, desc, hint}));
+const HUES = ['#3f7fd6','#2f9b93','#7a6cd0','#c2793a','#b7506a','#5a8f4a'];
+const iconOf = a => a.icon ? `<img src="assets/icons/${a.icon}.svg" alt="">`
+  : `<span class="mg" style="background:${HUES[[...a.id].reduce((n, c) => n + c.charCodeAt(0), 0) % HUES.length]}">${a.name[0]}</span>`;
+const byId = id => APPS.find(a => a.id === id) || EXTRA.find(a => a.id === id);
+let recent = ['files','settings','terminal','firefox','quake'];
+
+/* ---------- Windows ---------- */
+const WIN = {files:{z:1}, terminal:{z:2}, settings:{z:3}};
+let zTop = 3;
+const wEl = id => $('#w-' + id);
+const visible = id => WIN[id] && !WIN[id].closed && !WIN[id].min;
+function focusWin(id) {
+  if (id && visible(id)) { WIN[id].z = ++zTop; wEl(id).style.zIndex = WIN[id].z; }
+  const top = Object.keys(WIN).filter(visible).sort((a, b) => WIN[b].z - WIN[a].z)[0];
+  for (const k in WIN) wEl(k).classList.toggle('active', k === top);
+  renderTasks();
+}
+function setGone(id) { wEl(id).classList.toggle('gone', !visible(id)); }
+function openWin(id) { WIN[id].closed = WIN[id].min = false; setGone(id); focusWin(id); }
+function winAct(id, act) {
+  const w = WIN[id];
+  if (act === 'min') w.min = true; else if (act === 'close') w.closed = true;
+  else if (act === 'max') { w.max = !w.max; wEl(id).classList.toggle('max', w.max); $('[data-act=max] span', wEl(id)).innerHTML = ic(w.max ? 'restore' : 'max'); wpos(wEl(id)); return focusWin(id); }
+  setGone(id); focusWin();
+}
+function renderTasks() {
+  $('#tasks').innerHTML = Object.keys(WIN).filter(k => !WIN[k].closed).map(k => { const a = byId(k), act = wEl(k).classList.contains('active');
+    return `<button class="tk task${act ? ' active' : ''}${WIN[k].min ? ' min' : ''}" data-task="${k}" title="${a.name}" aria-pressed="${act}">${iconOf(a)}<span class="t">${a.name}</span></button>`; }).join('');
+}
+$('#tasks').addEventListener('click', e => { const b = e.target.closest('[data-task]'); if (!b) return; const id = b.dataset.task;
+  if (WIN[id].min) openWin(id); else if (wEl(id).classList.contains('active')) winAct(id, 'min'); else focusWin(id); });
+const scale = () => stage.getBoundingClientRect().width / 1600;
+const wpos = w => { w.style.setProperty('--wx', -w.offsetLeft + 'px'); w.style.setProperty('--wy', -w.offsetTop + 'px'); };   // screen position, for the rim and alloy highlight
+$$('.win').forEach(w => {
+  const id = w.dataset.app; w.style.zIndex = WIN[id].z; wpos(w);
+  const tl = document.createElement('span'); tl.className = 'tl'; tl.append($('.tb img', w), $('.tb .title', w)); $('.tb', w).prepend(tl);
+  w.addEventListener('pointerdown', () => focusWin(id), true);
+  $$('[data-act]', w).forEach(b => b.onclick = e => { e.stopPropagation(); winAct(id, b.dataset.act); });
+  const tb = $('.tb', w);
+  tb.ondblclick = e => { if (!e.target.closest('button')) winAct(id, 'max'); };
+  tb.onpointerdown = e => { if (e.target.closest('button') || WIN[id].max) return; dragEl(e, w, 36 - w.offsetWidth, 1564, 0, 820); };
+});
+function dragEl(e, el, x0, x1, y0, y1) {
+  const s = scale(), ox = e.clientX / s - el.offsetLeft, oy = e.clientY / s - el.offsetTop;
+  e.currentTarget.setPointerCapture(e.pointerId);
+  const mv = m => { el.style.left = Math.max(x0, Math.min(x1, m.clientX / s - ox)) + 'px'; el.style.top = Math.max(y0, Math.min(y1, m.clientY / s - oy)) + 'px'; el.style.right = el.style.bottom = 'auto'; if (el.classList.contains('win')) wpos(el); };
+  const up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+}
+$('#hud header').onpointerdown = e => { if (!e.target.closest('button')) dragEl(e, $('#hud'), 0, 1252, 0, 600); };
+
+function launch(id) {
+  const a = byId(id); recent = [id, ...recent.filter(r => r !== id)].slice(0, 5);
+  closePanels();
+  if (WIN[id]) openWin(id); else toast({icon:'info', title:a.name, body:'Not part of this prototype. Files, Terminal and Settings open real windows.'});
+}
+
+/* ---------- Files rows ---------- */
+$('#flist').innerHTML = '<div class="f-row head"><span>Name</span><span>Size</span><span>Modified</span></div>' + [
+  ['d','Documents','12 items','14 Nov 2026, 22:10'], ['d','Downloads','3 items','15 Nov 2026, 09:31'], ['d','Pictures','27 items','2 Nov 2026, 18:02'],
+  ['d','Projects','4 items','15 Nov 2026, 10:17'], ['d','Videos','6 items','28 Oct 2026, 12:46'],
+  ['f','BROOK.CFG','1.2 KB','13 Nov 2026, 23:54'], ['f','hello_brook.cpp','486 B','9 Nov 2026, 20:15'], ['f','morning-on-the-brook.png','2.3 MB','27 Oct 2026, 10:42'], ['f','notes.txt','3.1 KB','15 Nov 2026, 10:40']
+].map((r, i) => `<div class="f-row${i === 3 ? ' sel' : ''}"><span class="n">${r[0] === 'd' ? '<img src="assets/icons/files.svg" alt="">' : ic('file')}${r[1]}</span><span class="num">${r[2]}</span><span class="num">${r[3]}</span></div>`).join('');
+
+/* ---------- Launcher: user-organised categories ----------
+   Model: every app has exactly one home category, or none (Unsorted). Pins are a separate ordered list of references.
+   Native: this object is what [Launcher] in the user settings would hold, keyed by stable app_id. */
+const L = $('#launcher'), q = $('#q'), LKEY = 'brook.clearwater-next.launcher.v1';
+const COLORS = {blue:'#6aaeff', teal:'#5fd6c8', green:'#6fd08c', amber:'#f0b35a', coral:'#ff8a73', pink:'#ee8fc0', violet:'#b9a6f5', slate:'#a9b8cc'};
+const CICONS = ['folder','sliders','globe','play','doc','brush','pad','spark','star','code','music','tool'];
+const DEFAULT_CATS = [['system','System','blue','sliders'], ['internet','Internet','teal','globe'], ['media','Media','violet','play'], ['office','Office','amber','doc'],
+  ['graphics','Graphics','pink','brush'], ['games','Games','coral','pad'], ['demos','Demos','slate','spark']];
+const defaults = () => ({v:1, cats:DEFAULT_CATS.map(([id, name, color, icon]) => ({id, name, color, icon, apps:APPS.filter(a => a.hint === id).map(a => a.id)})),
+  pins:['files','terminal','settings','firefox','quake'], extra:[], fresh:[], top:'pins'});
+let LAY = defaults();
+if (!SHOT) try { const v = JSON.parse(localStorage.getItem(LKEY)); if (v && v.v === 1) LAY = v; } catch {}
+let view = 'all', org = false, kbId = null, justDragged = false, menuIds = [], editId = null, editSnap = null, editLabel = '', undoTimer = 0, drag = null, springT = 0, springId = null;
+const sel = new Set(), UNDO = [];
+
+const installed = () => [...APPS, ...EXTRA.filter(a => LAY.extra.includes(a.id))];
+const catOf = id => LAY.cats.find(c => c.apps.includes(id));
+const catById = id => LAY.cats.find(c => c.id === id);
+const unsorted = () => installed().filter(a => !catOf(a.id)).map(a => a.id);
+const suggest = id => catById(byId(id).hint);                       // the package's declared category, if the user still has it
+const order = ids => [...LAY.cats.flatMap(c => c.apps), ...unsorted()].filter(i => ids.includes(i));
+const nm = ids => ids.length === 1 ? byId(ids[0]).name : ids.length + ' apps';
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ctile = c => `<span class="ct" style="--cc:${COLORS[c.color]}">${ic(c.icon)}</span>`;
+const save = () => { if (!SHOT) try { localStorage.setItem(LKEY, JSON.stringify(LAY)); } catch {} };
+
+/* Every reorganisation goes through here: snapshot, mutate, save, redraw, offer Undo. */
+function changeFrom(snap, label, fn) { UNDO.push(snap); if (UNDO.length > 20) UNDO.shift(); fn(); save(); renderLauncher(); showUndo(label); }
+const change = (label, fn) => changeFrom(JSON.stringify(LAY), label, fn);
+function undo() {
+  const snap = UNDO.pop(); if (!snap) return;
+  LAY = JSON.parse(snap); if (view !== 'all' && view !== 'unsorted' && !catById(view)) view = 'all';
+  closeMenus(true); save(); renderLauncher(); showUndo('Undone');
+}
+function showUndo(label) {
+  const u = $('#l-undo'); u.hidden = false; $('#l-live').textContent = label;
+  u.innerHTML = `<span>${esc(label)}</span>` + (UNDO.length && label !== 'Undone' ? `<button class="gbtn" data-undo>${ic('undo')}Undo</button>` : '');
+  clearTimeout(undoTimer); if (!SHOT) undoTimer = setTimeout(() => u.hidden = true, 8000);
+}
+function moveApps(ids, catId, before) {
+  LAY.cats.forEach(c => c.apps = c.apps.filter(a => !ids.includes(a))); LAY.fresh = LAY.fresh.filter(a => !ids.includes(a));
+  const c = catById(catId); if (!c) return;
+  const i = before ? c.apps.indexOf(before) : -1; c.apps.splice(i < 0 ? c.apps.length : i, 0, ...ids);
+}
+function step(id, d) {                                               // keyboard and menu reordering; crosses into the neighbouring category at the ends
+  const c = catOf(id); if (!c) return; kbId = id;
+  const i = c.apps.indexOf(id), j = i + d, name = byId(id).name;
+  if (j >= 0 && j < c.apps.length) return change(`${name} moved to position ${j + 1} of ${c.apps.length} in ${c.name}`, () => { c.apps.splice(i, 1); c.apps.splice(j, 0, id); });
+  const n = LAY.cats[LAY.cats.indexOf(c) + d]; if (!n) return;
+  change(`${name} moved to ${n.name}`, () => { c.apps.splice(i, 1); d < 0 ? n.apps.push(id) : n.apps.unshift(id); if (view === c.id) view = n.id; });
+}
+function pin(ids) {
+  if (ids.every(i => LAY.pins.includes(i))) return change(`Unpinned ${nm(ids)}`, () => LAY.pins = LAY.pins.filter(i => !ids.includes(i)));
+  change(`Pinned ${nm(ids)}`, () => { LAY.pins = [...LAY.pins.filter(i => !ids.includes(i)), ...ids].slice(-10); LAY.top = 'pins'; });
+}
+function addCat(ids, name = 'New category') {
+  const snap = JSON.stringify(LAY), used = LAY.cats.map(c => c.color);
+  const c = {id:'c' + Date.now().toString(36) + LAY.cats.length, name, color:Object.keys(COLORS).find(k => !used.includes(k)) || 'blue', icon:'folder', apps:[]};
+  LAY.cats.push(c); moveApps(order(ids), c.id); sel.clear(); view = c.id; q.value = ''; save(); renderLauncher();
+  openEdit(c.id, snap, ids.length ? `Created a category with ${nm(ids)}` : 'Created a category');
+}
+function moveCat(id, d) { const i = LAY.cats.findIndex(c => c.id === id), j = i + d; if (j < 0 || j >= LAY.cats.length) return;
+  change(`${LAY.cats[i].name} moved ${d < 0 ? 'up' : 'down'}`, () => LAY.cats.splice(j, 0, LAY.cats.splice(i, 1)[0])); }
+function deleteCat(id, snap) { const c = catById(id); if (!c) return; if (view === id) view = 'all';
+  changeFrom(snap || JSON.stringify(LAY), `Deleted ${c.name}` + (c.apps.length ? `. ${nm(c.apps)} moved to Unsorted` : ''), () => LAY.cats = LAY.cats.filter(k => k !== c)); }
+function sortAll() { const ids = unsorted().filter(suggest); change(`Sorted ${nm(ids)} into suggested categories`, () => ids.forEach(i => moveApps([i], suggest(i).id))); }
+function toggleSel(id) { sel.has(id) ? sel.delete(id) : sel.add(id); kbId = id; renderLauncher(); }
+function install() {
+  const a = EXTRA.find(a => !LAY.extra.includes(a.id)); if (!a) return toast({icon:'info', title:'Nothing left to install', body:'Reset restores the sample apps.'});
+  LAY.extra.push(a.id); LAY.fresh.push(a.id); save(); const c = suggest(a.id);
+  toast({icon:'inbox', tone:'ok', title:`${a.name} installed`, body:`Added to Unsorted in the launcher.` + (c ? ` Suggested category: ${esc(c.name)}.` : '')});
+  if (!L.classList.contains('shut')) renderLauncher();
+}
+
+/* ---- rendering ---- */
+function appRow(a, term) {
+  let n = esc(a.name); if (term) { const i = a.name.toLowerCase().indexOf(term); if (i >= 0) n = esc(a.name.slice(0, i)) + '<mark>' + esc(a.name.slice(i, i + term.length)) + '</mark>' + esc(a.name.slice(i + term.length)); }
+  const c = catOf(a.id), s = !c && !term && suggest(a.id), on = sel.has(a.id);
+  return `<div class="app${on ? ' sel' : ''}" role="option" aria-selected="${on}" data-app="${a.id}">${org ? `<span class="ck">${on ? ic('check') : ''}</span>` : ''}${iconOf(a)}` +
+    `<span class="tx"><b>${n}${LAY.fresh.includes(a.id) ? '<i class="new">New</i>' : ''}</b><small>${esc(a.desc)}</small></span>` +
+    (term ? `<span class="chip" style="--cc:${c ? COLORS[c.color] : 'var(--ink-3)'}">${c ? esc(c.name) : 'Unsorted'}</span>` : '') +
+    (s ? `<button class="gbtn" data-sug="${a.id}" tabindex="-1">${ctile(s)}Move to ${esc(s.name)}</button>` : '') +
+    (WIN[a.id] && !WIN[a.id].closed ? '<span class="run" title="Running"></span>' : '') +
+    `<button class="more" data-more="${a.id}" tabindex="-1" aria-label="Organise ${esc(a.name)}">${ic('more')}</button></div>`;
+}
+function renderLauncher() {
+  const term = q.value.trim().toLowerCase(), list = $('#l-list'), inst = installed(), uns = unsorted(), keep = list.scrollTop;
+  if (view !== 'all' && view !== 'unsorted' && !catById(view)) view = 'all';
+  L.classList.toggle('org', org); $('#l-org').classList.toggle('on', org); $('#l-org').setAttribute('aria-pressed', org);
+  $('#l-top').hidden = !!term; $$('[data-top]').forEach(b => b.setAttribute('aria-pressed', b.dataset.top === LAY.top));
+  const tops = (LAY.top === 'pins' ? LAY.pins : recent).filter(id => inst.some(a => a.id === id));
+  $('#l-tiles').innerHTML = tops.length ? tops.map(id => `<div class="l-tile" role="button" data-app="${id}">${iconOf(byId(id))}<span>${esc(byId(id).name)}</span></div>`).join('')
+    : `<div class="l-none">${LAY.top === 'pins' ? 'Nothing pinned yet. Drag an app here, or choose Pin to top from its ⋯ menu.' : 'Apps you open will appear here.'}</div>`;
+  $('#l-rail').innerHTML =
+    `<div class="rb" role="button" tabindex="0" data-view="all" aria-pressed="${view === 'all' && !term}"><span class="ct plain">${ic('grid')}</span><span class="nm">All apps</span><small class="num">${inst.length}</small></div>` +
+    LAY.cats.map(c => `<div class="rb" role="button" tabindex="0" data-view="${c.id}" data-cat="${c.id}" aria-pressed="${view === c.id && !term}">${ctile(c)}<span class="nm">${esc(c.name)}</span>` +
+      (org ? `<button class="more" data-catmore="${c.id}" aria-label="Edit ${esc(c.name)}">${ic('more')}</button>` : `<small class="num">${c.apps.length}</small>`) + '</div>').join('') +
+    (uns.length || org || view === 'unsorted' ? `<div class="rb" role="button" tabindex="0" data-view="unsorted" aria-pressed="${view === 'unsorted' && !term}"><span class="ct plain">${ic('inbox')}</span><span class="nm">Unsorted</span>${uns.length ? `<small class="num badge">${uns.length}</small>` : ''}</div>` : '') +
+    `<div class="rb new" role="button" tabindex="0" data-newcat>${ic('plus')}<span class="nm">New category</span></div>`;
+  const rows = (ids, t) => ids.map(id => appRow(byId(id), t)).join('');
+  const sec = c => `<h5 data-cat="${c.id}" style="--cc:${COLORS[c.color]}"><i class="dot"></i>${esc(c.name)}<small class="num">${c.apps.length}</small></h5><div class="l-grid" data-cat="${c.id}">` +
+    (c.apps.length ? rows(c.apps) : `<div class="l-none">No apps in ${esc(c.name)} yet. Drag apps here, or use Move to in an app's ⋯ menu.</div>`) + '</div>';
+  const unsSec = () => `<h5><i class="dot" style="background:var(--ink-3)"></i>Unsorted<small class="num">${uns.length}</small>${uns.some(suggest) ? `<button class="gbtn" data-sortall>${ic('spark')}Sort all as suggested</button>` : ''}</h5>` +
+    `<div class="l-grid flat">${uns.length ? rows(uns) : '<div class="l-none">Nothing to sort. Newly installed apps land here until you file them.</div>'}</div>`;
+  if (term) {                                                        // search sees the user's own category names
+    const cname = a => (catOf(a.id)?.name || 'unsorted').toLowerCase();
+    const rank = a => { const n = a.name.toLowerCase(); return n.startsWith(term) ? 0 : n.includes(term) ? 1 : cname(a).includes(term) ? 2 : a.desc.toLowerCase().includes(term) ? 3 : 9; };
+    const hits = inst.filter(a => rank(a) < 9).sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name)), cats = LAY.cats.filter(c => c.name.toLowerCase().includes(term));
+    list.innerHTML = (cats.length ? `<h5>Categories</h5><div class="l-chips">${cats.map(c => `<button class="gbtn" data-view="${c.id}">${ctile(c)}${esc(c.name)}<small class="num">${c.apps.length}</small></button>`).join('')}</div>` : '') +
+      (hits.length ? `<h5>${hits.length} app${hits.length > 1 ? 's' : ''}</h5><div class="l-grid flat">${hits.map(a => appRow(a, term)).join('')}</div>`
+        : cats.length ? '' : `<div class="l-empty">Nothing matches “${esc(q.value.trim())}”<small>Search covers app names, descriptions and your category names.</small></div>`);
+    if (!hits.some(a => a.id === kbId)) kbId = hits[0]?.id ?? null;
+  } else {
+    list.innerHTML = view === 'unsorted' ? unsSec() : view !== 'all' ? sec(catById(view))
+      : (LAY.cats.filter(c => org || c.apps.length).map(sec).join('') + (uns.length ? unsSec() : '')) || '<div class="l-empty">No categories yet<small>Create one from the rail, or restore the standard set.</small><br><button class="gbtn" data-bar="reset">Reset to defaults</button></div>';
+    list.scrollTop = keep;
+  }
+  const bar = $('#l-bar'); bar.hidden = !org;
+  bar.innerHTML = sel.size ? `<span><b>${sel.size}</b> selected</span><button class="gbtn pri" data-bar="move">Move to…</button><button class="gbtn" data-bar="pin">${ic('pin')}Pin</button><button class="gbtn" data-bar="newcat">${ic('plus')}New category</button><button class="gbtn" data-bar="clear">Clear</button>`
+    : `<span>Drag apps and categories, or tick apps to move them together.</span><button class="gbtn" data-bar="reset">Reset to defaults</button><button class="gbtn pri" data-bar="done">Done</button>`;
+  if (drag?.active) markSrc(drag);
+  markKb();
+}
+const kbItems = () => $$('#l-list .app');
+function markKb() { kbItems().forEach(b => b.classList.toggle('kb', b.dataset.app === kbId)); const b = $('#l-list .app.kb'); if (b && !SHOT) b.scrollIntoView({block:'nearest'}); }
+function toggleLauncher(open = L.classList.contains('shut')) {
+  closePanels(); L.classList.toggle('shut', !open); $('#start').classList.toggle('on', open); $('#start').setAttribute('aria-expanded', open);
+  if (open) { q.value = ''; view = 'all'; org = false; sel.clear(); kbId = null; $('#l-undo').hidden = true; renderLauncher(); if (!SHOT) q.focus(); }
+}
+$('#start').onclick = e => { e.stopPropagation(); toggleLauncher(); };
+q.addEventListener('input', renderLauncher);
+
+/* ---- item menu and category editor: every drag action also has a click and a keyboard path ---- */
+function place(m, anchor) {
+  m.hidden = false; const s = scale(), lr = L.getBoundingClientRect(), r = (anchor || $('#l-rail')).getBoundingClientRect();
+  const ed = m.id === 'l-edit', x = ed ? 188 : (r.right - lr.left) / s - m.offsetWidth, y = !anchor ? 250 : ed ? (r.top - lr.top) / s - 8 : (r.bottom - lr.top) / s + 4;   // the editor opens beside the rail, not over it
+  m.style.left = Math.max(8, Math.min(L.offsetWidth - m.offsetWidth - 8, x)) + 'px'; m.style.top = Math.max(8, Math.min(L.offsetHeight - m.offsetHeight - 8, y)) + 'px';
+}
+const mi = (act, arg, icon, label) => `<button class="mi" role="menuitem" data-mi="${act}" data-arg="${arg}">${ic(icon)}<span>${label}</span></button>`;
+function openMenu(ids, anchor) {
+  closeMenus(); menuIds = ids; const one = ids.length === 1 ? ids[0] : null, c = one && catOf(one), pinned = ids.every(i => LAY.pins.includes(i));
+  $('#l-menu').innerHTML = `<header>${esc(nm(ids))}</header>` + (one ? mi('open', '', 'ret', 'Open') : '') + mi('pin', '', 'pin', pinned ? 'Unpin' : 'Pin to top') + '<h6>Move to</h6>' +
+    LAY.cats.map(k => `<button class="mi" role="menuitem" data-mi="to" data-arg="${k.id}"${c === k ? ' disabled' : ''}>${ctile(k)}<span>${esc(k.name)}</span>${c === k ? ic('check') : ''}</button>`).join('') +
+    mi('new', '', 'plus', 'New category…') + (c ? '<hr>' + mi('step', -1, 'up', 'Move earlier') + mi('step', 1, 'down', 'Move later') : '');
+  place($('#l-menu'), anchor); if (!SHOT) $('#l-menu .mi:not(:disabled)').focus();
+}
+function menuAct(act, arg) {
+  const ids = menuIds; closeMenus(); if (!SHOT) q.focus();
+  if (act === 'open') launch(ids[0]); else if (act === 'pin') { sel.clear(); pin(ids); } else if (act === 'new') addCat(ids);
+  else if (act === 'step') step(ids[0], +arg);
+  else if (act === 'to') { sel.clear(); change(`Moved ${nm(ids)} to ${catById(arg).name}`, () => moveApps(order(ids), arg)); }
+}
+function drawEdit() {
+  const c = catById(editId), i = LAY.cats.indexOf(c);
+  $('#l-edit').innerHTML = `<label class="eyebrow" for="ce-name">Category name</label><input id="ce-name" value="${esc(c.name)}" maxlength="24" autocomplete="off" spellcheck="false">` +
+    `<div class="pick c8" role="group" aria-label="Colour">${Object.keys(COLORS).map(k => `<button data-ed="color" data-arg="${k}" aria-pressed="${c.color === k}" aria-label="${k}"><i class="swc" style="--cc:${COLORS[k]}"></i></button>`).join('')}</div>` +
+    `<div class="pick c6" role="group" aria-label="Icon">${CICONS.map(k => `<button data-ed="icon" data-arg="${k}" aria-pressed="${c.icon === k}" aria-label="${k}">${ic(k)}</button>`).join('')}</div>` +
+    `<div class="ed-acts"><button class="gbtn" data-ed="up"${i ? '' : ' disabled'} aria-label="Move up">${ic('up')}</button><button class="gbtn" data-ed="down"${i < LAY.cats.length - 1 ? '' : ' disabled'} aria-label="Move down">${ic('down')}</button>` +
+    `<button class="gbtn danger" data-ed="delete">${ic('trash')}Delete</button><button class="gbtn pri" data-ed="done" style="margin-left:auto">Done</button></div>` +
+    `<small class="hint2">${c.apps.length ? `Deleting moves ${nm(c.apps)} to Unsorted. Nothing is uninstalled.` : 'Deleting an empty category removes it.'}</small>`;
+}
+function openEdit(id, snap, label) {
+  closeMenus(); editId = id; editSnap = snap || JSON.stringify(LAY); editLabel = label || ''; drawEdit();
+  place($('#l-edit'), $(`.rb[data-cat="${id}"]`)); if (!SHOT) { $('#ce-name').focus(); $('#ce-name').select(); }
+}
+function closeMenus(discard) {
+  $('#l-menu').hidden = true; if (!editId) return;
+  const c = catById(editId), changed = !discard && JSON.stringify(LAY) !== editSnap;
+  editId = null; $('#l-edit').hidden = true;
+  if (changed) { UNDO.push(editSnap); showUndo(editLabel || `Edited ${c ? c.name : 'category'}`); }
+}
+function edAct(act, arg) {
+  const c = catById(editId), i = LAY.cats.indexOf(c);
+  if (act === 'done') return closeMenus();
+  if (act === 'delete') { const snap = editSnap, id = editId; closeMenus(true); return deleteCat(id, snap); }
+  if (act === 'color') c.color = arg; else if (act === 'icon') c.icon = arg; else LAY.cats.splice(i + (act === 'up' ? -1 : 1), 0, LAY.cats.splice(i, 1)[0]);
+  save(); renderLauncher(); drawEdit();
+}
+L.addEventListener('input', e => { if (e.target.id === 'ce-name') { catById(editId).name = e.target.value.trim() || 'Untitled'; save(); renderLauncher(); } });
+function launcherEsc() {                                             // Esc unwinds one level at a time
+  if (L.classList.contains('shut')) return false;
+  if (drag) { endDrag(false); return true; }
+  if (!$('#l-menu').hidden || editId) { closeMenus(); q.focus(); return true; }
+  if (org) { org = false; sel.clear(); renderLauncher(); return true; }
+  return false;
+}
+L.addEventListener('click', e => {
+  if (justDragged) return; const t = e.target; let m;
+  if (m = t.closest('[data-more]')) return openMenu(sel.has(m.dataset.more) && sel.size > 1 ? [...sel] : [m.dataset.more], m);
+  if (m = t.closest('[data-catmore]')) return openEdit(m.dataset.catmore);
+  if (m = t.closest('[data-sug]')) { const id = m.dataset.sug, c = suggest(id); return change(`Moved ${byId(id).name} to ${c.name}`, () => moveApps([id], c.id)); }
+  if (t.closest('[data-sortall]')) return sortAll();
+  if (m = t.closest('[data-mi]')) return menuAct(m.dataset.mi, m.dataset.arg);
+  if (m = t.closest('[data-ed]')) return edAct(m.dataset.ed, m.dataset.arg);
+  if (t.closest('.menu')) return;
+  if (m = t.closest('[data-top]')) { LAY.top = m.dataset.top; save(); return renderLauncher(); }
+  if (t.closest('[data-newcat]')) return addCat([]);
+  if (m = t.closest('[data-view]')) { view = m.dataset.view; q.value = ''; kbId = null; return renderLauncher(); }
+  if (t.closest('#l-org')) { org = !org; sel.clear(); return renderLauncher(); }
+  if (t.closest('[data-undo]')) return undo();
+  if (m = t.closest('[data-bar]')) { const a = m.dataset.bar, ids = [...sel];
+    if (a === 'move') return openMenu(ids, m); if (a === 'newcat') return addCat(ids); if (a === 'pin') { sel.clear(); return pin(order(ids)); }
+    if (a === 'reset') return change('Categories reset to defaults', () => { LAY.cats = defaults().cats; view = 'all'; });
+    if (a === 'done') org = false; sel.clear(); return renderLauncher(); }
+  if (m = t.closest('[data-app]')) return org && !m.matches('.l-tile') ? toggleSel(m.dataset.app) : launch(m.dataset.app);
+  if (m = t.closest('[data-launch]')) launch(m.dataset.launch);
+});
+L.addEventListener('contextmenu', e => { const a = e.target.closest('[data-app]'), c = e.target.closest('.rb[data-cat]'); if (!a && !c) return; e.preventDefault(); a ? openMenu([a.dataset.app], a) : openEdit(c.dataset.cat); });
+L.addEventListener('keydown', e => {
+  const up = e.key === 'ArrowUp', down = e.key === 'ArrowDown', menu = e.target.closest('.menu'), rb = e.target.closest('.rb');
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && e.target.id !== 'ce-name') { undo(); return e.preventDefault(); }
+  if (menu) {
+    if (e.target.id === 'ce-name') { if (e.key === 'Enter') { closeMenus(); q.focus(); } return; }
+    if (up || down) { const it = $$('button:not(:disabled)', menu), i = it.indexOf(document.activeElement); it[(i + (down ? 1 : -1) + it.length) % it.length].focus(); e.preventDefault(); }
+    return;
+  }
+  if (rb) {                                                          // categories: Enter opens, Alt+arrows reorder, F2 edits, Delete removes
+    const id = rb.dataset.cat;
+    if (e.key === 'Enter' || e.key === ' ') { rb.click(); e.preventDefault(); }
+    else if (id && e.altKey && (up || down)) { moveCat(id, up ? -1 : 1); $(`.rb[data-cat="${id}"]`).focus(); e.preventDefault(); }
+    else if (id && e.key === 'F2') openEdit(id); else if (id && e.key === 'Delete') deleteCat(id);
+    return;
+  }
+  const it = kbItems(), n = it.length, i = it.findIndex(b => b.dataset.app === kbId); if (!n) return;
+  if (e.altKey && (up || down)) { if (kbId && !q.value.trim()) step(kbId, up ? -1 : 1); e.preventDefault(); }
+  else if (down) { kbId = it[(i + 1) % n].dataset.app; markKb(); e.preventDefault(); }
+  else if (up) { kbId = it[(Math.max(i, 0) - 1 + n) % n].dataset.app; markKb(); e.preventDefault(); }
+  else if ((e.altKey && e.key === 'Enter') || e.key === 'ContextMenu') { if (i >= 0) openMenu([kbId], it[i]); e.preventDefault(); }
+  else if (e.ctrlKey && e.key === ' ') { if (i >= 0) { org = true; toggleSel(kbId); } e.preventDefault(); }
+  else if (e.key === 'Enter') { const id = i >= 0 ? kbId : it[0].dataset.app; org ? toggleSel(id) : launch(id); }
+});
+
+/* ---- drag and drop (pointer events, so it works at any stage scale) ---- */
+const clearMarks = () => $$('.drop,.ins-l,.ins-r,.ins-t,.ins-b', L).forEach(e => e.classList.remove('drop', 'ins-l', 'ins-r', 'ins-t', 'ins-b'));
+function markSrc(d) { L.classList.add('dragging'); $$('[data-app],.rb[data-cat]', L).forEach(e => e.classList.toggle('src', d.kind === 'cat' ? e.dataset.cat === d.id : d.ids.includes(e.dataset.app))); }
+function makeGhost(d) {
+  const g = document.createElement('div'), first = d.kind === 'cat' ? catById(d.id) : byId(d.ids[0]); g.id = 'ghost'; g.className = 'glass';
+  g.innerHTML = (d.kind === 'cat' ? ctile(first) : iconOf(first)) + `<span>${esc(first.name)}</span>` + (d.ids && d.ids.length > 1 ? `<b class="n num">${d.ids.length}</b>` : '');
+  stage.append(g); return g;
+}
+function ghostTo(g, x, y) { const s = scale(), r = stage.getBoundingClientRect(); g.style.left = (x - r.left) / s + 'px'; g.style.top = (y - r.top) / s + 'px'; }
+function targetAt(x, y) {
+  const el = document.elementFromPoint(x, y); if (!el || !L.contains(el)) return null; let m;
+  const half = (r, horiz) => horiz ? x > r.left + r.width / 2 : y > r.top + r.height / 2;
+  if (drag.kind === 'cat') { if (!(m = el.closest('.rb[data-cat]'))) return null; const after = half(m.getBoundingClientRect()); return {type:'catpos', el:m, cls:after ? 'ins-b' : 'ins-t', id:m.dataset.cat, after}; }
+  if (m = el.closest('[data-newcat]')) return {type:'new', el:m, cls:'drop'};
+  if (m = el.closest('.rb[data-cat]')) return {type:'cat', id:m.dataset.cat, el:m, cls:'drop', spring:true};
+  if (el.closest('#l-top') && LAY.top === 'pins') { if (!(m = el.closest('.l-tile'))) return {type:'pin', el:$('#l-tiles'), cls:'drop'};
+    const after = half(m.getBoundingClientRect(), true); return {type:'pin', el:m, cls:after ? 'ins-r' : 'ins-l', ref:m.dataset.app, after}; }
+  if (m = el.closest('#l-list .l-grid[data-cat] .app')) { const after = half(m.getBoundingClientRect(), true); return {type:'cat', id:m.closest('.l-grid').dataset.cat, el:m, cls:after ? 'ins-r' : 'ins-l', ref:m.dataset.app, after}; }
+  if (m = el.closest('#l-list [data-cat]')) return {type:'cat', id:m.dataset.cat, el:m.matches('h5') ? m : m.previousElementSibling, cls:'drop'};
+  return null;
+}
+function moveDrag(x, y) {
+  ghostTo(drag.ghost, x, y); clearMarks(); const t = drag.target = targetAt(x, y);
+  const lr = $('#l-list').getBoundingClientRect(); if (x > lr.left && x < lr.right) { if (y < lr.top + 28) $('#l-list').scrollTop -= 10; else if (y > lr.bottom - 28) $('#l-list').scrollTop += 10; }
+  const sid = t && t.spring && view !== t.id ? t.id : null;             // rest on a category for 0.7 s and it opens, so you can place the app precisely
+  if (sid !== springId) { clearTimeout(springT); springId = sid; if (sid) springT = setTimeout(() => { if (drag) { view = sid; renderLauncher(); } }, 700); }
+  if (t) t.el.classList.add(t.cls);
+}
+function endDrag(drop) {
+  const d = drag, t = d.target; drag = null; clearTimeout(springT); springId = null; d.ghost?.remove(); clearMarks(); L.classList.remove('dragging'); $$('.src', L).forEach(e => e.classList.remove('src'));
+  if (!drop || !t) return; const ids = d.ids;
+  if (t.type === 'new') return addCat(ids);
+  if (t.type === 'catpos') { if (t.id === d.id) return; const c = catById(d.id);
+    return change(`${c.name} moved`, () => { LAY.cats = LAY.cats.filter(k => k !== c); LAY.cats.splice(LAY.cats.findIndex(k => k.id === t.id) + (t.after ? 1 : 0), 0, c); }); }
+  if (t.ref && ids.includes(t.ref)) return;
+  if (t.type === 'pin') return change(`Pinned ${nm(ids)}`, () => { const p = LAY.pins.filter(i => !ids.includes(i)); p.splice(t.ref ? p.indexOf(t.ref) + (t.after ? 1 : 0) : p.length, 0, ...ids); LAY.pins = p.slice(0, 10); });
+  const c = catById(t.id), rest = c.apps.filter(a => !ids.includes(a)), before = t.ref ? rest[rest.indexOf(t.ref) + (t.after ? 1 : 0)] ?? null : null, same = ids.every(i => c.apps.includes(i));
+  sel.clear(); change(same ? `Reordered ${nm(ids)} in ${c.name}` : `Moved ${nm(ids)} to ${c.name}`, () => moveApps(ids, c.id, before));
+}
+L.addEventListener('pointerdown', e => {
+  if (!e.target.closest('.menu,[data-more],[data-catmore],[data-bar]')) closeMenus();
+  if (e.button !== 0 || e.target.closest('button,input,.menu')) return;
+  const a = e.target.closest('[data-app]'), c = e.target.closest('.rb[data-cat]'); if (!a && !c) return;
+  if (a && q.value.trim()) return;                                      // search results are ranked, not ordered
+  drag = a ? {kind:'app', ids:sel.has(a.dataset.app) ? order([...sel]) : [a.dataset.app]} : {kind:'cat', id:c.dataset.cat};
+  drag.x0 = e.clientX; drag.y0 = e.clientY;
+});
+addEventListener('pointermove', e => {
+  if (!drag || drag.staged) return;
+  if (!drag.active) { if (Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 6) return; drag.active = true; drag.ghost = makeGhost(drag); markSrc(drag); }
+  moveDrag(e.clientX, e.clientY);
+});
+addEventListener('pointerup', () => { if (!drag || drag.staged) return; if (!drag.active) return void (drag = null); endDrag(true); justDragged = true; setTimeout(() => justDragged = false, 0); });
+function stageDrag(ids, pick) {                                         // freezes a drag mid-flight for the screenshots
+  drag = {kind:'app', ids, active:true, staged:true}; drag.ghost = makeGhost(drag); markSrc(drag);
+  const t = pick(), r = t.el.getBoundingClientRect(); t.el.classList.add(t.cls); ghostTo(drag.ghost, r.left + r.width * .5, r.top + r.height * .55);
+  drag.ghost.insertAdjacentHTML('afterbegin', '<svg class="cur" viewBox="0 0 18 18"><path d="M3 2v12l3.200-3 2 4.500 2-.900-2-4.400h4.300z" fill="#fff" stroke="#111" stroke-width="1"/></svg>');
+}
+
+
+/* ---------- Flyouts ---------- */
+function closePanels(except) {
+  $$('.fly').forEach(f => f !== except && f.classList.add('shut')); $$('[data-fly]').forEach(b => b.classList.toggle('on', !!except && except.id === 'fly-' + b.dataset.fly));
+  if (except !== L) { L.classList.add('shut'); $('#start').classList.remove('on'); closeMenus(); }
+}
+function fly(name) {
+  const f = $('#fly-' + name), open = f.classList.contains('shut'); closePanels(open ? f : null);
+  if (!open) return;
+  const b = $(`[data-fly=${name}]`), s = scale(), sr = stage.getBoundingClientRect(), r = b.getBoundingClientRect();
+  const mid = (r.left + r.width / 2 - sr.left) / s;                       // centre on the tray icon, clamp to the screen edge
+  f.style.right = Math.max(8, 1600 - mid - 152) + 'px'; f.classList.remove('shut');
+}
+$$('[data-fly]').forEach(b => b.onclick = e => { e.stopPropagation(); fly(b.dataset.fly); });
+stage.addEventListener('pointerdown', e => { if (!e.target.closest('.panel:not(#hud),#taskbar')) closePanels(); });
+let vol = 62, muted = false;
+function drawVol() {
+  const v = $('#vol'); v.value = vol; v.style.setProperty('--pct', vol + '%'); $('#volv').textContent = muted ? 'Off' : vol;
+  const n = muted || !vol ? 'mute' : 'vol'; $('#t-vol').innerHTML = ic(n); $('#mute').innerHTML = ic(n);
+  $('#t-vol').title = muted ? 'Volume: muted' : `Volume: ${vol}%`;
+}
+$('#vol').oninput = e => { vol = +e.target.value; muted = false; drawVol(); };
+$('#mute').onclick = () => { muted = !muted; drawVol(); };
+$('#t-vol').addEventListener('wheel', e => { e.preventDefault(); vol = Math.max(0, Math.min(100, vol - Math.sign(e.deltaY) * 5)); muted = false; drawVol(); }, {passive:false});
+
+/* ---------- Perf HUD: simulated samples, drawn as bar quads ---------- */
+let seed = 9343; const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+const N = 60, D = {app:[], comp:[], temp:[], pow:[]};
+function sample() {
+  const spike = rnd() > .94;
+  D.app.push(spike ? 15 + rnd() * 6 : 3.4 + rnd() * 2.2); D.comp.push(1.9 + rnd() * 1.1 + (spike ? 1.5 : 0));
+  const t = (D.temp.at(-1) ?? 52) + (rnd() - .5) * 1.6 + (spike ? 1.2 : 0); D.temp.push(Math.max(47, Math.min(58, t)));
+  D.pow.push(5.2 + rnd() * 1.6 + (spike ? 2 : 0));
+  for (const k in D) if (D[k].length > N) D[k].shift();
+}
+for (let i = 0; i < N; i++) sample();
+const pct = (a, p) => [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(a.length * p))];
+function bars(data, w, h, max, color, limit, noLine) {      // one rect per sample: maps 1:1 to GPU quads
+  const n = data.length, bw = w / n; let s = `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true">`;
+  data.forEach((v, i) => { const bh = Math.max(1, Math.min(1, v / max) * h); s += `<rect x="${(i * bw).toFixed(2)}" y="${(h - bh).toFixed(2)}" width="${(bw - 1).toFixed(2)}" height="${bh.toFixed(2)}" fill="${limit && v > limit ? 'var(--hot)' : color}"/>`; });
+  if (limit && !noLine) s += `<rect x="0" y="${(h - limit / max * h).toFixed(2)}" width="${w}" height="1" fill="var(--ink-3)"/>`;
+  return s + '</svg>';
+}
+function drawHud() {
+  const a = D.app.at(-1), c = D.comp.at(-1), t = Math.round(D.temp.at(-1)), p = D.pow.at(-1);
+  const state = t >= 90 ? 'hot' : t >= 75 ? 'warm' : '';
+  $('#t-tempv').textContent = t + '°'; $('#t-temp').className = 'tk ' + state + ($('#t-temp').classList.contains('on') ? ' on' : '');
+  $('#t-temp').title = `Package ${t} °C · ${p.toFixed(1)} W`;
+  if (S.hud === 'compact') $('#hudchip').innerHTML =
+    `<span class="hc"><em>APP</em>${bars(D.app.slice(-16), 48, 20, 16.7, 'var(--hud-1)', 16.6, 1)}<b class="num">${a.toFixed(1)}</b></span>` +
+    `<span class="hc"><em>COMP</em>${bars(D.comp.slice(-16), 48, 20, 16.7, 'var(--hud-2)', 16.6, 1)}<b class="num">${c.toFixed(1)}</b></span>` +
+    `<span class="hc"><em>ms</em></span>`;
+  if (S.hud === 'expanded') {
+    const st = d => `p50 ${pct(d, .5).toFixed(1)} · p95 ${pct(d, .95).toFixed(1)} · p99 ${pct(d, .99).toFixed(1)}`;
+    $('#g-app').innerHTML = bars(D.app, 310, 40, 22, 'var(--hud-1)', 16.7); $('#h-app').textContent = a.toFixed(1) + ' ms'; $('#h-app-p').textContent = st(D.app);
+    $('#g-comp').innerHTML = bars(D.comp, 310, 28, 22, 'var(--hud-2)', 16.7); $('#h-comp').textContent = c.toFixed(1) + ' ms'; $('#h-comp-p').textContent = st(D.comp);
+    $('#g-temp').innerHTML = bars(D.temp.map(v => v - 40), 310, 28, 60, 'var(--warn)', 35); $('#h-temp').textContent = t + ' °C'; $('#h-temp-p').textContent = p.toFixed(1) + ' W package';
+    $('#hud-fps').textContent = (1000 / Math.max(16.667, pct(D.app, .5) + pct(D.comp, .5))).toFixed(1) + ' fps';
+  }
+  if (!$('#fly-temp').classList.contains('shut') || SHOT) {
+    $('#temp-big').textContent = t; $('#pow-big').textContent = p.toFixed(1) + ' W';
+    $('#temp-g').innerHTML = bars(D.temp.map(v => v - 40), 258, 36, 60, 'var(--warn)', 35);
+    $('#temp-range').textContent = `${Math.round(Math.min(...D.temp))}–${Math.round(Math.max(...D.temp))} °C`;
+    $('#temp-pill').textContent = state === 'hot' ? 'Hot' : state === 'warm' ? 'Warm' : 'Cool'; $('#temp-pill').style.setProperty('--k', state ? `var(--${state})` : 'var(--ok)');
+  }
+}
+$('#hudchip').onclick = () => set('hud', 'expanded');
+$$('[data-hud]').forEach(b => b.onclick = () => set('hud', b.dataset.hud));
+if (!SHOT) setInterval(() => { sample(); drawHud(); }, 500);       // native: 2-4 Hz so the HUD never keeps the compositor awake
+
+/* ---------- Toasts ---------- */
+const BOOT = [['Firmware', 3.41, '#7db8ff'], ['Menu', .52, '#b9a6f5'], ['Loader', .61, '#5fd6c8'], ['Kernel', 3.58, '#f0b35a']];
+const bootBar = () => BOOT.map(b => `<i style="flex:${b[1]};background:${b[2]}"></i>`).join('');
+const bootLeg = () => BOOT.map(b => `<span style="--k:${b[2]}">${b[0]}<b class="num">${b[1].toFixed(2)} s</b></span>`).join('');
+$$('[data-boot]').forEach(e => e.innerHTML = bootBar()); $$('[data-bootleg]').forEach(e => e.innerHTML = bootLeg());
+function toast({icon = 'info', title, when = 'now', body = '', html = '', tone, ttl = 7000}) {
+  const t = document.createElement('div'); t.className = 'toast glass'; t.setAttribute('role', 'status');
+  if (tone) t.style.setProperty('--k', `var(--${tone})`);
+  t.innerHTML = `${ic(icon)}<div class="ttl">${title}<small>${when}</small></div><button class="ibtn" aria-label="Dismiss">${ic('close')}</button><div class="bd">${body ? `<span>${body}</span>` : ''}${html}</div>`;
+  const kill = () => { t.classList.add('out'); setTimeout(() => t.remove(), 160); };
+  $('.ibtn', t).onclick = kill; if (ttl && !SHOT) setTimeout(kill, ttl);
+  const box = $('#toasts'); box.prepend(t); while (box.children.length > 3) box.lastChild.remove();
+}
+const T = {
+  boot: () => toast({icon:'bolt', title:'Desktop ready', when:'boot', ttl:12000,
+    html:`<div class="hero num">8.12 s<small>from power-on</small></div><div class="bootbar">${bootBar()}</div><div class="bootleg">${bootLeg()}</div><div class="meta mono">Brook 3a4b909e+29117654</div>`}),
+  thermal: () => toast({icon:'temp', tone:'hot', title:'Running hot', body:'CPU package at 91 °C, drawing 14.8 W.'}),
+  net: () => toast({icon:'net', tone:'ok', title:'Network connected', body:'<span class="mono">eth0 · 192.168.1.42</span>'})
+};
+$('#again').onclick = T.boot;
+
+/* ---------- Clock ---------- */
+function tick() {
+  const d = SHOT ? new Date(2026, 10, 15, 10, 42) : new Date();
+  $('#c-time').textContent = d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', hour12:!S.h24}).replace(/ (am|pm)/i, (m, x) => ' ' + x.toUpperCase());
+  $('#c-date').textContent = d.toLocaleDateString('en-GB', {weekday:'short', day:'numeric', month:'short'});
+}
+if (!SHOT) setInterval(tick, 15000);
+
+/* ---------- Study bar, keys, fit ---------- */
+$('#study').addEventListener('click', e => {
+  const t = e.target.closest('[data-toggle]'); if (t) return set(t.dataset.toggle, !S[t.dataset.toggle]);
+  const d = e.target.closest('[data-do]'); if (!d) return;
+  const k = d.dataset.do;
+  if (k === 'launcher') toggleLauncher(); else if (k === 'organise') { toggleLauncher(true); org = true; renderLauncher(); } else if (k === 'install') install(); else if (k === 'hud') set('hud', {off:'compact', compact:'expanded', expanded:'off'}[S.hud]);
+  else if (k === 'reset') { try { localStorage.removeItem(KEY); localStorage.removeItem(LKEY); } catch {} location.href = location.pathname; } else T[k]();
+});
+addEventListener('pointerdown', e => { if (e.pointerType === 'touch' && !S.touch) set('touch', true); }, true);
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') { if (!launcherEsc()) closePanels(); }
+  else if (e.altKey && e.key.toLowerCase() === 'p') { e.preventDefault(); set('hud', {off:'compact', compact:'expanded', expanded:'off'}[S.hud]); }
+});
+addEventListener('keyup', e => { if (e.key === 'Meta') toggleLauncher(); });
+function fit() {
+  const bar = SHOT ? 0 : $('#study').offsetHeight, s = Math.min(innerWidth / 1600, (innerHeight - bar) / 900), f = $('#fit');
+  stage.style.transform = `scale(${s})`; f.style.width = 1600 * s + 'px'; f.style.height = 900 * s + 'px';
+}
+addEventListener('resize', fit); fit();
+
+/* ---------- Boot the scene ---------- */
+renderTasks(); drawVol(); apply(); tab(Q.get('tab') || 'appearance');
+if (Q.has('focus')) focusWin(Q.get('focus')); else focusWin('settings');
+const scene = Q.get('scene') || (SHOT ? '' : 'welcome');
+if (scene === 'welcome' || scene === 'boot') T.boot();
+if (scene === 'toasts') { T.boot(); T.net(); T.thermal(); }
+if (scene === 'launcher' || scene === 'search') { toggleLauncher(true); if (scene === 'search') { q.value = Q.get('q') || 'ga'; renderLauncher(); } }
+// Staged launcher states for the screenshots.
+const rowOf = id => $(`#l-list .app[data-app="${id}"]`);
+if (scene === 'organise') { toggleLauncher(true); org = true; ['doom','quake2','gimp'].forEach(i => sel.add(i)); renderLauncher(); $('#l-list').scrollTop = 9999; }
+if (scene === 'menu') { toggleLauncher(true); kbId = 'ladybird'; markKb(); openMenu(['ladybird'], $('.more', rowOf('ladybird'))); }
+if (scene === 'drag') { toggleLauncher(true); stageDrag(['netsurf'], () => ({el:$('.rb[data-cat="demos"]'), cls:'drop'})); }
+if (scene === 'reorder') { toggleLauncher(true); view = 'office'; org = true; ['calc','qalc'].forEach(i => sel.add(i)); renderLauncher(); stageDrag(['calc','qalc'], () => ({el:rowOf('edit'), cls:'ins-l'})); }
+if (scene === 'newcat') { toggleLauncher(true); addCat(['edit','mousepad'], 'Writing'); }
+if (scene === 'unsorted') { EXTRA.forEach(a => { LAY.extra.push(a.id); LAY.fresh.push(a.id); }); toggleLauncher(true); view = 'unsorted'; renderLauncher(); change('Moved htop to System', () => moveApps(['htop'], 'system')); }
+if (scene === 'empty') { toggleLauncher(true); LAY.pins = []; addCat([], 'Work'); closeMenus(); }
+if (['net','vol','temp'].includes(scene)) fly(scene);
+
+/* ---------- Self-test: index.html?selftest=1 drives real pointer events and writes the results to the tab title ---------- */
+if (Q.has('selftest')) {
+  const out = [], ok = (n, c) => out.push((c ? 'PASS ' : 'FAIL ') + n);
+  LAY = defaults(); toggleLauncher(true);
+  const pt = el => { const r = el.getBoundingClientRect(); return {clientX:r.left + r.width * .25, clientY:r.top + r.height / 2, button:0, bubbles:true}; };
+  const dragTo = (from, to) => { from.scrollIntoView({block:'nearest'}); const a = pt(from), b = pt(to);
+    from.dispatchEvent(new PointerEvent('pointerdown', a)); dispatchEvent(new PointerEvent('pointermove', {...a, clientX:a.clientX + 20})); dispatchEvent(new PointerEvent('pointermove', b)); dispatchEvent(new PointerEvent('pointerup', b)); };
+  dragTo(rowOf('netsurf'), $('.rb[data-cat="demos"]')); ok('drag app to category', catOf('netsurf').id === 'demos');
+  undo(); ok('undo', catOf('netsurf').id === 'internet');
+  dragTo(rowOf('ladybird'), rowOf('firefox')); ok('drag to reorder', catById('internet').apps[0] === 'ladybird');
+  dragTo($('.l-tile[data-app="quake"]'), $('.l-tile[data-app="files"]')); ok('drag to reorder pins', LAY.pins[0] === 'quake');
+  dragTo($('.rb[data-cat="games"]'), $('.rb[data-cat="system"]')); ok('drag category', LAY.cats[0].id === 'games');
+  step('doom', 1); ok('keyboard step', catById('games').apps[1] === 'doom');
+  step('quake2', 1); ok('step crosses into next category', catOf('quake2').id === 'system' && catById('system').apps[0] === 'quake2');
+  org = true; sel.add('edit'); sel.add('mousepad'); renderLauncher(); dragTo(rowOf('edit'), $('[data-newcat]')); closeMenus();
+  ok('multi-drag to new category', LAY.cats.length === 8 && LAY.cats.at(-1).apps.join() === 'edit,mousepad');
+  deleteCat(LAY.cats.at(-1).id); ok('delete sends apps to Unsorted', unsorted().join() === 'edit,mousepad');
+  justDragged = false; $('[data-sug="edit"]')?.click(); ok('suggestion files an app', catOf('edit')?.id === 'office');
+  q.value = 'games'; renderLauncher(); ok('search by category name', kbItems().map(b => b.dataset.app).join() === 'doom,quake');
+  const n = UNDO.length; while (UNDO.length) undo(); ok(`undo all ${n} steps restores defaults`, JSON.stringify(LAY.cats) === JSON.stringify(defaults().cats));
+  document.title = out.join(' | ');
+}
+})();
+</script>
+</body>
+</html>
