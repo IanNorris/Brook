@@ -3,11 +3,11 @@
 
 namespace brook {
 // Runtime gate for M4a prompt GPU wakeups (wait registry arming and RCS
-// completion spin slices). Off by default: every boot starts with the
-// previous 1 ms polling behaviour, which is known safe on the Dell. Turn it
-// on with the `gpu wakeups on` debug command (or /etc/dell-gpu-prompt-wake
-// at boot). Off restores polling for waits armed afterwards; waits already
-// armed still end at their one-tick timeout.
+// completion spin slices). Off until the Dell boot path decides: it turns
+// the gate on unless /etc/dell-gpu-no-prompt-wake exists (other boots keep
+// the 1 ms polling). `gpu wakeups on|off` switches at runtime. Off restores
+// polling for waits armed afterwards; waits already armed still end at their
+// one-tick timeout.
 struct BdwPromptWakeState {
     uint32_t enabled=0;
     uint64_t ifRestores=0;   // IF found clear after a worker wait and re-enabled

@@ -1905,9 +1905,11 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         };
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY)
-        // M4a prompt wakeups stay off unless explicitly opted in at boot or
-        // enabled later with `gpu wakeups on`.
-        if(OptedIn("/etc/dell-gpu-prompt-wake"))BdwPromptWakeSet(true);
+        // M4a prompt wakeups are on by default since gen 410: with sync_file
+        // polls woken by GPU retire they give ~19% more Quake swaps and a ~10%
+        // shorter demo. /etc/dell-gpu-no-prompt-wake keeps the 1 ms polling;
+        // `gpu wakeups on|off` still switches at runtime.
+        BdwPromptWakeSet(!OptedIn("/etc/dell-gpu-no-prompt-wake"));
         // Zero-copy scanout (wt) auto-arm when the renderer registers its
         // ring. Opt-in for now (/etc/dell-zero-copy-auto) until the gen 401
         // compositor failure after a live arm is understood; flip the

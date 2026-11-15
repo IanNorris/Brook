@@ -6129,7 +6129,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("if_restores",__atomic_load_n(&w.ifRestores,__ATOMIC_RELAXED));
         r.text(",");r.field("work_generation",BdwGpuEventGeneration(BdwGpuEvent::Work));
         r.text(",");r.field("retire_generation",BdwGpuEventGeneration(BdwGpuEvent::Retire));
-        r.text(",\"scope\":\"M4a prompt GPU wakeups; off = pre-M4a 1 ms polling (boot default unless /etc/dell-gpu-prompt-wake); on = wait-registry wakes plus RCS completion spin slices (spins also need no /etc/dell-gpu-no-poll-spin); new waits follow the switch immediately, armed waits end at their one-tick timeout; if_restores counts worker waits that returned with IF=0 and were re-enabled (should stay 0 outside spin slices)\"}\n");
+        r.text(",\"scope\":\"M4a prompt GPU wakeups; off = pre-M4a 1 ms polling (Dell boot default is on unless /etc/dell-gpu-no-prompt-wake); on = wait-registry wakes plus RCS completion spin slices (spins also need no /etc/dell-gpu-no-poll-spin); new waits follow the switch immediately, armed waits end at their one-tick timeout; if_restores counts worker waits that returned with IF=0 and were re-enabled (should stay 0 outside spin slices)\"}\n");
         r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
