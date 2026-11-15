@@ -709,7 +709,8 @@ int64_t UserMappingBreak(Process* actor,AddressSpaceState* space,uint64_t reques
             const auto* tail=MappingRangeFind(space->ranges,oldEnd-1);
             if (tail && tail->end==oldEnd && tail->kind==MappingKind::Heap && tail->protection==3 &&
                 tail->maximumProtection==7 && tail->leafOwnership==MappingLeafOwnership::Managed &&
-                tail->sharing==MappingSharing::Private && !tail->backing) extend=tail->identity;
+                tail->sharing==MappingSharing::Private && !tail->backing &&
+                !tail->forkFlags) extend=tail->identity; // Linux never merges differing VM_DONTCOPY/WIPEONFORK
         } else if (!operation.RangeLeafCount(newEnd,oldEnd,retired)) return static_cast<int64_t>(previous);
         const uint64_t generation=space->generation;operation.Unlock();
         if (!operation.Prepare(growth?growth:retired,growth) || !operation.PrepareRanges(3) ||
