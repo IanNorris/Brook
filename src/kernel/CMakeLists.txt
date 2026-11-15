@@ -293,6 +293,7 @@ add_executable(kernel
     src/syscall_memfd.cpp
     src/syscall_dsp.cpp
     src/syscall_pipe.cpp
+    src/syscall_unix_socket.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
