@@ -9,6 +9,8 @@
 
 namespace brook {
 
+MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpaceState* space,uint64_t address,uint64_t error,uint32_t retryBudget=0,bool allowPageableReclaim=false);
+
 enum MmapFlags : uint64_t {
     MAP_SHARED    = 0x01,
     MAP_PRIVATE   = 0x02,
@@ -24,6 +26,11 @@ enum MmapProt : uint64_t {
     PROT_READ     = 0x1,
     PROT_WRITE    = 0x2,
     PROT_EXEC     = 0x4,
+};
+
+struct MappingBackingGuard {
+    MappingBacking* value = nullptr;
+    ~MappingBackingGuard() { MappingBackingUnref(value); }
 };
 
 } // namespace brook

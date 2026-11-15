@@ -59,8 +59,21 @@ int64_t sys_pipe(uint64_t address,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
                    uint64_t, uint64_t, uint64_t);
 
-// syscall.cpp
+// syscall_memory.cpp
+int64_t sys_brk(uint64_t requested,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                   uint64_t flags, uint64_t fd, uint64_t offset);
+int64_t sys_mprotect(uint64_t addr,uint64_t length,uint64_t prot,uint64_t,uint64_t,uint64_t);
+int64_t sys_msync(uint64_t addr,uint64_t length,uint64_t flags,uint64_t,uint64_t,uint64_t);
+int64_t sys_munmap(uint64_t addr,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_mremap(uint64_t source,uint64_t oldLength,uint64_t newLength,uint64_t flags,uint64_t destination,uint64_t);
+int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_madvise(uint64_t address, uint64_t length, uint64_t advice,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_fadvise64(uint64_t, uint64_t, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_mbind(uint64_t, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
 
 } // namespace brook
