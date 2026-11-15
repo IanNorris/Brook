@@ -534,4 +534,30 @@ int64_t sys_brook_wm_get_windows(uint64_t outAddr, uint64_t maxCount, uint64_t,
 int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t);
 
+// syscall_brook_gpu.cpp
+int64_t sys_brook_gpu_output_alloc(uint64_t bytes,uint64_t flags,uint64_t a,uint64_t b,uint64_t c,uint64_t d);
+int64_t sys_brook_gpu_buffer_try_cpu_read(uint64_t fd,uint64_t flags,uint64_t a,uint64_t b,uint64_t c,uint64_t d);
+int64_t sys_brook_gpu_buffer_snapshot_fence(uint64_t fd,uint64_t flags,uint64_t a,uint64_t b,uint64_t c,uint64_t d);
+int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b,uint64_t c,uint64_t d);
+int64_t sys_brook_gpu_window_validate(uint64_t fdValue,uint64_t window,uint64_t incarnation,
+                                       uint64_t a,uint64_t b,uint64_t c);
+int64_t sys_brook_gpu_window_peer_recovery(uint64_t fdValue,uint64_t op,uint64_t bufferFd,
+                                            uint64_t a,uint64_t b,uint64_t c);
+int64_t sys_brook_gpu_ctx_create(uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t);
+int64_t sys_brook_gpu_resource_create(uint64_t ctx, uint64_t format,
+                                      uint64_t bind, uint64_t w, uint64_t h,
+                                      uint64_t);
+int64_t sys_brook_gpu_attach_window(uint64_t ctx, uint64_t resId,
+                                    uint64_t wmId, uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_gpu_upload_buffer(uint64_t ctx, uint64_t srcPtr,
+                                    uint64_t bytes, uint64_t,
+                                    uint64_t, uint64_t);
+int64_t sys_brook_gpu_submit(uint64_t ctx, uint64_t cmdPtr, uint64_t nDwords,
+                             uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_gpu_transfer(uint64_t ctx, uint64_t resId, uint64_t dir,
+                               uint64_t w, uint64_t h, uint64_t);
+int64_t sys_brook_gpu_ctx_destroy(uint64_t ctx, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t);
+
 } // namespace brook
