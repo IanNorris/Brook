@@ -426,4 +426,10 @@ int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
 int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t);
 
+// syscall_sysv_ipc.cpp
+int64_t sys_semget(uint64_t key,uint64_t count,uint64_t flags,uint64_t,uint64_t,uint64_t);
+int64_t sys_semop(uint64_t id,uint64_t address,uint64_t count,uint64_t,uint64_t,uint64_t);
+int64_t sys_semtimedop(uint64_t id,uint64_t address,uint64_t count,uint64_t timeout,uint64_t,uint64_t);
+int64_t sys_semctl(uint64_t id,uint64_t number,uint64_t command,uint64_t arg,uint64_t,uint64_t);
+
 } // namespace brook

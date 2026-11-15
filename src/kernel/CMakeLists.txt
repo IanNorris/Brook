@@ -316,6 +316,7 @@ add_executable(kernel
     src/syscall_futex.cpp
     src/syscall_cred.cpp
     src/syscall_sysinfo.cpp
+    src/syscall_sysv_ipc.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
