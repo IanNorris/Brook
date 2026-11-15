@@ -410,4 +410,20 @@ int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
 int64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
 int64_t sys_getresgid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t);
 
+// syscall_sysinfo.cpp
+int64_t sys_uname(uint64_t bufAddr, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
+                        uint64_t oldlimitAddr, uint64_t, uint64_t);
+int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
+                        uint64_t, uint64_t, uint64_t);
+int64_t sys_getrusage(uint64_t who, uint64_t usageAddr, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
