@@ -93,6 +93,32 @@ The 253-test host regression run completed successfully with five skips;
 evidence is under `build/workloads/drm-map-token-20261019/baseline/` and
 `build/vm-bridge-batch-host-tests-20261019.log`.
 
+### Taskbar agent indicator (bridge 0.12.0)
+
+While the long-lived MCP stdio server holds a session, it sends the guest a
+cheap framed `bridge presence beat 10` every 10 s (`presence.py`). The guest
+taskbar then shows a small robot icon, tooltip "Agent connected from ADDRESS".
+Every session a tool call used is beaten (`hw_attach` included); `vm_doctor`
+and `hw_doctor` report the server's `agent_presence` entry. Beats skip the
+per-session operation lock: one idempotent line on its own connection.
+
+| Guest observes | Indicator |
+| --- | --- |
+| Beat, or any framed request from that peer, within 3x interval (min 30 s), or a framed request still executing | Robot icon |
+| Silence beyond that | Dimmed robot with amber badge; tooltip "Agent stopped responding N s ago", or "network down" when the guest's own link is down |
+| `bridge presence detach`, or 10 min of silence | Nothing |
+
+The guest cannot see why beats stop. A clean server exit (stdin EOF or
+SIGTERM) sends detach to every beaten session, as does `hw_detach` (which also
+marks the hardware session detached) and 30 minutes without tool use for that
+session (`BROOK_BRIDGE_HEARTBEAT_IDLE_S`). Therefore a cleared icon means the
+agent left deliberately, while a warning means the server was killed or the
+host or network path failed; those last cases are indistinguishable. One-shot
+`--call` CLI processes never attach presence, so their normal gaps raise no
+warning. Older guests without `presence_api` are dropped after one beat. Set
+`BROOK_BRIDGE_HEARTBEAT=0` to disable beats, for example during idle-network
+measurements. `bridge presence` on the guest reports the current state.
+
 ### Media delivery (bridge 0.3.0)
 
 Image-producing tools default to `include_image: false`. Text results contain
@@ -732,6 +758,8 @@ is the default. Hardware session records live under `build/hardware-bridge`
 (or `BROOK_HARDWARE_REGISTRY`) and persist across client reconnects. The endpoint
 is pinned to its guest boot identity. Reboot or IP reassignment invalidates old
 commands and references; call `hw_attach` explicitly again for the new boot.
+`hw_detach` ends an attachment deliberately and clears the guest's taskbar
+agent indicator.
 A stale-identity response is distinct from TCP unreachability. This development
 protocol assumes a trusted LAN; the boot token prevents stale targeting and is
 not authentication.

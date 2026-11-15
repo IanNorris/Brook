@@ -6,6 +6,8 @@ Use `hw_*` for the explicitly selected Brook machine. Hardware tools do not prov
 
 `hw_sessions` reads the local opted-in registry without scanning or probing the LAN. `hw_attach` takes a literal current IPv4 address and optional port, default 1234. Use the endpoint displayed by the guest or supplied for the task; do not guess it from a previous boot or scan the subnet. Attaching pins a boot identity. The development debug port assumes a trusted network; its boot guard prevents stale targeting and is not authentication.
 
+While the MCP server holds a session it heartbeats the guest every 10 s, which shows an agent icon on the Brook taskbar (amber warning when beats stop). Call `hw_detach` when finished with a machine so the icon clears instead of turning into a warning; a clean MCP exit also detaches.
+
 On an authorized inspection, use `hw_doctor` and distinguish:
 
 | Result | Meaning and next step |

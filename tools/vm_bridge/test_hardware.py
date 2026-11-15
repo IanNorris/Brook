@@ -69,6 +69,11 @@ class Endpoint:
                                     self.power_drop=False;break
                                 result={'power_api':1,'request_id':request,'operation':verb,'state':self.power_requests.get(request,'missing'),'error':-95 if verb=='commit' else 0}
                         elif command.startswith('bridge hardware logs '):result={'logs_api':1,'lines':['hello "world"'],'next_cursor':2,'dropped_lines':1,'more':False}
+                        elif command.startswith('bridge presence'):
+                            verb=command[len('bridge presence'):].strip()
+                            if verb.startswith('beat '):self.presence='connected'
+                            elif verb=='detach':self.presence='hidden'
+                            result={'presence_api':1,'state':getattr(self,'presence','hidden')}
                         elif command=='effect':self.effects+=1;break
                         else:result={'reply':command}
                     response=f'BRIDGE_BEGIN {token}\n{json.dumps(result)}\nBRIDGE_END {token}\n'.encode()
@@ -224,6 +229,17 @@ class HardwareTests(unittest.TestCase):
         with patch.object(self.hardware,'guest',return_value={'reply':'unsupported'}),self.assertRaises(GuestJobError):
             self.hardware.power(session,'1'*32,'shutdown')
 
+    def test_detach_clears_guest_presence_and_refuses_later_calls(self):
+        session=self.attach();self.hardware.command(session,'bridge presence beat 10')
+        self.assertEqual(self.endpoint.presence,'connected')
+        result=self.hardware.detach(session)
+        self.assertEqual(result['guest_presence'],'hidden');self.assertEqual(result['previous_state'],'running')
+        self.assertEqual(self.endpoint.presence,'hidden')
+        self.assertIn(f'bridge guard {self.endpoint.epoch} bridge presence detach',self.endpoint.commands)
+        with self.assertRaisesRegex(RuntimeError,'detached'):self.hardware.stats(session)
+        self.assertEqual(self.hardware.detach(session)['previous_state'],'detached')
+        self.endpoint.epoch='e'*32
+        self.assertEqual(self.hardware.detach(session)['guest_presence'],'boot_changed')
     def test_session_symlinks_rejected(self):
         session=self.attach();file=Path(self.tmp.name)/session/'session.json';backup=file.with_suffix('.saved');file.rename(backup);file.symlink_to(backup)
         with self.assertRaises(ValueError):self.hardware.load_session(session)

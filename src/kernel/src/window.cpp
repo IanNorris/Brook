@@ -20,6 +20,7 @@
 #include "device.h"
 #include "virtio_blk.h"
 #include "net.h"
+#include "debug_presence.h"
 #include "smp.h"
 #include "build_info.h"
 #include "kvmclock.h"
@@ -1830,13 +1831,18 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
 struct TaskbarLayout
 {
     int y, textY;
-    WmRect apps, terminal, next, clock, network, volume;
+    WmRect apps, terminal, next, clock, network, volume, agent;
     WmRect metrics[7];
     WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int count, nextIndex;
     char clockText[32];
 };
+
+// Debug-bridge agent indicator cache (see WmAgentIndicatorRefresh).
+static uint8_t g_agentIndicatorState = 0; // BridgePresenceState
+static uint32_t g_agentIndicatorPeer = 0;
+static uint64_t g_agentIndicatorSilentMs = 0;
 
 static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
 {
@@ -1865,6 +1871,8 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     reserve(l.clock, WmTextWidth(l.clockText));
     reserve(l.network, WmMetric(16));
     reserve(l.volume, WmMetric(16));
+    // Leftmost fixed icon, so its appearance never moves the volume target.
+    if (__atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE)) reserve(l.agent, WmMetric(16));
     const int widths[7]={64,64,112,112,240,240,150};
     const uint32_t enabledMetrics=WmGetTaskbarMetrics();
     for(int i=6;i>=0;--i)if(enabledMetrics&(1u<<i)){
@@ -1980,6 +1988,100 @@ static void DrawNetworkIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw,
         WmFillRect(pixels, stride, sw, sh, x0 + i, top + i, t, t, fg);
         WmFillRect(pixels, stride, sw, sh, x0 + span - t - i, top + i, t, t, fg);
     }
+}
+
+// Debug-bridge agent indicator. The guest sees only its own debug listener:
+// heartbeats ("bridge presence beat") from a long-lived MCP bridge attach,
+// other framed requests from that peer refresh, and an explicit detach
+// clears. Silence beyond the stale threshold shows a warning variant; ten
+// minutes of silence clears it. The compositor thread samples once per
+// second (one short spinlock); taskbar rendering reads only this cache.
+bool WmAgentIndicatorRefresh(uint64_t now)
+{
+    static uint64_t lastTick = 0;
+    static bool sampled = false;
+    if (sampled && now - lastTick < 1000) return false;
+    sampled = true;
+    lastTick = now;
+    const BridgePresenceView view = DebugPresenceSnapshot(now);
+    const uint8_t state = static_cast<uint8_t>(view.state);
+    __atomic_store_n(&g_agentIndicatorPeer, view.peer, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_agentIndicatorSilentMs, view.silentMs, __ATOMIC_RELAXED);
+    const uint8_t previous = __atomic_exchange_n(&g_agentIndicatorState, state, __ATOMIC_ACQ_REL);
+    if (previous == state) return false;
+    const uint8_t* o = reinterpret_cast<const uint8_t*>(&view.peer);
+    SerialPrintf("WM: agent indicator %s peer=%u.%u.%u.%u silent_ms=%u\n", BridgePresenceStateName(view.state),
+                 o[0], o[1], o[2], o[3], static_cast<uint32_t>(view.silentMs));
+    return true;
+}
+
+// A small robot head: antenna, outlined face, two eyes. Connected draws it in
+// the clock colour with green eyes; stale dims it, closes the eyes and adds
+// an amber "!" badge at the lower right.
+static void DrawAgentIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh, const WmRect& r)
+{
+    const uint8_t state = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
+    if (r.w <= 0 || !state) return;
+    const bool stale = state == static_cast<uint8_t>(BridgePresenceState::Stale);
+    const uint32_t fg = WmCurrentPalette().secondaryText;
+    const uint32_t ink = stale ? WmBlendColor(fg, WmCurrentPalette().taskbar, 120) : fg;
+    // Drawn on a 16-unit grid scaled to the 16-pixel metric (any UI scale).
+    const int size = static_cast<int>(WmMetric(16));
+    const int x0 = r.x + (r.w - size) / 2, y0 = r.y + (r.h - size) / 2;
+    auto px = [&](int v) { return v * size / 16; };
+    auto box = [&](int x, int y, int w, int h, uint32_t c) {
+        WmFillRect(pixels, stride, sw, sh, x0 + px(x), y0 + px(y), px(x + w) - px(x), px(y + h) - px(y), c);
+    };
+    box(6, 0, 4, 2, ink);           // antenna knob
+    box(7, 2, 2, 2, ink);           // antenna stem
+    box(1, 4, 14, 2, ink);          // face outline
+    box(1, 14, 14, 2, ink);
+    box(1, 6, 2, 8, ink);
+    box(13, 6, 2, 8, ink);
+    if (!stale) {
+        const uint32_t eye = 0x4cd38a;
+        box(4, 8, 3, 3, eye);
+        box(9, 8, 3, 3, eye);
+        return;
+    }
+    box(4, 9, 3, 1, ink);           // closed eyes
+    box(9, 9, 3, 1, ink);
+    const uint32_t badge = 0xf0a020, mark = 0x1a1a1a;
+    box(10, 9, 6, 7, badge);
+    box(12, 10, 2, 3, mark);
+    box(12, 14, 2, 1, mark);
+}
+
+static void AgentIndicatorTooltip(char (&text)[48])
+{
+    const uint8_t state = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
+    const uint32_t peer = __atomic_load_n(&g_agentIndicatorPeer, __ATOMIC_RELAXED);
+    auto append = [&](const char* part) {
+        const size_t n = strlen(text);
+        WmStrCopy(text + n, part, sizeof(text) - n);
+    };
+    auto number = [&](uint64_t value) {
+        char digits[12];
+        DesktopNumber(digits, static_cast<unsigned>(value));
+        append(digits);
+    };
+    text[0] = 0;
+    if (state == static_cast<uint8_t>(BridgePresenceState::Connected)) {
+        append("Agent connected from ");
+        const uint8_t* o = reinterpret_cast<const uint8_t*>(&peer);
+        for (int i = 0; i < 4; ++i) { number(o[i]); if (i < 3) append("."); }
+        return;
+    }
+    // The guest can tell only that the host went quiet, not why; its own
+    // link state is the one cause it can rule in.
+    if (!__atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE)) {
+        WmStrCopy(text, "Agent unreachable: network down", sizeof(text));
+        return;
+    }
+    const uint64_t seconds = __atomic_load_n(&g_agentIndicatorSilentMs, __ATOMIC_RELAXED) / 1000;
+    append("Agent stopped responding ");
+    if (seconds < 120) { number(seconds); append(" s ago"); }
+    else { number(seconds / 60); append(" min ago"); }
 }
 
 // Taskbar volume. The control is the same atomic master gain the Settings app
@@ -2313,7 +2415,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // Use the already-reserved tray for the hover label. Geometry stays fixed
     // and no additional empty strip is reserved when nothing is hovered.
     int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.metrics[6],l.volume,l.network,l.clock};
+    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.metrics[6],l.agent,l.volume,l.network,l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
@@ -2328,6 +2430,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
     DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
     DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
+    DrawAgentIndicator(backBuffer, stride, screenW, screenH, l.agent);
     for(unsigned i=0;i<7;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
 }
 
@@ -2346,6 +2449,9 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     } else if (l.metrics[6].w && l.metrics[6].contains(mx, my)) {
         anchor = &l.metrics[6];
         DesktopThermalTooltip(text);
+    } else if (l.agent.w && l.agent.contains(mx, my)) {
+        anchor = &l.agent;
+        AgentIndicatorTooltip(text);
     } else if (l.network.contains(mx, my)) {
         anchor = &l.network;
         const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);

@@ -95,6 +95,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "compositor_scene.h"
 #include "debug_jobs.h"
 #include "debug_epoch.h"
+#include "debug_presence.h"
 #include "debug_ui.h"
 #include "drm_backing_diagnostics.h"
 #include "frame_timing.h"
@@ -4925,6 +4926,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #endif
     if (DebugHardwareHandleCommand(cmd,len)) return;
     if (DebugEpochHandleCommand(cmd)) return;
+    if (DebugPresenceHandleCommand(cmd)) return;
     if (DebugJobHandleCommand(cmd)) return;
     if (DebugUiHandleCommand(cmd)) return;
     // Guarded frame leases bind request/status/release to one guest boot.

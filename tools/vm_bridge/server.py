@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import socket
 import struct
 import subprocess
@@ -26,12 +27,13 @@ import zlib
 from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
 from media import Delivery, PreviewLimitError, describe as describe_artifact, scoped_path
 from guest_transport import exchange, parse_guest_reply, validate_commands
-from hardware import Hardware
+from hardware import Hardware, HardwareBootChanged
 from jobs import Jobs
 from ui import Ui
 from observation import Observations, StaleObservation, validate_selection
 from frame_views import FrameViews
 import reset as reset_control
+import presence as agent_presence
 import shutdown as shutdown_control
 
 MAX_LOG = 256 * 1024
@@ -236,7 +238,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.11.0",
+                  "generation": data["generation"], "server_version": "0.12.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -983,6 +985,7 @@ register("hw_transfer",hardware.transfer,"Transfer a staged file or completed sc
 register("hw_panic_report",hardware.panic_report,"Retrieve the newest valid preallocated panic journal record after reboot through the authenticated binary bridge; writes a local packet and receipts, never retries an uncertain operation",{**SESSION,"request_id":STR,"key_file":STR,"output":STR,"port":INT},["session","request_id","key_file","output"])
 register("hw_recovery_panic",hardware.recovery_panic,"Read the newest or previous boot-pinned recovery panic snapshot into a new local file and verify its checksum",{**SESSION,"output":STR,"previous":{"type":"boolean"}},["session","output"],True)
 register("hw_attach",hardware.attach,"Attach an explicit physical Brook IPv4 endpoint and pin its boot; no network discovery or QEMU required",{"host":STR,"port":INT},["host"])
+register("hw_detach",hardware.detach,"End a hardware attachment: clear the guest's taskbar agent indicator and mark the session detached; attach again to resume",SESSION,["session"])
 register("hw_sessions",hardware.sessions,"List opted-in hardware sessions without probing the network",readonly=True)
 register("hw_doctor",hardware.doctor,"Report network reachability and supported hardware operations; QEMU and post-panic access stay explicitly unavailable",SESSION,["session"],True)
 register("hw_stats",hardware.stats,"Memory, processes and compositor intervals from a boot-pinned physical Brook session",{**SESSION,"audio_details":{"type":"boolean"}},["session"],True)
@@ -1046,6 +1049,32 @@ register("vm_audio_capture",audio_capture,"Bounded PCM WAV capture without speak
 register("vm_audio_analyze",audio_analyze,"Return waveform artifact and metrics for a session WAV artifact",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
 
 
+# MCP server mode only (see presence.py): heartbeats for sessions this
+# process has used, driving the guest taskbar agent indicator.
+PRESENCE=None
+PRESENCE_UNTRACKED={"vm_sessions","hw_sessions","hw_detach","vm_start"}
+
+
+def presence_send(kind,session,command):
+    try:data=hardware.load_session(session) if kind=="hw" else load_session(session)
+    except Exception as error:raise agent_presence.PresenceGone(str(error)) from error
+    try:
+        if kind=="hw":return hardware.guest(data,command,agent_presence.BEAT_TIMEOUT_S)
+        return guest(data,command,agent_presence.BEAT_TIMEOUT_S)
+    except (HardwareBootChanged,RuntimeError,ValueError) as error:
+        raise agent_presence.PresenceGone(str(error)) from error
+
+
+def presence_note(name,arguments,result):
+    if PRESENCE is None:return
+    kind=name[:2]
+    session=arguments.get("session")
+    if name=="hw_attach" and isinstance(result,dict):session=result.get("session")
+    if name not in PRESENCE_UNTRACKED and session:PRESENCE.touch(kind,session)
+    if name in {"vm_doctor","hw_doctor"} and isinstance(result,dict):
+        result["agent_presence"]=PRESENCE.entry(kind,session) or {"state":"not_tracked"}
+
+
 def call_tool(name,arguments,cancel=None):
     if name not in TOOLS:raise ValueError("Unknown tool")
     fn,spec=TOOLS[name];properties=spec["inputSchema"]["properties"]
@@ -1057,7 +1086,9 @@ def call_tool(name,arguments,cancel=None):
            (kind=="array" and not isinstance(v,list)) or (kind=="object" and not isinstance(v,dict)) or (kind in {"integer","number"} and
             (isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or (kind=="integer" and not isinstance(v,int)))):
             raise ValueError("Invalid type for "+k)
+    if name=="hw_detach" and PRESENCE is not None:PRESENCE.forget("hw",arguments["session"])
     result=fn(**arguments,_cancel=cancel)
+    presence_note(name,arguments,result)
     delivery=Delivery(REGISTRY,arguments.get("session"),arguments.get("include_image",False))
     if isinstance(result,dict) and 'post_action_observation' in result:
         # Optional media delivery cannot erase a mutation's durable result.
@@ -1083,6 +1114,11 @@ def call_tool(name,arguments,cancel=None):
 
 
 def serve():
+    global PRESENCE
+    # A terminated server still runs the finally block below, so guests see
+    # an explicit detach rather than a stale heartbeat.
+    signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))
+    if agent_presence.enabled():PRESENCE=agent_presence.Presence(presence_send).start()
     out_lock=threading.Lock();pending={};pending_lock=threading.Lock()
     executor=ThreadPoolExecutor(max_workers=4)
     control_executor=ThreadPoolExecutor(max_workers=1)
@@ -1095,7 +1131,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.11.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.12.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":
@@ -1139,6 +1175,7 @@ def serve():
             for event in pending.values():event.set()
         executor.shutdown(wait=True)
         control_executor.shutdown(wait=True)
+        if PRESENCE is not None:PRESENCE.close()
 
 
 if __name__=="__main__":
