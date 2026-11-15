@@ -59,4 +59,8 @@ int64_t sys_pipe(uint64_t address,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
                    uint64_t, uint64_t, uint64_t);
 
+// syscall.cpp
+int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+                  uint64_t flags, uint64_t fd, uint64_t offset);
+
 } // namespace brook
