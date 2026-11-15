@@ -212,7 +212,7 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     // Never sweep by allocationPid: exec and PID reuse can own newer resources.
     kfree(space);
     // No AS, page-table, range or filesystem locks remain held here.
-    ExecPageCacheTrimIdle();
+    ExecPageCacheTrimAfterRelease(PmmGetFreePageCount());
     const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
     --g_cleanupStatus.liveUserAddressSpaces;
     ++g_cleanupStatus.completedAddressSpaces;

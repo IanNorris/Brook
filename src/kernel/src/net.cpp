@@ -5164,6 +5164,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched runtime history on|off|reset|status|cpu N - bounded clamp/owner history\n"
             "  sched kvm status - advertised PV features and independent preemption hints\n"
             "  sched lock-trace on|off|reset|status - ready-lock ticket and clock observations\n"
+            "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -6769,7 +6770,33 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("admissions",stats.admissions);
         r.text(",");r.field("full",stats.full);
         r.text(",");r.field("collisions",stats.collisions);
-        r.text(",");r.field("trimmed",stats.trimmed);r.text("}\n");r.send();
+        r.text(",");r.field("trimmed",stats.trimmed);
+        r.text(",");r.field("full_trims",stats.fullTrims);
+        r.text(",");r.field("step_trims",stats.stepTrims);
+        r.text(",");r.field("slots_scanned",stats.slotsScanned);r.text("}\n");r.send();
+    }
+    else if (NetStrEq(cmd, "mem cleanup status")) {
+        // Process-exit cleanup costs: exec page cache release trims (bounded
+        // steps vs full sweeps, slots visited) and the PMM quarantine drainer
+        // (all-CPU TLB barriers, frames per barrier, deferred small batches).
+        const auto e=ExecPageCacheGetStats();
+        const auto d=PmmReadDrainStats();
+        const uint64_t now=ApicTickCount();
+        BridgeReply r;r.text("{");r.field("tick_ms",now);
+        r.text(",\"exec_cache\":{");r.field("entries",e.entries);
+        r.text(",");r.field("full_trims",e.fullTrims);
+        r.text(",");r.field("step_trims",e.stepTrims);
+        r.text(",");r.field("slots_scanned",e.slotsScanned);
+        r.text(",");r.field("trimmed",e.trimmed);
+        r.text(",");r.field("step_slots",ExecPageCacheExitTrimSlots);
+        r.text("},\"pmm_drain\":{");r.field("barriers",d.barriers);
+        r.text(",");r.field("frames_released",d.framesReleased);
+        r.text(",");r.field("virtual_batches",d.virtualBatches);
+        r.text(",");r.field("deferred",d.deferred);
+        r.text(",");r.field("max_batch",d.maxBatch);
+        r.text(",");r.field("min_batch",PmmDrainMinBatch);
+        r.text("},\"scope\":\"cumulative since boot; diff two reads over a known interval for rates (tick_ms is ms). barriers = all-CPU TLB flush barriers by pmm_drain; frames_released/barriers = pages per barrier; deferred = small batches left for the next nap\"}\n");
+        r.send();
     }
     else if (NetStrEq(cmd, "mem vmalloc")) {
         const auto d=VmmArenaReadStatistics();
