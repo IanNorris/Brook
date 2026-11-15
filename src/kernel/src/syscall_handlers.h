@@ -182,4 +182,8 @@ int64_t sys_faccessat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 int64_t sys_faccessat2(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                       uint64_t flags, uint64_t, uint64_t);
 
+// syscall_dir.cpp
+int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                        uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
