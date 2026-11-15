@@ -92,6 +92,19 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, gen 397 (`dell-integration6-20261115`: main + publish-batch fix + VA-API 2a, video engine built):**
+- **Publish-stage panic fixed** (`ae899bce`). Table publication was capped at 128 pages and didn't grow with the 512-table limit; it's now batched in 64-page chunks up to 1,024, and failure refuses the job.
+  - Panics 37 (Firefox YouTube) and 39 (pid 100 about 50 s after boot, likely a browser session restore that left the Dell unreachable until AC-cycled) were both this bug.
+  - On gen 397: Firefox (362 app jobs) and Chromium (3,446) play YouTube on the GPU path for 90 s each, no panic, no refusals.
+- **VA-API works on the Dell:**
+  - `vaapi-brook-pkg` closure staged create-only (only `libdrm-brook-softpin` was new; 126/126 present), with Ian's approval.
+  - `vainfo` (i965, `LIBVA_DRIVERS_PATH=/nix/store/b9fz5qks…-brook-vaapi-0.2/lib/dri`, `/dev/dri/renderD129`) lists H.264/MPEG-2/VC-1/JPEG/VP8 VLD plus H.264 EncSlice and VideoProc. The only failed ioctl is GETPARAM 42 (HuC, n/a on BDW).
+  - **ffmpeg `-hwaccel vaapi` decode of a 720p H.264 clip: 60/60 frames bit-exact vs software** (`-pix_fmt yuv420p`), 120 VCS jobs, 0 failures, ~5.5 ms per job.
+  - GETPARAM correction: HAS_BSD is 10, not 5.
+  - Evidence: `display-perf/build/vaapi-gen397b/`.
+- **Git identity:** since Ian's host reboot, `~/.config/git/identity` sets an empty user.name. Commit with `-c user.name/-c user.email`.
+- **Next:** VA-API phase 3 (Chromium VA-API on Ozone/Wayland, Firefox via ffmpeg, an H.264 preference for YouTube), then phase 4 hardening (keep VCS state between jobs instead of two media resets per job).
+
 **Early 15 Nov (gens 394–395):**
 - **Merged to main:** `d26b3612` (vaapi chain plus steam), then `8611cda1` (browser-gpu).
 - **GPU browsers are the default on the Dell:**
