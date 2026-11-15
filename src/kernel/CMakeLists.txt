@@ -321,6 +321,7 @@ add_executable(kernel
     src/syscall_brook_wm.cpp
     src/syscall_brook_gpu.cpp
     src/syscall_brook_desktop.cpp
+    src/syscall_strace.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
