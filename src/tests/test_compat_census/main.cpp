@@ -108,12 +108,34 @@ void Paths()
 }
 }
 
+void QuietSet()
+{
+    // Deliberate ENOSYS (origin quiet) is counted but reported apart, so a
+    // frequent fallback probe cannot crowd real gaps out of the top N.
+    static CompatCensusTable<64> t{};
+    CompatKey rseq{};rseq.kind=CompatKind::Syscall;rseq.nr=334;rseq.error=38;rseq.a=CompatOriginQuiet;
+    CompatKey kcmp=rseq;kcmp.nr=312;kcmp.a=CompatOriginUnimplemented;
+    for(int i=0;i<100;++i)t.Note(rseq,nullptr,i,1,"bash");
+    t.Note(kcmp,nullptr,5,2,"Xwayland");
+    t.Note(Ioctl(0x5401),nullptr,6,2,"Xwayland");
+    t.Note(Ioctl(0x5401),nullptr,7,2,"Xwayland");
+    CHECK(CompatKeyQuiet(rseq) && !CompatKeyQuiet(kcmp) && !CompatKeyQuiet(Ioctl(1)));
+    CompatEntry out[8];uint32_t used=0;
+    CHECK(t.Snapshot(out,1,&used,CompatSelect::Loud)==1 && used==3);
+    CHECK(out[0].key.kind==CompatKind::Ioctl && out[0].count==2);
+    CHECK(t.Snapshot(out,8,nullptr,CompatSelect::Loud)==2 && out[1].key.nr==312);
+    CHECK(t.Snapshot(out,8,nullptr,CompatSelect::Quiet)==1 && out[0].key.nr==334 && out[0].count==100);
+    CHECK(t.Snapshot(out,8)==3 && out[0].key.nr==334); // All keeps the old ordering
+    CHECK(t.total==103);
+}
+
 int main()
 {
     BasicCounts();
     Overflow();
     Concurrent();
     Paths();
+    QuietSet();
     std::puts("test_compat_census: ok");
     return 0;
 }

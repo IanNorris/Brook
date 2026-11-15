@@ -355,8 +355,6 @@ int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
                     uint64_t, uint64_t, uint64_t);
 int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
                    uint64_t arg4, uint64_t arg5, uint64_t);
-int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
-                  uint64_t, uint64_t, uint64_t);
 
 // syscall_exec.cpp
 int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAddr,

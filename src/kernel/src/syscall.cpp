@@ -444,7 +444,18 @@ void SyscallTableInit()
     g_syscallTable[SYS_SET_ROBUST_LIST] = sys_set_robust_list;
     g_syscallTable[SYS_GET_ROBUST_LIST] = sys_get_robust_list;
     g_syscallTable[SYS_FACCESSAT]       = sys_faccessat;
-    g_syscallTable[SYS_RSEQ]            = sys_rseq;
+    // Deliberate ENOSYS with established userspace fallbacks: counted by the
+    // compat census in its quiet set, never logged as UNIMPL.
+    g_syscallTable[SYS_RSEQ]            = sys_enosys_quiet; // glibc/musl run without rseq
+    g_syscallTable[329]                 = sys_enosys_quiet; // pkey_mprotect
+    g_syscallTable[330]                 = sys_enosys_quiet; // pkey_alloc: no PKU; V8/PartitionAlloc fall back
+    g_syscallTable[331]                 = sys_enosys_quiet; // pkey_free
+    g_syscallTable[425]                 = sys_enosys_quiet; // io_uring_setup: libuv/glib use epoll
+    g_syscallTable[426]                 = sys_enosys_quiet; // io_uring_enter
+    g_syscallTable[427]                 = sys_enosys_quiet; // io_uring_register
+    g_syscallTable[444]                 = sys_enosys_quiet; // landlock_create_ruleset: sandboxes skip it
+    g_syscallTable[445]                 = sys_enosys_quiet; // landlock_add_rule
+    g_syscallTable[446]                 = sys_enosys_quiet; // landlock_restrict_self
     g_syscallTable[SYS_CLOSE_RANGE]     = sys_close_range;
     g_syscallTable[SYS_FACCESSAT2]      = sys_faccessat2;
 
