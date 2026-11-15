@@ -386,6 +386,10 @@ struct brook_surface {
     int  deco_csd;          /* 1 = client-side, 0 = server-side */
     int  deco_pending;      /* mode change requested but wm_id not yet known */
     int  deco_negotiated;   /* 1 = client negotiated xdg/KDE decoration */
+    /* xdg-decoration object and the mode the client asked for, so a policy
+     * decided by app_id (which may arrive later) can reconfigure it. */
+    struct wl_resource *deco_resource;
+    int deco_requested_csd;
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -879,6 +883,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     pointer_region_clear(&s->input_region);pointer_region_clear(&s->pending_input_region);
     xwayland_surface_detach(s);
     if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
+    if (s->deco_resource) { wl_resource_set_user_data(s->deco_resource,NULL);s->deco_resource=NULL; }
     /* Scrub references to this surface from all seat clients before we free
      * it.  Without this, a subsequent input event would dereference freed
      * memory and (more visibly) call wl_pointer.send_leave with a surface
@@ -1015,6 +1020,8 @@ static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
     if (s->wm_id) wm_set_title(s->wm_id, s->title);
     fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", s->title);
 }
+static void deco_apply_mode(struct wl_resource *r, int csd);
+static int deco_force_server_side(const struct brook_surface *s);
 static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
                                      const char *app_id) {
     (void)c;
@@ -1022,6 +1029,9 @@ static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
     if (!s || !app_id) return;
     snprintf(s->app_id, sizeof(s->app_id), "%s", app_id);
     if (s->wm_id) wm_set_app_id(s->wm_id, s->app_id);
+    /* The decoration request may precede the app_id: apply the policy now. */
+    if (s->deco_resource && s->deco_csd && s->deco_requested_csd && deco_force_server_side(s))
+        deco_apply_mode(s->deco_resource, 1);
 }
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
@@ -2095,6 +2105,10 @@ static void pump_input_once(void) {
 static void deco_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
+static void deco_resource_destroyed(struct wl_resource *r) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s && s->deco_resource==r) s->deco_resource=NULL;
+}
 static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;
     /* Popups never acquire toplevel chrome, irrespective of negotiation. */
@@ -2111,9 +2125,29 @@ static void surface_apply_decoration(struct brook_surface *s, int csd) {
         s->deco_pending = 1;
     }
 }
+/* Clients whose client-side frame is translucent (shadows, rounded corners)
+ * and that support server-side decoration well. Answering their CLIENT_SIDE
+ * request with SERVER_SIDE (the protocol lets the compositor choose) makes
+ * the window opaque, so the renderer can cull beneath it, and Brook's WM
+ * draws the chrome. BROOK_WAYLAND_SSD_APPS (comma list of app_id prefixes;
+ * empty disables) overrides the default. */
+static int deco_force_server_side(const struct brook_surface *s){
+    if(!s || !s->app_id[0])return 0;
+    const char *list=getenv("BROOK_WAYLAND_SSD_APPS");
+    if(!list)list="chromium,Chromium,google-chrome";
+    for(const char *p=list;*p;){
+        const char *e=strchr(p,',');size_t n=e?(size_t)(e-p):strlen(p);
+        if(n && !strncmp(s->app_id,p,n))return 1;
+        if(!e)break;p=e+1;
+    }
+    return 0;
+}
 static void deco_apply_mode(struct wl_resource *r, int csd) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    s->deco_resource=r;s->deco_requested_csd=csd;
+    if(csd && deco_force_server_side(s)){
+        csd=0;fprintf(stderr,"[waylandd] decoration server_side policy app_id=%s\n",s->app_id);}
     surface_apply_decoration(s, csd);
     zxdg_toplevel_decoration_v1_send_configure(r,
         s->deco_csd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
@@ -2149,7 +2183,7 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
         &zxdg_toplevel_decoration_v1_interface,
         wl_resource_get_version(r), id);
     if (!d) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(d, &deco_impl, s, NULL);
+    wl_resource_set_implementation(d, &deco_impl, s, deco_resource_destroyed);
     if (s) s->deco_negotiated = 1;
     fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
             (void*)s);
