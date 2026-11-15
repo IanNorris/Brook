@@ -92,6 +92,34 @@ _Last updated: 14 November 2026, by a Claude Code session started after the Code
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, gens 398–402 (with Ian):**
+- **Running on the Dell:** gen 402 `dell-integration9b-20261115` = `work/integration9` 51fa9401. It contains:
+  - multilayer v3 + opaque-region culling;
+  - touchpad (Synaptics absolute, two-finger scroll, jitter, speed, phantom guards);
+  - the popup subsurface pointer fix;
+  - VA-API 4 reset/flush tuning;
+  - worker recovery + containment;
+  - proc-cleanup;
+  - the Chrome warning policy;
+  - opt-in zero-copy auto-arm.
+
+  **Not merged to main yet.**
+- **Open, urgent:** the v3 layered offer is sometimes never PRESENTED, so frame callbacks are held and Chrome freezes (audio continues). Seen with a 2-layer commit (an ad overlay). With the multilayer agent.
+- **Chrome:**
+  - GPU-direct works after the client≠VFB size fix (windowed ~45 ms on gen 400).
+  - Maximised is slow: 12.8 Mpix shaded per 5.76 Mpix frame; opaque culling is meant to fix it, but `opaque_single`=0 so far.
+  - Zero-copy hurts blending (write-through readback): composites 30 → 71 ms. Keep it off until direct scanout and damage land.
+- **Panics:** 40 (renderer job, CSB) is now recovered without a panic. Containment means a failed compositor job no longer marks client buffers. The site=2 cause is not yet diagnosed (new 3-line logs).
+- **VA-API:**
+  - Chromium VA-API works with i965 carrying static softpin libdrm (`brook-vaapi-0.3`, **not staged**), but it's slower than software until the async VCS lane lands.
+  - Firefox VA-API, VP9 0.16× and the YouTube H.264 preference are pending.
+- **Touchpad (Ian):** speed OK but slightly fast (now −20%, settable), vertical scroll worked, the rest fixed in later builds.
+- **Chromium sandbox:**
+  - Brook lacks PID/net namespaces, unshare/setns and seccomp, so `--no-sandbox` stays and the policy hides the bar. Scope: `docs/chromium-sandbox.md`.
+  - No Landlock exists in the tree.
+- **Clearwater Next** (`work/ui-fable`, Fable): Ian chose the **glass** theme and **Mixed** as default; the customisable accent palette (~10 hues incl. hot pink and phosphor green) is in its final pass. Launcher organisation, edge-to-edge caption hit areas and the theme architecture are in DESIGN.md. The screenshots are large (~45 MB incl. history), so prune before merging.
+- **Git identity:** `~/.config/git/identity` has an empty user.name since the reboot; commit with `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars.
+
 **15 Nov, gen 397 (`dell-integration6-20261115`: main + publish-batch fix + VA-API 2a, video engine built):**
 - **Publish-stage panic fixed** (`ae899bce`). Table publication was capped at 128 pages and didn't grow with the 512-table limit; it's now batched in 64-page chunks up to 1,024, and failure refuses the job.
   - Panics 37 (Firefox YouTube) and 39 (pid 100 about 50 s after boot, likely a browser session restore that left the Dell unreachable until AC-cycled) were both this bug.
