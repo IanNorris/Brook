@@ -2030,6 +2030,16 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
         const uint64_t timerScanEnd=timerProbe?TimerWakeTimingNow():0;
 
         // alarm()/ITIMER_REAL expiry runs in PosixTimersTickLocked above.
+        // Default-action expiries are sent here, outside the registry lock,
+        // as the old alarm scan did (signal delivery can take readyLock).
+        {
+            Process* fatal[16]; int fatalSignals[16];
+            const uint32_t fatalCount = PosixTimersTakeFatal(fatal, fatalSignals, 16);
+            for (uint32_t i = 0; i < fatalCount; ++i) {
+                ProcessSendSignal(fatal[i], fatalSignals[i]);
+                ReleaseSchedulerReference(fatal[i], false);
+            }
+        }
 
         // Destruction closes filesystem handles and may sleep. Never run it
         // atop an interrupted kernel operation (which might own the same lock),

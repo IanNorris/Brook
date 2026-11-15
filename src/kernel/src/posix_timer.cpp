@@ -77,6 +77,13 @@ GroupItimers groupItimers[MAX_PROCESSES] = {};
 uint32_t realArmedCount = 0;
 uint64_t realNextDeadline = ~uint64_t{0}; // lower bound of armed REAL deadlines
 uint32_t itimerUnnotified = 0;            // a CPU itimer became pending off-BSP
+// Default-action (terminate) expiries found by the BSP tick. Delivered after
+// the registry lock drops, so a CPU-bound process without a handler dies as
+// Linux kills it, rather than waiting for a syscall return. BSP-only.
+constexpr uint32_t FatalLimit = 16;
+struct FatalItimer { Process* target; int signo; };
+FatalItimer fatalItimers[FatalLimit];
+uint32_t fatalItimerCount = 0;
 uint8_t PendingBits(const GroupItimers& g)
 {
     return uint8_t((g.real.Pending() ? 1 : 0) | (g.cpu[0].pending ? 2 : 0) |
@@ -176,9 +183,23 @@ void ItimersTickLocked(Process* const* processes, uint32_t count)
                 Process* p = processes[i];
                 if (p->state == ProcessState::Terminated || !ItimerMember(g, group, p)) continue;
                 uint8_t wants = 0;
-                for (unsigned k = 0; k < 3; ++k)
-                    if ((g.countedPending & (1u << k)) && !IgnoredUnblockedSignal(ItimerSignal[k], p))
-                        wants |= uint8_t(1u << k);
+                for (unsigned k = 0; k < 3; ++k) {
+                    const uint8_t bit = uint8_t(1u << k);
+                    if (!(g.countedPending & bit) || IgnoredUnblockedSignal(ItimerSignal[k], p)) continue;
+                    const uint64_t mask = 1ULL << (ItimerSignal[k] - 1);
+                    // SIGALRM/SIGVTALRM/SIGPROF default to terminate. Hand an
+                    // unblocked SIG_DFL expiry to the ordinary sender (which
+                    // requests the group kill) instead of leaving it pending.
+                    if (!(p->sigMask & mask) && ReadSignalAction(p->tgid, ItimerSignal[k] - 1).handler == 0 &&
+                        !(received & bit) && fatalItimerCount < FatalLimit) {
+                        ProcessRef(p); // registry lock held by the caller
+                        fatalItimers[fatalItimerCount++] = {p, ItimerSignal[k]};
+                        if (k == 0) g.real.Discard(); else g.cpu[k - 1].pending = false;
+                        received |= bit;
+                        continue;
+                    }
+                    wants |= bit;
+                }
                 if (wants) __atomic_store_n(&p->pendingWakeup, 1, __ATOMIC_RELEASE);
                 received |= wants;
             }
@@ -469,6 +490,19 @@ void PosixTimersCleanup(Process* p, bool exec)
 }
 
 uint32_t g_intervalCpuTimersArmed = 0;
+
+uint32_t PosixTimersTakeFatal(Process** targets, int* signals, uint32_t capacity)
+{
+    uint64_t flags = IrqSpinLockAcquire(&timerLock);
+    uint32_t n = 0;
+    for (; n < fatalItimerCount && n < capacity; ++n) {
+        targets[n] = fatalItimers[n].target; signals[n] = fatalItimers[n].signo;
+    }
+    for (uint32_t i = n; i < fatalItimerCount; ++i) fatalItimers[i - n] = fatalItimers[i];
+    fatalItimerCount -= n;
+    IrqSpinLockRelease(&timerLock, flags);
+    return n;
+}
 
 int IntervalTimerSet(Process* p, int which, uint64_t valueNs, uint64_t intervalNs,
                      IntervalTimerValue* old)

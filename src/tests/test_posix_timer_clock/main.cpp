@@ -302,6 +302,19 @@ void intervalTimers() {
     CHECK(PosixTimerPending(&p)==(vtalrm|prof));
     p.pendingWakeup=peer.pendingWakeup=0;tick(both,2);CHECK(p.pendingWakeup && peer.pendingWakeup);
     CHECK(PosixTimerDequeue(&p,prof,&info)==27 && PosixTimerDequeue(&peer,vtalrm,&info)==26 && !pendingCount);
+    // SIG_DFL and unblocked: handed to the ordinary sender (group kill) once,
+    // with a reference, rather than left pending for a syscall return.
+    signalHandler=0;p.sigMask=peer.sigMask=0;
+    CHECK(IntervalTimerSet(&p,ItimerReal,ms,0,nullptr)==0);monotonicNs+=ms;
+    const auto refsBefore=p.refCount+peer.refCount;tick(both,2);
+    Process* fatal[4]{};int signals[4]{};
+    CHECK(!pendingCount && PosixTimersTakeFatal(fatal,signals,4)==1 && signals[0]==14);
+    CHECK((fatal[0]==&p || fatal[0]==&peer) && p.refCount+peer.refCount==refsBefore+1);
+    --fatal[0]->refCount;CHECK(PosixTimersTakeFatal(fatal,signals,4)==0);
+    // Blocked default-action signals stay pending for sigtimedwait.
+    p.sigMask=peer.sigMask=alrm;CHECK(IntervalTimerSet(&p,ItimerReal,ms,0,nullptr)==0);monotonicNs+=ms;tick(both,2);
+    CHECK(pendingCount==1 && PosixTimersTakeFatal(fatal,signals,4)==0);
+    CHECK(PosixTimerDequeue(&p,alrm,&info)==14);p.sigMask=peer.sigMask=0;signalHandler=0x1234;
     // Kernel threads are never charged.
     Process kernel{};init(kernel,23);kernel.isKernelThread=true;IntervalTimerChargeTick(&kernel,true,ms);
     // Group end clears everything, including pending expiries.

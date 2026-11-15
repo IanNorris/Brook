@@ -63,4 +63,9 @@ inline bool IntervalTimerCpuArmed()
     return __atomic_load_n(&g_intervalCpuTimersArmed, __ATOMIC_RELAXED) != 0;
 }
 void IntervalTimerChargeTick(Process* current, bool user, uint64_t ns);
+// After PosixTimersTickLocked, with the registry lock released: interval
+// timer expiries whose signal is unblocked with SIG_DFL (terminate). Each
+// target carries a process reference; the caller sends the signal through
+// ProcessSendSignal and drops the reference.
+uint32_t PosixTimersTakeFatal(Process** targets, int* signals, uint32_t capacity);
 }
