@@ -124,4 +124,20 @@ int64_t sys_epoll_pwait(uint64_t epfd, uint64_t eventsAddr,
                          uint64_t maxevents, uint64_t timeout_ms,
                          uint64_t sigmaskAddr, uint64_t sigsetsize);
 
+// syscall_fd.cpp
+int64_t sys_close(uint64_t fd, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
+                        uint64_t, uint64_t, uint64_t);
+int64_t sys_dup(uint64_t oldfd, uint64_t, uint64_t,
+                 uint64_t, uint64_t, uint64_t);
+int64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
+                   uint64_t, uint64_t, uint64_t);
+
 } // namespace brook

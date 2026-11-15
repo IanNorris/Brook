@@ -300,6 +300,7 @@ add_executable(kernel
     src/syscall_time.cpp
     src/syscall_poll.cpp
     src/syscall_epoll.cpp
+    src/syscall_fd.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp

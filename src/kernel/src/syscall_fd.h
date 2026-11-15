@@ -8,6 +8,8 @@
 
 namespace brook {
 
+void FdBumpRefcount(const FdEntry* fde);
+
 // Linux file flags (used in fcntl F_GETFL/F_SETFL and dup3)
 [[maybe_unused]] static constexpr int O_NONBLOCK  = 0x800;
 
