@@ -92,6 +92,12 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov late (Dell gen 412, `dell-int11-20261115`, session `ea6c017f812d4390940513230c87c32c`):**
+- **Deployed `work/integration11` (`2dbbf101`)** = main + `work/tap-click` (`a1855614`, Settings › Touchpad "Tap to click", default off; `input touchpad tap on|off`) + `work/bridge-indicator` (`e932018d`, taskbar agent icon; `bridge presence [beat N|detach]`; the MCP server heartbeats every 10 s, CLI calls never attach). Release build plus 359 host tests pass (three load timeouts passed alone). The robot icon shows on the Dell. Tap-to-click still needs Ian's hands-on check.
+- **Clearwater Next approved by Ian** and merged (`4d467a91`): Glass / Opaque Light / Opaque Dark, 13 hues, side dock (rail and peek), launcher simplification.
+- **Steam's current blocker:** the nested Xephyr dies with "Linking lock file (/tmp/.X14-lock) in place failed: Operation not supported" because tmpfs has no `link()`. `work/tmpfs-link` is implementing hard links. After that, expect the earlier hang once steamwebhelper starts (`docs/steam-dell-software-glx-checkpoint.md`).
+- **Diagnostics:** `work/compat-census` (per-app census of unsupported syscalls/ioctls/options plus a previous-boot log tail that survives a hang) is in progress. It is the proposed top priority for running real software.
+
 **15 Nov evening (Ian's review; Dell gen 411, session `f9d5a5d80c9240239a1f464cbdc8fd00`):**
 - **Dell hang:** after Ian's Firefox crash the machine showed the Firefox crash reporter ("failed to generate crash information") but was off the network (no ping, no bridge). No panic record; Ian rebooted. A private-profile Firefox rerun did not crash (one content child exits on signal 9 every launch, and the crash-reporter background task exits 3). Not reproduced yet.
 - **Chrome is GPU-accelerated:** the installed launcher uses ANGLE/GLES on Iris, Ian's profile has hardware acceleration on, and a private-profile local 720p30 H.264 loop played at 29.6 fps with rAF 61.6 Hz and 16 drops in total. App GPU 30 jobs/s (22% busy), compositor 40% plus present 24% of GPU time, CPU 85% idle. Video decode is software by design. Evidence: `display-perf/build/dell/chrome-rate-local/`.
