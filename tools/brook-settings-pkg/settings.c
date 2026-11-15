@@ -16,8 +16,9 @@
 
 static GtkWidget *scale_choice,*preview,*status,*swatches[3];
 static GtkWidget *volume_slider,*mute_check,*audio_status;
-static GtkWidget *pointer_slider,*pointer_status;
+static GtkWidget *pointer_slider,*pointer_status,*tap_check;
 static long pointer_speed=-1;
+static long touchpad_tap=-1;
 static uint32_t audio_control=BROOK_AUDIO_DEFAULT;
 static int audio_supported;
 static GtkWidget *dark_switch,*opacity_slider,*opacity_value,*blur_choice,*performance;
@@ -105,6 +106,7 @@ static int save_appearance(unsigned theme,unsigned scale,uint32_t appearance,GEr
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
     g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
     if(pointer_speed>0)g_key_file_set_integer(settings,"Desktop","pointer_speed",(int)pointer_speed);
+    if(touchpad_tap>=0)g_key_file_set_integer(settings,"Desktop","touchpad_tap",(int)touchpad_tap);
     if(audio_supported)g_key_file_set_integer(settings,"Audio","output",audio_control);
     g_key_file_set_boolean(settings,"Experience","technical_details",gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details)));
     gsize length=0;char *contents=g_key_file_to_data(settings,&length,error);
@@ -155,6 +157,18 @@ static void pointer_changed(GtkWidget *widget,gpointer unused){
     }
     pointer_speed=value;
     gtk_label_set_text(GTK_LABEL(pointer_status),"Pointer speed changed. Apply settings to remember it.");
+}
+/* Tap to click applies live; Apply saves it with the other settings. */
+static void tap_changed(GtkWidget *widget,gpointer unused){
+    (void)widget;(void)unused;
+    const long value=gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(tap_check))?1:0;
+    if(syscall(BROOK_SYS_TOUCHPAD_TAP,1L,value)<0){
+        gtk_label_set_text(GTK_LABEL(pointer_status),"Could not change tap to click.");return;
+    }
+    touchpad_tap=value;
+    gtk_label_set_text(GTK_LABEL(pointer_status),value?
+        "Tap to click on: tap for left click, two-finger tap for right click, tap then touch and move to drag. Apply settings to remember it.":
+        "Tap to click off. Apply settings to remember it.");
 }
 /* The taskbar volume control changes the same kernel value; follow it while
  * open so Apply saves what the user last chose from either place. */
@@ -299,6 +313,13 @@ int main(int argc,char **argv) {
     gtk_style_context_add_class(gtk_widget_get_style_context(pointer_status),"muted");gtk_box_pack_start(GTK_BOX(pointer_box),pointer_status,FALSE,FALSE,0);
     gtk_widget_set_sensitive(pointer_slider,pointer_speed>0);
     g_signal_connect(pointer_slider,"value-changed",G_CALLBACK(pointer_changed),NULL);
+    touchpad_tap=syscall(BROOK_SYS_TOUCHPAD_TAP,0L,0L);
+    tap_check=gtk_check_button_new_with_label("Tap to click");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tap_check),touchpad_tap>0);
+    gtk_widget_set_sensitive(tap_check,touchpad_tap>=0);
+    gtk_box_pack_start(GTK_BOX(pointer_box),tap_check,FALSE,FALSE,0);
+    gtk_box_reorder_child(GTK_BOX(pointer_box),tap_check,2);   /* above the status line */
+    g_signal_connect(tap_check,"toggled",G_CALLBACK(tap_changed),NULL);
     GtkWidget *eyebrow=gtk_label_new("APPEARANCE");gtk_widget_set_halign(eyebrow,GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(eyebrow),"eyebrow");gtk_box_pack_start(GTK_BOX(box),eyebrow,FALSE,FALSE,0);
     GtkWidget *heading=gtk_label_new("Choose your\nmaterial.");gtk_label_set_justify(GTK_LABEL(heading),GTK_JUSTIFY_LEFT);gtk_widget_set_halign(heading,GTK_ALIGN_START);

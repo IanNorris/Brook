@@ -55,8 +55,10 @@ namespace brook {
 // Synaptics touchpad (absolute PS/2 mode, two-finger scroll). Boot default:
 // enabled when the pad identifies as Synaptics; otherwise relative PS/2.
 struct MouseTouchpadStatus {
-    bool wanted, active, identified, clickpad, natural, agm;
+    bool wanted, active, identified, clickpad, natural, agm, tap;
     uint32_t speed;
+    uint32_t tapLeft, tapRight, tapDrags, tapDoubles;
+    uint32_t tapRejectedPhysical, tapRejectedPalm, tapRejectedPhantom;
     uint32_t scrollLowZ, scrollRejected, gestureResets;
     const char* reason;
     uint8_t major, minor, model, mode, modeReadback, packetLen, relativeId;
@@ -70,5 +72,12 @@ bool MouseTouchpadProbe();
 bool MouseTouchpadSetSpeed(uint32_t percent);
 uint32_t MouseTouchpadSpeed();
 void MouseTouchpadSetNatural(bool natural);
+// Tap-to-click (Settings "Tap to click", [Desktop] touchpad_tap; default off).
+void MouseTouchpadSetTap(bool enabled);
+bool MouseTouchpadTap();
 MouseTouchpadStatus MouseTouchpadGetStatus();
+// Tap drag-window deadline in ApicTickCount() ms (0 = none). The BSP LAPIC
+// timer calls MouseTouchpadTapPoll once it has passed.
+extern volatile uint64_t g_touchpadTapDeadline;
+void MouseTouchpadTapPoll(uint64_t nowMs);
 }

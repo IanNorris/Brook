@@ -144,7 +144,8 @@ struct SynapticsOutput {
 };
 
 // One-finger motion, two-finger scroll, clickpad buttons (two-finger click is
-// right click), palm rejection. Tap-to-click is deliberately not implemented.
+// right click), palm rejection. Tap-to-click is a separate state machine
+// (synaptics_tap.h) fed from the same packets.
 class SynapticsGesture {
 public:
     explicit SynapticsGesture(SynapticsGestureConfig c = {}) : cfg_(c) {}
@@ -249,7 +250,9 @@ public:
     }
 
     // A one-finger press is held: extra fingers move the pointer, not scroll.
-    bool Dragging() const { return clickDown_ && !clickAsRight_; }
+    bool Dragging() const { return (clickDown_ && !clickAsRight_) || tapDrag_; }
+    // Tap-and-drag holds the left button without a physical press.
+    void SetTapDrag(bool on) { tapDrag_ = on; }
 
     int Fingers(const SynapticsPacket& p) const {
         if (p.z < cfg_.touchZ) return 0;
@@ -297,6 +300,7 @@ private:
     int32_t agmX_ = 0, agmY_ = 0;
     int32_t suppress_ = 0, pressX_ = 0, pressY_ = 0, lastZ_ = 0, stable_ = 0;
     bool deadzone_ = false;
+    bool tapDrag_ = false;
     uint8_t buttons_ = 0;
 };
 

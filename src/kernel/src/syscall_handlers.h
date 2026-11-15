@@ -480,6 +480,7 @@ int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
                           uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_appearance(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_brook_pointer_speed(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_touchpad_tap(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_brook_wm_scale(uint64_t op,uint64_t scale,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_brook_wm_set_client_socket(uint64_t wmId,uint64_t fdValue,
