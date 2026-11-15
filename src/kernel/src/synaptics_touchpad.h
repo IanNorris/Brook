@@ -124,6 +124,10 @@ struct SynapticsGestureConfig {
     bool naturalScroll = false;   // false: fingers up scrolls up (wheel convention)
     int32_t speedPercent = 100;   // user pointer speed; 100 = default (25..300)
     int32_t dragNoiseUnits = 3;   // per-packet motion below this is a resting finger
+    // Clickpad press jitter (Ian, gen 400: "clicking is also moving"):
+    int32_t clickSuppressPackets = 10; // ~125 ms at 80 Hz after press and release: no pointer motion
+    int32_t clickDeadzoneUnits = 40;   // while held, travel from the press point must exceed this
+    int32_t pressureJumpZ = 30;        // a pressure step this large is a press shift, not motion
 };
 constexpr int32_t SynapticsSpeedMin = 25, SynapticsSpeedMax = 300;
 // Base gain multiplier: 80% of the original tuning (Ian: "a tiny bit fast").
@@ -164,6 +168,13 @@ public:
         // already resting as the press started; it stays as chosen until release.
         const bool click = p.left;
         if (click && !clickDown_) clickAsRight_ = (fingers == 2);
+        if (click != clickDown_) {               // press or release: start jitter suppression
+            suppress_ = cfg_.clickSuppressPackets;
+            deadzone_ = click;
+            pressX_ = p.x; pressY_ = p.y;
+        } else if (suppress_ > 0) {
+            --suppress_;
+        }
         clickDown_ = click;
         buttons_ = uint8_t((click ? (clickAsRight_ ? 2 : 1) : 0) | (p.right ? 2 : 0));
         o.buttons = buttons_;
@@ -171,23 +182,33 @@ public:
 
         if (fingers != lastFingers_) {           // re-anchor on any count change
             haveAnchor_ = fingers != 0 && fingers < 3;
-            ax_ = p.x; ay_ = p.y;
+            ax_ = p.x; ay_ = p.y; lastZ_ = p.z;
             fracX_ = fracY_ = 0; scrollAccX_ = scrollAccY_ = 0;
             lastFingers_ = fingers;
             return o;
         }
-        if (!haveAnchor_) return o;
+        if (!haveAnchor_) { lastZ_ = p.z; return o; }
         int32_t dx = p.x - ax_, dy = p.y - ay_;   // pad: y up
         ax_ = p.x; ay_ = p.y;
+        const int32_t zStep = Abs(p.z - lastZ_);
+        lastZ_ = p.z;
+        // Pointer-motion jitter filters (scrolling is unaffected): the window
+        // after a button transition, a pressure step (the contact centroid
+        // shifts as the finger presses), and the held-button dead zone.
+        bool quiet = suppress_ > 0 || zStep >= cfg_.pressureJumpZ;
+        if (!quiet && fingers == 1 && deadzone_ && clickDown_) {
+            if (Abs(p.x - pressX_) < cfg_.clickDeadzoneUnits && Abs(p.y - pressY_) < cfg_.clickDeadzoneUnits) quiet = true;
+            else deadzone_ = false;              // deliberate drag: motion resumes
+        }
         if (Abs(dx) > cfg_.jumpUnits || Abs(dy) > cfg_.jumpUnits) return o;
         if (fingers == 1) {
-            Pointer(dx, dy, o);
+            if (!quiet) Pointer(dx, dy, o);
         } else if (fingers == 2 && Dragging()) {
             // Click-drag with a second finger: one finger holds the button, the
             // other moves. Each finger's own deltas drive the pointer (the
             // primary here, the secondary from AGM packets); a resting finger
             // contributes nothing. Never scroll or right-click in this state.
-            if (Abs(dx) >= cfg_.dragNoiseUnits || Abs(dy) >= cfg_.dragNoiseUnits) Pointer(dx, dy, o);
+            if (!quiet && (Abs(dx) >= cfg_.dragNoiseUnits || Abs(dy) >= cfg_.dragNoiseUnits)) Pointer(dx, dy, o);
         } else if (fingers == 2 && !clickDown_) {
             const int32_t sy = cfg_.naturalScroll ? -dy : dy;
             const int32_t sx = cfg_.naturalScroll ? -dx : dx;
@@ -244,6 +265,8 @@ private:
     bool clickDown_ = false, clickAsRight_ = false;
     bool haveAgm_ = false;
     int32_t agmX_ = 0, agmY_ = 0;
+    int32_t suppress_ = 0, pressX_ = 0, pressY_ = 0, lastZ_ = 0;
+    bool deadzone_ = false;
     uint8_t buttons_ = 0;
 };
 

@@ -16,6 +16,7 @@ static void Encode(int x, int y, int z, int w, bool left, bool clickpad, uint8_t
     b[5] = uint8_t(y);
     if (left) { if (clickpad) b[3] |= 0x01; else b[0] |= 0x01; }
 }
+static int Abs2(const SynapticsOutput& o) { return (o.dx < 0 ? -o.dx : o.dx) + (o.dy < 0 ? -o.dy : o.dy); }
 static SynapticsPacket P(int x, int y, int z, int w, bool left = false) {
     uint8_t b[6]; Encode(x, y, z, w, left, true, b);
     CHECK(SynapticsByteValid(0, b[0]) && SynapticsByteValid(3, b[3]));
@@ -163,6 +164,36 @@ int main() {
         CHECK(rc.Feed(P(3000, 2000, 70, 0, true)).buttons == 2);
         int sc = 0; for (int i = 1; i <= 5; ++i) sc += rc.Feed(P(3000, 2000 + 50 * i, 70, 0, true)).scrollY;
         CHECK(sc == 0);
+    }
+
+    // Click jitter: pressing and releasing with small centroid and pressure
+    // shifts produces no motion; a deliberate drag past the dead zone moves.
+    {
+        SynapticsGesture j;
+        j.Feed(P(3000, 2000, 50, 6)); j.Feed(P(3000, 2000, 50, 6));
+        int m = 0;
+        // Press: pressure rises and the centroid shifts by up to 25 units.
+        m += Abs2(j.Feed(P(3010, 1990, 90, 6, true)));
+        for (int i = 0; i < 12; ++i) m += Abs2(j.Feed(P(3010 + (i % 3) * 5, 1985 - (i % 2) * 5, 95, 6, true)));
+        CHECK(m == 0);
+        // Still held, jitter within the dead zone after the window: no motion.
+        for (int i = 0; i < 6; ++i) m += Abs2(j.Feed(P(3020 + (i & 1) * 10, 1980, 95, 6, true)));
+        CHECK(m == 0);
+        // Deliberate drag past 40 units: motion resumes, button stays down.
+        int dx = 0;
+        for (int i = 1; i <= 10; ++i) { auto r = j.Feed(P(3020 + 20 * i, 1980, 95, 6, true)); dx += r.dx; CHECK(r.buttons == 1); }
+        CHECK(dx > 0);
+        // Release with a shift: no motion during the window.
+        m = 0;
+        m += Abs2(j.Feed(P(3240, 1990, 60, 6, false)));
+        for (int i = 0; i < 9; ++i) m += Abs2(j.Feed(P(3245, 1995, 55, 6)));
+        CHECK(m == 0);
+        // Afterwards ordinary motion works again.
+        int after = 0; for (int i = 1; i <= 5; ++i) after += j.Feed(P(3245 + 30 * i, 1995, 55, 6)).dx;
+        CHECK(after > 0);
+        // A pressure step alone (no button) is not motion.
+        SynapticsGesture z; z.Feed(P(3000, 2000, 40, 6)); z.Feed(P(3000, 2000, 40, 6));
+        CHECK(Abs2(z.Feed(P(3020, 1980, 90, 6))) == 0);
     }
     // Palms and light touches produce nothing; extended packets are ignored.
     SynapticsGesture pm; pm.Feed(P(3000, 2000, 60, 14));
