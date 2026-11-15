@@ -92,6 +92,15 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov early (Dell gen 415, `dell-int14-20261116` = main + `work/bin-sh`, session `a9eefa8322d248edb6e96789ba3785ba`):**
+- **/bin/sh and /usr/bin/env now exist** (kernel tmpfs mounts). Steam's nested Xephyr starts, xkbcomp works, and the client starts inside pressure-vessel; processes reached 156.
+- **Kernel panic ~90 s into Steam:** #PF CR2=0x21 in `PipePollGroup::~PipePollGroup` ← PollWait ← sys_ppoll. A pipe poll-waiter node was linked after being freed (use-after-free).
+  - The persistent last log survived the panic, as designed. It shows Steam pid 195 stuck in "exhausted 1024 fds" with a fork/exec loop of a missing libpulseaudio `.bin-unwrapped/pulseaudio` (PulseAudio autospawn; see the "Steam startup controls" entry in DECISIONS).
+  - Suspect: fd-allocation failure paths, possibly H-20's SCM_RIGHTS retain path. Being fixed on `work/pipe-poll-uaf`.
+  - Evidence: `display-perf/build/dell/steam-int14-panic/`, `display-perf/build/dell/steam-int14-lastlog/`.
+  - The guard recovered to the desktop by itself. **Don't launch Steam again until the fix lands.**
+- **Next for Steam:** stop the PulseAudio autospawn loop (point PULSE_SERVER at the desktop server or set autospawn=no in the launcher). Then `work/steam-container` (/dev inside bwrap, /proc/self/fd/N/ traversal).
+
 **15–16 Nov night (Dell gen 414, `dell-int13-20261115`, session `e13ab3d15f70488e927538eac8361068`):**
 - **Main `2c53f154`** adds `work/open-file` (H-20: dup/fork/SCM_RIGHTS share offset and status flags, as on Linux), `work/tmpfs-link` (tmpfs hard links) and `work/compat-census`:
   - `compat census [N]` / `compat census reset` count failing syscalls, ioctls, options and missing /proc, /sys and /dev paths, per app;
