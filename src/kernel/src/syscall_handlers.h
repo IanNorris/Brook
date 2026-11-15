@@ -110,4 +110,18 @@ int64_t sys_select(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
 int64_t sys_pselect6(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefdsAddr,
                    uint64_t exceptfdsAddr, uint64_t timeoutAddr, uint64_t sigmaskAddr);
 
+// syscall_epoll.cpp
+int64_t sys_epoll_create(uint64_t size, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t);
+int64_t sys_epoll_create1(uint64_t flags, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t);
+int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
+                        uint64_t eventAddr, uint64_t, uint64_t);
+int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
+                        uint64_t maxevents, uint64_t timeout_ms,
+                        uint64_t, uint64_t);
+int64_t sys_epoll_pwait(uint64_t epfd, uint64_t eventsAddr,
+                         uint64_t maxevents, uint64_t timeout_ms,
+                         uint64_t sigmaskAddr, uint64_t sigsetsize);
+
 } // namespace brook

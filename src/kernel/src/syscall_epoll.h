@@ -34,6 +34,22 @@ struct EpollInstance {
     Process*   waiter; // process blocked in epoll_wait
 };
 
+static inline void EpollFdRef(EpollInstance* ep)
+{
+    if (ep) __atomic_fetch_add(&ep->refCount, 1, __ATOMIC_RELEASE);
+}
+
+static inline bool EpollFdUnref(EpollInstance* ep)
+{
+    if (!ep) return false;
+    uint32_t prev = __atomic_fetch_sub(&ep->refCount, 1, __ATOMIC_ACQ_REL);
+    if (prev <= 1) {
+        kfree(ep);
+        return true;
+    }
+    return false;
+}
+
 int EpollPollReady(Process* proc, EpollInstance* ep);
 
 } // namespace brook
