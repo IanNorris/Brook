@@ -453,3 +453,56 @@ A **persistent execlist context** comes with it: a lane-owned HWS page and GGTT 
   3. an unrelated flake.
 - **Next step:** repeat 720p and 1080p VA-API launches on the phase 4 kernel, and if it recurs, run Chromium with `--enable-logging --v=1` plus the exec logger, capturing which segment (field-trial or histogram shm) is corrupt.
 
+## Phase 4 measurements (gen 403–406) and the asynchronous lane (work/vcs-async)
+
+**ffmpeg bit-exactness** (gen 403, i965 from the RAM copy of brook-vaapi-0.3): `-hwaccel vaapi -pix_fmt yuv420p` framemd5 matches software for **300/300 frames at 720p and 1080p, with `coherent on` and with `coherent off`**.
+
+**Per-job VCS cost** (ffmpeg, 300 jobs each, µs per job):
+
+| tuning | clip | prep | run (worker blocked) | decode (ELSP→breadcrumb) | reset-before | init | CSB | tail | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| min + coherent | 720p | 451 | 1941 | 1493 | 5 | 57 | 44 | 67 | 2.80 s |
+| min + coherent | 1080p | 537 | 3756 | 3287 | 5 | 65 | 44 | 67 | 4.14 s |
+| full + no coherent | 720p | 3139 | 1944 | 1490 | 14 | 46 | 44 | 63 | 4.50 s |
+| full + no coherent | 1080p | 5860 | 3761 | 3283 | 14 | 60 | 47 | 64 | 7.27 s |
+
+- **Resets are cheap.** Each GDRST is about 10 µs. `resets min` hardly matters, and the post-job reset was never skipped (`skipped_resets_after` stayed 0).
+- **`coherent` (no CPU cache flushes) is the big CPU win:** it saves 2.7 ms per 720p job and 5.3 ms per 1080p job of preparation.
+- **The hardware decode is 77–87% of the worker's blocked time:** 1.5 ms at 720p and 3.3 ms at 1080p. Only overlapping it with other work, the asynchronous lane, can recover that.
+
+**Chromium, 20 s, private profile, VA-API via `LIBVA_DRIVERS_PATH` to the RAM copy** (no store writes):
+
+| boot | run | decoder | presented / total / dropped | p50 / p90 ms | CPU busy | VCS run µs/job |
+|---|---|---|---|---|---|---|
+| 404 | VA-API 720p, min + coherent | Vaapi | 430 / 527 / 108 | 36.7 / 57.2 | 16.5% | 1926 |
+| 404 | VA-API 1080p, min + coherent | Vaapi | 397 / 515 / 127 | 38.9 / 62.9 | 17.1% | 3756 |
+| 404 | VA-API 720p, full + no coherent | Vaapi | 354 / 528 / 182 | 44.4 / 77.1 | 17.9% | 1982 |
+| 404 | VA-API 1080p, full + no coherent | Vaapi | 240 / 522 / 292 | 66.6 / 115.4 | 18.8% | 3821 |
+| 404 | software 720p | FFmpeg | 461 / 526 / 68 | 35.9 / 52.7 | 18.0% | — |
+| 404 | software 1080p | FFmpeg | 449 / 507 / 59 | 35.9 / 51.8 | 20.5% | — |
+| 406 | VA-API 1080p (×4) | Vaapi | 440–450 / ~517 / 69–73 | 33.3–33.7 / 58–61 | 15.9–16.4% | 3757 |
+| 406 | VA-API 720p | Vaapi | 478 / 520 / 40 | 33.1 / 50.0 | 15.2% | 1929 |
+| 406 | software 1080p | FFmpeg | 492 / 511 / 16 | 32 / 47 | 19.6% | — |
+| 406 | software 720p | FFmpeg | 515 / 526 / 9 | 31.9 / 47 | 17.3% | — |
+
+- **With the default tuning, VA-API now reaches the 1080p30 p50 target (≤ 33 ms on gen 406).** It uses 3–4 points less CPU, but still drops more frames than software. That is consistent with the worker being blocked about 3.8 ms per decoded frame.
+- **1080p startup crash: not reproduced.** Six 1080p VA-API launches across gen 404 and 406 all started and decoded.
+
+**The asynchronous lane** (`gpu video tune async on|off`, **default off**, commit 8884eb3e, pair `pair-vcs-async`, QEMU check passed):
+- **Submit:** a critical section does the usual preparation, PAT lease and takeover, then writes ELSP and returns with VCS running the job. The CPU0 worker **parks** the request.
+- **Meanwhile:** the exec queue lets the worker take only later work that is provably independent of the parked job (no shared buffers, distinct contexts), and never a second video job.
+- **Complete:** the worker polls the breadcrumb in RAM, which needs no device access, about once a millisecond. When it lands, or after 2 s, a second critical section verifies the breadcrumb and CSB, stops VCS, unbinds and restores the PAT. A hang is a reset plus quarantine, with no 2 s worker stall.
+- **Shared-model changes, inert unless a lane job is in flight:**
+  - the forcewake observation accepts a VCS that the lane owns as non-quiescent;
+  - the private PAT keeps the lane base (entry 0 = 0x07, entry 4 = 0x0b) between the two critical sections. RCS and BCS leases accept that base and restore to it, the zero-copy slot-3 change included. The complete phase adopts the held lease and restores the firmware values.
+- **Pausing VCS diagnostics:** while the lane is busy, VCS diagnostics (`gpu video reset`, `selftest`, `pm …`) wait.
+- **New status fields:** `lane_jobs`, `lane_latency_us`, `lane_complete_retries`, `parked`, `overlapped` and `lane_busy`.
+- **Tests:** host tests cover the parked queue rules and the worker park/poll/finish flow. It has not run on hardware yet.
+
+**Dell test plan for the lane:**
+1. Gate on, probe, self-test.
+2. The ffmpeg framemd5 test with `async on`: it must be bit-exact.
+3. Chromium VA-API at 720p and 1080p with `async on`, compared with `off`: frame p50, drops, `overlapped` and `lane_latency_us`.
+4. Desktop and yquake regression, with zero-copy active, while VA-API plays.
+5. The `--hang` probe with `async on`: quarantine, and the desktop stays responsive.
+

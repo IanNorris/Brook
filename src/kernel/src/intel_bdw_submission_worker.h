@@ -6,7 +6,10 @@ namespace brook {
 // (error propagation) but it touched no GPU state, so neither its context
 // nor its buffers are poisoned: one client's failed frame must not make a
 // compositor job that sampled its buffer, or the compositor itself, unusable.
-struct BdwSubmissionOutcome {bool success=false,safelyStopped=false,skipped=false;};
+// parked (VA-API phase 4): the job's device work is in flight on another
+// engine (VCS); the worker parks the request and completes it later through
+// pollParked, running only provably independent work meanwhile.
+struct BdwSubmissionOutcome {bool success=false,safelyStopped=false,skipped=false,parked=false;};
 enum class BdwSubmissionStep:uint8_t { Idle,Finished,Recover };
 // A permanent single-engine worker. The supplied launch hook must create a
 // kernel thread pinned to the requested CPU; this object and hook context
@@ -33,10 +36,16 @@ public:
         uint64_t (*wakeGeneration)(void*)=nullptr;
         void (*idle)(void*,uint64_t)=nullptr;
         void (*wake)(void*)=nullptr;
+        // Optional (required to accept a parked outcome): complete the parked
+        // job if its device work is done. True with the final outcome in out;
+        // false while still in flight. Runs on the worker thread.
+        bool (*pollParked)(void*,BdwExecSnapshot*,BdwSubmissionOutcome& out)=nullptr;
     };
 private:
     BdwSubmissionQueue queue_;Hooks hooks_{};uint32_t state_=0; // fresh, starting, ready, failed
     uint32_t fairService_=0;bool serviceDeferred_=false; // deferred_ is worker-thread-only
+    uint64_t parkedId_=0;BdwExecSnapshot* parkedSnapshot_=nullptr; // worker-thread-only
+    uint64_t parkedTotal_=0,overlappedJobs_=0;
     uint64_t pendingCount_=0,bypassCount_=0,noEligibleCount_=0,forcedServiceCount_=0;
     uint64_t failures_[3]{};
     static void Run(void* opaque){
@@ -142,8 +151,23 @@ public:
         const uint64_t n=__atomic_add_fetch(&failures_[kind],uint64_t{1},__ATOMIC_RELAXED);
         if(hooks_.failure)hooks_.failure(hooks_.context,snapshot,kind,n);
     }
+    // Worker thread only: finish a parked job whose device work is done.
+    // True if nothing remains parked afterwards.
+    bool CompleteParked(BdwSubmissionStep& step){
+        step=BdwSubmissionStep::Idle;
+        if(!parkedId_)return true;
+        BdwSubmissionOutcome out{};
+        if(!hooks_.pollParked || !hooks_.pollParked(hooks_.context,parkedSnapshot_,out))return false;
+        if(!out.success)NoteFailure(parkedSnapshot_,out);
+        const uint64_t id=parkedId_;parkedId_=0;parkedSnapshot_=nullptr;
+        step=queue_.Finish(id,out.success,out.safelyStopped,out.skipped)?BdwSubmissionStep::Finished:BdwSubmissionStep::Recover;
+        return true;
+    }
+    bool HasParked()const{return parkedId_!=0;}
+    void ParkedCounts(uint64_t& parked,uint64_t& overlapped)const{parked=parkedTotal_;overlapped=overlappedJobs_;}
     // Single-consumer only. Exposed separately for deterministic worker tests.
     BdwSubmissionStep Step(){
+        if(parkedId_){BdwSubmissionStep done{};if(CompleteParked(done) && done!=BdwSubmissionStep::Idle)return done;}
         uint64_t id=0;BdwExecSnapshot* snapshot=nullptr;
         const bool fair=__atomic_load_n(&fairService_,__ATOMIC_ACQUIRE) && hooks_.servicePending;
         const bool pending=hooks_.servicePending && hooks_.servicePending(hooks_.context);
@@ -162,8 +186,13 @@ public:
             if(!pending)serviceDeferred_=false;
             if(!queue_.Take(id,snapshot))return queue_.Poisoned()?BdwSubmissionStep::Recover:BdwSubmissionStep::Idle;
         }
+        if(parkedId_)++overlappedJobs_;
         const auto result=BdwExecSnapshotDependencies(snapshot)==2?BdwSubmissionOutcome{false,true,true}:
             hooks_.execute(hooks_.context,snapshot);
+        if(result.parked){
+            if(!hooks_.pollParked || parkedId_ || !queue_.Park(id))return BdwSubmissionStep::Recover;
+            parkedId_=id;parkedSnapshot_=snapshot;++parkedTotal_;return BdwSubmissionStep::Finished;
+        }
         if(!result.success)NoteFailure(snapshot,result);
         return queue_.Finish(id,result.success,result.safelyStopped,result.skipped)?BdwSubmissionStep::Finished:BdwSubmissionStep::Recover;
     }

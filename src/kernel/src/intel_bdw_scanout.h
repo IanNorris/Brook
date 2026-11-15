@@ -64,6 +64,8 @@ bool BdwPinRetainedRenderScratch(BdwOwnedPage& out,BdwGgttReservation& reservati
 struct BdwExecSnapshot;
 struct BdwSubmissionPreparation;
 struct BdwSubmissionOutcome;
+// VA-API phase 4 lane: complete the parked VCS job (worker thread only).
+bool BdwVcsLanePoll(BdwExecSnapshot* snapshot,BdwSubmissionOutcome& out);
 struct BdwWorkerProbeResult {uint32_t submitted=0,completed=0;bool failed=false;uint32_t values[3]{},contextHashes[2]{};};
 bool BdwTestSubmissionWorker(BdwWorkerProbeResult& result);
 bool BdwTestContextSubmissionWorker(BdwWorkerProbeResult& result);
@@ -246,6 +248,9 @@ BdwPrepareOutcome BdwPrepareVcsUserJob(BdwExecSnapshot* snapshot,uint32_t nonce,
                                        BdwOwnedPage& scratch,const char*& reason);
 bool BdwRunPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink,uint64_t scratchDma,BdwBcsRunResult& result);
 bool BdwRetirePreparedVcsUser(BdwBcsExecutionBackend& backend);
+bool BdwSubmitPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink,uint64_t scratchDma,BdwBcsRunResult& result);
+bool BdwCompleteSubmittedVcsUser(BdwBcsExecutionBackend& backend,BdwBcsRunResult& result);
+bool BdwVcsUserLaneBreadcrumb();
 bool BdwReleaseVcsUserJob(BdwExecSnapshot* snapshot,bool verifiedStopped);
 #endif
 // Snapshot only. It does not grant GPU access or release the retained page.
@@ -298,7 +303,12 @@ struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=
     // preparation, the critical-section run (= worker blocked on VCS), and
     // its parts; skipped GDRSTs under minimal-reset tuning.
     uint64_t timed=0,prepUs=0,runUs=0,releaseUs=0,resetBeforeUs=0,patUs=0,initUs=0,decodeUs=0,csbUs=0,tailUs=0,maxRunUs=0;
-    uint64_t skippedResetsBefore=0,skippedResetsAfter=0,firstJobNs=0,lastJobNs=0;};
+    uint64_t skippedResetsBefore=0,skippedResetsAfter=0,firstJobNs=0,lastJobNs=0;
+    // Phase 4 lane: jobs completed through the lane, their submit-to-retire
+    // latency sum, complete attempts refused before any device access, and
+    // the worker's parked jobs / jobs run while one was parked.
+    uint64_t laneJobs=0,laneLatencyUs=0,laneCompleteRetries=0,parked=0,overlapped=0;};
+void BdwApplicationWorkerParkedCounts(uint64_t& parked,uint64_t& overlapped);
 void BdwVideoUserCountsRead(BdwVcsUserCounts& out);
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);
