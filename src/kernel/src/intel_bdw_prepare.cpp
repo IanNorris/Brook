@@ -94,23 +94,27 @@ struct PrivatePages {
     }
     bool publish(BdwOwnedPage* pages,unsigned count) {
         // The diagnostic runs on private PMM pages and does not grant device
-        // access. Pin execution while reading this CPU's CPUID and flushing.
+        // access. Large table sets (big application jobs) are flushed in
+        // bounded chunks, each pinned to this CPU with interrupts disabled
+        // while reading CPUID and flushing; the whole set is validated first.
+        return BdwPublishCpuPagesBatched(pages,count,[](const BdwOwnedPage* chunk,unsigned n){
 #ifndef BROOK_HOST_TEST
-        uint64_t flags;__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
+            uint64_t flags;__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
 #endif
-        uint32_t a,b,c,d;__asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
+            uint32_t a,b,c,d;__asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
 #ifdef BROOK_HOST_TEST
-        if(BdwTestDisableClflush())d&=~(1u<<19);
+            if(BdwTestDisableClflush())d&=~(1u<<19);
 #endif
-        struct Flush {
-            void fence(){__atomic_thread_fence(__ATOMIC_SEQ_CST);}
-            void line(void* p){__asm__ volatile("clflush (%0)"::"r"(p):"memory");}
-        } flush;
-        const bool ok=(d&(1u<<19)) && BdwPublishCpuPages(flush,pages,count,((b>>8)&255)*8);
+            struct Flush {
+                void fence(){__atomic_thread_fence(__ATOMIC_SEQ_CST);}
+                void line(void* p){__asm__ volatile("clflush (%0)"::"r"(p):"memory");}
+            } flush;
+            const bool ok=(d&(1u<<19)) && BdwPublishCpuPages(flush,chunk,n,((b>>8)&255)*8);
 #ifndef BROOK_HOST_TEST
-        if(flags&(1ull<<9))__asm__ volatile("sti":::"memory");
+            if(flags&(1ull<<9))__asm__ volatile("sti":::"memory");
 #endif
-        return ok;
+            return ok;
+        });
     }
     // These routines supply CPU cache maintenance for a retained status page.
     // The eventual engine owner must separately bind this exact page, exclude
@@ -1343,11 +1347,13 @@ BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* snapshot,
     reason="page table DMA inspection";
     if(!gemProbeTables.InspectDma(retainedRenderAllocator,status) || status!=BdwDmaSnapshotOk)return BdwPrepareOutcome::Uncertain;
     step(BdwOhInspectTables);
-    reason="publish";
-    if(!gemProbeTables.Publish(retainedRenderAllocator) || !retainedRender.PublishPrepared(retainedRenderAllocator))return BdwPrepareOutcome::Uncertain;
+    // Publication (CPU cache flushes of private table pages) and the device
+    // cache sync run before arming: nothing is device-visible yet, so a
+    // failure there refuses the job like the size limits above.
+    if(!gemProbeTables.Publish(retainedRenderAllocator) || !retainedRender.PublishPrepared(retainedRenderAllocator))
+        return refuse("page table publication failed");
     step(BdwOhPublish);
-    reason="device cache sync";
-    if(!BdwExecSnapshotSyncForDevice(snapshot))return BdwPrepareOutcome::Uncertain;
+    if(!BdwExecSnapshotSyncForDevice(snapshot))return refuse("buffer cache sync failed");
     step(BdwOhSyncDevice);
     reason="buffer DMA inspection";
     if(BdwExecSnapshotInspectDma(snapshot)!=BdwDmaSnapshotOk)return BdwPrepareOutcome::Uncertain;

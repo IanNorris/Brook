@@ -31,4 +31,28 @@ int main(){
     pages[count-1]=saved;pages[count-1].cpu=pages[0].cpu;assert(!BdwPublishCpuPages(bad,pages,count,64));assert(!bad.fences && !bad.lines);
     assert(!BdwPublishCpuPages(bad,pages,count+1,64));assert(!bad.fences && !bad.lines);
     assert(!munmap(region,4096*(count*2+1)));
+    // Batched publication of a large private set (gen 396: a 61,328-page
+    // Firefox job needs more than 128 PPGTT tables; the limit is 512 + 4).
+    {
+        constexpr unsigned big=516;static BdwOwnedPage set[big]{};
+        auto* area=(uint8_t*)mmap(nullptr,4096*big,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        assert(area!=MAP_FAILED);
+        for(unsigned i=0;i<big;++i)set[i].cpu=area+i*4096;
+        unsigned chunks=0,pagesSeen=0,largest=0;
+        auto record=[&](const BdwOwnedPage* chunk,unsigned n){
+            assert(chunk==set+pagesSeen && n<=BdwPublishBatchPages && n<=BdwPublishMaximumPages);
+            Flush f;f.expected=chunk;if(!BdwPublishCpuPages(f,chunk,n,64))return false;
+            assert(f.fences==2 && f.lines==n*64);++chunks;pagesSeen+=n;if(n>largest)largest=n;return true;};
+        assert(BdwPublishCpuPagesBatched(set,big,record));
+        assert(pagesSeen==big && chunks==(big+BdwPublishBatchPages-1)/BdwPublishBatchPages && largest==BdwPublishBatchPages);
+        // The whole set is validated before the first chunk is flushed: a
+        // duplicate in the last chunk is caught before any flush.
+        chunks=pagesSeen=0;auto saved=set[big-1];set[big-1].cpu=set[0].cpu;
+        assert(!BdwPublishCpuPagesBatched(set,big,record) && !chunks);set[big-1]=saved;
+        set[300].cpu=nullptr;assert(!BdwPublishCpuPagesBatched(set,big,record) && !chunks);set[300].cpu=area+300*4096;
+        assert(!BdwPublishCpuPagesBatched(set,BdwPublishMaximumBatchedPages+1,record) && !chunks);
+        // A failing chunk stops publication.
+        unsigned calls=0;assert(!BdwPublishCpuPagesBatched(set,big,[&](const BdwOwnedPage*,unsigned){return ++calls<3;}) && calls==3);
+        assert(!munmap(area,4096*big));
+    }
 }

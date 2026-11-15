@@ -1863,6 +1863,24 @@ int main(){
         assert(BdwGpuFileCloseBuffer(f,ha) && BdwGpuFileCloseBuffer(f,hb) && BdwGpuFileCloseBuffer(f,hc));
     }
     {
+        // More than 128 tables (gen 396): 43 one-page buffers in separate
+        // 512 GiB regions need 1 + 3*43 = 130 tables. They prepare, attach,
+        // inspect and publish through the table owner and the render image.
+        static uint32_t hs[43];static BdwExecObjectInput wide[43];uint64_t r4=0;
+        for(unsigned i=0;i<43;++i){hs[i]=BdwGpuFileCreateBuffer(f,4096,r4);assert(hs[i]);wide[i]={hs[i],uint64_t(i+1)<<39,4096,16|8};}
+        auto* job=BdwExecSnapshotCreate(f,wide,43,0,8,64);assert(job);
+        uint32_t count=0;assert(BdwExecSnapshotTableCount(job,count) && count==130);
+        RenderAllocator renderAlloc;TableAllocator tableAlloc;BdwRenderOneShot shot;BdwExecTables tables;
+        static BdwPpgttMapping workspace[43]{};
+        assert(shot.Prepare(renderAlloc,65536,42,99,renderStaging) && tables.Prepare(tableAlloc,job));
+        assert(tables.Inspect(tableAlloc,[](const BdwOwnedPage*,uint32_t n){return n==130;}));
+        assert(shot.AttachExternalSnapshot(renderAlloc,tables,tableAlloc,job,workspace,43));
+        uint32_t status=9;assert(tables.InspectDma(tableAlloc,status) && status==0 && tables.Publish(tableAlloc) && shot.PublishPrepared(renderAlloc));
+        RenderBackend backend;assert(backend.admitExtraTables(nullptr,130) && !backend.admitExtraTables(nullptr,BdwPpgttMaxTables+5));
+        assert(shot.DetachSnapshot(renderAlloc)==job && tables.AbandonUnsubmitted(tableAlloc) && shot.ReleasePrepared(renderAlloc));
+        assert(BdwExecSnapshotRelease(job,false));for(unsigned i=0;i<43;++i)assert(BdwGpuFileCloseBuffer(f,hs[i]));
+    }
+    {
         // Worker refusal unwinding (gen 386 panic): a preparation abandoned
         // before arming leaves the render image and tables Released, so the
         // next job's reprepare recycles them and runs normally.

@@ -85,7 +85,39 @@ static void LargeBufferSetTest() {
     assert(!BdwBuildExecAddressSpace(s4,tables.data(),count-1,set,objects,workspace.data(),total));
     for(auto* p:owned)std::free(p);
 }
+// Count and fully build a set; returns the table count.
+static uint32_t BuildShape(const BdwExecMemoryObject* set,uint32_t objects,uint32_t total){
+    uint32_t count=0;assert(BdwExecAddressSpaceTableCount(set,objects,count) && count<=BdwPpgttMaxTables);
+    std::vector<uint8_t*> owned;auto page=[&]{void* p=nullptr;assert(!posix_memalign(&p,4096,4096));owned.push_back(static_cast<uint8_t*>(p));return static_cast<uint8_t*>(p);};
+    BdwPpgttPage s4[4];for(unsigned i=0;i<4;++i)s4[i]={0x100000000ull+4096ull*i,page()};
+    std::vector<BdwPpgttPage> tables(count);for(uint32_t i=0;i<count;++i)tables[i]={0x180000000ull+4096ull*i,page()};
+    std::vector<BdwPpgttMapping> workspace(total);
+    assert(BdwBuildExecAddressSpace(s4,tables.data(),count,set,objects,workspace.data(),total));
+    for(auto* p:owned)std::free(p);return count;
+}
+// gen 396: Firefox hardware WebRender, 62 objects and 61,328 pages. More than
+// 128 tables (so publication needs batching) and within 512; plus the dense
+// 65,536-page maximum as one object and spread over 512 objects.
+static void WideShapeTests() {
+    {
+        constexpr uint32_t objects=62,total=61328;static BdwExecMemoryObject set[objects];static std::vector<uint64_t> dmas[objects];
+        uint64_t address=0x200000000ull;uint32_t left=total;
+        for(uint32_t i=0;i<objects;++i){const uint32_t n=i==objects-1?left:(i%7==0?6000:128);
+            dmas[i].resize(n);for(uint32_t j=0;j<n;++j)dmas[i][j]=0x300000000ull+(uint64_t(i)<<27)+uint64_t(j)*4096;
+            set[i]={address,dmas[i].data(),n,true,false};left-=n;address+=(uint64_t(n)*4096+0x1fffff)&~uint64_t{0x1fffff};}
+        assert(left==0);const uint32_t count=BuildShape(set,objects,total);assert(count>128+4);
+    }
+    {
+        static std::vector<uint64_t> dma(65536);for(uint32_t j=0;j<65536;++j)dma[j]=0x300000000ull+uint64_t(j)*4096;
+        const BdwExecMemoryObject one{0x400000000ull,dma.data(),65536,true,false};
+        assert(BuildShape(&one,1,65536)==1+1+1+128);
+        static BdwExecMemoryObject many[512];
+        for(uint32_t i=0;i<512;++i)many[i]={0x400000000ull+uint64_t(i)*128*4096,dma.data()+i*128,128,true,false};
+        assert(BuildShape(many,512,65536)==1+1+1+128);
+    }
+}
 int main() {
+    WideShapeTests();
     LargeBufferSetTest();
     DifferentialTest();
     BdwPpgttPage scratch[4],tables[16];
