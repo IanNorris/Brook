@@ -185,10 +185,11 @@ int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    auto* addr = reinterpret_cast<const SockAddrIn*>(addrVal);
-    if (!addr || addrLen < sizeof(SockAddrIn)) return -EINVAL;
+    if (!addrVal || addrLen < sizeof(SockAddrIn)) return -EINVAL;
+    SockAddrIn addr{};
+    if (!CopyFromUser(&addr, addrVal, sizeof(addr))) return -EFAULT;
 
-    return SockBind(sockIdx, addr);
+    return SockBind(sockIdx, &addr);
 }
 
 int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
@@ -378,10 +379,20 @@ int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         return static_cast<int64_t>(ret);
     }
 
-    // UDP path
-    auto* dest = destVal ? reinterpret_cast<const SockAddrIn*>(destVal) : nullptr;
-    int ret = SockSendTo(sockIdx, reinterpret_cast<const void*>(bufVal),
-                          static_cast<uint32_t>(lenVal), dest);
+    // UDP path: the destination and payload are copied into kernel memory
+    // before the network stack sees them.
+    SockAddrIn destination{};
+    if (destVal) {
+        if (addrLenVal < sizeof(SockAddrIn)) return -EINVAL;
+        if (!CopyFromUser(&destination, destVal, sizeof(destination))) return -EFAULT;
+    }
+    if (lenVal > 65535) return -90; // EMSGSIZE
+    auto* payload = static_cast<uint8_t*>(kmalloc(lenVal ? lenVal : 1));
+    if (!payload) return -ENOMEM;
+    if (lenVal && !CopyFromUser(payload, bufVal, lenVal)) { kfree(payload); return -EFAULT; }
+    int ret = SockSendTo(sockIdx, payload, static_cast<uint32_t>(lenVal),
+                          destVal ? &destination : nullptr);
+    kfree(payload);
     if (ret < 0) return -EIO;
     return static_cast<int64_t>(lenVal);
 }
@@ -409,15 +420,14 @@ int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
             auto result=UnixSocketReadSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
                 reinterpret_cast<char*>(bufVal),lenVal,descriptors,received,nullptr,&size);
             for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
-            if(srcVal && addrLenVal>=0x1000) {
-                if(!UserBufferWritable(addrLenVal,sizeof(uint32_t)))return -EFAULT;
-                *reinterpret_cast<uint32_t*>(addrLenVal)=0;
-            }
+            // The peer is unnamed: report a zero-length address.
+            const uint32_t unnamed=0;
+            if(result>=0 && srcVal && addrLenVal && !CopyToUser(addrLenVal,&unnamed,sizeof(unnamed)))return -EFAULT;
             return result<0?result:(flagsVal&0x20)?static_cast<int64_t>(size):result;
         }
         // The nested read's lease ends before the address-length store below.
         UserAccessScope addressAccess(proc);
-        if(srcVal && addrLenVal>=0x1000 &&
+        if(srcVal && addrLenVal &&
            !UserBufferWritable(addrLenVal,sizeof(uint32_t)))return -EFAULT;
         bool oldNonblock = usd ? usd->nonblock : false;
         if (usd && (flagsVal & 0x40)) // MSG_DONTWAIT
@@ -425,8 +435,9 @@ int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         int64_t ret = sys_read(fdVal, bufVal, lenVal, 0, 0, 0);
         if (usd)
             usd->nonblock = oldNonblock;
-        if (srcVal && addrLenVal >= 0x1000)
-            *reinterpret_cast<uint32_t*>(addrLenVal) = 0;
+        const uint32_t unnamed = 0;
+        if (ret >= 0 && srcVal && addrLenVal && !CopyToUser(addrLenVal, &unnamed, sizeof(unnamed)))
+            return -EFAULT;
         return ret;
     }
 
@@ -440,23 +451,17 @@ int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         return ReceiveTcpToUser(sockIdx, bufVal, lenVal, nonblock);
     }
 
-    // UDP path
-    SockAddrIn srcTmp {};
-    auto* src = srcVal ? reinterpret_cast<SockAddrIn*>(srcVal) : &srcTmp;
-    int ret = SockRecvFrom(sockIdx, reinterpret_cast<void*>(bufVal),
-                            static_cast<uint32_t>(lenVal), src);
-    if (ret > 0 && srcVal && addrLenVal >= 0x1000)
-        *reinterpret_cast<uint32_t*>(addrLenVal) = sizeof(SockAddrIn);
-
-    // Log DNS response delivery to userspace
-    if (ret > 0) {
-        uint16_t sport = brook::ntohs(src->sin_port);
-        if (sport == 53) {
-        }
-    }
-
+    // UDP path: payload and source address are staged in kernel memory.
+    if (srcVal && !addrLenVal) return -EFAULT;
+    SockAddrIn source {};
+    const int64_t ret = ReceiveUdpToUser(sockIdx, bufVal, lenVal, &source);
+    if (ret == -EFAULT || ret == -ENOMEM) return ret;
     if (ret < 0) return -EAGAIN;
-    return static_cast<int64_t>(ret);
+    if (srcVal) {
+        if (int64_t error = CopySockAddrToUser(srcVal, addrLenVal, &source, sizeof(source)))
+            return error;
+    }
+    return ret;
 }
 
 int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optionVal,
@@ -599,13 +604,7 @@ static int64_t UnixSocketName(UnixSocketData* socket,bool peer,uint64_t addrVal,
         memcpy(address,peer?socket->peerAddress:socket->localAddress,length);
     }
     SpinLockRelease(&g_unixRegistryLock);
-    uint32_t requested=0;
-    if(!CopyFromUser(&requested,addrLenVal,sizeof(requested)))return -EFAULT;
-    if(requested>0x7fffffffu)return -EINVAL;
-    const uint32_t copied=requested<actual?requested:actual;
-    if((copied && !CopyToUser(addrVal,address,copied)) ||
-       !CopyToUser(addrLenVal,&actual,sizeof(actual)))return -EFAULT;
-    return 0;
+    return CopySockAddrToUser(addrVal,addrLenVal,address,actual);
 }
 
 int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
@@ -625,9 +624,7 @@ int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    auto* uaddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
-    auto* ulen  = reinterpret_cast<uint32_t*>(addrLenVal);
-    if (!uaddr || !ulen) return -EFAULT;
+    if (!addrVal || !addrLenVal) return -EFAULT;
 
     brook::SockAddrIn local{};
     local.sin_family = AF_INET;
@@ -637,14 +634,7 @@ int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
     local.sin_addr = tmpIp;
     local.sin_port = tmpPort;
 
-    {
-    }
-
-    uint32_t copyLen = *ulen;
-    if (copyLen > sizeof(local)) copyLen = sizeof(local);
-    __builtin_memcpy(uaddr, &local, copyLen);
-    *ulen = sizeof(local);
-    return 0;
+    return CopySockAddrToUser(addrVal, addrLenVal, &local, sizeof(local));
 }
 
 int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
@@ -668,19 +658,12 @@ int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
         uint16_t remPort = 0;
         brook::SockGetRemote(sockIdx, &remIp, &remPort);
         if (remIp != 0 || remPort != 0) {
-            auto* uaddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
-            auto* ulen  = reinterpret_cast<uint32_t*>(addrLenVal);
-            if (uaddr && ulen) {
-                brook::SockAddrIn peer{};
-                peer.sin_family = AF_INET;
-                peer.sin_addr = remIp;
-                peer.sin_port = remPort;
-                uint32_t copyLen = *ulen;
-                if (copyLen > sizeof(peer)) copyLen = sizeof(peer);
-                __builtin_memcpy(uaddr, &peer, copyLen);
-                *ulen = sizeof(peer);
-                return 0;
-            }
+            if (!addrVal || !addrLenVal) return -EFAULT;
+            brook::SockAddrIn peer{};
+            peer.sin_family = AF_INET;
+            peer.sin_addr = remIp;
+            peer.sin_port = remPort;
+            return CopySockAddrToUser(addrVal, addrLenVal, &peer, sizeof(peer));
         }
     }
 
@@ -760,6 +743,17 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
     if(fde && fde->type==FdType::NetlinkSocket)return -95;
+    // The peer address is written after the descriptor is published, so
+    // check the destination first; a raced unmap afterwards cannot undo the
+    // accept and the new descriptor is still returned.
+    uint32_t requestedAddrLen = 0;
+    if (addrVal) {
+        if (!CopyFromUser(&requestedAddrLen, addrLenVal, sizeof(requestedAddrLen))) return -EFAULT;
+        if (requestedAddrLen > 0x7fffffffu) return -EINVAL;
+        if (!UserBufferWritable(addrLenVal, sizeof(uint32_t))) return -EFAULT;
+        const uint32_t needed = requestedAddrLen < sizeof(SockAddrIn) ? requestedAddrLen : sizeof(SockAddrIn);
+        if (needed && !UserBufferWritable(addrVal, needed)) return -EFAULT;
+    }
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if (usd->state != UnixSocketData::State::Listening) return -EINVAL;
@@ -813,8 +807,9 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
                 --usd->pendingCount;
                 allocation.socket = nullptr; // pending ownership transferred to fd
                 SpinLockRelease(&g_unixRegistryLock);
-                if (addrVal >= 0x1000 && addrLenVal >= 0x1000)
-                    *reinterpret_cast<uint32_t*>(addrLenVal) = 0;
+                // The client is reported as unnamed (zero-length address).
+                const uint32_t unnamed = 0;
+                if (addrVal) (void)CopyToUser(addrLenVal, &unnamed, sizeof(unnamed));
                 SerialPrintf("sys_accept: AF_UNIX fd=%d -> newFd=%d\n", fd, newFd);
                 return newFd;
             }
@@ -882,13 +877,9 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
         return -EMFILE;
     }
 
-    // Copy peer address to user if requested
-    if (addrVal && addrLenVal) {
-        auto* userAddr = reinterpret_cast<brook::SockAddrIn*>(addrVal);
-        auto* userLen  = reinterpret_cast<uint32_t*>(addrLenVal);
-        *userAddr = peerAddr;
-        *userLen  = sizeof(brook::SockAddrIn);
-    }
+    // Copy peer address to user if requested: min(*addrlen, actual) bytes.
+    if (addrVal)
+        (void)CopySockAddrToUser(addrVal, addrLenVal, &peerAddr, sizeof(peerAddr));
 
     SerialPrintf("sys_accept: fd=%d -> newFd=%d childIdx=%d\n", fd, newFd, childIdx);
     return newFd;
@@ -1528,17 +1519,18 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     }
 
     if(!msg->msg_iovlen)return -EINVAL;
-    void* buf = msg->msg_iov[0].iov_base;
-    uint32_t len = static_cast<uint32_t>(msg->msg_iov[0].iov_len);
-    if (!buf || len == 0) return -EINVAL;
+    iovec first{};
+    if(!CopyFromUser(&first,reinterpret_cast<uint64_t>(msg->msg_iov),sizeof(first)))return -EFAULT;
+    if (!first.iov_base || first.iov_len == 0) return -EINVAL;
+    const uint32_t len = static_cast<uint32_t>(first.iov_len < 65536 ? first.iov_len : 65536);
 
     brook::SockAddrIn srcAddr {};
-    int ret = brook::SockRecvFrom(sockIdx, buf, len, &srcAddr);
+    const int64_t ret = ReceiveUdpToUser(sockIdx, first.iov_base, len, &srcAddr);
+    if (ret == -EFAULT || ret == -ENOMEM) return ret;
     if (ret < 0) return -EAGAIN;
 
     if (msg->msg_name && msg->msg_namelen >= sizeof(brook::SockAddrIn)) {
-        auto* dst = reinterpret_cast<brook::SockAddrIn*>(msg->msg_name);
-        *dst = srcAddr;
+        if(!CopyToUser(reinterpret_cast<uint64_t>(msg->msg_name),&srcAddr,sizeof(srcAddr)))return -EFAULT;
         msg->msg_namelen = sizeof(brook::SockAddrIn);
     }
 

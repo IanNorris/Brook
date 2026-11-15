@@ -5,54 +5,15 @@
 
 using namespace harness;
 namespace {
-unsigned g_snapshots;
 const char* g_names[]={"alpha","beta","gamma"};
 }
 
-// Path resolution: every call fails, so open stops at the first lookup.
-namespace brook {
-int ProcessFsSnapshot(Process*,FsSnapshot*) { ++g_snapshots;return -ENOENT; }
-void FsSnapshotRelease(FsSnapshot*) {}
-void VfsPathRetain(const VfsPath&) {}
-void VfsPathRelease(VfsPath) {}
-bool VfsPathSame(const VfsPath&,const VfsPath&) { return false; }
-int VfsPathBrokerAllowed(const VfsPath&,const char*,bool*) { return -ENOENT; }
-int VfsCanonicalDeviceAllowed(const VfsPath&,const VfsPath&,const char*,bool*,bool,const char*) { return -ENOENT; }
-int VfsCanonicalDrmBrokerAllowed(const VfsPath&,bool,bool*,bool) { return -ENOENT; }
-int VfsPathDeviceActivation(const VfsPath&,const char*) { return -ENOENT; }
-int VfsPathFromVnode(Vnode*,VfsPath*) { return -ENOENT; }
-int VfsPathResolve(const VfsPath&,const VfsPath&,const char*,VfsPath*,bool,bool) { return -ENOENT; }
-int VfsPathDirectoryPath(const VfsPath&,char*,uint32_t) { return -ENOENT; }
-Vnode* VfsOpenAt(const VfsPath&,const VfsPath&,const char*,int,uint16_t,uint16_t,int* error,bool) { if(error)*error=-ENOENT;return nullptr; }
-void VfsRelease(Vnode*) {}
-int VfsStat(Vnode*,VnodeStat*) { return -ENOENT; }
-Vnode* GuardCheckerOpenLinux(uint64_t,int* error) { *error=-13;return nullptr; }
-const char* DrmSysAttrContent(const char*) { return nullptr; }
-bool DrmSysIsDir(const char*) { return false; }
-const char* IntelDrmSysAttrContent(const char*) { return nullptr; }
-bool IntelDrmSysIsDir(const char*) { return false; }
-void DrmOwnerUnref(DrmGpuOwner*) {}
-const char g_drmDriDirTag[]="dri";
-const GpuAppOps* GpuAppGet() { return nullptr; }
-bool BdwIntelUserNodeEnabled() { return false; }
-BdwGpuFile* BdwGpuFileCreate() { return nullptr; }
-void BdwGpuFileUnref(BdwGpuFile*) {}
-int FdAlloc(Process*,FdType,void*) { return -1; }
-int MemFdInstall(Process*,MemFdData*,uint32_t) { return -1; }
-int NamedShmOpen(Process*,const char*,uint32_t) { return -1; }
-int NamedFifoAttach(Vnode*,uint32_t) { return -1; }
-AudioStreamId AudioMixerOpen() { return 0; }
-bool AudioMixerClose(AudioStreamId) { return true; }
-bool AudioMixerSetCapacity(AudioStreamId,uint32_t,uint32_t) { return false; }
-bool AudioAvailable() { return false; }
-}
 extern "C" int VfsReaddir(brook::Vnode*,brook::DirEntry* out,uint32_t* cookie) {
     if(*cookie>=3)return 0;
     const char* name=g_names[*cookie];
     uint32_t i=0;for(;name[i];++i)out->name[i]=name[i];out->name[i]=0;
     out->isDir=false;++*cookie;return 1;
 }
-extern "C" void VfsClose(brook::Vnode*) {}
 
 static void Open() {
     Reset();ResetProcess();g_snapshots=0;

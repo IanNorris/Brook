@@ -4,35 +4,9 @@
 
 using namespace harness;
 namespace {
-bool g_wmActive=true;
 const char g_synthetic[]="root:x:0:0:root:/root:/bin/sh\n";
 }
 
-namespace brook {
-uint64_t ClockNowNs(uint64_t) { return 0; }
-uint32_t DebugOverlayReadFrom(uint32_t*,char*,uint32_t,uint32_t) { return 0; }
-NamedFifoOpen* FdNamedFifo(const FdEntry*) { return nullptr; }
-PipeBuffer* FdPipe(const FdEntry*) { return nullptr; }
-bool FdPipeRead(const FdEntry*) { return false; }
-void InputAddWaiter(Process*) {}
-void InputRemoveWaiter(Process*) {}
-int64_t MemFdReadAt(MemFdData*,void*,uint64_t,uint64_t*) { return -EBADF; }
-int64_t NetlinkReadUser(NetlinkSocket*,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) { return -EBADF; }
-void PipePollNotify(PipeBuffer*,uint32_t) {}
-int64_t SignalFdRead(Process*,SignalFd*,uint64_t,uint64_t,bool) { return -EBADF; }
-bool SockIsNonblock(int) { return true; }
-bool SockIsStream(int) { return false; }
-int SockRecvFrom(int,void*,uint32_t,SockAddrIn*) { return -EAGAIN; }
-int SockRecv(int,void*,uint32_t,bool) { return -EAGAIN; }
-uint64_t TimerFdDeadline(TimerFdData*,uint64_t*) { return 0; }
-void TtyPutChar(char) {}
-void UnixFdSnapRelease(const UnixFdSnap*) {}
-int64_t UnixSocketReadSome(UnixSocketData*,bool,char*,uint64_t,UnixFdSnap*,int&,UnixCredentials*,uint64_t*,bool*) { return -EBADF; }
-uint64_t WaitWakeupTick(uint64_t,uint64_t) { return 0; }
-bool WmIsActive() { return g_wmActive; }
-}
-extern "C" bool InputPollEvent(brook::InputEvent*) { return false; }
-extern "C" int VfsRead(brook::Vnode*,void*,uint64_t,uint64_t*) { return -brook::EIO; }
 bool RdrandU64(uint64_t* out) { *out=0x0807060504030201ULL;return true; }
 uint64_t SoftRandU64() { return 0; }
 

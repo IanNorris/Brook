@@ -18,6 +18,7 @@
 #undef __BROOK_KERNEL__
 #include "apic.h"
 #include "process.h"
+#include "net.h"
 #include <stdint.h>
 
 namespace harness {
@@ -47,6 +48,20 @@ void ResetProcess();
 // Count of user-copy calls that were refused because they hit kernel memory.
 extern unsigned g_refusedKernelCopies;
 
+// Fake network stack shared by the socket and read() tests.
+struct FakeNet {
+    unsigned binds=0,sends=0,receives=0,accepts=0;
+    brook::SockAddrIn bound{},sentDestination{};
+    bool sentWithDestination=false;
+    uint8_t sent[256]{};uint32_t sentLength=0;
+    bool datagramReady=false;uint8_t datagram[64]{};uint32_t datagramLength=0;
+    brook::SockAddrIn source{},peer{};
+    bool acceptReady=false;
+    uint32_t localIp=0,remoteIp=0;uint16_t localPort=0,remotePort=0;
+};
+extern FakeNet g_net;
+extern unsigned g_snapshots;   // ProcessFsSnapshot calls (open lookups)
+
 void Check(bool condition,const char* expression,const char* file,int line);
 unsigned Failures();
 }
@@ -56,3 +71,4 @@ unsigned Failures();
 void RunInputWmTests();
 void RunDirOpenTests();
 void RunRwTests();
+void RunSocketTests();

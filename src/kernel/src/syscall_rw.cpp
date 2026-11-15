@@ -452,6 +452,31 @@ int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count, bool don
     return result;
 }
 
+int64_t ReceiveUdpToUser(int sockIdx, uint64_t address, uint64_t count, SockAddrIn* source)
+{
+    // A UDP datagram is at most 64 KiB; longer reads cannot receive more.
+    const uint32_t size = static_cast<uint32_t>(count < 65536 ? count : 65536);
+    if (size && !UserBufferWritable(address, size)) return -EFAULT;
+    auto* staged = static_cast<uint8_t*>(kmalloc(size ? size : 1));
+    if (!staged) return -ENOMEM;
+    int result = SockRecvFrom(sockIdx, staged, size, source);
+    if (result > 0 && !CopyToUser(address, staged, static_cast<uint32_t>(result)))
+        result = -EFAULT;
+    kfree(staged);
+    return result;
+}
+
+int64_t CopySockAddrToUser(uint64_t address, uint64_t addrLen, const void* value, uint32_t actual)
+{
+    uint32_t requested = 0;
+    if (!CopyFromUser(&requested, addrLen, sizeof(requested))) return -EFAULT;
+    if (requested > 0x7fffffffu) return -EINVAL;
+    const uint32_t copied = requested < actual ? requested : actual;
+    if ((copied && !CopyToUser(address, value, copied)) ||
+        !CopyToUser(addrLen, &actual, sizeof(actual))) return -EFAULT;
+    return 0;
+}
+
 static int64_t PipeReadSome(Process* proc,FdEntry* fde,char* dst,uint64_t count)
 {
     KernelOperationGuard operation(proc);
@@ -954,11 +979,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // blocking sockets spin-poll briefly (matches existing TCP behaviour).
         SockAddrIn unused = {};
         for (;;) {
-            int ret = SockRecvFrom(sockIdx,
-                                    reinterpret_cast<void*>(bufAddr),
-                                    static_cast<uint32_t>(count),
-                                    &unused);
-            if (ret >= 0) return ret;
+            const int64_t ret = ReceiveUdpToUser(sockIdx, bufAddr, count, &unused);
+            if (ret >= 0 || ret == -EFAULT || ret == -ENOMEM) return ret;
             if (nonblock) return -EAGAIN;
             if (HasPendingSignals()) return -EINTR;
             // Yield briefly so the NIC ISR / poll path can deliver packets.
