@@ -156,10 +156,33 @@ static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
 }
 /* Selection uses the OS capture's non-reused window identity, never a title.
  * Native toplevels only; the offered full source scales to the client VFB. */
+/* Why a window that has an offer was not drawn from it this frame (stats
+ * JSON "gpu_select"). Counted only for windows with at least one offer. */
+enum {DESKTOP_GPU_SELECTED,DESKTOP_GPU_REFUSE_SHAPE,DESKTOP_GPU_REFUSE_NO_CANDIDATE,DESKTOP_GPU_REFUSE_FAILED,
+      DESKTOP_GPU_REFUSE_SNAPSHOT_NEWER,DESKTOP_GPU_REFUSE_VALIDATE,DESKTOP_GPU_REFUSE_USES,DESKTOP_GPU_SELECT_REASONS};
+static uint64_t g_desktopGpuSelect[DESKTOP_GPU_SELECT_REASONS];
+static const char *const desktop_gpu_select_names[DESKTOP_GPU_SELECT_REASONS]={"selected","shape","no_candidate","failed",
+    "snapshot_newer","validate","uses_full"};
 static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopGpuChannel *c,const struct BrookDesktopLayer *l,
                                                                   uint32_t screenW,uint32_t screenH,struct BrookVkSceneLayer *out,uint64_t frame){
-    if(!frame || !l || !out || !l->window || l->window>BROOK_DESKTOP_LAYER_LIMIT || (l->flags&BROOK_DESKTOP_LAYER_LEGACY_OPAQUE) || !l->clientWidth || !l->clientHeight ||
-       l->width!=l->clientWidth || l->height!=l->clientHeight)return NULL;
+    if(!frame || !l || !out || !l->window || l->window>BROOK_DESKTOP_LAYER_LIMIT)return NULL;
+    int offered=0;
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS && !offered;++i)
+        offered=c->offers[i].packet.identity.window==l->window && c->offers[i].packet.identity.incarnation==l->incarnation;
+    /* Native VFBs are drawn 1:1 and cropped to the client rectangle by the
+     * CPU-source path (desktop_content_layer.h), including while the client
+     * size and the committed buffer differ (resize in flight, or a client
+     * that picks its own size). The offer is the same pixels, so it is drawn
+     * the same way below. Legacy upscaled VFBs stay on the CPU source. */
+    if((l->flags&BROOK_DESKTOP_LAYER_LEGACY_OPAQUE) || !l->clientWidth || !l->clientHeight){
+        if(offered){
+            ++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SHAPE];
+            static unsigned logged;
+            if(logged<8){++logged;fprintf(stderr,"DESKTOP_GPU_SOURCE_SHAPE window=%u flags=0x%x layer=%ux%u client=%ux%u\n",
+                l->window,l->flags,l->width,l->height,l->clientWidth,l->clientHeight);}
+        }
+        return NULL;
+    }
     struct DesktopGpuOffer *best=NULL;
     for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];
         if(o->packet.identity.window!=l->window || o->packet.identity.incarnation!=l->incarnation || o->failed)continue;
@@ -171,12 +194,16 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
         }else if(o->state!=1 || !newer)continue;
         if(!best || o->packet.identity.commit>best->packet.identity.commit)best=o;
     }
-    if(!best)return NULL;
+    if(!best){if(offered)++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_NO_CANDIDATE];return NULL;}
+    /* A client/VFB size mismatch is drawn only when the offer is the VFB
+     * itself (cropped 1:1 below); anything else keeps the CPU source. */
+    if((l->width!=l->clientWidth || l->height!=l->clientHeight) &&
+       (best->packet.width!=l->width || best->packet.height!=l->height)){++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SHAPE];return NULL;}
     if(DESKTOP_GPU_FENCE_FAILED(best->fence) || DESKTOP_GPU_BUFFER_FAILED(best->buffer)){
         best->failed=1;best->current=0;
         fprintf(stderr,"DESKTOP_GPU_SOURCE_FAILED window=%u incarnation=%llu commit=%llu (producer fence or buffer failed; CPU source)\n",
             best->packet.identity.window,(unsigned long long)best->packet.identity.incarnation,(unsigned long long)best->packet.identity.commit);
-        return NULL;
+        ++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_FAILED];return NULL;
     }
     if(desktop_gpu_offer_retained(best) && best->current){
         /* The provider repaints its CPU buffer only when the GPU source can
@@ -184,19 +211,27 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
          * CPU fallback). A tagged snapshot at least as new replaces it. */
         uint64_t snapshot=0;
         if(!syscall(BROOK_SYS_WM_QUERY_SOURCE_COMMIT,(long)l->window,(long)l->incarnation,(long)l->generation,(long)&snapshot,0L,0L) &&
-           snapshot>=best->packet.identity.commit){best->current=0;return NULL;}
+           snapshot>=best->packet.identity.commit){best->current=0;++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SNAPSHOT_NEWER];return NULL;}
     }
-    if(syscall(BROOK_SYS_GPU_WINDOW_VALIDATE,(long)c->peer,(long)l->window,(long)l->incarnation,0L,0L,0L))return NULL;
+    if(syscall(BROOK_SYS_GPU_WINDOW_VALIDATE,(long)c->peer,(long)l->window,(long)l->incarnation,0L,0L,0L)){
+        ++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_VALIDATE];return NULL;}
     if(desktop_gpu_offer_retained(best) && !desktop_gpu_offer_used_by(best,frame)){
         unsigned slot=0;while(slot<DESKTOP_GPU_OFFER_USES && best->uses[slot])++slot;
-        if(slot==DESKTOP_GPU_OFFER_USES)return NULL;
+        if(slot==DESKTOP_GPU_OFFER_USES){++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_USES];return NULL;}
         best->uses[slot]=frame;
     }
     uint32_t opacity=(l->flags&BROOK_DESKTOP_LAYER_HAS_OPACITY)?(l->flags&BROOK_DESKTOP_LAYER_OPACITY_MASK)>>BROOK_DESKTOP_LAYER_OPACITY_SHIFT:255;
     uint32_t flags=best->packet.fourcc==0x34325258?(BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE):0;
-    *out=(struct BrookVkSceneLayer){best->packet.offset,best->packet.stride,best->packet.width,best->packet.height,
+    if(best->packet.width==l->width && best->packet.height==l->height &&
+       (l->width!=l->clientWidth || l->height!=l->clientHeight)){
+        /* The offer is the VFB's pixels: crop 1:1 like the CPU source. */
+        const uint32_t w=l->width<l->clientWidth?l->width:l->clientWidth,h=l->height<l->clientHeight?l->height:l->clientHeight;
+        *out=(struct BrookVkSceneLayer){best->packet.offset,best->packet.stride,best->packet.width,best->packet.height,
+            0,0,w,h,l->clientX,l->clientY,w,h,0,0,screenW,screenH,opacity|flags};
+    }else *out=(struct BrookVkSceneLayer){best->packet.offset,best->packet.stride,best->packet.width,best->packet.height,
         0,0,best->packet.width,best->packet.height,l->clientX,l->clientY,l->clientWidth,l->clientHeight,
         0,0,screenW,screenH,opacity|flags};
+    ++g_desktopGpuSelect[DESKTOP_GPU_SELECTED];
     best->state=2;best->frame=frame;return best;
 }
 static inline int desktop_gpu_offer_in_frame(const struct DesktopGpuOffer *o,uint64_t frame){
