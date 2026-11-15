@@ -227,4 +227,34 @@ int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
 int64_t sys_link(uint64_t oldAddr, uint64_t newAddr, uint64_t,
                   uint64_t, uint64_t, uint64_t);
 
+// syscall_file_ops.cpp
+int64_t sys_sync(uint64_t, uint64_t, uint64_t,
+                 uint64_t, uint64_t, uint64_t);
+int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
+                      uint64_t, uint64_t, uint64_t);
+int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                      uint64_t, uint64_t, uint64_t);
+int64_t sys_chown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_lchown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_fchownat(uint64_t dirfd, uint64_t pathAddr, uint64_t uid,
+                      uint64_t gid, uint64_t flags, uint64_t);
+int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAddr,
+                       uint64_t flags, uint64_t, uint64_t);
+int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
+                       uint64_t length, uint64_t, uint64_t);
+
 } // namespace brook
