@@ -789,6 +789,13 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
             UnixSocketData* socket;
             ~AcceptedAllocation() { if (socket) UnixSocketHandleUnref(socket); }
         } allocation{serverSock};
+        // The accepted fd's open file description, created outside the
+        // registry spinlock and released unlocked if publication fails.
+        struct PreparedDescription {
+            OpenFile* file;
+            ~PreparedDescription() { OpenFileRelease(file); }
+        } description{OpenFileCreate(static_cast<uint32_t>(flags) & UNIX_SOCK_NONBLOCK)};
+        if (!description.file) return -ENOMEM;
 
         for (;;) {
             if (__atomic_load_n(&fde->closing, __ATOMIC_ACQUIRE)) return -EBADF;
@@ -816,14 +823,17 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
                 // Registry -> fd lock is safe: finalizers release fdLock before
                 // taking the registry lock, and fd retain callbacks only use
                 // atomic reference increments. Keep the pending owner intact
-                // until publication succeeds so EMFILE remains retryable.
-                int newFd = UnixInstallSocket(proc, serverSock, flags, "accept");
+                // until publication succeeds so EMFILE remains retryable. The
+                // description was allocated before the registry lock: nothing
+                // here allocates, frees or logs under it.
+                int newFd = UnixInstallSocketPrepared(proc, serverSock, flags, description.file);
                 if (newFd < 0) {
                     serverSock->rxPipe = serverSock->txPipe = nullptr;
                     serverSock->incomingFds = serverSock->peerIncomingFds = nullptr;
                     SpinLockRelease(&g_unixRegistryLock);
                     return newFd;
                 }
+                description.file = nullptr; // owned by the published slot
                 usd->pending[slot] = {};
                 --usd->pendingCount;
                 allocation.socket = nullptr; // pending ownership transferred to fd
@@ -990,18 +1000,16 @@ int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endB->incomingFds = fdqAtoB;
     endB->peerIncomingFds = fdqBtoA;
 
-    int fdA = UnixInstallSocket(proc, endA, static_cast<uint32_t>(type), "socketpair-a");
-    if (fdA < 0) {
+    // Both endpoints are published together or not at all (no rollback
+    // that closes a possibly reused number when only one slot is free).
+    int ends[2] = {-1, -1};
+    int published = UnixInstallSocketPair(proc, endA, endB, static_cast<uint32_t>(type), ends);
+    if (published < 0) {
         UnixSocketHandleUnref(endA);
         UnixSocketHandleUnref(endB);
-        return fdA;
+        return published;
     }
-    int fdB = UnixInstallSocket(proc, endB, static_cast<uint32_t>(type), "socketpair-b");
-    if (fdB < 0) {
-        CloseProcessFd(proc, fdA);
-        UnixSocketHandleUnref(endB);
-        return fdB;
-    }
+    const int fdA = ends[0], fdB = ends[1];
 
     sv[0] = fdA;
     sv[1] = fdB;

@@ -260,6 +260,19 @@ static FdEntry* AllocFdTable()
     return table;
 }
 
+// Table exhaustion is common (Steam fills 1024 fds and retries every few
+// ms); report it at most once per second so the serial log stays usable.
+static void FdReportExhausted(Process* proc)
+{
+    static uint64_t lastTick = 0, suppressed = 0;
+    const uint64_t now = ApicTickCount();
+    const uint64_t last = __atomic_load_n(&lastTick, __ATOMIC_RELAXED);
+    if (last && now - last < 1000) { __atomic_fetch_add(&suppressed, 1, __ATOMIC_RELAXED); return; }
+    __atomic_store_n(&lastTick, now ? now : 1, __ATOMIC_RELAXED);
+    SerialPrintf("FD: pid %u exhausted %u fds (+%lu suppressed)\n", proc->pid, MAX_FDS,
+                 __atomic_exchange_n(&suppressed, 0, __ATOMIC_RELAXED));
+}
+
 int FdPublishNew(Process* proc, const FdEntry& owned, uint32_t openFlags,
                  bool pinned, void (*published)(int, const FdEntry&))
 {
@@ -274,9 +287,40 @@ int FdPublishNew(Process* proc, const FdEntry& owned, uint32_t openFlags,
     if (fd < 0)
     {
         OpenFileRelease(file);
-        if (fd == -24) SerialPrintf("FD: pid %u exhausted %u fds\n", proc->pid, MAX_FDS);
+        if (fd == -24) FdReportExhausted(proc);
     }
     return fd;
+}
+
+int FdPublishPrepared(Process* proc, const FdEntry& owned, OpenFile* file,
+                      void (*published)(int, const FdEntry&))
+{
+    if (!proc || !proc->fds || !file) return -24;
+    FdEntry entry = owned;
+    entry.file = file;
+    int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), entry, 0, -1, nullptr, published);
+    return fd;
+}
+
+int FdPublishNewPair(Process* proc, const FdEntry& first, uint32_t firstFlags,
+                     const FdEntry& second, uint32_t secondFlags, int out[2],
+                     void (*published)(int, const FdEntry&))
+{
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
+    if (!proc || !proc->fds) return -24;
+    OpenFile* a = OpenFileCreate(firstFlags);
+    OpenFile* b = a ? OpenFileCreate(secondFlags) : nullptr;
+    if (!b) { OpenFileRelease(a); return -12; }
+    FdEntry entries[2] = {first, second};
+    entries[0].file = a;
+    entries[1].file = b;
+    int result = FdTablePublishPair(proc->fds, ProcessFdLock(proc), entries[0], entries[1], out, published);
+    if (result < 0) {
+        OpenFileRelease(a);
+        OpenFileRelease(b);
+        if (result == -24) FdReportExhausted(proc);
+    }
+    return result;
 }
 
 int FdAlloc(Process* proc, FdType type, void* handle, uint32_t openFlags,

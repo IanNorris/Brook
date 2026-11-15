@@ -59,19 +59,17 @@ static int64_t CreatePipe(uint64_t pipefdAddr, uint64_t flags)
 
     // Read end (flags=0) and write end (flags=1): two open file descriptions,
     // each published complete with its status flags and FD_CLOEXEC (L-59).
+    // Both ends are published together or not at all: with one free slot
+    // (EMFILE storms) nothing becomes visible to a sibling dup/fork/close,
+    // and the unpublished buffer is simply destroyed.
     const uint8_t cloexec = (flags & 0x80000) ? 1 : 0;
-    int readFd = FdAlloc(proc, FdType::Pipe, pipe, static_cast<uint32_t>(flags & 0x800), 0, cloexec);
-    if (readFd < 0) { PipeBufferDestroy(pipe); return readFd; }
-
-    int writeFd = FdAlloc(proc, FdType::Pipe, pipe, static_cast<uint32_t>(1 | (flags & (0x800 | 0x4000))), 1, cloexec);
-    if (writeFd < 0)
-    {
-        // The write end never existed: drop the read end through its normal
-        // close, which also releases the reader count and the buffer.
-        __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_ACQ_REL);
-        CloseProcessFd(proc, readFd);
-        return writeFd;
-    }
+    FdEntry readEnd{};readEnd.type = FdType::Pipe;readEnd.handle = pipe;readEnd.flags = 0;readEnd.fdFlags = cloexec;
+    FdEntry writeEnd = readEnd;writeEnd.flags = 1;
+    int ends[2] = {-1, -1};
+    int published = FdPublishNewPair(proc, readEnd, static_cast<uint32_t>(flags & 0x800),
+                                     writeEnd, static_cast<uint32_t>(1 | (flags & (0x800 | 0x4000))), ends);
+    if (published < 0) { PipeBufferDestroy(pipe); return published; }
+    const int readFd = ends[0], writeFd = ends[1];
 
     const int32_t result[2]={readFd,writeFd};
     if(!CopyToUser(pipefdAddr,result,sizeof(result))) {
