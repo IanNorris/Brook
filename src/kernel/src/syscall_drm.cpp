@@ -1091,7 +1091,9 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
     }
     const int64_t result=brook::BdwIntelRenderIoctl(file,cmd,arg,user);
     // An execbuffer refusal becomes VK_ERROR_DEVICE_LOST in Mesa: name it.
-    if(result<0 && (cmd&0xff)==0x69){
+    // EINTR is a signal during a queue-space wait, not a refusal: the call
+    // restarts (SA_RESTART) or Mesa's drmIoctl retries it.
+    if(result<0 && result!=-EINTR && (cmd&0xff)==0x69){
         static uint64_t refusals=0;const char* why=brook::BdwTakeRefusal();
         if(brook::BdwRefusalLogDue(refusals))
             KPrintf("gpu-exec: execbuffer refused pid=%u errno=%ld reason=%s count=%lu\n",user.submitterPid,-result,

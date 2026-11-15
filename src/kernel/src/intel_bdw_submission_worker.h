@@ -97,6 +97,12 @@ public:
         return queue_.BeginPreparation(owner,entry);
     }
     void EndPreparation(BdwSubmissionPreparation& entry){queue_.EndPreparation(entry);}
+    // See BdwSubmissionQueue::ReservePreparation; -11 means wait for space.
+    int64_t ReservePreparation(uint64_t owner,uint64_t presentOwner,BdwSubmissionPreparation& entry){
+        if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)!=2)return -19;
+        return queue_.ReservePreparation(owner,presentOwner,entry);
+    }
+    BdwQueueSpaceStats SpaceStats(){return __atomic_load_n(&state_,__ATOMIC_ACQUIRE)==2?queue_.SpaceStats():BdwQueueSpaceStats{};}
     int64_t SubmitHandoff(BdwHandoffResources& handoff,uint64_t owner,HandoffTicket ticket,
                           BdwExecSnapshot* snapshot,BdwFence* fence,uint64_t gateToken){
         if(__atomic_load_n(&state_,__ATOMIC_ACQUIRE)!=2)return -19;
