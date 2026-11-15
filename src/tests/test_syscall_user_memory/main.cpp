@@ -145,7 +145,7 @@ void KMutexInit(KMutex*) {}
 void KMutexLock(KMutex*) {}
 void KMutexUnlock(KMutex*) {}
 FdEntry* FdGetRef(Process* proc,int fd) {
-    if(!proc || fd<0 || fd>=static_cast<int>(MAX_FDS) || proc->fds[fd].type==FdType::None)return nullptr;
+    if(!proc || fd<0 || fd>=static_cast<int>(MAX_FDS) || proc->fds[fd].type==FdType::None || proc->fds[fd].closing)return nullptr;
     ++proc->fds[fd].pinCount;return &proc->fds[fd];
 }
 void FdPut(Process* proc,int fd) { --proc->fds[fd].pinCount; }

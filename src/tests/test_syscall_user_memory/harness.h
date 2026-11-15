@@ -67,6 +67,7 @@ struct FakeNet {
 };
 extern FakeNet g_net;
 extern unsigned g_snapshots;   // ProcessFsSnapshot calls (open lookups)
+extern bool g_syntheticPathsOnly; // lookups succeed for brokered synthetic names
 
 void Check(bool condition,const char* expression,const char* file,int line);
 unsigned Failures();

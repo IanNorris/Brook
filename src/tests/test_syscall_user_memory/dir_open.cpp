@@ -63,7 +63,35 @@ static void Getdents() {
     CHECK(brook::StrEq(reinterpret_cast<const char*>(good+24+19),".."));
 }
 
+// H-27: /dev/tty borrows the stdin/stdout pipes only while they are pinned,
+// retains both ends before publishing, and honours O_CLOEXEC.
+static void DevTty() {
+    Reset();ResetProcess();g_syntheticPathsOnly=true;
+    auto* proc=CurrentProcess();
+    auto* in=brook::PipeBufferCreate(64);auto* out=brook::PipeBufferCreate(64);
+    in->readers=in->writers=1;out->readers=out->writers=1;
+    proc->fds[0].type=brook::FdType::Pipe;proc->fds[0].handle=in;proc->fds[0].flags=1;
+    proc->fds[1].type=brook::FdType::Pipe;proc->fds[1].handle=out;proc->fds[1].flags=1;
+    __builtin_memcpy(reinterpret_cast<void*>(UserAddress(0)),"/dev/tty",9);
+    const int64_t fd=brook::sys_openat(static_cast<uint64_t>(-100),UserAddress(0),2|0x80000,0,0,0);
+    CHECK(fd==2);
+    if(fd==2) {
+        CHECK(proc->fds[2].type==brook::FdType::DevTty);
+        CHECK(proc->fds[2].statusFlags==2 && proc->fds[2].fdFlags==1);
+        auto* pair=static_cast<brook::TtyDevicePair*>(proc->fds[2].handle);
+        CHECK(pair->readPipe==in && pair->writePipe==out);
+    }
+    CHECK(in->readers==2 && out->writers==2);
+    CHECK(proc->fds[0].pinCount==0 && proc->fds[1].pinCount==0);
+    // A stdin slot that a sibling is closing is not borrowed.
+    proc->fds[0].closing=1;
+    CHECK(brook::sys_openat(static_cast<uint64_t>(-100),UserAddress(0),2,0,0,0)==-brook::EMFILE);
+    CHECK(in->readers==2);
+    g_syntheticPathsOnly=false;
+}
+
 void RunDirOpenTests() {
+    DevTty();
     Open();
     Getdents();
 }

@@ -31,20 +31,25 @@
 namespace harness {
 FakeNet g_net;
 unsigned g_snapshots;
+bool g_syntheticPathsOnly;
 }
 using harness::g_net;
 
 namespace brook {
-// Filesystem: every lookup fails, so open stops at the first one.
-int ProcessFsSnapshot(Process*,FsSnapshot*) { ++harness::g_snapshots;return -ENOENT; }
+// Filesystem: every lookup fails, so open stops at the first one, unless a
+// test opts in to brokered synthetic paths (/dev/tty and friends).
+int ProcessFsSnapshot(Process*,FsSnapshot*) { ++harness::g_snapshots;return harness::g_syntheticPathsOnly?0:-ENOENT; }
 void FsSnapshotRelease(FsSnapshot*) {}
 void VfsPathRetain(const VfsPath&) {}
 void VfsPathRelease(VfsPath) {}
 bool VfsPathSame(const VfsPath&,const VfsPath&) { return false; }
-int VfsPathBrokerAllowed(const VfsPath&,const char*,bool*) { return -ENOENT; }
+int VfsPathBrokerAllowed(const VfsPath&,const char*,bool* allowed) {
+    if(!harness::g_syntheticPathsOnly)return -ENOENT;
+    *allowed=true;return 0;
+}
 int VfsCanonicalDeviceAllowed(const VfsPath&,const VfsPath&,const char*,bool*,bool,const char*) { return -ENOENT; }
 int VfsCanonicalDrmBrokerAllowed(const VfsPath&,bool,bool*,bool) { return -ENOENT; }
-int VfsPathDeviceActivation(const VfsPath&,const char*) { return -ENOENT; }
+int VfsPathDeviceActivation(const VfsPath&,const char*) { return harness::g_syntheticPathsOnly?0:-ENOENT; }
 int VfsPathFromVnode(Vnode*,VfsPath*) { return -ENOENT; }
 int VfsPathResolve(const VfsPath&,const VfsPath&,const char*,VfsPath*,bool,bool) { return -ENOENT; }
 int VfsPathDirectoryPath(const VfsPath&,char*,uint32_t) { return -ENOENT; }
