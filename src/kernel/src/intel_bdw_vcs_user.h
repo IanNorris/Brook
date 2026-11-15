@@ -44,6 +44,13 @@ public:
         return true;
     }
     bool UserRecycle(){if(!Recycle())return false;root_=batch_=0;return true;}
+    // Phase 4 lane: the breadcrumb of the in-flight job as seen by the CPU,
+    // without any device access (the completion page is private RAM).
+    bool LaneBreadcrumb(){
+        if(state_!=BdwOneShotState::Submitted)return false;
+        __asm__ volatile("mfence; clflush (%0); mfence"::"r"(pages_[Completion].cpu):"memory");
+        return SubmittedBreadcrumb();
+    }
 };
 
 // TSC stamps recorded in BdwBcsRunResult::stamps for one VCS user job.

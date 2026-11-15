@@ -605,6 +605,25 @@ bool BdwRunPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink
     }
     return false;
 }
+// Phase 4 lane: submit and leave running; later complete and poll the CSB.
+bool BdwSubmitPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink,uint64_t scratchDma,BdwBcsRunResult& result){
+    if(scratchDma!=vcsUserScratch.dma || !vcsUserSnapshot || !BdwGlobalGgttSpace().owns(vcsUserReservation))return false;
+    if(!vcsUserTables.AdmitAndPublish(sink))return false;
+    result.attempted=true;
+    result.stamps[BdwVcsStampExecute]=__builtin_ia32_rdtsc();
+    return vcsUserImage.ExecuteTakenOverWithBackend(retainedAllocator,backend,scratchDma,true);
+}
+bool BdwVcsUserLaneBreadcrumb(){return vcsUserSnapshot && vcsUserImage.LaneBreadcrumb();}
+bool BdwCompleteSubmittedVcsUser(BdwBcsExecutionBackend& backend,BdwBcsRunResult& result){
+    if(!vcsUserSnapshot || !vcsUserImage.CompleteSubmitted(backend))return false;
+    result.copyComplete=true;result.stamps[BdwVcsStampBreadcrumb]=__builtin_ia32_rdtsc();
+    while(backend.retirementContinue()){
+        const auto status=vcsUserImage.PollContextSwitch(backend);
+        if(status==BdwCsbPoll::Fault)return false;
+        if(status==BdwCsbPoll::Complete){result.contextComplete=true;result.stamps[BdwVcsStampCsb]=__builtin_ia32_rdtsc();return true;}
+    }
+    return false;
+}
 // Only after an acknowledged VCS reset: unbinds the lease back to scratch.
 bool BdwRetirePreparedVcsUser(BdwBcsExecutionBackend& backend){return vcsUserImage.RetireScanout(backend);}
 // After a run: release the private image and the tables. verifiedStopped is
@@ -682,6 +701,11 @@ static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
     hooks.wakeGeneration=[](void*){return BdwGpuEventGeneration(BdwGpuEvent::Work);};
     hooks.idle=idle;
     hooks.wake=[](void*){BdwGpuEventSignal(BdwGpuEvent::Work);};
+#if defined(BROOK_BDW_VIDEO_ENGINE)
+    // VA-API phase 4: the VCS lane parks in-flight video jobs on the worker.
+    hooks.pollParked=[](void*,BdwExecSnapshot* snapshot,BdwSubmissionOutcome& out){return BdwVcsLanePoll(snapshot,out);};
+    hooks.parkedIdle=[](void*){if(!(BdwVideoUserTuning()&BdwVcsTuneLaneSpin))return false;SchedulerYield();return true;};
+#endif
     hooks.recover=[](void*){KernelPanic("Broadwell submission worker requires recovery");};
     // Log the first failures of each kind: a failed job fails its fences and
     // (unless skipped) poisons its context and buffers, so name the owner.
@@ -815,6 +839,7 @@ static bool TestSubmissionWorker(BdwWorkerProbeResult& result,bool contexts) {
 bool BdwTestSubmissionWorker(BdwWorkerProbeResult& result){return TestSubmissionWorker(result,false);}
 bool BdwTestContextSubmissionWorker(BdwWorkerProbeResult& result){return TestSubmissionWorker(result,true);}
 static BdwSubmissionWorker applicationWorker;
+void BdwApplicationWorkerParkedCounts(uint64_t& parked,uint64_t& overlapped){applicationWorker.ParkedCounts(parked,overlapped);}
 bool BdwSetScanoutFairness(bool enabled){return applicationWorker.SetServiceFairness(enabled);}
 bool BdwScanoutFairness(){return applicationWorker.ServiceFairness();}
 void BdwScanoutFairnessCounts(uint64_t& pending,uint64_t& bypass,uint64_t& noEligible,uint64_t& forced){

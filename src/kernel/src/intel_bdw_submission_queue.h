@@ -189,6 +189,10 @@ public:
         }
         return ok && released?static_cast<int64_t>(cancelled):-5;
     }
+    bool Park(uint64_t id){
+        if(!initialized_)return false;
+        KMutexLock(&mutex_);const bool ok=queue_.Park(id);KMutexUnlock(&mutex_);return ok;
+    }
     bool Take(uint64_t& id,BdwExecSnapshot*& snapshot,bool applicationOnly=false){
         if(!initialized_)return false;
         KMutexLock(&mutex_);const bool ok=queue_.StartNext(id,snapshot,applicationOnly);

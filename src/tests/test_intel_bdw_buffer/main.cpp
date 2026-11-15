@@ -678,6 +678,71 @@ int main(){
             auto* retired=queue.Reap(1,id,state);assert(retired && BdwExecSnapshotRelease(retired,false));}
         BdwFenceUnref(wait);BdwGpuContextUnref(aCtx);BdwGpuContextUnref(bCtx);BdwGpuContextUnref(cCtx);BdwGpuFileUnref(thirdFile);
     }
+    {   // VA-API phase 4: a parked (in-flight VCS) request admits only
+        // independent later work and no second video job; finishing it by id
+        // releases the order.
+        auto* thirdFile=BdwGpuFileCreate();auto* fourthFile=BdwGpuFileCreate();assert(thirdFile && fourthFile);
+        auto* vCtx=BdwGpuFileGetDefaultContext(f);auto* rCtx=BdwGpuFileGetDefaultContext(other);
+        auto* dCtx=BdwGpuFileGetDefaultContext(thirdFile);auto* v2Ctx=BdwGpuFileGetDefaultContext(fourthFile);
+        assert(vCtx && rCtx && dCtx && v2Ctx);
+        BdwExecObjectInput vObj{replacement,0x10000,4096,16},rObj{next,0x20000,4096,16};
+        auto* video=BdwExecSnapshotCreate(f,&vObj,1,0,0,8);auto* render=BdwExecSnapshotCreate(f,&rObj,1,0,0,8);
+        auto* dependent=BdwExecSnapshotCreate(f,&vObj,1,0,0,8);
+        uint64_t v2bytes=0;const uint32_t v2buf=BdwGpuFileCreateBuffer(f,4096,v2bytes);assert(v2buf);
+        BdwExecObjectInput v2Obj{v2buf,0x30000,4096,16};auto* video2=BdwExecSnapshotCreate(f,&v2Obj,1,0,0,8);
+        assert(video && render && dependent && video2);
+        assert(BdwExecSnapshotBindContext(video,vCtx) && BdwExecSnapshotBindContext(render,rCtx) &&
+               BdwExecSnapshotBindContext(dependent,dCtx) && BdwExecSnapshotBindContext(video2,v2Ctx));
+        BdwExecSnapshotSetOrigin(video,1,0,80);BdwExecSnapshotSetOrigin(render,2,0,81);
+        BdwExecSnapshotSetOrigin(dependent,3,0,82);BdwExecSnapshotSetOrigin(video2,4,0,83);
+        assert(BdwExecSnapshotSetEngine(video,BdwExecEngineVideo) && BdwExecSnapshotSetEngine(video2,BdwExecEngineVideo));
+        BdwExecQueue queue;uint64_t vid=0,rid=0,did=0,v2id=0,id=0;BdwExecSnapshot* item=nullptr;BdwExecRequestState state{};
+        assert(queue.Enqueue(1,video,vid) && queue.Enqueue(1,dependent,did) && queue.Enqueue(1,video2,v2id) && queue.Enqueue(1,render,rid));
+        assert(queue.StartNext(id,item) && id==vid && !queue.Park(rid) && queue.Park(vid) && queue.Parked()==vid && !queue.Park(vid));
+        assert(queue.ActiveSnapshot(vid)==video);
+        // dependent shares the parked job's buffer; video2 is a second video job.
+        assert(queue.StartNext(id,item) && id==rid && item==render);
+        assert(!queue.Reap(1,vid,state)); // a parked request is still active
+        assert(queue.Finish(rid,true,true));
+        assert(!queue.StartNext(id,item));
+        assert(queue.Finish(vid,true,true) && !queue.Parked());
+        const uint64_t order[]={did,v2id};
+        for(auto expected:order){assert(queue.StartNext(id,item) && id==expected && queue.Finish(id,true,true));}
+        for(auto r:{vid,rid,did,v2id}){auto* retired=queue.Reap(1,r,state);assert(retired && BdwExecSnapshotRelease(retired,false));}
+        BdwGpuContextUnref(vCtx);BdwGpuContextUnref(rCtx);BdwGpuContextUnref(dCtx);BdwGpuContextUnref(v2Ctx);
+        BdwGpuFileUnref(thirdFile);BdwGpuFileUnref(fourthFile);assert(BdwGpuFileCloseBuffer(f,v2buf));
+    }
+    {   // VA-API phase 4: the worker parks a VCS job, runs independent work
+        // meanwhile, and finishes the parked job once pollParked reports it.
+        struct ParkHost {
+            BdwExecSnapshot* video=nullptr;unsigned polls=0,doneAt=3,executed=0;
+            static bool Launch(void*,void (*)(void*),void*,uint32_t){return true;}
+            static void Sleep(void*){}
+            static BdwSubmissionOutcome Execute(void* c,BdwExecSnapshot* s){auto& h=*static_cast<ParkHost*>(c);++h.executed;
+                return s==h.video?BdwSubmissionOutcome{false,true,false,true}:BdwSubmissionOutcome{true,true};}
+            static void Recover(void*){assert(false);}
+            static bool Poll(void* c,BdwExecSnapshot* s,BdwSubmissionOutcome& out){auto& h=*static_cast<ParkHost*>(c);
+                assert(s==h.video);if(++h.polls<h.doneAt)return false;out={true,true};return true;}
+        } park;
+        BdwSubmissionWorker::Hooks hooks{&park,ParkHost::Launch,ParkHost::Sleep,ParkHost::Execute,ParkHost::Recover};
+        hooks.pollParked=ParkHost::Poll;
+        BdwSubmissionWorker worker;assert(worker.Start(hooks,0));
+        auto* thirdFile=BdwGpuFileCreate();assert(thirdFile);
+        auto* vCtx=BdwGpuFileGetDefaultContext(f);auto* rCtx=BdwGpuFileGetDefaultContext(thirdFile);assert(vCtx && rCtx);
+        BdwExecObjectInput vObj{replacement,0x10000,4096,16},rObj{next,0x20000,4096,16};
+        auto* video=BdwExecSnapshotCreate(f,&vObj,1,0,0,8);auto* render=BdwExecSnapshotCreate(f,&rObj,1,0,0,8);
+        assert(video && render && BdwExecSnapshotBindContext(video,vCtx) && BdwExecSnapshotBindContext(render,rCtx));
+        BdwExecSnapshotSetOrigin(video,1,0,90);BdwExecSnapshotSetOrigin(render,2,0,91);
+        assert(BdwExecSnapshotSetEngine(video,BdwExecEngineVideo));park.video=video;
+        assert(!worker.Submit(video) && !worker.Submit(render));
+        assert(worker.Step()==BdwSubmissionStep::Finished && worker.HasParked() && park.executed==1);
+        assert(worker.Step()==BdwSubmissionStep::Finished && worker.HasParked() && park.executed==2 && park.polls==1);
+        assert(worker.Step()==BdwSubmissionStep::Idle && worker.HasParked() && park.polls==2);
+        assert(worker.Step()==BdwSubmissionStep::Finished && !worker.HasParked() && park.polls==3);
+        uint64_t parked=0,overlapped=0;worker.ParkedCounts(parked,overlapped);assert(parked==1 && overlapped==1);
+        assert(worker.Step()==BdwSubmissionStep::Idle);
+        BdwGpuContextUnref(vCtx);BdwGpuContextUnref(rCtx);BdwGpuFileUnref(thirdFile);
+    }
     {
         // gen 375: a job skipped because a wait dependency failed (a client's
         // failed frame) must fail its own fences without poisoning its

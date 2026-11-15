@@ -442,7 +442,12 @@ void BdwVideoUserCountsRead(BdwVcsUserCounts& out){
     {const auto& c=vcsUserCounts;out.timed=c.timed;out.prepUs=c.prepUs;out.runUs=c.runUs;out.releaseUs=c.releaseUs;
      out.resetBeforeUs=c.resetBeforeUs;out.patUs=c.patUs;out.initUs=c.initUs;out.decodeUs=c.decodeUs;out.csbUs=c.csbUs;
      out.tailUs=c.tailUs;out.maxRunUs=c.maxRunUs;out.skippedResetsBefore=c.skippedResetsBefore;
-     out.skippedResetsAfter=c.skippedResetsAfter;out.firstJobNs=c.firstJobNs;out.lastJobNs=c.lastJobNs;}
+     out.skippedResetsAfter=c.skippedResetsAfter;out.firstJobNs=c.firstJobNs;out.lastJobNs=c.lastJobNs;
+     out.laneJobs=c.laneJobs;out.laneLatencyUs=c.laneLatencyUs;out.laneCompleteRetries=c.laneCompleteRetries;
+     out.laneCrumbUs=c.laneCrumbUs;out.laneRetireUs=c.laneRetireUs;out.lanePolls=c.lanePolls;}
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
+    BdwApplicationWorkerParkedCounts(out.parked,out.overlapped);
+#endif
     out.quarantined=__atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE)!=0;out.detail=vcsUserQuarantineDetail;
 }
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
@@ -470,12 +475,13 @@ struct VideoWorkerStep {
 } videoStep [[maybe_unused]];
 [[maybe_unused]] uint64_t videoStepServiced=0,videoStepLeaseBusy=0,videoStepTimeouts=0;
 }
-bool BdwVideoWorkerPending(){return videoStep.slot.pending();}
+// A diagnostic VCS step waits while the phase 4 lane has a job in flight.
+bool BdwVideoWorkerPending(){return videoStep.slot.pending() && !BdwVcsLaneBusy();}
 void BdwVideoWorkerCounts(uint64_t& serviced,uint64_t& leaseBusy,uint64_t& timeouts){
     serviced=videoStepServiced;leaseBusy=videoStepLeaseBusy;timeouts=videoStepTimeouts;}
 bool BdwVideoWorkerService(){
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
-    if(!videoStep.slot.claim())return false;
+    if(BdwVcsLaneBusy() || !videoStep.slot.claim())return false;
     DiagnosticLease lease;
     if(!lease.held){++videoStepLeaseBusy;videoStep.slot.requeue();return false;}
     const auto& tsc=NativeTscObserveRead();
@@ -736,6 +742,86 @@ BdwVcsUserRunView VcsUserView(const BdwForcewakeAdapterResult& out,const BdwBcsR
     return v;
 }
 }
+namespace {
+BdwSubmissionOutcome VcsUserRefuse(BdwExecSnapshot* snapshot,const char* reason){
+    uint32_t pid=0,ctx=0;BdwExecSnapshotOrigin(snapshot,pid,ctx);
+    const uint64_t n=__atomic_add_fetch(&vcsUserCounts.refused,1,__ATOMIC_RELAXED);
+    if(n<=16 || !(n&(n-1)))KPrintf("gpu-exec: vcs job refused pid=%u context=%u objects=%u pages=%u reason=%s count=%lu\n",
+        pid,ctx,BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),reason?reason:"?",n);
+    return {false,true,true};
+}
+// The phase 4 lane's one in-flight job (CPU0 worker only).
+struct VcsLaneJob {BdwExecSnapshot* snapshot=nullptr;uint32_t pid=0,ctx=0;uint64_t startNs=0,preparedNs=0,submittedNs=0,deadlineNs=0;
+    BdwGgttReservation reservation{};BdwOwnedPage scratch{};uint64_t submitRunUs=0,crumbNs=0;uint32_t polls=0;};
+VcsLaneJob vcsLane{};
+// The common end of a VCS user job (synchronous run or lane completion).
+// blockedUs: time the worker spent in VCS critical sections for this job.
+BdwSubmissionOutcome ConcludeVcsUserJob(BdwExecSnapshot* snapshot,BdwVcsUserClass result,const BdwForcewakeAdapterResult& out,
+        const BdwBcsRunResult& run,uint32_t pid,uint32_t ctx,uint64_t startNs,uint64_t preparedNs,uint64_t ranNs,
+        uint64_t blockedUs,uint64_t khz,bool lane){
+    struct {uint64_t khz;} tsc{khz};
+    const uint64_t us=(ranNs-startNs)/1000;
+    __atomic_store_n(&vcsUserCounts.lastUs,us,__ATOMIC_RELAXED);
+    if(us>__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED))__atomic_store_n(&vcsUserCounts.maxUs,us,__ATOMIC_RELAXED);
+    switch(result){
+    case BdwVcsUserClass::Uncertain:
+        KernelPanic("Broadwell video (VCS) user job uncertain: pid=%u context=%u batch=%lx reset=%u/%u/%u pat=%u/%u retired=%u ggtt=%u elsp=%u wake=%u/%u head=%x tail=%x acthd=%x ipehr=%x",
+            pid,ctx,BdwExecSnapshotBatchAddress(snapshot),unsigned(run.resetBefore),unsigned(run.resetAfter),unsigned(run.resetUncertain),
+            unsigned(run.patEstablished),unsigned(run.patRestored),unsigned(run.scanoutRetired),run.ggttWriteAttempts,run.portWriteAttempts,
+            unsigned(out.clearDelivered),unsigned(out.sequence.released),run.head,run.tail,run.acthd,run.ipehr);
+    case BdwVcsUserClass::RefusedUntouched:
+        // Never submitted: the armed snapshot retires through the queue as
+        // skipped (fence error, buffers not poisoned).
+        if(!BdwReleaseVcsUserJob(snapshot,true)){VcsUserQuarantine("release-after-refusal");return {false,true};}
+        return VcsUserRefuse(snapshot,!out.sequence.workAttempted?VideoAdapterDetail(out):VideoStepDetail(run.refusalStep));
+    case BdwVcsUserClass::StoppedRetained:
+        // VCS was reset, but the GGTT lease could not be unbound: keep the
+        // image and tables for the boot (unreachable by the reset engine).
+        __atomic_add_fetch(&vcsUserCounts.failed,1,__ATOMIC_RELAXED);
+        KPrintf("gpu-exec: vcs job failed pid=%u context=%u reason=lease-not-retired; pages retained\n",pid,ctx);
+        VcsUserQuarantine("lease-not-retired");
+        return {false,true};
+    case BdwVcsUserClass::FailedStopped:{
+        __atomic_add_fetch(&vcsUserCounts.failed,1,__ATOMIC_RELAXED);
+        const char* detail=!run.attempted?"table-admission":!run.copyComplete?(run.portWriteAttempts<4?"execlist-init-or-elsp":"breadcrumb-timeout"):
+            !run.contextComplete?"csb-context-complete":"work-incomplete";
+        const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
+        KPrintf("gpu-exec: vcs job failed pid=%u context=%u reason=%s batch=%lx objects=%u pages=%u ggtt=%u elsp=%u head=%x tail=%x acthd=%x ipehr=%x execlist=%x words=%x,%x,%x,%x us=%lu\n",
+            pid,ctx,detail,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
+            run.ggttWriteAttempts,run.portWriteAttempts,run.head,run.tail,run.acthd,run.ipehr,run.execlist,
+            current.words[0],current.words[1],current.words[2],current.words[3],us);
+        const bool released=BdwReleaseVcsUserJob(snapshot,true);
+        VcsUserQuarantine(released?detail:"release-after-failure");
+        return {false,true};
+    }
+    case BdwVcsUserClass::Completed:
+        break;
+    }
+    if(!BdwReleaseVcsUserJob(snapshot,true)){
+        // The job completed and VCS was reset; only our bookkeeping failed.
+        VcsUserQuarantine("release-after-completion");
+    }
+    __atomic_add_fetch(&vcsUserCounts.completed,1,__ATOMIC_RELAXED);
+    {   // Phase 4 timing of this completed job (single CPU0 writer).
+        const uint64_t doneNs=TscClockReadNs();
+        auto d=[&](unsigned a,unsigned b)->uint64_t{const uint64_t x=run.stamps[a],y=run.stamps[b];
+            return x && y>x?(y-x)*1000/tsc.khz:0;};
+        auto& c=vcsUserCounts;
+        const uint64_t runUs=blockedUs;
+        ++c.timed;c.prepUs+=(preparedNs-startNs)/1000;c.runUs+=runUs;c.releaseUs+=(doneNs-ranNs)/1000;
+        if(runUs>c.maxRunUs)c.maxRunUs=runUs;
+        c.resetBeforeUs+=d(BdwVcsStampWorkStart,BdwVcsStampResetBefore);c.patUs+=d(BdwVcsStampResetBefore,BdwVcsStampPat);
+        c.initUs+=d(BdwVcsStampInitStart,BdwVcsStampInitEnd);c.decodeUs+=d(BdwVcsStampWaitStart,BdwVcsStampBreadcrumb);
+        c.csbUs+=d(BdwVcsStampBreadcrumb,BdwVcsStampCsb);c.tailUs+=d(BdwVcsStampCsb,BdwVcsStampWorkEnd);
+        if(lane){++c.laneJobs;c.laneLatencyUs+=(ranNs-preparedNs)/1000;}
+        if(!run.resetBeforeAttempted)++c.skippedResetsBefore;
+        if(run.resetAfterSkipped)++c.skippedResetsAfter;
+        if(!c.firstJobNs)c.firstJobNs=startNs;
+        c.lastJobNs=doneNs;
+    }
+    return {true,true};
+}
+}
 static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
     __atomic_add_fetch(&vcsUserCounts.jobs,1,__ATOMIC_RELAXED);
     uint32_t pid=0,ctx=0;BdwExecSnapshotOrigin(snapshot,pid,ctx);
@@ -777,75 +863,53 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
     const uint64_t preparedNs=TscClockReadNs();
     BdwForcewakeAdapterResult out{};BdwBcsRunResult run{};
     BdwVcsUserClass result=BdwVcsUserClass::RefusedUntouched;
+    // Phase 4 lane (tuning bit 2, default off): submit and park the job.
+    const bool async=(BdwVideoUserTuning()&BdwVcsTuneAsync)!=0;
     unsigned attempt=0;
     for(;;){
         ++attempt;
-        VmmDellVcsUserRun(tsc.khz,reservation.first,reservation.token,scratch.dma,out,run);
+        if(async)VmmDellVcsUserLane(tsc.khz,1,reservation.first,reservation.token,scratch.dma,out,run);
+        else VmmDellVcsUserRun(tsc.khz,reservation.first,reservation.token,scratch.dma,out,run);
+        if(async && run.laneSubmitted)break;
         result=BdwClassifyVcsUserRun(VcsUserView(out,run));
         if(result!=BdwVcsUserClass::RefusedUntouched || attempt>=20)break;
         SchedulerSleepMs(1);
     }
     if(attempt>1)__atomic_add_fetch(&vcsUserCounts.retries,attempt-1,__ATOMIC_RELAXED);
     const uint64_t ranNs=TscClockReadNs();
-    const uint64_t us=(ranNs-startNs)/1000;
-    __atomic_store_n(&vcsUserCounts.lastUs,us,__ATOMIC_RELAXED);
-    if(us>__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED))__atomic_store_n(&vcsUserCounts.maxUs,us,__ATOMIC_RELAXED);
-    switch(result){
-    case BdwVcsUserClass::Uncertain:
-        KernelPanic("Broadwell video (VCS) user job uncertain: pid=%u context=%u batch=%lx reset=%u/%u/%u pat=%u/%u retired=%u ggtt=%u elsp=%u wake=%u/%u head=%x tail=%x acthd=%x ipehr=%x",
-            pid,ctx,BdwExecSnapshotBatchAddress(snapshot),unsigned(run.resetBefore),unsigned(run.resetAfter),unsigned(run.resetUncertain),
-            unsigned(run.patEstablished),unsigned(run.patRestored),unsigned(run.scanoutRetired),run.ggttWriteAttempts,run.portWriteAttempts,
-            unsigned(out.clearDelivered),unsigned(out.sequence.released),run.head,run.tail,run.acthd,run.ipehr);
-    case BdwVcsUserClass::RefusedUntouched:
-        // Never submitted: the armed snapshot retires through the queue as
-        // skipped (fence error, buffers not poisoned).
-        if(!BdwReleaseVcsUserJob(snapshot,true)){VcsUserQuarantine("release-after-refusal");return {false,true};}
-        return refuse(!out.sequence.workAttempted?VideoAdapterDetail(out):VideoStepDetail(run.refusalStep));
-    case BdwVcsUserClass::StoppedRetained:
-        // VCS was reset, but the GGTT lease could not be unbound: keep the
-        // image and tables for the boot (unreachable by the reset engine).
-        __atomic_add_fetch(&vcsUserCounts.failed,1,__ATOMIC_RELAXED);
-        KPrintf("gpu-exec: vcs job failed pid=%u context=%u reason=lease-not-retired; pages retained\n",pid,ctx);
-        VcsUserQuarantine("lease-not-retired");
-        return {false,true};
-    case BdwVcsUserClass::FailedStopped:{
-        __atomic_add_fetch(&vcsUserCounts.failed,1,__ATOMIC_RELAXED);
-        const char* detail=!run.attempted?"table-admission":!run.copyComplete?(run.portWriteAttempts<4?"execlist-init-or-elsp":"breadcrumb-timeout"):
-            !run.contextComplete?"csb-context-complete":"work-incomplete";
-        const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
-        KPrintf("gpu-exec: vcs job failed pid=%u context=%u reason=%s batch=%lx objects=%u pages=%u ggtt=%u elsp=%u head=%x tail=%x acthd=%x ipehr=%x execlist=%x words=%x,%x,%x,%x us=%lu\n",
-            pid,ctx,detail,BdwExecSnapshotBatchAddress(snapshot),BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
-            run.ggttWriteAttempts,run.portWriteAttempts,run.head,run.tail,run.acthd,run.ipehr,run.execlist,
-            current.words[0],current.words[1],current.words[2],current.words[3],us);
-        const bool released=BdwReleaseVcsUserJob(snapshot,true);
-        VcsUserQuarantine(released?detail:"release-after-failure");
-        return {false,true};
+    if(async && run.laneSubmitted){
+        vcsLane={snapshot,pid,ctx,startNs,preparedNs,ranNs,ranNs+2000000000ull,reservation,scratch,(ranNs-preparedNs)/1000};
+        return {false,true,false,true};
     }
-    case BdwVcsUserClass::Completed:
-        break;
-    }
-    if(!BdwReleaseVcsUserJob(snapshot,true)){
-        // The job completed and VCS was reset; only our bookkeeping failed.
-        VcsUserQuarantine("release-after-completion");
-    }
-    __atomic_add_fetch(&vcsUserCounts.completed,1,__ATOMIC_RELAXED);
-    {   // Phase 4 timing of this completed job (single CPU0 writer).
-        const uint64_t doneNs=TscClockReadNs();
-        auto d=[&](unsigned a,unsigned b)->uint64_t{const uint64_t x=run.stamps[a],y=run.stamps[b];
-            return x && y>x?(y-x)*1000/tsc.khz:0;};
-        auto& c=vcsUserCounts;
-        const uint64_t runUs=(ranNs-preparedNs)/1000;
-        ++c.timed;c.prepUs+=(preparedNs-startNs)/1000;c.runUs+=runUs;c.releaseUs+=(doneNs-ranNs)/1000;
-        if(runUs>c.maxRunUs)c.maxRunUs=runUs;
-        c.resetBeforeUs+=d(BdwVcsStampWorkStart,BdwVcsStampResetBefore);c.patUs+=d(BdwVcsStampResetBefore,BdwVcsStampPat);
-        c.initUs+=d(BdwVcsStampInitStart,BdwVcsStampInitEnd);c.decodeUs+=d(BdwVcsStampWaitStart,BdwVcsStampBreadcrumb);
-        c.csbUs+=d(BdwVcsStampBreadcrumb,BdwVcsStampCsb);c.tailUs+=d(BdwVcsStampCsb,BdwVcsStampWorkEnd);
-        if(!run.resetBeforeAttempted)++c.skippedResetsBefore;
-        if(run.resetAfterSkipped)++c.skippedResetsAfter;
-        if(!c.firstJobNs)c.firstJobNs=startNs;
-        c.lastJobNs=doneNs;
-    }
-    return {true,true};
+    return ConcludeVcsUserJob(snapshot,result,out,run,pid,ctx,startNs,preparedNs,ranNs,(ranNs-preparedNs)/1000,tsc.khz,false);
+}
+// Phase 4 lane, worker thread: retire the parked job once its breadcrumb is
+// visible in RAM (or its 2 s deadline passed: then the complete phase finds
+// no breadcrumb, resets VCS and the job fails, quarantining VCS). False while
+// it is still in flight or the device is busy; the worker polls again.
+bool BdwVcsLanePoll(BdwExecSnapshot* snapshot,BdwSubmissionOutcome& o){
+    if(!vcsLane.snapshot || snapshot!=vcsLane.snapshot){o={false,false};return true;}
+    const uint64_t now=TscClockReadNs();
+    ++vcsLane.polls;
+    const bool crumb=vcsLane.crumbNs || BdwVcsUserLaneBreadcrumb();
+    if(crumb && !vcsLane.crumbNs)vcsLane.crumbNs=now;
+    if(!crumb && now<vcsLane.deadlineNs)return false;
+    RetryLease lease(&diagnosticOwner,1);if(!lease.held)return false;
+    const auto& tsc=NativeTscObserveRead();
+    if(!tsc.khz)return false;
+    BdwForcewakeAdapterResult out{};BdwBcsRunResult run{};
+    const uint64_t t0=TscClockReadNs();
+    VmmDellVcsUserLane(tsc.khz,2,vcsLane.reservation.first,vcsLane.reservation.token,vcsLane.scratch.dma,out,run);
+    const auto result=BdwClassifyVcsUserRun(VcsUserView(out,run));
+    if(result==BdwVcsUserClass::RefusedUntouched){++vcsUserCounts.laneCompleteRetries;return false;}
+    const uint64_t t1=TscClockReadNs();
+    const auto lane=vcsLane;vcsLane={};
+    if(lane.crumbNs>lane.submittedNs){vcsUserCounts.laneCrumbUs+=(lane.crumbNs-lane.submittedNs)/1000;
+        vcsUserCounts.laneRetireUs+=(t1-lane.crumbNs)/1000;}
+    vcsUserCounts.lanePolls+=lane.polls;
+    o=ConcludeVcsUserJob(snapshot,result,out,run,lane.pid,lane.ctx,lane.startNs,lane.preparedNs,t1,
+                         lane.submitRunUs+(t1-t0)/1000,tsc.khz,true);
+    return true;
 }
 #endif
 // VCS power-management experiments and residency sampling (gen 391 clock sag).

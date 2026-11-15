@@ -39,6 +39,7 @@
 #include "scheduler.h"
 #include "smp.h"
 
+inline void* operator new(__SIZE_TYPE__,void* storage) noexcept{return storage;}
 namespace brook {
 // Last VCS operation's GT PM before/after record (written only under the
 // forcewake claim; read by the debug command after the operation returns).
@@ -69,6 +70,10 @@ static uint32_t vcsEngineRestores=0,vcsEngineRestoreFailures=0;
 // Phase 4: the last VCS user job ended with VCS verifiably stopped and its
 // lease retired. Any other VCS operation clears it (the next job resets).
 static bool vcsCleanStop=false;
+// Phase 4 lane: the PAT values the submit phase left active (held) and the
+// inherited values to restore, plus the reservation the job is bound in.
+struct VcsLaneHeld {uint32_t inheritedLo,inheritedHi,lo,hi;uint32_t scratchIndex;uint64_t token,scratchDma;};
+[[maybe_unused]] static VcsLaneHeld laneHeld{};
 template<class Rw> static bool BdwVcsRestoreFirmwareEngine(Rw& io){
     const auto& first=vcsPmRecord.first;
     if(!first.valid)return false;
@@ -292,7 +297,7 @@ bool VmmDellForcewakeAckCriticalRead(uint32_t& result) {
 // bounded observation; an uncertain release permanently blocks further use.
 // The page-table lock prevents mapping changes throughout each operation.
 static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult& result,bool otherEngines,bool patRequested,bool tlbRequested,bool resetRequested,bool scopeCheck,
-                                        uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false,BdwRcsResetTestResult* vcsReset=nullptr,bool vcsSelftest=false,uint8_t vcsPmOp=0,BdwRcsResetTestResult* vcsPmResult=nullptr,bool vcsUser=false) {
+                                        uint32_t scratchIndex,uint64_t scratchDma,BdwScratchTakeoverResult* scratchResult,uint8_t* scratchCpu,BdwBcsInitResult* initResult,bool clearScratch,BdwPatTestResult* patResult,uint64_t copyToken,BdwBcsRunResult* copyResult,BdwRcsResetTestResult* rcsReset=nullptr,BdwRenderGtInitResult* gtInit=nullptr,BdwRenderRunResult* renderResult=nullptr,uint32_t (*snapshot)[20*1024]=nullptr,bool scanoutCopy=false,BdwRcsResetTestResult* vcsReset=nullptr,bool vcsSelftest=false,uint8_t vcsPmOp=0,BdwRcsResetTestResult* vcsPmResult=nullptr,bool vcsUser=false,uint8_t vcsUserPhase=0) {
     // VCS0 copy-flow users: the phase 1b self-test and phase 1c user jobs.
     const bool vcsCopy=vcsSelftest || vcsUser;
     static BdwForcewakeClaim claim;result={};
@@ -574,7 +579,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool preparePrivatePat(uint64_t descriptor){return gpuPatLease() && (descriptor&0x119)==0x119;}
                 bool readPrivatePat(uint32_t& l,uint32_t& h){return owned() && io.read32(BdwDellBar0+0x40e0,l) && io.read32(BdwDellBar0+0x40e4,h);}
                 bool safePatTransition(uint32_t l,uint32_t h,uint32_t nl,uint32_t nh){
-                    return owned() && l==0x03030303u && h==0x03030303u &&
+                    // Inherited firmware policy, or the VCS lane base while a
+                    // lane job is in flight (VA-API phase 4).
+                    return owned() && ((l==0x03030303u && h==0x03030303u) || BdwVcsLanePatBase(l,h)) &&
                         nl==(result.uncachedScanout?(0x00030307u|(uint32_t(result.scanoutPat)<<24)):0x03030307u) && nh==0x0303030bu;
                 }
                 bool drainAndInvalidate(){
@@ -917,7 +924,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool preparePrivatePat(uint64_t descriptor){return gpuPatLease() && (descriptor&0x119)==0x119;}
                 bool readPrivatePat(uint32_t& lo,uint32_t& hi){return owned() && io.read32(BdwDellBar0+0x40e0,lo) && io.read32(BdwDellBar0+0x40e4,hi);}
                 bool safePatTransition(uint32_t lo,uint32_t hi,uint32_t nlo,uint32_t nhi){
-                    return owned() && lo==0x03030303u && hi==0x03030303u &&
+                    return owned() && ((lo==0x03030303u && hi==0x03030303u) || BdwVcsLanePatBase(lo,hi)) &&
                         nlo==(scanout?0x00030307u:0x03030307u) && nhi==0x0303030bu;
                 }
                 bool drainAndInvalidate(){
@@ -985,7 +992,99 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             owner.line=((b>>8)&255)*8;
             if(!(d&(1u<<19)) || owner.line<16 || owner.line>4096 || (owner.line&(owner.line-1)) ||
                4096%owner.line || !held.tsc(owner.origin)){copyResult->refusalStep=4;return false;}
-            if(vcsCopy)BdwVcsPmBegin(held);
+#if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
+            // ---- VA-API phase 4: the VCS lane (async user jobs) ----
+            // One persistent backend gives the one-shot and its GGTT bind a
+            // stable owner identity across the submit and complete critical
+            // sections; LaneOwner forwards to this section's CopyOwner.
+            struct LaneOwner {
+                CopyOwner* o=nullptr;
+                bool owned(){return o && o->owned();}
+                bool gpuPatLease(){return o && o->gpuPatLease();}
+                bool preparePrivatePat(uint64_t d){return o && o->preparePrivatePat(d);}
+                bool readPrivatePat(uint32_t& lo,uint32_t& hi){return o && o->readPrivatePat(lo,hi);}
+                bool admitPages(BdwOwnedPage* p,unsigned n){return o && o->admitPages(p,n);}
+                bool publish(BdwOwnedPage* p,unsigned n){return o && o->publish(p,n);}
+                bool validateLease(const BdwGgttLease& l){return o && o->validateLease(l);}
+                bool validateTakeover(const BdwGgttLease& l,uint64_t sc){return o && o->validateTakeover(l,sc);}
+                bool quiescent(){return o && o->quiescent();}
+                bool resetBcs(BdwBcsResetIntent intent=BdwBcsResetIntent::IdleTakeover){return o && o->resetBcs(intent);}
+                bool syncForCpu(const BdwOwnedPage& p){return o && o->syncForCpu(p);}
+                bool syncForDevice(const BdwOwnedPage& p){return o && o->syncForDevice(p);}
+                bool acknowledgeCsb(unsigned slot){return o && o->acknowledgeCsb(slot);}
+                bool completionContinue(){return o && o->completionContinue();}
+                bool retirementContinue(){return o && o->retirementContinue();}
+                bool invalidateGpuTranslations(){return o && o->invalidateGpuTranslations();}
+                void relax(){if(o)o->relax();}
+            };
+            static LaneOwner lane;
+            struct LaneScope {LaneOwner& l;LaneScope(LaneOwner& lane_,CopyOwner& owner_):l(lane_){l.o=&owner_;}~LaneScope(){l.o=nullptr;}};
+            // Rebuilt in place at every lane submit: its ELSP port accessor is
+            // single-use per submission, while the address (the identity the
+            // one-shot and GGTT bind record) stays the same for submit and
+            // complete. No static guard is available in the kernel.
+            alignas(BdwVcsDeviceBackend<LaneOwner>) static unsigned char laneStorage[sizeof(BdwVcsDeviceBackend<LaneOwner>)];
+            static bool laneBuilt=false;
+            if(vcsUser && (vcsUserPhase==1 || (vcsUserPhase==2 && !laneBuilt))){
+                new(laneStorage) BdwVcsDeviceBackend<LaneOwner>(lane,reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+0xf6880000ull),
+                    reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
+                    reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwVcsEnginePage),scratchIndex,copyToken,scratchDma);
+                laneBuilt=true;
+            }
+            auto& laneVcs=*reinterpret_cast<BdwVcsDeviceBackend<LaneOwner>*>(laneStorage);
+            struct LaneSink final:BdwVcsTableSink {
+                CopyOwner& o;explicit LaneSink(CopyOwner& owner_):o(owner_){}
+                bool admitExtraTables(BdwOwnedPage* p,unsigned count)override{
+                    if(!o.owned() || !p || !count || count>BdwPpgttMaxTables+4)return false;
+                    for(unsigned i=0;i<count;++i){const auto dma=p[i].dma;
+                        if(!dma || (dma&4095) || dma>=(uint64_t{16}<<30) || p[i].cpu!=reinterpret_cast<uint8_t*>(DIRECT_MAP_BASE+dma))return false;
+                        for(unsigned j=0;j<i;++j)if(p[j].dma==dma)return false;
+                    }
+                    return true;
+                }
+                bool publishExtraTables(BdwOwnedPage* p,unsigned count)override{
+                    if(!o.owned() || !p || !count || count>BdwPpgttMaxTables+4)return false;
+                    for(unsigned i=0;i<count;++i)if(!o.flushPage(p[i]))return false;
+                    return true;
+                }
+            };
+            if(vcsUser && vcsUserPhase==2){
+                // Complete: the lane job was submitted earlier and VCS may still
+                // be running it. No reset-before and no new PAT lease: adopt
+                // the held one, verify the breadcrumb and CSB, stop, unbind,
+                // restore the inherited PAT, then clear the lane.
+                if(!BdwVcsLaneBusy() || scratchIndex!=laneHeld.scratchIndex || copyToken!=laneHeld.token || scratchDma!=laneHeld.scratchDma){
+                    copyResult->refusalStep=7;return false;}
+                LaneScope scope(lane,owner);
+                copyResult->stamps[BdwVcsStampWorkStart]=__builtin_ia32_rdtsc();
+                copyResult->resetBeforeAttempted=false;copyResult->resetBefore=true;copyResult->attempted=true;
+                BdwPatMmio<CopyOwner> patMmio(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),false);
+                BdwPatLease pat;copyResult->patEstablished=pat.AdoptHeld(patMmio,laneHeld.inheritedLo,laneHeld.inheritedHi,laneHeld.lo,laneHeld.hi);
+                if(!copyResult->patEstablished){
+                    // The lane's PAT changed underneath it: state unknown.
+                    copyResult->patUncertain=true;copyResult->resetUncertain=true;return false;
+                }
+                owner.patActive=true;
+                const bool ran=BdwCompleteSubmittedVcsUser(laneVcs,*copyResult);
+                copyResult->ggttWriteAttempts=laneVcs.ggttWriteAttempts();copyResult->portWriteAttempts=4;
+                copyResult->engineSampled=held.read32(BdwDellBar0+BdwVcsBase+0x34,copyResult->head) &&
+                    held.read32(BdwDellBar0+BdwVcsBase+0x30,copyResult->tail) && held.read32(BdwDellBar0+BdwVcsBase+0x74,copyResult->acthd) &&
+                    held.read32(BdwDellBar0+BdwVcsBase+0x68,copyResult->ipehr) && held.read32(BdwDellBar0+BdwVcsBase+0x234,copyResult->execlist);
+                const bool cleanlyIdle=(BdwVideoUserTuning()&BdwVcsTuneMinimalResets) && ran && copyResult->contextComplete && owner.quiescent();
+                copyResult->resetAfterSkipped=cleanlyIdle;
+                copyResult->resetAfter=cleanlyIdle || owner.resetBcs(BdwBcsResetIntent::StopOwnedWork);
+                if(copyResult->resetAfter)__atomic_store_n(&BdwVcsLaneBusyStorage(),0u,__ATOMIC_RELEASE);
+                if(copyResult->resetAfter)copyResult->scanoutRetired=BdwRetirePreparedVcsUser(laneVcs);
+                if(copyResult->resetAfter)copyResult->patRestored=pat.Release(patMmio);
+                copyResult->patUncertain=!copyResult->resetAfter || !copyResult->patRestored || !copyResult->scanoutRetired;
+                copyResult->resetUncertain=owner.resetWasUncertain;
+                owner.patActive=false;
+                copyResult->stamps[BdwVcsStampWorkEnd]=__builtin_ia32_rdtsc();
+                vcsCleanStop=ran && copyResult->resetAfter && copyResult->scanoutRetired && copyResult->patRestored && !copyResult->resetUncertain;
+                return !copyResult->patUncertain && !copyResult->resetUncertain;
+            }
+#endif
+            if(vcsCopy && !(vcsUser && vcsUserPhase==1))BdwVcsPmBegin(held);
             if(vcsCopy)copyResult->stamps[BdwVcsStampWorkStart]=__builtin_ia32_rdtsc();
             // Phase 4: a user job may skip this GDRST when the previous VCS
             // user job ended in a verified clean stop and VCS is observed
@@ -999,7 +1098,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             vcsCleanStop=false;
             copyResult->resetUncertain=owner.resetWasUncertain;
             if(vcsCopy)copyResult->stamps[BdwVcsStampResetBefore]=__builtin_ia32_rdtsc();
-            if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsCopy)BdwVcsPmFinish(held,2);return false;}
+            if(!copyResult->resetBefore){copyResult->refusalStep=5;if(vcsCopy && !(vcsUser && vcsUserPhase==1))BdwVcsPmFinish(held,2);return false;}
             BdwPatMmio<CopyOwner> patMmio(owner,reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwPrivatePatPage),scanoutCopy);
             BdwPatLease pat;copyResult->patEstablished=pat.Establish(patMmio,0x119,scanoutCopy);
             if(!copyResult->patEstablished){copyResult->patUncertain=pat.State()==BdwPatLeaseState::Quarantined;return false;}
@@ -1031,6 +1130,34 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         return true;
                     }
                 } sink{owner};
+                if(vcsUser && vcsUserPhase==1){
+                    // Submit: same preparation, PAT lease and takeover as the
+                    // synchronous run, but return with the job running on VCS.
+                    // The PAT lease stays active as the lane base; the complete
+                    // phase adopts it. Any failure takes the normal stop path.
+                    LaneScope scope(lane,owner);
+                    LaneSink laneSink(owner);
+                    const bool submitted=BdwSubmitPreparedVcsUser(laneVcs,laneSink,scratchDma,*copyResult);
+                    copyResult->ggttWriteAttempts=laneVcs.ggttWriteAttempts();copyResult->portWriteAttempts=laneVcs.portWriteAttempts();
+                    copyResult->stamps[BdwVcsStampInitStart]=laneVcs.initStartTicks();copyResult->stamps[BdwVcsStampInitEnd]=laneVcs.initEndTicks();
+                    uint32_t heldLo=0,heldHi=0;
+                    if(submitted && patMmio.readPrivatePat(heldLo,heldHi) && heldLo==BdwVcsLaneBaseLo && heldHi==BdwVcsLaneBaseHi){
+                        laneHeld={pat.InheritedLo(),pat.InheritedHi(),heldLo,heldHi,scratchIndex,copyToken,scratchDma};
+                        __atomic_store_n(&BdwVcsLaneBusyStorage(),1u,__ATOMIC_RELEASE);
+                        copyResult->laneSubmitted=true;owner.patActive=false;
+                        copyResult->stamps[BdwVcsStampWorkEnd]=__builtin_ia32_rdtsc();
+                        return true;
+                    }
+                    // Not submitted (or an unexpected PAT base): stop and unbind.
+                    copyResult->resetAfter=owner.resetBcs(BdwBcsResetIntent::StopOwnedWork);
+                    if(copyResult->resetAfter)copyResult->scanoutRetired=BdwRetirePreparedVcsUser(laneVcs);
+                    if(copyResult->resetAfter)copyResult->patRestored=pat.Release(patMmio);
+                    copyResult->patUncertain=!copyResult->resetAfter || !copyResult->patRestored || !copyResult->scanoutRetired;
+                    copyResult->resetUncertain=owner.resetWasUncertain;
+                    owner.patActive=false;
+                    copyResult->stamps[BdwVcsStampWorkEnd]=__builtin_ia32_rdtsc();
+                    return !copyResult->patUncertain && !copyResult->resetUncertain;
+                }
                 const bool ran=vcsUser?BdwRunPreparedVcsUser(vcs,sink,scratchDma,*copyResult):
                     BdwRunPreparedVcsSelftest(vcs,scratchDma,*copyResult);
                 copyResult->ggttWriteAttempts=vcs.ggttWriteAttempts();copyResult->portWriteAttempts=vcs.portWriteAttempts();
@@ -1297,6 +1424,13 @@ void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scra
         nullptr,nullptr,nullptr,nullptr,false,nullptr,true);
 }
 // VCS0 user job (VA-API phase 1c), prepared by BdwPrepareVcsUserJob.
+// Phase 4 VCS lane: phase 1 submits and leaves the job running, phase 2
+// completes it (breadcrumb, CSB, stop, unbind, PAT restore).
+void VmmDellVcsUserLane(uint32_t khz,uint8_t phase,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run) {
+    run={};if(phase!=1 && phase!=2){result={};return;}
+    VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,false,nullptr,token,&run,
+        nullptr,nullptr,nullptr,nullptr,false,nullptr,false,0,nullptr,true,phase);
+}
 void VmmDellVcsUserRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run) {
     run={};VmmDellForcewakeCriticalImpl(khz,result,true,true,false,false,false,index,scratch,nullptr,nullptr,nullptr,false,nullptr,token,&run,
         nullptr,nullptr,nullptr,nullptr,false,nullptr,false,0,nullptr,true);
