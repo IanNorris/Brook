@@ -308,6 +308,7 @@ add_executable(kernel
     src/syscall_path.cpp
     src/syscall_file_ops.cpp
     src/syscall_mount.cpp
+    src/syscall_ioctl.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp

@@ -19,7 +19,7 @@ void NetlinkUnref(NetlinkSocket* s) {
 uint32_t NetlinkReady(NetlinkSocket* s,uint32_t events) {
     SpinLockAcquire(&s->lock);const uint32_t ready=(events&4)|((s->head && (events&1))?1u:0u);SpinLockRelease(&s->lock);return ready;
 }
-static uint32_t NetlinkAvailable(NetlinkSocket* s) {
+uint32_t NetlinkAvailable(NetlinkSocket* s) {
     SpinLockAcquire(&s->lock);uint32_t n=s->head?s->head->length:0;SpinLockRelease(&s->lock);return n;
 }
 static int NetlinkBind(NetlinkSocket* s,uint32_t requested,bool automatic=false) {
@@ -113,7 +113,7 @@ int64_t NetlinkReadUser(NetlinkSocket* s,uint64_t address,uint64_t length,uint64
     if(source){if(int e=NetlinkCopyName(0,source,sourceLength))return e;}
     return (flags&0x20)?size:n;
 }
-static int NetlinkInterfaceIoctl(uint64_t command,uint64_t address) {
+int NetlinkInterfaceIoctl(uint64_t command,uint64_t address) {
     KernelOperationGuard operation(ProcessCurrent());
     // Native x86-64 struct ifreq: 16-byte name + 24-byte union.
     uint8_t request[40]{};if(!CopyFromUser(request,address,sizeof(request)))return -EFAULT;

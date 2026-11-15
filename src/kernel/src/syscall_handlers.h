@@ -264,4 +264,8 @@ int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
                     uint64_t,uint64_t,uint64_t);
 int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_t,uint64_t,uint64_t);
 
+// syscall_ioctl.cpp
+int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
+                   uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
