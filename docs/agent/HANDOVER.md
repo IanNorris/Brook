@@ -92,8 +92,24 @@ _Last updated: 15 November 2026 (midday), by a Claude Code session._
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, midday (gens 407–408, autonomous):**
+- **Main is `255d4b15`.** It adds `work/multilayer-main` (opaque regions clamped to the surface, per-window region state, the SSD override opt-in via `BROOK_WAYLAND_SSD_APPS`) and `work/integration10-lane`: the VA-API 4 asynchronous VCS lane (`gpu video tune async on|off`, **default off**), lane latency counters and `gpu video tune spin on|off`. With async off, the only paths that change are refactored, not altered: the sync VCS job is split into submit/conclude, and the worker's parked-job checks are no-ops. Release build plus 356/356 host tests pass (`test_audio_delivery` rerun alone).
+- **Dell: gen 408** `pair-int10-lane2` (= main code), video gate off, session in the shared session file.
+- **Lane results** (details in `docs/bdw-video-engine.md`):
+  - ffmpeg decode with async on is bit-exact, 300/300 at 720p and 1080p, with 0 lane failures. Worker blocked per job: 555 µs, against 1.9 ms (720p) and 3.8 ms (1080p) with sync.
+  - Chromium 1080p, per 20 s: async drops 40–47 frames, sync 76–77, software 7. Async uses 4–5 points less CPU than software.
+  - Async still drops because the breadcrumb is first seen ~8.7 ms after submit, though decode takes ~3.3 ms: the worker only polls between jobs.
+  - The `--hang` probe with async on quarantines VCS at 2 s, and the desktop never stalls.
+- **Decision:** async stays off by default and software decode stays the browser default. A lane is only useful once completion is polled inside the render engine's wait.
+- **Panic (gen 408, seq 41)** during a 1080p async + `spin on` run: a Chromium render job (pid 542, 7314 pages) was submitted but never started (no CSB, `head=0`), the PAT restore did not complete, and the guard recovered. It is unknown whether a lane job was in flight. The previous boot ran 6754 lane jobs (3371 overlapping render work) with spin off, cleanly. Decoded record: `browser-vaapi/build/hardware/vcs-lane-int10c/`.
+- **Next for VA-API:**
+  1. Separate async-only and sync-only Chromium soaks.
+  2. Log the lane state in the worker panic message.
+  3. Poll the lane breadcrumb inside the render completion wait.
+  4. Then Firefox VA-API, VP9 0.16× and the YouTube H.264 preference.
+
 **15 Nov, morning (gen 403, autonomous):**
-- **Main is `aac1d429`** = everything through `work/multilayer-int9`: multilayer v3 + the gen 402 freeze fix (offers superseded by CPU snapshots are retired; frame callbacks are released ≤100 ms after queueing whatever the offer state), touchpad, popup fix, worker recovery/containment, proc-cleanup, the Chrome warning policy and VA-API 4 tuning. Release build plus 355/356 host tests pass.
+- **Main was `aac1d429`** = everything through `work/multilayer-int9`: multilayer v3 + the gen 402 freeze fix (offers superseded by CPU snapshots are retired; frame callbacks are released ≤100 ms after queueing whatever the offer state), touchpad, popup fix, worker recovery/containment, proc-cleanup, the Chrome warning policy and VA-API 4 tuning. Release build plus 355/356 host tests pass.
 - **Dell: gen 403** `dell-multilayer-int9-20261115`.
   - Before this deploy it was unreachable after the usage-limit pause, with no new panic record (seq 40 is old); AC-cycled.
   - A private-profile Chrome probe showed offers 416/416 presented and no layered waits, but stalled on the YouTube consent page, so ad overlays are untested.
