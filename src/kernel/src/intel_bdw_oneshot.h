@@ -52,12 +52,13 @@ struct BdwBcsRunResult {
     // BdwVcsStamp. Zero means the step did not run.
     uint64_t stamps[10]={};
     bool resetAfterSkipped=false; // phase 4: CSB context-complete + quiescent accepted as the stop
+    bool laneSubmitted=false;     // phase 4 VCS lane: the job is running on VCS, lane busy
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     uint64_t runTicks=0; // diagnostic TSC interval of the prepared blit run
 #endif
 };
 // Caller must serialize all operations; intermediate states reject reentrant callbacks.
-enum class BdwOneShotState : uint8_t {Fresh,Preparing,Prepared,Executing,CompleteRetained,Polling,ContextCompleteRetained,Quarantined,StoppedRetained,Released};
+enum class BdwOneShotState : uint8_t {Fresh,Preparing,Prepared,Executing,CompleteRetained,Polling,ContextCompleteRetained,Quarantined,StoppedRetained,Released,Submitted};
 enum class BdwCsbPoll : uint8_t {Pending,Complete,Fault};
 constexpr uint64_t BdwBcsSourceAddress=0x02000000, BdwBcsScanoutAddress=0x04000000;
 constexpr uint32_t BdwBcsOperandPages=8192; // one 32 MiB virtual interval per operand
@@ -274,7 +275,7 @@ public:
     // publication and binding. HWS may be consumed even if its write reports
     // failure, so retain all pages from the first attempted engine write on.
 private:
-    template<class Allocator,class Io,class Binder,class EngineStart> bool ExecuteImpl(Allocator& allocator,Io& io,bool takeover,Binder bind,EngineStart start) {
+    template<class Allocator,class Io,class Binder,class EngineStart> bool ExecuteImpl(Allocator& allocator,Io& io,bool takeover,Binder bind,EngineStart start,bool submitOnly=false) {
         if(owner_!=static_cast<const void*>(&allocator) || state_!=BdwOneShotState::Prepared || attempted_)return false;
         attempted_=true;state_=BdwOneShotState::Executing;
         // Admission must establish pinned, distinct usable RAM, DMA translation
@@ -318,6 +319,9 @@ private:
         if(!io.prepareSubmission(descriptor_))return false;
         const uint32_t words[]={0,0,uint32_t(descriptor_>>32),uint32_t(descriptor_)};
         for(auto word:words)if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.submitDword(word))return false;
+        // VA-API phase 4: leave the job running; CompleteSubmitted (same
+        // backend identity) later verifies the breadcrumb.
+        if(submitOnly){state_=BdwOneShotState::Submitted;return true;}
         if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.waitCompletion(nonce_) ||
            !io.exclusiveHandoff() || !io.gpuPatLease() || (!scanout_ && !io.cpuVisible(pages_,allocated_)) ||
            Load32(pages_[Completion],0)!=nonce_)return false;
@@ -331,6 +335,15 @@ private:
         state_=BdwOneShotState::CompleteRetained;return true;
     }
 public:
+    // VA-API phase 4 (VCS user jobs): the breadcrumb of a Submitted job as
+    // seen by the CPU now. The caller makes the completion page CPU-visible.
+    bool SubmittedBreadcrumb()const{return state_==BdwOneShotState::Submitted && Load32(pages_[Completion],0)==nonce_;}
+    template<class Io> bool CompleteSubmitted(Io& io){
+        if(state_!=BdwOneShotState::Submitted || executionOwner_!=static_cast<const void*>(&io))return false;
+        if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.cpuVisible(pages_,allocated_) ||
+           Load32(pages_[Completion],0)!=nonce_)return false;
+        state_=BdwOneShotState::CompleteRetained;return true;
+    }
     // The hardware owner calls this only after an acknowledged BCS domain
     // reset. A failed or uncertain unbind retains every referenced page.
     template<class Io> bool RetireScanout(Io& io){
@@ -362,7 +375,7 @@ public:
     template<class Io> bool ExecuteTakenOver(Io& io,uint64_t scratchDma) {
         return ExecuteTakenOverWithBackend(io,io,scratchDma);
     }
-    template<class Allocator,class Io> bool ExecuteTakenOverWithBackend(Allocator& allocator,Io& io,uint64_t scratchDma) {
+    template<class Allocator,class Io> bool ExecuteTakenOverWithBackend(Allocator& allocator,Io& io,uint64_t scratchDma,bool submitOnly=false) {
         // The lease covers only the first eight pages. The scratch page must
         // also be distinct from the PPGTT hierarchy, batch and copy buffers:
         // a speculative or stray GGTT access must not alter those objects.
@@ -370,7 +383,7 @@ public:
            !scratchDma || (scratchDma&4095) || scratchDma>=(uint64_t{1}<<39))return false;
         for(unsigned i=0;i<allocated_;++i)if(pages_[i].dma==scratchDma)return false;
         return ExecuteImpl(allocator,io,true,[&](const BdwGgttLease& lease){return bind_.BindTakenOver(lease,io,scratchDma);},
-            [&](uint64_t hws){return io.initializeExeclists(hws,static_cast<const BdwOwnedPage&>(pages_[Hws]));});
+            [&](uint64_t hws){return io.initializeExeclists(hws,static_cast<const BdwOwnedPage&>(pages_[Hws]));},submitOnly);
     }
     // One exclusive descriptor from an initially idle six-slot CSB. The
     // backend must have synchronized the hardware/software cursors at five,

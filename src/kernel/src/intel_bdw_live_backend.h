@@ -26,6 +26,10 @@ public:
         :owner_(owner),first_(first),token_(token),scratch_(scratch),ggtt_(*this,ptes,flush,first,8),bcs_(*this,engine){}
     BdwEngineDeviceBackend(const BdwEngineDeviceBackend&)=delete;
     BdwEngineDeviceBackend& operator=(const BdwEngineDeviceBackend&)=delete;
+    // VA-API phase 4: a persistent backend (stable identity for the one-shot
+    // and GGTT bind across critical sections) starts each job afresh.
+    void ResetForJob(){pages_=nullptr;pageCount_=0;ggttWrites_=portWrites_=0;resetDone_=false;hws_=nullptr;
+        initStart_=initEnd_=waitStart_=waitEnd_=0;}
     bool owned(){return owner_.owned();}
     bool readable(){return owned();}
     bool exclusiveHandoff() override{return owned();}

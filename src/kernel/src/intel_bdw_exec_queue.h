@@ -23,7 +23,7 @@ class BdwExecQueue {
     static constexpr unsigned Capacity=32;
     struct Entry {uint64_t id=0,owner=0;BdwExecSnapshot* snapshot=nullptr;BdwExecRequestState state=BdwExecRequestState::Free;};
     Entry entries_[Capacity]{};
-    uint64_t next_=1,active_=0;bool exhausted_=false,poisoned_=false;
+    uint64_t next_=1,active_=0,parked_=0;bool exhausted_=false,poisoned_=false;
     Entry* find(uint64_t id){for(auto& e:entries_)if(e.state!=BdwExecRequestState::Free && e.id==id)return &e;return nullptr;}
 public:
     BdwExecQueue()=default;
@@ -117,9 +117,15 @@ public:
     }
     bool StartNext(uint64_t& id,BdwExecSnapshot*& snapshot,bool applicationOnly=false){
         if(poisoned_ || active_)return false;
+        // A parked request (VCS job in flight, VA-API phase 4) admits only
+        // later work that is provably independent of it, and no second
+        // video-engine job: the VCS lane holds one job at a time.
+        const Entry* parked=parked_?find(parked_):nullptr;
         Entry* first=nullptr;
         for(auto& e:entries_)if(e.state==BdwExecRequestState::Queued && BdwExecSnapshotDependencies(e.snapshot) &&
                                   (!applicationOnly || !BdwExecSnapshotHasProtectedBuffer(e.snapshot)) && (!first || e.id<first->id)){
+            if(parked && (BdwExecSnapshotEngine(e.snapshot)==BdwExecEngineVideo ||
+                          !BdwExecSnapshotsIndependent(parked->snapshot,e.snapshot)))continue;
             const auto owner=BdwExecSnapshotOwner(e.snapshot);bool permitted=!applicationOnly || owner;
             for(const auto& prior:entries_)if(prior.state==BdwExecRequestState::Queued && prior.id<e.id){
                 const auto previous=BdwExecSnapshotOwner(prior.snapshot);
@@ -134,8 +140,17 @@ public:
     }
     BdwExecSnapshot* ActiveSnapshot(uint64_t id){
         auto* e=find(id);
-        return e && e->state==BdwExecRequestState::Active && active_==id?e->snapshot:nullptr;
+        return e && e->state==BdwExecRequestState::Active && (active_==id || parked_==id)?e->snapshot:nullptr;
     }
+    // Move the active request aside while its device work continues (one at a
+    // time); the engine owner later finishes it by id. Its snapshot stays
+    // reserved and it still blocks reaping, like any active request.
+    bool Park(uint64_t id){
+        auto* e=find(id);
+        if(!e || e->state!=BdwExecRequestState::Active || active_!=id || parked_)return false;
+        active_=0;parked_=id;return true;
+    }
+    uint64_t Parked()const{return parked_;}
     // Only the engine owner may call Finish. The service can perform cache
     // synchronization before acquiring its admission mutex while the active
     // snapshot remains pinned. Other users keep the synchronous path.
@@ -143,7 +158,7 @@ public:
     // its context and buffers are not poisoned. Requires a safe stop.
     bool Finish(uint64_t id,bool success,bool safelyStopped,bool skipped=false){
         auto* e=find(id);
-        if(!e || e->state!=BdwExecRequestState::Active || active_!=id || (skipped && (success || !safelyStopped)))return false;
+        if(!e || e->state!=BdwExecRequestState::Active || (active_!=id && parked_!=id) || (skipped && (success || !safelyStopped)))return false;
         return FinishImpl(id,success,safelyStopped,false,false,skipped);
     }
     bool FinishWithCacheResult(uint64_t id,bool success,bool safelyStopped,bool cacheReady){
@@ -151,7 +166,8 @@ public:
     }
 private:
     bool FinishImpl(uint64_t id,bool success,bool safelyStopped,bool cacheChecked,bool cacheReady,bool skipped=false){
-        auto* e=find(id);if(!e || e->state!=BdwExecRequestState::Active || active_!=id)return false;
+        auto* e=find(id);if(!e || e->state!=BdwExecRequestState::Active || (active_!=id && parked_!=id))return false;
+        uint64_t& slot=parked_==id?parked_:active_;
         // Publish failure before any use count can fall, so waiters cannot
         // mistake failed work for successful idle buffers. An unsafe engine
         // cannot process its queued requests; fail them while retaining their
@@ -173,9 +189,9 @@ private:
                    !BdwExecSnapshotSignalFences(pending.snapshot,false))return false;
                 pending.state=BdwExecRequestState::Failed;
             }
-            active_=0;e->state=BdwExecRequestState::Quarantined;poisoned_=true;return true;
+            slot=0;e->state=BdwExecRequestState::Quarantined;poisoned_=true;return true;
         }
-        active_=0;
+        slot=0;
         if(!safelyStopped){e->state=BdwExecRequestState::Quarantined;poisoned_=true;}
         else {if(!BdwExecSnapshotSignalFences(e->snapshot,success))return false;
             e->state=success?BdwExecRequestState::Complete:BdwExecRequestState::Failed;}

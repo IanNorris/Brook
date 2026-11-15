@@ -79,6 +79,20 @@ public:
         }
         state_=BdwPatLeaseState::Active;return true;
     }
+    // VA-API phase 4: take over a lease that an earlier owner established
+    // and deliberately left active (VCS job in flight between critical
+    // sections). Requires the current policy to read back exactly as held and
+    // the held -> inherited restoration to pass the owner's transition check;
+    // Release then restores the inherited values.
+    template<class Io> bool AdoptHeld(Io& io,uint32_t inheritedLo,uint32_t inheritedHi,uint32_t heldLo,uint32_t heldHi) {
+        if(state_!=BdwPatLeaseState::Fresh)return false;
+        uint32_t lo=0,hi=0;
+        if(!io.owned() || !stable(io,lo,hi) || lo!=heldLo || hi!=heldHi ||
+           !io.safePatTransition(inheritedLo,inheritedHi,heldLo,heldHi))return false;
+        owner_=&io;oldLo_=inheritedLo;oldHi_=inheritedHi;state_=BdwPatLeaseState::Active;return true;
+    }
+    uint32_t InheritedLo()const{return oldLo_;}
+    uint32_t InheritedHi()const{return oldHi_;}
     // Return to the inherited policy only after the owner has retired or
     // reset its GPU work. Failed restoration is uncertain and quarantines
     // the lease; the caller must retain all potentially referenced memory.

@@ -309,7 +309,22 @@ inline uint32_t& BdwVideoUserSubmissionStorage(){static uint32_t ready=0;return 
 //  bit 1 (coherent, default on): map ordinary job buffers through the leased
 //        WB LLC PAT without CPU cache flushes before and after the job, as
 //        the RCS coherent-render path does.
-constexpr uint32_t BdwVcsTuneMinimalResets=1u,BdwVcsTuneCoherent=2u;
+//  bit 2 (async, default OFF): the VCS lane. A user job is submitted in one
+//        critical section and left running; the CPU0 worker parks it and runs
+//        independent RCS/BCS work, then retires it in a second critical
+//        section once the breadcrumb lands (or the 2 s deadline passes).
+constexpr uint32_t BdwVcsTuneMinimalResets=1u,BdwVcsTuneCoherent=2u,BdwVcsTuneAsync=4u;
+// VA-API phase 4 VCS lane state, shared with every GPU critical section.
+// While busy: VCS runs a Brook-owned user job between critical sections, so
+// the forcewake observation accepts VCS as non-quiescent, and the private PAT
+// holds the lane base (entry 0 = 0x07, entry 4 = 0x0b, as every Brook run
+// programs them) instead of the inherited firmware values; other runs lease
+// from and restore to that base. Set and cleared on the CPU0 worker only,
+// inside a critical section.
+constexpr uint32_t BdwVcsLaneBaseLo=0x03030307u,BdwVcsLaneBaseHi=0x0303030bu;
+inline uint32_t& BdwVcsLaneBusyStorage(){static uint32_t busy=0;return busy;}
+inline bool BdwVcsLaneBusy(){return __atomic_load_n(&BdwVcsLaneBusyStorage(),__ATOMIC_ACQUIRE)!=0;}
+inline bool BdwVcsLanePatBase(uint32_t lo,uint32_t hi){return BdwVcsLaneBusy() && lo==BdwVcsLaneBaseLo && hi==BdwVcsLaneBaseHi;}
 inline uint32_t& BdwVideoUserTuningStorage(){static uint32_t tune=BdwVcsTuneMinimalResets|BdwVcsTuneCoherent;return tune;}
 inline uint32_t BdwVideoUserTuning(){return __atomic_load_n(&BdwVideoUserTuningStorage(),__ATOMIC_ACQUIRE);}
 inline bool BdwVideoUserSubmissionReady(){return __atomic_load_n(&BdwVideoUserSubmissionStorage(),__ATOMIC_ACQUIRE)!=0;}

@@ -1,4 +1,5 @@
 #pragma once
+#include "intel_bdw_video.h"
 #include <stdint.h>
 namespace brook {
 struct BdwBcsSample {uint32_t head=0,tail=0,mode=0,start=0,control=0,execlistLo=0,execlistHi=0,submissionMode=0;};
@@ -92,7 +93,9 @@ template<class Io,class Work> BdwForcewakeResult BdwObserveBcsWithWork(Io& io,Wo
                 for(unsigned i=0;i<3;++i) {
                     result.other[i]=BdwObserveEngine(io,bases[i]);
                     result.otherEnginesSampled &= result.other[i].sampled;
-                    result.otherEnginesQuiescent &= result.other[i].submissionQuiescent;
+                    // VA-API phase 4: a busy VCS running the lane's own
+                    // in-flight job is owned, not foreign, activity.
+                    result.otherEnginesQuiescent &= result.other[i].submissionQuiescent || (i==1 && BdwVcsLaneBusy());
                     if(!result.other[i].sampled)break;
                 }
             }
