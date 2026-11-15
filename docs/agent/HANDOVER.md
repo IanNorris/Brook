@@ -13,7 +13,7 @@ _Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall f
   - `rollback-gen355/` (the known-good pair);
   - `quake-probe-bundle.tar` (demo timing script, swap trace library and paks).
 - **Legacy checkout:** `/data/Programming/Codex/Brook` and its `build/hardware/` evidence are reference only. Old disk images are being cleaned up separately.
-- **Build:** `nix-shell --run './scripts/build.sh Release'` from a clean checkout, then `ctest --test-dir build/release/host_tests`. `test_audio_delivery` can time out under parallel load; rerun it alone.
+- **Build:** `nix-shell --run './scripts/build.sh Release'` from a clean checkout, then `ctest --test-dir build/release/host_tests`. `test_audio_delivery` and `test_sched_lock_owner` can time out under parallel load; rerun them alone.
 
 ## Repository
 
@@ -92,7 +92,21 @@ _Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall f
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
-**15 Nov, afternoon (syscall fix pass, `work/syscall-fixes`, not on main yet):**
+**15 Nov, gen 410 (syscall fixes on main, autonomous):**
+- **Main is `c23acf3c`:** it now includes `work/syscall-fixes`. Release build passes; host tests 357/357, with `test_sched_lock_owner` timing out once under -j8. That test is untouched by the fixes and never hung in 360 runs under heavy parallel load; treat it like `test_audio_delivery`.
+- **Dell: gen 410** `dell-syscall-fixes-20261115`, session `4f0e6eebea1c4e58af1ba91ffa1b7790`, saved in the scratchpad `session` file.
+- **Smoke tests:**
+  - Quake: GPU wakeups off gave 43.2 swaps/s (composite 20.4 ms); `gpu wakeups on` gave 51.2 swaps/s (composite 19.4 ms). These are single runs and noisy; repeat them before changing the default.
+  - Firefox and Chromium on YouTube with private profiles stayed up with no refusals. The Chromium job count varies with page state: 199 on the first run, 2706 on the second.
+  - Kernel log is clean; the only panic record is the old seq 41.
+  - Evidence: `display-perf/build/dell/fixes-*`.
+- **Still to do:**
+  - Run an A/B of `gpu wakeups on` as the default.
+  - Decide H-03/H-21 authorisation (Ian).
+  - Schedule H-20 and H-22.
+  - Move the remaining direct user dereferences (VfsRead/VfsWrite on regular files, iovecs, sockopts, WM get_* and GPU submit) to `Copy*User`.
+
+**15 Nov, afternoon (syscall fix pass, merged above):**
 - **Branch head `ea753d08` plus a docs commit.** It has 11 fix commits on top of `7f5638aa`. Each issue's status is in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), under "Fix pass status" and the per-entry **Status** lines.
 - **Fixed:** 23 of the 27 high entries:
   - raw user pointers: input/WM, getdents64, open, inet sockets, the keyboard read at count 0;
