@@ -830,6 +830,8 @@ target_compile_options(test_ext2_objects PRIVATE -Wall -Wextra -Werror -Wno-unus
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_ext2_objects PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_ext2_objects PROPERTIES TIMEOUT 60)
+add_host_test(test_compat_paths)
+target_compile_options(test_compat_paths PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_mount_namespace_state)
 target_compile_options(test_mount_namespace_state PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 set_tests_properties(test_mount_namespace_state PROPERTIES TIMEOUT 20)

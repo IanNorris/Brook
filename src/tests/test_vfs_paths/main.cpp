@@ -416,6 +416,17 @@ static void testMountInfo(brook::MountNamespace* initial,const brook::VfsPath& s
     auto freshRoot=resolve(root,root,targetName);
     auto insidePath=resolve(root,freshRoot,"src"),destinationPath=resolve(root,freshRoot,"dst");
     assert(!VfsMountNamespaceBind(ns,insidePath,destinationPath));
+    {
+        // A fresh mount masks synthetic/alias names until its exact root is
+        // registered transparent (kernel /bin, /usr/bin). A subdirectory bind
+        // of the same instance still masks.
+        const std::string missing=std::string("/")+targetName+"/missing",bound=std::string("/")+targetName+"/dst/missing";
+        bool allowed=true;assert(!VfsPathBrokerAllowed(root,missing.c_str(),&allowed)&&!allowed);
+        assert(VfsPathBrokerTransparentRegister(insidePath)==-22);
+        assert(!VfsPathBrokerTransparentRegister(freshRoot)&&!VfsPathBrokerTransparentRegister(freshRoot));
+        allowed=false;assert(!VfsPathBrokerAllowed(root,missing.c_str(),&allowed)&&allowed);
+        allowed=true;assert(!VfsPathBrokerAllowed(root,bound.c_str(),&allowed)&&!allowed);
+    }
     // A legacy case-insensitive ancestor can report another spelling of the
     // same covered identity. An unrelated backing rename must preserve the
     // published fresh mount's lowercase anchor.

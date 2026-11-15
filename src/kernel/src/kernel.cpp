@@ -46,6 +46,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "vfs_path.h"
 #include "tmpfs.h"
 #include "mount_namespace.h"
+#include "compat_paths.h"
 #include "virtio_blk.h"
 #include "gpt.h"
 #include "ahci_system_volume.h"
@@ -758,6 +759,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // when set, takes precedence over either bounded profile.
         brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,larger=%u,wide=%u,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget,largerTmpfs?1u:0u,widerShm?1u:0u);
     }
+
+    // NixOS-style /bin/sh and /usr/bin/env for system()/popen(), shebangs and
+    // xkbcomp. Symlinks resolve lazily, so /nix may mount later. Non-fatal:
+    // the exec-path busybox aliases still cover a missing entry.
+    brook::CompatPathsProvisionBoot();
 
     // Optional read-only-media desktop: keep runtime sockets and user settings
     // on bounded tmpfs instances. No persistent disk is replaced by default.
