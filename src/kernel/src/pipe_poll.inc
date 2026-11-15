@@ -1,61 +1,7 @@
 // Shared actual poll subscription implementation. Include after ProcessRef,
 // ProcessUnref and WakeProcess definitions. Notification never allocates or
 // retains a registration pointer after releasing the pipe lock.
-struct PipePollNode {
-    PipeBuffer* pipe;
-    Process* process;
-    uint32_t events;
-    uint64_t sequence;
-    PipePollNode* nextPipe;
-    PipePollNode* nextGroup;
-};
-
-struct PipePollGroup {
-    PipePollNode* nodes = nullptr;
-    PipePollGroup() = default;
-    PipePollGroup(const PipePollGroup&) = delete;
-    PipePollGroup& operator=(const PipePollGroup&) = delete;
-    bool add(PipeBuffer* pipe, Process* process, uint32_t events) {
-        for (auto* n = nodes; n; n = n->nextGroup) {
-            if (n->pipe != pipe) continue;
-            SpinLockAcquire(&pipe->lock);
-            n->events |= events;
-            SpinLockRelease(&pipe->lock);
-            return true;
-        }
-        auto* n = static_cast<PipePollNode*>(kmalloc(sizeof(PipePollNode)));
-        if (!n) return false;
-        ProcessRef(process);
-        SpinLockAcquire(&pipe->lock);
-        if (pipe->pollSequence == ~0ULL || pipe->pollHolds == ~0ULL) {
-            SpinLockRelease(&pipe->lock);
-            ProcessUnref(process);
-            kfree(n);
-            return false;
-        }
-        ++pipe->pollHolds;
-        *n = {pipe, process, events, ++pipe->pollSequence, pipe->pollWaiters, nodes};
-        pipe->pollWaiters = n;
-        nodes = n;
-        SpinLockRelease(&pipe->lock);
-        return true;
-    }
-    ~PipePollGroup() {
-        while (nodes) {
-            auto* n = nodes;
-            nodes = n->nextGroup;
-            auto* pipe = n->pipe;
-            SpinLockAcquire(&pipe->lock);
-            auto** link = &pipe->pollWaiters;
-            while (*link && *link != n) link = &(*link)->nextPipe;
-            if (*link) *link = n->nextPipe;
-            SpinLockRelease(&pipe->lock);
-            ProcessUnref(n->process);
-            kfree(n);
-            PipeBufferDrop(pipe);
-        }
-    }
-};
+#include "pipe_poll_types.inc"
 
 void PipePollNotify(PipeBuffer* pipe, uint32_t events) {
     // The caller owns live storage at entry. Keep our own hold across every

@@ -1,22 +1,14 @@
 // Read-only route-query sockets. Included inside namespace brook after the
 // syscall lifetime/user-copy helpers. Queue locks never cover user memory.
-struct NetlinkPacket {NetlinkPacket* next;uint32_t length;uint8_t bytes[8192];};
-struct NetlinkWait;
-struct NetlinkSocket {
-    SpinLock lock{};uint32_t refs=1;bool nonblock=false,connected=false;
-    uint32_t port=0,type=0,queued=0,receiveLimit=65536;
-    SocketIdentity identity{};NetlinkSocket* next=nullptr;
-    NetlinkPacket *head=nullptr,*tail=nullptr;NetlinkWait* waiters=nullptr;
-};
+#include "syscall_netlink_types.inc"
 static SpinLock g_netlinkRegistryLock{};
 static NetlinkSocket* g_netlinkSockets=nullptr;
 bool NetlinkGetIdentity(void* handle,SocketIdentity* out) {
     if(!handle || !out)return false;
     *out=static_cast<NetlinkSocket*>(handle)->identity;return true;
 }
-struct NetlinkWait {NetlinkSocket* socket;Process* process;NetlinkWait *nextSocket,*nextGroup;};
-static void NetlinkRef(NetlinkSocket* s){__atomic_fetch_add(&s->refs,1,__ATOMIC_RELAXED);}
-static void NetlinkUnref(NetlinkSocket* s) {
+void NetlinkRef(NetlinkSocket* s){__atomic_fetch_add(&s->refs,1,__ATOMIC_RELAXED);}
+void NetlinkUnref(NetlinkSocket* s) {
     if(__atomic_fetch_sub(&s->refs,1,__ATOMIC_ACQ_REL)!=1)return;
     SpinLockAcquire(&g_netlinkRegistryLock);
     auto** link=&g_netlinkSockets;while(*link && *link!=s)link=&(*link)->next;
@@ -24,20 +16,6 @@ static void NetlinkUnref(NetlinkSocket* s) {
     SpinLockRelease(&g_netlinkRegistryLock);
     while(s->head){auto* p=s->head;s->head=p->next;kfree(p);}kfree(s);
 }
-struct NetlinkWaitGroup {
-    NetlinkWait* nodes=nullptr;
-    bool add(NetlinkSocket* s,Process* p) {
-        for(auto* n=nodes;n;n=n->nextGroup)if(n->socket==s)return true;
-        auto* n=static_cast<NetlinkWait*>(kmalloc(sizeof(NetlinkWait)));if(!n)return false;
-        NetlinkRef(s);ProcessRef(p);
-        SpinLockAcquire(&s->lock);*n={s,p,s->waiters,nodes};s->waiters=n;nodes=n;SpinLockRelease(&s->lock);return true;
-    }
-    ~NetlinkWaitGroup(){while(nodes){auto* n=nodes;nodes=n->nextGroup;auto* s=n->socket;
-        SpinLockAcquire(&s->lock);auto** link=&s->waiters;while(*link && *link!=n)link=&(*link)->nextSocket;
-        if(*link)*link=n->nextSocket;SpinLockRelease(&s->lock);
-        ProcessUnref(n->process);NetlinkUnref(s);kfree(n);
-    }}
-};
 static uint32_t NetlinkReady(NetlinkSocket* s,uint32_t events) {
     SpinLockAcquire(&s->lock);const uint32_t ready=(events&4)|((s->head && (events&1))?1u:0u);SpinLockRelease(&s->lock);return ready;
 }
@@ -114,29 +92,6 @@ static int64_t NetlinkReceive(NetlinkSocket* s,void* kernelBytes,uint32_t capaci
         SchedulerBlockInterruptible(ProcessCurrent());
     }
 }
-struct NetlinkVector {
-    struct Vector {uint64_t address,length;};
-    Vector* vectors=nullptr;uint8_t* bytes=nullptr;uint64_t count=0,total=0;uint32_t capacity=0;
-    ~NetlinkVector(){kfree(vectors);kfree(bytes);}
-    int init(uint64_t address,uint64_t n,bool writing) {
-        if(n>1024)return -EINVAL;
-        count=n;vectors=static_cast<Vector*>(kmalloc(n?n*sizeof(Vector):1));if(!vectors)return -ENOMEM;
-        if(n && !CopyFromUser(vectors,address,n*sizeof(Vector)))return -EFAULT;
-        for(uint64_t i=0;i<n;++i){if(vectors[i].length>0x7fffffffULL-total)return -EINVAL;total+=vectors[i].length;}
-        if(writing && total>65536)return -90;
-        capacity=static_cast<uint32_t>(total<(writing?65536u:8192u)?total:(writing?65536u:8192u));
-        bytes=static_cast<uint8_t*>(kmalloc(capacity?capacity:1));if(!bytes)return -ENOMEM;
-        uint64_t offset=0;
-        for(uint64_t i=0;i<n && offset<capacity;++i){uint64_t part=vectors[i].length;if(part>capacity-offset)part=capacity-offset;
-            if(part && (writing?!CopyFromUser(bytes+offset,vectors[i].address,part):!UserBufferWritable(vectors[i].address,part)))return -EFAULT;
-            offset+=part;
-        }return 0;
-    }
-    int scatter(uint32_t length){uint32_t offset=0;for(uint64_t i=0;i<count && offset<length;++i){
-        uint32_t part=static_cast<uint32_t>(vectors[i].length<length-offset?vectors[i].length:length-offset);
-        if(part && !CopyToUser(vectors[i].address,bytes+offset,part))return -EFAULT;offset+=part;
-    }return 0;}
-};
 static int64_t NetlinkVectorIo(NetlinkSocket* s,uint64_t address,uint64_t count,bool writing) {
     KernelOperationGuard operation(ProcessCurrent());
     NetlinkVector stage;if(int e=stage.init(address,count,writing))return e;if(!stage.total)return 0;

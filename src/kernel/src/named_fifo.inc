@@ -1,15 +1,7 @@
 // Actual named FIFO descriptions, included after anonymous-pipe release helpers.
 // Registry keys pin the backing inode, never a pathname. The mutex serializes
 // last-description retirement against a new open of that same inode.
-struct NamedFifoWait { Process* process;NamedFifoWait* next; };
-struct NamedFifoState {
-    NamedFifoState* next;
-    VfsPath identity;
-    PipeBuffer* pipe;
-    uint64_t descriptions,readerEpoch,writerEpoch;
-    NamedFifoWait* waiters;
-};
-struct NamedFifoOpen { NamedFifoState* state;uint32_t access;uint64_t writerEpoch;bool writerSeen; };
+#include "named_fifo_types.inc"
 static KMutex g_namedFifoMutex{};
 static NamedFifoState* g_namedFifos=nullptr;
 static void NamedFifoWake(NamedFifoState* state) {
