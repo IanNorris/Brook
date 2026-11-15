@@ -52,6 +52,7 @@
 #include "relative-pointer-v1-server-protocol.h"
 #include "pointer-constraints-v1-server-protocol.h"
 #include "pointer-region.h"
+#include "pointer-hit.h"
 #include "surface-tree.h"
 #include "surface-geometry.h"
 #include "gpu-scene-abi.h"
@@ -1380,6 +1381,7 @@ struct brook_seat_client {
     int cursor_visible;                     /* policy; kernel is mechanism */
     unsigned refs;
     int32_t pointer_x,pointer_y;
+    uint32_t buttons;                       /* held buttons: implicit grab */
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
     int keymap_fd;                          /* kept alive until client receives it */
@@ -1757,7 +1759,7 @@ static uint32_t scancode_to_xkb(uint8_t sc) {
 
 static void pointer_enter_if_needed(struct brook_seat_client *sc,
                                      struct brook_surface *s,
-                                     int lx, int ly) {
+                                     wl_fixed_t lx, wl_fixed_t ly) {
     if (!sc || !sc->pointer) return;
     if (sc->entered_surface == s) return;
     if (sc->entered_surface && sc->entered_surface != s) {
@@ -1774,8 +1776,7 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
         }
     }
     if (s) {
-        wl_pointer_send_enter(sc->pointer, next_serial(), s->resource,
-                              surface_pointer_fixed(s,lx), surface_pointer_fixed(s,ly));
+        wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, lx, ly);
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
     }
@@ -1791,6 +1792,45 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
     seat_apply_cursor_visibility(sc);
 }
 
+/* Pointer target within the window's surface tree. A window's input arrives
+ * root-relative; subsurfaces (e.g. Chromium's WaylandBubble dialogs) must
+ * receive the events over them, in surface-local coordinates. While a button
+ * is held the pressed surface keeps the pointer (implicit grab). Points that
+ * hit no mapped layer go to the root, as before subsurface hit-testing. */
+static struct brook_surface *pointer_target(struct brook_surface *root,struct brook_seat_client *sc,
+                                            int32_t px,int32_t py,wl_fixed_t *lx,wl_fixed_t *ly) {
+    const int64_t fx=surface_pointer_fixed(root,px),fy=surface_pointer_fixed(root,py);
+    *lx=(wl_fixed_t)fx;*ly=(wl_fixed_t)fy;
+    struct pointer_hit_layer layers[64];unsigned count=0;
+    struct frame { struct bt_node *node;size_t index;int own;int64_t x,y; } stack[65];
+    unsigned depth=1;stack[0]=(struct frame){&root->tree,0,0,0,0};
+    while (depth) {
+        struct frame *f=&stack[depth-1];struct bt_state *state=f->node->current;
+        if (!state || !state->value) { --depth;continue; }
+        if (!f->own && (f->index==state->count || !state->children[f->index].below)) {
+            if (count==64) break;
+            const struct brook_view *view=state->value;struct brook_surface *owner=f->node->user;
+            layers[count++]=(struct pointer_hit_layer){owner?&owner->input_region:NULL,f->x,f->y,
+                view->geometry.w,view->geometry.h,owner};
+            f->own=1;continue;
+        }
+        if (f->index==state->count) { --depth;continue; }
+        struct bt_child *child=&state->children[f->index++];
+        if (!bt_child_valid(f->node,child) || depth==65) continue;
+        stack[depth++]=(struct frame){child->node,0,0,f->x+child->x,f->y+child->y};
+    }
+    int64_t hx=fx,hy=fy;
+    int pick=(sc && sc->buttons)?pointer_hit_grab_index(layers,count,sc->entered_surface):-1;
+    if (pick>=0) { hx=fx-layers[pick].x*256;hy=fy-layers[pick].y*256; }
+    else pick=pointer_hit_pick(layers,count,fx,fy,&hx,&hy);
+    if (pick<0 || !layers[pick].user) return root;
+    struct brook_surface *target=layers[pick].user;
+    if (!target->resource) return root;
+    *lx=(wl_fixed_t)(hx<INT32_MIN?INT32_MIN:hx>INT32_MAX?INT32_MAX:hx);
+    *ly=(wl_fixed_t)(hy<INT32_MIN?INT32_MIN:hy>INT32_MAX?INT32_MAX:hy);
+    return target;
+}
+
 static void dispatch_surface_event(struct brook_surface *s,
                                    struct brook_seat_client *sc,
                                    struct brook_wm_event *e, uint32_t now) {
@@ -1801,10 +1841,9 @@ static void dispatch_surface_event(struct brook_surface *s,
         if (!sc || !sc->pointer || pointer_surface_locked(s)) break;
         sc->pointer_x=pointer_fixed_floor(surface_pointer_fixed(s,e->x));
         sc->pointer_y=pointer_fixed_floor(surface_pointer_fixed(s,e->y));
-        pointer_enter_if_needed(sc, s, e->x, e->y);
-        wl_pointer_send_motion(sc->pointer, now,
-                               surface_pointer_fixed(s,e->x),
-                               surface_pointer_fixed(s,e->y));
+        wl_fixed_t lx,ly;struct brook_surface *target=pointer_target(s,sc,e->x,e->y,&lx,&ly);
+        pointer_enter_if_needed(sc, target, lx, ly);
+        wl_pointer_send_motion(sc->pointer, now, lx, ly);
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         pointer_constraints_refresh();
@@ -1820,9 +1859,14 @@ static void dispatch_surface_event(struct brook_surface *s,
         if(e->reserved && !pointer_event_token(s,e->reserved))break;
         sc->pointer_x=pointer_fixed_floor(surface_pointer_fixed(s,e->x));
         sc->pointer_y=pointer_fixed_floor(surface_pointer_fixed(s,e->y));
-        pointer_enter_if_needed(sc, s, e->x, e->y);
+        {
+            wl_fixed_t lx,ly;struct brook_surface *target=pointer_target(s,sc,e->x,e->y,&lx,&ly);
+            pointer_enter_if_needed(sc, target, lx, ly);
+        }
         /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
         uint32_t btn = 0x110 + (e->scan & 0x3);
+        if (e->type == EVT_MOUSE_BTN_DOWN) sc->buttons |= 1u << (e->scan & 0x3);
+        else sc->buttons &= ~(1u << (e->scan & 0x3));
         uint32_t st  = (e->type == EVT_MOUSE_BTN_DOWN)
                          ? WL_POINTER_BUTTON_STATE_PRESSED
                          : WL_POINTER_BUTTON_STATE_RELEASED;
@@ -1837,6 +1881,13 @@ static void dispatch_surface_event(struct brook_surface *s,
     }
     case EVT_MOUSE_SCROLL: {
         if (!sc || !sc->pointer || (e->reserved && !pointer_event_token(s,e->reserved))) break;
+        if (!sc->buttons && sc->entered_surface && !pointer_surface_locked(s)) {
+            /* Scroll goes to the surface under the last pointer position. */
+            wl_fixed_t lx,ly;
+            struct brook_surface *target=pointer_target(s,sc,(int32_t)((int64_t)sc->pointer_x*surface_output_scale(s)),
+                                                       (int32_t)((int64_t)sc->pointer_y*surface_output_scale(s)),&lx,&ly);
+            pointer_enter_if_needed(sc, target, lx, ly);
+        }
             int32_t dy = (int8_t)e->scan;
             /* Brook wheel ticks are positive upward; Wayland axis values
              * are positive downward. */
