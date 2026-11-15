@@ -452,4 +452,86 @@ int64_t sys_brook_input_grab(uint64_t enable, uint64_t, uint64_t,
 int64_t sys_brook_audio_control(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_brook_ahci_export(uint64_t op,uint64_t destination,uint64_t length,uint64_t offset,uint64_t r0,uint64_t r1);
 
+// syscall_brook_wm.cpp
+int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
+                                    uint64_t titlePtr, uint64_t outPtr,
+                                    uint64_t flags, uint64_t);
+int64_t sys_brook_wm_destroy_window(uint64_t wmId, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_signal_dirty(uint64_t wmId, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_publish_source_commit(uint64_t wmId,uint64_t incarnation,uint64_t commit,
+                                            uint64_t a,uint64_t b,uint64_t c);
+int64_t sys_brook_wm_begin_source_write(uint64_t wmId,uint64_t incarnation,uint64_t a,
+                                         uint64_t b,uint64_t c,uint64_t d);
+int64_t sys_brook_wm_query_source_commit(uint64_t wmId,uint64_t incarnation,uint64_t generation,
+                                          uint64_t output,uint64_t a,uint64_t b);
+int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
+                                  uint64_t w, uint64_t h,
+                                  uint64_t, uint64_t);
+int64_t sys_brook_wm_place_window(uint64_t window, uint64_t incarnation,
+                                  uint64_t x, uint64_t y, uint64_t flags, uint64_t reserved);
+int64_t sys_brook_wm_window_state(uint64_t window, uint64_t incarnation,
+                                  uint64_t output, uint64_t size,
+                                  uint64_t flags, uint64_t reserved);
+int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
+                                 uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
+                          uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_appearance(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_pointer_speed(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_wm_scale(uint64_t op,uint64_t scale,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_wm_set_client_socket(uint64_t wmId,uint64_t fdValue,
+    uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_wm_set_app_id(uint64_t wmId, uint64_t appIdPtr,
+                               uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
+                                uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_pointer_capture(uint64_t wmId,uint64_t operation,uint64_t token,
+                                    uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_wm_pop_input(uint64_t wmId, uint64_t bufPtr,
+                                uint64_t max, uint64_t,
+                                uint64_t, uint64_t);
+int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
+                                 uint64_t newH, uint64_t outPtr,
+                                 uint64_t, uint64_t);
+int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
+                                          uint64_t, uint64_t,
+                                          uint64_t, uint64_t);
+int64_t sys_brook_wm_set_window_properties(uint64_t wmId, uint64_t mask,
+                                            uint64_t opacity, uint64_t blurRadius,
+                                            uint64_t, uint64_t);
+int64_t sys_brook_wm_begin_move(uint64_t wmId, uint64_t,
+                                 uint64_t, uint64_t,
+                                 uint64_t, uint64_t);
+int64_t sys_brook_wm_move_relative(uint64_t wmId, uint64_t parentWmId,
+                                    uint64_t relX, uint64_t relY,
+                                    uint64_t, uint64_t);
+int64_t sys_brook_wm_set_maximized(uint64_t wmId, uint64_t enable,
+                                    uint64_t, uint64_t,
+                                    uint64_t, uint64_t);
+int64_t sys_brook_wm_set_minimized(uint64_t wmId, uint64_t,
+                                    uint64_t, uint64_t,
+                                    uint64_t, uint64_t);
+int64_t sys_brook_wm_begin_resize(uint64_t wmId, uint64_t edges,
+                                   uint64_t, uint64_t,
+                                   uint64_t, uint64_t);
+int64_t sys_brook_wm_set_cursor_visible(uint64_t visible, uint64_t,
+                                         uint64_t, uint64_t,
+                                         uint64_t, uint64_t);
+int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
+                                       uint64_t h, uint64_t hotX,
+                                       uint64_t hotY, uint64_t);
+int64_t sys_brook_wm_get_screen_info(uint64_t outAddr, uint64_t, uint64_t,
+                                      uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_scanout_map(uint64_t outAddr, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_scanout_flip(uint64_t minY, uint64_t maxY, uint64_t,
+                                   uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_get_windows(uint64_t outAddr, uint64_t maxCount, uint64_t,
+                                  uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_wm_map_window_vfb(uint64_t wmId, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t);
+
 } // namespace brook

@@ -318,6 +318,7 @@ add_executable(kernel
     src/syscall_sysinfo.cpp
     src/syscall_sysv_ipc.cpp
     src/syscall_brook_system.cpp
+    src/syscall_brook_wm.cpp
     src/user_copy.cpp
     src/user_access_scope.cpp
     src/user_copy_fault.cpp
