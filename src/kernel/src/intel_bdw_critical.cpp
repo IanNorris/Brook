@@ -1019,11 +1019,13 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             };
             static LaneOwner lane;
             struct LaneScope {LaneOwner& l;LaneScope(LaneOwner& lane_,CopyOwner& owner_):l(lane_){l.o=&owner_;}~LaneScope(){l.o=nullptr;}};
-            // Constructed once on first lane use (the VCS user reservation is
-            // fixed for the boot); no static guard is available in the kernel.
+            // Rebuilt in place at every lane submit: its ELSP port accessor is
+            // single-use per submission, while the address (the identity the
+            // one-shot and GGTT bind record) stays the same for submit and
+            // complete. No static guard is available in the kernel.
             alignas(BdwVcsDeviceBackend<LaneOwner>) static unsigned char laneStorage[sizeof(BdwVcsDeviceBackend<LaneOwner>)];
             static bool laneBuilt=false;
-            if(vcsUser && vcsUserPhase && !laneBuilt){
+            if(vcsUser && (vcsUserPhase==1 || (vcsUserPhase==2 && !laneBuilt))){
                 new(laneStorage) BdwVcsDeviceBackend<LaneOwner>(lane,reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+0xf6880000ull),
                     reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
                     reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwVcsEnginePage),scratchIndex,copyToken,scratchDma);
@@ -1134,7 +1136,6 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     // The PAT lease stays active as the lane base; the complete
                     // phase adopts it. Any failure takes the normal stop path.
                     LaneScope scope(lane,owner);
-                    laneVcs.ResetForJob();
                     LaneSink laneSink(owner);
                     const bool submitted=BdwSubmitPreparedVcsUser(laneVcs,laneSink,scratchDma,*copyResult);
                     copyResult->ggttWriteAttempts=laneVcs.ggttWriteAttempts();copyResult->portWriteAttempts=laneVcs.portWriteAttempts();
