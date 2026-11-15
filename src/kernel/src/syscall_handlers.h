@@ -76,4 +76,28 @@ int64_t sys_fadvise64(uint64_t, uint64_t, uint64_t,
 int64_t sys_mbind(uint64_t, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
 
+// syscall_time.cpp
+int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
+                           uint64_t, uint64_t, uint64_t);
+int64_t sys_clock_getres(uint64_t clockid, uint64_t tsAddr, uint64_t,
+                          uint64_t, uint64_t, uint64_t);
+int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
+                          uint64_t, uint64_t, uint64_t);
+int64_t sys_time(uint64_t tloc, uint64_t, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
+                       uint64_t, uint64_t, uint64_t);
+int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t reqAddr,
+                             uint64_t remAddr, uint64_t, uint64_t);
+int64_t sys_timer_create(uint64_t clock, uint64_t eventAddr, uint64_t idAddr,
+                         uint64_t, uint64_t, uint64_t);
+int64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t valueAddr,
+                          uint64_t oldAddr, uint64_t, uint64_t);
+int64_t sys_timer_gettime(uint64_t id, uint64_t valueAddr, uint64_t,
+                          uint64_t, uint64_t, uint64_t);
+int64_t sys_timer_getoverrun(uint64_t id, uint64_t, uint64_t,
+                            uint64_t, uint64_t, uint64_t);
+int64_t sys_timer_delete(uint64_t id, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
