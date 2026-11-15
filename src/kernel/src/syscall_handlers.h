@@ -161,4 +161,25 @@ int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
                      uint64_t offset, uint64_t, uint64_t);
 
+// syscall_stat.cpp
+int64_t sys_access(uint64_t pathAddr, uint64_t mode, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_stat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_fstat(uint64_t fd,uint64_t statAddr,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
+                        uint64_t flags, uint64_t, uint64_t);
+int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
+                   uint64_t mask, uint64_t bufAddr, uint64_t);
+int64_t sys_statfs(uint64_t pathAddr, uint64_t bufAddr, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_fstatfs(uint64_t fd, uint64_t bufAddr, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_faccessat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_faccessat2(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
+                      uint64_t flags, uint64_t, uint64_t);
+
 } // namespace brook
