@@ -23,8 +23,34 @@
 /* uses: in-flight frames sampling a version 2 offer. current: the newest
  * presented offer of its window, kept for later frames. notify: 1 queued,
  * 2 sent PRESENTED. */
+/* Version 3 offers carry layers (count>0): layer 0's buffer and fence are
+ * buffer/fence; extraBuffer/extraFence[i-1] hold layer i. */
 struct DesktopGpuOffer {struct BrookGpuWindowPacket packet;int buffer,fence,state;uint64_t frame,receivedNs;
-    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed;};
+    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed;
+    unsigned layers;struct BrookGpuWindowLayer layer[BROOK_GPU_WINDOW_LAYERS_MAX];
+    int extraBuffer[BROOK_GPU_WINDOW_LAYERS_MAX-1],extraFence[BROOK_GPU_WINDOW_LAYERS_MAX-1];};
+static inline void desktop_gpu_offer_free(struct DesktopGpuOffer *o){
+    if(o->buffer>=0)close(o->buffer);
+    if(o->fence>=0)close(o->fence);
+    for(unsigned i=1;i<o->layers && i<BROOK_GPU_WINDOW_LAYERS_MAX;++i){
+        if(o->extraBuffer[i-1]>=0)close(o->extraBuffer[i-1]);
+        if(o->extraFence[i-1]>=0)close(o->extraFence[i-1]);}
+    *o=(struct DesktopGpuOffer){.buffer=-1,.fence=-1};
+}
+/* Buffer and fence of layer i (i < max(1, layers)). */
+static inline int desktop_gpu_offer_buffer(const struct DesktopGpuOffer *o,unsigned i){return i?o->extraBuffer[i-1]:o->buffer;}
+static inline int desktop_gpu_offer_fence(const struct DesktopGpuOffer *o,unsigned i){return i?o->extraFence[i-1]:o->fence;}
+static inline uint64_t desktop_gpu_offer_inode(const struct DesktopGpuOffer *o,unsigned i,uint64_t *device){
+    if(!o->layers){*device=o->packet.identity.device;return o->packet.identity.inode;}
+    *device=o->layer[i].device;return o->layer[i].inode;
+}
+/* Two offers that sample a common DMA-BUF (any layer). */
+static inline int desktop_gpu_offers_share(const struct DesktopGpuOffer *a,const struct DesktopGpuOffer *b){
+    const unsigned na=a->layers?a->layers:1,nb=b->layers?b->layers:1;
+    for(unsigned i=0;i<na;++i){uint64_t da,ia=desktop_gpu_offer_inode(a,i,&da);
+        for(unsigned j=0;j<nb;++j){uint64_t db,ib=desktop_gpu_offer_inode(b,j,&db);if(ia==ib && da==db)return 1;}}
+    return 0;
+}
 /* A producer fence that completed with an error (SYNC_IOC_FILE_INFO status
  * < 0). Its frame never rendered, and a compositor job sampling or waiting
  * on it would fail too, so such offers are never selected; the window falls
@@ -101,10 +127,7 @@ static inline void desktop_gpu_channel_init(struct DesktopGpuChannel *c){
 static inline void desktop_gpu_channel_disconnect(struct DesktopGpuChannel *c){
     if(c->peer>=0)close(c->peer);
     c->peer=-1;
-    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];
-        if(o->buffer>=0)close(o->buffer);
-        if(o->fence>=0)close(o->fence);
-        *o=(struct DesktopGpuOffer){.buffer=-1,.fence=-1};}
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i)desktop_gpu_offer_free(&c->offers[i]);
 }
 static inline void desktop_gpu_channel_close(struct DesktopGpuChannel *c){
     desktop_gpu_channel_disconnect(c);if(c->listener>=0)close(c->listener);c->listener=-1;
@@ -125,14 +148,11 @@ static inline void desktop_gpu_channel_flush(struct DesktopGpuChannel *c){
         /* An ACK can let the producer rewrite the underlying DMA-BUF, even
          * when a different offer for that same buffer is still in flight. */
         int busy=0;for(unsigned j=0;j<DESKTOP_GPU_OFFERS;++j){const struct DesktopGpuOffer *other=&c->offers[j];
-            if(other->state==2 && other->packet.identity.device==o->packet.identity.device &&
-               other->packet.identity.inode==o->packet.identity.inode){busy=1;break;}}
+            if(other->state==2 && desktop_gpu_offers_share(other,o)){busy=1;break;}}
         if(busy)continue;
         int sent=brook_gpu_window_send_reply(c->peer,o->packet.version,BROOK_GPU_WINDOW_SAFE,&o->packet.identity);if(!sent)return;
         if(sent<0){desktop_gpu_channel_disconnect(c);return;}
-        if(o->buffer>=0)close(o->buffer);
-        if(o->fence>=0)close(o->fence);
-        *o=(struct DesktopGpuOffer){.buffer=-1,.fence=-1};
+        desktop_gpu_offer_free(o);
     }
 }
 static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
@@ -142,16 +162,22 @@ static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
     for(unsigned n=0;n<DESKTOP_GPU_OFFERS;++n){unsigned slot=0;
         while(slot<DESKTOP_GPU_OFFERS && c->offers[slot].state)++slot;
         if(slot==DESKTOP_GPU_OFFERS)return;
-        struct BrookGpuWindowPacket packet={0};int fds[2];int got=brook_gpu_window_receive(c->peer,&packet,fds);
+        struct BrookGpuWindowLayersPacket wire;int fds[2*BROOK_GPU_WINDOW_LAYERS_MAX];unsigned nfds=0;
+        int got=brook_gpu_window_receive_layers(c->peer,&wire,fds,&nfds);
         if(!got)return;
-        if(got<0 || packet.type!=BROOK_GPU_WINDOW_OFFER){
-            if(got>0){if(fds[0]>=0)close(fds[0]);if(fds[1]>=0)close(fds[1]);}
+        if(got<0 || wire.header.type!=BROOK_GPU_WINDOW_OFFER){
+            for(unsigned i=0;got>0 && i<nfds;++i)close(fds[i]);
             desktop_gpu_channel_disconnect(c);return;
         }
+        const struct BrookGpuWindowPacket packet=wire.header;
         uint64_t received=0;
         if(getenv("BROOK_RENDER_TIMELINE")){struct timespec t={0};
             if(!clock_gettime(CLOCK_MONOTONIC,&t))received=(uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
-        c->offers[slot]=(struct DesktopGpuOffer){.packet=packet,.buffer=fds[0],.fence=fds[1],.state=1,.receivedNs=received};
+        struct DesktopGpuOffer *o=&c->offers[slot];
+        *o=(struct DesktopGpuOffer){.packet=packet,.buffer=fds[0],.fence=fds[1],.state=1,.receivedNs=received,.layers=wire.count};
+        for(unsigned i=0;i<BROOK_GPU_WINDOW_LAYERS_MAX-1;++i)o->extraBuffer[i]=o->extraFence[i]=-1;
+        for(unsigned i=0;i<wire.count;++i){o->layer[i]=wire.layers[i];
+            if(i){o->extraBuffer[i-1]=fds[2*i];o->extraFence[i-1]=fds[2*i+1];}}
     }
 }
 /* Selection uses the OS capture's non-reused window identity, never a title.
@@ -163,6 +189,27 @@ enum {DESKTOP_GPU_SELECTED,DESKTOP_GPU_REFUSE_SHAPE,DESKTOP_GPU_REFUSE_NO_CANDID
 static uint64_t g_desktopGpuSelect[DESKTOP_GPU_SELECT_REASONS];
 static const char *const desktop_gpu_select_names[DESKTOP_GPU_SELECT_REASONS]={"selected","shape","no_candidate","failed",
     "snapshot_newer","validate","uses_full"};
+/* Layer i of a version 3 offer as a scene layer: window VFB coordinates are
+ * placed at the client origin and clipped to the client rectangle cropped to
+ * the VFB (the CPU source's 1:1 crop), intersected with the screen. */
+static inline unsigned desktop_gpu_offer_layer_count(const struct DesktopGpuOffer *o){return o && o->layers?o->layers:1;}
+static inline void desktop_gpu_offer_scene_layer(const struct DesktopGpuOffer *o,const struct BrookDesktopLayer *l,
+                                                 uint32_t screenW,uint32_t screenH,unsigned i,struct BrookVkSceneLayer *out){
+    const struct BrookGpuWindowLayer *g=&o->layer[i];
+    uint32_t opacity=(l->flags&BROOK_DESKTOP_LAYER_HAS_OPACITY)?(l->flags&BROOK_DESKTOP_LAYER_OPACITY_MASK)>>BROOK_DESKTOP_LAYER_OPACITY_SHIFT:255;
+    const uint32_t flags=(g->fourcc==0x34325258 || (g->flags&BROOK_GPU_WINDOW_LAYER_OPAQUE))?(BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE):0;
+    int64_t cx0=l->clientX,cy0=l->clientY;
+    int64_t cx1=cx0+(l->width<l->clientWidth?l->width:l->clientWidth),cy1=cy0+(l->height<l->clientHeight?l->height:l->clientHeight);
+    if(cx0<0)cx0=0;
+    if(cy0<0)cy0=0;
+    if(cx1>(int64_t)screenW)cx1=screenW;
+    if(cy1>(int64_t)screenH)cy1=screenH;
+    if(cx1<cx0)cx1=cx0;
+    if(cy1<cy0)cy1=cy0;
+    *out=(struct BrookVkSceneLayer){g->offset,g->stride,g->width,g->height,g->srcX,g->srcY,g->srcWidth,g->srcHeight,
+        (int32_t)(l->clientX+g->dstX),(int32_t)(l->clientY+g->dstY),g->dstWidth,g->dstHeight,
+        (int32_t)cx0,(int32_t)cy0,(uint32_t)(cx1-cx0),(uint32_t)(cy1-cy0),opacity|flags};
+}
 static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopGpuChannel *c,const struct BrookDesktopLayer *l,
                                                                   uint32_t screenW,uint32_t screenH,struct BrookVkSceneLayer *out,uint64_t frame){
     if(!frame || !l || !out || !l->window || l->window>BROOK_DESKTOP_LAYER_LIMIT)return NULL;
@@ -197,9 +244,11 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
     if(!best){if(offered)++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_NO_CANDIDATE];return NULL;}
     /* A client/VFB size mismatch is drawn only when the offer is the VFB
      * itself (cropped 1:1 below); anything else keeps the CPU source. */
-    if((l->width!=l->clientWidth || l->height!=l->clientHeight) &&
+    if(!best->layers && (l->width!=l->clientWidth || l->height!=l->clientHeight) &&
        (best->packet.width!=l->width || best->packet.height!=l->height)){++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SHAPE];return NULL;}
-    if(DESKTOP_GPU_FENCE_FAILED(best->fence) || DESKTOP_GPU_BUFFER_FAILED(best->buffer)){
+    int layerFailed=0;
+    for(unsigned i=1;i<best->layers;++i)layerFailed|=DESKTOP_GPU_FENCE_FAILED(best->extraFence[i-1]) || DESKTOP_GPU_BUFFER_FAILED(best->extraBuffer[i-1]);
+    if(layerFailed || DESKTOP_GPU_FENCE_FAILED(best->fence) || DESKTOP_GPU_BUFFER_FAILED(best->buffer)){
         best->failed=1;best->current=0;
         fprintf(stderr,"DESKTOP_GPU_SOURCE_FAILED window=%u incarnation=%llu commit=%llu (producer fence or buffer failed; CPU source)\n",
             best->packet.identity.window,(unsigned long long)best->packet.identity.incarnation,(unsigned long long)best->packet.identity.commit);
@@ -231,6 +280,7 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
     }else *out=(struct BrookVkSceneLayer){best->packet.offset,best->packet.stride,best->packet.width,best->packet.height,
         0,0,best->packet.width,best->packet.height,l->clientX,l->clientY,l->clientWidth,l->clientHeight,
         0,0,screenW,screenH,opacity|flags};
+    if(best->layers)desktop_gpu_offer_scene_layer(best,l,screenW,screenH,0,out);
     ++g_desktopGpuSelect[DESKTOP_GPU_SELECTED];
     best->state=2;best->frame=frame;return best;
 }
