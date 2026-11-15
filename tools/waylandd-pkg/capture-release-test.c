@@ -513,7 +513,8 @@ static void check_gpu_window_opaque(void)
     root.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(root.xdg_toplevel);
     buffers[1]=retained_test_buffer(client,5);
     ((struct brook_dmabuf_buffer *)wl_resource_get_user_data(buffers[1]))->fourcc=0x34325241;
-    struct pointer_rect rect={0,0,1,1,1};struct pointer_region region={&rect,1,0};
+    /* Chrome's region: its initial window size, larger than the surface. */
+    struct pointer_rect rect={0,0,1050,880,1};struct pointer_region region={&rect,1,0};
     struct wl_resource *reg=wl_resource_create(client,&wl_region_interface,1,6);assert(reg);wl_resource_set_user_data(reg,&region);
     root.xdg_acked=root.xdg_initial_commit_done=1;
     uint32_t vfb=0;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
@@ -537,12 +538,55 @@ static void check_gpu_window_opaque(void)
         assert(brook_gpu_window_send_reply(channel[1],got.header.version,BROOK_GPU_WINDOW_SAFE,&got.header.identity)==1);
         intel_pending_poll();assert(g_gpu_window_channel>=0);
     }
+    /* Coverage is in logical surface units, clamped to the surface. */
+    {struct brook_surface t={0};t.opaque_set=1;t.opaque_w=1050;t.opaque_h=880;
+     assert(surface_opaque_covers(&t,832,642) && surface_opaque_covers(&t,1050,880) && !surface_opaque_covers(&t,1051,880));
+     t.opaque_x=1;assert(!surface_opaque_covers(&t,832,642));t.opaque_x=-5;assert(surface_opaque_covers(&t,832,642));
+     t.opaque_set=0;assert(!surface_opaque_covers(&t,832,642));}
+    /* A later NULL region clears it for the next commit. */
+    surface_set_opaque_region(client,root.resource,NULL);surface_commit(client,root.resource);
+    assert(!root.opaque_set && ((struct brook_view *)root.tree.current->value)->opaque==0);
     wl_resource_set_user_data(reg,NULL);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
     close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
+/* Chromium asks for client-side decoration and then draws a translucent
+ * frame, so its window is never opaque. waylandd answers SERVER_SIDE for
+ * listed app_ids, also when the app_id arrives after the request. */
+static void check_decoration_policy(void)
+{
+    int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,sockets[0]);assert(client);
+    struct brook_surface a={0},b={0};surface_tree_init(&a);surface_tree_init(&b);
+    struct wl_resource *da=wl_resource_create(client,&zxdg_toplevel_decoration_v1_interface,1,2);assert(da);
+    wl_resource_set_implementation(da,&deco_impl,&a,deco_resource_destroyed);
+    struct wl_resource *db=wl_resource_create(client,&zxdg_toplevel_decoration_v1_interface,1,3);assert(db);
+    wl_resource_set_implementation(db,&deco_impl,&b,deco_resource_destroyed);
+    struct wl_resource *ta=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(ta);wl_resource_set_user_data(ta,&a);
+    /* Default: the client's CLIENT_SIDE request is honoured. */
+    unsetenv("BROOK_WAYLAND_SSD_APPS");
+    snprintf(b.app_id,sizeof(b.app_id),"chromium-browser");
+    deco_set_mode(client,db,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(b.deco_csd==1);b.app_id[0]=0;
+    assert(!setenv("BROOK_WAYLAND_SSD_APPS","chromium,google-chrome",1));
+    /* a: request first, app_id later (Chromium's order) -> server side. */
+    deco_set_mode(client,da,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(a.deco_csd==1 && a.deco_resource==da);
+    xdg_toplevel_set_app_id(client,ta,"chromium-browser");assert(a.deco_csd==0);
+    /* b: an unlisted app keeps client-side decoration. */
+    snprintf(b.app_id,sizeof(b.app_id),"org.gnome.Calculator");
+    deco_set_mode(client,db,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(b.deco_csd==1);
+    /* An empty list disables the policy. */
+    assert(!setenv("BROOK_WAYLAND_SSD_APPS","",1));
+    deco_set_mode(client,da,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(a.deco_csd==1);
+    assert(!setenv("BROOK_WAYLAND_SSD_APPS","org.gnome",1));
+    deco_set_mode(client,db,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(b.deco_csd==0);
+    unsetenv("BROOK_WAYLAND_SSD_APPS");
+    wl_resource_destroy(da);assert(!a.deco_resource);
+    wl_resource_set_user_data(db,NULL);
+    wl_client_destroy(client);close(sockets[1]);wl_display_destroy(display);
 }
 static void check_intel_direct(int mode)
 {
@@ -687,6 +731,7 @@ int main(void)
     check_gpu_window_layers();
     check_gpu_window_layers_shm();
     check_gpu_window_opaque();
+    check_decoration_policy();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif
     {

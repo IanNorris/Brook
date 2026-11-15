@@ -91,6 +91,15 @@ static void view_unref(void *value) {
     if (!view || --view->refs) return;
     image_unref(view->image);free(view);
 }
+static unsigned long long g_opaque_views;
+static int surface_opaque_covers(const struct brook_surface *s,uint32_t w,uint32_t h){
+    if(!s->opaque_set || !w || !h || s->opaque_w<=0 || s->opaque_h<=0)return 0;
+    const int64_t x0=s->opaque_x>0?s->opaque_x:0,y0=s->opaque_y>0?s->opaque_y:0;
+    int64_t x1=(int64_t)s->opaque_x+s->opaque_w,y1=(int64_t)s->opaque_y+s->opaque_h;
+    if(x1>(int64_t)w)x1=w;
+    if(y1>(int64_t)h)y1=h;
+    return x0==0 && y0==0 && x1==(int64_t)w && y1==(int64_t)h;
+}
 static void surface_tree_apply(struct bt_node *node,void *value) {
     struct brook_surface *s=node->user;struct brook_view *view=value;
     struct brook_image *image=view?view->image:NULL;
@@ -122,8 +131,13 @@ static int surface_tree_commit(struct brook_surface *s,struct brook_image *image
     if (image) {
         view=calloc(1,sizeof(*view));if (!view) return 0;
         view->refs=1;view->image=image;view->geometry=geometry;image_ref(image);
-        view->opaque=s->opaque_set && s->opaque_x<=0 && s->opaque_y<=0 &&
-            (int64_t)s->opaque_x+s->opaque_w>=(int64_t)geometry.w && (int64_t)s->opaque_y+s->opaque_h>=(int64_t)geometry.h;
+        /* wl_region is in surface-local logical coordinates, the same units
+         * as the view's destination size (geometry.w/h, before output
+         * scale). Clamped to the surface, one rectangle that contains it
+         * makes the whole surface opaque (Chrome sends its initial window
+         * size, larger than the surface after a resize). */
+        view->opaque=surface_opaque_covers(s,geometry.w,geometry.h);
+        if(view->opaque)++g_opaque_views;
     }
     struct brook_frame_callback *frame;
     uint32_t now=g_trace_frames?g_now_ms():0;
@@ -312,7 +326,7 @@ static void surface_layer_trace(const struct brook_surface *root,const struct br
     for(unsigned i=0;i<count && i<4;++i){const struct brook_view *v=draws[i].view;const struct brook_image *im=v->image;
         w->l[i].kind=im->pending_cpu?'p':im->source && im->source->dmabuf?'d':im->pixels?'s':'n';
         w->l[i].w=im->width;w->l[i].h=im->height;w->l[i].dw=v->geometry.w;w->l[i].dh=v->geometry.h;w->l[i].fmt=im->format;
-        w->l[i].opaque=im->opaque;w->l[i].offer=im->offer_state;w->l[i].x=draws[i].x;w->l[i].y=draws[i].y;
+        w->l[i].opaque=im->opaque | (v->opaque<<1);w->l[i].offer=im->offer_state;w->l[i].x=draws[i].x;w->l[i].y=draws[i].y;
         w->l[i].sw=v->geometry.sw;w->l[i].sh=v->geometry.sh;}
     if(!enabled || (!changed && now-w->ms<1000))return;
     w->sig=sig;w->ms=now;

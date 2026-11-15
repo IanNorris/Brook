@@ -386,6 +386,10 @@ struct brook_surface {
     int  deco_csd;          /* 1 = client-side, 0 = server-side */
     int  deco_pending;      /* mode change requested but wm_id not yet known */
     int  deco_negotiated;   /* 1 = client negotiated xdg/KDE decoration */
+    /* xdg-decoration object and the mode the client asked for, so a policy
+     * decided by app_id (which may arrive later) can reconfigure it. */
+    struct wl_resource *deco_resource;
+    int deco_requested_csd;
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -659,7 +663,7 @@ static void trace_frames_report(uint32_t now) {
                 wl_list_length(&s->committed_frames), s->trace_request_max_ms, s->trace_committed_max_ms);
     }
 }
-static unsigned long long g_opaque_null,g_opaque_infinite,g_opaque_rects[5];static int32_t g_opaque_last[6];
+static unsigned long long g_opaque_null,g_opaque_infinite,g_opaque_rects[5];static int32_t g_opaque_last[6];static int g_opaque_last_kind=-1;
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
     (void)c;
@@ -667,6 +671,7 @@ static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r
     const struct pointer_region *region=reg?wl_resource_get_user_data(reg):NULL;
     s->pending_opaque_set=region && !region->infinite && region->count==1 && region->ops[0].add;
     /* What clients send (status file "opaque_regions"). */
+    g_opaque_last_kind=!region?0:region->infinite?2:1;
     if(!region)++g_opaque_null;else if(region->infinite)++g_opaque_infinite;
     else{++g_opaque_rects[region->count<4?region->count:4];
         if(region->count){g_opaque_last[0]=region->ops[0].x;g_opaque_last[1]=region->ops[0].y;g_opaque_last[2]=region->ops[0].w;
@@ -878,6 +883,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     pointer_region_clear(&s->input_region);pointer_region_clear(&s->pending_input_region);
     xwayland_surface_detach(s);
     if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
+    if (s->deco_resource) { wl_resource_set_user_data(s->deco_resource,NULL);s->deco_resource=NULL; }
     /* Scrub references to this surface from all seat clients before we free
      * it.  Without this, a subsequent input event would dereference freed
      * memory and (more visibly) call wl_pointer.send_leave with a surface
@@ -1014,6 +1020,8 @@ static void xdg_toplevel_set_title(struct wl_client *c, struct wl_resource *r,
     if (s->wm_id) wm_set_title(s->wm_id, s->title);
     fprintf(stderr, "[waylandd] xdg_toplevel.set_title: %s\n", s->title);
 }
+static void deco_apply_mode(struct wl_resource *r, int csd);
+static int deco_force_server_side(const struct brook_surface *s);
 static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
                                      const char *app_id) {
     (void)c;
@@ -1021,6 +1029,9 @@ static void xdg_toplevel_set_app_id(struct wl_client *c, struct wl_resource *r,
     if (!s || !app_id) return;
     snprintf(s->app_id, sizeof(s->app_id), "%s", app_id);
     if (s->wm_id) wm_set_app_id(s->wm_id, s->app_id);
+    /* The decoration request may precede the app_id: apply the policy now. */
+    if (s->deco_resource && s->deco_csd && s->deco_requested_csd && deco_force_server_side(s))
+        deco_apply_mode(s->deco_resource, 1);
 }
 static void xdg_toplevel_show_window_menu(struct wl_client *c, struct wl_resource *r,
                                             struct wl_resource *seat, uint32_t serial,
@@ -2094,6 +2105,10 @@ static void pump_input_once(void) {
 static void deco_destroy(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
 }
+static void deco_resource_destroyed(struct wl_resource *r) {
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (s && s->deco_resource==r) s->deco_resource=NULL;
+}
 static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;
     /* Popups never acquire toplevel chrome, irrespective of negotiation. */
@@ -2110,9 +2125,32 @@ static void surface_apply_decoration(struct brook_surface *s, int csd) {
         s->deco_pending = 1;
     }
 }
+/* Clients whose client-side frame is translucent (shadows, rounded corners)
+ * and that support server-side decoration well. Answering their CLIENT_SIDE
+ * request with SERVER_SIDE (the protocol lets the compositor choose) makes
+ * the window opaque, so the renderer can cull beneath it, and Brook's WM
+ * draws the chrome. Opt-in: BROOK_WAYLAND_SSD_APPS is a comma list of
+ * app_id prefixes (unset or empty: honour the client's request). */
+static int deco_force_server_side(const struct brook_surface *s){
+    if(!s || !s->app_id[0])return 0;
+    const char *list=getenv("BROOK_WAYLAND_SSD_APPS");
+    /* Off by default: Chromium keeps drawing its custom frame inside the
+     * server-side one (gen 405: a double frame with a transparent shadow
+     * margin). Its "use system title bar" preference is the working fix. */
+    if(!list)return 0;
+    for(const char *p=list;*p;){
+        const char *e=strchr(p,',');size_t n=e?(size_t)(e-p):strlen(p);
+        if(n && !strncmp(s->app_id,p,n))return 1;
+        if(!e)break;p=e+1;
+    }
+    return 0;
+}
 static void deco_apply_mode(struct wl_resource *r, int csd) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    s->deco_resource=r;s->deco_requested_csd=csd;
+    if(csd && deco_force_server_side(s)){
+        csd=0;fprintf(stderr,"[waylandd] decoration server_side policy app_id=%s\n",s->app_id);}
     surface_apply_decoration(s, csd);
     zxdg_toplevel_decoration_v1_send_configure(r,
         s->deco_csd ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
@@ -2148,7 +2186,7 @@ static void deco_mgr_get_toplevel_decoration(struct wl_client *c,
         &zxdg_toplevel_decoration_v1_interface,
         wl_resource_get_version(r), id);
     if (!d) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(d, &deco_impl, s, NULL);
+    wl_resource_set_implementation(d, &deco_impl, s, deco_resource_destroyed);
     if (s) s->deco_negotiated = 1;
     fprintf(stderr, "[waylandd] decoration get_toplevel_decoration surface=%p\n",
             (void*)s);
@@ -3538,9 +3576,9 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
         (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
     fprintf(f,"\"opaque_regions\":{\"null\":%llu,\"infinite\":%llu,\"by_ops\":[%llu,%llu,%llu,%llu,%llu],"
-        "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
+        "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d,\"last_kind\":%d,\"opaque_views\":%llu},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
         g_opaque_rects[2],g_opaque_rects[3],g_opaque_rects[4],g_opaque_last[0],g_opaque_last[1],g_opaque_last[2],g_opaque_last[3],
-        g_opaque_last[4],g_opaque_last[5]);
+        g_opaque_last[4],g_opaque_last[5],g_opaque_last_kind,g_opaque_views);
     fprintf(f,"\"layered\":{\"enabled\":%d,\"offers\":%llu,\"safe\":%llu,\"presented\":%llu,\"wait\":%llu,\"full\":%llu,"
         "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu},",gpu_layers_enabled(),
         (unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_safe,(unsigned long long)g_gpu_group_presented,
@@ -3559,8 +3597,11 @@ static void waylandd_status_write(const char *display){
         BrookWindowState state={0};
         const int known=!syscall(BROOK_SYS_WM_WINDOW_STATE,(long)w->wm,0L,(long)&state,(long)sizeof(state),0L,0L) &&
             state.version==BROOK_WINDOW_STATE_VERSION && state.window==w->wm;
-        fprintf(f,"%s{\"wm\":%u,\"vfb\":[%u,%u],\"client\":[%u,%u],\"scale\":%u,\"path\":\"%s\",\"count\":%u,\"layers\":[",
-            first?"":",",w->wm,w->vfb_w,w->vfb_h,known?state.width:0,known?state.height:0,
+        const struct brook_surface *rs=NULL;for(const struct brook_surface *x=g_surfaces;x;x=x->next)if(x->wm_id==w->wm && !x->tree.parent){rs=x;break;}
+        if(rs)fprintf(f,"%s{\"opaque_region\":[%d,%d,%d,%d,%d],",first?"":",",rs->opaque_set,rs->opaque_x,rs->opaque_y,rs->opaque_w,rs->opaque_h);
+        else fprintf(f,"%s{",first?"":",");
+        fprintf(f,"\"wm\":%u,\"vfb\":[%u,%u],\"client\":[%u,%u],\"scale\":%u,\"path\":\"%s\",\"count\":%u,\"layers\":[",
+            w->wm,w->vfb_w,w->vfb_h,known?state.width:0,known?state.height:0,
             w->scale,w->path>=0 && w->path<LAYER_PATHS?g_layer_path_names[w->path]:"?",w->count);first=0;
         for(unsigned k=0;k<w->count && k<4;++k)fprintf(f,"%s{\"kind\":\"%c\",\"buf\":[%u,%u],\"dst\":[%u,%u],\"at\":[%lld,%lld],"
             "\"src24_8\":[%u,%u],\"fmt\":%u,\"opaque\":%d,\"offer\":%d}",k?",":"",w->l[k].kind,w->l[k].w,w->l[k].h,w->l[k].dw,w->l[k].dh,
