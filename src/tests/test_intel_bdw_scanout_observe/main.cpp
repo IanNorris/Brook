@@ -35,6 +35,7 @@ extern "C" [[noreturn]] void KernelPanic(const char* format,...){
     }
     std::abort();
 }
+void BdwZeroCopySetAutoArm(bool){}
 bool BdwPreparePrivateImages(){++prepares;return scenario!=28;}
 bool BdwPreparePrivateRenderImages(uint32_t (&)[20*1024]){++renderPrepares;return scenario!=31;}
 bool BdwRetainPrivateBcsImages(uint32_t){++retains;return scenario!=33;}

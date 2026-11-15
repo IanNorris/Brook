@@ -1833,6 +1833,11 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         // M4a prompt wakeups stay off unless explicitly opted in at boot or
         // enabled later with `gpu wakeups on`.
         if(OptedIn("/etc/dell-gpu-prompt-wake"))BdwPromptWakeSet(true);
+        // Zero-copy scanout (wt) auto-arm when the renderer registers its
+        // ring. Opt-in for now (/etc/dell-zero-copy-auto) until the gen 401
+        // compositor failure after a live arm is understood; flip the
+        // default by inverting this test.
+        BdwZeroCopySetAutoArm(OptedIn("/etc/dell-zero-copy-auto"));
 #endif
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");

@@ -6266,6 +6266,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("sequence",z.sequence);r.text(",");r.field("setup_us",z.setupUs);
         r.text(",");r.field("gop_returns",z.gopReturns);
         r.text(",\"uncached_render\":");r.text(z.uncachedRender?"true":"false");
+        r.text(",\"auto_arm\":");r.text(BdwZeroCopyAutoArm()?"true":"false");
         r.text(",\"cache_mode\":");r.quoted(BdwZeroCopyCacheModeName());
         r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}

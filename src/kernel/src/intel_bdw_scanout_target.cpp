@@ -331,6 +331,7 @@ struct ZcImage {BdwGpuBuffer* buffer=nullptr;uint64_t identity=0;uint64_t* dma=n
     BdwGgttReservation reservation{};BdwGgttExtentBind bind;bool bound=false;};
 ZcImage zcImages[BdwZeroCopyMaxImages];
 uint32_t zcCount=0;uint64_t zcOwner=0;
+bool zcAutoArm=false;
 BdwZeroCopyRing zcRing;
 bool zcRequested=false,zcActive=false,zcDisabled=false,zcRepairOwed=false,zcBound=false;
 const char* zcReason="not requested";const char* zcPendingLog=nullptr;
@@ -735,6 +736,10 @@ int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* images,uint32_t 
     zcCount=imageCount;zcOwner=owner;
     IrqSpinLockRelease(&lock,f);
     KPrintf("gpu-zerocopy: registered %u renderer images (owner %lx)\n",imageCount,owner);
+    if(__atomic_load_n(&zcAutoArm,__ATOMIC_ACQUIRE)){
+        const char* note="";const bool armed=BdwZeroCopyArm(note);
+        KPrintf("gpu-zerocopy: boot default arm %s (%s)\n",armed?"requested":"refused",note);
+    }
     return 0;
 }
 int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count){
@@ -977,7 +982,10 @@ bool BdwZeroCopyArm(const char*& reason){
     IrqSpinLockRelease(&lock,f);
     return ok;
 }
+void BdwZeroCopySetAutoArm(bool enabled){__atomic_store_n(&zcAutoArm,enabled,__ATOMIC_RELEASE);}
+bool BdwZeroCopyAutoArm(){return __atomic_load_n(&zcAutoArm,__ATOMIC_ACQUIRE);}
 void BdwZeroCopyDisarm(){
+    __atomic_store_n(&zcAutoArm,false,__ATOMIC_RELEASE); // an explicit off holds for the boot
     const uint64_t f=IrqSpinLockAcquire(&lock);zcRequested=false;if(!zcDisabled)zcReason="leaving at the next present";
     IrqSpinLockRelease(&lock,f);
 }
@@ -1008,6 +1016,8 @@ uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& kh
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
+void BdwZeroCopySetAutoArm(bool){}
+bool BdwZeroCopyAutoArm(){return false;}
 bool BdwZeroCopyUncachedRender(){return false;}
 uint8_t BdwZeroCopyScanoutPat(){return 0;}
 bool BdwZeroCopySetCacheMode(uint32_t){return false;}
@@ -1027,6 +1037,8 @@ uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& kh
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
+void BdwZeroCopySetAutoArm(bool){}
+bool BdwZeroCopyAutoArm(){return false;}
 bool BdwZeroCopyUncachedRender(){return false;}
 uint8_t BdwZeroCopyScanoutPat(){return 0;}
 bool BdwZeroCopySetCacheMode(uint32_t){return false;}
@@ -1057,6 +1069,8 @@ uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& kh
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
 bool BdwZeroCopyArm(const char*& reason){reason="not built";return false;}
 void BdwZeroCopyDisarm(){}
+void BdwZeroCopySetAutoArm(bool){}
+bool BdwZeroCopyAutoArm(){return false;}
 bool BdwZeroCopyUncachedRender(){return false;}
 uint8_t BdwZeroCopyScanoutPat(){return 0;}
 bool BdwZeroCopySetCacheMode(uint32_t){return false;}
