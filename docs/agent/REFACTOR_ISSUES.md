@@ -2,6 +2,130 @@
 
 _Started 15 November 2026 during the pure-move split of `syscall.cpp` (branch `work/syscall-split`, see [syscall-split-plan.md](syscall-split-plan.md)). Nothing listed here was changed by the split. This log drives the separate fix pass, which adds test coverage first._
 
+## Fix pass status (15 November 2026, branch `work/syscall-fixes`)
+
+The fix pass took all 27 high entries plus the wakeup-related medium entries. Each entry now carries a **Status (fix pass)** line. Every high entry was confirmed against the code before it was changed; none was refuted outright, and H-26 is partly refuted (see its entry).
+
+| Outcome | Entries |
+|---|---|
+| Fixed, with a host test that fails on the previous code | H-01, H-02, H-05, H-06, H-09, H-10, H-11, H-12, H-13, H-14, H-15, H-16, H-17, H-18, H-23, H-24, H-26, H-27, M-18, M-23, M-27 |
+| Fixed; the test encodes the fix, but the old tree cannot build against it or the changed path is kernel-only | H-07, H-08, H-19, H-25, L-09 |
+| Hardened only (policy still open) | H-04 |
+| Partly fixed | M-64, L-60 (single-slot waiters remain on read/write/accept and on /dev/tty) |
+| Open: policy decision for Ian | H-03, H-21; see "Authorisation proposal" |
+| Deferred, with a design below | H-20, H-22 |
+
+Commits, oldest first:
+
+- `b61a0f73`: raw user pointers in input/WM, getdents64, open and keyboard read;
+- `06a10c04`: inet sockets;
+- `ae328f7a`: abstract AF_UNIX names;
+- `6881a138`: clone TLS, vfork, child TID;
+- `cd53b5ac`: read on O_WRONLY;
+- `4ef02e1f`: no user copies under spinlocks;
+- `d9c2bafa`: /dev/tty pins;
+- `863f802a`: sync-file, pipe and eventfd wakeups;
+- `196cc80d`: validate-then-dereference in process, time, cred, poll and stat;
+- `c5a6cae6`: ioctl and virtio DRM;
+- `ea753d08`: input grab hardening.
+
+### Test scaffolding
+
+`src/tests/test_syscall_user_memory/` compiles the real `syscall_*.cpp` files on the host against a fake user address space. There is one translation unit per area, and `--gc-sections` drops whatever a case does not reach.
+
+- **User memory** is an mmap arena with per-page protection. Every address outside it counts as kernel memory, so a raw store through a "kernel" pointer corrupts a canary instead of returning -EFAULT.
+- **Raced-unmap mode** marks a range unmapped right after `UserBufferReadable/Writable` succeeds, which is what a sibling `munmap` does. A handler that still dereferences after validating then writes into the "unmapped" page, and the case fails.
+- **Hooks** observe every user copy (to assert no pipe or memfd spinlock is held), every wake and every block.
+- **Stand-ins:** `fakes.cpp` holds minimal versions of the subsystems underneath (VFS lookups, a fake UDP/TCP socket, GPU ops). The real pipe, AF_UNIX, eventfd, memfd and poll code is compiled in.
+
+### Validate-then-dereference: the design
+
+The fault-tolerant copy already exists:
+
+- `user_copy.S` has one labelled `rep movsb` per direction.
+- `UserCopyFaultFixup`, called from the #PF handler, redirects a fault on exactly those instructions to a residual-count return.
+- `CopyFromUser`/`CopyToUser` prefault and retry the remaining page, so a raced `munmap` or `mprotect` becomes a short copy and -EFAULT.
+
+Any other kernel-mode fault on an unresolvable user address still panics.
+
+So the rule is: **user memory only through `CopyFromUser`/`CopyToUser`/`CopyUserCString*`**. Results are built in kernel memory and copied once, and never while a spinlock is held. `UserBufferReadable/Writable` remain useful only as an early check before consuming state, for example before popping input events. No new mechanism was needed.
+
+Sites converted in this pass: every site named by H-01, H-02, H-05, H-06, H-08, H-09, H-10, H-13, H-14, H-17, H-18 and H-19, plus the device reads in M-27.
+
+A grep after the pass found these sites still dereferencing user memory directly, for the next round:
+
+- `VfsRead`/`VfsWrite` on regular files (`sys_read`, `sys_write`, `pread64`/`pwrite64`) receive the user pointer and copy inside the filesystem. This is the largest remaining class. It needs a user-aware VFS copy or a bounce buffer in `syscall_rw.cpp`.
+- `readv`/`writev` read the iovec array directly (M-28), and `sendmmsg`/`recvmmsg` read the message vector directly.
+- `setsockopt`/`getsockopt` values and lengths, and `socketpair`'s result array.
+- WM `get_screen_info`, `scanout_map` and `get_windows` (M-02). GPU `submit` and `upload_buffer` pass raw pointers to the driver (M-01).
+- The DSP write path, `FUTEX_WAIT` (L-54) and the netlink request staging.
+
+### Authorisation proposal (H-03, H-04, H-21; Ian decides)
+
+Current in-tree users:
+
+- waylandd uses the per-window WM syscalls (506-520, 525), and none of 504, 505 or 521-524.
+- The Vulkan renderer (`tools/vulkan-compositor-pkg`) uses `DESKTOP_LAYERS` (0xB19) and the overlay (0xB1A).
+- The bridge's frame capture goes through the debug command path and `debug_frame`.
+
+Proposal:
+
+1. **Add one display-server capability.** It is a process-wide flag set by the kernel, never by the process itself.
+   - It goes to the processes the boot script starts as the desktop: the registered offscreen renderer (`BdwOffscreenRendererOwnedBy`), waylandd, and root.
+   - It survives `exec` only into those binaries, and never passes through `fork` into an unrelated `exec`.
+2. **Gate these syscalls on it**, returning -EPERM otherwise:
+   - `input_pop` (504) and `input_grab` (505);
+   - the legacy compositor calls 521-524 (scanout map and flip, window list, mapping any window's VFB);
+   - `DESKTOP_LAYERS` (0xB19), and the full-frame ops 0 and 2 of `DESKTOP_OVERLAY` (0xB1A);
+   - `DESKTOP_CLIENT_FRAME`;
+   - the cursor image set and reset (L-44).
+3. **Retire 521-524** if Ian confirms nothing out of tree uses them. There is no in-tree caller.
+4. **Keep `debug_frame` root-only**, and give it its own capture slot so that a desktop capture cannot starve it.
+
+Already done, with no policy change: `input_grab` refuses to replace a live grabber unless the caller is that grabber or root (`ea753d08`).
+
+### Shared open-file description (H-20)
+
+Today `FdEntry` holds `seekPos` and `statusFlags` per slot, and `dup`, `dup2`, `fork` and SCM_RIGHTS copy them.
+
+A correct fix gives each open a refcounted `OpenFile { refs; lock; offset; statusFlags; type; handle; }`. `FdEntry` then keeps only `fdFlags` (CLOEXEC) and a pointer to it.
+
+- **Reference counting:** `FdTableDuplicate*`, `FdTableForkSnapshot`, `UnixFdSnapFrom`/`Install` and `FinalizeClosedFd` retain and release the `OpenFile` rather than the handle. The per-type handle refcount moves into the `OpenFile`'s final release.
+- **Offsets:** `read`, `write`, `lseek`, `getdents64`, `sendfile` and `copy_file_range` update the offset under `OpenFile::lock`. That lock must be a sleeping lock, because VFS I/O can block. Pipes and sockets ignore the offset and skip the lock.
+- **Status flags:** `F_GETFL`/`F_SETFL` and `FIONBIO` act on the shared flags.
+
+This touches every fd type's lifetime, so it needs its own branch and a QEMU shell test. The test should show interleaved rather than overwritten output for `cmd >f 2>&1` and `{ a; b; } >f`, and should show a forked child's `F_SETFL O_NONBLOCK` reaching the parent.
+
+### GPU_ATTACH_WINDOW lifetime (H-22)
+
+`sys_brook_gpu_attach_window` (0xB12) hands the window's kernel VFB address to the virtio-gpu driver as resource backing. `WM_RESIZE_VFB` and window destroy then retire those pages through `CompositorRetireVfb`, while the host resource stays attached until `CtxDestroy`. Only the virtio demo apps (`gltri`, `glgears`) call it.
+
+Proposed fix:
+
+1. At attach, record `(ctx, resId)` on the `Window` under `g_vfbLock`, and do the window lookup under the same lock.
+2. In resize and destroy, before the old VFB is retired, call `GpuAppOps::RetireResource(ctx, resId)` (detach plus host unref) and clear the record. A later use of that resource by the app then fails instead of writing freed pages.
+
+It was not done in this pass, for two reasons:
+
+- The driver op must not run under `g_vfbLock` if the compositor's virtio path can take that lock while holding the virtqueue. The call therefore has to move outside the lock, with a retirement pin.
+- The QEMU check does not exercise virgl, so the change could not be verified.
+
+### Wakeups (H-26, M-18): what changed and what remains
+
+Changed:
+
+- **Sync files:** poll and epoll on an Intel sync_file arm the GPU `Retire` event, which every fence completion signals. A completion between the readiness check and the arm is reported as stale and rechecked.
+- **Fallback tick:** prompt GPU wakes are off by default (`gpu wakeups on` enables them). While they are off, a pending fence polls every 1 ms tick instead of every 50 or 100 ms.
+- **Pipes:** poll(POLLOUT) on a pipe write end now subscribes to the pipe.
+- **Eventfds:** each eventfd keeps a waiter list, so concurrent readers, writers, pollers and epoll waiters all wake.
+- **epoll:** pipes and AF_UNIX streams use pipe poll subscriptions instead of the single `epollWaiter` slots.
+
+Remaining:
+
+- **Single-slot waiters:** pipe and AF_UNIX `readerWaiter`/`writerWaiter` (blocking read and write), `acceptWaiter`, the listening socket's `epollWaiter` and the /dev/tty reader. Two blocked readers on one pipe still fall back to the 10 ms tick.
+- **10 ms tick:** signals aimed at a different thread from the signalfd poller, and poll() on an epoll fd.
+
+
 ## How this was collected
 
 Seven read-only reviewers each took one group of the new files. Each reviewer read the code in full, checked callees where severity depended on them, and reported every finding as file, function and an exact code snippet. The snippets were located mechanically in the split files, so every **Where** line points at the post-split location on this branch.
@@ -112,6 +236,7 @@ Elsewhere in the kernel:
 - **Problem:** 4 sites write through raw user pointers with no range check: input_pop (up to 256x16 bytes); sys_brook_wm_create_window and sys_brook_wm_resize_vfb (`auto* uo = reinterpret_cast<BrookWmCreateOut*>(outPtr);`); sys_brook_wm_pop_input (WmInputPop writes `out[produced++]`). There is no SMAP, so a kernel address is accepted and written with partly caller-controlled data. An unmapped address faults in kernel mode. On a failed write, events are lost or the new window leaks.
 - **Suggested fix:** Build the result in a kernel buffer, then CopyToUser. For pop_input, pop into a local array (WmInputPopOwned). Roll back window create/resize if the copy fails.
 - **Test:** Host test per handler with a kernel-half address and an unmapped address: -EFAULT and no kernel write. QEMU guest passing 0xffff800000000000 to syscalls 504, 506, 510 and 511.
+- **Status (fix pass):** fixed in `b61a0f73`. Test: host test in `test_syscall_user_memory` (input_wm.cpp).
 
 ### H-02 · Window title read byte by byte from an unvalidated user pointer (kernel memory disclosure)
 
@@ -120,6 +245,7 @@ Elsewhere in the kernel:
 - **Problem:** 2 sites (set_title, and create_window's `char c = utp[i];`). A kernel address supplied as the title copies kernel memory into a title that WM_GET_WINDOWS or the chrome then shows. An unmapped pointer faults the kernel. set_app_id already does this correctly with CopyUserCString.
 - **Suggested fix:** Use CopyUserCString(titlePtr, buf, sizeof(buf)) and return -EFAULT, through one shared helper.
 - **Test:** Host test: a kernel pointer and an unmapped title pointer both give -EFAULT; titles of 63, 64 and 65 bytes are terminated correctly.
+- **Status (fix pass):** fixed in `b61a0f73`. Test: host test in `test_syscall_user_memory` (input_wm.cpp).
 
 ### H-03 · Legacy user-mode compositor syscalls 521-524 lack any privilege check
 
@@ -128,6 +254,7 @@ Elsewhere in the kernel:
 - **Problem:** Any process can map the compositor backbuffer read/write, push rows to MMIO (scanout_flip), list every window (get_windows) and map any window's VFB (map_window_vfb, where WmMapWindowVfb only checks that the caller is non-null). That allows cross-process pixel leaks and screen spoofing. compositor.h says "privileged userspace process", but nothing enforces it. 521 and 524 also skip the ProcessCurrent() null check.
 - **Suggested fix:** Gate on a compositor capability (root, the registered input grabber or the display server), or retire the syscalls if unused. Otherwise return -EPERM.
 - **Test:** QEMU test: an unprivileged process calling 521-524 gets -EPERM.
+- **Status (fix pass):** open: policy decision for Ian; proposal under "Authorisation proposal" below. Confirmed: 521-524 have no in-tree caller.
 
 ### H-04 · Any process can become the global input grabber (keylogger, waylandd DoS)
 
@@ -136,6 +263,7 @@ Elsewhere in the kernel:
 - **Problem:** CompositorSetInputGrabber replaces the current grabber unconditionally, so any process receives all keyboard and mouse input and the display server stops getting it.
 - **Suggested fix:** Require privilege, and refuse while a live grabber is registered unless the caller is that grabber.
 - **Test:** QEMU test: non-root 505 gives -EPERM and the existing grabber keeps receiving input.
+- **Status (fix pass):** hardened in `ea753d08` (no silent takeover of a live grabber; root may take over). Policy still open, see "Authorisation proposal". Test: host test of `InputGrabTakeoverAllowed` (grab.cpp).
 
 ### H-05 · GET_CAPS zero-fills a user buffer directly and passes the raw user pointer to the GPU driver
 
@@ -144,6 +272,7 @@ Elsewhere in the kernel:
 - **Problem:** The address is only range-checked with UserBufferWritable (no UserAccessScope). The code then writes it byte by byte, and GetCapset writes up to 64 KiB into user memory from driver context. A sibling munmap or mprotect makes the kernel fault.
 - **Suggested fix:** kmalloc and zero a kernel buffer, GetCapset into it, then CopyToUser.
 - **Test:** QEMU virgl race test (GET_CAPS while a sibling munmaps); host test: an unmapped address gives -EFAULT.
+- **Status (fix pass):** fixed in `c5a6cae6`. Test: host test in `test_syscall_user_memory` (ioctl.cpp: the fake driver must receive a kernel buffer).
 
 ### H-06 · Direct user-pointer dereference after range validation only (repeated pattern)
 
@@ -152,6 +281,7 @@ Elsewhere in the kernel:
 - **Problem:** About 30 sites: 13 more in DRM (VERSION, GET_CAP, GETPARAM, RESOURCE_CREATE/INFO, TRANSFER, EXECBUFFER, PRIME, GEM_CLOSE, MAP) and 16 in ioctl (FIONBIO, FIONREAD, FBIO*, termios/TIOC*, TCGETS2). Examples: `DrmVirtgpuExecbuffer eb = *reinterpret_cast<DrmVirtgpuExecbuffer*>(arg);` and `auto* info = reinterpret_cast<FbVarScreeninfo*>(arg);`. A concurrent munmap makes the kernel fault, and partial in-place writes leave torn output.
 - **Suggested fix:** CopyFromUser into a kernel local, fill it, and CopyToUser once. Use one termios/winsize helper.
 - **Test:** Host test per ioctl family with an unmapped or read-only arg giving -EFAULT; QEMU munmap race against TCGETS, FBIOGET and RESOURCE_CREATE.
+- **Status (fix pass):** fixed in `c5a6cae6` (also L-09: one set of termios/pgrp/winsize helpers). Test: host test in `test_syscall_user_memory` (ioctl.cpp, including the raced-unmap mode).
 
 ### H-07 · vfork parent can block forever (lost wakeup); parent pointer unowned
 
@@ -160,6 +290,7 @@ Elsewhere in the kernel:
 - **Problem:** vforkParent is set after SchedulerAddProcess, and an unconditional [PROFILE] fork print widens the window. A child that exits or execs first never wakes the parent. SchedulerBlock returns on any wake. The raw pointer holds no reference, so a killed parent leaves the child unblocking a freed task.
 - **Suggested fix:** Publish a referenced vforkParent before SchedulerAddProcess; wait on a completion flag in a loop; use one release helper for exit, exit_group and exec.
 - **Test:** QEMU test_vfork_race: 10k vfork iterations with immediate _exit, and exec-ENOENT then _exit.
+- **Status (fix pass):** fixed in `6881a138`. Test: host test in `test_syscall_user_memory` (process.cpp). The old tree does not build against the test (new release helper); the publication-order assertion encodes the bug.
 
 ### H-08 · Direct user-pointer dereference after validation only (exec vectors, clone3, clone tid, wait4/waitid, arch_prctl, mincore)
 
@@ -168,6 +299,7 @@ Elsewhere in the kernel:
 - **Problem:** 11 sites. Exec slots and strings; clone3 `__builtin_memcpy(&copied,reinterpret_cast<const void*>(argsPtr)`; clone parent tid; wait4 status (`*reinterpret_cast<int32_t*>(statusAddr) = event.status`, after the child is already reaped); CopyWaitUsage; waitid; arch_prctl GET_FS/GET_GS; mincore `vec[i] = 1`. A raced munmap gives a kernel #PF.
 - **Suggested fix:** Copy*User throughout.
 - **Test:** QEMU test_usercopy_race; host CopyExecVector test.
+- **Status (fix pass):** fixed: arch_prctl GET_FS/GS in `6881a138`, the rest (exec vectors, clone3, wait4/waitid, rusage, mincore) in `196cc80d`. Test: covered by the checked-copy rule; no dedicated host case for exec/wait (they need the scheduler); clone3 is exercised by process.cpp.
 
 ### H-09 · User memory validated then dereferenced directly (37 sites in poll/cred/time/signal/sysinfo/sched/epoll)
 
@@ -176,6 +308,7 @@ Elsewhere in the kernel:
 - **Problem:** 37 sites: poll 9 (ParseWaitTimeout, PollUser in and out, SelectWait, the pselect6 argument), cred 9, time 8 (nanosleep, clock_nanosleep, timer_*), signal 5, sysinfo 5, sched 2 and epoll_ctl 1. A raced munmap faults the kernel (a user-triggerable DoS). timer_create writes the id after the timer exists, with no failure path, so the timer leaks. The UserAccessScope in clock_gettime is redundant.
 - **Suggested fix:** CopyFromUser/CopyToUser everywhere; delete the timer when the id copy fails.
 - **Test:** QEMU munmap race on poll, select, nanosleep rem, getgroups and getresuid gives EFAULT.
+- **Status (fix pass):** fixed in `196cc80d` (all 37 sites; timer_create deletes the timer when the id copy fails). Test: host test in `test_syscall_user_memory` (race.cpp: raced-unmap mode).
 
 ### H-10 · sched_getparam checks readability then writes
 
@@ -184,6 +317,7 @@ Elsewhere in the kernel:
 - **Problem:** A read-only page passes the check and is then written, which faults or (with WP off) modifies a read-only or CoW page. NULL or a bad pointer returns 0.
 - **Suggested fix:** CopyToUser; -EINVAL for NULL and -EFAULT on failure.
 - **Test:** sched_getparam on a PROT_READ page gives -EFAULT.
+- **Status (fix pass):** fixed in `196cc80d` (NULL is -EINVAL, a failed store -EFAULT). Test: host test in `test_syscall_user_memory` (race.cpp: read-only page).
 
 ### H-11 · User memory copied while a spinlock is held (pipe ring, memfd, serial)
 
@@ -192,6 +326,7 @@ Elsewhere in the kernel:
 - **Problem:** PipeBuffer::read/write memcpy under pipe->lock, and several callers hand them raw user pointers: /dev/tty read and write, pipe and FIFO write via pipe_write.inc, and AF_UNIX stream read and write. MemFdReadAt and MemFdWriteAt memcpy under MfdLock (a spinlock). DebugSerial and DevKeyboard write `buf[i]` under SerialLock. About 10 sites. A raced munmap, mprotect or fork-CoW faults inside a spinlock, giving a panic or deadlock.
 - **Suggested fix:** Stage through bounded kernel buffers with Copy*User outside the lock, as PipeReadSome and ReceiveTcpToUser already do.
 - **Test:** Host test_pipe_write asserting the callback never sees a user address; QEMU munmap and fork race on pipe, tty and memfd writes.
+- **Status (fix pass):** fixed in `4ef02e1f`. Test: host test in `test_syscall_user_memory` (memfd.cpp: no lock held across any user copy) and `test_pipe_write` (CopyFromUser staging, faulting source).
 
 ### H-12 · read()/pread64() on an O_WRONLY regular file returns its contents
 
@@ -200,6 +335,7 @@ Elsewhere in the kernel:
 - **Problem:** The Vnode branches never check (statusFlags&3)==1, while the MemFd, BlockDevice and sendfile paths do. A mode-0200 file opened write-only can be read, bypassing permissions. Linux returns EBADF.
 - **Suggested fix:** Return -EBADF for write-only descriptors; use a shared FdReadable/FdWritable helper.
 - **Test:** QEMU: create a mode-0200 file, open O_WRONLY; read and pread give EBADF.
+- **Status (fix pass):** fixed in `cd53b5ac`. Test: host test in `test_syscall_user_memory` (rw.cpp).
 
 ### H-13 · Cooked-tty Ctrl+C writes to an unvalidated user pointer when count==0
 
@@ -208,6 +344,7 @@ Elsewhere in the kernel:
 - **Problem:** UserBufferWritable is skipped for count==0, but the Ctrl+C branch still stores buf[0] and returns 1. read(fd, kernel address, 0) followed by Ctrl+C writes 0x0A into the kernel, and the call returns more than count.
 - **Suggested fix:** Return 0 for count==0 and use CopyToUser.
 - **Test:** QEMU: read(tty, 0xffff800000001000, 0) with an injected Ctrl+C returns 0.
+- **Status (fix pass):** fixed in `b61a0f73`. Test: host test in `test_syscall_user_memory` (rw.cpp).
 
 ### H-14 · Inet socket paths pass raw, unvalidated user pointers to the net stack or write through them (arbitrary kernel read/write)
 
@@ -216,6 +353,7 @@ Elsewhere in the kernel:
 - **Problem:** About 9 sites do no range check at all, so a kernel address is accepted. SockRecvFrom writes the datagram and source address directly, and a fault leaves the RX tail half-advanced. Others: sys_bind (`auto* addr = reinterpret_cast<const SockAddrIn*>(addrVal);`, which leaks through getsockname), sys_sendto UDP, sys_recvmsg UDP (`void* buf = msg->msg_iov[0].iov_base;`, `*dst = srcAddr;`), getsockname/getpeername inet (`__builtin_memcpy(uaddr, &local, copyLen);`), AcceptSocket inet (`*userAddr = peerAddr;`, which ignores addrlen and overflows) and AcceptSocket AF_UNIX (an addrlen store guarded only by >=0x1000).
 - **Suggested fix:** Stage every address and payload in the kernel; CopyFromUser into a SockAddrIn (check sin_family); CopyToUser min(*addrlen, actual) plus the length; user-aware UDP variants.
 - **Test:** Host test with stubbed user_copy rejecting kernel-range pointers: -EFAULT for bind, sendto, recvfrom, recvmsg, getsockname, getpeername and accept. QEMU probe with 0xffff800000000000.
+- **Status (fix pass):** fixed in `06a10c04`. Test: host test in `test_syscall_user_memory` (socket.cpp, with a fake network stack).
 
 ### H-15 · Abstract AF_UNIX names not distinguished; every abstract connect matches the first abstract listener
 
@@ -224,6 +362,7 @@ Elsewhere in the kernel:
 - **Problem:** bind and connect copy the name with `for (int i = 0; i < 107 && path[i]; ++i)`, which stops at the leading NUL, so every abstract path is "". A connect to "@foo" can reach "@bar": wrong peer, and a security problem. There is no EADDRINUSE for abstract names, sun_path is cut to 107 bytes, and addrlen==2 binds an empty name rather than autobinding.
 - **Suggested fix:** memcmp the full abstract address with its length; enforce uniqueness under g_unixNameLock; implement autobind.
 - **Test:** Host: listeners "\0a" and "\0b"; connecting to "\0b" pins b; a second bind of "\0a" gives EADDRINUSE.
+- **Status (fix pass):** fixed in `ae328f7a` (also EADDRINUSE and Linux autobind). Test: host test in `test_syscall_user_memory` (unix.cpp).
 
 ### H-16 · AF_UNIX stream I/O copies raw user memory while holding the pipe spinlock
 
@@ -232,6 +371,7 @@ Elsewhere in the kernel:
 - **Problem:** Only SOCK_SEQPACKET is staged. For streams, user pointers from sendto, sendmsg, recvmsg, read and write reach memcpy under pipe->lock (UnixStreamTryRead too), so a demand fault sleeps under a spinlock and a raced munmap oopses the kernel.
 - **Suggested fix:** Stage stream payloads in bounded kernel chunks; copy outside the lock.
 - **Test:** QEMU: socketpair send/recv while a sibling munmaps the buffer.
+- **Status (fix pass):** fixed in `4ef02e1f`. Test: host test in `test_syscall_user_memory` (memfd.cpp, AF_UNIX stream case).
 
 ### H-17 · getdents64 writes directory entries to an unchecked user address
 
@@ -240,6 +380,7 @@ Elsewhere in the kernel:
 - **Problem:** Neither the vnode branch nor the /dev/dri branch (`auto* obuf = reinterpret_cast<uint8_t*>(bufAddr);`) validates bufAddr or count. User-named dirents are written straight to that address, so a kernel address corrupts the kernel and an unmapped one faults in kernel mode.
 - **Suggested fix:** Kernel bounce buffer plus CopyToUser, as sys_fstat does.
 - **Test:** QEMU: getdents64 with a kernel, NULL, unmapped or straddling buffer returns -EFAULT and does not panic.
+- **Status (fix pass):** fixed in `b61a0f73`. Test: host test in `test_syscall_user_memory` (dir_open.cpp).
 
 ### H-18 · open/openat dereference a kernel-half path pointer supplied by the user
 
@@ -248,6 +389,7 @@ Elsewhere in the kernel:
 - **Problem:** Any upper-half address is used as the path, letting a user read kernel memory or trigger a page-fault DoS. No internal kernel callers exist.
 - **Suggested fix:** Remove the kernel-pointer branch and return -EFAULT. If needed later, add a separate OpenAtKernel().
 - **Test:** QEMU: open((char*)0xffff800000000000,0) returns -EFAULT.
+- **Status (fix pass):** fixed in `b61a0f73`. Test: host test in `test_syscall_user_memory` (dir_open.cpp).
 
 ### H-19 · User memory dereferenced directly after a validate-only check (stat, statx, F_GETLK, utimensat)
 
@@ -256,6 +398,7 @@ Elsewhere in the kernel:
 - **Problem:** 5 sites: do_stat_internal and do_lstat_internal, sys_statx (`auto* stx = reinterpret_cast<linux_statx*>(bufAddr);`), FileRecordLock in syscall_fd.cpp, and sys_utimensat (`UserTime value = userTimes[i];`). Each writes during VFS work, so a raced munmap faults the kernel.
 - **Suggested fix:** Fill kernel-local structs and use Copy*User.
 - **Test:** QEMU munmap race against stat, statx, F_GETLK and utimensat.
+- **Status (fix pass):** fixed in `196cc80d`. Test: covered by the checked-copy rule; no dedicated host case (stat needs the VFS lookups).
 
 ### H-20 · dup() and fork() copies get their own file offset and status flags (no shared open file description)
 
@@ -264,6 +407,7 @@ Elsewhere in the kernel:
 - **Problem:** seekPos and statusFlags are copied per slot. With `cmd >f 2>&1` and `{ a; b; } >f`, writers overwrite each other, and F_SETFL O_NONBLOCK on one alias doesn't affect the others.
 - **Suggested fix:** A refcounted open-file-description object holding the offset and flags; lock the offset read-modify-write.
 - **Test:** QEMU: dup then write "a" and "b" gives "ab"; same for fork.
+- **Status (fix pass):** deferred: confirmed; needs a refcounted open-file description through the fd table, fork and SCM_RIGHTS. Design under "Shared open-file description (H-20)" below.
 
 ### H-21 · Desktop capture/overlay syscalls expose window pixels and full frames to any process
 
@@ -272,6 +416,7 @@ Elsewhere in the kernel:
 - **Problem:** The only gate is BdwRenderExperimentEnabled(). Any process can export layer pixels, chrome and backdrop, or request and read a full composed frame (overlay op 0/2). That bypasses debug_frame's root-only check and shares its single capture slot (a DoS for root screenshots). BROOK_DESKTOP_CLIENT_FRAME also lets any process call WmNoteClientFrame for any id.
 - **Suggested fix:** Require the registered offscreen renderer (BdwOffscreenRendererOwnedBy) or root for every op.
 - **Test:** QEMU test with the experiment on: an unrelated process gets -EPERM on 0xB19 and 0xB1A.
+- **Status (fix pass):** open: policy decision for Ian; proposal under "Authorisation proposal" below. Not hardened: the Vulkan renderer and bridge capture tools use 0xB19/0xB1A.
 
 ### H-22 · gpu_attach_window gives the host a kernel VFB address with no lifetime link
 
@@ -280,6 +425,7 @@ Elsewhere in the kernel:
 - **Problem:** The VFB pages become host scatter-gather backing. WM_RESIZE_VFB or window destroy frees them while the resource stays attached until CtxDestroy, so later host transfers write freed or reused pages. Also: the lookup is not locked, and resId is not checked against the ctx.
 - **Suggested fix:** Hold a backing reference for the attachment, or detach on resize and destroy. Do the lookup under VfbGuard.
 - **Test:** QEMU test: attach, resize, then GPU_TRANSFER dir=1 must not corrupt foreign pages (freed-page poison check).
+- **Status (fix pass):** deferred: confirmed by inspection; virtio-gpu demo path only (gltri, glgears). Design under "GPU_ATTACH_WINDOW lifetime (H-22)" below.
 
 ### H-23 · CLONE_SETTLS accepts a non-canonical or kernel FS base (wrmsr #GP in context switch)
 
@@ -288,6 +434,7 @@ Elsewhere in the kernel:
 - **Problem:** arch_prctl validates the base but clone does not, and context_switch.S wrmsrs it: any user can crash the kernel. context_switch.S also skips the FS write when fsBase==0, so a task inherits the previous FS base after ARCH_SET_FS 0.
 - **Suggested fix:** ValidUserSegmentBase() in clone and clone3; always write FS base.
 - **Test:** QEMU: clone with tls=0x8000000000000000 gives -EPERM and the kernel survives.
+- **Status (fix pass):** fixed in `6881a138` (clone/clone3 validate the base; context_switch.S always writes FS). Test: host test in `test_syscall_user_memory` (process.cpp). The context-switch half is kernel-only; the QEMU check boots it.
 
 ### H-24 · memfd read/write memcpy to/from user buffer under the memfd spinlock (self-deadlock via MAP_SHARED fault)
 
@@ -296,6 +443,7 @@ Elsewhere in the kernel:
 - **Problem:** read(fd, its own unfaulted MAP_SHARED mapping) faults into MemFdGetOrAllocPage, which takes MfdLock again and deadlocks. A raced munmap faults under the spinlock. Large writes call PmmAllocPage repeatedly under the lock.
 - **Suggested fix:** Resolve pages under the lock, then copy unlocked (or bounce).
 - **Test:** QEMU test_memfd_self_read.
+- **Status (fix pass):** fixed in `4ef02e1f`. Test: host test in `test_syscall_user_memory` (memfd.cpp, including a fault back into the memfd during the copy).
 
 ### H-25 · CLONE_CHILD_SETTID never implemented; CHILD_CLEARTID ignored for fork-style clones
 
@@ -304,6 +452,7 @@ Elsewhere in the kernel:
 - **Problem:** glibc _Fork relies on CHILD_SETTID, so a forked child's TCB tid stays the parent's. PI unlock then gives EPERM, and robust-list cleanup skips the child's mutexes. PARENT_SETTID is honoured only with CLONE_THREAD.
 - **Suggested fix:** Write the child TID into the child's address space before it runs; honour CLEARTID and PARENT_SETTID for forks.
 - **Test:** QEMU test_fork_tid with a PI mutex.
+- **Status (fix pass):** fixed in `6881a138`. Test: host test in `test_syscall_user_memory` (process.cpp records the TID addresses; the ForkChildTrampoline store is kernel-only).
 
 ### H-26 · No wakeup registration for SyncFile, SignalFd, pipe POLLOUT or nested epoll; waits rely on the 50/100 ms safety tick
 
@@ -312,6 +461,7 @@ Elsewhere in the kernel:
 - **Problem:** Readiness for these types is only noticed at the next safety tick (50 ms in poll; 100 ms in epoll: `uint64_t safetyMs = timerWaiters.allocationFailed ? 5 : 100;`). A missed GPU fence wake costs several frames at 60 fps.
 - **Suggested fix:** Waiter groups for BdwGpuEvent (sync_file), signalfd, pipe writerWaiter and nested epoll; meanwhile lower safetyMs for these types.
 - **Test:** QEMU: poll and epoll on a sync_file signalled after 2 ms wake within 5 ms.
+- **Status (fix pass):** fixed in `863f802a` for sync files (GPU Retire event, or a 1 ms tick while prompt wakes are off) and pipe POLLOUT. Partly refuted: signal delivery already wakes the target thread even for a masked signal, and epoll flattens nested epolls onto their leaves. What remains (signals aimed at another thread, poll() on an epoll fd) now uses a 10 ms tick. Test: host test in `test_syscall_user_memory` (wait.cpp).
 
 ### H-27 · /dev/tty open borrows stdin/stdout pipe handles without pinning them
 
@@ -320,6 +470,7 @@ Elsewhere in the kernel:
 - **Problem:** fds 0 and 1 are read without FdRef or a lock, and the refcounts are bumped after publishing. A sibling's close can free the PipeBuffer first (use-after-free) or underflow the counts.
 - **Suggested fix:** Pin fds 0 and 1, retain both ends, then publish with FdTablePublishOwned.
 - **Test:** QEMU: open("/dev/tty") racing dup2 and close on fds 0 and 1; check pipe counts afterwards.
+- **Status (fix pass):** fixed in `d9c2bafa` (also honours O_CLOEXEC, part of M-45). Test: host test in `test_syscall_user_memory` (dir_open.cpp).
 
 
 ## Medium
@@ -467,6 +618,7 @@ Elsewhere in the kernel:
 - **Problem:** poll overwrites the eventfd readerWaiter that a blocked read() uses (even for a POLLOUT-only poll). The epollWaiter slots are shared too. With two or more waiters, the last one wins and the others fall back to the timeout. No lock is held.
 - **Suggested fix:** Per-object waiter lists like PipePollGroup.
 - **Test:** Two pollers and a reader on one eventfd: one write wakes all within 1 ms.
+- **Status (fix pass):** fixed in `863f802a`: eventfds keep a waiter list (EventFdWaitGroup); epoll uses pipe poll subscriptions for pipes and AF_UNIX rx/tx. Test: host test in `test_syscall_user_memory` (wait.cpp).
 
 ### M-19 · epoll entries keyed by fd number; close/reuse and fork give wrong events
 
@@ -507,6 +659,7 @@ Elsewhere in the kernel:
 - **Problem:** When set and oldset alias, SIG_BLOCK is a no-op. An invalid how still clobbers oldset.
 - **Suggested fix:** Copy set in, validate how, then write oldset.
 - **Test:** sigprocmask(SIG_BLOCK,&s,&s); how=7 leaves oldset untouched.
+- **Status (fix pass):** fixed in `196cc80d`. Test: host test in `test_syscall_user_memory` (race.cpp).
 
 ### M-24 · kill with pid <= 0 returns ENOSYS
 
@@ -539,6 +692,7 @@ Elsewhere in the kernel:
 - **Problem:** About 9 sites: urandom, klog, SyntheticMem and the keyboard modes. UDP read and write go through SockRecvFrom and SockSendTo byte loops, so a fault mid-datagram corrupts the RX ring. The urandom and klog `>= 0x0000800000000000ULL` checks are dead.
 - **Suggested fix:** Kernel staging buffers plus Copy*User; user-aware UDP variants.
 - **Test:** QEMU: munmap race during urandom, klog, SyntheticMem and UDP reads gives EFAULT.
+- **Status (fix pass):** fixed in `b61a0f73` (keyboard, urandom, klog, synthetic files) and `06a10c04` (UDP read/write). Test: host test in `test_syscall_user_memory` (rw.cpp, socket.cpp).
 
 ### M-28 · TOCTOU double-fetch of the iovec array in readv/writev
 
@@ -835,6 +989,7 @@ Elsewhere in the kernel:
 - **Problem:** The pointer is set and cleared without the lock and is not cleared after a timeout followed by success, so a peer can wake an exited Process. A second waiter overwrites the first. acceptWaiter is single-slot too.
 - **Suggested fix:** Wait queues with ProcessRef.
 - **Test:** Two concurrent readers both wake.
+- **Status (fix pass):** partly fixed in `863f802a`: epoll no longer uses the rx/tx single slots. read/write and accept still use readerWaiter/writerWaiter/acceptWaiter.
 
 ### M-65 · /boot alias fallback can create or modify files under /boot and ignores O_NOFOLLOW
 
@@ -934,6 +1089,7 @@ Elsewhere in the kernel:
 - **Problem:** TCGETS, TCSETS*, TIOCG/SPGRP and TIOCGWINSZ are implemented twice and the c_cc table three times; the copies already diverge.
 - **Suggested fix:** TtyFillTermios() and TtyIoctl() helpers.
 - **Test:** Host test: byte-compare TCGETS from the keyboard and a tty; TCGETS2 equals TCGETS plus speeds.
+- **Status (fix pass):** fixed in `c5a6cae6`. Test: host test in `test_syscall_user_memory` (ioctl.cpp).
 
 ### L-10 · TIOCSPGRP accepts any value, truncates it to uint16 and checks no permissions; dead code in TIOCGPGRP
 
@@ -1342,6 +1498,7 @@ Elsewhere in the kernel:
 - **Problem:** Waiters are registered outside the lock and concurrent readers overwrite each other, so wakeups fall back to the 10 ms timeout (latency that matters for the 60 fps goal).
 - **Suggested fix:** Register under the lock with wait groups.
 - **Test:** QEMU: two eventfd readers; one write wakes a reader within 1 ms.
+- **Status (fix pass):** partly fixed in `863f802a` (eventfd). The /dev/tty readerWaiter remains.
 
 ### L-61 · Zero-length netlink send returns ENODATA
 

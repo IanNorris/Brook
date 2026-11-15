@@ -2,7 +2,7 @@
 
 Current state and immediate goal. Keep this short and current: replace stale lines rather than appending. Put detailed run records in [AGENT_JOURNAL.md](AGENT_JOURNAL.md), the previous agent's ~1 MB append-only log (newest entries at the top). Decisions belong in [DECISIONS.md](DECISIONS.md), and working preferences in [WORKING_STYLE.md](WORKING_STYLE.md).
 
-_Last updated: 15 November 2026 (midday), by a Claude Code session._
+_Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall fix pass)._
 
 ## Workspace
 
@@ -92,6 +92,26 @@ _Last updated: 15 November 2026 (midday), by a Claude Code session._
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, afternoon (syscall fix pass, `work/syscall-fixes`, not on main yet):**
+- **Branch head `ea753d08` plus a docs commit.** It has 11 fix commits on top of `7f5638aa`. Each issue's status is in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), under "Fix pass status" and the per-entry **Status** lines.
+- **Fixed:** 23 of the 27 high entries:
+  - raw user pointers: input/WM, getdents64, open, inet sockets, the keyboard read at count 0;
+  - abstract AF_UNIX names;
+  - `CLONE_SETTLS` validation, plus the context switch now always writing FS;
+  - the vfork lost wakeup, and `CLONE_CHILD_SETTID`;
+  - read on O_WRONLY;
+  - no user copies under pipe, memfd or serial spinlocks;
+  - the /dev/tty pins;
+  - about 90 validate-then-dereference sites;
+  - sync-file, pipe POLLOUT and eventfd wakeups.
+- **Partly fixed:** H-04 is hardened only. H-03 and H-21 are authorisation policy for Ian; the proposal is in the log. H-20 (shared open-file description) and H-22 (GPU_ATTACH_WINDOW lifetime) are deferred, with designs.
+- **New host test** `test_syscall_user_memory` compiles the real `syscall_*.cpp` handlers against a fake user address space, with a raced-unmap mode. The Release build passes, and so do 357/357 host tests (`test_audio_delivery` and `test_sched_lock_owner` can time out under -j8; rerun alone).
+- **Dell pair:** `syscall-fixes/build/dell/pair-syscall-fixes` (payload `dell-syscall-fixes-20261115`, commit `ea753d08`, flip, persistent map, zero-copy and video engine ON). The QEMU guarded repair-to-desktop check passed on the first attempt. It has not been deployed to the Dell.
+- **60 fps relevance:**
+  - poll/epoll on a pending Intel sync_file now wakes on the GPU Retire event when `gpu wakeups on` is set. Otherwise it polls every 1 ms instead of every 50 or 100 ms.
+  - Several eventfd waiters all wake.
+  - Measure on the Dell before relying on either.
+
 **15 Nov, ~07:00 UTC (gen 409, autonomous):**
 - **Main is `f4b508f8`:** the syscall.cpp split, fast-forwarded on top of `cc07051a`. It is 36 `syscall_*.cpp` files plus headers; the map and the old→new line table are in [syscall-split-plan.md](syscall-split-plan.md).
   - The agent checked symbols, the 269-entry dispatch table, every commit's build, and 356/356 host tests.
@@ -101,7 +121,7 @@ _Last updated: 15 November 2026 (midday), by a Claude Code session._
   - Firefox and Chromium on YouTube with private profiles both stayed up (147 and 587 GPU jobs in 90 s, no refusals), and no new panic was recorded.
   - Evidence: `display-perf/build/dell/split-quake2/` and `split-browsers/`.
 - **Next for the refactor:**
-  - The fix pass with tests, driven by [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) (182 entries, 27 high, including the raw user-pointer writes in the WM and input syscalls and the non-canonical `CLONE_SETTLS` base).
+  - The fix pass is on `work/syscall-fixes` (see the afternoon entry above). It needs a Dell smoke test and a merge.
   - Then the `net.cpp` debug-command split.
   - Rebase any in-flight kernel branches using the line table.
 
