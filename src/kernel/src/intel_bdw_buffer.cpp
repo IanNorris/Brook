@@ -20,6 +20,7 @@ struct BdwGpuBuffer {
     bool userMappingAllowed;
     bool scanoutImage; // registered for zero-copy scanout: render maps it uncached
     bool gpuEverUsed;  // sticky: a write-back GPU mapping may have left LLC lines
+    const void* creator; // identity of the GPU file that created it (compare only; null = kernel)
     // i915 tiling metadata (SET/GET_TILING, VA-API phase 2a). Recorded for
     // userspace only: Brook programs no fences and maps every buffer linearly.
     uint32_t tilingStride; // (stride << 2) | mode, updated atomically
@@ -244,7 +245,38 @@ bool BdwGpuBufferEndGpuUse(BdwGpuBuffer* b){
     return true;
 }
 uint32_t BdwGpuBufferGpuUses(const BdwGpuBuffer* b){return b?uint32_t(__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE)):0;}
-void BdwGpuBufferMarkGpuFailed(BdwGpuBuffer* b){if(b)__atomic_fetch_or(&b->gpuState,uint64_t{1}<<63,__ATOMIC_ACQ_REL);}
+// Bit 58 qualifies a failure (bit 63) as recoverable: it was set by a job
+// that failed after a verified engine reset, so the buffer holds unknown
+// contents but no device state. A plain failure always clears it.
+static constexpr uint64_t BdwFailedBit=uint64_t{1}<<63,BdwRecoverableBit=uint64_t{1}<<58;
+void BdwGpuBufferMarkGpuFailed(BdwGpuBuffer* b){
+    if(!b)return;
+    uint64_t current=__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE);
+    while(!__atomic_compare_exchange_n(&b->gpuState,&current,(current|BdwFailedBit)&~BdwRecoverableBit,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){}
+}
+void BdwGpuBufferMarkGpuFailedRecoverable(BdwGpuBuffer* b){
+    if(!b)return;
+    uint64_t current=__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE);
+    for(;;){
+        // An earlier unrecoverable failure stays unrecoverable.
+        const uint64_t next=(current&BdwFailedBit) && !(current&BdwRecoverableBit)?current:(current|BdwFailedBit|BdwRecoverableBit);
+        if(next==current || __atomic_compare_exchange_n(&b->gpuState,&current,next,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
+    }
+}
+bool BdwGpuBufferClearRecoverableFailure(BdwGpuBuffer* b){
+    if(!b)return false;
+    uint64_t current=__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE);
+    for(;;){
+        if((current&(BdwFailedBit|BdwRecoverableBit))!=(BdwFailedBit|BdwRecoverableBit) || uint32_t(current))return false;
+        if(__atomic_compare_exchange_n(&b->gpuState,&current,current&~(BdwFailedBit|BdwRecoverableBit),false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return true;
+    }
+}
+bool BdwGpuBufferGpuFailedRecoverable(const BdwGpuBuffer* b){
+    const uint64_t s=b?__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE):0;
+    return (s&BdwFailedBit) && (s&BdwRecoverableBit);
+}
+void BdwGpuBufferSetCreator(BdwGpuBuffer* b,const void* creator){if(b)b->creator=creator;}
+const void* BdwGpuBufferCreator(const BdwGpuBuffer* b){return b?b->creator:nullptr;}
 bool BdwGpuBufferGpuFailed(const BdwGpuBuffer* b){return b && (__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE)>>63);}
 void BdwGpuBufferGpuStatus(const BdwGpuBuffer* b,uint32_t& uses,bool& failed){
     const uint64_t state=b?__atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE):0;

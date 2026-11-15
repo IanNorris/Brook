@@ -134,6 +134,13 @@ bool BdwExecSnapshotSyncForCpu(BdwExecSnapshot* snapshot,bool safelyStopped);
 // an aborted queued request. Reserved and armed snapshots are accepted.
 // This does not retire the snapshot or release its pages.
 bool BdwExecSnapshotMarkFailed(BdwExecSnapshot* snapshot,bool pending=false);
+// The worker proved the job failed after a verified engine reset: a later
+// MarkFailed marks only the buffers this job may have written (recoverably)
+// and leaves other processes' sampled buffers clean.
+bool BdwExecSnapshotScopeFailureToWritten(BdwExecSnapshot* snapshot);
+inline bool BdwExecSnapshotFailureCovers(bool handoffOutput,bool scanoutImage,bool submitterOwned){
+    return handoffOutput || scanoutImage || submitterOwned;
+}
 // Point-in-time Dell VT-d and backing ownership observation only. The caller
 // must prove exact PCI/DMAR identity, keep all buffers pinned and serialize
 // device/IOMMU changes throughout a later submission; this grants no DMA.

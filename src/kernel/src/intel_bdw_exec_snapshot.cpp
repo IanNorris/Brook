@@ -37,6 +37,8 @@ struct BdwExecSnapshot {
     bool coherentRender;
 #endif
     BdwBatchSample batchSample;
+    const void* file;            // submitting GPU file (compare only)
+    bool failureWrittenOnly;     // see BdwExecSnapshotScopeFailureToWritten
     uint32_t captureIndices[4],captureCount,captureRequested;
     uint64_t captureAddresses[4];
 };
@@ -240,7 +242,7 @@ BdwExecSnapshot* BdwExecSnapshotCreate(BdwGpuFile* file,const BdwExecObjectInput
     constexpr uint64_t limit=uint64_t{1}<<48,allowed=4|8|16|64|128;
     if(!file || !inputs || !count || count>8192 || batchIndex>=count || (batchStart&7))return nullptr;
     auto* s=static_cast<BdwExecSnapshot*>(kmalloc(sizeof(BdwExecSnapshot)));if(!s)return nullptr;
-    *s={};
+    *s={};s->file=file;
     s->buffers=static_cast<BdwGpuBuffer**>(kmalloc(uint64_t(count)*sizeof(*s->buffers)));
     s->objects=static_cast<BdwExecMemoryObject*>(kmalloc(uint64_t(count)*sizeof(*s->objects)));
     auto* handles=static_cast<uint32_t*>(kmalloc(uint64_t(count)*sizeof(uint32_t)));
@@ -530,8 +532,25 @@ bool BdwExecSnapshotMarkFailed(BdwExecSnapshot* s,bool pending){
     const auto state=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
     if(state!=1 && state!=3)return false;
     BdwGpuContextMarkLost(s->context,pending);
+    if(s->failureWrittenOnly){
+        // Failed after a verified engine reset: only what this job may have
+        // written is suspect (its handoff output, zero-copy images and the
+        // submitter's own buffers). Buffers created by another process and
+        // only sampled here (a client's dmabuf) stay clean.
+        for(uint32_t i=0;i<s->count;++i)
+            if(BdwExecSnapshotFailureCovers(s->buffers[i]==s->handoffBuffer,BdwGpuBufferIsScanoutImage(s->buffers[i]),
+                                            BdwGpuBufferCreator(s->buffers[i])==s->file))
+                BdwGpuBufferMarkGpuFailedRecoverable(s->buffers[i]);
+        return true;
+    }
     for(uint32_t i=0;i<s->count;++i)BdwGpuBufferMarkGpuFailed(s->buffers[i]);
     return true;
+}
+bool BdwExecSnapshotScopeFailureToWritten(BdwExecSnapshot* s){
+    if(!s)return false;
+    const auto state=__atomic_load_n(&s->state,__ATOMIC_ACQUIRE);
+    if(state!=1 && state!=3)return false;
+    s->failureWrittenOnly=true;return true;
 }
 uint32_t BdwExecSnapshotInspectDma(BdwExecSnapshot* s){
 #if defined(BROOK_SSD_AUTO_RECOVERY)

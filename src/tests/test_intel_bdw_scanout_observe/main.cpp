@@ -50,6 +50,7 @@ bool BdwReprepareRetainedGemProbe(){return scenario==81;}
 void BdwExecSnapshotCapture(const BdwExecSnapshot*,BdwGpuCapture& capture){capture={};}
 void PanicSetGpuCapture(const BdwGpuCapture&){}
 void BdwExecSnapshotOrigin(const BdwExecSnapshot*,uint32_t& pid,uint32_t& context){pid=context=0;}
+bool BdwExecSnapshotScopeFailureToWritten(BdwExecSnapshot*){return true;}
 BdwBatchSample BdwExecSnapshotBatchSample(const BdwExecSnapshot*){return {};}
 BdwBatchSample BdwExecSnapshotCurrentBatchSample(const BdwExecSnapshot*){return {};}
 uint32_t BdwExecSnapshotPageCount(const BdwExecSnapshot*){return 0;}
