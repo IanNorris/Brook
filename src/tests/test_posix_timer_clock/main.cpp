@@ -224,6 +224,111 @@ void timerLifecycle() {
 }
 }
 
+void intervalTimers() {
+    using namespace brook;
+    constexpr uint64_t alrm=1ULL<<13,vtalrm=1ULL<<25,prof=1ULL<<26,ms=1000000;
+    auto tick=[](Process* const* list,uint32_t n){PosixTimersTickLocked(list,n);};
+    Process p{};init(p,20);Process peer{};init(peer,21);
+    peer.tgid=p.tgid;peer.isThread=true;peer.leaderIncarnation=p.incarnation;
+    g_perCpu[0].currentProcess=&p;
+    Process* both[]={&p,&peer};
+    IntervalTimerValue v{};
+    CHECK(IntervalTimerSet(&p,3,ms,0,&v)==-22 && IntervalTimerGet(&p,-1,&v)==-22);
+    // Unarmed: every gate the hot paths test is clear.
+    CHECK(!realArmedCount && !g_intervalCpuTimersArmed && !IntervalTimerCpuArmed());
+    // Process-wide: a sibling thread observes and cancels the leader's timer.
+    CHECK(IntervalTimerSet(&p,ItimerReal,3000*ms,0,&v)==0 && !v.valueNs && !v.intervalNs);
+    CHECK(realArmedCount==1);
+    CHECK(IntervalTimerGet(&peer,ItimerReal,&v)==0 && v.valueNs==3000*ms);
+    CHECK(IntervalTimerSet(&peer,ItimerReal,0,0,&v)==0 && v.valueNs==3000*ms);
+    CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && !v.valueNs && !realArmedCount);
+    // Not inherited by fork: a new group (or a reused TGID) starts disarmed.
+    CHECK(IntervalTimerSet(&p,ItimerReal,3000*ms,0,nullptr)==0);
+    Process child{};init(child,22);CHECK(IntervalTimerGet(&child,ItimerReal,&v)==0 && !v.valueNs);
+    Process reused{};init(reused,20);reused.incarnation=p.incarnation+1000;
+    CHECK(IntervalTimerGet(&reused,ItimerReal,&v)==0 && !v.valueNs);
+    // Exec (group-kill cleanup by the surviving leader) preserves the timer.
+    PosixTimersCleanup(&p,true);CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && v.valueNs==3000*ms);
+    // Overdue before the tick: reported as one microsecond, never zero.
+    monotonicNs+=3000*ms;CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && v.valueNs==1000);
+    tick(both,2);CHECK(p.pendingWakeup && peer.pendingWakeup && pendingCount==1);
+    CHECK(PosixTimerPending(&p)==alrm && PosixTimerPending(&peer)==alrm);
+    SignalInfo info{};CHECK(PosixTimerDequeue(&peer,alrm,&info)==14 && info.si_code==0x80);
+    CHECK(!pendingCount && !PosixTimerPending(&p) && !realArmedCount);
+    // Periodic with SIGALRM blocked: stays expired (value 0) until dequeued,
+    // then restarts on the original phase.
+    p.sigMask=peer.sigMask=alrm;p.pendingWakeup=peer.pendingWakeup=0;
+    CHECK(IntervalTimerSet(&p,ItimerReal,20*ms,1000*ms,nullptr)==0);
+    monotonicNs+=120*ms;tick(both,2);
+    CHECK(p.pendingWakeup && pendingCount==1); // wakes synchronous waiters
+    CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && !v.valueNs && v.intervalNs==1000*ms);
+    monotonicNs+=5*ms;tick(both,2);CHECK(pendingCount==1); // coalesced
+    CHECK(PosixTimerPending(&p)==alrm); // blocked signals stay visible to sigtimedwait
+    CHECK(PosixTimerDequeue(&p,alrm,&info)==14 && info.si_code==0x80);
+    CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && v.valueNs==(1000-105)*ms && realArmedCount==1);
+    // Ignored and unblocked: discarded at expiry and not restarted.
+    CHECK(IntervalTimerSet(&p,ItimerReal,0,0,nullptr)==0);
+    p.sigMask=peer.sigMask=0;signalHandler=1;p.pendingWakeup=peer.pendingWakeup=0;
+    CHECK(IntervalTimerSet(&p,ItimerReal,20*ms,1000*ms,nullptr)==0);
+    monotonicNs+=120*ms;tick(both,2);
+    CHECK(!pendingCount && !p.pendingWakeup && !peer.pendingWakeup && !PosixTimerPending(&p));
+    CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && !v.valueNs && v.intervalNs==1000*ms);
+    // A kill()-delivered SIGALRM dequeue restarts the expired periodic timer.
+    signalHandler=0x1234;IntervalTimerAlarmConsumed(&p);
+    CHECK(IntervalTimerGet(&p,ItimerReal,&v)==0 && v.valueNs==(1000-100)*ms);
+    // ...and absorbs a coalesced timer expiry that is still pending.
+    monotonicNs+=900*ms;p.sigMask=alrm;tick(both,2);CHECK(pendingCount==1);
+    IntervalTimerAlarmConsumed(&p);CHECK(!pendingCount && IntervalTimerGet(&p,ItimerReal,&v)==0 && v.valueNs==1000*ms);
+    p.sigMask=0;
+    // Claim path used by IRQ-return delivery.
+    CHECK(IntervalTimerSet(&p,ItimerReal,ms,0,nullptr)==0);monotonicNs+=ms;tick(both,2);
+    KernelSigaction action{};signalHandler=0x5678;
+    CHECK(PosixTimerClaimCaught(&p,14,&info,&action) && action.handler==0x5678 && info.si_code==0x80 && !pendingCount);
+    signalHandler=0x1234;
+    // alarm-style replacement returns the previous value.
+    CHECK(IntervalTimerSet(&p,ItimerReal,5000*ms,0,nullptr)==0);monotonicNs+=1500*ms;
+    CHECK(IntervalTimerSet(&p,ItimerReal,0,0,&v)==0 && v.valueNs==3500*ms && !realArmedCount);
+    // CPU timers: VIRTUAL counts user ticks only; PROF counts all ticks and
+    // both reload from their interval at expiry.
+    CHECK(IntervalTimerSet(&p,ItimerVirtual,2*ms,5*ms,nullptr)==0);
+    CHECK(IntervalTimerSet(&peer,ItimerProf,3*ms,0,nullptr)==0);
+    CHECK(g_intervalCpuTimersArmed==2 && IntervalTimerCpuArmed());
+    IntervalTimerChargeTick(&peer,false,ms);
+    CHECK(IntervalTimerGet(&p,ItimerVirtual,&v)==0 && v.valueNs==2*ms && v.intervalNs==5*ms);
+    CHECK(IntervalTimerGet(&p,ItimerProf,&v)==0 && v.valueNs==2*ms);
+    IntervalTimerChargeTick(&p,true,ms);IntervalTimerChargeTick(&peer,true,ms);
+    CHECK(IntervalTimerGet(&p,ItimerVirtual,&v)==0 && v.valueNs==5*ms && pendingCount==2);
+    CHECK(IntervalTimerGet(&p,ItimerProf,&v)==0 && !v.valueNs && g_intervalCpuTimersArmed==1);
+    CHECK(PosixTimerPending(&p)==(vtalrm|prof));
+    p.pendingWakeup=peer.pendingWakeup=0;tick(both,2);CHECK(p.pendingWakeup && peer.pendingWakeup);
+    CHECK(PosixTimerDequeue(&p,prof,&info)==27 && PosixTimerDequeue(&peer,vtalrm,&info)==26 && !pendingCount);
+    // SIG_DFL and unblocked: handed to the ordinary sender (group kill) once,
+    // with a reference, rather than left pending for a syscall return.
+    signalHandler=0;p.sigMask=peer.sigMask=0;
+    CHECK(IntervalTimerSet(&p,ItimerReal,ms,0,nullptr)==0);monotonicNs+=ms;
+    const auto refsBefore=p.refCount+peer.refCount;tick(both,2);
+    Process* fatal[4]{};int signals[4]{};
+    CHECK(!pendingCount && PosixTimersTakeFatal(fatal,signals,4)==1 && signals[0]==14);
+    CHECK((fatal[0]==&p || fatal[0]==&peer) && p.refCount+peer.refCount==refsBefore+1);
+    --fatal[0]->refCount;CHECK(PosixTimersTakeFatal(fatal,signals,4)==0);
+    // Blocked default-action signals stay pending for sigtimedwait.
+    p.sigMask=peer.sigMask=alrm;CHECK(IntervalTimerSet(&p,ItimerReal,ms,0,nullptr)==0);monotonicNs+=ms;tick(both,2);
+    CHECK(pendingCount==1 && PosixTimersTakeFatal(fatal,signals,4)==0);
+    CHECK(PosixTimerDequeue(&p,alrm,&info)==14);p.sigMask=peer.sigMask=0;signalHandler=0x1234;
+    // Kernel threads are never charged.
+    Process kernel{};init(kernel,23);kernel.isKernelThread=true;IntervalTimerChargeTick(&kernel,true,ms);
+    // Group end clears everything, including pending expiries.
+    IntervalTimerChargeTick(&p,true,5*ms);CHECK(pendingCount==1);
+    CHECK(IntervalTimerSet(&p,ItimerReal,1000*ms,0,nullptr)==0);
+    p.asLiveThreads=0;PosixTimersCleanup(&p,false);
+    CHECK(!pendingCount && !realArmedCount && !g_intervalCpuTimersArmed);
+    CHECK(IntervalTimerGet(&p,ItimerVirtual,&v)==0 && !v.valueNs && !v.intervalNs);
+    // A dead group's armed timer is discarded at expiry and leaves no state.
+    init(p,20);CHECK(IntervalTimerSet(&p,ItimerReal,ms,ms,nullptr)==0);
+    p.state=ProcessState::Terminated;monotonicNs+=ms;Process* alone[]={&p};tick(alone,1);
+    CHECK(!pendingCount && !realArmedCount);
+}
+
 int main() {
     using namespace brook;
     // Deliberately unrelated fractional epochs. Exercise the production POSIX
@@ -255,6 +360,7 @@ int main() {
     timerAdmission();
     timerDomainsAndOwnership();
     timerLifecycle();
+    intervalTimers();
     {
         Process p{};init(p);const auto id=arm(p);expire(p);SignalInfo info{};KernelSigaction action{};
         signalHandler=1;CHECK(!PosixTimerClaimCaught(&p,10,&info,&action) && pendingCount==1);

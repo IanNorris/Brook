@@ -28,6 +28,8 @@ public:
         return true;
     }
     bool Pending() const {return pending_;}
+    bool Armed() const {return armed_;}
+    uint64_t Deadline() const {return deadline_;}
     // An ignored notification is discarded, not delivered; unlike consuming
     // it, discarding does not restart an expired periodic REAL timer.
     void Discard() {pending_=false;}

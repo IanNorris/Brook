@@ -34,6 +34,7 @@ static void kfree(void* p){if(p){--allocations;std::free(p);}}
 static uint64_t ApicTickCount(){return 100;}
 static uint64_t PosixTimerPending(Process*){return 0;}
 static bool PosixTimerDequeue(Process*,uint64_t,SignalInfo*){return false;}
+static void IntervalTimerAlarmConsumed(Process*){}
 static bool CopyToUser(uint64_t address,const void* source,uint64_t count){if(failCopy)return false;std::memcpy(reinterpret_cast<void*>(address),source,count);return true;}
 static void SchedulerKernelRegionEnter(Process* p){++p->regions;}
 static void SchedulerKernelRegionLeave(Process* p){--p->regions;}

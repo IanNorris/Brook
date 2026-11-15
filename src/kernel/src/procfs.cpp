@@ -11,6 +11,7 @@
 // Linux /proc layout that busybox ps/top expect.
 
 #include "procfs.h"
+#include "synthetic_system_files.h"
 #include "proc_inode.h"
 #include "vfs.h"
 #include "process.h"
@@ -867,6 +868,16 @@ static Vnode* GenPidMountInfo(const ProcessSnapshot& proc)
     return MakeProcVnode(buffer,bytes);
 }
 
+// /proc/[pid]/cgroup — every task is in the cgroup v2 root.
+static Vnode* GenPidCgroup(const ProcessSnapshot& /*proc*/)
+{
+    constexpr uint32_t bytes = sizeof(ProcCgroupText) - 1;
+    auto* buf = static_cast<char*>(kmalloc(bytes + 1));
+    if (!buf) return nullptr;
+    memcpy(buf, ProcCgroupText, bytes + 1);
+    return MakeProcVnode(buf, bytes);
+}
+
 // /proc/[pid]/limits — resource limits (Linux-compatible format)
 static Vnode* GenPidLimits(const ProcessSnapshot& /*proc*/)
 {
@@ -1420,6 +1431,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "limits",  GenPidLimits },
     { "root",    GenPidRoot },
     { "mountinfo", GenPidMountInfo },
+    { "cgroup",  GenPidCgroup },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

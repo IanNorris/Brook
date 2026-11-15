@@ -16,6 +16,9 @@ int VfsPathRoot(VfsPath* out);
 // not crossed a directory bind. Missing synthetic tails are permitted; a bind
 // must mask broker entries just as it masks ordinary backing entries.
 int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed);
+// Boot-only: mark a kernel compatibility tmpfs (by its exact mount root) as
+// not masking historical bin-path aliases. See VfsPathBrokerAllowed.
+int VfsPathBrokerTransparentRegister(const VfsPath& mountRoot);
 // Narrow null/urandom device compatibility bridge. Provision once before userspace.
 // Only a missing allowlisted device entry beneath the pinned canonical /dev is eligible;
 // retained parent identity and NODEV are checked in one namespace transaction.

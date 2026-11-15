@@ -106,6 +106,7 @@ implements a large subset of the Linux-compatible system call surface plus Brook
 | 218 | set_tid_address | ⚠️ Stored, validated later | |
 | 231 | exit_group | ✅ | |
 | 435 | clone3 | ❌ No args validation | BRO-004 |
+| 312 | kcmp | ✅ | FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM; EPOLL_TFD EOPNOTSUPP; ptrace-read REALCREDS check |
 
 ### Signal Handling
 | # | Name | Validation | Notes |
@@ -114,7 +115,9 @@ implements a large subset of the Linux-compatible system call surface plus Brook
 | 14 | rt_sigprocmask | ❌ No validation | BRO-004 |
 | 15 | rt_sigreturn | ✅ | |
 | 34 | pause | ✅ | |
-| 37 | alarm | ✅ | |
+| 36 | getitimer | ✅ CopyToUser | REAL/VIRTUAL/PROF; group record in posix_timer.cpp |
+| 37 | alarm | ✅ | Shares the group ITIMER_REAL |
+| 38 | setitimer | ✅ CopyFromUser/CopyToUser | REAL restarts on SIGALRM dequeue; VIRTUAL/PROF tick-charged (1 ms) |
 | 128 | rt_sigtimedwait | ✅ UserBufferReadable | |
 | 130 | rt_sigsuspend | ❌ No validation | BRO-004 |
 | 131 | sigaltstack | ❌ No validation | BRO-004 |

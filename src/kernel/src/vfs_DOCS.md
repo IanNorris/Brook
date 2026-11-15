@@ -61,6 +61,21 @@ the correct filesystem driver based on mount-point prefix matching.
 | `/proc` | procfs | — | Virtual process info |
 | `/home` | ext2 | drive 1 | User home directory |
 
+### Compatibility paths (`/bin`, `/usr/bin`)
+
+The FAT root initrd cannot hold symlinks, so `compat_paths.cpp` mounts one
+small root-owned 0755 tmpfs (nodev, nosuid, 64 KiB quota) per directory in
+`kCompatPathLinks` (`compat_paths.h`) right after `/dev/shm`, on both the
+QEMU and Dell initrds: `/bin/sh -> /nix/profile/bin/sh` and
+`/usr/bin/env -> /nix/profile/bin/env`. Missing mount points are created in
+the RAM initrd; an existing non-empty directory or non-directory is left
+unmasked. Non-root cannot add entries; root can. These mounts are registered
+with `VfsPathBrokerTransparentRegister`, so the historical exec/stat aliases
+(`/bin/bash` -> `/boot/BIN/bash`, busybox applets) still apply for names not
+present in them; other directories bound over them mask aliases as before.
+Mount namespaces copy them like any mount. `/lib64/ld-linux-x86-64.so.2` is a
+candidate table entry, but provider initrds already ship a real FAT `/lib64`.
+
 ## Vnode Model
 
 ```c

@@ -61,30 +61,83 @@ extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original)
 }
 
 // ---------------------------------------------------------------------------
-// sys_alarm (37) — deliver SIGALRM after seconds
+// alarm (37), getitimer (36), setitimer (38) — one process-wide REAL timer
+// shared with alarm(); VIRTUAL/PROF are tick-charged CPU timers. See
+// posix_timer.h for the lifetime and signal semantics.
 // ---------------------------------------------------------------------------
+
+namespace {
+struct UserTimeval { int64_t sec, usec; };
+struct UserItimerval { UserTimeval interval, value; };
+static_assert(sizeof(UserItimerval) == 32);
+constexpr uint64_t NsPerSec = 1000000000ULL;
+bool TimevalToNs(const UserTimeval& tv, uint64_t* ns)
+{
+    if (tv.sec < 0 || tv.usec < 0 || tv.usec >= 1000000) return false;
+    return TimeoutNanoseconds(tv.sec, tv.usec * 1000, ns);
+}
+UserTimeval NsToTimeval(uint64_t ns, bool roundUp)
+{
+    // A live timer never reads as disarmed: report at least one microsecond.
+    uint64_t usec = ns / 1000;
+    if (roundUp && ns && !usec) usec = 1;
+    return {int64_t(usec / 1000000), int64_t(usec % 1000000)};
+}
+UserItimerval ToUser(const IntervalTimerValue& v)
+{
+    return {NsToTimeval(v.intervalNs, false), NsToTimeval(v.valueNs, true)};
+}
+}
 
 int64_t sys_alarm(uint64_t seconds, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+    // alarm takes an unsigned int and is ITIMER_REAL with no interval.
+    IntervalTimerValue old{};
+    const int error = IntervalTimerSet(proc, ItimerReal, (seconds & 0xffffffffULL) * NsPerSec, 0, &old);
+    if (error) return error;
+    // Linux rounds the previous remaining time to the nearest second and
+    // never reports a live timer as zero.
+    const UserTimeval tv = NsToTimeval(old.valueNs, true);
+    int64_t remaining = tv.sec;
+    if ((!remaining && tv.usec) || tv.usec >= 500000) ++remaining;
+    return remaining;
+}
 
-    uint64_t prevRemaining = 0;
-    if (proc->alarmTick != 0)
-    {
-        // Calculate remaining seconds from previous alarm
-        uint64_t now = ApicTickCount();
-        if (proc->alarmTick > now)
-            prevRemaining = (proc->alarmTick - now + 999) / 1000; // round up
+int64_t sys_getitimer(uint64_t which, uint64_t valueAddr, uint64_t,
+                      uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    IntervalTimerValue value{};
+    const int error = IntervalTimerGet(proc, int(uint32_t(which)), &value); // ABI: int which
+    if (error) return error;
+    const UserItimerval out = ToUser(value);
+    return CopyToUser(valueAddr, &out, sizeof(out)) ? 0 : -EFAULT;
+}
+
+int64_t sys_setitimer(uint64_t which, uint64_t valueAddr, uint64_t oldAddr,
+                      uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    const int kind = int(uint32_t(which)); // ABI: int which
+    if (kind < ItimerReal || kind > ItimerProf) return -EINVAL;
+    // Linux treats a NULL new value as a zero (disarming) value.
+    UserItimerval in{};
+    if (valueAddr && !CopyFromUser(&in, valueAddr, sizeof(in))) return -EFAULT;
+    uint64_t valueNs = 0, intervalNs = 0;
+    if (!TimevalToNs(in.value, &valueNs) || !TimevalToNs(in.interval, &intervalNs)) return -EINVAL;
+    IntervalTimerValue old{};
+    const int error = IntervalTimerSet(proc, kind, valueNs, intervalNs, &old);
+    if (error) return error;
+    if (oldAddr) {
+        const UserItimerval out = ToUser(old);
+        if (!CopyToUser(oldAddr, &out, sizeof(out))) return -EFAULT;
     }
-
-    if (seconds == 0)
-        proc->alarmTick = 0; // Cancel alarm
-    else
-        proc->alarmTick = ApicTickCount() + seconds * 1000;
-
-    return static_cast<int64_t>(prevRemaining);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

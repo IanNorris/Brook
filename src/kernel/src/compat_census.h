@@ -157,6 +157,14 @@ inline void CompatDescribe(CompatText& t, const CompatKey& key, const char* text
 
 enum class CompatNote : uint8_t { Counted, New, Overflow };
 
+// Deliberate ENOSYS with a userspace fallback (sys_enosys_quiet): counted,
+// but reported apart so they cannot crowd out real gaps.
+inline bool CompatKeyQuiet(const CompatKey& key)
+{
+    return key.kind == CompatKind::Syscall && key.a == CompatOriginQuiet;
+}
+enum class CompatSelect : uint8_t { All, Loud, Quiet };
+
 template<uint32_t Capacity, uint32_t MaxProbe = 32>
 struct CompatCensusTable {
     static_assert((Capacity & (Capacity - 1)) == 0, "capacity must be a power of two");
@@ -233,9 +241,11 @@ struct CompatCensusTable {
     }
 
     // Copy published entries into out[] (at most limit), sorted by count
-    // descending. Returns the number copied; *used receives the number of
-    // published slots. Readers never block writers.
-    uint32_t Snapshot(CompatEntry* out, uint32_t limit, uint32_t* used = nullptr) const
+    // descending, optionally only the loud or quiet set. Returns the number
+    // copied; *used receives the number of published slots (all sets).
+    // Readers never block writers.
+    uint32_t Snapshot(CompatEntry* out, uint32_t limit, uint32_t* used = nullptr,
+                      CompatSelect select = CompatSelect::All) const
     {
         uint32_t n = 0, ready = 0;
         for (uint32_t i = 0; i < Capacity; ++i) {
@@ -254,6 +264,8 @@ struct CompatCensusTable {
             copy.firstName[CompatNameBytes - 1] = 0;
             copy.text[CompatTextBytes - 1] = 0;
             if (!copy.count) continue;
+            if (select != CompatSelect::All &&
+                CompatKeyQuiet(copy.key) != (select == CompatSelect::Quiet)) continue;
             // Insertion into a bounded top-N list.
             uint32_t at = n < limit ? n : limit;
             while (at > 0 && out[at - 1].count < copy.count) {

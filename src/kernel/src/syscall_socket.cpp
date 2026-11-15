@@ -3,6 +3,7 @@
 // Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "tcp_info.h"
 #include "process_user_namespace.h"
 
 #include "syscall.h"
@@ -532,6 +533,22 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
     if (!entry->handle) return -EBADF;
     int level = static_cast<int>(levelVal);
     int option = static_cast<int>(optnameVal);
+    if (level == 6 && entry->type == FdType::Socket) { // IPPROTO_TCP
+        TcpInfoSource source{};
+        const int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
+        // Linux: a UDP socket passes SOL_TCP to ip_getsockopt (EOPNOTSUPP);
+        // TCP knows only TCP_INFO here (other options ENOPROTOOPT).
+        if (!brook::SockGetTcpInfo(index, &source)) return -95;
+        if (option != 11) return -92;
+        int32_t length = 0;
+        if (!CopyFromUser(&length, optlenAddr, sizeof(length))) return -EFAULT;
+        if (length < 0) return -EINVAL;
+        const LinuxTcpInfo info = TcpInfoEncode(source);
+        const uint32_t copied = static_cast<uint32_t>(length) < sizeof(info) ? static_cast<uint32_t>(length) : sizeof(info);
+        if (!CopyToUser(optlenAddr, &copied, sizeof(copied))) return -EFAULT;
+        if (copied && !CopyToUser(optvalAddr, &info, copied)) return -EFAULT;
+        return 0;
+    }
     if (level != 1) return entry->type == FdType::UnixSocket ? -95 : -92;
     // Linux socklen_t is 32-bit, and negative lengths are invalid.
     if (!UserBufferReadable(optlenAddr, sizeof(uint32_t)) ||

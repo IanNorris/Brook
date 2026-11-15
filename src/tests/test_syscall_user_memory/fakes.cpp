@@ -2,6 +2,7 @@
 // fail or report "absent"; the fake network stack is observable via g_net.
 #include "harness.h"
 #include "syscall_internal.h"
+#include "tcp_info.h"
 #include "syscall_drm.h"
 #include "syscall_memfd.h"
 #include "syscall_pipe.h"
@@ -201,6 +202,9 @@ int SockSendTo(int,const void* buffer,uint32_t length,const SockAddrIn* destinat
 int SockSendUser(int,uint64_t,uint32_t) { return -EIO; }
 int SockConnect(int,const SockAddrIn*) { return -ECONNREFUSED; }
 int SockGetType(int) { return 2; }
+int SockGetProtocol(int) { return 17; }
+int SockGetConnectError(int) { return 0; }
+uint32_t SmpGetCpuCount() { return 4; }
 int SockListen(int,int) { return -1; }
 int SockRecvFrom(int,void* buffer,uint32_t length,SockAddrIn* source) {
     if(!g_net.datagramReady)return -EAGAIN;
@@ -222,6 +226,14 @@ void SockClearPollWaiter(int,Process*) {}
 void SockClose(int) {}
 void SockUnref(int) {}
 bool SockGetIdentity(int,SocketIdentity* identity) { identity->inode=77;return true; }
+bool SockGetTcpInfo(int,TcpInfoSource* out) {
+    if(!g_net.tcp)return false;
+    *out={};out->brookState=g_net.tcpState;out->peerMss=g_net.peerMss;out->advertisedMss=1460;out->mtu=1500;
+    out->sndIss=1000;out->sndUna=1001+5000;out->sndNxt=1001+5000+2800;out->peerWindow=65535;
+    out->receiveFree=4096;out->segmentsIn=7;out->segmentsOut=9;out->delayedAckUs=40000;
+    out->nowMs=5000;out->lastReceiveMs=4750;out->sndWscale=7;
+    return true;
+}
 }
 extern "C" bool InputPollEvent(brook::InputEvent*) { return false; }
 extern "C" bool InputHasEvents() { return false; }

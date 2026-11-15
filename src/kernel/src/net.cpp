@@ -43,6 +43,7 @@
 // Single-NIC, single-threaded receive path.
 
 #include "net.h"
+#include "tcp_info.h"
 #include "arp_probe_tracker.h"
 #include "arp_reply_validation.h"
 #include "tcp_send_queue.h"
@@ -2392,6 +2393,37 @@ int SockGetConnectError(int sockIdx)
     s.connectError = 0; // consumed
     SpinLockRelease(&s.lock);
     return err;
+}
+
+bool SockGetTcpInfo(int sockIdx, TcpInfoSource* out)
+{
+    if (!out || sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
+    if (!g_sockUsed[sockIdx]) return false;
+    Socket& s = g_sockets[sockIdx];
+    if (s.type != 1) return false; // SOCK_STREAM
+    *out = {};
+    SpinLockAcquire(&s.lock);
+    out->brookState = static_cast<uint8_t>(s.tcpState);
+    out->sndWscale = s.tcpSndWndScale;
+    out->rcvWscale = s.tcpRcvWndScale;
+    out->peerMss = s.tcpPeerMss;
+    out->sndIss = s.tcpSndIss;
+    out->sndUna = s.tcpSndUna;
+    out->sndNxt = s.tcpSndNxt;
+    out->cwndBytes = s.tcpFlightControl.cwnd;
+    out->ssthreshBytes = s.tcpFlightControl.threshold;
+    out->peerWindow = s.tcpSndWnd;
+    const uint64_t held = static_cast<uint64_t>(s.rxCount) + s.tcpOooBytes;
+    out->receiveFree = held < Socket::RX_BUF_SIZE ? static_cast<uint32_t>(Socket::RX_BUF_SIZE - held) : 0;
+    out->segmentsIn = s.rxPktCount;
+    out->segmentsOut = s.txPktCount;
+    out->lastReceiveMs = s.tcpLastRxTick;
+    SpinLockRelease(&s.lock);
+    out->advertisedMss = 1460;
+    out->mtu = ETH_MTU;
+    out->delayedAckUs = 40000; // delayed ACK timer (40 ms)
+    out->nowMs = ApicTickCount();
+    return true;
 }
 
 void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,

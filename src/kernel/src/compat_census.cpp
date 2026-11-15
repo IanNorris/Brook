@@ -174,6 +174,10 @@ void CompatCensusObserve(uint64_t num, int64_t result, const uint64_t* args, uin
     const uint64_t tick = ApicTickCount();
     const CompatNote note = g_compatCensus.Note(key, text[0] ? text : nullptr, tick, pid, name);
 
+    // Per-process totals describe real gaps; the quiet set would dominate
+    // them (every glibc process probes rseq once).
+    if (key.kind == CompatKind::Syscall && origin == CompatOriginQuiet) return;
+
     CompatKey owner{};
     owner.kind = CompatKind::ProcessName;
     owner.error = static_cast<uint16_t>(error == kEnosys ? kEnosys : 0);
@@ -184,8 +188,8 @@ void CompatCensusObserve(uint64_t num, int64_t result, const uint64_t* args, uin
 
     // One line per distinct key (bounded by the table size), on serial and
     // in the kernel log ring so hw_logs and the last-log record see it.
-    // The quiet ENOSYS set stays quiet but is still counted.
-    if (note == CompatNote::New && !(key.kind == CompatKind::Syscall && origin == CompatOriginQuiet)) {
+    // The quiet set returned above: counted, never logged.
+    if (note == CompatNote::New) {
         char line[200];
         CompatText t(line, sizeof(line));
         t.str("COMPAT: new ");
@@ -250,16 +254,19 @@ void CompatCensusReplyJson(uint32_t limit)
     r.text(",");r.field("overflow",__atomic_load_n(&g_compatCensus.overflow,__ATOMIC_RELAXED));
     r.text(",");r.field("resets",__atomic_load_n(&g_compatCensus.resets,__ATOMIC_RELAXED));
     uint32_t used = 0;
-    uint32_t n = g_compatCensus.Snapshot(g_compatSnapshot, limit, &used);
+    uint32_t n = g_compatCensus.Snapshot(g_compatSnapshot, limit, &used, CompatSelect::Loud);
     r.text(",");r.field("capacity",512);r.text(",");r.field("used",used);
     r.text(",\"entries\":[");
+    for (uint32_t i = 0; i < n; ++i) {if (i) r.text(",");CompatEntryJson(r,g_compatSnapshot[i]);}
+    n = g_compatCensus.Snapshot(g_compatSnapshot, limit, nullptr, CompatSelect::Quiet);
+    r.text("],\"quiet\":[");
     for (uint32_t i = 0; i < n; ++i) {if (i) r.text(",");CompatEntryJson(r,g_compatSnapshot[i]);}
     uint32_t processUsed = 0;
     n = g_compatProcesses.Snapshot(g_compatSnapshot, 128, &processUsed);
     r.text("],");r.field("process_overflow",__atomic_load_n(&g_compatProcesses.overflow,__ATOMIC_RELAXED));
     r.text(",\"processes\":[");
     for (uint32_t i = 0; i < n; ++i) {if (i) r.text(",");CompatEntryJson(r,g_compatSnapshot[i]);}
-    r.text("],\"scope\":\"failing syscalls since boot or reset, sorted by count. kind=syscall: ENOSYS by nr, a=origin (0 handler, 1 unimplemented, 2 quiet, 3 out of range). ioctl: a=FdType, b=request. fcntl/prctl/arch_prctl: b=cmd/option. sockopt: a=level, b=optname, c=FdType. socket: a=family, b=type, c=protocol. clone: b=flags. mmap: nr=mmap/mprotect/mremap/madvise, a=prot, b=flags/advice, c=FdType (0 anonymous). path: ENOENT under /proc,/sys,/dev with numeric components as N. processes: per process name; errno 38 = ENOSYS hits, 0 = other unsupported hits. ticks are ms since boot\"}\n");
+    r.text("],\"scope\":\"failing syscalls since boot or reset, sorted by count. quiet: deliberate ENOSYS with userspace fallbacks (origin 2), listed apart from entries. kind=syscall: ENOSYS by nr, a=origin (0 handler, 1 unimplemented, 2 quiet, 3 out of range). ioctl: a=FdType, b=request. fcntl/prctl/arch_prctl: b=cmd/option. sockopt: a=level, b=optname, c=FdType. socket: a=family, b=type, c=protocol. clone: b=flags. mmap: nr=mmap/mprotect/mremap/madvise, a=prot, b=flags/advice, c=FdType (0 anonymous). path: ENOENT under /proc,/sys,/dev with numeric components as N. processes: per process name; errno 38 = ENOSYS hits, 0 = other unsupported hits. ticks are ms since boot\"}\n");
     r.send();
     g_compatReply[g_compatReplyUsed] = 0;
     if (g_compatReplyTruncated)
@@ -286,7 +293,7 @@ uint32_t CompatCensusFormatSummary(char* out, uint32_t capacity, uint32_t limit)
     out[0] = 0;
     if (__atomic_exchange_n(&g_compatSnapshotBusy, 1u, __ATOMIC_ACQUIRE)) return 0;
     if (limit > 512) limit = 512;
-    const uint32_t n = g_compatCensus.Snapshot(g_compatSnapshot, limit);
+    const uint32_t n = g_compatCensus.Snapshot(g_compatSnapshot, limit, nullptr, CompatSelect::Loud);
     CompatText t(out, capacity);
     for (uint32_t i = 0; i < n; ++i) {
         const CompatEntry& e = g_compatSnapshot[i];

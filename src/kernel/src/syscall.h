@@ -152,6 +152,8 @@ static constexpr uint64_t SYS_CLOSE_RANGE     = 436;
 static constexpr uint64_t SYS_PSELECT6        = 270;
 static constexpr uint64_t SYS_FACCESSAT2      = 439;
 static constexpr uint64_t SYS_ALARM           = 37;
+static constexpr uint64_t SYS_GETITIMER       = 36;
+static constexpr uint64_t SYS_SETITIMER       = 38;
 static constexpr uint64_t SYS_PAUSE           = 34;
 static constexpr uint64_t SYS_RT_SIGSUSPEND   = 130;
 

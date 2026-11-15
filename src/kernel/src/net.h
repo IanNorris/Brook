@@ -455,6 +455,9 @@ void SockClearPollWaiter(int sockIdx, Process* waiter);
 void SockSetNonblock(int sockIdx, bool nonblock);
 bool SockIsNonblock(int sockIdx);
 int  SockGetConnectError(int sockIdx); // consume async connect error (SO_ERROR)
+struct TcpInfoSource;
+// Snapshot TCP_INFO inputs under the socket lock. False unless a live stream socket.
+bool SockGetTcpInfo(int sockIdx, TcpInfoSource* out);
 void SockClose(int sockIdx);
 void SockRef(int sockIdx);    // increment refcount (fork/dup)
 void SockUnref(int sockIdx);  // decrement refcount, destroy at 0

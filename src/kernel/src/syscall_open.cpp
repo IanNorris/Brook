@@ -19,6 +19,8 @@
 #include "syscall_drm.h"
 #include "syscall_open.h"
 #include "syscall_handlers.h"
+#include "synthetic_system_files.h"
+#include "smp.h"
 
 namespace brook {
 
@@ -391,6 +393,11 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         }
         return fd;
     }
+
+    // /sys/devices/system/cpu/{possible,present,online,offline,kernel_max}
+    // from the live CPU count (glibc get_nprocs_conf, Chromium, Firefox).
+    if (const char* cpus = SysfsCpuAttribute(syntheticPath, SmpGetCpuCount(), MAX_CPUS))
+        return OpenSyntheticFile(proc, cpus, flags);
 
     // Synthetic memory files: /etc/passwd, /etc/group, /proc/self/...
     {

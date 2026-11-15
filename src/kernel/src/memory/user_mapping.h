@@ -32,6 +32,11 @@ int64_t UserMappingSync(Process* actor,AddressSpaceState* space,uint64_t address
 // metadata/protections and fork peers. Old references retire after full TLB ACK.
 int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);
 int64_t UserMappingAdviseFree(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);
+// MADV_DONTFORK(10)/DOFORK(11)/WIPEONFORK(18)/KEEPONFORK(19). The whole range
+// must be mapped (ENOMEM otherwise, nothing changed); WIPEONFORK requires
+// private anonymous memory and DOFORK refuses device mappings (EINVAL).
+int64_t UserMappingAdviseFork(Process* actor, AddressSpaceState* space, uint64_t address,
+                              uint64_t length, uint32_t advice);
 // Destination must be a fresh, unpublished user AS. Failure leaves its partial
 // clone owned by destination teardown, which the caller must destroy. Parent
 // CoW downgrades may remain after failure; they are acknowledged before return.
