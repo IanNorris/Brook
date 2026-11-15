@@ -38,9 +38,11 @@ public:
 // Kernel GPU wake events. Work wakes the gpu-submit worker (submission,
 // present request, thaw, fence signal). Retire wakes CPU-side waiters on
 // fences, buffer GPU use, sync-object publication and BCS presentation.
+// Space wakes execbuffer callers waiting for a submission-queue slot; it is
+// signaled only while such a waiter is registered with the queue.
 // Every wait keeps a one-tick timeout as a safety net, so a missing signal
 // degrades to the previous 1 ms polling rather than hanging.
-enum class BdwGpuEvent : uint32_t { Work=0, Retire=1, Count=2 };
+enum class BdwGpuEvent : uint32_t { Work=0, Retire=1, Space=2, Count=3 };
 struct BdwGpuWaiter {uint32_t event=0;unsigned slot=~0u;void* process=nullptr;};
 #ifndef BROOK_HOST_TEST
 uint64_t BdwGpuEventGeneration(BdwGpuEvent event);

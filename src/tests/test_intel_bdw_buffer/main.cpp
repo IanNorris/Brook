@@ -1304,6 +1304,186 @@ int main(){
         assert(service.Take(id,item,true) && item==app && service.Finish(id,true,true));
         BdwHandoffDetach(h,76);BdwFenceUnref(signal);BdwGpuBufferUnref(output);
     }
+    // Queue-space back-pressure: a full queue makes execbuffer wait instead
+    // of failing (Mesa aborts on a failed execbuffer). Reservations are
+    // consumed only by their own snapshot, clients are capped, and the
+    // present owner keeps a reserved slice.
+    {
+        constexpr unsigned Cap=BdwExecQueue::Capacity,Shared=Cap-BdwSubmissionQueue::PresentReserve,Client=BdwSubmissionQueue::ClientLimit;
+        BdwSubmissionQueue service;assert(service.Init(true));
+        std::vector<BdwExecSnapshot*> queued;
+        auto make=[&](uint64_t owner){auto* s=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(s);BdwExecSnapshotSetOrigin(s,123,0,owner);return s;};
+        // Reserve, publish and admit one snapshot the way the ioctl does.
+        auto admit=[&](uint64_t owner,uint64_t present)->int64_t{
+            BdwSubmissionPreparation entry{};const auto r=service.ReservePreparation(owner,present,entry);
+            if(r){if(r==-11)service.EndPreparation(entry);return r;}
+            auto* s=make(owner);__atomic_store_n(&entry.snapshot,s,__ATOMIC_RELEASE);
+            const auto submitted=service.Submit(s);service.EndPreparation(entry);
+            if(submitted)assert(BdwExecSnapshotRelease(s,false));else queued.push_back(s);
+            return submitted;
+        };
+        auto drainOne=[&]{uint64_t id=0;BdwExecSnapshot* item=nullptr;assert(service.Take(id,item) && service.Finish(id,true,true));};
+        // One client alone is capped at ClientLimit even with no present owner.
+        for(unsigned i=0;i<Client;++i)assert(!admit(76,0));
+        assert(admit(76,0)==-11);
+        auto stats=service.SpaceStats();
+        assert(stats.occupied==Client && !stats.reserved && !stats.waiters && stats.waits==1 && stats.abandoned==1);
+        // A second client fills the shared slice; the third is held back.
+        for(unsigned i=0;i<Shared-Client;++i)assert(!admit(77,50));
+        assert(admit(77,50)==-11 && admit(78,50)==-11);
+        // Without an attached present owner nothing is held back...
+        assert(!admit(78,0));
+        // ...and the present owner may use the reserved slice.
+        for(unsigned i=Shared+1;i<Cap;++i)assert(!admit(50,50));
+        assert(service.SpaceStats().occupied==Cap && admit(50,50)==-11);
+        // Unreserved (kernel-internal) admission fails as before when full.
+        auto* extra=make(50);(void)BdwTakeRefusal();
+        assert(service.Submit(extra)==-16 && BdwTakeRefusal());assert(BdwExecSnapshotRelease(extra,false));
+        // A registered waiter is woken only by a freed slot. Finish with no
+        // waiter issues no Space signal (no added per-job cost).
+        BdwSubmissionPreparation waiter{};
+        uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Space);
+        assert(service.ReservePreparation(50,50,waiter)==-11 && waiter.waiting && service.SpaceStats().waiters==1);
+        assert(BdwGpuEventGeneration(BdwGpuEvent::Space)==seen);
+        drainOne();assert(BdwGpuEventGeneration(BdwGpuEvent::Space)!=seen && service.SpaceStats().signals==1);
+        assert(!service.ReservePreparation(50,50,waiter) && waiter.reserved && !waiter.waiting);
+        stats=service.SpaceStats();assert(stats.reserved==1 && !stats.waiters && stats.granted==1 && stats.occupied==Cap-1);
+        // The reserved slot is not available to an unreserved caller, but is
+        // to the snapshot its entry publishes.
+        extra=make(50);assert(service.Submit(extra)==-16);(void)BdwTakeRefusal();
+        __atomic_store_n(&waiter.snapshot,extra,__ATOMIC_RELEASE);
+        assert(!service.Submit(extra) && !waiter.reserved);queued.push_back(extra);
+        service.EndPreparation(waiter);
+        stats=service.SpaceStats();assert(!stats.reserved && stats.occupied==Cap);
+        // An unconsumed reservation is returned (and wakes waiters) on end.
+        seen=BdwGpuEventGeneration(BdwGpuEvent::Space);drainOne();
+        assert(BdwGpuEventGeneration(BdwGpuEvent::Space)==seen); // nobody waiting
+        BdwSubmissionPreparation held{},blocked{};
+        assert(!service.ReservePreparation(50,50,held) && service.ReservePreparation(50,50,blocked)==-11);
+        seen=BdwGpuEventGeneration(BdwGpuEvent::Space);service.EndPreparation(held);
+        assert(BdwGpuEventGeneration(BdwGpuEvent::Space)!=seen);
+        assert(!service.ReservePreparation(50,50,blocked));service.EndPreparation(blocked);
+        // Frozen and poisoned refusals end a wait immediately.
+        BdwSubmissionPreparation frozen{};assert(service.ReservePreparation(77,50,frozen)==-11);
+        BdwExecOwnerWork work{};assert(service.FreezeOwner(77,work) && work.queued==Shared-Client);
+        assert(service.ReservePreparation(77,50,frozen)==-16 && !frozen.waiting && !frozen.reserved);
+        assert(service.SpaceStats().refused==1 && service.ThawOwner(77));(void)BdwTakeRefusal();
+        // Drain; afterwards every counter balances.
+        for(unsigned i=0;i<Cap-1;++i)drainOne();
+        uint64_t id=0;BdwExecSnapshot* item=nullptr;assert(!service.Take(id,item));
+        stats=service.SpaceStats();assert(!stats.occupied && !stats.reserved && !stats.waiters);
+        assert(stats.waits==stats.granted+stats.refused+stats.abandoned);
+    }
+    // A handoff (present) submission: a full queue refuses before arming the
+    // ticket, so it stays Reserved; a reservation always admits it.
+    {
+        BdwSubmissionQueue service;assert(service.Init(true));
+        auto* output=BdwGpuFileGetBuffer(f,protectedHandle);assert(output);
+        BdwHandoffResources h{};HandoffTicket ticket{};
+        assert(HandoffAttach(h.policy,50) && BdwHandoffReserve(h,50,7,9,output,331,ticket));
+        BdwSubmissionPreparation reservation{};assert(!service.ReservePreparation(50,50,reservation));
+        std::vector<BdwExecSnapshot*> fill;
+        for(unsigned i=0;i+1<BdwExecQueue::Capacity;++i){auto* s=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(s);
+            BdwExecSnapshotSetOrigin(s,123,0,77);assert(!service.Submit(s));fill.push_back(s);}
+        auto* present=BdwExecSnapshotCreate(f,protectedExec,2,0,8,64);auto* signal=BdwFenceCreate();assert(present && signal);
+        BdwExecSnapshotSetOrigin(present,123,0,50);assert(BdwExecSnapshotAddSignalFence(present,signal));
+        auto* other=BdwExecSnapshotCreate(f,exec,2,0,8,64);assert(other);BdwExecSnapshotSetOrigin(other,123,0,77);
+        assert(service.Submit(other)==-16);assert(BdwExecSnapshotRelease(other,false));(void)BdwTakeRefusal();
+        // Without its reservation the present job is refused unarmed.
+        assert(service.SubmitHandoff(h,50,ticket,present,signal,331)==-16);
+        assert(h.policy.slots[ticket.slot].state==HandoffSlotState::Reserved);(void)BdwTakeRefusal();
+        __atomic_store_n(&reservation.snapshot,present,__ATOMIC_RELEASE);
+        assert(!service.SubmitHandoff(h,50,ticket,present,signal,331) && !reservation.reserved);
+        service.EndPreparation(reservation);
+        uint64_t id=0;BdwExecSnapshot* item=nullptr;
+        for(unsigned i=0;i<BdwExecQueue::Capacity;++i){assert(service.Take(id,item) && service.Finish(id,true,true));}
+        assert(BdwHandoffObserve(h,ticket)==1 && BdwHandoffTake(h,ticket,7,9) && BdwHandoffFinish(h,ticket));
+        BdwHandoffDetach(h,50);BdwFenceUnref(signal);BdwGpuBufferUnref(output);
+        assert(!service.SpaceStats().occupied);
+    }
+    // The real execbuffer path: it sleeps (with no reservation or snapshot
+    // held) until a slot frees, returns EINTR on a signal without leaking,
+    // and reports a queue that frees nothing for 10 s.
+    {
+        struct RawObject {uint32_t handle,relocCount;uint64_t relocs,alignment,offset,flags,reserved1,reserved2;};
+        struct RawExec {uint64_t objects;uint32_t count,start,length,dr1,dr4,clipCount;uint64_t clips,flags,context,fences;};
+        RawObject objects[]={{replacement,0,0,4096,0x20000,16,0,0},{next,0,0,4096,0x10000,20,0,0}};
+        RawExec request{reinterpret_cast<uint64_t>(objects),2,8,64,0,0,0,0,(1u<<11)|(1u<<18),0,0}; // batch first
+        struct SpaceUser {BdwSubmissionQueue queue;uint64_t present=0,now=0;unsigned sleeps=0,drainAt=0,interruptAt=0;};
+        static SpaceUser space{};assert(space.queue.Init(true));
+        BdwI915UserAccess user{&space,
+            [](void*,void* dst,uint64_t src,uint64_t n){std::memcpy(dst,reinterpret_cast<void*>(src),n);return true;},
+            [](void*,uint64_t,uint64_t){return true;},
+            [](void*,uint64_t dst,const void* src,uint64_t n){std::memcpy(reinterpret_cast<void*>(dst),src,n);return true;},
+            [](void* c){return static_cast<SpaceUser*>(c)->now;},
+            [](void* c,uint64_t n){auto& s=*static_cast<SpaceUser*>(c);s.now+=n;++s.sleeps;
+                if(s.drainAt && s.sleeps==s.drainAt){uint64_t id=0;BdwExecSnapshot* item=nullptr;
+                    assert(s.queue.Take(id,item) && s.queue.Finish(id,true,true));}
+                return !(s.interruptAt && s.sleeps>=s.interruptAt);}};
+        user.submit=[](void* c,BdwExecSnapshot* s)->int64_t{return static_cast<SpaceUser*>(c)->queue.Submit(s);};
+        user.beginExec=[](void* c,uint64_t owner,BdwSubmissionPreparation& e)->int64_t{
+            auto& s=*static_cast<SpaceUser*>(c);return s.queue.ReservePreparation(owner,s.present,e);};
+        user.endExec=[](void* c,BdwSubmissionPreparation& e){static_cast<SpaceUser*>(c)->queue.EndPreparation(e);};
+        user.renderExperiment=true;user.submitterIncarnation=76;
+        auto ioctl=[&]{return BdwIntelRenderIoctl(f,ioctlCommand(0x69,sizeof(request)),reinterpret_cast<uint64_t>(&request),user);};
+        for(unsigned i=0;i<BdwSubmissionQueue::ClientLimit;++i)assert(!ioctl());
+        assert(!space.sleeps);
+        // Full for this client: one sleep, the worker frees a slot, admitted.
+        space.drainAt=1;assert(!ioctl() && space.sleeps==1);space.drainAt=0;
+        auto stats=space.queue.SpaceStats();
+        assert(stats.waits==1 && stats.granted==1 && stats.signals==1 && !stats.reserved && !stats.waiters);
+        assert(stats.occupied==BdwSubmissionQueue::ClientLimit);
+        // A signal while waiting: EINTR, nothing reserved, nothing logged.
+        (void)BdwTakeRefusal();space.sleeps=0;space.interruptAt=3;
+        assert(ioctl()==-4 && space.sleeps==3 && !BdwTakeRefusal());space.interruptAt=0;
+        stats=space.queue.SpaceStats();
+        assert(stats.abandoned==1 && !stats.reserved && !stats.waiters && stats.occupied==BdwSubmissionQueue::ClientLimit);
+        // A wedged queue (no slot freed for 10 s) is reported, not waited on forever.
+        space.sleeps=0;assert(ioctl()==-16 && space.sleeps==10000);
+        const char* why=BdwTakeRefusal();assert(why && std::strstr(why,"freed no slot"));
+        stats=space.queue.SpaceStats();assert(stats.abandoned==2 && !stats.reserved && !stats.waiters);
+        // Drained, the queue holds no stale reservation and the buffers are idle.
+        for(unsigned i=0;i<BdwSubmissionQueue::ClientLimit;++i){uint64_t id=0;BdwExecSnapshot* item=nullptr;
+            assert(space.queue.Take(id,item) && space.queue.Finish(id,true,true));}
+        stats=space.queue.SpaceStats();assert(!stats.occupied && !stats.reserved && !stats.waiters);
+        auto* batch=BdwGpuFileGetBuffer(f,next);assert(batch && !BdwGpuBufferGpuUses(batch));BdwGpuBufferUnref(batch);
+    }
+    // Concurrent submitters against a real worker thread: every execbuffer
+    // eventually succeeds, and the accounting balances.
+    {
+        struct RawObject {uint32_t handle,relocCount;uint64_t relocs,alignment,offset,flags,reserved1,reserved2;};
+        struct RawExec {uint64_t objects;uint32_t count,start,length,dr1,dr4,clipCount;uint64_t clips,flags,context,fences;};
+        RawObject objects[]={{replacement,0,0,4096,0x20000,16,0,0},{next,0,0,4096,0x10000,20,0,0}};
+        RawExec request{reinterpret_cast<uint64_t>(objects),2,8,64,0,0,0,0,(1u<<11)|(1u<<18),0,0}; // batch first
+        struct Shared {BdwSubmissionQueue queue;std::atomic<bool> stop{false};std::atomic<uint64_t> done{0};};
+        static Shared shared{};assert(shared.queue.Init(true));
+        std::thread worker([&]{while(!shared.stop.load(std::memory_order_acquire)){uint64_t id=0;BdwExecSnapshot* item=nullptr;
+            if(shared.queue.Take(id,item)){std::this_thread::sleep_for(std::chrono::microseconds(20));assert(shared.queue.Finish(id,true,true));
+                shared.done.fetch_add(1,std::memory_order_relaxed);}else std::this_thread::yield();}});
+        constexpr unsigned Threads=4,PerThread=60;std::atomic<unsigned> failures{0};
+        std::vector<std::thread> clients;
+        for(unsigned t=0;t<Threads;++t)clients.emplace_back([&,t]{
+            BdwI915UserAccess user{&shared,
+                [](void*,void* dst,uint64_t src,uint64_t n){std::memcpy(dst,reinterpret_cast<void*>(src),n);return true;},
+                [](void*,uint64_t,uint64_t){return true;},
+                [](void*,uint64_t dst,const void* src,uint64_t n){std::memcpy(reinterpret_cast<void*>(dst),src,n);return true;},
+                [](void*){return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());},
+                [](void*,uint64_t){std::this_thread::sleep_for(std::chrono::microseconds(50));return true;}};
+            user.submit=[](void* c,BdwExecSnapshot* s)->int64_t{return static_cast<Shared*>(c)->queue.Submit(s);};
+            user.beginExec=[](void* c,uint64_t owner,BdwSubmissionPreparation& e)->int64_t{
+                return static_cast<Shared*>(c)->queue.ReservePreparation(owner,90,e);};
+            user.endExec=[](void* c,BdwSubmissionPreparation& e){static_cast<Shared*>(c)->queue.EndPreparation(e);};
+            user.renderExperiment=true;user.submitterIncarnation=t==0?90:80+t; // thread 0 is the present owner
+            for(unsigned i=0;i<PerThread;++i)
+                if(BdwIntelRenderIoctl(f,ioctlCommand(0x69,sizeof(request)),reinterpret_cast<uint64_t>(&request),user))failures.fetch_add(1);
+        });
+        for(auto& c:clients)c.join();
+        while(shared.done.load(std::memory_order_relaxed)<Threads*PerThread)std::this_thread::yield();
+        shared.stop.store(true,std::memory_order_release);worker.join();
+        const auto stats=shared.queue.SpaceStats();
+        assert(!failures.load() && !stats.occupied && !stats.reserved && !stats.waiters && stats.waits>0);
+        assert(stats.waits==stats.granted+stats.refused+stats.abandoned && !stats.refused && !stats.abandoned);
+    }
     assert(BdwGpuFileCloseBuffer(f,protectedHandle) && BdwGpuFileCloseBuffer(other,protectedAlias));
     BdwGpuBufferUnref(protectedOutput);
     {

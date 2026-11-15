@@ -36,6 +36,9 @@ struct BdwI915UserAccess {
     // Leader incarnation, not PID; zero denotes an unknown/untracked owner.
     uint64_t submitterIncarnation=0;
     // Optional paired tracking for the entire exec preparation/publication.
+    // beginExec may return -11 for a full submission queue: the dispatcher
+    // then sleeps (interruptibly, on BdwGpuEvent::Space) and calls it again,
+    // or ends the wait with endExec. It holds no lock while waiting.
     int64_t (*beginExec)(void*,uint64_t,BdwSubmissionPreparation&)=nullptr;
     void (*endExec)(void*,BdwSubmissionPreparation&)=nullptr;
     // Optional: map `bytes` of the render file at mmap token `token` into the
