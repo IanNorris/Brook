@@ -432,4 +432,24 @@ int64_t sys_semop(uint64_t id,uint64_t address,uint64_t count,uint64_t,uint64_t,
 int64_t sys_semtimedop(uint64_t id,uint64_t address,uint64_t count,uint64_t timeout,uint64_t,uint64_t);
 int64_t sys_semctl(uint64_t id,uint64_t number,uint64_t command,uint64_t arg,uint64_t,uint64_t);
 
+// syscall_brook_system.cpp
+int64_t sys_brook_system_message(uint64_t after,uint64_t output,uint64_t size,
+                                 uint64_t a,uint64_t b,uint64_t c);
+int64_t sys_brook_pageable_memory(uint64_t operation,uint64_t value,
+                                  uint64_t a,uint64_t b,uint64_t c,uint64_t d);
+int64_t sys_brook_profile(uint64_t op, uint64_t a1, uint64_t, uint64_t,
+                            uint64_t, uint64_t);
+int64_t sys_brook_set_crash_entry(uint64_t entry,
+                                   uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t);
+int64_t sys_brook_crash_complete(uint64_t exitCode,
+                                  uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t);
+int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
+                              uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_input_grab(uint64_t enable, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t);
+int64_t sys_brook_audio_control(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_brook_ahci_export(uint64_t op,uint64_t destination,uint64_t length,uint64_t offset,uint64_t r0,uint64_t r1);
+
 } // namespace brook
