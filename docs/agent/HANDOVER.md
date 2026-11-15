@@ -92,6 +92,27 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15–16 Nov night (Dell gen 414, `dell-int13-20261115`, session `e13ab3d15f70488e927538eac8361068`):**
+- **Main `2c53f154`** adds `work/open-file` (H-20: dup/fork/SCM_RIGHTS share offset and status flags, as on Linux), `work/tmpfs-link` (tmpfs hard links) and `work/compat-census`:
+  - `compat census [N]` / `compat census reset` count failing syscalls, ioctls, options and missing /proc, /sys and /dev paths, per app;
+  - `lastlog status|flush|previous` keeps a 64 KiB record (census top 40 plus serial tail) in `/nix/var/log/brook/lastlog{0,1}.bin`, so the previous boot's log survives a hang (`scripts/lastlog_fetch.py --hw SESSION --output DIR`).
+- **Checks on gen 413/414:** Quake 50.3/52.4 swaps/s (unchanged); Chromium local video 29.5 fps, 19 drops; Firefox unchanged (~18 drops/s).
+- **Per-app census** (`display-perf/build/dell/census-apps/*.json`):
+  - setitimer (38) from Xwayland, 1000+ hits with VLC and LibreOffice;
+  - kcmp (312) from Xwayland and Chromium;
+  - madvise MADV_DONTFORK, 273 hits from VSCodium, which opened no window in 40 s;
+  - TCP_INFO from Chromium;
+  - /sys/devices/system/cpu/{possible,present};
+  - /proc/self/cgroup and /sys/fs/cgroup;
+  - dma-buf EXPORT_SYNC_FILE (0xc0086202), ENOSYS, from Chromium;
+  - rseq noise.
+  - `work/compat-batch1` is fixing the first six.
+- **Steam:** past the lock now. The nested Xephyr dies at "XKB: Failed to compile keymap", because the FAT root has no `/bin/sh`, so popen and system fail for every program. `work/bin-sh` adds kernel-provided /bin/sh and /usr/bin/env. Next Steam blockers seen in the census: `/proc/self/fd/N/<subpath>` traversal (pressure-vessel, ENOENT ×72) and `/dev/null`, `/dev/urandom` and `/dev/tty` missing inside the srt-bwrap container.
+- **Ready for Ian:**
+  - `work/chrome-csd` (`d63b7a80`, Dell pair built): Chromium keeps its tab strip and Brook overlays min/max/close. It needs the new brook-chromium launcher (button-layout keyfile), which means a /nix/store write and Ian's approval. Also retire `work/chromium-frame`.
+  - `work/compositor-refactor` (`4a4349f4`): the plan is in `docs/design/clearwater-next/compositor-refactor-plan.md`, with stage 0.1 done (single shell-surface list, pixel-identical in QEMU). It has five questions for Ian.
+- **QEMU bridge under host load 40+:** several agents saw guest TCP SYN-ACKs go unanswered and vCPUs in `SchedLockWaitForTicket`, with one in virtio_net `SpinLockAcquire`. Evidence: `compositor-refactor/build/refactor-evidence/qemu-hang-virtio-net/`. Not investigated.
+
 **15 Nov late (Dell gen 412, `dell-int11-20261115`, session `ea6c017f812d4390940513230c87c32c`):**
 - **Deployed `work/integration11` (`2dbbf101`)** = main + `work/tap-click` (`a1855614`, Settings › Touchpad "Tap to click", default off; `input touchpad tap on|off`) + `work/bridge-indicator` (`e932018d`, taskbar agent icon; `bridge presence [beat N|detach]`; the MCP server heartbeats every 10 s, CLI calls never attach). Release build plus 359 host tests pass (three load timeouts passed alone). The robot icon shows on the Dell. Tap-to-click still needs Ian's hands-on check.
 - **Clearwater Next approved by Ian** and merged (`4d467a91`): Glass / Opaque Light / Opaque Dark, 13 hues, side dock (rail and peek), launcher simplification.
