@@ -54,4 +54,9 @@ int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
 int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
                            uint64_t, uint64_t, uint64_t, uint64_t);
 
+// syscall_pipe.cpp
+int64_t sys_pipe(uint64_t address,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+
 } // namespace brook

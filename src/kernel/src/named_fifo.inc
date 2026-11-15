@@ -25,7 +25,7 @@ static void NamedFifoClose(Vnode* node) {
     node->streamPipe=nullptr;node->streamOwner=nullptr;node->streamRelease=nullptr;kfree(opened);
     if(last) {VfsPathRelease(state->identity);kfree(state);}
 }
-static int NamedFifoAttach(Vnode* node,uint32_t flags) {
+int NamedFifoAttach(Vnode* node,uint32_t flags) {
     KernelOperationGuard operation(ProcessCurrent());
     const uint32_t access=flags&3;if(access==3)return -EINVAL;
     VfsPath identity{};int error=VfsPathFromVnode(node,&identity);if(error)return error;
@@ -76,19 +76,19 @@ static int NamedFifoAttach(Vnode* node,uint32_t flags) {
     if(error)NamedFifoClose(node);
     return error;
 }
-static PipeBuffer* FdPipe(const FdEntry* entry) {
+PipeBuffer* FdPipe(const FdEntry* entry) {
     if(!entry || !entry->handle)return nullptr;
     if(entry->type==FdType::Pipe)return static_cast<PipeBuffer*>(entry->handle);
     if(entry->type==FdType::Vnode)return static_cast<Vnode*>(entry->handle)->streamPipe;
     return nullptr;
 }
-static NamedFifoOpen* FdNamedFifo(const FdEntry* entry) {
+NamedFifoOpen* FdNamedFifo(const FdEntry* entry) {
     return entry && entry->type==FdType::Vnode && entry->handle && static_cast<Vnode*>(entry->handle)->streamPipe
         ?static_cast<NamedFifoOpen*>(static_cast<Vnode*>(entry->handle)->streamOwner):nullptr;
 }
-static bool FdPipeRead(const FdEntry* entry) {return FdNamedFifo(entry)?(entry->statusFlags&3)!=1:!(entry->flags&1);}
+bool FdPipeRead(const FdEntry* entry) {return FdNamedFifo(entry)?(entry->statusFlags&3)!=1:!(entry->flags&1);}
 static bool FdPipeWrite(const FdEntry* entry) {return FdNamedFifo(entry)?(entry->statusFlags&3)!=0:(entry->flags&1)!=0;}
-static uint32_t NamedFifoReady(const FdEntry* entry,uint32_t events) {
+uint32_t NamedFifoReady(const FdEntry* entry,uint32_t events) {
     auto* opened=FdNamedFifo(entry);if(!opened)return 0;
     auto* pipe=opened->state->pipe;uint32_t ready=0;
     SpinLockAcquire(&pipe->lock);

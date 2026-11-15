@@ -360,8 +360,6 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
 }
 namespace brook {
 
-#include "pipe_poll.inc"
-
 static void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
 static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1){BdwFenceUnref(file->intelFence);kfree(file);} }
 
@@ -1055,42 +1053,6 @@ static void UnixFdQueueUnref(UnixFdQueue* q)
     kfree(q);
 }
 
-static inline void PipeWakeEpollRaw(PipeBuffer* pipe)
-{
-    if (!pipe) return;
-    if (pipe->terminalReader) WakeProcess(pipe->terminalReader);
-    Process* ew = pipe->epollWaiter;
-    if (ew) {
-        pipe->epollWaiter = nullptr;
-        WakeProcess(ew);
-    }
-}
-
-void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
-{
-    if (!pipe) return;
-    PipeBufferHold(pipe);
-    // Finish every access before surrendering this endpoint. An opposite-end
-    // closer cannot destroy the object while we still hold its lock/reference.
-    SpinLockAcquire(&pipe->lock);
-    if (writer)
-        __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_RELEASE);
-    else
-        __atomic_fetch_sub(&pipe->readers, 1, __ATOMIC_RELEASE);
-    Process* waiter = writer ? pipe->readerWaiter : pipe->writerWaiter;
-    if (writer) pipe->readerWaiter = nullptr;
-    else pipe->writerWaiter = nullptr;
-    if (waiter) WakeProcess(waiter);
-    PipeWakeEpollRaw(pipe);
-    bool destroy = __atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
-                   __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0;
-    SpinLockRelease(&pipe->lock);
-    PipePollNotify(pipe, 1 | 4);
-    PipeBufferDrop(pipe, destroy);
-}
-
-#include "named_fifo.inc"
-
 // The receiver owns delivery, even while the sender still references the
 // queue. Stop new writes and detach all queued capabilities under the stream
 // lock; releasing them can recursively close sockets, so do that unlocked.
@@ -1162,16 +1124,6 @@ static int UnixInstallSocket(Process* process, UnixSocketData* socket, uint32_t 
     (void)site;
     int fd = FdTablePublishOwned(process->fds, ProcessFdLock(process), owned, 0, -1, nullptr, UnixLifePublished);
     return fd;
-}
-
-// Wake any process blocked inside epoll_wait on this pipe. Called from
-// sys_write / sys_sendmsg / sys_close after mutating pipe state in a way
-// that could transition a watched fd to ready.
-static inline void PipeWakeEpoll(PipeBuffer* pipe)
-{
-    if (!pipe) return;
-    SpinLockAcquire(&pipe->lock);PipeWakeEpollRaw(pipe);SpinLockRelease(&pipe->lock);
-    PipePollNotify(pipe, 1 | 4);
 }
 
 static void UnixShutdownDirection(PipeBuffer* pipe, bool writer)
@@ -3524,55 +3476,6 @@ static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
             CloseProcessFd(proc, static_cast<int>(fd));
     }
     return 0;
-}
-
-// ---------------------------------------------------------------------------
-// sys_pipe (22)
-// ---------------------------------------------------------------------------
-
-static int64_t CreatePipe(uint64_t pipefdAddr, uint64_t flags)
-{
-    if (!UserBufferWritable(pipefdAddr, 2 * sizeof(int32_t))) return -EFAULT;
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EMFILE;
-
-    // Allocate pipe buffer
-    auto* pipe = PipeBufferCreate(PIPE_BUF_DEFAULT_SIZE);
-    if (!pipe) return -ENOMEM;
-    if ((flags & 0x4000) && !pipe->enablePackets()) {PipeBufferDestroy(pipe);return -ENOMEM;}
-    pipe->readers = 1;
-    pipe->writers = 1;
-
-    // Allocate read end (flags=0) and write end (flags=1)
-    int readFd = FdAlloc(proc, FdType::Pipe, pipe);
-    if (readFd < 0) { PipeBufferDestroy(pipe); return -EMFILE; }
-    proc->fds[readFd].flags = 0;  // read end
-    proc->fds[readFd].statusFlags = flags & 0x800;
-    proc->fds[readFd].fdFlags = (flags & 0x80000) ? 1 : 0;
-
-    int writeFd = FdAlloc(proc, FdType::Pipe, pipe);
-    if (writeFd < 0)
-    {
-        FdFree(proc, readFd);
-        PipeBufferDestroy(pipe);
-        return -EMFILE;
-    }
-    proc->fds[writeFd].flags = 1;  // write end
-    proc->fds[writeFd].statusFlags = 1 | (flags & (0x800 | 0x4000));
-    proc->fds[writeFd].fdFlags = (flags & 0x80000) ? 1 : 0;
-
-    const int32_t result[2]={readFd,writeFd};
-    if(!CopyToUser(pipefdAddr,result,sizeof(result))) {
-        CloseProcessFd(proc,readFd);CloseProcessFd(proc,writeFd);return -EFAULT;
-    }
-
-    DbgPrintf("sys_pipe: fd[%d,%d] for pid %u\n", readFd, writeFd, proc->pid);
-    return 0;
-}
-
-static int64_t sys_pipe(uint64_t address,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
-{
-    return CreatePipe(address,0);
 }
 
 // ---------------------------------------------------------------------------
@@ -8361,10 +8264,6 @@ static constexpr int F_DUPFD_CLOEXEC = 1030;
 
 static constexpr int FD_CLOEXEC = 1;
 
-// Linux file flags (used in fcntl F_GETFL/F_SETFL and dup3)
-[[maybe_unused]] static constexpr int O_NONBLOCK  = 0x800;
-[[maybe_unused]] static constexpr int O_CLOEXEC   = 0x80000;
-
 struct LinuxFlock {
     int16_t type,whence;
     uint32_t padding;
@@ -9183,18 +9082,6 @@ static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t li
     if(!CopyUserCString(targetAddr,target,sizeof(target)) || !CopyUserCString(linkpathAddr,path,sizeof(path)))return -EFAULT;
     AtLookup lookup;if(int error=lookup.Init(static_cast<int>(newdirfd),path))return error;
     return VfsSymlinkAt(lookup.fs.root,lookup.start(),target,path);
-}
-
-// ---------------------------------------------------------------------------
-// sys_pipe2 (293) — like pipe() but with flags
-// ---------------------------------------------------------------------------
-
-static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
-{
-    constexpr uint64_t PIPE2_ALLOWED = O_CLOEXEC | O_NONBLOCK | 0x4000;
-    if (flags & ~PIPE2_ALLOWED) return -EINVAL;
-    return CreatePipe(pipefdAddr,flags);
 }
 
 // ---------------------------------------------------------------------------
