@@ -399,6 +399,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 
 ## Backlog (outside the immediate goal)
 
+- **Clearwater side drawer (Ian, 15 Nov):** an edge drawer for social and messaging apps, where any window can be stashed for quick access. Sketch in `docs/design/clearwater-next/DESIGN.md` § Ideas backlog.
 - **Keyboard shortcuts (implemented on `work/shortcuts`, QEMU-verified, not yet on Dell):** Super tap toggles the launcher (Escape closes it), Super key-down revokes pointer capture, Alt+F4 sends the normal advisory close. State machine `src/kernel/src/global_shortcuts.h`, host test `test_global_shortcuts`; evidence `build/shortcuts-check/`. Wayland lock release on hardware with a current waylandd and yquake2 is still unobserved (the QEMU seed's waylandd predates pointer constraints).
 - **Dell application audio for yquake2:** the gen 363 boot has no `/dev/dsp`, and the OSS OpenAL store path (`59h20vp…-openal-soft-oss-brook-1.24.3`) is present but has no `lib/`. Restore the gated Dell HDA path (`/etc/dell-hda-audible`; see `docs/xps9343-bringup.md`) and stage OpenAL, then verify audibly with Ian. The SDL build has no OSS backend, so OpenAL is required. The `/data/home` yquake2 config also had a stale absolute `al_driver`.
 - **Browser video and audio on the Dell (Ian, gen 363, 14 Nov):**

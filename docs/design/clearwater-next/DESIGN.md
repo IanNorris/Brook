@@ -937,6 +937,32 @@ corner clipping, or a new blur level.
 - **Dragging** still repaints and uploads the chrome atlas per the October notes,
   until milestone T1 replaces that path.
 
+## Ideas backlog
+
+Ideas raised after the design was settled. None is mocked yet.
+
+- **Side drawer** (Ian, 15 Nov). A drawer on one screen edge for social and
+  messaging apps (chat, mail, music and the like). Any window can be stashed
+  there for quick access and recalled without hunting through the taskbar.
+  - **Opening it:** a tab on the edge, a hotkey, or a touchpad edge or
+    three-finger swipe. It slides over the desktop rather than reflowing it,
+    and closes on Escape or a click outside.
+  - **Stashed windows** keep running, but the compositor skips them while the
+    drawer is shut, which costs no GPU time. Each one shows a thumbnail captured
+    at stash time plus a live icon, with an unread or attention badge.
+  - **Recalling one** shows it as a tall panel in the drawer. Pinning it brings
+    it back as a normal window.
+  - **Persistence:** the drawer's apps are saved in `[Drawer]`, alongside the
+    `[Launcher]` section.
+  - **Needed:**
+    - a "stashed" window state in the WM, with a hit table and focus rules;
+    - thumbnail capture, which already exists for the client-layer capture
+      keep;
+    - an attention signal, for example xdg-activation or the urgency hint;
+    - edge gestures from the touchpad path.
+  - **Cost:** moderate. The slide must follow the motion budget above, and the
+    drawer is one more glass surface against the barrier budget.
+
 ## Limitations
 
 - Browser rendering, fonts and blur are not evidence of native appearance.
