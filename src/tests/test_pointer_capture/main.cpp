@@ -47,6 +47,8 @@ int main() {
     CHECK(WmPointerCapture(owner,id,1,1)==-22);
     CHECK(WmPointerCapture(owner,id,3,0)==0);
     CHECK(WmPointerCapture(owner,id,4,0)==-22);
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Pointer not over its content yet.
+    WmPointerSetHover(slot);
     int64_t lease=WmPointerCapture(owner,id,1,0);
     CHECK(lease>0 && WmPointerCaptureActive());
     CHECK(WmPointerCapture(owner,id,0,lease)==lease);
@@ -103,7 +105,10 @@ int main() {
     const auto rearm=WmPointerCapture(owner,id,3,0);
     held.type=InputEventType::MouseButtonDown;held.sequence=++sequence;
     CHECK(!WmRouteCapturedPointer(held));
-    CHECK(WmPointerCapture(owner,id,3,0)==rearm+1);
+    // A raw press (taskbar, launcher, chrome) is not engagement; only WM
+    // delivery to this window's client area is.
+    CHECK(WmPointerCapture(owner,id,3,0)==rearm);
+    WmPointerEngage(slot);CHECK(WmPointerCapture(owner,id,3,0)==rearm+1);
     held.type=InputEventType::MouseButtonUp;held.sequence=++sequence;
     CHECK(!WmRouteCapturedPointer(held)); // New pair remains intact.
     CHECK(WmPointerCapture(owner,id,3,0)==rearm+1);
@@ -123,12 +128,18 @@ int main() {
     const int other=WmCreateWindow(owner,20,20,320,240,"Other",1,true);
     CHECK(other>=0 && !WmPointerCaptureActive() && !WmPointerCapture(owner,id,0,0));
     CHECK(WmPointerCapture(owner,id,1,0)==-11);
-    WmSetFocus(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>first);
+    // Focus loss was a WM revoke: refocusing alone does not re-engage.
+    WmSetFocus(slot);CHECK(WmPointerCapture(owner,id,1,0)==-11);
+    WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>first);
     WmMinimizeWindow(slot);CHECK(!WmPointerCaptureActive());
-    WmRestoreWindow(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    WmRestoreWindow(slot);CHECK(WmPointerCapture(owner,id,1,0)==-11);
+    WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     WmDestroyWindowById(owner,id);CHECK(!WmPointerCaptureActive());
     slot=WmCreateWindow(owner,0,0,640,480,"Reused",1,true);w=&g_windows[slot];
     CHECK(w->wmId==id);w->vfb=&pixel;
+    CHECK(!w->pointerDisengaged && WmPointerCapture(owner,id,3,0)==0);
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Hover named the dead incarnation.
+    WmPointerSetHover(slot);
     const auto fresh=WmPointerCapture(owner,id,1,0);CHECK(fresh>lease);
     CHECK(WmPointerCapture(owner,id,2,lease)==-116 && WmPointerCaptureActive());
     WmInputPop(w,queue,256);
@@ -137,7 +148,7 @@ int main() {
     event.type=InputEventType::MouseRelativeMove;event.deltaX=1;event.sequence=++sequence;
     CHECK(WmRouteCapturedPointer(event) && !WmPointerCaptureActive()); // Queue loss revokes.
     CHECK(WmInputPop(w,queue,256)==255);
-    lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     InputDevice device{};
     event.type=InputEventType::MouseRelativeMove;event.deltaX=123;event.deltaY=-45;
     for(unsigned i=0;i<INPUT_RING_SIZE;++i)InputDevicePush(&device,event);
@@ -148,7 +159,7 @@ int main() {
         last=event.sequence;++count;
     }
     CHECK(count==INPUT_RING_SIZE-1);
-    lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     event={};event.type=InputEventType::KeyPress;event.scanCode=1;
     CHECK(!WmRouteCapturedPointer(event)); // Ordinary Escape remains app input.
     event.modifiers=INPUT_MOD_CTRL|INPUT_MOD_ALT;
@@ -157,7 +168,9 @@ int main() {
     event.type=InputEventType::KeyRelease;CHECK(WmRouteCapturedPointer(event));
     CHECK(!WmRouteCapturedPointer(event));
     // Super-key release: the provider's lease query fails, the pointer returns
-    // to its anchor, and re-locking needs a fresh physical click.
+    // to its anchor, and re-locking needs a fresh physical click in content.
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Ctrl+Alt+Esc disengaged it.
+    WmPointerEngage(slot);
     mouseX=100;mouseY=100;lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     mouseX=5;mouseY=6;
     const auto beforeUser=WmPointerCapture(owner,id,3,0);
@@ -165,10 +178,43 @@ int main() {
     CHECK(!WmPointerCaptureReleaseByUser()); // Idempotent when nothing is captured.
     CHECK(!WmPointerCapture(owner,id,0,lease) && WmPointerCapture(owner,id,2,lease)==-116);
     CHECK(mouseX==100 && mouseY==100 && WmPointerCapture(owner,id,3,0)==beforeUser);
+    CHECK(w->pointerDisengaged);
+    // Ian's Dell report: Super, the launcher opens, the pointer crosses the
+    // taskbar and clicks there; the still-focused game must not re-lock.
+    g_launcherOpen=true;WmPointerSetHover(-1);
     held.type=InputEventType::MouseButtonDown;held.scanCode=0;held.sequence=++sequence;
-    CHECK(!WmRouteCapturedPointer(held) && WmPointerCapture(owner,id,3,0)==beforeUser+1);
+    CHECK(!WmRouteCapturedPointer(held) && WmPointerCapture(owner,id,3,0)==beforeUser);
     held.type=InputEventType::MouseButtonUp;held.sequence=++sequence;
     CHECK(!WmRouteCapturedPointer(held));
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Launcher open.
+    g_launcherOpen=false;
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Over the taskbar, still disengaged.
+    WmPointerSetHover(slot);
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Hovering content is not a click.
+    g_volumePopupOpen=true;WmPointerSetHover(-1);
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Volume popup/mute button usable.
+    g_volumePopupOpen=false;
+    // Clicking the game's content re-engages; the lock can then activate.
+    WmPointerSetHover(slot);WmPointerEngage(slot);
+    CHECK(WmPointerCapture(owner,id,3,0)==beforeUser+1 && !w->pointerDisengaged);
+    lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    // An open launcher or volume popup revokes a live lease too.
+    g_launcherOpen=true;WmPointerCaptureRefresh();CHECK(!WmPointerCaptureActive() && w->pointerDisengaged);
+    g_launcherOpen=false;CHECK(WmPointerCapture(owner,id,1,0)==-11);
+    WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    g_volumePopupOpen=true;WmPointerCaptureRefresh();CHECK(!WmPointerCaptureActive());
+    g_volumePopupOpen=false;WmPointerEngage(slot);
+    // Engaged but hovering a shell surface or another window: no lock.
+    WmPointerSetHover(-1);CHECK(WmPointerCapture(owner,id,1,0)==-11);
+    WmPointerSetHover(other);CHECK(WmPointerCapture(owner,id,1,0)==-11);
+    // Another window's content click does not re-engage this one.
+    lease=(WmPointerSetHover(slot),WmPointerCapture(owner,id,1,0));CHECK(lease>0);
+    const auto engaged=WmPointerCapture(owner,id,3,0);
+    CHECK(WmPointerCaptureReleaseByUser());WmPointerEngage(other);
+    CHECK(WmPointerCapture(owner,id,3,0)==engaged && WmPointerCapture(owner,id,1,0)==-11);
+    // The provider's own release (client unlocks) is not a revoke.
+    WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    CHECK(WmPointerCapture(owner,id,2,lease)==0 && !w->pointerDisengaged);
     lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     mouseButtons=1;
     event={};event.type=InputEventType::MouseRelativeMove;event.sequence=++sequence;
@@ -183,9 +229,10 @@ int main() {
     held.type=InputEventType::MouseButtonUp;held.sequence=++sequence;
     CHECK(!WmRouteCapturedPointer(held));
     { VfbGuard guard;SetWmActiveLocked(true); }
+    WmPointerEngage(slot);
     g_nextPointerCaptureToken=0xffffffffu;
     CHECK(WmPointerCapture(owner,id,1,0)==-75 && !WmPointerCaptureActive());
     w->vfb=nullptr;WmDestroyWindowById(owner,id);WmDestroyWindow(other);
     std::free(owner);std::free(stranger);CHECK(!lockDepth);
-    std::puts("POINTER_CAPTURE PASS: ownership, ordering, signed totals, focus/death/reuse, overflow, emergency and Super release");
+    std::puts("POINTER_CAPTURE PASS: ownership, ordering, signed totals, focus/death/reuse, overflow, emergency and Super release, re-engage only by content click, no lock over shell surfaces");
 }
