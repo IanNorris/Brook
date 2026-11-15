@@ -1,6 +1,6 @@
 # syscall.cpp split plan
 
-_Written 15 November 2026 by a Claude Code session, before any code moved. Branch `work/syscall-split` from `main` at `aac1d429`._
+_Written 15 November 2026 by a Claude Code session, before any code moved. Branch `work/syscall-split`, cut from `main` at `aac1d429` and later rebased onto `cc07051a` (see Verification results)._
 
 ## Goal and rules
 
@@ -416,7 +416,15 @@ To rebase a branch that edits `syscall.cpp`:
 
 ## Verification results (15 November)
 
-These are for `b0f1011c` (the last split commit) against the baseline `aac1d429`.
+The split was first verified on `aac1d429`. It was then rebased, cleanly, onto `cc07051a`, whose 18 new commits do not touch `syscall.cpp`, its fragments, `src/kernel/CMakeLists.txt` or the fragment-including tests. The checks below were rerun against the new base: base `cc07051a` versus the last split commit `b8d78730`.
+
+- The symbol comparison output is byte-identical to the one against `aac1d429`.
+- The decoded dispatch tables are again identical.
+- All 40 rebased commits build Release and pass the five fragment host tests.
+- The full host suite passes, except `test_audio_delivery`, which timed out under `-j6` load and passed when rerun alone.
+- A rebuilt Dell pair (`build/dell/pair-syscall-split-rebased`, payload `dell-syscall-split-20261115b`) passed `--qemu-check`.
+
+The details below are from the original verification on `aac1d429`. They apply unchanged.
 
 - **Symbols (Release `BROOK.elf`, `nm -C --defined-only`).**
   - 311 symbols changed binding only (`t→T`, `b→B`, `d→D`). Every one is an item the split shared on purpose: all 311 are in the generator's export manifest, and none is unexplained.
@@ -438,7 +446,7 @@ These are for `b0f1011c` (the last split commit) against the baseline `aac1d429`
   - Full Release host suite: 356/356 passed. `test_audio_delivery` passed in this run; it times out only under load.
   - Debug kernel builds. `build.sh`'s entry-state audit then rejects `TlbShootdownHandler` (`sub rsp, 0x10`, unmodelled at -O0). That handler is in `apic.cpp`, which this branch does not touch, so the failure is not caused by the split.
 - **Dell pair.** `scripts/build_dell_image.py --payload-id dell-syscall-split-20261115 --kernel-option BROOK_BDW_SCANOUT_FLIP=ON --kernel-option BROOK_BDW_PERSISTENT_SCANOUT_MAP=ON --kernel-option BROOK_BDW_ZERO_COPY_SCANOUT=ON --kernel-option BROOK_BDW_VIDEO_ENGINE=ON --qemu-check` built the Dell kernel with the full baseline option set plus these four. The guarded recovery-to-desktop QEMU check **passed** (`build/dell/pair-syscall-split/qemu-check/verdict.json`; kernel sha256 `288e81c5…`, commit `b0f1011c`, clean tree). Nothing was deployed to the Dell.
-- **Merging.** `main` has moved to `255d4b15` (18 commits), but none of those commits touch `syscall.cpp`, the fragments or `src/kernel/CMakeLists.txt`. `git merge-tree` merges the branch cleanly.
+- **Merging.** The branch is rebased on `cc07051a` and fast-forwards from it.
 
 ## Not done in this pass
 
