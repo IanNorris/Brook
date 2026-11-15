@@ -410,3 +410,46 @@ The patch uses only standard UAPI, so it also runs on Linux i915.
 - the launcher proposal;
 - the 1080p VA-API crash.
 
+## Phase 4 (work/vcs-lane): measurement first, cheap savings, and the async-lane design
+
+**Per job today:** up to **three** VCS GDRSTs, each followed by the firmware engine restore:
+1. the copy work item's reset-before;
+2. the reset inside the execlist takeover (`initializeExeclists` always resets so the CSB cursor is synchronized);
+3. the reset-after.
+
+Every ordinary job buffer is also clflushed before the job and again at retirement. A 720p decode job references 659–2705 pages, which is several MB flushed twice per frame.
+
+**This round (all switchable at runtime, both on by default):**
+- **`gpu video tune resets min|full`:** the reset-before is skipped when the previous user job ended in a verified clean stop and VCS is observed quiescent. The reset-after is replaced by a CSB context-complete on a quiescent engine (the context switched out and the engine went idle). A GDRST still happens on any failure or hang, and inside the execlist init, so that is 1 reset per job instead of 3. Any other VCS operation (self-test, reset, PM ops) clears the clean-stop state.
+- **`gpu video tune coherent on|off`:** job buffers use the leased WB LLC PAT slot without CPU cache flushes, as RCS coherent-render does. The VCS ring already invalidates TLBs before the batch and flushes before the breadcrumb (MI_FLUSH_DW). Check with the ffmpeg framemd5 bit-exact test before trusting it.
+- **Timing in `gpu video status` user_jobs:**
+  - `timed` (count) and `span_ms` (VCS jobs/s = timed / span);
+  - `prep_us`: CPU-side table build, DMA inspection and cache sync;
+  - `run_us`: the critical-section run, i.e. **time the CPU0 worker is blocked on VCS**;
+  - `release_us`;
+  - parts of the run: `reset_before_us`, `pat_us`, `init_us` (execlist takeover including its reset), `decode_us` (ELSP to breadcrumb: the hardware decode), `csb_us`, `tail_us` (stop, unbind, PAT restore, PM finish);
+  - `max_run_us`, `skipped_resets_before`, `skipped_resets_after`.
+
+  All are sums over timed jobs.
+
+**Why the asynchronous VCS lane is not in this pair.** Returning the worker to RCS/BCS while VCS decodes means leaving VCS running between forcewake critical sections. Two invariants of the current safety model forbid that, and changing them touches every GPU path:
+- **Quiescence:** `BdwObserveBcsWithWork` runs a work callback only if **every** other engine (RCS, VCS, VECS) is submission-quiescent. A busy VCS would refuse every RCS present and composite.
+  - Needed: an "owned busy" exemption. VCS is busy only with a job whose lane state Brook tracks, with its context, HWS and lease recorded, and that exemption is accepted by the RCS/BCS paths.
+- **PAT ownership:** each run establishes and then restores the global private PAT (lo/hi) through `BdwPatLease`, from the inherited firmware values (0x03030303) to 0x…07/0x…0b. The zero-copy scanout variant also changes slot 3. A VCS job in flight relies on the leased values, while RCS would restore or retarget them underneath it.
+  - Needed: one persistent GPU-wide PAT policy, established once and verified on each run instead of leased per run. It must be agreed with the scanout/zero-copy owner.
+
+With both in place, the lane is:
+1. **Submit:** critical section A does bind, init if needed, and ELSP, then returns with the job recorded as in flight.
+2. **Wait outside the claim:** the worker interleaves RCS/BCS work. It checks the breadcrumb in RAM (the completion page is CPU-readable), so no MMIO is needed until it changes.
+3. **Retire:** critical section B processes the CSB and unbinds.
+4. **Timeout:** the existing 2 s deadline then triggers reset and quarantine.
+
+A **persistent execlist context** comes with it: a lane-owned HWS page and GGTT lease, a CSB cursor kept across jobs, and no init reset. That removes the last per-job reset. The phase 4 timing above shows how much each of these is worth (`init_us` and `decode_us` against `run_us`) before that larger change.
+
+**1080p VA-API startup SIGTRAP (open):** twice on gen 398, Chromium's browser process logged "Corruption detected in shared-memory segment" (`persistent_memory_allocator.cc:890`) and died with SIGTRAP about 0.5 s after launch, before DevTools and before any decode. Software runs before and after were fine, and an earlier 720p VA-API run was fine.
+- **Hypotheses to test:**
+  1. GPU-process VA initialization (which maps BOs through the new GEM_MMAP path) corrupting an unrelated shared mapping;
+  2. a memfd or shm reuse problem;
+  3. an unrelated flake.
+- **Next step:** repeat 720p and 1080p VA-API launches on the phase 4 kernel, and if it recurs, run Chromium with `--enable-logging --v=1` plus the exec logger, capturing which segment (field-trial or histogram shm) is corrupt.
+
