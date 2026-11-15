@@ -145,4 +145,20 @@ int64_t sys_open(uint64_t path,uint64_t flags,uint64_t mode,uint64_t,uint64_t,ui
 int64_t sys_creat(uint64_t path,uint64_t mode,uint64_t,uint64_t,uint64_t,uint64_t);
 int64_t sys_openat(uint64_t dirfd,uint64_t path,uint64_t flags,uint64_t mode,uint64_t,uint64_t);
 
+// syscall_rw.cpp
+int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_readv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
+                      uint64_t count, uint64_t, uint64_t);
+int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                      uint64_t offset, uint64_t, uint64_t);
+int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
+                     uint64_t offset, uint64_t, uint64_t);
+
 } // namespace brook

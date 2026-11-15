@@ -51,8 +51,8 @@ static int NetlinkCopyName(uint32_t port,uint64_t address,uint64_t lengthAddress
     if((n && !CopyToUser(address,&name,n)) || !CopyToUser(lengthAddress,&actual,4))return -EFAULT;
     return 0;
 }
-static int64_t NetlinkSend(NetlinkSocket* s,uint64_t address,uint64_t length,uint64_t flags,
-                           uint64_t destination=0,uint64_t destinationLength=0,bool user=true) {
+int64_t NetlinkSend(NetlinkSocket* s,uint64_t address,uint64_t length,uint64_t flags,
+                    uint64_t destination=0,uint64_t destinationLength=0,bool user=true) {
     if(flags&~uint64_t(0x40|0x4000))return -95;
     if(int e=NetlinkDestination(destination,destinationLength,true))return e;
     if(length>65536)return -90;
@@ -92,15 +92,15 @@ static int64_t NetlinkReceive(NetlinkSocket* s,void* kernelBytes,uint32_t capaci
         SchedulerBlockInterruptible(ProcessCurrent());
     }
 }
-static int64_t NetlinkVectorIo(NetlinkSocket* s,uint64_t address,uint64_t count,bool writing) {
+int64_t NetlinkVectorIo(NetlinkSocket* s,uint64_t address,uint64_t count,bool writing) {
     KernelOperationGuard operation(ProcessCurrent());
     NetlinkVector stage;if(int e=stage.init(address,count,writing))return e;if(!stage.total)return 0;
     if(writing)return NetlinkSend(s,reinterpret_cast<uint64_t>(stage.bytes),stage.total,0,0,0,false);
     uint32_t size=0;auto n=NetlinkReceive(s,stage.bytes,stage.capacity,0,size);if(n<0)return n;
     if(int e=stage.scatter(n))return e;return n;
 }
-static int64_t NetlinkReadUser(NetlinkSocket* s,uint64_t address,uint64_t length,uint64_t flags,
-                              uint64_t source=0,uint64_t sourceLength=0) {
+int64_t NetlinkReadUser(NetlinkSocket* s,uint64_t address,uint64_t length,uint64_t flags,
+                       uint64_t source,uint64_t sourceLength) {
     uint32_t capacity=static_cast<uint32_t>(length<8192?length:8192);
     if(capacity && !UserBufferWritable(address,capacity))return -EFAULT;
     uint32_t nameLength=0;
