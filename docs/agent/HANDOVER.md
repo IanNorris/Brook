@@ -92,6 +92,15 @@ _Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall f
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, gen 411 (prompt GPU wakeups on by default, autonomous):**
+- **Main is `d84d2c2f`.** M4a prompt wakeups now default to on during Dell boot; `/etc/dell-gpu-no-prompt-wake` opts out, and `gpu wakeups on|off` still switches at runtime.
+- **Why:** after the syscall fix pass, sync_file polls wake on GPU retire, so M4a now pays off. Gen 410 A/B, 3 alternating rounds with zero-copy armed:
+  - swaps/s: 56.5–59.0 on, 47.6–50.1 off;
+  - demo wall time: 20.3–21.3 s on, 22.8–23.8 s off.
+  - Evidence: `display-perf/build/dell/wake-ab-*`.
+- **Soak (gen 410, wakeups on):** 8 Quake rounds with Chromium playing 4K YouTube throughout. No refusals, no new panic, `if_restores` 0, swaps 47–53/s. Rounds 0–2 showed a displayed p90 of ~1 s while the video played; this contention needs a look.
+- **Dell: gen 411** `dell-prompt-wake-20261115`, session `814f822e2d5a4021b0438ae42a997ef2`. Wakeups are enabled at boot; Quake (zero-copy unarmed) gives 51.0–52.6 swaps/s and a composite of 18.8–19.3 ms.
+
 **15 Nov, gen 410 (syscall fixes on main, autonomous):**
 - **Main is `c23acf3c`:** it now includes `work/syscall-fixes`. Release build passes; host tests 357/357, with `test_sched_lock_owner` timing out once under -j8. That test is untouched by the fixes and never hung in 360 runs under heavy parallel load; treat it like `test_audio_delivery`.
 - **Dell: gen 410** `dell-syscall-fixes-20261115`, session `4f0e6eebea1c4e58af1ba91ffa1b7790`, saved in the scratchpad `session` file.
