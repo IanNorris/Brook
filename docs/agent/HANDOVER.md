@@ -92,8 +92,21 @@ _Last updated: 15 November 2026 (midday), by a Claude Code session._
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**15 Nov, ~07:00 UTC (gen 409, autonomous):**
+- **Main is `f4b508f8`:** the syscall.cpp split, fast-forwarded on top of `cc07051a`. It is 36 `syscall_*.cpp` files plus headers; the map and the old→new line table are in [syscall-split-plan.md](syscall-split-plan.md).
+  - The agent checked symbols, the 269-entry dispatch table, every commit's build, and 356/356 host tests.
+  - An independent diff check found every removed line re-added except the 8 definitions whose default arguments moved to headers. The headers add no logic.
+- **Dell: gen 409** `dell-syscall-split-20261115b`, session `051819644a284c3e857af9c6b729d923`, saved in the scratchpad `session` file.
+  - Smoke test: the Quake benchmark ran (swaps 46/s, composite 20.1 ms, zero-copy off).
+  - Firefox and Chromium on YouTube with private profiles both stayed up (147 and 587 GPU jobs in 90 s, no refusals), and no new panic was recorded.
+  - Evidence: `display-perf/build/dell/split-quake2/` and `split-browsers/`.
+- **Next for the refactor:**
+  - The fix pass with tests, driven by [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md) (182 entries, 27 high, including the raw user-pointer writes in the WM and input syscalls and the non-canonical `CLONE_SETTLS` base).
+  - Then the `net.cpp` debug-command split.
+  - Rebase any in-flight kernel branches using the line table.
+
 **15 Nov, midday (gens 407–408, autonomous):**
-- **Main is `255d4b15`.** It adds `work/multilayer-main` (opaque regions clamped to the surface, per-window region state, the SSD override opt-in via `BROOK_WAYLAND_SSD_APPS`) and `work/integration10-lane`: the VA-API 4 asynchronous VCS lane (`gpu video tune async on|off`, **default off**), lane latency counters and `gpu video tune spin on|off`. With async off, the only paths that change are refactored, not altered: the sync VCS job is split into submit/conclude, and the worker's parked-job checks are no-ops. Release build plus 356/356 host tests pass (`test_audio_delivery` rerun alone).
+- **Main was `255d4b15`.** It adds `work/multilayer-main` (opaque regions clamped to the surface, per-window region state, the SSD override opt-in via `BROOK_WAYLAND_SSD_APPS`) and `work/integration10-lane`: the VA-API 4 asynchronous VCS lane (`gpu video tune async on|off`, **default off**), lane latency counters and `gpu video tune spin on|off`. With async off, the only paths that change are refactored, not altered: the sync VCS job is split into submit/conclude, and the worker's parked-job checks are no-ops. Release build plus 356/356 host tests pass (`test_audio_delivery` rerun alone).
 - **Dell: gen 408** `pair-int10-lane2` (= main code), video gate off, session in the shared session file.
 - **Lane results** (details in `docs/bdw-video-engine.md`):
   - ffmpeg decode with async on is bit-exact, 300/300 at 720p and 1080p, with 0 lane failures. Worker blocked per job: 555 µs, against 1.9 ms (720p) and 3.8 ms (1080p) with sync.
@@ -115,7 +128,7 @@ _Last updated: 15 November 2026 (midday), by a Claude Code session._
   - A private-profile Chrome probe showed offers 416/416 presented and no layered waits, but stalled on the YouTube consent page, so ad overlays are untested.
 - **Chrome opaque region:** Chrome sends a single 1050×880 rect over an 832×642 logical surface; `opaque_single` stayed 0 (exact-match check). Being relaxed to "covers the surface" on `work/multilayer`.
 - **Clearwater Next is final and on main** (`513a78d9`, squash-merged): glass chrome, Mixed default, a 13-choice accent row (incl. hot pink and phosphor), launcher organisation, the edge-to-edge caption hit spec, the theme architecture T0–T5 and the implementation order. Files: `docs/design/clearwater-next/`.
-- **syscall.cpp split** started on `work/syscall-split`: pure moves, issues logged in `docs/agent/REFACTOR_ISSUES.md`, `net.cpp` debug commands next. Rebase in-flight kernel branches onto it after merge.
+- **syscall.cpp split:** merged since (see above).
 - **VA-API 4 measurements** and the async-lane decision are with the VA-API agent.
 - **Worker site=2:** waiting for a recurrence; there are 3-line diagnostics now.
 
@@ -397,7 +410,7 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Loader F5 wait ignores input on the Dell:** works in QEMU/OVMF. Boot the timing loader (branch `work/boot-timing`), press keys during the wait and read `BOOT_TIMING_DETAIL wait_keys=`; zero suggests ConIn isn't connected on the fast-boot path. See `src/bootloader/src/DOCS.md`.
 
 - **Automatic slot rollback in the guard:** after N consecutive desktop panics on a newly activated generation, select the previous verified slot instead of looping in recovery-only mode. Also expose a slot-select operation in the recovery-only bridge.
-- **Split `src/kernel/src/syscall.cpp`:** done as a pure move on `work/syscall-split` (15 Nov), awaiting Ian's review and merge. It produced 36 single-responsibility `syscall_*.cpp` files plus internal headers; see [syscall-split-plan.md](syscall-split-plan.md) for the map and old→new line table. The 182 problems found along the way (27 high) are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), which drives the separate fix pass. Not done yet: moving the debug channel and commands out of `net.cpp`, which the issue log describes.
+- **Split `src/kernel/src/syscall.cpp`:** done as a pure move and merged to main (`f4b508f8`, 15 Nov). It produced 36 single-responsibility `syscall_*.cpp` files plus internal headers; see [syscall-split-plan.md](syscall-split-plan.md) for the map and old→new line table. The 182 problems found along the way (27 high) are in [REFACTOR_ISSUES.md](REFACTOR_ISSUES.md), which drives the separate fix pass. Not done yet: moving the debug channel and commands out of `net.cpp`, which the issue log describes.
 - **Remove or declare the twelve orphaned `tools/netsurf-build/*` gitlinks** (they have no `.gitmodules` entries).
 - **Transparent kernel rendering interfaces,** so console and shell output uses the GPU path.
 
