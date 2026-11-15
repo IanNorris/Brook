@@ -24,7 +24,7 @@
   --page:#0a1018; --page-ink:#c9d6e6; --page-dim:#7f90a6; --page-line:#1e2a3a;
 }
 
-/* ---------- Glass tokens: palette x glass mode ---------- */
+/* ---------- Chrome tokens by glass mode. These are the Blue values; the generated hue rows below replace them for every hue. ---------- */
 #stage{
   --op:.8; --blur:3px; --a-floor:.40;
   --g:16 36 66; --g-hi:40 80 138; --g-flat:22 40 68;
@@ -41,8 +41,6 @@
 }
 #stage[data-glass="light"]{--accent-hover:color-mix(in srgb,var(--accent) 88%,#000);--accent-press:color-mix(in srgb,var(--accent) 76%,#000)}
 #stage[data-content="light"]{--c-accent-hover:color-mix(in srgb,var(--c-accent) 88%,#000);--c-accent-press:color-mix(in srgb,var(--c-accent) 76%,#000)}
-#stage[data-palette="smoked"]{--g:22 26 34;--g-hi:54 62 78;--g-flat:30 34 43;--rim-act:rgb(214 224 240/.55);--accent:#a6c0e2;--on-accent:#101a28;--accent-2:#8fd0c6}
-#stage[data-palette="opal"]{--g:12 40 30;--g-hi:28 86 62;--g-flat:17 46 36;--rim-act:rgb(178 240 208/.58);--accent:#62d6a0;--on-accent:#05281a;--accent-2:#7db8ff}
 #stage[data-glass="light"]{
   --a-floor:.55;
   --g:226 237 251; --g-hi:186 213 248; --g-flat:226 235 247;
@@ -52,20 +50,15 @@
   --hover:rgb(20 50 100/.08); --press:rgb(20 50 100/.14); --well:rgb(255 255 255/.5);
   --accent:#1f6fe0; --on-accent:#fff; --accent-2:#0a7f8a;
   --sh:20 34 56;
+  --ok:#157040; --warn:#855400; --hot:#c0271f;   /* the signal colours, deepened for light chrome */
 }
-#stage[data-glass="light"][data-palette="smoked"]{--g:235 238 243;--g-hi:208 215 226;--g-flat:232 235 240;--rim-act:rgb(70 96 136/.6);--accent:#44628c;--accent-2:#2f7d78}
-#stage[data-glass="light"][data-palette="opal"]{--g:234 247 247;--g-hi:190 231 231;--g-flat:230 243 243;--rim-act:rgb(10 127 138/.58);--accent:#0a7f8a;--accent-2:#1f6fe0}
 
-/* ---------- Content tokens: palette x content mode (opaque app surfaces) ---------- */
+/* ---------- Content tokens by content mode (opaque app surfaces). Blue values, as above. ---------- */
 #stage{
   --c-bg:#111c2b; --c-raise:#18263a; --c-sink:#0c1522; --c-line:#26374f;
   --c-ink:#e6edf7; --c-dim:#93a4bb; --c-accent:#6aaeff; --c-on-accent:#06213f; --c-sel:rgb(106 174 255/.16);
 }
-#stage[data-palette="smoked"]{--c-bg:#16181d;--c-raise:#1f2229;--c-sink:#101216;--c-line:#2d323c;--c-ink:#e8eaee;--c-dim:#9aa1ad;--c-accent:#a6c0e2;--c-on-accent:#101a28;--c-sel:rgb(166 192 226/.15)}
-#stage[data-palette="opal"]{--c-bg:#0f201a;--c-raise:#152b23;--c-sink:#0a1813;--c-line:#223f34;--c-ink:#e4f1ea;--c-dim:#8fada0;--c-accent:#62d6a0;--c-on-accent:#05281a;--c-sel:rgb(98 214 160/.14)}
 #stage[data-content="light"]{--c-bg:#f5f8fc;--c-raise:#fff;--c-sink:#eaf0f8;--c-line:#d7e0ed;--c-ink:#1c2b3f;--c-dim:#5c6d84;--c-accent:#1f6fe0;--c-on-accent:#fff;--c-sel:rgb(31 111 224/.11)}
-#stage[data-content="light"][data-palette="smoked"]{--c-bg:#f6f7f9;--c-raise:#fff;--c-sink:#eceef2;--c-line:#dadde4;--c-ink:#20242b;--c-dim:#626a77;--c-accent:#44628c;--c-sel:rgb(68 98 140/.12)}
-#stage[data-content="light"][data-palette="opal"]{--c-bg:#f3fafa;--c-raise:#fff;--c-sink:#e6f2f2;--c-line:#d2e5e5;--c-ink:#17302f;--c-dim:#557072;--c-accent:#0a7f8a;--c-sel:rgb(10 127 138/.11)}
 
 /* ---------- Page and study bar ---------- */
 *{box-sizing:border-box}
@@ -84,6 +77,8 @@ button{border:0;background:none;padding:0;cursor:pointer}
 #study button.on{background:#22344b;color:#fff}
 #study .sp{flex:1}
 #study button:focus-visible{outline:2px solid #6aaeff;outline-offset:1px}
+#study .grp[data-key=accent] button{padding:0 5px}
+#study .grp .dot{display:block;width:12px;height:12px;border-radius:50%}
 #fit{position:relative;margin:0 auto;overflow:hidden}
 html.shot #study{display:none}
 html.shot *{transition:none!important;animation:none!important}
@@ -120,7 +115,7 @@ html.shot *{transition:none!important;animation:none!important}
 .win.max::after{display:none}
 .win.active{box-shadow:0 14px 32px rgb(var(--sh)/.50),0 2px 6px rgb(0 0 0/.40)}
 .win.gone{opacity:0;transform:translateY(10px) scale(.985);pointer-events:none}
-.win.max{left:0!important;top:0!important;width:1600px!important;height:calc(900px - var(--h-bar))!important;border-radius:0;box-shadow:none}
+.win.max{left:var(--wa-left)!important;top:var(--wa-top)!important;width:calc(1600px - var(--wa-left) - var(--wa-right))!important;height:calc(900px - var(--h-bar) - var(--wa-top))!important;border-radius:0;box-shadow:none}   /* the work area: beside a pinned side dock, below the top dock */
 .tb{--a:max(var(--op),var(--a-floor));position:relative;flex:none;height:var(--h-title);display:flex;align-items:center;gap:var(--sp-2);padding-left:var(--sp-3);
   background:rgb(var(--g)/var(--a));-webkit-backdrop-filter:blur(var(--blur));backdrop-filter:blur(var(--blur));
   border-bottom:1px solid var(--divide);color:var(--ink-3);cursor:default}
@@ -193,6 +188,11 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 .pals{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-2)}
 .pal{border:1px solid var(--c-line);border-radius:var(--r-win);padding:6px 6px 8px;text-align:center;font-size:var(--t-sm);color:var(--c-dim);background:var(--c-raise);transition:border-color var(--m-fast)}
 .pal:hover{border-color:var(--c-dim)}
+.pal:disabled{opacity:.45;cursor:not-allowed}
+.pal:disabled:hover{border-color:var(--c-line)}
+.pal[data-v="glass"] .mini i::before{opacity:.84}
+.note{display:flex;gap:var(--sp-2);align-items:flex-start;margin-top:var(--sp-2);padding:8px 10px;border-radius:var(--r-sm);background:var(--c-sink);border:1px solid var(--c-line);font-size:var(--t-sm);color:var(--c-ink)}
+#stage .note svg.i{margin-top:1px;color:var(--c-dim)}
 .pal[aria-pressed="true"]{border-color:var(--c-accent);box-shadow:0 0 0 1px var(--c-accent);color:var(--c-ink)}
 .pal .mini{display:block;height:40px;border-radius:5px;overflow:hidden;margin-bottom:6px;position:relative;background:url("assets/brook-dawn.png") center 62%/420px}
 .pal .mini i{position:absolute;left:10px;right:10px;top:10px;bottom:-4px;border-radius:4px 4px 0 0;background:var(--pc);box-shadow:0 3px 8px rgb(0 0 0/.4)}
@@ -201,16 +201,11 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 .accs{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin:0 -6px}
 .accs button{height:36px;border-radius:var(--r-sm);display:grid;place-items:center}
 .accs button:hover{background:var(--c-sink)}
-.accs i{width:22px;height:22px;border-radius:50%;background:var(--sd);display:grid;place-items:center;color:var(--c-on-accent)}
-#stage[data-content="light"] .accs i{background:var(--sl)}
+.accs i{width:22px;height:22px;border-radius:50%;background:var(--sw);display:grid;place-items:center;color:var(--sk)}   /* one identity colour per hue, the same in every mode */
 #stage .accs i.wp{background:url("assets/brook-dawn.png") 50% 30%/90px}
 .accs button[aria-pressed="true"] i{box-shadow:0 0 0 2px var(--c-bg),0 0 0 4px var(--c-accent)}
 #stage .accs svg.i{width:12px;height:12px;stroke-width:2.2;display:none}
 #stage .accs button[aria-pressed="true"] svg.i{display:block}
-#stage #acc-auto{background:none;box-shadow:inset 0 0 0 6px var(--sd)}
-#stage[data-content="light"] #acc-auto{box-shadow:inset 0 0 0 6px var(--sl)}
-#stage .accs button[aria-pressed="true"] #acc-auto{box-shadow:inset 0 0 0 6px var(--c-accent),0 0 0 2px var(--c-bg),0 0 0 4px var(--c-accent)}
-#stage #acc-auto svg.i{display:none}
 .about-id{display:flex;gap:var(--sp-4);align-items:center}
 .about-id img{height:52px}
 .about-id strong{font-size:var(--t-head);font-weight:700;display:block}
@@ -305,7 +300,7 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 .ibtn{width:36px;height:36px;border-radius:var(--r-sm);display:grid;place-items:center;color:var(--ink-2);flex:none;transition:background var(--m-fast)}
 .ibtn:hover{background:var(--hover);color:var(--ink)}
 
-#launcher{left:8px;bottom:calc(var(--h-bar) + 8px);width:680px;height:648px;display:flex;flex-direction:column}
+#launcher{left:calc(var(--wa-left) + 8px);bottom:calc(var(--h-bar) + 8px);width:680px;height:648px;display:flex;flex-direction:column}
 .l-search{flex:none;margin:var(--sp-3) var(--sp-3) 0;height:44px;display:flex;align-items:center;gap:10px;padding:0 var(--sp-3);border-radius:var(--r-win);background:var(--well);border:1px solid var(--rim-out)}
 .l-search:focus-within{border-color:var(--accent)}
 .l-search input{flex:1;min-width:0;background:none;border:0;outline:0;font-size:var(--t-lead);color:var(--ink)}
@@ -330,7 +325,9 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 .rb small.badge{background:var(--accent);color:var(--on-accent);border-radius:9px;padding:1px 7px;font-weight:700}
 .rb:hover{background:var(--hover);color:var(--ink)}
 .rb[aria-pressed="true"]{background:var(--press);color:var(--ink)}
-.rb.new{color:var(--ink-3);margin-top:auto;padding-left:11px}
+/* 'New category' is a drop target, not a button: it exists only while an app is being dragged. */
+.rb.new{display:none;color:var(--ink-2);margin-top:auto;padding-left:11px;border:1px dashed var(--ink-3);cursor:default}
+#launcher.dragapp .rb.new{display:flex}
 .ct{width:22px;height:22px;border-radius:var(--r-sm);display:grid;place-items:center;background:var(--cc);color:#0b1a2b;flex:none}
 #stage .ct svg.i{width:14px;height:14px}
 .ct.plain{background:var(--well);color:var(--ink-2)}
@@ -442,7 +439,7 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 .hg .top span{margin-left:auto}
 #hud footer{font-size:var(--t-cap);color:var(--ink-3);padding:2px 2px 0;display:flex;justify-content:space-between;gap:var(--sp-2);user-select:text}
 
-#toasts{position:absolute;right:16px;top:16px;width:360px;display:flex;flex-direction:column;gap:var(--sp-2);z-index:960}
+#toasts{position:absolute;right:16px;top:calc(var(--wa-top) + 16px);width:360px;display:flex;flex-direction:column;gap:var(--sp-2);z-index:960}
 .toast{border-radius:var(--r-shell);padding:var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-4);display:grid;grid-template-columns:20px 1fr 30px;gap:2px var(--sp-3);align-items:start;
   animation:tin var(--m-slow) var(--ease)}
 .toast.out{opacity:0;transform:translateX(12px);transition:opacity var(--m-base),transform var(--m-base)}
@@ -457,12 +454,16 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 .toast .meta{font-size:var(--t-cap);color:var(--ink-3);user-select:text}
 
 /* ---------- Effects (Settings > Lab) ---------- */
-/* ---------- Accent choices (Settings > Appearance). Generated with contrast checks; see DESIGN.md. ---------- */
+/* ---------- Hues (Settings > Appearance). Generated with contrast checks; see DESIGN.md "Hue and accent colours". ---------- */
 /* 'wallpaper' is sampled when the wallpaper is set; hardcoded here for brook-dawn. */
 #stage[data-accent="blue"][data-glass]{--accent:#6aaeff;--on-accent:#101e2e;--rim-act:rgb(106 174 255/.62);--accent-2:#5fd6c8;}
 #stage[data-accent="blue"][data-glass="light"][data-palette]{--accent:#1c65cc;--on-accent:#fff;--rim-act:rgb(28 101 204/.6);--accent-2:#0a7f8a}
 #stage[data-accent="blue"][data-content]{--c-accent:#6aaeff;--c-on-accent:#101e2e;--c-sel:rgb(106 174 255/.16)}
 #stage[data-accent="blue"][data-content="light"][data-palette]{--c-accent:#1c65cc;--c-on-accent:#fff;--c-sel:rgb(28 101 204/.11)}
+#stage[data-accent="navy"][data-glass]{--accent:#739fff;--on-accent:#111c2e;--rim-act:rgb(115 159 255/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="navy"][data-glass="light"][data-palette]{--accent:#17409c;--on-accent:#fff;--rim-act:rgb(23 64 156/.6);--accent-2:#0a7f8a}
+#stage[data-accent="navy"][data-content]{--c-accent:#739fff;--c-on-accent:#111c2e;--c-sel:rgb(115 159 255/.16)}
+#stage[data-accent="navy"][data-content="light"][data-palette]{--c-accent:#17409c;--c-on-accent:#fff;--c-sel:rgb(23 64 156/.11)}
 #stage[data-accent="teal"][data-glass]{--accent:#4fd3c4;--on-accent:#0d2227;--rim-act:rgb(79 211 196/.62);--accent-2:#7db8ff;}
 #stage[data-accent="teal"][data-glass="light"][data-palette]{--accent:#09747e;--on-accent:#fff;--rim-act:rgb(9 116 126/.6);--accent-2:#1f6fe0}
 #stage[data-accent="teal"][data-content]{--c-accent:#4fd3c4;--c-on-accent:#0d2227;--c-sel:rgb(79 211 196/.16)}
@@ -479,22 +480,22 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 #stage[data-accent="lime"][data-glass="light"][data-palette]{--accent:#53710c;--on-accent:#fff;--rim-act:rgb(83 113 12/.6);--accent-2:#1f6fe0}
 #stage[data-accent="lime"][data-content]{--c-accent:#b4e04a;--c-on-accent:#192419;--c-sel:rgb(180 224 74/.16)}
 #stage[data-accent="lime"][data-content="light"][data-palette]{--c-accent:#53710c;--c-on-accent:#fff;--c-sel:rgb(83 113 12/.11)}
-#stage[data-accent="amber"][data-glass]{--accent:#f2bb4e;--on-accent:#211f19;--rim-act:rgb(242 187 78/.62);--accent-2:#5fd6c8;}
-#stage[data-accent="amber"][data-glass="light"][data-palette]{--accent:#8a5a00;--on-accent:#fff;--rim-act:rgb(138 90 0/.6);--accent-2:#0a7f8a}
-#stage[data-accent="amber"][data-content]{--c-accent:#f2bb4e;--c-on-accent:#211f19;--c-sel:rgb(242 187 78/.16)}
-#stage[data-accent="amber"][data-content="light"][data-palette]{--c-accent:#8a5a00;--c-on-accent:#fff;--c-sel:rgb(138 90 0/.11)}
-#stage[data-accent="orange"][data-glass]{--accent:#ff9a57;--on-accent:#221b1a;--rim-act:rgb(255 154 87/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
-#stage[data-accent="orange"][data-glass="light"][data-palette]{--accent:#ae4e0f;--on-accent:#fff;--rim-act:rgb(174 78 15/.6);--accent-2:#0a7f8a}
-#stage[data-accent="orange"][data-content]{--c-accent:#ff9a57;--c-on-accent:#221b1a;--c-sel:rgb(255 154 87/.16)}
-#stage[data-accent="orange"][data-content="light"][data-palette]{--c-accent:#ae4e0f;--c-on-accent:#fff;--c-sel:rgb(174 78 15/.11)}
-#stage[data-accent="red"][data-glass]{--accent:#ff7a72;--on-accent:#22171e;--rim-act:rgb(255 122 114/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
-#stage[data-accent="red"][data-glass="light"][data-palette]{--accent:#c4302b;--on-accent:#fff;--rim-act:rgb(196 48 43/.6);--accent-2:#0a7f8a}
-#stage[data-accent="red"][data-content]{--c-accent:#ff7a72;--c-on-accent:#22171e;--c-sel:rgb(255 122 114/.16)}
-#stage[data-accent="red"][data-content="light"][data-palette]{--c-accent:#c4302b;--c-on-accent:#fff;--c-sel:rgb(196 48 43/.11)}
+#stage[data-accent="amber"][data-glass]{--accent:#ffc233;--on-accent:#222016;--rim-act:rgb(255 194 51/.62);--accent-2:#5fd6c8;}
+#stage[data-accent="amber"][data-glass="light"][data-palette]{--accent:#8f5d00;--on-accent:#fff;--rim-act:rgb(143 93 0/.6);--accent-2:#0a7f8a}
+#stage[data-accent="amber"][data-content]{--c-accent:#ffc233;--c-on-accent:#222016;--c-sel:rgb(255 194 51/.16)}
+#stage[data-accent="amber"][data-content="light"][data-palette]{--c-accent:#8f5d00;--c-on-accent:#fff;--c-sel:rgb(143 93 0/.11)}
+#stage[data-accent="orange"][data-glass]{--accent:#ff8a3c;--on-accent:#221917;--rim-act:rgb(255 138 60/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
+#stage[data-accent="orange"][data-glass="light"][data-palette]{--accent:#b54600;--on-accent:#fff;--rim-act:rgb(181 70 0/.6);--accent-2:#0a7f8a}
+#stage[data-accent="orange"][data-content]{--c-accent:#ff8a3c;--c-on-accent:#221917;--c-sel:rgb(255 138 60/.16)}
+#stage[data-accent="orange"][data-content="light"][data-palette]{--c-accent:#b54600;--c-on-accent:#fff;--c-sel:rgb(181 70 0/.11)}
+#stage[data-accent="red"][data-glass]{--accent:#ff625a;--on-accent:#22151b;--rim-act:rgb(255 98 90/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
+#stage[data-accent="red"][data-glass="light"][data-palette]{--accent:#c9211d;--on-accent:#fff;--rim-act:rgb(201 33 29/.6);--accent-2:#0a7f8a}
+#stage[data-accent="red"][data-content]{--c-accent:#ff625a;--c-on-accent:#22151b;--c-sel:rgb(255 98 90/.16)}
+#stage[data-accent="red"][data-content="light"][data-palette]{--c-accent:#c9211d;--c-on-accent:#fff;--c-sel:rgb(201 33 29/.11)}
 #stage[data-accent="pink"][data-glass]{--accent:#ff6cba;--on-accent:#221626;--rim-act:rgb(255 108 186/.62);--accent-2:#5fd6c8;--hud-1:var(--ink-2);}
-#stage[data-accent="pink"][data-glass="light"][data-palette]{--accent:#c81e7c;--on-accent:#fff;--rim-act:rgb(200 30 124/.6);--accent-2:#0a7f8a}
+#stage[data-accent="pink"][data-glass="light"][data-palette]{--accent:#c71d7b;--on-accent:#fff;--rim-act:rgb(199 29 123/.6);--accent-2:#0a7f8a}
 #stage[data-accent="pink"][data-content]{--c-accent:#ff6cba;--c-on-accent:#221626;--c-sel:rgb(255 108 186/.16)}
-#stage[data-accent="pink"][data-content="light"][data-palette]{--c-accent:#c81e7c;--c-on-accent:#fff;--c-sel:rgb(200 30 124/.11)}
+#stage[data-accent="pink"][data-content="light"][data-palette]{--c-accent:#c71d7b;--c-on-accent:#fff;--c-sel:rgb(199 29 123/.11)}
 #stage[data-accent="violet"][data-glass]{--accent:#b79cff;--on-accent:#191c2e;--rim-act:rgb(183 156 255/.62);--accent-2:#5fd6c8;}
 #stage[data-accent="violet"][data-glass="light"][data-palette]{--accent:#6a43d6;--on-accent:#fff;--rim-act:rgb(106 67 214/.6);--accent-2:#0a7f8a}
 #stage[data-accent="violet"][data-content]{--c-accent:#b79cff;--c-on-accent:#191c2e;--c-sel:rgb(183 156 255/.16)}
@@ -507,6 +508,61 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 #stage[data-accent="wallpaper"][data-glass="light"][data-palette]{--accent:#a8511d;--on-accent:#fff;--rim-act:rgb(168 81 29/.6);--accent-2:#0a7f8a}
 #stage[data-accent="wallpaper"][data-content]{--c-accent:#f6b98a;--c-on-accent:#211f20;--c-sel:rgb(246 185 138/.16)}
 #stage[data-accent="wallpaper"][data-content="light"][data-palette]{--c-accent:#a8511d;--c-on-accent:#fff;--c-sel:rgb(168 81 29/.11)}
+/* ---------- The chosen hue drives every chrome and app surface, in all three themes. Generated. ----------
+   Each row is the approved blue set rotated to the hue in OKLCH, shaped for the warm hues and Navy, then nudged until the
+   contrast targets hold on the glass tint and on the flat fill the Opaque themes use. */
+#stage[data-tint="blue"][data-glass]{--g:16 36 66;--g-hi:40 80 138;--g-flat:22 40 68;--ink:#eef4fc;--ink-2:rgb(238 244 252/.74);--ink-3:rgb(238 244 252/.52);--sh:3 10 22}
+#stage[data-tint="blue"][data-glass="light"]{--g:226 237 251;--g-hi:186 213 248;--g-flat:226 235 247;--ink:#14263d;--ink-2:rgb(20 38 61/.78);--ink-3:rgb(20 38 61/.66);--rim-out:rgb(20 44 80/.24);--divide:rgb(20 44 80/.13);--hover:rgb(20 50 100/.08);--press:rgb(20 50 100/.14);--sh:20 34 56}
+#stage[data-tint="blue"][data-content]{--c-bg:#111c2b;--c-raise:#18263a;--c-sink:#0c1522;--c-line:#26374f;--c-ink:#e6edf7;--c-dim:#93a4bb}
+#stage[data-tint="blue"][data-content="light"]{--c-bg:#f5f8fc;--c-raise:#fff;--c-sink:#eaf0f8;--c-line:#d7e0ed;--c-ink:#1c2b3f;--c-dim:#5c6d84}
+#stage[data-tint="navy"][data-glass]{--g:9 18 68;--g-hi:35 56 145;--g-flat:14 24 69;--ink:#eff3fc;--ink-2:rgb(239 243 252/.74);--ink-3:rgb(239 243 252/.52);--sh:5 9 22}
+#stage[data-tint="navy"][data-glass="light"]{--g:227 236 255;--g-hi:190 210 255;--g-flat:227 234 251;--ink:#1a243e;--ink-2:rgb(26 36 62/.78);--ink-3:rgb(26 36 62/.66);--rim-out:rgb(30 42 80/.24);--divide:rgb(30 42 80/.13);--hover:rgb(34 47 100/.08);--press:rgb(34 47 100/.14);--sh:25 33 56}
+#stage[data-tint="navy"][data-content]{--c-bg:#0c1328;--c-raise:#131d38;--c-sink:#070d1f;--c-line:#212d4e;--c-ink:#e8ecf7;--c-dim:#97a2bc}
+#stage[data-tint="navy"][data-content="light"]{--c-bg:#f6f8fc;--c-raise:#fff;--c-sink:#ebeff8;--c-line:#d9dfed;--c-ink:#212a3f;--c-dim:#616b84}
+#stage[data-tint="teal"][data-glass]{--g:0 43 41;--g-hi:0 94 89;--g-flat:0 47 45;--ink:#ecf6f4;--ink-2:rgb(236 246 244/.74);--ink-3:rgb(236 246 244/.52);--sh:0 13 11}
+#stage[data-tint="teal"][data-glass="light"]{--g:223 240 237;--g-hi:176 221 215;--g-flat:223 238 236;--ink:#062c28;--ink-2:rgb(6 44 40/.78);--ink-3:rgb(6 44 40/.66);--rim-out:rgb(0 53 50/.24);--divide:rgb(0 53 50/.13);--hover:rgb(0 61 59/.08);--press:rgb(0 61 59/.14);--sh:5 40 38}
+#stage[data-tint="teal"][data-content]{--c-bg:#0a201e;--c-raise:#0d2b29;--c-sink:#061817;--c-line:#1a3d3a;--c-ink:#e3efee;--c-dim:#8caaa6}
+#stage[data-tint="teal"][data-content="light"]{--c-bg:#f4f9f8;--c-raise:#fff;--c-sink:#e8f2f0;--c-line:#d3e3e1;--c-ink:#13302d;--c-dim:#54736f}
+#stage[data-tint="pine"][data-glass]{--g:0 44 30;--g-hi:0 96 68;--g-flat:2 49 34;--ink:#edf6f1;--ink-2:rgb(237 246 241/.74);--ink-3:rgb(237 246 241/.52);--sh:1 13 7}
+#stage[data-tint="pine"][data-glass="light"]{--g:224 241 231;--g-hi:179 222 200;--g-flat:224 238 230;--ink:#0a2c1e;--ink-2:rgb(10 44 30/.78);--ink-3:rgb(10 44 30/.66);--rim-out:rgb(0 54 37/.24);--divide:rgb(0 54 37/.13);--hover:rgb(0 63 45/.08);--press:rgb(0 63 45/.14);--sh:7 41 29}
+#stage[data-tint="pine"][data-content]{--c-bg:#0c2017;--c-raise:#102c20;--c-sink:#071911;--c-line:#1d3e30;--c-ink:#e4f0ea;--c-dim:#8eaa9c}
+#stage[data-tint="pine"][data-content="light"]{--c-bg:#f4f9f6;--c-raise:#fff;--c-sink:#e9f2ed;--c-line:#d4e4dc;--c-ink:#153124;--c-dim:#577365}
+#stage[data-tint="phosphor"][data-glass]{--g:3 45 22;--g-hi:11 97 51;--g-flat:12 48 27;--ink:#eef6ef;--ink-2:rgb(238 246 239/.74);--ink-3:rgb(238 246 239/.52);--sh:2 13 4}
+#stage[data-tint="phosphor"][data-glass="light"]{--g:226 240 228;--g-hi:185 222 191;--g-flat:226 238 228;--ink:#112c18;--ink-2:rgb(17 44 24/.78);--ink-3:rgb(17 44 24/.66);--rim-out:rgb(3 55 27/.24);--divide:rgb(3 55 27/.13);--hover:rgb(0 64 33/.08);--press:rgb(0 64 33/.14);--sh:13 40 24}
+#stage[data-tint="phosphor"][data-content]{--c-bg:#0f2014;--c-raise:#142b1b;--c-sink:#09190e;--c-line:#223d2a;--c-ink:#e5f0e7;--c-dim:#91aa96}
+#stage[data-tint="phosphor"][data-content="light"]{--c-bg:#f5f9f6;--c-raise:#fff;--c-sink:#eaf2eb;--c-line:#d6e3d9;--c-ink:#1a301f;--c-dim:#5a7360}
+#stage[data-tint="lime"][data-glass]{--g:27 42 4;--g-hi:63 91 13;--g-flat:31 45 12;--ink:#f1f5ec;--ink-2:rgb(241 245 236/.74);--ink-3:rgb(241 245 236/.52);--sh:7 12 1}
+#stage[data-tint="lime"][data-glass="light"]{--g:232 239 223;--g-hi:201 218 177;--g-flat:231 237 223;--ink:#1f2a0d;--ink-2:rgb(31 42 13/.78);--ink-3:rgb(31 42 13/.66);--rim-out:rgb(33 51 5/.24);--divide:rgb(33 51 5/.13);--hover:rgb(36 61 0/.08);--press:rgb(36 61 0/.14);--sh:27 38 13}
+#stage[data-tint="lime"][data-content]{--c-bg:#171e0d;--c-raise:#202912;--c-sink:#111708;--c-line:#2f3b1f;--c-ink:#e9efe4;--c-dim:#9ca78d}
+#stage[data-tint="lime"][data-content="light"]{--c-bg:#f7f9f4;--c-raise:#fff;--c-sink:#edf1e8;--c-line:#dbe2d4;--c-ink:#252e16;--c-dim:#657056}
+#stage[data-tint="amber"][data-glass]{--g:67 50 0;--g-hi:139 106 0;--g-flat:67 50 0;--ink:#f7f3ea;--ink-2:rgb(247 243 234/.74);--ink-3:rgb(247 243 234/.56);--sh:15 9 0}
+#stage[data-tint="amber"][data-glass="light"]{--g:252 234 199;--g-hi:249 204 108;--g-flat:247 233 203;--ink:#302304;--ink-2:rgb(48 35 4/.78);--ink-3:rgb(48 35 4/.66);--rim-out:rgb(57 42 0/.24);--divide:rgb(57 42 0/.13);--hover:rgb(66 50 0/.08);--press:rgb(66 50 0/.14);--sh:43 32 4}
+#stage[data-tint="amber"][data-content]{--c-bg:#241a02;--c-raise:#312301;--c-sink:#1c1301;--c-line:#44340a;--c-ink:#f1ece1;--c-dim:#ada187}
+#stage[data-tint="amber"][data-content="light"]{--c-bg:#faf7f3;--c-raise:#fff;--c-sink:#f3efe6;--c-line:#e5dfd0;--c-ink:#342910;--c-dim:#776a50}
+#stage[data-tint="orange"][data-glass]{--g:77 36 0;--g-hi:139 69 0;--g-flat:83 39 0;--ink:#fbf1ec;--ink-2:rgb(251 241 236/.74);--ink-3:rgb(251 241 236/.56);--sh:19 6 1}
+#stage[data-tint="orange"][data-glass="light"]{--g:255 230 216;--g-hi:255 196 161;--g-flat:253 229 215;--ink:#381e0d;--ink-2:rgb(56 30 13/.78);--ink-3:rgb(56 30 13/.66);--rim-out:rgb(71 33 0/.24);--divide:rgb(71 33 0/.13);--hover:rgb(81 39 0/.08);--press:rgb(81 39 0/.14);--sh:51 28 10}
+#stage[data-tint="orange"][data-content]{--c-bg:#2a1608;--c-raise:#381e0b;--c-sink:#211005;--c-line:#4d2d17;--c-ink:#f5eae3;--c-dim:#b79c8c}
+#stage[data-tint="orange"][data-content="light"]{--c-bg:#fbf7f4;--c-raise:#fff;--c-sink:#f7ede8;--c-line:#ebdcd3;--c-ink:#3b2416;--c-dim:#806555}
+#stage[data-tint="red"][data-glass]{--g:87 4 0;--g-hi:151 10 0;--g-flat:94 7 0;--ink:#fcf0ef;--ink-2:rgb(252 240 239/.74);--ink-3:rgb(252 240 239/.56);--sh:20 5 4}
+#stage[data-tint="red"][data-glass="light"]{--g:255 229 225;--g-hi:255 193 185;--g-flat:254 227 223;--ink:#3a1b18;--ink-2:rgb(58 27 24/.78);--ink-3:rgb(58 27 24/.66);--rim-out:rgb(74 28 21/.24);--divide:rgb(74 28 21/.13);--hover:rgb(91 28 17/.08);--press:rgb(91 28 17/.14);--sh:53 25 20}
+#stage[data-tint="red"][data-content]{--c-bg:#2c1310;--c-raise:#3b1b16;--c-sink:#230e0a;--c-line:#512924;--c-ink:#f7e9e6;--c-dim:#ba9a95}
+#stage[data-tint="red"][data-content="light"]{--c-bg:#fcf6f5;--c-raise:#fff;--c-sink:#f8eceb;--c-line:#ecdbd7;--c-ink:#3d221e;--c-dim:#82635e}
+#stage[data-tint="pink"][data-glass]{--g:59 22 38;--g-hi:124 52 85;--g-flat:62 27 41;--ink:#fbf0f4;--ink-2:rgb(251 240 244/.74);--ink-3:rgb(251 240 244/.52);--sh:19 5 11}
+#stage[data-tint="pink"][data-glass="light"]{--g:248 230 238;--g-hi:241 196 215;--g-flat:246 231 237;--ink:#371b28;--ink-2:rgb(55 27 40/.78);--ink-3:rgb(55 27 40/.66);--rim-out:rgb(71 27 47/.24);--divide:rgb(71 27 47/.13);--hover:rgb(88 26 53/.08);--press:rgb(88 26 53/.14);--sh:51 24 35}
+#stage[data-tint="pink"][data-content]{--c-bg:#28151d;--c-raise:#361d27;--c-sink:#1f0f16;--c-line:#4a2c38;--c-ink:#f5e8ed;--c-dim:#b799a5}
+#stage[data-tint="pink"][data-content="light"]{--c-bg:#fbf6f8;--c-raise:#fff;--c-sink:#f7ecf0;--c-line:#ebdae0;--c-ink:#3a212c;--c-dim:#7f626e}
+#stage[data-tint="violet"][data-glass]{--g:41 28 62;--g-hi:90 65 130;--g-flat:45 33 64;--ink:#f4f2fb;--ink-2:rgb(244 242 251/.74);--ink-3:rgb(244 242 251/.52);--sh:11 7 21}
+#stage[data-tint="violet"][data-glass="light"]{--g:237 233 250;--g-hi:214 203 244;--g-flat:235 232 246;--ink:#28203a;--ink-2:rgb(40 32 58/.78);--ink-3:rgb(40 32 58/.66);--rim-out:rgb(50 35 75/.24);--divide:rgb(50 35 75/.13);--hover:rgb(61 37 92/.08);--press:rgb(61 37 92/.14);--sh:38 28 53}
+#stage[data-tint="violet"][data-content]{--c-bg:#1d1829;--c-raise:#282137;--c-sink:#171220;--c-line:#39314c;--c-ink:#edeaf6;--c-dim:#a59eb8}
+#stage[data-tint="violet"][data-content="light"]{--c-bg:#f8f7fc;--c-raise:#fff;--c-sink:#f0eef7;--c-line:#e1ddeb;--c-ink:#2d263d;--c-dim:#6e6781}
+#stage[data-tint="slate"][data-glass]{--g:31 37 46;--g-hi:70 81 99;--g-flat:35 40 49;--ink:#f2f3f6;--ink-2:rgb(242 243 246/.74);--ink-3:rgb(242 243 246/.52);--sh:7 10 14}
+#stage[data-tint="slate"][data-glass="light"]{--g:233 236 240;--g-hi:203 211 222;--g-flat:232 234 238;--ink:#21262d;--ink-2:rgb(33 38 45/.78);--ink-3:rgb(33 38 45/.66);--rim-out:rgb(38 45 56/.24);--divide:rgb(38 45 56/.13);--hover:rgb(44 53 67/.08);--press:rgb(44 53 67/.14);--sh:30 34 41}
+#stage[data-tint="slate"][data-content]{--c-bg:#181c20;--c-raise:#22262c;--c-sink:#121519;--c-line:#32373e;--c-ink:#eaecf0;--c-dim:#9ea3aa}
+#stage[data-tint="slate"][data-content="light"]{--c-bg:#f7f8f9;--c-raise:#fff;--c-sink:#eeeff2;--c-line:#dddfe3;--c-ink:#262b31;--c-dim:#676c73}
+#stage[data-tint="wallpaper"][data-glass]{--g:51 31 13;--g-hi:109 71 35;--g-flat:54 36 19;--ink:#f8f2ee;--ink-2:rgb(248 242 238/.74);--ink-3:rgb(248 242 238/.52);--sh:16 8 3}
+#stage[data-tint="wallpaper"][data-glass="light"]{--g:244 234 226;--g-hi:230 205 186;--g-flat:241 232 226;--ink:#322114;--ink-2:rgb(50 33 20/.78);--ink-3:rgb(50 33 20/.66);--rim-out:rgb(62 39 16/.24);--divide:rgb(62 39 16/.13);--hover:rgb(75 44 9/.08);--press:rgb(75 44 9/.14);--sh:45 31 17}
+#stage[data-tint="wallpaper"][data-content]{--c-bg:#231910;--c-raise:#302217;--c-sink:#1b130b;--c-line:#433325;--c-ink:#f2ebe5;--c-dim:#af9f92}
+#stage[data-tint="wallpaper"][data-content="light"]{--c-bg:#faf7f5;--c-raise:#fff;--c-sink:#f4eeea;--c-line:#e6ddd6;--c-ink:#35271c;--c-dim:#78685b}
 /* Reactive rim: the active rim shows the wallpaper under it, brightened. Native: per-vertex colours from the blur target. */
 #stage[data-rim="1"] .win.active:not(.max)::after{border:0;padding:2px;background:url("assets/brook-dawn.png") var(--wx,0) var(--wy,0)/1600px 900.5px;filter:saturate(2.6) brightness(1.3);
   -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
@@ -550,8 +606,251 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 #stage[data-hits="1"] .win:not(.max){outline:6px solid rgb(0 220 255/.38)}
 #stage[data-hits="1"] .win:not(.max)::before{content:"";position:absolute;inset:0;border:2px solid rgb(0 220 255/.9);pointer-events:none;z-index:2}
 #stage[data-hits="1"] .caps{position:relative;z-index:4}
-#hitkey{position:absolute;left:16px;top:16px;z-index:980;padding:10px 12px;border-radius:var(--r-win);background:rgb(8 12 20/.88);color:#e8eef8;font-size:var(--t-cap);line-height:1.7}
+#hitkey{position:absolute;left:16px;top:calc(var(--wa-top) + 16px);z-index:980;padding:10px 12px;border-radius:var(--r-win);background:rgb(8 12 20/.88);color:#e8eef8;font-size:var(--t-cap);line-height:1.7}
 #hitkey i{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+
+/* ---------- Side drawer (concept, not scheduled; Settings > Lab). See DESIGN.md "Side drawer". ----------
+   Three variants share one model: rail (glass icon rail, app peeks beside it), cards (wide shelf, a card
+   returns its window to the desktop) and tabs (always-visible flat edge tabs). Native: the rail is one
+   glass surface; a stashed window is not composited until it is peeked. */
+#stage{--d-w:64px;--d-used:0px}
+#drawer{position:absolute;top:0;bottom:var(--h-bar);left:0;width:var(--d-w);z-index:891;display:flex;flex-direction:column;border-width:0 1px 0 0;
+  transition:opacity var(--m-base) var(--ease),transform var(--m-base) var(--ease)}
+#drawer.glass{--a:min(1,calc(max(var(--op),var(--a-floor)) + .1))}
+#drawer.shut{opacity:0;transform:translateX(-8px);pointer-events:none;visibility:hidden;transition:opacity var(--m-fast),transform var(--m-fast),visibility 0s var(--m-fast)}   /* 8 px and a fade, never a full-width slide of a blurred surface */
+.d-list{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden auto;scrollbar-width:none}
+.d-it{position:relative;flex:none;width:100%;height:56px;display:grid;place-items:center;color:var(--ink-2);cursor:pointer;touch-action:none}   /* hit area: the whole 64x56 cell, out to the screen edge, no gaps between cells */
+.d-it::before{content:"";position:absolute;inset:4px 6px;border-radius:var(--r-win);transition:background var(--m-fast)}   /* visual pill */
+.d-it:hover::before{background:var(--hover)}
+.d-it:active::before,.d-it.sel::before{background:var(--press)}
+.d-it::after{content:"";position:absolute;left:0;top:50%;width:3px;height:6px;margin-top:-3px;border-radius:0 2px 2px 0;background:var(--ink-3);transition:height var(--m-base) var(--ease),margin var(--m-base) var(--ease)}   /* same grammar as the task pill */
+.d-it.sel::after{display:none}   /* the lighter pill marks the selected entry; no accent marker as well */
+.d-it.out::after{background:none;box-shadow:inset 0 0 0 1px var(--ink-3)}
+.d-it.off::after{display:none}
+.d-it.off .d-ic>:first-child{opacity:.42}
+.d-it.ins-t{box-shadow:inset 0 2px 0 var(--accent)} .d-it.ins-b{box-shadow:inset 0 -2px 0 var(--accent)}
+.d-it:focus-visible{outline-offset:-3px}
+#drawer.dragging .d-it.src{opacity:.35}
+.d-ic{position:relative;width:36px;height:36px;display:grid;flex:none}
+.d-ic>img,.d-ic>.mg{width:100%;height:100%}
+#stage .mg svg.i{width:62%;height:62%}
+.d-bdg{position:absolute;right:-7px;top:-5px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--accent);color:var(--on-accent);font-size:var(--t-cap);font-weight:700;line-height:18px;text-align:center;box-shadow:0 0 0 2px rgb(var(--g-flat))}
+.d-bdg.dot{min-width:10px;width:10px;height:10px;padding:0;right:-3px;top:-3px}
+.d-bdg.st{top:auto;bottom:-5px;background:rgb(var(--g-flat));color:var(--ink);padding:0;width:18px;display:grid;place-items:center;box-shadow:0 0 0 1px var(--rim-out)}   /* state (playing), not attention: never accent */
+#stage .d-bdg svg.i{width:10px;height:10px;stroke-width:2}
+.d-sep{flex:none;height:1px;margin:6px 14px;background:var(--rim-out)}
+.d-add{flex:none;height:52px;display:grid;place-items:center;color:var(--ink-3);border-top:1px solid var(--rim-out)}
+.d-add span{width:36px;height:36px;border-radius:var(--r-win);border:1px dashed var(--ink-3);display:grid;place-items:center;transition:background var(--m-fast)}
+.d-add:hover{color:var(--ink)} .d-add:hover span{background:var(--hover)}
+.d-empty{position:absolute;left:calc(100% + 8px);top:8px;width:236px;padding:10px 12px;border-radius:var(--r-win);background:rgb(var(--g-flat)/.98);border:1px solid var(--rim-out);font-size:var(--t-sm);color:var(--ink-2);white-space:normal}
+/* Resting state: a 5 px tab on the edge. Flat fill, so it costs no backdrop. Hit area 10x112 including the edge column. */
+#d-tab{position:absolute;left:0;top:calc((900px - var(--h-bar))/2 - 56px);width:10px;height:112px;z-index:889;touch-action:none}
+#d-tab::before{content:"";position:absolute;left:0;top:20px;width:5px;height:72px;border-radius:0 4px 4px 0;background:rgb(var(--g-flat)/.97);box-shadow:0 0 0 1px var(--rim-out);transition:width var(--m-fast),background var(--m-fast)}
+#d-tab:hover::before{width:9px}
+#d-tab.att::before{background:var(--accent);box-shadow:0 0 0 1px rgb(var(--g-flat)/.6)}
+#dbtn{width:52px;justify-content:center;padding:0}
+#dbtn .d-bdg{position:absolute;right:2px;top:6px}
+#dbtn .d-bdg.dot{right:10px;top:11px}
+#dbtn.pulse::before,#d-tab.pulse::before{animation:dpulse var(--m-slow) var(--ease) 2}
+@keyframes dpulse{50%{background:color-mix(in srgb,var(--accent) 55%,transparent)}}
+/* Variant: card shelf */
+#drawer[data-v="cards"] .d-hd{flex:none;height:48px;display:flex;align-items:center;gap:var(--sp-2);padding:0 6px 0 var(--sp-4);border-bottom:1px solid var(--rim-out)}
+.d-hd small{flex:1;font-size:var(--t-cap);color:var(--ink-3)}
+#drawer[data-v="cards"] .d-list{padding:5px 0}
+#drawer[data-v="cards"] .d-it{height:auto;display:block;place-items:normal;padding:5px 10px}
+#drawer[data-v="cards"] .d-it::before{inset:5px 10px;background:var(--well);box-shadow:inset 0 0 0 1px var(--rim-out)}
+#drawer[data-v="cards"] .d-it:hover::before{background:var(--hover)}
+.d-card{position:relative;display:grid;grid-template-columns:32px 1fr auto;gap:1px 10px;padding:10px 10px 10px 12px;align-items:center;color:var(--ink)}
+.d-card .d-ic{width:32px;height:32px;grid-row:1/3}
+.d-card b{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-card time{font-size:var(--t-cap);color:var(--ink-3);margin-right:34px}
+.d-card .pv{grid-column:2/4;font-size:var(--t-sm);color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-th{grid-column:1/4;height:76px;margin-top:8px;border-radius:5px;overflow:hidden;position:relative;background:var(--c-bg);box-shadow:0 0 0 1px var(--rim-out)}
+.d-th>.client{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none}
+.d-it .more{position:absolute;right:14px;top:11px;height:36px;z-index:1}
+.d-none{margin:var(--sp-4);padding:var(--sp-5) var(--sp-4);border:1px dashed var(--rim-out);border-radius:var(--r-win);text-align:center;font-size:var(--t-sm);color:var(--ink-3)}
+/* Variant: edge tabs. Always on screen, so flat and narrow: 16 px at rest, 52 px under the pointer. */
+#drawer[data-v="tabs"]{top:calc((900px - var(--h-bar))/2);bottom:auto;transform:translateY(-50%);width:16px;overflow:hidden;border-radius:0 10px 10px 0;
+  background:rgb(var(--g-flat)/.97);border:1px solid var(--rim-out);border-left:0;box-shadow:0 6px 16px rgb(var(--sh)/.35);color:var(--ink);transition:width var(--m-fast) var(--ease)}
+#drawer[data-v="tabs"]:is(:hover,.open,.dragging,:focus-within){width:52px}
+#drawer[data-v="tabs"] .d-it{width:52px;height:48px}
+#drawer[data-v="tabs"] .d-ic{width:28px;height:28px;opacity:0;transition:opacity var(--m-fast)}
+#drawer[data-v="tabs"]:is(:hover,.open,.dragging,:focus-within) .d-ic{opacity:1}
+#drawer[data-v="tabs"] .d-it::after{display:none}
+.d-chip{position:absolute;left:5px;top:10px;width:6px;height:28px;border-radius:3px;transition:opacity var(--m-fast)}
+.d-chip.att::after{content:"";position:absolute;right:-4px;top:-4px;width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 1.5px rgb(var(--g-flat))}
+#drawer[data-v="tabs"]:is(:hover,.open,.dragging,:focus-within) .d-chip{opacity:0}
+/* Peeked window: the real window, docked beside the drawer at full work-area height. */
+.win.peek{z-index:890!important;border-radius:0;box-shadow:14px 0 32px rgb(var(--sh)/.45)}
+.win.gone.stashed{transform:translateX(-10px);visibility:hidden;transition:opacity var(--m-base) var(--ease),transform var(--m-base) var(--ease),visibility 0s var(--m-base)}   /* hidden, not just transparent: nothing of a stashed window is drawn */
+.caps [data-act="stash"]{display:none}
+#stage:not([data-drawer="off"]) .win.dpin .caps [data-act="stash"],.win.peek .caps [data-act="stash"]{display:grid}
+.win.peek .caps [data-act="max"]{display:none}
+.tb .mg{width:16px;height:16px;flex:none;opacity:.7} .win.active .tb .mg{opacity:1}
+/* Drop zone while a window is dragged to the drawer edge: a gradient quad and a flat chip. */
+#d-drop{position:absolute;left:0;top:0;bottom:var(--h-bar);width:200px;z-index:892;display:flex;align-items:center;pointer-events:none;opacity:0;transition:opacity var(--m-fast);
+  background:linear-gradient(90deg,color-mix(in srgb,var(--accent) 42%,transparent),transparent);border-left:3px solid var(--accent)}
+#d-drop.on{opacity:1}
+#d-drop span{margin-left:14px;display:flex;align-items:center;gap:var(--sp-2);height:32px;padding:0 12px;border-radius:var(--r-sm);background:var(--accent);color:var(--on-accent);font-size:var(--t-sm);font-weight:700;white-space:nowrap}
+#d-menu{z-index:970}
+/* Right edge: mirror everything that touches the edge. */
+#stage[data-dedge="right"] :is(#drawer,#d-tab,#d-drop){left:auto;right:0}
+#stage[data-dedge="right"] #drawer{border-width:0 0 0 1px}
+#stage[data-dedge="right"] #drawer.shut{transform:translateX(8px)}
+#stage[data-dedge="right"] .d-it::after{left:auto;right:0;border-radius:2px 0 0 2px}
+#stage[data-dedge="right"] .d-empty{left:auto;right:calc(100% + 8px)}
+#stage[data-dedge="right"] #d-tab::before{left:auto;right:0;border-radius:4px 0 0 4px}
+#stage[data-dedge="right"] #drawer[data-v="tabs"]{border-radius:10px 0 0 10px;border:1px solid var(--rim-out);border-right:0}
+#stage[data-dedge="right"] #drawer[data-v="tabs"] .d-list{align-items:flex-end}
+#stage[data-dedge="right"] .d-chip{left:auto;right:5px}
+#stage[data-dedge="right"] .win.peek{box-shadow:-14px 0 32px rgb(var(--sh)/.45)}
+#stage[data-dedge="right"] .win.gone.stashed{transform:translateX(10px)}
+#stage[data-dedge="right"] #d-drop{background:linear-gradient(270deg,color-mix(in srgb,var(--accent) 42%,transparent),transparent);border-left:0;border-right:3px solid var(--accent);justify-content:flex-end}
+#stage[data-dedge="right"] #d-drop span{margin:0 14px 0 0}
+#stage[data-dedge="right"] .flipx svg{transform:scaleX(-1)}
+#stage[data-dedge="right"] #taskbar{padding-right:0}                                   /* the drawer button owns the bottom-right corner */
+#stage[data-dopen="1"]:not([data-dedge="right"]) #hitkey{left:calc(var(--d-used) + 16px)}
+#stage[data-dedge="right"][data-dopen="1"] #toasts{right:calc(var(--d-used) + 16px)}   /* toasts move inboard of the open drawer */
+#stage[data-touch="1"] #drawer[data-v="rail"] .d-it{height:60px}
+#stage[data-touch="1"] #drawer[data-v="tabs"] .d-it{height:52px}
+/* ---------- Side dock (concept, not scheduled; the recommended variant). See DESIGN.md "Dock and side drawer". ----------
+   Rail and peek, with the icons moved off the side rail: a sidebar on one edge, hidden at rest, whose dock icons run along
+   its top or its bottom. Everything stays inside the sidebar's width. The strip is icons only, except the selected page,
+   whose tile carries the name and the window's own buttons, so the page needs no title bar. The lighter tile is the only
+   selection mark. Pinned open, the sidebar is outside the work area. */
+#stage{--side-w:420px;--strip-h:48px;--wa-left:0px;--wa-right:0px}
+#drawer[data-v="side"]{width:var(--side-w);height:var(--strip-h);bottom:auto;flex-direction:row;border-width:0 1px 1px 0}
+#stage[data-dpos="bottom"] #drawer[data-v="side"]{top:auto;bottom:var(--h-bar);border-width:1px 1px 0 0}
+#stage[data-dedge="right"] #drawer[data-v="side"]{border-width:0 0 1px 1px}
+#stage[data-dedge="right"][data-dpos="bottom"] #drawer[data-v="side"]{border-width:1px 0 0 1px}
+#drawer[data-v="side"] .d-list{flex-direction:row;overflow:hidden}
+#drawer[data-v="side"] .d-it{flex:none;width:42px;height:100%}                                  /* icon only; the cell runs to the screen edge */
+#drawer[data-v="side"] .d-it::before{inset:4px 2px}
+#drawer[data-v="side"] .d-act{width:32px}
+#drawer[data-v="side"] .d-bdg:not(.st){right:-5px;top:-4px}
+#drawer[data-v="side"] .d-it::after{left:50%;top:auto;bottom:2px;width:4px;height:3px;margin:0 0 0 -2px;border-radius:2px}   /* running, hollow when out on the desktop; never an accent */
+#drawer[data-v="side"] .d-it.sel{flex:1 1 0;min-width:0;width:auto;display:flex;align-items:center;gap:9px;padding:0 5px 0 12px;text-align:left;color:var(--ink)}   /* the selected page: the one tile with a label, and the page's title bar */
+#drawer[data-v="side"] .d-ic{width:28px;height:28px}
+#drawer[data-v="side"] .d-it.sel .d-ic{width:26px;height:26px}
+#drawer[data-v="side"] .d-sep{width:1px;height:auto;margin:11px 3px}
+#drawer[data-v="side"] .d-add{width:38px;height:100%;border-top:0;border-left:1px solid var(--rim-out)}
+#drawer[data-v="side"] .d-add span{width:30px;height:30px;border:0}
+#drawer[data-v="side"] .d-add[aria-pressed="true"]{color:var(--ink)} #drawer[data-v="side"] .d-add[aria-pressed="true"] span{background:var(--press)}
+#drawer[data-v="side"] .d-slot{flex:0 0 40px;margin:6px 3px}
+#drawer[data-v="side"] .d-slot span{display:none}
+#drawer[data-v="side"].over{box-shadow:inset 0 0 0 2px var(--accent)}
+#stage[data-touch="1"]{--strip-h:52px}
+/* The page area. With a page showing, the window covers it; with none, it is one glass pane with a hint. */
+#d-pane{position:absolute;left:0;top:var(--strip-h);bottom:var(--h-bar);width:var(--side-w);z-index:889;border-width:0 1px 0 0;display:grid;place-items:center;padding:var(--sp-8);text-align:center;font-size:var(--t-sm);color:var(--ink-2)}
+#stage[data-dpos="bottom"] #d-pane{top:0;bottom:calc(var(--h-bar) + var(--strip-h))}
+#stage[data-dedge="right"] #d-pane{left:auto;right:0;border-width:0 0 0 1px}
+#stage[data-drawer="side"] .win.peek{border-radius:0}
+#stage[data-drawer="side"] .win.peek .tb{display:none}
+#stage[data-drawer="side"][data-dpinned="1"] .win.peek{box-shadow:none}                              /* pinned: a seam, not a floating panel */
+#stage[data-drawer="side"] .win.peek::after{border-width:0 1px 0 0}
+#stage[data-drawer="side"][data-dedge="right"] .win.peek::after{border-width:0 0 0 1px}
+#stage[data-drawer="side"] #d-drop{width:var(--drop-w,200px)}
+/* Dragging a tile out of the dock: the outline shows where its window will land. */
+#d-land{position:absolute;z-index:893;border:2px solid var(--accent);border-radius:var(--r-win) var(--r-win) 2px 2px;background:color-mix(in srgb,var(--accent) 12%,transparent);pointer-events:none;overflow:hidden}
+#d-land::before{content:"";display:block;height:var(--h-title);background:color-mix(in srgb,var(--accent) 34%,transparent)}
+/* ---------- Top dock (concept, not scheduled; an earlier variant, kept for comparison). See DESIGN.md "Dock and side drawer". ----------
+   A strip reserved on the top edge, opposite the taskbar. Each docked app is one tile that carries its own window
+   info, so there is no rail beside a title bar: the open app's tile is its title bar. The strip is outside the work
+   area, so maximised windows fit below it and nothing but the wallpaper is ever behind its glass. */
+#stage{--dock-h:56px;--wa-top:0px}
+#stage[data-drawer="dock"]{--wa-top:var(--dock-h)}
+#drawer[data-v="dock"]{right:0;bottom:auto;width:auto;height:var(--dock-h);flex-direction:row;border-width:0 0 1px;box-shadow:inset 0 1px 0 var(--rim-hi)}
+#drawer[data-v="dock"] .d-list{flex-direction:row;overflow:hidden}
+#drawer[data-v="dock"] .d-it{flex:0 1 264px;min-width:132px;width:auto;height:100%;display:flex;align-items:center;gap:10px;padding:0 8px 0 12px;text-align:left;color:var(--ink)}   /* hit area: the whole tile from y = 0, no gaps between tiles */
+#drawer[data-v="dock"] .d-it::before{inset:4px 2px}
+#drawer[data-v="dock"] .d-it.sel::before{inset:4px 2px 0;border-radius:var(--r-win) var(--r-win) 0 0}   /* the open tile reads as a tab on its panel */
+#drawer[data-v="dock"] .d-it::after{left:50%;top:0;width:6px;height:3px;margin:0 0 0 -3px;border-radius:0 0 2px 2px;transition:width var(--m-base) var(--ease),margin var(--m-base) var(--ease)}
+#drawer[data-v="dock"] .d-it.ins-t{box-shadow:inset 2px 0 0 var(--accent)} #drawer[data-v="dock"] .d-it.ins-b{box-shadow:inset -2px 0 0 var(--accent)}
+#drawer[data-v="dock"] .d-ic{width:30px;height:30px}
+#drawer[data-v="dock"] .d-bdg{position:static;box-shadow:none}
+#drawer[data-v="dock"] .d-bdg.st{box-shadow:0 0 0 1px var(--rim-out)}
+#drawer[data-v="dock"] .d-sep{width:1px;height:auto;margin:10px 4px}
+#drawer[data-v="dock"] .d-add{width:48px;height:100%;border-top:0;border-left:1px solid var(--rim-out)}   /* owns the top-right corner */
+#drawer[data-v="dock"] .d-add span{width:28px;height:28px}
+.d-tx{position:relative;flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.d-tx b{font-weight:700;font-size:var(--t-body);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-tx .pv{font-size:var(--t-sm);color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-it.att .d-tx .pv{color:var(--ink)}
+.d-meta{position:relative;flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-size:var(--t-cap);color:var(--ink-3)}
+.d-acts{position:relative;flex:none;display:flex;margin-right:-4px}
+.d-act{width:36px;height:36px;display:grid;place-items:center;border-radius:var(--r-sm);color:var(--ink-2);transition:background var(--m-fast)}
+.d-act:hover{background:var(--hover);color:var(--ink)} .d-act.x:hover{background:#c8414f;color:#fff}
+.d-hint{align-self:center;padding:0 var(--sp-4);font-size:var(--t-sm);color:var(--ink-3);white-space:nowrap}
+.d-it.pulse::before{animation:dpulse var(--m-slow) var(--ease) 2}
+/* Height: one line under 48, two from 48, three from 80. */
+#drawer[data-sz="c"] .d-tx .pv,#drawer[data-sz="c"] .d-meta time{display:none}
+#drawer[data-sz="c"] .d-ic{width:22px;height:22px}
+#drawer[data-sz="c"] .d-add span{width:24px;height:24px}
+#drawer[data-sz="c"] .d-act{height:30px}
+#drawer[data-sz="t"] .d-ic{width:40px;height:40px}
+#drawer[data-sz="t"] .d-tx .pv{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+/* Drop target while a window is dragged: a slot where its tile will land, and the strip's lower edge lit. */
+.d-slot{display:none;flex:0 0 172px;margin:5px 3px;border-radius:var(--r-win);border:1px dashed var(--ink-3);align-items:center;justify-content:center;gap:var(--sp-2);font-style:normal;font-size:var(--t-sm);color:var(--ink-2);white-space:nowrap;overflow:hidden}
+#drawer.dropping .d-slot{display:flex}
+#drawer.over .d-slot{border:1px solid transparent;background:var(--accent);color:var(--on-accent);font-weight:700}
+#drawer[data-v="dock"].over{box-shadow:inset 0 1px 0 var(--rim-hi),inset 0 -3px 0 var(--accent)}
+#stage[data-drawer="dock"] #d-drop{left:0;right:0;top:var(--dock-h);bottom:auto;width:auto;height:64px;border:0;background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 36%,transparent),transparent)}
+#stage[data-drawer="dock"] #d-drop span{display:none}
+/* Resize: the lowest 4 px of the strip. The new height is drawn as a guide and applied on release, so a maximised client is configured once. */
+#d-size{position:absolute;left:0;right:0;top:calc(var(--dock-h) - 4px);height:4px;z-index:893;cursor:ns-resize;touch-action:none}
+#d-size::before{content:"";position:absolute;left:50%;bottom:0;width:44px;height:3px;margin-left:-22px;border-radius:2px 2px 0 0;background:var(--ink-3);transition:background var(--m-fast)}
+#d-size:hover::before,#d-size.on::before{background:var(--accent)}
+#stage[data-touch="1"] #d-size{height:10px;top:calc(var(--dock-h) - 10px)}
+#stage[data-touch="1"] #drawer:not([data-sz="c"]) .d-act{width:44px;height:44px}
+#stage[data-touch="1"] #d-grip{width:28px;height:28px;margin:-10px 0 0 -10px}
+#stage[data-hits="1"] #d-size{background:rgb(0 220 255/.9)}
+#d-guide{position:absolute;left:0;right:0;height:2px;margin-top:-1px;background:var(--accent);z-index:908;pointer-events:none}
+#d-guide span{position:absolute;left:50%;top:10px;transform:translateX(-50%);height:28px;padding:0 12px;border-radius:var(--r-sm);background:var(--accent);color:var(--on-accent);font-size:var(--t-sm);font-weight:700;display:flex;align-items:center;white-space:nowrap}
+/* The open app: the real window hung under its tile, with no title bar of its own. */
+#stage[data-drawer="dock"] .win.peek{border-radius:0 0 2px 2px;box-shadow:0 14px 32px rgb(var(--sh)/.45),0 2px 6px rgb(0 0 0/.3)}
+#stage[data-drawer="dock"] .win.peek .tb{display:none}
+#stage[data-drawer="dock"] .win.gone.stashed{transform:translateY(-10px)}
+#d-grip{position:absolute;width:18px;height:18px;z-index:892;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 0 52%,var(--c-dim) 52% 60%,transparent 60% 72%,var(--c-dim) 72% 80%,transparent 80%)}
+/* Fullscreen: covers the dock and the taskbar unless the user keeps the dock above it. */
+.win.fs{left:0!important;top:0!important;width:1600px!important;height:900px!important;z-index:905!important;border-radius:0;box-shadow:none}
+.win.fs .tb,.win.fs::after{display:none}
+#stage[data-drawer="dock"][data-dfs="1"] .win.fs{top:var(--dock-h)!important;height:calc(900px - var(--dock-h))!important}
+#stage[data-dfs="1"][data-fs="1"] #drawer[data-v="dock"]{z-index:906}
+#fs-hint{position:absolute;left:50%;top:calc(var(--fs-top,0px) + 14px);transform:translateX(-50%);z-index:907;height:32px;padding:0 14px;border-radius:var(--r-sm);display:flex;align-items:center;gap:var(--sp-2);background:rgb(var(--g-flat)/.97);border:1px solid var(--rim-out);color:var(--ink);font-size:var(--t-sm);white-space:nowrap;pointer-events:none}
+/* Illustrative clients for the four drawer apps. Content tokens only, like any other app. */
+.tag{font-weight:400;letter-spacing:.04em;border:1px solid var(--c-line);border-radius:9px;padding:1px 7px;margin-left:6px}
+.x-hd{flex:none;min-height:52px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16px;border-bottom:1px solid var(--c-line);background:var(--c-raise)}
+.x-hd>div{flex:1;min-width:0} .x-hd b{display:block} .x-hd small{display:block;font-size:var(--t-cap);color:var(--c-dim)}
+.x-av{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:var(--h);color:#fff;font-weight:700;flex:none}
+.x-ib{width:36px;height:36px;border-radius:var(--r-sm);display:grid;place-items:center;color:var(--c-dim);flex:none}
+.x-ib:hover{background:var(--c-sink);color:var(--c-ink)}
+.x-body{flex:1;min-height:0;overflow:hidden}
+.x-thread{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;gap:6px;padding:var(--sp-4)}
+.x-day{align-self:center;font-size:var(--t-cap);color:var(--c-dim);margin:4px 0}
+.x-day.new{color:var(--c-accent);font-weight:700}
+.x-msg{margin:0;max-width:80%;padding:8px 12px;border-radius:12px 12px 12px 4px;background:var(--c-raise);border:1px solid var(--c-line);align-self:flex-start;user-select:text}
+.x-msg.me{align-self:flex-end;border-radius:12px 12px 4px 12px;background:var(--c-accent);color:var(--c-on-accent);border-color:transparent}
+.x-msg time{display:block;font-size:var(--t-cap);opacity:.72;margin-top:2px}
+.x-compose{flex:none;display:flex;gap:var(--sp-2);padding:var(--sp-3);border-top:1px solid var(--c-line);background:var(--c-raise)}
+.x-in{flex:1;height:36px;display:flex;align-items:center;padding:0 12px;border-radius:var(--r-sm);background:var(--c-sink);border:1px solid var(--c-line);color:var(--c-dim)}
+.x-row{display:grid;grid-template-columns:8px 1fr auto;gap:1px 10px;padding:10px 16px;border-bottom:1px solid var(--c-line)}
+.x-row:hover{background:var(--c-sink)}
+.x-row i{width:8px;height:8px;border-radius:50%;margin-top:5px;grid-row:1/4}
+.x-row.un i{background:var(--c-accent)} .x-row.un b{font-weight:700}
+.x-row b{font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .x-row time{font-size:var(--t-cap);color:var(--c-dim)}
+.x-row span{grid-column:2/4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .x-row span+span{color:var(--c-dim);font-size:var(--t-sm)}
+.x-now{flex:none;display:flex;flex-direction:column;align-items:center;gap:8px;padding:24px 28px 16px;border-bottom:1px solid var(--c-line)}
+.x-art{width:196px;height:196px;border-radius:var(--r-win);background:url("assets/brook-dawn.png") 30% 60%/520px;box-shadow:0 6px 16px rgb(0 0 0/.25);margin-bottom:6px}
+.x-now b{font-size:var(--t-lead)} .x-now small{color:var(--c-dim)}
+.x-prog{width:100%;height:4px;border-radius:2px;background:var(--c-line);margin-top:6px} .x-prog i{display:block;height:100%;width:38%;border-radius:2px;background:var(--c-accent)}
+.x-times{width:100%;display:flex;justify-content:space-between;font-size:var(--t-cap);color:var(--c-dim)}
+.x-tr{display:flex;gap:var(--sp-3);align-items:center}
+.x-tr button{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;color:var(--c-ink)}
+.x-tr button:hover{background:var(--c-sink)}
+.x-tr .pp,.x-tr .pp:hover{background:var(--c-accent);color:var(--c-on-accent)}
+.x-post{display:grid;grid-template-columns:32px 1fr;gap:2px 10px;padding:12px 16px;border-bottom:1px solid var(--c-line)}
+.x-post .x-av{grid-row:1/4} .x-post b small{font-weight:400;color:var(--c-dim);margin-left:6px} .x-post p{margin:0;user-select:text}
+.x-post footer{display:flex;gap:18px;color:var(--c-dim);font-size:var(--t-sm);margin-top:4px} .x-post footer span{display:flex;gap:5px;align-items:center}
 
 @media (prefers-reduced-motion:reduce){#stage *{transition:none!important;animation:none!important}}
 </style>
@@ -560,22 +859,29 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 
 <div id="study" role="toolbar" aria-label="Study controls">
   <b>Clearwater Next</b>
-  <span class="lbl">Palette</span>
-  <div class="grp" data-key="palette"><button data-v="clearwater">Clearwater</button><button data-v="smoked">Smoked</button><button data-v="opal">Opal</button></div>
+  <span class="lbl">Theme</span>
+  <div class="grp" data-key="theme"><button data-v="glass">Glass</button><button data-v="opaque-light">Opaque Light</button><button data-v="opaque-dark">Opaque Dark</button></div>
+  <button class="one" id="noaccel" aria-pressed="false" title="Pretend the GPU is not accelerated: Glass locks and an opaque theme takes over">Simulate no acceleration</button>
+  <span class="lbl">Hue</span>
+  <div class="grp" data-key="accent" id="study-hues"></div>
   <span class="lbl">Mode</span>
   <div class="grp" data-key="mode"><button data-v="light">Light</button><button data-v="mixed">Mixed</button><button data-v="dark">Dark</button></div>
-  <button class="one" data-toggle="perf">Performance mode</button>
   <span class="lbl">Style</span>
   <div class="grp" data-key="style"><button data-v="glass">Glass</button><button data-v="tabs">Tabs</button><button data-v="alloy">Alloy</button><button data-v="phosphor">Phosphor</button><button data-v="neon">Neon</button></div>
   <button class="one" data-toggle="hits">Hit areas</button>
   <span class="lbl">Show</span>
   <div class="grp"><button data-do="launcher">Launcher</button><button data-do="organise">Organise</button><button data-do="install">Install app</button><button data-do="hud">HUD</button><button data-do="boot">Boot toast</button><button data-do="thermal">Thermal toast</button><button data-do="net">Network toast</button></div>
+  <span class="lbl">Dock</span>
+  <div class="grp" data-key="drawer"><button data-v="off">Off</button><button data-v="side">Side dock</button><button data-v="dock" title="Earlier variant">Top dock</button><button data-v="rail" title="Earlier variant">Rail</button><button data-v="cards" title="Earlier variant">Cards</button><button data-v="tabs" title="Earlier variant">Tabs</button></div>
+  <div class="grp" data-key="dpos" title="Where the dock icons sit in the sidebar"><button data-v="top">Icons top</button><button data-v="bottom">Icons bottom</button></div>
+  <button class="one" data-toggle="dpin">Pin dock open</button>
+  <div class="grp"><button data-do="drawer">Open</button><button data-do="dmsg">Message</button></div>
   <span class="sp"></span>
   <button class="one" data-do="reset">Reset</button>
 </div>
 
 <div id="fit">
-<main id="stage" data-palette="clearwater" data-glass="dark" data-content="light" data-perf="0" data-labels="1" data-style="glass" aria-label="Brook desktop prototype, 1600 by 900 logical pixels">
+<main id="stage" data-palette="tinted" data-theme="glass" data-glass="dark" data-content="light" data-perf="0" data-labels="1" data-style="glass" aria-label="Brook desktop prototype, 1600 by 900 logical pixels">
 
   <!-- Files -->
   <section class="win" id="w-files" data-app="files" style="left:250px;top:64px;width:800px;height:500px" aria-label="Files window">
@@ -602,8 +908,8 @@ kbd{font:var(--t-cap) var(--font-ui);color:var(--ink-3);border:1px solid var(--r
 <span class="g">BOOT  DEV  DRIVERS  ETC  SYS  TEST  TMP  USR  data  nix  proc</span>
 BROOK.CFG
 <span class="p">brook:/ $</span> gpu glass status
-<span class="o">palette=clearwater mode=mixed opacity=80 blur=light
-performance_mode=off material_cache_rebuilds=1</span>
+<span class="o"><span id="t-pal">palette=tinted hue=blue mode=mixed opacity=80 blur=light</span>
+<span id="t-acc">accelerated=yes</span> material_cache_rebuilds=1</span>
 <span class="p">brook:/ $</span> <span class="cur"></span></div></div>
   </section>
 
@@ -614,24 +920,24 @@ performance_mode=off material_cache_rebuilds=1</span>
     <div class="client">
       <div class="set-tabs" role="tablist"><button role="tab" data-tab="appearance">Appearance</button><button role="tab" data-tab="taskbar">Taskbar</button><button role="tab" data-tab="lab">Lab</button><button role="tab" data-tab="about">About</button></div>
       <div class="set-body" id="set-appearance" role="tabpanel">
-        <section><h3>Palette</h3>
-          <div class="pals" data-key="palette">
-            <button class="pal" data-v="clearwater"><span class="mini"><i></i></span>Clearwater</button>
-            <button class="pal" data-v="smoked"><span class="mini"><i></i></span>Smoked</button>
-            <button class="pal" data-v="opal"><span class="mini"><i></i></span>Opal</button></div>
-          <div class="row" style="min-height:28px"><div class="lab">Accent</div><span class="val" id="acc-name"></span></div>
-          <div class="accs" data-key="accent"><button data-v="auto" aria-label="Palette default" title="Palette default"><i id="acc-auto"><i data-i="check"></i></i></button><button data-v="blue" aria-label="Clearwater blue" title="Clearwater blue"><i style="--sd:#6aaeff;--sl:#1c65cc"><i data-i="check"></i></i></button><button data-v="teal" aria-label="Teal" title="Teal"><i style="--sd:#4fd3c4;--sl:#09747e"><i data-i="check"></i></i></button><button data-v="pine" aria-label="Pine green" title="Pine green"><i style="--sd:#62d6a0;--sl:#1b7650"><i data-i="check"></i></i></button><button data-v="phosphor" aria-label="Phosphor" title="Phosphor"><i style="--sd:#7dff9b;--sl:#0f7a33"><i data-i="check"></i></i></button><button data-v="lime" aria-label="Lime" title="Lime"><i style="--sd:#b4e04a;--sl:#53710c"><i data-i="check"></i></i></button><button data-v="amber" aria-label="Amber" title="Amber"><i style="--sd:#f2bb4e;--sl:#8a5a00"><i data-i="check"></i></i></button><button data-v="orange" aria-label="Orange" title="Orange"><i style="--sd:#ff9a57;--sl:#ae4e0f"><i data-i="check"></i></i></button><button data-v="red" aria-label="Red" title="Red"><i style="--sd:#ff7a72;--sl:#c4302b"><i data-i="check"></i></i></button><button data-v="pink" aria-label="Hot pink" title="Hot pink"><i style="--sd:#ff6cba;--sl:#c81e7c"><i data-i="check"></i></i></button><button data-v="violet" aria-label="Violet" title="Violet"><i style="--sd:#b79cff;--sl:#6a43d6"><i data-i="check"></i></i></button><button data-v="slate" aria-label="Slate" title="Slate"><i style="--sd:#a9bdd6;--sl:#47607f"><i data-i="check"></i></i></button><button data-v="wallpaper" aria-label="Wallpaper (dawn)" title="Wallpaper (dawn)"><i class="wp" style="--sd:#f6b98a;--sl:#a8511d"><i data-i="check"></i></i></button></div>
-          <div class="row"><div class="lab">Mode<small id="mode-hint"></small></div>
+        <section><h3>Theme</h3>
+          <div class="pals" data-key="theme">
+            <button class="pal" data-v="glass"><span class="mini"><i></i></span>Glass</button>
+            <button class="pal" data-v="opaque-light"><span class="mini"><i></i></span>Opaque Light</button>
+            <button class="pal" data-v="opaque-dark"><span class="mini"><i></i></span>Opaque Dark</button></div>
+          <div class="note" id="accel-note" hidden><i data-i="info"></i><span id="accel-text"></span></div>
+          <div class="row" style="min-height:28px"><div class="lab">Hue<small>Tints all of the chrome and the app surfaces.</small></div><span class="val" id="acc-name"></span></div>
+          <div class="accs" data-key="accent" id="set-hues"></div>
+          <div class="row" id="row-mode"><div class="lab">Mode<small id="mode-hint"></small></div>
             <div class="seg" data-key="mode"><button data-v="light">Light</button><button data-v="mixed">Mixed</button><button data-v="dark">Dark</button></div></div>
         </section>
-        <section><h3>Glass</h3>
+        <section><h3>Glass<span class="tag" id="glass-tag" hidden>Glass theme only</span></h3>
           <div id="glassrows">
             <div class="row"><label class="lab" for="s-op">Opacity</label><span class="val num" id="s-opv">80%</span></div>
             <input type="range" id="s-op" min="40" max="100" step="5" value="80" aria-label="Glass opacity">
             <div class="row" style="margin-top:4px"><div class="lab">Backdrop blur</div>
               <div class="seg" data-key="blur"><button data-v="none">None</button><button data-v="light">Light</button><button data-v="moderate">Moderate</button><button data-v="heavy">Heavy</button></div></div>
           </div>
-          <div class="row"><div class="lab">Performance mode<small>Opaque flat frames. No blur, shadows or motion.</small></div><button class="sw" role="switch" data-key="perf" aria-label="Performance mode"></button></div>
         </section>
         <section><h3>Display</h3>
           <div class="row"><div class="lab">Scale</div>
@@ -654,6 +960,23 @@ performance_mode=off material_cache_rebuilds=1</span>
         </section>
       </div>
       <div class="set-body" id="set-lab" role="tabpanel" hidden>
+        <section><h3>Dock and drawer<span class="tag">Concept</span></h3>
+          <div class="radios" data-key="drawer">
+            <button data-v="off"><b>Off</b><small>The settled design, unchanged.</small></button>
+            <button data-v="side"><b>Side dock</b><small>A sidebar that opens on demand. Dock icons along its top or bottom; the selected page shows its name. Recommended.</small></button>
+            <button data-v="dock"><b>Top dock</b><small>Earlier variant. A strip across the whole top edge.</small></button>
+            <button data-v="rail"><b>Rail and peek</b><small>Earlier variant. An icon rail down a side edge, the app beside it.</small></button>
+            <button data-v="cards"><b>Card shelf</b><small>Earlier variant. A wide list with previews.</small></button>
+            <button data-v="tabs"><b>Edge tabs</b><small>Earlier variant. One tab per app, always on the edge.</small></button>
+          </div>
+          <div class="row" id="row-dpos"><div class="lab">Dock icons<small>Along the top or the bottom of the sidebar.</small></div><div class="seg" data-key="dpos"><button data-v="top">Top</button><button data-v="bottom">Bottom</button></div></div>
+          <div class="row" id="row-dpin"><div class="lab">Pin dock open<small>Keeps the sidebar on screen. Windows get the space beside it.</small></div><button class="sw" role="switch" data-key="dpin" aria-label="Pin dock open"></button></div>
+          <div class="row" id="row-dockw"><div class="lab">Sidebar width</div><div class="seg" data-key="dockw"><button data-v="360">Narrow</button><button data-v="420">Standard</button><button data-v="520">Wide</button></div></div>
+          <div class="row" id="row-dedge"><div class="lab">Edge</div><div class="seg" data-key="dedge"><button data-v="left">Left</button><button data-v="right">Right</button></div></div>
+          <div class="row" id="row-dockh"><div class="lab">Dock height<small id="dockh-v"></small></div><div class="seg" data-key="dockh"><button data-v="36">Compact</button><button data-v="56">Standard</button><button data-v="80">Tall</button></div></div>
+          <div class="row" id="row-dfs"><div class="lab">Keep the dock over fullscreen<small>Off: a fullscreen window covers the dock and the taskbar.</small></div><button class="sw" role="switch" data-key="dfs" aria-label="Keep the dock over fullscreen"></button></div>
+          <span class="hint" id="d-keys"></span>
+        </section>
         <section><h3>Chrome style</h3>
           <div class="radios" data-key="style">
             <button data-v="glass"><b>Glass</b><small>Clearwater as designed.</small></button>
@@ -683,9 +1006,22 @@ performance_mode=off material_cache_rebuilds=1</span>
   <div id="toasts" aria-live="polite"></div>
   <div id="hitkey" hidden><i style="background:rgb(255 0 200/.6)"></i>Click target<br><i style="border:1px dashed rgb(255 196 0)"></i>Titlebar drag<br><i style="background:rgb(0 220 255/.9)"></i>Resize, 2 px inside the frame<br><i style="background:rgb(0 220 255/.38)"></i>Resize, 6 px outside the frame</div>
 
+  <!-- Side drawer (concept). The demo app windows are generated in the script. -->
+  <button id="d-tab" aria-label="Open drawer" title="Drawer (Super+S)" hidden></button>
+  <div id="d-size" role="separator" aria-orientation="horizontal" aria-label="Dock height" title="Drag to resize the dock. Double-click for the standard height." hidden></div>
+  <div id="d-guide" hidden><span class="num"></span></div>
+  <div id="d-grip" title="Drag to resize" hidden></div>
+  <div id="fs-hint" hidden></div>
+  <div class="glass" id="d-pane" hidden></div>
+  <div id="d-land" hidden></div>
+  <aside id="drawer" aria-label="Drawer" hidden></aside>
+  <div id="d-drop" aria-hidden="true"><span class="flipx"><i data-i="stash"></i>Stash in drawer</span></div>
+  <div class="menu" id="d-menu" role="menu" hidden></div>
+  <div class="sr" id="d-live" aria-live="polite"></div>
+
   <!-- Launcher -->
   <section class="panel glass shut" id="launcher" aria-label="Launcher">
-    <label class="l-search"><i data-i="search"></i><input id="q" type="text" placeholder="Search apps and categories" autocomplete="off" spellcheck="false" aria-label="Search apps and categories"><kbd>Esc</kbd></label>
+    <label class="l-search"><i data-i="search"></i><input id="q" type="text" placeholder="Type to search apps and categories" autocomplete="off" spellcheck="false" aria-label="Search apps and categories"><kbd>Esc</kbd></label>
     <div class="l-top" id="l-top"><div class="l-toptabs"><button data-top="pins">Pinned</button><button data-top="recent">Recent</button></div><div class="l-tiles" id="l-tiles"></div></div>
     <div class="l-mid"><nav class="l-rail" id="l-rail" aria-label="Categories"></nav>
       <div class="l-pane"><div class="l-bar" id="l-bar" hidden></div><div class="l-list" id="l-list" role="listbox" aria-label="Apps"></div><div class="l-undo" id="l-undo" hidden></div></div></div>
@@ -727,6 +1063,7 @@ performance_mode=off material_cache_rebuilds=1</span>
   <!-- Taskbar -->
   <footer class="glass" id="taskbar">
     <button class="tk" id="start" aria-label="Launcher" aria-expanded="false"><img src="assets/brook-mark.png" alt=""></button>
+    <button class="tk flipx" id="dbtn" aria-label="Drawer" aria-expanded="false" title="Drawer (Super+S)" hidden></button>
     <span class="vsep"></span>
     <div id="tasks"></div>
     <span class="grow"></span>
@@ -776,33 +1113,49 @@ const ICON = {
   music:'<path d="M6 11.5V4l6-1.500V10"/><circle cx="4.5" cy="11.5" r="1.5"/><circle cx="10.5" cy="10" r="1.5"/>', tool:'<path d="M3 13l5.500-5.500M9 3.500a3 3 0 0 0 3.500 3.500l-1.500-1.500 1-2z"/>',
   inbox:'<path d="m2.5 9 1.800-5h7.400l1.800 5v3.500h-11zm0 0h3.200l.8 1.500h3l.8-1.500h3.200"/>', pin:'<path d="M6 2.500h4l-.5 4 2 2.500h-7l2-2.500zM8 9v4.500"/>',
   undo:'<path d="M5 4 2.500 6.500 5 9M2.500 6.500h7a3.500 3.500 0 0 1 0 7H7"/>', trash:'<path d="M3.500 4.500h9m-6 0V3h3v1.500m-5 0 .6 8.500h5.800l.6-8.500"/>',
-  ret:'<path d="M12 4v4.5a1 1 0 0 1-1 1H4.5m0 0 2.2-2.2M4.5 9.5l2.2 2.2"/>'
+  ret:'<path d="M12 4v4.5a1 1 0 0 1-1 1H4.5m0 0 2.2-2.2M4.5 9.5l2.2 2.2"/>',
+  chat:'<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h7A1.5 1.5 0 0 1 13 4.5V9a1.5 1.5 0 0 1-1.5 1.5H7.5l-3 2.5v-2.5A1.5 1.5 0 0 1 3 9z"/>',
+  mail:'<rect x="2.5" y="4" width="11" height="8.5" rx="1.5"/><path d="m3.2 5.2 4.8 3.8 4.8-3.8"/>',
+  feed:'<circle cx="4.3" cy="11.7" r=".9"/><path d="M3.5 7.5a5 5 0 0 1 5 5M3.5 3.5a9 9 0 0 1 9 9"/>',
+  drawer:'<rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6.5 3v10"/>',
+  stash:'<path d="M3 3v10M13.5 8h-7m0 0L9 5.5M6.5 8 9 10.5"/>', popout:'<path d="M3 3v10M6.5 8h7m0 0L11 5.5M13.5 8 11 10.5"/>',
+  dockup:'<path d="M3 3h10M8 13.5v-7m0 0L5.5 9M8 6.5 10.5 9"/>', undock:'<path d="M3 3h10M8 6.5v7m0 0L5.5 11M8 13.5l2.5-2.5"/>',
+  full:'<path d="M3 6V3h3m4 0h3v3m0 4v3h-3m-4 0H3v-3"/>',
+  prev:'<path d="M11.5 4v8l-6-4zM4.5 4v8"/>', next:'<path d="M4.5 4v8l6-4zM11.5 4v8"/>', pause:'<path d="M5.5 4v8m5-8v8"/>'
 };
 const ic = n => `<svg class="i" viewBox="0 0 16 16" aria-hidden="true">${ICON[n]}</svg>`;
 $$('i[data-i]').forEach(e => e.outerHTML = ic(e.dataset.i));
 
 /* ---------- State (what native Settings persists in [Desktop]) ---------- */
-const DEF = {palette:'clearwater', mode:'mixed', opacity:80, blur:'light', perf:false, scale:'200', hud:'compact', build:true, temp:true, h24:true, date:true, labels:true,
-  accent:'auto', style:'glass', rim:false, touch:false, hits:false};
+const DEF = {theme:'glass', mode:'mixed', opacity:80, blur:'light', scale:'200', hud:'compact', build:true, temp:true, h24:true, date:true, labels:true,
+  accent:'blue', style:'glass', rim:false, touch:false, hits:false, drawer:'off', dedge:'left', dpos:'top', dpin:false, dockw:420, dockh:56, dfs:false};
 const BLUR = {none:'0px', light:'3px', moderate:'9px', heavy:'18px'};   // roughly x3 then x2: each step reads as a different material
-const KEY = 'brook.clearwater-next.v3';
-const ACCENTS = {"blue": "Clearwater blue", "teal": "Teal", "pine": "Pine green", "phosphor": "Phosphor", "lime": "Lime", "amber": "Amber", "orange": "Orange", "red": "Red", "pink": "Hot pink", "violet": "Violet", "slate": "Slate", "wallpaper": "Wallpaper (dawn)"};
+const KEY = 'brook.clearwater-next.v4';
+const ACCENTS = {"blue":"Blue","navy":"Navy","teal":"Teal","pine":"Pine green","phosphor":"Phosphor","lime":"Lime","amber":"Amber","orange":"Orange","red":"Red","pink":"Hot pink","violet":"Violet","slate":"Slate","wallpaper":"Wallpaper (dawn)"};
 const load = () => { try { return {...DEF, ...JSON.parse(localStorage.getItem(KEY) || '{}')}; } catch { return {...DEF}; } };
-let saved = SHOT ? {...DEF} : load(), S = {...saved};
+let saved = SHOT ? {...DEF} : load();
+let S = {...saved};
 for (const k of Object.keys(DEF)) if (Q.has(k)) { const v = Q.get(k); S[k] = typeof DEF[k] === 'boolean' ? v !== '0' : typeof DEF[k] === 'number' ? +v : v; }
+// Settings from before the themes were folded together, in a URL or a BROOK.CFG: Smoked is the Slate hue, Opal is Pine green, Performance mode is an Opaque theme.
+if (!Q.has('accent')) { if (Q.get('palette') === 'smoked') S.accent = 'slate'; else if (Q.get('palette') === 'opal') S.accent = 'pine'; }
+if (Q.has('perf') && Q.get('perf') !== '0' && !Q.has('theme')) S.theme = S.mode === 'light' ? 'opaque-light' : 'opaque-dark';
+if (!ACCENTS[S.accent]) S.accent = 'blue';                             // 'auto' meant the default hue
+if (!['glass','opaque-light','opaque-dark'].includes(S.theme)) S.theme = 'glass';
+let NOACCEL = Q.has('noaccel') && Q.get('noaccel') !== '0';             // study aid, not a setting: what Settings shows when the GPU is not accelerated
 if (SHOT) saved = {...S};
 
-const PAL = {   // palette-card miniatures: [glass, title highlight, accent] per glass mode
-  clearwater:{dark:['#10244a','#28508a','#6aaeff'], light:['#e2edfb','#bad5f8','#1f6fe0']},
-  smoked:{dark:['#161a22','#363e4e','#a6c0e2'], light:['#ebeef3','#d0d7e2','#44628c']},
-  opal:{dark:['#0c281e','#1c563e','#62d6a0'], light:['#eaf7f7','#bee7e7','#0a7f8a']}
-};
+// Per hue and glass mode: [glass, title highlight, accent, content background, flat fill], then the picker swatch and its tick colour. Generated with the CSS rows; see DESIGN.md.
+const TINT = {"blue":{"dark":["#102442","#28508a","#6aaeff","#111c2b","#162844"],"light":["#e2edfb","#bad5f8","#1c65cc","#f5f8fc","#e2ebf7"],"sw":"#3f8cff","sk":"#fff"},"navy":{"dark":["#091244","#233891","#739fff","#0c1328","#0e1845"],"light":["#e3ecff","#bed2ff","#17409c","#f6f8fc","#e3eafb"],"sw":"#17409c","sk":"#fff"},"teal":{"dark":["#002b29","#005e59","#4fd3c4","#0a201e","#002f2d"],"light":["#dff0ed","#b0ddd7","#09747e","#f4f9f8","#dfeeec"],"sw":"#1fb5a8","sk":"#1a1400"},"pine":{"dark":["#002c1e","#006044","#62d6a0","#0c2017","#023122"],"light":["#e0f1e7","#b3dec8","#1b7650","#f4f9f6","#e0eee6"],"sw":"#2fa56f","sk":"#fff"},"phosphor":{"dark":["#032d16","#0b6133","#7dff9b","#0f2014","#0c301b"],"light":["#e2f0e4","#b9debf","#0f7a33","#f5f9f6","#e2eee4"],"sw":"#35d45f","sk":"#1a1400"},"lime":{"dark":["#1b2a04","#3f5b0d","#b4e04a","#171e0d","#1f2d0c"],"light":["#e8efdf","#c9dab1","#53710c","#f7f9f4","#e7eddf"],"sw":"#9acb2b","sk":"#1a1400"},"amber":{"dark":["#433200","#8b6a00","#ffc233","#241a02","#433200"],"light":["#fceac7","#f9cc6c","#8f5d00","#faf7f3","#f7e9cb"],"sw":"#ffc233","sk":"#1a1400"},"orange":{"dark":["#4d2400","#8b4500","#ff8a3c","#2a1608","#532700"],"light":["#ffe6d8","#ffc4a1","#b54600","#fbf7f4","#fde5d7"],"sw":"#ff7a1a","sk":"#1a1400"},"red":{"dark":["#570400","#970a00","#ff625a","#2c1310","#5e0700"],"light":["#ffe5e1","#ffc1b9","#c9211d","#fcf6f5","#fee3df"],"sw":"#f0392f","sk":"#fff"},"pink":{"dark":["#3b1626","#7c3455","#ff6cba","#28151d","#3e1b29"],"light":["#f8e6ee","#f1c4d7","#c71d7b","#fbf6f8","#f6e7ed"],"sw":"#f0389b","sk":"#fff"},"violet":{"dark":["#291c3e","#5a4182","#b79cff","#1d1829","#2d2140"],"light":["#ede9fa","#d6cbf4","#6a43d6","#f8f7fc","#ebe8f6"],"sw":"#8d63f0","sk":"#fff"},"slate":{"dark":["#1f252e","#465163","#a9bdd6","#181c20","#232831"],"light":["#e9ecf0","#cbd3de","#47607f","#f7f8f9","#e8eaee"],"sw":"#7088a8","sk":"#fff"},"wallpaper":{"dark":["#331f0d","#6d4723","#f6b98a","#231910","#362413"],"light":["#f4eae2","#e6cdba","#a8511d","#faf7f5","#f1e8e2"],"sw":"#f6b98a","sk":"#1a1400"}};
+const THEMES = {glass:'Glass', 'opaque-light':'Opaque Light', 'opaque-dark':'Opaque Dark'};
 const MODE_HINT = {light:'Light glass, light apps.', mixed:'Dark glass around light apps.', dark:'Dark glass, dark apps.'};
 
+// Glass needs an accelerated GPU. Without one the saved choice is kept and an opaque theme stands in, picked from the mode.
+const effTheme = () => NOACCEL && S.theme === 'glass' ? (S.mode === 'light' ? 'opaque-light' : 'opaque-dark') : S.theme;
 function apply() {
-  const glass = S.mode === 'light' ? 'light' : 'dark', content = S.mode === 'dark' ? 'dark' : 'light';
-  Object.assign(stage.dataset, {palette:S.palette, glass, content, perf:S.perf ? '1' : '0', labels:S.labels ? '1' : '0', style:S.style,
-    accent:S.accent, rim:S.rim ? '1' : '0', touch:S.touch ? '1' : '0', hits:S.hits ? '1' : '0'});
+  const eff = effTheme(), opq = eff !== 'glass', hue = S.accent;
+  const glass = opq ? (eff === 'opaque-light' ? 'light' : 'dark') : S.mode === 'light' ? 'light' : 'dark', content = opq ? glass : S.mode === 'dark' ? 'dark' : 'light';   // an opaque theme is one mode throughout
+  Object.assign(stage.dataset, {palette:'tinted', theme:eff, glass, content, perf:opq ? '1' : '0', labels:S.labels ? '1' : '0', style:S.style,
+    accent:hue, tint:hue, rim:S.rim ? '1' : '0', touch:S.touch ? '1' : '0', hits:S.hits ? '1' : '0'});
   $('#hitkey').hidden = !S.hits; $('[data-toggle=hits]').classList.toggle('on', S.hits);
   stage.style.setProperty('--op', S.opacity / 100);
   stage.style.setProperty('--blur', BLUR[S.blur]);
@@ -810,24 +1163,34 @@ function apply() {
     if (g.matches('.sw')) return g.setAttribute('aria-checked', String(!!S[g.dataset.key]));
     $$('button', g).forEach(b => { const on = String(S[g.dataset.key]) === b.dataset.v; b.setAttribute('aria-pressed', on); b.classList.toggle('on', on); });
   });
-  $('[data-toggle=perf]').classList.toggle('on', S.perf);
-  $$('.pal').forEach(p => { const c = PAL[p.dataset.v][glass]; p.style.setProperty('--pg', c[0]); p.style.setProperty('--ph', c[1]); p.style.setProperty('--pa', c[2]); p.style.setProperty('--pc', content === 'dark' ? '#111c2b' : '#f5f8fc'); });
+  $$('[data-key=theme] button').forEach(b => { const on = b.dataset.v === eff; b.setAttribute('aria-pressed', on); b.classList.toggle('on', on); b.disabled = NOACCEL && b.dataset.v === 'glass'; });   // the theme in use, which is not the saved one while Glass is locked
+  $('#noaccel').classList.toggle('on', NOACCEL); $('#noaccel').setAttribute('aria-pressed', NOACCEL);
+  $('#accel-note').hidden = !NOACCEL; $('#accel-text').textContent = 'Glass needs GPU acceleration, which this display does not have. ' + (S.theme === 'glass' ? `${THEMES[eff]} is in use until it does.` : 'It will be available again when it does.');
+  $$('.pal').forEach(p => { const v = p.dataset.v, g = v === 'opaque-light' ? 'light' : v === 'opaque-dark' ? 'dark' : S.mode === 'light' ? 'light' : 'dark', c = TINT[hue][g], fl = v !== 'glass';
+    p.style.setProperty('--pg', c[fl ? 4 : 0]); p.style.setProperty('--ph', c[fl ? 4 : 1]); p.style.setProperty('--pa', c[2]); p.style.setProperty('--pc', TINT[hue][fl ? g : S.mode === 'dark' ? 'dark' : 'light'][3]); });
   const op = $('#s-op'); op.value = S.opacity; op.style.setProperty('--pct', (S.opacity - 40) / 60 * 100 + '%'); $('#s-opv').textContent = S.opacity + '%';
-  $('#glassrows').classList.toggle('dis', S.perf);
-  $('#mode-hint').textContent = MODE_HINT[S.mode];
-  $('#acc-name').textContent = S.accent === 'auto' ? 'Palette default' : ACCENTS[S.accent];
-  $('#acc-auto').style.setProperty('--sd', PAL[S.palette].dark[2]); $('#acc-auto').style.setProperty('--sl', PAL[S.palette].light[2]);
+  $('#glassrows').classList.toggle('dis', opq); $('#glass-tag').hidden = !opq; $('#row-mode').classList.toggle('dis', opq);
+  $('#mode-hint').textContent = opq ? `${THEMES[eff]} is ${glass} throughout.` : MODE_HINT[S.mode];
+  $('#t-pal').textContent = `theme=${eff} hue=${hue} mode=${opq ? glass : S.mode} opacity=${opq ? 100 : S.opacity} blur=${opq ? 'none' : S.blur}`;
+  $('#t-acc').textContent = 'accelerated=' + (NOACCEL ? 'no' : 'yes');
+  $('#acc-name').textContent = ACCENTS[hue] + (hue === 'blue' ? ' (default)' : '');
+  for (const r of ['dockh','dfs']) $('#row-' + r).hidden = S.drawer !== 'dock'; for (const r of ['dpos','dpin','dockw']) $('#row-' + r).classList.toggle('dis', S.drawer !== 'side');
+  $('#row-dedge').classList.toggle('dis', !['side','rail','cards','tabs'].includes(S.drawer)); $('[data-toggle=dpin]').classList.toggle('on', S.dpin);
   $('#build').hidden = !S.build; $('#t-temp').hidden = !S.temp; $('#c-date').hidden = !S.date;
   $('#hudchip').hidden = S.hud !== 'compact'; $('#hud').classList.toggle('shut', S.hud !== 'expanded');
   const dirty = JSON.stringify(S) !== JSON.stringify(saved);
   $('#set-foot').classList.toggle('dirty', dirty); $('#set-state').textContent = dirty ? 'Previewing changes' : 'Saved';
   $('#apply').disabled = $('#revert').disabled = !dirty;
-  tick(); drawHud();
+  tick(); drawHud(); drawerApply();
 }
 const set = (k, v) => { S[k] = v; apply(); };
+// The hue row, in the study bar and in Settings. Each swatch is the hue's identity colour, not the contrast-adjusted accent.
+$('#study-hues').innerHTML = Object.keys(ACCENTS).map(k => `<button data-v="${k}" title="${ACCENTS[k]}" aria-label="${ACCENTS[k]}"><i class="dot" style="background:${TINT[k].sw}"></i></button>`).join('');
+$('#set-hues').innerHTML = Object.keys(ACCENTS).map(k => `<button data-v="${k}" aria-label="${ACCENTS[k]}" title="${ACCENTS[k]}"><i${k === 'wallpaper' ? ' class="wp"' : ''} style="--sw:${TINT[k].sw};--sk:${TINT[k].sk}">${ic('check')}</i></button>`).join('');
+$('#noaccel').onclick = () => { NOACCEL = !NOACCEL; apply(); };
 document.addEventListener('click', e => {
   const sw = e.target.closest('.sw[data-key]') || e.target.closest('.row')?.querySelector('.sw[data-key]'); if (sw) return set(sw.dataset.key, !S[sw.dataset.key]);   // the whole row toggles
-  const b = e.target.closest('[data-key] > button[data-v]'); if (b) return set(b.parentElement.dataset.key, b.dataset.v);
+  const b = e.target.closest('[data-key] > button[data-v]'); if (b) { const k = b.parentElement.dataset.key; return set(k, typeof DEF[k] === 'number' ? +b.dataset.v : b.dataset.v); }
 });
 $('#s-op').addEventListener('input', e => set('opacity', +e.target.value));
 $('#apply').onclick = () => { saved = {...S}; try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch {} apply(); };
@@ -850,16 +1213,60 @@ const APPS = [
 // Not installed at first. 'Install app' in the study bar adds them to Unsorted. hint = the category the package declares.
 const EXTRA = [['inkscape','Inkscape','Vector drawing','graphics'], ['audacity','Audacity','Record and edit audio','media'], ['htop','htop','Process viewer','system']].map(([id, name, desc, hint]) => ({id, name, desc, hint}));
 const HUES = ['#3f7fd6','#2f9b93','#7a6cd0','#c2793a','#b7506a','#5a8f4a'];
-const iconOf = a => a.icon ? `<img src="assets/icons/${a.icon}.svg" alt="">`
+const iconOf = a => a.icon ? `<img src="assets/icons/${a.icon}.svg" alt="">` : a.glyph ? `<span class="mg" style="background:${a.hue}">${ic(a.glyph)}</span>`
   : `<span class="mg" style="background:${HUES[[...a.id].reduce((n, c) => n + c.charCodeAt(0), 0) % HUES.length]}">${a.name[0]}</span>`;
-const byId = id => APPS.find(a => a.id === id) || EXTRA.find(a => a.id === id);
+const byId = id => APPS.find(a => a.id === id) || EXTRA.find(a => a.id === id) || DAPPS.find(a => a.id === id);
 let recent = ['files','settings','terminal','firefox','quake'];
+
+/* ---------- Side drawer, part 1: the four illustrative residents and the drawer's state ----------
+   Kept out of APPS so the launcher's lists and its self-test stay as they were. All names and text are invented. */
+const DAPPS = [['chat','Chat','Mira Okafor - Chat','#2f9b93'], ['mail','Mail','Inbox - Mail','#3f7fd6'], ['music','Music','Music','#b7506a'], ['feed','Feed','Home - Feed','#7a6cd0']]
+  .map(([id, name, title, hue]) => ({id, name, title, hue, glyph:id}));
+const xrow = (un, from, time, subj, snip) => `<div class="x-row${un ? ' un' : ''}"><i></i><b>${from}</b><time class="num">${time}</time><span>${subj}</span><span>${snip}</span></div>`;
+const xpost = (h, who, at, when, text, r, b, f) => `<div class="x-post"><span class="x-av" style="--h:${h}">${who[0]}</span><b>${who}<small>${at} · ${when}</small></b><p>${text}</p><footer><span>${ic('ret')}${r}</span><span>${ic('restart')}${b}</span><span>${ic('star')}${f}</span></footer></div>`;
+const DX = {
+  chat:`<div class="x-hd"><span class="x-av" style="--h:#c2793a">M</span><div><b>Mira Okafor</b><small>Active now</small></div><button class="x-ib" aria-label="Search">${ic('search')}</button><button class="x-ib" aria-label="More">${ic('more')}</button></div>
+    <div class="x-thread"><div class="x-day">Today</div>
+      <p class="x-msg">Morning! Did the Dell hit 60 last night?<time class="num">09:12</time></p>
+      <p class="x-msg me">Close. 58 to 60 with the glass on, steady 60 on Opaque Dark.<time class="num">09:20</time></p>
+      <p class="x-msg">That is better than I expected for the blur.<time class="num">09:21</time></p>
+      <div class="x-day new">3 new</div>
+      <p class="x-msg">Pushed a fix for the chrome atlas upload.<time class="num">10:36</time></p>
+      <p class="x-msg">It should stop the repaint while dragging.<time class="num">10:37</time></p>
+      <p class="x-msg">Are we still on for the build review at 3?<time class="num">10:39</time></p></div>
+    <div class="x-compose"><span class="x-in">Message Mira</span><button class="c-btn primary">Send</button></div>`,
+  mail:`<div class="x-hd"><div><b>Inbox</b><small>12 unread</small></div><button class="x-ib" aria-label="Search">${ic('search')}</button><button class="c-btn primary">Compose</button></div>
+    <div class="x-body">${[[1,'Build bot','10:12','Nightly 3a4b909e passed','All 214 tests green. Boot to desktop in 8.12 s.'], [1,'Priya Raman','09:47','Re: Touchpad edge gestures','Three fingers sideways works, but the threshold feels'],
+      [1,'Tomasz Lind','09:30','Wallpaper candidates','Six more from the river walk. The dawn one is still my'], [1,'brook-dev','08:55','[brook-dev] Hit-test conformance table','Draft attached. It covers the top-right pixel in all'],
+      [0,'Mira Okafor','Sat','Review notes','Thanks for the write-up. Two small things on the rim'], [0,'Build bot','Sat','Nightly 29117654 passed','All 212 tests green.'],
+      [0,'Priya Raman','Fri','Panel calibration','The 200% scale looks right on mine. I measured the'], [0,'Hana Sato','Fri','Icons, second pass','The 16 px grid is holding up. I redrew the folder and'],
+      [0,'brook-dev','Thu','[brook-dev] Opal dark, greener','Moved the glass from teal to pine. Screenshots in the'], [0,'Tomasz Lind','Thu','Lunch?','There is a new place by the weir.']].map(r => xrow(...r)).join('')}</div>`,
+  music:`<div class="x-now"><div class="x-art"></div><b>Low Tide</b><small>Harbour Lights · Slow Water</small><div class="x-prog"><i></i></div><div class="x-times num"><span>1:42</span><span>4:27</span></div>
+      <div class="x-tr"><button aria-label="Previous">${ic('prev')}</button><button class="pp" aria-label="Pause">${ic('pause')}</button><button aria-label="Next">${ic('next')}</button></div></div>
+    <div class="x-body">${[['Up next','','Millrace','Harbour Lights · 3:58'], ['','','Stepping Stones','Harbour Lights · 5:10'], ['','','Heron','Ada Winter · 2:49'], ['','','Morning on the Brook','Ada Winter · 6:02'], ['','','Weir','Slow Water Ensemble · 4:15']].map((r, i) => xrow(0, r[2], i ? '' : 'Up next', r[3], '')).join('')}</div>`,
+  feed:`<div class="x-hd"><div><b>Home</b><small>New activity</small></div><button class="x-ib" aria-label="Search">${ic('search')}</button><button class="c-btn primary">Post</button></div>
+    <div class="x-body">${xpost('#5a8f4a','Tomasz Lind','@tomasz','12 min','Boosted: a hobby OS that boots to a glass desktop in eight seconds. The taskbar graphs are a nice touch.',4,18,52) +
+      xpost('#c2793a','Mira Okafor','@mira','40 min','Edge-to-edge caption buttons are the kind of detail you stop noticing after a day, which is the point.',2,6,31) +
+      xpost('#3f7fd6','Hana Sato','@hana','1 h','One icon grid, one stroke weight. Everything else is negotiable.',7,22,90) +
+      xpost('#7a6cd0','Priya Raman','@priya','2 h','Measured the panel again. 3200 by 1800 at 200% is exactly as sharp as it sounds.',1,3,17) +
+      xpost('#b7506a','Ada Winter','@ada','3 h','New record out today: six tracks named after parts of a river.',9,41,120) +
+      xpost('#2f9b93','brook-dev','@brookdev','5 h','Opal dark is now pine green. Teal lives on as an accent.',3,9,44)}</div>`
+};
+// Attention and preview data. Native: n and dot come from the app's attention signal; pv needs the app to publish a summary.
+const DMETA = {chat:{n:3, pv:'Mira: Are we still on for the build review at 3?', t:'10:39'}, mail:{n:12, pv:'Build bot: Nightly 3a4b909e passed', t:'10:12'},
+  music:{play:true, pv:'Low Tide · Harbour Lights', t:'1:42'}, feed:{dot:true, pv:'Tomasz boosted your post', t:'09:58'}};
+// pin: lives in the drawer and is saved in [Drawer]. Without it the entry is a guest: a window stashed for now.
+const DR = {open:false, peek:null, kb:null, menuId:null, items:DAPPS.map(a => ({id:a.id, pin:true}))};
+DAPPS.forEach((a, i) => $('#w-settings').insertAdjacentHTML('afterend', `<section class="win gone" id="w-${a.id}" data-app="${a.id}" style="left:${330 + i * 46}px;top:${96 + i * 28}px;width:420px;height:640px" aria-label="${a.name} window">
+  <header class="tb">${iconOf(a)}<span class="title">${a.title}</span><div class="caps">${[['min','Minimise',''], ['max','Maximise',''], ['close','Close',' class="x"']].map(c => `<button data-act="${c[0]}"${c[2]} aria-label="${c[1]}"><span>${ic(c[0])}</span></button>`).join('')}</div></header>
+  <div class="client">${DX[a.id]}</div></section>`));
 
 /* ---------- Windows ---------- */
 const WIN = {files:{z:1}, terminal:{z:2}, settings:{z:3}};
+DAPPS.forEach(a => WIN[a.id] = {z:0, stash:true});                   // the residents start stashed
 let zTop = 3;
 const wEl = id => $('#w-' + id);
-const visible = id => WIN[id] && !WIN[id].closed && !WIN[id].min;
+const visible = id => WIN[id] && !WIN[id].closed && !WIN[id].min && (!WIN[id].stash || DR.peek === id);   // a stashed window is drawn only while it is peeked
 function focusWin(id) {
   if (id && visible(id)) { WIN[id].z = ++zTop; wEl(id).style.zIndex = WIN[id].z; }
   const top = Object.keys(WIN).filter(visible).sort((a, b) => WIN[b].z - WIN[a].z)[0];
@@ -870,32 +1277,38 @@ function setGone(id) { wEl(id).classList.toggle('gone', !visible(id)); }
 function openWin(id) { WIN[id].closed = WIN[id].min = false; setGone(id); focusWin(id); }
 function winAct(id, act) {
   const w = WIN[id];
+  if (drawerAct(id, act)) return;
+  if (w.fs && act !== 'max') setFs(id, false);
   if (act === 'min') w.min = true; else if (act === 'close') w.closed = true;
   else if (act === 'max') { w.max = !w.max; wEl(id).classList.toggle('max', w.max); $('[data-act=max] span', wEl(id)).innerHTML = ic(w.max ? 'restore' : 'max'); wpos(wEl(id)); return focusWin(id); }
-  setGone(id); focusWin();
+  setGone(id); focusWin(); renderDrawer();
 }
 function renderTasks() {
-  $('#tasks').innerHTML = Object.keys(WIN).filter(k => !WIN[k].closed).map(k => { const a = byId(k), act = wEl(k).classList.contains('active');
+  $('#tasks').innerHTML = Object.keys(WIN).filter(k => !WIN[k].closed && !WIN[k].stash).map(k => { const a = byId(k), act = wEl(k).classList.contains('active');
     return `<button class="tk task${act ? ' active' : ''}${WIN[k].min ? ' min' : ''}" data-task="${k}" title="${a.name}" aria-pressed="${act}">${iconOf(a)}<span class="t">${a.name}</span></button>`; }).join('');
 }
+$('#tasks').addEventListener('contextmenu', e => { const b = e.target.closest('[data-task]'); if (!b || !dOn()) return; e.preventDefault(); winMenu(b.dataset.task, e); });
 $('#tasks').addEventListener('click', e => { const b = e.target.closest('[data-task]'); if (!b) return; const id = b.dataset.task;
   if (WIN[id].min) openWin(id); else if (wEl(id).classList.contains('active')) winAct(id, 'min'); else focusWin(id); });
 const scale = () => stage.getBoundingClientRect().width / 1600;
 const wpos = w => { w.style.setProperty('--wx', -w.offsetLeft + 'px'); w.style.setProperty('--wy', -w.offsetTop + 'px'); };   // screen position, for the rim and alloy highlight
 $$('.win').forEach(w => {
   const id = w.dataset.app; w.style.zIndex = WIN[id].z; wpos(w);
-  const tl = document.createElement('span'); tl.className = 'tl'; tl.append($('.tb img', w), $('.tb .title', w)); $('.tb', w).prepend(tl);
+  const tl = document.createElement('span'); tl.className = 'tl'; tl.append($('.tb img,.tb .mg', w), $('.tb .title', w)); $('.tb', w).prepend(tl);
+  $('.caps', w).insertAdjacentHTML('afterbegin', `<button data-act="stash" class="flipx" aria-label="Stash in drawer" title="Stash in drawer"><span>${ic('stash')}</span></button>`);   // shown only on drawer apps; drawerSync sets its wording
   w.addEventListener('pointerdown', () => focusWin(id), true);
   $$('[data-act]', w).forEach(b => b.onclick = e => { e.stopPropagation(); winAct(id, b.dataset.act); });
   const tb = $('.tb', w);
   tb.ondblclick = e => { if (!e.target.closest('button')) winAct(id, 'max'); };
-  tb.onpointerdown = e => { if (e.target.closest('button') || WIN[id].max) return; dragEl(e, w, 36 - w.offsetWidth, 1564, 0, 820); };
+  tb.onpointerdown = e => { if (e.button || e.target.closest('button') || WIN[id].max || DR.peek === id) return; const p = pinW();
+    dragEl(e, w, p && !dRight() ? p : 36 - w.offsetWidth, p && dRight() ? 1600 - p - w.offsetWidth : 1564, dockH(), 820, dOn() && stashDrag(id)); };   // a window cannot go under a dock that is outside the work area, so a pointer inside the dock can only mean "dock this"
+  tb.oncontextmenu = e => { if (!dOn() || e.target.closest('button')) return; e.preventDefault(); DR.peek === id ? entryMenu(id, null, e) : winMenu(id, e); };
 });
-function dragEl(e, el, x0, x1, y0, y1) {
+function dragEl(e, el, x0, x1, y0, y1, hook) {
   const s = scale(), ox = e.clientX / s - el.offsetLeft, oy = e.clientY / s - el.offsetTop;
-  e.currentTarget.setPointerCapture(e.pointerId);
-  const mv = m => { el.style.left = Math.max(x0, Math.min(x1, m.clientX / s - ox)) + 'px'; el.style.top = Math.max(y0, Math.min(y1, m.clientY / s - oy)) + 'px'; el.style.right = el.style.bottom = 'auto'; if (el.classList.contains('win')) wpos(el); };
-  const up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}   // synthetic events in the self-tests have no live pointer
+  const mv = m => { el.style.left = Math.max(x0, Math.min(x1, m.clientX / s - ox)) + 'px'; el.style.top = Math.max(y0, Math.min(y1, m.clientY / s - oy)) + 'px'; el.style.right = el.style.bottom = 'auto'; if (el.classList.contains('win')) wpos(el); hook && hook.mv(m); };
+  const up = m => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); hook && hook.up(m); };
   addEventListener('pointermove', mv); addEventListener('pointerup', up);
 }
 $('#hud header').onpointerdown = e => { if (!e.target.closest('button')) dragEl(e, $('#hud'), 0, 1252, 0, 600); };
@@ -903,7 +1316,7 @@ $('#hud header').onpointerdown = e => { if (!e.target.closest('button')) dragEl(
 function launch(id) {
   const a = byId(id); recent = [id, ...recent.filter(r => r !== id)].slice(0, 5);
   closePanels();
-  if (WIN[id]) openWin(id); else toast({icon:'info', title:a.name, body:'Not part of this prototype. Files, Terminal and Settings open real windows.'});
+  if (WIN[id] && WIN[id].stash && dOn()) dPick(id); else if (WIN[id]) openWin(id); else toast({icon:'info', title:a.name, body:'Not part of this prototype. Files, Terminal and Settings open real windows.'});
 }
 
 /* ---------- Files rows ---------- */
@@ -922,13 +1335,14 @@ const CICONS = ['folder','sliders','globe','play','doc','brush','pad','spark','s
 const DEFAULT_CATS = [['system','System','blue','sliders'], ['internet','Internet','teal','globe'], ['media','Media','violet','play'], ['office','Office','amber','doc'],
   ['graphics','Graphics','pink','brush'], ['games','Games','coral','pad'], ['demos','Demos','slate','spark']];
 const defaults = () => ({v:1, cats:DEFAULT_CATS.map(([id, name, color, icon]) => ({id, name, color, icon, apps:APPS.filter(a => a.hint === id).map(a => a.id)})),
-  pins:['files','terminal','settings','firefox','quake'], extra:[], fresh:[], top:'pins'});
+  pins:['files','terminal','settings','firefox','quake'], extra:[], fresh:[], gone:[], top:'pins'});
 let LAY = defaults();
-if (!SHOT) try { const v = JSON.parse(localStorage.getItem(LKEY)); if (v && v.v === 1) LAY = v; } catch {}
+if (!SHOT) try { const v = JSON.parse(localStorage.getItem(LKEY)); if (v && v.v === 1) LAY = {gone:[], ...v}; } catch {}
 let view = 'all', org = false, kbId = null, justDragged = false, menuIds = [], editId = null, editSnap = null, editLabel = '', undoTimer = 0, drag = null, springT = 0, springId = null;
 const sel = new Set(), UNDO = [];
 
-const installed = () => [...APPS, ...EXTRA.filter(a => LAY.extra.includes(a.id))];
+const installed = () => [...APPS.filter(a => !LAY.gone.includes(a.id)), ...EXTRA.filter(a => LAY.extra.includes(a.id))];
+const SYS = ['files','terminal','settings','kconsole','gallery'];   // part of Brook: these cannot be uninstalled
 const catOf = id => LAY.cats.find(c => c.apps.includes(id));
 const catById = id => LAY.cats.find(c => c.id === id);
 const unsorted = () => installed().filter(a => !catOf(a.id)).map(a => a.id);
@@ -968,6 +1382,10 @@ function pin(ids) {
   if (ids.every(i => LAY.pins.includes(i))) return change(`Unpinned ${nm(ids)}`, () => LAY.pins = LAY.pins.filter(i => !ids.includes(i)));
   change(`Pinned ${nm(ids)}`, () => { LAY.pins = [...LAY.pins.filter(i => !ids.includes(i)), ...ids].slice(-10); LAY.top = 'pins'; });
 }
+function uninstall(ids) {                                            // undoable for as long as the bar shows; natively the package is removed when the bar goes
+  change(`Uninstalled ${nm(ids)}`, () => { LAY.cats.forEach(c => c.apps = c.apps.filter(a => !ids.includes(a))); for (const k of ['pins','fresh','extra']) LAY[k] = LAY[k].filter(a => !ids.includes(a));
+    LAY.gone = [...LAY.gone, ...ids.filter(i => APPS.some(a => a.id === i))]; recent = recent.filter(a => !ids.includes(a)); });
+}
 function addCat(ids, name = 'New category') {
   const snap = JSON.stringify(LAY), used = LAY.cats.map(c => c.color);
   const c = {id:'c' + Date.now().toString(36) + LAY.cats.length, name, color:Object.keys(COLORS).find(k => !used.includes(k)) || 'blue', icon:'folder', apps:[]};
@@ -995,8 +1413,7 @@ function appRow(a, term) {
     `<span class="tx"><b>${n}${LAY.fresh.includes(a.id) ? '<i class="new">New</i>' : ''}</b><small>${esc(a.desc)}</small></span>` +
     (term ? `<span class="chip" style="--cc:${c ? COLORS[c.color] : 'var(--ink-3)'}">${c ? esc(c.name) : 'Unsorted'}</span>` : '') +
     (s ? `<button class="gbtn" data-sug="${a.id}" tabindex="-1">${ctile(s)}Move to ${esc(s.name)}</button>` : '') +
-    (WIN[a.id] && !WIN[a.id].closed ? '<span class="run" title="Running"></span>' : '') +
-    `<button class="more" data-more="${a.id}" tabindex="-1" aria-label="Organise ${esc(a.name)}">${ic('more')}</button></div>`;
+    (WIN[a.id] && !WIN[a.id].closed ? '<span class="run" title="Running"></span>' : '') + '</div>';
 }
 function renderLauncher() {
   const term = q.value.trim().toLowerCase(), list = $('#l-list'), inst = installed(), uns = unsorted(), keep = list.scrollTop;
@@ -1005,16 +1422,16 @@ function renderLauncher() {
   $('#l-top').hidden = !!term; $$('[data-top]').forEach(b => b.setAttribute('aria-pressed', b.dataset.top === LAY.top));
   const tops = (LAY.top === 'pins' ? LAY.pins : recent).filter(id => inst.some(a => a.id === id));
   $('#l-tiles').innerHTML = tops.length ? tops.map(id => `<div class="l-tile" role="button" data-app="${id}">${iconOf(byId(id))}<span>${esc(byId(id).name)}</span></div>`).join('')
-    : `<div class="l-none">${LAY.top === 'pins' ? 'Nothing pinned yet. Drag an app here, or choose Pin to top from its ⋯ menu.' : 'Apps you open will appear here.'}</div>`;
+    : `<div class="l-none">${LAY.top === 'pins' ? 'Nothing pinned yet. Drag an app here, or right-click one and choose Pin.' : 'Apps you open will appear here.'}</div>`;
   $('#l-rail').innerHTML =
     `<div class="rb" role="button" tabindex="0" data-view="all" aria-pressed="${view === 'all' && !term}"><span class="ct plain">${ic('grid')}</span><span class="nm">All apps</span><small class="num">${inst.length}</small></div>` +
     LAY.cats.map(c => `<div class="rb" role="button" tabindex="0" data-view="${c.id}" data-cat="${c.id}" aria-pressed="${view === c.id && !term}">${ctile(c)}<span class="nm">${esc(c.name)}</span>` +
       (org ? `<button class="more" data-catmore="${c.id}" aria-label="Edit ${esc(c.name)}">${ic('more')}</button>` : `<small class="num">${c.apps.length}</small>`) + '</div>').join('') +
     (uns.length || org || view === 'unsorted' ? `<div class="rb" role="button" tabindex="0" data-view="unsorted" aria-pressed="${view === 'unsorted' && !term}"><span class="ct plain">${ic('inbox')}</span><span class="nm">Unsorted</span>${uns.length ? `<small class="num badge">${uns.length}</small>` : ''}</div>` : '') +
-    `<div class="rb new" role="button" tabindex="0" data-newcat>${ic('plus')}<span class="nm">New category</span></div>`;
+    `<div class="rb new" data-newcat>${ic('plus')}<span class="nm">New category</span></div>`;
   const rows = (ids, t) => ids.map(id => appRow(byId(id), t)).join('');
   const sec = c => `<h5 data-cat="${c.id}" style="--cc:${COLORS[c.color]}"><i class="dot"></i>${esc(c.name)}<small class="num">${c.apps.length}</small></h5><div class="l-grid" data-cat="${c.id}">` +
-    (c.apps.length ? rows(c.apps) : `<div class="l-none">No apps in ${esc(c.name)} yet. Drag apps here, or use Move to in an app's ⋯ menu.</div>`) + '</div>';
+    (c.apps.length ? rows(c.apps) : `<div class="l-none">No apps in ${esc(c.name)} yet. Drag apps here.</div>`) + '</div>';
   const unsSec = () => `<h5><i class="dot" style="background:var(--ink-3)"></i>Unsorted<small class="num">${uns.length}</small>${uns.some(suggest) ? `<button class="gbtn" data-sortall>${ic('spark')}Sort all as suggested</button>` : ''}</h5>` +
     `<div class="l-grid flat">${uns.length ? rows(uns) : '<div class="l-none">Nothing to sort. Newly installed apps land here until you file them.</div>'}</div>`;
   if (term) {                                                        // search sees the user's own category names
@@ -1027,11 +1444,11 @@ function renderLauncher() {
     if (!hits.some(a => a.id === kbId)) kbId = hits[0]?.id ?? null;
   } else {
     list.innerHTML = view === 'unsorted' ? unsSec() : view !== 'all' ? sec(catById(view))
-      : (LAY.cats.filter(c => org || c.apps.length).map(sec).join('') + (uns.length ? unsSec() : '')) || '<div class="l-empty">No categories yet<small>Create one from the rail, or restore the standard set.</small><br><button class="gbtn" data-bar="reset">Reset to defaults</button></div>';
+      : (LAY.cats.filter(c => org || c.apps.length).map(sec).join('') + (uns.length ? unsSec() : '')) || '<div class="l-empty">No categories yet<small>Drag an app to New category to make one, or restore the standard set.</small><br><button class="gbtn" data-bar="reset">Reset to defaults</button></div>';
     list.scrollTop = keep;
   }
   const bar = $('#l-bar'); bar.hidden = !org;
-  bar.innerHTML = sel.size ? `<span><b>${sel.size}</b> selected</span><button class="gbtn pri" data-bar="move">Move to…</button><button class="gbtn" data-bar="pin">${ic('pin')}Pin</button><button class="gbtn" data-bar="newcat">${ic('plus')}New category</button><button class="gbtn" data-bar="clear">Clear</button>`
+  bar.innerHTML = sel.size ? `<span><b>${sel.size}</b> selected. Drag any ticked app to move them all.</span><button class="gbtn" data-bar="pin">${ic('pin')}Pin</button><button class="gbtn" data-bar="clear">Clear</button>`
     : `<span>Drag apps and categories, or tick apps to move them together.</span><button class="gbtn" data-bar="reset">Reset to defaults</button><button class="gbtn pri" data-bar="done">Done</button>`;
   if (drag?.active) markSrc(drag);
   markKb();
@@ -1043,27 +1460,30 @@ function toggleLauncher(open = L.classList.contains('shut')) {
   if (open) { q.value = ''; view = 'all'; org = false; sel.clear(); kbId = null; $('#l-undo').hidden = true; renderLauncher(); if (!SHOT) q.focus(); }
 }
 $('#start').onclick = e => { e.stopPropagation(); toggleLauncher(); };
+addEventListener('keydown', e => {                                    // typing anywhere in the open launcher searches: the box shows the query, it does not have to be clicked
+  if (L.classList.contains('shut') || e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input') || !$('#l-menu').hidden || editId) return;
+  const ch = e.key.length === 1; if (!ch && e.key !== 'Backspace') return;
+  if (e.key === ' ' && (!q.value || e.target.closest('button,[role=button]'))) return;   // Space still presses a focused button
+  e.preventDefault(); q.focus(); q.value = ch ? q.value + e.key : q.value.slice(0, -1); kbId = null; renderLauncher();
+}, true);
 q.addEventListener('input', renderLauncher);
 
 /* ---- item menu and category editor: every drag action also has a click and a keyboard path ---- */
-function place(m, anchor) {
+function place(m, anchor, at) {                                      // at: the pointer, for a right-click
   m.hidden = false; const s = scale(), lr = L.getBoundingClientRect(), r = (anchor || $('#l-rail')).getBoundingClientRect();
-  const ed = m.id === 'l-edit', x = ed ? 188 : (r.right - lr.left) / s - m.offsetWidth, y = !anchor ? 250 : ed ? (r.top - lr.top) / s - 8 : (r.bottom - lr.top) / s + 4;   // the editor opens beside the rail, not over it
+  const ed = m.id === 'l-edit', x = at ? (at.clientX - lr.left) / s : ed ? 188 : (r.right - lr.left) / s - m.offsetWidth, y = at ? (at.clientY - lr.top) / s : !anchor ? 250 : ed ? (r.top - lr.top) / s - 8 : (r.bottom - lr.top) / s + 4;   // the editor opens beside the rail, not over it
   m.style.left = Math.max(8, Math.min(L.offsetWidth - m.offsetWidth - 8, x)) + 'px'; m.style.top = Math.max(8, Math.min(L.offsetHeight - m.offsetHeight - 8, y)) + 'px';
 }
 const mi = (act, arg, icon, label) => `<button class="mi" role="menuitem" data-mi="${act}" data-arg="${arg}">${ic(icon)}<span>${label}</span></button>`;
-function openMenu(ids, anchor) {
-  closeMenus(); menuIds = ids; const one = ids.length === 1 ? ids[0] : null, c = one && catOf(one), pinned = ids.every(i => LAY.pins.includes(i));
-  $('#l-menu').innerHTML = `<header>${esc(nm(ids))}</header>` + (one ? mi('open', '', 'ret', 'Open') : '') + mi('pin', '', 'pin', pinned ? 'Unpin' : 'Pin to top') + '<h6>Move to</h6>' +
-    LAY.cats.map(k => `<button class="mi" role="menuitem" data-mi="to" data-arg="${k.id}"${c === k ? ' disabled' : ''}>${ctile(k)}<span>${esc(k.name)}</span>${c === k ? ic('check') : ''}</button>`).join('') +
-    mi('new', '', 'plus', 'New category…') + (c ? '<hr>' + mi('step', -1, 'up', 'Move earlier') + mi('step', 1, 'down', 'Move later') : '');
-  place($('#l-menu'), anchor); if (!SHOT) $('#l-menu .mi:not(:disabled)').focus();
+function openMenu(ids, anchor, at) {                                 // the whole menu: Pin or Unpin, and Uninstall. Everything else is drag and drop.
+  closeMenus(); menuIds = ids; const pinned = ids.every(i => LAY.pins.includes(i)), fixed = ids.some(i => SYS.includes(i));
+  $('#l-menu').innerHTML = `<header>${esc(nm(ids))}</header>` + mi('pin', '', 'pin', pinned ? 'Unpin' : 'Pin') +
+    `<button class="mi" role="menuitem" data-mi="uninstall"${fixed ? ' disabled title="Part of Brook"' : ''}>${ic('trash')}<span>Uninstall</span></button>`;
+  place($('#l-menu'), anchor, at); if (!SHOT) $('#l-menu .mi:not(:disabled)').focus();
 }
-function menuAct(act, arg) {
-  const ids = menuIds; closeMenus(); if (!SHOT) q.focus();
-  if (act === 'open') launch(ids[0]); else if (act === 'pin') { sel.clear(); pin(ids); } else if (act === 'new') addCat(ids);
-  else if (act === 'step') step(ids[0], +arg);
-  else if (act === 'to') { sel.clear(); change(`Moved ${nm(ids)} to ${catById(arg).name}`, () => moveApps(order(ids), arg)); }
+function menuAct(act) {
+  const ids = menuIds; closeMenus(); if (!SHOT) q.focus(); sel.clear();
+  if (act === 'pin') pin(ids); else if (act === 'uninstall') uninstall(ids);
 }
 function drawEdit() {
   const c = catById(editId), i = LAY.cats.indexOf(c);
@@ -1101,26 +1521,24 @@ function launcherEsc() {                                             // Esc unwi
 }
 L.addEventListener('click', e => {
   if (justDragged) return; const t = e.target; let m;
-  if (m = t.closest('[data-more]')) return openMenu(sel.has(m.dataset.more) && sel.size > 1 ? [...sel] : [m.dataset.more], m);
   if (m = t.closest('[data-catmore]')) return openEdit(m.dataset.catmore);
   if (m = t.closest('[data-sug]')) { const id = m.dataset.sug, c = suggest(id); return change(`Moved ${byId(id).name} to ${c.name}`, () => moveApps([id], c.id)); }
   if (t.closest('[data-sortall]')) return sortAll();
-  if (m = t.closest('[data-mi]')) return menuAct(m.dataset.mi, m.dataset.arg);
+  if (m = t.closest('[data-mi]')) return menuAct(m.dataset.mi);
   if (m = t.closest('[data-ed]')) return edAct(m.dataset.ed, m.dataset.arg);
   if (t.closest('.menu')) return;
   if (m = t.closest('[data-top]')) { LAY.top = m.dataset.top; save(); return renderLauncher(); }
-  if (t.closest('[data-newcat]')) return addCat([]);
   if (m = t.closest('[data-view]')) { view = m.dataset.view; q.value = ''; kbId = null; return renderLauncher(); }
   if (t.closest('#l-org')) { org = !org; sel.clear(); return renderLauncher(); }
   if (t.closest('[data-undo]')) return undo();
   if (m = t.closest('[data-bar]')) { const a = m.dataset.bar, ids = [...sel];
-    if (a === 'move') return openMenu(ids, m); if (a === 'newcat') return addCat(ids); if (a === 'pin') { sel.clear(); return pin(order(ids)); }
-    if (a === 'reset') return change('Categories reset to defaults', () => { LAY.cats = defaults().cats; view = 'all'; });
+    if (a === 'pin') { sel.clear(); return pin(order(ids)); }
+    if (a === 'reset') return change('Categories reset to defaults', () => { LAY.cats = defaults().cats; LAY.cats.forEach(c => c.apps = c.apps.filter(i => !LAY.gone.includes(i))); view = 'all'; });
     if (a === 'done') org = false; sel.clear(); return renderLauncher(); }
   if (m = t.closest('[data-app]')) return org && !m.matches('.l-tile') ? toggleSel(m.dataset.app) : launch(m.dataset.app);
   if (m = t.closest('[data-launch]')) launch(m.dataset.launch);
 });
-L.addEventListener('contextmenu', e => { const a = e.target.closest('[data-app]'), c = e.target.closest('.rb[data-cat]'); if (!a && !c) return; e.preventDefault(); a ? openMenu([a.dataset.app], a) : openEdit(c.dataset.cat); });
+L.addEventListener('contextmenu', e => { const a = e.target.closest('[data-app]'), c = e.target.closest('.rb[data-cat]'); if (!a && !c) return; e.preventDefault(); a ? openMenu(sel.has(a.dataset.app) && sel.size > 1 ? order([...sel]) : [a.dataset.app], a, e) : openEdit(c.dataset.cat); });
 L.addEventListener('keydown', e => {
   const up = e.key === 'ArrowUp', down = e.key === 'ArrowDown', menu = e.target.closest('.menu'), rb = e.target.closest('.rb');
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && e.target.id !== 'ce-name') { undo(); return e.preventDefault(); }
@@ -1147,7 +1565,8 @@ L.addEventListener('keydown', e => {
 
 /* ---- drag and drop (pointer events, so it works at any stage scale) ---- */
 const clearMarks = () => $$('.drop,.ins-l,.ins-r,.ins-t,.ins-b', L).forEach(e => e.classList.remove('drop', 'ins-l', 'ins-r', 'ins-t', 'ins-b'));
-function markSrc(d) { L.classList.add('dragging'); $$('[data-app],.rb[data-cat]', L).forEach(e => e.classList.toggle('src', d.kind === 'cat' ? e.dataset.cat === d.id : d.ids.includes(e.dataset.app))); }
+function markSrc(d) { L.classList.add('dragging'); L.classList.toggle('dragapp', d.kind === 'app');   // an app in flight is what brings the New category target into being
+  $$('[data-app],.rb[data-cat]', L).forEach(e => e.classList.toggle('src', d.kind === 'cat' ? e.dataset.cat === d.id : d.ids.includes(e.dataset.app))); }
 function makeGhost(d) {
   const g = document.createElement('div'), first = d.kind === 'cat' ? catById(d.id) : byId(d.ids[0]); g.id = 'ghost'; g.className = 'glass';
   g.innerHTML = (d.kind === 'cat' ? ctile(first) : iconOf(first)) + `<span>${esc(first.name)}</span>` + (d.ids && d.ids.length > 1 ? `<b class="n num">${d.ids.length}</b>` : '');
@@ -1174,7 +1593,7 @@ function moveDrag(x, y) {
   if (t) t.el.classList.add(t.cls);
 }
 function endDrag(drop) {
-  const d = drag, t = d.target; drag = null; clearTimeout(springT); springId = null; d.ghost?.remove(); clearMarks(); L.classList.remove('dragging'); $$('.src', L).forEach(e => e.classList.remove('src'));
+  const d = drag, t = d.target; drag = null; clearTimeout(springT); springId = null; d.ghost?.remove(); clearMarks(); L.classList.remove('dragging', 'dragapp'); $$('.src', L).forEach(e => e.classList.remove('src'));
   if (!drop || !t) return; const ids = d.ids;
   if (t.type === 'new') return addCat(ids);
   if (t.type === 'catpos') { if (t.id === d.id) return; const c = catById(d.id);
@@ -1185,7 +1604,7 @@ function endDrag(drop) {
   sel.clear(); change(same ? `Reordered ${nm(ids)} in ${c.name}` : `Moved ${nm(ids)} to ${c.name}`, () => moveApps(ids, c.id, before));
 }
 L.addEventListener('pointerdown', e => {
-  if (!e.target.closest('.menu,[data-more],[data-catmore],[data-bar]')) closeMenus();
+  if (!e.target.closest('.menu,[data-catmore],[data-bar]')) closeMenus();
   if (e.button !== 0 || e.target.closest('button,input,.menu')) return;
   const a = e.target.closest('[data-app]'), c = e.target.closest('.rb[data-cat]'); if (!a && !c) return;
   if (a && q.value.trim()) return;                                      // search results are ranked, not ordered
@@ -1209,6 +1628,7 @@ function stageDrag(ids, pick) {                                         // freez
 function closePanels(except) {
   $$('.fly').forEach(f => f !== except && f.classList.add('shut')); $$('[data-fly]').forEach(b => b.classList.toggle('on', !!except && except.id === 'fly-' + b.dataset.fly));
   if (except !== L) { L.classList.add('shut'); $('#start').classList.remove('on'); closeMenus(); }
+  if (except !== DRW) shutDrawer();
 }
 function fly(name) {
   const f = $('#fly-' + name), open = f.classList.contains('shut'); closePanels(open ? f : null);
@@ -1218,7 +1638,7 @@ function fly(name) {
   f.style.right = Math.max(8, 1600 - mid - 152) + 'px'; f.classList.remove('shut');
 }
 $$('[data-fly]').forEach(b => b.onclick = e => { e.stopPropagation(); fly(b.dataset.fly); });
-stage.addEventListener('pointerdown', e => { if (!e.target.closest('.panel:not(#hud),#taskbar')) closePanels(); });
+stage.addEventListener('pointerdown', e => { if (!e.target.closest('.panel:not(#hud),#taskbar,#drawer,#d-pane,#d-tab,#d-menu,#d-size,#d-grip,.win.peek')) closePanels(); });
 let vol = 62, muted = false;
 function drawVol() {
   const v = $('#vol'); v.value = vol; v.style.setProperty('--pct', vol + '%'); $('#volv').textContent = muted ? 'Off' : vol;
@@ -1303,20 +1723,333 @@ function tick() {
 }
 if (!SHOT) setInterval(tick, 15000);
 
+/* ---------- Side drawer, part 2 (concept, not scheduled; see DESIGN.md "Side drawer") ----------
+   One model, three presentations. An entry is pinned (it lives in the drawer) or a guest (a window stashed for now).
+   A stashed window is hidden and, natively, dropped from the compositor's quad list until it is peeked. */
+const DRW = $('#drawer'), dOn = () => S.drawer !== 'off', dItem = id => DR.items.find(i => i.id === id), isDemo = id => DAPPS.some(a => a.id === id);
+const sd = () => S.drawer === 'side', sideW = () => Math.max(360, Math.min(720, S.dockw)), stripH = () => S.touch ? 52 : 48, pinW = () => sd() && S.dpin ? sideW() : 0;   // side dock: the sidebar's width; pinned, it is outside the work area
+const railW = () => sd() ? sideW() : ({rail:64, cards:336, tabs:52}[S.drawer] || 0);
+// Top dock: a strip on the top edge whose height the user sets. It is outside the work area.
+const dk = () => S.drawer === 'dock', barH = () => S.touch ? 52 : 48, dockMin = () => S.touch ? 44 : 36, dockH = () => dk() ? Math.max(dockMin(), Math.min(96, S.dockh)) : 0;
+const dRight = () => !dk() && S.dedge === 'right', clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const DW = () => dk() ? {send:'Send to dock', where:'dock', si:'dockup', ri:'undock'} : sd() ? {send:'Send to dock', where:'dock', si:'stash', ri:'popout'} : {send:'Stash in drawer', where:'drawer', si:'stash', ri:'popout'};   // wording follows the variant
+const GT = {files:'Home - Files', terminal:'brook: / - Terminal', settings:'Appearance - Settings'};   // a guest's tile shows its window title, which needs no protocol
+const stagePt = (cx, cy) => { const s = scale(), r = stage.getBoundingClientRect(); return [(cx - r.left) / s, (cy - r.top) / s]; };
+const dState = id => WIN[id].closed ? 'off' : !WIN[id].stash ? 'out' : DR.peek === id ? 'sel' : '';
+const dMeta = id => DMETA[id] || (dk() || sd() ? {pv:GT[id] || $('.title', wEl(id)).textContent, t:''} : {pv:$('.title', wEl(id)).textContent + ' window', t:'Stashed'});
+const topDesk = () => Object.keys(WIN).filter(k => visible(k) && !WIN[k].stash).sort((a, b) => WIN[b].z - WIN[a].z)[0];
+const say = t => $('#d-live').textContent = t;
+function pulse() { [$('#dbtn'), $('#d-tab')].forEach(b => { b.classList.remove('pulse'); void b.offsetWidth; b.classList.add('pulse'); }); }
+function closeDMenu() { $('#d-menu').hidden = true; }
+
+function renderDrawer() {
+  const v = S.drawer, on = dOn(), dockv = dk(), H = dockH(), had = DRW.contains(document.activeElement), btn = $('#dbtn'), tabv = $('#d-tab'), right = dRight(), D = DW();
+  const sidev = sd(), pw = pinW();
+  Object.assign(stage.dataset, {drawer:v, dedge:right ? 'right' : 'left', dopen:DR.open ? '1' : '0', dfs:S.dfs ? '1' : '0', dpos:S.dpos, dpinned:pw ? '1' : '0'}); stage.style.setProperty('--d-w', railW() + 'px'); stage.style.setProperty('--dock-h', H + 'px');
+  stage.style.setProperty('--side-w', sideW() + 'px'); stage.style.setProperty('--wa-left', (right ? 0 : pw) + 'px'); stage.style.setProperty('--wa-right', (right ? pw : 0) + 'px'); stage.style.setProperty('--drop-w', (sidev && DR.open ? sideW() : 200) + 'px');
+  const pane = $('#d-pane'); pane.hidden = !(sidev && DR.open); pane.textContent = DR.items.length ? 'Pick an app from the dock.' : 'Nothing docked. Drag a window here, right-click its title bar, or press Super+Shift+S.';
+  $('#d-size').hidden = !dockv; $('#d-grip').hidden = !(dockv && DR.peek); $('#d-drop span').innerHTML = ic(D.si) + D.send;
+  $('#dockh-v').textContent = `${dockv ? H : S.dockh} px. Drag the dock's lower edge to set it.`;
+  $('#d-keys').textContent = sidev || !on ? 'Super+S, or Alt+S in a browser, opens the dock. Super+Shift+S sends the focused window to it. Right-click a title bar or task button, or drag a window to the dock\'s edge. Drag a tile out of the dock to float its window again.'
+    : dockv ? 'Super+S, or Alt+S in a browser, moves to the dock. Super+Shift+S sends the focused window to it. Right-click a title bar or task button, or drag a window onto the dock.'
+    : 'Super+S, or Alt+S in a browser, opens the drawer. Super+Shift+S stashes the focused window. Right-click a title bar or task button, or drag a window to the drawer\'s edge.';
+  const n = DR.items.reduce((s, i) => s + (DMETA[i.id]?.n || 0), 0), att = n || DR.items.some(i => DMETA[i.id]?.dot);
+  btn.hidden = !on || dockv || !!pw; btn.innerHTML = ic('drawer') + (n ? `<b class="d-bdg num">${n > 99 ? '99+' : n}</b>` : att ? '<b class="d-bdg dot"></b>' : '');
+  btn.classList.toggle('on', DR.open); btn.setAttribute('aria-expanded', DR.open); btn.setAttribute('aria-label', (sidev ? 'Dock' : 'Drawer') + (n ? `, ${n} unread` : '')); btn.title = (sidev ? 'Dock' : 'Drawer') + ' (Super+S)';
+  if (on && right && btn.nextElementSibling) $('#taskbar').append(btn); else if (!(on && right) && btn.previousElementSibling !== $('#start')) $('#start').after(btn);   // left: beside the launcher. Right: the bottom-right corner.
+  tabv.hidden = !on || v === 'tabs' || dockv || DR.open; tabv.classList.toggle('att', !!att);
+  DRW.hidden = !on || (v === 'tabs' && !DR.items.length); if (!on) return;
+  DRW.dataset.v = v; DRW.dataset.sz = !dockv ? '' : H < 48 ? 'c' : H < 80 ? 's' : 't';
+  DRW.className = (v === 'tabs' ? '' : 'glass') + (v !== 'tabs' && !dockv && !DR.open ? ' shut' : '') + (DR.open ? ' open' : '');   // the dock strip never shuts
+  const cell = it => {
+    const id = it.id, a = byId(id), m = dMeta(id), st = dState(id);
+    const bdg = m.n ? `<b class="d-bdg num">${m.n > 99 ? '99+' : m.n}</b>` : m.dot ? '<b class="d-bdg dot"></b>' : m.play && st !== 'off' ? `<b class="d-bdg st">${ic('play')}</b>` : '';
+    const label = a.name + (m.n ? `, ${m.n} unread` : m.dot ? ', new activity' : '') + ({off:', not running', out:', on the desktop', sel:', showing'}[st] || '') + (it.pin ? '' : ', stashed for now');
+    // Top dock: the tile is the button and the window info in one. Line two is the app's summary if it publishes one, else its window title. The open tile carries the window's own buttons.
+    if (dockv) return `<div class="d-it ${st}${m.n || m.dot ? ' att' : ''}" role="button" tabindex="0" data-d="${id}" title="${label}" aria-label="${label}"><span class="d-ic">${iconOf(a)}</span>` +
+      `<span class="d-tx"><b>${a.name}</b><span class="pv">${esc(st === 'off' ? 'Not running' : st === 'out' ? 'On the desktop' : st === 'sel' ? $('.title', wEl(id)).textContent : m.pv)}</span></span>` +
+      (st === 'sel' ? `<span class="d-acts"><button class="d-act" data-dout="${id}" aria-label="Return to desktop" title="Return to desktop">${ic('undock')}</button><button class="d-act x" data-dx="${id}" aria-label="Close" title="Close">${ic('close')}</button></span>`
+        : `<span class="d-meta">${st || !m.t ? '' : `<time class="num">${m.t}</time>`}${bdg}</span>`) + '</div>';
+    const icn = `<span class="d-ic">${iconOf(a)}${bdg}</span>`;
+    // Side dock: icons only. The selected page is the one tile with a label; it carries the window's own buttons, so it is the page's title bar. No accent mark: the lighter tile says it.
+    if (sidev && st === 'sel') return `<div class="d-it sel" role="button" tabindex="0" data-d="${id}" title="${label}" aria-label="${label}"><span class="d-ic">${iconOf(a)}</span><span class="d-tx"><b>${a.name}</b><span class="pv">${esc(GT[id] || $('.title', wEl(id)).textContent)}</span></span>` +
+      `<span class="d-acts"><button class="d-act" data-dout="${id}" aria-label="Return to desktop" title="Return to desktop">${ic('popout')}</button><button class="d-act x" data-dx="${id}" aria-label="Close" title="Close">${ic('close')}</button></span></div>`;
+    if (v === 'cards') return `<div class="d-it ${st}" role="button" tabindex="0" data-d="${id}" aria-label="${label}"><span class="d-card">${icn}<b>${a.name}</b><time class="num">${st === 'off' ? 'Not running' : st === 'out' ? 'On the desktop' : m.t}</time>` +
+      `<span class="pv">${esc(m.pv)}</span>${st ? '' : `<div class="d-th" data-th="${id}" inert></div>`}</span><button class="more" data-dmore="${id}" aria-label="More for ${a.name}">${ic('more')}</button></div>`;
+    return `<button class="d-it ${st}" data-d="${id}" title="${label}" aria-label="${label}">${v === 'tabs' ? `<i class="d-chip${m.n || m.dot ? ' att' : ''}" style="background:${a.hue || '#a9b8cc'}"></i>` : ''}${icn}</button>`;
+  };
+  const pins = DR.items.filter(i => i.pin), guests = DR.items.filter(i => !i.pin);
+  const list = pins.map(cell).join('') + (pins.length && guests.length ? '<i class="d-sep"></i>' : '') + guests.map(cell).join('');
+  const addT = dockv ? 'Send the focused window to the dock' : 'Stash the focused window';
+  const add = `<button class="${v === 'cards' ? 'ibtn' : 'd-add'} flipx" data-dadd aria-label="${addT}" title="${addT} (Super+Shift+S)">${v === 'cards' ? ic('stash') : `<span>${ic('plus')}</span>`}</button>`;
+  const none = dockv ? 'Nothing docked. Drag a window here, right-click its title bar, or press Super+Shift+S.' : 'Nothing stashed. Drag a window to this edge, right-click its title bar, or press Super+Shift+S.';
+  DRW.innerHTML = sidev ? `<div class="d-list" role="group" aria-label="Docked apps">${list}<i class="d-slot">${ic('plus')}<span>Drop to dock</span></i></div>` +
+      `<button class="d-add" data-dpin aria-pressed="${S.dpin}" aria-label="Pin dock open" title="${S.dpin ? 'Unpin: the dock closes when you click away' : 'Pin dock open'}"><span>${ic('pin')}</span></button>`
+    : dockv ? `<div class="d-list" role="group" aria-label="Docked apps">${list || `<span class="d-hint">${none}</span>`}<i class="d-slot">${ic('dockup')}Drop to dock</i></div>` + add
+    : v === 'cards'
+    ? `<header class="d-hd"><span class="eyebrow">Drawer</span><small>${DR.items.length} ${DR.items.length === 1 ? 'app' : 'apps'}${n ? ` · ${n} unread` : ''}</small>${add}<button class="ibtn" data-dclose aria-label="Close drawer">${ic('close')}</button></header><div class="d-list">${list || `<div class="d-none">${none}</div>`}</div>`
+    : `<div class="d-list" role="group" aria-label="Stashed apps">${list}</div>` + (v === 'rail' ? add + (list ? '' : `<div class="d-empty">${none}</div>`) : '');
+  // Card thumbnails: a static copy, as captured at stash time. Never live.
+  $$('.d-th', DRW).forEach(th => { const el = wEl(th.dataset.th), c = $('.client', el).cloneNode(true), w = el.offsetWidth; $$('[id]', c).forEach(e => e.removeAttribute('id'));
+    Object.assign(c.style, {width:w + 'px', height:el.offsetHeight - 40 + 'px', transform:`scale(${th.clientWidth / w})`}); th.append(c); });
+  if (had && DR.kb && !SHOT) $(`.d-it[data-d="${DR.kb}"]`, DRW)?.focus();
+  placePanel();
+}
+function placePanel() {                                               // top dock: the open app hangs under its own tile, kept on screen
+  const id = dk() && DR.peek, g = $('#d-grip'); if (!id) return; const el = wEl(id), t = $(`.d-it[data-d="${id}"]`, DRW); if (!t) return;
+  el.style.left = Math.round(clamp(stagePt(t.getBoundingClientRect().left, 0)[0], 0, 1600 - el.offsetWidth)) + 'px'; wpos(el);
+  g.style.left = el.offsetLeft + el.offsetWidth - 18 + 'px'; g.style.top = el.offsetTop + el.offsetHeight - 18 + 'px';
+}
+// A peek docks the real window beside the drawer: its own width (360 to 720), the full work-area height. Its floating geometry is kept for the return.
+function dock(id) {
+  const w = WIN[id], el = wEl(id); if (!w.geo) w.geo = ['left','top','width','height'].map(k => el.style[k]);
+  const wd = Math.max(360, Math.min(720, parseFloat(w.geo[2])));
+  if (sd()) Object.assign(el.style, {left:(dRight() ? 1600 - sideW() : 0) + 'px', top:(S.dpos === 'top' ? stripH() : 0) + 'px', width:sideW() + 'px', height:900 - barH() - stripH() + 'px'});   // the sidebar's width, whatever the window's own was
+  else if (dk()) Object.assign(el.style, {top:dockH() + 'px', width:(w.dsz ? w.dsz[0] : wd) + 'px', height:w.dsz ? Math.min(w.dsz[1], 900 - barH() - dockH()) + 'px' : 'calc(900px - var(--h-bar) - var(--dock-h))'});   // left is set by placePanel
+  else Object.assign(el.style, {left:(dRight() ? 1600 - railW() - wd : railW()) + 'px', top:'0px', width:wd + 'px', height:'calc(900px - var(--h-bar))'});
+  wpos(el);
+}
+function undock(id) { const w = WIN[id], el = wEl(id); if (!w.geo) return; ['left','top','width','height'].forEach((k, i) => el.style[k] = w.geo[i]); w.geo = null; belowDock(id); besideDock(id); wpos(el); }
+function besideDock(id) { const el = wEl(id), p = pinW(); if (!p || WIN[id].geo || WIN[id].stash) return;   // floating windows live in the work area: beside a pinned side dock
+  const x = parseFloat(el.style.left) || 0; if (!dRight() && x < p) el.style.left = p + 8 + 'px'; else if (dRight() && x + el.offsetWidth > 1600 - p) el.style.left = Math.max(0, 1600 - p - el.offsetWidth - 8) + 'px'; wpos(el); }
+// Side dock: open always shows a page if there is one to show: the last one used, else the first that is running.
+const sideLive = id => !!id && !!dItem(id) && WIN[id].stash && !WIN[id].closed;
+const sidePage = () => sideLive(DR.last) ? DR.last : DR.items.find(i => sideLive(i.id))?.id || null;
+function sideRefill() { if (!sd()) return; if (S.dpin) DR.open = true; if (DR.open && !sideLive(DR.peek)) DR.peek = sidePage(); if (DR.peek) { DR.last = DR.peek; const m = DMETA[DR.peek]; if (m) m.n = 0, m.dot = false; dock(DR.peek); } }
+function belowDock(id) { const el = wEl(id); if (dk() && !WIN[id].geo && parseFloat(el.style.top) < dockH()) { el.style.top = dockH() + 8 + 'px'; wpos(el); } }   // floating windows live in the work area
+function drawerSync() {
+  sideRefill();
+  for (const id in WIN) { const el = wEl(id), pk = DR.peek === id, b = $('[data-act=stash]', el);
+    el.classList.toggle('peek', pk); el.classList.toggle('stashed', !!WIN[id].stash && !pk); el.classList.toggle('dpin', !!dItem(id) && !WIN[id].stash);
+    $('span', b).innerHTML = ic(pk ? DW().ri : DW().si); b.title = pk ? 'Return to desktop' : DW().send; b.setAttribute('aria-label', b.title); setGone(id); }
+  stage.style.setProperty('--d-used', (DR.open ? railW() : 0) + (DR.peek && !dk() && !sd() ? wEl(DR.peek).offsetWidth : 0) + 'px');
+  focusWin(DR.peek || undefined); renderDrawer();
+}
+function drawerApply() {                                              // called from apply(): variant or edge changed
+  if (!dOn()) { DR.open = false; DR.peek = null; DR.items = DAPPS.map(a => ({id:a.id, pin:true})); for (const id in WIN) { undock(id); WIN[id].stash = isDemo(id); if (WIN[id].fs) setFs(id, false); } closeDMenu(); }   // Off also resets the demo
+  else if (S.drawer === 'cards') DR.peek = null; else if (DR.peek) dock(DR.peek);
+  if (dk()) Object.keys(WIN).forEach(belowDock);
+  if (pinW()) Object.keys(WIN).forEach(besideDock);
+  setFs(); drawerSync();
+}
+function setDrawer(open, peek = null) {
+  if (!dOn()) return;
+  if (open) closePanels(DRW);                                         // launcher and flyouts close: the drawer never adds to their glass
+  if (sd() && open && !peek) peek = DR.peek;                          // the side dock opens on a page, not on bare icons; sideRefill picks one if there is none
+  closeDMenu(); DR.open = !!open || !!pinW(); DR.peek = DR.open ? peek : null; if (DR.peek) dock(DR.peek);
+  drawerSync();
+}
+function shutDrawer() { if (DR.open || DR.peek) setDrawer(false); }
+function dPick(id) {                                                  // click, Enter or a digit on an entry
+  const w = WIN[id], m = DMETA[id]; DR.kb = id;
+  if (!w.stash && !w.closed) { setDrawer(false); return openWin(id); }   // out on the desktop: focus it there
+  w.closed = w.min = false; w.stash = true; if (m) m.n = 0, m.dot = false;   // the app clears its own attention once it is seen
+  if (S.drawer === 'cards') return unstash(id);                       // the shelf has no peek: a card returns its window
+  if (sd() && DR.peek === id) return void (S.dpin || setDrawer(false));   // the selected tile again: hide the dock, unless it is pinned
+  setDrawer(true, DR.peek === id ? null : id);
+}
+function stash(id) {
+  const w = WIN[id]; if (!dOn() || !w || w.closed || w.stash) return;
+  if (w.fs) setFs(id, false); if (w.max) winAct(id, 'max'); w.stash = true; w.min = false; if (!dItem(id)) DR.items.push({id, pin:false});
+  drawerSync(); pulse(); $(`.d-it[data-d="${id}"]`, DRW)?.classList.add('pulse'); say(byId(id).name + (dk() || sd() ? ' sent to the dock' : ' stashed in the drawer'));
+}
+// Where a window lands when its tile is dragged out of the dock: under the pointer, inside the work area. Its size is the one it had before it was docked.
+function landAt(id, at) { const w = WIN[id], el = wEl(id), ww = w.geo ? parseFloat(w.geo[2]) : el.offsetWidth, wh = w.geo ? parseFloat(w.geo[3]) : el.offsetHeight, p = pinW();
+  return [Math.round(clamp(at[0] - 90, dRight() ? 0 : p, 1600 - ww - (dRight() ? p : 0))), Math.round(clamp(at[1] - 20, dockH(), 780)), ww, wh]; }
+function unstash(id, at) {                                            // back to an ordinary window; a guest's entry goes with it
+  const w = WIN[id], it = dItem(id), el = wEl(id); w.stash = w.closed = w.min = false; undock(id);
+  if (at) { const r = landAt(id, at); el.style.left = r[0] + 'px'; el.style.top = r[1] + 'px'; wpos(el); }
+  if (it && !it.pin) DR.items.splice(DR.items.indexOf(it), 1);
+  DR.open = false; DR.peek = null; closeDMenu(); drawerSync(); focusWin(id); say(byId(id).name + ' returned to the desktop');
+}
+function dClose(id) { const w = WIN[id], it = dItem(id); w.closed = true; if (DR.peek === id) DR.peek = null; if (it && !it.pin) { DR.items.splice(DR.items.indexOf(it), 1); w.stash = false; undock(id); } drawerSync(); }
+function dRemove(id) { const it = dItem(id), w = WIN[id]; if (!it) return; it.pin = false; if (w.stash && !w.closed) return unstash(id);
+  DR.items.splice(DR.items.indexOf(it), 1); if (w.closed) { w.stash = false; undock(id); } drawerSync(); }
+function dKeep(id) { const it = dItem(id); DR.items.splice(DR.items.indexOf(it), 1); it.pin = true; DR.items.splice(DR.items.filter(i => i.pin).length, 0, it); renderDrawer(); }
+function dMove(id, d) { const i = DR.items.findIndex(x => x.id === id), j = i + d; if (i < 0 || !DR.items[j] || DR.items[j].pin !== DR.items[i].pin) return;   // reordering stays inside its group
+  [DR.items[i], DR.items[j]] = [DR.items[j], DR.items[i]]; DR.kb = id; renderDrawer(); say(`${byId(id).name}, position ${j + 1} of ${DR.items.length}`); }
+function drawerAct(id, act) {                                         // caption buttons on drawer windows; true means handled
+  if (act === 'stash') { DR.peek === id ? unstash(id) : stash(id); return true; }
+  if (DR.peek !== id) return false;
+  if (act === 'min') setDrawer(true, null); else if (act === 'close') dClose(id);
+  return true;                                                        // a peek does not maximise
+}
+function drawerEsc() {                                                // Esc unwinds: menu, drag, peek, drawer
+  if (!$('#d-menu').hidden) { closeDMenu(); return true; }
+  if (dd && dd.active) { endDD(false); return true; }
+  if (sd()) { if (DR.open && !S.dpin) { setDrawer(false); return true; } return false; }   // the side dock has one level; pinned, Esc is not its key
+  if (DR.peek) { DR.kb = DR.peek; setDrawer(true, null); if (!SHOT) $(`.d-it[data-d="${DR.kb}"]`, DRW)?.focus(); return true; }
+  if (DR.open) { setDrawer(false); return true; }
+  return false;
+}
+// True fullscreen (a game, a video): the window takes the whole screen and the dock is not drawn. With "keep the dock over fullscreen" it takes the screen below the dock instead.
+function setFs(id, on) {
+  if (id) { WIN[id].fs = on; wEl(id).classList.toggle('fs', on); if (on) focusWin(id); }
+  const any = Object.keys(WIN).some(k => WIN[k].fs && visible(k)), keep = dk() && S.dfs, h = $('#fs-hint');
+  stage.dataset.fs = any ? '1' : '0'; h.hidden = !any; h.style.setProperty('--fs-top', (keep ? dockH() : 0) + 'px');
+  h.innerHTML = ic('full') + (keep ? 'Fullscreen below the dock. Esc or F11 leaves it.' : dk() ? 'Fullscreen covers the dock. Esc or F11 leaves it; Super+S shows the dock.' : 'Fullscreen. Esc or F11 leaves it.');
+  for (const k in WIN) wpos(wEl(k));
+}
+const fsWin = () => Object.keys(WIN).find(k => WIN[k].fs && visible(k));
+function stashFocused() { if (DR.peek) return unstash(DR.peek); const id = topDesk(); id ? stash(id) : say('No window to stash'); }
+function stashDrag(id) {                                              // hook for a titlebar drag: the drawer's edge is a drop target
+  const el = wEl(id), from = [el.style.left, el.style.top], zone = m => { const [x, y] = stagePt(m.clientX, m.clientY), zw = sd() && DR.open ? sideW() : 28; return dk() ? y < dockH() : y < 900 - barH() && (dRight() ? x > 1600 - zw : x < zw); };   // an open side dock is a drop target across its whole width
+  return {mv:m => { const z = zone(m); $('#d-drop').classList.toggle('on', z); if (dk() || sd()) { DRW.classList.add('dropping'); DRW.classList.toggle('over', z); } },   // top dock: a slot shows where the tile will land as soon as the drag starts
+    up:() => { const z = $('#d-drop').classList.contains('on'); $('#d-drop').classList.remove('on'); DRW.classList.remove('dropping', 'over'); if (z) { WIN[id].geo = [...from, el.style.width, el.style.height]; stash(id); } }};   // it returns to where the drag began
+}
+
+/* ---- menus: every drag has a menu and a keyboard path ---- */
+function dMenu(title, items, x, y, right) {
+  const m = $('#d-menu');
+  m.innerHTML = `<header>${esc(title)}</header>` + items.filter(Boolean).map(i => i === '-' ? '<hr>' : `<button class="mi${/stash|popout/.test(i[1]) ? ' flipx' : ''}" role="menuitem" data-dm="${i[0]}" data-arg="${i[3] ?? ''}"${i[4] ? ' disabled' : ''}>${ic(i[1])}<span>${i[2]}</span></button>`).join('');
+  m.hidden = false; m.style.left = Math.max(8, Math.min(1592 - m.offsetWidth, right ? x - m.offsetWidth : x)) + 'px'; m.style.top = Math.max(8, Math.min(844 - m.offsetHeight, y)) + 'px';
+  if (!SHOT) $('.mi:not(:disabled)', m).focus();
+}
+function entryMenu(id, anchor, e) {
+  const it = dItem(id); if (!it) return; const st = dState(id), i = DR.items.indexOf(it), same = j => DR.items[j] && DR.items[j].pin === it.pin, right = dRight(), cards = S.drawer === 'cards', hz = dk() || sd(), D = DW();
+  let x, y; if (anchor) { const r = anchor.getBoundingClientRect(); [x, y] = hz ? stagePt(r.left, sd() && S.dpos === 'bottom' ? r.top - 250 : r.bottom + 6) : stagePt(right ? r.left - 6 : r.right + 6, r.top); } else [x, y] = stagePt(e.clientX, e.clientY);
+  DR.menuId = id;
+  dMenu(byId(id).name, [
+    st === 'off' ? ['pick','ret',`Open in the ${D.where}`] : st === 'out' ? ['pick','ret','Show window'] : cards ? ['pick','popout','Return to desktop'] : st === 'sel' && pinW() ? null : ['pick','ret', st === 'sel' ? 'Hide' : hz ? 'Open' : 'Peek'],
+    st === 'out' ? ['stash',D.si, hz ? 'Send to dock' : 'Stash again'] : st !== 'off' && !cards ? ['out',D.ri,'Return to desktop'] : null,
+    '-', ['mv', hz ? 'back' : 'up', hz ? 'Move left' : 'Move up',-1,!same(i - 1)], ['mv', hz ? 'fwd' : 'down', hz ? 'Move right' : 'Move down',1,!same(i + 1)], '-',
+    it.pin ? ['unpin','trash',`Remove from ${D.where}`] : ['pin','pin',`Keep in ${D.where}`], st !== 'off' ? ['close','close','Close'] : null], x, y, anchor && right);
+}
+function winMenu(id, e) {                                             // title bar or task button, right-click or long press
+  const w = WIN[id], [x, y] = stagePt(e.clientX, e.clientY); DR.menuId = id;
+  dMenu(byId(id).name, [['stash',DW().si,DW().send], '-', ['wmin','min', w.min ? 'Restore' : 'Minimise'], ['wmax','max', w.max ? 'Restore size' : 'Maximise'], ['wfs','full', w.fs ? 'Leave fullscreen' : 'Fullscreen'], ['close','close','Close']], x, y);
+}
+$('#d-menu').addEventListener('click', e => { const b = e.target.closest('[data-dm]'); if (!b) return; const id = DR.menuId; closeDMenu();
+  ({pick:() => dPick(id), out:() => unstash(id), stash:() => stash(id), mv:() => dMove(id, +b.dataset.arg), pin:() => dKeep(id), unpin:() => dRemove(id), close:() => dClose(id),
+    wmin:() => WIN[id].min ? openWin(id) : winAct(id, 'min'), wmax:() => winAct(id, 'max'), wfs:() => { if (WIN[id].min) openWin(id); setFs(id, !WIN[id].fs); }})[b.dataset.dm](); });
+$('#d-menu').addEventListener('keydown', e => { const it = $$('.mi:not(:disabled)', e.currentTarget), i = it.indexOf(document.activeElement), d = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
+  if (d) { it[(i + d + it.length) % it.length].focus(); e.preventDefault(); } });
+stage.addEventListener('pointerdown', e => { if (!e.target.closest('#d-menu')) closeDMenu(); }, true);
+
+/* ---- opening: taskbar button, edge tab (click or pull), Super+S ---- */
+$('#dbtn').onclick = () => setDrawer(!DR.open);
+$('#d-tab').onclick = () => setDrawer(true);
+$('#d-tab').onpointerdown = e => {                                    // pull the tab inward: the pointer and touch version of the edge swipe
+  const x0 = e.clientX, mv = m => { if (Math.abs(m.clientX - x0) > 16 * scale()) { up(); setDrawer(true); } }, up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+};
+let dd = null, dJust = false;
+DRW.addEventListener('click', e => {
+  if (dJust) return; const t = e.target; let m;
+  if (m = t.closest('[data-dmore]')) return entryMenu(m.dataset.dmore, m);
+  if (t.closest('[data-dadd]')) return DR.peek ? unstash(DR.peek) : topDesk() ? stash(topDesk()) : say('No window to stash');
+  if (t.closest('[data-dclose]')) return setDrawer(false);
+  if (t.closest('[data-dpin]')) return set('dpin', !S.dpin);
+  if (m = t.closest('[data-dout]')) return unstash(m.dataset.dout);         // the open tile's own buttons: the window's title bar lives in its tile
+  if (m = t.closest('[data-dx]')) return dClose(m.dataset.dx);
+  if (m = t.closest('[data-d]')) dPick(m.dataset.d);
+});
+DRW.addEventListener('contextmenu', e => { const m = e.target.closest('[data-d]'); if (!m) return; e.preventDefault(); entryMenu(m.dataset.d, m); });
+DRW.addEventListener('focusin', e => { const m = e.target.closest('.d-it'); if (m) DR.kb = m.dataset.d; });
+DRW.addEventListener('keydown', e => {                                // same keys as the launcher: arrows move, Alt+arrows reorder, Alt+Enter opens the menu
+  const it = $$('.d-it', DRW), i = it.indexOf(e.target.closest('.d-it')); if (i < 0 || e.target.closest('.more,.d-act')) return;
+  const id = it[i].dataset.d, hz = dk() || sd(), up = e.key === (hz ? 'ArrowLeft' : 'ArrowUp'), down = e.key === (hz ? 'ArrowRight' : 'ArrowDown');   // the dock runs left to right
+  if (e.altKey && (up || down)) dMove(id, up ? -1 : 1);
+  else if (up || down) it[(i + (down ? 1 : -1) + it.length) % it.length].focus();
+  else if ((e.altKey && e.key === 'Enter') || e.key === 'ContextMenu') entryMenu(id, it[i]);
+  else if (e.shiftKey && e.key === 'Enter') { if (WIN[id].stash && !WIN[id].closed) unstash(id); }
+  else if (e.key === 'Delete') dRemove(id);
+  else if ((e.key === 'Enter' || e.key === ' ') && it[i].tagName !== 'BUTTON') dPick(id);
+  else return;
+  e.preventDefault();
+});
+/* ---- dragging an entry: along the drawer to reorder, off it to return the window to the desktop ---- */
+DRW.addEventListener('pointerdown', e => {
+  const it = e.target.closest('.d-it'); if (!it || e.button || e.target.closest('.more,.d-act')) return;
+  dd = {id:it.dataset.d, x:e.clientX, y:e.clientY};
+  if (e.pointerType === 'touch') dd.hold = setTimeout(() => { if (dd && !dd.active) { entryMenu(dd.id, it); dd = null; dJust = true; setTimeout(() => dJust = false, 400); } }, 500);   // long press opens the menu
+});
+addEventListener('pointermove', e => { if (!dd || dd.staged) return; if (!dd.active) { if (Math.hypot(e.clientX - dd.x, e.clientY - dd.y) < 6) return; startDD(); } moveDD(e.clientX, e.clientY); });
+addEventListener('pointerup', e => { if (!dd || dd.staged) return; clearTimeout(dd.hold); if (!dd.active) return void (dd = null); endDD(true, e); dJust = true; setTimeout(() => dJust = false, 0); });
+function startDD() {
+  clearTimeout(dd.hold); dd.active = true; const a = byId(dd.id), g = document.createElement('div'); g.id = 'ghost'; g.className = 'glass'; g.innerHTML = iconOf(a) + `<span class="gl">${a.name}</span>`;
+  stage.append(g); dd.ghost = g; DRW.classList.add('dragging'); $(`.d-it[data-d="${dd.id}"]`, DRW).classList.add('src');
+}
+function moveDD(cx, cy) {
+  ghostTo(dd.ghost, cx, cy); $$('.ins-t,.ins-b', DRW).forEach(e => e.classList.remove('ins-t', 'ins-b'));
+  const r = DRW.getBoundingClientRect(), a = byId(dd.id), live = WIN[dd.id].stash && !WIN[dd.id].closed;
+  const hz = dk() || sd(), [sx, sy] = stagePt(cx, cy);
+  dd.out = dk() ? cy > r.bottom + 12 : sd() ? sy > 900 - barH() || (dRight() ? sx < 1600 - sideW() - 12 : sx > sideW() + 12) : cx < r.left - 12 || cx > r.right + 12 || cy < r.top || cy > r.bottom; dd.before = dd.id;   // side dock: out means out of the whole sidebar, not just its strip
+  $('.gl', dd.ghost).textContent = dd.out && live ? a.name + ' · float on the desktop' : a.name;
+  const land = $('#d-land'); land.hidden = !(dd.out && live); if (!land.hidden) { const g = landAt(dd.id, [sx, sy]); Object.assign(land.style, {left:g[0] + 'px', top:g[1] + 'px', width:g[2] + 'px', height:g[3] + 'px'}); }   // where the window will be
+  if (dd.out) return;
+  const its = $$('.d-it', DRW).filter(e => dItem(e.dataset.d).pin === dItem(dd.id).pin), t = its.find(e => { const b = e.getBoundingClientRect(); return hz ? cx < b.left + b.width / 2 : cy < b.top + b.height / 2; });
+  dd.before = t ? t.dataset.d : null; (t || its.at(-1)).classList.add(t ? 'ins-t' : 'ins-b');
+}
+function endDD(drop, e) {
+  const d = dd, it = dItem(d.id); dd = null; d.ghost.remove(); DRW.classList.remove('dragging'); $('#d-land').hidden = true;
+  if (drop && d.out && WIN[d.id].stash && !WIN[d.id].closed) return unstash(d.id, stagePt(e.clientX, e.clientY));
+  if (drop && !d.out && d.before !== d.id) { DR.items.splice(DR.items.indexOf(it), 1);
+    DR.items.splice(d.before ? DR.items.findIndex(x => x.id === d.before) : it.pin ? DR.items.filter(x => x.pin).length : DR.items.length, 0, it); }
+  renderDrawer();
+}
+/* ---- top dock: its height, and the open panel's size ---- */
+const SNAP = [36, 56, 80], dockLines = h => h < 48 ? 'one line' : h < 80 ? 'two lines' : 'three lines';
+const snapH = y => { let h = clamp(Math.round(y), dockMin(), 96); for (const sn of SNAP) if (Math.abs(h - sn) <= 5 && sn >= dockMin()) h = sn; return h; };
+function guide(h) { const g = $('#d-guide'); g.hidden = h == null; $('#d-size').classList.toggle('on', h != null); if (h != null) { g.style.top = h + 'px'; $('span', g).textContent = `${h} px · ${dockLines(h)}`; } }
+$('#d-size').onpointerdown = e => {                                    // a guide while dragging; the height is applied once, on release
+  if (e.button) return; e.preventDefault(); let h = dockH();
+  const mv = m => guide(h = snapH(stagePt(m.clientX, m.clientY)[1])), up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); guide(null); set('dockh', h); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+};
+$('#d-size').ondblclick = () => set('dockh', DEF.dockh);
+$('#d-grip').onpointerdown = e => {                                    // the open panel is an ordinary window resize: width 360 to 720, height down to the taskbar
+  const id = DR.peek, el = id && wEl(id); if (!el || e.button) return; e.preventDefault();
+  const mv = m => { const [x, y] = stagePt(m.clientX, m.clientY); WIN[id].dsz = [clamp(Math.round(x - el.offsetLeft), 360, 720), clamp(Math.round(y - el.offsetTop), 320, 900 - barH() - dockH())];
+    el.style.width = WIN[id].dsz[0] + 'px'; el.style.height = WIN[id].dsz[1] + 'px'; placePanel(); }, up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+};
+function dMsg() {                                                     // study bar: an app raises attention while stashed
+  if (!dOn()) set('drawer', 'side'); const m = DMETA.chat; if (DR.peek !== 'chat') m.n++; m.pv = 'Mira: Pushed. Can you take a look?'; m.t = 'now';
+  toast({icon:'chat', title:'Chat', body:'Mira Okafor: Pushed. Can you take a look?'}); renderDrawer(); pulse();
+}
+const CURSOR = '<svg class="cur" viewBox="0 0 18 18"><path d="M3 2v12l3.2-3 2 4.5 2-.9-2-4.4h4.300z" fill="#fff" stroke="#111" stroke-width="1"/></svg>';
+function drawerScene(scene) {                                         // staged states for the screenshots
+  const app = Q.get('dapp') || 'chat', right = dRight(), H = dockH();
+  (Q.get('dstash') || '').split(',').filter(k => WIN[k]).forEach(stash);
+  if (scene === 'drawer') setDrawer(true);
+  if (scene === 'dpeek') dPick(app);
+  if (scene === 'dout') { unstash(app); setDrawer(true); }
+  if (scene === 'dmenu') { setDrawer(true); entryMenu(app, $(`.d-it[data-d="${app}"]`, DRW)); }
+  if (scene === 'dwinmenu') { const r = $('.tb', wEl('files')).getBoundingClientRect(); focusWin('files'); winMenu('files', {clientX:r.left + r.width * .3, clientY:r.top + r.height * .7}); }
+  if (scene === 'dreorder') { setDrawer(true); dd = {id:'music', staged:true}; startDD(); const r = $('.d-it[data-d="mail"]', DRW).getBoundingClientRect(); moveDD(r.left + r.width * .62, r.top + r.height * .3); dd.ghost.insertAdjacentHTML('afterbegin', CURSOR); }
+  if (scene === 'ddrag' && sd()) { if (!Q.has('dshut')) setDrawer(true); const el = wEl('files'), z = DR.open ? sideW() : 28; focusWin('files'); el.style.left = (right ? 1600 - z - 610 : pinW() || z - 190) + 'px'; el.style.top = '150px'; wpos(el); $('#d-drop').classList.add('on'); DRW.classList.add('dropping', 'over');
+    stage.insertAdjacentHTML('beforeend', CURSOR.replace('class="cur"', `style="position:absolute;z-index:999;width:18px;height:18px;top:164px;${right ? 'right' : 'left'}:${Math.round(z * .55)}px"`)); }
+  else if (scene === 'ddrag' && dk()) { const el = wEl('files'); focusWin('files'); el.style.left = '430px'; el.style.top = H + 'px'; wpos(el); $('#d-drop').classList.add('on'); DRW.classList.add('dropping', 'over');
+    stage.insertAdjacentHTML('beforeend', CURSOR.replace('class="cur"', `style="position:absolute;z-index:999;width:18px;height:18px;top:${Math.round(H * .55)}px;left:640px"`)); }
+  else if (scene === 'ddrag') { const el = wEl('files'); focusWin('files'); el.style.left = (right ? 1010 : -210) + 'px'; el.style.top = '150px'; wpos(el); $('#d-drop').classList.add('on');
+    stage.insertAdjacentHTML('beforeend', CURSOR.replace('class="cur"', `style="position:absolute;z-index:999;width:18px;height:18px;top:164px;${right ? 'right:2px' : 'left:14px'}"`)); }
+  if (scene === 'dtear') { setDrawer(true, app); dd = {id:app, staged:true}; startDD(); const r = stage.getBoundingClientRect(), k = scale(), x = +(Q.get('dx') || 760), y = +(Q.get('dy') || 210); moveDD(r.left + x * k, r.top + y * k); dd.ghost.insertAdjacentHTML('afterbegin', CURSOR); }   // a tile dragged out of the dock
+  if (scene === 'dtaskmenu') { const r = $('[data-task=terminal]').getBoundingClientRect(); winMenu('terminal', {clientX:r.left + r.width * .5, clientY:r.top + 2}); }
+  if (scene === 'dmax' || scene === 'dresize') { winAct(Q.get('dwin') || 'files', 'max'); if (Q.has('dapp')) dPick(app); }
+  if (scene === 'dresize') { const to = +Q.get('dto') || 80; guide(to); stage.insertAdjacentHTML('beforeend', CURSOR.replace('class="cur"', `style="position:absolute;z-index:999;width:18px;height:18px;top:${to - 2}px;left:812px"`)); }
+  if (scene === 'dfull') setFs(Q.get('dwin') || 'terminal', true);
+}
+
 /* ---------- Study bar, keys, fit ---------- */
 $('#study').addEventListener('click', e => {
   const t = e.target.closest('[data-toggle]'); if (t) return set(t.dataset.toggle, !S[t.dataset.toggle]);
   const d = e.target.closest('[data-do]'); if (!d) return;
   const k = d.dataset.do;
   if (k === 'launcher') toggleLauncher(); else if (k === 'organise') { toggleLauncher(true); org = true; renderLauncher(); } else if (k === 'install') install(); else if (k === 'hud') set('hud', {off:'compact', compact:'expanded', expanded:'off'}[S.hud]);
+  else if (k === 'drawer') { if (!dOn()) set('drawer', 'side'); dk() ? dPick(DR.peek || DR.items[0]?.id || 'chat') : setDrawer(!DR.open); } else if (k === 'dmsg') dMsg();
   else if (k === 'reset') { try { localStorage.removeItem(KEY); localStorage.removeItem(LKEY); } catch {} location.href = location.pathname; } else T[k]();
 });
 addEventListener('pointerdown', e => { if (e.pointerType === 'touch' && !S.touch) set('touch', true); }, true);
 addEventListener('keydown', e => {
-  if (e.key === 'Escape') { if (!launcherEsc()) closePanels(); }
+  if (e.key === 'F11' && dOn()) { e.preventDefault(); const f = fsWin() || topDesk(); if (f) setFs(f, !WIN[f].fs); }
+  else if (e.key === 'Escape') { if (!drawerEsc() && !launcherEsc()) { if (fsWin()) setFs(fsWin(), false); else closePanels(); } }
+  else if ((e.metaKey || e.altKey) && e.key.toLowerCase() === 's' && dOn()) { e.preventDefault(); chord = e.metaKey; e.shiftKey ? stashFocused() : (setDrawer(!DR.open), DR.open && !SHOT && $('.d-it', DRW)?.focus()); }
+  else if (DR.open && L.classList.contains('shut') && /^[1-9]$/.test(e.key) && !e.target.closest('input') && DR.items[e.key - 1]) dPick(DR.items[e.key - 1].id);
   else if (e.altKey && e.key.toLowerCase() === 'p') { e.preventDefault(); set('hud', {off:'compact', compact:'expanded', expanded:'off'}[S.hud]); }
 });
-addEventListener('keyup', e => { if (e.key === 'Meta') toggleLauncher(); });
+let chord = false;                                                     // Super used as a modifier must not also open the launcher
+addEventListener('keyup', e => { if (e.key === 'Meta') { if (chord) chord = false; else toggleLauncher(); } });
 function fit() {
   const bar = SHOT ? 0 : $('#study').offsetHeight, s = Math.min(innerWidth / 1600, (innerHeight - bar) / 900), f = $('#fit');
   stage.style.transform = `scale(${s})`; f.style.width = 1600 * s + 'px'; f.style.height = 900 * s + 'px';
@@ -1333,13 +2066,16 @@ if (scene === 'launcher' || scene === 'search') { toggleLauncher(true); if (scen
 // Staged launcher states for the screenshots.
 const rowOf = id => $(`#l-list .app[data-app="${id}"]`);
 if (scene === 'organise') { toggleLauncher(true); org = true; ['doom','quake2','gimp'].forEach(i => sel.add(i)); renderLauncher(); $('#l-list').scrollTop = 9999; }
-if (scene === 'menu') { toggleLauncher(true); kbId = 'ladybird'; markKb(); openMenu(['ladybird'], $('.more', rowOf('ladybird'))); }
+if (scene === 'menu') { toggleLauncher(true); kbId = 'ladybird'; markKb(); const r = rowOf('ladybird').getBoundingClientRect(); openMenu(['ladybird'], null, {clientX:r.left + r.width * .45, clientY:r.top + r.height * .6}); }
 if (scene === 'drag') { toggleLauncher(true); stageDrag(['netsurf'], () => ({el:$('.rb[data-cat="demos"]'), cls:'drop'})); }
+if (scene === 'dragnew') { toggleLauncher(true); stageDrag(['netsurf'], () => ({el:$('[data-newcat]'), cls:'drop'})); }
 if (scene === 'reorder') { toggleLauncher(true); view = 'office'; org = true; ['calc','qalc'].forEach(i => sel.add(i)); renderLauncher(); stageDrag(['calc','qalc'], () => ({el:rowOf('edit'), cls:'ins-l'})); }
 if (scene === 'newcat') { toggleLauncher(true); addCat(['edit','mousepad'], 'Writing'); }
 if (scene === 'unsorted') { EXTRA.forEach(a => { LAY.extra.push(a.id); LAY.fresh.push(a.id); }); toggleLauncher(true); view = 'unsorted'; renderLauncher(); change('Moved htop to System', () => moveApps(['htop'], 'system')); }
 if (scene === 'empty') { toggleLauncher(true); LAY.pins = []; addCat([], 'Work'); closeMenus(); }
 if (['net','vol','temp'].includes(scene)) fly(scene);
+if (/^d(rawer|peek|out|menu|winmenu|taskmenu|reorder|drag|tear|max|resize|full)$/.test(scene)) { if (!dOn()) { S.drawer = 'side'; if (SHOT) saved = {...S}; apply(); } drawerScene(scene); }   // the side dock is the default variant
+else if (Q.has('dstash') && dOn()) drawerScene('');
 
 /* ---------- Self-test: index.html?selftest=1 drives real pointer events and writes the results to the tab title ---------- */
 if (Q.has('selftest')) {
@@ -1355,12 +2091,154 @@ if (Q.has('selftest')) {
   dragTo($('.rb[data-cat="games"]'), $('.rb[data-cat="system"]')); ok('drag category', LAY.cats[0].id === 'games');
   step('doom', 1); ok('keyboard step', catById('games').apps[1] === 'doom');
   step('quake2', 1); ok('step crosses into next category', catOf('quake2').id === 'system' && catById('system').apps[0] === 'quake2');
-  org = true; sel.add('edit'); sel.add('mousepad'); renderLauncher(); dragTo(rowOf('edit'), $('[data-newcat]')); closeMenus();
+  const nc = () => $('[data-newcat]'), shown = el => el.getBoundingClientRect().width > 0;
+  ok('New category is not shown until an app is dragged', !shown(nc()) && !$('[data-newcat][role=button]'));
+  org = true; sel.add('edit'); sel.add('mousepad'); renderLauncher();
+  { const from = rowOf('edit'); from.scrollIntoView({block:'nearest'}); const a = pt(from); from.dispatchEvent(new PointerEvent('pointerdown', a)); dispatchEvent(new PointerEvent('pointermove', {...a, clientX:a.clientX + 20}));
+    ok('dragging an app brings up the New category target', shown(nc())); const b = pt(nc()); dispatchEvent(new PointerEvent('pointermove', b)); dispatchEvent(new PointerEvent('pointerup', b)); }
+  ok('and it goes again after the drop', !shown(nc())); closeMenus();
   ok('multi-drag to new category', LAY.cats.length === 8 && LAY.cats.at(-1).apps.join() === 'edit,mousepad');
   deleteCat(LAY.cats.at(-1).id); ok('delete sends apps to Unsorted', unsorted().join() === 'edit,mousepad');
   justDragged = false; $('[data-sug="edit"]')?.click(); ok('suggestion files an app', catOf('edit')?.id === 'office');
   q.value = 'games'; renderLauncher(); ok('search by category name', kbItems().map(b => b.dataset.app).join() === 'doom,quake');
+  q.value = ''; view = 'all'; org = false; sel.clear(); renderLauncher(); justDragged = false;
+  ok('apps carry no menu button', !$('#l-list .app .more') && !$('#l-list [data-more]'));
+  rowOf('quake').dispatchEvent(new MouseEvent('contextmenu', {...pt(rowOf('quake')), cancelable:true}));
+  ok('right-click menu is Pin or Unpin, and Uninstall, only', $$('#l-menu .mi').map(b => b.textContent).join() === 'Unpin,Uninstall');
+  $('#l-menu [data-mi=uninstall]').click(); ok('Uninstall removes the app from the launcher', !installed().some(a => a.id === 'quake') && !rowOf('quake') && !LAY.pins.includes('quake'));
+  undo(); ok('and can be undone', !!rowOf('quake') && catOf('quake').id === 'games' && LAY.pins.includes('quake'));
+  rowOf('files').dispatchEvent(new MouseEvent('contextmenu', {...pt(rowOf('files')), cancelable:true})); ok('a system app cannot be uninstalled', $('#l-menu [data-mi=uninstall]').disabled); closeMenus();
+  $('.rb[data-cat="media"]').focus(); const kd = (el, ch) => el.dispatchEvent(new KeyboardEvent('keydown', {key:ch, bubbles:true, cancelable:true}));
+  kd(document.activeElement, 'v'); const took = document.activeElement === q; q.blur(); kd(document.body, 'l'); kd($('#l-list'), 'c');   // from a focused category, from nothing, and from the list
+  ok('typing anywhere searches at once', took && q.value === 'vlc' && document.activeElement === q && kbItems().map(b => b.dataset.app).join() === 'vlc');
+  q.value = ''; renderLauncher();
   const n = UNDO.length; while (UNDO.length) undo(); ok(`undo all ${n} steps restores defaults`, JSON.stringify(LAY.cats) === JSON.stringify(defaults().cats));
+  // Themes and hues: read the live tokens back and measure WCAG contrast for every hue in every theme and mode.
+  const cs = k => getComputedStyle(stage).getPropertyValue(k).trim(), tri = v => v.startsWith('#') ? [1, 3, 5].map(i => parseInt(v.slice(i, i + 2), 16)) : v.split(' ').map(Number);
+  const lin = c => c.map(x => { x /= 255; return x <= .04045 ? x / 12.92 : ((x + .055) / 1.055) ** 2.4; }), lum = c => { const [r, g, b] = lin(c); return .2126 * r + .7152 * g + .0722 * b; };
+  const col = (k, on) => { const v = cs(k), m = /^rgb\((\d+) (\d+) (\d+) ?\/ ?([.\d]+)\)$/.exec(v); if (!m) return tri(v); const bg = tri(cs(on)), a = +m[4]; return [1, 2, 3].map(i => +m[i] * a + bg[i - 1] * (1 - a)); };   // an alpha ink is measured composited on its surface
+  const cr = (a, b) => { const x = lum(col(a, b)), y = lum(tri(cs(b))); return (Math.max(x, y) + .05) / (Math.min(x, y) + .05); };
+  const tbg = () => getComputedStyle($('#taskbar')).backgroundColor + getComputedStyle($('#taskbar')).backgroundImage, blur = () => getComputedStyle($('#taskbar')).backdropFilter;
+  NOACCEL = false; S.theme = 'glass'; S.accent = 'blue'; S.mode = 'mixed'; apply();
+  ok('glass: the default hue is blue, on the approved glass', stage.dataset.theme === 'glass' && stage.dataset.tint === 'blue' && cs('--g') === '16 36 66' && cs('--accent') === '#6aaeff' && /blur/.test(blur()));
+  S.accent = 'pink'; apply();
+  const ttl = getComputedStyle($('.win.active .tb')).backgroundImage;
+  ok('glass: the hue reaches the taskbar, title bars and panels', cs('--g') === '59 22 38' && /59,? 22,? 38/.test(tbg()) && /124,? 52,? 85/.test(ttl) && /59,? 22,? 38/.test(getComputedStyle(L).backgroundColor + getComputedStyle(L).backgroundImage));
+  S.mode = 'dark'; apply(); ok('glass: app surfaces take the hue in Dark', cs('--c-bg') === '#28151d' && getComputedStyle($('.client')).backgroundColor === 'rgb(40, 21, 29)');
+  S.theme = 'opaque-dark'; S.mode = 'mixed'; apply(); const fd = cs('--g-flat').split(' ').join(', ');
+  ok('opaque dark: flat fill in the hue, no blur, no alpha, dark apps', stage.dataset.glass === 'dark' && stage.dataset.content === 'dark' && tbg().includes(`rgb(${fd})`) && blur() === 'none' && getComputedStyle($('.win.active .tb')).backgroundColor === `rgb(${fd})`);
+  S.theme = 'opaque-light'; apply(); const fl = cs('--g-flat').split(' ').join(', ');
+  ok('opaque light: the same, light throughout', stage.dataset.glass === 'light' && stage.dataset.content === 'light' && tbg().includes(`rgb(${fl})`) && blur() === 'none' && $('#row-mode').classList.contains('dis') && $('#glassrows').classList.contains('dis'));
+  S.theme = 'glass'; S.mode = 'mixed'; NOACCEL = true; apply(); const gcard = $('.pal[data-v=glass]');
+  ok('no acceleration: Glass is locked with a reason, Opaque Dark stands in, the saved choice is kept', gcard.disabled && !$('#accel-note').hidden && /acceleration/.test($('#accel-text').textContent) && stage.dataset.theme === 'opaque-dark' && S.theme === 'glass' && $('.pal[aria-pressed=true]').dataset.v === 'opaque-dark' && blur() === 'none');
+  S.mode = 'light'; apply(); const viaLight = stage.dataset.theme === 'opaque-light'; NOACCEL = false; S.mode = 'mixed'; apply();
+  ok('no acceleration: Light mode falls back to Opaque Light, and Glass returns with acceleration', viaLight && stage.dataset.theme === 'glass' && !gcard.disabled && $('#accel-note').hidden && /blur/.test(blur()));
+  const bad = []; let pairs = 0;
+  for (const h of Object.keys(ACCENTS)) for (const [th, m] of [['glass','dark'], ['glass','light'], ['opaque-dark','mixed'], ['opaque-light','mixed']]) { S.accent = h; S.theme = th; S.mode = m; apply();
+    const dk = stage.dataset.glass === 'dark', surf = th === 'glass' ? '--g' : '--g-flat';
+    const t = [['--ink', surf, 4.5], ['--ink-2', surf, 4.5], ['--ink-3', surf, 4.5], ['--accent', surf, 4.5], ['--ok', surf, 4.5], ['--warn', surf, 4.5], ['--hot', surf, 4.5], ['--on-accent', '--accent', 4.5],
+      ['--c-ink', '--c-bg', 4.5], ['--c-dim', '--c-bg', 4.5], ['--c-dim', dk ? '--c-raise' : '--c-sink', 4.5], ['--c-accent', '--c-bg', 4.5], ['--c-accent', dk ? '--c-raise' : '--c-sink', 4.5], ['--c-on-accent', '--c-accent', 4.5]];
+    if (th === 'glass') t.push(['--ink', '--g-hi', 4.5], ['--accent', '--g-hi', 3], ['--accent', '--g-flat', 4.5]);   // the Opaque themes draw every title bar in the flat fill
+    t.forEach(([a, b, min]) => { pairs++; const v = cr(a, b); if (v < min) bad.push(`${h} ${th} ${m} ${a} on ${b} ${v.toFixed(2)}`); }); }
+  ok(`contrast: ${Object.keys(ACCENTS).length} hues in Glass (dark and light), Opaque Dark and Opaque Light, ${pairs} pairs` + (bad.length ? ' (' + bad.join('; ') + ')' : ''), !bad.length);
+  ok('swatches show one identity colour per hue', $$('#set-hues button').length === 13 && $('#set-hues [data-v=amber] i').style.getPropertyValue('--sw') === '#ffc233' && $('#set-hues [data-v=navy]') && !$('[data-key=palette]'));
+  S = {...saved}; apply();
+  document.title = out.join(' | ');
+}
+/* ---------- Drawer self-test: index.html?dtest=1. Same idea: real events where the browser allows, results in the tab title. ---------- */
+if (Q.has('dtest')) {
+  const out = [], ok = (n, c) => out.push((c ? 'PASS ' : 'FAIL ') + n); addEventListener('error', e => document.title = out.join(' | ') + ' | FAIL stopped: ' + e.message);   // a thrown check must not look like a clean run
+  const it = id => $(`.d-it[data-d="${id}"]`, DRW), order = () => DR.items.map(i => i.id).join();
+  const at = (el, fx = .5, fy = .5) => { const r = el.getBoundingClientRect(); return {clientX:r.left + r.width * fx, clientY:r.top + r.height * fy, button:0, bubbles:true, cancelable:true}; };
+  const pe = (el, t, o) => el.dispatchEvent(new PointerEvent(t, o)), key = (k, o = {}, el = document.body) => el.dispatchEvent(new KeyboardEvent('keydown', {key:k, bubbles:true, ...o}));
+  const pull = (from, to) => { pe(from, 'pointerdown', at(from)); pe(window, 'pointermove', {...at(from), clientX:at(from).clientX + 20}); pe(window, 'pointermove', to); pe(window, 'pointerup', to); dJust = false; };   // the click guard clears on a timer, which a synchronous test never reaches
+  const edge = y => { const r = stage.getBoundingClientRect(); return {clientX:r.left + 4 * scale(), clientY:r.top + y * scale(), button:0, bubbles:true}; };
+  S.drawer = 'rail'; S.dedge = 'left'; apply();
+  ok('resting: tab shown, drawer shut, residents not drawn', !$('#d-tab').hidden && DRW.classList.contains('shut') && DAPPS.every(a => !visible(a.id)));
+  $('#d-tab').click(); ok('edge tab opens', DR.open && !DRW.classList.contains('shut') && $('#d-tab').hidden);
+  it('chat').click(); ok('click peeks and clears the badge', DR.peek === 'chat' && wEl('chat').classList.contains('peek') && visible('chat') && !DMETA.chat.n);
+  ok('only the peeked window is drawn', ['mail','music','feed'].every(k => !visible(k)));
+  key('Escape'); ok('Esc hides the peek first', DR.open && !DR.peek && !visible('chat')); key('Escape'); ok('then the drawer', !DR.open);
+  key('s', {altKey:true}); ok('hotkey opens', DR.open); key('2'); ok('digit peeks the second entry', DR.peek === 'mail');
+  pe(wEl('settings'), 'pointerdown', at(wEl('settings'), .5, .9)); ok('click outside closes', !DR.open && !DR.peek);
+  focusWin('files'); key('S', {altKey:true, shiftKey:true});
+  ok('hotkey stashes the focused window as a guest', WIN.files.stash && !visible('files') && dItem('files') && !dItem('files').pin && !$('[data-task=files]'));
+  $('.tb', wEl('terminal')).dispatchEvent(new MouseEvent('contextmenu', at($('.tb', wEl('terminal')), .3))); $('#d-menu [data-dm=stash]').click(); ok('title bar menu stashes', WIN.terminal.stash && order().endsWith('files,terminal'));
+  const stb = $('.tb', wEl('settings')); pe(stb, 'pointerdown', at(stb, .3)); pe(window, 'pointermove', edge(300)); const lit = $('#d-drop').classList.contains('on'); pe(window, 'pointerup', edge(300));
+  ok('drag to the edge stashes', lit && WIN.settings.stash && !$('#d-drop').classList.contains('on'));
+  $('#dbtn').click(); it('mail').focus(); key('ArrowUp', {altKey:true}, it('mail')); ok('Alt+Up reorders', order().startsWith('mail,chat'));
+  key('ArrowUp', {altKey:true}, it('files')); ok('reordering stays inside its group', order() === 'mail,chat,music,feed,files,terminal,settings');
+  pull(it('music'), at(it('mail'), .5, .2)); ok('drag reorders', order().startsWith('music,mail,chat'));
+  pull(it('files'), {clientX:at(stage).clientX, clientY:at(stage, .5, .3).clientY, button:0, bubbles:true}); ok('drag off the drawer returns a guest and drops its entry', !WIN.files.stash && visible('files') && !dItem('files'));
+  $('#dbtn').click(); it('chat').click(); $('[data-act=stash]', wEl('chat')).click();
+  ok('a resident returns to the desktop but keeps its entry', !WIN.chat.stash && visible('chat') && dState('chat') === 'out' && !!$('[data-task=chat]') && wEl('chat').classList.contains('dpin'));
+  $('[data-act=stash]', wEl('chat')).click(); ok('its caption button stashes it again', WIN.chat.stash && !visible('chat') && !$('[data-task=chat]'));
+  $('#dbtn').click(); it('feed').dispatchEvent(new MouseEvent('contextmenu', at(it('feed')))); $('#d-menu [data-dm=unpin]').click(); ok('Remove from drawer returns the window', !dItem('feed') && visible('feed') && !wEl('feed').classList.contains('dpin'));
+  $('#dbtn').click(); it('mail').click(); $('[data-act=close]', wEl('mail')).click(); ok('closing a resident leaves a not-running entry', dState('mail') === 'off' && !DR.peek && DR.open);
+  it('mail').click(); ok('which starts it in the drawer again', DR.peek === 'mail' && visible('mail'));
+  S.drawer = 'tabs'; apply(); ok('edge tabs: always present, peek survives the switch', !DRW.hidden && $('#d-tab').hidden && DR.peek === 'mail');
+  S.drawer = 'cards'; apply(); $('#dbtn').click(); ok('cards: thumbnails are static copies', $$('.d-th .client', DRW).length > 0 && !DR.peek);
+  it('music').click(); ok('cards: a card returns its window', !WIN.music.stash && visible('music') && !DR.open);
+  S.dedge = 'right'; apply(); $('#dbtn').click(); ok('right edge: button in the corner', DR.open && !$('#dbtn').nextElementSibling && Math.round(DRW.getBoundingClientRect().right) === Math.round(stage.getBoundingClientRect().right));
+  // ---- top dock ----
+  const sy = y => { const r = stage.getBoundingClientRect(); return {clientX:r.left + 700 * scale(), clientY:r.top + y * scale(), button:0, bubbles:true, cancelable:true}; };
+  const top = el => el.offsetTop, hgt = el => el.offsetHeight, menu = k => $(`#d-menu [data-dm=${k}]`);
+  S.drawer = 'dock'; S.dedge = 'left'; S.dockh = 56; apply(); setDrawer(false);
+  ok('dock: a 56 px strip on the top edge, no taskbar button, no edge tab', !DRW.hidden && !DRW.classList.contains('shut') && top(DRW) === 0 && hgt(DRW) === 56 && $('#dbtn').hidden && $('#d-tab').hidden && stage.dataset.dedge === 'left');
+  DMETA.chat.n = 2; renderDrawer();
+  ok('dock: a tile is the button and the window info in one', $('.d-tx b', it('chat')).textContent === 'Chat' && $('.pv', it('chat')).textContent.startsWith('Mira') && $('.d-bdg', it('chat')).textContent === '2' && !it('chat').querySelector('[data-dout]'));
+  ok('dock: docked windows are not drawn', ['chat','mail','terminal','settings'].every(k => WIN[k].stash && !visible(k) && wEl(k).classList.contains('stashed') && wEl(k).classList.contains('gone')));
+  winAct('files', 'max'); ok('dock: a maximised window fits below the dock', top(wEl('files')) === 56 && hgt(wEl('files')) === 900 - 48 - 56);
+  it('chat').click();
+  ok('dock: a tile opens its app below the dock, and the tile is its title bar', DR.peek === 'chat' && visible('chat') && top(wEl('chat')) === 56 && getComputedStyle($('.tb', wEl('chat'))).display === 'none' && !!$('[data-dout]', it('chat')) && !!$('[data-dx]', it('chat')) && !DMETA.chat.n && hgt(wEl('files')) === 796);
+  $('[data-dout]', it('chat')).click(); ok('dock: the open tile returns its window to the desktop', !WIN.chat.stash && visible('chat') && dState('chat') === 'out' && top(wEl('chat')) >= 56);
+  $('.tb', wEl('chat')).dispatchEvent(new MouseEvent('contextmenu', at($('.tb', wEl('chat')), .3))); const t1 = menu('stash').textContent; menu('stash').click();
+  ok('dock: title bar menu has Send to dock', t1 === 'Send to dock' && WIN.chat.stash && !visible('chat'));
+  winAct('files', 'max'); $('[data-task=files]').dispatchEvent(new MouseEvent('contextmenu', at($('[data-task=files]')))); const t2 = menu('stash').textContent; menu('stash').click();
+  ok('dock: task button menu has Send to dock', t2 === 'Send to dock' && WIN.files.stash && !$('[data-task=files]') && dItem('files') && !dItem('files').pin && $('.pv', it('files')).textContent === 'Home - Files');
+  it('files').dispatchEvent(new MouseEvent('contextmenu', at(it('files')))); const t3 = menu('out').textContent; menu('out').click();
+  ok('dock: tile menu has Return to desktop', t3 === 'Return to desktop' && !WIN.files.stash && visible('files') && !dItem('files') && !!$('[data-task=files]'));
+  const ftb = $('.tb', wEl('files')); pe(ftb, 'pointerdown', at(ftb, .3)); pe(window, 'pointermove', sy(300)); const hintOn = DRW.classList.contains('dropping') && !DRW.classList.contains('over') && $('.d-slot', DRW).offsetWidth > 0;
+  pe(window, 'pointermove', sy(20)); const lit2 = DRW.classList.contains('over') && $('#d-drop').classList.contains('on') && top(wEl('files')) === 56; pe(window, 'pointerup', sy(20));
+  ok('dock: dragging a window shows a slot, the dock lights under the pointer, and a drop docks it', hintOn && lit2 && WIN.files.stash && !DRW.classList.contains('dropping') && !!it('files'));
+  it('mail').focus(); const o1 = order(); key('ArrowRight', {altKey:true}, it('mail')); ok('dock: Alt+Right reorders along the strip', o1.startsWith('music,mail,chat') && order().startsWith('music,chat,mail'));
+  pull(it('files'), sy(420)); ok('dock: dragging a tile off the dock returns its window', !WIN.files.stash && visible('files') && !dItem('files') && top(wEl('files')) >= 56);
+  const hs = $('#d-size'); pe(hs, 'pointerdown', at(hs)); pe(window, 'pointermove', sy(83)); const mid = !$('#d-guide').hidden && S.dockh === 56 && hgt(DRW) === 56; pe(window, 'pointerup', sy(83));
+  winAct('files', 'max'); ok('dock: dragging its edge resizes it on release, with a snap, and the work area follows', mid && S.dockh === 80 && hgt(DRW) === 80 && DRW.dataset.sz === 't' && $('#d-guide').hidden && top(wEl('files')) === 80 && hgt(wEl('files')) === 900 - 48 - 80);
+  winAct('files', 'max'); S.dockh = 36; apply(); ok('dock: compact height drops to one line', hgt(DRW) === 36 && DRW.dataset.sz === 'c' && getComputedStyle($('.pv', it('mail'))).display === 'none');
+  S.dockh = 56; apply(); setFs('files', true); const z = +getComputedStyle(wEl('files')).zIndex;
+  ok('dock: fullscreen covers the dock and the taskbar', top(wEl('files')) === 0 && hgt(wEl('files')) === 900 && z > +getComputedStyle(DRW).zIndex && z > +getComputedStyle($('#taskbar')).zIndex && !$('#fs-hint').hidden);
+  S.dfs = true; apply(); ok('dock: with the toggle, fullscreen fits below the dock', top(wEl('files')) === 56 && hgt(wEl('files')) === 844 && +getComputedStyle(DRW).zIndex > z);
+  S.dfs = false; apply(); key('Escape'); ok('dock: Esc leaves fullscreen', !WIN.files.fs && !wEl('files').classList.contains('fs') && $('#fs-hint').hidden);
+  // ---- side dock: the recommended variant ----
+  const W = 420, left = el => el.offsetLeft, wid = el => el.offsetWidth, sx = (x, y) => { const r = stage.getBoundingClientRect(); return {clientX:r.left + x * scale(), clientY:r.top + y * scale(), button:0, bubbles:true, cancelable:true}; };
+  S.drawer = 'off'; apply(); Object.assign(S, {drawer:'side', dedge:'left', dpos:'top', dpin:false, dockw:W}); apply();
+  ok('side: hidden at rest behind the edge tab and the taskbar button', DRW.classList.contains('shut') && !$('#d-tab').hidden && !$('#dbtn').hidden && $('#d-pane').hidden && DAPPS.every(a => !visible(a.id)));
+  DMETA.chat.n = 2; $('#dbtn').click();
+  ok('side: it opens on a page, and nothing leaves the sidebar width', DR.open && DR.peek === 'chat' && !DMETA.chat.n && left(DRW) === 0 && wid(DRW) === W && hgt(DRW) === 48 && top(DRW) === 0 && left(wEl('chat')) === 0 && wid(wEl('chat')) === W && top(wEl('chat')) === 48 && hgt(wEl('chat')) === 900 - 48 - 48 && getComputedStyle($('.tb', wEl('chat'))).display === 'none');
+  ok('side: icons only, except the selected page, whose tile carries its name and buttons', $$('.d-it', DRW).length === 4 && $$('.d-it', DRW).every(e => e.dataset.d === 'chat' ? $('.d-tx b', e).textContent === 'Chat' && !!$('[data-dout]', e) && !!$('[data-dx]', e) && wid(e) > 150 : !$('.d-tx', e) && wid(e) === 42));
+  ok('side: the lighter tile is the only selection mark', getComputedStyle(it('chat'), '::after').display === 'none' && getComputedStyle(it('chat'), '::before').boxShadow === 'none' && getComputedStyle(it('chat'), '::before').backgroundColor !== 'rgba(0, 0, 0, 0)');
+  it('mail').click(); ok('side: another icon switches the page in place', DR.peek === 'mail' && !visible('chat') && visible('mail') && !!$('.d-tx', it('mail')) && !$('.d-tx', it('chat')) && left(wEl('mail')) === 0 && wid(wEl('mail')) === W);
+  pe(wEl('settings'), 'pointerdown', at(wEl('settings'), .5, .9)); ok('side: a click outside closes it', !DR.open && !DR.peek && !visible('mail'));
+  S.dpos = 'bottom'; apply(); $('#dbtn').click();
+  ok('side: with the icons at the bottom the strip sits on the taskbar and the last page returns above it', DR.peek === 'mail' && top(DRW) === 900 - 48 - 48 && top(wEl('mail')) === 0 && hgt(wEl('mail')) === 804);
+  if (!WIN.files.max) winAct('files', 'max'); $('[data-dpin]', DRW).click();
+  ok('side: pinned open, it is outside the work area and the taskbar button goes', S.dpin && DR.open && $('#dbtn').hidden && $('#d-tab').hidden && left(wEl('files')) === W && wid(wEl('files')) === 1600 - W && left(wEl('settings')) >= W);
+  pe(wEl('settings'), 'pointerdown', at(wEl('settings'), .5, .9)); key('Escape'); it('mail').click();
+  ok('side: pinned, a click outside, Esc and the selected tile all leave it open', DR.open && DR.peek === 'mail' && visible('mail'));
+  winAct('files', 'max');
+  const ttb = $('.tb', wEl('terminal')); pe(ttb, 'pointerdown', at(ttb, .3)); pe(window, 'pointermove', sx(200, 300)); const lit3 = $('#d-drop').classList.contains('on') && DRW.classList.contains('over') && left(wEl('terminal')) >= W; pe(window, 'pointerup', sx(200, 300));
+  ok('side: dragging a window onto the sidebar docks it as a guest', lit3 && WIN.terminal.stash && !visible('terminal') && !!it('terminal') && !dItem('terminal').pin && !DRW.classList.contains('dropping'));
+  pe(it('terminal'), 'pointerdown', at(it('terminal'))); pe(window, 'pointermove', {...at(it('terminal')), clientX:at(it('terminal')).clientX + 20}); pe(window, 'pointermove', sx(900, 300));
+  const landOn = !$('#d-land').hidden && left($('#d-land')) === 810 && $('#ghost').textContent.includes('float'); pe(window, 'pointerup', sx(900, 300)); dJust = false;
+  ok('side: dragging a tile out of the dock shows where the window will land, and floats it there', landOn && $('#d-land').hidden && !WIN.terminal.stash && visible('terminal') && !dItem('terminal') && left(wEl('terminal')) === 810 && !!$('[data-task=terminal]'));
+  pull(it('mail'), sx(700, 200));
+  ok('side: the selected page drags out the same way; a resident keeps its tile and the next page shows', !WIN.mail.stash && visible('mail') && dState('mail') === 'out' && !$('.d-tx', it('mail')) && DR.open && DR.peek === 'chat');
+  S.dedge = 'right'; apply();
+  ok('side: on the right edge it mirrors', left(DRW) === 1600 - W && left(wEl('chat')) === 1600 - W && getComputedStyle(stage).getPropertyValue('--wa-right').trim() === '420px' && getComputedStyle(stage).getPropertyValue('--wa-left').trim() === '0px');
+  Object.assign(S, {dpin:false, dedge:'left', dpos:'top'}); apply(); const stillOpen = DR.open; key('Escape');
+  ok('side: unpinned again, Esc closes it in one step', stillOpen && !DR.open && !DR.peek && getComputedStyle(stage).getPropertyValue('--wa-left').trim() === '0px');
+  S.drawer = 'off'; apply(); ok('off restores the settled desktop', DRW.hidden && $('#dbtn').hidden && $('#d-size').hidden && stage.dataset.drawer === 'off' && getComputedStyle(stage).getPropertyValue('--wa-top').trim() === '0px' && $('#d-pane').hidden && DAPPS.every(a => !visible(a.id)) && ['files','terminal','settings'].every(k => !WIN[k].stash));
   document.title = out.join(' | ');
 }
 })();
