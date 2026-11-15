@@ -8,13 +8,13 @@ The log used to be one 1,700-line file. It is now split into work chunks under [
 
 | Severity | Total | Fixed (done.md) | Open or partly fixed (chunks) |
 |---|---|---|---|
-| High | 27 | 22 | 5 |
-| Medium | 67 | 3 | 64 |
-| Low | 71 | 1 | 70 |
+| High | 27 | 23 | 4 |
+| Medium | 67 | 5 | 62 |
+| Low | 71 | 4 | 67 |
 | Info | 17 | 0 | 17 |
-| **All** | **182** | **26** | **156** |
+| **All** | **182** | **32** | **150** |
 
-Open includes entries only partly fixed (M-64, L-60), hardened (H-04), deferred (H-20, H-22) and awaiting a decision (H-03, H-21). Entries marked confidence "low" are the reviewer's suspicion and need confirming before anyone fixes them.
+Open includes entries only partly fixed (M-64, L-60, M-67, L-34), hardened (H-04), deferred (H-22) and awaiting a decision (H-03, H-21). Entries marked confidence "low" are the reviewer's suspicion and need confirming before anyone fixes them.
 
 ## Chunks
 
@@ -24,7 +24,7 @@ Open counts are H/M/L/I. File numbers group related themes and are not the work 
 |---|---|---|---|---|---|---|
 | [01-user-copy.md](refactor-issues/01-user-copy.md) | User-memory copies still dereferencing directly | 0/6/4/0 | 10 | none; before 05, 06 | no | M-28 (with M-35) |
 | [02-authorisation.md](refactor-issues/02-authorisation.md) | Brook syscall authorisation (display-server capability) | 3/0/3/0 | 6 | none | **yes** | H-03 (decision) |
-| [03-file-descriptions-and-fd-table.md](refactor-issues/03-file-descriptions-and-fd-table.md) | Open-file descriptions (H-20), fd publish races | 1/7/6/0 | 14 | coordinate with 05, 07 | no | M-45 |
+| [03-file-descriptions-and-fd-table.md](refactor-issues/03-file-descriptions-and-fd-table.md) | fd publish/close races on top of the shared open-file description (H-20 done) | 0/5/3/0 | 8 | coordinate with 05, 07 | no | M-52 |
 | [04-process-clone-exec-signals.md](refactor-issues/04-process-clone-exec-signals.md) | clone, exec, setpgid, prctl, signals | 0/8/3/0 | 11 | M-15 with 09 (M-49) | no | M-11 |
 | [05-sockets.md](refactor-issues/05-sockets.md) | AF_UNIX, inet, netlink semantics | 0/9/8/0 | 17 | 01, 03 (M-63) | no | M-41 |
 | [06-pipes-tty-devices-rw.md](refactor-issues/06-pipes-tty-devices-rw.md) | Pipes, tty, klog, read/write semantics | 0/6/4/0 | 10 | 01 | no | M-30 |
@@ -36,7 +36,7 @@ Open counts are H/M/L/I. File numbers group related themes and are not the work 
 | [12-errno-and-diagnostics.md](refactor-issues/12-errno-and-diagnostics.md) | Raw errno literals, strace, serial logging | 0/1/8/1 | 10 | run early or per file; see chunk | no | L-03 |
 | [13-hygiene-and-split-artefacts.md](refactor-issues/13-hygiene-and-split-artefacts.md) | Dead code, stale comments, split leftovers, L-37 | 0/0/1/16 | 17 | do last | no | L-37 |
 | [14-single-responsibility-refactors.md](refactor-issues/14-single-responsibility-refactors.md) | Follow-on file splits (net.cpp, compositor.cpp, window.cpp, ext2_vfs.cpp, scheduler.cpp, syscall_* leftovers) | no IDs | 0 | after the bug chunk touching the same file | no | `net.cpp` debug channel move |
-| [done.md](refactor-issues/done.md) | Fixed entries, grouped by fix commit | n/a | 26 | n/a | no | n/a |
+| [done.md](refactor-issues/done.md) | Fixed entries, grouped by fix commit | n/a | 32 | n/a | no | n/a |
 
 ## Suggested order across chunks
 
@@ -45,7 +45,7 @@ Open counts are H/M/L/I. File numbers group related themes and are not the work 
 3. **04 process/exec**, **09 VFS/paths** (M-15 and M-49 share one path limit), **06 pipes/tty/devices**.
 4. **03 fd table** (the small entries), **05 sockets**, **07 wait/wakeup** (the last needs the 60 fps measurements; M-60 is a cheap start).
 5. **08 memory**, **10 DRM/GPU** and **11 WM** (do H-22 with M-51).
-6. **H-20** (shared open-file description) on its own branch with a QEMU shell test.
+6. ~~**H-20** (shared open-file description) on its own branch with a QEMU shell test.~~ Done on `work/open-file` (`6adbe3bc`), with M-45, M-50, L-57, L-59 and L-63.
 7. **13 hygiene** last, then **14 single-responsibility** moves, each after the bug chunk that touches the same file.
 
 The original ordering, kept for reference: test scaffolding, then the no-validation kernel read/write entries, authorisation, spinlock-held copies and `CLONE_SETTLS`, the validate-then-dereference class, then Linux-semantics entries. The first four steps are done.
@@ -53,7 +53,7 @@ The original ordering, kept for reference: test scaffolding, then the no-validat
 ## Where the designs live
 
 - Authorisation proposal (H-03, H-04, H-21): [02-authorisation.md](refactor-issues/02-authorisation.md)
-- Shared open-file description (H-20): [03-file-descriptions-and-fd-table.md](refactor-issues/03-file-descriptions-and-fd-table.md)
+- Shared open-file description (H-20, as built): [03-file-descriptions-and-fd-table.md](refactor-issues/03-file-descriptions-and-fd-table.md)
 - Wakeups changed and remaining (H-26, M-18): [07-wait-and-wakeup.md](refactor-issues/07-wait-and-wakeup.md)
 - GPU_ATTACH_WINDOW lifetime (H-22): [10-drm-gpu-ioctl.md](refactor-issues/10-drm-gpu-ioctl.md)
 - Split artefacts: [13-hygiene-and-split-artefacts.md](refactor-issues/13-hygiene-and-split-artefacts.md)
@@ -70,7 +70,7 @@ The fix pass took all 27 high entries plus the wakeup-related medium entries. Ea
 | Hardened only (policy still open) | H-04 |
 | Partly fixed | M-64, L-60 (single-slot waiters remain on read/write/accept and on /dev/tty) |
 | Open: policy decision for Ian | H-03, H-21; see the authorisation proposal in [02-authorisation.md](refactor-issues/02-authorisation.md) |
-| Deferred, with a design in its chunk file | H-20 ([03](refactor-issues/03-file-descriptions-and-fd-table.md)), H-22 ([10](refactor-issues/10-drm-gpu-ioctl.md)) |
+| Deferred, with a design in its chunk file | H-22 ([10](refactor-issues/10-drm-gpu-ioctl.md)); H-20 was later fixed on `work/open-file` (`6adbe3bc`) |
 
 Commits, oldest first:
 
@@ -140,4 +140,4 @@ These cut across the whole syscall layer and are better fixed as one design chan
 4. **Descriptor publication races.** Many paths publish an fd with `FdAlloc` and then patch flags, or close by number on a copy-out failure. This loses `O_CLOEXEC` and can close a sibling's reused fd. `FdTablePublishOwned` and `FdTablePublishOwnedPinned` already exist and should be used everywhere.
 5. **Single-slot waiter fields** (`readerWaiter`, `epollWaiter`, `acceptWaiter`) are overwritten and set without locks. Several fd types also have no wakeup source at all, so waiters fall back to 10–100 ms safety ticks (H-26 and the medium poll/epoll entries). This is directly relevant to the 60 fps goal: a missed sync-file wake costs frames.
 6. **Raw errno literals.** There are about 200 `return -NN` sites even where named constants exist. Several are wrong for Linux (`ENOSYS` from `kill` and unknown ioctls, `EFAULT` for long paths). Add the missing constants to `syscall_internal.h`, then a grep lint.
-7. **No shared open-file description** (H-20). Offsets and status flags are copied on `dup` and `fork`, so shell redirections that share an offset overwrite each other's output.
+7. **No shared open-file description** (H-20, fixed in `6adbe3bc`). Offsets and status flags were copied on `dup` and `fork`, so shell redirections that share an offset overwrote each other's output.

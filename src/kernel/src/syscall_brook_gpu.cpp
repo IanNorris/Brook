@@ -40,7 +40,7 @@ int64_t sys_brook_gpu_output_alloc(uint64_t bytes,uint64_t flags,uint64_t a,uint
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
     auto* buffer=brook::BdwGpuBufferCreateHandoff(bytes);if(!buffer)return -ENOMEM;
     FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;
-    const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+    const int fd=FdPublishNew(proc,owned,0);
     if(fd<0)brook::BdwGpuBufferUnref(buffer);
     return fd;
 #else
@@ -137,7 +137,7 @@ int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b
         for(uint32_t i=0;i<count;++i){
             if(result){brook::BdwGpuBufferUnref(images[i]);continue;}
             FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=images[i];owned.fdFlags=1;
-            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            const int fd=FdPublishNew(proc,owned,0);
             if(fd<0){brook::BdwGpuBufferUnref(images[i]);result=fd;continue;}
             wire.fds[i]=fd; // the fd table now holds the reference
         }

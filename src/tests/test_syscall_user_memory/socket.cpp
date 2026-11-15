@@ -122,7 +122,31 @@ static void Accept() {
     CHECK(Get<uint32_t>(length)==sizeof(brook::SockAddrIn));
 }
 
+// H-20 / L-34: SCM_RIGHTS passes the description itself. The receiver shares
+// the sender's offset and status flags; FD_CLOEXEC comes from the receive call.
+static void RightsShareDescription() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    auto& source=proc->fds[5];
+    source.type=brook::FdType::DevNull;source.fdFlags=1;
+    auto* description=Describe(source,2|0x800);
+    brook::OpenFileSetOffset(description,42);
+    brook::UnixFdSnap snap{};
+    CHECK(brook::UnixFdSnapFrom(&source,&snap));
+    CHECK(snap.file==description && description->refs==2);
+    snap.fdFlags=0; // recvmsg without MSG_CMSG_CLOEXEC
+    const int installed=brook::UnixFdSnapInstall(proc,&snap);
+    CHECK(installed>=0 && installed!=5);
+    if(installed>=0) {
+        auto& received=proc->fds[installed];
+        CHECK(received.file==description && received.fdFlags==0 && source.fdFlags==1);
+        CHECK(brook::OpenFileOffset(received.file)==42);
+        brook::OpenFileUpdateStatus(received.file,brook::OPEN_FILE_SETFL_MASK,0);
+        CHECK(brook::FdStatus(&source)==2); // receiver's F_SETFL reaches the sender
+    }
+}
+
 void RunSocketTests() {
+    RightsShareDescription();
     Bind();
     SendTo();
     RecvFrom();

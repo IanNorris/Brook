@@ -83,9 +83,8 @@ int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
     EventFdInit(efd, static_cast<uint32_t>(initval), flags);
 
     FdEntry entry{};entry.type=FdType::EventFd;entry.handle=efd;
-    entry.statusFlags=2u|((flags&EFD_NONBLOCK)?0x800u:0u);
     entry.fdFlags=(flags&EFD_CLOEXEC)?1:0;
-    int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+    int fd=FdPublishNew(proc,entry,2u|((flags&EFD_NONBLOCK)?0x800u:0u));
     if (fd < 0) { kfree(efd); return -EMFILE; }
 
     DbgPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);

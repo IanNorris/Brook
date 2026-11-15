@@ -60,11 +60,11 @@ int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
     FdEntry* fde = ref.get();
     if(fde->type==FdType::Path)return -EBADF;
     if (fde->type == FdType::Vnode) {
-        if ((fde->statusFlags & 3) == 0) return -EINVAL;
+        if ((FdStatus(fde) & 3) == 0) return -EINVAL;
         return VfsTruncate(static_cast<Vnode*>(fde->handle), length);
     }
     if (fde->type == FdType::MemFd) {
-            if ((fde->statusFlags & 3) == 0) return -EINVAL;
+            if ((FdStatus(fde) & 3) == 0) return -EINVAL;
             auto* mfd = static_cast<MemFdData*>(fde->handle);
             MfdLock(mfd);
             if(int error=MemFdSealedResize(mfd->seals,mfd->size,length)) {MfdUnlock(mfd);return error;}
@@ -260,7 +260,7 @@ int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
     FdRef descriptor(proc, static_cast<int>(fd)); // Linux fd/mode are low-32-bit ints.
     if (!descriptor) return -EBADF;
     FdEntry* entry = descriptor.get();
-    if ((entry->statusFlags & 3u) == 0) return -EBADF;
+    if ((FdStatus(entry) & 3u) == 0) return -EBADF;
     if (static_cast<int64_t>(offset) < 0 || static_cast<int64_t>(length) <= 0)
         return -EINVAL;
     if (offset > 0x7fffffffffffffffULL - length) return -27; // EFBIG

@@ -103,14 +103,12 @@ void MemFdReleaseMapping(void* object) {
 int MemFdInstall(Process* proc, MemFdData* mfd, uint32_t flags)
 {
     if (!proc || !proc->fds) return -EMFILE;
-    FdEntry entry{};
-    entry.type = FdType::MemFd;
-    entry.handle = mfd;
-    entry.statusFlags = flags & ~(0x80000u | 0x40u | 0x80u | 0x200u);
-    entry.fdFlags = (flags & 0x80000u) ? 1 : 0;
-    int fd = FdTableDuplicatePinned(proc->fds, ProcessFdLock(proc), &entry, 0,
-        entry.fdFlags, [](FdEntry* e) { MemFdRef(static_cast<MemFdData*>(e->handle)); });
-    return fd < 0 ? -EMFILE : fd;
+    // A new open file description (H-20) holding its own memfd reference;
+    // the caller's reference keeps mfd alive across publication.
+    MemFdRef(mfd);
+    int fd = FdAlloc(proc, FdType::MemFd, mfd, flags, 0, (flags & 0x80000u) ? 1 : 0);
+    if (fd < 0) MemFdUnref(mfd);
+    return fd;
 }
 
 // Data moves one page at a time: the page is resolved and copied to or from

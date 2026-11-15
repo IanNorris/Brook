@@ -24,6 +24,8 @@
 #include "unix_lifetime_trace.h"
 #include "pipe.h"
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 
 // These tests exercise FD ownership and pipe I/O, without a scheduler.
 namespace brook { void PipePollNotify(PipeBuffer*, uint32_t) {} }
@@ -639,8 +641,120 @@ static void TestPipeReadRegistration()
     CHECK(pipe.readerWaiter == nullptr, "wake or interruption removes registration");
 }
 
+// ---------------------------------------------------------------------------
+// Shared open file descriptions (H-20). Host shims: heap and a spinning
+// KMutex stand-in, enough to exercise OpenFilePosition's lock protocol.
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_openFileAllocs{0};
+extern "C" void* kmalloc(uint64_t size) { g_openFileAllocs.fetch_add(1); return std::malloc(size); }
+extern "C" void kfree(void* p) { if (p) { g_openFileAllocs.fetch_sub(1); std::free(p); } }
+namespace brook {
+void KMutexInit(KMutex* m) { std::memset(m, 0, sizeof(*m)); }
+void KMutexLock(KMutex* m) {
+    while (__atomic_exchange_n(&m->locked, 1u, __ATOMIC_ACQUIRE)) std::this_thread::yield();
+}
+void KMutexUnlock(KMutex* m) { __atomic_store_n(&m->locked, 0u, __ATOMIC_RELEASE); }
+}
+
+// Mirrors the kernel FdRetainCopy for handle-less test slots: every alias
+// owns a reference to the same description.
+static bool RetainDescription(FdEntry* copy) { brook::OpenFileRetain(copy->file); return true; }
+static void RetainDescriptionVoid(FdEntry* copy) { brook::OpenFileRetain(copy->file); }
+
+static void TestOpenFileDescriptions()
+{
+    using brook::OpenFile;
+    FdEntry fds[MAX_FDS] = {};
+    SpinLock lock;
+    const int baseAllocs = g_openFileAllocs.load();
+
+    // open() flags: the call-only bits never reach F_GETFL (M-50).
+    OpenFile* file = brook::OpenFileCreate(0x2u | 0x40u | 0x80u | 0x200u | 0x80000u | 0x400u);
+    CHECK(file && brook::OpenFileStatus(file) == (0x2u | 0x400u), "description keeps access mode and O_APPEND only");
+    CHECK(file->refs == 1 && brook::OpenFileOffset(file) == 0, "new description has one ref, offset 0");
+    int fd = FdTableAlloc(fds, &lock, FdType::Vnode, TokenHandle(9), file);
+    CHECK(fd == 0 && fds[fd].file == file, "slot adopts its description");
+
+    // dup(): the alias shares the description; FD_CLOEXEC stays per slot.
+    FdEntry* pinned = FdTablePin(fds, &lock, fd);
+    int dup = brook::FdTableDuplicatePinned(fds, &lock, pinned, 0, 1, RetainDescriptionVoid);
+    FdClaimResult unused{};
+    FdTableUnpin(fds, &lock, fd, &unused);
+    CHECK(dup == 1 && fds[dup].file == file && file->refs == 2, "dup shares and retains the description");
+    CHECK(fds[fd].fdFlags == 0 && fds[dup].fdFlags == 1, "FD_CLOEXEC is per descriptor");
+
+    // A write through one alias moves the offset seen by the other.
+    {
+        brook::OpenFilePosition position(fds[fd].file);
+        position.set(position.value() + 1); // "a"
+    }
+    {
+        brook::OpenFilePosition position(fds[dup].file);
+        CHECK(position.value() == 1, "dup alias continues at the shared offset");
+        position.set(position.value() + 1); // "b"
+    }
+    CHECK(brook::OpenFileOffset(file) == 2, "two one-byte writes through dup aliases give offset 2 (\"ab\")");
+
+    // F_SETFL through one alias is visible through the other; access mode and
+    // bits outside SETFL_MASK are not changeable.
+    brook::OpenFileUpdateStatus(fds[dup].file, brook::OPEN_FILE_SETFL_MASK, 0x800u | 0x1u | 0x200000u);
+    CHECK(brook::FdStatus(&fds[fd]) == (0x2u | 0x800u), "F_SETFL O_NONBLOCK reaches the alias; O_APPEND cleared, mode kept");
+
+    // fork(): the child's slots name the parent's descriptions.
+    FdEntry child[MAX_FDS] = {};
+    CHECK(brook::FdTableForkSnapshot(child, fds, &lock, RetainDescription), "fork snapshot");
+    CHECK(child[fd].file == file && child[dup].file == file && file->refs == 4, "fork shares descriptions");
+    brook::OpenFileUpdateStatus(child[fd].file, 0x800u, 0);
+    CHECK((brook::FdStatus(&fds[dup]) & 0x800u) == 0, "child's F_SETFL reaches the parent");
+
+    // A second open() of the same object is independent.
+    OpenFile* other = brook::OpenFileCreate(0x2u);
+    int second = FdTableAlloc(fds, &lock, FdType::Vnode, TokenHandle(9), other);
+    CHECK(fds[second].file != file && brook::OpenFileOffset(other) == 0, "independent open has its own offset");
+
+    // dup2-style replacement returns the retired slot's description reference.
+    FdEntry owned = fds[second];
+    brook::OpenFileRetain(owned.file);
+    FdClaimResult retired{};
+    CHECK(brook::FdTablePublishOwned(fds, &lock, owned, 0, dup, &retired) == dup, "replace dup with second open");
+    CHECK(retired.file == file && fds[dup].file == other, "replacement hands back the old description");
+    brook::OpenFileRelease(retired.file);
+
+    // Close: each claim hands back exactly its own reference.
+    for (int i = 0; i < static_cast<int>(MAX_FDS); ++i) {
+        FdClaimResult claimed{};
+        if (FdTableClaim(fds, &lock, i, &claimed)) brook::OpenFileRelease(claimed.file);
+        if (FdTableClaim(child, &lock, i, &claimed)) brook::OpenFileRelease(claimed.file);
+    }
+    CHECK(g_openFileAllocs.load() == baseAllocs, "every description is freed after its last close");
+
+    // Concurrent read-modify-writes through aliases never lose an update.
+    OpenFile* shared = brook::OpenFileCreate(0x1u);
+    constexpr int THREADS = 4, ITERATIONS = 20000;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < THREADS; ++t) {
+        brook::OpenFileRetain(shared);
+        threads.emplace_back([shared] {
+            for (int i = 0; i < ITERATIONS; ++i) {
+                brook::OpenFilePosition position(shared);
+                const uint64_t at = position.value();
+                std::this_thread::yield();
+                position.set(at + 1);
+            }
+            brook::OpenFileRelease(shared);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    CHECK(brook::OpenFileOffset(shared) == uint64_t(THREADS) * ITERATIONS,
+          "posLock serializes offset updates across aliases");
+    brook::OpenFileRelease(shared);
+    CHECK(g_openFileAllocs.load() == baseAllocs, "shared description freed after the last alias");
+    std::printf("open file descriptions: dup/fork/replace/close sharing and offset serialization passed\n");
+}
+
 int main()
 {
+    TestOpenFileDescriptions();
     TestPipeReadRegistration();
     TestUnixLifeCore();
     TestBasic();

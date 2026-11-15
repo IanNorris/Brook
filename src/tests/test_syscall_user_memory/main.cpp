@@ -70,6 +70,11 @@ static bool Refuse(uint64_t address) {
 }
 
 brook::Process* CurrentProcess() { if(!g_process)ResetProcess();return g_process; }
+brook::OpenFile* Describe(brook::FdEntry& entry,uint32_t status) {
+    // Leaked deliberately: fake finalizers never release descriptions.
+    entry.file=brook::OpenFileCreate(status);
+    return entry.file;
+}
 void ResetProcess() {
     if(!g_process)g_process=static_cast<brook::Process*>(calloc(1,sizeof(brook::Process)));
     else for(uint64_t i=0;i<sizeof(brook::Process);++i)reinterpret_cast<uint8_t*>(g_process)[i]=0;

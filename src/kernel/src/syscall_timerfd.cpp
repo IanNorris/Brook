@@ -77,13 +77,10 @@ int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
     tfd->clockId = static_cast<int>(clockid);
     tfd->refCount = 1;
 
-    int fd = FdAlloc(proc, FdType::TimerFd, tfd);
-    if (fd < 0) { kfree(tfd); return -EMFILE; }
-
-    if (flags & TFD_NONBLOCK)
-        proc->fds[fd].statusFlags = 0x800;
-    if (flags & TFD_CLOEXEC)
-        proc->fds[fd].fdFlags |= 1;
+    // Published complete with O_NONBLOCK and FD_CLOEXEC (L-57).
+    int fd = FdAlloc(proc, FdType::TimerFd, tfd, (flags & TFD_NONBLOCK) ? 0x800u : 0u, 0,
+                     (flags & TFD_CLOEXEC) ? 1 : 0);
+    if (fd < 0) { kfree(tfd); return fd; }
 
     return fd;
 }

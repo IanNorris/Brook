@@ -70,6 +70,17 @@ static int OpenProcMemFd(Process* proc, const char* path, uint64_t flags, bool* 
     return MemFdInstall(proc, static_cast<MemFdData*>(source.get()->handle), static_cast<uint32_t>(flags));
 }
 
+// Read-only synthetic files (/etc/passwd, DRM sysfs attributes): they always
+// exist and are never writable (M-45). Published complete, with FD_CLOEXEC.
+static int64_t OpenSyntheticFile(Process* proc, const char* content, uint64_t flags)
+{
+    if ((flags & 0xc0) == 0xc0) return -EEXIST;   // O_CREAT|O_EXCL
+    if (flags & 0x10000) return -ENOTDIR;         // O_DIRECTORY
+    if ((flags & 3) || (flags & 0x200)) return -13; // EACCES: write or O_TRUNC
+    return FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(content),
+                   static_cast<uint32_t>(flags), 0, (flags & 0x80000) ? 1 : 0);
+}
+
 static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_t mode)
 {
     Process* proc = ProcessCurrent();
@@ -99,8 +110,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         int error=0;Vnode* node=GuardRepairOpenLinux(flags,&error);
         if(!node)return error?error:-13;
         FdEntry entry{};entry.type=FdType::Vnode;entry.handle=node;
-        entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
-        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        entry.fdFlags=(flags&0x80000)?1:0;
+        int fd=FdPublishNew(proc,entry,static_cast<uint32_t>(flags));
         if(fd<0) {VfsRelease(node);return -EMFILE;}
         return fd;
     }
@@ -113,8 +124,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         Vnode* node=GuardCheckerOpenLinux(flags,&error);
         if(!node)return error?error:-13;
         FdEntry entry{};entry.type=FdType::Vnode;entry.handle=node;
-        entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
-        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        entry.fdFlags=(flags&0x80000)?1:0;
+        int fd=FdPublishNew(proc,entry,static_cast<uint32_t>(flags));
         if(fd<0) {VfsRelease(node);return -EMFILE;}
         return fd;
     }
@@ -145,23 +156,25 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             SpinLockRelease(&maintenanceBlockLock);
         }
         FdEntry entry{};entry.type=FdType::BlockDevice;entry.handle=block;
-        entry.statusFlags=static_cast<uint32_t>(flags);entry.fdFlags=(flags&0x80000)?1:0;
-        const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        entry.fdFlags=(flags&0x80000)?1:0;
+        const int fd=FdPublishNew(proc,entry,static_cast<uint32_t>(flags));
         if(fd<0){kfree(block);MaintenanceBlockRelease();return -EMFILE;}
         return fd;
     }
 #endif
 
+    // Every descriptor is published complete, with its status and FD_CLOEXEC
+    // already set (M-45): a sibling fork+exec never sees a half-built slot.
+    const uint8_t cloexec=(flags&0x80000)?1:0;
+    const uint32_t status=static_cast<uint32_t>(flags);
     if(flags&0x200000) { // O_PATH: retained metadata, never synthetic data I/O.
         const uint64_t normalized=flags&(0x200000u|0x10000u|0x20000u);
         int error=0;
         auto* node=VfsOpenAt(at.fs.root,at.start(),path,VFS_O_METADATA,0,at.fs.mask,&error,!(flags&0x20000));
         if(!node)return error?error:-ENOENT;
         if((flags&0x10000) && node->type!=VnodeType::Dir) {VfsRelease(node);return -ENOTDIR;}
-        int fd=FdAlloc(proc,FdType::Path,node);
-        if(fd<0) {VfsRelease(node);return -EMFILE;}
-        proc->fds[fd].statusFlags=normalized;
-        proc->fds[fd].fdFlags=(flags&0x80000)?1:0; // FD_CLOEXEC
+        int fd=FdAlloc(proc,FdType::Path,node,static_cast<uint32_t>(normalized),0,cloexec);
+        if(fd<0) {VfsRelease(node);return fd;}
         return fd;
     }
 
@@ -195,16 +208,16 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     }
     if (StrEq(syntheticPath, "/dev/fb0"))
     {
-        int fd = FdAlloc(proc, FdType::DevFramebuf, nullptr);
-        if (fd < 0) return -EMFILE;
+        int fd = FdAlloc(proc, FdType::DevFramebuf, nullptr, status, 0, cloexec);
+        if (fd < 0) return fd;
         DbgPrintf("sys_open: /dev/fb0 → fd %d\n", fd);
         return fd;
     }
 
     if (StrEq(syntheticPath, "keyboard") || StrEq(syntheticPath, "/dev/keyboard"))
     {
-        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
-        if (fd < 0) return -EMFILE;
+        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr, status, 0, cloexec);
+        if (fd < 0) return fd;
         DbgPrintf("sys_open: keyboard → fd %d\n", fd);
         return fd;
     }
@@ -234,9 +247,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             FdEntry entry{};
             entry.type = FdType::DevTty;
             entry.handle = pair;
-            entry.statusFlags = 2; // O_RDWR
             entry.fdFlags = (flags & 0x80000) ? 1 : 0;
-            int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), entry, 0, -1, nullptr);
+            int fd = FdPublishNew(proc,entry,2); // O_RDWR
             if (fd < 0) {
                 PipeReleaseEnd(rp, false);
                 PipeReleaseEnd(wp, true);
@@ -245,8 +257,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             }
             return fd;
         }
-        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
-        if (fd < 0) return -EMFILE;
+        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr, status, 0, cloexec);
+        if (fd < 0) return fd;
         DbgPrintf("sys_open: %s → fd %d (keyboard/tty)\n", path, fd);
         return fd;
     }
@@ -262,9 +274,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         if((flags&3)==3 || (flags&0x10000))return -EINVAL;
         auto* file=brook::BdwGpuFileCreate();if(!file)return -ENOMEM;
         FdEntry owned{};owned.type=FdType::DevIntelDri;owned.handle=file;
-        owned.statusFlags=static_cast<uint32_t>(flags)&~(0x80000u|0x40u|0x80u|0x200u);
         owned.fdFlags=(flags&0x80000u)?1:0;
-        const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        const int fd=FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
         if(fd<0){brook::BdwGpuFileUnref(file);return -EMFILE;}return fd;
     }
     if (StrEq(syntheticPath, "/dev/dri/renderD128"))
@@ -278,8 +289,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         dctx->owner=static_cast<DrmGpuOwner*>(kmalloc(sizeof(DrmGpuOwner)));
         if (!dctx->owner) { kfree(dctx);return -ENOMEM; }
         *dctx->owner={1,0,{}};
-        int fd = FdAlloc(proc, FdType::DevDri, dctx);
-        if (fd < 0) { DrmOwnerUnref(dctx->owner);kfree(dctx);return -EMFILE; }
+        int fd = FdAlloc(proc, FdType::DevDri, dctx, status, 0, cloexec);
+        if (fd < 0) { DrmOwnerUnref(dctx->owner);kfree(dctx);return fd; }
         DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
         return fd;
     }
@@ -289,11 +300,9 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // handle in getdents64/fstat). Only when a 3D driver is present.
     if (StrEq(syntheticPath, "/dev/dri") && (brook::GpuAppGet() || brook::BdwIntelUserNodeEnabled()))
     {
+        if (flags & 3) return -21; // EISDIR
         int fd = FdAlloc(proc, FdType::SyntheticMem,
-                         const_cast<char*>(g_drmDriDirTag));
-        if (fd < 0) return -EMFILE;
-        proc->fds[fd].seekPos = 0;
-        proc->fds[fd].dirPath[0] = '\0';
+                         const_cast<char*>(g_drmDriDirTag), status, 0, cloexec);
         return fd;
     }
 
@@ -302,18 +311,11 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     if (brook::GpuAppGet())
     {
         const char* drmAttr = DrmSysAttrContent(syntheticPath);
-        if (drmAttr)
-        {
-            int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(drmAttr));
-            if (fd < 0) return -EMFILE;
-            proc->fds[fd].seekPos = 0;
-            return fd;
-        }
+        if (drmAttr) return OpenSyntheticFile(proc, drmAttr, flags);
     }
     if(brook::BdwIntelUserNodeEnabled()){
         const char* attr=IntelDrmSysAttrContent(syntheticPath);
-        if(attr){int fd=FdAlloc(proc,FdType::SyntheticMem,const_cast<char*>(attr));if(fd<0)return -EMFILE;
-            proc->fds[fd].seekPos=0;return fd;}
+        if(attr)return OpenSyntheticFile(proc,attr,flags);
     }
 
     // /dev/null — discard writes, EOF on read
@@ -322,9 +324,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         if((flags&0xc0)==0xc0)return -EEXIST; // O_CREAT|O_EXCL
         if(flags&0x10000)return -ENOTDIR;
         FdEntry owned{};owned.type=FdType::DevNull;
-        owned.statusFlags=static_cast<uint32_t>(flags)&~(0x80000u|0x40u|0x80u|0x200u);
         owned.fdFlags=(flags&0x80000u)?1:0;
-        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        int fd=FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
         return fd<0?-EMFILE:fd;
     }
 
@@ -334,9 +335,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         if((flags&0xc0)==0xc0)return -EEXIST;
         if(flags&0x10000)return -ENOTDIR;
         FdEntry owned{};owned.type=FdType::DevUrandom;
-        owned.statusFlags=static_cast<uint32_t>(flags)&~(0x80000u|0x40u|0x80u|0x200u);
         owned.fdFlags=(flags&0x80000u)?1:0;
-        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        int fd=FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
         return fd<0?-EMFILE:fd;
     }
 
@@ -347,8 +347,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         auto* cursor = static_cast<uint32_t*>(kmalloc(sizeof(uint32_t)));
         if (!cursor) return -ENOMEM;
         *cursor = 0; // start from beginning of ring
-        int fd = FdAlloc(proc, FdType::DevKlog, cursor);
-        if (fd < 0) { kfree(cursor); return -EMFILE; }
+        int fd = FdAlloc(proc, FdType::DevKlog, cursor, status, 0, cloexec);
+        if (fd < 0) { kfree(cursor); return fd; }
         DbgPrintf("sys_open: /dev/klog → fd %d\n", fd);
         return fd;
     }
@@ -383,9 +383,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         }
         FdEntry owned{};
         owned.type = FdType::DevDsp; owned.handle = dsp;
-        owned.statusFlags = static_cast<uint32_t>(flags) & ~(0x80000u | 0x40u | 0x80u | 0x200u);
         owned.fdFlags = (flags & 0x80000u) ? 1 : 0;
-        int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), owned, 0, -1, nullptr);
+        int fd = FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
         if (fd < 0) {
             AudioMixerClose(dsp->mixerStreamId);
             kfree(dsp->inputBuffer); kfree(dsp->buffer); kfree(dsp); return -EMFILE;
@@ -411,13 +410,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         for (auto* sf = syntheticFiles; sf->path; ++sf)
         {
             if (StrEq(syntheticPath, sf->path))
-            {
-                // Store pointer to static content in handle, seekPos=0
-                int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(sf->content));
-                if (fd < 0) return -EMFILE;
-                proc->fds[fd].seekPos = 0;
-                return fd;
-            }
+                return OpenSyntheticFile(proc, sf->content, flags);
         }
 
     }
@@ -555,21 +548,20 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         if(int error=NamedFifoAttach(vn,static_cast<uint32_t>(flags))) {VfsClose(vn);return error;}
     }
     FdEntry openedEntry{};openedEntry.type=FdType::Vnode;openedEntry.handle=vn;
-    openedEntry.statusFlags=static_cast<uint32_t>(flags);openedEntry.fdFlags=(flags&0x80000)?1:0;
-    int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),openedEntry,0,-1,nullptr);
-    if(fd<0) {VfsClose(vn);return -EMFILE;}
-
+    openedEntry.fdFlags=(flags&0x80000)?1:0;
     // Keep a bounded diagnostic label; this is never a resolution prefix.
     if (vn->type == VnodeType::Dir)
     {
         uint32_t pi = 0;
-        while (lookupPath[pi] && pi < 62) { proc->fds[fd].dirPath[pi] = lookupPath[pi]; pi++; }
+        while (lookupPath[pi] && pi < 62) { openedEntry.dirPath[pi] = lookupPath[pi]; pi++; }
         // Ensure trailing slash
-        if (pi > 0 && proc->fds[fd].dirPath[pi-1] != '/' && pi < 63)
-            proc->fds[fd].dirPath[pi++] = '/';
-        proc->fds[fd].dirPath[pi] = '\0';
+        if (pi > 0 && openedEntry.dirPath[pi-1] != '/' && pi < 63)
+            openedEntry.dirPath[pi++] = '/';
+        openedEntry.dirPath[pi] = '\0';
     }
-
+    // Each open() creates a new open file description (H-20).
+    int fd=FdPublishNew(proc,openedEntry,static_cast<uint32_t>(flags));
+    if(fd<0) {VfsClose(vn);return fd;}
     return fd;
 }
 int64_t sys_open(uint64_t path,uint64_t flags,uint64_t mode,uint64_t,uint64_t,uint64_t)

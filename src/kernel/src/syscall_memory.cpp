@@ -373,11 +373,11 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     auto* entry=descriptor.get();
     if(entry->type==FdType::Path)return -EBADF;
     if (entry->type == FdType::MemFd && entry->handle) {
-        if ((entry->statusFlags & 3) == 1 ||
-            ((flags & MAP_SHARED) && (prot & 2) && (entry->statusFlags & 3) == 0)) return -13;
+        if ((FdStatus(entry) & 3) == 1 ||
+            ((flags & MAP_SHARED) && (prot & 2) && (FdStatus(entry) & 3) == 0)) return -13;
         if ((flags & MAP_PRIVATE) && (prot & 2)) return -95;
         auto* mfd=static_cast<MemFdData*>(entry->handle);
-        uint32_t maximum=5u|(((flags & MAP_SHARED) && (entry->statusFlags & 3) != 0)?2u:0u);
+        uint32_t maximum=5u|(((flags & MAP_SHARED) && (FdStatus(entry) & 3) != 0)?2u:0u);
         MfdLock(mfd);
         if((flags&MAP_SHARED) && (prot&2) && (mfd->seals.bits&8)) {MfdUnlock(mfd);return -EPERM;}
         if (!MemFdGrowLocked(mfd,offset+length)) {MfdUnlock(mfd);return -ENOMEM;}
@@ -467,8 +467,8 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
     if (entry->type != FdType::Vnode || !entry->handle || static_cast<Vnode*>(entry->handle)->type != VnodeType::File) return -ENODEV;
-    if ((entry->statusFlags & 3) == 1) return -13;
-    if ((flags & MAP_SHARED) && (prot & 2) && (entry->statusFlags & 3) == 0)return -13;
+    if ((FdStatus(entry) & 3) == 1) return -13;
+    if ((flags & MAP_SHARED) && (prot & 2) && (FdStatus(entry) & 3) == 0)return -13;
     auto fileFailure=[&](const char* stage,int64_t result) -> int64_t {
         // Only selected errors-only tracing emits this setup-stage evidence.
         // The mapping core reports its own detailed failure after unlocking.
@@ -493,7 +493,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     backing.value->fileVnode=vnode;
     request.range.kind=MappingKind::File;request.range.backing=backing.value;
     if (flags & MAP_SHARED) request.range.maximumProtection=5u|
-        ((fileObject && vnode->ops->write && (entry->statusFlags&3)!=0)?2u:0u);
+        ((fileObject && vnode->ops->write && (FdStatus(entry)&3)!=0)?2u:0u);
     if (pin == -95) { request.preparedPages=length/4096;request.prepare=PrepareFileMapping; }
     else if (length<=16*1024*1024 && stat.size>offset)
         PageCachePreload(vnode,offset/4096,stat.size,static_cast<uint32_t>(length/4096));

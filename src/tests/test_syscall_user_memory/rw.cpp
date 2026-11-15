@@ -59,29 +59,74 @@ static void RawKeyboardAndDevices() {
     CHECK(brook::sys_read(1,out,300,0,0,0)==300);
     CHECK(reinterpret_cast<const uint8_t*>(out)[299]==0x04);
     CHECK(brook::sys_read(1,g_kernel.Address(),16,0,0,0)==-brook::EFAULT);
-    proc->fds[2].type=brook::FdType::SyntheticMem;proc->fds[2].handle=const_cast<char*>(g_synthetic);
+    proc->fds[2].type=brook::FdType::SyntheticMem;proc->fds[2].handle=const_cast<char*>(g_synthetic);Describe(proc->fds[2],0);
     CHECK(brook::sys_read(2,out,4,0,0,0)==4);
     CHECK(__builtin_memcmp(reinterpret_cast<const void*>(out),"root",4)==0);
-    CHECK(proc->fds[2].seekPos==4);
+    CHECK(brook::OpenFileOffset(proc->fds[2].file)==4);
     CHECK(g_kernel.Intact());
 }
 
 // H-12: a write-only descriptor cannot read a regular file.
 static void WriteOnlyRead() {
     Reset();ResetProcess();auto* proc=CurrentProcess();
-    static int node;
-    proc->fds[3].type=brook::FdType::Vnode;proc->fds[3].handle=&node;proc->fds[3].statusFlags=1; // O_WRONLY
+    static brook::Vnode node{};
+    proc->fds[3].type=brook::FdType::Vnode;proc->fds[3].handle=&node;Describe(proc->fds[3],1); // O_WRONLY
     const uint64_t out=UserAddress(0);
     CHECK(brook::sys_read(3,out,16,0,0,0)==-brook::EBADF);
     CHECK(brook::sys_pread64(3,out,16,0,0,0)==-brook::EBADF);
     // O_RDONLY and O_RDWR reach the filesystem (whose fake read fails).
-    proc->fds[3].statusFlags=0;
+    proc->fds[3].file->statusFlags=0;
     CHECK(brook::sys_read(3,out,16,0,0,0)==-brook::EIO);
-    proc->fds[3].statusFlags=2;
+    proc->fds[3].file->statusFlags=2;
     CHECK(brook::sys_pread64(3,out,16,0,0,0)==-brook::EIO);
 }
 
+// H-20: dup/fork aliases share one open file description (offset and status
+// flags); separate opens of the same file do not.
+static void SharedDescriptions() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    static MemoryFile file;file=MemoryFile{};file.vnode.priv=&file;
+    auto slot=[&](int fd,brook::OpenFile* description) {
+        proc->fds[fd].type=brook::FdType::Vnode;proc->fds[fd].handle=&file.vnode;
+        proc->fds[fd].file=description;
+    };
+    // `cmd >f 2>&1`: fd 1 and its dup fd 2 append at one shared offset.
+    auto* shared=brook::OpenFileCreate(1|0x40|0x200); // O_WRONLY|O_CREAT|O_TRUNC
+    slot(1,shared);slot(2,shared);
+    const uint64_t a=UserAddress(0),b=UserAddress(16);
+    __builtin_memcpy(reinterpret_cast<void*>(a),"a",1);
+    __builtin_memcpy(reinterpret_cast<void*>(b),"b",1);
+    CHECK(brook::sys_write(1,a,1,0,0,0)==1);
+    CHECK(brook::sys_write(2,b,1,0,0,0)==1);
+    CHECK(file.size==2 && __builtin_memcmp(file.bytes,"ab",2)==0);
+    CHECK(brook::OpenFileOffset(shared)==2);
+    CHECK(brook::FdStatus(&proc->fds[2])==1); // call-only flags stripped
+    // A second, independent open starts at 0 and overwrites (Linux).
+    slot(3,brook::OpenFileCreate(1));
+    __builtin_memcpy(reinterpret_cast<void*>(a),"X",1);
+    CHECK(brook::sys_write(3,a,1,0,0,0)==1);
+    CHECK(__builtin_memcmp(file.bytes,"Xb",2)==0 && brook::OpenFileOffset(shared)==2);
+    // O_APPEND on a separate description always lands at EOF.
+    slot(4,brook::OpenFileCreate(1|0x400));
+    __builtin_memcpy(reinterpret_cast<void*>(a),"c",1);
+    CHECK(brook::sys_write(4,a,1,0,0,0)==1);
+    CHECK(file.size==3 && __builtin_memcmp(file.bytes,"Xbc",3)==0);
+    // The shared writer continues after the appended byte only through its own offset.
+    CHECK(brook::sys_write(2,b,1,0,0,0)==1);
+    CHECK(__builtin_memcmp(file.bytes,"Xbb",3)==0 && brook::OpenFileOffset(shared)==3);
+    // Readers sharing a description consume the file once between them.
+    auto* reader=brook::OpenFileCreate(0);
+    slot(5,reader);slot(6,reader);
+    const uint64_t out=UserAddress(64);
+    CHECK(brook::sys_read(5,out,1,0,0,0)==1 && *reinterpret_cast<const char*>(out)=='X');
+    CHECK(brook::sys_read(6,out,2,0,0,0)==2 && __builtin_memcmp(reinterpret_cast<const void*>(out),"bb",2)==0);
+    CHECK(brook::sys_read(5,out,1,0,0,0)==0);
+    // pread does not move the shared offset.
+    CHECK(brook::sys_pread64(6,out,1,0,0,0)==1 && brook::OpenFileOffset(reader)==3);
+}
+
 void RunRwTests() {
+    SharedDescriptions();
     WriteOnlyRead();
     CookedTtyCountZero();
     RawKeyboardAndDevices();

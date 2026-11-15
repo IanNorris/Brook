@@ -102,6 +102,24 @@ struct FdRef
     FdEntry* get() const            { return fde; }
 };
 
+// Linux FMODE_ATOMIC_POS: offset updates on regular files and directories
+// (and memfd / synthetic files) serialize on the description's posLock, so
+// aliases created by dup/fork never interleave a read-modify-write of the
+// shared offset. Devices and pseudo files may block indefinitely and do not.
+inline bool FdAtomicPosition(const FdEntry* fde)
+{
+    if (fde->type == FdType::MemFd || fde->type == FdType::SyntheticMem) return true;
+    if (fde->type != FdType::Vnode || !fde->handle) return false;
+    const VnodeType type = static_cast<const Vnode*>(fde->handle)->type;
+    return type == VnodeType::File || type == VnodeType::Dir;
+}
+
+// Scoped offset of the descriptor's open file description (see open_file.h).
+struct FdPosition : OpenFilePosition
+{
+    explicit FdPosition(const FdEntry* fde) : OpenFilePosition(fde->file, FdAtomicPosition(fde)) {}
+};
+
 bool StrEq(const char* a, const char* b);
 
 } // namespace brook

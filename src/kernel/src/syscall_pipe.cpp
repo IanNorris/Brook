@@ -57,23 +57,21 @@ static int64_t CreatePipe(uint64_t pipefdAddr, uint64_t flags)
     pipe->readers = 1;
     pipe->writers = 1;
 
-    // Allocate read end (flags=0) and write end (flags=1)
-    int readFd = FdAlloc(proc, FdType::Pipe, pipe);
-    if (readFd < 0) { PipeBufferDestroy(pipe); return -EMFILE; }
-    proc->fds[readFd].flags = 0;  // read end
-    proc->fds[readFd].statusFlags = flags & 0x800;
-    proc->fds[readFd].fdFlags = (flags & 0x80000) ? 1 : 0;
+    // Read end (flags=0) and write end (flags=1): two open file descriptions,
+    // each published complete with its status flags and FD_CLOEXEC (L-59).
+    const uint8_t cloexec = (flags & 0x80000) ? 1 : 0;
+    int readFd = FdAlloc(proc, FdType::Pipe, pipe, static_cast<uint32_t>(flags & 0x800), 0, cloexec);
+    if (readFd < 0) { PipeBufferDestroy(pipe); return readFd; }
 
-    int writeFd = FdAlloc(proc, FdType::Pipe, pipe);
+    int writeFd = FdAlloc(proc, FdType::Pipe, pipe, static_cast<uint32_t>(1 | (flags & (0x800 | 0x4000))), 1, cloexec);
     if (writeFd < 0)
     {
-        FdFree(proc, readFd);
-        PipeBufferDestroy(pipe);
-        return -EMFILE;
+        // The write end never existed: drop the read end through its normal
+        // close, which also releases the reader count and the buffer.
+        __atomic_fetch_sub(&pipe->writers, 1, __ATOMIC_ACQ_REL);
+        CloseProcessFd(proc, readFd);
+        return writeFd;
     }
-    proc->fds[writeFd].flags = 1;  // write end
-    proc->fds[writeFd].statusFlags = 1 | (flags & (0x800 | 0x4000));
-    proc->fds[writeFd].fdFlags = (flags & 0x80000) ? 1 : 0;
 
     const int32_t result[2]={readFd,writeFd};
     if(!CopyToUser(pipefdAddr,result,sizeof(result))) {

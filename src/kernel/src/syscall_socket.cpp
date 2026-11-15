@@ -60,9 +60,9 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         if(!socket->identity.inode){kfree(socket);return -ENOMEM;}
         socket->type=type&0xf;socket->nonblock=(type&0x800)!=0;
         SpinLockAcquire(&g_netlinkRegistryLock);socket->next=g_netlinkSockets;g_netlinkSockets=socket;SpinLockRelease(&g_netlinkRegistryLock);
-        FdEntry entry{};entry.type=FdType::NetlinkSocket;entry.handle=socket;entry.statusFlags=2|(type&0x800);entry.fdFlags=(type&0x80000)?1:0;
+        FdEntry entry{};entry.type=FdType::NetlinkSocket;entry.handle=socket;entry.fdFlags=(type&0x80000)?1:0;
         SocketIdentityLabel(socket->identity.inode,entry.dirPath,sizeof(entry.dirPath));
-        int result=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        int result=FdPublishNew(proc,entry,2|(type&0x800));
         if(result<0){NetlinkUnref(socket);return -EMFILE;}return result;
     }
     if (domain == AF_UNIX) {
@@ -104,14 +104,13 @@ int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     FdEntry owned{};
     owned.type = FdType::Socket;
     owned.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(sockIdx + 1));
-    owned.statusFlags = type & UNIX_SOCK_NONBLOCK;
     owned.fdFlags = (type & UNIX_SOCK_CLOEXEC) ? 1 : 0;
     brook::SocketIdentity identity{};
     if (!brook::SockGetIdentity(sockIdx, &identity) ||
         !brook::SocketIdentityLabel(identity.inode, owned.dirPath, sizeof(owned.dirPath))) {
         SockClose(sockIdx); return -ENOMEM;
     }
-    int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), owned, 0, -1, nullptr);
+    int fd = FdPublishNew(proc,owned,type & UNIX_SOCK_NONBLOCK);
     if (fd < 0) {
         SockClose(sockIdx);
         return -EMFILE;
@@ -381,7 +380,7 @@ int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if(usd->socketType==5 && (flagsVal&~(0x40ULL|0x80ULL|0x4000ULL)))return -95;
         if(lenVal && !UserBufferReadable(bufVal,lenVal))return -EFAULT;
-        return UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+        return UnixSocketWriteSome(usd,(flagsVal&0x40)||(FdStatus(fde)&0x800),
             reinterpret_cast<const char*>(bufVal),lenVal,nullptr,0,(flagsVal&0x4000)!=0);
     }
 
@@ -436,7 +435,7 @@ int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
             if(flagsVal&~(0x40ULL|0x20ULL|0x4000ULL))return -95;
             if(lenVal && !UserBufferWritable(bufVal,lenVal))return -EFAULT;
             UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;uint64_t size=0;
-            auto result=UnixSocketReadSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+            auto result=UnixSocketReadSome(usd,(flagsVal&0x40)||(FdStatus(fde)&0x800),
                 reinterpret_cast<char*>(bufVal),lenVal,descriptors,received,nullptr,&size);
             for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
             // The peer is unnamed: report a zero-length address.
@@ -886,14 +885,13 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
     FdEntry accepted{};
     accepted.type = FdType::Socket;
     accepted.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(childIdx + 1));
-    accepted.statusFlags = flags & UNIX_SOCK_NONBLOCK;
     accepted.fdFlags = (flags & UNIX_SOCK_CLOEXEC) ? 1 : 0;
     brook::SocketIdentity identity{};
     if (!brook::SockGetIdentity(childIdx, &identity) ||
         !brook::SocketIdentityLabel(identity.inode, accepted.dirPath, sizeof(accepted.dirPath))) {
         brook::SockClose(childIdx); return -ENOMEM;
     }
-    int newFd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), accepted, 0, -1, nullptr);
+    int newFd = FdPublishNew(proc,accepted,flags & UNIX_SOCK_NONBLOCK);
     if (newFd < 0) {
         brook::SockClose(childIdx);
         return -EMFILE;
@@ -1026,70 +1024,21 @@ struct CmsgHdr {
 // CMSG alignment rounds to sizeof(size_t) = 8 on x86-64.
 static inline uint64_t CmsgAlign(uint64_t n) { return (n + 7) & ~uint64_t{7}; }
 
-// Take an FdEntry snapshot suitable for passing over AF_UNIX. Bumps the
-// underlying handle's refcount so the sender can close their fd without
-// freeing the kernel object out from under the receiver.
+// Take an FdEntry snapshot suitable for passing over AF_UNIX. Like dup(), the
+// snapshot names the SAME open file description (shared offset and status
+// flags, H-20) and owns a handle reference retained by the common dup path,
+// so every fd type dup() supports can be passed and the sender may close its
+// fd before the receiver installs it (L-34).
 static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
 {
     if (!src || src->type == FdType::None) return false;
-    switch (src->type) {
-        case FdType::NetlinkSocket:
-        case FdType::Pipe:
-        case FdType::DevDri:
-        case FdType::DevIntelDri:
-        case FdType::IntelPrime:
-        case FdType::IntelSyncObj:
-        case FdType::SignalFd:
-        case FdType::SyncFile:
-        case FdType::EventFd:
-        case FdType::EpollFd:
-        case FdType::TimerFd:
-            // Own the same endpoint/object reference as dup(). In particular,
-            // queued pipe rights keep readers/writers alive after sender close.
-            FdBumpRefcount(src);
-            break;
-        case FdType::DevNull:
-        case FdType::DevUrandom:
-            // Stateless devices have no allocated handle to retain.
-            break;
-        case FdType::MemFd:
-            if (src->handle) MemFdRef(static_cast<MemFdData*>(src->handle));
-            break;
-        case FdType::Path:
-        case FdType::Vnode:
-            if (src->handle)
-                __atomic_fetch_add(&static_cast<Vnode*>(src->handle)->refCount,
-                                    1, __ATOMIC_RELEASE);
-            break;
-        case FdType::Socket:
-            if (src->handle) {
-                int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(src->handle)) - 1;
-                brook::SockRef(sockIdx);
-            }
-            break;
-        case FdType::UnixSocket:
-            if (src->handle)
-                UnixSocketHandleRef(src->handle);
-            break;
-        case FdType::DrmPrime:
-            // PRIME dmabuf fd: a client hands its render-target capability to the
-            // compositor over the Wayland socket. Bump the object ref so the
-            // sender closing its fd doesn't free it out from under the receiver.
-            if (src->handle) DrmPrimeRef(static_cast<DrmPrimeObj*>(src->handle));
-            break;
-        case FdType::CompositorScene:
-            if (src->handle) SceneHandleRef(static_cast<SceneHandle*>(src->handle));
-            break;
-        default:
-            // Other fd types (DevDsp, DevTty, etc.)
-            // don't have a portable snapshot refcount today.
-            return false;
-    }
-    out->type        = src->type;
-    out->flags       = src->flags;
-    out->fdFlags     = src->fdFlags;
-    out->statusFlags = src->statusFlags;
-    out->handle      = src->handle;
+    FdEntry copy = *src;
+    if (!FdRetainCopy(&copy)) return false;
+    out->type    = copy.type;
+    out->flags   = copy.flags;
+    out->fdFlags = copy.fdFlags;
+    out->file    = copy.file;
+    out->handle  = copy.handle;
     return true;
 }
 
@@ -1103,7 +1052,7 @@ static int UnixFdSnapInstall(Process* dst, const UnixFdSnap* snap)
     owned.handle = snap->handle;
     owned.flags = snap->flags;
     owned.fdFlags = snap->fdFlags;
-    owned.statusFlags = snap->statusFlags;
+    owned.file = snap->file; // the receiver shares the sender's description
     if(owned.type==FdType::NetlinkSocket)SocketIdentityLabel(static_cast<NetlinkSocket*>(owned.handle)->identity.inode,owned.dirPath,sizeof(owned.dirPath));
     if (owned.type == FdType::Socket) {
         // The queued snapshot owns a socket reference. Reconstruct its cached
@@ -1119,63 +1068,10 @@ static int UnixFdSnapInstall(Process* dst, const UnixFdSnap* snap)
 
 void UnixFdSnapRelease(const UnixFdSnap* snap)
 {
-    if (!snap || !snap->handle) return;
-    switch (snap->type) {
-        case FdType::NetlinkSocket:NetlinkUnref(static_cast<NetlinkSocket*>(snap->handle));break;
-        case FdType::Pipe:
-            PipeReleaseEnd(static_cast<PipeBuffer*>(snap->handle), (snap->flags & 1) != 0);
-            break;
-        case FdType::SignalFd:
-            SignalFdUnref(static_cast<SignalFd*>(snap->handle));break;
-        case FdType::SyncFile:
-            SyncFileUnref(static_cast<SyncFileData*>(snap->handle));break;
-        case FdType::EventFd:
-            EventFdUnref(static_cast<EventFdData*>(snap->handle));
-            break;
-        case FdType::EpollFd:
-            EpollFdUnref(static_cast<EpollInstance*>(snap->handle));
-            break;
-        case FdType::TimerFd:
-            TimerFdUnref(static_cast<TimerFdData*>(snap->handle));
-            break;
-        case FdType::MemFd:
-            MemFdUnref(static_cast<MemFdData*>(snap->handle));
-            break;
-        case FdType::Path:
-        case FdType::Vnode: {
-            auto* vn = static_cast<Vnode*>(snap->handle);
-            uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
-            if (prev <= 1) VfsClose(vn);
-            break;
-        }
-        case FdType::Socket: {
-            int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(snap->handle)) - 1;
-            brook::SockUnref(sockIdx);
-            break;
-        }
-        case FdType::UnixSocket: {
-            UnixSocketHandleUnref(snap->handle);
-            break;
-        }
-        case FdType::DevDri:
-            // Queued rights own the same DRM context reference as dup().
-            // Share ordinary final-close retirement when a message is discarded.
-            FinalizeClosedFd({FdType::DevDri,snap->handle,snap->flags});
-            break;
-        case FdType::DevIntelDri:
-            brook::BdwGpuFileUnref(static_cast<brook::BdwGpuFile*>(snap->handle));break;
-        case FdType::IntelPrime:
-            brook::BdwGpuBufferUnref(static_cast<brook::BdwGpuBuffer*>(snap->handle));break;
-        case FdType::IntelSyncObj:
-            brook::BdwGpuSyncUnref(static_cast<brook::BdwGpuSync*>(snap->handle));break;
-        case FdType::DrmPrime:
-            DrmPrimeUnref(static_cast<DrmPrimeObj*>(snap->handle));
-            break;
-        case FdType::CompositorScene:
-            SceneHandleUnref(static_cast<SceneHandle*>(snap->handle));
-            break;
-        default: break;
-    }
+    // Exactly the references UnixFdSnapFrom took: the handle as dup() retains
+    // it and the open file description (L-34: one teardown path).
+    if (!snap) return;
+    FinalizeClosedFd({snap->type, snap->handle, snap->flags, snap->file});
 }
 
 struct LinuxMsgHdr {
@@ -1295,7 +1191,7 @@ int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if(usd->socketType==5) {
         UnixRecordVector stage;
         if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,true))return failControl(error);
-        auto result=UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+        auto result=UnixSocketWriteSome(usd,(flagsVal&0x40)||(FdStatus(fde)&0x800),
             stage.bytes,stage.length,pendingSnaps,pendingCount,(flagsVal&0x4000)!=0,
             hasExplicitCredentials?&explicitCredentials:nullptr);
         if(result<0)return failControl(static_cast<int>(result));
@@ -1308,7 +1204,7 @@ int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
             return total?total:-EFAULT;
         }
-        auto n=UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+        auto n=UnixSocketWriteSome(usd,(flagsVal&0x40)||(FdStatus(fde)&0x800),
             static_cast<const char*>(iov.iov_base),iov.iov_len,pendingSnaps,pendingCount,(flagsVal&0x4000)!=0,
             hasExplicitCredentials?&explicitCredentials:nullptr);
         if(n>0) {pendingCount=0;total+=n;}
@@ -1427,7 +1323,7 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         if(record) {
             UnixRecordVector stage;
             if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,false))return error;
-            total=UnixSocketReadSome(usd,dontwait || (fde->statusFlags&0x800),stage.bytes,stage.capacity,
+            total=UnixSocketReadSome(usd,dontwait || (FdStatus(fde)&0x800),stage.bytes,stage.capacity,
                 descriptors,received,passCredentials?&sender:nullptr,&messageLength,&consumed);
             if(total<0)return total;
             if(int error=stage.Scatter(total)) {
@@ -1441,7 +1337,7 @@ int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                 return total?total:-EFAULT;
             }
             int count=0;
-            auto n=UnixSocketReadSome(usd,dontwait || total>0 || (fde->statusFlags&0x800),
+            auto n=UnixSocketReadSome(usd,dontwait || total>0 || (FdStatus(fde)&0x800),
                 static_cast<char*>(iov.iov_base),iov.iov_len,descriptors,count,passCredentials ? &sender : nullptr);
             received=count;
             if(n<0 && !total)return n;

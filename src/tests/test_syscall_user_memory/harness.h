@@ -19,6 +19,7 @@
 #include "apic.h"
 #include "process.h"
 #include "net.h"
+#include "vfs.h"
 #include <stdint.h>
 
 namespace harness {
@@ -44,6 +45,17 @@ extern KernelCanary g_kernel;
 
 brook::Process* CurrentProcess();   // zeroed, PROCESS_MAGIC, pid 7
 void ResetProcess();
+// Give a hand-built slot its own open file description (H-20) with the given
+// O_* status flags; returns it. Tests may share it between slots to model dup.
+brook::OpenFile* Describe(brook::FdEntry& entry,uint32_t status);
+// A regular-file vnode whose VfsRead/VfsWrite/VfsAppend fakes operate on this
+// buffer (vnode.priv). Other vnodes keep failing with -EIO.
+struct MemoryFile {
+    brook::Vnode vnode{};
+    char bytes[256]{};
+    uint64_t size=0;
+    MemoryFile() { vnode.priv=this; }
+};
 
 // Called before every checked user copy (address, length, true = to user).
 // Tests use it to assert no spinlock is held across user memory access.

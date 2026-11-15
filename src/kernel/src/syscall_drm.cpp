@@ -433,8 +433,8 @@ int CreateCompletedSyncFile(Process* process) {
     auto* file=static_cast<SyncFileData*>(kmalloc(sizeof(SyncFileData)));
     if(!file)return -ENOMEM;
     *file={1,ClockNowNs(1),__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED)};
-    FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;owned.statusFlags=0;
-    const int fd=FdTablePublishOwnedPinned(process->fds,ProcessFdLock(process),owned);
+    FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;
+    const int fd=FdPublishNew(process,owned,0,true);
     if(fd<0)SyncFileUnref(file);
     return fd;
 }
@@ -445,7 +445,7 @@ int CreateIntelSyncFile(Process* process,BdwFence* fence) {
     BdwFenceRef(fence);
     *file={1,0,__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED),fence};
     FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;
-    const int fd=FdTablePublishOwnedPinned(process->fds,ProcessFdLock(process),owned);
+    const int fd=FdPublishNew(process,owned,0,true);
     if(fd<0)SyncFileUnref(file);
     return fd;
 }
@@ -1006,8 +1006,8 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
            !request.bytes || request.bytes>BROOK_BDW_CACHE_PROBE_MAX_BYTES || (request.omit&~3u))return -EINVAL;
         auto* buffer=brook::BdwGpuBufferCreateCacheProbe(request.bytes,request.omit);
         if(!buffer)return -ENOMEM;
-        FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;owned.statusFlags=2;
-        const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;
+        const int fd=FdPublishNew(proc,owned,2);
         if(fd<0){brook::BdwGpuBufferUnref(buffer);return fd;}
         request.fd=fd;
         if(CopyToUser(arg,&request,sizeof(request)))return 0;
@@ -1050,7 +1050,7 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
         if((cmd&255)==0xc1){
             auto* sync=brook::BdwGpuFileGetSync(file,request.handle);if(!sync)return -ENOENT;
             FdEntry owned{};owned.type=FdType::IntelSyncObj;owned.handle=sync;owned.fdFlags=1;
-            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            const int fd=FdPublishNew(proc,owned,0);
             if(fd<0){brook::BdwGpuSyncUnref(sync);return -EMFILE;}
             request.fd=fd;if(!CopyToUser(arg,&request,ioctlSize)){CloseProcessFd(proc,fd);return -EFAULT;}
             return 0;
@@ -1073,8 +1073,8 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
             if(request.flags&~(0x80000u|2u))return -EINVAL; // DRM_CLOEXEC | DRM_RDWR
             auto* buffer=brook::BdwGpuFileGetBuffer(file,request.handle);if(!buffer)return -ENOENT;
             FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;
-            owned.fdFlags=(request.flags&0x80000u)?1:0;owned.statusFlags=(request.flags&2)?2:0;
-            const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+            owned.fdFlags=(request.flags&0x80000u)?1:0;
+            const int fd=FdPublishNew(proc,owned,(request.flags&2)?2:0);
             if(fd<0){brook::BdwGpuBufferUnref(buffer);return -EMFILE;}
             request.fd=fd;
             if(!CopyToUser(arg,&request,sizeof(request))){CloseProcessFd(proc,fd);return -EFAULT;}
