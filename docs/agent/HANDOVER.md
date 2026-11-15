@@ -2,7 +2,7 @@
 
 Current state and immediate goal. Keep this short and current: replace stale lines rather than appending. Put detailed run records in [AGENT_JOURNAL.md](AGENT_JOURNAL.md), the previous agent's ~1 MB append-only log (newest entries at the top). Decisions belong in [DECISIONS.md](DECISIONS.md), and working preferences in [WORKING_STYLE.md](WORKING_STYLE.md).
 
-_Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall fix pass)._
+_Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 ## Workspace
 
@@ -91,6 +91,13 @@ _Last updated: 15 November 2026 (afternoon), by a Claude Code session (syscall f
 - `clock status` reports `tsc`/`invariant-tsc`. Under load, monotonic tracks TSC; LAPIC ticks lose ~7%, which no longer matters.
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
+
+**15 Nov evening (Ian's review; Dell gen 411, session `f9d5a5d80c9240239a1f464cbdc8fd00`):**
+- **Dell hang:** after Ian's Firefox crash the machine showed the Firefox crash reporter ("failed to generate crash information") but was off the network (no ping, no bridge). No panic record; Ian rebooted. A private-profile Firefox rerun did not crash (one content child exits on signal 9 every launch, and the crash-reporter background task exits 3). Not reproduced yet.
+- **Chrome is GPU-accelerated:** the installed launcher uses ANGLE/GLES on Iris, Ian's profile has hardware acceleration on, and a private-profile local 720p30 H.264 loop played at 29.6 fps with rAF 61.6 Hz and 16 drops in total. App GPU 30 jobs/s (22% busy), compositor 40% plus present 24% of GPU time, CPU 85% idle. Video decode is software by design. Evidence: `display-perf/build/dell/chrome-rate-local/`.
+- **Firefox is the weak one:** on the same clip it reports 30 decoded/s but ~18 dropped/s (`build/dell/ff-probe2/`).
+- **Chrome's default frame:** with "Use system title bar" off, Chromium already draws its tabs at the top with no Brook bar, but shows only a Close button. Ian rejected the system-title-bar look (`work/chromium-frame` is not wanted); `work/chrome-csd` is getting min/max/close (Brook-styled if possible) into the CSD mode.
+- **In flight:** `work/ui-drawer` (Glass/Opaque themes, rail-and-peek, launcher), `work/bridge-indicator` (taskbar agent icon), `work/tap-click`, `work/open-file` (H-20 shared open-file description, Ian: match Linux), `work/chrome-csd`.
 
 **15 Nov, gen 411 (prompt GPU wakeups on by default, autonomous):**
 - **Main is `d84d2c2f`.** M4a prompt wakeups now default to on during Dell boot; `/etc/dell-gpu-no-prompt-wake` opts out, and `gpu wakeups on|off` still switches at runtime.
