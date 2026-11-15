@@ -658,7 +658,7 @@ static void trace_frames_report(uint32_t now) {
                 wl_list_length(&s->committed_frames), s->trace_request_max_ms, s->trace_committed_max_ms);
     }
 }
-static unsigned long long g_opaque_null,g_opaque_infinite,g_opaque_rects[5];static int32_t g_opaque_last[6];
+static unsigned long long g_opaque_null,g_opaque_infinite,g_opaque_rects[5];static int32_t g_opaque_last[6];static int g_opaque_last_kind=-1;
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
     (void)c;
@@ -666,6 +666,7 @@ static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r
     const struct pointer_region *region=reg?wl_resource_get_user_data(reg):NULL;
     s->pending_opaque_set=region && !region->infinite && region->count==1 && region->ops[0].add;
     /* What clients send (status file "opaque_regions"). */
+    g_opaque_last_kind=!region?0:region->infinite?2:1;
     if(!region)++g_opaque_null;else if(region->infinite)++g_opaque_infinite;
     else{++g_opaque_rects[region->count<4?region->count:4];
         if(region->count){g_opaque_last[0]=region->ops[0].x;g_opaque_last[1]=region->ops[0].y;g_opaque_last[2]=region->ops[0].w;
@@ -3479,9 +3480,9 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
         (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
     fprintf(f,"\"opaque_regions\":{\"null\":%llu,\"infinite\":%llu,\"by_ops\":[%llu,%llu,%llu,%llu,%llu],"
-        "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
+        "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d,\"last_kind\":%d,\"opaque_views\":%llu},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
         g_opaque_rects[2],g_opaque_rects[3],g_opaque_rects[4],g_opaque_last[0],g_opaque_last[1],g_opaque_last[2],g_opaque_last[3],
-        g_opaque_last[4],g_opaque_last[5]);
+        g_opaque_last[4],g_opaque_last[5],g_opaque_last_kind,g_opaque_views);
     fprintf(f,"\"layered\":{\"enabled\":%d,\"offers\":%llu,\"safe\":%llu,\"presented\":%llu,\"wait\":%llu,\"full\":%llu,"
         "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu},",gpu_layers_enabled(),
         (unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_safe,(unsigned long long)g_gpu_group_presented,
@@ -3500,8 +3501,11 @@ static void waylandd_status_write(const char *display){
         BrookWindowState state={0};
         const int known=!syscall(BROOK_SYS_WM_WINDOW_STATE,(long)w->wm,0L,(long)&state,(long)sizeof(state),0L,0L) &&
             state.version==BROOK_WINDOW_STATE_VERSION && state.window==w->wm;
-        fprintf(f,"%s{\"wm\":%u,\"vfb\":[%u,%u],\"client\":[%u,%u],\"scale\":%u,\"path\":\"%s\",\"count\":%u,\"layers\":[",
-            first?"":",",w->wm,w->vfb_w,w->vfb_h,known?state.width:0,known?state.height:0,
+        const struct brook_surface *rs=NULL;for(const struct brook_surface *x=g_surfaces;x;x=x->next)if(x->wm_id==w->wm && !x->tree.parent){rs=x;break;}
+        if(rs)fprintf(f,"%s{\"opaque_region\":[%d,%d,%d,%d,%d],",first?"":",",rs->opaque_set,rs->opaque_x,rs->opaque_y,rs->opaque_w,rs->opaque_h);
+        else fprintf(f,"%s{",first?"":",");
+        fprintf(f,"\"wm\":%u,\"vfb\":[%u,%u],\"client\":[%u,%u],\"scale\":%u,\"path\":\"%s\",\"count\":%u,\"layers\":[",
+            w->wm,w->vfb_w,w->vfb_h,known?state.width:0,known?state.height:0,
             w->scale,w->path>=0 && w->path<LAYER_PATHS?g_layer_path_names[w->path]:"?",w->count);first=0;
         for(unsigned k=0;k<w->count && k<4;++k)fprintf(f,"%s{\"kind\":\"%c\",\"buf\":[%u,%u],\"dst\":[%u,%u],\"at\":[%lld,%lld],"
             "\"src24_8\":[%u,%u],\"fmt\":%u,\"opaque\":%d,\"offer\":%d}",k?",":"",w->l[k].kind,w->l[k].w,w->l[k].h,w->l[k].dw,w->l[k].dh,
