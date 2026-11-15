@@ -576,6 +576,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 #endif
     if (fde->type == FdType::Vnode && fde->handle && !FdNamedFifo(fde))
     {
+        // A write-only descriptor cannot read, whatever the file mode.
+        if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
                               static_cast<uint32_t>(count), &fde->seekPos);
@@ -1377,6 +1379,7 @@ int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
     if (fde->type == FdType::Vnode && fde->handle)
     {
+        if (!FdOpenForReading(fde)) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
         uint64_t pos = offset;
         return VfsRead(vn, reinterpret_cast<void*>(bufAddr),

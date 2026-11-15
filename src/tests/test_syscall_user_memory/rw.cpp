@@ -66,7 +66,23 @@ static void RawKeyboardAndDevices() {
     CHECK(g_kernel.Intact());
 }
 
+// H-12: a write-only descriptor cannot read a regular file.
+static void WriteOnlyRead() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    static int node;
+    proc->fds[3].type=brook::FdType::Vnode;proc->fds[3].handle=&node;proc->fds[3].statusFlags=1; // O_WRONLY
+    const uint64_t out=UserAddress(0);
+    CHECK(brook::sys_read(3,out,16,0,0,0)==-brook::EBADF);
+    CHECK(brook::sys_pread64(3,out,16,0,0,0)==-brook::EBADF);
+    // O_RDONLY and O_RDWR reach the filesystem (whose fake read fails).
+    proc->fds[3].statusFlags=0;
+    CHECK(brook::sys_read(3,out,16,0,0,0)==-brook::EIO);
+    proc->fds[3].statusFlags=2;
+    CHECK(brook::sys_pread64(3,out,16,0,0,0)==-brook::EIO);
+}
+
 void RunRwTests() {
+    WriteOnlyRead();
     CookedTtyCountZero();
     RawKeyboardAndDevices();
 }

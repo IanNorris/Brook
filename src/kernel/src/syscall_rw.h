@@ -11,6 +11,8 @@
 namespace brook {
 
 bool IsTerminalFd(const FdEntry* fde);
+// O_ACCMODE check shared by the read paths: O_WRONLY descriptors are EBADF.
+inline bool FdOpenForReading(const FdEntry* fde) { return (fde->statusFlags & 3) != 1; }
 
 // Backend/VFS byte results are signed int. Bound ordinary writes rather than
 // narrowing a 64-bit request (which can wrap to zero or a negative result).
