@@ -1,5 +1,34 @@
 # Brook project handover
 
+**Caption block sized to Chromium's tab strip; launcher bundle; rebased (`work/chrome-csd` `d53bc0ed`, QEMU only):**
+- **Rebased** onto main `2f3372e0`; the earlier HANDOVER line was dropped.
+- **Sliver fix:** Chromium's tab strip is 40 surface units restored and maximised: 40 px in QEMU, 80 px on the Dell at scale 2. Syscall 512's 4th argument now carries the client strip height, and waylandd's `BROOK_WAYLAND_CAPTION_APPS` entries take `:height` (default `chromium:40,google-chrome:40`).
+- **QEMU v3:**
+  - Restored: block 50–89, toolbar from 90.
+  - Maximised: block 0–39, toolbar from 40.
+  - The 4 px sliver is gone. Before/after crops are `build/csd-qemu/evidence/2{0,1,3,5}-sliver-*.png`.
+- **Host tests:** 360/361 under load; `test_audio_delivery` passed alone.
+- **Launcher bundle:** `build/chrome-launcher-stage/bundle.tar`, built by `tools/launcher-stage/make_bundle.py`. It installs `svypzdsv…-brook-hardware-network-launchers` and swaps only `/nix/profile/bin/brook-chromium`, writing a rollback record. The installer was checked on the host in a user namespace.
+- **Dell pair (not deployed):** `build/dell/pair-chrome-csd-20261116` (payload `dell-chrome-csd-20261116`, kernel `46e7b93f…`, initrd `3aa9087d…`) passed `check_dell_image_qemu.py --attempts 4` (attempt 1 stalled in firmware, attempt 2 passed).
+- **Note:** in this busy guest, a click sent in the same instant as the pointer move sometimes missed the button; a hover-then-click worked.
+
+**Chromium tabs in the title area, with Brook's caption buttons overlaid (`work/chrome-csd` `78ce6db0`; QEMU only):**
+- **Finding:** Chromium already decorates client-side by default (tab strip at the top). It showed only a close button because GTK reads GNOME `button-layout` from GSettings, and with no dconf that is the schema default `appmenu:close`.
+- **Kernel WM:** new caption overlay. A CSD window carries right/top shadow insets; the WM draws and hit-tests only its min/max/close block at the top-right of the window geometry. Implemented across the CPU compositor, GPU chrome layer and desktop-renderer chrome capture, and the renderer gives an overlay chrome surface no hole.
+- **Syscall 512 mode 2:** packs the insets and returns 2 when the overlay is applied.
+- **waylandd:** `BROOK_WAYLAND_CAPTION_APPS`, default `chromium,google-chrome`.
+- **Launcher (branch only, not installed):** writes GSettings keyfile `button-layout=':minimize,maximize,close'` plus `GSETTINGS_BACKEND=keyfile`.
+- **QEMU results** (worktree build on the Oct 28 windows-refresh seed, software Chromium 148, private `/tmp` profiles):
+  - The overlay is at the right place restored (insets 16,10) and maximised (0,0).
+  - Layout `:` lets tabs run under the block; the full layout keeps them clear, with Chromium's own buttons (~100 px) hidden under the 138 px block.
+  - Strip drag (`xdg_toplevel.move`), double-click maximise (`set_maximized`), and Brook's maximise/restore, minimise and close all work, with hover colours shown. The terminal and popups are unchanged.
+- **Tests:** host `test_desktop_metrics`, `test_wm_chrome_key`, the full suite (fd_table, sched_lock_owner and audio_delivery rerun alone) and `DESKTOP_TRACK_PASS` pass.
+- **Dell pair:** `build/dell/pair-chrome-csd` (payload `dell-chrome-csd-20261115`, kernel `4a6c6868…`, initrd `2b4900ef…`) passed `--qemu-check`; not deployed.
+- **Limits:**
+  - The QEMU debug TCP bridge failed: SYN-ACKs were not completing, and the same happened in another agent's VM. Input and capture therefore went through QMP directly.
+  - Chromium startup in QEMU took ~30 min under host load.
+  - Evidence: `build/csd-qemu/evidence/`.
+
 **Steam shortcut installed on the Dell.** New generation-354 boot `3f2b585d80f0405d9720b5a314dc4125`, session `1a156ab25d334f86aa2dab528ae9e2ca`, has fresh debug capacity. Installed `scripts/workloads/brook_steam_launcher.py` as `/data/home/.local/share/brook/steam/brook-steam`; its prerequisite check passed. Added the `brook-steam` entry to the live application index, saved `applications.idx.before-steam`, synced and refreshed the catalog. Bridge catalog generation 2 lists Steam as launch eligible. Steam itself was not started; its runtime and window behavior remain unverified. Regenerating the index may remove this device-local entry. The old Quake RAM traces did not survive the reboot.
 
 **Goal blocked pending Dell reboot.** Rechecked generation-354 boot `06a716baff8e42c6922abf8b5d2edf70`: debug bridge reachable, writable desktop ready, compositor job `820a129fb76240cab24b735c8e110149` still running PID 84/incarnation 6103. The retained job table is full and the checked restart was cancelled because it waited for this debug job. The current boot lacks the VM-tested termination API, and its two last Quake swap traces remain unexported in RAM. The user has been asked for a normal reboot; after it, attach explicitly to the new boot and use the latest profiling candidate described below. Goal marked blocked until that external change; the old session remains available.

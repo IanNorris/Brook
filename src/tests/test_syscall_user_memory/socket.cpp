@@ -145,7 +145,59 @@ static void RightsShareDescription() {
     }
 }
 
+// getsockopt(IPPROTO_TCP, TCP_INFO): Linux struct tcp_info, truncated to the
+// caller's length, which is written back as min(len, sizeof).
+static void TcpInfo() {
+    Begin();
+    const uint64_t value=UserAddress(0),length=UserAddress(PageSize);
+    Put<int32_t>(length,sizeof(brook::LinuxTcpInfo));
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==-95); // UDP: EOPNOTSUPP, as ip_getsockopt
+    g_net.tcp=true;
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,g_kernel.Address(),0)==-brook::EFAULT);
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,g_kernel.Address(),length,0)==-brook::EFAULT);
+    CHECK(g_kernel.Intact());
+    Put<int32_t>(length,-1);
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==-brook::EINVAL);
+    Put<int32_t>(length,1024);
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==0);
+    CHECK(Get<uint32_t>(length)==248);
+    const auto info=Get<brook::LinuxTcpInfo>(value);
+    CHECK(info.state==1 && info.sndMss==1400 && info.rcvMss==1460 && info.pmtu==1500);
+    CHECK(info.unacked==2 && info.sndWnd==65535 && info.rcvWnd==4096 && info.bytesAcked==5000);
+    CHECK(info.segsIn==7 && info.segsOut==9 && info.lastDataRecv==250 && info.ato==40000);
+    CHECK((info.options&4) && (info.wscale&15)==7 && info.rtt==0);
+    // A short buffer (older struct layouts) receives a prefix.
+    Put<uint64_t>(value+104,0x3333333333333333ULL);
+    Put<int32_t>(length,104);
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==0);
+    CHECK(Get<uint32_t>(length)==104 && Get<uint64_t>(value+104)==0x3333333333333333ULL);
+    g_net.tcpState=1; // Listen
+    Put<int32_t>(length,8);
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==0 && Get<uint8_t>(value)==10);
+    // Other TCP-level options remain ENOPROTOOPT.
+    CHECK(brook::sys_getsockopt(SocketFd,6,1,value,length,0)==-92);
+}
+
+// socketpair() with one free slot publishes neither end (no rollback that
+// closes a possibly reused number) and releases both endpoints.
+static void SocketpairAtFullTable() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    for(unsigned fd=0;fd<brook::MAX_FDS;++fd)proc->fds[fd].type=brook::FdType::DevNull;
+    proc->fds[10].type=brook::FdType::None;
+    const uint64_t out=UserAddress(0);
+    CHECK(brook::sys_socketpair(1,1,0,out,0,0)==-brook::EMFILE);
+    CHECK(proc->fds[10].type==brook::FdType::None);
+    proc->fds[20].type=brook::FdType::None;
+    CHECK(brook::sys_socketpair(1,1|0x80000,0,out,0,0)==0);
+    const auto* fds=reinterpret_cast<const int32_t*>(out);
+    CHECK(fds[0]==10 && fds[1]==20);
+    CHECK(proc->fds[10].type==brook::FdType::UnixSocket && proc->fds[20].type==brook::FdType::UnixSocket);
+    CHECK(proc->fds[10].fdFlags==1 && proc->fds[10].file && proc->fds[10].file!=proc->fds[20].file);
+}
+
 void RunSocketTests() {
+    TcpInfo();
+    SocketpairAtFullTable();
     RightsShareDescription();
     Bind();
     SendTo();

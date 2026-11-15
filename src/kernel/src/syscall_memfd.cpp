@@ -100,6 +100,8 @@ void MemFdReleaseMapping(void* object) {
 
 // Publish a complete independent descriptor while retaining object ownership
 // under fdLock, so a sibling close cannot race partially initialized flags.
+// The caller must hold its own reference to mfd for the whole call: the
+// descriptor's reference is taken first and dropped again on failure.
 int MemFdInstall(Process* proc, MemFdData* mfd, uint32_t flags)
 {
     if (!proc || !proc->fds) return -EMFILE;
@@ -318,11 +320,16 @@ int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     mfd->size         = 0;
     mfd->capacity     = 0;
     mfd->lock         = 0;
-    mfd->refCount     = 0; // bumped by FdAlloc below
+    // This call owns one reference while it publishes. MemFdInstall takes the
+    // descriptor's own reference only if publication succeeds, so dropping
+    // ours afterwards either leaves the descriptor as sole owner or frees an
+    // object nobody else ever saw. (Freeing it here as well as inside a failed
+    // install was a double free under EMFILE: Steam gen 415 panic.)
+    mfd->refCount     = 1;
     mfd->seals        = {flags&MFD_ALLOW_SEALING?0u:1u,0};
 
     int fd = MemFdInstall(proc, mfd, 2u | ((flags & MFD_CLOEXEC) ? 0x80000u : 0));
-    if (fd < 0) kfree(mfd);
+    MemFdUnref(mfd);
 
     if (memfdTraceEnabled) {
         uint32_t previous=__atomic_load_n(&memfdTraceSequence,__ATOMIC_RELAXED);

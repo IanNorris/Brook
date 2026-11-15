@@ -487,8 +487,9 @@ struct Process
     uint32_t sigAltstackSize;   // Alternate stack size
     uint32_t sigAltstackFlags;  // SS_DISABLE, SS_ONSTACK, etc.
 
-    // Alarm timer (SIGALRM delivery)
-    uint64_t alarmTick;         // LAPIC tick at which to deliver SIGALRM (0 = disabled)
+    // Unused since alarm() moved to the group interval timer (posix_timer.h);
+    // kept so later field offsets stay stable.
+    uint64_t alarmTick;
 
     // Signal delivery state
     bool     inSignalHandler;   // Legacy diagnostic hint, not delivery authority
@@ -774,6 +775,17 @@ int       FdAlloc(Process* proc, FdType type, void* handle, uint32_t openFlags =
 // the caller adopts the publication pin (see FdTablePublishOwnedPinned).
 int       FdPublishNew(Process* proc, const FdEntry& owned, uint32_t openFlags,
                        bool pinned = false, void (*published)(int, const FdEntry&) = nullptr);
+// Publish two new descriptions atomically (pipe, socketpair): on success
+// out[0..1] hold both numbers; on failure (-EMFILE/-ENOMEM) nothing was
+// published and both handles stay the caller's. No close-by-number rollback.
+int       FdPublishNewPair(Process* proc, const FdEntry& first, uint32_t firstFlags,
+                           const FdEntry& second, uint32_t secondFlags, int out[2],
+                           void (*published)(int, const FdEntry&) = nullptr);
+// Publish `owned` with a description the caller created beforehand (for
+// callers holding a spinlock that must not allocate). On success the slot
+// owns `file`; on failure the caller still owns it (release it unlocked).
+int       FdPublishPrepared(Process* proc, const FdEntry& owned, OpenFile* file,
+                            void (*published)(int, const FdEntry&) = nullptr);
 void      FdFree(Process* proc, int fd);
 FdEntry*  FdGet(Process* proc, int fd);
 

@@ -33,4 +33,7 @@ int SysvSemClone(Process* parent, Process* child, bool share);
 // Outside scheduler locks, before dropping termination's temporary reference.
 // Allocation-free, non-sleeping, idempotent; safe with interrupts disabled.
 void SysvSemExit(Process*);
+// Identity of the task's SEM_UNDO list (shared by CLONE_SYSVSEM), 0 until the
+// first SEM_UNDO operation creates one, like Linux's sysvsem.undo_list (kcmp).
+uintptr_t SysvSemUndoIdentity(Process*);
 }

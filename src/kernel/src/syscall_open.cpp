@@ -19,6 +19,8 @@
 #include "syscall_drm.h"
 #include "syscall_open.h"
 #include "syscall_handlers.h"
+#include "synthetic_system_files.h"
+#include "smp.h"
 
 namespace brook {
 
@@ -79,6 +81,70 @@ static int64_t OpenSyntheticFile(Process* proc, const char* content, uint64_t fl
     if ((flags & 3) || (flags & 0x200)) return -13; // EACCES: write or O_TRUNC
     return FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(content),
                    static_cast<uint32_t>(flags), 0, (flags & 0x80000) ? 1 : 0);
+}
+
+// /dev/tty, /dev/console — controlling terminal
+// In WM terminal mode (stdin is a pipe), dup the stdin pipe so bash's
+// /dev/tty reads go through the terminal's input pipe instead of consuming
+// raw keyboard events from the input subsystem.
+static int64_t OpenTerminalDevice(Process* proc,const char* path,uint64_t flags)
+{
+    const uint8_t cloexec=(flags&0x80000)?1:0;
+    const uint32_t status=static_cast<uint32_t>(flags);
+    // Pin fds 0 and 1 so a sibling's close or dup2 cannot free the pipes
+    // while they are borrowed, retain both ends, and only then publish
+    // the complete descriptor (with its access mode and O_CLOEXEC).
+    FdRef input(proc, 0), output(proc, 1);
+    if (input && input->type == FdType::Pipe && input->handle &&
+        output && output->type == FdType::Pipe && output->handle)
+    {
+        // Terminal mode: /dev/tty reads from stdin pipe, writes to stdout pipe
+        auto* pair = static_cast<TtyDevicePair*>(kmalloc(sizeof(TtyDevicePair)));
+        if (!pair) return -ENOMEM;
+        pair->readPipe = input->handle;
+        pair->writePipe = output->handle;
+        auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+        auto* wp = static_cast<PipeBuffer*>(pair->writePipe);
+        __atomic_fetch_add(&rp->readers, 1, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&wp->writers, 1, __ATOMIC_RELEASE);
+        FdEntry entry{};
+        entry.type = FdType::DevTty;
+        entry.handle = pair;
+        entry.fdFlags = (flags & 0x80000) ? 1 : 0;
+        int fd = FdPublishNew(proc,entry,2); // O_RDWR
+        if (fd < 0) {
+            PipeReleaseEnd(rp, false);
+            PipeReleaseEnd(wp, true);
+            kfree(pair);
+            return -EMFILE;
+        }
+        return fd;
+    }
+    int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr, status, 0, cloexec);
+    if (fd < 0) return fd;
+    DbgPrintf("sys_open: %s → fd %d (keyboard/tty)\n", path, fd);
+    return fd;
+}
+
+// Character device inodes (the boot /dev tmpfs, or binds of its nodes into
+// a container) select their driver by device number, never by name, as on
+// Linux. The VFS open has already applied permissions and the NODEV check.
+static int64_t OpenCharacterDevice(Process* proc,uint64_t rdev,const char* path,uint64_t flags)
+{
+    if(flags&0x10000)return -ENOTDIR;
+    FdType type=FdType::None;
+    switch(rdev) {
+        case 0x0103: type=FdType::DevNull;break;
+        case 0x0105: type=FdType::DevZero;break;
+        case 0x0107: type=FdType::DevFull;break;
+        case 0x0108: case 0x0109: type=FdType::DevUrandom;break;
+        case 0x0500: case 0x0501: return OpenTerminalDevice(proc,path,flags);
+        default: return -6; // ENXIO: no driver for this device number
+    }
+    FdEntry owned{};owned.type=type;
+    owned.fdFlags=(flags&0x80000u)?1:0;
+    const int fd=FdPublishNew(proc,owned,static_cast<uint32_t>(flags));
+    return fd<0?-EMFILE:fd;
 }
 
 static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_t mode)
@@ -222,46 +288,8 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         return fd;
     }
 
-    // /dev/tty — controlling terminal
-    // In WM terminal mode (stdin is a pipe), dup the stdin pipe so bash's
-    // /dev/tty reads go through the terminal's input pipe instead of consuming
-    // raw keyboard events from the input subsystem.
     if (StrEq(syntheticPath, "/dev/tty") || StrEq(syntheticPath, "/dev/console"))
-    {
-        // Pin fds 0 and 1 so a sibling's close or dup2 cannot free the pipes
-        // while they are borrowed, retain both ends, and only then publish
-        // the complete descriptor (with its access mode and O_CLOEXEC).
-        FdRef input(proc, 0), output(proc, 1);
-        if (input && input->type == FdType::Pipe && input->handle &&
-            output && output->type == FdType::Pipe && output->handle)
-        {
-            // Terminal mode: /dev/tty reads from stdin pipe, writes to stdout pipe
-            auto* pair = static_cast<TtyDevicePair*>(kmalloc(sizeof(TtyDevicePair)));
-            if (!pair) return -ENOMEM;
-            pair->readPipe = input->handle;
-            pair->writePipe = output->handle;
-            auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-            auto* wp = static_cast<PipeBuffer*>(pair->writePipe);
-            __atomic_fetch_add(&rp->readers, 1, __ATOMIC_RELEASE);
-            __atomic_fetch_add(&wp->writers, 1, __ATOMIC_RELEASE);
-            FdEntry entry{};
-            entry.type = FdType::DevTty;
-            entry.handle = pair;
-            entry.fdFlags = (flags & 0x80000) ? 1 : 0;
-            int fd = FdPublishNew(proc,entry,2); // O_RDWR
-            if (fd < 0) {
-                PipeReleaseEnd(rp, false);
-                PipeReleaseEnd(wp, true);
-                kfree(pair);
-                return -EMFILE;
-            }
-            return fd;
-        }
-        int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr, status, 0, cloexec);
-        if (fd < 0) return fd;
-        DbgPrintf("sys_open: %s → fd %d (keyboard/tty)\n", path, fd);
-        return fd;
-    }
+        return OpenTerminalDevice(proc, path, flags);
 
     // /dev/dri/renderD128 — virtio-gpu DRM render node. A Linux-compatible
     // render node that maps the virtio-gpu DRM uABI onto Brook's native
@@ -391,6 +419,11 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         }
         return fd;
     }
+
+    // /sys/devices/system/cpu/{possible,present,online,offline,kernel_max}
+    // from the live CPU count (glibc get_nprocs_conf, Chromium, Firefox).
+    if (const char* cpus = SysfsCpuAttribute(syntheticPath, SmpGetCpuCount(), MAX_CPUS))
+        return OpenSyntheticFile(proc, cpus, flags);
 
     // Synthetic memory files: /etc/passwd, /etc/group, /proc/self/...
     {
@@ -544,6 +577,10 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     }
     VnodeStat openedStat{};
     if(int error=VfsStat(vn,&openedStat)) {VfsClose(vn);return error;}
+    if((openedStat.mode&0170000)==0020000) {
+        VfsClose(vn);
+        return OpenCharacterDevice(proc,openedStat.rdev,path,flags);
+    }
     if((openedStat.mode&0170000)==0010000) {
         if(int error=NamedFifoAttach(vn,static_cast<uint32_t>(flags))) {VfsClose(vn);return error;}
     }

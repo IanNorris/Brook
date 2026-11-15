@@ -891,6 +891,64 @@ static void releaseCloneBacking(void* object) {
 static int prepareBorrowedClone(MappingTransaction& operation,const UserMappingRequest&,void* context) {
     return operation.StagePage(0,static_cast<CloneBacking*>(context)->page,false)?0:-12;
 }
+static void forkAdvice() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* source=AddressSpaceCreate(31);auto* child=AddressSpaceCreate(32);CHECK(source&&child);
+    Process actor{};actor.addressSpace=source;
+    UserMappingRequest request{};
+    request.range=rangeRecord(0,pageSize,nullptr);
+    request.hint=va.raw();request.length=4*pageSize;request.preparedPages=4;
+    request.fixed=true;request.prepare=prepareMappingPages;
+    CHECK(UserMappingCreate(&actor,source,request)==static_cast<int64_t>(va.raw()));
+    const uint64_t a=va.raw();
+    // Argument validation and all-or-nothing coverage (a hole is ENOMEM).
+    CHECK(UserMappingAdviseFork(&actor,source,a+1,pageSize,10)==-22);
+    CHECK(UserMappingAdviseFork(&actor,source,a,0,10)==0);
+    CHECK(UserMappingAdviseFork(&actor,source,a,pageSize,12)==-22);
+    CHECK(UserMappingAdviseFork(&actor,source,a+3*pageSize,2*pageSize,10)==-12);
+    CHECK(!MappingRangeFind(source->ranges,a+3*pageSize)->forkFlags);
+    // DONTFORK page 1, WIPEONFORK pages 2..3 then KEEPONFORK page 3.
+    CHECK(UserMappingAdviseFork(&actor,source,a+pageSize,1,10)==0); // length rounds up
+    CHECK(UserMappingAdviseFork(&actor,source,a+2*pageSize,2*pageSize,18)==0);
+    CHECK(UserMappingAdviseFork(&actor,source,a+3*pageSize,pageSize,19)==0);
+    CHECK(MappingRangeFind(source->ranges,a)->forkFlags==0);
+    CHECK(MappingRangeFind(source->ranges,a+pageSize)->forkFlags==MappingForkSkip);
+    CHECK(MappingRangeFind(source->ranges,a+2*pageSize)->forkFlags==MappingForkWipe);
+    CHECK(MappingRangeFind(source->ranges,a+3*pageSize)->forkFlags==0);
+    for (unsigned i=0;i<4;++i)
+        std::memset(reinterpret_cast<void*>(VmmLeafPhysical(VmmReadLeaf(source->pageTable,va+i*pageSize)).raw()),0x40+i,pageSize);
+    const auto skipped=VmmLeafPhysical(VmmReadLeaf(source->pageTable,va+pageSize));
+    const auto wiped=VmmLeafPhysical(VmmReadLeaf(source->pageTable,va+2*pageSize));
+    CHECK(UserMappingClone(&actor,source,child,32));
+    // Inherited pages are CoW-shared; skipped pages have no child metadata or
+    // leaf; wiped pages keep the (flagged) range but no leaf, and the parent
+    // keeps exclusive writable ownership of both.
+    CHECK(VmmLeafPhysical(VmmReadLeaf(child->pageTable,va))==VmmLeafPhysical(VmmReadLeaf(source->pageTable,va)));
+    CHECK(!MappingRangeFind(child->ranges,a+pageSize) && !VmmReadLeaf(child->pageTable,va+pageSize));
+    const auto* wipe=MappingRangeFind(child->ranges,a+2*pageSize);
+    CHECK(wipe && wipe->forkFlags==MappingForkWipe && !VmmReadLeaf(child->pageTable,va+2*pageSize));
+    CHECK(MappingRangeFind(child->ranges,a+3*pageSize) && VmmReadLeaf(child->pageTable,va+3*pageSize));
+    CHECK(PmmGetRefCount(skipped)==1 && maps(skipped)==1 && PmmGetRefCount(wiped)==1 && maps(wiped)==1);
+    for (auto page:{va+pageSize,va+2*pageSize}) {
+        auto raw=VmmReadLeaf(source->pageTable,page);
+        CHECK((raw&VMM_WRITABLE) && !(raw&PTE_COW_BIT));
+    }
+    // A wiped child page demand-faults zeroes.
+    Process childActor{};childActor.addressSpace=child;
+    CHECK(UserMappingPageAccess(&childActor,child,a+2*pageSize,2,true)==UserPageAccess::Missing);
+    // DOFORK/KEEPONFORK clear the policy again; WIPEONFORK refuses shared memory.
+    CHECK(UserMappingAdviseFork(&actor,source,a,4*pageSize,11)==0);
+    CHECK(UserMappingAdviseFork(&actor,source,a,4*pageSize,19)==0);
+    for (unsigned i=0;i<4;++i) CHECK(!MappingRangeFind(source->ranges,a+i*pageSize)->forkFlags);
+    request.range.sharing=MappingSharing::Shared;request.hint=a+8*pageSize;request.length=pageSize;request.preparedPages=1;
+    CHECK(UserMappingCreate(&actor,source,request)==static_cast<int64_t>(a+8*pageSize));
+    CHECK(UserMappingAdviseFork(&actor,source,a+8*pageSize,pageSize,18)==-22);
+    CHECK(UserMappingAdviseFork(&actor,source,a+8*pageSize,pageSize,10)==0);
+    AddressSpaceUnref(source);CHECK(ProcessCleanupStep());
+    AddressSpaceUnref(child);CHECK(ProcessCleanupStep());
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("FORK ADVICE PASS dontfork/wipeonfork/dofork/keeponfork/coverage/shared-refusal");
+}
 static void sharedMappingClone() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto* source=AddressSpaceCreate(34);auto* child=AddressSpaceCreate(35);CHECK(source&&child);
@@ -2847,7 +2905,7 @@ int main(int argc,char** argv) {
     accessedLeafAging();competingInstallAndDetach();rejectUnrepresentableOwner();ownedRangeRetirement();ownedSingleRetirement();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
-    liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
+    liveMappingClone();forkAdvice();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();

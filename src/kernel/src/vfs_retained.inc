@@ -504,6 +504,35 @@ int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed,bo
     VfsPathRelease(parent.parent);VfsPathRelease(parent.object);
     return error==-2?0:error;
 }
+// Kernel compatibility directories (/bin, /usr/bin) are fresh tmpfs mounts,
+// but they must not mask the historical bin-path aliases that applied while
+// those names were absent. Only whole-instance attachments of a registered
+// instance are transparent; identity survives namespace copies and binds, and
+// any other directory bound over them masks aliases as usual. Boot-only.
+namespace {
+struct BrokerTransparentRoot { uint64_t device,identity; };
+BrokerTransparentRoot g_brokerTransparent[4];
+uint32_t g_brokerTransparentCount=0;
+bool BrokerTransparentLocked(const MountEntry& mount)
+{
+    for(uint32_t i=0;i<g_brokerTransparentCount;++i)
+        if(mount.rootDevice==g_brokerTransparent[i].device && mount.rootIdentityKnown &&
+           mount.rootIdentity==g_brokerTransparent[i].identity)return true;
+    return false;
+}
+} // namespace
+int VfsPathBrokerTransparentRegister(const VfsPath& mountRoot)
+{
+    if(!mountRoot.attachment || !mountRoot.object)return -22;
+    FileMutationGuard transaction;
+    auto* mount=static_cast<MountEntry*>(mountRoot.attachment);
+    if(!VfsMountPublished(*mount) || !mount->rootObject || !mount->rootIdentityKnown ||
+       mountRoot.object->identity!=mount->rootIdentity)return -22;
+    if(BrokerTransparentLocked(*mount))return 0;
+    if(g_brokerTransparentCount>=sizeof(g_brokerTransparent)/sizeof(g_brokerTransparent[0]))return -28;
+    g_brokerTransparent[g_brokerTransparentCount++]={mount->rootDevice,mount->rootIdentity};
+    return 0;
+}
 int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed)
 {
     if(!allowed)return -22;
@@ -529,7 +558,8 @@ int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed)
             if(error==-2 || (!saved && error==-95)) {*allowed=true;return 0;}
             return error;
         }
-        bool bound=static_cast<MountEntry*>(result.object.attachment)->rootObject!=nullptr;
+        const auto* reached=static_cast<MountEntry*>(result.object.attachment);
+        bool bound=reached->rootObject!=nullptr && !BrokerTransparentLocked(*reached);
         VfsPathRelease(result.object);VfsPathRelease(result.parent);
         if(bound)return 0;
     }
@@ -576,7 +606,9 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
     if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment))) {
         VnodeStat stat{};int error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(error)return error;
-        if((stat.mode&0170000)!=0140000 && (stat.mode&0170000)!=0010000)return -30;
+        // Sockets, FIFOs and character devices are not filesystem data.
+        const uint16_t type=stat.mode&0170000;
+        if(type!=0140000 && type!=0010000 && type!=0020000)return -30;
     }
     return path.object->ops->access?path.object->ops->access(path.object,required,realIds):-95;
 }
@@ -596,12 +628,13 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     if((flags&VFS_O_TRUNC) || (VfsReadOnly(mount) && (flags&VFS_O_WRITE))) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
-        fifo=(stat.mode&0170000)==0010000;
+        // Character devices, like FIFOs, ignore O_TRUNC (shell "> /dev/null").
+        fifo=(stat.mode&0170000)==0010000 || (stat.mode&0170000)==0020000;
     }
     if(VfsReadOnly(mount) && (flags&(VFS_O_WRITE|VFS_O_TRUNC))) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
-        if((stat.mode&0170000)!=0010000) { *error=-30;return nullptr; }
+        if((stat.mode&0170000)!=0010000 && (stat.mode&0170000)!=0020000) { *error=-30;return nullptr; }
     }
     if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;

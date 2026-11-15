@@ -110,7 +110,28 @@ static void TtyAndUnixStreamUnlockedCopies() {
     g_userCopyHook=nullptr;
 }
 
+// Steam gen 415 root cause: memfd_create() on a full table freed the memfd
+// twice (inside the failed install, then again in memfd_create). Under load
+// another CPU reused the block between the two frees, so the second kfree
+// released a live PipePollNode and a later ppoll walked freed memory.
+static void MemfdCreateAtFullTable() {
+    Reset();ResetProcess();auto* proc=CurrentProcess();
+    for(unsigned fd=0;fd<brook::MAX_FDS;++fd)proc->fds[fd].type=brook::FdType::DevNull;
+    __builtin_memcpy(reinterpret_cast<void*>(UserAddress(0)),"shm",4);
+    const unsigned before=g_invalidFrees;
+    for(int i=0;i<4;++i)
+        CHECK(brook::sys_memfd_create(UserAddress(0),1,0,0,0,0)==-brook::EMFILE); // MFD_CLOEXEC
+    CHECK(g_invalidFrees==before);
+    // With a free slot the descriptor is the sole owner.
+    proc->fds[77].type=brook::FdType::None;
+    CHECK(brook::sys_memfd_create(UserAddress(0),1,0,0,0,0)==77);
+    auto* mfd=static_cast<brook::MemFdData*>(proc->fds[77].handle);
+    CHECK(mfd && mfd->refCount==1 && proc->fds[77].fdFlags==1);
+    CHECK(g_invalidFrees==before);
+}
+
 void RunMemfdTests() {
+    MemfdCreateAtFullTable();
     MemfdUnlockedCopies();
     TtyAndUnixStreamUnlockedCopies();
 }

@@ -284,6 +284,14 @@ exec), avoid inheriting it on fork, and handle pending signals and periodic
 rearming. Ordinary POSIX timers have different semantics and cannot simply be
 substituted. VIRTUAL and PROF need separate CPU accounting.
 
+Update (work/compat-batch1): `setitimer`/`getitimer` are now implemented in
+`posix_timer.cpp` as one record per thread group, shared with `alarm()`.
+REAL follows the semantics above (fork clears, exec keeps, a periodic timer
+restarts when its SI_KERNEL SIGALRM is dequeued, ignored expiries are dropped
+without restart). VIRTUAL/PROF are charged from the 1 ms scheduler tick. The
+oracle's two busy-loop children still need IRQ-return delivery, which remains
+the opt-in `irq-signal-probe` path.
+
 Upstream's [smart-scheduling timer](https://raw.githubusercontent.com/XQuartz/xorg-server/master/os/utils.c)
 explains the repeated REAL timer calls. Whether a `-dumbSched` diagnostic A/B
 improves this particular workload remains untested. For that comparison, start

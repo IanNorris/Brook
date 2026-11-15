@@ -38,6 +38,25 @@ expose the global shared-memory broker, random, GPU, or audio devices through
 this exception. Existing open null descriptors remain usable after NODEV remount,
 matching Linux. The boot anchor is intentionally held for the kernel lifetime.
 
+**Superseded (16 November):** `/dev` is now a boot tmpfs of real device
+inodes (see the device-directory section of `src/kernel/src/vfs_DOCS.md`). The
+Dell census for the Steam run showed `access`/`faccessat2` of `/dev/null` and
+`/dev/urandom` and `open("/dev/tty")` failing ENOENT in the container: the
+bridge above served only data opens of `null`/`urandom`, and no device had an
+inode for stat/access. Device numbers now select the driver, so binds of `/dev`
+or of single nodes carry them. In QEMU, static bubblewrap 0.12 passes
+`--dev-bind /dev /dev`, nested bwrap and per-node `--dev-bind` checks
+(`tools/at-syscall-probe/devfscheck.c`); `bwrap --dev` still fails because
+Brook has no devpts. The bridge code remains but is no longer reached for
+those names. The same census's `/proc/self/fd/N/<subpath>` ENOENTs are not a
+traversal gap: proc magic links already resolve to the
+open directory (host test `test_vfs_paths`, QEMU `devfscheck` with O_PATH and
+ordinary directory descriptors, inside and outside containers). They appear
+to be ordinary absent-file probes (not yet confirmed against a Linux trace):
+libcapsule tries Exherbo's `etc/ld-x86_64-pc-linux-gnu.cache` before `etc/ld.so.cache`,
+and pressure-vessel's mkdir-p fast path stats `from-host/...` before creating
+it.
+
 ## Verification
 
 Evidence: `build/workloads/null-device-20261023/` and its original private review

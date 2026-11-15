@@ -84,6 +84,10 @@ int main(void){
     const struct BrookDesktopLayer frame={.window=1,.incarnation=2,.clientX=100,.clientY=20,.width=408,.height=274};
     const struct DesktopTrackHole h=desktop_track_chrome_hole(&client,&frame);
     CHECK(h.x==4 && h.y==30 && h.width==400 && h.height==240);
+    /* Caption buttons overlaid inside a client-decorated window have no hole. */
+    const struct BrookDesktopLayer captions={.window=1,.incarnation=2,.clientX=366,.clientY=58,.width=138,.height=36};
+    const struct DesktopTrackHole none=desktop_track_chrome_hole(&client,&captions);
+    CHECK(!none.width && !none.height);
     printf("DESKTOP_TRACK_PASS\n");
     return 0;
 }

@@ -14,6 +14,8 @@
 #include "syscall_internal.h"
 #include "syscall_maintenance_block.h"
 #include "syscall_drm.h"
+#include "synthetic_system_files.h"
+#include "smp.h"
 #include "syscall_open.h"
 #include "syscall_rw.h"
 #include "syscall_netlink.h"
@@ -228,6 +230,16 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         return true;
     }
 #endif
+    if (const char* cpus = SysfsCpuAttribute(path, SmpGetCpuCount(), MAX_CPUS))
+    {
+        uint64_t len = 0; while (cpus[len]) ++len;
+        memset(st, 0, sizeof(*st));
+        st->st_mode = 0100444; // S_IFREG | r--r--r--
+        st->st_nlink = 1;
+        st->st_size = static_cast<int64_t>(len);
+        st->st_blksize = 4096;
+        return true;
+    }
     const bool virt=brook::GpuAppGet()!=nullptr,intel=brook::BdwIntelUserNodeEnabled();
     if(!virt && !intel)return false;
     if ((virt && StrEq(path, "/dev/dri/renderD128")) || (intel && StrEq(path,"/dev/dri/renderD129")))
@@ -446,12 +458,15 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
 
     if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
         fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp ||
+        fde->type == FdType::DevZero || fde->type == FdType::DevFull ||
         fde->type == FdType::DebugSerial || fde->type == FdType::DebugConsole) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR
         st->st_rdev = (fde->type == FdType::DevNull) ? 0x0103 :
                       (fde->type == FdType::DevUrandom) ? 0x0109 :
+                      (fde->type == FdType::DevZero) ? 0x0105 :
+                      (fde->type == FdType::DevFull) ? 0x0107 :
                       (fde->type == FdType::DevDsp) ? 0x0E03 :
                       (fde->type == FdType::DebugSerial) ? 0x0440 : 0x0400; // 4,64 = UART
         st->st_blksize = 4096;

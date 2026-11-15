@@ -47,6 +47,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "vfs_path.h"
 #include "tmpfs.h"
 #include "mount_namespace.h"
+#include "compat_paths.h"
 #include "virtio_blk.h"
 #include "gpt.h"
 #include "ahci_system_volume.h"
@@ -65,6 +66,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "memory/file_page_cache.h"
 #include "ext4_vfs.h"
 #include "procfs_vfs.h"
+#include "devtmpfs.h"
 #include "net.h"
 #include "compositor.h"
 #include "serial_writer.h"
@@ -704,10 +706,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // Child attachments require the root identity to exist first.
     brook::VfsMount("/proc", "procfs", 0);
-    const int nullAnchor=brook::VfsCanonicalDeviceAnchorInitialize();
-    brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
-    const int drmAnchor=brook::VfsCanonicalDrmAnchorInitialize();
-    if(drmAnchor)KernelPanic("canonical DRM sysfs anchor failed (rebuild initrd): %d",drmAnchor);
     // Read boot options before creating the first tmpfs instance.
     brook::FwCfgInit();
     brook::ProcessConfigureIrqSignalProbe();
@@ -730,6 +728,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     const uint64_t tmpfsBudget=unboundedTmpfs ? 0x7ffffffffffff000ULL :
         brook::TmpfsBootBudget(brook::PmmGetFreePageCount(),largerTmpfs);
     if(brook::TmpfsConfigureByteBudget(tmpfsBudget))KernelPanic("tmpfs memory budget initialization failed");
+    // Real /dev device inodes; the canonical anchors below then pin its
+    // directories. On failure the initrd's /DEV directory remains in place.
+    const int devMount=brook::DevtmpfsMountBoot();
+    brook::SerialPrintf("VFS: /dev device tmpfs result=%d\n",devMount);
+    const int nullAnchor=brook::VfsCanonicalDeviceAnchorInitialize();
+    brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
+    const int drmAnchor=brook::VfsCanonicalDrmAnchorInitialize();
+    if(drmAnchor)KernelPanic("canonical DRM sysfs anchor failed (rebuild initrd): %d",drmAnchor);
     const uint64_t desktopShmBytes=unboundedTmpfs ? tmpfsBudget : brook::TmpfsDesktopBudget(tmpfsBudget,widerShm);
     // A real retained filesystem must survive directory binds into containers;
     // the historical pathname-only shm broker cannot serve those namespaces.
@@ -759,6 +765,11 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // when set, takes precedence over either bounded profile.
         brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,larger=%u,wide=%u,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget,largerTmpfs?1u:0u,widerShm?1u:0u);
     }
+
+    // NixOS-style /bin/sh and /usr/bin/env for system()/popen(), shebangs and
+    // xkbcomp. Symlinks resolve lazily, so /nix may mount later. Non-fatal:
+    // the exec-path busybox aliases still cover a missing entry.
+    brook::CompatPathsProvisionBoot();
 
     // Optional read-only-media desktop: keep runtime sockets and user settings
     // on bounded tmpfs instances. No persistent disk is replaced by default.

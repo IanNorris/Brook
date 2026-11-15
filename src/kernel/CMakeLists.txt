@@ -311,12 +311,14 @@ add_executable(kernel
     src/syscall_ioctl.cpp
     src/syscall_socket.cpp
     src/syscall_process.cpp
+    src/syscall_kcmp.cpp
     src/syscall_exec.cpp
     src/syscall_sched.cpp
     src/syscall_futex.cpp
     src/syscall_cred.cpp
     src/syscall_sysinfo.cpp
     src/compat_census.cpp
+    src/devtmpfs.cpp
     src/lastlog.cpp
     src/syscall_sysv_ipc.cpp
     src/syscall_brook_system.cpp
@@ -404,6 +406,7 @@ add_executable(kernel
     src/exec_image.cpp
     src/vfs.cpp
     src/tmpfs.cpp
+    src/compat_paths.cpp
     src/process_fs.cpp
     src/fs_context.cpp
     src/fatfs_vfs.cpp

@@ -2,7 +2,7 @@
 // every per-task operation checks the captured incarnation. No Process strong
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
 static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
-static_assert(NUM_PID_ENTRIES==10,"Update retained proc PID entry indices when changing the catalog");
+static_assert(NUM_PID_ENTRIES==11,"Update retained proc PID entry indices when changing the catalog");
 enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap,Sys,SysKernel,OverflowId,NsDirectory,NsLink };
 struct ProcObject {
     VfsObject object;
@@ -234,14 +234,16 @@ static int ProcAcquireVnodeFdPath(const ProcObject* value,VfsPath* out,char* fal
     // VnodeType::File also covers FIFOs. Inspect the retained backend identity
     // after dropping the FD lock; pathname sockets allow O_PATH/stat/bind while
     // ordinary opening still fails ENXIO in the backend. These are filesystem
-    // nodes, not transport FDs. Do not follow devices or textual symlinks.
+    // nodes, not transport FDs. Character-device inodes (an O_PATH /dev
+    // node, which bubblewrap binds through /proc/self/fd) are followed too;
+    // their driver comes from st_rdev at open. Never follow textual symlinks.
     // Normal VFS open then rechecks permissions and creates
     // a fresh description, independently of the source offset/access mode.
     if(!error && !anyObject) {
         VnodeStat st{};
         error=out->object->ops->stat?out->object->ops->stat(out->object,&st):-95;
-        if(!error && (st.mode&0170000)!=0040000 && (st.mode&0170000)!=0100000 &&
-           (st.mode&0170000)!=0140000)error=-95;
+        const uint32_t type=st.mode&0170000;
+        if(!error && type!=0040000 && type!=0100000 && type!=0140000 && type!=0020000)error=-95;
         if(error) {VfsPathRelease(*out);*out={};}
     }
     return error;

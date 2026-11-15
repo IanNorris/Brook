@@ -416,6 +416,17 @@ static void testMountInfo(brook::MountNamespace* initial,const brook::VfsPath& s
     auto freshRoot=resolve(root,root,targetName);
     auto insidePath=resolve(root,freshRoot,"src"),destinationPath=resolve(root,freshRoot,"dst");
     assert(!VfsMountNamespaceBind(ns,insidePath,destinationPath));
+    {
+        // A fresh mount masks synthetic/alias names until its exact root is
+        // registered transparent (kernel /bin, /usr/bin). A subdirectory bind
+        // of the same instance still masks.
+        const std::string missing=std::string("/")+targetName+"/missing",bound=std::string("/")+targetName+"/dst/missing";
+        bool allowed=true;assert(!VfsPathBrokerAllowed(root,missing.c_str(),&allowed)&&!allowed);
+        assert(VfsPathBrokerTransparentRegister(insidePath)==-22);
+        assert(!VfsPathBrokerTransparentRegister(freshRoot)&&!VfsPathBrokerTransparentRegister(freshRoot));
+        allowed=false;assert(!VfsPathBrokerAllowed(root,missing.c_str(),&allowed)&&allowed);
+        allowed=true;assert(!VfsPathBrokerAllowed(root,bound.c_str(),&allowed)&&!allowed);
+    }
     // A legacy case-insensitive ancestor can report another spelling of the
     // same covered identity. An unrelated backing rename must preserve the
     // published fresh mount's lowercase anchor.
@@ -506,6 +517,11 @@ static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPat
     VfsRetain(reader);VfsRelease(reader);assert(VfsMountNamespaceRemount(ns,bind,3)==-16);VfsRelease(reader);
     assert(!VfsMountNamespaceRemount(ns,bind,3));assert(VfsMountReadOnly(metadata)&&VfsMountReadOnly(directory));
     assert(VfsMountNamespaceRemount(ns,bind,2)==-1);
+    // Character devices are not filesystem data: a read-only mount neither
+    // refuses their writers nor truncates them (shell "> /dev/null").
+    Node roDevice{&mounts[6],702,false,&node(source.object),{},{},0020666};node(source.object).children["ro-null"]=&roDevice;
+    auto* deviceWriter=VfsOpenAt(root,bind,"ro-null",VFS_O_WRITE|VFS_O_TRUNC,0,0,&error);assert(deviceWriter&&!error);VfsRelease(deviceWriter);
+    assert(!VfsAccessAt(root,bind,"ro-null",2));node(source.object).children.erase("ro-null");
     assert(!VfsPathOpen(path,VFS_O_WRITE,&error)&&error==-30);
     reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error);assert(!VfsMountNamespaceRemount(ns,bind,7));assert(VfsMountNamespaceRemount(ns,bind,3)==-1);
     uint64_t offset=0;VnodeTime times[2]{};
@@ -542,6 +558,10 @@ static void testFileBinds(brook::MountNamespace* initial,const brook::VfsPath& s
     node(b.object).children.erase("alias");originalTarget->nlink=1;
     originalSource->nlink=2;assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value"));
     detachFile();originalSource->nlink=1;
+    // Character device nodes bind onto regular files (bubblewrap --dev).
+    originalSource->mode=0020666;assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value"));
+    {auto p=resolve(root,root,"ns-b/value");VnodeStat st{};assert(!VfsPathStat(p,&st)&&st.mode==0020666&&p.object->identity==101);VfsPathRelease(p);}
+    detachFile();originalSource->mode=0;
     assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b")==-20);
     assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a","ns-b/value")==-20);
     bool succeeded=false;

@@ -70,6 +70,9 @@ extern bool g_raceUnmapAfterCheck;
 extern unsigned g_racedUnmaps;
 inline bool SpinLockHeld(const brook::SpinLock& lock) { return lock.next!=lock.serving; }
 
+// kfree calls on pointers that were not live (double frees); see main.cpp.
+extern unsigned g_invalidFrees;
+
 // Count of user-copy calls that were refused because they hit kernel memory.
 extern unsigned g_refusedKernelCopies;
 
@@ -83,6 +86,7 @@ struct FakeNet {
     brook::SockAddrIn source{},peer{};
     bool acceptReady=false;
     uint32_t localIp=0,remoteIp=0;uint16_t localPort=0,remotePort=0;
+    bool tcp=false;uint8_t tcpState=4;uint16_t peerMss=1400; // TCP_INFO source
 };
 extern FakeNet g_net;
 extern unsigned g_snapshots;   // ProcessFsSnapshot calls (open lookups)

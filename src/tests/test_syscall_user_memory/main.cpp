@@ -92,8 +92,31 @@ unsigned Failures() { return g_failures; }
 }
 
 // --- Kernel symbols shared by every TU --------------------------------------
-extern "C" void* kmalloc(uint64_t size) { return malloc(size?size:1); }
-extern "C" void kfree(void* p) { free(p); }
+// Live-allocation registry: a kfree of a pointer that is not live (double
+// free, or a stray pointer) is counted instead of corrupting the host heap.
+namespace harness {
+unsigned g_invalidFrees;
+namespace {
+constexpr unsigned LiveSlots=1u<<16;
+void* g_live[LiveSlots];
+unsigned Slot(void* p) { return static_cast<unsigned>((reinterpret_cast<uintptr_t>(p)>>4)*2654435761u)&(LiveSlots-1); }
+void Track(void* p) {
+    for(unsigned i=Slot(p),n=0;n<LiveSlots;++n,i=(i+1)&(LiveSlots-1))
+        if(!g_live[i] || g_live[i]==reinterpret_cast<void*>(1)) { g_live[i]=p;return; }
+}
+bool Untrack(void* p) {
+    for(unsigned i=Slot(p),n=0;n<LiveSlots && g_live[i];++n,i=(i+1)&(LiveSlots-1))
+        if(g_live[i]==p) { g_live[i]=reinterpret_cast<void*>(1);return true; }
+    return false;
+}
+}
+}
+extern "C" void* kmalloc(uint64_t size) { void* p=malloc(size?size:1);if(p)harness::Track(p);return p; }
+extern "C" void kfree(void* p) {
+    if(!p)return;
+    if(!harness::Untrack(p)) { ++harness::g_invalidFrees;return; }
+    free(p);
+}
 
 namespace brook {
 using harness::Access;

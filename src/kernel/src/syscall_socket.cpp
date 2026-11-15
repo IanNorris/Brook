@@ -3,6 +3,7 @@
 // Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "tcp_info.h"
 #include "process_user_namespace.h"
 
 #include "syscall.h"
@@ -532,6 +533,22 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
     if (!entry->handle) return -EBADF;
     int level = static_cast<int>(levelVal);
     int option = static_cast<int>(optnameVal);
+    if (level == 6 && entry->type == FdType::Socket) { // IPPROTO_TCP
+        TcpInfoSource source{};
+        const int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
+        // Linux: a UDP socket passes SOL_TCP to ip_getsockopt (EOPNOTSUPP);
+        // TCP knows only TCP_INFO here (other options ENOPROTOOPT).
+        if (!brook::SockGetTcpInfo(index, &source)) return -95;
+        if (option != 11) return -92;
+        int32_t length = 0;
+        if (!CopyFromUser(&length, optlenAddr, sizeof(length))) return -EFAULT;
+        if (length < 0) return -EINVAL;
+        const LinuxTcpInfo info = TcpInfoEncode(source);
+        const uint32_t copied = static_cast<uint32_t>(length) < sizeof(info) ? static_cast<uint32_t>(length) : sizeof(info);
+        if (!CopyToUser(optlenAddr, &copied, sizeof(copied))) return -EFAULT;
+        if (copied && !CopyToUser(optvalAddr, &info, copied)) return -EFAULT;
+        return 0;
+    }
     if (level != 1) return entry->type == FdType::UnixSocket ? -95 : -92;
     // Linux socklen_t is 32-bit, and negative lengths are invalid.
     if (!UserBufferReadable(optlenAddr, sizeof(uint32_t)) ||
@@ -789,6 +806,13 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
             UnixSocketData* socket;
             ~AcceptedAllocation() { if (socket) UnixSocketHandleUnref(socket); }
         } allocation{serverSock};
+        // The accepted fd's open file description, created outside the
+        // registry spinlock and released unlocked if publication fails.
+        struct PreparedDescription {
+            OpenFile* file;
+            ~PreparedDescription() { OpenFileRelease(file); }
+        } description{OpenFileCreate(static_cast<uint32_t>(flags) & UNIX_SOCK_NONBLOCK)};
+        if (!description.file) return -ENOMEM;
 
         for (;;) {
             if (__atomic_load_n(&fde->closing, __ATOMIC_ACQUIRE)) return -EBADF;
@@ -816,14 +840,17 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
                 // Registry -> fd lock is safe: finalizers release fdLock before
                 // taking the registry lock, and fd retain callbacks only use
                 // atomic reference increments. Keep the pending owner intact
-                // until publication succeeds so EMFILE remains retryable.
-                int newFd = UnixInstallSocket(proc, serverSock, flags, "accept");
+                // until publication succeeds so EMFILE remains retryable. The
+                // description was allocated before the registry lock: nothing
+                // here allocates, frees or logs under it.
+                int newFd = UnixInstallSocketPrepared(proc, serverSock, flags, description.file);
                 if (newFd < 0) {
                     serverSock->rxPipe = serverSock->txPipe = nullptr;
                     serverSock->incomingFds = serverSock->peerIncomingFds = nullptr;
                     SpinLockRelease(&g_unixRegistryLock);
                     return newFd;
                 }
+                description.file = nullptr; // owned by the published slot
                 usd->pending[slot] = {};
                 --usd->pendingCount;
                 allocation.socket = nullptr; // pending ownership transferred to fd
@@ -990,18 +1017,16 @@ int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endB->incomingFds = fdqAtoB;
     endB->peerIncomingFds = fdqBtoA;
 
-    int fdA = UnixInstallSocket(proc, endA, static_cast<uint32_t>(type), "socketpair-a");
-    if (fdA < 0) {
+    // Both endpoints are published together or not at all (no rollback
+    // that closes a possibly reused number when only one slot is free).
+    int ends[2] = {-1, -1};
+    int published = UnixInstallSocketPair(proc, endA, endB, static_cast<uint32_t>(type), ends);
+    if (published < 0) {
         UnixSocketHandleUnref(endA);
         UnixSocketHandleUnref(endB);
-        return fdA;
+        return published;
     }
-    int fdB = UnixInstallSocket(proc, endB, static_cast<uint32_t>(type), "socketpair-b");
-    if (fdB < 0) {
-        CloseProcessFd(proc, fdA);
-        UnixSocketHandleUnref(endB);
-        return fdB;
-    }
+    const int fdA = ends[0], fdB = ends[1];
 
     sv[0] = fdA;
     sv[1] = fdB;

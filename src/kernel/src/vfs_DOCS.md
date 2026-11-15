@@ -61,6 +61,21 @@ the correct filesystem driver based on mount-point prefix matching.
 | `/proc` | procfs | — | Virtual process info |
 | `/home` | ext2 | drive 1 | User home directory |
 
+### Compatibility paths (`/bin`, `/usr/bin`)
+
+The FAT root initrd cannot hold symlinks, so `compat_paths.cpp` mounts one
+small root-owned 0755 tmpfs (nodev, nosuid, 64 KiB quota) per directory in
+`kCompatPathLinks` (`compat_paths.h`) right after `/dev/shm`, on both the
+QEMU and Dell initrds: `/bin/sh -> /nix/profile/bin/sh` and
+`/usr/bin/env -> /nix/profile/bin/env`. Missing mount points are created in
+the RAM initrd; an existing non-empty directory or non-directory is left
+unmasked. Non-root cannot add entries; root can. These mounts are registered
+with `VfsPathBrokerTransparentRegister`, so the historical exec/stat aliases
+(`/bin/bash` -> `/boot/BIN/bash`, busybox applets) still apply for names not
+present in them; other directories bound over them mask aliases as before.
+Mount namespaces copy them like any mount. `/lib64/ld-linux-x86-64.so.2` is a
+candidate table entry, but provider initrds already ship a real FAT `/lib64`.
+
 ## Vnode Model
 
 ```c
@@ -190,6 +205,35 @@ Virtual filesystem generating process and system information on the fly.
 
 ### Special Paths
 - `/proc/self` → resolves to current process's PID directory
+
+## Device directory (`/dev`)
+
+`/dev` is a boot-mounted tmpfs instance (`devtmpfs.cpp`, reported as `tmpfs`,
+`nosuid` only) that covers the initrd's FAT `/DEV`. It is seeded before the
+canonical device/DRM anchors are pinned with real inodes:
+
+| Entry | Type | Device |
+|-------|------|--------|
+| `null`, `zero`, `full`, `random`, `urandom` | char 0666 | 1:3, 1:5, 1:7, 1:8, 1:9 |
+| `tty` (0666), `console` (0600) | char | 5:0, 5:1 |
+| `fd`, `stdin`, `stdout`, `stderr` | symlink | `/proc/self/fd[/0-2]` |
+| `shm` (01777), `dri` (0755) | directory | `/dev/shm` tmpfs mountpoint; DRM anchor |
+
+Character devices are ordinary tmpfs inodes (`TmpfsSeedEntry`, only on the
+instance from `TmpfsCreateDeviceDirectory`; userspace `mknod` stays FIFO-only)
+whose `st_rdev` selects the driver: after the ordinary retained VFS open,
+`OpenCharacterDevice` (`syscall_open.cpp`) maps 1:3/1:5/1:7/1:8/1:9/5:0/5:1 to
+the existing descriptor types and anything else to ENXIO. Because the device
+is a property of the inode, not of its name, stat/access/O_PATH work, and a
+bind of `/dev` (bubblewrap `--dev-bind`) or of single nodes onto files
+(`--dev`) keeps working in any mount namespace. Opening a device through a
+NODEV mount is EACCES. Like FIFOs and sockets, character devices ignore
+`O_TRUNC` and stay writable on read-only mounts.
+
+Brook-specific names (`/dev/fb0`, `/dev/keyboard`, `/dev/klog`, `/dev/dsp`,
+guard and maintenance nodes) and the DRM render nodes are still served by path
+text. The boot `/dev` attachment and whole binds of it are registered with
+`VfsPathBrokerTransparentRegister`, so they do not mask those names.
 
 ## Public API
 

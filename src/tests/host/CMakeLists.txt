@@ -832,6 +832,8 @@ target_compile_options(test_ext2_objects PRIVATE -Wall -Wextra -Werror -Wno-unus
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_ext2_objects PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_ext2_objects PROPERTIES TIMEOUT 60)
+add_host_test(test_compat_paths)
+target_compile_options(test_compat_paths PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_mount_namespace_state)
 target_compile_options(test_mount_namespace_state PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 set_tests_properties(test_mount_namespace_state PROPERTIES TIMEOUT 20)
@@ -973,6 +975,13 @@ set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)
 
 add_host_test(test_intel_bdw_forcewake_adapter)
 add_host_test(test_real_interval_timer)
+add_host_test(test_synthetic_system_files)
+target_compile_options(test_synthetic_system_files PRIVATE -UNDEBUG)
+add_host_test(test_kcmp)
+target_compile_options(test_kcmp PRIVATE -DBROOK_HOST_TEST -UNDEBUG
+    -ffunction-sections -fdata-sections -Wno-unused-function -Wno-missing-field-initializers
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_kcmp PRIVATE -Wl,--gc-sections)
 add_host_test(test_signal_context)
 target_compile_options(test_signal_context PRIVATE -DBROOK_HOST_TEST -UNDEBUG
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")

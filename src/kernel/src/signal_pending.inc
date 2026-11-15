@@ -83,11 +83,18 @@ static bool ProcessDequeueSignalLocked(Process* proc, int signum, SignalInfo* in
     }
     return consumed;
 }
+// A process-directed SIGALRM (anything but tkill/tgkill) restarts an expired
+// periodic ITIMER_REAL, as Linux's shared-queue dequeue does. Called unlocked.
+static void NoteAlarmConsumed(Process* proc,int signum,bool consumed,int code) {
+    if(consumed && signum==14 && code!=-6)IntervalTimerAlarmConsumed(proc);
+}
 bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
 {
+    SignalInfo local{};SignalInfo* out=info?info:&local;
     const auto flags=IrqSpinLockAcquire(&g_signalSenderLock);
-    const bool consumed=ProcessDequeueSignalLocked(proc,signum,info);
-    IrqSpinLockRelease(&g_signalSenderLock,flags);return consumed;
+    const bool consumed=ProcessDequeueSignalLocked(proc,signum,out);
+    IrqSpinLockRelease(&g_signalSenderLock,flags);
+    NoteAlarmConsumed(proc,signum,consumed,out->si_code);return consumed;
 }
 // Caller must select an unblocked signal for the current task.
 [[maybe_unused]] static bool ProcessClaimCaughtSignal(Process* proc,int signum,SignalInfo* info,KernelSigaction* action) {
@@ -100,7 +107,8 @@ bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
         const auto snapshot=ReadSignalAction(proc->tgid,signum-1);
         if(snapshot.handler>1) {*action=snapshot;consumed=ProcessDequeueSignalLocked(proc,signum,info);}
     }
-    IrqSpinLockRelease(&g_signalSenderLock,flags);return consumed;
+    IrqSpinLockRelease(&g_signalSenderLock,flags);
+    NoteAlarmConsumed(proc,signum,consumed,info->si_code);return consumed;
 }
 
 void ProcessQueueChildSignal(Process* parent,Process* child)

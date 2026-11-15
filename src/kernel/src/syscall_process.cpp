@@ -668,15 +668,4 @@ int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// sys_rseq (334) — restartable sequences (stub)
-// ---------------------------------------------------------------------------
-
-int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
-                  uint64_t, uint64_t, uint64_t)
-{
-    return -ENOSYS; // Not supported — musl handles this gracefully
-}
-
 } // namespace brook
