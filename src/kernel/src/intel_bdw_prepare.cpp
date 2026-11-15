@@ -1640,16 +1640,28 @@ bool BdwRunRetainedRender(BdwRenderExecutionBackend& backend,uint64_t scratchDma
     // section. An attempted transaction retains every page until recovery.
     if(!__atomic_load_n(&retainedRenderScratchPinned,__ATOMIC_ACQUIRE) || !retainedRenderScratchValid ||
        retainedRenderScratchAmbiguous || scratchDma!=retainedRenderScratch.dma ||
-       !BdwGlobalGgttSpace().owns(retainedRenderReservation))return false;
+       !BdwGlobalGgttSpace().owns(retainedRenderReservation)){result.runFailSite=1;return false;}
     result.attempted=true;
-    if(!retainedRender.ExecuteTakenOver(retainedRenderAllocator,backend,scratchDma))return false;
+    if(!retainedRender.ExecuteTakenOver(retainedRenderAllocator,backend,scratchDma)){result.runFailSite=2;return false;}
     result.breadcrumb=true;
     while(backend.retirementContinue()){
         const auto state=retainedRender.PollContextSwitch(backend);
-        if(state==BdwCsbPoll::Fault)return false;
+        if(state==BdwCsbPoll::Fault){
+            const auto d=retainedRender.LastCsbDiag();
+            result.runFailSite=3;result.csbSite=d.site;result.csbTail=d.tail;result.csbHead=d.head;
+            result.csbEvents=d.events;result.csbEvent=d.event;return false;
+        }
         if(state==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
     }
-    return false;
+    result.runFailSite=4;return false;
+}
+// After a failed attempted run whose RCS reset was verified: the one-shot is
+// in a state RetireAfterReset accepts (submitted, polled or quarantined by a
+// status fault), so its GGTT binding can be retired like a completed run.
+bool BdwRetainedRenderRetirableAfterFailedRun(){
+    const auto st=retainedRender.State();
+    return st==BdwOneShotState::CompleteRetained || st==BdwOneShotState::ContextCompleteRetained ||
+        st==BdwOneShotState::Quarantined;
 }
 bool BdwCopyRetainedRenderContext(BdwRenderExecutionBackend& backend,uint32_t (&out)[20*1024]) {
     return __atomic_load_n(&retainedRenderScratchPinned,__ATOMIC_ACQUIRE) &&
