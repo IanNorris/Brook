@@ -611,11 +611,15 @@ int64_t sys_madvise(uint64_t address, uint64_t length, uint64_t advice,
     if (!proc) return -EINVAL;
     if (advice==4) return UserMappingDiscardAnonymous(proc,proc->addressSpace,address,length);
     if (advice==8) return UserMappingAdviseFree(proc,proc->addressSpace,address,length);
+    if (advice==10 || advice==11 || advice==18 || advice==19)
+        return UserMappingAdviseFork(proc,proc->addressSpace,address,length,uint32_t(advice));
     constexpr uint64_t limit=0x0000800000000000ULL;
     if ((address&4095) || address>=limit || length>limit-address) return -EINVAL;
     // Optional locality / hugepage hints do not promise changed contents.
     if (advice<=3 || advice==14 || advice==15) return 0;
-    return -EINVAL; // Never claim REMOVE/fork-inheritance semantics.
+    // REMOVE, guard regions (102/103) and other advice stay EINVAL, as on a
+    // kernel without them; callers (glibc stack guards) fall back.
+    return -EINVAL;
 }
 
 int64_t sys_fadvise64(uint64_t, uint64_t, uint64_t,

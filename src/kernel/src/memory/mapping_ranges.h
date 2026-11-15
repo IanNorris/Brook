@@ -22,6 +22,10 @@ void MappingBackingUnref(MappingBacking* backing);
 enum class MappingKind : uint8_t { Anonymous, File, MemFd, Device, Image, Stack, Heap, Pageable };
 enum class MappingSharing : uint8_t { Private, Shared };
 enum class MappingLeafOwnership : uint8_t { Managed, Borrowed };
+// madvise fork inheritance (Linux VM_DONTCOPY / VM_WIPEONFORK). Skip leaves
+// the range out of a forked child; Wipe gives the child the range without
+// its pages (private anonymous only, so the child demand-faults zeroes).
+enum : uint8_t { MappingForkSkip = 1, MappingForkWipe = 2 };
 struct MappingRange {
     uint64_t begin, end, offset, identity;
     MappingBacking* backing;
@@ -29,6 +33,7 @@ struct MappingRange {
     MappingKind kind;
     MappingSharing sharing;
     MappingLeafOwnership leafOwnership;
+    uint8_t forkFlags = 0; // MappingFork*; copied by splits, fork and exec-free paths
 };
 bool MappingRangeValid(const MappingRange& range);
 struct MappingRangeNode {
@@ -86,11 +91,21 @@ public:
                  uint32_t protection);
     bool CanProtect(const MappingRangeTable& table, uint64_t begin, uint64_t end,
                     uint32_t protection) const;
+    // Same coverage/split contract as Protect; replaces forkFlags bits in
+    // mask with bits. Leaves, protection and backing are unchanged.
+    bool SetForkFlags(MappingRangeTable& table, uint64_t begin, uint64_t end,
+                      uint8_t mask, uint8_t bits);
+    bool CanSetForkFlags(const MappingRangeTable& table, uint64_t begin, uint64_t end) const;
     bool Extend(MappingRangeTable& table, uint64_t identity, uint64_t end);
     void Finish(); // after unlock + acknowledgement; idempotent
 private:
     MappingRangeNode* Take(const MappingRange& source, uint64_t begin,
                            uint64_t end, MappingRangeTable& table);
+    // Split at begin/end and apply to every covered node (preflighted).
+    template<typename Apply>
+    void SplitApply(MappingRangeTable& table, uint64_t begin, uint64_t end, Apply apply);
+    bool CanSplitCovered(const MappingRangeTable& table, uint64_t begin, uint64_t end,
+                         uint32_t protection, bool checkProtection) const;
     MappingRangeNode* spare_ = nullptr;
     MappingRangeNode* retired_ = nullptr;
     uint64_t available_ = 0;

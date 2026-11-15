@@ -187,15 +187,15 @@ bool MappingRangePlan::Insert(MappingRangeTable& table, const MappingRange& rang
     table.root=IndexInsert(table.root,inserted);
     return true;
 }
-bool MappingRangePlan::CanProtect(const MappingRangeTable& table, uint64_t begin, uint64_t end,
-                                  uint32_t protection) const {
+bool MappingRangePlan::CanSplitCovered(const MappingRangeTable& table, uint64_t begin, uint64_t end,
+                                       uint32_t protection, bool checkProtection) const {
     if (!prepared_ || !ValidRange(begin,end) || (protection & ~7u)) return false;
     auto* first = table.head;
     while (first && first->range.end <= begin) first = first->next;
     uint64_t covered = begin, splits = 0, changed = 0;
     for (auto* node = first; node && node->range.begin < end; node = node->next) {
         const auto& range = node->range;
-        if (range.begin > covered || (protection & ~range.maximumProtection)) return false;
+        if (range.begin > covered || (checkProtection && (protection & ~range.maximumProtection))) return false;
         if (range.begin < begin) ++splits;
         if (range.end > end) ++splits;
         covered = range.end; ++changed;
@@ -204,9 +204,15 @@ bool MappingRangePlan::CanProtect(const MappingRangeTable& table, uint64_t begin
         table.nextIdentity > ~uint64_t{0} - splits - changed) return false;
     return true;
 }
-bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_t end,
-                               uint32_t protection) {
-    if (!CanProtect(table,begin,end,protection)) return false;
+bool MappingRangePlan::CanProtect(const MappingRangeTable& table, uint64_t begin, uint64_t end,
+                                  uint32_t protection) const {
+    return CanSplitCovered(table,begin,end,protection,true);
+}
+bool MappingRangePlan::CanSetForkFlags(const MappingRangeTable& table, uint64_t begin, uint64_t end) const {
+    return CanSplitCovered(table,begin,end,0,false);
+}
+template<typename Apply>
+void MappingRangePlan::SplitApply(MappingRangeTable& table, uint64_t begin, uint64_t end, Apply apply) {
     InvalidateLookup(table);
     MappingRangeNode** link = &table.head;
     while (*link && (*link)->range.end <= begin) link = &(*link)->next;
@@ -224,10 +230,23 @@ bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_
             table.root = IndexInsert(table.root, right);
             right->next = node->next; node->next = right; node->range.end = end;
         }
-        node->range.protection = protection; node->range.identity = ++table.nextIdentity;
+        apply(node->range); node->range.identity = ++table.nextIdentity;
         table.root = IndexInsert(table.root, node);
         link = &node->next;
     }
+}
+bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_t end,
+                               uint32_t protection) {
+    if (!CanProtect(table,begin,end,protection)) return false;
+    SplitApply(table,begin,end,[protection](MappingRange& range) { range.protection = protection; });
+    return true;
+}
+bool MappingRangePlan::SetForkFlags(MappingRangeTable& table, uint64_t begin, uint64_t end,
+                                    uint8_t mask, uint8_t bits) {
+    if (!CanSetForkFlags(table,begin,end)) return false;
+    SplitApply(table,begin,end,[mask,bits](MappingRange& range) {
+        range.forkFlags = uint8_t((range.forkFlags & ~mask) | (bits & mask));
+    });
     return true;
 }
 const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t address) {

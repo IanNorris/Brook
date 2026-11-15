@@ -297,6 +297,11 @@ bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t p
     if (!ranges_.Protect(space_->ranges,begin,end,protection)) KernelPanic("mapping: protection preflight changed under lock");
     Changed(); return true;
 }
+bool MappingTransaction::SetForkFlags(uint64_t begin, uint64_t end, uint8_t mask, uint8_t bits) {
+    if (!locked_ || faultScoped_) KernelPanic("mapping: fork policy without lock or in fault scope");
+    if (!ranges_.SetForkFlags(space_->ranges,begin,end,mask,bits)) return false;
+    Changed(false); return true;
+}
 static void ReleaseMappingBacking(void* backing) { MappingBackingUnref(static_cast<MappingBacking*>(backing)); }
 bool MappingTransaction::CaptureMapping(uint64_t address, MappingFaultSnapshot& snapshot) {
     if (!locked_) KernelPanic("mapping: range snapshot without lock");

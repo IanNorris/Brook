@@ -38,6 +38,8 @@ static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destin
                     // Every populated user leaf must have authoritative metadata.
                     if (!range || range->range.begin>address) return false;
                     const auto& mapping=range->range;
+                    // DONTFORK: no child range; WIPEONFORK: child demand-faults zeroes.
+                    if (mapping.forkFlags&(MappingForkSkip|MappingForkWipe)) continue;
                     bool managed=mapping.leafOwnership==MappingLeafOwnership::Managed;
                     bool cow=managed && mapping.sharing==MappingSharing::Private &&
                         (raw&(VMM_WRITABLE|PTE_COW_BIT));
@@ -100,6 +102,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         if(source->pagingAdmission.Exclusive() && !destination->pagingAdmission.ClaimExclusive())return false;
         for (auto* node=source->ranges.head; node; node=node->next) {
             MappingRange range=node->range;
+            if(range.forkFlags&MappingForkSkip)continue; // MADV_DONTFORK
             if(range.kind==MappingKind::Pageable) {
                 range.backing=paging.ChildBackingFor(range.backing);
                 if(!range.backing)KernelPanic("paging: missing prepared fork backing");
@@ -542,6 +545,38 @@ int64_t UserMappingAdviseFree(Process* actor, AddressSpaceState* space, uint64_t
     // Reclamation is optional for MADV_FREE; retain the data until Brook
     // implements lazy reclaim. Validate the entire private anonymous range.
     return error == -95 ? -22 : error;
+}
+
+int64_t UserMappingAdviseFork(Process* actor, AddressSpaceState* space, uint64_t address,
+                              uint64_t length, uint32_t advice) {
+    uint64_t end;
+    if (!actor || !space || (address & 4095)) return -22;
+    if (!length) return 0;
+    if (!UserInterval(address, length, end)) return -22;
+    uint8_t mask = 0, bits = 0;
+    switch (advice) {
+    case 10: mask = bits = MappingForkSkip; break;        // MADV_DONTFORK
+    case 11: mask = MappingForkSkip; break;               // MADV_DOFORK
+    case 18: mask = bits = MappingForkWipe; break;        // MADV_WIPEONFORK
+    case 19: mask = MappingForkWipe; break;               // MADV_KEEPONFORK
+    default: return -22;
+    }
+    MappingTransaction operation(actor, space);
+    if (!operation.PrepareRanges(2)) return -12;
+    if (!operation.Lock()) return -12;
+    for (uint64_t at = address; at < end;) {
+        const auto* range = MappingRangeFind(space->ranges, at);
+        if (!range) return -12;
+        // Brook pager regions carry fork-time backing state; keep them inherited.
+        if (range->kind == MappingKind::Pageable) return -22;
+        if (advice == 11 && range->kind == MappingKind::Device) return -22; // VM_IO
+        if (advice == 18 && (range->backing || range->sharing != MappingSharing::Private ||
+            range->leafOwnership != MappingLeafOwnership::Managed ||
+            (range->kind != MappingKind::Anonymous && range->kind != MappingKind::Heap &&
+             range->kind != MappingKind::Stack))) return -22;
+        at = range->end < end ? range->end : end;
+    }
+    return operation.SetForkFlags(address, end, mask, bits) ? 0 : -12;
 }
 
 int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length) {
