@@ -1,6 +1,6 @@
 # Done: fixed entries
 
-Entries from the syscall-split issue log that the fix pass (branch `work/syscall-fixes`) fixed. They are copied verbatim, with their original IDs and **Status** lines, grouped by fix commit (oldest first; entries fixed across several commits come last). The open entries are in the chunk files, see [../REFACTOR_ISSUES.md](../REFACTOR_ISSUES.md).
+Entries from the syscall-split issue log that the fix pass (branch `work/syscall-fixes`) and later branches fixed. They are copied verbatim, with their original IDs and **Status** lines, grouped by fix commit (oldest first; entries fixed across several commits come last). The open entries are in the chunk files, see [../REFACTOR_ISSUES.md](../REFACTOR_ISSUES.md).
 
 Entries that are only partly fixed (M-64, L-60) or hardened (H-04) stay in their chunk with the done part noted in the Status line.
 
@@ -241,6 +241,62 @@ Note on H-26: the sync-file and pipe POLLOUT parts are fixed. The single-slot wa
 - **Suggested fix:** TtyFillTermios() and TtyIoctl() helpers.
 - **Test:** Host test: byte-compare TCGETS from the keyboard and a tty; TCGETS2 equals TCGETS plus speeds.
 - **Status (fix pass):** fixed in `c5a6cae6`. Test: host test in `test_syscall_user_memory` (ioctl.cpp).
+
+## `6adbe3bc`: shared open file descriptions (branch `work/open-file`)
+
+### H-20 · dup() and fork() copies get their own file offset and status flags (no shared open file description)
+
+- **Where:** `src/kernel/src/syscall_fd.cpp:362`, in `DuplicateFd`.
+- **Severity:** high (confidence high).
+- **Problem:** seekPos and statusFlags are copied per slot. With `cmd >f 2>&1` and `{ a; b; } >f`, writers overwrite each other, and F_SETFL O_NONBLOCK on one alias doesn't affect the others.
+- **Suggested fix:** A refcounted open-file-description object holding the offset and flags; lock the offset read-modify-write.
+- **Test:** QEMU: dup then write "a" and "b" gives "ab"; same for fork.
+- **Status (`work/open-file`):** fixed in `6adbe3bc`: refcounted `OpenFile` (offset, status flags, sleeping `posLock`) shared by dup, dup2/dup3, F_DUPFD, fork and SCM_RIGHTS; design as built in [03-file-descriptions-and-fd-table.md](03-file-descriptions-and-fd-table.md). Test: `test_fd_table`, `test_syscall_user_memory` (rw.cpp, socket.cpp) and QEMU `scripts/test_open_file_qemu.py` (dup "ab", fork offsets, child F_SETFL O_NONBLOCK reaching the parent, BusyBox `cmd >f 2>&1` and `{ a; b; } >f`).
+
+### M-45 · Publish-then-mutate fd allocation ignores O_CLOEXEC and other open flags (11 branches)
+
+- **Where:** `src/kernel/src/syscall_open.cpp:175`, in `OpenAtInternal`.
+- **Severity:** medium (confidence high).
+- **Problem:** Affected branches: O_PATH, fb0, keyboard, tty, renderD128, /dev/dri, DRM sysfs, synthetic /etc and klog. Flags are set after FdAlloc publishes the fd, or not at all, so fds leak across exec. open("/etc/hostname", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC) succeeds.
+- **Suggested fix:** One FdEntry builder plus FdTablePublishOwned; reject write and O_EXCL on read-only synthetic nodes.
+- **Test:** QEMU: per synthetic path, F_GETFD after O_CLOEXEC; O_WRONLY on /etc/passwd fails.
+- **Status (`work/open-file`):** fixed in `6adbe3bc`: every branch publishes through `FdAlloc`/`FdPublishNew` with status and FD_CLOEXEC preset; read-only synthetic files refuse write, O_TRUNC and O_CREAT|O_EXCL (EACCES/EEXIST), `/dev/dri` refuses write (EISDIR). Test: `test_syscall_user_memory` (dir_open.cpp keyboard fallback).
+
+### M-50 · F_GETFL reports open-only flags; F_SETFL accepts any bit
+
+- **Where:** `src/kernel/src/syscall_fd.cpp:626`, in `sys_fcntl`.
+- **Severity:** medium (confidence high).
+- **Problem:** F_GETFL returns O_CREAT, O_EXCL, O_TRUNC and O_CLOEXEC. F_SETFL can set O_PATH or O_TRUNC.
+- **Suggested fix:** Strip open-only flags at open; apply only the settable mask in F_SETFL.
+- **Test:** QEMU: F_GETFL after open(O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC) equals O_RDWR.
+- **Status (`work/open-file`):** fixed in `6adbe3bc`: call-only flags are stripped when the description is created and F_SETFL applies only Linux SETFL_MASK. Test: `test_fd_table`, QEMU `scripts/test_open_file_qemu.py`.
+
+### L-57 · timerfd_create and epoll_create publish the fd and then patch its flags
+
+- **Where:** `src/kernel/src/syscall_timerfd.cpp:84`, in `sys_timerfd_create`.
+- **Severity:** low (confidence medium).
+- **Problem:** A sibling fork+exec can see the fd without CLOEXEC.
+- **Suggested fix:** FdTablePublishOwned with the flags preset (as eventfd2 and signalfd4 do).
+- **Test:** Fork+exec race never inherits a TFD_CLOEXEC fd.
+- **Status (`work/open-file`):** fixed in `6adbe3bc`: timerfd_create and epoll_create publish with O_NONBLOCK/FD_CLOEXEC preset.
+
+### L-59 · CreatePipe publishes descriptors before setting endpoint flags
+
+- **Where:** `src/kernel/src/syscall_pipe.cpp:74`, in `CreatePipe`.
+- **Severity:** low (confidence medium).
+- **Problem:** The flags, status flags and CLOEXEC are written after FdAlloc and without the fd lock, so a sibling's dup or fork can see a write end with flags=0 or no CLOEXEC. Every error is flattened to EMFILE.
+- **Suggested fix:** Publish the entry with its flags preset (FdTablePublishOwned).
+- **Test:** Host: FdAlloc with initial flags.
+- **Status (`work/open-file`):** fixed in `6adbe3bc`: both pipe ends publish complete with flags, status and FD_CLOEXEC; the real error is returned. Test: QEMU `scripts/test_open_file_qemu.py` (pipe ends are separate descriptions).
+
+### L-63 · lseek succeeds on sockets, ttys, keyboard and epoll fds
+
+- **Where:** `src/kernel/src/syscall_fd.cpp:456`, in `sys_lseek`.
+- **Severity:** low (confidence medium).
+- **Problem:** Should be ESPIPE. A VfsStat error becomes EINVAL, and seekPos is updated unlocked.
+- **Suggested fix:** A seekable-type allowlist; propagate errors.
+- **Test:** QEMU: lseek on socketpair, tty and epoll gives ESPIPE.
+- **Status (`work/open-file`):** fixed in `6adbe3bc`: ESPIPE for sockets (inet, unix, netlink), /dev/tty, keyboard and serial stdio; eventfd/timerfd/epoll/signalfd return 0 as Linux noop_llseek does (not ESPIPE as suggested); VfsStat errors propagate; the offset is updated under the description's posLock. Test: QEMU `scripts/test_open_file_qemu.py`.
 
 ## Several commits: `b61a0f73`, `06a10c04`
 

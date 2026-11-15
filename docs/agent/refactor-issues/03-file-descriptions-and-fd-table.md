@@ -1,48 +1,30 @@
 # File descriptions, offsets and fd-table races
 
-_14 open entries (1 high, 7 medium, 6 low). Part of the split refactor issue log; index in [../REFACTOR_ISSUES.md](../REFACTOR_ISSUES.md). Fixed entries are in [done.md](done.md)._
+_8 open entries (0 high, 5 medium, 3 low; M-67 and L-34 partly fixed). Part of the split refactor issue log; index in [../REFACTOR_ISSUES.md](../REFACTOR_ISSUES.md). Fixed entries are in [done.md](done.md); H-20, M-45, M-50, L-57, L-59 and L-63 were fixed on branch `work/open-file`._
 
-- **Scope:** How fds are allocated, published, duplicated and closed (`FdAlloc` vs `FdTablePublishOwned`), plus the missing shared open-file description (H-20): shared offset and status flags, `F_GETFL`/`F_SETFL`, `flock`, `lseek` on non-seekable fds, close-by-number on error paths.
-- **Why it matters:** Shell redirections (`cmd >f 2>&1`) overwrite instead of interleave, `O_CLOEXEC` is lost on several paths, and error paths can close a sibling thread's reused fd.
-- **Dependencies:** Touches every fd type, so coordinate with 05 (SCM_RIGHTS: M-63, L-34) and 07 (epoll/poll key on fd numbers: M-19, M-58 should be redone on top of the open-file description). Do the small publish-order entries first; H-20 is its own branch.
-- **Suggested order:** M-45 (publish helpers everywhere), M-52, M-63, L-45, L-57, L-59, L-71 (the same publish/pin theme), L-34 (merge snapshot code with `FdBumpRefcount`), M-50, L-63, M-48, M-53, M-67, then H-20 on a dedicated branch.
-- **Test approach:** `test_fd_table`, `test_scheduler_fd_snapshot` and `test_syscall_user_memory/dir_open.cpp` (publish with pins, O_CLOEXEC). H-20 needs a QEMU shell test: interleaved output for `cmd >f 2>&1` and `{ a; b; } >f`, and a forked child's `F_SETFL O_NONBLOCK` reaching the parent.
-- **Size:** Medium for the 13 small entries; H-20 is large (a branch of its own).
+- **Scope:** How fds are allocated, published, duplicated and closed, on top of the shared open file description (H-20, done): `flock`, close-by-number on error paths, SCM_RIGHTS publication order, `close_range` UNSHARE, retention under the fd spinlock.
+- **Why it matters:** Error paths can close a sibling thread's reused fd, received SCM_RIGHTS fds can leak on a fault, and `flock` does not exclude.
+- **Dependencies:** Coordinate with 05 (SCM_RIGHTS: M-63) and 07 (epoll/poll key on fd numbers: M-19, M-58 can now key on the `OpenFile*` description).
+- **Suggested order:** M-52, M-63, L-45, L-71 (the same publish/pin theme), M-48, M-53, M-67 (UNSHARE), L-34 (self-cycle GC).
+- **Test approach:** `test_fd_table`, `test_scheduler_fd_snapshot` and `test_syscall_user_memory` (publish with pins, O_CLOEXEC, shared descriptions); `scripts/test_open_file_qemu.py` for guest-visible fd semantics.
+- **Size:** Small to medium per entry.
 
-### Shared open-file description (H-20)
+### Shared open-file description (H-20), as built
 
-Today `FdEntry` holds `seekPos` and `statusFlags` per slot, and `dup`, `dup2`, `fork` and SCM_RIGHTS copy them.
+Built on `work/open-file`; see `src/kernel/src/open_file.h`. It differs from the original proposal in one respect: the per-type handle reference stays per slot.
 
-A correct fix gives each open a refcounted `OpenFile { refs; lock; offset; statusFlags; type; handle; }`. `FdEntry` then keeps only `fdFlags` (CLOEXEC) and a pointer to it.
-
-- **Reference counting:** `FdTableDuplicate*`, `FdTableForkSnapshot`, `UnixFdSnapFrom`/`Install` and `FinalizeClosedFd` retain and release the `OpenFile` rather than the handle. The per-type handle refcount moves into the `OpenFile`'s final release.
-- **Offsets:** `read`, `write`, `lseek`, `getdents64`, `sendfile` and `copy_file_range` update the offset under `OpenFile::lock`. That lock must be a sleeping lock, because VFS I/O can block. Pipes and sockets ignore the offset and skip the lock.
-- **Status flags:** `F_GETFL`/`F_SETFL` and `FIONBIO` act on the shared flags.
-
-This touches every fd type's lifetime, so it needs its own branch and a QEMU shell test. The test should show interleaved rather than overwritten output for `cmd >f 2>&1` and `{ a; b; } >f`, and should show a forked child's `F_SETFL O_NONBLOCK` reaching the parent.
+- **`OpenFile { refs; statusFlags; offset; posLock; }`** is allocated by every publication of a new description (`FdAlloc`, `FdPublishNew`, `ProcessCreate`'s standard fds). `FdEntry` keeps the immutable identity (`type`, `handle`, pipe-direction `flags`, diagnostic `dirPath`), the per-descriptor `fdFlags` (FD_CLOEXEC) and a pointer to its `OpenFile`; `seekPos` and `statusFlags` are gone from `FdEntry`, so every reader goes through `FdStatus()` or the position helpers.
+- **Reference counting:** each live slot (and each queued SCM_RIGHTS record) owns one `OpenFile` reference. `FdRetainCopy` (dup, dup2/dup3, F_DUPFD, fork, exec-in-thread unshare, SCM_RIGHTS send) retains the description alongside the handle; `FinalizeClosedFd` releases both. `FdClaimResult` and `UnixFdSnap` carry the `file` pointer. Keeping the handle reference per slot means no fd type's lifetime changed; moving it into the description's final release (the original proposal, which would also remove the deep copies of DevKlog/DevTty and retention under the fd spinlock, L-71) is a possible follow-up.
+- **Offsets:** `read`, `write`, `writev` O_APPEND, `lseek` and `getdents64` hold `posLock` (a `KMutex`) across the offset read-modify-write for regular files, directories, memfd and synthetic files (`FdAtomicPosition`, Linux FMODE_ATOMIC_POS). Devices and pseudo files use the shared offset without the lock. `sendfile` reads and stores the offset atomically without the lock, as Linux does. Brook has no `copy_file_range`.
+- **Status flags:** `F_GETFL`, `F_SETFL` (Linux SETFL_MASK only, M-50) and `FIONBIO` act on the shared flags with an atomic update. Call-only open flags (O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC, O_CLOEXEC) are stripped when the description is created.
+- **SCM_RIGHTS:** the receiver gets a new slot naming the sender's description; FD_CLOEXEC comes from MSG_CMSG_CLOEXEC. Snapshot and release reuse `FdRetainCopy` and `FinalizeClosedFd` (L-34).
+- **Tests:** `test_fd_table` (sharing across dup/fork/replace/close, posLock serialization), `test_syscall_user_memory` (rw.cpp: `ab` through dup aliases, independent opens, O_APPEND, shared readers; socket.cpp: SCM_RIGHTS shares the description), `test_scheduler_fd_snapshot`, and `scripts/test_open_file_qemu.py` (guest: dup family, fork, child F_SETFL O_NONBLOCK reaching the parent, SCM_RIGHTS, exec with per-fd CLOEXEC, BusyBox `cmd >f 2>&1` and `{ a; b; } >f`).
 
 ## Entries
 
 ### High
 
-### H-20 · dup() and fork() copies get their own file offset and status flags (no shared open file description)
-
-- **Where:** `src/kernel/src/syscall_fd.cpp:362`, in `DuplicateFd`.
-- **Severity:** high (confidence high).
-- **Problem:** seekPos and statusFlags are copied per slot. With `cmd >f 2>&1` and `{ a; b; } >f`, writers overwrite each other, and F_SETFL O_NONBLOCK on one alias doesn't affect the others.
-- **Suggested fix:** A refcounted open-file-description object holding the offset and flags; lock the offset read-modify-write.
-- **Test:** QEMU: dup then write "a" and "b" gives "ab"; same for fork.
-- **Status (fix pass):** deferred: confirmed; needs a refcounted open-file description through the fd table, fork and SCM_RIGHTS. Design under "Shared open-file description (H-20)" below.
-
 ### Medium
-
-### M-45 · Publish-then-mutate fd allocation ignores O_CLOEXEC and other open flags (11 branches)
-
-- **Where:** `src/kernel/src/syscall_open.cpp:175`, in `OpenAtInternal`.
-- **Severity:** medium (confidence high).
-- **Problem:** Affected branches: O_PATH, fb0, keyboard, tty, renderD128, /dev/dri, DRM sysfs, synthetic /etc and klog. Flags are set after FdAlloc publishes the fd, or not at all, so fds leak across exec. open("/etc/hostname", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC) succeeds.
-- **Suggested fix:** One FdEntry builder plus FdTablePublishOwned; reject write and O_EXCL on read-only synthetic nodes.
-- **Test:** QEMU: per synthetic path, F_GETFD after O_CLOEXEC; O_WRONLY on /etc/passwd fails.
 
 ### M-48 · flock() is a stub that always succeeds
 
@@ -51,14 +33,6 @@ This touches every fd type's lifetime, so it needs its own branch and a QEMU she
 - **Problem:** No EBADF or EINVAL checks and no exclusion, so git, nix and package managers believe they hold locks. Record-lock machinery already exists.
 - **Suggested fix:** Whole-file locks owned by the open file description, at least with validation and EWOULDBLOCK.
 - **Test:** test_record_locks flock cases; QEMU: a second LOCK_EX|LOCK_NB gives EWOULDBLOCK.
-
-### M-50 · F_GETFL reports open-only flags; F_SETFL accepts any bit
-
-- **Where:** `src/kernel/src/syscall_fd.cpp:626`, in `sys_fcntl`.
-- **Severity:** medium (confidence high).
-- **Problem:** F_GETFL returns O_CREAT, O_EXCL, O_TRUNC and O_CLOEXEC. F_SETFL can set O_PATH or O_TRUNC.
-- **Suggested fix:** Strip open-only flags at open; apply only the settable mask in F_SETFL.
-- **Test:** QEMU: F_GETFL after open(O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC) equals O_RDWR.
 
 ### M-52 · Unpinned fd publish, then CloseProcessFd(fd) on copyout failure, can close a sibling's descriptor
 
@@ -91,6 +65,7 @@ This touches every fd type's lifetime, so it needs its own branch and a QEMU she
 - **Problem:** Threads sharing the table are affected, and the unlocked write races publish.
 - **Suggested fix:** Implement UNSHARE or return EINVAL; set CLOEXEC under ProcessFdLock.
 - **Test:** test_fd_table range-CLOEXEC under the lock.
+- **Status (`work/open-file`):** partly fixed: CLOSE_RANGE_CLOEXEC now sets FD_CLOEXEC under ProcessFdLock. CLOSE_RANGE_UNSHARE is still accepted and ignored.
 
 ### Low
 
@@ -101,6 +76,7 @@ This touches every fd type's lifetime, so it needs its own branch and a QEMU she
 - **Problem:** BlockDevice, DevTty and DevDsp are rejected here but supported by FdBumpRefcount. Passing a socket over itself creates an uncollectable cycle (no GC).
 - **Suggested fix:** Use FdBumpRefcount and FinalizeClosedFd.
 - **Test:** Host per-FdType refcount balance.
+- **Status (`work/open-file`):** partly fixed: `UnixFdSnapFrom` now uses `FdRetainCopy` and `UnixFdSnapRelease` uses `FinalizeClosedFd`, so every type dup() supports can be passed and the snapshot carries the shared open file description (H-20). Passing a socket over itself still creates an uncollectable cycle.
 
 ### L-45 · SCANOUT_ADOPT rollback closes fds by number (may close a sibling's replacement)
 
@@ -109,30 +85,6 @@ This touches every fd type's lifetime, so it needs its own branch and a QEMU she
 - **Problem:** A sibling can close and reopen an fd number before the CopyToUser failure, so the rollback closes an unrelated descriptor. scene_create already handles this with an FdRef identity compare.
 - **Suggested fix:** Pin each fd and verify type and handle before closing, through a helper shared with scene_create.
 - **Test:** Host fd-table test: a number replaced between publish and rollback is not closed.
-
-### L-57 · timerfd_create and epoll_create publish the fd and then patch its flags
-
-- **Where:** `src/kernel/src/syscall_timerfd.cpp:84`, in `sys_timerfd_create`.
-- **Severity:** low (confidence medium).
-- **Problem:** A sibling fork+exec can see the fd without CLOEXEC.
-- **Suggested fix:** FdTablePublishOwned with the flags preset (as eventfd2 and signalfd4 do).
-- **Test:** Fork+exec race never inherits a TFD_CLOEXEC fd.
-
-### L-59 · CreatePipe publishes descriptors before setting endpoint flags
-
-- **Where:** `src/kernel/src/syscall_pipe.cpp:74`, in `CreatePipe`.
-- **Severity:** low (confidence medium).
-- **Problem:** The flags, status flags and CLOEXEC are written after FdAlloc and without the fd lock, so a sibling's dup or fork can see a write end with flags=0 or no CLOEXEC. Every error is flattened to EMFILE.
-- **Suggested fix:** Publish the entry with its flags preset (FdTablePublishOwned).
-- **Test:** Host: FdAlloc with initial flags.
-
-### L-63 · lseek succeeds on sockets, ttys, keyboard and epoll fds
-
-- **Where:** `src/kernel/src/syscall_fd.cpp:456`, in `sys_lseek`.
-- **Severity:** low (confidence medium).
-- **Problem:** Should be ESPIPE. A VfsStat error becomes EINVAL, and seekPos is updated unlocked.
-- **Suggested fix:** A seekable-type allowlist; propagate errors.
-- **Test:** QEMU: lseek on socketpair, tty and epoll gives ESPIPE.
 
 ### L-71 · Handle retention and allocation while holding the per-process fd spinlock
 
