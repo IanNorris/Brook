@@ -20,7 +20,9 @@ struct BdwExecOwnerWork {uint32_t queued=0,active=0,quarantined=0,unknown=0,reti
 // schedules a worker nor submits commands, and it does not itself release
 // snapshots or validate GPU memory, privilege, cache or reset safety.
 class BdwExecQueue {
+public:
     static constexpr unsigned Capacity=32;
+private:
     struct Entry {uint64_t id=0,owner=0;BdwExecSnapshot* snapshot=nullptr;BdwExecRequestState state=BdwExecRequestState::Free;};
     Entry entries_[Capacity]{};
     uint64_t next_=1,active_=0,parked_=0;bool exhausted_=false,poisoned_=false;
@@ -66,6 +68,14 @@ public:
             else ++out.quarantined;
         }
         return true;
+    }
+    // Records that hold a slot (anything not Free, including finished records
+    // awaiting reaping and quarantined ones). With incarnation, only records
+    // whose snapshot names that submitter.
+    unsigned Occupied(uint64_t incarnation=0)const{
+        unsigned n=0;
+        for(const auto& e:entries_)if(e.state!=BdwExecRequestState::Free && (!incarnation || BdwExecSnapshotOwner(e.snapshot)==incarnation))++n;
+        return n;
     }
     bool Enqueue(uint64_t owner,BdwExecSnapshot* snapshot,uint64_t& id){
         if(!owner || !snapshot || poisoned_ || exhausted_)return false;

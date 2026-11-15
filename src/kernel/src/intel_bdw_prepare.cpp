@@ -847,6 +847,14 @@ void BdwScanoutFairnessCounts(uint64_t& pending,uint64_t& bypass,uint64_t& noEli
 }
 static BdwHandoffSession offscreenSession;
 static KMutex offscreenMutex{};
+// The attached handoff renderer (the desktop compositor), published under
+// offscreenMutex whenever attachment can change. Queue-space admission keeps
+// a reserved slice for it; a stale read only shifts one admission decision.
+static uint64_t presentOwnerHint=0;
+static void PublishPresentOwnerLocked(){__atomic_store_n(&presentOwnerHint,offscreenSession.Owner(),__ATOMIC_RELEASE);}
+BdwQueueSpaceStats BdwApplicationQueueSpaceStats(uint64_t& presentOwner){
+    presentOwner=__atomic_load_n(&presentOwnerHint,__ATOMIC_ACQUIRE);return applicationWorker.SpaceStats();
+}
 static uint32_t offscreenInit=0;
 static KMutex presentMutex{};
 static KSemaphore presentWake{};
@@ -1114,8 +1122,10 @@ int64_t BdwSubmitRenderExperiment(void*,BdwExecSnapshot* snapshot){
     if(!BdwRenderExperimentEnabled())return -19;
     return SubmitApplicationSnapshot(snapshot);
 }
+// Reserves the exec's queue slot; -11 makes the ioctl wait for space.
 int64_t BdwBeginRenderPreparation(void*,uint64_t owner,BdwSubmissionPreparation& entry){
-    const auto ready=InitApplicationWorker();return ready?ready:applicationWorker.BeginPreparation(owner,entry);
+    const auto ready=InitApplicationWorker();
+    return ready?ready:applicationWorker.ReservePreparation(owner,__atomic_load_n(&presentOwnerHint,__ATOMIC_ACQUIRE),entry);
 }
 void BdwEndRenderPreparation(void*,BdwSubmissionPreparation& entry){applicationWorker.EndPreparation(entry);}
 int64_t BdwOffscreenRegisterScene(uint64_t owner,WmDesktopLayers* layers,uint64_t* token){
@@ -1221,7 +1231,7 @@ int64_t BdwOffscreenHandoffControl(uint64_t owner,uint64_t op,uint64_t arg,BdwGp
         if(offscreenSceneOwner==owner){old=offscreenScene;offscreenScene=nullptr;oldBase=offscreenBaseScene;offscreenBaseScene=nullptr;offscreenSceneOwner=offscreenSceneId=offscreenDisplay=offscreenBackdrop=0;offscreenChromeMask=0;offscreenChromeTracking=false;}}break;
     }
     if(detached){DropQueuedPresent(owner);CompositorReleasePresentLease(owner);}
-    CollectRetiredFrameScenes(retired,retiredCount);
+    CollectRetiredFrameScenes(retired,retiredCount);PublishPresentOwnerLocked();
     KMutexUnlock(&offscreenMutex);FreeOffscreenScene(old);FreeOffscreenScene(oldBase);
     for(unsigned i=0;i<retiredCount;++i)FreeOffscreenScene(retired[i]);return result;
 }
@@ -1388,7 +1398,7 @@ int64_t BdwOffscreenHandoffPresentRegions(uint64_t owner,uint64_t ticket,const C
 }
 void BdwOffscreenHandoffOwnerExit(uint64_t owner){
     if(!owner || __atomic_load_n(&offscreenInit,__ATOMIC_ACQUIRE)!=2)return;
-    KMutexLock(&offscreenMutex);DropQueuedPresent(owner);offscreenSession.OwnerExit(owner,applicationWorker);
+    KMutexLock(&offscreenMutex);DropQueuedPresent(owner);offscreenSession.OwnerExit(owner,applicationWorker);PublishPresentOwnerLocked();
     WmDesktopLayers* old=nullptr;WmDesktopLayers* oldBase=nullptr;
     if(offscreenSceneOwner==owner){old=offscreenScene;offscreenScene=nullptr;oldBase=offscreenBaseScene;offscreenBaseScene=nullptr;offscreenSceneOwner=offscreenSceneId=offscreenDisplay=offscreenBackdrop=0;offscreenChromeMask=0;offscreenChromeTracking=false;}
     WmDesktopLayers* retired[BROOK_GPU_HANDOFF_MAX_DEPTH]={};unsigned retiredCount=0;CollectRetiredFrameScenes(retired,retiredCount);

@@ -70,13 +70,36 @@ static_assert(sizeof(ExecBuffer)==64 && sizeof(ExecObject)==56,"i915 exec ABI la
 // completes, buffer use is released or a sync object is published. seen
 // must be read before the caller tests its condition, so a retirement in
 // between is reported as stale and re-checked instead of slept through.
-static bool RetireWait(const BdwI915UserAccess& u,uint64_t seen,uint64_t ns){
+static bool EventWait(const BdwI915UserAccess& u,BdwGpuEvent event,uint64_t seen,uint64_t ns){
     BdwGpuWaiter waiter{};
-    const auto armed=BdwGpuEventArm(BdwGpuEvent::Retire,seen,waiter);
+    const auto armed=BdwGpuEventArm(event,seen,waiter);
     if(armed==BdwWaitArm::Stale)return true;
     const bool ok=u.sleepNs(u.context,ns);
     if(armed==BdwWaitArm::Armed)BdwGpuEventDisarm(waiter);
     return ok;
+}
+static bool RetireWait(const BdwI915UserAccess& u,uint64_t seen,uint64_t ns){return EventWait(u,BdwGpuEvent::Retire,seen,ns);}
+// A full queue that frees no slot for this long is wedged, not busy: report
+// it (EBUSY, as before) rather than block the client forever.
+static constexpr uint64_t QueueStallNs=10'000'000'000ull;
+// Linux i915 blocks an execbuffer until it can be queued; Mesa treats any
+// other failure as fatal. Wait for a queue slot before anything is decoded
+// or locked: no snapshot exists yet, so an interrupted wait discards nothing.
+// EINTR restarts under SA_RESTART (and Mesa's drmIoctl retries it).
+static int64_t BeginExecWaitingForSpace(const BdwI915UserAccess& u,BdwSubmissionPreparation& preparation){
+    uint64_t progressSeen=0,progressAt=0;bool waited=false;
+    for(;;){
+        const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Space);
+        const auto started=u.beginExec(u.context,u.submitterIncarnation,preparation);
+        if(started!=-11)return started;
+        if(!u.sleepNs || !u.nowNs){u.endExec(u.context,preparation);BdwNoteRefusal("submit: exec queue full (32 entries)");return -16;}
+        const uint64_t now=u.nowNs(u.context);
+        if(!waited || seen!=progressSeen){waited=true;progressSeen=seen;progressAt=now;}
+        else if(now-progressAt>=QueueStallNs){
+            u.endExec(u.context,preparation);BdwNoteRefusal("submit: exec queue full and freed no slot for 10 s");return -16;
+        }
+        if(!EventWait(u,BdwGpuEvent::Space,seen,1000000)){u.endExec(u.context,preparation);return -4;}
+    }
 }
 bool BdwIntelSyncReplaceAdmitted(BdwGpuSync* sync,BdwFence* fence){
     KMutexLock(&timelineAdmission);const bool ok=BdwGpuSyncReplace(sync,fence);KMutexUnlock(&timelineAdmission);return ok;
@@ -696,8 +719,8 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
         if(!u.submit)return notty;
         if(bool(u.beginExec)!=bool(u.endExec))return invalid;
         BdwSubmissionPreparation preparation{};
-        if(u.beginExec){const auto started=u.beginExec(u.context,u.submitterIncarnation,preparation);
-            if(started){if(!g_bdwRefusal)BdwNoteRefusal("prepare: submission worker not ready or admission refused");return started;}}
+        if(u.beginExec){const auto started=BeginExecWaitingForSpace(u,preparation);
+            if(started){if(started!=-4 && !g_bdwRefusal)BdwNoteRefusal("prepare: submission worker not ready or admission refused");return started;}}
         struct PreparationGuard {const BdwI915UserAccess& u;BdwSubmissionPreparation& p;
             ~PreparationGuard(){if(u.endExec)u.endExec(u.context,p);}} preparationGuard{u,preparation};
         // Serialize preparation, admission and publication so another
@@ -734,9 +757,12 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
         if(u.sleepNs)for(unsigned i=0;i<100 && BdwExecSnapshotInCpuTransition(snapshot);++i)
             if(!u.sleepNs(u.context,1000000))break;
         int64_t submitted=0;
+        // Admission consumes the slot reserved for exactly this snapshot.
+        __atomic_store_n(&preparation.snapshot,snapshot,__ATOMIC_RELEASE);
         const bool claimed=u.handoffSubmit && u.handoffSubmit(u.context,snapshot,&submitted);
         if(!claimed)submitted=u.submit(u.context,snapshot);
         if(!submitted){plan.publish();plan.release();return 0;}
+        __atomic_store_n(&preparation.snapshot,static_cast<BdwExecSnapshot*>(nullptr),__ATOMIC_RELEASE);
         plan.release();
         // A failed callback is contractually unarmed and retains no owner.
         if(!BdwExecSnapshotRelease(snapshot,false))__builtin_trap();

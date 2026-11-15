@@ -10,6 +10,7 @@
 #include "intel_bdw_submission_timing.h"
 #include "intel_bdw_worker_stats.h"
 #include "intel_bdw_prompt_wake.h"
+#include "intel_bdw_preparation.h"
 #include "intel_bdw_video.h"
 #include "intel_bdw_ioctl_trace.h"
 #include "intel_bdw_critical.h"
@@ -6174,7 +6175,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("if_restores",__atomic_load_n(&w.ifRestores,__ATOMIC_RELAXED));
         r.text(",");r.field("work_generation",BdwGpuEventGeneration(BdwGpuEvent::Work));
         r.text(",");r.field("retire_generation",BdwGpuEventGeneration(BdwGpuEvent::Retire));
-        r.text(",\"scope\":\"M4a prompt GPU wakeups; off = pre-M4a 1 ms polling (Dell boot default is on unless /etc/dell-gpu-no-prompt-wake); on = wait-registry wakes plus RCS completion spin slices (spins also need no /etc/dell-gpu-no-poll-spin); new waits follow the switch immediately, armed waits end at their one-tick timeout; if_restores counts worker waits that returned with IF=0 and were re-enabled (should stay 0 outside spin slices)\"}\n");
+        {uint64_t presentOwner=0;const auto q=BdwApplicationQueueSpaceStats(presentOwner);
+         r.text(",");r.field("queue_waits",q.waits);r.text(",");r.field("queue_granted",q.granted);
+         r.text(",");r.field("queue_refused",q.refused);r.text(",");r.field("queue_abandoned",q.abandoned);
+         r.text(",");r.field("queue_space_signals",q.signals);r.text(",");r.field("queue_occupied",uint64_t{q.occupied});
+         r.text(",");r.field("queue_reserved",uint64_t{q.reserved});r.text(",");r.field("queue_waiters",uint64_t{q.waiters});
+         r.text(",");r.field("present_owner",presentOwner);}
+        r.text(",\"scope\":\"M4a prompt GPU wakeups; off = pre-M4a 1 ms polling (Dell boot default is on unless /etc/dell-gpu-no-prompt-wake); on = wait-registry wakes plus RCS completion spin slices (spins also need no /etc/dell-gpu-no-poll-spin); new waits follow the switch immediately, armed waits end at their one-tick timeout; if_restores counts worker waits that returned with IF=0 and were re-enabled (should stay 0 outside spin slices); queue_* = execbuffers that waited for a submission-queue slot (granted, refused poisoned/frozen, abandoned on signal/stall) and current occupancy; present_owner keeps a reserved slice\"}\n");
         r.send();
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
