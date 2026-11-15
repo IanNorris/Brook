@@ -175,8 +175,8 @@ static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
 }
 /* mode 0 server side, 1 client side, 2 client side with Brook's caption
  * buttons overlaid at the top-right; insets = right | top << 16 (VFB px). */
-static long wm_set_decoration_mode(uint32_t id, int mode, uint32_t insets) {
-    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode, (long)insets);
+static long wm_set_decoration_mode(uint32_t id, int mode, uint32_t insets, uint32_t height) {
+    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode, (long)insets, (long)height);
 }
 static long wm_begin_move(uint32_t id) {
     return syscall(BROOK_SYS_WM_BEGIN_MOVE, (long)id);
@@ -396,7 +396,7 @@ struct brook_surface {
     int deco_requested_csd;
     /* Mode and insets last sent to the kernel WM (-1: nothing sent yet). */
     int deco_sent_mode;
-    uint32_t deco_sent_insets;
+    uint32_t deco_sent_insets, deco_sent_height;
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -2125,21 +2125,32 @@ static void deco_resource_destroyed(struct wl_resource *r) {
 }
 /* Chromium-family browsers draw their tab strip in the title area when they
  * decorate client-side; Brook keeps its own caption buttons over the top-right
- * of that surface (the launcher asks Chromium to draw none, via GTK's button
- * layout). BROOK_WAYLAND_CAPTION_APPS is a comma list of app_id prefixes;
- * empty disables the overlay. */
+ * of that strip (the launcher asks Chromium for all three of its own buttons,
+ * via GTK's button layout, so it keeps its tabs clear of the corner; Brook's
+ * block covers them). BROOK_WAYLAND_CAPTION_APPS is a comma list of
+ * app_id prefixes, each optionally ":height", the client's title-strip height
+ * in surface units so the block spans it (Chromium's is 40 restored and
+ * maximised); no height uses Brook's title height. Empty disables the overlay.
+ * Returns the height, 0 for the native height, or -1 for no overlay. */
 static int deco_caption_overlay_app(const struct brook_surface *s) {
-    if (!s || !s->app_id[0]) return 0;
+    if (!s || !s->app_id[0]) return -1;
     const char *list = getenv("BROOK_WAYLAND_CAPTION_APPS");
-    if (!list) list = "chromium,google-chrome";
+    if (!list) list = "chromium:40,google-chrome:40";
     for (const char *p = list; *p;) {
         const char *e = strchr(p, ',');
         size_t n = e ? (size_t)(e - p) : strlen(p);
-        if (n && !strncmp(s->app_id, p, n)) return 1;
+        const char *colon = memchr(p, ':', n);
+        size_t prefix = colon ? (size_t)(colon - p) : n;
+        if (prefix && !strncmp(s->app_id, p, prefix)) {
+            int height = 0;
+            for (const char *d = colon ? colon + 1 : p + n; d < p + n && *d >= '0' && *d <= '9'; ++d)
+                if (height < 4096) height = height * 10 + (*d - '0');
+            return height;
+        }
         if (!e) break;
         p = e + 1;
     }
-    return 0;
+    return -1;
 }
 static int g_caption_overlay_unsupported;
 /* The kernel needs the client's shadow margin to place the buttons on its
@@ -2158,25 +2169,30 @@ static uint32_t deco_caption_insets(const struct brook_surface *s) {
 static void surface_sync_decoration(struct brook_surface *s, int force) {
     if (!s || !s->wm_id) return;
     int mode = s->deco_csd ? 1 : 0;
-    uint32_t insets = 0;
+    uint32_t insets = 0, height = 0;
+    int strip = -1;
     if (mode && !s->xdg_popup && s->xdg_toplevel && s->deco_resource && s->deco_requested_csd &&
-        !g_caption_overlay_unsupported && deco_caption_overlay_app(s)) {
+        !g_caption_overlay_unsupported && (strip = deco_caption_overlay_app(s)) >= 0) {
         mode = 2;
         insets = deco_caption_insets(s);
+        uint64_t physical = (uint64_t)strip * surface_output_scale(s);
+        height = physical > 0xFFFF ? 0xFFFF : (uint32_t)physical;
     }
-    if (!force && mode == s->deco_sent_mode && insets == s->deco_sent_insets) return;
-    long rc = wm_set_decoration_mode(s->wm_id, mode, insets);
+    if (!force && mode == s->deco_sent_mode && insets == s->deco_sent_insets &&
+        height == s->deco_sent_height) return;
+    long rc = wm_set_decoration_mode(s->wm_id, mode, insets, height);
     if (mode == 2 && rc == 0) {
         /* An older kernel treats mode 2 as plain CSD: stop asking. */
         g_caption_overlay_unsupported = 1;
         fprintf(stderr, "[waylandd] caption overlay unsupported by kernel; plain client-side\n");
     }
     if (force || mode != s->deco_sent_mode)
-        fprintf(stderr, "[waylandd] decoration wm=%u mode=%s insets=%u,%u rc=%ld\n", s->wm_id,
+        fprintf(stderr, "[waylandd] decoration wm=%u mode=%s insets=%u,%u height=%u rc=%ld\n", s->wm_id,
                 mode == 2 ? "client_side+captions" : mode ? "client_side" : "server_side",
-                insets & 0xFFFF, insets >> 16, rc);
+                insets & 0xFFFF, insets >> 16, height, rc);
     s->deco_sent_mode = mode;
     s->deco_sent_insets = insets;
+    s->deco_sent_height = height;
 }
 static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;

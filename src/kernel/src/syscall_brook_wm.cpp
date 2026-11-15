@@ -416,17 +416,19 @@ int64_t sys_brook_wm_resize_vfb(uint64_t wmId, uint64_t newW,
 //   side; any other value is CSD: the kernel WM stops drawing chrome and the
 //   whole outer area is client.  mode 2 additionally keeps the WM's caption
 //   buttons over the client's top-right corner; insets packs the client's
-//   right (bits 0-15) and top (bits 16-31) shadow margins in VFB pixels.
+//   right (bits 0-15) and top (bits 16-31) shadow margins in VFB pixels, and
+//   height is the client's title-strip height in VFB pixels (0: native title
+//   height), so the buttons span the whole strip.
 //   Returns 2 when the caption overlay is in effect (older kernels return 0
 //   and treat mode 2 as plain CSD), otherwise 0.
 int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
-                                          uint64_t insets, uint64_t,
+                                          uint64_t insets, uint64_t height,
                                           uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
     if (wmId == 0 || wmId > 0xFFFFu) return -EINVAL;
-    if (insets > 0xFFFFFFFFull) return -EINVAL;
+    if (insets > 0xFFFFFFFFull || height > 0xFFFFu) return -EINVAL;
 
     brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
     if (!w) return -EINVAL;
@@ -434,7 +436,8 @@ int64_t sys_brook_wm_set_decoration_mode(uint64_t wmId, uint64_t csd,
     const bool overlay = csd == 2;
     brook::WmSetClientSideDecoration(idx, csd != 0, overlay,
                                      static_cast<uint16_t>(overlay ? insets & 0xFFFFu : 0),
-                                     static_cast<uint16_t>(overlay ? insets >> 16 : 0));
+                                     static_cast<uint16_t>(overlay ? insets >> 16 : 0),
+                                     static_cast<uint16_t>(overlay ? height : 0));
     return overlay ? 2 : 0;
 }
 

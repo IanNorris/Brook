@@ -235,7 +235,7 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
     w->state=*message;
     if (w->surface && w->surface->wm_id &&
         ((old_flags^message->flags)&BXWM_CLIENT_CHROME) && !(message->flags&BXWM_OVERRIDE)) {
-        if (wm_set_decoration_mode(w->surface->wm_id,(message->flags&BXWM_CLIENT_CHROME)!=0,0)<0) {
+        if (wm_set_decoration_mode(w->surface->wm_id,(message->flags&BXWM_CLIENT_CHROME)!=0,0,0)<0) {
             g_xwm_failed=1;return 0;
         }
         xwayland_native_sync(w->surface,0);

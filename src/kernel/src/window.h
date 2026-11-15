@@ -161,6 +161,7 @@ struct Window
     // client's window geometry (its transparent shadow margin).
     bool        captionOverlay;
     uint16_t    captionInsetRight,captionInsetTop;
+    uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
     char        title[64];
     char        appId[128];     // explicit xdg app_id, independent of document title
@@ -327,7 +328,8 @@ int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
 // captionOverlay keeps the WM's caption buttons over the client's top-right,
 // inset from the surface edges by insetRight/insetTop physical pixels.
 void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay=false,
-                               uint16_t insetRight=0, uint16_t insetTop=0);
+                               uint16_t insetRight=0, uint16_t insetTop=0,
+                               uint16_t captionHeight=0);
 // Screen rectangle of a window's overlaid caption buttons (empty if none).
 WmRect WmCaptionOverlayRect(const Window& w);
 

@@ -36,6 +36,7 @@ struct DesktopWindowGeometry {
     // the top edge). Insets exclude the client's transparent shadow margin.
     bool captionOverlay=false;
     int captionInsetRight=0,captionInsetTop=0;
+    int captionHeight=0; // client's title-strip height in physical pixels; 0: native title()
     int clientX(const DesktopMetrics& m) const { return x+(clientDecorated?0:m.border()); }
     int clientY(const DesktopMetrics& m) const { return y+(clientDecorated?0:m.border()+m.title()); }
 };
@@ -48,7 +49,8 @@ inline DesktopRect DesktopCaptionRect(const DesktopWindowGeometry& g,const Deskt
         int width=m.captionButton();
         if(width*3>span) width=span/3;
         if(width<=0 || top>=g.clientH) return {};
-        const int height=m.title()<g.clientH-top?m.title():g.clientH-top;
+        const int want=g.captionHeight>0?g.captionHeight:m.title();
+        const int height=want<g.clientH-top?want:g.clientH-top;
         return {g.x+span-(button+1)*width,g.y+top,width,height};
     }
     int width=m.captionButton();

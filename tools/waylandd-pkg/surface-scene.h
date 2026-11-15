@@ -180,7 +180,7 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);
         if (s->app_id[0]) wm_set_app_id(s->wm_id,s->app_id);
-        s->deco_pending=0;s->deco_sent_mode=csd?1:0;s->deco_sent_insets=0;popup_apply_position(s);
+        s->deco_pending=0;s->deco_sent_mode=csd?1:0;s->deco_sent_insets=s->deco_sent_height=0;popup_apply_position(s);
     } else if (s->vfb_w!=width || s->vfb_h!=height) {
         if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) return 0;
     } else return 1;

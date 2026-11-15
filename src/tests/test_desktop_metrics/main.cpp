@@ -115,6 +115,12 @@ int main() {
         auto tight=DesktopCaptionOverlayRect({0,0,60,20,true,true,0,0},next);
         CHECK(tight.w<=60&&tight.h<=20);
         CHECK(DesktopCaptionOverlayRect({0,0,60,20,true,true,0,20},next).w==0);
+        // A client title strip taller than the native title: the block spans it.
+        DesktopWindowGeometry strip{100,50,800,600,true,true,12,8,next.pixels(40)};
+        auto tall=DesktopCaptionOverlayRect(strip,next);
+        CHECK(tall.h==next.pixels(40)&&tall.y==58&&tall.w==block.w);
+        for(int i=0;i<3;++i)CHECK(DesktopCaptionRect(strip,next,i).h==next.pixels(40));
+        CHECK(DesktopCaptionOverlayRect({0,0,300,30,true,true,0,0,40},next).h==30);
         auto top=ReframeDesktopWindow({0,0,800,600,false},old,next,1920,1080-next.taskbar());
         CHECK(top.y>=0);
         auto small=DesktopCaptionRect({0,0,80,40,false},next,0);

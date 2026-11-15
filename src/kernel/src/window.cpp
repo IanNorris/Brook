@@ -572,7 +572,7 @@ bool WmLauncherApplyPending()
 static DesktopWindowGeometry CaptionGeometry(const Window& w)
 {
     return {w.x,w.y,w.clientW,w.clientH,w.noChrome,w.noChrome && w.captionOverlay,
-            w.captionInsetRight,w.captionInsetTop};
+            w.captionInsetRight,w.captionInsetTop,w.captionHeight};
 }
 static WmRect CaptionRect(const Window& w, int index)
 {
@@ -887,7 +887,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.minimized = false;
     w.noChrome = false;
     w.captionOverlay = false;
-    w.captionInsetRight = w.captionInsetTop = 0;
+    w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0;
     w.focusable = focusable;
     w.savedX = x;
     w.savedY = y;
@@ -1232,27 +1232,29 @@ Window* WmGetWindow(int idx)
 }
 
 void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
-                               uint16_t insetRight, uint16_t insetTop)
+                               uint16_t insetRight, uint16_t insetTop, uint16_t captionHeight)
 {
     VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
     captionOverlay = enable && captionOverlay;
-    if (!captionOverlay) insetRight = insetTop = 0;
+    if (!captionOverlay) insetRight = insetTop = captionHeight = 0;
     if (w.noChrome == enable && w.captionOverlay == captionOverlay &&
-        w.captionInsetRight == insetRight && w.captionInsetTop == insetTop) return;
+        w.captionInsetRight == insetRight && w.captionInsetTop == insetTop &&
+        w.captionHeight == captionHeight) return;
     const bool modeChanged = w.noChrome != enable || w.captionOverlay != captionOverlay;
     w.noChrome = enable;
     w.captionOverlay = captionOverlay;
     w.captionInsetRight = insetRight;
     w.captionInsetTop = insetTop;
+    w.captionHeight = captionHeight;
     if (!modeChanged) { extern void CompositorMarkDirty(); CompositorMarkDirty(); return; }
     // Mark compositor dirty so the chrome region repaints/clears next frame.
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
-    SerialPrintf("WM: window %d CSD=%d caption_overlay=%d inset=%u,%u\n", idx, (int)enable,
-                 (int)captionOverlay, insetRight, insetTop);
+    SerialPrintf("WM: window %d CSD=%d caption_overlay=%d inset=%u,%u height=%u\n", idx, (int)enable,
+                 (int)captionOverlay, insetRight, insetTop, captionHeight);
 }
 
 // Set per-window display properties (opacity and/or backdrop blur radius). `mask`
@@ -3812,7 +3814,7 @@ static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Windo
     in.state=static_cast<uint32_t>(origin0.state);
     in.focused=origin0.focused;in.visible=origin0.visible;in.noChrome=origin0.noChrome;
     in.captionOverlay=origin0.noChrome && origin0.captionOverlay ?
-        (1u<<31)|(uint32_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
+        (1ull<<63)|(uint64_t(origin0.captionHeight)<<32)|(uint64_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
     in.hoverButton=hover;
     in.theme=static_cast<uint32_t>(layers.theme);in.appearance=static_cast<uint32_t>(layers.appearance);
     in.scale=static_cast<uint32_t>(layers.scale);

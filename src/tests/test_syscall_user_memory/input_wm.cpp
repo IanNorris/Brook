@@ -27,7 +27,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const c
     WmCreateWindowResult result{};result.wmId=3;result.vfbStride=4096;
     result.vfbUser=reinterpret_cast<void*>(0x40000000);return result;
 }
-void WmSetClientSideDecoration(int,bool,bool,uint16_t,uint16_t) {}
+void WmSetClientSideDecoration(int,bool,bool,uint16_t,uint16_t,uint16_t) {}
 void WmDestroyWindowById(Process*,uint32_t) { ++g_wm.destroys;g_wm.exists=false; }
 void WmSetTitleById(Process*,uint32_t,const char* title) { ++g_wm.titles;for(int i=0;i<64;++i)g_wm.title[i]=title[i]; }
 int WmResizeVfbForProcess(Process*,uint32_t wmId,uint16_t,uint16_t,WmCreateWindowResult* out) {

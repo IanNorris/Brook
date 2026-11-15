@@ -19,7 +19,7 @@ struct WmChromeKeyInput {
     int32_t clientOffsetX,clientOffsetY;
     uint32_t state;
     bool focused,visible,noChrome;
-    uint32_t captionOverlay;      // 0, or bit 31 | top inset << 16 | right inset
+    uint64_t captionOverlay;      // 0, or bit 63 | height << 32 | top inset << 16 | right inset
     int32_t hoverButton;          // -1 none, else caption button index
     uint32_t theme,appearance,scale;
     uint64_t settingsEpoch,launcherEpoch;
