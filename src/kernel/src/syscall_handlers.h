@@ -268,4 +268,42 @@ int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_
 int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                    uint64_t, uint64_t, uint64_t);
 
+// syscall_socket.cpp
+int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
+                    uint64_t flagsVal, uint64_t destVal, uint64_t addrLenVal);
+int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
+                      uint64_t flagsVal, uint64_t srcVal, uint64_t addrLenVal);
+int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optionVal,
+                        uint64_t valueAddr, uint64_t length, uint64_t);
+int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
+                        uint64_t optvalAddr, uint64_t optlenAddr, uint64_t);
+int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                         uint64_t, uint64_t, uint64_t);
+int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                         uint64_t, uint64_t, uint64_t);
+int64_t sys_shutdown(uint64_t fdVal, uint64_t howVal, uint64_t,
+                      uint64_t, uint64_t, uint64_t);
+int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_accept(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_accept4(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
+                     uint64_t flags, uint64_t, uint64_t);
+int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
+                        uint64_t svAddr, uint64_t, uint64_t);
+int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_sendmmsg(uint64_t fdVal, uint64_t msgvecVal, uint64_t vlenVal,
+                      uint64_t flagsVal, uint64_t, uint64_t);
+int64_t sys_recvmmsg(uint64_t fdVal, uint64_t msgvecVal, uint64_t vlenVal,
+                      uint64_t flagsVal, uint64_t timeoutVal, uint64_t);
+
 } // namespace brook
