@@ -94,6 +94,11 @@ void BdwExecSnapshotCapture(const BdwExecSnapshot* snapshot,BdwGpuCapture& out);
 void BdwExecSnapshotSetOrigin(BdwExecSnapshot* snapshot,uint32_t pid,uint32_t contextId,uint64_t incarnation=0);
 void BdwExecSnapshotOrigin(const BdwExecSnapshot* snapshot,uint32_t& pid,uint32_t& contextId);
 uint64_t BdwExecSnapshotOwner(const BdwExecSnapshot* snapshot);
+// i915 engine selector copied at admission (0/1 render, 2 BSD/VCS0). Set only
+// before the snapshot is reserved; the worker routes on it.
+constexpr uint32_t BdwExecEngineVideo=2;
+bool BdwExecSnapshotSetEngine(BdwExecSnapshot* snapshot,uint32_t engine);
+uint32_t BdwExecSnapshotEngine(const BdwExecSnapshot* snapshot);
 // Exact table-page count for the copied, sorted object addresses; the builder
 // independently checks all backing pages and the caller's allocation.
 bool BdwExecSnapshotTableCount(const BdwExecSnapshot* snapshot,uint32_t& out);

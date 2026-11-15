@@ -27,7 +27,7 @@ struct BdwExecSnapshot {
     BdwFence* signalFences[BdwMaxSubmissionFences];uint32_t signalCount;
     BdwFence* waitFences[BdwMaxSubmissionFences];uint32_t waitCount;
     uint32_t count,pages,state,preparedFlags,batchIndex,batchOffset,probeShadowed;
-    uint32_t submitterPid,contextId;
+    uint32_t submitterPid,contextId,engine;
     uint64_t batchAddress,batchLength,submitterIncarnation;
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
     uint64_t diagnosticQueuedTicks, traceId;
@@ -305,6 +305,11 @@ void BdwExecSnapshotSetOrigin(BdwExecSnapshot* s,uint32_t pid,uint32_t contextId
     if(s && __atomic_load_n(&s->state,__ATOMIC_ACQUIRE)==0){s->submitterPid=pid;s->contextId=contextId;s->submitterIncarnation=incarnation;}
 }
 uint64_t BdwExecSnapshotOwner(const BdwExecSnapshot* s){return s?s->submitterIncarnation:0;}
+bool BdwExecSnapshotSetEngine(BdwExecSnapshot* s,uint32_t engine){
+    if(!s || engine>2 || __atomic_load_n(&s->state,__ATOMIC_ACQUIRE)!=0)return false;
+    s->engine=engine;return true;
+}
+uint32_t BdwExecSnapshotEngine(const BdwExecSnapshot* s){return s?s->engine:0;}
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 static BdwTimingSnapshot gpuTiming{};static uint32_t gpuTimingLock=0;static uint64_t gpuTimingDropped=0,gpuTimingOwnerHint=0;
 uint64_t BdwTimingNow(){uint32_t lo,hi;__asm__ volatile("lfence; rdtsc":"=a"(lo),"=d"(hi)::"memory");return (uint64_t(hi)<<32)|lo;}

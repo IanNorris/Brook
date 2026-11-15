@@ -140,9 +140,13 @@ public:
         refuse(reason==BdwVideoRefusal::None?BdwVideoRefusal::SubmitFailed:reason);
         if(engineTouched)stage_=BdwVideoStage::Quarantined;
     }
-    // User submission (execbuffer I915_EXEC_BSD) is phase 1c and not
-    // implemented: userspace is never told VCS exists, even after a self-test.
-    bool advertiseBsd()const{return false;}
+    // A VCS failure seen outside the gate's owner (the worker's user-job
+    // executor) quarantines VCS for the boot.
+    void quarantine(BdwVideoRefusal reason){stage_=BdwVideoStage::Quarantined;refuse(reason);}
+    // User submission (execbuffer I915_EXEC_BSD, phase 1c) may be offered
+    // only with the gate on, not quarantined, and a self-test that passed on
+    // this boot. The kernel additionally requires the executor to be built.
+    bool advertiseBsd()const{return selftestPasses_>0 && enabled();}
 };
 
 // MI commands used by the planned VCS self-test (phase 1b). Encoded here so

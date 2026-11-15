@@ -7379,7 +7379,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
 // The Intel file type is not published yet. These operations provide the
 // real GEM handle/mmap substrate for a future admitted i915 render node;
 // unsupported execution and cache modes fail rather than report success.
-static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg) {
+static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint64_t renderFd) {
     // Exec preparation and admission retain stack-owned ledger nodes and
     // snapshots across user copies and sleepable locks. A fatal signal must
     // unwind those objects before the scheduler may retire this thread.
@@ -7391,6 +7391,12 @@ static int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t ar
         [](void*){return ClockNowNs(1);},
         [](void*,uint64_t){auto* self=ProcessCurrent();if(!self || HasPendingSignals())return false;
             self->wakeupTick=ApicTickCount()+1;SchedulerBlockInterruptible(self);return !HasPendingSignals();}};
+    // Legacy GEM_MMAP (VA-API phase 2a): map the buffer's token through this
+    // same descriptor, exactly as the caller's own mmap(2) would.
+    uint64_t mapFd=renderFd;user.context=&mapFd;
+    user.mapBuffer=[](void* context,uint64_t token,uint64_t bytes,uint64_t& address)->int64_t{
+        const int64_t mapped=sys_mmap(0,bytes,PROT_READ|PROT_WRITE,MAP_SHARED,*static_cast<uint64_t*>(context),token);
+        if(mapped<0)return mapped;address=static_cast<uint64_t>(mapped);return 0;};
     if(auto* current=ProcessCurrent()){
         user.submitterPid=current->pid;
         user.submitterIncarnation=current->leaderIncarnation?current->leaderIncarnation:current->incarnation;
@@ -7707,7 +7713,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         return 0;
     }
 
-    if(fde->type==FdType::DevIntelDri)return IntelRenderIoctl(static_cast<brook::BdwGpuFile*>(fde->handle),cmd,arg);
+    if(fde->type==FdType::DevIntelDri)return IntelRenderIoctl(static_cast<brook::BdwGpuFile*>(fde->handle),cmd,arg,fd);
     if (fde->type == FdType::DevDri)
     {
         uint8_t type = static_cast<uint8_t>((cmd >> 8) & 0xFF);

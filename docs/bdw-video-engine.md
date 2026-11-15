@@ -1,6 +1,6 @@
 # Broadwell video engine (VCS0) and VA-API
 
-Status: **phases 1a and 1b implemented**: VCS0 probe, domain reset and a submission self-test, behind a build option and a runtime gate; nothing is advertised to userspace. None of it has run on hardware yet. Phase 1c onwards is designed below but not implemented. Branch `work/vaapi`.
+Status: **phase 1 (1a, 1b) passes on the Dell (gen 393); phase 1c (VCS user jobs, `I915_EXEC_BSD`) is implemented and host/QEMU-tested (pair `pair-vaapi-p1c1`), not yet run on hardware.** Everything stays behind the build option `BROOK_BDW_VIDEO_ENGINE` and a runtime gate that is off at boot. Branch `work/vaapi`.
 
 ## Why
 
@@ -12,7 +12,7 @@ Brook's browsers now render on the GPU, but video decode is software (dav1d/ffmp
 |---|---|---|
 | 1a | VCS0 constants, probe, domain reset, runtime gate, debug commands, explicit `HAS_BSD=0` | done (this branch) |
 | 1b | VCS0 HWS/CSB, execlist init, logical context, one-shot submission, `gpu video selftest` | done (this branch), host-tested; untested on hardware |
-| 1c | VCS jobs in the submission worker (separate queue), `I915_EXEC_BSD`, `HAS_BSD=1` once the self-test passes | designed |
+| 1c | VCS jobs in the submission worker, `I915_EXEC_BSD`, `HAS_BSD=1` once the self-test passes | implemented (p1c1), untested on hardware |
 | 2 | libva + intel-vaapi-driver (i965) running `vainfo` and `ffmpeg -hwaccel vaapi` H.264 | scoped below |
 | 3 | Chrome VA-API (Ozone/Wayland, NV12 dma-buf into ANGLE), Firefox (ffmpeg VA-API), H.264 preference for YouTube | not started |
 | 4 | Soak, hang recovery, A/V sync, multiple streams | not started |
@@ -37,7 +37,7 @@ Brook's browsers now render on the GPU, but video decode is software (dav1d/ffmp
   - The shared reset/init/MMIO templates accept `0x12000` (`BdwResetVcsDomain`, `BdwInitializeVcsExeclists`, `BdwVcsMmio`).
   - `VmmDellVcsReset` runs inside the existing forcewake critical section (`VmmDellForcewakeCriticalImpl`, new `vcsReset` work item). That serialises it with every render, blit and present job through the shared `BdwForcewakeClaim`, and requires write-verified UC aliases for the VCS and reset pages.
 - **Debug commands** (`gpu video on|off|status|probe|reset|selftest`): status reports built, stage, counters, last refusal, the last VCS sample (head, tail, MI_MODE, control, execlist status, GFX_MODE, idle, quiescent), and the reset outcome. `selftest` currently returns `not-implemented`.
-- **Userspace ABI:** `GETPARAM HAS_BSD` (5) now answers 0 explicitly, so libva/i965 see "no BSD" rather than an error. `execbuffer2` with any engine other than render still returns EINVAL (`engine>1`). Nothing user-controlled reaches VCS.
+- **Userspace ABI:** `GETPARAM HAS_BSD` now answers 0 explicitly (phases 1a–1c used id 5 by mistake, which is `HAS_GEM`; fixed in 2a to id 10), so libva/i965 see "no BSD" rather than an error. `execbuffer2` with any engine other than render still returns EINVAL (`engine>1`). Nothing user-controlled reaches VCS.
 - **Tests:** `test_intel_bdw_video`:
   - the reset sequence on a fake VCS (writes `0x120d0=0x10001`, `0x941c=4`, `0x120d0=0x10000`; refusal before any write on catastrophic error or another domain in reset; uncertain on no ack or no reset-ready, with the request cancelled);
   - every gate transition including quarantine;
@@ -222,3 +222,147 @@ Both need **relocation-free submission** from Brook's point of view: Brook's exe
 - truthful GETPARAMs;
 - `SET_TILING`/`GET_TILING` metadata and `GEM_MMAP` WC;
 - confirming the list with `gpu ioctl trace` while running `vainfo`.
+
+## Phase 1c executor (p1c1, commit 29818357)
+
+**Path of an `I915_EXEC_BSD` execbuffer:**
+1. `CopyExecSnapshot` admits engine 2 only while `BdwVideoUserSubmissionReady()`. Otherwise it is refused (EINVAL, reason `execbuffer: I915_EXEC_BSD video engine submission not available`). Engines above 2 stay refused. The snapshot is tagged `BdwExecEngineVideo`.
+2. It is queued on the normal application queue. On the CPU0 worker, `ExecuteRetainedWorker` hands tagged snapshots to `ExecuteVcsUserJob` (`intel_bdw_scanout.cpp`) before any render-path state is touched. VCS jobs therefore run one at a time, between RCS jobs. There is no separate VCS queue yet: a VCS job delays the next RCS job by its own duration.
+3. `BdwPrepareVcsUserJob` (`intel_bdw_prepare.cpp`) uses objects that the RCS path never touches:
+   - **Tables:** its own `BdwExecTables` instance with a table-only `BuildTables`. There is no render ring and no table cache.
+   - **One-shot:** its own `BdwVcsUserOneShot` (`intel_bdw_vcs_user.h`). Each job gets a fresh, restore-inhibited VCS context with PML4 set to the job's table root, and a ring of `MI_BATCH_BUFFER_START` (PPGTT, 48-bit, 8-byte aligned) to the user batch followed by the GGTT breadcrumb.
+   - **GGTT:** its own 8-entry reservation in the one-shot window, plus a scratch page.
+
+   Snapshots containing scanout (uncached) or protected buffers are refused. After a clean build, DMA inspection, publication and cache sync, the snapshot is armed.
+4. `VmmDellVcsUserRun` runs the 1b sequence in the forcewake critical section:
+   1. VCS reset, with the firmware engine values (RING_MAX_IDLE etc.) restored;
+   2. PAT lease;
+   3. a check and flush of the table pages under the lease;
+   4. takeover bind, execlist init, ELSP;
+   5. breadcrumb and CSB completion within the 2 s budget;
+   6. VCS reset, unbind.
+5. Fences complete or fail through the queue's normal snapshot retirement.
+
+**Failure policy:**
+
+| Outcome (`BdwClassifyVcsUserRun`) | Job | VCS |
+|---|---|---|
+| Refused before any VCS write: gate, preconditions, size or allocation limits, claim busy (retried 20× at 1 ms) | fence fails (skipped), buffers not poisoned | unchanged |
+| Touched and failed (hang: no breadcrumb/CSB in 2 s; CSB fault), reset acknowledged | fence fails, buffers marked failed (GEM_WAIT returns EIO) | quarantined for the boot, `HAS_BSD`→0 |
+| Stopped but the lease could not be unbound | fence fails, pages retained for the boot | quarantined |
+| Uncertain GDRST, PAT or forcewake | — | kernel panic (guard recovery), as in 1b |
+
+**Readiness:** `HAS_BSD` and BSD admission are published only by a video-build kernel when all of these hold:
+- the gate is on;
+- a self-test has passed this boot;
+- VCS is not quarantined.
+
+Gate off withdraws them, and gate on again restores them without a new self-test. The worker reports a quarantine through an atomic flag, because a running self-test holds the video lease while it waits on that same worker. Holders of the lease fold the flag into the gate. `gpu video status` now reports `user_ready` and `user_jobs {jobs, completed, refused, failed, retries, last_us, max_us, quarantined, quarantine_detail}`.
+
+**Probe tool:** `tools/vcs-store-probe/vcs_store_probe.c` is static and has no libdrm dependency. Build it with:
+
+```
+$MUSL_CC -static -O2 -Wall -Wextra -Werror tools/vcs-store-probe/vcs_store_probe.c -o build/vcs-store-probe/vcs_store_probe
+```
+
+It finds the i915 render node and reads `HAS_BSD`. It then submits a softpinned `MI_STORE_DATA_IMM` batch with `I915_EXEC_BSD | NO_RELOC | FENCE_ARRAY`, using a signalling syncobj. It waits on the syncobj and `GEM_WAIT`, then checks the value. Modes:
+- `--count N`: run N jobs.
+- `--high`: place the objects above 4 GiB.
+- `--expect-refused`: requires `HAS_BSD=0` and an EINVAL refusal.
+- `--hang`: destructive for the boot. A self-looping batch; it expects EIO on the BO and `HAS_BSD=0` afterwards.
+
+**Known costs, left for phase 4:**
+- Every job does two media resets and full execlist init. That is fine for correctness, but per-job latency will matter for decode throughput; persistent VCS execlist state is the phase 4 fix.
+- A hang stalls the CPU0 worker, and so the desktop, for up to the 2 s budget once before the quarantine.
+
+**Tests:**
+- Host tests:
+  - user ring encoding and its refusals;
+  - every classifier outcome;
+  - advertisement and quarantine;
+  - `BdwVcsUserOneShot` complete, hang and refusal flows on the fake backend;
+  - decoder tagging and refusal of engines 2, 3 and 4.
+- The full host suite passes (352 tests).
+- `pair-vaapi-p1c1` passes the guarded QEMU check on the first attempt.
+
+## Phase 1c on the Dell (gen 395) and phase 2a (p2a0)
+
+**1c passed on the Dell** (gen 395, session `979e6fe7a4e44dcaa9789fcbe62fd4cc`, evidence in `display-perf/build/vcs-user-p1c1/`):
+- `--expect-refused` passed. After the self-test, `advertised` and `user_ready` were true.
+- Single jobs, low and `--high` placement, passed.
+- 500 jobs: mean 2180 µs, worst 6009 µs, kernel `max_us` 680.
+- 5000 jobs during yquake: mean 1973 µs. yquake ran at 19.82 ms under VCS load against 20.40 ms alone, and zero-copy stayed active.
+- Gate off/on: SKIP, then refused, then PASS again with no new self-test.
+- `--hang` was detected at 2002 ms and VCS was quarantined (`breadcrumb-timeout`) with no panic. yquake afterwards: 20.65 ms.
+- In total 5504 jobs ran: 1 failed (the hang), 0 refused.
+
+**Correction:** the 1a–1c kernels and probe used GETPARAM id **5** for `HAS_BSD`. That id is `HAS_GEM`; `HAS_BSD` is **10**. The Dell results stand, because the probe and kernel agreed, but libdrm and i965 query 10. 2a moves `HAS_BSD` to 10, answers `HAS_GEM`=1, and rebuilds the probe.
+
+**2a kernel (`intel_bdw_ioctl.cpp`, `intel_bdw_buffer.*`, `syscall.cpp`):**
+- **GETPARAM:**
+
+  | Param | Answer |
+  |---|---|
+  | HAS_GEM | 1 |
+  | NUM_FENCES_AVAIL | 0 (no fences) |
+  | HAS_BSD (10) | executor-ready |
+  | HAS_BLT | 0 (BCS is kernel-owned) |
+  | RELAXED_FENCING | 1 |
+  | RELAXED_DELTA | 1 |
+  | GEN7_SOL_RESET | 0 |
+  | HAS_LLC | 1 |
+  | ALIASING_PPGTT | 3 |
+  | SEMAPHORES | 0 |
+  | HAS_VEBOX | 0 |
+  | SECURE_BATCHES | 0 |
+  | HAS_WT | 0 |
+  | MMAP_VERSION | 1 |
+  | HAS_BSD2 | 0 |
+  | SUBSLICE_TOTAL | 3 |
+  | EU_TOTAL | 24 |
+  | POOLED_EU | 0 |
+  | MIN_EU_IN_POOL | 0 |
+
+  `HAS_HUC` stays EINVAL.
+- **`GEM_SET_TILING`/`GET_TILING`:** metadata only, shared by every handle of a buffer. Mode is X or Y. Strides must be a multiple of 512 (X) or 128 (Y), at most 256 KiB. Swizzle is always NONE. No fences and no detiling: every mapping stays linear.
+- **`GEM_MMAP` (legacy, 40 bytes):** maps the buffer's mmap token through the caller's own `mmap` on the same fd (new `BdwI915UserAccess::mapBuffer`). The WC flag is accepted and served write-back, which is coherent on Broadwell's LLC.
+- **`GEM_MMAP_GTT` (16 bytes):** returns the WB token for linear buffers. Tiled buffers are refused with ENODEV, because there is no aperture to detile.
+- **`GEM_GET_APERTURE`:** 256 MiB. That is the worker's real per-execbuffer limit (65536 pages), so libdrm flushes before it.
+- **`SW_FINISH`:** handle check only.
+- **`SET_CACHING`/`GET_CACHING`:** SET accepts NONE, CACHED and DISPLAY. GET reports CACHED, the effective policy.
+- **`PREAD`/`PWRITE`:** copy while holding the buffer's CPU transition, so no GPU use can start mid-copy. They wait for current GPU use like SET_DOMAIN and return EIO for a failed one.
+- **`SET_DOMAIN`:** now also accepts the GTT domain (0x40), which libdrm's `map_gtt` uses.
+- **`REG_READ`:** not implemented. i965 does not use it.
+
+**libdrm_intel softpin patch (`tools/vaapi-brook-pkg/libdrm-intel-brook-softpin.patch`, i965 only):**
+- **VA allocator:** per bufmgr, first-fit and address-sorted with coalescing, so BOs pack densely and need few page tables. It covers [1 MiB, 4 GiB) by default, because i965 writes `bo->offset + delta` into 32-bit relocation fields itself. `BROOK_LIBDRM_SOFTPIN_48B=1` places everything at or above 4 GiB, with `EXEC_OBJECT_SUPPORTS_48B_ADDRESS`, for testing only.
+- **Pinning:** every BO is softpinned at allocation, cache reuse (the pin is re-established after `unreference_final` clears `kflags`) and flink/prime import.
+- **No relocations:** relocation emission becomes softpin targets. Write domains become `EXEC_OBJECT_WRITE` per execbuffer, because Brook maps unwritten objects read-only. Submission carries `I915_EXEC_NO_RELOC`.
+- **CPU maps:** try `GEM_MMAP`, then fall back to `MMAP_OFFSET` WB.
+- **GTT maps of tiled BOs:** a linear CPU shadow, detiled (X and Y) on map and retiled on the last unmap. Imported BOs have no known stride and are refused.
+- **Opt-out:** `BROOK_LIBDRM_SOFTPIN=0` restores stock behaviour.
+
+The patch uses only standard UAPI, so it also runs on Linux i915.
+
+**Package:**
+- `tools/vaapi-brook-pkg` is `brook-vaapi-0.2`: libva, i965 built against `libdrm-brook-softpin`, libva-utils and **ffmpeg-headless**. ffmpeg-headless still has the VAAPI hwaccel, through libva-minimal. The closure is 126 paths, 314 MiB.
+- The stock libdrm stays for everything else.
+
+**Host harness (`tools/vaapi-brook-pkg/host-shim/`):**
+- An LD_PRELOAD shim built from Brook's own `intel_bdw_ioctl.cpp`, `intel_bdw_file.cpp`, `intel_bdw_buffer.cpp` and `intel_bdw_exec_snapshot.cpp`.
+- It opens the host render node only for a genuine DRM fd. Every ioctl and mmap on that fd, and on its dups, is served by Brook's code; buffer pages come from a memfd arena. Nothing reaches the host GPU.
+- Admitted execbuffers are retired as completed without execution, so decoded pixels are meaningless and only the ioctl contract is tested.
+- Build it with `nix-shell --run tools/vaapi-brook-pkg/host-shim/build.sh`.
+
+**Host results:**
+- **`vainfo`:** under the shim, i965 initialises as "Intel i965 driver for Intel(R) Broadwell" and lists, among others, `H264ConstrainedBaseline`/`Main`/`High` (VLD and EncSlice), MPEG2, VC1, JPEG, VP8 and VideoProc. Its only failed ioctl is GETPARAM HAS_HUC.
+- **First decode run:** `ffmpeg -hwaccel vaapi` decoding a 720p H.264 High clip (60 frames) had 119 of 120 execbuffers refused. Cause: BOs reused from libdrm's cache lost `EXEC_OBJECT_PINNED` and fell back to relocations. Fixed in the patch.
+- **After the fix:** 120 of 120 execbuffers were admitted by Brook's decoder: 60 BSD decode and 60 RCS (i965's hardware `vaGetImage`). At most 16 objects, 2705 pages and 18 page tables per execbuffer, against Brook's 65536 pages and 512 tables. The 48-bit mode is also admitted.
+- `framemd5` produces 60 frames. On the host they are not meaningful; the Dell comparison is against the software reference `build/brook-i915-shim/sw.framemd5`.
+
+**Staging bundle (`tools/vaapi-brook-pkg/stage/`):**
+- `make_bundle.py` writes `store.tar`, `manifest.json` (per-file SHA-256, exec bits, symlinks, exact entry sets), `closure.txt` and `install.py` into `bundle.tar`.
+- `install.py` (root) refuses if any path already exists, extracts into a private `/nix/store/.brook-vaapi-stage-TX`, verifies, renames into place, re-verifies, and checks that the whole closure is present.
+- It never overwrites, removes or touches `/nix/profile`.
+- A gen 396 inventory (job in `build/hardware/vaapi-stage-gen396/`) found 120 of 126 closure paths already on the Dell. The bundle carries the 6 missing ones (15 MB): libdrm-brook-softpin, i965, libva-utils, ffmpeg-headless bin and man, and the env.
+

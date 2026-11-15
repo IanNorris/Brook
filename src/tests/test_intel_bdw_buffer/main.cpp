@@ -1,3 +1,4 @@
+#include "intel_bdw_video.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_bootstrap_gate.h"
 #include "intel_bdw_file.h"
@@ -2137,6 +2138,67 @@ int main(){
     fake.writable=false;assert(BdwIntelRenderIoctl(f,createCmd,createArg,user)==-14);fake.writable=true;
     const unsigned oldFrees=frees;fake.writeOk=false;assert(BdwIntelRenderIoctl(f,createCmd,createArg,user)==-14 && frees==oldFrees+1);fake.writeOk=true;
     create={4097,0,0};assert(BdwIntelRenderIoctl(f,createCmd,createArg,user)==0 && create.handle==1 && create.size==8192);
+    {   // VA-API phase 2a: truthful GETPARAMs and the legacy GEM ioctls libdrm_intel uses.
+        auto param=[&](int32_t id){int32_t v=-1;GetParam g{id,0,reinterpret_cast<uint64_t>(&v)};
+            return BdwIntelRenderIoctl(f,ioctlCommand(0x46,sizeof(g)),reinterpret_cast<uint64_t>(&g),user)==0?v:-100;};
+        assert(param(5)==1 && param(6)==0 && param(10)==0 && param(11)==0 && param(17)==1 && param(18)==3);
+        assert(param(22)==0 && param(30)==1 && param(31)==0 && param(33)==3 && param(34)==24 && param(12)==1 && param(15)==1);
+        __atomic_store_n(&BdwVideoUserSubmissionStorage(),1u,__ATOMIC_RELEASE);assert(param(10)==1);
+        __atomic_store_n(&BdwVideoUserSubmissionStorage(),0u,__ATOMIC_RELEASE);
+        uint64_t r2=0;const uint32_t h=BdwGpuFileCreateBuffer(f,3*4096,r2);assert(h);
+        struct Tiling {uint32_t handle,mode,stride,swizzle;} t{h,2,512,7};
+        struct GetTiling {uint32_t handle,mode,swizzle,phys;} gt{h,9,9,9};
+        const auto setT=ioctlCommand(0x61,sizeof(t)),getT=ioctlCommand(0x62,sizeof(gt));
+        assert(!BdwIntelRenderIoctl(f,setT,reinterpret_cast<uint64_t>(&t),user) && t.mode==2 && t.swizzle==0);
+        assert(!BdwIntelRenderIoctl(f,getT,reinterpret_cast<uint64_t>(&gt),user) && gt.mode==2 && !gt.swizzle && !gt.phys);
+        t={h,1,128,0};assert(BdwIntelRenderIoctl(f,setT,reinterpret_cast<uint64_t>(&t),user)==-22);   // X needs 512-byte strides
+        t={h,2,0,0};assert(BdwIntelRenderIoctl(f,setT,reinterpret_cast<uint64_t>(&t),user)==-22);
+        t={h,3,512,0};assert(BdwIntelRenderIoctl(f,setT,reinterpret_cast<uint64_t>(&t),user)==-22);
+        t={999,0,0,0};assert(BdwIntelRenderIoctl(f,setT,reinterpret_cast<uint64_t>(&t),user)==-2);
+        // GTT mmap: refused while tiled, the WB token once linear.
+        struct Gtt {uint32_t handle,pad;uint64_t offset;} gtt{h,0,0};const auto gttCmd=ioctlCommand(0x64,sizeof(gtt));
+        assert(BdwIntelRenderIoctl(f,gttCmd,reinterpret_cast<uint64_t>(&gtt),user)==-19);
+        t={h,0,4096,0};assert(!BdwIntelRenderIoctl(f,setT,reinterpret_cast<uint64_t>(&t),user) && t.stride==0);
+        assert(!BdwIntelRenderIoctl(f,gttCmd,reinterpret_cast<uint64_t>(&gtt),user) && gtt.offset==BdwGpuFileMapToken(f,h));
+        // GEM_MMAP maps the token (+offset) through the caller's mmap.
+        struct Mmap {uint32_t handle,pad;uint64_t offset,size,addr,flags;} mm{h,0,4096,8192,0,1};
+        const auto mmCmd=ioctlCommand(0x5e,sizeof(mm));
+        assert(BdwIntelRenderIoctl(f,mmCmd,reinterpret_cast<uint64_t>(&mm),user)==-25);              // no mapper
+        static uint64_t mappedToken=0,mappedBytes=0;
+        user.mapBuffer=[](void*,uint64_t token,uint64_t bytes,uint64_t& address)->int64_t{mappedToken=token;mappedBytes=bytes;address=0x7f0000001000;return 0;};
+        assert(!BdwIntelRenderIoctl(f,mmCmd,reinterpret_cast<uint64_t>(&mm),user) && mm.addr==0x7f0000001000);
+        assert(mappedToken==BdwGpuFileMapToken(f,h)+4096 && mappedBytes==8192);
+        mm.size=3*4096;assert(BdwIntelRenderIoctl(f,mmCmd,reinterpret_cast<uint64_t>(&mm),user)==-22);  // past the end
+        mm.size=4096;mm.offset=100;assert(BdwIntelRenderIoctl(f,mmCmd,reinterpret_cast<uint64_t>(&mm),user)==-22);
+        mm.offset=0;mm.flags=2;assert(BdwIntelRenderIoctl(f,mmCmd,reinterpret_cast<uint64_t>(&mm),user)==-22);
+        user.mapBuffer=nullptr;
+        struct Aperture {uint64_t size,available;} ap{};
+        assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x63,sizeof(ap)),reinterpret_cast<uint64_t>(&ap),user) && ap.size==(uint64_t{256}<<20) && ap.available==ap.size);
+        uint32_t fin=h;assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x60,4),reinterpret_cast<uint64_t>(&fin),user));
+        fin=999;assert(BdwIntelRenderIoctl(f,ioctlCommand(0x60,4),reinterpret_cast<uint64_t>(&fin),user)==-2);
+        struct Caching {uint32_t handle,caching;} c{h,0};
+        assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x6f,sizeof(c)),reinterpret_cast<uint64_t>(&c),user));
+        c.caching=5;assert(BdwIntelRenderIoctl(f,ioctlCommand(0x6f,sizeof(c)),reinterpret_cast<uint64_t>(&c),user)==-22);
+        c.caching=0;assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x70,sizeof(c)),reinterpret_cast<uint64_t>(&c),user) && c.caching==1);
+        // PWRITE across a page boundary, then PREAD it back; out of range refused.
+        uint8_t out[6000],in[6000]{};for(unsigned i=0;i<sizeof(out);++i)out[i]=uint8_t(i*7+1);
+        struct Rw {uint32_t handle,pad;uint64_t offset,size,data;} w{h,0,1000,sizeof(out),reinterpret_cast<uint64_t>(out)};
+        assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x5d,sizeof(w)),reinterpret_cast<uint64_t>(&w),user));
+        Rw rd{h,0,1000,sizeof(in),reinterpret_cast<uint64_t>(in)};
+        assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x5c,sizeof(rd)),reinterpret_cast<uint64_t>(&rd),user) && !std::memcmp(in,out,sizeof(in)));
+        auto* rb=BdwGpuFileGetBuffer(f,h);assert(rb);
+        assert(reinterpret_cast<uint8_t*>(BdwGpuBufferPageKernelAddress(rb,1))[6000+1000-4096-1]==out[5999]);
+        rd.offset=3*4096-10;rd.size=11;assert(BdwIntelRenderIoctl(f,ioctlCommand(0x5c,sizeof(rd)),reinterpret_cast<uint64_t>(&rd),user)==-22);
+        // A GPU use in progress blocks the copy until it retires (here: interrupted).
+        assert(BdwGpuBufferBeginGpuUse(rb));fake.interrupt=true;rd.offset=0;rd.size=4;
+        assert(BdwIntelRenderIoctl(f,ioctlCommand(0x5c,sizeof(rd)),reinterpret_cast<uint64_t>(&rd),user)==-4);
+        fake.interrupt=false;assert(BdwGpuBufferEndGpuUse(rb));BdwGpuBufferUnref(rb);
+        // SET_DOMAIN accepts the GTT domain libdrm uses for map_gtt.
+        struct Domain {uint32_t handle,read,write;} dm{h,0x40,0x40};
+        assert(!BdwIntelRenderIoctl(f,ioctlCommand(0x5f,sizeof(dm)),reinterpret_cast<uint64_t>(&dm),user));
+        dm={h,0x40,1};assert(BdwIntelRenderIoctl(f,ioctlCommand(0x5f,sizeof(dm)),reinterpret_cast<uint64_t>(&dm),user)==-22);
+        assert(BdwGpuFileCloseBuffer(f,h));
+    }
     struct Wait {uint32_t handle,flags;int64_t timeout;} wait{create.handle,0,5000000};
     const auto waitCmd=ioctlCommand(0x6c,sizeof(wait)),waitArg=reinterpret_cast<uint64_t>(&wait);
     assert(BdwIntelRenderIoctl(f,waitCmd,waitArg,user)==0 && wait.timeout==5000000);
@@ -2225,6 +2287,18 @@ int main(){
         assert(BdwGpuFileCloseBuffer(f,secondHandle));
     }
     eb.flags|=1u<<17;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eb.flags=1u<<11;
+    // I915_EXEC_BSD (2): refused until the VCS executor is ready; then tagged
+    // for the VCS worker path. Other engine selectors (BLT 3, VEBOX 4) stay refused.
+    eb.flags=(1u<<11)|2u;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);
+    __atomic_store_n(&BdwVideoUserSubmissionStorage(),1u,__ATOMIC_RELEASE);
+    assert(!BdwIntelCopyExecSnapshot(f,execArg,user,&decoded) && decoded && BdwExecSnapshotEngine(decoded)==BdwExecEngineVideo);
+    assert(!BdwExecSnapshotSetEngine(decoded,3) && BdwExecSnapshotEngine(decoded)==BdwExecEngineVideo);
+    assert(BdwExecSnapshotRelease(decoded,false));decoded=nullptr;
+    eb.flags=(1u<<11)|1u;assert(!BdwIntelCopyExecSnapshot(f,execArg,user,&decoded) && decoded && BdwExecSnapshotEngine(decoded)==0);
+    assert(BdwExecSnapshotRelease(decoded,false));decoded=nullptr;
+    eb.flags=(1u<<11)|3u;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);
+    eb.flags=(1u<<11)|4u;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);
+    __atomic_store_n(&BdwVideoUserSubmissionStorage(),0u,__ATOMIC_RELEASE);eb.flags=1u<<11;
     eb.start=1;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eb.start=8;
     eo.relocCount=1;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eo.relocCount=0;
     eo.reserved1=1;assert(BdwIntelCopyExecSnapshot(f,execArg,user,&decoded)==-22 && !decoded);eo.reserved1=0;

@@ -1,4 +1,5 @@
 #include "intel_bdw_oneshot.h"
+#include "intel_bdw_vcs_user.h"
 #include "intel_bdw_live_backend.h"
 #include "intel_bdw_csb.h"
 #include "intel_bdw_bcs_init.h"
@@ -78,7 +79,7 @@ struct Fake : BdwBcsExecutionBackend {
     unsigned csbAcks=0,csbAckSlots[6]{};bool csbFailAck=false,csbFailTail=false,csbFailEntry=false;
     bool handoff=true,execlist=true,modeReadable=true,modeStable=true,ringRunning=true,csbReady=true,csbSynced=true;
     bool admitted=true,pat=true,published=false,failHws=false,complete=true,idle=true,corruptSource=false,takeover=true,portReady=true;
-    bool scanout=false,video=false,videoCorrupt=false;unsigned cpuVisibilityChecks=0;
+    bool scanout=false,video=false,videoCorrupt=false,videoUser=false;uint64_t userRoot=0,userBatch=0;unsigned cpuVisibilityChecks=0;
     BdwBcsOneShot* reentrant=nullptr;unsigned aliasAt=0,aliasKind=0;
     ~Fake(){for(auto p:live)std::free(p.cpu);}
     bool alloc(BdwOwnedPage& out){if(++allocations==failAlloc)return false;void* p=nullptr;assert(!posix_memalign(&p,4096,4096));
@@ -147,6 +148,13 @@ struct Fake : BdwBcsExecutionBackend {
         auto* ring=ggtt(read32(context,9));assert(read32(context,7)==56 && read32(ring,0)==0x13244002 &&
             read32(ring,1)==0xd0 && read32(ring,2)==0 && read32(ring,3)==0 && read32(ring,4)==0x04000000 &&
             read32(ring,5)==0x18800101 && read32(ring,8)==0x13004002);
+        if(videoUser){
+            // VCS0 user job: VCS context with the external root; BB_START to the user batch.
+            assert(read32(context,2)==0x12244 && read32(context,66)==0x12200 && pml4==userRoot);
+            assert((uint64_t(read32(ring,6))|(uint64_t(read32(ring,7))<<32))==userBatch);
+            auto* done=ggtt(read32(ring,9)&~7u);uint32_t written=read32(ring,11);assert(written==nonce);std::memcpy(done,&written,4);
+            return true;
+        }
         auto* batch=translate(pml4,uint64_t(read32(ring,6))|(uint64_t(read32(ring,7))<<32),false);
         if(video){
             // VCS0 self-test: VCS context registers, then the batch's one store.
@@ -447,6 +455,29 @@ int main(){
     {Fake f;f.video=true;f.videoCorrupt=true;BdwBcsOneShot x;
         assert(x.PrepareVideoSelftest(f,65536,99,0x1234,0xabcd0000u,staging));
         assert(!x.ExecuteTakenOver(f,0x600000) && x.State()==BdwOneShotState::Quarantined && f.live.size()==19 && !x.ReleasePrepared(f));}
+    // VCS0 user job (VA-API phase 1c): external table root and user batch.
+    {Fake f;BdwVcsUserOneShot x;
+        assert(!x.PrepareUser(f,65536,99,0x1234,0,0x100000,staging) && !f.allocations);            // no root
+        assert(!x.PrepareUser(f,65536,99,0x1234,0x900000,0x100004,staging) && !f.allocations);     // unaligned batch
+        assert(!x.PrepareUser(f,65536,99,0x1234,0x900000,uint64_t{1}<<48,staging) && !f.allocations);
+        assert(!x.PrepareUser(f,65536,99,0x1234,0x900800,0x100000,staging) && !f.allocations);     // unaligned root
+        // A root that is one of the private pages is refused and fully unwound.
+        assert(!x.PrepareUser(f,65536,99,0x1234,0x203000,0x100000,staging) && f.live.empty() && x.UserRecycle());}
+    for(unsigned round=0;round<2;++round){Fake f;f.videoUser=true;f.userRoot=0x900000;f.userBatch=0x7fff00001008ull+round*8;BdwVcsUserOneShot x;
+        BdwPpgttPage sc[4]{};assert(!x.ScratchTables(sc));
+        assert(x.PrepareUser(f,65536,99,0x1234+round,f.userRoot,f.userBatch,staging) && f.live.size()==19);
+        assert(x.Root()==f.userRoot && x.Batch()==f.userBatch && x.ScratchTables(sc) && sc[0].dma==f.live[15].dma && sc[3].dma==f.live[18].dma);
+        assert(x.ExecuteTakenOver(f,0x600000) && f.ggttWrites==8 && f.portWrites==4 && !x.ReleasePrepared(f));
+        f.event(0,1);f.event(1,0x0000000100000018ull);f.tail(1);
+        assert(x.PollContextSwitch(f)==BdwCsbPoll::Complete && !x.ReleasePrepared(f));
+        assert(x.RetireScanout(f));
+        for(const auto slot:f.slots)assert(!slot);
+        assert(x.ReleasePrepared(f) && f.live.empty() && x.UserRecycle() && x.State()==BdwOneShotState::Fresh && !x.Root());}
+    // A hung user job (no breadcrumb): quarantined until the owner's reset, then retired and released.
+    {Fake f;f.videoUser=true;f.userRoot=0x900000;f.userBatch=0x100000;f.complete=false;BdwVcsUserOneShot x;
+        assert(x.PrepareUser(f,65536,99,0x1234,f.userRoot,f.userBatch,staging));
+        assert(!x.ExecuteTakenOver(f,0x600000) && x.State()==BdwOneShotState::Quarantined && !x.ReleasePrepared(f));
+        assert(x.RetireScanout(f) && x.ReleasePrepared(f) && f.live.empty() && x.UserRecycle());}
     {
         BdwBcsOneShot image;
         const BdwBlitRegion region{{BdwBcsSourceAddress,64,64},{BdwBcsScanoutAddress,4096,64},0,0,0,0,16,1};

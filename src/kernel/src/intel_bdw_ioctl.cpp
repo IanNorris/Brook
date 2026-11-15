@@ -38,6 +38,20 @@ struct MmapOffset {uint32_t handle,pad;uint64_t offset,flags,extensions;};
 struct ExecBuffer {uint64_t objects;uint32_t count,start,length,dr1,dr4,clipCount;uint64_t clips,flags,context,fences;};
 struct ExecObject {uint32_t handle,relocCount;uint64_t relocs,alignment,offset,flags,reserved1,reserved2;};
 struct ExecFence {uint32_t handle,flags;};
+// VA-API phase 2a (libdrm_intel / i965) legacy GEM ioctls.
+struct GemMmap {uint32_t handle,pad;uint64_t offset,size,addr,flags;};
+struct GemMmapGtt {uint32_t handle,pad;uint64_t offset;};
+struct GemTiling {uint32_t handle,mode,stride,swizzle;};       // SET_TILING
+struct GemGetTiling {uint32_t handle,mode,swizzle,physSwizzle;}; // GET_TILING
+struct GemAperture {uint64_t size,available;};
+struct GemSwFinish {uint32_t handle;};
+struct GemCaching {uint32_t handle,caching;};
+struct GemRw {uint32_t handle,pad;uint64_t offset,size,data;};    // PREAD/PWRITE
+static_assert(sizeof(GemMmap)==40 && sizeof(GemMmapGtt)==16 && sizeof(GemTiling)==16 && sizeof(GemGetTiling)==16 &&
+              sizeof(GemAperture)==16 && sizeof(GemSwFinish)==4 && sizeof(GemCaching)==8 && sizeof(GemRw)==32,"i915 legacy GEM ABI");
+// Per-execbuffer limit of the Brook worker (65536 pages through 512 page
+// tables): reported as the aperture so libdrm flushes batches before it.
+constexpr uint64_t BdwApertureBytes=uint64_t{65536}*4096;
 struct TimelineExtension {uint64_t next;uint32_t name,flags,reserved[4];uint64_t count,handles,points;};
 static KMutex timelineAdmission{};
 struct FencePlan {
@@ -83,11 +97,13 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
     ExecBuffer request{};if(!u.read(u.context,&request,arg,sizeof(request)))return fault;
     constexpr uint64_t noReloc=uint64_t{1}<<11,handleLut=uint64_t{1}<<12,batchFirst=uint64_t{1}<<18,fenceArray=uint64_t{1}<<19,useExtensions=uint64_t{1}<<21;
     const uint64_t engine=request.flags&63;
-    // I915_EXEC_BSD (2): VCS user submission (VA-API phase 1c) is not wired
-    // into the worker yet; refuse it explicitly with a recorded reason.
+    // I915_EXEC_BSD (2): VCS0 user submission (VA-API phase 1c). Admitted only
+    // while the VCS executor is ready (gate on, a self-test passed this boot,
+    // not quarantined); otherwise refused with a recorded reason. The worker
+    // re-checks readiness for every job it runs.
     if(engine==2 && !BdwVideoUserSubmissionReady()){BdwNoteRefusal("execbuffer: I915_EXEC_BSD video engine submission not available");return invalid;}
     if(!request.count || request.count>8192 || !request.objects ||
-       (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>1 ||
+       (request.flags&~(noReloc|handleLut|batchFirst|fenceArray|useExtensions|uint64_t{63})) || !(request.flags&noReloc) || engine>2 ||
        request.dr1 || request.dr4 || request.context>0xffffffffull || request.fences ||
        ((request.flags&useExtensions)?(!plan || (request.flags&fenceArray) || request.clipCount || !request.clips):
         (request.flags&fenceArray)?(!plan || !request.clipCount || request.clipCount>BdwMaxSubmissionFences || !request.clips):
@@ -112,6 +128,7 @@ static int64_t CopyExecSnapshot(BdwGpuFile* file,uint64_t arg,const BdwI915UserA
             if(!*out)result=invalid;
             else {
                 BdwExecSnapshotSetOrigin(*out,u.submitterPid,uint32_t(request.context),u.submitterIncarnation);
+                if(engine==2 && !BdwExecSnapshotSetEngine(*out,BdwExecEngineVideo)){BdwExecSnapshotRelease(*out,false);*out=nullptr;result=invalid;}
             }
             if(!result && (request.context || u.renderExperiment)){
                 auto* context=request.context?BdwGpuFileGetContext(file,uint32_t(request.context)):
@@ -209,10 +226,29 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
         // Publication is restricted to the matching live Dell PCI function.
         case 4: value=0x1616;break; // CHIPSET_ID
         case 32: value=9;break;     // REVISION
-        // HAS_BSD: VCS submission is not implemented (VA-API phase 1b). Answer 0
-        // explicitly so libva/i965 probe the engine as absent instead of seeing
-        // an error. I915_EXEC_BSD stays refused by execbuffer (engine>1).
-        case 5: value=BdwVideoUserSubmissionReady()?1:0;break;
+        // HAS_BSD (10): 1 only while the VCS0 user-job executor is ready (VA-API
+        // phase 1c: gate on and a self-test passed this boot). Otherwise 0, so
+        // libva/i965 treat the engine as absent instead of seeing an error.
+        case 10: value=BdwVideoUserSubmissionReady()?1:0;break;
+        // VA-API phase 2a: truthful answers for libdrm_intel and i965.
+        case 5:  value=1;break;  // HAS_GEM
+        case 6:  value=0;break;  // NUM_FENCES_AVAIL: no fence registers; tiling is metadata only
+        case 11: value=0;break;  // HAS_BLT: BCS is kernel-owned, I915_EXEC_BLT is refused
+        case 12: value=1;break;  // HAS_RELAXED_FENCING (no fences to constrain)
+        case 15: value=1;break;  // HAS_RELAXED_DELTA
+        case 16: value=0;break;  // HAS_GEN7_SOL_RESET: the flag is refused
+        case 17: value=1;break;  // HAS_LLC (Broadwell GT2)
+        case 18: value=3;break;  // HAS_ALIASING_PPGTT: per-job 48-bit PPGTT
+        case 20: value=0;break;  // HAS_SEMAPHORES
+        case 22: value=0;break;  // HAS_VEBOX: VECS is not offered to userspace
+        case 23: value=0;break;  // HAS_SECURE_BATCHES
+        case 27: value=0;break;  // HAS_WT
+        case 30: value=1;break;  // MMAP_VERSION: GEM_MMAP accepts the WC flag (WB coherent on LLC)
+        case 31: value=0;break;  // HAS_BSD2: one VCS on GT2
+        case 33: value=3;break;  // SUBSLICE_TOTAL (BDW GT2: 1 slice x 3 subslices)
+        case 34: value=24;break; // EU_TOTAL (HD Graphics 5500: 3 x 8)
+        case 38: value=0;break;  // HAS_POOLED_EU
+        case 39: value=0;break;  // MIN_EU_IN_POOL
         case 19: value=(u.nowNs && u.sleepNs)?1:0;break; // HAS_WAIT_TIMEOUT
         // Iris can use the implemented WB mmap-offset path in this explicit
         // bring-up mode. Other cache modes still fail the mmap-offset ioctl.
@@ -251,7 +287,9 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
     }
     if(nr==0x5f && size==sizeof(GemSetDomain)){
         GemSetDomain d{};if(!u.read(u.context,&d,arg,sizeof(d)))return fault;
-        if(d.read!=1 || (d.write!=0 && d.write!=1))return invalid;
+        // CPU (1) or GTT (0x40): Brook's only CPU view of a buffer is the
+        // linear write-back mapping, so both take the same CPU transition.
+        if((d.read!=1 && d.read!=0x40) || (d.write!=0 && d.write!=d.read))return invalid;
         auto* buffer=BdwGpuFileGetBuffer(file,d.handle);if(!buffer)return noent;
         if(!u.sleepNs){BdwGpuBufferUnref(buffer);return notty;}
         int64_t result=0;
@@ -534,6 +572,110 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
         if(original>0)w.timeout=now<start?0:now>=deadline?0:static_cast<int64_t>(deadline-now);
         BdwGpuBufferUnref(buffer);
         return u.write(u.context,arg,&w,sizeof(w))?result:fault;
+    }
+    // ---- VA-API phase 2a: legacy GEM ioctls used by libdrm_intel / i965 ----
+    if(nr==0x5e && size==sizeof(GemMmap)){
+        // CPU mmap through the same token mapping as MMAP_OFFSET. The WC flag
+        // (1) is accepted and served write-back: Broadwell's LLC keeps the
+        // mapping coherent and every GPU use is cache-synchronized anyway.
+        GemMmap m{};if(!u.read(u.context,&m,arg,sizeof(m)) || !u.writable(u.context,arg,sizeof(m)))return fault;
+        if(m.pad || (m.flags&~uint64_t{1}) || !m.size || (m.offset&4095))return invalid;
+        if(!u.mapBuffer)return notty;
+        auto* buffer=BdwGpuFileGetBuffer(file,m.handle);if(!buffer)return noent;
+        const uint64_t bytes=BdwGpuBufferBytes(buffer);const bool mappable=BdwGpuBufferAllowsUserMapping(buffer);BdwGpuBufferUnref(buffer);
+        if(!mappable || m.offset>=bytes || m.size>bytes-m.offset)return invalid;
+        const uint64_t token=BdwGpuFileMapToken(file,m.handle);if(!token)return noent;
+        uint64_t address=0;const int64_t mapped=u.mapBuffer(u.context,token+m.offset,m.size,address);
+        if(mapped)return mapped;
+        m.addr=address;return u.write(u.context,arg,&m,sizeof(m))?0:fault;
+    }
+    if(nr==0x64 && size==sizeof(GemMmapGtt)){
+        // Legacy GTT mmap: Brook has no aperture or fence detiling. A linear
+        // buffer's GTT view equals its CPU view, so return the WB token; a
+        // tiled one is refused rather than handing out a swizzled layout.
+        GemMmapGtt m{};if(!u.read(u.context,&m,arg,sizeof(m)) || !u.writable(u.context,arg,sizeof(m)))return fault;
+        if(m.pad)return invalid;
+        auto* buffer=BdwGpuFileGetBuffer(file,m.handle);if(!buffer)return noent;
+        uint32_t mode=0,stride=0;BdwGpuBufferTiling(buffer,mode,stride);BdwGpuBufferUnref(buffer);
+        if(mode)return -19; // ENODEV
+        m.offset=BdwGpuFileMapToken(file,m.handle);if(!m.offset)return noent;
+        return u.write(u.context,arg,&m,sizeof(m))?0:fault;
+    }
+    if(nr==0x61 && size==sizeof(GemTiling)){
+        GemTiling t{};if(!u.read(u.context,&t,arg,sizeof(t)) || !u.writable(u.context,arg,sizeof(t)))return fault;
+        if(t.mode>2)return invalid;
+        if(t.mode==0)t.stride=0;
+        // Gen7+ limits: X tiles are 512 bytes wide, Y tiles 128; stride <= 256 KiB.
+        else if(!t.stride || t.stride>256*1024 || (t.stride&(t.mode==1?511u:127u)))return invalid;
+        auto* buffer=BdwGpuFileGetBuffer(file,t.handle);if(!buffer)return noent;
+        const bool ok=BdwGpuBufferSetTiling(buffer,t.mode,t.stride);BdwGpuBufferUnref(buffer);
+        if(!ok)return invalid;
+        t.swizzle=0; // I915_BIT_6_SWIZZLE_NONE on Gen8
+        return u.write(u.context,arg,&t,sizeof(t))?0:fault;
+    }
+    if(nr==0x62 && size==sizeof(GemGetTiling)){
+        GemGetTiling t{};if(!u.read(u.context,&t,arg,sizeof(t)) || !u.writable(u.context,arg,sizeof(t)))return fault;
+        auto* buffer=BdwGpuFileGetBuffer(file,t.handle);if(!buffer)return noent;
+        uint32_t mode=0,stride=0;BdwGpuBufferTiling(buffer,mode,stride);BdwGpuBufferUnref(buffer);
+        t.mode=mode;t.swizzle=0;t.physSwizzle=0;
+        return u.write(u.context,arg,&t,sizeof(t))?0:fault;
+    }
+    if(nr==0x63 && size==sizeof(GemAperture)){
+        if(!u.writable(u.context,arg,sizeof(GemAperture)))return fault;
+        const GemAperture a{BdwApertureBytes,BdwApertureBytes};
+        return u.write(u.context,arg,&a,sizeof(a))?0:fault;
+    }
+    if(nr==0x60 && size==sizeof(GemSwFinish)){
+        // Only flushes scanout on Linux; Brook's presentation owns that path.
+        GemSwFinish f{};if(!u.read(u.context,&f,arg,sizeof(f)))return fault;
+        auto* buffer=BdwGpuFileGetBuffer(file,f.handle);if(!buffer)return noent;
+        BdwGpuBufferUnref(buffer);return 0;
+    }
+    if((nr==0x6f || nr==0x70) && size==sizeof(GemCaching)){
+        // Every Brook buffer is mapped write-back LLC-coherent for the CPU and
+        // the GPU. SET accepts the i915 levels (NONE, CACHED, DISPLAY) without
+        // changing that; GET reports the effective level, CACHED.
+        GemCaching c{};if(!u.read(u.context,&c,arg,sizeof(c)))return fault;
+        if(nr==0x6f && c.caching>2)return invalid;
+        auto* buffer=BdwGpuFileGetBuffer(file,c.handle);if(!buffer)return noent;
+        BdwGpuBufferUnref(buffer);
+        if(nr==0x6f)return 0;
+        if(!u.writable(u.context,arg,sizeof(c)))return fault;
+        c.caching=1;return u.write(u.context,arg,&c,sizeof(c))?0:fault;
+    }
+    if((nr==0x5c || nr==0x5d) && size==sizeof(GemRw)){
+        // PREAD (0x5c) / PWRITE (0x5d): copy while holding the buffer's CPU
+        // transition, so no GPU use can begin mid-copy; waits for current
+        // GPU use like SET_DOMAIN. A failed GPU use reports EIO.
+        GemRw r{};if(!u.read(u.context,&r,arg,sizeof(r)))return fault;
+        if(r.pad)return invalid;
+        if(!r.size)return 0;
+        if(!u.sleepNs)return notty;
+        auto* buffer=BdwGpuFileGetBuffer(file,r.handle);if(!buffer)return noent;
+        const uint64_t bytes=BdwGpuBufferBytes(buffer);
+        if(!BdwGpuBufferAllowsUserMapping(buffer) || r.offset>=bytes || r.size>bytes-r.offset ||
+           r.data>~uint64_t{0}-(r.size-1)){BdwGpuBufferUnref(buffer);return r.offset>=bytes || r.size>bytes-r.offset?invalid:fault;}
+        int64_t result=0;
+        for(;;){const uint64_t seen=BdwGpuEventGeneration(BdwGpuEvent::Retire);
+            if(BdwGpuBufferBeginCpuTransition(buffer))break;
+            if(BdwGpuBufferGpuFailed(buffer)){result=-5;break;}
+            if(!RetireWait(u,seen,1000000)){result=-4;break;}
+        }
+        if(!result){
+            if(!BdwGpuBufferSyncCpuCache(buffer))result=-5;
+            for(uint64_t done=0;!result && done<r.size;){
+                const uint64_t at=r.offset+done,page=at/4096,within=at%4096;
+                const uint64_t n=(4096-within)<(r.size-done)?(4096-within):(r.size-done);
+                const uint64_t kva=BdwGpuBufferPageKernelAddress(buffer,uint32_t(page));
+                if(!kva){result=invalid;break;}
+                auto* kernel=reinterpret_cast<uint8_t*>(kva)+within;
+                const bool ok=nr==0x5d?u.read(u.context,kernel,r.data+done,n):u.write(u.context,r.data+done,kernel,n);
+                if(!ok){result=fault;break;}
+                done+=n;
+            }
+            if(!BdwGpuBufferEndCpuTransition(buffer))__builtin_trap();
+        }
+        BdwGpuBufferUnref(buffer);return result;
     }
     if(nr==0x5b && size==sizeof(GemCreate)){
         GemCreate c{};if(!u.read(u.context,&c,arg,sizeof(c)) || !u.writable(u.context,arg,sizeof(c)))return fault;

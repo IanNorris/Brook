@@ -51,6 +51,7 @@ void VmmDellVcsPmSample(BdwGtPmSnapshot& out,uint32_t& writes,uint32_t& failures
 void VmmDellVcsEngineRestoreCounts(uint32_t& restores,uint32_t& failures);
 // VCS0 self-test submission (VA-API phase 1b) of the prepared video image.
 void VmmDellVcsSelftest(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run);
+void VmmDellVcsUserRun(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& run);
 void VmmDellBcsCopy(uint32_t khz,uint32_t index,uint64_t token,uint64_t scratch,BdwForcewakeAdapterResult& result,BdwBcsRunResult& copy);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
 class BdwGgttExtentBind;struct BdwGgttExtentLease;struct BdwFlipGgttDiag;

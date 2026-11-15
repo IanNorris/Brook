@@ -77,6 +77,28 @@ inline bool BdwBuildBcsRegions(const BdwBcsLaunch& s,const BdwBlitRegion* region
 // in the context's PPGTT: MI_STORE_DATA_IMM writes `data` to dataPpgtt, which
 // proves the batch executed on VCS through the private address space; the ring
 // breadcrumb proves completion ordering.
+// VCS0 user job (VA-API phase 1c): the same ring with MI_BATCH_BUFFER_START
+// to the user's batch in the job's PPGTT (48-bit, 8-byte aligned; the user
+// batch runs nonprivileged and reaches only the snapshot's mapped buffers),
+// then the privileged GGTT breadcrumb. The context is fresh and
+// restore-inhibited per job, with PML4 = the job's external table root.
+inline bool BdwBuildVcsUser(const BdwBcsLaunch& s,uint32_t (&context)[2048],uint32_t (&ring)[14],uint64_t& descriptor) {
+    constexpr uint64_t limit32=uint64_t{1}<<32,limit48=uint64_t{1}<<48;
+    if(s.context.tailBytes!=56 || !s.nonce || (s.batchPpgtt&7) || s.batchPpgtt>=limit48 ||
+       (s.completionGgtt&0x27) || s.completionGgtt>limit32-8 || !s.completionGgtt)return false;
+    if(!BdwContext64Valid(s.context,8192))return false;
+    const auto overlaps=[](uint64_t a,uint64_t size,uint64_t b,uint64_t other){return a<b+other && b<a+size;};
+    if(overlaps(s.completionGgtt,8,s.context.contextGgtt,8192) ||
+       overlaps(s.completionGgtt,8,s.context.ringGgtt,s.context.ringBytes))return false;
+    uint64_t built=0;
+    if(!BdwBuildVcsContext64(s.context,context,built))return false;
+    const uint32_t r[14]={0x13244002,0xd0,0,0,0x04000000,
+        0x18800101,uint32_t(s.batchPpgtt),uint32_t(s.batchPpgtt>>32),
+        0x13004002,uint32_t(s.completionGgtt)|4,0,s.nonce,0,0x04000001};
+    for(unsigned i=0;i<14;++i)ring[i]=r[i];
+    descriptor=built;
+    return true;
+}
 inline bool BdwBuildVcsSelftest(const BdwBcsLaunch& s,uint64_t dataPpgtt,uint32_t data,
                                 uint32_t (&context)[2048],uint32_t (&batch)[8],uint32_t (&ring)[14],uint64_t& descriptor) {
     constexpr uint64_t limit=uint64_t{1}<<32;

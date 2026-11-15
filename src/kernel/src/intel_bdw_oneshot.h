@@ -60,6 +60,7 @@ constexpr uint32_t BdwBcsOperandPages=8192; // one 32 MiB virtual interval per o
 constexpr unsigned BdwBcsLegacyPrivatePages=19;
 constexpr unsigned BdwBcsMaxPrivatePages=BdwBcsLegacyPrivatePages+2*(BdwBcsOperandPages/512);
 class BdwBcsOneShot {
+protected:
     enum : unsigned {Ctx0,Ctx1,Ring0,Ring1,Ring2,Ring3,Hws,Completion,Batch,Source,Destination,
         Pml4,Pdpt,Pd,Pt,ScratchData,ScratchPt,ScratchPd,ScratchPdpt,Count};
     static constexpr unsigned ExtraTables=2*(BdwBcsOperandPages/512);
@@ -69,6 +70,7 @@ class BdwBcsOneShot {
     BdwGgttLease lease_{};BdwGgttBind bind_{};uint64_t descriptor_=0;uint32_t nonce_=0;bool attempted_=false,scanout_=false;
     uint8_t csbHead_=5;bool csbActivated_=false;
     bool video_=false;uint32_t videoData_=0; // VCS0 self-test (VA-API phase 1b)
+    bool videoUser_=false; // VCS0 user job (phase 1c): external PPGTT root, no private data check
     template<class Io> void ReleasePages(Io& io){while(allocated_)io.free(pages_[--allocated_]);}
     static void Zero(BdwOwnedPage& p){for(unsigned i=0;i<4096;++i)p.cpu[i]=0;}
     static void Store32(BdwOwnedPage& p,unsigned offset,uint32_t v){for(unsigned i=0;i<4;++i)p.cpu[offset+i]=uint8_t(v>>(8*i));}
@@ -315,7 +317,7 @@ private:
         if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.waitCompletion(nonce_) ||
            !io.exclusiveHandoff() || !io.gpuPatLease() || (!scanout_ && !io.cpuVisible(pages_,allocated_)) ||
            Load32(pages_[Completion],0)!=nonce_)return false;
-        if(video_ && Load32(pages_[Source],0)!=videoData_)return false;
+        if(video_ && !videoUser_ && Load32(pages_[Source],0)!=videoData_)return false;
         for(unsigned i=0;!scanout_ && !video_ && i<4096;++i) {
             if(pages_[Source].cpu[i]!=Pattern(i))return false;
             if(pages_[Destination].cpu[i]!=(i<256?pages_[Source].cpu[i]:0xa5))return false;
@@ -337,7 +339,7 @@ public:
     bool Recycle(){
         if(state_!=BdwOneShotState::Released || !bind_.Recycle())return false;
         state_=BdwOneShotState::Fresh;owner_=executionOwner_=nullptr;
-        descriptor_=0;nonce_=0;attempted_=scanout_=csbActivated_=video_=false;videoData_=0;csbHead_=5;
+        descriptor_=0;nonce_=0;attempted_=scanout_=csbActivated_=video_=videoUser_=false;videoData_=0;csbHead_=5;
         return true;
     }
     template<class Io> bool Execute(Io& io) {

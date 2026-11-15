@@ -38,6 +38,10 @@ struct BdwI915UserAccess {
     // Optional paired tracking for the entire exec preparation/publication.
     int64_t (*beginExec)(void*,uint64_t,BdwSubmissionPreparation&)=nullptr;
     void (*endExec)(void*,BdwSubmissionPreparation&)=nullptr;
+    // Optional: map `bytes` of the render file at mmap token `token` into the
+    // caller (MAP_SHARED, read/write), for the legacy GEM_MMAP ioctl. Returns
+    // 0 and the user address, or a negative errno.
+    int64_t (*mapBuffer)(void*,uint64_t token,uint64_t bytes,uint64_t& address)=nullptr;
 };
 int64_t BdwIntelRenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI915UserAccess& user);
 // Decode a limited soft-pinned EXECBUFFER2 request into a retained snapshot.
