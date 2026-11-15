@@ -12,13 +12,14 @@ static long test_syscall(long,...);
 static uint32_t kernel_token,next_token;
 static uint64_t physical_click_serial;
 static int revoke_during_release;
+static int kernel_refuse; // Launcher open, or the pointer over taskbar/other content.
 static long test_syscall(long number,...) {
     if(number!=BROOK_SYS_WM_POINTER_CAPTURE)return 0;
     va_list ap;va_start(ap,number);long window=va_arg(ap,long),op=va_arg(ap,long);uint32_t token=va_arg(ap,long);va_end(ap);
     assert(window==1);
     if(op==3)return physical_click_serial;
     if(op==0)return kernel_token==token?kernel_token:0;
-    if(op==1) {assert(!kernel_token);return kernel_token=++next_token;}
+    if(op==1) {assert(!kernel_token);if(kernel_refuse)return -11;return kernel_token=++next_token;}
     assert(op==2);
     if(revoke_during_release) {revoke_during_release=0;kernel_token=0;return -116;}
     if(token!=kernel_token)return -116;kernel_token=0;return 0;
@@ -86,17 +87,17 @@ int main(void) {
     out=drain(display,sockets[1],lock_id,pointer_id,relative_id);assert(!out.relative);
     // Release wl_seat before its children. Constraints/relative/pointer remain valid.
     wl_resource_destroy(sc->seat);assert(!sc->seat && g_seat_clients==sc && sc->refs==3);
-    uint32_t stale=kernel_token;kernel_token=0;pointer_constraints_refresh();assert(g_pointer_lock_inhibited && !lock->blocked && !lock->token);
+    uint32_t stale=kernel_token;kernel_token=0;pointer_constraints_refresh();assert(s->pointer_lock_inhibited && !lock->blocked && !lock->token);
     pointer_constraints_refresh();assert(!kernel_token); // Emergency release cannot auto-recapture.
     event.reserved=stale;dispatch_surface_event(s,sc,&event,1);
     out=drain(display,sockets[1],lock_id,pointer_id,relative_id);assert(out.unlocked==1 && !out.relative);
     wl_resource_destroy(lock->resource);
     constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
-    lock=g_pointer_constraints;assert(!lock->token && g_pointer_lock_inhibited);
+    lock=g_pointer_constraints;assert(!lock->token && s->pointer_lock_inhibited);
     pointer_constraints_refresh();assert(!kernel_token); // Retry/recreated object does not rearm.
     event=(struct brook_wm_event){.type=EVT_MOUSE_BTN_DOWN};dispatch_surface_event(s,sc,&event,2);
     pointer_constraints_refresh();assert(!kernel_token); // Old queued WM button cannot rearm either.
-    ++physical_click_serial;pointer_constraints_refresh();assert(lock->token && !g_pointer_lock_inhibited);
+    ++physical_click_serial;pointer_constraints_refresh();assert(lock->token && !s->pointer_lock_inhibited);
     lock_id=wl_resource_get_id(lock->resource);
     constraint_set_region(client,lock->resource,rr);assert(lock->region_pending);
     assert(lock->region.infinite);surface_commit(client,s->resource);assert(!lock->region_pending && !lock->region.infinite);
@@ -130,10 +131,56 @@ int main(void) {
     constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
     lock=g_pointer_constraints;assert(lock->token);
     revoke_during_release=1;wl_resource_destroy(lock->resource);
-    assert(g_pointer_lock_inhibited && !kernel_token);
+    assert(s->pointer_lock_inhibited && !kernel_token);
     constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
     lock=g_pointer_constraints;assert(!lock->token);
     ++physical_click_serial;pointer_constraints_refresh();assert(lock->token);
+    // Ian's Dell report, with SDL2's persistent lock: Super revokes, the
+    // launcher opens, the pointer crosses the taskbar and clicks mute. Neither
+    // stale motion, commits nor shell clicks (engage serial unchanged) re-lock.
+    lock_id=wl_resource_get_id(lock->resource);
+    drain(display,sockets[1],lock_id,pointer_id,relative_id);
+    kernel_token=0;pointer_constraints_refresh();
+    assert(!lock->token && !lock->blocked && s->pointer_lock_inhibited);
+    kernel_refuse=1;
+    event=(struct brook_wm_event){.type=EVT_MOUSE_MOVE,.x=6,.y=6};dispatch_surface_event(s,sc,&event,4);
+    surface_commit(client,s->resource);pointer_constraints_refresh();assert(!kernel_token && !lock->token);
+    kernel_refuse=0; // Launcher closed, pointer hovering the game again.
+    surface_commit(client,s->resource);pointer_constraints_refresh();assert(!kernel_token && !lock->token);
+    // A click in the content is the re-engage: delivered, then the lock returns.
+    ++physical_click_serial;
+    event=(struct brook_wm_event){.type=EVT_MOUSE_BTN_DOWN,.x=6,.y=6};dispatch_surface_event(s,sc,&event,4);
+    pointer_constraints_refresh();assert(lock->token && kernel_token==lock->token && !s->pointer_lock_inhibited);
+    event=(struct brook_wm_event){.type=EVT_MOUSE_BTN_UP,.reserved=lock->token};dispatch_surface_event(s,sc,&event,4);
+    out=drain(display,sockets[1],lock_id,pointer_id,relative_id);
+    assert(out.unlocked==1 && out.locked==1 && out.button==2);
+    // Engaged, but the kernel refuses while the pointer is on a shell surface;
+    // waylandd retries rather than latching a failure.
+    kernel_token=0;pointer_constraints_refresh();++physical_click_serial;kernel_refuse=1;
+    pointer_constraints_refresh();assert(!lock->token && !s->pointer_lock_inhibited);
+    kernel_refuse=0;pointer_constraints_refresh();assert(lock->token);
+    // Oneshot: a revoked oneshot is dead (unlocked, never relocks, even after
+    // a re-engage click). A replacement created after a click locks at once.
+    wl_resource_destroy(lock->resource);assert(!kernel_token);
+    drain(display,sockets[1],0,pointer_id,relative_id); // Server ids are reused.
+    constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
+    lock=g_pointer_constraints;assert(lock->oneshot && lock->token);lock_id=wl_resource_get_id(lock->resource);
+    kernel_token=0;pointer_constraints_refresh();assert(!lock->token && lock->blocked && s->pointer_lock_inhibited);
+    ++physical_click_serial;pointer_constraints_refresh();assert(!lock->token && !kernel_token && lock->blocked);
+    out=drain(display,sockets[1],lock_id,pointer_id,relative_id);assert(out.locked==1 && out.unlocked==1);
+    wl_resource_destroy(lock->resource);
+    constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
+    lock=g_pointer_constraints;assert(lock->token);
+    // ...whereas one recreated straight after the revoke waits for the click.
+    kernel_token=0;pointer_constraints_refresh();assert(lock->blocked && s->pointer_lock_inhibited);
+    wl_resource_destroy(lock->resource);
+    constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
+    lock=g_pointer_constraints;assert(!lock->token && !lock->blocked);
+    surface_commit(client,s->resource);pointer_constraints_refresh();assert(!kernel_token);
+    ++physical_click_serial;pointer_constraints_refresh();assert(lock->token && kernel_token==lock->token);
+    wl_resource_destroy(lock->resource);assert(!kernel_token);
+    constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+    lock=g_pointer_constraints;assert(lock->token);
     wl_resource_destroy(pointer);assert(!kernel_token && lock->blocked && !lock->pointer && !relative->pointer);
     assert(g_seat_clients==sc && sc->refs==2);
     pointer_constraints_unmap(s,1);assert(!lock->surface);
@@ -141,5 +188,5 @@ int main(void) {
     wl_resource_destroy(relative->resource);assert(!g_seat_clients && !g_relative_pointers && !g_pointer_constraints);
     s->wm_id=0;pointer_region_clear(&region);wl_client_destroy(client);close(sockets[1]);wl_display_destroy(display);
     assert(!g_surfaces);
-    puts("POINTER_CONSTRAINTS_PASS region snapshots/holes/overflow, lock/relative/button wire, stale epochs, emergency escape, oneshot, inactive confinement, surface/pointer/seat lifetimes");
+    puts("POINTER_CONSTRAINTS_PASS region snapshots/holes/overflow, lock/relative/button wire, stale epochs, emergency escape, Super/taskbar no-relock, content-click re-engage, persistent vs oneshot, inactive confinement, surface/pointer/seat lifetimes");
 }
