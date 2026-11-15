@@ -11,6 +11,7 @@
 #include "ahci_readonly.h"
 #include "audio.h"
 #include "profiler.h"
+#include "string.h"
 #include "user_copy.h"
 #include "syscall_internal.h"
 #include "syscall_handlers.h"
@@ -143,6 +144,32 @@ int64_t sys_brook_crash_complete(uint64_t exitCode,
 
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
 
+static void EncodeInputPopEvent(Process* proc, InputEvent ev, uint8_t* slot)
+{
+    if(ev.type==InputEventType::MouseRelativeMove)ev.type=InputEventType::MouseMove;
+    slot[0] = static_cast<uint8_t>(ev.type);
+    slot[1] = ev.scanCode;
+    slot[2] = static_cast<uint8_t>(ev.ascii);
+    slot[3] = ev.modifiers;
+    slot[4] = slot[5] = slot[6] = slot[7] = 0;
+    int32_t mx = 0, my = 0;
+    if (ev.type == InputEventType::MouseMove ||
+        ev.type == InputEventType::MouseButtonDown ||
+        ev.type == InputEventType::MouseButtonUp ||
+        ev.type == InputEventType::MouseScroll) {
+        int32_t sx = 0, sy = 0;
+        MouseGetPosition(&sx, &sy);
+        // Translate screen coords to caller's VFB coords. The compositor
+        // blits the VFB to (fbDestX, fbDestY) at fbScale×; the inverse is
+        // (sx - fbDestX) / fbScale.  Userspace then converts VFB→surface.
+        uint8_t scale = proc->fbScale ? proc->fbScale : 1;
+        mx = (sx - proc->fbDestX) / scale;
+        my = (sy - proc->fbDestY) / scale;
+    }
+    memcpy(slot + 8, &mx, sizeof(mx));
+    memcpy(slot + 12, &my, sizeof(my));
+}
+
 int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
                               uint64_t, uint64_t, uint64_t, uint64_t)
 {
@@ -153,35 +180,27 @@ int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
 
-    auto* out = reinterpret_cast<uint8_t*>(bufAddr);
+    // Check the whole destination before popping, so a bad buffer does not
+    // discard queued input. Events are then staged in kernel memory and
+    // copied out with the fault-tolerant user copy.
+    if (!UserBufferWritable(bufAddr, maxCount * 16)) return -EFAULT;
+    static constexpr uint64_t Batch = 32;
+    uint8_t staged[Batch * 16];
     uint64_t n = 0;
-    while (n < maxCount) {
-        InputEvent ev{};
-        if (!ProcessInputPop(proc, &ev)) break;
-        if(ev.type==InputEventType::MouseRelativeMove)ev.type=InputEventType::MouseMove;
-        uint8_t* slot = out + (n * 16);
-        slot[0] = static_cast<uint8_t>(ev.type);
-        slot[1] = ev.scanCode;
-        slot[2] = static_cast<uint8_t>(ev.ascii);
-        slot[3] = ev.modifiers;
-        slot[4] = slot[5] = slot[6] = slot[7] = 0;
-        int32_t mx = 0, my = 0;
-        if (ev.type == InputEventType::MouseMove ||
-            ev.type == InputEventType::MouseButtonDown ||
-            ev.type == InputEventType::MouseButtonUp ||
-            ev.type == InputEventType::MouseScroll) {
-            int32_t sx = 0, sy = 0;
-            MouseGetPosition(&sx, &sy);
-            // Translate screen coords to caller's VFB coords. The compositor
-            // blits the VFB to (fbDestX, fbDestY) at fbScale×; the inverse is
-            // (sx - fbDestX) / fbScale.  Userspace then converts VFB→surface.
-            uint8_t scale = proc->fbScale ? proc->fbScale : 1;
-            mx = (sx - proc->fbDestX) / scale;
-            my = (sy - proc->fbDestY) / scale;
+    bool drained = false;
+    while (n < maxCount && !drained) {
+        uint64_t batch = 0;
+        while (batch < Batch && n + batch < maxCount) {
+            InputEvent ev{};
+            if (!ProcessInputPop(proc, &ev)) { drained = true; break; }
+            EncodeInputPopEvent(proc, ev, staged + batch * 16);
+            ++batch;
         }
-        *reinterpret_cast<int32_t*>(slot + 8)  = mx;
-        *reinterpret_cast<int32_t*>(slot + 12) = my;
-        ++n;
+        if (!batch) break;
+        // A raced unmap loses only this batch; report what already landed.
+        if (!CopyToUser(bufAddr + n * 16, staged, batch * 16))
+            return n ? static_cast<int64_t>(n) : -EFAULT;
+        n += batch;
     }
     return static_cast<int64_t>(n);
 }

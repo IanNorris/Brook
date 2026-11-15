@@ -426,6 +426,20 @@ target_compile_options(test_tcp PRIVATE
     -DBROOK_HOST_TEST
 )
 
+# Real syscall handlers against a fake user address space. Handlers must reach
+# user memory only through the checked copies; see harness.h.
+add_host_test(test_syscall_user_memory
+    "${BROOK_ROOT}/src/tests/test_syscall_user_memory/input_wm.cpp"
+    "${BROOK_ROOT}/src/tests/test_syscall_user_memory/dir_open.cpp"
+    "${BROOK_ROOT}/src/tests/test_syscall_user_memory/rw.cpp")
+target_compile_options(test_syscall_user_memory PRIVATE -DBROOK_HOST_TEST
+    -ffunction-sections -fdata-sections -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter
+    -Wno-attributes -Wno-missing-field-initializers
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km" "-iquote${BROOK_ROOT}/src/tests/test_syscall_user_memory")
+target_link_options(test_syscall_user_memory PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_syscall_user_memory PROPERTIES TIMEOUT 20)
+
 add_host_test(test_socket_lifetime "${BROOK_ROOT}/src/kernel/src/tcp.cpp"
     "${BROOK_ROOT}/src/kernel/src/sync/kmutex.cpp")
 target_compile_options(test_socket_lifetime PRIVATE -DBROOK_HOST_TEST -DBROOK_SOCKET_LIFETIME_TEST

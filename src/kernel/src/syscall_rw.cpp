@@ -489,6 +489,35 @@ static int64_t PipeReadSome(Process* proc,FdEntry* fde,char* dst,uint64_t count)
         }
 }
 
+// Bytes a device read produces are collected in kernel memory and flushed
+// with the checked user copy, so a raced unmap returns -EFAULT (or the bytes
+// already delivered) instead of faulting the kernel.
+struct ReadStage {
+    uint64_t address;
+    uint64_t done = 0;
+    uint32_t used = 0;
+    bool failed = false;
+    uint8_t bytes[256];
+    explicit ReadStage(uint64_t destination) : address(destination) {}
+    bool Put(uint8_t value) {
+        if (failed) return false;
+        bytes[used++] = value;
+        return used < sizeof(bytes) || Flush();
+    }
+    bool Flush() {
+        if (failed) return false;
+        if (!used) return true;
+        if (!CopyToUser(address + done, bytes, used)) { failed = true; return false; }
+        done += used; used = 0;
+        return true;
+    }
+    uint64_t Total() const { return done + used; }
+    int64_t Result() {
+        Flush();
+        return failed && !done ? -EFAULT : static_cast<int64_t>(done);
+    }
+};
+
 int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                   uint64_t, uint64_t, uint64_t)
 {
@@ -536,13 +565,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // /dev/urandom — fill buffer with RDRAND random bytes
     if (fde->type == FdType::DevUrandom)
     {
-        // Validate user buffer is in user address space
-        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL)
-            return -EFAULT;
-        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL)
-            return -EFAULT;
-
-        auto* dst = reinterpret_cast<uint8_t*>(bufAddr);
+        ReadStage out(bufAddr);
         uint64_t filled = 0;
         while (filled < count) {
             uint64_t rval;
@@ -551,27 +574,22 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint64_t remain = count - filled;
             uint64_t chunk = (remain < 8) ? remain : 8;
             for (uint64_t i = 0; i < chunk; i++)
-                dst[filled + i] = static_cast<uint8_t>(rval >> (i * 8));
+                if (!out.Put(static_cast<uint8_t>(rval >> (i * 8)))) return out.Result();
             filled += chunk;
         }
-        return static_cast<int64_t>(count);
+        return out.Result();
     }
 
     // /dev/klog — read new lines from the kernel log ring buffer
     if (fde->type == FdType::DevKlog && fde->handle)
     {
-        if (bufAddr == 0 || bufAddr >= 0x0000800000000000ULL) return -EFAULT;
-        if (count > 0 && (bufAddr + count - 1) >= 0x0000800000000000ULL) return -EFAULT;
-
         auto* cursor = static_cast<uint32_t*>(fde->handle);
-        auto* dst = reinterpret_cast<char*>(bufAddr);
+        ReadStage out(bufAddr);
 
         // Read available lines from the ring buffer into a temp buffer
         static constexpr uint32_t KLOG_LINE_LEN = 161; // 160 chars + null
         static constexpr uint32_t KLOG_BATCH    = 8;  // 8 × 161 = ~1.3KB stack
         char lineBuf[KLOG_BATCH][KLOG_LINE_LEN];
-
-        uint64_t written = 0;
 
         for (;;) {
             uint32_t nread = DebugOverlayReadFrom(cursor, reinterpret_cast<char*>(lineBuf),
@@ -583,16 +601,16 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 while (len < KLOG_LINE_LEN - 1 && lineBuf[i][len]) len++;
 
                 // Need space for line + newline
-                if (written + len + 1 > count) goto done;
+                if (out.Total() + len + 1 > count) goto done;
 
                 for (uint32_t j = 0; j < len; j++)
-                    dst[written++] = lineBuf[i][j];
-                dst[written++] = '\n';
+                    if (!out.Put(static_cast<uint8_t>(lineBuf[i][j]))) return out.Result();
+                if (!out.Put('\n')) return out.Result();
             }
         }
 
     done:
-        if (written == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
+        if (out.Total() == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
             // Blocking mode: sleep briefly and retry once
             Process* self = ProcessCurrent();
             self->wakeupTick = ApicTickCount() + 100;
@@ -603,14 +621,14 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             for (uint32_t i = 0; i < nread; i++) {
                 uint32_t len = 0;
                 while (len < KLOG_LINE_LEN - 1 && lineBuf[i][len]) len++;
-                if (written + len + 1 > count) break;
+                if (out.Total() + len + 1 > count) break;
                 for (uint32_t j = 0; j < len; j++)
-                    dst[written++] = lineBuf[i][j];
-                dst[written++] = '\n';
+                    if (!out.Put(static_cast<uint8_t>(lineBuf[i][j]))) return out.Result();
+                if (!out.Put('\n')) return out.Result();
             }
         }
 
-        return static_cast<int64_t>(written);
+        return out.Result();
     }
 
     // Synthetic in-memory files (/etc/passwd, /etc/group, etc.)
@@ -625,22 +643,22 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         uint64_t avail = contentLen - pos;
         uint64_t toRead = (count < avail) ? count : avail;
-        auto* dst = reinterpret_cast<char*>(bufAddr);
-        for (uint64_t i = 0; i < toRead; i++)
-            dst[i] = content[pos + i];
+        if (!CopyToUser(bufAddr, content + pos, toRead)) return -EFAULT;
         fde->seekPos += toRead;
         return static_cast<int64_t>(toRead);
     }
 
     if (fde->type == FdType::DevKeyboard)
     {
-        auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
+        // read(fd, buf, 0) neither blocks nor consumes input. The buffer is
+        // unchecked for count 0, so nothing below may store through it.
+        if (count == 0) return 0;
+        ReadStage out(bufAddr);
 
         // Non-blocking raw scancode mode (DOOM uses ioctl cmd=1 to enable this)
         if (fde->flags & 1)
         {
-            uint64_t bytesRead = 0;
-            while (bytesRead < count)
+            while (out.Total() < count)
             {
                 InputEvent ev{};
                 bool got;
@@ -670,19 +688,21 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 case SC_EXT_PGDN:   ps2 = 0x51; break;
                 }
 
+                bool stored;
                 if (ps2)
                 {
                     // Emit single-byte scancode (no E0 prefix) for compatibility
                     // with apps that read 1 byte at a time (DOOM, etc.)
-                    buf[bytesRead++] = release ? (ps2 | 0x80) : ps2;
+                    stored = out.Put(release ? (ps2 | 0x80) : ps2);
                 }
                 else
                 {
                     if (release) sc |= 0x80;
-                    buf[bytesRead++] = sc;
+                    stored = out.Put(sc);
                 }
+                if (!stored) break;
             }
-            return static_cast<int64_t>(bytesRead);
+            return out.Result();
         }
 
         // Non-canonical (raw) terminal mode: return ASCII chars as they arrive.
@@ -690,15 +710,14 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (!proc->ttyCanonical)
         {
             bool wmMode = WmIsActive();
-            uint64_t bytesRead = 0;
-            while (bytesRead < count)
+            while (out.Total() < count)
             {
                 InputEvent ev{};
                 bool got = wmMode ? ProcessInputPop(proc, &ev)
                                   : InputPollEvent(&ev);
                 if (!got)
                 {
-                    if (bytesRead > 0) break; // return what we have
+                    if (out.Total() > 0) break; // return what we have
                     // Register as waiter BEFORE re-checking, to close the
                     // race where a key arrives between the poll and block.
                     InputAddWaiter(proc);
@@ -713,7 +732,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                     }
                     SchedulerBlock(proc);
                     if (HasPendingSignals())
-                        return bytesRead > 0 ? static_cast<int64_t>(bytesRead) : -EINTR;
+                        return out.Total() > 0 ? out.Result() : -EINTR;
                     continue;
                 }
             got_event_nc:
@@ -731,17 +750,17 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 // Ctrl+D → EOF
                 if ((ev.modifiers & INPUT_MOD_CTRL) && (ev.scanCode == 0x20))
                 {
-                    if (bytesRead == 0) return 0; // EOF
+                    if (out.Total() == 0) return 0; // EOF
                     break;
                 }
 
-                buf[bytesRead++] = static_cast<uint8_t>(c);
+                if (!out.Put(static_cast<uint8_t>(c))) break;
 
                 // Don't echo here — bash handles its own echo in
                 // non-canonical mode by redisplaying the line on Enter.
                 // Kernel echo would duplicate every character.
             }
-            return static_cast<int64_t>(bytesRead);
+            return out.Result();
         }
 
         // Cooked terminal mode: blocking, ASCII translation, line buffering, echo.
@@ -787,8 +806,8 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 // Echo ^C and return empty line
                 brook::SerialLock(); brook::SerialPutChar('^'); brook::SerialPutChar('C'); brook::SerialPutChar('\n'); brook::SerialUnlock();
                 TtyPutChar('^'); TtyPutChar('C'); TtyPutChar('\n');
-                buf[0] = '\n';
-                return 1;
+                const char newline = '\n';
+                return CopyToUser(bufAddr, &newline, 1) ? 1 : -EFAULT;
             }
 
             // Ctrl+D → EOF
@@ -851,7 +870,7 @@ int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         // Copy line buffer to user buffer
         uint64_t copyLen = lineLen;
         if (copyLen > count) copyLen = count;
-        __builtin_memcpy(buf, lineBuf, copyLen);
+        if (copyLen && !CopyToUser(bufAddr, lineBuf, copyLen)) return -EFAULT;
         return static_cast<int64_t>(copyLen);
     }
 

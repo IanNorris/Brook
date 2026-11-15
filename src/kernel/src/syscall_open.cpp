@@ -77,26 +77,15 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
 
     UserAccessScope pathAccess(proc);
     char pathBuf[512];
-    const char* path = nullptr;
-    if (pathAddr < 0x0000800000000000ULL)
-    {
-        if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
-            Process* p = ProcessCurrent();
-            SerialPrintf("sys_open: EFAULT pathAddr=0x%lx pid=%u (%s)\n",
-                         pathAddr, p ? p->pid : 0, p ? p->name : "?");
-            return -EFAULT;
-        }
-        path = pathBuf;
-    }
-    else if ((pathAddr >> 47) == 0x1FFFFULL)
-    {
-        // Internal callers such as openat() pass kernel-built absolute paths.
-        path = reinterpret_cast<const char*>(pathAddr);
-    }
-    else
-    {
+    // The path is always a user pointer. There are no in-kernel callers, so
+    // an upper-half address is never trusted as a kernel string.
+    if (pathAddr < 0x1000 || !CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
+        Process* p = ProcessCurrent();
+        SerialPrintf("sys_open: EFAULT pathAddr=0x%lx pid=%u (%s)\n",
+                     pathAddr, p ? p->pid : 0, p ? p->name : "?");
         return -EFAULT;
     }
+    const char* path = pathBuf;
 
     AtLookup at;if(int error=at.Init(dirfd,path))return error;
     char resolvedPath[512];

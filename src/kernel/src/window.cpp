@@ -3969,6 +3969,15 @@ int WmInputPopOwned(Process* proc, uint32_t wmId, uint64_t incarnation,
     return static_cast<int>(WmInputPop(win,out,max));
 }
 
+int WmInputPopById(Process* proc, uint32_t wmId, Window::WmInputEvent* out, uint32_t max)
+{
+    if (!proc || !out || !max) return -22;
+    VfbGuard guard;
+    Window* win=WmFindWindowById(proc,wmId);
+    if (!win) return -2;
+    return static_cast<int>(WmInputPop(win,out,max));
+}
+
 bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
 {
     if (!win) return false;
