@@ -13,6 +13,10 @@ int64_t sys_alarm(uint64_t seconds, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
 int64_t sys_pause(uint64_t, uint64_t, uint64_t,
                    uint64_t, uint64_t, uint64_t);
+int64_t sys_getitimer(uint64_t which, uint64_t valueAddr, uint64_t,
+                      uint64_t, uint64_t, uint64_t);
+int64_t sys_setitimer(uint64_t which, uint64_t valueAddr, uint64_t oldAddr,
+                      uint64_t, uint64_t, uint64_t);
 int64_t sys_rt_sigsuspend(uint64_t maskAddr, uint64_t sigsetsize, uint64_t,
                             uint64_t, uint64_t, uint64_t);
 int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,

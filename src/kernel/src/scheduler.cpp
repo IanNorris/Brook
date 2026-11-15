@@ -2029,30 +2029,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
         const auto wakeCandidates=TryBlockedWakeScan(0);
         const uint64_t timerScanEnd=timerProbe?TimerWakeTimingNow():0;
 
-        // Check alarm timers for all processes
-        uint64_t now = ApicTickCount();
-        // Signal delivery can acquire g_readyLock. Snapshot with references
-        // rather than inverting ready->allProc lock order while delivering.
-        static Process* alarmTargets[MAX_PROCESSES]; // BSP-only, IRQs disabled
-        uint32_t alarmCount = 0;
-        uint64_t alf_alarm = SchedLockAcquire(g_allProcLock);
-        for (uint32_t i = 0; i < g_processCount; ++i)
-        {
-            Process* p = g_allProcesses[i];
-            if (p->alarmTick != 0 && now >= p->alarmTick &&
-                p->state != ProcessState::Terminated)
-            {
-                p->alarmTick = 0; // one-shot
-                ProcessRef(p);
-                alarmTargets[alarmCount++] = p;
-            }
-        }
-        SchedLockRelease(g_allProcLock, alf_alarm);
-        for (uint32_t i = 0; i < alarmCount; ++i)
-        {
-            ProcessSendSignal(alarmTargets[i], 14); // SIGALRM
-            ReleaseSchedulerReference(alarmTargets[i], false);
-        }
+        // alarm()/ITIMER_REAL expiry runs in PosixTimersTickLocked above.
 
         // Destruction closes filesystem handles and may sleep. Never run it
         // atop an interrupted kernel operation (which might own the same lock),
@@ -2141,6 +2118,9 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
         else
             cur->sysTicks++;
         g_perCpu[cpu].busyTicks++;
+        // ITIMER_VIRTUAL/PROF: one load unless a CPU interval timer is armed.
+        if (__builtin_expect(IntervalTimerCpuArmed(), 0))
+            IntervalTimerChargeTick(cur, allowPreempt, 1000000);
     }
     else
     {

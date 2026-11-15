@@ -410,6 +410,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETSID]          = sys_getsid;
     g_syscallTable[SYS_SIGALTSTACK]     = sys_sigaltstack;
     g_syscallTable[SYS_ALARM]           = sys_alarm;
+    g_syscallTable[SYS_GETITIMER]       = sys_getitimer;
+    g_syscallTable[SYS_SETITIMER]       = sys_setitimer;
     g_syscallTable[SYS_PAUSE]           = sys_pause;
     g_syscallTable[SYS_RT_SIGPENDING] = sys_rt_sigpending;
     g_syscallTable[SYS_RT_SIGTIMEDWAIT] = sys_rt_sigtimedwait;

@@ -487,8 +487,9 @@ struct Process
     uint32_t sigAltstackSize;   // Alternate stack size
     uint32_t sigAltstackFlags;  // SS_DISABLE, SS_ONSTACK, etc.
 
-    // Alarm timer (SIGALRM delivery)
-    uint64_t alarmTick;         // LAPIC tick at which to deliver SIGALRM (0 = disabled)
+    // Unused since alarm() moved to the group interval timer (posix_timer.h);
+    // kept so later field offsets stay stable.
+    uint64_t alarmTick;
 
     // Signal delivery state
     bool     inSignalHandler;   // Legacy diagnostic hint, not delivery authority
