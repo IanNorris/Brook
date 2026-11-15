@@ -664,6 +664,12 @@ target_compile_options(test_exec_page_cache PRIVATE
 )
 set_tests_properties(test_exec_page_cache PROPERTIES TIMEOUT 30)
 
+add_host_test(test_pmm_drain_policy)
+target_compile_options(test_pmm_drain_policy PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+)
+
 add_host_test(test_shutdown_service_escalation)
 target_compile_options(test_shutdown_service_escalation PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_launch_feedback)
@@ -675,6 +681,9 @@ target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src
 add_host_test(test_desktop_metrics)
 add_host_test(test_global_shortcuts)
 target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+add_host_test(test_synaptics_touchpad)
+target_compile_options(test_synaptics_touchpad PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_wayland_provider)

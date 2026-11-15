@@ -52,6 +52,7 @@
 #include "relative-pointer-v1-server-protocol.h"
 #include "pointer-constraints-v1-server-protocol.h"
 #include "pointer-region.h"
+#include "pointer-hit.h"
 #include "surface-tree.h"
 #include "surface-geometry.h"
 #include "gpu-scene-abi.h"
@@ -324,6 +325,14 @@ struct brook_surface {
     uint32_t *image, *composite;
     uint32_t image_w, image_h;
     size_t composite_pixels;
+    /* Monotonic per-window number for every published source (GPU offer,
+     * layered offer or tagged CPU snapshot). Independent of tree commits so
+     * a desynchronised subsurface update still publishes a newer source. */
+    uint64_t publish_commit;
+    /* wl_surface.set_opaque_region, kept only when it is one added rectangle
+     * (the exact, conservative case); applied on commit. */
+    int opaque_set,pending_opaque_set,opaque_pending;
+    int32_t opaque_x,opaque_y,opaque_w,opaque_h,pending_opaque_x,pending_opaque_y,pending_opaque_w,pending_opaque_h;
 
     /* xdg-shell role state. */
     struct wl_resource *xdg_surface;
@@ -603,7 +612,11 @@ static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t
 enum { GPU_CALLBACK_FALLBACK_MS=100 };
 static int image_callbacks_due(const struct brook_image *image, uint32_t now) {
     if (!image->pending_cpu || image->gpu_presented) return 1;
-    return image->offer_state==1 && image->offer_ms && (int32_t)(now-image->offer_ms)>=GPU_CALLBACK_FALLBACK_MS;
+    if (image->offer_state==1 && image->offer_ms && (int32_t)(now-image->offer_ms)>=GPU_CALLBACK_FALLBACK_MS) return 1;
+    /* Never hold callbacks indefinitely on a missing PRESENTED, a slow
+     * producer fence, a layered wait or channel recovery: after the same
+     * delay from queueing, release them regardless of offer state. */
+    return image->queued_ms && (int32_t)(now-image->queued_ms)>=GPU_CALLBACK_FALLBACK_MS;
 }
 static struct wl_event_source *g_frame_timer;
 static int frame_clock_tick(void *unused) {
@@ -646,9 +659,21 @@ static void trace_frames_report(uint32_t now) {
                 wl_list_length(&s->committed_frames), s->trace_request_max_ms, s->trace_committed_max_ms);
     }
 }
+static unsigned long long g_opaque_null,g_opaque_infinite,g_opaque_rects[5];static int32_t g_opaque_last[6];
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
-    (void)c; (void)r; (void)reg;
+    (void)c;
+    struct brook_surface *s=wl_resource_get_user_data(r);
+    const struct pointer_region *region=reg?wl_resource_get_user_data(reg):NULL;
+    s->pending_opaque_set=region && !region->infinite && region->count==1 && region->ops[0].add;
+    /* What clients send (status file "opaque_regions"). */
+    if(!region)++g_opaque_null;else if(region->infinite)++g_opaque_infinite;
+    else{++g_opaque_rects[region->count<4?region->count:4];
+        if(region->count){g_opaque_last[0]=region->ops[0].x;g_opaque_last[1]=region->ops[0].y;g_opaque_last[2]=region->ops[0].w;
+            g_opaque_last[3]=region->ops[0].h;g_opaque_last[4]=region->ops[0].add;g_opaque_last[5]=(int32_t)region->count;}}
+    if(s->pending_opaque_set){s->pending_opaque_x=region->ops[0].x;s->pending_opaque_y=region->ops[0].y;
+        s->pending_opaque_w=region->ops[0].w;s->pending_opaque_h=region->ops[0].h;}
+    s->opaque_pending=1;
 }
 static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *reg) {
@@ -693,6 +718,10 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
 }
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
+    if(s->opaque_pending){
+        s->opaque_set=s->pending_opaque_set;s->opaque_x=s->pending_opaque_x;s->opaque_y=s->pending_opaque_y;
+        s->opaque_w=s->pending_opaque_w;s->opaque_h=s->pending_opaque_h;s->opaque_pending=0;
+    }
     if(s->input_region_pending) {
         pointer_region_clear(&s->input_region);s->input_region=s->pending_input_region;
         memset(&s->pending_input_region,0,sizeof(s->pending_input_region));s->input_region_pending=0;
@@ -1380,6 +1409,7 @@ struct brook_seat_client {
     int cursor_visible;                     /* policy; kernel is mechanism */
     unsigned refs;
     int32_t pointer_x,pointer_y;
+    uint32_t buttons;                       /* held buttons: implicit grab */
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
     int keymap_fd;                          /* kept alive until client receives it */
@@ -1757,7 +1787,7 @@ static uint32_t scancode_to_xkb(uint8_t sc) {
 
 static void pointer_enter_if_needed(struct brook_seat_client *sc,
                                      struct brook_surface *s,
-                                     int lx, int ly) {
+                                     wl_fixed_t lx, wl_fixed_t ly) {
     if (!sc || !sc->pointer) return;
     if (sc->entered_surface == s) return;
     if (sc->entered_surface && sc->entered_surface != s) {
@@ -1774,8 +1804,7 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
         }
     }
     if (s) {
-        wl_pointer_send_enter(sc->pointer, next_serial(), s->resource,
-                              surface_pointer_fixed(s,lx), surface_pointer_fixed(s,ly));
+        wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, lx, ly);
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
     }
@@ -1791,6 +1820,45 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
     seat_apply_cursor_visibility(sc);
 }
 
+/* Pointer target within the window's surface tree. A window's input arrives
+ * root-relative; subsurfaces (e.g. Chromium's WaylandBubble dialogs) must
+ * receive the events over them, in surface-local coordinates. While a button
+ * is held the pressed surface keeps the pointer (implicit grab). Points that
+ * hit no mapped layer go to the root, as before subsurface hit-testing. */
+static struct brook_surface *pointer_target(struct brook_surface *root,struct brook_seat_client *sc,
+                                            int32_t px,int32_t py,wl_fixed_t *lx,wl_fixed_t *ly) {
+    const int64_t fx=surface_pointer_fixed(root,px),fy=surface_pointer_fixed(root,py);
+    *lx=(wl_fixed_t)fx;*ly=(wl_fixed_t)fy;
+    struct pointer_hit_layer layers[64];unsigned count=0;
+    struct frame { struct bt_node *node;size_t index;int own;int64_t x,y; } stack[65];
+    unsigned depth=1;stack[0]=(struct frame){&root->tree,0,0,0,0};
+    while (depth) {
+        struct frame *f=&stack[depth-1];struct bt_state *state=f->node->current;
+        if (!state || !state->value) { --depth;continue; }
+        if (!f->own && (f->index==state->count || !state->children[f->index].below)) {
+            if (count==64) break;
+            const struct brook_view *view=state->value;struct brook_surface *owner=f->node->user;
+            layers[count++]=(struct pointer_hit_layer){owner?&owner->input_region:NULL,f->x,f->y,
+                view->geometry.w,view->geometry.h,owner};
+            f->own=1;continue;
+        }
+        if (f->index==state->count) { --depth;continue; }
+        struct bt_child *child=&state->children[f->index++];
+        if (!bt_child_valid(f->node,child) || depth==65) continue;
+        stack[depth++]=(struct frame){child->node,0,0,f->x+child->x,f->y+child->y};
+    }
+    int64_t hx=fx,hy=fy;
+    int pick=(sc && sc->buttons)?pointer_hit_grab_index(layers,count,sc->entered_surface):-1;
+    if (pick>=0) { hx=fx-layers[pick].x*256;hy=fy-layers[pick].y*256; }
+    else pick=pointer_hit_pick(layers,count,fx,fy,&hx,&hy);
+    if (pick<0 || !layers[pick].user) return root;
+    struct brook_surface *target=layers[pick].user;
+    if (!target->resource) return root;
+    *lx=(wl_fixed_t)(hx<INT32_MIN?INT32_MIN:hx>INT32_MAX?INT32_MAX:hx);
+    *ly=(wl_fixed_t)(hy<INT32_MIN?INT32_MIN:hy>INT32_MAX?INT32_MAX:hy);
+    return target;
+}
+
 static void dispatch_surface_event(struct brook_surface *s,
                                    struct brook_seat_client *sc,
                                    struct brook_wm_event *e, uint32_t now) {
@@ -1801,10 +1869,9 @@ static void dispatch_surface_event(struct brook_surface *s,
         if (!sc || !sc->pointer || pointer_surface_locked(s)) break;
         sc->pointer_x=pointer_fixed_floor(surface_pointer_fixed(s,e->x));
         sc->pointer_y=pointer_fixed_floor(surface_pointer_fixed(s,e->y));
-        pointer_enter_if_needed(sc, s, e->x, e->y);
-        wl_pointer_send_motion(sc->pointer, now,
-                               surface_pointer_fixed(s,e->x),
-                               surface_pointer_fixed(s,e->y));
+        wl_fixed_t lx,ly;struct brook_surface *target=pointer_target(s,sc,e->x,e->y,&lx,&ly);
+        pointer_enter_if_needed(sc, target, lx, ly);
+        wl_pointer_send_motion(sc->pointer, now, lx, ly);
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         pointer_constraints_refresh();
@@ -1820,9 +1887,14 @@ static void dispatch_surface_event(struct brook_surface *s,
         if(e->reserved && !pointer_event_token(s,e->reserved))break;
         sc->pointer_x=pointer_fixed_floor(surface_pointer_fixed(s,e->x));
         sc->pointer_y=pointer_fixed_floor(surface_pointer_fixed(s,e->y));
-        pointer_enter_if_needed(sc, s, e->x, e->y);
+        {
+            wl_fixed_t lx,ly;struct brook_surface *target=pointer_target(s,sc,e->x,e->y,&lx,&ly);
+            pointer_enter_if_needed(sc, target, lx, ly);
+        }
         /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
         uint32_t btn = 0x110 + (e->scan & 0x3);
+        if (e->type == EVT_MOUSE_BTN_DOWN) sc->buttons |= 1u << (e->scan & 0x3);
+        else sc->buttons &= ~(1u << (e->scan & 0x3));
         uint32_t st  = (e->type == EVT_MOUSE_BTN_DOWN)
                          ? WL_POINTER_BUTTON_STATE_PRESSED
                          : WL_POINTER_BUTTON_STATE_RELEASED;
@@ -1837,12 +1909,27 @@ static void dispatch_surface_event(struct brook_surface *s,
     }
     case EVT_MOUSE_SCROLL: {
         if (!sc || !sc->pointer || (e->reserved && !pointer_event_token(s,e->reserved))) break;
+        if (!sc->buttons && sc->entered_surface && !pointer_surface_locked(s)) {
+            /* Scroll goes to the surface under the last pointer position. */
+            wl_fixed_t lx,ly;
+            struct brook_surface *target=pointer_target(s,sc,(int32_t)((int64_t)sc->pointer_x*surface_output_scale(s)),
+                                                       (int32_t)((int64_t)sc->pointer_y*surface_output_scale(s)),&lx,&ly);
+            pointer_enter_if_needed(sc, target, lx, ly);
+        }
             int32_t dy = (int8_t)e->scan;
+            /* Horizontal ticks travel in the ascii byte, positive right, which
+             * matches Wayland's horizontal axis (positive = right). */
+            int32_t dx = (int8_t)e->ascii;
             /* Brook wheel ticks are positive upward; Wayland axis values
              * are positive downward. */
-            wl_pointer_send_axis(sc->pointer, now,
-                                 WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                 wl_fixed_from_int(-dy * 10));
+            if (dy)
+                wl_pointer_send_axis(sc->pointer, now,
+                                     WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                     wl_fixed_from_int(-dy * 10));
+            if (dx)
+                wl_pointer_send_axis(sc->pointer, now,
+                                     WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+                                     wl_fixed_from_int(dx * 10));
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         break;
@@ -2538,6 +2625,7 @@ static struct brook_image *intel_dmabuf_copy(const struct brook_dmabuf_buffer *d
     if (pixels==MAP_FAILED) return NULL;
     struct brook_image *image=image_snapshot((const uint8_t *)pixels+db->offset,db->width,db->height,
         db->stride,db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
+    if(image)g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;
     munmap(pixels,length);return image;
 }
 /* The Wayland buffer ownership contract excludes new producer writes until
@@ -2616,10 +2704,18 @@ static void intel_image_want_pixels(struct brook_image *image){
  * that its previously delivered GPU reads have retired. Event-loop only. */
 static int g_gpu_window_channel=-1;
 static int g_gpu_window_dead=-1;
+static void gpu_groups_lost(void);
+static int gpu_layers_enabled(void);
+struct gpu_group;
+static void gpu_group_release(struct gpu_group *g);
+static uint64_t g_gpu_group_offers,g_gpu_group_safe,g_gpu_group_presented,g_gpu_group_wait,g_gpu_group_full;
+static uint64_t g_gpu_group_skip_shape,g_gpu_group_skip_buffer,g_gpu_group_skip_upload,g_gpu_group_uploads;
+
 static struct wl_event_source *g_gpu_window_source;
 static uint64_t g_gpu_window_offers,g_gpu_window_acks,g_gpu_window_recovered,g_gpu_window_presented;
 /* Aggregate failures instead of logging each frame; the latter perturbs pacing. */
 static uint64_t g_gpu_offer_no_channel,g_gpu_offer_no_root,g_gpu_offer_layers,g_gpu_offer_geometry,g_gpu_offer_window,g_gpu_offer_metadata;
+static uint64_t g_gpu_offer_size_mismatch,g_gpu_opaque_offers;
 static uint64_t g_gpu_connect_fail,g_gpu_auth_fail;
 static int g_gpu_connect_errno,g_gpu_auth_errno;
 struct GpuWindowTiming {uint64_t count,sum,buckets[10];uint32_t max;};
@@ -2646,6 +2742,7 @@ static void gpu_window_channel_lost(void){
     }
     g_gpu_window_channel=-1;
     for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)if(i->offer_state==1)i->offer_state=3;
+    gpu_groups_lost();
 }
 static void gpu_window_reap_dead(void){
     if(g_gpu_window_dead<0)return;
@@ -2687,18 +2784,21 @@ static int gpu_window_retain_enabled(void){
 /* The renderer composed a frame including this offer and the OS accepted it.
  * Callbacks committed with (or before) that content are done; a newer commit
  * still waits for its own presentation. Unknown identities are ignored. */
+static struct gpu_group *gpu_group_find(const struct BrookGpuWindowIdentity *identity);
+static void gpu_group_presented(struct gpu_group *g);
 static void gpu_window_presented(const struct BrookGpuWindowIdentity *identity){
     struct brook_image *match=NULL;
     for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)
         if(i->offer_state==1 && brook_gpu_window_identity_equal(&i->offer_identity,identity)){match=i;break;}
-    if(!match || match->gpu_presented)return;
+    if(!match){struct gpu_group *g=gpu_group_find(identity);if(g)gpu_group_presented(g);return;}
+    if(match->gpu_presented)return;
     match->gpu_presented=1;++g_gpu_window_presented;
     const uint32_t now=g_now_ms();
     gpu_window_timing_add(&g_presentWait,match->offer_sent_ms,now);
     for(struct brook_surface *s=g_surfaces;s;s=s->next){
         if(s->tree.parent || s->wm_id!=identity->window)continue;
         const struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
-        surface_send_frame_callbacks_upto(s,now,view && view->image==match?UINT64_MAX:identity->commit);
+        surface_send_frame_callbacks_upto(s,now,view && view->image==match?UINT64_MAX:match->offer_tree_commit);
     }
 }
 static void gpu_window_channel_drain(void){
@@ -2715,8 +2815,15 @@ static void gpu_window_channel_drain(void){
         struct brook_image *match=NULL;
         for(struct brook_image *i=g_intel_pending_head;i;i=i->pending_next)
             if(i->offer_state==1 && brook_gpu_window_identity_equal(&i->offer_identity,&packet.identity)){match=i;break;}
-        if(!match){gpu_window_channel_lost();return;}
-        match->offer_state=2;++g_gpu_window_acks;
+        if(!match){
+            struct gpu_group *g=gpu_group_find(&packet.identity);
+            if(!g){gpu_window_channel_lost();return;}
+            ++g_gpu_group_safe;gpu_group_release(g);continue;
+        }
+        ++g_gpu_window_acks;
+        /* Still held by a layered commit: that group's SAFE releases it. */
+        if(match->group_refs){match->offer_identity=(struct BrookGpuWindowIdentity){0};continue;}
+        match->offer_state=2;
         if(getenv("BROOK_WAYLAND_GPU_TIMING")){match->offer_ack_ms=g_now_ms();
             gpu_window_timing_add(&g_offerWait,match->offer_sent_ms,match->offer_ack_ms);}
     }
@@ -2727,31 +2834,210 @@ static int gpu_window_offer(struct brook_image *image){
     struct brook_surface *root=NULL;
     for(struct brook_surface *s=g_surfaces;s;s=s->next){struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
         if(view && view->image==image && !s->tree.parent){root=s;break;}}
+    /* A subsurface's buffer belongs to its tree's root window (layered offers). */
+    if(!root && gpu_layers_enabled())for(struct brook_surface *s=g_surfaces;s && !root;s=s->next){
+        struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+        if(!view || view->image!=image || !s->tree.parent)continue;
+        root=s;while(root->tree.parent)root=root->tree.parent->user;}
     if(!root || !root->xdg_toplevel || !root->xdg_acked){++g_gpu_offer_no_root;return 0;}
     struct brook_draw draws[64];unsigned count=0;
-    if(!surface_layers(root,draws,&count) || count!=1 || draws[0].view->image!=image){++g_gpu_offer_layers;return 0;}
+    if(!surface_layers(root,draws,&count)){++g_gpu_offer_layers;return 0;}
+    if(count>=2){
+        int layered=0;for(unsigned i=0;i<count;++i)layered|=draws[i].view->image==image;
+        const int sent=layered?gpu_window_offer_layers(root,draws,count):0;
+        if(sent==1)return 1;
+        if(sent<0)return -1;
+        if(sent==2)return -2;
+        ++g_gpu_offer_layers;return 0;
+    }
+    if(draws[0].view->image!=image){++g_gpu_offer_layers;return 0;}
     const struct brook_view *view=draws[0].view;const struct brook_geometry *g=&view->geometry;
     const struct brook_dmabuf_buffer *db=image->source->dmabuf;
+    const uint32_t scale=surface_output_scale(root);
     if(g->transform || g->sx || g->sy || g->sw!=(int64_t)image->width*256 || g->sh!=(int64_t)image->height*256 ||
+       (uint64_t)g->w*scale!=image->width || (uint64_t)g->h*scale!=image->height ||
        (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
     if(!surface_window(root,(struct brook_view *)view) || !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
     struct stat st={0};BrookWindowState window={0};
     if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3) ||
        syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
        window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id || !root->tree.current ||
-       window.width!=root->vfb_w || window.height!=root->vfb_h){++g_gpu_offer_metadata;return 0;}
+       root->vfb_w!=image->width || root->vfb_h!=image->height){++g_gpu_offer_metadata;return 0;}
+    /* The WM client size (window.width/height) may differ from the committed
+     * buffer while a resize is in flight or when the client picks its own
+     * size. The renderer draws the offer exactly as it draws the VFB, 1:1
+     * and cropped to the client rectangle, so that is not a reason to fall
+     * back to CPU composition. */
+    if(window.width!=root->vfb_w || window.height!=root->vfb_h)++g_gpu_offer_size_mismatch;
     struct BrookGpuWindowPacket offer={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,
         .version=gpu_window_retain_enabled()?BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN:BROOK_GPU_WINDOW_WIRE_VERSION,
-        .type=BROOK_GPU_WINDOW_OFFER,.identity={root->wm_id,0,window.incarnation,root->tree.current->commit,
+        .type=BROOK_GPU_WINDOW_OFFER,.identity={root->wm_id,0,window.incarnation,root->publish_commit+1,
             (uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=(uint64_t)st.st_size/4,.offset=db->offset/4,
         .stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
-    int sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
-    if(sent==1){image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;
+    int sent;
+    if(view->opaque && db->fourcc==0x34325241 && gpu_layers_enabled()){
+        /* An ARGB buffer the client declared opaque: a one-layer version 3
+         * offer carries the opaque flag, so the renderer can cull beneath
+         * the window instead of blending everything under it. */
+        struct BrookGpuWindowLayersPacket one;memset(&one,0,sizeof(one));
+        one.header=offer;one.header.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS;one.count=1;
+        one.layers[0]=(struct BrookGpuWindowLayer){.words=offer.words,.device=offer.identity.device,.inode=offer.identity.inode,
+            .offset=offer.offset,.stride=offer.stride,.width=offer.width,.height=offer.height,.fourcc=offer.fourcc,
+            .flags=BROOK_GPU_WINDOW_LAYER_OPAQUE,.srcWidth=offer.width,.srcHeight=offer.height,
+            .dstWidth=g->w*scale,.dstHeight=g->h*scale};
+        sent=brook_gpu_window_send_layers(g_gpu_window_channel,&one,&image->pending_fd,&image->producer_fence);
+        if(sent==1)++g_gpu_opaque_offers;
+    }else sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
+    if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
+        image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
         if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->offer_sent_ms=g_now_ms();
         return 1;}
     if(sent<0){image->offer_state=3;gpu_window_channel_lost();return -1;}
     return 0;
+}
+/* ---- Version 3 layered window offers ----------------------------------
+ * A window of 2..8 layers (a video subsurface over a page, a delegated
+ * compositor's overlays) is offered as one commit of several buffers instead
+ * of being read back and flattened on the CPU. DMA-BUF layers are offered
+ * from the Intel queue (their prime fd and producer fence); CPU-pixel layers
+ * (SHM, or a snapshot taken earlier) are copied once into a GEM buffer that
+ * lives with the image. An image may be held by several groups (an
+ * unchanged layer appears in consecutive commits); it is released only when
+ * every group holding it has been acknowledged (SAFE). */
+struct gpu_group {int live;struct BrookGpuWindowIdentity identity;uint64_t tree_commit;uint32_t sent_ms;int presented;
+    unsigned count;struct brook_image *images[BROOK_GPU_WINDOW_LAYERS_MAX];};
+enum {GPU_GROUPS=48};
+static struct gpu_group g_gpu_groups[GPU_GROUPS];
+static int gpu_layers_enabled(void){
+    static int enabled=-1;
+    if(enabled<0){const char *e=getenv("BROOK_WAYLAND_GPU_LAYERS");enabled=!e || strcmp(e,"0");}
+    return enabled && gpu_window_retain_enabled();
+}
+static void image_gem_free(struct brook_image *image){
+    if(!image || !image->gem_handle)return;
+    if(image->gem_fence>=0)close(image->gem_fence);
+    if(image->gem_fd>=0)close(image->gem_fd);
+    struct {uint32_t handle,pad;} gclose={image->gem_handle,0};(void)ioctl(g_drm_fd,DRM_IOC(0x09,sizeof(gclose)),&gclose);
+    image->gem_handle=0;image->gem_fd=image->gem_fence=-1;image->gem_words=0;
+}
+/* One GEM copy of an image's CPU pixels (straight from the snapshot: SHM
+ * ARGB is premultiplied, XRGB snapshots carry alpha 255). 1 ready, 0 no. */
+static int image_gem_upload(struct brook_image *image){
+    if(image->gem_handle)return image->gem_fd>=0 && image->gem_fence>=0;
+    if(!image->pixels || g_drm_fd<0 || !g_drm_intel)return 0;
+    const uint64_t bytes=((uint64_t)image->width*image->height*4+4095)&~UINT64_C(4095);
+    struct {uint64_t size;uint32_t handle,pad;} create={bytes,0,0};
+    if(ioctl(g_drm_fd,DRM_IOC(0x5b,sizeof(create)),&create) || !create.handle)return 0;
+    image->gem_handle=create.handle;image->gem_fd=image->gem_fence=-1;image->gem_words=create.size/4;
+    struct {uint32_t handle,pad;uint64_t offset,flags,extensions;} map={create.handle,0,0,2,0};
+    void *pixels=MAP_FAILED;
+    if(!ioctl(g_drm_fd,DRM_IOC(0x64,sizeof(map)),&map))
+        pixels=mmap(NULL,(size_t)create.size,PROT_READ|PROT_WRITE,MAP_SHARED,g_drm_fd,(off_t)map.offset);
+    if(pixels==MAP_FAILED){image_gem_free(image);return 0;}
+    memcpy(pixels,image->pixels,(size_t)image->width*image->height*4);munmap(pixels,(size_t)create.size);
+    struct drm_prime_handle prime={create.handle,O_CLOEXEC|O_RDWR,-1};
+    if(ioctl(g_drm_fd,DRM_IOC(0x2d,sizeof(prime)),&prime) || prime.fd<0){image_gem_free(image);return 0;}
+    image->gem_fd=prime.fd;
+    /* Never written by the GPU: the kernel returns an already signalled fence. */
+    errno=0;long fence=syscall(BROOK_SYS_GPU_BUFFER_SNAPSHOT_FENCE,(long)prime.fd,0L,0L,0L,0L,0L);
+    if(fence<0){image_gem_free(image);return 0;}
+    image->gem_fence=(int)fence;++g_gpu_group_uploads;return 1;
+}
+static void gpu_group_presented(struct gpu_group *g){
+    if(g->presented)return;
+    g->presented=1;++g_gpu_group_presented;++g_gpu_window_presented;
+    const uint32_t now=g_now_ms();
+    gpu_window_timing_add(&g_presentWait,g->sent_ms,now);
+    /* Every layer of the commit is on screen: callbacks of every surface in
+     * the window (subsurfaces included) are paced like a single offer. */
+    for(unsigned i=0;i<g->count;++i)g->images[i]->gpu_presented=1;
+    for(struct brook_surface *s=g_surfaces;s;s=s->next){
+        struct brook_surface *root=s;while(root->subsurface_parent)root=root->subsurface_parent;
+        if(root->wm_id!=g->identity.window)continue;
+        struct brook_draw draws[64];unsigned n=0;int pending=!surface_layers(root,draws,&n);
+        for(unsigned k=0;!pending && k<n;++k)if(!image_callbacks_due(draws[k].view->image,now))pending=1;
+        if(!pending)surface_send_frame_callbacks(s,now);
+    }
+}
+static void gpu_group_release(struct gpu_group *g){
+    for(unsigned i=0;i<g->count;++i){struct brook_image *image=g->images[i];
+        if(image->group_refs && !--image->group_refs && image->offer_state==1 && image->pending_cpu==1){
+            image->offer_state=2;intel_pending_schedule();}
+        image_unref(image);}
+    *g=(struct gpu_group){0};
+}
+static struct gpu_group *gpu_group_find(const struct BrookGpuWindowIdentity *identity){
+    for(unsigned i=0;i<GPU_GROUPS;++i)if(g_gpu_groups[i].live && brook_gpu_window_identity_equal(&g_gpu_groups[i].identity,identity))return &g_gpu_groups[i];
+    return NULL;
+}
+/* Channel loss: images in the queue are already marked uncertain (state 3)
+ * by gpu_window_channel_lost; drop the group references. */
+static void gpu_groups_lost(void){
+    for(unsigned i=0;i<GPU_GROUPS;++i)if(g_gpu_groups[i].live){struct gpu_group *g=&g_gpu_groups[i];
+        for(unsigned k=0;k<g->count;++k){if(g->images[k]->group_refs)--g->images[k]->group_refs;image_unref(g->images[k]);}
+        *g=(struct gpu_group){0};}
+}
+/* Returns 1 sent, 0 not offerable (use the CPU path), 2 wait (a DMA-BUF
+ * layer's producer fence is not known yet), -1 uncertain delivery. */
+static int gpu_window_offer_layers(struct brook_surface *root,const struct brook_draw *draws,unsigned count){
+    if(!gpu_layers_enabled() || count<2 || count>BROOK_GPU_WINDOW_LAYERS_MAX || !gpu_window_channel_connect())return 0;
+    if(!root || root->tree.parent || !root->xdg_toplevel || !root->xdg_acked || !root->wm_id || !root->vfb || !root->tree.current)return 0;
+    const uint32_t scale=surface_output_scale(root);
+    struct BrookGpuWindowLayersPacket packet;memset(&packet,0,sizeof(packet));
+    int buffers[BROOK_GPU_WINDOW_LAYERS_MAX],fences[BROOK_GPU_WINDOW_LAYERS_MAX];
+    for(unsigned i=0;i<count;++i){
+        const struct brook_view *view=draws[i].view;struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
+        if(g->transform || ((g->sx|g->sy|g->sw|g->sh)&255) || !g->sw || !g->sh ||
+           (uint64_t)g->w*scale>16384 || (uint64_t)g->h*scale>16384 ||
+           draws[i].x*(int64_t)scale<=-16384 || draws[i].x*(int64_t)scale>=16384 ||
+           draws[i].y*(int64_t)scale<=-16384 || draws[i].y*(int64_t)scale>=16384){++g_gpu_group_skip_shape;return 0;}
+        struct BrookGpuWindowLayer *l=&packet.layers[i];
+        struct stat st={0};
+        if(image->pending_cpu==1){
+            const struct brook_dmabuf_buffer *db=image->source && image->source->dmabuf?image->source->dmabuf:NULL;
+            if(!db || image->pending_fd<0 || image->uncertain || db->modifier || (db->stride&3) || (db->offset&3) ||
+               image->offer_state==3 || image->offer_state==4){++g_gpu_group_skip_buffer;return 0;}
+            if(image->producer_fence<0){++g_gpu_group_wait;return 2;}
+            if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3)){++g_gpu_group_skip_buffer;return 0;}
+            *l=(struct BrookGpuWindowLayer){.words=(uint64_t)st.st_size/4,.device=(uint64_t)st.st_dev,.inode=(uint64_t)st.st_ino,
+                .offset=db->offset/4,.stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc,
+                .flags=view->opaque?BROOK_GPU_WINDOW_LAYER_OPAQUE:0};
+            buffers[i]=image->pending_fd;fences[i]=image->producer_fence;
+        }else if(image->pixels && !image->pending_cpu){
+            if(!image_gem_upload(image)){++g_gpu_group_skip_upload;return 0;}
+            if(fstat(image->gem_fd,&st) || !st.st_ino){++g_gpu_group_skip_upload;return 0;}
+            *l=(struct BrookGpuWindowLayer){.words=(uint64_t)st.st_size/4,.device=(uint64_t)st.st_dev,.inode=(uint64_t)st.st_ino,
+                .stride=image->width,.width=image->width,.height=image->height,.fourcc=image->format==2?0x34325258u:0x34325241u,
+                .flags=(image->opaque || view->opaque)?BROOK_GPU_WINDOW_LAYER_OPAQUE:0};
+            buffers[i]=image->gem_fd;fences[i]=image->gem_fence;
+        }else{++g_gpu_group_skip_buffer;return 0;}
+        /* Source rectangle: Wayland 24.8 in transformed buffer units; with no
+         * transform these are buffer pixels. */
+        l->srcX=g->sx/256;l->srcY=g->sy/256;l->srcWidth=g->sw/256;l->srcHeight=g->sh/256;
+        l->dstX=(int32_t)(draws[i].x*(int64_t)scale);l->dstY=(int32_t)(draws[i].y*(int64_t)scale);
+        l->dstWidth=g->w*scale;l->dstHeight=g->h*scale;
+    }
+    BrookWindowState window={0};
+    if(syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
+       window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id){++g_gpu_offer_metadata;return 0;}
+    unsigned slot=0;while(slot<GPU_GROUPS && g_gpu_groups[slot].live)++slot;
+    if(slot==GPU_GROUPS){++g_gpu_group_full;return 0;}
+    const struct BrookGpuWindowLayer *l0=&packet.layers[0];
+    packet.header=(struct BrookGpuWindowPacket){.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,
+        .type=BROOK_GPU_WINDOW_OFFER,.identity={root->wm_id,0,window.incarnation,++root->publish_commit,l0->device,l0->inode},
+        .words=l0->words,.offset=l0->offset,.stride=l0->stride,.width=l0->width,.height=l0->height,.fourcc=l0->fourcc};
+    packet.count=count;
+    int sent=brook_gpu_window_send_layers(g_gpu_window_channel,&packet,buffers,fences);
+    if(sent<0){gpu_window_channel_lost();return -1;}
+    if(!sent)return 2;
+    struct gpu_group *group=&g_gpu_groups[slot];
+    *group=(struct gpu_group){1,packet.header.identity,root->tree.current->commit,g_now_ms(),0,count,{0}};
+    for(unsigned i=0;i<count;++i){struct brook_image *image=draws[i].view->image;
+        image_ref(image);group->images[i]=image;++image->group_refs;
+        if(image->pending_cpu==1){image->offer_state=1;image->gpu_presented=0;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;}}
+    ++g_gpu_group_offers;++g_layer_offer_frames;
+    return 1;
 }
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer){
     if(!buffer || !buffer->dmabuf || g_intel_pending_count>=INTEL_PENDING_LIMIT)return NULL;
@@ -2762,6 +3048,7 @@ static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer){
     image->refs=1;image->width=db->width;image->height=db->height;image->format=db->fourcc==0x34325258?2:1;
     image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
     image->pending_cpu=1;image->pending_fd=prime.fd;image->producer_fence=-1;
+    image->queued_ms=g_now_ms();if(!image->queued_ms)image->queued_ms=1;
     if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->trace_queued_ms=g_now_ms();
     const char *fenced=getenv("BROOK_WAYLAND_SNAPSHOT_FENCE");
     image->producer_fence_required=fenced && !strcmp(fenced,"1");
@@ -2838,7 +3125,15 @@ static void intel_pending_poll(void){
                 }
                 else if(!image->offer_state){
                     int offered=gpu_window_offer(image);
-                    if(offered<0){intel_pending_append(image);continue;}
+                    if(offered==-2){
+                        /* Layered window: another layer's producer fence is
+                         * not known yet. Wait briefly, then use the CPU path. */
+                        const uint32_t now=g_now_ms();
+                        if(!image->group_wait_ms)image->group_wait_ms=now?now:1;
+                        if(now-image->group_wait_ms<50){intel_retry_after(INTEL_RETRY_MS);intel_pending_append(image);continue;}
+                        image->offer_state=4;
+                    }
+                    else if(offered<0){if(!image->offer_state)image->offer_state=3;intel_pending_append(image);continue;}
                     else if(offered>0){intel_pending_append(image);continue;}
                     else image->offer_state=4; /* fallback, no fd transferred */
                 }
@@ -3043,8 +3338,8 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
                                        "dmabuf import failed");
         return NULL;
     }
-    fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x -> gres=%u\n",
-            width, height, db->stride, format, db->gres);
+    fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x modifier=0x%llx -> gres=%u\n",
+            width, height, db->stride, format, (unsigned long long)db->modifier, db->gres);
 
     struct wl_resource *buf = wl_resource_create(c, &wl_buffer_interface, 1, id);
     if (!buf) {
@@ -3220,6 +3515,60 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
 
 /* ---------------- main ---------------- */
 
+/* Live diagnostics: every 2 s, write $XDG_RUNTIME_DIR (or /tmp)/brook-waylandd-<display>.json
+ * atomically, so the bridge can read why windows are composed on the CPU
+ * without restarting the provider. */
+static void waylandd_status_write(const char *display){
+    static uint32_t last;const uint32_t now=g_now_ms();
+    if(last && now-last<2000)return;
+    last=now?now:1;
+    const char *dir=getenv("XDG_RUNTIME_DIR");if(!dir || !*dir)dir="/tmp";
+    char path[256],tmp[272];
+    if(snprintf(path,sizeof(path),"%s/brook-waylandd-%s.json",dir,display)>=(int)sizeof(path))return;
+    snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    FILE *f=fopen(tmp,"w");if(!f)return;
+    fprintf(f,"{\"schema\":\"brook-waylandd-status/1\",\"pid\":%ld,\"now_ms\":%u,\"gpu_socket\":%d,",
+        (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
+    fprintf(f,"\"offers\":{\"sent\":%llu,\"safe\":%llu,\"presented\":%llu,\"retained_snapshots\":%llu,\"recovered\":%llu},",
+        (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
+        (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered);
+    fprintf(f,"\"offer_skipped\":{\"no_channel_or_fence\":%llu,\"no_root\":%llu,\"layers\":%llu,\"geometry\":%llu,\"window\":%llu,"
+        "\"metadata\":%llu,\"connect_fail\":%llu,\"auth_fail\":%llu,\"sent_with_client_size_mismatch\":%llu},",
+        (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,
+        (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
+        (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
+    fprintf(f,"\"opaque_regions\":{\"null\":%llu,\"infinite\":%llu,\"by_ops\":[%llu,%llu,%llu,%llu,%llu],"
+        "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
+        g_opaque_rects[2],g_opaque_rects[3],g_opaque_rects[4],g_opaque_last[0],g_opaque_last[1],g_opaque_last[2],g_opaque_last[3],
+        g_opaque_last[4],g_opaque_last[5]);
+    fprintf(f,"\"layered\":{\"enabled\":%d,\"offers\":%llu,\"safe\":%llu,\"presented\":%llu,\"wait\":%llu,\"full\":%llu,"
+        "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu},",gpu_layers_enabled(),
+        (unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_safe,(unsigned long long)g_gpu_group_presented,
+        (unsigned long long)g_gpu_group_wait,(unsigned long long)g_gpu_group_full,(unsigned long long)g_gpu_group_skip_shape,
+        (unsigned long long)g_gpu_group_skip_buffer,(unsigned long long)g_gpu_group_skip_upload,(unsigned long long)g_gpu_group_uploads,
+        (unsigned long long)g_gpu_opaque_offers);
+    fprintf(f,"\"intel\":{\"queued\":%llu,\"ready\":%llu,\"discarded\":%llu,\"busy\":%llu,\"failed\":%llu,\"fences\":%llu,"
+        "\"fence_pending\":%llu,\"pending\":%u,\"direct\":%llu},\"readback_bytes\":%llu,\"paths\":{",
+        (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_discarded,
+        (unsigned long long)g_intel_busy,(unsigned long long)g_intel_failed,(unsigned long long)g_intel_fences,
+        (unsigned long long)g_intel_fence_pending,g_intel_pending_count,(unsigned long long)g_intel_direct,g_layer_readback_bytes);
+    for(unsigned i=0;i<LAYER_PATHS;++i)fprintf(f,"%s\"%s\":%llu",i?",":"",g_layer_path_names[i],g_layer_paths[i]);
+    fprintf(f,"},\"windows\":[");
+    int first=1;
+    for(unsigned i=0;i<16;++i){const struct layer_summary *w=&g_layer_windows[i];if(!w->wm)continue;
+        BrookWindowState state={0};
+        const int known=!syscall(BROOK_SYS_WM_WINDOW_STATE,(long)w->wm,0L,(long)&state,(long)sizeof(state),0L,0L) &&
+            state.version==BROOK_WINDOW_STATE_VERSION && state.window==w->wm;
+        fprintf(f,"%s{\"wm\":%u,\"vfb\":[%u,%u],\"client\":[%u,%u],\"scale\":%u,\"path\":\"%s\",\"count\":%u,\"layers\":[",
+            first?"":",",w->wm,w->vfb_w,w->vfb_h,known?state.width:0,known?state.height:0,
+            w->scale,w->path>=0 && w->path<LAYER_PATHS?g_layer_path_names[w->path]:"?",w->count);first=0;
+        for(unsigned k=0;k<w->count && k<4;++k)fprintf(f,"%s{\"kind\":\"%c\",\"buf\":[%u,%u],\"dst\":[%u,%u],\"at\":[%lld,%lld],"
+            "\"src24_8\":[%u,%u],\"fmt\":%u,\"opaque\":%d,\"offer\":%d}",k?",":"",w->l[k].kind,w->l[k].w,w->l[k].h,w->l[k].dw,w->l[k].dh,
+            (long long)w->l[k].x,(long long)w->l[k].y,w->l[k].sw,w->l[k].sh,w->l[k].fmt,w->l[k].opaque,w->l[k].offer);
+        fprintf(f,"]}");}
+    fprintf(f,"]}\n");
+    if(fclose(f)==0)rename(tmp,path);else unlink(tmp);
+}
 /* 1 when a server accepts connections on dir/name (a stale file refuses). */
 static int display_socket_live(const char *dir, const char *name) {
     if (!dir || !*dir || !name || strchr(name, '/')) return 0;
@@ -3382,6 +3731,7 @@ int main(int argc, char **argv)
                 goto done;
             }
             wl_display_flush_clients(g_display);
+            waylandd_status_write(sock);
             xwayland_pump();
             if (g_trace_frames) {
                 uint32_t now = g_now_ms();

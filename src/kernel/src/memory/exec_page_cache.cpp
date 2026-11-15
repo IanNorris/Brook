@@ -57,7 +57,32 @@ uint64_t ExecPageCache::Trim(bool all) {
             if(!entry.physical || (!all && !PmmHasSingleReference(entry.physical)))continue;
             retired[count++]=entry.physical;entry={};--stats_.entries;
         }
-        stats_.trimmed+=count;
+        stats_.trimmed+=count;stats_.slotsScanned+=visited;
+        IrqSpinLockRelease(&lock_,irq);
+        // No ref release/quarantine work while holding the cache lock.
+        for(uint32_t i=0;i<count;++i)PmmUnrefPage(retired[i]);
+        removed+=count;
+    }
+    return removed;
+}
+uint64_t ExecPageCache::TrimStep(uint32_t maximumScan) {
+    uint64_t removed=0;
+    uint32_t remaining=maximumScan<slots_?maximumScan:slots_;
+    {
+        const uint64_t irq=IrqSpinLockAcquire(&lock_);++stats_.stepTrims;
+        IrqSpinLockRelease(&lock_,irq);
+    }
+    while(remaining) {
+        PhysicalAddress retired[32];uint32_t count=0,visited=0;
+        const uint64_t irq=IrqSpinLockAcquire(&lock_);
+        if(!stats_.entries) { IrqSpinLockRelease(&lock_,irq);break; }
+        while(remaining && count<32 && visited<128) {
+            auto& entry=entries_[trimCursor_++];if(trimCursor_==slots_)trimCursor_=0;
+            ++visited;--remaining;
+            if(!entry.physical || !PmmHasSingleReference(entry.physical))continue;
+            retired[count++]=entry.physical;entry={};--stats_.entries;
+        }
+        stats_.trimmed+=count;stats_.slotsScanned+=visited;
         IrqSpinLockRelease(&lock_,irq);
         // No ref release/quarantine work while holding the cache lock.
         for(uint32_t i=0;i<count;++i)PmmUnrefPage(retired[i]);
@@ -81,7 +106,10 @@ uint64_t ExecPageCache::ReclaimIdleStep(uint32_t maximumScan) {
     }
     return removed;
 }
-uint64_t ExecPageCache::TrimIdle() { return Trim(false); }
+uint64_t ExecPageCache::TrimIdle() {
+    { const uint64_t irq=IrqSpinLockAcquire(&lock_);++stats_.fullTrims;IrqSpinLockRelease(&lock_,irq); }
+    return Trim(false);
+}
 uint64_t ExecPageCache::Clear() { return Trim(true); }
 ExecPageCacheStats ExecPageCache::Stats() {
     const uint64_t irq=IrqSpinLockAcquire(&lock_);
@@ -96,6 +124,9 @@ ExecPageCache cache(entries,262144,131072);
 }
 PhysicalAddress ExecPageCacheAdopt(PhysicalAddress candidate) { return cache.Adopt(candidate); }
 uint64_t ExecPageCacheTrimIdle() { return cache.TrimIdle(); }
+uint64_t ExecPageCacheTrimAfterRelease(uint64_t freePages) {
+    return ExecPageCacheExitTrimFull(freePages)?cache.TrimIdle():cache.TrimStep(ExecPageCacheExitTrimSlots);
+}
 uint64_t ExecPageCacheReclaimIdleStep(uint32_t maximumScan) {return cache.ReclaimIdleStep(maximumScan);}
 ExecPageCacheStats ExecPageCacheGetStats() { return cache.Stats(); }
 #ifdef BROOK_HOST_TEST

@@ -3,6 +3,7 @@
 #include "serial.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_vcs_user.h"
+#include "intel_bdw_video.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_publish.h"
@@ -542,6 +543,13 @@ BdwPrepareOutcome BdwPrepareVcsUserJob(BdwExecSnapshot* snapshot,uint32_t nonce,
     if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
         return refuse("address space needs more than 512 page tables");
     vcsUserSnapshot=snapshot;
+#ifdef BROOK_BDW_COHERENT_RENDER
+    // Phase 4: ordinary job buffers go through the leased WB LLC PAT slot
+    // without CPU cache flushes, as on the RCS coherent-render path; the ring
+    // invalidates before the batch and flushes before the breadcrumb.
+    if((BdwVideoUserTuning()&BdwVcsTuneCoherent) && !BdwExecSnapshotUseCoherentRender(snapshot))
+        return refuse("coherent policy");
+#endif
     if(!vcsUserTables.Prepare(retainedAllocator,snapshot)){
         if(vcsUserTables.Quarantined()){reason="table page allocation returned an unsafe page";return BdwPrepareOutcome::Uncertain;}
         return refuse("page table allocation failed");
@@ -587,12 +595,13 @@ bool BdwRunPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink
     // Recheck the table pages' geometry and flush them under the device lease.
     if(!vcsUserTables.AdmitAndPublish(sink))return false;
     result.attempted=true;
+    result.stamps[BdwVcsStampExecute]=__builtin_ia32_rdtsc();
     if(!vcsUserImage.ExecuteTakenOverWithBackend(retainedAllocator,backend,scratchDma))return false;
     result.copyComplete=true;
     while(backend.retirementContinue()){
         const auto status=vcsUserImage.PollContextSwitch(backend);
         if(status==BdwCsbPoll::Fault)return false;
-        if(status==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
+        if(status==BdwCsbPoll::Complete){result.contextComplete=true;result.stamps[BdwVcsStampCsb]=__builtin_ia32_rdtsc();return true;}
     }
     return false;
 }
@@ -1631,16 +1640,30 @@ bool BdwRunRetainedRender(BdwRenderExecutionBackend& backend,uint64_t scratchDma
     // section. An attempted transaction retains every page until recovery.
     if(!__atomic_load_n(&retainedRenderScratchPinned,__ATOMIC_ACQUIRE) || !retainedRenderScratchValid ||
        retainedRenderScratchAmbiguous || scratchDma!=retainedRenderScratch.dma ||
-       !BdwGlobalGgttSpace().owns(retainedRenderReservation))return false;
+       !BdwGlobalGgttSpace().owns(retainedRenderReservation)){result.runFailSite=1;return false;}
     result.attempted=true;
-    if(!retainedRender.ExecuteTakenOver(retainedRenderAllocator,backend,scratchDma))return false;
+    if(!retainedRender.ExecuteTakenOver(retainedRenderAllocator,backend,scratchDma)){
+        result.runFailSite=2;result.submitSite=retainedRender.LastSubmitSite();result.completionNonce=retainedRender.Nonce();
+        backend.completionDiag(result.completionSeen,result.completionPolls);return false;}
     result.breadcrumb=true;
     while(backend.retirementContinue()){
         const auto state=retainedRender.PollContextSwitch(backend);
-        if(state==BdwCsbPoll::Fault)return false;
+        if(state==BdwCsbPoll::Fault){
+            const auto d=retainedRender.LastCsbDiag();
+            result.runFailSite=3;result.csbSite=d.site;result.csbTail=d.tail;result.csbHead=d.head;
+            result.csbEvents=d.events;result.csbEvent=d.event;return false;
+        }
         if(state==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
     }
-    return false;
+    result.runFailSite=4;return false;
+}
+// After a failed attempted run whose RCS reset was verified: the one-shot is
+// in a state RetireAfterReset accepts (submitted, polled or quarantined by a
+// status fault), so its GGTT binding can be retired like a completed run.
+bool BdwRetainedRenderRetirableAfterFailedRun(){
+    const auto st=retainedRender.State();
+    return st==BdwOneShotState::CompleteRetained || st==BdwOneShotState::ContextCompleteRetained ||
+        st==BdwOneShotState::Quarantined;
 }
 bool BdwCopyRetainedRenderContext(BdwRenderExecutionBackend& backend,uint32_t (&out)[20*1024]) {
     return __atomic_load_n(&retainedRenderScratchPinned,__ATOMIC_ACQUIRE) &&

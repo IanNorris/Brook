@@ -523,6 +523,17 @@ static long reserve_output(int output,uint64_t baseline,const struct PipelineBas
  * again later) and -1 for a safe retry. quiescent: no other frame is in
  * flight, so the displayed frame is the baseline for change tracking.
  * pipe (pipelined admission only): the baseline to compare with instead. */
+/* A layered offer occupies several scene slots; it is still sampled when
+ * any of them is used. */
+static int desktop_offer_slot_used(struct DesktopGpuOffer *const *offers,const uint8_t *used,unsigned count,const struct DesktopGpuOffer *o){
+    for(unsigned i=0;i<count;++i)if(offers[i]==o && used[i])return 1;
+    return 0;
+}
+/* used[], with every slot of a layered offer marked used when any is. */
+static const uint8_t *desktop_offer_used_merge(struct DesktopGpuOffer *const *offers,const uint8_t *used,unsigned count,uint8_t *out){
+    for(unsigned i=0;i<count;++i)out[i]=used[i] || (offers[i] && desktop_offer_slot_used(offers,used,count,offers[i]));
+    return out;
+}
 static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint64_t *presentedNs,struct PendingDesktopFrame *pending,
                         int asyncPartial,uint64_t baselineTicket,int quiescent,const struct PipelineBase *pipe){
     const struct DesktopTrackState *trackBase=pipe?pipe->track:g_trackDisplayed;
@@ -540,7 +551,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct BrookDesktopLayers backdrop={.version=BROOK_DESKTOP_LAYERS_VERSION};
     struct BrookVkExternalSource sources[BROOK_VK_MAX_LAYERS];
     uint8_t directSource[BROOK_VK_MAX_LAYERS]={0};
-    struct DesktopGpuOffer *directOffer[BROOK_VK_MAX_LAYERS]={0};
+    struct DesktopGpuOffer *directOffer[BROOK_VK_MAX_LAYERS]={0};uint8_t mergedUsed[BROOK_VK_MAX_LAYERS]={0};
     struct DesktopGpuOffer *preselected[BROOK_DESKTOP_LAYER_LIMIT]={0};uint32_t skipMask=0,keepMask=0,keptMask=0;
     struct AsyncWindowSource frameSources[BROOK_DESKTOP_LAYER_LIMIT]={{0}};
     unsigned clientSourceIndex[BROOK_DESKTOP_LAYER_LIMIT]={0};
@@ -646,10 +657,22 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         clientSourceIndex[i]=count;
         if(direct){
             if(!traceWindow){traceReceived=direct->receivedNs;traceWindow=l->window;traceIncarnation=l->incarnation;traceCommit=direct->packet.identity.commit;}
-            if(count>=BROOK_VK_MAX_LAYERS)goto done;
-            sources[count]=(struct BrookVkExternalSource){direct->buffer,(size_t)direct->packet.words,direct->fence};
-            directSource[count]=1;directOffer[count]=direct;
-            memcpy(scene+BROOK_VK_SCENE_HEADER+count*BROOK_VK_LAYER_WORDS,&content,sizeof(content));++count;
+            const unsigned parts=desktop_gpu_offer_layer_count(direct);
+            if(count+parts>BROOK_VK_MAX_LAYERS)goto done;
+            for(unsigned k=0;k<parts;++k){
+                struct BrookVkSceneLayer part=content;
+                if(direct->layers)desktop_gpu_offer_scene_layer(direct,l,width,height,k,&part);
+                const size_t words=direct->layers?(size_t)direct->layer[k].words:(size_t)direct->packet.words;
+                sources[count]=(struct BrookVkExternalSource){desktop_gpu_offer_buffer(direct,k),words,desktop_gpu_offer_fence(direct,k)};
+                directSource[count]=1;directOffer[count]=direct;
+                memcpy(scene+BROOK_VK_SCENE_HEADER+count*BROOK_VK_LAYER_WORDS,&part,sizeof(part));++count;
+            }
+            if(direct->layers){
+                /* Damage tracking sees the window's client rectangle. */
+                content.x=(int32_t)l->clientX;content.y=(int32_t)l->clientY;
+                content.width=l->width<l->clientWidth?l->width:l->clientWidth;
+                content.height=l->height<l->clientHeight?l->height:l->clientHeight;
+            }
         }else if(push(scene,&count,sources,&client[i],&content))goto done;
         clientBytes+=client[i].size;
         struct DesktopTrackWindow *trackWindow=&track->windows[i];
@@ -867,7 +890,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         struct QuadPlan *plan=ctx->plan;
         stage="quad_plan";
         if(quad_plan_build_auto(scene,words,holes,&drawDamage,g_quadOcclusion,plan) &&
-           async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,plan->used,count)){
+           async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,desktop_offer_used_merge(directOffer,plan->used,count,mergedUsed),count)){
             stage="quad_reserve";
             ticket=reserve_output(ctx->output,qpartial?baselineTicket:0,pipe,&rebased);
             if(ticket<=0)goto done;
@@ -894,7 +917,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 /* Only content actually sampled advances commit barriers;
                  * release culled (for example occluded) direct offers. */
                 for(unsigned i=0;i<count;++i){frameDirect+=directSource[i] && plan->used[i];
-                    if(!directOffer[i] || plan->used[i])continue;
+                    if(!directOffer[i] || plan->used[i] || desktop_offer_slot_used(directOffer,plan->used,count,directOffer[i]))continue;
                     const struct BrookGpuWindowIdentity *id=&directOffer[i]->packet.identity;
                     for(unsigned j=0;j<layers.count;++j)if(frameSources[j].window==id->window &&
                         frameSources[j].incarnation==id->incarnation && frameSources[j].commit==id->commit)frameSources[j].commit=0;
@@ -955,8 +978,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             used[selected[i]]=1;frameDirect+=directSource[selected[i]];}
         // A partial frame must only advance commit barriers for content that
         // was actually sampled by at least one submitted tile.
-        if(!async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,used,count))goto done;
-        for(unsigned i=0;i<count;++i)if(directOffer[i] && !used[i]){
+        if(!async_sources_mark_omitted(frameSources,layers.count,clientSourceIndex,desktop_offer_used_merge(directOffer,used,count,mergedUsed),count))goto done;
+        for(unsigned i=0;i<count;++i)if(directOffer[i] && !used[i] && !desktop_offer_slot_used(directOffer,used,count,directOffer[i])){
             const struct BrookGpuWindowIdentity *id=&directOffer[i]->packet.identity;
             if(getenv("BROOK_RENDER_TRACE_OCCLUSION"))fprintf(stderr,"DESKTOP_RENDERER_CULLED_DIRECT window=%u incarnation=%llu commit=%llu\n",
                 id->window,(unsigned long long)id->incarnation,(unsigned long long)id->commit);
@@ -1397,15 +1420,19 @@ static void stats_publish(uint64_t now){
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
-            char rows[DESKTOP_TIMELINE*120+64];size_t used=0;
+            char rows[DESKTOP_TIMELINE*120+640];size_t used=0;
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
             const uint64_t first=g_timelineCount>DESKTOP_TIMELINE?g_timelineCount-DESKTOP_TIMELINE:0;
-            for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-128;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
+            for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-640;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
                 used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s[%llu,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu]",k>first?",":"",
                     (unsigned long long)(t->start/1000),(unsigned long long)(t->submit/1000),(unsigned long long)(t->fence/1000),
                     (unsigned long long)(t->presentCall/1000),(unsigned long long)(t->presented/1000),t->image,t->partial,
                     (unsigned long long)t->drawPixels,(unsigned long long)t->commit);}
-            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"]}\n");
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"],\"gpu_select\":{");
+            for(unsigned r=0;r<DESKTOP_GPU_SELECT_REASONS;++r)
+                used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",desktop_gpu_select_names[r],
+                    (unsigned long long)g_desktopGpuSelect[r]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}\n");
             /* replace the final "}\n" of the spliced block with the timeline */
             if(length>=2 && g_statsJson[length-2]=='}' && length-2+used<sizeof(g_statsJson)){
                 memcpy(g_statsJson+length-2,rows,used);length=length-2+used;}

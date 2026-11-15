@@ -5133,6 +5133,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
+            "  input touchpad synaptics on|off|status | natural on|off | speed N | probe - Synaptics two-finger scroll touchpad (probe: raw query replies)\n"
             "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
@@ -5163,6 +5164,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched runtime history on|off|reset|status|cpu N - bounded clamp/owner history\n"
             "  sched kvm status - advertised PV features and independent preemption hints\n"
             "  sched lock-trace on|off|reset|status - ready-lock ticket and clock observations\n"
+            "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -5931,6 +5933,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     else if(StrStartsWith(cmd,"gpu video")) {
         // VA-API phase 1: VCS0 (video engine) bring-up. Build option
         // BROOK_BDW_VIDEO_ENGINE plus this runtime gate (boot default off).
+        // Phase 4 tuning of VCS user jobs: `gpu video tune resets min|full`,
+        // `gpu video tune coherent on|off` (read by the worker per job).
+        {struct {const char* c;uint32_t bit;bool on;} knobs[]={
+             {"gpu video tune resets min",BdwVcsTuneMinimalResets,true},{"gpu video tune resets full",BdwVcsTuneMinimalResets,false},
+             {"gpu video tune coherent on",BdwVcsTuneCoherent,true},{"gpu video tune coherent off",BdwVcsTuneCoherent,false}};
+         for(const auto& k:knobs)if(NetStrEq(cmd,k.c)){
+             if(k.on)__atomic_or_fetch(&BdwVideoUserTuningStorage(),k.bit,__ATOMIC_ACQ_REL);
+             else __atomic_and_fetch(&BdwVideoUserTuningStorage(),~k.bit,__ATOMIC_ACQ_REL);
+             BridgeReply r;r.text("{");r.field("tune",BdwVideoUserTuning());r.text("}\n");r.send();return;}}
         const bool on=NetStrEq(cmd,"gpu video on"),off=NetStrEq(cmd,"gpu video off");
         const bool probe=NetStrEq(cmd,"gpu video probe"),reset=NetStrEq(cmd,"gpu video reset");
         const bool selftest=NetStrEq(cmd,"gpu video selftest"),status=NetStrEq(cmd,"gpu video status");
@@ -5970,7 +5981,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
              r.text(",");r.field("refused",c.refused);r.text(",");r.field("failed",c.failed);
              r.text(",");r.field("retries",c.retries);r.text(",");r.field("last_us",c.lastUs);r.text(",");r.field("max_us",c.maxUs);
              r.text(",\"quarantined\":");r.text(c.quarantined?"true":"false");
-             r.text(",\"quarantine_detail\":\"");r.text(c.detail);r.text("\"}");}
+             r.text(",\"quarantine_detail\":\"");r.text(c.detail);r.text("\"");
+             r.text(",");r.field("tune",BdwVideoUserTuning());r.text(",");r.field("timed",c.timed);
+             r.text(",");r.field("prep_us",c.prepUs);r.text(",");r.field("run_us",c.runUs);r.text(",");r.field("release_us",c.releaseUs);
+             r.text(",");r.field("reset_before_us",c.resetBeforeUs);r.text(",");r.field("pat_us",c.patUs);
+             r.text(",");r.field("init_us",c.initUs);r.text(",");r.field("decode_us",c.decodeUs);r.text(",");r.field("csb_us",c.csbUs);
+             r.text(",");r.field("tail_us",c.tailUs);r.text(",");r.field("max_run_us",c.maxRunUs);
+             r.text(",");r.field("skipped_resets_before",c.skippedResetsBefore);r.text(",");r.field("skipped_resets_after",c.skippedResetsAfter);
+             r.text(",");r.field("span_ms",c.lastJobNs>c.firstJobNs?(c.lastJobNs-c.firstJobNs)/1000000:0);r.text("}");}
             r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
             r.text(",");r.field("retries",g.retries());
             r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");
@@ -6047,6 +6065,48 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("refusal_step",st.refusalStep);r.text(",");r.field("adapter_refusal",fw.refusal);
             r.text(",\"wake_released\":");r.text(fw.sequence.released?"true":"false");r.text("}");}
         r.text(",\"scope\":\"VCS0 video engine phase 1: probe = read-only double sample via the shared forcewake observation; reset = GEN6_GRDOM_MEDIA domain reset of an idle, unowned VCS (IdleTakeover; uncertain outcome panics like the RCS reset test); selftest = reset VCS, init execlists, one-shot submission (PPGTT batch MI_STORE_DATA_IMM plus ring breadcrumb) with CSB retirement, reset after and unbind; failures after an engine write quarantine VCS for the boot, uncertain GT reset/PAT/forcewake state panics; user submission (I915_EXEC_BSD) not implemented; HAS_BSD stays 0\"}\n");
+        r.send();
+    }
+    else if(StrStartsWith(cmd,"input touchpad ")) {
+        // Synaptics touchpad: absolute mode with two-finger scroll (boot default
+        // on when detected), or plain relative PS/2.
+        if(NetStrEq(cmd,"input touchpad synaptics on"))MouseTouchpadSet(true);
+        else if(NetStrEq(cmd,"input touchpad synaptics off"))MouseTouchpadSet(false);
+        else if(NetStrEq(cmd,"input touchpad natural on"))MouseTouchpadSetNatural(true);
+        else if(NetStrEq(cmd,"input touchpad natural off"))MouseTouchpadSetNatural(false);
+        else if(NetStrEq(cmd,"input touchpad probe"))MouseTouchpadProbe();
+        else if(StrStartsWith(cmd,"input touchpad speed ")){
+            const char* v=cmd+21;uint32_t n=0,d=0;while(*v>='0'&&*v<='9'&&d<4){n=n*10+uint32_t(*v++-'0');++d;}
+            if(!d||*v||!MouseTouchpadSetSpeed(n)){DebugChannelSend("{\"error\":\"usage: input touchpad speed <25-300>\"}\n");return;}}
+        else if(!NetStrEq(cmd,"input touchpad status") && !NetStrEq(cmd,"input touchpad synaptics status")){
+            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | speed <25-300> | probe\"}\n");return;}
+        const auto st=MouseTouchpadGetStatus();
+        BridgeReply r;
+        r.text("{\"wanted\":");r.text(st.wanted?"true":"false");
+        r.text(",\"active\":");r.text(st.active?"true":"false");
+        r.text(",\"reason\":\"");r.text(st.reason?st.reason:"");r.text("\"");
+        r.text(",\"identified\":");r.text(st.identified?"true":"false");
+        r.text(",");r.field("major",st.major);r.text(",");r.field("minor",st.minor);r.text(",");r.field("model",st.model);
+        r.text(",");r.field("caps",st.caps);r.text(",");r.field("ext",st.ext);r.text(",");r.field("ext0c",st.ext0c);
+        r.text(",\"clickpad\":");r.text(st.clickpad?"true":"false");
+        r.text(",");r.field("mode",st.mode);r.text(",");r.field("mode_readback",st.modeReadback);
+        r.text(",");r.field("packet_len",st.packetLen);r.text(",");r.field("relative_id",st.relativeId);
+        r.text(",");r.field("packets",st.packets);r.text(",");r.field("resyncs",st.resyncs);
+        r.text(",");r.field("scroll_ticks",st.scrollTicks);
+        r.text(",\"fingers\":[");for(int i=0;i<4;++i){if(i)r.text(",");r.number(st.fingers[i]);}r.text("]");
+        r.text(",\"natural\":");r.text(st.natural?"true":"false");
+        r.text(",\"agm\":");r.text(st.agm?"true":"false");
+        r.text(",");r.field("speed",st.speed);
+        r.text(",");r.field("scroll_ticks_low_z",st.scrollLowZ);
+        r.text(",");r.field("scroll_rejected",st.scrollRejected);
+        r.text(",");r.field("gesture_resets",st.gestureResets);
+        {static const char* const names[5]={"identify","caps","ext09","ext0c","modes"};
+         r.text(",\"raw\":{");bool first=true;
+         for(int i=0;i<5;++i){if(!(st.rawValid&(1u<<i)))continue;if(!first)r.text(",");first=false;
+          r.text("\"");r.text(names[i]);r.text("\":[");
+          for(int j=0;j<3;++j){if(j)r.text(",");r.number(st.raw[i][j]);}r.text("]");}
+         r.text("}");}
+        r.text(",\"scope\":\"fingers = packets seen with 0,1,2,3+ fingers; resyncs = bytes failing Synaptics packet sync; off renegotiates relative IntelliMouse PS/2\"}\n");
         r.send();
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
@@ -6207,6 +6267,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("sequence",z.sequence);r.text(",");r.field("setup_us",z.setupUs);
         r.text(",");r.field("gop_returns",z.gopReturns);
         r.text(",\"uncached_render\":");r.text(z.uncachedRender?"true":"false");
+        r.text(",\"auto_arm\":");r.text(BdwZeroCopyAutoArm()?"true":"false");
         r.text(",\"cache_mode\":");r.quoted(BdwZeroCopyCacheModeName());
         r.text(",");r.field("render_jobs_uc",z.renderJobsUc);r.text(",");r.field("render_jobs_wb",z.renderJobsWb);
         r.text(",\"surfaces\":[");for(unsigned i=0;i<BdwZeroCopyMaxImages;++i){if(i)r.text(",");r.number(z.surfaces[i]);}
@@ -6710,7 +6771,33 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("admissions",stats.admissions);
         r.text(",");r.field("full",stats.full);
         r.text(",");r.field("collisions",stats.collisions);
-        r.text(",");r.field("trimmed",stats.trimmed);r.text("}\n");r.send();
+        r.text(",");r.field("trimmed",stats.trimmed);
+        r.text(",");r.field("full_trims",stats.fullTrims);
+        r.text(",");r.field("step_trims",stats.stepTrims);
+        r.text(",");r.field("slots_scanned",stats.slotsScanned);r.text("}\n");r.send();
+    }
+    else if (NetStrEq(cmd, "mem cleanup status")) {
+        // Process-exit cleanup costs: exec page cache release trims (bounded
+        // steps vs full sweeps, slots visited) and the PMM quarantine drainer
+        // (all-CPU TLB barriers, frames per barrier, deferred small batches).
+        const auto e=ExecPageCacheGetStats();
+        const auto d=PmmReadDrainStats();
+        const uint64_t now=ApicTickCount();
+        BridgeReply r;r.text("{");r.field("tick_ms",now);
+        r.text(",\"exec_cache\":{");r.field("entries",e.entries);
+        r.text(",");r.field("full_trims",e.fullTrims);
+        r.text(",");r.field("step_trims",e.stepTrims);
+        r.text(",");r.field("slots_scanned",e.slotsScanned);
+        r.text(",");r.field("trimmed",e.trimmed);
+        r.text(",");r.field("step_slots",ExecPageCacheExitTrimSlots);
+        r.text("},\"pmm_drain\":{");r.field("barriers",d.barriers);
+        r.text(",");r.field("frames_released",d.framesReleased);
+        r.text(",");r.field("virtual_batches",d.virtualBatches);
+        r.text(",");r.field("deferred",d.deferred);
+        r.text(",");r.field("max_batch",d.maxBatch);
+        r.text(",");r.field("min_batch",PmmDrainMinBatch);
+        r.text("},\"scope\":\"cumulative since boot; diff two reads over a known interval for rates (tick_ms is ms). barriers = all-CPU TLB flush barriers by pmm_drain; frames_released/barriers = pages per barrier; deferred = small batches left for the next nap\"}\n");
+        r.send();
     }
     else if (NetStrEq(cmd, "mem vmalloc")) {
         const auto d=VmmArenaReadStatistics();

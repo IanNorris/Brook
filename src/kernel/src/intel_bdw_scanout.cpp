@@ -439,6 +439,10 @@ void BdwVideoUserCountsRead(BdwVcsUserCounts& out){
     out.refused=__atomic_load_n(&vcsUserCounts.refused,__ATOMIC_RELAXED);out.failed=__atomic_load_n(&vcsUserCounts.failed,__ATOMIC_RELAXED);
     out.retries=__atomic_load_n(&vcsUserCounts.retries,__ATOMIC_RELAXED);out.lastUs=__atomic_load_n(&vcsUserCounts.lastUs,__ATOMIC_RELAXED);
     out.maxUs=__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED);
+    {const auto& c=vcsUserCounts;out.timed=c.timed;out.prepUs=c.prepUs;out.runUs=c.runUs;out.releaseUs=c.releaseUs;
+     out.resetBeforeUs=c.resetBeforeUs;out.patUs=c.patUs;out.initUs=c.initUs;out.decodeUs=c.decodeUs;out.csbUs=c.csbUs;
+     out.tailUs=c.tailUs;out.maxRunUs=c.maxRunUs;out.skippedResetsBefore=c.skippedResetsBefore;
+     out.skippedResetsAfter=c.skippedResetsAfter;out.firstJobNs=c.firstJobNs;out.lastJobNs=c.lastJobNs;}
     out.quarantined=__atomic_load_n(&vcsUserQuarantined,__ATOMIC_ACQUIRE)!=0;out.detail=vcsUserQuarantineDetail;
 }
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal){
@@ -770,6 +774,7 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
         // state: refuse this job and every later one.
         VcsUserQuarantine("prepare-uncertain");return refuse(reason?reason:"prepare");
     }
+    const uint64_t preparedNs=TscClockReadNs();
     BdwForcewakeAdapterResult out{};BdwBcsRunResult run{};
     BdwVcsUserClass result=BdwVcsUserClass::RefusedUntouched;
     unsigned attempt=0;
@@ -781,7 +786,8 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
         SchedulerSleepMs(1);
     }
     if(attempt>1)__atomic_add_fetch(&vcsUserCounts.retries,attempt-1,__ATOMIC_RELAXED);
-    const uint64_t us=(TscClockReadNs()-startNs)/1000;
+    const uint64_t ranNs=TscClockReadNs();
+    const uint64_t us=(ranNs-startNs)/1000;
     __atomic_store_n(&vcsUserCounts.lastUs,us,__ATOMIC_RELAXED);
     if(us>__atomic_load_n(&vcsUserCounts.maxUs,__ATOMIC_RELAXED))__atomic_store_n(&vcsUserCounts.maxUs,us,__ATOMIC_RELAXED);
     switch(result){
@@ -823,6 +829,22 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
         VcsUserQuarantine("release-after-completion");
     }
     __atomic_add_fetch(&vcsUserCounts.completed,1,__ATOMIC_RELAXED);
+    {   // Phase 4 timing of this completed job (single CPU0 writer).
+        const uint64_t doneNs=TscClockReadNs();
+        auto d=[&](unsigned a,unsigned b)->uint64_t{const uint64_t x=run.stamps[a],y=run.stamps[b];
+            return x && y>x?(y-x)*1000/tsc.khz:0;};
+        auto& c=vcsUserCounts;
+        const uint64_t runUs=(ranNs-preparedNs)/1000;
+        ++c.timed;c.prepUs+=(preparedNs-startNs)/1000;c.runUs+=runUs;c.releaseUs+=(doneNs-ranNs)/1000;
+        if(runUs>c.maxRunUs)c.maxRunUs=runUs;
+        c.resetBeforeUs+=d(BdwVcsStampWorkStart,BdwVcsStampResetBefore);c.patUs+=d(BdwVcsStampResetBefore,BdwVcsStampPat);
+        c.initUs+=d(BdwVcsStampInitStart,BdwVcsStampInitEnd);c.decodeUs+=d(BdwVcsStampWaitStart,BdwVcsStampBreadcrumb);
+        c.csbUs+=d(BdwVcsStampBreadcrumb,BdwVcsStampCsb);c.tailUs+=d(BdwVcsStampCsb,BdwVcsStampWorkEnd);
+        if(!run.resetBeforeAttempted)++c.skippedResetsBefore;
+        if(run.resetAfterSkipped)++c.skippedResetsAfter;
+        if(!c.firstJobNs)c.firstJobNs=startNs;
+        c.lastJobNs=doneNs;
+    }
     return {true,true};
 }
 #endif
@@ -1357,8 +1379,46 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
         LiveGpuMatches(entry) && PowerD0(entry.device);
     if(ok && run.completionEndTicks>run.completionStartTicks)
         completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
+    // gen 400: the job ran but its completion was not observed cleanly (for
+    // example an unexpected context-status event). If the engine reset was
+    // verified, this run's GGTT binding retired and PAT restored, nothing on
+    // the device is uncertain: retire the job as failed (fence error, its
+    // buffers marked failed, its context lost) instead of panicking.
+    BdwRenderFailureView failure{};
+    failure.ok=ok;failure.retiredAfterFailedRun=run.retiredAfterFailedRun;failure.resetComplete=t.resetComplete;
+    failure.patRestored=t.patRestored;failure.uncertain=t.uncertain;failure.ggttCleared=run.ggttCleared;
+    failure.pollYieldFailed=run.pollYieldFailed;failure.clearDelivered=out.clearDelivered;failure.released=out.sequence.released;
+    failure.liveGpu=!ok && LiveGpuMatches(entry) && PowerD0(entry.device);
+    const bool recoveredFailure=BdwRenderFailureRecoverable(failure);
+    if(recoveredFailure){
+        static uint32_t recovered=0;const uint32_t n=++recovered;
+        // hw_logs keeps 160 columns per line: split the record.
+        if(n<=16 || !(n&(n-1))){
+            KPrintf("gpu-submit: job failed after verified reset pid=%u ctx=%u objects=%u pages=%u site=%u submit=%u count=%u\n",
+                originPid,originContext,BdwExecSnapshotObjectCount(snapshot),BdwExecSnapshotPageCount(snapshot),
+                unsigned(run.runFailSite),unsigned(run.submitSite),n);
+            KPrintf("gpu-submit:  csb site=%u events=%u tail=%u head=%u event=%lx breadcrumb=%u ctx_complete=%u\n",
+                unsigned(run.csbSite),unsigned(run.csbEvents),unsigned(run.csbTail),unsigned(run.csbHead),run.csbEvent,
+                unsigned(run.breadcrumb),unsigned(run.contextComplete));
+            KPrintf("gpu-submit:  ring head=%x tail=%x acthd=%x elsp=%x eir=%x esr=%x ipehr=%x seen=%x want=%x polls=%u\n",
+                run.head,run.tail,run.acthd,run.execlist,run.eir,run.esr,run.ipehr,run.completionSeen,run.completionNonce,run.completionPolls);
+        }
+        // Keep the blast radius to what this job wrote; clients' sampled
+        // buffers stay usable (gen 401: Chromium died as collateral).
+        (void)BdwExecSnapshotScopeFailureToWritten(snapshot);
+        if(!BdwRetireRetainedSubmission(snapshot)){kfree(memory);PanicWorkerStage("retire after failed run",snapshot);}
+        kfree(memory);
+        if(owner){BdwGpuContextFinish(owner,nullptr,false);guard.active=false;} // marks the context lost
+        return {false,true,false};
+    }
     const auto sample=BdwExecSnapshotBatchSample(snapshot);
     if(!ok){CaptureWorkerObjects(snapshot);const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);
+        KPrintf("gpu-submit: render run failed site=%u submit=%u csb=%u/%u/%u/%u event=%lx breadcrumb=%u ctx_complete=%u\n",
+            unsigned(run.runFailSite),unsigned(run.submitSite),unsigned(run.csbSite),unsigned(run.csbEvents),unsigned(run.csbTail),unsigned(run.csbHead),run.csbEvent,
+            unsigned(run.breadcrumb),unsigned(run.contextComplete));
+        KPrintf("gpu-submit:  saved=%u run=%u ggtt_cleared=%u retired_after_failure=%u uncertain=%u eir=%x esr=%x seen=%x want=%x\n",
+            unsigned(t.contextSaved),unsigned(t.runComplete),unsigned(run.ggttCleared),
+            unsigned(run.retiredAfterFailedRun),unsigned(t.uncertain),run.eir,run.esr,run.completionSeen,run.completionNonce);
         KPrintf("gpu-submit: render run failed class=%u reason=%s fw_refusal=%u/%u requested=%u acquired=%u idle=%u quiescent=%u/%u released=%u clear=%u work=%u/%u entry=%u/%u gt_writes=%u\n",
             unsigned(attemptClass),BdwRenderAttemptReason(attemptView),unsigned(out.refusal),unsigned(out.refusalDetail),
             unsigned(out.sequence.requested),unsigned(out.sequence.acquired),unsigned(out.sequence.idle),
@@ -1784,6 +1844,11 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         // M4a prompt wakeups stay off unless explicitly opted in at boot or
         // enabled later with `gpu wakeups on`.
         if(OptedIn("/etc/dell-gpu-prompt-wake"))BdwPromptWakeSet(true);
+        // Zero-copy scanout (wt) auto-arm when the renderer registers its
+        // ring. Opt-in for now (/etc/dell-zero-copy-auto) until the gen 401
+        // compositor failure after a live arm is understood; flip the
+        // default by inverting this test.
+        BdwZeroCopySetAutoArm(OptedIn("/etc/dell-zero-copy-auto"));
 #endif
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");

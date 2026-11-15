@@ -16,6 +16,8 @@
 #include "kprintf.h"
 #include "portio.h"
 #include "irq_wrapper.h"
+#include "keyboard.h"
+#include "synaptics_touchpad.h"
 
 namespace brook {
 uint32_t WmGetAppliedScale();
@@ -56,6 +58,45 @@ static void CtrlCmd(uint8_t cmd)
     outb(0x64, cmd);
 }
 
+
+// Checked variants used for Synaptics negotiation: a missing ACK or reply is
+// reported instead of silently consuming whatever byte comes next.
+static bool AuxRead(uint8_t& out)
+{
+    for (int i = 0; i < 200000; i++)
+        if (inb(0x64) & 0x01) { out = inb(0x60); return true; }
+    return false;
+}
+static bool AuxCommand(uint8_t cmd)
+{
+    WaitWrite();
+    outb(0x64, 0xD4);
+    WaitWrite();
+    outb(0x60, cmd);
+    uint8_t ack = 0;
+    return AuxRead(ack) && ack == 0xFA;
+}
+// Synaptics "special" command: E6 then four E8 carrying the argument 2 bits at a time.
+static bool SynSpecial(uint8_t arg)
+{
+    uint8_t slice[4];
+    SynapticsSlice(arg, slice);
+    if (!AuxCommand(0xE6)) return false;
+    for (int i = 0; i < 4; i++)
+        if (!AuxCommand(0xE8) || !AuxCommand(slice[i])) return false;
+    return true;
+}
+static bool SynQuery(uint8_t query, uint8_t r[3])
+{
+    if (!SynSpecial(query) || !AuxCommand(0xE9)) return false;
+    for (int i = 0; i < 3; i++) if (!AuxRead(r[i])) return false;
+    return true;
+}
+static bool SynSetMode(uint8_t mode)
+{
+    return SynSpecial(mode) && AuxCommand(0xF3) && AuxCommand(0x14);
+}
+
 // ---------------------------------------------------------------------------
 // Mouse state
 // ---------------------------------------------------------------------------
@@ -73,13 +114,97 @@ static bool              g_mouseInit = false;
 static uint8_t           g_mouseId   = 0;   // 0=3-byte legacy, 3=IntelliMouse wheel, 4=Explorer (5 btn + H wheel)
 static uint8_t           g_packetLen = 3;
 
+// Synaptics absolute mode (6-byte packets). g_synWanted is the runtime switch
+// (boot default on); g_synActive is set only after detection and mode set
+// succeeded, otherwise the relative IntelliMouse path below stays in use.
+static bool                 g_synWanted = true;
+static volatile bool        g_synActive = false;
+static SynapticsIdentity    g_synId;
+static SynapticsCaps        g_synCaps;
+static uint8_t              g_synMode = 0;
+static uint8_t              g_synModeReadback = 0;
+static bool                 g_synAgm = false;
+// Raw 3-byte replies: identify, capabilities, ext 0x09, ext 0x0c, modes; bit i of g_synRawValid set when reply i was read.
+static uint8_t              g_synRaw[5][3];
+static uint8_t              g_synRawValid = 0;
+static const char*          g_synReason = "not attempted";
+static SynapticsGesture     g_synGesture;
+static volatile uint32_t    g_synPackets = 0, g_synResyncs = 0, g_synScrollTicks = 0;
+
 // 4-byte packet assembly for IntelliMouse modes.
-static uint8_t  g_packetBuf[4];
+static uint8_t  g_packetBuf[6];
 static uint8_t  g_packetIdx = 0;
 
 // Input device for the input subsystem
 static InputDeviceOps g_mouseOps = { "ps2_mouse", nullptr };
 static InputDevice    g_mouseInputDev = { &g_mouseOps, {}, 0, 0, nullptr };
+
+// Push motion, scroll and button events for one decoded packet.
+static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX, uint8_t buttons)
+{
+    // Only the desktop position is scaled; the event below retains raw deltas.
+    MouseMoveRelative(dx, dyDown);
+    g_prevButtons = g_buttons;
+    g_buttons = buttons;
+    if (dx != 0 || dyDown != 0)
+    {
+        InputEvent ev{};
+        ev.type     = InputEventType::MouseRelativeMove;
+        ev.scanCode = g_buttons;
+        ev.deltaX = dx;
+        ev.deltaY = dyDown;
+        InputDevicePush(&g_mouseInputDev, ev);
+    }
+    if (wheelY != 0 || wheelX != 0)
+    {
+        InputEvent ev{};
+        ev.type     = InputEventType::MouseScroll;
+        ev.scanCode = static_cast<uint8_t>(wheelY); // int8 dy (up positive)
+        ev.ascii    = static_cast<char>(wheelX);    // int8 dx (right positive)
+        ev.modifiers = g_buttons;
+        InputDevicePush(&g_mouseInputDev, ev);
+    }
+    uint8_t changed = g_buttons ^ g_prevButtons;
+    for (uint8_t bit = 0; bit < 5; bit++)
+    {
+        if (changed & (1 << bit))
+        {
+            InputEvent ev{};
+            ev.type     = (g_buttons & (1 << bit)) ? InputEventType::MouseButtonDown
+                                                   : InputEventType::MouseButtonUp;
+            ev.scanCode = bit;
+            ev.modifiers = g_buttons;
+            InputDevicePush(&g_mouseInputDev, ev);
+        }
+    }
+    CompositorWake();
+    InputWakeWaiters();
+}
+
+static int8_t ClampTicks(int32_t v) { return static_cast<int8_t>(v > 127 ? 127 : v < -127 ? -127 : v); }
+
+// Synaptics absolute-mode byte handler (IRQ context).
+static void SynapticsByte(uint8_t data)
+{
+    if (!SynapticsByteValid(g_packetIdx, data))
+    {
+        ++g_synResyncs;
+        // A rejected byte may be the start of the next packet. Contact state
+        // from before the loss is no longer trustworthy.
+        g_synGesture.Reset();
+        g_packetIdx = 0;
+        if (!SynapticsByteValid(0, data)) return;
+    }
+    g_packetBuf[g_packetIdx++] = data;
+    if (g_packetIdx < 6) return;
+    g_packetIdx = 0;
+    ++g_synPackets;
+    const SynapticsPacket p = SynapticsDecodePacket(g_packetBuf, g_synCaps.clickpad());
+    const SynapticsOutput o = g_synGesture.Feed(p);
+    if (o.scrollY || o.scrollX) g_synScrollTicks += uint32_t((o.scrollY < 0 ? -o.scrollY : o.scrollY) + (o.scrollX < 0 ? -o.scrollX : o.scrollX));
+    if (o.dx || o.dy || o.scrollY || o.scrollX || o.buttons != g_buttons)
+        EmitPointer(o.dx, o.dy, ClampTicks(o.scrollY), ClampTicks(o.scrollX), o.buttons);
+}
 
 // ---------------------------------------------------------------------------
 // IRQ12 interrupt handler
@@ -112,6 +237,13 @@ extern "C" void MouseIrqHandlerInner(void)
             while ((inb(0x3FD) & 0x20) == 0) {}
             outb(0x3F8, static_cast<uint8_t>(*msg++));
         }
+    }
+
+    if (g_synActive)
+    {
+        SynapticsByte(data);
+        ApicSendEoi();
+        return;
     }
 
     // Synchronise to packet boundary: status byte (byte 0) always has bit 3 set.
@@ -253,6 +385,105 @@ IRQ_NAKED_HANDLER(MouseIrqHandler, MouseIrqHandlerInner)
 
 // ---------------------------------------------------------------------------
 
+// Relative PS/2: IntelliMouse / Explorer negotiation, 100 Hz, 4 counts/mm.
+static void NegotiateRelative()
+{
+    // IntelliMouse Explorer knock sequence.  The magic sample-rate
+    // sequence enables extended PS/2 protocols:
+    //   200, 100, 80  → device ID 3 (IntelliMouse: +1 byte vertical wheel)
+    //   200, 200, 80  → device ID 4 (Explorer: +1 byte wheel + 2 buttons,
+    //                                 some firmwares encode horizontal
+    //                                 scroll in upper bits of the Z byte)
+    // We only move to the next knock if the previous one succeeded.
+    auto tryKnock = [](const uint8_t* rates) {
+        for (int i = 0; i < 3; i++) {
+            MouseCmd(0xF3);   // Set sample rate
+            MouseCmd(rates[i]);
+        }
+    };
+    auto readId = []() -> uint8_t {
+        MouseCmd(0xF2);       // Get device ID (ACK consumed)
+        WaitRead();
+        return inb(0x60);
+    };
+    static const uint8_t KNOCK_WHEEL[3]   = { 200, 100, 80 };
+    static const uint8_t KNOCK_EXPLORER[3] = { 200, 200, 80 };
+    g_mouseId = 0;
+    g_packetLen = 3;
+    tryKnock(KNOCK_WHEEL);
+    uint8_t id = readId();
+    if (id == 3)
+    {
+        g_mouseId = 3;
+        g_packetLen = 4;
+        tryKnock(KNOCK_EXPLORER);
+        uint8_t id2 = readId();
+        if (id2 == 4) g_mouseId = 4;
+    }
+    SerialPrintf("MOUSE: negotiated protocol id=%u (%u-byte packets)\n", g_mouseId, g_packetLen);
+    MouseCmd(0xF3);   // 100 samples/sec
+    MouseCmd(100);
+    MouseCmd(0xE8);   // 4 counts/mm
+    MouseCmd(0x03);
+}
+
+static bool SynRawQuery(unsigned slot, uint8_t query, uint8_t r[3])
+{
+    if (!SynQuery(query, r)) return false;
+    for (int i = 0; i < 3; ++i) g_synRaw[slot][i] = r[i];
+    g_synRawValid |= uint8_t(1u << slot);
+    return true;
+}
+
+// Identify and capability queries only (no mode change).
+static bool SynapticsQueryAll(SynapticsCaps& caps)
+{
+    uint8_t r[3];
+    g_synRawValid = 0;
+    if (!SynRawQuery(0, SynQueryIdentify, r)) { g_synReason = "identify query failed"; return false; }
+    g_synId = SynapticsDecodeIdentify(r);
+    if (!g_synId.valid) { g_synReason = "not a Synaptics pad"; return false; }
+    if (!SynRawQuery(1, SynQueryCapabilities, r)) { g_synReason = "capabilities query failed"; return false; }
+    caps = SynapticsDecodeCaps(r, g_synId);
+    g_synCaps = caps;
+    if (!caps.valid) { g_synReason = "capabilities invalid"; return false; }
+    if (caps.extRequests() >= 1 && SynRawQuery(2, SynQueryExtCap, r)) caps.ext = SynapticsWord(r);
+    if (caps.extRequests() >= 4 && SynRawQuery(3, SynQueryExtCap0C, r)) caps.ext0c = SynapticsWord(r);
+    g_synCaps = caps;
+    return true;
+}
+
+static bool SynapticsTryEnable()
+{
+    uint8_t r[3];
+    g_synModeReadback = 0;
+    SynapticsCaps caps;
+    if (!SynapticsQueryAll(caps)) return false;
+    const uint8_t mode = SynapticsModeByte(caps);
+    if (!SynSetMode(mode)) { g_synReason = "mode set failed"; (void)SynSetMode(0); return false; }
+    if (!SynRawQuery(4, SynQueryModes, r)) { g_synReason = "modes query failed"; (void)SynSetMode(0); return false; }
+    g_synModeReadback = r[2];
+    if (!(r[2] & SynModeAbsolute)) { g_synReason = "absolute mode not confirmed"; (void)SynSetMode(0); return false; }
+    g_synMode = mode;
+    // Advanced gesture mode (image-sensor pads): W=2 packets then report the
+    // second finger, used for click-drag with the moving finger. Linux
+    // synaptics_set_advanced_gesture_mode: sliced 0x03, then F3 0xC8.
+    g_synAgm = caps.agm() && SynSpecial(0x03) && AuxCommand(0xF3) && AuxCommand(0xC8);
+    g_synReason = caps.extended() ? "active" : "active (no W: two-finger scroll unavailable)";
+    SerialPrintf("MOUSE: Synaptics %u.%u model %u caps=0x%06x ext=0x%06x ext0c=0x%06x clickpad=%u agm=%u mode=0x%02x\n",
+                 g_synId.major, g_synId.minor, g_synId.model, caps.caps, caps.ext, caps.ext0c,
+                 caps.clickpad() ? 1u : 0u, g_synAgm ? 1u : 0u, mode);
+    return true;
+}
+
+static void ConfigureSynapticsPackets()
+{
+    g_mouseId = 0;
+    g_packetLen = 6;
+    g_packetIdx = 0;
+    g_synActive = true;
+}
+
 void MouseInit()
 {
     if (g_mouseInit) return;
@@ -335,51 +566,11 @@ void MouseInit()
     // Use default settings
     MouseCmd(0xF6);
 
-    // IntelliMouse Explorer knock sequence.  The magic sample-rate
-    // sequence enables extended PS/2 protocols:
-    //   200, 100, 80  → device ID 3 (IntelliMouse: +1 byte vertical wheel)
-    //   200, 200, 80  → device ID 4 (Explorer: +1 byte wheel + 2 buttons,
-    //                                 some firmwares encode horizontal
-    //                                 scroll in upper bits of the Z byte)
-    // We only move to the next knock if the previous one succeeded.
-    auto tryKnock = [](const uint8_t* rates) {
-        for (int i = 0; i < 3; i++) {
-            MouseCmd(0xF3);   // Set sample rate
-            MouseCmd(rates[i]);
-        }
-    };
-    auto readId = []() -> uint8_t {
-        MouseCmd(0xF2);       // Get device ID (ACK consumed)
-        WaitRead();
-        return inb(0x60);
-    };
-
-    static const uint8_t KNOCK_WHEEL[3]   = { 200, 100, 80 };
-    static const uint8_t KNOCK_EXPLORER[3] = { 200, 200, 80 };
-
-    tryKnock(KNOCK_WHEEL);
-    uint8_t id = readId();
-    if (id == 3)
-    {
-        g_mouseId = 3;
-        g_packetLen = 4;
-        tryKnock(KNOCK_EXPLORER);
-        uint8_t id2 = readId();
-        if (id2 == 4)
-        {
-            g_mouseId = 4;
-        }
-    }
-    SerialPrintf("MOUSE: negotiated protocol id=%u (%u-byte packets)\n",
-                 g_mouseId, g_packetLen);
-
-    // Set sample rate to 100 samples/sec
-    MouseCmd(0xF3);
-    MouseCmd(100);
-
-    // Set resolution to 4 counts/mm (highest)
-    MouseCmd(0xE8);
-    MouseCmd(0x03);
+    // Synaptics absolute mode (two-finger scroll) when the pad identifies as
+    // Synaptics; anything else, or any failed step, keeps the relative path.
+    g_synActive = false;
+    if (g_synWanted && SynapticsTryEnable()) ConfigureSynapticsPackets();
+    else NegotiateRelative();
 
     // Enable data reporting — this is critical: without it, the mouse
     // generates no data (and thus no IRQ12).
@@ -464,6 +655,109 @@ void MouseSetButtons(uint8_t buttons)
 void MouseSetAvailable(bool available)
 {
     g_mouseInit = available;
+}
+
+// Runtime switch: renegotiate the PS/2 device in absolute (Synaptics) or
+// relative mode. IRQ1 and IRQ12 are masked and local interrupts disabled so no
+// handler consumes command replies from port 0x60.
+bool MouseTouchpadSet(bool synaptics)
+{
+    if (!g_mouseInit) return false;
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
+    IoApicMaskIrq(12);
+    IoApicMaskIrq(1);
+    (void)AuxCommand(0xF5);                      // stop reporting
+    for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
+    g_synWanted = synaptics;
+    const bool wasActive = g_synActive;
+    g_synActive = false;
+    g_packetIdx = 0;
+    bool ok = true;
+    if (synaptics && SynapticsTryEnable()) ConfigureSynapticsPackets();
+    else {
+        if (synaptics) ok = false;
+        if (wasActive) (void)SynSetMode(0);       // back to relative PS/2
+        if (!synaptics) g_synReason = "disabled";
+        MouseCmd(0xF6);
+        NegotiateRelative();
+    }
+    g_synGesture = SynapticsGesture(g_synGesture.Config());
+    MouseCmd(0xF4);                              // resume reporting
+    for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
+    g_packetIdx = 0;
+    IoApicUnmaskIrq(1, KBD_IRQ_VECTOR);
+    IoApicUnmaskIrq(12, MOUSE_IRQ_VECTOR);
+    if (flags & (1ull << 9)) __asm__ volatile("sti":::"memory");
+    return ok;
+}
+
+// Read-only diagnostic: pause reporting, rerun the identify/capability/modes
+// queries and record the raw replies, then resume in the current mode.
+bool MouseTouchpadProbe()
+{
+    if (!g_mouseInit) return false;
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
+    IoApicMaskIrq(12);
+    IoApicMaskIrq(1);
+    (void)AuxCommand(0xF5);
+    for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
+    const char* reason = g_synReason;
+    SynapticsCaps caps;
+    bool ok = SynapticsQueryAll(caps);
+    uint8_t r[3];
+    if (ok) ok = SynRawQuery(4, SynQueryModes, r);
+    if (g_synActive) g_synReason = reason;      // keep the live state's reason
+    (void)AuxCommand(0xF4);
+    for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
+    g_packetIdx = 0;
+    IoApicUnmaskIrq(1, KBD_IRQ_VECTOR);
+    IoApicUnmaskIrq(12, MOUSE_IRQ_VECTOR);
+    if (flags & (1ull << 9)) __asm__ volatile("sti":::"memory");
+    return ok;
+}
+
+bool MouseTouchpadSetSpeed(uint32_t percent)
+{
+    if (percent < uint32_t(SynapticsSpeedMin) || percent > uint32_t(SynapticsSpeedMax)) return false;
+    auto cfg = g_synGesture.Config();
+    cfg.speedPercent = int32_t(percent);
+    g_synGesture.SetConfig(cfg);
+    return true;
+}
+uint32_t MouseTouchpadSpeed() { return uint32_t(g_synGesture.Config().speedPercent); }
+
+void MouseTouchpadSetNatural(bool natural)
+{
+    auto cfg = g_synGesture.Config();
+    cfg.naturalScroll = natural;
+    g_synGesture.SetConfig(cfg);
+}
+
+MouseTouchpadStatus MouseTouchpadGetStatus()
+{
+    MouseTouchpadStatus st{};
+    st.wanted = g_synWanted;
+    st.active = g_synActive;
+    st.reason = g_synReason;
+    st.identified = g_synId.valid;
+    st.major = g_synId.major; st.minor = g_synId.minor; st.model = g_synId.model;
+    st.caps = g_synCaps.caps; st.ext = g_synCaps.ext; st.ext0c = g_synCaps.ext0c;
+    st.clickpad = g_synCaps.clickpad();
+    st.mode = g_synMode; st.modeReadback = g_synModeReadback;
+    st.packetLen = g_packetLen; st.relativeId = g_mouseId;
+    st.packets = g_synPackets; st.resyncs = g_synResyncs; st.scrollTicks = g_synScrollTicks;
+    for (int i = 0; i < 4; ++i) st.fingers[i] = g_synGesture.fingerHistogram[i];
+    st.natural = g_synGesture.Config().naturalScroll;
+    st.agm = g_synAgm;
+    st.scrollLowZ = g_synGesture.scrollTicksLowZ;
+    st.scrollRejected = g_synGesture.scrollRejected;
+    st.gestureResets = g_synGesture.resets;
+    st.speed = uint32_t(g_synGesture.Config().speedPercent);
+    st.rawValid = g_synRawValid;
+    for (int i = 0; i < 5; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];
+    return st;
 }
 
 } // namespace brook

@@ -7,7 +7,7 @@ static long test_syscall(long,...);
 #include "waylandd.c"
 #undef main
 #undef syscall
-static unsigned sourceBegins,sourceTags;static uint64_t sourceCommit;
+static unsigned sourceBegins,sourceTags;static uint64_t sourceCommit,lastSourceCommit;
 static long test_syscall(long number,...){
     va_list args;va_start(args,number);
     if(number==BROOK_SYS_WM_WINDOW_STATE){long window=va_arg(args,long);(void)va_arg(args,long);
@@ -15,7 +15,9 @@ static long test_syscall(long number,...){
         va_end(args);return 0;}
     if(number==BROOK_SYS_WM_BEGIN_SOURCE_WRITE){++sourceBegins;va_end(args);return 0;}
     if(number==BROOK_SYS_WM_PUBLISH_SOURCE_COMMIT){long window=va_arg(args,long),incarnation=va_arg(args,long);
-        long commit=va_arg(args,long);assert(window==1 && incarnation==77 && commit>0);sourceCommit=(uint64_t)commit;++sourceTags;va_end(args);return 0;}
+        long commit=va_arg(args,long);assert(window==1 && incarnation==77 && commit>0);
+        /* Published source commits follow the surface's publish counter. */
+        assert(!sourceTags || (uint64_t)commit!=lastSourceCommit || commit==1);lastSourceCommit=(uint64_t)commit;sourceCommit=(uint64_t)commit;++sourceTags;va_end(args);return 0;}
     va_end(args);return 0;
 }
 static struct brook_surface *make_surface(struct wl_client *client) {
@@ -53,14 +55,14 @@ int main(void) {
             assert(padded[y*4+x]==pixel_straight(pixel_over(input[y*3+x],0)));
         assert(padded[y*4+3]==0x12345678);
     }
-    assert(sourceCommit==single->tree.current->commit && sourceTags==sourceBegins);
+    assert(sourceCommit==single->publish_commit && sourceTags==sourceBegins);
     surface_destroy(client,single->resource);
     associate(client,sc,p,r);associate(client,sc,c,p);
     subsurface_set_position(client,p->subsurface_resource,1,1);
     snapshot(c,0xffff0000,1,1);snapshot(p,0xffabcdef,2,2);
     snapshot(c,0xff0000ff,1,1);snapshot(r,0xff102030,4,3);
     assert(vfb[5]==0xffff0000 && vfb[0]==0xff102030); // captured A, not newer B
-    assert(sourceBegins && sourceTags && sourceCommit==r->tree.current->commit);
+    assert(sourceBegins && sourceTags && sourceCommit==r->publish_commit);
     assert(c->tree.cached && ((struct brook_view *)c->tree.cached->value)->image->pixels[0]==0xff0000ff);
     snapshot(r,0xff102030,4,3);assert(vfb[5]==0xffff0000);
     surface_commit(client,p->resource);surface_commit(client,r->resource);assert(vfb[5]==0xff0000ff);
@@ -83,7 +85,7 @@ int main(void) {
     subsurface_set_desync(client,c->subsurface_resource);
     snapshot(c,0xff00ff00,1,1);assert(vfb[0]!=0xff00ff00); // inherited sync remains
     subsurface_set_desync(client,p->subsurface_resource);assert(vfb[0]==0xff00ff00);
-    assert(sourceCommit==r->tree.current->commit && sourceTags==sourceBegins);
+    assert(sourceCommit==r->publish_commit && sourceTags==sourceBegins);
     // Destroying a role unmaps immediately; old snapshots retain safe dead nodes.
     struct wl_resource *role=c->subsurface_resource;wl_resource_destroy(role);assert(vfb[0]==0xff102030 && c->role==2);
     associate(client,sc,c,p);snapshot(c,0xff0000ff,1,1);surface_commit(client,p->resource);

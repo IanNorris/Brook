@@ -141,6 +141,7 @@ void BdwGpuFileUnref(BdwGpuFile* f){
 }
 uint32_t BdwGpuFileCreateBuffer(BdwGpuFile* f,uint64_t requested,uint64_t& rounded){
     rounded=0;if(!f)return 0;auto* buffer=BdwGpuBufferCreate(requested);if(!buffer)return 0;
+    BdwGpuBufferSetCreator(buffer,f);
     uint32_t handle=0;
     {BdwFileGuard guard(&f->lock);for(uint32_t i=0;i<BdwMaxHandles;++i)if(!f->slots[i].buffer){
         f->slots[i]={buffer,0};handle=i+1;rounded=BdwGpuBufferBytes(buffer);break;}}

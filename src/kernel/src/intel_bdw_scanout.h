@@ -141,6 +141,19 @@ struct BdwRenderRunResult {
     // (BdwRenderEntryRefusal, intel_bdw_render_refusal.h); detail is the page
     // index for evidence and the GT init refusal code for GT NotStarted.
     uint8_t entryRefusal=0,entryDetail=0;uint32_t gtWrites=0;
+    // Output (gen 400): why an attempted run did not complete. runFailSite:
+    // 1 scratch/reservation precheck, 2 submission (ExecuteTakenOver), 3
+    // context-status poll fault (csb* fields), 4 retirement wait ended.
+    uint8_t runFailSite=0,csbSite=0,csbTail=0,csbHead=0,csbEvents=0;uint64_t csbEvent=0;
+    uint32_t eir=0,esr=0;
+    // Submission diagnostics (gen 401, site 2): submitSite names the first
+    // failed step in ExecuteTakenOver (see BdwRenderOneShot::SubmitDiag);
+    // completionSeen/Nonce the last breadcrumb value read and the expected
+    // one; completionPolls the breadcrumb polls made.
+    uint8_t submitSite=0;uint32_t completionSeen=0,completionNonce=0,completionPolls=0;
+    // The run failed but the engine was reset (verified) and this run's GGTT
+    // binding retired: device state is known and the job can just fail.
+    bool retiredAfterFailedRun=false;
     bool ggttClearRequested=false,ggttCleared=false;
     bool gemReleaseRequested=false,gemReleased=false;
     bool externalTablesRequested=false;
@@ -191,6 +204,7 @@ struct BdwRenderRunResult {
 };
 bool BdwRunRetainedRender(BdwRenderExecutionBackend& backend,uint64_t scratchDma,BdwRenderRunResult& result);
 bool BdwRetireRetainedRenderAfterReset(BdwRenderExecutionBackend& backend);
+bool BdwRetainedRenderRetirableAfterFailedRun();
 bool BdwTestRenderRun(BdwForcewakeAdapterResult& out,BdwRenderRunResult& result);
 // Explicitly opted-in first-use bootstrap; this does not initialize the GPU.
 bool BdwAutomaticRenderRequested();
@@ -279,7 +293,12 @@ class BdwVideoGate;enum class BdwVideoRefusal : uint8_t;
 bool BdwVideoBuilt();
 bool BdwVideoStatus(BdwVideoGate& out);
 // VCS0 user jobs run by the worker (phase 1c). Counters are relaxed reads.
-struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=0,lastUs=0,maxUs=0;bool quarantined=false;const char* detail="none";};
+struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=0,lastUs=0,maxUs=0;bool quarantined=false;const char* detail="none";
+    // Phase 4 timing sums over `timed` completed jobs (microseconds): CPU-side
+    // preparation, the critical-section run (= worker blocked on VCS), and
+    // its parts; skipped GDRSTs under minimal-reset tuning.
+    uint64_t timed=0,prepUs=0,runUs=0,releaseUs=0,resetBeforeUs=0,patUs=0,initUs=0,decodeUs=0,csbUs=0,tailUs=0,maxRunUs=0;
+    uint64_t skippedResetsBefore=0,skippedResetsAfter=0,firstJobNs=0,lastJobNs=0;};
 void BdwVideoUserCountsRead(BdwVcsUserCounts& out);
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);

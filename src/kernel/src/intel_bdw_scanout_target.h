@@ -104,6 +104,11 @@ uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry* out,uint32_t max,uint
 int64_t BdwZeroCopyAdopt(uint64_t owner,BdwGpuBuffer** out,uint32_t& count);
 bool BdwZeroCopyArm(const char*& reason);
 void BdwZeroCopyDisarm();
+// Auto-arm (wt cache mode) when the renderer registers its ring. Enabled at
+// boot by /etc/dell-zero-copy-auto (opt-in for now); `gpu zerocopy off`
+// cancels it for the boot. Arming still requires a passing flip probe.
+void BdwZeroCopySetAutoArm(bool enabled);
+bool BdwZeroCopyAutoArm();
 // Render jobs writing images lease PPAT slot 3 UC (default on). The toggle
 // exists only to A/B the coherency fix ("gpu zerocopy uc on|off").
 bool BdwZeroCopyUncachedRender();

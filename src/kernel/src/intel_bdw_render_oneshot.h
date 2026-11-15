@@ -37,6 +37,8 @@ struct BdwRenderExecutionBackend {
     virtual bool csbReadEntry(BdwOwnedPage&,unsigned,uint64_t&)=0;
     virtual bool csbAcknowledge(unsigned)=0;
     virtual bool retirementContinue()=0;
+    // Diagnostics only: last breadcrumb value read and polls made.
+    virtual void completionDiag(uint32_t& seen,uint32_t& polls)const{seen=0;polls=0;}
 };
 // A private, single-use render command. This is an engine bring-up workload,
 // not an application 3D draw. The backend must own the render engine and
@@ -55,6 +57,23 @@ class BdwRenderOneShot {
     const void* allocator_=nullptr;const void* backend_=nullptr;
     BdwRenderPlan plan_{};BdwGgttBind bind_{};uint32_t nonce_=0;
     uint8_t csbHead_=5;bool activated_=false,attempted_=false,storeProbe_=false,gt3_=false;
+public:
+    // Diagnostics of the last context-status poll fault (gen 400): site
+    // 1 ownership, 2 tail invalid, 3 entry read, 4 first event lacks
+    // idle-to-active, 5 unexpected later event or context id or not last,
+    // 6 acknowledge; plus the event, tail and head at the fault.
+    struct CsbDiag {uint8_t site=0,tail=0,head=0,events=0;uint64_t event=0;};
+    CsbDiag LastCsbDiag()const{return csbDiag_;}
+    // First failed step of the last ExecuteTakenOver (gen 401 site 2):
+    // 1 entry state, 2 admission/PAT/publish/quiescent, 3 lease read, 4 lease
+    // unstable, 5 GGTT bind, 6 handoff/PAT/state before execlists, 7 execlist
+    // init (includes the RCS reset), 8 state after init or prepareSubmission,
+    // 9 ELSP dword write, 10 breadcrumb wait, 11 CPU visibility, 12 breadcrumb
+    // or probe value mismatch. Nonce is the breadcrumb value expected.
+    uint8_t LastSubmitSite()const{return submitSite_;}
+    uint32_t Nonce()const{return nonce_;}
+private:
+    CsbDiag csbDiag_{};uint8_t submitSite_=0;
     BdwExecSnapshot* execSnapshot_=nullptr;BdwExecTables* execExternal_=nullptr;
     bool execPublished_=false,execArmed_=false,execDetached_=false;
     template<class Io> void freePages(Io& io){while(allocated_)io.free(pages_[--allocated_]);}
@@ -74,7 +93,7 @@ public:
     template<class Allocator> bool Recycle(Allocator& io){
         if(allocator_!=static_cast<const void*>(&io) || state_!=BdwOneShotState::Released || allocated_ || execSnapshot_ ||
            (execExternal_ && !execExternal_->Released()) || !bind_.Recycle())return false;
-        allocator_=backend_=nullptr;execExternal_=nullptr;plan_={};nonce_=0;csbHead_=5;
+        allocator_=backend_=nullptr;execExternal_=nullptr;plan_={};nonce_=0;csbHead_=5;csbDiag_={};submitSite_=0;
         activated_=attempted_=storeProbe_=gt3_=false;execPublished_=execArmed_=execDetached_=false;
         state_=BdwOneShotState::Fresh;return true;
     }
@@ -230,8 +249,8 @@ public:
     template<class Allocator,class Backend> bool ExecuteTakenOver(Allocator& allocator,Backend& io,uint64_t scratchDma) {
         if(allocator_!=static_cast<const void*>(&allocator) || state_!=BdwOneShotState::Prepared || attempted_ ||
            execDetached_ || (execSnapshot_ && !execArmed_) ||
-           !scratchDma || (scratchDma&4095) || scratchDma>=(uint64_t{1}<<39))return false;
-        for(unsigned i=0;i<Count;++i)if(scratchDma==pages_[i].dma)return false;
+           !scratchDma || (scratchDma&4095) || scratchDma>=(uint64_t{1}<<39)){submitSite_=1;return false;}
+        for(unsigned i=0;i<Count;++i)if(scratchDma==pages_[i].dma){submitSite_=1;return false;}
         attempted_=true;state_=BdwOneShotState::Executing;
         uint32_t lo=0,hi=0,lo2=0,hi2=0;
         if(!io.exclusiveHandoff() || !io.renderStateReady() || !io.admitPages(pages_,Count) ||
@@ -240,31 +259,31 @@ public:
            !io.readPrivatePat(lo,hi) || !io.readPrivatePat(lo2,hi2) || lo!=lo2 || hi!=hi2 ||
            !BdwLegacyBcsPatCompatible(plan_.descriptor,lo,hi) || !io.publish(pages_,Count) ||
            !io.validateLease(plan_.lease) || !io.quiescent()) {
-            state_=BdwOneShotState::Prepared;return false;
+            state_=BdwOneShotState::Prepared;submitSite_=2;return false;
         }
         for(unsigned i=0;i<plan_.lease.count;++i)if(!io.read(plan_.lease.index[i],plan_.lease.expected[i])){
-            state_=BdwOneShotState::Prepared;return false;
+            state_=BdwOneShotState::Prepared;submitSite_=3;return false;
         }
         for(unsigned i=0;i<plan_.lease.count;++i){uint64_t second=0;
             if(!io.read(plan_.lease.index[i],second) || second!=plan_.lease.expected[i]){
-                state_=BdwOneShotState::Prepared;return false;
+                state_=BdwOneShotState::Prepared;submitSite_=4;return false;
             }
         }
         if(!bind_.BindTakenOver(plan_.lease,io,scratchDma)){
-            state_=bind_.SafeToRelease()?BdwOneShotState::Prepared:BdwOneShotState::Quarantined;return false;
+            state_=bind_.SafeToRelease()?BdwOneShotState::Prepared:BdwOneShotState::Quarantined;submitSite_=5;return false;
         }
         backend_=static_cast<const void*>(&io);state_=BdwOneShotState::Quarantined;
         // initializeExeclists may reset RCS, so its owner must re-establish
         // any reset-sensitive render state before the second readiness check.
-        if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.renderStateReady() ||
-           !io.initializeExeclists(plan_.hwsGgtt,static_cast<const BdwOwnedPage&>(pages_[Hws])) ||
-           !io.renderStateReady() || !io.prepareSubmission(plan_.descriptor))return false;
+        if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.renderStateReady()){submitSite_=6;return false;}
+        if(!io.initializeExeclists(plan_.hwsGgtt,static_cast<const BdwOwnedPage&>(pages_[Hws]))){submitSite_=7;return false;}
+        if(!io.renderStateReady() || !io.prepareSubmission(plan_.descriptor)){submitSite_=8;return false;}
         const uint32_t words[]={0,0,uint32_t(plan_.descriptor>>32),uint32_t(plan_.descriptor)};
-        for(auto word:words)if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.submitDword(word))return false;
-        if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.waitCompletion(nonce_) ||
-           !io.exclusiveHandoff() || !io.gpuPatLease() || !io.cpuVisible(pages_,Count) ||
-           load(pages_[Completion],0)!=nonce_ || load(pages_[Completion],4)!=0 ||
-           (storeProbe_ && load(pages_[WaScratch],0)!=nonce_))return false;
+        for(auto word:words)if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.submitDword(word)){submitSite_=9;return false;}
+        if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.waitCompletion(nonce_)){submitSite_=10;return false;}
+        if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.cpuVisible(pages_,Count)){submitSite_=11;return false;}
+        if(load(pages_[Completion],0)!=nonce_ || load(pages_[Completion],4)!=0 ||
+           (storeProbe_ && load(pages_[WaScratch],0)!=nonce_)){submitSite_=12;return false;}
         state_=BdwOneShotState::CompleteRetained;return true;
     }
     template<class Backend> BdwCsbPoll PollContextSwitch(Backend& io) {
@@ -272,25 +291,25 @@ public:
         if(state_==BdwOneShotState::ContextCompleteRetained)return BdwCsbPoll::Complete;
         if(state_!=BdwOneShotState::CompleteRetained)return BdwCsbPoll::Fault;
         state_=BdwOneShotState::Polling;
-        if(!io.exclusiveHandoff() || !io.gpuPatLease()){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+        auto fault=[&](uint8_t site,uint32_t tail,uint64_t event){csbDiag_.site=site;csbDiag_.tail=uint8_t(tail);csbDiag_.head=csbHead_;
+            csbDiag_.event=event;state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;};
+        if(!io.exclusiveHandoff() || !io.gpuPatLease())return fault(1,0,0);
         uint32_t tail=0;
-        if(!io.csbReadTail(pages_[Hws],tail) || tail>=6){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+        if(!io.csbReadTail(pages_[Hws],tail) || tail>=6)return fault(2,tail,0);
         while(csbHead_!=tail) {
-            if(!io.exclusiveHandoff() || !io.gpuPatLease()){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+            if(!io.exclusiveHandoff() || !io.gpuPatLease())return fault(1,tail,0);
             const uint8_t next=(csbHead_+1)%6;uint64_t event=0;
-            if(!io.csbReadEntry(pages_[Hws],next,event)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}
+            if(!io.csbReadEntry(pages_[Hws],next,event))return fault(3,tail,0);
+            ++csbDiag_.events;
             if(event==~uint64_t{0}){state_=BdwOneShotState::CompleteRetained;return BdwCsbPoll::Pending;}
             bool terminal=false;
-            if(!activated_){if(!(event&1)){state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;}activated_=true;}
+            if(!activated_){if(!(event&1))return fault(4,tail,event);activated_=true;}
             else {
-                if((uint32_t(event)&0xffff07ffu)!=0x18 || uint32_t(event>>32)!=uint32_t(plan_.descriptor>>32) || next!=tail){
-                    state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;
-                }
+                if((uint32_t(event)&0xffff07ffu)!=0x18 || uint32_t(event>>32)!=uint32_t(plan_.descriptor>>32) || next!=tail)
+                    return fault(5,tail,event);
                 terminal=true;
             }
-            if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.csbAcknowledge(next)){
-                state_=BdwOneShotState::Quarantined;return BdwCsbPoll::Fault;
-            }
+            if(!io.exclusiveHandoff() || !io.gpuPatLease() || !io.csbAcknowledge(next))return fault(6,tail,event);
             csbHead_=next;
             if(terminal){state_=BdwOneShotState::ContextCompleteRetained;return BdwCsbPoll::Complete;}
         }

@@ -39,7 +39,7 @@ static int test_fprintf(FILE *stream,const char *format,...)
 static long result;
 static int result_errno, calls;
 static unsigned intel_fail_request;
-static int try_error,snapshot_error,snapshot_status=1,mock_fence_fd=-1;
+static int try_error,snapshot_error,snapshot_status=1,mock_fence_fd=-1,gem_create_ok,gem_creates,gem_closes;
 static int test_ioctl(int fd,unsigned long request,...)
 {
     (void)fd;
@@ -48,6 +48,11 @@ static int test_ioctl(int fd,unsigned long request,...)
         va_list args;va_start(args,request);unsigned char *info=va_arg(args,void *);va_end(args);
         memcpy(info+32,&snapshot_status,sizeof(snapshot_status));return 0;
     }
+    if((request&255u)==0x5b && gem_create_ok){
+        va_list args;va_start(args,request);struct {uint64_t size;uint32_t handle,pad;} *c=va_arg(args,void *);va_end(args);
+        c->handle=77;c->size=4096;++gem_creates;return 0;
+    }
+    if((request&255u)==0x09){++gem_closes;return 0;}
     if((request&255u)==0x2d){
         va_list args;va_start(args,request);struct drm_prime_handle *prime=va_arg(args,void *);va_end(args);
         prime->fd=dup(g_drm_fd);return prime->fd<0?-1:0;
@@ -73,7 +78,7 @@ static long test_syscall(long number, ...)
 #endif
     if(number==BROOK_SYS_GPU_BUFFER_SNAPSHOT_FENCE){va_end(args);if(snapshot_error){errno=snapshot_error;return -1;}return dup(mock_fence_fd>=0?mock_fence_fd:g_drm_fd);}
     if(number==BROOK_SYS_GPU_BUFFER_TRY_CPU_READ){va_end(args);if(try_error){errno=try_error;return -1;}return 0;}
-    if(number==BROOK_SYS_WM_SIGNAL_DIRTY){va_end(args);return 0;}
+    if(number==BROOK_SYS_WM_SIGNAL_DIRTY || number==BROOK_SYS_WM_DESTROY_WINDOW){va_end(args);return 0;}
     if (number==0xB06) { va_end(args);return open("/dev/null",O_RDWR); }
     assert(number==0xB07);(void)va_arg(args,long);long op=va_arg(args,long);va_end(args);
     if (op!=SCENE_CTL_CAPTURE_DMABUF) return 0;
@@ -345,6 +350,200 @@ static void check_gpu_window_retained(void)
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
+/* Version 3: a root DMA-BUF plus a DMA-BUF subsurface is offered as one
+ * layered commit (no CPU readback), with a publish number newer than the
+ * single offer before it; SAFE of the older single offer does not release
+ * the root buffer the layered commit still holds; SAFE of the layered commit
+ * releases both. */
+static void check_gpu_window_layers(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *rootBuffer=retained_test_buffer(client,2);
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    root.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(root.xdg_toplevel);
+    struct wl_resource *childBuffer=retained_test_buffer(client,5);
+    struct brook_surface *child=calloc(1,sizeof(*child));assert(child);surface_tree_init(child);
+    child->resource=wl_resource_create(client,&wl_surface_interface,4,6);assert(child->resource);
+    wl_resource_set_implementation(child->resource,&surface_impl,child,surface_destroy_userdata);
+    struct wl_resource *sc=wl_resource_create(client,&wl_subcompositor_interface,1,7);assert(sc);
+    root.xdg_acked=root.xdg_initial_commit_done=1;
+    uint32_t vfb=0xff445566;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
+    root.scene_disabled=1;root.next=child;g_surfaces=&root;
+    char path[]="/tmp/brook-layers-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    const uint64_t groupsBefore=g_gpu_group_offers,readbackBefore=g_layer_readback_bytes;
+    /* 1. Root alone: a version 2 single offer. */
+    surface_attach(client,root.resource,rootBuffer,0,0);surface_commit(client,root.resource);
+    struct brook_image *rootImage=((struct brook_view *)root.tree.current->value)->image;
+    struct brook_buffer *rootHeld=rootImage->source;++rootHeld->refs;
+    intel_pending_poll();assert(rootImage->offer_state==1);
+    struct BrookGpuWindowPacket single;int fds[2];assert(brook_gpu_window_receive(channel[1],&single,fds)==1);close(fds[0]);close(fds[1]);
+    assert(single.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && single.identity.commit==root.publish_commit);
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&single.identity)==1);
+    intel_pending_poll();
+    /* 2. A synchronized subsurface with its own DMA-BUF joins on the next root commit. */
+    subcomp_get_subsurface(client,sc,8,child->resource,root.resource);assert(child->tree.parent==&root.tree);
+    surface_attach(client,child->resource,childBuffer,0,0);surface_commit(client,child->resource);
+    surface_commit(client,root.resource);
+    struct brook_draw draws[64];unsigned n=0;assert(surface_layers(&root,draws,&n) && n==2);
+    struct brook_image *childImage=child->tree.current?((struct brook_view *)child->tree.current->value)->image:NULL;assert(childImage);
+    struct brook_buffer *childHeld=childImage->source;++childHeld->refs;
+    intel_pending_poll();
+    struct BrookGpuWindowLayersPacket layered;int lfds[16];unsigned nfds=0;
+    {int got=brook_gpu_window_receive_layers(channel[1],&layered,lfds,&nfds);
+     if(got!=1){printf("LAYERS_DEBUG got=%d errno=%d groups=%llu wait=%llu shape=%llu buffer=%llu upload=%llu full=%llu offer_layers=%llu no_channel=%llu meta=%llu child_state=%d child_pending=%d child_fence=%d root_state=%d n=%u\n",
+        got,errno,(unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_wait,(unsigned long long)g_gpu_group_skip_shape,
+        (unsigned long long)g_gpu_group_skip_buffer,(unsigned long long)g_gpu_group_skip_upload,(unsigned long long)g_gpu_group_full,
+        (unsigned long long)g_gpu_offer_layers,(unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_metadata,
+        childImage->offer_state,childImage->pending_cpu,childImage->producer_fence,rootImage->offer_state,n);fflush(stdout);}
+     assert(got==1);}
+    for(unsigned i=0;i<nfds;++i)close(lfds[i]);
+    assert(layered.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS && layered.count==2 && nfds==4);
+    assert(layered.header.identity.commit>single.identity.commit && layered.header.identity.commit==root.publish_commit);
+    assert(layered.layers[1].dstX==0 && layered.layers[1].dstWidth==1 && layered.layers[1].srcWidth==1);
+    assert(g_gpu_group_offers==groupsBefore+1 && rootImage->group_refs==1 && childImage->group_refs==1);
+    assert(childImage->offer_state==1 && rootImage->offer_state==1 && g_layer_readback_bytes==readbackBefore);
+    /* Never presented: frame callbacks are still released after the fallback delay. */
+    /* Any pending image, whatever its offer state, is due after the delay from queueing. */
+    {const int saved=childImage->offer_state;childImage->offer_state=3;
+     assert(!image_callbacks_due(childImage,childImage->queued_ms) &&
+            image_callbacks_due(childImage,childImage->queued_ms+GPU_CALLBACK_FALLBACK_MS));childImage->offer_state=saved;}
+    {const uint32_t now=g_now_ms();assert(!image_callbacks_due(childImage,now));
+     assert(image_callbacks_due(childImage,now+GPU_CALLBACK_FALLBACK_MS) && image_callbacks_due(rootImage,now+GPU_CALLBACK_FALLBACK_MS));}
+    /* 3. SAFE for the superseded single offer keeps the root held by the group. */
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&single.identity)==1);
+    intel_pending_poll();assert(rootImage->offer_state==1 && rootHeld->uses==1 && g_gpu_window_channel>=0);
+    /* 4. PRESENTED, then SAFE of the layered commit releases its group. */
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_PRESENTED,&layered.header.identity)==1);
+    intel_pending_poll();assert(childImage->gpu_presented && rootImage->gpu_presented && g_gpu_group_presented>=1);
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_SAFE,&layered.header.identity)==1);
+    intel_pending_poll();assert(g_gpu_window_channel>=0 && !rootImage->group_refs && !childImage->group_refs && g_gpu_group_safe>=1);
+    for(unsigned i=0;i<GPU_GROUPS;++i)assert(!g_gpu_groups[i].live);
+    bt_state_set(&child->tree.current,NULL);bt_state_set(&child->tree.latest,NULL);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);
+    buffer_drop(rootHeld);buffer_drop(childHeld);
+    free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
+/* Version 3 with a CPU-pixel layer: the SHM-style root is copied once into
+ * a GEM buffer and offered with the DMA-BUF subsurface; the GEM copy is
+ * freed with its image. */
+static void check_gpu_window_layers_shm(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,2);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    root.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,3);assert(root.xdg_toplevel);
+    struct wl_resource *childBuffer=retained_test_buffer(client,4);
+    struct brook_surface *child=calloc(1,sizeof(*child));assert(child);surface_tree_init(child);
+    child->resource=wl_resource_create(client,&wl_surface_interface,4,5);assert(child->resource);
+    wl_resource_set_implementation(child->resource,&surface_impl,child,surface_destroy_userdata);
+    struct wl_resource *sc=wl_resource_create(client,&wl_subcompositor_interface,1,6);assert(sc);
+    root.xdg_acked=root.xdg_initial_commit_done=1;
+    uint32_t vfb=0xff445566;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
+    root.scene_disabled=1;root.next=child;g_surfaces=&root;
+    char path[]="/tmp/brook-layers-shm-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;gem_create_ok=1;gem_creates=gem_closes=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    subcomp_get_subsurface(client,sc,7,child->resource,root.resource);
+    uint32_t px=0x80402010;struct brook_image *rootImage=image_snapshot((uint8_t *)&px,1,1,4,WL_SHM_FORMAT_ARGB8888);assert(rootImage);
+    assert(surface_tree_commit(&root,rootImage));image_unref(rootImage);
+    surface_attach(client,child->resource,childBuffer,0,0);surface_commit(client,child->resource);
+    surface_commit(client,root.resource);
+    struct brook_image *childImage=((struct brook_view *)child->tree.current->value)->image;
+    struct brook_buffer *childHeld=childImage->source;++childHeld->refs;
+    intel_pending_poll();
+    struct BrookGpuWindowLayersPacket layered;int lfds[16];unsigned nfds=0;
+    assert(brook_gpu_window_receive_layers(channel[1],&layered,lfds,&nfds)==1 && layered.count==2 && nfds==4);
+    for(unsigned i=0;i<nfds;++i)close(lfds[i]);
+    assert(layered.layers[0].fourcc==0x34325241 && !(layered.layers[0].flags&BROOK_GPU_WINDOW_LAYER_OPAQUE));
+    assert(gem_creates==1 && rootImage->gem_handle==77 && rootImage->gem_fd>=0 && rootImage->gem_fence>=0);
+    uint32_t copied=0;assert(pread(g_drm_fd,&copied,4,0)==4 && copied==0x80402010);
+    unsigned extra=0;struct BrookGpuWindowLayersPacket more;
+    while(brook_gpu_window_receive_layers(channel[1],&more,lfds,&nfds)==1){for(unsigned i=0;i<nfds;++i)close(lfds[i]);++extra;}
+    assert(!extra);
+    /* SAFE while the window still shows these layers: the DMA-BUF child is
+     * snapshotted and released, and the window is re-offered from CPU pixels
+     * (both layers now GEM copies). Its SAFE then releases everything. */
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_SAFE,&layered.header.identity)==1);
+    intel_pending_poll();
+    assert(brook_gpu_window_receive_layers(channel[1],&more,lfds,&nfds)==1 && more.count==2);
+    for(unsigned i=0;i<nfds;++i)close(lfds[i]);
+    assert(more.header.identity.commit>layered.header.identity.commit && gem_creates==2 && !childHeld->uses);
+    assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_SAFE,&more.header.identity)==1);
+    intel_pending_poll();assert(!rootImage->group_refs && !childImage->group_refs);
+    assert(brook_gpu_window_receive_layers(channel[1],&more,lfds,&nfds)==0);
+    bt_state_set(&child->tree.current,NULL);bt_state_set(&child->tree.latest,NULL);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);
+    assert(gem_closes==2); /* both images and their GEM copies are gone */
+    buffer_drop(childHeld);
+    free(root.composite);g_surfaces=NULL;g_drm_intel=0;gem_create_ok=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
+/* An ARGB DMA-BUF whose opaque region covers the surface is offered as a
+ * one-layer version 3 commit with the opaque flag; without the region it is
+ * an ordinary version 2 offer. */
+static void check_gpu_window_opaque(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *buffers[2]={retained_test_buffer(client,2),NULL};
+    ((struct brook_dmabuf_buffer *)wl_resource_get_user_data(buffers[0]))->fourcc=0x34325241;
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    root.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(root.xdg_toplevel);
+    buffers[1]=retained_test_buffer(client,5);
+    ((struct brook_dmabuf_buffer *)wl_resource_get_user_data(buffers[1]))->fourcc=0x34325241;
+    struct pointer_rect rect={0,0,1,1,1};struct pointer_region region={&rect,1,0};
+    struct wl_resource *reg=wl_resource_create(client,&wl_region_interface,1,6);assert(reg);wl_resource_set_user_data(reg,&region);
+    root.xdg_acked=root.xdg_initial_commit_done=1;
+    uint32_t vfb=0;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
+    root.scene_disabled=1;g_surfaces=&root;
+    char path[]="/tmp/brook-opaque-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    struct brook_buffer *held[2];struct BrookGpuWindowLayersPacket got;int fds[16];unsigned nfds=0;
+    for(unsigned i=0;i<2;++i){
+        if(i)surface_set_opaque_region(client,root.resource,reg);
+        surface_attach(client,root.resource,buffers[i],0,0);surface_commit(client,root.resource);
+        struct brook_view *view=root.tree.current->value;held[i]=view->image->source;++held[i]->refs;
+        assert(view->opaque==(int)i);
+        intel_pending_poll();
+        assert(brook_gpu_window_receive_layers(channel[1],&got,fds,&nfds)==1 && nfds==2);
+        for(unsigned k=0;k<nfds;++k)close(fds[k]);
+        if(!i)assert(got.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && !got.count);
+        else assert(got.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS && got.count==1 &&
+                    (got.layers[0].flags&BROOK_GPU_WINDOW_LAYER_OPAQUE) && got.layers[0].dstWidth==1);
+        assert(brook_gpu_window_send_reply(channel[1],got.header.version,BROOK_GPU_WINDOW_SAFE,&got.header.identity)==1);
+        intel_pending_poll();assert(g_gpu_window_channel>=0);
+    }
+    wl_resource_set_user_data(reg,NULL);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held[0]);buffer_drop(held[1]);
+    free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
 static void check_intel_direct(int mode)
 {
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
@@ -485,6 +684,9 @@ int main(void)
     assert(source_begins>0 && source_tags>0);
     check_gpu_window_offer(1);check_gpu_window_offer(2);
     check_gpu_window_retained();
+    check_gpu_window_layers();
+    check_gpu_window_layers_shm();
+    check_gpu_window_opaque();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif
     {

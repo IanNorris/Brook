@@ -1,0 +1,30 @@
+--- a/src/i965_drv_video.c	2026-11-15 01:11:14.480574372 +0000
++++ b/src/i965_drv_video.c	2026-11-15 01:11:14.482574392 +0000
+@@ -6819,9 +6819,26 @@
+     int composite_object =
+         flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS;
+ 
+-    if (!obj_surface || !obj_surface->bo)
++    if (!obj_surface)
+         return VA_STATUS_ERROR_INVALID_SURFACE;
+ 
++    /* Brook OS: a surface created without a pixel-format attribute has no
++     * BO until first use. Clients such as Chromium's VaapiVideoDecoder export
++     * the frame pool right after vaCreateSurfaces(), so allocate the BO now,
++     * the same way the decoders would (NV12 or P010, tiled). */
++    if (!obj_surface->bo) {
++        int fourcc = 0;
++        if (obj_surface->expected_format == VA_RT_FORMAT_YUV420)
++            fourcc = VA_FOURCC_NV12;
++        else if (obj_surface->expected_format == VA_RT_FORMAT_YUV420_10BPP)
++            fourcc = VA_FOURCC_P010;
++        if (!fourcc ||
++            i965_check_alloc_surface_bo(ctx, obj_surface, HAS_TILED_SURFACE(i965),
++                                        fourcc, SUBSAMPLE_YUV420) != VA_STATUS_SUCCESS ||
++            !obj_surface->bo)
++            return VA_STATUS_ERROR_INVALID_SURFACE;
++    }
++
+     if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+         i965_log_info(ctx, "vaExportSurfaceHandle: memory type %08x "
+                       "is not supported.\n", mem_type);

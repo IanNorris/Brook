@@ -5,6 +5,7 @@
 #include "boot_protocol/boot_protocol.h"
 #include "mem_tag.h"
 #include "../task_capacity.h"
+#include "pmm_drain_policy.h"
 
 namespace brook {
 
@@ -121,6 +122,8 @@ void PmmEnumeratePid(uint16_t pid,
 void PmmDumpPidStats();
 
 // Statistics — useful for diagnostics and tests.
+// BRO-179 drain counters (barriers, frames, deferrals); see pmm_drain_policy.h.
+PmmDrainStats PmmReadDrainStats();
 uint64_t PmmGetFreePageCount();
 uint64_t PmmGetTotalPageCount();
 // RAM capacity from the boot descriptors, excluding physical holes/MMIO.

@@ -15,7 +15,8 @@ import tempfile
 
 from prepare_guard_check_pair import CHECKER_SHA, E2FSCK_SHA, REQUIRED, selector
 from prepare_hardware_kernel_pair import (INITRD_MAX, KERNEL_MAX, module_version, regular, desktop_startup, add_vulkan_desktop_start,
-                                          KERNEL_CONSOLE_SHORTCUT, KERNEL_CONSOLE_SHORTCUT_PATH)
+                                          KERNEL_CONSOLE_SHORTCUT, KERNEL_CONSOLE_SHORTCUT_PATH,
+                                          CHROMIUM_POLICY, CHROMIUM_POLICY_PATH)
 
 FILES=('ETC/ahci-write-target','ETC/ahci-boot-volume','ETC/ahci-data-volume',
        'BOOT/FATFSCK.ELF','BOOT/E2FSCK.ELF')
@@ -125,6 +126,9 @@ def verify(candidate, source, reference, build, expected_kernel, expected_source
         shortcut=optional(live,KERNEL_CONSOLE_SHORTCUT_PATH)
         expected_shortcut=KERNEL_CONSOLE_SHORTCUT if allow_hidden_kernel_console else optional(base,KERNEL_CONSOLE_SHORTCUT_PATH)
         if shortcut!=expected_shortcut:raise ValueError('Kernel Console shortcut mismatch')
+        policy=optional(live,CHROMIUM_POLICY_PATH)
+        expected_policy=CHROMIUM_POLICY if allow_vulkan_desktop else optional(base,CHROMIUM_POLICY_PATH)
+        if policy!=expected_policy:raise ValueError('Chromium policy mismatch')
         vulkan_files={}
         if allow_vulkan_desktop:
             executables=[('VKSUP.ELF',expected_vulkan_supervisor),('VKRENDER.ELF',expected_vulkan_renderer)]

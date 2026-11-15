@@ -35,6 +35,7 @@ extern "C" [[noreturn]] void KernelPanic(const char* format,...){
     }
     std::abort();
 }
+void BdwZeroCopySetAutoArm(bool){}
 bool BdwPreparePrivateImages(){++prepares;return scenario!=28;}
 bool BdwPreparePrivateRenderImages(uint32_t (&)[20*1024]){++renderPrepares;return scenario!=31;}
 bool BdwRetainPrivateBcsImages(uint32_t){++retains;return scenario!=33;}
@@ -50,6 +51,7 @@ bool BdwReprepareRetainedGemProbe(){return scenario==81;}
 void BdwExecSnapshotCapture(const BdwExecSnapshot*,BdwGpuCapture& capture){capture={};}
 void PanicSetGpuCapture(const BdwGpuCapture&){}
 void BdwExecSnapshotOrigin(const BdwExecSnapshot*,uint32_t& pid,uint32_t& context){pid=context=0;}
+bool BdwExecSnapshotScopeFailureToWritten(BdwExecSnapshot*){return true;}
 BdwBatchSample BdwExecSnapshotBatchSample(const BdwExecSnapshot*){return {};}
 BdwBatchSample BdwExecSnapshotCurrentBatchSample(const BdwExecSnapshot*){return {};}
 uint32_t BdwExecSnapshotPageCount(const BdwExecSnapshot*){return 0;}
