@@ -270,6 +270,46 @@ static int surface_begin_source_write(struct brook_surface *root,uint64_t *incar
 #ifdef BROOK_WAYLAND_VULKAN_COMPOSITOR
 #include "surface-vulkan.h"
 #endif
+/* Per-window layer summary, kept for the status file (waylandd_status_write)
+ * and, with BROOK_WAYLAND_LAYER_TRACE=1, logged once per second per window or
+ * whenever the layer signature changes. Diagnostic only. */
+static unsigned long long g_layer_readback_bytes,g_layer_offer_frames;
+enum {LAYER_PATH_SCENE,LAYER_PATH_SINGLE,LAYER_PATH_GENERAL,LAYER_PATH_VULKAN,LAYER_PATH_PENDING,LAYER_PATHS};
+static unsigned long long g_layer_paths[LAYER_PATHS];
+static const char *const g_layer_path_names[LAYER_PATHS]={"scene","cpu_single","cpu_general","vulkan_compose","pending"};
+struct layer_summary {uint32_t wm,count,vfb_w,vfb_h,scale,ms;int path;uint64_t sig;
+    struct {char kind;uint32_t w,h,dw,dh,fmt;int opaque,offer;int64_t x,y;uint32_t sw,sh;} l[4];};
+static struct layer_summary g_layer_windows[16];
+static void surface_layer_trace(const struct brook_surface *root,const struct brook_draw *draws,unsigned count,int path){
+    static int enabled=-1;
+    if(enabled<0){const char *e=getenv("BROOK_WAYLAND_LAYER_TRACE");enabled=e && !strcmp(e,"1");}
+    if(path>=0 && path<LAYER_PATHS)++g_layer_paths[path];
+    uint64_t sig=1469598103934665603ull^(uint64_t)path;
+    for(unsigned i=0;i<count;++i){const struct brook_view *v=draws[i].view;
+        uint64_t parts[5]={(uint64_t)v->geometry.w<<32|v->geometry.h,(uint64_t)v->image->width<<32|v->image->height,
+            (uint64_t)(uint32_t)draws[i].x<<32|(uint32_t)draws[i].y,(uint64_t)v->geometry.sw<<32|v->geometry.sh,
+            (uint64_t)(v->image->source && v->image->source->dmabuf)<<1|(uint64_t)v->image->opaque};
+        for(unsigned k=0;k<5;++k){sig^=parts[k];sig*=1099511628211ull;}}
+    struct layer_summary *w=&g_layer_windows[root->wm_id%16];
+    const uint32_t now=g_now_ms();
+    const int changed=w->wm!=root->wm_id || w->sig!=sig;
+    w->wm=root->wm_id;w->count=count;w->vfb_w=root->vfb_w;w->vfb_h=root->vfb_h;w->path=path;
+    w->scale=surface_output_scale((struct brook_surface *)root);
+    for(unsigned i=0;i<count && i<4;++i){const struct brook_view *v=draws[i].view;const struct brook_image *im=v->image;
+        w->l[i].kind=im->pending_cpu?'p':im->source && im->source->dmabuf?'d':im->pixels?'s':'n';
+        w->l[i].w=im->width;w->l[i].h=im->height;w->l[i].dw=v->geometry.w;w->l[i].dh=v->geometry.h;w->l[i].fmt=im->format;
+        w->l[i].opaque=im->opaque;w->l[i].offer=im->offer_state;w->l[i].x=draws[i].x;w->l[i].y=draws[i].y;
+        w->l[i].sw=v->geometry.sw;w->l[i].sh=v->geometry.sh;}
+    if(!enabled || (!changed && now-w->ms<1000))return;
+    w->sig=sig;w->ms=now;
+    fprintf(stderr,"[waylandd] LAYERS wm=%u vfb=%ux%u scale=%u count=%u path=%s readback_bytes=%llu\n",
+        root->wm_id,root->vfb_w,root->vfb_h,w->scale,count,path>=0 && path<LAYER_PATHS?g_layer_path_names[path]:"?",g_layer_readback_bytes);
+    for(unsigned i=0;i<count;++i){const struct brook_view *v=draws[i].view;const struct brook_image *im=v->image;
+        const char *kind=im->pending_cpu?"dmabuf-pending":im->source && im->source->dmabuf?"dmabuf":im->pixels?"pixels":"none";
+        fprintf(stderr,"[waylandd]   layer%u kind=%s buf=%ux%u fmt=%u opaque=%d at=%lld,%lld dst=%ux%u src24.8=%u,%u,%u,%u transform=%u offer=%d\n",
+            i,kind,im->width,im->height,im->format,im->opaque,(long long)draws[i].x,(long long)draws[i].y,
+            v->geometry.w,v->geometry.h,v->geometry.sx,v->geometry.sy,v->geometry.sw,v->geometry.sh,v->geometry.transform,im->offer_state);}
+}
 static int surface_render(struct brook_surface *root) {
     if ((root->xdg_toplevel || root->xdg_popup) && !root->xdg_acked) return 1;
     struct brook_view *base=root->tree.current?root->tree.current->value:NULL;
@@ -279,6 +319,7 @@ static int surface_render(struct brook_surface *root) {
     /* Keep the previously published frame until every current producer is
      * ready. The queue owns pending images even if their surface is removed. */
     for(unsigned i=0;i<count;++i)if(draws[i].view->image->pending_cpu){
+        surface_layer_trace(root,draws,count,LAYER_PATH_PENDING);
         /* An offered GPU source can stand for the window only as its sole,
          * unchanged root layer. Anything else needs CPU pixels now, without
          * waiting for the renderer to give the source back. */
@@ -310,6 +351,7 @@ static int surface_render(struct brook_surface *root) {
             if (!image_gpu(image,root->scene)) return 0;
             layers[n++]=(struct SceneLayerDesc){image->version,g->sx,g->sy,g->sw,g->sh,(int32_t)dx,(int32_t)dy,dw,dh,255,0,0,root->vfb_w,root->vfb_h,SCENE_LAYER_FIXED8|(g->transform<<SCENE_LAYER_TRANSFORM_SHIFT)};
         }
+        surface_layer_trace(root,draws,count,LAYER_PATH_SCENE);
         struct ScenePresentDesc desc={(uintptr_t)layers,n,root->vfb_w,root->vfb_h,0};
         long result=scene_ctl(root->scene->fd,SCENE_CTL_PRESENT,&desc,sizeof(desc));
         // Native resize/content generation changes can safely discard a frame.
@@ -328,6 +370,7 @@ static int surface_render(struct brook_surface *root) {
            g->w*scale==image->width && g->h*scale==image->height &&
            root->vfb_w==image->width && root->vfb_h==image->height){
             writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
+            surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
             brook_straight_rows(root->vfb,root->vfb_stride,image->pixels,image->width,root->vfb_w,root->vfb_h);
             goto publish;
         }
@@ -357,6 +400,7 @@ static int surface_render(struct brook_surface *root) {
     }
     }
     writeGuard=surface_begin_source_write(root,&writeIncarnation);if(!writeGuard)return 1;
+    surface_layer_trace(root,draws,count,gpuComposed?LAYER_PATH_VULKAN:LAYER_PATH_GENERAL);
     brook_straight_rows(root->vfb,root->vfb_stride,root->composite,root->vfb_w,root->vfb_w,root->vfb_h);
 publish:;
     int tagged=0;

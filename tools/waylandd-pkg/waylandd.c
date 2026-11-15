@@ -2589,6 +2589,7 @@ static struct brook_image *intel_dmabuf_copy(const struct brook_dmabuf_buffer *d
     if (pixels==MAP_FAILED) return NULL;
     struct brook_image *image=image_snapshot((const uint8_t *)pixels+db->offset,db->width,db->height,
         db->stride,db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
+    if(image)g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;
     munmap(pixels,length);return image;
 }
 /* The Wayland buffer ownership contract excludes new producer writes until
@@ -2671,6 +2672,7 @@ static struct wl_event_source *g_gpu_window_source;
 static uint64_t g_gpu_window_offers,g_gpu_window_acks,g_gpu_window_recovered,g_gpu_window_presented;
 /* Aggregate failures instead of logging each frame; the latter perturbs pacing. */
 static uint64_t g_gpu_offer_no_channel,g_gpu_offer_no_root,g_gpu_offer_layers,g_gpu_offer_geometry,g_gpu_offer_window,g_gpu_offer_metadata;
+static uint64_t g_gpu_offer_size_mismatch;
 static uint64_t g_gpu_connect_fail,g_gpu_auth_fail;
 static int g_gpu_connect_errno,g_gpu_auth_errno;
 struct GpuWindowTiming {uint64_t count,sum,buckets[10];uint32_t max;};
@@ -2783,21 +2785,29 @@ static int gpu_window_offer(struct brook_image *image){
     if(!surface_layers(root,draws,&count) || count!=1 || draws[0].view->image!=image){++g_gpu_offer_layers;return 0;}
     const struct brook_view *view=draws[0].view;const struct brook_geometry *g=&view->geometry;
     const struct brook_dmabuf_buffer *db=image->source->dmabuf;
+    const uint32_t scale=surface_output_scale(root);
     if(g->transform || g->sx || g->sy || g->sw!=(int64_t)image->width*256 || g->sh!=(int64_t)image->height*256 ||
+       (uint64_t)g->w*scale!=image->width || (uint64_t)g->h*scale!=image->height ||
        (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
     if(!surface_window(root,(struct brook_view *)view) || !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
     struct stat st={0};BrookWindowState window={0};
     if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3) ||
        syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
        window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id || !root->tree.current ||
-       window.width!=root->vfb_w || window.height!=root->vfb_h){++g_gpu_offer_metadata;return 0;}
+       root->vfb_w!=image->width || root->vfb_h!=image->height){++g_gpu_offer_metadata;return 0;}
+    /* The WM client size (window.width/height) may differ from the committed
+     * buffer while a resize is in flight or when the client picks its own
+     * size. The renderer draws the offer exactly as it draws the VFB, 1:1
+     * and cropped to the client rectangle, so that is not a reason to fall
+     * back to CPU composition. */
+    if(window.width!=root->vfb_w || window.height!=root->vfb_h)++g_gpu_offer_size_mismatch;
     struct BrookGpuWindowPacket offer={.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,
         .version=gpu_window_retain_enabled()?BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN:BROOK_GPU_WINDOW_WIRE_VERSION,
         .type=BROOK_GPU_WINDOW_OFFER,.identity={root->wm_id,0,window.incarnation,root->tree.current->commit,
             (uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=(uint64_t)st.st_size/4,.offset=db->offset/4,
         .stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
     int sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
-    if(sent==1){image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;
+    if(sent==1){image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
         if(getenv("BROOK_WAYLAND_GPU_TIMING"))image->offer_sent_ms=g_now_ms();
         return 1;}
@@ -3094,8 +3104,8 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
                                        "dmabuf import failed");
         return NULL;
     }
-    fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x -> gres=%u\n",
-            width, height, db->stride, format, db->gres);
+    fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x modifier=0x%llx -> gres=%u\n",
+            width, height, db->stride, format, (unsigned long long)db->modifier, db->gres);
 
     struct wl_resource *buf = wl_resource_create(c, &wl_buffer_interface, 1, id);
     if (!buf) {
@@ -3271,6 +3281,50 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
 
 /* ---------------- main ---------------- */
 
+/* Live diagnostics: every 2 s, write $XDG_RUNTIME_DIR (or /tmp)/brook-waylandd-<display>.json
+ * atomically, so the bridge can read why windows are composed on the CPU
+ * without restarting the provider. */
+static void waylandd_status_write(const char *display){
+    static uint32_t last;const uint32_t now=g_now_ms();
+    if(last && now-last<2000)return;
+    last=now?now:1;
+    const char *dir=getenv("XDG_RUNTIME_DIR");if(!dir || !*dir)dir="/tmp";
+    char path[256],tmp[272];
+    if(snprintf(path,sizeof(path),"%s/brook-waylandd-%s.json",dir,display)>=(int)sizeof(path))return;
+    snprintf(tmp,sizeof(tmp),"%s.tmp",path);
+    FILE *f=fopen(tmp,"w");if(!f)return;
+    fprintf(f,"{\"schema\":\"brook-waylandd-status/1\",\"pid\":%ld,\"now_ms\":%u,\"gpu_socket\":%d,",
+        (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
+    fprintf(f,"\"offers\":{\"sent\":%llu,\"safe\":%llu,\"presented\":%llu,\"retained_snapshots\":%llu,\"recovered\":%llu},",
+        (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
+        (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered);
+    fprintf(f,"\"offer_skipped\":{\"no_channel_or_fence\":%llu,\"no_root\":%llu,\"layers\":%llu,\"geometry\":%llu,\"window\":%llu,"
+        "\"metadata\":%llu,\"connect_fail\":%llu,\"auth_fail\":%llu,\"sent_with_client_size_mismatch\":%llu},",
+        (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,
+        (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
+        (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
+    fprintf(f,"\"intel\":{\"queued\":%llu,\"ready\":%llu,\"discarded\":%llu,\"busy\":%llu,\"failed\":%llu,\"fences\":%llu,"
+        "\"fence_pending\":%llu,\"pending\":%u,\"direct\":%llu},\"readback_bytes\":%llu,\"paths\":{",
+        (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_discarded,
+        (unsigned long long)g_intel_busy,(unsigned long long)g_intel_failed,(unsigned long long)g_intel_fences,
+        (unsigned long long)g_intel_fence_pending,g_intel_pending_count,(unsigned long long)g_intel_direct,g_layer_readback_bytes);
+    for(unsigned i=0;i<LAYER_PATHS;++i)fprintf(f,"%s\"%s\":%llu",i?",":"",g_layer_path_names[i],g_layer_paths[i]);
+    fprintf(f,"},\"windows\":[");
+    int first=1;
+    for(unsigned i=0;i<16;++i){const struct layer_summary *w=&g_layer_windows[i];if(!w->wm)continue;
+        BrookWindowState state={0};
+        const int known=!syscall(BROOK_SYS_WM_WINDOW_STATE,(long)w->wm,0L,(long)&state,(long)sizeof(state),0L,0L) &&
+            state.version==BROOK_WINDOW_STATE_VERSION && state.window==w->wm;
+        fprintf(f,"%s{\"wm\":%u,\"vfb\":[%u,%u],\"client\":[%u,%u],\"scale\":%u,\"path\":\"%s\",\"count\":%u,\"layers\":[",
+            first?"":",",w->wm,w->vfb_w,w->vfb_h,known?state.width:0,known?state.height:0,
+            w->scale,w->path>=0 && w->path<LAYER_PATHS?g_layer_path_names[w->path]:"?",w->count);first=0;
+        for(unsigned k=0;k<w->count && k<4;++k)fprintf(f,"%s{\"kind\":\"%c\",\"buf\":[%u,%u],\"dst\":[%u,%u],\"at\":[%lld,%lld],"
+            "\"src24_8\":[%u,%u],\"fmt\":%u,\"opaque\":%d,\"offer\":%d}",k?",":"",w->l[k].kind,w->l[k].w,w->l[k].h,w->l[k].dw,w->l[k].dh,
+            (long long)w->l[k].x,(long long)w->l[k].y,w->l[k].sw,w->l[k].sh,w->l[k].fmt,w->l[k].opaque,w->l[k].offer);
+        fprintf(f,"]}");}
+    fprintf(f,"]}\n");
+    if(fclose(f)==0)rename(tmp,path);else unlink(tmp);
+}
 /* 1 when a server accepts connections on dir/name (a stale file refuses). */
 static int display_socket_live(const char *dir, const char *name) {
     if (!dir || !*dir || !name || strchr(name, '/')) return 0;
@@ -3433,6 +3487,7 @@ int main(int argc, char **argv)
                 goto done;
             }
             wl_display_flush_clients(g_display);
+            waylandd_status_write(sock);
             xwayland_pump();
             if (g_trace_frames) {
                 uint32_t now = g_now_ms();
