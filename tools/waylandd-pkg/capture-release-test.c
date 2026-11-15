@@ -410,6 +410,9 @@ static void check_gpu_window_layers(void)
     assert(layered.layers[1].dstX==0 && layered.layers[1].dstWidth==1 && layered.layers[1].srcWidth==1);
     assert(g_gpu_group_offers==groupsBefore+1 && rootImage->group_refs==1 && childImage->group_refs==1);
     assert(childImage->offer_state==1 && rootImage->offer_state==1 && g_layer_readback_bytes==readbackBefore);
+    /* Never presented: frame callbacks are still released after the fallback delay. */
+    {const uint32_t now=g_now_ms();assert(!image_callbacks_due(childImage,now));
+     assert(image_callbacks_due(childImage,now+GPU_CALLBACK_FALLBACK_MS) && image_callbacks_due(rootImage,now+GPU_CALLBACK_FALLBACK_MS));}
     /* 3. SAFE for the superseded single offer keeps the root held by the group. */
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_SAFE,&single.identity)==1);
     intel_pending_poll();assert(rootImage->offer_state==1 && rootHeld->uses==1 && g_gpu_window_channel>=0);

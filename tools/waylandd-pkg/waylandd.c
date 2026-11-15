@@ -655,12 +655,18 @@ static void trace_frames_report(uint32_t now) {
                 wl_list_length(&s->committed_frames), s->trace_request_max_ms, s->trace_committed_max_ms);
     }
 }
+static unsigned long long g_opaque_null,g_opaque_infinite,g_opaque_rects[5];static int32_t g_opaque_last[6];
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
     (void)c;
     struct brook_surface *s=wl_resource_get_user_data(r);
     const struct pointer_region *region=reg?wl_resource_get_user_data(reg):NULL;
     s->pending_opaque_set=region && !region->infinite && region->count==1 && region->ops[0].add;
+    /* What clients send (status file "opaque_regions"). */
+    if(!region)++g_opaque_null;else if(region->infinite)++g_opaque_infinite;
+    else{++g_opaque_rects[region->count<4?region->count:4];
+        if(region->count){g_opaque_last[0]=region->ops[0].x;g_opaque_last[1]=region->ops[0].y;g_opaque_last[2]=region->ops[0].w;
+            g_opaque_last[3]=region->ops[0].h;g_opaque_last[4]=region->ops[0].add;g_opaque_last[5]=(int32_t)region->count;}}
     if(s->pending_opaque_set){s->pending_opaque_x=region->ops[0].x;s->pending_opaque_y=region->ops[0].y;
         s->pending_opaque_w=region->ops[0].w;s->pending_opaque_h=region->ops[0].h;}
     s->opaque_pending=1;
@@ -3526,6 +3532,10 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,
         (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
         (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
+    fprintf(f,"\"opaque_regions\":{\"null\":%llu,\"infinite\":%llu,\"by_ops\":[%llu,%llu,%llu,%llu,%llu],"
+        "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
+        g_opaque_rects[2],g_opaque_rects[3],g_opaque_rects[4],g_opaque_last[0],g_opaque_last[1],g_opaque_last[2],g_opaque_last[3],
+        g_opaque_last[4],g_opaque_last[5]);
     fprintf(f,"\"layered\":{\"enabled\":%d,\"offers\":%llu,\"safe\":%llu,\"presented\":%llu,\"wait\":%llu,\"full\":%llu,"
         "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu},",gpu_layers_enabled(),
         (unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_safe,(unsigned long long)g_gpu_group_presented,

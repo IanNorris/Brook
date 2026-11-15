@@ -85,7 +85,10 @@ static inline int desktop_gpu_offer_in_use(const struct DesktopGpuOffer *o){
     return 0;
 }
 struct DesktopGpuChannel {int listener,peer;char path[sizeof(((struct sockaddr_un *)0)->sun_path)];struct DesktopGpuOffer offers[DESKTOP_GPU_OFFERS];
-    struct {uint64_t incarnation,commit;} presented[BROOK_DESKTOP_LAYER_LIMIT];uint64_t nextFrame;};
+    struct {uint64_t incarnation,commit;} presented[BROOK_DESKTOP_LAYER_LIMIT];uint64_t nextFrame;
+    /* Newest tagged CPU snapshot seen for each window (selection time). An
+     * offer at or below it can never be shown again, presented or not. */
+    struct {uint64_t incarnation,commit;} snapshot[BROOK_DESKTOP_LAYER_LIMIT];};
 static inline uint64_t desktop_gpu_channel_begin_frame(struct DesktopGpuChannel *c){
     if(c->nextFrame==UINT64_MAX)return 0;
     return ++c->nextFrame;
@@ -230,9 +233,23 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
         }
         return NULL;
     }
+    /* The provider composes on the CPU (and tags the snapshot) whenever an
+     * offer cannot represent a commit. Offers at or below that tag are
+     * older than what the window shows: never select them, and let finish
+     * retire them (SAFE) even if they were never presented. Without this an
+     * unpresented offer superseded only by CPU content is held forever and
+     * the client runs out of buffers. */
+    if(offered){uint64_t tag=0;
+        if(!syscall(BROOK_SYS_WM_QUERY_SOURCE_COMMIT,(long)l->window,(long)l->incarnation,(long)l->generation,(long)&tag,0L,0L) && tag &&
+           (c->snapshot[l->window-1].incarnation!=l->incarnation || tag>c->snapshot[l->window-1].commit)){
+            c->snapshot[l->window-1].incarnation=l->incarnation;c->snapshot[l->window-1].commit=tag;}}
+    const uint64_t tagged=c->snapshot[l->window-1].incarnation==l->incarnation?c->snapshot[l->window-1].commit:0;
     struct DesktopGpuOffer *best=NULL;
     for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];
         if(o->packet.identity.window!=l->window || o->packet.identity.incarnation!=l->incarnation || o->failed)continue;
+        if(o->packet.identity.commit<=tagged){
+            if(o->state==1 || o->state==2){o->current=0;++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SNAPSHOT_NEWER];}
+            continue;}
         const int newer=c->presented[l->window-1].incarnation!=l->incarnation || o->packet.identity.commit>c->presented[l->window-1].commit;
         if(desktop_gpu_offer_retained(o)){
             /* In-flight offers stay selectable so consecutive frames never
@@ -320,6 +337,7 @@ static inline void desktop_gpu_channel_presented(struct DesktopGpuChannel *c,uin
 static inline int desktop_gpu_offer_dead(struct DesktopGpuChannel *c,const struct DesktopGpuOffer *o,uint64_t frame){
     const struct BrookGpuWindowIdentity *id=&o->packet.identity;
     if(!id->window || id->window>BROOK_DESKTOP_LAYER_LIMIT)return 1;
+    if(c->snapshot[id->window-1].incarnation==id->incarnation && id->commit<=c->snapshot[id->window-1].commit)return 1;
     if(!o->current){
         if(c->presented[id->window-1].incarnation==id->incarnation && id->commit<=c->presented[id->window-1].commit)return 1;
         for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){const struct DesktopGpuOffer *p=&c->offers[i];
