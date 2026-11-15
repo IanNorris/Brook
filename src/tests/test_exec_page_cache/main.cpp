@@ -91,5 +91,29 @@ int main() {
         CHECK(c.Stats().hits==8000&&c.Stats().entries==1&&PmmGetRefCount(witness)==2);
         PmmUnrefPage(witness);CHECK(c.TrimIdle()==1);empty();
     }
+    // Release-path bounded trim: TrimStep visits at most maximumScan slots from
+    // a persistent cursor, never drops active (shared) entries, and the cursor
+    // wraps so every idle entry is eventually reclaimed across releases. An
+    // empty cache does no walk. Low free memory selects the full sweep.
+    {
+        ExecPageCacheEntry entries[64]{};ExecPageCache c(entries,64,64,64);
+        std::vector<PhysicalAddress> idle,active;
+        for(unsigned i=0;i<6;++i){auto p=c.Adopt(page(100+i));if(i%2)active.push_back(p);else{PmmUnrefPage(p);idle.push_back(p);}}
+        CHECK(c.Stats().entries==6);
+        const auto before=c.Stats().slotsScanned;
+        uint64_t reclaimed=c.TrimStep(4);
+        CHECK(c.Stats().slotsScanned-before<=4 && reclaimed<=3);
+        for(unsigned i=0;i<64 && reclaimed<3;++i)reclaimed+=c.TrimStep(4);
+        CHECK(reclaimed==3 && c.Stats().entries==3 && c.Stats().stepTrims>=2);
+        for(auto p:active)CHECK(PmmGetRefCount(p)==2);
+        for(auto p:active)PmmUnrefPage(p);
+        reclaimed=0;for(unsigned i=0;i<64 && c.Stats().entries;++i)reclaimed+=c.TrimStep(16);
+        CHECK(reclaimed==3 && !c.Stats().entries);
+        const auto scanned=c.Stats().slotsScanned;CHECK(!c.TrimStep(64) && c.Stats().slotsScanned==scanned);
+        empty();
+        CHECK(ExecPageCacheExitTrimFull(0) && ExecPageCacheExitTrimFull(ExecPageCacheLowFreePages-1));
+        CHECK(!ExecPageCacheExitTrimFull(ExecPageCacheLowFreePages) && !ExecPageCacheExitTrimFull(1u<<21));
+        CHECK(ExecPageCacheExitTrimSlots<=262144/32);
+    }
     std::puts("exec page cache: content, collisions, bounds, cleanup and concurrency PASS");
 }

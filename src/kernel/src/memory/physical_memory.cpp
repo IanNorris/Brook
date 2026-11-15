@@ -1,4 +1,5 @@
 #include "physical_memory.h"
+#include "pmm_drain_policy.h"
 #include "oom_recovery.h"
 #include "serial.h"
 #include "panic_serial.h"
@@ -453,6 +454,7 @@ void TlbFlushAllCpusBarrier();   // apic.cpp (namespace brook)
 static bool     g_drainDebug   = false;
 static uint64_t g_drainCycles  = 0;
 static uint64_t g_drainedTotal = 0;
+static PmmDrainStats g_drainStats;   // relaxed counters, single writer (drainer)
 
 static void PmmDrainThread(void* /*arg*/)
 {
@@ -475,10 +477,23 @@ static void PmmDrainThread(void* /*arg*/)
         // work remains keeps the quarantine bounded at ~one barrier's worth of
         // production (self-rate-matching): frames retired during a barrier land
         // in the now-empty live list and are drained by the very next iteration.
+        bool firstAfterNap = true;
         for (;;)
         {
             // Splice out the entire accumulated batch in O(1) (descriptor-linked).
             uint64_t f = IrqSpinLockAcquire(&g_pmmLock);
+            // After the first drain of this wake, only drain again immediately
+            // when the batch amortises the all-CPU barrier (PmmDrainContinue);
+            // otherwise nap and let more frees accumulate behind one barrier.
+            if (!firstAfterNap &&
+                !PmmDrainContinue(g_quarCount, g_freePages, g_totalPages))
+            {
+                if (g_quarCount)
+                    __atomic_add_fetch(&g_drainStats.deferred, 1, __ATOMIC_RELAXED);
+                IrqSpinLockRelease(&g_pmmLock, f);
+                break;
+            }
+            firstAfterNap = false;
             uint32_t head = g_quarHead;
             uint32_t n    = g_quarCount;
             g_quarHead = PMM_NULL_PAGE;
@@ -494,6 +509,11 @@ static void PmmDrainThread(void* /*arg*/)
             // of them. MUST run with no g_pmmLock held (it busy-waits for remote
             // CPUs).
             TlbFlushAllCpusBarrier();
+            __atomic_add_fetch(&g_drainStats.barriers, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_drainStats.framesReleased, n, __ATOMIC_RELAXED);
+            if (virtualBatch) __atomic_add_fetch(&g_drainStats.virtualBatches, 1, __ATOMIC_RELAXED);
+            if (n > __atomic_load_n(&g_drainStats.maxBatch, __ATOMIC_RELAXED))
+                __atomic_store_n(&g_drainStats.maxBatch, n, __ATOMIC_RELAXED);
             if (virtualBatch) VmmCompleteReclaim();
 
             // Now safe to return the batch's frames to the allocatable pool. Walk
@@ -523,6 +543,17 @@ static void PmmDrainThread(void* /*arg*/)
     }
 }
 
+PmmDrainStats PmmReadDrainStats()
+{
+    PmmDrainStats r;
+    r.barriers = __atomic_load_n(&g_drainStats.barriers, __ATOMIC_RELAXED);
+    r.framesReleased = __atomic_load_n(&g_drainStats.framesReleased, __ATOMIC_RELAXED);
+    r.virtualBatches = __atomic_load_n(&g_drainStats.virtualBatches, __ATOMIC_RELAXED);
+    r.deferred = __atomic_load_n(&g_drainStats.deferred, __ATOMIC_RELAXED);
+    r.maxBatch = __atomic_load_n(&g_drainStats.maxBatch, __ATOMIC_RELAXED);
+    return r;
+}
+
 void PmmStartDrainThread()
 {
     // BRO-206: run the drainer at REALTIME priority (0). At NORMAL (2) it was
@@ -544,6 +575,7 @@ void PmmStartDrainThread()
 // Host unit tests don't link the scheduler/apic; the quarantine drain is a
 // no-op (RetireFrameLocked's safety-valve releases frames immediately).
 void PmmStartDrainThread() {}
+PmmDrainStats PmmReadDrainStats() { return {}; }
 #endif
 
 // BRO-206: producer back-pressure. The single barrier-bound drain thread cannot
