@@ -606,7 +606,9 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
     if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment))) {
         VnodeStat stat{};int error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(error)return error;
-        if((stat.mode&0170000)!=0140000 && (stat.mode&0170000)!=0010000)return -30;
+        // Sockets, FIFOs and character devices are not filesystem data.
+        const uint16_t type=stat.mode&0170000;
+        if(type!=0140000 && type!=0010000 && type!=0020000)return -30;
     }
     return path.object->ops->access?path.object->ops->access(path.object,required,realIds):-95;
 }
@@ -626,12 +628,13 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     if((flags&VFS_O_TRUNC) || (VfsReadOnly(mount) && (flags&VFS_O_WRITE))) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
-        fifo=(stat.mode&0170000)==0010000;
+        // Character devices, like FIFOs, ignore O_TRUNC (shell "> /dev/null").
+        fifo=(stat.mode&0170000)==0010000 || (stat.mode&0170000)==0020000;
     }
     if(VfsReadOnly(mount) && (flags&(VFS_O_WRITE|VFS_O_TRUNC))) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
-        if((stat.mode&0170000)!=0010000) { *error=-30;return nullptr; }
+        if((stat.mode&0170000)!=0010000 && (stat.mode&0170000)!=0020000) { *error=-30;return nullptr; }
     }
     if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;

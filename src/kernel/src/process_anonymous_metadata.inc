@@ -26,6 +26,7 @@ int ProcessReadAnonymousFdMetadata(Process* viewer, Process* target, uint32_t fd
         case FdType::EpollFd: case FdType::TimerFd: case FdType::SignalFd:
         case FdType::SyncFile: case FdType::DevKeyboard: case FdType::DevNull:
         case FdType::DevUrandom: case FdType::DevDsp: case FdType::DevTty:
+        case FdType::DevZero: case FdType::DevFull:
         case FdType::DebugSerial: case FdType::DebugConsole: case FdType::DevFramebuf: break;
         default: SpinLockRelease(lock); return 0;
     }
@@ -42,6 +43,7 @@ int ProcessReadAnonymousFdMetadata(Process* viewer, Process* target, uint32_t fd
         out->rdev = type == FdType::Pipe || type == FdType::DevTty ? 0x8800 :
                     type == FdType::DevFramebuf ? 0x1d00 : type == FdType::DevNull ? 0x0103 :
                     type == FdType::DevUrandom ? 0x0109 : type == FdType::DevDsp ? 0x0e03 :
+                    type == FdType::DevZero ? 0x0105 : type == FdType::DevFull ? 0x0107 :
                     type == FdType::DebugSerial ? 0x0440 : 0x0400;
     }
     return 1;

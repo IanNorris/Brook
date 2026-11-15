@@ -683,6 +683,40 @@ int main()
         assert(!r->ops->remove(r,"renamed",false));assert(!fifo->ops->stat(fifo,&stat) && !stat.nlink);
         VfsClose(again);VfsObjectRelease(object);VfsClose(fifo);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
     }
+    // Boot device directory: kernel-seeded character devices with st_rdev,
+    // directories and links. Ordinary instances refuse character devices.
+    {
+        auto* plain=make();
+        assert(TmpfsSeedEntry(plain,"null",0020666,0x0103)==-22);
+        assert(!TmpfsDestroy(plain));clean();
+        int error=0;auto* fs=TmpfsCreateDeviceDirectory(&error);assert(fs && !error);
+        assert(!TmpfsSeedEntry(fs,"null",0020666,0x0103));
+        assert(TmpfsSeedEntry(fs,"null",0020666,0x0103)==-17);
+        assert(TmpfsSeedEntry(fs,"bad/name",0020666,0x0103)==-22);
+        assert(TmpfsSeedEntry(fs,"reg",0100644)==-22);
+        assert(TmpfsSeedEntry(fs,"dirdev",0040755,1)==-22);
+        assert(TmpfsSeedEntry(fs,"nolink",0120777)==-22);
+        assert(!TmpfsSeedEntry(fs,"shm",0041777));
+        assert(!TmpfsSeedEntry(fs,"fd",0120777,0,"/proc/self/fd"));
+        auto* r=root(fs);VnodeStat st{};
+        assert(!r->ops->stat(r,&st) && (st.mode&0177777)==0040755 && st.uid==0 && st.nlink==3);
+        auto* null=child(r,"null");
+        assert(!null->ops->stat(null,&st) && (st.mode&0177777)==0020666 && st.rdev==0x0103 && !st.isDir);
+        // Any user may open a 0666 node for writing; truncation is not data.
+        auto* opened=null->ops->open(null,VFS_O_WRITE|VFS_O_READWRITE,&error);
+        assert(opened && !error && opened->type==VnodeType::Device && !opened->ops->read && !opened->ops->write);
+        assert(!opened->ops->stat(opened,&st) && st.rdev==0x0103);
+        VfsClose(opened);
+        auto* shm=child(r,"shm");assert(!shm->ops->stat(shm,&st) && (st.mode&0177777)==0041777 && st.isDir && !st.rdev);
+        auto* fd=child(r,"fd");char target[64]{};
+        assert(fd->ops->readlink(fd,target,sizeof(target))>=0 && !strcmp(target,"/proc/self/fd"));
+        // Root may still remove or rename seeded nodes, as on devtmpfs.
+        identity(0);assert(!r->ops->rename(r,"null",r,"null2"));
+        assert(!null->ops->stat(null,&st) && st.rdev==0x0103);
+        assert(!r->ops->remove(r,"null2",false));identity(1000);
+        VfsObjectRelease(fd);VfsObjectRelease(shm);VfsObjectRelease(null);VfsObjectRelease(r);
+        assert(!TmpfsDestroy(fs));clean();
+    }
     {
         auto* fs=make();auto* r=root(fs);int error=0;
         auto* socket=r->ops->create_socket(r,"wayland-0",0600,&error);assert(socket && !error);
