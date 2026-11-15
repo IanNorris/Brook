@@ -1397,15 +1397,19 @@ static void stats_publish(uint64_t now){
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
-            char rows[DESKTOP_TIMELINE*120+64];size_t used=0;
+            char rows[DESKTOP_TIMELINE*120+640];size_t used=0;
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
             const uint64_t first=g_timelineCount>DESKTOP_TIMELINE?g_timelineCount-DESKTOP_TIMELINE:0;
-            for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-128;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
+            for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-640;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
                 used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s[%llu,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu]",k>first?",":"",
                     (unsigned long long)(t->start/1000),(unsigned long long)(t->submit/1000),(unsigned long long)(t->fence/1000),
                     (unsigned long long)(t->presentCall/1000),(unsigned long long)(t->presented/1000),t->image,t->partial,
                     (unsigned long long)t->drawPixels,(unsigned long long)t->commit);}
-            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"]}\n");
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"],\"gpu_select\":{");
+            for(unsigned r=0;r<DESKTOP_GPU_SELECT_REASONS;++r)
+                used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",desktop_gpu_select_names[r],
+                    (unsigned long long)g_desktopGpuSelect[r]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}\n");
             /* replace the final "}\n" of the spliced block with the timeline */
             if(length>=2 && g_statsJson[length-2]=='}' && length-2+used<sizeof(g_statsJson)){
                 memcpy(g_statsJson+length-2,rows,used);length=length-2+used;}

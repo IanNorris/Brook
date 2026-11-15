@@ -181,6 +181,20 @@ int main(void){check_failed_fence();
     desktop_gpu_channel_poll(&receiver);assert(desktop_gpu_channel_select(&receiver,&layer,100,100,&scene,frame));
     desktop_gpu_channel_presented(&receiver,frame);desktop_gpu_channel_finish(&receiver,frame);
     assert(brook_gpu_window_receive(pair[0],&reply,fds)==1 && reply.identity.incarnation==103);
+    /* Client size differs from the committed VFB (resize in flight): the
+     * offer of the VFB itself is drawn 1:1 and cropped, like the CPU source. */
+    {struct BrookDesktopLayer resized={.window=2,.incarnation=104,.width=16,.height=16,.clientWidth=12,.clientHeight=10,
+        .clientX=3,.clientY=4,.upscale=1};
+     p.identity.incarnation=104;assert(brook_gpu_window_send_offer(pair[0],&p,buffer,fence[0])==1);desktop_gpu_channel_poll(&receiver);
+     const uint64_t shape=g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SHAPE];
+     struct BrookDesktopLayer bigger=resized;bigger.width=bigger.height=32;
+     assert(!desktop_gpu_channel_select(&receiver,&bigger,100,100,&scene,frame));
+     assert(g_desktopGpuSelect[DESKTOP_GPU_REFUSE_SHAPE]==shape+1);
+     struct DesktopGpuOffer *cropped=desktop_gpu_channel_select(&receiver,&resized,100,100,&scene,frame);
+     assert(cropped && scene.sourceWidth==16 && scene.sourceWidthUsed==12 && scene.sourceHeightUsed==10 &&
+            scene.width==12 && scene.height==10 && scene.x==3 && scene.y==4);
+     desktop_gpu_channel_presented(&receiver,frame);desktop_gpu_channel_finish(&receiver,frame);
+     assert(brook_gpu_window_receive(pair[0],&reply,fds)==1 && reply.identity.incarnation==104);}
     /* Two windows may share a title. The channel never sees titles: exercise
      * interleaved sources and commits, then reuse one slot with a new owner. */
     char path2[]="/tmp/brook-desktop-channel-XXXXXX";int buffer2=mkstemp(path2);assert(buffer2>=0);unlink(path2);assert(!ftruncate(buffer2,4096));
