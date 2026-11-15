@@ -567,14 +567,18 @@ static void check_decoration_policy(void)
     struct wl_resource *db=wl_resource_create(client,&zxdg_toplevel_decoration_v1_interface,1,3);assert(db);
     wl_resource_set_implementation(db,&deco_impl,&b,deco_resource_destroyed);
     struct wl_resource *ta=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(ta);wl_resource_set_user_data(ta,&a);
+    /* Default: the client's CLIENT_SIDE request is honoured. */
     unsetenv("BROOK_WAYLAND_SSD_APPS");
+    snprintf(b.app_id,sizeof(b.app_id),"chromium-browser");
+    deco_set_mode(client,db,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(b.deco_csd==1);b.app_id[0]=0;
+    assert(!setenv("BROOK_WAYLAND_SSD_APPS","chromium,google-chrome",1));
     /* a: request first, app_id later (Chromium's order) -> server side. */
     deco_set_mode(client,da,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(a.deco_csd==1 && a.deco_resource==da);
     xdg_toplevel_set_app_id(client,ta,"chromium-browser");assert(a.deco_csd==0);
     /* b: an unlisted app keeps client-side decoration. */
     snprintf(b.app_id,sizeof(b.app_id),"org.gnome.Calculator");
     deco_set_mode(client,db,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(b.deco_csd==1);
-    /* Override: empty list disables the policy. */
+    /* An empty list disables the policy. */
     assert(!setenv("BROOK_WAYLAND_SSD_APPS","",1));
     deco_set_mode(client,da,ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);assert(a.deco_csd==1);
     assert(!setenv("BROOK_WAYLAND_SSD_APPS","org.gnome",1));
