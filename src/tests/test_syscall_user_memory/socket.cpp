@@ -151,7 +151,7 @@ static void TcpInfo() {
     Begin();
     const uint64_t value=UserAddress(0),length=UserAddress(PageSize);
     Put<int32_t>(length,sizeof(brook::LinuxTcpInfo));
-    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==-92); // UDP: ENOPROTOOPT
+    CHECK(brook::sys_getsockopt(SocketFd,6,11,value,length,0)==-95); // UDP: EOPNOTSUPP, as ip_getsockopt
     g_net.tcp=true;
     CHECK(brook::sys_getsockopt(SocketFd,6,11,value,g_kernel.Address(),0)==-brook::EFAULT);
     CHECK(brook::sys_getsockopt(SocketFd,6,11,g_kernel.Address(),length,0)==-brook::EFAULT);

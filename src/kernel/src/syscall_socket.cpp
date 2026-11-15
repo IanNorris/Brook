@@ -533,10 +533,13 @@ int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
     if (!entry->handle) return -EBADF;
     int level = static_cast<int>(levelVal);
     int option = static_cast<int>(optnameVal);
-    if (level == 6 && option == 11 && entry->type == FdType::Socket) { // IPPROTO_TCP, TCP_INFO
+    if (level == 6 && entry->type == FdType::Socket) { // IPPROTO_TCP
         TcpInfoSource source{};
         const int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
-        if (!brook::SockGetTcpInfo(index, &source)) return -92; // not a TCP socket
+        // Linux: a UDP socket passes SOL_TCP to ip_getsockopt (EOPNOTSUPP);
+        // TCP knows only TCP_INFO here (other options ENOPROTOOPT).
+        if (!brook::SockGetTcpInfo(index, &source)) return -95;
+        if (option != 11) return -92;
         int32_t length = 0;
         if (!CopyFromUser(&length, optlenAddr, sizeof(length))) return -EFAULT;
         if (length < 0) return -EINVAL;
