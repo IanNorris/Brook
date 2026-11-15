@@ -157,6 +157,7 @@ static void WmRestoreTheme()
     uint32_t appearance=WmGetAppearance();
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
     uint32_t pointerSpeed=BROOK_POINTER_SPEED_DEFAULT;
+    uint32_t touchpadTap=BROOK_TOUCHPAD_TAP_DEFAULT;
     uint32_t audioControl=AudioOutputControl();
     const bool forceMuted=(audioControl&BROOK_AUDIO_MUTED)!=0;
     VfsPath root{};Vnode* vn=nullptr;
@@ -217,6 +218,7 @@ static void WmRestoreTheme()
                     appearance=brook_appearance_setting(appearance,p);
                     taskbarMetrics=brook_taskbar_metrics_setting(taskbarMetrics,p);
                     pointerSpeed=brook_pointer_speed_setting(pointerSpeed,p);
+                    touchpadTap=brook_touchpad_tap_setting(touchpadTap,p);
                 }
                 if (!more) break;
                 line = end + 1;
@@ -231,6 +233,7 @@ static void WmRestoreTheme()
     WmSetAppearance(appearance);
     WmSetTaskbarMetrics(taskbarMetrics);
     MouseTouchpadSetSpeed(pointerSpeed);
+    MouseTouchpadSetTap(touchpadTap!=0);
     WmSetScale(selectedScale);
     WmSetTheme(selected);
     AudioSetOutputControl(audioControl|(forceMuted?BROOK_AUDIO_MUTED:0));

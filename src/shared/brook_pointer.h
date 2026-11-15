@@ -19,4 +19,17 @@ static inline uint32_t brook_pointer_speed_setting(uint32_t prior, const char *l
     while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
     return digits && !*line && brook_pointer_speed_valid(value) ? value : prior;
 }
+
+/* Touchpad tap-to-click (0 off, 1 on; default off).
+ * syscall(BROOK_SYS_TOUCHPAD_TAP, 0) reads it, (1, 0|1) sets it live.
+ * Persisted by Settings as [Desktop] touchpad_tap=0|1 and applied at boot. */
+enum { BROOK_SYS_TOUCHPAD_TAP = 0xB23, BROOK_TOUCHPAD_TAP_DEFAULT = 0 };
+static inline uint32_t brook_touchpad_tap_setting(uint32_t prior, const char *line) {
+    const char *key = "touchpad_tap=";
+    while (*key && *line == *key) { ++line; ++key; }
+    if (*key || (*line != '0' && *line != '1')) return prior;
+    const uint32_t value = (uint32_t)(*line++ - '0');
+    while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
+    return !*line ? value : prior;
+}
 #endif

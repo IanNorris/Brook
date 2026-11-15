@@ -707,6 +707,8 @@ target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/k
 
 add_host_test(test_synaptics_touchpad)
 target_compile_options(test_synaptics_touchpad PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_synaptics_tap)
+target_compile_options(test_synaptics_tap PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_wayland_provider)

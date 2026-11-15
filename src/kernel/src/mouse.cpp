@@ -18,6 +18,7 @@
 #include "irq_wrapper.h"
 #include "keyboard.h"
 #include "synaptics_touchpad.h"
+#include "synaptics_tap.h"
 
 namespace brook {
 uint32_t WmGetAppliedScale();
@@ -130,6 +131,13 @@ static uint8_t              g_synRawValid = 0;
 static const char*          g_synReason = "not attempted";
 static SynapticsGesture     g_synGesture;
 static volatile uint32_t    g_synPackets = 0, g_synResyncs = 0, g_synScrollTicks = 0;
+// Tap-to-click (user setting, default off). g_synLock serialises the gesture
+// and tap state between IRQ12, the LAPIC timer poll that releases a tap whose
+// drag window expired without further packets, and the runtime setters.
+static IrqSpinLock          g_synLock;
+static SynapticsTap         g_synTap;
+static uint8_t              g_synPhysButtons = 0;   // physical buttons as last reported
+volatile uint64_t           g_touchpadTapDeadline = 0;
 
 // 4-byte packet assembly for IntelliMouse modes.
 static uint8_t  g_packetBuf[6];
@@ -183,6 +191,18 @@ static void EmitPointer(int32_t dx, int32_t dyDown, int8_t wheelY, int8_t wheelX
 
 static int8_t ClampTicks(int32_t v) { return static_cast<int8_t>(v > 127 ? 127 : v < -127 ? -127 : v); }
 
+// Tap button transitions, each reported as its own state change on top of the
+// physical buttons (g_synLock held).
+static void EmitTapSteps(const SynapticsTapOutput& t)
+{
+    for (uint8_t i = 0; i < t.steps; ++i)
+        EmitPointer(0, 0, 0, 0, static_cast<uint8_t>(g_synPhysButtons | t.mask[i]));
+}
+static void PublishTapDeadline()
+{
+    __atomic_store_n(&g_touchpadTapDeadline, g_synTap.Deadline(), __ATOMIC_RELEASE);
+}
+
 // Synaptics absolute-mode byte handler (IRQ context).
 static void SynapticsByte(uint8_t data)
 {
@@ -191,7 +211,12 @@ static void SynapticsByte(uint8_t data)
         ++g_synResyncs;
         // A rejected byte may be the start of the next packet. Contact state
         // from before the loss is no longer trustworthy.
+        const auto flags = IrqSpinLockAcquire(&g_synLock);
         g_synGesture.Reset();
+        EmitTapSteps(g_synTap.Reset());
+        g_synGesture.SetTapDrag(false);
+        PublishTapDeadline();
+        IrqSpinLockRelease(&g_synLock, flags);
         g_packetIdx = 0;
         if (!SynapticsByteValid(0, data)) return;
     }
@@ -200,10 +225,29 @@ static void SynapticsByte(uint8_t data)
     g_packetIdx = 0;
     ++g_synPackets;
     const SynapticsPacket p = SynapticsDecodePacket(g_packetBuf, g_synCaps.clickpad());
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
     const SynapticsOutput o = g_synGesture.Feed(p);
+    if (p.w != 2) {   // extended (second-finger) packets carry no contact summary
+        EmitTapSteps(g_synTap.Feed(SynapticsTapInputFrom(p, g_synGesture, ApicTickCount())));
+        g_synGesture.SetTapDrag(g_synTap.Dragging());
+        PublishTapDeadline();
+    }
+    g_synPhysButtons = o.buttons;
+    const uint8_t buttons = static_cast<uint8_t>(o.buttons | g_synTap.Held());
     if (o.scrollY || o.scrollX) g_synScrollTicks += uint32_t((o.scrollY < 0 ? -o.scrollY : o.scrollY) + (o.scrollX < 0 ? -o.scrollX : o.scrollX));
-    if (o.dx || o.dy || o.scrollY || o.scrollX || o.buttons != g_buttons)
-        EmitPointer(o.dx, o.dy, ClampTicks(o.scrollY), ClampTicks(o.scrollX), o.buttons);
+    if (o.dx || o.dy || o.scrollY || o.scrollX || buttons != g_buttons)
+        EmitPointer(o.dx, o.dy, ClampTicks(o.scrollY), ClampTicks(o.scrollX), buttons);
+    IrqSpinLockRelease(&g_synLock, flags);
+}
+
+// LAPIC timer (BSP) once g_touchpadTapDeadline has passed: release a tap whose
+// drag window closed while the pad sent no packets.
+void MouseTouchpadTapPoll(uint64_t nowMs)
+{
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
+    EmitTapSteps(g_synTap.Timeout(nowMs));
+    PublishTapDeadline();
+    IrqSpinLockRelease(&g_synLock, flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +726,14 @@ bool MouseTouchpadSet(bool synaptics)
         MouseCmd(0xF6);
         NegotiateRelative();
     }
-    g_synGesture = SynapticsGesture(g_synGesture.Config());
+    {
+        const auto lockFlags = IrqSpinLockAcquire(&g_synLock);
+        g_synGesture = SynapticsGesture(g_synGesture.Config());
+        EmitTapSteps(g_synTap.Reset());
+        g_synPhysButtons = 0;
+        PublishTapDeadline();
+        IrqSpinLockRelease(&g_synLock, lockFlags);
+    }
     MouseCmd(0xF4);                              // resume reporting
     for (unsigned i = 0; i < 64 && (inb(0x64) & 1); ++i) (void)inb(0x60);
     g_packetIdx = 0;
@@ -721,18 +772,32 @@ bool MouseTouchpadProbe()
 bool MouseTouchpadSetSpeed(uint32_t percent)
 {
     if (percent < uint32_t(SynapticsSpeedMin) || percent > uint32_t(SynapticsSpeedMax)) return false;
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
     auto cfg = g_synGesture.Config();
     cfg.speedPercent = int32_t(percent);
     g_synGesture.SetConfig(cfg);
+    IrqSpinLockRelease(&g_synLock, flags);
     return true;
 }
 uint32_t MouseTouchpadSpeed() { return uint32_t(g_synGesture.Config().speedPercent); }
 
+void MouseTouchpadSetTap(bool enabled)
+{
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
+    EmitTapSteps(g_synTap.SetEnabled(enabled));
+    g_synGesture.SetTapDrag(false);
+    PublishTapDeadline();
+    IrqSpinLockRelease(&g_synLock, flags);
+}
+bool MouseTouchpadTap() { return g_synTap.Config().enabled; }
+
 void MouseTouchpadSetNatural(bool natural)
 {
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
     auto cfg = g_synGesture.Config();
     cfg.naturalScroll = natural;
     g_synGesture.SetConfig(cfg);
+    IrqSpinLockRelease(&g_synLock, flags);
 }
 
 MouseTouchpadStatus MouseTouchpadGetStatus()
@@ -755,6 +820,12 @@ MouseTouchpadStatus MouseTouchpadGetStatus()
     st.scrollRejected = g_synGesture.scrollRejected;
     st.gestureResets = g_synGesture.resets;
     st.speed = uint32_t(g_synGesture.Config().speedPercent);
+    st.tap = g_synTap.Config().enabled;
+    st.tapLeft = g_synTap.tapsLeft; st.tapRight = g_synTap.tapsRight;
+    st.tapDrags = g_synTap.drags; st.tapDoubles = g_synTap.doubleTaps;
+    st.tapRejectedPhysical = g_synTap.rejectedPhysical;
+    st.tapRejectedPalm = g_synTap.rejectedPalm;
+    st.tapRejectedPhantom = g_synTap.rejectedPhantom;
     st.rawValid = g_synRawValid;
     for (int i = 0; i < 5; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];
     return st;
