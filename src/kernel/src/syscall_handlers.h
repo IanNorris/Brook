@@ -560,4 +560,13 @@ int64_t sys_brook_gpu_transfer(uint64_t ctx, uint64_t resId, uint64_t dir,
 int64_t sys_brook_gpu_ctx_destroy(uint64_t ctx, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t);
 
+// syscall_brook_desktop.cpp
+int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint64_t a,uint64_t b,uint64_t c);
+int64_t sys_brook_scene_create(uint64_t window,uint64_t abi,uint64_t flags,
+                               uint64_t a,uint64_t b,uint64_t c);
+int64_t sys_brook_scene_ctl(uint64_t fd,uint64_t op,uint64_t arg,uint64_t size,
+                            uint64_t flags,uint64_t reserved);
+int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,uint64_t length,uint64_t offset,uint64_t reserved);
+int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destination,uint64_t length,uint64_t offset,uint64_t reserved);
+
 } // namespace brook
