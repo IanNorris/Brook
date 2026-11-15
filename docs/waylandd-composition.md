@@ -153,3 +153,30 @@ Until the profile binary is updated, the launcher's second server keeps stealing
 - Fractional source rectangles and buffer transforms stay on the CPU path.
 - Damage is still ignored.
 - Scaling a layer uses the quad shader's nearest sampling, which matches the CPU reference in the e2e test for integer ratios. Fractional ratios aren't proved bit-exact.
+
+## Chromium's window frame and the opaque region (gens 403–406, 15 Nov 2026)
+
+**Why Chrome is never opaque:**
+- Chromium's default *custom frame* is translucent (shadows, rounded corners).
+- It sends `set_opaque_region` with its initial window rectangle (0,0 1050×880, surface-local logical units) and then **clears it with NULL**.
+- Its AR24 window is therefore never opaque, and the renderer blends the whole desktop beneath the browser every frame. Gen 404 status: `opaque_regions.last_kind=0`, `opaque_views=0`.
+
+**What did not help:** answering Chromium's `CLIENT_SIDE` xdg-decoration request with `SERVER_SIDE` (`810b1997`, gen 405). Chromium keeps its custom frame inside Brook's title bar: a double frame with a transparent shadow margin, and the opaque region is still cleared. The override is opt-in only (`BROOK_WAYLAND_SSD_APPS`, unset by default; `49b15263`, gen 406). By default waylandd honours the client's request, so there is no double frame.
+
+**What works:** Chromium's own setting *Settings → Appearance → "Use system title bar and borders"* (pref `browser.custom_chrome_frame=false`). A private profile on gen 405 then showed:
+- `last_kind=1`;
+- the window's `opaque_region` set to the whole 800×600 surface;
+- view-opaque layers;
+- 52 opaque one-layer v3 offers;
+- a single clean frame (Brook title bar over Chrome's tab strip).
+
+Captures: `display-perf/build/ssd-probe-frame/` (double frame) and `ssd-pref-frame/` (system title bar).
+
+**Recommendation:** use the system title bar for Chromium on Brook. A proposed launcher default exists on `work/chromium-frame` (`14287f38`), **not installed**: `brook-chromium` would set the pref only when it is absent from the profile, keeping any later user choice. For now Ian can flip the setting himself; the wrapper default is his decision.
+
+**How opacity is decided (`surface_opaque_covers`):** a single added rectangle, clamped to the surface, that covers the whole surface marks the view opaque. The comparison is in logical surface units, against the view's destination size before output scale. Multi-rectangle regions stay non-opaque (conservative).
+
+**Diagnostics in the status file:**
+- `opaque_regions`: counts of NULL / infinite / by-number-of-ops calls, the last call's kind and first op, and `opaque_views`;
+- per window: the root's `opaque_region` `[set,x,y,w,h]`;
+- per layer: `opaque` bit 0 = XRGB pixels, bit 1 = view marked opaque.
