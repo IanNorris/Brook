@@ -46,6 +46,12 @@ public:
     bool UserRecycle(){if(!Recycle())return false;root_=batch_=0;return true;}
 };
 
+// TSC stamps recorded in BdwBcsRunResult::stamps for one VCS user job.
+enum BdwVcsStamp : unsigned {
+    BdwVcsStampWorkStart,BdwVcsStampResetBefore,BdwVcsStampPat,BdwVcsStampExecute,BdwVcsStampInitStart,
+    BdwVcsStampInitEnd,BdwVcsStampWaitStart,BdwVcsStampBreadcrumb,BdwVcsStampCsb,BdwVcsStampWorkEnd,BdwVcsStampCount
+};
+
 // Admission and cache publication of a job's external table pages, supplied
 // by the device owner under the same forcewake lease as the run.
 struct BdwVcsTableSink {

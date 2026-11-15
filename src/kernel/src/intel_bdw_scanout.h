@@ -279,7 +279,12 @@ class BdwVideoGate;enum class BdwVideoRefusal : uint8_t;
 bool BdwVideoBuilt();
 bool BdwVideoStatus(BdwVideoGate& out);
 // VCS0 user jobs run by the worker (phase 1c). Counters are relaxed reads.
-struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=0,lastUs=0,maxUs=0;bool quarantined=false;const char* detail="none";};
+struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=0,lastUs=0,maxUs=0;bool quarantined=false;const char* detail="none";
+    // Phase 4 timing sums over `timed` completed jobs (microseconds): CPU-side
+    // preparation, the critical-section run (= worker blocked on VCS), and
+    // its parts; skipped GDRSTs under minimal-reset tuning.
+    uint64_t timed=0,prepUs=0,runUs=0,releaseUs=0,resetBeforeUs=0,patUs=0,initUs=0,decodeUs=0,csbUs=0,tailUs=0,maxRunUs=0;
+    uint64_t skippedResetsBefore=0,skippedResetsAfter=0,firstJobNs=0,lastJobNs=0;};
 void BdwVideoUserCountsRead(BdwVcsUserCounts& out);
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);
 bool BdwVideoProbe(BdwForcewakeAdapterResult& out,BdwVideoRefusal& refusal);

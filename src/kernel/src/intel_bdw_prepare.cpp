@@ -3,6 +3,7 @@
 #include "serial.h"
 #include "intel_bdw_oneshot.h"
 #include "intel_bdw_vcs_user.h"
+#include "intel_bdw_video.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_gtt_probe.h"
 #include "intel_bdw_publish.h"
@@ -542,6 +543,13 @@ BdwPrepareOutcome BdwPrepareVcsUserJob(BdwExecSnapshot* snapshot,uint32_t nonce,
     if(!BdwExecSnapshotTableCount(snapshot,tableCount) || !tableCount || tableCount>BdwExecTables::Max)
         return refuse("address space needs more than 512 page tables");
     vcsUserSnapshot=snapshot;
+#ifdef BROOK_BDW_COHERENT_RENDER
+    // Phase 4: ordinary job buffers go through the leased WB LLC PAT slot
+    // without CPU cache flushes, as on the RCS coherent-render path; the ring
+    // invalidates before the batch and flushes before the breadcrumb.
+    if((BdwVideoUserTuning()&BdwVcsTuneCoherent) && !BdwExecSnapshotUseCoherentRender(snapshot))
+        return refuse("coherent policy");
+#endif
     if(!vcsUserTables.Prepare(retainedAllocator,snapshot)){
         if(vcsUserTables.Quarantined()){reason="table page allocation returned an unsafe page";return BdwPrepareOutcome::Uncertain;}
         return refuse("page table allocation failed");
@@ -587,12 +595,13 @@ bool BdwRunPreparedVcsUser(BdwBcsExecutionBackend& backend,BdwVcsTableSink& sink
     // Recheck the table pages' geometry and flush them under the device lease.
     if(!vcsUserTables.AdmitAndPublish(sink))return false;
     result.attempted=true;
+    result.stamps[BdwVcsStampExecute]=__builtin_ia32_rdtsc();
     if(!vcsUserImage.ExecuteTakenOverWithBackend(retainedAllocator,backend,scratchDma))return false;
     result.copyComplete=true;
     while(backend.retirementContinue()){
         const auto status=vcsUserImage.PollContextSwitch(backend);
         if(status==BdwCsbPoll::Fault)return false;
-        if(status==BdwCsbPoll::Complete){result.contextComplete=true;return true;}
+        if(status==BdwCsbPoll::Complete){result.contextComplete=true;result.stamps[BdwVcsStampCsb]=__builtin_ia32_rdtsc();return true;}
     }
     return false;
 }

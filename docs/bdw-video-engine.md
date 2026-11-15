@@ -366,3 +366,90 @@ The patch uses only standard UAPI, so it also runs on Linux i915.
 - It never overwrites, removes or touches `/nix/profile`.
 - A gen 396 inventory (job in `build/hardware/vaapi-stage-gen396/`) found 120 of 126 closure paths already on the Dell. The bundle carries the 6 missing ones (15 MB): libdrm-brook-softpin, i965, libva-utils, ffmpeg-headless bin and man, and the env.
 
+## Phase 3: Chromium VA-API (work/browser-vaapi, in progress)
+
+**Probe:** `scripts/workloads/browser_vaapi_probe.py`. It runs on the Dell as uid 1000 with a private profile and closes the browser afterwards.
+- It serves a clip in an autoplaying `<video>` and launches Chromium (or Firefox) through `brook-run` and `brook-iris-run`.
+- For Chromium it reads the DevTools Media domain (`kVideoDecoderName`, the player messages), `SystemInfo.getInfo`, the playback quality, and aggregate CPU from `/proc/stat`.
+- VA-API flags:
+  - `--enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL`;
+  - `--disable-features=Vulkan,UseChromeOSDirectVideoDecoder`;
+  - `--render-node-override=/dev/dri/renderD129`.
+
+  The environment sets `LIBVA_DRIVER_NAME=i965` and `LIBVA_DRIVERS_PATH`.
+
+**Two bugs found and fixed in the package (`brook-vaapi-0.3`, not yet staged):**
+1. **Frame-pool export.** Chromium's VaapiVideoDecoder creates surfaces without a pixel-format attribute and exports them (`vaExportSurfaceHandle`) before decoding. i965 allocates a surface's BO lazily, so the export failed with "invalid VASurfaceID" and Chromium fell back to FFmpeg.
+   - Fix: `i965-brook-export-alloc.patch` allocates NV12 or P010, tiled, on export.
+   - The export carries modifier `I915_FORMAT_MOD_Y_TILED` (0x0100000000000002), NV12 as R8 plus GR88 layers, pitch 1280, UV offset 942080 for 1280×720.
+   - Host check: `tools/vaapi-brook-pkg/host-shim/va_export_check.c` under the shim.
+2. **Stock libdrm_intel shadowed the softpin one: the green frames.** Chromium's GPU process loads Mesa's libgallium, which links stock `libdrm_intel.so.1`. When libva later loaded i965, the loader reused that object for i965's `libdrm_intel.so.1`.
+   - Every BSD execbuffer then went out stock (no NO_RELOC, unpinned objects with relocations), and Brook refused hundreds of them. The surfaces were never decoded into, so the video showed solid green. `gpu video status` user_jobs did not move.
+   - `exec_logger.so` (`tools/vaapi-brook-pkg/exec-logger/`) captured the refused requests on the Dell.
+   - The host shim reproduces it: LD_PRELOAD stock `libdrm_intel` makes 31 of 31 ffmpeg execbuffers refused.
+   - Fix: i965 links the softpin `libdrm_intel` **statically**, with its symbols made local (`--exclude-libs`). The build fails if i965 still needs or exports `libdrm_intel`.
+   - With stock `libdrm_intel` preloaded, the host shim then admits all 31 of 31.
+
+**Dell results (gen 398, `dell-integration7`), private profiles, 20 s each.** The patched i965 was loaded from a RAM copy (`LIBVA_DRIVERS_PATH`), with no store write.
+
+| Run | Decoder | VCS jobs | Frames presented / total / dropped | Frame p50 / p90 | CPU busy |
+|---|---|---|---|---|---|
+| 720p H.264, VA-API | VaapiVideoDecoder | 515 completed, 0 refused or failed, ~4.9 ms each (max 7.5) | 270 / 505 / 243 | 55 / 104 ms | 25.3% |
+| 720p H.264, software | FFmpegVideoDecoder | — | 382 / 519 / 141 | 40 / 69 ms | 22.1% |
+| 1080p H.264, software | FFmpegVideoDecoder | — | 325 / 512 / 175 | 44 / 77 ms | 23.0% |
+| 1080p H.264, VA-API | — | — | browser crashed at start twice (SIGTRAP after "Corruption detected in shared-memory segment"), before any decode; not yet understood | | |
+
+**VA-API decode works end to end in Chromium, but it is slower than software today.**
+- Each VCS job holds the CPU0 submission worker for about 5 ms: two media resets, execlist init, and polling for the breadcrumb. RCS composition and Chromium's own GL work queue behind it.
+- That is the phase 4 item: keep VCS state between jobs and do not block the worker for the decode time.
+- Software decode at 720p and 1080p also drops frames here (the package was near 90 °C with the clock capped during these runs), so these are relative numbers.
+
+**Not done yet:**
+- the Firefox VA-API path and its VP9 0.16× issue;
+- the YouTube H.264 preference;
+- the launcher proposal;
+- the 1080p VA-API crash.
+
+## Phase 4 (work/vcs-lane): measurement first, cheap savings, and the async-lane design
+
+**Per job today:** up to **three** VCS GDRSTs, each followed by the firmware engine restore:
+1. the copy work item's reset-before;
+2. the reset inside the execlist takeover (`initializeExeclists` always resets so the CSB cursor is synchronized);
+3. the reset-after.
+
+Every ordinary job buffer is also clflushed before the job and again at retirement. A 720p decode job references 659–2705 pages, which is several MB flushed twice per frame.
+
+**This round (all switchable at runtime, both on by default):**
+- **`gpu video tune resets min|full`:** the reset-before is skipped when the previous user job ended in a verified clean stop and VCS is observed quiescent. The reset-after is replaced by a CSB context-complete on a quiescent engine (the context switched out and the engine went idle). A GDRST still happens on any failure or hang, and inside the execlist init, so that is 1 reset per job instead of 3. Any other VCS operation (self-test, reset, PM ops) clears the clean-stop state.
+- **`gpu video tune coherent on|off`:** job buffers use the leased WB LLC PAT slot without CPU cache flushes, as RCS coherent-render does. The VCS ring already invalidates TLBs before the batch and flushes before the breadcrumb (MI_FLUSH_DW). Check with the ffmpeg framemd5 bit-exact test before trusting it.
+- **Timing in `gpu video status` user_jobs:**
+  - `timed` (count) and `span_ms` (VCS jobs/s = timed / span);
+  - `prep_us`: CPU-side table build, DMA inspection and cache sync;
+  - `run_us`: the critical-section run, i.e. **time the CPU0 worker is blocked on VCS**;
+  - `release_us`;
+  - parts of the run: `reset_before_us`, `pat_us`, `init_us` (execlist takeover including its reset), `decode_us` (ELSP to breadcrumb: the hardware decode), `csb_us`, `tail_us` (stop, unbind, PAT restore, PM finish);
+  - `max_run_us`, `skipped_resets_before`, `skipped_resets_after`.
+
+  All are sums over timed jobs.
+
+**Why the asynchronous VCS lane is not in this pair.** Returning the worker to RCS/BCS while VCS decodes means leaving VCS running between forcewake critical sections. Two invariants of the current safety model forbid that, and changing them touches every GPU path:
+- **Quiescence:** `BdwObserveBcsWithWork` runs a work callback only if **every** other engine (RCS, VCS, VECS) is submission-quiescent. A busy VCS would refuse every RCS present and composite.
+  - Needed: an "owned busy" exemption. VCS is busy only with a job whose lane state Brook tracks, with its context, HWS and lease recorded, and that exemption is accepted by the RCS/BCS paths.
+- **PAT ownership:** each run establishes and then restores the global private PAT (lo/hi) through `BdwPatLease`, from the inherited firmware values (0x03030303) to 0x…07/0x…0b. The zero-copy scanout variant also changes slot 3. A VCS job in flight relies on the leased values, while RCS would restore or retarget them underneath it.
+  - Needed: one persistent GPU-wide PAT policy, established once and verified on each run instead of leased per run. It must be agreed with the scanout/zero-copy owner.
+
+With both in place, the lane is:
+1. **Submit:** critical section A does bind, init if needed, and ELSP, then returns with the job recorded as in flight.
+2. **Wait outside the claim:** the worker interleaves RCS/BCS work. It checks the breadcrumb in RAM (the completion page is CPU-readable), so no MMIO is needed until it changes.
+3. **Retire:** critical section B processes the CSB and unbinds.
+4. **Timeout:** the existing 2 s deadline then triggers reset and quarantine.
+
+A **persistent execlist context** comes with it: a lane-owned HWS page and GGTT lease, a CSB cursor kept across jobs, and no init reset. That removes the last per-job reset. The phase 4 timing above shows how much each of these is worth (`init_us` and `decode_us` against `run_us`) before that larger change.
+
+**1080p VA-API startup SIGTRAP (open):** twice on gen 398, Chromium's browser process logged "Corruption detected in shared-memory segment" (`persistent_memory_allocator.cc:890`) and died with SIGTRAP about 0.5 s after launch, before DevTools and before any decode. Software runs before and after were fine, and an earlier 720p VA-API run was fine.
+- **Hypotheses to test:**
+  1. GPU-process VA initialization (which maps BOs through the new GEM_MMAP path) corrupting an unrelated shared mapping;
+  2. a memfd or shm reuse problem;
+  3. an unrelated flake.
+- **Next step:** repeat 720p and 1080p VA-API launches on the phase 4 kernel, and if it recurs, run Chromium with `--enable-logging --v=1` plus the exec logger, capturing which segment (field-trial or histogram shm) is corrupt.
+

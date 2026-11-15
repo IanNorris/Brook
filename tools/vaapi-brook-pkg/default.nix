@@ -15,10 +15,39 @@ let
   libdrmBrook = pkgs.libdrm.overrideAttrs (old: {
     pname = "libdrm-brook-softpin";
     patches = (old.patches or []) ++ [ ./libdrm-intel-brook-softpin.patch ];
+    # Also build the static archives: i965 links libdrm_intel statically.
+    mesonFlags = (old.mesonFlags or []) ++ [ "-Ddefault_library=both" ];
   });
-  driver = pkgs.intel-vaapi-driver.override { libdrm = libdrmBrook; };
+  # i965 carries the softpin libdrm_intel inside itself, with its symbols made
+  # local (--exclude-libs). A process can already hold stock libdrm_intel.so.1
+  # before libva loads i965 (Mesa's libgallium links it, so every GL/EGL
+  # client such as Chromium's GPU process does); the dynamic loader would then
+  # satisfy i965's DT_NEEDED with that object, or bind its drm_intel_* calls
+  # to it, and every execbuffer would carry relocations Brook refuses.
+  # i965-brook-export-alloc.patch: allocate a surface's BO in
+  # vaExportSurfaceHandle (Chromium exports its frame pool before decoding).
+  driver = (pkgs.intel-vaapi-driver.override { libdrm = libdrmBrook; }).overrideAttrs (old: {
+    patches = (old.patches or []) ++ [ ./i965-brook-export-alloc.patch ];
+    preConfigure = (old.preConfigure or "") + ''
+      mkdir -p brook-pc
+      sed -e 's|^Libs:.*|Libs: ${libdrmBrook}/lib/libdrm_intel.a -Wl,--exclude-libs,libdrm_intel.a -lpciaccess|' \
+          -e 's|^Requires.private:|Requires:|' \
+          ${libdrmBrook.dev}/lib/pkgconfig/libdrm_intel.pc > brook-pc/libdrm_intel.pc
+      export PKG_CONFIG_PATH="$PWD/brook-pc''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    '';
+    buildInputs = (old.buildInputs or []) ++ [ pkgs.libpciaccess ];
+    # Fail the build if i965 still depends on a shared libdrm_intel.
+    postFixup = (old.postFixup or "") + ''
+      if readelf -d $out/lib/dri/i965_drv_video.so | grep -q 'libdrm_intel'; then
+        echo "i965 still links libdrm_intel dynamically" >&2; exit 1
+      fi
+      if nm -D --defined-only $out/lib/dri/i965_drv_video.so | grep -q ' drm_intel_'; then
+        echo "i965 exports drm_intel_ symbols" >&2; exit 1
+      fi
+    '';
+  });
 in pkgs.buildEnv {
-  name = "brook-vaapi-0.2";
+  name = "brook-vaapi-0.3";
   # ffmpeg-headless (libva-minimal, no X11/SDL) keeps the staged closure small
   # while keeping the VAAPI hwaccel.
   paths = [ pkgs.libva driver pkgs.libva-utils pkgs.ffmpeg-headless ];
