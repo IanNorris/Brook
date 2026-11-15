@@ -306,4 +306,46 @@ int64_t sys_sendmmsg(uint64_t fdVal, uint64_t msgvecVal, uint64_t vlenVal,
 int64_t sys_recvmmsg(uint64_t fdVal, uint64_t msgvecVal, uint64_t vlenVal,
                       uint64_t flagsVal, uint64_t timeoutVal, uint64_t);
 
+// syscall_process.cpp
+int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t,
+                        uint64_t, uint64_t, uint64_t);
+int64_t sys_exit(uint64_t status, uint64_t, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_exit_group(uint64_t status, uint64_t, uint64_t,
+                        uint64_t, uint64_t, uint64_t);
+int64_t sys_getpid(uint64_t, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_getppid(uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_fork(uint64_t, uint64_t, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAddr,
+                   uint64_t childTidAddr, uint64_t tlsAddr, uint64_t);
+int64_t sys_vfork(uint64_t, uint64_t, uint64_t,
+                   uint64_t, uint64_t, uint64_t);
+int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_wait4(uint64_t pidArg, uint64_t statusAddr, uint64_t rawOptions,
+                  uint64_t usageAddr, uint64_t, uint64_t);
+int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAddr,
+                   uint64_t rawOptions, uint64_t usageAddr, uint64_t);
+int64_t sys_set_tid_address(uint64_t tidptr, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t);
+int64_t sys_getpgrp(uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_getpgid(uint64_t pid, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_setpgid(uint64_t pid, uint64_t pgid, uint64_t,
+                     uint64_t, uint64_t, uint64_t);
+int64_t sys_getsid(uint64_t pid, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_setsid(uint64_t, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
+                    uint64_t, uint64_t, uint64_t);
+int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
+                   uint64_t arg4, uint64_t arg5, uint64_t);
+int64_t sys_rseq(uint64_t, uint64_t, uint64_t,
+                  uint64_t, uint64_t, uint64_t);
+
 } // namespace brook
