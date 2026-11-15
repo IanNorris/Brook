@@ -30,6 +30,7 @@
 #include "memory/address.h"
 #include "mouse.h"
 #include "window.h"
+#include "desktop_shell_surfaces.h"
 #include "debug_ui.h"
 #include "shutdown.h"
 #include "terminal.h"
@@ -1904,29 +1905,14 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
         for(int64_t row=top;row<bottom;++row)for(int64_t col=left;col<right;++col)
             pixels[uint64_t(row)*width+col]|=0xff000000u;
     };
-    WmRenderTaskbar(pixels,width,width,height,now,mouseX,mouseY);
-    const uint32_t tbY=WmDesktopHeight(height);opaque(0,tbY,width,height-tbY);
-    rects[rectCount++]={0,int32_t(tbY),width,height-tbY};
-    if(WmLauncherVisible()){
-        int32_t x=0,y=0;uint32_t w=0,h=0;WmLauncherGetRect(width,height,&x,&y,&w,&h);
-        WmLauncherRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
-        rects[rectCount++]={x,y,w,h};
-    }else if(WmVolumePopupVisible()){
-        // Exclusive with the launcher, so the four-rectangle budget holds.
-        int32_t x=0,y=0;uint32_t w=0,h=0;WmVolumePopupGetRect(width,height,&x,&y,&w,&h);
-        WmVolumePopupRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
-        rects[rectCount++]={x,y,w,h};
-    }else{
-        int32_t x=0,y=0;uint32_t w=0,h=0;
-        if(WmTrayTooltipGetRect(width,height,mouseX,mouseY,&x,&y,&w,&h)){
-            WmTrayTooltipRender(pixels,width,width,height,mouseX,mouseY);opaque(x,y,w,h);
-            rects[rectCount++]={x,y,w,h};
-        }
-    }
-    int32_t x=0,y=0;uint32_t w=0,h=0;
-    if(WmBootSummaryRect(width,height,&x,&y,&w,&h)){
-        WmRenderBootSummary(pixels,width,width,height);opaque(x,y,w,h);
-        rects[rectCount++]={x,y,w,h};
+    // At most three shell surfaces, so the four-rectangle budget (plus the
+    // optional cursor appended by CaptureDesktopOverlay) holds.
+    WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
+    const uint32_t surfaceCount=WmShellSurfaces(width,height,mouseX,mouseY,surfaces);
+    for(uint32_t i=0;i<surfaceCount;++i){
+        const auto& s=surfaces[i];
+        WmRenderShellSurface(s,pixels,width,width,height,now,mouseX,mouseY);opaque(s.x,s.y,s.w,s.h);
+        rects[rectCount++]={s.x,s.y,s.w,s.h};
     }
     for(uint32_t i=0;i<rectCount;++i)g_debugFrameDirty[i]=rects[i];
     g_debugFrameDirtyCount=rectCount;
@@ -2384,56 +2370,41 @@ static void CompositorLoopWM()
         }
     }
 
-    // 3. Render taskbar at bottom of screen + launcher popup if open.
-    uint32_t tbY = WmDesktopHeight(g_physFbHeight);
+    // 3. Render the shell surfaces (taskbar and the shared popup slot) over
+    // the windows. The boot summary is drawn below, also while a renderer
+    // holds the lease.
     const bool cpuOverlayLeased=!drawOverlayLayer && rendererLeased;
+    auto markShellDirty=[](const WmShellSurface& s){
+        const int64_t bottom=int64_t(s.y)+s.h;
+        MarkDirtyRows(s.y>0?uint32_t(s.y):0,bottom>int64_t(g_physFbHeight)?g_physFbHeight:bottom>0?uint32_t(bottom):0);
+    };
+    WmShellSurface shellSurfaces[WM_SHELL_SURFACE_LIMIT];
+    const uint32_t shellSurfaceCount=(drawOverlayLayer || (g_backBuffer && !cpuOverlayLeased))?
+        WmShellSurfaces(g_physFbWidth,g_physFbHeight,chromeMx,chromeMy,shellSurfaces):0;
     if (drawOverlayLayer)
     {
         // GPU DRAW: render into the overlay layer (composited on top of windows
-        // at g_overlayOpacity). Clear+redraw the taskbar strip each frame; mark
-        // its pixels opaque by geometry (solid full-width strip).
-        OverlayClearRect(0, (int)tbY, (int)g_physFbWidth, (int)WmMetric(WM_TASKBAR_HEIGHT));
-        WmRenderTaskbar(g_overlayBuffer, g_backBufStride,
-                        g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
-        OverlaySetAlphaRect(0, (int)tbY, (int)g_physFbWidth, (int)WmMetric(WM_TASKBAR_HEIGHT));
-        MarkDirtyRows(tbY, g_physFbHeight);
-
-        int32_t lx, ly; uint32_t lw, lh;
-        WmLauncherGetRect(g_physFbWidth, g_physFbHeight, &lx, &ly, &lw, &lh);
-        if (WmLauncherVisible())
-        {
-            OverlayClearRect(lx, ly, (int)lw, (int)lh);
-            WmLauncherRender(g_overlayBuffer, g_backBufStride,
-                             g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
-            OverlaySetAlphaRect(lx, ly, (int)lw, (int)lh);
-            MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
-            g_overlayLauncherShown = true;
-        }
-        else if (g_overlayLauncherShown)
+        // at g_overlayOpacity). Clear+redraw each surface every frame; mark its
+        // pixels by geometry (solid hard-edged rectangles).
+        if (!WmLauncherVisible() && g_overlayLauncherShown)
         {
             // Launcher just closed — erase its pixels from the overlay.
+            int32_t lx, ly; uint32_t lw, lh;
+            WmLauncherGetRect(g_physFbWidth, g_physFbHeight, &lx, &ly, &lw, &lh);
             OverlayClearRect(lx, ly, (int)lw, (int)lh);
-            MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
+            markShellDirty({WmShellSurfaceKind::Launcher, lx, ly, lw, lh, true});
             g_overlayLauncherShown = false;
         }
-        if (WmVolumePopupVisible())
+        for (uint32_t i = 0; i < shellSurfaceCount; ++i)
         {
-            int32_t vx, vy; uint32_t vw, vh;
-            WmVolumePopupGetRect(g_physFbWidth, g_physFbHeight, &vx, &vy, &vw, &vh);
-            OverlayClearRect(vx, vy, (int)vw, (int)vh);
-            WmVolumePopupRender(g_overlayBuffer, g_backBufStride,
-                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
-            OverlaySetAlphaRect(vx, vy, (int)vw, (int)vh);
-            MarkDirtyRows(vy > 0 ? (uint32_t)vy : 0, (uint32_t)(vy + (int)vh));
-        }
-        int32_t tx, ty; uint32_t tw, th;
-        if (WmTrayTooltipGetRect(g_physFbWidth, g_physFbHeight, chromeMx, chromeMy, &tx, &ty, &tw, &th))
-        {
-            OverlayClearRect(tx, ty, (int)tw, (int)th);
-            WmTrayTooltipRender(g_overlayBuffer, g_backBufStride,
-                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
-            OverlaySetAlphaRect(tx, ty, (int)tw, (int)th);
-            MarkDirtyRows(ty > 0 ? (uint32_t)ty : 0, (uint32_t)(ty + (int)th));
+            const WmShellSurface& s = shellSurfaces[i];
+            if (s.kind == WmShellSurfaceKind::BootSummary) continue;
+            OverlayClearRect(s.x, s.y, (int)s.w, (int)s.h);
+            WmRenderShellSurface(s, g_overlayBuffer, g_backBufStride,
+                                 g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
+            OverlaySetAlphaRect(s.x, s.y, (int)s.w, (int)s.h);
+            markShellDirty(s);
+            if (s.kind == WmShellSurfaceKind::Launcher) g_overlayLauncherShown = true;
         }
     }
     else if (g_backBuffer && cpuOverlayLeased)
@@ -2446,36 +2417,13 @@ static void CompositorLoopWM()
     else if (g_backBuffer)
     {
         ++g_idleStats.cpuOverlayDraws;
-        WmRenderTaskbar(g_backBuffer, g_backBufStride,
-                        g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
-        MarkDirtyRows(tbY, g_physFbHeight);
-
-        // Render launcher popup over everything if open
-        if (WmLauncherVisible())
+        for (uint32_t i = 0; i < shellSurfaceCount; ++i)
         {
-            WmLauncherRender(g_backBuffer, g_backBufStride,
-                             g_physFbWidth, g_physFbHeight,
-                             chromeMx, chromeMy);
-            // Mark the launcher area dirty (it's above the taskbar)
-            int32_t lx, ly; uint32_t lw, lh;
-            WmLauncherGetRect(g_physFbWidth, g_physFbHeight, &lx, &ly, &lw, &lh);
-            const uint32_t top=ly>0?uint32_t(ly):0;
-            MarkDirtyRows(top, uint32_t(int64_t(ly)+lh)>g_physFbHeight?g_physFbHeight:uint32_t(int64_t(ly)+lh));
-        }
-        if (WmVolumePopupVisible())
-        {
-            int32_t vx, vy; uint32_t vw, vh;
-            WmVolumePopupGetRect(g_physFbWidth, g_physFbHeight, &vx, &vy, &vw, &vh);
-            WmVolumePopupRender(g_backBuffer, g_backBufStride,
-                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
-            MarkDirtyRows(vy > 0 ? (uint32_t)vy : 0, (uint32_t)(vy + (int)vh));
-        }
-        int32_t tx, ty; uint32_t tw, th;
-        if (WmTrayTooltipGetRect(g_physFbWidth, g_physFbHeight, chromeMx, chromeMy, &tx, &ty, &tw, &th))
-        {
-            WmTrayTooltipRender(g_backBuffer, g_backBufStride,
-                                g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
-            MarkDirtyRows(ty > 0 ? (uint32_t)ty : 0, (uint32_t)(ty + (int)th));
+            const WmShellSurface& s = shellSurfaces[i];
+            if (s.kind == WmShellSurfaceKind::BootSummary) continue;
+            WmRenderShellSurface(s, g_backBuffer, g_backBufStride,
+                                 g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
+            markShellDirty(s);
         }
     }
     if(showSummary) {
@@ -3864,46 +3812,28 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     }
 
     const uint32_t overlayOpacity=(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE)?255:g_overlayOpacity;
-    // Taskbar (and launcher) on top of all windows, composited from the alpha
-    // overlay layer at g_overlayOpacity (translucent-capable; the launcher sits
-    // above windows). Populated in WM mode only; legacy mode has no taskbar.
+    // Shell surfaces (taskbar, popup slot, boot summary) on top of all windows,
+    // composited from the alpha overlay layer: material surfaces at
+    // g_overlayOpacity over one shared blurred backdrop, the boot summary
+    // opaque. Populated in WM mode only; legacy mode has no taskbar.
     if (useOverlayLayer)
     {
+        int32_t mx = 0, my = 0;
+        MouseGetPosition(&mx, &my);
+        WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
+        const uint32_t count = WmShellSurfaces(scrW, scrH, mx, my, surfaces);
         if(CompositorGlassActive() && CompositorMaterialBlur()>0) {
             gpu->BlurBarrier(CompositorMaterialBlur());
-            GpuComposeRectBlur(gpu,0,scrH-WmMetric(WM_TASKBAR_HEIGHT),scrW,WmMetric(WM_TASKBAR_HEIGHT));
-            if(WmLauncherVisible()) {int32_t x,y;uint32_t w,h;WmLauncherGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
-            if(WmVolumePopupVisible()) {int32_t x,y;uint32_t w,h;WmVolumePopupGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
-            {int32_t mx=0,my=0,x,y;uint32_t w,h;MouseGetPosition(&mx,&my);
-             if(WmTrayTooltipGetRect(scrW,scrH,mx,my,&x,&y,&w,&h))GpuComposeRectBlur(gpu,x,y,w,h);}
+            for (uint32_t i = 0; i < count; ++i)
+                if (surfaces[i].material)
+                    GpuComposeRectBlur(gpu, surfaces[i].x, surfaces[i].y, (int)surfaces[i].w, (int)surfaces[i].h);
         }
-        GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WmMetric(WM_TASKBAR_HEIGHT),
-                          (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), overlayOpacity, true);
-        if (WmLauncherVisible())
+        for (uint32_t i = 0; i < count; ++i)
         {
-            int32_t lx, ly; uint32_t lw, lh;
-            WmLauncherGetRect(scrW, scrH, &lx, &ly, &lw, &lh);
-            GpuComposeSrcRect(gpu, g_overlayTex, lx, ly, (int)lw, (int)lh,
-                              overlayOpacity, true);
+            const WmShellSurface& s = surfaces[i];
+            GpuComposeSrcRect(gpu, g_overlayTex, s.x, s.y, (int)s.w, (int)s.h,
+                              s.material ? overlayOpacity : 255, true);
         }
-        if (WmVolumePopupVisible())
-        {
-            int32_t vx, vy; uint32_t vw, vh;
-            WmVolumePopupGetRect(scrW, scrH, &vx, &vy, &vw, &vh);
-            GpuComposeSrcRect(gpu, g_overlayTex, vx, vy, (int)vw, (int)vh,
-                              overlayOpacity, true);
-        }
-        {
-            int32_t mx = 0, my = 0, tx, ty; uint32_t tw, th;
-            MouseGetPosition(&mx, &my);
-            if (WmTrayTooltipGetRect(scrW, scrH, mx, my, &tx, &ty, &tw, &th))
-                GpuComposeSrcRect(gpu, g_overlayTex, tx, ty, (int)tw, (int)th, overlayOpacity, true);
-        }
-    }
-
-    if(useOverlayLayer) {
-        int32_t x,y;uint32_t w,h;
-        if(WmBootSummaryRect(scrW,scrH,&x,&y,&w,&h))GpuComposeSrcRect(gpu,g_overlayTex,x,y,w,h,255,true);
     }
     // Cursor (alpha) on top of everything.
     if (!WmPointerCaptureActive() && __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) && g_cursorTex &&
