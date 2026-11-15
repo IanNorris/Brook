@@ -1,0 +1,19 @@
+// syscall_mount.cpp -- mount namespace syscalls: mount/umount2/pivot_root.
+//
+// Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
+// Adapted from Enkel OS (IanNorris/Enkel, MIT license).
+
+#include "mount_namespace.h"
+#include "tmpfs_mount_options.h"
+#include "process_user_namespace.h"
+
+#include "user_copy.h"
+#include "syscall_internal.h"
+#include "syscall_open.h"
+#include "syscall_handlers.h"
+
+namespace brook {
+
+#include "syscall_mount_namespace.inc"
+
+} // namespace brook

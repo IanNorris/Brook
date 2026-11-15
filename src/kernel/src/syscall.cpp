@@ -2377,7 +2377,6 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     SerialPrintf("sys_ioctl: unhandled fd=%lu cmd=0x%lx\n", fd, cmd);
     return -ENOSYS;
 }
-#include "syscall_mount_namespace.inc"
 
 // ---------------------------------------------------------------------------
 // Identity syscalls: getuid/getgid/geteuid/getegid/setuid/setgid

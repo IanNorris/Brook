@@ -1,7 +1,7 @@
 // Bounded mount slice: directory binds, private-only propagation and detach.
 // No shared/master topology exists; reject types that would create one.
-static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
-                         uint64_t flags,uint64_t dataAddr,uint64_t)
+int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
+                  uint64_t flags,uint64_t dataAddr,uint64_t)
 {
     constexpr uint64_t Bind=0x1000,Remount=0x20,Recursive=0x4000,Silent=0x8000;
     // Linux accepts the historical magic prefix only when all its bits match.
@@ -61,8 +61,8 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     if(!source[0])return -ENOENT;
     return VfsMountNamespaceBindAt(lookup.fs.mountNamespace,lookup.fs.root,lookup.fs.cwd,source,target,(flags&Recursive)!=0);
 }
-static int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
-                           uint64_t,uint64_t,uint64_t)
+int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
+                    uint64_t,uint64_t,uint64_t)
 {
     if(flags!=2)return -EINVAL;
     auto* process=ProcessCurrent();if(!process)return -EPERM;
@@ -76,7 +76,7 @@ static int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
     VfsPathRelease(path);return error;
 }
 
-static int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_t,uint64_t,uint64_t)
+int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     auto* process=ProcessCurrent();if(!process)return -EPERM;
     char newName[512],oldName[512];

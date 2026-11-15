@@ -257,4 +257,11 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAddr,
 int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
                        uint64_t length, uint64_t, uint64_t);
 
+// syscall_mount.cpp
+int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
+                  uint64_t flags,uint64_t dataAddr,uint64_t);
+int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
+                    uint64_t,uint64_t,uint64_t);
+int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_t,uint64_t,uint64_t);
+
 } // namespace brook
