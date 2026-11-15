@@ -704,6 +704,7 @@ static bool StartKernelWorker(BdwSubmissionWorker& worker,void* context,
 #if defined(BROOK_BDW_VIDEO_ENGINE)
     // VA-API phase 4: the VCS lane parks in-flight video jobs on the worker.
     hooks.pollParked=[](void*,BdwExecSnapshot* snapshot,BdwSubmissionOutcome& out){return BdwVcsLanePoll(snapshot,out);};
+    hooks.parkedIdle=[](void*){if(!(BdwVideoUserTuning()&BdwVcsTuneLaneSpin))return false;SchedulerYield();return true;};
 #endif
     hooks.recover=[](void*){KernelPanic("Broadwell submission worker requires recovery");};
     // Log the first failures of each kind: a failed job fails its fences and

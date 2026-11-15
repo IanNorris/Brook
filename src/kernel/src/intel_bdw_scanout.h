@@ -307,7 +307,10 @@ struct BdwVcsUserCounts {uint64_t jobs=0,completed=0,refused=0,failed=0,retries=
     // Phase 4 lane: jobs completed through the lane, their submit-to-retire
     // latency sum, complete attempts refused before any device access, and
     // the worker's parked jobs / jobs run while one was parked.
-    uint64_t laneJobs=0,laneLatencyUs=0,laneCompleteRetries=0,parked=0,overlapped=0;};
+    uint64_t laneJobs=0,laneLatencyUs=0,laneCompleteRetries=0,parked=0,overlapped=0;
+    // Lane timing sums: submit to first breadcrumb sighting, sighting to
+    // retired, and breadcrumb polls.
+    uint64_t laneCrumbUs=0,laneRetireUs=0,lanePolls=0;};
 void BdwApplicationWorkerParkedCounts(uint64_t& parked,uint64_t& overlapped);
 void BdwVideoUserCountsRead(BdwVcsUserCounts& out);
 bool BdwVideoSetEnabled(bool on,BdwVideoRefusal& refusal);

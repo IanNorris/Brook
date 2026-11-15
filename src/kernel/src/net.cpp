@@ -5938,7 +5938,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         {struct {const char* c;uint32_t bit;bool on;} knobs[]={
              {"gpu video tune resets min",BdwVcsTuneMinimalResets,true},{"gpu video tune resets full",BdwVcsTuneMinimalResets,false},
              {"gpu video tune coherent on",BdwVcsTuneCoherent,true},{"gpu video tune coherent off",BdwVcsTuneCoherent,false},
-             {"gpu video tune async on",BdwVcsTuneAsync,true},{"gpu video tune async off",BdwVcsTuneAsync,false}};
+             {"gpu video tune async on",BdwVcsTuneAsync,true},{"gpu video tune async off",BdwVcsTuneAsync,false},
+             {"gpu video tune spin on",BdwVcsTuneLaneSpin,true},{"gpu video tune spin off",BdwVcsTuneLaneSpin,false}};
          for(const auto& k:knobs)if(NetStrEq(cmd,k.c)){
              if(k.on)__atomic_or_fetch(&BdwVideoUserTuningStorage(),k.bit,__ATOMIC_ACQ_REL);
              else __atomic_and_fetch(&BdwVideoUserTuningStorage(),~k.bit,__ATOMIC_ACQ_REL);
@@ -5992,7 +5993,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
              r.text(",");r.field("span_ms",c.lastJobNs>c.firstJobNs?(c.lastJobNs-c.firstJobNs)/1000000:0);
              r.text(",");r.field("lane_jobs",c.laneJobs);r.text(",");r.field("lane_latency_us",c.laneLatencyUs);
              r.text(",");r.field("lane_complete_retries",c.laneCompleteRetries);r.text(",");r.field("parked",c.parked);
-             r.text(",");r.field("overlapped",c.overlapped);r.text(",\"lane_busy\":");r.text(BdwVcsLaneBusy()?"true":"false");r.text("}");}
+             r.text(",");r.field("overlapped",c.overlapped);r.text(",");r.field("lane_crumb_us",c.laneCrumbUs);
+             r.text(",");r.field("lane_retire_us",c.laneRetireUs);r.text(",");r.field("lane_polls",c.lanePolls);r.text(",\"lane_busy\":");r.text(BdwVcsLaneBusy()?"true":"false");r.text("}");}
             r.text(",");r.field("selftests",g.selftests());r.text(",");r.field("selftest_passes",g.selftestPasses());
             r.text(",");r.field("retries",g.retries());
             r.text(",\"detail\":\"");r.text(g.detail());r.text("\"");

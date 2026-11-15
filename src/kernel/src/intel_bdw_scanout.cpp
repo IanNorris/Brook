@@ -443,7 +443,8 @@ void BdwVideoUserCountsRead(BdwVcsUserCounts& out){
      out.resetBeforeUs=c.resetBeforeUs;out.patUs=c.patUs;out.initUs=c.initUs;out.decodeUs=c.decodeUs;out.csbUs=c.csbUs;
      out.tailUs=c.tailUs;out.maxRunUs=c.maxRunUs;out.skippedResetsBefore=c.skippedResetsBefore;
      out.skippedResetsAfter=c.skippedResetsAfter;out.firstJobNs=c.firstJobNs;out.lastJobNs=c.lastJobNs;
-     out.laneJobs=c.laneJobs;out.laneLatencyUs=c.laneLatencyUs;out.laneCompleteRetries=c.laneCompleteRetries;}
+     out.laneJobs=c.laneJobs;out.laneLatencyUs=c.laneLatencyUs;out.laneCompleteRetries=c.laneCompleteRetries;
+     out.laneCrumbUs=c.laneCrumbUs;out.laneRetireUs=c.laneRetireUs;out.lanePolls=c.lanePolls;}
 #if defined(BROOK_BDW_VIDEO_ENGINE) && defined(BROOK_SSD_AUTO_RECOVERY)
     BdwApplicationWorkerParkedCounts(out.parked,out.overlapped);
 #endif
@@ -751,7 +752,7 @@ BdwSubmissionOutcome VcsUserRefuse(BdwExecSnapshot* snapshot,const char* reason)
 }
 // The phase 4 lane's one in-flight job (CPU0 worker only).
 struct VcsLaneJob {BdwExecSnapshot* snapshot=nullptr;uint32_t pid=0,ctx=0;uint64_t startNs=0,preparedNs=0,submittedNs=0,deadlineNs=0;
-    BdwGgttReservation reservation{};BdwOwnedPage scratch{};uint64_t submitRunUs=0;};
+    BdwGgttReservation reservation{};BdwOwnedPage scratch{};uint64_t submitRunUs=0,crumbNs=0;uint32_t polls=0;};
 VcsLaneJob vcsLane{};
 // The common end of a VCS user job (synchronous run or lane completion).
 // blockedUs: time the worker spent in VCS critical sections for this job.
@@ -889,7 +890,10 @@ static BdwSubmissionOutcome ExecuteVcsUserJob(BdwExecSnapshot* snapshot){
 bool BdwVcsLanePoll(BdwExecSnapshot* snapshot,BdwSubmissionOutcome& o){
     if(!vcsLane.snapshot || snapshot!=vcsLane.snapshot){o={false,false};return true;}
     const uint64_t now=TscClockReadNs();
-    if(!BdwVcsUserLaneBreadcrumb() && now<vcsLane.deadlineNs)return false;
+    ++vcsLane.polls;
+    const bool crumb=vcsLane.crumbNs || BdwVcsUserLaneBreadcrumb();
+    if(crumb && !vcsLane.crumbNs)vcsLane.crumbNs=now;
+    if(!crumb && now<vcsLane.deadlineNs)return false;
     RetryLease lease(&diagnosticOwner,1);if(!lease.held)return false;
     const auto& tsc=NativeTscObserveRead();
     if(!tsc.khz)return false;
@@ -900,6 +904,9 @@ bool BdwVcsLanePoll(BdwExecSnapshot* snapshot,BdwSubmissionOutcome& o){
     if(result==BdwVcsUserClass::RefusedUntouched){++vcsUserCounts.laneCompleteRetries;return false;}
     const uint64_t t1=TscClockReadNs();
     const auto lane=vcsLane;vcsLane={};
+    if(lane.crumbNs>lane.submittedNs){vcsUserCounts.laneCrumbUs+=(lane.crumbNs-lane.submittedNs)/1000;
+        vcsUserCounts.laneRetireUs+=(t1-lane.crumbNs)/1000;}
+    vcsUserCounts.lanePolls+=lane.polls;
     o=ConcludeVcsUserJob(snapshot,result,out,run,lane.pid,lane.ctx,lane.startNs,lane.preparedNs,t1,
                          lane.submitRunUs+(t1-t0)/1000,tsc.khz,true);
     return true;
