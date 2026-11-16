@@ -2516,6 +2516,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         SerialPuts("WM: shortcut Escape launcher closed\n");
         break;
     case GlobalShortcutAction::CloseVolumePopup:WmVolumePopupClose();break;
+    case GlobalShortcutAction::LauncherPromptKey:WmLauncherPowerKey(r.key);break;
     case GlobalShortcutAction::CloseFocusedWindow: {
         // The same advisory close as the title-bar button and semantic action:
         // xdg_toplevel.close, WM_DELETE_WINDOW via the XWM, or a native signal.
@@ -2567,6 +2568,7 @@ static void CompositorInputWM()
             GlobalShortcutContext context{};
             context.launcherVisible=WmLauncherVisible();
             context.volumePopupVisible=WmVolumePopupVisible();
+            context.launcherPrompt=WmLauncherPowerPrompt();
             const GlobalShortcutResult shortcut=g_globalShortcuts.Key(
                 ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
             CompositorRunShortcut(shortcut);

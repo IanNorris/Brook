@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include "global_shortcuts.h"
 using namespace brook;
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);std::abort();}} while(0)
@@ -91,8 +92,26 @@ static void escape() {
     CHECK(down(s,0x10).deliver && up(s,0x10).deliver);
 }
 
+static void launcherPrompt() {
+    GlobalShortcuts s;GlobalShortcutContext prompt{};prompt.launcherVisible=true;prompt.launcherPrompt=true;
+    // The prompt owns its keys; Escape dismisses it instead of closing the launcher.
+    for(uint8_t sc:{GlobalShortcuts::ScEscape,GlobalShortcuts::ScEnter,GlobalShortcuts::ScTab,SC_EXT_LEFT,SC_EXT_RIGHT}) {
+        auto r=down(s,sc,0,prompt);CHECK(!r.deliver && r.action==Action::LauncherPromptKey && r.key==sc);
+        r=down(s,sc,0,prompt);CHECK(!r.deliver && r.action==Action::None); // auto-repeat does not re-fire
+        CHECK(!up(s,sc,0,prompt).deliver);
+    }
+    // Other keys, and Alt+Tab, keep their meaning.
+    CHECK(down(s,0x10,0,prompt).deliver && up(s,0x10,0,prompt).deliver);
+    CHECK(down(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT,prompt).action==Action::CycleFocus);
+    CHECK(!up(s,GlobalShortcuts::ScTab,INPUT_MOD_ALT,prompt).deliver);
+    // Without the prompt, Enter reaches the client: there is no keyboard path to power.
+    GlobalShortcutContext launcher{};launcher.launcherVisible=true;
+    auto r=down(s,GlobalShortcuts::ScEnter,0,launcher);CHECK(r.deliver && r.action==Action::None);
+    CHECK(up(s,GlobalShortcuts::ScEnter,0,launcher).deliver);
+}
+
 int main() {
-    superTap();superChord();altF4();escape();
+    superTap();superChord();altF4();escape();launcherPrompt();
     std::puts("global shortcuts: ok");
     return 0;
 }

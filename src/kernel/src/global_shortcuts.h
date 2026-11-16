@@ -25,17 +25,20 @@ enum class GlobalShortcutAction : uint8_t {
     CycleFocus,
     SpawnTerminal,
     ToggleGlass,
+    LauncherPromptKey, // Enter/Escape/Tab/Left/Right for the launcher power prompt
 };
 
 struct GlobalShortcutResult {
     bool deliver = true;          // route the event to clients as usual
     bool releasePointer = false;  // revoke pointer capture and show the cursor
     GlobalShortcutAction action = GlobalShortcutAction::None;
+    uint8_t key = 0;              // scan code for LauncherPromptKey
 };
 
 struct GlobalShortcutContext {
     bool launcherVisible = false;
     bool volumePopupVisible = false;
+    bool launcherPrompt = false;  // launcher power confirmation showing
 };
 
 class GlobalShortcuts {
@@ -71,7 +74,13 @@ public:
         if (m_super) m_superChord = true;
         const bool super = m_super || (mods & INPUT_MOD_SUPER);
         const bool alt = (mods & INPUT_MOD_ALT) != 0;
-        if (scan == ScEscape && context.volumePopupVisible) r.action = GlobalShortcutAction::CloseVolumePopup;
+        if (context.launcherPrompt && !super && !alt &&
+            (scan == ScEscape || scan == ScEnter || scan == ScTab || scan == SC_EXT_LEFT || scan == SC_EXT_RIGHT)) {
+            // The prompt owns its keys; Escape dismisses it before closing the launcher.
+            r.action = GlobalShortcutAction::LauncherPromptKey;
+            r.key = scan;
+        }
+        else if (scan == ScEscape && context.volumePopupVisible) r.action = GlobalShortcutAction::CloseVolumePopup;
         else if (scan == ScEscape && context.launcherVisible) r.action = GlobalShortcutAction::CloseLauncher;
         else if (alt && scan == ScF4) r.action = GlobalShortcutAction::CloseFocusedWindow;
         else if (alt && scan == ScTab) r.action = GlobalShortcutAction::CycleFocus;

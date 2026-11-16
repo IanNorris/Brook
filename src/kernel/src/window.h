@@ -640,8 +640,14 @@ bool WmSnapshotLaunch(uint64_t token,LaunchRecord* out);
 uint32_t WmSnapshotLaunches(LaunchRecord* out,uint32_t capacity);
 void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared);
 
-// Launch the item at the given index.
+// Launch the item at the given index. Hit-test results at or above
+// WM_LAUNCHER_MAX_ITEMS are footer power targets: a power button only arms a
+// confirmation prompt; the separate confirm button performs it.
 void WmLauncherExec(int itemIdx);
+// The launcher power confirmation is showing; it owns Enter, Escape, Tab and
+// Left/Right until dismissed.
+bool WmLauncherPowerPrompt();
+void WmLauncherPowerKey(uint8_t scan);
 void WmSetLaunchInhibited(bool inhibited);
 bool WmLauncherDispatching();
 
