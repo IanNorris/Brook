@@ -92,6 +92,22 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Ready, not deployed: `work/compositor-refactor` (`c5fab410`, rebased on main 73409c2a; trial merge with work/shell-opaque is clean).**
+- **Stages done:**
+  - 0.1: one shell-surface list;
+  - 0.2: theme tokens and one metrics source;
+  - 0.3: window.cpp split into `chrome_raster.{h,cpp}`, `wm_shell_taskbar.inc`, `wm_shell_launcher.inc` (4234 → 3155 lines, pure move);
+  - 0.4: `chrome_alpha.h`, one opaque-frame rule for virgl and VKRENDER;
+  - 0.5: shell damage driven by the list.
+- **Checks:** QEMU CPU path pixel-identical; virgl glass path identical outside blur halos from the build label and caret. Soak: no freezes in 9 boots (QEMU stalls track host contention; see `work/sched-convoy`).
+- **Next stage:** 1.1, a part table for drawing and hit-testing, absorbing chrome-csd's caption overlay. Stage 1.3 should extend shell-opaque's band opacity and keys to window frames.
+
+**Suggested next integration (`work/integration23`):** main + `work/shell-opaque` + `work/compositor-refactor` + `work/storage-io` + `work/sched-convoy`, plus the zero-copy auto-arm fix (flip probe, then arm at renderer registration), then:
+1. Dell measurements: Q2 with the launcher open vs closed (expect ~72 both ways); `bridge hardware ahci-ro` (MSI working?); `sched lock-stats` during Q2/Steam.
+2. Ian's hands-on checks: clickpad, power confirmation, Chromium caption colour.
+3. With Ian's approval for the brook-xwm store staging, add `work/xwayland-hidpi` (+ `work/steam-rootless-hidpi`) and retest Stardew.
+4. Then the Xwayland dma-buf presentation investigation (Torchlight II and Stardew at ~10 fps through CPU copies).
+
 **Ready, not deployed: `work/sched-convoy` (`b09d19e5`, `177f5240`).** Note: `docs/sched-lock-convoy.md`.
 - **Cause of the QEMU freezes:** FIFO ticket-lock waiter preemption under an overcommitted hypervisor. Ready lock 86.7% contended; 588 s total wait vs 1.6 s total hold. Not long critical sections.
 - **Fixes:**
