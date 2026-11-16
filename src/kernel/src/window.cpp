@@ -943,6 +943,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.noChrome = false;
     w.captionOverlay = false;
     w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0;
+    w.captionStyle = 0;
     w.focusable = focusable;
     w.savedX = x;
     w.savedY = y;
@@ -1288,7 +1289,8 @@ Window* WmGetWindow(int idx)
 }
 
 void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
-                               uint16_t insetRight, uint16_t insetTop, uint16_t captionHeight)
+                               uint16_t insetRight, uint16_t insetTop, uint16_t captionHeight,
+                               uint32_t captionStyle)
 {
     VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
@@ -1296,15 +1298,17 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
     if (!w.proc) return;
     captionOverlay = enable && captionOverlay;
     if (!captionOverlay) insetRight = insetTop = captionHeight = 0;
+    if (!captionOverlay || !(captionStyle & DesktopCaptionStyleValid)) captionStyle = 0;
     if (w.noChrome == enable && w.captionOverlay == captionOverlay &&
         w.captionInsetRight == insetRight && w.captionInsetTop == insetTop &&
-        w.captionHeight == captionHeight) return;
+        w.captionHeight == captionHeight && w.captionStyle == captionStyle) return;
     const bool modeChanged = w.noChrome != enable || w.captionOverlay != captionOverlay;
     w.noChrome = enable;
     w.captionOverlay = captionOverlay;
     w.captionInsetRight = insetRight;
     w.captionInsetTop = insetTop;
     w.captionHeight = captionHeight;
+    w.captionStyle = captionStyle;
     if (!modeChanged) { extern void CompositorMarkDirty(); CompositorMarkDirty(); return; }
     // Mark compositor dirty so the chrome region repaints/clears next frame.
     extern void CompositorMarkDirty();
@@ -1795,20 +1799,37 @@ const ChromeMaterialCache& WmChromeMaterial(){
 }
 uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
 
+// Fill clipped to a rounded top-right corner of `block` (radius 0: plain).
+static void FillCornerClipped(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                              int x, int y, int width, int height, uint32_t color,
+                              const WmRect& block, unsigned radius)
+{
+    if (!radius) { WmFillRect(buf, stride, screenW, screenH, x, y, width, height, color); return; }
+    for (int row = y; row < y + height; ++row)
+    {
+        const int r = row - block.y;
+        const int right = block.x + block.w - (r >= 0 ? static_cast<int>(ChromeCornerInset(radius, static_cast<unsigned>(r))) : 0);
+        const int end = x + width < right ? x + width : right;
+        if (end > x) WmFillRect(buf, stride, screenW, screenH, x, row, end - x, 1, color);
+    }
+}
+
 static void RenderCaptionButtons(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
                                  const Window& w, uint32_t bg, uint32_t fg, bool material,
-                                 int32_t mouseX, int32_t mouseY)
+                                 int32_t mouseX, int32_t mouseY,
+                                 uint32_t hoverBg, uint32_t hoverInk,
+                                 const WmRect& clip = WmRect{}, unsigned radius = 0)
 {
     for (int button = 0; button < 3; ++button)
     {
         const WmRect r = CaptionRect(w, button);
         const bool hover = r.contains(mouseX, mouseY);
         if(material)WmFillRect(buf,stride,screenW,screenH,r.x,r.y,1,r.h,ChromeMix(bg,0xffffff,20));
-        if (hover) WmFillRect(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
-                             button == 0 ? WmCurrentPalette().closeHover : WmCurrentPalette().captionHover);
+        if (hover) FillCornerClipped(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
+                             button == 0 ? WmCurrentPalette().closeHover : hoverBg, clip, radius);
         if (r.w < static_cast<int>(WmMetric(14))) continue;
         const uint32_t ink = hover && button == 0 ? WmCurrentPalette().closeText :
-                             hover ? WmCurrentPalette().text : fg;
+                             hover ? hoverInk : fg;
         const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
         if (button == 0)
         {
@@ -1830,7 +1851,7 @@ static void RenderCaptionButtons(uint32_t* buf, uint32_t stride, uint32_t screen
             {
                 box(cx - WmMetric(2), cy - WmMetric(5), WmMetric(8), WmMetric(8));
                 WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8),
-                           hover ? WmCurrentPalette().captionHover : bg);
+                           hover ? hoverBg : bg);
                 box(cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8));
             }
             else box(cx - WmMetric(5), cy - WmMetric(4), WmMetric(11), WmMetric(9));
@@ -1858,8 +1879,25 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
         // rest of its top edge (Chromium's tab strip).
         const WmRect block = WmCaptionOverlayRect(w);
         if (block.w <= 0 || block.h <= 0) return;
+        if (w.captionStyle & DesktopCaptionStyleValid)
+        {
+            // Matched to the client's strip (as Chromium's own buttons, or
+            // macOS/Windows controls over an app-drawn title area): the strip
+            // colour hides the client's buttons underneath, glyphs contrast
+            // with it, hover is a light tint and close hover stays red.
+            const uint32_t strip = 0xff000000u | DesktopCaptionStyleRgb(w.captionStyle);
+            const uint32_t ink = DesktopCaptionInk(strip & 0xffffff);
+            const uint32_t idle = w.focused ? ink : ChromeMix(ink, strip, 100);
+            const uint32_t hoverBg = 0xff000000u | ChromeMix(strip, ink, 28);
+            const unsigned radius = w.state == WindowState::Maximized ? 0 : DesktopCaptionStyleRadius(w.captionStyle);
+            FillCornerClipped(buf, stride, screenW, screenH, block.x, block.y, block.w, block.h, strip, block, radius);
+            RenderCaptionButtons(buf, stride, screenW, screenH, w, strip, idle | 0xff000000u, false,
+                                 mouseX, mouseY, hoverBg, ink | 0xff000000u, block, radius);
+            return;
+        }
         WmFillRect(buf, stride, screenW, screenH, block.x, block.y, block.w, block.h, bg);
-        RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, false, mouseX, mouseY);
+        RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, false, mouseX, mouseY,
+                             WmCurrentPalette().captionHover, WmCurrentPalette().text);
         return;
     }
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y, ow, border, edge);
@@ -1902,7 +1940,8 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
         WmRenderString(buf, stride, screenW, screenH, textX,
             ty + (static_cast<int>(WmMetric(WM_TITLE_BAR_HEIGHT)) - WmDesktopFont().lineHeight) / 2,
             w.title, fg, bg, textW);
-    RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, material, mouseX, mouseY);
+    RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, material, mouseX, mouseY,
+                         WmCurrentPalette().captionHover, WmCurrentPalette().text);
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -3874,6 +3913,7 @@ static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Windo
     in.focused=origin0.focused;in.visible=origin0.visible;in.noChrome=origin0.noChrome;
     in.captionOverlay=origin0.noChrome && origin0.captionOverlay ?
         (1ull<<63)|(uint64_t(origin0.captionHeight)<<32)|(uint64_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
+    in.captionStyle=origin0.noChrome && origin0.captionOverlay ? origin0.captionStyle : 0;
     in.hoverButton=hover;
     in.theme=static_cast<uint32_t>(layers.theme);in.appearance=static_cast<uint32_t>(layers.appearance);
     in.scale=static_cast<uint32_t>(layers.scale);
@@ -3922,6 +3962,12 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         RenderWindowChrome(pixels,width,width,height,local,mouseX==-1 && mouseY==-1?-1:int32_t(mouseX-originX),
                            mouseX==-1 && mouseY==-1?-1:int32_t(mouseY-originY));
         for(uint64_t i=0;i<uint64_t(width)*height;++i)pixels[i]|=0xff000000u;
+        // A client-matched block follows the client's rounded top-right corner.
+        const unsigned radius=(local.captionStyle&DesktopCaptionStyleValid) && local.state!=WindowState::Maximized ?
+            DesktopCaptionStyleRadius(local.captionStyle) : 0;
+        for(unsigned row=0;row<radius && row<height;++row)
+            for(unsigned x=width-(ChromeCornerInset(radius,row)<width?ChromeCornerInset(radius,row):width);x<width;++x)
+                pixels[uint64_t(row)*width+x]=0;
         ProcessUnref(local.proc);
         return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
     }

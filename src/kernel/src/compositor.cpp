@@ -1724,11 +1724,14 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
     {
         // Overlaid caption buttons are an opaque block over the client.
         const WmRect block = WmCaptionOverlayRect(w);
+        const unsigned radius = (w.captionStyle & DesktopCaptionStyleValid) && w.state != WindowState::Maximized ?
+            DesktopCaptionStyleRadius(w.captionStyle) : 0;
         for (int y = block.y; y < block.y + block.h; ++y)
         {
             if (y < 0 || y >= static_cast<int>(g_physFbHeight)) continue;
             uint32_t* row = g_chromeBuffer + static_cast<uint32_t>(y) * g_backBufStride;
-            for (int x = block.x; x < block.x + block.w; ++x)
+            const int end = block.x + block.w - static_cast<int>(ChromeCornerInset(radius, static_cast<unsigned>(y - block.y)));
+            for (int x = block.x; x < end; ++x)
                 if (x >= 0 && x < static_cast<int>(g_physFbWidth)) row[x] |= 0xFF000000u;
         }
         return;

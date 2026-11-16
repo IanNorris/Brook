@@ -1,5 +1,20 @@
 # Brook project handover
 
+**Caption block matched to Chromium's strip (`work/chrome-csd-style` from main `5f9d13cd`; QEMU only):**
+- **Ian on gen 417:** the grey strip plus a blue Brook block looked wrong.
+- **Approach:** the macOS / Window Controls Overlay model, with the colour sampled instead of declared.
+  - waylandd reads the strip colour 3 px inside its right edge, and the top-right corner radius from the top row's alpha. SHM buffers are read directly; Intel buffers only after `TRY_CPU_READ`.
+  - It samples on map, resize and focus (the next 3 commits), plus a trailing sample after the 500 ms throttle.
+  - The kernel fills the block with the strip colour (Chromium's own buttons stay hidden underneath), draws contrast glyphs and a 10% hover tint, keeps close hover red, and clips the block to the frame's rounded corner.
+- **QEMU v4/v4b:**
+  - The sample tracks Chromium's active `#d3e3fd` and inactive `#dde3e9` strips, radius 5.
+  - The first build missed the inactive repaint; fixed in `3154f7ec`.
+  - Before/after: `build/csd-qemu/evidence/37-before-after-style.png`; hover: `32-style-hover.png`; focus: `36-style-focused-vs-unfocused.png`.
+- **Fallback:** `--class` does not change Chromium's Wayland app_id, so the fallback was tested by booting waylandd with `BROOK_WAYLAND_CAPTION_APPS` empty. The kernel logged `CSD=1 caption_overlay=0` and Chromium drew its own three buttons (`35-fallback-chromium-own-buttons-full.png`).
+- **Not tested:** the Intel GPU read path has not run on hardware.
+- **Dell pair (not deployed):** `build/dell/pair-chrome-csd-style-20261116` (commit `3154f7ec`, kernel `74e2e57e…`, initrd `65364ca2…`) passed `check_dell_image_qemu.py --attempts 4` (attempt 1 stalled in firmware).
+- **Host tests:** 362/364 under load; `test_sched_lock_owner` and `test_audio_delivery` passed alone.
+
 **Caption block sized to Chromium's tab strip; launcher bundle; rebased (`work/chrome-csd` `d53bc0ed`, QEMU only):**
 - **Rebased** onto main `2f3372e0`; the earlier HANDOVER line was dropped.
 - **Sliver fix:** Chromium's tab strip is 40 surface units restored and maximised: 40 px in QEMU, 80 px on the Dell at scale 2. Syscall 512's 4th argument now carries the client strip height, and waylandd's `BROOK_WAYLAND_CAPTION_APPS` entries take `:height` (default `chromium:40,google-chrome:40`).
