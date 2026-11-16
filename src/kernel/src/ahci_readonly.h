@@ -23,6 +23,9 @@ struct AhciIrqStatus { bool configured=false, active=false; uint8_t vector=0, ap
 void AhciReadOnlyInit();
 AhciIoStats AhciReadOnlyIoStats();
 AhciIrqStatus AhciReadOnlyIrqStatus();
+// Runtime spin budget before an interrupt sleep, 0..2000 us (diagnostic).
+bool AhciReadOnlySetSpinUs(uint64_t us);
+uint64_t AhciReadOnlySpinUs();
 AhciReadOnlyStatus AhciReadOnlyGetStatus();
 // Boot-only, borrowed device pointer: available only for an identity-admitted,
 // ready writable disk. The registered device remains pinned for the boot.

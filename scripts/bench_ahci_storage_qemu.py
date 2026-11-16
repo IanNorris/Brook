@@ -41,6 +41,7 @@ def main():
     p.add_argument('--compiler', default='x86_64-unknown-linux-musl-gcc')
     p.add_argument('--polled', action='store_true', help='Add /etc/ahci-polled (interrupt opt-out control)')
     p.add_argument('--keep-disk', action='store_true')
+    p.add_argument('--spin-us', type=int, help='Set the AHCI spin budget at attach (bridge hardware ahci-spin-us)')
     p.add_argument('--profile-ms', type=int, default=0,
                    help='Kernel profile from the start of the first write phase; saved as profile.txt')
     p.add_argument('--sched', default='eevdf', help="INIT.RC scheduler policy ('' keeps the boot default)")
@@ -153,6 +154,8 @@ def main():
                     if session is None and 'IOBENCH_START' in text:
                         try:
                             session = bridge.attach('127.0.0.1', port)['session']
+                            if a.spin_us is not None:
+                                result['spin'] = bridge.command(session, f'bridge hardware ahci-spin-us {a.spin_us}')
                             if a.profile_ms:
                                 result['profile_start'] = bridge.command(session, f'prof start {a.profile_ms} /media/system')
                         except (OSError, RuntimeError, ValueError):

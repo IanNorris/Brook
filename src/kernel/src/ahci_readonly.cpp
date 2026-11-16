@@ -99,7 +99,11 @@ static constexpr uint32_t pages=17, dataOffset=4096, tableOffset=1280, fisOffset
 // port interrupts masked and keeps its polling loop. Interrupt mode can only
 // be turned off after boot (automatic miss detection), never back on.
 constexpr uint8_t AhciMsiVector=64; // outside the shared INTx pool (48-63)
-constexpr uint64_t AhciSpinNs=100000;
+// Spin budget before sleeping. QEMU: 100 us kept write throughput while
+// cutting CPU per byte ~16%; 20 us cut ~35% but lost ~10% throughput.
+// Tunable at runtime (bridge hardware ahci-spin-us) for physical measurement.
+constexpr uint64_t AhciDefaultSpinNs=100000, AhciMaxSpinNs=2000000;
+uint64_t spinNs=AhciDefaultSpinNs;
 IrqSpinLock irqLock{};
 Process* irqWaiter=nullptr;       // under irqLock
 uint64_t irqWakeNs=0;             // under irqLock: when the ISR woke irqWaiter
@@ -273,7 +277,7 @@ bool PortIo::waitCommand(uint64_t timeoutTicks) {
     const uint64_t began=ElapsedClockNs();
     AhciWaitTrace trace;
     // Same iteration caps as the polling loop, for a stalled tick clock.
-    const auto result=AhciWaitCommand(wait,timeoutTicks,AhciSpinNs,timeoutTicks>2000?2000000000ull:100000000ull,trace);
+    const auto result=AhciWaitCommand(wait,timeoutTicks,__atomic_load_n(&spinNs,__ATOMIC_RELAXED),timeoutTicks>2000?2000000000ull:100000000ull,trace);
     const uint64_t ended=ElapsedClockNs();
     StatAdd(ioStats.waits);
     if(!trace.spunOut)StatAdd(ioStats.spinCompletions);
@@ -729,6 +733,11 @@ AhciIoStats AhciReadOnlyIoStats() {
     s.maxWakeLatencyNs=load(ioStats.maxWakeLatencyNs);
     return s;
 }
+bool AhciReadOnlySetSpinUs(uint64_t us) {
+    if(us>AhciMaxSpinNs/1000)return false;
+    __atomic_store_n(&spinNs,us*1000,__ATOMIC_RELAXED);return true;
+}
+uint64_t AhciReadOnlySpinUs(){return __atomic_load_n(&spinNs,__ATOMIC_RELAXED)/1000;}
 AhciIrqStatus AhciReadOnlyIrqStatus() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return {};
     AhciIrqStatus copy=irqStatus;copy.active=__atomic_load_n(&irqMode,__ATOMIC_ACQUIRE);
