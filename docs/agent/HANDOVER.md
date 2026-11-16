@@ -92,6 +92,14 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Ready, not deployed: `work/xwayland-hidpi` (`817f8894`, `94b6fd27`, `98c4ff02`).**
+- **Stardew offset cause:** brook-xwm ignored `_NET_WM_STATE_FULLSCREEN`. It now honours EWMH fullscreen (chrome-less, at the output size), sends synthetic ConfigureNotify, and restores the previous state on exit.
+- **HiDPI:** Xft.dpi/XSETTINGS/`-dpi` hints by default; per-app compositor upscale via `BROOK_XWAYLAND_SCALED_APPS` (WM_CLASS list).
+- **Limit:** Xwayland 24.1 has no rootless per-surface scaling.
+- **Needs both halves:** the INTLWL in the pair (`xwayland-hidpi/build/dell/pair-xwayland-hidpi`) and a new `/nix/profile/bin/brook-xwm`. The store staging bundle is `xwayland-hidpi/build/dell/xwm-stage-20261116/bundle.tar` (stages `h9x75map…-waylandd-brook-0.1-brook`); **it needs Ian's approval**.
+- **Steam UI scale follow-up:** `work/steam-rootless-hidpi` (`132ff9e5`, on top of `work/steam-rootless`).
+- **Still wrong:** the taskbar draws over fullscreen games (kernel compositor follow-up); apps that ignore DPI hints stay tiny unless listed.
+
 **Gen 423 deployed (`dell-int22-20261116`, session `2074aa4179ba4cb3a864f2539379acc6`; `work/integration22` merged to main):**
 - **Network:** ARP 2 entries, 0 failures, a queued frame released correctly. Bridge stable.
 - **Zero-copy auto-arm doesn't fire at boot:** `auto_arm: true` but "not requested". Auto-arm only triggers at renderer ring registration, before any flip probe has passed. A manual `gpu flip probe` + `gpu zerocopy arm` works (I armed it on this boot).
