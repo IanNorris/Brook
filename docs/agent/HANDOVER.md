@@ -92,6 +92,22 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Ready, not deployed: `work/storage-io` (5 commits on f388d5ac).**
+- **What it does:**
+  - AHCI completion waits spin up to 100 µs, then sleep on MSI (vector 64, with a self-IPI to wake on the boot CPU);
+  - automatic fallback to polling, and `/etc/ahci-polled` forces polling;
+  - the panic journal keeps its polled path, plus a gate takeover when the owner is asleep;
+  - ext2 doubly-indirect lookups use the indirect-block cache;
+  - mapping-range walks start at the index lower bound;
+  - the taskbar R/W now counts AHCI and USB mass storage (plus `/proc/diskstats`, and `storage` in `bridge stats`).
+- **QEMU:** throughput unchanged; writer CPU per byte −16% (100 µs spin) and −35% (20 µs).
+- **Risks:**
+  - MSI on the Dell's 8086:9c83 is untested; test with `bridge hardware ahci-ro`;
+  - the boot-CPU-panic journal path is host-tested only.
+- **Ian's decision:** spin budget (`bridge hardware ahci-spin-us N` at runtime; 20–30 µs may suit CPU-bound downloads).
+- **Not fixed:** the FileMappingGateSet design (it locks every mapped file per mmap call), and ext2's flush every 256 allocations.
+- Pair: `storage-io/build/dell/pair-storage-io` (QEMU check PASS).
+
 **Q2 attract demo on gen 423 (zero-copy armed by hand, Steam open behind it):** 65.2 displayed fps (1435 frames, mean 15.3 / p50 14.2 / p90 16.8 / p99 30.9 ms), all direct frames, Q2 3.2 ms, composite 5.5 ms (4.5 layers with Steam behind), GPU 38% idle, CPU 67% idle. Profile: `display-perf/build/dell/q2-423-prof/`. Ian saw 72 fps in game. Torchlight II has no sound: Steam's private Pulse uses a null sink (desktop Pulse server is a next step).
 
 **Torchlight II runs on gen 423 (rootless Steam with machine-id) but at ~10 displayed fps.** Profile: `display-perf/build/dell/tl2-play-prof/`.
