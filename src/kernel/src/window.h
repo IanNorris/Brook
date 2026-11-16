@@ -167,6 +167,7 @@ struct Window
     bool        captionOverlay;
     uint16_t    captionInsetRight,captionInsetTop;
     uint16_t    captionHeight;  // client's title-strip height (physical px); 0 = native title height
+    uint32_t    captionStyle;   // DesktopCaptionStyle* packing; 0 = native title style
     bool        focusable;      // popups/tooltips stay above but don't take keyboard focus
     char        title[64];
     char        appId[128];     // explicit xdg app_id, independent of document title
@@ -334,7 +335,7 @@ int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
 // inset from the surface edges by insetRight/insetTop physical pixels.
 void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay=false,
                                uint16_t insetRight=0, uint16_t insetTop=0,
-                               uint16_t captionHeight=0);
+                               uint16_t captionHeight=0, uint32_t captionStyle=0);
 // Screen rectangle of a window's overlaid caption buttons (empty if none).
 WmRect WmCaptionOverlayRect(const Window& w);
 
@@ -640,8 +641,14 @@ bool WmSnapshotLaunch(uint64_t token,LaunchRecord* out);
 uint32_t WmSnapshotLaunches(LaunchRecord* out,uint32_t capacity);
 void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared);
 
-// Launch the item at the given index.
+// Launch the item at the given index. Hit-test results at or above
+// WM_LAUNCHER_MAX_ITEMS are footer power targets: a power button only arms a
+// confirmation prompt; the separate confirm button performs it.
 void WmLauncherExec(int itemIdx);
+// The launcher power confirmation is showing; it owns Enter, Escape, Tab and
+// Left/Right until dismissed.
+bool WmLauncherPowerPrompt();
+void WmLauncherPowerKey(uint8_t scan);
 void WmSetLaunchInhibited(bool inhibited);
 bool WmLauncherDispatching();
 

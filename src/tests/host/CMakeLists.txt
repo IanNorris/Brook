@@ -718,6 +718,8 @@ target_compile_options(test_wayland_provider PRIVATE "-iquote${BROOK_ROOT}/src/k
 
 add_host_test(test_taskbar_volume)
 target_compile_options(test_taskbar_volume PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_launcher_power)
+target_compile_options(test_launcher_power PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 add_host_test(test_debug_job_wire)
 target_compile_options(test_debug_job_wire PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
@@ -1040,3 +1042,6 @@ target_compile_options(test_boot_timing PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/s
 add_host_test(test_intel_bdw_node_cache)
 add_host_test(test_cpu_idle)
 target_compile_options(test_cpu_idle PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+
+add_host_test(test_arp_neighbor)
+target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

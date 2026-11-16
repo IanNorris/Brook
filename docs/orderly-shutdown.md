@@ -123,6 +123,47 @@ forced diagnostic controls remain separate. The bounded table retains 64
 operation IDs until reboot. Widget-level save-dialog semantics, per-blocker
 progress details and full cross-app save testing remain follow-ups.
 
+### Windowless process escalation (16 November)
+
+Advisory close cannot reach a process with no window: a daemon or helper
+started over the debug bridge (a private `pulseaudio -n` on the Dell), a
+lingering launcher child, or an app that closed its window but hangs on exit.
+Such processes held checked restarts in `closing` indefinitely. The policy is
+now (`WindowlessStopPolicy` in `shutdown_service_escalation.h`):
+
+- While any focusable client window is open, nothing is escalated. An
+  unsaved-document prompt therefore stays the user's decision, however long it
+  takes; the status names the window's process and offers Cancel. A window
+  that reappears at any stage sends the policy back to idle, and the full grace
+  period restarts when it is gone.
+- Once every initial window has received its close request, no client window
+  is open and no launch is being dispatched, the remaining non-service user
+  processes are *windowless*. They get 10 s to exit, then SIGTERM (plus
+  SIGCONT for a stopped process), then SIGKILL 5 s later, repeated every 2 s
+  for late descendants. Kernel threads and tagged system services are never
+  signalled here; services keep their own bounded stop after this phase.
+- The distinction is the compositor's window table, not process heuristics:
+  a process is windowed if it is the client or provider of an open focusable
+  window. Before each signal step the worker re-reads the window table itself,
+  so a window opened since the compositor's last poll vetoes that step.
+  Signals go through incarnation-checked references (no PID-reuse kill).
+- Cancel stays available throughout `closing` and stops further escalation;
+  a signal already delivered cannot be undone. The worker now runs at high
+  priority so deadlines and Cancel are not starved by the processes it stops.
+
+The status (launcher text, `ShutdownRequestStatus`, and the bridge power reply)
+names up to three blockers with PID, marks window owners, and gives the stage
+countdown, for example
+`Closing apps - no window: pulseaudio pid 51; SIGTERM in 8 s, or Cancel`.
+The bridge reply adds `stage` (`windows`, `waiting`, `grace`, `sigterm`,
+`sigkill`, `draining`, `cancelling`, `services`, `cleanup`, or the phase name),
+`blocker_count`, `next_signal_ms` and `blockers` (`pid`, `name`, `window`,
+`service`). `scripts/dell_deploy.py` and `tools/hardware_update_workflow.py`
+print that stage and blocker list when a restart does not reach `ready`.
+
+This supersedes the "timeouts never become an implicit kill" rule above for
+windowless processes only; open windows are still never closed by force.
+
 ### Coordinator acceptance (18 October)
 
 All 44 native suites and the compiled entry audit pass. Native fixtures exercise

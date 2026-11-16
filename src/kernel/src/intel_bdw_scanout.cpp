@@ -1910,11 +1910,13 @@ void BdwGopObserveConfigure(const BootProtocol* boot) {
         // shorter demo. /etc/dell-gpu-no-prompt-wake keeps the 1 ms polling;
         // `gpu wakeups on|off` still switches at runtime.
         BdwPromptWakeSet(!OptedIn("/etc/dell-gpu-no-prompt-wake"));
-        // Zero-copy scanout (wt) auto-arm when the renderer registers its
-        // ring. Opt-in for now (/etc/dell-zero-copy-auto) until the gen 401
-        // compositor failure after a live arm is understood; flip the
-        // default by inverting this test.
-        BdwZeroCopySetAutoArm(OptedIn("/etc/dell-zero-copy-auto"));
+        // Zero-copy scanout (wt) auto-arms when the renderer registers its
+        // ring. On by default since gen 422 (16 Nov): with scaled games offered
+        // as direct opaque layers it removed the BCS present copy, taking live
+        // yquake2 to 72 displayed fps and the matched demo from ~33 to ~40-43,
+        // with 12k+ flips and no GOP fallbacks. /etc/dell-zero-copy-no-auto
+        // keeps the copy path; `gpu zerocopy off` cancels it for the boot.
+        BdwZeroCopySetAutoArm(!OptedIn("/etc/dell-zero-copy-no-auto"));
 #endif
         observation.probeRequested=OptedIn("/etc/dell-gpu-gtt-probe");
         observation.ackRequested=OptedIn("/etc/dell-gpu-forcewake-ack");

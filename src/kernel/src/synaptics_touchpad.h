@@ -22,6 +22,8 @@ constexpr uint8_t SynQueryModes        = 0x01;
 constexpr uint8_t SynQueryCapabilities = 0x02;
 constexpr uint8_t SynQueryExtCap       = 0x09;
 constexpr uint8_t SynQueryExtCap0C     = 0x0c;
+constexpr uint8_t SynQueryMaxCoords    = 0x0d;
+constexpr uint8_t SynQueryMinCoords    = 0x0f;
 
 constexpr uint8_t SynModeAbsolute = 0x80;
 constexpr uint8_t SynModeHighRate = 0x40;  // 80 packets/s instead of 40
@@ -51,7 +53,32 @@ struct SynapticsCaps {
     bool clickpad() const { return (ext0c & (1u << 20)) || (ext0c & (1u << 8)); }
     // Advanced gesture mode / image sensor: W=2 packets carry the second finger.
     bool agm() const { return (ext0c & (1u << 19)) || (ext0c & (1u << 11)); }
+    // Linux synaptics_resolution(): query 0x0d (max) needs >= 5 extended
+    // requests, query 0x0f (min) >= 7; both are flagged in the 0x0c word.
+    bool maxCoords() const { return extRequests() >= 5 && (ext0c & (1u << 17)); }
+    bool minCoords() const { return extRequests() >= 7 && (ext0c & (1u << 13)); }
 };
+
+// Reported coordinate range (pad units, y up). Defaults are Linux's nominal
+// XMIN/XMAX/YMIN/YMAX_NOMINAL, used when the pad cannot report its own.
+struct SynapticsRange {
+    int32_t xMin = 1472, xMax = 5472, yMin = 1408, yMax = 4448;
+    bool reportedMax = false, reportedMin = false;
+};
+// Query 0x0d / 0x0f reply: x = r0<<5 | (r1 & 0x0f)<<1, y = r2<<5 | (r1 & 0xf0)>>3.
+inline void SynapticsDecodeCoords(const uint8_t r[3], int32_t& x, int32_t& y) {
+    x = (int32_t(r[0]) << 5) | ((r[1] & 0x0f) << 1);
+    y = (int32_t(r[2]) << 5) | ((r[1] & 0xf0) >> 3);
+}
+// Apply the replies that were read (null = not read); an implausible result
+// (inverted, tiny or beyond the 13-bit packet range) keeps the nominal range.
+inline SynapticsRange SynapticsDecodeRange(const uint8_t* maxReply, const uint8_t* minReply) {
+    SynapticsRange r, n;
+    if (maxReply) { SynapticsDecodeCoords(maxReply, r.xMax, r.yMax); r.reportedMax = true; }
+    if (minReply) { SynapticsDecodeCoords(minReply, r.xMin, r.yMin); r.reportedMin = true; }
+    if (r.xMax > 8191 || r.yMax > 8191 || r.xMax - r.xMin < 1000 || r.yMax - r.yMin < 1000) return n;
+    return r;
+}
 inline uint32_t SynapticsWord(const uint8_t r[3]) {
     return (uint32_t(r[0]) << 16) | (uint32_t(r[1]) << 8) | r[2];
 }
@@ -131,7 +158,22 @@ struct SynapticsGestureConfig {
     // Phantom-scroll guards (Ian, gen 400: "scrolled without me near it"):
     int32_t scrollStablePackets = 3;   // consecutive two-finger packets before scrolling starts
     int32_t scrollJumpUnits = 250;     // per-packet two-finger motion above this is not a scroll
+    // Clickpad software buttons (libinput button areas; Ian, gen 421: right
+    // click was only reachable with a second finger resting). A physical
+    // click whose contact is in the bottom strip (y below buttonTopY) is a
+    // right click when x >= buttonSplitX, otherwise left. Pad units, y up;
+    // set from the reported range by SynapticsSetButtonAreas. Defaults match
+    // the nominal range.
+    bool softButtons = true;
+    int32_t buttonTopY = 1408 + (4448 - 1408) * 15 / 100;
+    int32_t buttonSplitX = (1472 + 5472) / 2;
 };
+// Bottom 15% of the pad height (libinput without resolution), split in half.
+inline void SynapticsSetButtonAreas(SynapticsGestureConfig& c, const SynapticsRange& r, bool clickpad) {
+    c.softButtons = clickpad;
+    c.buttonTopY = r.yMin + (r.yMax - r.yMin) * 15 / 100;
+    c.buttonSplitX = (r.xMin + r.xMax) / 2;
+}
 constexpr int32_t SynapticsSpeedMin = 25, SynapticsSpeedMax = 300;
 // Base gain multiplier: 80% of the original tuning (Ian: "a tiny bit fast").
 constexpr int32_t SynapticsBaseGainPercent = 80;
@@ -143,8 +185,8 @@ struct SynapticsOutput {
     uint8_t buttons = 0;          // bit0 left, bit1 right
 };
 
-// One-finger motion, two-finger scroll, clickpad buttons (two-finger click is
-// right click), palm rejection. Tap-to-click is a separate state machine
+// One-finger motion, two-finger scroll, clickpad buttons (software button
+// areas; two-finger click on the main surface is right click), palm rejection. Tap-to-click is a separate state machine
 // (synaptics_tap.h) fed from the same packets.
 class SynapticsGesture {
 public:
@@ -155,6 +197,13 @@ public:
     unsigned scrollTicksLowZ = 0;   // ticks emitted while either packet's Z was under 2x the touch threshold
     unsigned scrollRejected = 0;    // two-finger packets dropped by the stability/jump guards
     unsigned resets = 0;            // state resets (resync, lift-off)
+    // Clickpad press decisions (each press counts once in total and once by reason).
+    unsigned clicksLeft = 0, clicksRight = 0;
+    unsigned clicksRightArea = 0;   // right: a contact in the bottom-right area
+    unsigned clicksTwoFinger = 0;   // right: two fingers on the main surface
+    unsigned clicksThumbLeft = 0;   // left: two contacts, one resting in the left area
+    unsigned clicksStalePos = 0;    // press packet had no contact; used the last contact
+    unsigned clicksNoPos = 0;       // press with no contact position known (left)
 
     // Forget all contact state (used on packet resync): the next packets must
     // re-establish a stable touch before any motion or scroll.
@@ -162,6 +211,7 @@ public:
         ++resets;
         lastFingers_ = 0; haveAnchor_ = false; haveAgm_ = false; stable_ = 0;
         fracX_ = fracY_ = scrollAccX_ = scrollAccY_ = 0; lastZ_ = 0;
+        haveContact_ = false; contactRaw_ = 0;
     }
 
     SynapticsOutput Feed(const SynapticsPacket& p) {
@@ -179,10 +229,13 @@ public:
         }
         const int fingers = Fingers(p);
         ++fingerHistogram[fingers > 3 ? 3 : fingers];
-        // Buttons: the physical click maps to right only when two fingers were
-        // already resting as the press started; it stays as chosen until release.
+        // Buttons: the press picks left or right from the contact positions
+        // (ChooseClick) and keeps that button until release.
         const bool click = p.left;
-        if (click && !clickDown_) clickAsRight_ = (fingers == 2);
+        if (click && !clickDown_) clickButton_ = ChooseClick(p);
+        if (p.z >= cfg_.touchZ) {               // raw contact, palms included
+            haveContact_ = true; contactX_ = p.x; contactY_ = p.y; contactRaw_ = RawFingers(p);
+        }
         if (click != clickDown_) {               // press or release: start jitter suppression
             suppress_ = cfg_.clickSuppressPackets;
             deadzone_ = click;
@@ -191,7 +244,7 @@ public:
             --suppress_;
         }
         clickDown_ = click;
-        buttons_ = uint8_t((click ? (clickAsRight_ ? 2 : 1) : 0) | (p.right ? 2 : 0));
+        buttons_ = uint8_t((click ? clickButton_ : 0) | (p.right ? 2 : 0));
         o.buttons = buttons_;
         if (fingers < 2) haveAgm_ = false;
 
@@ -249,8 +302,9 @@ public:
         return o;
     }
 
-    // A one-finger press is held: extra fingers move the pointer, not scroll.
-    bool Dragging() const { return (clickDown_ && !clickAsRight_) || tapDrag_; }
+    // A press other than a two-finger click is held: extra fingers move the
+    // pointer, not scroll.
+    bool Dragging() const { return (clickDown_ && !clickTwoFinger_) || tapDrag_; }
     // Tap-and-drag holds the left button without a physical press.
     void SetTapDrag(bool on) { tapDrag_ = on; }
 
@@ -262,8 +316,56 @@ public:
         return 1;
     }
 
+    // Contact count without the palm guards: a hard press can widen or
+    // deepen a fingertip past palmW/palmZ, and it still chooses the button.
+    int RawFingers(const SynapticsPacket& p) const {
+        if (p.z < cfg_.touchZ) return 0;
+        if (p.w == 0) return 2;
+        if (p.w == 1) return 3;
+        return 1;
+    }
+
 private:
     static int32_t Abs(int32_t v) { return v < 0 ? -v : v; }
+    bool InStrip(int32_t y) const { return y < cfg_.buttonTopY; }
+    bool InRight(int32_t x, int32_t y) const { return InStrip(y) && x >= cfg_.buttonSplitX; }
+
+    // Button for a new physical press (bit0 left, bit1 right), libinput
+    // software-button style:
+    //  - any contact in the bottom-right area: right (whichever finger
+    //    pressed; a thumb resting in the left area does not get in the way);
+    //  - two contacts, one of them in the bottom strip (a resting thumb):
+    //    left, the area it rests in;
+    //  - two contacts on the main surface, or a second contact whose position
+    //    is not known yet (no AGM packet): right, the two-finger click;
+    //  - otherwise left.
+    // A press packet without a contact (Z below touchZ) uses the last contact.
+    uint8_t ChooseClick(const SynapticsPacket& p) {
+        bool havePos = true;
+        int32_t x = p.x, y = p.y;
+        int raw = RawFingers(p);
+        if (raw == 0) {
+            if (haveContact_) { x = contactX_; y = contactY_; raw = contactRaw_; ++clicksStalePos; }
+            else havePos = false;
+        }
+        clickTwoFinger_ = false;
+        uint8_t b = 1;
+        if (!havePos) {
+            ++clicksNoPos;
+        } else if (!cfg_.softButtons) {
+            if (raw == 2) { b = 2; clickTwoFinger_ = true; ++clicksTwoFinger; }
+        } else {
+            const bool second = raw >= 2 && haveAgm_;
+            if (InRight(x, y) || (second && InRight(agmX_, agmY_))) { b = 2; ++clicksRightArea; }
+            else if (raw == 2) {
+                if (second && (InStrip(y) || InStrip(agmY_))) ++clicksThumbLeft;
+                else { b = 2; clickTwoFinger_ = true; ++clicksTwoFinger; }
+            }
+        }
+        if (b == 2) ++clicksRight; else ++clicksLeft;
+        return b;
+    }
+
     void Pointer(int32_t dx, int32_t dy, SynapticsOutput& o) {
         // Speed-dependent gain: ~1/6 count per pad unit when slow, up to ~1/2
         // fast, scaled by the base tuning and the user's speed setting.
@@ -295,7 +397,11 @@ private:
     int lastFingers_ = 0;
     bool haveAnchor_ = false;
     int32_t ax_ = 0, ay_ = 0, fracX_ = 0, fracY_ = 0, scrollAccX_ = 0, scrollAccY_ = 0;
-    bool clickDown_ = false, clickAsRight_ = false;
+    bool clickDown_ = false, clickTwoFinger_ = false;
+    uint8_t clickButton_ = 1;
+    bool haveContact_ = false;      // last raw contact position (any packet with Z >= touchZ)
+    int32_t contactX_ = 0, contactY_ = 0;
+    int contactRaw_ = 0;
     bool haveAgm_ = false;
     int32_t agmX_ = 0, agmY_ = 0;
     int32_t suppress_ = 0, pressX_ = 0, pressY_ = 0, lastZ_ = 0, stable_ = 0;

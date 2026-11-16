@@ -159,6 +159,7 @@ static void surface_unmap(struct brook_surface *s) {
     scene_owner_unref(s->scene);s->scene=NULL;s->scene_disabled=0;
     if (s->wm_id) wm_destroy_window(s->wm_id);
     s->wm_id=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;s->deco_sent_mode=-1;
+    s->strip_due=3;s->strip_trailing=0;s->strip_style=0;strip_retry_drop(s);
 }
 static int surface_window(struct brook_surface *s,struct brook_view *view) {
     const int xwayland=s->role==4;
@@ -180,12 +181,12 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);
         if (s->app_id[0]) wm_set_app_id(s->wm_id,s->app_id);
-        s->deco_pending=0;s->deco_sent_mode=csd?1:0;s->deco_sent_insets=s->deco_sent_height=0;popup_apply_position(s);
+        s->deco_pending=0;s->deco_sent_mode=csd?1:0;s->deco_sent_insets=s->deco_sent_height=s->deco_sent_style=0;popup_apply_position(s);
     } else if (s->vfb_w!=width || s->vfb_h!=height) {
         if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) return 0;
     } else return 1;
     s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
-    s->vfb_w=width;s->vfb_h=height;
+    s->vfb_w=width;s->vfb_h=height;s->strip_due=3;
     if (s->xdg_toplevel && s->deco_csd) surface_sync_decoration(s,0);
     if (xwayland) xwayland_surface_created(s);
     return 1;

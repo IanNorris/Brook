@@ -121,6 +121,11 @@ int main() {
         CHECK(tall.h==next.pixels(40)&&tall.y==58&&tall.w==block.w);
         for(int i=0;i<3;++i)CHECK(DesktopCaptionRect(strip,next,i).h==next.pixels(40));
         CHECK(DesktopCaptionOverlayRect({0,0,300,30,true,true,0,0,40},next).h==30);
+        // Client-matched style: contrast ink, packed corner radius.
+        CHECK(DesktopCaptionInk(0xd3e3fd)==0x1f1f1f && DesktopCaptionInk(0x202124)==0xe8eaed);
+        CHECK(DesktopCaptionInk(0xffffff)==0x1f1f1f && DesktopCaptionInk(0x000000)==0xe8eaed);
+        CHECK(DesktopCaptionStyleRgb(DesktopCaptionStyleValid|(10u<<25)|0x123456)==0x123456);
+        CHECK(DesktopCaptionStyleRadius(DesktopCaptionStyleValid|(10u<<25)|0x123456)==10);
         auto top=ReframeDesktopWindow({0,0,800,600,false},old,next,1920,1080-next.taskbar());
         CHECK(top.y>=0);
         auto small=DesktopCaptionRect({0,0,80,40,false},next,0);

@@ -344,6 +344,9 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             ie.modifiers = cur;
             InputDevicePush(&g_inputDev, ie);
             InputWakeWaiters();
+            // Like the PS/2 path: an idle compositor must see the click now,
+            // not at the next pointer motion or timer.
+            CompositorWake();
         }
     }
     else if (ev.type == EV_REL)

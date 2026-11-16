@@ -1724,11 +1724,14 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
     {
         // Overlaid caption buttons are an opaque block over the client.
         const WmRect block = WmCaptionOverlayRect(w);
+        const unsigned radius = (w.captionStyle & DesktopCaptionStyleValid) && w.state != WindowState::Maximized ?
+            DesktopCaptionStyleRadius(w.captionStyle) : 0;
         for (int y = block.y; y < block.y + block.h; ++y)
         {
             if (y < 0 || y >= static_cast<int>(g_physFbHeight)) continue;
             uint32_t* row = g_chromeBuffer + static_cast<uint32_t>(y) * g_backBufStride;
-            for (int x = block.x; x < block.x + block.w; ++x)
+            const int end = block.x + block.w - static_cast<int>(ChromeCornerInset(radius, static_cast<unsigned>(y - block.y)));
+            for (int x = block.x; x < end; ++x)
                 if (x >= 0 && x < static_cast<int>(g_physFbWidth)) row[x] |= 0xFF000000u;
         }
         return;
@@ -2516,6 +2519,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         SerialPuts("WM: shortcut Escape launcher closed\n");
         break;
     case GlobalShortcutAction::CloseVolumePopup:WmVolumePopupClose();break;
+    case GlobalShortcutAction::LauncherPromptKey:WmLauncherPowerKey(r.key);break;
     case GlobalShortcutAction::CloseFocusedWindow: {
         // The same advisory close as the title-bar button and semantic action:
         // xdg_toplevel.close, WM_DELETE_WINDOW via the XWM, or a native signal.
@@ -2567,6 +2571,7 @@ static void CompositorInputWM()
             GlobalShortcutContext context{};
             context.launcherVisible=WmLauncherVisible();
             context.volumePopupVisible=WmVolumePopupVisible();
+            context.launcherPrompt=WmLauncherPowerPrompt();
             const GlobalShortcutResult shortcut=g_globalShortcuts.Key(
                 ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
             CompositorRunShortcut(shortcut);
@@ -3014,11 +3019,18 @@ static void CompositorHandleMouseWM()
         // If launcher is open, check launcher panel first
         if (WmLauncherVisible())
         {
+            // Launcher presses act on the press. A tap's release can arrive in
+            // the same pass; consume it here too, or the next tap (such as
+            // Cancel on the power prompt) reads as a held button and is lost.
+            const auto launcherPressDone=[&] {
+                if(releaseLatched&&!polledDown){g_wmPrimaryDown=false;g_wmLastBtnDown=false;}
+                else g_wmLastBtnDown=btnDown;
+            };
             int launcherIdx = WmLauncherHitTest(mx, my, g_physFbWidth, g_physFbHeight);
             if (launcherIdx >= 0)
             {
                 WmLauncherExec(launcherIdx);
-                g_wmLastBtnDown = btnDown;
+                launcherPressDone();
                 return;
             }
             // Check if clicking the Apps button again (toggle off)
@@ -3026,12 +3038,12 @@ static void CompositorHandleMouseWM()
             if (tbIdx == -3)
             {
                 WmLauncherToggle();
-                g_wmLastBtnDown = btnDown;
+                launcherPressDone();
                 return;
             }
             // Clicked elsewhere — close launcher
             WmLauncherToggle();
-            g_wmLastBtnDown = btnDown;
+            launcherPressDone();
             return;
         }
 

@@ -10,6 +10,20 @@ from pathlib import Path
 from hardware_update_protocol import upload,read_payload,KERNEL_MAX,INITRD_MAX
 from hardware_bulk_protocol import validate_pacing
 
+def power_blocker_summary(status):
+    """One line naming the guest's power stage and the processes still blocking it."""
+    if not isinstance(status,dict):return 'no power status recorded'
+    parts=[f"state={status.get('state','?')}"]
+    if status.get('stage'):parts.append(f"stage={status['stage']}")
+    blockers=status.get('blockers') or []
+    if blockers:
+        named=', '.join(f"{b.get('name','?')} pid {b.get('pid','?')}"+(' (window)' if b.get('window') else ' (no window)' if not b.get('service') else ' (service)') for b in blockers)
+        extra=(status.get('blocker_count') or len(blockers))-len(blockers)
+        parts.append('blockers='+named+(f' (+{extra} more)' if extra>0 else ''))
+    if status.get('next_signal_ms'):parts.append(f"next_signal_in={status['next_signal_ms']/1000:.1f}s")
+    if status.get('status'):parts.append(f"status={status['status']!r}")
+    return ' '.join(parts)
+
 class UpdateRun:
     def __init__(self,bridge,output,uploader=upload,clock=time.monotonic,sleep=time.sleep):
         self.bridge=bridge;self.output=Path(output);self.uploader=uploader;self.clock=clock;self.sleep=sleep
@@ -78,10 +92,18 @@ class UpdateRun:
             if not restart:return self.receipt
             self.save(state='restart_dispatched')
             status=self.bridge.power(session,power_id,'restart');self.save(power=status)
+            # Windowless processes get a bounded SIGTERM/SIGKILL escalation in
+            # the guest (about 15 s after the last window closes); an open
+            # window, such as a save prompt, is never escalated.
             end=self.clock()+90
             while status.get('state')!='ready':
-                if status.get('state') in ('failed','unsupported') or self.clock()>=end:raise RuntimeError('Restart did not reach checked ready state')
-                self.sleep(.1);status=self.bridge.power(session,power_id,'status');self.save(power=status)
+                if status.get('state') in ('failed','unsupported','cancelled'):
+                    raise RuntimeError('Restart did not reach checked ready state: '+power_blocker_summary(status))
+                if self.clock()>=end:
+                    raise TimeoutError('Restart did not reach checked ready state within 90 s: '+power_blocker_summary(status)+
+                        f'; the request is still pending in the guest; cancel with hw_power {power_id} cancel or resolve the blockers')
+                # Half-second polling keeps the single-client guest bridge free for a cancel.
+                self.sleep(.5);status=self.bridge.power(session,power_id,'status');self.save(power=status)
             self.save(state='restart_commit_dispatched')
             try:
                 committed=self.bridge.power(session,power_id,'commit');self.save(power_commit=committed)

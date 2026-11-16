@@ -25,6 +25,18 @@ void ShutdownDesktopRequest(bool restart);
 void ShutdownDesktopCancel();
 const char* ShutdownDesktopStatus();
 const char* ShutdownRequestStatus(const char* requestId);
+// Processes still holding the current request in closing/services, for the
+// bridge reply. A request that is not current reports count 0 and its stage.
+struct ShutdownBlocker { uint16_t pid; bool window, service; char name[32]; };
+struct ShutdownBlockerReport {
+    char stage[16];            // windows|waiting|grace|sigterm|sigkill|services|cleanup|none
+    uint32_t count;            // total blocking processes (entries holds the first few)
+    uint32_t listed;
+    uint64_t nextSignalMs;     // until the next SIGTERM/SIGKILL (0: none pending)
+    ShutdownBlocker entries[4];
+    char status[192];          // same text as ShutdownRequestStatus, copied under lock
+};
+void ShutdownRequestBlockers(const char* requestId, ShutdownBlockerReport* out);
 void ShutdownCompositorPoll();
 bool ShutdownLaunchAllowed();
 }

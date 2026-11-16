@@ -16,6 +16,7 @@ class Bridge:
     def __init__(self):
         self.calls=[];self.tx=None;self.newboot=False;self.activated=False;self.job_polls=0
         self.reset=True;self.stale=False;self.boot_changes=True;self.payload='candidate';self.mismatch=False;self.missing_commit=False
+        self.blocked=None
     def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'192.0.2.1','port':1234}
     def doctor(self,session):return {'probe_stage':'verified','reachable':True,'identity_matches':not (self.stale or self.newboot),
         'capabilities':{'power':{'reset':self.reset}}}
@@ -35,7 +36,7 @@ class Bridge:
     def power(self,session,ident,operation):
         self.calls.append(('power',session,ident,operation))
         if operation=='restart':return {'state':'closing'}
-        if operation=='status':return {'state':'ready','error':0}
+        if operation=='status':return dict(self.blocked) if self.blocked else {'state':'ready','error':0}
         assert operation=='commit'
         self.newboot=self.boot_changes
         if self.missing_commit:raise ConnectionError('Reset dropped reply')
@@ -159,6 +160,24 @@ class Tests(unittest.TestCase):
         self.assertLess(self.clock.now,5)
         self.assertEqual(sum(x[0]=='power' and x[3]=='commit' for x in self.bridge.calls),1)
         self.assertEqual(self.receipt()['boot_timeout_s'],3)
+
+    def test_restart_timeout_names_stage_and_blockers(self):
+        self.bridge.blocked={'state':'closing','error':0,'stage':'sigkill','blocker_count':3,'next_signal_ms':0,
+            'status':'Closing apps - no window: pulseaudio pid 51, sleep pid 60 (+1); killed, waiting for exit, or Cancel',
+            'blockers':[{'pid':51,'name':'pulseaudio','window':False,'service':False},{'pid':60,'name':'sleep','window':False,'service':False}]}
+        with self.assertRaises(TimeoutError) as caught:self.execute(restart=True)
+        message=str(caught.exception)
+        for text in ('stage=sigkill','pulseaudio pid 51 (no window)','sleep pid 60','(+1 more)','killed, waiting for exit','cancel'):
+            self.assertIn(text,message)
+        receipt=self.receipt()
+        self.assertEqual((receipt['state'],receipt['last_stage']),('needs_inspection','restart_dispatched'))
+        self.assertIn('pulseaudio pid 51',receipt['error']);self.assertEqual(receipt['power']['stage'],'sigkill')
+        self.assertFalse(any(x[0]=='power' and x[3]=='commit' for x in self.bridge.calls))
+    def test_cancelled_restart_is_reported_not_retried(self):
+        self.bridge.blocked={'state':'cancelled','error':0,'stage':'cancelled','status':'Shutdown cancelled','blockers':[]}
+        with self.assertRaises(RuntimeError) as caught:self.execute(restart=True)
+        self.assertIn('state=cancelled',str(caught.exception))
+        self.assertEqual(sum(x[0]=='power' and x[3]=='restart' for x in self.bridge.calls),1)
 
     def test_invalid_key_never_launches(self):
         self.key.write_text('secret\n')

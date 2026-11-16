@@ -228,6 +228,151 @@ int main() {
         int lt = 0; for (int i = 1; i <= 4; ++i) lt += lz.Feed(P(3000, 2000 + 50 * i, 30, 0)).scrollY;
         CHECK(lt == 2 && lz.scrollTicksLowZ == 2);
     }
+    // Coordinate range queries (0x0d max, 0x0f min) and button areas.
+    {
+        SynapticsCaps rc; rc.caps = 0xf00123u; rc.ext0c = 0x12e800u;   // extRequests 7, max/min/clickpad/image sensor bits
+        CHECK(rc.extRequests() == 7 && rc.maxCoords() && rc.minCoords() && rc.clickpad() && rc.agm());
+        rc.caps = 0xd00123u; CHECK(rc.maxCoords() && !rc.minCoords());  // 5 requests: max only
+        rc.ext0c = 0; CHECK(!rc.maxCoords());
+        // x = r0<<5 | (r1&0x0f)<<1, y = r2<<5 | (r1&0xf0)>>3
+        const uint8_t mx[3] = {0xb1, 0x5a, 0x94};   // x 5684, y 4746
+        const uint8_t mn[3] = {0x27, 0x36, 0x22};   // x 1260, y 1094
+        int32_t x = 0, y = 0; SynapticsDecodeCoords(mx, x, y); CHECK(x == 5684 && y == 4746);
+        auto rg = SynapticsDecodeRange(mx, mn);
+        CHECK(rg.xMin == 1260 && rg.yMin == 1094 && rg.xMax == 5684 && rg.yMax == 4746 && rg.reportedMax && rg.reportedMin);
+        auto nominal = SynapticsDecodeRange(nullptr, nullptr);
+        CHECK(nominal.xMin == 1472 && nominal.xMax == 5472 && nominal.yMin == 1408 && nominal.yMax == 4448 && !nominal.reportedMax);
+        const uint8_t zero[3] = {0, 0, 0};
+        CHECK(SynapticsDecodeRange(zero, nullptr).xMax == 5472);          // implausible: nominal
+        auto maxOnly = SynapticsDecodeRange(mx, nullptr); CHECK(maxOnly.xMin == 1472 && maxOnly.xMax == 5684);
+        SynapticsGestureConfig bc; SynapticsSetButtonAreas(bc, rg, true);
+        CHECK(bc.softButtons && bc.buttonTopY == 1094 + (4746 - 1094) * 15 / 100 && bc.buttonSplitX == (1260 + 5684) / 2);
+        SynapticsSetButtonAreas(bc, rg, false); CHECK(!bc.softButtons);
+        SynapticsGestureConfig dc;   // defaults equal the nominal range
+        SynapticsGestureConfig nc2; SynapticsSetButtonAreas(nc2, nominal, true);
+        CHECK(dc.buttonTopY == nc2.buttonTopY && dc.buttonSplitX == nc2.buttonSplitX);
+    }
+
+    // Clickpad software buttons (nominal range: strip y < 1864, split x 3472).
+    // Packet shapes follow the 9343 pad: a light touch, then the press packet
+    // with higher pressure and a wider contact, held, then release.
+    {
+        auto press = [](SynapticsGesture& gg, int x, int y, int z = 110, int w = 8) {
+            gg.Feed(P(x, y, 50, 6)); gg.Feed(P(x, y, 60, 6));
+            return gg.Feed(P(x, y, z, w, true)).buttons;
+        };
+        // Hard click in the bottom-right area: right, held, then released.
+        SynapticsGesture a;
+        CHECK(press(a, 4800, 1600) == 2);
+        for (int i = 0; i < 5; ++i) CHECK(a.Feed(P(4800, 1600, 120, 8, true)).buttons == 2);
+        CHECK(a.Feed(P(4800, 1600, 60, 6)).buttons == 0);
+        CHECK(a.clicksRight == 1 && a.clicksRightArea == 1 && a.clicksLeft == 0);
+        // Bottom-left area: left. Centre of the pad: left. Right half above the strip: left.
+        { SynapticsGesture b; CHECK(press(b, 2000, 1600) == 1); CHECK(b.clicksLeft == 1); }
+        { SynapticsGesture b; CHECK(press(b, 3400, 3000) == 1); }
+        { SynapticsGesture b; CHECK(press(b, 4800, 2400) == 1); }
+        // Right at the bottom edge (Synaptics reports y below yMin there).
+        { SynapticsGesture b; CHECK(press(b, 5300, 1200) == 2); }
+        // A forceful press that trips the palm guards (W >= 12, Z >= 200)
+        // still chooses by position.
+        { SynapticsGesture b; CHECK(press(b, 4800, 1600, 230, 13) == 2); }
+        { SynapticsGesture b; CHECK(press(b, 2000, 1600, 230, 13) == 1); }
+
+        // Button held while the finger drifts out of its area.
+        SynapticsGesture d;
+        CHECK(press(d, 4800, 1600) == 2);
+        for (int i = 1; i <= 30; ++i) CHECK(d.Feed(P(4800 - 60 * i, 1600 + 50 * i, 110, 8, true)).buttons == 2);
+        CHECK(d.Feed(P(3000, 3100, 60, 6)).buttons == 0);
+        SynapticsGesture dl;
+        CHECK(press(dl, 2000, 1600) == 1);
+        int dragX = 0;
+        for (int i = 1; i <= 30; ++i) { auto r = dl.Feed(P(2000 + 100 * i, 1600, 110, 8, true)); dragX += r.dx; CHECK(r.buttons == 1); }
+        CHECK(dragX > 0);                                         // left-area press still drags
+        CHECK(dl.Feed(P(5000, 1600, 60, 6)).buttons == 0);
+
+        // Press packet with Z=0 (no contact): the last contact decides.
+        SynapticsGesture z0;
+        z0.Feed(P(4800, 1600, 60, 6)); z0.Feed(P(4800, 1600, 70, 6));
+        CHECK(z0.Feed(P(0, 0, 0, 0, true)).buttons == 2);
+        CHECK(z0.Feed(P(4800, 1600, 120, 8, true)).buttons == 2);
+        CHECK(z0.Feed(P(4800, 1600, 60, 6)).buttons == 0);
+        CHECK(z0.clicksStalePos == 1 && z0.clicksRightArea == 1);
+        SynapticsGesture z1;
+        z1.Feed(P(2000, 1600, 60, 6));
+        CHECK(z1.Feed(P(0, 0, 0, 0, true)).buttons == 1);
+        // No contact seen at all: left.
+        SynapticsGesture z2;
+        CHECK(z2.Feed(P(0, 0, 0, 0, true)).buttons == 1 && z2.clicksNoPos == 1);
+
+        // Ian's case: a finger resting in the left area, another finger
+        // presses in the right area. Either finger may be the one the
+        // primary (W=0) packet reports; the other arrives in AGM packets.
+        auto rest = [&](SynapticsGesture& gg, int sx, int sy, int ax, int ay) {
+            gg.Feed(P(2000, 1500, 60, 6)); gg.Feed(P(2000, 1500, 60, 6));   // thumb alone
+            for (int i = 0; i < 3; ++i) { gg.Feed(P(sx, sy, 70, 0)); gg.Feed(AGM(ax, ay, 60)); }
+            return gg.Feed(P(sx, sy, 140, 0, true)).buttons;
+        };
+        { SynapticsGesture t1; CHECK(rest(t1, 2000, 1500, 4800, 1600) == 2); CHECK(t1.clicksRightArea == 1); }
+        { SynapticsGesture t2; CHECK(rest(t2, 4800, 1600, 2000, 1500) == 2); }
+        // Thumb resting in the left area, click with another finger on the
+        // main surface: the thumb's area decides (left), not a two-finger click.
+        { SynapticsGesture t3; CHECK(rest(t3, 2000, 1500, 3400, 3000) == 1); CHECK(t3.clicksThumbLeft == 1); }
+        { SynapticsGesture t4; CHECK(rest(t4, 3400, 3000, 2000, 1500) == 1); }
+        // Second finger landed but no AGM position yet: two-finger click (right),
+        // as before (this is what the old code did for every two-finger press).
+        {
+            SynapticsGesture t5; t5.Feed(P(2000, 1500, 60, 6)); t5.Feed(P(2000, 1500, 60, 6));
+            t5.Feed(P(2000, 1500, 70, 0));
+            CHECK(t5.Feed(P(2000, 1500, 140, 0, true)).buttons == 2 && t5.clicksTwoFinger == 1);
+        }
+        // Thumb resting in the right area, click elsewhere: right.
+        { SynapticsGesture t6; t6.Feed(P(4800, 1500, 60, 6)); t6.Feed(P(4800, 1500, 60, 6));
+          for (int i = 0; i < 3; ++i) { t6.Feed(P(4800, 1500, 70, 0)); t6.Feed(AGM(3000, 3000, 60)); }
+          CHECK(t6.Feed(P(4800, 1500, 140, 0, true)).buttons == 2); }
+
+        // Two-finger click on the main surface: right; no scroll or motion while held.
+        {
+            SynapticsGesture tf;
+            for (int i = 0; i < 3; ++i) { tf.Feed(P(3000, 3000, 70, 0)); tf.Feed(AGM(3600, 3000, 60)); }
+            CHECK(tf.Feed(P(3000, 3000, 90, 0, true)).buttons == 2 && tf.clicksTwoFinger == 1);
+            CHECK(!tf.Dragging());
+            int sc = 0, mv = 0;
+            for (int i = 1; i <= 5; ++i) { auto r = tf.Feed(P(3000, 3000 + 50 * i, 90, 0, true)); sc += r.scrollY; mv += Abs2(r); CHECK(r.buttons == 2); }
+            CHECK(sc == 0 && mv == 0);
+            CHECK(tf.Feed(P(3000, 3250, 60, 0)).buttons == 0);
+        }
+        // Right-area press held by one finger while another moves: a right drag.
+        {
+            SynapticsGesture rd;
+            CHECK(press(rd, 4800, 1600) == 2);
+            CHECK(rd.Dragging());
+            rd.Feed(P(4800, 1600, 110, 0, true));
+            rd.Feed(AGM(3000, 3000, 60));
+            int mx = 0, sy = 0;
+            for (int i = 1; i <= 10; ++i) { auto r = rd.Feed(AGM(3000 + 30 * i, 3000, 60)); mx += r.dx; sy += r.scrollY; CHECK(r.buttons == 2); }
+            CHECK(mx > 0 && sy == 0);
+        }
+        // Two-finger scroll with a contact near (but above) the strip is unchanged.
+        {
+            SynapticsGesture sc; for (int i = 0; i < 3; ++i) sc.Feed(P(3000, 2000, 70, 0));
+            int t = 0; for (int i = 1; i <= 4; ++i) t += sc.Feed(P(3000, 2000 + 50 * i, 70, 0)).scrollY;
+            CHECK(t == 2);
+        }
+        // Software buttons off (not a clickpad): position does not matter.
+        {
+            SynapticsGestureConfig off; off.softButtons = false; SynapticsGesture nb(off);
+            CHECK(press(nb, 4800, 1600) == 1);
+            nb.Feed(P(4800, 1600, 60, 6));
+            nb.Feed(P(3000, 3000, 70, 0));
+            CHECK(nb.Feed(P(3000, 3000, 70, 0, true)).buttons == 2);
+        }
+        // A resync reset forgets the last contact position.
+        {
+            SynapticsGesture rs; rs.Feed(P(4800, 1600, 60, 6)); rs.Reset();
+            CHECK(rs.Feed(P(0, 0, 0, 0, true)).buttons == 1 && rs.clicksNoPos == 1);
+        }
+    }
+
     // Palms and light touches produce nothing; extended packets are ignored.
     SynapticsGesture pm; pm.Feed(P(3000, 2000, 60, 14));
     CHECK(pm.Feed(P(3300, 2300, 60, 14)).dx == 0);
