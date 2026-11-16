@@ -92,6 +92,45 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov wrap-up (usage limit; finish in-flight work, start nothing new). Dell on gen 422 `dell-int20-20261116`, session `c6affe0f76244436bd0aa9c0aedac0d0`, Steam closed.**
+
+Done today, on main up to `f388d5ac`:
+- **60 fps:** live yquake2 with zero-copy armed displays 72 fps (p99 18 ms). The matched demo is ~40–43 displayed (~33 without zero-copy, ~12 on gen 419).
+- **Also on main:** occlusion and direct scaled sources, pointer relock and Alt+Tab, Steam working (rootless launcher installed on the Dell), the Quake audio recipe, and the decisions recorded in DECISIONS.md.
+
+**In flight — finish these, in order:**
+1. **`work/integration22`** = main + `work/restart-harden` + `work/clickpad-buttons` + `work/zc-default` + `work/net-arp` + `work/chrome-csd-style` + `work/power-guard`.
+   - Build, run `check_dell_image_qemu.py`, deploy (the Dell is idle).
+   - Verify: `gpu zerocopy status` shows active from boot; the matched demo; bridge/ping stay healthy (`bridge net stats`, `bridge net arp`).
+   - Then Ian tests: clickpad hard click (bottom-right = right, `input touchpad status` shows range and soft_buttons), launcher power confirmation, Chromium caption colour (waylandd log `caption style … strip=#…`).
+   - Merge to main if good.
+2. **Agents still running.** Each will report a branch plus a Dell pair; integrate the next image from main + these:
+   - `work/shell-opaque` (`3f916b91`+): opaque launcher/shell bands, so an open launcher costs no game frames. Measure Q2 with the launcher open (it was 49–64 fps, now expected ~72).
+   - `work/steam-rootless` (`fe4f65cf`+): machine-id and /etc files in Steam's container. This is the fix for Torchlight II's D-Bus abort. Install with the bundle's `install.py` (rollback: `install.py --rollback`), then retry Torchlight II.
+   - `work/xwayland-hidpi`: first the Stardew X11 geometry and input offset (synthetic ConfigureNotify, borderless/fullscreen hints, pointer translation), then HiDPI (Xft.dpi/GDK/Qt/Steam scale hints by default, per-app opt-in compositor 2× upscale).
+   - `work/storage-io`: AHCI interrupt-driven completion (the guard/panic paths keep polling), the file-mapping lock hot spot, and the taskbar R/W graph (it showed nothing while ~14.5 MB/s was being written).
+   - `work/sched-convoy`: scheduler-lock hold/contention stats and fixes. Behind the QEMU freezes under host load and the Dell's `SchedLockRelease` profile skid.
+   - `work/compositor-refactor` (after shell-opaque): rebase, idle-host soak (2/4 candidate boots froze under load before), then stages 0.3/0.4.
+
+**Next steps after that (not started):**
+- **Matched demo to 60 displayed:** composite into the uncached zero-copy images costs ~12 ms at 2560×1440. Options: honour `xdg_toplevel.set_fullscreen`, then direct scanout of a fullscreen game (design in the occlusion report); or composite into cached memory; or hardware sprite planes for shell surfaces.
+- **Compat batch 2:**
+  - xattr syscalls should return EOPNOTSUPP, not ENOSYS (Python `shutil.copy2` breaks);
+  - `strace exec NAME` (attach at execve) and lift `strace`'s pid < 256 limit;
+  - dma-buf EXPORT_SYNC_FILE (VKRENDER hits ENOSYS per frame, 9,887 in one boot);
+  - netlink uevent sockets, `/dev/input`, `/sys/class/net`, SIOCGIFHWADDR (Steam census);
+  - `/proc/self/exe` status → EOPNOTSUPP (OpenAL);
+  - `oom_recovery` thread using ~1.8% CPU with no memory pressure.
+- **Launchers (Ian's approval needed for /nix/store):**
+  - Quake II Apps entry, using the recipe in the gen 419 entry;
+  - VSCodium (`--no-sandbox`, or a working Chromium namespace sandbox);
+  - desktop PulseAudio session server with Dell HDA output.
+- **32-bit (i386) support:** absent. Not prioritised (Ian); Steam's i386 helpers fail with 126.
+- **Direction docs:**
+  - `work/brook-value` (`1671e404`) holds Fable's "What is Brook for?" with Ian's decisions; merge it after Ian's review;
+  - commit the untracked `docs/discrete-gpu-bringup-plan.md` from /data/Programming/Codex/Brook;
+  - hardware target is the RTX 3080 desktop, booting from removable media with no writes to internal drives (DECISIONS row).
+
 **16 Nov night (Dell gen 422, `dell-int20-20261116` = main + `work/occlusion` `811879bf`, session `6138c7fa7e564e65821833a64ed2fe19`):**
 - **Occlusion and direct scaled sources (merged).** Matched demo, displayed frames (the goal metric):
   - gen 419: 162 in 24 s, mean interval 84 ms (~12 fps), swaps 52, composite 19.0 ms;
