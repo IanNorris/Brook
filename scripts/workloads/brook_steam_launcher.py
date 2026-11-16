@@ -36,7 +36,7 @@ try:
 except ImportError:  # python3-minimal, the Dell's /nix/profile/bin/python3, lacks _ctypes
     ctypes = None
 
-LAUNCHER_VERSION = 'rootless-2'
+LAUNCHER_VERSION = 'rootless-3'
 HOME = Path(os.environ.get('BROOK_STEAM_USER_HOME', '/data/home'))
 BROOK = HOME / '.local/share/brook'
 LOG = Path(os.environ.get('BROOK_STEAM_LOG', BROOK / 'steam-launcher.log'))
@@ -44,6 +44,21 @@ STATE = Path(os.environ.get('BROOK_STEAM_STATE', BROOK / 'steam-launcher-state.j
 PIDFILE = Path(os.environ.get('BROOK_STEAM_PIDFILE', BROOK / 'steam-launcher.pid'))
 RESOLV = Path(os.environ.get('BROOK_STEAM_RESOLV', '/etc/RESOLV.CONF'))
 PULSE_PREFIX = 'brook-steam-pulse-'
+# Host machine-id candidates (Brook's FAT initrd root spells /ETC/MACHINE-ID).
+HOST_MACHINE_IDS = [p for p in os.environ.get('BROOK_STEAM_HOST_MACHINE_ID',
+                                              '/etc/machine-id:/etc/MACHINE-ID').split(':') if p]
+# make_initrd.sh writes this constant into every Brook image; it is not an identity.
+PLACEHOLDER_MACHINE_ID = '0123456789abcdef0123456789abcdef'
+# Small private /etc files that glibc, libdbus and pressure-vessel look for on
+# the "host" (here the launcher's --tmpfs / container). pressure-vessel imports
+# machine-id, hosts and resolv.conf from it into the client and game containers.
+PRIVATE_ETC = {
+    'hosts': '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n',
+    'nsswitch.conf': ('passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n'
+                      'networks: files\nprotocols: files\nservices: files\nethers: files\nrpc: files\n'),
+    'os-release': 'NAME="Brook"\nID=brook\nPRETTY_NAME="Brook"\n',
+    'host.conf': 'multi on\n',
+}
 X_EXTENSIONS = ('GLX', 'DRI3', 'Present', 'MIT-SHM', 'XFIXES', 'Composite', 'RANDR',
                 'XInputExtension', 'DRI2')
 _log_stream = None
@@ -752,11 +767,45 @@ class Steam:
             extra = graphics_environment(env, self.args.gl, self.args.iris, self.args.gl_debug)
         return env, extra
 
+    def machine_id(self, etc):
+        """libdbus aborts without a machine ID (Torchlight II). Use a valid host
+        ID if there is one; otherwise create a private one once and keep it."""
+        for candidate in HOST_MACHINE_IDS:
+            try:
+                text = Path(candidate).read_text()
+            except OSError:
+                continue
+            if re.fullmatch(r'[0-9a-f]{32}\n?', text) and text.strip() not in (PLACEHOLDER_MACHINE_ID, '0' * 32):
+                return Path(candidate), 'host'
+        private = etc / 'machine-id'
+        try:
+            text = private.read_text()
+        except FileNotFoundError:
+            temporary = etc / f'.machine-id.{os.getpid()}'
+            temporary.write_text(os.urandom(16).hex() + '\n')
+            try:
+                os.link(temporary, private)  # never replace an ID created concurrently
+            except FileExistsError:
+                pass
+            except OSError:
+                if not private.exists():
+                    os.replace(temporary, private)
+            temporary.unlink(missing_ok=True)
+            text = private.read_text()
+            log('created private machine-id', path=str(private))
+        if not re.fullmatch(r'[0-9a-f]{32}\n', text):
+            raise RuntimeError(f'{private} is not a 32-hex machine ID; fix or remove it')
+        return private, 'private'
+
     def command(self, extra):
         etc = BROOK / 'steam-private-etc'
         etc.mkdir(mode=0o700, exist_ok=True)
         (etc / 'passwd').write_text('brook:x:1000:100:Brook:/data/home:/nix/profile/bin/sh\n')
         (etc / 'group').write_text('users:x:100:brook\n')
+        for name, text in PRIVATE_ETC.items():
+            if not (etc / name).exists() or (etc / name).read_text() != text:
+                (etc / name).write_text(text)
+        machine_id, self.machine_id_source = self.machine_id(etc)
         command = [str(self.bwrap), '--tmpfs', '/']
         for mount in ('/nix', '/data', '/tmp', '/proc', '/boot', '/usr', '/sys'):
             command += ['--dir', mount, '--bind', mount, mount]
@@ -765,6 +814,9 @@ class Steam:
                              (self.provider / 'ld.so.cache', '/etc/ld.so.cache'),
                              (self.provider / 'ld.so.cache', '/var/cache/ldconfig/ld.so.cache'),
                              (RESOLV, '/etc/resolv.conf'),
+                             (machine_id, '/etc/machine-id'),
+                             (machine_id, '/var/lib/dbus/machine-id'),
+                             *((etc / name, '/etc/' + name) for name in PRIVATE_ETC),
                              (self.loader, '/lib64/ld-linux-x86-64.so.2'),
                              ('/nix/profile/bin/sh', '/bin/sh'),
                              ('/nix/profile/bin/bash', '/bin/bash')):
@@ -957,7 +1009,8 @@ class Steam:
                         pulse_keeper=self.pulse.process.pid if self.pulse else None, client_pid=self.main.pid,
                         graphics=dict(gl='software' if args.xephyr else args.gl, **extra),
                         state='running')
-            log('client started', pid=self.main.pid, pulse_server=self.pulse_server)
+            log('client started', pid=self.main.pid, pulse_server=self.pulse_server,
+                machine_id=self.machine_id_source)
             reason = self.supervise()
         except (OSError, RuntimeError, XError) as error:
             reason = f'error: {error}'

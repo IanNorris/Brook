@@ -31,6 +31,8 @@ NO_CTYPES = ("import runpy, sys; sys.modules['ctypes'] = None; path = sys.argv[1
 
 FAKE_BWRAP = '''#!{python}
 import os, sys
+import json
+open({record!r} + '/bwrap.json', 'w').write(json.dumps(sys.argv[1:]))
 rest = sys.argv[sys.argv.index('--') + 1:]
 rest[0] = sys.executable if rest[0] == '/nix/profile/bin/python3' else rest[0]
 os.execv(rest[0], rest)
@@ -120,7 +122,7 @@ class LauncherTest(unittest.TestCase):
         for directory in (bwrap.parent, provider, self.root / 'record', self.root / 'run'):
             directory.mkdir(parents=True)
         self.record = self.root / 'record'
-        bwrap.write_text(FAKE_BWRAP.format(python=sys.executable))
+        bwrap.write_text(FAKE_BWRAP.format(python=sys.executable, record=str(self.record)))
         (client / 'steamrt64/steam').write_text('#!/bin/false\n')
         (provider / 'ld-linux-x86-64.so.2').write_text('')
         (provider / 'ld.so.cache').write_text('')
@@ -182,6 +184,35 @@ class LauncherTest(unittest.TestCase):
         report = json.loads(result.stdout[:result.stdout.rindex('}') + 1])
         self.assertEqual(report['display']['display'], self.display)
         self.assertIn('GLX', report['display']['extensions'])
+
+    def binds(self):
+        argv = json.loads((self.record / 'bwrap.json').read_text())
+        return {argv[i + 2]: argv[i + 1] for i, a in enumerate(argv) if a == '--bind'}
+
+    def test_machine_id_and_etc(self):
+        self.helper('tray')
+        self.env['BROOK_STEAM_HOST_MACHINE_ID'] = ''  # no host ID: create a private one
+        ids = []
+        for _ in range(2):
+            launcher = self.launch('--windowless-grace', '2', '--startup-timeout', '60')
+            launcher.communicate(timeout=60)
+            self.assertEqual(launcher.returncode, 0, self.log()[-3000:])
+            binds = self.binds()
+            self.assertEqual(binds['/etc/machine-id'], binds['/var/lib/dbus/machine-id'])
+            ids.append(Path(binds['/etc/machine-id']).read_text())
+            for name in ('hosts', 'nsswitch.conf', 'os-release', 'passwd', 'group', 'resolv.conf'):
+                self.assertTrue(Path(binds['/etc/' + name]).is_file(), name)
+        self.assertRegex(ids[0], r'^[0-9a-f]{32}\n$')
+        self.assertEqual(ids[0], ids[1])  # created once, never regenerated
+        self.assertIn('"machine_id": "private"', self.log())
+        placeholder = self.root / 'placeholder-id'
+        placeholder.write_text('0123456789abcdef0123456789abcdef\n')
+        host = self.root / 'host-id'
+        host.write_text('a' * 32 + '\n')
+        self.env['BROOK_STEAM_HOST_MACHINE_ID'] = f'{placeholder}:{host}'
+        launcher = self.launch('--windowless-grace', '2', '--startup-timeout', '60')
+        launcher.communicate(timeout=60)
+        self.assertEqual(self.binds()['/etc/machine-id'], str(host))  # placeholder skipped
 
     def test_check_without_ctypes(self):
         self.helper('stay')

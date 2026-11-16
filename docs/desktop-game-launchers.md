@@ -163,6 +163,31 @@ here means DRI3 failed and Mesa fell back to DRISW.
   If no such Python exists it still runs. It then cannot become a subreaper,
   so it remembers each descendant's PID and command line and signals the
   orphans that still match. `--probe` reports that it needs ctypes.
+- **Container `/etc`.** The outer srt-bwrap container starts from
+  `--tmpfs /`, so only files the launcher binds exist there. pressure-vessel
+  treats that container as the host, and imports `machine-id`, `hosts` and
+  `resolv.conf` from it into the client and game containers.
+  - Torchlight II (app 200710) exited about 2 s after start because libdbus
+    aborts when neither `/etc/machine-id` nor `/var/lib/dbus/machine-id`
+    exists.
+  - The launcher now binds one ID file to both paths. It uses the host's
+    `/etc/machine-id` (Brook's FAT root spells it `/ETC/MACHINE-ID`) only if
+    the file is 32 lowercase hex and is not the constant
+    `0123456789abcdef…` that `make_initrd.sh` writes into every image. That
+    constant is valid but not an identity, and the Dell's separately
+    assembled initrd may not carry it.
+  - Otherwise it creates `steam-private-etc/machine-id` once (16 random bytes
+    as hex plus a newline) and never regenerates it; an invalid file there
+    stops the launch.
+  - It also binds private `hosts` (localhost), `nsswitch.conf` (files, then
+    dns), `os-release` (ID=brook) and `host.conf`, alongside the existing
+    passwd, group, resolv.conf, ld.so.cache and loader.
+  - No `/etc/localtime` is bound, so containers use UTC, as Brook's clock
+    does.
+  - pressure-vessel's "Cannot find locale/localedef" warnings mean it cannot
+    generate extra locales. With `LANG=C.UTF-8` the runtime's built-in
+    C.UTF-8 suffices. Torchlight II's "Failed to set locale to UTF-8 locale …
+    trying to force it" is non-fatal.
 - **Ownership.**
   - The launcher is a child subreaper (`PR_SET_CHILD_SUBREAPER` is
     implemented), so descendants that daemonize stay in its tree.
