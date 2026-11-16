@@ -16,8 +16,6 @@ struct brook_pointer_constraint {
 };
 static struct brook_relative_pointer *g_relative_pointers;
 static struct brook_pointer_constraint *g_pointer_constraints;
-static int g_pointer_lock_inhibited;
-static uint64_t g_pointer_lock_rearm_serial;
 static long pointer_lease(struct brook_surface *s,int op,uint32_t token) {
     return syscall(BROOK_SYS_WM_POINTER_CAPTURE,(long)s->wm_id,(long)op,(long)token,0L,0L);
 }
@@ -31,10 +29,13 @@ static int pointer_event_token(struct brook_surface *s,uint32_t token) {
         if(p->surface==s && p->token==token)return 1;
     return 0;
 }
+/* Op 3 is the window's engage serial: it advances only when a physical
+ * primary press is delivered to that window's client area. Clicks on the
+ * taskbar, launcher, popups or other windows never re-arm a revoked lock. */
 static void pointer_lock_inhibit(struct brook_surface *s) {
     long serial=pointer_lease(s,3,0);
-    g_pointer_lock_inhibited=1;
-    g_pointer_lock_rearm_serial=serial>=0?(uint64_t)serial:UINT64_MAX;
+    s->pointer_lock_inhibited=1;
+    s->pointer_lock_rearm_serial=serial>=0?(uint64_t)serial:UINT64_MAX;
 }
 static void pointer_constraint_unlock(struct brook_pointer_constraint *p,int notify,int block) {
     if(p->token) {
@@ -53,17 +54,21 @@ static void pointer_constraint_unlock(struct brook_pointer_constraint *p,int not
 static void pointer_constraints_refresh(void) {
     for(struct brook_pointer_constraint *p=g_pointer_constraints;p;p=p->next) {
         if(p->token && pointer_lease(p->surface,0,p->token)!=(long)p->token) {
-            // Includes emergency release. Inhibition belongs to the physical
-            // seat, surviving client destroy/recreate until a fresh real click.
+            // Includes Super, emergency release and focus loss. Inhibition
+            // belongs to the surface, surviving constraint destroy/recreate
+            // (a fresh oneshot) until a real click in its content.
             pointer_constraint_unlock(p,1,0);
         }
         if(p->confined || p->blocked || !p->surface || !p->pointer)continue;
         struct brook_surface *s=p->surface;struct brook_seat_client *sc=p->seat;
-        if(g_pointer_lock_inhibited && s->wm_id) {
+        if(s->pointer_lock_inhibited && s->wm_id) {
             long serial=pointer_lease(s,3,0);
-            if(serial>=0 && (uint64_t)serial>g_pointer_lock_rearm_serial)g_pointer_lock_inhibited=0;
+            if(serial>=0 && (uint64_t)serial>s->pointer_lock_rearm_serial)s->pointer_lock_inhibited=0;
         }
-        int eligible=!g_pointer_lock_inhibited && s->wm_id && sc->entered_surface==s &&
+        // entered_surface/pointer_x are only as fresh as the last event routed
+        // here (the WM sends no leave for the taskbar); the kernel acquire is
+        // authoritative about the pointer actually being over this content.
+        int eligible=!s->pointer_lock_inhibited && s->wm_id && sc->entered_surface==s &&
             pointer_region_contains(&s->input_region,sc->pointer_x,sc->pointer_y) &&
             pointer_region_contains(&p->region,sc->pointer_x,sc->pointer_y);
         if(p->token && !eligible)pointer_constraint_unlock(p,1,0);

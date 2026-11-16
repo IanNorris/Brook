@@ -320,6 +320,10 @@ struct brook_surface {
     struct wl_resource *resource;
     struct pointer_region input_region,pending_input_region;
     int input_region_pending;
+    /* A revoked pointer lock stays inhibited for this surface until the
+     * kernel's per-window engage serial (a click in its content) advances. */
+    int pointer_lock_inhibited;
+    uint64_t pointer_lock_rearm_serial;
     struct brook_buffer *pending_buffer;
     int pending_attach;
     /* Own committed SHM pixels after releasing the client's buffer. Never use

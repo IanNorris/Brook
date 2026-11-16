@@ -2583,11 +2583,15 @@ static void CompositorInputWM()
                            ev.type==InputEventType::MouseButtonUp ||
                            ev.type==InputEventType::MouseMove ||
                            ev.type==InputEventType::MouseScroll;
+        bool overlay=false;
         if(pointer) {
             int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
             const bool launcher=WmLauncherVisible();
-            const bool overlay=launcher || WmVolumePopupVisible() ||
-                               my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight));
+            overlay=launcher || WmVolumePopupVisible() ||
+                    my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight));
+            // Shell surfaces own the pointer: no window may acquire a lock
+            // while it is over the taskbar, launcher or volume popup.
+            if(overlay)WmPointerSetHover(-1);
             const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
                             ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
                             ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
@@ -2611,6 +2615,13 @@ static void CompositorInputWM()
         }
         // Non-overlay events retain the existing raw and targeted routes.
         RouteToGrabber(ev);
+        if(pointer && !overlay) {
+            // Publish the delivery target before the event reaches waylandd,
+            // so a lock request made on its behalf sees the same hover.
+            int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
+            const WmHitResult hover=WmHitTest(mx,my);
+            WmPointerSetHover(hover.zone==WmHitZone::ClientArea?hover.windowIndex:-1);
+        }
 
         if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
         {
@@ -2623,6 +2634,10 @@ static void CompositorInputWM()
                 Window* target = WmGetWindow(hit.windowIndex);
                 if (target && target->proc)
                 {
+                    // The explicit re-engage gesture after a revoked pointer
+                    // lock; the press itself is still delivered (as in mutter
+                    // and sway), before any lock it permits can activate.
+                    WmPointerEngage(hit.windowIndex);
                     ProcessInputPush(target->proc, ev);
                     WmInputPush(target, ev,
                                 static_cast<int16_t>(mx - target->clientX()),
