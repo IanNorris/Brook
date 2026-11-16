@@ -69,7 +69,7 @@ Expected gain: unmeasured on this hardware. Gen8 guidance suggests linear sampli
 
 ## Zero-copy at boot
 
-This branch adds `BdwZeroCopySetAutoArm`. When it's enabled, the kernel requests arming as soon as the renderer registers its ring. It is gated on the boot marker `/etc/dell-zero-copy-auto`, so it is **off by default**, until the compositor failure after a live arm on gen 401 is understood. The arm still needs a passing flip probe, `gpu zerocopy off` cancels auto-arm for the rest of the boot, and `gpu zerocopy status` reports `auto_arm`. Making it the default means inverting one test in `BdwGopObserveConfigure`.
+This branch adds `BdwZeroCopySetAutoArm`. When it's enabled, the kernel requests arming as soon as the renderer registers its ring. It was gated on the boot marker `/etc/dell-zero-copy-auto` (off by default) until gen 422; since 16 Nov it is **on by default**, with `/etc/dell-zero-copy-no-auto` to opt out, after a gen 422 live arm ran 12k+ flips with no GOP fallback. The arm still needs a passing flip probe, `gpu zerocopy off` cancels auto-arm for the rest of the boot, and `gpu zerocopy status` reports `auto_arm`. Making it the default means inverting one test in `BdwGopObserveConfigure`.
 
 ## GPU clock headroom
 
