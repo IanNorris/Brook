@@ -618,6 +618,26 @@ def patched_iris():
     raise RuntimeError('--iris needs brook-iris-run (patched Iris); none found')
 
 
+def desktop_scale():
+    """Integer desktop scale: BROOK_STEAM_UI_SCALE, else Brook's applied
+    desktop scale (syscall 0xB04 op 2, percent), else 1. The desktop Xwayland
+    shows X windows at device pixels ("apps scale themselves"), so Steam's
+    CEF UI must scale itself."""
+    override = os.environ.get('BROOK_STEAM_UI_SCALE')
+    if override:
+        return int(override) if override.isdigit() and 1 <= int(override) <= 4 else 1
+    if ctypes is None:
+        return 1
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        percent = libc.syscall(ctypes.c_long(0xB04), ctypes.c_long(2), ctypes.c_long(0), ctypes.c_long(0),
+                               ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(0))
+    except (OSError, AttributeError):
+        return 1
+    return (percent + 50) // 100 if 100 <= percent <= 400 else 1
+
+
 def graphics_environment(env, gl, iris, gl_debug):
     env.pop('LIBGL_ALWAYS_SOFTWARE', None)
     extra = {}
@@ -765,6 +785,11 @@ class Steam:
         else:
             env['DISPLAY'] = self.display
             extra = graphics_environment(env, self.args.gl, self.args.iris, self.args.gl_debug)
+            scale = desktop_scale()
+            if scale > 1:
+                # Steam's own UI; games ignore it and keep choosing their own resolution.
+                env.setdefault('STEAM_FORCE_DESKTOPUI_SCALING', str(scale))
+            extra['ui_scale'] = env.get('STEAM_FORCE_DESKTOPUI_SCALING') or '1'
         return env, extra
 
     def machine_id(self, etc):
