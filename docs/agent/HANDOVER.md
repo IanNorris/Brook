@@ -92,6 +92,22 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov night (Dell gen 422, `dell-int20-20261116` = main + `work/occlusion` `811879bf`, session `6138c7fa7e564e65821833a64ed2fe19`):**
+- **Occlusion and direct scaled sources (merged).** Matched demo, displayed frames (the goal metric):
+  - gen 419: 162 in 24 s, mean interval 84 ms (~12 fps), swaps 52, composite 19.0 ms;
+  - gen 422: 536, mean 30.1 ms / p90 44 / p99 50 (~33 fps), swaps 43.5, composite 10.5 ms.
+  - With an idle Qalc behind: composite 10.9 ms and 42.6 swaps (no penalty).
+  - waylandd `layered.scaled_single` counts every game frame; `offer_skipped.geometry` is 0.
+  - Cause: c76814b7 (15 Nov) only offered exact-size buffers, so scaled games went through waylandd CPU composition and were never opaque. Separately, carried damage never shrank.
+  - Evidence: `display-perf/build/dell/occl-{alone,idle}-{1,2}`.
+  - Next for 60 fps: present blit 7.8 ms and submit→fence 29.7 ms on direct frames; honour fullscreen plus zero-copy/scanout (design note in the occlusion report).
+- **Alt+Tab pointer re-engage:** confirmed by Ian, merged (`5f9d13cd`).
+- **Network-dead-but-desktop-alive (16 Nov, Chromium video):** the lastlog record shows ARP replies from 192.168.85.8 arriving while "ARP resolve failed" loops; also DNS sockets full and dropping, the debug listener's accept queue full, and VKRENDER hitting dma-buf EXPORT_SYNC_FILE ENOSYS 9,887 times. Evidence: `display-perf/build/dell/hang-1116-lastlog/`. Fix in progress on `work/net-arp`.
+- **Ready to integrate:**
+  - `work/restart-harden` `4ace7567` (TERM/KILL escalation for windowless processes, blockers in status, tcp traces behind `log level tcp debug`);
+  - `work/brook-value` `1671e404` (revised with Ian's direction).
+- **In progress:** `work/clickpad-buttons` (hard right-click on the clickpad), `work/chrome-csd-style` (caption glyphs over Chromium's strip), `work/steam-rootless`.
+
 **16 Nov late (paused at the usage limit). Dell on gen 421 `dell-int19-20261116` (Alt+Tab pointer change), session `feb450f6f3a648f0b935b97d0f6535ef`; Q2 running for Ian's test:**
 - **Ready, not yet deployed:** `integration20/build/dell/pair-int20` = gen 421 + `work/occlusion` (`811879bf`), QEMU check PASS.
   - Fixes: scaled games are offered as a direct opaque layer (waylandd), and carried damage no longer grows (`DESKTOP_PIPELINE_WAIT_CARRY`).
