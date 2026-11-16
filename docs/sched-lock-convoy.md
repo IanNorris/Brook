@@ -35,6 +35,19 @@ bridge queries plus the 200 x 1 ms sleep job, with statistics on.
 | C: unfair claim, no idle skip | 0.57 / 0.53 | 1.53 / 1.54 | 0.05 / 0.06 s | 3.7% | 1.9 s | 0.43 s |
 | D: unfair claim, idle skip (new default in VMs) | 0.62 / 0.46 | 1.51 / 0.82 | 0.04 / 0.05 s | 3.7% | 2.4 s (2.3 s own steal) | 0.47 s |
 
+With statistics off the old behaviour does not merely crawl; it freezes. Under
+the same pinned load, the unmodified `main` kernel (`c48be213…`) answered no
+bridge query and never completed the sleep job in two separate runs (four
+rounds, 20 of 20 queries timed out). The guest stayed frozen after the host
+loops stopped, held there by its own busy jobs, and recovered within 12 s once
+QEMU was unpinned. The new kernel in `ticket` mode with statistics off froze
+the same way. In `unfair` + idle-skip mode with statistics off, three rounds gave
+sleep 0.64–0.90 s guest time, sleep job 1.6–2.7 s and query p50 0.08–0.11 s.
+No D configuration froze in any run: 2- and 4-CPU pinning, host-only load of
+32 and 64 loops, with statistics on and off. Statistics-on timing delays the
+lock enough that FIFO mode limps instead of freezing; treat the A row above as
+a lower bound on the damage.
+
 With QEMU pinned to two host CPUs, A spent 95.8% of acquisitions contended
 (594 s aggregate wait, sleep job 37.5/31.9 s); D stayed at 2.8% (sleep job
 2.2/2.2 s).
