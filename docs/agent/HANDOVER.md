@@ -92,6 +92,15 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Gen 423 deployed (`dell-int22-20261116`, session `2074aa4179ba4cb3a864f2539379acc6`; `work/integration22` merged to main):**
+- **Network:** ARP 2 entries, 0 failures, a queued frame released correctly. Bridge stable.
+- **Zero-copy auto-arm doesn't fire at boot:** `auto_arm: true` but "not requested". Auto-arm only triggers at renderer ring registration, before any flip probe has passed. A manual `gpu flip probe` + `gpu zerocopy arm` works (I armed it on this boot).
+  - **Fix next:** run the flip probe automatically at registration (or at boot), then arm.
+  - Until then the matched demo runs on the copy path (~33 displayed, 43.5 swaps).
+- **Ian to test on this boot:** clickpad hard click (bottom-right = right); launcher Restart/Shut down confirmation; Chromium caption colour (waylandd log `caption style … strip=#…`).
+- **Steam launcher `rootless-3` installed** (machine-id + /etc files for Steam's containers): retry Torchlight II (app 200710). Ian's Steam launch option `%command% > $HOME/t2.log 2>&1` writes to `/data/home/steam-20261022/user/t2.log`.
+- **Ready, not deployed:** `work/shell-opaque` `3f916b91` (opaque keyed shell bands, so the launcher costs no game frames; measurement steps in its commit/report: Q2 with the launcher open vs closed, expect ~72 displayed). Pair `shell-opaque/build/dell/pair-shell-opaque` (main f388d5ac + fix). Rebase onto main and rebuild with the zero-copy probe fix.
+
 **16 Nov wrap-up (usage limit; finish in-flight work, start nothing new). Dell on gen 422 `dell-int20-20261116`, session `c6affe0f76244436bd0aa9c0aedac0d0`, Steam closed.**
 
 Done today, on main up to `f388d5ac`:
