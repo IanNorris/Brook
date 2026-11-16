@@ -287,12 +287,11 @@ check. Stages 0 and 1 change no pixels unless a step says otherwise.
 | --- | --- | --- |
 | **0.1 (done)** | One shell-surface list: `WmShellSurfaces()` and `WmRenderShellSurface()`. The VKRENDER capture, CPU draw, virgl overlay draw, virgl blur and virgl compose all iterate it. | Host test (`test_window_surfaces`), QEMU CPU screenshots pixel-identical (see Phase 1 evidence) |
 | **0.2 (done)** | Tokens:<br>• `brook_theme.h` gains palette fields `accent`, `halo`, `ok/warm/hot` and `badgeText/badgeFill`, plus named constants for theme-independent colours (material shade, wallpaper fallback, cursor busy dots, agent icon). Every theme keeps the old literal values.<br>• Painters, telemetry, `chrome_material.h`, `cursor_composition.h` and `desktop_backdrop.h` read tokens.<br>• One metrics source: `WM_TITLE_BAR_HEIGHT`/`BORDER`/`BUTTON`/`TASKBAR` come from `DesktopMetrics::*Base`.<br>• `DesktopMetrics::clientOffsetX/Y()` replaces the frame-offset arithmetic in the shell, ioctl and Kernel Console code.<br>**Held for 0.4**, because chrome-csd edits those functions: the accent stroke literal in `RenderWindowChrome` and the colour key in `SetChromeDecorAlpha`. | `test_window_surfaces` pins the metric equivalence and the token values; QEMU screenshots identical (see Stage 0.2/0.5 evidence) |
-| 0.3 | Split window.cpp:<br>• shell layout and painters to `desktop_shell.cpp`;<br>• raster primitives to `chrome_raster.{h,cpp}` (freestanding, host-buildable). | Build, host tests, identical screenshots |
-| 0.4 | One alpha rule: painters write real alpha. Delete `SetChromeDecorAlpha`'s colour key and the capture's span loop; keep one helper for interior transparency and corner masks. | Virgl screenshot identical; `desktop_chrome_test` mask check |
+| **0.3 (done)** | Split window.cpp (4234 → 3155 lines), pure move:<br>• raster primitives to `chrome_raster.{h,cpp}`, one translation unit with a header;<br>• taskbar/tray/popup/tooltip code to `wm_shell_taskbar.inc` and launcher UI to `wm_shell_launcher.inc`, still included in window.cpp's translation unit because they share the WM's window list and launcher state. They become their own unit when the shell builds surfaces (stage 1.2/3).<br>Not done: `chrome_raster` is not yet freestanding, since it still calls `WmDesktopFont`, `WmMetric` and the compositor's glass state; that is the executor work in stage 1.2. | Expanded includes reproduce the old file exactly; host tests; identical screenshots (see Stage 0.3/0.4 evidence) |
+| **0.4 (done)** | One alpha rule: `chrome_alpha.h`, where frame = outer minus client is opaque, the interior is transparent, and an overlaid caption block is opaque. Used by the virgl chrome layer's opaque branch and by the VKRENDER capture. The glass branch (virgl only: title material alpha, opaque text/accent colour key, corners) stays and takes the accent token; it goes when surfaces carry their material (stage 1.3). Painters writing real alpha is moved to the stage 2 repaint, because the colour key encodes behaviour (hover glyphs keep material alpha) that a pure step must not change. | `test_chrome_alpha`: exact against copies of both old loops; virgl and CPU screenshots identical |
 | **0.5 (done)** | Damage triggers use the surface list: one comparison of the shell surfaces (kind and rect, boot summary excluded) replaces the separate launcher, volume-popup and tooltip triggers. A surface that resizes while it is open now also repaints the scene under it. | Same |
 
-Steps 0.3 and 0.4 touch `RenderWindowChrome`. Land them **after
-`work/chrome-csd` merges** (see [Interactions](#interactions)).
+Steps 0.3 and 0.4 landed after `work/chrome-csd` merged into main.
 
 ### Stage 1: single description
 
@@ -403,16 +402,15 @@ taskbar and frame for when the shell is down (DESIGN.md T3).
 
 ## Interactions
 
-- **`work/chrome-csd`** (uncommitted, in progress):
-  - It adds `captionOverlay` caption buttons over a client-decorated
-    surface. The changes are in `DesktopCaptionRect`, `WmHitTest`,
-    `RenderWindowChrome`, `SetChromeDecorAlpha`, `GpuComposeShadow`, the
-    chrome capture and the chrome key.
-  - Stage 0.1 deliberately avoids those hunks. Stages 0.3, 0.4 and 1.1
-    build on its result.
-  - Its overlaid caption buttons are the first case of a part table on a
-    client-decorated window. Stage 1.1 should absorb it as "parts with a
-    button role on a CSD window".
+- **`work/chrome-csd`** is merged into main. Its overlaid caption buttons
+  (`captionOverlay`) are the first case of a part table on a
+  client-decorated window. Stage 1.1 should absorb it as "parts with a
+  button role on a CSD window". Stages 0.3 and 0.4 were built on top of it.
+- **`work/shell-opaque`** (16 November) makes opaque shell bands occlude in
+  VKRENDER and adds per-band keys (overlay op 9). A trial merge with this
+  branch is clean. It is the first piece of "surfaces carry their
+  material" (stage 1.3), so stage 1.3 should extend its band opacity and
+  key to window-frame surfaces rather than add a parallel mechanism.
 - **`work/compat-census`:** no overlap found.
 - **`work/ui-drawer` (Clearwater):** stage 2 is that work. Its native
   steps should target the builder and theme, not the painters directly.
@@ -540,3 +538,57 @@ How each side was booted and captured:
 candidate completed without a stall once host load fell (load about 8).
 That is consistent with stalls triggered by contention. It does not
 replace the idle-host soak.
+
+## Stage 0.3 and 0.4 evidence, and the idle-host soak
+
+The branch was rebased onto `main` `73409c2a` (chrome-csd included).
+
+**Soak.** One QEMU boot per row, alternating `main` and the rebased stage
+0.1+0.2+0.5 build. Each boot ran the seven-scene bridge sequence twice, then
+checked for a freeze: is the taskbar clock unchanged across 65 s of QMP
+screendumps? vCPU RIPs were also sampled. Results are in
+`build/refactor-evidence/soak/results.jsonl`.
+
+| Boot | Build | Load average | Scene passes | Frozen |
+|---|---|---|---|---|
+| 0 | main | 34 | 7 + 7 | no |
+| 1 | candidate | 34 → 39 | 4 (bridge stalled) | no |
+| 2 | main | 38 → 13 | 7 + 7 | no |
+| 3 | candidate | 13 | 7 + 7 | no |
+| 4 | main | 11 | 7 + 7 | no |
+| 5 | candidate | 11 | 7 + 7 | no |
+
+- **No freezes in six boots.** Three more candidate boots for the
+  screenshots below were also clean.
+- **One bridge stall,** on a candidate boot under load 34–39. The guest
+  stayed alive.
+- **The `SchedLockWaitForTicket` spin shows up in RIP samples of both
+  builds** under load.
+- **The earlier freezes** (two of four candidate boots) happened at load
+  40–49.
+- **Conclusion:** with this sample, there is no evidence that the refactor
+  changes the freeze rate. The stalls track host contention. If it comes
+  back, look at the scheduler-lock path under vCPU preemption, not at the
+  compositor.
+
+**Stage 0.3/0.4 checks:**
+- **Host tests:** 364 run, `test_fd_table` excluded because it hangs on main
+  too.
+  - `test_audio_delivery` hit the ctest timeout under load and passes when
+    run alone.
+  - `test_intel_bdw_buffer` segfaulted once; it flakes on main as well (3
+    of 20 runs on main, 0 of 20 on this branch).
+  - New: `test_chrome_alpha`.
+- **QEMU CPU path:** all seven scenes match `main` exactly outside the usual
+  masks (`compare-034-cpu.txt`).
+- **QEMU virgl path (`gpu=gl`, glass active):**
+  - This path exercises the glass alpha, shadows, blur and overlay
+    composition.
+  - All seven scenes are identical outside the usual masks plus two blur
+    halos (`compare-034-gl-blurmask.txt`).
+  - The halos come from things outside this change. The build label differs
+    in length (dirty-tree suffix), and the glass taskbar, popup and tooltip
+    blur it. The blinking terminal caret is in the desktop backdrop, and the
+    glass titlebar blurs it.
+  - The differences are small: at most 13 levels near the caret, and only
+    within the blur radius of those two sources.
