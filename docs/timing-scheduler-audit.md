@@ -248,6 +248,13 @@ Later evidence supersedes several early leads:
   fails, reinforcing older MLFQ/RR and later EEVDF clamp evidence. A further
   8.59-million-event history capture is negative and does not clear those gates.
 
+- [Scheduler-lock convoy](sched-lock-convoy.md): under vCPU overcommit the
+  FIFO ready lock handed ownership to descheduled waiters (86–96% of
+  acquisitions contended, holds under 1 µs on average). Unfair claims under a
+  hypervisor and idle ticks that skip the lock while nothing is queued cut
+  contention to about 3% and the loaded sleep job from about 31 s to 1–2 s.
+  `sched lock-stats` measures hold/wait/handoff by site.
+
 - [Bounded owner-directed yield](ready-lock-owner-yield.md) follows positive
   owner-qualified preemption observations. Its matched native pair exercises
   19 guest calls and 15 successful host yields in the separately bracketed
