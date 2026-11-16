@@ -24,6 +24,10 @@ import time
 import unittest
 
 LAUNCHER = Path(__file__).resolve().parent / 'workloads/brook_steam_launcher.py'
+PACKAGER = Path(__file__).resolve().parent / 'package_steam_launcher.py'
+# The Dell's /nix/profile/bin/python3 is python3-minimal, without _ctypes.
+NO_CTYPES = ("import runpy, sys; sys.modules['ctypes'] = None; path = sys.argv[1]; "
+             "sys.argv = sys.argv[1:]; runpy.run_path(path, run_name='__main__')")
 
 FAKE_BWRAP = '''#!{python}
 import os, sys
@@ -139,8 +143,11 @@ class LauncherTest(unittest.TestCase):
         helper.chmod(0o755)
         self.env['BROOK_STEAM_HELPER'] = str(helper)
 
-    def launch(self, *args):
-        return subprocess.Popen([sys.executable, str(LAUNCHER), *args], env=self.env,
+    def command(self, args, no_ctypes=False):
+        return [sys.executable, *(['-c', NO_CTYPES] if no_ctypes else []), str(LAUNCHER), *args]
+
+    def launch(self, *args, no_ctypes=False):
+        return subprocess.Popen(self.command(args, no_ctypes), env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def log(self):
@@ -176,6 +183,34 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(report['display']['display'], self.display)
         self.assertIn('GLX', report['display']['extensions'])
 
+    def test_check_without_ctypes(self):
+        self.helper('stay')
+        self.env['BROOK_STEAM_FULL_PYTHON'] = 'none'
+        result = subprocess.run(self.command(['--probe', '--allow-no-glx'], no_ctypes=True),
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        report = json.loads(result.stdout[:result.stdout.rindex('}') + 1])
+        self.assertEqual(report['display']['display'], self.display)
+        self.assertIn('ctypes', report['glx_probe']['error'])
+        self.assertEqual(result.returncode, 1)  # the probe cannot run, everything else works
+
+    def test_reexec_under_full_python(self):
+        self.helper('tray')
+        self.env['BROOK_STEAM_FULL_PYTHON'] = sys.executable
+        launcher = self.launch('--windowless-grace', '3', '--startup-timeout', '60', no_ctypes=True)
+        launcher.communicate(timeout=60)
+        self.assertEqual(launcher.returncode, 0, self.log()[-3000:])
+        self.assertIn('"subreaper": true', self.log())
+        self.assert_clean(launcher)
+
+    def test_windowless_without_subreaper(self):
+        self.helper('tray')
+        self.env['BROOK_STEAM_FULL_PYTHON'] = 'none'
+        launcher = self.launch('--windowless-grace', '3', '--startup-timeout', '60', no_ctypes=True)
+        launcher.communicate(timeout=60)
+        self.assertEqual(launcher.returncode, 0, self.log()[-3000:])
+        self.assertIn('no child subreaper', self.log())
+        self.assert_clean(launcher)  # the orphaned SIGTERM-ignoring descendant was still killed
+
     def test_windowless_steam_is_ended(self):
         self.helper('tray')
         started = time.monotonic()
@@ -206,6 +241,28 @@ class LauncherTest(unittest.TestCase):
         self.assertLess(time.monotonic() - stopped, 30)
         self.assertIn('signal SIGTERM', self.log())
         self.assert_clean(launcher)
+
+
+
+class InstallTest(unittest.TestCase):
+    def test_install_and_rollback(self):
+        root = Path(tempfile.mkdtemp(prefix='brook-steam-install-'))
+        self.addCleanup(shutil.rmtree, root, True)
+        subprocess.run([sys.executable, str(PACKAGER), '--output', str(root / 'bundle')], check=True,
+                       capture_output=True)
+        dest = root / 'dest'
+        dest.mkdir()
+        (dest / 'brook-steam').write_text('old\n')
+        env = dict(os.environ, BROOK_STEAM_INSTALL_DIR=str(dest))
+        result = subprocess.run([sys.executable, str(root / 'bundle/install.py')], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertIn('launcher import ok', result.stdout, result.stdout + result.stderr)
+        self.assertEqual((dest / 'brook-steam').read_bytes(), LAUNCHER.read_bytes())
+        self.assertEqual(len(list(dest.glob('brook-steam.before-*'))), 1)
+        subprocess.run([sys.executable, str(root / 'bundle/install.py'), '--rollback'], env=env, check=True,
+                       capture_output=True)
+        self.assertEqual((dest / 'brook-steam').read_text(), 'old\n')
+        self.assertFalse((dest / 'steam-client-check.py').exists())
 
 
 if __name__ == '__main__':

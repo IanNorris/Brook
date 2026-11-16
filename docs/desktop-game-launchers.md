@@ -155,6 +155,14 @@ here means DRI3 failed and Mesa fell back to DRISW.
     pulseaudio if the launcher disappears, even after SIGKILL.
   - `--pulse-server` reuses an existing server and `--no-pulse` starts none.
   - The output is still a null sink: Steam and game audio are silent.
+- **Interpreter.** The Dell's `/nix/profile/bin/python3` is python3-minimal,
+  which has no `_ctypes`. The launcher imports ctypes optionally. Without it,
+  it re-executes itself under a full Python found at runtime:
+  `BROOK_STEAM_FULL_PYTHON`, or an installed `/nix/store/*-python3-3.*`
+  (not `-minimal`) whose `lib-dynload` has `_ctypes` and which imports it.
+  If no such Python exists it still runs. It then cannot become a subreaper,
+  so it remembers each descendant's PID and command line and signals the
+  orphans that still match. `--probe` reports that it needs ctypes.
 - **Ownership.**
   - The launcher is a child subreaper (`PR_SET_CHILD_SUBREAPER` is
     implemented), so descendants that daemonize stay in its tree.
@@ -191,7 +199,10 @@ PulseAudio and a fake SteamRT tree. Its client maps a `steam` window, checks
 the server with `pactl info`, and starts a descendant in its own session that
 ignores SIGTERM. The test covers `--check`; the windowless shutdown (with the
 SIGKILL of that descendant); SIGTERM; single-instance behavior; and the absence
-of leftovers, Pulse directory or PID file afterwards. Run it with
+of leftovers, Pulse directory or PID file afterwards. It also runs the launcher
+with ctypes blocked: the `--probe` error, re-execution under a full Python, and
+cleanup without a subreaper. Finally it installs and rolls back a fresh bundle.
+Run it with
 `nix-shell -p xvfb pulseaudio --run 'python3 scripts/test_brook_steam_launcher.py'`.
 The GLX probe passed against Xvfb (llvmpipe, direct, red pixel).
 
@@ -238,7 +249,10 @@ close; it is covered by the host test. Evidence:
 `SHA256SUMS` and `SOURCE.json`. On the Dell, as uid 1000,
 `/nix/profile/bin/python3 install.py` verifies the checksums. It backs up the
 installed copies as `*.before-<stamp>` with a `rollback-<stamp>.json`, installs
-the files atomically, syncs, and runs `brook-steam --check`.
+the files atomically and syncs. It copies with `copyfile`, `chmod` and `utime`,
+not `copy2`: Brook's ext2 returns ENOSYS for the xattr calls, and `copystat`
+does not tolerate that. It then import-tests the launcher under the shebang
+interpreter and runs `brook-steam --check`.
 `install.py --rollback` restores the newest backup set. Nothing goes into
 `/nix/store`. The application entry is unchanged.
 

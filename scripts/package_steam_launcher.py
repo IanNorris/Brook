@@ -44,6 +44,30 @@ def fsync_dir(path):
     try: os.fsync(fd)
     finally: os.close(fd)
 
+def copy_plain(source, target):
+    # No shutil.copy2: copystat copies xattrs, and Brook's ext2 returns ENOSYS
+    # for the xattr calls, which Python does not tolerate.
+    shutil.copyfile(source, target)
+    st = os.stat(source)
+    os.chmod(target, st.st_mode & 0o7777)
+    os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+def interpreter(script):
+    line = script.read_bytes().split(b'\n', 1)[0].decode()
+    path = line[2:].strip().split()[0] if line.startswith('#!') else ''
+    if os.access(path, os.X_OK):
+        return path
+    print('warning: shebang interpreter', repr(path), 'not found; testing with', sys.executable)
+    return sys.executable
+
+IMPORT_TEST = (
+    "import importlib.machinery, importlib.util, sys\n"
+    "loader = importlib.machinery.SourceFileLoader('brook_steam', sys.argv[1])\n"
+    "spec = importlib.util.spec_from_loader('brook_steam', loader)\n"
+    "module = importlib.util.module_from_spec(spec); loader.exec_module(module)\n"
+    "full = module.full_python() if module.ctypes is None else sys.executable\n"
+    "print('launcher import ok under', sys.executable, '| ctypes:', module.ctypes is not None, '| full python:', full)\n")
+
 def put(source, target):
     temporary = target.with_name(target.name + '.new')
     shutil.copyfile(source, temporary)
@@ -72,7 +96,7 @@ for name in NAMES:
     target = DEST / name
     if target.exists():
         backup = DEST / f'{name}.before-{stamp}'
-        shutil.copy2(target, backup); backups[name] = str(backup)
+        copy_plain(target, backup); backups[name] = str(backup)
     else:
         backups[name] = None
 (DEST / f'rollback-{stamp}.json').write_text(json.dumps(dict(backups=backups,
@@ -81,7 +105,10 @@ for name in NAMES:
     put(HERE / name, DEST / name)
 fsync_dir(DEST)
 print('installed', ', '.join(NAMES), 'into', DEST, '; backups:', backups)
-sys.exit(subprocess.call([sys.executable, str(DEST / 'brook-steam'), '--check']))
+python = interpreter(DEST / 'brook-steam')
+if subprocess.call([python, '-c', IMPORT_TEST, str(DEST / 'brook-steam')]):
+    sys.exit('launcher failed to import under ' + python + '; roll back with: install.py --rollback')
+sys.exit(subprocess.call([python, str(DEST / 'brook-steam'), '--check']))
 '''
 
 README = '''Brook Steam launcher bundle ({commit})

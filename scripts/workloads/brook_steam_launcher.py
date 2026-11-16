@@ -19,7 +19,6 @@ creates a GLX context on it and reports the renderer. Design notes:
 docs/desktop-game-launchers.md ("Rootless Steam on the Dell").
 """
 import argparse
-import ctypes
 import glob
 import json
 import os
@@ -32,8 +31,12 @@ import struct
 import subprocess
 import sys
 import time
+try:
+    import ctypes
+except ImportError:  # python3-minimal, the Dell's /nix/profile/bin/python3, lacks _ctypes
+    ctypes = None
 
-LAUNCHER_VERSION = 'rootless-1'
+LAUNCHER_VERSION = 'rootless-2'
 HOME = Path(os.environ.get('BROOK_STEAM_USER_HOME', '/data/home'))
 BROOK = HOME / '.local/share/brook'
 LOG = Path(os.environ.get('BROOK_STEAM_LOG', BROOK / 'steam-launcher.log'))
@@ -217,6 +220,32 @@ def wait_for_display(display, deadline_s, child=None):
 # ---------------------------------------------------------------------------
 # GLX probe, run in a child so libGL never enters the launcher process.
 # ---------------------------------------------------------------------------
+def full_python():
+    """A Python with ctypes, found at runtime: BROOK_STEAM_FULL_PYTHON (a path,
+    or 'none'), else an installed /nix/store python3 3.x (not -minimal) whose
+    lib-dynload has _ctypes and which imports it."""
+    override = os.environ.get('BROOK_STEAM_FULL_PYTHON')
+    if override == 'none':
+        return None
+    if override:
+        candidates = [override]
+    else:
+        same = f'python3-{sys.version_info.major}.{sys.version_info.minor}.'
+        found = [path for path in glob.glob('/nix/store/*-python3-3.*/bin/python3') if 'minimal' not in path]
+        candidates = sorted(found, key=lambda path: (same not in path, path.endswith('-env/bin/python3'), path))
+    for candidate in candidates:
+        if not os.access(candidate, os.X_OK):
+            continue
+        if not override and not glob.glob(str(Path(candidate).parent.parent / 'lib/python3.*/lib-dynload/_ctypes*')):
+            continue
+        try:
+            if subprocess.run([candidate, '-c', 'import ctypes'], capture_output=True, timeout=15).returncode == 0:
+                return candidate
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
 def loaded_libraries(pattern):
     """Shared objects in this process (Brook's /proc/self/maps omits files)."""
     class Info(ctypes.Structure):
@@ -229,6 +258,9 @@ def loaded_libraries(pattern):
 
 
 def glx_probe(display):
+    if ctypes is None:
+        print(json.dumps(dict(ok=False, error=f'{sys.executable} has no ctypes; set BROOK_STEAM_FULL_PYTHON')))
+        return 1
     signal.alarm(30)
     os.environ['DISPLAY'] = display
     os.environ.setdefault('__GLX_VENDOR_LIBRARY_NAME', 'mesa')
@@ -415,6 +447,8 @@ def signal_all(pids, sig):
 
 
 def set_child_subreaper():
+    if ctypes is None:
+        return False
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         return libc.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
@@ -586,8 +620,11 @@ def graphics_environment(env, gl, iris, gl_debug):
 
 
 def run_glx_probe(display, env, timeout=40):
+    python = sys.executable if ctypes is not None else full_python()
+    if python is None:
+        return dict(ok=False, error='GLX probe needs a Python with ctypes; none found (set BROOK_STEAM_FULL_PYTHON)')
     try:
-        result = subprocess.run([sys.executable, os.path.abspath(__file__), '--_glx-probe', display],
+        result = subprocess.run([python, os.path.abspath(__file__), '--_glx-probe', display],
                                 env=env, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return dict(ok=False, error=f'GLX probe timed out after {timeout} s')
@@ -655,6 +692,28 @@ class Steam:
         self.stop_requested = None
         self.display = None
         self.report = {}
+        self.subreaper = False
+        self.seen = {}  # pid -> cmdline, for descendants that leave our tree without a subreaper
+
+    def client_processes(self, include_services=False):
+        """Live descendants. Without a child subreaper an orphaned descendant is
+        reparented to init, so also keep every process seen before whose
+        command line is unchanged (a PID-reuse guard)."""
+        found = descendants(os.getpid(), () if include_services else self.owned_services())
+        if self.subreaper:
+            return found
+        for pid in found:
+            self.seen.setdefault(pid, cmdline(pid))
+        services = set() if include_services else self.owned_services()
+        for pid, argv in list(self.seen.items()):
+            if pid in found or pid in services:
+                continue
+            state = (read_status(pid) or {}).get('State', 'Z')[:1]
+            if state == 'Z' or cmdline(pid) != argv:
+                del self.seen[pid]
+            else:
+                found[pid] = state
+        return found
 
     def prerequisites(self):
         needed = [self.bwrap, self.loader, self.client / 'steamrt64/steam']
@@ -744,7 +803,7 @@ class Steam:
         return wait_for_display(':14', 12, self.server)
 
     def steam_main_processes(self):
-        pids = descendants(os.getpid(), self.owned_services())
+        pids = self.client_processes()
         found = [pid for pid in pids if cmdline(pid)[:1] and cmdline(pid)[0].endswith(b'/steamrt64/steam')]
         return found or [pid for pid in pids if (read_status(pid) or {}).get('Name') == 'steam']
 
@@ -757,7 +816,7 @@ class Steam:
 
     def game_running(self):
         return any(any(part == b'SteamLaunch' for part in cmdline(pid))
-                   for pid in descendants(os.getpid(), self.owned_services()))
+                   for pid in self.client_processes())
 
     def tracked(self):
         return {p.pid for p in (self.main, self.server, self.pulse.process if self.pulse else None) if p}
@@ -778,6 +837,8 @@ class Steam:
             if now >= next_check:
                 next_check = now + 2
                 reap_orphans(self.tracked())
+                if not self.subreaper:
+                    self.client_processes()  # remember descendants while they are still in our tree
                 try:
                     if connection is None:
                         connection = XConnection(self.display)
@@ -828,7 +889,7 @@ class Steam:
             if not steam:
                 signal_all([self.main.pid], signal.SIGTERM)
             self.wait_main(15)
-        remaining = descendants(os.getpid(), self.owned_services())
+        remaining = self.client_processes()
         if remaining:
             log('terminating leftover client processes', count=len(remaining))
             signal_all(remaining, signal.SIGTERM)
@@ -836,7 +897,7 @@ class Steam:
             while remaining and time.monotonic() < deadline:
                 reap_orphans(self.tracked())
                 time.sleep(0.2)
-                remaining = {p: s for p, s in descendants(os.getpid(), self.owned_services()).items() if s != 'Z'}
+                remaining = {p: s for p, s in self.client_processes().items() if s != 'Z'}
         if remaining:
             log('killing leftover client processes', pids=sorted(remaining))
             signal_all(remaining, signal.SIGKILL)
@@ -856,7 +917,7 @@ class Steam:
             self.pulse.stop()
         # Anything still left (for example a server whose keeper was killed
         # and that we adopted as subreaper) goes now.
-        remaining = descendants(os.getpid())
+        remaining = self.client_processes(include_services=True)
         if remaining:
             signal_all(remaining, signal.SIGKILL)
             time.sleep(0.2)
@@ -866,11 +927,13 @@ class Steam:
         args = self.args
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, lambda number, _: setattr(self, 'stop_requested', signal.Signals(number).name))
-        subreaper = set_child_subreaper()
+        subreaper = self.subreaper = set_child_subreaper()
         self.display = self.target_display()
         log('start', version=LAUNCHER_VERSION, mode='xephyr' if args.xephyr else 'rootless',
             display=self.display, gl='software' if args.xephyr else args.gl, iris=args.iris,
-            subreaper=subreaper, pid=os.getpid())
+            subreaper=subreaper, pid=os.getpid(), python=sys.executable)
+        if not subreaper:
+            log('no child subreaper: descendants whose parent exits are tracked by PID and command line')
         reason, code = 'setup failed', 1
         try:
             if not (args.no_pulse or args.pulse_server):
@@ -909,7 +972,7 @@ class Steam:
                 code = self.main.returncode
             elif not reason.startswith(('error', 'setup', 'Xephyr')):
                 code = 0
-            leftovers = descendants(os.getpid())
+            leftovers = self.client_processes(include_services=True)
             write_state(pid=os.getpid(), version=LAUNCHER_VERSION, state='stopped', reason=reason,
                         exit=code, cleanup_s=round(time.monotonic() - started, 1), leftovers=sorted(leftovers))
             log('stopped', reason=reason, exit=code, cleanup_s=round(time.monotonic() - started, 1),
@@ -924,6 +987,12 @@ def main(argv=None):
         return keeper(args._keeper, args.command)
     if args._glx_probe:
         return glx_probe(args._glx_probe)
+    if ctypes is None and not os.environ.get('BROOK_STEAM_REEXEC'):
+        # Re-run under a full Python so the launcher can be a child subreaper.
+        python = full_python()
+        if python:
+            argv = sys.argv[1:] if argv is None else argv
+            os.execve(python, [python, os.path.abspath(__file__), *argv], dict(os.environ, BROOK_STEAM_REEXEC='1'))
     if os.geteuid() == 0:
         raise RuntimeError('run Steam as the desktop user, not root')
     steam = Steam(args)
