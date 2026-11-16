@@ -92,6 +92,16 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov late (paused at the usage limit). Dell on gen 421 `dell-int19-20261116` (Alt+Tab pointer change), session `feb450f6f3a648f0b935b97d0f6535ef`; Q2 running for Ian's test:**
+- **Ready, not yet deployed:** `integration20/build/dell/pair-int20` = gen 421 + `work/occlusion` (`811879bf`), QEMU check PASS.
+  - Fixes: scaled games are offered as a direct opaque layer (waylandd), and carried damage no longer grows (`DESKTOP_PIPELINE_WAIT_CARRY`).
+  - Measure: matched demo alone vs with an idle Qalc behind, against gen 419 (steps in the occlusion agent's report and `docs/waylandd-composition.md`). This may also explain the 70→55 in-game drop, since c76814b7 stopped direct offers for scaled games.
+- **Merge pending:** merge `work/integration19` to main once Ian confirms Alt+Tab, and `integration20` after measuring.
+- **Stopped mid-way at the usage limit; resume from their worktrees:**
+  - `work/restart-harden` (was about to build its Dell pair);
+  - `work/steam-rootless` (had just started inspecting the guest).
+- **`work/brook-value` (`9a342754`):** Fable's "What is Brook for?" critique, sent to Ian, not merged.
+
 **16 Nov evening (Dell gen 420, `dell-int18-20261116`, session `6601d8cda6cd41d3b5e73b4900b22b45`):**
 - **Pointer re-grab after Super is fixed, and Ian confirmed it on the Dell** (`work/pointer-relock` `aa42f690`, merged).
   - Revokes disengage the window. Only a click in the window's own content re-engages it, and acquire also requires the pointer to hover that content. The volume popup blocks a lock as the launcher does.
