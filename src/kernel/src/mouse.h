@@ -54,19 +54,44 @@ extern "C" void MouseSetAvailable(bool available);
 namespace brook {
 // Synaptics touchpad (absolute PS/2 mode, two-finger scroll). Boot default:
 // enabled when the pad identifies as Synaptics; otherwise relative PS/2.
+constexpr int MouseTouchpadRawReplies = 7;
 struct MouseTouchpadStatus {
     bool wanted, active, identified, clickpad, natural, agm, tap;
     uint32_t speed;
     uint32_t tapLeft, tapRight, tapDrags, tapDoubles;
     uint32_t tapRejectedPhysical, tapRejectedPalm, tapRejectedPhantom;
     uint32_t scrollLowZ, scrollRejected, gestureResets;
+    // Clickpad press decisions (synaptics_touchpad.h ChooseClick).
+    uint32_t clicksLeft, clicksRight, clicksRightArea, clicksTwoFinger, clicksThumbLeft;
+    uint32_t clicksStalePos, clicksNoPos;
+    int32_t xMin, xMax, yMin, yMax;     // coordinate range (nominal unless reported)
+    bool rangeReportedMax, rangeReportedMin, softButtons, traceOn;
+    int32_t buttonTopY, buttonSplitX;   // button strip: y below top; right at x >= split
+    uint32_t traceTotal;
     const char* reason;
     uint8_t major, minor, model, mode, modeReadback, packetLen, relativeId;
     uint32_t caps, ext, ext0c, packets, resyncs, scrollTicks;
     uint32_t fingers[4];
-    uint8_t rawValid;      // bit i: raw[i] read (identify, caps, ext 0x09, ext 0x0c, modes)
-    uint8_t raw[5][3];
+    uint8_t rawValid;      // bit i: raw[i] read (identify, caps, ext 0x09, ext 0x0c, modes, max 0x0d, min 0x0f)
+    uint8_t raw[MouseTouchpadRawReplies][3];
 };
+// Raw packet trace for the debug bridge. Start clears the ring and records
+// every 6-byte packet with its time and the physical buttons the gesture code
+// reported; Stop ends recording and returns the ring, oldest first from
+// entries[first] (wrapping), valid until the next Start.
+struct MouseTouchpadTraceEntry {
+    uint32_t ms;           // since Start
+    uint8_t bytes[6];
+    uint8_t buttons;       // gesture physical buttons after this packet (bit0 left, bit1 right)
+    uint8_t reserved;
+};
+constexpr uint32_t MouseTouchpadTraceCapacity = 2048;   // ~13 s at 160 packets/s (two fingers with AGM)
+struct MouseTouchpadTraceView {
+    const MouseTouchpadTraceEntry* entries;
+    uint32_t capacity, first, count, total;
+};
+void MouseTouchpadTraceStart();
+MouseTouchpadTraceView MouseTouchpadTraceStop();
 bool MouseTouchpadSet(bool synaptics);
 bool MouseTouchpadProbe();
 bool MouseTouchpadSetSpeed(uint32_t percent);

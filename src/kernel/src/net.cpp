@@ -91,6 +91,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "vfs.h"
 #include "input.h"
 #include "mouse.h"
+#include "synaptics_touchpad.h"
 #include "shell.h"
 #include "compositor.h"
 #include "wm_chrome_key.h"
@@ -5217,7 +5218,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  gpu submission timing watch INC|off|status - diagnostic kernel submission wall times\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu wakeups on|off|status - M4a prompt GPU wakeups (default off; off = 1 ms polling)\n"
-            "  input touchpad synaptics on|off|status | natural on|off | tap on|off | speed N | probe - Synaptics two-finger scroll touchpad (probe: raw query replies)\n"
+            "  input touchpad synaptics on|off|status | natural on|off | tap on|off | speed N | probe | trace on|off|dump - Synaptics two-finger scroll touchpad (probe: raw query replies; trace: raw packet ring, dump stops it)\n"
             "  gpu video on|off|status|probe|reset|selftest - VCS0 video engine bring-up (VA-API phase 1; build option, default off)\n"
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
@@ -6171,11 +6172,40 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if(NetStrEq(cmd,"input touchpad tap on"))MouseTouchpadSetTap(true);
         else if(NetStrEq(cmd,"input touchpad tap off"))MouseTouchpadSetTap(false);
         else if(NetStrEq(cmd,"input touchpad probe"))MouseTouchpadProbe();
+        else if(NetStrEq(cmd,"input touchpad trace on"))MouseTouchpadTraceStart();
+        else if(NetStrEq(cmd,"input touchpad trace off"))(void)MouseTouchpadTraceStop();
+        else if(NetStrEq(cmd,"input touchpad trace dump")){
+            // Oldest first: [ms, "6 raw bytes hex", x, y, z, w, click, buttons]
+            // where click is the decoded clickpad bit and buttons what the
+            // gesture code reported (bit0 left, bit1 right). Dumping stops
+            // the trace; "trace on" clears and restarts it.
+            const auto v=MouseTouchpadTraceStop();
+            const bool clickpad=MouseTouchpadGetStatus().clickpad;
+            BridgeReply r;
+            r.text("{");r.field("total",v.total);r.text(",");r.field("count",v.count);
+            r.text(",");r.field("dropped",v.total-v.count);
+            r.text(",\"clickpad\":");r.text(clickpad?"true":"false");
+            r.text(",\"format\":\"ms,bytes,x,y,z,w,click,buttons\",\"packets\":[");
+            static const char hex[]="0123456789abcdef";
+            for(uint32_t i=0;i<v.count;++i){
+                const auto& e=v.entries[(v.first+i)%v.capacity];
+                const auto p=SynapticsDecodePacket(e.bytes,clickpad);
+                if(i)r.text(",");
+                r.text("[");r.number(e.ms);r.text(",\"");
+                for(int j=0;j<6;++j){r.append(hex[e.bytes[j]>>4]);r.append(hex[e.bytes[j]&15]);}
+                r.text("\",");
+                if(p.w==2&&p.agm){r.number(uint32_t(p.agmX));r.text(",");r.number(uint32_t(p.agmY));r.text(",");r.number(uint32_t(p.agmZ));}
+                else{r.number(uint32_t(p.x));r.text(",");r.number(uint32_t(p.y));r.text(",");r.number(uint32_t(p.z));}
+                r.text(",");r.number(uint32_t(p.w));r.text(",");r.number(p.left?1:0);r.text(",");r.number(e.buttons);r.text("]");
+            }
+            r.text("],\"scope\":\"most recent packets while tracing (ring of 2048); W=2 rows show the AGM second finger; y is up from the pad bottom\"}\n");
+            r.send();
+            return;}
         else if(StrStartsWith(cmd,"input touchpad speed ")){
             const char* v=cmd+21;uint32_t n=0,d=0;while(*v>='0'&&*v<='9'&&d<4){n=n*10+uint32_t(*v++-'0');++d;}
             if(!d||*v||!MouseTouchpadSetSpeed(n)){DebugChannelSend("{\"error\":\"usage: input touchpad speed <25-300>\"}\n");return;}}
         else if(!NetStrEq(cmd,"input touchpad status") && !NetStrEq(cmd,"input touchpad synaptics status")){
-            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | tap on|off | speed <25-300> | probe\"}\n");return;}
+            DebugChannelSend("{\"error\":\"usage: input touchpad synaptics on|off|status | natural on|off | tap on|off | speed <25-300> | probe | trace on|off|dump\"}\n");return;}
         const auto st=MouseTouchpadGetStatus();
         BridgeReply r;
         r.text("{\"wanted\":");r.text(st.wanted?"true":"false");
@@ -6201,13 +6231,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("scroll_ticks_low_z",st.scrollLowZ);
         r.text(",");r.field("scroll_rejected",st.scrollRejected);
         r.text(",");r.field("gesture_resets",st.gestureResets);
-        {static const char* const names[5]={"identify","caps","ext09","ext0c","modes"};
+        r.text(",\"clicks\":{");r.field("left",st.clicksLeft);r.text(",");r.field("right",st.clicksRight);
+        r.text(",");r.field("right_area",st.clicksRightArea);r.text(",");r.field("two_finger",st.clicksTwoFinger);
+        r.text(",");r.field("thumb_left",st.clicksThumbLeft);r.text(",");r.field("stale_position",st.clicksStalePos);
+        r.text(",");r.field("no_position",st.clicksNoPos);r.text("}");
+        r.text(",\"range\":{");r.field("x_min",uint32_t(st.xMin));r.text(",");r.field("x_max",uint32_t(st.xMax));
+        r.text(",");r.field("y_min",uint32_t(st.yMin));r.text(",");r.field("y_max",uint32_t(st.yMax));
+        r.text(",\"reported_max\":");r.text(st.rangeReportedMax?"true":"false");
+        r.text(",\"reported_min\":");r.text(st.rangeReportedMin?"true":"false");r.text("}");
+        r.text(",\"soft_buttons\":{\"enabled\":");r.text(st.softButtons?"true":"false");
+        r.text(",");r.field("top_y",uint32_t(st.buttonTopY));r.text(",");r.field("split_x",uint32_t(st.buttonSplitX));r.text("}");
+        r.text(",\"trace\":{\"on\":");r.text(st.traceOn?"true":"false");r.text(",");r.field("total",st.traceTotal);r.text("}");
+        {static const char* const names[MouseTouchpadRawReplies]={"identify","caps","ext09","ext0c","modes","max_coords","min_coords"};
          r.text(",\"raw\":{");bool first=true;
-         for(int i=0;i<5;++i){if(!(st.rawValid&(1u<<i)))continue;if(!first)r.text(",");first=false;
+         for(int i=0;i<MouseTouchpadRawReplies;++i){if(!(st.rawValid&(1u<<i)))continue;if(!first)r.text(",");first=false;
           r.text("\"");r.text(names[i]);r.text("\":[");
           for(int j=0;j<3;++j){if(j)r.text(",");r.number(st.raw[i][j]);}r.text("]");}
          r.text("}");}
-        r.text(",\"scope\":\"fingers = packets seen with 0,1,2,3+ fingers; resyncs = bytes failing Synaptics packet sync; off renegotiates relative IntelliMouse PS/2; tap on|off is live only (Settings persists [Desktop] touchpad_tap)\"}\n");
+        r.text(",\"scope\":\"fingers = packets seen with 0,1,2,3+ fingers; resyncs = bytes failing Synaptics packet sync; clicks = clickpad press decisions (right_area: a contact in the bottom-right strip; two_finger: two contacts above the strip; thumb_left: two contacts, one in the strip, none right); range is nominal unless reported; off renegotiates relative IntelliMouse PS/2; tap on|off is live only (Settings persists [Desktop] touchpad_tap)\"}\n");
         r.send();
     }
     else if(NetStrEq(cmd,"gpu wakeups on") || NetStrEq(cmd,"gpu wakeups off") || NetStrEq(cmd,"gpu wakeups status")) {
