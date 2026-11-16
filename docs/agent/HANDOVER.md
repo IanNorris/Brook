@@ -92,6 +92,15 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**16 Nov evening (Dell gen 420, `dell-int18-20261116`, session `6601d8cda6cd41d3b5e73b4900b22b45`):**
+- **Pointer re-grab after Super is fixed, and Ian confirmed it on the Dell** (`work/pointer-relock` `aa42f690`, merged).
+  - Revokes disengage the window. Only a click in the window's own content re-engages it, and acquire also requires the pointer to hover that content. The volume popup blocks a lock as the launcher does.
+  - Root causes: the WM bumped the "physical click" serial for clicks anywhere (taskbar, launcher), and waylandd's entered-surface state went stale over the taskbar.
+  - Ian's follow-up, in progress on the same branch: Alt+Tab back (a deliberate activation) re-engages without a click, as on Windows.
+- **Gen 419 Steam and Stardew:** the GPU queue fix held (17,158 waits, 0 refused, Xwayland stayed up). Frame times were poor: the Xephyr detour runs Stardew on llvmpipe, then Xwayland glamor turns the image pushes into ~286 tiny GPU jobs/s (GPU 73% busy) and composites starve to ~18/s. `work/steam-rootless` moves Steam onto the desktop Xwayland with Iris GL.
+- **A background window costs the game about a quarter of its frame rate:** an idle Qalc behind Q2 took composite from 9.1 to 15.9 ms and the game from 53 to 39 frames/s. `work/occlusion` is investigating; it also covers fullscreen direct scanout.
+- **In flight:** `work/restart-harden` (TERM/KILL escalation for windowless processes, blocker names in status; bridge per-connection logging moved to a debug category) and `work/brook-value` (Fable's critique of brook-directions.md: Brook's value, Linux's unfixable DNA, and the do-over list).
+
 **16 Nov afternoon (Dell gen 419, `dell-int17-20261116` = main + `work/prof-path` + `work/gpu-queue-wait`, session `26fb3e21dbc4414f8b3cde5e5022f349`):**
 - **Quake II audio works (Ian confirmed). Launch recipe:**
   - `brook-run <brook-iris-run> <yquake2 quake2> -datadir /data/home/quake2 +set s_openal 1 +set al_driver libopenal.so.1`
