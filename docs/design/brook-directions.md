@@ -1,5 +1,8 @@
 # Brook beyond compatibility
 
+See also: [What is Brook for?](brook-value.md), a critique of this document
+with a proposed thesis and next steps (16 November 2026).
+
 Status: future design exploration, requested 18 October 2026. This does not
 replace the current reliability, application and performance work. The proposals
 below are hypotheses and research questions, not implemented guarantees or a
