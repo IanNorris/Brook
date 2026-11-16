@@ -76,6 +76,47 @@ static int desktop_scene(void){
     return 0;
 }
 
+/* An idle window larger than the game, partly behind it: its content is
+ * translucent (a client-side shadow, never opaque) with its chrome above
+ * it, and the game is an opaque direct source sampled 2x (a 640x480 game
+ * at 200%). The damage is the game's client rectangle each frame: nothing
+ * of the hidden window (or the wallpaper) may be sampled there, so the
+ * frame costs exactly the game's pixels. A damage that also covers the
+ * idle window's exposed part draws it only outside the game. */
+static int game_over_idle(void){
+    enum {W=400,H=240};
+    uint32_t scene[BROOK_VK_SCENE_HEADER+4*BROOK_VK_LAYER_WORDS]={W,H,4,0};
+    /* 0 wallpaper, 1 idle client (200x150 at 20,30, translucent), 2 its
+     * chrome (204x162 at 18,20, interior hole), 3 game (80x60 drawn
+     * 160x120 at 120,60, clipped to its client rectangle). */
+    set_layer(scene,0,&(struct BrookVkSceneLayer){0,W,W,H,0,0,W,H,0,0,W,H,0,0,W,H,255});
+    set_layer(scene,1,&(struct BrookVkSceneLayer){0,200,200,150,0,0,200,150,20,30,200,150,0,0,W,H,255|BROOK_VK_STRAIGHT_ALPHA});
+    set_layer(scene,2,&(struct BrookVkSceneLayer){0,204,204,162,0,0,204,162,18,20,204,162,0,0,W,H,255|BROOK_VK_STRAIGHT_ALPHA});
+    set_layer(scene,3,&(struct BrookVkSceneLayer){0,80,80,60,0,0,80,60,120,60,160,120,120,60,160,120,255|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE});
+    struct QuadRect holes[4]={{0}};holes[2]=(struct QuadRect){20,30,220,180};
+    const struct QuadRect game={120,60,280,180};
+    static struct QuadPlan plan;
+    struct DesktopDamageSet frame={1,{{120,60,280,180}}};
+    CHECK(quad_plan_build(scene,sizeof(scene)/4,holes,&frame,1,&plan));
+    CHECK(!plan.used[0] && !plan.used[1] && !plan.used[2] && plan.used[3] && plan.layersDrawn==1);
+    CHECK(!layer_draws_intersect(&plan,1,game) && !layer_draws_intersect(&plan,2,game));
+    CHECK(plan.drawCount==1 && plan.draws[0].kind==QUAD_KIND_REPLACE && plan.pixelsShaded==160*120 && !plan.clearCount);
+    /* The same frame at opacity 254 blends: everything beneath is drawn. */
+    scene[BROOK_VK_SCENE_HEADER+3*BROOK_VK_LAYER_WORDS+16]=254|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE;
+    CHECK(quad_plan_build(scene,sizeof(scene)/4,holes,&frame,1,&plan));
+    CHECK(plan.used[0] && plan.used[1] && plan.used[2] && plan.used[3]);
+    scene[BROOK_VK_SCENE_HEADER+3*BROOK_VK_LAYER_WORDS+16]=255|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE;
+    /* Damage over both windows: the idle window is drawn only where it is
+     * exposed, never inside the game. */
+    struct DesktopDamageSet both={1,{{18,20,280,182}}};
+    CHECK(quad_plan_build(scene,sizeof(scene)/4,holes,&both,1,&plan));
+    CHECK(plan.used[0] && plan.used[1] && plan.used[2] && plan.used[3]);
+    CHECK(!layer_draws_intersect(&plan,0,game) && !layer_draws_intersect(&plan,1,game) && !layer_draws_intersect(&plan,2,game));
+    uint64_t idle=0;for(uint32_t i=0;i<plan.drawCount;++i)if(plan.draws[i].layer==1)idle+=quad_rect_area(plan.draws[i].rect);
+    CHECK(idle==200*150-(220-120)*(180-60));
+    return 0;
+}
+
 /* Random scenes against the composite.comp oracle. Output pixels outside
  * the damage must be untouched; inside it every pixel must be exact. */
 enum {RW=72,RH=48,MAXL=8};
@@ -141,6 +182,7 @@ static int random_scene(unsigned iteration){
 
 int main(void){
     if(desktop_scene())return 1;
+    if(game_over_idle())return 1;
     for(unsigned i=0;i<4000;++i)if(random_scene(i))return 1;
     printf("QUAD_PLAN_PASS iterations=4000\n");
     return 0;

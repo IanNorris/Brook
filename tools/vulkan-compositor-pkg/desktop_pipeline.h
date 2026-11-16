@@ -18,6 +18,17 @@
  *    a full frame would only produce a second full-screen frame.
  *  - Frames retire strictly in ticket order, so the older frame is never
  *    discarded as stale behind its successor.
+ *  - Carried regions are transitive: when A is accepted after B was
+ *    reserved, the kernel requires B to present A's regions, which already
+ *    hold what A carried, and so on. While every frame overlaps its
+ *    predecessor (a game committing faster than the desktop composes), a
+ *    single large change (a window opening or restacking, a focus change)
+ *    would stay in every later frame's draw and present indefinitely; with
+ *    bounding-box merging it becomes the union of the windows it touched.
+ *    So a successor waits for an in-flight frame whose regions exceed its
+ *    own (aligned) damage by more than the carry slack, and then starts
+ *    from the displayed frame with its own damage only
+ *    (DESKTOP_PIPELINE_WAIT_CARRY): one serial frame ends the chain.
  *
  * Default: pipelined whenever the buffered partial renderer runs
  * (--async-partial) and the kernel offers dependent reservations
@@ -34,6 +45,7 @@
 #include "desktop_damage.h"
 #include "gpu_output_abi.h"
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum { DESKTOP_PIPELINE_SERIAL=1, DESKTOP_PIPELINE_MAX=2 };
@@ -53,13 +65,33 @@ enum DesktopPipelineAdmit {
     DESKTOP_PIPELINE_WAIT_FULL,    /* the in-flight frame is full-screen (or has no regions) */
     DESKTOP_PIPELINE_WAIT_BASELINE,/* no accepted ticket yet, or the in-flight frame's state is unknown */
     DESKTOP_PIPELINE_WAIT_DEPTH,   /* both slots in flight */
+    DESKTOP_PIPELINE_WAIT_CARRY,   /* the in-flight frame carries much more than its own damage */
 };
 struct DesktopPipelineInFlight {
     long ticket;              /* 0: slot free */
     int partial;              /* presents regions (not a full frame) */
     uint32_t regions;         /* region count */
     int trackValid;           /* its change-tracking state is usable as a baseline */
+    int carryExcess;          /* desktop_pipeline_carry_excess() of the frame */
 };
+/* Pixels a frame may present beyond its own damage before its successor
+ * stops overlapping it: BROOK_RENDER_CARRY_SLACK ("off" never waits, or a
+ * pixel count), by default 1/64 of the output (90,000 at 3200x1800, about
+ * a cursor trail or a small popup) and at least 4096. */
+static inline uint64_t desktop_pipeline_carry_slack(const char *value,uint32_t width,uint32_t height){
+    if(value && *value){
+        if(!strcmp(value,"off"))return UINT64_MAX;
+        char *end=NULL;const unsigned long long n=strtoull(value,&end,10);
+        if(end && !*end && value[0]!='-')return (uint64_t)n;
+    }
+    const uint64_t slack=(uint64_t)width*height/64;
+    return slack<4096?4096:slack;
+}
+/* A frame presenting presentPixels whose own (aligned) damage is ownPixels:
+ * the difference is carried from older frames. */
+static inline int desktop_pipeline_carry_excess(uint64_t ownPixels,uint64_t presentPixels,uint64_t slack){
+    return presentPixels>ownPixels && presentPixels-ownPixels>slack;
+}
 static inline enum DesktopPipelineAdmit desktop_pipeline_admit(unsigned depth,const struct DesktopPipelineInFlight *frames,unsigned count,
                                                                uint64_t lastAccepted){
     unsigned active=0;const struct DesktopPipelineInFlight *inflight=0;
@@ -68,6 +100,7 @@ static inline enum DesktopPipelineAdmit desktop_pipeline_admit(unsigned depth,co
     if(depth<DESKTOP_PIPELINE_MAX || active>=DESKTOP_PIPELINE_MAX)return DESKTOP_PIPELINE_WAIT_DEPTH;
     if(!inflight->partial || !inflight->regions || inflight->regions>BROOK_GPU_PRESENT_MAX_REGIONS)return DESKTOP_PIPELINE_WAIT_FULL;
     if(!lastAccepted || !inflight->trackValid)return DESKTOP_PIPELINE_WAIT_BASELINE;
+    if(inflight->carryExcess)return DESKTOP_PIPELINE_WAIT_CARRY;
     return DESKTOP_PIPELINE_OVERLAP;
 }
 
