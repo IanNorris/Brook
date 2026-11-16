@@ -22,6 +22,9 @@ enum {
     BXWM_MAXIMIZED=1u<<4, BXWM_MINIMIZED=1u<<5,
     /* Native state, authoritative in CONFIGURE; echoed by WINDOW messages. */
     BXWM_FULLSCREEN=1u<<6,
+    /* Present this X window scaled by the output scale ("scaled by the
+     * system"): its X geometry is in 1x units. Decided once per window. */
+    BXWM_SCALED=1u<<7,
     BXWM_QUEUE=64
 };
 struct bxwm_message {
@@ -82,7 +85,7 @@ static int bxwm_valid(const struct bxwm_message *message,uint64_t generation,int
     if (from_helper && message->type==BXWM_DESTROY) return 1;
     if (from_helper && message->type==BXWM_WINDOW)
         return message->width && message->height && message->width<=65535 && message->height<=65535 &&
-            !(message->flags&~(BXWM_MAPPED|BXWM_OVERRIDE|BXWM_INPUT|BXWM_CLIENT_CHROME|BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN)) &&
+            !(message->flags&~(BXWM_MAPPED|BXWM_OVERRIDE|BXWM_INPUT|BXWM_CLIENT_CHROME|BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN|BXWM_SCALED)) &&
             message->title[sizeof(message->title)-1]==0;
     if (!from_helper && message->type==BXWM_CONFIGURE)
         return message->width && message->height && message->width<=65535 && message->height<=65535 &&

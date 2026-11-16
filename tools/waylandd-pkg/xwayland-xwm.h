@@ -47,6 +47,36 @@ static struct brook_xwindow *xwayland_window(uint32_t xid,uint64_t identity) {
         if (w->state.window==xid && (!identity || w->state.identity==identity)) return w;
     return NULL;
 }
+/* "Scaled by the system" (BXWM_SCALED, per X client from
+ * BROOK_XWAYLAND_SCALED_APPS): the X window keeps 1x geometry and waylandd
+ * presents its buffer at the output scale. A scaled window's X origin is its
+ * native client origin, so moving and pointer input need no translation, and
+ * its sizes are native/scale. Its override-redirect popups are positioned by
+ * the application in those 1x units relative to their parent, so they map
+ * through that anchor: native = parent_native + (x - parent_x) * scale. */
+static uint32_t xw_scale(const struct brook_xwindow *w) {
+    return w && (w->state.flags&BXWM_SCALED) && g_output_scale>1?g_output_scale:1;
+}
+static uint32_t xwayland_surface_scale(const struct brook_surface *s) { return xw_scale(s->xwindow); }
+static int32_t xw_clamp(int64_t v) { return v<-32768?-32768:v>32767?32767:(int32_t)v; }
+static int64_t xw_floor_div(int64_t a,int64_t b) { return a>=0?a/b:-((-a+b-1)/b); }
+static const struct brook_xwindow *xw_anchor(const struct brook_xwindow *w) {
+    if (xw_scale(w)==1 || !(w->state.flags&BXWM_OVERRIDE) || !w->state.parent_identity) return NULL;
+    const struct brook_xwindow *a=xwayland_window(w->state.parent,w->state.parent_identity);
+    return a && a!=w && a->native_valid?a:NULL;
+}
+static void xw_to_native(const struct brook_xwindow *w,int32_t x,int32_t y,int32_t *nx,int32_t *ny) {
+    const struct brook_xwindow *a=xw_anchor(w);int64_t scale=xw_scale(w);
+    if (!a) { *nx=x;*ny=y;return; }
+    *nx=xw_clamp(a->native.client_x+((int64_t)x-a->state.x)*scale);
+    *ny=xw_clamp(a->native.client_y+((int64_t)y-a->state.y)*scale);
+}
+static void xw_to_x(const struct brook_xwindow *w,int32_t nx,int32_t ny,int32_t *x,int32_t *y) {
+    const struct brook_xwindow *a=xw_anchor(w);int64_t scale=xw_scale(w);
+    if (!a) { *x=nx;*y=ny;return; }
+    *x=xw_clamp(a->state.x+xw_floor_div((int64_t)nx-a->native.client_x,scale));
+    *y=xw_clamp(a->state.y+xw_floor_div((int64_t)ny-a->native.client_y,scale));
+}
 static int xwayland_surface_ready(const struct brook_surface *s) {
     return s->role==4 && s->xwindow && s->xwindow->surface==s &&
         s->xwayland_generation==g_xwayland_generation && !g_xwm_failed &&
@@ -108,8 +138,10 @@ static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindow
         message.flags&=~BXWM_FULLSCREEN;
         if (w->fullscreen) message.flags|=BXWM_FULLSCREEN;
         w->sent_fullscreen=w->fullscreen;
-        message.x=geometry->client_x;message.y=geometry->client_y;
-        message.width=geometry->width;message.height=geometry->height;
+        const uint32_t scale=xw_scale(w);
+        xw_to_x(w,geometry->client_x,geometry->client_y,&message.x,&message.y);
+        message.width=geometry->width/scale?geometry->width/scale:1;
+        message.height=geometry->height/scale?geometry->height/scale:1;
         if (w->native_sequence==UINT64_MAX) { g_xwm_failed=1;return 0; }
         message.configure_serial=++w->native_sequence;
     }
@@ -130,6 +162,17 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
         geometry.version!=BROOK_WINDOW_STATE_VERSION || !geometry.incarnation) {
         g_xwm_failed=1;return;
     }
+    const uint32_t scale=xw_scale(w);
+    if (scale>1 && (geometry.width%scale || geometry.height%scale)) {
+        // A native resize of a scaled window lands on whole 1x X pixels.
+        uint32_t width=geometry.width/scale*scale,height=geometry.height/scale*scale;
+        struct brook_wm_create_out out={0};
+        if (!width) width=scale;
+        if (!height) height=scale;
+        if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) { g_xwm_failed=1;return; }
+        s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
+        s->vfb_w=geometry.width=width;s->vfb_h=geometry.height=height;
+    }
     if (initial && !w->initial_placement) {
         w->initial_placement=1;
         // Let unspecified normal (0,0) placement use native cascading. Menus
@@ -138,8 +181,8 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
             int32_t x=w->state.x,y=w->state.y;
             struct brook_xwindow *parent=xwayland_window(w->state.parent,w->state.parent_identity);
             if (w->state.parent_identity && parent && parent!=w && parent->native_valid) {
-                x=parent->native.client_x+(w->state.x-parent->state.x);
-                y=parent->native.client_y+(w->state.y-parent->state.y);
+                x=xw_clamp(parent->native.client_x+((int64_t)w->state.x-parent->state.x)*scale);
+                y=xw_clamp(parent->native.client_y+((int64_t)w->state.y-parent->state.y)*scale);
             }
             if (!(w->state.flags&BXWM_OVERRIDE)) {
                 if (x<40) x=40;
@@ -217,26 +260,31 @@ static int xwayland_accept_view(struct brook_surface *s,uint32_t width,uint32_t 
     struct brook_xwindow *w=s->xwindow;
     if (w && !w->native_valid && (width!=w->state.width || height!=w->state.height)) return 0;
     if (!w || !w->target_width) return 1;
-    if (width!=w->target_width || height!=w->target_height) return 0;
+    const uint64_t scale=xw_scale(w);
+    if (width*scale!=w->target_width || height*scale!=w->target_height) return 0;
     w->target_width=w->target_height=0;return 1;
 }
 static void xwayland_apply_client_geometry(struct brook_xwindow *w,const struct bxwm_message *message) {
     struct brook_surface *s=w->surface;
     if (!s || !s->wm_id || !w->native_valid || message->configure_serial!=w->native_sequence) return;
-    if (message->x!=w->native.client_x || message->y!=w->native.client_y) {
+    int32_t x,y;xw_to_native(w,message->x,message->y,&x,&y);
+    if (x!=w->native.client_x || y!=w->native.client_y) {
         if (syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)s->wm_id,(long)w->native.incarnation,
-            (long)message->x,(long)message->y,0L,0L)<0) { g_xwm_failed=1;return; }
-        w->native.client_x=message->x;w->native.client_y=message->y;
+            (long)x,(long)y,0L,0L)<0) { g_xwm_failed=1;return; }
+        w->native.client_x=x;w->native.client_y=y;
     }
-    if (message->width!=w->native.width || message->height!=w->native.height) {
+    const uint64_t scale=xw_scale(w);
+    const uint64_t width=message->width*scale,height=message->height*scale;
+    if (width>65535 || height>65535) return;
+    if (width!=w->native.width || height!=w->native.height) {
         struct brook_wm_create_out out={0};
-        if (wm_resize_vfb(s->wm_id,message->width,message->height,&out) || !out.vfb_user) {
+        if (wm_resize_vfb(s->wm_id,(uint32_t)width,(uint32_t)height,&out) || !out.vfb_user) {
             g_xwm_failed=1;return;
         }
         s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
-        s->vfb_w=message->width;s->vfb_h=message->height;
-        w->native.width=message->width;w->native.height=message->height;
-        w->target_width=message->width;w->target_height=message->height;
+        s->vfb_w=(uint32_t)width;s->vfb_h=(uint32_t)height;
+        w->native.width=(uint32_t)width;w->native.height=(uint32_t)height;
+        w->target_width=(uint32_t)width;w->target_height=(uint32_t)height;
     }
 }
 static void xwayland_pair_surfaces(void) {
@@ -460,6 +508,13 @@ static int xwayland_start(const char *server,const char *helper,const char *disp
         if (software) { args[n++]="-shm";args[n++]="+extension";args[n++]="GLX";args[n++]="+iglx"; }
         else { args[n++]="-glamor";args[n++]="gl"; }
         if (dumb) args[n++]="-dumbSched";
+        // The X screen stays at device pixels; give its core DPI the output
+        // scale so physical-size users (Tk, xdpyinfo) agree with Xft.dpi.
+        char dpi[16];
+        if (g_output_scale>1) {
+            snprintf(dpi,sizeof(dpi),"%u",96*g_output_scale);
+            args[n++]="-dpi";args[n++]=dpi;
+        }
         args[n]=NULL;
         execv(server,args);
         _exit(127);
@@ -471,6 +526,10 @@ static int xwayland_start(const char *server,const char *helper,const char *disp
         snprintf(wm_fd,sizeof(wm_fd),"%d",wm[0]);snprintf(control_fd,sizeof(control_fd),"%d",control[1]);
         snprintf(generation,sizeof(generation),"%llu",(unsigned long long)g_xwayland_generation);
         if (!xwayland_inherit_fd(wm[0]) || !xwayland_inherit_fd(control[1])) _exit(126);
+        // Environment, not argv: an older helper ignores it. Protocol 2 lets
+        // the helper send fullscreen requests and BXWM_SCALED windows.
+        char scale[16];snprintf(scale,sizeof(scale),"%u",g_output_scale);
+        if (setenv("BROOK_XWM_PROTOCOL","2",1) || setenv("BROOK_XWM_SCALE",scale,1)) _exit(126);
         execl(helper,helper,wm_fd,control_fd,generation,(char *)NULL);_exit(127);
     }
     g_xwm_pid=child;

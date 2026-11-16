@@ -132,8 +132,10 @@ static uint64_t g_trace_surface_id, g_trace_ticks, g_trace_dispatches;
 static uint32_t g_trace_last_tick, g_trace_tick_max_ms, g_trace_last_report;
 static uint32_t g_trace_input_max_ms, g_trace_dispatch_max_ms;
 /* One output, fixed for this provider lifetime. Surface geometry stays logical;
- * native WM buffers and coordinates stay physical. Xwayland's native window
- * bridge has an explicit pixel contract and is deliberately not transformed. */
+ * native WM buffers and coordinates stay physical. Xwayland sees scale 1 and
+ * device pixels ("apps scale themselves", told by brook-xwm's Xft.dpi and
+ * XSETTINGS); only windows the XWM marks BXWM_SCALED are presented at the
+ * output scale (see xwayland-xwm.h). */
 static uint32_t g_output_scale=1;
 
 static uint32_t g_now_ms(void) {
@@ -441,10 +443,11 @@ static void xwayland_native_unmapped(struct brook_surface *);
 static void xwayland_pair_surfaces(void);
 static void xwayland_generation_lost(void);
 static int xwayland_accept_view(struct brook_surface *,uint32_t,uint32_t);
+static uint32_t xwayland_surface_scale(const struct brook_surface *s);
 static uint32_t surface_output_scale(const struct brook_surface *s) {
     if (s->is_cursor && s->cursor_output_scale) return s->cursor_output_scale;
     while (s->tree.parent) s=s->tree.parent->user;
-    return s->role==4?1:g_output_scale;
+    return s->role==4?xwayland_surface_scale(s):g_output_scale;
 }
 static wl_fixed_t surface_pointer_fixed(const struct brook_surface *s,int32_t physical) {
     int64_t value=(int64_t)physical*256/surface_output_scale(s);
@@ -1788,8 +1791,12 @@ static void output_bind(struct wl_client *client, void *data,
             w = (int)sw; h = (int)sh;
         }
     }
+    /* Millimetres at 96 dpi per output-scale unit. Xwayland's X screen is in
+     * device pixels, so its RandR size reports 96 * scale dpi, matching the
+     * Xft.dpi brook-xwm publishes; other clients see logical 96 dpi. */
+    const int mm_scale = client == g_xwayland_client ? (int)g_output_scale : 1;
     wl_output_send_geometry(r, 0, 0,
-        (int)((w * 254 + 480) / 960), (int)((h * 254 + 480) / 960),
+        (int)((w * 254 + 480) / 960) / mm_scale, (int)((h * 254 + 480) / 960) / mm_scale,
         WL_OUTPUT_SUBPIXEL_UNKNOWN, "Brook", "vfb-0",
         WL_OUTPUT_TRANSFORM_NORMAL);
     wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,

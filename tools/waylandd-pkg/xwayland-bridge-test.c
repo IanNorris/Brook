@@ -254,11 +254,48 @@ int main(int argc,char **argv) {
            !configure.x && !configure.y);
     no_command(peer,&rx);
     image(full,48,40);assert(full->vfb_w==48 && !full->xwindow->target_width);
+    // "Scaled by the system": a BXWM_SCALED window keeps 1x X geometry at its
+    // native client origin and is presented at the output scale. Pointer
+    // input arrives in 1x surface units; popups map through their anchor.
+    g_output_scale=2;
+    struct bxwm_message legacy=state;legacy.window=126;legacy.identity=4;legacy.serial=58;legacy.configure_serial=0;
+    legacy.flags=BXWM_MAPPED|BXWM_INPUT|BXWM_SCALED;legacy.x=50;legacy.y=90;legacy.width=10;legacy.height=8;
+    assert(xwayland_accept_message(&legacy));
+    struct brook_surface *old_app=new_surface(client,58);image(old_app,10,8);
+    uint32_t lid=old_app->wm_id;assert(lid && old_app->vfb_w==20 && old_app->vfb_h==16);
+    assert(native[lid].client_x==50 && native[lid].client_y==90 && native[lid].width==20 && native[lid].height==16);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
+    assert(configure.x==50 && configure.y==90 && configure.width==10 && configure.height==8);
+    assert(surface_pointer_fixed(old_app,20)==wl_fixed_from_int(10));
+    legacy.configure_serial=configure.configure_serial;assert(xwayland_accept_message(&legacy));
+    // An odd native resize snaps to whole 1x pixels before the X configure.
+    native[lid].width=25;native[lid].height=17;xwayland_native_sync(old_app,0);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
+    assert(configure.width==12 && configure.height==8 && native[lid].width==24 && native[lid].height==16);
+    image(old_app,10,8);assert(old_app->vfb_w==24); // stale 1x size is held back
+    legacy.configure_serial=configure.configure_serial;legacy.width=12;assert(xwayland_accept_message(&legacy));
+    image(old_app,12,8);assert(old_app->vfb_w==24 && !old_app->xwindow->target_width);
+    // The client resizes itself in 1x units.
+    legacy.width=14;assert(xwayland_accept_message(&legacy));assert(native[lid].width==28 && old_app->xwindow->target_width==28);
+    image(old_app,14,8);assert(old_app->vfb_w==28);
+    struct bxwm_message popup_menu=legacy;popup_menu.window=127;popup_menu.identity=5;popup_menu.serial=59;
+    popup_menu.configure_serial=0;popup_menu.flags=BXWM_MAPPED|BXWM_OVERRIDE|BXWM_SCALED;
+    popup_menu.parent=126;popup_menu.parent_identity=4;popup_menu.x=55;popup_menu.y=93;popup_menu.width=4;popup_menu.height=3;
+    assert(xwayland_accept_message(&popup_menu));
+    struct brook_surface *scaled_popup=new_surface(client,59);image(scaled_popup,4,3);
+    uint32_t pid=scaled_popup->wm_id;
+    assert(native[pid].client_x==60 && native[pid].client_y==96 && native[pid].width==8 && native[pid].height==6);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
+    assert(configure.window==127 && configure.x==55 && configure.y==93 && configure.width==4 && configure.height==3);
+    // Moving the popup in X units moves it twice as far natively.
+    popup_menu.configure_serial=configure.configure_serial;popup_menu.x=57;assert(xwayland_accept_message(&popup_menu));
+    assert(native[pid].client_x==64);
+    g_output_scale=1;
     assert(unrelated->wm_id==native_id && pixels[native_id][0]==0xff123456);
     // Server disconnect takes the other teardown route through the exact
     // wl_client destroy listener. It must have the same isolation guarantee.
     wl_client_destroy(client);close(wayland_peer);close(peer);
-    assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0 && destroyed==5);
+    assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0 && destroyed==7);
     assert(g_surfaces==unrelated && unrelated->wm_id==native_id);
     assert(native[native_id].incarnation==native_incarnation && surface_repaint(unrelated));
     // Exercise real fork/exec retirement and replacement while the unrelated
@@ -301,8 +338,8 @@ int main(int argc,char **argv) {
     xwayland_pump();assert(g_xwayland_generation==last_generation);
     close(report[0]);close(report[1]);unsetenv("BROOK_TEST_XWAYLAND_REPORT_FD");
     unsetenv("BROOK_XWAYLAND_SOFTWARE_GLX");unsetenv("BROOK_XWAYLAND_DUMB_SCHED");
-    wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==6);
+    wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==8);
     wl_display_destroy(g_display);
-    puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival and generation reuse");
+    puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival, generation reuse, EWMH fullscreen and scaled windows");
     return 0;
 }

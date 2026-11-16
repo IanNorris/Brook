@@ -11,12 +11,15 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <strings.h>
 #include "xwm-wire.h"
 
 struct window {
     struct window *next;
     struct bxwm_message state,last;
-    uint64_t serial_high_water;
+    uint64_t serial_high_water,activity;
+    int scale_decided;
+    xcb_window_t inferred_parent;
 };
 struct xwm {
     xcb_connection_t *xcb;
@@ -32,6 +35,15 @@ struct xwm {
     uint32_t time_counter;
     struct bxwm_message pending_focus;
     int failed;
+    /* Set by waylandd (BROOK_XWM_PROTOCOL/BROOK_XWM_SCALE). Protocol 1 is the
+     * original wire use; 2 adds fullscreen requests and BXWM_SCALED windows,
+     * which an older waylandd would reject as malformed. */
+    int protocol;
+    uint32_t scale,client_mask;
+    const char *scaled_apps;
+    uint32_t scaled_clients[64];
+    unsigned scaled_client_count;
+    uint64_t activity;
 };
 static xcb_atom_t atom(struct xwm *wm,const char *name) {
     xcb_intern_atom_reply_t *reply=xcb_intern_atom_reply(wm->xcb,
@@ -70,6 +82,60 @@ static int publish(struct xwm *wm,struct window *w) {
     if (!emit(wm,&w->state)) return 0;
     w->last=w->state;return 1;
 }
+/* WM_CLASS is "instance\0class\0". List entries are comma separated and
+ * match either name case-insensitively; "*" matches every client. */
+static int class_listed(const char *list,const char *value,size_t length) {
+    const char *names[2]={NULL,NULL};size_t lengths[2]={0,0};
+    for (size_t start=0,i=0;i<2 && start<length;++i) {
+        const char *end=memchr(value+start,0,length-start);
+        size_t n=end?(size_t)(end-(value+start)):length-start;
+        names[i]=value+start;lengths[i]=n;start+=n+1;
+    }
+    for (const char *p=list;p && *p;) {
+        while (*p==' ' || *p==',') ++p;
+        size_t n=strcspn(p,",");
+        while (n && p[n-1]==' ') --n;
+        if (n==1 && *p=='*') return 1;
+        for (unsigned i=0;i<2;++i)
+            if (n && names[i] && lengths[i]==n && !strncasecmp(names[i],p,n)) return 1;
+        p+=n;
+    }
+    return 0;
+}
+static uint32_t client_key(struct xwm *wm,xcb_window_t window) { return window&~wm->client_mask; }
+/* Once, when a window is first mapped: is it presented scaled by the system?
+ * A listed WM_CLASS marks its whole X client, so later menus and tooltips
+ * (which often carry no WM_CLASS) follow their application. */
+static void decide_scale(struct xwm *wm,struct window *w) {
+    if (w->scale_decided) {
+        if ((w->state.flags&(BXWM_SCALED|BXWM_OVERRIDE))!=(BXWM_SCALED|BXWM_OVERRIDE)) return;
+    }
+    else {
+        w->scale_decided=1;
+        if (wm->protocol<2 || wm->scale<2 || !wm->scaled_apps || !*wm->scaled_apps) return;
+        uint32_t key=client_key(wm,w->state.window);int scaled=0;
+        for (unsigned i=0;i<wm->scaled_client_count;++i) if (wm->scaled_clients[i]==key) scaled=1;
+        if (!scaled) {
+            xcb_get_property_reply_t *reply=property(wm,w->state.window,XCB_ATOM_WM_CLASS,64);
+            if (reply && reply->format==8 && xcb_get_property_value_length(reply)>0)
+                scaled=class_listed(wm->scaled_apps,xcb_get_property_value(reply),
+                    (size_t)xcb_get_property_value_length(reply));
+            free(reply);
+            if (scaled && wm->scaled_client_count<sizeof(wm->scaled_clients)/sizeof(wm->scaled_clients[0]))
+                wm->scaled_clients[wm->scaled_client_count++]=key;
+        }
+        if (!scaled) return;
+        w->state.flags|=BXWM_SCALED;
+        if (!(w->state.flags&BXWM_OVERRIDE)) return;
+    }
+    // Each map of a scaled popup re-anchors to the client's active window.
+    struct window *best=NULL;uint32_t key=client_key(wm,w->state.window);
+    for (struct window *other=wm->windows;other;other=other->next)
+        if (other!=w && client_key(wm,other->state.window)==key &&
+            (other->state.flags&(BXWM_MAPPED|BXWM_OVERRIDE|BXWM_SCALED))==(BXWM_MAPPED|BXWM_SCALED) &&
+            (!best || other->activity>best->activity)) best=other;
+    w->inferred_parent=best?best->state.window:XCB_WINDOW_NONE;
+}
 static int refresh(struct xwm *wm,struct window *w) {
     xcb_get_geometry_reply_t *geometry=xcb_get_geometry_reply(wm->xcb,xcb_get_geometry(wm->xcb,w->state.window),NULL);
     xcb_get_window_attributes_reply_t *attributes=xcb_get_window_attributes_reply(wm->xcb,
@@ -81,7 +147,8 @@ static int refresh(struct xwm *wm,struct window *w) {
     }
     w->state.x=geometry->x;w->state.y=geometry->y;
     w->state.width=geometry->width;w->state.height=geometry->height;
-    w->state.flags=(w->state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN))|
+    const unsigned was_mapped=w->state.flags&BXWM_MAPPED;
+    w->state.flags=(w->state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN|BXWM_SCALED))|
         (attributes->override_redirect?BXWM_OVERRIDE:0)|
         (attributes->map_state!=XCB_MAP_STATE_UNMAPPED?BXWM_MAPPED:0)|BXWM_INPUT;
     free(geometry);free(attributes);
@@ -100,7 +167,16 @@ static int refresh(struct xwm *wm,struct window *w) {
         if ((values[0]&2) && values[2]==0) w->state.flags|=BXWM_CLIENT_CHROME;
     }
     free(motif);
+    if ((w->state.flags&BXWM_MAPPED) && !was_mapped) {
+        w->activity=++wm->activity;
+        decide_scale(wm,w);
+    }
     uint32_t parent=property_word(wm,w->state.window,wm->transient,0);
+    // A scaled client's menus and tooltips rarely name a transient parent but
+    // are positioned in that client's 1x coordinates; anchor them to its
+    // most recently active window so waylandd can map them consistently.
+    if (!parent && (w->state.flags&(BXWM_SCALED|BXWM_OVERRIDE))==(BXWM_SCALED|BXWM_OVERRIDE))
+        parent=w->inferred_parent;
     if (parent!=w->state.parent) w->state.parent_identity=0;
     w->state.parent=parent;
     struct window *parent_window=find(wm,parent);
@@ -210,6 +286,7 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
         break;
     }
     case BXWM_FOCUS:
+        w->activity=++wm->activity;
         // Brook already raised this native window. Keep X's hit-test order
         // aligned: changing keyboard focus alone leaves an overlapping X
         // sibling on top, so pointer events can reach the wrong application.
@@ -253,7 +330,7 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
         // including its absence, so the native side applies it before the
         // first frame and a remap without the atom leaves fullscreen.
         if (w && !refresh(wm,w)) return 0;
-        if (w && !(w->state.flags&BXWM_OVERRIDE)) {
+        if (w && wm->protocol>=2 && !(w->state.flags&BXWM_OVERRIDE)) {
             struct bxwm_message request=w->state;
             request.type=BXWM_FULLSCREEN_REQUEST;request.x=initial_fullscreen(wm,e->window);
             return emit(wm,&request);
@@ -346,7 +423,7 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
                 request.type=e->data.data32[2]==8?BXWM_BEGIN_MOVE:BXWM_BEGIN_RESIZE;
                 request.x=(int32_t)e->data.data32[2];
             } else if (e->type==wm->change_state && e->data.data32[0]==3) request.type=BXWM_MINIMIZE;
-            else if (e->type==wm->net_state && e->data.data32[0]<=2 &&
+            else if (wm->protocol>=2 && e->type==wm->net_state && e->data.data32[0]<=2 &&
                 (e->data.data32[1]==wm->fullscreen || e->data.data32[2]==wm->fullscreen)) {
                 request.type=BXWM_FULLSCREEN_REQUEST;request.x=(int32_t)e->data.data32[0];
             }
@@ -371,12 +448,60 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
     }
     return !w || refresh(wm,w);
 }
+/* "Apps scale themselves": the X screen stays at device pixels, so tell X
+ * clients the scale the way GNOME/KDE sessions do. Xft.dpi (Qt, Xft, Tk via
+ * the toolkit, Chromium) and Xcursor.size live in RESOURCE_MANAGER; GTK reads
+ * Gdk/WindowScalingFactor and the unscaled font DPI from XSETTINGS. An
+ * existing Xft.dpi (an earlier xrdb -merge) is left alone. */
+static void xsettings_int(uint8_t *buffer,size_t *used,const char *name,int32_t value) {
+    const uint16_t length=(uint16_t)strlen(name);
+    buffer[*used]=0;buffer[*used+1]=0;memcpy(buffer+*used+2,&length,2);*used+=4;
+    memcpy(buffer+*used,name,length);*used+=(length+3u)&~3u;
+    const uint32_t serial=0;memcpy(buffer+*used,&serial,4);memcpy(buffer+*used+4,&value,4);*used+=8;
+}
+static int publish_scale_hints(struct xwm *wm) {
+    const uint32_t dpi=96*wm->scale,cursor=24*wm->scale;
+    xcb_atom_t resources=atom(wm,"RESOURCE_MANAGER");
+    if (!resources) return 0;
+    xcb_get_property_reply_t *old=property(wm,wm->root,resources,16384);
+    const char *text=old && old->format==8?xcb_get_property_value(old):"";
+    size_t length=old && old->format==8?(size_t)xcb_get_property_value_length(old):0;
+    if (!memmem(text,length,"Xft.dpi:",8)) {
+        char *merged=malloc(length+96);
+        if (!merged) { free(old);return 0; }
+        memcpy(merged,text,length);
+        if (length && merged[length-1]!='\n') merged[length++]='\n';
+        length+=(size_t)snprintf(merged+length,96,"Xft.dpi:\t%u\nXcursor.size:\t%u\n",dpi,cursor);
+        xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,resources,XCB_ATOM_STRING,8,(uint32_t)length,merged);
+        free(merged);
+    }
+    free(old);
+    uint8_t settings[256]={0};size_t used=12;uint32_t count=4,serial=1;
+    memcpy(settings+4,&serial,4);memcpy(settings+8,&count,4); // byte 0: LSBFirst
+    xsettings_int(settings,&used,"Xft/DPI",(int32_t)(dpi*1024));
+    xsettings_int(settings,&used,"Gdk/WindowScalingFactor",(int32_t)wm->scale);
+    xsettings_int(settings,&used,"Gdk/UnscaledDPI",96*1024);
+    xsettings_int(settings,&used,"Gtk/CursorThemeSize",(int32_t)cursor);
+    xcb_atom_t selection=atom(wm,"_XSETTINGS_S0"),data=atom(wm,"_XSETTINGS_SETTINGS"),manager=atom(wm,"MANAGER");
+    if (!selection || !data || !manager) return 0;
+    xcb_get_selection_owner_reply_t *owner=xcb_get_selection_owner_reply(wm->xcb,
+        xcb_get_selection_owner(wm->xcb,selection),NULL);
+    const int taken=owner && owner->owner!=XCB_WINDOW_NONE;free(owner);
+    if (taken) return 1; // Another settings daemon already answers clients.
+    xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,data,data,8,(uint32_t)used,settings);
+    xcb_set_selection_owner(wm->xcb,wm->support,selection,XCB_CURRENT_TIME);
+    xcb_client_message_event_t announce={.response_type=XCB_CLIENT_MESSAGE,.format=32,
+        .window=wm->root,.type=manager};
+    announce.data.data32[0]=XCB_CURRENT_TIME;announce.data.data32[1]=selection;announce.data.data32[2]=wm->support;
+    xcb_send_event(wm->xcb,0,wm->root,XCB_EVENT_MASK_STRUCTURE_NOTIFY,(const char *)&announce);
+    return 1;
+}
 static int initialize(struct xwm *wm,int wm_fd) {
     wm->xcb=xcb_connect_to_fd(wm_fd,NULL);
     if (!wm->xcb || xcb_connection_has_error(wm->xcb)) return 0;
     xcb_screen_iterator_t screens=xcb_setup_roots_iterator(xcb_get_setup(wm->xcb));
     if (!screens.rem) return 0;
-    wm->root=screens.data->root;
+    wm->root=screens.data->root;wm->client_mask=xcb_get_setup(wm->xcb)->resource_id_mask;
     // Rootless Xwayland only creates Wayland surfaces for manually redirected
     // X windows. Synthetic serial events in an Xvfb control cannot prove this.
     xcb_composite_query_version_reply_t *composite=xcb_composite_query_version_reply(wm->xcb,
@@ -410,9 +535,10 @@ static int initialize(struct xwm *wm,int wm_fd) {
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,wm->supporting,XCB_ATOM_WINDOW,32,1,&wm->support);
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,wm->name,wm->utf8,8,9,"Brook XWM");
     xcb_atom_t supported[]={wm->supporting,wm->name,wm->active,wm->net_state,wm->max_h,wm->max_v,
-        wm->fullscreen,wm->moveresize};
+        wm->moveresize,wm->fullscreen};
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supported,XCB_ATOM_ATOM,32,
-        sizeof(supported)/sizeof(supported[0]),supported);
+        sizeof(supported)/sizeof(supported[0])-(wm->protocol>=2?0:1),supported);
+    if (wm->scale>1 && !publish_scale_hints(wm)) return 0;
     xcb_flush(wm->xcb);
     struct bxwm_message ready={.version=BXWM_VERSION,.type=BXWM_READY,.generation=wm->generation,
         .window=wm->root,.width=screens.data->width_in_pixels,.height=screens.data->height_in_pixels};
@@ -429,7 +555,11 @@ int main(int argc,char **argv) {
         wm_fd>INT_MAX || control>INT_MAX || wm_fd==control || !generation ||
         fcntl((int)wm_fd,F_GETFD)<0 || fcntl((int)control,F_GETFD)<0) return 2;
     signal(SIGPIPE,SIG_IGN);
-    struct xwm wm={.control=(int)control,.generation=generation};
+    struct xwm wm={.control=(int)control,.generation=generation,.protocol=1,.scale=1};
+    const char *protocol=getenv("BROOK_XWM_PROTOCOL"),*scale=getenv("BROOK_XWM_SCALE");
+    if (protocol && !strcmp(protocol,"2")) wm.protocol=2;
+    if (scale && scale[0]>='1' && scale[0]<='4' && !scale[1]) wm.scale=(uint32_t)(scale[0]-'0');
+    wm.scaled_apps=getenv("BROOK_XWAYLAND_SCALED_APPS");
     int success=initialize(&wm,(int)wm_fd);
     while (success && !wm.failed && !xcb_connection_has_error(wm.xcb)) {
         xcb_generic_event_t *e;
