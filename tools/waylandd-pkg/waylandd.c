@@ -405,7 +405,7 @@ struct brook_surface {
      * sampled from the client's buffer (packed for syscall 512), when the
      * next sample is due, and a newest GPU frame still waiting to be read. */
     uint32_t strip_style, strip_last_ms;
-    int strip_due;
+    int strip_due, strip_trailing;
     struct brook_image *strip_retry;
     unsigned strip_retry_count;
 
@@ -2091,7 +2091,7 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
     if (!surface->xdg_toplevel || !surface->xdg_surface ||
         surface->toplevel_activated == active) return;
     surface->toplevel_activated=active;
-    surface->strip_due=1; /* Chromium redraws its strip in the (in)active colour. */
+    surface->strip_due=3; /* Chromium redraws its strip in the (in)active colour. */
     int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)(surface->vfb_w/surface_output_scale(surface));
     int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)(surface->vfb_h/surface_output_scale(surface));
     if(surface->toplevel_maximized || surface->configure_size_pending) {
@@ -2259,9 +2259,20 @@ static void strip_retry_drop(struct brook_surface *s) {
     if (s->strip_retry) { image_unref(s->strip_retry);s->strip_retry=NULL; }
     s->strip_retry_count=0;
 }
+static void surface_strip_commit(struct brook_surface *s, struct brook_image *older);
 static int strip_timer_tick(void *data) {
     (void)data;int again=0;
     for (struct brook_surface *s=g_surfaces;s;s=s->next) {
+        if (s->strip_trailing && !s->strip_retry) {
+            /* A commit inside the throttle window was skipped: sample the
+             * latest frame now, so an idle client's last change is seen. */
+            s->strip_trailing=0;s->strip_due=1;
+            const uint32_t before=s->strip_style;
+            surface_strip_commit(s,NULL);
+            if (s->strip_style!=before && s->deco_sent_mode==2) surface_sync_decoration(s,0);
+            if (s->strip_retry) again=1;
+            continue;
+        }
         if (!s->strip_retry) continue;
         int r=strip_sample(s,s->strip_retry);
         if (r<0 && ++s->strip_retry_count<STRIP_RETRY_LIMIT) { again=1;continue; }
@@ -2277,8 +2288,20 @@ static void surface_strip_commit(struct brook_surface *s, struct brook_image *ol
     struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
     struct brook_image *im=view?view->image:NULL;
     const uint32_t now=g_now_ms();
-    if (!im || (!s->strip_due && now-s->strip_last_ms<STRIP_SAMPLE_MS)) return;
-    s->strip_last_ms=now;s->strip_due=0;
+    if (!im) return;
+    if (!s->strip_due && now-s->strip_last_ms<STRIP_SAMPLE_MS) {
+        /* Throttled: sample this frame once the window has passed. */
+        if (!s->strip_trailing) {
+            s->strip_trailing=1;
+            if (!g_strip_timer) g_strip_timer=wl_event_loop_add_timer(wl_display_get_event_loop(g_display),strip_timer_tick,NULL);
+            if (g_strip_timer) wl_event_source_timer_update(g_strip_timer,(int)(STRIP_SAMPLE_MS-(now-s->strip_last_ms))+1);
+        }
+        return;
+    }
+    s->strip_last_ms=now;
+    /* A focus or size change is followed by a few commits before the client
+     * shows its new strip: keep sampling each of them. */
+    if (s->strip_due>0) --s->strip_due;
     int r=strip_sample(s,im);
     if (r<0) {
         /* The newest frame is still being drawn: read the previous one now
