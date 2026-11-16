@@ -239,7 +239,20 @@ does not show hardware rendering; DRI3 and the probe's renderer do.
   restart bound.
 
 The windowless-grace path was not reached in QEMU, because the dialog ignored
-close; it is covered by the host test. Evidence:
+close; it is covered by the host test.
+
+A second QEMU boot checked the python3-minimal fixes, with ctypes blocked in
+the guest's interpreter:
+- **Install.** The bundle's `install.py` backed up, installed and
+  import-tested the launcher on the guest's ext2.
+- **Probe.** `--probe` re-executed under a full Python found by the store glob
+  (`0r6k8xa2…-python3-3.13.12`, the same path as the Dell's) and passed. With
+  `BROOK_STEAM_FULL_PYTHON=none` it reported that it needs ctypes and exited 1.
+- **Launch.** A launch under the re-executed launcher reported subreaper true
+  and started Pulse and the client.
+- **SIGTERM.** Sent during SteamRT setup (host load about 40, so no window
+  yet), it cleaned up in 8 s: four leftovers terminated, the Pulse directory
+  removed, and the job drained with zero live tasks. Evidence:
 `build/qemu-steam-rootless/evidence/` in the `work/steam-rootless` worktree.
 
 ### Install and Dell test
