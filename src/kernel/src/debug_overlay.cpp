@@ -16,6 +16,7 @@
 #include "serial.h"
 #include "net.h"
 #include "debug_presence.h"
+#include "klog.h"
 #include "kprintf.h"
 #include "string.h"
 #include "tty.h"
@@ -495,7 +496,11 @@ static void DebugTcpThread(void* /*arg*/)
             continue;
         }
 
-        SerialPrintf("DEBUG_TCP: client connected (sock %d)\n", clientSock);
+        NetCountDebugClient(true);
+        // Per-connection traces are `log level tcp debug`; `tcp stats`
+        // keeps the totals. A polling bridge connects several times a second.
+        if (KLogEnabled(LogCat::Tcp, LogLevel::Debug))
+            SerialPrintf("DEBUG_TCP: client connected (sock %d)\n", clientSock);
 
         // Send banner
         const char* banner = "=== Brook OS Debug Console ===\r\n";
@@ -595,7 +600,9 @@ static void DebugTcpThread(void* /*arg*/)
         }
 
     client_done:
-        SerialPuts("DEBUG_TCP: client disconnected\n");
+        NetCountDebugClient(false);
+        if (KLogEnabled(LogCat::Tcp, LogLevel::Debug))
+            SerialPuts("DEBUG_TCP: client disconnected\n");
         SockUnref(clientSock);
     }
 }

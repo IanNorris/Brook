@@ -2525,11 +2525,33 @@ namespace {
     };
     TcpStats g_tcpStats = {};
     uint64_t g_tcpStatsLastTick = 0;
+    // Cumulative since boot, read on demand by `tcp stats` (the per-segment
+    // and per-connection traces are LogCat::Tcp Debug, off by default).
+    struct TcpTotals {
+        uint64_t txPkts, rxPkts, txBytes, rxBytes, txAcks, rxAcks;
+        uint64_t txControl, rxControl, txRst, rxRst, synAcks, sendFailures;
+        uint64_t debugClients, debugDisconnects;
+    };
+    TcpTotals g_tcpTotals = {};
+    inline void TcpTotalAdd(uint64_t& field, uint64_t value) { __atomic_fetch_add(&field, value, __ATOMIC_RELAXED); }
+    inline uint64_t TcpTotalGet(const uint64_t& field) { return __atomic_load_n(&field, __ATOMIC_RELAXED); }
+    inline bool TcpTraceEnabled() { return KLogEnabled(LogCat::Tcp, LogLevel::Debug); }
+}
+
+void NetCountDebugClient(bool connected)
+{
+    TcpTotalAdd(connected ? g_tcpTotals.debugClients : g_tcpTotals.debugDisconnects, 1);
 }
 
 static void TcpStatsRecord(bool tx, uint8_t flags, uint32_t dataLen)
 {
     bool isPureAck = (flags & ~TCP_ACK) == 0 && dataLen == 0;
+    const bool control = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
+    TcpTotalAdd(tx ? g_tcpTotals.txPkts : g_tcpTotals.rxPkts, 1);
+    TcpTotalAdd(tx ? g_tcpTotals.txBytes : g_tcpTotals.rxBytes, dataLen);
+    if (isPureAck) TcpTotalAdd(tx ? g_tcpTotals.txAcks : g_tcpTotals.rxAcks, 1);
+    if (control) TcpTotalAdd(tx ? g_tcpTotals.txControl : g_tcpTotals.rxControl, 1);
+    if (flags & TCP_RST) TcpTotalAdd(tx ? g_tcpTotals.txRst : g_tcpTotals.rxRst, 1);
     if (tx) {
         g_tcpStats.txPkts++;
         g_tcpStats.txBytes += dataLen;
@@ -2579,6 +2601,14 @@ static void TcpStatsMaybeFlush()
     }
 
     if (!TcpTimerElapsed(now, g_tcpStatsLastTick, 5000)) return;
+    // The 5 s rollup and idle-socket dump are traces too: with a polling
+    // bridge they otherwise add serial output (and a persistent last-log
+    // rewrite) every interval. Totals stay available through `tcp stats`.
+    if (!TcpTraceEnabled()) {
+        g_tcpStats = {};
+        g_tcpStatsLastTick = now;
+        return;
+    }
     if (g_tcpStats.txPkts == 0 && g_tcpStats.rxPkts == 0) {
         // No traffic in 5s — dump state of all established sockets to help
         // diagnose stalls (BRO-153).
@@ -2814,17 +2844,17 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
     int sendResult = asyncNeighbor ? NetSendIpv4AsyncNeighbor(snapshot.localIp,snapshot.remoteIp,IP_PROTO_TCP,buf,tcpLen)
                                    : NetSendIpv4From(snapshot.localIp, snapshot.remoteIp, IP_PROTO_TCP, buf, tcpLen);
     if (sendResult != 0) {
-        if(!asyncNeighbor || sendResult!=-11)SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
+        if(!asyncNeighbor || sendResult!=-11){TcpTotalAdd(g_tcpTotals.sendFailures,1);SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);}
     } else {
         SpinLockAcquire(&s.lock);
         const uint32_t packetCount = ++s.txPktCount;
         SpinLockRelease(&s.lock);
         TcpStatsRecord(/*tx=*/true, flags, dataLen);
-        // Control segments (SYN/FIN/RST) are still logged inline because they
-        // mark connection state transitions worth seeing in real time. Pure
-        // ACKs and data segments roll up into the 5s summary instead.
+        // Control segments (SYN/FIN) mark connection state transitions and
+        // are traced with `log level tcp debug`; resets are always logged.
+        // Pure ACKs and data segments roll up into the 5s summary instead.
         bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
-        if (isControl) {
+        if ((flags & TCP_RST) || (isControl && TcpTraceEnabled())) {
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
                           snapshot.ownerPid, sockIdx, ApicTickCount(), flags,
@@ -2966,7 +2996,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         }
         TcpStatsRecord(/*tx=*/false, flags, dataLen);
         bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
-        if (isControl)
+        if ((flags & TCP_RST) || (isControl && TcpTraceEnabled()))
         {
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
@@ -3172,11 +3202,13 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             TcpSendSnapshot(child, childSnapshot, childSnapshot.iss,
                             TCP_SYN | TCP_ACK, nullptr, 0, "synack");
 
-            SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
-                         ntohs(dstPort),
-                         ip->srcIp & 0xFF, (ip->srcIp >> 8) & 0xFF,
-                         (ip->srcIp >> 16) & 0xFF, (ip->srcIp >> 24) & 0xFF,
-                         ntohs(srcPort), childIdx);
+            TcpTotalAdd(g_tcpTotals.synAcks, 1);
+            if (TcpTraceEnabled())
+                SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
+                             ntohs(dstPort),
+                             ip->srcIp & 0xFF, (ip->srcIp >> 8) & 0xFF,
+                             (ip->srcIp >> 16) & 0xFF, (ip->srcIp >> 24) & 0xFF,
+                             ntohs(srcPort), childIdx);
             // Transfer the creator reference only after sending and logging.
             // Once published, accept/listener close may immediately retire it;
             // successful publication must be our last access to this child.
@@ -4435,6 +4467,7 @@ static bool MatchLogCat(const char* name, LogCat* out)
         {"mem", LogCat::Mem}, {"vfs", LogCat::Vfs}, {"net", LogCat::Net},
         {"input", LogCat::Input}, {"wm", LogCat::Wm}, {"term", LogCat::Term},
         {"syscall", LogCat::Syscall}, {"driver", LogCat::Driver}, {"prof", LogCat::Prof},
+        {"tcp", LogCat::Tcp},
     };
     for (auto& m : kMap) {
         const char* a = name;
@@ -5069,6 +5102,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));r.text("}");
         r.text("}\n");r.send();return;
     }
+    if (NetStrEq(cmd, "tcp stats")) {
+        BridgeReply r;r.text("{\"tcp_stats_api\":1,\"trace\":");r.text(TcpTraceEnabled()?"true":"false");
+        const struct { const char* name; const uint64_t& value; } fields[] = {
+            {"tx_packets",g_tcpTotals.txPkts},{"rx_packets",g_tcpTotals.rxPkts},
+            {"tx_bytes",g_tcpTotals.txBytes},{"rx_bytes",g_tcpTotals.rxBytes},
+            {"tx_pure_acks",g_tcpTotals.txAcks},{"rx_pure_acks",g_tcpTotals.rxAcks},
+            {"tx_control",g_tcpTotals.txControl},{"rx_control",g_tcpTotals.rxControl},
+            {"tx_resets",g_tcpTotals.txRst},{"rx_resets",g_tcpTotals.rxRst},
+            {"synacks_sent",g_tcpTotals.synAcks},{"send_failures",g_tcpTotals.sendFailures},
+            {"debug_clients",g_tcpTotals.debugClients},{"debug_disconnects",g_tcpTotals.debugDisconnects},
+        };
+        for (const auto& f : fields) {r.text(",");r.field(f.name,TcpTotalGet(f.value));}
+        r.text("}\n");r.send();return;
+    }
     if (NetStrEq(cmd, "bridge stats")) {
         uint64_t total = PmmGetRamPageCount(), free = PmmGetFreePageCount();
         uint32_t count=0,running=0;SchedulerGetProcessCounts(count,running);
@@ -5216,7 +5263,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  log level <cat> <level>  - set level for category\n"
             "  log level all <level>    - set level for all categories\n"
             "  log stream on|off        - enable/disable log streaming here\n"
-            "  (categories: general sched mem vfs net input wm term syscall driver prof)\n"
+            "  (categories: general sched mem vfs net input wm term syscall driver prof tcp)\n"
+            "  tcp stats                - cumulative TCP/debug-client counters (per-connection\n"
+            "                             traces need: log level tcp debug)\n"
             "  (levels: error warn info debug trace)\n"
             "\n"
             "Profiler:\n"

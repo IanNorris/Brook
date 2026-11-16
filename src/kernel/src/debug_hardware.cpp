@@ -1140,7 +1140,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         Reply r;r.text("{\"power_api\":1,\"request_id\":");r.quoted(id);r.text(",\"operation\":");r.quoted(verb);
         r.text(",\"state\":");r.quoted(state);r.text(",\"error\":");
         if(error<0){r.text("-");r.number(static_cast<uint64_t>(-int64_t(error)));}else r.number(error);
-        r.text(",\"status\":");r.quoted(ShutdownRequestStatus(id));r.text("}\n");r.send();return true;
+        ShutdownBlockerReport blockers{};ShutdownRequestBlockers(id,&blockers);
+        r.text(",\"status\":");r.quoted(blockers.status);
+        r.text(",\"stage\":");r.quoted(blockers.stage);
+        r.text(",");r.field("blocker_count",blockers.count);
+        r.text(",");r.field("next_signal_ms",blockers.nextSignalMs);
+        r.text(",\"blockers\":[");
+        for(uint32_t i=0;i<blockers.listed;++i){
+            if(i)r.text(",");
+            r.text("{");r.field("pid",blockers.entries[i].pid);r.text(",\"name\":");r.quoted(blockers.entries[i].name);
+            r.text(",\"window\":");r.text(blockers.entries[i].window?"true":"false");
+            r.text(",\"service\":");r.text(blockers.entries[i].service?"true":"false");r.text("}");
+        }
+        r.text("]}\n");r.send();return true;
     }
     constexpr const char* logs="bridge hardware logs ";
     if(!Prefix(command,logs))return false;

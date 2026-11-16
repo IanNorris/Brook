@@ -31,6 +31,7 @@ static LogLevel g_catLevels[static_cast<int>(LogCat::Count)] = {
     LogLevel::Info,  // Syscall
     LogLevel::Info,  // Driver
     LogLevel::Info,  // Prof
+    LogLevel::Info,  // Tcp (its traces are Debug, so off by default)
 };
 
 static volatile bool g_remoteStream = false;
@@ -41,7 +42,7 @@ static volatile bool g_remoteStream = false;
 
 static const char* const kCatNames[] = {
     "general", "sched", "mem", "vfs", "net",
-    "input", "wm", "term", "syscall", "driver", "prof"
+    "input", "wm", "term", "syscall", "driver", "prof", "tcp"
 };
 
 static const char* const kLevelNames[] = {
@@ -73,6 +74,11 @@ LogLevel KLogGetLevel(LogCat cat)
     if (idx >= 0 && idx < static_cast<int>(LogCat::Count))
         return g_catLevels[idx];
     return LogLevel::Info;
+}
+
+bool KLogEnabled(LogCat cat, LogLevel level)
+{
+    return level <= KLogGetLevel(cat);
 }
 
 void KLogSetGlobalLevel(LogLevel level)

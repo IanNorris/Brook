@@ -56,6 +56,7 @@ unsigned largeFinalCalls=0;
 #endif
 brook::ProcessCleanupStatus cleanup{};
 brook::Process serviceTasks[2]{};unsigned signalPid=0;
+brook::Process appTasks[3]{};int signalLog[32]{};unsigned signalPids[32]{};unsigned signalCount=0;
 brook::DebugTaskSnapshot census[4]{};unsigned censusCount=0;
 brook::WmDebugWindow window{};bool visible=false;
 void step(){try{brook::Worker(nullptr);}catch(Yield&){} }
@@ -70,8 +71,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms){if(terminalSleeps && ms!=25)return
 uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t cap,uint32_t* total,uint64_t* begin,uint64_t* end){*total=censusCount;*begin=*end=0;for(unsigned i=0;i<censusCount&&i<cap;++i)out[i]=census[i];return censusCount;}
 uint32_t SchedulerSetUserBirthClosed(bool closed){gate=closed;return births;}
 void SchedulerUserBirthStatus(bool* closed,uint32_t* pending){*closed=gate;*pending=births;}
-Process* SchedulerFindProcessReference(uint16_t pid){for(auto& p:serviceTasks)if(p.pid==pid){ProcessRef(&p);return &p;}return nullptr;}
-int ProcessSendSignal(Process* p,int,const SignalInfo*){++signals;signalPid=p->pid;return 0;}
+Process* SchedulerFindProcessReference(uint16_t pid){for(auto& p:serviceTasks)if(p.pid==pid){ProcessRef(&p);return &p;}for(auto& p:appTasks)if(p.pid==pid){ProcessRef(&p);return &p;}return nullptr;}
+int ProcessSendSignal(Process* p,int signal,const SignalInfo*){++signals;signalPid=p->pid;if(signalCount<32){signalLog[signalCount]=signal;signalPids[signalCount++]=p->pid;}return 0;}
 void WmSetLaunchInhibited(bool inhibited){launched=!inhibited;}
 bool WmLauncherDispatching(){return dispatching;}
 void DebugJobsSetLaunchInhibited(bool inhibited){jobsAllowed=!inhibited;}
@@ -103,6 +104,70 @@ void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
 void KLog(const char*,...){}
 uint64_t ApicTickCount(){return tick;}
+}
+namespace {
+using namespace brook;
+void App(unsigned slot,uint16_t pid,const char* name,ProcessState state=ProcessState::Ready) {
+    auto& c=census[slot];c={};c.pid=c.tgid=pid;c.incarnation=c.groupIncarnation=1000+pid;c.state=state;
+    {unsigned i=0;for(;name[i]&&i+1<sizeof(c.name);++i)c.name[i]=name[i];c.name[i]=0;}
+    auto& p=appTasks[slot];p.pid=pid;p.tgid=pid;p.incarnation=1000+pid;p.lifecycleRole=ProcessLifecycleRole::Application;p.state=state;p.sigMask=0;p.refCount=1;
+}
+bool Contains(const char* haystack,const char* needle) {
+    for(;*haystack;++haystack){unsigned i=0;while(needle[i]&&haystack[i]==needle[i])++i;if(!needle[i])return true;}
+    return !*needle;
+}
+void Show(const char* request,const char* stage,const char* text) {
+    ShutdownBlockerReport r{};ShutdownRequestBlockers(request,&r);
+    if(strcmp(r.stage,stage)||!Contains(r.status,text))std::fprintf(stderr,"escalation: expected %s/'%s' got %s/'%s'\n",stage,text,r.stage,r.status);
+    assert(!strcmp(r.stage,stage));assert(Contains(r.status,text));assert(!strcmp(ShutdownRequestStatus(request),r.status));
+}
+// Windowless user processes (a bridge-started daemon) are escalated
+// SIGTERM -> SIGKILL only while no client window is open; an open window
+// (a save prompt) is never escalated and a reappearing one restarts grace.
+void TestWindowlessEscalation() {
+    current=-1;irreversible=false;acRecovery={};powerRestart=true;powerOff=true;tick=1000000;
+    cleanup={};births=0;gate=false;jobsBusy=true;dispatching=false;visible=false;signalCount=0;signals=0;
+    const char* req="99999999999999999999999999999999";
+    command(req,"restart","closing");
+    // Editor with a save prompt (pid 40) plus a windowless daemon (pid 50).
+    censusCount=2;App(0,40,"mousepad");App(1,50,"pulseaudio");
+    visible=true;window={};window.id=9;window.incarnation=90;window.focusable=true;window.clientPid=40;window.clientIncarnation=1040;
+    const unsigned closesBefore=closes;ShutdownCompositorPoll();assert(closes==closesBefore+1);
+    for(unsigned i=0;i<20;++i){tick+=5000;ShutdownCompositorPoll();step();}
+    assert(!signalCount);Show(req,"windows","1 window open; waiting for mousepad pid 40 (window), pulseaudio pid 50; resolve save dialogs");
+    {ShutdownBlockerReport r{};ShutdownRequestBlockers(req,&r);assert(r.count==2&&r.listed==2&&r.entries[0].pid==40&&r.entries[0].window&&r.entries[1].pid==50&&!r.entries[1].window);}
+    // Prompt answered: the editor exits; only the daemon remains.
+    visible=false;censusCount=1;App(0,50,"pulseaudio",ProcessState::Stopped);ShutdownCompositorPoll();
+    step();Show(req,"grace","no window: pulseaudio pid 50; SIGTERM in 10 s");
+    tick+=WindowlessStopPolicy::GraceMs-1;step();assert(!signalCount);
+    // A window opened since the compositor's last poll vetoes the step.
+    visible=true;window.clientPid=61;window.clientIncarnation=1061;window.incarnation=91;
+    tick+=1;step();assert(!signalCount);Show(req,"waiting","no window: pulseaudio pid 50");
+    ShutdownCompositorPoll();step();Show(req,"windows","1 window open");
+    tick+=60000;step();assert(!signalCount);
+    visible=false;ShutdownCompositorPoll();step();Show(req,"grace","SIGTERM in 10 s");
+    tick+=WindowlessStopPolicy::GraceMs;step();
+    // SIGTERM, then SIGCONT because the daemon was stopped.
+    assert(signalCount==2&&signalLog[0]==15&&signalPids[0]==50&&signalLog[1]==18);
+    Show(req,"sigterm","SIGKILL in 5 s");
+    tick+=WindowlessStopPolicy::KillMs-1;step();assert(signalCount==2);
+    tick+=1;step();assert(signalCount==3&&signalLog[2]==9&&signalPids[2]==50);Show(req,"sigkill","killed, waiting for exit");
+    tick+=WindowlessStopPolicy::RekillMs;step();assert(signalCount==4&&signalLog[3]==9);
+    assert(!gate&&operations[current].phase==Phase::Closing);
+    // Exit observed; the bridge job drains, then the normal path continues.
+    censusCount=0;step();assert(operations[current].phase==Phase::Closing);Show(req,"draining","bridge job output");
+    jobsBusy=false;for(unsigned i=0;i<10&&operations[current].phase!=Phase::Ready;++i)step();
+    command(req,"power_status","ready");assert(signalCount==4);
+    // Cancel is honoured promptly during escalation and stops it.
+    current=-1;irreversible=false;signalCount=0;
+    const char* cancelled="aaaaaaaa999999999999999999999999";
+    command(cancelled,"shutdown","closing");censusCount=1;App(0,70,"sleep");ShutdownCompositorPoll();
+    step();tick+=WindowlessStopPolicy::GraceMs;step();assert(signalCount==1&&signalLog[0]==15);
+    command(cancelled,"cancel","closing");Show(cancelled,"cancelling","Cancelling");
+    step();command(cancelled,"power_status","cancelled");assert(launched&&jobsAllowed&&!gate);
+    tick+=60000;step();assert(signalCount==1);
+    censusCount=0;current=-1;irreversible=false;
+}
 }
 int main(){
     TestAcShutdownRecord();
@@ -218,6 +283,7 @@ step();assert(!signals&&!syncs&&!gate);
     sample(AcPowerSource::Online);
     for(unsigned i=0;i<10;++i)sample(AcPowerSource::Offline);
     step();assert(current<0 && powerWrites==3); // one attempt per boot
+    TestWindowlessEscalation();
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

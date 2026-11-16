@@ -52,6 +52,15 @@ ClientIdentity closeClients[MAX_PROCESSES]{};uint32_t closeClientCount=0;
 CloseTarget closeTargets[WM_MAX_WINDOWS]{};uint32_t closeCount=0,guiRemaining=0;
 DebugTaskSnapshot tasks[MAX_PROCESSES];uint32_t taskCount=0;
 ServiceStopPolicy serviceStop{};
+WindowlessStopPolicy windowless{};
+// Client/provider processes of the focusable windows still open, published by
+// the compositor poll with guiRemaining (under lock). Used to name windowed
+// blockers and to never signal a process that owns an open window.
+uint32_t windowOwners[WM_MAX_WINDOWS*2]{};uint32_t windowOwnerCount=0;
+WmDebugWindow workerWindows[WM_MAX_WINDOWS];
+// Status and blockers for the current request (under lock). The last status
+// byte is never written, so an unlocked reader always finds a terminator.
+ShutdownBlockerReport blockerReport{};
 void RequestDesktopPower(bool restart,bool acLoss);
 const char* Name(Phase phase) {
     switch(phase) {
@@ -78,45 +87,155 @@ uint32_t Census(uint32_t* applications) {
     }
     return users;
 }
-// Names the first service still alive in the Services phase (under lock).
-char servicesStatus[96]{};
+struct Text {
+    char* out;uint32_t cap,n=0;
+    void put(const char* x){while(*x&&n+1<cap)out[n++]=*x++;out[n]=0;}
+    void num(uint64_t v){char d[21];int k=0;do{d[k++]=char('0'+v%10);v/=10;}while(v&&k<20);while(k&&n+1<cap)out[n++]=d[--k];out[n]=0;}
+};
+bool Member(const DebugTaskSnapshot& t,bool services) {
+    return t.pid&&!t.kernel&&t.systemService==services&&t.state!=ProcessState::Terminated;
+}
+// First live census entry of its thread group (one entry per process).
+bool FirstOfGroup(uint32_t i,bool services) {
+    for(uint32_t j=0;j<i;++j)if(Member(tasks[j],services)&&tasks[j].tgid==tasks[i].tgid&&tasks[j].groupIncarnation==tasks[i].groupIncarnation)return false;
+    return true;
+}
+bool OwnsWindow(const DebugTaskSnapshot& t,const uint32_t* owners,uint32_t count) {
+    for(uint32_t i=0;i<count;++i)if(owners[i]&&(owners[i]==t.tgid||owners[i]==t.pid))return true;
+    return false;
+}
+// Fills the blocker list from the last Census(): one entry per live process
+// group of the selected kind, window owners listed first. Returns the count.
+uint32_t CollectBlockers(bool services,const uint32_t* owners,uint32_t ownerCount,ShutdownBlockerReport& r) {
+    r.count=r.listed=0;
+    for(int pass=0;pass<2;++pass)for(uint32_t i=0;i<taskCount;++i) {
+        const auto& t=tasks[i];if(!Member(t,services)||!FirstOfGroup(i,services))continue;
+        const bool window=OwnsWindow(t,owners,ownerCount);if(window!=(pass==0))continue;
+        ++r.count;if(r.listed>=sizeof(r.entries)/sizeof(r.entries[0]))continue;
+        auto& e=r.entries[r.listed++];e.pid=t.tgid?t.tgid:t.pid;e.window=window;e.service=services;
+        memcpy(e.name,t.name,sizeof(e.name));e.name[sizeof(e.name)-1]=0;
+    }
+    return r.count;
+}
+void PutBlockers(Text& t,const ShutdownBlockerReport& r,uint32_t limit) {
+    for(uint32_t i=0;i<r.listed&&i<limit;++i){if(i)t.put(", ");t.put(r.entries[i].name);t.put(" pid ");t.num(r.entries[i].pid);if(r.entries[i].window)t.put(" (window)");}
+    const uint32_t shown=r.listed<limit?r.listed:limit;
+    if(r.count>shown){t.put(" (+");t.num(r.count-shown);t.put(")");}
+}
+void Publish(ShutdownBlockerReport& r,const char* stage) {
+    unsigned i=0;while(stage[i]&&i+1<sizeof(r.stage)){r.stage[i]=stage[i];++i;}r.stage[i]=0;
+    SpinLockAcquire(&lock);
+    const bool changed=strcmp(blockerReport.status,r.status)!=0;
+    memcpy(&blockerReport,&r,sizeof(blockerReport)-sizeof(blockerReport.status));
+    uint32_t n=0;while(r.status[n]&&n+1<sizeof(blockerReport.status)){blockerReport.status[n]=r.status[n];++n;}blockerReport.status[n]=0;
+    SpinLockRelease(&lock);
+    if(changed){CompositorMarkDirty();CompositorWake();}
+}
 void FormatServicesStatus(uint64_t now) {
     uint32_t unused=0;Census(&unused);
-    const DebugTaskSnapshot* blocker=nullptr;uint32_t remaining=0;
-    for(uint32_t i=0;i<taskCount;++i)if(!tasks[i].kernel&&tasks[i].state!=ProcessState::Terminated){++remaining;if(!blocker||(tasks[i].pid==tasks[i].tgid&&blocker->pid!=blocker->tgid))blocker=&tasks[i];}
-    char text[96];uint32_t n=0;
-    auto put=[&](const char* x){while(*x&&n<sizeof(text)-1)text[n++]=*x++;};
-    auto num=[&](uint64_t v){char d[21];int k=0;do{d[k++]=char('0'+v%10);v/=10;}while(v&&k<20);while(k&&n<sizeof(text)-1)text[n++]=d[--k];};
-    put("Stopping desktop services");
-    if(blocker){put(" - waiting for ");put(blocker->name);put(" pid ");num(blocker->tgid);
-        if(remaining>1){put(" (+");num(remaining-1);put(" tasks)");}
-        const uint64_t left=serviceStop.MsUntilKill(now);
-        if(left){put(", forcing in ");num((left+999)/1000);put(" s");}else put(", forced");}
-    text[n]=0;
-    SpinLockAcquire(&lock);memcpy(servicesStatus,text,n+1);SpinLockRelease(&lock);
+    ShutdownBlockerReport r{};CollectBlockers(true,nullptr,0,r);
+    if(!r.count){
+        // Remaining user tasks that are not tagged services still block.
+        uint32_t remaining=0;
+        for(uint32_t i=0;i<taskCount;++i)if(!tasks[i].kernel&&tasks[i].state!=ProcessState::Terminated)++remaining;
+        r.count=remaining;
+    }
+    Text t{r.status,sizeof(r.status)};
+    t.put("Stopping desktop services");
+    if(r.listed){t.put(" - waiting for ");PutBlockers(t,r,3);}
+    else if(r.count){t.put(" - waiting for ");t.num(r.count);t.put(" tasks");}
+    const uint64_t left=serviceStop.MsUntilKill(now);r.nextSignalMs=left;
+    if(r.count){if(left){t.put(", forcing in ");t.num((left+999)/1000);t.put(" s");}else t.put(", forced");}
+    Publish(r,"services");
 }
-void StopServices(int signal=15) {
-    uint32_t unused=0;Census(&unused);
+// Signals each live process group of one kind once, through an incarnation-
+// checked member (preferring one that does not mask SIGTERM). Application
+// groups that own an open window (owners) are never signalled.
+uint32_t SignalGroups(bool services,int signal,const uint32_t* owners,uint32_t ownerCount,bool log) {
+    uint32_t unused=0;Census(&unused);uint32_t sent=0;
     for(uint32_t i=0;i<taskCount;++i) {
-        const auto& t=tasks[i];if(!t.pid||t.kernel||!t.systemService||t.state==ProcessState::Terminated)continue;
-        bool prior=false;
-        for(uint32_t j=0;j<i;++j)if(!tasks[j].kernel&&tasks[j].systemService&&tasks[j].state!=ProcessState::Terminated&&tasks[j].tgid==t.tgid&&tasks[j].groupIncarnation==t.groupIncarnation)prior=true;
-        if(prior)continue;
+        const auto& t=tasks[i];if(!Member(t,services)||!FirstOfGroup(i,services))continue;
+        if(!services&&OwnsWindow(t,owners,ownerCount))continue;
         Process* recipient=nullptr;
         for(uint32_t j=i;j<taskCount;++j) {
             const auto& member=tasks[j];
-            if(member.kernel||!member.systemService||member.state==ProcessState::Terminated||member.tgid!=t.tgid||member.groupIncarnation!=t.groupIncarnation)continue;
+            if(!Member(member,services)||member.tgid!=t.tgid||member.groupIncarnation!=t.groupIncarnation)continue;
             auto* p=SchedulerFindProcessReference(member.pid);
             if(!p)continue;
-            if(p->incarnation!=member.incarnation||p->isKernelThread||p->lifecycleRole!=ProcessLifecycleRole::Service||p->state==ProcessState::Terminated){ProcessUnref(p);continue;}
+            const bool service=p->lifecycleRole==ProcessLifecycleRole::Service;
+            if(p->incarnation!=member.incarnation||p->isKernelThread||service!=services||p->state==ProcessState::Terminated){ProcessUnref(p);continue;}
             const bool unmasked=!(__atomic_load_n(&p->sigMask,__ATOMIC_ACQUIRE)&(1ULL<<14));
             if(!recipient||unmasked){if(recipient)ProcessUnref(recipient);recipient=p;}else ProcessUnref(p);
             if(unmasked)break;
         }
         if(recipient){
-            SerialPrintf("shutdown: service %s pid=%u signal=%d\n",t.name,t.tgid,signal);
-            ProcessSendSignal(recipient,signal);ProcessUnref(recipient);}
+            if(log)SerialPrintf("shutdown: %s %s pid=%u signal=%d\n",services?"service":"windowless",t.name,t.tgid,signal);
+            ProcessSendSignal(recipient,signal);
+            // A stopped process acts on SIGTERM only once continued.
+            if(!services&&signal==15&&recipient->state==ProcessState::Stopped)ProcessSendSignal(recipient,18);
+            ProcessUnref(recipient);++sent;}
     }
+    return sent;
+}
+void StopServices(int signal=15) {SignalGroups(true,signal,nullptr,0,true);}
+// Closing phase: bounded escalation for processes that have no window to
+// answer the advisory close, and the status naming what still blocks.
+void UpdateClosing(int selected,bool captured,uint32_t windows,uint32_t apps,uint64_t now) {
+    uint32_t owners[WM_MAX_WINDOWS*2];uint32_t ownerCount=0;
+    SpinLockAcquire(&lock);ownerCount=windowOwnerCount;memcpy(owners,windowOwners,ownerCount*sizeof(owners[0]));SpinLockRelease(&lock);
+    const bool dispatching=WmLauncherDispatching();
+    const bool eligible=captured&&!windows&&apps&&!dispatching;
+    const auto action=windowless.Poll(now,eligible);
+    if(action!=WindowlessStopPolicy::Action::None) {
+        // Recheck from this thread: a window opened since the compositor's
+        // last poll cancels this step and restarts the grace period.
+        uint64_t tick=0;const uint32_t count=WmSnapshotDebugWindows(workerWindows,WM_MAX_WINDOWS,&tick);
+        bool open=false;for(uint32_t i=0;i<count;++i)if(!workerWindows[i].providerKernel&&workerWindows[i].focusable)open=true;
+        SpinLockAcquire(&lock);const bool cancelled=operations[selected].cancel;SpinLockRelease(&lock);
+        if(open)windowless.Reset();
+        else if(!cancelled) {
+            const bool term=action==WindowlessStopPolicy::Action::Term;
+            const bool first=term||windowless.since==windowless.lastKill;
+            ShutdownBlockerReport named{};CollectBlockers(false,owners,ownerCount,named);
+            if(first){
+                char text[160];Text t{text,sizeof(text)};PutBlockers(t,named,4);
+                if(term)KLog("shutdown: no window for %u s; SIGTERM to %s",unsigned(WindowlessStopPolicy::GraceMs/1000),text);
+                else KLog("shutdown: still running %u s after SIGTERM; SIGKILL to %s",unsigned(WindowlessStopPolicy::KillMs/1000),text);
+            }
+            SignalGroups(false,term?15:9,owners,ownerCount,first);
+        }
+    }
+    uint32_t unused=0;Census(&unused);
+    ShutdownBlockerReport r{};CollectBlockers(false,owners,ownerCount,r);
+    Text t{r.status,sizeof(r.status)};const char* stage="waiting";
+    t.put("Closing apps - ");
+    if(windows) {
+        stage="windows";t.num(windows);t.put(windows==1?" window open":" windows open");
+        if(r.listed){t.put("; waiting for ");PutBlockers(t,r,3);}
+        t.put("; resolve save dialogs, or Cancel");
+    }else if(r.count) {
+        t.put("no window: ");PutBlockers(t,r,3);t.put("; ");
+        r.nextSignalMs=windowless.MsUntilNext(now);stage=windowless.StageName();
+        if(windowless.stage==WindowlessStopPolicy::Stage::Grace){t.put("SIGTERM in ");t.num((r.nextSignalMs+999)/1000);t.put(" s");}
+        else if(windowless.stage==WindowlessStopPolicy::Stage::Terminated){t.put("SIGKILL in ");t.num((r.nextSignalMs+999)/1000);t.put(" s");}
+        else if(windowless.stage==WindowlessStopPolicy::Stage::Killed)t.put("killed, waiting for exit");
+        else t.put(dispatching?"waiting for an app launch":"waiting for window close");
+        t.put(", or Cancel");
+    }else if(dispatching) {stage="draining";t.put("waiting for an app launch, or Cancel");}
+    else if(DebugJobsActive()) {stage="draining";t.put("waiting for bridge job output, or Cancel");}
+    else t.put("resolve save dialogs, or Cancel");
+    Publish(r,stage);
+}
+void FormatCleanupStatus(const ProcessCleanupStatus& c,bool closed,uint32_t births) {
+    ShutdownBlockerReport r{};uint32_t unused=0;Census(&unused);CollectBlockers(false,nullptr,0,r);
+    ShutdownBlockerReport services{};CollectBlockers(true,nullptr,0,services);
+    for(uint32_t i=0;i<services.listed&&r.listed<4;++i)r.entries[r.listed++]=services.entries[i];
+    r.count+=services.count;
+    Text t{r.status,sizeof(r.status)};t.put("Waiting for process cleanup");
+    if(r.listed){t.put(" - ");PutBlockers(t,r,3);}
+    t.put(" (address spaces ");t.num(c.liveUserAddressSpaces);t.put(", queued ");t.num(c.queuedProcesses+c.queuedAddressSpaces);
+    t.put(", finalizers ");t.num(c.activeFinalizers);if(!closed||births){t.put(", births ");t.num(births);}t.put(")");
+    Publish(r,"cleanup");
 }
 void Worker(void*) {
     for(;;) {
@@ -139,10 +258,12 @@ void Worker(void*) {
         if(selected<0||!ready||!Active(op.phase)){SchedulerSleepMs(25);continue;}
         if(op.phase==Phase::Closing) {
             if(op.cancel&&!polling) {
+                windowless.Reset();
                 SchedulerSetUserBirthClosed(false);WmSetLaunchInhibited(false);DebugJobsSetLaunchInhibited(false);
                 SetPhase(selected,Phase::Cancelled);continue;
             }
             uint32_t apps=0;Census(&apps);
+            if(!op.cancel){UpdateClosing(selected,captured,windows,apps,ApicTickCount());Census(&apps);}
             if(!op.cancel&&captured&&!windows&&!apps&&!WmLauncherDispatching()&&!DebugJobsActive()) {
                 SchedulerSetUserBirthClosed(true);
                 bool closed=false;uint32_t births=0;SchedulerUserBirthStatus(&closed,&births);
@@ -171,6 +292,7 @@ void Worker(void*) {
         }else if(op.phase==Phase::Cleanup) {
             bool closed=false;uint32_t births=0;SchedulerUserBirthStatus(&closed,&births);
             const auto cleanup=ProcessGetCleanupStatus();uint32_t apps=0;
+            FormatCleanupStatus(cleanup,closed,births);
             if(closed&&!births&&!Census(&apps)&&!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers) {
 #if defined(BROOK_SSD_GUARDED_DESKTOP_RESET_TEST) || defined(BROOK_SSD_GUARDED_DESKTOP_RESET)
                 // The clean-marker transaction may fail after an uncertain
@@ -283,7 +405,9 @@ ShutdownPowerCapabilities ShutdownGetPowerCapabilities() {
     return {workerStarted,powerRestart,powerOff,plan.ResetMethod(),plan.PowerOffMethod(),plan.ResetReason(),plan.PowerOffReason()};
 }
 void ShutdownStart() {
-    auto* worker=KernelThreadCreate("shutdown",Worker,nullptr,3);
+    // High priority: the worker mostly sleeps, but escalation deadlines and
+    // Cancel must not wait behind the CPU-bound processes it is stopping.
+    auto* worker=KernelThreadCreate("shutdown",Worker,nullptr,1);
     if(worker){if(PlatformPowerGetPlan().efiEntry)worker->cpuAffinity=0;workerStarted=true;SchedulerAddProcess(worker);}
 }
 bool ShutdownLaunchAllowed() {
@@ -306,7 +430,8 @@ void HandleShutdownCommand(const char* id,const char* verb,char state[24],int* e
             op.automatic=automatic;op.acLoss=acLoss;
             // Admission closes under the launch/job locks before the worker can
             // observe this operation. Already dispatched work is awaited.
-            current=found;closeCaptured=false;guiRemaining=0;admissionReady=false;admitted=true;
+            current=found;closeCaptured=false;guiRemaining=0;windowOwnerCount=0;admissionReady=false;admitted=true;
+            windowless.Reset();memset(&blockerReport,0,sizeof(blockerReport));
         }
     }else if(!start&&strcmp(verb,"power_status")&&strcmp(verb,"cancel")&&strcmp(verb,"commit")){result="unsupported";*error=-95;}
     if(!result&&found<0){result="missing";*error=-2;}
@@ -342,10 +467,13 @@ void ShutdownDesktopCancel() {
     char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
     if(id[0]){char state[24];int error;ShutdownCommand(id,"cancel",state,&error);if(!error)__atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);}
 }
-static const char* DescribePhase(Phase phase,bool restart) {
+static const char* DescribePhase(Phase phase,bool restart,bool live=false,bool cancelling=false) {
+    // live: this is the current request, so the worker's detailed status applies.
+    if(phase==Phase::Closing&&cancelling)return "Cancelling - reopening the desktop";
+    if(live&&(phase==Phase::Closing||phase==Phase::Services||phase==Phase::Cleanup)&&blockerReport.status[0])return blockerReport.status;
     switch(phase) {
     case Phase::Closing:return "Closing apps - resolve save dialogs, or Cancel";
-    case Phase::Services:return servicesStatus[0]?servicesStatus:"Stopping desktop services";
+    case Phase::Services:return "Stopping desktop services";
     case Phase::Cleanup:return "Waiting for process cleanup";
     case Phase::Syncing:return "Saving filesystem changes";
     case Phase::Ready:return restart?"Ready to restart":powerOff?"Ready to power off":"Safe to power off manually";
@@ -356,15 +484,31 @@ static const char* DescribePhase(Phase phase,bool restart) {
     }
 }
 const char* ShutdownRequestStatus(const char* id) {
-    Phase phase=Phase::Empty;bool restart=false;
+    Phase phase=Phase::Empty;bool restart=false,live=false,cancelling=false;
     SpinLockAcquire(&lock);
-    for(const auto& op:operations)if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;break;}
-    SpinLockRelease(&lock);return DescribePhase(phase,restart);
+    for(int i=0;i<64;++i){const auto& op=operations[i];if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;live=i==current;cancelling=op.cancel;break;}}
+    SpinLockRelease(&lock);return DescribePhase(phase,restart,live,cancelling);
+}
+void ShutdownRequestBlockers(const char* id,ShutdownBlockerReport* out) {
+    memset(out,0,sizeof(*out));
+    Phase phase=Phase::Empty;bool restart=false,live=false,cancelling=false;
+    SpinLockAcquire(&lock);
+    for(int i=0;i<64;++i){const auto& op=operations[i];if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;live=i==current;cancelling=op.cancel;break;}}
+    const bool detailed=live&&!cancelling&&(phase==Phase::Closing||phase==Phase::Services||phase==Phase::Cleanup)&&blockerReport.status[0];
+    if(detailed)memcpy(out,&blockerReport,sizeof(*out));
+    else {
+        const char* stage=phase==Phase::Closing&&cancelling?"cancelling":Name(phase);
+        unsigned i=0;while(stage[i]&&i+1<sizeof(out->stage)){out->stage[i]=stage[i];++i;}
+        const char* text=DescribePhase(phase,restart,false,cancelling);
+        i=0;while(text[i]&&i+1<sizeof(out->status)){out->status[i]=text[i];++i;}
+    }
+    out->status[sizeof(out->status)-1]=0;
+    SpinLockRelease(&lock);
 }
 const char* ShutdownDesktopStatus() {
     SpinLockAcquire(&lock);const auto phase=current<0?Phase::Empty:operations[current].phase;
-    const bool restart=current>=0&&operations[current].restart;SpinLockRelease(&lock);
-    if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart);
+    const bool restart=current>=0&&operations[current].restart,cancelling=current>=0&&operations[current].cancel;SpinLockRelease(&lock);
+    if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart,true,cancelling);
     const auto* notice=__atomic_load_n(&desktopNotice,__ATOMIC_ACQUIRE);return notice?notice:"Applications";
 }
 void ShutdownCompositorPoll() {
@@ -393,7 +537,13 @@ void ShutdownCompositorPoll() {
         const int error=WmApplyDebugAction(target.id,target.incarnation,WmDebugAction::Close,0,&result,&method);
         if(error!=-11)target.sent=true;
     }
-    uint32_t remaining=0;for(uint32_t i=0;i<count;++i)if(!windows[i].providerKernel&&windows[i].focusable)++remaining;
-    SpinLockAcquire(&lock);closePolling=false;if(current==selected&&operations[selected].phase==Phase::Closing){closeCaptured=true;guiRemaining=remaining;}SpinLockRelease(&lock);
+    uint32_t remaining=0,owners[WM_MAX_WINDOWS*2];uint32_t ownerCount=0;
+    for(uint32_t i=0;i<count;++i)if(!windows[i].providerKernel&&windows[i].focusable) {
+        ++remaining;
+        const uint32_t ids[2]={windows[i].clientPid,windows[i].providerPid};
+        for(const uint32_t pid:ids){if(!pid)continue;bool seen=false;for(uint32_t j=0;j<ownerCount;++j)if(owners[j]==pid)seen=true;if(!seen&&ownerCount<WM_MAX_WINDOWS*2)owners[ownerCount++]=pid;}
+    }
+    SpinLockAcquire(&lock);closePolling=false;if(current==selected&&operations[selected].phase==Phase::Closing){closeCaptured=true;guiRemaining=remaining;
+        memcpy(windowOwners,owners,ownerCount*sizeof(owners[0]));windowOwnerCount=ownerCount;}SpinLockRelease(&lock);
 }
 }
