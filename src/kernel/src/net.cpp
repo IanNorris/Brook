@@ -3429,10 +3429,14 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     if (!g_sockUsed[sockIdx]) return -1;
 
     Socket& s = g_sockets[sockIdx];
+    // As in Linux, INADDR_ANY as a destination means this host. Ad-blocking
+    // resolvers answer 0.0.0.0; sending that SYN to the gateway left
+    // Chromium's connects hanging instead of being refused immediately.
+    const uint32_t destination = addr->sin_addr ? addr->sin_addr : htonl(0x7f000001);
 
     // UDP connect: just set default destination
     if (s.type == SOCK_DGRAM) {
-        s.remoteIp   = addr->sin_addr;
+        s.remoteIp   = destination;
         s.remotePort = addr->sin_port;
         s.connected  = true;
         // Auto-bind if not yet bound
@@ -3463,7 +3467,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         ++g_tcpAsyncEpoch[sockIdx];
     }
 
-    s.remoteIp   = addr->sin_addr;
+    s.remoteIp   = destination;
     s.remotePort = addr->sin_port; // already big-endian
 
     // Auto-bind local port
