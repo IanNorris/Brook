@@ -3016,11 +3016,18 @@ static void CompositorHandleMouseWM()
         // If launcher is open, check launcher panel first
         if (WmLauncherVisible())
         {
+            // Launcher presses act on the press. A tap's release can arrive in
+            // the same pass; consume it here too, or the next tap (such as
+            // Cancel on the power prompt) reads as a held button and is lost.
+            const auto launcherPressDone=[&] {
+                if(releaseLatched&&!polledDown){g_wmPrimaryDown=false;g_wmLastBtnDown=false;}
+                else g_wmLastBtnDown=btnDown;
+            };
             int launcherIdx = WmLauncherHitTest(mx, my, g_physFbWidth, g_physFbHeight);
             if (launcherIdx >= 0)
             {
                 WmLauncherExec(launcherIdx);
-                g_wmLastBtnDown = btnDown;
+                launcherPressDone();
                 return;
             }
             // Check if clicking the Apps button again (toggle off)
@@ -3028,12 +3035,12 @@ static void CompositorHandleMouseWM()
             if (tbIdx == -3)
             {
                 WmLauncherToggle();
-                g_wmLastBtnDown = btnDown;
+                launcherPressDone();
                 return;
             }
             // Clicked elsewhere — close launcher
             WmLauncherToggle();
-            g_wmLastBtnDown = btnDown;
+            launcherPressDone();
             return;
         }
 
