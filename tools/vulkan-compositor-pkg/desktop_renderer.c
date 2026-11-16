@@ -84,6 +84,9 @@ struct PendingDesktopFrame {
     /* Pipelined: an older in-flight frame failed, so this frame's success
      * must not re-establish the change-tracking baseline. */
     int tainted;
+    /* Presents more than the carry slack beyond its own damage: the next
+     * frame waits for it instead of carrying its regions (desktop_pipeline.h). */
+    int carryExcess;
     uint32_t statsLayers,statsDraws;uint64_t statsShaded,statsDamage;
     struct DesktopOverlayFrameState overlay;
     uint64_t traceStart,traceSubmitStart,traceReceived,traceCompleted,statsSubmitStart,statsFence;uint32_t traceWindow;uint64_t traceIncarnation,traceCommit;
@@ -124,6 +127,8 @@ static uint64_t g_lastPresentNs;
 static uint64_t g_idlePollNs=16000000ull;
 enum { DESKTOP_KEEPALIVE_NS=200000000ull };
 static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
+/* BROOK_RENDER_CARRY_SLACK (desktop_pipeline_carry_slack). */
+static const char *g_carrySlack;
 /* Keep unchanged window chrome (kernel keyed capture); BROOK_RENDER_CHROME_KEEP=0 disables. */
 static int g_chromeKeep=1;
 static struct {unsigned long long keeps,keepMisses,captures,bytesCopied;} g_chromeStats;
@@ -1097,6 +1102,13 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         uint32_t skipped=0;uint64_t skippedBytes=0;
         for(unsigned i=0;i<layers.count;++i)if(skipMask&(1u<<i)){++skipped;skippedBytes+=layers.layers[i].bytes;}
         uint64_t now=monotonic_ns();
+        /* Own damage as it would be presented (aligned) against what this
+         * frame presents, the difference being carried from older frames. */
+        uint64_t ownPixels=0,regionPixels=0;
+        {struct DesktopDamageSet ownAligned;const struct DesktopDamageSet *o=&own;
+         if(own.count && desktop_graphics_damage(&own,width,height,&ownAligned))o=&ownAligned;
+         for(uint32_t i=0;i<o->count;++i)ownPixels+=(uint64_t)(o->rects[i].right-o->rects[i].left)*(uint64_t)(o->rects[i].bottom-o->rects[i].top);
+         for(uint32_t i=0;i<regionBatch.count;++i)regionPixels+=(uint64_t)regionBatch.regions[i].width*regionBatch.regions[i].height;}
         *pending=(struct PendingDesktopFrame){.ticket=ticket,.frame=frame,.started=now,.traceStart=timing[0],
             .traceSubmitStart=traceSubmitStart,.statsSubmitStart=statsSubmitStart,.traceReceived=traceReceived,.traceWindow=traceWindow,.traceIncarnation=traceIncarnation,.traceCommit=traceCommit,
             .traceChannel=traceChannel,.traceQuery=traceQuery,.traceClients=timing[1],.traceBackdrop=timing[2],.traceChrome=chromeEndNs,.traceOverlay=timing[3],
@@ -1107,7 +1119,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,
             .drawPixels=quadUsed?plan_draw_pixels(ctx->plan):0,.drawPartial=ringImage>=0?ringDrawPartial:attemptPartial,
             .statsLayers=traceLayers,.statsDraws=statsDraws,.statsShaded=statsShaded,.statsDamage=statsDamage,
-            .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay};
+            .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay,
+            .carryExcess=attemptPartial && desktop_pipeline_carry_excess(ownPixels,regionPixels,desktop_pipeline_carry_slack(g_carrySlack,width,height))};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
         return 1;
     }
@@ -1552,13 +1565,16 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
             if(pipelined){
                 struct DesktopPipelineInFlight flights[BROOK_GPU_HANDOFF_MAX_DEPTH];unsigned older=depth;
                 for(unsigned j=0;j<depth;++j){flights[j]=(struct DesktopPipelineInFlight){pending[j].ticket,pending[j].partial,
-                    pending[j].regions.count,pending[j].ticket && ctx[j].track && ctx[j].track->valid && !pending[j].tainted};
+                    pending[j].regions.count,pending[j].ticket && ctx[j].track && ctx[j].track->valid && !pending[j].tainted,
+                    pending[j].carryExcess};
                     if(pending[j].ticket)older=j;}
                 const enum DesktopPipelineAdmit admit=desktop_pipeline_admit(g_pipeline,flights,depth,lastPresentedTicket);
                 /* Count each in-flight frame waited behind once. */
-                if(admit==DESKTOP_PIPELINE_WAIT_FULL || admit==DESKTOP_PIPELINE_WAIT_BASELINE){
+                if(admit==DESKTOP_PIPELINE_WAIT_FULL || admit==DESKTOP_PIPELINE_WAIT_BASELINE || admit==DESKTOP_PIPELINE_WAIT_CARRY){
                     if(older<depth && waitedTicket!=pending[older].ticket){waitedTicket=pending[older].ticket;
-                        if(admit==DESKTOP_PIPELINE_WAIT_FULL)++g_stats.pipeline.waitFull;else ++g_stats.pipeline.waitBaseline;}
+                        if(admit==DESKTOP_PIPELINE_WAIT_FULL)++g_stats.pipeline.waitFull;
+                        else if(admit==DESKTOP_PIPELINE_WAIT_CARRY)++g_stats.pipeline.waitCarry;
+                        else ++g_stats.pipeline.waitBaseline;}
                     break;
                 }
                 if(admit==DESKTOP_PIPELINE_WAIT_DEPTH)break;
@@ -1636,10 +1652,11 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
     }
     fprintf(stderr,"DESKTOP_ASYNC_STOP frames=%u partial=%u retries=%u max_active=%u interval_over_250ms=%u max_interval_ms=%lu unsupported_retries=%u idle_busy_retries=%u depth=%u full_waits=%u full_wait_ns=%llu\n",
         frames,partialFrames,retries,maxActive,gaps,(unsigned long)maxInterval,unsupportedRetries,idleBusyRetries,depth,fullWaits,(unsigned long long)fullWaitNs);
-    fprintf(stderr,"DESKTOP_PIPELINE_COUNTS pipeline=%u async_present=%d submitted_in_flight=%llu/%llu/%llu carried=%llu rebased=%llu wait_full=%llu wait_baseline=%llu overlay_adopted=%llu full_forced=%llu no_baseline=%llu in_flight=%llu other=%llu\n",
+    fprintf(stderr,"DESKTOP_PIPELINE_COUNTS pipeline=%u async_present=%d submitted_in_flight=%llu/%llu/%llu carried=%llu rebased=%llu wait_full=%llu wait_baseline=%llu wait_carry=%llu overlay_adopted=%llu full_forced=%llu no_baseline=%llu in_flight=%llu other=%llu\n",
         g_pipeline,g_asyncPresent,(unsigned long long)g_stats.pipeline.submitted[0],(unsigned long long)g_stats.pipeline.submitted[1],
         (unsigned long long)g_stats.pipeline.submitted[2],(unsigned long long)g_stats.pipeline.carried,(unsigned long long)g_stats.pipeline.rebased,
-        (unsigned long long)g_stats.pipeline.waitFull,(unsigned long long)g_stats.pipeline.waitBaseline,(unsigned long long)g_stats.pipeline.overlayAdopted,(unsigned long long)g_stats.fullForced.total,
+        (unsigned long long)g_stats.pipeline.waitFull,(unsigned long long)g_stats.pipeline.waitBaseline,(unsigned long long)g_stats.pipeline.waitCarry,
+        (unsigned long long)g_stats.pipeline.overlayAdopted,(unsigned long long)g_stats.fullForced.total,
         (unsigned long long)g_stats.fullForced.noBaseline,(unsigned long long)g_stats.fullForced.inFlight,(unsigned long long)g_stats.fullForced.other);
     return limit && frames!=limit?1:0;
 }
@@ -1697,6 +1714,7 @@ int main(int argc,char **argv){
     const char *compose=getenv("BROOK_RENDER_COMPOSE");
     g_quadMode=!(compose && !strcmp(compose,"compute"));
     g_quadOcclusion=!getenv("BROOK_RENDER_QUAD_NO_OCCLUSION");
+    g_carrySlack=getenv("BROOK_RENDER_CARRY_SLACK");
     g_chromeHoles=!getenv("BROOK_RENDER_CHROME_FULL");
     {const char *keep=getenv("BROOK_RENDER_CHROME_KEEP");g_chromeKeep=!(keep && keep[0]=='0');}
     {const char *keep=getenv("BROOK_RENDER_CLIENT_KEEP");g_clientKeep=!(keep && keep[0]=='0');}
