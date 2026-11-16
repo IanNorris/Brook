@@ -125,8 +125,10 @@ static SynapticsCaps        g_synCaps;
 static uint8_t              g_synMode = 0;
 static uint8_t              g_synModeReadback = 0;
 static bool                 g_synAgm = false;
-// Raw 3-byte replies: identify, capabilities, ext 0x09, ext 0x0c, modes; bit i of g_synRawValid set when reply i was read.
-static uint8_t              g_synRaw[5][3];
+// Raw 3-byte replies: identify, capabilities, ext 0x09, ext 0x0c, modes, max
+// coords 0x0d, min coords 0x0f; bit i of g_synRawValid set when reply i was read.
+static uint8_t              g_synRaw[MouseTouchpadRawReplies][3];
+static SynapticsRange       g_synRange;
 static uint8_t              g_synRawValid = 0;
 static const char*          g_synReason = "not attempted";
 static SynapticsGesture     g_synGesture;
@@ -138,6 +140,12 @@ static IrqSpinLock          g_synLock;
 static SynapticsTap         g_synTap;
 static uint8_t              g_synPhysButtons = 0;   // physical buttons as last reported
 volatile uint64_t           g_touchpadTapDeadline = 0;
+// Raw packet trace (debug bridge "input touchpad trace"): a ring of the most
+// recent packets, written under g_synLock only while g_synTraceOn.
+static volatile bool        g_synTraceOn = false;
+static MouseTouchpadTraceEntry g_synTrace[MouseTouchpadTraceCapacity];
+static uint32_t             g_synTraceTotal = 0;
+static uint64_t             g_synTraceStartMs = 0;
 
 // 4-byte packet assembly for IntelliMouse modes.
 static uint8_t  g_packetBuf[6];
@@ -227,6 +235,13 @@ static void SynapticsByte(uint8_t data)
     const SynapticsPacket p = SynapticsDecodePacket(g_packetBuf, g_synCaps.clickpad());
     const auto flags = IrqSpinLockAcquire(&g_synLock);
     const SynapticsOutput o = g_synGesture.Feed(p);
+    if (g_synTraceOn) {
+        auto& e = g_synTrace[g_synTraceTotal % MouseTouchpadTraceCapacity];
+        e.ms = static_cast<uint32_t>(ApicTickCount() - g_synTraceStartMs);
+        for (int i = 0; i < 6; ++i) e.bytes[i] = g_packetBuf[i];
+        e.buttons = o.buttons;
+        ++g_synTraceTotal;
+    }
     if (p.w != 2) {   // extended (second-finger) packets carry no contact summary
         EmitTapSteps(g_synTap.Feed(SynapticsTapInputFrom(p, g_synGesture, ApicTickCount())));
         g_synGesture.SetTapDrag(g_synTap.Dragging());
@@ -494,6 +509,11 @@ static bool SynapticsQueryAll(SynapticsCaps& caps)
     if (caps.extRequests() >= 1 && SynRawQuery(2, SynQueryExtCap, r)) caps.ext = SynapticsWord(r);
     if (caps.extRequests() >= 4 && SynRawQuery(3, SynQueryExtCap0C, r)) caps.ext0c = SynapticsWord(r);
     g_synCaps = caps;
+    // Coordinate range for the clickpad button areas (Linux synaptics_resolution).
+    uint8_t mx[3], mn[3];
+    const bool haveMax = caps.maxCoords() && SynRawQuery(5, SynQueryMaxCoords, mx);
+    const bool haveMin = caps.minCoords() && SynRawQuery(6, SynQueryMinCoords, mn);
+    g_synRange = SynapticsDecodeRange(haveMax ? mx : nullptr, haveMin ? mn : nullptr);
     return true;
 }
 
@@ -509,6 +529,13 @@ static bool SynapticsTryEnable()
     g_synModeReadback = r[2];
     if (!(r[2] & SynModeAbsolute)) { g_synReason = "absolute mode not confirmed"; (void)SynSetMode(0); return false; }
     g_synMode = mode;
+    {
+        const auto lockFlags = IrqSpinLockAcquire(&g_synLock);
+        auto cfg = g_synGesture.Config();
+        SynapticsSetButtonAreas(cfg, g_synRange, caps.clickpad());
+        g_synGesture.SetConfig(cfg);
+        IrqSpinLockRelease(&g_synLock, lockFlags);
+    }
     // Advanced gesture mode (image-sensor pads): W=2 packets then report the
     // second finger, used for click-drag with the moving finger. Linux
     // synaptics_set_advanced_gesture_mode: sliced 0x03, then F3 0xC8.
@@ -517,6 +544,10 @@ static bool SynapticsTryEnable()
     SerialPrintf("MOUSE: Synaptics %u.%u model %u caps=0x%06x ext=0x%06x ext0c=0x%06x clickpad=%u agm=%u mode=0x%02x\n",
                  g_synId.major, g_synId.minor, g_synId.model, caps.caps, caps.ext, caps.ext0c,
                  caps.clickpad() ? 1u : 0u, g_synAgm ? 1u : 0u, mode);
+    SerialPrintf("MOUSE: Synaptics range x %d..%d y %d..%d (%s) button strip y<%d split x=%d\n",
+                 g_synRange.xMin, g_synRange.xMax, g_synRange.yMin, g_synRange.yMax,
+                 g_synRange.reportedMax ? "reported" : "nominal",
+                 g_synGesture.Config().buttonTopY, g_synGesture.Config().buttonSplitX);
     return true;
 }
 
@@ -826,9 +857,43 @@ MouseTouchpadStatus MouseTouchpadGetStatus()
     st.tapRejectedPhysical = g_synTap.rejectedPhysical;
     st.tapRejectedPalm = g_synTap.rejectedPalm;
     st.tapRejectedPhantom = g_synTap.rejectedPhantom;
+    st.clicksLeft = g_synGesture.clicksLeft; st.clicksRight = g_synGesture.clicksRight;
+    st.clicksRightArea = g_synGesture.clicksRightArea; st.clicksTwoFinger = g_synGesture.clicksTwoFinger;
+    st.clicksThumbLeft = g_synGesture.clicksThumbLeft;
+    st.clicksStalePos = g_synGesture.clicksStalePos; st.clicksNoPos = g_synGesture.clicksNoPos;
+    st.xMin = g_synRange.xMin; st.xMax = g_synRange.xMax; st.yMin = g_synRange.yMin; st.yMax = g_synRange.yMax;
+    st.rangeReportedMax = g_synRange.reportedMax; st.rangeReportedMin = g_synRange.reportedMin;
+    st.softButtons = g_synGesture.Config().softButtons;
+    st.buttonTopY = g_synGesture.Config().buttonTopY; st.buttonSplitX = g_synGesture.Config().buttonSplitX;
+    st.traceOn = g_synTraceOn; st.traceTotal = g_synTraceTotal;
     st.rawValid = g_synRawValid;
-    for (int i = 0; i < 5; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];
+    for (int i = 0; i < MouseTouchpadRawReplies; ++i) for (int j = 0; j < 3; ++j) st.raw[i][j] = g_synRaw[i][j];
     return st;
+}
+
+void MouseTouchpadTraceStart()
+{
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
+    g_synTraceTotal = 0;
+    g_synTraceStartMs = ApicTickCount();
+    g_synTraceOn = true;
+    IrqSpinLockRelease(&g_synLock, flags);
+}
+
+MouseTouchpadTraceView MouseTouchpadTraceStop()
+{
+    // Taking the lock orders this after any packet being recorded; with the
+    // trace off nothing writes the ring, so the caller may read it unlocked.
+    const auto flags = IrqSpinLockAcquire(&g_synLock);
+    g_synTraceOn = false;
+    MouseTouchpadTraceView v{};
+    v.entries = g_synTrace;
+    v.capacity = MouseTouchpadTraceCapacity;
+    v.total = g_synTraceTotal;
+    v.count = v.total < v.capacity ? v.total : v.capacity;
+    v.first = v.total < v.capacity ? 0 : v.total % v.capacity;
+    IrqSpinLockRelease(&g_synLock, flags);
+    return v;
 }
 
 } // namespace brook
