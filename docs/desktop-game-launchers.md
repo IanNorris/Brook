@@ -277,7 +277,21 @@ the guest's interpreter:
   and started Pulse and the client.
 - **SIGTERM.** Sent during SteamRT setup (host load about 40, so no window
   yet), it cleaned up in 8 s: four leftovers terminated, the Pulse directory
-  removed, and the job drained with zero live tasks. Evidence:
+  removed, and the job drained with zero live tasks.
+
+A third boot (rootless-3 bundle) checked the container `/etc`. The guest's
+`/ETC/MACHINE-ID` is the placeholder, so the launcher created a private ID
+(`machine_id: private`). A stand-in helper (`BROOK_STEAM_HELPER`) printed the
+files in the outer container and then inside a real `srt-client-container`
+(pressure-vessel, 16 s).
+- **Machine ID.** Both containers had the same 32-hex ID at `/etc/machine-id`
+  and `/var/lib/dbus/machine-id`. A second launcher run reused that ID.
+- **Imported from the outer container.** pressure-vessel took `/etc/hosts`
+  and `resolv.conf` from it.
+- **Runtime's own copies.** Inside the client container, `/etc/nsswitch.conf`
+  and `/etc/os-release` (steamrt3c) came from the runtime, as expected.
+
+Evidence: `etc-probe-run4.txt` in the evidence directory. Evidence:
 `build/qemu-steam-rootless/evidence/` in the `work/steam-rootless` worktree.
 
 ### Install and Dell test
