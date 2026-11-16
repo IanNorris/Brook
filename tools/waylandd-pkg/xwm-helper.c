@@ -27,7 +27,7 @@ struct xwm {
     struct window *windows;
     xcb_atom_t serial,protocols,delete_window,take_focus,hints,transient,motif;
     xcb_atom_t utf8,name,supporting,supported,active,wm_state;
-    xcb_atom_t time_property,net_state,max_h,max_v,moveresize,change_state;
+    xcb_atom_t time_property,net_state,max_h,max_v,fullscreen,moveresize,change_state;
     xcb_timestamp_t timestamp;
     uint32_t time_counter;
     struct bxwm_message pending_focus;
@@ -81,7 +81,7 @@ static int refresh(struct xwm *wm,struct window *w) {
     }
     w->state.x=geometry->x;w->state.y=geometry->y;
     w->state.width=geometry->width;w->state.height=geometry->height;
-    w->state.flags=(w->state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED))|
+    w->state.flags=(w->state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN))|
         (attributes->override_redirect?BXWM_OVERRIDE:0)|
         (attributes->map_state!=XCB_MAP_STATE_UNMAPPED?BXWM_MAPPED:0)|BXWM_INPUT;
     free(geometry);free(attributes);
@@ -145,23 +145,37 @@ static void protocol_message(struct xwm *wm,xcb_window_t window,xcb_atom_t proto
     event.data.data32[0]=protocol;event.data.data32[1]=timestamp;
     xcb_send_event(wm->xcb,0,window,XCB_EVENT_MASK_NO_EVENT,(const char *)&event);
 }
-static int update_maximized_state(struct xwm *wm,xcb_window_t window,int maximized) {
-    // Preserve states owned by the client or other policies. Refuse to rewrite
-    // a malformed or truncated property rather than silently discarding it.
+/* Replace the atoms in `atoms` (all present or all absent) within
+ * _NET_WM_STATE. Preserve states owned by the client or other policies.
+ * Refuse to rewrite a malformed or truncated property rather than silently
+ * discarding it. */
+static int update_net_state(struct xwm *wm,xcb_window_t window,const xcb_atom_t *atoms,size_t n,int present) {
     xcb_get_property_reply_t *reply=property(wm,window,wm->net_state,4096);
     // A client may have destroyed the X window while its configure was queued.
     if(!reply)return !xcb_connection_has_error(wm->xcb);
     if(reply->bytes_after || (reply->type!=XCB_ATOM_NONE &&
        (reply->type!=XCB_ATOM_ATOM || reply->format!=32))) {free(reply);return 1;}
     const size_t count=(size_t)xcb_get_property_value_length(reply)/sizeof(xcb_atom_t);
-    xcb_atom_t *states=malloc((count+2)*sizeof(*states));
+    xcb_atom_t *states=malloc((count+n)*sizeof(*states));
     if(!states){free(reply);return 0;}
     const xcb_atom_t *old=xcb_get_property_value(reply);size_t used=0;
-    for(size_t i=0;i<count;++i)if(old[i]!=wm->max_h && old[i]!=wm->max_v)states[used++]=old[i];
-    if(maximized && used>4094){free(states);free(reply);return 1;}
-    if(maximized){states[used++]=wm->max_h;states[used++]=wm->max_v;}
+    for(size_t i=0;i<count;++i) {
+        int listed=0;
+        for(size_t j=0;j<n;++j)if(old[i]==atoms[j])listed=1;
+        if(!listed)states[used++]=old[i];
+    }
+    if(present && used+n>4096){free(states);free(reply);return 1;}
+    if(present)for(size_t j=0;j<n;++j)states[used++]=atoms[j];
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,window,wm->net_state,XCB_ATOM_ATOM,32,(uint32_t)used,states);
     free(states);free(reply);return 1;
+}
+static int initial_fullscreen(struct xwm *wm,xcb_window_t window) {
+    xcb_get_property_reply_t *reply=property(wm,window,wm->net_state,4096);int found=0;
+    if (reply && reply->type==XCB_ATOM_ATOM && reply->format==32) {
+        const xcb_atom_t *atoms=xcb_get_property_value(reply);
+        for (int i=0;i<xcb_get_property_value_length(reply)/4;++i) if (atoms[i]==wm->fullscreen) found=1;
+    }
+    free(reply);return found;
 }
 static int command(struct xwm *wm,const struct bxwm_message *message) {
     if (!bxwm_valid(message,wm->generation,0)) return 0;
@@ -171,17 +185,29 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
     switch (message->type) {
     case BXWM_CONFIGURE: {
         w->state.configure_serial=message->configure_serial;
-        unsigned state_mask=BXWM_MAXIMIZED|BXWM_MINIMIZED;
+        unsigned state_mask=BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN;
         unsigned changed=(w->state.flags^message->flags)&state_mask;
         if (changed) {
             w->state.flags=(w->state.flags&~state_mask)|(message->flags&state_mask);
-            if((changed&BXWM_MAXIMIZED) && !update_maximized_state(wm,message->window,(message->flags&BXWM_MAXIMIZED)!=0))return 0;
+            const xcb_atom_t maximized[]={wm->max_h,wm->max_v};
+            if((changed&BXWM_MAXIMIZED) && !update_net_state(wm,message->window,maximized,2,(message->flags&BXWM_MAXIMIZED)!=0))return 0;
+            if((changed&BXWM_FULLSCREEN) && !update_net_state(wm,message->window,&wm->fullscreen,1,(message->flags&BXWM_FULLSCREEN)!=0))return 0;
             uint32_t state[]={(message->flags&BXWM_MINIMIZED)?3:1,XCB_WINDOW_NONE};
             xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,message->window,wm->wm_state,wm->wm_state,32,2,state);
         }
         uint32_t values[]={(uint32_t)message->x,(uint32_t)message->y,message->width,message->height};
         xcb_configure_window(wm->xcb,message->window,XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|
-            XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);break;
+            XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
+        // ICCCM 4.1.5/4.2.3: tell the client its root-relative client-area
+        // geometry even when the request changed nothing on the X side (a
+        // real ConfigureNotify is generated only for an actual change). X
+        // windows are never reparented here, so this matches the real one.
+        xcb_configure_notify_event_t notify={.response_type=XCB_CONFIGURE_NOTIFY,
+            .event=message->window,.window=message->window,.above_sibling=XCB_WINDOW_NONE,
+            .x=(int16_t)message->x,.y=(int16_t)message->y,.width=(uint16_t)message->width,
+            .height=(uint16_t)message->height,.border_width=0,.override_redirect=0};
+        xcb_send_event(wm->xcb,0,message->window,XCB_EVENT_MASK_STRUCTURE_NOTIFY,(const char *)&notify);
+        break;
     }
     case BXWM_FOCUS:
         // Brook already raised this native window. Keep X's hit-test order
@@ -222,7 +248,17 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
         // InputOnly windows do not get native presentation, but still need
         // their ordinary X11 map request honored (grabs/focus/event routing).
         xcb_map_window(wm->xcb,e->window);
-        break;
+        // EWMH: a withdrawn client sets _NET_WM_STATE itself before mapping
+        // (SDL does this for fullscreen windows). Report the initial request,
+        // including its absence, so the native side applies it before the
+        // first frame and a remap without the atom leaves fullscreen.
+        if (w && !refresh(wm,w)) return 0;
+        if (w && !(w->state.flags&BXWM_OVERRIDE)) {
+            struct bxwm_message request=w->state;
+            request.type=BXWM_FULLSCREEN_REQUEST;request.x=initial_fullscreen(wm,e->window);
+            return emit(wm,&request);
+        }
+        return 1;
     }
     case XCB_MAP_NOTIFY:w=track(wm,((xcb_map_notify_event_t *)generic)->window);break;
     case XCB_UNMAP_NOTIFY: {
@@ -237,6 +273,21 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
     case XCB_CONFIGURE_REQUEST: {
         xcb_configure_request_event_t *e=(void *)generic;
         uint32_t values[7];unsigned n=0;
+        // A fullscreen window keeps the output geometry until the native side
+        // leaves fullscreen. Deny the geometry part (ICCCM 4.1.5: answer with
+        // a synthetic ConfigureNotify) but still honour restacking.
+        struct window *full=find(wm,e->window);
+        if (full && (full->state.flags&BXWM_FULLSCREEN) &&
+            (e->value_mask&(XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|XCB_CONFIG_WINDOW_WIDTH|
+                            XCB_CONFIG_WINDOW_HEIGHT|XCB_CONFIG_WINDOW_BORDER_WIDTH))) {
+            xcb_configure_notify_event_t notify={.response_type=XCB_CONFIGURE_NOTIFY,
+                .event=e->window,.window=e->window,.above_sibling=XCB_WINDOW_NONE,
+                .x=(int16_t)full->state.x,.y=(int16_t)full->state.y,.width=(uint16_t)full->state.width,
+                .height=(uint16_t)full->state.height,.border_width=0,.override_redirect=0};
+            xcb_send_event(wm->xcb,0,e->window,XCB_EVENT_MASK_STRUCTURE_NOTIFY,(const char *)&notify);
+            e->value_mask&=~(XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|XCB_CONFIG_WINDOW_WIDTH|
+                             XCB_CONFIG_WINDOW_HEIGHT|XCB_CONFIG_WINDOW_BORDER_WIDTH);
+        }
         if (e->value_mask&XCB_CONFIG_WINDOW_X) values[n++]=(uint32_t)e->x;
         if (e->value_mask&XCB_CONFIG_WINDOW_Y) values[n++]=(uint32_t)e->y;
         if (e->value_mask&XCB_CONFIG_WINDOW_WIDTH) values[n++]=e->width;
@@ -296,6 +347,10 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
                 request.x=(int32_t)e->data.data32[2];
             } else if (e->type==wm->change_state && e->data.data32[0]==3) request.type=BXWM_MINIMIZE;
             else if (e->type==wm->net_state && e->data.data32[0]<=2 &&
+                (e->data.data32[1]==wm->fullscreen || e->data.data32[2]==wm->fullscreen)) {
+                request.type=BXWM_FULLSCREEN_REQUEST;request.x=(int32_t)e->data.data32[0];
+            }
+            else if (e->type==wm->net_state && e->data.data32[0]<=2 &&
                 (e->data.data32[1]==wm->max_h || e->data.data32[1]==wm->max_v ||
                  e->data.data32[2]==wm->max_h || e->data.data32[2]==wm->max_v)) {
                 request.type=BXWM_MAXIMIZE;request.x=(int32_t)e->data.data32[0];
@@ -342,7 +397,7 @@ static int initialize(struct xwm *wm,int wm_fd) {
     wm->active=atom(wm,"_NET_ACTIVE_WINDOW");wm->wm_state=atom(wm,"WM_STATE");
     wm->time_property=atom(wm,"_BROOK_XWM_TIME");
     wm->net_state=atom(wm,"_NET_WM_STATE");wm->max_h=atom(wm,"_NET_WM_STATE_MAXIMIZED_HORZ");
-    wm->max_v=atom(wm,"_NET_WM_STATE_MAXIMIZED_VERT");wm->moveresize=atom(wm,"_NET_WM_MOVERESIZE");
+    wm->max_v=atom(wm,"_NET_WM_STATE_MAXIMIZED_VERT");wm->fullscreen=atom(wm,"_NET_WM_STATE_FULLSCREEN");wm->moveresize=atom(wm,"_NET_WM_MOVERESIZE");
     wm->change_state=atom(wm,"WM_CHANGE_STATE");
     if (!wm->serial || !wm->wm_state) return 0;
     uint32_t mask=XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY|XCB_EVENT_MASK_PROPERTY_CHANGE;
@@ -354,7 +409,8 @@ static int initialize(struct xwm *wm,int wm_fd) {
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supporting,XCB_ATOM_WINDOW,32,1,&wm->support);
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,wm->supporting,XCB_ATOM_WINDOW,32,1,&wm->support);
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,wm->name,wm->utf8,8,9,"Brook XWM");
-    xcb_atom_t supported[]={wm->supporting,wm->name,wm->active,wm->net_state,wm->max_h,wm->max_v,wm->moveresize};
+    xcb_atom_t supported[]={wm->supporting,wm->name,wm->active,wm->net_state,wm->max_h,wm->max_v,
+        wm->fullscreen,wm->moveresize};
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supported,XCB_ATOM_ATOM,32,
         sizeof(supported)/sizeof(supported[0]),supported);
     xcb_flush(wm->xcb);

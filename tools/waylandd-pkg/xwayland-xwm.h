@@ -8,6 +8,14 @@ struct brook_xwindow {
     int native_valid,initial_placement;
     uint64_t native_sequence;
     uint32_t target_width,target_height;
+    /* EWMH fullscreen: wanted follows the X client's requests (kept across a
+     * native unmap so a remapped window returns to fullscreen); fullscreen is
+     * the applied native state. A fullscreen window has no Brook chrome, its
+     * client area at the output origin and exactly the output size, which is
+     * what SDL and similar toolkits assume for coordinates and buffer size. */
+    int want_fullscreen,fullscreen,sent_fullscreen,saved_maximized;
+    int32_t saved_x,saved_y;
+    uint32_t saved_width,saved_height;
 };
 static struct brook_xwindow *g_xwindows;
 static struct bxwm_stream g_xwm_stream;
@@ -49,17 +57,18 @@ static unsigned xwayland_surface_flags(const struct brook_surface *s) {
      * native keyboard focus. Normal X11 windows get movable Brook chrome. */
     if (!s->xwindow) return 0;
     unsigned flags=s->xwindow->state.flags;
+    if (s->xwindow->want_fullscreen) flags|=BXWM_CLIENT_CHROME;
     return ((flags&(BXWM_OVERRIDE|BXWM_CLIENT_CHROME))?BROOK_WM_CREATE_FLAG_CSD:0)|
         ((flags&BXWM_OVERRIDE)?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
 }
 static void xwayland_native_unmapped(struct brook_surface *s) {
     if (!s->xwindow) return;
-    s->xwindow->native_valid=0;s->xwindow->initial_placement=0;
+    s->xwindow->native_valid=0;s->xwindow->initial_placement=0;s->xwindow->fullscreen=0;
     s->xwindow->target_width=s->xwindow->target_height=0;
 }
 static void xwayland_surface_detach(struct brook_surface *s) {
     if (s->xwindow) {
-        s->xwindow->surface=NULL;s->xwindow->native_valid=0;
+        s->xwindow->surface=NULL;s->xwindow->native_valid=0;s->xwindow->fullscreen=0;
         s->xwindow->target_width=s->xwindow->target_height=0;s->xwindow=NULL;
     }
 }
@@ -96,6 +105,9 @@ static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindow
         message.flags&=~(BXWM_MAXIMIZED|BXWM_MINIMIZED);
         if (geometry->flags&BROOK_WINDOW_STATE_MAXIMIZED) message.flags|=BXWM_MAXIMIZED;
         if (geometry->flags&BROOK_WINDOW_STATE_MINIMIZED) message.flags|=BXWM_MINIMIZED;
+        message.flags&=~BXWM_FULLSCREEN;
+        if (w->fullscreen) message.flags|=BXWM_FULLSCREEN;
+        w->sent_fullscreen=w->fullscreen;
         message.x=geometry->client_x;message.y=geometry->client_y;
         message.width=geometry->width;message.height=geometry->height;
         if (w->native_sequence==UINT64_MAX) { g_xwm_failed=1;return 0; }
@@ -109,6 +121,7 @@ static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindow
         (g_xwm_stream.count?WL_EVENT_WRITABLE:0));
     return 1;
 }
+static void xwayland_apply_fullscreen(struct brook_xwindow *w);
 static void xwayland_native_sync(struct brook_surface *s,int initial) {
     if (!s->wm_id || !xwayland_surface_ready(s)) return;
     struct brook_xwindow *w=s->xwindow;BrookWindowState geometry={0};
@@ -137,14 +150,65 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
             geometry.client_x=x;geometry.client_y=y;
         }
     }
-    int changed=!w->native_valid || geometry.client_x!=w->native.client_x ||
+    int changed=!w->native_valid || w->sent_fullscreen!=w->fullscreen || geometry.client_x!=w->native.client_x ||
         geometry.client_y!=w->native.client_y || geometry.width!=w->native.width || geometry.height!=w->native.height ||
         ((geometry.flags^w->native.flags)&(BROOK_WINDOW_STATE_MAXIMIZED|BROOK_WINDOW_STATE_MINIMIZED));
     if (w->native_valid && (geometry.width!=w->native.width || geometry.height!=w->native.height)) {
         w->target_width=geometry.width;w->target_height=geometry.height;
     }
     w->native=geometry;w->native_valid=1;
+    if (initial && w->want_fullscreen && !w->fullscreen) { xwayland_apply_fullscreen(w);return; }
     if (changed) xwayland_send(w,BXWM_CONFIGURE,&geometry);
+}
+static int xwayland_resize_native(struct brook_xwindow *w,uint32_t width,uint32_t height) {
+    struct brook_surface *s=w->surface;
+    if (width==w->native.width && height==w->native.height) return 1;
+    struct brook_wm_create_out out={0};
+    if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) return 0;
+    s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
+    s->vfb_w=width;s->vfb_h=height;
+    // Frames of the old size are not presented into the new extent.
+    w->target_width=width;w->target_height=height;return 1;
+}
+/* Bring the native window to w->want_fullscreen. The geometry then reaches
+ * the X window through the ordinary CONFIGURE path, carrying BXWM_FULLSCREEN
+ * so the XWM publishes the EWMH state. Declined (screen size unavailable,
+ * popup, not yet mapped) requests leave the window as it is; a not-yet-mapped
+ * window applies the wanted state on its first native sync. */
+static void xwayland_apply_fullscreen(struct brook_xwindow *w) {
+    struct brook_surface *s=w->surface;
+    if (!s || !s->wm_id || !w->native_valid || (w->state.flags&BXWM_OVERRIDE) ||
+        !!w->want_fullscreen==!!w->fullscreen) return;
+    uint32_t id=s->wm_id;
+    if (w->want_fullscreen) {
+        uint32_t width=0,height=0;
+        if (wm_get_screen_info(&width,&height) || !width || !height || width>65535 || height>65535) {
+            w->want_fullscreen=0;xwayland_native_sync(s,0);return;
+        }
+        if (w->native.flags&BROOK_WINDOW_STATE_MAXIMIZED) {
+            // The native WM keeps maximized windows in place; restore first
+            // and remember to maximize again when fullscreen ends.
+            (void)wm_set_maximized(id,0);
+            BrookWindowState restored={0};
+            if (syscall(BROOK_SYS_WM_WINDOW_STATE,(long)id,(long)w->native.incarnation,(long)&restored,
+                (long)sizeof(restored),0L,0L)<0 || restored.version!=BROOK_WINDOW_STATE_VERSION) { g_xwm_failed=1;return; }
+            w->native=restored;w->saved_maximized=1;
+        } else w->saved_maximized=0;
+        w->saved_x=w->native.client_x;w->saved_y=w->native.client_y;
+        w->saved_width=w->native.width;w->saved_height=w->native.height;
+        if (wm_set_decoration_mode(id,1,0,0)<0 ||
+            syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)id,(long)w->native.incarnation,0L,0L,0L,0L)<0 ||
+            !xwayland_resize_native(w,width,height)) { g_xwm_failed=1;return; }
+        w->fullscreen=1;
+    } else {
+        w->fullscreen=0;
+        if (wm_set_decoration_mode(id,(w->state.flags&BXWM_CLIENT_CHROME)!=0,0,0)<0 ||
+            !xwayland_resize_native(w,w->saved_width,w->saved_height) ||
+            syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)id,(long)w->native.incarnation,
+                (long)w->saved_x,(long)w->saved_y,0L,0L)<0) { g_xwm_failed=1;return; }
+        if (w->saved_maximized) (void)wm_set_maximized(id,1);
+    }
+    xwayland_native_sync(s,0);
 }
 static void xwayland_surface_created(struct brook_surface *s) {
     xwayland_native_sync(s,1);
@@ -201,10 +265,17 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
         if (w && w->state.identity==message->identity) { *link=w->next;xwayland_unpair(w);free(w); }
         return 1;
     }
+    if (message->type==BXWM_FULLSCREEN_REQUEST) {
+        if (!w || w->state.identity!=message->identity || (w->state.flags&BXWM_OVERRIDE)) return 1;
+        w->want_fullscreen=message->x==2?!w->want_fullscreen:message->x;
+        xwayland_apply_fullscreen(w);return !g_xwm_failed;
+    }
     if (message->type==BXWM_BEGIN_MOVE || message->type==BXWM_BEGIN_RESIZE ||
         message->type==BXWM_MAXIMIZE || message->type==BXWM_MINIMIZE) {
         if (!w || w->state.identity!=message->identity || !w->surface || !w->surface->wm_id ||
             !w->native_valid || !(w->state.flags&BXWM_MAPPED) || (w->state.flags&BXWM_OVERRIDE)) return 1;
+        // Fullscreen owns the geometry; only minimizing is meaningful.
+        if (w->fullscreen && message->type!=BXWM_MINIMIZE) return 1;
         uint32_t id=w->surface->wm_id;
         if (message->type==BXWM_BEGIN_MOVE) (void)wm_begin_move(id);
         if (message->type==BXWM_BEGIN_RESIZE) {
@@ -233,7 +304,7 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
     xwayland_apply_client_geometry(w,message);
     unsigned old_flags=w->state.flags;
     w->state=*message;
-    if (w->surface && w->surface->wm_id &&
+    if (w->surface && w->surface->wm_id && !w->fullscreen &&
         ((old_flags^message->flags)&BXWM_CLIENT_CHROME) && !(message->flags&BXWM_OVERRIDE)) {
         if (wm_set_decoration_mode(w->surface->wm_id,(message->flags&BXWM_CLIENT_CHROME)!=0,0,0,0)<0) {
             g_xwm_failed=1;return 0;

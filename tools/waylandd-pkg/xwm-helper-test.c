@@ -45,6 +45,27 @@ static xcb_timestamp_t wait_protocol(xcb_connection_t *c,xcb_atom_t protocols,xc
     }
     fprintf(stderr,"XWM helper protocol timeout\n");abort();
 }
+/* Wait for a ConfigureNotify on window; synthetic selects SendEvent copies. */
+static xcb_configure_notify_event_t wait_configure(xcb_connection_t *c,xcb_window_t window,int synthetic,
+                                                   unsigned width,unsigned height) {
+    uint64_t deadline=now()+5000;
+    while (now()<deadline) {
+        xcb_generic_event_t *e=xcb_poll_for_event(c);
+        if (e) {
+            xcb_configure_notify_event_t n=*(xcb_configure_notify_event_t *)e;
+            int found=(e->response_type&127)==XCB_CONFIGURE_NOTIFY && n.window==window &&
+                (!synthetic || (e->response_type&0x80)) && n.width==width && n.height==height;
+            free(e);if (found) return n;
+        } else { struct pollfd p={xcb_get_file_descriptor(c),POLLIN,0};assert(poll(&p,1,100)>=0); }
+    }
+    fprintf(stderr,"XWM helper ConfigureNotify timeout\n");abort();
+}
+static int state_has(xcb_connection_t *c,xcb_window_t window,xcb_atom_t net_state,xcb_atom_t wanted) {
+    xcb_get_property_reply_t *r=xcb_get_property_reply(c,xcb_get_property(c,0,window,net_state,XCB_ATOM_ATOM,0,64),NULL);
+    int found=0;assert(r);
+    for (int i=0;i<xcb_get_property_value_length(r)/4;++i) if (((xcb_atom_t *)xcb_get_property_value(r))[i]==wanted) found=1;
+    free(r);return found;
+}
 int main(int argc,char **argv) {
     /* Runner supplies a newly created headless Xvfb display, never DISPLAY. */
     assert(argc==3);int control=atoi(argv[2]);
@@ -230,7 +251,54 @@ int main(int argc,char **argv) {
     receive(control,BXWM_WINDOW,id,0,301,181);
     geometry=xcb_get_geometry_reply(c,xcb_get_geometry(c,id),NULL);
     assert(geometry && geometry->width==301 && geometry->height==181);free(geometry);
+    // EWMH fullscreen. The WM advertises it; a property set before mapping and
+    // later client messages become native requests; the native answer is
+    // published in _NET_WM_STATE with a synthetic root-relative ConfigureNotify;
+    // geometry requests are refused while fullscreen.
+    xcb_atom_t fullscreen=atom(c,"_NET_WM_STATE_FULLSCREEN");
+    xcb_get_property_reply_t *supported_reply=xcb_get_property_reply(c,xcb_get_property(c,0,screen->root,
+        atom(c,"_NET_SUPPORTED"),XCB_ATOM_ATOM,0,64),NULL);
+    int advertised=0;assert(supported_reply);
+    for (int i=0;i<xcb_get_property_value_length(supported_reply)/4;++i)
+        if (((xcb_atom_t *)xcb_get_property_value(supported_reply))[i]==fullscreen) advertised=1;
+    free(supported_reply);assert(advertised);
+    xcb_window_t game=xcb_generate_id(c);uint32_t structure=XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    xcb_create_window(c,XCB_COPY_FROM_PARENT,game,screen->root,0,0,640,360,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,XCB_CW_EVENT_MASK,&structure);
+    xcb_change_property(c,XCB_PROP_MODE_REPLACE,game,net_state,XCB_ATOM_ATOM,32,1,&fullscreen);
+    xcb_map_window(c,game);xcb_flush(c);
+    // The mapped state is published before the request it qualifies.
+    struct bxwm_message full=receive(control,BXWM_WINDOW,game,0,640,360);
+    struct bxwm_message wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==1);
+    full.x=0;full.y=0;full.width=800;full.height=600;full.flags|=BXWM_FULLSCREEN;full.configure_serial=1;
+    send_command(control,full,BXWM_CONFIGURE);
+    xcb_configure_notify_event_t notify=wait_configure(c,game,1,800,600);assert(!notify.x && !notify.y);
+    full=receive(control,BXWM_WINDOW,game,0,800,600);assert(full.flags&BXWM_FULLSCREEN);
+    assert(state_has(c,game,net_state,fullscreen));
+    uint32_t smaller[]={10,20,320,200};
+    xcb_configure_window(c,game,XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,smaller);
+    xcb_flush(c);notify=wait_configure(c,game,1,800,600);assert(!notify.x && !notify.y);
+    geometry=xcb_get_geometry_reply(c,xcb_get_geometry(c,game),NULL);
+    assert(geometry && geometry->width==800 && geometry->height==600 && !geometry->x && !geometry->y);free(geometry);
+    xcb_client_message_event_t toggle={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=game,.type=net_state};
+    toggle.data.data32[0]=0;toggle.data.data32[1]=fullscreen;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&toggle);
+    xcb_flush(c);wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==0);
+    full.flags&=~BXWM_FULLSCREEN;full.x=30;full.y=40;full.width=640;full.height=360;full.configure_serial=2;
+    send_command(control,full,BXWM_CONFIGURE);notify=wait_configure(c,game,1,640,360);
+    assert(notify.x==30 && notify.y==40);receive(control,BXWM_WINDOW,game,0,640,360);
+    assert(!state_has(c,game,net_state,fullscreen));
+    // Unfullscreened windows get their geometry requests again.
+    xcb_configure_window(c,game,XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,smaller);
+    xcb_flush(c);receive(control,BXWM_WINDOW,game,0,320,200);
+    toggle.data.data32[0]=2;toggle.data.data32[1]=0;toggle.data.data32[2]=fullscreen;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&toggle);
+    xcb_flush(c);wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==2);
+    // A remap without the atom reports that absence.
+    xcb_unmap_window(c,game);xcb_map_window(c,game);xcb_flush(c);
+    wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==0);
+    xcb_destroy_window(c,game);
     xcb_disconnect(c);
-    puts("XWM_HELPER_PASS isolated X server: InputOnly, geometry, focus/stack, client chrome/actions, native state, close, reparent and XID reuse");
+    puts("XWM_HELPER_PASS isolated X server: InputOnly, geometry, focus/stack, client chrome/actions, native state, EWMH fullscreen, close, reparent and XID reuse");
     return 0;
 }

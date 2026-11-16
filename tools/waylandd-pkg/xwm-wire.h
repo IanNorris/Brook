@@ -14,10 +14,14 @@ enum {
     BXWM_VERSION=1,
     BXWM_READY=1, BXWM_WINDOW=2, BXWM_DESTROY=3, BXWM_ERROR=4,
     BXWM_BEGIN_MOVE=5, BXWM_MAXIMIZE=6, BXWM_MINIMIZE=7, BXWM_BEGIN_RESIZE=8,
+    /* EWMH _NET_WM_STATE_FULLSCREEN request: x is 0 remove, 1 add, 2 toggle. */
+    BXWM_FULLSCREEN_REQUEST=9,
     BXWM_CONFIGURE=16, BXWM_FOCUS=17, BXWM_CLOSE=18,
     BXWM_MAPPED=1u<<0, BXWM_OVERRIDE=1u<<1, BXWM_INPUT=1u<<2,
     BXWM_CLIENT_CHROME=1u<<3,
     BXWM_MAXIMIZED=1u<<4, BXWM_MINIMIZED=1u<<5,
+    /* Native state, authoritative in CONFIGURE; echoed by WINDOW messages. */
+    BXWM_FULLSCREEN=1u<<6,
     BXWM_QUEUE=64
 };
 struct bxwm_message {
@@ -72,12 +76,13 @@ static int bxwm_valid(const struct bxwm_message *message,uint64_t generation,int
         return message->identity==0 && message->serial==0;
     if (!message->window || !message->identity) return 0;
     if (from_helper && (message->type==BXWM_BEGIN_MOVE || message->type==BXWM_MINIMIZE)) return 1;
-    if (from_helper && message->type==BXWM_MAXIMIZE) return message->x>=0 && message->x<=2;
+    if (from_helper && (message->type==BXWM_MAXIMIZE || message->type==BXWM_FULLSCREEN_REQUEST))
+        return message->x>=0 && message->x<=2;
     if (from_helper && message->type==BXWM_BEGIN_RESIZE) return message->x>=0 && message->x<=7;
     if (from_helper && message->type==BXWM_DESTROY) return 1;
     if (from_helper && message->type==BXWM_WINDOW)
         return message->width && message->height && message->width<=65535 && message->height<=65535 &&
-            !(message->flags&~(BXWM_MAPPED|BXWM_OVERRIDE|BXWM_INPUT|BXWM_CLIENT_CHROME|BXWM_MAXIMIZED|BXWM_MINIMIZED)) &&
+            !(message->flags&~(BXWM_MAPPED|BXWM_OVERRIDE|BXWM_INPUT|BXWM_CLIENT_CHROME|BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN)) &&
             message->title[sizeof(message->title)-1]==0;
     if (!from_helper && message->type==BXWM_CONFIGURE)
         return message->width && message->height && message->width<=65535 && message->height<=65535 &&
