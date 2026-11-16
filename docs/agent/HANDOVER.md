@@ -92,6 +92,15 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Torchlight II runs on gen 423 (rootless Steam with machine-id) but at ~10 displayed fps.** Profile: `display-perf/build/dell/tl2-play-prof/`.
+- **Not CPU- or GPU-bound:** app GPU jobs 11/s at 11 ms; CPU 72% idle; GPU 76% idle.
+- **Its X window reaches the compositor as a CPU source** (`src cpu`, all nondirect frames, ~99 ms mean interval). Xwayland is presenting through SHM/CPU copies, not DRI3 dma-buf.
+- **Kernel profile:** memset 9.3%, likely zero-filling freshly allocated GPU buffers (per-frame BO churn?), and SchedLockRelease 5.5% (see `work/sched-convoy`).
+- **Next:**
+  1. Why Xwayland GL games don't get direct dma-buf presentation (waylandd linux-dmabuf v4 feedback, LINEAR-only, Present/flip vs copy).
+  2. Who allocates and clears buffers per frame (GEM create/zero in the i915 path).
+- The window is 800×600 and tiny; the `work/xwayland-hidpi` fullscreen/DPI changes apply.
+
 **Ready, not deployed: `work/xwayland-hidpi` (`817f8894`, `94b6fd27`, `98c4ff02`).**
 - **Stardew offset cause:** brook-xwm ignored `_NET_WM_STATE_FULLSCREEN`. It now honours EWMH fullscreen (chrome-less, at the output size), sends synthetic ConfigureNotify, and restores the previous state on exit.
 - **HiDPI:** Xft.dpi/XSETTINGS/`-dpi` hints by default; per-app compositor upscale via `BROOK_XWAYLAND_SCALED_APPS` (WM_CLASS list).
