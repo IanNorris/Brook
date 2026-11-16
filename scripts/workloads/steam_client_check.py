@@ -40,6 +40,9 @@ def main():
     parser.add_argument('--pulse-server', help='Optional absolute guest Unix-socket endpoint, unix:/path')
     parser.add_argument('--pulse-cookie', type=Path,
                         help='Optional guest cookie file visible inside SteamRT; requires --pulse-server')
+    parser.add_argument('--library-dir', type=Path, action='append', default=[],
+                        help='Prepend this guest library directory (for example the patched Iris '
+                             'libgallium) to the host and client library paths; repeatable')
     parser.add_argument('--include-log-tail', action='store_true',
                         help='Opt in to exporting bounded raw log text; default reports paths and hashes only')
     args = parser.parse_args()
@@ -79,9 +82,10 @@ def main():
     if available < 1024 ** 3:
         parser.error('need at least 1 GiB unreserved free space for runtime copying and updates')
     corebin = Path('/nix/profile/bin/true').resolve(strict=True).parent
-    host_libraries = ':'.join(map(str, [client / 'hostlibs', client / 'steamrt64', client / 'ubuntu12_64',
+    library_dirs = [path.resolve(strict=True) for path in args.library_dir]
+    host_libraries = ':'.join(map(str, [*library_dirs, client / 'hostlibs', client / 'steamrt64', client / 'ubuntu12_64',
         platform / 'lib/x86_64-linux-gnu', platform / 'usr/lib/x86_64-linux-gnu']))
-    client_libraries = ':'.join(map(str, [client / 'steamrt64', client / 'ubuntu12_64',
+    client_libraries = ':'.join(map(str, [*library_dirs, client / 'steamrt64', client / 'ubuntu12_64',
         client / 'hostlibs', platform / 'lib/x86_64-linux-gnu', platform / 'usr/lib/x86_64-linux-gnu']))
     # GLVND loads its vendor by SONAME. The staged exports can omit this
     # transitive Mesa output even though it is installed in the guest profile.
@@ -141,7 +145,8 @@ def main():
                    companion_launcher_service=True,
                    client_descendant_supervisor=str(supervisor),
                    background_exit_idle_s=2, background_exit_term_s=5,
-                   launch_app=args.launch_app,
+                   launch_app=args.launch_app, display=args.display,
+                   library_dirs=[str(path) for path in library_dirs],
                    note='Existing staged client may contain prior ELF interpreter patches')
     (evidence / 'request.json').write_text(json.dumps(request, indent=2) + '\n')
     print(json.dumps(request), flush=True)

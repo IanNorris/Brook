@@ -85,6 +85,163 @@ No manual signals are needed for that accepted retry. Its transient sign-in
 window resolves automatically without account input. This validates bounded
 exit cleanup, not cooperative CEF shutdown or a game running across Steam exit.
 
+## Rootless Steam on the Dell
+
+The Dell's Steam shortcut runs `/data/home/.local/share/brook/steam/brook-steam`
+(source `scripts/workloads/brook_steam_launcher.py`, with its helper
+`steam-client-check.py` from `scripts/workloads/steam_client_check.py`). Until
+November 2026 it started a nested `Xephyr :14` with `LIBGL_ALWAYS_SOFTWARE=1`.
+With Stardew Valley on gen 419 that path kept the GPU 73% busy with about 286
+tiny jobs/s: the desktop Xwayland's glamor uploading Xephyr's llvmpipe frames
+as images. The compositor was starved to about 18 composites/s while the CPU
+was 59% idle. The software path was chosen when the Dell's desktop Xwayland had
+no GLX ([checkpoint](steam-dell-software-glx-checkpoint.md)).
+
+### What the desktop Xwayland offers
+
+`waylandd --xwayland … --xdisplay :0` starts Xwayland with `-rootless -wm FD
+-displayfd FD -nolisten tcp -noreset -ac -glamor gl`
+(`tools/waylandd-pkg/xwayland-xwm.h`); `BROOK_XWAYLAND_SOFTWARE_GLX=1` is the
+only software variant. It inherits the kernel's Dell Mesa environment (stock
+Mesa 26.0.6, `9kypdl7x…`, `iris`). Xwayland 24.1 has two GLX providers.
+`xwl_glamor_init()` pushes glamor's EGL-backed provider
+(`GlxPushProvider(&glamor_provider)`). Underneath it sits DRISWRast, which only
+works if a swrast driver can be found through `LIBGL_DRIVERS_PATH`. The earlier
+software-rendered Dell session had neither: no glamor, and the kernel then gave
+non-virtio machines the QEMU Mesa path, which the Dell lacks. That is why it
+reported no GLX. The kernel now selects the Dell Mesa paths, and glamor runs on
+the Dell (its GPU jobs are visible), so the server should advertise GLX 1.4
+backed by glamor's EGL context. GLX alone does not prove hardware rendering,
+because QEMU's software Xwayland also reports it (below). DRI3 and
+Present follow from the GBM backend, which uses waylandd's linux-dmabuf v4
+feedback (one render node, LINEAR XR24/AR24). Clients therefore render directly
+with Iris in their own process and present through Present. This is derived
+from source and the Dell's glamor activity; `brook-steam --probe` is the check
+on the Dell. It reports the server's extensions, then creates a GLX context and
+reports `glXIsDirect`, `GL_RENDERER`, a red-pixel readback and the `libgallium`
+that was loaded. Expected: `GLX`, `DRI3` and `Present` true, renderer
+`Mesa Intel(R) HD Graphics 5500 (BDW GT2)`, `direct: true`. A software renderer
+here means DRI3 failed and Mesa fell back to DRISW.
+
+### Launcher design
+
+- **Display.** The default mode targets `$DISPLAY`, or `:0`. Before starting
+  anything it completes an X11 handshake with a small pure-Python client and
+  queries GLX, DRI3, Present and MIT-SHM. It does not use libX11, which exits the
+  process when the connection drops, and the compositor can restart its
+  Xwayland generation. It refuses to start without GLX unless given
+  `--allow-no-glx`; `--xephyr` is then the fallback.
+- **Graphics.** It removes `LIBGL_ALWAYS_SOFTWARE` and keeps the desktop's Mesa
+  environment, which pressure-vessel imports through the provider
+  `ld.so.cache` and the helper's client library path.
+  - `--gl software` restores llvmpipe without nesting.
+  - `--iris` (experimental) reads the patched build's library directory from
+    `brook-iris-run` and passes it as the helper's new `--library-dir`, which
+    puts it ahead of the stock `libgallium` for the client. The game containers
+    (Soldier) import graphics through capsule capture from the provider cache,
+    so they keep the stock Iris until a provider cache variant exists.
+  - `--gl-debug` sets `LIBGL_DEBUG=verbose`.
+  - CEF stays on `-cef-disable-gpu`; its software frames reach Xwayland over
+    MIT-SHM.
+- **Audio.** It starts a private `pulseaudio -n --daemonize=no
+  --exit-idle-time=-1 --use-pid-file=no` with a native socket in
+  `$XDG_RUNTIME_DIR` (or `/tmp`) at `brook-steam-pulse-<pid>/native`
+  (`auth-anonymous=1`), `module-null-sink` and `module-always-sink`. It passes
+  this to the helper as `--pulse-server`, which sets `PULSE_SERVER` for the
+  container and the companion game launcher.
+  - Readiness is a socket connect plus `pactl info`.
+  - The server runs under a small keeper process. Brook accepts but does not
+    implement `PR_SET_PDEATHSIG`, so the keeper polls its parent and stops
+    pulseaudio if the launcher disappears, even after SIGKILL.
+  - `--pulse-server` reuses an existing server and `--no-pulse` starts none.
+  - The output is still a null sink: Steam and game audio are silent.
+- **Ownership.**
+  - The launcher is a child subreaper (`PR_SET_CHILD_SUBREAPER` is
+    implemented), so descendants that daemonize stay in its tree.
+  - Single instance: a second launch while one is running logs "already
+    running" and exits 0. It does not yet bring a hidden Steam window back.
+  - `steam-launcher.log` records each step as JSON lines.
+    `steam-launcher-state.json` records the mode, display report, Pulse
+    endpoint, PIDs, stop reason and leftovers.
+- **Ending Steam.** Brook has no tray, so a Steam without a window is
+  unreachable, and the graceful restart's Closing phase waits for every
+  non-service process. The launcher therefore lists viewable top-level windows
+  every 2 s.
+  - Once a window with WM_CLASS containing `steam` has appeared, it ends Steam
+    20 s (`--windowless-grace`) after the last such window closed, unless a
+    game is running (a `reaper … SteamLaunch` descendant).
+  - Without any window in 900 s (`--startup-timeout`) it also gives up.
+  - SIGTERM, SIGINT and SIGHUP stop it immediately.
+  - Stopping sends SIGTERM to the `steamrt64/steam` main process; Steam treats
+    this as a normal shutdown, and its runtime supervisor ends the client
+    subtree. It then waits up to 15 s, sends SIGTERM to the remaining
+    descendants for 5 s, then SIGKILL. Finally it stops pulseaudio and removes
+    its directory. The worst case is about 25 s after the trigger.
+  - During a restart, Closing closes Steam's windows, the launcher ends Steam
+    20 s later, and Closing can proceed. When the planned kernel change sends
+    SIGTERM to windowless processes, that becomes the fast path.
+- **Fallback.** `--xephyr` keeps the previous nested software path, now with the
+  same Pulse ownership and cleanup. If Xephyr's window is closed the server
+  exits, and the launcher then stops Steam.
+
+### Host and QEMU checks
+
+`scripts/test_brook_steam_launcher.py` uses a private Xvfb display, private
+PulseAudio and a fake SteamRT tree. Its client maps a `steam` window, checks
+the server with `pactl info`, and starts a descendant in its own session that
+ignores SIGTERM. The test covers `--check`; the windowless shutdown (with the
+SIGKILL of that descendant); SIGTERM; single-instance behavior; and the absence
+of leftovers, Pulse directory or PID file afterwards. Run it with
+`nix-shell -p xvfb pulseaudio --run 'python3 scripts/test_brook_steam_launcher.py'`.
+The GLX probe passed against Xvfb (llvmpipe, direct, red pixel).
+
+QEMU (16 November) used a private reflink clone of
+`build/reviews/steam-rootless-stardew-offline-20261104`, with its 4 November
+kernel, Nix disk and installed Steam. It ran with 4 vCPUs, 6 GiB,
+`BROOK_NET_RESTRICT=1` (Steam offline), headless and without audio playback.
+Its desktop Xwayland 24.1.10 runs `-glamor gl` without a GPU, so glamor fails;
+it still reports GLX 1.4 with DRI3 absent. The provider is DRISWRast, which
+finds swrast through the kernel's `LIBGL_DRIVERS_PATH`. GLX alone therefore
+does not show hardware rendering; DRI3 and the probe's renderer do.
+
+- **`--check` and `--probe`.** `--check` passed. `--probe` created a direct
+  llvmpipe context and read back the red pixel, as expected without DRI3.
+- **Startup.** As uid 1000, the launcher started its Pulse server in 2 s
+  (`pactl info`: pulseaudio 17.0, default sink `brook_null`). It found `:0`
+  and started the real client through srt-bwrap, the helper and SteamRT,
+  reaching about 140 processes. A rootless "Unexpected Transport Error" window
+  appeared after 165 s (offline) as a native window from waylandd/Xwayland.
+- **Audio.** `pactl list clients` on the launcher's socket showed two `steam`
+  connections, so the null sink was in use and no autospawn loop occurred.
+- **Window close.** A semantic close completed, but Steam kept this dialog
+  open. A WM close alone does not end it.
+- **SIGTERM.** After SIGTERM to the launcher, Steam had not exited within
+  15 s. The launcher then sent SIGTERM to 18 leftovers and, 5 s later, SIGKILL
+  to 3 of them. The bridge job then reported zero live tasks and exit 0. The
+  Pulse directory was gone and the state file showed `leftovers: []`.
+- **Teardown time.** The final "stopped" line came 278 s after SIGTERM. The
+  launcher's own steps took about 20 s. For the rest, all four vCPUs were
+  sampled in `SchedLockWaitForTicket`, and file access in `/data/home` stalled.
+  The serial log shows Steam's hundreds of offline TCP sockets being torn
+  down, each logged to serial. This is old-kernel teardown cost, not launcher
+  logic. Measure it on the Dell's current kernel before relying on the
+  restart bound.
+
+The windowless-grace path was not reached in QEMU, because the dialog ignored
+close; it is covered by the host test. Evidence:
+`build/qemu-steam-rootless/evidence/` in the `work/steam-rootless` worktree.
+
+### Install and Dell test
+
+`python3 scripts/package_steam_launcher.py` writes
+`build/steam-launcher-bundle{,.tar}` with both scripts, `install.py`,
+`SHA256SUMS` and `SOURCE.json`. On the Dell, as uid 1000,
+`/nix/profile/bin/python3 install.py` verifies the checksums. It backs up the
+installed copies as `*.before-<stamp>` with a `rollback-<stamp>.json`, installs
+the files atomically, syncs, and runs `brook-steam --check`.
+`install.py --rollback` restores the newest backup set. Nothing goes into
+`/nix/store`. The application entry is unchanged.
+
 ## Q3 performance and remaining input work
 
 The user's audible live run reports about 15 FPS and heavy stuttering. A later
