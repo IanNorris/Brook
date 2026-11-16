@@ -1569,6 +1569,7 @@ static void keyboard_resource_destroy(struct wl_resource *r) {
     seat_unref(sc);
 }
 
+static void pointer_enter_if_needed(struct brook_seat_client *sc,struct brook_surface *s,wl_fixed_t lx,wl_fixed_t ly);
 #include "pointer-constraints.h"
 
 #include "keyboard-keymap.h"

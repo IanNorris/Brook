@@ -256,6 +256,13 @@ static uint64_t g_pointerInteractionSerial=0;
 // Creation identity of the window whose client area receives pointer input;
 // zero over shell surfaces, chrome and desktop. Written by WM routing.
 static uint64_t g_pointerHoverIdentity=0;
+// Deliberate keyboard/taskbar activation (Alt+Tab, taskbar button): like
+// Windows granting ClipCursor on activation, the activated window may acquire
+// once without the pointer over its content. Cancelled by any focus change,
+// Super, the launcher/volume popup, minimising, or the pointer moving to a
+// different delivery target than it had at activation.
+static uint64_t g_pointerActivationIdentity=0,g_pointerActivationHover=0;
+static void PointerActivationCancel() { __atomic_store_n(&g_pointerActivationIdentity,0,__ATOMIC_RELEASE); }
 static uint32_t g_pointerQuarantinedButtons=0;
 // Physical-up recovery must retain ownership of a delayed or queued release.
 static uint32_t g_pointerOrphanedReleases=0;
@@ -310,6 +317,17 @@ void WmPointerSetHover(int idx) {
     const uint64_t identity=idx>=0 && idx<static_cast<int>(WM_MAX_WINDOWS) && g_windows[idx].proc
         ?g_windows[idx].creationIdentity:0;
     __atomic_store_n(&g_pointerHoverIdentity,identity,__ATOMIC_RELEASE);
+    if(identity!=__atomic_load_n(&g_pointerActivationHover,__ATOMIC_ACQUIRE))PointerActivationCancel();
+}
+void WmPointerActivate(int idx) {
+    if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS))return;
+    VfbGuard guard;
+    Window& w=g_windows[idx];
+    if(!w.proc || !w.focused || g_focusedIdx!=idx || w.minimized)return;
+    if(g_pointerInteractionSerial<0x7fffffffffffffffull)++g_pointerInteractionSerial;
+    w.pointerEngageSerial=g_pointerInteractionSerial;w.pointerDisengaged=false;
+    __atomic_store_n(&g_pointerActivationHover,__atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE),__ATOMIC_RELEASE);
+    __atomic_store_n(&g_pointerActivationIdentity,w.creationIdentity,__ATOMIC_RELEASE);
 }
 void WmPointerEngage(int idx) {
     if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS))return;
@@ -321,6 +339,7 @@ void WmPointerEngage(int idx) {
 }
 bool WmPointerCaptureReleaseByUser() {
     VfbGuard guard;
+    PointerActivationCancel(); // Super means the shell, not the activated game.
     if(g_pointerCaptureIndex<0)return false;
     PointerCaptureReleaseLocked();return true;
 }
@@ -336,6 +355,8 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     const bool owned=g_pointerCaptureIndex==static_cast<int>(wmId)-1 &&
                      g_pointerCaptureIdentity==w->creationIdentity;
     if(operation==0)return owned && (!token || token==g_pointerCaptureToken)?g_pointerCaptureToken:0;
+    const bool activated=__atomic_load_n(&g_pointerActivationIdentity,__ATOMIC_ACQUIRE)==w->creationIdentity;
+    if(operation==4)return token?-22:activated?1:0;
     if(operation==2) {
         if(!owned || !token || token!=g_pointerCaptureToken)return -116;
         PointerCaptureReleaseLocked(true);return 0;
@@ -343,11 +364,22 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     if(operation!=1 || token)return -22;
     if(owned)return g_pointerCaptureToken;
     if(g_pointerCaptureIndex>=0)return -16;
+    if(WmLauncherVisible() || WmVolumePopupVisible())PointerActivationCancel();
+    const bool hovered=__atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE)==w->creationIdentity;
+    // An activation waiver never inherits the activating click: the taskbar
+    // press/release pair must finish in the shell before the game is granted.
+    const bool waived=!hovered && activated && !MouseGetButtons();
     if(!g_wmActive || !w->vfb || !w->visible || w->minimized || !w->focused ||
        g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmVolumePopupVisible() ||
-       WmPointerSuppressedButtons() || w->pointerDisengaged ||
-       __atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE)!=w->creationIdentity)return -11;
+       WmPointerSuppressedButtons() || w->pointerDisengaged || (!hovered && !waived))return -11;
     if(g_nextPointerCaptureToken==0xffffffffu)return -75;
+    PointerActivationCancel();
+    if(waived) {
+        // Anchor inside the game, as Windows clips an activated cursor into
+        // the window: release then returns the pointer over its content.
+        MouseSetPosition(w->clientX()+w->clientW/2,w->clientY()+w->clientH/2);
+        __atomic_store_n(&g_pointerHoverIdentity,w->creationIdentity,__ATOMIC_RELEASE);
+    }
     MouseGetPosition(&g_pointerAnchorX,&g_pointerAnchorY);
     g_pointerLocalX=static_cast<int16_t>(g_pointerAnchorX-w->clientX());
     g_pointerLocalY=static_cast<int16_t>(g_pointerAnchorY-w->clientY());
@@ -1171,6 +1203,7 @@ static void FocusWindowLocked(int idx)
     if (g_focusedIdx == idx) return;
 
     PointerCaptureReleaseLocked();
+    PointerActivationCancel(); // Only WmPointerActivate after this focus re-arms it.
     // Unfocus old
     if (g_focusedIdx >= 0 && g_focusedIdx < static_cast<int>(WM_MAX_WINDOWS))
     {
@@ -1573,6 +1606,7 @@ static void MinimizeWindowLocked(int idx)
     if (!w.proc || w.minimized) return;
 
     if(g_pointerCaptureIndex==idx)PointerCaptureReleaseLocked();
+    PointerActivationCancel();
     w.minimized = true;
     SerialPrintf("WM: minimized window %d '%s'\n", idx, w.title);
 
@@ -2319,6 +2353,7 @@ bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screen
         if (!WmVolumeIconContains(mx, my, screenW, screenH)) return false;
         WmLauncherClose();
         g_volumePopupOpen = true;
+        PointerActivationCancel();
         return true;
     }
     const TaskbarVolumePopupLayout l = WmVolumePopupLayout(screenW, screenH);
@@ -3122,6 +3157,7 @@ void WmLauncherToggle()
     if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
     if (g_launcherOpen) {
+        PointerActivationCancel();
         WmVolumePopupClose(); // the two popups share one overlay slot
         g_launcherError = 0;
         g_launcherScroll = 0;
