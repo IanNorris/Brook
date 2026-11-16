@@ -92,6 +92,17 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Ready, not deployed: `work/sched-convoy` (`b09d19e5`, `177f5240`).** Note: `docs/sched-lock-convoy.md`.
+- **Cause of the QEMU freezes:** FIFO ticket-lock waiter preemption under an overcommitted hypervisor. Ready lock 86.7% contended; 588 s total wait vs 1.6 s total hold. Not long critical sections.
+- **Fixes:**
+  - unfair CAS claim when the CPUID hypervisor bit is set (FIFO fallback after 65,536 checks; `sched lock-mode ticket|unfair|status`);
+  - idle CPUs skip the ready lock on ticks when nothing is queued (`sched idle-skip`, default on, also on bare metal);
+  - new `sched lock-stats on|off|reset|status`.
+- **Result:** unmodified main froze in every overcommitted run; the fixed kernel never froze (sleep loop 0.5–0.9 s, query p50 0.04–0.11 s).
+- **On the Dell:** it stays FIFO; only idle-skip applies.
+- **Leading suspect for the Dell's SchedLockRelease skid:** KernelRegionTryEnter/Leave take the ready lock twice per user copy. Not fixed. Confirm with `sched lock-stats` on the Dell.
+- **Recommend:** boot the pair on the Dell (`sched-convoy/build/dell/pair-sched-convoy`, QEMU check PASS) and run `sched lock-stats` during Q2/Steam, then merge. It also makes QEMU testing reliable for agents.
+
 **Ready, not deployed: `work/storage-io` (5 commits on f388d5ac).**
 - **What it does:**
   - AHCI completion waits spin up to 100 µs, then sleep on MSI (vector 64, with a self-IPI to wake on the boot CPU);
