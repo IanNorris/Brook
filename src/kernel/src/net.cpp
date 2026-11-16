@@ -45,6 +45,7 @@
 
 #include "net.h"
 #include "tcp_info.h"
+#include "arp_neighbor.h"
 #include "arp_probe_tracker.h"
 #include "arp_reply_validation.h"
 #include "tcp_send_queue.h"
@@ -157,18 +158,39 @@ static NetIf* g_netIf = nullptr;
 // process context rather than running inline in the ISR.
 static Process* g_netPollThread = nullptr;
 
-// ARP cache — small fixed table
-static constexpr uint32_t ARP_CACHE_SIZE = 32;
-
-struct ArpEntry {
-    uint32_t ip;
-    MacAddr  mac;
-    bool     valid;
-};
-
-static ArpEntry g_arpCache[ARP_CACHE_SIZE];
-static uint32_t g_arpCount = 0;
+// ARP neighbor table and pending-frame queue (arp_neighbor.h), guarded by
+// g_arpLock. Never held across transmit, SchedulerBlock or another lock.
+static constexpr uint32_t ARP_CACHE_SIZE = 64;
+static constexpr uint32_t ARP_QUEUE_SLOTS = 16;
+static constexpr uint32_t ARP_QUEUE_PER_NEIGHBOR = 4;
+static constexpr uint64_t ARP_RETRY_MS = 500;
+using ArpTable = ArpNeighborTable<ARP_CACHE_SIZE, ARP_QUEUE_SLOTS, ARP_QUEUE_PER_NEIGHBOR, ETH_FRAME_MAX>;
+#ifdef __clang__
+[[clang::require_constant_initialization]]
+#endif
+static ArpTable g_arpTable;
 static SpinLock g_arpLock;
+// Blocking resolvers waiting for a particular neighbor (g_arpLock).
+struct ArpWaiter { Process* process; uint32_t ip; };
+static constexpr uint32_t ARP_WAITERS = 16;
+static ArpWaiter g_arpWaiters[ARP_WAITERS];
+static uint64_t g_arpFlushAt; // `bridge net arp flush`: net_poll flushes at this tick
+
+// Aggregate network-stack drop/ARP counters, exposed by `bridge net stats`
+// rather than per-event serial lines. Relaxed atomics; diagnostic only.
+struct NetStackCounters {
+    uint64_t arpRxRequests, arpRxReplies, arpRxIgnored, arpRxForUs, arpRxLearned, arpRxNotLearned;
+    uint64_t arpRepliesSent, arpRequestsSent;
+    uint64_t resolveBlocking, resolveBlockingFailed, resolveNonBlocking, resolveQueued;
+    uint64_t sendNoNeighbor;           // NetSendIpv4 returned -2
+    uint64_t rxThreadOverflow;         // NetReceive callers beyond the tracking table
+    uint64_t udpRxFull;                // datagrams dropped: receive buffer full
+    uint64_t synQueueFull, synNoSocket, synRecvEvicted;
+};
+static NetStackCounters g_netCounters;
+static inline void NetCount(uint64_t& counter) { __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED); }
+// Log the 1st, 2nd, 4th, 8th ... occurrence of a repeated condition.
+static inline bool NetLogPowerOfTwo(uint64_t count) { return count && !(count & (count - 1)); }
 
 // ---------------------------------------------------------------------------
 // Loopback delivery trampoline (BRO-163): never deliver loopback frames by
@@ -184,11 +206,6 @@ static LoopbackQueueT<LOOPBACK_QUEUE_SLOTS, ETH_FRAME_MAX> g_loopbackQueue;
 static SpinLock g_loopbackLock;
 static bool     g_loopbackDraining = false;  // guarded by g_loopbackLock
 
-// Pending ARP resolution
-static volatile bool g_arpReplyPending = false;
-static uint32_t g_arpReplyIp = 0;
-static MacAddr  g_arpReplyMac;
-static Process* g_arpWaiter = nullptr;
 
 // Socket table
 // TODO: Replace with per-process dynamic socket pool to support high socket
@@ -429,51 +446,69 @@ static uint16_t InetChecksum(const void* data, uint32_t len)
 // ARP cache
 // ---------------------------------------------------------------------------
 
+// Threads currently inside NetReceive. Code running there (or on net_poll)
+// must never wait for an ARP reply: only receive processing can deliver it,
+// and USB/virtio dispatch is serialized, so the wait always timed out (BRO
+// Dell 2026-11-16: SYN-ACKs to the bridge host failed while its replies sat in
+// the RX queue). Each slot's depth is changed only by its owning thread.
+static constexpr uint32_t NET_RX_THREADS = 32;
+static Process* g_netRxThreads[NET_RX_THREADS];
+static uint32_t g_netRxDepth[NET_RX_THREADS];
+static uint32_t g_netEarlyRxDepth; // pre-scheduler (BSP-only) receive nesting
+
+class NetRxScope {
+    int slot_ = -1; bool early_ = false;
+public:
+    NetRxScope() {
+        Process* self = SchedulerCurrentProcess();
+        if (!self) { early_ = true; ++g_netEarlyRxDepth; return; }
+        for (uint32_t i = 0; i < NET_RX_THREADS; ++i)
+            if (__atomic_load_n(&g_netRxThreads[i], __ATOMIC_ACQUIRE) == self) { slot_ = int(i); ++g_netRxDepth[i]; return; }
+        for (uint32_t i = 0; i < NET_RX_THREADS; ++i) {
+            Process* expected = nullptr;
+            if (__atomic_compare_exchange_n(&g_netRxThreads[i], &expected, self, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                slot_ = int(i); g_netRxDepth[i] = 1; return;
+            }
+        }
+        NetCount(g_netCounters.rxThreadOverflow);
+    }
+    ~NetRxScope() {
+        if (early_) { --g_netEarlyRxDepth; return; }
+        if (slot_ >= 0 && --g_netRxDepth[slot_] == 0)
+            __atomic_store_n(&g_netRxThreads[slot_], static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
+    }
+    NetRxScope(const NetRxScope&) = delete;
+    NetRxScope& operator=(const NetRxScope&) = delete;
+};
+
+enum class NeighborWait : uint8_t { Block, Poll, Never };
+static NeighborWait NetNeighborWaitMode()
+{
+    Process* self = SchedulerCurrentProcess();
+    if (!self) return g_netEarlyRxDepth ? NeighborWait::Never : NeighborWait::Poll;
+    if (self == __atomic_load_n(&g_netPollThread, __ATOMIC_ACQUIRE)) return NeighborWait::Never;
+    for (uint32_t i = 0; i < NET_RX_THREADS; ++i)
+        if (__atomic_load_n(&g_netRxThreads[i], __ATOMIC_ACQUIRE) == self) return NeighborWait::Never;
+    return NeighborWait::Block;
+}
+
+// Record a confirmed mapping (boot-time gateway, tests). Always succeeds.
 void ArpCacheInsert(uint32_t ip, const MacAddr& mac)
 {
     SpinLockAcquire(&g_arpLock);
-    // Update existing entry
-    for (uint32_t i = 0; i < g_arpCount; i++) {
-        if (g_arpCache[i].ip == ip) {
-            g_arpCache[i].mac = mac;
-            g_arpCache[i].valid = true;
-            SpinLockRelease(&g_arpLock);
-            return;
-        }
-    }
-    // Insert new
-    if (g_arpCount < ARP_CACHE_SIZE) {
-        g_arpCache[g_arpCount].ip = ip;
-        g_arpCache[g_arpCount].mac = mac;
-        g_arpCache[g_arpCount].valid = true;
-        g_arpCount++;
-    }
+    (void)g_arpTable.Confirm(ip, mac.b, ApicTickCount(), true);
     SpinLockRelease(&g_arpLock);
 }
 
-enum class ArpCacheResult : uint8_t { Found, Missing, Full };
-
-// Distinguish a miss that can be retained from a full cache. Both the lookup
-// and capacity observation are made under the cache lock; a future async
-// caller must recheck after a reply because another insertion can race it.
-static ArpCacheResult ArpCacheQuery(uint32_t ip, MacAddr* out)
+[[maybe_unused]] static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
 {
     SpinLockAcquire(&g_arpLock);
-    for (uint32_t i = 0; i < g_arpCount; i++) {
-        if (g_arpCache[i].ip == ip && g_arpCache[i].valid) {
-            if (out) *out = g_arpCache[i].mac;
-            SpinLockRelease(&g_arpLock);
-            return ArpCacheResult::Found;
-        }
-    }
-    const auto result=g_arpCount<ARP_CACHE_SIZE ? ArpCacheResult::Missing : ArpCacheResult::Full;
+    const auto r = g_arpTable.Resolve(ip, ApicTickCount(), false);
     SpinLockRelease(&g_arpLock);
-    return result;
-}
-
-static bool ArpCacheLookup(uint32_t ip, MacAddr* out)
-{
-    return ArpCacheQuery(ip,out)==ArpCacheResult::Found;
+    if (r.result != ArpTable::Result::Found) return false;
+    if (out) memcpy(out->b, r.mac, 6);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +540,7 @@ static int ArpSendRequestFrom(NetIf* nif, const MacAddr& mac,uint32_t sourceIp,u
     memset(arp->tha.b, 0, 6);
     arp->tpa   = targetIp;
 
+    NetCount(g_netCounters.arpRequestsSent);
     if(tryOnly)return nif->tryTransmit ? nif->tryTransmit(nif,frame,42) : -95;
     return nif->transmit(nif, frame, 42);
 }
@@ -543,9 +579,66 @@ static void ArpSendReply(NetIf* nif, const MacAddr& dstMac, uint32_t dstIp)
     arp->tha   = dstMac;
     arp->tpa   = dstIp;
 
+    NetCount(g_netCounters.arpRepliesSent);
     nif->transmit(nif, frame, 42);
 }
 
+// Transmit queued frames whose neighbor has resolved. Called after every
+// confirmation and from the poll loop; the lock is dropped around transmit.
+static void ArpReleaseReady()
+{
+    alignas(16) uint8_t frame[ETH_FRAME_MAX];
+    for (uint32_t n = 0; n < ARP_QUEUE_SLOTS; ++n) {
+        uint32_t length = 0; void* context = nullptr;
+        SpinLockAcquire(&g_arpLock);
+        const bool ready = g_arpTable.PopReady(frame, sizeof(frame), &length, &context);
+        SpinLockRelease(&g_arpLock);
+        if (!ready) return;
+        auto* nif = static_cast<NetIf*>(context);
+        if (nif && nif->transmit) (void)nif->transmit(nif, frame, length);
+    }
+}
+
+// Retransmit requests for unresolved neighbors, fail exhausted ones (dropping
+// their queued frames) and release anything resolved. net_poll, every wake.
+static void ArpService()
+{
+    const uint64_t now = ApicTickCount();
+    uint64_t flushAt = __atomic_load_n(&g_arpFlushAt, __ATOMIC_ACQUIRE);
+    if (flushAt && now >= flushAt &&
+        __atomic_compare_exchange_n(&g_arpFlushAt, &flushAt, uint64_t(0), false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        SpinLockAcquire(&g_arpLock);
+        g_arpTable.Flush();
+        SpinLockRelease(&g_arpLock);
+    }
+    for (uint32_t n = 0; n < 4; ++n) {
+        uint32_t ip = 0;
+        SpinLockAcquire(&g_arpLock);
+        const bool due = g_arpTable.NextProbe(now, &ip);
+        SpinLockRelease(&g_arpLock);
+        if (!due) break;
+        ArpSendRequest(ip);
+    }
+    ArpReleaseReady();
+}
+
+static bool ArpSenderLearnable(const NetIf* nif, const ArpPacket* arp)
+{
+    const uint32_t spa = arp->spa, host = ntohl(spa);
+    const uint8_t* sha = arp->sha.b;
+    if (!spa || (sha[0] & 1)) return false; // probe, or multicast/broadcast MAC
+    if (!(sha[0] | sha[1] | sha[2] | sha[3] | sha[4] | sha[5])) return false;
+    if ((host >> 24) == 127 || (host >> 28) >= 0xE) return false; // loopback, multicast, class E
+    if (nif && spa == nif->ipAddr) return false; // address conflict: do not learn our own IP
+    if (nif && nif->netmask && (spa | nif->netmask) == 0xFFFFFFFF) return false; // subnet broadcast
+    return true;
+}
+
+// Linux arp_process() semantics in reduced form: any well-formed ARP updates
+// an existing entry for its sender (so gratuitous and late replies always
+// land); an entry is created only when the packet is addressed to us.
+// Broadcast requests between other hosts no longer fill the table.
 static void HandleArp(NetIf* nif, const uint8_t* frame, uint32_t len)
 {
     if (len < sizeof(EthHeader) + sizeof(ArpPacket)) return;
@@ -553,91 +646,135 @@ static void HandleArp(NetIf* nif, const uint8_t* frame, uint32_t len)
 
     auto* arp = reinterpret_cast<const ArpPacket*>(frame + sizeof(EthHeader));
     uint16_t op = ntohs(arp->oper);
-
-    // Always learn from any ARP packet; only log when the cache entry is new
-    // to avoid spamming the serial log with repeated gratuitous ARPs from the
-    // gateway (QEMU sends one every few seconds for each host).
-    MacAddr existing;
-    bool isNew = !ArpCacheLookup(arp->spa, &existing);
-    ArpCacheInsert(arp->spa, arp->sha);
-    if (isNew)
-        SerialPrintf("arp: RX op=%u spa=%d.%d.%d.%d sha=%02x:%02x:%02x:%02x:%02x:%02x tpa=%d.%d.%d.%d\n",
-                     op,
-                     arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
-                     (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
-                     arp->sha.b[0], arp->sha.b[1], arp->sha.b[2],
-                     arp->sha.b[3], arp->sha.b[4], arp->sha.b[5],
-                     arp->tpa & 0xFF, (arp->tpa >> 8) & 0xFF,
-                     (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
-
-    if (op == ARP_OP_REQUEST) {
-        // Is this for us? Check against the receiving interface's IP.
-        if (nif && arp->tpa == nif->ipAddr) {
-            ArpSendReply(nif, arp->sha, arp->spa);
-        }
-    } else if (op == ARP_OP_REPLY) {
-
-        // Wake up anyone waiting for this ARP reply
-        if (arp->spa == g_arpReplyIp) {
-            g_arpReplyMac = arp->sha;
-            __asm__ volatile("mfence" ::: "memory");
-            g_arpReplyPending = true;
-            Process* waiter = g_arpWaiter;
-            if (waiter) {
-                g_arpWaiter = nullptr;
-                __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
-                SchedulerUnblock(waiter);
-            }
-        }
+    if (ntohs(arp->htype) != 1 || ntohs(arp->ptype) != ETH_TYPE_IPV4 || arp->hlen != 6 ||
+        arp->plen != 4 || (op != ARP_OP_REQUEST && op != ARP_OP_REPLY)) {
+        NetCount(g_netCounters.arpRxIgnored); return;
     }
+    NetCount(op == ARP_OP_REQUEST ? g_netCounters.arpRxRequests : g_netCounters.arpRxReplies);
+    const bool forUs = nif && nif->ipAddr && arp->tpa == nif->ipAddr;
+    if (forUs) NetCount(g_netCounters.arpRxForUs);
+
+    if (ArpSenderLearnable(nif, arp)) {
+        Process* wake[ARP_WAITERS]; uint32_t wakeCount = 0;
+        bool created = false;
+        SpinLockAcquire(&g_arpLock);
+        const bool existed = g_arpTable.Has(arp->spa);
+        const bool learned = g_arpTable.Confirm(arp->spa, arp->sha.b, ApicTickCount(), forUs);
+        created = learned && !existed;
+        if (learned) {
+            for (auto& w : g_arpWaiters)
+                if (w.process && w.ip == arp->spa) { ProcessRef(w.process); wake[wakeCount++] = w.process; }
+        }
+        SpinLockRelease(&g_arpLock);
+        NetCount(learned ? g_netCounters.arpRxLearned : g_netCounters.arpRxNotLearned);
+        for (uint32_t i = 0; i < wakeCount; ++i) {
+            __atomic_store_n(&wake[i]->pendingWakeup, 1, __ATOMIC_RELEASE);
+            SchedulerUnblock(wake[i]);
+            ProcessUnref(wake[i]);
+        }
+        if (created)
+            SerialPrintf("arp: RX op=%u spa=%d.%d.%d.%d sha=%02x:%02x:%02x:%02x:%02x:%02x tpa=%d.%d.%d.%d\n",
+                         op,
+                         arp->spa & 0xFF, (arp->spa >> 8) & 0xFF,
+                         (arp->spa >> 16) & 0xFF, (arp->spa >> 24) & 0xFF,
+                         arp->sha.b[0], arp->sha.b[1], arp->sha.b[2],
+                         arp->sha.b[3], arp->sha.b[4], arp->sha.b[5],
+                         arp->tpa & 0xFF, (arp->tpa >> 8) & 0xFF,
+                         (arp->tpa >> 16) & 0xFF, (arp->tpa >> 24) & 0xFF);
+        if (learned) ArpReleaseReady();
+    }
+
+    if (op == ARP_OP_REQUEST && forUs)
+        ArpSendReply(nif, arp->sha, arp->spa);
 }
 
+static int ArpWaiterRegisterLocked(Process* self, uint32_t ip)
+{
+    for (uint32_t i = 0; i < ARP_WAITERS; ++i)
+        if (!g_arpWaiters[i].process) { g_arpWaiters[i] = {self, ip}; return int(i); }
+    return -1; // fall back to short timed sleeps
+}
+
+// Resolve ip. Blocks (or polls, before the scheduler) only when the caller is
+// not receive processing or net_poll; from those contexts this returns false
+// immediately on a miss after starting resolution. NetSendIpv4 instead queues
+// the frame there (NetNeighborTransmit).
 bool ArpResolve(uint32_t ip, MacAddr* outMac)
 {
-    // Check cache first
-    if (ArpCacheLookup(ip, outMac))
-        return true;
-
-    // Broadcast address
     if (ip == 0xFFFFFFFF) {
         memset(outMac->b, 0xFF, 6);
         return true;
     }
-
-    // Need to send ARP request and wait
-    g_arpReplyPending = false;
-    g_arpReplyIp = ip;
-    __asm__ volatile("mfence" ::: "memory");
-
+    const NeighborWait mode = NetNeighborWaitMode();
     Process* self = SchedulerCurrentProcess();
-
-    for (int attempt = 0; attempt < 3; attempt++) {
-        ArpSendRequest(ip);
-
-        // Block until ARP reply arrives (500ms timeout per attempt)
-        uint64_t deadline = ApicTickCount() + 500;
-        while (!g_arpReplyPending && ApicTickCount() < deadline) {
-            if (self) {
-                g_arpWaiter = self;
-                self->wakeupTick = ApicTickCount() + 500;
-                SchedulerBlock(self);
-            } else if (g_netIf && g_netIf->poll) {
-                // Early-boot: no scheduler yet, fall back to polling
-                g_netIf->poll(g_netIf);
-            }
+    int slot = -1;
+    bool resolved = false;
+    if (mode == NeighborWait::Block) NetCount(g_netCounters.resolveBlocking);
+    for (;;) {
+        const uint64_t now = ApicTickCount();
+        SpinLockAcquire(&g_arpLock);
+        const auto r = g_arpTable.Resolve(ip, now, true);
+        if (r.result == ArpTable::Result::Pending && mode == NeighborWait::Block && slot < 0)
+            slot = ArpWaiterRegisterLocked(self, ip);
+        SpinLockRelease(&g_arpLock);
+        if (r.sendRequest) ArpSendRequest(ip);
+        if (r.result == ArpTable::Result::Found) { memcpy(outMac->b, r.mac, 6); resolved = true; break; }
+        if (r.result == ArpTable::Result::Failed || mode == NeighborWait::Never) break;
+        if (mode == NeighborWait::Poll) {
+            // Early boot: no scheduler and no net_poll; drive the NIC here.
+            NetIf* nif = NetIfForDst(ip);
+            if (nif && nif->poll) nif->poll(nif);
+            continue;
         }
-
-        if (g_arpReplyPending) {
-            *outMac = g_arpReplyMac;
-            ArpCacheInsert(ip, *outMac);
-            return true;
-        }
+        self->wakeupTick = now + (slot >= 0 ? ARP_RETRY_MS : 10);
+        SchedulerBlock(self);
     }
+    if (slot >= 0) {
+        SpinLockAcquire(&g_arpLock);
+        g_arpWaiters[slot] = {nullptr, 0};
+        SpinLockRelease(&g_arpLock);
+    }
+    if (!resolved && mode != NeighborWait::Never) {
+        NetCount(g_netCounters.resolveBlockingFailed);
+        if (NetLogPowerOfTwo(__atomic_load_n(&g_netCounters.resolveBlockingFailed, __ATOMIC_RELAXED)))
+            SerialPrintf("net: ARP resolve failed for %d.%d.%d.%d (failures=%lu)\n",
+                         ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF,
+                         __atomic_load_n(&g_netCounters.resolveBlockingFailed, __ATOMIC_RELAXED));
+    }
+    return resolved;
+}
 
-    SerialPrintf("net: ARP resolve failed for %d.%d.%d.%d\n",
-                 ip & 0xFF, (ip >> 8) & 0xFF,
-                 (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
-    return false;
+// Fill the Ethernet destination of a complete frame for nextHop and submit
+// it. Contexts that may wait resolve synchronously (returning -2 when the
+// neighbor does not answer). Receive processing and net_poll never wait: the
+// frame is queued and sent when the reply is processed, or dropped when
+// resolution fails; that counts as accepted (0), as in Linux.
+static int NetNeighborTransmit(NetIf* nif, uint32_t nextHop, uint8_t* frame, uint32_t frameLength)
+{
+    auto* eth = reinterpret_cast<EthHeader*>(frame);
+    if (nextHop == 0xFFFFFFFF ||
+        (nif->netmask && (nextHop | nif->netmask) == 0xFFFFFFFF &&
+         (nextHop & nif->netmask) == (nif->ipAddr & nif->netmask))) {
+        memset(eth->dst.b, 0xFF, 6);
+        return nif->transmit(nif, frame, frameLength);
+    }
+    if (NetNeighborWaitMode() != NeighborWait::Never) {
+        MacAddr mac;
+        if (!ArpResolve(nextHop, &mac)) return -2;
+        eth->dst = mac;
+        return nif->transmit(nif, frame, frameLength);
+    }
+    NetCount(g_netCounters.resolveNonBlocking);
+    SpinLockAcquire(&g_arpLock);
+    const auto r = g_arpTable.ResolveOrQueue(nextHop, ApicTickCount(), frame, frameLength, nif);
+    SpinLockRelease(&g_arpLock);
+    if (r.sendRequest) (void)ArpSendRequestOn(nif, nextHop);
+    if (r.result == ArpTable::Result::Found) {
+        memcpy(eth->dst.b, r.mac, 6);
+        return nif->transmit(nif, frame, frameLength);
+    }
+    NetCount(g_netCounters.resolveQueued);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -722,20 +859,15 @@ static bool NetIpv4PayloadFits(uint32_t payloadLen)
 // addresses or wait for an ARP reply. It retains the existing synchronous
 // NetIf::transmit contract; not every driver or loopback path has been audited
 // for use by a shared worker.
-static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
-                               uint32_t source, uint32_t dstIp, uint8_t proto,
-                               const void* payload, uint32_t payloadLen,bool tryOnly=false)
+// Build an Ethernet+IPv4 frame for nif with a zero destination MAC. The
+// caller checked NetIpv4PayloadFits; returns the frame length.
+static uint32_t NetBuildIpv4Frame(NetIf* nif, uint8_t* frame, uint32_t source, uint32_t dstIp,
+                                  uint8_t proto, const void* payload, uint32_t payloadLen)
 {
-    if (!NetIpv4PayloadFits(payloadLen)) return -3;
-    if (tryOnly && !nif->tryTransmit) return -95;
     uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
     uint32_t frameLen = sizeof(EthHeader) + ipLen;
-    if (frameLen > ETH_FRAME_MAX) return -3;
-
-    alignas(16) uint8_t frame[ETH_FRAME_MAX];
     memset(frame, 0, frameLen);
     auto* eth = reinterpret_cast<EthHeader*>(frame);
-    eth->dst = dstMac;
     eth->src = nif->mac;
     eth->etherType = htons(ETH_TYPE_IPV4);
 
@@ -755,6 +887,18 @@ static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
 
     nif->txPackets++;
     nif->txBytes += frameLen;
+    return frameLen;
+}
+
+static int NetSendIpv4Resolved(NetIf* nif, const MacAddr& dstMac,
+                               uint32_t source, uint32_t dstIp, uint8_t proto,
+                               const void* payload, uint32_t payloadLen,bool tryOnly=false)
+{
+    if (!NetIpv4PayloadFits(payloadLen)) return -3;
+    if (tryOnly && !nif->tryTransmit) return -95;
+    alignas(16) uint8_t frame[ETH_FRAME_MAX];
+    const uint32_t frameLen = NetBuildIpv4Frame(nif, frame, source, dstIp, proto, payload, payloadLen);
+    reinterpret_cast<EthHeader*>(frame)->dst = dstMac;
     return tryOnly ? nif->tryTransmit(nif,frame,frameLen) : nif->transmit(nif,frame,frameLen);
 }
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
@@ -821,12 +965,12 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
         if (!nextHop) return -1; // no gateway configured
     }
 
-    // Resolve MAC
-    MacAddr dstMac;
-    if (!ArpResolve(nextHop, &dstMac))
-        return -2; // ARP failed
-
-    return NetSendIpv4Resolved(nif,dstMac,source,dstIp,proto,payload,payloadLen);
+    if (!NetIpv4PayloadFits(payloadLen)) return -3;
+    alignas(16) uint8_t frame[ETH_FRAME_MAX];
+    const uint32_t frameLen = NetBuildIpv4Frame(nif, frame, source, dstIp, proto, payload, payloadLen);
+    const int result = NetNeighborTransmit(nif, nextHop, frame, frameLen);
+    if (result == -2) NetCount(g_netCounters.sendNoNeighbor); // ARP failed
+    return result;
 #endif
 }
 
@@ -954,6 +1098,7 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local)
 void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 {
     if (len < sizeof(EthHeader)) return;
+    NetRxScope rxScope; // sends from here never wait for ARP
 
     nif->rxPackets++;
     nif->rxBytes += len;
@@ -1074,8 +1219,9 @@ void NetConfigureBoot()
 
 void NetInit()
 {
-    memset(g_arpCache, 0, sizeof(g_arpCache));
-    g_arpCount = 0;
+    SpinLockAcquire(&g_arpLock);
+    g_arpTable.Flush();
+    SpinLockRelease(&g_arpLock);
     memset(g_sockets, 0, sizeof(g_sockets));
     memset(g_sockUsed, 0, sizeof(g_sockUsed));
     for (uint32_t i = 0; i < MAX_SOCKETS; ++i) {
@@ -1332,6 +1478,7 @@ void NetStartPollThread()
             // many parallel connections (speedtest-go). Driving it from the
             // poll loop decouples maintenance from the send path entirely.
             TcpStatsMaybeFlush();
+            ArpService();
             Process* self = ProcessCurrent();
             if (self) {
                 // Wake every ~5ms for responsive networking. TLS page loads
@@ -2457,7 +2604,12 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
         if (needed > avail) {
             SpinLockRelease(&s.lock);
-            SerialPrintf("net: socket %u rx buffer full, dropping\n", i);
+            // An application that stops reading must cost one counter, not a
+            // serial line per datagram (see `bridge net stats`).
+            NetCount(g_netCounters.udpRxFull);
+            const uint64_t drops = __atomic_load_n(&g_netCounters.udpRxFull, __ATOMIC_RELAXED);
+            if (NetLogPowerOfTwo(drops))
+                SerialPrintf("net: socket %u rx buffer full, dropping (udp_rx_full=%lu)\n", i, drops);
             return;
         }
 
@@ -2919,6 +3071,33 @@ static bool RetireAbandonedQueuedChild(Socket& child, uint64_t now)
     return child.tcpRstRecv || child.tcpState == TcpState::Closed;
 }
 
+// Remove the oldest queued child still in SynRecv for at least a second
+// (its handshake never completed). Caller holds g_acceptQueueLock and
+// drops the returned reference after releasing it. Returns -1 if none.
+static int EvictStaleSynRecvLocked(Socket& listener, uint64_t now)
+{
+    for (int qi = 0; qi < listener.acceptQueueCount; ++qi) {
+        const int childIdx = listener.acceptQueue[qi];
+        if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS) || !g_sockUsed[childIdx]) continue;
+        Socket& child = g_sockets[childIdx];
+        SpinLockAcquire(&child.lock);
+        const bool stale = child.tcpState == TcpState::SynRecv && TcpTimerElapsed(now, child.tcpLastRxTick, 1000);
+        if (stale) {
+            child.tcpState = TcpState::Closed;
+            child.connected = false;
+            child.tcpRstRecv = true;
+            child.listenSockIdx = -1;
+        }
+        SpinLockRelease(&child.lock);
+        if (!stale) continue;
+        for (int j = qi; j < listener.acceptQueueCount - 1; ++j)
+            listener.acceptQueue[j] = listener.acceptQueue[j + 1];
+        --listener.acceptQueueCount;
+        return childIdx;
+    }
+    return -1;
+}
+
 static void PruneAcceptQueue(Socket& listener)
 {
     int retired[Socket::ACCEPT_QUEUE_MAX];
@@ -3159,10 +3338,18 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             PruneAcceptQueue(s);
             uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
             bool full = !s.listening || s.acceptQueueCount >= s.listenBacklog;
+            // Half-open children count against the small backlog (2 for the
+            // debug listener); stale ones must not lock out new clients.
+            const int evicted = full && s.listening ? EvictStaleSynRecvLocked(s, ApicTickCount()) : -1;
+            if (evicted >= 0) full = false;
             IrqSpinLockRelease(&g_acceptQueueLock, queueFlags);
+            if (evicted >= 0) { NetCount(g_netCounters.synRecvEvicted); SockUnref(evicted); }
             if (full) {
-                SerialPrintf("net: TCP SYN dropped — accept queue full (port %u)\n",
-                             ntohs(dstPort));
+                NetCount(g_netCounters.synQueueFull);
+                const uint64_t drops = __atomic_load_n(&g_netCounters.synQueueFull, __ATOMIC_RELAXED);
+                if (NetLogPowerOfTwo(drops))
+                    SerialPrintf("net: TCP SYN dropped — accept queue full (port %u, drops=%lu)\n",
+                                 ntohs(dstPort), drops);
                 break;
             }
 
@@ -3171,7 +3358,9 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
                                            ownerPid, uid, gid);
             if (childIdx < 0)
             {
-                SerialPrintf("net: TCP SYN dropped — no free sockets\n");
+                NetCount(g_netCounters.synNoSocket);
+                if (NetLogPowerOfTwo(__atomic_load_n(&g_netCounters.synNoSocket, __ATOMIC_RELAXED)))
+                    SerialPrintf("net: TCP SYN dropped — no free sockets\n");
                 break;
             }
 
@@ -3273,10 +3462,14 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     if (!g_sockUsed[sockIdx]) return -1;
 
     Socket& s = g_sockets[sockIdx];
+    // As in Linux, INADDR_ANY as a destination means this host. Ad-blocking
+    // resolvers answer 0.0.0.0; sending that SYN to the gateway left
+    // Chromium's connects hanging instead of being refused immediately.
+    const uint32_t destination = addr->sin_addr ? addr->sin_addr : htonl(0x7f000001);
 
     // UDP connect: just set default destination
     if (s.type == SOCK_DGRAM) {
-        s.remoteIp   = addr->sin_addr;
+        s.remoteIp   = destination;
         s.remotePort = addr->sin_port;
         s.connected  = true;
         // Auto-bind if not yet bound
@@ -3307,7 +3500,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         ++g_tcpAsyncEpoch[sockIdx];
     }
 
-    s.remoteIp   = addr->sin_addr;
+    s.remoteIp   = destination;
     s.remotePort = addr->sin_port; // already big-endian
 
     // Auto-bind local port
@@ -5068,6 +5261,86 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{\"arp_probe_api\":1,\"status\":\"");r.text(status);
         r.text("\",\"errno\":");r.number(result.error<0?static_cast<uint64_t>(-static_cast<int64_t>(result.error)):0);
         r.text(",");r.field("mac",result.mac);r.text("}\n");r.send();return;
+    }
+    if (NetStrEq(cmd, "bridge net arp flush")) {
+        // Like `ip neigh flush all`: entries and queued frames are dropped.
+        // net_poll flushes 50 ms later, after this exchange completes, so the
+        // client's next connection is answered (SYN-ACK) from receive
+        // processing with an empty table: the 2026-11-16 Dell failure path.
+        SpinLockAcquire(&g_arpLock);
+        const uint32_t entries = g_arpTable.Count(), frames = g_arpTable.QueuedFrames();
+        SpinLockRelease(&g_arpLock);
+        __atomic_store_n(&g_arpFlushAt, ApicTickCount() + 50, __ATOMIC_RELEASE);
+        BridgeReply r;r.text("{\"arp_api\":1,\"deferred_ms\":50,");r.field("entries",entries);
+        r.text(",");r.field("queued_frames",frames);r.text("}\n");r.send();return;
+    }
+    if (NetStrEq(cmd, "bridge net arp") || NetStrEq(cmd, "bridge net stats")) {
+        const bool table = NetStrEq(cmd, "bridge net arp");
+        struct Row { uint32_t ip; uint8_t state; uint8_t mac[6]; uint32_t probes, queued; uint64_t confirmed, used; };
+        Row rows[ARP_CACHE_SIZE]; // ~2.5 KiB: copied out so no lock is held while replying
+        uint32_t count = 0;
+        SpinLockAcquire(&g_arpLock);
+        const ArpNeighborStats st = g_arpTable.Stats();
+        const uint32_t queuedFrames = g_arpTable.QueuedFrames();
+        if (table)
+            g_arpTable.ForEach([&](const ArpTable::EntryView& v) {
+                if (count >= ARP_CACHE_SIZE) return;
+                Row& row = rows[count++];
+                row.ip = v.ip; row.state = static_cast<uint8_t>(v.state); memcpy(row.mac, v.mac, 6);
+                row.probes = v.probes; row.queued = v.queued; row.confirmed = v.confirmedMs; row.used = v.usedMs;
+            });
+        else count = g_arpTable.Count();
+        SpinLockRelease(&g_arpLock);
+        const uint64_t now = ApicTickCount();
+        BridgeReply r;
+        r.text(table ? "{\"arp_api\":1," : "{\"net_stats_api\":1,");
+        r.field("arp_capacity",ARP_CACHE_SIZE);r.text(",");r.field("arp_entries",count);
+        r.text(",");r.field("arp_queued_frames",queuedFrames);
+        r.text(",\"arp\":{");
+        r.field("requests",st.requests);r.text(",");r.field("refresh_probes",st.refreshProbes);
+        r.text(",");r.field("resolved",st.resolved);r.text(",");r.field("created",st.created);
+        r.text(",");r.field("updated",st.updated);r.text(",");r.field("mac_changes",st.macChanges);
+        r.text(",");r.field("failures",st.failures);r.text(",");r.field("refresh_failures",st.refreshFailures);
+        r.text(",");r.field("evictions",st.evictions);r.text(",");r.field("queued",st.queued);
+        r.text(",");r.field("queue_drops",st.queueDrops);r.text(",");r.field("fail_drops",st.failDrops);
+        r.text(",");r.field("released",st.released);r.text("}");
+        if (table) {
+            r.text(",\"entries\":[");
+            for (uint32_t i = 0; i < count; ++i) {
+                const Row& row = rows[i];
+                if (i) r.text(",");
+                r.text("{\"ip\":\"");
+                for (int b = 0; b < 4; ++b) { if (b) r.text("."); r.number((row.ip >> (8 * b)) & 0xFF); }
+                r.text("\",\"state\":\"");
+                r.text(row.state == static_cast<uint8_t>(ArpTable::State::Valid) ? "valid" : "incomplete");
+                r.text("\",\"mac\":\"");
+                for (int b = 0; b < 6; ++b) {
+                    if (b) r.text(":");
+                    const char* hex = "0123456789abcdef";
+                    char pair[3] = {hex[row.mac[b] >> 4], hex[row.mac[b] & 15], 0}; r.text(pair);
+                }
+                r.text("\",");r.field("confirmed_age_ms",row.confirmed ? now - row.confirmed : 0);
+                r.text(",");r.field("idle_ms",now - row.used);
+                r.text(",");r.field("probes",row.probes);r.text(",");r.field("queued",row.queued);r.text("}");
+            }
+            r.text("]");
+        } else {
+            auto field=[&](const char* name,uint64_t& value){r.text(",");r.field(name,__atomic_load_n(&value,__ATOMIC_RELAXED));};
+            auto& c = g_netCounters;
+            field("arp_rx_requests",c.arpRxRequests);field("arp_rx_replies",c.arpRxReplies);
+            field("arp_rx_ignored",c.arpRxIgnored);field("arp_rx_for_us",c.arpRxForUs);
+            field("arp_rx_learned",c.arpRxLearned);field("arp_rx_not_learned",c.arpRxNotLearned);
+            field("arp_requests_sent",c.arpRequestsSent);field("arp_replies_sent",c.arpRepliesSent);
+            field("resolve_blocking",c.resolveBlocking);field("resolve_blocking_failed",c.resolveBlockingFailed);
+            field("resolve_nonblocking",c.resolveNonBlocking);field("resolve_queued",c.resolveQueued);
+            field("send_no_neighbor",c.sendNoNeighbor);field("rx_thread_overflow",c.rxThreadOverflow);
+            field("udp_rx_full",c.udpRxFull);field("syn_queue_full",c.synQueueFull);
+            field("syn_no_socket",c.synNoSocket);field("syn_recv_evicted",c.synRecvEvicted);
+            uint32_t rxThreads = 0;
+            for (auto* p : g_netRxThreads) rxThreads += __atomic_load_n(&p, __ATOMIC_RELAXED) != nullptr;
+            r.text(",");r.field("rx_threads_active",rxThreads);
+        }
+        r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge network")) {
         NetDriverSnapshot s{};

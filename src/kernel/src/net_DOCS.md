@@ -58,10 +58,24 @@ dedicated poll thread for packet I/O.
 - Dispatches on etherType: 0x0800 → IPv4, 0x0806 → ARP
 
 ### ARP
-- Fixed 32-entry cache (`g_arpCache`)
-- `ArpResolve()`: blocking lookup with up to 3 request retries (100ms each)
-- Gateway routing: non-local IPs resolve the gateway's MAC instead
-- Handles ARP requests (replies with our MAC) and ARP replies (updates cache)
+- `arp_neighbor.h`: 64-entry neighbor table plus a 16-frame queue of packets
+  awaiting resolution (4 per neighbor), guarded by `g_arpLock`; host-tested by
+  `test_arp_neighbor` and the RX-context cases in `test_socket_lifetime`.
+- Insertion always succeeds (LRU eviction; unresolved entries capped at half
+  the table). Requests are retried every 500 ms, 3 times, then the entry fails
+  and its queued frames are dropped. Entries older than 60 s are refreshed on
+  use while the old MAC stays usable.
+- Learning follows Linux `arp_process()`: any ARP updates an existing entry for
+  its sender (gratuitous/late replies included); entries are created only for
+  packets addressed to us. Probes (sender 0.0.0.0), our own address and
+  multicast senders are ignored.
+- Receive processing (`NetReceive`, tracked per thread) and `net_poll` never
+  wait for a reply: `NetSendIpv4` queues the frame and the reply releases it.
+  Other threads block in `ArpResolve()` (woken by the reply). Before the
+  scheduler, `ArpResolve()` polls the NIC.
+- Gateway routing: non-local IPs resolve the gateway's MAC instead.
+- Diagnostics: `bridge net arp` (table), `bridge net arp flush`, and
+  `bridge net stats` (ARP, UDP receive-full, SYN backlog counters).
 
 ### IPv4
 - `NetSendIpv4()`: builds IPv4 header, computes checksum, resolves destination MAC via ARP

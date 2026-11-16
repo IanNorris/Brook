@@ -54,6 +54,7 @@ std::atomic<uint32_t> deadlineAckValue{0};
 std::atomic<uint32_t> deadlineSecondAckValue{0};
 std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
 std::atomic<bool> earlySchedulerBlock{false};
+std::atomic<brook::Process*> wakeOnlyProcess{nullptr};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
 std::atomic<int> updateAckSlot{-1};
@@ -152,6 +153,11 @@ uint64_t ProcessPendingSignals(Process* p) { return __atomic_load_n(&p->sigPendi
 uint64_t PosixTimerPending(Process*) { return 0; }
 void SchedulerBlock(Process* p) {
     if(earlySchedulerBlock.exchange(false))return;
+    if(p && p==wakeOnlyProcess.load()){
+        // Block until an explicit wake, without advancing time.
+        while(!__atomic_exchange_n(&p->pendingWakeup,0,__ATOMIC_ACQ_REL))std::this_thread::yield();
+        return;
+    }
     ticks = p ? p->wakeupTick : ticks.load() + 50;
     if (windowUpdateSocket.load()>=0 && ticks.load()>=windowUpdateTick.load()) {
         ticks=windowUpdateTick.load();int idx=windowUpdateSocket.exchange(-1);
@@ -185,6 +191,9 @@ void SchedulerUnblock(Process*) { ++wakes; }
 extern "C" void SchedulerYield() { std::this_thread::yield(); }
 void SerialPuts(const char*) {}
 void SerialPrintf(const char*, ...) {}
+}
+extern "C" void KPrintf(const char*, ...) {}
+namespace brook {
 int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                                const void* data, uint32_t len) {
     assert(proto == IP_PROTO_TCP);
@@ -287,6 +296,13 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
 }
 }
 using namespace brook;
+static void buildArp(uint8_t* out,uint16_t op,const MacAddr& ethDst,const MacAddr& sha,uint32_t spa,const MacAddr& tha,uint32_t tpa) {
+    memset(out,0,42);
+    auto* eth=reinterpret_cast<EthHeader*>(out);auto* arp=reinterpret_cast<ArpPacket*>(out+sizeof(EthHeader));
+    eth->dst=ethDst;eth->src=sha;eth->etherType=htons(ETH_TYPE_ARP);
+    arp->htype=htons(1);arp->ptype=htons(ETH_TYPE_IPV4);arp->hlen=6;arp->plen=4;arp->oper=htons(op);
+    arp->sha=sha;arp->spa=spa;arp->tha=tha;arp->tpa=tpa;
+}
 static void runTestWorker() {
     for(auto& w:testWorkers)if(w.scheduled){
         auto* process=w.process;auto fn=w.fn;void* arg=w.arg;w={};
@@ -365,15 +381,18 @@ int main() {
         g_netIfs[0]=nullptr;g_netIfCount=0;g_interfaceGeneration=1;
     }
     {
-        MacAddr mac={{1,2,3,4,5,6}},updated={{6,5,4,3,2,1}},found{};
-        assert(ArpCacheQuery(1,&found)==ArpCacheResult::Missing);
-        for(uint32_t ip=1;ip<=ARP_CACHE_SIZE;++ip)ArpCacheInsert(ip,mac);
-        assert(ArpCacheQuery(ARP_CACHE_SIZE+1,&found)==ArpCacheResult::Full);
-        ArpCacheInsert(1,updated);
-        assert(ArpCacheQuery(1,&found)==ArpCacheResult::Found && !memcmp(&found,&updated,sizeof(found)));
-        ArpCacheInsert(ARP_CACHE_SIZE+1,mac);
-        assert(ArpCacheQuery(ARP_CACHE_SIZE+1,&found)==ArpCacheResult::Full);
-        memset(g_arpCache,0,sizeof(g_arpCache));g_arpCount=0;
+        // A full table evicts its least recently used entry: insertion of a
+        // confirmed mapping always succeeds (the Dell lost its bridge host
+        // when a 32-entry table without eviction filled with LAN chatter).
+        MacAddr mac={{2,2,3,4,5,6}},updated={{6,5,4,3,2,2}},found{};
+        assert(!ArpCacheLookup(1,&found));
+        for(uint32_t ip=1;ip<=ARP_CACHE_SIZE;++ip){ticks=ticks.load()+1;ArpCacheInsert(ip,mac);}
+        ticks=ticks.load()+1;ArpCacheInsert(1,updated);
+        assert(ArpCacheLookup(1,&found) && !memcmp(&found,&updated,sizeof(found)));
+        ticks=ticks.load()+1;ArpCacheInsert(ARP_CACHE_SIZE+1,mac);
+        assert(ArpCacheLookup(ARP_CACHE_SIZE+1,&found) && !ArpCacheLookup(2,&found));
+        assert(g_arpTable.Count()==ARP_CACHE_SIZE && g_arpTable.Stats().evictions==1);
+        g_arpTable.Flush();
     }
     assert(NetIpv4PayloadFits(1480) && !NetIpv4PayloadFits(1481) && !NetIpv4PayloadFits(~uint32_t(0)));
     {
@@ -501,7 +520,7 @@ int main() {
         g_tcpTryTransmit=false;nif.tryTransmit=nullptr;
         g_arpAsyncProbeEnabled=false;g_arpAsyncProbe=AsyncArpTracker{};
         g_netIfs[0]=nullptr;g_netIfCount=0;g_interfaceGeneration=1;
-        memset(g_arpCache,0,sizeof(g_arpCache));g_arpCount=0;
+        g_arpTable.Flush();
     }
     {
         using Tracker=ArpProbeTracker<2>;Tracker tracker;Tracker::Ticket first{},other{},retry{};
@@ -1960,6 +1979,117 @@ int main() {
      packet.tcp.seqNum=htonl(20);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);}
     assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].rxCount==Socket::RX_BUF_SIZE && g_sockets[i].tcpRcvNxt==24);
     SockClose(i);
+    // Neighbor resolution from receive processing (Dell 2026-11-16). The
+    // bridge host's replies arrived, but the SYN-ACK was resolved by net_poll,
+    // which waited 1.5 s for a reply only it could process, and the 32-entry
+    // table (filled by LAN chatter, no eviction) could not retain the reply.
+    {
+        g_arpTable.Flush();
+        NetIf nif{};nif.transmit=captureFrame;nif.mac={{2,0,0,0,0,1}};
+        nif.ipAddr=htonl(0xc0a85506);nif.netmask=htonl(0xffffff00);
+        g_netIfs[0]=&nif;g_netIfCount=1;g_netIf=&nif; // service requests route by subnet
+        const MacAddr broadcast={{0xff,0xff,0xff,0xff,0xff,0xff}},zero={};
+        const uint32_t host=htonl(0xc0a85508);const MacAddr hostMac={{0xa4,0xbb,0x6d,0x81,0x34,0x13}};
+        uint8_t arp[42];
+        Process poll{};poll.refCount=1;Process user{};user.refCount=1;
+        Process* previous=currentProcess;currentProcess=&poll;g_netPollThread=&poll;
+        assert(NetNeighborWaitMode()==NeighborWait::Never);
+        // Requests between other hosts are not learned.
+        for(uint32_t n=0;n<200;++n){
+            MacAddr sha={{0x10,0,0,0,static_cast<uint8_t>(n>>8),static_cast<uint8_t>(n)}};
+            buildArp(arp,ARP_OP_REQUEST,broadcast,sha,htonl(0xc0a85500+10+n%200),zero,htonl(0xc0a85501));
+            NetReceive(&nif,arp,sizeof(arp));
+        }
+        assert(g_arpTable.Count()==0);
+        // Requests for us create entries (answered); more than fit: eviction.
+        frameTransmitCalls=0;
+        for(uint32_t n=0;n<ARP_CACHE_SIZE+8;++n){
+            ticks=ticks.load()+1;
+            MacAddr sha={{0x12,0,0,0,static_cast<uint8_t>(n>>8),static_cast<uint8_t>(n)}};
+            buildArp(arp,ARP_OP_REQUEST,broadcast,sha,htonl(0x0a000000+20+n),zero,nif.ipAddr);
+            NetReceive(&nif,arp,sizeof(arp));
+        }
+        assert(g_arpTable.Count()==ARP_CACHE_SIZE && frameTransmitCalls==ARP_CACHE_SIZE+8);
+        // SYN-ACK to the host from net_poll: queued plus one broadcast request, no wait.
+        uint8_t frame[60]{};reinterpret_cast<EthHeader*>(frame)->etherType=htons(ETH_TYPE_IPV4);frame[59]=0x5a;
+        frameTransmitCalls=0;uint64_t before=ticks.load();
+        assert(NetNeighborTransmit(&nif,host,frame,sizeof(frame))==0 && ticks.load()==before);
+        const auto* request=reinterpret_cast<const ArpPacket*>(capturedFrame+sizeof(EthHeader));
+        assert(frameTransmitCalls==1 && capturedFrameLength==42 && request->tpa==host && ntohs(request->oper)==ARP_OP_REQUEST);
+        assert(g_arpTable.QueuedFrames()==1);
+        // The reply, received by the same thread, releases the queued frame.
+        buildArp(arp,ARP_OP_REPLY,nif.mac,hostMac,host,nif.mac,nif.ipAddr);
+        NetReceive(&nif,arp,sizeof(arp));
+        assert(frameTransmitCalls==2 && capturedFrameLength==sizeof(frame) && capturedFrame[59]==0x5a);
+        assert(!memcmp(capturedFrame,&hostMac,6) && g_arpTable.QueuedFrames()==0);
+        assert(NetNeighborTransmit(&nif,host,frame,sizeof(frame))==0 && frameTransmitCalls==3);
+        // An unsolicited (gratuitous) announcement updates the existing entry.
+        const MacAddr moved={{0xa4,0xbb,0x6d,0x81,0x34,0x99}};
+        buildArp(arp,ARP_OP_REPLY,broadcast,moved,host,broadcast,host);
+        NetReceive(&nif,arp,sizeof(arp));
+        assert(NetNeighborTransmit(&nif,host,frame,sizeof(frame))==0 && !memcmp(capturedFrame,&moved,6));
+        // A reply addressed to us is retained even with no outstanding entry.
+        g_arpTable.Flush();buildArp(arp,ARP_OP_REPLY,nif.mac,hostMac,host,nif.mac,nif.ipAddr);
+        NetReceive(&nif,arp,sizeof(arp));
+        frameTransmitCalls=0;
+        assert(NetNeighborTransmit(&nif,host,frame,sizeof(frame))==0 && frameTransmitCalls==1 && !memcmp(capturedFrame,&hostMac,6));
+        // Probes (spa 0), our own address and multicast senders are not learned.
+        const unsigned count=g_arpTable.Count();
+        buildArp(arp,ARP_OP_REQUEST,broadcast,hostMac,0,zero,nif.ipAddr);NetReceive(&nif,arp,sizeof(arp));
+        buildArp(arp,ARP_OP_REPLY,nif.mac,hostMac,nif.ipAddr,nif.mac,nif.ipAddr);NetReceive(&nif,arp,sizeof(arp));
+        buildArp(arp,ARP_OP_REPLY,nif.mac,broadcast,htonl(0xc0a85509),nif.mac,nif.ipAddr);NetReceive(&nif,arp,sizeof(arp));
+        assert(g_arpTable.Count()==count);
+        // Unresolved neighbors are failed by the poll-loop service, dropping frames.
+        const uint32_t dead=htonl(0xc0a85563);const auto failDrops=g_arpTable.Stats().failDrops;
+        frameTransmitCalls=0;
+        for(int n=0;n<6;++n)assert(NetNeighborTransmit(&nif,dead,frame,sizeof(frame))==0);
+        assert(g_arpTable.QueuedFrames()==ARP_QUEUE_PER_NEIGHBOR && frameTransmitCalls==1);
+        for(int n=0;n<4;++n){ticks=ticks.load()+ARP_RETRY_MS;ArpService();}
+        assert(g_arpTable.QueuedFrames()==0 && g_arpTable.Stats().failDrops==failDrops+ARP_QUEUE_PER_NEIGHBOR);
+        assert(frameTransmitCalls==3); // three requests in total, then failure
+        // Ordinary threads may wait (bounded); the same thread inside NetReceive may not.
+        currentProcess=&user;
+        assert(NetNeighborWaitMode()==NeighborWait::Block);
+        {NetRxScope scope;assert(NetNeighborWaitMode()==NeighborWait::Never);
+         {NetRxScope nested;assert(NetNeighborWaitMode()==NeighborWait::Never);}
+         assert(NetNeighborWaitMode()==NeighborWait::Never);}
+        assert(NetNeighborWaitMode()==NeighborWait::Block);
+        before=ticks.load();frameTransmitCalls=0;
+        assert(NetNeighborTransmit(&nif,dead,frame,sizeof(frame))==-2);
+        assert(ticks.load()-before>=3*ARP_RETRY_MS && frameTransmitCalls==3 && !g_arpWaiters[0].process);
+        // A blocked resolver is woken by the reply for its address.
+        g_arpTable.Flush();
+        {MacAddr mac{};std::atomic<bool> done{false};
+         wakeOnlyProcess=&user;
+         std::thread resolver([&]{currentProcess=&user;assert(ArpResolve(host,&mac));done=true;});
+         await([&]{SpinLockAcquire(&g_arpLock);bool waiting=g_arpWaiters[0].process==&user;SpinLockRelease(&g_arpLock);return waiting;});
+         buildArp(arp,ARP_OP_REPLY,nif.mac,hostMac,host,nif.mac,nif.ipAddr);
+         currentProcess=&poll;NetReceive(&nif,arp,sizeof(arp));
+         resolver.join();wakeOnlyProcess=nullptr;assert(done && !memcmp(&mac,&hostMac,6) && user.refCount==1);}
+        currentProcess=previous;g_netPollThread=nullptr;g_arpTable.Flush();
+        g_netIfs[0]=nullptr;g_netIfCount=0;g_netIf=nullptr;
+    }
+    // An application that stops reading costs one counter per datagram, and
+    // stale half-open children cannot lock the debug listener (backlog 2).
+    {
+        int u=create(SOCK_DGRAM);g_sockets[u].bound=true;g_sockets[u].localPort=htons(5353);
+        static uint8_t dns[512];const auto fullBefore=g_netCounters.udpRxFull;
+        for(unsigned n=0;n<2000;++n)SockDeliverUdp(2,53,1,5353,dns,sizeof(dns));
+        assert(g_netCounters.udpRxFull-fullBefore==2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)));
+        int l=create();g_sockets[l].listening=true;g_sockets[l].listenBacklog=2;
+        g_sockets[l].localPort=htons(1234);g_sockets[l].tcpState=TcpState::Listen;
+        auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;TcpHeader t{};
+            t.srcPort=htons(port);t.dstPort=htons(1234);t.seqNum=htonl(70);t.flags=TCP_SYN;
+            t.window=htons(1000);t.dataOff=5<<4;HandleTcp(&ip,&t,sizeof(t));};
+        syn(40000);syn(40001);assert(g_sockets[l].acceptQueueCount==2);
+        const auto fullDrops=g_netCounters.synQueueFull,evicted=g_netCounters.synRecvEvicted;
+        syn(40002);assert(g_sockets[l].acceptQueueCount==2 && g_netCounters.synQueueFull==fullDrops+1);
+        ticks=ticks.load()+1001;syn(40002);
+        assert(g_netCounters.synRecvEvicted==evicted+1 && g_sockets[l].acceptQueueCount==2);
+        assert(g_sockets[g_sockets[l].acceptQueue[0]].remotePort==htons(40001));
+        assert(g_sockets[g_sockets[l].acceptQueue[1]].remotePort==htons(40002));
+        SockClose(l);SockClose(u);
+    }
     assert(allocations == frees);
     std::puts("socket lifetime: PASS");
 }
