@@ -520,12 +520,16 @@ int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
 // client-local for mouse events.  Drops on overflow.
 bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY,
                  uint32_t captureToken = 0);
-// WM_POINTER_CAPTURE: query=0, acquire=1, release=2, engage serial=3.
+// WM_POINTER_CAPTURE: query=0, acquire=1, release=2, engage serial=3,
+// activation pending=4 (1 when acquire may skip the hover requirement).
 // Positive leases never identify a later incarnation of the same window slot.
 // Acquire also requires the pointer to be over the window's own client area
 // (never the taskbar, launcher, volume popup, chrome or another window) and,
-// after an involuntary revoke, a fresh physical click in that client area.
-// The engage serial is per window: it advances only on such clicks.
+// after an involuntary revoke, re-engagement: a fresh physical click in that
+// client area, or a deliberate activation (Alt+Tab, taskbar button). An
+// activation also waives the hover requirement once: the grant warps the
+// pointer into the window's content. The engage serial is per window and
+// advances only on those two gestures.
 int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint32_t token);
 bool WmPointerCaptureActive();
 uint64_t WmPointerCaptureRevision();
@@ -541,6 +545,9 @@ bool WmRouteCapturedPointer(const InputEvent& event);
 void WmPointerSetHover(int idx);
 // A physical primary press was delivered to window `idx`'s client area.
 void WmPointerEngage(int idx);
+// Window `idx` was just deliberately activated (Alt+Tab, taskbar button) and
+// is focused. Call after the focus change, never for click-to-focus.
+void WmPointerActivate(int idx);
 bool WmInputPushRelative(Window* window,const InputEvent& event);
 
 // Drain up to `max` events from the window's queue into `out`.  Returns

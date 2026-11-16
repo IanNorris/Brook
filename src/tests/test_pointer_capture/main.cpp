@@ -46,7 +46,8 @@ int main() {
     CHECK(WmPointerCapture(stranger,id,1,0)==-2);
     CHECK(WmPointerCapture(owner,id,1,1)==-22);
     CHECK(WmPointerCapture(owner,id,3,0)==0);
-    CHECK(WmPointerCapture(owner,id,4,0)==-22);
+    CHECK(WmPointerCapture(owner,id,4,0)==0 && WmPointerCapture(owner,id,4,1)==-22);
+    CHECK(WmPointerCapture(owner,id,5,0)==-22);
     CHECK(WmPointerCapture(owner,id,1,0)==-11); // Pointer not over its content yet.
     WmPointerSetHover(slot);
     int64_t lease=WmPointerCapture(owner,id,1,0);
@@ -216,6 +217,47 @@ int main() {
     WmPointerEngage(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     CHECK(WmPointerCapture(owner,id,2,lease)==0 && !w->pointerDisengaged);
     lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    // Alt+Tab away and back (Windows semantics): the deliberate activation
+    // re-engages and waives hover; the grant warps into the content centre.
+    const int32_t centreX=w->clientX()+w->clientW/2,centreY=w->clientY()+w->clientH/2;
+    WmSetFocus(other);CHECK(!WmPointerCaptureActive() && w->pointerDisengaged);
+    WmPointerSetHover(other);mouseX=30;mouseY=30; // Pointer over the other window.
+    WmPointerActivate(slot);CHECK(WmPointerCapture(owner,id,4,0)==0); // Not focused: no-op.
+    WmSetFocus(slot);CHECK(WmPointerCapture(owner,id,1,0)==-11); // Plain refocus.
+    auto serial=WmPointerCapture(owner,id,3,0);
+    WmPointerActivate(slot);
+    CHECK(!w->pointerDisengaged && WmPointerCapture(owner,id,3,0)==serial+1 && WmPointerCapture(owner,id,4,0)==1);
+    lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0 && WmPointerCaptureActive());
+    CHECK(mouseX==centreX && mouseY==centreY && WmPointerCapture(owner,id,4,0)==0); // Consumed.
+    CHECK(WmPointerCaptureReleaseByUser() && mouseX==centreX && mouseY==centreY);
+    // Super leaves it focused-but-disengaged: taskbar hover never grabs.
+    WmPointerSetHover(-1);CHECK(WmPointerCapture(owner,id,1,0)==-11 && !WmPointerCapture(owner,id,4,0));
+    // Taskbar-button activation: the activating press is still held, so the
+    // grant waits for its release and the click never reaches the game.
+    WmSetFocus(other);mouseButtons=1;WmSetFocus(slot);WmPointerActivate(slot);
+    CHECK(WmPointerCapture(owner,id,4,0)==1 && WmPointerCapture(owner,id,1,0)==-11);
+    WmPointerSetHover(-1); // Still on the taskbar: the waiver survives.
+    mouseButtons=0;lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
+    CHECK(WmPointerCaptureReleaseByUser());
+    WmPointerSetHover(-1); // The user then moves back onto the taskbar.
+    // Cancellations: Super, moving to another target, launcher, volume popup,
+    // focus change and minimise all drop a pending activation.
+    WmSetFocus(other);WmSetFocus(slot);WmPointerActivate(slot);
+    CHECK(WmPointerCaptureReleaseByUser()==false && !WmPointerCapture(owner,id,4,0));
+    CHECK(WmPointerCapture(owner,id,1,0)==-11); // Engaged, but over the taskbar.
+    WmSetFocus(other);WmSetFocus(slot);WmPointerActivate(slot);
+    WmPointerSetHover(other);CHECK(!WmPointerCapture(owner,id,4,0) && WmPointerCapture(owner,id,1,0)==-11);
+    WmPointerSetHover(-1);WmSetFocus(other);WmSetFocus(slot);WmPointerActivate(slot);
+    g_launcherOpen=true;CHECK(WmPointerCapture(owner,id,1,0)==-11);g_launcherOpen=false;
+    CHECK(!WmPointerCapture(owner,id,4,0) && WmPointerCapture(owner,id,1,0)==-11);
+    WmSetFocus(other);WmSetFocus(slot);WmPointerActivate(slot);
+    g_volumePopupOpen=true;CHECK(WmPointerCapture(owner,id,1,0)==-11);g_volumePopupOpen=false;
+    CHECK(!WmPointerCapture(owner,id,4,0));
+    WmPointerActivate(slot);WmSetFocus(other);CHECK(!WmPointerCapture(owner,id,4,0));
+    WmSetFocus(slot);WmPointerActivate(slot);WmMinimizeWindow(slot);CHECK(!WmPointerCapture(owner,id,4,0));
+    WmRestoreWindow(slot);CHECK(WmPointerCapture(owner,id,1,0)==-11);
+    // Restore from the taskbar is an activation too; then back to normal.
+    WmPointerActivate(slot);lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);
     mouseButtons=1;
     event={};event.type=InputEventType::MouseRelativeMove;event.sequence=++sequence;
     { VfbGuard guard;SetWmActiveLocked(false); }
@@ -234,5 +276,5 @@ int main() {
     CHECK(WmPointerCapture(owner,id,1,0)==-75 && !WmPointerCaptureActive());
     w->vfb=nullptr;WmDestroyWindowById(owner,id);WmDestroyWindow(other);
     std::free(owner);std::free(stranger);CHECK(!lockDepth);
-    std::puts("POINTER_CAPTURE PASS: ownership, ordering, signed totals, focus/death/reuse, overflow, emergency and Super release, re-engage only by content click, no lock over shell surfaces");
+    std::puts("POINTER_CAPTURE PASS: ownership, ordering, signed totals, focus/death/reuse, overflow, emergency and Super release, re-engage by content click or Alt+Tab/taskbar activation (hover waived, click withheld), no lock over shell surfaces");
 }

@@ -2534,6 +2534,8 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
         if(zCount>1) {
             WmSendToBack(zOrder[zCount-1]);
             WmSetFocus(zOrder[zCount-2]);
+            // A deliberate switch: the target's pointer lock may take over.
+            WmPointerActivate(zOrder[zCount-2]);
         }
         break;
     }
@@ -3054,9 +3056,13 @@ static void CompositorHandleMouseWM()
             Window* tw = WmGetWindow(tbIdx);
             if (tw && tw->proc)
             {
+                // Restoring/focusing via the taskbar is a deliberate
+                // activation (as on Windows). The kernel withholds the lock
+                // until this press is released, so it never reaches the game.
                 if (tw->minimized)
                 {
                     WmRestoreWindow(tbIdx);
+                    WmPointerActivate(tbIdx);
                 }
                 else if (tw->focused)
                 {
@@ -3065,6 +3071,7 @@ static void CompositorHandleMouseWM()
                 else
                 {
                     WmSetFocus(tbIdx);
+                    WmPointerActivate(tbIdx);
                 }
             }
         }
