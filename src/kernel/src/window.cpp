@@ -27,6 +27,7 @@
 #include "shutdown.h"
 #include "launcher_command.h"
 #include "launch_feedback.h"
+#include "launcher_power.h"
 #include "shell.h"
 #include "process.h"
 #include "scheduler.h"
@@ -474,6 +475,8 @@ static bool g_launcherLoaded = false;
 static bool g_launcherOpen = false;
 static int g_launcherError = 0;
 static uint32_t g_launcherScroll = 0;
+// Power buttons arm a confirmation; only the separate confirm button acts.
+static LauncherPowerGuard g_launcherPower;
 static void LauncherStartWorker();
 
 // Requests own all metadata/icon pixels, never launcher snapshot pointers.
@@ -3188,13 +3191,14 @@ void WmLauncherLoad()
     g_launcherLoaded = true;
 }
 
-void WmLauncherClose() { g_launcherOpen = false; }
+void WmLauncherClose() { g_launcherOpen = false; g_launcherPower.Reset(); }
 
 void WmLauncherToggle()
 {
     // Loading belongs to WmSetActive (shell context), never the input/render thread.
     if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
+    g_launcherPower.Reset();
     if (g_launcherOpen) {
         PointerActivationCancel();
         WmVolumePopupClose(); // the two popups share one overlay slot
@@ -3215,6 +3219,20 @@ struct LauncherLayout
     uint32_t w, h, cols, rows, itemW, capacity;
 };
 
+static constexpr const char* LAUNCHER_POWER_LABELS[] = {"Restart", "Shut down", "Cancel"};
+static constexpr const char* LAUNCHER_CONFIRM_LABELS[] = {"Restart now", "Shut down now"};
+
+static LauncherPowerMetrics LauncherPowerMetricsNow()
+{
+    int label = 0, confirm = 0;
+    for (const char* text : LAUNCHER_POWER_LABELS) { const int w = WmTextWidth(text); if (w > label) label = w; }
+    for (const char* text : LAUNCHER_CONFIRM_LABELS) { const int w = WmTextWidth(text); if (w > confirm) confirm = w; }
+    const int inner = 2 * static_cast<int>(WmMetric(14));
+    return {static_cast<int>(WmMetric(LAUNCHER_ITEM_HEIGHT)), static_cast<int>(WmMetric(LAUNCHER_PADDING)),
+            static_cast<int>(WmMetric(6)), static_cast<int>(WmMetric(28)), static_cast<int>(WmMetric(12)),
+            label + inner, confirm + inner};
+}
+
 static LauncherLayout GetLauncherLayout(uint32_t screenW, uint32_t screenH,
                                         const LauncherSnapshot& launcher)
 {
@@ -3226,7 +3244,9 @@ static LauncherLayout GetLauncherLayout(uint32_t screenW, uint32_t screenH,
     l.x = screenW > WmMetric(8) ? WmMetric(4) : 0;
     const uint32_t availableW = screenW > WmMetric(8) ? screenW - WmMetric(8) : screenW;
     const uint32_t availableH = desktopH > WmMetric(4) ? desktopH - WmMetric(4) : desktopH;
-    const uint32_t fixedH = 2 * WmMetric(LAUNCHER_ITEM_HEIGHT) + 2 * WmMetric(LAUNCHER_PADDING);
+    const LauncherPowerMetrics power = LauncherPowerMetricsNow();
+    const uint32_t fixedH = WmMetric(LAUNCHER_ITEM_HEIGHT) + 2 * WmMetric(LAUNCHER_PADDING) +
+                            static_cast<uint32_t>(LauncherPowerFooterHeight(power));
     l.rows = availableH > fixedH ? (availableH - fixedH) / (WmMetric(LAUNCHER_ITEM_HEIGHT) + WmMetric(2)) : 0;
     if (l.rows > LAUNCHER_MAX_ROWS) l.rows = LAUNCHER_MAX_ROWS;
     l.cols = l.rows ? (total + l.rows - 1) / l.rows : 1;
@@ -3245,12 +3265,62 @@ static LauncherLayout GetLauncherLayout(uint32_t screenW, uint32_t screenH,
     uint32_t maxScroll = total > l.capacity ? total - l.capacity : 0;
     if (g_launcherScroll > maxScroll) g_launcherScroll = maxScroll;
     l.w = l.cols * (l.itemW + WmMetric(4)) + 2 * WmMetric(LAUNCHER_PADDING);
+    const uint32_t footerW = static_cast<uint32_t>(LauncherPowerMinimumWidth(power));
+    if (l.w < footerW) l.w = footerW; // the power prompt never clips its confirm button
     if (l.w > availableW) l.w = availableW;
     l.h = fixedH + l.rows * (WmMetric(LAUNCHER_ITEM_HEIGHT) + WmMetric(2));
     if (l.h > availableH) l.h = availableH;
     l.y = static_cast<int>(desktopH) - static_cast<int>(l.h) - WmMetric(2);
     if (l.y < 0) l.y = 0;
     return l;
+}
+
+static LauncherPowerLayout LauncherPowerLayoutFor(const LauncherLayout& l)
+{
+    return LauncherPowerFooter({l.x, l.y, static_cast<int>(l.w), static_cast<int>(l.h)}, LauncherPowerMetricsNow());
+}
+
+static void LauncherPowerButton(uint32_t* buf, uint32_t stride, uint32_t sw, uint32_t sh, const WmRect& r,
+                                const char* label, uint32_t bg, uint32_t fg, bool focused)
+{
+    if (r.w <= 0 || r.h <= 0) return;
+    const int inset = static_cast<int>(WmMetric(4));
+    const WmRect face{r.x, r.y + inset, r.w, r.h - 2 * inset};
+    if (focused) {
+        const int ring = static_cast<int>(WmMetric(2));
+        WmMaterialRect(buf, stride, sw, sh, {face.x - ring, face.y - ring, face.w + 2 * ring, face.h + 2 * ring}, 0x68acff);
+    }
+    WmMaterialRect(buf, stride, sw, sh, face, bg);
+    const int textW = WmTextWidth(label);
+    const int x = r.x + (textW < r.w ? (r.w - textW) / 2 : 0);
+    WmRenderMaterialString(buf, stride, sw, sh, x, r.y + (r.h - WmDesktopFont().lineHeight) / 2, label, fg, bg, r.w);
+}
+
+static bool LauncherShutdownActive() { return !ShutdownLaunchAllowed(); }
+
+static void LauncherPowerRender(uint32_t* buf, uint32_t stride, uint32_t sw, uint32_t sh,
+                                const LauncherLayout& layout, int32_t mouseX, int32_t mouseY)
+{
+    const LauncherPowerLayout f = LauncherPowerLayoutFor(layout);
+    if (f.footer.w <= 0) return;
+    const WmPalette& pal = WmCurrentPalette();
+    WmFillRect(buf, stride, sw, sh, f.separator.x, f.separator.y, f.separator.w, f.separator.h, pal.launcherBorder);
+    const auto face = [&](const DesktopRect& r) { return r.contains(mouseX, mouseY) ? pal.taskHover : pal.taskButton; };
+    if (LauncherShutdownActive()) {
+        LauncherPowerButton(buf, stride, sw, sh, f.cluster, "Cancel shutdown", face(f.cluster), pal.text, false);
+        return;
+    }
+    if (g_launcherPower.prompt()) {
+        const bool restart = g_launcherPower.pending() == LauncherPowerAction::Restart;
+        const bool focusConfirm = g_launcherPower.confirmFocused();
+        // Destructive confirm: the close-button red, apart from the cluster.
+        const uint32_t confirmBg = f.confirm.contains(mouseX, mouseY) ? WmBlendColor(pal.closeHover, pal.text, 200) : pal.closeHover;
+        LauncherPowerButton(buf, stride, sw, sh, f.confirm, LAUNCHER_CONFIRM_LABELS[restart ? 0 : 1], confirmBg, pal.closeText, focusConfirm);
+        LauncherPowerButton(buf, stride, sw, sh, f.dismiss, LAUNCHER_POWER_LABELS[2], face(f.dismiss), pal.text, !focusConfirm);
+        return;
+    }
+    LauncherPowerButton(buf, stride, sw, sh, f.restart, LAUNCHER_POWER_LABELS[0], face(f.restart), pal.text, false);
+    LauncherPowerButton(buf, stride, sw, sh, f.shutdown, LAUNCHER_POWER_LABELS[1], face(f.shutdown), pal.text, false);
 }
 
 static WmRect LauncherItemRect(const LauncherLayout& l, uint32_t slot)
@@ -3323,7 +3393,11 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     if (pw > WmMetric(56)) WmRenderMaterialString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int>(WmMetric(4)),
                    iy + static_cast<int32_t>(textYOff),
-                   g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" : ShutdownDesktopStatus(), WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
+                   g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" :
+                   g_launcherPower.prompt() && !LauncherShutdownActive() ?
+                       (g_launcherPower.pending() == LauncherPowerAction::Restart ?
+                            "Restart? Open apps will be asked to close" : "Shut down? Open apps will be asked to close") :
+                   ShutdownDesktopStatus(), WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
     iy += WmMetric(LAUNCHER_ITEM_HEIGHT);
 
     // Separator line below header
@@ -3331,19 +3405,14 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)),
                iy - 1, static_cast<int>(pw) - 2 * WmMetric(LAUNCHER_PADDING), 1, WmCurrentPalette().launcherBorder);
 
-    // Always available, independent of installed package shortcuts.
-    const int footerY=py+static_cast<int>(ph)-WmMetric(LAUNCHER_PADDING)-WmMetric(LAUNCHER_ITEM_HEIGHT);
-    const int third=(static_cast<int>(pw)-2*WmMetric(LAUNCHER_PADDING))/3;
-    const char* labels[]={"Shut down","Restart","Cancel"};
-    for(int i=0;i<3;++i)if(third>static_cast<int>(WmMetric(12)))
-        WmRenderMaterialString(backBuffer,stride,screenW,screenH,px+WmMetric(LAUNCHER_PADDING)+i*third+WmMetric(4),footerY+textYOff,labels[i],WmCurrentPalette().text,WmCurrentPalette().launcher,third-WmMetric(8));
-
     // Items — render in multi-column layout based on scroll offset
     uint32_t totalValid = 0;
     for (uint32_t i = 0; i < launcher.count; i++)
         if (launcher.items[i].valid) totalValid++;
 
     const LauncherLayout layout = GetLauncherLayout(screenW, screenH, launcher);
+    // Power controls: always available, in their own footer below a separator.
+    LauncherPowerRender(backBuffer, stride, screenW, screenH, layout, mouseX, mouseY);
     uint32_t maxVisible = layout.capacity;
 
     uint32_t validIdx = 0;
@@ -3425,12 +3494,11 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
         my < py || my >= py + static_cast<int32_t>(ph))
         return -1;
 
-    const int footerY=py+static_cast<int>(ph)-WmMetric(LAUNCHER_PADDING)-WmMetric(LAUNCHER_ITEM_HEIGHT);
-    const int third=(static_cast<int>(pw)-2*WmMetric(LAUNCHER_PADDING))/3;
-    const int relative=mx-px-WmMetric(LAUNCHER_PADDING);
-    if(my>=footerY&&my<footerY+static_cast<int>(WmMetric(LAUNCHER_ITEM_HEIGHT))&&third>0&&relative>=0&&relative<3*third)
-        return WM_LAUNCHER_MAX_ITEMS+relative/third;
     const LauncherLayout layout = GetLauncherLayout(screenW, screenH, launcher);
+    const LauncherPowerTarget power = LauncherPowerHit(LauncherPowerLayoutFor(layout), g_launcherPower.prompt(),
+                                                       LauncherShutdownActive(), mx, my);
+    if (power != LauncherPowerTarget::None)
+        return WM_LAUNCHER_MAX_ITEMS + static_cast<int>(power); // inert Footer is consumed, not a dismissal
     uint32_t maxVisible = layout.capacity;
 
     // Map visual slot to actual launcher item, accounting for scroll
@@ -3502,11 +3570,35 @@ bool WmLauncherDispatching() {
     for(const auto& entry:g_launches.entries)if(entry.inFlight())dispatching=true;
     SpinLockRelease(&g_launchLock);return dispatching;
 }
+static void LauncherPowerRun(LauncherPowerCommand command)
+{
+    switch(command) {
+    case LauncherPowerCommand::None:break;
+    case LauncherPowerCommand::Restart:SerialPuts("WM: launcher restart confirmed\n");ShutdownDesktopRequest(true);break;
+    case LauncherPowerCommand::Shutdown:SerialPuts("WM: launcher shutdown confirmed\n");ShutdownDesktopRequest(false);break;
+    case LauncherPowerCommand::CancelShutdown:ShutdownDesktopCancel();break;
+    }
+    CompositorMarkDirty();CompositorWake();
+}
+
+bool WmLauncherPowerPrompt() { return g_launcherOpen && g_launcherPower.prompt(); }
+
+void WmLauncherPowerKey(uint8_t scan)
+{
+    if(!WmLauncherPowerPrompt())return;
+    const LauncherPowerKey key=scan==0x01?LauncherPowerKey::Escape:scan==0x1C?LauncherPowerKey::Enter:
+        scan==SC_EXT_LEFT?LauncherPowerKey::Previous:LauncherPowerKey::Next;
+    LauncherPowerRun(g_launcherPower.Key(key,ApicTickCount()));
+}
+
 void WmLauncherExec(int itemIdx)
 {
-    if(itemIdx==WM_LAUNCHER_MAX_ITEMS){ShutdownDesktopRequest(false);return;}
-    if(itemIdx==WM_LAUNCHER_MAX_ITEMS+1){ShutdownDesktopRequest(true);return;}
-    if(itemIdx==WM_LAUNCHER_MAX_ITEMS+2){ShutdownDesktopCancel();return;}
+    constexpr int footer=static_cast<int>(WM_LAUNCHER_MAX_ITEMS);
+    if(itemIdx>=footer){
+        LauncherPowerRun(g_launcherPower.Activate(static_cast<LauncherPowerTarget>(itemIdx-footer),ApicTickCount()));
+        return;
+    }
+    g_launcherPower.Reset(); // any other launcher press dismisses the prompt
     LauncherReadGuard guard;uint64_t token=0;bool coalesced=false;
     AdmitLauncherItem(guard.get(),itemIdx,false,&token,&coalesced);
 }
