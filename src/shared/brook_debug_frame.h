@@ -61,6 +61,19 @@ enum { BROOK_DESKTOP_OVERLAY_GENERATION=6, BROOK_DESKTOP_OVERLAY_WAIT=7,
        BROOK_DESKTOP_OVERLAY_CURSOR=8 };
 enum { BROOK_DESKTOP_OVERLAY_NO_CURSOR=1, BROOK_DESKTOP_OVERLAY_WAIT_MAX_MS=250 };
 enum { BROOK_DESKTOP_CURSOR_MAX=64 };
+/* Op 9 (optional; older kernels return -EINVAL) is op 4 plus, per band, an
+ * opaque bit and a content key, for the same capture lease. Bit i of opaque
+ * means every pixel of band i has alpha 255 (a shell surface drawn in an
+ * opaque material), so a renderer may let it replace whatever lies beneath.
+ * keys[i] is a nonzero hash of band i's geometry and pixels: a band with the
+ * same geometry and key as one the caller holds has identical pixels, so it
+ * need not be reread or redrawn. bands.reserved stays zero. */
+enum { BROOK_DESKTOP_OVERLAY_BANDS_V2=9 };
+struct BrookDesktopOverlayBandsV2 {
+    struct BrookDesktopOverlayBands bands;
+    uint32_t opaque,reserved;
+    uint64_t keys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
+};
 struct BrookDesktopOverlayInfo {
     struct BrookDebugFrameInfo frame;
     uint64_t generation;

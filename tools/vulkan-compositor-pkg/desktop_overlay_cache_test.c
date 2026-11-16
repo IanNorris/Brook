@@ -5,7 +5,7 @@
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"OVERLAY_CACHE line %d: %s\n",__LINE__,#x);abort();}}while(0)
 
 static struct DesktopOverlayFrameState frame(uint64_t generation){
-    struct DesktopOverlayFrameState s={1,100,80,generation,{0},{0}};
+    struct DesktopOverlayFrameState s={1,100,80,generation,{0},{0},0,{0}};
     s.bands.count=1;s.bands.bands[0]=(struct BrookDesktopOverlayBand){0,70,100,10};
     return s;
 }

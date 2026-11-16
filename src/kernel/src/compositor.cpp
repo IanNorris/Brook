@@ -2022,6 +2022,10 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
     DesktopOverlayRect rects[4]{};
     uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects);
+    // RenderDesktopOverlay sets alpha 255 across every surface rectangle it
+    // returns (the overlay is never captured under glass), so each is opaque;
+    // a composited pointer rectangle appended below is not.
+    const uint32_t opaqueRects=(1u<<rectCount)-1u;
     g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=InputLatestSequence();
     g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
     if(cursorVisible && g_debugFrameOverlayCursor){
@@ -2052,7 +2056,8 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
             }
         }
     }
-    if(!DesktopOverlayMakeBands(width,height,rects,rectCount,g_debugOverlayBands))return;
+    if(!DesktopOverlayMakeBands(width,height,rects,rectCount,g_debugOverlayBands,opaqueRects))return;
+    DesktopOverlayKeyBands(pixels,width,height,g_debugOverlayBands);
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
     g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=now;
     g_debugFrame.epoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
