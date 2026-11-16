@@ -80,6 +80,8 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
 #include "window.h"
+#include "desktop_telemetry.h"
+#include "storage_io_stats.h"
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
@@ -5100,6 +5102,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("last_event_sequence",oom.lastEventSequence);r.text("}");
         r.text(",");r.field("process_count",count);
         r.text(",");r.field("running_process_count",running);
+        // Device transfer totals per storage source plus the taskbar's last
+        // R/W sample (bytes/s, refreshed every 500 ms by the compositor).
+        const auto desktop=WmDesktopTelemetryRead();
+        r.text(",\"storage\":{");r.field("taskbar_sample_tick_ms",desktop.tick);
+        r.text(",");r.field("taskbar_read_bytes_per_second",desktop.readBytesPerSecond);
+        r.text(",");r.field("taskbar_write_bytes_per_second",desktop.writeBytesPerSecond);
+        for(uint32_t source=0;source<uint32_t(StorageIoSource::Count);++source) {
+            const auto id=StorageIoSource(source);const auto totals=StorageIoRead(id);
+            r.text(",\"");r.text(StorageIoSourceName(id));r.text("\":{");
+            r.field("read_ops",totals.readOps);r.text(",");r.field("write_ops",totals.writeOps);
+            r.text(",");r.field("flush_ops",totals.flushOps);r.text(",");r.field("read_bytes",totals.readBytes);
+            r.text(",");r.field("write_bytes",totals.writeBytes);r.text("}");
+        }
+        r.text("}");
         r.text(",");r.field("sample_tick_ms",t.tick);
         r.text(",\"frametimes\":{\"source\":\"compositor_interval\",");r.field("count",t.count);
         r.text(",");r.field("p50_ms",t.p50Ms);r.text(",");r.field("p90_ms",t.p90Ms);

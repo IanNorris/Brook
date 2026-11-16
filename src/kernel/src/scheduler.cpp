@@ -2319,6 +2319,11 @@ void SchedulerYield()
     DoSwitch(old, next, requeue, /* holdingReadyLock */ true);
 }
 
+bool SchedulerIsRunning()
+{
+    return __atomic_load_n(&g_schedulerRunning, __ATOMIC_ACQUIRE);
+}
+
 extern "C" void SchedulerSleepMs(uint32_t ms)
 {
     if (ms == 0) { SchedulerYield(); return; }

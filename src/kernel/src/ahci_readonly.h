@@ -10,7 +10,19 @@ struct AhciReadOnlyStatus {
     uint64_t sectors=0;
     char model[41]{}, serial[21]{};
 };
+// Runtime completion-wait statistics (relaxed counters). irqMode reports
+// whether completion interrupts are currently in use.
+struct AhciIoStats {
+    uint64_t waits=0, spinCompletions=0, sleepingWaits=0, sleeps=0, yields=0;
+    uint64_t irqWakes=0, irqTimeouts=0, irqSkipped=0, irqDisabled=0, interrupts=0;
+    uint64_t waitNs=0, maxWaitNs=0;
+    // Interrupted sleeps only: block -> ISR wake, and ISR wake -> waiter running.
+    uint64_t irqLatencyNs=0, wakeLatencyNs=0, maxWakeLatencyNs=0;
+};
+struct AhciIrqStatus { bool configured=false, active=false; uint8_t vector=0, apic=0; const char* reason="not configured"; };
 void AhciReadOnlyInit();
+AhciIoStats AhciReadOnlyIoStats();
+AhciIrqStatus AhciReadOnlyIrqStatus();
 AhciReadOnlyStatus AhciReadOnlyGetStatus();
 // Boot-only, borrowed device pointer: available only for an identity-admitted,
 // ready writable disk. The registered device remains pinned for the boot.

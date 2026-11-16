@@ -7,6 +7,8 @@
 #include "ahci_byte_write.h"
 #include "ahci_panic_gate.h"
 #include "ahci_write_target.h"
+#include "ahci_completion.h"
+#include "storage_io_stats.h"
 #include "ata_identify.h"
 #include "pci.h"
 #include "vfs.h"
@@ -16,6 +18,13 @@
 #include "memory/virtual_memory.h"
 #include "memory/address.h"
 #include "apic.h"
+#include "idt.h"
+#include "irq_wrapper.h"
+#include "process.h"
+#include "scheduler.h"
+#include "spinlock.h"
+#include "tsc_clock.h"
+#include "smp.h"
 #include "serial.h"
 #include "string.h"
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
@@ -84,6 +93,39 @@ uint32_t contentionTestYielded=0;
 #endif
 static constexpr uint32_t pages=17, dataOffset=4096, tableOffset=1280, fisOffset=1024;
 
+// Runtime completion interrupts (single-message MSI to the BSP). PxIE is
+// nonzero only while a normal-I/O owner sleeps for its command; the panic
+// writer only runs after that owner has left the gate, so it always finds
+// port interrupts masked and keeps its polling loop. Interrupt mode can only
+// be turned off after boot (automatic miss detection), never back on.
+constexpr uint8_t AhciMsiVector=64; // outside the shared INTx pool (48-63)
+constexpr uint64_t AhciSpinNs=100000;
+IrqSpinLock irqLock{};
+Process* irqWaiter=nullptr;       // under irqLock
+uint64_t irqWakeNs=0;             // under irqLock: when the ISR woke irqWaiter
+// True from arming to disarm in SleepForCompletion. In that window the owner
+// touches only PxIE, HBA IS and irqLock, never descriptors or the DMA buffer;
+// panic capture uses it to recover the gate from a halted or unschedulable
+// sleeper (the MSI and timed wakeups are both serviced by the BSP).
+bool ownerSleeping=false;
+bool irqMode=false;               // published before first normal I/O; cleared on misses
+AhciIrqHealth irqHealth{};        // under ioLock (normal I/O owner)
+AhciIoStats ioStats{};
+AhciIrqStatus irqStatus{};
+void StatAdd(uint64_t& field,uint64_t value=1){__atomic_fetch_add(&field,value,__ATOMIC_RELAXED);}
+void StatMax(uint64_t& field,uint64_t value){
+    uint64_t seen=__atomic_load_n(&field,__ATOMIC_RELAXED);
+    while(value>seen && !__atomic_compare_exchange_n(&field,&seen,value,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+}
+bool PanicIo() {
+#if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
+    return panicIoMode;
+#else
+    return false;
+#endif
+}
+bool InterruptsEnabled(){uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");return f&0x200;}
+
 struct CommandHeader {
     uint16_t flags, prdtEntries;
     volatile uint32_t transferred;
@@ -102,7 +144,11 @@ struct PortIo {
         auto* hdr=reinterpret_cast<CommandHeader*>(dma);
         return __atomic_load_n(&hdr->transferred,__ATOMIC_ACQUIRE);
     }
+    // Runtime (non-panic) command completion: spin briefly, then sleep for the
+    // completion interrupt or yield. Same tick deadline as the polling loop.
+    bool waitCommand(uint64_t timeoutTicks);
     bool waitClear(uint32_t offset,uint32_t mask) {
+        if(offset==CI && mask==1u && !PanicIo())return waitCommand(2000);
         const uint64_t start=ApicTickCount();
         const uint32_t limit=
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
@@ -120,6 +166,7 @@ struct PortIo {
         return false;
     }
     bool waitClearFlush(uint32_t offset,uint32_t mask) {
+        if(offset==CI && mask==1u && !PanicIo())return waitCommand(30000);
         const uint64_t start=ApicTickCount();
         const uint64_t limit=
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
@@ -137,6 +184,104 @@ struct PortIo {
         return false;
     }
 } io;
+// MSI handler (BSP). Masks the port and acknowledges HBA IS.IPS without
+// touching PxIS, which the waiter still inspects for completion status.
+void AhciIrqBody() {
+    StatAdd(ioStats.interrupts);
+    if(hba && portRegs) {
+        const uint32_t bit=1u<<status.port;
+        if(hba[2]&bit){portRegs[IE/4]=0;hba[2]=bit;}
+    }
+    const uint64_t flags=IrqSpinLockAcquire(&irqLock);
+    bool woke=false;
+    if(Process* waiter=irqWaiter){irqWaiter=nullptr;irqWakeNs=ElapsedClockNs();SchedulerUnblock(waiter);woke=true;}
+    IrqSpinLockRelease(&irqLock,flags);
+    // SchedulerUnblock kicks only other idle CPUs. If this CPU was idle, the
+    // reschedule IPI (taken after this EOI) dispatches the waiter here now.
+    if(woke)ApicSendRescheduleIpi(ApicGetId());
+}
+enum class SleepOutcome : uint8_t { Interrupted, TimedOut, Skipped };
+// Arm, enable port interrupts, recheck, block for at most one tick, disarm.
+// The ISR wakes the waiter under irqLock, so after disarm no stale wake can
+// reach a later, unrelated sleep of this thread.
+SleepOutcome SleepForCompletion(PortIo& port) {
+    Process* self=ProcessCurrent();
+    __atomic_store_n(&ownerSleeping,true,__ATOMIC_SEQ_CST);
+    uint64_t flags=IrqSpinLockAcquire(&irqLock);irqWaiter=self;IrqSpinLockRelease(&irqLock,flags);
+    port.write(IE,AhciPortIrqMask);port.fence();
+    // A completion just before IE was set may not interrupt; never sleep on it.
+    const uint32_t ci=port.read(CI);
+    bool block=true;
+    if(ci==0xffffffffu || !(ci&1u)) {
+        flags=IrqSpinLockAcquire(&irqLock);
+        if(irqWaiter==self){irqWaiter=nullptr;block=false;} // no wake was issued
+        IrqSpinLockRelease(&irqLock,flags);
+    }
+    // When the ISR already consumed the arming, pendingWakeup makes this
+    // block return at once, consuming that wake here.
+    const uint64_t blockedNs=ElapsedClockNs();
+    if(block){self->wakeupTick=ApicTickCount()+1;SchedulerBlock(self);}
+    const uint64_t resumedNs=ElapsedClockNs();
+    flags=IrqSpinLockAcquire(&irqLock);
+    const bool interrupted=irqWaiter!=self;
+    if(!interrupted)irqWaiter=nullptr;
+    const uint64_t wokeNs=irqWakeNs;
+    IrqSpinLockRelease(&irqLock,flags);
+    if(interrupted && block && wokeNs>=blockedNs && resumedNs>=wokeNs) {
+        StatAdd(ioStats.irqLatencyNs,wokeNs-blockedNs);StatAdd(ioStats.wakeLatencyNs,resumedNs-wokeNs);
+        StatMax(ioStats.maxWakeLatencyNs,resumedNs-wokeNs);
+    }
+    // If the block timed out just before the ISR's wake, that wake left a
+    // latch for this (now running) thread. Drop it, as KMutexLock does before
+    // each block, so it cannot shorten an unrelated later sleep.
+    if(interrupted && block)__atomic_store_n(&self->pendingWakeup,0,__ATOMIC_RELEASE);
+    port.write(IE,0);hba[2]=1u<<status.port;port.fence(); // mask, clear HBA IS.IPS
+    __atomic_store_n(&ownerSleeping,false,__ATOMIC_SEQ_CST);
+    if(!block)return SleepOutcome::Skipped;
+    return interrupted?SleepOutcome::Interrupted:SleepOutcome::TimedOut;
+}
+bool PortIo::waitCommand(uint64_t timeoutTicks) {
+    struct Wait {
+        PortIo& port;
+        uint32_t ci(){return port.read(CI);}
+        uint64_t nowNs(){return ElapsedClockNsResolution()?ElapsedClockNs():0;}
+        uint64_t ticks(){return ApicTickCount();}
+        void pause(){__asm__ volatile("pause":::"memory");}
+        AhciWaitMode mode() {
+            if(!InterruptsEnabled() || !SchedulerIsRunning() || !ProcessCurrent() || panicGate.PanicPending())
+                return AhciWaitMode::Spin;
+            // A latched error never completes through an interrupt rearm.
+            if(port.read(IS)&AhciPortIrqErrors)return AhciWaitMode::Yield;
+            return __atomic_load_n(&irqMode,__ATOMIC_ACQUIRE)?AhciWaitMode::Sleep:AhciWaitMode::Yield;
+        }
+        void sleep() {
+            const auto outcome=SleepForCompletion(port);
+            if(outcome==SleepOutcome::Interrupted)StatAdd(ioStats.irqWakes);
+            else if(outcome==SleepOutcome::TimedOut)StatAdd(ioStats.irqTimeouts);
+            else StatAdd(ioStats.irqSkipped);
+            const uint32_t now=port.read(CI);
+            const bool completed=now!=0xffffffffu && !(now&1u);
+            if(outcome!=SleepOutcome::Skipped &&
+               !irqHealth.Record(outcome==SleepOutcome::Interrupted,outcome==SleepOutcome::TimedOut,completed) &&
+               __atomic_exchange_n(&irqMode,false,__ATOMIC_ACQ_REL)) {
+                StatAdd(ioStats.irqDisabled);
+                SerialPuts("ahci: completion interrupts missed; reverting to polled completion\n");
+            }
+        }
+        void yield(){SchedulerYield();}
+    } wait{*this};
+    const uint64_t began=ElapsedClockNs();
+    AhciWaitTrace trace;
+    // Same iteration caps as the polling loop, for a stalled tick clock.
+    const auto result=AhciWaitCommand(wait,timeoutTicks,AhciSpinNs,timeoutTicks>2000?2000000000ull:100000000ull,trace);
+    const uint64_t ended=ElapsedClockNs();
+    StatAdd(ioStats.waits);
+    if(!trace.spunOut)StatAdd(ioStats.spinCompletions);
+    if(trace.sleeps)StatAdd(ioStats.sleepingWaits);
+    StatAdd(ioStats.sleeps,trace.sleeps);StatAdd(ioStats.yields,trace.yields);
+    if(ended>=began){StatAdd(ioStats.waitNs,ended-began);StatMax(ioStats.maxWaitNs,ended-began);}
+    return result==AhciWaitResult::Complete;
+}
 struct HandoffIo {
     PortIo port(uint32_t i) { return PortIo{hba+(0x100+i*0x80)/4}; }
     bool disableInterrupts() {
@@ -190,6 +335,7 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
     if(result!=Result::Ok) { Quarantine("AHCI command failed or timed out");return false; }
     const uint8_t* d2h=dma+fisOffset+0x40;
     if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
+    StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
     return true;
 }
 
@@ -278,6 +424,7 @@ uint64_t BlockCount(Device*) {return status.sectors;}
 uint32_t BlockSize(Device*) {return 512;}
 const BlockDeviceOps ops={Read,Write,Ioctl,nullptr,BlockCount,BlockSize};
 Device device{reinterpret_cast<const DeviceOps*>(&ops),"ahci0",DeviceType::Block,nullptr};
+void InstallCompletionIrq();
 bool ReadWriteTarget(AhciWriteTarget& target,bool& present) {
     auto* node=VfsOpen("/etc/ahci-write-target",VFS_O_STREAM);
     present=node!=nullptr;if(!node)return false;
@@ -286,6 +433,50 @@ bool ReadWriteTarget(AhciWriteTarget& target,bool& present) {
     if(ok)ok=VfsRead(node,record,st.size,&offset)==int(st.size) &&
         AhciWriteTargetParse(record,uint32_t(st.size),target);
     VfsRelease(node);return ok;
+}
+}
+} // namespace brook
+
+extern "C" void AhciMsiIsrInner() { brook::AhciIrqBody(); brook::ApicSendEoi(); }
+IRQ_NAKED_HANDLER(AhciMsiIsr, AhciMsiIsrInner)
+
+namespace brook {
+namespace {
+// Boot-only, on the BSP, before publication. Any failure leaves the previous
+// polled completion path (spin, then yield) without changing device state
+// beyond the MSI capability. /etc/ahci-polled opts out entirely.
+void InstallCompletionIrq() {
+    irqStatus.reason="no MSI capability";
+    if(auto* marker=VfsOpen("/etc/ahci-polled")){VfsClose(marker);irqStatus.reason="disabled by /etc/ahci-polled";return;}
+    const auto b=pci.bus,d=pci.dev,f=pci.fn;
+    uint8_t cap=PciConfigRead8(b,d,f,0x34);
+    for(unsigned hops=0;cap>=0x40 && cap<=0xfc && !(cap&3) && hops<48;++hops) {
+        if(PciConfigRead8(b,d,f,cap)==5) {
+            const uint16_t control=PciConfigRead16(b,d,f,cap+2);
+            PciMsiLayout layout;
+            if(control==0xffffu || !PciMsiRegisters(cap,control,layout)){irqStatus.reason="MSI capability invalid";return;}
+            const uint8_t apic=ApicGetId();
+            // Keep MSI disabled while programming address/data.
+            PciConfigWrite16(b,d,f,cap+2,uint16_t(control&~1u));
+            IdtInstallHandler(AhciMsiVector,reinterpret_cast<void*>(AhciMsiIsr));
+            PciConfigWrite32(b,d,f,cap+4,0xfee00000u|(uint32_t(apic)<<12));
+            if(layout.upper)PciConfigWrite32(b,d,f,layout.upper,0);
+            PciConfigWrite16(b,d,f,layout.data,AhciMsiVector);
+            if(layout.mask)PciConfigWrite32(b,d,f,layout.mask,PciConfigRead32(b,d,f,layout.mask)&~1u);
+            // INTx disable: only the MSI message may signal completion.
+            PciCommand(uint16_t(PciConfigRead16(b,d,f,4)|(1u<<10)));
+            PciConfigWrite16(b,d,f,cap+2,layout.enabled);
+            if(!(PciConfigRead16(b,d,f,cap+2)&1u)){irqStatus.reason="MSI enable not retained";return;}
+            // Port interrupts stay masked (PxIE=0) except during a runtime sleep.
+            io.write(IE,0);hba[2]=1u<<status.port;
+            hba[1]=hba[1]|2u; // GHC.IE
+            irqStatus={true,true,AhciMsiVector,apic,"MSI completion interrupts"};
+            __atomic_store_n(&irqMode,true,__ATOMIC_RELEASE);
+            SerialPrintf("ahci: MSI completion vector=%u LAPIC=%u\n",AhciMsiVector,apic);
+            return;
+        }
+        cap=PciConfigRead8(b,d,f,cap+1);
+    }
 }
 }
 
@@ -523,7 +714,26 @@ void AhciReadOnlyInit() {
             VfsRelease(exportMarker);
         }
     }
+    if(status.ready && !status.quarantined)InstallCompletionIrq();
     __atomic_store_n(&published,true,__ATOMIC_RELEASE);
+}
+AhciIoStats AhciReadOnlyIoStats() {
+    AhciIoStats s;
+    auto load=[](const uint64_t& v){return __atomic_load_n(&v,__ATOMIC_RELAXED);};
+    s.waits=load(ioStats.waits);s.spinCompletions=load(ioStats.spinCompletions);
+    s.sleepingWaits=load(ioStats.sleepingWaits);s.sleeps=load(ioStats.sleeps);s.yields=load(ioStats.yields);
+    s.irqWakes=load(ioStats.irqWakes);s.irqTimeouts=load(ioStats.irqTimeouts);s.irqSkipped=load(ioStats.irqSkipped);
+    s.irqDisabled=load(ioStats.irqDisabled);s.interrupts=load(ioStats.interrupts);
+    s.waitNs=load(ioStats.waitNs);s.maxWaitNs=load(ioStats.maxWaitNs);
+    s.irqLatencyNs=load(ioStats.irqLatencyNs);s.wakeLatencyNs=load(ioStats.wakeLatencyNs);
+    s.maxWakeLatencyNs=load(ioStats.maxWakeLatencyNs);
+    return s;
+}
+AhciIrqStatus AhciReadOnlyIrqStatus() {
+    if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return {};
+    AhciIrqStatus copy=irqStatus;copy.active=__atomic_load_n(&irqMode,__ATOMIC_ACQUIRE);
+    if(copy.configured && !copy.active)copy.reason="reverted to polling after missed interrupts";
+    return copy;
 }
 AhciReadOnlyStatus AhciReadOnlyGetStatus() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return status;
@@ -650,9 +860,35 @@ void AhciPanicTestWaitForWriter() {
         __asm__ volatile("pause");
 }
 #endif
+// After SmpHaltAllAPs. A pending normal owner parked in its completion sleep
+// cannot finish when the BSP (its MSI and timed-wakeup CPU) panicked with
+// interrupts off. Once every peer CPU is confirmed halted, that owner can never
+// run again; take the gate only if the port is idle (no DMA in flight).
+static void RecoverGateFromParkedOwner() {
+    if(!panicReservationRequested || panicGate.PanicOwned() || !panicGate.PanicPending() ||
+       !__atomic_load_n(&ownerSleeping,__ATOMIC_SEQ_CST))return;
+    const uint32_t self=SmpCurrentCpuIndex(),cpus=SmpGetCpuCount();
+    for(uint32_t c=0;c<cpus;++c) {
+        if(c==self)continue;
+        const auto* halted=SmpGetHaltedState(c);
+        if(!halted || !halted->halted){SerialPanicPuts("PANIC_DISK_PARKED_OWNER_PEER_RUNNING\n");return;}
+    }
+    bool idle=false;
+    for(uint32_t spin=0;spin<10000000 && !idle;++spin) {
+        const uint32_t ci=io.read(CI),sact=io.read(SACT);
+        if(ci==0xffffffffu || sact==0xffffffffu)break;
+        idle=!ci && !sact;
+        if(!idle)__asm__ volatile("pause");
+    }
+    if(idle && panicGate.TakeFromParkedOwner()) {
+        io.write(IE,0); // the parked owner never masked it
+        SerialPanicPuts("PANIC_DISK_PARKED_OWNER_TAKEN\n");
+    } else SerialPanicPuts("PANIC_DISK_PARKED_OWNER_BUSY\n");
+}
 void AhciPanicTestCapture() {
     const uint8_t* packet=nullptr;uint32_t bytes=0;
     if(!panicTestReady || !PanicCapturedPacket(&packet,&bytes))return;
+    RecoverGateFromParkedOwner();
     if(!(panicReservationRequested?panicGate.PanicOwned():panicGate.EnterPanic())) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
         const char* message="PANIC_DISK_BUSY\n";

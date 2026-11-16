@@ -45,6 +45,7 @@
 #include "input.h"
 #include "keyboard.h"
 #include "device.h"
+#include "storage_io_stats.h"
 #include "irq_wrapper.h"
 #include "memory/heap.h"
 #include "string.h"
@@ -85,6 +86,7 @@ MODULE_IMPORT_SYMBOL(NetEarlyBootPolling);
 MODULE_IMPORT_SYMBOL(VfsOpen);
 MODULE_IMPORT_SYMBOL(VfsClose);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
+MODULE_IMPORT_SYMBOL(StorageIoAccount);
 MODULE_IMPORT_SYMBOL(ApicSendEoi);
 MODULE_IMPORT_SYMBOL(ApicTickCount);
 MODULE_IMPORT_SYMBOL(NetRegisterIf);
@@ -2891,8 +2893,11 @@ struct UsbMscByteTransport {
         uint8_t cdb[10]{};cdb[0]=read?SCSI_READ_10:SCSI_WRITE_10;
         cdb[2]=lba>>24;cdb[3]=lba>>16;cdb[4]=lba>>8;cdb[5]=lba;
         cdb[7]=count>>8;cdb[8]=count;
-        return XhciMscCommand(*state->ctrl,g_devices[state->devIndex],cdb,10,
-            state->bounce,state->bouncePhys,count*blockSize(),read);
+        const uint64_t bytes=uint64_t(count)*blockSize();
+        const bool ok=XhciMscCommand(*state->ctrl,g_devices[state->devIndex],cdb,10,
+            state->bounce,state->bouncePhys,uint32_t(bytes),read);
+        if(ok)StorageIoAccount(uint32_t(StorageIoSource::Usb),read?0:1,bytes);
+        return ok;
     }
     bool readBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,true);}
     bool writeBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,false);}
@@ -2929,7 +2934,7 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
     // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
     uint8_t cdb[10] = {};cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
     auto result=XhciMscExecuteLocked(*st->ctrl,udev,cdb,sizeof(cdb),nullptr,0,0,false);
-    if(result.success())return 0;
+    if(result.success()){StorageIoAccount(uint32_t(StorageIoSource::Usb),2,0);return 0;}
     if(UsbScsiUnsupportedSync(result.sense)) {
         if(udev.mscCache==UsbScsiCache::Unknown)udev.mscCache=XhciMscCacheLocked(*st->ctrl,udev);
         if(!__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE)&&UsbScsiWriteThroughFlush(udev.mscCache,result.sense)) {
