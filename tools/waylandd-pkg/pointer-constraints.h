@@ -71,10 +71,25 @@ static void pointer_constraints_refresh(void) {
         int eligible=!s->pointer_lock_inhibited && s->wm_id && sc->entered_surface==s &&
             pointer_region_contains(&s->input_region,sc->pointer_x,sc->pointer_y) &&
             pointer_region_contains(&p->region,sc->pointer_x,sc->pointer_y);
+        // Deliberate activation (Alt+Tab, taskbar button) lets the lock take
+        // over wherever the pointer is: the kernel grant warps it to the
+        // content centre, which must satisfy the regions instead.
+        int32_t cx=0,cy=0,activated=0;
+        if(!p->token && !p->blocked && !eligible && !s->pointer_lock_inhibited && s->wm_id) {
+            cx=pointer_fixed_floor(surface_pointer_fixed(s,(int32_t)(s->vfb_w/2)));
+            cy=pointer_fixed_floor(surface_pointer_fixed(s,(int32_t)(s->vfb_h/2)));
+            activated=pointer_region_contains(&s->input_region,cx,cy) &&
+                pointer_region_contains(&p->region,cx,cy) && pointer_lease(s,4,0)==1;
+        }
         if(p->token && !eligible)pointer_constraint_unlock(p,1,0);
-        if(!p->token && !p->blocked && eligible) {
+        if(!p->token && !p->blocked && (eligible || activated)) {
             long token=pointer_lease(s,1,0);
             if(token>0 && (unsigned long)token<=UINT32_MAX) {
+                if(activated) {
+                    // The client sees the pointer arrive where the kernel put it.
+                    sc->pointer_x=cx;sc->pointer_y=cy;
+                    pointer_enter_if_needed(sc,s,wl_fixed_from_int(cx),wl_fixed_from_int(cy));
+                }
                 p->token=token;zwp_locked_pointer_v1_send_locked(p->resource);
             }
         }
