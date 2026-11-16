@@ -90,7 +90,7 @@ static struct {
     struct {uint64_t sent,visible;int sentBuffer,visibleBuffer;uint32_t *pixels[2],*over[2];int hasOver[2];} offer[MAXW+1];
     int layers;unsigned layeredOffers;
     unsigned offers,safes,presentedReplies,badReplies,poisoned,earlySafes;
-    int overlayFeedback,staleBase,lateClose;uint64_t overlayRenderedNs;unsigned overlayBumps,baseCount,staleBaseRejects;
+    int overlayFeedback,staleBase,lateClose,game,gameScaled;unsigned gameOver;uint64_t overlayRenderedNs;unsigned overlayBumps,baseCount,staleBaseRejects;
     struct {uint32_t window;uint64_t incarnation;} base[MAXW];
 } K;
 static uint32_t rng=0x2545f491u;
@@ -125,7 +125,17 @@ static void reference(void){
 #define LAYER(p,...) do{const struct BrookVkSceneLayer l={__VA_ARGS__};memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&l,sizeof(l));src[n++]=(p);}while(0)
     LAYER(K.backdrop,0,FW,FW,FH,0,0,FW,FH,0,0,FW,FH,0,0,FW,FH,255);
     for(unsigned i=0;i<K.count;++i){const struct FakeWindow *w=&K.win[K.order[i]];
-        if(w->window<=MAXW && K.offer[w->window].visible)
+        if(w->window<=MAXW && K.offer[w->window].visible && K.gameScaled && w->window==2){
+            /* HOST_E2E_GAME_SCALED: a half-size buffer drawn 2x (one-layer
+             * version 3 offer), clipped to the client rectangle. */
+            int32_t cx0=w->x<0?0:w->x,cy0=w->y<0?0:w->y,cx1=w->x+(int32_t)w->w,cy1=w->y+(int32_t)w->h;
+            if(cx1>FW)cx1=FW;
+            if(cy1>FH)cy1=FH;
+            if(cx1<cx0)cx1=cx0;
+            if(cy1<cy0)cy1=cy0;
+            LAYER(K.offer[w->window].pixels[1],0,w->w/2,w->w/2,w->h/2,0,0,w->w/2,w->h/2,w->x,w->y,w->w,w->h,
+                  cx0,cy0,(uint32_t)(cx1-cx0),(uint32_t)(cy1-cy0),w->opacity|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE);}
+        else if(w->window<=MAXW && K.offer[w->window].visible)
         {LAYER(K.offer[w->window].pixels[1],0,w->w,w->w,w->h,0,0,w->w,w->h,w->x,w->y,w->w,w->h,0,0,FW,FH,
                   w->opacity|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE);
             /* Layered offer: a quarter-size opaque buffer drawn at 2x inside
@@ -176,7 +186,7 @@ static void provider_drain(void){
         for(unsigned i=0;i<POOL;++i)if(K.pool[i].busy && K.pool[i].window==p.identity.window && K.pool[i].commit==p.identity.commit){
             b=&K.pool[i];if(members<2)group[members++]=b;}
         const uint32_t expect=K.layers?BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS:BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN;
-        if(!b || p.version!=expect){++K.badReplies;continue;}
+        if(!b || (p.version!=expect && !(K.gameScaled && p.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS))){++K.badReplies;continue;}
         if(p.type==BROOK_GPU_WINDOW_PRESENTED){if(b->presented)++K.badReplies;
             for(unsigned m=0;m<members;++m){group[m]->presented=1;}
             ++K.presentedReplies;continue;}
@@ -192,10 +202,31 @@ static void provider_drain(void){
 }
 static void provider_offer(struct FakeWindow *w){
     if(K.peer<0 || !w || w->window>MAXW)return;
-    const uint64_t bytes=((uint64_t)w->w*w->h*4+4095)&~4095ull;
+    const int scaled=K.gameScaled && w->window==2;
+    const uint32_t bw=scaled?w->w/2:w->w,bh=scaled?w->h/2:w->h;
+    const uint64_t bytes=((uint64_t)bw*bh*4+4095)&~4095ull;
     struct FakeBuffer *b=pool_get(bytes);if(!b)return;
     const uint64_t commit=++K.nextCommit;
     uint32_t *copy=K.offer[w->window].pixels[0];
+    if(scaled){
+        for(uint32_t y=0;y<bh;++y)for(uint32_t x=0;x<bw;++x){
+            const uint32_t v=(uint32_t)(commit*0x9e3779b9u)^(x*0x85ebca6bu)^(y*0xc2b2ae35u);b->map[y*bw+x]=v;copy[y*bw+x]=v;}
+        struct dma_buf_export_sync_file_wire sync={1,-1};
+        if(ioctl(b->fd,_IOWR('b',2,struct dma_buf_export_sync_file_wire),&sync) || sync.fd<0){fprintf(stderr,"HOST_E2E_NO_SYNC_FILE\n");exit(2);}
+        struct stat st;fstat(b->fd,&st);
+        struct BrookGpuWindowLayersPacket lp;memset(&lp,0,sizeof(lp));
+        lp.header=(struct BrookGpuWindowPacket){.magic=BROOK_GPU_WINDOW_WIRE_MAGIC,.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,.type=BROOK_GPU_WINDOW_OFFER,
+            .identity={w->window,0,w->incarnation,commit,(uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=bytes/4,
+            .offset=0,.stride=bw,.width=bw,.height=bh,.fourcc=0x34325258};
+        lp.count=1;
+        lp.layers[0]=(struct BrookGpuWindowLayer){bytes/4,(uint64_t)st.st_dev,(uint64_t)st.st_ino,0,bw,bw,bh,0x34325258,BROOK_GPU_WINDOW_LAYER_OPAQUE,
+            0,0,bw,bh,0,0,w->w,w->h};
+        const int buffers[1]={b->fd},fences[1]={sync.fd};
+        const int sent=brook_gpu_window_send_layers(K.peer,&lp,buffers,fences);close(sync.fd);
+        if(sent!=1)return;
+        *b=(struct FakeBuffer){b->handle,b->fd,b->bytes,b->map,1,w->window,commit,0};
+        K.offer[w->window].hasOver[0]=0;K.offer[w->window].sent=commit;++K.offers;++K.layeredOffers;return;
+    }
     for(uint32_t y=0;y<w->h;++y)for(uint32_t x=0;x<w->w;++x){
         const uint32_t v=(uint32_t)(commit*0x9e3779b9u)^(x*0x85ebca6bu)^(y*0xc2b2ae35u);
         b->map[y*w->w+x]=v;copy[y*w->w+x]=v;}
@@ -252,6 +283,20 @@ static void advance(void){
             K.offer[id].hasOver[1]=K.offer[id].hasOver[0];}
         K.offer[id].visible=K.offer[id].sent;}
     struct FakeWindow *a=window_by_id(1),*b=window_by_id(2);
+    if(K.game){
+        /* HOST_E2E_GAME: an idle, larger CPU window (translucent pixels, as
+         * a client-side shadow) partly behind an opaque GPU game window
+         * that commits every frame; no pointer (the game grabs it). */
+        const int idleGpu=getenv("HOST_E2E_GAME_IDLE_GPU")!=NULL;
+        if(s==0){window_open(0,1,16,16,420,300,1);K.cursorVisible=0;if(idleGpu)provider_window(1,420,300);}
+        if(idleGpu && s==1)provider_offer(a);
+        /* The game opens above it (a restack), then commits every frame;
+         * the idle window loses focus once (its title bar changes). */
+        if(s==4){window_open(1,2,176,48,320,240,0);provider_window(2,320,240);}
+        if(s>=5 && K.direct)provider_offer(window_by_id(2));
+        if(s==30 && a)for(uint32_t y=0;y<10;++y)for(uint32_t x=0;x<a->chromeW;++x)a->chrome[y*a->chromeW+x]^=0x00303030u;
+        reference();return;
+    }
     switch(s){
     case 0:window_open(0,1,40,40,300,180,1);window_open(1,2,260,120,200,140,0);provider_window(2,200,140);
         K.cursorVisible=1;K.cursorX=100;K.cursorY=100;break;
@@ -432,6 +477,9 @@ static long present_now(long ticket,const struct BrookGpuPresentRegions *r,const
     else {for(uint32_t y=0;y<FH;++y)memcpy(K.screen+y*FW,m+(uint64_t)y*f->stride,FW*4);pixels=FW*FH;++K.fulls;}
     dma_sync(t->fd,1|4);munmap(m,bytes);K.presentedPixels+=pixels;
     if(r){++K.partials;if(pixels<=4096)++K.presentedPixelsSmall;}
+    /* HOST_E2E_GAME: long after the one-off changes only the game's
+     * 320x240 client rectangle changes, so no present may exceed it. */
+    if(K.game && K.step>45 && pixels>320u*240u)++K.gameOver;
     K.lastPresented=(uint64_t)ticket;
     /* RecordAccepted: younger tickets must cover these writes. */
     for(unsigned i=0;i<TICKETS;++i){struct FakeTicket *o=&K.tickets[i];if(!o->ticket || o->ticket<=ticket)continue;
@@ -527,7 +575,8 @@ int main(int argc,char **argv){
     for(uint32_t i=0;i<64*64;++i)K.cursor[i]=(i&1)?0x80ffffffu:0xff102030u;
     const char *delay=getenv("HOST_E2E_PRESENT_DELAY_US");K.presentDelayNs=delay?strtoull(delay,NULL,10)*1000ull:2000000ull;
     K.overlayFeedback=getenv("HOST_E2E_OVERLAY_FEEDBACK")!=NULL;K.staleBase=getenv("HOST_E2E_STALE_BASE")!=NULL;
-    K.lateClose=getenv("HOST_E2E_LATE_CLOSE")!=NULL;
+    K.lateClose=getenv("HOST_E2E_LATE_CLOSE")!=NULL;K.game=getenv("HOST_E2E_GAME")!=NULL;
+    K.gameScaled=K.game && getenv("HOST_E2E_GAME_SCALED")!=NULL;
     K.noClientKeep=getenv("HOST_E2E_OLD_KERNEL_NO_CLIENT_KEEP")!=NULL;
     K.peer=-1;K.direct=getenv("HOST_E2E_DIRECT") && strcmp(getenv("HOST_E2E_DIRECT"),"0");
     K.layers=K.direct && getenv("HOST_E2E_LAYERS") && strcmp(getenv("HOST_E2E_LAYERS"),"0");
@@ -543,16 +592,22 @@ int main(int argc,char **argv){
     unsigned bad=0;
     if(K.direct){
         /* Window 2 closed at step 9: every one of its sources must be released. */
-        unsigned held=0;for(unsigned i=0;i<POOL;++i)if(K.pool[i].busy && K.pool[i].window==2)++held;
+        unsigned held=0;for(unsigned i=0;i<POOL && !K.game;++i)if(K.pool[i].busy && K.pool[i].window==2)++held;
         printf("HOST_E2E_DIRECT offers=%u safes=%u presented=%u bad_replies=%u early_safes=%u closed_window_held=%u direct_layers=%llu\n",
             K.offers,K.safes,K.presentedReplies,K.badReplies,K.earlySafes,held,(unsigned long long)g_gpuDirectLayers);
         if(K.badReplies || K.earlySafes || held || !g_gpuDirectLayers || !K.safes || !K.presentedReplies)++bad;
-        if(K.layers){printf("HOST_E2E_LAYERS layered_offers=%u\n",K.layeredOffers);if(!K.layeredOffers)++bad;}
+        if(K.layers || K.gameScaled){printf("HOST_E2E_LAYERS layered_offers=%u\n",K.layeredOffers);if(!K.layeredOffers)++bad;}
     }
     printf("HOST_E2E_STATS pipeline=%u submitted_in_flight=%llu/%llu carried=%llu rebased=%llu wait_full=%llu full_forced=%llu forced_in_flight=%llu present_failures=%llu\n",
         g_pipeline,(unsigned long long)g_stats.pipeline.submitted[0],(unsigned long long)g_stats.pipeline.submitted[1],
         (unsigned long long)g_stats.pipeline.carried,(unsigned long long)g_stats.pipeline.rebased,(unsigned long long)g_stats.pipeline.waitFull,
         (unsigned long long)g_stats.fullForced.total,(unsigned long long)g_stats.fullForced.inFlight,(unsigned long long)g_stats.presentFailures);
+    {const struct DesktopStatsWork *d=&g_stats.cls[DESKTOP_STATS_DIRECT].work,*n=&g_stats.cls[DESKTOP_STATS_NONDIRECT].work;
+     const uint64_t frames=d->frames+n->frames;
+     printf("HOST_E2E_WORK frames=%llu damage_px_avg=%llu shaded_px_avg=%llu layers_avg_x100=%llu presented_px_avg=%llu\n",(unsigned long long)frames,
+        (unsigned long long)(frames?(d->damagePixels+n->damagePixels)/frames:0),(unsigned long long)(frames?(d->pixelsShaded+n->pixelsShaded)/frames:0),
+        (unsigned long long)(frames?100*(d->layersDrawn+n->layersDrawn)/frames:0),(unsigned long long)(K.presents?K.presentedPixels/K.presents:0));}
+    if(K.game){printf("HOST_E2E_GAME presents_over_game_rect=%u scaled=%d\n",K.gameOver,K.gameScaled);if(K.gameOver)++bad;}
     if(getenv("HOST_E2E_EXPECT_PIPELINE")){
         /* Overlap really happened, nothing was forced full or refused because
          * a frame was in flight, and the kernel never rejected a present. */

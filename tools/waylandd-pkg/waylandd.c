@@ -2837,7 +2837,14 @@ static struct wl_event_source *g_gpu_window_source;
 static uint64_t g_gpu_window_offers,g_gpu_window_acks,g_gpu_window_recovered,g_gpu_window_presented;
 /* Aggregate failures instead of logging each frame; the latter perturbs pacing. */
 static uint64_t g_gpu_offer_no_channel,g_gpu_offer_no_root,g_gpu_offer_layers,g_gpu_offer_geometry,g_gpu_offer_window,g_gpu_offer_metadata;
-static uint64_t g_gpu_offer_size_mismatch,g_gpu_opaque_offers;
+static uint64_t g_gpu_offer_size_mismatch,g_gpu_opaque_offers,g_gpu_scaled_offers;
+/* BROOK_WAYLAND_GPU_SCALED=0 keeps scaled single-buffer windows on the
+ * provider's composition path (the previous behaviour, for A/B runs). */
+static int gpu_scaled_offers_enabled(void){
+    static int enabled=-1;
+    if(enabled<0){const char *e=getenv("BROOK_WAYLAND_GPU_SCALED");enabled=!e || strcmp(e,"0");}
+    return enabled;
+}
 static uint64_t g_gpu_connect_fail,g_gpu_auth_fail;
 static int g_gpu_connect_errno,g_gpu_auth_errno;
 struct GpuWindowTiming {uint64_t count,sum,buckets[10];uint32_t max;};
@@ -2976,15 +2983,25 @@ static int gpu_window_offer(struct brook_image *image){
     const struct brook_view *view=draws[0].view;const struct brook_geometry *g=&view->geometry;
     const struct brook_dmabuf_buffer *db=image->source->dmabuf;
     const uint32_t scale=surface_output_scale(root);
-    if(g->transform || g->sx || g->sy || g->sw!=(int64_t)image->width*256 || g->sh!=(int64_t)image->height*256 ||
-       (uint64_t)g->w*scale!=image->width || (uint64_t)g->h*scale!=image->height ||
-       (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
+    /* exact: the buffer is the VFB, pixel for pixel. scaled: any other
+     * whole-pixel source rectangle drawn to the surface (a client that is
+     * not scale-aware on a scaled output, such as SDL's 640x480 yquake2 at
+     * 200%, or a viewport). It is offered as a one-layer version 3 commit
+     * carrying both rectangles, so the renderer samples the buffer directly
+     * (and can cull beneath it) instead of this provider composing it into
+     * the VFB on the CPU or GPU for every frame. */
+    const int exact=!g->sx && !g->sy && g->sw==(int64_t)image->width*256 && g->sh==(int64_t)image->height*256 &&
+        (uint64_t)g->w*scale==image->width && (uint64_t)g->h*scale==image->height;
+    const int scaled=!exact && gpu_scaled_offers_enabled() && gpu_layers_enabled() && !((g->sx|g->sy|g->sw|g->sh)&255) &&
+        g->sx>=0 && g->sy>=0 && g->sw>0 && g->sh>0 && g->sx+g->sw<=(int64_t)image->width*256 && g->sy+g->sh<=(int64_t)image->height*256 &&
+        g->w>0 && g->h>0 && (uint64_t)g->w*scale<=16384 && (uint64_t)g->h*scale<=16384;
+    if(g->transform || (!exact && !scaled) || (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
     if(!surface_window(root,(struct brook_view *)view) || !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
     struct stat st={0};BrookWindowState window={0};
     if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3) ||
        syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
        window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id || !root->tree.current ||
-       root->vfb_w!=image->width || root->vfb_h!=image->height){++g_gpu_offer_metadata;return 0;}
+       root->vfb_w!=(uint64_t)g->w*scale || root->vfb_h!=(uint64_t)g->h*scale){++g_gpu_offer_metadata;return 0;}
     /* The WM client size (window.width/height) may differ from the committed
      * buffer while a resize is in flight or when the client picks its own
      * size. The renderer draws the offer exactly as it draws the VFB, 1:1
@@ -2997,18 +3014,23 @@ static int gpu_window_offer(struct brook_image *image){
             (uint64_t)st.st_dev,(uint64_t)st.st_ino},.words=(uint64_t)st.st_size/4,.offset=db->offset/4,
         .stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
     int sent;
-    if(view->opaque && db->fourcc==0x34325241 && gpu_layers_enabled()){
-        /* An ARGB buffer the client declared opaque: a one-layer version 3
-         * offer carries the opaque flag, so the renderer can cull beneath
-         * the window instead of blending everything under it. */
+    const int opaqueArgb=view->opaque && db->fourcc==0x34325241 && gpu_layers_enabled();
+    if(opaqueArgb || scaled){
+        /* An ARGB buffer the client declared opaque, or a scaled buffer: a
+         * one-layer version 3 offer carries the opaque flag (XRGB is opaque
+         * by format) and the source and destination rectangles, so the
+         * renderer can cull beneath the window instead of blending
+         * everything under it. */
         struct BrookGpuWindowLayersPacket one;memset(&one,0,sizeof(one));
         one.header=offer;one.header.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS;one.count=1;
         one.layers[0]=(struct BrookGpuWindowLayer){.words=offer.words,.device=offer.identity.device,.inode=offer.identity.inode,
             .offset=offer.offset,.stride=offer.stride,.width=offer.width,.height=offer.height,.fourcc=offer.fourcc,
-            .flags=BROOK_GPU_WINDOW_LAYER_OPAQUE,.srcWidth=offer.width,.srcHeight=offer.height,
+            .flags=(view->opaque || db->fourcc==0x34325258)?BROOK_GPU_WINDOW_LAYER_OPAQUE:0,
+            .srcX=(uint32_t)(g->sx/256),.srcY=(uint32_t)(g->sy/256),.srcWidth=(uint32_t)(g->sw/256),.srcHeight=(uint32_t)(g->sh/256),
             .dstWidth=g->w*scale,.dstHeight=g->h*scale};
         sent=brook_gpu_window_send_layers(g_gpu_window_channel,&one,&image->pending_fd,&image->producer_fence);
-        if(sent==1)++g_gpu_opaque_offers;
+        if(sent==1 && opaqueArgb)++g_gpu_opaque_offers;
+        if(sent==1 && scaled)++g_gpu_scaled_offers;
     }else sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
     if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
         image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
@@ -3664,11 +3686,11 @@ static void waylandd_status_write(const char *display){
         g_opaque_rects[2],g_opaque_rects[3],g_opaque_rects[4],g_opaque_last[0],g_opaque_last[1],g_opaque_last[2],g_opaque_last[3],
         g_opaque_last[4],g_opaque_last[5],g_opaque_last_kind,g_opaque_views);
     fprintf(f,"\"layered\":{\"enabled\":%d,\"offers\":%llu,\"safe\":%llu,\"presented\":%llu,\"wait\":%llu,\"full\":%llu,"
-        "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu},",gpu_layers_enabled(),
+        "\"skip_shape\":%llu,\"skip_buffer\":%llu,\"skip_upload\":%llu,\"uploads\":%llu,\"opaque_single\":%llu,\"scaled_single\":%llu},",gpu_layers_enabled(),
         (unsigned long long)g_gpu_group_offers,(unsigned long long)g_gpu_group_safe,(unsigned long long)g_gpu_group_presented,
         (unsigned long long)g_gpu_group_wait,(unsigned long long)g_gpu_group_full,(unsigned long long)g_gpu_group_skip_shape,
         (unsigned long long)g_gpu_group_skip_buffer,(unsigned long long)g_gpu_group_skip_upload,(unsigned long long)g_gpu_group_uploads,
-        (unsigned long long)g_gpu_opaque_offers);
+        (unsigned long long)g_gpu_opaque_offers,(unsigned long long)g_gpu_scaled_offers);
     fprintf(f,"\"intel\":{\"queued\":%llu,\"ready\":%llu,\"discarded\":%llu,\"busy\":%llu,\"failed\":%llu,\"fences\":%llu,"
         "\"fence_pending\":%llu,\"pending\":%u,\"direct\":%llu},\"readback_bytes\":%llu,\"paths\":{",
         (unsigned long long)g_intel_queued,(unsigned long long)g_intel_ready,(unsigned long long)g_intel_discarded,

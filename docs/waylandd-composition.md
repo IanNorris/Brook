@@ -183,6 +183,15 @@ Captures: `display-perf/build/ssd-probe-frame/` (double frame) and `ssd-pref-fra
 - per window: the root's `opaque_region` `[set,x,y,w,h]`;
 - per layer: `opaque` bit 0 = XRGB pixels, bit 1 = view marked opaque.
 
+## A game in front of an idle window (`work/occlusion`, 16 Nov 2026)
+
+Dell gen 419: yquake2 GL3 (a 640×480 drawable shown 2× in a 1280×960 window) in front of an idle Qalculate! window. The compositor job rose from 9.1 to 15.9 ms and partial presents averaged 2.57 Mpx, about twice the game's area. Two defects, both found from code and host tests, not yet measured on the Dell:
+
+- **The scaled game was never a direct GPU source.** A single-buffer offer required the buffer to be the VFB pixel for pixel (`buffer = logical size × output scale`). A client that is not scale-aware (SDL's default, a 640×480 buffer under a 640×480 logical surface at 200%) failed that check (`offer_skipped.geometry`). waylandd then composed the buffer into the VFB on every frame, and the renderer received a CPU window layer. The renderer never marks CPU layers opaque, so it blended the wallpaper and every window beneath the game. Now any whole-pixel source rectangle without a transform is offered as a one-layer version 3 commit carrying source and destination rectangles. The opaque flag is set for XRGB or a covering opaque region. Status: `layered.scaled_single`. Opt out with `BROOK_WAYLAND_GPU_SCALED=0`.
+- **Carried damage never shrank.** With two frames in flight, the kernel requires each frame to present the regions of the frame it overlaps. Those regions already contain what that frame carried. While the game keeps the pipeline full, one large change stays in every later frame. For example, the restack when the game window opened damages both windows, and bounding-box merging turns that into the union of both. The renderer now waits once behind a frame that presents more than `BROOK_RENDER_CARRY_SLACK` beyond its own damage (default 1/64 of the output). The next frame then starts from the screen. Stats: `pipeline.waits_carry`. `BROOK_RENDER_CARRY_SLACK=off` restores the old behaviour.
+
+`xdg_toplevel.set_fullscreen` is still a no-op, so the game is composited as an ordinary window with chrome.
+
 ## Chromium's tab strip in the title area, with Brook's caption buttons (`work/chrome-csd`, 15 Nov 2026)
 
 **Goal (Ian):** Chromium draws its tabs at the top of the window, as on Linux desktops, with Brook's own minimise/maximise/close at the right instead of a Brook title bar above the tab strip.

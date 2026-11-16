@@ -553,6 +553,50 @@ static void check_gpu_window_opaque(void)
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
+/* A buffer drawn scaled (here a 1x1 XRGB buffer with a 2x2 viewport
+ * destination, as a 640x480 game on a 200% output) is offered directly as
+ * a one-layer version 3 commit with both rectangles and the opaque flag,
+ * instead of being composed into the 2x2 VFB by the provider. */
+static void check_gpu_window_scaled(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *buffer=retained_test_buffer(client,2);
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    root.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,4);assert(root.xdg_toplevel);
+    root.xdg_acked=root.xdg_initial_commit_done=1;
+    root.geometry.destination_set=1;root.geometry.dw=root.geometry.dh=2;
+    uint32_t vfb[4]={0};root.wm_id=1;root.vfb=vfb;root.vfb_w=root.vfb_h=root.vfb_stride=2;
+    root.scene_disabled=1;g_surfaces=&root;
+    char path[]="/tmp/brook-scaled-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    const uint64_t before=g_gpu_scaled_offers,geometryBefore=g_gpu_offer_geometry;
+    surface_attach(client,root.resource,buffer,0,0);surface_commit(client,root.resource);
+    struct brook_view *view=root.tree.current->value;struct brook_buffer *held=view->image->source;++held->refs;
+    assert(view->geometry.w==2 && view->geometry.h==2 && view->image->width==1);
+    intel_pending_poll();
+    struct BrookGpuWindowLayersPacket got;int fds[16];unsigned nfds=0;
+    assert(brook_gpu_window_receive_layers(channel[1],&got,fds,&nfds)==1 && nfds==2);
+    for(unsigned k=0;k<nfds;++k)close(fds[k]);
+    assert(got.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS && got.count==1);
+    const struct BrookGpuWindowLayer *l=&got.layers[0];
+    assert(l->width==1 && l->height==1 && l->srcX==0 && l->srcY==0 && l->srcWidth==1 && l->srcHeight==1 &&
+           l->dstX==0 && l->dstY==0 && l->dstWidth==2 && l->dstHeight==2 && (l->flags&BROOK_GPU_WINDOW_LAYER_OPAQUE));
+    assert(g_gpu_scaled_offers==before+1 && g_gpu_offer_geometry==geometryBefore);
+    assert(brook_gpu_window_send_reply(channel[1],got.header.version,BROOK_GPU_WINDOW_SAFE,&got.header.identity)==1);
+    intel_pending_poll();assert(g_gpu_window_channel>=0);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
+    free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
 /* Chromium asks for client-side decoration and then draws a translucent
  * frame, so its window is never opaque. waylandd answers SERVER_SIDE for
  * listed app_ids, also when the app_id arrives after the request. */
@@ -731,6 +775,7 @@ int main(void)
     check_gpu_window_layers();
     check_gpu_window_layers_shm();
     check_gpu_window_opaque();
+    check_gpu_window_scaled();
     check_decoration_policy();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif
