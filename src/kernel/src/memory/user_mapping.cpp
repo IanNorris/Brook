@@ -704,7 +704,7 @@ int64_t UserMappingBreak(Process* actor,AddressSpaceState* space,uint64_t reques
         if (oldEnd==newEnd) { space->programBreak=requested;operation.Changed(false);return static_cast<int64_t>(requested); }
         uint64_t growth=newEnd>oldEnd?(newEnd-oldEnd)/4096:0,retired=0,extend=0;
         if (growth) {
-            for (auto* node=space->ranges.head;node && node->range.begin<newEnd;node=node->next)
+            for (auto* node=MappingRangeFirstEndingAfter(space->ranges,oldEnd);node && node->range.begin<newEnd;node=node->next)
                 if (node->range.end>oldEnd) return static_cast<int64_t>(previous);
             const auto* tail=MappingRangeFind(space->ranges,oldEnd-1);
             if (tail && tail->end==oldEnd && tail->kind==MappingKind::Heap && tail->protection==3 &&

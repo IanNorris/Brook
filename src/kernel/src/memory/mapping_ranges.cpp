@@ -66,6 +66,11 @@ static void IndexErase(MappingRangeTable& table, MappingRangeNode* node) {
     table.root = IndexRemove(table.root, node);
     node->left = node->right = nullptr; node->height = 1;
 }
+// List link to MappingRangeFirstEndingAfter(address), for in-place edits.
+static MappingRangeNode** FirstEndingAfterLink(MappingRangeTable& table, uint64_t address) {
+    auto* predecessor = MappingRangeLastEndingAtOrBefore(table, address);
+    return predecessor ? &predecessor->next : &table.head;
+}
 static bool ValidRange(uint64_t begin, uint64_t end) {
     return begin < end && end <= UserEnd && !(begin & 4095) && !(end & 4095);
 }
@@ -130,7 +135,8 @@ bool MappingRangePlan::Replace(MappingRangeTable& table, uint64_t begin, uint64_
                                const MappingRange* replacement) {
     if (!CanReplace(table,begin,end,replacement)) return false;
     InvalidateLookup(table);
-    MappingRangeNode** first = &table.head;
+    // The index lower bound; the walk is a no-op unless the index is empty.
+    MappingRangeNode** first = FirstEndingAfterLink(table, begin);
     while (*first && (*first)->range.end <= begin) first = &(*first)->next;
     auto* stop = *first;
     const MappingRange* left = nullptr; const MappingRange* right = nullptr;
@@ -162,7 +168,7 @@ bool MappingRangePlan::CanReplace(const MappingRangeTable& table, uint64_t begin
     if (!prepared_ || !ValidRange(begin,end) || (replacement &&
         (!MappingRangeValid(*replacement) || replacement->begin != begin || replacement->end != end))) return false;
     uint64_t needed = replacement != nullptr;
-    for (auto* node = table.head; node && node->range.begin < end; node = node->next) {
+    for (auto* node = MappingRangeFirstEndingAfter(table, begin); node && node->range.begin < end; node = node->next) {
         if (node->range.end <= begin) continue;
         needed += (node->range.begin < begin) + (node->range.end > end);
     }
@@ -190,7 +196,7 @@ bool MappingRangePlan::Insert(MappingRangeTable& table, const MappingRange& rang
 bool MappingRangePlan::CanSplitCovered(const MappingRangeTable& table, uint64_t begin, uint64_t end,
                                        uint32_t protection, bool checkProtection) const {
     if (!prepared_ || !ValidRange(begin,end) || (protection & ~7u)) return false;
-    auto* first = table.head;
+    auto* first = MappingRangeFirstEndingAfter(table, begin);
     while (first && first->range.end <= begin) first = first->next;
     uint64_t covered = begin, splits = 0, changed = 0;
     for (auto* node = first; node && node->range.begin < end; node = node->next) {
@@ -214,7 +220,7 @@ bool MappingRangePlan::CanSetForkFlags(const MappingRangeTable& table, uint64_t 
 template<typename Apply>
 void MappingRangePlan::SplitApply(MappingRangeTable& table, uint64_t begin, uint64_t end, Apply apply) {
     InvalidateLookup(table);
-    MappingRangeNode** link = &table.head;
+    MappingRangeNode** link = FirstEndingAfterLink(table, begin);
     while (*link && (*link)->range.end <= begin) link = &(*link)->next;
     while (*link && (*link)->range.begin < end) {
         auto* node = *link; const auto original = node->range;
@@ -291,7 +297,7 @@ uint64_t MappingRangeFindGap(const MappingRangeTable& table, uint64_t hint,
     uint64_t start = hint >= floor && hint < ceiling ? hint : floor;
     if (start > ~uint64_t{0}-4095) return 0;
     start = (start + 4095) & ~uint64_t{4095};
-    for (auto* node = table.head; node; node = node->next) {
+    for (auto* node = MappingRangeFirstEndingAfter(table, start); node; node = node->next) {
         if (node->range.end <= start) continue;
         if (node->range.begin >= start && node->range.begin-start >= length) break;
         start = node->range.end;
