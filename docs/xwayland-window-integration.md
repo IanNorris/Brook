@@ -107,6 +107,92 @@ Xserver ignores for non-root callers. That attempt remains recorded; the
 corrected ordinary-user launch succeeds. The new worker is deployed with the
 compositor by fresh-image, image-update and private offline-staging scripts.
 
+## Fullscreen and HiDPI (work/xwayland-hidpi)
+
+**EWMH fullscreen.** SDL games ask for `_NET_WM_STATE_FULLSCREEN` (a property
+set before mapping, or a client message) and then assume the window sits at
+the output origin with the output size. SDL2's `SDL_GetWindowPosition`
+returns the display origin for fullscreen windows, and MonoGame computes the
+mouse as global position minus that, so a framed window (Stardew on the Dell:
+client at 4,80 in a 3192x1632 maximized frame) offset the cursor by the title
+bar and cut off the bottom of an output-sized back buffer. brook-xwm now
+advertises the atom, reports the initial property at MapRequest and
+add/remove/toggle messages, publishes the answer in `_NET_WM_STATE`, refuses
+geometry requests while fullscreen and sends a synthetic root-relative
+ConfigureNotify after every native configure (ICCCM 4.1.5). waylandd shows a
+fullscreen window without chrome at the output origin with exactly the output
+size, restores geometry/chrome/maximize on exit and ignores move, resize and
+maximize requests meanwhile. The native taskbar still draws over (and takes
+clicks in) the bottom strip; hiding it for a fullscreen window is a kernel
+compositor follow-up.
+
+**What Xwayland 24.1 offers.** The Dell and image profiles carry Xwayland
+24.1.11 (pinned nixpkgs). `-hidpi` ("adjust to output scale when rootful") and
+`-decorate` apply only to rootful mode; in rootless mode
+`global_surface_scale` stays 1, no `wl_surface.set_buffer_scale` is sent for
+X windows, and fractional-scale/viewport scaling is rootful-only. Native
+per-client scaling (`_XWAYLAND_GLOBAL_OUTPUT_SCALE`, GNOME's
+xwayland-native-scaling) is not in 24.1. waylandd sends Xwayland
+`wl_output.scale` 1 and the device mode, and no xdg-output, so the rootless X
+screen is 3200x1800 device pixels and every X window is shown 1:1.
+
+**Default: apps scale themselves** (KDE's choice, GNOME's native-scaling
+result). waylandd passes `BROOK_XWM_SCALE` (the output scale) and
+`BROOK_XWM_PROTOCOL=2` to brook-xwm, `-dpi 96*scale` to Xwayland, and reports
+RandR millimetres at 96*scale dpi to the Xwayland client only. brook-xwm puts
+`Xft.dpi` and `Xcursor.size` in RESOURCE_MANAGER (keeping an existing
+`Xft.dpi`) and owns XSETTINGS with `Xft/DPI`, `Gdk/WindowScalingFactor`,
+`Gdk/UnscaledDPI` and `Gtk/CursorThemeSize`. GTK3, Qt6, Chromium/Electron
+(via GTK settings or Xft.dpi), Tk (core DPI) and Xft text follow. Steam's
+CEF UI needs `STEAM_FORCE_DESKTOPUI_SCALING`; the rootless launcher sets it
+from the desktop scale (branch `work/steam-rootless-hidpi`, on top of
+`work/steam-rootless`). Games keep choosing their own resolution in device
+pixels.
+
+**Fallback: scaled by the system, per app.** `BROOK_XWAYLAND_SCALED_APPS`
+(waylandd's environment; comma list of WM_CLASS instance or class names,
+case-insensitive, `*` for all; empty by default) marks the matching X client.
+Its windows keep 1x X geometry at the native client origin and are presented
+at the output scale: pointer input arrives in 1x surface units, odd native
+sizes snap to whole 1x pixels, and override-redirect popups map through their
+transient parent or, if none, the client's most recently active window
+(native = parent + (x - parent_x) * scale). Limits: the app still sees the
+global Xft.dpi/XSETTINGS (list only apps that ignore them, or launch a toolkit
+app with `GDK_SCALE=1 GDK_DPI_SCALE=0.5` / `QT_SCALE_FACTOR=0.5`); it sees a
+3200x1800 screen in its 1x units, so its own screen-edge placement (menus
+near the bottom, centring) can be off; X pointer root coordinates of a scaled
+window differ from native ones, so drag-and-drop between a scaled and a
+native X window can target the wrong window. Unlike KDE's global mode, the X
+root is never logical-sized.
+
+**Compatibility.** The new wire messages (fullscreen requests, `BXWM_SCALED`)
+are only sent when waylandd announces protocol 2, so a new brook-xwm under an
+older waylandd behaves as before; an older brook-xwm under the new waylandd
+just lacks fullscreen and hints. Both are needed for the fixes.
+
+**Tests and evidence.** Nix check phase: the bridge test covers fullscreen
+from a maximized window, request-before-map, ignored requests while
+fullscreen, restore, scaled presentation, snap, client resize, popup anchors
+and pointer units; the Xvfb helper test covers `_NET_SUPPORTED`, initial
+property, client messages, synthetic ConfigureNotify, refused geometry while
+fullscreen, remap, RESOURCE_MANAGER, XSETTINGS contents and scaled-client
+marking, plus a protocol-1 run that must not emit the new messages. A private
+software-composited QEMU review (Xwayland from the rootless Stardew review
+image, 1920x1080 at 200%, current kernel/waylandd/brook-xwm, session
+`97856bedea61430c892685d0bc0059b4`, stopped after a checked sync) used
+`scripts/workloads/x11_hidpi_probe.py`: Xft.dpi 192, Xcursor.size 48, XSETTINGS
+owner, core DPI 192; an Xlib window with the fullscreen property and an SDL2
+(sdl2-compat) OpenGL `FULLSCREEN_DESKTOP` window both became chrome-less
+1920x1080 at 0,0 with real and synthetic ConfigureNotify; SDL clicks at
+(800,300)/(1500,900) reported identical event and global-minus-position
+coordinates with the button held. An Xlib window at 400x300 was 1:1; the
+listed class was 800x600 natively, a click 100,100 device pixels into it
+arrived at 50,50 and its override-redirect popup appeared at the click. X11
+Mousepad (GTK3) rendered at scale 2 with its File menu under the menu bar.
+Screenshots: `build/workloads/xwayland-hidpi-20261116/evidence/`. An SDL3
+window that recreates its X window after the fullscreen request (window
+surface path) stayed framed; MonoGame creates an OpenGL window up front.
+
 ## Evidence and remaining acceptance
 
 The Nix check phase exercises the actual shell and bridge adapters. It covers

@@ -126,5 +126,8 @@ The screenshot is the GPU run at native 1920×1080 and 200% desktop scale:
    buffers, pointer input, configure sizes, popups, subsurfaces and cursor hotspots
    need consistent handling. Start with 100%/200% app scaling; fractional app
    scaling requires additional protocol/resampling work.
+   X11 clients through rootless Xwayland stay at device pixels and are told
+   the scale (Xft.dpi, XSETTINGS), with an opt-in per-app system-scaled mode;
+   see the HiDPI section of `docs/xwayland-window-integration.md`.
 4. Update user-facing screenshots after live acceptance. The Settings preview
    currently demonstrates the theme, not the selected desktop scale.
