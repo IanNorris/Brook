@@ -1192,9 +1192,10 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
         uint32_t idx1 = fileBlock / ptrsPerBlock;
         uint32_t idx2 = fileBlock % ptrsPerBlock;
 
-        uint64_t off1 = (static_cast<uint64_t>(ino->i_block[13]) << mnt->blockShift) + idx1 * 4;
-        uint32_t indBlock = 0;
-        Ext2DevRead(mnt, off1, &indBlock, 4);
+        // Same indirect-block cache as the singly-indirect case and the read
+        // path; Ext2WriteIndPointer/Ext2WriteBlock keep it coherent. A raw
+        // 4-byte read here cost one device command per written block.
+        uint32_t indBlock = Ext2ReadIndPointer(mnt, ino->i_block[13], idx1);
         if (!indBlock) {
             indBlock = Ext2AllocBlock(mnt);
             if (!indBlock) return 0;
@@ -1207,9 +1208,7 @@ static uint32_t Ext2EnsureBlock(Ext2Mount* mnt, Ext2Inode* ino,
             ino->i_blocks += mnt->blockSize / 512;
         }
 
-        uint64_t off2 = (static_cast<uint64_t>(indBlock) << mnt->blockShift) + idx2 * 4;
-        uint32_t entry = 0;
-        Ext2DevRead(mnt, off2, &entry, 4);
+        uint32_t entry = Ext2ReadIndPointer(mnt, indBlock, idx2);
         if (entry) return entry;
         uint32_t nb = Ext2AllocBlock(mnt);
         if (!nb) return 0;
