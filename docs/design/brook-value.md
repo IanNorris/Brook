@@ -1,19 +1,22 @@
 # What is Brook for?
 
-Status: critique and proposal, written 16 November 2026 at Ian's request. It
-scrutinises [Brook beyond compatibility](brook-directions.md) and takes
-positions where that document asks questions. Nothing here is implemented or
-decided. It does not change the active goal in
+Status: critique and proposal, written 16 November 2026 at Ian's request and
+revised the same day after his response. It scrutinises
+[Brook beyond compatibility](brook-directions.md) and takes positions where
+that document asks questions. The section "Ian's response and the agreed
+direction" records decisions. Everything else is analysis or proposal, and
+nothing here is implemented. It does not change the active goal in
 [HANDOVER.md](../agent/HANDOVER.md).
 
-Reading time is about 25 minutes. The recommendation is in the last section if
-you want to start there.
+Reading time is about 35 minutes. The agreed direction is next, and the plan
+is in the last section.
 
 ## Summary
 
-- **Brook today is a learning and research platform, and a very good one.** It
-  is not yet a reason to stop using Linux, and on security it is currently
-  behind Linux, not ahead of it.
+- **Brook is a platform for exploring OS concepts, not a production OS, and it
+  will probably never be one.** That is Ian's framing and this revision adopts
+  it. The critique below still measures Brook against Linux, because an honest
+  baseline is what makes an experiment's result mean something.
 - **Almost everything Ian dislikes about Linux lives in userspace and in
   governance, not in the kernel.** Android and ChromeOS fixed most of it on a
   Linux kernel. So "we have our own kernel" is not, by itself, the value.
@@ -21,16 +24,35 @@ you want to start there.
   control of the kernel side of the Linux ABI.** Brook decides what world each
   unmodified Linux program sees. On Linux, confinement is something each app
   opts into; on Brook it can be the only thing that exists.
-- **The thesis I recommend:** Brook is a single-owner personal computer where
-  every app, including unmodified Linux and Windows apps, runs inside its own
-  confined world built by the OS, and where the whole machine is observable and
-  operable by its owner's agents. The Linux ABI is a guest personality, not
-  Brook's system model.
-- **The test of the thesis is narrow and can be run in about three months:**
-  can ordinary Linux apps run confined, with no access to the owner's files
-  except through an OS-owned picker, without breaking and without annoying Ian?
-  If yes, Brook has something Linux does not offer by default. If no, Brook is
-  a learning project, which is a legitimate thing to be.
+- **The headline concept is compartments:** a desktop OS that runs ordinary
+  Linux and Windows software with phone-like separation between apps, without
+  asking app developers for anything. UWP asked developers to rewrite.
+  Compartments ask nothing of them.
+- **Concepts are only worth what their validation is worth,** so performance,
+  compatibility and capable hardware come first, and security claims wait for
+  a kernel that can carry them.
+
+## Ian's response and the agreed direction
+
+Ian read the first version of this document on 16 November 2026, broadly
+agreed it was realistic, and corrected its framing. These are recorded as
+decisions. Where the first version recommended otherwise, it has been changed.
+
+| Subject | Decision | What changed in this document |
+| --- | --- | --- |
+| Purpose | Brook is a way of exploring concepts. It is not, and likely never will be, a production OS. | "Would someone use it daily" is kept as context, not as the goal. The goal is that concepts can be validated on real workloads. |
+| Anti-cheat | Keep it, as a thought experiment: how can the OS make kernel-level anti-cheat unnecessary, and offer guarantees it cannot? Supporting a specific title such as Valorant is not the point. | "Drop anti-cheat" is withdrawn. Section 4.5 is new. |
+| Hardware | The Dell proved the foundations and is not a long-term platform. Bring Brook up on more powerful hardware that can game. | "No second machine or GPU" is withdrawn. See workstream 2 of the plan and the draft `docs/discrete-gpu-bringup-plan.md`. |
+| Games and browsers | They are demos, and they are also the best available tests of syscall and ABI compatibility and stress tests of the whole system. Ian is a games developer and can steer optimisation. | "Stop trophy bring-ups" is withdrawn. Workloads are chosen for the coverage they add. |
+| Security timing | Leading with security is the wrong order. A hand-written C++ kernel produced mostly by AI is not a foundation for security claims. A move to Rust may be sensible, after interfaces are formalised and tested: build abstraction interfaces, test every element as far as feasible, convert the tests to Rust, then port the code. | The plan is resequenced. Compartments are built as a concept and an architecture now; guarantees are claimed only as the kernel earns them. |
+| xdg-desktop-portal | An obvious short-term goal, preferably forked to work natively with Brook rather than shimmed. Not yet, because performance is not there. | Moved after the performance work; reworked as a native fork. |
+| Compartments | The major hook: Linux support with phone-like compartmentalisation, seamless for most apps. | Promoted to the headline. The mechanism is made concrete in the plan. |
+| Multiple users | Not excluded; personal tablets support several users. User-level isolation is not enough by itself, and Brook should lean into per-app isolation. | "No user accounts" is withdrawn. Multi-user is a non-goal for now, with the app as the primary boundary and users as a possible outer one. |
+
+Two positions from the first version stand, as risks and not as instructions:
+Android is still the most expensive ecosystem for the least return on x86, and
+a native syscall API still has almost no callers. Neither blocks anything
+above.
 
 ## What I read and checked
 
@@ -41,22 +63,20 @@ Brook files: `README.md`, `docs/design/brook-directions.md`,
 accessibility proposal), `docs/identity.md`, `docs/chromium-sandbox.md`,
 `docs/exec-permissions.md`, `docs/roadmap.md`, `docs/package-pipeline.md`, and
 the launcher and chrome-architecture sections of
-`docs/design/clearwater-next/DESIGN.md`. I did not read the kernel source
+`docs/design/clearwater-next/DESIGN.md`. For the revision I also read
+`docs/agent/syscall-split-plan.md`, `docs/agent/REFACTOR_ISSUES.md` and the
+untracked draft `docs/discrete-gpu-bringup-plan.md` in the legacy checkout. I did not read the kernel source
 beyond a line count, and I did not operate the Dell or a VM.
 
-Web checks, all on 16 November 2026 and all from secondary sources:
-
-- Waydroid's requirements: binder in the kernel, a Wayland session, LXC (Arch
-  wiki).
-- Windows Subsystem for Android: support ended 5 March 2025.
-- ChromeOS and Android: Google confirmed the merger in 2025, with Android as
-  the base. I could not confirm launch details.
-- Fuchsia: still releasing (F30 in April 2026), still confined to Nest Hubs
-  plus the Starnix Linux-ABI work.
-- Flatpak: broad `filesystem=home`/`host` grants remain common. I found no
-  reliable current percentage.
-- Anti-cheat on Linux: Easy Anti-Cheat and BattlEye are user-mode and opt-in
-  per game; Riot Vanguard has no Linux path.
+Web checks, all on 16 November 2026 and all from secondary sources: Waydroid's
+requirements (binder, Wayland, a container); the end of Windows Subsystem for
+Android on 5 March 2025; the ChromeOS and Android merger (confirmed in 2025,
+launch details unconfirmed); Fuchsia (still releasing, still on Nest Hubs, plus
+the Starnix Linux-ABI work); Flatpak home-directory grants (common; no
+reliable current figure); anti-cheat on Linux (Easy Anti-Cheat and BattlEye
+are user-mode and opt-in per game, Riot Vanguard has no Linux path); and, for
+the revision, firmware requirements of NVIDIA RTX 30 and Intel Arc cards under
+Linux.
 
 Everything else about other systems is from my own knowledge and is not
 re-verified. Where I am guessing, I say "speculation".
@@ -132,8 +152,8 @@ re-verified. Where I am guessing, I say "speculation".
   owner cannot load kernel code into the attested environment. The rest of the
   document is built on one owner with full control, a developer mode, and a
   debug bridge with machine-wide reach. Both can exist only as two separate
-  boot states, and then the "protected" state is a console, not a personal
-  computer.
+  boot states. Section 4.5 takes the idea seriously as a thought experiment and
+  accepts that cost.
 - **"Preserve a conventional desktop option while testing alternatives"
   against "one coherent environment".** Keeping the old option beside the new
   one is how Linux ended up with five of everything.
@@ -189,8 +209,8 @@ As a thing to *use*, measured against the Linux it imitates:
 | Agent operability | Ahead. Nothing on Linux matches the bridge's durable job, window and launch identities. |
 
 So today nobody should choose Brook over Linux to get work done, and that
-includes Ian. That is not a criticism. It is the baseline the rest of this
-document works from.
+includes Ian. That is not a criticism, and daily use is not the goal. It is
+the baseline against which any concept tested on Brook has to be read.
 
 ### Who would choose Brook, and why
 
@@ -198,34 +218,41 @@ In descending order of how confident I am:
 
 1. **Ian, and people like him,** for the pleasure and understanding of owning
    the whole machine. This value is real and already delivered.
-2. **People studying agent-operated computers.** An OS where one team can
-   change any layer, from the scheduler to the launcher, to make it more
-   legible to an agent is rare. Brook is already that.
-3. **A single-owner appliance user:** someone who wants a laptop that runs a
+2. **People exploring OS concepts and agent-operated computers.** An OS where
+   one team can change any layer, from the scheduler to the launcher, and then
+   run Firefox and Steam on the result, is rare. This is the audience Ian has
+   chosen, and Brook already serves it.
+3. **A single-owner appliance user:** someone who wants a machine that runs a
    browser, an office suite and Steam, cannot be wrecked by what they install,
-   and never asks them to administer it. This user exists in large numbers.
-   Today they buy a Chromebook, an iPad or a Steam Deck. Brook could serve them
-   only on hardware Brook fully supports. This is the only route to "worth
-   using daily", and it is a long one.
+   and never asks to be administered. Today they buy a Chromebook, an iPad or
+   a Steam Deck. Brook is not aiming at them, but they are the right imagined
+   user when judging whether a concept is any good.
 
-A fourth audience, Linux enthusiasts who want a better Linux, will not come.
-They value exactly the choice and openness that Brook would have to remove.
+Linux enthusiasts who want a better Linux will not come. They value exactly
+the choice that Brook removes.
 
-### What would have to be true for daily use
+### What daily use would require, for the record
 
-All four, not any one:
+Daily use is not the goal. It is still worth knowing the distance. All four
+would be needed: one machine supported completely (suspend, Wi-Fi, battery,
+Bluetooth, each a driver project); a browser at parity including its sandbox;
+no data loss, ever; and one thing Linux does not offer that the owner notices
+weekly. The hardware treadmill, not kernel design, is what has ended every
+alternative desktop OS.
 
-1. **One supported machine works completely:** suspend and resume, Wi-Fi,
-   battery, external display, camera, Bluetooth. Each is a driver project. The
-   hardware treadmill, not the kernel design, is what has killed every
-   alternative desktop OS.
-2. **The browser is at parity,** including its sandbox, hardware video and
-   stability. For most people the browser is the computer.
-3. **It does not lose data,** ever, including across updates and panics.
-4. **It offers one thing Linux does not,** that the owner notices weekly.
+### What a concept platform requires instead
 
-Brook is working on 1 and 2 by accretion. It has good discipline on 3. It has
-not yet started on 4, which is what this document is about.
+A concept is validated on Brook only if the result would survive contact with
+real software. That needs three things, and they set the order of the plan:
+
+1. **Real workloads run well enough that a result is not an artefact of
+   slowness or missing ABI.** A confinement experiment that fails because
+   Stardew takes two minutes to start has measured nothing.
+2. **Hardware with headroom.** A 2015 integrated GPU cannot show whether an
+   idea costs 2% or 20% on a demanding game.
+3. **A kernel that can be changed safely.** Concepts will be prototyped by
+   changing core code. Without interfaces and tests, each prototype risks the
+   last one.
 
 ### The compatibility tax
 
@@ -323,10 +350,12 @@ failed to displace Win32 because Win32 stayed available and more capable. When
 the unconfined path remains open on the same system, developers stay on it.
 
 **Third, Linux's lack of a stable driver ABI cuts against Brook, not for it.**
-Linux has the drivers. Brook has about ten driver modules and one GPU driver. Brook's kernel is
-MIT-licensed, so borrowing GPL drivers through a compatibility shim (as
-FreeBSD does for graphics) would be a licensing and engineering project of its
-own. Speculation: that is not within reach of this team.
+Linux has the drivers. Brook has about ten driver modules and one GPU driver.
+Every new machine is a driver project, and that now matters, because the
+agreed direction includes a discrete GPU. One mitigating fact, from memory and
+worth verifying: Linux's GPU drivers are largely MIT-licensed, unlike most of
+the kernel, so they can be read and adapted for an MIT kernel. The obstacle is
+their size, not their licence.
 
 ### What others tried
 
@@ -338,7 +367,6 @@ own. Speculation: that is not within reach of this team.
 | macOS | Retrofit: App Sandbox, per-resource consent prompts, notarisation, a signed system volume | The OS-owned open/save panel grants access invisibly and well | Mixed. Sandboxing is optional outside the store, so the consent prompts carry the load, and users learn to click through them. |
 | Fuchsia | A complete do-over: capabilities, components, typed IPC, no ambient authority, plus Starnix to run Linux binaries | The design | Did not win. It shipped on smart displays. A large, well-funded team with the right architecture did not displace Linux, because there was no app-level reason to switch. |
 | Genode / Sculpt | A capability-based component OS that its developers use daily | Proves a small team can live on such a system | Tiny adoption. Software must be ported or run in a VM. |
-| seL4 | A formally verified microkernel | Verification | It is a kernel, not an OS. It wins in embedded and defence. |
 | Plan 9 | Per-process namespaces; every service a file server | Elegance; its ideas were absorbed (`/proc`, UTF-8, namespaces, 9P) | Lost. Unix was good enough and Plan 9 ran no Unix software. |
 | Qubes | Isolation by virtual machine, with trusted window borders | Strong compartments that motivated users can operate | Niche. Heavy on hardware and on the user's attention. |
 | NixOS | A declarative, immutable, content-addressed system with rollback | The system-state problem is solved | Niche. It does nothing for app confinement or desktop fragmentation, and it is hard to learn. Brook already borrows its store. |
@@ -380,20 +408,23 @@ What Brook owns:
 5. **Distribution.** One Gallery, one install unit ("an app"), one update
    mechanism.
 6. **Settings.** One place, searchable. Apps do not own system settings.
-7. **Identity.** One owner. No login manager, no user accounts in the ordinary
-   experience.
+7. **Identity.** The app is the primary boundary. Multiple users are not
+   excluded; if they arrive, a user is an outer boundary around a set of
+   compartments. The ordinary single-owner experience has no login ceremony.
 
 The desktop contract is toolkit-independent because it is defined as
 protocols, not as a widget library: a Wayland surface, the broker's
 interfaces, and a semantic tree. I would not build a Brook widget toolkit.
 
 The important design choice is how the broker is exposed. **Brook should
-implement the xdg-desktop-portal D-Bus interfaces as the compatibility face of
-its broker.** That API is already a deployed powerbox. GTK, Qt, Electron,
-Firefox and Chromium already call it when they believe they are sandboxed. An
-app that uses portals becomes nearly native on Brook without modification.
-This is the single highest-leverage adapter available. Brook has no portal
-implementation today (I searched `docs/`, `src/` and `tools/`).
+offer the xdg-desktop-portal D-Bus interfaces as the compatibility face of its
+broker, as a fork that talks to Brook natively and not as a shim over stock
+backends** (Ian's refinement). That API is already a deployed powerbox. GTK,
+Qt, Electron, Firefox and Chromium already call it when they believe they are
+sandboxed. An app that uses portals becomes nearly native on Brook without
+modification. This is the single highest-leverage adapter available. Brook has
+no portal implementation today (I searched `docs/`, `src/` and `tools/`). It
+is sequenced after the performance work.
 
 How fragmentation is kept from leaking back in:
 
@@ -496,47 +527,37 @@ What it does not prevent:
   against commodity malware and not against a targeted attacker.
 - **Firmware and physical attacks.**
 
-Three compatibility costs to plan for:
-
-- **Apps that run code they download.** Steam, and developer tools generally.
-  These need a compartment in which downloaded code is executable. Treat Steam
-  as a nested platform: everything it installs lives and runs inside Steam's
-  compartment. Development gets a "workshop" compartment (section 4.4).
-- **Apps that expect to see each other.** Password-manager browser
-  integration, editors launching compilers, anything using a shared session
-  bus. Each needs a declared, brokered connection.
-- **A versioning filesystem.** Brook's data volume is ext2. Versioning at the
-  broker (copy before granting write) avoids needing a new filesystem at
-  first. Speculation: it will be good enough for documents and too slow for
-  large media projects.
+Compatibility costs to plan for: apps that run code they download (Steam,
+developer tools) need a compartment where that is allowed; apps that expect to
+see each other need declared, brokered connections; and versioning needs
+either broker-side copies or a filesystem better than ext2. The plan's
+compartment table covers each.
 
 ### 4.3 Cross-platform
 
 Position: **Linux first, the web second, Windows through Proton third, and
-Android not at all for now.**
+Android last, as a risk to weigh and not a ruling.**
 
 | Ecosystem | Path | Cost | Priority |
 | --- | --- | --- | --- |
 | Linux | The existing ABI personality, each app in a compartment, portals for integration | Ongoing ABI gaps; this is already the main cost of the project | 1. It is the substrate for the next two |
 | Web | Installed web apps as first-class apps: own launcher entry, own window, own compartment and browser profile | Small. It rides on Chromium or Firefox, which already run | 2. Cheapest large gain |
 | Windows | Wine and Proton as Linux programs. One Wine prefix per compartment | Moderate. It already works for several titles (`docs/proton.md`, `docs/wine-unity.md`, `docs/d3d12.md`) | 3. Games are the strongest reason an appliance user needs more than a browser |
-| Android | A full Android userland in a container, plus binder in the kernel, a graphics bridge, and ARM translation on x86 | Very large, and the result is poor | Deferred indefinitely |
+| Android | A full Android userland in a container, plus binder in the kernel, a graphics bridge, and ARM translation on x86 | Very large, and the result is poor | 4. My advice is to defer it |
 
-On Android specifically. Waydroid shows the shape: it needs the binder driver,
-a Wayland session, a container, and a multi-gigabyte Android system image.
-Brook would need to implement binder, satisfy Android's expectations of
-cgroups and SELinux, and bridge Android's graphics stack to Wayland. Then:
-many apps ship ARM-only native code and need a translator on x86; apps that
-depend on Google Play services do not work without them; and banking and
-payment apps check device integrity and refuse. Microsoft built this for
-Windows 11 with far more resources and withdrew it in March 2025. The apps
-people most want from Android (messaging, banking, media) mostly have web
-versions. Revisit only if Brook ever targets ARM hardware.
+On Android specifically. Waydroid shows the shape: binder in the kernel, a
+Wayland session, a container and a multi-gigabyte system image. Brook would
+also need to meet Android's expectations of cgroups and SELinux and bridge its
+graphics stack. Then many apps ship ARM-only native code, apps that depend on
+Google Play services fail without them, and banking apps refuse on integrity
+checks. Microsoft built this for Windows 11 and withdrew it in March 2025. As
+a concept study it has some interest, since Android's app model is the closest
+relative of compartments. As a workload it costs more than anything else here.
 
-On anti-cheat, since the directions document raises it under this heading:
-drop it. Kernel-level anti-cheat vendors do not support Linux even with the
-Steam Deck's volume behind it. An OS with one machine has no leverage, and the
-attested mode conflicts with owner control.
+On anti-cheat: existing kernel-level anti-cheat will not run on Brook, and
+its vendors do not support Linux even with the Steam Deck's volume behind it.
+That is accepted. The interesting question is the inverse one, taken up in
+section 4.5.
 
 What "seamless" should mean. An app from any ecosystem is seamless when all of
 the following hold, and none of them requires the app to hold ambient
@@ -544,15 +565,12 @@ authority:
 
 | Integration point | Seamless means |
 | --- | --- |
-| Windows | Each app window is a Brook window with Brook chrome. No desktop-in-a-window (so rootless Xwayland, never Xephyr, for delivery). |
-| Launcher | One icon, one name, found by the same search, with launch feedback. |
-| Documents | Open and save go through the system picker. Inside a Wine prefix, the chosen file appears at a stable drive path. The app never sees the owner's file tree. |
-| Clipboard and drag-and-drop | Work across ecosystems, mediated by the broker, delivered on paste or drop and not readable in the background. |
-| Notifications | Appear in the one notification surface, attributed to the app. |
-| Audio | One volume control per app in one mixer. |
-| Input | The same keyboard layout, input method and pointer settings. |
-| Settings | Scale and dark mode are honoured where the toolkit can. |
-| Lifecycle | Close means close. The system can stop the whole app, including its helper processes. |
+| Windows and launcher | Each app window is a Brook window with Brook chrome, never a desktop-in-a-window. One icon, found by the same search. |
+| Documents | Open and save go through the system picker. Inside a Wine prefix the chosen file appears at a stable drive path. |
+| Clipboard and drag-and-drop | Work across ecosystems, delivered on paste or drop and not readable in the background. |
+| Notifications and audio | One notification surface, attributed to the app. One mixer with a volume control per app. |
+| Input and settings | The same layout, input method, scale and dark mode, where the toolkit can honour them. |
+| Lifecycle | Close means close. The system can stop the whole app, helpers included. |
 
 The capability model makes this easier, not harder, in one respect: the broker
 is the single place where each ecosystem is adapted, so there are four
@@ -572,12 +590,10 @@ Drop from the default experience:
 | Manual updates and "restart to update" prompts | Silent, atomic, reversible updates. The new generation takes effect at next boot. |
 | Administrator passwords and `sudo` | One owner. The few dangerous actions need the owner's presence through a system-drawn confirmation that apps cannot imitate or cover. |
 | Up-front permission prompts | Authority follows the owner's action: picking a file, pressing a capture button. Standing permissions are few and listed in one place. |
-| Modal dialogs | Sheets attached to the window they concern; undo instead of "are you sure". |
 | Explicit save, and "unsaved changes" on close | Autosave with versions for native apps. For compatibility apps, the broker's versions make an accidental overwrite recoverable. |
 | App-drawn window frames, tray icons, per-app update checkers, per-app autostart | System chrome; one background-activity surface showing what is running and why; none of the rest. |
 | Config files and dotfiles | One settings surface. Per-app settings live in the compartment and "reset this app" always works. |
 | Invisible background processes | Anything running without a window is listed, attributable and stoppable. The system may suspend idle apps. |
-| Logs and error codes as the failure experience | An error says what failed, what state things are in, and what can be done. The existing launch-feedback work (`docs/launch-feedback.md`) is the right instinct. |
 | The terminal as a requirement | Never required for any ordinary task. |
 
 Keep, because phones got these wrong or desktops got them right:
@@ -605,13 +621,117 @@ per app, no nested folders, an Unsorted inbox and search
 document's "preserve a conventional desktop option" should be read as "keep
 windows and a taskbar", not "keep a second shell".
 
+### 4.5 A thought experiment: making kernel anti-cheat unnecessary
+
+The question, as Ian put it: if the OS can attest the state of the machine,
+and apply rules about memory and cross-app interaction when an app asks for
+them, can it offer guarantees that kernel-level anti-cheat cannot? This is a
+concept study. Whether any vendor would adopt it is a separate question,
+addressed under the limits.
+
+**Why kernel anti-cheat exists.** On Windows the owner is an administrator
+and can load drivers, so cheats run in the kernel to read and write game
+memory. Anti-cheat follows them into the kernel, and loads at boot to be there
+first. It is an arms race at ring 0 that exists only because the OS hands the
+owner ring 0 and gives a game no way to ask for less. Everyone pays:
+third-party code with total access to the machine, and the privacy, stability
+and security problems that come with it.
+
+**The threat model is unusual: the adversary is the machine's owner.**
+
+| Cheat class | How it works |
+| --- | --- |
+| Memory read | Another process or driver reads game state (wallhacks, radar). |
+| Memory write and injection | Code or data is altered in the game process. |
+| Synthetic input | Software generates aim or trigger input. |
+| Screen reading | Software captures the game window and reacts to it. |
+| Overlays | Another program draws over the game. |
+| Modified client | Game files or libraries are replaced. |
+| Below the OS | A hypervisor, or tampered firmware, sits under the kernel. |
+| DMA hardware | A PCIe device reads memory directly. |
+| Outside the machine | A camera or capture card feeds a second computer, which sends input through a device that looks like a mouse. |
+
+**What the OS would attest.** A signed statement, bound to a TPM quote, of
+facts a server can check:
+
+- the measured boot chain: firmware, loader, kernel and system generation;
+- that this boot has no owner-loaded kernel code and the debug bridge is
+  absent, not merely idle;
+- that DMA remapping is on and covers every device;
+- the identity of the game's compartment: the hash of its immutable code;
+- the policy currently applied to that compartment, and that any change ends
+  the session.
+
+**The policy an app could request.** A game's manifest asks for a protected
+session, and the OS applies, for that compartment only:
+
+- no memory access from outside it by any route (ptrace, `/proc`, shared
+  mappings it did not create), including by the owner's tools;
+- no code in the process except from its signed closure, so no preloaded or
+  injected libraries;
+- no capture of its windows by other apps and no overlays above them
+  (`DECISIONS.md` already anticipates a capture opt-out for competitive games);
+- input delivered only from physical devices, with injected events excluded;
+- no memory dumps, and GPU buffers isolated from other contexts.
+
+Most of this is the compartment model with stricter settings. That is the
+point: the mechanism is the same one that protects a password manager.
+
+**What this offers that kernel anti-cheat cannot:**
+
+- **No third-party kernel code at all.** The game learns the answer to a
+  defined question. It does not get to inspect the machine.
+- **Prevention by construction.** Anti-cheat detects known cheats after the
+  fact. Here the capability to read another compartment's memory does not
+  exist in a protected session.
+- **Input provenance and capture denial as facts the OS states,** not
+  heuristics the game guesses at.
+- **A statement the owner can read.** Exactly what is attested is public, and
+  the code enforcing it is open.
+- **Scope.** The restriction applies to one compartment in one session. The
+  rest of the machine stays the owner's.
+
+**Honest limits.**
+
+- **The protected state is a property of the boot, not only of the session.**
+  If the owner had kernel access earlier in this boot, the kernel cannot vouch
+  for itself. So there are two boot states, as on ChromeOS, and the owner picks
+  one at startup. This resolves the tension noted in section 1; it does not
+  remove it. (Speculation: a late-launch mechanism could avoid the reboot.)
+- **Anything outside the machine is invisible.** A camera, a second computer
+  and an input-emulating device defeat every OS-level scheme, this one
+  included. Server-side detection remains necessary.
+- **DMA and firmware.** An IOMMU stops ordinary DMA devices if it is enabled
+  from boot. It does not stop tampered firmware, and TPM attestation can be
+  relayed or virtualised by a determined attacker.
+- **The kernel is the weak point.** One exploitable bug in Brook's kernel is a
+  universal cheat, and a young C++ kernel with a Linux-sized syscall surface
+  has such bugs. This concept is credible only after the hardening path in the
+  plan.
+- **Vendor trust.** A server must trust a signing key for "blessed" Brook
+  builds, and someone must operate verification and revocation. Windows games
+  under Proton expect their own Windows driver and need the vendor's
+  cooperation regardless. No vendor will do this for a research OS.
+- **Collateral.** The same rules block mods, overlays, streaming software and
+  accessibility tools that synthesise input, unless each is a declared, signed
+  partner of the session.
+- **Privacy.** Attestation can identify a machine. A real design needs an
+  anonymising step.
+
+**Smallest prototype.** No vendor is needed. Take an open-source multiplayer
+game Brook already runs (Quake II has LAN deathmatch per `README.md`), add a
+toy server that verifies a quote from a software TPM in QEMU, and write a
+cheat fixture suite: a memory reader, a library injector, an input
+synthesiser and a window grabber. Success is that every fixture fails in a
+protected session, works in a normal one, and the server refuses a boot with
+debugging enabled.
+
 ## 5. Do-over decisions
 
-Eleven choices I would make differently from Unix if starting today. For each:
+Ten choices I would make differently from Unix if starting today. For each:
 why, what it costs Brook given its Linux personality, and the smallest
-prototype that would test it. Decisions 1, 2, 7 and 9 are the ones the
-recommendation depends on. The others are worth knowing and mostly not worth
-building yet.
+prototype that would test it. Decisions 1, 2, 6 and 8 are the ones the
+compartment concept depends on. The others are candidates for later study.
 
 **1. A process starts with nothing and is handed what it may use.**
 *Why:* ambient authority is the root of the malware problem. Plan 9 and
@@ -623,8 +743,8 @@ or `/tmp` sockets with other apps break and need declared connections.
 and save one file through a broker-granted path. Count what breaks.
 
 **2. The app, not the user, is the security principal.**
-*Why:* a personal computer has one user and a hundred mutually distrustful
-programs. *Cost:* UIDs remain as a fiction inside each compartment (always
+*Why:* a personal computer has one or a few users and a hundred mutually
+distrustful programs. *Cost:* UIDs remain as a fiction inside each compartment (always
 "uid 1000"). Kernel permission checks gain a compartment check that runs
 first. *Prototype:* an unforgeable compartment identity on every process,
 inherited across fork and exec, with `kill`, ptrace and `/proc` scoped by it.
@@ -637,20 +757,15 @@ Linux personality, so the kernel carries both. The gain is limited to native
 system components. *Prototype:* a native `spawn(image, handles[])` used by the
 launcher; compare launch latency with fork-and-exec for the same app.
 
-**4. Events on handles, not signals.**
+**4. Events and completions, not signals and blocking calls.**
 *Why:* signals are asynchronous, process-global and nearly impossible to
-handle correctly. *Cost:* signals stay in the Linux personality. *Prototype:*
-make "please close" for native apps a message with a deadline and an
-acknowledgement, building on `docs/orderly-shutdown.md`. Low priority.
+handle correctly; blocking calls with `EINTR` and no cancellation are why UIs
+freeze. io_uring and `signalfd` are Linux conceding both points. *Cost:* both
+stay in the Linux personality, and Linux apps cannot use the replacement.
+*Prototype:* make "please close" for native apps a message with a deadline
+and an acknowledgement, building on `docs/orderly-shutdown.md`.
 
-**5. I/O is asynchronous, cancellable and reports completion.**
-*Why:* blocking calls with `EINTR` and no cancellation are why UIs freeze and
-why "did it finish?" is hard to answer. io_uring is Linux conceding the point.
-*Cost:* Linux apps cannot use it. *Prototype:* none yet. The bridge's job
-model (durable identity, observable completion) is the pattern; apply it to
-broker operations first.
-
-**6. System interfaces are typed, versioned messages, not ioctls and text
+**5. System interfaces are typed, versioned messages, not ioctls and text
 files.** *Why:* `/proc` text, `ioctl` numbers and ad-hoc sockets cannot be
 checked, versioned or introspected. Fuchsia's FIDL and Android's binder
 interfaces can. *Cost:* the Linux-facing `/proc` and `/sys` must still be
@@ -659,7 +774,7 @@ generate both the portal adapter and the bridge's tool definitions from it.
 One contract for apps, accessibility and agents is the directions document's
 best idea; this is how to make it literally true.
 
-**7. The system is an immutable, signed image, and state is separated into
+**6. The system is an immutable, signed image, and state is separated into
 four kinds:** system, app code, app private data, and the owner's documents.
 *Why:* it makes updates atomic, rollback possible, uninstall complete and
 self-modifying code impossible. *Cost:* self-updating apps (Steam, browsers'
@@ -668,13 +783,13 @@ compartment. *Prototype:* switch a whole generation, including the app
 profile, and roll it back from the boot menu on the Dell. Most of the parts
 exist.
 
-**8. Every object has an unforgeable identity that is never reused.**
+**7. Every object has an unforgeable identity that is never reused.**
 *Why:* PIDs, UIDs, window titles and descriptor numbers are integers that get
 recycled, and whole classes of bugs and attacks follow. *Cost:* Linux apps
 still see PIDs. *Prototype:* largely done for windows and bridge jobs. Extend
 the same identity to processes and compartments in the kernel's job API.
 
-**9. Cross-app access happens through an OS-owned act (the powerbox), not a
+**8. Cross-app access happens through an OS-owned act (the powerbox), not a
 permission setting.** *Why:* prompts train people to click "allow". Picking a
 file is something the person was going to do anyway. macOS's sandboxed
 open panel shows this works. *Cost:* apps that do not use the portal file
@@ -683,7 +798,7 @@ owner drops files into. *Prototype:* implement the portal FileChooser and
 OpenURI interfaces; run the twenty most-used apps; record which use them
 unprompted.
 
-**10. The OS owns app lifecycle.**
+**9. The OS owns app lifecycle.**
 *Why:* phones stay responsive because the system may suspend or stop anything
 not in use. Desktops degrade because everything runs forever. *Cost:* Linux
 apps assume they are immortal; some lose network sessions when frozen.
@@ -691,7 +806,7 @@ apps assume they are immortal; some lose network sessions when frozen.
 on focus. Measure against the existing out-of-memory behaviour
 (`docs/oom-recovery.md`).
 
-**11. Drivers and the compositor are restartable, isolated components behind a
+**10. Drivers and the compositor are restartable, isolated components behind a
 stable interface.** *Why:* most kernel crashes and most kernel attack surface
 are drivers. *Cost:* large, and the GPU driver is the hardest case. I would
 not attempt a microkernel conversion. *Prototype:* finish moving the window
@@ -702,126 +817,248 @@ already intends. Then stop, and reconsider with data.
 
 ### Thesis
 
-Brook is a single-owner personal computer on which every program, including
-unmodified Linux and Windows software, runs as a guest in a world the OS
-builds for it: its own identity, its own private storage, and nothing of the
-owner's except what the owner hands over through the system. The system and
-its apps are immutable, signed and reversible, so ordinary malware has nothing
-to hold on to. Everything that happens on the machine has an identity and an
-observable outcome, so the owner's agents can operate it with delegated
-authority and the owner can see what they did. Brook does not try to be a
-better Linux. It treats Linux as one guest personality, exact in its
-semantics and arbitrary in what it is shown, and puts all of its own design
-into the layer between apps and everything else.
+Brook is a platform for testing what a personal computer could be if one
+owner controlled every layer. Its headline concept is that every program,
+including unmodified Linux and Windows software, runs as a guest in a world
+the OS builds for it: its own identity, its own private storage, and nothing
+of the owner's except what the owner hands over through the system. Linux is
+one guest personality, exact in its semantics and arbitrary in what it is
+shown. Brook's own design goes into the layer between apps and everything
+else. Because a concept proves nothing on a system that cannot run demanding
+software well, Brook first earns the ability to validate: real games and
+browsers at good frame rates on capable hardware, on a kernel whose interfaces
+are defined and tested well enough to be changed, and eventually rewritten,
+with confidence.
 
-### The part Ian may disagree with
+### Sequence
 
-- **The kernel is not the product.** The user-visible value in this thesis
-  could be built as an opinionated Linux distribution, in less time, with
-  working hardware. Android and ChromeOS are the proof. The reasons to do it
-  on Brook's kernel are that Ian wants to, that owning the ABI makes
-  confinement the default at the lowest level with no namespace and seccomp
-  layering, and that one team changing any layer is what makes the agent work
-  possible. Those are good reasons. They are not the reasons a user would
-  give.
-- **The do-over mostly should not happen in the kernel.** A clean native
-  syscall API is the most attractive work and the least valuable, because
-  nothing will call it.
-- **More Linux ABI work is required before any of the differentiating work
-  counts.** Seccomp and namespaces are needed so that browsers run their own
-  sandboxes. That is unglamorous imitation, and it comes first.
-- **Android and anti-cheat should be dropped,** not explored.
-- **"Impossible to get a virus" should be retired as a phrase.**
-- **There is a real chance the thesis fails,** because too many Linux apps
-  misbehave when confined. Flatpak's experience says many will need holes.
-  Brook's advantage is that it controls the kernel side and can lie more
-  convincingly than bubblewrap can. Whether that is enough is an empirical
-  question, and it is the first one to answer.
+Six workstreams. The first three make validation possible. The last three are
+the concepts. They overlap, but the order of emphasis is as listed.
 
-### What to stop doing
+**1. Performance and compatibility, driven by games and browsers.**
 
-- **Open-ended performance work on the Broadwell GPU** once the 60 fps goal in
-  `HANDOVER.md` is met. `DECISIONS.md` already records Ian's wish to avoid
-  diminishing returns here.
-- **App bring-ups as trophies.** Fix a list of about twenty apps that define
-  the appliance (two browsers, office, image editor, media player, editor,
-  Steam and a handful of games) and decline others until the thesis is tested.
-- **Exploring Android, anti-cheat, service activation and alternative desktop
-  shells.** The first two are poor bets; the third is solved elsewhere and not
-  differentiating; the fourth competes with Clearwater Next.
-- **Treating UIDs as a security mechanism.** `identity.md` is honest that they
-  are not one. Stop investing in user accounts.
-- **Per-app launch recipes held in handover notes and scripts.** Move them
-  into manifests.
-- **Xephyr as anything but a diagnostic,** as `DECISIONS.md` already says.
-- **A second machine or GPU.**
+Finish the active 60 fps goal on the Dell. Keep bringing up games and browsers,
+chosen for what they exercise. A new title earns its place by adding syscalls,
+ABI paths or load patterns that the existing set does not cover; the
+compatibility census (`work/compat-census` in `HANDOVER.md`) can make that
+choice explicit. Seccomp and PID and network namespaces
+(`chromium-sandbox.md`) belong here, as compatibility work: they let Chromium,
+Electron and Steam run the way upstream ships them, with no `--no-sandbox`.
+*Measure:* displayed frames per second against a Linux run of the same
+workload on the same machine; census gaps closed per workload added; number
+of per-app launch workarounds.
 
-### Next steps
+**2. A more capable hardware target with a discrete GPU.**
 
-Step 0 is to finish the active 60 fps goal. Nothing below should interrupt it.
+There is an untracked draft, `docs/discrete-gpu-bringup-plan.md`, in the
+legacy checkout `/data/Programming/Codex/Brook`. It is not in main yet and
+should be committed there. It proposes
+short bare-metal sessions on the existing desktop (ASUS Z370, RTX 3080),
+booting from USB with internal disk writes disabled, proving platform boot
+and the debug connection first, then a first accelerated backend, then game
+comparisons against Linux on the same box. Broadwell stays as the integrated
+regression target.
 
-1. **Close the gap where Brook is worse than Linux.** Implement seccomp-bpf
-   and PID and network namespaces to the extent Chromium's and Electron's
-   sandboxes need (`chromium-sandbox.md` has the scope), and remove
-   `--no-sandbox` from the launchers.
-   *Measure:* Chromium, Firefox and VSCodium start with their own sandboxes
-   enabled and pass their existing acceptance checks.
+I agree with its order and its caution. Two things to reconcile:
 
-2. **Compartments, version 0.** A kernel compartment identity; a private home,
-   `/tmp` and runtime directory per installed app; `/proc`, signals and ptrace
-   scoped to the compartment; window capture and input injection denied across
-   compartments. The Gallery places every installed app in one.
-   *Measure:* a "hostile app" fixture suite, written once and kept as a
-   regression test, that tries to read another app's profile, read the owner's
-   documents, signal or trace another app, capture another window, and persist
-   after uninstall. Target: every attempt fails. And: how many of the twenty
-   apps run unmodified in a compartment.
+- **The smoke test is worth doing on that desktop whatever card comes next.**
+  It exercises what the Dell never did: PCIe topology, 64-bit BARs, DMA
+  remapping beyond one integrated device, more cores, and a NIC with no Brook
+  driver.
+- **The RTX 3080 is probably the hardest of the three candidate cards for a
+  first accelerated backend.** From a web check today (news coverage, not Mesa
+  documentation): open NVIDIA support runs through nouveau's kernel interface,
+  and usable performance on RTX 30 depends on NVIDIA's large signed GSP
+  firmware. An Arc A380 would keep the Mesa Iris and ANV drivers and the
+  i915-style kernel interface Brook already implements for Broadwell, though
+  it too needs firmware (GuC). An RX 6600 means a new kernel interface, backed
+  by fully open source. All three need firmware blobs. My position: decide the
+  first accelerated card after the smoke test, with a written cost comparison,
+  and expect an Arc card in the same desktop to be the shortest route to "can
+  game". This is a judgement from partial information.
 
-3. **The broker and powerbox, exposed as xdg-desktop-portal.** FileChooser,
-   OpenURI, Notification, Settings and Screenshot first, with the Import shelf
-   as the fallback for apps that do not use portals. Broker-side versioning of
-   any file granted for writing.
-   *Measure:* for each of the twenty apps, can the owner open, edit and save a
-   document with no filesystem hole in the manifest? Count holes. Then run a
-   ransomware fixture against granted files and restore them.
+*Measure:* the draft's own criteria, plus one Steam title with matched
+settings and displayed frame pacing against Linux.
 
-4. **Manifests and one audio endpoint.** Every app's adapters, environment and
-   service needs are declared in its manifest. One mixer, with a PulseAudio
-   protocol endpoint and an ALSA device per compartment as its only
-   compatibility faces. (Speculation: I have not read the audio code, and OSS
-   may need to remain for specific games.)
-   *Measure:* the number of hand-written launcher scripts and environment
-   overrides outside manifests goes to zero for the twenty apps.
+**3. Interfaces, tests, then Rust.**
 
-5. **Turn the bridge's semantics into a delegated agent interface.** Give an
-   agent a compartment-scoped grant instead of machine-wide debug authority,
-   and add the AT-SPI ingestion that `vm-bridge-next.md` proposes, for
-   compatibility apps.
-   *Measure:* a fixed suite of ten everyday tasks (open a document and export
-   it, find and play a file, install and remove an app, and so on). Record the
-   fraction completed without pixel-level input and without debug authority.
+The codebase already leans this way. `syscall.cpp` has been split by
+responsibility as a pure move (`docs/agent/syscall-split-plan.md`); 182
+issues are logged for a fix pass that "adds test coverage first"
+(`docs/agent/REFACTOR_ISSUES.md`); policy logic lives in headers and `.inc`
+fragments that host tests include directly; and guest matrices already use
+Linux as the oracle (`docs/exec-permissions.md`: 672 cases). The proposal
+extends that practice. It does not replace it.
 
-### How to tell whether the thesis holds
+*Defining the interfaces.* Three tiers, each with a different kind of test:
 
-Run steps 1 to 3 and then use Brook on the Dell for a defined set of ordinary
-tasks, for a fixed period, keeping a log of every time Ian falls back to Linux
-and why.
+| Tier | Interface | Form | Tests that survive a rewrite |
+| --- | --- | --- | --- |
+| External | The Linux syscall ABI | Already defined, by Linux | Guest workload matrices run on Linux and on Brook. Language-neutral. |
+| Module | Kernel to driver (the versioned module ABI) | Already a C-level boundary | Per-driver conformance fixtures against a fake kernel side. |
+| Internal | Between subsystems: VFS backends, block and network devices, scheduler policy, memory, user-copy, the syscall handler table | To be written: one C-ABI header per boundary, using plain structs and opaque handles | Contract tests against the header, with no knowledge of the implementation. |
 
-The thesis holds if, at the end:
+Each internal header states what C++ leaves implicit and Rust will demand: who
+allocates and frees, what may sleep, which locks are held on entry. Writing
+that down will surface bugs before any Rust exists.
 
-- the hostile-app suite passes completely;
-- at least fifteen of the twenty apps run confined with no filesystem hole;
-- document open and save through the picker is no slower or more irritating
-  than on Linux, by Ian's own judgement;
-- there is at least one recurring task for which Ian prefers Brook.
+*Measuring coverage.* Three numbers per subsystem:
 
-The thesis fails if more than about half the apps need holes to function, or
-if the confinement is correct but Ian turns it off to get things done. In that
-case the honest description of Brook is the one in the summary: a learning and
-research platform, and a testbed for agent-operated computers. That would
-still justify the project. It would not justify describing it as an
-alternative to Linux.
+- line and branch coverage of host tests, from Clang's source-based coverage,
+  which the existing LLVM toolchain supports and which rustc shares;
+- the fraction of interface functions with at least one contract test;
+- the fraction of syscall handlers exercised by a guest matrix with a Linux
+  oracle.
 
-The thresholds above (twenty apps, fifteen passing, half) are my proposals to
-make the test falsifiable. They are not derived from data and Ian should set
-them before starting, not after.
+In-kernel coverage on a running guest is harder. Speculation: an instrumented
+build could export its counters through the bridge.
+
+*Converting the tests to Rust, before any code.* Write the contract tests in
+Rust on the host, calling the existing C++ implementation through the C-ABI
+header (generated bindings). Nothing in the kernel changes yet. This proves
+the headers are sufficient, since a test that needs to reach around one has
+found a hole in it. It also brings property testing and fuzzing to the C++
+code immediately, on the same LLVM.
+
+*Porting, one subsystem at a time.* A Rust implementation of one interface is
+built as a `no_std` static library and linked into the same kernel. The same
+Rust tests run against both implementations with the same inputs. A
+difference is a bug in one of them, and often in the original. Suggested
+order, from least to most entangled:
+
+1. Pure policy headers that are already host-tested. Small, and they prove the
+   toolchain, the panic strategy and the allocator hookup.
+2. Parsers of untrusted input: ELF loading, on-disk filesystem structures,
+   partition tables, netlink and network packets, user-memory copying. This
+   is where memory safety pays most.
+3. One whole leaf subsystem behind the VFS interface, such as tmpfs or FAT.
+4. Syscall handlers, a family at a time. After the split, the dispatch table
+   can point at a Rust function per entry.
+5. Core memory management and the scheduler, last, or never if the earlier
+   stages show diminishing returns.
+
+*Gates and risks.* Do not port a subsystem until every interface function has
+a contract test and its branch coverage passes a threshold Ian sets. Port only
+subsystems that are quiet; one being reworked for performance is a moving
+target. Track `unsafe` per crate, because agents translating C++ will
+otherwise produce C++ in Rust syntax. Where an interface shares mutable
+structures across the language boundary, narrow the interface first. New
+drivers are a tempting place to start in Rust; I would not write the discrete
+GPU backend in Rust unless stage 1 is already done, to avoid stacking two
+unknowns.
+
+*Measure:* the three coverage numbers; subsystems with a complete interface
+card; subsystems ported; open High and Medium entries in the refactor log.
+
+**4. Compartments, the headline concept.**
+
+The claim to test: most Linux apps run confined with no change to the app and
+no visible friction. The mechanism has five parts.
+
+- **A compartment object in the kernel.** It has a non-reused identity. A
+  trusted launcher creates it; every process the app starts inherits it; there
+  is no call to leave it.
+- **A constructed filesystem view.** Brook already has mount namespaces, bind
+  mounts, tmpfs and `pivot_root` from the Steam and bubblewrap work (the
+  `mount-*`, `tmpfs-*` and `pivot-root` checkpoints). The launcher uses the
+  same machinery on the app's behalf: the store read-only, a private directory
+  mounted as the home, private `/tmp` and runtime directories, a minimal
+  `/dev`, and a filtered `/proc`. The app sees uid 1000 and an ordinary
+  system.
+- **A scoped process view.** Signals, ptrace and `/proc` stop at the
+  compartment boundary.
+- **Per-compartment endpoints.** Its own Wayland socket, audio socket and
+  session bus, so the system knows which app is speaking by which socket it
+  used. Its own Xwayland if it needs X11.
+- **Documents bound in at their real paths.** This is where owning the kernel
+  beats a shim. When the owner picks `Documents/report.odt`, Brook binds that
+  one file into the compartment at the same path the owner sees. Flatpak's
+  document portal exposes an opaque path instead, which confuses recent-file
+  lists and relative links. Grants can cover a folder and can persist.
+
+What each kind of app needs:
+
+| App class | What it needs to be seamless |
+| --- | --- |
+| Games, native and Proton | Nothing. Saves and settings live in the private home. Expected to be the easiest class, and the first to demonstrate. |
+| Browsers | A granted Downloads folder; the system picker for uploads; nested namespaces and seccomp so the browser's own sandbox runs inside the compartment. |
+| GTK and Qt apps using their toolkit's standard file chooser | A manifest setting that switches the toolkit to the portal chooser. |
+| Apps with their own file dialogs (GIMP, parts of LibreOffice, Java, Wine apps) | Launch-with-file from the Files app, drag-and-drop, and persistent folder grants. The dialog shows the private home with granted items in place. |
+| Electron apps and editors | The portal chooser, plus project-folder grants. |
+| Steam | Treated as a nested platform. Downloaded code runs inside Steam's compartment, and its own bubblewrap nests within it. |
+| Terminals and developer tools | A workshop compartment with folder grants (section 4.4). |
+| Apps that talk to each other (password manager and browser, "open with", link handlers) | A declared, brokered connection per pair. This is the class most likely to need manual work. |
+
+Which toolkits honour the portal switch in practice is from memory and is the
+first thing to measure.
+
+Framed for the agreed direction: this is built now as an architecture and a
+user-experience concept. It will already stop apps reading each other's data
+and make uninstall complete. It is not presented as a defence against a
+determined attacker until workstream 3 has hardened what enforces it.
+*Measure:* a hostile-app fixture suite kept as a regression test; of a fixed
+app list, how many run with no folder grant beyond what the owner chose; frame
+rate and startup time inside and outside a compartment.
+
+**5. A native xdg-desktop-portal, once performance allows.**
+
+Fork the portal front end so that it speaks to Brook's broker directly,
+instead of running the stock service with a backend shim. Apps see the
+standard D-Bus interface; behind it there is no FUSE document store and no
+separate backend process, because the kernel binds granted files itself. Start
+with FileChooser, OpenURI, Notification, Settings and Screenshot. Broker-side
+versioning of files granted for writing follows. (From memory: the upstream
+project is LGPL. A user-space fork under that licence sits fine beside an MIT
+kernel, but check before starting.)
+*Measure:* for each app, open, edit and save through the picker with no
+folder grant; picker latency against the same app on Linux.
+
+**6. Thought experiments with small prototypes.**
+
+The anti-cheat study in section 4.5, with its toy server and cheat fixtures,
+after compartments exist. The agent interface: a compartment-scoped grant for
+an agent in place of machine-wide debug authority, and the accessibility
+ingestion proposed in `vm-bridge-next.md`. Multi-user is a non-goal for now
+and is not excluded: if it arrives, a user is an outer boundary that contains
+compartments, and nothing in the compartment design should assume there is
+only one.
+
+### Risks that remain
+
+- **Confinement may not be seamless for enough apps.** Flatpak's experience is
+  that many need broad grants. Brook's advantage is real-path binding and
+  control of the kernel side. Whether that is enough is the experiment.
+- **The compatibility tail does not end.** Linux adds interfaces every
+  release. Workload-driven coverage keeps the effort honest, and it stays a
+  permanent cost.
+- **A discrete GPU driver is the largest single piece of work proposed here.**
+  It could absorb the project for months, as Broadwell did.
+- **The Rust path competes for the same hours as everything else,** and a
+  half-finished port leaves two languages and one set of bugs.
+- **Per-app launch recipes held in handover notes and scripts** are
+  fragmentation leaking in. They should move into manifests as each app is
+  placed in a compartment.
+- **Android** remains the worst cost-to-value ecosystem on x86 (section 4.3).
+- **A native syscall API** remains the most attractive work with the fewest
+  users (section 2). Build native interfaces where system components need
+  them.
+- **Security wording.** Until the kernel is hardened, compartments should be
+  described by what they do, not as protection. "Impossible to get a virus"
+  should stay retired; section 4.2 gives the claim that can eventually be
+  defended.
+
+### How to tell whether it is working
+
+For the platform: a demanding game and a browser run on the desktop at frame
+rates within a stated factor of Linux on the same hardware, and coverage
+numbers exist for every subsystem.
+
+For the headline concept: the hostile-app suite passes; most of a fixed app
+list runs confined with no grant the owner did not choose; and Ian, using it,
+does not reach for a way to turn it off. If more than about half the apps
+need broad grants, or the confinement is correct and Ian disables it anyway,
+the concept has failed as designed and the finding is worth writing up. On a
+concept platform a clear negative result is a result.
+
+The thresholds here are proposals to make the tests falsifiable. Ian should
+set them before starting, not after.
