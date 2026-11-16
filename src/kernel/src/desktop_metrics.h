@@ -57,6 +57,20 @@ inline DesktopRect DesktopCaptionRect(const DesktopWindowGeometry& g,const Deskt
     if(width*3>g.clientW) width=g.clientW/3;
     return {g.x+g.clientW+m.border()-(button+1)*width,g.y+m.border(),width,m.title()};
 }
+// Overlaid captions matched to the client's own title strip. The Wayland
+// server samples the strip colour (and the frame's top-right corner radius)
+// from the client's buffer and packs them: bits 0-23 RGB, bit 24 valid,
+// bits 25-31 radius in physical pixels. Zero keeps the native title style.
+inline constexpr uint32_t DesktopCaptionStyleValid=1u<<24;
+inline constexpr uint32_t DesktopCaptionStyleRgb(uint32_t style){return style&0xffffffu;}
+inline constexpr unsigned DesktopCaptionStyleRadius(uint32_t style){return style>>25;}
+inline constexpr bool DesktopCaptionStripDark(uint32_t rgb){
+    return ((rgb>>16&255)*299+(rgb>>8&255)*587+(rgb&255)*114)<140*1000;
+}
+// Glyph colour with contrast against the strip (Chromium's own caption ink).
+inline constexpr uint32_t DesktopCaptionInk(uint32_t rgb){
+    return DesktopCaptionStripDark(rgb)?0xe8eaedu:0x1f1f1fu;
+}
 // The union of the three overlaid caption buttons (empty unless overlaid).
 inline DesktopRect DesktopCaptionOverlayRect(const DesktopWindowGeometry& g,const DesktopMetrics& m) {
     if(!g.clientDecorated || !g.captionOverlay) return {};

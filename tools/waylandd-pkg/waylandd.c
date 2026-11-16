@@ -175,8 +175,8 @@ static long wm_resize_vfb(uint32_t id, uint32_t w, uint32_t h,
 }
 /* mode 0 server side, 1 client side, 2 client side with Brook's caption
  * buttons overlaid at the top-right; insets = right | top << 16 (VFB px). */
-static long wm_set_decoration_mode(uint32_t id, int mode, uint32_t insets, uint32_t height) {
-    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode, (long)insets, (long)height);
+static long wm_set_decoration_mode(uint32_t id, int mode, uint32_t insets, uint32_t height, uint32_t style) {
+    return syscall(BROOK_SYS_WM_SET_DECORATION_MODE, (long)id, (long)mode, (long)insets, (long)height, (long)style);
 }
 static long wm_begin_move(uint32_t id) {
     return syscall(BROOK_SYS_WM_BEGIN_MOVE, (long)id);
@@ -400,7 +400,14 @@ struct brook_surface {
     int deco_requested_csd;
     /* Mode and insets last sent to the kernel WM (-1: nothing sent yet). */
     int deco_sent_mode;
-    uint32_t deco_sent_insets, deco_sent_height;
+    uint32_t deco_sent_insets, deco_sent_height, deco_sent_style;
+    /* Client-matched caption style: the strip colour and corner radius
+     * sampled from the client's buffer (packed for syscall 512), when the
+     * next sample is due, and a newest GPU frame still waiting to be read. */
+    uint32_t strip_style, strip_last_ms;
+    int strip_due;
+    struct brook_image *strip_retry;
+    unsigned strip_retry_count;
 
     /* Cursor surface state. When a surface is assigned as cursor via
      * wl_pointer.set_cursor, its commits upload pixels to the kernel
@@ -450,6 +457,9 @@ static int32_t pointer_fixed_floor(wl_fixed_t value) {
 struct brook_image;
 static void intel_image_want_pixels(struct brook_image *image);
 static void surface_sync_decoration(struct brook_surface *s, int force);
+static void strip_retry_drop(struct brook_surface *s);
+struct brook_image;
+static void surface_strip_commit(struct brook_surface *s, struct brook_image *older);
 #include "surface-scene.h"
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
@@ -799,6 +809,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
 
     struct brook_view *previous=s->tree.latest?s->tree.latest->value:NULL;
     struct brook_image *image=previous?previous->image:NULL;
+    struct brook_image *strip_older=image;image_ref(strip_older);
     image_ref(image);
     if (s->pending_attach) {
         image_unref(image);image=NULL;
@@ -841,8 +852,13 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     if (!committed) wl_client_post_no_memory(c);
     else if (committed>0 && s->is_cursor) surface_cursor_commit(s);
     else if (committed>0 && !bt_effective_sync(&s->tree)) published=surface_repaint(s);
-    /* Window geometry (the CSD shadow margin) places overlaid captions. */
-    if (committed>0 && s->xdg_toplevel && s->deco_sent_mode==2) surface_sync_decoration(s,0);
+    /* Window geometry (the CSD shadow margin) places overlaid captions, and
+     * the client's strip colours them. */
+    if (committed>0 && s->xdg_toplevel && s->deco_sent_mode==2) {
+        surface_strip_commit(s,strip_older);
+        surface_sync_decoration(s,0);
+    }
+    image_unref(strip_older);
     if (committed>0 && published && configure_committed) {
         s->configure_size_pending=s->configure_size_acked=0;
         if(s->toplevel_resizing && s->wm_id) {
@@ -899,6 +915,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     xwayland_surface_detach(s);
     if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
     if (s->deco_resource) { wl_resource_set_user_data(s->deco_resource,NULL);s->deco_resource=NULL; }
+    strip_retry_drop(s);
     /* Scrub references to this surface from all seat clients before we free
      * it.  Without this, a subsequent input event would dereference freed
      * memory and (more visibly) call wl_pointer.send_leave with a surface
@@ -2074,6 +2091,7 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
     if (!surface->xdg_toplevel || !surface->xdg_surface ||
         surface->toplevel_activated == active) return;
     surface->toplevel_activated=active;
+    surface->strip_due=1; /* Chromium redraws its strip in the (in)active colour. */
     int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)(surface->vfb_w/surface_output_scale(surface));
     int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)(surface->vfb_h/surface_output_scale(surface));
     if(surface->toplevel_maximized || surface->configure_size_pending) {
@@ -2171,10 +2189,111 @@ static uint32_t deco_caption_insets(const struct brook_surface *s) {
     if (top > 0xFFFF) top = 0xFFFF;
     return (uint32_t)right | ((uint32_t)top << 16);
 }
+/* ---- Caption style sampled from the client's own title strip ----
+ * Brook's overlaid caption buttons take the colour of the strip beneath them
+ * (Chromium's frame colour: theme, dark mode, incognito, focused or not), as
+ * macOS and Windows Controls Overlay draw system controls over app-drawn title
+ * areas. A few pixels 3 px inside the strip's right edge are read (the client's
+ * own buttons never hover there: Brook owns that pointer area), plus the alpha
+ * along the strip's top row, which gives the frame's rounded-corner radius.
+ * Samples are taken when due (map, resize, focus change) and at most every
+ * 500 ms otherwise. A GPU frame is read only once its producer is idle and its
+ * cache is synchronised (TRY_CPU_READ never sleeps); a busy newest frame is
+ * retried from a short timer. */
+enum { STRIP_SAMPLE_MS=500, STRIP_RETRY_MS=20, STRIP_RETRY_LIMIT=25 };
+static struct wl_event_source *g_strip_timer;
+static int strip_read(struct brook_image *im, const uint32_t *xs, uint32_t y, unsigned n, uint32_t *out) {
+    if (!im || y >= im->height) return 0;
+    for (unsigned i=0;i<n;++i) if (xs[i] >= im->width) return 0;
+    if (im->pixels) {
+        for (unsigned i=0;i<n;++i) out[i]=im->pixels[(size_t)y*im->width+xs[i]];
+        return 1;
+    }
+    const struct brook_dmabuf_buffer *db=im->source?im->source->dmabuf:NULL;
+    if (!g_drm_intel || !db || db->modifier || im->pending_fd<0 || im->uncertain || (db->stride&3)) return 0;
+    errno=0;long ready=syscall(BROOK_SYS_GPU_BUFFER_TRY_CPU_READ,(long)im->pending_fd,0L,0L,0L,0L,0L);
+    if (ready<0) return errno==EAGAIN || errno==EINTR ? -1 : 0;
+    if (ready) return 0;
+    struct { uint32_t handle,pad;uint64_t offset,flags,extensions; } map={db->bo_handle,0,0,2,0};
+    /* DRM_IOCTL_I915_GEM_MMAP_OFFSET (write-back), as intel_dmabuf_copy. */
+    if (ioctl(g_drm_fd,((3u<<30)|((unsigned)sizeof(map)<<16)|('d'<<8)|0x64u),&map)) return 0;
+    uint64_t bytes=(uint64_t)db->offset+(uint64_t)db->stride*(y+1);
+    size_t length=(size_t)((bytes+4095)&~UINT64_C(4095));
+    void *p=mmap(NULL,length,PROT_READ,MAP_SHARED,g_drm_fd,(off_t)map.offset);
+    if (p==MAP_FAILED) return 0;
+    const uint32_t *row=(const uint32_t *)((const uint8_t *)p+db->offset+(size_t)db->stride*y);
+    const int opaque=db->fourcc==0x34325258;
+    for (unsigned i=0;i<n;++i) out[i]=row[xs[i]]|(opaque?0xff000000u:0);
+    munmap(p,length);return 1;
+}
+/* 1 sampled, 0 not possible, -1 busy (retry later). */
+static int strip_sample(struct brook_surface *s, struct brook_image *im) {
+    struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+    const int strip=deco_caption_overlay_app(s);
+    if (!view || !im || !view->geometry.w || s->window_geometry_w<=0 || strip<=0) return 0;
+    const uint32_t bs=im->width/view->geometry.w?im->width/view->geometry.w:1;
+    const int64_t right=((int64_t)s->window_geometry_x+s->window_geometry_w)*bs,top=(int64_t)s->window_geometry_y*bs;
+    if (right<8 || top<0 || right>(int64_t)im->width) return 0;
+    uint32_t xs[32],px[32];
+    for (unsigned i=0;i<3;++i) xs[i]=(uint32_t)(right-3-i);
+    int r=strip_read(im,xs,(uint32_t)(top+(int64_t)strip*bs/2),3,px);
+    if (r<=0) return r;
+    uint32_t colour=0;int found=0;
+    for (unsigned i=0;i<3 && !found;++i) {
+        unsigned same=0;
+        for (unsigned j=0;j<3;++j) same+=(px[j]&0xffffffu)==(px[i]&0xffffffu) && (px[j]>>24)==255;
+        if ((px[i]>>24)==255 && same>=2) { colour=px[i]&0xffffffu;found=1; }
+    }
+    if (!found) return 0;
+    unsigned radius=0;const unsigned span=right>=32?32:(unsigned)right;
+    for (unsigned i=0;i<span;++i) xs[i]=(uint32_t)(right-1-i);
+    if (strip_read(im,xs,(uint32_t)top,span,px)==1)
+        while (radius<span && (px[radius]>>24)<128) ++radius;
+    uint64_t physical=(uint64_t)radius*surface_output_scale(s)/bs;
+    if (physical>127) physical=127;
+    s->strip_style=colour|(1u<<24)|((uint32_t)physical<<25);
+    return 1;
+}
+static void surface_sync_decoration(struct brook_surface *s, int force);
+static void strip_retry_drop(struct brook_surface *s) {
+    if (s->strip_retry) { image_unref(s->strip_retry);s->strip_retry=NULL; }
+    s->strip_retry_count=0;
+}
+static int strip_timer_tick(void *data) {
+    (void)data;int again=0;
+    for (struct brook_surface *s=g_surfaces;s;s=s->next) {
+        if (!s->strip_retry) continue;
+        int r=strip_sample(s,s->strip_retry);
+        if (r<0 && ++s->strip_retry_count<STRIP_RETRY_LIMIT) { again=1;continue; }
+        strip_retry_drop(s);
+        if (r>0 && s->deco_sent_mode==2) surface_sync_decoration(s,0);
+    }
+    if (again) wl_event_source_timer_update(g_strip_timer,STRIP_RETRY_MS);
+    return 0;
+}
+/* After a root commit of an overlaid window: refresh the sampled style. */
+static void surface_strip_commit(struct brook_surface *s, struct brook_image *older) {
+    if (s->deco_sent_mode!=2) return;
+    struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+    struct brook_image *im=view?view->image:NULL;
+    const uint32_t now=g_now_ms();
+    if (!im || (!s->strip_due && now-s->strip_last_ms<STRIP_SAMPLE_MS)) return;
+    s->strip_last_ms=now;s->strip_due=0;
+    int r=strip_sample(s,im);
+    if (r<0) {
+        /* The newest frame is still being drawn: read the previous one now
+         * (same strip unless the theme or focus just changed) and the newest
+         * once it is idle. */
+        if (older && older!=im) (void)strip_sample(s,older);
+        strip_retry_drop(s);image_ref(im);s->strip_retry=im;
+        if (!g_strip_timer) g_strip_timer=wl_event_loop_add_timer(wl_display_get_event_loop(g_display),strip_timer_tick,NULL);
+        if (g_strip_timer) wl_event_source_timer_update(g_strip_timer,STRIP_RETRY_MS);
+    }
+}
 static void surface_sync_decoration(struct brook_surface *s, int force) {
     if (!s || !s->wm_id) return;
     int mode = s->deco_csd ? 1 : 0;
-    uint32_t insets = 0, height = 0;
+    uint32_t insets = 0, height = 0, style = 0;
     int strip = -1;
     if (mode && !s->xdg_popup && s->xdg_toplevel && s->deco_resource && s->deco_requested_csd &&
         !g_caption_overlay_unsupported && (strip = deco_caption_overlay_app(s)) >= 0) {
@@ -2182,10 +2301,12 @@ static void surface_sync_decoration(struct brook_surface *s, int force) {
         insets = deco_caption_insets(s);
         uint64_t physical = (uint64_t)strip * surface_output_scale(s);
         height = physical > 0xFFFF ? 0xFFFF : (uint32_t)physical;
+        style = s->strip_style;
     }
+    if (mode != 2) s->strip_due = 1;
     if (!force && mode == s->deco_sent_mode && insets == s->deco_sent_insets &&
-        height == s->deco_sent_height) return;
-    long rc = wm_set_decoration_mode(s->wm_id, mode, insets, height);
+        height == s->deco_sent_height && style == s->deco_sent_style) return;
+    long rc = wm_set_decoration_mode(s->wm_id, mode, insets, height, style);
     if (mode == 2 && rc == 0) {
         /* An older kernel treats mode 2 as plain CSD: stop asking. */
         g_caption_overlay_unsupported = 1;
@@ -2195,9 +2316,13 @@ static void surface_sync_decoration(struct brook_surface *s, int force) {
         fprintf(stderr, "[waylandd] decoration wm=%u mode=%s insets=%u,%u height=%u rc=%ld\n", s->wm_id,
                 mode == 2 ? "client_side+captions" : mode ? "client_side" : "server_side",
                 insets & 0xFFFF, insets >> 16, height, rc);
+    if (style != s->deco_sent_style)
+        fprintf(stderr, "[waylandd] caption style wm=%u strip=#%06x radius=%u\n", s->wm_id,
+                style & 0xFFFFFF, style >> 25);
     s->deco_sent_mode = mode;
     s->deco_sent_insets = insets;
     s->deco_sent_height = height;
+    s->deco_sent_style = style;
 }
 static void surface_apply_decoration(struct brook_surface *s, int csd) {
     if (!s) return;

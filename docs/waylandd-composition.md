@@ -213,7 +213,7 @@ Captures: `display-perf/build/ssd-probe-frame/` (double frame) and `ssd-pref-fra
 - **Evidence:** `chrome-csd/build/csd-qemu/evidence/` (screenshots 01–15, serial logs).
 
 **Not done / limits:**
-- The block is Brook's title colour over Chromium's light tab strip; it does not adopt Chromium's frame colour.
+- Superseded on `work/chrome-csd-style`: the block now takes Chromium's strip colour (next section).
 - The strip height is a per-app constant from waylandd's list. If a future Chromium changes its tab-strip height, the block will again be shorter or taller than the strip; edit `BROOK_WAYLAND_CAPTION_APPS`.
 - Pre-existing: restoring a client-decorated window configures the VFB size, which includes the shadow margin, so Chromium grows by its shadow (800×600 to 832×642 geometry) on each maximise/restore.
 - The Dell desktop renderer path (chrome capture plus no-hole rule) is covered by host/package tests, not yet exercised on hardware.
@@ -243,3 +243,28 @@ Guest steps go through the bridge, as root:
    `/nix/profile/bin/bash -c 'set -e; d=/data/.brook-launcher-stage-TX; mkdir -m 700 $d; cd $d; tar -xf /data/.brook-transfer/<id>.bin; /nix/profile/bin/python3 install.py store.tar manifest.json closure.txt links.json TX --check'`
 3. If it prints `CHECK_OK`, rerun without `--check` and expect `LAUNCHER_STAGE_OK`.
 4. **Rollback:** point `/nix/profile/bin/brook-chromium` back to the `previous` target in `/nix/.brook-profile-rollback-TX.json`.
+
+### Caption style matched to the client's strip (`work/chrome-csd-style`, 16 Nov 2026)
+
+**Ian on gen 417:** "grey on the left then our buttons rendered on top as a blue block … we should try to match the style."
+
+**How other platforms do it:**
+- **Windows:** Chromium draws Windows-style caption buttons itself on its custom frame. With Window Controls Overlay (installed web apps only), the OS draws its own buttons over the app's title area, in colours the app supplies (`theme_color`, or a CSS-reported title-bar colour).
+- **macOS:** the OS draws the traffic lights over a transparent, full-size-content title bar on whatever the app paints there, and the app leaves room for them.
+- **GNOME/KDE:** client-side apps draw their own buttons in the toolkit theme. Chromium draws GTK-styled buttons in the layout GTK reports.
+
+**Brook's choice is the macOS/WCO model,** with the colour taken from the client's pixels instead of a protocol:
+- waylandd samples the strip just inside its right edge (3 px in, mid-height) from the committed buffer, plus the alpha along the strip's top row, which gives the frame's rounded-corner radius.
+  - **SHM** buffers are read directly.
+  - **Intel GPU** buffers are read only after `TRY_CPU_READ` reports the producer idle with caches synchronised. It never sleeps: a busy newest frame is retried from a 20 ms timer (up to 25 times), reading the previous frame meanwhile.
+  - **When:** on map, resize, maximise and focus change, otherwise at most every 500 ms.
+  - **Packing:** syscall 512's 5th argument carries the result: RGB, a valid bit, and the radius in bits 25–31.
+- **Kernel drawing:**
+  - It fills the block with the strip colour, which hides Chromium's own buttons underneath. Those buttons stay requested (`:minimize,maximize,close`), so Chromium keeps its tabs clear of the corner.
+  - Glyphs are dark (`#1f1f1f`) on light strips and light (`#e8eaed`) on dark ones. They are softened when the window is unfocused.
+  - Hover is a 10% ink tint; close hover stays red.
+  - Restored windows clip the block to the frame's rounded top-right corner; the corner pixels are transparent in the renderer's chrome surface too.
+  - The chrome key includes the style, so a colour change (theme, incognito, focus) recaptures.
+- **Until a sample exists,** or for apps with no `:height`, the block keeps Brook's title colours.
+
+**Fallback (Chromium draws everything):** take the app out of `BROOK_WAYLAND_CAPTION_APPS`, or set it empty for all apps. waylandd then answers plain client-side, and Chromium shows its own three buttons (with the launcher's layout).
