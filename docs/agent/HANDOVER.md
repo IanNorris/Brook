@@ -92,6 +92,8 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Q2 attract demo on gen 423 (zero-copy armed by hand, Steam open behind it):** 65.2 displayed fps (1435 frames, mean 15.3 / p50 14.2 / p90 16.8 / p99 30.9 ms), all direct frames, Q2 3.2 ms, composite 5.5 ms (4.5 layers with Steam behind), GPU 38% idle, CPU 67% idle. Profile: `display-perf/build/dell/q2-423-prof/`. Ian saw 72 fps in game. Torchlight II has no sound: Steam's private Pulse uses a null sink (desktop Pulse server is a next step).
+
 **Torchlight II runs on gen 423 (rootless Steam with machine-id) but at ~10 displayed fps.** Profile: `display-perf/build/dell/tl2-play-prof/`.
 - **Not CPU- or GPU-bound:** app GPU jobs 11/s at 11 ms; CPU 72% idle; GPU 76% idle.
 - **Its X window reaches the compositor as a CPU source** (`src cpu`, all nondirect frames, ~99 ms mean interval). Xwayland is presenting through SHM/CPU copies, not DRI3 dma-buf.
