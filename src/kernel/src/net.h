@@ -506,5 +506,7 @@ void DebugChannelPoll();
 
 // Is the debug channel connected?
 bool DebugChannelConnected();
+// Debug TCP listener accounting for `tcp stats` (no log line per client).
+void NetCountDebugClient(bool connected);
 
 } // namespace brook

@@ -129,6 +129,7 @@ uint64_t CopyFromUserBytes(void* dst,uint64_t src,uint64_t len) {
     return len;
 }
 uint64_t ApicTickCount() { return ticks.load(); }
+bool KLogEnabled(LogCat, LogLevel) { return false; }
 Process* ProcessCurrent() { return currentProcess; }
 Process* SchedulerCurrentProcess() { return currentProcess; }
 Process* KernelThreadCreate(const char*,KernelThreadFn fn,void* arg,uint8_t) {

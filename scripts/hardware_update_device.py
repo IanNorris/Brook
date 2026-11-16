@@ -11,7 +11,7 @@ import argparse,json,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'tools'),str(ROOT/'tools/vm_bridge')]
-from hardware_update_workflow import UpdateRun
+from hardware_update_workflow import UpdateRun,power_blocker_summary
 from hardware import Hardware
 from dell_recovery_lock import inhibit_recovery
 
@@ -28,9 +28,22 @@ def main():
     a=p.parse_args()
     bridge = Hardware()
     target = bridge.load_session(a.session)
-    with inhibit_recovery(target['host'], target['port']):
-        result=UpdateRun(bridge,a.output).execute(a.session,a.key_file,a.kernel,a.initrd,
-            a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second)
+    run=UpdateRun(bridge,a.output)
+    try:
+        with inhibit_recovery(target['host'], target['port']):
+            result=run.execute(a.session,a.key_file,a.kernel,a.initrd,
+                a.activate,a.restart,a.expected_payload_id,a.port,a.boot_timeout_s,a.helper,a.pace_bytes_per_second)
+    except Exception as error:
+        receipt=run.receipt
+        summary={'state':receipt.get('state','not_started'),'last_stage':receipt.get('last_stage'),'error':str(error),
+                 'receipt':str(a.output.resolve()/'receipt.json') if receipt else None,
+                 'transaction_id':receipt.get('transaction_id'),'power_request_id':receipt.get('power_request_id')}
+        if 'power' in receipt:
+            power=receipt['power']
+            summary['power']={k:power.get(k) for k in ('state','stage','status','blocker_count','blockers','next_signal_ms') if k in power}
+            summary['power_summary']=power_blocker_summary(power)
+        print(json.dumps(summary,indent=2))
+        sys.exit(1)
     print(json.dumps({'state':result['state'],'receipt':str(a.output.resolve()/'receipt.json'),
         'session':result.get('new_session',a.session),'transaction_id':result['transaction_id']},indent=2))
 if __name__=='__main__':main()

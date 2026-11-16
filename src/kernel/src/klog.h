@@ -44,8 +44,10 @@ enum class LogCat : uint8_t {
     Syscall  = 8,   // Syscall handler
     Driver   = 9,   // Device drivers
     Prof     = 10,  // Profiler
+    Tcp      = 11,  // Per-connection/per-segment TCP and debug-bridge traces
+                    // (Debug level; off by default, `log level tcp debug`)
 
-    Count    = 11
+    Count    = 12
 };
 
 // Category names (for display / remote protocol).
@@ -61,6 +63,10 @@ void KLogSetLevel(LogCat cat, LogLevel level);
 
 // Get the current level for a category.
 LogLevel KLogGetLevel(LogCat cat);
+
+// True when a message of this category and level would be kept. Use it to
+// guard high-rate SerialPrintf diagnostics without formatting them.
+bool KLogEnabled(LogCat cat, LogLevel level);
 
 // Set level for ALL categories at once.
 void KLogSetGlobalLevel(LogLevel level);

@@ -34,4 +34,15 @@ if manifest.get('dirty') and not a.allow_dirty: sys.exit('refusing: built from a
 cmd = [sys.executable, str(ROOT / 'scripts/hardware_update_device.py'), '--session', a.session, '--key-file', str(KEY),
        '--kernel', str(kernel), '--initrd', str(initrd), '--output', str(a.output), '--activate', '--restart',
        '--expected-payload-id', manifest['payload_id'], '--helper', 'system', '--boot-timeout-s', str(a.boot_timeout_s)]
-sys.exit(subprocess.call(cmd))
+code = subprocess.call(cmd)
+receipt_path = a.output / 'receipt.json'
+if code and receipt_path.exists():
+    # Name the stage and the guest processes still blocking a restart rather
+    # than leaving a bare needs_inspection for the caller to dig out.
+    sys.path.insert(0, str(ROOT / 'tools'))
+    from hardware_update_workflow import power_blocker_summary
+    receipt = json.loads(receipt_path.read_text())
+    print(f"deploy: {receipt.get('state')} at {receipt.get('last_stage')}: {receipt.get('error')}", file=sys.stderr)
+    if 'power' in receipt:
+        print(f"deploy: restart request {receipt.get('power_request_id')}: {power_blocker_summary(receipt['power'])}", file=sys.stderr)
+sys.exit(code)
