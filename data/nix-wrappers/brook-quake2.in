@@ -1,0 +1,53 @@
+#!@BASH@
+# Quake II (Yamagi yquake2) for the Dell Apps menu: Iris GL plus OSS OpenAL.
+# Recipe confirmed by Ian on Dell gen 419:
+#   brook-run brook-iris-run quake2 -datadir /data/home/quake2 \
+#     +set s_openal 1 +set al_driver libopenal.so.1
+# with the OSS OpenAL library first on LD_LIBRARY_PATH and ALSOFT_CONF pinning
+# 44100 Hz stereo int16 (without it SNDCTL_DSP_SPEED after SETFRAGMENT fails).
+# `brook-quake2 --check` prints the chosen paths and exits 1 if any is missing.
+# yquake2 refuses to run as root; the Apps entry launches it as uid 1000.
+# No $(...) here: each candidate is tested with builtins only.
+set -u
+
+QUAKE2=
+for candidate in @YQUAKE2_NIX@ @YQUAKE2_STAGE@; do
+    if [ -x "$candidate/lib/yquake2/quake2" ] && [ -f "$candidate/lib/yquake2/ref_gl1.so" ]; then
+        QUAKE2=$candidate/lib/yquake2/quake2; break
+    fi
+done
+OPENAL_LIB=
+for candidate in @OPENAL_NIX@ @OPENAL_STAGE@; do
+    if [ -e "$candidate/lib/libopenal.so.1" ]; then OPENAL_LIB=$candidate/lib; break; fi
+done
+IRIS_RUN=
+for candidate in @IRIS_VERIFIED@/bin/brook-iris-run @IRIS_NIX@/bin/brook-iris-run /nix/profile/bin/brook-iris-run; do
+    if [ -x "$candidate" ]; then IRIS_RUN=$candidate; break; fi
+done
+BROOK_RUN=/nix/profile/bin/brook-run
+DATA_DIR=${BROOK_QUAKE2_DATA_DIR:-/data/home/quake2}
+
+if [ "${1:-}" = "--check" ]; then
+    status=0
+    for item in "quake2=$QUAKE2" "openal=$OPENAL_LIB" "iris=$IRIS_RUN"; do
+        echo "brook-quake2: $item"
+        [ -n "${item#*=}" ] || status=1
+    done
+    [ -x "$BROOK_RUN" ] && echo "brook-quake2: brook-run=$BROOK_RUN" || { echo "brook-quake2: brook-run missing"; status=1; }
+    [ -f "$DATA_DIR/baseq2/pak0.pak" ] && echo "brook-quake2: data=$DATA_DIR" || { echo "brook-quake2: no $DATA_DIR/baseq2/pak0.pak"; status=1; }
+    echo "brook-quake2: alsoft=@ALSOFT_CONF@"
+    [ "$status" = 0 ] && echo BROOK_QUAKE2_CHECK_OK || echo BROOK_QUAKE2_CHECK_MISSING
+    exit "$status"
+fi
+if [ "$EUID" -eq 0 ]; then
+    echo 'brook-quake2: launch from Applications or use: run --uid 1000 /nix/profile/bin/brook-quake2' >&2
+    exit 64
+fi
+if [ -z "$QUAKE2" ] || [ -z "$OPENAL_LIB" ] || [ -z "$IRIS_RUN" ]; then
+    echo "brook-quake2: missing yquake2, OSS OpenAL or Iris launcher (run brook-quake2 --check)" >&2
+    exit 127
+fi
+export LD_LIBRARY_PATH="$OPENAL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ALSOFT_CONF=@ALSOFT_CONF@
+exec "$BROOK_RUN" "$IRIS_RUN" "$QUAKE2" -datadir "$DATA_DIR" \
+    +set s_openal 1 +set al_driver libopenal.so.1 "$@"

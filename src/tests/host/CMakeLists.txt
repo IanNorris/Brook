@@ -1050,3 +1050,6 @@ target_compile_options(test_cpu_idle PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/
 
 add_host_test(test_arp_neighbor)
 target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+# Launcher staging bundle installer (tools/launcher-stage): check, install, Apps manifest edits, rollback.
+add_test(NAME test_launcher_stage COMMAND python3 "${BROOK_ROOT}/tools/launcher-stage/test_install.py")
