@@ -711,7 +711,10 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
     }
     if(nr==0x64 && size==sizeof(MmapOffset)){
         MmapOffset m{};if(!u.read(u.context,&m,arg,sizeof(m)) || !u.writable(u.context,arg,sizeof(m)))return fault;
-        if(m.pad || m.extensions || m.flags!=2)return invalid;
+        // WB (2) and WC (1). iris maps shared/scanout buffers (its uncached
+        // heap: every tiled Xwayland pixmap) WC; like legacy GEM_MMAP, WC is
+        // served write-back, coherent through Broadwell's LLC.
+        if(m.pad || m.extensions || (m.flags!=1 && m.flags!=2))return invalid;
         m.offset=BdwGpuFileMapToken(file,m.handle);if(!m.offset)return noent;
         return u.write(u.context,arg,&m,sizeof(m))?0:fault;
     }

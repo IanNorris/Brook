@@ -9,6 +9,24 @@ struct AcpiSdtHeader {
 };
 #pragma pack(pop)
 static_assert(sizeof(AcpiSdtHeader)==36);
+// Zero the bytes of a MADT that the XPS 9343 firmware leaves uninitialised
+// (they change between boots): the header checksum and each LAPIC NMI entry's
+// flags and LINT#. Everything else stays pinned. False on a malformed table.
+inline bool AcpiDellNormalizeMadt(uint8_t* madt,uint32_t length) {
+    if(length<44)return false;
+    madt[9]=0;
+    for(uint32_t o=44;o<length;) {
+        if(length-o<2)return false;
+        const uint8_t type=madt[o],entryLength=madt[o+1];
+        if(entryLength<2 || entryLength>length-o)return false;
+        if(type==4) {
+            if(entryLength!=6)return false;
+            madt[o+3]=madt[o+4]=madt[o+5]=0;
+        }
+        o+=entryLength;
+    }
+    return true;
+}
 struct AcpiResetInfo {
     bool available=false;uint16_t port=0;uint8_t value=0;
     const char* reason="No validated FADT reset register";

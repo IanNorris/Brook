@@ -46,6 +46,122 @@ support. Whether Present flips or copies into the window pixmap depends on
 Xwayland's `xwl_present_check_flip`. Either way the result is a LINEAR
 dma-buf, which is now offered.
 
+## Xwayland pacing, kernel lock convoys and tiled buffers (18 Nov 2026, `work/xwl-pacing`)
+
+**Gen 427 result for the GPU-offer fix.** Torchlight II (800×600) is now
+`src gpu` with all frames direct, but only 12.9 displayed fps (mean 77.5 ms).
+Xwayland commits about 13.6 times a second (300 offers in 22 s). The GPU is
+75% idle and the CPU 76% idle, so the game is waiting on latency. Evidence:
+`display-perf/build/dell/tl2-int24/`.
+
+**Where the time goes.** I matched the context-switch records (1 ms ticks)
+in `prof.txt` against the int24 `kernel.elf`. The analysis scripts are in this
+branch's report.
+- **The global epoll graph mutex convoys.** One game-process thread
+  (pid 748) calls `epoll_wait` about 1,700 times a second with events ready.
+  Inside `EpollScanReady`, while holding `g_epollGraphLock`, it blocked 6,589
+  times on its own process's address-space mutation lock (`CopyToUser`,
+  then `UserMappingPageAccess`).
+  - Every other epoll user in the system queued behind it.
+  - waylandd (pid 24) spent about 5.9 s of 10 s blocked on the graph mutex and
+    only 5 s idle-waiting.
+  - Other epoll users (pids 30, 520, 575, 450) were blocked 5–9 s.
+  - Commit 83ecfa6f moved `CopyToUser` out of the lock. That was not enough:
+    in Dell gen 433 (`display-perf/build/dell/tl2-433-menu/`), Xwayland still
+    spent about 6.7 s of 10 s in `KMutexLock` from `epoll_wait_impl` and
+    `EpollScanReady`, behind Steam's steamwebhelper threads, because the scan
+    still ran every `watchReady` under the global lock. Branch
+    `work/epoll-instance-lock` replaces that lock with a per-instance leaf
+    lock (`EpollInstance::lock`). It is held only to copy or commit entries,
+    and readiness is evaluated with no epoll lock held. The global lock now
+    serialises only `epoll_ctl(ADD)` of an epoll fd, for loop and depth
+    validation. "Locking" in `syscall_epoll.cpp` documents this, and
+    `test_epoll_instance_lock` checks it.
+- **The per-process mapping mutex convoys.** `UserMappingPageAccess` takes
+  `space->mutation` for every page of every user copy. The game's threads
+  were blocked on it for seconds:
+  - pid 470, the thread doing `IntelRenderIoctl`: 6.2 s of 10 s;
+  - pid 687: 5.5 s;
+  - pid 689: 2.5 s.
+  This is not fixed here. It needs a lock-free read-only PTE check or a
+  reader lock, in the same spirit as `work/kregion-lockfree`.
+  Fixed later on `work/mapping-convoy` (option b, no sequence check): a
+  leaf that is present, `VMM_USER` and grants the access answers Ready
+  under the page-table spinlock alone; all other cases take the locked path
+  unchanged. A sequence check is unnecessary because the locked answer was
+  already advisory (released before the copy). Frames retire only after the
+  full TLB ACK, and user page tables are freed only at the final AS unref.
+  The safety argument is at `LeafGrantsUserAccess` in
+  `src/kernel/src/memory/user_mapping.cpp`. `test_vmm_leaf`
+  `pageAccessFastPath` covers it: lock-free answers while the mutex is held,
+  locked fallback and CoW, and copiers racing munmap/mmap/mprotect under a
+  modelled ACK. Removing the ACK wait from that model makes the test fail.
+  Host throughput with 8 threads in one AS is about 9.9 M/s on the fast path
+  and 2.0 M/s on the locked path.
+- **Present pacing.** Rootless Xwayland completes a sync flip at the next
+  `wl_surface.frame` done after its commit. Mesa GLX with swap interval 1
+  keeps only one swap outstanding (`loader_dri3_swap_buffers_msc` waits for
+  `recv_sbc + 1 == send_sbc`). waylandd released callbacks only on
+  PRESENTED, which comes after the renderer's composite (14.4 ms
+  submit→fence, queued behind the game's 10 ms GPU jobs) and the flip at
+  vblank. That serialised each frame with the whole renderer latency, about
+  25–35 ms (`timeline` in `s1.json`), plus the convoy delays.
+
+**Changes.**
+- **waylandd:** an Xwayland root's frame callbacks are released once its
+  commit is offered to the renderer, at most every 15 ms. Buffer release
+  (SAFE after a newer commit is shown) still bounds how far the client runs
+  ahead. `BROOK_WAYLAND_XWAYLAND_FRAME=presented` restores the old behaviour.
+  The status file has a `pacing` block, always on, for native and x11
+  clients. Each entry is `[count, sum_us, max_us]`:
+  - `interval`: commit to the next commit;
+  - `offer`: commit to offer sent;
+  - `presented`: offer to PRESENTED;
+  - `callback`: commit to frame callback done;
+  - `turnaround`: frame callback done to the client's next commit;
+  - also `dmabuf_created`, `early_callbacks` and `tiled_created`.
+- **epoll:** events are copied out without the graph mutex. The mutex is
+  retaken only to commit edge-triggered eventfd and sync-file snapshots,
+  skipped if `epoll_ctl` changed the instance in between.
+- **Tiled buffers:** waylandd advertises I915 Y- and X-tiled XR24/AR24 to the
+  Xwayland client when the Intel GPU channel is present
+  (`BROOK_WAYLAND_TILED=xwayland|all|0`).
+  - Tiled buffers are offered as version 3 layers flagged `TILED_X` or
+    `TILED_Y`.
+  - The renderer's quad pass imports them through
+    `VK_EXT_image_drm_format_modifier` (`BROOK_RENDER_TILED=0` disables
+    this).
+  - A frame that the quad pass does not draw retires the offer, so the window
+    uses waylandd's detiled CPU copy instead.
+  - Host results, UHD 630 (Gen9.5), 8 blended quads:
+
+    | Size | LINEAR | X-tiled | Y-tiled |
+    |---|---|---|---|
+    | 3192×1632 | 48.6 ms | 15.3 ms | 14.5 ms |
+    | 800×600 | 4.8 ms | 2.0 ms | 2.0 ms |
+
+  - Correctness on the host Intel GPU: the quad pass draws X and Y sources,
+    1:1 and scaled, exactly like the linear source. The tiling arithmetic
+    matches Mesa's own tiled output (`intel-tiling-host-test.c`).
+  - The Dell's renderer uses hasvk (Gen8), which advertises the extension.
+    It has not been tested here.
+
+**Gen 428 GPU job failure (`stardew-hang428`).** This is not caused by the
+X11 offer path.
+- pid 223 is a Chromium child, almost certainly its GPU process: it probed
+  `/sys/bus/pci/devices/0000:00:02.0/boot_vga`. Chromium is a native Wayland
+  (xdg) client.
+- The failed source is window 1 incarnation 1, the first window, created
+  before Steam. Its last good commit was at about 289 s.
+- Stardew (pid 333) logged its first syscalls only after the reset, so its
+  process started after it. Window 2 incarnation 8 (1280×720 XRGB, the
+  usual Stardew size) then displayed 42.9 fps in `s0`→`s1`.
+- The same signature happened on 16 Nov to VKRENDER itself, before any
+  Xwayland offers existed (`hang-1116-lastlog`, pid 52): ring
+  head = tail = acthd = 0xe0, `elsp=302`, `ipehr=0x4000001`, no CSB events.
+- `DESKTOP_SCANOUT_STARVED` was logged twice; `scanout.starved` stayed at 2
+  from `s0` to `s1`. It was a transient effect of the reset.
+
 ## Native geometry API
 
 `WM_WINDOW_STATE` (`0xB08`) snapshots one calling provider's window without

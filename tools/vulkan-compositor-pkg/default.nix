@@ -11,6 +11,7 @@ pkgs.stdenv.mkDerivation {
     cp ${../../src/shared/gpu_buffer_abi.h} gpu_buffer_abi.h
     cp ${../../src/shared/gpu_window_source_abi.h} gpu_window_source_abi.h
     cp ${../../src/shared/gpu_window_channel.h} gpu_window_channel.h
+    cp ${../../src/shared/intel_tiling.h} intel_tiling.h
     cp ${../../scripts/workloads/intel_cpu_try_probe.c} intel_cpu_try_probe.c
     cp ${../../scripts/workloads/intel_sdl_same_title_probe.c} intel_sdl_same_title_probe.c
     cp ${../../scripts/workloads/desktop_pair_pixel_probe.c} desktop_pair_pixel_probe.c

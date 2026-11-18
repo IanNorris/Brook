@@ -5,6 +5,7 @@
 // (see docs/agent/syscall-split-plan.md).
 
 #include "process.h"
+#include "sync/kmutex.h"
 
 namespace brook {
 
@@ -28,10 +29,15 @@ struct EpollEntry {
 };
 
 struct EpollInstance {
+    // `lock` protects entries, count and ctlGeneration. It is a leaf lock:
+    // it is never held together with another instance's lock, across a
+    // readiness check, a user copy or a sleep. See syscall_epoll.cpp.
+    KMutex     lock;
     EpollEntry entries[EPOLL_MAX_FDS];
     int        count;
     volatile uint32_t refCount; // +1 per fd sharing this epoll instance
     Process*   waiter; // process blocked in epoll_wait
+    uint64_t   ctlGeneration; // bumped by epoll_ctl under `lock`
 };
 
 static inline void EpollFdRef(EpollInstance* ep)

@@ -456,6 +456,18 @@ target_compile_options(test_syscall_user_memory PRIVATE -DBROOK_HOST_TEST
 target_link_options(test_syscall_user_memory PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_syscall_user_memory PROPERTIES TIMEOUT 20)
 
+# Real syscall_epoll.cpp under pthreads: per-instance locking, nested
+# readiness, ctl/wait races and close during wait.
+add_host_test(test_epoll_instance_lock)
+target_compile_options(test_epoll_instance_lock PRIVATE -DBROOK_HOST_TEST
+    -ffunction-sections -fdata-sections -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter
+    -Wno-attributes -Wno-missing-field-initializers -Wno-misleading-indentation
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_compile_options(test_epoll_instance_lock PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-class-memaccess>)
+target_link_options(test_epoll_instance_lock PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_epoll_instance_lock PROPERTIES TIMEOUT 60)
+
 add_host_test(test_socket_lifetime "${BROOK_ROOT}/src/kernel/src/tcp.cpp"
     "${BROOK_ROOT}/src/kernel/src/sync/kmutex.cpp")
 target_compile_options(test_socket_lifetime PRIVATE -DBROOK_HOST_TEST -DBROOK_SOCKET_LIFETIME_TEST

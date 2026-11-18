@@ -329,6 +329,7 @@ static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint
         if(brook_vk_renderer_graphics_context(ctx->renderer,&physical,&device,&queue,&family))
             ctx->quad=brook_vk_quad_pass_create(physical,device,queue,family);
         if(!ctx->quad)fprintf(stderr,"DESKTOP_QUAD_UNAVAILABLE compute fallback\n");
+        else brook_vk_quad_pass_set_modifiers(ctx->quad,brook_vk_renderer_modifiers(ctx->renderer));
     }
     if(getenv("BROOK_RENDER_GRAPHICS_SCENE")){
         VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
@@ -572,6 +573,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     struct BrookDesktopLayers layers={.version=BROOK_DESKTOP_LAYERS_VERSION};
     struct BrookDesktopLayers backdrop={.version=BROOK_DESKTOP_LAYERS_VERSION};
     struct BrookVkExternalSource sources[BROOK_VK_MAX_LAYERS];
+    uint64_t sourceModifier[BROOK_VK_MAX_LAYERS]={0};
+    /* Tiled offers only for frames the quad pass draws (see g_desktopGpuTiledOk). */
+    g_desktopGpuTiledOk=pending && ctx->quad && brook_vk_renderer_modifiers(ctx->renderer) && !getenv("BROOK_RENDER_TEST_BLOCKED_FENCE");
     uint8_t directSource[BROOK_VK_MAX_LAYERS]={0};
     struct DesktopGpuOffer *directOffer[BROOK_VK_MAX_LAYERS]={0};uint8_t mergedUsed[BROOK_VK_MAX_LAYERS]={0};
     struct DesktopGpuOffer *preselected[BROOK_DESKTOP_LAYER_LIMIT]={0};uint32_t skipMask=0,keepMask=0,keptMask=0;
@@ -686,7 +690,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 if(direct->layers)desktop_gpu_offer_scene_layer(direct,l,width,height,k,&part);
                 const size_t words=direct->layers?(size_t)direct->layer[k].words:(size_t)direct->packet.words;
                 sources[count]=(struct BrookVkExternalSource){desktop_gpu_offer_buffer(direct,k),words,desktop_gpu_offer_fence(direct,k)};
-                directSource[count]=1;directOffer[count]=direct;
+                directSource[count]=1;directOffer[count]=direct;sourceModifier[count]=desktop_gpu_offer_modifier(direct,k);
                 memcpy(scene+BROOK_VK_SCENE_HEADER+count*BROOK_VK_LAYER_WORDS,&part,sizeof(part));++count;
             }
             if(direct->layers){
@@ -925,12 +929,13 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             for(unsigned i=0;i<count;++i){const uint32_t *l=scene+BROOK_VK_SCENE_HEADER+i*BROOK_VK_LAYER_WORDS;
                 inputs[i]=(struct BrookVkQuadSource){{sources[i].fd,sources[i].syncFd,l[2],l[3],l[0],l[1],(uint64_t)sources[i].words*4u},
                     !directSource[i]};}
+            const int modifiersSet=brook_vk_quad_pass_set_source_modifiers(ctx->quad,sourceModifier,count);
             /* Ring images are imported for the frame only (see quad_pass.h). */
             const struct BrookVkQuadSource output={{ctx->output,-1,width,height,0,width,ctx->outputBytes},ctx->scanoutCount?0:1};
             stage="quad_submit";
             statsSubmitStart=monotonic_ns();
             if(getenv("BROOK_RENDER_TIMELINE"))traceSubmitStart=statsSubmitStart;
-            status=brook_vk_quad_pass_submit(ctx->quad,scene,words,inputs,count,&output,plan);
+            status=modifiersSet?brook_vk_quad_pass_submit(ctx->quad,scene,words,inputs,count,&output,plan):BROOK_VK_REJECTED;
             if(status==BROOK_VK_UNCERTAIN){fprintf(stderr,"DESKTOP_QUAD_UNCERTAIN stage=submit vk_result=%d (the kernel refused the submission or the device is lost)\n",
                 brook_vk_quad_pass_last_result(ctx->quad));
                 {uint64_t inodes[8];const unsigned n=brook_vk_quad_pass_target_imports(ctx->quad,inodes,8);
@@ -982,6 +987,17 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             }
         }else ++g_quadFallback;
         if(!quadUsed)for(unsigned i=0;i<layers.count;++i)frameSources[i].omitted=0;
+    }
+    if(!quadUsed){
+        /* Only the quad pass samples tiled sources. Retire such offers to the
+         * provider's detiled CPU source and redraw next frame. */
+        int tiled=0;
+        for(unsigned i=0;i<count;++i)if(directSource[i] && sourceModifier[i] && directOffer[i]){
+            if(!directOffer[i]->failed){static unsigned logged;if(logged++<8)fprintf(stderr,
+                "DESKTOP_GPU_SOURCE_TILED_FALLBACK window=%u commit=%llu modifier=0x%llx (quad pass did not draw it; CPU source)\n",
+                directOffer[i]->packet.identity.window,(unsigned long long)directOffer[i]->packet.identity.commit,(unsigned long long)sourceModifier[i]);}
+            directOffer[i]->failed=directOffer[i]->retire=1;directOffer[i]->current=0;tiled=1;}
+        if(tiled){stage="tiled_fallback";goto done;}
     }
     if(quadUsed){}
     else if(attemptPartial){

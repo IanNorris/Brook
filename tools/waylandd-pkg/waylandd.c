@@ -59,6 +59,7 @@
 #include "gpu_buffer_abi.h"
 #include "gpu_window_source_abi.h"
 #include "gpu_window_channel.h"
+#include "intel-tiling.h"
 #include "intel_pending_drain.h"
 #include "wm-window-state.h"
 #include "xwm-wire.h"
@@ -140,6 +141,29 @@ static uint32_t g_trace_input_max_ms, g_trace_dispatch_max_ms;
  * output scale (see xwayland-xwm.h). */
 static uint32_t g_output_scale=1;
 
+static uint64_t g_now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec*1000000ull+(uint64_t)ts.tv_nsec/1000u;
+}
+/* Per-frame chain timing, always on (a few adds per frame), reported in the
+ * status file for X11 (Xwayland) and native roots separately:
+ *  interval     buffer commit to the next buffer commit of the window;
+ *  offer        commit to GPU offer sent (producer fence obtained);
+ *  presented    offer sent to the renderer's PRESENTED;
+ *  callback     commit to its wl_surface.frame done;
+ *  turnaround   frame done to the client's next buffer commit (the client,
+ *               e.g. Xwayland Present plus the game, not this server). */
+struct brook_pace { uint64_t count,sum_us,max_us; };
+enum { PACE_INTERVAL,PACE_OFFER,PACE_PRESENTED,PACE_CALLBACK,PACE_TURNAROUND,PACE_KINDS };
+static struct brook_pace g_pace[2][PACE_KINDS];
+static uint64_t g_pace_dmabuf_created[2],g_pace_early_callbacks;
+static void pace_add(int x11,int kind,uint64_t start_us,uint64_t end_us){
+    if(!start_us || end_us<start_us)return;
+    struct brook_pace *p=&g_pace[x11?1:0][kind];const uint64_t d=end_us-start_us;
+    ++p->count;p->sum_us+=d;if(d>p->max_us)p->max_us=d;
+}
+static uint64_t now_us_since(uint64_t start_us){const uint64_t now=g_now_us();return now>start_us?now-start_us:0;}
 static uint32_t g_now_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -449,6 +473,9 @@ struct brook_surface {
     struct brook_surface *sibling;    /* next child in parent's children list */
     struct wl_resource   *subsurface_resource; /* wl_subsurface resource if role is subsurface */
     int dmabuf_subsurface_reported; /* bounded diagnostic: once per surface */
+    /* Frame pacing (status "pacing"): last buffer commit and last frame
+     * callback sent, in microseconds. */
+    uint64_t pace_commit_us,pace_callback_us;
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -650,6 +677,10 @@ static void surface_send_frame_callbacks_upto(struct brook_surface *surface, uin
     struct brook_frame_callback *callback, *next;
     wl_list_for_each_safe(callback, next, &surface->committed_frames, link) {
         if (callback->commit > limit) continue;
+        if (!surface->subsurface_parent && surface->pace_commit_us>surface->pace_callback_us) {
+            const uint64_t now_us=g_now_us();
+            pace_add(surface->role==4,PACE_CALLBACK,surface->pace_commit_us,now_us);surface->pace_callback_us=now_us;
+        }
         if (g_trace_frames) {
             uint32_t requested = now - callback->requested_ms;
             uint32_t committed = now - callback->committed_ms;
@@ -679,6 +710,26 @@ static int image_callbacks_due(const struct brook_image *image, uint32_t now) {
      * delay from queueing, release them regardless of offer state. */
     return image->queued_ms && (int32_t)(now-image->queued_ms)>=GPU_CALLBACK_FALLBACK_MS;
 }
+/* Rootless Xwayland paces Present by frame callbacks: a sync flip completes
+ * (PresentCompleteNotify) at the next frame done after its commit, and Mesa
+ * GLX with swap interval 1 lets only one swap be outstanding. Holding the
+ * callback until PRESENTED (composite, plus the flip at vblank) therefore
+ * serialises the game with the renderer's whole latency. By default an
+ * Xwayland window's callbacks are released once its commit has been offered
+ * to the renderer, at most once per XWAYLAND_FRAME_MIN_US; buffer release
+ * (SAFE, after a newer commit is shown) still bounds how far the client gets
+ * ahead. BROOK_WAYLAND_XWAYLAND_FRAME=presented keeps PRESENTED pacing. */
+enum { XWAYLAND_FRAME_MIN_US=15000 };
+static int xwayland_early_frames(void){
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("BROOK_WAYLAND_XWAYLAND_FRAME");enabled=!v || strcmp(v,"presented");}
+    return enabled;
+}
+static int root_callbacks_due(const struct brook_surface *root,const struct brook_image *image,uint32_t now){
+    if(image_callbacks_due(image,now))return 1;
+    return root->role==4 && image->offer_state==1 && xwayland_early_frames() &&
+        g_now_us()-root->pace_callback_us>=XWAYLAND_FRAME_MIN_US;
+}
 static struct wl_event_source *g_frame_timer;
 static int frame_clock_tick(void *unused) {
     (void)unused;
@@ -695,7 +746,7 @@ static int frame_clock_tick(void *unused) {
         while (root->subsurface_parent) root = root->subsurface_parent;
         struct brook_draw draws[64];unsigned n=0;int pending=0;
         if(!surface_layers(root,draws,&n))pending=1;
-        for(unsigned i=0;i<n;++i)if(!image_callbacks_due(draws[i].view->image,now)){pending=1;break;}
+        for(unsigned i=0;i<n;++i)if(!root_callbacks_due(root,draws[i].view->image,now)){pending=1;break;}
         if(pending)continue;
         if (root->wm_id || surface->is_cursor) surface_send_frame_callbacks(surface, now);
     }
@@ -877,6 +928,12 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
             wl_shm_buffer_begin_access(shm);
             image=image_snapshot(wl_shm_buffer_get_data(shm),wl_shm_buffer_get_width(shm),wl_shm_buffer_get_height(shm),wl_shm_buffer_get_stride(shm),wl_shm_buffer_get_format(shm));
             wl_shm_buffer_end_access(shm);buffer_release(buffer);
+        }
+        if (image && buffer && !s->subsurface_parent) {
+            const uint64_t now_us=g_now_us();const int x11=s->role==4;
+            pace_add(x11,PACE_INTERVAL,s->pace_commit_us,now_us);
+            if(s->pace_callback_us>s->pace_commit_us)pace_add(x11,PACE_TURNAROUND,s->pace_callback_us,now_us);
+            s->pace_commit_us=now_us;image->pace_commit_us=now_us;image->pace_x11=x11;
         }
         if (buffer && !image) {
             if(buffer->uncertain)wl_client_post_implementation_error(c,"GPU buffer completion could not be verified");
@@ -2963,12 +3020,24 @@ static struct brook_image *intel_dmabuf_copy(const struct brook_dmabuf_buffer *d
 {
     struct { uint32_t handle,pad;uint64_t offset,flags,extensions; } map={db->bo_handle,0,0,2,0};
     if (ioctl(g_drm_fd,DRM_IOC(0x64,sizeof(map)),&map)) return NULL;
-    uint64_t bytes=(uint64_t)db->offset+(uint64_t)db->stride*(uint32_t)db->height;
+    const int tiling=brook_tiling_from_modifier(db->modifier);
+    if (tiling<0) return NULL;
+    uint64_t bytes=(uint64_t)db->offset+brook_tiled_bytes(tiling,db->stride,(uint32_t)db->height);
     if (!bytes || bytes>SIZE_MAX-4095) return NULL;
     size_t length=(size_t)((bytes+4095)&~UINT64_C(4095));
     void *pixels=mmap(NULL,length,PROT_READ,MAP_SHARED,g_drm_fd,(off_t)map.offset);
     if (pixels==MAP_FAILED) return NULL;
-    struct brook_image *image=image_snapshot((const uint8_t *)pixels+db->offset,db->width,db->height,
+    struct brook_image *image;
+    if (tiling) {
+        /* A tiled client buffer (glamor or a DRI3 game) read on the CPU
+         * fallback path: detile into a linear copy, then snapshot it. */
+        uint32_t *linear=malloc((size_t)db->width*(size_t)db->height*4u);
+        if (!linear) { munmap(pixels,length);return NULL; }
+        brook_detile32(linear,(size_t)db->width,(const uint8_t *)pixels+db->offset,tiling,db->stride,db->width,db->height);
+        image=image_snapshot((const uint8_t *)linear,db->width,db->height,
+            db->width*4u,db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
+        free(linear);
+    } else image=image_snapshot((const uint8_t *)pixels+db->offset,db->width,db->height,
         db->stride,db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
     if(image)g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;
     munmap(pixels,length);return image;
@@ -3163,6 +3232,7 @@ static void gpu_window_presented(const struct BrookGpuWindowIdentity *identity){
     if(!match){struct gpu_group *g=gpu_group_find(identity);if(g)gpu_group_presented(g);return;}
     if(match->gpu_presented)return;
     match->gpu_presented=1;++g_gpu_window_presented;
+    pace_add(match->pace_x11,PACE_PRESENTED,match->pace_offer_us,g_now_us());
     const uint32_t now=g_now_ms();
     gpu_window_timing_add(&g_presentWait,match->offer_sent_ms,now);
     for(struct brook_surface *s=g_surfaces;s;s=s->next){
@@ -3236,7 +3306,10 @@ static int gpu_window_offer(struct brook_image *image){
     const int scaled=!exact && gpu_scaled_offers_enabled() && gpu_layers_enabled() && !((g->sx|g->sy|g->sw|g->sh)&255) &&
         g->sx>=0 && g->sy>=0 && g->sw>0 && g->sh>0 && g->sx+g->sw<=(int64_t)image->width*256 && g->sy+g->sh<=(int64_t)image->height*256 &&
         g->w>0 && g->h>0 && (uint64_t)g->w*scale<=16384 && (uint64_t)g->h*scale<=16384;
-    if(g->transform || (!exact && !scaled) || (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
+    const uint32_t tileFlags=db->modifier==BROOK_DRM_MOD_I915_X_TILED?BROOK_GPU_WINDOW_LAYER_TILED_X:
+        db->modifier==BROOK_DRM_MOD_I915_Y_TILED?BROOK_GPU_WINDOW_LAYER_TILED_Y:0;
+    if(g->transform || (!exact && !scaled) || (db->stride&3) || (db->offset&3) || (db->modifier && !tileFlags) ||
+       (tileFlags && !gpu_layers_enabled())){++g_gpu_offer_geometry;return 0;}
     /* An X window resized by the native WM waits for a buffer of the new
      * size, exactly as surface_render does for the CPU path. */
     if(root->role==4 && !xwayland_accept_view(root,g->w,g->h)){++g_gpu_xwayland_resize_wait;return 0;}
@@ -3259,7 +3332,7 @@ static int gpu_window_offer(struct brook_image *image){
         .stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc};
     int sent;
     const int opaqueArgb=view->opaque && db->fourcc==0x34325241 && gpu_layers_enabled();
-    if(opaqueArgb || scaled){
+    if(opaqueArgb || scaled || tileFlags){
         /* An ARGB buffer the client declared opaque, or a scaled buffer: a
          * one-layer version 3 offer carries the opaque flag (XRGB is opaque
          * by format) and the source and destination rectangles, so the
@@ -3269,14 +3342,22 @@ static int gpu_window_offer(struct brook_image *image){
         one.header=offer;one.header.version=BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS;one.count=1;
         one.layers[0]=(struct BrookGpuWindowLayer){.words=offer.words,.device=offer.identity.device,.inode=offer.identity.inode,
             .offset=offer.offset,.stride=offer.stride,.width=offer.width,.height=offer.height,.fourcc=offer.fourcc,
-            .flags=(view->opaque || db->fourcc==0x34325258)?BROOK_GPU_WINDOW_LAYER_OPAQUE:0,
+            .flags=((view->opaque || db->fourcc==0x34325258)?BROOK_GPU_WINDOW_LAYER_OPAQUE:0)|tileFlags,
             .srcX=(uint32_t)(g->sx/256),.srcY=(uint32_t)(g->sy/256),.srcWidth=(uint32_t)(g->sw/256),.srcHeight=(uint32_t)(g->sh/256),
             .dstWidth=g->w*scale,.dstHeight=g->h*scale};
+        /* A tiled buffer whose size or pitch breaks the tile rules stays on
+         * the CPU path rather than failing the whole channel. */
+        if(tileFlags && !brook_gpu_window_layers_valid(&one)){++g_gpu_offer_geometry;return 0;}
         sent=brook_gpu_window_send_layers(g_gpu_window_channel,&one,&image->pending_fd,&image->producer_fence);
         if(sent==1 && opaqueArgb)++g_gpu_opaque_offers;
         if(sent==1 && scaled)++g_gpu_scaled_offers;
     }else sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
-    if(sent==1 && root->role==4)++g_gpu_xwayland_offers;
+    if(sent==1){const uint64_t now_us=g_now_us();pace_add(root->role==4,PACE_OFFER,image->pace_commit_us,now_us);image->pace_offer_us=now_us;}
+    if(sent==1 && root->role==4){
+        ++g_gpu_xwayland_offers;
+        if(xwayland_early_frames() && now_us_since(root->pace_callback_us)>=XWAYLAND_FRAME_MIN_US && draws[0].view==root->tree.current->value){
+            ++g_pace_early_callbacks;surface_send_frame_callbacks(root,g_now_ms());}
+    }
     if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
         image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
@@ -3388,13 +3469,18 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
         struct stat st={0};
         if(image->pending_cpu==1){
             const struct brook_dmabuf_buffer *db=image->source && image->source->dmabuf?image->source->dmabuf:NULL;
-            if(!db || image->pending_fd<0 || image->uncertain || db->modifier || (db->stride&3) || (db->offset&3) ||
+            const uint32_t tileFlags=!db?0:db->modifier==BROOK_DRM_MOD_I915_X_TILED?BROOK_GPU_WINDOW_LAYER_TILED_X:
+                db->modifier==BROOK_DRM_MOD_I915_Y_TILED?BROOK_GPU_WINDOW_LAYER_TILED_Y:0;
+            if(!db || image->pending_fd<0 || image->uncertain || (db->modifier && !tileFlags) || (db->stride&3) || (db->offset&3) ||
                image->offer_state==3 || image->offer_state==4){++g_gpu_group_skip_buffer;return 0;}
             if(image->producer_fence<0){++g_gpu_group_wait;return 2;}
             if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3)){++g_gpu_group_skip_buffer;return 0;}
             *l=(struct BrookGpuWindowLayer){.words=(uint64_t)st.st_size/4,.device=(uint64_t)st.st_dev,.inode=(uint64_t)st.st_ino,
                 .offset=db->offset/4,.stride=db->stride/4,.width=image->width,.height=image->height,.fourcc=db->fourcc,
-                .flags=view->opaque?BROOK_GPU_WINDOW_LAYER_OPAQUE:0};
+                .flags=(view->opaque?BROOK_GPU_WINDOW_LAYER_OPAQUE:0)|tileFlags};
+            if(tileFlags){struct BrookGpuWindowLayer probe=*l;probe.srcX=g->sx/256;probe.srcY=g->sy/256;probe.srcWidth=g->sw/256;
+                probe.srcHeight=g->sh/256;probe.dstWidth=g->w*scale;probe.dstHeight=g->h*scale;
+                if(!brook_gpu_window_layer_valid(&probe)){++g_gpu_group_skip_buffer;return 0;}}
             buffers[i]=image->pending_fd;fences[i]=image->producer_fence;
         }else if(image->pixels && !image->pending_cpu){
             if(!image_gem_upload(image)){++g_gpu_group_skip_upload;return 0;}
@@ -3669,6 +3755,8 @@ static int is_dmabuf_buffer(struct wl_resource *buf)
                                           &dmabuf_buffer_impl);
 }
 
+static int dmabuf_tiled_for(struct wl_client *client);
+static uint64_t g_dmabuf_tiled_created;
 /* zwp_linux_buffer_params_v1: the client adds plane(s) then create[_immed]. We
  * support a single-plane buffer (plane 0) — enough for Mesa's window surface. */
 struct brook_dmabuf_params {
@@ -3717,8 +3805,13 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
                                "no plane added");
         return NULL;
     }
-    const struct BrookDmabufLayout layout={(uint32_t)width,(uint32_t)height,format,p->stride,p->offset,flags,p->modifier};
+    /* Tiled layouts are checked as linear plus the tile pitch/offset rules. */
+    const int tiling=brook_tiling_from_modifier(p->modifier);
+    const int tiled=tiling>0 && dmabuf_tiled_for(c);
+    const struct BrookDmabufLayout layout={(uint32_t)width,(uint32_t)height,format,p->stride,p->offset,flags,tiled?0:p->modifier};
     enum BrookDmabufLayoutError error=BrookDmabufValidate(&layout,UINT64_MAX,1);
+    if (error==BROOK_DMABUF_LAYOUT_OK && tiled && ((p->stride&(tiling==BROOK_TILING_X?511u:127u)) || (p->offset&4095u)))
+        error=BROOK_DMABUF_LAYOUT_BOUNDS;
     if (error!=BROOK_DMABUF_LAYOUT_OK) {
         uint32_t protocol_error=error==BROOK_DMABUF_LAYOUT_DIMENSIONS?ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS:
             error==BROOK_DMABUF_LAYOUT_FORMAT?ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT:ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS;
@@ -3729,6 +3822,7 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
     if (!db) { wl_client_post_no_memory(c); return NULL; }
     db->refs = 1;db->width = width; db->height = height;
     db->stride = p->stride; db->fourcc = format;db->offset=p->offset;db->modifier=p->modifier;
+    if (tiled) ++g_dmabuf_tiled_created;
     db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
     close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */
     if (!db->gres) {
@@ -3737,6 +3831,7 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
                                        "dmabuf import failed");
         return NULL;
     }
+    ++g_pace_dmabuf_created[c==g_xwayland_client];
     fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x modifier=0x%llx -> gres=%u\n",
             width, height, db->stride, format, (unsigned long long)db->modifier, db->gres);
 
@@ -3812,6 +3907,19 @@ static uint64_t g_drm_dev = 0;
  * platform learns *which render node* to use: without it (or wl_drm) Mesa can't
  * find the GPU, falls back to Zink/swrast and crashes. We expose a single tranche
  * for our render node advertising the LINEAR-modifier XR24/AR24 formats. */
+/* Intel X/Y-tiled buffers. Broadwell renders several times faster into a
+ * tiled colour buffer than into a LINEAR one (host Gen9.5, 8 blended quads at
+ * 3192x1632: LINEAR 48.6 ms, X 15.3 ms, Y 14.5 ms). The renderer's quad pass
+ * samples them (layer flags TILED_X/TILED_Y) and the CPU fallback detiles.
+ * Offered only with the Intel GPU channel. BROOK_WAYLAND_TILED: "xwayland"
+ * (default: the Xwayland client, hence glamor and DRI3 games), "all", "0". */
+static int dmabuf_tiled_for(struct wl_client *client){
+    static int mode=-1;
+    if(mode<0){const char *v=getenv("BROOK_WAYLAND_TILED");
+        mode=!v || !strcmp(v,"xwayland")?1:!strcmp(v,"all")?2:0;}
+    if(!mode || !g_drm_intel || !getenv("BROOK_WAYLAND_GPU_SOCKET"))return 0;
+    return mode==2 || (client && client==g_xwayland_client);
+}
 static void dmabuf_send_feedback(struct wl_resource *fb)
 {
     /* Format table: 16-byte entries { u32 format, u32 pad, u64 modifier }. */
@@ -3819,8 +3927,12 @@ static void dmabuf_send_feedback(struct wl_resource *fb)
     static const struct fmt_entry table[] = {
         { FMT_XRGB8888, 0, 0 /* LINEAR */ },
         { FMT_ARGB8888, 0, 0 /* LINEAR */ },
+        { FMT_XRGB8888, 0, BROOK_DRM_MOD_I915_Y_TILED },
+        { FMT_ARGB8888, 0, BROOK_DRM_MOD_I915_Y_TILED },
+        { FMT_XRGB8888, 0, BROOK_DRM_MOD_I915_X_TILED },
+        { FMT_ARGB8888, 0, BROOK_DRM_MOD_I915_X_TILED },
     };
-    const uint32_t n = sizeof(table) / sizeof(table[0]);
+    const uint32_t n = dmabuf_tiled_for(wl_resource_get_client(fb)) ? sizeof(table) / sizeof(table[0]) : 2;
 
     int tfd = syscall(SYS_memfd_create, "brook-dmabuf-fmt", 0u);
     if (tfd >= 0) {
@@ -3908,6 +4020,13 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
         if (use >= 3) {
             zwp_linux_dmabuf_v1_send_modifier(r, FMT_XRGB8888, 0, 0);
             zwp_linux_dmabuf_v1_send_modifier(r, FMT_ARGB8888, 0, 0);
+            if (dmabuf_tiled_for(client)) {
+                static const uint64_t mods[2]={BROOK_DRM_MOD_I915_Y_TILED,BROOK_DRM_MOD_I915_X_TILED};
+                for (int i=0;i<2;++i) {
+                    zwp_linux_dmabuf_v1_send_modifier(r, FMT_XRGB8888, (uint32_t)(mods[i]>>32), (uint32_t)mods[i]);
+                    zwp_linux_dmabuf_v1_send_modifier(r, FMT_ARGB8888, (uint32_t)(mods[i]>>32), (uint32_t)mods[i]);
+                }
+            }
         }
     }
 }
@@ -3932,6 +4051,13 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
         (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered,
         (unsigned long long)g_gpu_xwayland_offers,gpu_xwayland_offers_enabled());
+    {static const char *kinds[PACE_KINDS]={"interval","offer","presented","callback","turnaround"};
+     fprintf(f,"\"pacing\":{\"xwayland_frame\":\"%s\",\"early_callbacks\":%llu,\"tiled_created\":%llu,",xwayland_early_frames()?"offer":"presented",
+         (unsigned long long)g_pace_early_callbacks,(unsigned long long)g_dmabuf_tiled_created);
+     for(int x=0;x<2;++x){fprintf(f,"\"%s\":{\"dmabuf_created\":%llu",x?"x11":"native",(unsigned long long)g_pace_dmabuf_created[x]);
+         for(int k=0;k<PACE_KINDS;++k)fprintf(f,",\"%s\":[%llu,%llu,%llu]",kinds[k],(unsigned long long)g_pace[x][k].count,
+             (unsigned long long)g_pace[x][k].sum_us,(unsigned long long)g_pace[x][k].max_us);
+         fprintf(f,"}%s",x?"},":",");}}
     fprintf(f,"\"offer_skipped\":{\"no_channel_or_fence\":%llu,\"no_root\":%llu,\"layers\":%llu,\"geometry\":%llu,\"window\":%llu,"
         "\"metadata\":%llu,\"connect_fail\":%llu,\"auth_fail\":%llu,\"sent_with_client_size_mismatch\":%llu,\"xwayland_resize_wait\":%llu},",
         (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,

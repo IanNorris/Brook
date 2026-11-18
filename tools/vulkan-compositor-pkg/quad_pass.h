@@ -40,6 +40,12 @@ struct BrookVkQuadStats { uint64_t imports,cacheHits,evictions,submits,targetEvi
 unsigned brook_vk_quad_pass_target_imports(const BrookVkQuadPass *,uint64_t *inodes,unsigned max);
 
 BrookVkQuadPass *brook_vk_quad_pass_create(VkPhysicalDevice,VkDevice,VkQueue,uint32_t queueFamily);
+/* The device enabled VK_EXT_image_drm_format_modifier: sources with a
+ * nonzero buffer.modifier (Intel X/Y tiled) may be imported. Default off. */
+void brook_vk_quad_pass_set_modifiers(BrookVkQuadPass *,int enabled);
+/* DRM format modifiers of the next submit's sources (0 = linear), by
+ * source index. Cleared by each submit. 0 if modifiers are not enabled. */
+int brook_vk_quad_pass_set_source_modifiers(BrookVkQuadPass *,const uint64_t *modifiers,size_t count);
 /* scene: header and layer words; sources: one per scene layer (only layers
  * the plan draws are imported; others may have fd -1). The output must be
  * distinct from every source, have offset 0 and the scene's size. Rejects
