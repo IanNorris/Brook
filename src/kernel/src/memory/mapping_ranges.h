@@ -57,10 +57,26 @@ struct MappingRangeTable {
     mutable const MappingRange* lookup[LookupSlots] = {};
     MappingRangeNode* root = nullptr;
 };
+// First list node whose range ends after address (the containing range, or
+// the next one after a hole), found through the AVL index in O(log n). Ranges
+// are disjoint and ordered, so end order equals the index's begin order.
+// AS mutation (or exclusive construction/teardown) required.
+inline MappingRangeNode* MappingRangeLastEndingAtOrBefore(const MappingRangeTable& table,uint64_t address) {
+    MappingRangeNode* found=nullptr;
+    for(auto* node=table.root;node;) {
+        if(node->range.end<=address){found=node;node=node->right;}
+        else node=node->left;
+    }
+    return found;
+}
+inline MappingRangeNode* MappingRangeFirstEndingAfter(const MappingRangeTable& table,uint64_t address) {
+    auto* predecessor=MappingRangeLastEndingAtOrBefore(table,address);
+    return predecessor?predecessor->next:table.head;
+}
 // Callers without prepared per-page content retirement cannot remove even a
 // whole node: it may be one fragment whose siblings keep the Region alive.
 inline bool MappingRangeRemovalAllowed(const MappingRangeTable& table,uint64_t begin,uint64_t end) {
-    for(auto* node=table.head;node;node=node->next) {
+    for(auto* node=MappingRangeFirstEndingAfter(table,begin);node && node->range.begin<end;node=node->next) {
         const auto& r=node->range;
         if(r.kind==MappingKind::Pageable && r.begin<end && begin<r.end)return false;
     }

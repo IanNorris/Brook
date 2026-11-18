@@ -17,6 +17,8 @@ static void SampleDesktopMetrics(uint64_t now) {
         if(base)for(const char* c=d->name+6;*c;++c)if(*c<'0'||*c>'9')base=false;
         if(base){uint64_t ro,wo,r,w;VirtioBlkGetStats(d,ro,wo,r,w);auto* v=static_cast<uint64_t*>(context);v[0]+=r;v[1]+=w;}return true;
     },disk);
+    // AHCI and USB mass storage: completed device transfers, not cache hits.
+    const auto storage=StorageIoReadAll();disk[0]+=storage.readBytes;disk[1]+=storage.writeBytes;
     uint64_t down=0,up=0;
     for(uint32_t i=0;i<NetIfCount();++i){auto* n=NetIfAt(i);if(n){down+=__atomic_load_n(&n->rxBytes,__ATOMIC_RELAXED);up+=__atomic_load_n(&n->txBytes,__ATOMIC_RELAXED);}}
     const uint64_t elapsed=g_desktopStats.tick && now>g_desktopStats.tick?now-g_desktopStats.tick:0;
@@ -26,6 +28,17 @@ static void SampleDesktopMetrics(uint64_t now) {
     g_desktopStats={now,rate(disk[0],g_metricsRead),rate(disk[1],g_metricsWrite),rate(down,g_metricsDown),rate(up,g_metricsUp),
         static_cast<uint32_t>(elapsed && db+di?db*100/(db+di):0),static_cast<uint32_t>(total && free<=total?(total-free)*100/total:0)};
     g_metricsBusy=busy;g_metricsIdle=idle;g_metricsRead=disk[0];g_metricsWrite=disk[1];g_metricsDown=down;g_metricsUp=up;
+}
+DesktopTelemetry WmDesktopTelemetryRead() {
+    DesktopTelemetry copy;
+    copy.tick=__atomic_load_n(&g_desktopStats.tick,__ATOMIC_RELAXED);
+    copy.readBytesPerSecond=__atomic_load_n(&g_desktopStats.readBytesPerSecond,__ATOMIC_RELAXED);
+    copy.writeBytesPerSecond=__atomic_load_n(&g_desktopStats.writeBytesPerSecond,__ATOMIC_RELAXED);
+    copy.downBytesPerSecond=__atomic_load_n(&g_desktopStats.downBytesPerSecond,__ATOMIC_RELAXED);
+    copy.upBytesPerSecond=__atomic_load_n(&g_desktopStats.upBytesPerSecond,__ATOMIC_RELAXED);
+    copy.cpuPercent=__atomic_load_n(&g_desktopStats.cpuPercent,__ATOMIC_RELAXED);
+    copy.memoryPercent=__atomic_load_n(&g_desktopStats.memoryPercent,__ATOMIC_RELAXED);
+    return copy;
 }
 void WmObserveDesktopTick(uint64_t now) {
     g_desktopCadence.Record(now);SampleDesktopMetrics(now);

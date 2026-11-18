@@ -16,6 +16,10 @@ int main() {
      Timer t{g,0xffff00,1000000};assert(!brook::AhciWaitForPanicOwner(g,t,20) && g.PanicPending() && t.reads<20);}
     {AhciPanicGate g;assert(g.EnterNormal() && g.RequestPanic()==Request::Pending);
      Timer t{g,42,0};assert(!brook::AhciWaitForPanicOwner(g,t,5) && g.PanicPending() && t.reads==6);}
+    // Parked-owner recovery applies only to a pending request.
+    {AhciPanicGate g;assert(!g.TakeFromParkedOwner());assert(g.EnterNormal() && !g.TakeFromParkedOwner());
+     assert(g.RequestPanic()==Request::Pending && g.TakeFromParkedOwner() && g.PanicOwned());
+     assert(!g.TakeFromParkedOwner());g.LeaveNormal();assert(g.PanicOwned() && !g.EnterNormal());}
     AhciPanicGate gate;
     assert(gate.EnterNormal());
     assert(!gate.EnterPanic());

@@ -33,6 +33,13 @@ public:
         }
         return Request::Unavailable;
     }
+    // Panic CPU only, after every peer CPU has halted: the pending normal
+    // owner is parked inside its interrupt-driven completion sleep and can
+    // never run again, and the caller has seen the port idle. Pending only.
+    bool TakeFromParkedOwner() {
+        uint32_t expected=3;
+        return __atomic_compare_exchange_n(&owner_,&expected,2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+    }
     bool PanicOwned() const {return __atomic_load_n(&owner_,__ATOMIC_ACQUIRE)==2;}
     // Normal owner checks this between commands, never while the controller
     // may still be using its DMA descriptors or data buffer.

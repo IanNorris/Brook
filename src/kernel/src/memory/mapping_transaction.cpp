@@ -260,7 +260,7 @@ bool MappingTransaction::GrowPageableMetadata(const MappingFaultSnapshot& snapsh
        old.leafOwnership!=MappingLeafOwnership::Managed || !old.backing || !replacement || replacement->file ||
        replacement==old.backing || replacement->release!=old.backing->release || end<=old.end ||
        !ValidateMapping(snapshot,old.begin))return false;
-    for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next)
+    for(auto* node=MappingRangeFirstEndingAfter(space_->ranges,old.end);node && node->range.begin<end;node=node->next)
         if(node->range.end>old.end)return false;
     uint64_t leaves=0;
     if(!RangeLeafCount(old.end,end,leaves) || leaves)return false;
@@ -275,7 +275,7 @@ bool MappingTransaction::PrivateLeaf(VirtualAddress address, uint64_t, void* con
 }
 bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t protection) {
     if (!locked_ || faultScoped_) KernelPanic("mapping: protection without lock or in fault scope");
-    if (protection)for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next) {
+    if (protection)for(auto* node=MappingRangeFirstEndingAfter(space_->ranges,begin);node && node->range.begin<end;node=node->next) {
         const auto& range=node->range;
         if(range.end>begin && range.backing && range.backing->file && range.backing->file->mappingError)return false;
     }
@@ -283,7 +283,7 @@ bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t p
     // This precedes every writable PTE, including hidden PROT_NONE leaves.
     // Conservative exposure after a later preflight failure is harmless; no
     // permission may be granted unless all affected file ranges are retained.
-    if(protection&2)for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next) {
+    if(protection&2)for(auto* node=MappingRangeFirstEndingAfter(space_->ranges,begin);node && node->range.begin<end;node=node->next) {
         const auto& range=node->range;
         if(range.end<=begin || range.kind!=MappingKind::File || range.sharing!=MappingSharing::Shared)continue;
         const auto left=range.begin>begin?range.begin:begin;

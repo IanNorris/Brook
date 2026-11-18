@@ -102,6 +102,12 @@ WritableDesktopInfo WritableDesktopRead(){return writable;}
 AhciReadOnlyStatus ahciStatus{};
 AhciObservation ahciObservation{};
 AhciReadOnlyStatus AhciReadOnlyGetStatus(){return ahciStatus;}
+AhciIoStats ahciIoStats{};
+AhciIoStats AhciReadOnlyIoStats(){return ahciIoStats;}
+uint64_t ahciSpinUs=100;
+bool AhciReadOnlySetSpinUs(uint64_t us){if(us>2000)return false;ahciSpinUs=us;return true;}
+uint64_t AhciReadOnlySpinUs(){return ahciSpinUs;}
+AhciIrqStatus AhciReadOnlyIrqStatus(){AhciIrqStatus s;s.configured=s.active=true;s.vector=64;s.reason="MSI completion interrupts";return s;}
 const AhciObservation& AhciObserveRead(){return ahciObservation;}
 int AhciReadOnlySector(uint64_t lba,void* out){if(lba!=3)return -22;std::memset(out,0x5a,512);return 512;}
 Vnode binaryNode{},markerNode{},payloadNode{};
@@ -250,6 +256,15 @@ int main(){
     assert(handle("bridge hardware native-tsc-observe") && reply.find("\"lower\":-12,\"upper\":34")!=std::string::npos);
     brook::ahciStatus.ready=true;std::strcpy(brook::ahciStatus.serial,"serial-123");
     assert(handle("bridge hardware ahci-ro") && reply.find("\"serial\":\"serial-123\"")!=std::string::npos);
+    brook::ahciIoStats.waits=7;brook::ahciIoStats.irqWakes=5;
+    assert(handle("bridge hardware ahci-ro") && reply.find("\"irq_active\":true")!=std::string::npos &&
+           reply.find("\"waits\":7")!=std::string::npos && reply.find("\"irq_wakes\":5")!=std::string::npos &&
+           reply.find("\"vector\":64")!=std::string::npos);
+    assert(handle("bridge hardware ahci-spin-us 20") && reply.find("\"applied\":true")!=std::string::npos &&
+           reply.find("\"spin_us\":20")!=std::string::npos);
+    assert(handle("bridge hardware ahci-spin-us 5000") && reply.find("\"applied\":false")!=std::string::npos &&
+           reply.find("\"spin_us\":20")!=std::string::npos);
+    assert(handle("bridge hardware ahci-spin-us x") && reply.find("\"applied\":false")!=std::string::npos);
     assert(handle("bridge hardware ahci-sector 3") && reply.find("5a5a5a5a")!=std::string::npos);
     assert(handle("bridge hardware ahci-sector 4") && reply.find("ahci_ro_error")!=std::string::npos);
     assert(handle("bridge hardware ahci") && reply.find("ahci_observe_api")!=std::string::npos);

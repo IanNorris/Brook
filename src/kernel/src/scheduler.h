@@ -52,6 +52,10 @@ uint64_t SchedulerContextSwitchGeneration(unsigned cpu);
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();
 
+// True once the BSP has dispatched its first process; blocking or yielding
+// before then must not be attempted by drivers that also run during boot.
+bool SchedulerIsRunning();
+
 // Block the current process for approximately `ms` milliseconds.  Uses the
 // same wakeup-tick path as sys_nanosleep so other CPUs / processes can run
 // while we wait.  Safe to call from kernel/driver context that has a

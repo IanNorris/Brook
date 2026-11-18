@@ -5,6 +5,7 @@
 #include "block_write_leases.h"
 #include "process.h"
 #include "module.h"
+#include "storage_io_stats.h"
 namespace brook { __attribute__((weak)) Process* ProcessCurrent(); }
 
 namespace brook {
@@ -359,6 +360,38 @@ void DeviceIterate(DeviceType type, bool (*cb)(Device* dev, void* ctx), void* ct
         }
     }
     SpinLockRelease(&g_deviceLock);
+}
+
+namespace {
+StorageIoCounters g_storageIo[uint32_t(StorageIoSource::Count)];
+}
+extern "C" void StorageIoAccount(uint32_t source, uint32_t kind, uint64_t bytes)
+{
+    if (source >= uint32_t(StorageIoSource::Count)) return;
+    auto& counters = g_storageIo[source];
+    if (kind == 0) counters.Read(bytes);
+    else if (kind == 1) counters.Write(bytes);
+    else if (kind == 2) counters.Flush();
+}
+StorageIoTotals StorageIoRead(StorageIoSource source)
+{
+    const auto index = uint32_t(source);
+    return index < uint32_t(StorageIoSource::Count) ? g_storageIo[index].Snapshot() : StorageIoTotals{};
+}
+StorageIoTotals StorageIoReadAll()
+{
+    StorageIoTotals sum;
+    for (const auto& counters : g_storageIo) StorageIoAdd(sum, counters.Snapshot());
+    return sum;
+}
+const char* StorageIoSourceName(StorageIoSource source)
+{
+    switch (source) {
+    case StorageIoSource::Ahci: return "ahci";
+    case StorageIoSource::Usb: return "usb";
+    case StorageIoSource::Nvme: return "nvme";
+    default: return "unknown";
+    }
 }
 
 } // namespace brook

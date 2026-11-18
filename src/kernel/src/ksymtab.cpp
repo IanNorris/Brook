@@ -14,6 +14,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "device.h"
+#include "storage_io_stats.h"
 #include "vfs.h"
 #include "fatfs_glue.h"
 #include "ext2_vfs.h"
@@ -81,6 +82,7 @@ EXPORT_SYMBOL(VmmMapPage);
 
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
+EXPORT_SYMBOL(StorageIoAccount);
 EXPORT_SYMBOL(DeviceFlush);
 EXPORT_SYMBOL(DeviceWrite);
 EXPORT_SYMBOL(DeviceUnregister);
