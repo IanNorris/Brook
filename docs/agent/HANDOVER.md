@@ -101,7 +101,7 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **To do:**
   - read `sched lock-stats status` (lock-stats is enabled on this boot) during Q2/Steam to confirm the KernelRegion enter/leave suspect;
   - Ian's hands-on checks: clickpad, power confirmation, Chromium caption colour;
-  - `work/compositor-refactor` is rebased onto main 67922774 (head `495f0875`; stages 0.1–0.5 now also cover the power footer and the chrome-csd-style caption strip; QEMU CPU path pixel-identical; 369/369 host tests). Pair `compositor-refactor/build/dell/pair-refactor` (`dell-refactor-20261118`). **Boot it on the Dell (check chrome, launcher footer, Chromium caption, Q2 with the launcher open) before merging**, because the VKRENDER chrome capture now uses the shared alpha helper.
+  - `work/compositor-refactor` is rebased onto main 67922774 (head `495f0875`; stages 0.1–0.5 now also cover the power footer and the chrome-csd-style caption strip; QEMU CPU path pixel-identical; 369/369 host tests). Pair `compositor-refactor/build/dell/pair-refactor` (`dell-refactor-20261118`). **Merged after Dell gen 425 (`dell-refactor-20261118`, session `3009030bf1204b94a56f5210652ca594`):** the desktop renders normally, zero-copy is active from boot, and the matched demo is unchanged (65.6 swaps, displayed mean 22.8 / p50 21.0 ms). Ian still to eyeball the launcher power footer and the Chromium caption colour on it. Next refactor stage: 1.1 (part table for drawing and hit-testing).
 
 **Ready, not deployed: `work/compositor-refactor` (`c5fab410`, rebased on main 73409c2a; trial merge with work/shell-opaque is clean).**
 - **Stages done:**
