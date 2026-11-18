@@ -303,7 +303,7 @@ void DellAcpiMonitorConfigure() {
         for(uint32_t off=0;off<bytes;off+=32) {
             char line[65];const char* h="0123456789abcdef";uint32_t n=bytes-off<32?bytes-off:32;
             for(uint32_t i=0;i<n;++i){line[2*i]=h[diag.madt[off+i]>>4];line[2*i+1]=h[diag.madt[off+i]&15];}line[2*n]=0;
-            KLog("dell-acpi: madt %03u %s",off,line);
+            KLog("dell-acpi: madt %u %s",unsigned(off),line);
         }
         return;
     }
