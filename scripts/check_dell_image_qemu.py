@@ -51,6 +51,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from hardware_update_protocol import record
+from test_guard_repair_handoff_qemu import DATA_FIRST, TRIM_DATA_SECTORS
 
 DEFAULT_SHARED = Path('/data/Programming/Brook/shared/dell')
 IMAGE = ('qemu-check/guard-efi-fixture-20261103.raw.gz',
@@ -115,6 +116,8 @@ def main():
                    help='maximum runs; only a firmware stall before boot selection is retried (default 2)')
     p.add_argument('--ssd-trim', choices=('dry-run', 'run'), help='also test TRIM in the disposable fixture')
     a = p.parse_args()
+    if a.ssd_trim and a.efi:
+        p.error('--ssd-trim builds a loader for the enlarged fixture')
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
     if 'OVMF_CODE' not in os.environ and not a.firmware:
@@ -155,6 +158,22 @@ def main():
             src = shared / 'qemu-check/recovery-v2' / name
             pinned(src.with_name(name + '.gz') if not src.exists() else src, recovery / name, digest)
         rmanifest = json.loads((recovery / 'manifest.json').read_text())
+
+        if a.ssd_trim:
+            options = scratch / 'trim-loader-options'
+            options.mkdir(mode=0o700)
+            config = options / 'guard-loader-options.txt'
+            config.write_text(
+                f'BROOK_GUARD_IDENTITY:STRING={rmanifest["guard_identity"]}\n'
+                f'BROOK_GUARD_DATA_FIRST:STRING={DATA_FIRST}\n'
+                f'BROOK_GUARD_DATA_SECTORS:STRING={TRIM_DATA_SECTORS}\n')
+            config.chmod(0o600)
+            loader = scratch / 'trim-loader'
+            subprocess.run([sys.executable, ROOT / 'scripts/build_dell_loader.py',
+                            '--shared', options, '--output', loader, '--allow-dirty'], check=True)
+            efi = loader / 'BROOKGUARD.efi'
+            verdict['trim_fixture'] = {'data_sectors': TRIM_DATA_SECTORS,
+                                       'efi_sha256': sha(efi), 'mode': a.ssd_trim}
 
         # 1. QEMU-only desktop pair: exact kernel and initrd, fixture identity.
         desktop = scratch / 'desktop-pair'

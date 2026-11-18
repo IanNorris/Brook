@@ -599,7 +599,8 @@ static int TrimGuardedDataBeforeMount() {
     const uint64_t maxSectors=uint64_t(request.maximumMiB)*2048;
     const uint64_t started=RtcNowNs();
     uint64_t sectors=0;
-    uint32_t rangeCount=0,commands=0;
+    uint32_t rangeCount=0;
+    AhciTrimStats stats{};
     int error=-22;
     if(parsed && guardDesktopPhase==GuardDesktopPhase::Preparing &&
        guardDataPhase==GuardDataPhase::Disabled && !directPrepared && !directReady &&
@@ -619,7 +620,7 @@ static int TrimGuardedDataBeforeMount() {
                         if(!TrimSetFilesystemState(0)) {error=-5;return false;}
                         markedDirty=true;
                     }
-                    error=AhciTrimBatch(guardDataRange.parent,trimWindow,batch,used,run,commands);
+                    error=AhciTrimBatch(guardDataRange.parent,trimWindow,batch,used,run,stats);
                     used=0;
                     return !error;
                 };
@@ -652,8 +653,10 @@ static int TrimGuardedDataBeforeMount() {
         }
     }
     KPrintf("SSD_TRIM {\"mode\":\"%s\",\"ranges\":%u,\"bytes\":%lu,\"dsm_commands\":%u,"
-            "\"planned_commands\":%u,\"duration_ns\":%lu,\"error\":%d}\n",run?"run":"dry-run",
-            rangeCount,sectors*512,run?commands:0,run?0:commands,RtcNowNs()-started,error);
+            "\"planned_commands\":%u,\"command_total_ns\":%lu,\"command_max_ns\":%lu,"
+            "\"duration_ns\":%lu,\"error\":%d}\n",run?"run":"dry-run",
+            rangeCount,sectors*512,run?stats.commands:0,run?0:stats.commands,
+            stats.commandTotalNs,stats.commandMaxNs,RtcNowNs()-started,error);
     return error;
 }
 #endif

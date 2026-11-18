@@ -3,7 +3,7 @@
 #include <initializer_list>
 using namespace brook::ahci_ro;
 struct Mock {
-    uint32_t regs[32]{};unsigned writes=0,fences=0;uint32_t transferredBytes=512;
+    uint32_t regs[32]{};unsigned writes=0,fences=0,longWaits=0;uint32_t transferredBytes=512;
     bool stuckCi=false,stuckCr=false,stuckFr=false,ignoreStop=false,ignoreFisStop=false,unavailableAfterWrite=false;
     uint32_t ignoredOffset=0xffffffffu;
     uint32_t injectIs=0;
@@ -11,7 +11,7 @@ struct Mock {
     void write(uint32_t off,uint32_t value){++writes;if(off==IS || off==SERR)regs[off/4]&=~value;else if(off==ignoredOffset){}else if(off==CMD && ignoreStop && !(value&ST)){}else if(off==CMD && ignoreFisStop && !(value&FRE)){}else regs[off/4]=value;if(off==CMD && unavailableAfterWrite)regs[off/4]=0xffffffffu;}
     void fence(){++fences;}
     bool waitClear(uint32_t off,uint32_t mask){if((off==CI&&stuckCi)||(mask==CR&&stuckCr)||(mask==FR&&stuckFr))return false;regs[off/4]&=~mask;if(off==CI)regs[IS/4]|=injectIs;return true;}
-    bool waitClearFlush(uint32_t off,uint32_t mask){return waitClear(off,mask);}
+    bool waitClearLong(uint32_t off,uint32_t mask){++longWaits;return waitClear(off,mask);}
     uint32_t transferred(){return transferredBytes;}
 };
 int main(){
@@ -21,7 +21,10 @@ int main(){
     assert(Prepare(m,0x1000,0x2000,false)==Result::Ok);
     assert(m.regs[CLB/4]==0x1000 && m.regs[FB/4]==0x2000 && m.fences==1);
     assert(Start(m)==Result::Ok && (m.regs[CMD/4]&(ST|FRE))==(ST|FRE));
-    assert(Submit(m,512)==Result::Ok && m.fences==3);
+    assert(Submit(m,512)==Result::Ok && m.fences==3 && m.longWaits==0);
+    Mock trim;assert(Submit<true>(trim,512)==Result::Ok && trim.longWaits==1);
+    Mock trimTimeout;trimTimeout.stuckCi=true;
+    assert(Submit<true>(trimTimeout,512)==Result::Timeout && trimTimeout.longWaits==1);
     assert(Quiesce(m) && !(m.regs[CMD/4]&(ST|FRE)));
     Mock busy;busy.regs[CI/4]=1;assert(Prepare(busy,0x1000,0x2000,false)==Result::Busy && busy.writes==0);
     Mock invalid;assert(Prepare(invalid,0x1001,0x2000,false)==Result::InvalidDma && invalid.writes==0);

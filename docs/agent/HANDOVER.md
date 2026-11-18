@@ -18,12 +18,13 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 ## SSD TRIM (18 November 2026)
 
 `work/ssd-trim` in `/tmp/brook-ssd-trim` implements guarded pre-mount dry-run
-and opt-in ATA DSM. The Dell pair `build/dell/pair-trim-v3` from `e41edd69`
-passed the ordinary QEMU gate and both TRIM modes. Dry-run issued zero
-commands. One explicit DSM command reclaimed 11.8 MiB of mapped qcow2
-data, preserved ten fixture file hashes and passed clean offline fsck.
-No physical tests have been performed. See [SSD TRIM](../ssd-trim.md)
-for command syntax, evidence and the proposed bounded Dell rollout.
+and opt-in ATA DSM. The follow-up gives DSM a 30-second timeout and records
+total and longest command latency. The pair at `build/dell/pair-trim-v4`
+passed the ordinary QEMU gate. Dry-run found 83 ranges across four ext2
+groups and issued zero commands. The enlarged run completed six commands,
+reclaimed 315 MiB of mapped qcow2 data, preserved 89 file hashes, and passed
+offline fsck. No physical tests have been performed. See
+[SSD TRIM](../ssd-trim.md) for the proposed bounded Dell rollout.
 
 ## Repository
 

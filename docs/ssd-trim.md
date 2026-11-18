@@ -21,7 +21,9 @@ forms, with a trailing newline. An empty marker selects a dry run.
 The numbers are the minimum run and maximum total in MiB. A maximum of zero
 selects the whole partition. The console emits `SSD_TRIM_RANGE` JSON records
 during a dry run and an `SSD_TRIM` JSON summary with ranges, candidate bytes,
-planned or completed commands, duration and error. On failure, candidate
+planned or completed commands, duration and error. The
+`command_total_ns` and `command_max_ns` fields measure AHCI submission
+and completion for attempted commands, including any failed attempt. On failure, candidate
 bytes may include ranges whose commands did not complete. Successful dry
 runs report zero submitted commands.
 
@@ -53,7 +55,9 @@ The AHCI driver requires IDENTIFY word 169 bit 0. It respects a reported
 word 105 limit and uses one 512-byte payload block when the limit is
 unspecified. Each non-queued DATA SET MANAGEMENT command uses feature
 TRIM, and each entry holds a 48-bit LBA and at most 65,535 sectors.
-Unused entries are zero padded. Verification relies on preservation of
+Unused entries are zero padded. DSM waits use the existing 30-second
+completion deadline for flushes. Ordinary data transfers keep the 2-second
+deadline. Verification relies on preservation of
 live data and discard accounting, independent of reads from discarded LBAs.
 
 ## Verification and rollout
@@ -66,19 +70,24 @@ These run alongside the ordinary pair check. The fixture deletes a seeded
 file, verifies live file hashes, measures qcow2 allocation, and checks GPT,
 FAT and ext2 after a clean shutdown.
 
-The `dell-ssd-trim-v3` pair built from `e41edd69` passed the normal
-guarded recovery-to-desktop check. Both TRIM modes passed on disposable
-QEMU/KVM images using that pair's kernel. They found 62,607,360 candidate
-bytes. Dry-run issued zero commands and left 70,975,488 bytes mapped.
-The explicit run completed one command and reduced mapped data to
-58,589,184 bytes, a reduction of 12,386,304 bytes (11.8 MiB). Ten live
-file hashes matched in each fixture. GPT checks, FAT fsck and offline
-ext2 fsck passed after checked shutdown. A host concurrency fixture
-also verified that the boot lease refuses ordinary writes and writes
-from the future desktop adapter while the range emitter is outstanding.
+The `dell-ssd-trim-v4` pair passed its normal guarded recovery-to-desktop
+check. The enlarged disposable fixture uses a 512 MiB ext2 partition and
+seeds 320 MiB of deleted data with live files interleaved. The dry run
+found 83 ranges across four block groups, totaling 530,321,408 bytes. It
+planned six commands, issued zero, and changed no qcow2 allocation.
+The explicit run completed six DSM commands and reclaimed 315 MiB of mapped
+qcow2 data. AHCI command time was 52.2 ms total and 14.9 ms for the longest
+command. These are emulator measurements. All 89 live file hashes matched
+in both modes, and GPT checks, FAT fsck and offline ext2 fsck passed after
+checked shutdown.
 
-Receipts are in the worktree under `build/dell/pair-trim-v3/qemu-check`,
-`build/dell/trim-dry-v3` and `build/dell/trim-run-v3`.
+A host concurrency fixture verified that the boot lease refuses ordinary
+writes and writes from the future desktop adapter while the range emitter
+is outstanding. The AHCI sequence test checks that DSM selects the extended
+wait and still propagates a timeout.
+
+Receipts are in the worktree under `build/dell/pair-trim-v4/qemu-check`,
+`build/dell/trim-dry-v4` and `build/dell/trim-run-v4`.
 
 For a future physical rollout, first confirm the Dell's IDENTIFY support.
 Prepare a temporary dry-run pair and review its absolute sector ranges

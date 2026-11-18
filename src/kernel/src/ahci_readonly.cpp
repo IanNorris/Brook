@@ -25,6 +25,7 @@
 #include "scheduler.h"
 #include "spinlock.h"
 #include "tsc_clock.h"
+#include "rtc.h"
 #include "smp.h"
 #include "serial.h"
 #include "string.h"
@@ -171,7 +172,7 @@ struct PortIo {
         }
         return false;
     }
-    bool waitClearFlush(uint32_t offset,uint32_t mask) {
+    bool waitClearLong(uint32_t offset,uint32_t mask) {
         if(offset==CI && mask==1u && !PanicIo())return waitCommand(30000);
         const uint64_t start=ApicTickCount();
         const uint64_t limit=
@@ -342,7 +343,8 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
         auto* prd=reinterpret_cast<Prdt*>(dma+tableOffset+128);
         prd->low=plan.dmaLow;prd->high=plan.dmaHigh;prd->byteCountMinusOne=plan.byteCountMinusOne;
     }
-    const auto result=isFlush ? SubmitNoData(io) : Submit(io,expected);
+    const auto result=isFlush ? SubmitNoData(io) :
+        isTrim ? Submit<true>(io,expected) : Submit(io,expected);
     if(result!=Result::Ok) { Quarantine("AHCI command failed or timed out");return false; }
     const uint8_t* d2h=dma+fisOffset+0x40;
     if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
@@ -763,7 +765,7 @@ uint16_t AhciTrimPayloadLimit(Device* parent) {
 }
 
 int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
-                  uint32_t count, bool submit, uint32_t& commands) {
+                  uint32_t count, bool submit, AhciTrimStats& stats) {
     const uint16_t limit=AhciTrimPayloadLimit(parent);
     if(!limit)return -95;
     if(!ranges || !count || !TrimRangeInside(partition,{0,status.sectors}))return -22;
@@ -782,12 +784,17 @@ int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
                     return false;
                 }
                 memcpy(dma+dataOffset,payload,sizeof(payload));
-                if(!Run(plan,sizeof(payload))) {
+                const uint64_t started=RtcNowNs();
+                const bool completed=Run(plan,sizeof(payload));
+                const uint64_t elapsed=RtcNowNs()-started;
+                stats.commandTotalNs+=elapsed;
+                if(elapsed>stats.commandMaxNs)stats.commandMaxNs=elapsed;
+                if(!completed) {
                     error=-5;
                     return false;
                 }
             }
-            ++commands;
+            ++stats.commands;
             return true;
         });
     return ok?0:error;

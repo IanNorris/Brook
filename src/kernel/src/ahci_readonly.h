@@ -34,8 +34,12 @@ Device* AhciWriteAdmittedDevice();
 // Internal guarded pre-mount path only. The caller must own the boot write
 // lease, validate filesystem exclusions and keep the allocator unpublished.
 uint16_t AhciTrimPayloadLimit(Device* parent);
+struct AhciTrimStats {
+    uint32_t commands = 0;
+    uint64_t commandTotalNs = 0, commandMaxNs = 0;
+};
 int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
-                  uint32_t count, bool submit, uint32_t& commands);
+                  uint32_t count, bool submit, AhciTrimStats& stats);
 
 #if defined(BROOK_SSD_INSTALLER)
 Device* AhciPhysicalInstallDevice();

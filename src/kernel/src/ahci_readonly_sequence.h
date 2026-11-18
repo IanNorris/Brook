@@ -59,11 +59,13 @@ template<class Io> bool Quiesce(Io& io) {
 
 // The caller prepared slot zero and holds its sleepable serialization lock.
 // Io::transferred reads PRDBC after the completion fence.
-template<class Io> Result Submit(Io& io, uint32_t expectedBytes) {
+template<bool LongTimeout = false, class Io> Result Submit(Io& io, uint32_t expectedBytes) {
     if(!expectedBytes || io.read(CI) || io.read(SACT))return Result::Busy;
     if(io.read(TFD)&(0x80u|0x08u))return Result::DeviceBusy;
     io.write(IS,0xffffffffu);io.fence();io.write(CI,1);
-    if(!io.waitClear(CI,1))return Result::Timeout;
+    if constexpr (LongTimeout) {
+        if(!io.waitClearLong(CI,1))return Result::Timeout;
+    } else if(!io.waitClear(CI,1))return Result::Timeout;
     io.fence();
     if((io.read(IS)&ERROR_MASK) || (io.read(TFD)&1u))return Result::DeviceError;
     if(io.transferred()!=expectedBytes)return Result::ShortTransfer;
@@ -83,7 +85,7 @@ template<class Io> Result SubmitNoData(Io& io) {
     const uint32_t cleared=io.read(IS);
     if(cleared==0xffffffffu || (cleared&1u))return Result::DeviceError;
     io.write(CI,1);
-    if(!io.waitClearFlush(CI,1))return Result::Timeout;
+    if(!io.waitClearLong(CI,1))return Result::Timeout;
     io.fence();
     const uint32_t completed=io.read(IS),task=io.read(TFD),engine=io.read(CMD);
     // A newly received device-to-host register FIS proves that a no-data
