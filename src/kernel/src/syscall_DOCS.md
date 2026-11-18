@@ -258,10 +258,12 @@ struct TimerFdData {
 ### EpollInstance
 ```cpp
 struct EpollInstance {
-    EpollEntry entries[EPOLL_MAX_FDS]; // 64 max watched fds
+    KMutex lock;                        // per-instance leaf lock (entries/count/ctlGeneration)
+    EpollEntry entries[EPOLL_MAX_FDS];  // MAX_FDS watched fds
     int count;
     volatile uint32_t refCount;
     Process* waiter;
+    uint64_t ctlGeneration;
 };
 ```
 

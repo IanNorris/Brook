@@ -60,14 +60,66 @@ static constexpr uint32_t EPOLLET      = (1u << 31); // eventfd notifications; o
 static constexpr int EPOLL_CTL_DEL = 2;
 static constexpr int EPOLL_CTL_MOD = 3;
 
-// Serialize interest-list mutation and traversals, including graph validation.
-// Never acquired by fd finalization, and never held across a userspace wait.
+// Locking
+// -------
+// EpollInstance::lock (per instance) protects that instance's entries[],
+// count and ctlGeneration. It is a leaf lock: while it is held the code only
+// copies or updates entries. It is never held together with another epoll
+// instance's lock, across a readiness check (watchReady/EpollLeafReady), a
+// pin (FdGetRef/FdPut), CopyToUser/CopyFromUser, an allocation or a sleep.
+//
+// Traversals (scan, nested readiness, waiter collection, graph validation)
+// copy an instance's entries in small chunks under its lock, drop the lock,
+// and evaluate the copies. Readiness is evaluated with no epoll lock held:
+// the walk pins every fd it dereferences (including nested epoll fds, whose
+// pin keeps the child EpollInstance alive), so ctl DEL, close or replacement
+// cannot free what the walk is looking at. A chunked view is not an atomic
+// snapshot of the whole interest list; readiness is inherently a racing
+// observation, and the one thing that needs a stable view, the edge-trigger
+// / oneshot commit after copyout, is guarded by ctlGeneration: any ctl on
+// the instance between the scan's first chunk and the commit skips the
+// commit (a possible spurious re-report, never a lost edge).
+//
+// g_epollGraphLock serialises only epoll_ctl(ADD) of an epoll fd, i.e. the
+// operations that create epoll-to-epoll edges, so that cycle/depth
+// validation of one new edge cannot race another new edge. It is taken
+// before any instance lock (order: g_epollGraphLock -> EpollInstance::lock),
+// and validation itself takes instance locks one at a time. DEL and MOD
+// never add edges, and scans/waits never take it, so unrelated epoll
+// instances never contend (the Dell gen 433 Xwayland/Steam convoy).
+// Edges that appear through fd-number reuse are not validated (as before);
+// walks tolerate cycles through their active/depth guards.
 static KMutex g_epollGraphLock{};
-struct EpollGraphGuard {
-    EpollGraphGuard() { KMutexLock(&g_epollGraphLock); }
-    ~EpollGraphGuard() { KMutexUnlock(&g_epollGraphLock); }
+struct EpollInstanceGuard {
+    EpollInstance* ep;
+    explicit EpollInstanceGuard(EpollInstance* instance) : ep(instance) { KMutexLock(&ep->lock); }
+    ~EpollInstanceGuard() { KMutexUnlock(&ep->lock); }
 };
 static constexpr int EPOLL_MAX_DEPTH = 5; // four epoll-to-epoll edges
+static constexpr int EPOLL_SNAPSHOT_CHUNK = 32; // entries copied per lock hold
+
+// Copy entries [start, start+capacity) (bounded by count) under the
+// instance lock. Returns the number copied, 0 past the end.
+static int EpollCopyEntries(EpollInstance* ep, int start, EpollEntry* out,
+                            int capacity, uint64_t* generation)
+{
+    EpollInstanceGuard guard(ep);
+    *generation = ep->ctlGeneration;
+    int end = ep->count < EPOLL_MAX_FDS ? ep->count : EPOLL_MAX_FDS;
+    int n = 0;
+    for (int i = start; i < end && n < capacity; ++i) out[n++] = ep->entries[i];
+    return n;
+}
+
+// Lazily drop an entry whose fd no longer exists, unless an epoll_ctl
+// touched the instance since the entry was copied (it may now name a
+// reopened fd that userspace re-registered with MOD).
+static void EpollForgetClosed(EpollInstance* ep, int index, int fd, uint64_t generation)
+{
+    EpollInstanceGuard guard(ep);
+    if (ep->ctlGeneration == generation && ep->entries[index].fd == fd)
+        ep->entries[index].fd = -1;
+}
 
 // Check if a single fd is ready given the requested events mask.
 // Returns the set of events that are actually ready.
@@ -158,7 +210,8 @@ struct EpollWalk {
     bool attempted[MAX_FDS];
     uint32_t masks[MAX_FDS];
     // Only selected events have delivery snapshots. Retained until copyout
-    // succeeds under the graph mutex; peeking never changes a watch.
+    // succeeds, then committed under the instance lock; peeking never
+    // changes a watch.
     struct Delivery { int index; EventFdSnapshot eventFd; } deliveries[MAX_FDS];
     struct Node {
         EpollInstance* ep;
@@ -168,6 +221,14 @@ struct EpollWalk {
         int height;
     } nodes[EPOLL_MAX_FDS + 1];
     int count;
+    // Per-depth entry copies: forEach at depth d only uses chunk[d], so a
+    // nested visit (depth d+1) never overwrites the chunk its caller is
+    // iterating. Written before read; never needs zeroing.
+    EpollEntry chunk[EPOLL_MAX_DEPTH][EPOLL_SNAPSHOT_CHUNK];
+    // epoll_ctl(ADD) validates the edge it is about to insert before
+    // publishing it: height() treats it as an extra entry of edgeParent.
+    EpollInstance* edgeParent;
+    EpollInstance* edgeChild;
     FdEntry* pin(int fd) {
         if (fd < 0 || fd >= EPOLL_MAX_FDS) return nullptr;
         if (!attempted[fd]) {
@@ -181,20 +242,35 @@ struct EpollWalk {
         if (count >= EPOLL_MAX_FDS + 1) return nullptr;
         auto* n = &nodes[count++]; *n = Node{}; n->ep = ep; return n;
     }
+    // Visit each live, pinnable entry of ep with no epoll lock held (see
+    // Locking). visit(entry, slot) returns true to stop; forEach returns
+    // whether it stopped early. *firstGeneration, if given, is the
+    // ctlGeneration observed with the first chunk.
+    template <typename Visit>
+    bool forEach(EpollInstance* ep, int depth, Visit&& visit, uint64_t* firstGeneration = nullptr) {
+        EpollEntry* buffer = chunk[depth];
+        for (int base = 0;; base += EPOLL_SNAPSHOT_CHUNK) {
+            uint64_t generation = 0;
+            const int n = EpollCopyEntries(ep, base, buffer, EPOLL_SNAPSHOT_CHUNK, &generation);
+            if (firstGeneration && base == 0) *firstGeneration = generation;
+            for (int k = 0; k < n; ++k) {
+                const EpollEntry& e = buffer[k];
+                if (e.fd < 0) continue;
+                if (!pin(e.fd)) { EpollForgetClosed(ep, base + k, e.fd, generation); continue; }
+                if (visit(e, base + k)) return true;
+            }
+            if (n < EPOLL_SNAPSHOT_CHUNK) return false;
+        }
+    }
     bool any(EpollInstance* ep, int depth = 0) {
         if (depth >= EPOLL_MAX_DEPTH) return false;
         auto* n = node(ep);
         if (!n || n->active) return false; // guard fd-reuse-created cycles too
         if (n->ready[depth]) return n->ready[depth] == 2;
         n->active = true;
-        bool result = false;
-        for (int i = 0; i < ep->count && !result; i++) {
-            auto e = ep->entries[i];
-            if (e.fd >= 0) {
-                if (!pin(e.fd)) { ep->entries[i].fd = -1; continue; }
-                result = watchReady(e, depth);
-            }
-        }
+        const bool result = forEach(ep, depth, [&](const EpollEntry& e, int) {
+            return watchReady(e, depth) != 0;
+        });
         n->active = false; n->ready[depth] = result ? 2 : 1;
         return result;
     }
@@ -227,14 +303,14 @@ struct EpollWalk {
         auto* n = node(ep);
         if (!n || n->collectedDepth >= EPOLL_MAX_DEPTH - depth) return;
         n->collectedDepth = EPOLL_MAX_DEPTH - depth;
-        for (int i = 0; i < ep->count; i++) {
-            auto e = ep->entries[i];
-            auto* fde = pin(e.fd);
-            if (!fde || !fde->handle) continue;
+        forEach(ep, depth, [&](const EpollEntry& e, int) {
+            auto* fde = pins[e.fd];
+            if (!fde->handle) return false;
             if (fde->type == FdType::EpollFd) {
                 if (e.events & EPOLLIN) collect(static_cast<EpollInstance*>(fde->handle), depth + 1);
             } else masks[e.fd] |= e.events | EPOLLERR | EPOLLHUP;
-        }
+            return false;
+        });
     }
     // All edges participate in cycle/depth validation, regardless of masks.
     int height(EpollInstance* ep, int depth = 0) {
@@ -244,13 +320,17 @@ struct EpollWalk {
         if (n->height) return n->height;
         n->active = true;
         int h = 1;
-        for (int i = 0; i < ep->count; i++) {
-            auto* fde = pin(ep->entries[i].fd);
-            if (!fde || fde->type != FdType::EpollFd || !fde->handle) continue;
-            int child = height(static_cast<EpollInstance*>(fde->handle), depth + 1) + 1;
-            if (child > h) h = child;
-            if (h > EPOLL_MAX_DEPTH) break;
-        }
+        auto edge = [&](EpollInstance* child) {
+            const int candidate = height(child, depth + 1) + 1;
+            if (candidate > h) h = candidate;
+            return h > EPOLL_MAX_DEPTH;
+        };
+        const bool exceeded = forEach(ep, depth, [&](const EpollEntry& e, int) {
+            auto* fde = pins[e.fd];
+            if (fde->type != FdType::EpollFd || !fde->handle) return false;
+            return edge(static_cast<EpollInstance*>(fde->handle));
+        });
+        if (!exceeded && ep == edgeParent && edgeChild) edge(edgeChild);
         n->active = false; n->height = h; return h;
     }
     // node() initialises each node it hands out, so forgetting the memo is
@@ -269,6 +349,7 @@ struct EpollWalk {
         __builtin_memset(attempted, 0, sizeof(attempted));
         __builtin_memset(masks, 0, sizeof(masks));
         count = 0;
+        edgeParent = edgeChild = nullptr;
     }
 };
 // Reuse free scratch objects on hot epoll paths. Sleepers retain their own
@@ -328,14 +409,9 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
                           uint64_t eventsAddr) {
     int n = 0;
     uint64_t ctlGeneration = 0;
-    {
-    EpollGraphGuard guard;
     walk->clearMemo();
-    ctlGeneration = ep->ctlGeneration;
-    for (int i = 0; i < ep->count && n < maxevents; i++) {
-        auto e = ep->entries[i];
-        if (e.fd < 0) continue;
-        if (!walk->pin(e.fd)) { ep->entries[i].fd = -1; continue; }
+    // No epoll lock is held while readiness is evaluated (see Locking).
+    walk->forEach(ep, 0, [&](const EpollEntry& e, int i) {
         EventFdSnapshot captured{};
         uint32_t ready = walk->watchReady(e, 0, &captured);
         if (ready) {
@@ -354,18 +430,17 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
                 __atomic_store_n(&diag->counters[EpLastReturned], ready, __ATOMIC_RELAXED);
             }
         }
-    }
-    }
-    // Copy out without the global graph mutex. CopyToUser takes the caller's
-    // address-space mutation lock per page and may fault; holding the graph
-    // lock across it made every epoll user in the system wait behind one
-    // contended process (Dell gen 427, Torchlight II: waylandd spent ~6 s of
-    // 10 s blocked on this mutex). The walk keeps the watched fds pinned.
+        return n >= maxevents;
+    }, &ctlGeneration);
+    // Copy out with no epoll lock. CopyToUser takes the caller's
+    // address-space mutation lock per page and may fault (Dell gen 427:
+    // holding the old global graph lock across it convoyed waylandd).
+    // The walk keeps the watched fds pinned.
     if (n && !CopyToUser(eventsAddr, events, sizeof(EpollEvent) * n)) return -EFAULT;
     bool commit = false;
     for (int i = 0; i < n && !commit; ++i) commit = walk->deliveries[i].eventFd.identity != 0;
     if (!commit) return n;
-    EpollGraphGuard guard;
+    EpollInstanceGuard guard(ep);
     // An epoll_ctl in between may have replaced an entry. Skipping the commit
     // can only re-report an edge (a spurious wakeup), never lose one.
     if (ep->ctlGeneration != ctlGeneration) return n;
@@ -384,7 +459,6 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
 int EpollPollReady(Process* proc, EpollInstance* ep) {
     EpollWalkOwner state(proc);
     if (!state.walk) return -ENOMEM;
-    EpollGraphGuard guard;
     return state.walk->any(ep) ? 1 : 0;
 }
 
@@ -395,6 +469,7 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
 
     auto* ep = static_cast<EpollInstance*>(kmalloc(sizeof(EpollInstance)));
     if (!ep) return -ENOMEM;
+    KMutexInit(&ep->lock);
     for (int i = 0; i < EPOLL_MAX_FDS; i++) ep->entries[i] = {-1, 0, 0};
     ep->count = 0;
     ep->refCount = 1;
@@ -446,9 +521,41 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     if ((watchref->type == FdType::Vnode && !FdNamedFifo(watchref.get())) ||
         watchref->type == FdType::MemFd || watchref->type == FdType::SyntheticMem)
         return -EPERM;
-    EpollWalkOwner state(proc);
-    if (!state.walk) return -ENOMEM;
-    EpollGraphGuard guard;
+    // Only a new epoll-to-epoll edge needs the graph lock and a walk: it is
+    // validated (with the edge treated as present) before it is published,
+    // so scans never observe an invalid edge and nothing has to be undone.
+    // Edges are only ever added here, under g_epollGraphLock, so the graph
+    // cannot grow between this validation and the insertion below.
+    const bool newEdge = op == EPOLL_CTL_ADD && watchref->type == FdType::EpollFd;
+    struct OptionalGraphGuard {
+        bool held;
+        explicit OptionalGraphGuard(bool take) : held(take) { if (held) KMutexLock(&g_epollGraphLock); }
+        ~OptionalGraphGuard() { if (held) KMutexUnlock(&g_epollGraphLock); }
+    } graph(newEdge);
+    if (newEdge) {
+        bool exists = false;
+        {
+            EpollInstanceGuard guard(ep);
+            for (int i = 0; i < EPOLL_MAX_FDS && !exists; i++)
+                exists = ep->entries[i].fd == static_cast<int>(watchfd);
+        }
+        if (!exists) { // EEXIST takes precedence; it is reported below.
+            EpollWalkOwner state(proc);
+            if (!state.walk) return -ENOMEM;
+            auto* walk = state.walk;
+            walk->edgeParent = ep;
+            walk->edgeChild = static_cast<EpollInstance*>(watchref->handle);
+            // Include ancestors: adding at the bottom can also exceed the limit.
+            bool valid = walk->height(ep) <= EPOLL_MAX_DEPTH;
+            for (int fd = 0; fd < EPOLL_MAX_FDS && valid; fd++) {
+                auto* fde = walk->pin(fd);
+                if (fde && fde->type == FdType::EpollFd && fde->handle)
+                    valid = walk->height(static_cast<EpollInstance*>(fde->handle)) <= EPOLL_MAX_DEPTH;
+            }
+            if (!valid) return -ELOOP;
+        }
+    }
+    EpollInstanceGuard guard(ep);
     ++ep->ctlGeneration;
     int existing = -1, free = -1;
     for (int i = 0; i < EPOLL_MAX_FDS; i++) {
@@ -474,8 +581,6 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     }
     int slot = op == EPOLL_CTL_MOD ? existing : free;
     if (slot < 0) return -ENOMEM;
-    const int oldCount = ep->count;
-    const auto old = ep->entries[slot];
     ep->entries[slot] = {static_cast<int>(watchfd), ev.events, ev.data.u64};
 #if defined(BROOK_EPOLL_TARGET_DIAGNOSTICS)
     if(EpollDiagEnabled()) {
@@ -485,16 +590,6 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     }
 #endif
     if (slot >= ep->count) ep->count = slot + 1;
-    if (op == EPOLL_CTL_ADD && watchref->type == FdType::EpollFd) {
-        // Include ancestors: adding at the bottom can also exceed the limit.
-        bool valid = state.walk->height(ep) <= EPOLL_MAX_DEPTH;
-        for (int fd = 0; fd < EPOLL_MAX_FDS && valid; fd++) {
-            auto* fde = state.walk->pin(fd);
-            if (fde && fde->type == FdType::EpollFd && fde->handle)
-                valid = state.walk->height(static_cast<EpollInstance*>(fde->handle)) <= EPOLL_MAX_DEPTH;
-        }
-        if (!valid) { ep->entries[slot] = old; ep->count = oldCount; return -ELOOP; }
-    }
     return 0;
 }
 
@@ -514,11 +609,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         if (n > 0) { EpollDiagAdd(diag, firstScan ? EpInitialReady : EpLaterReady); return n; }
         if (timeout_ms == 0) { EpollDiagAdd(diag, EpTimeouts); return 0; }
         firstScan = false;
-        {
-            EpollGraphGuard guard;
-            walk->clearMemo();
-            walk->collect(ep);
-        }
+        walk->clearMemo();
+        walk->collect(ep);
         NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup namedWaiters;bool namedWaitFailed=false;
@@ -588,7 +680,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         if(namedWaitFailed) {unregisterWaiters();return -ENOMEM;}
         // A fence retired since the snapshot: rescan without sleeping.
         const bool fenceRetired = syncWait.Arm();
-        // The graph mutex can sleep. Arm the timeout only after this scan:
+        // The instance mutex can sleep. Arm the timeout only after this scan:
         // SchedulerUnblock clears wakeupTick when granting a contended mutex.
         n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
         if (!n && !fenceRetired && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
