@@ -359,6 +359,7 @@ add_executable(kernel
     src/compositor.cpp
     src/compositor_scene.cpp
     src/window.cpp
+    src/chrome_raster.cpp
     src/terminal.cpp
     src/rtc.cpp
     src/kvmclock.cpp

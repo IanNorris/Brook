@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../shared/brook_theme.h"
 
 namespace brook {
 constexpr uint32_t CursorCapacity = 64;
@@ -43,7 +44,7 @@ inline void ComposeCursor(const CursorImage& source, CursorImage& frame,
     for (unsigned dot = 0; dot < 8; ++dot) {
         const uint32_t x = static_cast<uint32_t>(static_cast<int>(cx) + dx[dot]);
         const uint32_t y = static_cast<uint32_t>(static_cast<int>(cy) + dy[dot]);
-        const uint32_t color = dot == phase ? (accent | 0xff000000u) : 0xff53677bu;
+        const uint32_t color = dot == phase ? (accent | 0xff000000u) : (BROOK_CURSOR_BUSY_IDLE | 0xff000000u);
         for (uint32_t yy = 0; yy < 2; ++yy)
             for (uint32_t xx = 0; xx < 2; ++xx)
                 frame.pixels[(y + yy) * CursorCapacity + x + xx] = color;

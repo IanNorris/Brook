@@ -626,8 +626,8 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
             uint16_t displayH = static_cast<uint16_t>(vfbH * upscale);
 
             // Set up the VFB at native resolution
-            CompositorSetupProcess(proc, winX + WmMetric(WM_BORDER_WIDTH),
-                                   winY + WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH),
+            CompositorSetupProcess(proc, winX + static_cast<uint32_t>(WmDesktopMetrics().clientOffsetX()),
+                                   winY + static_cast<uint32_t>(WmDesktopMetrics().clientOffsetY()),
                                    vfbW, vfbH, 1);
 
             WmCreateWindow(proc, winX, winY, displayW, displayH, proc->name, upscale);
@@ -1112,8 +1112,8 @@ static int ExecCommand(int argc, const char* const* argv)
 
             // Set up compositor dest coords — terminal VFB is already set by TerminalCreate.
             // Do NOT call CompositorSetupProcess (it would allocate a new VFB).
-            t->child->fbDestX = winX + WmMetric(WM_BORDER_WIDTH);
-            t->child->fbDestY = winY + WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH);
+            t->child->fbDestX = winX + static_cast<uint32_t>(WmDesktopMetrics().clientOffsetX());
+            t->child->fbDestY = winY + static_cast<uint32_t>(WmDesktopMetrics().clientOffsetY());
             t->child->fbScale = 1;
             ProcessFramebufferMarkDirty(t->child);
 

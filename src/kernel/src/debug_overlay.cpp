@@ -280,7 +280,7 @@ static void KernelConsoleThread(void* /*arg*/)
     if(initialW>backingW)initialW=backingW;
     if(initialH>backingH)initialH=backingH;
     const auto initial=ConsoleFitInitial(backingW,WmDesktopHeight(backingH),initialW,initialH,
-                                         WmMetric(WM_BORDER_WIDTH),WmMetric(WM_TITLE_BAR_HEIGHT));
+                                         static_cast<uint32_t>(WmDesktopMetrics().border()),static_cast<uint32_t>(WmDesktopMetrics().title()));
     if(!initial.width || !initial.height) { SerialPuts("KCONSOLE: display too small\n"); return; }
     int consoleIdx = WmCreateWindow(self, static_cast<int16_t>(initial.x), static_cast<int16_t>(initial.y),
                    static_cast<uint16_t>(initial.width),

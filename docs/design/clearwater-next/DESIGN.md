@@ -1204,6 +1204,15 @@ Steps 1 to 5 touch only the window manager's hit test, constants and chrome
 painting. Steps 6 to 8 are where a user-mode shell (milestone T3) would pay off,
 so decide before step 6 whether to build them in the kernel or wait for it.
 
+**Decided (Ian, 15 November):**
+- Launcher organisation waits for the user-mode shell process. It is not
+  built in the kernel painter first.
+- Glass on the Dell is decided by measurement, once the Vulkan renderer can
+  blur.
+
+The compositor work that leads there is in
+[compositor-refactor-plan.md](compositor-refactor-plan.md).
+
 ## Native implementation, in priority order
 
 The full change list, with costs.

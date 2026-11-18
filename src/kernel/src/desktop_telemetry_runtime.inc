@@ -83,7 +83,7 @@ static void DrawMetricGraph(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_
     for(unsigned i=0;i<shown;++i){const auto& v=history.samples[(history.next+128-shown+i)%128];
         if(now<v.tick || now-v.tick>10000)continue;
         unsigned value=v.ms>100?100:v.ms;int bar=static_cast<uint64_t>(value)*height/100;if(!bar)bar=1;
-        WmFillRect(pixels,stride,sw,sh,x+width-shown+i,y+height-bar,1,bar,0xff68acff);
+        WmFillRect(pixels,stride,sw,sh,x+width-shown+i,y+height-bar,1,bar,0xff000000u|WmCurrentPalette().accent);
     }
 }
 static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,
@@ -94,7 +94,7 @@ static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint3
     auto text=[&](int x,int y,const char* v,uint32_t color){WmRenderString(pixels,stride,sw,sh,x,y,v,color,p.taskbar,r.x+r.w-x);};
     if(kind<2){
         unsigned percent=kind?g_desktopStats.memoryPercent:g_desktopStats.cpuPercent;if(percent>100)percent=100;
-        const uint32_t color=percent>=90?0xe06c75:percent>=70?0xe5bf69:0x63b782;
+        const uint32_t color=percent>=90?WmCurrentPalette().hot:percent>=70?WmCurrentPalette().warm:WmCurrentPalette().ok;
         text(r.x,top,kind?"MEM":"CPU",p.secondaryText);
         WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w,line,WmMaterialColor(p.taskButton));
         WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w*percent/100,line,color|0xff000000u);
@@ -165,14 +165,14 @@ static bool WmBuildIdLayout(uint32_t sw,uint32_t sh,WmBuildIdText& text,WmRect& 
 // of sw x sh pixels (a full frame, or one row for the span path).
 static void WmDrawBuildIdText(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,int x,int y,
                           const WmBuildIdText& text,const WmRect* clip) {
-    WmRenderString(pixels,stride,sw,sh,x,y,text.main,0xa4b2c7,0x172335,0,clip);
+    WmRenderString(pixels,stride,sw,sh,x,y,text.main,WmCurrentPalette().badgeText,WmCurrentPalette().badgeFill,0,clip);
     if(!text.suffix)return;
     const int dotX=x+text.mainWidth+text.dotGap,dotY=y+(WmDesktopFont().lineHeight-text.dot)/2;
     int l=dotX,t=dotY,r=dotX+text.dot,b=dotY+text.dot;
     if(clip){if(l<clip->x)l=clip->x;if(t<clip->y)t=clip->y;
         if(r>clip->x+clip->w)r=clip->x+clip->w;if(b>clip->y+clip->h)b=clip->y+clip->h;}
-    if(r>l && b>t)WmFillRect(pixels,stride,sw,sh,l,t,r-l,b-t,0xa4b2c7);
-    WmRenderString(pixels,stride,sw,sh,dotX+text.dot+text.dotGap,y,text.suffix,0xa4b2c7,0x172335,0,clip);
+    if(r>l && b>t)WmFillRect(pixels,stride,sw,sh,l,t,r-l,b-t,WmCurrentPalette().badgeText);
+    WmRenderString(pixels,stride,sw,sh,dotX+text.dot+text.dotGap,y,text.suffix,WmCurrentPalette().badgeText,WmCurrentPalette().badgeFill,0,clip);
 }
 void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect* clip) {
     WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect))return;
@@ -181,7 +181,7 @@ void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,cons
     const int right=clip && clip->x+clip->w<x+width?clip->x+clip->w:x+width;
     const int bottom=clip && clip->y+clip->h<y+height?clip->y+clip->h:y+height;
     if(right<=left||bottom<=top)return;
-    WmFillRect(pixels,stride,sw,sh,left,top,right-left,bottom-top,0x172335);
+    WmFillRect(pixels,stride,sw,sh,left,top,right-left,bottom-top,WmCurrentPalette().badgeFill);
     WmDrawBuildIdText(pixels,stride,sw,sh,x+WmMetric(7),y+WmMetric(3),text,clip);
 }
 // Draw into one already-populated screen span, using the same glyph renderer
@@ -190,7 +190,7 @@ void WmDrawBuildIdSpan(uint32_t* pixels,uint32_t left,uint32_t count,uint32_t ro
     if(!pixels || !count || left>=sw || count>sw-left || row>=sh)return;
     WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect) ||
         int64_t(row)<rect.y || int64_t(row)>=int64_t(rect.y)+rect.h)return;
-    WmFillRect(pixels,count,count,1,rect.x-int(left),0,rect.w,1,0x172335);
+    WmFillRect(pixels,count,count,1,rect.x-int(left),0,rect.w,1,WmCurrentPalette().badgeFill);
     WmDrawBuildIdText(pixels,count,count,1,rect.x+int(WmMetric(7))-int(left),
                       rect.y+int(WmMetric(3))-int(row),text,nullptr);
 }
@@ -204,7 +204,7 @@ bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* w
 void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh) {
     int32_t x,y;uint32_t w,h;if(!WmBootSummaryRect(sw,sh,&x,&y,&w,&h))return;
     const auto& p=WmCurrentPalette();WmFillRect(pixels,stride,sw,sh,x,y,w,h,p.taskbar);
-    WmFillRect(pixels,stride,sw,sh,x,y,w,WmMetric(3),0x68acff);
+    WmFillRect(pixels,stride,sw,sh,x,y,w,WmMetric(3),WmCurrentPalette().accent);
     int py=y+WmMetric(11);const int line=WmDesktopFont().lineHeight;
     auto text=[&](const char* s,uint32_t color){WmRenderString(pixels,stride,sw,sh,x+WmMetric(12),py,s,color,p.taskbar,w-WmMetric(24));py+=line;};
     char number[16],row[96];

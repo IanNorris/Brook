@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../shared/brook_theme.h"
 namespace brook {
 // Pixel-centre circle coverage, shared by the decoration mask and backdrop.
 // Native scale is bounded to 100/150/200%.
@@ -81,7 +82,7 @@ struct ChromeMaterialCache {
             const uint32_t base=bases[focused],rimAlpha=focused?(alpha+255)/2:alpha;
             rims[focused][0]=(rimAlpha<<24)|ChromeMix(base,0xffffff,focused?184:0);
             rims[focused][1]=(rimAlpha<<24)|ChromeMix(base,0xffffff,focused?88:0);
-            rims[focused][2]=(alpha<<24)|ChromeMix(base,0x071526,focused?64:20);
+            rims[focused][2]=(alpha<<24)|ChromeMix(base,BROOK_CHROME_SHADE,focused?64:20);
             for(unsigned y=0;y<height;++y)
                 rows[focused][y]=(alpha<<24)|ChromeMix(base,ChromeTitleColor(base,y,height),focused?255:104);
         }
@@ -116,7 +117,7 @@ inline uint32_t ChromeShadowPixel(unsigned x,unsigned y) {
     static constexpr uint8_t opacity[]={136,113,92,73,56,42,30,21,14,9,5,3,2,1,0,0,0};
     unsigned alpha=distance<17?opacity[distance]:0;
     if(y<16)alpha=alpha*3/4;
-    return alpha?(alpha<<24)|0x071526:0;
+    return alpha?(alpha<<24)|BROOK_CHROME_SHADE:0;
 }
 static constexpr unsigned ChromeGlassWindowLimit=8,ChromeShadowWindowLimit=4;
 // 32 clients+four decoration strips; up to six rounded backdrop bands/window;

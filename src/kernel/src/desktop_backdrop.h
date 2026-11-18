@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../shared/brook_theme.h"
 
 namespace brook {
 // Render a horizontal span of the desktop's opaque wallpaper plane. The
@@ -14,12 +15,12 @@ inline void DesktopBackdropSpan(uint32_t* out,uint32_t left,uint32_t right,uint3
     const uint32_t height=wallpaperHeight<screenHeight?wallpaperHeight:screenHeight;
     const uint32_t x0=(screenWidth-width)/2,y0=(screenHeight-height)/2;
     if(!wallpaper || !width || !height || y<y0 || y-y0>=height || right<=x0 || left>=x0+width){
-        for(uint32_t x=left;x<right;++x)out[x-left]=0x00001a3a;
+        for(uint32_t x=left;x<right;++x)out[x-left]=BROOK_WALLPAPER_FALLBACK;
         return;
     }
     const uint32_t start=left>x0?left:x0,end=right<x0+width?right:x0+width;
-    for(uint32_t x=left;x<start;++x)out[x-left]=0x00001a3a;
+    for(uint32_t x=left;x<start;++x)out[x-left]=BROOK_WALLPAPER_FALLBACK;
     __builtin_memcpy(out+start-left,wallpaper+uint64_t(y-y0)*wallpaperWidth+start-x0,uint64_t(end-start)*4);
-    for(uint32_t x=end;x<right;++x)out[x-left]=0x00001a3a;
+    for(uint32_t x=end;x<right;++x)out[x-left]=BROOK_WALLPAPER_FALLBACK;
 }
 }

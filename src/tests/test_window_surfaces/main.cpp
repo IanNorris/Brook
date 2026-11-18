@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <initializer_list>
 #include "../../kernel/src/window.cpp"
+#include "../../kernel/src/chrome_raster.cpp"
+#include "../../kernel/src/desktop_shell_surfaces.h"
 #include "../../kernel/src/desktop_layers_export.h"
 #include "../../kernel/src/desktop_chrome_binding.h"
 #include "../../kernel/src/desktop_frame_scenes.h"
@@ -50,6 +52,11 @@ bool UserMappingBufferRead(MappingBacking* backing,uint64_t offset,void* out,uin
 }
 void AddressSpaceUnref(AddressSpaceState*) { std::abort(); }
 void CompositorRetireVfb(CompositorVfbAllocation*) { std::abort(); }
+// Shell-surface layout reads the clock, thermal state and boot summary age.
+uint64_t CompositorDesktopReadyTick() { return 0; }
+uint64_t RtcNow() { return 0; }
+char* RtcFormatTaskbar(char* buf,uint64_t,bool) { buf[0]='0';buf[1]=0;return buf; }
+bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
 }
 extern "C" void KernelPanic(const char*,...) { std::abort(); }
 
@@ -557,5 +564,55 @@ int main() {
     CHECK(!layers.count && backingA.references==1 && backingB.references==1);
     owner->fbBacking=nullptr;owner->fbVirtual=nullptr;window.vfbBacking=nullptr;
     std::free(owner);std::free(stranger);
+    // One shell-surface list for every compositor path: the taskbar first,
+    // then at most one popup in the shared slot, the boot summary last.
+    {
+        constexpr uint32_t sw=1024,sh=768;
+        auto kinds=[&](WmShellSurface (&s)[WM_SHELL_SURFACE_LIMIT]){
+            const uint32_t n=WmShellSurfaces(sw,sh,-1,-1,s);
+            CHECK(n>=1 && n<=WM_SHELL_SURFACE_LIMIT);
+            CHECK(s[0].kind==WmShellSurfaceKind::Taskbar && s[0].material && s[0].x==0 &&
+                  s[0].y==int32_t(WmDesktopHeight(sh)) && s[0].w==sw && s[0].h==sh-WmDesktopHeight(sh));
+            for(uint32_t i=1;i<n;++i)CHECK(s[i].kind!=WmShellSurfaceKind::Taskbar &&
+                (s[i].kind==WmShellSurfaceKind::BootSummary)==!s[i].material);
+            if(n>1 && s[n-1].kind!=WmShellSurfaceKind::BootSummary)CHECK(n==2);
+            return n;
+        };
+        WmShellSurface s[WM_SHELL_SURFACE_LIMIT];
+        g_launcherOpen=false;g_volumePopupOpen=false;
+        uint32_t n=kinds(s);
+        for(uint32_t i=1;i<n;++i)CHECK(s[i].kind==WmShellSurfaceKind::BootSummary);
+        g_volumePopupOpen=true;n=kinds(s);
+        CHECK(n>=2 && s[1].kind==WmShellSurfaceKind::VolumePopup);
+        int32_t x,y;uint32_t w,h;WmVolumePopupGetRect(sw,sh,&x,&y,&w,&h);
+        CHECK(s[1].x==x && s[1].y==y && s[1].w==w && s[1].h==h);
+        // The slot holds one popup even if both flags were ever set.
+        g_launcherOpen=true;n=kinds(s);
+        CHECK(n>=2 && s[1].kind==WmShellSurfaceKind::Launcher);
+        for(uint32_t i=2;i<n;++i)CHECK(s[i].kind==WmShellSurfaceKind::BootSummary);
+        g_launcherOpen=false;g_volumePopupOpen=false;
+    }
+    // One metrics source: the WM constants are DesktopMetrics' bases, and the
+    // client offset used outside the WM equals the WM's own arithmetic.
+    {
+        static_assert(WM_TITLE_BAR_HEIGHT==uint32_t(DesktopMetrics::TitleBase) &&
+                      WM_BORDER_WIDTH==uint32_t(DesktopMetrics::BorderBase) &&
+                      WM_BUTTON_WIDTH==uint32_t(DesktopMetrics::CaptionButtonBase) &&
+                      WM_TASKBAR_HEIGHT==uint32_t(DesktopMetrics::TaskbarBase),"WM metrics");
+        for(const auto* metrics:{&DesktopMetric100,&DesktopMetric150,&DesktopMetric200}){
+            g_desktopMetrics=metrics;
+            CHECK(uint32_t(metrics->clientOffsetX())==WmMetric(WM_BORDER_WIDTH));
+            CHECK(uint32_t(metrics->clientOffsetY())==WmMetric(WM_TITLE_BAR_HEIGHT)+WmMetric(WM_BORDER_WIDTH));
+            CHECK(uint32_t(metrics->taskbar())==WmMetric(WM_TASKBAR_HEIGHT));
+        }
+        g_desktopMetrics=&DesktopMetric100;
+    }
+    // Chrome tokens: until the Clearwater hue derivation, every theme keeps
+    // the values the painters previously hard-coded (no visual change).
+    for(uint32_t id=0;id<BROOK_THEME_COUNT;++id){
+        const auto& p=*brook_theme_palette(id);
+        CHECK(p.accent==0x0068ACFFu && p.halo==0x00071526u && p.ok==0x0063B782u && p.warm==0x00E5BF69u &&
+              p.hot==0x00E06C75u && p.badgeText==0x00A4B2C7u && p.badgeFill==0x00172335u);
+    }
     std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry and chrome");
 }
