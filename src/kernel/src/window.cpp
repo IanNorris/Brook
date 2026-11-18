@@ -3289,7 +3289,7 @@ static void LauncherPowerButton(uint32_t* buf, uint32_t stride, uint32_t sw, uin
     const WmRect face{r.x, r.y + inset, r.w, r.h - 2 * inset};
     if (focused) {
         const int ring = static_cast<int>(WmMetric(2));
-        WmMaterialRect(buf, stride, sw, sh, {face.x - ring, face.y - ring, face.w + 2 * ring, face.h + 2 * ring}, 0x68acff);
+        WmMaterialRect(buf, stride, sw, sh, {face.x - ring, face.y - ring, face.w + 2 * ring, face.h + 2 * ring}, WmCurrentPalette().accent);
     }
     WmMaterialRect(buf, stride, sw, sh, face, bg);
     const int textW = WmTextWidth(label);
