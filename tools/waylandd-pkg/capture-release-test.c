@@ -597,6 +597,71 @@ static void check_gpu_window_scaled(void)
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
 }
+/* A rootless Xwayland window (role 4, no xdg_toplevel) paired with its
+ * mapped X window is offered to the renderer like a native toplevel:
+ * glamor's DMA-BUF window buffer (or a Present flip's pixmap) becomes the
+ * window's GPU source instead of a CPU readback into the VFB. An unpaired
+ * surface and a buffer still waiting for a native resize stay on the CPU
+ * path. */
+static void check_gpu_window_xwayland(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *first=retained_test_buffer(client,2);
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    struct brook_xwindow xw={0};xw.state.flags=BXWM_MAPPED;xw.state.serial=9;xw.state.width=xw.state.height=1;
+    xw.surface=&root;xw.native_valid=1;
+    root.role=4;root.xwindow=&xw;root.xwayland_serial=9;root.xwayland_generation=g_xwayland_generation;g_xwm_failed=0;
+    uint32_t vfb=0;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
+    root.scene_disabled=1;g_surfaces=&root;
+    char path[]="/tmp/brook-xwl-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    /* Paired and mapped: one GPU offer, no CPU copy, released after SAFE. */
+    const uint64_t offers=g_gpu_xwayland_offers,noRoot=g_gpu_offer_no_root,ready=g_intel_ready;
+    surface_attach(client,root.resource,first,0,0);surface_commit(client,root.resource);
+    struct brook_view *view=root.tree.current->value;struct brook_buffer *held=view->image->source;++held->refs;
+    intel_pending_poll();
+    assert(view->image->offer_state==1 && g_gpu_xwayland_offers==offers+1 && g_gpu_offer_no_root==noRoot);
+    struct BrookGpuWindowPacket offer={0};int fds[2];assert(brook_gpu_window_receive(channel[1],&offer,fds)==1);
+    assert(offer.type==BROOK_GPU_WINDOW_OFFER && offer.identity.window==1 && offer.width==1 && offer.fourcc==0x34325258);
+    close(fds[0]);close(fds[1]);
+    assert(brook_gpu_window_send_safe(channel[1],&offer.identity)==1);
+    intel_pending_poll();assert(!g_intel_pending_count && !held->uses);(void)ready;
+    wl_display_flush_clients(display);assert(count_events(clientSockets[1],2,WL_BUFFER_RELEASE)==1);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
+    /* A native resize to 2x2 is pending: the 1x1 buffer is not offered. */
+    const uint64_t waits=g_gpu_xwayland_resize_wait;xw.target_width=xw.target_height=2;
+    struct wl_resource *second=retained_test_buffer(client,4);
+    surface_attach(client,root.resource,second,0,0);surface_commit(client,root.resource);
+    view=root.tree.current->value;held=view->image->source;++held->refs;
+    intel_pending_poll();
+    assert(g_gpu_xwayland_resize_wait==waits+1 && g_gpu_xwayland_offers==offers+1 && view->image->offer_state==4);
+    assert(brook_gpu_window_receive(channel[1],&offer,fds)==0);
+    intel_pending_poll();assert(!g_intel_pending_count);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
+    xw.target_width=xw.target_height=0;
+    /* Unpaired (serial mismatch): not a window root, so no offer. */
+    xw.state.serial=10;
+    struct wl_resource *third=retained_test_buffer(client,5);
+    surface_attach(client,root.resource,third,0,0);surface_commit(client,root.resource);
+    view=root.tree.current->value;held=view->image->source;++held->refs;
+    intel_pending_poll();
+    assert(g_gpu_offer_no_root==noRoot+1 && g_gpu_xwayland_offers==offers+1);
+    assert(brook_gpu_window_receive(channel[1],&offer,fds)==0);
+    intel_pending_poll();assert(!g_intel_pending_count);
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
+    root.xwindow=NULL;
+    free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
 /* Chromium asks for client-side decoration and then draws a translucent
  * frame, so its window is never opaque. waylandd answers SERVER_SIDE for
  * listed app_ids, also when the app_id arrives after the request. */
@@ -776,6 +841,7 @@ int main(void)
     check_gpu_window_layers_shm();
     check_gpu_window_opaque();
     check_gpu_window_scaled();
+    check_gpu_window_xwayland();
     check_decoration_policy();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif

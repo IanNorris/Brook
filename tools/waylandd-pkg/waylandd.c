@@ -2991,6 +2991,24 @@ static uint64_t g_gpu_window_offers,g_gpu_window_acks,g_gpu_window_recovered,g_g
 /* Aggregate failures instead of logging each frame; the latter perturbs pacing. */
 static uint64_t g_gpu_offer_no_channel,g_gpu_offer_no_root,g_gpu_offer_layers,g_gpu_offer_geometry,g_gpu_offer_window,g_gpu_offer_metadata;
 static uint64_t g_gpu_offer_size_mismatch,g_gpu_opaque_offers,g_gpu_scaled_offers;
+static uint64_t g_gpu_xwayland_offers,g_gpu_xwayland_resize_wait;
+/* A root the renderer may take a GPU source for: a configured xdg_toplevel,
+ * or a rootless Xwayland surface paired with its mapped X window. Role 4
+ * surfaces never have an xdg handshake; brook-xwm's map and serial pairing
+ * play that part (xwayland_surface_ready). Without this, every X11 window,
+ * including glamor's DMA-BUF window buffers and Present flips of GL games,
+ * was read back and composed into the VFB on the CPU (offer_skipped.no_root).
+ * BROOK_WAYLAND_GPU_XWAYLAND=0 restores that CPU path. */
+static int gpu_xwayland_offers_enabled(void){
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("BROOK_WAYLAND_GPU_XWAYLAND");enabled=!v || strcmp(v,"0");}
+    return enabled;
+}
+static int gpu_offer_root_ready(const struct brook_surface *root){
+    if(!root || root->tree.parent)return 0;
+    if(root->xdg_toplevel)return root->xdg_acked;
+    return root->role==4 && gpu_xwayland_offers_enabled() && xwayland_surface_ready(root);
+}
 /* BROOK_WAYLAND_GPU_SCALED=0 keeps scaled single-buffer windows on the
  * provider's composition path (the previous behaviour, for A/B runs). */
 static int gpu_scaled_offers_enabled(void){
@@ -3121,7 +3139,7 @@ static int gpu_window_offer(struct brook_image *image){
         struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
         if(!view || view->image!=image || !s->tree.parent)continue;
         root=s;while(root->tree.parent)root=root->tree.parent->user;}
-    if(!root || !root->xdg_toplevel || !root->xdg_acked){++g_gpu_offer_no_root;return 0;}
+    if(!gpu_offer_root_ready(root)){++g_gpu_offer_no_root;return 0;}
     struct brook_draw draws[64];unsigned count=0;
     if(!surface_layers(root,draws,&count)){++g_gpu_offer_layers;return 0;}
     if(count>=2){
@@ -3149,6 +3167,9 @@ static int gpu_window_offer(struct brook_image *image){
         g->sx>=0 && g->sy>=0 && g->sw>0 && g->sh>0 && g->sx+g->sw<=(int64_t)image->width*256 && g->sy+g->sh<=(int64_t)image->height*256 &&
         g->w>0 && g->h>0 && (uint64_t)g->w*scale<=16384 && (uint64_t)g->h*scale<=16384;
     if(g->transform || (!exact && !scaled) || (db->stride&3) || (db->offset&3) || db->modifier){++g_gpu_offer_geometry;return 0;}
+    /* An X window resized by the native WM waits for a buffer of the new
+     * size, exactly as surface_render does for the CPU path. */
+    if(root->role==4 && !xwayland_accept_view(root,g->w,g->h)){++g_gpu_xwayland_resize_wait;return 0;}
     if(!surface_window(root,(struct brook_view *)view) || !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
     struct stat st={0};BrookWindowState window={0};
     if(fstat(image->pending_fd,&st) || !st.st_ino || st.st_size<=0 || (st.st_size&3) ||
@@ -3185,6 +3206,7 @@ static int gpu_window_offer(struct brook_image *image){
         if(sent==1 && opaqueArgb)++g_gpu_opaque_offers;
         if(sent==1 && scaled)++g_gpu_scaled_offers;
     }else sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
+    if(sent==1 && root->role==4)++g_gpu_xwayland_offers;
     if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
         image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
@@ -3279,7 +3301,7 @@ static void gpu_groups_lost(void){
  * layer's producer fence is not known yet), -1 uncertain delivery. */
 static int gpu_window_offer_layers(struct brook_surface *root,const struct brook_draw *draws,unsigned count){
     if(!gpu_layers_enabled() || count<2 || count>BROOK_GPU_WINDOW_LAYERS_MAX || !gpu_window_channel_connect())return 0;
-    if(!root || root->tree.parent || !root->xdg_toplevel || !root->xdg_acked || !root->wm_id || !root->vfb || !root->tree.current)return 0;
+    if(!gpu_offer_root_ready(root) || !root->wm_id || !root->vfb || !root->tree.current)return 0;
     const uint32_t scale=surface_output_scale(root);
     struct BrookGpuWindowLayersPacket packet;memset(&packet,0,sizeof(packet));
     int buffers[BROOK_GPU_WINDOW_LAYERS_MAX],fences[BROOK_GPU_WINDOW_LAYERS_MAX];
@@ -3826,14 +3848,16 @@ static void waylandd_status_write(const char *display){
     FILE *f=fopen(tmp,"w");if(!f)return;
     fprintf(f,"{\"schema\":\"brook-waylandd-status/1\",\"pid\":%ld,\"now_ms\":%u,\"gpu_socket\":%d,",
         (long)getpid(),now,getenv("BROOK_WAYLAND_GPU_SOCKET")!=NULL);
-    fprintf(f,"\"offers\":{\"sent\":%llu,\"safe\":%llu,\"presented\":%llu,\"retained_snapshots\":%llu,\"recovered\":%llu},",
+    fprintf(f,"\"offers\":{\"sent\":%llu,\"safe\":%llu,\"presented\":%llu,\"retained_snapshots\":%llu,\"recovered\":%llu,\"xwayland\":%llu,\"xwayland_enabled\":%d},",
         (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
-        (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered);
+        (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered,
+        (unsigned long long)g_gpu_xwayland_offers,gpu_xwayland_offers_enabled());
     fprintf(f,"\"offer_skipped\":{\"no_channel_or_fence\":%llu,\"no_root\":%llu,\"layers\":%llu,\"geometry\":%llu,\"window\":%llu,"
-        "\"metadata\":%llu,\"connect_fail\":%llu,\"auth_fail\":%llu,\"sent_with_client_size_mismatch\":%llu},",
+        "\"metadata\":%llu,\"connect_fail\":%llu,\"auth_fail\":%llu,\"sent_with_client_size_mismatch\":%llu,\"xwayland_resize_wait\":%llu},",
         (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,
         (unsigned long long)g_gpu_offer_geometry,(unsigned long long)g_gpu_offer_window,(unsigned long long)g_gpu_offer_metadata,
-        (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch);
+        (unsigned long long)g_gpu_connect_fail,(unsigned long long)g_gpu_auth_fail,(unsigned long long)g_gpu_offer_size_mismatch,
+        (unsigned long long)g_gpu_xwayland_resize_wait);
     fprintf(f,"\"opaque_regions\":{\"null\":%llu,\"infinite\":%llu,\"by_ops\":[%llu,%llu,%llu,%llu,%llu],"
         "\"last_first_op\":[%d,%d,%d,%d,%d],\"last_ops\":%d,\"last_kind\":%d,\"opaque_views\":%llu},",g_opaque_null,g_opaque_infinite,g_opaque_rects[0],g_opaque_rects[1],
         g_opaque_rects[2],g_opaque_rects[3],g_opaque_rects[4],g_opaque_last[0],g_opaque_last[1],g_opaque_last[2],g_opaque_last[3],

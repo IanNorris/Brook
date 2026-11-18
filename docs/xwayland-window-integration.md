@@ -6,6 +6,46 @@ Store and Library render in a native window, and Friends opens and moves as a
 separate window. Longer Steam acceptance, broader transient policy and
 shaped-window rendering remain open.
 
+## GPU presentation of X11 windows (18 Nov 2026, `work/xwl-dmabuf`)
+
+**Cause of `src cpu` for every X11 window (Dell gen 423, Torchlight II ~10
+displayed fps, Stardew).** Xwayland already hands waylandd GPU buffers:
+glamor's window buffers (and Present flips of a GL client's DRI3 pixmap) arrive
+as `zwp_linux_dmabuf_v1` buffers, LINEAR, because waylandd's v4 feedback
+offers only LINEAR XR24/AR24 on its one render node. The Dell log shows
+`dmabuf buffer 1280x800 ... modifier=0x0`; nothing falls back to `wl_shm`, and
+modifiers are not the problem. waylandd's GPU offer path
+(`gpu_window_offer`, `gpu_window_offer_layers`) required the root to be an
+acknowledged `xdg_toplevel`. Xwayland surfaces have role 4
+(`xwayland_surface_v1`) and no xdg objects, so every X11 commit was counted
+as `offer_skipped.no_root`. The Intel queue then waited for the frame, read the
+whole buffer back (`TRY_CPU_READ` plus mmap copy) and composed it into the
+VFB, and the renderer received a CPU source.
+
+**Fix.** `gpu_offer_root_ready()` also accepts a role 4 root that
+`xwayland_surface_ready()` reports paired with its mapped X window. A buffer
+that does not match a pending native resize (`xwayland_accept_view`) still
+waits, as on the CPU path (`offer_skipped.xwayland_resize_wait`). Counters:
+`offers.xwayland` in `brook-waylandd-:N.json`. Kill switch:
+`BROOK_WAYLAND_GPU_XWAYLAND=0`. Host test: `check_gpu_window_xwayland` in
+`capture-release-test.c` (direct variant): offer and release, resize wait, and
+an unpaired surface staying on the CPU.
+
+**The 9% memset was not GPU buffer zero-fill.** Symbolising the gen 423
+profile against the int22 `kernel.elf` puts it inside `epoll_wait_impl`.
+`EpollWalkOwner` cleared the whole roughly 78 KiB `EpollWalk`, and
+`clearMemo()` cleared about 24 KiB more, on every `epoll_wait` iteration. One
+process (pid 0x1d5) spent about a CPU in `epoll_wait` (870 of its 963
+samples). Now only `pins`, `attempted` and `masks` (13 KiB) are zeroed, and
+memo nodes are initialised on allocation. That process is still busy-polling;
+it is unidentified.
+
+**Not changed.** X11 buffers stay LINEAR. Y- or X-tiled imports would need a
+modifier field in the GPU window channel, plus kernel shim and VKRENDER
+support. Whether Present flips or copies into the window pixmap depends on
+Xwayland's `xwl_present_check_flip`. Either way the result is a LINEAR
+dma-buf, which is now offered.
+
 ## Native geometry API
 
 `WM_WINDOW_STATE` (`0xB08`) snapshots one calling provider's window without
