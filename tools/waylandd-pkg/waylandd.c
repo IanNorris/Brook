@@ -138,6 +138,29 @@ static uint32_t g_trace_input_max_ms, g_trace_dispatch_max_ms;
  * output scale (see xwayland-xwm.h). */
 static uint32_t g_output_scale=1;
 
+static uint64_t g_now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec*1000000ull+(uint64_t)ts.tv_nsec/1000u;
+}
+/* Per-frame chain timing, always on (a few adds per frame), reported in the
+ * status file for X11 (Xwayland) and native roots separately:
+ *  interval     buffer commit to the next buffer commit of the window;
+ *  offer        commit to GPU offer sent (producer fence obtained);
+ *  presented    offer sent to the renderer's PRESENTED;
+ *  callback     commit to its wl_surface.frame done;
+ *  turnaround   frame done to the client's next buffer commit (the client,
+ *               e.g. Xwayland Present plus the game, not this server). */
+struct brook_pace { uint64_t count,sum_us,max_us; };
+enum { PACE_INTERVAL,PACE_OFFER,PACE_PRESENTED,PACE_CALLBACK,PACE_TURNAROUND,PACE_KINDS };
+static struct brook_pace g_pace[2][PACE_KINDS];
+static uint64_t g_pace_dmabuf_created[2],g_pace_early_callbacks;
+static void pace_add(int x11,int kind,uint64_t start_us,uint64_t end_us){
+    if(!start_us || end_us<start_us)return;
+    struct brook_pace *p=&g_pace[x11?1:0][kind];const uint64_t d=end_us-start_us;
+    ++p->count;p->sum_us+=d;if(d>p->max_us)p->max_us=d;
+}
+static uint64_t now_us_since(uint64_t start_us){const uint64_t now=g_now_us();return now>start_us?now-start_us:0;}
 static uint32_t g_now_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -429,6 +452,9 @@ struct brook_surface {
     struct brook_surface *sibling;    /* next child in parent's children list */
     struct wl_resource   *subsurface_resource; /* wl_subsurface resource if role is subsurface */
     int dmabuf_subsurface_reported; /* bounded diagnostic: once per surface */
+    /* Frame pacing (status "pacing"): last buffer commit and last frame
+     * callback sent, in microseconds. */
+    uint64_t pace_commit_us,pace_callback_us;
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -618,6 +644,10 @@ static void surface_send_frame_callbacks_upto(struct brook_surface *surface, uin
     struct brook_frame_callback *callback, *next;
     wl_list_for_each_safe(callback, next, &surface->committed_frames, link) {
         if (callback->commit > limit) continue;
+        if (!surface->subsurface_parent && surface->pace_commit_us>surface->pace_callback_us) {
+            const uint64_t now_us=g_now_us();
+            pace_add(surface->role==4,PACE_CALLBACK,surface->pace_commit_us,now_us);surface->pace_callback_us=now_us;
+        }
         if (g_trace_frames) {
             uint32_t requested = now - callback->requested_ms;
             uint32_t committed = now - callback->committed_ms;
@@ -647,6 +677,26 @@ static int image_callbacks_due(const struct brook_image *image, uint32_t now) {
      * delay from queueing, release them regardless of offer state. */
     return image->queued_ms && (int32_t)(now-image->queued_ms)>=GPU_CALLBACK_FALLBACK_MS;
 }
+/* Rootless Xwayland paces Present by frame callbacks: a sync flip completes
+ * (PresentCompleteNotify) at the next frame done after its commit, and Mesa
+ * GLX with swap interval 1 lets only one swap be outstanding. Holding the
+ * callback until PRESENTED (composite, plus the flip at vblank) therefore
+ * serialises the game with the renderer's whole latency. By default an
+ * Xwayland window's callbacks are released once its commit has been offered
+ * to the renderer, at most once per XWAYLAND_FRAME_MIN_US; buffer release
+ * (SAFE, after a newer commit is shown) still bounds how far the client gets
+ * ahead. BROOK_WAYLAND_XWAYLAND_FRAME=presented keeps PRESENTED pacing. */
+enum { XWAYLAND_FRAME_MIN_US=15000 };
+static int xwayland_early_frames(void){
+    static int enabled=-1;
+    if(enabled<0){const char *v=getenv("BROOK_WAYLAND_XWAYLAND_FRAME");enabled=!v || strcmp(v,"presented");}
+    return enabled;
+}
+static int root_callbacks_due(const struct brook_surface *root,const struct brook_image *image,uint32_t now){
+    if(image_callbacks_due(image,now))return 1;
+    return root->role==4 && image->offer_state==1 && xwayland_early_frames() &&
+        g_now_us()-root->pace_callback_us>=XWAYLAND_FRAME_MIN_US;
+}
 static struct wl_event_source *g_frame_timer;
 static int frame_clock_tick(void *unused) {
     (void)unused;
@@ -663,7 +713,7 @@ static int frame_clock_tick(void *unused) {
         while (root->subsurface_parent) root = root->subsurface_parent;
         struct brook_draw draws[64];unsigned n=0;int pending=0;
         if(!surface_layers(root,draws,&n))pending=1;
-        for(unsigned i=0;i<n;++i)if(!image_callbacks_due(draws[i].view->image,now)){pending=1;break;}
+        for(unsigned i=0;i<n;++i)if(!root_callbacks_due(root,draws[i].view->image,now)){pending=1;break;}
         if(pending)continue;
         if (root->wm_id || surface->is_cursor) surface_send_frame_callbacks(surface, now);
     }
@@ -844,6 +894,12 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
             wl_shm_buffer_begin_access(shm);
             image=image_snapshot(wl_shm_buffer_get_data(shm),wl_shm_buffer_get_width(shm),wl_shm_buffer_get_height(shm),wl_shm_buffer_get_stride(shm),wl_shm_buffer_get_format(shm));
             wl_shm_buffer_end_access(shm);buffer_release(buffer);
+        }
+        if (image && buffer && !s->subsurface_parent) {
+            const uint64_t now_us=g_now_us();const int x11=s->role==4;
+            pace_add(x11,PACE_INTERVAL,s->pace_commit_us,now_us);
+            if(s->pace_callback_us>s->pace_commit_us)pace_add(x11,PACE_TURNAROUND,s->pace_callback_us,now_us);
+            s->pace_commit_us=now_us;image->pace_commit_us=now_us;image->pace_x11=x11;
         }
         if (buffer && !image) {
             if(buffer->uncertain)wl_client_post_implementation_error(c,"GPU buffer completion could not be verified");
@@ -3100,6 +3156,7 @@ static void gpu_window_presented(const struct BrookGpuWindowIdentity *identity){
     if(!match){struct gpu_group *g=gpu_group_find(identity);if(g)gpu_group_presented(g);return;}
     if(match->gpu_presented)return;
     match->gpu_presented=1;++g_gpu_window_presented;
+    pace_add(match->pace_x11,PACE_PRESENTED,match->pace_offer_us,g_now_us());
     const uint32_t now=g_now_ms();
     gpu_window_timing_add(&g_presentWait,match->offer_sent_ms,now);
     for(struct brook_surface *s=g_surfaces;s;s=s->next){
@@ -3213,7 +3270,12 @@ static int gpu_window_offer(struct brook_image *image){
         if(sent==1 && opaqueArgb)++g_gpu_opaque_offers;
         if(sent==1 && scaled)++g_gpu_scaled_offers;
     }else sent=brook_gpu_window_send_offer(g_gpu_window_channel,&offer,image->pending_fd,image->producer_fence);
-    if(sent==1 && root->role==4)++g_gpu_xwayland_offers;
+    if(sent==1){const uint64_t now_us=g_now_us();pace_add(root->role==4,PACE_OFFER,image->pace_commit_us,now_us);image->pace_offer_us=now_us;}
+    if(sent==1 && root->role==4){
+        ++g_gpu_xwayland_offers;
+        if(xwayland_early_frames() && now_us_since(root->pace_callback_us)>=XWAYLAND_FRAME_MIN_US && draws[0].view==root->tree.current->value){
+            ++g_pace_early_callbacks;surface_send_frame_callbacks(root,g_now_ms());}
+    }
     if(sent==1){++root->publish_commit;image->offer_tree_commit=root->tree.current->commit;
         image->offer_identity=offer.identity;image->offer_state=1;++g_gpu_window_offers;++g_layer_offer_frames;
         image->offer_geometry=*g;image->offer_ms=g_now_ms();if(!image->offer_ms)image->offer_ms=1;
@@ -3664,6 +3726,7 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
                                        "dmabuf import failed");
         return NULL;
     }
+    ++g_pace_dmabuf_created[c==g_xwayland_client];
     fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x modifier=0x%llx -> gres=%u\n",
             width, height, db->stride, format, (unsigned long long)db->modifier, db->gres);
 
@@ -3859,6 +3922,13 @@ static void waylandd_status_write(const char *display){
         (unsigned long long)g_gpu_window_offers,(unsigned long long)g_gpu_window_acks,(unsigned long long)g_gpu_window_presented,
         (unsigned long long)g_intel_retained_snapshots,(unsigned long long)g_gpu_window_recovered,
         (unsigned long long)g_gpu_xwayland_offers,gpu_xwayland_offers_enabled());
+    {static const char *kinds[PACE_KINDS]={"interval","offer","presented","callback","turnaround"};
+     fprintf(f,"\"pacing\":{\"xwayland_frame\":\"%s\",\"early_callbacks\":%llu,",xwayland_early_frames()?"offer":"presented",
+         (unsigned long long)g_pace_early_callbacks);
+     for(int x=0;x<2;++x){fprintf(f,"\"%s\":{\"dmabuf_created\":%llu",x?"x11":"native",(unsigned long long)g_pace_dmabuf_created[x]);
+         for(int k=0;k<PACE_KINDS;++k)fprintf(f,",\"%s\":[%llu,%llu,%llu]",kinds[k],(unsigned long long)g_pace[x][k].count,
+             (unsigned long long)g_pace[x][k].sum_us,(unsigned long long)g_pace[x][k].max_us);
+         fprintf(f,"}%s",x?"},":",");}}
     fprintf(f,"\"offer_skipped\":{\"no_channel_or_fence\":%llu,\"no_root\":%llu,\"layers\":%llu,\"geometry\":%llu,\"window\":%llu,"
         "\"metadata\":%llu,\"connect_fail\":%llu,\"auth_fail\":%llu,\"sent_with_client_size_mismatch\":%llu,\"xwayland_resize_wait\":%llu},",
         (unsigned long long)g_gpu_offer_no_channel,(unsigned long long)g_gpu_offer_no_root,(unsigned long long)g_gpu_offer_layers,

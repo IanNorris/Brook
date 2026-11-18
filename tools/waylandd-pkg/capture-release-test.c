@@ -623,7 +623,8 @@ static void check_gpu_window_xwayland(void)
     assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
     assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
     /* Paired and mapped: one GPU offer, no CPU copy, released after SAFE. */
-    const uint64_t offers=g_gpu_xwayland_offers,noRoot=g_gpu_offer_no_root,ready=g_intel_ready;
+    const uint64_t offers=g_gpu_xwayland_offers,noRoot=g_gpu_offer_no_root,ready=g_intel_ready,early=g_pace_early_callbacks;
+    surface_frame(client,root.resource,4);
     surface_attach(client,root.resource,first,0,0);surface_commit(client,root.resource);
     struct brook_view *view=root.tree.current->value;struct brook_buffer *held=view->image->source;++held->refs;
     intel_pending_poll();
@@ -631,13 +632,18 @@ static void check_gpu_window_xwayland(void)
     struct BrookGpuWindowPacket offer={0};int fds[2];assert(brook_gpu_window_receive(channel[1],&offer,fds)==1);
     assert(offer.type==BROOK_GPU_WINDOW_OFFER && offer.identity.window==1 && offer.width==1 && offer.fourcc==0x34325258);
     close(fds[0]);close(fds[1]);
+    /* Xwayland pacing: the frame callback is released with the offer, before
+     * the renderer reports PRESENTED (BROOK_WAYLAND_XWAYLAND_FRAME). */
+    wl_display_flush_clients(display);
+    assert(g_pace_early_callbacks==early+1 && count_events(clientSockets[1],4,WL_CALLBACK_DONE)==1);
+    assert(g_pace[1][PACE_OFFER].count && g_pace[1][PACE_CALLBACK].count);
     assert(brook_gpu_window_send_safe(channel[1],&offer.identity)==1);
     intel_pending_poll();assert(!g_intel_pending_count && !held->uses);(void)ready;
     wl_display_flush_clients(display);assert(count_events(clientSockets[1],2,WL_BUFFER_RELEASE)==1);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
     /* A native resize to 2x2 is pending: the 1x1 buffer is not offered. */
     const uint64_t waits=g_gpu_xwayland_resize_wait;xw.target_width=xw.target_height=2;
-    struct wl_resource *second=retained_test_buffer(client,4);
+    struct wl_resource *second=retained_test_buffer(client,5);
     surface_attach(client,root.resource,second,0,0);surface_commit(client,root.resource);
     view=root.tree.current->value;held=view->image->source;++held->refs;
     intel_pending_poll();
@@ -648,7 +654,7 @@ static void check_gpu_window_xwayland(void)
     xw.target_width=xw.target_height=0;
     /* Unpaired (serial mismatch): not a window root, so no offer. */
     xw.state.serial=10;
-    struct wl_resource *third=retained_test_buffer(client,5);
+    struct wl_resource *third=retained_test_buffer(client,6);
     surface_attach(client,root.resource,third,0,0);surface_commit(client,root.resource);
     view=root.tree.current->value;held=view->image->source;++held->refs;
     intel_pending_poll();
