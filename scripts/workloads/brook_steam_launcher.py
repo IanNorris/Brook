@@ -36,7 +36,7 @@ try:
 except ImportError:  # python3-minimal, the Dell's /nix/profile/bin/python3, lacks _ctypes
     ctypes = None
 
-LAUNCHER_VERSION = 'rootless-3'
+LAUNCHER_VERSION = 'rootless-4'
 HOME = Path(os.environ.get('BROOK_STEAM_USER_HOME', '/data/home'))
 BROOK = HOME / '.local/share/brook'
 LOG = Path(os.environ.get('BROOK_STEAM_LOG', BROOK / 'steam-launcher.log'))
