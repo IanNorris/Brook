@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include "../../kernel/src/window.cpp"
 #include "../../kernel/src/chrome_raster.cpp"
+#include "../../kernel/src/chrome_frame.cpp"
+#include "../../kernel/src/chrome_shell.cpp"
 
 // Real window lifecycle, input rings and capture entry points. No renderer or
 // device is mocked into claiming physical capture; that remains a VM gate.

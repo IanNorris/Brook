@@ -736,6 +736,44 @@ target_compile_options(test_wayland_provider PRIVATE "-iquote${BROOK_ROOT}/src/k
 
 add_host_test(test_taskbar_volume)
 add_host_test(test_chrome_alpha)
+add_host_test(test_chrome_layout)
+target_compile_options(test_chrome_layout PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+# Chrome golden images: the freestanding display list builders and executor,
+# with the desktop fonts baked exactly as the kernel bakes them.
+set(CHROME_FONT_TTF "")
+if(DEFINED ENV{BROOK_DESKTOP_FONT_TTF} AND EXISTS "$ENV{BROOK_DESKTOP_FONT_TTF}")
+    set(CHROME_FONT_TTF "$ENV{BROOK_DESKTOP_FONT_TTF}")
+elseif(DEFINED ENV{HACK_FONT_TTF} AND EXISTS "$ENV{HACK_FONT_TTF}")
+    set(CHROME_FONT_TTF "$ENV{HACK_FONT_TTF}")
+endif()
+find_program(CHROME_PYTHON3 python3 NO_CACHE)
+if(CHROME_FONT_TTF AND CHROME_PYTHON3)
+    set(CHROME_FONT_SOURCES "")
+    foreach(DESKTOP_SCALE IN ITEMS 100 150 200)
+        math(EXPR DESKTOP_FONT_SIZE "16 * ${DESKTOP_SCALE} / 100")
+        set(DESKTOP_FONT_CPP "${CMAKE_CURRENT_BINARY_DIR}/chrome_desktop_font_${DESKTOP_SCALE}.cpp")
+        add_custom_command(
+            OUTPUT "${DESKTOP_FONT_CPP}"
+            COMMAND ${CHROME_PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py"
+                    "${CHROME_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
+                    "g_desktopFont${DESKTOP_SCALE}"
+            DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${CHROME_FONT_TTF}"
+            VERBATIM)
+        list(APPEND CHROME_FONT_SOURCES "${DESKTOP_FONT_CPP}")
+    endforeach()
+    add_host_test(test_chrome_goldens
+        "${BROOK_ROOT}/src/kernel/src/chrome_raster.cpp"
+        "${BROOK_ROOT}/src/kernel/src/chrome_frame.cpp"
+        "${BROOK_ROOT}/src/kernel/src/chrome_shell.cpp"
+        ${CHROME_FONT_SOURCES})
+    target_compile_options(test_chrome_goldens PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+    target_compile_definitions(test_chrome_goldens PRIVATE
+        BROOK_CHROME_GOLDENS="${BROOK_ROOT}/src/tests/goldens/chrome")
+    set_tests_properties(test_chrome_goldens PROPERTIES TIMEOUT 120)
+else()
+    message(WARNING "Desktop font or python3 not found: test_chrome_goldens is not built (run from nix-shell)")
+endif()
 target_compile_options(test_taskbar_volume PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_launcher_power)
 target_compile_options(test_launcher_power PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

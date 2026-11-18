@@ -1,8 +1,9 @@
 # Compositor refactor: describe Clearwater chrome once
 
 15 November 2026. Status: accepted by Ian, with his answers recorded in
-[Decisions (Ian)](#decisions-ian-15-november). Stages 0.1, 0.2 and 0.5 are
-implemented on `work/compositor-refactor`. It covers the [Clearwater Next design](DESIGN.md)
+[Decisions (Ian)](#decisions-ian-15-november). Stages 0.1–0.5 are
+implemented on `work/compositor-refactor`; stages 1.1 and 1.2 on
+`work/clearwater-s1` (see [Stage 1.1/1.2 evidence](#stage-11-and-12-evidence)). It covers the [Clearwater Next design](DESIGN.md)
 and the [compositor direction](../../compositor-direction.md).
 
 Line numbers refer to `main` at `0ae38b0d`, before stage 0.1.
@@ -297,8 +298,8 @@ Steps 0.3 and 0.4 landed after `work/chrome-csd` merged into main.
 
 | Step | Change | Exit check |
 | --- | --- | --- |
-| 1.1 | Part table plus `WmHitTest` on parts, with edge-to-edge captions (DESIGN.md T0, implementation step 1) | Table-driven conformance test (DESIGN.md "Conformance test") at 100/150/200%. Intended visual change: caption hit areas only. |
-| 1.2 | Display lists: frame and shell painters become *build list* plus *CPU execute* | Host golden images per element × theme × scale (see Tests); QEMU screenshots identical |
+| **1.1 (done)** | Part table plus `WmHitTest` on parts, with edge-to-edge captions (DESIGN.md T0, implementation step 1):<br>• `chrome_layout.h`: freestanding part table per window state (role, visual rect, hit rect), in the spec's test order;<br>• the full DESIGN.md zone table at today's metrics (title 36, buttons 46): 6 px outer margin on every side with 16 px diagonal corners, buttons hit from y = 0 and Close to the outer right edge, 2 px inner band with 8 px corner squares, no zones when maximised, none on an edge touching the screen;<br>• chrome-csd's `captionOverlay` is three button parts on a CSD window, hit where drawn;<br>• hover follows the hit rect. | `test_chrome_layout` (DESIGN.md "Conformance test") at 100/150/200%. Intended change: hit areas only (see Stage 1.1/1.2 evidence). |
+| **1.2 (done)** | Display lists: frame and shell painters become *build list* plus *CPU execute*:<br>• `chrome_display_list.h` (7 primitives: fill, title rows, corner-clipped fill, material rect, text, icon, square runs), `chrome_style.h` (palette, metrics, font, resolved material);<br>• `chrome_raster` is the freestanding executor; `chrome_frame` and `chrome_shell` are freestanding builders with the taskbar and launcher layouts;<br>• the WM snapshots state into models (`wm_shell_*.inc`) and keeps hit tests and the build-badge spans. | `test_chrome_goldens`: 144 goldens (16 elements × 3 themes × 3 scales); QEMU CPU screenshots identical |
 | 1.3 | Surface records (material, radii, shadow class):<br>• virgl consumes them, replacing its own blur and shadow geometry;<br>• layers ABI v2 carries them to VKRENDER, which draws the shadow nine-slice. | Virgl screenshot identical; VKRENDER host quad test against the CPU reference |
 | 1.4 | Per-surface overlay keys and bands, replacing the 100 ms full re-render and hash; no CPU raster under lease; span-only chrome copy; opaque occlusion | Dell measurement (below): compositor GPU ms and job count no worse, kernel CPU lower |
 | 1.5 | Backend `backdrop-blur` capability and theme resolution, replacing `CompositorGlassActive()` | QEMU: software → Opaque, gl → Glass; renderer kill → Opaque stand-in |
@@ -592,3 +593,84 @@ screendumps? vCPU RIPs were also sampled. Results are in
     glass titlebar blurs it.
   - The differences are small: at most 13 levels near the caret, and only
     within the blur radius of those two sources.
+
+## Stage 1.1 and 1.2 evidence
+
+Branch `work/clearwater-s1`, based on `work/integration32` (`7268f1b6`).
+Commits: `ddd9b9ce` (part table and conformance test), `306b2e53`
+(`WmHitTest` on parts), `0acc8712` (builders and executor), `311bea32`
+(goldens).
+
+**Caption hit areas changed in stage 1.1, not deferred.** Ian left the
+timing to the implementer (DECISIONS.md, 18 November). Rewriting
+`WmHitTest` onto the part table is where every zone is defined, so the
+spec's zones landed there with the conformance test. Stage 1.2 does not
+touch input. What changed for the user:
+
+- Caption buttons are hit from the outer top edge (y = 0) down to the
+  titlebar bottom, and Close to the outer right edge. A maximised window's
+  Close owns the screen's top-right pixel.
+- Hover follows the hit rect: the pill (still drawn in today's cell)
+  lights whenever a click would press the button, including from the top
+  border.
+- Resize: a 6 px outer margin on every side (new on the left and top;
+  diagonal within 16 px of a corner). Inside the frame, a 2 px band with
+  8 px corner squares replaces the old 6 px right/bottom band and 16 px
+  bottom-right square. Left and top resizes use the existing
+  `CompositorBeginWindowResize` edges.
+- Maximised windows have no resize zones. An edge that touches the screen
+  edge loses its zones, so a window pushed to the right edge has Close in
+  the screen corner.
+- Client-decorated windows are unchanged: overlaid caption buttons are
+  three button parts, hit exactly where they are drawn, and the client's
+  shadow margin stays the client's.
+- Metrics are unchanged (title 36, buttons 46). Title 40 and buttons 48
+  are stage 2.1.
+
+**Host tests:** 376 run, all pass. `test_audio_delivery` timed out under
+parallel load and passed alone (known flake).
+- `test_chrome_layout`: the DESIGN.md conformance set at 100/150/200%
+  (outer top-right pixel in normal, maximised and right-tiled states; one
+  pixel either side of each button boundary; a y = 0 sweep across the
+  titlebar; the margin on every side; corner extents; inner bands; CSD
+  overlay with and without a shadow inset). Expected zones are written
+  from the spec's logical sizes, not the implementation's arithmetic.
+- `test_chrome_goldens`: 16 elements × 3 themes × 3 scales = 144 PNGs
+  (2.2 MB) under `src/tests/goldens/chrome/`, byte-identical, plus a hash
+  of each ARGB buffer (alpha included) in `MANIFEST`. The binary links
+  only `chrome_raster.cpp`, `chrome_frame.cpp`, `chrome_shell.cpp` and the
+  desktop fonts baked as the kernel bakes them, which also proves those
+  sources are freestanding. `--update` rewrites them.
+
+**QEMU CPU path (`gpu=software`), headless with QMP input and
+screendump** (no debug bridge, `BROOK_NET_DEVICE=none`). The same seven
+scenes as stage 0, plus close-button hover at its centre, a hover at the
+outer top-right pixel (the cursor landed one row above the window, in the
+resize margin), a taskbar-button hover and a final idle. Baseline
+`7268f1b6` against candidate `311bea32`: all 11 scenes are
+**pixel-identical** outside the usual masks (clock, telemetry, build
+label, caret) (`compare-cpu.txt`). A candidate-only scene with the
+pointer on the top border above Close shows the hover pill: the intended
+hit-area change. The boot summary disappears before the scenes start, so
+it is covered by the goldens only.
+
+**Dell pair:** `build/dell/pair-cw1` (payload `dell-cw1-20261118`, scanout
+flip, persistent scanout map, zero-copy scanout and video engine on;
+clean tree at `311bea32`; kernel `290d1958…`). `check_dell_image_qemu.py
+--attempts 4`: PASS.
+
+**Not checked:** virgl (`gpu=gl`) and VKRENDER screenshots. Both consume
+the same CPU raster (chrome layer, chrome capture, overlay capture) and the
+material inputs are unchanged, so they were reviewed only.
+
+**Check by hand on the Dell (200%):** Close from the screen's top-right
+corner with a maximised window; hover and click on the top border above
+the buttons; resize from the new left and top margins (12 px outside the
+frame at 200%) and the smaller inside band (4 px; 16 px corner squares);
+a maximised window must not start a resize from any edge; Chromium's
+overlaid captions behave as before.
+
+**Evidence** (not committed): `build/cw1-evidence/` in the worktree:
+`base/`, `cand/`, `cand-edge/`, `compare-cpu.txt`, `scenes_qmp.py`,
+`scenes_extra.py`, `scenes_edge.py`, `compare.py`, serial logs, and the
+pair build and QEMU check logs.

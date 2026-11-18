@@ -32,8 +32,7 @@ bool WmApplyScalePending();
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = DesktopMetrics::TitleBase;
 static constexpr uint32_t WM_BORDER_WIDTH     = DesktopMetrics::BorderBase;
 static constexpr uint32_t WM_BUTTON_WIDTH     = DesktopMetrics::CaptionButtonBase;
-static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
-static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
+// Resize zone sizes: ChromeResizeMetrics (chrome_layout.h).
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
@@ -263,7 +262,28 @@ enum class WmHitZone : uint8_t
     Border,
     Taskbar,        // clicked on taskbar background
     TaskbarButton,  // clicked on a taskbar window button
+    ResizeLeft,
+    ResizeTop,
+    ResizeTopLeft,
+    ResizeTopRight,
+    ResizeBottomLeft,
 };
+// Resize zones as edge masks (bit 0 left, 1 top, 2 right, 3 bottom; the
+// chrome_layout.h ChromeEdge* values). Zero for any other zone.
+inline constexpr uint8_t WmHitZoneResizeEdges(WmHitZone zone)
+{
+    return zone == WmHitZone::ResizeLeft ? 1 : zone == WmHitZone::ResizeTop ? 2 :
+           zone == WmHitZone::ResizeRight ? 4 : zone == WmHitZone::ResizeBottom ? 8 :
+           zone == WmHitZone::ResizeTopLeft ? 3 : zone == WmHitZone::ResizeTopRight ? 6 :
+           zone == WmHitZone::ResizeBottomLeft ? 9 : zone == WmHitZone::ResizeCorner ? 12 : 0;
+}
+inline constexpr WmHitZone WmHitZoneForResizeEdges(uint8_t edges)
+{
+    return edges == 1 ? WmHitZone::ResizeLeft : edges == 2 ? WmHitZone::ResizeTop :
+           edges == 4 ? WmHitZone::ResizeRight : edges == 8 ? WmHitZone::ResizeBottom :
+           edges == 3 ? WmHitZone::ResizeTopLeft : edges == 6 ? WmHitZone::ResizeTopRight :
+           edges == 9 ? WmHitZone::ResizeBottomLeft : edges == 12 ? WmHitZone::ResizeCorner : WmHitZone::None;
+}
 
 struct WmHitResult
 {

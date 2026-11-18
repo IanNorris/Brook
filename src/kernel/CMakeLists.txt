@@ -360,6 +360,8 @@ add_executable(kernel
     src/compositor_scene.cpp
     src/window.cpp
     src/chrome_raster.cpp
+    src/chrome_frame.cpp
+    src/chrome_shell.cpp
     src/terminal.cpp
     src/rtc.cpp
     src/kvmclock.cpp

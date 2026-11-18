@@ -67,84 +67,24 @@ void WmNoteClientFrame(uint64_t identity,uint64_t commit) {
     if(g_appClientFrames.Accept(__atomic_load_n(&g_metricsAppIdentity,__ATOMIC_RELAXED),identity,commit))g_appCadence.Record(now);
     SpinLockRelease(&g_appCadenceLock);
 }
-static void DesktopNumber(char* out,unsigned value) {
-    char rev[12];unsigned n=0;do{rev[n++]='0'+value%10;value/=10;}while(value && n<sizeof(rev));
-    while(n)*out++=rev[--n];*out=0;
-}
-static void DesktopRate(char* out,uint64_t bytes) {
-    // Decimal MB/s, one fractional digit. Never call the potentially locking printf.
-    uint64_t tenths=bytes/100000;if(tenths>99999)tenths=99999;
-    DesktopNumber(out,static_cast<unsigned>(tenths/10));while(*out)++out;*out++='.';*out++='0'+tenths%10;*out=0;
-}
-static void DrawMetricGraph(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,
-                            int x,int y,int width,int height,const DesktopIntervals<>& history,uint64_t now) {
-    if(width<=0||height<=0)return;
-    const unsigned n=history.count,shown=n<static_cast<unsigned>(width)?n:width;
-    for(unsigned i=0;i<shown;++i){const auto& v=history.samples[(history.next+128-shown+i)%128];
-        if(now<v.tick || now-v.tick>10000)continue;
-        unsigned value=v.ms>100?100:v.ms;int bar=static_cast<uint64_t>(value)*height/100;if(!bar)bar=1;
-        WmFillRect(pixels,stride,sw,sh,x+width-shown+i,y+height-bar,1,bar,0xff000000u|WmCurrentPalette().accent);
-    }
-}
-static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,
-                              const WmRect& r,unsigned kind,uint64_t now) {
-    if(r.w<=0)return;
-    const auto& p=WmCurrentPalette();const int line=WmDesktopFont().lineHeight;
-    const int top=r.y,bottom=r.y+r.h-line;
-    auto text=[&](int x,int y,const char* v,uint32_t color){WmRenderString(pixels,stride,sw,sh,x,y,v,color,p.taskbar,r.x+r.w-x);};
-    if(kind<2){
-        unsigned percent=kind?g_desktopStats.memoryPercent:g_desktopStats.cpuPercent;if(percent>100)percent=100;
-        const uint32_t color=percent>=90?WmCurrentPalette().hot:percent>=70?WmCurrentPalette().warm:WmCurrentPalette().ok;
-        text(r.x,top,kind?"MEM":"CPU",p.secondaryText);
-        WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w,line,WmMaterialColor(p.taskButton));
-        WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w*percent/100,line,color|0xff000000u);
-        char value[12];DesktopNumber(value,percent);size_t n=strlen(value);value[n]='%';value[n+1]=0;
-        text(r.x+WmMetric(3),bottom,value,p.taskText);return;
-    }
-    if(kind==6){
-        // Package temperature graph (1 s points, coloured against TjMax) and
-        // the current temperature / package power. Changes at most once a
-        // second, so it never forces per-frame overlay recaptures.
-        ThermalSnapshot snap{};
-        if(!ThermalReadSnapshot(snap) || snap.latest.pkgC<0){text(r.x,top,"TEMP",p.secondaryText);text(r.x,bottom,"n/a",p.mutedText);return;}
-        static ThermalSample points[ThermalGraphHistory];
-        const uint32_t n=ThermalReadGraph(points,ThermalGraphHistory);
-        const ThermalSample& now1s=n?points[n-1]:snap.latest;
-        text(r.x,top,"TEMP",p.secondaryText);
-        const int gx=r.x+WmMetric(44),gw=r.w-WmMetric(44),gh=line-2;
-        if(gw>0){
-            const unsigned shown=n<unsigned(gw)?n:unsigned(gw);
-            const int floorC=40,ceilC=int(snap.tjmax?snap.tjmax:100);
-            for(unsigned i=0;i<shown;++i){const auto& v=points[n-shown+i];if(v.pkgC<0)continue;
-                int t=v.pkgC<floorC?floorC:v.pkgC>ceilC?ceilC:v.pkgC;
-                int bar=(t-floorC)*gh/(ceilC-floorC);if(bar<1)bar=1;
-                WmFillRect(pixels,stride,sw,sh,gx+gw-int(shown)+int(i),top+gh-bar,1,bar,ThermalColour(v.pkgC,snap.tjmax)|0xff000000u);}
-        }
-        char value[48]{};unsigned used=0;
-        auto append=[&](const char* v){while(*v && used+1<sizeof(value))value[used++]=*v++;value[used]=0;};
-        char num[12];DesktopNumber(num,unsigned(now1s.pkgC));append(num);append("C");
-        if(snap.rapl){append("  ");DesktopNumber(num,now1s.pkgMw/1000);append(num);append(".");DesktopNumber(num,(now1s.pkgMw/100)%10);append(num);append("W");}
-        text(r.x,bottom,value,ThermalColour(now1s.pkgC,snap.tjmax));return;
-    }
-    if(kind<4){
-        char first[20],second[20],number[12];const bool net=kind==3;
-        WmStrCopy(first,net?"D ":"R ",sizeof(first));DesktopRate(number,net?g_desktopStats.downBytesPerSecond:g_desktopStats.readBytesPerSecond);
-        WmStrCopy(first+2,number,sizeof(first)-2);size_t n=strlen(first);WmStrCopy(first+n," MB/s",sizeof(first)-n);
-        WmStrCopy(second,net?"U ":"W ",sizeof(second));DesktopRate(number,net?g_desktopStats.upBytesPerSecond:g_desktopStats.writeBytesPerSecond);
-        WmStrCopy(second+2,number,sizeof(second)-2);n=strlen(second);WmStrCopy(second+n," MB/s",sizeof(second)-n);
-        text(r.x,top,first,p.secondaryText);text(r.x,bottom,second,p.secondaryText);return;
-    }
+// Telemetry for the taskbar builder: the sampled rates and loads, both
+// cadence histories and, when the TEMP metric is shown, the thermal graph.
+// Compositor thread only (the copies are static).
+static ChromeTelemetryModel WmTelemetryModel(const ChromeTaskbarLayout& l) {
+    ChromeTelemetryModel t{};
+    t.stats=g_desktopStats;
+    t.compositor=&g_desktopCadence;
     static DesktopIntervals<> appCopy;
-    if(kind==5){SpinLockAcquire(&g_appCadenceLock);appCopy=g_appCadence;SpinLockRelease(&g_appCadenceLock);}
-    const auto& history=kind==4?g_desktopCadence:appCopy;
-    const auto summary=history.Read(now);
-    text(r.x,top,kind==4?"COMP":"APP",p.secondaryText);
-    DrawMetricGraph(pixels,stride,sw,sh,r.x+WmMetric(48),top,r.w-WmMetric(48),line-2,history,now);
-    if(!summary.count || (kind==5 && (!history.last || now-history.last>2000))){text(r.x,bottom,"idle / no frames",p.mutedText);return;}
-    char value[64]{};unsigned used=0;
-    auto append=[&](const char* v){while(*v && used+1<sizeof(value))value[used++]=*v++;value[used]=0;};
-    char n[12];append("80:");DesktopNumber(n,summary.p80);append(n);append(" 95:");DesktopNumber(n,summary.p95);append(n);append(" max:");DesktopNumber(n,summary.max);append(n);append("ms");
-    text(r.x,bottom,value,p.secondaryText);
+    if(l.metrics[5].w){SpinLockAcquire(&g_appCadenceLock);appCopy=g_appCadence;SpinLockRelease(&g_appCadenceLock);}
+    t.app=&appCopy;
+    if(l.metrics[6].w){
+        static ThermalSample points[ThermalGraphHistory];
+        ThermalSnapshot snap{};
+        t.thermal=ThermalReadSnapshot(snap) && snap.latest.pkgC>=0;
+        t.rapl=snap.rapl;t.tjmax=snap.tjmax;t.latest=snap.latest;
+        if(t.thermal){t.pointCount=ThermalReadGraph(points,ThermalGraphHistory);t.points=points;}
+    }
+    return t;
 }
 // "Brook <build>" plus, on hardware payloads, a drawn middle dot and the
 // payload name (the desktop font is ASCII-only).
@@ -165,14 +105,15 @@ static bool WmBuildIdLayout(uint32_t sw,uint32_t sh,WmBuildIdText& text,WmRect& 
 // of sw x sh pixels (a full frame, or one row for the span path).
 static void WmDrawBuildIdText(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,int x,int y,
                           const WmBuildIdText& text,const WmRect* clip) {
-    WmRenderString(pixels,stride,sw,sh,x,y,text.main,WmCurrentPalette().badgeText,WmCurrentPalette().badgeFill,0,clip);
+    const ChromeTarget target{pixels,stride,sw,sh};
+    ChromeRenderString(target,WmDesktopFont(),x,y,text.main,WmCurrentPalette().badgeText,0,clip);
     if(!text.suffix)return;
     const int dotX=x+text.mainWidth+text.dotGap,dotY=y+(WmDesktopFont().lineHeight-text.dot)/2;
     int l=dotX,t=dotY,r=dotX+text.dot,b=dotY+text.dot;
     if(clip){if(l<clip->x)l=clip->x;if(t<clip->y)t=clip->y;
         if(r>clip->x+clip->w)r=clip->x+clip->w;if(b>clip->y+clip->h)b=clip->y+clip->h;}
-    if(r>l && b>t)WmFillRect(pixels,stride,sw,sh,l,t,r-l,b-t,WmCurrentPalette().badgeText);
-    WmRenderString(pixels,stride,sw,sh,dotX+text.dot+text.dotGap,y,text.suffix,WmCurrentPalette().badgeText,WmCurrentPalette().badgeFill,0,clip);
+    if(r>l && b>t)ChromeFillRect(target,l,t,r-l,b-t,WmCurrentPalette().badgeText);
+    ChromeRenderString(target,WmDesktopFont(),dotX+text.dot+text.dotGap,y,text.suffix,WmCurrentPalette().badgeText,0,clip);
 }
 void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect* clip) {
     WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect))return;
@@ -181,7 +122,7 @@ void WmDrawBuildId(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,cons
     const int right=clip && clip->x+clip->w<x+width?clip->x+clip->w:x+width;
     const int bottom=clip && clip->y+clip->h<y+height?clip->y+clip->h:y+height;
     if(right<=left||bottom<=top)return;
-    WmFillRect(pixels,stride,sw,sh,left,top,right-left,bottom-top,WmCurrentPalette().badgeFill);
+    ChromeFillRect({pixels,stride,sw,sh},left,top,right-left,bottom-top,WmCurrentPalette().badgeFill);
     WmDrawBuildIdText(pixels,stride,sw,sh,x+WmMetric(7),y+WmMetric(3),text,clip);
 }
 // Draw into one already-populated screen span, using the same glyph renderer
@@ -190,7 +131,7 @@ void WmDrawBuildIdSpan(uint32_t* pixels,uint32_t left,uint32_t count,uint32_t ro
     if(!pixels || !count || left>=sw || count>sw-left || row>=sh)return;
     WmBuildIdText text{};WmRect rect{};if(!WmBuildIdLayout(sw,sh,text,rect) ||
         int64_t(row)<rect.y || int64_t(row)>=int64_t(rect.y)+rect.h)return;
-    WmFillRect(pixels,count,count,1,rect.x-int(left),0,rect.w,1,WmCurrentPalette().badgeFill);
+    ChromeFillRect({pixels,count,count,1},rect.x-int(left),0,rect.w,1,WmCurrentPalette().badgeFill);
     WmDrawBuildIdText(pixels,count,count,1,rect.x+int(WmMetric(7))-int(left),
                       rect.y+int(WmMetric(3))-int(row),text,nullptr);
 }
@@ -203,29 +144,29 @@ bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* w
 }
 void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh) {
     int32_t x,y;uint32_t w,h;if(!WmBootSummaryRect(sw,sh,&x,&y,&w,&h))return;
-    const auto& p=WmCurrentPalette();WmFillRect(pixels,stride,sw,sh,x,y,w,h,p.taskbar);
-    WmFillRect(pixels,stride,sw,sh,x,y,w,WmMetric(3),WmCurrentPalette().accent);
-    int py=y+WmMetric(11);const int line=WmDesktopFont().lineHeight;
-    auto text=[&](const char* s,uint32_t color){WmRenderString(pixels,stride,sw,sh,x+WmMetric(12),py,s,color,p.taskbar,w-WmMetric(24));py+=line;};
-    char number[16],row[96];
-    if(const BootTimingSummary* timing=BootTimingRead()) {
+    char number[16],headline[96],timing[96],machine[96],build[96];
+    if(const BootTimingSummary* timing0=BootTimingRead()) {
         // Firmware | boot menu | loader | kernel; fold the loader into the
         // kernel bucket when the full row would be clipped.
-        BootTimingHeadline(row,sizeof(row),*timing);text(row,p.text);
-        BootTimingRow(row,sizeof(row),*timing,false);
-        if(WmTextWidth(row)>int(w)-int(WmMetric(24)))BootTimingRow(row,sizeof(row),*timing,true);
-        text(row,p.secondaryText);
+        BootTimingHeadline(headline,sizeof(headline),*timing0);
+        BootTimingRow(timing,sizeof(timing),*timing0,false);
+        if(WmTextWidth(timing)>int(w)-int(WmMetric(24)))BootTimingRow(timing,sizeof(timing),*timing0,true);
     } else {
         const uint64_t duration=CompositorBootDurationMs();
-        WmStrCopy(row,"Desktop ready in ",sizeof(row));DesktopNumber(number,duration/1000);
-        size_t n=strlen(row);WmStrCopy(row+n,number,sizeof(row)-n);n=strlen(row);row[n++]='.';row[n++]='0'+(duration/100)%10;row[n++]='0'+(duration/10)%10;row[n]=0;
-        WmStrCopy(row+n,KvmClockStableAvailable()?" s (VM start)":" s (kernel clock)",sizeof(row)-n);text(row,p.text);
-        text("Boot timing n/a",p.secondaryText);
+        char* row=headline;
+        WmStrCopy(row,"Desktop ready in ",sizeof(headline));DesktopNumber(number,duration/1000);
+        size_t n=strlen(row);WmStrCopy(row+n,number,sizeof(headline)-n);n=strlen(row);row[n++]='.';row[n++]='0'+(duration/100)%10;row[n++]='0'+(duration/10)%10;row[n]=0;
+        WmStrCopy(row+n,KvmClockStableAvailable()?" s (VM start)":" s (kernel clock)",sizeof(headline)-n);
+        WmStrCopy(timing,"Boot timing n/a",sizeof(timing));
     }
-    size_t n=0;
-    DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores | ",sizeof(row)-n);n=strlen(row);DesktopNumber(number,PmmGetFreePageCount()*4096/1048576);WmStrCopy(row+n,number,sizeof(row)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(row)-n);text(row,p.secondaryText);
-    text(CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",p.secondaryText);
-    WmStrCopy(row,"Build ",sizeof(row));WmStrCopy(row+6,BuildGitHash(),sizeof(row)-6);text(row,p.mutedText);
+    size_t n=0;char* row=machine;
+    DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores | ",sizeof(machine)-n);n=strlen(row);DesktopNumber(number,PmmGetFreePageCount()*4096/1048576);WmStrCopy(row+n,number,sizeof(machine)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(machine)-n);
+    WmStrCopy(build,"Build ",sizeof(build));WmStrCopy(build+6,BuildGitHash(),sizeof(build)-6);
+    const ChromeBootSummaryModel model{{x,y,int(w),int(h)},{headline,timing,machine,
+        CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",build}};
+    ChromeDisplayList list=ChromeListOn(g_shellListStorage);
+    ChromeBuildBootSummary(model,WmChromeStyle(),list);
+    ChromeExecute(list,{pixels,stride,sw,sh},WmDesktopFont());
 }
 
 // Tray tooltip for the TEMP metric (fits the 48-byte tooltip buffer).
