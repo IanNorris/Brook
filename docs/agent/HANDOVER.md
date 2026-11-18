@@ -92,6 +92,19 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**18 Nov late, gens 432–438 (autonomous, Ian away; current image gen 438 = `work/integration31` 39bf431f, payload `dell-int31-20261118`, session `c074200fc09541a4a0897600dc5bf5c5`):**
+- **Gen 430 merged to main** (`b6dfbb0d`; Ian confirmed fullscreen).
+- **Xwayland died when Steam opened a window (gen 432, int27 tiled buffers):** iris maps shared/scanout BOs with `I915_MMAP_OFFSET_WC`, which the kernel refused. WC is now served write-back like legacy GEM_MMAP (`f4be9ee0`).
+- **GPU clock stuck at 300 MHz since Ian's forced restart (Q2 demo ~65 → 47 swaps/s):** the render-clock request is gated on AC Online, and the Dell ACPI monitor refused admission. Cause: the MADT's processor-4 LAPIC NMI flags/LINT# bytes are uninitialised firmware memory and changed (0x6ceb/4 → 0x6cef/5). The pin now hashes a normalised MADT (`b821c97c`, `AcpiDellNormalizeMadt`, host test); admission logs which check failed. AC online again; Q2 demo 66.8 swaps, mean 22.0 ms, jobs at 500 MHz (`display-perf/build/dell/q2-436`).
+- **Per-page mapping-mutex convoy removed** (`work/mapping-convoy` d8cd5d26: lock-free `UserMappingPageAccess` for present user leaves).
+- **Global epoll mutex replaced by per-instance leaf locks** (`work/epoll-instance-lock` 42bdd722); the graph lock is only for epoll-in-epoll ADD.
+- **Torchlight II menu (800×600, Steam open):** ~9 displayed fps (gen 433) → 23.2 (gen 437: clock + mapping) → **25.3** (gen 438: + epoll), with no epoll or mapping mutex left in the blocking profile. GPU ~75% busy now. Evidence: `display-perf/build/dell/tl2-{433,437,438}-menu/`. Gameplay not yet measured.
+- **Stardew fullscreen 3200×1800 (gen 433, GPU at 300 MHz):** 22.6 displayed fps (was ~19 maximised): tiled buffers cut the game's GPU frame 30.8 → 19 ms. It is GPU-bound and the compositor spends 21.8 ms per frame redrawing a fullscreen opaque window. **Next:** re-measure at 500 MHz, then direct scanout of fullscreen X-tiled client buffers.
+- **Intermittent BDW submission failure hit Xwayland** on gen 438's first TL2 launch: the job never started (ring head=tail=acthd=0, no CSB), verified reset, sticky failure, so Mesa lost the device and Xwayland aborted (Steam exited). Same signature as gen 428. The second launch was fine. This is now the top stability bug.
+- **Automation:** Steam games start without Ian by writing `<client>/steamrt64/steam steam://rungameid/<id>` to `~/.steam/steam.pipe` (uid 1000). The TL2 Mod Launcher is dismissed with the store's xdotool (`DISPLAY=:0`, windowactivate plus `key space`).
+- **Known flake:** `test_intel_bdw_buffer` segfaults about 1 in 30 runs on the base as well.
+- **To merge after Ian's check:** `work/integration31` (int26 + xwl-pacing + WC + ACPI + mapping + epoll).
+
 **18 Nov night:**
 - **Gen 428 merged to main** (`6776790d`, Chromium fixes; Ian confirmed resize works).
 - **Graceful restart with a hung Chromium (YouTube):** windowless processes were escalated as designed (blockers 27 → 6), but Chromium pid 124 kept its window, ignored the WM close, and a bridge SIGTERM job timed out (jobs restricted while closing?). Ian had to force power-off.
