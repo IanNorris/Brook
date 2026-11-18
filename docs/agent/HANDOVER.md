@@ -92,6 +92,16 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**18 Nov later (Dell gen 425, main `c9e54176` with `work/brook-value` merged; Ian wants a docs pass at some point):**
+- **`sched lock-stats` during the matched demo** (bare metal): ready lock 23.9M acquisitions/~76 s, 9.7% contended, 855 ms wait. KernelRegionTryEnter and SchedulerKernelRegionLeave are 11.2M each, 93% of the traffic, ~630 ms of the wait. Evidence: `display-perf/build/dell/lockstats-demo.json`. Fix in progress: `work/kregion-lockfree`.
+- **Ian's Dell feedback:**
+  - Chromium: the cursor sticks on the resize cursor after crossing the window edge; rendering stops after a resize; ads/iframes don't render. Fix in progress: `work/chromium-fixes`.
+  - VSCodium errors on launch (needs a `--no-sandbox` wrapper).
+  - No Q2 launcher yet. Both launchers need /nix/store staging approval (asked).
+- **Approved:** staging the new brook-xwm. `work/xwayland-hidpi` is being rebased; then stage the bundle and deploy the pair.
+- **Next step agreed:** Xwayland GL games onto dma-buf/direct layers (`work/xwl-dmabuf`, in progress).
+- **AHCI spin budget:** keep 100 µs; A/B 25 µs on the next big Steam download (`bridge hardware ahci-spin-us N`).
+
 **18 Nov: Dell gen 424 `dell-int23-20261118` (session `c59d4ec167b645e4b9449e8acc2c2aa9`); main = `work/integration23`** (shell-opaque, storage-io, sched-convoy, and the zero-copy auto-arm retry thread `f03e922e`).
 - **Zero-copy active from boot** with no manual arm (the auto-arm retry works).
 - **AHCI MSI works on the Dell's Samsung PM851** (vector 64; 4,754 of 17,941 waits slept on the interrupt).
