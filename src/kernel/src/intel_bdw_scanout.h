@@ -5,6 +5,7 @@
 #include "intel_bdw_scratch_takeover.h"
 #include "intel_bdw_bcs_init.h"
 #include "intel_bdw_render_transaction.h"
+#include "intel_bdw_hang_diag.h"
 struct BrookGpuPresentProbe;
 namespace brook {
 struct BdwGpuBuffer;struct BdwFence;
@@ -203,6 +204,11 @@ struct BdwRenderRunResult {
     uint32_t contextHash=0;
     bool engineSampled=false;
     uint32_t head=0,tail=0,mode=0,control=0,acthd=0,ipeir=0,ipehr=0,execlist=0;
+    // Hang diagnostics (intel_bdw_hang_diag.h): per-job breadcrumb inputs,
+    // and the capture storage filled after a failed run before its reset
+    // (or after any run when hangCaptureAlways); nullptr = no capture.
+    BdwRenderJobDiag diag{};
+    BdwHangCapture* hangCapture=nullptr;bool hangCaptureAlways=false;
 };
 bool BdwRunRetainedRender(BdwRenderExecutionBackend& backend,uint64_t scratchDma,BdwRenderRunResult& result);
 bool BdwRetireRetainedRenderAfterReset(BdwRenderExecutionBackend& backend);

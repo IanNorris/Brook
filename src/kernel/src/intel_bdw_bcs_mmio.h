@@ -9,8 +9,11 @@ namespace brook {
 template<class Owner,uint32_t EngineBase> class BdwEngineMmio {
     static_assert(EngineBase==0x22000 || EngineBase==0x2000 || EngineBase==0x12000,"unsupported engine");
     Owner& owner_;volatile uint32_t* page_;uint64_t descriptor_=0;uint8_t portState_=0;
+    BdwExeclistInitDiag initDiag_{};
     bool mapped()const{return page_ && !(reinterpret_cast<uintptr_t>(page_)&3);}
 public:
+    // First failed execlist-init step of the last initializeExeclists.
+    BdwExeclistInitDiag InitDiag()const{return initDiag_;}
     BdwEngineMmio(Owner& owner,volatile uint32_t* page):owner_(owner),page_(page){}
     BdwEngineMmio(const BdwEngineMmio&)=delete;
     BdwEngineMmio& operator=(const BdwEngineMmio&)=delete;
@@ -23,15 +26,18 @@ public:
     bool synchronizeCsb(uint64_t hws){
         if(!owned() || !quiescent() || !owner_.resetVerified() || !csbPrepared(hws))return false;
         uint32_t ptr=0,producer=0;
+        auto fail=[&](uint8_t stage,uint32_t value){initDiag_.stage=stage;initDiag_.value=value;return false;};
         // Gen8 reset exposes an invalid hardware write cursor (7). Verify
         // that this reset state still holds before overwriting the cursor;
         // a stale/reset proof alone cannot rule out another submission.
-        if(!readReg(EngineBase+0x3a0,ptr) || ptr==0xffffffffu || (ptr&7u)!=7u ||
-           !writeReg(EngineBase+0x3a0,0xffff0505u) || !readReg(EngineBase+0x3a0,ptr) ||
-           !owner_.prepareCsbMemory(hws) || !writeReg(EngineBase+0x3a0,0xffff0505u) ||
-           !readReg(EngineBase+0x3a0,ptr) || (ptr&0x707u)!=0x505u ||
-           !owner_.csbMemoryProducer(hws,producer) || producer!=5)return false;
-        return owned() && quiescent() && owner_.resetVerified();
+        if(!readReg(EngineBase+0x3a0,ptr) || ptr==0xffffffffu || (ptr&7u)!=7u)return fail(6,ptr);
+        if(!writeReg(EngineBase+0x3a0,0xffff0505u) || !readReg(EngineBase+0x3a0,ptr))return fail(7,ptr);
+        if(!owner_.prepareCsbMemory(hws))return fail(8,ptr);
+        if(!writeReg(EngineBase+0x3a0,0xffff0505u) ||
+           !readReg(EngineBase+0x3a0,ptr) || (ptr&0x707u)!=0x505u)return fail(9,ptr);
+        if(!owner_.csbMemoryProducer(hws,producer) || producer!=5)return fail(10,producer);
+        if(!(owned() && quiescent() && owner_.resetVerified()))return fail(11,ptr);
+        return true;
     }
     bool readReg(uint32_t reg,uint32_t& value){
         if(!owned() || (reg!=EngineBase+0x29c && reg!=EngineBase+0x9c && reg!=EngineBase+0x80 && reg!=EngineBase+0x3a0))return false;
@@ -50,7 +56,7 @@ public:
         page_[(reg-EngineBase)/4]=value;
         __asm__ volatile("mfence":::"memory");return owner_.owned();
     }
-    bool initializeExeclists(uint64_t hws){return BdwInitializeEngineExeclists<EngineBase>(*this,hws);}
+    bool initializeExeclists(uint64_t hws){return BdwInitializeEngineExeclists<EngineBase>(*this,hws,&initDiag_);}
     // The four writes form one transaction: an empty second descriptor and
     // the validated first descriptor, high dword before low. Never reuse this
     // accessor after any failure or a completed submission.

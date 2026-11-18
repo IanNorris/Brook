@@ -7,8 +7,12 @@ namespace brook {
 // page tables and completion page, validate commands and maintain all DMA
 // mappings until verified retirement or reset. PPGTT selection does not by
 // itself establish command or memory isolation.
+// startedMarker (hang diagnostics, docs/gpu-hang-diagnostics.md): the CS
+// stall before the batch also posts the nonce to completion+16 with the same
+// PIPE_CONTROL post-sync write as the final breadcrumb, so a failure shows
+// whether the command streamer reached MI_BATCH_BUFFER_START.
 inline bool BdwBuildRenderRing(uint64_t batch,uint64_t completion,uint32_t nonce,
-                               bool ppgtt,bool gt3,uint32_t (&ring)[56]) {
+                               bool ppgtt,bool gt3,uint32_t (&ring)[56],bool startedMarker=false) {
     const uint64_t limit=ppgtt?(uint64_t{1}<<48):(uint64_t{1}<<32);
     if((batch&7) || batch>=limit || !completion || (completion&0x27) ||
        completion>(uint64_t{1}<<32)-8 || !nonce)return false;
@@ -18,6 +22,7 @@ inline bool BdwBuildRenderRing(uint64_t batch,uint64_t completion,uint32_t nonce
     constexpr uint32_t write=stall|qw|(1u<<24)|(1u<<7);
     const uint32_t initial[6]={pc,invalidate,0xd0,0,0,0};
     const uint32_t barrier[6]={pc,stall,0,0,0,0};
+    const uint32_t started[6]={pc,write,uint32_t(completion+16),0,nonce,0};
     uint32_t contextWa[20]{};BdwBuildRenderContextWa(gt3,contextWa);
     // Gen8: bit 8 selects the per-process graphics address space. The ring
     // itself remains privileged; it writes the breadcrumb via GGTT only.
@@ -28,7 +33,7 @@ inline bool BdwBuildRenderRing(uint64_t batch,uint64_t completion,uint32_t nonce
     for(auto word:initial)ring[cursor++]=word;
     for(auto word:barrier)ring[cursor++]=word;
     for(auto word:contextWa)ring[cursor++]=word;
-    for(auto word:barrier)ring[cursor++]=word;
+    for(auto word:startedMarker?started:barrier)ring[cursor++]=word;
     for(auto word:finish)ring[cursor++]=word;
     return true;
 }

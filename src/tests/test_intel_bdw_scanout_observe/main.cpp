@@ -83,6 +83,11 @@ BdwPrepareOutcome BdwPrepareRetainedSubmissionChecked(BdwExecSnapshot* s,const c
     reason="prepare";return BdwPrepareOutcome::Uncertain;
 }
 bool BdwUnwindFailedReprepare(){return reprepareUnwindable;}
+// Hang diagnostics (intel_bdw_hang_diag.cpp is covered by test_intel_bdw_hang_diag).
+static BdwHangCapture hangScratch;static unsigned hangNotes=0;
+BdwHangCapture* BdwHangScratchCapture(){return &hangScratch;}
+bool BdwHangTakeReferenceRequest(){return false;}
+void BdwHangNoteRenderJob(const BdwHangJobInfo&,const BdwRenderRunResult&,bool,bool){++hangNotes;}
 bool BdwRetireRetainedSubmission(BdwExecSnapshot* s){++workerRetired;return scenario>=82 && s;}
 bool BdwReuseRetainedRenderScratch(BdwOwnedPage& p,BdwGgttReservation& r){p={0x600000,reinterpret_cast<uint8_t*>(0x600000)};r={65544,29,2};return scenario>=81;}
 bool BdwRetainedBcsScratch(BdwOwnedPage& p){if(scenario<48)return false;p={0x400000,reinterpret_cast<uint8_t*>(0x400000)};return true;}
