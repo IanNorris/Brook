@@ -298,6 +298,13 @@ void DellAcpiMonitorConfigure() {
         char all[17],fadt[17],madt[17];hex8(diag.hash,all);hex8(diag.fadtHash,fadt);hex8(diag.madtHash,madt);
         KLog("dell-acpi: platform admission failed (firmware tables: %s; hash %s fadt %u/%s madt %u/%s ssdt %u fadt# %u madt# %u)",
             diag.reason?diag.reason:"?",all,diag.fadtLength,fadt,diag.madtLength,madt,diag.ssdts,diag.fadts,diag.madts);
+        // The MADT carries no secrets; dump it so a changed table can be diffed.
+        const uint32_t bytes=diag.madtLength<sizeof(diag.madt)?diag.madtLength:sizeof(diag.madt);
+        for(uint32_t off=0;off<bytes;off+=32) {
+            char line[65];const char* h="0123456789abcdef";uint32_t n=bytes-off<32?bytes-off:32;
+            for(uint32_t i=0;i<n;++i){line[2*i]=h[diag.madt[off+i]>>4];line[2*i+1]=h[diag.madt[off+i]&15];}line[2*n]=0;
+            KLog("dell-acpi: madt %03u %s",off,line);
+        }
         return;
     }
     if(power.pm1aControl!=PowerControl || power.pm1bControl ||

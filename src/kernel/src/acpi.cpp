@@ -241,6 +241,7 @@ uint64_t AcpiAdmitDellMonitorFirmware(AcpiDellAdmitDiag* diag) {
     const uint64_t madt=g_tables.Find("APIC",&header);
     if(!add(madt,header))return refuse("MADT outside firmware memory");
     d.madtLength=header.length;prefix(madt,header.length,d.madtHash);
+    __builtin_memcpy(d.madt,reinterpret_cast<const void*>(madt),header.length<sizeof(d.madt)?header.length:sizeof(d.madt));
     const uint64_t dsdt=g_tables.Dsdt(&header);
     if(!add(dsdt,header))return refuse("DSDT outside firmware memory");
     unsigned ssdts=0,fadts=0,madts=0;
