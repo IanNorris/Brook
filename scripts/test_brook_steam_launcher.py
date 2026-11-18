@@ -45,7 +45,7 @@ parser.add_argument('--client'); parser.add_argument('--display'); parser.add_ar
 args, _ = parser.parse_known_args()
 open({record!r} + '/helper.json', 'w').write(__import__('json').dumps(dict(
     argv=sys.argv, display=args.display, pulse=args.pulse_server,
-    software=os.environ.get('LIBGL_ALWAYS_SOFTWARE'))))
+    software=os.environ.get('LIBGL_ALWAYS_SOFTWARE'), ui_scale=os.environ.get('STEAM_FORCE_DESKTOPUI_SCALING'))))
 env = dict(os.environ, DISPLAY=args.display, PULSE_SERVER=args.pulse_server or '')
 steam = args.client + '/steamrt64/steam'
 sys.exit(subprocess.call([steam, {fake_steam!r}], executable=sys.executable, env=env))
@@ -175,6 +175,7 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(helper['display'], self.display)
         self.assertTrue(helper['pulse'].startswith('unix:' + str(self.root / 'run')))
         self.assertIsNone(helper['software'])  # rootless GPU mode: no forced llvmpipe
+        self.assertEqual(helper['ui_scale'], self.env.get('BROOK_STEAM_UI_SCALE'))
 
     def test_check_reports_display(self):
         self.helper('stay')
@@ -244,6 +245,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_windowless_steam_is_ended(self):
         self.helper('tray')
+        self.env['BROOK_STEAM_UI_SCALE'] = '2'  # the fake client records STEAM_FORCE_DESKTOPUI_SCALING
         started = time.monotonic()
         launcher = self.launch('--windowless-grace', '3', '--startup-timeout', '60')
         out, err = launcher.communicate(timeout=60)
