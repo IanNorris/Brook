@@ -24,6 +24,7 @@ static int test_ioctl(int fd,unsigned long request,...);
 #undef syscall
 #undef fprintf
 #ifdef BROOK_DIRECT_TEST
+static int resize_calls;static long resize_w,resize_h;static uint32_t resize_vfb[16];
 static int direct_status=1,direct_calls,window_queries,window_stale,direct_mutate_commit,peer_error,source_begins,source_tags,source_begin_error;
 BrookVkSurface *test_surface_create(int software){(void)software;return (BrookVkSurface *)(uintptr_t)1;}
 const char *test_surface_device(const BrookVkSurface *s){(void)s;return "test";}
@@ -67,6 +68,12 @@ static long test_syscall(long number, ...)
     if(number==BROOK_SYS_WM_PUBLISH_SOURCE_COMMIT){
         long window=va_arg(args,long),incarnation=va_arg(args,long),commit=va_arg(args,long);va_end(args);
         assert(window==1 && incarnation==77 && commit>0);++source_tags;return 0;
+    }
+    if(number==BROOK_SYS_WM_RESIZE_VFB){
+        long window=va_arg(args,long),w=va_arg(args,long),h=va_arg(args,long);
+        struct brook_wm_create_out *out=(void *)(uintptr_t)va_arg(args,long);va_end(args);
+        ++resize_calls;resize_w=w;resize_h=h;
+        *out=(struct brook_wm_create_out){(uint32_t)window,(uint32_t)w,(uintptr_t)resize_vfb};return 0;
     }
     if(number==BROOK_SYS_GPU_WINDOW_PEER_RECOVERY){va_end(args);if(peer_error){errno=peer_error;return -1;}return 0;}
     if(number==BROOK_SYS_WM_WINDOW_STATE){
@@ -388,6 +395,10 @@ static void check_gpu_window_layers(void)
     assert(single.version==BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN && single.identity.commit==root.publish_commit);
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_RETAIN,BROOK_GPU_WINDOW_PRESENTED,&single.identity)==1);
     intel_pending_poll();
+    /* The window's VFB is still an older size (it resized while layered):
+     * the layered offer must resize it to the root's committed size, as a
+     * single offer does, or the renderer clips the layers to the old size. */
+    root.vfb_w=root.vfb_h=3;resize_calls=0;
     /* 2. A synchronized subsurface with its own DMA-BUF joins on the next root commit. */
     subcomp_get_subsurface(client,sc,8,child->resource,root.resource);assert(child->tree.parent==&root.tree);
     surface_attach(client,child->resource,childBuffer,0,0);surface_commit(client,child->resource);
@@ -409,6 +420,7 @@ static void check_gpu_window_layers(void)
     assert(layered.header.identity.commit>single.identity.commit && layered.header.identity.commit==root.publish_commit);
     assert(layered.layers[1].dstX==0 && layered.layers[1].dstWidth==1 && layered.layers[1].srcWidth==1);
     assert(g_gpu_group_offers==groupsBefore+1 && rootImage->group_refs==1 && childImage->group_refs==1);
+    assert(resize_calls==1 && resize_w==1 && resize_h==1 && root.vfb_w==1 && root.vfb_h==1 && root.vfb==resize_vfb);
     assert(childImage->offer_state==1 && rootImage->offer_state==1 && g_layer_readback_bytes==readbackBefore);
     /* Never presented: frame callbacks are still released after the fallback delay. */
     /* Any pending image, whatever its offer state, is due after the delay from queueing. */
@@ -423,8 +435,21 @@ static void check_gpu_window_layers(void)
     /* 4. PRESENTED, then SAFE of the layered commit releases its group. */
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_PRESENTED,&layered.header.identity)==1);
     intel_pending_poll();assert(childImage->gpu_presented && rootImage->gpu_presented && g_gpu_group_presented>=1);
+    /* 4b. The window can no longer be offered as layers (a transformed
+     * subsurface): both layers held by the presented group are read back and
+     * composed on the CPU, instead of the renderer showing that group forever. */
+    {struct brook_view *cv=child->tree.current->value;const uint64_t snapshots=g_intel_retained_snapshots;
+     cv->geometry.transform=1;assert(surface_render(&root));
+     assert(childImage->want_pixels || childImage->pending_cpu==0);
+     for(int k=0;k<4 && (childImage->pending_cpu || rootImage->pending_cpu);++k)intel_pending_poll();
+     assert(!childImage->pending_cpu && !rootImage->pending_cpu && g_intel_retained_snapshots==snapshots+2);
+     assert(childImage->pending_fd>=0 && rootImage->pending_fd>=0 && childImage->offer_state==1);
+     cv->geometry.transform=0;}
     assert(brook_gpu_window_send_reply(channel[1],BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS,BROOK_GPU_WINDOW_SAFE,&layered.header.identity)==1);
     intel_pending_poll();assert(g_gpu_window_channel>=0 && !rootImage->group_refs && !childImage->group_refs && g_gpu_group_safe>=1);
+    /* The group's SAFE retires the read-back images too: their client
+     * buffers are released (fds closed), not left waiting forever. */
+    intel_pending_poll();assert(childImage->pending_fd<0 && rootImage->pending_fd<0);
     for(unsigned i=0;i<GPU_GROUPS;++i)assert(!g_gpu_groups[i].live);
     bt_state_set(&child->tree.current,NULL);bt_state_set(&child->tree.latest,NULL);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);

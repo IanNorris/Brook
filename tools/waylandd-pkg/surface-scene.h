@@ -361,9 +361,14 @@ static int surface_render(struct brook_surface *root) {
         /* An offered GPU source can stand for the window only as its sole,
          * unchanged root layer. Anything else needs CPU pixels now, without
          * waiting for the renderer to give the source back. */
-        struct brook_image *held=draws[i].view->image;
-        if(held->offer_state==1 && !held->group_refs && (count!=1 || draws[0].view!=base ||
-           memcmp(&base->geometry,&held->offer_geometry,sizeof(base->geometry))))intel_image_want_pixels(held);
+        /* That includes an image held by a presented layered commit: when
+         * the window can no longer be offered as layers (a new layer shape,
+         * a CPU fallback for another layer) nothing newer would replace that
+         * commit, and the renderer would keep showing it while the client
+         * keeps drawing (frozen content). Snapshot every such layer. */
+        for(unsigned j=i;j<count;++j){struct brook_image *held=draws[j].view->image;
+            if(held->pending_cpu && held->offer_state==1 && (held->group_refs || count!=1 || draws[0].view!=base ||
+               memcmp(&base->geometry,&held->offer_geometry,sizeof(base->geometry))))intel_image_want_pixels(held);}
         return 1;
     }
     if (!surface_window(root,base)) return 0;

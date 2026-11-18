@@ -119,6 +119,7 @@ struct brook_wm_event {
 #define WM_EVT_FOCUS_GAINED    0x81
 #define WM_EVT_FOCUS_LOST      0x82
 #define WM_EVT_RESIZED         0x83
+#define WM_EVT_POINTER_LEFT    0x84 /* pointer left this window's client area */
 #define WM_RESIZE_MAXIMIZED     1
 #define WM_RESIZE_RESIZING      2
 
@@ -199,10 +200,19 @@ static long wm_begin_resize(uint32_t id, uint32_t edges) {
 static long wm_set_cursor_visible(int visible) {
     return syscall(BROOK_SYS_WM_SET_CURSOR_VISIBLE, (long)(visible != 0));
 }
+/* The 6th argument names the window the cursor was set for (tag | wm id):
+ * the kernel shows it only over that window's client area and the built-in
+ * arrow elsewhere. 0 (no window known) leaves ownership to the kernel. */
+#define BROOK_CURSOR_OWNER_TAG (0xC5C50000ull<<32)
+static long wm_set_cursor_image_for(const uint32_t *pixels, uint32_t w, uint32_t h,
+                                    int32_t hot_x, int32_t hot_y, uint32_t owner_wm) {
+    return syscall(BROOK_SYS_WM_SET_CURSOR_IMAGE, (long)pixels, (long)w,
+                   (long)h, (long)hot_x, (long)hot_y,
+                   owner_wm ? (long)(BROOK_CURSOR_OWNER_TAG|owner_wm) : 0L);
+}
 static long wm_set_cursor_image(const uint32_t *pixels, uint32_t w, uint32_t h,
                                 int32_t hot_x, int32_t hot_y) {
-    return syscall(BROOK_SYS_WM_SET_CURSOR_IMAGE, (long)pixels, (long)w,
-                   (long)h, (long)hot_x, (long)hot_y);
+    return wm_set_cursor_image_for(pixels, w, h, hot_x, hot_y, 0);
 }
 static long wm_get_screen_info(uint32_t *w_out, uint32_t *h_out) {
     uint32_t buf[2] = {0, 0};
@@ -418,6 +428,7 @@ struct brook_surface {
     int32_t cursor_hot_x;
     int32_t cursor_hot_y;
     uint32_t cursor_output_scale;
+    uint32_t cursor_owner_wm; /* root window of the surface it was set over */
 
     /* Linked list of all surfaces — used by the input pump. */
     struct brook_surface *next;
@@ -727,7 +738,7 @@ static void surface_cursor_commit(struct brook_surface *s) {
         brook_geometry_pixel(&cursor,image->width,image->height,x,y,&px,&py);
         pixels[y*dw+x]=image->pixels[(size_t)py*image->width+px];
     }
-    wm_set_cursor_image(pixels,dw,dh,(int64_t)s->cursor_hot_x*dw/g->w,(int64_t)s->cursor_hot_y*dh/g->h);
+    wm_set_cursor_image_for(pixels,dw,dh,(int64_t)s->cursor_hot_x*dw/g->w,(int64_t)s->cursor_hot_y*dh/g->h,s->cursor_owner_wm);
 }
 /* Configure size and state form one transaction. Focus changes may supersede
  * its serial, but must preserve both dimensions and management state. */
@@ -1554,6 +1565,9 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
             cs->cursor_output_scale=sc->entered_surface?surface_output_scale(sc->entered_surface):g_output_scale;
             cs->cursor_hot_x = hx;
             cs->cursor_hot_y = hy;
+            struct brook_surface *owner = sc->entered_surface;
+            while (owner && owner->subsurface_parent) owner = owner->subsurface_parent;
+            cs->cursor_owner_wm = owner ? owner->wm_id : 0;
         }
 
         /* set_cursor selects committed content. Pending attachments and
@@ -2031,6 +2045,26 @@ static void dispatch_surface_event(struct brook_surface *s,
                     e->mods, depressed, locked);
         sc->kb_mods_depressed = depressed;
         sc->kb_mods_locked    = locked;
+        break;
+    }
+    case WM_EVT_POINTER_LEFT: {
+        /* The kernel routes pointer input only to the client area under
+         * it, so without this a client never learns the pointer went to
+         * the desktop, WM chrome or another client's window. Chromium then
+         * keeps its hover state and the cursor it last set (its resize
+         * cursor from the shadow edge) when the pointer comes back; with
+         * leave, the next event re-enters and it sets its cursor again. */
+        if (!sc || !sc->pointer || !sc->entered_surface || sc->buttons) break;
+        struct brook_surface *root = sc->entered_surface;
+        while (root->subsurface_parent) root = root->subsurface_parent;
+        if (root != s) break;
+        struct wl_resource *prev = sc->entered_surface->resource;
+        if (prev && wl_resource_get_client(prev) == sc->client) {
+            wl_pointer_send_leave(sc->pointer, next_serial(), prev);
+            if (wl_resource_get_version(sc->pointer) >= 5)
+                wl_pointer_send_frame(sc->pointer);
+        }
+        sc->entered_surface = NULL;
         break;
     }
     case WM_EVT_CLOSE_REQUESTED: {
@@ -3288,7 +3322,10 @@ static void gpu_group_presented(struct gpu_group *g){
 }
 static void gpu_group_release(struct gpu_group *g){
     for(unsigned i=0;i<g->count;++i){struct brook_image *image=g->images[i];
-        if(image->group_refs && !--image->group_refs && image->offer_state==1 && image->pending_cpu==1){
+        /* Also an image whose pixels were taken while the group held it
+         * (pending_cpu 0, fd still open): it waits in the queue at state 1,
+         * and only this SAFE can retire it and release the client's buffer. */
+        if(image->group_refs && !--image->group_refs && image->offer_state==1 && image->pending_fd>=0){
             image->offer_state=2;intel_pending_schedule();}
         image_unref(image);}
     *g=(struct gpu_group){0};
@@ -3344,6 +3381,13 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
         l->dstX=(int32_t)(draws[i].x*(int64_t)scale);l->dstY=(int32_t)(draws[i].y*(int64_t)scale);
         l->dstWidth=g->w*scale;l->dstHeight=g->h*scale;
     }
+    /* The root's committed size is the window's size, exactly as for a
+     * single offer. Without this a window that resized while it had a
+     * subsurface (Chromium's video or ad overlays) kept its old VFB, and so
+     * its old kernel size: the renderer clipped every layer to it, and the
+     * WM, captions and later configures used the stale size. */
+    if(!root->tree.current->value || !surface_window(root,(struct brook_view *)root->tree.current->value) ||
+       !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
     BrookWindowState window={0};
     if(syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
        window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id){++g_gpu_offer_metadata;return 0;}
