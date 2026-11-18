@@ -124,9 +124,7 @@ Use `sched lock-stats` on the Dell to confirm before changing it.
 
 ## Follow-ups (not done)
 
-- Kernel-region enter/leave: make the outermost enter lock-free. This needs a
-  store-then-load (Dekker) protocol shared with `SchedulerMarkTerminated`, which
-  currently reads depth and then publishes Terminated under the ready lock.
+- Kernel-region enter/leave: done on `work/kregion-lockfree`; see below.
 - Block then yield takes the ready lock twice (`SchedulerBlockImpl`, then
   `SchedulerYield`). Merging them is equivalent to an existing interleaving,
   but the hosted block tests inject races between the two, so it needs test
@@ -138,3 +136,46 @@ Use `sched lock-stats` on the Dell to confirm before changing it.
   This is not part of the scheduler convoy, but under host load it serialises
   senders for as long as QEMU takes. It needs more than one TX descriptor
   instead of the wait.
+
+## Lock-free kernel regions
+
+The Dell's matched yquake2 demo (gen 425) put 23.94M ready-lock acquisitions
+in about 76 s, and 93% were `KernelRegionTryEnter`/`SchedulerKernelRegionLeave`:
+two per user copy. Both now avoid the lock (`kernel_region.h`).
+
+Entry and termination form a store-buffering pair. With IF clear, the entering
+CPU increments depth (locked RMW), sets the operation latch, fences, then reads
+the new `terminalClaim` byte and the state. `SchedulerMarkTerminated` still
+runs under the ready lock: for a live process it sets the claim, fences, then
+reads depth and latch. If either is set it clears the claim and defers through
+`terminalPending` as before. Otherwise it keeps the claim and publishes
+Terminated before unlocking. If entry sees the claim or Terminated, it resolves
+under the ready lock, where the decision is settled: either succeed, or
+withdraw the depth and latch it set and fail. Leave is a CAS decrement with no
+lock, because the latch keeps termination deferred until the locked operation
+boundary clears it.
+
+`test_kernel_region` checks every branch, the real header under a threaded
+stress (200,000 races with no in-region termination or spurious failure), and
+an exhaustive x86-TSO store-buffer model. The model covers enter, leave,
+boundary and a second enter, against a locked terminator: 282 states with no
+in-region Terminated state and no failed entry without termination. As a
+self-check, the model finds violations when the terminator fence is removed,
+or when the owner uses a plain store with no fence.
+
+`sched kregion locked|lockfree|status` restores the former locked entry and
+leave at runtime for A/B measurement. Mixing modes is safe because locked entry
+is serialized with the terminator.
+
+QEMU, same VM, alternating `sched kregion` modes, two repetitions each, with
+the guest running a four-thread small-file write/read workload plus a pipe
+ping-pong (`build/kregion/io_load.py`) and then the 200 x 1 ms sleep loop:
+
+| Mode | Ready-lock acquisitions | Contended | Wait | Region sites | Workload |
+| --- | --- | --- | --- | --- | --- |
+| locked (former) | 1.57M / 1.58M | 806k / 697k | 481 / 359 ms | 1.40M (89%) | 0.554 / 0.511 s |
+| lock-free | 0.347M / 0.346M | 74k / 75k | 42 / 44 ms | 0 | 0.411 / 0.413 s |
+
+The resolve path was never taken (no `KernelRegionTryEnter` lock site). Under
+the pinned-overcommit load from above, neither mode froze, and acquisitions
+fell from 2.80M to 1.39M; latency there is dominated by CPU contention.

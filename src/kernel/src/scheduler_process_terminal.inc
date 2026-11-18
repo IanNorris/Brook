@@ -1,14 +1,15 @@
 // Production scheduler lifecycle paths, included within namespace brook.
+// (kernel_region.h is included by the including file, outside the namespace.)
 bool SchedulerKernelOperationBoundary()
 {
     Process* proc = SchedulerCurrentProcess();
     if (!proc) return false;
     uint64_t flags = SchedLockAcquire(g_readyLock);
-    if (proc->kernelRegionDepth) {
+    if (__atomic_load_n(&proc->kernelRegionDepth, __ATOMIC_RELAXED)) {
         SchedLockRelease(g_readyLock, flags);
         return false;
     }
-    proc->kernelOperationProtected = false;
+    __atomic_store_n(&proc->kernelOperationProtected, false, __ATOMIC_RELAXED);
     bool pending = proc->terminalPending;
     int status = proc->pendingWaitStatus;
     proc->terminalPending = false;
@@ -31,8 +32,9 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
     // targets. All nonterminal state transitions use this same ready lock.
     uint64_t rlf = SchedLockAcquire(g_readyLock);
     ProcessRef(proc);
+    // Store-then-load against lock-free region entry (kernel_region.h).
     if (proc->state != ProcessState::Terminated &&
-        (proc->kernelRegionDepth || proc->kernelOperationProtected)) {
+        KernelRegionBusyForTerminationLocked(proc)) {
         if (!proc->terminalPending) proc->pendingWaitStatus = waitStatus;
         proc->terminalPending = true;
         bool resume = proc->state == ProcessState::Stopped || proc->interruptibleWait;

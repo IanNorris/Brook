@@ -5586,6 +5586,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched lock-trace on|off|reset|status - ready-lock ticket and clock observations\n"
             "  sched lock-stats on|off|reset|status - scheduler-lock hold/wait/handoff histograms and sites (default off)\n"
             "  sched lock-mode ticket|unfair|status - FIFO tickets or unfair claims (default unfair under a hypervisor)\n"
+            "  sched kregion locked|lockfree|status - kernel-region entry via ready lock (A/B) or lock-free (default)\n"
             "  sched idle-skip on|off|status - idle ticks skip the ready lock while nothing is queued (default on)\n"
             "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
@@ -7118,6 +7119,11 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         int mode=NetStrEq(cmd,"sched lock-mode ticket")?0:NetStrEq(cmd,"sched lock-mode unfair")?1:-1;
         const bool unfair=SchedulerLockUnfairMode(mode);BridgeReply r;
         r.text("{\"mode\":");r.text(unfair?"\"unfair\"":"\"ticket\"");r.text("}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"sched kregion locked") || NetStrEq(cmd,"sched kregion lockfree") || NetStrEq(cmd,"sched kregion status")){
+        int mode=NetStrEq(cmd,"sched kregion locked")?1:NetStrEq(cmd,"sched kregion lockfree")?0:-1;
+        const bool locked=SchedulerKernelRegionLockedMode(mode);BridgeReply r;
+        r.text("{\"mode\":");r.text(locked?"\"locked\"":"\"lockfree\"");r.text("}\n");r.send();
     }
     else if(NetStrEq(cmd,"sched idle-skip on") || NetStrEq(cmd,"sched idle-skip off") || NetStrEq(cmd,"sched idle-skip status")){
         int mode=NetStrEq(cmd,"sched idle-skip on")?1:NetStrEq(cmd,"sched idle-skip off")?0:-1;
