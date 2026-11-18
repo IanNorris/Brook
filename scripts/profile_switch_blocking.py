@@ -2,6 +2,7 @@
 """Blocked time per pid by switch-out kernel stack, from a Brook profiler
 capture (CS records, 1 ms ticks). Usage: profile_switch_blocking.py prof.txt kernel.elf [pid_hex,...]
 Used to find the gen 427 epoll/mapping-mutex convoys (docs/xwayland-window-integration.md)."""
+import sys,collections,subprocess
 prof,elf=sys.argv[1],sys.argv[2]
 want=sys.argv[3].split(',') if len(sys.argv)>3 else None
 lastout={}
