@@ -1,58 +1,47 @@
-// CPU raster primitives for kernel-drawn desktop chrome: fills, glyph runs,
-// icons and the translucent-material fill rule. Moved unchanged out of
-// window.cpp (compositor refactor stage 0.3); the window frame, taskbar,
-// launcher and popup painters call these. A later stage turns them into the
-// CPU executor of the chrome display list.
+// CPU raster primitives for desktop chrome, and the display-list executor
+// built from them (compositor refactor stages 0.3 and 1.2). The primitives
+// are the painters' historical ones, unchanged apart from taking the font
+// and target explicitly, so lists reproduce the old pixels exactly.
+// Freestanding: no kernel dependencies.
 #include "chrome_raster.h"
 #include "chrome_material.h"
-#include "compositor.h"
-#include "font_atlas.h"
-#include "window.h"
 
 namespace brook {
 
-int WmTextWidth(const char* text)
+static constexpr int ChromeIconSourcePx = 24; // LAUNCHER_ICON_PX
+
+int ChromeTextWidth(const FontAtlas& font, const char* text)
 {
     int width = 0;
     for (; *text; ++text)
     {
         uint32_t code = static_cast<uint8_t>(*text);
-        if (code >= WmDesktopFont().firstChar && code < WmDesktopFont().firstChar + WmDesktopFont().glyphCount)
-            width += WmDesktopFont().glyphs[code - WmDesktopFont().firstChar].advance;
+        if (code >= font.firstChar && code < font.firstChar + font.glyphCount)
+            width += font.glyphs[code - font.firstChar].advance;
     }
     return width;
 }
 
-// Pixel write into buffer with bounds check
-static inline void WmPutPixel(uint32_t* buf, uint32_t stride,
-                               uint32_t screenW, uint32_t screenH,
-                               int x, int y, uint32_t color)
+// Pixel write into the target with bounds check
+static inline void ChromePutPixel(const ChromeTarget& t, int x, int y, uint32_t color)
 {
+    x -= t.originX; y -= t.originY;
     if (x < 0 || y < 0) return;
-    if (static_cast<uint32_t>(x) >= screenW) return;
-    if (static_cast<uint32_t>(y) >= screenH) return;
-    buf[y * stride + x] = color;
+    if (static_cast<uint32_t>(x) >= t.width) return;
+    if (static_cast<uint32_t>(y) >= t.height) return;
+    t.pixels[static_cast<uint64_t>(y) * t.stride + x] = color;
 }
 
-// Fill a rectangle
-void WmFillRect(uint32_t* buf, uint32_t stride,
-                        uint32_t screenW, uint32_t screenH,
-                        int x0, int y0, int w, int h, uint32_t color)
+void ChromeFillRect(const ChromeTarget& t, int x0, int y0, int w, int h, uint32_t color)
 {
     for (int y = y0; y < y0 + h; ++y)
         for (int x = x0; x < x0 + w; ++x)
-            WmPutPixel(buf, stride, screenW, screenH, x, y, color);
+            ChromePutPixel(t, x, y, color);
 }
 
-// Render a single glyph from g_fontAtlas at (penX, penY) into buffer.
-// Returns advance width. Clips pixels to [0, clipRight) horizontally.
-int WmRenderGlyph(uint32_t* buf, uint32_t stride,
-                          uint32_t screenW, uint32_t screenH,
-                          int penX, int penY, int code,
-                          uint32_t fg, uint32_t bg,
-                          int clipRight, const WmRect* clip)
+int ChromeRenderGlyph(const ChromeTarget& t, const FontAtlas& fa, int penX, int penY, int code,
+                      uint32_t fg, int clipRight, const DesktopRect* clip)
 {
-    const FontAtlas& fa = WmDesktopFont();
     if (code < static_cast<int>(fa.firstChar) ||
         code >= static_cast<int>(fa.firstChar + fa.glyphCount))
         return 0;
@@ -64,8 +53,6 @@ int WmRenderGlyph(uint32_t* buf, uint32_t stride,
     int drawX = penX + gi.bearingX;
     int drawY = penY + fa.ascent - gi.bearingY;
 
-    int maxX = (clipRight > 0) ? clipRight : static_cast<int>(screenW);
-
     for (int row = 0; row < gh; ++row)
     {
         for (int col = 0; col < gw; ++col)
@@ -74,92 +61,54 @@ int WmRenderGlyph(uint32_t* buf, uint32_t stride,
                                      + (gi.atlasX0 + col)];
             if (cov == 0) continue;
 
-            int px = drawX + col;
-            int py = drawY + row;
-            if (px < 0 || py < 0) continue;
-            if (clip && !clip->contains(px,py)) continue;
-            if (px >= maxX) continue;
-            if (static_cast<uint32_t>(px) >= screenW) continue;
-            if (static_cast<uint32_t>(py) >= screenH) continue;
+            const int px = drawX + col, py = drawY + row;
+            if (clip && !clip->contains(px, py)) continue;
+            if (clipRight > 0 && px >= clipRight) continue;
+            const int tx = px - t.originX, ty = py - t.originY;
+            if (tx < 0 || ty < 0) continue;
+            if (static_cast<uint32_t>(tx) >= t.width) continue;
+            if (static_cast<uint32_t>(ty) >= t.height) continue;
 
             // Preserve foreground coverage over a translucent material fill.
             // Legacy RGB buffers have alpha zero and remain fully opaque.
-            (void)bg;
-            auto& destination=buf[py*stride+px];
-            destination=ChromePixelOver(destination,(uint32_t(cov)<<24)|(fg&0xffffff));
+            auto& destination = t.pixels[static_cast<uint64_t>(ty) * t.stride + tx];
+            destination = ChromePixelOver(destination, (uint32_t(cov) << 24) | (fg & 0xffffff));
         }
     }
 
     return gi.advance;
 }
 
-// Render a string, optionally clipped to maxWidth pixels from starting x.
-// maxWidth <= 0 means no clipping.
-void WmRenderString(uint32_t* buf, uint32_t stride,
-                            uint32_t screenW, uint32_t screenH,
-                            int x, int y, const char* str,
-                            uint32_t fg, uint32_t bg,
-                            int maxWidth, const WmRect* clip)
+void ChromeRenderString(const ChromeTarget& t, const FontAtlas& font, int x, int y, const char* str,
+                        uint32_t fg, int maxWidth, const DesktopRect* clip)
 {
     int penX = x;
     int clipRight = (maxWidth > 0) ? (x + maxWidth) : 0;
     while (*str)
     {
         if (maxWidth > 0 && (penX - x) >= maxWidth) break;
-        penX += WmRenderGlyph(buf, stride, screenW, screenH,
-                               penX, y, static_cast<uint8_t>(*str), fg, bg,
-                               clipRight, clip);
+        penX += ChromeRenderGlyph(t, font, penX, y, static_cast<uint8_t>(*str), fg, clipRight, clip);
         ++str;
     }
 }
 
-// Keep pale launcher labels legible when a low-opacity panel crosses bright
-// client content. The narrow outline follows glyph coverage, not a solid box.
-void WmRenderMaterialString(uint32_t* buf,uint32_t stride,uint32_t sw,uint32_t sh,
-                                  int x,int y,const char* text,uint32_t fg,uint32_t bg,int width)
+void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels)
 {
-    const unsigned brightness=(((fg>>16)&255)+((fg>>8)&255)+(fg&255))/3;
-    if(CompositorGlassActive() && CompositorMaterialOpacity()<180 && brightness>128){
-        const int offset=WmMetric(1);
-        WmRenderString(buf,stride,sw,sh,x-offset,y,text,WmCurrentPalette().halo,bg,width);
-        WmRenderString(buf,stride,sw,sh,x+offset,y,text,WmCurrentPalette().halo,bg,width);
-        WmRenderString(buf,stride,sw,sh,x,y-offset,text,WmCurrentPalette().halo,bg,width);
-        WmRenderString(buf,stride,sw,sh,x,y+offset,text,WmCurrentPalette().halo,bg,width);
-    }
-    WmRenderString(buf,stride,sw,sh,x,y,text,fg,bg,width);
+    if (!pixels) return;
+    for (int row = 0; row < size; ++row)
+        for (int col = 0; col < size; ++col)
+        {
+            const int tx = x + col - t.originX, ty = y + row - t.originY;
+            if (tx < 0 || ty < 0 || tx >= static_cast<int>(t.width) || ty >= static_cast<int>(t.height)) continue;
+            const uint32_t src = pixels[(row * ChromeIconSourcePx / size) * ChromeIconSourcePx +
+                                        col * ChromeIconSourcePx / size];
+            if (!(src >> 24)) continue;
+            auto& destination = t.pixels[static_cast<uint64_t>(ty) * t.stride + tx];
+            destination = ChromePixelOver(destination, src);
+        }
 }
 
-// Shared straight-alpha ARGB renderer. No VFS access or ownership transfer in
-// the compositor path; icons are immutable for the launcher's lifetime.
-void WmDrawIcon(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                       int x, int y, int size, const uint32_t* pixels)
-{
-    if (pixels)
-    {
-        for (int row = 0; row < size; ++row)
-            for (int col = 0; col < size; ++col)
-            {
-                const int px = x + col, py = y + row;
-                if (px < 0 || py < 0 || px >= static_cast<int>(screenW) || py >= static_cast<int>(screenH)) continue;
-                const uint32_t src = pixels[(row * LAUNCHER_ICON_PX / size) * LAUNCHER_ICON_PX + col * LAUNCHER_ICON_PX / size];
-                if(!(src>>24))continue;
-                auto& destination=buf[py*stride+px];
-                destination=ChromePixelOver(destination,src);
-            }
-        return;
-    }
-    // Missing asset: a neutral application-window glyph, never a misleading
-    // letter tile or a guessed application logo.
-    WmFillRect(buf, stride, screenW, screenH, x + 2, y + 3, size - 4, size - 6, WmCurrentPalette().mutedText);
-    WmFillRect(buf, stride, screenW, screenH, x + 3, y + 7, size - 6, size - 11, WmCurrentPalette().itemHover);
-    WmFillRect(buf, stride, screenW, screenH, x + 5, y + 5, 2, 1, WmCurrentPalette().titleInactive);
-}
-
-uint32_t WmMaterialColor(uint32_t color){
-    return (color&0xffffff)|(CompositorGlassActive()?CompositorMaterialOpacity()<<24:0xff000000u);
-}
-
-uint32_t WmBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
+uint32_t ChromeBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
 {
     uint32_t out = 0;
     for (uint32_t shift = 0; shift <= 16; shift += 8) {
@@ -169,11 +118,52 @@ uint32_t WmBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
     return out;
 }
 
-void WmMaterialRect(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect& r,uint32_t color){
-    const unsigned radius=CompositorGlassActive()?WmMetric(4):0;
-    for(int y=0;y<r.h;++y){const unsigned row=y<r.h/2?y:r.h-1-y;
-        const int inset=ChromeCornerInset(radius,row);
-        WmFillRect(pixels,stride,sw,sh,r.x+inset,r.y+y,r.w-2*inset,1,WmMaterialColor(color));
+void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const FontAtlas& font)
+{
+    if (!t.pixels || !t.width || !t.height) return;
+    for (uint32_t i = 0; i < list.Count(); ++i)
+    {
+        const ChromeCmd& c = list.At(i);
+        switch (c.op)
+        {
+        case ChromeOp::Fill:
+            ChromeFillRect(t, c.x, c.y, c.w, c.h, c.color);
+            break;
+        case ChromeOp::Rows:
+            for (int row = 0; row < c.h; ++row)
+                ChromeFillRect(t, c.x, c.y + row, c.w, 1, static_cast<const uint32_t*>(c.data)[row]);
+            break;
+        case ChromeOp::CornerFill:
+            if (!c.arg) { ChromeFillRect(t, c.x, c.y, c.w, c.h, c.color); break; }
+            for (int row = c.y; row < c.y + c.h; ++row)
+            {
+                const int r = row - c.clip.y;
+                const int right = c.clip.x + c.clip.w -
+                    (r >= 0 ? static_cast<int>(ChromeCornerInset(c.arg, static_cast<unsigned>(r))) : 0);
+                const int end = c.x + c.w < right ? c.x + c.w : right;
+                if (end > c.x) ChromeFillRect(t, c.x, row, end - c.x, 1, c.color);
+            }
+            break;
+        case ChromeOp::MaterialRect:
+            for (int y = 0; y < c.h; ++y)
+            {
+                const unsigned row = y < c.h / 2 ? y : c.h - 1 - y;
+                const int inset = ChromeCornerInset(c.arg, row);
+                ChromeFillRect(t, c.x + inset, c.y + y, c.w - 2 * inset, 1, c.color);
+            }
+            break;
+        case ChromeOp::Text:
+            ChromeRenderString(t, font, c.x, c.y, list.TextAt(c.arg), c.color, c.w, c.dx ? &c.clip : nullptr);
+            break;
+        case ChromeOp::Icon:
+            ChromeDrawIcon(t, c.x, c.y, c.w, static_cast<const uint32_t*>(c.data));
+            break;
+        case ChromeOp::Squares:
+            for (uint32_t n = 0; n < c.arg; ++n)
+                ChromeFillRect(t, c.x + static_cast<int>(n) * c.dx, c.y + static_cast<int>(n) * c.dy,
+                               c.w, c.h, c.color);
+            break;
+        }
     }
 }
 

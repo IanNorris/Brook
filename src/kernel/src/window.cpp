@@ -40,6 +40,8 @@
 #include "chrome_raster.h"
 #include "chrome_alpha.h"
 #include "chrome_layout.h"
+#include "chrome_frame.h"
+#include "chrome_shell.h"
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
@@ -643,16 +645,13 @@ bool WmLauncherApplyPending()
 
 
 
-// Index 0 is close, 1 maximize/restore, 2 minimize. Rendering and input
-// intentionally use the same full-height rectangular control cells.
+// Caption cells: index 0 is close, 1 maximize/restore, 2 minimize. They are
+// drawn in these cells; input uses the part table's hit rects, which extend
+// them to the outer edges (chrome_layout.h).
 static DesktopWindowGeometry CaptionGeometry(const Window& w)
 {
     return {w.x,w.y,w.clientW,w.clientH,w.noChrome,w.noChrome && w.captionOverlay,
             w.captionInsetRight,w.captionInsetTop,w.captionHeight};
-}
-static WmRect CaptionRect(const Window& w, int index)
-{
-    return DesktopCaptionRect(CaptionGeometry(w),w.desktopMetrics(),index);
 }
 // The window's part table (chrome_layout.h). screenW/H: the output, whose
 // edges remove resize zones; 0 when only the visual parts matter.
@@ -1689,72 +1688,20 @@ const ChromeMaterialCache& WmChromeMaterial(){
 }
 uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
 
-// Fill clipped to a rounded top-right corner of `block` (radius 0: plain).
-static void FillCornerClipped(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                              int x, int y, int width, int height, uint32_t color,
-                              const WmRect& block, unsigned radius)
+// The builders' view of the WM's theme, scale, font and material state.
+ChromeStyle WmChromeStyle()
 {
-    if (!radius) { WmFillRect(buf, stride, screenW, screenH, x, y, width, height, color); return; }
-    for (int row = y; row < y + height; ++row)
-    {
-        const int r = row - block.y;
-        const int right = block.x + block.w - (r >= 0 ? static_cast<int>(ChromeCornerInset(radius, static_cast<unsigned>(r))) : 0);
-        const int end = x + width < right ? x + width : right;
-        if (end > x) WmFillRect(buf, stride, screenW, screenH, x, row, end - x, 1, color);
-    }
+    const bool glass = CompositorGlassActive();
+    return {&WmCurrentPalette(), &WmDesktopMetrics(), &WmDesktopFont(), glass, CompositorMaterialOpacity(),
+            glass ? &WmChromeMaterial() : nullptr};
 }
+static int WmTextWidth(const char* text) { return ChromeTextWidth(WmDesktopFont(), text); }
+// Shell surfaces are built and executed on the compositor thread only; they
+// share this list storage (too large for the stack).
+static ChromeShellStorage g_shellListStorage;
 
-static void RenderCaptionButtons(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                                 const Window& w, uint32_t bg, uint32_t fg, bool material,
-                                 int32_t mouseX, int32_t mouseY,
-                                 uint32_t hoverBg, uint32_t hoverInk,
-                                 const WmRect& clip = WmRect{}, unsigned radius = 0)
-{
-    // The painter draws the part table's buttons: each in its visual cell,
-    // hovered anywhere in its (edge-to-edge) hit rect.
-    const ChromeLayout layout = WindowChromeLayout(w);
-    for (int button = 0; button < 3; ++button)
-    {
-        const ChromePart* part = layout.Find(ChromeCaptionRole(button));
-        if (!part) continue;
-        const WmRect r = part->visual;
-        const bool hover = part->hit.contains(mouseX, mouseY);
-        if(material)WmFillRect(buf,stride,screenW,screenH,r.x,r.y,1,r.h,ChromeMix(bg,0xffffff,20));
-        if (hover) FillCornerClipped(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
-                             button == 0 ? WmCurrentPalette().closeHover : hoverBg, clip, radius);
-        if (r.w < static_cast<int>(WmMetric(14))) continue;
-        const uint32_t ink = hover && button == 0 ? WmCurrentPalette().closeText :
-                             hover ? hoverInk : fg;
-        const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
-        if (button == 0)
-        {
-            for (int d = -static_cast<int>(WmMetric(4)); d <= static_cast<int>(WmMetric(4)); ++d)
-            {
-                WmFillRect(buf, stride, screenW, screenH, cx+d,cy+d,WmMetric(1),WmMetric(1),ink);
-                WmFillRect(buf, stride, screenW, screenH, cx+d,cy-d,WmMetric(1),WmMetric(1),ink);
-            }
-        }
-        else if (button == 1)
-        {
-            auto box = [&](int x, int y, int width, int height) {
-                WmFillRect(buf, stride, screenW, screenH, x, y, width, WmMetric(1), ink);
-                WmFillRect(buf, stride, screenW, screenH, x, y + height - 1, width, WmMetric(1), ink);
-                WmFillRect(buf, stride, screenW, screenH, x, y, WmMetric(1), height, ink);
-                WmFillRect(buf, stride, screenW, screenH, x + width - 1, y, WmMetric(1), height, ink);
-            };
-            if (w.state == WindowState::Maximized)
-            {
-                box(cx - WmMetric(2), cy - WmMetric(5), WmMetric(8), WmMetric(8));
-                WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8),
-                           hover ? hoverBg : bg);
-                box(cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8));
-            }
-            else box(cx - WmMetric(5), cy - WmMetric(4), WmMetric(11), WmMetric(9));
-        }
-        else WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy + WmMetric(3), WmMetric(11), WmMetric(1), ink);
-    }
-}
-
+// The frame is the window's part table drawn through its display list
+// (chrome_frame.cpp); the executor writes the same pixels the painter did.
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
@@ -1762,81 +1709,13 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
 {
     if (!buf || !stride || !screenW || !screenH || !w.proc || !w.visible) return;
     if (w.noChrome && !w.captionOverlay) return;
-    const int border = WmMetric(WM_BORDER_WIDTH);
-    const int ow = w.outerWidth(), oh = w.outerHeight();
-    const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().titleInactive;
-    const uint32_t bg = WmMaterialColor(w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive);
-    const uint32_t fg = w.focused ? WmCurrentPalette().text : WmCurrentPalette().mutedText;
-    if (w.noChrome)
-    {
-        // Overlaid captions: only the button block, in the native title
-        // material, over the client's own title area. The client keeps the
-        // rest of its top edge (Chromium's tab strip).
-        const WmRect block = WmCaptionOverlayRect(w);
-        if (block.w <= 0 || block.h <= 0) return;
-        if (w.captionStyle & DesktopCaptionStyleValid)
-        {
-            // Matched to the client's strip (as Chromium's own buttons, or
-            // macOS/Windows controls over an app-drawn title area): the strip
-            // colour hides the client's buttons underneath, glyphs contrast
-            // with it, hover is a light tint and close hover stays red.
-            const uint32_t strip = 0xff000000u | DesktopCaptionStyleRgb(w.captionStyle);
-            const uint32_t ink = DesktopCaptionInk(strip & 0xffffff);
-            const uint32_t idle = w.focused ? ink : ChromeMix(ink, strip, 100);
-            const uint32_t hoverBg = 0xff000000u | ChromeMix(strip, ink, 28);
-            const unsigned radius = w.state == WindowState::Maximized ? 0 : DesktopCaptionStyleRadius(w.captionStyle);
-            FillCornerClipped(buf, stride, screenW, screenH, block.x, block.y, block.w, block.h, strip, block, radius);
-            RenderCaptionButtons(buf, stride, screenW, screenH, w, strip, idle | 0xff000000u, false,
-                                 mouseX, mouseY, hoverBg, ink | 0xff000000u, block, radius);
-            return;
-        }
-        WmFillRect(buf, stride, screenW, screenH, block.x, block.y, block.w, block.h, bg);
-        RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, false, mouseX, mouseY,
-                             WmCurrentPalette().captionHover, WmCurrentPalette().text);
-        return;
-    }
-    WmFillRect(buf, stride, screenW, screenH, w.x, w.y, ow, border, edge);
-    WmFillRect(buf, stride, screenW, screenH, w.x, w.y, border, oh, edge);
-    WmFillRect(buf, stride, screenW, screenH, w.x + ow - border, w.y, border, oh, edge);
-    WmFillRect(buf, stride, screenW, screenH, w.x, w.y + oh - border, ow, border, edge);
-    const int tx = w.x + border, ty = w.y + border;
-    const bool material=CompositorGlassActive();
-    const auto* cached=material?&WmChromeMaterial():nullptr;
-    const int titleH=WmMetric(WM_TITLE_BAR_HEIGHT);
-    for(int row=0;row<titleH;++row)
-        WmFillRect(buf,stride,screenW,screenH,tx,ty+row,w.clientW,1,
-            material?cached->rows[w.focused][row]:bg);
-    // A restrained one-pixel edge replaces the old heavy double outline.
-    if(border>1){
-        WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+1,ow-2,border-1,bg);
-        WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+border,border-1,oh-2*border,bg);
-        WmFillRect(buf,stride,screenW,screenH,w.x+ow-border,w.y+border,border-1,oh-2*border,bg);
-        WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+oh-border,ow-2,border-1,bg);
-    }
-    if(material){
-        WmFillRect(buf,stride,screenW,screenH,w.x,w.y,ow,1,cached->rims[w.focused][0]);
-        WmFillRect(buf,stride,screenW,screenH,w.x,w.y+1,1,oh-2,cached->rims[w.focused][1]);
-        WmFillRect(buf,stride,screenW,screenH,w.x+ow-1,w.y+1,1,oh-2,cached->rims[w.focused][1]);
-        WmFillRect(buf,stride,screenW,screenH,w.x,w.y+oh-1,ow,1,cached->rims[w.focused][2]);
-    }
-    WmFillRect(buf,stride,screenW,screenH,tx,ty+titleH-1,w.clientW,1,
-               material?cached->rims[w.focused][2]:ChromeMix(bg,0xffffff,32));
-    // Active identity stroke: keep the hit-test geometry and client opacity.
-    if (w.focused) WmFillRect(buf,stride,screenW,screenH,tx+WmMetric(12),ty,
-        w.clientW>WmMetric(184)?WmMetric(160):w.clientW/2,WmMetric(4),WmCurrentPalette().accent);
     LauncherReadGuard icons;
-    const int iconX = tx + WmMetric(10);
-    const int textX = iconX + WmMetric(20) + WmMetric(8);
-    if (CaptionRect(w, 2).x - iconX >= static_cast<int>(WmMetric(24)))
-        WmDrawIcon(buf, stride, screenW, screenH, iconX,
-                   ty + (static_cast<int>(WmMetric(WM_TITLE_BAR_HEIGHT)) - static_cast<int>(WmMetric(20))) / 2, WmMetric(20), WindowIcon(w, icons.get()));
-    const int textW = CaptionRect(w, 2).x - textX - WmMetric(8);
-    if (textW > 0)
-        WmRenderString(buf, stride, screenW, screenH, textX,
-            ty + (static_cast<int>(WmMetric(WM_TITLE_BAR_HEIGHT)) - WmDesktopFont().lineHeight) / 2,
-            w.title, fg, bg, textW);
-    RenderCaptionButtons(buf, stride, screenW, screenH, w, bg, fg, material, mouseX, mouseY,
-                         WmCurrentPalette().captionHover, WmCurrentPalette().text);
+    const ChromeFrameModel model{WindowChromeLayout(w), w.clientW, w.focused, w.state == WindowState::Maximized,
+                                 w.noChrome, w.captionStyle, w.title, WindowIcon(w, icons.get()), mouseX, mouseY};
+    ChromeFrameStorage storage;
+    ChromeDisplayList list = ChromeListOn(storage);
+    ChromeBuildFrame(model, WmChromeStyle(), list);
+    ChromeExecute(list, {buf, stride, screenW, screenH}, WmDesktopFont());
 }
 
 void WmRenderChrome(uint32_t* backBuffer, uint32_t stride,
@@ -1910,22 +1789,12 @@ void WmSpawnTerminal()
 // App Launcher — popup panel with shortcut items
 // ---------------------------------------------------------------------------
 
-// Launcher visual constants
-static constexpr uint32_t LAUNCHER_ICON_SIZE    = LAUNCHER_ICON_PX;
-static constexpr uint32_t LAUNCHER_ICON_MARGIN  = 8;
-static constexpr uint32_t LAUNCHER_ITEM_HEIGHT  = 40;
-static constexpr uint32_t LAUNCHER_ITEM_WIDTH   = 230;
-static constexpr uint32_t LAUNCHER_PADDING      = 6;
-static constexpr uint32_t LAUNCHER_MAX_ROWS     = 14; // max rows before scrolling
-static constexpr uint32_t LAUNCHER_MAX_COLS     = 3;  // max columns
-
-static void LauncherDrawIcon(uint32_t* buf, uint32_t stride,
-                             uint32_t screenW, uint32_t screenH,
-                             int32_t x, int32_t y, const LauncherItem* item, const LauncherSnapshot& launcher)
-{
-    WmDrawIcon(buf, stride, screenW, screenH, x, y, WmMetric(LAUNCHER_ICON_PX),
-               item->iconPixels ? item->iconPixels : launcher.applicationIcon);
-}
+// Launcher and taskbar sizes are the shell builders' (chrome_shell.h).
+static_assert(LAUNCHER_ICON_PX == ChromeShellMetrics::LauncherIconSize, "launcher icon size");
+static_assert(WM_TASKBAR_BTN_WIDTH == ChromeShellMetrics::TaskbarButtonWidth &&
+              WM_TASKBAR_BTN_HEIGHT == ChromeShellMetrics::TaskbarButtonHeight &&
+              WM_TASKBAR_PADDING == ChromeShellMetrics::TaskbarPadding, "taskbar metrics");
+static_assert(WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity <= ChromeTaskbarButtonLimit, "taskbar entries");
 
 // Read title and explicit window identity from a shortcut's comment header.
 // Identity metadata matches Wayland app_id/executable without guessing by title.
