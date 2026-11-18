@@ -26,14 +26,19 @@ int main(){
     s.lastCaps=0x060613;
     assert(BdwClockEffectiveBin(s)==12);            // boot request 600 (fallbacks stay 500)
     BdwClockSetMhz(s,950);assert(BdwClockEffectiveBin(s)==19);
-    assert(!BdwClockNoteTemp(s,85));assert(BdwClockEffectiveBin(s)==19);
-    assert(BdwClockNoteTemp(s,90));assert(s.tripped && s.trips==1);
-    assert(BdwClockEffectiveBin(s)==10);            // latched fallback
-    assert(!BdwClockNoteTemp(s,95));assert(s.trips==1); // counted once
-    assert(!BdwClockNoteTemp(s,60));assert(BdwClockEffectiveBin(s)==10); // stays latched
-    BdwClockSetMhz(s,700);assert(!s.tripped && BdwClockEffectiveBin(s)==14);
+    assert(BdwClockNoteTemp(s,85,1000)==0);assert(BdwClockEffectiveBin(s)==19);
+    assert(BdwClockNoteTemp(s,90,1050)==1);assert(s.tripped && s.trips==1);
+    assert(BdwClockEffectiveBin(s)==10);            // fallback
+    assert(BdwClockNoteTemp(s,95,1100)==0);assert(s.trips==1); // counted once
+    assert(BdwClockNoteTemp(s,60,2000)==0 && BdwClockEffectiveBin(s)==10); // cool run starts
+    assert(BdwClockNoteTemp(s,70,6999)==0 && s.tripped);  // 4.999 s: not yet
+    assert(BdwClockNoteTemp(s,76,7000)==0 && s.tripped && !s.coolSinceMs); // above 75: run broken
+    assert(BdwClockNoteTemp(s,75,8000)==0);assert(BdwClockNoteTemp(s,-1,12000)==0 && s.tripped); // invalid ignored
+    assert(BdwClockNoteTemp(s,74,13000)==-1 && !s.tripped && s.recoveries==1 && BdwClockEffectiveBin(s)==19);
+    assert(BdwClockNoteTemp(s,92,13050)==1 && s.trips==2);
+    BdwClockSetMhz(s,700);assert(!s.tripped && !s.coolSinceMs && BdwClockEffectiveBin(s)==14);
     assert(s.maxTempC==95);
-    assert(!BdwClockNoteTemp(s,-1));               // invalid sample never trips
+    assert(BdwClockNoteTemp(s,-1,14000)==0);       // invalid sample never trips
     // RAPL: ESU 14 -> 61.04 uJ per tick; wraparound handled.
     const uint64_t unit=uint64_t(14)<<8;
     assert(BdwClockEnergyDeltaUj(0,16384,unit)==1000000);

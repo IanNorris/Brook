@@ -6314,7 +6314,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("max_temp_c",st.maxTempC<0?0:uint64_t(st.maxTempC));
             r.text(",");r.field("limit_c",uint64_t(st.limitC));
             r.text(",\"tripped\":");r.text(st.tripped?"true":"false");
-            r.text(",");r.field("trips",st.trips);
+            r.text(",");r.field("trips",st.trips);r.text(",");r.field("recoveries",st.recoveries);
             r.text(",");r.field("thermal_samples",st.samples);
             r.text(",\"rapl_available\":");r.text(now.valid?"true":"false");
             if(now.valid && prev.valid && now.tsc>prev.tsc){
@@ -6327,7 +6327,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 }
             }
             if(now.valid)prev=now;
-            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; trip latches 500 until the next gpu clock command; pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
+            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; a trip falls back to 500 and recovers after 5 s at or below limit-15 C (or at the next gpu clock command); pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
             r.send();
         }
 #else

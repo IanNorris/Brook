@@ -43,9 +43,14 @@ inline void BdwClockSampleThermal(uint64_t tscKhz){
     s.lastSampleTsc=now;
     const int32_t t=BdwClockReadTempC();
     if(t<0)return;
-    if(BdwClockNoteTemp(s,t))
-        KPrintf("gpu-clock: package %d C >= limit %d C; render clock request back to %u MHz until the next 'gpu clock' command\n",
-            t,s.limitC,BdwClockDefaultMhz);
+    const uint64_t nowMs=tscKhz?now/tscKhz:0;
+    const int change=BdwClockNoteTemp(s,t,nowMs);
+    if(change>0)
+        KPrintf("gpu-clock: package %d C >= limit %d C; render clock request back to %u MHz until %d C for %u ms\n",
+            t,s.limitC,BdwClockDefaultMhz,s.limitC-BdwClockRecoverMarginC,unsigned(BdwClockRecoverMs));
+    else if(change<0)
+        KPrintf("gpu-clock: package %d C; render clock request restored to %u MHz (recovery %u)\n",
+            t,s.requestedMhz,unsigned(s.recoveries));
 }
 struct BdwClockEnergy { bool valid=false; uint32_t pkg=0,pp1=0; uint64_t unit=0,tsc=0; };
 inline BdwClockEnergy BdwClockReadEnergy(){
