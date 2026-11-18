@@ -92,6 +92,13 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**18 Nov night:**
+- **Gen 428 merged to main** (`6776790d`, Chromium fixes; Ian confirmed resize works).
+- **Graceful restart with a hung Chromium (YouTube):** windowless processes were escalated as designed (blockers 27 → 6), but Chromium pid 124 kept its window, ignored the WM close, and a bridge SIGTERM job timed out (jobs restricted while closing?). Ian had to force power-off.
+  - **Gap:** windows that stop responding to close need a force-close step (e.g. after N s, offer or apply SIGTERM/SIGKILL to window owners, with the process named in the prompt), plus a way for bridge root jobs to run during closing.
+- **Integration slip:** `work/launchers-fullscreen` was based on main da26b714, so its pair (deployed as `dell-fullscreen-20261118`) lacked gens 427/428. Corrected image: `work/integration26` = main + launchers-fullscreen. **Always integrate agent branches with current main before deploying.**
+- **Quake II and VSCodium launchers staged** (bundle tx `apps1118`, store `0s7bcrci…-brook-dell-app-launchers`, rollback `install.py --rollback apps1118`). `brook-quake2 --check` OK. The menu reloads at next boot (the installer's 0xB03 notify needs ctypes, which the minimal python lacks).
+
 **18 Nov evening, Dell gens 427/428 (main `678b009d` = integration24; gen 428 `dell-int25-20261118` adds `work/chromium-fixes`, session `fab0e3daae964a16aef47e58ed99acf7`):**
 - **Gen 427:**
   - Xwayland windows are GPU sources (`work/xwl-dmabuf`); epoll no longer zeroes ~100 KiB per wait; kernel-region enter/leave is lock-free (`work/kregion-lockfree`).
