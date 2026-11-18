@@ -28,6 +28,7 @@
 #include "acpi.h"
 #include "spinlock.h"
 #include "scheduler.h"
+#include "process.h"
 #include "serial.h"
 #include "smp.h"
 
@@ -710,7 +711,25 @@ void BdwScanoutTargetReadStatus(BdwScanoutTargetStatus& out){
 }
 #if defined(BROOK_BDW_SCANOUT_FLIP)
 #if defined(BROOK_BDW_ZERO_COPY_SCANOUT)
-namespace {constexpr int64_t ErrBadf=-9,ErrBusy=-16,ErrInval=-22;}
+namespace {constexpr int64_t ErrBadf=-9,ErrBusy=-16,ErrInval=-22;
+bool zcAutoRetrySpawned=false;
+// Retries the boot-default arm every 2 s, up to 30 times. Stops as soon as the
+// arm is requested, auto-arm is cancelled (gpu zerocopy off), or zero-copy is
+// disabled or unregistered.
+void ZcAutoArmRetry(void*){
+    for(unsigned attempt=1;attempt<=30;++attempt){
+        SchedulerSleepMs(2000);
+        if(!__atomic_load_n(&zcAutoArm,__ATOMIC_ACQUIRE))return;
+        bool stop=false,requested=false;
+        {const uint64_t f=IrqSpinLockAcquire(&lock);stop=zcDisabled || !zcCount;requested=zcRequested || zcActive;IrqSpinLockRelease(&lock,f);}
+        if(stop || requested)return;
+        const char* note="";const bool armed=BdwZeroCopyArm(note);
+        if(armed){KPrintf("gpu-zerocopy: boot default arm requested on retry %u (%s)\n",attempt,note);return;}
+        if(attempt==1 || attempt%10==0)KPrintf("gpu-zerocopy: boot default arm retry %u refused (%s)\n",attempt,note);
+    }
+    KPrintf("gpu-zerocopy: boot default arm gave up after 30 retries\n");
+}
+}
 int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* images,uint32_t imageCount,const BdwZeroCopyGeometry& geometry,
                             BdwZeroCopyRefusal& refusal){
     refusal=BdwZeroCopyRefusal::Count;
@@ -739,6 +758,14 @@ int64_t BdwZeroCopyRegister(uint64_t owner,BdwGpuBuffer* const* images,uint32_t 
     if(__atomic_load_n(&zcAutoArm,__ATOMIC_ACQUIRE)){
         const char* note="";const bool armed=BdwZeroCopyArm(note);
         KPrintf("gpu-zerocopy: boot default arm %s (%s)\n",armed?"requested":"refused",note);
+        // gen 423: the first arm at registration can be refused (the flip probe
+        // runs before the display has settled), and nothing retried it, so the
+        // boot default never took effect. Retry from a kernel thread: the probe
+        // sleeps 100 ms, so it must stay off the present path.
+        if(!armed && !__atomic_exchange_n(&zcAutoRetrySpawned,true,__ATOMIC_ACQ_REL)){
+            if(Process* t=KernelThreadCreate("zc-autoarm",ZcAutoArmRetry,nullptr,3))SchedulerAddProcess(t);
+            else KPrintf("gpu-zerocopy: auto-arm retry thread creation failed\n");
+        }
     }
     return 0;
 }
