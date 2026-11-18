@@ -38,6 +38,7 @@
 #include "compositor.h"
 #include "font_atlas.h"
 #include "chrome_raster.h"
+#include "chrome_alpha.h"
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
@@ -1785,7 +1786,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                material?cached->rims[w.focused][2]:ChromeMix(bg,0xffffff,32));
     // Active identity stroke: keep the hit-test geometry and client opacity.
     if (w.focused) WmFillRect(buf,stride,screenW,screenH,tx+WmMetric(12),ty,
-        w.clientW>WmMetric(184)?WmMetric(160):w.clientW/2,WmMetric(4),0x0068ACFF);
+        w.clientW>WmMetric(184)?WmMetric(160):w.clientW/2,WmMetric(4),WmCurrentPalette().accent);
     LauncherReadGuard icons;
     const int iconX = tx + WmMetric(10);
     const int textX = iconX + WmMetric(20) + WmMetric(8);
@@ -2911,13 +2912,10 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         local.x=int16_t(local.x-originX);local.y=int16_t(local.y-originY);
         RenderWindowChrome(pixels,width,width,height,local,mouseX==-1 && mouseY==-1?-1:int32_t(mouseX-originX),
                            mouseX==-1 && mouseY==-1?-1:int32_t(mouseY-originY));
-        for(uint64_t i=0;i<uint64_t(width)*height;++i)pixels[i]|=0xff000000u;
         // A client-matched block follows the client's rounded top-right corner.
         const unsigned radius=(local.captionStyle&DesktopCaptionStyleValid) && local.state!=WindowState::Maximized ?
             DesktopCaptionStyleRadius(local.captionStyle) : 0;
-        for(unsigned row=0;row<radius && row<height;++row)
-            for(unsigned x=width-(ChromeCornerInset(radius,row)<width?ChromeCornerInset(radius,row):width);x<width;++x)
-                pixels[uint64_t(row)*width+x]=0;
+        ChromeMarkCaptionBlockOpaque(pixels,width,width,height,{0,0,width,height},radius);
         ProcessUnref(local.proc);
         return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
     }
@@ -2928,22 +2926,9 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
     };
     const bool noMouse=mouseX==-1 && mouseY==-1;
     RenderWindowChrome(pixels,width,width,height,local,noMouse?-1:relative(mouseX,originX),noMouse?-1:relative(mouseY,originY));
-    const int cx=local.clientX(),cy=local.clientY();
-    // The client interior remains transparent. Mark only the chrome spans;
-    // testing every interior pixel is costly for large application windows.
-    auto clip=[](int64_t v,uint32_t limit)->uint32_t {
-        return v<=0?0:v>=limit?limit:static_cast<uint32_t>(v);
-    };
-    const uint32_t left=clip(cx,width),right=clip(int64_t(cx)+local.clientW,width);
-    const uint32_t top=clip(cy,height),bottom=clip(int64_t(cy)+local.clientH,height);
-    for(uint32_t y=0;y<height;++y){
-        uint32_t* row=pixels+uint64_t(y)*width;
-        if(y<top || y>=bottom){for(uint32_t x=0;x<width;++x)row[x]|=0xff000000u;}
-        else {
-            for(uint32_t x=0;x<left;++x)row[x]|=0xff000000u;
-            for(uint32_t x=right;x<width;++x)row[x]|=0xff000000u;
-        }
-    }
+    // The client interior remains transparent; only the frame is marked.
+    ChromeMarkFrameOpaque(pixels,width,width,height,{0,0,width,height},
+                          {local.clientX(),local.clientY(),local.clientW,local.clientH});
     ProcessUnref(local.proc);
     return (tolerateVisualChanges?WmDesktopLayersCaptureCurrent(layers):WmDesktopLayersCurrent(layers))?0:-116;
 }

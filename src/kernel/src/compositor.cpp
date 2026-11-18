@@ -1,5 +1,6 @@
 #include "boot_timing_runtime.h"
 #include "chrome_material.h"
+#include "chrome_alpha.h"
 #include "keyboard.h"
 #include "kprintf.h"
 #include "compositor_wake_sequence.h"
@@ -1727,20 +1728,20 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
         const WmRect block = WmCaptionOverlayRect(w);
         const unsigned radius = (w.captionStyle & DesktopCaptionStyleValid) && w.state != WindowState::Maximized ?
             DesktopCaptionStyleRadius(w.captionStyle) : 0;
-        for (int y = block.y; y < block.y + block.h; ++y)
-        {
-            if (y < 0 || y >= static_cast<int>(g_physFbHeight)) continue;
-            uint32_t* row = g_chromeBuffer + static_cast<uint32_t>(y) * g_backBufStride;
-            const int end = block.x + block.w - static_cast<int>(ChromeCornerInset(radius, static_cast<unsigned>(y - block.y)));
-            for (int x = block.x; x < end; ++x)
-                if (x >= 0 && x < static_cast<int>(g_physFbWidth)) row[x] |= 0xFF000000u;
-        }
+        ChromeMarkCaptionBlockOpaque(g_chromeBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight,
+                                     {block.x, block.y, block.w, block.h}, radius);
         return;
     }
     int ox = w.x, oy = w.y;
     int ow = (int)w.outerWidth(), oh = (int)w.outerHeight();
     int cx = w.clientX(), cy = w.clientY();
     int cw = (int)w.clientW, ch = (int)w.clientH;
+    if (!glass)
+    {
+        ChromeMarkFrameOpaque(g_chromeBuffer, g_backBufStride, g_physFbWidth, g_physFbHeight,
+                              {ox, oy, ow, oh}, {cx, cy, cw, ch});
+        return;
+    }
     auto setAlpha = [](int x, int y, int rw, int rh, uint32_t a,bool preserve=false) {
         if (rw <= 0 || rh <= 0) return;
         if (x < 0) { rw += x; x = 0; }
@@ -1757,21 +1758,25 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
     // Top strip = solid top border (WmMetric(WM_BORDER_WIDTH) rows) + glassy titlebar.
     int topBorderH = (int)WmMetric(WM_BORDER_WIDTH);
     int titleBarH  = (cy - oy) - topBorderH;          // == WmMetric(WM_TITLE_BAR_HEIGHT)
-    setAlpha(ox, oy, ow, topBorderH, 0xFF,glass);
-    setAlpha(ox, oy + topBorderH, ow, titleBarH, glass?CompositorMaterialOpacity():255,glass); // titlebar (glass)
-    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF,glass);
-    setAlpha(ox, cy, cx - ox, ch, 0xFF,glass);
-    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF,glass);
-    if(glass) {
+    // Glass: keep painted alpha, give the rest of the titlebar the material
+    // alpha and the frame full alpha, then make title text and the accent
+    // stroke opaque again (they are painted without alpha).
+    setAlpha(ox, oy, ow, topBorderH, 0xFF,true);
+    setAlpha(ox, oy + topBorderH, ow, titleBarH, CompositorMaterialOpacity(),true); // titlebar (glass)
+    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF,true);
+    setAlpha(ox, cy, cx - ox, ch, 0xFF,true);
+    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF,true);
+    {
         const uint32_t fg=w.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText;
+        const uint32_t accent=WmCurrentPalette().accent&0xffffff;
         for(int y=oy+topBorderH;y<cy;++y)for(int x=ox;x<ox+ow;++x) {
             if(x<0||y<0||x>=int(g_physFbWidth)||y>=int(g_physFbHeight))continue;
             auto& pixel=g_chromeBuffer[uint64_t(y)*g_backBufStride+x];
             const uint32_t rgb=pixel&0xffffff;
-            if(rgb==fg||rgb==0x68acff)pixel|=0xff000000;
+            if(rgb==fg||rgb==accent)pixel|=0xff000000;
         }
     }
-    if(glass && w.state!=WindowState::Maximized && !w.blurRadius) {
+    if(w.state!=WindowState::Maximized && !w.blurRadius) {
         const auto& material=WmChromeMaterial();
         if(ow>=int(material.top.radius*2)&&oh>=int(material.top.radius*2))
         for(unsigned corner=0;corner<4;++corner){
