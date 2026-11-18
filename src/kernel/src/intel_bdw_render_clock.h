@@ -17,6 +17,10 @@ namespace brook {
 // `gpu clock` command; each trip is counted and logged once.
 constexpr uint32_t BdwClockBinMhz=50;
 constexpr uint32_t BdwClockDefaultMhz=500;
+// Boot request on AC (Ian, 18 Nov): 600 MHz held 69-75 C at ~10 W in Stardew
+// fullscreen with no trips, 27-29 -> 39 displayed fps; 700 MHz reached 98 C.
+// The trip and no-caps fallbacks stay at BdwClockDefaultMhz.
+constexpr uint32_t BdwClockBootMhz=600;
 constexpr int32_t BdwClockDefaultLimitC=90;
 
 struct BdwClockCaps { uint32_t rpn=0,rp1=0,rp0=0; bool valid=false; };
@@ -53,7 +57,7 @@ inline uint64_t BdwClockEnergyDeltaUj(uint32_t before,uint32_t after,uint64_t po
 }
 
 struct BdwClockState {
-    uint32_t requestedMhz=BdwClockDefaultMhz;
+    uint32_t requestedMhz=BdwClockBootMhz;
     int32_t limitC=BdwClockDefaultLimitC;
     uint32_t tripped=0;          // latched thermal fallback
     uint64_t trips=0,samples=0;

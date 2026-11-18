@@ -24,7 +24,7 @@ int main(){
     BdwClockState s{};
     assert(BdwClockEffectiveBin(s)==10);            // no caps yet
     s.lastCaps=0x060613;
-    assert(BdwClockEffectiveBin(s)==10);            // default 500
+    assert(BdwClockEffectiveBin(s)==12);            // boot request 600 (fallbacks stay 500)
     BdwClockSetMhz(s,950);assert(BdwClockEffectiveBin(s)==19);
     assert(!BdwClockNoteTemp(s,85));assert(BdwClockEffectiveBin(s)==19);
     assert(BdwClockNoteTemp(s,90));assert(s.tripped && s.trips==1);
