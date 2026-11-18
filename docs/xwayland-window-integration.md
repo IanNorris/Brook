@@ -26,7 +26,7 @@ VFB, and the renderer received a CPU source.
 `xwayland_surface_ready()` reports paired with its mapped X window. A buffer
 that does not match a pending native resize (`xwayland_accept_view`) still
 waits, as on the CPU path (`offer_skipped.xwayland_resize_wait`). Counters:
-`offers.xwayland` in `brook-waylandd-:N.json`. Kill switch:
+`offers.xwayland` in `$XDG_RUNTIME_DIR` (or `/tmp`) `/brook-waylandd-wayland-0.json`. Kill switch:
 `BROOK_WAYLAND_GPU_XWAYLAND=0`. Host test: `check_gpu_window_xwayland` in
 `capture-release-test.c` (direct variant): offer and release, resize wait, and
 an unpaired surface staying on the CPU.
