@@ -971,7 +971,26 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("sectors",s.sectors);r.text(",");r.field("logical_sector_bytes",s.logicalSectorBytes);
         r.text(",");r.field("physical_sector_bytes",s.physicalSectorBytes);r.text(",\"model\":");r.quoted(s.model);
         r.text(",\"serial\":");r.quoted(s.serial);
+        const auto irq=AhciReadOnlyIrqStatus();const auto w=AhciReadOnlyIoStats();
+        r.text(",\"completion\":{\"irq_configured\":");r.text(irq.configured?"true":"false");
+        r.text(",\"irq_active\":");r.text(irq.active?"true":"false");r.text(",\"irq_reason\":");r.quoted(irq.reason);
+        r.text(",");r.field("vector",irq.vector);r.text(",");r.field("apic",irq.apic);r.text(",");r.field("spin_us",AhciReadOnlySpinUs());
+        r.text(",");r.field("waits",w.waits);r.text(",");r.field("spin_completions",w.spinCompletions);
+        r.text(",");r.field("sleeping_waits",w.sleepingWaits);r.text(",");r.field("sleeps",w.sleeps);
+        r.text(",");r.field("yields",w.yields);r.text(",");r.field("interrupts",w.interrupts);
+        r.text(",");r.field("irq_wakes",w.irqWakes);r.text(",");r.field("irq_timeouts",w.irqTimeouts);
+        r.text(",");r.field("irq_skipped",w.irqSkipped);r.text(",");r.field("irq_disabled",w.irqDisabled);
+        r.text(",");r.field("wait_ns",w.waitNs);r.text(",");r.field("max_wait_ns",w.maxWaitNs);
+        r.text(",");r.field("irq_latency_ns",w.irqLatencyNs);r.text(",");r.field("wake_latency_ns",w.wakeLatencyNs);
+        r.text(",");r.field("max_wake_latency_ns",w.maxWakeLatencyNs);r.text("}");
         r.text("}\n");r.send();return true;
+    }
+    constexpr char spinPrefix[]="bridge hardware ahci-spin-us ";
+    if(Prefix(command,spinPrefix)) {
+        const char* p=command+sizeof(spinPrefix)-1;uint64_t us=0;
+        const bool ok=Decimal64(p,us) && !*p && AhciReadOnlySetSpinUs(us);
+        Reply r;r.text("{\"ahci_ro_api\":1,\"applied\":");r.text(ok?"true":"false");
+        r.text(",");r.field("spin_us",AhciReadOnlySpinUs());r.text("}\n");r.send();return true;
     }
     constexpr char sectorPrefix[]="bridge hardware ahci-sector ";
     if(Prefix(command,sectorPrefix)) {

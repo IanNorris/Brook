@@ -109,6 +109,9 @@ uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
 void WmObserveDesktopTick(uint64_t now);
+// Latest taskbar sample (CPU, memory, disk and network rates), for diagnostics.
+struct DesktopTelemetry;
+DesktopTelemetry WmDesktopTelemetryRead();
 // The renderer composited a GPU-source frame for window identity/commit.
 void WmNoteClientFrame(uint64_t identity,uint64_t commit);
 using WmRect = DesktopRect;

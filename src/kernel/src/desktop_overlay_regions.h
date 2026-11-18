@@ -4,7 +4,9 @@
 namespace brook {
 struct DesktopOverlayRect {int32_t x,y;uint32_t width,height;};
 struct DesktopOverlayBand {uint32_t x,y,width,height;};
-struct DesktopOverlayBands {DesktopOverlayBand bands[7]{};uint32_t count=0;};
+// opaque: bit i set when every pixel of band i comes from an opaque input
+// rectangle (alpha 255). keys: content keys, filled by DesktopOverlayKeyBands.
+struct DesktopOverlayBands {DesktopOverlayBand bands[7]{};uint32_t count=0,opaque=0;uint64_t keys[7]{};};
 
 // Enumerate a packed band's bounded reads without retaining a user pointer.
 // The callback receives offsets into the immutable full image and destination.
@@ -17,11 +19,13 @@ inline bool DesktopOverlayPackedRead(const DesktopOverlayBand& b,uint32_t width,
     if(!b.x && b.width==width){
         const uint64_t base=uint64_t(b.y)*width*4,total=rowBytes*b.height;
         for(uint64_t pos=0;pos<total;){const uint32_t n=uint32_t(total-pos<chunk?total-pos:chunk);
-            if(!copy(base+pos,pos,n))return false;pos+=n;}
+            if(!copy(base+pos,pos,n))return false;
+            pos+=n;}
     }else for(uint32_t y=0;y<b.height;++y){
         const uint64_t base=(uint64_t(b.y+y)*width+b.x)*4;
         for(uint64_t pos=0;pos<rowBytes;){const uint32_t n=uint32_t(rowBytes-pos<chunk?rowBytes-pos:chunk);
-            if(!copy(base+pos,uint64_t(y)*rowBytes+pos,n))return false;pos+=n;}
+            if(!copy(base+pos,uint64_t(y)*rowBytes+pos,n))return false;
+            pos+=n;}
     }
     return true;
 }
@@ -29,10 +33,13 @@ inline bool DesktopOverlayPackedRead(const DesktopOverlayBand& b,uint32_t width,
 // Up to four semantic rectangles become at most seven non-overlapping row
 // bands. A band may contain transparent pixels between its objects, but no
 // nontransparent pixel in any admitted rectangle is omitted or drawn twice.
+// opaqueRects has bit i set when every pixel of rects[i] is opaque; a band is
+// marked opaque only when such rectangles cover all of it, and bands of
+// different opacity are never merged.
 inline bool DesktopOverlayMakeBands(uint32_t width,uint32_t height,const DesktopOverlayRect* rects,
-                                    uint32_t count,DesktopOverlayBands& out){
+                                    uint32_t count,DesktopOverlayBands& out,uint32_t opaqueRects=0){
     out={};if(!width || !height || count>4 || (count && !rects))return false;
-    struct Clipped {uint32_t left,top,right,bottom;};Clipped clipped[4]{};
+    struct Clipped {uint32_t left,top,right,bottom;bool opaque;};Clipped clipped[4]{};
     uint32_t n=0,edges[8]{},edgeCount=0;
     for(uint32_t i=0;i<count;++i){
         const int64_t left=rects[i].x,top=rects[i].y;
@@ -40,7 +47,7 @@ inline bool DesktopOverlayMakeBands(uint32_t width,uint32_t height,const Desktop
         const int64_t l=left<0?0:left,t=top<0?0:top;
         const int64_t r=right>width?width:right,b=bottom>height?height:bottom;
         if(r<=l || b<=t)continue;
-        clipped[n++]={uint32_t(l),uint32_t(t),uint32_t(r),uint32_t(b)};
+        clipped[n++]={uint32_t(l),uint32_t(t),uint32_t(r),uint32_t(b),(opaqueRects>>i&1u)!=0};
         edges[edgeCount++]=uint32_t(t);edges[edgeCount++]=uint32_t(b);
     }
     for(uint32_t i=1;i<edgeCount;++i){uint32_t v=edges[i],j=i;while(j && edges[j-1]>v){edges[j]=edges[j-1];--j;}edges[j]=v;}
@@ -52,11 +59,40 @@ inline bool DesktopOverlayMakeBands(uint32_t width,uint32_t height,const Desktop
             if(clipped[j].right>right)right=clipped[j].right;
         }
         if(left>=right)continue;
+        // Opaque when opaque rectangles spanning these rows cover [left,right).
+        uint32_t reach=left;
+        for(bool grew=true;grew && reach<right;){
+            grew=false;
+            for(uint32_t j=0;j<n;++j)if(clipped[j].opaque && clipped[j].top<=top && clipped[j].bottom>=bottom &&
+                clipped[j].left<=reach && clipped[j].right>reach){reach=clipped[j].right;grew=true;}
+        }
+        const bool opaque=reach>=right;
         if(out.count && out.bands[out.count-1].x==left && out.bands[out.count-1].width==right-left &&
-           out.bands[out.count-1].y+out.bands[out.count-1].height==top){out.bands[out.count-1].height+=bottom-top;continue;}
+           out.bands[out.count-1].y+out.bands[out.count-1].height==top && ((out.opaque>>(out.count-1)&1u)!=0)==opaque){
+            out.bands[out.count-1].height+=bottom-top;continue;}
         if(out.count>=7)return false;
+        if(opaque)out.opaque|=1u<<out.count;
         out.bands[out.count++]={left,top,right-left,bottom-top};
     }
     return true;
+}
+
+// Nonzero content key of each band's geometry and pixels in a packed
+// width-wide image. Equal keys mean identical band pixels.
+inline void DesktopOverlayKeyBands(const uint32_t* pixels,uint32_t width,uint32_t height,DesktopOverlayBands& bands){
+    constexpr uint64_t prime=0x100000001b3ull;
+    for(uint32_t i=0;i<bands.count && i<7;++i){
+        const auto& b=bands.bands[i];
+        uint64_t h=0xcbf29ce484222325ull^(uint64_t(b.x)<<32|b.y);
+        h=(h^(uint64_t(b.width)<<32|b.height))*prime;
+        h=(h^((bands.opaque>>i)&1u))*prime;
+        if(pixels && b.width && b.height && b.x<width && b.y<height && b.width<=width-b.x && b.height<=height-b.y)
+            for(uint32_t y=0;y<b.height;++y){
+                const uint32_t* row=pixels+uint64_t(b.y+y)*width+b.x;uint32_t x=0;
+                for(;x+1<b.width;x+=2){uint64_t pair;__builtin_memcpy(&pair,row+x,8);h=(h^pair)*prime;}
+                if(x<b.width)h=(h^row[x])*prime;
+            }
+        bands.keys[i]=h?h:1;
+    }
 }
 }

@@ -4,6 +4,7 @@
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
 #include "sched_lock_owner.h"
+#include "sched_lock_stats.h"
 #include "dsp_producer_timing.h"
 #include "syscall_timing.h"
 #include "sched_decision_trace.h"
@@ -81,6 +82,8 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
 #include "window.h"
+#include "desktop_telemetry.h"
+#include "storage_io_stats.h"
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
@@ -4745,6 +4748,51 @@ static void DebugRuntimeHistory(unsigned cpu,bool rows)
     DebugChannelSend("]}\n");
 }
 
+static void DebugSchedulerLockStats()
+{
+    // Debug listener is serial; static storage keeps ~8 KiB off its stack.
+    static SchedLockStats::Merged m;unsigned cpus=0;
+    SchedulerLockStatsRead(&m,&cpus);
+    const uint64_t khz=ApicGetTscKhz();
+    auto ns=[&](uint64_t cycles)->uint64_t{return khz?cycles*1000000ull/khz:0;};
+    static const char* lockNames[LockStatLocks]={"ready","all_proc","pid"};
+    BridgeReply h;
+    h.text("{\"enabled\":");h.text(SchedulerLockStatsEnabled()?"true":"false");
+    h.text(",\"lock_mode\":");h.text(SchedulerLockUnfairMode(-1)?"\"unfair\"":"\"ticket\"");
+    h.text(",\"idle_skip\":");h.text(SchedulerIdleTickSkipMode(-1)?"true":"false");
+    h.text(",");h.field("cpus",cpus);h.text(",");h.field("cpus_in_epoch",m.cpusInEpoch);
+    h.text(",");h.field("tsc_khz",khz);h.text(",");h.field("site_overflow",m.siteOverflow);
+    h.text(",");h.field("merge_overflow",m.mergeOverflow);
+    h.text(",\"bucket_lower_cycles\":\"2^(b+6), bucket 0 from 0, last open\"");
+    h.text(",\"scope\":\"default off; TSC cycles from claim start to ownership (wait, contended only), ownership to release (hold), predecessor release to ownership (handoff, contended only); steal is the measuring vCPU's own KVM steal; rows cleared lazily per CPU on reset; independent relaxed reads\",\"locks\":[");
+    h.send();
+    for(unsigned l=0;l<LockStatLocks;++l){
+        const auto& r=m.lock[l];BridgeReply o;if(l)o.text(",");
+        o.text("{\"lock\":\"");o.text(lockNames[l]);o.text("\",");
+        o.field("acquisitions",r.acquisitions);o.text(",");o.field("contended",r.contended);
+        o.text(",");o.field("wait_ns",ns(r.waitCycles));o.text(",");o.field("max_wait_ns",ns(r.maxWaitCycles));
+        o.text(",");o.field("hold_ns",ns(r.holdCycles));o.text(",");o.field("max_hold_ns",ns(r.maxHoldCycles));
+        o.text(",");o.field("wait_steal_ns",r.waitStealNs);o.text(",");o.field("hold_steal_ns",r.holdStealNs);
+        o.text(",");o.field("stolen_holds",r.stolenHolds);o.text(",");o.field("handoffs",r.handoffs);
+        o.text(",");o.field("handoff_ns",ns(r.handoffCycles));o.text(",");o.field("max_handoff_ns",ns(r.maxHandoffCycles));
+        const uint64_t* hists[3]={r.waitHist,r.holdHist,r.handoffHist};static const char* hn[3]={"wait_hist","hold_hist","handoff_hist"};
+        for(unsigned k=0;k<3;++k){o.text(",\"");o.text(hn[k]);o.text("\":[");
+            for(unsigned b=0;b<LockStatBuckets;++b){if(b)o.text(",");o.number(hists[k][b]);}o.text("]");}
+        o.text("}");o.send();
+    }
+    DebugChannelSend("],\"sites\":[");
+    for(unsigned i=0;i<m.sites;++i){
+        const auto& x=m.site[i];BridgeReply o;if(i)o.text(",");
+        o.text("{\"lock\":\"");o.text(x.lock<LockStatLocks?lockNames[x.lock]:"?");o.text("\",\"caller\":");
+        o.quoted(x.caller?x.caller:"?");o.text(",");o.field("line",x.line);
+        o.text(",");o.field("acquisitions",x.acquisitions);o.text(",");o.field("contended",x.contended);
+        o.text(",");o.field("wait_ns",ns(x.waitCycles));o.text(",");o.field("max_wait_ns",ns(x.maxWaitCycles));
+        o.text(",");o.field("hold_ns",ns(x.holdCycles));o.text(",");o.field("max_hold_ns",ns(x.maxHoldCycles));
+        o.text(",");o.field("hold_steal_ns",x.holdStealNs);o.text("}");o.send();
+    }
+    DebugChannelSend("]}\n");
+}
+
 static void DebugSchedulerLockTrace()
 {
     SchedulerLockTraceSnapshot s{};SchedulerLockTraceRead(&s);
@@ -5421,6 +5469,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("last_event_sequence",oom.lastEventSequence);r.text("}");
         r.text(",");r.field("process_count",count);
         r.text(",");r.field("running_process_count",running);
+        // Device transfer totals per storage source plus the taskbar's last
+        // R/W sample (bytes/s, refreshed every 500 ms by the compositor).
+        const auto desktop=WmDesktopTelemetryRead();
+        r.text(",\"storage\":{");r.field("taskbar_sample_tick_ms",desktop.tick);
+        r.text(",");r.field("taskbar_read_bytes_per_second",desktop.readBytesPerSecond);
+        r.text(",");r.field("taskbar_write_bytes_per_second",desktop.writeBytesPerSecond);
+        for(uint32_t source=0;source<uint32_t(StorageIoSource::Count);++source) {
+            const auto id=StorageIoSource(source);const auto totals=StorageIoRead(id);
+            r.text(",\"");r.text(StorageIoSourceName(id));r.text("\":{");
+            r.field("read_ops",totals.readOps);r.text(",");r.field("write_ops",totals.writeOps);
+            r.text(",");r.field("flush_ops",totals.flushOps);r.text(",");r.field("read_bytes",totals.readBytes);
+            r.text(",");r.field("write_bytes",totals.writeBytes);r.text("}");
+        }
+        r.text("}");
         r.text(",");r.field("sample_tick_ms",t.tick);
         r.text(",\"frametimes\":{\"source\":\"compositor_interval\",");r.field("count",t.count);
         r.text(",");r.field("p50_ms",t.p50Ms);r.text(",");r.field("p90_ms",t.p90Ms);
@@ -5522,6 +5584,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched runtime history on|off|reset|status|cpu N - bounded clamp/owner history\n"
             "  sched kvm status - advertised PV features and independent preemption hints\n"
             "  sched lock-trace on|off|reset|status - ready-lock ticket and clock observations\n"
+            "  sched lock-stats on|off|reset|status - scheduler-lock hold/wait/handoff histograms and sites (default off)\n"
+            "  sched lock-mode ticket|unfair|status - FIFO tickets or unfair claims (default unfair under a hypervisor)\n"
+            "  sched idle-skip on|off|status - idle ticks skip the ready lock while nothing is queued (default on)\n"
             "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
@@ -7040,6 +7105,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             }
         }
         DebugSchedulerLockTrace();
+    }
+    else if(StrStartsWith(cmd,"sched lock-stats ")){
+        const char* a=cmd+sizeof("sched lock-stats ")-1;
+        if(NetStrEq(a,"on"))SchedulerLockStatsControl(1,false);
+        else if(NetStrEq(a,"off"))SchedulerLockStatsControl(0,false);
+        else if(NetStrEq(a,"reset"))SchedulerLockStatsControl(-1,true);
+        else if(!NetStrEq(a,"status")){DebugChannelSend("{\"error\":\"usage: sched lock-stats on|off|reset|status\"}\n");return;}
+        DebugSchedulerLockStats();
+    }
+    else if(NetStrEq(cmd,"sched lock-mode ticket") || NetStrEq(cmd,"sched lock-mode unfair") || NetStrEq(cmd,"sched lock-mode status")){
+        int mode=NetStrEq(cmd,"sched lock-mode ticket")?0:NetStrEq(cmd,"sched lock-mode unfair")?1:-1;
+        const bool unfair=SchedulerLockUnfairMode(mode);BridgeReply r;
+        r.text("{\"mode\":");r.text(unfair?"\"unfair\"":"\"ticket\"");r.text("}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"sched idle-skip on") || NetStrEq(cmd,"sched idle-skip off") || NetStrEq(cmd,"sched idle-skip status")){
+        int mode=NetStrEq(cmd,"sched idle-skip on")?1:NetStrEq(cmd,"sched idle-skip off")?0:-1;
+        const bool on=SchedulerIdleTickSkipMode(mode);BridgeReply r;
+        r.text("{\"enabled\":");r.text(on?"true":"false");r.text("}\n");r.send();
     }
     else if (NetStrEq(cmd, "sched kvm status")) {
         KvmVirtualizationStatus status{}; KvmVirtualizationRead(SmpGetCpuCount(), &status);

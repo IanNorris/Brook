@@ -26,6 +26,7 @@
 #include "net.h"
 #include "module.h"
 #include "virtio_blk.h"
+#include "storage_io_stats.h"
 #include "ext2_vfs.h"
 #include "fs/compressed_vfs.h"
 #include "string.h"
@@ -1264,7 +1265,7 @@ static Vnode* GenDiskstats()
 {
     // Format: major minor name reads rd_merged rd_sectors rd_ms writes wr_merged wr_sectors wr_ms io_cur io_ms weighted_ms
     // We use a simplified form with real read/write counts and sectors.
-    uint32_t bufSize = 512;
+    uint32_t bufSize = 1024;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) return nullptr;
 
@@ -1302,6 +1303,28 @@ static Vnode* GenDiskstats()
         p = AppendU64(p, wrOps);
         p = AppendStr(p, " 0 ");
         p = AppendU64(p, wrSectors);
+        p = AppendStr(p, " 0 0 0 0\n");
+    }
+    // Whole-device transfer totals for AHCI (sda) and USB mass storage (sdu);
+    // partitions and filesystems above them are not listed separately.
+    static const char* const names[] = {"sda", "sdu", "nvme0n1"};
+    for (uint32_t source = 0; source < uint32_t(StorageIoSource::Count); ++source)
+    {
+        const auto t = StorageIoRead(StorageIoSource(source));
+        if (!t.readOps && !t.writeOps && !t.flushOps) continue;
+        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+        p = AppendStr(p, source == 2 ? " 259    " : "   8    ");
+        p = AppendU64(p, source == 1 ? 16 : 0);
+        *p++ = ' ';
+        p = AppendStr(p, names[source]);
+        *p++ = ' ';
+        p = AppendU64(p, t.readOps);
+        p = AppendStr(p, " 0 ");
+        p = AppendU64(p, t.readBytes / 512);
+        p = AppendStr(p, " 0 ");
+        p = AppendU64(p, t.writeOps);
+        p = AppendStr(p, " 0 ");
+        p = AppendU64(p, t.writeBytes / 512);
         p = AppendStr(p, " 0 0 0 0\n");
     }
     *p = '\0';

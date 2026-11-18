@@ -19,6 +19,7 @@
 #include "debug_hardware.h"
 #include "device.h"
 #include "virtio_blk.h"
+#include "storage_io_stats.h"
 #include "net.h"
 #include "debug_presence.h"
 #include "smp.h"

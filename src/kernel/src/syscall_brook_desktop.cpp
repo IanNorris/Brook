@@ -448,6 +448,17 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         for(uint32_t i=0;i<bands.count;++i)info.bands[i]={bands.bands[i].x,bands.bands[i].y,bands.bands[i].width,bands.bands[i].height};
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
+    if(op==BROOK_DESKTOP_OVERLAY_BANDS_V2){
+        if(offset || length!=sizeof(BrookDesktopOverlayBandsV2))return -EINVAL;
+        DesktopOverlayBands bands{};const int result=CompositorOverlayBands(uint32_t(token),owner,bands);
+        if(result)return result;
+        BrookDesktopOverlayBandsV2 info{};info.bands.count=bands.count;info.opaque=bands.opaque;
+        for(uint32_t i=0;i<bands.count;++i){
+            info.bands.bands[i]={bands.bands[i].x,bands.bands[i].y,bands.bands[i].width,bands.bands[i].height};
+            info.keys[i]=bands.keys[i];
+        }
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
     if(op==BROOK_DESKTOP_OVERLAY_GENERATION){
         if(token || destination || length || offset)return -EINVAL;
         return int64_t(CompositorOverlayGeneration()&0x7fffffffffffffffULL);

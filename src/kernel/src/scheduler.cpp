@@ -9,6 +9,8 @@
 #include "sched_decision_trace.h"
 #include "sched_lock_trace.h"
 #include "sched_lock_owner.h"
+#include "sched_lock_stats.h"
+#include "sched_lock_claim.h"
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
@@ -74,7 +76,33 @@ struct SchedLock {
     volatile uint32_t serving = 0;
     bool traced = false;
     bool ownerObserved = false;
+    uint8_t statId = 0;          // SchedLockStats row: 0 ready, 1 all-process, 2 pid
+    bool publishReady = false;   // publish the lock-free ready hint on release
+    // Statistics only, written by the owner: previous release time and the
+    // current hold. Both stay zero/invalid while statistics are off.
+    uint64_t lastReleaseTsc = 0;
+    LockStatHold statHold{};
 };
+
+// Unfair claims avoid handing the lock to a descheduled vCPU (see
+// sched_lock_claim.h). Selected at boot when CPUID reports a hypervisor;
+// `sched lock-mode` switches at runtime (mixed acquirers stay correct).
+static uint32_t g_schedLockUnfair = 0;
+static constexpr uint64_t SCHEDLOCK_UNFAIR_SPIN_BUDGET = 1ULL << 16;
+static SchedLockStats g_lockStats;
+static inline uint64_t SchedLockTsc()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (uint64_t(hi) << 32) | lo;
+}
+static inline uint64_t SchedLockSteal(uint32_t cpu)
+{
+    uint64_t steal = 0;
+    if (KvmStealAvailable(cpu) && !KvmStealReadNs(cpu, &steal)) steal = 0;
+    return steal;
+}
+static void PublishReadyHintLocked();
 
 static ReadyLockOwnerObservation g_readyOwner;
 void SchedulerReadyLockOwnerMode(bool enabled){g_readyOwner.Mode(enabled);}
@@ -112,7 +140,8 @@ static void LockTraceReleased(const LockTraceToken& token)
 // critical section, which should be <1µs.
 static constexpr uint64_t SCHEDLOCK_TIMEOUT_SPINS = 50000000ULL;
 
-static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const char* caller)
+// Returns true when the ticket was not already current (the caller waited).
+static inline bool SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const char* caller)
 {
     uint64_t spins = 0,nextOwnerSample=64;bool ownerHintSpent=false;
     const bool observeOwner=lock.ownerObserved && g_readyOwner.Enabled();
@@ -147,21 +176,76 @@ static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const 
                         __atomic_load_n(&lock.serving, __ATOMIC_RELAXED));
         }
     }
+    return spins!=0;
 }
-static inline uint64_t SchedLockAcquire(SchedLock& lock,const char* caller=__builtin_FUNCTION())
+// Unfair claim with the same owner observation/yield checkpoints as the FIFO
+// wait. Exhausting the budget reserves a FIFO ticket (bounded starvation).
+static inline uint32_t SchedLockClaimUnfair(SchedLock& lock,const char* caller,bool* contended)
+{
+    const bool observeOwner=lock.ownerObserved && g_readyOwner.Enabled();
+    const auto observerCpu=observeOwner?SmpCurrentCpuIndex():0;
+    uint64_t nextOwnerSample=64;bool ownerHintSpent=false;
+    return TicketUnfairAcquire(&lock.next,&lock.serving,SCHEDLOCK_UNFAIR_SPIN_BUDGET,
+        [&](uint64_t spins){
+            if(observeOwner){
+                if(spins==1)g_readyOwner.Waiting(observerCpu);
+                if(spins==nextOwnerSample){
+                    g_readyOwner.ObserveUnfairWait(observerCpu,ownerHintSpent,[&]{return __atomic_load_n(&lock.serving,__ATOMIC_ACQUIRE);},
+                        [](unsigned cpu,uint8_t* hint){return KvmStealReadPreempted(cpu,hint);},
+                        [](unsigned cpu,int64_t* result){return KvmSchedYield(cpu,result);},
+                        []{uint64_t flags;__asm__ volatile("pushfq; pop %0" : "=r"(flags) :: "memory");return flags;});
+                    nextOwnerSample*=2;
+                }
+            }
+            __asm__ volatile("pause" ::: "memory");
+        },
+        [&](uint32_t ticket){SchedLockWaitForTicket(lock,ticket,caller);},contended);
+}
+static inline void SchedLockStatsAcquired(SchedLock& lock,const char* caller,uint32_t line,bool contended,
+                                          uint32_t cpu,uint64_t startTsc,uint64_t startSteal)
+{
+    g_lockStats.Acquired(cpu,lock.statId,caller,line,contended,startTsc,startSteal,SchedLockTsc(),
+                         SchedLockSteal(cpu),lock.lastReleaseTsc,&lock.statHold);
+    lock.lastReleaseTsc=0;
+}
+// Owner only, before the releasing store.
+static inline void SchedLockStatsReleasing(SchedLock& lock)
+{
+    if(__builtin_expect(lock.statHold.valid,0)){
+        const uint32_t cpu=lock.statHold.cpu;const uint64_t now=SchedLockTsc();
+        g_lockStats.Released(cpu,lock.statId,&lock.statHold,now,SchedLockSteal(cpu));
+        lock.lastReleaseTsc=now;
+    }else if(lock.lastReleaseTsc)lock.lastReleaseTsc=0;
+}
+static inline uint64_t SchedLockAcquire(SchedLock& lock,const char* caller=__builtin_FUNCTION(),
+                                        uint32_t line=__builtin_LINE())
 {
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    const auto ticket=__atomic_fetch_add(&lock.next,1,__ATOMIC_RELAXED);
-    const auto trace=LockTraceReserved(lock,ticket,caller);
-    SchedLockWaitForTicket(lock,ticket,caller);
+    const bool stats=__builtin_expect(g_lockStats.Enabled(),0);
+    uint32_t statCpu=0;uint64_t startTsc=0,startSteal=0;
+    if(stats){statCpu=SmpCurrentCpuIndex();startTsc=SchedLockTsc();startSteal=SchedLockSteal(statCpu);}
+    bool contended=false;uint32_t ticket;LockTraceToken trace{};
+    if(__atomic_load_n(&g_schedLockUnfair,__ATOMIC_RELAXED)){
+        // The lock trace reserves after the claim here: its wait bracket
+        // covers only a fallback/stale FIFO wait, not the unfair spin.
+        ticket=SchedLockClaimUnfair(lock,caller,&contended);
+        trace=LockTraceReserved(lock,ticket,caller);
+    }else{
+        ticket=__atomic_fetch_add(&lock.next,1,__ATOMIC_RELAXED);
+        trace=LockTraceReserved(lock,ticket,caller);
+        contended=SchedLockWaitForTicket(lock,ticket,caller);
+    }
     if(lock.ownerObserved && g_readyOwner.Enabled())g_readyOwner.Acquired(SmpCurrentCpuIndex(),ticket);
     LockTraceAcquired(trace);
+    if(stats)SchedLockStatsAcquired(lock,caller,line,contended,statCpu,startTsc,startSteal);
     return flags;
 }
 
 static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
 {
+    if(lock.publishReady)PublishReadyHintLocked();
+    SchedLockStatsReleasing(lock);
     const auto trace=LockTraceReleasing(lock);
     if(lock.ownerObserved && g_readyOwner.Owner())g_readyOwner.Releasing(SmpCurrentCpuIndex(),__atomic_load_n(&lock.serving,__ATOMIC_RELAXED));
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
@@ -182,6 +266,8 @@ static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
 // IF=0 critical section.
 static inline void SchedLockReleaseRaw(SchedLock& lock)
 {
+    if(lock.publishReady)PublishReadyHintLocked();
+    SchedLockStatsReleasing(lock);
     const auto trace=LockTraceReleasing(lock);
     if(lock.ownerObserved && g_readyOwner.Owner())g_readyOwner.Releasing(SmpCurrentCpuIndex(),__atomic_load_n(&lock.serving,__ATOMIC_RELAXED));
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
@@ -303,7 +389,39 @@ static uint32_t g_registeredPolicyCount = 0;
 static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 
 // Global scheduler lock (interrupt-safe, protects all policy calls).
-static SchedLock g_readyLock{0,0,true,true};
+static SchedLock g_readyLock{0,0,true,true,0,true};
+
+// Lock-free "anything queued?" hint, published by every ready-lock release
+// (all queue mutations hold the lock). A reader can see a stale zero; every
+// enqueuer kicks an idle CPU after releasing and each tick rechecks.
+static uint32_t g_readyHint = 0;
+static void PublishReadyHintLocked()
+{
+    if (g_schedOps)
+        __atomic_store_n(&g_readyHint, g_schedOps->ReadyCount(g_schedState), __ATOMIC_RELAXED);
+}
+static inline bool ReadyHintEmpty() { return __atomic_load_n(&g_readyHint, __ATOMIC_RELAXED) == 0; }
+// Idle ticks with an empty ready hint skip the ready lock (`sched idle-skip`).
+static bool g_idleTickSkip = true;
+
+void SchedulerLockStatsControl(int mode,bool reset){g_lockStats.Control(mode,reset);}
+bool SchedulerLockStatsEnabled(){return g_lockStats.Enabled();}
+void SchedulerLockStatsRead(SchedLockStats::Merged* output,unsigned* cpus)
+{
+    unsigned n=SmpGetCpuCount();if(n>LockStatCpus)n=LockStatCpus;
+    if(cpus)*cpus=n;
+    if(output)g_lockStats.Read(n,output);
+}
+bool SchedulerLockUnfairMode(int mode)
+{
+    if(mode>=0)__atomic_store_n(&g_schedLockUnfair,uint32_t(mode!=0),__ATOMIC_RELAXED);
+    return __atomic_load_n(&g_schedLockUnfair,__ATOMIC_RELAXED)!=0;
+}
+bool SchedulerIdleTickSkipMode(int mode)
+{
+    if(mode>=0)__atomic_store_n(&g_idleTickSkip,mode!=0,__ATOMIC_RELAXED);
+    return __atomic_load_n(&g_idleTickSkip,__ATOMIC_RELAXED);
+}
 
 bool SchedulerLockTraceControl(int mode,bool reset){return g_lockTrace.Control(mode,reset);}
 void SchedulerLockTraceRead(SchedulerLockTraceSnapshot* output)
@@ -537,7 +655,7 @@ bool SchedulerReadyLatencyWatch(uint32_t pid) {
 // All processes (for blocked-process scanning).
 static Process* g_allProcesses[MAX_PROCESSES] = {};
 static uint32_t g_processCount = 0;
-static SchedLock g_allProcLock;
+static SchedLock g_allProcLock{0,0,false,false,1};
 
 // BRO-179: reverse-map diagnostic. Given a physical frame, scan EVERY live
 // process's user page table (PML4[0..255]) for a present leaf PTE that still
@@ -619,7 +737,7 @@ extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys)
 // PID allocation, recycling and unpublished user-birth leases share one lock.
 // No PID escapes a shutdown admission check before acquiring its reservation.
 static ProcessIdPool<MAX_PROCESSES> g_processIds;
-static SchedLock g_pidLock;
+static SchedLock g_pidLock{0,0,false,false,2};
 
 // Guard: timer ticks are ignored until SchedulerStart sets this.
 static volatile bool g_schedulerRunning = false;
@@ -1184,6 +1302,15 @@ static void IdleLoop()
 void SchedulerInit()
 {
     g_runtimeStableClock = KvmClockStableAvailable();
+    // CPUID.1:ECX[31]: running under a hypervisor. vCPUs can then be
+    // descheduled while waiting for a FIFO ticket; claim the scheduler locks
+    // unfairly instead (sched_lock_claim.h). Bare metal keeps FIFO tickets.
+    {
+        uint32_t a = 1, b, c = 0, d;
+        __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+        g_schedLockUnfair = (c >> 31) & 1;
+        SerialPrintf("SCHED: lock mode %s\n", g_schedLockUnfair ? "unfair (hypervisor)" : "ticket");
+    }
     // Load the scheduling policy module.
     // The statically-linked default (sched_rr) is always available.
     // Dynamic modules can register additional policies at runtime.
@@ -1933,7 +2060,25 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     const uint64_t timerScheduler=timerProbe?TimerWakeTimingNow():0;
     IdleIrqAccountingPending idleAccounting;
 
+    // An idle CPU with nothing queued needs neither the runtime sample nor the
+    // idle dispatch below: the next dispatch's ownership sample charges the
+    // whole interval to the idle owner. Without this every idle CPU takes the
+    // global ready lock twice per millisecond. Diagnostics that observe each
+    // idle tick (ready-latency watch, coalesced idle accounting) keep the
+    // original path, as does the BSP when its lost-enqueue check is due.
+    bool idleQuiet=false;
     {
+        const uint32_t entryCpu=ThisCpu();
+        const auto* local=g_perCpu[entryCpu].currentProcess;
+        idleQuiet=local && local==g_perCpu[entryCpu].idleProcess &&
+            __atomic_load_n(&g_idleTickSkip,__ATOMIC_RELAXED) && ReadyHintEmpty() &&
+            !g_readyLatency.Enabled() && !__atomic_load_n(&g_idleIrqAccountingCoalesce,__ATOMIC_ACQUIRE) &&
+            (entryCpu!=0 || !PersistentReadyStallDue());
+    }
+
+    if(idleQuiet){
+        if(stages){stages->acquiredNs=TimerWakeTimingNow();stages->deferred=true;stages->accountedNs=stages->acquiredNs;}
+    }else{
         const uint32_t runtimeCpu=ThisCpu();
         const auto* local=g_perCpu[runtimeCpu].currentProcess;
         const bool runtimeCurrent=local!=nullptr;
@@ -2140,6 +2285,9 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     // Idle — if something became ready, switch to it.
     if (cur == g_perCpu[cpu].idleProcess)
     {
+        // Recheck: the BSP wake scan above may have queued work since entry.
+        if (idleQuiet && !idleAccounting.active && ReadyHintEmpty())
+            return;
         uint64_t rlf7 = SchedLockAcquire(g_readyLock,"irq-idle-dispatch");
         const bool coalescedIdleSample=idleAccounting.active;
         if(coalescedIdleSample){
@@ -2317,6 +2465,11 @@ void SchedulerYield()
     }
     // DoSwitch claims next + releases g_readyLock (raw) before context_switch.
     DoSwitch(old, next, requeue, /* holdingReadyLock */ true);
+}
+
+bool SchedulerIsRunning()
+{
+    return __atomic_load_n(&g_schedulerRunning, __ATOMIC_ACQUIRE);
 }
 
 extern "C" void SchedulerSleepMs(uint32_t ms)

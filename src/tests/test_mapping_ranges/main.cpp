@@ -94,6 +94,9 @@ static void checkLookup(const MappingRangeTable& table, uint64_t address) {
     for(auto* node=table.head;node;node=node->next)
         if(node->range.end>address){next=&node->range;break;}
     assert(MappingRangeAtOrAfter(table,address)==next);
+    // The index lower bound used by Replace/CanReplace/Protect walks.
+    const auto* first=MappingRangeFirstEndingAfter(table,address);
+    assert(first?&first->range==next:!next);
     mutation = false; failAfter = -1;
 }
 static MappingRange anonymous(uint64_t begin, uint64_t end, unsigned protection = 3) {
