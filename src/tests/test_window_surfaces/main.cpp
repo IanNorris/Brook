@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include "../../kernel/src/window.cpp"
+#include "../../kernel/src/chrome_raster.cpp"
 #include "../../kernel/src/desktop_shell_surfaces.h"
 #include "../../kernel/src/desktop_layers_export.h"
 #include "../../kernel/src/desktop_chrome_binding.h"
