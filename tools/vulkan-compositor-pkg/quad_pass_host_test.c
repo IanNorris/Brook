@@ -14,6 +14,7 @@
 #include "quad_reference.h"
 #include "desktop_tile.h"
 #include "desktop_graphics_damage.h"
+#include "intel_tiling.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -280,6 +281,46 @@ static void ring_targets(void){
     g_outputCache=1;(void)before;
     printf("QUAD_HOST_RING_TARGETS_PASS\n");
 }
+/* Intel X/Y-tiled sources (DRM format modifiers): a tiled copy of a random
+ * image, drawn 1:1 and scaled, must give exactly the linear source's output. */
+static void tiled_sources(void){
+    if(!brook_vk_renderer_modifiers(compute)){printf("QUAD_HOST_TILED_SKIP no VK_EXT_image_drm_format_modifier\n");return;}
+    enum {TW=200,TH=70,PITCH=256,PADH=96,OW=300,OH=150};
+    static const uint64_t mods[2]={0x0100000000000001ull,0x0100000000000002ull};
+    struct Gem linear,tiled,outLinear,outTiled;
+    gem_new((uint64_t)PITCH*PADH*4,&linear);gem_new((uint64_t)PITCH*PADH*4,&tiled);
+    gem_new((uint64_t)OW*OH*4,&outLinear);gem_new((uint64_t)OW*OH*4,&outTiled);
+    for(unsigned m=0;m<2;++m){
+        const int tiling=m?BROOK_TILING_Y:BROOK_TILING_X;
+        gem_cpu(&linear,1);gem_cpu(&tiled,1);
+        for(uint32_t y=0;y<TH;++y)for(uint32_t x=0;x<TW;++x){uint32_t v=next()|0xff000000u;
+            linear.map[y*PITCH+x]=v;memcpy((uint8_t *)tiled.map+brook_tiled_offset(tiling,PITCH*4u,x,y),&v,4);}
+        for(unsigned scaled=0;scaled<2;++scaled){
+            uint32_t scene[BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS]={OW,OH,1,0};
+            struct BrookVkSceneLayer l={0,PITCH,TW,TH,0,0,TW,TH,7,5,scaled?OW-20:TW,scaled?OH-10:TH,0,0,OW,OH,
+                255|BROOK_VK_STRAIGHT_ALPHA|BROOK_VK_OPAQUE_SOURCE};
+            memcpy(scene+BROOK_VK_SCENE_HEADER,&l,sizeof(l));
+            struct QuadPlan *plan=calloc(1,sizeof(*plan));CHECK(plan);
+            const struct DesktopDamageSet full={1,{{0,0,OW,OH}}};const struct QuadRect holes[1]={{0}};
+            CHECK(quad_plan_build_auto(scene,BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS,holes,&full,1,plan));
+            for(int pass=0;pass<2;++pass){struct Gem *src=pass?&tiled:&linear,*out=pass?&outTiled:&outLinear;
+                gem_cpu(out,1);memset(out->map,0,(size_t)OW*OH*4);
+                struct BrookVkQuadSource s={{src->fd,-1,TW,TH,0,PITCH,src->size},0};
+                const struct BrookVkQuadSource o={{out->fd,-1,OW,OH,0,OW,out->size},0};
+                const uint64_t modifier=pass?mods[m]:0;CHECK(brook_vk_quad_pass_set_source_modifiers(quad,&modifier,1));
+                const BrookVkResult r=brook_vk_quad_pass_submit(quad,scene,BROOK_VK_SCENE_HEADER+BROOK_VK_LAYER_WORDS,&s,1,&o,plan);
+                if(r!=BROOK_VK_PENDING)fprintf(stderr,"QUAD_HOST_TILED submit=%d modifier=0x%llx\n",r,(unsigned long long)modifier);
+                CHECK(r==BROOK_VK_PENDING);CHECK(brook_vk_quad_pass_wait(quad,5000000000ull)==BROOK_VK_COMPLETE);}
+            gem_cpu(&outLinear,0);gem_cpu(&outTiled,0);
+            unsigned bad=0;for(uint32_t k=0;k<OW*OH;++k)bad+=outLinear.map[k]!=outTiled.map[k];
+            unsigned drawn=0;for(uint32_t k=0;k<OW*OH;++k)drawn+=outLinear.map[k]!=0;
+            printf("QUAD_HOST_TILED modifier=0x%016llx scaled=%u drawn=%u mismatches=%u\n",(unsigned long long)mods[m],scaled,drawn,bad);
+            CHECK(!bad && drawn>(scaled?OW*OH/2:TW*TH/2));free(plan);
+        }
+    }
+    gem_free(&linear);gem_free(&tiled);gem_free(&outLinear);gem_free(&outTiled);
+    printf("QUAD_HOST_TILED_PASS\n");
+}
 int main(int argc,char **argv){
     const unsigned iterations=argc>1?(unsigned)strtoul(argv[1],NULL,10):300;
     setenv("BROOK_RENDER_GPU_TIMESTAMPS","1",0);
@@ -290,6 +331,8 @@ int main(int argc,char **argv){
     VkPhysicalDevice physical;VkDevice device;VkQueue queue;uint32_t family;
     CHECK(brook_vk_renderer_graphics_context(compute,&physical,&device,&queue,&family));
     quad=brook_vk_quad_pass_create(physical,device,queue,family);CHECK(quad);
+    brook_vk_quad_pass_set_modifiers(quad,brook_vk_renderer_modifiers(compute));
+    tiled_sources();
     ring_targets();
     for(unsigned i=0;i<iterations;++i)random_scene(i);
     printf("QUAD_HOST_RANDOM_EXACT iterations=%u\n",iterations);

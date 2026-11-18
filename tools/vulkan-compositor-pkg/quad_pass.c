@@ -21,7 +21,7 @@ _Static_assert(sizeof(struct QuadPush)==72,"quad push constant layout");
 struct QuadImage {
     dev_t dev;ino_t ino;uint64_t bytes,lastUse;
     uint32_t width,height,offsetWords,strideWords;VkImageUsageFlags usage;
-    int pin,live;
+    int pin,live;uint64_t modifier;
     VkImage image;VkDeviceMemory memory;VkImageView view;VkDescriptorSet set;VkFramebuffer framebuffer;
 };
 struct BrookVkQuadPass {
@@ -30,7 +30,8 @@ struct BrookVkQuadPass {
     VkShaderModule vertex,fragment;VkSampler sampler;VkPipeline pipeline[QUAD_PIPELINES];
     VkCommandPool commandPool;VkCommandBuffer command;VkFence fence;
     VkQueryPool timestamps;uint32_t timestampBits;float timestampPeriod;uint64_t gpuNs;int gpuValid;
-    PFN_vkGetMemoryFdPropertiesKHR getFdProperties;PFN_vkImportSemaphoreFdKHR importSemaphore;
+    PFN_vkGetMemoryFdPropertiesKHR getFdProperties;PFN_vkImportSemaphoreFdKHR importSemaphore;int modifiers;
+    uint64_t sourceModifiers[BROOK_VK_MAX_LAYERS];
     struct QuadImage cache[QUAD_CACHE_SLOTS],frame[QUAD_FRAME_SLOTS];unsigned frameCount;
     VkSemaphore wait[BROOK_VK_MAX_LAYERS];unsigned waitCount;
     uint64_t clock;int pending,uncertain;VkResult lastResult;
@@ -194,31 +195,50 @@ fail:
  * width, or, if the driver's natural row pitch differs, at the stride width
  * (the shader never samples outside the used crop). The data offset becomes
  * the memory binding offset. */
-static int image_create(BrookVkQuadPass *p,int fd,const struct BrookVkGraphicsBuffer *b,uint32_t width,
+void brook_vk_quad_pass_set_modifiers(BrookVkQuadPass *p,int enabled){if(p)p->modifiers=enabled!=0;}
+int brook_vk_quad_pass_set_source_modifiers(BrookVkQuadPass *p,const uint64_t *modifiers,size_t count){
+    if(!p || count>BROOK_VK_MAX_LAYERS)return 0;
+    memset(p->sourceModifiers,0,sizeof(p->sourceModifiers));
+    for(size_t i=0;i<count;++i){if(modifiers[i] && !p->modifiers)return 0;p->sourceModifiers[i]=modifiers[i];}
+    return 1;
+}
+static int image_create(BrookVkQuadPass *p,int fd,const struct BrookVkGraphicsBuffer *b,uint64_t modifier,uint32_t width,
                         VkImageUsageFlags usage,struct QuadImage *m){
+    /* Intel X/Y-tiled sources use an explicit DRM format modifier layout
+     * (one plane, pitch = stride, data offset = memory binding offset). */
+    const int tiled=modifier!=0;
+    if(tiled && (!p->modifiers || (usage&~VK_IMAGE_USAGE_SAMPLED_BIT) || width!=b->width))return 0;
+    const VkSubresourceLayout plane={.offset=0,.rowPitch=(VkDeviceSize)b->strideWords*4u};
+    VkImageDrmFormatModifierExplicitCreateInfoEXT explicitModifier={.sType=VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+        .drmFormatModifier=modifier,.drmFormatModifierPlaneCount=1,.pPlaneLayouts=&plane};
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierInfo={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+        .drmFormatModifier=modifier,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
+    const VkImageTiling vkTiling=tiled?VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:VK_IMAGE_TILING_LINEAR;
     VkPhysicalDeviceExternalImageFormatInfo externalFormat={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-        .handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        .pNext=tiled?&modifierInfo:NULL,.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     VkPhysicalDeviceImageFormatInfo2 format={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,.pNext=&externalFormat,
-        .format=VK_FORMAT_B8G8R8A8_UNORM,.type=VK_IMAGE_TYPE_2D,.tiling=VK_IMAGE_TILING_LINEAR,.usage=usage};
+        .format=VK_FORMAT_B8G8R8A8_UNORM,.type=VK_IMAGE_TYPE_2D,.tiling=vkTiling,.usage=usage};
     VkExternalImageFormatProperties externalProperties={.sType=VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
     VkImageFormatProperties2 properties={.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,.pNext=&externalProperties};
     if(vkGetPhysicalDeviceImageFormatProperties2(p->physical,&format,&properties)!=VK_SUCCESS ||
        !(externalProperties.externalMemoryProperties.externalMemoryFeatures&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
        width>properties.imageFormatProperties.maxExtent.width || b->height>properties.imageFormatProperties.maxExtent.height)return 0;
     VkExternalMemoryImageCreateInfo external={.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        .handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        .pNext=tiled?&explicitModifier:NULL,.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     VkImageCreateInfo create={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.pNext=&external,.imageType=VK_IMAGE_TYPE_2D,
         .format=VK_FORMAT_B8G8R8A8_UNORM,.extent={width,b->height,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,
-        .tiling=VK_IMAGE_TILING_LINEAR,.usage=usage,.sharingMode=VK_SHARING_MODE_EXCLUSIVE,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+        .tiling=vkTiling,.usage=usage,.sharingMode=VK_SHARING_MODE_EXCLUSIVE,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
     if(vkCreateImage(p->device,&create,NULL,&m->image)!=VK_SUCCESS){m->image=VK_NULL_HANDLE;return 0;}
-    VkImageSubresource subresource={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT};VkSubresourceLayout layout;
+    VkImageSubresource subresource={.aspectMask=tiled?VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT:VK_IMAGE_ASPECT_COLOR_BIT};VkSubresourceLayout layout;
     vkGetImageSubresourceLayout(p->device,m->image,&subresource,&layout);
     VkMemoryDedicatedRequirements dedicated={.sType=VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
     VkMemoryRequirements2 requirements={.sType=VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,.pNext=&dedicated};
     VkImageMemoryRequirementsInfo2 info={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,.image=m->image};
     vkGetImageMemoryRequirements2(p->device,&info,&requirements);
     const uint64_t bind=(uint64_t)b->offsetWords*4u,need=requirements.memoryRequirements.size;
-    const uint64_t last=bind+((uint64_t)(b->height-1u)*b->strideWords+b->width)*4u;
+    const uint64_t tileRows=modifier==0x0100000000000001ull?8u:32u;
+    const uint64_t last=tiled?bind+(((uint64_t)b->height+tileRows-1u)/tileRows*tileRows)*b->strideWords*4u:
+        bind+((uint64_t)(b->height-1u)*b->strideWords+b->width)*4u;
     const int dedicatedOnly=dedicated.requiresDedicatedAllocation ||
         (externalProperties.externalMemoryProperties.externalMemoryFeatures&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT);
     if(layout.offset || layout.rowPitch!=(uint64_t)b->strideWords*4u || !need ||
@@ -245,13 +265,13 @@ static int image_create(BrookVkQuadPass *p,int fd,const struct BrookVkGraphicsBu
     if(vkCreateImageView(p->device,&view,NULL,&m->view)!=VK_SUCCESS){m->view=VK_NULL_HANDLE;return 0;}
     return 1;
 }
-static int image_import(BrookVkQuadPass *p,const struct BrookVkGraphicsBuffer *b,const struct stat *id,
+static int image_import(BrookVkQuadPass *p,const struct BrookVkGraphicsBuffer *b,uint64_t modifier,const struct stat *id,
                         VkImageUsageFlags usage,int pin,struct QuadImage *m){
     *m=(struct QuadImage){.pin=-1};
     off_t size=lseek(b->fd,0,SEEK_END);
     if(lseek(b->fd,0,SEEK_SET)!=0 || size<0 || (uint64_t)size!=b->allocationBytes)return 0;
-    int ok=image_create(p,b->fd,b,b->width,usage,m);
-    if(!ok && b->strideWords!=b->width){image_destroy(p,m);ok=image_create(p,b->fd,b,b->strideWords,usage,m);}
+    int ok=image_create(p,b->fd,b,modifier,b->width,usage,m);
+    if(!ok && !modifier && b->strideWords!=b->width){image_destroy(p,m);ok=image_create(p,b->fd,b,0,b->strideWords,usage,m);}
     if(ok && (usage&VK_IMAGE_USAGE_SAMPLED_BIT)){
         VkDescriptorSetAllocateInfo ds={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=p->pool,
             .descriptorSetCount=1,.pSetLayouts=&p->setLayout};
@@ -282,20 +302,20 @@ static int image_import(BrookVkQuadPass *p,const struct BrookVkGraphicsBuffer *b
     if(ok && pin){m->pin=fcntl(b->fd,F_DUPFD_CLOEXEC,0);if(m->pin<0)ok=0;}
     if(!ok){image_destroy(p,m);return 0;}
     m->dev=id->st_dev;m->ino=id->st_ino;m->bytes=b->allocationBytes;m->width=b->width;m->height=b->height;
-    m->offsetWords=b->offsetWords;m->strideWords=b->strideWords;m->usage=usage;m->live=1;
+    m->offsetWords=b->offsetWords;m->strideWords=b->strideWords;m->usage=usage;m->live=1;m->modifier=modifier;
     ++p->stats.imports;return 1;
 }
-static int image_matches(const struct QuadImage *m,const struct BrookVkGraphicsBuffer *b,const struct stat *id,VkImageUsageFlags usage){
-    return m->live && m->dev==id->st_dev && m->ino==id->st_ino && m->bytes==b->allocationBytes && m->width==b->width &&
+static int image_matches(const struct QuadImage *m,const struct BrookVkGraphicsBuffer *b,uint64_t modifier,const struct stat *id,VkImageUsageFlags usage){
+    return m->live && m->modifier==modifier && m->dev==id->st_dev && m->ino==id->st_ino && m->bytes==b->allocationBytes && m->width==b->width &&
            m->height==b->height && m->offsetWords==b->offsetWords && m->strideWords==b->strideWords && m->usage==usage;
 }
 /* Find or import; returns NULL on failure. Cached imports outlive the
  * frame; others are destroyed when it retires. */
-static struct QuadImage *image_get(BrookVkQuadPass *p,const struct BrookVkQuadSource *s,const struct stat *id,VkImageUsageFlags usage){
+static struct QuadImage *image_get(BrookVkQuadPass *p,const struct BrookVkQuadSource *s,uint64_t modifier,const struct stat *id,VkImageUsageFlags usage){
     const struct BrookVkGraphicsBuffer *b=&s->buffer;
-    for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)if(image_matches(&p->cache[i],b,id,usage)){
+    for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)if(image_matches(&p->cache[i],b,modifier,id,usage)){
         p->cache[i].lastUse=p->clock;++p->stats.cacheHits;return &p->cache[i];}
-    for(unsigned i=0;i<p->frameCount;++i)if(image_matches(&p->frame[i],b,id,usage))return &p->frame[i];
+    for(unsigned i=0;i<p->frameCount;++i)if(image_matches(&p->frame[i],b,modifier,id,usage))return &p->frame[i];
     if(s->cache){
         int slot=-1;
         for(unsigned i=0;i<QUAD_CACHE_SLOTS && slot<0;++i)if(!p->cache[i].live)slot=(int)i;
@@ -305,11 +325,11 @@ static struct QuadImage *image_get(BrookVkQuadPass *p,const struct BrookVkQuadSo
             if(slot>=0){image_destroy(p,&p->cache[slot]);++p->stats.evictions;}
         }
         if(slot>=0){
-            if(!image_import(p,b,id,usage,1,&p->cache[slot]))return NULL;
+            if(!image_import(p,b,modifier,id,usage,1,&p->cache[slot]))return NULL;
             p->cache[slot].lastUse=p->clock;return &p->cache[slot];
         }
     }
-    if(p->frameCount==QUAD_FRAME_SLOTS || !image_import(p,b,id,usage,0,&p->frame[p->frameCount]))return NULL;
+    if(p->frameCount==QUAD_FRAME_SLOTS || !image_import(p,b,modifier,id,usage,0,&p->frame[p->frameCount]))return NULL;
     return &p->frame[p->frameCount++];
 }
 static int buffer_valid(const struct BrookVkGraphicsBuffer *b){
@@ -327,7 +347,17 @@ static uint32_t fetch_mode(const uint32_t *l){
     return x && y?QUAD_MODE_SAMPLER:QUAD_MODE_DIVIDE;
 }
 
+static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
+        const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
+        const struct QuadPlan *plan);
 BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
+        const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
+        const struct QuadPlan *plan){
+    const BrookVkResult result=quad_pass_submit(p,scene,words,sources,count,output,plan);
+    if(p)memset(p->sourceModifiers,0,sizeof(p->sourceModifiers)); /* one submit only */
+    return result;
+}
+static BrookVkResult quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene,size_t words,
         const struct BrookVkQuadSource *sources,size_t count,const struct BrookVkQuadSource *output,
         const struct QuadPlan *plan){
     if(!p || p->pending || p->uncertain || !scene || !sources || !output || !plan || !count || count>BROOK_VK_MAX_LAYERS ||
@@ -372,10 +402,10 @@ BrookVkResult brook_vk_quad_pass_submit(BrookVkQuadPass *p,const uint32_t *scene
     if(!output->cache)for(unsigned i=0;i<QUAD_CACHE_SLOTS;++i)
         if(p->cache[i].live && (p->cache[i].usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)){
             image_destroy(p,&p->cache[i]);++p->stats.targetEvictions;}
-    struct QuadImage *target=image_get(p,output,&outputId,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+    struct QuadImage *target=image_get(p,output,0,&outputId,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
     struct QuadImage *images[BROOK_VK_MAX_LAYERS]={0};
     if(!target)goto reject;
-    for(size_t i=0;i<count;++i)if(used[i] && !(images[i]=image_get(p,&sources[i],&ids[i],VK_IMAGE_USAGE_SAMPLED_BIT)))goto reject;
+    for(size_t i=0;i<count;++i)if(used[i] && !(images[i]=image_get(p,&sources[i],p->sourceModifiers[i],&ids[i],VK_IMAGE_USAGE_SAMPLED_BIT)))goto reject;
     VkSemaphore waits[BROOK_VK_MAX_LAYERS];VkPipelineStageFlags stages[BROOK_VK_MAX_LAYERS];
     for(size_t i=0;i<count;++i)if(used[i] && sources[i].buffer.syncFd>=0){
         int fd=fcntl(sources[i].buffer.syncFd,F_DUPFD_CLOEXEC,0);if(fd<0)goto reject;
