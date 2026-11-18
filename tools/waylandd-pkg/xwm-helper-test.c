@@ -21,6 +21,9 @@ static struct bxwm_message receive(int fd,uint32_t type,xcb_window_t window,uint
         if (result) {
             assert(bxwm_valid(&m,7,1));
             assert(m.type!=BXWM_WINDOW || m.window!=never_present);
+            // Without waylandd's protocol 2 the helper must keep to the
+            // original messages, which an older waylandd validates.
+            if (!getenv("BROOK_XWM_PROTOCOL")) assert(m.type!=BXWM_FULLSCREEN_REQUEST && !(m.flags&BXWM_SCALED));
             if (m.type==type && (!window || m.window==window) && (!serial || m.serial==serial) &&
                 (!width || m.width==width) && (!height || m.height==height) &&
                 (type!=BXWM_WINDOW || (m.flags&BXWM_MAPPED))) return m;
@@ -44,6 +47,27 @@ static xcb_timestamp_t wait_protocol(xcb_connection_t *c,xcb_atom_t protocols,xc
         } else { struct pollfd p={xcb_get_file_descriptor(c),POLLIN,0};assert(poll(&p,1,100)>=0); }
     }
     fprintf(stderr,"XWM helper protocol timeout\n");abort();
+}
+/* Wait for a ConfigureNotify on window; synthetic selects SendEvent copies. */
+static xcb_configure_notify_event_t wait_configure(xcb_connection_t *c,xcb_window_t window,int synthetic,
+                                                   unsigned width,unsigned height) {
+    uint64_t deadline=now()+5000;
+    while (now()<deadline) {
+        xcb_generic_event_t *e=xcb_poll_for_event(c);
+        if (e) {
+            xcb_configure_notify_event_t n=*(xcb_configure_notify_event_t *)e;
+            int found=(e->response_type&127)==XCB_CONFIGURE_NOTIFY && n.window==window &&
+                (!synthetic || (e->response_type&0x80)) && n.width==width && n.height==height;
+            free(e);if (found) return n;
+        } else { struct pollfd p={xcb_get_file_descriptor(c),POLLIN,0};assert(poll(&p,1,100)>=0); }
+    }
+    fprintf(stderr,"XWM helper ConfigureNotify timeout\n");abort();
+}
+static int state_has(xcb_connection_t *c,xcb_window_t window,xcb_atom_t net_state,xcb_atom_t wanted) {
+    xcb_get_property_reply_t *r=xcb_get_property_reply(c,xcb_get_property(c,0,window,net_state,XCB_ATOM_ATOM,0,64),NULL);
+    int found=0;assert(r);
+    for (int i=0;i<xcb_get_property_value_length(r)/4;++i) if (((xcb_atom_t *)xcb_get_property_value(r))[i]==wanted) found=1;
+    free(r);return found;
 }
 int main(int argc,char **argv) {
     /* Runner supplies a newly created headless Xvfb display, never DISPLAY. */
@@ -230,7 +254,108 @@ int main(int argc,char **argv) {
     receive(control,BXWM_WINDOW,id,0,301,181);
     geometry=xcb_get_geometry_reply(c,xcb_get_geometry(c,id),NULL);
     assert(geometry && geometry->width==301 && geometry->height==181);free(geometry);
+    if (!getenv("BROOK_XWM_PROTOCOL")) {
+        xcb_disconnect(c);puts("XWM_HELPER_PASS protocol 1");return 0;
+    }
+    // EWMH fullscreen. The WM advertises it; a property set before mapping and
+    // later client messages become native requests; the native answer is
+    // published in _NET_WM_STATE with a synthetic root-relative ConfigureNotify;
+    // geometry requests are refused while fullscreen.
+    xcb_atom_t fullscreen=atom(c,"_NET_WM_STATE_FULLSCREEN");
+    xcb_get_property_reply_t *supported_reply=xcb_get_property_reply(c,xcb_get_property(c,0,screen->root,
+        atom(c,"_NET_SUPPORTED"),XCB_ATOM_ATOM,0,64),NULL);
+    int advertised=0;assert(supported_reply);
+    for (int i=0;i<xcb_get_property_value_length(supported_reply)/4;++i)
+        if (((xcb_atom_t *)xcb_get_property_value(supported_reply))[i]==fullscreen) advertised=1;
+    free(supported_reply);assert(advertised);
+    xcb_window_t game=xcb_generate_id(c);uint32_t structure=XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    xcb_create_window(c,XCB_COPY_FROM_PARENT,game,screen->root,0,0,640,360,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,XCB_CW_EVENT_MASK,&structure);
+    xcb_change_property(c,XCB_PROP_MODE_REPLACE,game,net_state,XCB_ATOM_ATOM,32,1,&fullscreen);
+    xcb_map_window(c,game);xcb_flush(c);
+    // The mapped state is published before the request it qualifies.
+    struct bxwm_message full=receive(control,BXWM_WINDOW,game,0,640,360);
+    struct bxwm_message wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==1);
+    full.x=0;full.y=0;full.width=800;full.height=600;full.flags|=BXWM_FULLSCREEN;full.configure_serial=1;
+    send_command(control,full,BXWM_CONFIGURE);
+    xcb_configure_notify_event_t notify=wait_configure(c,game,1,800,600);assert(!notify.x && !notify.y);
+    full=receive(control,BXWM_WINDOW,game,0,800,600);assert(full.flags&BXWM_FULLSCREEN);
+    assert(state_has(c,game,net_state,fullscreen));
+    uint32_t smaller[]={10,20,320,200};
+    xcb_configure_window(c,game,XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,smaller);
+    xcb_flush(c);notify=wait_configure(c,game,1,800,600);assert(!notify.x && !notify.y);
+    geometry=xcb_get_geometry_reply(c,xcb_get_geometry(c,game),NULL);
+    assert(geometry && geometry->width==800 && geometry->height==600 && !geometry->x && !geometry->y);free(geometry);
+    xcb_client_message_event_t toggle={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=game,.type=net_state};
+    toggle.data.data32[0]=0;toggle.data.data32[1]=fullscreen;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&toggle);
+    xcb_flush(c);wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==0);
+    full.flags&=~BXWM_FULLSCREEN;full.x=30;full.y=40;full.width=640;full.height=360;full.configure_serial=2;
+    send_command(control,full,BXWM_CONFIGURE);notify=wait_configure(c,game,1,640,360);
+    assert(notify.x==30 && notify.y==40);receive(control,BXWM_WINDOW,game,0,640,360);
+    assert(!state_has(c,game,net_state,fullscreen));
+    // Unfullscreened windows get their geometry requests again.
+    xcb_configure_window(c,game,XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,smaller);
+    xcb_flush(c);receive(control,BXWM_WINDOW,game,0,320,200);
+    toggle.data.data32[0]=2;toggle.data.data32[1]=0;toggle.data.data32[2]=fullscreen;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&toggle);
+    xcb_flush(c);wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==2);
+    // A remap without the atom reports that absence.
+    xcb_unmap_window(c,game);xcb_map_window(c,game);xcb_flush(c);
+    wanted=receive(control,BXWM_FULLSCREEN_REQUEST,game,0,0,0);assert(wanted.x==0);
+    xcb_destroy_window(c,game);
+    // Scale hints for "apps scale themselves" (BROOK_XWM_SCALE=2).
+    xcb_get_property_reply_t *resources=xcb_get_property_reply(c,xcb_get_property(c,0,screen->root,
+        atom(c,"RESOURCE_MANAGER"),XCB_ATOM_STRING,0,4096),NULL);
+    assert(resources && memmem(xcb_get_property_value(resources),xcb_get_property_value_length(resources),
+        "Xft.dpi:\t192\n",13) && memmem(xcb_get_property_value(resources),
+        xcb_get_property_value_length(resources),"Xcursor.size:\t48\n",17));free(resources);
+    xcb_get_selection_owner_reply_t *owner=xcb_get_selection_owner_reply(c,
+        xcb_get_selection_owner(c,atom(c,"_XSETTINGS_S0")),NULL);
+    assert(owner && owner->owner!=XCB_WINDOW_NONE);
+    xcb_atom_t settings_atom=atom(c,"_XSETTINGS_SETTINGS");
+    xcb_get_property_reply_t *settings=xcb_get_property_reply(c,xcb_get_property(c,0,owner->owner,
+        settings_atom,settings_atom,0,256),NULL);free(owner);
+    assert(settings && settings->format==8);
+    const uint8_t *bytes=xcb_get_property_value(settings);size_t length=(size_t)xcb_get_property_value_length(settings);
+    uint32_t count;memcpy(&count,bytes+8,4);assert(!bytes[0] && count==4);
+    int32_t scaling=0,font_dpi=0,unscaled=0;
+    for (size_t at=12,i=0;i<count;++i) {
+        uint16_t name_length;memcpy(&name_length,bytes+at+2,2);assert(bytes[at]==0);
+        const char *name=(const char *)bytes+at+4;at+=4+((name_length+3u)&~3u)+4;
+        int32_t value;memcpy(&value,bytes+at,4);at+=4;assert(at<=length);
+        if (name_length==23 && !memcmp(name,"Gdk/WindowScalingFactor",23)) scaling=value;
+        if (name_length==7 && !memcmp(name,"Xft/DPI",7)) font_dpi=value;
+        if (name_length==15 && !memcmp(name,"Gdk/UnscaledDPI",15)) unscaled=value;
+    }
+    free(settings);assert(scaling==2 && font_dpi==192*1024 && unscaled==96*1024);
+    // Per-app "scaled by the system": a listed WM_CLASS marks its X client;
+    // that client's later override-redirect popup follows and is anchored to
+    // its active window. Another client stays native.
+    xcb_connection_t *legacy=xcb_connect(argv[1],NULL);assert(legacy && !xcb_connection_has_error(legacy));
+    xcb_window_t old_app=xcb_generate_id(legacy);
+    xcb_create_window(legacy,XCB_COPY_FROM_PARENT,old_app,screen->root,50,60,200,100,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,0,NULL);
+    static const char class_name[]="legacy-app\0Brook-Scaled-Test";
+    xcb_change_property(legacy,XCB_PROP_MODE_REPLACE,old_app,XCB_ATOM_WM_CLASS,XCB_ATOM_STRING,8,sizeof(class_name),class_name);
+    xcb_map_window(legacy,old_app);xcb_flush(legacy);
+    struct bxwm_message scaled=receive(control,BXWM_WINDOW,old_app,0,200,100);assert(scaled.flags&BXWM_SCALED);
+    xcb_window_t popup=xcb_generate_id(legacy);uint32_t override=1;
+    xcb_create_window(legacy,XCB_COPY_FROM_PARENT,popup,screen->root,70,90,40,30,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,XCB_CW_OVERRIDE_REDIRECT,&override);
+    xcb_map_window(legacy,popup);xcb_flush(legacy);
+    struct bxwm_message menu=receive(control,BXWM_WINDOW,popup,0,40,30);
+    assert((menu.flags&(BXWM_SCALED|BXWM_OVERRIDE))==(BXWM_SCALED|BXWM_OVERRIDE));
+    assert(menu.parent==old_app && menu.parent_identity==scaled.identity);
+    xcb_window_t native_app=xcb_generate_id(c);
+    xcb_create_window(c,XCB_COPY_FROM_PARENT,native_app,screen->root,5,5,120,80,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,0,NULL);
+    static const char other_class[]="modern\0Modern";
+    xcb_change_property(c,XCB_PROP_MODE_REPLACE,native_app,XCB_ATOM_WM_CLASS,XCB_ATOM_STRING,8,sizeof(other_class),other_class);
+    xcb_map_window(c,native_app);xcb_flush(c);
+    struct bxwm_message native=receive(control,BXWM_WINDOW,native_app,0,120,80);assert(!(native.flags&BXWM_SCALED));
+    xcb_disconnect(legacy);
     xcb_disconnect(c);
-    puts("XWM_HELPER_PASS isolated X server: InputOnly, geometry, focus/stack, client chrome/actions, native state, close, reparent and XID reuse");
+    puts("XWM_HELPER_PASS isolated X server: InputOnly, geometry, focus/stack, client chrome/actions, native state, EWMH fullscreen, scale hints, scaled clients, close, reparent and XID reuse");
     return 0;
 }

@@ -155,6 +155,9 @@ stdenv.mkDerivation {
         -L${libxcb}/lib -lxcb -lxcb-composite -o xwm-helper-fixture
     python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
         --helper "$PWD/xwm-helper-fixture" --fixture "$PWD/xwm-helper-test"
+    BROOK_XWM_PROTOCOL=2 BROOK_XWM_SCALE=2 BROOK_XWAYLAND_SCALED_APPS="other, brook-scaled-test" \
+        python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
+        --helper "$PWD/xwm-helper-fixture" --fixture "$PWD/xwm-helper-test"
   '';
 
   buildPhase = ''

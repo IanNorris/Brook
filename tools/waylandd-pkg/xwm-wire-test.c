@@ -11,6 +11,9 @@ int main(void) {
     m.flags|=BXWM_CLIENT_CHROME|BXWM_MAXIMIZED|BXWM_MINIMIZED;assert(bxwm_valid(&m,7,1));
     m.flags|=1u<<31;assert(!bxwm_valid(&m,7,1));m.flags=BXWM_MAPPED|BXWM_INPUT;
     m.type=BXWM_MAXIMIZE;m.x=2;assert(bxwm_valid(&m,7,1));m.x=3;assert(!bxwm_valid(&m,7,1));
+    m.type=BXWM_FULLSCREEN_REQUEST;m.x=0;assert(bxwm_valid(&m,7,1));m.x=2;assert(bxwm_valid(&m,7,1));
+    m.x=3;assert(!bxwm_valid(&m,7,1));m.x=-1;assert(!bxwm_valid(&m,7,1));m.x=1;assert(!bxwm_valid(&m,7,0));
+    m.type=BXWM_WINDOW;m.x=0;m.flags|=BXWM_FULLSCREEN;assert(bxwm_valid(&m,7,1));m.flags=BXWM_MAPPED|BXWM_INPUT;
     m.type=BXWM_BEGIN_RESIZE;m.x=7;assert(bxwm_valid(&m,7,1));m.x=8;assert(!bxwm_valid(&m,7,1));
     m.type=BXWM_WINDOW;m.x=0;
     struct bxwm_message received;
