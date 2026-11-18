@@ -131,6 +131,8 @@ pkgs.stdenv.mkDerivation {
     ./brook-desktop-buffer-age-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_scanout_ring_test.c -o brook-desktop-scanout-ring-test
     ./brook-desktop-scanout-ring-test
+    $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_app_present_test.c -o brook-desktop-app-present-test
+    ./brook-desktop-app-present-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_overlay_cache_test.c -o brook-desktop-overlay-cache-test
     ./brook-desktop-overlay-cache-test
     $CC -std=c11 -O2 -Wall -Wextra -Werror desktop_shell_opaque_test.c -o brook-desktop-shell-opaque-test

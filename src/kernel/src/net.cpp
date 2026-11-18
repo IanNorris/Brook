@@ -28,6 +28,7 @@
 #include "cpu_idle.h"
 #include "thermal_runtime.h"
 #include "intel_bdw_scanout_target.h"
+#include "desktop_present_policy.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
 #endif
@@ -6712,6 +6713,30 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
+    }
+    else if(NetStrEq(cmd,"desktop present") || StrStartsWith(cmd,"desktop present ")) {
+        // App-driven present cadence and direct scanout (docs/app-driven-present.md).
+        // RAM only; the renderer reads the policy with BROOK_DESKTOP_FOCUS_QUERY
+        // every frame, so a change applies at its next frame.
+        uint32_t policy=DesktopPresentPolicy();bool ok=true;
+        if(NetStrEq(cmd,"desktop present app on"))policy|=BROOK_DESKTOP_POLICY_APP_CADENCE;
+        else if(NetStrEq(cmd,"desktop present app off"))policy&=~BROOK_DESKTOP_POLICY_APP_CADENCE;
+        else if(NetStrEq(cmd,"desktop present direct off"))policy&=~(BROOK_DESKTOP_POLICY_DIRECT_SHADOW|BROOK_DESKTOP_POLICY_DIRECT_ON);
+        else if(NetStrEq(cmd,"desktop present direct shadow"))
+            policy=(policy&~BROOK_DESKTOP_POLICY_DIRECT_ON)|BROOK_DESKTOP_POLICY_DIRECT_SHADOW;
+        else if(NetStrEq(cmd,"desktop present direct on"))policy|=BROOK_DESKTOP_POLICY_DIRECT_SHADOW|BROOK_DESKTOP_POLICY_DIRECT_ON;
+        else if(StrStartsWith(cmd,"desktop present defer ")){
+            const char* p=cmd+sizeof("desktop present defer ")-1;uint64_t ms=0;bool any=false;
+            while(*p>='0' && *p<='9' && ms<=1000){ms=ms*10+uint64_t(*p++-'0');any=true;}
+            ok=any && !*p && ms<=100;
+            if(ok)DesktopPresentDeferSet(uint32_t(ms*1000));
+        }else if(!NetStrEq(cmd,"desktop present") && !NetStrEq(cmd,"desktop present status"))ok=false;
+        if(!ok){DebugChannelSend("{\"error\":\"usage: desktop present [status]|app on|app off|direct off|direct shadow|direct on|defer <0..100 ms, 0 = renderer default>\"}\n");return;}
+        DesktopPresentPolicySet(policy);
+        BridgeReply r;r.text("{\"ok\":true,\"app_cadence\":");r.text(policy&BROOK_DESKTOP_POLICY_APP_CADENCE?"true":"false");
+        r.text(",\"direct\":");r.quoted(policy&BROOK_DESKTOP_POLICY_DIRECT_ON?"on":policy&BROOK_DESKTOP_POLICY_DIRECT_SHADOW?"shadow":"off");
+        r.text(",");r.field("defer_us",DesktopPresentDeferUs());
+        r.text(",\"counters\":\"/tmp/brook-desktop-stats.json app_present and direct_scanout\"}\n");r.send();
     }
     else if(StrStartsWith(cmd,"gpu zerocopy ")) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)

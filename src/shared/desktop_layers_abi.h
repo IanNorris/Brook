@@ -62,6 +62,28 @@
 // incarnation), c=client commit. Diagnostic only; the kernel counts each new
 // commit once for the focused window.
 #define BROOK_DESKTOP_CLIENT_FRAME 14
+// Focused window and the app-driven present policy (kernel debug commands
+// "desktop present ..."; RAM only, off at boot). address = struct
+// BrookDesktopFocus, size = its size, a = b = c = 0. window 0: nothing
+// focused. state holds BROOK_WINDOW_STATE_* bits (wm_window_state.h). Older
+// kernels return EINVAL; the renderer then keeps its own cadence.
+#define BROOK_DESKTOP_FOCUS_QUERY 15
+#define BROOK_DESKTOP_FOCUS_VERSION 1
+// A focused window covering more than 60% of the output drives presents.
+#define BROOK_DESKTOP_POLICY_APP_CADENCE 1u
+// Evaluate direct scanout eligibility and count it, without scanning out.
+#define BROOK_DESKTOP_POLICY_DIRECT_SHADOW 2u
+// Scan an eligible fullscreen client buffer out directly (needs a kernel
+// with BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT; otherwise counted as a fallback).
+#define BROOK_DESKTOP_POLICY_DIRECT_ON 4u
+struct BrookDesktopFocus {
+    uint32_t version,window;
+    uint64_t incarnation;
+    uint32_t state,policy;
+    // Longest delay (us) for a present that carries only non-app damage
+    // (pointer, overlay, other windows); 0 = the renderer default.
+    uint32_t deferUs,reserved;
+};
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u
@@ -82,6 +104,8 @@ struct BrookDesktopLayers {
 };
 #ifdef __cplusplus
 static_assert(sizeof(BrookDesktopLayer)==80 && sizeof(BrookDesktopLayers)==2576,"desktop layer ABI layout");
+static_assert(sizeof(BrookDesktopFocus)==32,"desktop focus ABI layout");
 #else
 _Static_assert(sizeof(struct BrookDesktopLayer)==80 && sizeof(struct BrookDesktopLayers)==2576,"desktop layer ABI layout");
+_Static_assert(sizeof(struct BrookDesktopFocus)==32,"desktop focus ABI layout");
 #endif

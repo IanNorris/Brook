@@ -27,6 +27,7 @@
 #include "desktop_async_source_barrier.h"
 #include "desktop_stats.h"
 #include "desktop_pipeline.h"
+#include "desktop_app_present.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -273,6 +274,86 @@ static int scanout_pick(void){
         }
     }
     errno=EAGAIN;return -1;
+}
+/* ---- App-driven present cadence and direct scanout ----------------------
+ * (desktop_app_present.h, docs/app-driven-present.md.) The mode is the
+ * kernel policy, set by the "desktop present ..." debug command and read
+ * with BROOK_DESKTOP_FOCUS_QUERY every frame, unless pinned with
+ * BROOK_RENDER_APP_PRESENT=0|1 or BROOK_RENDER_DIRECT_SCANOUT=off|shadow|on.
+ * The boot default evaluates direct scanout eligibility only (counters). */
+static uint64_t monotonic_ns(void);
+enum { DIRECT_MODE_OFF=0, DIRECT_MODE_SHADOW=1, DIRECT_MODE_ON=2 };
+static const char *const g_directModeNames[3]={"off","shadow","on"};
+static int g_appPinned=-1,g_directPinned=-1,g_focusSupported=1;
+static struct DesktopAppCadence g_appCadence;
+/* Set by render_frame when it defers non-app damage: the idle wait ends then. */
+static uint64_t g_appWakeNs;
+static struct {int app,direct;uint64_t deferNs;uint32_t dominant;
+    uint64_t dominance[DESKTOP_APP_REASONS],actions[DESKTOP_APP_ACTIONS],earlyNotifies;} g_app;
+static const char *const g_appActionNames[DESKTOP_APP_ACTIONS]={"free","present","deadline","defer","transition"};
+static struct {uint64_t evaluated,eligible,frames,enters,exits,reasons[DESKTOP_DIRECT_REASONS];int last,wasEligible;} g_direct;
+static void app_present_env(void){
+    const char *app=getenv("BROOK_RENDER_APP_PRESENT"),*direct=getenv("BROOK_RENDER_DIRECT_SCANOUT");
+    if(app && *app)g_appPinned=app[0]!='0';
+    if(direct && *direct)g_directPinned=!strcmp(direct,"on")?DIRECT_MODE_ON:!strcmp(direct,"shadow")?DIRECT_MODE_SHADOW:DIRECT_MODE_OFF;
+}
+/* Focused window and policy for this frame. Without the query (older
+ * kernel) the cadence stays the desktop's own and nothing is evaluated. */
+static void focus_query(struct DesktopFocusInfo *out){
+    *out=(struct DesktopFocusInfo){0};
+    g_app.app=g_appPinned>0;g_app.direct=g_directPinned>0?g_directPinned:DIRECT_MODE_OFF;g_app.deferNs=DESKTOP_APP_DEFER_NS;
+    if(!g_focusSupported)return;
+    struct BrookDesktopFocus f;memset(&f,0,sizeof(f));
+    if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_FOCUS_QUERY,&f,sizeof(f),0,0,0)){
+        if(errno==EINVAL || errno==ENOSYS){g_focusSupported=0;fprintf(stderr,"DESKTOP_APP_PRESENT_UNAVAILABLE errno=%d (no focus query)\n",errno);}
+        return;
+    }
+    if(f.version!=BROOK_DESKTOP_FOCUS_VERSION)return;
+    if(g_appPinned<0)g_app.app=(f.policy&BROOK_DESKTOP_POLICY_APP_CADENCE)!=0;
+    if(g_directPinned<0)g_app.direct=(f.policy&BROOK_DESKTOP_POLICY_DIRECT_ON)?DIRECT_MODE_ON:
+        (f.policy&BROOK_DESKTOP_POLICY_DIRECT_SHADOW)?DIRECT_MODE_SHADOW:DIRECT_MODE_OFF;
+    if(f.deferUs)g_app.deferNs=(uint64_t)f.deferUs*1000ull;
+    *out=(struct DesktopFocusInfo){1,f.window,f.state,f.incarnation};
+}
+/* End of an idle wait: the next poll, or sooner when deferred damage is due. */
+static uint64_t idle_until(void){
+    const uint64_t now=monotonic_ns(),poll=now+g_idlePollNs,wake=g_appWakeNs;g_appWakeNs=0;
+    return wake && wake<poll?(wake>now?wake:now+1):poll;
+}
+/* Direct scanout eligibility of a frame about to present. Shadow mode asks
+ * whether it would scan out given a capable kernel; "on" uses the real
+ * capability, which no kernel reports yet, so every frame composites and
+ * the fallback is counted. */
+static void direct_scanout_evaluate(int dominant,const struct BrookDesktopLayers *layers,const struct DesktopTrackState *track,
+                                    const struct DesktopGpuOffer *offer,int sampled,const struct DesktopOverlayFrameState *overlay,
+                                    int ringActive,uint32_t width,uint32_t height){
+    if(g_app.direct==DIRECT_MODE_OFF)return;
+    struct DesktopDirectScene s={.dominant=dominant,.layers=layers->layers,.count=layers->count,.ringActive=ringActive,
+        .kernelCapable=g_app.direct==DIRECT_MODE_SHADOW};
+    if(dominant>=0 && (unsigned)dominant<layers->count){
+        const struct BrookDesktopLayer *l=&layers->layers[dominant];
+        s.chromeVisible=track->windows[dominant].hasChrome!=0;s.gpuSource=offer && sampled;
+        s.offerLayers=offer?desktop_gpu_offer_layer_count(offer):0;
+        if(offer && offer->layers){const struct BrookGpuWindowLayer *g=&offer->layer[0];
+            s.buffer=(struct DesktopDirectBuffer){g->width,g->height,g->stride,g->offset,g->fourcc,g->flags,g->words,
+                g->srcX,g->srcY,g->srcWidth,g->srcHeight,g->dstWidth,g->dstHeight};
+            if(g->dstX || g->dstY)s.buffer.dstWidth=0; /* offset in the window: not the output 1:1 */}
+        else if(offer){const struct BrookGpuWindowPacket *p=&offer->packet;
+            s.buffer=(struct DesktopDirectBuffer){p->width,p->height,p->stride,p->offset,p->fourcc,0,p->words,
+                0,0,p->width,p->height,l->clientWidth,l->clientHeight};}
+    }
+    for(uint32_t i=0;i<overlay->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i){const struct BrookDesktopOverlayBand *b=&overlay->bands.bands[i];
+        if(b->width && b->height && b->x<(int64_t)width && b->y<(int64_t)height && (int64_t)b->x+b->width>0 && (int64_t)b->y+b->height>0)++s.overlayBands;}
+    {const struct DesktopOverlayCursorState *c=&overlay->cursor;
+     s.cursorVisible=c->visible && c->width && c->height && c->x<(int64_t)width && c->y<(int64_t)height &&
+         (int64_t)c->x+c->width>0 && (int64_t)c->y+c->height>0;}
+    const enum DesktopDirectReason reason=desktop_direct_eligible(&s,width,height);
+    ++g_direct.evaluated;++g_direct.reasons[reason];g_direct.last=(int)reason;
+    const int ok=reason==DESKTOP_DIRECT_OK;
+    if(ok)++g_direct.eligible;
+    if(ok && !g_direct.wasEligible)++g_direct.enters;
+    if(!ok && g_direct.wasEligible)++g_direct.exits;
+    g_direct.wasEligible=ok;
 }
 static void context_init(struct RenderContext *ctx){
     memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;ctx->cursor.fd=-1;
@@ -584,6 +665,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     uint64_t traceReceived=0,traceIncarnation=0,traceCommit=0,traceSubmitStart=0;uint32_t traceWindow=0;
     uint32_t scene[SCENE_HEADER]={0};long ticket=-1;int result=-1,attemptPartial=0,savedErrno=0,presentFailed=0;unsigned frameDirect=0;const char *stage="query";
     uint64_t statsSubmitStart=0;
+    struct DesktopGpuOffer *layerOffer[BROOK_DESKTOP_LAYER_LIMIT]={0};
+    g_appWakeNs=0;
     if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_LAYERS_QUERY,&layers,sizeof(layers),0,0,0) ||
        layers.count>BROOK_DESKTOP_LAYER_LIMIT ||
        syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_BACKDROP_QUERY,&backdrop,sizeof(backdrop),0,0,0))goto done;
@@ -668,6 +751,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             content.x,content.y,(int64_t)content.x+content.width,(int64_t)content.y+content.height},width,height);
         struct DesktopGpuOffer *direct=desktop_gpu_channel_select(&g_gpuChannel,l,width,height,&content,frame);
         if(direct)desktop_note_client_frame(l->window,l->incarnation,direct->packet.identity.commit);
+        layerOffer[i]=direct;
         if(direct && getenv("BROOK_RENDER_SOURCE_GEOMETRY")){
             static unsigned samples;
             if(samples++<16)fprintf(stderr,"DESKTOP_SOURCE_GEOMETRY window=%u incarnation=%llu commit=%llu source=%ux%u destination=%ux%u fourcc=%08x offset_words=%u stride_words=%u size_words=%llu\n",
@@ -847,6 +931,25 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Nothing new relative to an in-flight frame: it will present on its
      * own and keeps the lease, so stay idle. */
     if(tracked && !damage.count && pipe && pipe->carry){++g_stats.idleSkips;result=2;stage="idle";goto done;}
+    /* App-driven cadence: while a focused window covers most of the output,
+     * damage it did not cause (pointer, overlay, other windows, popups)
+     * waits for its next commit, at most the deferral (desktop_app_present.h). */
+    struct DesktopFocusInfo focus;focus_query(&focus);
+    enum DesktopAppReason appReason=DESKTOP_APP_NO_FOCUS_INFO;
+    const int dominant=desktop_app_dominant(layers.layers,layers.count,&focus,width,height,DESKTOP_APP_THRESHOLD_PERCENT,&appReason);
+    g_app.dominant=dominant>=0?layers.layers[dominant].window:0;
+    if(!damage.count)desktop_app_cadence_idle(&g_appCadence);
+    else {
+        ++g_app.dominance[appReason];
+        if(g_app.app && tracked){
+            const int changed=dominant>=0 && desktop_app_window_changed(trackBase,&track->windows[dominant]);
+            uint64_t wake=0;
+            const enum DesktopAppAction action=desktop_app_cadence(&g_appCadence,dominant>=0,g_app.dominant,
+                dominant>=0?layers.layers[dominant].incarnation:0,changed,monotonic_ns(),g_app.deferNs,&wake);
+            ++g_app.actions[action];
+            if(action==DESKTOP_APP_DEFER){g_appWakeNs=wake;result=2;stage="idle";goto done;}
+        }
+    }
     if(tracked && !damage.count){
         const uint64_t now=monotonic_ns();
         if(!g_neverIdle && g_lastPresentNs && now>=g_lastPresentNs && now-g_lastPresentNs<DESKTOP_KEEPALIVE_NS){
@@ -1160,6 +1263,12 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay,
             .carryExcess=attemptPartial && desktop_pipeline_carry_excess(ownPixels,regionPixels,desktop_pipeline_carry_slack(g_carrySlack,width,height))};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
+        /* The dominant app's frame is on its way: release its frame
+         * callbacks now rather than after the OS present. */
+        if(g_app.app && dominant>=0 && frameSources[dominant].commit &&
+           desktop_gpu_channel_notify_early(&g_gpuChannel,frame,layers.layers[dominant].window))++g_app.earlyNotifies;
+        direct_scanout_evaluate(dominant,&layers,track,dominant>=0?layerOffer[dominant]:NULL,dominant>=0 && frameSources[dominant].commit,
+            &frameOverlay,ctx->scanoutCount && g_scanoutActive,width,height);
         return 1;
     }
     if(status==BROOK_VK_UNCERTAIN){
@@ -1471,7 +1580,7 @@ static void stats_publish(uint64_t now){
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
-            char rows[DESKTOP_TIMELINE*120+640];size_t used=0;
+            char rows[DESKTOP_TIMELINE*120+640+2048];size_t used=0;
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
             const uint64_t first=g_timelineCount>DESKTOP_TIMELINE?g_timelineCount-DESKTOP_TIMELINE:0;
             for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-640;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
@@ -1483,7 +1592,26 @@ static void stats_publish(uint64_t now){
             for(unsigned r=0;r<DESKTOP_GPU_SELECT_REASONS;++r)
                 used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",desktop_gpu_select_names[r],
                     (unsigned long long)g_desktopGpuSelect[r]);
-            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}\n");
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}");
+            /* "app_present": mode, deferral, the dominant window, per-frame
+             * dominance reasons (frames with damage, deferred re-evaluations
+             * included), cadence actions; "direct_scanout": eligibility of
+             * presented frames, by first blocker. */
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"app_present\":{\"mode\":\"%s\",\"focus_query\":%d,\"defer_us\":%llu,"
+                "\"dominant\":%u,\"early_notifies\":%llu,\"dominance\":{",g_app.app?"on":"off",g_focusSupported,
+                (unsigned long long)(g_app.deferNs/1000ull),g_app.dominant,(unsigned long long)g_app.earlyNotifies);
+            for(unsigned r=0;r<DESKTOP_APP_REASONS;++r)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",
+                desktop_app_reason_names[r],(unsigned long long)g_app.dominance[r]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"},\"actions\":{");
+            for(unsigned a=0;a<DESKTOP_APP_ACTIONS;++a)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",a?",":"",
+                g_appActionNames[a],(unsigned long long)g_app.actions[a]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}},\"direct_scanout\":{\"mode\":\"%s\",\"evaluated\":%llu,\"eligible\":%llu,"
+                "\"frames\":%llu,\"enters\":%llu,\"exits\":%llu,\"last\":\"%s\",\"fallback\":{",g_directModeNames[g_app.direct],
+                (unsigned long long)g_direct.evaluated,(unsigned long long)g_direct.eligible,(unsigned long long)g_direct.frames,
+                (unsigned long long)g_direct.enters,(unsigned long long)g_direct.exits,desktop_direct_reason_names[g_direct.last]);
+            for(unsigned r=1;r<DESKTOP_DIRECT_REASONS;++r)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r>1?",":"",
+                desktop_direct_reason_names[r],(unsigned long long)g_direct.reasons[r]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}}\n");
             /* replace the final "}\n" of the spliced block with the timeline */
             if(length>=2 && g_statsJson[length-2]=='}' && length-2+used<sizeof(g_statsJson)){
                 memcpy(g_statsJson+length-2,rows,used);length=length-2+used;}
@@ -1627,7 +1755,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                  * even when nothing is in flight, so a present still
                  * retiring in the kernel cannot make this frame full-only. */
                 int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],1,lastPresentedTicket,!before,&base);
-                if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
+                if(result==2){++idlePolls;idleUntil=idle_until();desktop_retry_success(&retry);break;}
                 if(result==1){++active;if(active>maxActive)maxActive=active;desktop_stats_in_flight(&g_stats,active);
                     failureStart=0;desktop_retry_success(&retry);progress=1;break;}
                 const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
@@ -1644,7 +1772,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
             if(overlapPartial && active && !overlapSafe)break;
             const int partial=getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL && (!active || overlapSafe);
             int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],partial,overlapSafe?lastPresentedTicket:0,!active,NULL);
-            if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
+            if(result==2){++idlePolls;idleUntil=idle_until();desktop_retry_success(&retry);break;}
             if(result==1){++active;if(active>maxActive)maxActive=active;desktop_stats_in_flight(&g_stats,active);
                 failureStart=0;desktop_retry_success(&retry);progress=1;break;}
             else if(result<0){const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
@@ -1760,6 +1888,7 @@ int main(int argc,char **argv){
     const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");
     if(idlePoll){char *end=NULL;unsigned long ms=strtoul(idlePoll,&end,10);if(end && !*end && ms && ms<=100)g_idlePollNs=ms*1000000ull;}
     g_trackDisplayed=calloc(1,sizeof(*g_trackDisplayed));
+    app_present_env();
     g_neverIdle=limit!=0 && !getenv("BROOK_RENDER_ALLOW_IDLE");
     if(depth){
         struct sigaction stop={0};stop.sa_handler=async_stop_signal;sigemptyset(&stop.sa_mask);
