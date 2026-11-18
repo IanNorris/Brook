@@ -551,6 +551,7 @@ void SyscallTableInit()
     g_syscallTable[513]                  = sys_brook_wm_begin_move;
     g_syscallTable[514]                  = sys_brook_wm_move_relative;
     g_syscallTable[515]                  = sys_brook_wm_set_maximized;
+    g_syscallTable[526]                  = sys_brook_wm_set_fullscreen;
     g_syscallTable[516]                  = sys_brook_wm_set_minimized;
     g_syscallTable[517]                  = sys_brook_wm_begin_resize;
     g_syscallTable[518]                  = sys_brook_wm_set_cursor_visible;

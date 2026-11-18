@@ -803,6 +803,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.visible = true;
     w.minimized = false;
     w.noChrome = false;
+    w.fullscreen = false;
     w.captionOverlay = false;
     w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0;
     w.captionStyle = 0;
@@ -1161,6 +1162,12 @@ void WmSetClientSideDecoration(int idx, bool enable, bool captionOverlay,
     captionOverlay = enable && captionOverlay;
     if (!captionOverlay) insetRight = insetTop = captionHeight = 0;
     if (!captionOverlay || !(captionStyle & DesktopCaptionStyleValid)) captionStyle = 0;
+    if (w.fullscreen) {
+        w.fsNoChrome = enable; w.fsCaptionOverlay = captionOverlay;
+        w.fsCaptionInsetRight = insetRight; w.fsCaptionInsetTop = insetTop;
+        w.fsCaptionHeight = captionHeight; w.fsCaptionStyle = captionStyle;
+        return;
+    }
     if (w.noChrome == enable && w.captionOverlay == captionOverlay &&
         w.captionInsetRight == insetRight && w.captionInsetTop == insetTop &&
         w.captionHeight == captionHeight && w.captionStyle == captionStyle) return;
@@ -1228,6 +1235,8 @@ static void SetMaximizedLocked(int idx, bool enable)
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
+    // Fullscreen owns the geometry; leaving it restores the earlier state.
+    if (w.fullscreen) return;
     if ((w.state == WindowState::Maximized) == enable) return;
 
     uint32_t screenW, screenH;
@@ -1292,6 +1301,78 @@ void WmToggleMaximize(int idx)
     if (!w.proc) return;
     WmSetMaximized(idx, w.state != WindowState::Maximized);
 }
+
+static bool SetFullscreenLocked(int idx, bool enable)
+{
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
+    Window& w = g_windows[idx];
+    if (!w.proc) return false;
+    if (w.fullscreen == enable) return true;
+    if (enable) {
+        uint32_t screenW = 0, screenH = 0;
+        CompositorGetPhysDims(&screenW, &screenH);
+        if (screenW < WM_MIN_WIDTH || screenH < WM_MIN_HEIGHT || screenW > 32767 || screenH > 32767) return false;
+        w.fsState = w.state; w.fsX = w.x; w.fsY = w.y; w.fsW = w.clientW; w.fsH = w.clientH;
+        w.fsNoChrome = w.noChrome; w.fsCaptionOverlay = w.captionOverlay;
+        w.fsCaptionInsetRight = w.captionInsetRight; w.fsCaptionInsetTop = w.captionInsetTop;
+        w.fsCaptionHeight = w.captionHeight; w.fsCaptionStyle = w.captionStyle;
+        w.noChrome = true; w.captionOverlay = false;
+        w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0; w.captionStyle = 0;
+        w.x = 0; w.y = 0; w.fullscreen = true; w.state = WindowState::Maximized;
+        if (!ResizeWindowLocked(idx, static_cast<uint16_t>(screenW), static_cast<uint16_t>(screenH))) {
+            w.fullscreen = false; w.state = w.fsState; w.x = w.fsX; w.y = w.fsY;
+            w.noChrome = w.fsNoChrome; w.captionOverlay = w.fsCaptionOverlay;
+            w.captionInsetRight = w.fsCaptionInsetRight; w.captionInsetTop = w.fsCaptionInsetTop;
+            w.captionHeight = w.fsCaptionHeight; w.captionStyle = w.fsCaptionStyle;
+            return false;
+        }
+    } else {
+        const auto x = w.x, y = w.y; const auto width = w.clientW, height = w.clientH;
+        w.fullscreen = false; w.state = w.fsState;
+        w.noChrome = w.fsNoChrome; w.captionOverlay = w.fsCaptionOverlay;
+        w.captionInsetRight = w.fsCaptionInsetRight; w.captionInsetTop = w.fsCaptionInsetTop;
+        w.captionHeight = w.fsCaptionHeight; w.captionStyle = w.fsCaptionStyle;
+        w.x = w.fsX; w.y = w.fsY;
+        if (!ResizeWindowLocked(idx, w.fsW, w.fsH)) {
+            // Stay fullscreen rather than half-restored; the caller may retry.
+            w.fsState = w.state; w.fsNoChrome = w.noChrome; w.fsCaptionOverlay = w.captionOverlay;
+            w.fsCaptionInsetRight = w.captionInsetRight; w.fsCaptionInsetTop = w.captionInsetTop;
+            w.fsCaptionHeight = w.captionHeight; w.fsCaptionStyle = w.captionStyle;
+            w.noChrome = true; w.captionOverlay = false;
+            w.captionInsetRight = w.captionInsetTop = w.captionHeight = 0; w.captionStyle = 0;
+            w.x = x; w.y = y; w.clientW = width; w.clientH = height;
+            w.fullscreen = true; w.state = WindowState::Maximized;
+            return false;
+        }
+    }
+    w.proc->fbDestX = w.clientX(); w.proc->fbDestY = w.clientY();
+    SerialPrintf("WM: window %d '%s' fullscreen=%d %ux%u at %d,%d\n", idx, w.title, (int)enable,
+                 w.clientW, w.clientH, w.x, w.y);
+    extern void CompositorMarkDirty();
+    CompositorMarkDirty();
+    return true;
+}
+
+bool WmSetFullscreen(int idx, bool enable) { VfbGuard guard; return SetFullscreenLocked(idx, enable); }
+
+bool WmTaskbarHidden()
+{
+    if (!g_wmActive || WmLauncherVisible() || WmVolumePopupVisible()) return false;
+    const int idx = __atomic_load_n(&g_focusedIdx, __ATOMIC_ACQUIRE);
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
+    const Window& w = g_windows[idx];
+    if (!w.proc || !w.visible || w.minimized) return false;
+    if (w.fullscreen) return true;
+    // A chrome-less window placed over the whole output is fullscreen too:
+    // the Xwayland WM shipped before WM_SET_FULLSCREEN sizes EWMH fullscreen
+    // windows this way. Maximized windows stop at the taskbar, so never match.
+    uint32_t screenW = 0, screenH = 0;
+    CompositorGetPhysDims(&screenW, &screenH);
+    return w.noChrome && screenW && screenH && w.x <= 0 && w.y <= 0 &&
+           int64_t(w.x) + w.clientW >= int64_t(screenW) && int64_t(w.y) + w.clientH >= int64_t(screenH);
+}
+
+uint32_t WmTaskbarTop(uint32_t screenH) { return WmTaskbarHidden() ? screenH : WmDesktopHeight(screenH); }
 
 static void MoveWindowLocked(int idx, int16_t newX, int16_t newY)
 {
@@ -1424,6 +1505,12 @@ bool WmApplyScalePending()
     for (auto& w:g_windows) {
         if (!w.proc) continue;
         const auto& before=w.desktopMetrics();
+        if (w.fullscreen) {
+            // Still covers the output; only the geometry it returns to changes.
+            auto saved=ReframeDesktopWindow({w.fsX,w.fsY,w.fsW,w.fsH,w.fsNoChrome},before,*next,sw,desktopH,false);
+            w.fsX=static_cast<int16_t>(saved.x);w.fsY=static_cast<int16_t>(saved.y);
+            w.metrics=next;continue;
+        }
         auto rect=ReframeDesktopWindow({w.x,w.y,w.clientW,w.clientH,w.noChrome},before,*next,sw,desktopH,!w.noChrome && w.focusable);
         auto saved=ReframeDesktopWindow({w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},before,*next,sw,desktopH,false);
         w.metrics=next;w.x=static_cast<int16_t>(rect.x);w.y=static_cast<int16_t>(rect.y);
@@ -1537,7 +1624,7 @@ static void SnapshotDebugWindowLocked(const Window& w,WmDebugWindow* out)
     out->x=w.x;out->y=w.y;out->width=w.clientW;out->height=w.clientH;
     out->outerWidth=w.outerWidth();out->outerHeight=w.outerHeight();
     out->bufferWidth=w.vfbWidth;out->bufferHeight=w.vfbHeight;
-    out->visible=w.visible;out->minimized=w.minimized;out->maximized=w.state==WindowState::Maximized;
+    out->visible=w.visible;out->minimized=w.minimized;out->maximized=w.state==WindowState::Maximized && !w.fullscreen;out->fullscreen=w.fullscreen;
     out->focused=w.focused;out->focusable=w.focusable;out->apiWindow=w.vfb!=nullptr;
     out->providerKernel=w.proc->isKernelThread;
     WmStrCopy(out->title,w.title,sizeof(out->title));WmStrCopy(out->appId,w.appId,sizeof(out->appId));
@@ -2539,7 +2626,8 @@ int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
     state.flags = (w->visible ? BROOK_WINDOW_STATE_VISIBLE : 0) |
         (w->focused ? BROOK_WINDOW_STATE_FOCUSED : 0) |
         (w->minimized ? BROOK_WINDOW_STATE_MINIMIZED : 0) |
-        (w->state == WindowState::Maximized ? BROOK_WINDOW_STATE_MAXIMIZED : 0) |
+        (w->fullscreen ? BROOK_WINDOW_STATE_FULLSCREEN :
+         w->state == WindowState::Maximized ? BROOK_WINDOW_STATE_MAXIMIZED : 0) |
         (w->noChrome ? BROOK_WINDOW_STATE_CLIENT_CHROME : 0) |
         (w->focusable ? BROOK_WINDOW_STATE_FOCUSABLE : 0);
     *out = state;
@@ -3207,7 +3295,8 @@ bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
     slot.modifiers = 0;
     slot.x         = x;
     slot.y         = y;
-    slot.reserved  = type==WM_EVT_RESIZED ? (win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : WM_RESIZE_RESIZING) : 0;
+    slot.reserved  = type!=WM_EVT_RESIZED ? 0 : win->fullscreen ? WM_RESIZE_FULLSCREEN :
+                     win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : WM_RESIZE_RESIZING;
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
     return true;
 }

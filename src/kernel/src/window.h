@@ -222,6 +222,20 @@ struct Window
     int16_t     savedX, savedY;
     uint16_t    savedW, savedH;
 
+    // Fullscreen (xdg_toplevel.set_fullscreen, EWMH _NET_WM_STATE_FULLSCREEN):
+    // the client covers the whole output with no chrome, and while it is the
+    // focused window the taskbar is hidden and the whole output is its input
+    // area. state is Maximized meanwhile, so move/resize/rounding treat it as
+    // fixed. The fs* fields hold what leaving fullscreen restores; decoration
+    // requests made while fullscreen update them instead of the live window.
+    bool        fullscreen;
+    WindowState fsState;
+    int16_t     fsX, fsY;
+    uint16_t    fsW, fsH;
+    bool        fsNoChrome, fsCaptionOverlay;
+    uint16_t    fsCaptionInsetRight, fsCaptionInsetTop, fsCaptionHeight;
+    uint32_t    fsCaptionStyle;
+
     // Outer dimensions including chrome.  CSD (noChrome) windows have
     // no kernel chrome, so outer == client.
     const DesktopMetrics& desktopMetrics() const { return metrics ? *metrics : DesktopMetric100; }
@@ -303,6 +317,18 @@ uint32_t WmWindowCount();
 // Toggle maximise/restore for a window.
 void WmToggleMaximize(int idx);
 
+// Enter or leave fullscreen (see Window::fullscreen). Returns false if the
+// output size is unavailable or the resize cannot be queued.
+bool WmSetFullscreen(int idx, bool enable);
+
+// True while the focused window is fullscreen and no launcher or volume popup
+// is open: the taskbar is neither drawn nor hit-tested.
+bool WmTaskbarHidden();
+
+// Top row of the taskbar for input routing: the screen height while hidden,
+// otherwise WmDesktopHeight. Layout (maximize, work area) uses WmDesktopHeight.
+uint32_t WmTaskbarTop(uint32_t screenH);
+
 // Set maximise state idempotently.
 void WmSetMaximized(int idx, bool enable);
 
@@ -320,6 +346,7 @@ struct WmDebugWindow {
     WmClientOrigin clientOrigin;
     int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
     bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
+    bool fullscreen;
     char title[64],appId[128];
 };
 enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
@@ -572,6 +599,7 @@ static constexpr uint8_t WM_EVT_FOCUS_LOST      = 0x82;
 static constexpr uint8_t WM_EVT_RESIZED         = 0x83; // x=newW, y=newH; reserved=WM_RESIZE_*
 static constexpr uint32_t WM_RESIZE_MAXIMIZED = 1;
 static constexpr uint32_t WM_RESIZE_RESIZING = 2;
+static constexpr uint32_t WM_RESIZE_FULLSCREEN = 4; // never with MAXIMIZED
 
 // Push a synthetic WM event into the per-window queue.  Drops on overflow.
 bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);

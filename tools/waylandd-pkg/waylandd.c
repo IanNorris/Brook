@@ -120,6 +120,7 @@ struct brook_wm_event {
 #define WM_EVT_FOCUS_LOST      0x82
 #define WM_EVT_RESIZED         0x83
 #define WM_RESIZE_MAXIMIZED     1
+#define WM_RESIZE_FULLSCREEN    4
 #define WM_RESIZE_RESIZING      2
 
 static struct wl_display *g_display = NULL;
@@ -189,6 +190,10 @@ static long wm_move_relative(uint32_t id, uint32_t parent_id, int32_t x, int32_t
 }
 static long wm_set_maximized(uint32_t id, int enable) {
     return syscall(BROOK_SYS_WM_SET_MAXIMIZED, (long)id, (long)enable);
+}
+/* Fails (ENOSYS) on kernels without fullscreen support. */
+static long wm_set_fullscreen(uint32_t id, int enable) {
+    return syscall(BROOK_SYS_WM_SET_FULLSCREEN, (long)id, (long)(enable != 0));
 }
 static long wm_set_minimized(uint32_t id) {
     return syscall(BROOK_SYS_WM_SET_MINIMIZED, (long)id);
@@ -355,6 +360,10 @@ struct brook_surface {
     unsigned size_hints_pending;
     int  toplevel_activated;
     int  toplevel_maximized,toplevel_resizing;
+    /* toplevel_fullscreen: the kernel window covers the output (configured
+     * with the fullscreen state). want_fullscreen: the client's request,
+     * applied once the kernel window exists. */
+    int  toplevel_fullscreen,want_fullscreen;
     int32_t configure_width,configure_height;
     int configure_size_pending,configure_size_acked;
     uint32_t configure_size_serial;
@@ -463,6 +472,18 @@ static void surface_sync_decoration(struct brook_surface *s, int force);
 static void strip_retry_drop(struct brook_surface *s);
 struct brook_image;
 static void surface_strip_commit(struct brook_surface *s, struct brook_image *older);
+/* Fullscreen is native-window state: the kernel resizes the window to the
+ * output and answers with WM_EVT_RESIZED carrying WM_RESIZE_FULLSCREEN, which
+ * configures the client (fullscreen state, output size); leaving restores the
+ * earlier geometry the same way. A request made before the window exists is
+ * applied when it is created. There is one output, so set_fullscreen's
+ * output argument is ignored. */
+static void toplevel_apply_fullscreen(struct brook_surface *s) {
+    if (!s || !s->wm_id || !s->xdg_toplevel || !!s->want_fullscreen==!!s->toplevel_fullscreen) return;
+    long rc=wm_set_fullscreen(s->wm_id,s->want_fullscreen);
+    if (rc==0) s->toplevel_fullscreen=s->want_fullscreen;
+    fprintf(stderr,"[waylandd] xdg_toplevel fullscreen=%d wm=%u rc=%ld\n",s->want_fullscreen,s->wm_id,rc);
+}
 #include "surface-scene.h"
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
@@ -734,9 +755,10 @@ static void surface_cursor_commit(struct brook_surface *s) {
 static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t height) {
     if (!s->xdg_toplevel || !s->xdg_surface) return 1;
     struct wl_array states;wl_array_init(&states);
-    const uint32_t values[]={XDG_TOPLEVEL_STATE_ACTIVATED,XDG_TOPLEVEL_STATE_MAXIMIZED,XDG_TOPLEVEL_STATE_RESIZING};
-    const int enabled[]={s->toplevel_activated,s->toplevel_maximized,s->toplevel_resizing};
-    for (unsigned i=0;i<3;++i) if(enabled[i]) {
+    const uint32_t values[]={XDG_TOPLEVEL_STATE_ACTIVATED,XDG_TOPLEVEL_STATE_MAXIMIZED,XDG_TOPLEVEL_STATE_RESIZING,
+        XDG_TOPLEVEL_STATE_FULLSCREEN};
+    const int enabled[]={s->toplevel_activated,s->toplevel_maximized,s->toplevel_resizing,s->toplevel_fullscreen};
+    for (unsigned i=0;i<4;++i) if(enabled[i]) {
         uint32_t *state=wl_array_add(&states,sizeof(*state));
         if(!state) { wl_array_release(&states);wl_client_post_no_memory(wl_resource_get_client(s->resource));return 0; }
         *state=values[i];
@@ -1136,10 +1158,16 @@ static void xdg_toplevel_unset_maximized(struct wl_client *c, struct wl_resource
 }
 static void xdg_toplevel_set_fullscreen(struct wl_client *c, struct wl_resource *r,
                                          struct wl_resource *output) {
-    (void)c; (void)r; (void)output;
+    (void)c; (void)output;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s) return;
+    s->want_fullscreen=1;toplevel_apply_fullscreen(s);
 }
 static void xdg_toplevel_unset_fullscreen(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (!s) return;
+    s->want_fullscreen=0;toplevel_apply_fullscreen(s);
 }
 static void xdg_toplevel_set_minimized(struct wl_client *c, struct wl_resource *r) {
     (void)c;
@@ -2075,12 +2103,13 @@ static void dispatch_surface_event(struct brook_surface *s,
         if (s->xdg_toplevel && s->xdg_surface) {
             int32_t neww = e->x/(int32_t)surface_output_scale(s);
             int32_t newh = e->y/(int32_t)surface_output_scale(s);
-            s->toplevel_maximized=(e->reserved&WM_RESIZE_MAXIMIZED)!=0;
-            s->toplevel_resizing=!s->toplevel_maximized && (e->reserved&WM_RESIZE_RESIZING)!=0;
+            s->toplevel_fullscreen=(e->reserved&WM_RESIZE_FULLSCREEN)!=0;
+            s->toplevel_maximized=!s->toplevel_fullscreen && (e->reserved&WM_RESIZE_MAXIMIZED)!=0;
+            s->toplevel_resizing=!s->toplevel_maximized && !s->toplevel_fullscreen && (e->reserved&WM_RESIZE_RESIZING)!=0;
             s->configure_width=neww;s->configure_height=newh;s->configure_size_pending=1;
             toplevel_send_state(s,neww,newh);
-            fprintf(stderr,"[waylandd] WM_EVT_RESIZED wm=%u configure %dx%d max=%d resizing=%d serial=%u\n",
-                s->wm_id,neww,newh,s->toplevel_maximized,s->toplevel_resizing,s->next_configure_serial);
+            fprintf(stderr,"[waylandd] WM_EVT_RESIZED wm=%u configure %dx%d max=%d full=%d resizing=%d serial=%u\n",
+                s->wm_id,neww,newh,s->toplevel_maximized,s->toplevel_fullscreen,s->toplevel_resizing,s->next_configure_serial);
         }
         break;
     }
@@ -2101,7 +2130,7 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
     surface->strip_due=3; /* Chromium redraws its strip in the (in)active colour. */
     int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)(surface->vfb_w/surface_output_scale(surface));
     int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)(surface->vfb_h/surface_output_scale(surface));
-    if(surface->toplevel_maximized || surface->configure_size_pending) {
+    if(surface->toplevel_maximized || surface->toplevel_fullscreen || surface->configure_size_pending) {
         width=surface->configure_width;height=surface->configure_height;
     }
     // A state-only configure never resets the initial map/ack gate.

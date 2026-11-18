@@ -520,6 +520,22 @@ int64_t sys_brook_wm_set_maximized(uint64_t wmId, uint64_t enable,
     return 0;
 }
 
+// 526: WM_SET_FULLSCREEN(wmId, enable) — cover the whole output without
+// chrome (enable 1) or return to the earlier geometry and state (0). The
+// window receives WM_EVT_RESIZED with WM_RESIZE_FULLSCREEN while fullscreen.
+int64_t sys_brook_wm_set_fullscreen(uint64_t wmId, uint64_t enable,
+                                     uint64_t, uint64_t,
+                                     uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (wmId == 0 || wmId > 0xFFFFu || enable > 1) return -EINVAL;
+
+    brook::Window* w = brook::WmFindWindowById(proc, static_cast<uint32_t>(wmId));
+    if (!w) return -EINVAL;
+    return brook::WmSetFullscreen(static_cast<int>(wmId) - 1, enable != 0) ? 0 : -EAGAIN;
+}
+
 // 516: WM_SET_MINIMIZED(wmId)
 int64_t sys_brook_wm_set_minimized(uint64_t wmId, uint64_t,
                                     uint64_t, uint64_t,

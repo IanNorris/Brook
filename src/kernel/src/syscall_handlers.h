@@ -520,6 +520,8 @@ int64_t sys_brook_wm_move_relative(uint64_t wmId, uint64_t parentWmId,
 int64_t sys_brook_wm_set_maximized(uint64_t wmId, uint64_t enable,
                                     uint64_t, uint64_t,
                                     uint64_t, uint64_t);
+int64_t sys_brook_wm_set_fullscreen(uint64_t wmId, uint64_t enable,
+                                     uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_brook_wm_set_minimized(uint64_t wmId, uint64_t,
                                     uint64_t, uint64_t,
                                     uint64_t, uint64_t);

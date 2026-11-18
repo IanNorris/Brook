@@ -95,7 +95,7 @@ void SerializeWindow(Json& json,const WmDebugWindow& window) {
     json.field("outer_width",window.outerWidth);json.field("outer_height",window.outerHeight);
     json.field("buffer_width",window.bufferWidth);json.field("buffer_height",window.bufferHeight);
     json.boolean("visible",window.visible);json.boolean("minimized",window.minimized);
-    json.boolean("maximized",window.maximized);json.boolean("focused",window.focused);
+    json.boolean("maximized",window.maximized);json.boolean("fullscreen",window.fullscreen);json.boolean("focused",window.focused);
     json.boolean("focusable",window.focusable);json.boolean("api_window",window.apiWindow);
     json.text(",\"supports\":[");
     if(window.focusable) {
