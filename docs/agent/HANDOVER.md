@@ -17,11 +17,13 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 
 ## SSD TRIM (18 November 2026)
 
-The isolated `work/ssd-trim` branch starts at integration32 (`7268f1b6`).
-The host-tested planner validates sector bounds and exclusions, intersects
-free bitmaps, and builds non-queued ATA DSM payloads. See
-[SSD TRIM](../ssd-trim.md) for remaining runtime admission, locking, QEMU and
-rollout work. No discard has been submitted and no Dell test was performed.
+`work/ssd-trim` in `/tmp/brook-ssd-trim` implements guarded pre-mount dry-run
+and opt-in ATA DSM. The Dell pair `build/dell/pair-trim-v3` from `e41edd69`
+passed the ordinary QEMU gate and both TRIM modes. Dry-run issued zero
+commands. One explicit DSM command reclaimed 11.8 MiB of mapped qcow2
+data, preserved ten fixture file hashes and passed clean offline fsck.
+No physical tests have been performed. See [SSD TRIM](../ssd-trim.md)
+for command syntax, evidence and the proposed bounded Dell rollout.
 
 ## Repository
 

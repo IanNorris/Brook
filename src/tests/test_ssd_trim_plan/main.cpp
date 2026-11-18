@@ -1,7 +1,10 @@
 #include "ext2_trim_plan.h"
+#include "ahci_direct_layout.h"
 
 #include <cassert>
 #include <cstring>
+#include <atomic>
+#include <thread>
 
 using namespace brook;
 
@@ -98,6 +101,40 @@ static void TestCleanScan()
     };
     auto scan = [&] { return Ext2TrimScanClean(partition, uuid, 1, scratch, read, emit); };
     assert(scan() == Ext2TrimScanResult::Ok && ranges == 2);
+    // Use the boot path's lease layout. A competing raw writer (including
+    // the would-be desktop adapter before ownership transfer) may not
+    // allocate any block in the partition while the emitter is outstanding.
+    AhciDirectLayout layout{};
+    layout.esp.first = 34;
+    layout.esp.count = partition.lba - 34;
+    layout.data.first = partition.lba;
+    layout.data.count = partition.sectors;
+    layout.frontBytes = 34 * 512;
+    layout.backStart = (partition.lba + partition.sectors) * 512;
+    layout.backBytes = 33 * 512;
+    constexpr uintptr_t disk = 1, dataOwner = 2, espOwner = 3, desktopAdapter = 4;
+    BlockWriteLease reservations[4]{};
+    assert(AhciDirectGuardLeases(layout, disk, dataOwner, espOwner, reservations));
+    BlockWriteLeases leases;
+    assert(leases.Install(reservations, 4, true));
+    std::atomic<bool> emitting{false}, attempted{false};
+    std::thread writer([&] {
+        while (!emitting.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        const uint64_t offset = (partition.lba + 5 * 8) * 512;
+        assert(!leases.AllowOrdinary(disk, offset, 4096));
+        assert(!leases.AllowOwner(disk, desktopAdapter, offset, 4096));
+        assert(leases.AllowOwner(disk, dataOwner, partition.lba * 512 + 1082, 2));
+        attempted.store(true, std::memory_order_release);
+    });
+    ranges = 0;
+    assert(Ext2TrimScanClean(partition, uuid, 1, scratch, read, [&](TrimRange range) {
+        emitting.store(true, std::memory_order_release);
+        while (!attempted.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        return emit(range);
+    }) == Ext2TrimScanResult::Ok && ranges == 2);
+    writer.join();
     ranges = 0;
     bitmaps[1][0] |= 0x20;
     assert(scan() == Ext2TrimScanResult::Invalid && ranges == 0);
