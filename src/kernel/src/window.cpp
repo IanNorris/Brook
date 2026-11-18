@@ -2631,6 +2631,25 @@ bool WmGpuSourceProviderMatches(uint32_t window,uint64_t incarnation,uint32_t pi
         (w.proc->isThread?w.proc->leaderIncarnation:w.proc->incarnation)==providerIncarnation;
 }
 
+bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags)
+{
+    if (!window || !incarnation || !flags) return false;
+    *window = 0; *incarnation = 0; *flags = 0;
+    VfbGuard guard;
+    const int idx = __atomic_load_n(&g_focusedIdx, __ATOMIC_ACQUIRE);
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
+    const Window& w = g_windows[idx];
+    if (!w.proc || !w.wmId) return false;
+    *window = w.wmId; *incarnation = w.creationIdentity;
+    *flags = BROOK_WINDOW_STATE_FOCUSED |
+        (w.visible ? BROOK_WINDOW_STATE_VISIBLE : 0) |
+        (w.minimized ? BROOK_WINDOW_STATE_MINIMIZED : 0) |
+        (w.fullscreen ? BROOK_WINDOW_STATE_FULLSCREEN :
+         w.state == WindowState::Maximized ? BROOK_WINDOW_STATE_MAXIMIZED : 0) |
+        (w.noChrome ? BROOK_WINDOW_STATE_CLIENT_CHROME : 0);
+    return true;
+}
+
 int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
                                uint64_t expectedIncarnation, BrookWindowState* out)
 {

@@ -347,6 +347,22 @@ static inline void desktop_gpu_channel_presented(struct DesktopGpuChannel *c,uin
     }
     desktop_gpu_channel_flush(c);
 }
+/* App-driven cadence (desktop_app_present.h): the frame that samples the
+ * dominant window's offer has been submitted, so tell the provider now
+ * instead of after the OS present. PRESENTED only releases the client's
+ * frame callbacks; the presented watermark, current source and SAFE still
+ * wait for desktop_gpu_channel_presented/finish, so buffer reuse is
+ * unchanged. A frame that then fails to present costs the client one early
+ * callback, never a buffer. Returns the offers notified. */
+static inline unsigned desktop_gpu_channel_notify_early(struct DesktopGpuChannel *c,uint64_t frame,uint32_t window){
+    unsigned n=0;
+    if(!frame || !window)return 0;
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];
+        if(o->notify || o->packet.identity.window!=window || !desktop_gpu_offer_retained(o) || !desktop_gpu_offer_in_frame(o,frame))continue;
+        o->notify=1;++n;}
+    if(n)desktop_gpu_channel_flush(c);
+    return n;
+}
 /* A retained offer that is idle can still be shown only while it is the
  * window's current source or the newest unpresented commit. */
 static inline int desktop_gpu_offer_dead(struct DesktopGpuChannel *c,const struct DesktopGpuOffer *o,uint64_t frame){

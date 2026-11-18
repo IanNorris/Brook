@@ -7,6 +7,7 @@
 
 #include "syscall.h"
 #include "desktop_layers_export.h"
+#include "desktop_present_policy.h"
 #include "intel_bdw_scanout.h"
 #include "memory/user_mapping.h"
 #include "compositor.h"
@@ -22,6 +23,7 @@ namespace brook {
 
 WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
 DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
+uint32_t g_desktopPresentPolicy=BROOK_DESKTOP_POLICY_DIRECT_SHADOW,g_desktopPresentDeferUs=0; // desktop_present_policy.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {
@@ -155,6 +157,13 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    if(op==BROOK_DESKTOP_FOCUS_QUERY){
+        if(size!=sizeof(BrookDesktopFocus) || a || b || c || !address || address>~uint64_t{0}-size)return -EINVAL;
+        BrookDesktopFocus focus{};focus.version=BROOK_DESKTOP_FOCUS_VERSION;
+        (void)brook::WmSnapshotFocus(&focus.window,&focus.incarnation,&focus.state);
+        focus.policy=brook::DesktopPresentPolicy();focus.deferUs=brook::DesktopPresentDeferUs();
+        return CopyToUser(address,&focus,sizeof(focus))?0:-EFAULT;
+    }
     if(op==BROOK_DESKTOP_CLIENT_FRAME){
         if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
         brook::WmNoteClientFrame(b,c);return 0;
