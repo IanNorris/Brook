@@ -1,6 +1,7 @@
 #include "ext2_trim_plan.h"
 
 #include <cassert>
+#include <cstring>
 
 using namespace brook;
 
@@ -36,9 +37,81 @@ static void TestExt2Metadata()
                                   disk, cache, sizeof(disk), plan));
 }
 
+static void TestCleanScan()
+{
+    constexpr uint32_t totalBlocks = 32768 + 8;
+    const TrimRange partition{2048, uint64_t(totalBlocks) * 8};
+    const uint8_t uuid[16]{1};
+    uint8_t super[1024]{};
+    auto put = [](uint8_t* p, uint32_t value, unsigned bytes = 4) {
+        for (unsigned i = 0; i < bytes; ++i)
+            p[i] = uint8_t(value >> (8 * i));
+    };
+    put(super, 64);
+    put(super + 4, totalBlocks);
+    put(super + 12, 32766);
+    put(super + 24, 2);
+    put(super + 28, 2);
+    put(super + 32, 32768);
+    put(super + 36, 32768);
+    put(super + 40, 32);
+    put(super + 56, 0xef53, 2);
+    put(super + 58, 1, 2);
+    put(super + 76, 1);
+    put(super + 84, 11);
+    put(super + 88, 128, 2);
+    put(super + 96, 2);
+    put(super + 100, 3);
+    memcpy(super + 104, uuid, sizeof(uuid));
+    uint8_t desc[2][32]{};
+    uint8_t bitmaps[2][4096]{{0x1f}, {0x1f}};
+    for (unsigned g = 0; g < 2; ++g) {
+        for (unsigned field = 0; field < 3; ++field)
+            put(desc[g] + 4 * field, g * 32768 + 2 + field);
+        put(desc[g] + 12, (g ? 8 : 32768) - 5, 2);
+    }
+    auto read = [&](uint64_t offset, void* out, uint32_t bytes) {
+        if (offset == 1024 && bytes == sizeof(super)) {
+            memcpy(out, super, bytes);
+            return true;
+        }
+        for (unsigned g = 0; g < 2; ++g) {
+            if (offset == 4096 + g * 32 && bytes == sizeof(desc[g])) {
+                memcpy(out, desc[g], bytes);
+                return true;
+            }
+            if (offset == uint64_t(g * 32768 + 2) * 4096 && bytes == sizeof(bitmaps[g])) {
+                memcpy(out, bitmaps[g], bytes);
+                return true;
+            }
+        }
+        return false;
+    };
+    Ext2TrimScan scratch{};
+    unsigned ranges = 0;
+    auto emit = [&](TrimRange range) {
+        assert(ranges < 2);
+        assert(range.lba == partition.lba + (ranges * 32768 + 5) * 8);
+        assert(range.sectors == (ranges ? 3 : 32763) * 8);
+        ++ranges;
+        return true;
+    };
+    auto scan = [&] { return Ext2TrimScanClean(partition, uuid, 1, scratch, read, emit); };
+    assert(scan() == Ext2TrimScanResult::Ok && ranges == 2);
+    ranges = 0;
+    bitmaps[1][0] |= 0x20;
+    assert(scan() == Ext2TrimScanResult::Invalid && ranges == 0);
+    bitmaps[1][0] = 0x1f;
+    put(super + 12, 32765);
+    assert(scan() == Ext2TrimScanResult::Invalid && ranges == 0);
+    put(super + 58, 0, 2);
+    assert(scan() == Ext2TrimScanResult::Dirty && ranges == 0);
+}
+
 int main()
 {
     TestExt2Metadata();
+    TestCleanScan();
     const TrimRange partition{2048, 524288};
     const TrimRange reserved[] = {{2048, 8}, {3000, 16}, {7000, 128}};
     assert(TrimRangeAllowed({2056, 944}, partition, reserved, 3));

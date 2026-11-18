@@ -54,7 +54,7 @@ endfunction()
 
 enable_testing()
 add_host_test(test_ssd_trim_plan)
-target_include_directories(test_ssd_trim_plan PRIVATE "${BROOK_ROOT}/src/kernel/src")
+target_compile_options(test_ssd_trim_plan PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_immutable_image_snapshot)
 add_host_test(test_ramdisk "${BROOK_ROOT}/src/kernel/src/ramdisk.cpp")
 target_include_directories(test_ramdisk PRIVATE "${BROOK_ROOT}/src/shared/inc_km")

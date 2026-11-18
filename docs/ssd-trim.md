@@ -29,18 +29,20 @@ free count matches the group descriptor.
 
 ## Runtime integration still needed
 
-- Use the guarded direct ext2 mount at `/media/system`. Derive the sector
-  window from the admitted GPT identity. Build exclusions independently of
-  allocation bits, including primary and backup filesystem metadata and all
-  guard and boot reservations. Refuse geometry or feature combinations whose
-  metadata layout the validator cannot prove.
-- Under ext2 allocation exclusion, sync and flush queued writes, reread
-  metadata, and verify group and superblock free counts and filesystem and
-  guard state before issuing any DSM. Brook currently serializes allocation
-  with `g_ext2Lock`. If that lock is released between batches, revalidate the
-  current group's ranges under the lock before issuing them. Keep allocation
-  excluded until the command retires. Define what happens to affected ranges
-  after an uncertain completion before enabling the runtime path.
+- Take the ext2 sector window from the guard’s admitted GPT data reservation.
+  The direct ext2 volume appears at `/nix`. The guarded `/media/system`
+  mount is the EFI partition and must remain outside the discard window.
+- Use the clean pre-mount window after guard admission and before publishing
+  the ext2 allocator. The direct session intentionally marks the primary
+  superblock dirty before mounting, so an online scan cannot satisfy the
+  clean-header requirement. Keep the boot lease and maintenance ownership
+  through both passes and command retirement. If completion is uncertain,
+  leave the allocator unpublished and return to maintenance.
+- The two-pass scan checks every group and the superblock free total before
+  emitting any ranges. It derives primary and sparse backup reservations
+  independently of the allocation bits. The guard must pin the partition
+  and exclude writers across both passes. In this window no ext2 cache
+  exists, so there are no deferred allocations or frees to reconcile.
 - Limit each command to the admitted target, preserve AHCI I/O serialization
   and panic handling, and stop on a command failure. Provide an explicit
   maintenance command with dry-run by default and JSON for ranges, bytes,
@@ -50,8 +52,9 @@ free count matches the group descriptor.
 
 The host test covers bitmap intersections and minimum lengths, reserved-sector
 and partition checks, IDENTIFY gating, FIS and range entry encoding, range
-splitting, padding and prevalidation before emission. Allocation race and
-runtime admission tests require the runtime integration above.
+splitting, padding and prevalidation before emission. A synthetic two-group scan also verifies that a late bitmap mismatch, an
+incorrect superblock free total and a dirty header all suppress emission.
+Writer-exclusion and runtime admission tests require the integration above.
 
 On a disposable QEMU AHCI image with `discard=unmap`, validate dry-run and
 execution against a Dell-style GPT/ext2 image with deleted files. Compare all

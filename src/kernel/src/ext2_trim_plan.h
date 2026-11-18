@@ -62,4 +62,79 @@ inline bool Ext2TrimValidateGroup(const LargeExt2Geometry& geometry,
     return true;
 }
 
+struct Ext2TrimScan {
+    uint8_t superblock[1024];
+    uint8_t descriptor[32];
+    uint8_t bitmap[4096];
+};
+
+enum class Ext2TrimScanResult { Ok, IoError, Invalid, Dirty, Cancelled };
+
+// Reads partition-relative bytes. The caller must pin the clean filesystem
+// and its write lease across both passes. With no mounted allocator, the disk
+// bitmap is authoritative. An emitter failure stops before the next group.
+template<class Read, class Emit>
+Ext2TrimScanResult Ext2TrimScanClean(TrimRange partition, const uint8_t* uuid,
+                                   uint32_t minBlocks, Ext2TrimScan& scratch,
+                                   Read read, Emit emit)
+{
+    if (!minBlocks || !TrimRangeInside(partition, {0, TrimLbaLimit}))
+        return Ext2TrimScanResult::Invalid;
+    constexpr uint32_t blockBytes = 4096;
+    if (!read(1024, scratch.superblock, sizeof(scratch.superblock)))
+        return Ext2TrimScanResult::IoError;
+
+    LargeExt2Geometry geometry{};
+    switch (LargeExt2ClassifyHeader(scratch.superblock, sizeof(scratch.superblock),
+                                    partition.sectors * 512, uuid, geometry)) {
+    case LargeExt2HeaderState::Invalid:
+        return Ext2TrimScanResult::Invalid;
+    case LargeExt2HeaderState::NeedsCheck:
+        return Ext2TrimScanResult::Dirty;
+    case LargeExt2HeaderState::Clean:
+        break;
+    }
+    const uint32_t ipg = LargeExt2Read32(scratch.superblock + 40);
+    const uint32_t expectedFree = LargeExt2Read32(scratch.superblock + 12);
+
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        uint64_t freeBlocks = 0;
+        for (uint32_t group = 0; group < geometry.groups; ++group) {
+            if (!read(blockBytes + uint64_t(group) * sizeof(scratch.descriptor),
+                      scratch.descriptor, sizeof(scratch.descriptor)))
+                return Ext2TrimScanResult::IoError;
+            if (!LargeExt2GroupDescriptorValid(geometry, group, ipg,
+                                               scratch.descriptor, sizeof(scratch.descriptor)))
+                return Ext2TrimScanResult::Invalid;
+            const uint64_t bitmap = LargeExt2Read32(scratch.descriptor);
+            if (!read(bitmap * blockBytes, scratch.bitmap, sizeof(scratch.bitmap)))
+                return Ext2TrimScanResult::IoError;
+            Ext2TrimGroup plan{};
+            if (!Ext2TrimValidateGroup(geometry, partition, group, ipg, scratch.descriptor,
+                                       scratch.bitmap, scratch.bitmap, sizeof(scratch.bitmap), plan))
+                return Ext2TrimScanResult::Invalid;
+            freeBlocks += plan.freeBlocks;
+            if (pass == 0)
+                continue;
+            const uint64_t groupStart = uint64_t(group) * Ext2TrimBlocksPerGroup;
+            const uint64_t remaining = geometry.blocks - groupStart;
+            const uint32_t blocks = remaining < Ext2TrimBlocksPerGroup ?
+                                    uint32_t(remaining) : Ext2TrimBlocksPerGroup;
+            bool valid = true;
+            const bool visited = TrimVisitCommonFreeRuns(scratch.bitmap, scratch.bitmap, blocks,
+                    minBlocks, [&](uint32_t start, uint32_t count) {
+                const TrimRange range{partition.lba + (groupStart + start) * Ext2TrimSectorsPerBlock,
+                                      uint64_t(count) * Ext2TrimSectorsPerBlock};
+                valid = TrimRangeAllowed(range, partition, plan.reserved, plan.reservedCount);
+                return valid && emit(range);
+            });
+            if (!visited)
+                return valid ? Ext2TrimScanResult::Cancelled : Ext2TrimScanResult::Invalid;
+        }
+        if (freeBlocks != expectedFree)
+            return Ext2TrimScanResult::Invalid;
+    }
+    return Ext2TrimScanResult::Ok;
+}
+
 } // namespace brook
