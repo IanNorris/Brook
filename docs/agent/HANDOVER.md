@@ -92,6 +92,12 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Dell gen 426 `dell-xwayland-hidpi-20261118` (session `036dae3a34b34a55bf6c6cfdf12c13ed`; branch `work/xwayland-hidpi` `85496659`, not merged):**
+- **brook-xwm staged:** `/nix/store/h9x75map…-waylandd-brook-0.1-brook`. Rollback record: `/nix/.brook-profile-rollback-xwm20261118.json` (previous `4p01fkxz…`).
+- **Steam launcher `rootless-4` installed** (`ui_scale` 2; rollback via the bundle's `install.py --rollback`).
+- **Ian to test:** Stardew fullscreen and mouse; Steam UI scale; X11 apps' sharpness/size (LibreOffice, VLC).
+- **Then:** merge `work/xwayland-hidpi` to main, and `work/steam-rootless` + `work/steam-rootless-hidpi` (the launcher source).
+
 **18 Nov later (Dell gen 425, main `c9e54176` with `work/brook-value` merged; Ian wants a docs pass at some point):**
 - **`sched lock-stats` during the matched demo** (bare metal): ready lock 23.9M acquisitions/~76 s, 9.7% contended, 855 ms wait. KernelRegionTryEnter and SchedulerKernelRegionLeave are 11.2M each, 93% of the traffic, ~630 ms of the wait. Evidence: `display-perf/build/dell/lockstats-demo.json`. Fix in progress: `work/kregion-lockfree`.
 - **Ian's Dell feedback:**
