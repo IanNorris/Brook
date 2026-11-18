@@ -66,6 +66,17 @@ branch's report.
   - waylandd (pid 24) spent about 5.9 s of 10 s blocked on the graph mutex and
     only 5 s idle-waiting.
   - Other epoll users (pids 30, 520, 575, 450) were blocked 5–9 s.
+  - Commit 83ecfa6f moved `CopyToUser` out of the lock. That was not enough:
+    in Dell gen 433 (`display-perf/build/dell/tl2-433-menu/`), Xwayland still
+    spent about 6.7 s of 10 s in `KMutexLock` from `epoll_wait_impl` and
+    `EpollScanReady`, behind Steam's steamwebhelper threads, because the scan
+    still ran every `watchReady` under the global lock. Branch
+    `work/epoll-instance-lock` replaces that lock with a per-instance leaf
+    lock (`EpollInstance::lock`). It is held only to copy or commit entries,
+    and readiness is evaluated with no epoll lock held. The global lock now
+    serialises only `epoll_ctl(ADD)` of an epoll fd, for loop and depth
+    validation. "Locking" in `syscall_epoll.cpp` documents this, and
+    `test_epoll_instance_lock` checks it.
 - **The per-process mapping mutex convoys.** `UserMappingPageAccess` takes
   `space->mutation` for every page of every user copy. The game's threads
   were blocked on it for seconds:
