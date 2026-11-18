@@ -32,6 +32,7 @@ struct EpollInstance {
     int        count;
     volatile uint32_t refCount; // +1 per fd sharing this epoll instance
     Process*   waiter; // process blocked in epoll_wait
+    uint64_t   ctlGeneration; // bumped by epoll_ctl under g_epollGraphLock
 };
 
 static inline void EpollFdRef(EpollInstance* ep)
