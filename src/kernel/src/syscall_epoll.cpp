@@ -179,7 +179,7 @@ struct EpollWalk {
     Node* node(EpollInstance* ep) {
         for (int i = 0; i < count; i++) if (nodes[i].ep == ep) return &nodes[i];
         if (count >= EPOLL_MAX_FDS + 1) return nullptr;
-        auto* n = &nodes[count++]; n->ep = ep; return n;
+        auto* n = &nodes[count++]; *n = Node{}; n->ep = ep; return n;
     }
     bool any(EpollInstance* ep, int depth = 0) {
         if (depth >= EPOLL_MAX_DEPTH) return false;
@@ -253,8 +253,22 @@ struct EpollWalk {
         }
         n->active = false; n->height = h; return h;
     }
-    void clearMemo() {
-        __builtin_memset(nodes, 0, sizeof(nodes)); count = 0;
+    // node() initialises each node it hands out, so forgetting the memo is
+    // O(1). Clearing all EPOLL_MAX_FDS+1 nodes (about 24 KiB) here and the
+    // whole walk (about 78 KiB) in EpollWalkOwner ran on every epoll_wait
+    // iteration and was the 9% memset in the Dell gen 423 Torchlight II
+    // profile (a busy epoll_wait caller), not GPU buffer zero-fill.
+    void clearMemo() { count = 0; }
+    // Fields that must start zeroed: pins/attempted (pin()), masks (OR-ed by
+    // collect(), scanned by the waiter registration) and the memo. Delivery
+    // records are written before they are read (EpollScanReady) and nodes
+    // are initialised by node().
+    void reset(Process* owner) {
+        proc = owner;
+        __builtin_memset(pins, 0, sizeof(pins));
+        __builtin_memset(attempted, 0, sizeof(attempted));
+        __builtin_memset(masks, 0, sizeof(masks));
+        count = 0;
     }
 };
 // Reuse free scratch objects on hot epoll paths. Sleepers retain their own
@@ -266,7 +280,7 @@ struct EpollWalkOwner {
     EpollWalk* walk;
     explicit EpollWalkOwner(Process* proc) : operation(proc), walk(g_epollWalkCache.TryAcquire()) {
         if (!walk) walk = static_cast<EpollWalk*>(kmalloc(sizeof(EpollWalk)));
-        if (walk) { __builtin_memset(walk, 0, sizeof(*walk)); walk->proc = proc; }
+        if (walk) walk->reset(proc);
     }
     ~EpollWalkOwner() {
         if (!walk) return;
