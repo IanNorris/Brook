@@ -3135,21 +3135,14 @@ static void CompositorHandleMouseWM()
                 }else CompositorBeginWindowMove(hit.windowIndex);
                 break;
             }
-            case WmHitZone::ResizeCorner:
-            case WmHitZone::ResizeRight:
-            case WmHitZone::ResizeBottom:
-            {
-                // Start resize drag
-                Window* w = WmGetWindow(hit.windowIndex);
-                if (w && w->state != WindowState::Maximized)
-                {
-                    bool resizeX = (hit.zone != WmHitZone::ResizeBottom);
-                    bool resizeY = (hit.zone != WmHitZone::ResizeRight);
-                    CompositorBeginWindowResize(hit.windowIndex, false, resizeX, false, resizeY);
-                }
-                break;
-            }
             default:
+                if (const uint8_t edges = WmHitZoneResizeEdges(hit.zone))
+                {
+                    // Start resize drag from the part's edges.
+                    Window* w = WmGetWindow(hit.windowIndex);
+                    if (w && w->state != WindowState::Maximized)
+                        CompositorBeginWindowResize(hit.windowIndex, edges & 1, edges & 4, edges & 2, edges & 8);
+                }
                 break;
             }
         }

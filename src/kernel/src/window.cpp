@@ -39,6 +39,7 @@
 #include "font_atlas.h"
 #include "chrome_raster.h"
 #include "chrome_alpha.h"
+#include "chrome_layout.h"
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
@@ -653,6 +654,14 @@ static WmRect CaptionRect(const Window& w, int index)
 {
     return DesktopCaptionRect(CaptionGeometry(w),w.desktopMetrics(),index);
 }
+// The window's part table (chrome_layout.h). screenW/H: the output, whose
+// edges remove resize zones; 0 when only the visual parts matter.
+static ChromeLayout WindowChromeLayout(const Window& w, uint32_t screenW = 0, uint32_t screenH = 0)
+{
+    return ChromeFrameLayout({CaptionGeometry(w), w.state == WindowState::Maximized,
+                              {0, 0, static_cast<int>(screenW), static_cast<int>(screenH)}},
+                             w.desktopMetrics());
+}
 WmRect WmCaptionOverlayRect(const Window& w)
 {
     return DesktopCaptionOverlayRect(CaptionGeometry(w),w.desktopMetrics());
@@ -964,110 +973,30 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
     // Collect sorted indices
     int sorted[WM_MAX_WINDOWS];
     uint32_t count = WmGetZOrder(sorted, WM_MAX_WINDOWS);
+    uint32_t screenW = 0, screenH = 0;
+    CompositorGetPhysDims(&screenW, &screenH);
 
-    // Walk front to back (last in z-order array = frontmost)
+    // Walk front to back (last in z-order array = frontmost). The first
+    // window whose part table claims the point wins, including its outer
+    // resize margin.
     for (int i = static_cast<int>(count) - 1; i >= 0; --i)
     {
         int idx = sorted[i];
         const Window& w = g_windows[idx];
         if (!w.proc || !w.visible || w.minimized) continue;
-
-        int wx = w.x;
-        int wy = w.y;
-        int ww = w.outerWidth();
-        int wh = w.outerHeight();
-
-        // Check if mouse is within outer bounds (extended by grab zone for resize).
-        // CSD windows have no kernel-managed chrome or resize zone; treat them
-        // strictly by their outer (== client) bounds.
-        int grab = w.noChrome ? 0 : static_cast<int>(WmMetric(WM_RESIZE_EDGE));
-        if (mx < wx - grab || my < wy || mx >= wx + ww + grab || my >= wy + wh + grab)
-            continue;
-
-        // CSD: no chrome zones, no edge resize.  The whole window is client,
-        // except for caption buttons the WM overlays on it.
-        if (w.noChrome)
-        {
-            result.windowIndex = idx;
-            result.zone = WmHitZone::ClientArea;
-            const WmHitZone overlayZones[] = {WmHitZone::CloseButton,
-                WmHitZone::MaximizeButton, WmHitZone::MinimizeButton};
-            if (w.captionOverlay)
-                for (int button = 0; button < 3; ++button)
-                    if (CaptionRect(w, button).contains(mx, my))
-                        result.zone = overlayZones[button];
-            return result;
-        }
-
-        // If click is outside the visual window but inside grab zone,
-        // treat as edge resize
-        bool outsideRight  = (mx >= wx + ww);
-        bool outsideBottom = (my >= wy + wh);
-        if (outsideRight || outsideBottom)
-        {
-            result.windowIndex = idx;
-            if (outsideRight && outsideBottom)
-                result.zone = WmHitZone::ResizeCorner;
-            else if (outsideRight)
-                result.zone = WmHitZone::ResizeRight;
-            else
-                result.zone = WmHitZone::ResizeBottom;
-            return result;
-        }
-
-        // We hit this window
+        const ChromeLayout layout = WindowChromeLayout(w, screenW, screenH);
+        const ChromePart* part = layout.Hit(mx, my);
+        if (!part) continue;
         result.windowIndex = idx;
-
-        int relX = mx - wx;
-        int relY = my - wy;
-
-        const WmHitZone captionZones[] = {WmHitZone::CloseButton,
-            WmHitZone::MaximizeButton, WmHitZone::MinimizeButton};
-        for (int button = 0; button < 3; ++button)
-        {
-            if (CaptionRect(w, button).contains(mx, my))
-            {
-                result.zone = captionZones[button];
-                return result;
-            }
+        switch (part->role) {
+        case ChromePartRole::Resize: result.zone = WmHitZoneForResizeEdges(part->edges); break;
+        case ChromePartRole::Close: result.zone = WmHitZone::CloseButton; break;
+        case ChromePartRole::Maximise: result.zone = WmHitZone::MaximizeButton; break;
+        case ChromePartRole::Minimise: result.zone = WmHitZone::MinimizeButton; break;
+        case ChromePartRole::Drag: result.zone = WmHitZone::TitleBar; break;
+        case ChromePartRole::Client: result.zone = WmHitZone::ClientArea; break;
+        case ChromePartRole::Border: result.zone = WmHitZone::Border; break;
         }
-        if (relY < static_cast<int>(WmMetric(WM_BORDER_WIDTH) + WmMetric(WM_TITLE_BAR_HEIGHT)))
-        {
-            result.zone = WmHitZone::TitleBar;
-            return result;
-        }
-
-        // Resize corner (bottom-right grab zone)
-        if (relX >= ww - static_cast<int>(WmMetric(WM_RESIZE_GRAB)) &&
-            relY >= wh - static_cast<int>(WmMetric(WM_RESIZE_GRAB)))
-        {
-            result.zone = WmHitZone::ResizeCorner;
-            return result;
-        }
-
-        // Resize edges (bottom and right, wider than visual border)
-        if (relY >= wh - static_cast<int>(WmMetric(WM_RESIZE_EDGE)))
-        {
-            result.zone = WmHitZone::ResizeBottom;
-            return result;
-        }
-        if (relX >= ww - static_cast<int>(WmMetric(WM_RESIZE_EDGE)))
-        {
-            result.zone = WmHitZone::ResizeRight;
-            return result;
-        }
-
-        // Border
-        if (relX < static_cast<int>(WmMetric(WM_BORDER_WIDTH)) ||
-            relX >= ww - static_cast<int>(WmMetric(WM_BORDER_WIDTH)) ||
-            relY >= wh - static_cast<int>(WmMetric(WM_BORDER_WIDTH)))
-        {
-            result.zone = WmHitZone::Border;
-            return result;
-        }
-
-        // Client area
-        result.zone = WmHitZone::ClientArea;
         return result;
     }
 
@@ -1781,10 +1710,15 @@ static void RenderCaptionButtons(uint32_t* buf, uint32_t stride, uint32_t screen
                                  uint32_t hoverBg, uint32_t hoverInk,
                                  const WmRect& clip = WmRect{}, unsigned radius = 0)
 {
+    // The painter draws the part table's buttons: each in its visual cell,
+    // hovered anywhere in its (edge-to-edge) hit rect.
+    const ChromeLayout layout = WindowChromeLayout(w);
     for (int button = 0; button < 3; ++button)
     {
-        const WmRect r = CaptionRect(w, button);
-        const bool hover = r.contains(mouseX, mouseY);
+        const ChromePart* part = layout.Find(ChromeCaptionRole(button));
+        if (!part) continue;
+        const WmRect r = part->visual;
+        const bool hover = part->hit.contains(mouseX, mouseY);
         if(material)WmFillRect(buf,stride,screenW,screenH,r.x,r.y,1,r.h,ChromeMix(bg,0xffffff,20));
         if (hover) FillCornerClipped(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
                              button == 0 ? WmCurrentPalette().closeHover : hoverBg, clip, radius);
@@ -2982,7 +2916,11 @@ int64_t WmDesktopLayersUseIfBothPresentable(const WmDesktopLayers& base,const Wm
 static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Window& origin0,int32_t mouseX,int32_t mouseY) {
     // origin0 has x=y=0, exactly as RenderWindowChrome sees it in a capture.
     int32_t hover=-1;
-    for(int button=0;button<3 && hover<0;++button)if(CaptionRect(origin0,button).contains(mouseX,mouseY))hover=button;
+    const ChromeLayout layout=WindowChromeLayout(origin0);
+    for(int button=0;button<3 && hover<0;++button){
+        const ChromePart* part=layout.Find(ChromeCaptionRole(button));
+        if(part && part->hit.contains(mouseX,mouseY))hover=button;
+    }
     WmChromeKeyInput in{};
     in.title=origin0.title;in.titleCapacity=sizeof(origin0.title);
     in.appId=origin0.appId;in.appIdCapacity=sizeof(origin0.appId);
