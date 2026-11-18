@@ -65,6 +65,8 @@ struct RenderContext {
     /* Retained overlay capture: reused while the kernel generation matches. */
     uint64_t overlayGeneration;uint32_t overlayWidth,overlayHeight;
     struct BrookDesktopOverlayBands overlayBands;
+    /* Per band, from kernel op 9: opaque bits and content keys (0 = unknown). */
+    uint32_t overlayOpaque;uint64_t overlayKeys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
     struct Source cursor;uint64_t cursorSerial;
     struct BackdropIdentity backdropIdentity;
     struct DesktopDamageState damage;
@@ -180,7 +182,7 @@ static void renderer_exit_for_restart(const char *cause,long detail){
 static unsigned g_scanoutImages;
 static const char *g_failStage="none";
 #define DESKTOP_OVERLAY_ONLY_NS 250000000ull
-static uint64_t g_lastOverlayOnlyNs,g_overlayOnlySkips;
+static uint64_t g_lastOverlayOnlyNs,g_overlayOnlySkips,g_overlayBandsKept;
 /* Per presented frame timeline (CLOCK_MONOTONIC us; on the Dell the same TSC
  * as the kernel's "gpu zerocopy timeline"): start, quad submit, fence,
  * present call, present done; ring image, drawn partial/full, drawn pixels,
@@ -381,8 +383,12 @@ static int batch_output_ensure(struct RenderContext *ctx,uint64_t bytes){
 static uint64_t monotonic_ns(void);
 /* Returns the generation of the captured content (0 if untracked) through
  * generation. Waits in the kernel for completion where supported. */
+/* bands/opaque/keys: in, the held capture whose pixels are in output (an
+ * unchanged band is not reread); out, the new capture. */
 static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t height,
-                           struct BrookDesktopOverlayBands *bands,uint64_t *generation){
+                           struct BrookDesktopOverlayBands *bands,uint32_t *opaque,uint64_t *keys,uint64_t *generation){
+    const struct BrookDesktopOverlayBands held=*bands;uint64_t heldKeys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
+    memcpy(heldKeys,keys,sizeof(heldKeys));memset(keys,0,sizeof(heldKeys));*opaque=0;
     uint64_t start=monotonic_ns(),ready=0,pollEnd=0;unsigned polls=0;*generation=0;
     long token=syscall(BROOK_SYS_DESKTOP_OVERLAY,0,0,0,0,g_overlayTracked==1?BROOK_DESKTOP_OVERLAY_NO_CURSOR:0,0);
     if(token<=0){desktop_stats_overlay(&g_stats,0,0,0);return -1;}
@@ -409,16 +415,26 @@ static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t
        info.bytes!=(uint64_t)width*height*4)goto done;
     ready=monotonic_ns();
     memset(bands,0,sizeof(*bands));
-    if(syscall(BROOK_SYS_DESKTOP_OVERLAY,4,token,bands,sizeof(*bands),0,0))goto done;
+    /* Op 9 adds per-band opacity and content keys; older kernels: op 4. */
+    struct BrookDesktopOverlayBandsV2 v2;memset(&v2,0,sizeof(v2));
+    uint64_t newKeys[BROOK_DESKTOP_OVERLAY_MAX_BANDS]={0};uint32_t newOpaque=0;
+    if(!syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_BANDS_V2,token,&v2,sizeof(v2),0,0)){
+        if(v2.reserved || v2.bands.count>BROOK_DESKTOP_OVERLAY_MAX_BANDS || (v2.opaque>>v2.bands.count))goto done;
+        *bands=v2.bands;newOpaque=v2.opaque;memcpy(newKeys,v2.keys,sizeof(newKeys));
+    }else if(errno!=EINVAL || syscall(BROOK_SYS_DESKTOP_OVERLAY,4,token,bands,sizeof(*bands),0,0))goto done;
     if(bands->reserved || bands->count>BROOK_DESKTOP_OVERLAY_MAX_BANDS)goto done;
     for(uint32_t i=0;i<bands->count;++i){
         const struct BrookDesktopOverlayBand *b=&bands->bands[i];
         if(!b->width || !b->height || b->x>=width || b->y>=height || b->width>width-b->x || b->height>height-b->y ||
            (i && b->y<bands->bands[i-1].y+bands->bands[i-1].height))goto done;
+        /* The same keyed band is already in this context's buffer. */
+        if(newKeys[i] && i<held.count && heldKeys[i]==newKeys[i] && held.bands[i].x==b->x && held.bands[i].y==b->y &&
+           held.bands[i].width==b->width && held.bands[i].height==b->height && output[i].map){++g_overlayBandsKept;continue;}
         const uint64_t rowBytes=(uint64_t)b->width*4;
         if(source_ensure(drm,rowBytes*b->height,&output[i]))goto done;
         if(desktop_overlay_copy_band(token,i,output[i].map,width,height,b))goto done;
     }
+    *opaque=newOpaque;memcpy(keys,newKeys,sizeof(newKeys));
     if(blocking && g_overlayTracked==1)*generation=overlayInfo.generation;
     result=0;
 done: (void)syscall(BROOK_SYS_DESKTOP_OVERLAY,3,token,0,0,0,0);
@@ -456,6 +472,7 @@ static int overlay_adopt(int drm,struct RenderContext *ctx,uint64_t generation,u
             memcpy(ctx->overlay[i].map,peer->overlay[i].map,bytes);
         }
         ctx->overlayBands=*bands;ctx->overlayGeneration=generation;ctx->overlayWidth=width;ctx->overlayHeight=height;
+        ctx->overlayOpaque=peer->overlayOpaque;memcpy(ctx->overlayKeys,peer->overlayKeys,sizeof(ctx->overlayKeys));
         ++g_stats.pipeline.overlayAdopted;return 1;
     }
     return 0;
@@ -772,17 +789,21 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height) &&
        !overlay_adopt(drm,ctx,overlayGeneration,width,height)){
         uint64_t captured=0;ctx->overlayGeneration=0;
-        if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&captured))goto done;
+        if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&ctx->overlayOpaque,ctx->overlayKeys,&captured))goto done;
         ctx->overlayGeneration=captured;ctx->overlayWidth=width;ctx->overlayHeight=height;
     }
     const struct BrookDesktopOverlayBands bands=ctx->overlayBands;
-    struct DesktopOverlayFrameState frameOverlay={1,width,height,ctx->overlayGeneration,bands,{0}};
+    struct DesktopOverlayFrameState frameOverlay={1,width,height,ctx->overlayGeneration,bands,{0},ctx->overlayOpaque,{0}};
+    memcpy(frameOverlay.keys,ctx->overlayKeys,sizeof(frameOverlay.keys));
     stage="overlay_cursor";
     if(overlay_cursor(drm,ctx,&frameOverlay.cursor))goto done;
     timing[3]=monotonic_ns();
     for(uint32_t i=0;i<bands.count;++i){const struct BrookDesktopOverlayBand *b=&bands.bands[i];
         struct BrookVkSceneLayer layer={0,b->width,b->width,b->height,0,0,b->width,b->height,
             b->x,b->y,b->width,b->height,0,0,width,height,255|BROOK_VK_STRAIGHT_ALPHA};
+        /* An opaque band (an opaque shell surface) replaces what lies beneath:
+         * the planner culls the game under it and draws it without reading. */
+        if((ctx->overlayOpaque>>i)&1u)layer.opacity|=BROOK_VK_OPAQUE_SOURCE;
         if(push(scene,&count,sources,&overlay[i],&layer))goto done;
     }
     if(frameOverlay.cursor.visible){const struct DesktopOverlayCursorState *c=&frameOverlay.cursor;
@@ -802,6 +823,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
         struct DesktopDamageSet changes={0};
         if(desktop_track_diff(trackBase,track,&changes)){
+            desktop_overlay_clip_opaque(overlayBase,&frameOverlay,&changes);
             const uint32_t sceneChanges=changes.count;
             desktop_overlay_damage(overlayBase,&frameOverlay,&changes);
             damage=changes;tracked=1;
@@ -1423,12 +1445,12 @@ static void stats_publish(uint64_t now){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
         if(end){char tail[1024];
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
-                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,"
+                "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,\"overlay_bands_kept\":%llu,"
                 "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu},"
                 "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
                 (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
-                (unsigned long long)g_overlayOnlySkips,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
+                (unsigned long long)g_overlayOnlySkips,(unsigned long long)g_overlayBandsKept,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
                 g_chromeStats.captures,g_chromeStats.bytesCopied,g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}

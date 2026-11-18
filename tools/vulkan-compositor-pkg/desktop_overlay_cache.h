@@ -7,12 +7,33 @@
  * kernel content generation (0 = unknown, e.g. an older kernel, which is
  * treated as changed every frame) and the separately drawn pointer. */
 struct DesktopOverlayCursorState { uint32_t visible,width,height; int32_t x,y; uint64_t serial; };
+/* opaque/keys come from kernel op 9 (zero from older kernels): bit i means
+ * band i is fully opaque, keys[i] identifies its pixels (0 = unknown). */
 struct DesktopOverlayFrameState {
     uint32_t valid,width,height;
     uint64_t generation;
     struct BrookDesktopOverlayBands bands;
     struct DesktopOverlayCursorState cursor;
+    uint32_t opaque;
+    uint64_t keys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
 };
+
+/* Index of a band of s with exactly band b's geometry, key and opacity, or
+ * -1. A zero key never matches: its content is unknown. */
+static inline int desktop_overlay_find_band(const struct DesktopOverlayFrameState *s,
+                                            const struct BrookDesktopOverlayBand *b,uint64_t key,int opaque){
+    if(!key)return -1;
+    for(uint32_t i=0;i<s->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i){const struct BrookDesktopOverlayBand *x=&s->bands.bands[i];
+        if(s->keys[i]==key && ((s->opaque>>i)&1u)==(uint32_t)(opaque!=0) &&
+           x->x==b->x && x->y==b->y && x->width==b->width && x->height==b->height)return (int)i;}
+    return -1;
+}
+/* Every band of s is keyed, so bands can be compared one by one. */
+static inline int desktop_overlay_keyed(const struct DesktopOverlayFrameState *s){
+    if(!s->valid)return 0;
+    for(uint32_t i=0;i<s->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)if(!s->keys[i])return 0;
+    return 1;
+}
 
 /* A context's retained overlay bands may be reused only for the same
  * nonzero generation and output size; anything else needs a new capture. */
@@ -52,7 +73,17 @@ static inline void desktop_overlay_damage(const struct DesktopOverlayFrameState 
                                           struct DesktopDamageSet *damage){
     const uint32_t width=frame->width,height=frame->height;
     const int sameOutput=displayed->valid && displayed->width==width && displayed->height==height;
-    if(!sameOutput || !frame->generation || displayed->generation!=frame->generation ||
+    if(sameOutput && frame->generation && desktop_overlay_keyed(displayed) && desktop_overlay_keyed(frame)){
+        /* Keyed bands: damage only bands that appeared, vanished or changed,
+         * so an unchanged launcher is not redrawn when the taskbar clock or
+         * graphs change the overlay generation. */
+        for(uint32_t i=0;i<displayed->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i){const struct BrookDesktopOverlayBand *b=&displayed->bands.bands[i];
+            if(desktop_overlay_find_band(frame,b,displayed->keys[i],(displayed->opaque>>i)&1u)<0)
+                desktop_damage_add(damage,(struct DesktopDamageRect){b->x,b->y,(int64_t)b->x+b->width,(int64_t)b->y+b->height},width,height);}
+        for(uint32_t i=0;i<frame->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i){const struct BrookDesktopOverlayBand *b=&frame->bands.bands[i];
+            if(desktop_overlay_find_band(displayed,b,frame->keys[i],(frame->opaque>>i)&1u)<0)
+                desktop_damage_add(damage,(struct DesktopDamageRect){b->x,b->y,(int64_t)b->x+b->width,(int64_t)b->y+b->height},width,height);}
+    }else if(!sameOutput || !frame->generation || displayed->generation!=frame->generation ||
        !desktop_overlay_bands_equal(&displayed->bands,&frame->bands)){
         if(sameOutput)desktop_overlay_add_bands(damage,displayed,width,height);
         desktop_overlay_add_bands(damage,frame,width,height);
@@ -60,6 +91,40 @@ static inline void desktop_overlay_damage(const struct DesktopOverlayFrameState 
     if(!sameOutput || !desktop_overlay_cursor_equal(&displayed->cursor,&frame->cursor)){
         if(sameOutput)desktop_overlay_add_cursor(damage,&displayed->cursor,width,height);
         desktop_overlay_add_cursor(damage,&frame->cursor,width,height);
+    }
+}
+
+/* Scene changes beneath an opaque overlay band that is unchanged since the
+ * displayed frame change no visible pixel: remove them from the damage, so a
+ * game under an open launcher neither shades nor reblends the launcher area.
+ * Pieces stay disjoint; if they would not fit, the damage is left as it was
+ * (overdraw, never a missed change). Call on scene damage only, before the
+ * overlay's own damage is added. */
+static inline void desktop_overlay_clip_opaque(const struct DesktopOverlayFrameState *displayed,
+                                               const struct DesktopOverlayFrameState *frame,
+                                               struct DesktopDamageSet *damage){
+    if(!displayed->valid || !frame->valid || displayed->width!=frame->width || displayed->height!=frame->height)return;
+    for(uint32_t i=0;i<frame->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i){
+        const struct BrookDesktopOverlayBand *b=&frame->bands.bands[i];
+        if(!((frame->opaque>>i)&1u) || desktop_overlay_find_band(displayed,b,frame->keys[i],1)<0)continue;
+        const struct DesktopDamageRect cut={b->x,b->y,(int64_t)b->x+b->width,(int64_t)b->y+b->height};
+        struct DesktopDamageSet out={0};int fits=1;
+        for(uint32_t r=0;r<damage->count && fits;++r){const struct DesktopDamageRect d=damage->rects[r];
+            const struct DesktopDamageRect o={d.left>cut.left?d.left:cut.left,d.top>cut.top?d.top:cut.top,
+                                              d.right<cut.right?d.right:cut.right,d.bottom<cut.bottom?d.bottom:cut.bottom};
+            struct DesktopDamageRect parts[4];unsigned n=0;
+            if(o.left>=o.right || o.top>=o.bottom)parts[n++]=d;
+            else{
+                parts[n++]=(struct DesktopDamageRect){d.left,d.top,d.right,o.top};
+                parts[n++]=(struct DesktopDamageRect){d.left,o.bottom,d.right,d.bottom};
+                parts[n++]=(struct DesktopDamageRect){d.left,o.top,o.left,o.bottom};
+                parts[n++]=(struct DesktopDamageRect){o.right,o.top,d.right,o.bottom};
+            }
+            for(unsigned k=0;k<n;++k){if(parts[k].left>=parts[k].right || parts[k].top>=parts[k].bottom)continue;
+                if(out.count==DESKTOP_DAMAGE_MAX_RECTS){fits=0;break;}
+                out.rects[out.count++]=parts[k];}
+        }
+        if(fits)*damage=out;
     }
 }
 
