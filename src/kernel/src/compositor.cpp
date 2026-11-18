@@ -1535,6 +1535,16 @@ static CursorImage g_cursorSource;
 static CursorImage g_cursorFrame;
 static bool g_cursorSourceReady = false;
 static bool g_cursorBuiltin = true;
+// A client cursor belongs to the window it was set for (its creation
+// identity; 0 means shown everywhere, as before ownership existed). Away from
+// that window's client area (desktop, taskbar, WM caption buttons, other
+// windows) the built-in arrow is shown instead, and the client's image comes
+// back when the pointer returns. Wayland clients set cursors only while they
+// have pointer focus, so without this the last client cursor (Chromium's
+// resize arrow at its edge) stays on screen everywhere.
+static CursorOwnership g_cursorOwnership;
+static CursorImage g_cursorBuiltinSource;
+static bool g_cursorBuiltinReady = false;
 static CursorImage g_cursorLogicalFrame;
 
 // Saved pixels under the cursor (for restore before re-blit)
@@ -1542,30 +1552,46 @@ static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
 static int32_t  g_cursorSaveX = -1;
 static int32_t  g_cursorSaveY = -1;
 
-// Caller holds g_cursorSourceLock.
-static void CursorLoadBuiltinPixels()
+static void CursorFillBuiltin(CursorImage& image)
 {
-    g_cursorSource.width = 12;
-    g_cursorSource.height = 16;
-    g_cursorSource.hotX = g_cursorSource.hotY = 0;
-    for (uint32_t i = 0; i < CURSOR_MAX * CURSOR_MAX; ++i) g_cursorSource.pixels[i] = 0;
+    image.width = 12;
+    image.height = 16;
+    image.hotX = image.hotY = 0;
+    for (uint32_t i = 0; i < CURSOR_MAX * CURSOR_MAX; ++i) image.pixels[i] = 0;
     for (uint32_t row = 0; row < 16; ++row)
         for (uint32_t col = 0; col < 12; ++col) {
             uint8_t px = g_cursorBitmapBuiltin[row][col];
-            g_cursorSource.pixels[row * CURSOR_MAX + col] = px == 1 ? 0xffffffffu : px == 2 ? 0xff000000u : 0;
+            image.pixels[row * CURSOR_MAX + col] = px == 1 ? 0xffffffffu : px == 2 ? 0xff000000u : 0;
         }
+}
+
+// Caller holds g_cursorSourceLock.
+static void CursorLoadBuiltinPixels()
+{
+    CursorFillBuiltin(g_cursorSource);
     g_cursorSourceReady = true;
     g_cursorBuiltin = true;
 }
 
 static void CursorPrepareFrame(bool busy, uint64_t now)
 {
+    // Ownership follows the hover except while a button is held, so a drag
+    // (selection, WM resize) keeps the cursor it started with.
+    const uint64_t hover = WmPointerHoverIdentity();
+    const bool buttons = MouseGetButtons() != 0;
     SpinLockAcquire(&g_cursorSourceLock);
     if (!g_cursorSourceReady) CursorLoadBuiltinPixels();
-    if(g_cursorBuiltin && WmGetAppliedScale()!=100) {
-        ComposeCursor(g_cursorSource,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
+    const bool showClient = g_cursorOwnership.Update(hover, buttons);
+    const bool builtin = g_cursorBuiltin || !showClient;
+    if (builtin && !g_cursorBuiltin && !g_cursorBuiltinReady) {
+        CursorFillBuiltin(g_cursorBuiltinSource);
+        g_cursorBuiltinReady = true;
+    }
+    const CursorImage& source = g_cursorBuiltin || showClient ? g_cursorSource : g_cursorBuiltinSource;
+    if(builtin && WmGetAppliedScale()!=100) {
+        ComposeCursor(source,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
         ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,WmGetAppliedScale());
-    } else ComposeCursor(g_cursorSource,g_cursorFrame,busy,now,WmCurrentPalette().borderActive);
+    } else ComposeCursor(source,g_cursorFrame,busy,now,WmCurrentPalette().borderActive);
     SpinLockRelease(&g_cursorSourceLock);
 }
 static int32_t  g_cursorSaveW = 0;
@@ -1658,7 +1684,7 @@ static void CursorDraw(int32_t mx, int32_t my)
 }
 
 bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
-                              int32_t hotX, int32_t hotY)
+                              int32_t hotX, int32_t hotY, uint64_t owner)
 {
     if (w > CURSOR_MAX || h > CURSOR_MAX || (w && h && !pixels)) return false;
     Process* self = ProcessCurrent();
@@ -1677,6 +1703,7 @@ bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
         g_cursorSourceReady = true;
         g_cursorBuiltin = false;
     }
+    g_cursorOwnership.Set(w && h ? owner : 0, WmPointerHoverIdentity(), MouseGetButtons() != 0);
     SpinLockRelease(&g_cursorSourceLock);
     if (self) SchedulerKernelRegionLeave(self);
     return true;

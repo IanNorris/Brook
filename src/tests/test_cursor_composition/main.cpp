@@ -39,5 +39,17 @@ int main()
     ScaleCursor(source,bounds.cursor,200);
     CHECK(bounds.cursor.width==CursorCapacity && bounds.cursor.height==CursorCapacity);
     CHECK(bounds.before==0x12345678 && bounds.after==0x87654321);
-    std::puts("cursor composition: source preservation, animation, hotspot and bounds PASS");
+    // Ownership: a window's cursor shows only over that window, the arrow
+    // elsewhere (desktop/chrome = 0, another window), back on return; a held
+    // button keeps the current choice; unowned images show everywhere.
+    CursorOwnership own;
+    own.Set(0,0,false);CHECK(own.Update(0,false) && own.Update(5,false));
+    own.Set(7,7,false);CHECK(own.showClient);
+    CHECK(!own.Update(0,false));CHECK(!own.Update(9,false));CHECK(own.Update(7,false));
+    CHECK(own.Update(0,true));CHECK(!own.Update(0,false));CHECK(!own.Update(7,true));CHECK(own.Update(7,false));
+    own.Set(7,0,false);CHECK(!own.showClient);
+    // Same owner re-setting during a drag outside its window keeps showing it.
+    own.Set(7,7,false);CHECK(own.Update(0,true));own.Set(7,0,true);CHECK(own.showClient);
+    own.Set(9,0,true);CHECK(!own.showClient);
+    std::puts("cursor composition: source preservation, animation, hotspot, bounds and ownership PASS");
 }

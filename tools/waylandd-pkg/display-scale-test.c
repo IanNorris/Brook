@@ -8,6 +8,7 @@ static long test_syscall(long,...);
 #include "waylandd.c"
 #undef main
 #undef syscall
+static unsigned long long cursor_owner;
 static uint32_t framebuffer[48],cursor_pixels[4096],cursor_width,cursor_height;
 static int32_t hotspot_x,hotspot_y;
 static uint32_t native_width,native_height,presents;
@@ -25,7 +26,7 @@ static long test_syscall(long number,...) {
     } else if (number==BROOK_SYS_WM_SET_CURSOR_IMAGE) {
         const uint32_t *px=(void *)va_arg(ap,long);
         cursor_width=va_arg(ap,long);cursor_height=va_arg(ap,long);
-        hotspot_x=va_arg(ap,long);hotspot_y=va_arg(ap,long);
+        hotspot_x=va_arg(ap,long);hotspot_y=va_arg(ap,long);cursor_owner=(unsigned long long)va_arg(ap,long);
         assert(cursor_width*cursor_height<=4096);
         if(px)memcpy(cursor_pixels,px,cursor_width*cursor_height*4);
     } else if (number==0xB07) {
@@ -117,6 +118,38 @@ int main(void) {
         i+=size/4;
     }
     assert(entered==1 && motion==1 && raw==1);
+    /* A cursor set over the window is owned by its root window, so the kernel
+     * can show its own arrow once the pointer leaves that client area (the
+     * client's resize cursor must not stick over the desktop). */
+    assert(seat.entered_surface && (seat.entered_surface==root || seat.entered_surface==child));
+    wl_resource_set_user_data(seat.pointer,&seat);
+    pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);
+    assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|root->wm_id) && root->wm_id==1);
+    cursor_owner=0;surface_cursor_commit(cursor);assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1));
+    struct brook_surface *entered_before=seat.entered_surface;seat.entered_surface=NULL;
+    pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);assert(cursor_owner==0);
+    seat.entered_surface=entered_before;wl_resource_set_user_data(seat.pointer,NULL);
+    /* The kernel's POINTER_LEFT (pointer moved to the desktop, WM chrome or
+     * another window) ends pointer focus; the next motion enters again, so
+     * the client re-sets its cursor. Not while a button is held. */
+    seat.buttons=1;struct brook_wm_event left={.type=WM_EVT_POINTER_LEFT};
+    dispatch_surface_event(root,&seat,&left,45);assert(seat.entered_surface==entered_before);
+    seat.buttons=0;dispatch_surface_event(child,&seat,&left,45);assert(seat.entered_surface==entered_before);
+    dispatch_surface_event(root,&seat,&left,45);assert(!seat.entered_surface);
+    dispatch_surface_event(root,&seat,&left,45);assert(!seat.entered_surface);
+    event.type=EVT_MOUSE_MOVE;event.x=1;event.y=3;dispatch_surface_event(root,&seat,&event,46);
+    assert(seat.entered_surface==entered_before);
+    wl_display_flush_clients(d);bytes=recv(pair[1],wire,sizeof(wire),MSG_DONTWAIT);assert(bytes>0);
+    unsigned leaves=0;entered=0;
+    for(size_t i=0;i<(size_t)bytes/4;) {
+        uint32_t size=wire[i+1]>>16;assert(size>=8 && i*4+size<=(size_t)bytes);
+        if(wire[i]==wl_resource_get_id(seat.pointer)) {
+            if((wire[i+1]&65535)==WL_POINTER_LEAVE) {assert(wire[i+3]==wl_resource_get_id(entered_before->resource));++leaves;}
+            if((wire[i+1]&65535)==WL_POINTER_ENTER) {assert(!leaves || entered==0);++entered;}
+        }
+        i+=size/4;
+    }
+    assert(leaves==1 && entered==1);
     struct brook_wm_event resize={.type=WM_EVT_RESIZED,.x=1600,.y=1200};
     dispatch_surface_event(root,NULL,&resize,44);
     assert(root->configure_width==800 && root->configure_height==600);

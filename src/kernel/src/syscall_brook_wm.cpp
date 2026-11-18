@@ -571,11 +571,16 @@ int64_t sys_brook_wm_set_cursor_visible(uint64_t visible, uint64_t,
     return brook::CompositorSetCursorVisible(proc, visible != 0) ? 0 : -EPERM;
 }
 
-// 519: WM_SET_CURSOR_IMAGE(pixels_ptr, w, h, hotX, hotY)
+// 519: WM_SET_CURSOR_IMAGE(pixels_ptr, w, h, hotX, hotY, owner)
 // Upload a custom ARGB8888 cursor image (max 64×64). Pass w=0 to reset.
+// `owner` is BROOK_CURSOR_OWNER_TAG | wmId of the caller's window the cursor
+// was set for; the image is then shown only over that window's client area.
+// Without the tag (older providers pass whatever is in the register) the
+// image is owned by the window hovered now.
+static constexpr uint64_t kCursorOwnerTag = 0xC5C50000ull << 32;
 int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
                                        uint64_t h, uint64_t hotX,
-                                       uint64_t hotY, uint64_t)
+                                       uint64_t hotY, uint64_t ownerArg)
 {
     if (w == 0) {
         brook::CompositorSetCursorImage(nullptr, 0, 0, 0, 0);
@@ -616,10 +621,16 @@ int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         }
         KMutexUnlock(&proc->addressSpace->mutation);
     }
+    uint64_t owner = brook::WmPointerHoverIdentity();
+    if ((ownerArg & ~0xFFFFull) == kCursorOwnerTag) {
+        // A tagged wmId that is not the caller's (closed meanwhile) keeps the
+        // image unowned rather than attaching it to an unrelated window.
+        owner = brook::WmWindowCreationIdentity(proc, static_cast<uint32_t>(ownerArg & 0xFFFFu));
+    }
     // Cursor publication reads kernel memory only, after releasing the AS lock.
     if (!result && !brook::CompositorSetCursorImage(reinterpret_cast<const uint32_t*>(staged),
             static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-            static_cast<int32_t>(hotX), static_cast<int32_t>(hotY))) result = -EINVAL;
+            static_cast<int32_t>(hotX), static_cast<int32_t>(hotY), owner)) result = -EINVAL;
     kfree(staged);
     return result;
 }
