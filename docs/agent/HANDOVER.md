@@ -92,6 +92,17 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**18 Nov: Dell gen 424 `dell-int23-20261118` (session `c59d4ec167b645e4b9449e8acc2c2aa9`); main = `work/integration23`** (shell-opaque, storage-io, sched-convoy, and the zero-copy auto-arm retry thread `f03e922e`).
+- **Zero-copy active from boot** with no manual arm (the auto-arm retry works).
+- **AHCI MSI works on the Dell's Samsung PM851** (vector 64; 4,754 of 17,941 waits slept on the interrupt).
+- **Network healthy** (0 ARP failures).
+- **Matched demo:** 63.7 swaps; displayed mean 22.8 ms / p50 21.5 (~44 fps), the best yet.
+- **Q2 with the launcher open:** Ian confirmed no drop. Composite 4.24 ms (was 9.25), shaded 0.98 Mpx (was 3.1), ~66 displayed fps (p50 12.8 ms). Evidence: `display-perf/build/dell/int23-launcher/` and `goal-int23`.
+- **To do:**
+  - read `sched lock-stats status` (lock-stats is enabled on this boot) during Q2/Steam to confirm the KernelRegion enter/leave suspect;
+  - Ian's hands-on checks: clickpad, power confirmation, Chromium caption colour;
+  - merge `work/compositor-refactor` once its agent has rebased it onto main (it conflicted with power-guard's launcher edits).
+
 **Ready, not deployed: `work/compositor-refactor` (`c5fab410`, rebased on main 73409c2a; trial merge with work/shell-opaque is clean).**
 - **Stages done:**
   - 0.1: one shell-surface list;
