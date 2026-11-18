@@ -145,6 +145,15 @@ Max CPUs: 64 (SCHED_MAX_CPUS).
 
 All three are interrupt-safe ticket locks (CLI on acquire, restore IF on release).
 
+Under a hypervisor (CPUID.1:ECX[31]) they are claimed unfairly: a CAS on the
+ticket counters that succeeds only when no ticket is outstanding, with a FIFO
+fallback after 65,536 failed checks (`sched_lock_claim.h`). This avoids handing
+the lock to a descheduled vCPU. Bare metal keeps FIFO tickets; `sched lock-mode`
+switches at runtime. Idle timer ticks skip the ready lock while the lock-free
+ready hint is zero (`sched idle-skip`). `sched lock-stats` reports hold, wait
+and handoff histograms and per-site totals. See
+[the convoy note](../../../docs/sched-lock-convoy.md).
+
 **Lock ordering:** Code that needs both `g_readyLock` and `g_allProcLock` must
 acquire `g_readyLock` first (see `SchedulerSwitchPolicy`). However, most paths
 acquire them independently. `ReapTerminated` drops `g_allProcLock` before calling

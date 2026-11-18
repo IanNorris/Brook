@@ -1,8 +1,14 @@
 // Included by scheduler.cpp and the hosted actual-body lifetime regression.
 // Caller is the idle BSP, after releasing its dispatch ready-lock acquisition.
+static uint64_t g_readyStallLastLog = 0;
+// Lets an idle tick skip the ready lock without starving this detector.
+[[maybe_unused]] static bool PersistentReadyStallDue()
+{
+    return ApicTickCount() - g_readyStallLastLog >= 500;
+}
 static void ReportPersistentReadyStall(uint32_t cpu, uint32_t readyN)
 {
-    static uint64_t lastLog = 0;
+    uint64_t& lastLog = g_readyStallLastLog;
     static uint16_t lastPid = SCHED_PID_NONE;
     static uint64_t lastIncarnation = 0;
     const uint64_t now = ApicTickCount();

@@ -60,15 +60,20 @@ public:
     // Compatibility observation-only entry for helpers without a wait ticket.
     template<class Serving,class Hint> void Observe(unsigned cpu,Serving serving,Hint hint){
         bool spent=false;
-        ObserveImpl(cpu,serving,hint,false,0,spent,[](unsigned,int64_t*){return false;},[]{return uint64_t(0);});
+        ObserveImpl(cpu,serving,hint,false,0,false,spent,[](unsigned,int64_t*){return false;},[]{return uint64_t(0);});
     }
     template<class Serving,class Hint,class Yield,class Flags>
     void ObserveWait(unsigned cpu,uint32_t ticket,bool& spent,Serving serving,Hint hint,Yield yield,Flags flags){
-        ObserveImpl(cpu,serving,hint,true,ticket,spent,yield,flags);
+        ObserveImpl(cpu,serving,hint,true,ticket,true,spent,yield,flags);
+    }
+    // Unfair claim spin: no reserved ticket, but the same bounded owner hint.
+    template<class Serving,class Hint,class Yield,class Flags>
+    void ObserveUnfairWait(unsigned cpu,bool& spent,Serving serving,Hint hint,Yield yield,Flags flags){
+        ObserveImpl(cpu,serving,hint,false,0,true,spent,yield,flags);
     }
 private:
     template<class Serving,class Hint,class Yield,class Flags>
-    void ObserveImpl(unsigned cpu,Serving serving,Hint hint,bool hasTicket,uint32_t ticket,bool& spent,Yield yield,Flags flags){
+    void ObserveImpl(unsigned cpu,Serving serving,Hint hint,bool hasTicket,uint32_t ticket,bool mayYield,bool& spent,Yield yield,Flags flags){
         if(cpu>=64 || !Enabled())return;
         auto& c=cpu_[cpu].value;Increment(c.observations);
         const uint32_t before=serving();const auto owner=Owner();
@@ -87,7 +92,7 @@ private:
             }
         }
         Increment(c.kind[unsigned(result)]);
-        if(result!=OwnerWaitObservation::Preempted || !hasTicket || !YieldEnabled())return;
+        if(result!=OwnerWaitObservation::Preempted || !mayYield || !YieldEnabled())return;
         Increment(c.hintEligible);
         if(spent){Increment(c.hintBudgetExhausted);return;}
         const uint64_t beforeFlags=flags();
