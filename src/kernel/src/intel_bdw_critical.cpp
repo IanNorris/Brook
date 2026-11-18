@@ -455,20 +455,49 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 renderResult->entryRefusal=BdwRenderRefusalPageEvidence;renderResult->entryDetail=index;return false;}++index;}}
             held.clearTypes();
             GtOwner gt{held,khz};
-            struct RenderOwner {
+            struct RenderOwner final : BdwSubmitSampler {
                 Io& io;GtOwner& gt;BdwRenderRunResult& result;uint32_t khz,line;uint64_t origin;uint32_t budget=4000000;
                 bool patActive=false,gtReady=false,fault=false;
                 bool firstCompletionPoll=true,firstRetirementPoll=true;
                 unsigned gtInitCalls=0;
+                RenderOwner(Io& i,GtOwner& g,BdwRenderRunResult& r,uint32_t k,uint32_t l,uint64_t o)
+                    :io(i),gt(g),result(r),khz(k),line(l),origin(o){}
                 bool owned(){return gt.owned();}
                 bool quiescent(){
                     struct Reader {RenderOwner& o;bool owned(){return o.owned();}
                         bool read(uint32_t r,uint32_t& v){return o.io.read32(BdwDellBar0+r,v);}} reader{*this};
-                    return owned() && BdwObserveEngine(reader,0x2000).submissionQuiescent;
+                    if(!owned())return false;
+                    const auto observed=BdwObserveEngine(reader,0x2000);
+                    if(!observed.submissionQuiescent){
+                        // Hang diagnostics: keep the last refusing sample (no extra MMIO).
+                        auto& d=result.diag;++d.nonQuiescent;const auto& f=observed.first;
+                        d.busy={f.head,f.tail,f.mode,f.control,f.execlistLo,f.execlistHi,f.submissionMode};
+                    }
+                    return observed.submissionQuiescent;
+                }
+                // Hang diagnostics around the ELSP write: reads only, all on
+                // pages this critical section audited (RCS, 0xa000, 0x130000,
+                // 0x138000). EXECLIST_STATUS_LO/HI, RING_CONTEXT_STATUS_PTR,
+                // GEN6_RC_STATE, GEN6_GT_CORE_STATUS, FORCEWAKE_ACK_HSW.
+                void sampleBefore(BdwSubmitSample& s) override {
+                    io.tsc(s.tsc);
+                    s.valid=owned() && io.read32(BdwDellBar0+0x2234,s.execlistLo) && io.read32(BdwDellBar0+0x23a0,s.csbPtr) &&
+                        io.read32(BdwDellBar0+0xa094,s.rcState) && io.read32(BdwDellBar0+0x138060,s.coreStatus) &&
+                        io.read32(BdwDellBar0+0x130044,s.fwAck);
+                }
+                void sampleAfter(BdwSubmitSample& s) override {
+                    io.tsc(s.tsc);
+                    s.valid=owned() && io.read32(BdwDellBar0+0x2234,s.execlistLo) && io.read32(BdwDellBar0+0x2238,s.execlistHi) &&
+                        io.read32(BdwDellBar0+0x23a0,s.csbPtr);
                 }
                 bool allEnginesQuiescent(){return quiescent();} // others held idle under claim
                 bool monotonicMs(uint64_t& ms){uint64_t t=0;if(!io.tsc(t) || t<origin)return false;ms=(t-origin)/khz;return true;}
-                bool inTime(){uint64_t ms=0;return budget && --budget && monotonicMs(ms) && ms<2000;}
+                // Hang diagnostics: diag.deadline 1 = poll budget, 2 = clock, 3 = 2000 ms elapsed.
+                bool inTime(){uint64_t ms=0;
+                    if(!(budget && --budget)){result.diag.deadline=1;return false;}
+                    if(!monotonicMs(ms)){result.diag.deadline=2;return false;}
+                    if(ms>=2000){result.diag.deadline=3;return false;}
+                    return true;}
                 BdwPollPacer completionPacer{},retirementPacer{};BdwPollPacer* pacer=nullptr;
                 void beginPacer(BdwPollPacer& p,uint64_t expected,uint64_t spinBudget){
                     uint64_t now=0;io.tsc(now);
@@ -596,6 +625,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwResetPage));
                     const auto r=reset.reset(intent);gtReady=false;
                     if(r==BdwBcsResetResult::Uncertain)fault=true;
+                    (intent==BdwBcsResetIntent::IdleTakeover?result.diag.takeoverReset:result.diag.stopReset)=uint8_t(uint8_t(r)+1);
                     return r==BdwBcsResetResult::DomainAcknowledged;
                 }
                 bool admitPages(BdwOwnedPage* p,unsigned count){
@@ -639,6 +669,8 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             BdwRenderDeviceBackend<RenderOwner> backend(owner,reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+0xf6880000ull),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwOtherEnginePages[0]),scratchIndex,copyToken,scratchDma,rebased?2:1);
+            renderResult->diag.originTsc=owner.origin;
+            backend.attachDiag(&renderResult->diag,&owner);
             struct Transaction {
                 RenderOwner& o;BdwRenderDeviceBackend<RenderOwner>& backend;BdwRenderRunResult& result;
                 uint64_t scratch;uint32_t (&snapshot)[20*1024];bool rebased;BdwPatLease lease;
@@ -706,6 +738,21 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         o.io.read32(BdwDellBar0+0x2064,result.ipeir) && o.io.read32(BdwDellBar0+0x2068,result.ipehr) &&
                         o.io.read32(BdwDellBar0+0x2234,result.execlist);
                     if(result.engineSampled){(void)o.io.read32(BdwDellBar0+0x20b0,result.eir);(void)o.io.read32(BdwDellBar0+0x20b8,result.esr);}
+                    result.diag.runEndTsc=BdwHangTsc();
+                    // Failure capture before the engine reset in resetAfter():
+                    // register reads on audited pages, flushed CPU reads of the
+                    // private pages, GGTT PTE reads. Nothing is written.
+                    if(result.hangCapture && (!ok || result.hangCaptureAlways)){
+                        struct CaptureIo {RenderOwner& o;BdwRenderDeviceBackend<RenderOwner>& b;
+                            bool reg(uint32_t off,uint32_t& v){return o.owned() && o.io.read32(BdwDellBar0+off,v);}
+                            const uint8_t* page(unsigned i){return b.diagPage(i);}
+                            bool pte(unsigned i,uint64_t& v){return b.diagPte(i,v);}
+                            uint64_t dma(unsigned i){return b.diagDma(i);}
+                        } captureIo{o,backend};
+                        BdwHangClear(*result.hangCapture);
+                        BdwHangCaptureDevice(captureIo,*result.hangCapture);
+                        result.diag.captured=true;
+                    }
                     return ok;});}
                 bool saveContext(){return BdwTimedTransaction(result,3,[&](){return rebased?BdwCopyRebasedRenderContext(backend,snapshot):BdwCopyRetainedRenderContext(backend,snapshot);});}
                 bool resetAfter(){return BdwTimedTransaction(result,4,[&](){

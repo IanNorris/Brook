@@ -1052,6 +1052,8 @@ add_host_test(test_intel_bdw_publish)
 target_compile_options(test_intel_bdw_publish PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_csb)
 target_compile_options(test_intel_bdw_csb PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_hang_diag)
+target_compile_options(test_intel_bdw_hang_diag PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_pte_owner_sidecars)
 target_compile_options(test_pte_owner_sidecars PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 

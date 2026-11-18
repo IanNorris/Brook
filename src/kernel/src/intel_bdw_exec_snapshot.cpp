@@ -398,7 +398,7 @@ bool BdwExecSnapshotAdoptRenderImage(BdwExecSnapshot* s,const BdwPpgttMapping* c
     s->preparedFlags&=~1u;
     if(!BdwExecSnapshotMatchesMappings(s,cached,cachedCount))return false;
     uint32_t next[56]{};
-    if(!BdwBuildRenderRing(BdwExecSnapshotBatchAddress(s),completion,nonce,true,gt3,next))return false;
+    if(!BdwBuildRenderRing(BdwExecSnapshotBatchAddress(s),completion,nonce,true,gt3,next,BdwHangStartedMarkerEnabled()))return false;
     for(unsigned i=0;i<56;++i)ring[i]=next[i];
     s->preparedFlags|=1u;return true;
 }
@@ -420,7 +420,7 @@ bool BdwExecSnapshotBuildRenderImage(BdwExecSnapshot* s,const BdwPpgttPage (&scr
     for(unsigned i=0;i<4;++i)if(overlaps(reinterpret_cast<uintptr_t>(scratch[i].cpu),4096))return false;
     for(uint32_t i=0;i<tableCount;++i)if(overlaps(reinterpret_cast<uintptr_t>(tables[i].cpu),4096))return false;
     uint32_t next[56]{};
-    if(!BdwBuildRenderRing(BdwExecSnapshotBatchAddress(s),completion,nonce,true,gt3,next) ||
+    if(!BdwBuildRenderRing(BdwExecSnapshotBatchAddress(s),completion,nonce,true,gt3,next,BdwHangStartedMarkerEnabled()) ||
        !BdwExecSnapshotBuildPpgtt(s,scratch,tables,tableCount,workspace,workspaceCount))return false;
     for(unsigned i=0;i<56;++i)ring[i]=next[i];
     return true;

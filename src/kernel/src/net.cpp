@@ -110,6 +110,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "frame_timing_reply.h"
 #include "compat_census_runtime.h"
 #include "lastlog.h"
+#include "intel_bdw_hang_diag.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -5559,6 +5560,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
             "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
+            "  gpu hang [status|last|ring [n]|reference arm|reference|marker on|off] - RCS hang breadcrumbs and pre-reset capture\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
             "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
@@ -6646,6 +6648,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"scope\":\"on (default) = one MTRR/PAT/CR0 observation window per critical-section audit; off = the previous per-page observation; results are identical by construction\"}\n");r.send();
     }
     else if(LastLogHandleCommand(cmd)) {}
+    else if(BdwHangHandleCommand(cmd)) {}
     else if(NetStrEq(cmd,"compat census reset")) {
         CompatCensusReset();
         DebugChannelSend("{\"reset\":true,\"scope\":\"compat census tables cleared; concurrent hits may be lost\"}\n");
