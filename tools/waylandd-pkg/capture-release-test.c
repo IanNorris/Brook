@@ -648,7 +648,8 @@ static void check_gpu_window_xwayland(void)
     assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
     assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
     /* Paired and mapped: one GPU offer, no CPU copy, released after SAFE. */
-    const uint64_t offers=g_gpu_xwayland_offers,noRoot=g_gpu_offer_no_root,ready=g_intel_ready;
+    const uint64_t offers=g_gpu_xwayland_offers,noRoot=g_gpu_offer_no_root,ready=g_intel_ready,early=g_pace_early_callbacks;
+    surface_frame(client,root.resource,4);
     surface_attach(client,root.resource,first,0,0);surface_commit(client,root.resource);
     struct brook_view *view=root.tree.current->value;struct brook_buffer *held=view->image->source;++held->refs;
     intel_pending_poll();
@@ -656,13 +657,18 @@ static void check_gpu_window_xwayland(void)
     struct BrookGpuWindowPacket offer={0};int fds[2];assert(brook_gpu_window_receive(channel[1],&offer,fds)==1);
     assert(offer.type==BROOK_GPU_WINDOW_OFFER && offer.identity.window==1 && offer.width==1 && offer.fourcc==0x34325258);
     close(fds[0]);close(fds[1]);
+    /* Xwayland pacing: the frame callback is released with the offer, before
+     * the renderer reports PRESENTED (BROOK_WAYLAND_XWAYLAND_FRAME). */
+    wl_display_flush_clients(display);
+    assert(g_pace_early_callbacks==early+1 && count_events(clientSockets[1],4,WL_CALLBACK_DONE)==1);
+    assert(g_pace[1][PACE_OFFER].count && g_pace[1][PACE_CALLBACK].count);
     assert(brook_gpu_window_send_safe(channel[1],&offer.identity)==1);
     intel_pending_poll();assert(!g_intel_pending_count && !held->uses);(void)ready;
     wl_display_flush_clients(display);assert(count_events(clientSockets[1],2,WL_BUFFER_RELEASE)==1);
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
     /* A native resize to 2x2 is pending: the 1x1 buffer is not offered. */
     const uint64_t waits=g_gpu_xwayland_resize_wait;xw.target_width=xw.target_height=2;
-    struct wl_resource *second=retained_test_buffer(client,4);
+    struct wl_resource *second=retained_test_buffer(client,5);
     surface_attach(client,root.resource,second,0,0);surface_commit(client,root.resource);
     view=root.tree.current->value;held=view->image->source;++held->refs;
     intel_pending_poll();
@@ -673,7 +679,7 @@ static void check_gpu_window_xwayland(void)
     xw.target_width=xw.target_height=0;
     /* Unpaired (serial mismatch): not a window root, so no offer. */
     xw.state.serial=10;
-    struct wl_resource *third=retained_test_buffer(client,5);
+    struct wl_resource *third=retained_test_buffer(client,6);
     surface_attach(client,root.resource,third,0,0);surface_commit(client,root.resource);
     view=root.tree.current->value;held=view->image->source;++held->refs;
     intel_pending_poll();
@@ -683,6 +689,56 @@ static void check_gpu_window_xwayland(void)
     bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
     root.xwindow=NULL;
     free(root.composite);g_surfaces=NULL;g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
+    close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
+    unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
+    wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
+}
+/* A Y-tiled Xwayland buffer is offered as a one-layer version 3 commit
+ * flagged TILED_Y (never as a version 2 linear offer). */
+static void check_gpu_window_tiled(void)
+{
+    int clientSockets[2],channel[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,clientSockets));
+    assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel));
+    struct wl_display *display=wl_display_create();assert(display);
+    struct wl_client *client=wl_client_create(display,clientSockets[0]);assert(client);
+    struct wl_resource *first=retained_test_buffer(client,2);
+    struct brook_dmabuf_buffer *db=wl_resource_get_user_data(first);
+    db->stride=128;db->modifier=BROOK_DRM_MOD_I915_Y_TILED;
+    struct brook_surface root={0};surface_tree_init(&root);
+    root.resource=wl_resource_create(client,&wl_surface_interface,4,3);assert(root.resource);
+    wl_resource_set_user_data(root.resource,&root);
+    struct brook_xwindow xw={0};xw.state.flags=BXWM_MAPPED;xw.state.serial=9;xw.state.width=xw.state.height=1;
+    xw.surface=&root;xw.native_valid=1;
+    root.role=4;root.xwindow=&xw;root.xwayland_serial=9;root.xwayland_generation=g_xwayland_generation;g_xwm_failed=0;
+    uint32_t vfb=0;root.wm_id=1;root.vfb=&vfb;root.vfb_w=root.vfb_h=root.vfb_stride=1;
+    root.scene_disabled=1;g_surfaces=&root;
+    char path[]="/tmp/brook-tiled-test-XXXXXX";g_drm_fd=mkstemp(path);assert(g_drm_fd>=0);unlink(path);assert(!ftruncate(g_drm_fd,4096));
+    g_drm_intel=1;g_gpu_window_channel=channel[0];window_stale=0;
+    assert(!setenv("BROOK_WAYLAND_INTEL_ASYNC","1",1));assert(!setenv("BROOK_WAYLAND_SNAPSHOT_FENCE","1",1));
+    assert(!setenv("BROOK_WAYLAND_GPU_SOCKET","/tmp/fake-consumer",1));
+    surface_attach(client,root.resource,first,0,0);surface_commit(client,root.resource);
+    struct brook_view *view=root.tree.current->value;struct brook_buffer *held=view->image->source;++held->refs;
+    intel_pending_poll();assert(view->image->offer_state==1);
+    struct BrookGpuWindowLayersPacket got;int fds[16];unsigned nfds=0;
+    assert(brook_gpu_window_receive_layers(channel[1],&got,fds,&nfds)==1 && nfds==2);
+    for(unsigned k=0;k<nfds;++k)close(fds[k]);
+    assert(got.header.version==BROOK_GPU_WINDOW_WIRE_VERSION_LAYERS && got.count==1);
+    assert((got.layers[0].flags&BROOK_GPU_WINDOW_LAYER_TILING)==BROOK_GPU_WINDOW_LAYER_TILED_Y && got.layers[0].stride==32);
+    assert(brook_gpu_window_layer_modifier(got.layers[0].flags)==BROOK_DRM_MOD_I915_Y_TILED);
+    assert(brook_gpu_window_send_reply(channel[1],got.header.version,BROOK_GPU_WINDOW_SAFE,&got.header.identity)==1);
+    intel_pending_poll();
+    bt_state_set(&root.tree.current,NULL);bt_state_set(&root.tree.latest,NULL);buffer_drop(held);
+    root.xwindow=NULL;free(root.composite);g_surfaces=NULL;close(g_drm_fd);
+    /* CPU fallback: a 40x40 Y-tiled buffer (pitch 256 bytes) detiles exactly. */
+    char tpath[]="/tmp/brook-tiled-copy-XXXXXX";g_drm_fd=mkstemp(tpath);assert(g_drm_fd>=0);unlink(tpath);
+    uint8_t *raw=calloc(1,16384);assert(raw);
+    for(uint32_t y=0;y<40;++y)for(uint32_t x=0;x<40;++x){uint32_t v=0xff000000u|(y<<8)|x;memcpy(raw+brook_tiled_offset(BROOK_TILING_Y,256,x,y),&v,4);}
+    assert(write(g_drm_fd,raw,16384)==16384);free(raw);
+    struct brook_dmabuf_buffer tdb={.width=40,.height=40,.stride=256,.bo_handle=7,.fourcc=0x34325258,.modifier=BROOK_DRM_MOD_I915_Y_TILED};
+    struct brook_image *image=intel_dmabuf_copy(&tdb);assert(image && image->pixels);
+    for(uint32_t y=0;y<40;++y)for(uint32_t x=0;x<40;++x)assert((image->pixels[y*40+x]&0xffffu)==((y<<8)|x));
+    image_unref(image);
+    g_drm_intel=0;close(g_drm_fd);g_drm_fd=-1;
     close(channel[1]);gpu_window_channel_lost();gpu_window_reap_dead();
     unsetenv("BROOK_WAYLAND_INTEL_ASYNC");unsetenv("BROOK_WAYLAND_SNAPSHOT_FENCE");unsetenv("BROOK_WAYLAND_GPU_SOCKET");
     wl_client_destroy(client);close(clientSockets[1]);wl_display_destroy(display);
@@ -867,6 +923,7 @@ int main(void)
     check_gpu_window_opaque();
     check_gpu_window_scaled();
     check_gpu_window_xwayland();
+    check_gpu_window_tiled();
     check_decoration_policy();
     check_intel_direct(0);check_intel_direct(2);check_intel_direct(3);check_intel_direct(1);
 #endif

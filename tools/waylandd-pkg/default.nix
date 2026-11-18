@@ -35,6 +35,7 @@ stdenv.mkDerivation {
     cp ${../../src/shared/gpu_buffer_abi.h} "$sourceRoot/gpu_buffer_abi.h"
     cp ${../../src/shared/gpu_window_source_abi.h} "$sourceRoot/gpu_window_source_abi.h"
     cp ${../../src/shared/gpu_window_channel.h} "$sourceRoot/gpu_window_channel.h"
+    cp ${../../src/shared/intel_tiling.h} "$sourceRoot/intel-tiling.h"
     ${if enableVulkanCompositor then ''
       cp ${../vulkan-compositor-pkg/renderer.c} "$sourceRoot/renderer.c"
       cp ${../vulkan-compositor-pkg/renderer.h} "$sourceRoot/renderer.h"

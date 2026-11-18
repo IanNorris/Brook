@@ -35,6 +35,8 @@ struct brook_image {
     unsigned group_refs;uint32_t group_wait_ms,queued_ms;
     uint64_t offer_tree_commit;
     int gem_fd,gem_fence;uint32_t gem_handle;uint64_t gem_words;
+    uint64_t pace_commit_us,pace_offer_us; /* frame pacing (waylandd.c) */
+    int pace_x11;
 };
 static void image_gem_free(struct brook_image *image);
 static long scene_ctl(int fd,unsigned op,const void *arg,size_t size) {

@@ -18,6 +18,8 @@ struct BrookVkGraphicsBuffer {
  * external synchronization. One instance owns at most one pending frame. */
 BrookVkGraphicsPass *brook_vk_graphics_pass_create(VkPhysicalDevice,VkDevice,VkQueue,uint32_t queueFamily);
 /* Borrowed handles: the renderer must outlive every pass created from them. */
+/* The device enabled VK_EXT_image_drm_format_modifier (tiled sources). */
+int brook_vk_renderer_modifiers(const BrookVkRenderer *);
 int brook_vk_renderer_graphics_context(BrookVkRenderer *,VkPhysicalDevice *,VkDevice *,VkQueue *,uint32_t *);
 /* bg must cover the whole output and be opaque. Output is a distinct,
  * caller-reserved OS buffer. Every FD, producer lease and output ticket must

@@ -42,6 +42,20 @@
 #define BROOK_GPU_WINDOW_LAYERS_MAX 8u
 /* The layer's pixels all have alpha 255 (XRGB or known-opaque). */
 #define BROOK_GPU_WINDOW_LAYER_OPAQUE 1u
+/* The layer's buffer is Intel X- or Y-tiled (I915_FORMAT_MOD_X_TILED /
+ * Y_TILED, no bit-6 swizzle on Gen8+), not linear. stride is the pitch in
+ * pixels (a multiple of 128 for X, 32 for Y) and words covers whole tile
+ * rows (8 for X, 32 for Y). At most one of the two is set. Version 3 only;
+ * a renderer that does not sample the layout must not select the offer. */
+#define BROOK_GPU_WINDOW_LAYER_TILED_X 2u
+#define BROOK_GPU_WINDOW_LAYER_TILED_Y 4u
+#define BROOK_GPU_WINDOW_LAYER_TILING (BROOK_GPU_WINDOW_LAYER_TILED_X|BROOK_GPU_WINDOW_LAYER_TILED_Y)
+#define BROOK_DRM_MOD_I915_X_TILED 0x0100000000000001ull
+#define BROOK_DRM_MOD_I915_Y_TILED 0x0100000000000002ull
+static inline uint64_t brook_gpu_window_layer_modifier(uint32_t flags){
+    return (flags&BROOK_GPU_WINDOW_LAYER_TILED_X)?BROOK_DRM_MOD_I915_X_TILED:
+        (flags&BROOK_GPU_WINDOW_LAYER_TILED_Y)?BROOK_DRM_MOD_I915_Y_TILED:0;
+}
 #define BROOK_GPU_WINDOW_OFFER 1u
 #define BROOK_GPU_WINDOW_SAFE 2u
 #define BROOK_GPU_WINDOW_PRESENTED 3u
@@ -141,8 +155,15 @@ struct BrookGpuWindowLayersPacket {
 static inline int brook_gpu_window_layer_valid(const struct BrookGpuWindowLayer *l){
     if(!l || !l->words || l->words>UINT32_MAX || !l->width || !l->height || l->width>16384 || l->height>16384 ||
        l->stride<l->width || l->stride>16384 || (l->fourcc!=0x34325241 && l->fourcc!=0x34325258) ||
-       (l->flags&~BROOK_GPU_WINDOW_LAYER_OPAQUE) || !l->inode ||
+       (l->flags&~(BROOK_GPU_WINDOW_LAYER_OPAQUE|BROOK_GPU_WINDOW_LAYER_TILING)) || !l->inode ||
        (uint64_t)l->offset+(uint64_t)(l->height-1)*l->stride+l->width>l->words)return 0;
+    if(l->flags&BROOK_GPU_WINDOW_LAYER_TILING){
+        const int x=(l->flags&BROOK_GPU_WINDOW_LAYER_TILED_X)!=0;
+        if((l->flags&BROOK_GPU_WINDOW_LAYER_TILING)==BROOK_GPU_WINDOW_LAYER_TILING || (l->offset&1023u) ||
+           (l->stride&(x?127u:31u)))return 0;
+        const uint64_t rows=((uint64_t)l->height+(x?7u:31u))&~(uint64_t)(x?7u:31u);
+        if((uint64_t)l->offset+rows*l->stride>l->words)return 0;
+    }
     if(!l->srcWidth || !l->srcHeight || (uint64_t)l->srcX+l->srcWidth>l->width || (uint64_t)l->srcY+l->srcHeight>l->height)return 0;
     return l->dstWidth && l->dstHeight && l->dstWidth<=16384 && l->dstHeight<=16384 &&
         l->dstX>-16384 && l->dstX<16384 && l->dstY>-16384 && l->dstY<16384;

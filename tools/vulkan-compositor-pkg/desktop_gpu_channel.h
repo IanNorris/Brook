@@ -26,7 +26,7 @@
 /* Version 3 offers carry layers (count>0): layer 0's buffer and fence are
  * buffer/fence; extraBuffer/extraFence[i-1] hold layer i. */
 struct DesktopGpuOffer {struct BrookGpuWindowPacket packet;int buffer,fence,state;uint64_t frame,receivedNs;
-    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed;
+    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed,retire;
     unsigned layers;struct BrookGpuWindowLayer layer[BROOK_GPU_WINDOW_LAYERS_MAX];
     int extraBuffer[BROOK_GPU_WINDOW_LAYERS_MAX-1],extraFence[BROOK_GPU_WINDOW_LAYERS_MAX-1];};
 static inline void desktop_gpu_offer_free(struct DesktopGpuOffer *o){
@@ -188,10 +188,23 @@ static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
 /* Why a window that has an offer was not drawn from it this frame (stats
  * JSON "gpu_select"). Counted only for windows with at least one offer. */
 enum {DESKTOP_GPU_SELECTED,DESKTOP_GPU_REFUSE_SHAPE,DESKTOP_GPU_REFUSE_NO_CANDIDATE,DESKTOP_GPU_REFUSE_FAILED,
-      DESKTOP_GPU_REFUSE_SNAPSHOT_NEWER,DESKTOP_GPU_REFUSE_VALIDATE,DESKTOP_GPU_REFUSE_USES,DESKTOP_GPU_SELECT_REASONS};
+      DESKTOP_GPU_REFUSE_SNAPSHOT_NEWER,DESKTOP_GPU_REFUSE_VALIDATE,DESKTOP_GPU_REFUSE_USES,DESKTOP_GPU_REFUSE_TILED,
+      DESKTOP_GPU_SELECT_REASONS};
 static uint64_t g_desktopGpuSelect[DESKTOP_GPU_SELECT_REASONS];
 static const char *const desktop_gpu_select_names[DESKTOP_GPU_SELECT_REASONS]={"selected","shape","no_candidate","failed",
-    "snapshot_newer","validate","uses_full"};
+    "snapshot_newer","validate","uses_full","tiled"};
+/* Set by the renderer for each frame: the frame is drawn by the quad pass on
+ * a device that samples DRM format modifiers. Only then may an offer with an
+ * X/Y-tiled layer be selected; other paths read sources as linear, so such
+ * a window keeps the provider's (detiled) CPU source. */
+static int g_desktopGpuTiledOk;
+static inline uint64_t desktop_gpu_offer_modifier(const struct DesktopGpuOffer *o,unsigned i){
+    return o && o->layers && i<o->layers?brook_gpu_window_layer_modifier(o->layer[i].flags):0;
+}
+static inline int desktop_gpu_offer_tiled(const struct DesktopGpuOffer *o){
+    for(unsigned i=0;o && i<o->layers;++i)if(o->layer[i].flags&BROOK_GPU_WINDOW_LAYER_TILING)return 1;
+    return 0;
+}
 /* Layer i of a version 3 offer as a scene layer: window VFB coordinates are
  * placed at the client origin and clipped to the client rectangle cropped to
  * the VFB (the CPU source's 1:1 crop), intersected with the screen. */
@@ -271,6 +284,8 @@ static inline struct DesktopGpuOffer *desktop_gpu_channel_select(struct DesktopG
             best->packet.identity.window,(unsigned long long)best->packet.identity.incarnation,(unsigned long long)best->packet.identity.commit);
         ++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_FAILED];return NULL;
     }
+    if(desktop_gpu_offer_tiled(best) && !g_desktopGpuTiledOk){
+        best->failed=best->retire=1;best->current=0;++g_desktopGpuSelect[DESKTOP_GPU_REFUSE_TILED];return NULL;}
     if(desktop_gpu_offer_retained(best) && best->current){
         /* The provider repaints its CPU buffer only when the GPU source can
          * no longer represent the window (for example a new subsurface or a
@@ -337,6 +352,10 @@ static inline void desktop_gpu_channel_presented(struct DesktopGpuChannel *c,uin
 static inline int desktop_gpu_offer_dead(struct DesktopGpuChannel *c,const struct DesktopGpuOffer *o,uint64_t frame){
     const struct BrookGpuWindowIdentity *id=&o->packet.identity;
     if(!id->window || id->window>BROOK_DESKTOP_LAYER_LIMIT)return 1;
+    /* A tiled offer this renderer cannot draw is never selected again; once
+     * no frame uses it, SAFE lets the provider fall back to its detiled CPU
+     * source instead of leaving the window on a stale VFB. */
+    if(o->retire)return 1;
     if(c->snapshot[id->window-1].incarnation==id->incarnation && id->commit<=c->snapshot[id->window-1].commit)return 1;
     if(!o->current){
         if(c->presented[id->window-1].incarnation==id->incarnation && id->commit<=c->presented[id->window-1].commit)return 1;

@@ -326,9 +326,12 @@ static void EpollDiagAdd(EpollDiagSnapshot* row, EpollDiagCounter metric) {
 static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
                           EpollEvent* events, int maxevents, EpollDiagSnapshot* diag,
                           uint64_t eventsAddr) {
+    int n = 0;
+    uint64_t ctlGeneration = 0;
+    {
     EpollGraphGuard guard;
     walk->clearMemo();
-    int n = 0;
+    ctlGeneration = ep->ctlGeneration;
     for (int i = 0; i < ep->count && n < maxevents; i++) {
         auto e = ep->entries[i];
         if (e.fd < 0) continue;
@@ -352,7 +355,20 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
             }
         }
     }
+    }
+    // Copy out without the global graph mutex. CopyToUser takes the caller's
+    // address-space mutation lock per page and may fault; holding the graph
+    // lock across it made every epoll user in the system wait behind one
+    // contended process (Dell gen 427, Torchlight II: waylandd spent ~6 s of
+    // 10 s blocked on this mutex). The walk keeps the watched fds pinned.
     if (n && !CopyToUser(eventsAddr, events, sizeof(EpollEvent) * n)) return -EFAULT;
+    bool commit = false;
+    for (int i = 0; i < n && !commit; ++i) commit = walk->deliveries[i].eventFd.identity != 0;
+    if (!commit) return n;
+    EpollGraphGuard guard;
+    // An epoll_ctl in between may have replaced an entry. Skipping the commit
+    // can only re-report an edge (a spurious wakeup), never lose one.
+    if (ep->ctlGeneration != ctlGeneration) return n;
     for (int i = 0; i < n; ++i) {
         const auto& delivery = walk->deliveries[i];
         if (!delivery.eventFd.identity) continue;
@@ -383,6 +399,7 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
     ep->count = 0;
     ep->refCount = 1;
     ep->waiter = nullptr;
+    ep->ctlGeneration = 0;
 
     // Published complete with EPOLL_CLOEXEC (L-57).
     int fd = FdAlloc(proc, FdType::EpollFd, ep, 2, 0, (flagsVal & 0x80000) ? 1 : 0);
@@ -432,6 +449,7 @@ int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     EpollWalkOwner state(proc);
     if (!state.walk) return -ENOMEM;
     EpollGraphGuard guard;
+    ++ep->ctlGeneration;
     int existing = -1, free = -1;
     for (int i = 0; i < EPOLL_MAX_FDS; i++) {
         if (ep->entries[i].fd == static_cast<int>(watchfd)) existing = i;

@@ -30,7 +30,7 @@ struct BrookVkRenderer {
     VkPipelineLayout pipelineLayout; VkPipeline pipeline; VkShaderModule shader;
     VkCommandPool pool; VkCommandBuffer command; VkFence fence;
     VkQueryPool timestampPool;uint32_t timestampBits;uint64_t gpuTimestampNs;int gpuTimestampValid,timestampPending,timestampDispatchOnly;
-    VkPhysicalDeviceProperties properties; size_t maxWords; uint32_t maxTiles; int quarantined,pending,external,syncSupported;
+    VkPhysicalDeviceProperties properties; size_t maxWords; uint32_t maxTiles; int quarantined,pending,external,syncSupported,modifiers;
     uint32_t family; VkBuffer source; VkDeviceMemory sourceMemory; VkSemaphore sourceSemaphore;
     VkBuffer multiSource[BROOK_VK_MAX_LAYERS+1]; VkDeviceMemory multiMemory[BROOK_VK_MAX_LAYERS+1];
     VkSemaphore multiSemaphore[BROOK_VK_MAX_LAYERS]; uint32_t multiCount;
@@ -173,8 +173,11 @@ static BrookVkRenderer *renderer_create(size_t maxWords,int allowSoftware,int ex
     float priority=1;
     VkDeviceQueueCreateInfo qi={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
-    const char *extensions[]={VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-                              VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME};
+    /* The DRM format modifier pair is optional and only enabled together:
+     * it lets the quad pass sample Intel X/Y-tiled client buffers. */
+    const char *extensions[5]={VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+                              VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,NULL,NULL};
+    int formatList=0,drmModifier=0;
     uint32_t extensionCount=0;
     if(external){
         uint32_t n=0;VK_OK(vkEnumerateDeviceExtensionProperties(r->physical,NULL,&n,NULL));
@@ -186,9 +189,17 @@ static BrookVkRenderer *renderer_create(size_t maxWords,int allowSoftware,int ex
             if(!strcmp(available[i].extensionName,extensions[0]))memoryFd=1;
             if(!strcmp(available[i].extensionName,extensions[1]))dmaBuf=1;
             if(!strcmp(available[i].extensionName,extensions[2]))r->syncSupported=1;
+            if(!strcmp(available[i].extensionName,VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME))formatList=1;
+            if(!strcmp(available[i].extensionName,VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME))drmModifier=1;
         }
         free(available);if(result!=VK_SUCCESS || !memoryFd || !dmaBuf)goto fail;
         extensionCount=r->syncSupported?3u:2u;
+        const char *tiled=getenv("BROOK_RENDER_TILED");
+        if(r->syncSupported && formatList && drmModifier && (!tiled || strcmp(tiled,"0"))){
+            extensions[extensionCount++]=VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
+            extensions[extensionCount++]=VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
+            r->modifiers=1;
+        }
     }
     VkPhysicalDeviceFeatures enabled={0};if(external>=2)enabled.shaderStorageBufferArrayDynamicIndexing=VK_TRUE;
     VkDeviceCreateInfo di={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qi,
@@ -272,6 +283,7 @@ BrookVkRenderer *brook_vk_renderer_create_batch_output(uint32_t maxTiles,int all
 }
 
 const char *brook_vk_renderer_device(const BrookVkRenderer *r) {return r?r->properties.deviceName:NULL;}
+int brook_vk_renderer_modifiers(const BrookVkRenderer *r){return r && r->modifiers;}
 int brook_vk_renderer_graphics_context(BrookVkRenderer *r,VkPhysicalDevice *physical,VkDevice *device,VkQueue *queue,uint32_t *family){
     if(!r || !physical || !device || !queue || !family || r->quarantined)return 0;
     uint32_t count=0;vkGetPhysicalDeviceQueueFamilyProperties(r->physical,&count,NULL);
