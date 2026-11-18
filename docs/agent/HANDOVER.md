@@ -15,6 +15,14 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **Legacy checkout:** `/data/Programming/Codex/Brook` and its `build/hardware/` evidence are reference only. Old disk images are being cleaned up separately.
 - **Build:** `nix-shell --run './scripts/build.sh Release'` from a clean checkout, then `ctest --test-dir build/release/host_tests`. `test_audio_delivery` and `test_sched_lock_owner` can time out under parallel load; rerun them alone.
 
+## SSD TRIM (18 November 2026)
+
+The isolated `work/ssd-trim` branch starts at integration32 (`7268f1b6`).
+The host-tested planner validates sector bounds and exclusions, intersects
+free bitmaps, and builds non-queued ATA DSM payloads. See
+[SSD TRIM](../ssd-trim.md) for remaining runtime admission, locking, QEMU and
+rollout work. No discard has been submitted and no Dell test was performed.
+
 ## Repository
 
 - Work from `main` (`dc12f39e` at the time of writing). On 13 November at about 23:31 UTC it absorbed both lines of the previous agent's work: the main checkout's long-uncommitted changes (`d6724e11`), and the private checkout `/tmp/brook-main-BrURO4` (`dcb99b97`, `bd0ae24b`).
