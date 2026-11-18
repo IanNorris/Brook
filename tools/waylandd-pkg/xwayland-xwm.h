@@ -239,13 +239,13 @@ static void xwayland_apply_fullscreen(struct brook_xwindow *w) {
         } else w->saved_maximized=0;
         w->saved_x=w->native.client_x;w->saved_y=w->native.client_y;
         w->saved_width=w->native.width;w->saved_height=w->native.height;
-        if (wm_set_decoration_mode(id,1,0,0)<0 ||
+        if (wm_set_decoration_mode(id,1,0,0,0)<0 ||
             syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)id,(long)w->native.incarnation,0L,0L,0L,0L)<0 ||
             !xwayland_resize_native(w,width,height)) { g_xwm_failed=1;return; }
         w->fullscreen=1;
     } else {
         w->fullscreen=0;
-        if (wm_set_decoration_mode(id,(w->state.flags&BXWM_CLIENT_CHROME)!=0,0,0)<0 ||
+        if (wm_set_decoration_mode(id,(w->state.flags&BXWM_CLIENT_CHROME)!=0,0,0,0)<0 ||
             !xwayland_resize_native(w,w->saved_width,w->saved_height) ||
             syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)id,(long)w->native.incarnation,
                 (long)w->saved_x,(long)w->saved_y,0L,0L)<0) { g_xwm_failed=1;return; }
