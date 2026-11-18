@@ -717,6 +717,9 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Deeper idle states (Ian, 18 Nov):** IdleLoop uses only `hlt`; the package sits in C2 (idle 56–58 °C at 3.3 W). Package C3+ would cut idle heat and battery use.
+- **GPU clock 600 MHz (18 Nov):** sustainable in Stardew (69–75 °C, ~10 W, no trips over 60 s; 27–29 → 39.2 displayed fps). 700 MHz reached 98–99 °C with an 11 W CPU burst and tripped the 90 °C guard. Fans stay near silent, so the EC is not ramping much. Candidate default for AC.
+- **CPU power while GPU-bound:** the cores draw 4.5–5 W at ~18% busy and 2.7 GHz turbo, sharing the package budget with the GPU.
 
 - **Clearwater side drawer (Ian, 15 Nov):** an edge drawer for social and messaging apps, where any window can be stashed for quick access. Sketch in `docs/design/clearwater-next/DESIGN.md` § Ideas backlog.
 - **Keyboard shortcuts (implemented on `work/shortcuts`, QEMU-verified, not yet on Dell):** Super tap toggles the launcher (Escape closes it), Super key-down revokes pointer capture, Alt+F4 sends the normal advisory close. State machine `src/kernel/src/global_shortcuts.h`, host test `test_global_shortcuts`; evidence `build/shortcuts-check/`. Wayland lock release on hardware with a current waylandd and yquake2 is still unobserved (the QEMU seed's waylandd predates pointer constraints).
