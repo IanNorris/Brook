@@ -1,5 +1,6 @@
 // Compile the actual scheduler birth/terminal paths with inert policy, registry
 // and interrupt adapters. ProcessFs/VFS storage and membership remain real.
+#include "../../kernel/src/kernel_region.h"
 namespace scheduler_membership_fixture {
 using namespace brook;
 struct Lock { bool held=false; };

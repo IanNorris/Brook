@@ -11,6 +11,7 @@
 #include "sched_lock_owner.h"
 #include "sched_lock_stats.h"
 #include "sched_lock_claim.h"
+#include "kernel_region.h"
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
@@ -1550,18 +1551,53 @@ void SchedulerMarkStopped(Process* proc, int signal)
     SchedLockRelease(g_readyLock, rlf);
 }
 
+static bool KernelRegionTerminated(Process* p)
+{
+    return __atomic_load_n(reinterpret_cast<uint8_t*>(&p->state), __ATOMIC_ACQUIRE) ==
+        static_cast<uint8_t>(ProcessState::Terminated);
+}
+
+// Lock-free unless a terminator is deciding concurrently (kernel_region.h).
+// IF is clear across publication so this CPU's timer tick, whose BSP reaper
+// also enters a region, cannot interleave with it.
+// `sched kregion locked` restores the former ready-lock entry/leave for A/B
+// measurement. Both modes interoperate: locked entry is serialized with the
+// terminator, which uses the store-then-load check either way.
+static bool g_kernelRegionLocked = false;
+bool SchedulerKernelRegionLockedMode(int mode)
+{
+    if (mode >= 0) __atomic_store_n(&g_kernelRegionLocked, mode != 0, __ATOMIC_RELAXED);
+    return __atomic_load_n(&g_kernelRegionLocked, __ATOMIC_RELAXED);
+}
+
 static bool KernelRegionTryEnter(Process* proc)
 {
-    uint64_t flags = SchedLockAcquire(g_readyLock);
-    if (proc->state == ProcessState::Terminated) {
+    if (__atomic_load_n(&g_kernelRegionLocked, __ATOMIC_RELAXED)) {
+        uint64_t flags = SchedLockAcquire(g_readyLock);
+        if (KernelRegionTerminated(proc)) {
+            SchedLockRelease(g_readyLock, flags);
+            return false;
+        }
+        ProcessRef(proc);
+        __atomic_fetch_add(&proc->kernelRegionDepth, 1u, __ATOMIC_RELAXED);
+        __atomic_store_n(&proc->kernelOperationProtected, true, __ATOMIC_RELAXED);
         SchedLockRelease(g_readyLock, flags);
-        return false;
+        return true;
     }
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
     ProcessRef(proc);
-    ++proc->kernelRegionDepth;
-    proc->kernelOperationProtected = true;
-    SchedLockRelease(g_readyLock, flags);
-    return true;
+    KernelRegionUndo undo;
+    bool entered = KernelRegionOwnerEnter(proc, KernelRegionTerminated, &undo) ==
+        KernelRegionEnter::Entered;
+    if (!entered) {
+        const uint64_t rlf = SchedLockAcquire(g_readyLock);
+        entered = KernelRegionResolveLocked(proc, KernelRegionTerminated, undo);
+        SchedLockRelease(g_readyLock, rlf);
+    }
+    if (!entered) ProcessUnref(proc);
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return entered;
 }
 
 void SchedulerKernelRegionEnter(Process* proc)
@@ -1574,12 +1610,17 @@ void SchedulerKernelRegionEnter(Process* proc)
 
 void SchedulerKernelRegionLeave(Process* proc)
 {
-    uint64_t flags = SchedLockAcquire(g_readyLock);
-    if (!proc->kernelRegionDepth) __builtin_trap();
-    --proc->kernelRegionDepth;
-    // Keep the operation latch until its callers have also unwound their state.
+    // No lock: the operation latch keeps termination deferred until the
+    // locked operation boundary, even after depth reaches zero.
+    if (__atomic_load_n(&g_kernelRegionLocked, __ATOMIC_RELAXED)) {
+        uint64_t flags = SchedLockAcquire(g_readyLock);
+        if (!KernelRegionOwnerLeave(proc)) __builtin_trap();
+        ProcessUnref(proc);
+        SchedLockRelease(g_readyLock, flags);
+        return;
+    }
+    if (!KernelRegionOwnerLeave(proc)) __builtin_trap();
     ProcessUnref(proc);
-    SchedLockRelease(g_readyLock, flags);
 }
 
 #include "scheduler_process_terminal.inc"
@@ -3172,8 +3213,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                 // Never print while holding the scheduler ready lock.
                 uint64_t diagnosticFlags = SchedLockAcquire(g_readyLock);
                 unsigned state = static_cast<unsigned>(p->state);
-                uint32_t depth = p->kernelRegionDepth;
-                bool protectedOperation = p->kernelOperationProtected;
+                uint32_t depth = __atomic_load_n(&p->kernelRegionDepth, __ATOMIC_RELAXED);
+                bool protectedOperation = __atomic_load_n(&p->kernelOperationProtected, __ATOMIC_RELAXED);
                 bool pending = p->terminalPending;
                 bool interruptible = p->interruptibleWait;
                 uint32_t queued = p->inReadyQueue;

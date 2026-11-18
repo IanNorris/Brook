@@ -150,7 +150,8 @@ ticket counters that succeeds only when no ticket is outstanding, with a FIFO
 fallback after 65,536 failed checks (`sched_lock_claim.h`). This avoids handing
 the lock to a descheduled vCPU. Bare metal keeps FIFO tickets; `sched lock-mode`
 switches at runtime. Idle timer ticks skip the ready lock while the lock-free
-ready hint is zero (`sched idle-skip`). `sched lock-stats` reports hold, wait
+ready hint is zero (`sched idle-skip`). Kernel-region entry and leave take no lock
+(`kernel_region.h`, store-then-load pair with `SchedulerMarkTerminated`). `sched lock-stats` reports hold, wait
 and handoff histograms and per-site totals. See
 [the convoy note](../../../docs/sched-lock-convoy.md).
 
