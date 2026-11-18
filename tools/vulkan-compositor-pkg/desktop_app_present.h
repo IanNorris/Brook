@@ -21,10 +21,12 @@
 #include <string.h>
 
 enum { DESKTOP_APP_THRESHOLD_PERCENT=60 };
-/* Non-app damage waits at most this long for an app commit: under a 60 Hz
- * vblank, so the pointer never loses more than one refresh to a stalled or
- * slow app. Overridden by the kernel policy's deferUs. */
-#define DESKTOP_APP_DEFER_NS 12000000ull
+/* Non-app damage waits at most this long for an app commit: one 60 Hz
+ * refresh. It waits only when the app's next commit is expected within it
+ * (see desktop_app_cadence). Overridden by the kernel policy's deferUs. */
+#define DESKTOP_APP_DEFER_NS 16000000ull
+/* After the expected commit, allow this much lateness before giving up. */
+#define DESKTOP_APP_COMMIT_SLACK_NS 2000000ull
 
 /* ---- Which window drives the cadence ------------------------------------ */
 enum DesktopAppReason {
@@ -39,7 +41,8 @@ enum DesktopAppReason {
 static const char *const desktop_app_reason_names[DESKTOP_APP_REASONS]={
     "driven","no_focus_info","no_focus","focus_hidden","small","translucent"};
 
-struct DesktopFocusInfo { uint32_t valid,window,state; uint64_t incarnation; };
+struct DesktopFocusInfo { uint32_t valid,window,state; uint64_t incarnation;
+    uint32_t shell,hasPointer; int32_t pointerX,pointerY; /* focus query version 2 */ };
 
 /* The output rectangle a layer's client content covers (clipped). */
 static inline uint64_t desktop_app_client_area(const struct BrookDesktopLayer *l,uint32_t width,uint32_t height,
@@ -104,26 +107,82 @@ enum DesktopAppAction {
     DESKTOP_APP_DEADLINE,   /* only non-app damage, and it has waited the deadline: present it */
     DESKTOP_APP_DEFER,      /* only non-app damage: wait for the app (until *wakeNs) */
     DESKTOP_APP_TRANSITION, /* a different window became dominant: present at once */
+    /* Non-app damage presented at once, never deferred (gen 440: the pointer
+     * and the launcher animated at the game's 34 fps over fullscreen Quake): */
+    DESKTOP_APP_SHELL,      /* a shell surface (launcher, volume popup, tooltip, toast) is open or animating */
+    DESKTOP_APP_ABOVE,      /* a window (popup, menu, dialog) lies over the dominant one */
+    DESKTOP_APP_POINTER_OUTSIDE, /* the pointer is not over the dominant client area */
+    DESKTOP_APP_STALLED,    /* no app commit for over one app interval (paused), or no history yet */
+    DESKTOP_APP_NOT_DUE,    /* the next app commit is expected later than the deferral */
     DESKTOP_APP_ACTIONS
 };
-struct DesktopAppCadence { uint32_t window; uint64_t incarnation,foreignSinceNs; };
-/* Called for a frame that has damage. Losing the dominant window, or a new
- * one taking over, never delays a frame: waiting damage presents at once. */
-static inline enum DesktopAppAction desktop_app_cadence(struct DesktopAppCadence *s,int dominant,uint32_t window,uint64_t incarnation,
-                                                        int appChanged,uint64_t now,uint64_t deferNs,uint64_t *wakeNs){
+static const char *const desktop_app_action_names[DESKTOP_APP_ACTIONS]={"free","present","deadline","defer","transition",
+    "shell","window_above","pointer_outside","app_stalled","app_not_due"};
+/* lastAppNs/intervalNs: the dominant window's last commit as seen here and
+ * its smoothed commit interval (0 = unknown). */
+struct DesktopAppCadence { uint32_t window; uint64_t incarnation,foreignSinceNs,lastAppNs,intervalNs; };
+/* What the frame shows besides the damage itself. */
+struct DesktopAppFrame {
+    int dominant;uint32_t window;uint64_t incarnation;
+    int appChanged;      /* the dominant window committed */
+    int shellOpen;       /* a shell surface is open, animating, or over the window */
+    int windowAbove;     /* another window shows over the dominant one */
+    int pointerOutside;  /* the pointer is outside the dominant client area */
+    uint64_t now,deferNs;
+};
+/* Called for a frame that has damage. Non-app damage waits only when nothing
+ * else needs the screen to move (no shell surface, no window above, the
+ * pointer over the app) and the app is running steadily with its next
+ * commit due within the deferral; it then waits for that commit, bounded
+ * by the deferral. Losing the dominant window, or a new one taking over,
+ * never delays a frame. */
+static inline enum DesktopAppAction desktop_app_cadence(struct DesktopAppCadence *s,const struct DesktopAppFrame *f,uint64_t *wakeNs){
     if(wakeNs)*wakeNs=0;
-    if(!dominant){s->window=0;s->incarnation=0;s->foreignSinceNs=0;return DESKTOP_APP_FREE;}
-    if(s->window!=window || s->incarnation!=incarnation){
-        s->window=window;s->incarnation=incarnation;s->foreignSinceNs=0;return DESKTOP_APP_TRANSITION;}
-    if(appChanged){s->foreignSinceNs=0;return DESKTOP_APP_PRESENT;}
-    if(!s->foreignSinceNs)s->foreignSinceNs=now?now:1;
-    if(now>=s->foreignSinceNs && now-s->foreignSinceNs>=deferNs){s->foreignSinceNs=0;return DESKTOP_APP_DEADLINE;}
-    if(wakeNs)*wakeNs=s->foreignSinceNs+deferNs;
+    if(!f->dominant){*s=(struct DesktopAppCadence){0};return DESKTOP_APP_FREE;}
+    const uint64_t now=f->now?f->now:1;
+    if(s->window!=f->window || s->incarnation!=f->incarnation){
+        *s=(struct DesktopAppCadence){f->window,f->incarnation,0,f->appChanged?now:0,0};return DESKTOP_APP_TRANSITION;}
+    if(f->appChanged){
+        if(s->lastAppNs && now>s->lastAppNs){const uint64_t d=now-s->lastAppNs;
+            /* A pause (gap over 4 intervals) is not a frame interval. */
+            if(d>=1000000000ull)s->intervalNs=0;
+            else if(!s->intervalNs)s->intervalNs=d;
+            else if(d<=4*s->intervalNs)s->intervalNs=(s->intervalNs*7+d)/8;}
+        s->lastAppNs=now;s->foreignSinceNs=0;return DESKTOP_APP_PRESENT;}
+    enum DesktopAppAction now_action=DESKTOP_APP_DEFER;
+    const uint64_t silent=s->lastAppNs && now>=s->lastAppNs?now-s->lastAppNs:UINT64_MAX;
+    const uint64_t interval=s->intervalNs,due=s->lastAppNs+interval;
+    if(f->shellOpen)now_action=DESKTOP_APP_SHELL;
+    else if(f->windowAbove)now_action=DESKTOP_APP_ABOVE;
+    else if(f->pointerOutside)now_action=DESKTOP_APP_POINTER_OUTSIDE;
+    else if(!interval || silent>interval+interval/4+DESKTOP_APP_COMMIT_SLACK_NS)now_action=DESKTOP_APP_STALLED;
+    else if(due>now && due-now>f->deferNs)now_action=DESKTOP_APP_NOT_DUE;
+    if(now_action!=DESKTOP_APP_DEFER){s->foreignSinceNs=0;return now_action;}
+    if(!s->foreignSinceNs)s->foreignSinceNs=now;
+    if(now-s->foreignSinceNs>=f->deferNs){s->foreignSinceNs=0;return DESKTOP_APP_DEADLINE;}
+    uint64_t wake=s->foreignSinceNs+f->deferNs;
+    if(due+DESKTOP_APP_COMMIT_SLACK_NS<wake)wake=due+DESKTOP_APP_COMMIT_SLACK_NS;
+    if(wake<=now){s->foreignSinceNs=0;return DESKTOP_APP_DEADLINE;}
+    if(wakeNs)*wakeNs=wake;
     return DESKTOP_APP_DEFER;
 }
-
 /* A frame with no damage at all: nothing waits any more. */
 static inline void desktop_app_cadence_idle(struct DesktopAppCadence *s){s->foreignSinceNs=0;}
+/* Whether point (x,y) lies in the layer's on-screen client rectangle. */
+static inline int desktop_app_point_inside(const struct BrookDesktopLayer *l,uint32_t width,uint32_t height,int32_t x,int32_t y){
+    struct DesktopDamageRect r;if(!desktop_app_client_area(l,width,height,&r))return 0;
+    return x>=r.left && x<r.right && y>=r.top && y<r.bottom;
+}
+/* Any later (higher) layer with on-screen area that overlaps the dominant
+ * window's client rectangle. */
+static inline int desktop_app_window_above(const struct BrookDesktopLayer *layers,unsigned count,int dominant,uint32_t width,uint32_t height){
+    if(dominant<0)return 0;
+    struct DesktopDamageRect d;if(!desktop_app_client_area(&layers[dominant],width,height,&d))return 0;
+    for(unsigned i=(unsigned)dominant+1;i<count;++i){struct DesktopDamageRect r;
+        if(!desktop_app_client_area(&layers[i],width,height,&r))continue;
+        if(r.left<d.right && d.left<r.right && r.top<d.bottom && d.top<r.bottom)return 1;}
+    return 0;
+}
 
 /* ---- Direct scanout eligibility ----------------------------------------- */
 /* Broadwell primary plane (Linux i915 i9xx_plane.c for gen8: ivb_primary

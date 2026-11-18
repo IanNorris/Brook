@@ -290,7 +290,6 @@ static struct DesktopAppCadence g_appCadence;
 static uint64_t g_appWakeNs;
 static struct {int app,direct;uint64_t deferNs;uint32_t dominant;
     uint64_t dominance[DESKTOP_APP_REASONS],actions[DESKTOP_APP_ACTIONS],earlyNotifies;} g_app;
-static const char *const g_appActionNames[DESKTOP_APP_ACTIONS]={"free","present","deadline","defer","transition"};
 static struct {uint64_t evaluated,eligible,frames,enters,exits,reasons[DESKTOP_DIRECT_REASONS];int last,wasEligible;} g_direct;
 static void app_present_env(void){
     const char *app=getenv("BROOK_RENDER_APP_PRESENT"),*direct=getenv("BROOK_RENDER_DIRECT_SCANOUT");
@@ -304,16 +303,23 @@ static void focus_query(struct DesktopFocusInfo *out){
     g_app.app=g_appPinned>0;g_app.direct=g_directPinned>0?g_directPinned:DIRECT_MODE_OFF;g_app.deferNs=DESKTOP_APP_DEFER_NS;
     if(!g_focusSupported)return;
     struct BrookDesktopFocus f;memset(&f,0,sizeof(f));
-    if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_FOCUS_QUERY,&f,sizeof(f),0,0,0)){
+    /* A version 1 kernel takes only the 32-byte request (no pointer). */
+    static size_t size=sizeof(struct BrookDesktopFocus);
+    long r=syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_FOCUS_QUERY,&f,size,0,0,0);
+    if(r && errno==EINVAL && size!=BROOK_DESKTOP_FOCUS_V1_SIZE){
+        size=BROOK_DESKTOP_FOCUS_V1_SIZE;memset(&f,0,sizeof(f));
+        r=syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_FOCUS_QUERY,&f,size,0,0,0);
+    }
+    if(r){
         if(errno==EINVAL || errno==ENOSYS){g_focusSupported=0;fprintf(stderr,"DESKTOP_APP_PRESENT_UNAVAILABLE errno=%d (no focus query)\n",errno);}
         return;
     }
-    if(f.version!=BROOK_DESKTOP_FOCUS_VERSION)return;
+    if(f.version!=BROOK_DESKTOP_FOCUS_VERSION && f.version!=BROOK_DESKTOP_FOCUS_VERSION_POINTER)return;
     if(g_appPinned<0)g_app.app=(f.policy&BROOK_DESKTOP_POLICY_APP_CADENCE)!=0;
     if(g_directPinned<0)g_app.direct=(f.policy&BROOK_DESKTOP_POLICY_DIRECT_ON)?DIRECT_MODE_ON:
         (f.policy&BROOK_DESKTOP_POLICY_DIRECT_SHADOW)?DIRECT_MODE_SHADOW:DIRECT_MODE_OFF;
     if(f.deferUs)g_app.deferNs=(uint64_t)f.deferUs*1000ull;
-    *out=(struct DesktopFocusInfo){1,f.window,f.state,f.incarnation};
+    *out=(struct DesktopFocusInfo){1,f.window,f.state,f.incarnation,f.shell,f.version==BROOK_DESKTOP_FOCUS_VERSION_POINTER,f.pointerX,f.pointerY};
 }
 /* End of an idle wait: the next poll, or sooner when deferred damage is due. */
 static uint64_t idle_until(void){
@@ -942,10 +948,24 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     else {
         ++g_app.dominance[appReason];
         if(g_app.app && tracked){
-            const int changed=dominant>=0 && desktop_app_window_changed(trackBase,&track->windows[dominant]);
+            struct DesktopAppFrame af={.dominant=dominant>=0,.window=g_app.dominant,.now=monotonic_ns(),.deferNs=g_app.deferNs};
+            if(dominant>=0){const struct BrookDesktopLayer *dl=&layers.layers[dominant];
+                af.incarnation=dl->incarnation;af.appChanged=desktop_app_window_changed(trackBase,&track->windows[dominant]);
+                /* A shell popup open, or any overlay band over the window
+                 * (launcher, tooltip, toast, boot summary): it must animate
+                 * at the display rate, not the app's. */
+                struct DesktopDamageRect client;(void)desktop_app_client_area(dl,width,height,&client);
+                af.shellOpen=focus.shell!=0;
+                for(uint32_t b=0;!af.shellOpen && b<bands.count && b<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++b){const struct BrookDesktopOverlayBand *ob=&bands.bands[b];
+                    af.shellOpen=ob->width && ob->height && ob->x<client.right && client.left<(int64_t)ob->x+ob->width &&
+                        ob->y<client.bottom && client.top<(int64_t)ob->y+ob->height;}
+                af.windowAbove=desktop_app_window_above(layers.layers,layers.count,dominant,width,height);
+                /* Without the pointer position (version 1 kernel) assume it is
+                 * outside: never defer on a guess. */
+                af.pointerOutside=!focus.hasPointer || !desktop_app_point_inside(dl,width,height,focus.pointerX,focus.pointerY);
+            }
             uint64_t wake=0;
-            const enum DesktopAppAction action=desktop_app_cadence(&g_appCadence,dominant>=0,g_app.dominant,
-                dominant>=0?layers.layers[dominant].incarnation:0,changed,monotonic_ns(),g_app.deferNs,&wake);
+            const enum DesktopAppAction action=desktop_app_cadence(&g_appCadence,&af,&wake);
             ++g_app.actions[action];
             if(action==DESKTOP_APP_DEFER){g_appWakeNs=wake;result=2;stage="idle";goto done;}
         }
@@ -1604,7 +1624,7 @@ static void stats_publish(uint64_t now){
                 desktop_app_reason_names[r],(unsigned long long)g_app.dominance[r]);
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"},\"actions\":{");
             for(unsigned a=0;a<DESKTOP_APP_ACTIONS;++a)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",a?",":"",
-                g_appActionNames[a],(unsigned long long)g_app.actions[a]);
+                desktop_app_action_names[a],(unsigned long long)g_app.actions[a]);
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}},\"direct_scanout\":{\"mode\":\"%s\",\"evaluated\":%llu,\"eligible\":%llu,"
                 "\"frames\":%llu,\"enters\":%llu,\"exits\":%llu,\"last\":\"%s\",\"fallback\":{",g_directModeNames[g_app.direct],
                 (unsigned long long)g_direct.evaluated,(unsigned long long)g_direct.eligible,(unsigned long long)g_direct.frames,
