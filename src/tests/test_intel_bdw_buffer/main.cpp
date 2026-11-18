@@ -2801,7 +2801,8 @@ int main(){
     struct Offset {uint32_t handle,pad;uint64_t offset,flags,extensions;} map{create.handle,0,0,2,0};
     const auto mapCmd=ioctlCommand(0x64,sizeof(map));assert(BdwIntelRenderIoctl(f,mapCmd,reinterpret_cast<uint64_t>(&map),user)==0 && map.offset);
     auto* pinMapping=BdwGpuFileGetMapping(f,map.offset+4096,4096,offset);assert(pinMapping && offset==4096);
-    map.flags=1;assert(BdwIntelRenderIoctl(f,mapCmd,reinterpret_cast<uint64_t>(&map),user)==-22);
+    {const uint64_t wb=map.offset;map.flags=1;map.offset=0;assert(BdwIntelRenderIoctl(f,mapCmd,reinterpret_cast<uint64_t>(&map),user)==0 && map.offset==wb);}
+    for(uint64_t bad:{uint64_t{0},uint64_t{3},uint64_t{4}}){map.flags=bad;assert(BdwIntelRenderIoctl(f,mapCmd,reinterpret_cast<uint64_t>(&map),user)==-22);}
     struct Close {uint32_t handle,pad;} close{create.handle,0};
     assert(BdwIntelRenderIoctl(f,ioctlCommand(9,sizeof(close)),reinterpret_cast<uint64_t>(&close),user)==0);
     assert(BdwIntelRenderIoctl(f,ioctlCommand(9,sizeof(close)),reinterpret_cast<uint64_t>(&close),user)==-2);
