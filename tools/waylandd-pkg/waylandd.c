@@ -1638,7 +1638,24 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
     sc->cursor_visible = surface != NULL;
     seat_apply_cursor_visibility(sc);
 
-    if (surface) {
+    if (!surface) {
+        /* set_cursor(NULL) hides the pointer (games, Xwayland's blank or
+         * XFixes-hidden cursor). Cursor images are owned per window since
+         * a243a68c, so a transparent image owned by the hovered window hides
+         * it there only; the kernel keeps its arrow over the desktop, the
+         * taskbar, WM chrome and other windows. */
+        struct brook_surface *owner = sc->entered_surface;
+        while (owner && owner->subsurface_parent) owner = owner->subsurface_parent;
+        if (owner && owner->wm_id) {
+            static const uint32_t clear_pixel = 0;
+            long rc = wm_set_cursor_image_for(&clear_pixel, 1, 1, 0, 0, owner->wm_id);
+            if (rc != 0) fprintf(stderr, "[waylandd] hidden cursor for wm %u failed rc=%ld\n", owner->wm_id, rc);
+        } else {
+            wm_set_cursor_image(NULL, 0, 0, 0, 0); /* no window known: built-in arrow */
+        }
+        return;
+    }
+    {
         /* Mark this surface as a cursor surface so commits upload pixels
          * to the kernel compositor instead of creating a window. */
         struct brook_surface *cs = wl_resource_get_user_data(surface);
@@ -1658,9 +1675,6 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
         /* set_cursor selects committed content. Pending attachments and
          * viewport/scale changes become visible only at wl_surface.commit. */
         if (cs) surface_cursor_commit(cs);
-    } else {
-        /* Reset to built-in cursor */
-        wm_set_cursor_image(NULL, 0, 0, 0, 0);
     }
 }
 static void pointer_release(struct wl_client *c, struct wl_resource *r) {

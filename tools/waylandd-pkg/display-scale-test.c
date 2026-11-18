@@ -126,7 +126,15 @@ int main(void) {
     pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);
     assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|root->wm_id) && root->wm_id==1);
     cursor_owner=0;surface_cursor_commit(cursor);assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1));
+    /* set_cursor(NULL) hides the pointer over this window only: a 1x1
+     * transparent image owned by the root window (Q2/Stardew showed the
+     * system arrow over the game). */
+    cursor_owner=0;cursor_width=cursor_height=99;cursor_pixels[0]=0xffffffffu;
+    pointer_set_cursor(client,seat.pointer,0,NULL,0,0);
+    assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1) && cursor_width==1 && cursor_height==1 && cursor_pixels[0]==0);
     struct brook_surface *entered_before=seat.entered_surface;seat.entered_surface=NULL;
+    cursor_width=cursor_height=99;pointer_set_cursor(client,seat.pointer,0,NULL,0,0);
+    assert(cursor_width==0 && cursor_owner==0); /* no window known: built-in arrow */
     pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);assert(cursor_owner==0);
     seat.entered_surface=entered_before;wl_resource_set_user_data(seat.pointer,NULL);
     /* The kernel's POINTER_LEFT (pointer moved to the desktop, WM chrome or
