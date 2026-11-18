@@ -3293,7 +3293,10 @@ static void gpu_group_presented(struct gpu_group *g){
 }
 static void gpu_group_release(struct gpu_group *g){
     for(unsigned i=0;i<g->count;++i){struct brook_image *image=g->images[i];
-        if(image->group_refs && !--image->group_refs && image->offer_state==1 && image->pending_cpu==1){
+        /* Also an image whose pixels were taken while the group held it
+         * (pending_cpu 0, fd still open): it waits in the queue at state 1,
+         * and only this SAFE can retire it and release the client's buffer. */
+        if(image->group_refs && !--image->group_refs && image->offer_state==1 && image->pending_fd>=0){
             image->offer_state=2;intel_pending_schedule();}
         image_unref(image);}
     *g=(struct gpu_group){0};
@@ -3349,6 +3352,13 @@ static int gpu_window_offer_layers(struct brook_surface *root,const struct brook
         l->dstX=(int32_t)(draws[i].x*(int64_t)scale);l->dstY=(int32_t)(draws[i].y*(int64_t)scale);
         l->dstWidth=g->w*scale;l->dstHeight=g->h*scale;
     }
+    /* The root's committed size is the window's size, exactly as for a
+     * single offer. Without this a window that resized while it had a
+     * subsurface (Chromium's video or ad overlays) kept its old VFB, and so
+     * its old kernel size: the renderer clipped every layer to it, and the
+     * WM, captions and later configures used the stale size. */
+    if(!root->tree.current->value || !surface_window(root,(struct brook_view *)root->tree.current->value) ||
+       !root->wm_id || !root->vfb){++g_gpu_offer_window;return 0;}
     BrookWindowState window={0};
     if(syscall(BROOK_SYS_WM_WINDOW_STATE,(long)root->wm_id,0L,(long)&window,(long)sizeof(window),0L,0L) ||
        window.version!=BROOK_WINDOW_STATE_VERSION || window.window!=root->wm_id){++g_gpu_offer_metadata;return 0;}
