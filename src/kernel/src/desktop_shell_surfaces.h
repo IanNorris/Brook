@@ -16,7 +16,8 @@ struct WmShellSurface {
     uint32_t w, h;
     bool material;
 };
-// Taskbar, at most one of launcher / volume popup / tray tooltip, boot summary.
+// Taskbar (absent while WmTaskbarHidden), at most one of launcher / volume
+// popup / tray tooltip, boot summary.
 static constexpr uint32_t WM_SHELL_SURFACE_LIMIT = 3;
 
 // Back to front. (mx,my) is the pointer the caller renders hover state with.
@@ -24,8 +25,11 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
                                 WmShellSurface (&out)[WM_SHELL_SURFACE_LIMIT])
 {
     uint32_t count = 0;
-    const uint32_t tbY = WmDesktopHeight(screenH);
-    out[count++] = {WmShellSurfaceKind::Taskbar, 0, static_cast<int32_t>(tbY), screenW, screenH - tbY, true};
+    // A focused fullscreen window owns the whole output (WmTaskbarHidden).
+    if (!WmTaskbarHidden()) {
+        const uint32_t tbY = WmDesktopHeight(screenH);
+        out[count++] = {WmShellSurfaceKind::Taskbar, 0, static_cast<int32_t>(tbY), screenW, screenH - tbY, true};
+    }
     // One popup slot: opening the launcher closes the volume popup and vice
     // versa, and the tray tooltip yields to either of them.
     int32_t x = 0, y = 0; uint32_t w = 0, h = 0;

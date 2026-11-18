@@ -233,6 +233,23 @@ Screenshots: `build/workloads/xwayland-hidpi-20261116/evidence/`. An SDL3
 window that recreates its X window after the fullscreen request (window
 surface path) stayed framed; MonoGame creates an OpenGL window up front.
 
+## Fullscreen owns the output, taskbar included (work/launchers-fullscreen)
+
+Ian on Stardew (gen 426): fullscreen "doesn't cover the task bar, some buttons are still cut off". The window was output-sized, but the kernel WM still drew the taskbar over it and took clicks there.
+
+- **Kernel state:** `WM_SET_FULLSCREEN` (syscall 526, `BROOK_SYS_WM_SET_FULLSCREEN` in `wm_window_state.h`) saves geometry, chrome and maximized state, then makes the window chrome-less at 0,0 at the full output size (`CompositorGetPhysDims`, e.g. 3200×1800, not the work area). The client gets `WM_EVT_RESIZED` with `WM_RESIZE_FULLSCREEN` (4, never with MAXIMIZED), and `WM_WINDOW_STATE` reports `BROOK_WINDOW_STATE_FULLSCREEN`. Leaving restores all of it. While fullscreen, maximize, moves and decoration changes are ignored (decoration requests update what leaving restores). The debug window list has `"fullscreen"`.
+- **Taskbar:** `WmTaskbarHidden()` is true while the focused window is fullscreen, visible and not minimized, and neither the launcher nor the volume popup is open. Then `WmShellSurfaces` omits the taskbar, so every compositor path stops drawing it. `WmTaskbarHitTest` returns nothing, the tray tooltip is off, and input routing uses `WmTaskbarTop()` (the screen height), so the whole output reaches the window. Super opens the launcher with the taskbar above the game. Alt+Tab, minimize or focusing another window brings the taskbar back. Maximize and the work area still use `WmDesktopHeight`.
+- **Older brook-xwm:** the Xwayland WM on the Dell (`h9x75map…`) makes EWMH fullscreen windows itself (chrome-less, at the origin, output-sized). The kernel counts such a focused window as fullscreen too, so the kernel pair alone fixes Stardew.
+- **waylandd:** `xdg_toplevel.set_fullscreen`/`unset_fullscreen` call `WM_SET_FULLSCREEN`. A request made before the window exists is applied when it is created. The configure carries `XDG_TOPLEVEL_STATE_FULLSCREEN` at the output size. The XWM path uses the kernel call too, and falls back to its own geometry when the kernel returns ENOSYS.
+- **Tests:**
+  - host `test_window_surfaces`: fullscreen enter/leave, taskbar hidden/shown with the launcher, volume popup, focus and minimize, and the legacy shape;
+  - waylandd checks: `xwayland-bridge-test` kernel path and fallback, and the `surface-frame-test` fullscreen configure.
+- **QEMU** (software composition, 1920×1080 at 200%, session `eee90e30da484bcab4370a851e43a0c7`, evidence `build/workloads/fullscreen-20261118/evidence/`):
+  - With the old brook-xwm, an X11 `_NET_WM_STATE_FULLSCREEN` probe covered all four corner markers with no taskbar. Clicks at y=1065/1070 reached the X client.
+  - Super showed the launcher and taskbar over it; closing the launcher hid the taskbar again.
+  - A second window brought the taskbar back; Alt+Tab to the game hid it.
+  - With the new waylandd and brook-xwm, the X11 probe and an SDL2 Wayland `FULLSCREEN_DESKTOP` window both reported `fullscreen: true` at 1920×1080. The Wayland client got the click at the bottom edge, and on leaving it returned to its framed window with the taskbar.
+
 ## Evidence and remaining acceptance
 
 The Nix check phase exercises the actual shell and bridge adapters. It covers

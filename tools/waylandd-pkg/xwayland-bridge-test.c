@@ -14,6 +14,8 @@ static long bridge_syscall(long number,...);
 static BrookWindowState native[64];
 static uint32_t pixels[64][64*64],next_window,created,destroyed,resized,placed;
 static uint32_t create_flags[64],decoration_changes,moves,edge_resizes;
+/* WM_SET_FULLSCREEN: ENOSYS (older kernels, the fallback) unless enabled. */
+static int kernel_fullscreen;static BrookWindowState kernel_saved[64];
 static long bridge_syscall(long number,...) {
     va_list ap;va_start(ap,number);long result=0;
     if (number==BROOK_SYS_WM_CREATE_WINDOW) {
@@ -59,6 +61,14 @@ static long bridge_syscall(long number,...) {
         long id=va_arg(ap,long),enable=va_arg(ap,long);assert(enable==0 || enable==1);
         if (enable) native[id].flags|=BROOK_WINDOW_STATE_MAXIMIZED;
         else native[id].flags&=~BROOK_WINDOW_STATE_MAXIMIZED;
+    } else if (number==BROOK_SYS_WM_SET_FULLSCREEN) {
+        long id=va_arg(ap,long),enable=va_arg(ap,long);assert(id>0 && id<64 && native[id].version);
+        if (!kernel_fullscreen) { errno=ENOSYS;result=-1; }
+        else if (enable && !(native[id].flags&BROOK_WINDOW_STATE_FULLSCREEN)) {
+            kernel_saved[id]=native[id];native[id].client_x=native[id].client_y=0;
+            native[id].width=48;native[id].height=40;
+            native[id].flags=(native[id].flags&~BROOK_WINDOW_STATE_MAXIMIZED)|BROOK_WINDOW_STATE_FULLSCREEN|BROOK_WINDOW_STATE_CLIENT_CHROME;
+        } else if (!enable && (native[id].flags&BROOK_WINDOW_STATE_FULLSCREEN)) native[id]=kernel_saved[id];
     } else if (number==BROOK_SYS_WM_SET_MINIMIZED) {
         long id=va_arg(ap,long);native[id].flags|=BROOK_WINDOW_STATE_MINIMIZED;
     } else if (number==BROOK_SYS_WM_GET_SCREEN_INFO) {
@@ -292,10 +302,33 @@ int main(int argc,char **argv) {
     assert(native[pid].client_x==64);
     g_output_scale=1;
     assert(unrelated->wm_id==native_id && pixels[native_id][0]==0xff123456);
+    // With WM_SET_FULLSCREEN the kernel owns the output geometry (and hides
+    // the taskbar while the window is focused); leaving restores it.
+    kernel_fullscreen=1;
+    struct bxwm_message editor=state;editor.window=130;editor.identity=9;editor.serial=60;editor.configure_serial=0;
+    editor.flags=BXWM_MAPPED|BXWM_INPUT;editor.x=60;editor.y=90;editor.width=8;editor.height=6;
+    assert(xwayland_accept_message(&editor));
+    struct brook_surface *kfull=new_surface(client,60);image(kfull,8,6);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);no_command(peer,&rx);
+    const uint32_t kid=kfull->wm_id;const BrookWindowState before_full=native[kid];
+    unsigned kernel_decorations=decoration_changes,kernel_places=placed;
+    struct bxwm_message kwant=editor;kwant.type=BXWM_FULLSCREEN_REQUEST;kwant.x=1;
+    assert(xwayland_accept_message(&kwant) && !g_xwm_failed);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
+    assert(configure.window==130 && (configure.flags&BXWM_FULLSCREEN) && !(configure.flags&BXWM_MAXIMIZED));
+    assert(!configure.x && !configure.y && configure.width==48 && configure.height==40);
+    assert(decoration_changes==kernel_decorations && placed==kernel_places && kfull->xwindow->kernel_fullscreen);
+    assert(kfull->xwindow->target_width==48);image(kfull,48,40);assert(kfull->vfb_w==48);
+    kwant.x=0;assert(xwayland_accept_message(&kwant) && !g_xwm_failed);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
+    assert(!(configure.flags&BXWM_FULLSCREEN) && configure.width==before_full.width && configure.height==before_full.height);
+    assert(native[kid].client_x==before_full.client_x && !(native[kid].flags&BROOK_WINDOW_STATE_FULLSCREEN));
+    assert(!kfull->xwindow->kernel_fullscreen);
+    kernel_fullscreen=0;
     // Server disconnect takes the other teardown route through the exact
     // wl_client destroy listener. It must have the same isolation guarantee.
     wl_client_destroy(client);close(wayland_peer);close(peer);
-    assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0 && destroyed==7);
+    assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0 && destroyed==8);
     assert(g_surfaces==unrelated && unrelated->wm_id==native_id);
     assert(native[native_id].incarnation==native_incarnation && surface_repaint(unrelated));
     // Exercise real fork/exec retirement and replacement while the unrelated
@@ -338,8 +371,8 @@ int main(int argc,char **argv) {
     xwayland_pump();assert(g_xwayland_generation==last_generation);
     close(report[0]);close(report[1]);unsetenv("BROOK_TEST_XWAYLAND_REPORT_FD");
     unsetenv("BROOK_XWAYLAND_SOFTWARE_GLX");unsetenv("BROOK_XWAYLAND_DUMB_SCHED");
-    wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==8);
+    wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==9);
     wl_display_destroy(g_display);
-    puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival, generation reuse, EWMH fullscreen and scaled windows");
+    puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival, generation reuse, EWMH fullscreen (kernel and fallback) and scaled windows");
     return 0;
 }

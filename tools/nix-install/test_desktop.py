@@ -61,6 +61,11 @@ class DesktopTests(unittest.TestCase):
                 wrapper.write_text('#!/bin/sh\n'); wrapper.chmod(0o755)
                 identity = '' if program=='chromium' else '--uid 1000 '
                 self.assertIn(f'{program}\t{identity}{wrapper} --test-argument\t', collect())
+            quake=root/'profile/bin/brook-quake2'
+            quake.write_text('#!/bin/sh\n');quake.chmod(0o755)
+            (root/'profile/share/applications/brook-quake2.desktop').write_text(
+                f'[Desktop Entry]\nType=Application\nName=Quake II\nExec={quake}\nIcon=brook-quake2\n')
+            self.assertIn(f'Quake II\t--uid 1000 {quake}\t',collect())
             runtime=root/'profile/bin/brook-run'
             runtime.write_text('#!/bin/sh\n');runtime.chmod(0o755)
             for program in ('gimp-3.0','mousepad','openttd','gnome-commander','thunar','galculator'):

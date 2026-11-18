@@ -39,6 +39,7 @@ void KMutexUnlock(KMutex* m) { CHECK(locks>0);--locks;(m==&g_debugFrameLock?fram
 VirtualAddress VmmAllocPages(uint64_t,uint64_t,MemTag,uint16_t) { return VirtualAddress{}; }
 void VmmFreePages(VirtualAddress,uint64_t) { std::abort(); }
 uint32_t WmDesktopHeight(uint32_t h) { return h-1; }
+bool WmTaskbarHidden() { return false; }
 void WmRenderTaskbar(uint32_t* p,uint32_t stride,uint32_t w,uint32_t h,uint64_t,int32_t,int32_t) {
     for(uint32_t x=0;x<w;++x)p[(h-1)*stride+x]=0x00123456;
 }

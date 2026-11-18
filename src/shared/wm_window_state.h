@@ -17,7 +17,11 @@ enum {
     BROOK_WINDOW_STATE_MINIMIZED = 1u << 2,
     BROOK_WINDOW_STATE_MAXIMIZED = 1u << 3,
     BROOK_WINDOW_STATE_CLIENT_CHROME = 1u << 4,
-    BROOK_WINDOW_STATE_FOCUSABLE = 1u << 5
+    BROOK_WINDOW_STATE_FOCUSABLE = 1u << 5,
+    /* Covers the output via WM_SET_FULLSCREEN; never with MAXIMIZED. */
+    BROOK_WINDOW_STATE_FULLSCREEN = 1u << 6,
+    /* WM_SET_FULLSCREEN (526): (window, enable 0/1, 0, 0, 0, 0). */
+    BROOK_SYS_WM_SET_FULLSCREEN = 526
 };
 typedef struct BrookWindowState {
     uint32_t version;

@@ -603,7 +603,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
 static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
                           char (&text)[48], DesktopRect& box)
 {
-    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen) return false;
+    if (!g_wmActive || g_launcherOpen || g_volumePopupOpen || WmTaskbarHidden()) return false;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     const WmRect* anchor = nullptr;
     if (l.volume.contains(mx, my)) {
@@ -668,6 +668,7 @@ void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, ui
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 {
     if (mx < 0 || my < 0 || mx >= static_cast<int32_t>(screenW) || my >= static_cast<int32_t>(screenH)) return -1;
+    if (WmTaskbarHidden()) return -1;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     if (l.apps.contains(mx, my)) return -3;
     if (l.terminal.contains(mx, my)) return -2;

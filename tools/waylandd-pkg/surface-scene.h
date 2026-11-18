@@ -155,7 +155,7 @@ static void surface_unmap(struct brook_surface *s) {
         s->xdg_initial_commit_done=0;s->xdg_acked=0;
     }
     memset(&s->size_hints,0,sizeof(s->size_hints));memset(&s->pending_size_hints,0,sizeof(s->pending_size_hints));s->size_hints_pending=0;
-    s->toplevel_maximized=s->toplevel_resizing=0;s->configure_width=s->configure_height=0;s->configure_size_pending=s->configure_size_acked=0;s->configure_size_serial=0;
+    s->toplevel_maximized=s->toplevel_resizing=s->toplevel_fullscreen=0;s->configure_width=s->configure_height=0;s->configure_size_pending=s->configure_size_acked=0;s->configure_size_serial=0;
     scene_owner_unref(s->scene);s->scene=NULL;s->scene_disabled=0;
     if (s->wm_id) wm_destroy_window(s->wm_id);
     s->wm_id=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;s->deco_sent_mode=-1;
@@ -189,6 +189,7 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
     s->vfb_w=width;s->vfb_h=height;s->strip_due=3;
     if (s->xdg_toplevel && s->deco_csd) surface_sync_decoration(s,0);
     if (xwayland) xwayland_surface_created(s);
+    toplevel_apply_fullscreen(s);
     return 1;
 }
 static int scene_ensure(struct brook_surface *s) {

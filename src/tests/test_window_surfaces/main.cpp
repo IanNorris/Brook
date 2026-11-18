@@ -26,6 +26,7 @@ const char* BuildGitHash(){return "test";}
 bool CompositorGlassActive() { return false; }
 uint32_t CompositorMaterialOpacity() { return 255; }
 Terminal* TerminalFindByProcess(Process*) { return nullptr; }
+TerminalResizeResult TerminalResizeForProcess(uint16_t,uint64_t,uint32_t,uint32_t) { return TerminalResizeResult::NotOwned; }
 bool TerminalSnapshotCaret(uint16_t pid,uint64_t incarnation,TerminalCaret* out) {
     if(!caretPid || pid!=caretPid || incarnation!=caretIncarnation)return false;
     *out={5,1,3,2};return true;
@@ -57,6 +58,8 @@ uint64_t CompositorDesktopReadyTick() { return 0; }
 uint64_t RtcNow() { return 0; }
 char* RtcFormatTaskbar(char* buf,uint64_t,bool) { buf[0]='0';buf[1]=0;return buf; }
 bool ThermalReadSnapshot(ThermalSnapshot&) { return false; }
+uint32_t testScreenW=1024,testScreenH=768;
+extern "C" void CompositorGetPhysDims(uint32_t* w,uint32_t* h) { if(w)*w=testScreenW;if(h)*h=testScreenH; }
 }
 extern "C" void KernelPanic(const char*,...) { std::abort(); }
 
@@ -592,6 +595,73 @@ int main() {
         for(uint32_t i=2;i<n;++i)CHECK(s[i].kind==WmShellSurfaceKind::BootSummary);
         g_launcherOpen=false;g_volumePopupOpen=false;
     }
+    // Fullscreen: the client covers the whole output without chrome, and while
+    // it is focused the taskbar is neither drawn nor hit-tested (the launcher
+    // and volume popup bring it back). Leaving restores geometry, chrome and
+    // the maximized state. The Xwayland WM shipped before WM_SET_FULLSCREEN
+    // makes a chrome-less output-sized window, which counts as fullscreen.
+    {
+        constexpr uint32_t sw=1024,sh=768;testScreenW=sw;testScreenH=sh;
+        auto* gamer=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(gamer);
+        gamer->pid=gamer->tgid=9;gamer->incarnation=99;
+        const int game=WmCreateWindow(gamer,40,50,640,480,"Game",1,true);
+        const int editor=WmCreateWindow(gamer,60,70,320,240,"Editor",1,true);
+        CHECK(game>=0 && editor>=0);
+        auto& g=g_windows[game];
+        g.vfb=reinterpret_cast<uint32_t*>(0x1000); // API window: resizes notify the client
+        WmSetFocus(game);
+        auto taskbarShown=[&]{
+            WmShellSurface s[WM_SHELL_SURFACE_LIMIT];const uint32_t n=WmShellSurfaces(sw,sh,-1,-1,s);
+            bool shown=false;for(uint32_t i=0;i<n;++i)shown|=s[i].kind==WmShellSurfaceKind::Taskbar;
+            const int32_t apps=WmTaskbarHitTest(int32_t(WmMetric(10)),int32_t(sh-WmMetric(10)),sw,sh);
+            CHECK(shown==(apps!=-1) && shown==!WmTaskbarHidden());
+            CHECK(WmTaskbarTop(sh)==(shown?WmDesktopHeight(sh):sh));
+            return shown;
+        };
+        CHECK(taskbarShown());
+        WmSetMaximized(game,true);
+        CHECK(g.state==WindowState::Maximized && g.clientH<WmDesktopHeight(sh) && taskbarShown());
+        Window::WmInputEvent drain[256]{},event{};WmInputPop(&g,drain,256);
+        CHECK(WmSetFullscreen(game,true) && g.fullscreen && g.noChrome && g.x==0 && g.y==0);
+        CHECK(g.clientW==sw && g.clientH==sh && g.outerWidth()==sw && g.outerHeight()==sh);
+        CHECK(WmInputPop(&g,&event,1)==1 && event.type==WM_EVT_RESIZED && event.reserved==WM_RESIZE_FULLSCREEN);
+        CHECK(event.x==int16_t(sw) && event.y==int16_t(sh));
+        CHECK(!taskbarShown());
+        // Maximize requests, moves and decoration changes do not disturb it.
+        WmSetMaximized(game,false);WmMoveWindow(game,10,10);
+        WmSetClientSideDecoration(game,false);
+        CHECK(g.fullscreen && g.noChrome && g.x==0 && g.y==0 && g.clientW==sw && !taskbarShown());
+        g_launcherOpen=true;CHECK(taskbarShown());g_launcherOpen=false;
+        g_volumePopupOpen=true;CHECK(taskbarShown());g_volumePopupOpen=false;
+        CHECK(!taskbarShown());
+        WmSetFocus(editor);CHECK(taskbarShown());       // Alt+Tab away
+        WmSetFocus(game);CHECK(!taskbarShown());
+        WmMinimizeWindow(game);CHECK(taskbarShown());
+        WmRestoreWindow(game);WmSetFocus(game);CHECK(!taskbarShown());
+        {
+            WmDebugWindow snapshots[WM_MAX_WINDOWS]{};uint64_t tick=0;bool seen=false;
+            const uint32_t n=WmSnapshotDebugWindows(snapshots,WM_MAX_WINDOWS,&tick);
+            for(uint32_t i=0;i<n;++i)if(snapshots[i].id==g.wmId){seen=true;CHECK(snapshots[i].fullscreen && !snapshots[i].maximized);}
+            CHECK(seen);
+            BrookWindowState state{};CHECK(WmSnapshotOwnedWindowState(gamer,g.wmId,0,&state)==0);
+            CHECK((state.flags&BROOK_WINDOW_STATE_FULLSCREEN) && !(state.flags&BROOK_WINDOW_STATE_MAXIMIZED));
+            CHECK(state.client_x==0 && state.client_y==0 && state.width==sw && state.height==sh);
+        }
+        WmInputPop(&g,drain,256);
+        CHECK(WmSetFullscreen(game,false) && !g.fullscreen && g.state==WindowState::Maximized);
+        // The decoration requested while fullscreen (server-side) applies now.
+        CHECK(!g.noChrome && g.clientH<WmDesktopHeight(sh) && taskbarShown());
+        CHECK(WmInputPop(&g,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
+        WmSetMaximized(game,false);
+        CHECK(g.state==WindowState::Normal && g.x==40 && g.y==50 && g.clientW==640 && g.clientH==480);
+        // Legacy Xwayland WM: chrome-less, placed at the origin, output-sized.
+        WmSetClientSideDecoration(game,true);WmMoveWindow(game,0,0);
+        CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh)) && !g.fullscreen && !taskbarShown());
+        CHECK(WmResizeWindow(game,uint16_t(sw),uint16_t(sh-1)) && taskbarShown());
+        g.vfb=nullptr;WmDestroyWindowById(gamer,g_windows[editor].wmId);WmDestroyWindowById(gamer,g.wmId);
+        CHECK(taskbarShown() && !lockDepth);
+        std::free(gamer);
+    }
     // One metrics source: the WM constants are DesktopMetrics' bases, and the
     // client offset used outside the WM equals the WM's own arithmetic.
     {
@@ -614,5 +684,5 @@ int main() {
         CHECK(p.accent==0x0068ACFFu && p.halo==0x00071526u && p.ok==0x0063B782u && p.warm==0x00E5BF69u &&
               p.hot==0x00E06C75u && p.badgeText==0x00A4B2C7u && p.badgeFill==0x00172335u);
     }
-    std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry and chrome");
+    std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry, chrome and fullscreen");
 }

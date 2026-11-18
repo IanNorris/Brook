@@ -2,15 +2,17 @@
 """Host side: build a create-only staging bundle for new store paths plus
 /nix/profile symlink swaps (the pattern used for the GPU browser launchers and
 brook-vaapi). usage:
-  make_bundle.py OUTDIR --path STORE_PATH... --link PROFILE_LINK=TARGET...
-Writes OUTDIR/{store.tar,manifest.json,closure.txt,links.json,install.py} and
-OUTDIR/bundle.tar holding all five. closure.txt is the full runtime closure of
+  make_bundle.py OUTDIR --path STORE_PATH... --link PROFILE_LINK=TARGET... [--apps APPS.json]
+Writes OUTDIR/{store.tar,manifest.json,closure.txt,links.json,install.py} (and
+apps.json with --apps; its format is in install.py) and OUTDIR/bundle.tar
+holding them. closure.txt is the full runtime closure of
 the staged paths; install.py refuses to swap links unless all of it is present."""
 import argparse, hashlib, json, os, shutil, subprocess, sys, tarfile
 ap = argparse.ArgumentParser()
 ap.add_argument('out')
 ap.add_argument('--path', action='append', required=True)
 ap.add_argument('--link', action='append', default=[])
+ap.add_argument('--apps')
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=False)
 def sha(f):
@@ -48,6 +50,13 @@ with tarfile.open(os.path.join(a.out, 'store.tar'), 'w', format=tarfile.PAX_FORM
         m.uid = m.gid = 0; m.uname = m.gname = 'root'; return m
     for p in a.path: t.add(p, p.lstrip('/'), filter=root_owned)
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'install.py'), os.path.join(a.out, 'install.py'))
+names = ['store.tar', 'manifest.json', 'closure.txt', 'links.json', 'install.py']
+if a.apps:
+    apps = json.load(open(a.apps))
+    for src in apps.get('icons', {}).values():
+        assert any(src.startswith(p + '/') for p in a.path) and os.path.isfile(src), ('icon not staged', src)
+    with open(os.path.join(a.out, 'apps.json'), 'w') as f: json.dump(apps, f, indent=1, sort_keys=True)
+    names.append('apps.json')
 with tarfile.open(os.path.join(a.out, 'bundle.tar'), 'w') as t:
-    for n in ('store.tar', 'manifest.json', 'closure.txt', 'links.json', 'install.py'): t.add(os.path.join(a.out, n), n)
+    for n in names: t.add(os.path.join(a.out, n), n)
 print(os.path.join(a.out, 'bundle.tar'), sha(os.path.join(a.out, 'bundle.tar')))

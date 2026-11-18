@@ -180,6 +180,26 @@ int main(void) {
         i+=size/4;
     }
     assert(maxConfigs==2);
+    /* Native fullscreen is the fullscreen state (never also maximized) at the
+     * output size, and focus changes keep both. */
+    event=(struct brook_wm_event){.type=WM_EVT_RESIZED,.x=1920,.y=1080,.reserved=WM_RESIZE_FULLSCREEN};
+    dispatch_window_event(&surface,&event,105);assert(surface.toplevel_fullscreen && !surface.toplevel_maximized);
+    event.type=WM_EVT_FOCUS_LOST;dispatch_window_event(&surface,&event,106);
+    wl_display_flush_clients(display);keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);
+    unsigned fullConfigs=0;
+    for(size_t i=0;i<(size_t)keysBytes/4;) {
+        unsigned size=keysWire[i+1]>>16;assert(size>=8 && i*4+size<=(size_t)keysBytes);
+        if(keysWire[i]==36 && (keysWire[i+1]&65535)==XDG_TOPLEVEL_CONFIGURE) {
+            assert(keysWire[i+2]==1920 && keysWire[i+3]==1080);
+            unsigned count=keysWire[i+4]/4;int full=0,max=0;
+            for(unsigned j=0;j<count;++j){full|=keysWire[i+5+j]==XDG_TOPLEVEL_STATE_FULLSCREEN;max|=keysWire[i+5+j]==XDG_TOPLEVEL_STATE_MAXIMIZED;}
+            assert(full && !max);++fullConfigs;
+        }
+        i+=size/4;
+    }
+    assert(fullConfigs==2);
+    event.type=WM_EVT_FOCUS_GAINED;dispatch_window_event(&surface,&event,106);
+    wl_display_flush_clients(display);(void)recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);
     event=(struct brook_wm_event){.type=WM_EVT_RESIZED,.x=800,.y=600};
     dispatch_window_event(&surface,&event,107);assert(!surface.toplevel_maximized && surface.configure_size_pending);
     xdg_surface_set_window_geometry(client,surface.xdg_surface,0,0,640,480);
