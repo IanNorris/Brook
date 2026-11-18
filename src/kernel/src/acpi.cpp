@@ -211,10 +211,14 @@ const AcpiLegacyPowerInfo& AcpiGetLegacyPowerInfo(){return g_legacyPower;}
 const AcpiSciRoute& AcpiGetSciRoute(){return g_sciRoute;}
 #ifdef BROOK_DELL_ACPI_MONITOR
 uint64_t AcpiAdmitDellMonitorFirmware(AcpiDellAdmitDiag* diag) {
-    // Archived XPS 9343 FADT, MADT, DSDT and 11 SSDTs in root order.
+    // Archived XPS 9343 FADT, MADT, DSDT and 11 SSDTs in root order, with the
+    // MADT normalised (AcpiDellNormalizeMadt): the firmware leaves the LAPIC
+    // NMI entries' flags/LINT# bytes uninitialised and they change between
+    // boots (gen 432: processor 4 flags 0x6ceb LINT 4 -> 0x6cef LINT 5; only
+    // LINT 0/1 exist). Brook never reads NMI entries.
     constexpr uint8_t expected[32]={
-        0x0f,0x25,0x88,0xec,0x24,0x29,0x7e,0xd3,0x42,0xfd,0xe5,0x96,0x3e,0x44,0xaf,0x3e,
-        0x6b,0x01,0x7e,0xe0,0xa1,0x58,0x1d,0x46,0xe8,0xd7,0xcb,0x2e,0x28,0xdb,0xb6,0xf4,
+        0x19,0xd7,0x74,0xa6,0x2a,0xfe,0x06,0x6f,0x4c,0xfd,0x80,0xcd,0xb0,0x5c,0x20,0xce,
+        0x2f,0x6c,0x7b,0x5f,0x98,0xb7,0x71,0xe1,0xba,0xb1,0x3a,0x24,0x1c,0xf8,0x5a,0xbf,
     };
     AcpiDellAdmitDiag local{};auto& d=diag?*diag:local;d=AcpiDellAdmitDiag{};
     auto refuse=[&](const char* why)->uint64_t{d.reason=why;return 0;};
@@ -239,9 +243,13 @@ uint64_t AcpiAdmitDellMonitorFirmware(AcpiDellAdmitDiag* diag) {
     if(!add(fadt,header))return refuse("FADT outside firmware memory");
     d.fadtLength=header.length;prefix(fadt,header.length,d.fadtHash);
     const uint64_t madt=g_tables.Find("APIC",&header);
-    if(!add(madt,header))return refuse("MADT outside firmware memory");
+    if(!madt || !ContainsFirmware(madt,header.length,false))return refuse("MADT outside firmware memory");
+    if(header.length>sizeof(d.madt))return refuse("MADT too large");
     d.madtLength=header.length;prefix(madt,header.length,d.madtHash);
-    __builtin_memcpy(d.madt,reinterpret_cast<const void*>(madt),header.length<sizeof(d.madt)?header.length:sizeof(d.madt));
+    __builtin_memcpy(d.madt,reinterpret_cast<const void*>(madt),header.length);
+    {uint8_t normalized[sizeof(d.madt)];__builtin_memcpy(normalized,d.madt,header.length);
+     if(!AcpiDellNormalizeMadt(normalized,header.length))return refuse("MADT structure");
+     BrookShaAdd(&hash,normalized,header.length);}
     const uint64_t dsdt=g_tables.Dsdt(&header);
     if(!add(dsdt,header))return refuse("DSDT outside firmware memory");
     unsigned ssdts=0,fadts=0,madts=0;

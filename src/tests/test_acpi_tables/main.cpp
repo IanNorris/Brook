@@ -120,7 +120,22 @@ static void TestEmbeddedController() {
     Io after;
     assert(controller.Read(after,6,value)==AcpiEcResult::Unavailable && !after.polls);
 }
+static void TestDellMadtNormalize(){
+    // Header (44 bytes) + LAPIC (type 0) + LAPIC NMI (type 4) + IOAPIC (type 1).
+    uint8_t a[44+8+6+12]{};a[0]='A';a[9]=0x5a;uint32_t o=44;
+    const uint8_t lapic[8]={0,8,1,0,1,0,0,0},nmi[6]={4,6,4,0xeb,0x6c,4},io[12]={1,12,2,0,0,0,0xc0,0xfe,0,0,0,0};
+    std::memcpy(a+o,lapic,8);o+=8;std::memcpy(a+o,nmi,6);o+=6;std::memcpy(a+o,io,12);
+    uint8_t b[sizeof(a)];std::memcpy(b,a,sizeof(a));b[9]=0x55;b[44+8+3]=0xef;b[44+8+5]=5; // a later boot's noise
+    assert(AcpiDellNormalizeMadt(a,sizeof(a)) && AcpiDellNormalizeMadt(b,sizeof(b)) && !std::memcmp(a,b,sizeof(a)));
+    assert(a[44+8+2]==4); // the NMI processor UID stays pinned
+    uint8_t c[sizeof(a)];std::memcpy(c,a,sizeof(a));c[44+2]=2;AcpiDellNormalizeMadt(c,sizeof(c));assert(std::memcmp(a,c,sizeof(a))); // LAPIC change still differs
+    uint8_t bad[sizeof(a)];std::memcpy(bad,a,sizeof(a));bad[44+8+1]=7;assert(!AcpiDellNormalizeMadt(bad,sizeof(bad))); // odd NMI length
+    bad[44+8+1]=200;assert(!AcpiDellNormalizeMadt(bad,sizeof(bad))); // overruns the table
+    bad[44+8+1]=0;assert(!AcpiDellNormalizeMadt(bad,sizeof(bad)));
+    assert(!AcpiDellNormalizeMadt(a,43));
+}
 int main(){
+    TestDellMadtNormalize();
     Firmware f;assert(f.init());auto reset=AcpiGetResetInfo();assert(reset.available && reset.port==0xcf9 && reset.value==6);
     TestLegacyPower(f);
     TestEmbeddedController();
