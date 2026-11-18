@@ -11,6 +11,7 @@
 #include <thread>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 #include <sys/mman.h>
 #include "memory/mapping_transaction.h"
 #include "memory/user_mapping.h"
@@ -93,6 +94,24 @@ void empty() {
 }
 namespace {
 Gate* pendingAcknowledgement=nullptr;
+// Models per-CPU TLB acknowledgement for the lock-free page-access stress:
+// each simulated copier is odd while it may hold a translation it walked.
+// A shootdown returns only after every copier inside at its start has left,
+// as a real IPI ACK cannot complete mid-copy on an interrupts-off CPU and a
+// flushed CPU re-walks (and faults) afterwards.
+struct CopyWindows {
+    static constexpr unsigned Count=8;
+    std::atomic<uint64_t> state[Count]{};
+    std::atomic<uint64_t> shootdowns{0};
+    void acknowledge() {
+        uint64_t snapshot[Count];
+        for(unsigned i=0;i<Count;++i)snapshot[i]=state[i].load(std::memory_order_seq_cst);
+        for(unsigned i=0;i<Count;++i)
+            if(snapshot[i]&1)while(state[i].load(std::memory_order_seq_cst)==snapshot[i])std::this_thread::yield();
+        ++shootdowns;
+    }
+};
+std::atomic<CopyWindows*> copyWindows{nullptr};
 int closedVnodes=0, unpinnedVnodes=0, droppedMemfds=0;
 struct BorrowedBacking { PhysicalAddress page; };
 Process* expectedDestroy = nullptr;
@@ -157,7 +176,10 @@ void CompositorReleaseAddressSpaceBuffers(AddressSpaceState* space) {
     CHECK(!PmmGetRefCount(space->pageTable.pml4));
     if(lateRetirement) { auto* late=lateRetirement;lateRetirement=nullptr;AddressSpaceUnref(late); }
 }
-void TlbShootdownFull(uint64_t,uint64_t) { if(pendingAcknowledgement)pendingAcknowledgement->park(); }
+void TlbShootdownFull(uint64_t,uint64_t) {
+    if(pendingAcknowledgement)pendingAcknowledgement->park();
+    if(auto* windows=copyWindows.load())windows->acknowledge();
+}
 void MemFdHandleUnref(void* handle) { ++droppedMemfds;PmmFreePage(static_cast<BorrowedBacking*>(handle)->page); }
 void VfsFileMapUnpin(Vnode*) { ++unpinnedVnodes; }
 extern "C" void VfsClose(Vnode* vn) { CHECK(!vn->refCount);++closedVnodes; }
@@ -2063,6 +2085,153 @@ static void pageAccessWithoutUnrelatedGate() {
     std::puts("PAGE ACCESS PASS unrelated-gate/no-allocation/read-statuses/CoW-revalidation/lifetime");
 }
 
+// Lock-free UserMappingPageAccess fast path: present user-accessible leaves
+// answer while AS.mutation is held elsewhere; everything else still waits for
+// the authoritative locked check. Then copiers race munmap/mmap/mprotect of
+// the same range and must never observe a retired (poisoned) frame.
+static void pageAccessFastPath() {
+    auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
+    auto* space=AddressSpaceCreate(31);auto* child=AddressSpaceCreate(32);CHECK(space&&child);
+    Process actor{};actor.addressSpace=space;
+    constexpr unsigned Pages=8;
+    const uint64_t base=0x60000000;
+    auto map=[&](Process& who) {
+        UserMappingRequest request{};request.range=rangeRecord(0,Pages*pageSize,nullptr);
+        request.length=Pages*pageSize;request.preparedPages=Pages;request.prepare=prepareMappingPages;
+        request.fixed=true;request.hint=base;
+        CHECK(UserMappingCreate(&who,space,request)==static_cast<int64_t>(base));
+    };
+    map(actor);
+    CHECK(UserMappingRemove(&actor,space,base+2*pageSize,pageSize)==0);          // page 2 unmapped
+    CHECK(UserMappingProtect(&actor,space,base+3*pageSize,pageSize,1)==0);       // page 3 read-only
+    CHECK(UserMappingProtect(&actor,space,base+4*pageSize,pageSize,0)==0);       // page 4 PROT_NONE
+    {
+        // Page 5 becomes a private CoW candidate shared with a child.
+        Process childActor{};childActor.addressSpace=child;
+        CHECK(UserMappingClone(&actor,space,child,32));
+        CHECK(VmmReadLeaf(space->pageTable,VirtualAddress(base+5*pageSize))&PTE_COW_BIT);
+        // Fork downgraded every private page; break page 1 back to writable.
+        CHECK(UserMappingPageAccess(&actor,space,base+pageSize,2,true)==UserPageAccess::Ready);
+        CHECK(VmmReadLeaf(space->pageTable,VirtualAddress(base+pageSize))&VMM_WRITABLE);
+    }
+    // Hold the mutation lock as a long munmap/fault would.
+    KMutexLock(&space->mutation);
+    std::atomic<unsigned> fastDone{0};std::atomic<bool> slowDone{false};
+    UserPageAccess fast[3]{},slow[4]{};
+    std::thread fastReader([&]{
+        Process reader{};reader.addressSpace=space;
+        fast[0]=UserMappingPageAccess(&reader,space,base,1,true);
+        fast[1]=UserMappingPageAccess(&reader,space,base+pageSize,2,true);
+        fast[2]=UserMappingPageAccess(&reader,space,base+3*pageSize,1,true);
+        CHECK(reader.kernelRegionDepth==0&&reader.refCount==0);
+        fastDone=1;
+    });
+    std::thread slowReader([&]{
+        Process reader{};reader.addressSpace=space;
+        slow[0]=UserMappingPageAccess(&reader,space,base+2*pageSize,1,true);
+        slow[1]=UserMappingPageAccess(&reader,space,base+3*pageSize,2,true);
+        slow[2]=UserMappingPageAccess(&reader,space,base+4*pageSize,1,true);
+        slow[3]=UserMappingPageAccess(&reader,space,base+Pages*pageSize,1,true);
+        slowDone=true;
+    });
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(!fastDone && std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+    const bool fastWhileHeld=fastDone.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool slowWhileHeld=slowDone.load();
+    KMutexUnlock(&space->mutation);fastReader.join();slowReader.join();
+    CHECK(fastWhileHeld&&!slowWhileHeld);
+    CHECK(fast[0]==UserPageAccess::Ready&&fast[1]==UserPageAccess::Ready&&fast[2]==UserPageAccess::Ready);
+    CHECK(slow[0]==UserPageAccess::Denied&&slow[1]==UserPageAccess::Denied); // unmapped, read-only write
+    CHECK(slow[2]==UserPageAccess::Denied&&slow[3]==UserPageAccess::Denied);
+    // CoW write cannot use the fast path: it waits, then resolves under lock.
+    KMutexLock(&space->mutation);
+    std::atomic<bool> cowDone{false};UserPageAccess cowResult=UserPageAccess::Denied;
+    std::thread cowWriter([&]{
+        Process writer{};writer.addressSpace=space;
+        cowResult=UserMappingPageAccess(&writer,space,base+5*pageSize,2,true);cowDone=true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool cowWhileHeld=cowDone.load();
+    KMutexUnlock(&space->mutation);cowWriter.join();
+    CHECK(!cowWhileHeld&&cowResult==UserPageAccess::Ready);
+    CHECK(VmmReadLeaf(space->pageTable,VirtualAddress(base+5*pageSize))&VMM_WRITABLE);
+    AddressSpaceUnref(child);CHECK(ProcessCleanupStep());
+
+    // Throughput: fast path versus the mutex path (an unmapped page), all
+    // threads in one AS. Informational; the decision metric is the convoy.
+    {
+        constexpr unsigned Threads=8,Calls=50000;
+        auto run=[&](uint64_t address,UserPageAccess expected) {
+            std::vector<std::thread> workers;
+            const auto start=std::chrono::steady_clock::now();
+            for(unsigned t=0;t<Threads;++t)workers.emplace_back([&]{
+                Process reader{};reader.addressSpace=space;
+                for(unsigned i=0;i<Calls;++i)CHECK(UserMappingPageAccess(&reader,space,address,1,true)==expected);
+            });
+            for(auto& worker:workers)worker.join();
+            const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+            return Threads*Calls/seconds;
+        };
+        const double fastRate=run(base,UserPageAccess::Ready);
+        const double lockedRate=run(base+2*pageSize,UserPageAccess::Denied);
+        std::printf("PAGE ACCESS THROUGHPUT threads=8 fast=%.0f/s locked=%.0f/s\n",fastRate,lockedRate);
+    }
+
+    // Stress: copiers versus munmap/mmap/mprotect of the same range.
+    CHECK(UserMappingRemove(&actor,space,base,Pages*pageSize)==0);map(actor);
+    CopyWindows windows;copyWindows=&windows;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> ready{0},missing{0},denied{0},bytesRead{0};
+    constexpr unsigned Copiers=4;
+    std::vector<std::thread> copiers;
+    for(unsigned c=0;c<Copiers;++c)copiers.emplace_back([&,c]{
+        Process reader{};reader.addressSpace=space;
+        auto& window=windows.state[c];
+        while(!stop.load(std::memory_order_relaxed)) {
+            for(unsigned page=0;page<Pages;++page) {
+                const uint64_t address=base+page*pageSize;
+                const uint32_t access=(page&1)?2:1;
+                window.fetch_add(1,std::memory_order_seq_cst); // enter: may cache a walk
+                const auto status=UserMappingPageAccess(&reader,space,address,access,true);
+                if(status==UserPageAccess::Ready) {
+                    // The "copy": walk again as the CPU would and read the frame.
+                    // Anonymous frames hold zero; a retired frame is poisoned 0xa5.
+                    const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+                    if(leaf&VMM_PRESENT) {
+                        const auto* bytes=reinterpret_cast<const volatile unsigned char*>(VmmLeafPhysical(leaf).raw());
+                        for(unsigned j=0;j<pageSize;j+=64)CHECK(bytes[j]==0);
+                        bytesRead+=pageSize;
+                    }
+                    ++ready;
+                } else if(status==UserPageAccess::Missing)++missing;
+                else {CHECK(status==UserPageAccess::Denied);++denied;}
+                window.fetch_add(1,std::memory_order_seq_cst); // leave
+            }
+        }
+        CHECK(reader.kernelRegionDepth==0&&reader.refCount==0);
+    });
+    constexpr unsigned Rounds=1500;
+    for(unsigned round=0;round<Rounds;++round) {
+        CHECK(UserMappingRemove(&actor,space,base,Pages*pageSize)==0);
+        map(actor);
+        CHECK(UserMappingProtect(&actor,space,base,4*pageSize,1)==0);
+        CHECK(UserMappingProtect(&actor,space,base+4*pageSize,2*pageSize,0)==0);
+        CHECK(UserMappingRemove(&actor,space,base+6*pageSize,pageSize)==0);
+        CHECK(UserMappingProtect(&actor,space,base,6*pageSize,3)==0);
+    }
+    stop=true;for(auto& copier:copiers)copier.join();copyWindows=nullptr;
+    CHECK(ready&&denied&&windows.shootdowns);
+    std::printf("PAGE ACCESS STRESS rounds=%u ready=%llu missing=%llu denied=%llu shootdowns=%llu\n",Rounds,
+        (unsigned long long)ready.load(),(unsigned long long)missing.load(),(unsigned long long)denied.load(),
+        (unsigned long long)windows.shootdowns.load());
+    CHECK(UserMappingRemove(&actor,space,base,Pages*pageSize)==0);
+    CHECK(space->references==1&&actor.kernelRegionDepth==0&&actor.refCount==0);
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("PAGE ACCESS FAST PASS lock-free-present/locked-fallback/CoW/throughput/munmap-mmap-mprotect-stress");
+}
+
 static void anonymousIntervalIsolation() {
     auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
     auto* space=AddressSpaceCreate(80);auto* child=AddressSpaceCreate(81);CHECK(space&&child);
@@ -2907,7 +3076,7 @@ int main(int argc,char** argv) {
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();forkAdvice();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
-    targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
+    targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();pageAccessFastPath();
     anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);

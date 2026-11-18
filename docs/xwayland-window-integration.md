@@ -74,6 +74,19 @@ branch's report.
   - pid 689: 2.5 s.
   This is not fixed here. It needs a lock-free read-only PTE check or a
   reader lock, in the same spirit as `work/kregion-lockfree`.
+  Fixed later on `work/mapping-convoy` (option b, no sequence check): a
+  leaf that is present, `VMM_USER` and grants the access answers Ready
+  under the page-table spinlock alone; all other cases take the locked path
+  unchanged. A sequence check is unnecessary because the locked answer was
+  already advisory (released before the copy). Frames retire only after the
+  full TLB ACK, and user page tables are freed only at the final AS unref.
+  The safety argument is at `LeafGrantsUserAccess` in
+  `src/kernel/src/memory/user_mapping.cpp`. `test_vmm_leaf`
+  `pageAccessFastPath` covers it: lock-free answers while the mutex is held,
+  locked fallback and CoW, and copiers racing munmap/mmap/mprotect under a
+  modelled ACK. Removing the ACK wait from that model makes the test fail.
+  Host throughput with 8 threads in one AS is about 9.9 M/s on the fast path
+  and 2.0 M/s on the locked path.
 - **Present pacing.** Rootless Xwayland completes a sync flip at the next
   `wl_surface.frame` done after its commit. Mesa GLX with swap interval 1
   keeps only one swap outstanding (`loader_dri3_swap_buffers_msc` waits for
