@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import random
 import re
 from pathlib import Path
 import shutil
@@ -85,7 +86,11 @@ def main():
     parser.add_argument('--auto-desktop-dell-async-network',action='store_true',help='Retain Dell asynchronous TCP settings with the emulated NIC')
     parser.add_argument('--normal-kernel',type=Path,help='Use this normal kernel for the final boot')
     parser.add_argument('--normal-network-module',type=Path,help='Matching virtio-net module for normal boot')
+    parser.add_argument('--ssd-trim', choices=('dry-run', 'run'))
     a=parser.parse_args()
+    if a.ssd_trim and (not a.auto_desktop_dell_initrd or not a.auto_desktop_intel_provider or
+                       not a.auto_desktop_vulkan_service or a.auto_desktop_panic):
+        parser.error('SSD TRIM requires the Dell initrd and synthetic desktop services')
     if (a.torn_journal_before_desktop or a.torn_journal_before_repair) and (not a.auto_desktop_reset or a.two_panic_records or a.auto_desktop_serial_stall or a.auto_desktop_nested_panic or (a.torn_journal_before_desktop and a.torn_journal_before_repair)):
         parser.error('torn journal requires an ordinary desktop panic and reset')
     if a.auto_desktop_corrupt_counts and (not a.auto_desktop_reset or a.auto_desktop_startup_panic or
@@ -184,6 +189,11 @@ def main():
                 for name in ('arp-async-probe','tcp-async-neighbor','tcp-try-transmit','tcp-async-send',
                              'tcp-producer-wake','tcp-async-retry-1ms','tcp-worker-waiter','tcp-adaptive-flight16'):
                     subprocess.run(['mdel','-i',str(normal),'::/ETC/'+name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if a.ssd_trim:
+            subprocess.run(['mcopy','-o','-i',str(normal),'-','::/ETC/ssd-trim'],
+                           input=(a.ssd_trim+'\n').encode(),check=True)
+            subprocess.run(['mcopy','-o','-i',str(normal),'-','::/BOOT/INIT.RC'],
+                           input=startup.rstrip(b'\r\n')+b'\nshutdown\n',check=True)
         if a.auto_desktop:
             for directory in ('MEDIA','MEDIA/SYSTEM','DATA','NIX'):
                 if subprocess.run(['mdir','-i',str(normal),'::/'+directory],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
@@ -272,6 +282,23 @@ def main():
                         subprocess.run(['debugfs','-w','-R',f'set_inode_field {target} mode 0100755',str(partition)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                         evidence['libraries'][target]=hashlib.sha256(source.read_bytes()).hexdigest()
                 (a.output/'provider-runtime.json').write_text(json.dumps(evidence,indent=2)+'\n')
+        trim_live = {}
+        if a.ssd_trim:
+            rng = random.Random(32768)
+            deleted = work/'deleted'
+            deleted.write_bytes(rng.randbytes(12*1024*1024))
+            live = work/'live'
+            live.write_bytes(rng.randbytes(2*1024*1024))
+            for cmd in (f'write {live} /TRIMLIVE.BIN', f'write {deleted} /TRIMDEAD.BIN',
+                        'rm /TRIMDEAD.BIN'):
+                subprocess.run(['debugfs','-w','-R',cmd,str(partition)],check=True,
+                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            for name in (*FILES, 'TRIMLIVE.BIN'):
+                content=subprocess.check_output(['debugfs','-R',f'cat /{name}',str(partition)],
+                                                stderr=subprocess.DEVNULL)
+                trim_live[name]=hashlib.sha256(content).hexdigest()
+            if trim_live['TRIMLIVE.BIN'] != hashlib.sha256(live.read_bytes()).hexdigest():
+                raise RuntimeError('TRIM live fixture was not written')
         with disk.open('r+b') as dst,partition.open('rb') as src:
             dst.seek(133120*512);shutil.copyfileobj(src,dst);dst.seek(133120*512+1024+58);dst.write(b'\0\0')
         guard=bytearray(128);guard[:8]=b'BRKRCV01';struct.pack_into('<QI',guard,8,1,1)
@@ -674,6 +701,39 @@ def main():
             finally:
                 for name in ('serial.log','qemu.log'):
                     if (second/name).exists():shutil.copyfile(second/name,a.output/('desktop-attempt-'+name))
+        elif a.ssd_trim:
+            qcow=work/'trim.qcow2'
+            subprocess.run(['qemu-img','convert','-f','raw','-O','qcow2',str(disk),str(qcow)],check=True)
+            def allocation():
+                return sum(e['length'] for e in json.loads(subprocess.check_output(
+                    ['qemu-img','map','--output=json',str(qcow)])) if e['data'])
+            before=allocation()
+            try:
+                boot(qcow,a.firmware,second,False,'AHCI_DIRECT_SESSION_CLEAN\r\n',120,True,
+                     sata_snapshot=False,sata_discard=True,sata_serial='BROOK-RECOVERY-QA',
+                     expect_reset=True,reset_evidence_marker='efi-runtime: shutdown call',
+                     failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
+            finally:
+                for name in ('serial.log','qemu.log'):
+                    if (second/name).exists():shutil.copyfile(second/name,a.output/('trim-'+name))
+            after=allocation()
+            trim_serial=(second/'serial.log').read_text(errors='replace')
+            reports=re.findall(r'^SSD_TRIM (\{.*\})',trim_serial,re.M)
+            if len(reports)!=1:
+                raise RuntimeError('expected one SSD TRIM report')
+            report=json.loads(reports[0])
+            if report['error'] or report['mode']!=a.ssd_trim or report['bytes'] < 12*1024*1024:
+                raise RuntimeError(f'unexpected SSD TRIM result {report}')
+            if a.ssd_trim=='run' and (report['dsm_commands'] < 1 or before-after < 8*1024*1024):
+                raise RuntimeError(f'SSD TRIM did not reclaim expected allocation: {before} -> {after}')
+            if a.ssd_trim=='dry-run' and (report['dsm_commands'] or not report['planned_commands'] or
+                                          before-after > 0):
+                raise RuntimeError('dry-run issued discard or failed to plan commands')
+            if trim_serial.index('SSD_TRIM {') >= trim_serial.index('ahci direct: ready '):
+                raise RuntimeError('allocator was published before TRIM completed')
+            report.update(allocated_before=before,allocated_after=after,live_hashes=trim_live)
+            (a.output/'ssd-trim.json').write_text(json.dumps(report,indent=2)+'\n')
+            subprocess.run(['qemu-img','convert','-f','qcow2','-O','raw',str(qcow),str(disk)],check=True)
         elif a.auto_desktop:
             boot(disk,a.firmware,second,False,'GUARD_DESKTOP_HANDOFF_SCRIPT status=0',120,True,sata_snapshot=False,
                  hold_after_marker=5,sata_serial='BROOK-RECOVERY-QA',failure_marker='GUARD_DESKTOP_HANDOFF_FAILED')
@@ -830,6 +890,16 @@ def main():
             if subprocess.check_output(['mtype','-i',media,'::/PANIC.BIN'])!=journal_after:
                 raise RuntimeError('desktop panic recovery changed the journal')
         with disk.open('rb') as src,partition.open('wb') as dst:src.seek(133120*512);dst.write(src.read(126976*512))
+        if a.ssd_trim:
+            with partition.open('rb') as data:
+                data.seek(1024+58)
+                if data.read(2)!=b'\x01\x00':
+                    raise RuntimeError('TRIM fixture did not leave a clean ext2 header')
+            for name, digest in trim_live.items():
+                content=subprocess.check_output(['debugfs','-R',f'cat /{name}',str(partition)],
+                                                stderr=subprocess.DEVNULL)
+                if hashlib.sha256(content).hexdigest()!=digest:
+                    raise RuntimeError(f'TRIM fixture changed /{name}')
         if a.auto_desktop_shutdown or dell_shutdown:
             with partition.open('rb') as source:
                 source.seek(1024+58)

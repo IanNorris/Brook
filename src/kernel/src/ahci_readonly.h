@@ -3,6 +3,7 @@
 #include "../../shared/brook_ahci_export.h"
 namespace brook {
 struct Device;
+struct TrimRange;
 struct AhciReadOnlyStatus {
     bool requested=false, ready=false, quarantined=false;
     const char* reason="not requested";
@@ -30,6 +31,12 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus();
 // Boot-only, borrowed device pointer: available only for an identity-admitted,
 // ready writable disk. The registered device remains pinned for the boot.
 Device* AhciWriteAdmittedDevice();
+// Internal guarded pre-mount path only. The caller must own the boot write
+// lease, validate filesystem exclusions and keep the allocator unpublished.
+uint16_t AhciTrimPayloadLimit(Device* parent);
+int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
+                  uint32_t count, bool submit, uint32_t& commands);
+
 #if defined(BROOK_SSD_INSTALLER)
 Device* AhciPhysicalInstallDevice();
 Device* AhciPhysicalBlockToolsDevice();

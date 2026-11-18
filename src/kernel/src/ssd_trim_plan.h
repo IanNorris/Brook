@@ -15,6 +15,52 @@ constexpr uint32_t TrimPayloadBlockBytes = 512;
 constexpr uint32_t TrimEntryBytes = 8;
 constexpr uint32_t TrimEntryMaxSectors = 65535;
 
+struct SsdTrimRequest {
+    bool run = false;
+    uint32_t minimumMiB = 1;
+    uint32_t maximumMiB = 0;
+};
+
+// Empty file means dry-run with defaults. An optional minimum and maximum
+// are decimal MiB. A maximum of zero means the whole admitted partition.
+inline bool SsdTrimParseRequest(const char* input, uint32_t bytes, SsdTrimRequest& out)
+{
+    out = {};
+    if (!bytes)
+        return true;
+    if (!input || input[bytes - 1] != '\n')
+        return false;
+    --bytes;
+    SsdTrimRequest request{};
+    uint32_t at = 0;
+    const char* verb = bytes && input[0] == 'r' ? "run" : "dry-run";
+    request.run = verb[0] == 'r';
+    while (verb[at]) {
+        if (at >= bytes || verb[at] != input[at])
+            return false;
+        ++at;
+    }
+    auto number = [&](uint32_t& value) {
+        if (at >= bytes || input[at++] != ' ' || at >= bytes)
+            return false;
+        value = 0;
+        const uint32_t start = at;
+        while (at < bytes && input[at] >= '0' && input[at] <= '9') {
+            value = value * 10 + uint32_t(input[at++] - '0');
+            if (value > 524288)
+                return false;
+        }
+        return at > start;
+    };
+    if ((at < bytes && !number(request.minimumMiB)) ||
+        (at < bytes && !number(request.maximumMiB)) || at != bytes ||
+        !request.minimumMiB ||
+        (request.maximumMiB && request.maximumMiB < request.minimumMiB))
+        return false;
+    out = request;
+    return true;
+}
+
 inline bool TrimRangeInside(TrimRange range, TrimRange bounds)
 {
     return bounds.sectors && bounds.lba < TrimLbaLimit &&
@@ -48,7 +94,10 @@ inline uint16_t AtaTrimPayloadLimit(const uint8_t* identify, uint32_t bytes)
         return 0;
     const uint16_t support = AtaIdentifyWord(identify, 169);
     const uint16_t limit = AtaIdentifyWord(identify, 105);
-    return support != 0xffff && (support & 1u) && limit != 0xffff ? limit : 0;
+    if (support == 0xffff || !(support & 1u) || limit == 0xffff)
+        return 0;
+    // Zero means the device does not specify a limit. Use one block.
+    return limit ? limit : 1;
 }
 
 inline bool AhciPlanTrim(AhciReadPlan& out, uint16_t payloadBlocks,

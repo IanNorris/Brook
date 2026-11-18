@@ -110,6 +110,14 @@ static void TestCleanScan()
 
 int main()
 {
+    SsdTrimRequest request{};
+    assert(SsdTrimParseRequest(nullptr, 0, request));
+    assert(!request.run && request.minimumMiB == 1 && !request.maximumMiB);
+    assert(SsdTrimParseRequest("run 1 16\n", 9, request));
+    assert(request.run && request.minimumMiB == 1 && request.maximumMiB == 16);
+    assert(!SsdTrimParseRequest("run 2 1\n", 8, request));
+    assert(!SsdTrimParseRequest("run 0\n", 6, request));
+    assert(!SsdTrimParseRequest("run", 3, request));
     TestExt2Metadata();
     TestCleanScan();
     const TrimRange partition{2048, 524288};
@@ -126,6 +134,9 @@ int main()
     identify[210] = 2;
     assert(AtaTrimPayloadLimit(identify, sizeof(identify)) == 0);
     identify[338] = 1;
+    identify[210] = 0;
+    assert(AtaTrimPayloadLimit(identify, sizeof(identify)) == 1);
+    identify[210] = 2;
     assert(AtaTrimPayloadLimit(identify, sizeof(identify)) == 2);
     assert(AtaTrimPayloadLimit(identify, 511) == 0);
     AhciReadPlan plan{};

@@ -19,7 +19,8 @@ from pathlib import Path
 def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None, sata_snapshot=True,
          hold_after_marker=0, sata_serial=None, failure_marker=None, extra_fw_cfg=None, expect_reset=False,
          network_port=None,on_marker=None,network_usb=False,intermediate_marker=None,on_intermediate=None,
-         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2):
+         reset_evidence_marker='PANIC_TEST_RESET_WAIT',gdb_script=None,smp=2,
+         sata_discard=False):
     variables = work / 'vars.fd'
     serial = work / 'serial.log'
     monitor = work / 'monitor.sock'
@@ -31,8 +32,9 @@ def boot(image, firmware, work, recovery, marker, timeout, sata, forbidden=None,
         '-drive', f'if=pflash,format=raw,file={variables}', '-device', 'VGA',
     ]
     if sata:
+        disk_format = 'qcow2,discard=unmap' if sata_discard else 'raw'
         command += [
-            '-drive', f'if=none,id=stick,format=raw,snapshot={"on" if sata_snapshot else "off"},file={image}',
+            '-drive', f'if=none,id=stick,format={disk_format},snapshot={"on" if sata_snapshot else "off"},file={image}',
             '-device', 'ide-hd,drive=stick,bus=ide.0,bootindex=1' +
                        (f',serial={sata_serial}' if sata_serial else ''),
         ]

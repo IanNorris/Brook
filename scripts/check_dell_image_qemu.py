@@ -113,6 +113,7 @@ def main():
     p.add_argument('--force', action='store_true', help='replace an existing result directory')
     p.add_argument('--attempts', type=int, default=2,
                    help='maximum runs; only a firmware stall before boot selection is retried (default 2)')
+    p.add_argument('--ssd-trim', choices=('dry-run', 'run'), help='also test TRIM in the disposable fixture')
     a = p.parse_args()
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
@@ -187,6 +188,8 @@ def main():
                     '--image', str(image), '--efi', str(efi), '--firmware', str(firmware),
                     '--desktop-pair', str(desktop), '--recovery-pair', str(recovery),
                     '--output', str(run_dir), '--identity', rmanifest['guard_identity'], *MODE_FLAGS]
+            if a.ssd_trim:
+                argv += ['--ssd-trim', a.ssd_trim]
             print('+', ' '.join(argv), flush=True)
             start = time.monotonic()
             with log_path.open('w') as log:

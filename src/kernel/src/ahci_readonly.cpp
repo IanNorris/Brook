@@ -4,6 +4,7 @@
 #include "ahci_readonly_sequence.h"
 #include "ahci_firmware_handoff.h"
 #include "ahci_write_plan.h"
+#include "ssd_trim_plan.h"
 #include "ahci_byte_write.h"
 #include "ahci_panic_gate.h"
 #include "ahci_write_target.h"
@@ -58,6 +59,7 @@ struct NormalIoGuard {
     ~NormalIoGuard() { if(admitted)panicGate.LeaveNormal(); KMutexUnlock(&ioLock); }
 };
 bool published=false;
+uint16_t trimPayloadLimit=0;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
 #if defined(BROOK_AHCI_PANIC_TEST) || defined(BROOK_SSD_GUARD_PENDING_TEST) || defined(BROOK_SSD_AUTO_RECOVERY)
@@ -319,7 +321,12 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
         !plan.prdtEntries && !expected;
     valid=valid || isFlush || (writeEnabled && plan.fis[2]==0x35 &&
         plan.commandFlags==(5u|(1u<<6)) && plan.prdtEntries==1 && expected && plan.byteCountMinusOne+1==expected);
-    if(!dma || status.quarantined || !valid)
+    const bool isTrim=writeEnabled && trimPayloadLimit && plan.fis[2]==0x06 &&
+        plan.fis[3]==1 && plan.commandFlags==(5u|(1u<<6)) && plan.prdtEntries==1 &&
+        expected && expected%512==0 && expected/512<=trimPayloadLimit &&
+        expected/512==(uint32_t(plan.fis[12]) | (uint32_t(plan.fis[13]) << 8)) &&
+        plan.byteCountMinusOne+1==expected;
+    if(!dma || status.quarantined || !(valid || isTrim))
         return false;
     // Do not alter descriptors if hardware unexpectedly owns any slot.
     if (io.read(CI) != 0 || io.read(SACT) != 0) {
@@ -339,7 +346,7 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
     if(result!=Result::Ok) { Quarantine("AHCI command failed or timed out");return false; }
     const uint8_t* d2h=dma+fisOffset+0x40;
     if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
-    StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
+    if(!isTrim)StorageIoAccount(uint32_t(StorageIoSource::Ahci),isFlush?2:plan.fis[2]==0x35?1:0,expected);
     return true;
 }
 
@@ -578,6 +585,7 @@ void AhciReadOnlyInit() {
        !(AtaIdentifyWord(dma+dataOffset,49)&(1u<<8))) {
         Quarantine("ATA identify geometry or DMA unsupported");return;
     }
+    trimPayloadLimit=AtaTrimPayloadLimit(dma+dataOffset,512);
     status.sectors=info.sectors;status.logicalSectorBytes=info.logicalSectorBytes;
     status.physicalSectorBytes=info.physicalSectorBytes;memcpy(status.model,info.model,sizeof(status.model));
     memcpy(status.serial,info.serial,sizeof(status.serial));
@@ -748,6 +756,43 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return status;
     KMutexLock(&ioLock);const auto copy=status;KMutexUnlock(&ioLock);return copy;
 }
+uint16_t AhciTrimPayloadLimit(Device* parent) {
+    if(parent!=&device || !__atomic_load_n(&published,__ATOMIC_ACQUIRE) || !writeEnabled)
+        return 0;
+    return trimPayloadLimit;
+}
+
+int AhciTrimBatch(Device* parent, TrimRange partition, const TrimRange* ranges,
+                  uint32_t count, bool submit, uint32_t& commands) {
+    const uint16_t limit=AhciTrimPayloadLimit(parent);
+    if(!limit)return -95;
+    if(!ranges || !count || !TrimRangeInside(partition,{0,status.sectors}))return -22;
+    // Deliberately cap this path to one payload sector per command. This
+    // bounds lock hold time and works with any positive IDENTIFY limit.
+    uint8_t payload[512]{};
+    int error=-22;
+    const bool ok=TrimVisitPayloads(ranges,count,partition,nullptr,0,payload,sizeof(payload),limit,
+        [&](uint16_t blocks) {
+            if(submit) {
+                NormalIoGuard guard;
+                AhciReadPlan plan{};
+                if(!guard.admitted || !status.ready ||
+                   !AhciPlanTrim(plan,blocks,limit,dmaPhys+dataOffset,dma64)) {
+                    error=-5;
+                    return false;
+                }
+                memcpy(dma+dataOffset,payload,sizeof(payload));
+                if(!Run(plan,sizeof(payload))) {
+                    error=-5;
+                    return false;
+                }
+            }
+            ++commands;
+            return true;
+        });
+    return ok?0:error;
+}
+
 Device* AhciWriteAdmittedDevice() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
 #if defined(BROOK_SSD_INSTALLER)
