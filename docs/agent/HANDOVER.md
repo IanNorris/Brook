@@ -24,6 +24,9 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 
 ## Active goal (set 14 November 2026)
 
+**Met (Ian, 18 Nov, gen 439):** Ian has declared the performance goal met for now. The matched Q2 demo gives 66.8 swaps/s. Quake II fullscreen runs at 56 fps (640×480) and 38 fps (1080p, compositor-scaled). Stardew gameplay runs at 39 fps at 600 MHz, and the Torchlight II menu at 25 fps. The next focus is compatibility and desktop quality.
+
+
 **Reach at least 60 distinct displayed frames/s for the matched yquake2 GL3 demo on the Dell's GPU desktop, with the panel, recovery paths and normal boot intact.** Work through the milestones in order, iterating as the measurements direct. Ian has authorized autonomous iteration, including Dell reboots and AC power cycling. Stop when the goal is verified, or when a decision needs Ian.
 
 | # | Milestone | State |
@@ -717,6 +720,14 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **"True" fullscreen modes through the panel fitter (Ian, 18 Nov; investigation):** scan out a game's lower-resolution fullscreen buffer (e.g. 1080p or 1600×900) and let the display engine upscale it, instead of the compositor's 13.6 ms per-frame scale (Q2 1080p fullscreen: `display-perf/build/dell/q2-439-fs`, direct-scanout fallback `scaled`). Open questions:
+  - restoring the panel mode when the program crashes, hangs or loses focus;
+  - the cursor and overlays without a hardware cursor plane;
+  - Alt-Tab;
+  - the PIPESRC/PF_WIN_SZ change without a full modeset on BDW.
+
+  This sits on the direct-scanout kernel work in `docs/app-driven-present.md` section 4.
+- **Q2 above 1080p falls back to windowed:** yquake2 offers no 3200×1800 mode. Try `r_mode -2`, or `r_mode -1` with a custom size, to find the limit.
 - **Deeper idle states (Ian, 18 Nov):** IdleLoop uses only `hlt`; the package sits in C2 (idle 56–58 °C at 3.3 W). Package C3+ would cut idle heat and battery use.
 - **GPU clock 600 MHz (18 Nov):** sustainable in Stardew (69–75 °C, ~10 W, no trips over 60 s; 27–29 → 39.2 displayed fps). 700 MHz reached 98–99 °C with an 11 W CPU burst and tripped the 90 °C guard. Fans stay near silent, so the EC is not ramping much. Candidate default for AC.
 - **CPU power while GPU-bound:** the cores draw 4.5–5 W at ~18% busy and 2.7 GHz turbo, sharing the package budget with the GPU.
