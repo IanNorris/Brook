@@ -92,6 +92,19 @@ _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review 
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**18 Nov evening, Dell gens 427/428 (main `678b009d` = integration24; gen 428 `dell-int25-20261118` adds `work/chromium-fixes`, session `fab0e3daae964a16aef47e58ed99acf7`):**
+- **Gen 427:**
+  - Xwayland windows are GPU sources (`work/xwl-dmabuf`); epoll no longer zeroes ~100 KiB per wait; kernel-region enter/leave is lock-free (`work/kregion-lockfree`).
+  - Ready-lock acquisitions during the matched demo fell from 23.9M to 5.76M. Demo: 67 swaps, displayed mean 21.8 / p50 20.0 ms (~46 fps).
+  - Evidence: `display-perf/build/dell/{goal-int24,lockstats-int24.json}`.
+- **Torchlight II:** `src gpu`, all frames direct, but ~13 displayed fps. GPU 75% idle, CPU 76% idle: latency-bound, probably Xwayland Present pacing.
+- **Stardew maximised (3192×1632):** GPU-bound (30.8 ms per game frame into LINEAR buffers, plus a 14.8 ms composite), ~19 fps; windowed is fine.
+- **Both being investigated on `work/xwl-pacing`:** Present pacing and tiled modifiers.
+- **Gen 428:**
+  - Ian confirms the resize freeze is fixed (Stardew/Chromium). Not yet merged; merge after Ian's Chromium cursor/ads check.
+  - **New:** Stardew stopped rendering before any resize. A GPU job (pid 223, now a zombie) never started (ring head=tail, no CSB). It was reset, and Mesa reported device lost; then DESKTOP_SCANOUT_STARVED repeated. Evidence: `display-perf/build/dell/stardew-hang428/` (klog, stats, waylandd). Handed to the `work/xwl-pacing` agent as priority.
+- **Stardew audio:** still the null-sink Pulse in Steam's launcher (desktop Pulse server needed).
+
 **Dell gen 426 `dell-xwayland-hidpi-20261118` (session `036dae3a34b34a55bf6c6cfdf12c13ed`; branch `work/xwayland-hidpi` `85496659`, not merged):**
 - **brook-xwm staged:** `/nix/store/h9x75map…-waylandd-brook-0.1-brook`. Rollback record: `/nix/.brook-profile-rollback-xwm20261118.json` (previous `4p01fkxz…`).
 - **Steam launcher `rootless-4` installed** (`ui_scale` 2; rollback via the bundle's `install.py --rollback`).
