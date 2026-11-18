@@ -1280,6 +1280,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->wakeupTick = 0;
     child->kernelRegionDepth = 0;
     child->kernelOperationProtected = false;
+    child->terminalClaim = 0;
     child->interruptibleWait = false;
     child->terminalPending = false;
     child->pendingWaitStatus = 0;
@@ -1496,6 +1497,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->wakeupTick = 0;
     thread->kernelRegionDepth = 0;
     thread->kernelOperationProtected = false;
+    thread->terminalClaim = 0;
     thread->interruptibleWait = false;
     thread->terminalPending = false;
     thread->pendingWaitStatus = 0;

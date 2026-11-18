@@ -191,4 +191,5 @@ bool SchedulerLockStatsEnabled();
 void SchedulerLockStatsRead(SchedLockStats::Merged* output,unsigned* cpus);
 bool SchedulerLockUnfairMode(int mode);   // returns the resulting mode
 bool SchedulerIdleTickSkipMode(int mode); // returns the resulting mode
+bool SchedulerKernelRegionLockedMode(int mode); // true: ready-lock region entry (A/B only)
 }

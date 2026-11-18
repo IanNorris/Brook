@@ -382,12 +382,14 @@ struct Process
     uint64_t schedTrace[12];
     uint8_t  schedTraceHead;
 
-    // Protected by scheduler readyLock. Sleeping filesystem locks defer fatal
+    // Depth/latch: see kernel_region.h (lock-free entry). Sleeping filesystem locks defer fatal
     // cancellation through the complete kernel operation, including gaps between
     // locks (e.g. FAT cache loading). Each queued/held lock owns a Process ref.
     uint32_t kernelRegionDepth;
     UserAccessScope* userAccessScope;
     bool kernelOperationProtected;
+    // A terminator is deciding or decided (kernel_region.h); readyLock writer.
+    uint8_t terminalClaim;
     bool terminalPending;
     bool interruptibleWait; // readyLock: registered wait may unwind on terminalPending
     int pendingWaitStatus;
