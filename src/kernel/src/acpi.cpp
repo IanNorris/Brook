@@ -210,14 +210,19 @@ const AcpiPmTimerInfo& AcpiGetPmTimerInfo(){return g_pmTimer;}
 const AcpiLegacyPowerInfo& AcpiGetLegacyPowerInfo(){return g_legacyPower;}
 const AcpiSciRoute& AcpiGetSciRoute(){return g_sciRoute;}
 #ifdef BROOK_DELL_ACPI_MONITOR
-uint64_t AcpiAdmitDellMonitorFirmware() {
+uint64_t AcpiAdmitDellMonitorFirmware(AcpiDellAdmitDiag* diag) {
     // Archived XPS 9343 FADT, MADT, DSDT and 11 SSDTs in root order.
     constexpr uint8_t expected[32]={
         0x0f,0x25,0x88,0xec,0x24,0x29,0x7e,0xd3,0x42,0xfd,0xe5,0x96,0x3e,0x44,0xaf,0x3e,
         0x6b,0x01,0x7e,0xe0,0xa1,0x58,0x1d,0x46,0xe8,0xd7,0xcb,0x2e,0x28,0xdb,0xb6,0xf4,
     };
-    if(!g_acpiReady || !g_legacyPower.facs || !g_sciRoute.available ||
-       !g_pmTimer.available || g_tables.RootEntryCount()>64)return 0;
+    AcpiDellAdmitDiag local{};auto& d=diag?*diag:local;d=AcpiDellAdmitDiag{};
+    auto refuse=[&](const char* why)->uint64_t{d.reason=why;return 0;};
+    if(!g_acpiReady)return refuse("acpi not ready");
+    if(!g_legacyPower.facs)return refuse("no FACS");
+    if(!g_sciRoute.available)return refuse("no SCI route");
+    if(!g_pmTimer.available)return refuse("no PM timer");
+    if(g_tables.RootEntryCount()>64)return refuse("root entries");
     BrookSha256 hash;
     BrookShaInit(&hash);
     auto add=[&](uint64_t address,const AcpiSdtHeader& h) {
@@ -225,28 +230,38 @@ uint64_t AcpiAdmitDellMonitorFirmware() {
         BrookShaAdd(&hash,reinterpret_cast<const uint8_t*>(address),h.length);
         return true;
     };
+    auto prefix=[&](uint64_t address,uint32_t length,uint8_t (&out)[8]) {
+        BrookSha256 one;BrookShaInit(&one);BrookShaAdd(&one,reinterpret_cast<const uint8_t*>(address),length);
+        uint8_t full[32]{};BrookShaFinish(&one,full);__builtin_memcpy(out,full,8);
+    };
     AcpiSdtHeader header{};
     const uint64_t fadt=g_tables.Find("FACP",&header);
-    if(!add(fadt,header))return 0;
+    if(!add(fadt,header))return refuse("FADT outside firmware memory");
+    d.fadtLength=header.length;prefix(fadt,header.length,d.fadtHash);
     const uint64_t madt=g_tables.Find("APIC",&header);
-    if(!add(madt,header))return 0;
+    if(!add(madt,header))return refuse("MADT outside firmware memory");
+    d.madtLength=header.length;prefix(madt,header.length,d.madtHash);
     const uint64_t dsdt=g_tables.Dsdt(&header);
-    if(!add(dsdt,header))return 0;
+    if(!add(dsdt,header))return refuse("DSDT outside firmware memory");
     unsigned ssdts=0,fadts=0,madts=0;
     for(uint32_t i=0;i<g_tables.RootEntryCount();++i) {
         const uint64_t address=g_tables.RootEntry(i,&header);
-        if(!address)return 0;
+        if(!address)return refuse("invalid root entry");
         const char* sig=header.signature;
         if(memcmp(sig,"FACP",4)==0)++fadts;
         if(memcmp(sig,"APIC",4)==0)++madts;
-        if(memcmp(sig,"PSDT",4)==0 || memcmp(sig,"DSDT",4)==0)return 0;
+        if(memcmp(sig,"PSDT",4)==0 || memcmp(sig,"DSDT",4)==0)return refuse("PSDT or root DSDT");
         if(memcmp(sig,"SSDT",4)==0) {
-            if(++ssdts>11 || !add(address,header))return 0;
+            if(++ssdts>11)return refuse("more than 11 SSDTs");
+            if(!add(address,header))return refuse("SSDT outside firmware memory");
         }
     }
+    d.ssdts=ssdts;d.fadts=fadts;d.madts=madts;
     uint8_t actual[32]{};
-    BrookShaFinish(&hash,actual);
-    return ssdts==11 && fadts==1 && madts==1 && BrookUpdateEqual(actual,expected,32)?g_rsdp:0;
+    BrookShaFinish(&hash,actual);__builtin_memcpy(d.hash,actual,32);
+    if(ssdts!=11 || fadts!=1 || madts!=1)return refuse("table counts");
+    if(!BrookUpdateEqual(actual,expected,32))return refuse("table hash");
+    return g_rsdp;
 }
 bool AcpiFirmwareRange(uint64_t address,uint32_t bytes) {
     return g_acpiReady && ContainsFirmware(address,bytes,false);

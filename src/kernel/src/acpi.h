@@ -43,7 +43,11 @@ const AcpiSciRoute& AcpiGetSciRoute();
 #ifdef BROOK_DELL_ACPI_MONITOR
 // Returns the real RSDP only when the pinned Dell FADT, MADT, and all
 // executable ACPI tables match. Table mapping does not authorize AML I/O.
-uint64_t AcpiAdmitDellMonitorFirmware();
+// Diagnostics for a refused admission: the first failed check, the combined
+// hash actually seen and the lengths/SHA-256 prefixes of FADT and MADT (the
+// AML tables can be compared with the read-only inventory instead).
+struct AcpiDellAdmitDiag {const char* reason;uint8_t hash[32];uint32_t fadtLength,madtLength,ssdts,fadts,madts;uint8_t fadtHash[8],madtHash[8];};
+uint64_t AcpiAdmitDellMonitorFirmware(AcpiDellAdmitDiag* diag=nullptr);
 bool AcpiFirmwareRange(uint64_t address,uint32_t bytes);
 #endif
 

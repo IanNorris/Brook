@@ -291,11 +291,22 @@ void DellAcpiMonitorConfigure() {
     if(!Requested())return;
     const auto& power=AcpiGetLegacyPowerInfo();
     const auto& route=AcpiGetSciRoute();
-    const uint64_t admitted=AcpiAdmitDellMonitorFirmware();
-    if(!admitted || power.pm1aControl!=PowerControl || power.pm1bControl ||
+    AcpiDellAdmitDiag diag{};
+    const uint64_t admitted=AcpiAdmitDellMonitorFirmware(&diag);
+    if(!admitted) {
+        auto hex8=[](const uint8_t* b,char* out){const char* h="0123456789abcdef";for(int i=0;i<8;++i){out[2*i]=h[b[i]>>4];out[2*i+1]=h[b[i]&15];}out[16]=0;};
+        char all[17],fadt[17],madt[17];hex8(diag.hash,all);hex8(diag.fadtHash,fadt);hex8(diag.madtHash,madt);
+        KLog("dell-acpi: platform admission failed (firmware tables: %s; hash %s fadt %u/%s madt %u/%s ssdt %u fadt# %u madt# %u)",
+            diag.reason?diag.reason:"?",all,diag.fadtLength,fadt,diag.madtLength,madt,diag.ssdts,diag.fadts,diag.madts);
+        return;
+    }
+    if(power.pm1aControl!=PowerControl || power.pm1bControl ||
        power.smiCommand!=SmiCommand || power.acpiEnable!=AcpiEnable ||
        AcpiGetPmTimerInfo().port!=Timer || AcpiGetPmTimerInfo().wide) {
-        KLog("dell-acpi: platform admission failed (firmware tables)");return;
+        KLog("dell-acpi: platform admission failed (FADT power fields pm1a=%x pm1b=%x smi=%x enable=%x timer=%x wide=%u)",
+            unsigned(power.pm1aControl),unsigned(power.pm1bControl),unsigned(power.smiCommand),unsigned(power.acpiEnable),
+            unsigned(AcpiGetPmTimerInfo().port),AcpiGetPmTimerInfo().wide?1u:0u);
+        return;
     }
     if(PciConfigRead32(0,31,0,0)!=0x9cc38086u || (PciConfigRead32(0,31,0,0x40)&0xff80u)!=0x1800 ||
        !LpcDecodes(EcData) || !LpcDecodes(EcCommand)) {
