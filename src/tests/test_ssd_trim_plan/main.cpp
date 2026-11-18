@@ -1,11 +1,44 @@
-#include "ssd_trim_plan.h"
+#include "ext2_trim_plan.h"
 
 #include <cassert>
 
 using namespace brook;
 
+static void TestExt2Metadata()
+{
+    // Group 3 ends early and contains sparse-super backup metadata.
+    LargeExt2Geometry geometry{};
+    assert(LargeExt2GeometryMake(3 * 32768 + 16, geometry));
+    const TrimRange partition{2048, uint64_t(geometry.blocks) * 8};
+    const uint32_t base = 3 * 32768;
+    uint8_t descriptor[32]{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        const uint32_t block = base + 2 + i;
+        for (uint32_t byte = 0; byte < 4; ++byte)
+            descriptor[4 * i + byte] = uint8_t(block >> (8 * byte));
+    }
+    descriptor[12] = 11;
+    uint8_t disk[4096]{0x1f};
+    uint8_t cache[4096]{0x1f};
+    Ext2TrimGroup plan{};
+    assert(Ext2TrimValidateGroup(geometry, partition, 3, 32, descriptor,
+                                 disk, cache, sizeof(disk), plan));
+    assert(plan.freeBlocks == 11 && plan.reservedCount == 4);
+    const uint64_t first = partition.lba + uint64_t(base) * 8;
+    assert(!TrimRangeAllowed({first + 8, 1}, partition, plan.reserved, plan.reservedCount));
+    assert(!TrimRangeAllowed({first + 32, 1}, partition, plan.reserved, plan.reservedCount));
+    assert(TrimRangeAllowed({first + 40, 88}, partition, plan.reserved, plan.reservedCount));
+    cache[0] = 0x3d; // Same count, but claims a backup descriptor block is free.
+    assert(!Ext2TrimValidateGroup(geometry, partition, 3, 32, descriptor,
+                                  disk, cache, sizeof(disk), plan));
+    cache[0] = 0x3f; // Metadata still reserved, free count disagrees.
+    assert(!Ext2TrimValidateGroup(geometry, partition, 3, 32, descriptor,
+                                  disk, cache, sizeof(disk), plan));
+}
+
 int main()
 {
+    TestExt2Metadata();
     const TrimRange partition{2048, 524288};
     const TrimRange reserved[] = {{2048, 8}, {3000, 16}, {7000, 128}};
     assert(TrimRangeAllowed({2056, 944}, partition, reserved, 3));

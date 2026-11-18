@@ -22,6 +22,10 @@ The pure planner prevalidates the entire range list before producing the first
 payload. Ranges must be sorted, non-overlapping, inside the selected partition
 and outside all supplied exclusions. The bitmap helper finds runs free in both
 the on-disk and cached copies and skips runs shorter than the specified minimum.
+For the Dell’s classic ext2 layout the group validator derives primary and
+backup superblock and descriptor reservations, both bitmaps, and the inode
+table. It checks that both bitmaps reserve these blocks and that each copy's
+free count matches the group descriptor.
 
 ## Runtime integration still needed
 
