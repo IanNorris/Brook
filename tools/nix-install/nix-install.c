@@ -840,6 +840,16 @@ static void refresh_desktop_entries(void)
                 break;
             }
 
+            /* Brook wrappers that refuse root (yquake2 will not run as root). */
+            const char *user_wrappers[]={"brook-quake2"};
+            for(size_t ui=0;ui<sizeof(user_wrappers)/sizeof(user_wrappers[0]);++ui) {
+                if(strcmp(base,user_wrappers[ui]))continue;
+                char original[sizeof(exec_cmd)];snprintf(original,sizeof(original),"%s",exec_cmd);
+                if(strlen(original)+12>=sizeof(exec_cmd))break;
+                snprintf(exec_cmd,sizeof(exec_cmd),"--uid 1000 %s",original);
+                break;
+            }
+
             /* Preserve the profile's GUI environment after every install, not
              * just in the host-generated initial index. Keep browsers/media
              * above on their more specific compatibility launchers. */

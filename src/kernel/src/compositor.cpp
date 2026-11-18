@@ -2582,7 +2582,7 @@ static void CompositorInputWM()
             int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
             const bool launcher=WmLauncherVisible();
             overlay=launcher || WmVolumePopupVisible() ||
-                    my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight));
+                    my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight));
             // Shell surfaces own the pointer: no window may acquire a lock
             // while it is over the taskbar, launcher or volume popup.
             if(overlay)WmPointerSetHover(-1);
@@ -2994,7 +2994,7 @@ static void CompositorHandleMouseWM()
     if (btnDown && !g_wmLastBtnDown)
     {
         const auto captionHit=WmHitTest(mx,my);
-        if(WmLauncherVisible()||my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight))||
+        if(WmLauncherVisible()||my>=static_cast<int32_t>(WmTaskbarTop(g_physFbHeight))||
            captionHit.zone!=WmHitZone::TitleBar)g_titleClicks.Reset();
         DbgPrintf("WM: click at (%d,%d)\n", mx, my);
         // The volume popup owns every press while open (outside closes it).
@@ -3074,7 +3074,7 @@ static void CompositorHandleMouseWM()
                 }
             }
         }
-        else if (my >= static_cast<int32_t>(WmDesktopHeight(g_physFbHeight)))
+        else if (my >= static_cast<int32_t>(WmTaskbarTop(g_physFbHeight)))
         {
             // Clicked taskbar background — do nothing
         }

@@ -14,6 +14,10 @@ struct brook_xwindow {
      * client area at the output origin and exactly the output size, which is
      * what SDL and similar toolkits assume for coordinates and buffer size. */
     int want_fullscreen,fullscreen,sent_fullscreen,saved_maximized;
+    /* Applied through WM_SET_FULLSCREEN, which owns the saved geometry and
+     * hides the taskbar while the window is focused; otherwise the fallback
+     * below for kernels without it. */
+    int kernel_fullscreen;
     int32_t saved_x,saved_y;
     uint32_t saved_width,saved_height;
 };
@@ -94,11 +98,13 @@ static unsigned xwayland_surface_flags(const struct brook_surface *s) {
 static void xwayland_native_unmapped(struct brook_surface *s) {
     if (!s->xwindow) return;
     s->xwindow->native_valid=0;s->xwindow->initial_placement=0;s->xwindow->fullscreen=0;
+    s->xwindow->kernel_fullscreen=0;
     s->xwindow->target_width=s->xwindow->target_height=0;
 }
 static void xwayland_surface_detach(struct brook_surface *s) {
     if (s->xwindow) {
         s->xwindow->surface=NULL;s->xwindow->native_valid=0;s->xwindow->fullscreen=0;
+        s->xwindow->kernel_fullscreen=0;
         s->xwindow->target_width=s->xwindow->target_height=0;s->xwindow=NULL;
     }
 }
@@ -223,6 +229,15 @@ static void xwayland_apply_fullscreen(struct brook_xwindow *w) {
     if (!s || !s->wm_id || !w->native_valid || (w->state.flags&BXWM_OVERRIDE) ||
         !!w->want_fullscreen==!!w->fullscreen) return;
     uint32_t id=s->wm_id;
+    if (w->want_fullscreen && wm_set_fullscreen(id,1)==0) {
+        // The kernel resizes the native window to the output; the size then
+        // reaches the X window through the ordinary CONFIGURE path.
+        w->fullscreen=w->kernel_fullscreen=1;xwayland_native_sync(s,0);return;
+    }
+    if (!w->want_fullscreen && w->kernel_fullscreen) {
+        if (wm_set_fullscreen(id,0)<0) { g_xwm_failed=1;return; }
+        w->fullscreen=w->kernel_fullscreen=0;xwayland_native_sync(s,0);return;
+    }
     if (w->want_fullscreen) {
         uint32_t width=0,height=0;
         if (wm_get_screen_info(&width,&height) || !width || !height || width>65535 || height>65535) {

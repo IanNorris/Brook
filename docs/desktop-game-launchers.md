@@ -308,6 +308,29 @@ interpreter and runs `brook-steam --check`.
 `install.py --rollback` restores the newest backup set. Nothing goes into
 `/nix/store`. The application entry is unchanged.
 
+## Quake II and VSCodium Apps entries (Dell)
+
+`nix/dell-app-launchers.nix` builds `brook-dell-app-launchers`:
+- `bin/brook-quake2` runs Ian's gen 419 recipe: `brook-run brook-iris-run quake2 -datadir /data/home/quake2 +set s_openal 1 +set al_driver libopenal.so.1`, with the OSS OpenAL `lib/` first on `LD_LIBRARY_PATH` and `ALSOFT_CONF` set to the packaged `share/brook-quake2/alsoft-oss.conf`. It refuses root (yquake2 does too).
+  - The game, OpenAL and Iris paths are plain strings, not closure references. On the Dell, the complete yquake2 (`sb7y1c75…`) and OSS OpenAL (`59h20vp1…`) are in the private stage directories `.brook-gpu-stage-c6f05db4` and `.brook-audio-stage`, and the top-level OpenAL path has no `lib/`. The wrapper takes the first complete candidate: the top-level path of the same repo derivation, then the stage copy. For Iris: `998k7n88…` (the measured Quake path), then the repo's `xiwkhbn3…`, then `/nix/profile/bin/brook-iris-run`.
+  - `brook-quake2 --check` prints each choice and `BROOK_QUAKE2_CHECK_OK`, or `BROOK_QUAKE2_CHECK_MISSING`.
+- `bin/brook-codium` is `data/nix-wrappers/brook-codium` with a store bash: `/nix/profile/bin/codium --no-sandbox --disable-chromium-sandbox` under `brook-run`, as uid 1000 with its own `VSCodium-brook` profile. Electron's SUID sandbox is not set up, so the bare `codium` entry aborts.
+- `share/applications/brook-quake2.desktop`, a 24×24 icon from yquake2's `Quake2.png`, and `share/brook-stage/apps.json`, the menu edits for the staging bundle.
+
+The Apps menu reads `/nix/share/applications/applications.idx` (Name, Exec, Icon, Categories, app id). `tools/launcher-stage/install.py --apps apps.json` edits it atomically: it adds `Quake II` (`--uid 1000 /nix/profile/bin/brook-quake2`), rewrites every entry whose executable is `codium`/`vscodium` to `--uid 1000 /nix/profile/bin/brook-codium` (keeping its arguments), installs the icon if absent, then notifies the desktop (syscall 0xB03). The previous manifest is saved, and `install.py --rollback TX` restores it with the links.
+
+`nix-install`'s own manifest rebuild already redirects codium to `brook-codium` when the wrapper is in the profile, and now also launches `brook-quake2` as uid 1000. An older guest `nix-install` (the Dell's current one) drops that uid on its next rebuild; Quake II then refuses root with a message, and rerunning the bundle's manifest step (`--rollback` then install) restores it.
+
+```sh
+out=$(nix-build nix/dell-app-launchers.nix --no-out-link)
+python3 tools/launcher-stage/make_bundle.py build/apps-launcher-stage --path "$out" \
+  --link /nix/profile/bin/brook-quake2="$out/bin/brook-quake2" \
+  --link /nix/profile/bin/brook-codium="$out/bin/brook-codium" \
+  --link /nix/profile/share/applications/brook-quake2.desktop="$out/share/applications/brook-quake2.desktop" \
+  --apps "$out/share/brook-stage/apps.json"
+```
+Guest steps are as for the Chromium launcher (`docs/waylandd-composition.md`), adding `--apps apps.json` to both `install.py` runs. Afterwards `run --uid 1000 /nix/profile/bin/brook-quake2 --check`.
+
 ## Q3 performance and remaining input work
 
 The user's audible live run reports about 15 FPS and heavy stuttering. A later
