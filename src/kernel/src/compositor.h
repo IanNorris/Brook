@@ -215,8 +215,10 @@ bool CompositorSetCursorVisible(Process* proc, bool visible);
 // kernel-side buffer. Max 64×64. hotX/hotY are the click-point offset.
 // Pass w=0 to reset to the built-in arrow cursor.
 // Pixels must be kernel-owned through return; userspace stages before publication.
+// `owner` is the creation identity of the window the image belongs to: it is
+// shown only while that window's client area is hovered (0: everywhere).
 bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
-                              int32_t hotX, int32_t hotY);
+                              int32_t hotX, int32_t hotY, uint64_t owner = 0);
 
 // --- Scanout interface (Phase 1 of usermode compositor migration) ---
 // These allow a privileged userspace process to take over compositing duties.

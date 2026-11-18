@@ -547,6 +547,11 @@ bool WmRouteCapturedPointer(const InputEvent& event);
 // area of window `idx`, or -1 for shell surfaces (taskbar, launcher, popups),
 // chrome and desktop. Acquire is refused unless it names the requester.
 void WmPointerSetHover(int idx);
+// Creation identity of the window currently hovered (as published by
+// WmPointerSetHover), or 0 over shell surfaces, chrome and the desktop.
+uint64_t WmPointerHoverIdentity();
+// Creation identity of `proc`'s window `wmId`, or 0 when it owns no such window.
+uint64_t WmWindowCreationIdentity(Process* proc, uint32_t wmId);
 // A physical primary press was delivered to window `idx`'s client area.
 void WmPointerEngage(int idx);
 // Window `idx` was just deliberately activated (Alt+Tab, taskbar button) and
@@ -570,6 +575,11 @@ static constexpr uint8_t WM_EVT_CLOSE_REQUESTED = 0x80;
 static constexpr uint8_t WM_EVT_FOCUS_GAINED    = 0x81;
 static constexpr uint8_t WM_EVT_FOCUS_LOST      = 0x82;
 static constexpr uint8_t WM_EVT_RESIZED         = 0x83; // x=newW, y=newH; reserved=WM_RESIZE_*
+// Pointer input stopped going to this window's client area (it moved to the
+// desktop, a shell surface, the WM's caption buttons or another window). The
+// provider sends wl_pointer.leave; the next delivered event re-enters.
+// Withheld while a button is held over nothing (implicit grab).
+static constexpr uint8_t WM_EVT_POINTER_LEFT    = 0x84;
 static constexpr uint32_t WM_RESIZE_MAXIMIZED = 1;
 static constexpr uint32_t WM_RESIZE_RESIZING = 2;
 

@@ -260,6 +260,10 @@ static uint64_t g_pointerInteractionSerial=0;
 // Creation identity of the window whose client area receives pointer input;
 // zero over shell surfaces, chrome and desktop. Written by WM routing.
 static uint64_t g_pointerHoverIdentity=0;
+// The window whose provider was last told the pointer is over it (slot and
+// creation identity), so it can be told when the pointer leaves.
+static int g_pointerEnteredIdx=-1;
+static uint64_t g_pointerEnteredIdentity=0;
 // Deliberate keyboard/taskbar activation (Alt+Tab, taskbar button): like
 // Windows granting ClipCursor on activation, the activated window may acquire
 // once without the pointer over its content. Cancelled by any focus change,
@@ -317,11 +321,23 @@ void WmPointerCaptureRefresh() {
         __atomic_fetch_and(&g_pointerQuarantinedButtons,~recovered,__ATOMIC_ACQ_REL);
     }
 }
+uint64_t WmPointerHoverIdentity() {
+    return __atomic_load_n(&g_pointerHoverIdentity,__ATOMIC_ACQUIRE);
+}
 void WmPointerSetHover(int idx) {
     const uint64_t identity=idx>=0 && idx<static_cast<int>(WM_MAX_WINDOWS) && g_windows[idx].proc
         ?g_windows[idx].creationIdentity:0;
     __atomic_store_n(&g_pointerHoverIdentity,identity,__ATOMIC_RELEASE);
     if(identity!=__atomic_load_n(&g_pointerActivationHover,__ATOMIC_ACQUIRE))PointerActivationCancel();
+    // Called from WM input routing only, which also delivers this window's
+    // pointer events, so LEFT is ordered after the last of them.
+    if(identity!=g_pointerEnteredIdentity && (identity || !MouseGetButtons())) {
+        const int left=g_pointerEnteredIdx;
+        if(g_pointerEnteredIdentity && left>=0 && left<static_cast<int>(WM_MAX_WINDOWS) &&
+           g_windows[left].proc && g_windows[left].creationIdentity==g_pointerEnteredIdentity && g_windows[left].vfb)
+            WmPushWmEvent(&g_windows[left],WM_EVT_POINTER_LEFT);
+        g_pointerEnteredIdx=identity?idx:-1;g_pointerEnteredIdentity=identity;
+    }
 }
 void WmPointerActivate(int idx) {
     if(idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS))return;
@@ -2511,6 +2527,13 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId)
     Window& w = g_windows[idx];
     if (w.proc != proc || w.wmId != wmId) return nullptr;
     return &w;
+}
+
+uint64_t WmWindowCreationIdentity(Process* proc, uint32_t wmId)
+{
+    VfbGuard guard;
+    const Window* w = WmFindWindowById(proc, wmId);
+    return w ? w->creationIdentity : 0;
 }
 
 bool WmGpuSourceProviderMatches(uint32_t window,uint64_t incarnation,uint32_t pid,uint64_t providerIncarnation)
