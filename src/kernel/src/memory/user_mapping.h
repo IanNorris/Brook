@@ -66,6 +66,9 @@ int64_t UserMappingRemoveBacking(Process* actor,AddressSpaceState* space,Mapping
 int64_t UserMappingStack(Process* actor, AddressSpaceState* space, uint64_t size,
                           const void* arguments, uint64_t argumentLength, uint64_t* argumentAddress);
 enum class UserPageAccess { Ready, Missing, Denied, OutOfMemory };
+// Advisory preflight; the caller keeps space referenced. A leaf that already
+// grants the access to user mode answers Ready without AS.mutation (see the
+// safety argument at the definition); every other case takes the locked check.
 UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, uint64_t address,
                                      uint32_t access, bool resolveCow);
 int64_t UserMappingBreak(Process* actor, AddressSpaceState* space, uint64_t requested);

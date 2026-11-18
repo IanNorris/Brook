@@ -662,9 +662,48 @@ static UserPageAccess CheckPage(AddressSpaceState* space,uint64_t address,uint32
     }
     return UserPageAccess::Ready;
 }
+// Lock-free preflight for the common case: the leaf already grants the access
+// to user mode. This removes the per-process AS.mutation convoy from every
+// user copy, futex and ioctl argument page (Dell gen 433: TL2's render thread
+// blocked ~3.9 s per 10 s here behind its own sibling threads' copies).
+//
+// Why no AS.mutation (and no sequence check) is needed:
+// - The answer is advisory in both paths. The locked path also drops the
+//   mutex before the caller touches memory, so a concurrent munmap/mprotect/
+//   mremap can always invalidate it. User copies go through the current CR3
+//   with fault fixup and re-run this check on a fault; robust-futex and other
+//   physical-frame readers revalidate range and leaf under their own
+//   transaction lock before dereferencing a frame.
+// - A leaf that is present, VMM_USER and (for writes) writable / (for exec)
+//   executable grants exactly what the owning user thread could do with a
+//   plain load/store at that instant, so a kernel copy through it widens
+//   nothing. It can only be stale in the same way as a racing user access.
+// - Frame reuse: mutators clear the leaf, shoot down every CPU in tlbCpuMask
+//   and retire frames only after the full ACK (MappingTransaction). A copying
+//   CPU runs this CR3, so it is in the mask; once it ACKs, its next access
+//   re-walks and faults to the fixup. No frame is reused under a copy.
+// - Table lifetime: user page-table pages are freed only by
+//   VmmDestroyUserPageTable at the final AddressSpaceUnref. Callers must keep
+//   the AS referenced (the locked path's AddressSpaceRef already required a
+//   live reference). VmmReadLeaf walks under the page-table spinlock and
+//   returns a coherent snapshot, never a torn intermediate entry.
+// Anything else (missing, hidden/PROT_NONE, CoW, kernel-only, read-only for a
+// write) takes the authoritative locked path below, unchanged. One semantic
+// difference: a write-only (PROT_WRITE) range reads as Ready here, as x86
+// hardware and Linux copy_from_user both allow. Mapping timing counters
+// measure only the locked path.
+static bool LeafGrantsUserAccess(AddressSpaceState* space,uint64_t address,uint32_t access) {
+    if (!access || (access & ~7u)) return false;
+    const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+    if ((leaf & (VMM_PRESENT|VMM_USER)) != (VMM_PRESENT|VMM_USER)) return false;
+    if ((access & 2) && !(leaf & VMM_WRITABLE)) return false;
+    if ((access & 4) && (leaf & VMM_NO_EXEC)) return false;
+    return true;
+}
 UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, uint64_t address,
                                      uint32_t access, bool resolveCow) {
     if (!actor || !space || space->kernel || address >= 0x0000800000000000ULL) return UserPageAccess::Denied;
+    if (LeafGrantsUserAccess(space,address,access)) return UserPageAccess::Ready;
     // Pin AS lifetime and cancellation protection before a potentially
     // blocking mutation lock. Read-only PTE/range checks need no file gates.
     MappingTransaction operation(actor,space);
