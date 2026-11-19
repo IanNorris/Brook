@@ -140,7 +140,7 @@ int main() {
     // for client-side chrome. Negative desktop coordinates stay signed.
     window.x=-30;window.y=-20;window.metrics=&DesktopMetric200;
     CHECK(WmSnapshotOwnedWindowState(owner,id,originalIncarnation,&geometry)==0);
-    CHECK(geometry.client_x==-26 && geometry.client_y==56);
+    CHECK(geometry.client_x==-26 && geometry.client_y==64);
     window.noChrome=true;window.focused=true;window.minimized=true;
     window.visible=false;window.focusable=true;window.state=WindowState::Maximized;
     CHECK(WmSnapshotOwnedWindowState(owner,id,originalIncarnation,&geometry)==0);
@@ -194,7 +194,7 @@ int main() {
     CHECK(!__builtin_memcmp(&geometry,&beforeStale,sizeof(geometry)));
     CHECK(WmSnapshotOwnedWindowState(owner,id,0,&geometry)==-2);
     CHECK(WmSnapshotOwnedWindowState(stranger,id,0,&geometry)==0);
-    CHECK(geometry.incarnation!=originalIncarnation && geometry.client_x==12 && geometry.client_y==48);
+    CHECK(geometry.incarnation!=originalIncarnation && geometry.client_x==12 && geometry.client_y==52);
     CHECK(!WmGpuSourceProviderMatches(id,originalIncarnation,7,77));
     CHECK(!WmGpuSourceProviderMatches(id,originalIncarnation,8,88));
     CHECK(WmGpuSourceProviderMatches(id,geometry.incarnation,8,88));

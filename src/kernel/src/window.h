@@ -140,9 +140,9 @@ static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
 static constexpr int WM_BTN_RIGHT_PAD = 0;
 
 // Taskbar layout constants
-static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 44; // icon button width
-static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 32;
-static constexpr uint32_t WM_TASKBAR_PADDING    = 4;
+static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 48; // icon button target width
+static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 48; // targets are the taskbar's full height
+static constexpr uint32_t WM_TASKBAR_PADDING    = 0;  // targets abut; the pills are inset
 static constexpr uint32_t WM_TASKBAR_TEXT_PAD_X = 6;   // text offset within button
 
 enum class WindowState : uint8_t

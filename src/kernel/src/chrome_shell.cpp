@@ -29,13 +29,16 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
     const int sw = static_cast<int>(screenW), sh = static_cast<int>(screenH);
     l.y = sh > static_cast<int>(s.M(DesktopMetrics::TaskbarBase)) ? sh - s.M(DesktopMetrics::TaskbarBase) : 0;
     const int height = sh - l.y;
+    // Targets span the whole taskbar height (Fitts: the screen's bottom edge
+    // and the bottom-left corner hit them); pills are drawn inset.
     const int bh = height < static_cast<int>(s.M(SM::TaskbarButtonHeight)) ? height : s.M(SM::TaskbarButtonHeight);
     const int by = l.y + (height - bh) / 2;
     l.textY = by + (bh - s.Font().lineHeight) / 2;
     int x = s.M(SM::TaskbarPadding);
-    const int appsW = s.M(40);
+    const int appsW = s.M(SM::TaskbarLauncherWidth);
     l.apps = {x, by, appsW, bh}; x += appsW + s.M(SM::TaskbarPadding);
-    l.terminal = {x, by, static_cast<int>(s.M(40)), bh}; x += s.M(40) + s.M(SM::TaskbarPadding);
+    l.terminal = {x, by, static_cast<int>(s.M(SM::TaskbarButtonWidth)), bh};
+    x += s.M(SM::TaskbarButtonWidth) + s.M(SM::TaskbarPadding);
     CopyText(l.clockText, clockText, sizeof(l.clockText));
     int right = sw - s.M(8);
     // Reserve measured widgets from right to left. Keep one useful window
@@ -279,8 +282,15 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
     const int32_t mouseX = m.mouseX, mouseY = m.mouseY;
     dl.Fill(0, l.y, screenW, screenH - l.y, s.MaterialColor(p.taskbar));
     dl.Fill(0, l.y, screenW, 1, p.separator);
-    auto button = [&](const DesktopRect& r, const char* title, bool active, bool minimized) {
-        uint32_t bg = active ? p.taskActive : r.contains(mouseX, mouseY) ? p.taskHover : p.taskButton;
+    // The visual pill of a full-height target (hover follows the target).
+    auto pill = [&](const DesktopRect& r) {
+        const int ix = r.w > static_cast<int>(4 * s.M(SM::TaskbarPillInsetX)) ? s.M(SM::TaskbarPillInsetX) : 0;
+        const int iy = r.h > static_cast<int>(4 * s.M(SM::TaskbarPillInsetY)) ? s.M(SM::TaskbarPillInsetY) : 0;
+        return DesktopRect{r.x + ix, r.y + iy, r.w - 2 * ix, r.h - 2 * iy};
+    };
+    auto button = [&](const DesktopRect& target, const char* title, bool active, bool minimized) {
+        const DesktopRect r = pill(target);
+        uint32_t bg = active ? p.taskActive : target.contains(mouseX, mouseY) ? p.taskHover : p.taskButton;
         ChromeMaterialRect(dl, s, r, bg);
         if (active || minimized)
             dl.Fill(r.x + s.M(6), r.y + r.h - s.M(2), r.w - s.M(12), s.M(2), active ? p.accent : p.minimized);
@@ -302,16 +312,17 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
             button(r, "", false, false);
             if (r.w >= icon && r.h >= icon)
                 ChromeIcon(dl, s, r.x + (r.w - icon) / 2, r.y + (r.h - icon) / 2, icon, b.icon);
+            const DesktopRect pr = pill(r);
             if (b.busy) {
                 // Eight positions form a bounded animated progress ring.
                 static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
                 static const int dy[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
                 unsigned step = (m.uptimeMs / 100) % 8;
                 for (unsigned dot = 0; dot < 8; ++dot)
-                    dl.Fill(r.x + r.w - 8 + dx[dot], r.y + r.h - 8 + dy[dot], 2, 2,
+                    dl.Fill(pr.x + pr.w - 8 + dx[dot], pr.y + pr.h - 8 + dy[dot], 2, 2,
                             dot == step ? p.taskText : p.minimized);
             } else {
-                dl.Text(r.x + r.w - s.M(10), l.textY, "!", p.taskText, s.M(10));
+                dl.Text(pr.x + pr.w - s.M(10), l.textY, "!", p.taskText, s.M(10));
             }
             if (r.contains(mouseX, mouseY)) hoverTitle = b.hoverTitle;
             continue;
