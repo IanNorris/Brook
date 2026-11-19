@@ -1127,3 +1127,111 @@ attempt. Nothing has run on the Dell.
 - Glass keeps rounded windows and panels; Opaque Light and Dark are square
   outside and rounded inside (pills, rows, wells).
 
+
+## Launcher
+
+Branch `work/launcher`, from `work/integration51` (`6c18bafd`). DESIGN.md
+"Launcher organisation" (implementation steps 6 and 7, in part), built as
+freestanding units so that the stage 3 shell process runs the same code the
+kernel runs today. Decision 3 (organisation waits for the shell process) is
+kept in spirit: nothing here is kernel painter code; the kernel side is a
+thin, temporary host for the model until the shell owns it.
+
+### Design
+
+```
+ catalog (LauncherSnapshot) ─► LauncherModel ◄── keys, presses, scroll
+   applications.idx,            (launcher_model.{h,cpp}: data + logic,
+   /boot/SHORTCUTS               trivially copyable, no kernel headers)
+                                     │  Serialize / Parse ([Launcher] text)
+                                     ▼
+            ChromeLauncherFrameFor(model, chrome, style)  ── targets ──► hit test
+                  (chrome_launcher.{h,cpp}: layout)                      (same rects)
+                                     │
+            ChromeBuildLauncher(model, chrome, frame, style) ─► display list
+                                     │                          (keyed by its hash)
+                                     ▼
+                     CPU executor / capture, as every shell surface
+```
+
+- **Model** (`launcher_model.h`): the catalog (stable key, name,
+  description, declared category), the user's layout (categories with one
+  home per app, the seven defaults, pins and recent apps as references,
+  the Pinned/Recent top-row choice, unknown IDs kept), ranked search (name
+  prefix, word start, name substring, the user's category names,
+  descriptions), the list as lines (headings, one- or two-column app rows,
+  category chips, empty states), keyboard state (type-anywhere query,
+  ↑ ↓ with wrap, Tab between list, tiles and rail, ← → between rail and
+  list, Home/End/PgUp/PgDn, Enter, Esc unwinds menu then query then closes,
+  Alt+Enter menu, Alt+↑ ↓ reorder across categories), line-based scroll,
+  and the two-item context menu. `LayoutEpoch()` changes on every saved
+  change. Host test: `test_launcher_model`.
+- **Builder** (`chrome_launcher.h`): one layout function produces the
+  panel rects and a target list (menu first); the builder draws from it and
+  the WM hit-tests it, so what is drawn is what is hit. Tokens beyond the
+  palette (pressed, hairline, well, category colours, on-accent) are
+  derived in one place. Only existing display-list ops are used, so stage
+  3's wire format (`chrome_shell_wire.h`) carries the list unchanged.
+- **Glue** (`wm_shell_launcher.inc`): snapshots the active catalog into the
+  model when its generation changes (icons stay borrowed from the
+  snapshot, under the read guard), maps keys and presses, launches through
+  the existing queue, and persists. Keys reach it through a new
+  `GlobalShortcutAction::LauncherKey`: while the launcher is open it takes
+  every key except Super, Alt+Tab, Alt+F4 and Alt+P (repeats act; the
+  release is swallowed). Right click in the panel opens the menu.
+- **Persistence:** `/data/home/.config/brook/launcher.ini`, DESIGN.md's
+  `[Launcher]` format (`version`, `top_row`, `pinned`, `recent`,
+  `categories`, `category.<id>=Name|colour|icon|keys`). The compositor
+  serialises on a change; the launcher worker writes at most once a second
+  as a temporary file and a rename. A bad or missing file keeps the
+  defaults. It is a separate file because `settings.ini` is limited to
+  2 KiB and rewritten by Settings.
+- **Categories of apps:** shortcuts gain `# category:` (all of
+  `data/shortcuts` have one); desktop entries map their `Categories=`
+  (`HintFromDesktopCategories`). At first run each installed app is filed
+  in its declared category; later installs land in Unsorted.
+- **Cost:** the launcher surface re-rasterises only when its list key
+  changes (a model change, or the pointer crossing into another target);
+  nothing per frame. Host benchmark at 200% (3200x1800): layout, build and
+  raster of a state change 2.2 ms for the 1360x1296 panel, against 3.4 ms
+  for the old 968x1140 one (the fill fix in `chrome_raster` pays for the
+  larger panel).
+
+### How stage 3 picks it up
+
+`work/clearwater-s3` snapshots a `ChromeShellModel` (trivially copyable)
+for each shell surface and the shell process calls the builders. For the
+launcher:
+
+1. The shell process owns a `LauncherModel` itself (it is trivially
+   copyable and needs no kernel), loads the catalog and icons from
+   `/nix/share/applications` and `/boot/SHORTCUTS` in user mode, and reads
+   and writes `launcher.ini` directly.
+2. Keys and presses for the open launcher are forwarded to the shell (the
+   `LauncherKey` action marks exactly which keys); the shell runs
+   `Key()`/`Press()` and asks the WM to launch by catalog ID
+   (`WmLauncherActivate`).
+3. The shell calls `ChromeLauncherFrameFor` and `ChromeBuildLauncher`
+   and submits the list; the WM keeps only the panel rectangle
+   (`ChromeLauncherRect`) and the power guard. Until then the kernel glue
+   does both. `ChromeShellModel`'s launcher fields (layout, entries, icons)
+   are replaced by the model; `chrome_shell.h` no longer has the old
+   launcher layout.
+
+### Deviations from DESIGN.md
+
+- Not built yet (step 7's remainder): drag and drop (and with it the "New
+  category" target), Organise mode and multi-select, the category editor,
+  Undo, suggestions and "Sort all". Moving an app is Alt+↑ ↓ for now (an
+  Unsorted app moves into the last category), so empty states say that
+  instead of "Drag apps here".
+- Uninstall is shown in the menu, disabled: there is no deferred package
+  removal yet.
+- The footer hides the keyboard hints and the Organise button (Ian, 19
+  November).
+- The search field uses the 13 px body face (there is no 15 px regular
+  role); the caret does not blink (a blink would re-raster twice a second).
+- Rail rows are 40 and menu items 36, DESIGN.md's pointer sizes; app rows,
+  tiles and footer buttons are 44 or more.
+- Members within a default category are alphabetical (the prototype uses
+  its catalogue order).
