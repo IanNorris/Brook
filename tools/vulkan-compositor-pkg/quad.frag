@@ -11,29 +11,22 @@ layout(input_attachment_index=0,set=1,binding=0) uniform subpassInput destinatio
 #ifdef BROOK_QUAD_BLUR
 layout(set=2,binding=0) uniform sampler2D backdrop;
 #endif
-layout(location=0) in vec2 desktopPixel;
 layout(push_constant) uniform Quad {
     ivec4 rect; vec2 invHalf; ivec2 dst; uvec2 dstSize; uvec2 src; uvec2 srcSize; vec2 scale; uint opacity; uint mode;
     ivec4 glassRect; ivec4 atlasRect; uint radius;
 } q;
 layout(location=0) out vec4 color;
-const uint STRAIGHT=1u,OPAQUE=2u,OVER_ZERO=4u,FETCH_SAMPLER=8u,FETCH_DIVIDE=16u,READ_DESTINATION=32u,CAPTURE=64u,CAPTURE_FILTER=128u;
+const uint STRAIGHT=1u,OPAQUE=2u,OVER_ZERO=4u,FETCH_SAMPLER=8u,FETCH_DIVIDE=16u,READ_DESTINATION=32u;
 uint scale8(uint x,uint f){return (x*f+127u)/255u;}
 uvec4 scale8(uvec4 x,uint f){return (x*f+127u)/255u;}
 #ifdef BROOK_QUAD_BLUR
-vec4 glass_sample(vec2 pixel,vec2 delta) {
-    const vec2 atlasSize=vec2(480.0,270.0);
-    vec2 lo=vec2(q.atlasRect.xy)+0.5,hi=vec2(q.atlasRect.zw)-0.5;
-    return textureLod(backdrop,clamp(pixel+delta,lo,hi)/atlasSize,0.0);
-}
+// The tile's blurred backdrop (quad_backdrop.h): glassRect is its capture
+// rectangle, atlasRect that rectangle's texels in the sampled mip and
+// radius the desktop pixels per texel. One bilinear tap, clamped to the tile.
 vec4 glass_backdrop() {
-    vec2 scale=vec2(q.atlasRect.zw-q.atlasRect.xy)/vec2(q.glassRect.zw-q.glassRect.xy);
-    vec2 sampleAt=vec2(q.atlasRect.xy)+(gl_FragCoord.xy-vec2(q.glassRect.xy))*scale;
-    if(q.radius<=3u)return glass_sample(sampleAt,vec2(0));
-    vec2 d=float(q.radius)*scale*0.5;
-    return (4.0*glass_sample(sampleAt,vec2(0)) + glass_sample(sampleAt,vec2(d.x,0)) +
-        glass_sample(sampleAt,vec2(-d.x,0)) + glass_sample(sampleAt,vec2(0,d.y)) +
-        glass_sample(sampleAt,vec2(0,-d.y)))*0.125;
+    const vec2 atlasSize=vec2(1024.0,1024.0); // QUAD_BACKDROP_WIDTH/HEIGHT >> QUAD_BACKDROP_FINAL
+    const vec2 at=vec2(q.atlasRect.xy)+(gl_FragCoord.xy-vec2(q.glassRect.xy))/float(q.radius);
+    return textureLod(backdrop,clamp(at,vec2(q.atlasRect.xy)+0.5,vec2(q.atlasRect.zw)-0.5)/atlasSize,0.0);
 }
 #endif
 vec4 source_at(uvec2 u){
@@ -43,19 +36,9 @@ vec4 source_at(uvec2 u){
         return texelFetch(source,ivec2(q.src+(2u*u+1u)*q.srcSize/(2u*q.dstSize)),0);
     return texelFetch(source,ivec2(q.src+u),0);
 }
-vec4 prefilter(ivec2 pixel,ivec2 delta){
-    ivec2 at=clamp(pixel+delta,q.glassRect.xy,q.glassRect.zw-1);
-    return source_at(uvec2(at-q.dst));
-}
 void main(){
-    vec2 xy=(q.mode&CAPTURE)!=0u?desktopPixel:gl_FragCoord.xy;
-    ivec2 pixel=ivec2(xy);
+    ivec2 pixel=ivec2(gl_FragCoord.xy);
     vec4 t=source_at(uvec2(pixel-q.dst));
-    if((q.mode&CAPTURE_FILTER)!=0u){
-        int r=int(q.radius/2u);
-        t=(4.0*t + prefilter(pixel,ivec2(r,0)) + prefilter(pixel,ivec2(-r,0)) +
-            prefilter(pixel,ivec2(0,r)) + prefilter(pixel,ivec2(0,-r)))*0.125;
-    }
     uvec4 s=uvec4(round(t*255.0));
     if((q.mode&OPAQUE)!=0u)s.a=255u;
     const uint op=q.opacity;
