@@ -15,6 +15,7 @@ static bool resetArmed=true,sharedPage=false,translated=false,protectedEnabled=f
 static unsigned vtdReads=0;
 static uint32_t renderStaging[20*1024];
 namespace brook {
+void PmmReassignOwner(PhysicalAddress,PmmOwner,PmmOwner) {}
 bool BdwTestDisableClflush(){return disableFlush;}
 PhysicalAddress PmmAllocPage(MemTag tag,uint16_t pid) {
     assert(tag==MemTag::KernelData && pid==KernelPid);

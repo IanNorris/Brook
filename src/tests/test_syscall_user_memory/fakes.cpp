@@ -83,6 +83,7 @@ bool BdwIntelUserNodeEnabled() { return false; }
 BdwGpuFile* BdwGpuFileCreate() { return nullptr; }
 void BdwGpuFileUnref(BdwGpuFile*) {}
 void BdwGpuBufferUnref(BdwGpuBuffer*) {}
+void BdwGpuBufferTrackUserRef(BdwGpuBuffer*,BdwBufferUserRef,bool) {}
 void BdwGpuSyncUnref(BdwGpuSync*) {}
 void SceneHandleUnref(SceneHandle*) {}
 void SignalFdUnref(SignalFd*) {}

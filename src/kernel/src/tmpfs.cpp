@@ -193,7 +193,7 @@ Page* NewPage(Tmpfs* fs,uint64_t index,int* error) {
     auto* p=static_cast<Page*>(Allocate(fs,sizeof(Page)));
     if(!p){if(error)*error=-28;return nullptr;}
     if(!Reserve(fs,4096)){Free(fs,p);if(error)*error=-28;return nullptr;}
-    auto frame=PmmAllocPage(MemTag::User,KernelPid);
+    auto frame=PmmAllocPageAccounted(MemTag::User,KernelPid,PmmOwner::Shmem);
     if(!frame){Unreserve(fs,4096);Free(fs,p);if(error)*error=-12;return nullptr;}
     p->fs=fs;p->physical=frame;p->owners=1;p->index=index;
     memset(PageBytes(p),0,4096);return p;

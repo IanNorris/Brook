@@ -7,11 +7,16 @@
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
 #include "memory/heap.h"
+#include "spinlock.h"
 
 namespace brook {
 static constexpr uint32_t BdwGpuBufferChunkPages=256;
 struct BdwGpuBuffer {
     MappingBacking* backing;
+    BdwGpuBuffer *previous, *next;
+    uint64_t creatorIncarnation;
+    uint16_t creatorPid;
+    uint32_t gemRefs, importedGemRefs, primeRefs, mapRefs;
     uint64_t bytes,identity;
     uint64_t *pages,*chunks;
     uint32_t count,allocatedChunks;
@@ -30,7 +35,99 @@ struct BdwGpuBuffer {
     uint64_t skippedToDevice, skippedToCpu;
 #endif
 };
+static IrqSpinLock g_bufferListLock{};
+static BdwGpuBuffer* g_liveBuffers;
 static uint64_t g_nextBufferIdentity=1;
+
+void BdwGpuBufferTrackUserRef(BdwGpuBuffer* buffer, BdwBufferUserRef kind, bool acquire)
+{
+    if (!buffer) return;
+    uint32_t* counter = nullptr;
+    switch (kind) {
+    case BdwBufferUserRef::Gem: counter = &buffer->gemRefs; break;
+    case BdwBufferUserRef::ImportedGem: counter = &buffer->importedGemRefs; break;
+    case BdwBufferUserRef::Prime: counter = &buffer->primeRefs; break;
+    case BdwBufferUserRef::Mapping: counter = &buffer->mapRefs; break;
+    }
+    if (!counter) return;
+    if (acquire) __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+    else __atomic_fetch_sub(counter, 1, __ATOMIC_RELAXED);
+}
+
+void BdwGpuBufferRecordCreator(BdwGpuBuffer* buffer, uint16_t pid, uint64_t incarnation)
+{
+    if (!buffer) return;
+    const auto flags = IrqSpinLockAcquire(&g_bufferListLock);
+    buffer->creatorPid = pid;
+    buffer->creatorIncarnation = incarnation;
+    IrqSpinLockRelease(&g_bufferListLock, flags);
+}
+
+BdwBufferMemoryUsage BdwGpuBufferMemorySnapshot(
+    BdwBufferOwnerUsage* owners, unsigned capacity,
+    const uint64_t* live, unsigned liveCapacity)
+{
+    BdwBufferMemoryUsage usage{};
+    // A stack marker preserves the cursor across short lock holds without
+    // retaining any BO or holding off TLB shootdowns for the entire list.
+    BdwGpuBuffer marker{};
+    auto flags = IrqSpinLockAcquire(&g_bufferListLock);
+    marker.next = g_liveBuffers;
+    if (marker.next) marker.next->previous = &marker;
+    g_liveBuffers = &marker;
+    while (marker.next) {
+        auto* next = marker.next;
+        for (unsigned sampled = 0; next && sampled < 128; ++sampled) {
+            const auto* b = next;
+            next = next->next;
+            if (!b->backing) continue; // another snapshot's cursor
+            ++usage.buffers;
+            usage.bytes += b->bytes;
+            const bool mapped = __atomic_load_n(&b->mapRefs, __ATOMIC_RELAXED);
+            const bool imported = __atomic_load_n(&b->importedGemRefs, __ATOMIC_RELAXED);
+            if (mapped) { ++usage.mappedBuffers; usage.mappedBytes += b->bytes; }
+            if (imported) { ++usage.importedBuffers; usage.importedBytes += b->bytes; }
+            if (!mapped && !imported && !__atomic_load_n(&b->gemRefs, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&b->primeRefs, __ATOMIC_RELAXED)) {
+                ++usage.unusedBuffers;
+                usage.unusedBytes += b->bytes;
+            }
+            const auto pid = b->creatorPid;
+            const auto incarnation = b->creatorIncarnation;
+            const bool exited = incarnation && pid < liveCapacity && live[pid] != incarnation;
+            if (exited) { ++usage.exitedBuffers; usage.exitedBytes += b->bytes; }
+            if (!capacity) continue;
+            unsigned slot = (pid * 2654435761u + incarnation) % capacity;
+            unsigned probes = 0;
+            for (; probes < 16 && probes < capacity; ++probes, slot = (slot + 1) % capacity) {
+                auto& owner = owners[slot];
+                if (!owner.buffers) owner = {pid, exited, incarnation, 0, 0};
+                if (owner.pid != pid || owner.incarnation != incarnation) continue;
+                ++owner.buffers;
+                owner.bytes += b->bytes;
+                break;
+            }
+            if (probes == 16 || probes == capacity) ++usage.unlistedOwnersBuffers;
+        }
+        if (marker.previous) marker.previous->next = marker.next;
+        else g_liveBuffers = marker.next;
+        marker.next->previous = marker.previous;
+        if (!next) break;
+        marker.previous = next->previous;
+        marker.next = next;
+        marker.previous->next = &marker;
+        next->previous = &marker;
+        IrqSpinLockRelease(&g_bufferListLock, flags);
+        flags = IrqSpinLockAcquire(&g_bufferListLock);
+    }
+    if (!marker.next) {
+        // Empty at start, or the remainder was freed between batches.
+        if (marker.previous) marker.previous->next = nullptr;
+        else g_liveBuffers = nullptr;
+    }
+    IrqSpinLockRelease(&g_bufferListLock, flags);
+    return usage;
+}
 static uint64_t BdwNextBufferIdentity(){
     uint64_t next=__atomic_load_n(&g_nextBufferIdentity,__ATOMIC_RELAXED);
     do {if(!next || next==~uint64_t{0})return 0;}
@@ -39,6 +136,13 @@ static uint64_t BdwNextBufferIdentity(){
 }
 static void BdwGpuBufferDestroy(void* object) {
     auto* buffer=static_cast<BdwGpuBuffer*>(object);
+    if (buffer->backing) {
+        const auto flags = IrqSpinLockAcquire(&g_bufferListLock);
+        if (buffer->previous) buffer->previous->next = buffer->next;
+        else g_liveBuffers = buffer->next;
+        if (buffer->next) buffer->next->previous = buffer->previous;
+        IrqSpinLockRelease(&g_bufferListLock, flags);
+    }
     for(uint32_t i=0;i<buffer->allocatedChunks;++i){
         const uint32_t left=buffer->count-i*BdwGpuBufferChunkPages;
         VmmFreePages(VirtualAddress(buffer->chunks[i]),left<BdwGpuBufferChunkPages?left:BdwGpuBufferChunkPages);
@@ -62,7 +166,7 @@ static BdwGpuBuffer* BdwGpuBufferCreateInternal(uint64_t bytes,bool userMappingA
     for(uint32_t chunk=0;chunk<chunkCount;++chunk){
         const uint32_t first=chunk*BdwGpuBufferChunkPages,left=count-first;
         const uint32_t length=left<BdwGpuBufferChunkPages?left:BdwGpuBufferChunkPages;
-        const auto kva=VmmAllocPages(length,VMM_WRITABLE,MemTag::Device,KernelPid);
+        const auto kva=VmmAllocPagesAccounted(length,VMM_WRITABLE,MemTag::Device,KernelPid,PmmOwner::GpuBuffer);
         if(!kva.raw()){BdwGpuBufferDestroy(buffer);return nullptr;}
         buffer->chunks[buffer->allocatedChunks++]=kva.raw();
         for(uint32_t i=0;i<length;++i){
@@ -75,6 +179,11 @@ static BdwGpuBuffer* BdwGpuBufferCreateInternal(uint64_t bytes,bool userMappingA
     }
     buffer->backing=MappingBackingCreate(buffer,BdwGpuBufferDestroy);
     if(!buffer->backing){BdwGpuBufferDestroy(buffer);return nullptr;}
+    const auto flags = IrqSpinLockAcquire(&g_bufferListLock);
+    buffer->next = g_liveBuffers;
+    if (g_liveBuffers) g_liveBuffers->previous = buffer;
+    g_liveBuffers = buffer;
+    IrqSpinLockRelease(&g_bufferListLock, flags);
     return buffer;
 }
 BdwGpuBuffer* BdwGpuBufferCreate(uint64_t bytes){
@@ -155,7 +264,10 @@ bool BdwGpuBufferMarkScanoutImage(BdwGpuBuffer* b){
     // write-back line can later land on top of uncached render writes.
     if(!b || b->userMappingAllowed || __atomic_load_n(&b->gpuState,__ATOMIC_ACQUIRE) ||
        __atomic_load_n(&b->gpuEverUsed,__ATOMIC_ACQUIRE))return false;
-    __atomic_store_n(&b->scanoutImage,true,__ATOMIC_RELEASE);return true;
+    if (!__atomic_exchange_n(&b->scanoutImage, true, __ATOMIC_ACQ_REL))
+        for (uint32_t i = 0; i < b->count; ++i)
+            PmmReassignOwner(PhysicalAddress(b->pages[i]), PmmOwner::GpuBuffer, PmmOwner::Scanout);
+    return true;
 }
 void BdwGpuBufferRef(BdwGpuBuffer* b){if(b)MappingBackingRef(b->backing);}
 void BdwGpuBufferUnref(BdwGpuBuffer* b){if(b)MappingBackingUnref(b->backing);}

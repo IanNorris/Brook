@@ -36,6 +36,7 @@ MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
+MODULE_IMPORT_SYMBOL(VmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(IoApicRegisterHandler);
@@ -214,7 +215,7 @@ static bool AllocQueue(VirtqState& q, uint16_t queueSize)
     uint32_t usedPages  = AlignUp(usedSize, 4096) / 4096;
     uint32_t totalPages = descPages + availPages + usedPages;
 
-    auto qAddr = VmmAllocPages(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    auto qAddr = VmmAllocPagesAccounted(totalPages, VMM_WRITABLE, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
     if (!qAddr) return false;
 
     uint8_t* base = reinterpret_cast<uint8_t*>(qAddr.raw());
@@ -248,7 +249,7 @@ static bool AllocRxBuffers()
     uint32_t totalSize = g_rxq.size * RX_BUF_SIZE;
     uint32_t pages = AlignUp(totalSize, 4096) / 4096;
 
-    auto vaddr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    auto vaddr = VmmAllocPagesAccounted(pages, VMM_WRITABLE, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
     if (!vaddr) return false;
 
     g_rxBufs = reinterpret_cast<uint8_t*>(vaddr.raw());
@@ -281,7 +282,7 @@ static void FillRxQueue()
 static bool AllocTxBuffer()
 {
     uint32_t pages = AlignUp(RX_BUF_SIZE, 4096) / 4096;
-    auto vaddr = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
+    auto vaddr = VmmAllocPagesAccounted(pages, VMM_WRITABLE, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
     if (!vaddr) return false;
 
     g_txBuf = reinterpret_cast<uint8_t*>(vaddr.raw());

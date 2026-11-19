@@ -545,7 +545,7 @@ void AhciReadOnlyInit() {
         PciCommand(original);status.reason="AHCI bus mastering could not be disabled";return;
     }
     status.port=selected;portRegs=hba+(0x100+selected*0x80)/4;io.regs=portRegs;dma64=(cap&(1u<<31))!=0;
-    const auto phys=PmmAllocPages(pages,MemTag::Device,KernelPid);
+    const auto phys=PmmAllocPagesAccounted(pages,MemTag::Device,KernelPid,PmmOwner::AhciDma);
     if(!phys){PciCommand(original);status.reason="AHCI DMA allocation failed";return;}
     dmaPhys=phys.raw();
     if(dmaPhys>=(16ull<<30) || uint64_t(pages)*4096>(16ull<<30)-dmaPhys ||

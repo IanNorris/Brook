@@ -93,12 +93,18 @@ extern "C" void PciConfigWrite32(uint8_t,uint8_t,uint8_t,uint8_t o,uint32_t v){a
  if((v==2 && scenario==3) || (v==0 && scenario==6))return;cmd=uint16_t(v);}
 bool VmmInspectKernelAliases(uint64_t p,KernelAliasMapping& a,KernelAliasMapping& b){a={true,21,0,p};b=a;if(((scenario==52 || scenario==54) && toneAllocations) || rejectRetainedMapping)b.patIndex=1;return true;}
 bool VmmInspectKernelAddress(uint64_t,KernelAliasMapping& m){m={true,12,uint8_t(scenario==50 || scenario==53?0:3),bar};return true;}
+VirtualAddress VmmAllocPagesAccounted(uint64_t n,uint64_t flags,MemTag tag,uint16_t pid,PmmOwner) {
+    return VmmAllocPages(n,flags,tag,pid);
+}
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){assert(n==1);++allocs;if(scenario==4)return VirtualAddress{};return VirtualAddress(reinterpret_cast<uint64_t>(page));}
 uint64_t VmmDetachPage(PageTable,VirtualAddress){return ram|1;}
 PhysicalAddress VmmLeafPhysical(uint64_t){return PhysicalAddress(ram);}
 void PmmFreePage(PhysicalAddress p){if(p.raw()==ram){++pmmFrees;return;}assert(scenario>=20 && !(cmd&4));
  if(chip.published)assert(chip.read32(Chip::base+0x18)==0 && chip.read32(Chip::base+0x1c)==0 && !(chip.read16(Chip::base)&2));
  assert(munmap(reinterpret_cast<void*>(p.raw()),4096)==0);++toneFrees;}
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t){if(scenario<20 || ((scenario==22 || scenario==51) && toneAllocations==2))return PhysicalAddress{};
  void* p=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,-1,0);assert(p!=MAP_FAILED && toneAllocations<17);tonePages[toneAllocations++]=p;return PhysicalAddress(reinterpret_cast<uint64_t>(p));}
 // Mirrors the real 4 KiB-only translator's failure on a huge direct-map leaf.

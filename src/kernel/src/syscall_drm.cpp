@@ -972,6 +972,7 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
         if(mapped<0)return mapped;address=static_cast<uint64_t>(mapped);return 0;};
     if(auto* current=ProcessCurrent()){
         user.submitterPid=current->pid;
+        user.submitterTgid=current->tgid?current->tgid:current->pid;
         user.submitterIncarnation=current->leaderIncarnation?current->leaderIncarnation:current->incarnation;
     }
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
@@ -1006,9 +1007,12 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
            !request.bytes || request.bytes>BROOK_BDW_CACHE_PROBE_MAX_BYTES || (request.omit&~3u))return -EINVAL;
         auto* buffer=brook::BdwGpuBufferCreateCacheProbe(request.bytes,request.omit);
         if(!buffer)return -ENOMEM;
+        brook::BdwGpuBufferRecordCreator(buffer,proc->tgid?proc->tgid:proc->pid,
+            proc->isThread?proc->leaderIncarnation:proc->incarnation);
         FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;
+        brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,true);
         const int fd=FdPublishNew(proc,owned,2);
-        if(fd<0){brook::BdwGpuBufferUnref(buffer);return fd;}
+        if(fd<0){brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,false);brook::BdwGpuBufferUnref(buffer);return fd;}
         request.fd=fd;
         if(CopyToUser(arg,&request,sizeof(request)))return 0;
         CloseProcessFd(proc,fd);
@@ -1074,8 +1078,9 @@ int64_t IntelRenderIoctl(brook::BdwGpuFile* file,uint64_t cmd,uint64_t arg,uint6
             auto* buffer=brook::BdwGpuFileGetBuffer(file,request.handle);if(!buffer)return -ENOENT;
             FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;
             owned.fdFlags=(request.flags&0x80000u)?1:0;
+            brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,true);
             const int fd=FdPublishNew(proc,owned,(request.flags&2)?2:0);
-            if(fd<0){brook::BdwGpuBufferUnref(buffer);return -EMFILE;}
+            if(fd<0){brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,false);brook::BdwGpuBufferUnref(buffer);return -EMFILE;}
             request.fd=fd;
             if(!CopyToUser(arg,&request,sizeof(request))){CloseProcessFd(proc,fd);return -EFAULT;}
             return 0;

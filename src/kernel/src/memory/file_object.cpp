@@ -211,7 +211,7 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
         *page={index,physical,object->pages[index%64],false,token};object->pages[index%64]=page;
         PmmRefPage(physical);if(loaded)*loaded=true;return physical;
     }
-    auto physical=PmmAllocPage(MemTag::User,KernelPid);
+    auto physical=PmmAllocPageAccounted(MemTag::User,KernelPid,PmmOwner::FileCache);
     if(!physical) { kfree(page);rollback();if(error)*error=-12;return PhysicalAddress{}; }
     if(object->prepareBackingPage) {
         int prepared=object->prepareBackingPage(object->pageBudgetContext,index);

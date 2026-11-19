@@ -89,6 +89,22 @@ void BdwGpuBufferMarkGpuFailedRecoverable(BdwGpuBuffer* buffer);
 bool BdwGpuBufferGpuFailedRecoverable(const BdwGpuBuffer* buffer);
 // Clears a recoverable failure only while no GPU use is outstanding.
 bool BdwGpuBufferClearRecoverableFailure(BdwGpuBuffer* buffer);
+struct BdwBufferOwnerUsage {
+    uint16_t pid;
+    bool exited;
+    uint64_t incarnation, buffers, bytes;
+};
+struct BdwBufferMemoryUsage {
+    uint64_t buffers, bytes, mappedBuffers, mappedBytes, unusedBuffers, unusedBytes;
+    uint64_t importedBuffers, importedBytes, exitedBuffers, exitedBytes;
+    uint64_t unlistedOwnersBuffers;
+};
+enum class BdwBufferUserRef : uint8_t { Gem, ImportedGem, Prime, Mapping };
+void BdwGpuBufferTrackUserRef(BdwGpuBuffer*, BdwBufferUserRef, bool acquire);
+void BdwGpuBufferRecordCreator(BdwGpuBuffer*, uint16_t pid, uint64_t incarnation);
+BdwBufferMemoryUsage BdwGpuBufferMemorySnapshot(
+    BdwBufferOwnerUsage* owners, unsigned capacity,
+    const uint64_t* liveIncarnations, unsigned liveCapacity);
 void BdwGpuBufferSetCreator(BdwGpuBuffer* buffer,const void* creator);
 const void* BdwGpuBufferCreator(const BdwGpuBuffer* buffer);
 bool BdwGpuBufferGpuFailed(const BdwGpuBuffer* buffer);

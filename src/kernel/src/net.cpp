@@ -69,6 +69,7 @@
 #include "user_copy.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
+#include "intel_bdw_buffer.h"
 #include "memory/oom_recovery.h"
 #include "memory/exec_page_cache.h"
 #include "memory/address_space.h"
@@ -5279,6 +5280,81 @@ static void DebugAudioDiagnostics()
 
 // Process-context only: pin completed AS identities without following a raw
 // proc->addressSpace pointer that a concurrent exec could retire.
+static void DebugMemoryBreakdown()
+{
+    constexpr unsigned ownerCapacity = 2048, topOwners = 16;
+    auto* owners = static_cast<BdwBufferOwnerUsage*>(kmalloc(sizeof(BdwBufferOwnerUsage) * ownerCapacity));
+    auto* tasks = static_cast<DebugTaskSnapshot*>(kmalloc(sizeof(DebugTaskSnapshot) * MAX_PROCESSES));
+    auto* live = static_cast<uint64_t*>(kmalloc(sizeof(uint64_t) * MAX_PROCESSES));
+    if (!owners || !tasks || !live) {
+        kfree(owners); kfree(tasks); kfree(live);
+        DebugChannelSend("{\"error\":\"memory_breakdown_allocation_failed\"}\n");
+        return;
+    }
+    memset(owners, 0, sizeof(BdwBufferOwnerUsage) * ownerCapacity);
+    memset(live, 0, sizeof(uint64_t) * MAX_PROCESSES);
+    uint32_t total = 0;
+    uint64_t begin = 0, end = 0;
+    const unsigned count = SchedulerSnapshotDebugTasks(tasks, MAX_PROCESSES, &total, &begin, &end);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& task = tasks[i];
+        if (task.tgid < MAX_PROCESSES && task.state != ProcessState::Terminated)
+            live[task.tgid] = task.groupIncarnation;
+    }
+    kfree(tasks);
+    auto* actor = ProcessCurrent();
+    if (actor) SchedulerKernelRegionEnter(actor);
+    const auto gpu = BdwGpuBufferMemorySnapshot(owners, ownerCapacity, live, MAX_PROCESSES);
+    if (actor) SchedulerKernelRegionLeave(actor);
+    kfree(live);
+    BdwBufferOwnerUsage top[topOwners]{};
+    for (unsigned i = 0; i < ownerCapacity; ++i) {
+        auto candidate = owners[i];
+        for (auto& row : top) {
+            if (candidate.bytes <= row.bytes) continue;
+            const auto previous = row;
+            row = candidate;
+            candidate = previous;
+        }
+    }
+    kfree(owners);
+    const auto memory = PmmReadOwnerStats();
+    BridgeReply r;
+    r.text("{\"version\":1,");
+    r.field("ram_pages", memory.ramPages); r.text(",");
+    r.field("free_pages", memory.freePages); r.text(",");
+    r.field("quarantined_pages", memory.quarantinedPages);
+    r.text(",\"classes\":{");
+    for (unsigned i = 1; i < PmmOwnerCount; ++i) {
+        if (i > 1) r.text(",");
+        r.quoted(PmmOwnerNames[i]); r.text(":{");
+        r.field("pages", memory.pages[i]); r.text(",");
+        r.field("bytes", memory.pages[i] * 4096); r.text("}");
+    }
+    r.text("},\"gpu\":{");
+    r.field("buffers", gpu.buffers); r.text(",");
+    r.field("bytes", gpu.bytes); r.text(",");
+    r.field("mapped_buffers", gpu.mappedBuffers); r.text(",");
+    r.field("mapped_bytes", gpu.mappedBytes); r.text(",");
+    r.field("unreferenced_buffers", gpu.unusedBuffers); r.text(",");
+    r.field("unreferenced_bytes", gpu.unusedBytes); r.text(",");
+    r.field("imported_buffers", gpu.importedBuffers); r.text(",");
+    r.field("imported_bytes", gpu.importedBytes); r.text(",");
+    r.field("exited_creator_buffers", gpu.exitedBuffers); r.text(",");
+    r.field("exited_creator_bytes", gpu.exitedBytes); r.text(",");
+    r.field("owner_table_overflow_buffers", gpu.unlistedOwnersBuffers);
+    r.text(",\"top_owners\":[");
+    for (unsigned i = 0; i < topOwners && top[i].buffers; ++i) {
+        if (i) r.text(",");
+        r.text("{"); r.field("pid", top[i].pid); r.text(",");
+        r.field("incarnation", top[i].incarnation); r.text(",");
+        r.text(top[i].exited ? "\"exited\":true," : "\"exited\":false,");
+        r.field("buffers", top[i].buffers); r.text(",");
+        r.field("bytes", top[i].bytes); r.text("}");
+    }
+    r.text("]}}\n"); r.send();
+}
+
 static void DebugMemoryCensus()
 {
     Process* actor=ProcessCurrent();
@@ -5790,6 +5866,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched idle-skip on|off|status - idle ticks skip the ready lock while nothing is queued (default on)\n"
             "  mem cleanup status - exec-cache release trims and PMM drain TLB barriers (rates: diff two reads)\n"
             "  mem exec-cache  - executable page sharing counters\n"
+            "  mem breakdown   - physical RAM classes and live Broadwell buffer owners\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  lastlog status|on|off|flush | lastlog previous OFFSET COUNT - on-disk kernel log tail + census (/nix/var/log/brook), previous boot's record\n"
             "  compat census [N (default 128, max 512)] | compat census reset - ENOSYS and unsupported ioctl/fcntl/prctl/sockopt/socket/clone/mmap/path hits, sorted by count\n"
@@ -7736,6 +7813,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("host_blob_quarantined",blobs.quarantined);
         r.text("}\n");r.send();
     }
+    else if (NetStrEq(cmd, "mem breakdown")) { DebugMemoryBreakdown(); }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {
         PmmDumpPidStats();

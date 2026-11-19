@@ -35,6 +35,7 @@ struct BdwI915UserAccess {
     bool (*handoffSubmit)(void*,BdwExecSnapshot*,int64_t* result)=nullptr;
     // Leader incarnation, not PID; zero denotes an unknown/untracked owner.
     uint64_t submitterIncarnation=0;
+    uint16_t submitterTgid=0;
     // Optional paired tracking for the entire exec preparation/publication.
     // beginExec may return -11 for a full submission queue: the dispatcher
     // then sleeps (interruptibly, on BdwGpuEvent::Space) and calls it again,

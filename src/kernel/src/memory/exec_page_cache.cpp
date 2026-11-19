@@ -40,6 +40,7 @@ PhysicalAddress ExecPageCache::Adopt(PhysicalAddress candidate) {
     }
     ++stats_.misses;
     if(empty<slots_ && stats_.entries<capacity_) {
+        PmmReassignOwner(candidate, PmmOwner::Other, PmmOwner::FileCache);
         PmmRefPage(candidate);entries_[empty]={hash,candidate};
         ++stats_.entries;++stats_.admissions;
     } else ++stats_.full;
