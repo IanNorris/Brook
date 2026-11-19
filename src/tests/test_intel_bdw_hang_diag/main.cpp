@@ -99,12 +99,14 @@ int main(){
     {Submitted(c,io,nonce);c.kind=2;io.word(25,0,nonce);io.word(25,1,0);assert(verdict()=="completed");io.word(25,0,0);}
     // 6. JSON is balanced and carries the key fields.
     {Submitted(c,io,nonce);io.regs[0x2034]=0xe0;io.word(25,4,nonce);BdwHangCaptureDevice(io,c);
+     c.diag.yields=5;c.diag.grace=1;c.diag.longest.valid=true;c.diag.longest.totalTicks=2000000ull*2194;
+     c.diag.longest.waitTicks=2000000ull*2190;c.diag.longest.switches=1;c.diag.longest.fromPid=432;
      c.pid=30;c.ctx=1;c.crumbCount=2;c.crumbs[0].job=7;c.crumbs[1].job=8;c.crumbs[1].outcome=BdwHangRecovered;
      g_out.clear();Writer w;BdwHangCaptureJson(w,c);w.send();
      assert(Balanced(g_out));
      for(const char* key:{"\"verdict\":\"ring_completed_breadcrumb_missing\"","\"RING_ACTHD\":\"0x","\"EXECLIST_STATUS_LO\":\"0x1\"",
                           "\"GEN8_RING_FAULT_REG\":","\"csb_regs\":[","\"lrc_regstate\":[","\"ring\":[","\"ggtt\":[[",
-                          "\"crumbs\":[{\"job\":7","\"outcome\":\"failed_recovered\"","\"pid\":30","\"elsp\":50"})
+                          "\"crumbs\":[{\"job\":7","\"outcome\":\"failed_recovered\"","\"pid\":30","\"elsp\":50","\"grace\":1","\"total_us\":2194000","\"wait_us\":2190000","\"from_pid\":432"})
          if(g_out.find(key)==std::string::npos){std::printf("missing %s in %s\n",key,g_out.c_str());return 1;}
      std::printf("capture json %zu bytes\n",g_out.size());
      g_out.clear();Writer v;BdwHangCrumbJson(v,c.crumbs[1]);v.send();assert(Balanced(g_out) && g_out.find("\"job\":8")!=std::string::npos);}

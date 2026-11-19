@@ -87,3 +87,20 @@ gpu hang reference arm      (then run any GPU work)
 gpu hang reference
 lastlog previous 0 4096     (after a reboot: previous boot tail incl. gpu-hang: lines)
 ```
+
+## Gen 440: starved completion poll (late completion)
+
+The first capture (`build/dell/q2-440-launcher` in display-perf) was `breadcrumb_late_after_deadline`. Both the started marker and the breadcrumb equal the nonce, and the ring is idle at its tail. The job had finished. The worker made 4 polls in the first 2.9 ms (gaps of about 1 ms). Its next yield did not return until about 2194 ms, past the 2000 ms critical-section deadline (`dl=3`), and the finished job was reset as failed. The `submit=10` failures of gen 428 and 16 Nov have the same signature.
+
+**Fix: deadline grace.** `BdwDeadlineGrace` (`intel_bdw_wait_yield.h`) applies to both the completion wait and the context-status retirement wait. When the normal poll stops because of the deadline, it allows exactly one more check under the ownership that is still held. It does not apply after a failed yield, lost ownership or uncertainty, and the check never yields. If the nonce (or the context-complete CSB event) is there, the job retires normally. It is then counted as `late_completions` in `gpu hang status`, flagged 4 in its breadcrumb, logged as `gpu-submit: late completion accepted ...`, and excluded from the completion predictor. Otherwise the job fails exactly as before.
+
+**Where the time goes.** Each capture and breadcrumb now records the run's longest poll yield, split into phases: `unlock_us`, `wait_us` (the `SchedulerSleepMs(1)` or spin slice), `lock_us` (re-taking the kernel page-table lock) and `audit_us`. It also records `apic_ticks` (timer interrupts on CPU 0 during the wait), and the last context switch into CPU 0: `from_pid`, `from_kernel`, and `from_ran_us`, how long that process had held CPU 0. The KLog line is `gpu-hang:  longest yield ...`.
+
+How to read it:
+
+| Fields | Meaning |
+|---|---|
+| `wait_us` large, `apic_ticks` ≈ `wait_us`/1000, `from_ran_us` ≈ `wait_us` | One process held CPU 0 the whole time. Brook does not preempt ring-0 code: a tick that interrupts a kernel thread or a syscall never switches. `from_kernel` and `from_pid` name it |
+| `wait_us` large, `apic_ticks` small | CPU 0 ran with interrupts off. No tick also means no timed-wake scan, because sleeping tasks are woken only by CPU 0's tick |
+| `lock_us` large | Another CPU held the kernel page-table lock (`VmmKernelPtCriticalEnter` spins with IF=0) |
+| `wait_us` large, `switches` > 1 or `from_ran_us` small | Run-queue starvation of the CPU-0-pinned worker (EEVDF pick); confirm with `sched timing on` + `sched timing watch <gpu-submit pid>` |

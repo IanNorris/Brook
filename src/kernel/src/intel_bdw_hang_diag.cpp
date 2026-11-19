@@ -19,7 +19,7 @@ BdwHangCapture g_scratch;   // written by the critical section (worker thread)
 struct Store {uint32_t seq=0,pad=0;BdwHangCapture c{};};
 Store g_store[2];           // 0 last failure, 1 last reference
 BdwHangCapture g_readCopy;  // debug-channel copy, guarded by g_readBusy
-uint32_t g_readBusy=0,g_referenceArmed=0,g_failures=0,g_captures=0;
+uint32_t g_readBusy=0,g_referenceArmed=0,g_failures=0,g_captures=0,g_lateCompletions=0;
 
 void Publish(unsigned slot,const BdwHangCapture& c){
     auto& s=g_store[slot];
@@ -76,7 +76,7 @@ void BdwHangNoteRenderJob(const BdwHangJobInfo& job,const BdwRenderRunResult& ru
     b.descriptor=d.descriptor;b.prepareTsc=job.prepareTsc;
     b.engine=0;b.outcome=ok?BdwHangOk:recovered?BdwHangRecovered:BdwHangUncertain;
     b.runFailSite=run.runFailSite;b.submitSite=run.submitSite;b.initStage=d.initStage;b.csbSite=run.csbSite;
-    b.portWrites=d.portWrites;b.flags=uint8_t((d.captured?1:0)|(d.marker?2:0));
+    b.portWrites=d.portWrites;b.flags=uint8_t((d.captured?1:0)|(d.marker?2:0)|(d.grace?4:0));
     b.ringHead=d.ringHead;b.ringTail=d.ringTail;
     b.execlistBefore=d.before.execlistLo;b.csbPtrBefore=d.before.csbPtr;
     b.execlistAfter=d.after.execlistLo;b.execlistHiAfter=d.after.execlistHi;b.csbPtrAfter=d.after.csbPtr;
@@ -85,6 +85,8 @@ void BdwHangNoteRenderJob(const BdwHangJobInfo& job,const BdwRenderRunResult& ru
     b.elspUs=Us(d.elspTsc,base,khz);b.firstPollUs=Us(d.firstPollTsc,base,khz);b.breadcrumbUs=Us(d.breadcrumbTsc,base,khz);
     b.csbUs=Us(d.firstCsbTsc,base,khz);b.doneUs=Us(d.runEndTsc,base,khz);
     b.maxPollGapUs=khz?uint32_t(d.maxPollGapTicks*1000/khz):0;
+    const auto& y=d.longest;auto us32=[&](uint64_t t){const uint64_t v=khz?t*1000/khz:0;return v>0xffffffffu?0xffffffffu:uint32_t(v);};
+    b.yieldUs=us32(y.totalTicks);b.yieldWaitUs=us32(y.waitTicks);b.yieldFromPid=y.switches?y.fromPid:0;b.yieldFromRanUs=us32(y.fromRanTicks);
     g_ring.Append(b);b.job=uint32_t(g_ring.Count());
     BdwHangCapture* c=d.captured?run.hangCapture:nullptr;
     if(c){
@@ -100,6 +102,15 @@ void BdwHangNoteRenderJob(const BdwHangJobInfo& job,const BdwRenderRunResult& ru
         c->crumbCount=0;
         for(uint64_t i=first;i<count;++i)if(g_ring.Read(i,c->crumbs[c->crumbCount]))++c->crumbCount;
         Publish(ok?1:0,*c);__atomic_fetch_add(&g_captures,1,__ATOMIC_RELAXED);
+    }
+    if(ok && d.grace){
+        // gen 440: the poll was starved past the deadline but the job had
+        // completed; it retired normally after one more check.
+        const uint32_t late=__atomic_add_fetch(&g_lateCompletions,1,__ATOMIC_RELAXED);
+        if(late<=16 || !(late&(late-1)))
+            KPrintf("gpu-submit: late completion accepted pid=%u job=%u grace=%u dl=%u yield_us=%u wait_us=%u lock_us=%u ticks=%u from=%u%s ran_us=%u n=%u\n",
+                job.pid,b.job,unsigned(d.grace),unsigned(d.deadline),b.yieldUs,b.yieldWaitUs,us32(y.lockTicks),y.apicTicks,
+                b.yieldFromPid,y.fromKernel?"k":"",b.yieldFromRanUs,late);
     }
     if(ok)return;
     const uint32_t n=__atomic_add_fetch(&g_failures,1,__ATOMIC_RELAXED);
@@ -117,6 +128,9 @@ void BdwHangNoteRenderJob(const BdwHangJobInfo& job,const BdwRenderRunResult& ru
         KPrintf("gpu-hang:  pre-elsp execlist=%x csbptr=%x ack=%x rc=%x core=%x post=%x/%x us elsp=%u poll=%u gap=%u end=%u dl=%u n=%u\n",
             d.before.execlistLo,d.before.csbPtr,d.before.fwAck,d.before.rcState,d.before.coreStatus,
             d.after.execlistLo,d.after.csbPtr,b.elspUs,b.firstPollUs,b.maxPollGapUs,b.doneUs,unsigned(d.deadline),n);
+        KPrintf("gpu-hang:  longest yield us=%u wait=%u lock=%u audit=%u spin=%u ticks=%u switches=%u from=%u%s ran_us=%u at=%u\n",
+            b.yieldUs,b.yieldWaitUs,us32(y.lockTicks),us32(y.auditTicks),unsigned(y.spin),y.apicTicks,y.switches,
+            b.yieldFromPid,y.fromKernel?"k":"",b.yieldFromRanUs,us32(y.offsetTicks));
     }else KPrintf("gpu-hang: job=%u no capture init=%u/%u/%x elsp_writes=%u n=%u\n",
         b.job,unsigned(d.initStage),unsigned(d.execInitStage),d.execInitValue,unsigned(d.portWrites),n);
 }
@@ -127,6 +141,7 @@ bool BdwHangHandleCommand(const char* cmd){
     if(!*rest || !strcmp(rest," status")){
         Reply r;r.text("{");r.field("jobs",g_ring.Count());r.text(",");r.field("failures",__atomic_load_n(&g_failures,__ATOMIC_RELAXED));
         r.text(",");r.field("captures",__atomic_load_n(&g_captures,__ATOMIC_RELAXED));
+        r.text(",");r.field("late_completions",__atomic_load_n(&g_lateCompletions,__ATOMIC_RELAXED));
         r.text(",\"marker\":");r.text(BdwHangStartedMarkerEnabled()?"true":"false");
         r.text(",\"reference_armed\":");r.text(__atomic_load_n(&g_referenceArmed,__ATOMIC_RELAXED)?"true":"false");
         r.text(",\"scope\":\"RCS user jobs; gpu hang last = failure capture taken before the engine reset; gpu hang ring [n] = last n per-job breadcrumbs (max 128); gpu hang reference arm|show = capture the next job even if healthy; gpu hang marker on|off = started marker in later rings; docs/gpu-hang-diagnostics.md\"}\n");
