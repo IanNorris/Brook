@@ -430,7 +430,8 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
     if(token>0xffffffffULL || (reserved &&
-       (op!=BROOK_DESKTOP_OVERLAY_CURSOR || reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1)))return -EINVAL;
+       (op!=BROOK_DESKTOP_OVERLAY_CURSOR ||
+        (reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1 && reserved!=BROOK_DESKTOP_CURSOR_PLANE_V2))))return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==0){
         if(token || destination || length || (offset & ~uint64_t(BROOK_DESKTOP_OVERLAY_NO_CURSOR)))return -EINVAL;
@@ -490,15 +491,22 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         info.generation=frame.state==DebugFrameState::Ready?frame.overlayGeneration:0;
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
+    if(op==BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED){
+        if(token || destination || length || !offset)return -EINVAL;
+        brook::BdwCursorRendererPresented(owner,offset);
+        return 0;
+    }
     if(op==BROOK_DESKTOP_OVERLAY_CURSOR){
         if(token || length!=sizeof(BrookDesktopOverlayCursor))return -EINVAL;
         auto* cursor=static_cast<BrookDesktopOverlayCursor*>(kmalloc(sizeof(BrookDesktopOverlayCursor)));
         if(!cursor)return -ENOMEM;
         CompositorOverlayCursor(*cursor,offset);
-        if(reserved && brook::BdwCursorRendererQuery(owner))cursor->visible=0;
+        bool suppress=false;
+        const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V2,suppress);
+        if(suppress)cursor->visible=0;
         const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
         const bool copied=CopyToUser(destination,cursor,bytes);
-        kfree(cursor);return copied?0:-EFAULT;
+        kfree(cursor);return copied?int64_t(epoch):-EFAULT;
     }
     if(op==BROOK_DESKTOP_OVERLAY_READ_BAND){
         DesktopOverlayBands bands{};int result=CompositorOverlayBands(uint32_t(token),owner,bands);

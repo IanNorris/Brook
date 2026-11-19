@@ -15,7 +15,9 @@ struct BdwCursorStatus {
 };
 bool BdwCursorRequest(bool enable);
 BdwCursorStatus BdwCursorReadStatus();
-bool BdwCursorRendererQuery(uint64_t owner);
+uint64_t BdwCursorRendererQuery(uint64_t owner,bool supportsHandoff,bool& suppress);
+void BdwCursorRendererPresented(uint64_t owner,uint64_t epoch);
+bool BdwCursorBlocksSoftware();
 // Published only after both boot-lifetime cursor buffers are bound. The
 // display safety check reads these without taking the scanout lock.
 inline uint32_t g_bdwCursorBases[2]{};
