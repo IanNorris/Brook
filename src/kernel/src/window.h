@@ -722,7 +722,8 @@ void WmLauncherToggle();
 bool WmLauncherVisible();
 
 // Scroll the launcher by delta (negative = up, positive = down).
-void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH);
+// delta120: 1/120 wheel ticks, up positive.
+void WmLauncherScroll(int delta120, uint32_t screenW, uint32_t screenH);
 
 // Render the launcher popup over the desktop.
 void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,

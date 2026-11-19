@@ -2521,6 +2521,12 @@ static void CompositorLoopWM()
 }
 
 static DesktopPointerGate g_desktopPointerGate;
+// Vertical scroll in 1/120 ticks, up positive (whole ticks when a source
+// gives no finer motion).
+static int LauncherScroll120(const InputEvent& ev)
+{
+    return ev.deltaY ? int(ev.deltaY) : int(static_cast<int8_t>(ev.scanCode)) * 120;
+}
 static GlobalShortcuts g_globalShortcuts;
 static void CompositorReconcilePointerCapture();
 
@@ -2591,6 +2597,9 @@ static void CompositorInputWM()
     InputEvent ev{};
     while (InputPollEvent(&ev))
     {
+        // Fine touchpad scroll with no whole tick only drives the launcher;
+        // clients and the terminal still scroll by ticks.
+        if(ev.type==InputEventType::MouseScroll && !ev.scanCode && !ev.ascii && !WmLauncherVisible())continue;
         const bool captured=WmRouteCapturedPointer(ev);
         CompositorReconcilePointerCapture();
         if(captured)continue;
@@ -2638,8 +2647,8 @@ static void CompositorInputWM()
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Down)g_wmBtnLatch=true;
                 if(ev.scanCode==0 && kind==DesktopPointerEvent::Up)g_wmBtnReleaseLatch=true;
                 if(kind==DesktopPointerEvent::Scroll && launcher)
-                    WmLauncherScroll(static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
-                else if(kind==DesktopPointerEvent::Scroll)
+                    WmLauncherScroll(LauncherScroll120(ev),g_physFbWidth,g_physFbHeight);
+                else if(kind==DesktopPointerEvent::Scroll && (ev.scanCode || ev.ascii))
                     WmVolumeScroll(mx,my,static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
                 // Right click on the volume icon (or its popup) toggles mute.
                 if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && !launcher)
@@ -2772,8 +2781,7 @@ static void CompositorInputWM()
             // If launcher is open, scroll it instead of windows
             if (WmLauncherVisible())
             {
-                int8_t dy = static_cast<int8_t>(ev.scanCode);
-                WmLauncherScroll(dy, g_physFbWidth, g_physFbHeight);
+                WmLauncherScroll(LauncherScroll120(ev), g_physFbWidth, g_physFbHeight);
                 continue;
             }
 
