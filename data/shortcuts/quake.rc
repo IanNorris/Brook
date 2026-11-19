@@ -1,6 +1,7 @@
 # title: Quake
 # Requires: /nix/games/quake/quake
 # desc: First-person shooter
+# category: games
 set vfb 640x480
 set scale 1
 run /nix/games/quake/quake -basedir /nix/games/quake

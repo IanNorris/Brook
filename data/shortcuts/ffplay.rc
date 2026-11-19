@@ -3,4 +3,5 @@
 # executable: brook-player
 # Requires: /nix/profile/bin/brook-player
 # desc: Brook video player (wl_shm)
+# category: media
 source /boot/SCRIPTS/wayland_brookplayer.rc

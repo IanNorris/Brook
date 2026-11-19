@@ -1,4 +1,5 @@
 # title: FB Test
 # Requires: /nix/bin/brook-fbtest
 # desc: Framebuffer stress test (24fps bar)
+# category: demos
 source /boot/SCRIPTS/wayland_fbtest.rc

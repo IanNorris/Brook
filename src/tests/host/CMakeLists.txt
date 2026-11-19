@@ -772,6 +772,8 @@ if(CHROME_FONT_TTF AND CHROME_PYTHON3)
         "${BROOK_ROOT}/src/kernel/src/chrome_raster.cpp"
         "${BROOK_ROOT}/src/kernel/src/chrome_frame.cpp"
         "${BROOK_ROOT}/src/kernel/src/chrome_shell.cpp"
+        "${BROOK_ROOT}/src/kernel/src/chrome_launcher.cpp"
+        "${BROOK_ROOT}/src/kernel/src/launcher_model.cpp"
         ${CHROME_FONT_SOURCES})
     target_compile_options(test_chrome_goldens PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
     target_compile_definitions(test_chrome_goldens PRIVATE

@@ -2549,6 +2549,7 @@ static void CompositorRunShortcut(const GlobalShortcutResult& r)
     case GlobalShortcutAction::CloseVolumePopup:WmVolumePopupClose();WmTrayFlyoutClose();break;
     case GlobalShortcutAction::CyclePerformanceHud:WmCyclePerformanceHud();break;
     case GlobalShortcutAction::LauncherPromptKey:WmLauncherPowerKey(r.key);break;
+    case GlobalShortcutAction::LauncherKey:WmLauncherKey(r.key,r.ascii,r.modifiers);break;
     case GlobalShortcutAction::CloseFocusedWindow: {
         // The same advisory close as the title-bar button and semantic action:
         // xdg_toplevel.close, WM_DELETE_WINDOW via the XWM, or a native signal.
@@ -2601,8 +2602,9 @@ static void CompositorInputWM()
             context.launcherVisible=WmLauncherVisible();
             context.volumePopupVisible=WmVolumePopupVisible() || WmTrayFlyoutVisible();
             context.launcherPrompt=WmLauncherPowerPrompt();
-            const GlobalShortcutResult shortcut=g_globalShortcuts.Key(
+            GlobalShortcutResult shortcut=g_globalShortcuts.Key(
                 ev.type==InputEventType::KeyPress,ev.scanCode,ev.modifiers,context);
+            shortcut.ascii=ev.ascii;shortcut.modifiers=ev.modifiers;
             CompositorRunShortcut(shortcut);
             if(shortcut.releasePointer)CompositorReconcilePointerCapture();
             if(!shortcut.deliver)continue;
@@ -2642,6 +2644,9 @@ static void CompositorInputWM()
                 // Right click on the volume icon (or its popup) toggles mute.
                 if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && !launcher)
                     WmVolumeToggleMuteAt(mx,my,g_physFbWidth,g_physFbHeight);
+                // Right click in the launcher: an app's Pin / Uninstall menu.
+                if(kind==DesktopPointerEvent::Down && ev.scanCode==1 && launcher)
+                    WmLauncherPress(mx,my,g_physFbWidth,g_physFbHeight,true);
                 if(__atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)==0) {
                     __atomic_store_n(&g_defaultCursorVisible,1u,__ATOMIC_RELEASE);
                     CompositorSetCursorImage(nullptr,0,0,0,0);
@@ -3060,10 +3065,8 @@ static void CompositorHandleMouseWM()
                 if(releaseLatched&&!polledDown){g_wmPrimaryDown=false;g_wmLastBtnDown=false;}
                 else g_wmLastBtnDown=btnDown;
             };
-            int launcherIdx = WmLauncherHitTest(mx, my, g_physFbWidth, g_physFbHeight);
-            if (launcherIdx >= 0)
+            if (WmLauncherPress(mx, my, g_physFbWidth, g_physFbHeight, false))
             {
-                WmLauncherExec(launcherIdx);
                 launcherPressDone();
                 return;
             }

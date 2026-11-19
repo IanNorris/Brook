@@ -27,13 +27,16 @@ enum class GlobalShortcutAction : uint8_t {
     ToggleGlass,
     CyclePerformanceHud,
     LauncherPromptKey, // Enter/Escape/Tab/Left/Right for the launcher power prompt
+    LauncherKey,       // any other key while the launcher is open: it takes every key
 };
 
 struct GlobalShortcutResult {
     bool deliver = true;          // route the event to clients as usual
     bool releasePointer = false;  // revoke pointer capture and show the cursor
     GlobalShortcutAction action = GlobalShortcutAction::None;
-    uint8_t key = 0;              // scan code for LauncherPromptKey
+    uint8_t key = 0;              // scan code for LauncherPromptKey and LauncherKey
+    char ascii = 0;               // LauncherKey: the caller fills in the translated character
+    uint8_t modifiers = 0;        // and the modifiers
 };
 
 struct GlobalShortcutContext {
@@ -48,6 +51,10 @@ public:
         ScP = 0x19, ScEnter = 0x1C, ScG = 0x22, ScF4 = 0x3E;
 
     static bool IsSuper(uint8_t scan) { return scan == SC_LSUPER || scan == SC_RSUPER; }
+    // Shift, Ctrl, Alt and Caps Lock (set 1, both sides): state, not keys.
+    static bool IsModifier(uint8_t scan) {
+        return scan == 0x2A || scan == 0x36 || scan == 0x1D || scan == 0x38 || scan == 0x3A;
+    }
 
     GlobalShortcutResult Key(bool press, uint8_t scan, uint8_t mods,
                              const GlobalShortcutContext& context) {
@@ -82,8 +89,17 @@ public:
             r.key = scan;
         }
         else if (scan == ScEscape && context.volumePopupVisible) r.action = GlobalShortcutAction::CloseVolumePopup;
-        else if (scan == ScEscape && context.launcherVisible) r.action = GlobalShortcutAction::CloseLauncher;
         else if (alt && scan == ScP) r.action = GlobalShortcutAction::CyclePerformanceHud;
+        else if (context.launcherVisible && !super && !(alt && (scan == ScTab || scan == ScF4)) && !IsModifier(scan)) {
+            // Typing anywhere in the open launcher searches, and it owns
+            // navigation (Escape unwinds: menu, query, then the launcher).
+            // Auto-repeat keeps acting, so held arrows and Backspace repeat.
+            r.action = GlobalShortcutAction::LauncherKey;
+            r.key = scan;
+            SetSwallowed(scan, true);
+            r.deliver = false;
+            return r;
+        }
         else if (alt && scan == ScF4) r.action = GlobalShortcutAction::CloseFocusedWindow;
         else if (alt && scan == ScTab) r.action = GlobalShortcutAction::CycleFocus;
         else if (super && scan == ScEnter) r.action = GlobalShortcutAction::SpawnTerminal;

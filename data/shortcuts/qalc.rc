@@ -1,4 +1,5 @@
 # title: Qalculate
 # Requires: /nix/store/k4zn496hh9gcfn36dmq92hdlm8xm1jaq-qalculate-gtk-5.10.0/bin/qalculate-gtk
 # desc: GTK calculator (qalculate-gtk)
+# category: office
 source /boot/SCRIPTS/wayland_qalc.rc
