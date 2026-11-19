@@ -746,8 +746,13 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
-- **Saving a page in Chromium writes a coreutils binary (gen 442, 19 Nov):** every "save" Ian made produced `/data/home/Downloads/coreutils (N)`, 1,677,816 bytes, a copy of the coreutils ELF; eight files between 03:54 and 04:59. Suspects: the download-move path (copy_file_range ENOSYS → cp fallback seen earlier) or coreutils multi-call/argv dispatch. Reproduce with a deliberate save, then strace.
-- **Chromium after the gen 442 resize freeze and restart:** buffers arrive without a GPU fence (`offer_skipped.no_channel_or_fence` 3,396; `readback_bytes` ~71 GB). The window takes the `cpu_single` path, and 1080p YouTube runs at 11 displayed fps. Suspect a software-compositing fallback after GPU-process crashes; check `chrome://gpu`.
+- **Chromium 1080p YouTube on gen 442: 11 displayed fps, `cpu_single` path.** `chrome://gpu` (`/data/home/Downloads/about-gpu-2026-11-19T01-52-22-010Z.txt`) shows hardware compositing, GPU process crash count 0, and video decode software only. It also lists the `rely_on_implicit_sync_for_swap_buffers` workaround. waylandd refused the GPU path (`offer_skipped.no_channel_or_fence` 3,396), so it reads frames back on the CPU (`readback_bytes` ~71 GB). Gen 441's capture showed `src gpu`, so find what differs.
+
+  Fixes:
+  - waylandd derives a fence from implicitly synced dma-bufs (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, codex-queue item 2);
+  - hardware video decode (VA-API on VCS, `docs/bdw-video-engine.md`).
+
+  The `/data/home/Downloads/coreutils (N)` files (ELF copies of coreutils, 03:54–04:59) predate this session and are unrelated to Ian's save.
 - **User-mode process dump (Ian, 19 Nov; Codex `work/proc-dump`):** `proc dump <pid> <path>` writes a gdb-readable ELF core (PRSTATUS per thread, NT_FILE, PT_LOAD), and `scripts/dell_proc_dump.py` fetches it and prints the gdb command. Follow-ons (Ian, 19 Nov):
   - an automatic core on crash signals: uid 1000 by default, `RLIMIT_CORE` honoured, written to `/data/home/.local/share/brook/cores/`, with a budget and rate limit and a `proc autodump` toggle;
   - a kernel hook for hang dumps, which waylandd will call when a window ignores xdg ping for 10 s. Motivation: the gen 442 Chromium resize freeze (all threads asleep; we could not see where they were blocked). The procfs `syscall`/`wchan` and `proc blocked` work is on `work/chromium-freeze` (Claude agent).
