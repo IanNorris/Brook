@@ -118,9 +118,11 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
     const uint64_t start=ApicTickCount();
     struct Duration { CoreDumpResult& result;uint64_t start;~Duration(){result.durationMs=ApicTickCount()-start;} } duration{result,start};
     const uint64_t byteLimit=destination.byteLimit?destination.byteLimit:CoreDumpLimit;
+    result.stage="byte-budget";
     if(byteLimit<CorePageSize)return -27;
     const auto expired=[&]{return destination.expired && destination.expired(destination.context);};
     if(expired())return -110;
+    result.stage="allocate";
     const uint64_t maxResidentPages=byteLimit/CorePageSize;
     Allocation<CoreProgramHeader> programs(MaxPrograms);
     Allocation<uint64_t> identities(MaxPrograms),addresses(maxResidentPages);
@@ -139,7 +141,8 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
         KMutexLock(&space->mutation);
         struct Unlock { KMutex* lock;~Unlock(){KMutexUnlock(lock);} } unlock{&space->mutation};
         auxWords=space->savedAuxvWords;
-        if(auxWords>AddressSpaceState::SavedAuxvWords)return -5;
+        if(auxWords>AddressSpaceState::SavedAuxvWords){result.stage="auxv";return -5;}
+        result.stage="layout";
         memcpy(aux,space->savedAuxv,uint64_t(auxWords)*sizeof(*aux));
         for(const auto* node=space->ranges.head;node;node=node->next){
             if(expired())return -110;
@@ -150,7 +153,7 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
             const char* name=file?file->directoryPath:nullptr;
             const bool named=name && name[0]=='/' && NameLength(name)<sizeof(CoreFileName::name);
             if(named){
-                if(fileCount==MaxFileNotes)return -7;
+                if(fileCount==MaxFileNotes){result.stage="file-notes";return -7;}
                 auto& entry=files.ptr[fileCount++];
                 entry.begin=range.begin;entry.end=range.end;entry.pageOffset=range.offset/CorePageSize;
                 CopyName(entry.name,sizeof(entry.name),name);
@@ -159,7 +162,7 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
             ++result.mappings;
             uint64_t pages=0;
             if(!VmmCollectRangeAddresses(space->pageTable,range.begin,range.end,addresses.ptr,
-                                         maxResidentPages,&pages))return -7;
+                                         maxResidentPages,&pages)){result.stage="resident-pages";return -7;}
             const uint32_t flags=ElfProtection(range.protection);
             if(!named || full)result.holes+=(range.end-range.begin)/CorePageSize-pages;
             uint32_t active=0;
@@ -175,12 +178,12 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
                 // if a concurrent protection change cleared their dirty bit.
                 if(!full && named && !(leaf&VMM_DIRTY) &&
                    !(range.sharing==MappingSharing::Private && (range.protection&2)))continue;
-                if(loadBytes>byteLimit-CorePageSize){layoutError=-27;break;}
+                if(loadBytes>byteLimit-CorePageSize){result.stage="byte-budget";layoutError=-27;break;}
                 if(active && programs.ptr[active].address+programs.ptr[active].memorySize==va){
                     programs.ptr[active].memorySize+=CorePageSize;
                     programs.ptr[active].fileSize+=CorePageSize;
                 }else{
-                    if(programCount==MaxPrograms){layoutError=-7;break;}
+                    if(programCount==MaxPrograms){result.stage="load-segments";layoutError=-7;break;}
                     active=programCount++;
                     programs.ptr[active]={1,flags,0,va,0,CorePageSize,CorePageSize,CorePageSize};
                     identities.ptr[active]=range.identity;
@@ -199,7 +202,7 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
     const uint64_t noteOffset=sizeof(CoreElfHeader)+uint64_t(programCount)*sizeof(CoreProgramHeader);
     programs.ptr[0]={4,0,noteOffset,0,0,notes,0,4};
     uint64_t finalBytes=CorePageAlign(noteOffset+notes);
-    if(finalBytes>byteLimit || loadBytes>byteLimit-finalBytes)return -27;
+    if(finalBytes>byteLimit || loadBytes>byteLimit-finalBytes){result.stage="byte-budget";return -27;}
     for(uint32_t i=1;i<programCount;++i){
         programs.ptr[i].offset=finalBytes;
         finalBytes+=programs.ptr[i].fileSize;
@@ -273,6 +276,10 @@ int CoreDumpWriteSnapshot(CoreDumpSnapshot& snapshot,const char* path,bool full,
         status=expired()?-110:VfsTruncate(node,finalBytes);
     }else status=out.error;
     if(!status && expired())status=-110;
+    if(!status && destination.setOwner){
+        result.stage="file-owner";
+        status=VfsChown(node,destination.uid,destination.gid);
+    }
     if(!status){result.stage="sync";status=VfsSync(node);}
     if(!status && expired())status=-110;
     VfsClose(node);

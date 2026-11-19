@@ -5,13 +5,16 @@
 #include "process.h"
 #include "rtc.h"
 #include "scheduler.h"
+#include "spinlock.h"
 #include "vfs_path.h"
 
 namespace brook {
 namespace {
 
-constexpr char DirectoryName[]="/data/home/.local/share/brook/cores";
-constexpr char PendingName[]=".brook-core-pending";
+constexpr char HomeDirectory[]="/data/home/.local/share/brook/cores";
+constexpr char OtherUsersDirectory[]="/data/.brook-cores";
+constexpr char StageDirectory[]=".brook-private";
+constexpr char PendingName[]="pending";
 enum : uint32_t { Idle, Capturing, Pending, Writing };
 uint32_t g_state=Idle;
 uint32_t g_mode=static_cast<uint32_t>(CoreAutoMode::Uid1000);
@@ -20,6 +23,8 @@ uint64_t g_started, g_queued, g_completed, g_failed, g_timedOut, g_busy, g_rateL
 CoreAutoRate g_rate;
 CoreThreadNote g_notes[MAX_PROCESSES];
 CoreAutoJob g_job;
+SpinLock g_errorLock;
+CoreAutoFailure g_lastError;
 
 void Increment(uint64_t& counter){__atomic_add_fetch(&counter,1,__ATOMIC_RELAXED);}
 uint64_t Read(const uint64_t& counter){return __atomic_load_n(&counter,__ATOMIC_RELAXED);}
@@ -43,25 +48,44 @@ bool Deadline(void*){
     return CoreAutoExpired(g_job.started,ApicTickCount());
 }
 
-int EnterDirectory(const VfsPath& root,Path& current,const char* child,bool privateDirectory)
+int EnterDirectory(const VfsPath& root,Path& current,const char* child,uint16_t mode,
+                   uint32_t uid,uint32_t gid,bool managed,bool migrateRoot=false)
 {
     if(Deadline(nullptr))return -110;
     Path next;
     int result=VfsPathResolve(root,current.path,child,&next.path,false);
+    bool created=false;
     if(result==-2){
-        result=VfsMkdirAt(root,current.path,child,privateDirectory?0700:0755,0);
-        if(!result && !privateDirectory){
-            // Leave the ordinary user home directories usable by their owner.
-            result=VfsChownAt(root,current.path,child,1000,1000,false);
-        }
+        result=VfsMkdirAt(root,current.path,child,mode,0);
         if(result && result!=-17)return result;
+        created=!result;
         result=VfsPathResolve(root,current.path,child,&next.path,false);
     }
     if(result)return result;
     VnodeStat st{};
     if((result=VfsPathStat(next.path,&st)))return result;
     if(!st.isDir || st.isSymlink)return -20;
-    if(privateDirectory && (st.uid || (st.mode&0777)!=0700))return -13;
+    if(managed && (next.path.attachment!=current.path.attachment || (st.mode&07777)!=mode ||
+       (st.uid!=uid && (st.uid || (!created && !migrateRoot)))))return -13;
+    if((created || managed) && (st.uid!=uid || st.gid!=gid)){
+        // Use the retained directory object, even if a parent is renamed.
+        auto* node=VfsPathOpen(next.path,VFS_O_READ,&result);
+        if(!node)return result?result:-5;
+        if(managed && !created && st.uid!=uid){
+            // The legacy root-only directory can be migrated when empty.
+            // Never give away existing files from a root-owned directory.
+            uint32_t cookie=0;
+            DirEntry entry{};
+            while((result=VfsReaddir(node,&entry,&cookie))>0){
+                if(entry.name[0]=='.' && (!entry.name[1] || (entry.name[1]=='.' && !entry.name[2])))continue;
+                result=-13;
+                break;
+            }
+        }
+        if(!result)result=VfsChown(node,uid,gid);
+        VfsClose(node);
+        if(result)return result;
+    }
     VfsPathRelease(current.path);
     current.path=next.path;
     next.path={};
@@ -101,6 +125,7 @@ bool Timestamp(const char* name,uint64_t& stamp)
 struct BudgetDirectory {
     const VfsPath& root;
     const VfsPath& dir;
+    uint32_t uid;
 };
 
 int Reserve(void* raw,uint64_t incoming)
@@ -125,7 +150,7 @@ int Reserve(void* raw,uint64_t incoming)
             VnodeStat st{};
             error=VfsStatAt(path.root,path.dir,entry.name,&st,false);
             if(error)break;
-            if(st.isSymlink || st.uid || (st.mode&0170000)!=0100000 || st.nlink!=1)continue;
+            if(st.isSymlink || st.uid!=path.uid || (st.mode&0177777)!=0100600 || st.nlink!=1)continue;
             bool isOldest=false;
             if(!retention.add(st.size,stamp,isOldest)){error=-75;break;}
             if(isOldest){
@@ -162,7 +187,7 @@ void CoreCommandName(const CoreProcessNote& info,char (&comm)[16])
     if(!comm[0])comm[0]='_';
 }
 
-int WriteJob(const char (&comm)[16],char (&name)[80])
+int WriteJob(const char (&comm)[16],char (&name)[80],char (&directory)[80])
 {
     auto& snapshot=g_job.snapshot;
     char* end=name;
@@ -173,34 +198,64 @@ int WriteJob(const char (&comm)[16],char (&name)[80])
     end=WriteDecimal(end,RtcNow());
     for(char ch:".core")*end++=ch;
 
-    Path root,dir;
+    Path root,dir,stage;
+    auto& result=snapshot.result;
+    const auto uid=snapshot.info.uid,gid=snapshot.info.gid;
+    result.stage="initial-root";
     if(Deadline(nullptr))return -110;
     int error=VfsPathRoot(&root.path);
     if(error)return error;
-    error=VfsPathResolve(root.path,root.path,"/data/home",&dir.path,false);
+    result.stage="data-home";
+    error=VfsPathResolve(root.path,root.path,uid==1000?"/data/home":"/data",&dir.path,false);
     if(error)return error;
     VnodeStat home{};
     if((error=VfsPathStat(dir.path,&home)))return error;
     if(!home.isDir || home.isSymlink)return -20;
-    const char* parts[]={".local","share","brook","cores"};
-    for(uint32_t i=0;i<4;++i)if((error=EnterDirectory(root.path,dir,parts[i],i==3)))return error;
 
+    char* display=directory;
+    if(uid==1000){
+        for(const char* p=HomeDirectory;*p;)*display++=*p++;
+        const char* parts[]={".local","share","brook"};
+        for(const char* part:parts){
+            result.stage=part;
+            if((error=EnterDirectory(root.path,dir,part,0755,uid,gid,false)))return error;
+        }
+        result.stage="core-directory";
+        if((error=EnterDirectory(root.path,dir,"cores",0700,uid,gid,true,true)))return error;
+    }else{
+        for(const char* p=OtherUsersDirectory;*p;)*display++=*p++;
+        *display++='/';
+        *WriteDecimal(display,uid)=0;
+        result.stage="core-users";
+        if((error=EnterDirectory(root.path,dir,".brook-cores",0711,0,0,true)))return error;
+        result.stage="core-directory";
+        if((error=EnterDirectory(root.path,dir,display,0700,uid,gid,true)))return error;
+    }
+
+    // The user owns the published directory and can rename its children.
+    // Keep the pending name in a retained root-only directory until publish.
+    result.stage="staging-directory";
+    stage.path=dir.path;VfsPathRetain(stage.path);
+    if((error=EnterDirectory(root.path,stage,StageDirectory,0700,0,0,true)))return error;
+    result.stage="stale-pending";
     VnodeStat staged{};
-    error=VfsStatAt(root.path,dir.path,PendingName,&staged,false);
+    error=VfsStatAt(root.path,stage.path,PendingName,&staged,false);
     if(!error){
-        if(staged.uid || staged.isSymlink || (staged.mode&0170000)!=0100000 || staged.nlink!=1)return -13;
-        if((error=VfsRemoveAt(root.path,dir.path,PendingName,false)))return error;
+        if((staged.uid && staged.uid!=uid) || staged.isSymlink || (staged.mode&0177777)!=0100600 || staged.nlink!=1)return -13;
+        if((error=VfsRemoveAt(root.path,stage.path,PendingName,false)))return error;
     }else if(error!=-2)return error;
 
-    BudgetDirectory budget{root.path,dir.path};
-    const CoreDumpDestination destination{&root.path,&dir.path,g_job.byteLimit,Deadline,Reserve,&budget};
+    BudgetDirectory budget{root.path,dir.path,uid};
+    const CoreDumpDestination destination{&root.path,&stage.path,g_job.byteLimit,Deadline,Reserve,&budget,true,uid,gid};
     error=CoreDumpWriteSnapshot(snapshot,PendingName,false,destination);
     // No further target memory access once the file contents are written.
     AddressSpaceUnref(snapshot.space);
     snapshot.space=nullptr;
-    if(!error && Deadline(nullptr))error=-110;
-    if(!error)error=VfsRenameNoReplaceAt(root.path,dir.path,PendingName,dir.path,name);
-    if(error)(void)VfsRemoveAt(root.path,dir.path,PendingName,false);
+    if(!error){
+        result.stage="publish";
+        error=Deadline(nullptr)?-110:VfsRenameNoReplaceAt(root.path,stage.path,PendingName,dir.path,name);
+    }
+    if(error)(void)VfsRemoveAt(root.path,stage.path,PendingName,false);
     return error;
 }
 
@@ -210,20 +265,24 @@ void Worker(void*)
         if(__atomic_load_n(&g_state,__ATOMIC_ACQUIRE)!=Pending){SchedulerSleepMs(100);continue;}
         __atomic_store_n(&g_state,Writing,__ATOMIC_RELEASE);
         auto& snapshot=g_job.snapshot;
-        char comm[16]{},name[80]{};
+        char comm[16]{},name[80]{},directory[80]{};
         CoreCommandName(snapshot.info,comm);
-        const int status=WriteJob(comm,name);
+        const int status=WriteJob(comm,name,directory);
         if(snapshot.space)AddressSpaceUnref(snapshot.space);
         const unsigned pid=static_cast<unsigned>(snapshot.info.pid);
         if(status){
-            if(status==-110 || Deadline(nullptr))Increment(g_timedOut);
+            const auto error=uint32_t(-status);
+            SpinLockAcquire(&g_errorLock);
+            g_lastError={snapshot.result.stage,pid,error};
+            SpinLockRelease(&g_errorLock);
+            if(status==-110)Increment(g_timedOut);
             else Increment(g_failed);
-            KLOG_WARN(General,"core-dump: %s pid=%u sig=%d abandoned at %s (error=%d)",
-                      comm,pid,g_job.signal,snapshot.result.stage,status);
+            KLOG_ERROR(General,"core-dump: %s pid=%u failed: %s errno=%u",
+                       comm,pid,snapshot.result.stage,error);
         }else{
             Increment(g_completed);
             KLOG_INFO(General,"core-dump: %s pid=%u sig=%d -> %s/%s (%lu)",
-                      comm,pid,g_job.signal,DirectoryName,name,snapshot.result.bytes);
+                      comm,pid,g_job.signal,directory,name,snapshot.result.bytes);
         }
         __atomic_store_n(&g_started,uint64_t{0},__ATOMIC_RELAXED);
         __atomic_store_n(&g_state,Idle,__ATOMIC_RELEASE);
@@ -281,9 +340,12 @@ CoreAutoStats CoreAutoReadStats()
 {
     const auto mode=static_cast<CoreAutoMode>(__atomic_load_n(&g_mode,__ATOMIC_ACQUIRE));
     const uint64_t started=Read(g_started);
+    SpinLockAcquire(&g_errorLock);
+    const auto failure=g_lastError;
+    SpinLockRelease(&g_errorLock);
     return {mode,Read(g_queued),Read(g_completed),Read(g_failed),Read(g_timedOut),
             Read(g_busy),Read(g_rateLimited),started?ApicTickCount()-started:0,
-            __atomic_load_n(&g_worker,__ATOMIC_ACQUIRE)};
+            __atomic_load_n(&g_worker,__ATOMIC_ACQUIRE),failure};
 }
 
 } // namespace brook

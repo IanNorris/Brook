@@ -11,6 +11,7 @@ void VfsPathRelease(VfsPath path);
 bool VfsPathSame(const VfsPath& a,const VfsPath& b);
 // Both operands must be retained; compares the backing object across bind aliases.
 bool VfsPathSameObject(const VfsPath& a,const VfsPath& b);
+// Retain the initial mount namespace root, independent of process fs context.
 int VfsPathRoot(VfsPath* out);
 // Synthetic syscall brokers may serve only paths whose retained ancestry has
 // not crossed a directory bind. Missing synthetic tails are permitted; a bind

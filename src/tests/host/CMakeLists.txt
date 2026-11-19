@@ -819,6 +819,13 @@ add_host_test(test_intel_bdw_forcewake_ack)
 target_compile_options(test_intel_bdw_forcewake_ack PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_core_autodump_policy)
 target_compile_options(test_core_autodump_policy PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_core_autodump_destination)
+target_compile_options(test_core_autodump_destination PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_core_autodump_destination PRIVATE -Wl,--gc-sections)
 add_host_test(test_core_dump)
 target_compile_options(test_core_dump PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_ggtt_bind)
