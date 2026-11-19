@@ -8,6 +8,7 @@
 #include "memory/heap.h"
 #include "process.h"
 #include "scheduler.h"
+#include "serial.h"
 #include "string.h"
 #include "sync/kmutex.h"
 #include "syscall_internal.h"
@@ -309,7 +310,14 @@ int64_t ShellServiceSyscallInvoke(uint64_t op, uint64_t exchange, uint64_t paylo
                                  uint64_t bytes, uint64_t reserved1, uint64_t reserved2)
 {
     auto* proc = ProcessCurrent();
-    if (!proc || proc->euid || proc->isThread || strcmp(proc->exePath, "/boot/CWSHELL.ELF")) return -1;
+    if (!proc || proc->euid || proc->isThread) return -1;
+    // A mounted QEMU boot volume reports /boot. The guarded initrd keeps
+    // the FAT directory's canonical /BOOT spelling in the executable path.
+    if (strcmp(proc->exePath, "/boot/CWSHELL.ELF") && strcmp(proc->exePath, "/BOOT/CWSHELL.ELF")) {
+        if (op == uint64_t(ShellServiceOp::Register))
+            SerialPrintf("CLEARWATER_SHELL_REJECT pid=%u executable=%s\n", proc->pid, proc->exePath);
+        return -1;
+    }
     if (reserved1 || reserved2) return -22;
     if (op != uint64_t(ShellServiceOp::Register) && (!exchange ||
         payload > (~uint64_t{0}) - sizeof(ShellWireList) || !payload)) return -22;
