@@ -1997,6 +1997,11 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
         if(p->ringImage)cursor_presented(p->cursorEpoch);
         *presented=monotonic_ns();ctx->lastPresentNs=*presented;ctx->lastPartial=p->partial;
         desktop_async_damage_retire(displayedDamage,p->damage,p->partial,1);
+        /* Gaps near the kernel's 500 ms present lease (a refused streak):
+         * the software compositor may have shown a frame meanwhile. */
+        if(g_lastPresentNs && *presented>g_lastPresentNs){const uint64_t gap=(*presented-g_lastPresentNs)/1000000ull;
+            if(gap>g_stats.presentGapMaxMs)g_stats.presentGapMaxMs=gap;
+            if(gap>=400)++g_stats.presentLeaseGaps;}
         g_lastPresentNs=*presented;
         if(g_trackDisplayed){
             if(ctx->track->valid && !p->tainted && (!lastPresentedTicket || (uint64_t)p->ticket>lastPresentedTicket)){

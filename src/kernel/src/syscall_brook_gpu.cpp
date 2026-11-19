@@ -262,6 +262,8 @@ int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b
             if(brook::BdwRefusalLogDue(refusals))
                 KPrintf("gpu-handoff: reserve refused pid=%u errno=%ld reason=%s count=%lu\n",proc->pid,-result,why?why:"unrecorded",refusals);
         }else (void)brook::BdwTakeRefusal();
+        // Reserving proves the renderer alive through a refused-present streak.
+        if(result>0)(void)CompositorRenewLiveRendererLease(owner);
         return result;
     }
     return brook::BdwOffscreenHandoffControl(owner,op,arg,nullptr);

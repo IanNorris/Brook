@@ -49,6 +49,8 @@ struct DesktopStats {
     /* presentStaleSources: of presentStale, refused by the renderer itself
      * (a window's source older than one already shown), not the kernel. */
     uint64_t presentFailures,presentStale,presentBusy,prepareFailures,presentStaleSources;
+    /* Longest interval between accepted async presents, and those of 400 ms or more. */
+    uint64_t presentGapMaxMs,presentLeaseGaps;
     struct DesktopStatsClass cls[2];
     uint64_t overlayCaptures,overlayFailures,overlayPolls,overlayMaxPolls;
     struct DesktopStatsDuration overlayWait;
@@ -182,10 +184,10 @@ static inline size_t desktop_stats_format(const struct DesktopStats *s,const str
     for(unsigned i=0;i<DESKTOP_STATS_BUCKETS-1;++i)desktop_stats_put(&b,"%u,",desktop_stats_bucket_ms[i]);
     desktop_stats_put(&b,"null],");
     desktop_stats_put(&b,"\"presents\":{\"completed\":%llu,\"full\":%llu,\"partial\":%llu,\"graphics\":%llu,\"compute\":%llu,"
-        "\"quad\":%llu,\"failed\":%llu,\"stale\":%llu,\"stale_sources\":%llu,\"busy_retries\":%llu,\"prepare_failures\":%llu,\"direct_layers\":%llu},",
+        "\"quad\":%llu,\"failed\":%llu,\"stale\":%llu,\"stale_sources\":%llu,\"gap_max_ms\":%llu,\"lease_gaps\":%llu,\"busy_retries\":%llu,\"prepare_failures\":%llu,\"direct_layers\":%llu},",
         (unsigned long long)s->presents,(unsigned long long)s->full,(unsigned long long)s->partial,
         (unsigned long long)s->graphics,(unsigned long long)s->compute,(unsigned long long)s->quad,(unsigned long long)s->presentFailures,
-        (unsigned long long)s->presentStale,(unsigned long long)s->presentStaleSources,(unsigned long long)s->presentBusy,(unsigned long long)s->prepareFailures,
+        (unsigned long long)s->presentStale,(unsigned long long)s->presentStaleSources,(unsigned long long)s->presentGapMaxMs,(unsigned long long)s->presentLeaseGaps,(unsigned long long)s->presentBusy,(unsigned long long)s->prepareFailures,
         (unsigned long long)s->directLayers);
     static const char *const paths[3]={"compute","graphics","quad"};
     desktop_stats_put(&b,"\"idle\":{\"skipped_polls\":%llu,\"keepalive_presents\":%llu},",

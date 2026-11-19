@@ -943,18 +943,68 @@ uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps){
 // it rendered with blur. Treating it as a loss made a compositor loop that
 // ran mid-present flip the theme to the Opaque stand-in and back (each flip
 // a chrome epoch, so every in-flight present failed ESTALE).
-static bool CompositorBackendBlur(uint64_t now){
+static bool CompositorBackendBlur(uint64_t now,CompositorBlurReason* reason=nullptr){
+    CompositorBlurReason why=CompositorBlurReason::Gpu;bool blur=false;
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
         const bool leased=g_presentLease.Active(now);
-        if(g_gopWriter && (!leased || g_gopWriterRevoked || g_gopWriterOwner!=g_presentLease.owner))return false;
-        if(leased)
-            return g_rendererCapsOwner==g_presentLease.owner && (g_rendererCaps&BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+        if(g_gopWriter && !leased)why=CompositorBlurReason::WriterUnleased;
+        else if(g_gopWriter && g_gopWriterRevoked)why=CompositorBlurReason::WriterRevoked;
+        else if(g_gopWriter && g_gopWriterOwner!=g_presentLease.owner)why=CompositorBlurReason::ForeignWriter;
+        else if(leased){
+            if(g_rendererCapsOwner!=g_presentLease.owner)why=CompositorBlurReason::CapsOwnerMismatch;
+            else if(!(g_rendererCaps&BROOK_DESKTOP_CAP_BACKDROP_BLUR))why=CompositorBlurReason::CapsBitClear;
+            else {why=CompositorBlurReason::Renderer;blur=true;}
+        }else why=g_rendererCapsOwner?CompositorBlurReason::LeaseLapsed:CompositorBlurReason::NoRenderer;
     }
-    const auto* gpu=GpuCompositorGet();
-    return CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
+    if(why==CompositorBlurReason::LeaseLapsed || why==CompositorBlurReason::NoRenderer){
+        const auto* gpu=GpuCompositorGet();
+        if(CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported()){why=CompositorBlurReason::Gpu;blur=true;}
+    }
+    if(reason)*reason=why;
+    return blur;
 }
 bool CompositorBackendBlurActive(){return __atomic_load_n(&g_backendBlurLatched,__ATOMIC_ACQUIRE);}
+// Latch transitions with the branch that decided each, newest last
+// (compositor thread writes; the debug reader tolerates a torn entry).
+static CompositorBlurChange g_blurChangeRing[COMPOSITOR_BLUR_CHANGE_RING]{};
+static uint64_t g_blurChangeReasons[uint32_t(CompositorBlurReason::Count)]{};
+static uint64_t g_cpuFramesOverRenderer=0,g_leaseLiveRenewals=0;
+static void CompositorNoteBlurChange(bool blur,CompositorBlurReason why,uint64_t tick){
+    const uint64_t n=__atomic_add_fetch(&g_backendBlurChanges,1,__ATOMIC_RELAXED);
+    ++g_blurChangeReasons[uint32_t(why)];
+    uint64_t age=0;
+    {CompositorMutexGuard geometry(&g_scanoutMappingLock);age=g_leasedFrameTick && tick>=g_leasedFrameTick?tick-g_leasedFrameTick:0;}
+    g_blurChangeRing[(n-1)%COMPOSITOR_BLUR_CHANGE_RING]={tick,age,uint32_t(why),blur};
+}
+CompositorBlurDiagnostics CompositorReadBlurDiagnostics(){
+    CompositorBlurDiagnostics d{};
+    d.changes=__atomic_load_n(&g_backendBlurChanges,__ATOMIC_RELAXED);
+    for(uint32_t i=0;i<uint32_t(CompositorBlurReason::Count);++i)d.reasons[i]=g_blurChangeReasons[i];
+    for(uint32_t i=0;i<COMPOSITOR_BLUR_CHANGE_RING;++i)d.ring[i]=g_blurChangeRing[i];
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    d.cpuFramesOverRenderer=g_cpuFramesOverRenderer;d.leaseLiveRenewals=g_leaseLiveRenewals;
+    return d;
+}
+// A renderer whose presents are refused (a stale source, a moved baseline)
+// still proves it is alive by reserving its next frame. While its own frame
+// is on screen and intact, that keeps the lease (and its Glass blur) for up
+// to COMPOSITOR_PRESENT_LEASE_STALL_MS after its last accepted present:
+// letting the 500 ms lease lapse in such a retry streak showed a CPU frame
+// and flipped the theme to the Opaque stand-in and back. A renderer that
+// stops reserving, or stays refused longer, still loses the display.
+bool CompositorRenewLiveRendererLease(uint64_t owner){
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint64_t tick=ApicTickCount();
+    if(!owner || g_gopWriter || g_scanoutNeedsRepair || !g_scanoutContainsLeasedFrame ||
+       !g_presentLease.Active(tick) || g_presentLease.owner!=owner || g_rendererCapsOwner!=owner ||
+       tick<g_leasedFrameTick || tick-g_leasedFrameTick>=COMPOSITOR_PRESENT_LEASE_STALL_MS)return false;
+    uint64_t duration=COMPOSITOR_PRESENT_LEASE_STALL_MS-(tick-g_leasedFrameTick);
+    if(duration>COMPOSITOR_PRESENT_LEASE_MS)duration=COMPOSITOR_PRESENT_LEASE_MS;
+    if(g_presentLease.deadline>=tick+duration)return false;
+    if(!g_presentLease.Renew(owner,tick,duration))return false;
+    ++g_leaseLiveRenewals;return true;
+}
 uint64_t CompositorBackendBlurChanges(){return __atomic_load_n(&g_backendBlurChanges,__ATOMIC_RELAXED);}
 
 void CompositorInit()
@@ -4014,6 +4064,7 @@ static void CompositorFlipSoftware()
     g_dirtyMinY=0xFFFFFFFFu;g_dirtyMaxY=0;
     if(minY>=maxY)return;
     ++g_idleStats.softwareFlips;g_idleStats.rowsDirty+=maxY-minY;
+    if(g_rendererCapsOwner)++g_cpuFramesOverRenderer; // a CPU frame while a renderer is registered
     const uint64_t rowBytes=uint64_t(g_physFbWidth)*4;
     auto copyRow=[&](uint32_t y){
         __builtin_memcpy(const_cast<uint32_t*>(g_physFb+y*g_physFbStride),g_backBuffer+y*g_backBufStride,rowBytes);
@@ -4059,9 +4110,9 @@ static void CompositorLoop()
     // agree. The theme is re-resolved first if the backend's backdrop-blur
     // capability changed (renderer start or exit, lease loss, GPU fault).
     {
-        const bool blur=CompositorBackendBlur(ApicTickCount());
-        if(blur!=__atomic_load_n(&g_backendBlurLatched,__ATOMIC_ACQUIRE))
-            __atomic_add_fetch(&g_backendBlurChanges,1,__ATOMIC_RELAXED);
+        const uint64_t tick=ApicTickCount();CompositorBlurReason why{};
+        const bool blur=CompositorBackendBlur(tick,&why);
+        if(blur!=__atomic_load_n(&g_backendBlurLatched,__ATOMIC_ACQUIRE))CompositorNoteBlurChange(blur,why,tick);
         __atomic_store_n(&g_backendBlurLatched,blur,__ATOMIC_RELEASE);
         WmSetBackendBlur(blur);
     }

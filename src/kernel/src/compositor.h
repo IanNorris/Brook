@@ -39,6 +39,31 @@ uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps);
 // The active backend can blur (latched at the last frame boundary).
 bool CompositorBackendBlurActive();
 uint64_t CompositorBackendBlurChanges();
+// Which branch of the backend-blur decision produced a latch transition.
+enum class CompositorBlurReason : uint32_t {
+    Renderer,           // lease holder reported blur (on)
+    Gpu,                // kernel GPU compositor can blur (on), or cannot
+    WriterUnleased,     // a GOP write with no active lease
+    WriterRevoked,      // the writer's lease was released mid-write
+    ForeignWriter,      // a GOP writer that is not the lease holder
+    CapsOwnerMismatch,  // lease held by a process that did not report caps
+    CapsBitClear,       // the lease holder reported no blur
+    LeaseLapsed,        // caps registered, but the lease expired
+    NoRenderer,         // no lease and no renderer caps
+    Count
+};
+static constexpr uint32_t COMPOSITOR_BLUR_CHANGE_RING=16;
+struct CompositorBlurChange {uint64_t tick,leasedFrameAgeMs;uint32_t reason;bool blur;};
+struct CompositorBlurDiagnostics {
+    uint64_t changes,reasons[uint32_t(CompositorBlurReason::Count)];
+    CompositorBlurChange ring[COMPOSITOR_BLUR_CHANGE_RING];
+    uint64_t cpuFramesOverRenderer;   // software flips while renderer caps were registered
+    uint64_t leaseLiveRenewals;       // leases extended by a refused-but-reserving renderer
+};
+CompositorBlurDiagnostics CompositorReadBlurDiagnostics();
+// Extend the lease of a renderer that is still reserving frames while its
+// presents are refused (bounded by COMPOSITOR_PRESENT_LEASE_STALL_MS).
+bool CompositorRenewLiveRendererLease(uint64_t owner);
 uint32_t CompositorMaterialOpacity();
 uint32_t CompositorMaterialBlur();
 // Opacity of material shell surfaces (taskbar, launcher, popups) under glass.

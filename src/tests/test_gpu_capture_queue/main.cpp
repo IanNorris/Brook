@@ -539,6 +539,40 @@ int main() {
         CompositorSetRendererCapabilities(42,0);g_gopWriterOwner=42;CHECK(!CompositorBackendBlur(t));
         CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);CHECK(CompositorBackendBlur(t));
         g_gopWriter=0;g_gopWriterOwner=0;CHECK(CompositorBackendBlur(t));
+        {   // Each branch names its reason (gpu glass status backend_blur_change_reasons).
+            CompositorBlurReason why{};
+            CHECK(CompositorBackendBlur(t,&why) && why==CompositorBlurReason::Renderer);
+            CHECK(!CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS,&why) && why==CompositorBlurReason::LeaseLapsed);
+            g_gopWriter=7;g_gopWriterOwner=43;CHECK(!CompositorBackendBlur(t,&why) && why==CompositorBlurReason::ForeignWriter);
+            g_gopWriterOwner=42;g_gopWriterRevoked=true;CHECK(!CompositorBackendBlur(t,&why) && why==CompositorBlurReason::WriterRevoked);
+            g_gopWriterRevoked=false;CHECK(!CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS,&why) && why==CompositorBlurReason::WriterUnleased);
+            g_gopWriter=0;g_gopWriterOwner=0;
+            CompositorSetRendererCapabilities(43,BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+            CHECK(!CompositorBackendBlur(t,&why) && why==CompositorBlurReason::CapsOwnerMismatch);
+            CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+        }
+        {   // A refused-present streak: the renderer keeps reserving, so its
+            // lease (and blur) survive past 500 ms, but only to the stall bound
+            // after its last accepted present, and only with its frame intact.
+            g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;g_leasedFrameTick=t;
+            g_lapicTickCount=t+400;CHECK(CompositorRenewLiveRendererLease(42));
+            CHECK(!CompositorRenewLiveRendererLease(43));
+            CHECK(CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS+100)); // stale streak past the old lapse
+            for(uint64_t k=t+800;k<t+COMPOSITOR_PRESENT_LEASE_STALL_MS;k+=300){g_lapicTickCount=k;CHECK(CompositorBackendBlur(k));
+                (void)CompositorRenewLiveRendererLease(42);}
+            g_lapicTickCount=t+COMPOSITOR_PRESENT_LEASE_STALL_MS;CHECK(!CompositorRenewLiveRendererLease(42));
+            CompositorBlurReason why{};
+            CHECK(!CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_STALL_MS,&why) && why==CompositorBlurReason::LeaseLapsed);
+            // No renewal over a frame the software compositor must repair, or
+            // without the renderer's own blur report.
+            g_lapicTickCount=t;CHECK(g_presentLease.Acquire(42,t,COMPOSITOR_PRESENT_LEASE_MS));
+            g_lapicTickCount=t+100;g_scanoutNeedsRepair=true;CHECK(!CompositorRenewLiveRendererLease(42));g_scanoutNeedsRepair=false;
+            CompositorSetRendererCapabilities(42,0);CHECK(!CompositorRenewLiveRendererLease(42));
+            CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+            CHECK(CompositorReadBlurDiagnostics().leaseLiveRenewals>=2);
+            g_scanoutContainsLeasedFrame=false;g_leasedFrameTick=0;g_lapicTickCount=t;
+            g_presentLease.Clear();CHECK(g_presentLease.Acquire(42,t,COMPOSITOR_PRESENT_LEASE_MS));CHECK(CompositorBackendBlur(t));
+        }
         CompositorReleasePresentLease(42); // detach or exit drops the report
         CHECK(g_presentLease.Acquire(42,t,COMPOSITOR_PRESENT_LEASE_MS));CHECK(!CompositorBackendBlur(t));
         CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);
