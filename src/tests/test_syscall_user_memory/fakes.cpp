@@ -217,6 +217,8 @@ int SockSendTo(int,const void* buffer,uint32_t length,const SockAddrIn* destinat
 int SockSendUser(int,uint64_t,uint32_t) { return -EIO; }
 int SockConnect(int,const SockAddrIn*) { return -ECONNREFUSED; }
 int SockGetType(int) { return 2; }
+int SockSetReceiveBuffer(int,int32_t value) { g_net.receiveBufferRequest=value;return 0; }
+int SockGetReceiveBuffer(int) { return g_net.receiveBuffer; }
 int SockGetProtocol(int) { return 17; }
 int SockGetConnectError(int) { return 0; }
 uint32_t SmpGetCpuCount() { return 4; }
