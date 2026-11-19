@@ -1133,3 +1133,5 @@ target_compile_options(test_arp_neighbor PRIVATE "-iquote${BROOK_ROOT}/src/kerne
 
 # Launcher staging bundle installer (tools/launcher-stage): check, install, Apps manifest edits, rollback.
 add_test(NAME test_launcher_stage COMMAND python3 "${BROOK_ROOT}/tools/launcher-stage/test_install.py")
+
+add_test(NAME test_brook_session_env COMMAND python3 "${BROOK_ROOT}/scripts/test_brook_session_env.py")

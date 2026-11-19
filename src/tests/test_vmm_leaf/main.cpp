@@ -208,6 +208,7 @@ bool PmmRefPageIfAlive(PhysicalAddress p) {
 }
 void PmmUnrefPage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);dropLocked(indexOf(p)); }
 void PmmFreePage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);CHECK(records[indexOf(p)].refs==1);dropLocked(indexOf(p)); }
+void PmmReassignOwner(PhysicalAddress, PmmOwner, PmmOwner) {}
 bool PmmHasSingleReference(PhysicalAddress p) { return PmmGetRefCount(p)==1; }
 uint32_t PmmGetRefCount(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);return records[indexOf(p)].refs; }
 uint32_t PmmGetMapCount(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);return records[indexOf(p)].maps; }

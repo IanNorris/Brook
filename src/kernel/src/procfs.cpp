@@ -530,8 +530,8 @@ static Vnode* GenMeminfo()
         "SwapCached:     0 kB\n"
         "SwapTotal:      0 kB\n"
         "SwapFree:       0 kB\n",
-        totalKB, freeKB, freeKB,
-        memory.Pages(PmmOwner::FsBuffers) * 4, memory.Pages(PmmOwner::FileCache) * 4,
+        totalKB, freeKB, memory.AvailablePages() * 4,
+        memory.Pages(PmmOwner::FsBuffers) * 4, memory.CachedPages() * 4,
         memory.Pages(PmmOwner::KernelHeap) * 4, memory.Pages(PmmOwner::KernelStacks) * 4,
         memory.Pages(PmmOwner::PageTables) * 4, memory.Pages(PmmOwner::Shmem) * 4);
 

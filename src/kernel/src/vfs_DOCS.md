@@ -176,7 +176,7 @@ Virtual filesystem generating process and system information on the fly.
 | File | Content |
 |------|---------|
 | `stat` | Per-CPU tick counters (user/nice/system/idle), fork count |
-| `meminfo` | MemTotal, MemFree, MemAvailable (from PMM) |
+| `meminfo` | PMM totals, Cached (file and executable page caches), MemAvailable (free pages plus executable pages held only by the cache), and other kernel memory classes |
 | `uptime` | Seconds since boot, idle time (from per-CPU counters) |
 | `version` | Kernel version string |
 | `loadavg` | Approximate load average |

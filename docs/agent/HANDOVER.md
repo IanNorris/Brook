@@ -5,6 +5,20 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
 
+## Session environment and executable cache (19 November 2026)
+
+- `work/session-env` uses an app-owned `/tmp/brook-$UID` directory with mode
+  `0700` and connects clients to the existing `/tmp/wayland-0` socket.
+  Qt's built-in KDE theme discovers Breeze from the profile and respects
+  existing Qt theme overrides and `kdeglobals`. A host headless Wayland
+  probe rendered a Breeze Dark icon with the pinned Qt 6.11.0 edition.
+- `mem breakdown` reports `classes.exec_cache` and the cache-only subset
+  as `reclaimable_exec_cache_pages`. `Cached` includes the full executable
+  cache. `MemAvailable` includes only its reclaimable subset alongside free
+  pages.
+- Release, both kernel audits and all 386 non-stress host tests passed. Logs
+  are in `build/session-env-release.log` and `build/session-env-ctest.log`.
+
 ## Wayland latency diagnostics (19 November 2026)
 
 - `work/wayland-latency` at `ee769aec` adds per-connection and per-toplevel

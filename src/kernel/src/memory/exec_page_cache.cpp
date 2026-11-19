@@ -40,7 +40,7 @@ PhysicalAddress ExecPageCache::Adopt(PhysicalAddress candidate) {
     }
     ++stats_.misses;
     if(empty<slots_ && stats_.entries<capacity_) {
-        PmmReassignOwner(candidate, PmmOwner::Other, PmmOwner::FileCache);
+        PmmReassignOwner(candidate, PmmOwner::KernelHeap, PmmOwner::ExecCache);
         PmmRefPage(candidate);entries_[empty]={hash,candidate};
         ++stats_.entries;++stats_.admissions;
     } else ++stats_.full;
@@ -56,6 +56,7 @@ uint64_t ExecPageCache::Trim(bool all) {
         while(cursor<slots_ && count<32 && visited<128) {
             auto& entry=entries_[cursor++];++visited;
             if(!entry.physical || (!all && !PmmHasSingleReference(entry.physical)))continue;
+            if (all) PmmReassignOwner(entry.physical, PmmOwner::ExecCache, PmmOwner::KernelHeap);
             retired[count++]=entry.physical;entry={};--stats_.entries;
         }
         stats_.trimmed+=count;stats_.slotsScanned+=visited;

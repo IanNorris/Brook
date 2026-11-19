@@ -12,34 +12,49 @@
 using namespace brook;
 namespace {
 std::mutex frameLock;
-std::unordered_map<uint64_t,unsigned> refs;
+struct Frame {
+    unsigned refs = 1;
+    PmmOwner owner = PmmOwner::KernelHeap;
+};
+std::unordered_map<uint64_t,Frame> frames;
 PhysicalAddress page(unsigned value) {
     auto* memory=static_cast<unsigned char*>(std::aligned_alloc(4096,4096));CHECK(memory);
     std::memset(memory,value,4096);
     std::lock_guard<std::mutex> guard(frameLock);
-    auto p=PhysicalAddress(reinterpret_cast<uint64_t>(memory));CHECK(refs.emplace(p.raw(),1).second);return p;
+    auto p=PhysicalAddress(reinterpret_cast<uint64_t>(memory));CHECK(frames.emplace(p.raw(),Frame{}).second);
+    return p;
 }
 uint64_t collision(PhysicalAddress) {return 1;}
-void empty() {std::lock_guard<std::mutex> guard(frameLock);CHECK(refs.empty());}
+void empty() {std::lock_guard<std::mutex> guard(frameLock);CHECK(frames.empty());}
+PmmOwner owner(PhysicalAddress p) {
+    std::lock_guard<std::mutex> guard(frameLock);
+    return frames.at(p.raw()).owner;
+}
 }
 namespace brook {
-void PmmReassignOwner(PhysicalAddress,PmmOwner,PmmOwner) {}
-void PmmRefPage(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);CHECK(refs.at(p.raw()));++refs.at(p.raw());}
-void PmmUnrefPage(PhysicalAddress p) {
-    std::lock_guard<std::mutex> guard(frameLock);auto found=refs.find(p.raw());CHECK(found!=refs.end()&&found->second);
-    if(!--found->second){refs.erase(found);std::free(reinterpret_cast<void*>(p.raw()));}
+void PmmReassignOwner(PhysicalAddress p, PmmOwner expected, PmmOwner replacement) {
+    std::lock_guard<std::mutex> guard(frameLock);
+    auto& current = frames.at(p.raw()).owner;
+    if (current == expected) current = replacement;
 }
-bool PmmHasSingleReference(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);return refs.at(p.raw())==1;}
-uint32_t PmmGetRefCount(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);return refs.at(p.raw());}
+void PmmRefPage(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);CHECK(frames.at(p.raw()).refs);++frames.at(p.raw()).refs;}
+void PmmUnrefPage(PhysicalAddress p) {
+    std::lock_guard<std::mutex> guard(frameLock);auto found=frames.find(p.raw());CHECK(found!=frames.end()&&found->second.refs);
+    if(!--found->second.refs){frames.erase(found);std::free(reinterpret_cast<void*>(p.raw()));}
+}
+bool PmmHasSingleReference(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);return frames.at(p.raw()).refs==1;}
+uint32_t PmmGetRefCount(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);return frames.at(p.raw()).refs;}
 }
 int main() {
     // Distinct source frames converge; active refs survive trim and clear.
     {
         ExecPageCacheEntry entries[16]{};ExecPageCache c(entries,16,8);
         auto a=c.Adopt(page(42));auto b=c.Adopt(page(42));CHECK(a==b&&PmmGetRefCount(a)==3);
+        CHECK(owner(a) == PmmOwner::ExecCache);
         CHECK(c.Stats().hits==1&&c.Stats().entries==1&&!c.TrimIdle());
         PmmRefPage(a);auto same=c.Adopt(a);CHECK(same==a&&PmmGetRefCount(a)==4);
         PmmUnrefPage(same);CHECK(c.Clear()==1&&PmmGetRefCount(a)==2);
+        CHECK(owner(a) == PmmOwner::KernelHeap);
         PmmUnrefPage(a);PmmUnrefPage(b);empty();
     }
     // Exact collision, hole before canonical winner, and bounded admission.

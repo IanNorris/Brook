@@ -31,8 +31,7 @@ let
     cat > $out/bin/brook-run <<'EOF'
     #!${pkgs.bash}/bin/bash
     export PATH=/nix/profile/bin:/boot/BIN:/data/bin
-    export XDG_RUNTIME_DIR=/tmp
-    export WAYLAND_DISPLAY=wayland-0
+    source ${../data/nix-wrappers/brook-session-env.sh} /tmp || exit 1
     export GDK_BACKEND=wayland
     export SDL_VIDEODRIVER=wayland
     export GTK_THEME=Adwaita
@@ -81,6 +80,7 @@ in {
       pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
+      pkgs.kdePackages.breeze-icons
       firefox chromium
       waylandd calc player files settings message gallery fonts cursors launchers session
     ];

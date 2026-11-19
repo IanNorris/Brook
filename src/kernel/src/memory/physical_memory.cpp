@@ -159,6 +159,7 @@ static inline void FreeLogRecord(uint64_t phys, uint16_t ownerPid, const char* s
 static PageDescriptor* g_pageDescs = nullptr;  // [g_totalPages], via kmalloc
 static uint64_t g_ownerPages[PmmOwnerCount]{};
 static uint64_t g_retiredPages = 0;
+static uint64_t g_idleExecCachePages = 0;
 
 static PmmOwner DefaultOwner(MemTag tag)
 {
@@ -176,11 +177,25 @@ static PmmOwner DefaultOwner(MemTag tag)
 static void ChargeOwner(PageDescriptor& frame, PmmOwner owner)
 {
     if (frame.owner == owner) return;
+    if (frame.refCount == 1) {
+        if (frame.owner == PmmOwner::ExecCache) --g_idleExecCachePages;
+        if (owner == PmmOwner::ExecCache) ++g_idleExecCachePages;
+    }
     if (frame.owner != PmmOwner::Automatic)
         __atomic_sub_fetch(&g_ownerPages[static_cast<unsigned>(frame.owner)], 1, __ATOMIC_RELAXED);
     frame.owner = owner;
     if (owner != PmmOwner::Automatic)
         __atomic_add_fetch(&g_ownerPages[static_cast<unsigned>(owner)], 1, __ATOMIC_RELAXED);
+}
+
+// An exec cache frame is reclaimable when the cache holds its only reference.
+static void SetReferenceCount(PageDescriptor& frame, uint32_t count)
+{
+    if (frame.owner == PmmOwner::ExecCache) {
+        if (frame.refCount == 1) --g_idleExecCachePages;
+        if (count == 1) ++g_idleExecCachePages;
+    }
+    frame.refCount = count;
 }
 
 // Per-PID doubly-linked page lists.  Static (16KB), indexed by PID.
@@ -282,8 +297,8 @@ static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid, PmmOwn
     }
 
     ListAppend(pageIdx, pid, tag);
-    ChargeOwner(Desc(pageIdx), owner);
     Desc(pageIdx).refCount = 1;  // exclusive ownership on fresh allocation
+    ChargeOwner(Desc(pageIdx), owner);
     // BRO-176 stale-mapping detector (ALLOC side). A frame returned by the
     // allocator must have NO existing USER PTE mapping it — it was on the free
     // list. If mapCount is already nonzero here, some process still maps this
@@ -911,7 +926,7 @@ void PmmFreePage(PhysicalAddress physAddr)
     if (g_pageDescs && Desc(static_cast<uint32_t>(idx)).refCount > 1)
     {
         auto& dd = Desc(static_cast<uint32_t>(idx));
-        dd.refCount--;
+        SetReferenceCount(dd, dd.refCount - 1);
         if (dd.tag == static_cast<uint8_t>(MemTag::User))
             RefLogRecord(physAddr.raw(), dd.pid, REFOP_DEC, dd.refCount, "PmmFreePage");
         ListRemove(static_cast<uint32_t>(idx));
@@ -993,12 +1008,9 @@ void PmmRefPage(PhysicalAddress physAddr)
                      physAddr.raw(), d.refCount, (unsigned)d.tag);
         PmmDumpFreeLogLocked(physAddr.raw());
     }
-    if (d.refCount == 0)
-        d.refCount = 2;  // legacy page: count existing owner + new sharer
-    else {
-        if (d.refCount == ~uint32_t{0}) KernelPanic("PMM: frame reference overflow");
-        ++d.refCount;
-    }
+    if (d.refCount == ~uint32_t{0}) KernelPanic("PMM: frame reference overflow");
+    // For a legacy uncounted page, count the existing owner and the new sharer.
+    SetReferenceCount(d, d.refCount ? d.refCount + 1 : 2);
     if (d.tag == static_cast<uint8_t>(MemTag::User))
         RefLogRecord(physAddr.raw(), d.pid, REFOP_REF, d.refCount, "PmmRefPage");
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
@@ -1029,7 +1041,7 @@ bool PmmRefPageIfAlive(PhysicalAddress physAddr)
         return false;  // already free — do NOT resurrect
     }
     if (d.refCount == ~uint32_t{0}) KernelPanic("PMM: frame pin overflow");
-    ++d.refCount;
+    SetReferenceCount(d, d.refCount + 1);
     if (d.tag == static_cast<uint8_t>(MemTag::User))
         RefLogRecord(physAddr.raw(), d.pid, REFOP_REF, d.refCount, "PmmRefPin");
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
@@ -1087,7 +1099,7 @@ void PmmUnrefPage(PhysicalAddress physAddr)
     }
     if (d.refCount > 1)
     {
-        d.refCount--;
+        SetReferenceCount(d, d.refCount - 1);
         if (d.tag == static_cast<uint8_t>(MemTag::User))
             RefLogRecord(physAddr.raw(), d.pid, REFOP_DEC, d.refCount, "PmmUnrefPage");
         // Drop the page from its owner's PID list — see PmmFreePage and BRO-161.
@@ -1508,7 +1520,7 @@ void PmmKillPid(uint16_t pid)
         if (Desc(idx).refCount > 1)
         {
             // COW shared page — decrement refcount, remove from this PID's list
-            Desc(idx).refCount--;
+            SetReferenceCount(Desc(idx), Desc(idx).refCount - 1);
             if (Desc(idx).tag == static_cast<uint8_t>(MemTag::User))
                 RefLogRecord(static_cast<uint64_t>(idx) * PAGE_SIZE, pid, REFOP_DEC,
                              Desc(idx).refCount, "PmmKillPid");
@@ -1630,6 +1642,7 @@ PmmOwnerStats PmmReadOwnerStats()
     stats.ramPages = g_ramPages;
     stats.freePages = g_freePages;
     stats.quarantinedPages = g_retiredPages;
+    stats.idleExecCachePages = g_idleExecCachePages;
     uint64_t accounted = stats.freePages + stats.quarantinedPages;
     for (unsigned i = 1; i < PmmOwnerCount; ++i) {
         stats.pages[i] = __atomic_load_n(&g_ownerPages[i], __ATOMIC_RELAXED);
@@ -1658,6 +1671,7 @@ void PmmHostTestInit(PageDescriptor* descriptors, uint32_t pages) {
     g_pageDescs = descriptors;
     for (auto& count : g_ownerPages) count = 0;
     g_retiredPages = 0;
+    g_idleExecCachePages = 0;
     g_quarantineOn = false; g_framePoisonOn = false; g_freeLogOn = false;
     for (uint64_t i=0;i<BITMAP_WORDS;++i) g_bitmap[i]=~uint64_t{0};
     for (uint32_t i=0;i<PMM_MAX_PIDS;++i) g_pidLists[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,0};
