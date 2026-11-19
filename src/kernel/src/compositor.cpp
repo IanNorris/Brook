@@ -4519,6 +4519,15 @@ int CompositorFinishGopWrite(const CompositorGopWrite& write,int result,bool tou
                 g_scanoutContainsLeasedFrame=true;g_scanoutNeedsRepair=false;
             }
         }
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP) && defined(BROOK_BDW_ZERO_COPY_SCANOUT)
+        // Only an admitted, completed renderer frame may renew on a clean
+        // deferral. Do not resurrect an expired or revoked lease.
+        if(result==-11 && !touched && !g_gopWriterRevoked && !g_scanoutNeedsRepair &&
+           g_scanoutContainsLeasedFrame && g_presentLease.Active(tick) && g_presentLease.owner==write.owner &&
+           RefreshBackdropStyle() && write.display==g_displayGeneration && write.backdrop==g_backdropGeneration &&
+           BdwZeroCopyCanHoldFront(write.owner))
+            (void)g_presentLease.Renew(write.owner,ApicTickCount(),COMPOSITOR_PRESENT_LEASE_MS);
+#endif
         if(result && touched){g_scanoutNeedsRepair=true;g_presentLease.Release(write.owner);}
         g_gopWriter=0;g_gopWriterOwner=0;
     }

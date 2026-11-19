@@ -32,6 +32,7 @@
  * full frame forced by an in-flight frame and no failed presents.
  * Usage: brook-desktop-renderer-host-test [frames]   (env as for the renderer) */
 #define _GNU_SOURCE
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -531,7 +532,14 @@ static void queue_progress(void){
     K.queue.result=present_now(K.queue.ticket,K.queue.full?NULL:&K.queue.regions,&K.queue.frame);K.queue.state=2;
 }
 static long fail(long e){errno=(int)-e;return -1;}
+/* Inject a full or failed scanout ring without opening a Vulkan device. */
+static struct BrookGpuScanoutStatus scanoutQaStatus;
+static int scanoutQa;
 static long handoff_call(long op,long arg,long a){
+    if(scanoutQa && op==BROOK_GPU_HANDOFF_SCANOUT_STATUS){
+        *(struct BrookGpuScanoutStatus *)arg=scanoutQaStatus;
+        return 0;
+    }
     switch(op){
     case BROOK_GPU_HANDOFF_ATTACH:case BROOK_GPU_HANDOFF_DETACH:return 0;
     case BROOK_GPU_HANDOFF_PRESENT_CAPS:return BROOK_GPU_PRESENT_CAP_FRAME|BROOK_GPU_PRESENT_CAP_DEPENDENT|BROOK_GPU_PRESENT_CAP_ASYNC;
@@ -600,7 +608,30 @@ int fake_open(const char *path,int flags,...){
     if(!strcmp(path,"/dev/dri/renderD129"))return dup(K.intel);
     return open(path,flags,mode);
 }
+static int scanout_backpressure_qa(void){
+    scanoutQa=1;
+    g_ring.count=g_scanoutImages=4;
+    scanoutQaStatus.flags=BROOK_GPU_SCANOUT_REQUESTED|BROOK_GPU_SCANOUT_ACTIVE;
+    scanoutQaStatus.front=1;scanoutQaStatus.armed=2;scanoutQaStatus.queued=3;
+    for(unsigned frame=0;frame<32;++frame){
+        assert(scanout_pick()<0 && errno==EAGAIN && g_scanoutActive && g_scanoutImages==4);
+        assert(scanout_reserve_wait(0)==2 && g_appWakeNs);
+    }
+    assert(g_scanoutWaits==64 && g_scanoutStarved==32);
+    scanoutQaStatus.front=2;scanoutQaStatus.freeMask=1;
+    assert(scanout_pick()==0 && g_scanoutPicks==1);
+    desktop_scanout_ring_begin(&g_ring,0);
+    assert(scanout_pick()<0 && errno==EAGAIN);
+    desktop_scanout_ring_end(&g_ring,0);
+    assert(scanout_pick()==0);
+    scanoutQaStatus.flags=BROOK_GPU_SCANOUT_DISABLED;
+    scanoutQaStatus.freeMask=0;
+    assert(scanout_pick()<0 && errno==EIO && !g_scanoutImages && !g_scanoutActive);
+    puts("HOST_SCANOUT_BACKPRESSURE_PASS");
+    return 0;
+}
 int main(int argc,char **argv){
+    if(argc==2 && !strcmp(argv[1],"--scanout-backpressure-qa"))return scanout_backpressure_qa();
     const char *frames=argc>1?argv[1]:"60";
     for(int n=128;n<136 && !K.intel;++n){char path[32];snprintf(path,sizeof(path),"/dev/dri/renderD%d",n);
         int fd=open(path,O_RDWR|O_CLOEXEC);if(fd<0)continue;

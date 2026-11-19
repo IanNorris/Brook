@@ -1154,11 +1154,12 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         return BdwZeroCopyOutcome::RepairRequired;
     }
     if(!zcActive || zcDisabled){IrqSpinLockRelease(&lock,f);return BdwZeroCopyOutcome::Copy;}
-    auto p=zcRing.Present(slot);
-    if(p==BdwZeroCopyPresent::Rejected && zcRing.BeginWrite(slot)){
-        // Reserved before activation: not tracked as written, but provably not
-        // displayed, armed or queued now, so it may be presented.
-        ZcFallback(BdwZeroCopyFallback::NotWriting);p=zcRing.Present(slot);
+    bool adopted=false;
+    const auto p=zcRing.PresentCompleted(slot,adopted);
+    if(p==BdwZeroCopyPresent::Deferred){
+        ++zcStats.deferredPresents;
+        IrqSpinLockRelease(&lock,f);
+        return BdwZeroCopyOutcome::Deferred;
     }
     BdwZeroCopyOutcome outcome=BdwZeroCopyOutcome::Presented;
     if(p==BdwZeroCopyPresent::Rejected){
@@ -1166,6 +1167,7 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
         ZcDisableLocked("image-busy");outcome=BdwZeroCopyOutcome::RepairRequired;
     }else{
         ++zcStats.presents;
+        if(adopted)++zcStats.adoptedPresents;
         {const uint64_t seq=zcRing.Sequence();auto& e=zcTimeline[seq%ZcTimelineSize];
          e={seq,slot,p==BdwZeroCopyPresent::Queued,Rdtsc(),0,0,0};zcSlotSequence[slot]=seq;}
         if(p==BdwZeroCopyPresent::ArmNow){++zcStats.armedNow;
@@ -1175,6 +1177,19 @@ BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer* source,const Composito
     }
     IrqSpinLockRelease(&lock,f);ZcLogPending();
     return outcome;
+}
+// A verified, owned front can remain on screen during present back-pressure.
+bool BdwZeroCopyCanHoldFront(uint64_t owner){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    const bool canHold=owner && zcOwner==owner && zcActive && zcRequested && !zcDisabled &&
+        !zcLeavingForGop && !ClientShowing() && zcRing.HoldsFront(Read(BdwFlipRegs::SurfaceLive));
+    IrqSpinLockRelease(&lock,f);
+    return canHold;
+}
+void BdwZeroCopyNoteWorkerWait(){
+    const uint64_t f=IrqSpinLockAcquire(&lock);
+    ++zcStats.workerWaits;
+    IrqSpinLockRelease(&lock,f);
 }
 uint64_t zcRenderUc=0,zcRenderWb=0;
 bool BdwZeroCopyUncachedRender(){return __atomic_load_n(&zcCacheMode,__ATOMIC_ACQUIRE)!=ZcCacheFlush;}
@@ -1297,6 +1312,8 @@ int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZero
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
+void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
 uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
@@ -1318,6 +1335,8 @@ int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZero
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
+void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
 uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}
@@ -1350,6 +1369,8 @@ int64_t BdwZeroCopyRegister(uint64_t,BdwGpuBuffer* const*,uint32_t,const BdwZero
 bool BdwZeroCopyOnReserve(BdwGpuBuffer*){return true;}
 void BdwZeroCopyOnRelease(BdwGpuBuffer*){}
 BdwZeroCopyOutcome BdwZeroCopyPresentSource(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){return BdwZeroCopyOutcome::Copy;}
+bool BdwZeroCopyCanHoldFront(uint64_t){return false;}
+void BdwZeroCopyNoteWorkerWait(){}
 void BdwZeroCopyPrepareScanout(BdwGpuBuffer*,const CompositorPresentRegion*,uint32_t){}
 uint32_t BdwZeroCopyReadTimeline(BdwZeroCopyTimelineEntry*,uint32_t,uint64_t& khz){khz=0;return 0;}
 void BdwZeroCopyReadStatus(BdwZeroCopyStatus& out){out={};out.reason="not built";out.last=BdwZeroCopyFallback::NotBuilt;}

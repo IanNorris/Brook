@@ -1,4 +1,5 @@
 #include "../../kernel/src/intel_bdw_zero_copy.h"
+#include "../../kernel/src/compositor_present_lease.h"
 #include <cassert>
 #include <cstring>
 using namespace brook;
@@ -165,7 +166,49 @@ static void Hold(){
     ++counter;assert(r.Poll(counter,S[1],0,l)==BdwFlipPoll::Latched && r.Front()==2);
     assert(r.TakeQueued(q) && q==4 && r.Armed(4,counter,0));
 }
+static void Backpressure(){
+    auto ring=Ring();
+    uint32_t frame=20,queued=0;
+    Frame(ring,1,frame);
+    bool adopted=true;
+    // One handoff ticket already existed before activation; the slot is
+    // free and the ticket proves completion, so adoption can present it.
+    assert(ring.PresentCompleted(2,adopted)==BdwZeroCopyPresent::ArmNow && adopted);
+    assert(ring.Armed(2,frame,0));
+    assert(ring.BeginWrite(3) && ring.Present(3)==BdwZeroCopyPresent::Queued);
+    assert(ring.BeginWrite(4) && !ring.FreeMask());
+
+    CompositorPresentLease lease;
+    assert(lease.Acquire(7,100,COMPOSITOR_PRESENT_LEASE_MS));
+    for(uint64_t now=120;now<=740;now+=20){
+        for(uint32_t slot=1;slot<=4;++slot)assert(!ring.BeginWrite(slot));
+        assert(ring.PresentCompleted(1,adopted)==BdwZeroCopyPresent::Deferred && !adopted);
+        assert(ring.PresentCompleted(2,adopted)==BdwZeroCopyPresent::Deferred && !adopted);
+        assert(ring.PresentCompleted(3,adopted)==BdwZeroCopyPresent::Deferred && !adopted);
+        assert(ring.Front()==1 && ring.HoldsFront(S[0]) && !ring.HoldsFront(0));
+        assert(!ring.Leaving() && !ring.Uncertain() && ring.Sequence()==3);
+        // A completed deferred ticket may renew only its own live lease.
+        assert(!lease.Renew(8,now,COMPOSITOR_PRESENT_LEASE_MS));
+        assert(lease.Renew(7,now,COMPOSITOR_PRESENT_LEASE_MS));
+    }
+    BdwFlipLatch latch{};
+    assert(ring.Poll(++frame,S[1],0,latch)==BdwFlipPoll::Latched);
+    assert(ring.Front()==2 && (ring.FreeMask()&1));
+    assert(ring.TakeQueued(queued) && queued==3 && ring.Armed(3,frame,0));
+    assert(ring.BeginWrite(1) && ring.PresentCompleted(1,adopted)==BdwZeroCopyPresent::Queued && !adopted);
+
+    // A real latch failure is rejected (not deferred) and the GOP remains
+    // the recovery surface. An expired lease cannot be resurrected.
+    assert(ring.Poll(frame+3,S[1],0,latch)==BdwFlipPoll::Uncertain);
+    assert(!ring.HoldsFront(S[1]));
+    assert(ring.PresentCompleted(4,adopted)==BdwZeroCopyPresent::Rejected);
+    assert(!lease.Renew(7,1240,COMPOSITOR_PRESENT_LEASE_MS) && lease.Expire(1240));
+    ring.AbandonWrite(4);
+    ring.GopObserved();
+    assert(ring.Front()==0 && ring.Quiescent());
+}
 int main(){
+    Backpressure();
     Hold();
     Adoption();
     Eligibility();Configure();Rotation();NeverWriteDisplayed();Latch();Leave();Abandon();Stats();

@@ -6906,6 +6906,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("queued",st.queued);r.text(",");r.field("replaced",st.replaced);
         r.text(",");r.field("latched",st.latched);r.text(",");r.field("missed_vblanks",st.missedVblanks);
         r.text(",");r.field("uncertain",st.uncertain);r.text(",");r.field("refused_reserve",st.refusedReserve);
+        r.text(",");r.field("deferred_presents",st.deferredPresents);r.text(",");r.field("adopted_presents",st.adoptedPresents);
+        r.text(",");r.field("worker_waits",st.workerWaits);
         r.text(",");r.field("flushes",st.flushes);r.text(",");r.field("full_flushes",st.fullFlushes);
         r.text(",");r.field("flush_bytes",st.flushBytes);
         r.text(",\"flush_us\":[");r.number(st.flushes?st.flushUsSum/st.flushes:0);r.text(",");r.number(st.flushUsMax);r.text("]");
