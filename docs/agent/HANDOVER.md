@@ -95,6 +95,8 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov late: Dell on gen 459 = `work/integration56` 6d2efe6b** (int55 + `work/launcher` e53fe116: launcher pixel scrolling, 20 logical px a wheel tick, list clipped by a new `ChromeOp::Clip`; Ian: two rows a tick was too far and jumpy). Session `b63dcd2afa2a479792f0c63f71b43ea7`. 385 tests pass; QEMU passes; glass changes 1.
+
 **19 Nov night: Dell on gen 458 = `work/integration55` 16753e94** (int54 + `work/launcher` 584dc701: new launcher plus condensed taskbar; session `f6a042f7dc224160940012b28176854d`). 385 non-stress tests pass; QEMU passes. Healthy; glass changes 1.
 - **Taskbar screenshot:** `display-perf/build/dell/shots/full-458/`.
 - **Launcher evidence:** `launcher/build/launcher-evidence/compare/`.
