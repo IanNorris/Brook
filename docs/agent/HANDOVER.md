@@ -95,6 +95,27 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov morning: resume here (supersedes "19 Nov early").**
+- **The Dell is on gen 443:** `work/integration37` 7250125e, payload `dell-int37-20261119`, session `e791539677cc46fcabebc9316b7d13a4`.
+  - Chain: int34 → int35 (+app-present: shell/popup cadence rules, 33 ms defer, overlay capture rate limit, cadence ON at boot) → int36 (+`work/udp-rx-lock` a02725a9) → int37 (+Codex `work/display-planes` 04685a0a).
+  - `work/udp-rx-lock` fixes UDP dequeue without the socket lock. It was the 2–5 s ring-0 stalls of Chromium's QUIC network service that starved the CPU-0 GPU worker; `late_completions` is 0 since.
+  - `work/display-planes`: hardware cursor plane, off at boot; client-scanout kernel ABI, shadow.
+- **Hardware cursor on gen 443 is broken** (Codex is fixing it on display-planes): each image change falls back (521 of 522) and Ian saw two cursors. It is off by default; `gpu cursor off` restores one cursor.
+- **Codex work (mailbox, now "steer"):**
+  - cursor fixes;
+  - `work/net-rx`: ECM rx depth 8 → deeper; TCP OOO store (`ooo_full` 25,624 in a speedtest: down 42.6 / up 77.2 on 900/100);
+  - `work/proc-dump`: manual dump done (5b7ccc26 + 565b30ba, pair passes QEMU, `docs/process-core-dump.md`); auto-dump on crash/hang in progress;
+  - stage 2 renderer wiring: waits for my go-ahead after Clearwater 1.3–1.4 lands.
+- **Claude agents:**
+  - `work/clearwater-s1b` (Clearwater 1.3–1.4, from int36);
+  - `work/chromium-freeze` (procfs `syscall`/`wchan`, `proc blocked`, waylandd per-surface state, QEMU repro of the gen 442 resize freeze).
+- **Next image:** int37 + whatever of the cursor fix, net-rx, proc-dump, clearwater-s1b and chromium-freeze is ready. Then test: the hardware cursor over Q2/launcher, a speedtest, YouTube 1080p, a `proc dump` on Chromium.
+- **Findings:**
+  - YouTube 1080p decodes in software (`chrome://gpu`: Video Decode software only).
+  - Chromium buffers lack fences, so waylandd reads them back on the CPU (`no_channel_or_fence`; DMA_BUF EXPORT_SYNC_FILE is codex-queue item 2).
+  - The kernel audio mixer takes ~13% of CPU during the speedtest.
+- **Not merged to main:** int32–int37 (main has int31). Merge once the cursor is fixed and Ian has checked the image.
+
 **19 Nov early: resume here.**
 - **The Dell is on gen 440:** `work/integration33`, payload `dell-int33b-20261118`, session `e66205da44274cc59d7b75a0899ce4bc`. gen 440 = int32 plus:
   - the per-window hidden cursor (`work/cursor-hide`; Ian confirmed it fixes Q2 and Stardew);
