@@ -779,6 +779,15 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **Queued after Clearwater (Ian, 19 Nov: "queue but not implement, finish Clearwater first"):**
+  1. **Stock Mesa.** Brook's Mesa is nixpkgs Mesa 26.0.6 plus:
+     - Iris `batch-completion.patch`: it caches signalled syncobjs because every `DRM_SYNCOBJ_WAIT` is expensive on Brook (DECISIONS "Dell Quake performance": 1.95 → 6.29 swaps/s);
+     - hasvk `optional-capture.patch`: stock hasvk refuses to start when `I915_PARAM_HAS_EXEC_CAPTURE` = 0;
+     - an opt-in, default-off Wayland buffer-depth patch.
+
+     Kernel fixes would let stock Mesa run: a fast path for waits on already-signalled syncobjs, and reporting and accepting exec capture. Verify the Q2 demo with stock Iris after the syncobj fix. This also simplifies the Flatpak GL extension, since Flathub's Mesa would run directly.
+  2. **GTK4 smoke test:** a GTK4/libadwaita demo on the Dell; confirm `GSK_RENDERER` GL/Vulkan, frame times and input. It informs the App Gallery rebuild (DECISIONS row of 19 Nov).
+  3. **Flatpak feasibility:** flatpak CLI + Flathub, then a small CPU-only app (bwrap, OSTree, D-Bus, runtime); list the gaps. Scope the GL extension separately.
 - **App Gallery goes unresponsive after an install (gen 444, Ian):** the install completes ("Package operation completed. Installed state refreshed."). Afterwards Install opens no dialog and there is no hover glow, until the window "eventually" responds again. Seen twice (Blender, then Thunar). At check time no installer process remained and the gallery's threads were idle (main loop in `poll`). Next time, while it is stuck, run `proc blocked <gallery pid>` and read the waylandd `surfaces` entry for its `client_pid`. A running main thread means an app refresh on the UI thread; an idle `poll` means waylandd input delivery. Code: `tools/brook-gallery-pkg/gallery.c` (`finish_operation` → `read_installed` + `filter_changed`). Related: Brook returns ENOSYS for `pidfd_open`, so GLib uses its SIGCHLD child-watch fallback.
 - **Torchlight II crash on gen 444:** Ogre `RenderingAPIException: Zero sized texture surface on texture …/rt_output/…` (SIGABRT); the window's render target was recreated at 0×0. Beforehand, HUD and pause input stopped responding while world input worked. Suspect a 0×0 or minimised configure from brook-xwm/waylandd on a focus or size change. TL2 log: `/data/home/steam-20261022/user/t2.log`. The autodump failed (queued 1, failed 1, no reason logged); Codex is fixing it (namespace/directory ownership).
 - **Gen 444 under heavy GPU load** (SuperTuxKart + 4 windows; GPU ~100%; 94 °C, tripped to 500 MHz): the screen flashes because `image-not-reserved` sends the zero-copy ring back to GOP (191 returns). Codex is fixing this as back-pressure instead of a GOP fallback.
