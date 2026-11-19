@@ -55,7 +55,10 @@ struct QuadBackdrop {
 /* Theme strengths (brook_appearance_blur_strength): Light 2, Moderate 8,
  * Heavy 16. The result is close to a Gaussian with sigma about G: 15, 31
  * and 62 desktop pixels (7.5, 15 and 31 logical pixels at 200%). */
-static inline unsigned quad_backdrop_depth(unsigned level){return level<=3?4u:level<=11?5u:6u;}
+/* Ian, 19 Nov: Light was too strong. Light = 8 px coarse cell, Moderate = the
+ * old Light (16), Heavy = the old Moderate (32). Depth 3 is the minimum the
+ * 1/2 capture plus the 1/4 final level allow. */
+static inline unsigned quad_backdrop_depth(unsigned level){return level<=3?3u:level<=11?4u:5u;}
 
 static inline void quad_backdrop_add(struct QuadBackdrop *p,struct QuadRect screen,
                                     unsigned layer,unsigned below,unsigned radius)
