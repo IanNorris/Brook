@@ -1955,7 +1955,7 @@ static int submit_present(struct PendingDesktopFrame *p){
     if(observed!=1){fprintf(stderr,"DESKTOP_ASYNC_FENCE_UNKNOWN result=%ld errno=%d resources retained\n",observed,errno);renderer_exit_for_restart("async_fence_unknown",0);}
     if(!async_sources_presentable(g_asyncSourceBarriers,p->sources,p->visible)){
         if(getenv("BROOK_RENDER_ASYNC_TRACE"))fprintf(stderr,"DESKTOP_ASYNC_STALE_CPU ticket=%ld\n",p->ticket);
-        errno=ESTALE;return -1;
+        ++g_stats.presentStaleSources;errno=ESTALE;return -1;
     }
     p->regions.ticket=(uint64_t)p->ticket;p->kernelRegions.ticket=(uint64_t)p->ticket;p->presentCallNs=monotonic_ns();
     if(p->partial){

@@ -38,6 +38,7 @@ bool CompositorGlassRequested();
 uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps);
 // The active backend can blur (latched at the last frame boundary).
 bool CompositorBackendBlurActive();
+uint64_t CompositorBackendBlurChanges();
 uint32_t CompositorMaterialOpacity();
 uint32_t CompositorMaterialBlur();
 // Opacity of material shell surfaces (taskbar, launcher, popups) under glass.

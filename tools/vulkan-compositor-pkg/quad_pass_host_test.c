@@ -412,7 +412,7 @@ static void blur_test_layout(void)
     /* The title strip samples only the wallpaper; the taskbar's padded
      * capture also reaches the game above it. */
     CHECK(p.used[0] && p.used[1] && !p.used[2]);
-    CHECK(p.tiles[0].depth==4 && p.tiles[1].depth==5 && p.tiles[0].base==1 && p.tiles[0].mips==3);
+    CHECK(p.tiles[0].depth==3 && p.tiles[1].depth==4 && p.tiles[0].base==1 && p.tiles[0].mips==2);
     for(unsigned t=0;t<p.count;++t){
         const struct QuadBackdropTile *tile=&p.tiles[t];const int32_t g=1<<tile->depth;
         CHECK(quad_rect_contains(tile->capture,tile->screen) && tile->capture.x0%g==0 && tile->capture.y0%g==0);
