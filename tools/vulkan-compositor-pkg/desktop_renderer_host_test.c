@@ -87,7 +87,8 @@ static struct {
     uint64_t lastPresented;unsigned outstanding,maxOutstanding,overlapReserves,fullOnlyReserves,dependentReserves,staleReserves;
     unsigned fulls,rejected;
     unsigned chromeKeeps,chromeKeepMisses,chromeCaptures,chromeSpanCaptures,surfaceQueries;
-    int oldSurfaces; /* HOST_E2E_OLD_KERNEL_NO_SURFACES: layers ops 16/17 refused */
+    int oldSurfaces; /* HOST_E2E_OLD_KERNEL_NO_SURFACES: layers ops 16/17/18 refused */
+    unsigned capsReports;long capsRequested; /* layers op 18 (stage 1.5) */
     unsigned clientKeeps,clientKeepMisses,clientCaptures,noClientKeep;unsigned long long clientBytes;
     struct {long ticket;int state,full;struct BrookGpuPresentRegions regions;struct BrookGpuPresentFrame frame;uint64_t readyNs;long result;} queue;
     unsigned queued;uint64_t presentDelayNs;
@@ -387,6 +388,10 @@ static void dma_sync(int fd,uint64_t flags){struct dma_buf_sync_wire s={flags};(
 static struct FakeTicket *ticket_find(long ticket){for(unsigned i=0;i<TICKETS;++i)if(ticket>0 && K.tickets[i].ticket==ticket)return &K.tickets[i];return NULL;}
 
 static long layers_call(long op,struct BrookDesktopLayers *L,long a,long b){
+    if(op==BROOK_DESKTOP_RENDERER_CAPS){
+        if(K.oldSurfaces || L || a!=BROOK_DESKTOP_CAPS_VERSION)return errno=EINVAL,-1;
+        ++K.capsReports;K.capsRequested=b;return b&BROOK_DESKTOP_CAP_KNOWN;
+    }
     if(op==BROOK_DESKTOP_SURFACES_QUERY){
         if(K.oldSurfaces)return errno=EINVAL,-1;
         struct BrookDesktopSurfaces *S=(struct BrookDesktopSurfaces*)(void*)L;
@@ -841,6 +846,10 @@ int main(int argc,char **argv){
     if(getenv("HOST_E2E_EXPECT_CHROME_KEEP") && (K.chromeKeeps<=K.chromeCaptures || !K.chromeKeepMisses))++bad;
     if(getenv("HOST_E2E_MIN_IDLE") && g_stats.idleSkips<strtoull(getenv("HOST_E2E_MIN_IDLE"),NULL,10))++bad;
     if(getenv("HOST_E2E_MAX_FAILURES") && g_stats.presentFailures>strtoull(getenv("HOST_E2E_MAX_FAILURES"),NULL,10))++bad;
+    /* Stage 1.5: the renderer reports its capabilities once, after attach,
+     * and has no backdrop blur yet (the kernel keeps Glass opaque for it). */
+    printf("HOST_E2E_CAPS reports=%u requested=%#lx\n",K.capsReports,(unsigned long)K.capsRequested);
+    if(!K.oldSurfaces && (K.capsReports!=1 || K.capsRequested))++bad;
     if(bad)printf("HOST_E2E_EXPECTATION_FAILED\n");
     else if(!K.failures && !result)printf("HOST_E2E_PASS\n");
     if(K.direct)unlink(K.socketPath);

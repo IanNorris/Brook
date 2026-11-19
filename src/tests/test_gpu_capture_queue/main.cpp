@@ -465,5 +465,40 @@ int main() {
     CHECK(CompositorReleaseDebugFrame(frame.token,77));g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};g_backBuffer=nullptr;
     g_compositorProcess=nullptr;const auto finalWakes=wakeRequests.load();CompositorWake();CHECK(wakeRequests==finalWakes);
     std::free(compositor);
+    {
+        // Stage 1.5: backdrop blur follows the backend that shows the desktop.
+        // CPU never; virgl when its driver can blur; a renderer holding the
+        // present lease only if it reported the capability itself (op 18),
+        // and only until the lease lapses, is released or a GOP writer runs.
+        const uint64_t t=g_lapicTickCount=5000;g_presentLease.Clear();g_gopWriter=0;
+        CHECK(!CompositorBackendBlur(t));
+        g_gpuComposite=g_gpuDrawReady=true;ops.BlurSupported=[]{return true;};CHECK(CompositorBackendBlur(t));
+        ops.BlurSupported=[]{return false;};CHECK(!CompositorBackendBlur(t));
+        ops.BlurSupported=nullptr;CHECK(!CompositorBackendBlur(t));g_gpuComposite=g_gpuDrawReady=false;
+        CHECK(g_presentLease.Acquire(42,t,COMPOSITOR_PRESENT_LEASE_MS));CHECK(!CompositorBackendBlur(t));
+        CHECK(CompositorSetRendererCapabilities(42,0xffffffffu)==BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+        CHECK(CompositorBackendBlur(t));
+        CHECK(CompositorSetRendererCapabilities(43,BROOK_DESKTOP_CAP_BACKDROP_BLUR)==BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+        CHECK(!CompositorBackendBlur(t)); // reported by a process that does not hold the lease
+        CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);CHECK(CompositorBackendBlur(t));
+        CHECK(!CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS)); // lapsed: the CPU path shows the desktop
+        g_gopWriter=7;CHECK(!CompositorBackendBlur(t));g_gopWriter=0;CHECK(CompositorBackendBlur(t));
+        CompositorReleasePresentLease(42); // detach or exit drops the report
+        CHECK(g_presentLease.Acquire(42,t,COMPOSITOR_PRESENT_LEASE_MS));CHECK(!CompositorBackendBlur(t));
+        CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+        CHECK(!CompositorSetRendererCapabilities(42,0));CHECK(!CompositorBackendBlur(t)); // withdrawn
+        CHECK(!CompositorSetRendererCapabilities(0,BROOK_DESKTOP_CAP_BACKDROP_BLUR));
+        g_presentLease.Clear();
+        // Under the resolved Glass theme (only ever for a renderer that can
+        // blur) the overlay keeps material alpha on material surfaces and
+        // reports them translucent; opaque otherwise.
+        uint32_t pixels[48]{};DesktopOverlayRect rects[4]{};uint64_t keys[4]{};uint32_t opaque=0xffu;
+        g_materialFrame=BROOK_APPEARANCE_DEFAULT;CHECK(CompositorGlassActive());++shellKeyBump;
+        uint32_t count=RenderDesktopOverlay(pixels,8,6,600,0,0,rects,keys,nullptr,&opaque);
+        CHECK(count && !opaque && pixels[47]==(CompositorMaterialOpacity()<<24|0x123456u) && CompositorMaterialOpacity()<255);
+        g_materialFrame=BROOK_APPEARANCE_DEFAULT|BROOK_APPEARANCE_PERFORMANCE;CHECK(!CompositorGlassActive());++shellKeyBump;
+        count=RenderDesktopOverlay(pixels,8,6,601,0,0,rects,keys,nullptr,&opaque);
+        CHECK(count && opaque==(1u<<count)-1u && pixels[47]==0xff123456u);
+    }
     std::puts("CAPTURE_QUEUE_PASS bounded staging, SHM/reuse races, running cancellation, queued timeout, uncertain lease retention");
 }

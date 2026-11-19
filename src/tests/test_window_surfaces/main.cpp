@@ -376,6 +376,15 @@ int main() {
     const auto theme=WmGetTheme();CHECK(WmSetTheme(theme==0?1:0));
     CHECK(!WmDesktopLayersCurrent(layers));CHECK(WmSetTheme(theme));CHECK(!WmDesktopLayersCurrent(layers));
     g_chromeSettingsEpoch=layers.settingsGeneration; // test restores the fixture snapshot
+    // Stage 1.5: a backend change re-resolves the theme (Glass needs blur;
+    // without it the opaque material stands in) and stales every capture;
+    // reporting an unchanged capability does not.
+    CHECK(!WmBackendBlur() && (WmResolvedAppearance()&BROOK_APPEARANCE_PERFORMANCE));
+    WmSetBackendBlur(false);CHECK(WmDesktopLayersCurrent(layers));
+    WmSetBackendBlur(true);CHECK(!WmDesktopLayersCurrent(layers));
+    CHECK(WmResolvedAppearance()==WmGetAppearance() && !(WmGetAppearance()&BROOK_APPEARANCE_PERFORMANCE));
+    WmSetBackendBlur(false);CHECK(WmResolvedAppearance()==(WmGetAppearance()|BROOK_APPEARANCE_PERFORMANCE));
+    g_chromeSettingsEpoch=layers.settingsGeneration;CHECK(WmDesktopLayersCurrent(layers));
     otherWindow.x++;
     CHECK(WmDesktopLayersUseIfCurrent(layers,&uses,use)==-116 && uses==2);
     otherWindow.x--;

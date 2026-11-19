@@ -8,6 +8,13 @@ enum {
     BROOK_APPEARANCE_PERFORMANCE=2u,
     BROOK_APPEARANCE_DEFAULT=1u|(80u<<8)|(1u<<16)
 };
+/* 0xB02 op 4: what the compositor reports (stage 1.5). Acceleration is a
+ * fact of the active backend, not a setting: Glass needs backdrop blur. */
+enum {
+    BROOK_THEME_OP_STATUS=4,
+    BROOK_THEME_STATUS_GLASS_AVAILABLE=1u, /* the active backend can blur: Glass can be chosen */
+    BROOK_THEME_STATUS_GLASS_ACTIVE=2u     /* the resolved theme is Glass */
+};
 static inline unsigned brook_appearance_opacity(uint32_t value){return (value>>8)&255;}
 static inline unsigned brook_appearance_blur(uint32_t value){return (value>>16)&3;}
 static inline int brook_appearance_valid(uint32_t value){

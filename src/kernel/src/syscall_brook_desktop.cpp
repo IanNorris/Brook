@@ -188,6 +188,13 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
         }
         return CopyToUser(address,&focus,size)?0:-EFAULT;
     }
+    if(op==BROOK_DESKTOP_RENDERER_CAPS){
+        // Stage 1.5: the renderer's backdrop-blur capability, used while it
+        // holds the present lease (owner as in the capture ops).
+        if(address || size || a!=BROOK_DESKTOP_CAPS_VERSION || b>0xffffffffULL || c)return -EINVAL;
+        return CompositorSetRendererCapabilities(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,
+                                                 static_cast<uint32_t>(b));
+    }
     if(op==BROOK_DESKTOP_CLIENT_FRAME){
         if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
         brook::WmNoteClientFrame(b,c);return 0;

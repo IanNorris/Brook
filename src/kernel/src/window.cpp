@@ -136,6 +136,28 @@ void WmSetPerformanceMode(bool enabled){
     else __atomic_fetch_and(&g_appearance,~uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
     CompositorMarkDirty();CompositorWake();
 }
+// Stage 1.5: the backend's backdrop-blur capability, set by the compositor at
+// each frame boundary. A change re-resolves the theme (Glass or its Opaque
+// stand-in): every chrome key changes and everything is repainted once.
+static bool g_backendBlur=false;
+bool WmBackendBlur(){return __atomic_load_n(&g_backendBlur,__ATOMIC_ACQUIRE);}
+void WmSetBackendBlur(bool blur){
+    if(WmBackendBlur()==blur)return;
+    {
+        VfbGuard guard;
+        if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
+        __atomic_store_n(&g_backendBlur,blur,__ATOMIC_RELEASE);
+    }
+    SerialPrintf("WM: backend backdrop blur %s\n",blur?"available":"unavailable");
+    CompositorMarkDirty();
+}
+// The appearance as resolved against the backend: Glass needs backdrop blur,
+// so without it the opaque material (BROOK_APPEARANCE_PERFORMANCE) stands in.
+// The saved selection is never rewritten.
+uint32_t WmResolvedAppearance(){
+    const uint32_t value=WmGetAppearance();
+    return WmBackendBlur()?value:value|BROOK_APPEARANCE_PERFORMANCE;
+}
 uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
 const WmPalette& WmCurrentPalette() { return *brook_theme_palette(WmGetTheme()); }
 bool WmSetTheme(uint32_t theme)
@@ -1681,11 +1703,18 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 
 static ChromeMaterialCache g_chromeMaterial;
 static uint64_t g_materialRebuilds=0;
+// The compositor thread and, under glass, chrome captures for a renderer
+// both use it: rebuilds are serialised. A rebuild follows a theme, opacity or
+// scale change, which also changes every chrome key, so a capture that read
+// it mid-rebuild is discarded as stale.
+static SpinLock g_chromeMaterialLock;
 const ChromeMaterialCache& WmChromeMaterial(){
     const auto& p=WmCurrentPalette();
+    SpinLockAcquire(&g_chromeMaterialLock);
     if(g_chromeMaterial.Ensure(p.titleActive,p.titleInactive,CompositorMaterialOpacity(),
                               WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(7),WmMetric(WM_BORDER_WIDTH)))
         __atomic_add_fetch(&g_materialRebuilds,1,__ATOMIC_RELAXED);
+    SpinLockRelease(&g_chromeMaterialLock);
     return g_chromeMaterial;
 }
 uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
@@ -2922,7 +2951,7 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
     {
         VfbGuard guard;
         if(!DesktopLayersCurrentLocked(layers,!tolerateVisualChanges))return -116;
-        if(!g_wmActive || CompositorGlassActive())return -95;
+        if(!g_wmActive)return -95;
         int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
         const Window& source=g_windows[sorted[index]];
         if(source.noChrome && !source.captionOverlay){*info={source.x,source.y,0,0,0,0,0,0,0};return 0;}
@@ -2988,6 +3017,15 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
     const bool noMouse=mouseX==-1 && mouseY==-1;
     RenderWindowChrome(pixels,width,width,height,local,noMouse?-1:relative(mouseX,originX),noMouse?-1:relative(mouseY,originY));
     // The client interior remains transparent; only the frame is marked.
+    // Glass resolves only for a renderer that reported backdrop blur (layers
+    // op 18): it then gets the same glass alpha as virgl's chrome layer.
+    if(CompositorGlassActive()){
+        const bool rounded=local.state!=WindowState::Maximized && !local.blurRadius;
+        ChromeMarkFrameGlass(pixels,width,width,height,{0,0,width,height},
+                             {local.clientX(),local.clientY(),local.clientW,local.clientH},WmMetric(WM_BORDER_WIDTH),
+                             CompositorMaterialOpacity(),local.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText,
+                             WmCurrentPalette().accent,rounded?&WmChromeMaterial():nullptr,local.focused);
+    }else
     ChromeMarkFrameOpaque(pixels,width,width,height,{0,0,width,height},
                           {local.clientX(),local.clientY(),local.clientW,local.clientH});
     ProcessUnref(local.proc);
