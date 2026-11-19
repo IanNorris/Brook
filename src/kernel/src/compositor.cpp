@@ -1741,7 +1741,7 @@ static CursorImage g_cursorFrame;
 static bool g_cursorSourceReady = false;
 static bool g_cursorBuiltin = true;
 // A client cursor belongs to the window it was set for (its creation
-// identity; 0 means shown everywhere, as before ownership existed). Away from
+// identity; 0 means no window, and the image is never shown). Away from
 // that window's client area (desktop, taskbar, WM caption buttons, other
 // windows) the built-in arrow is shown instead, and the client's image comes
 // back when the pointer returns. Wayland clients set cursors only while they

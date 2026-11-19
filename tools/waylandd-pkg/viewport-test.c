@@ -121,7 +121,7 @@ int main(void) {
     assert(!child->tree.current->value && screen[0]==black[0]);
     // A viewport may outlive its surface, without retaining a dangling pointer.
     surface_destroy(client,child->resource);assert(!wl_resource_get_user_data(vp));viewport_destroy(client,vp);
-    struct brook_surface *cursor=surface(client);cursor->is_cursor=1;cursor->role=3;cursor->cursor_hot_x=1;cursor->cursor_hot_y=2;
+    struct brook_surface *cursor=surface(client);cursor->is_cursor=1;cursor->role=3;cursor->cursor_hot_x=1;cursor->cursor_hot_y=2;cursor->cursor_owner_wm=1;
     cursor->geometry.transform=1;commit_pixels(cursor,grid,3,2);surface_cursor_commit(cursor);
     assert(cursor_w==2 && cursor_h==3 && cursor_x==1 && cursor_y==2);
     assert(cursor_pixels[0]==grid[3] && cursor_pixels[1]==grid[0] && cursor_pixels[4]==grid[5]);

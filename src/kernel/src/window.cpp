@@ -2622,6 +2622,17 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId)
     return &w;
 }
 
+uint64_t WmPointerHoverIdentityOf(Process* proc)
+{
+    const uint64_t hover = WmPointerHoverIdentity();
+    if (!proc || !hover) return 0;
+    VfbGuard guard;
+    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
+        if (g_windows[i].proc && g_windows[i].creationIdentity == hover)
+            return g_windows[i].proc == proc ? hover : 0;
+    return 0;
+}
+
 uint64_t WmWindowCreationIdentity(Process* proc, uint32_t wmId)
 {
     VfbGuard guard;

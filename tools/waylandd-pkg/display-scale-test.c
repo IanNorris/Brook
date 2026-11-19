@@ -84,7 +84,7 @@ int main(void) {
     assert(!pointer_region_contains(&region,pointer_fixed_floor(surface_pointer_fixed(root,2)),0));
     struct brook_surface x11={.role=4};surface_tree_init(&x11);
     assert(surface_output_scale(&x11)==1 && surface_pointer_fixed(&x11,3)==3*256);
-    cursor->is_cursor=1;cursor->role=3;cursor->cursor_hot_x=1;cursor->cursor_hot_y=1;
+    cursor->is_cursor=1;cursor->role=3;cursor->cursor_hot_x=1;cursor->cursor_hot_y=1;cursor->cursor_owner_wm=1;
     surface_set_buffer_scale(client,cursor->resource,2);commit_pixels(cursor,background,8,6);
     surface_cursor_commit(cursor);
     assert(cursor_width==8 && cursor_height==6 && hotspot_x==2 && hotspot_y==2);
@@ -133,9 +133,13 @@ int main(void) {
     pointer_set_cursor(client,seat.pointer,0,NULL,0,0);
     assert(cursor_owner==(BROOK_CURSOR_OWNER_TAG|1) && cursor_width==1 && cursor_height==1 && cursor_pixels[0]==0);
     struct brook_surface *entered_before=seat.entered_surface;seat.entered_surface=NULL;
-    cursor_width=cursor_height=99;pointer_set_cursor(client,seat.pointer,0,NULL,0,0);
-    assert(cursor_width==0 && cursor_owner==0); /* no window known: built-in arrow */
-    pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);assert(cursor_owner==0);
+    /* Without pointer focus (after POINTER_LEFT, Xwayland sets its root "X"
+     * cursor) set_cursor uploads nothing, so the kernel keeps its arrow over
+     * the desktop, taskbar and kernel windows; later commits stay silent. */
+    cursor_width=cursor_height=99;cursor_owner=77;pointer_set_cursor(client,seat.pointer,0,NULL,0,0);
+    assert(cursor_width==99 && cursor_owner==77);
+    pointer_set_cursor(client,seat.pointer,0,cursor->resource,1,1);assert(cursor_width==99 && cursor_owner==77);
+    surface_cursor_commit(cursor);assert(cursor_width==99 && cursor_owner==77);
     seat.entered_surface=entered_before;wl_resource_set_user_data(seat.pointer,NULL);
     /* The kernel's POINTER_LEFT (pointer moved to the desktop, WM chrome or
      * another window) ends pointer focus; the next motion enters again, so

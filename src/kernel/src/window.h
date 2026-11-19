@@ -643,6 +643,8 @@ void WmPointerSetHover(int idx);
 // Creation identity of the window currently hovered (as published by
 // WmPointerSetHover), or 0 over shell surfaces, chrome and the desktop.
 uint64_t WmPointerHoverIdentity();
+// The hovered identity only when `proc` owns the hovered window, else 0.
+uint64_t WmPointerHoverIdentityOf(Process* proc);
 // Creation identity of `proc`'s window `wmId`, or 0 when it owns no such window.
 uint64_t WmWindowCreationIdentity(Process* proc, uint32_t wmId);
 // A physical primary press was delivered to window `idx`'s client area.
