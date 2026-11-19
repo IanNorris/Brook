@@ -18,6 +18,14 @@ struct ChromeTarget {
     int originX = 0, originY = 0;
 };
 
+// One baked atlas per type role, at one desktop scale.
+struct ChromeFontSet {
+    const FontAtlas* font[static_cast<unsigned>(ChromeFont::Count)];
+    const FontAtlas& operator[](ChromeFont role) const { return *font[static_cast<unsigned>(role)]; }
+};
+// The sets the build bakes (chrome_fonts.cpp, cmake/ChromeFonts.cmake).
+extern const ChromeFontSet g_chromeFonts100, g_chromeFonts150, g_chromeFonts200;
+
 // Advance width of text in the font.
 int ChromeTextWidth(const FontAtlas& font, const char* text);
 void ChromeFillRect(const ChromeTarget& t, int x0, int y0, int w, int h, uint32_t color);
@@ -28,11 +36,11 @@ int ChromeRenderGlyph(const ChromeTarget& t, const FontAtlas& font, int penX, in
 // A string, stopped at maxWidth pixels from x when maxWidth > 0.
 void ChromeRenderString(const ChromeTarget& t, const FontAtlas& font, int x, int y, const char* str,
                         uint32_t fg, int maxWidth = 0, const DesktopRect* clip = nullptr);
-// A straight-alpha 24x24 (LAUNCHER_ICON_PX) icon scaled to size.
+// A straight-alpha 24x24 (LAUNCHER_ICON_PX) icon scaled to size (bilinear).
 void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels, unsigned opacity = 255);
 uint32_t ChromeBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha);
 
 // Rasterise every command of the list, in order.
-void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& target, const FontAtlas& font);
+void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& target, const ChromeFontSet& fonts);
 
 } // namespace brook

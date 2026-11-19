@@ -94,19 +94,63 @@ void ChromeRenderString(const ChromeTarget& t, const FontAtlas& font, int x, int
 
 void ChromeDrawIcon(const ChromeTarget& t, int x, int y, int size, const uint32_t* pixels, unsigned opacity)
 {
-    if (!pixels) return;
+    if (!pixels || size <= 0) return;
+    // Bilinear over premultiplied samples (8.8 fixed point): exact at the
+    // source size, smooth at 16/20 px and at the 150% and 200% scales.
+    const int n = ChromeIconSourcePx;
     for (int row = 0; row < size; ++row)
+    {
+        int sy = ((2 * row + 1) * n * 128) / size - 128;
+        if (sy < 0) sy = 0;
+        if (sy > (n - 1) * 256) sy = (n - 1) * 256;
+        const int y0 = sy >> 8, y1 = y0 + 1 < n ? y0 + 1 : y0, fy = sy & 255;
         for (int col = 0; col < size; ++col)
         {
             const int tx = x + col - t.originX, ty = y + row - t.originY;
             if (tx < 0 || ty < 0 || tx >= static_cast<int>(t.width) || ty >= static_cast<int>(t.height)) continue;
-            const uint32_t src = pixels[(row * ChromeIconSourcePx / size) * ChromeIconSourcePx +
-                                        col * ChromeIconSourcePx / size];
-            if (!(src >> 24)) continue;
+            int sx = ((2 * col + 1) * n * 128) / size - 128;
+            if (sx < 0) sx = 0;
+            if (sx > (n - 1) * 256) sx = (n - 1) * 256;
+            const int x0 = sx >> 8, x1 = x0 + 1 < n ? x0 + 1 : x0, fx = sx & 255;
+            const uint32_t texels[4] = {pixels[y0 * n + x0], pixels[y0 * n + x1], pixels[y1 * n + x0], pixels[y1 * n + x1]};
+            const uint32_t weights[4] = {uint32_t((256 - fx) * (256 - fy)), uint32_t(fx * (256 - fy)),
+                                         uint32_t((256 - fx) * fy), uint32_t(fx * fy)};
+            uint64_t a = 0, c[3] = {0, 0, 0};
+            for (int i = 0; i < 4; ++i) {
+                const uint64_t wa = uint64_t(texels[i] >> 24) * weights[i];
+                a += wa;
+                for (int ch = 0; ch < 3; ++ch) c[ch] += ((texels[i] >> (8 * ch)) & 255) * wa;
+            }
+            if (!a) continue;
+            uint32_t src = 0;
+            for (int ch = 0; ch < 3; ++ch) src |= static_cast<uint32_t>((c[ch] + a / 2) / a) << (8 * ch);
+            const unsigned alpha = static_cast<unsigned>(((a + 32768) >> 16) * opacity + 127) / 255;
+            if (!alpha) continue;
             auto& destination = t.pixels[static_cast<uint64_t>(ty) * t.stride + tx];
-            const unsigned alpha = ((src >> 24) * opacity + 127) / 255;
-            destination = ChromePixelOver(destination, (alpha << 24) | (src & 0xffffff));
+            destination = ChromePixelOver(destination, (uint32_t(alpha > 255 ? 255 : alpha) << 24) | src);
         }
+    }
+}
+
+// A material pixel at partial coverage (rounded-corner edges): straight-alpha
+// interpolation toward the fill. Alpha 0 on either side is the legacy opaque
+// convention and is kept when both sides use it.
+static inline void ChromeCoverPixel(const ChromeTarget& t, int x, int y, uint32_t color, unsigned coverage)
+{
+    if (!coverage) return;
+    if (coverage >= 255) { ChromePutPixel(t, x, y, color); return; }
+    x -= t.originX; y -= t.originY;
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= t.width || static_cast<uint32_t>(y) >= t.height) return;
+    auto& destination = t.pixels[static_cast<uint64_t>(y) * t.stride + x];
+    const uint32_t dst = destination;
+    const bool legacy = !(dst >> 24) && !(color >> 24);
+    const uint32_t da = (dst >> 24) ? dst >> 24 : 255, sa = (color >> 24) ? color >> 24 : 255;
+    const uint32_t ws = sa * coverage, wd = da * (255 - coverage), sum = ws + wd;
+    if (!sum) return;
+    uint32_t out = legacy ? 0 : ((sum + 127) / 255) << 24;
+    for (unsigned shift = 0; shift < 24; shift += 8)
+        out |= ((((color >> shift) & 255) * ws + ((dst >> shift) & 255) * wd + sum / 2) / sum) << shift;
+    destination = out;
 }
 
 uint32_t ChromeBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
@@ -119,7 +163,7 @@ uint32_t ChromeBlendColor(uint32_t fg, uint32_t bg, uint32_t alpha)
     return out;
 }
 
-void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const FontAtlas& font)
+void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const ChromeFontSet& fonts)
 {
     if (!t.pixels || !t.width || !t.height) return;
     for (uint32_t i = 0; i < list.Count(); ++i)
@@ -163,25 +207,41 @@ void ChromeExecute(const ChromeDisplayList& list, const ChromeTarget& t, const F
         case ChromeOp::MaterialRect: {
             const int half = (c.w < c.h ? c.w : c.h) / 2;
             if (half < 0) break;
-            const unsigned radius = c.arg > static_cast<unsigned>(half) ? half : c.arg;
+            unsigned radius = c.arg > static_cast<unsigned>(half) ? half : c.arg;
+            if (radius > ChromeCornerMask::MaxRadius * 2) radius = ChromeCornerMask::MaxRadius * 2;
             const bool outline = c.op == ChromeOp::MaterialOutline;
+            const int r = static_cast<int>(radius);
+            // Corner coverage: 4x4 samples of the outer circle, less the
+            // inner circle (one pixel in) for an outline.
+            auto corner = [&](int cx, int cy) -> unsigned {
+                const unsigned outer = ChromeCornerMask::Sample(radius, cx, cy);
+                if (!outline) return outer;
+                const unsigned inner = (cx && cy) ? ChromeCornerMask::Sample(radius - 1, cx - 1, cy - 1) : 0;
+                return outer > inner ? outer - inner : 0;
+            };
             for (int y = 0; y < c.h; ++y)
             {
-                const unsigned row = y < c.h / 2 ? y : c.h - 1 - y;
-                const int inset = ChromeCornerInset(radius, row);
-                if (!outline || row == 0) {
+                const int cy = y < r ? y : c.h - 1 - y < r ? c.h - 1 - y : -1;
+                if (cy >= 0) {
+                    for (int cx = 0; cx < r; ++cx) {
+                        const unsigned coverage = corner(cx, cy);
+                        ChromeCoverPixel(t, c.x + cx, c.y + y, c.color, coverage);
+                        ChromeCoverPixel(t, c.x + c.w - 1 - cx, c.y + y, c.color, coverage);
+                    }
+                }
+                const int inset = cy >= 0 ? r : 0;
+                if (!outline || y == 0 || y == c.h - 1) {
                     ChromeFillRect(t, c.x + inset, c.y + y, c.w - 2 * inset, 1, c.color);
-                } else {
-                    const int inner = 1 + ChromeCornerInset(radius ? radius - 1 : 0, row - 1);
-                    const int stroke = inner - inset;
-                    ChromeFillRect(t, c.x + inset, c.y + y, stroke, 1, c.color);
-                    ChromeFillRect(t, c.x + c.w - inner, c.y + y, stroke, 1, c.color);
+                } else if (cy < 0) {
+                    ChromeFillRect(t, c.x, c.y + y, 1, 1, c.color);
+                    ChromeFillRect(t, c.x + c.w - 1, c.y + y, 1, 1, c.color);
                 }
             }
             break;
         }
         case ChromeOp::Text:
-            ChromeRenderString(t, font, c.x, c.y, list.TextAt(c.arg), c.color, c.w, c.dx ? &c.clip : nullptr);
+            ChromeRenderString(t, fonts[static_cast<ChromeFont>(c.dy < static_cast<int>(ChromeFont::Count) && c.dy >= 0 ? c.dy : 0)],
+                               c.x, c.y, list.TextAt(c.arg), c.color, c.w, c.dx ? &c.clip : nullptr);
             break;
         case ChromeOp::Icon:
             ChromeDrawIcon(t, c.x, c.y, c.w, static_cast<const uint32_t*>(c.data), c.arg);

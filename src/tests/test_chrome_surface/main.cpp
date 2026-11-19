@@ -76,7 +76,9 @@ int main(){
             CHECK(g.opacity==180 && !(g.flags&BROOK_DESKTOP_SURFACE_OPAQUE));
             const bool panel = kind != BROOK_DESKTOP_SURFACE_TASKBAR;
             const bool shadow = panel && kind != BROOK_DESKTOP_SURFACE_TOOLTIP;
-            for (auto radius : g.radii) CHECK(radius == (panel ? 12 * scale : 0));
+            // Panels round at 12; a tooltip at the small radius, 6.
+            for (auto radius : g.radii)
+                CHECK(radius == (!panel ? 0 : kind == BROOK_DESKTOP_SURFACE_TOOLTIP ? 6 * scale : 12 * scale));
             CHECK(g.shadow == (shadow ? BROOK_DESKTOP_SHADOW_PANEL : BROOK_DESKTOP_SHADOW_NONE));
             if (shadow) CHECK(g.shadowAlpha == 255 && g.shadowSpread == 16 * scale && g.shadowCorner == 28 * scale);
         }

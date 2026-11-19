@@ -3,7 +3,7 @@
 // per theme and scale, then compared byte for byte with the PNG under
 // src/tests/goldens/chrome/. The ARGB buffer (alpha included) is also pinned
 // by hash in MANIFEST. This binary links only the freestanding chrome
-// sources and the baked desktop fonts: no kernel code.
+// sources and the baked chrome fonts and icon masks: no kernel code.
 //
 //   test_chrome_goldens            compare; on a mismatch, write the actual
 //                                  image to ./chrome-golden-actual/ and fail
@@ -24,10 +24,6 @@ using namespace brook;
 #ifndef BROOK_CHROME_GOLDENS
 #error "BROOK_CHROME_GOLDENS must name the golden directory"
 #endif
-
-namespace brook {
-extern const FontAtlas g_desktopFont100, g_desktopFont150, g_desktopFont200;
-}
 
 namespace {
 
@@ -70,11 +66,11 @@ void Check(const std::string& name, const ChromeDisplayList& list, const ChromeS
     if (w <= 0 || h <= 0) { std::fprintf(stderr, "%s: empty image\n", name.c_str()); ++failures; return; }
     std::vector<uint32_t> pixels(static_cast<size_t>(w) * h, 0x00303030u);
     ChromeTarget target{pixels.data(), static_cast<uint32_t>(w), static_cast<uint32_t>(w), static_cast<uint32_t>(h), ox, oy};
-    ChromeExecute(list, target, style.Font());
+    ChromeExecute(list, target, *style.fonts);
     // Content keys (stage 1.4): equal keys must mean equal pixels. The kernel
     // seeds the key with the font and the surface rectangle, as here.
     {
-        const uint64_t seed = reinterpret_cast<uintptr_t>(&style.Font()) ^ (uint64_t(uint32_t(ox)) << 32 | uint32_t(oy)) ^
+        const uint64_t seed = reinterpret_cast<uintptr_t>(style.fonts) ^ (uint64_t(uint32_t(ox)) << 32 | uint32_t(oy)) ^
                               (uint64_t(uint32_t(w)) << 48) ^ (uint64_t(uint32_t(h)) << 16);
         const uint64_t key = ChromeListKey(list, seed), pixelsKey = Fnv(pixels.data(), pixels.size());
         if (!key || ChromeListKey(list, seed) != key) { std::fprintf(stderr, "%s: unstable or zero key\n", name.c_str()); ++failures; }
@@ -130,8 +126,8 @@ const BrookThemePalette* PaletteFor(unsigned index, const GoldenTheme& t) {
 const BrookThemePalette* currentPalette;
 
 ChromeStyle StyleFor(uint32_t, const DesktopMetrics& m, bool glass) {
-    static const FontAtlas* fonts[] = {&g_desktopFont100, &g_desktopFont150, &g_desktopFont200};
-    const FontAtlas* font = fonts[m.percent == 100 ? 0 : m.percent == 150 ? 1 : 2];
+    static const ChromeFontSet* fonts[] = {&g_chromeFonts100, &g_chromeFonts150, &g_chromeFonts200};
+    const ChromeFontSet* font = fonts[m.percent == 100 ? 0 : m.percent == 150 ? 1 : 2];
     const BrookThemePalette* p = currentPalette;
     ChromeStyle s{p, &m, font, glass, glass ? 200u : 255u, nullptr};
     if (glass) {
@@ -216,7 +212,9 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     // a failed launch; CPU, MEM, disk and COMP metrics; agent stale.
     const int ids[] = {0, 1, 2, -10, -11};
     const uint32_t metrics = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 4;
-    const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", true, metrics, ids, 5, 0, "dev  6785ca29  debug");
+    const char* const labels[] = {"Terminal", "Files", "Settings", nullptr, nullptr};
+    const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", true, metrics, ids, 5, 0,
+                                                              "dev  6785ca29  debug", false, labels);
     const ChromeTaskbarButton buttons[] = {
         {testIcon, "Terminal", true, false, false, false},
         {nullptr, "Files", false, true, false, false},
@@ -246,6 +244,21 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         ChromeBuildTaskbar(tb, s, list);
         Check(prefix + (hover ? "taskbar-hover" : "taskbar"), list, s, 0, layout.y, screenW, screenH - layout.y);
     }
+    // The compact HUD and the temperature target, without the diagnostics.
+    {
+        const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, "09:41 15 Nov 2026", false, 1u << 6,
+                                                                     ids, 3, 2, "Brook 3a4b909e", true, labels);
+        ChromeTaskbarModel hm = tb;
+        hm.layout = &hudLayout;
+        hm.agentShown = false;
+        hm.mouseX = hm.mouseY = -1;
+        hm.launcherOpen = false;
+        hm.telemetry.thermal = true; hm.telemetry.tjmax = 100; hm.telemetry.latest.pkgC = 57;
+        ChromeDisplayList list = ChromeListOn(storage);
+        ChromeBuildTaskbar(hm, s, list);
+        ChromeBuildCompactHud({hudLayout.hud, hm.telemetry, now + 300}, s, list);
+        Check(prefix + "taskbar-hud", list, s, 0, hudLayout.y, screenW, screenH - hudLayout.y);
+    }
 
     // Launcher: ten apps, the third hovered; then the restart prompt.
     const ChromeLauncherItem items[] = {
@@ -274,7 +287,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     // Volume popup over the tray icon, mute button hovered.
     {
         ChromeVolumePopupModel vm{};
-        vm.layout = TaskbarVolumePopup(m, layout.volume, layout.y, screenW, s.TextWidth("100%"));
+        vm.layout = TaskbarVolumePopup(m, layout.volume, layout.y, screenW, ChromeVolumeValueWidth(s));
         vm.control = 60;
         vm.available = true;
         vm.mouseX = vm.layout.mute.x + 1;
@@ -288,37 +301,44 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     // Tray tooltip.
     {
         const char* text = "Volume: 60%";
-        const int pad = ChromeTooltipPadding(s);
-        const DesktopRect box = TaskbarTooltipBox(layout.volume, s.TextWidth(text) + 2 * pad,
-                                                  s.Font().lineHeight + static_cast<int>(s.M(10)), layout.y,
-                                                  static_cast<int>(s.M(4)), screenW, static_cast<int>(s.M(4)));
+        const DesktopRect box = TaskbarTooltipBox(layout.volume, ChromeTooltipWidth(s, text, nullptr),
+                                                  ChromeTooltipHeight(s, false), layout.y,
+                                                  static_cast<int>(s.M(8)), screenW, static_cast<int>(s.M(4)));
         ChromeDisplayList list = ChromeListOn(storage);
         ChromeBuildTooltip({box, text}, s, list);
         Check(prefix + "tooltip", list, s, box.x, box.y, box.w, box.h);
     }
 
-    // Boot summary.
+    // Boot toast: the total, the four phases and three meta lines.
     {
-        const int margin = s.M(16), w = s.M(480), h = s.Font().lineHeight * 5 + s.M(28);
-        ChromeBootSummaryModel bm{{static_cast<int>(screenW) - w - margin, margin, w, h},
-                                  {"Desktop ready in 4.21 s (VM start)", "Boot timing n/a",
-                                   "8 cores | 7712 MiB available", "Software composition | flat", "Build test"}};
+        const int margin = s.M(16), w = s.M(360), h = ChromeBootSummaryHeight(s, true, true, 3);
+        ChromeBootSummaryModel bm{{static_cast<int>(screenW) - w - margin, margin, w, h}, "8.12 s", "from power-on",
+                                  {"8 cores " BROOK_CHROME_DOT " 7712 MiB available",
+                                   "Software composition " BROOK_CHROME_DOT " Opaque", "Brook 3a4b909e+29117654"}};
+        static const char* const names[] = {"Firmware", "Menu", "Loader", "Kernel"};
+        static const char* const values[] = {"3.41 s", "0.52 s", "0.61 s", "3.58 s"};
+        const uint64_t ms[] = {3410, 520, 610, 3580};
+        for (unsigned i = 0; i < 4; ++i) { bm.phaseMs[i] = ms[i]; bm.phaseNames[i] = names[i]; bm.phaseValues[i] = values[i]; }
         ChromeDisplayList list = ChromeListOn(storage);
-        bm.phaseMs[0]=420;bm.phaseMs[1]=340;bm.phaseMs[2]=940;bm.phaseMs[3]=2510;
         ChromeBuildBootSummary(bm, s, list);
         Check(prefix + "boot-summary", list, s, bm.rect.x, bm.rect.y, w, h);
     }
 
-    const DesktopRect flyout{0, 0, int(s.M(320)), int(s.M(208))};
-    ChromeTelemetryModel telemetry=tb.telemetry;
-    telemetry.tjmax=100;telemetry.thermal=true;
+    // Tray flyouts with live content, and the HUD panel with a thermal graph.
+    ChromeTelemetryModel telemetry = tb.telemetry;
+    static ThermalSample points[60];
+    for (unsigned i = 0; i < 60; ++i) { points[i].pkgC = static_cast<int16_t>(52 + (i * 7) % 6); points[i].pkgMw = 6200; }
+    telemetry.tjmax = 100; telemetry.thermal = true; telemetry.rapl = true;
+    telemetry.points = points; telemetry.pointCount = 60; telemetry.latest = points[59];
+    telemetry.app = &compositorCadence;
     for (const bool network : {true, false}) {
+        const DesktopRect flyout{0, 0, int(s.M(304)), ChromeTrayFlyoutHeight(s, network, true)};
         ChromeDisplayList list = ChromeListOn(storage);
         ChromeBuildTrayFlyout({flyout, network, true, "192.168.1.35", telemetry}, s, list);
         Check(prefix + (network ? "network-flyout" : "temperature-flyout"), list, s,
               flyout.x, flyout.y, flyout.w, flyout.h);
     }
-    const DesktopRect hud{0, 0, int(s.M(400)), int(s.M(240))};
+    const DesktopRect hud{0, 0, int(s.M(348)), ChromePerformanceHudHeight(s, true)};
     ChromeDisplayList list = ChromeListOn(storage);
     ChromeBuildPerformanceHud({hud, telemetry, now + 300}, s, list);
     Check(prefix + "hud", list, s, hud.x, hud.y, hud.w, hud.h);

@@ -86,31 +86,33 @@ static ChromeTelemetryModel WmTelemetryModel(bool app, bool temp) {
     }
     return t;
 }
+// The boot toast: 360 wide, 16 px from the top-right corner, as tall as its
+// content (ChromeBootSummaryHeight). Shown for 7 s after the desktop is ready.
+static unsigned WmBootSummaryMetaLines() { return 3; }
 bool WmBootSummaryRect(uint32_t sw,uint32_t sh,int32_t* x,int32_t* y,uint32_t* width,uint32_t* height) {
     const uint64_t ready=CompositorDesktopReadyTick(),now=ApicTickCount();
     if(!ready||now<ready||now-ready>7000)return false;
-    const uint32_t margin=WmMetric(16),w=WmMetric(360),h=WmDesktopFont().lineHeight*6+WmMetric(41);
+    const BootTimingSummary* timing=BootTimingRead();
+    const uint32_t margin=WmMetric(16),w=WmMetric(360);
+    const uint32_t h=static_cast<uint32_t>(ChromeBootSummaryHeight(WmChromeStyle(),true,timing!=nullptr,WmBootSummaryMetaLines()));
     if(sw<margin*2+WmMetric(100)||sh<h+margin+WmMetric(WM_TASKBAR_HEIGHT))return false;
     *width=w<sw-margin*2?w:sw-margin*2;*height=h;*x=sw-*width-margin;*y=margin;return true;
 }
 static void WmBootSummarySurface(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,uint64_t keySeed,uint64_t* key) {
     int32_t x,y;uint32_t w,h;if((!pixels && !key) || !WmBootSummaryRect(sw,sh,&x,&y,&w,&h))return;
-    char number[16],headline[96],machine[96],build[96],phaseLabels[4][32];
+    char number[16],total[32],machine[96],build[96],phaseValues[4][16];
+    const char* note;
     const BootTimingSummary* timing0 = BootTimingRead();
-    if (timing0) {
+    if (timing0 && (timing0->total.valid || timing0->kernel.valid)) {
         const BootTimingValue elapsed = timing0->total.valid ? timing0->total : timing0->kernel;
-        BootText title(headline, sizeof(headline));
-        title.Add("Desktop ready");
-        if (elapsed.valid) {
-            title.Add(" in "); title.Seconds(elapsed.ms, 2); title.Add(" s");
-            if (!timing0->total.valid) title.Add(" (kernel)");
-        }
+        BootText value(total, sizeof(total));
+        value.Seconds(elapsed.ms, 2); value.Add(" s");
+        note = timing0->total.valid ? "from power-on" : "in the kernel";
     } else {
         const uint64_t duration=CompositorBootDurationMs();
-        char* row=headline;
-        WmStrCopy(row,"Desktop ready in ",sizeof(headline));DesktopNumber(number,duration/1000);
-        size_t n=strlen(row);WmStrCopy(row+n,number,sizeof(headline)-n);n=strlen(row);row[n++]='.';row[n++]='0'+(duration/100)%10;row[n++]='0'+(duration/10)%10;row[n]=0;
-        WmStrCopy(row+n,KvmClockStableAvailable()?" s (VM start)":" s (kernel clock)",sizeof(headline)-n);
+        BootText value(total, sizeof(total));
+        value.Seconds(duration, 2); value.Add(" s");
+        note = KvmClockStableAvailable() ? "from VM start" : "on the kernel clock";
     }
     static bool sampledMemory = false;
     static uint64_t freeAtReadyMiB;
@@ -119,24 +121,25 @@ static void WmBootSummarySurface(uint32_t* pixels,uint32_t stride,uint32_t sw,ui
         sampledMemory = true;
     }
     size_t n=0;char* row=machine;
-    DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores | ",sizeof(machine)-n);n=strlen(row);DesktopNumber(number,freeAtReadyMiB);WmStrCopy(row+n,number,sizeof(machine)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(machine)-n);
-    WmStrCopy(build,"Build ",sizeof(build));WmStrCopy(build+6,BuildGitHash(),sizeof(build)-6);
-    ChromeBootSummaryModel model{{x,y,int(w),int(h)},{headline,timing0 ? nullptr : "Boot timing unavailable",machine,
-        CompositorGlassActive()?"GPU composition | glass":CompositorGpuActive()?"GPU composition | flat":"Software composition | flat",build}};
+    DesktopNumber(row,SmpGetCpuCount());n=strlen(row);WmStrCopy(row+n," cores " BROOK_CHROME_DOT " ",sizeof(machine)-n);n=strlen(row);DesktopNumber(number,freeAtReadyMiB);WmStrCopy(row+n,number,sizeof(machine)-n);n=strlen(row);WmStrCopy(row+n," MiB available",sizeof(machine)-n);
+    WmStrCopy(build,"Brook ",sizeof(build));WmStrCopy(build+6,BuildGitHash(),sizeof(build)-6);
+    ChromeBootSummaryModel model{{x,y,int(w),int(h)},total,note,{machine,
+        CompositorGlassActive()?"GPU composition " BROOK_CHROME_DOT " Glass":CompositorGpuActive()?"GPU composition " BROOK_CHROME_DOT " Opaque":"Software composition " BROOK_CHROME_DOT " Opaque",build}};
     if (timing0) {
         const BootTimingValue phases[] = {timing0->firmware, timing0->wait, timing0->loader, timing0->kernel};
-        const char* names[] = {"Firmware", "Menu", "Loader", "Kernel"};
+        static const char* const names[] = {"Firmware", "Menu", "Loader", "Kernel"};
         for (unsigned i = 0; i < 4; ++i) {
             if (phases[i].valid) model.phaseMs[i] = phases[i].ms;
-            BootText label(phaseLabels[i], sizeof(phaseLabels[i]));
-            label.Value(names[i], phases[i]);
-            model.phaseLabels[i] = phaseLabels[i];
+            BootText value(phaseValues[i], sizeof(phaseValues[i]));
+            if (phases[i].valid) { value.Seconds(phases[i].ms, 2); value.Add(" s"); } else value.Add("n/a");
+            model.phaseNames[i] = names[i];
+            model.phaseValues[i] = phaseValues[i];
         }
     }
     ChromeDisplayList list=ChromeListOn(g_shellListStorage);
     ChromeBuildBootSummary(model,WmChromeStyle(),list);
     if(key)*key=ChromeListKey(list,keySeed);
-    else ChromeExecute(list,{pixels,stride,sw,sh},WmDesktopFont());
+    else ChromeExecute(list,{pixels,stride,sw,sh},WmChromeFonts());
 }
 void WmRenderBootSummary(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh) {
     WmBootSummarySurface(pixels,stride,sw,sh,0,nullptr);

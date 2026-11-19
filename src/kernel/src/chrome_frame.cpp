@@ -19,35 +19,13 @@ static void CaptionButtons(ChromeDisplayList& dl, const ChromeStyle& s, const Ch
             dl.MaterialRect({r.x + (r.w - width) / 2, r.y + (r.h - height) / 2, width, height},
                             button == 0 ? 0xff000000u | s.P().closeHover : hoverBg, s.M(6));
         }
-        if (r.w < static_cast<int>(s.M(14))) continue;
-        const uint32_t ink = 0xff000000u | (hover && button == 0 ? s.P().closeText : hover ? hoverInk : fg);
-        const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
-        if (button == 0)
-        {
-            const int k = static_cast<int>(s.M(4));
-            dl.Squares(cx - k, cy - k, s.M(1), s.M(1), 1, 1, 2 * k + 1, ink);
-            dl.Squares(cx - k, cy + k, s.M(1), s.M(1), 1, -1, 2 * k + 1, ink);
-        }
-        else if (button == 1)
-        {
-            auto box = [&](int x, int y, int width, int height) {
-                dl.Fill(x, y, width, s.M(1), ink);
-                dl.Fill(x, y + height - s.M(1), width, s.M(1), ink);
-                dl.Fill(x, y, s.M(1), height, ink);
-                dl.Fill(x + width - s.M(1), y, s.M(1), height, ink);
-            };
-            if (m.maximised)
-            {
-                // Draw only the visible edges of the rear square.
-                dl.Fill(cx - s.M(2), cy - s.M(5), s.M(8), s.M(1), ink);
-                dl.Fill(cx + s.M(5), cy - s.M(5), s.M(1), s.M(8), ink);
-                dl.Fill(cx - s.M(2), cy - s.M(5), s.M(1), s.M(3), ink);
-                dl.Fill(cx + s.M(3), cy + s.M(2), s.M(3), s.M(1), ink);
-                box(cx - s.M(5), cy - s.M(2), s.M(8), s.M(8));
-            }
-            else box(cx - s.M(5), cy - s.M(4), s.M(11), s.M(9));
-        }
-        else dl.Fill(cx - s.M(5), cy + s.M(3), s.M(11), s.M(1), ink);
+        const int glyph = s.M(16);
+        if (r.w < glyph || r.h < glyph) continue;
+        const uint32_t ink = hover && button == 0 ? s.P().closeText : hover ? hoverInk : fg;
+        // The 16 px line icons (DESIGN.md "Type and icons"), centred in the cell.
+        const ChromeGlyph icon = button == 0 ? ChromeGlyph::Close : button == 2 ? ChromeGlyph::Minimise :
+                                 m.maximised ? ChromeGlyph::Restore : ChromeGlyph::Maximise;
+        dl.Glyph(icon, r.x + (r.w - glyph) / 2, r.y + (r.h - glyph) / 2, ink);
     }
 }
 
@@ -113,9 +91,15 @@ void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDis
     }
     dl.Fill(tx, ty + titleH - 1, m.clientW, 1, divider);
     if (m.focused) {
-        const int start = x + (m.maximised ? 0 : static_cast<int>(s.M(8)));
-        const int width = x + ow - start;
-        dl.FadeX(start, y, width < static_cast<int>(s.M(176)) ? width : s.M(176), s.M(2), 0xff000000u | p.accent);
+        // A 2 px light on the top rim: solid for 45% of 176 px, then fading.
+        const int start = x + (m.maximised ? 0 : static_cast<int>(s.M(10)));
+        const int limit = x + ow - (m.maximised ? 0 : static_cast<int>(s.M(10))) - start;
+        const int width = limit < static_cast<int>(s.M(176)) ? limit : static_cast<int>(s.M(176));
+        if (width > 0) {
+            const int solid = width * 45 / 100;
+            dl.Fill(start, y, solid, s.M(2), 0xff000000u | p.accent);
+            dl.FadeX(start + solid, y, width - solid, s.M(2), 0xff000000u | p.accent);
+        }
     }
     const ChromePart* minimise = m.layout.Find(ChromePartRole::Minimise);
     const int runLeft = minimise ? minimise->visual.x : x + ow;
@@ -130,8 +114,7 @@ void ChromeBuildFrame(const ChromeFrameModel& m, const ChromeStyle& s, ChromeDis
     }
     const int textW = runLeft - textX - s.M(8);
     if (textW > 0)
-        dl.Text(textX, ty + (static_cast<int>(s.M(DesktopMetrics::TitleBase)) - s.Font().lineHeight) / 2,
-                m.title, fg, textW);
+        ChromeElidedText(dl, s, ChromeFont::Body, textX, ty + (titleH - s.Line()) / 2, m.title, fg, textW);
     CaptionButtons(dl, s, m, fg, s.MaterialColor(p.captionHover), p.text);
 }
 

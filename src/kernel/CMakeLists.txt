@@ -177,6 +177,11 @@ foreach(DESKTOP_SCALE IN ITEMS 100 150 200)
     list(APPEND DESKTOP_FONT_SOURCES "${DESKTOP_FONT_CPP}")
 endforeach()
 
+# Clearwater chrome type roles and icon masks (DESIGN.md "Type").
+include("${BROOK_ROOT}/cmake/ChromeFonts.cmake")
+brook_chrome_fonts(DESKTOP_FONT_SOURCES "${BROOK_PYTHON3}" "${BROOK_DESKTOP_FONT_TTF}" "${BROOK_FONT_TTF}"
+                   "${CMAKE_CURRENT_BINARY_DIR}")
+
 # ---------------------------------------------------------------------------
 # FAT test image baking — generates a small FAT16 ramdisk embedded in the kernel.
 # ---------------------------------------------------------------------------

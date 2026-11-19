@@ -1010,3 +1010,120 @@ apps and survive a reboot; renderer kill: the CPU desktop returns complete
 and in the same Opaque theme; `DESKTOP_RENDERER_CAPS requested=0 accepted=0`
 in the renderer log.
 
+## Stage 2 visual review
+
+Branch `work/clearwater-review`, from `work/clearwater-s2b` (`1d528e94`).
+A review of stage 2.5/2.6 against the prototype and DESIGN.md's token
+sheet, for layout, proportion, hierarchy, shape and legibility. Exact
+colours and blend values were not in scope. The fixes are in the builders,
+the executor and the baked fonts: every backend picks them up, and nothing
+new runs per frame.
+
+### Differences found, by priority
+
+| # | Difference in `1d528e94` | Now |
+| --- | --- | --- |
+| **P1** | One 16 px face for every string: task labels, titles, clock and panel text a third larger than the reference, and no hierarchy in panels. | Type roles (DESIGN.md "Type"): Body 13, Label 12, Small 11, Strong 13 bold, Lead 15 bold, Hero 20, Mono 11. Fixed. |
+| **P1** | CPU and MEM tray meters drew their fill bar under the first digit of the value. | One-line chips: caption label, 6 px meter, value. Fixed. |
+| **P1** | Build label drawn one proportional glyph per fixed cell ("Br ook"). | Hack 11, as the prototype's monospace label. Fixed. |
+| **P2** | Every taskbar target carried an idle pill; the focused indicator spanned half the button and was 2 px high; buttons were always 188 wide with 24 px icons; no separators. | Pill only when focused, open or hovered; 20 × 3 (focused), 6 × 3 (running) and outlined (minimised) state pills 7 px above the edge; 20 px icons, buttons sized to their label (48 to 188); separators after the launcher and before the tray. Fixed. |
+| **P2** | Caption glyphs were 1 px rectangles (a non-square maximise); tray icons were built from blocks. | The prototype's 16 px, 1.5 px-stroke icons as coverage masks tinted at draw time (DESIGN.md: "Native: A8 masks"). Fixed. |
+| **P2** | Tray order and content: volume, network, a bare "n/a"; clock in the large face. | Network, volume, thermometer with the value; time 12 over date 11, right-aligned. Fixed. |
+| **P2** | Network and Temperature flyouts had a fixed height (empty space), repeated their title as text and had no status. | Icon, 15 px bold title and a status pill; key and value rows; the temperature readout as the 20 px hero with its graph in a well; sized to their content. Fixed. |
+| **P2** | HUD panel: label, graph and percentiles stacked in one face, no wells. Compact HUD: labels above graphs. | Label, value and percentiles on one row above a graph in a well; compact HUD on one row as label, graph, value. Fixed. |
+| **P2** | Boot toast: six equal lines. | Bold title, the total as the hero number, a 6 px phase bar in the design's four segment colours, a four-column legend, then the machine, composition and build lines. Fixed. |
+| **P2** | Launcher 4 px from the screen edge and 2 px above the taskbar; square hover rows; text-only power buttons. | 8 px from both; 6 px-radius hover rows; Restart and Shut down lead with their icons. Fixed. |
+| **P2** | Rounded pills were stair-stepped; icons were point-sampled (blocky at 150% and 200%); long titles were cut mid-glyph. | Anti-aliased rounded rectangles; bilinear icon sampling; titles and task labels end in "...". Fixed. |
+| **P3** | Tooltips were full pills (radius = half their height). | Radius 6. Fixed. |
+| **P3** | Launcher content: search, pinned row, categories. | Deferred to stage 3 (decision 3). |
+| **P3** | Icon sources are 24 px, so task and launcher icons are upscaled at 150% and 200%. | Smoothed, not solved: larger sources need the launcher icon pipeline. Deferred. |
+| **P3** | Volume flyout has no Output row; only the boot toast exists; the HUD has no close or collapse buttons, fps readout or footer. | Deferred: content, not geometry. |
+| **P3** | virgl: small sharper patches at rounded corners; integer shadow falloff. | Left alone (Ian, 19 November: do not polish these). |
+| **P3** | Opaque themes are square-cornered where the prototype keeps its radii. | Kept square (Ian, 19 November: corners are optional outside Glass). |
+
+### Rounded corners and cost
+
+- **VKRENDER (the Dell).** A surface record's radii are not drawn by the
+  renderer at all. The kernel writes the corner coverage into the chrome and
+  overlay captures' alpha once, when a surface's content key changes, and the
+  quad shader blends that alpha as it does every glass pixel. Corners add no
+  draw, mask or per-frame work, and block no occlusion that glass does not
+  already block (a glass surface is never marked opaque).
+- **Opaque themes.** Frame and shell records carry radii only under glass;
+  an Opaque surface is square, marked `BROOK_DESKTOP_SURFACE_OPAQUE` and
+  occludes fully. No change was needed.
+- **virgl (QEMU only).** A rounded glass window splits its backdrop into up
+  to six bands, which is extra quads there.
+- The rounded pills and rows inside a surface are CPU-drawn into its cached
+  raster, in every theme, and cost nothing per frame.
+
+### Cost of the review changes
+
+- Kernel image: read-only data grows by 679 KB (4.62 MB to 5.30 MB of
+  text and rodata) for 21 text atlases and 3 icon atlases (seven roles at
+  three scales).
+- Raster work happens only when a surface's key changes, as before. The
+  taskbar key changes at the same events (clock minute, 1 Hz telemetry, HUD
+  at 2 Hz, pointer); a re-raster blends more anti-aliased pixels but fills
+  fewer pills.
+- The taskbar layout measures each window title (hit tests included), and
+  an open flyout or HUD panel reads the thermal snapshot when its rectangle
+  is asked for. Both are a few hundred instructions.
+
+### Evidence
+
+Not committed. Scenes as stage 2b: headless QEMU, QMP input, no NIC or
+audio (so the tray shows the disconnected, no-device and no-sensor states;
+the connected states are in the goldens).
+
+- Before: `/data/Programming/Brook/clearwater-s2b/build/cw2b-evidence/`
+  (`compare-*.png` and the scene folders).
+- After: `build/cwreview-evidence/final/{glass,opaque-light,opaque-dark}-{100,150,200}/`.
+- Sheets, prototype | before | after, in `build/cwreview-evidence/final/compare/`:
+  - `compare-{glass,opaque-light,opaque-dark}.png`: the whole desktop at each scale;
+  - `detail-taskbar-{glass,opaque-light,opaque-dark}.png`: both taskbar ends at 100% and 200%, native pixels;
+  - `detail-titlebar.png`: title and caption buttons, Close hovered;
+  - `detail-panels-glass-100.png`: launcher, flyouts, HUD and boot toast.
+
+### Tests
+
+- Goldens (`test_chrome_goldens --update`): all 209 existing images
+  change, for the reasons in the table, and 11 are new (`taskbar-hud`: the
+  compact HUD with the temperature target). 220 images.
+- `test_chrome_surface`: a tooltip's glass radius is 6.
+- Host suite: 383 pass. `test_intel_bdw_buffer` crashed once in one
+  parallel run and passes alone and in the two runs either side; this
+  branch does not touch it.
+- Compositor package: builds with its tests (its sources are unchanged).
+
+### Dell pair
+
+`build/dell/pair-cwreview` (payload `dell-cwreview-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `72d40bbe`, after which only this section changed; kernel
+`6850a292…`). `check_dell_image_qemu.py --attempts 4`: PASS on the first
+attempt. Nothing has run on the Dell.
+
+**Check by hand on the Dell (200%):**
+
+- Text is smaller than before (titles 26 px, task labels 24, captions 22
+  device pixels). Check it is comfortable at the panel's density; the sizes
+  are one table in `cmake/ChromeFonts.cmake`.
+- Caption, tray and power icons are crisp 32 px line icons; application
+  icons are smooth, not blocky (they are still 24 px sources).
+- Taskbar: no pill on idle buttons, a pill and a 40 px accent mark on the
+  focused window, a 12 px mark on the others; buttons as wide as their
+  label; the bottom screen row and the bottom-left corner still hit.
+- Tray reads network, volume, thermometer with the temperature (coloured
+  only when warm or hot), then the clock. Each flyout opens centred on its
+  target, 16 px above the taskbar and at least 16 px from the right edge:
+  Network (address, download, upload), Temperature (large readout, graph),
+  Volume (white thumb with an accent ring).
+- Alt+P: the compact HUD is one row (APP graph value, COMP graph value ms);
+  the panel has graphs in wells with the newest value and percentiles.
+- Boot toast: bold title, large total, four-colour phase bar, legend.
+- Launcher: 16 px from the left edge and the taskbar; rounded hover rows;
+  Restart and Shut down with icons; the confirm prompt still fits.
+- Glass keeps rounded windows and panels; Opaque Light and Dark are square
+  outside and rounded inside (pills, rows, wells).
+
