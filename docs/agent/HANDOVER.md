@@ -95,6 +95,11 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov afternoon: Dell on gen 453 = `work/integration50` 59383819** (int49 + `work/glass-blur`: 19ca75f9 mip-chain dual-Kawase blur + 6a4eaa00 waylandd popup-reposition order; session `5f4dbd8735cf432abd43e0dc712ba021`). Blur marker present; Glass active. GPU healthy, zero-copy on, HDA OK.
+- **Idle-desktop blur cost on the HD 5500:** 0.79 ms per atlas rebuild frame (3 in 97 frames); glass draw 0.68 ms per frame.
+- **Deploy note:** the graceful restart blocked on the frozen Nautilus window. Recovery: `hw_power cancel`, kill the pid, a new `restart` request, `commit` at ready, `hw_attach`, then the `HWSTATUS` payload check. Fix idea: power-close should offer to kill unresponsive windows.
+- **Still to do:** Ian to re-test Nautilus tooltips and scrolling; profile the Nautilus scroll stutter.
+
 **GTK4/Nautilus on the Dell (19 Nov, gen 451):** staged tx `naut1119b`: Nautilus 49.4 `nznpdd9x…` plus `gtk4-demo` (gtk4.dev). 24 missing store paths, 118 MB; the bundler now stores hard links as regular files (545f2c5a).
 - **Works:** both apps render; GTK picks Vulkan `hasvk`.
 - **Freeze — root cause found:** waylandd sent `xdg_popup.configure` before `repositioned`. GTK4 reuses its tooltip popup through reposition, so it blocked in `gdk_wayland_surface_present_popup`. Fixed in 6a4eaa00 (on `work/glass-blur`); this may also be the old "GTK popup grab" backlog bug.
