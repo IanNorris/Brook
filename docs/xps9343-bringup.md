@@ -3290,3 +3290,5 @@ This comes from the boot snapshot (`bridge hardware pci <cursor> <count>`), whic
 - replacing the M.2 2230 A/E card with an Intel 7265, 8265 or AX200 (`iwlwifi`).
 
 Both need a Brook 802.11 station layer and a `wpa_supplicant` backend. Hosting the `wl` blob is not recommended.
+
+**Decision (Ian, 19 Nov): the BCM4352 is not supported, and no USB Wi-Fi dongle either. The goal was to get off the USB path. Revisit if a different device is chosen (see DECISIONS.md).**
