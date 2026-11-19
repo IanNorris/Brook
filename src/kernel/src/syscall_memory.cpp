@@ -87,7 +87,7 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
         // Allocate physical pages for this chunk
         PhysicalAddress pages[CHUNK_PAGES];
         for (uint32_t i = 0; i < chunkPages; ++i) {
-            pages[i] = PmmAllocPage(MemTag::User, 0);
+            pages[i] = PmmAllocPageAccounted(MemTag::User, KernelPid, PmmOwner::Shmem);
             if (!pages[i]) { chunkPages = i; break; }
         }
         if (chunkPages == 0) break;
@@ -322,6 +322,7 @@ static int PrepareDeviceMapping(MappingTransaction& operation, const UserMapping
 }
 static void ReleaseDeviceMapping(void* object) {
     auto* source=static_cast<DeviceMappingBacking*>(object);
+    brook::BdwGpuBufferTrackUserRef(source->intelBuffer,brook::BdwBufferUserRef::Mapping,false);
     MappingBackingUnref(source->resourceLifetime);kfree(source);
 }
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
@@ -404,6 +405,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             if(!buffer)return -EINVAL;
             source->resourceLifetime=brook::BdwGpuBufferBacking(buffer);
             MappingBackingRef(source->resourceLifetime);
+            brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Mapping,true);
             source->intelBuffer=buffer;source->intelPageOffset=relative/4096;
             available=brook::BdwGpuBufferBytes(buffer)-relative;
             brook::BdwGpuBufferUnref(buffer);

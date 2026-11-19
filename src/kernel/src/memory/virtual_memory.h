@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "address.h"
 #include "mem_tag.h"
+#include "pmm_accounting.h"
 #include "../task_capacity.h"
 
 namespace brook {
@@ -300,6 +301,9 @@ VirtualAddress VmmAllocPages(uint64_t pageCount,
                              uint64_t flags = VMM_WRITABLE,
                              MemTag tag     = MemTag::KernelData,
                              uint16_t pid   = KernelPid);
+
+VirtualAddress VmmAllocPagesAccounted(uint64_t pageCount, uint64_t flags,
+                                      MemTag tag, uint16_t pid, PmmOwner owner);
 
 // Free pages previously allocated with VmmAllocPages.
 void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount);

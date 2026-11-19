@@ -40,9 +40,12 @@ int64_t sys_brook_gpu_output_alloc(uint64_t bytes,uint64_t flags,uint64_t a,uint
     if(!bytes || bytes>BROOK_GPU_OUTPUT_MAX_BYTES || flags || a || b || c || d)return -EINVAL;
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
     auto* buffer=brook::BdwGpuBufferCreateHandoff(bytes);if(!buffer)return -ENOMEM;
+    brook::BdwGpuBufferRecordCreator(buffer,proc->tgid?proc->tgid:proc->pid,
+        proc->isThread?proc->leaderIncarnation:proc->incarnation);
     FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=buffer;owned.fdFlags=1;
+    brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,true);
     const int fd=FdPublishNew(proc,owned,0);
-    if(fd<0)brook::BdwGpuBufferUnref(buffer);
+    if(fd<0){brook::BdwGpuBufferTrackUserRef(buffer,brook::BdwBufferUserRef::Prime,false);brook::BdwGpuBufferUnref(buffer);}
     return fd;
 #else
     (void)bytes;(void)flags;(void)a;(void)b;(void)c;(void)d;return -ENODEV;
@@ -190,8 +193,9 @@ int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b
         for(uint32_t i=0;i<count;++i){
             if(result){brook::BdwGpuBufferUnref(images[i]);continue;}
             FdEntry owned{};owned.type=FdType::IntelPrime;owned.handle=images[i];owned.fdFlags=1;
+            brook::BdwGpuBufferTrackUserRef(images[i],brook::BdwBufferUserRef::Prime,true);
             const int fd=FdPublishNew(proc,owned,0);
-            if(fd<0){brook::BdwGpuBufferUnref(images[i]);result=fd;continue;}
+            if(fd<0){brook::BdwGpuBufferTrackUserRef(images[i],brook::BdwBufferUserRef::Prime,false);brook::BdwGpuBufferUnref(images[i]);result=fd;continue;}
             wire.fds[i]=fd; // the fd table now holds the reference
         }
         if(!result && !CopyToUser(arg,&wire,sizeof(wire)))result=-EFAULT;

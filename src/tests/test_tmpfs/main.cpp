@@ -142,6 +142,9 @@ uint64_t RtcNow()
 {
     return rtcSeconds;
 }
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
     assert(tag==MemTag::User && pid==KernelPid);

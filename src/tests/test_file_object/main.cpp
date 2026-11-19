@@ -115,6 +115,9 @@ void KMutexLock(KMutex* mutex) { ++gateAcquires;std::mutex* lock;{std::lock_guar
 void KMutexUnlock(KMutex* mutex) { std::mutex* lock;{std::lock_guard<std::mutex> held(locksGuard);lock=locks.at(mutex).get();}lock->unlock(); }
 extern "C" void* kmalloc(uint64_t bytes) { if(failHeap)return nullptr;auto* memory=std::malloc(bytes);if(memory)++heapBlocks;return memory; }
 extern "C" void kfree(void* memory) { if(memory){CHECK(heapBlocks.fetch_sub(1)>0);std::free(memory);} }
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t) {
     if(failFrame)return PhysicalAddress{};
     void* memory=nullptr;CHECK(posix_memalign(&memory,4096,4096)==0);

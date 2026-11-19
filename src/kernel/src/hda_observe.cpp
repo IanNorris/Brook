@@ -229,7 +229,7 @@ struct TonePlatform {
     uint16_t command(){return io.command();}void setCommand(uint16_t v){io.setCommand(v);}
     bool controllerIdle(){return HdaDellToneControllerIdle(*this,snapshot);}
     bool allocatePage(uint64_t& physical,void*& address){
-        const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);
+        const auto p=PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::HdaDma);
         if(!p){observation.tonePage=0;observation.tonePageStatus=4;return false;}
         physical=p.raw();address=reinterpret_cast<void*>(PhysToVirt(p).raw());observation.tonePage=physical;
         for(auto& slot:dmaPages)if(!slot){slot=address;return true;}
@@ -328,7 +328,7 @@ void ObserveCachePages(Io& io){
         HdaCacheMmioMapping(io.base,mmio);
     if(!observation.cacheMmioMapping)return;
     uint64_t pages[17]{};unsigned acquired=0;bool valid=true;
-    for(unsigned i=0;i<17;++i){const auto p=PmmAllocPage(MemTag::KernelData,KernelPid);if(!p){valid=false;break;}
+    for(unsigned i=0;i<17;++i){const auto p=PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::HdaDma);if(!p){valid=false;break;}
         pages[acquired++]=p.raw();for(unsigned j=0;j<i;++j)if(pages[j]==p.raw())valid=false;
         KernelAliasMapping identity{},direct{};
         if(!valid || !VmmInspectKernelAliases(p.raw(),identity,direct) || !HdaCacheDmaMappings(p.raw(),identity,direct)){

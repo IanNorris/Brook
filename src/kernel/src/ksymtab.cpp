@@ -69,10 +69,12 @@ EXPORT_SYMBOL(UsbBootReportReset);
 // Physical memory
 EXPORT_SYMBOL(PmmAllocPage);
 EXPORT_SYMBOL(PmmAllocPages);
+EXPORT_SYMBOL(PmmAllocPagesAccounted);
 EXPORT_SYMBOL(PmmFreePage);
 
 // Virtual memory
 EXPORT_SYMBOL(VmmAllocPages);
+EXPORT_SYMBOL(VmmAllocPagesAccounted);
 EXPORT_SYMBOL(VmmFreePages);
 EXPORT_SYMBOL(VmmAllocKernelStack);
 EXPORT_SYMBOL(VmmFreeKernelStack);

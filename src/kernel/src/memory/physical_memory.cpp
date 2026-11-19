@@ -157,6 +157,31 @@ static inline void FreeLogRecord(uint64_t phys, uint16_t ownerPid, const char* s
 // ---------------------------------------------------------------------------
 
 static PageDescriptor* g_pageDescs = nullptr;  // [g_totalPages], via kmalloc
+static uint64_t g_ownerPages[PmmOwnerCount]{};
+static uint64_t g_retiredPages = 0;
+
+static PmmOwner DefaultOwner(MemTag tag)
+{
+    switch (tag) {
+    case MemTag::PageTable: return PmmOwner::PageTables;
+    case MemTag::Heap: return PmmOwner::KernelHeap;
+    case MemTag::User: return PmmOwner::User;
+    case MemTag::Device: return PmmOwner::DriverDma;
+    default: return PmmOwner::Other;
+    }
+}
+
+// All transitions happen under the PMM lock, so a snapshot counts one
+// owner per live frame and excludes storage pending its reuse barrier.
+static void ChargeOwner(PageDescriptor& frame, PmmOwner owner)
+{
+    if (frame.owner == owner) return;
+    if (frame.owner != PmmOwner::Automatic)
+        __atomic_sub_fetch(&g_ownerPages[static_cast<unsigned>(frame.owner)], 1, __ATOMIC_RELAXED);
+    frame.owner = owner;
+    if (owner != PmmOwner::Automatic)
+        __atomic_add_fetch(&g_ownerPages[static_cast<unsigned>(owner)], 1, __ATOMIC_RELAXED);
+}
 
 // Per-PID doubly-linked page lists.  Static (16KB), indexed by PID.
 static PidList g_pidLists[PMM_MAX_PIDS] = {};
@@ -221,7 +246,7 @@ static void ListAppend(uint32_t idx, uint16_t pid, MemTag tag)
 // g_pmmLock, so they must use this variant — PmmDumpFreeLog re-takes the lock.
 static int PmmDumpFreeLogLocked(uint64_t phys);
 
-static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
+static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid, PmmOwner owner)
 {
     // Free pages are not in any list; just append to the new owner's list.
     if (!g_pageDescs) return;
@@ -257,6 +282,7 @@ static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
     }
 
     ListAppend(pageIdx, pid, tag);
+    ChargeOwner(Desc(pageIdx), owner);
     Desc(pageIdx).refCount = 1;  // exclusive ownership on fresh allocation
     // BRO-176 stale-mapping detector (ALLOC side). A frame returned by the
     // allocator must have NO existing USER PTE mapping it — it was on the free
@@ -430,6 +456,7 @@ static inline void RetireFrameLocked(uint32_t idx, uint16_t ownerPid)
     Desc(idx).next = g_quarHead;     // frame stays bitmap-USED (not allocatable)
     g_quarHead = idx;
     g_quarCount++;
+    ++g_retiredPages;
     if (g_quarCount > g_quarPeak) g_quarPeak = g_quarCount;
 #ifndef BROOK_HOST_TEST
     // Liveness guard: the drainer should keep this list short. If it grows past
@@ -527,6 +554,7 @@ static void PmmDrainThread(void* /*arg*/)
                 ReleaseFrameLocked(idx);
                 idx = next;
             }
+            g_retiredPages -= n;
             IrqSpinLockRelease(&g_pmmLock, f);
 
             if (g_drainDebug)
@@ -742,7 +770,13 @@ static void ReportAllocationFailure(uint64_t count,uint64_t free,bool contiguous
 
 PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
-    if (pid >= PMM_MAX_PIDS) return PhysicalAddress{};
+    return PmmAllocPageAccounted(tag, pid, PmmOwner::Automatic);
+}
+
+PhysicalAddress PmmAllocPageAccounted(MemTag tag, uint16_t pid, PmmOwner owner)
+{
+    if (pid >= PMM_MAX_PIDS || owner >= PmmOwner::Count) return PhysicalAddress{};
+    if (owner == PmmOwner::Automatic) owner = DefaultOwner(tag);
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
     // Preserve a small physical floor for kernel cleanup/control resources.
@@ -772,7 +806,7 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
             SetUsed(idx);
             g_freePages--;
             g_nextHint = idx + 1;
-            TrackAlloc(static_cast<uint32_t>(idx), tag, pid);
+            TrackAlloc(static_cast<uint32_t>(idx), tag, pid, owner);
             IrqSpinLockRelease(&g_pmmLock, pmmFlags);
 
             return PhysicalAddress(idx * PAGE_SIZE);
@@ -793,9 +827,14 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 
 PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
 {
-    if (pid >= PMM_MAX_PIDS) return PhysicalAddress{};
-    if (count == 0) return PhysicalAddress{};
-    if (count == 1) return PmmAllocPage(tag, pid);
+    return PmmAllocPagesAccounted(count, tag, pid, PmmOwner::Automatic);
+}
+
+PhysicalAddress PmmAllocPagesAccounted(uint64_t count, MemTag tag, uint16_t pid, PmmOwner owner)
+{
+    if (pid >= PMM_MAX_PIDS || owner >= PmmOwner::Count || !count) return PhysicalAddress{};
+    if (count == 1) return PmmAllocPageAccounted(tag, pid, owner);
+    if (owner == PmmOwner::Automatic) owner = DefaultOwner(tag);
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
@@ -819,7 +858,7 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
                 {
                     SetUsed(runStart + i);
                     g_freePages--;
-                    TrackAlloc(static_cast<uint32_t>(runStart + i), tag, pid);
+                    TrackAlloc(static_cast<uint32_t>(runStart + i), tag, pid, owner);
                 }
                 IrqSpinLockRelease(&g_pmmLock, pmmFlags);
                 return PhysicalAddress(runStart * PAGE_SIZE);
@@ -898,6 +937,7 @@ void PmmFreePage(PhysicalAddress physAddr)
         FreeLogRecord(physAddr.raw(), d.pid,
                       d.tag < 8 ? kFreeSite[d.tag] : "free:?");
         ListRemove(static_cast<uint32_t>(idx));
+        ChargeOwner(d, PmmOwner::Automatic);
         d.pid = 0;
         d.tag = static_cast<uint8_t>(MemTag::Free);
         d.refCount = 0;
@@ -996,6 +1036,19 @@ bool PmmRefPageIfAlive(PhysicalAddress physAddr)
     return true;
 }
 
+void PmmReassignOwner(PhysicalAddress frame, PmmOwner expected, PmmOwner replacement)
+{
+    const uint64_t index = frame.raw() / PAGE_SIZE;
+    if (!g_pageDescs || !frame || (frame.raw() & (PAGE_SIZE - 1)) ||
+        index >= g_totalPages || replacement == PmmOwner::Automatic ||
+        static_cast<unsigned>(replacement) >= PmmOwnerCount) return;
+    const auto flags = IrqSpinLockAcquire(&g_pmmLock);
+    auto& descriptor = Desc(static_cast<uint32_t>(index));
+    if (IsUsed(index) && descriptor.refCount && descriptor.owner == expected)
+        ChargeOwner(descriptor, replacement);
+    IrqSpinLockRelease(&g_pmmLock, flags);
+}
+
 bool PmmReclassifyPrivateFrame(PhysicalAddress frame,MemTag expected,MemTag replacement,uint16_t pid) {
     if(!g_pageDescs || !frame || (frame.raw()&(PAGE_SIZE-1)) || pid>=PMM_MAX_PIDS ||
        (expected!=MemTag::User && expected!=MemTag::KernelData) ||
@@ -1006,7 +1059,11 @@ bool PmmReclassifyPrivateFrame(PhysicalAddress frame,MemTag expected,MemTag repl
     const bool valid=IsUsed(index) && descriptor.refCount==1 && descriptor.pid<PMM_MAX_PIDS &&
         descriptor.tag==static_cast<uint8_t>(expected) &&
         !__atomic_load_n(&descriptor.mapCount,__ATOMIC_ACQUIRE);
-    if(valid){ListRemove(index);ListAppend(index,pid,replacement);}
+    if(valid){
+        ListRemove(index);
+        ListAppend(index,pid,replacement);
+        if (expected != replacement) ChargeOwner(descriptor, DefaultOwner(replacement));
+    }
     IrqSpinLockRelease(&g_pmmLock,flags);return valid;
 }
 
@@ -1052,8 +1109,9 @@ void PmmUnrefPage(PhysicalAddress physAddr)
         retire = true;
     }
     ListRemove(idx);
+    ChargeOwner(d, PmmOwner::Automatic);
     d = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-          static_cast<uint8_t>(MemTag::Free), 0, 0 };
+          static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
     // Quarantine the frame (defer reuse) instead of releasing it immediately,
     // so a stale TLB entry is gone before the frame is handed to a new owner.
     if (retire)
@@ -1198,7 +1256,7 @@ void PmmEnableTracking()
     for (uint32_t i = 0; i < static_cast<uint32_t>(g_totalPages); i++)
     {
         g_pageDescs[i] = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                           static_cast<uint8_t>(MemTag::Free), 0, 0 };
+                           static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
     }
 
     // Backfill: add used pages to KernelPid's list; free pages are left
@@ -1468,8 +1526,9 @@ void PmmKillPid(uint16_t pid)
                     FreeLogRecord(static_cast<uint64_t>(idx) * PAGE_SIZE, pid, "PmmKillPid");
                 retire = true;
             }
+            ChargeOwner(Desc(idx), PmmOwner::Automatic);
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                          static_cast<uint8_t>(MemTag::Free), 0, 0 };
+                          static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
             if (retire)
                 RetireFrameLocked(idx, pid);
         }
@@ -1515,8 +1574,9 @@ void PmmFreeByTag(uint16_t pid, MemTag tag)
             g_pidLists[pid].pageCount--;
 
             // Free the page (via quarantine)
+            ChargeOwner(Desc(idx), PmmOwner::Automatic);
             Desc(idx) = { PMM_NULL_PAGE, PMM_NULL_PAGE, 0,
-                          static_cast<uint8_t>(MemTag::Free), 0, 0 };
+                          static_cast<uint8_t>(MemTag::Free), PmmOwner::Automatic, 0, 0 };
             RetireFrameLocked(idx, pid);
             count++;
         }
@@ -1563,6 +1623,26 @@ void PmmDumpPidStats()
     }
 }
 
+PmmOwnerStats PmmReadOwnerStats()
+{
+    PmmOwnerStats stats;
+    const auto flags = IrqSpinLockAcquire(&g_pmmLock);
+    stats.ramPages = g_ramPages;
+    stats.freePages = g_freePages;
+    stats.quarantinedPages = g_retiredPages;
+    uint64_t accounted = stats.freePages + stats.quarantinedPages;
+    for (unsigned i = 1; i < PmmOwnerCount; ++i) {
+        stats.pages[i] = __atomic_load_n(&g_ownerPages[i], __ATOMIC_RELAXED);
+        accounted += stats.pages[i];
+    }
+    // Include boot reservations and allocations from before tracking in the
+    // physical RAM balance, without counting gaps in the physical map.
+    if (stats.ramPages > accounted)
+        stats.pages[static_cast<unsigned>(PmmOwner::Other)] += stats.ramPages - accounted;
+    IrqSpinLockRelease(&g_pmmLock, flags);
+    return stats;
+}
+
 uint64_t PmmGetFreePageCount()  { return g_freePages;  }
 uint64_t PmmGetTotalPageCount() { return g_totalPages; }
 uint64_t PmmGetRamPageCount() { return g_ramPages; }
@@ -1576,11 +1656,13 @@ namespace brook {
 void PmmHostTestInit(PageDescriptor* descriptors, uint32_t pages) {
     g_totalPages = pages; g_ramPages = pages; g_freePages = 0; g_nextHint = 1;
     g_pageDescs = descriptors;
+    for (auto& count : g_ownerPages) count = 0;
+    g_retiredPages = 0;
     g_quarantineOn = false; g_framePoisonOn = false; g_freeLogOn = false;
     for (uint64_t i=0;i<BITMAP_WORDS;++i) g_bitmap[i]=~uint64_t{0};
     for (uint32_t i=0;i<PMM_MAX_PIDS;++i) g_pidLists[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,0};
     for (uint32_t i=0;i<pages;++i)
-        descriptors[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,static_cast<uint8_t>(MemTag::Free),0,0};
+        descriptors[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,static_cast<uint8_t>(MemTag::Free),PmmOwner::Automatic,0,0};
     if (pages>1) MarkRangeFree(4096,pages-1);
 }
 }

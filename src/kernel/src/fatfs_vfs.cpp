@@ -316,7 +316,7 @@ static CachedFile* CacheFileUnlocked(FIL* fil, const char* fatPath)
 
     uint64_t numPages = (size + 4095) / 4096;
     cf->data = static_cast<uint8_t*>(
-        reinterpret_cast<void*>(VmmAllocPages(numPages, VMM_WRITABLE, MemTag::KernelData).raw()));
+        reinterpret_cast<void*>(VmmAllocPagesAccounted(numPages, VMM_WRITABLE, MemTag::KernelData, KernelPid, PmmOwner::FileCache).raw()));
     if (!cf->data) {
         SerialPrintf("FATFS_VFS: cache alloc failed (%lu pages)\n", (unsigned long)numPages);
         kfree(cf);

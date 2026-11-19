@@ -23,6 +23,7 @@ uint64_t collision(PhysicalAddress) {return 1;}
 void empty() {std::lock_guard<std::mutex> guard(frameLock);CHECK(refs.empty());}
 }
 namespace brook {
+void PmmReassignOwner(PhysicalAddress,PmmOwner,PmmOwner) {}
 void PmmRefPage(PhysicalAddress p) {std::lock_guard<std::mutex> guard(frameLock);CHECK(refs.at(p.raw()));++refs.at(p.raw());}
 void PmmUnrefPage(PhysicalAddress p) {
     std::lock_guard<std::mutex> guard(frameLock);auto found=refs.find(p.raw());CHECK(found!=refs.end()&&found->second);

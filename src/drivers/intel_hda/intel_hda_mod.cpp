@@ -37,6 +37,7 @@ MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
+MODULE_IMPORT_SYMBOL(VmmAllocPagesAccounted);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
@@ -1316,7 +1317,7 @@ static int IntelHdaInit()
     ConfigureOutputPath();
 
     // Allocate BDL (uncacheable for DMA)
-    auto bdlPage = VmmAllocPages(1, VMM_WRITABLE | VMM_CACHE_DISABLE, MemTag::Device, KernelPid);
+    auto bdlPage = VmmAllocPagesAccounted(1, VMM_WRITABLE | VMM_CACHE_DISABLE, MemTag::Device, KernelPid, PmmOwner::HdaDma);
     if (!bdlPage)
     {
         SerialPuts("intel_hda: BDL alloc failed\n");
@@ -1328,8 +1329,8 @@ static int IntelHdaInit()
 
     // Allocate audio buffer (64 pages = 256KB, uncacheable for DMA)
     uint32_t audioPages = AUDIO_BUF_SIZE / 4096;
-    auto audioBufAddr = VmmAllocPages(audioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
-                                       MemTag::Device, KernelPid);
+    auto audioBufAddr = VmmAllocPagesAccounted(audioPages, VMM_WRITABLE | VMM_CACHE_DISABLE,
+                                       MemTag::Device, KernelPid, PmmOwner::HdaDma);
     if (!audioBufAddr)
     {
         SerialPuts("intel_hda: audio buffer alloc failed\n");

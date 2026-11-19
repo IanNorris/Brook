@@ -17,6 +17,7 @@
 #include "kprintf.h"
 #include "string.h"
 #include "memory/heap.h"
+#include "memory/virtual_memory.h"
 #include "spinlock.h"
 
 // lwext4 headers (C)
@@ -29,6 +30,8 @@ extern "C" {
 MODULE_IMPORT_SYMBOL(VfsRegisterFs);
 MODULE_IMPORT_SYMBOL(VfsUnregisterFs);
 MODULE_IMPORT_SYMBOL(kmalloc);
+MODULE_IMPORT_SYMBOL(VmmAllocPagesAccounted);
+MODULE_IMPORT_SYMBOL(VmmFreePages);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(krealloc);
 MODULE_IMPORT_SYMBOL(DeviceFind);
@@ -199,7 +202,7 @@ struct Ext4FilePriv {
     char path[MAX_PATH_LEN];  // full lwext4 path, needed for readdir
 
     // Read-ahead buffer for sequential reads
-    uint8_t* raBuf;       // heap-allocated, EXT4_READAHEAD_SIZE bytes (or nullptr)
+    uint8_t* raBuf;       // page-backed, EXT4_READAHEAD_SIZE bytes (or nullptr)
     uint64_t raStart;     // file offset of first byte in buffer
     uint32_t raValid;     // number of valid bytes in buffer
 };
@@ -240,7 +243,8 @@ static int ext4_vn_read(Vnode* vn, void* buf, uint64_t len, uint64_t* offset) {
 
         // Buffer miss — fill read-ahead buffer from lwext4
         if (!fp->raBuf) {
-            fp->raBuf = static_cast<uint8_t*>(kmalloc(EXT4_READAHEAD_SIZE));
+            fp->raBuf = reinterpret_cast<uint8_t*>(VmmAllocPagesAccounted(EXT4_READAHEAD_SIZE / 4096,
+                VMM_WRITABLE, MemTag::KernelData, KernelPid, PmmOwner::FileCache).raw());
             if (!fp->raBuf) break;
         }
 
@@ -318,7 +322,8 @@ static void ext4_vn_close(Vnode* vn) {
     if (!fp) return;
 
     if (fp->raBuf) {
-        kfree(fp->raBuf);
+        VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(fp->raBuf)),
+                     EXT4_READAHEAD_SIZE / 4096);
         fp->raBuf = nullptr;
     }
 

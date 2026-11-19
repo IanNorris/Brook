@@ -123,12 +123,16 @@ namespace brook {
 static bool failHeapOnce=false;
 extern "C" void* kmalloc(uint64_t n){if(failHeapOnce){failHeapOnce=false;return nullptr;}return std::malloc(n);}
 extern "C" void kfree(void* p){std::free(p);}
+VirtualAddress VmmAllocPagesAccounted(uint64_t n,uint64_t flags,MemTag tag,uint16_t pid,PmmOwner) {
+    return VmmAllocPages(n,flags,tag,pid);
+}
 VirtualAddress VmmAllocPages(uint64_t n,uint64_t,MemTag,uint16_t){
     if(failVmm || (failAt && allocated+1==failAt))return VirtualAddress{};
     assert(allocated<256 && n<=256);auto& a=allocations[allocated];
     assert(!posix_memalign(&a.ptr,4096,n*4096));a.pages=n;a.dma=0x100000+uint64_t(allocated)*0x200000;
     ++allocated;std::memset(a.ptr,0xaa,n*4096);return VirtualAddress(reinterpret_cast<uint64_t>(a.ptr));
 }
+void PmmReassignOwner(PhysicalAddress,PmmOwner,PmmOwner) {}
 void VmmFreePages(VirtualAddress address,uint64_t n){
     for(unsigned i=0;i<allocated;++i)if(address.raw()==reinterpret_cast<uint64_t>(allocations[i].ptr)){
         assert(n==allocations[i].pages);std::free(allocations[i].ptr);allocations[i].ptr=nullptr;++frees;return;}
@@ -326,6 +330,28 @@ int main(){
     badDma=true;assert(!BdwGpuBufferCreate(8192) && frees==1);badDma=false;
     failBacking=true;assert(!BdwGpuBufferCreate(4096) && frees==2);failBacking=false;
     allocated=0;auto* b=BdwGpuBufferCreate(4097);assert(b && BdwGpuBufferBytes(b)==8192);
+    {
+        BdwBufferOwnerUsage owners[4]{};
+        uint64_t live[8]{};
+        BdwGpuBufferRecordCreator(b, 2, 90);
+        live[2] = 90;
+        auto usage = BdwGpuBufferMemorySnapshot(owners, 4, live, 8);
+        assert(usage.buffers == 1 && usage.bytes == 8192 && usage.unusedBuffers == 1);
+        assert(usage.exitedBuffers == 0);
+        BdwGpuBufferTrackUserRef(b, BdwBufferUserRef::Prime, true);
+        assert(BdwGpuBufferMemorySnapshot(nullptr, 0, live, 8).unusedBuffers == 0);
+        BdwGpuBufferTrackUserRef(b, BdwBufferUserRef::Mapping, true);
+        BdwGpuBufferTrackUserRef(b, BdwBufferUserRef::ImportedGem, true);
+        BdwGpuBufferTrackUserRef(b, BdwBufferUserRef::Prime, false);
+        live[2] = 91; // PID reuse must not make the original creator appear live.
+        usage = BdwGpuBufferMemorySnapshot(nullptr, 0, live, 8);
+        assert(usage.mappedBytes == 8192 && usage.importedBytes == 8192 &&
+               usage.exitedBytes == 8192 && usage.unusedBuffers == 0);
+        BdwGpuBufferTrackUserRef(b, BdwBufferUserRef::Mapping, false);
+        BdwGpuBufferTrackUserRef(b, BdwBufferUserRef::ImportedGem, false);
+        usage = BdwGpuBufferMemorySnapshot(nullptr, 0, live, 8);
+        assert(usage.unusedBytes == 8192 && !usage.mappedBuffers && !usage.importedBuffers);
+    }
     const uint64_t firstIdentity=BdwGpuBufferIdentity(b);assert(firstIdentity && !BdwGpuBufferIdentity(nullptr));
     assert(!BdwGpuBufferReserveHandoff(b,0));
     assert(BdwGpuBufferBeginGpuUse(b) && !BdwGpuBufferReserveHandoff(b,101) && BdwGpuBufferEndGpuUse(b));

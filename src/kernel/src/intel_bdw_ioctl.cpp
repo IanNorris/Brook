@@ -703,7 +703,8 @@ static int64_t RenderIoctl(BdwGpuFile* file,uint64_t cmd,uint64_t arg,const BdwI
     if(nr==0x5b && size==sizeof(GemCreate)){
         GemCreate c{};if(!u.read(u.context,&c,arg,sizeof(c)) || !u.writable(u.context,arg,sizeof(c)))return fault;
         if(c.pad || !c.size || c.size>(uint64_t{65536}<<12))return invalid;
-        uint64_t rounded=0;const uint32_t handle=BdwGpuFileCreateBuffer(file,c.size,rounded);
+        uint64_t rounded=0;const uint32_t handle=BdwGpuFileCreateBuffer(file,c.size,rounded,
+            u.submitterTgid,u.submitterIncarnation);
         if(!handle)return nomem;
         c.handle=handle;c.size=rounded;
         if(!u.write(u.context,arg,&c,sizeof(c))){BdwGpuFileCloseBuffer(file,handle);return fault;}

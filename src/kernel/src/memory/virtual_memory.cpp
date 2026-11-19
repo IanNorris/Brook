@@ -962,7 +962,7 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
 // g_vmmLock covers reservation, construction, teardown and retirement. Physical
 // failures use the same delayed VA retirement path as ordinary frees.
 static VirtualAddress AllocVmalloc(uint64_t pageCount, uint64_t flags, MemTag tag,
-                                   uint16_t pid, bool guards)
+                                   uint16_t pid, bool guards, PmmOwner owner)
 {
     uint64_t saved = IrqSpinLockAcquire(&g_vmmLock);
     uint64_t usablePage = 0;
@@ -973,7 +973,7 @@ static VirtualAddress AllocVmalloc(uint64_t pageCount, uint64_t flags, MemTag ta
     const uint64_t base = VMALLOC_BASE + usablePage * PAGE_SIZE;
     uint64_t mapped = 0;
     for (; mapped < pageCount; ++mapped) {
-        const PhysicalAddress phys = PmmAllocPage(tag, pid);
+        const PhysicalAddress phys = PmmAllocPageAccounted(tag, pid, owner);
         if (!phys) break;
         if (!VmmMapPage(KernelPageTable, VirtualAddress(base + mapped * PAGE_SIZE),
                         phys, flags, tag, pid)) {
@@ -1000,12 +1000,18 @@ static VirtualAddress AllocVmalloc(uint64_t pageCount, uint64_t flags, MemTag ta
 
 VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
 {
-    return AllocVmalloc(pageCount, flags, tag, pid, false);
+    return AllocVmalloc(pageCount, flags, tag, pid, false, PmmOwner::Automatic);
+}
+
+VirtualAddress VmmAllocPagesAccounted(uint64_t pageCount, uint64_t flags,
+                                     MemTag tag, uint16_t pid, PmmOwner owner)
+{
+    return AllocVmalloc(pageCount, flags, tag, pid, false, owner);
 }
 
 VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
 {
-    return AllocVmalloc(pageCount, VMM_WRITABLE, tag, pid, true);
+    return AllocVmalloc(pageCount, VMM_WRITABLE, tag, pid, true, PmmOwner::KernelStacks);
 }
 
 void VmmFreeKernelStack(VirtualAddress virtAddr, uint64_t pageCount)

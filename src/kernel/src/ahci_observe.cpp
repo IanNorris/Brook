@@ -23,7 +23,7 @@ bool SafeRange(const BootProtocol* boot, uint64_t base) {
 }
 
 volatile uint32_t* MapPage(uint64_t physical) {
-    const auto address = VmmAllocPages(1, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid);
+    const auto address = VmmAllocPagesAccounted(1, VMM_WRITABLE | VMM_NO_EXEC, MemTag::Device, KernelPid, PmmOwner::AhciDma);
     if (!address) return nullptr;
     const auto leaf = VmmDetachPage(KernelPageTable, address);
     if (leaf) PmmFreePage(VmmLeafPhysical(leaf));

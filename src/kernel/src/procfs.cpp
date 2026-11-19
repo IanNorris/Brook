@@ -20,6 +20,7 @@
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "memory/user_mapping.h"
+#include "memory/resident_pages.h"
 #include "exec_limits.h"
 #include "user_copy.h"
 #include "serial.h"
@@ -172,11 +173,69 @@ struct ProcPriv {
     uint8_t mapKind; // 1 UID, 2 GID, 3 setgroups; independent namespace lease
     bool sysKernelDirectory;
     bool commandLine;
+    bool residentStatusPending;
+    KMutex residentStatusLock;
     uint64_t reportedOwner;
 };
 
 static int ProcReportedInode(VfsObject*,uint64_t*);
 static int ProcOpenedIdentity(Vnode*,VnodeStat*);
+
+static constexpr unsigned ProcStatusCapacity = 768;
+
+// Build at first read, outside pathname lookup and its VFS mutation lock.
+// Range topology and the AS lifetime are pinned only during the page walk.
+static int ProcAppendResidentStatus(ProcPriv& status)
+{
+    struct Guard {
+        ProcPriv& status;
+        Process* actor = ProcessCurrent();
+        explicit Guard(ProcPriv& value) : status(value) {
+            if (actor) SchedulerKernelRegionEnter(actor);
+            KMutexLock(&status.residentStatusLock);
+        }
+        ~Guard() {
+            KMutexUnlock(&status.residentStatusLock);
+            if (actor) SchedulerKernelRegionLeave(actor);
+        }
+    } guard(status);
+    if (!__atomic_load_n(&status.residentStatusPending, __ATOMIC_ACQUIRE)) return 0;
+
+    ResidentPages resident;
+    bool exists = false;
+    auto* space = SchedulerReferenceProcessAddressSpace(status.pid, status.incarnation, &exists);
+    if (!exists) return -3;
+    if (space) {
+        bool valid = true;
+        KMutexLock(&space->mutation);
+        for (auto* node = space->ranges.head; node; node = node->next) {
+            const auto& range = node->range;
+            VmmRangeStats pages{};
+            if (ResidentPages::ChargesRss(range) &&
+                !VmmMeasureRange(space->pageTable, range.begin, range.end, false, &pages)) {
+                valid = false;
+                break;
+            }
+            resident.Add(range, pages.backedPages);
+        }
+        KMutexUnlock(&space->mutation);
+        AddressSpaceUnref(space);
+        if (!valid) return -5;
+    }
+
+    const uint32_t prefix = __atomic_load_n(&status.size, __ATOMIC_RELAXED);
+    const uint32_t suffix = ProcFmt(status.data + prefix, ProcStatusCapacity - prefix,
+        "VmSize:\t%lu kB\n"
+        "VmRSS:\t%lu kB\n"
+        "RssAnon:\t%lu kB\n"
+        "RssFile:\t%lu kB\n"
+        "RssShmem:\t%lu kB\n",
+        resident.virtualPages * 4, resident.Total() * 4, resident.anonymous * 4,
+        resident.file * 4, resident.shared * 4);
+    __atomic_store_n(&status.size, prefix + suffix, __ATOMIC_RELEASE);
+    __atomic_store_n(&status.residentStatusPending, false, __ATOMIC_RELEASE);
+    return 0;
+}
 
 // VnodeOps for procfs files
 static int ProcFileOpen(Vnode*, int) { return 0; }
@@ -207,9 +266,13 @@ static int ProcFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
         kfree(staged);*offset+=delivered;
         return delivered?static_cast<int>(delivered):copied?-14:0;
     }
-    if (!pp || !pp->data) return 0;
-    if (*offset >= pp->size) return 0;
-    uint64_t avail = pp->size - *offset;
+    if (!pp || !pp->data || !len) return 0;
+    if (__atomic_load_n(&pp->residentStatusPending, __ATOMIC_ACQUIRE)) {
+        if (const int error = ProcAppendResidentStatus(*pp)) return error;
+    }
+    const uint32_t size = __atomic_load_n(&pp->size, __ATOMIC_ACQUIRE);
+    if (*offset >= size) return 0;
+    uint64_t avail = size - *offset;
     if (len > avail) len = avail;
     auto* src = reinterpret_cast<const uint8_t*>(pp->data + *offset);
     auto* dst = static_cast<uint8_t*>(buf);
@@ -229,7 +292,7 @@ static void ProcFileClose(Vnode* vn)
 static int ProcFileStat(Vnode* vn, VnodeStat* st)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
-    st->size = pp ? pp->size : 0;
+    st->size = pp ? __atomic_load_n(&pp->size, __ATOMIC_ACQUIRE) : 0;
     st->isDir = false;st->mode=0100444;st->dev=0x70726f63;
     st->nlink=1;
     if(vn->backendObject)if(int error=ProcOpenedIdentity(vn,st))return error;
@@ -450,21 +513,27 @@ static Vnode* GenMeminfo()
     auto* buf = static_cast<char*>(kmalloc(1024));
     if (!buf) return nullptr;
 
-    uint64_t totalPages = PmmGetRamPageCount();
-    uint64_t freePages  = PmmGetFreePageCount();
-    uint64_t totalKB = totalPages * 4;  // 4KB pages
-    uint64_t freeKB  = freePages * 4;
+    const auto memory = PmmReadOwnerStats();
+    const uint64_t totalKB = memory.ramPages * 4;
+    const uint64_t freeKB = memory.freePages * 4;
 
     uint32_t n = ProcFmt(buf, 1024,
         "MemTotal:       %lu kB\n"
         "MemFree:        %lu kB\n"
         "MemAvailable:   %lu kB\n"
-        "Buffers:        0 kB\n"
-        "Cached:         0 kB\n"
+        "Buffers:        %lu kB\n"
+        "Cached:         %lu kB\n"
+        "Slab:           %lu kB\n"
+        "KernelStack:    %lu kB\n"
+        "PageTables:     %lu kB\n"
+        "Shmem:          %lu kB\n"
         "SwapCached:     0 kB\n"
         "SwapTotal:      0 kB\n"
         "SwapFree:       0 kB\n",
-        totalKB, freeKB, freeKB);
+        totalKB, freeKB, freeKB,
+        memory.Pages(PmmOwner::FsBuffers) * 4, memory.Pages(PmmOwner::FileCache) * 4,
+        memory.Pages(PmmOwner::KernelHeap) * 4, memory.Pages(PmmOwner::KernelStacks) * 4,
+        memory.Pages(PmmOwner::PageTables) * 4, memory.Pages(PmmOwner::Shmem) * 4);
 
     return MakeProcVnode(buf, n);
 }
@@ -702,12 +771,10 @@ static Vnode* GenPidStat(const ProcessSnapshot& proc)
 // /proc/[pid]/status — human-readable
 static Vnode* GenPidStatus(const ProcessSnapshot& proc)
 {
-    auto* buf = static_cast<char*>(kmalloc(512));
+    auto* buf = static_cast<char*>(kmalloc(ProcStatusCapacity));
     if (!buf) return nullptr;
 
-    uint64_t vsize = proc.programBreak > 0 ? proc.programBreak : 0;
-
-    uint32_t n = ProcFmt(buf, 512,
+    uint32_t n = ProcFmt(buf, ProcStatusCapacity,
         "Name:\t%s\n"
         "State:\t%s (%s)\n"
         "Tgid:\t%u\n"
@@ -717,8 +784,6 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         "Sid:\t%u\n"
         "Uid:\t%u\t%u\t%u\t%u\n"
         "Gid:\t%u\t%u\t%u\t%u\n"
-        "VmSize:\t%lu kB\n"
-        "VmRSS:\t%lu kB\n"
         "Threads:\t%u\n",
         proc.name,
         StateStr(proc.state), proc.name,
@@ -731,10 +796,17 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         ProcessReportId(ProcessCurrent(),false,proc.suid),ProcessReportId(ProcessCurrent(),false,proc.euid),
         ProcessReportId(ProcessCurrent(),true,proc.gid),ProcessReportId(ProcessCurrent(),true,proc.egid),
         ProcessReportId(ProcessCurrent(),true,proc.sgid),ProcessReportId(ProcessCurrent(),true,proc.egid),
-        vsize / 1024,
-        (proc.stackTop - proc.stackBase) / 1024, proc.threadCount);
+        proc.threadCount);
 
-    return MakeProcVnode(buf, n);
+    auto* node = MakeProcVnode(buf, n);
+    if (node) {
+        auto* status = static_cast<ProcPriv*>(node->priv);
+        status->pid = proc.pid;
+        status->incarnation = proc.incarnation;
+        KMutexInit(&status->residentStatusLock);
+        status->residentStatusPending = true;
+    }
+    return node;
 }
 
 static_assert(ProcFd::Pipe==int(FdType::Pipe) && ProcFd::Socket==int(FdType::Socket) &&

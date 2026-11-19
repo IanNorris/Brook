@@ -183,6 +183,9 @@ void TlbShootdownFull(uint64_t,uint64_t) {
 void MemFdHandleUnref(void* handle) { ++droppedMemfds;PmmFreePage(static_cast<BorrowedBacking*>(handle)->page); }
 void VfsFileMapUnpin(Vnode*) { ++unpinnedVnodes; }
 extern "C" void VfsClose(Vnode* vn) { CHECK(!vn->refCount);++closedVnodes; }
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t pid) {
     CHECK(pid<PMM_MAX_PIDS);
     if(failAllocation.exchange(false))return {};

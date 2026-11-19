@@ -49,6 +49,28 @@ int main() {
     CHECK(!PmmAllocPages(2,MemTag::User,PMM_MAX_PIDS));
     PmmKillPid(PMM_MAX_PIDS);PmmFreeByTag(PMM_MAX_PIDS,MemTag::User);
     CHECK(owned(PMM_MAX_PIDS)==0 && PmmGetFreePageCount()==freeBefore);
+    const auto accountingBefore=PmmReadOwnerStats();
+    auto heap=PmmAllocPage(MemTag::Heap,KernelPid);
+    auto dma=PmmAllocPagesAccounted(8,MemTag::Device,KernelPid,PmmOwner::XhciDma);
+    auto cache=PmmAllocPageAccounted(MemTag::KernelData,KernelPid,PmmOwner::FileCache);
+    auto task=PmmAllocPageAccounted(MemTag::KernelData,17,PmmOwner::KernelStacks);
+    auto shm=PmmAllocPageAccounted(MemTag::User,18,PmmOwner::Shmem);
+    CHECK(heap && dma && cache && task && shm);
+    auto measured=PmmReadOwnerStats();
+    CHECK(measured.Pages(PmmOwner::KernelHeap)==1 && measured.Pages(PmmOwner::XhciDma)==8);
+    CHECK(measured.Pages(PmmOwner::FileCache)==1 && measured.Pages(PmmOwner::KernelStacks)==1);
+    CHECK(measured.Pages(PmmOwner::Shmem)==1 && measured.freePages==accountingBefore.freePages-12);
+    PmmRefPage(cache);
+    PmmFreePage(cache);
+    CHECK(PmmReadOwnerStats().Pages(PmmOwner::FileCache)==1);
+    PmmUnrefPage(cache);
+    PmmKillPid(17);
+    PmmFreeByTag(18,MemTag::User);
+    PmmFreePage(heap);
+    for (unsigned i=0; i<8; ++i) PmmFreePage(dma+uint64_t(i)*4096);
+    measured=PmmReadOwnerStats();
+    CHECK(measured.freePages==accountingBefore.freePages);
+    for (unsigned i=0; i<PmmOwnerCount; ++i) CHECK(measured.pages[i]==accountingBefore.pages[i]);
     auto page=PmmAllocPage(MemTag::User,7); CHECK(page); describe(page,1,0,1);
     constexpr unsigned aliases=70000;
     for(unsigned i=0;i<aliases;++i) {

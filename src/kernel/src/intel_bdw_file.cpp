@@ -24,7 +24,7 @@ struct BdwGpuSync {uint32_t references;BdwTimelineSync timeline;};
 struct BdwGpuFile {
     uint32_t references;
     KMutex lock;
-    struct Slot {BdwGpuBuffer* buffer;uint64_t token;} slots[BdwMaxHandles];
+    struct Slot {BdwGpuBuffer* buffer;uint64_t token;bool imported;} slots[BdwMaxHandles];
     struct ContextSlot {BdwGpuContext* context;uint32_t id;} contexts[BdwMaxContexts];
     uint32_t nextContextId;
     BdwGpuContext* defaultContext;
@@ -133,18 +133,24 @@ void BdwGpuFileUnref(BdwGpuFile* f){
     if(!f || __atomic_fetch_sub(&f->references,1,__ATOMIC_ACQ_REL)!=1)return;
     // Last file reference implies no operation is active. Release outside any
     // file or mapping lock because a buffer's final reference frees memory.
-    for(auto& s:f->slots)if(s.buffer)BdwGpuBufferUnref(s.buffer);
+    for(auto& s:f->slots)if(s.buffer){
+        BdwGpuBufferTrackUserRef(s.buffer,s.imported?BdwBufferUserRef::ImportedGem:BdwBufferUserRef::Gem,false);
+        BdwGpuBufferUnref(s.buffer);
+    }
     for(auto& c:f->contexts)if(c.context)BdwGpuContextUnref(c.context);
     BdwGpuContextUnref(f->defaultContext);
     for(auto& s:f->syncs)if(s.sync)BdwGpuSyncUnref(s.sync);
     kfree(f);
 }
-uint32_t BdwGpuFileCreateBuffer(BdwGpuFile* f,uint64_t requested,uint64_t& rounded){
+uint32_t BdwGpuFileCreateBuffer(BdwGpuFile* f,uint64_t requested,uint64_t& rounded,
+                                uint16_t pid,uint64_t incarnation){
     rounded=0;if(!f)return 0;auto* buffer=BdwGpuBufferCreate(requested);if(!buffer)return 0;
     BdwGpuBufferSetCreator(buffer,f);
+    BdwGpuBufferRecordCreator(buffer,pid,incarnation);
     uint32_t handle=0;
     {BdwFileGuard guard(&f->lock);for(uint32_t i=0;i<BdwMaxHandles;++i)if(!f->slots[i].buffer){
-        f->slots[i]={buffer,0};handle=i+1;rounded=BdwGpuBufferBytes(buffer);break;}}
+        BdwGpuBufferTrackUserRef(buffer,BdwBufferUserRef::Gem,true);
+        f->slots[i]={buffer,0,false};handle=i+1;rounded=BdwGpuBufferBytes(buffer);break;}}
     if(!handle)BdwGpuBufferUnref(buffer);
     return handle;
 }
@@ -156,12 +162,15 @@ uint32_t BdwGpuFileImportBuffer(BdwGpuFile* f,BdwGpuBuffer* buffer){
         if(!f->slots[i].buffer && empty==BdwMaxHandles)empty=i;
     }
     if(empty==BdwMaxHandles)return 0;
-    BdwGpuBufferRef(buffer);f->slots[empty]={buffer,0};return empty+1;
+    BdwGpuBufferRef(buffer);BdwGpuBufferTrackUserRef(buffer,BdwBufferUserRef::ImportedGem,true);
+    f->slots[empty]={buffer,0,true};return empty+1;
 }
 bool BdwGpuFileCloseBuffer(BdwGpuFile* f,uint32_t handle){
     if(!f || !handle || handle>BdwMaxHandles)return false;
     BdwGpuBuffer* buffer=nullptr;
-    {BdwFileGuard guard(&f->lock);auto& slot=f->slots[handle-1];buffer=slot.buffer;slot={};}
+    {BdwFileGuard guard(&f->lock);auto& slot=f->slots[handle-1];buffer=slot.buffer;
+        BdwGpuBufferTrackUserRef(buffer,slot.imported?BdwBufferUserRef::ImportedGem:BdwBufferUserRef::Gem,false);
+        slot={};}
     if(!buffer)return false;
     BdwGpuBufferUnref(buffer);return true;
 }

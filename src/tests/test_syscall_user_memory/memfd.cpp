@@ -27,6 +27,9 @@ void PipeCopyHook(uint64_t,uint64_t,bool) { if(SpinLockHeld(g_watchedPipe->lock)
 }
 namespace brook {
 void PmmFreePage(PhysicalAddress) {}
+PhysicalAddress PmmAllocPageAccounted(MemTag tag,uint16_t pid,PmmOwner) {
+    return PmmAllocPage(tag,pid);
+}
 PhysicalAddress PmmAllocPage(MemTag,uint16_t) {
     void* page=aligned_alloc(4096,4096);
     return PhysicalAddress(reinterpret_cast<uint64_t>(page)-DIRECT_MAP_BASE);
