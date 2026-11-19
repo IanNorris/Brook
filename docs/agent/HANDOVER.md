@@ -779,6 +779,11 @@ Two independent code reviews (compositor and driver), Dell measurements on the g
 - **Job table:** a long campaign can exhaust the 256-slot table, and the current boot may lack the terminate API. Archive completed work and plan a checked restart.
 
 ## Backlog (outside the immediate goal)
+- **GTK popup menus block clicks elsewhere (Ian, 19 Nov):** with a GTK popup menu open, clicking another part of the window (e.g. the caption's close button) does nothing until a menu item is chosen.
+  - **Likely cause:** the xdg_popup grab is never dismissed. Clicks on kernel-WM chrome, the taskbar or the desktop don't reach waylandd, so it never sends `xdg_popup.popup_done`.
+  - **Fix:** the kernel WM reports a press outside the client's surface tree (like `WM_EVT_POINTER_LEFT`); waylandd dismisses the grabbed popup chain.
+  - **Policy:** whether that press also acts. Mutter and KWin dismiss and consume it.
+  - **Tests:** extend waylandd's popup/xdg tests.
 - **Queued after Clearwater (Ian, 19 Nov: "queue but not implement, finish Clearwater first"):**
   1. **Stock Mesa.** Brook's Mesa is nixpkgs Mesa 26.0.6 plus:
      - Iris `batch-completion.patch`: it caches signalled syncobjs because every `DRM_SYNCOBJ_WAIT` is expensive on Brook (DECISIONS "Dell Quake performance": 1.95 → 6.29 swaps/s);
