@@ -1,5 +1,8 @@
 #include "toplevel-size.h"
 #include "latency-stats.h"
+#include "wm-input-abi.h"
+
+#include <stddef.h>
 /*
  * waylandd.c — Brook OS Wayland server (Phase D rewrite).
  *
@@ -109,6 +112,11 @@ struct brook_wm_event {
     int16_t  y;
     uint32_t reserved;
 };
+_Static_assert(sizeof(struct brook_wm_event) == 12 &&
+               offsetof(struct brook_wm_event, x) == 4 &&
+               offsetof(struct brook_wm_event, y) == 6 &&
+               offsetof(struct brook_wm_event, reserved) == 8,
+               "WM_POP_INPUT event layout");
 
 #define EVT_KEY_PRESS        0
 #define EVT_KEY_RELEASE      1
@@ -173,8 +181,14 @@ static uint32_t g_now_ms(void) {
 
 static long wm_create_window(uint32_t w, uint32_t h, const char* title,
                              uint32_t flags, struct brook_wm_create_out* out) {
-    return syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
-                   (long)title, (long)out, (long)flags);
+    long result = syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
+                          (long)title, (long)out, (long)(flags | BROOK_WM_CREATE_FLAG_FINE_SCROLL));
+    if (result == -1 && errno == EINVAL) {
+        /* Older kernels reject the fine scroll opt-in bit. */
+        result = syscall(BROOK_SYS_WM_CREATE_WINDOW, (long)w, (long)h,
+                         (long)title, (long)out, (long)flags);
+    }
+    return result;
 }
 static long wm_destroy_window(uint32_t id) {
     return syscall(BROOK_SYS_WM_DESTROY_WINDOW, (long)id);
@@ -1767,6 +1781,7 @@ struct brook_seat_client {
     unsigned refs;
     int32_t pointer_x,pointer_y;
     uint32_t buttons;                       /* held buttons: implicit grab */
+    unsigned finger_axes;                   /* axes moved on the entered surface */
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
     int keymap_fd;                          /* kept alive until client receives it */
@@ -1779,12 +1794,27 @@ static uint32_t next_serial(void) { return g_serial++; }
 
 #include "text-input-v3.h"
 
+static void pointer_stop_finger_scroll(struct brook_seat_client *sc, uint32_t now) {
+    const unsigned axes = sc->finger_axes;
+    sc->finger_axes = 0;
+    if (!axes || !sc->pointer || wl_resource_get_version(sc->pointer) < WL_POINTER_AXIS_STOP_SINCE_VERSION)
+        return;
+
+    wl_pointer_send_axis_source(sc->pointer, WL_POINTER_AXIS_SOURCE_FINGER);
+    if (axes & (1u << WL_POINTER_AXIS_VERTICAL_SCROLL))
+        wl_pointer_send_axis_stop(sc->pointer, now, WL_POINTER_AXIS_VERTICAL_SCROLL);
+    if (axes & (1u << WL_POINTER_AXIS_HORIZONTAL_SCROLL))
+        wl_pointer_send_axis_stop(sc->pointer, now, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+    wl_pointer_send_frame(sc->pointer);
+}
+
 static void seat_clients_scrub_surface(struct brook_surface *s) {
     for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
         if (sc->entered_surface == s) {
             if (!sc->cursor_visible)
                 wm_set_cursor_visible(1);
             sc->entered_surface = NULL;
+            sc->finger_axes = 0;
         }
         if (sc->kb_focus == s) {
             text_input_focus(sc, NULL);
@@ -1801,6 +1831,7 @@ static void seat_clients_unmap_surface(struct brook_surface *s) {
     for(struct brook_seat_client *sc=g_seat_clients;sc;sc=sc->next) {
         if(sc->entered_surface==s && sc->pointer && s->resource &&
            wl_resource_get_client(s->resource)==sc->client) {
+            if (sc->finger_axes) pointer_stop_finger_scroll(sc, g_now_ms());
             wl_pointer_send_leave(sc->pointer,next_serial(),s->resource);
             if(wl_resource_get_version(sc->pointer)>=5)wl_pointer_send_frame(sc->pointer);
         }
@@ -1916,7 +1947,10 @@ static const struct wl_pointer_interface pointer_impl = {
 static void pointer_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
     pointer_objects_remove_pointer(r);
-    if (sc && sc->pointer == r) sc->pointer = NULL;
+    if (sc && sc->pointer == r) {
+        sc->pointer = NULL;
+        sc->finger_axes = 0;
+    }
     seat_unref(sc);
 }
 static void keyboard_release(struct wl_client *c, struct wl_resource *r) {
@@ -1993,7 +2027,7 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
                                                 wl_resource_get_version(r), id);
     if (!p) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
-    if (sc) {sc->pointer = p;++sc->refs;}
+    if (sc) {sc->pointer = p;sc->finger_axes = 0;++sc->refs;}
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct brook_seat_client *sc = seat_for_resource(r);
@@ -2194,10 +2228,12 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
          * a different client.  Drop silently in that case. */
         struct wl_resource *prev = sc->entered_surface->resource;
         if (prev && wl_resource_get_client(prev) == sc->client) {
+            if (sc->finger_axes) pointer_stop_finger_scroll(sc, g_now_ms());
             wl_pointer_send_leave(sc->pointer, next_serial(), prev);
             if (wl_resource_get_version(sc->pointer) >= 5)
                 wl_pointer_send_frame(sc->pointer);
         }
+        sc->finger_axes = 0;
     }
     if (s) {
         wl_pointer_send_enter(sc->pointer, next_serial(), s->resource, lx, ly);
@@ -2255,6 +2291,22 @@ static struct brook_surface *pointer_target(struct brook_surface *root,struct br
     return target;
 }
 
+static void pointer_send_scroll_axis(struct wl_resource *pointer, uint32_t now,
+                                     uint32_t axis, int32_t v120, int32_t ticks, int finger) {
+    if (!v120) return;
+
+    const int version = wl_resource_get_version(pointer);
+    if (!finger) {
+        if (version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+            wl_pointer_send_axis_value120(pointer, axis, v120);
+        else if (version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && ticks)
+            wl_pointer_send_axis_discrete(pointer, axis, ticks);
+    }
+    /* Round to the nearest 24.8 fixed-point value at ten pixels per tick. */
+    const int32_t scaled = v120 * 10 * 256;
+    wl_pointer_send_axis(pointer, now, axis, (scaled + (scaled < 0 ? -60 : 60)) / 120);
+}
+
 static void dispatch_surface_event(struct brook_surface *s,
                                    struct brook_seat_client *sc,
                                    struct brook_wm_event *e, uint32_t now) {
@@ -2306,31 +2358,48 @@ static void dispatch_surface_event(struct brook_surface *s,
         break;
     }
     case EVT_MOUSE_SCROLL: {
-        if (!sc || !sc->pointer || (e->reserved && !pointer_event_token(s,e->reserved))) break;
-        if (!sc->buttons && sc->entered_surface && !pointer_surface_locked(s)) {
-            /* Scroll goes to the surface under the last pointer position. */
-            wl_fixed_t lx,ly;
-            struct brook_surface *target=pointer_target(s,sc,(int32_t)((int64_t)sc->pointer_x*surface_output_scale(s)),
-                                                       (int32_t)((int64_t)sc->pointer_y*surface_output_scale(s)),&lx,&ly);
+        if (!sc || !sc->pointer) break;
+        const int fine = e->mods & BROOK_WM_SCROLL_FINE;
+        if (!fine && e->reserved && !pointer_event_token(s, e->reserved)) break;
+        const int locked = pointer_surface_locked(s);
+        if (fine && locked) break;
+        if (fine && (e->mods & BROOK_WM_SCROLL_END)) {
+            struct brook_surface *root = sc->entered_surface;
+            while (root && root->subsurface_parent) root = root->subsurface_parent;
+            if (root == s) pointer_stop_finger_scroll(sc, now);
+            break;
+        }
+
+        /* Brook vertical is up positive. Wayland vertical is down positive. */
+        const int32_t dy_ticks = -(int8_t)e->scan;
+        const int32_t dx_ticks = (int8_t)e->ascii;
+        const int32_t dy_v120 = fine ? -(int32_t)e->x : dy_ticks * 120;
+        const int32_t dx_v120 = fine ? e->y : dx_ticks * 120;
+        if (!dx_v120 && !dy_v120) break;
+
+        if (!locked) {
+            const int16_t px = fine ? (int16_t)e->reserved : e->x;
+            const int16_t py = fine ? (int16_t)(e->reserved >> 16) : e->y;
+            sc->pointer_x = pointer_fixed_floor(surface_pointer_fixed(s, px));
+            sc->pointer_y = pointer_fixed_floor(surface_pointer_fixed(s, py));
+            wl_fixed_t lx, ly;
+            struct brook_surface *target = pointer_target(s, sc, px, py, &lx, &ly);
             pointer_enter_if_needed(sc, target, lx, ly);
         }
-            int32_t dy = (int8_t)e->scan;
-            /* Horizontal ticks travel in the ascii byte, positive right, which
-             * matches Wayland's horizontal axis (positive = right). */
-            int32_t dx = (int8_t)e->ascii;
-            /* Brook wheel ticks are positive upward; Wayland axis values
-             * are positive downward. */
-            if (dy)
-                wl_pointer_send_axis(sc->pointer, now,
-                                     WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                     wl_fixed_from_int(-dy * 10));
-            if (dx)
-                wl_pointer_send_axis(sc->pointer, now,
-                                     WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-                                     wl_fixed_from_int(dx * 10));
-        if (wl_resource_get_version(sc->pointer) >= 5)
-            wl_pointer_send_frame(sc->pointer);
-        if (dx || dy) latency_input_sent(sc->client, LATENCY_AXIS);
+        const int finger = fine && (e->mods & BROOK_WM_SCROLL_FINGER);
+        if (finger) {
+            if (dy_v120) sc->finger_axes |= 1u << WL_POINTER_AXIS_VERTICAL_SCROLL;
+            if (dx_v120) sc->finger_axes |= 1u << WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+        } else {
+            pointer_stop_finger_scroll(sc, now);
+        }
+        const int version = wl_resource_get_version(sc->pointer);
+        if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
+            wl_pointer_send_axis_source(sc->pointer, finger ? WL_POINTER_AXIS_SOURCE_FINGER : WL_POINTER_AXIS_SOURCE_WHEEL);
+        pointer_send_scroll_axis(sc->pointer, now, WL_POINTER_AXIS_VERTICAL_SCROLL, dy_v120, dy_ticks, finger);
+        pointer_send_scroll_axis(sc->pointer, now, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx_v120, dx_ticks, finger);
+        if (version >= WL_POINTER_FRAME_SINCE_VERSION) wl_pointer_send_frame(sc->pointer);
+        latency_input_sent(sc->client, LATENCY_AXIS);
         break;
     }
     case EVT_KEY_PRESS:
@@ -2390,6 +2459,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         struct brook_surface *root = sc->entered_surface;
         while (root->subsurface_parent) root = root->subsurface_parent;
         if (root != s) break;
+        pointer_stop_finger_scroll(sc, now);
         struct wl_resource *prev = sc->entered_surface->resource;
         if (prev && wl_resource_get_client(prev) == sc->client) {
             wl_pointer_send_leave(sc->pointer, next_serial(), prev);
@@ -4573,7 +4643,8 @@ int main(int argc, char **argv)
 
     if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
     if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
+    if (!wl_global_create(g_display, &wl_seat_interface, WL_POINTER_AXIS_VALUE120_SINCE_VERSION,
+                          NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;
     if (!wl_global_create(g_display,&zwp_pointer_constraints_v1_interface,1,NULL,pointer_constraints_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;

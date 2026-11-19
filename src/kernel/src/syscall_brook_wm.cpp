@@ -16,6 +16,7 @@
 #include "syscall_drm.h"
 #include "syscall_memory.h"
 #include "syscall_handlers.h"
+#include "../../shared/wm_input_abi.h"
 
 namespace brook {
 
@@ -36,6 +37,7 @@ namespace brook {
 //          bit 0 requests initial client-side decoration/noChrome
 //          bit 1 creates a raised but non-keyboard-focusable popup/tool window
 //          bit 2 identifies this process itself as the native application client
+//          bit 3 opts into fine scroll in WM_POP_INPUT
 // Returns 0 on success, -errno on failure.
 struct BrookWmCreateOut {
     uint32_t wmId;
@@ -75,7 +77,7 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
         if (int64_t error = CopyWindowTitle(titlePtr, titleBuf)) return error;
     }
 
-    if (flags & ~7ull) return -EINVAL;
+    if (flags & ~(7ull | BROOK_WM_CREATE_FLAG_FINE_SCROLL)) return -EINVAL;
     // Check the result buffer before creating anything; a raced unmap after
     // creation is rolled back below.
     if (!UserBufferWritable(outPtr, sizeof(BrookWmCreateOut))) return -EFAULT;
@@ -84,7 +86,8 @@ int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
                                                  static_cast<uint16_t>(cW),
                                                  static_cast<uint16_t>(cH),
                                                  titlePtr ? titleBuf : nullptr,
-                                                 focusable, (flags & 4u) != 0);
+                                                 focusable, (flags & 4u) != 0,
+                                                 (flags & BROOK_WM_CREATE_FLAG_FINE_SCROLL) != 0);
     if (res.wmId == 0) return -ENOMEM;
     if (flags & 1u) {
         brook::WmSetClientSideDecoration(static_cast<int>(res.wmId) - 1, true);

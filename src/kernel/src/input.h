@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "../../shared/wm_input_abi.h"
 
 // Generic input device interface.
 //
@@ -39,8 +40,15 @@ struct InputEvent {
     char     ascii;      // Translated ASCII character (0 if non-printable)
     uint8_t  modifiers;  // Bitmask of active modifiers at event time
     int32_t  deltaX, deltaY; // screen convention: right/down positive
+    uint8_t scrollFlags; // MouseScroll only: BROOK_WM_SCROLL_FINGER / BROOK_WM_SCROLL_END
     uint64_t sequence; // assigned when published to the device queue
 };
+
+// Whole ticks remain available to legacy clients and captured games.
+inline bool InputHasScrollTicks(const InputEvent& event)
+{
+    return event.scanCode || event.ascii;
+}
 
 // Modifier bits.
 static constexpr uint8_t INPUT_MOD_LSHIFT   = (1 << 0);

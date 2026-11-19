@@ -9,6 +9,7 @@ using namespace harness;
 namespace {
 struct FakeWm {
     bool exists=false;
+    bool fineScroll=false;
     unsigned creates=0,destroys=0,titles=0,resizes=0;
     char title[64]{};
     brook::Window::WmInputEvent queue[300]{};
@@ -21,8 +22,8 @@ uint32_t g_inputPopped;
 
 extern "C" void MouseGetPosition(int32_t* x,int32_t* y) { *x=100;*y=50; }
 namespace brook {
-WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool) {
-    ++g_wm.creates;g_wm.exists=true;
+WmCreateWindowResult WmCreateWindowForProcess(Process*,uint16_t,uint16_t,const char* title,bool,bool,bool fineScroll) {
+    ++g_wm.creates;g_wm.exists=true;g_wm.fineScroll=fineScroll;
     if(title)for(int i=0;i<64;++i)g_wm.title[i]=title[i];
     WmCreateWindowResult result{};result.wmId=3;result.vfbStride=4096;
     result.vfbUser=reinterpret_cast<void*>(0x40000000);return result;
@@ -104,6 +105,11 @@ static void CreateWindow() {
     struct { uint32_t id,stride;uint64_t user; } result{};
     __builtin_memcpy(&result,reinterpret_cast<void*>(out),sizeof(result));
     CHECK(result.id==3 && result.stride==4096 && result.user==0x40000000);
+    CHECK(!g_wm.fineScroll);
+    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,BROOK_WM_CREATE_FLAG_FINE_SCROLL,0)==0);
+    CHECK(g_wm.fineScroll);
+    CHECK(brook::sys_brook_wm_create_window(64,64,title,out,16,0)==-brook::EINVAL);
+    CHECK(g_wm.creates==2);
 }
 
 static void SetTitle() {

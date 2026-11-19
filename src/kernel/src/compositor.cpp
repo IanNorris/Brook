@@ -2749,9 +2749,7 @@ static void CompositorInputWM()
     InputEvent ev{};
     while (InputPollEvent(&ev))
     {
-        // Fine touchpad scroll with no whole tick only drives the launcher;
-        // clients and the terminal still scroll by ticks.
-        if(ev.type==InputEventType::MouseScroll && !ev.scanCode && !ev.ascii && !WmLauncherVisible())continue;
+        const bool fineOnly = ev.type == InputEventType::MouseScroll && !InputHasScrollTicks(ev);
         const bool captured=WmRouteCapturedPointer(ev);
         CompositorReconcilePointerCapture();
         if(captured)continue;
@@ -2815,8 +2813,8 @@ static void CompositorInputWM()
                 continue;
             }
         }
-        // Non-overlay events retain the existing raw and targeted routes.
-        RouteToGrabber(ev);
+        // The raw grabber receives its existing whole-tick scroll stream.
+        if (!fineOnly) RouteToGrabber(ev);
         if(pointer && !overlay) {
             // Publish the delivery target before the event reaches waylandd,
             // so a lock request made on its behalf sees the same hover.
@@ -2944,16 +2942,13 @@ static void CompositorInputWM()
                 if (target && target->proc)
                 {
                     int8_t dy = static_cast<int8_t>(ev.scanCode);
-                    int8_t dx = static_cast<int8_t>(ev.ascii);
                     Terminal* term = TerminalFindByProcess(target->proc);
                     if (term)
                     {
-                        TerminalScroll(term, dy);
-                        (void)dx;
+                        if (dy) TerminalScroll(term, dy);
                     }
-                    else
+                    else if (target->fineScroll ? hit.zone == WmHitZone::ClientArea : !fineOnly)
                     {
-                        // Route scroll to Wayland/VFB windows via WmInputPush
                         WmInputPush(target, ev,
                                     static_cast<int16_t>(mx - target->clientX()),
                                     static_cast<int16_t>(my - target->clientY()));

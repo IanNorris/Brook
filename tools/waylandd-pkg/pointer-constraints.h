@@ -90,6 +90,7 @@ static void pointer_constraints_refresh(void) {
                     sc->pointer_x=cx;sc->pointer_y=cy;
                     pointer_enter_if_needed(sc,s,wl_fixed_from_int(cx),wl_fixed_from_int(cy));
                 }
+                if (sc->finger_axes) pointer_stop_finger_scroll(sc, g_now_ms());
                 p->token=token;zwp_locked_pointer_v1_send_locked(p->resource);
             }
         }
