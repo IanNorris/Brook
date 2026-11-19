@@ -26,7 +26,7 @@
 /* Version 3 offers carry layers (count>0): layer 0's buffer and fence are
  * buffer/fence; extraBuffer/extraFence[i-1] hold layer i. */
 struct DesktopGpuOffer {struct BrookGpuWindowPacket packet;int buffer,fence,state;uint64_t frame,receivedNs;
-    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed,retire;
+    uint64_t uses[DESKTOP_GPU_OFFER_USES];int current,notify,failed,retire,scanoutHeld;
     unsigned layers;struct BrookGpuWindowLayer layer[BROOK_GPU_WINDOW_LAYERS_MAX];
     int extraBuffer[BROOK_GPU_WINDOW_LAYERS_MAX-1],extraFence[BROOK_GPU_WINDOW_LAYERS_MAX-1];};
 static inline void desktop_gpu_offer_free(struct DesktopGpuOffer *o){
@@ -84,7 +84,7 @@ static inline int desktop_gpu_offer_in_use(const struct DesktopGpuOffer *o){
     for(unsigned i=0;i<DESKTOP_GPU_OFFER_USES;++i)if(o->uses[i])return 1;
     return 0;
 }
-struct DesktopGpuChannel {int listener,peer;char path[sizeof(((struct sockaddr_un *)0)->sun_path)];struct DesktopGpuOffer offers[DESKTOP_GPU_OFFERS];
+struct DesktopGpuChannel {int listener,peer,blockAccept;char path[sizeof(((struct sockaddr_un *)0)->sun_path)];struct DesktopGpuOffer offers[DESKTOP_GPU_OFFERS];
     struct {uint64_t incarnation,commit;} presented[BROOK_DESKTOP_LAYER_LIMIT];uint64_t nextFrame;
     /* Newest tagged CPU snapshot seen for each window (selection time). An
      * offer at or below it can never be shown again, presented or not. */
@@ -147,11 +147,11 @@ static inline void desktop_gpu_channel_flush(struct DesktopGpuChannel *c){
         if(sent<0){desktop_gpu_channel_disconnect(c);return;}
         o->notify=2;
     }
-    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];if(o->state!=3)continue;
+    for(unsigned i=0;i<DESKTOP_GPU_OFFERS;++i){struct DesktopGpuOffer *o=&c->offers[i];if(o->state!=3 || o->scanoutHeld)continue;
         /* An ACK can let the producer rewrite the underlying DMA-BUF, even
          * when a different offer for that same buffer is still in flight. */
         int busy=0;for(unsigned j=0;j<DESKTOP_GPU_OFFERS;++j){const struct DesktopGpuOffer *other=&c->offers[j];
-            if(other->state==2 && desktop_gpu_offers_share(other,o)){busy=1;break;}}
+            if((other->state==2 || other->scanoutHeld) && desktop_gpu_offers_share(other,o)){busy=1;break;}}
         if(busy)continue;
         int sent=brook_gpu_window_send_reply(c->peer,o->packet.version,BROOK_GPU_WINDOW_SAFE,&o->packet.identity);if(!sent)return;
         if(sent<0){desktop_gpu_channel_disconnect(c);return;}
@@ -161,7 +161,7 @@ static inline void desktop_gpu_channel_flush(struct DesktopGpuChannel *c){
 static inline void desktop_gpu_channel_poll(struct DesktopGpuChannel *c){
     desktop_gpu_channel_flush(c);
     if(c->listener<0)return;
-    if(c->peer<0){int fd=accept4(c->listener,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);if(fd<0)return;c->peer=fd;}
+    if(c->peer<0){if(c->blockAccept)return;int fd=accept4(c->listener,NULL,NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);if(fd<0)return;c->peer=fd;}
     for(unsigned n=0;n<DESKTOP_GPU_OFFERS;++n){unsigned slot=0;
         while(slot<DESKTOP_GPU_OFFERS && c->offers[slot].state)++slot;
         if(slot==DESKTOP_GPU_OFFERS)return;
