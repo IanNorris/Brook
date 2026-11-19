@@ -37,6 +37,7 @@
 #include "intel_bdw_poll_pacer.h"
 #include "intel_bdw_prompt_wake.h"
 #include "scheduler.h"
+#include "apic.h"
 #include "smp.h"
 
 inline void* operator new(__SIZE_TYPE__,void* storage) noexcept{return storage;}
@@ -373,6 +374,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
         // slice (yielding first to any ready CPU-0 work) instead of a tick.
         void Wait(){
             BdwOverheadScope waitScope(BdwOhYieldWait);
+            // Yield diagnostics (gen 440 starved completion poll): TSC and
+            // APIC tick around the wait, and the CPU's last context switch.
+            tsc(waitBegin);waitBeginTick=ApicTickCount();switchBefore=SchedulerLastSwitch(SmpCurrentCpuIndex());
             if(spinTicks){
                 struct Cpu {Io& io;
                     uint64_t flags(){uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");return f;}
@@ -390,9 +394,11 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 uint64_t f;__asm__ volatile("pushfq; popq %0":"=r"(f)::"memory");
                 if(!(f&0x200)){__asm__ volatile("sti":::"memory");BdwPromptWakeCount(BdwPromptWake().ifRestores);}
             }
-            tsc(waitEnd);
+            tsc(waitEnd);waitEndTick=ApicTickCount();switchAfter=SchedulerLastSwitch(SmpCurrentCpuIndex());
         }
-        void Lock(){*irq=VmmKernelPtCriticalEnter();}
+        void Lock(){*irq=VmmKernelPtCriticalEnter();tsc(lockedTsc);}
+        uint64_t waitBegin=0,lockedTsc=0,waitBeginTick=0,waitEndTick=0;
+        SchedulerSwitchInfo switchBefore{},switchAfter{};
         bool Audit(){
             if(SmpCurrentCpuIndex()!=0)return false;
             BdwOverheadScope scope(BdwOhAudit);
@@ -455,20 +461,49 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 renderResult->entryRefusal=BdwRenderRefusalPageEvidence;renderResult->entryDetail=index;return false;}++index;}}
             held.clearTypes();
             GtOwner gt{held,khz};
-            struct RenderOwner {
+            struct RenderOwner final : BdwSubmitSampler {
                 Io& io;GtOwner& gt;BdwRenderRunResult& result;uint32_t khz,line;uint64_t origin;uint32_t budget=4000000;
                 bool patActive=false,gtReady=false,fault=false;
                 bool firstCompletionPoll=true,firstRetirementPoll=true;
                 unsigned gtInitCalls=0;
+                RenderOwner(Io& i,GtOwner& g,BdwRenderRunResult& r,uint32_t k,uint32_t l,uint64_t o)
+                    :io(i),gt(g),result(r),khz(k),line(l),origin(o){}
                 bool owned(){return gt.owned();}
                 bool quiescent(){
                     struct Reader {RenderOwner& o;bool owned(){return o.owned();}
                         bool read(uint32_t r,uint32_t& v){return o.io.read32(BdwDellBar0+r,v);}} reader{*this};
-                    return owned() && BdwObserveEngine(reader,0x2000).submissionQuiescent;
+                    if(!owned())return false;
+                    const auto observed=BdwObserveEngine(reader,0x2000);
+                    if(!observed.submissionQuiescent){
+                        // Hang diagnostics: keep the last refusing sample (no extra MMIO).
+                        auto& d=result.diag;++d.nonQuiescent;const auto& f=observed.first;
+                        d.busy={f.head,f.tail,f.mode,f.control,f.execlistLo,f.execlistHi,f.submissionMode};
+                    }
+                    return observed.submissionQuiescent;
+                }
+                // Hang diagnostics around the ELSP write: reads only, all on
+                // pages this critical section audited (RCS, 0xa000, 0x130000,
+                // 0x138000). EXECLIST_STATUS_LO/HI, RING_CONTEXT_STATUS_PTR,
+                // GEN6_RC_STATE, GEN6_GT_CORE_STATUS, FORCEWAKE_ACK_HSW.
+                void sampleBefore(BdwSubmitSample& s) override {
+                    io.tsc(s.tsc);
+                    s.valid=owned() && io.read32(BdwDellBar0+0x2234,s.execlistLo) && io.read32(BdwDellBar0+0x23a0,s.csbPtr) &&
+                        io.read32(BdwDellBar0+0xa094,s.rcState) && io.read32(BdwDellBar0+0x138060,s.coreStatus) &&
+                        io.read32(BdwDellBar0+0x130044,s.fwAck);
+                }
+                void sampleAfter(BdwSubmitSample& s) override {
+                    io.tsc(s.tsc);
+                    s.valid=owned() && io.read32(BdwDellBar0+0x2234,s.execlistLo) && io.read32(BdwDellBar0+0x2238,s.execlistHi) &&
+                        io.read32(BdwDellBar0+0x23a0,s.csbPtr);
                 }
                 bool allEnginesQuiescent(){return quiescent();} // others held idle under claim
                 bool monotonicMs(uint64_t& ms){uint64_t t=0;if(!io.tsc(t) || t<origin)return false;ms=(t-origin)/khz;return true;}
-                bool inTime(){uint64_t ms=0;return budget && --budget && monotonicMs(ms) && ms<2000;}
+                // Hang diagnostics: diag.deadline 1 = poll budget, 2 = clock, 3 = 2000 ms elapsed.
+                bool inTime(){uint64_t ms=0;
+                    if(!(budget && --budget)){result.diag.deadline=1;return false;}
+                    if(!monotonicMs(ms)){result.diag.deadline=2;return false;}
+                    if(ms>=2000){result.diag.deadline=3;return false;}
+                    return true;}
                 BdwPollPacer completionPacer{},retirementPacer{};BdwPollPacer* pacer=nullptr;
                 void beginPacer(BdwPollPacer& p,uint64_t expected,uint64_t spinBudget){
                     uint64_t now=0;io.tsc(now);
@@ -476,6 +511,27 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                     p.Begin({k,k/10,k/20,k/4},now,expected,result.pollSpinRequested?spinBudget:0);
                     pacer=&p;
                 }
+                // Longest yield of this run: where its time went (hang diagnostics).
+                void noteYield(uint64_t start,bool spin){
+                    uint64_t end=0;io.tsc(end);auto& d=result.diag;++d.yields;
+                    const uint64_t total=end>start?end-start:0;
+                    if(total<=d.longest.totalTicks || !io.waitBegin || !io.waitEnd || !io.lockedTsc)return;
+                    auto& y=d.longest;y={};y.valid=true;y.spin=spin;y.totalTicks=total;
+                    y.unlockTicks=io.waitBegin>start?io.waitBegin-start:0;
+                    y.waitTicks=io.waitEnd>io.waitBegin?io.waitEnd-io.waitBegin:0;
+                    y.lockTicks=io.lockedTsc>io.waitEnd?io.lockedTsc-io.waitEnd:0;
+                    y.auditTicks=end>io.lockedTsc?end-io.lockedTsc:0;
+                    y.apicTicks=uint32_t(io.waitEndTick-io.waitBeginTick);
+                    y.switches=uint32_t(io.switchAfter.sequence-io.switchBefore.sequence);
+                    if(y.switches){y.fromPid=io.switchAfter.fromPid;y.fromKernel=io.switchAfter.fromKernel;
+                        y.fromIdle=io.switchAfter.fromIdle;y.fromRanTicks=io.switchAfter.fromRanTsc;}
+                    y.offsetTicks=start>d.originTsc?start-d.originTsc:0;
+                }
+                // gen 440: one further check under ownership after the
+                // deadline, so a completed job whose poll was starved is not
+                // reset as failed. Never after a failed yield or uncertainty.
+                BdwDeadlineGrace completionGrace{},retirementGrace{};
+                bool graceEligible(){return result.diag.deadline && !result.pollYieldFailed && !fault && owned();}
                 bool pollContinue(){
                     if(!owned() || !inTime())return false;
                     if(result.pollYieldRequested){
@@ -488,7 +544,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         // A job is in flight: keep this CPU out of deep
                         // C-states for its completion polls (governor only).
                         CpuIdleLatencyHint(4000);
+                        io.waitBegin=io.lockedTsc=0;
                         const bool yielded=BdwYieldGpuWait(io);
+                        noteYield(start,slice!=0);
                         io.spinTicks=0;
                         if(!yielded){result.pollYieldFailed=true;fault=true;return false;}
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
@@ -542,13 +600,16 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
                     const auto yieldsBefore=result.pollYields;
                     const auto spinsBefore=result.pollSpins;
-                    const bool more=BdwFirstGpuPoll(*this,firstCompletionPoll);
+                    const bool more=completionGrace.Continue(*this,firstCompletionPoll,[this]{return graceEligible();});
+                    if(completionGrace.used)result.diag.grace|=1;
                     result.completionPollYields+=result.pollYields-yieldsBefore;
                     result.completionPollSpins+=result.pollSpins-spinsBefore;
                     if(!more)return false;
                     sampleRenderFrequency();
 #else
-                    if(!BdwFirstGpuPoll(*this,firstCompletionPoll))return false;
+                    const bool more=completionGrace.Continue(*this,firstCompletionPoll,[this]{return graceEligible();});
+                    if(completionGrace.used)result.diag.grace|=1;
+                    if(!more)return false;
 #endif
                     // The breadcrumb check follows; on success this is the
                     // observing poll, which feeds the completion predictor.
@@ -558,7 +619,9 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                 bool retirementContinue(){
                     if(firstRetirementPoll)beginPacer(retirementPacer,0,khz/2);
                     pacer=&retirementPacer;
-                    return BdwFirstGpuPoll(*this,firstRetirementPoll);
+                    const bool more=retirementGrace.Continue(*this,firstRetirementPoll,[this]{return graceEligible();});
+                    if(retirementGrace.used)result.diag.grace|=2;
+                    return more;
                 }
                 void relax(){io.relax();}
                 bool renderStateReady(){return owned() && gtReady;}
@@ -596,6 +659,7 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwResetPage));
                     const auto r=reset.reset(intent);gtReady=false;
                     if(r==BdwBcsResetResult::Uncertain)fault=true;
+                    (intent==BdwBcsResetIntent::IdleTakeover?result.diag.takeoverReset:result.diag.stopReset)=uint8_t(uint8_t(r)+1);
                     return r==BdwBcsResetResult::DomainAcknowledged;
                 }
                 bool admitPages(BdwOwnedPage* p,unsigned count){
@@ -639,6 +703,8 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
             BdwRenderDeviceBackend<RenderOwner> backend(owner,reinterpret_cast<volatile uint64_t*>(DIRECT_MAP_BASE+0xf6880000ull),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+0xf6101008ull),
                 reinterpret_cast<volatile uint32_t*>(DIRECT_MAP_BASE+BdwOtherEnginePages[0]),scratchIndex,copyToken,scratchDma,rebased?2:1);
+            renderResult->diag.originTsc=owner.origin;
+            backend.attachDiag(&renderResult->diag,&owner);
             struct Transaction {
                 RenderOwner& o;BdwRenderDeviceBackend<RenderOwner>& backend;BdwRenderRunResult& result;
                 uint64_t scratch;uint32_t (&snapshot)[20*1024];bool rebased;BdwPatLease lease;
@@ -706,6 +772,21 @@ static void VmmDellForcewakeCriticalImpl(uint32_t khz,BdwForcewakeAdapterResult&
                         o.io.read32(BdwDellBar0+0x2064,result.ipeir) && o.io.read32(BdwDellBar0+0x2068,result.ipehr) &&
                         o.io.read32(BdwDellBar0+0x2234,result.execlist);
                     if(result.engineSampled){(void)o.io.read32(BdwDellBar0+0x20b0,result.eir);(void)o.io.read32(BdwDellBar0+0x20b8,result.esr);}
+                    result.diag.runEndTsc=BdwHangTsc();
+                    // Failure capture before the engine reset in resetAfter():
+                    // register reads on audited pages, flushed CPU reads of the
+                    // private pages, GGTT PTE reads. Nothing is written.
+                    if(result.hangCapture && (!ok || result.hangCaptureAlways)){
+                        struct CaptureIo {RenderOwner& o;BdwRenderDeviceBackend<RenderOwner>& b;
+                            bool reg(uint32_t off,uint32_t& v){return o.owned() && o.io.read32(BdwDellBar0+off,v);}
+                            const uint8_t* page(unsigned i){return b.diagPage(i);}
+                            bool pte(unsigned i,uint64_t& v){return b.diagPte(i,v);}
+                            uint64_t dma(unsigned i){return b.diagDma(i);}
+                        } captureIo{o,backend};
+                        BdwHangClear(*result.hangCapture);
+                        BdwHangCaptureDevice(captureIo,*result.hangCapture);
+                        result.diag.captured=true;
+                    }
                     return ok;});}
                 bool saveContext(){return BdwTimedTransaction(result,3,[&](){return rebased?BdwCopyRebasedRenderContext(backend,snapshot):BdwCopyRetainedRenderContext(backend,snapshot);});}
                 bool resetAfter(){return BdwTimedTransaction(result,4,[&](){
@@ -1343,8 +1424,8 @@ void VmmDellBcsScanout(uint32_t khz,uint32_t index,uint64_t token,uint64_t scrat
 }
 #endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
-bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
-                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag) {
+bool VmmDellFlipGgttUpdate(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease,uint64_t* snapshot,
+                         uint64_t takeoverScratch,BdwFlipGgttDiag& diag, BdwFlipGgttOperation op) {
     constexpr uint32_t maxPages=16;
     const auto& r=lease.reservation;
     diag.first=r.first;diag.count=r.count;diag.stage=BdwFlipGgttStage::Precondition;
@@ -1397,6 +1478,13 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
     BdwGgttExtentMmio<Owner> io(owner,lease,pages,pageCount,flush,takeoverScratch);
     return VmmWithKernelPtCritical([&](){
         if(!Owner::Audit(BdwDellBar0+0x101000)){diag.stage=BdwFlipGgttStage::FlushAudit;return false;}
+        // The scanout worker calls retirement only after confirming a latch
+        // away and removing this extent from plane admission.
+        if(op==BdwFlipGgttOperation::Retire){
+            const bool ok=bind.RetireReversible(io);
+            diag.stage=ok?BdwFlipGgttStage::Bound:BdwFlipGgttStage::Uncertain;
+            return ok;
+        }
         // Stable twice-read snapshot of the inherited entries.
         for(unsigned pass=0;pass<2;++pass)for(uint32_t i=0;i<r.count;++i){
             uint64_t v=0;
@@ -1410,7 +1498,10 @@ bool VmmDellFlipGgttBind(BdwGgttExtentBind& bind,const BdwGgttExtentLease& lease
         BdwFlipGgttClassify(snapshot,r.first,r.count,diag);
         // All-zero ranges use the plain binder; anything inherited is taken
         // over against the exact snapshot (BindTakenOver re-reads it first).
-        const bool ok=diag.takeover?bind.BindTakenOver(lease,io,snapshot,takeoverScratch):bind.Bind(lease,io);
+        const bool ok=op==BdwFlipGgttOperation::BindReversible
+            ? bind.BindReversible(lease,io,snapshot,takeoverScratch)
+            : diag.takeover ? bind.BindTakenOver(lease,io,snapshot,takeoverScratch)
+                            : bind.Bind(lease,io);
         if(ok){diag.stage=BdwFlipGgttStage::Bound;return true;}
         diag.stage=bind.State()==BdwGgttExtentState::Fresh?BdwFlipGgttStage::Refused:BdwFlipGgttStage::Uncertain;
         if(owner.failedPage){diag.auditPage=owner.failedPage;}

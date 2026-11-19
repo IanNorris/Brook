@@ -1,5 +1,8 @@
 #pragma once
+#include "proc_wait_info.h"
 
+#include "core_dump.h"
+#include "core_autodump_policy.h"
 #include <stdint.h>
 #include "memory/address.h"
 #include "memory/address_space.h"
@@ -497,6 +500,8 @@ struct Process
     bool     inSignalHandler;   // Legacy diagnostic hint, not delivery authority
     bool     inSignalHandlerOnAltStack; // Legacy hint; use actual user RSP instead
     bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals
+    CoreRegisterSample coreRegisters;
+    CoreResourceLimits coreLimits; // group leader, protected by the task registry lock
     uint64_t currentSyscallNum;  // Syscall number (RAX) saved per-process for SA_RESTART
 
     // Fork child state: when true, the trampoline enters user mode at
@@ -555,6 +560,13 @@ struct Process
 
     UserCapabilityState capabilities; // credential lock; meaningful in private user namespaces
     UserNamespace* userNamespace; // owned immutable identity after publication; null is initial
+
+    // Wait diagnostics (proc_wait_info.h), written by the task itself in
+    // SchedulerBlock: ApicTickCount() when the latest wait began and the
+    // kernel return addresses above SchedulerBlock. Meaningful only while
+    // state==Blocked; read racily by procfs and the debug bridge.
+    uint64_t blockedSinceMs;
+    uint64_t blockSites[ProcWaitSiteDepth];
 
     // Independent live-task membership and owned namespace storage reference.
     // Exchange only through process_fs.h; logical exit retires before reaping.

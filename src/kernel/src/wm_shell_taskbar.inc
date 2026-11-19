@@ -1,7 +1,8 @@
-// Taskbar, tray indicators, volume popup and tray tooltips: shell layout,
-// painters and hit tests. Part of window.cpp's translation unit (it shares
-// the WM's window list and launch state); split out unchanged by compositor
-// refactor stage 0.3. Include only from window.cpp.
+// Taskbar, tray indicators, volume popup and tray tooltips: state caches,
+// model snapshots and hit tests. The layout and display list builders are
+// freestanding (chrome_shell.cpp). Part of window.cpp's translation unit (it
+// shares the WM's window list and launch state). Include only from
+// window.cpp.
 
 // ---------------------------------------------------------------------------
 // Taskbar
@@ -9,16 +10,7 @@
 
 #include "desktop_telemetry_runtime.inc"
 
-struct TaskbarLayout
-{
-    int y, textY;
-    WmRect apps, terminal, next, clock, network, volume, agent;
-    WmRect metrics[7];
-    WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
-    int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
-    int count, nextIndex;
-    char clockText[32];
-};
+using TaskbarLayout = ChromeTaskbarLayout;
 
 // Debug-bridge agent indicator cache (see WmAgentIndicatorRefresh).
 static uint8_t g_agentIndicatorState = 0; // BridgePresenceState
@@ -27,44 +19,8 @@ static uint64_t g_agentIndicatorSilentMs = 0;
 
 static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
 {
-    TaskbarLayout l = {};
-    l.nextIndex = -1;
-    const int sw = static_cast<int>(screenW), sh = static_cast<int>(screenH);
-    l.y = sh > static_cast<int>(WmMetric(WM_TASKBAR_HEIGHT)) ? sh - WmMetric(WM_TASKBAR_HEIGHT) : 0;
-    const int height = sh - l.y;
-    const int bh = height < static_cast<int>(WmMetric(WM_TASKBAR_BTN_HEIGHT)) ? height : WmMetric(WM_TASKBAR_BTN_HEIGHT);
-    const int by = l.y + (height - bh) / 2;
-    l.textY = by + (bh - WmDesktopFont().lineHeight) / 2;
-    int x = WmMetric(WM_TASKBAR_PADDING);
-    const int appsW = WmMetric(40);
-    l.apps = {x, by, appsW, bh}; x += appsW + WmMetric(WM_TASKBAR_PADDING);
-    l.terminal = {x, by, static_cast<int>(WmMetric(40)), bh}; x += WmMetric(40) + WmMetric(WM_TASKBAR_PADDING);
-    RtcFormatTaskbar(l.clockText, RtcNow(), false);
-    int right = sw - WmMetric(8);
-    // Reserve measured widgets from right to left. Keep one useful window
-    // button on small displays; diagnostics yield before the clock does.
-    auto reserve = [&](WmRect& r, int width) {
-        if (right - width - static_cast<int>(WmMetric(12)) < x + static_cast<int>(WmMetric(80))) return;
-        right -= width;
-        r = {right, by, width, bh};
-        right -= WmMetric(12);
-    };
-    reserve(l.clock, WmTextWidth(l.clockText));
-    reserve(l.network, WmMetric(16));
-    reserve(l.volume, WmMetric(16));
-    // Leftmost fixed icon, so its appearance never moves the volume target.
-    if (__atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE)) reserve(l.agent, WmMetric(16));
-    const int widths[7]={64,64,112,112,240,240,150};
-    const uint32_t enabledMetrics=WmGetTaskbarMetrics();
-    for(int i=6;i>=0;--i)if(enabledMetrics&(1u<<i)){
-        reserve(l.metrics[i],WmMetric(widths[i]));
-        if(l.metrics[i].w){
-            // Two 19-pixel text lines do not fit the 32-pixel task buttons.
-            // Use the full tray height, retaining a scaled top/bottom inset.
-            l.metrics[i].y=l.y+WmMetric(2);
-            l.metrics[i].h=height-2*WmMetric(2);
-        }
-    }
+    char clockText[32];
+    RtcFormatTaskbar(clockText, RtcNow(), false);
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
@@ -80,35 +36,9 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         ids[total++] = -10 - static_cast<int>(i);
     }
     SpinLockRelease(&g_launchLock);
-    int available = right - x;
-    if (!total || available <= 0) return l;
-    int capacity = (available + WmMetric(WM_TASKBAR_PADDING)) / (WmMetric(WM_TASKBAR_BTN_WIDTH) + WmMetric(WM_TASKBAR_PADDING));
-    bool overflow = capacity < total;
-    if (overflow)
-    {
-        // The arrow focuses the first window on the next page. The focused
-        // window selects the page, so every hidden/minimized window remains
-        // reachable through the existing focus/restore input path.
-        int arrowW = available < static_cast<int>(WmMetric(32)) ? available : static_cast<int>(WmMetric(32));
-        l.next = {right - arrowW, by, arrowW, bh};
-        available -= arrowW + WmMetric(WM_TASKBAR_PADDING);
-        capacity = (available + WmMetric(WM_TASKBAR_PADDING)) / (WmMetric(WM_TASKBAR_BTN_WIDTH) + WmMetric(WM_TASKBAR_PADDING));
-        if (capacity < 1 && available > 0) capacity = 1;
-        if (capacity < 1) { l.nextIndex = ids[(focused + 1) % total]; return l; }
-    }
-    if (capacity > total) capacity = total;
-    const int first = (focused / capacity) * capacity;
-    l.count = total - first < capacity ? total - first : capacity;
-    int width = (available - (capacity - 1) * WmMetric(WM_TASKBAR_PADDING)) / capacity;
-    if (width > static_cast<int>(WmMetric(WM_TASKBAR_BTN_WIDTH))) width = WmMetric(WM_TASKBAR_BTN_WIDTH);
-    for (int i = 0; i < l.count; ++i)
-    {
-        l.indices[i] = ids[first + i];
-        l.buttons[i] = {x, by, width, bh};
-        x += width + WmMetric(WM_TASKBAR_PADDING);
-    }
-    if (overflow) l.nextIndex = ids[(first + capacity) % total];
-    return l;
+    return ChromeTaskbarLayoutFor(WmChromeStyle(), screenW, screenH, clockText,
+                                  __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE) != 0,
+                                  WmGetTaskbarMetrics(), ids, total, focused);
 }
 
 // Network indicator. The compositor thread refreshes this cache at most once
@@ -138,29 +68,6 @@ bool WmNetworkIndicatorRefresh(uint64_t now)
     return true;
 }
 
-// Four ascending bars in the clock colour when connected; dimmed bars with a
-// cross over the short (left) end when disconnected.
-static void DrawNetworkIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
-                                 const WmRect& r, bool connected)
-{
-    if (r.w <= 0) return;
-    const uint32_t fg = WmCurrentPalette().secondaryText;
-    const uint32_t bar = connected ? fg : WmBlendColor(fg, WmCurrentPalette().taskbar, 90);
-    const int size = static_cast<int>(WmMetric(16));
-    const int barW = static_cast<int>(WmMetric(3)), gap = static_cast<int>(WmMetric(1));
-    const int x0 = r.x, top = r.y + (r.h - size) / 2, bottom = top + size;
-    for (int i = 0; i < 4; ++i) {
-        const int h = size * (i + 1) / 4;
-        WmFillRect(pixels, stride, sw, sh, x0 + i * (barW + gap), bottom - h, barW, h, bar);
-    }
-    if (connected) return;
-    const int span = size * 5 / 8, t = static_cast<int>(WmMetric(2));
-    for (int i = 0; i + t <= span; ++i) {
-        WmFillRect(pixels, stride, sw, sh, x0 + i, top + i, t, t, fg);
-        WmFillRect(pixels, stride, sw, sh, x0 + span - t - i, top + i, t, t, fg);
-    }
-}
-
 // Debug-bridge agent indicator. The guest sees only its own debug listener:
 // heartbeats ("bridge presence beat") from a long-lived MCP bridge attach,
 // other framed requests from that peer refresh, and an explicit detach
@@ -184,43 +91,6 @@ bool WmAgentIndicatorRefresh(uint64_t now)
     SerialPrintf("WM: agent indicator %s peer=%u.%u.%u.%u silent_ms=%u\n", BridgePresenceStateName(view.state),
                  o[0], o[1], o[2], o[3], static_cast<uint32_t>(view.silentMs));
     return true;
-}
-
-// A small robot head: antenna, outlined face, two eyes. Connected draws it in
-// the clock colour with green eyes; stale dims it, closes the eyes and adds
-// an amber "!" badge at the lower right.
-static void DrawAgentIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh, const WmRect& r)
-{
-    const uint8_t state = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
-    if (r.w <= 0 || !state) return;
-    const bool stale = state == static_cast<uint8_t>(BridgePresenceState::Stale);
-    const uint32_t fg = WmCurrentPalette().secondaryText;
-    const uint32_t ink = stale ? WmBlendColor(fg, WmCurrentPalette().taskbar, 120) : fg;
-    // Drawn on a 16-unit grid scaled to the 16-pixel metric (any UI scale).
-    const int size = static_cast<int>(WmMetric(16));
-    const int x0 = r.x + (r.w - size) / 2, y0 = r.y + (r.h - size) / 2;
-    auto px = [&](int v) { return v * size / 16; };
-    auto box = [&](int x, int y, int w, int h, uint32_t c) {
-        WmFillRect(pixels, stride, sw, sh, x0 + px(x), y0 + px(y), px(x + w) - px(x), px(y + h) - px(y), c);
-    };
-    box(6, 0, 4, 2, ink);           // antenna knob
-    box(7, 2, 2, 2, ink);           // antenna stem
-    box(1, 4, 14, 2, ink);          // face outline
-    box(1, 14, 14, 2, ink);
-    box(1, 6, 2, 8, ink);
-    box(13, 6, 2, 8, ink);
-    if (!stale) {
-        const uint32_t eye = BROOK_AGENT_ICON_EYE;
-        box(4, 8, 3, 3, eye);
-        box(9, 8, 3, 3, eye);
-        return;
-    }
-    box(4, 9, 3, 1, ink);           // closed eyes
-    box(9, 9, 3, 1, ink);
-    const uint32_t badge = BROOK_AGENT_ICON_BADGE, mark = BROOK_AGENT_ICON_MARK;
-    box(10, 9, 6, 7, badge);
-    box(12, 10, 2, 3, mark);
-    box(12, 14, 2, 1, mark);
 }
 
 static void AgentIndicatorTooltip(char (&text)[48])
@@ -328,54 +198,6 @@ static void WmVolumeApply(uint32_t control)
                  (g_volumeControl & BROOK_AUDIO_MUTED) ? " muted" : "");
 }
 
-// Speaker body and cone, then one to three ")" waves for the level, on a
-// 16x16 design grid scaled like the network bars. Muted draws a small cross
-// where the waves go; no device dims the speaker and crosses it like the
-// disconnected network bars.
-static void DrawVolumeGlyph(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
-                            int x0, int y0, int size, uint32_t control, bool available, uint32_t bg)
-{
-    const uint32_t fg = WmCurrentPalette().secondaryText;
-    const uint32_t ink = available ? fg : WmBlendColor(fg, bg, 90);
-    auto u = [&](int v) { return v * size / 16; };
-    auto cell = [&](int x, int y, int w, int h) {
-        WmFillRect(pixels, stride, sw, sh, x0 + u(x), y0 + u(y), u(x + w) - u(x), u(y + h) - u(y), ink);
-    };
-    cell(0, 5, 3, 6);
-    for (int c = 0; c < 3; ++c) cell(3 + c, 4 - c, 1, 8 + 2 * c);
-    const TaskbarVolumeGlyph glyph = TaskbarVolumeGlyphFor(control);
-    if (glyph == TaskbarVolumeGlyph::Muted) {
-        const int span = u(6), t = u(2) > 0 ? u(2) : 1, left = x0 + u(9), top = y0 + u(5);
-        for (int i = 0; i + t <= span; ++i) {
-            WmFillRect(pixels, stride, sw, sh, left + i, top + i, t, t, ink);
-            WmFillRect(pixels, stride, sw, sh, left + span - t - i, top + i, t, t, ink);
-        }
-    } else {
-        const int waves = glyph == TaskbarVolumeGlyph::Low ? 1 : glyph == TaskbarVolumeGlyph::Medium ? 2 : 3;
-        for (int i = 0; i < waves; ++i) {
-            const int x = 8 + 3 * i, half = 2 + 2 * i, cap = i ? 2 : 1;
-            cell(x, 8 - half, 2, 2 * half);
-            cell(x - 1, 8 - half - cap, 2, cap);
-            cell(x - 1, 8 + half, 2, cap);
-        }
-    }
-    if (available) return;
-    const int span = size * 5 / 8, ct = static_cast<int>(WmMetric(2));
-    for (int i = 0; i + ct <= span; ++i) {
-        WmFillRect(pixels, stride, sw, sh, x0 + i, y0 + i, ct, ct, fg);
-        WmFillRect(pixels, stride, sw, sh, x0 + span - ct - i, y0 + i, ct, ct, fg);
-    }
-}
-
-
-static void DrawVolumeIndicator(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh, const WmRect& r)
-{
-    if (r.w <= 0) return;
-    const int size = static_cast<int>(WmMetric(16));
-    DrawVolumeGlyph(pixels, stride, sw, sh, r.x, r.y + (r.h - size) / 2, size,
-                    g_volumeControl, g_volumeAvailable, WmCurrentPalette().taskbar);
-}
-
 static TaskbarVolumePopupLayout WmVolumePopupLayout(uint32_t screenW, uint32_t screenH)
 {
     const TaskbarLayout t = GetTaskbarLayout(screenW, screenH);
@@ -456,145 +278,97 @@ bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t scr
     return true;
 }
 
+// Shell painters build their list, then either execute it (key == nullptr)
+// or return its content key seeded with keySeed (WmShellSurfaceKey).
+static void WmVolumePopupSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                                 int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
+{
+    if (!g_volumePopupOpen || (!pixels && !key)) return;
+    const ChromeVolumePopupModel model{WmVolumePopupLayout(screenW, screenH), g_volumeControl, g_volumeAvailable,
+                                       g_volumeDragging, mouseX, mouseY};
+    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
+    ChromeBuildVolumePopup(model, WmChromeStyle(), list);
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+}
 void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
                          int32_t mouseX, int32_t mouseY)
 {
-    if (!g_volumePopupOpen || !pixels) return;
-    const TaskbarVolumePopupLayout l = WmVolumePopupLayout(screenW, screenH);
-    const WmPalette& pal = WmCurrentPalette();
-    const DesktopRect& p = l.panel;
-    if (p.w <= 2 || p.h <= 2) return;
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, p.h, WmMaterialColor(pal.launcher));
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, 1, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y + p.h - 1, p.w, 1, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, 1, p.h, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, p.x + p.w - 1, p.y, 1, p.h, pal.launcherBorder);
-    const bool muted = (g_volumeControl & BROOK_AUDIO_MUTED) != 0;
-    const uint32_t buttonBg = l.mute.contains(mouseX, mouseY) ? pal.taskHover : pal.taskButton;
-    WmMaterialRect(pixels, stride, screenW, screenH, l.mute, buttonBg);
-    const int size = static_cast<int>(WmMetric(16));
-    DrawVolumeGlyph(pixels, stride, screenW, screenH, l.mute.x + (l.mute.w - size) / 2,
-                    l.mute.y + (l.mute.h - size) / 2, size, g_volumeControl, g_volumeAvailable, buttonBg);
-    const uint32_t level = brook_audio_volume(g_volumeControl);
-    const int barH = static_cast<int>(WmMetric(4)), barY = l.track.y + (l.track.h - barH) / 2;
-    const int knobX = TaskbarVolumeSliderX(l.track, level);
-    const uint32_t fill = muted || !g_volumeAvailable ? WmBlendColor(pal.secondaryText, pal.launcher, 110) : pal.accent;
-    WmFillRect(pixels, stride, screenW, screenH, l.track.x, barY, l.track.w, barH, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, l.track.x, barY, knobX - l.track.x + 1, barH, fill);
-    const int knob = static_cast<int>(WmMetric(12));
-    WmMaterialRect(pixels, stride, screenW, screenH, {knobX - knob / 2, l.track.y + (l.track.h - knob) / 2, knob, knob},
-                   g_volumeDragging ? pal.accent : pal.text);
-    char value[8]{};
-    char* out = value;
-    DesktopNumber(out, level);
-    while (*out) ++out;
-    *out++ = '%'; *out = 0;
-    const int textY = l.value.y + (l.value.h - WmDesktopFont().lineHeight) / 2;
-    WmRenderMaterialString(pixels, stride, screenW, screenH, l.value.x + l.value.w - WmTextWidth(value), textY,
-                           value, muted ? pal.secondaryText : pal.text, pal.launcher, l.value.w);
+    WmVolumePopupSurface(pixels, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
 }
 
-void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
-                     uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
+// Taskbar model: per-button icons and hover labels, tray state and the
+// telemetry snapshot. Launch entries copy their icon (owned by the launch
+// table under g_launchLock) into launchIcons.
+static uint32_t g_taskbarLaunchIcons[LaunchFeedbackTable::Capacity][LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
+static char g_taskbarLaunchLabels[LaunchFeedbackTable::Capacity][80];
+static ChromeTaskbarButton g_taskbarButtons[ChromeTaskbarButtonLimit];
+static TaskbarLayout g_taskbarLayout;
+
+static void WmTaskbarSurface(uint32_t* backBuffer, uint32_t stride,
+                             uint32_t screenW, uint32_t screenH,
+                             uint64_t uptimeMs, int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
 {
-    if (!g_wmActive || !backBuffer) return;
+    if (!g_wmActive || (!backBuffer && !key)) return;
     LauncherReadGuard icons;
-    const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
-    WmFillRect(backBuffer, stride, screenW, screenH, 0, l.y, screenW,
-               screenH - l.y, WmMaterialColor(WmCurrentPalette().taskbar));
-    WmFillRect(backBuffer, stride, screenW, screenH, 0, l.y, screenW, 1, WmCurrentPalette().separator);
-    auto button = [&](const WmRect& r, const char* title, bool active, bool minimized) {
-        uint32_t bg = active ? WmCurrentPalette().taskActive :
-            r.contains(mouseX, mouseY) ? WmCurrentPalette().taskHover : WmCurrentPalette().taskButton;
-        WmMaterialRect(backBuffer,stride,screenW,screenH,r,bg);
-        if (active || minimized)
-            WmFillRect(backBuffer, stride, screenW, screenH, r.x + WmMetric(6), r.y + r.h - WmMetric(2),
-                       r.w - WmMetric(12), WmMetric(2), active ? WmCurrentPalette().accent : WmCurrentPalette().minimized);
-        if (r.w > static_cast<int>(WmMetric(12))) WmRenderString(backBuffer, stride, screenW, screenH,
-            r.x + WmMetric(6), l.textY, title, WmCurrentPalette().taskText, bg, r.w - WmMetric(12));
-    };
-    button(l.apps, "", g_launcherOpen, false);
-    button(l.terminal, "", false, false);
-    WmDrawIcon(backBuffer, stride, screenW, screenH, l.apps.x + (l.apps.w - static_cast<int>(WmMetric(24))) / 2,
-               l.apps.y + (l.apps.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), icons.get().appsIcon);
-    WmDrawIcon(backBuffer, stride, screenW, screenH, l.terminal.x + (l.terminal.w - static_cast<int>(WmMetric(24))) / 2,
-               l.terminal.y + (l.terminal.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), icons.get().terminalIcon);
-    char launchTitle[80]{};
-    const uint32_t netAddress = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
-    const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
-        l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
+    TaskbarLayout& l = g_taskbarLayout;
+    l = GetTaskbarLayout(screenW, screenH);
     for (int i = 0; i < l.count; ++i)
     {
-        const WmRect& r = l.buttons[i];
+        ChromeTaskbarButton& b = g_taskbarButtons[i];
+        b = {};
         if (l.indices[i] <= -10) {
             const unsigned slot = static_cast<unsigned>(-10 - l.indices[i]);
             LaunchFeedback e;
-            uint32_t icon[LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
             bool hasIcon;
             SpinLockAcquire(&g_launchLock);
             e = g_launches.entries[slot];
             hasIcon = g_launchRequests[slot].hasIcon;
-            if (hasIcon) memcpy(icon, g_launchRequests[slot].icon, sizeof(icon));
+            if (hasIcon) memcpy(g_taskbarLaunchIcons[slot], g_launchRequests[slot].icon, sizeof(g_taskbarLaunchIcons[slot]));
             SpinLockRelease(&g_launchLock);
-            button(r, "", false, false);
-            if (r.w >= static_cast<int>(WmMetric(24)) && r.h >= static_cast<int>(WmMetric(24)))
-                WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - static_cast<int>(WmMetric(24))) / 2,
-                           r.y + (r.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), hasIcon ? icon : icons.get().applicationIcon);
-            if (e.busy()) {
-                // Eight positions form a bounded animated progress ring.
-                static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
-                static const int dy[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
-                unsigned step = (uptimeMs / 100) % 8;
-                for (unsigned dot = 0; dot < 8; ++dot)
-                    WmFillRect(backBuffer, stride, screenW, screenH, r.x + r.w - 8 + dx[dot],
-                               r.y + r.h - 8 + dy[dot], 2, 2,
-                               dot == step ? WmCurrentPalette().taskText : WmCurrentPalette().minimized);
-            } else {
-                WmRenderString(backBuffer, stride, screenW, screenH, r.x + r.w - WmMetric(10),
-                               l.textY, "!", WmCurrentPalette().taskText, WmCurrentPalette().taskButton, WmMetric(10));
-            }
-            if (r.contains(mouseX, mouseY)) {
-                WmStrCopy(launchTitle, e.busy() ? "Starting: " :
-                    e.phase == LaunchPhase::TimedOut ? "Still waiting: " :
-                    e.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(launchTitle));
-                size_t n = strlen(launchTitle);
-                WmStrCopy(launchTitle + n, e.title, sizeof(launchTitle) - n);
-                hoverTitle = launchTitle;
-            }
+            char* label = g_taskbarLaunchLabels[slot];
+            WmStrCopy(label, e.busy() ? "Starting: " :
+                e.phase == LaunchPhase::TimedOut ? "Still waiting: " :
+                e.phase == LaunchPhase::Exited ? "Exited without a window: " : "Launch failed: ", sizeof(g_taskbarLaunchLabels[slot]));
+            const size_t n = strlen(label);
+            WmStrCopy(label + n, e.title, sizeof(g_taskbarLaunchLabels[slot]) - n);
+            b.launch = true;
+            b.busy = e.busy();
+            b.icon = hasIcon ? g_taskbarLaunchIcons[slot] : icons.get().applicationIcon;
+            b.hoverTitle = label;
             continue;
         }
         const Window& w = g_windows[l.indices[i]];
-        button(r, "", w.focused && !w.minimized, w.minimized);
-        if (r.w >= static_cast<int>(WmMetric(24)) && r.h >= static_cast<int>(WmMetric(24)))
-            WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - static_cast<int>(WmMetric(24))) / 2,
-                       r.y + (r.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), WindowIcon(w, icons.get()));
-        if (r.contains(mouseX, mouseY)) hoverTitle = w.title;
+        b.active = w.focused && !w.minimized;
+        b.minimized = w.minimized;
+        b.icon = WindowIcon(w, icons.get());
+        b.hoverTitle = w.title;
     }
-    if (l.next.w > 0) {
-        button(l.next, ">", false, false);
-        if (l.next.contains(mouseX, mouseY)) hoverTitle = "More windows";
-    }
-    // Use the already-reserved tray for the hover label. Geometry stays fixed
-    // and no additional empty strip is reserved when nothing is hovered.
-    int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.metrics[6],l.agent,l.volume,l.network,l.clock};
-    for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
-    if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
-    {
-        WmRenderString(backBuffer, stride, screenW, screenH, labelX, l.textY,
-                       hoverTitle, WmCurrentPalette().text, WmCurrentPalette().taskbar, static_cast<int>(screenW) - labelX - WmMetric(8));
-        return;
-    }
-    auto trayText = [&](const WmRect& r, const char* text, uint32_t fg) {
-        if (r.w > 0) WmRenderString(backBuffer, stride, screenW, screenH,
-            r.x, l.textY, text, fg, WmCurrentPalette().taskbar, r.w);
-    };
-    trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
-    DrawNetworkIndicator(backBuffer, stride, screenW, screenH, l.network, netAddress != 0);
-    DrawVolumeIndicator(backBuffer, stride, screenW, screenH, l.volume);
-    DrawAgentIndicator(backBuffer, stride, screenW, screenH, l.agent);
-    for(unsigned i=0;i<7;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
+    ChromeTaskbarModel model{};
+    model.layout = &l;
+    model.buttons = g_taskbarButtons;
+    model.launcherOpen = g_launcherOpen;
+    model.appsIcon = icons.get().appsIcon;
+    model.terminalIcon = icons.get().terminalIcon;
+    model.networkConnected = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
+    model.volumeControl = g_volumeControl;
+    model.volumeAvailable = g_volumeAvailable;
+    const uint8_t agent = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
+    model.agentShown = agent != 0;
+    model.agentStale = agent == static_cast<uint8_t>(BridgePresenceState::Stale);
+    model.telemetry = WmTelemetryModel(l);
+    model.uptimeMs = uptimeMs;
+    model.mouseX = mouseX; model.mouseY = mouseY;
+    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
+    ChromeBuildTaskbar(model, WmChromeStyle(), list);
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmDesktopFont());
+}
+void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
+                     uint32_t screenW, uint32_t screenH,
+                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
+{
+    WmTaskbarSurface(backBuffer, stride, screenW, screenH, uptimeMs, mouseX, mouseY, 0, nullptr);
 }
 
 // Volume and network tooltips float in a small panel just above the
@@ -631,7 +405,7 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
         } else WmStrCopy(text, "Network: disconnected", sizeof(text));
     }
     if (!anchor) return false;
-    const int pad = static_cast<int>(WmMetric(8));
+    const int pad = ChromeTooltipPadding(WmChromeStyle());
     box = TaskbarTooltipBox(*anchor, WmTextWidth(text) + 2 * pad,
                             WmDesktopFont().lineHeight + static_cast<int>(WmMetric(10)), l.y,
                             static_cast<int>(WmMetric(4)), static_cast<int>(screenW), static_cast<int>(WmMetric(4)));
@@ -648,21 +422,21 @@ bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     return true;
 }
 
-void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mx, int32_t my)
+static void WmTrayTooltipSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                                 int32_t mx, int32_t my, uint64_t keySeed, uint64_t* key)
 {
     char text[48]{};
     DesktopRect p{};
-    if (!pixels || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
-    const WmPalette& pal = WmCurrentPalette();
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, p.h, WmMaterialColor(pal.launcher));
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, p.w, 1, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y + p.h - 1, p.w, 1, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, p.x, p.y, 1, p.h, pal.launcherBorder);
-    WmFillRect(pixels, stride, screenW, screenH, p.x + p.w - 1, p.y, 1, p.h, pal.launcherBorder);
-    const int pad = static_cast<int>(WmMetric(8));
-    WmRenderMaterialString(pixels, stride, screenW, screenH, p.x + pad,
-                           p.y + (p.h - WmDesktopFont().lineHeight) / 2, text, pal.text, pal.launcher, p.w - pad);
+    if ((!pixels && !key) || !WmTrayTooltip(screenW, screenH, mx, my, text, p)) return;
+    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
+    ChromeBuildTooltip({p, text}, WmChromeStyle(), list);
+    if (key) *key = ChromeListKey(list, keySeed);
+    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmDesktopFont());
+}
+void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
+                         int32_t mx, int32_t my)
+{
+    WmTrayTooltipSurface(pixels, stride, screenW, screenH, mx, my, 0, nullptr);
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

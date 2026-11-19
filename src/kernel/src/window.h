@@ -8,6 +8,8 @@
 #include "../../shared/brook_taskbar.h"
 #include "../../shared/wm_window_state.h"
 
+struct BrookDesktopSurface;
+
 namespace brook {
 
 struct Process;
@@ -32,8 +34,7 @@ bool WmApplyScalePending();
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = DesktopMetrics::TitleBase;
 static constexpr uint32_t WM_BORDER_WIDTH     = DesktopMetrics::BorderBase;
 static constexpr uint32_t WM_BUTTON_WIDTH     = DesktopMetrics::CaptionButtonBase;
-static constexpr uint32_t WM_RESIZE_GRAB      = 16;  // corner/edge grab zone for resize
-static constexpr uint32_t WM_RESIZE_EDGE      = 6;   // edge-only grab zone (bottom/right)
+// Resize zone sizes: ChromeResizeMetrics (chrome_layout.h).
 static constexpr uint32_t WM_MIN_WIDTH        = 200;
 static constexpr uint32_t WM_MIN_HEIGHT       = 100;
 static constexpr uint32_t WM_MAX_WINDOWS      = 32;
@@ -88,10 +89,14 @@ bool WmCopyDesktopLayers(const WmDesktopLayers& layers,const WmDesktopLayerCopy*
 void WmReleaseDesktopLayers(WmDesktopLayers* layers);
 // Offscreen opaque-chrome prototype, one independent surface per window.
 // It excludes glass effects and does not yet version theme, title or hover.
-struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;}; // key: WmChromeKey of the rendered pixels
+// key: WmChromeKey of the rendered pixels. interior: the transparent client
+// rectangle relative to the surface (frames; empty for a caption block).
+struct WmDesktopChrome {int32_t x,y;uint32_t width,height;uint64_t key;uint32_t interiorX,interiorY,interiorW,interiorH;};
+// spansOnly: clear and render only the frame strips (outer minus interior);
+// interior pixels of the buffer are left as they were.
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
-                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false);
+                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges=false,bool spansOnly=false);
 static constexpr uint32_t WM_TASKBAR_HEIGHT   = DesktopMetrics::TaskbarBase; // bottom taskbar height
 
 // Chrome layout constants
@@ -114,6 +119,11 @@ struct DesktopTelemetry;
 DesktopTelemetry WmDesktopTelemetryRead();
 // The renderer composited a GPU-source frame for window identity/commit.
 void WmNoteClientFrame(uint64_t identity,uint64_t commit);
+// Surface records (layers ABI v2, chrome_surface.h): one per visible window
+// with chrome, back to front, resolved against the active backend.
+struct ChromeSurfaceEffects;
+ChromeSurfaceEffects WmChromeSurfaceEffects();
+uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max);
 using WmRect = DesktopRect;
 void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
 void WmDrawBuildIdSpan(uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
@@ -263,7 +273,28 @@ enum class WmHitZone : uint8_t
     Border,
     Taskbar,        // clicked on taskbar background
     TaskbarButton,  // clicked on a taskbar window button
+    ResizeLeft,
+    ResizeTop,
+    ResizeTopLeft,
+    ResizeTopRight,
+    ResizeBottomLeft,
 };
+// Resize zones as edge masks (bit 0 left, 1 top, 2 right, 3 bottom; the
+// chrome_layout.h ChromeEdge* values). Zero for any other zone.
+inline constexpr uint8_t WmHitZoneResizeEdges(WmHitZone zone)
+{
+    return zone == WmHitZone::ResizeLeft ? 1 : zone == WmHitZone::ResizeTop ? 2 :
+           zone == WmHitZone::ResizeRight ? 4 : zone == WmHitZone::ResizeBottom ? 8 :
+           zone == WmHitZone::ResizeTopLeft ? 3 : zone == WmHitZone::ResizeTopRight ? 6 :
+           zone == WmHitZone::ResizeBottomLeft ? 9 : zone == WmHitZone::ResizeCorner ? 12 : 0;
+}
+inline constexpr WmHitZone WmHitZoneForResizeEdges(uint8_t edges)
+{
+    return edges == 1 ? WmHitZone::ResizeLeft : edges == 2 ? WmHitZone::ResizeTop :
+           edges == 4 ? WmHitZone::ResizeRight : edges == 8 ? WmHitZone::ResizeBottom :
+           edges == 3 ? WmHitZone::ResizeTopLeft : edges == 6 ? WmHitZone::ResizeTopRight :
+           edges == 9 ? WmHitZone::ResizeBottomLeft : edges == 12 ? WmHitZone::ResizeCorner : WmHitZone::None;
+}
 
 struct WmHitResult
 {
@@ -542,6 +573,11 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
 // Look up a Window* given (proc, wmId).  Returns nullptr if mismatch.
 Window* WmFindWindowById(Process* proc, uint32_t wmId);
 // Coherent owned-window geometry; output is unchanged on error.
+// Focused window for the desktop renderer's app-driven present cadence:
+// its identity and BROOK_WINDOW_STATE_* flags (VISIBLE, FOCUSED, MINIMIZED,
+// MAXIMIZED, FULLSCREEN, CLIENT_CHROME). False when nothing is focused.
+bool WmSnapshotFocus(uint32_t* window, uint64_t* incarnation, uint32_t* flags);
+bool WmClientScanoutWindowMatches(uint32_t window,uint64_t incarnation,uint32_t width,uint32_t height);
 int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
                                uint64_t expectedIncarnation, BrookWindowState* out);
 int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,

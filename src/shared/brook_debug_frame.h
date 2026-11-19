@@ -74,10 +74,21 @@ struct BrookDesktopOverlayBandsV2 {
     uint32_t opaque,reserved;
     uint64_t keys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
 };
+/* Op 10 (optional; older kernels return -EINVAL): the shell surface records
+ * (layers ABI v2, struct BrookDesktopSurface in desktop_layers_abi.h) of the
+ * same capture lease, back to front: kind, rectangle, material, opacity,
+ * radii, shadow and content key. The pointer is not a surface. */
+enum { BROOK_DESKTOP_OVERLAY_SURFACES=10, BROOK_DESKTOP_OVERLAY_MAX_SURFACES=4 };
 struct BrookDesktopOverlayInfo {
     struct BrookDebugFrameInfo frame;
     uint64_t generation;
 };
+/* Final syscall argument for op 8. V2 returns a positive epoch when
+ * preparing a cursor-free frame. Older kernels reject it with EINVAL. */
+#define BROOK_DESKTOP_CURSOR_PLANE_V1 1
+#define BROOK_DESKTOP_CURSOR_PLANE_V2 2
+/* After presenting that frame, pass the epoch in the offset argument. */
+enum { BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED=10 };
 struct BrookDesktopOverlayCursor {
     uint32_t visible,width,height,stride;
     int32_t x,y;

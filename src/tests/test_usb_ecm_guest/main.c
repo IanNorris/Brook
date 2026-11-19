@@ -178,10 +178,32 @@ static int storage(int fd,unsigned pass){
     for(unsigned i=0;i<sizeof(disk);++i)if(disk[i]!=(unsigned char)(((offset+i)*17+5)%251))return -1;
     return 0;
 }
+// Matched before/after receive-only record. Clock starts at the request
+// byte and all data is checked in the guest before reporting the rate.
+static int benchmark_receive(int tcp,unsigned mib){
+    struct timespec start,end;
+    const char marker='B';
+    if(clock_gettime(CLOCK_MONOTONIC,&start) || write(tcp,&marker,1)!=1)return -1;
+    for(unsigned n=0;n<mib*32;++n){
+        if(exact(tcp,reply,sizeof(reply),0))return -1;
+        for(unsigned i=0;i<sizeof(reply);++i)
+            if(reply[i]!=(unsigned char)((i*17+3)%251))return -1;
+    }
+    if(clock_gettime(CLOCK_MONOTONIC,&end))return -1;
+    const long long ns=(end.tv_sec-start.tv_sec)*1000000000LL+end.tv_nsec-start.tv_nsec;
+    printf("ECM_RX_BENCH bytes=%u ns=%lld\n",mib*1024u*1024u,ns);
+    return ns>0 ? 0 : -1;
+}
 int main(int argc,char** argv){
-    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>9)return 2;
+    setvbuf(stdout,NULL,_IONBF,0);if(argc<2 || argc>10)return 2;
     int concurrency=0,close_race=0,user_copy=0,async=0,bench_small=0,pool_test=0,blocked_close=0;
-    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else if(!strcmp(argv[i],"pool-test"))pool_test=1;else if(!strcmp(argv[i],"blocked-close"))blocked_close=1;else return 2;}
+    unsigned rx_mib=0;
+    for(int i=2;i<argc;++i){if(!strcmp(argv[i],"concurrency"))concurrency=1;else if(!strcmp(argv[i],"close-race"))close_race=1;else if(!strcmp(argv[i],"user-copy"))user_copy=1;else if(!strcmp(argv[i],"async"))async=1;else if(!strcmp(argv[i],"bench-small"))bench_small=1;else if(!strcmp(argv[i],"pool-test"))pool_test=1;else if(!strcmp(argv[i],"blocked-close"))blocked_close=1;
+        else if(!strncmp(argv[i],"rx-mib=",7)){
+            char* end;unsigned long value=strtoul(argv[i]+7,&end,10);
+            if(*end || value==0 || value>64)return 2;
+            rx_mib=(unsigned)value;
+        }else return 2;}
     if(close_race && !concurrency)return 2;
     struct sockaddr_in peer={.sin_family=AF_INET,.sin_port=htons((unsigned short)atoi(argv[1]))};
     inet_pton(AF_INET,"10.0.2.100",&peer.sin_addr);
@@ -195,6 +217,7 @@ int main(int argc,char** argv){
         if(exact(tcp,data,sizeof(data),1) || exact(tcp,reply,sizeof(reply),0) || memcmp(data,reply,sizeof(data)))return fail("TCP integrity");
         if(storage(file,pass))return fail("concurrent USB read");
     }
+    if(rx_mib && benchmark_receive(tcp,rx_mib))return fail("RX benchmark");
     if(bench_small){
         memset(data,'T',1024);
         for(unsigned n=0;n<1024;++n)if(exact(tcp,data,1024,1))return fail("small write benchmark");

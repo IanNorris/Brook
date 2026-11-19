@@ -113,7 +113,14 @@ def main():
     p.add_argument('--force', action='store_true', help='replace an existing result directory')
     p.add_argument('--attempts', type=int, default=2,
                    help='maximum runs; only a firmware stall before boot selection is retried (default 2)')
+    p.add_argument('--proc-dump-qa', action='store_true', help='Also run the two-thread live core and GDB fixture')
+    p.add_argument('--proc-autodump-qa', action='store_true', help='Run the live core fixture and verify an automatic fault core')
     a = p.parse_args()
+    mode_flags = list(MODE_FLAGS)
+    if a.proc_dump_qa or a.proc_autodump_qa:
+        mode_flags += ['--proc-dump-qa', str(a.kernel_build.resolve() / 'drivers/virtio_net.mod')]
+    if a.proc_autodump_qa:
+        mode_flags.append('--proc-autodump-qa')
     pair, shared = a.pair.resolve(), a.shared.resolve()
     out = (a.output or pair / 'qemu-check').resolve()
     if 'OVMF_CODE' not in os.environ and not a.firmware:
@@ -137,7 +144,7 @@ def main():
     scratch = tmp_root / f'p{os.getpid()}'
     scratch.mkdir(parents=True)
     verdict = {'pair': str(pair), 'kernel_sha256': kernel_sha, 'initrd_sha256': initrd_sha,
-               'kernel_build_flags_source': flag_source, 'kernel_build_flags': flags, 'mode_flags': MODE_FLAGS,
+               'kernel_build_flags_source': flag_source, 'kernel_build_flags': flags, 'mode_flags': mode_flags,
                'pinned_inputs': {'image': IMAGE[1], 'efi': sha(a.efi) if a.efi else EFI[1], 'recovery_pair': RECOVERY,
                                  'ovmf_code_sha256': sha(firmware / 'OVMF_CODE.fd'), 'ovmf_dir': str(firmware)}}
     try:
@@ -186,7 +193,7 @@ def main():
             argv = [sys.executable, str(ROOT / 'scripts/test_guard_repair_handoff_qemu.py'),
                     '--image', str(image), '--efi', str(efi), '--firmware', str(firmware),
                     '--desktop-pair', str(desktop), '--recovery-pair', str(recovery),
-                    '--output', str(run_dir), '--identity', rmanifest['guard_identity'], *MODE_FLAGS]
+                    '--output', str(run_dir), '--identity', rmanifest['guard_identity'], *mode_flags]
             print('+', ' '.join(argv), flush=True)
             start = time.monotonic()
             with log_path.open('w') as log:

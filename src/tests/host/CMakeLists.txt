@@ -209,6 +209,8 @@ target_compile_options(test_scheduler_fd_snapshot PRIVATE -UNDEBUG)
 set_tests_properties(test_scheduler_fd_snapshot PROPERTIES TIMEOUT 10)
 add_host_test(test_proc_inode)
 target_compile_options(test_proc_inode PRIVATE -UNDEBUG)
+add_host_test(test_proc_wait_info)
+target_compile_options(test_proc_wait_info PRIVATE -UNDEBUG)
 add_host_test(test_memfd_seals)
 target_compile_options(test_memfd_seals PRIVATE -UNDEBUG)
 add_host_test(test_shared_irq_registry)
@@ -404,7 +406,8 @@ target_compile_options(test_audio_delivery PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_audio_delivery PRIVATE -Wl,--gc-sections)
-set_tests_properties(test_audio_delivery PROPERTIES TIMEOUT 15)
+# The full mixer matrix takes more than 15 seconds even when run alone.
+set_tests_properties(test_audio_delivery PROPERTIES TIMEOUT 45)
 add_host_test(test_user_copy
     "${BROOK_ROOT}/src/kernel/src/user_copy_fault.cpp"
     "${BROOK_ROOT}/src/kernel/src/user_copy.S"
@@ -518,6 +521,9 @@ target_compile_options(test_futex_pool PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
 add_host_test(test_fd_table)
+# The full suite includes stress tests. For local iteration use ctest -LE stress,
+# then run the stress tests separately with ctest -L stress -j1.
+set_tests_properties(test_fd_table PROPERTIES LABELS stress)
 add_host_test(test_record_locks
     "${BROOK_ROOT}/src/kernel/src/record_locks.cpp"
     "${BROOK_ROOT}/src/kernel/src/file_locks.cpp"
@@ -617,6 +623,7 @@ target_compile_options(test_vmm_leaf PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_vmm_leaf PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_vmm_leaf PROPERTIES LABELS stress)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(test_vmm_leaf PRIVATE -Wno-error=class-memaccess -Wno-error=attributes -Wno-error=array-bounds)
 endif()
@@ -722,6 +729,7 @@ target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src
 
 add_host_test(test_desktop_metrics)
 add_host_test(test_desktop_overlay_regions)
+add_host_test(test_desktop_overlay_surfaces)
 add_host_test(test_global_shortcuts)
 target_compile_options(test_global_shortcuts PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
@@ -736,6 +744,46 @@ target_compile_options(test_wayland_provider PRIVATE "-iquote${BROOK_ROOT}/src/k
 
 add_host_test(test_taskbar_volume)
 add_host_test(test_chrome_alpha)
+add_host_test(test_chrome_layout)
+target_compile_options(test_chrome_layout PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_chrome_surface)
+target_compile_options(test_chrome_surface PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+# Chrome golden images: the freestanding display list builders and executor,
+# with the desktop fonts baked exactly as the kernel bakes them.
+set(CHROME_FONT_TTF "")
+if(DEFINED ENV{BROOK_DESKTOP_FONT_TTF} AND EXISTS "$ENV{BROOK_DESKTOP_FONT_TTF}")
+    set(CHROME_FONT_TTF "$ENV{BROOK_DESKTOP_FONT_TTF}")
+elseif(DEFINED ENV{HACK_FONT_TTF} AND EXISTS "$ENV{HACK_FONT_TTF}")
+    set(CHROME_FONT_TTF "$ENV{HACK_FONT_TTF}")
+endif()
+find_program(CHROME_PYTHON3 python3 NO_CACHE)
+if(CHROME_FONT_TTF AND CHROME_PYTHON3)
+    set(CHROME_FONT_SOURCES "")
+    foreach(DESKTOP_SCALE IN ITEMS 100 150 200)
+        math(EXPR DESKTOP_FONT_SIZE "16 * ${DESKTOP_SCALE} / 100")
+        set(DESKTOP_FONT_CPP "${CMAKE_CURRENT_BINARY_DIR}/chrome_desktop_font_${DESKTOP_SCALE}.cpp")
+        add_custom_command(
+            OUTPUT "${DESKTOP_FONT_CPP}"
+            COMMAND ${CHROME_PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py"
+                    "${CHROME_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
+                    "g_desktopFont${DESKTOP_SCALE}"
+            DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${CHROME_FONT_TTF}"
+            VERBATIM)
+        list(APPEND CHROME_FONT_SOURCES "${DESKTOP_FONT_CPP}")
+    endforeach()
+    add_host_test(test_chrome_goldens
+        "${BROOK_ROOT}/src/kernel/src/chrome_raster.cpp"
+        "${BROOK_ROOT}/src/kernel/src/chrome_frame.cpp"
+        "${BROOK_ROOT}/src/kernel/src/chrome_shell.cpp"
+        ${CHROME_FONT_SOURCES})
+    target_compile_options(test_chrome_goldens PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+    target_compile_definitions(test_chrome_goldens PRIVATE
+        BROOK_CHROME_GOLDENS="${BROOK_ROOT}/src/tests/goldens/chrome")
+    set_tests_properties(test_chrome_goldens PROPERTIES TIMEOUT 120)
+else()
+    message(WARNING "Desktop font or python3 not found: test_chrome_goldens is not built (run from nix-shell)")
+endif()
 target_compile_options(test_taskbar_volume PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_launcher_power)
 target_compile_options(test_launcher_power PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
@@ -769,6 +817,10 @@ add_host_test(test_intel_bdw_forcewake)
 target_compile_options(test_intel_bdw_forcewake PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_forcewake_ack)
 target_compile_options(test_intel_bdw_forcewake_ack PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_core_autodump_policy)
+target_compile_options(test_core_autodump_policy PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_core_dump)
+target_compile_options(test_core_dump PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_ggtt_bind)
 target_compile_options(test_intel_bdw_ggtt_bind PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_ggtt_space)
@@ -1024,6 +1076,9 @@ add_host_test(test_intel_bdw_submission)
 add_host_test(test_intel_bdw_worker_stats)
 add_host_test(test_intel_bdw_render_refusal)
 add_host_test(test_intel_bdw_display_flip)
+add_host_test(test_intel_bdw_cursor)
+add_host_test(test_intel_bdw_client_scanout)
+target_compile_options(test_intel_bdw_client_scanout PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_compositor_row_filter)
 add_host_test(test_wm_chrome_key)
 target_compile_options(test_wm_chrome_key PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/tools/vulkan-compositor-pkg")
@@ -1052,6 +1107,8 @@ add_host_test(test_intel_bdw_publish)
 target_compile_options(test_intel_bdw_publish PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_intel_bdw_csb)
 target_compile_options(test_intel_bdw_csb PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_intel_bdw_hang_diag)
+target_compile_options(test_intel_bdw_hang_diag PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_pte_owner_sidecars)
 target_compile_options(test_pte_owner_sidecars PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 

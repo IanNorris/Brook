@@ -1,6 +1,7 @@
 #pragma once
 #include "desktop_overlay_regions.h"
 #include "../../shared/brook_debug_frame.h"
+#include "../../shared/desktop_layers_abi.h"
 
 #include <stdint.h>
 
@@ -32,6 +33,8 @@ bool CompositorGlassActive();
 bool CompositorGlassRequested();
 uint32_t CompositorMaterialOpacity();
 uint32_t CompositorMaterialBlur();
+// Opacity of material shell surfaces (taskbar, launcher, popups) under glass.
+uint32_t CompositorShellMaterialOpacity();
 void CompositorSetGlassEnabled(bool enabled);
 struct CompositorUploadStats { uint64_t calls[4],bytes[4]; };
 CompositorUploadStats CompositorReadUploads();
@@ -74,6 +77,8 @@ uint64_t CompositorOverlayGeneration();
 void CompositorOverlayCursor(struct ::BrookDesktopOverlayCursor& out,uint64_t knownSerial);
 DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner=0);
 int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& bands);
+// Shell surface records of the same capture lease (overlay op 10).
+int CompositorOverlaySurfaces(uint32_t token,uint64_t owner,BrookDesktopOverlaySurfaces& surfaces);
 bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner=0);
 // Destination must be kernel memory. Copies under the lease lock; callers
 // must copy to userspace only after this returns and releases that lock.
@@ -147,7 +152,11 @@ struct CompositorIdleStats {
     uint64_t cpuOverlayDraws;     // CPU-path taskbar/launcher draws
     uint64_t cpuOverlaySkips;     // skipped: a renderer holds the present lease
     uint64_t overlayRenders;      // renderer overlay capture renders
-    uint64_t overlayBumps;        // of which changed the overlay generation
+    uint64_t overlayBumps;        // overlay generation changes (keys, rectangles or kinds)
+    uint64_t overlaySurfaceDraws; // shell surfaces rasterised by overlay captures
+    uint64_t overlaySurfaceKeeps; // unchanged surfaces a capture kept (no raster)
+    uint64_t overlayKeyChecks;    // key-only change checks (no raster)
+    uint64_t cpuSceneSkips;       // loops that skipped the CPU scene raster under a lease
     uint64_t leaseActiveLoops;    // loops while a renderer held the lease
 };
 CompositorIdleStats CompositorReadIdleStats(bool reset);
@@ -164,6 +173,7 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
                              uint64_t display,uint64_t backdrop,uint64_t owner);
 void CompositorReleasePresentLease(uint64_t owner);
+bool CompositorRefreshClientScanoutLease(uint64_t owner);
 
 // Begin a WM drag operation for a window at the current mouse position.
 // Used by Wayland clients via xdg_toplevel.move when they draw their own chrome.

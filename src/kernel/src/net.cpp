@@ -1,3 +1,5 @@
+#include "core_dump.h"
+#include "core_autodump.h"
 #include "desktop_layers_export.h"
 #include "intel_bdw_worker_overhead.h"
 #include "native_tsc_observe.h"
@@ -28,10 +30,12 @@
 #include "cpu_idle.h"
 #include "thermal_runtime.h"
 #include "intel_bdw_scanout_target.h"
+#include "desktop_present_policy.h"
 #if defined(BROOK_GPU_SUBMISSION_TIMING)
 #include "native_tsc_observe.h"
 #endif
 #include "bridge_reply.h"
+#include "procfs.h"
 #include "debug_hardware.h"
 #if defined(BROOK_SSD_AUTO_RECOVERY)
 #include "recovery_debug_policy.h"
@@ -109,6 +113,7 @@ inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage
 #include "frame_timing_reply.h"
 #include "compat_census_runtime.h"
 #include "lastlog.h"
+#include "intel_bdw_hang_diag.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -188,6 +193,7 @@ struct NetStackCounters {
     uint64_t sendNoNeighbor;           // NetSendIpv4 returned -2
     uint64_t rxThreadOverflow;         // NetReceive callers beyond the tracking table
     uint64_t udpRxFull;                // datagrams dropped: receive buffer full
+    uint64_t udpRxCorrupt;             // UDP rx rings reset: inconsistent datagram framing
     uint64_t synQueueFull, synNoSocket, synRecvEvicted;
 };
 static NetStackCounters g_netCounters;
@@ -394,7 +400,7 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
 // Preserve any newer pending ACK and its earlier timer.
 static uint64_t g_tcpAckSubmissionFailures=0;
 struct TcpReceiveDiagnostics {
-    uint64_t oooArrivals,oooStored,oooOverlap,oooCapacity,oooOversize,oooFull,clippedSegments;
+    uint64_t oooArrivals,oooStored,oooOverlap,oooCapacity,clippedSegments;
 };
 static TcpReceiveDiagnostics g_tcpReceiveDiagnostics{};
 static void TcpRequeueFailedAck(Socket& s)
@@ -2181,11 +2187,13 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
         socket.identity = {g_socketInodes.allocate(), uid, gid};
         socket.ownerPid = pid;
         socket.rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
-        if (socket.rxBuf && type == SOCK_STREAM)
-            socket.tcpOooBuf = static_cast<uint8_t*>(kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
-        if (!socket.identity.inode || !socket.rxBuf || (type == SOCK_STREAM && !socket.tcpOooBuf)) {
+        if (socket.rxBuf && type == SOCK_STREAM) {
+            socket.tcpOooMap = static_cast<uint64_t*>(kmalloc(Socket::TCP_OOO_WORDS * sizeof(uint64_t)));
+            if(socket.tcpOooMap)memset(socket.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+        }
+        if (!socket.identity.inode || !socket.rxBuf || (type == SOCK_STREAM && !socket.tcpOooMap)) {
             if (socket.rxBuf) kfree(socket.rxBuf);
-            if (socket.tcpOooBuf) kfree(socket.tcpOooBuf);
+            if (socket.tcpOooMap) kfree(socket.tcpOooMap);
             flags = IrqSpinLockAcquire(&g_socketRegistryLock);
             ResetSocketPayload(socket);
             g_sockReserved[i] = false;
@@ -2299,6 +2307,12 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
     return NetSendUdpFrom(s.localIp, dstIp, ntohs(s.localPort), dstPort, buf, len);
 }
 
+// Copy n bytes out of a socket rx ring starting at tail (wraps once at most).
+static void SockRingRead(const uint8_t* ring,uint32_t tail,void* out,uint32_t n){
+    const uint32_t first=n<Socket::RX_BUF_SIZE-tail?n:Socket::RX_BUF_SIZE-tail;
+    if(out){memcpy(out,ring+tail,first);if(n>first)memcpy(static_cast<uint8_t*>(out)+first,ring,n-first);}
+}
+
 int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
                  SockAddrIn* src)
 {
@@ -2312,41 +2326,47 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     // packets, but don't spin. Caller uses non-blocking semantics (returns
     // -EAGAIN below); the prior 100k-iteration pause-spin was burning ~6ms
     // per empty call and caused per-frame stalls (Q2 loopback polling).
-    if (s.rxCount == 0 && g_netIf && g_netIf->poll) {
+    // Outside s.lock: delivery takes it.
+    if (__atomic_load_n(&s.rxCount, __ATOMIC_ACQUIRE) == 0 && g_netIf && g_netIf->poll) {
         g_netIf->poll(g_netIf);
     }
 
-    if (s.rxCount == 0) return -11; // EAGAIN
+    // The ring is shared with the delivery path, which appends under s.lock;
+    // dequeue under the same lock. Without it (gen 441, YouTube over QUIC)
+    // the two rxCount updates raced, a lost update made the reader parse
+    // payload bytes as a datagram length, and the byte-wise skip loop ran for
+    // seconds in ring 0 on CPU 0, starving the GPU submission worker.
+    SpinLockAcquire(&s.lock);
+    const uint32_t count = s.rxCount;
+    if (count == 0) { SpinLockRelease(&s.lock); return -11; } // EAGAIN
 
-    // Read datagram length prefix (4 bytes) then data
-    uint32_t dgLen = 0;
-    for (int i = 0; i < 4; i++) {
-        dgLen |= static_cast<uint32_t>(s.rxBuf[s.rxTail]) << (i * 8);
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
+    // Datagram layout: [len:4][srcIp:4][srcPort:2][data:len].
+    uint8_t header[10];
+    if (count < sizeof(header)) {
+        s.rxHead = s.rxTail = 0; s.rxCount = 0;
+        SpinLockRelease(&s.lock);
+        NetCount(g_netCounters.udpRxCorrupt);
+        return -11;
     }
-
-    // Read source IP (4 bytes) and port (2 bytes)
-    uint32_t srcIp = 0;
-    for (int i = 0; i < 4; i++) {
-        srcIp |= static_cast<uint32_t>(s.rxBuf[s.rxTail]) << (i * 8);
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
+    SockRingRead(s.rxBuf, s.rxTail, header, sizeof(header));
+    const uint32_t dgLen = uint32_t(header[0]) | uint32_t(header[1]) << 8 |
+                           uint32_t(header[2]) << 16 | uint32_t(header[3]) << 24;
+    if (dgLen > 65535 || dgLen > count - sizeof(header)) {
+        // Never trust an inconsistent length: drop the whole ring.
+        s.rxHead = s.rxTail = 0; s.rxCount = 0;
+        SpinLockRelease(&s.lock);
+        NetCount(g_netCounters.udpRxCorrupt);
+        return -11;
     }
-    uint16_t srcPort = 0;
-    srcPort = s.rxBuf[s.rxTail]; s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-    srcPort |= static_cast<uint16_t>(s.rxBuf[s.rxTail]) << 8;
-    s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-
-    uint32_t copyLen = dgLen < len ? dgLen : len;
-    for (uint32_t i = 0; i < copyLen; i++) {
-        static_cast<uint8_t*>(buf)[i] = s.rxBuf[s.rxTail];
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-    }
-    // Skip remainder if dgLen > len
-    for (uint32_t i = copyLen; i < dgLen; i++)
-        s.rxTail = (s.rxTail + 1) % Socket::RX_BUF_SIZE;
-
-    __asm__ volatile("mfence" ::: "memory");
-    s.rxCount -= (10 + dgLen); // 4 len + 4 ip + 2 port + data
+    const uint32_t srcIp = uint32_t(header[4]) | uint32_t(header[5]) << 8 |
+                           uint32_t(header[6]) << 16 | uint32_t(header[7]) << 24;
+    const uint16_t srcPort = static_cast<uint16_t>(header[8] | header[9] << 8);
+    const uint32_t dataTail = (s.rxTail + sizeof(header)) % Socket::RX_BUF_SIZE;
+    const uint32_t copyLen = dgLen < len ? dgLen : len;
+    SockRingRead(s.rxBuf, dataTail, buf, copyLen);
+    s.rxTail = (dataTail + dgLen) % Socket::RX_BUF_SIZE; // skips any truncated remainder
+    s.rxCount = count - (sizeof(header) + dgLen);
+    SpinLockRelease(&s.lock);
 
     if (src) {
         src->sin_family = AF_INET;
@@ -2456,7 +2476,7 @@ static void SockFinalize(int sockIdx)
     SpinLockAcquire(&s.lock);
     SetSocketWaiterLocked(s, nullptr);
     SpinLockRelease(&s.lock);
-    if (s.tcpOooBuf) kfree(s.tcpOooBuf);
+    if (s.tcpOooMap) kfree(s.tcpOooMap);
     if (s.rxBuf) kfree(s.rxBuf);
     ResetSocketPayload(s);
     flags = IrqSpinLockAcquire(&g_socketRegistryLock);
@@ -2819,154 +2839,124 @@ static bool TcpSeqAfter(uint32_t a, uint32_t b)
 
 static uint32_t TcpReceiveFree(const Socket& s)
 {
-    uint32_t used = s.rxCount + s.tcpOooBytes;
-    return used >= Socket::RX_BUF_SIZE ? 0 : Socket::RX_BUF_SIZE - used;
+    // The window is a sequence span, not a count of unallocated bytes.
+    // Future bytes already occupy positions within that span. Subtracting
+    // them again moves its right edge backwards after every reordered packet.
+    return s.rxCount<Socket::RX_BUF_SIZE ? Socket::RX_BUF_SIZE-s.rxCount : 0;
 }
 
-static void TcpReapOoo(Socket& s, uint64_t now)
+static void TcpReapOoo(Socket& s,uint64_t now)
 {
     static constexpr uint64_t TCP_OOO_REAP_MS = 30000;
-    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-        auto& slot = s.tcpOooSlots[i];
-        if (!slot.used || !TcpTimerElapsed(now, slot.tick, TCP_OOO_REAP_MS))
-            continue;
+    if(!s.tcpOooBytes || !TcpTimerElapsed(now,s.tcpOooSince,TCP_OOO_REAP_MS))return;
+    memset(s.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+    s.tcpOooBytes=0;
+}
 
-        if (s.tcpOooBytes >= slot.len)
-            s.tcpOooBytes -= slot.len;
-        else
-            s.tcpOooBytes = 0;
-        slot.used = false;
-        slot.len = 0;
+static uint64_t TcpOooMask(uint32_t count)
+{
+    return count==64 ? ~uint64_t{0} : (uint64_t{1}<<count)-1;
+}
+
+// The start and length are always within the same receive window. Traverse
+// ring words rather than packet descriptors, including across ring wrap.
+template<class Apply> static void TcpVisitOooWords(uint32_t position,uint32_t length,Apply&& apply)
+{
+    uint32_t consumed=0;
+    while(consumed<length){
+        const uint32_t bit=position%64;
+        uint32_t count=64-bit;
+        if(count>length-consumed)count=length-consumed;
+        apply(position,bit,count,consumed);
+        position=(position+count)%Socket::RX_BUF_SIZE;
+        consumed+=count;
     }
 }
 
-static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
-                        uint32_t len, uint64_t now)
+static void TcpClearOoo(Socket& s,uint32_t position,uint32_t length)
 {
-    if (!s.tcpOooBuf || !data || len == 0)
-        return false;
+    if(!s.tcpOooBytes)return;
+    TcpVisitOooWords(position,length,[&](uint32_t byte,uint32_t bit,uint32_t count,uint32_t){
+        const uint64_t mask=TcpOooMask(count)<<bit;
+        auto& word=s.tcpOooMap[byte/64];
+        // Clang lowers 64-bit popcount to a runtime helper on builds
+        // without POPCNT, so count full words and scan only partial words.
+        uint64_t occupied=word&mask;
+        if(occupied==mask)s.tcpOooBytes-=count;
+        else while(occupied){occupied&=occupied-1;--s.tcpOooBytes;}
+        word&=~mask;
+    });
+}
 
-    uint32_t end = seq + len;
-    if (!TcpSeqAfter(end, s.tcpRcvNxt))
-        return false;
-
-    if (TcpSeqBefore(seq, s.tcpRcvNxt)) {
-        uint32_t trim = s.tcpRcvNxt - seq;
-        data += trim;
-        len -= trim;
-        seq = s.tcpRcvNxt;
-        end = seq + len;
-    }
-    if (len == 0)
-        return false;
-    if (len > Socket::TCP_OOO_SLOT_SIZE) {
-        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOversize,1,__ATOMIC_RELAXED);
-        s.oooDropCount++;
-        if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-            SerialPrintf("tcp: OOO TOOLARGE pid=%u seq=%u len=%u drop=%u\n",
-                         s.ownerPid, seq, len, s.oooDropCount);
-        return false;
-    }
-
-    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-        const auto& slot = s.tcpOooSlots[i];
-        if (!slot.used)
-            continue;
-        uint32_t slotEnd = slot.seq + slot.len;
-        bool disjoint = !TcpSeqBefore(seq, slotEnd) || !TcpSeqBefore(slot.seq, end);
-        if (!disjoint) {
-            __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOverlap,1,__ATOMIC_RELAXED);
-            s.oooDropCount++;
-            if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-                SerialPrintf("tcp: OOO OVERLAP pid=%u seq=%u len=%u slotSeq=%u slotLen=%u drop=%u\n",
-                             s.ownerPid, seq, len, slot.seq, slot.len, s.oooDropCount);
-            return false;
-        }
-    }
-
-    if (len > TcpReceiveFree(s)) {
+static bool TcpStoreOoo(Socket& s,uint32_t seq,const uint8_t* data,uint32_t len,uint64_t now)
+{
+    if(!s.tcpOooMap || !data || !len)return false;
+    const uint32_t distance=seq-s.tcpRcvNxt;
+    const uint32_t window=TcpReceiveFree(s);
+    if(distance>=window){
         __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
-        s.oooDropCount++;
-        if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-            SerialPrintf("tcp: OOO CAPACITY pid=%u seq=%u len=%u free=%u drop=%u bytes=%u\n",
-                         s.ownerPid, seq, len, TcpReceiveFree(s),
-                         s.oooDropCount, s.tcpOooBytes);
+        ++s.oooDropCount;
         return false;
     }
-
-    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-        auto& slot = s.tcpOooSlots[i];
-        if (slot.used)
-            continue;
-
-        memcpy(s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE, data, len);
-        slot.seq = seq;
-        slot.len = static_cast<uint16_t>(len);
-        slot.tick = now;
-        slot.used = true;
-        s.tcpOooBytes += len;
-        s.oooHeldCount++;
-        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooStored,1,__ATOMIC_RELAXED);
-        if (s.oooHeldCount <= 5 || (s.oooHeldCount % 50) == 0) {
-            int32_t gap = static_cast<int32_t>(seq - s.tcpRcvNxt);
-            SerialPrintf("tcp: OOO HELD pid=%u seq=%u rcvNxt=%u gap=%d len=%u held=%u bytes=%u\n",
-                         s.ownerPid, seq, s.tcpRcvNxt, gap, len,
-                         s.oooHeldCount, s.tcpOooBytes);
-        }
-        return true;
+    if(len>window-distance){
+        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
+        len=window-distance;
     }
-
-    __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooFull,1,__ATOMIC_RELAXED);
-    s.oooDropCount++;
-    if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-        SerialPrintf("tcp: OOO FULL pid=%u seq=%u rcvNxt=%u len=%u drop=%u bytes=%u\n",
-                     s.ownerPid, seq, s.tcpRcvNxt, len, s.oooDropCount, s.tcpOooBytes);
-    return false;
+    uint32_t added=0;
+    TcpVisitOooWords((s.rxHead+distance)%Socket::RX_BUF_SIZE,len,
+        [&](uint32_t position,uint32_t bit,uint32_t count,uint32_t consumed){
+            const uint64_t mask=TcpOooMask(count)<<bit;
+            auto& word=s.tcpOooMap[position/64];
+            const uint64_t occupied=word&mask;
+            if(!occupied){
+                memcpy(s.rxBuf+position,data+consumed,count);
+                added+=count;
+            }else if(occupied!=mask){
+                uint64_t missing=(mask&~occupied)>>bit;
+                while(missing){
+                    const unsigned index=__builtin_ctzll(missing);
+                    s.rxBuf[position+index]=data[consumed+index];
+                    missing&=missing-1;
+                    ++added;
+                }
+            }
+            word|=mask;
+        });
+    if(added<len)__atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOverlap,1,__ATOMIC_RELAXED);
+    if(!added)return false;
+    if(!s.tcpOooBytes)s.tcpOooSince=now;
+    s.tcpOooBytes+=added;
+    ++s.oooHeldCount;
+    __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooStored,1,__ATOMIC_RELAXED);
+    return true;
 }
 
 static bool TcpDrainOoo(Socket& s)
 {
-    bool drained = false;
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-            auto& slot = s.tcpOooSlots[i];
-            if (!slot.used)
-                continue;
-
-            uint32_t end = slot.seq + slot.len;
-            // A retransmission may already have supplied the entire slot.
-            // Release its accounting immediately instead of retaining it
-            // until the OOO reap timeout.
-            if (!TcpSeqAfter(end, s.tcpRcvNxt)) {
-                s.tcpOooBytes = s.tcpOooBytes >= slot.len ? s.tcpOooBytes - slot.len : 0;
-                slot.used = false;
-                slot.len = 0;
-                continue;
-            }
-            if (TcpSeqAfter(slot.seq, s.tcpRcvNxt))
-                continue;
-
-            uint32_t offset = s.tcpRcvNxt - slot.seq;
-            uint32_t len = slot.len - offset;
-            const uint8_t* data = s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE + offset;
-            if (s.tcpOooBytes >= slot.len)
-                s.tcpOooBytes -= slot.len;
-            else
-                s.tcpOooBytes = 0;
-            slot.used = false;
-            slot.len = 0;
-
-            TcpEnqueueData(s, data, len);
-            s.tcpRcvNxt += len;
-            s.oooDrainCount++;
-            drained = true;
-            progress = true;
-            break;
-        }
+    // FIN consumes sequence space without moving the ring write index.
+    // Discard any pre-FIN speculative data beyond that end of stream.
+    if(s.tcpFinRecv || s.tcpRstRecv){
+        if(s.tcpOooBytes)memset(s.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+        s.tcpOooBytes=0;
+        return false;
     }
-    return drained;
+    uint32_t drained=0;
+    while(s.tcpOooBytes){
+        const unsigned bit=s.rxHead%64;
+        auto& word=s.tcpOooMap[s.rxHead/64];
+        const uint64_t pending=word>>bit;
+        if(!(pending&1))break;
+        const uint64_t missing=(~pending)&TcpOooMask(64-bit);
+        const unsigned count=missing ? __builtin_ctzll(missing) : 64-bit;
+        word&=~(TcpOooMask(count)<<bit);
+        s.rxHead=(s.rxHead+count)%Socket::RX_BUF_SIZE;
+        s.tcpOooBytes-=count;
+        drained+=count;
+    }
+    s.rxCount+=drained;
+    s.tcpRcvNxt+=drained;
+    if(drained)++s.oooDrainCount;
+    return drained!=0;
 }
 
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
@@ -3051,12 +3041,13 @@ static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
     uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
     if (len > avail) len = avail;
 
-    const uint8_t* d = static_cast<const uint8_t*>(data);
-    for (uint32_t i = 0; i < len; i++) {
-        s.rxBuf[s.rxHead] = d[i];
-        s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
-    }
-    __asm__ volatile("mfence" ::: "memory");
+    TcpClearOoo(s,s.rxHead,len);
+    const auto* bytes=static_cast<const uint8_t*>(data);
+    const uint32_t tail=Socket::RX_BUF_SIZE-s.rxHead;
+    const uint32_t first=len<tail?len:tail;
+    memcpy(s.rxBuf+s.rxHead,bytes,first);
+    if(len>first)memcpy(s.rxBuf,bytes+first,len-first);
+    s.rxHead=(s.rxHead+len)%Socket::RX_BUF_SIZE;
     s.rxCount += len;
     // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
@@ -5382,7 +5373,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             field("resolve_blocking",c.resolveBlocking);field("resolve_blocking_failed",c.resolveBlockingFailed);
             field("resolve_nonblocking",c.resolveNonBlocking);field("resolve_queued",c.resolveQueued);
             field("send_no_neighbor",c.sendNoNeighbor);field("rx_thread_overflow",c.rxThreadOverflow);
-            field("udp_rx_full",c.udpRxFull);field("syn_queue_full",c.synQueueFull);
+            field("udp_rx_full",c.udpRxFull);field("udp_rx_corrupt",c.udpRxCorrupt);field("syn_queue_full",c.synQueueFull);
             field("syn_no_socket",c.synNoSocket);field("syn_recv_evicted",c.synRecvEvicted);
             uint32_t rxThreads = 0;
             for (auto* p : g_netRxThreads) rxThreads += __atomic_load_n(&p, __ATOMIC_RELAXED) != nullptr;
@@ -5419,8 +5410,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("ooo_stored",__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_overlap",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_capacity",__atomic_load_n(&g_tcpReceiveDiagnostics.oooCapacity,__ATOMIC_RELAXED));
-        r.text(",");r.field("ooo_oversize",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOversize,__ATOMIC_RELAXED));
-        r.text(",");r.field("ooo_full",__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED));
+        // Legacy fixed-slot diagnostics. The bitmap has no slot length
+        // or slot count limit. Out-of-window data is ooo_capacity.
+        r.text(",");r.field("ooo_oversize",0);
+        r.text(",");r.field("ooo_full",0);
         r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));r.text("}");
         r.text("}\n");r.send();return;
     }
@@ -5558,6 +5551,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  cpu idle mwait on|off | cpu idle state hlt|c1|c1e|c3|c6|auto | cpu idle status|reset - idle C-state (default auto = menu governor; hlt = old C1 behaviour)\n"
             "  cpu epb <0-15>|default|status - IA32_ENERGY_PERF_BIAS on every CPU (boot: firmware 0/15 -> 6)\n"
             "  gpu worker overhead [reset] - gpu-submit worker fixed per-job cost breakdown\n"
+            "  gpu hang [status|last|ring [n]|reference arm|reference|marker on|off] - RCS hang breadcrumbs and pre-reset capture\n"
             "  gpu audit batch on|off|status - batched MTRR/PAT observation in GPU critical-section audits (default on)\n"
             "  gpu ppgtt cache on|off|status - reuse exact-match PPGTT table sets across GPU jobs (default off)\n"
             "  gpu clock <MHz>|status - render clock request (default 500, clamped to fused RPn..RP0; 90 C fallback)\n"
@@ -5609,6 +5603,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  (levels: error warn info debug trace)\n"
             "\n"
             "Profiler:\n"
+            "  proc dump PID /path [--full] - write a live ELF core\n"
+            "  proc autodump on|off|status - control managed crash dumps\n"
             "  prof start [ms]  - start profiler (ms=0 or omitted: indefinite)\n"
             "  prof stop        - stop profiler + flush\n"
             "  prof status      - profiler status\n"
@@ -5669,8 +5665,59 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
 
     // -----------------------------------------------------------------------
-    // procs — process list
+    // Process dump controls and process list
     // -----------------------------------------------------------------------
+    else if(NetStrEq(cmd,"proc autodump on") || NetStrEq(cmd,"proc autodump off") ||
+            NetStrEq(cmd,"proc autodump status")){
+        if(NetStrEq(cmd,"proc autodump on"))CoreAutoSetMode(CoreAutoMode::AllUsers);
+        if(NetStrEq(cmd,"proc autodump off"))CoreAutoSetMode(CoreAutoMode::Off);
+        const auto s=CoreAutoReadStats();
+        BridgeReply reply;
+        reply.text("{\"policy\":");
+        reply.quoted(s.mode==CoreAutoMode::Off?"off":s.mode==CoreAutoMode::AllUsers?"all_users":"uid_1000");
+        reply.text(",\"worker\":");reply.text(s.worker?"true":"false");
+        reply.text(",");reply.field("queued",s.queued);
+        reply.text(",");reply.field("completed",s.completed);
+        reply.text(",");reply.field("failed",s.failed);
+        reply.text(",");reply.field("timed_out",s.timedOut);
+        reply.text(",");reply.field("busy",s.busy);
+        reply.text(",");reply.field("rate_limited",s.rateLimited);
+        reply.text(",");reply.field("active_ms",s.activeMs);
+        reply.text("}\n");reply.send();
+    }
+    else if(StrStartsWith(cmd,"proc dump ")){
+        const char* argument=cmd+sizeof("proc dump ")-1;
+        uint32_t pid=0;
+        while(*argument>='0' && *argument<='9' && pid<=65535)pid=pid*10+uint32_t(*argument++-'0');
+        if(!pid || pid>65535 || *argument!=' '){
+            DebugChannelSend("{\"error\":\"usage: proc dump PID /absolute/path [--full]\"}\n");return;
+        }
+        while(*argument==' ')++argument;
+        char path[1024];
+        uint32_t length=0;
+        while(*argument && *argument!=' ' && length+1<sizeof(path))path[length++]=*argument++;
+        path[length]=0;
+        while(*argument==' ')++argument;
+        const bool full=NetStrEq(argument,"--full");
+        if(path[0]!='/' || path[1]==0 || (*argument && !full)){
+            DebugChannelSend("{\"error\":\"usage: proc dump PID /absolute/path [--full]\"}\n");return;
+        }
+        CoreDumpResult dump{};
+        const int result=CoreDumpProcess(uint16_t(pid),path,full,dump);
+        BridgeReply reply;
+        if(result){
+            reply.text("{\"error\":\"core dump failed\",");reply.field("errno",uint64_t(-result));
+            reply.text(",\"stage\":");reply.quoted(dump.stage);
+        }else{
+            reply.text("{");reply.field("threads",dump.threads);
+            reply.text(",");reply.field("missing_registers",dump.missingRegisters);
+            reply.text(",");reply.field("mappings",dump.mappings);
+            reply.text(",");reply.field("bytes",dump.bytes);
+            reply.text(",");reply.field("holes",dump.holes);
+            reply.text(",\"exe\":");reply.quoted(dump.executable);
+        }
+        reply.text(",");reply.field("duration_ms",dump.durationMs);reply.text("}\n");reply.send();
+    }
     else if (NetStrEq(cmd, "procs")) {
         extern uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
@@ -5704,6 +5751,66 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const char* done = "---\n";
         DebugReplySend( done, 4);
         kfree(snaps);
+    }
+
+    // -----------------------------------------------------------------------
+    // proc blocked <pid> — per-thread syscall and wait site of a thread group
+    // -----------------------------------------------------------------------
+    else if (StrStartsWith(cmd, "proc blocked ")) {
+        uint32_t pid = 0;
+        const char* arg = cmd + 13;
+        while (*arg == ' ') ++arg;
+        if (ParseUint(arg, &pid) <= 0 || !pid || pid > 65535) {
+            DebugChannelSend("{\"error\":\"usage: proc blocked <pid>\"}\n"); return;
+        }
+        auto* snap = static_cast<ProcessSnapshot*>(kmalloc(sizeof(ProcessSnapshot)));
+        auto* wait = static_cast<ProcWaitDescription*>(kmalloc(sizeof(ProcWaitDescription)));
+        if (!snap || !wait) {
+            if (snap) kfree(snap); if (wait) kfree(wait);
+            DebugChannelSend("{\"error\":\"out_of_memory\"}\n"); return;
+        }
+        if (!SchedulerSnapshotProcess(static_cast<uint16_t>(pid), snap)) {
+            kfree(snap); kfree(wait);
+            DebugChannelSend("{\"error\":\"no_such_process\"}\n"); return;
+        }
+        const uint16_t tgid = snap->tgid;
+        const uint64_t group = snap->groupIncarnation;
+        BridgeReply r;
+        r.text("{");r.field("pid",pid);r.text(",");r.field("tgid",tgid);
+        r.text(",");r.field("now_ms",ApicTickCount());r.text(",\"threads\":[");
+        const char* states[] = {"ready","running","blocked","stopped","terminated"};
+        uint32_t minTid = 0, count = 0;
+        while (count < 512 && SchedulerSnapshotTask(tgid, group, 0, minTid, snap)) {
+            minTid = uint32_t{snap->pid} + 1;
+            ProcDescribeWait(*snap, wait);
+            if (count++) r.text(",");
+            r.text("{");r.field("tid",snap->pid);r.text(",\"name\":");r.quoted(snap->name);
+            const uint32_t st = static_cast<uint32_t>(snap->state);
+            r.text(",\"state\":\"");r.text(st < 5 ? states[st] : "unknown");r.text("\"");
+            r.text(",\"cpu\":");
+            if (snap->runningOnCpu < 0) r.text("-1"); else r.number(static_cast<uint32_t>(snap->runningOnCpu));
+            r.text(",\"wait\":\"");r.text(wait->kind);r.text("\"");
+            if (snap->state == ProcessState::Blocked || snap->state == ProcessState::Stopped) {
+                if (!snap->kernelThread) {
+                    r.text(",");r.field("syscall",snap->syscallNr);r.text(",\"args\":[");
+                    for (int i = 0; i < 3; ++i) { if (i) r.text(","); r.text("\"0x"); r.number(snap->syscallArgs[i], true); r.text("\""); }
+                    r.text("]");
+                }
+                r.text(",");r.field("blocked_ms",wait->blockedForMs);
+                if (snap->wakeupTick) { r.text(",");r.field("wakeup_tick",snap->wakeupTick); }
+                if (wait->fd >= 0) {
+                    r.text(",");r.field("fd",static_cast<uint32_t>(wait->fd));
+                    r.text(",\"fd_type\":");
+                    if (wait->fdType < 0) r.text("-1"); else r.number(static_cast<uint32_t>(wait->fdType));
+                }
+                r.text(",\"sites\":[");
+                for (uint32_t i = 0; i < wait->siteCount; ++i) { if (i) r.text(","); r.quoted(wait->sites[i]); }
+                r.text("]");
+            }
+            r.text("}");
+        }
+        r.text("]}\n");r.send();
+        kfree(snap); kfree(wait);
     }
 
     // -----------------------------------------------------------------------
@@ -6311,7 +6418,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("max_temp_c",st.maxTempC<0?0:uint64_t(st.maxTempC));
             r.text(",");r.field("limit_c",uint64_t(st.limitC));
             r.text(",\"tripped\":");r.text(st.tripped?"true":"false");
-            r.text(",");r.field("trips",st.trips);
+            r.text(",");r.field("trips",st.trips);r.text(",");r.field("recoveries",st.recoveries);
             r.text(",");r.field("thermal_samples",st.samples);
             r.text(",\"rapl_available\":");r.text(now.valid?"true":"false");
             if(now.valid && prev.valid && now.tsc>prev.tsc){
@@ -6324,7 +6431,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
                 }
             }
             if(now.valid)prev=now;
-            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; trip latches 500 until the next gpu clock command; pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
+            r.text(",\"scope\":\"requested=gpu clock setting; effective=bin the next render job requests (clamped to fused RPn..RP0 from caps 0x145998; 500 until caps are seen; 500 while tripped); actual clock = mhz in gpu worker stats (RPSTAT1 CAGF at issue/breadcrumb); temp=package DTS (MSR 0x1b1/0x1a2), sampled by the worker at most every 50 ms; a trip falls back to 500 and recovers after 5 s at or below limit-15 C (or at the next gpu clock command); pkg/gt power = RAPL energy delta since the previous status call (MSR 0x611/0x641)\"}\n");
             r.send();
         }
 #else
@@ -6645,6 +6752,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",\"scope\":\"on (default) = one MTRR/PAT/CR0 observation window per critical-section audit; off = the previous per-page observation; results are identical by construction\"}\n");r.send();
     }
     else if(LastLogHandleCommand(cmd)) {}
+    else if(BdwHangHandleCommand(cmd)) {}
     else if(NetStrEq(cmd,"compat census reset")) {
         CompatCensusReset();
         DebugChannelSend("{\"reset\":true,\"scope\":\"compat census tables cleared; concurrent hits may be lost\"}\n");
@@ -6712,6 +6820,30 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"diagnostic kernel required\"}\n");
 #endif
+    }
+    else if(NetStrEq(cmd,"desktop present") || StrStartsWith(cmd,"desktop present ")) {
+        // App-driven present cadence and direct scanout (docs/app-driven-present.md).
+        // RAM only; the renderer reads the policy with BROOK_DESKTOP_FOCUS_QUERY
+        // every frame, so a change applies at its next frame.
+        uint32_t policy=DesktopPresentPolicy();bool ok=true;
+        if(NetStrEq(cmd,"desktop present app on"))policy|=BROOK_DESKTOP_POLICY_APP_CADENCE;
+        else if(NetStrEq(cmd,"desktop present app off"))policy&=~BROOK_DESKTOP_POLICY_APP_CADENCE;
+        else if(NetStrEq(cmd,"desktop present direct off"))policy&=~(BROOK_DESKTOP_POLICY_DIRECT_SHADOW|BROOK_DESKTOP_POLICY_DIRECT_ON);
+        else if(NetStrEq(cmd,"desktop present direct shadow"))
+            policy=(policy&~BROOK_DESKTOP_POLICY_DIRECT_ON)|BROOK_DESKTOP_POLICY_DIRECT_SHADOW;
+        else if(NetStrEq(cmd,"desktop present direct on"))policy|=BROOK_DESKTOP_POLICY_DIRECT_SHADOW|BROOK_DESKTOP_POLICY_DIRECT_ON;
+        else if(StrStartsWith(cmd,"desktop present defer ")){
+            const char* p=cmd+sizeof("desktop present defer ")-1;uint64_t ms=0;bool any=false;
+            while(*p>='0' && *p<='9' && ms<=1000){ms=ms*10+uint64_t(*p++-'0');any=true;}
+            ok=any && !*p && ms<=100;
+            if(ok)DesktopPresentDeferSet(uint32_t(ms*1000));
+        }else if(!NetStrEq(cmd,"desktop present") && !NetStrEq(cmd,"desktop present status"))ok=false;
+        if(!ok){DebugChannelSend("{\"error\":\"usage: desktop present [status]|app on|app off|direct off|direct shadow|direct on|defer <0..100 ms, 0 = renderer default>\"}\n");return;}
+        DesktopPresentPolicySet(policy);
+        BridgeReply r;r.text("{\"ok\":true,\"app_cadence\":");r.text(policy&BROOK_DESKTOP_POLICY_APP_CADENCE?"true":"false");
+        r.text(",\"direct\":");r.quoted(policy&BROOK_DESKTOP_POLICY_DIRECT_ON?"on":policy&BROOK_DESKTOP_POLICY_DIRECT_SHADOW?"shadow":"off");
+        r.text(",");r.field("defer_us",DesktopPresentDeferUs());
+        r.text(",\"counters\":\"/tmp/brook-desktop-stats.json app_present and direct_scanout\"}\n");r.send();
     }
     else if(StrStartsWith(cmd,"gpu zerocopy ")) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -6793,6 +6925,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
 #else
         DebugChannelSend("{\"error\":\"guarded Dell kernel required\"}\n");
 #endif
+    }
+    else if(StrStartsWith(cmd,"gpu cursor ")) {
+        const bool on=NetStrEq(cmd,"gpu cursor on"),off=NetStrEq(cmd,"gpu cursor off");
+        if(!on && !off && !NetStrEq(cmd,"gpu cursor status")){
+            DebugChannelSend("{\"error\":\"expected gpu cursor on|off|status\"}\n");
+        }else{
+            const bool ok=(!on && !off) || BdwCursorRequest(on);
+            const auto cursor=BdwCursorReadStatus();
+            BridgeReply r;
+            r.text("{\"ok\":");r.text(ok?"true":"false");
+            r.text(",\"requested\":");r.text(cursor.requested?"true":"false");
+            r.text(",\"bound\":");r.text(cursor.bound?"true":"false");
+            r.text(",\"active\":");r.text(cursor.active?"true":"false");
+            r.text(",");r.field("images",cursor.images);
+            r.text(",");r.field("positions",cursor.positions);
+            r.text(",");r.field("fallbacks",cursor.fallbacks);
+            r.text("}\n");r.send();
+        }
     }
     else if(StrStartsWith(cmd,"gpu flip ") || StrStartsWith(cmd,"gpu scanout map ")) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
@@ -6879,7 +7029,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("shadow_invalidations",s.shadowInvalidations);r.text(",");r.field("shadow_unavailable",s.shadowUnavailable);
         r.text(",");r.field("cpu_overlay_draws",s.cpuOverlayDraws);r.text(",");r.field("cpu_overlay_skips",s.cpuOverlaySkips);
         r.text(",");r.field("overlay_renders",s.overlayRenders);r.text(",");r.field("overlay_bumps",s.overlayBumps);
-        r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay capture renders and generation bumps\"}\n");r.send();
+        r.text(",");r.field("overlay_surface_draws",s.overlaySurfaceDraws);r.text(",");r.field("overlay_surface_keeps",s.overlaySurfaceKeeps);
+        r.text(",");r.field("overlay_key_checks",s.overlayKeyChecks);r.text(",");r.field("cpu_scene_skips",s.cpuSceneSkips);
+        r.text(",\"scope\":\"cumulative since boot or reset; loops=compositor frames (wakes); software flips copy back buffer rows to the firmware framebuffer, skipping rows equal to the cached shadow; cpu_overlay_* = CPU-path taskbar/popup draws vs skips while a renderer holds the present lease; overlay_* = renderer overlay captures, generation bumps, shell surfaces rasterised vs kept by key, key-only checks; cpu_scene_skips = loops without CPU window/chrome raster under a lease\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"desktop chrome status") || NetStrEq(cmd,"desktop chrome reset")) {
         auto& g=g_chromeCaptureStats;

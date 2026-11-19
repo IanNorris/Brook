@@ -27,6 +27,8 @@
 #include "desktop_async_source_barrier.h"
 #include "desktop_stats.h"
 #include "desktop_pipeline.h"
+#include "desktop_app_present.h"
+#include "desktop_surfaces.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -58,7 +60,14 @@ struct RenderContext {
     uint32_t *batchScenes;struct Source batchBackdrop;int lastPartial,expiryInjected;
     uint64_t lastPresentNs;
     struct Source client[BROOK_DESKTOP_LAYER_LIMIT],chrome[BROOK_DESKTOP_LAYER_LIMIT];
-    struct Source chromeSpan[BROOK_DESKTOP_LAYER_LIMIT][4];
+    /* Span-only chrome capture leaves the client interior of chrome[i]
+     * untouched: the interior zeroed last (per buffer allocation), so a
+     * frame that falls back to the whole chrome layer samples transparency. */
+    struct DesktopTrackHole chromeInterior[BROOK_DESKTOP_LAYER_LIMIT];uint64_t chromeInteriorSerial[BROOK_DESKTOP_LAYER_LIMIT];
+    /* The 64x64 window shadow nine-slice (desktop_surfaces.h), one copy per
+     * piece of each shadowed window: the compute and graphics paths reject
+     * layers that share a buffer, and a shadow must not vanish on them. */
+    struct Source shadow[DESKTOP_SHADOW_WINDOWS][DESKTOP_SHADOW_PIECES];uint64_t shadowSerial[DESKTOP_SHADOW_WINDOWS][DESKTOP_SHADOW_PIECES];
     struct DesktopChromeHeld chromeHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct DesktopClientHeld clientHeld[BROOK_DESKTOP_LAYER_LIMIT];
     struct Source background,overlay[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
@@ -67,6 +76,10 @@ struct RenderContext {
     struct BrookDesktopOverlayBands overlayBands;
     /* Per band, from kernel op 9: opaque bits and content keys (0 = unknown). */
     uint32_t overlayOpaque;uint64_t overlayKeys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
+    /* Overlay op 10: the shell surface records of that capture (layers ABI
+     * v2). Shell surfaces carry no shadow yet (stage 2.6), so they are kept
+     * and counted only; count 0 from an older kernel. */
+    struct BrookDesktopOverlaySurfaces overlaySurfaces;
     struct Source cursor;uint64_t cursorSerial;
     struct BackdropIdentity backdropIdentity;
     struct DesktopDamageState damage;
@@ -82,7 +95,7 @@ struct PendingDesktopFrame {
     /* Regions handed to the kernel when they differ from the frame's own
      * damage (zero-copy: everything drawn into the image). */
     struct BrookGpuPresentRegions kernelRegions;int hasKernelRegions;
-    uint64_t presentCallNs,drawPixels;int drawPartial;
+    uint64_t presentCallNs,drawPixels,cursorEpoch;int drawPartial;
     /* Pipelined: an older in-flight frame failed, so this frame's success
      * must not re-establish the change-tracking baseline. */
     int tainted;
@@ -133,6 +146,19 @@ static int g_quadMode=1,g_quadOcclusion=1,g_chromeHoles=1,g_trackDamage=1;
 static const char *g_carrySlack;
 /* Keep unchanged window chrome (kernel keyed capture); BROOK_RENDER_CHROME_KEEP=0 disables. */
 static int g_chromeKeep=1;
+/* Stage 1.3/1.4: surface records (layers op 16), window shadows from them,
+ * span-only chrome (op 17, the frame strips sampled in place) and opaque
+ * frame spans that occlude. BROOK_RENDER_CHROME_SPANS=0 draws whole chrome
+ * layers; BROOK_RENDER_SURFACES=0 ignores records (no shadows, no opaque). */
+static int g_surfaceRecords=1,g_chromeSpans=1,g_chromeSpanCapture=1;
+static struct DesktopSurfaceSet g_frameSurfaces;
+/* In-place spans make several layers sample one chrome buffer, which only
+ * the quad pass accepts (the compute and graphics paths reject aliased
+ * sources). They are used only for frames the quad pass is meant to draw;
+ * if it rejects one anyway, the frame is retried with whole chrome layers
+ * (the same pixels) for a second. */
+static uint64_t g_sharedLayersHoldNs;static unsigned long long g_sharedLayerFallbacks;
+static struct {unsigned long long queries,shadows,shadowLayers,shadowSkips,spanCaptures,spanLayers,opaqueSpans,interiorClears;} g_surfaceStats;
 static struct {unsigned long long keeps,keepMisses,captures,bytesCopied;} g_chromeStats;
 /* Keep unchanged CPU client windows (kernel CAPTURE_TRACKED_KEEP);
  * BROOK_RENDER_CLIENT_KEEP=0 disables. g_clientKeepAccepted: the kernel
@@ -274,12 +300,98 @@ static int scanout_pick(void){
     }
     errno=EAGAIN;return -1;
 }
+/* ---- App-driven present cadence and direct scanout ----------------------
+ * (desktop_app_present.h, docs/app-driven-present.md.) The mode is the
+ * kernel policy, set by the "desktop present ..." debug command and read
+ * with BROOK_DESKTOP_FOCUS_QUERY every frame, unless pinned with
+ * BROOK_RENDER_APP_PRESENT=0|1 or BROOK_RENDER_DIRECT_SCANOUT=off|shadow|on.
+ * The boot default is cadence on, direct scanout shadow (counters only). */
+static uint64_t monotonic_ns(void);
+enum { DIRECT_MODE_OFF=0, DIRECT_MODE_SHADOW=1, DIRECT_MODE_ON=2 };
+static const char *const g_directModeNames[3]={"off","shadow","on"};
+static int g_appPinned=-1,g_directPinned=-1,g_focusSupported=1;
+static struct DesktopAppCadence g_appCadence;
+/* Set by render_frame when it defers non-app damage: the idle wait ends then. */
+static uint64_t g_appWakeNs;
+static struct {int app,direct;uint64_t deferNs;uint32_t dominant;
+    uint64_t dominance[DESKTOP_APP_REASONS],actions[DESKTOP_APP_ACTIONS],earlyNotifies,overlayCaptureSkips,pointerOnly,pointerOnlyDriven;} g_app;
+static struct {uint64_t evaluated,eligible,frames,enters,exits,reasons[DESKTOP_DIRECT_REASONS];int last,wasEligible;} g_direct;
+static void app_present_env(void){
+    const char *app=getenv("BROOK_RENDER_APP_PRESENT"),*direct=getenv("BROOK_RENDER_DIRECT_SCANOUT");
+    if(app && *app)g_appPinned=app[0]!='0';
+    if(direct && *direct)g_directPinned=!strcmp(direct,"on")?DIRECT_MODE_ON:!strcmp(direct,"shadow")?DIRECT_MODE_SHADOW:DIRECT_MODE_OFF;
+}
+/* Focused window and policy for this frame. Without the query (older
+ * kernel) the cadence stays the desktop's own and nothing is evaluated. */
+static void focus_query(struct DesktopFocusInfo *out){
+    *out=(struct DesktopFocusInfo){0};
+    g_app.app=g_appPinned>0;g_app.direct=g_directPinned>0?g_directPinned:DIRECT_MODE_OFF;g_app.deferNs=DESKTOP_APP_DEFER_NS;
+    if(!g_focusSupported)return;
+    struct BrookDesktopFocus f;memset(&f,0,sizeof(f));
+    /* A version 1 kernel takes only the 32-byte request (no pointer). */
+    static size_t size=sizeof(struct BrookDesktopFocus);
+    long r=syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_FOCUS_QUERY,&f,size,0,0,0);
+    if(r && errno==EINVAL && size!=BROOK_DESKTOP_FOCUS_V1_SIZE){
+        size=BROOK_DESKTOP_FOCUS_V1_SIZE;memset(&f,0,sizeof(f));
+        r=syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_FOCUS_QUERY,&f,size,0,0,0);
+    }
+    if(r){
+        if(errno==EINVAL || errno==ENOSYS){g_focusSupported=0;fprintf(stderr,"DESKTOP_APP_PRESENT_UNAVAILABLE errno=%d (no focus query)\n",errno);}
+        return;
+    }
+    if(f.version!=BROOK_DESKTOP_FOCUS_VERSION && f.version!=BROOK_DESKTOP_FOCUS_VERSION_POINTER)return;
+    if(g_appPinned<0)g_app.app=(f.policy&BROOK_DESKTOP_POLICY_APP_CADENCE)!=0;
+    if(g_directPinned<0)g_app.direct=(f.policy&BROOK_DESKTOP_POLICY_DIRECT_ON)?DIRECT_MODE_ON:
+        (f.policy&BROOK_DESKTOP_POLICY_DIRECT_SHADOW)?DIRECT_MODE_SHADOW:DIRECT_MODE_OFF;
+    if(f.deferUs)g_app.deferNs=(uint64_t)f.deferUs*1000ull;
+    *out=(struct DesktopFocusInfo){1,f.window,f.state,f.incarnation,f.shell,f.version==BROOK_DESKTOP_FOCUS_VERSION_POINTER,f.pointerX,f.pointerY};
+}
+/* End of an idle wait: the next poll, or sooner when deferred damage is due. */
+static uint64_t idle_until(void){
+    const uint64_t now=monotonic_ns(),poll=now+g_idlePollNs,wake=g_appWakeNs;g_appWakeNs=0;
+    return wake && wake<poll?(wake>now?wake:now+1):poll;
+}
+/* Direct scanout eligibility of a frame about to present. Shadow mode asks
+ * whether it would scan out given a capable kernel; "on" uses the real
+ * capability, which no kernel reports yet, so every frame composites and
+ * the fallback is counted. */
+static void direct_scanout_evaluate(int dominant,const struct BrookDesktopLayers *layers,const struct DesktopTrackState *track,
+                                    const struct DesktopGpuOffer *offer,int sampled,const struct DesktopOverlayFrameState *overlay,
+                                    int ringActive,uint32_t width,uint32_t height){
+    if(g_app.direct==DIRECT_MODE_OFF)return;
+    struct DesktopDirectScene s={.dominant=dominant,.layers=layers->layers,.count=layers->count,.ringActive=ringActive,
+        .kernelCapable=g_app.direct==DIRECT_MODE_SHADOW};
+    if(dominant>=0 && (unsigned)dominant<layers->count){
+        const struct BrookDesktopLayer *l=&layers->layers[dominant];
+        s.chromeVisible=track->windows[dominant].hasChrome!=0;s.gpuSource=offer && sampled;
+        s.offerLayers=offer?desktop_gpu_offer_layer_count(offer):0;
+        if(offer && offer->layers){const struct BrookGpuWindowLayer *g=&offer->layer[0];
+            s.buffer=(struct DesktopDirectBuffer){g->width,g->height,g->stride,g->offset,g->fourcc,g->flags,g->words,
+                g->srcX,g->srcY,g->srcWidth,g->srcHeight,g->dstWidth,g->dstHeight};
+            if(g->dstX || g->dstY)s.buffer.dstWidth=0; /* offset in the window: not the output 1:1 */}
+        else if(offer){const struct BrookGpuWindowPacket *p=&offer->packet;
+            s.buffer=(struct DesktopDirectBuffer){p->width,p->height,p->stride,p->offset,p->fourcc,0,p->words,
+                0,0,p->width,p->height,l->clientWidth,l->clientHeight};}
+    }
+    for(uint32_t i=0;i<overlay->bands.count && i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i){const struct BrookDesktopOverlayBand *b=&overlay->bands.bands[i];
+        if(b->width && b->height && b->x<(int64_t)width && b->y<(int64_t)height && (int64_t)b->x+b->width>0 && (int64_t)b->y+b->height>0)++s.overlayBands;}
+    {const struct DesktopOverlayCursorState *c=&overlay->cursor;
+     s.cursorVisible=c->visible && c->width && c->height && c->x<(int64_t)width && c->y<(int64_t)height &&
+         (int64_t)c->x+c->width>0 && (int64_t)c->y+c->height>0;}
+    const enum DesktopDirectReason reason=desktop_direct_eligible(&s,width,height);
+    ++g_direct.evaluated;++g_direct.reasons[reason];g_direct.last=(int)reason;
+    const int ok=reason==DESKTOP_DIRECT_OK;
+    if(ok)++g_direct.eligible;
+    if(ok && !g_direct.wasEligible)++g_direct.enters;
+    if(!ok && g_direct.wasEligible)++g_direct.exits;
+    g_direct.wasEligible=ok;
+}
 static void context_init(struct RenderContext *ctx){
     memset(ctx,0,sizeof(*ctx));ctx->output=-1;ctx->batchOutput=-1;ctx->background.fd=-1;ctx->batchBackdrop.fd=-1;ctx->cursor.fd=-1;
     ctx->scanoutImage=-1;
+    for(unsigned w=0;w<DESKTOP_SHADOW_WINDOWS;++w)for(unsigned k=0;k<DESKTOP_SHADOW_PIECES;++k)ctx->shadow[w][k].fd=-1;
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)ctx->overlay[i].fd=-1;
-    for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){ctx->client[i].fd=-1;ctx->chrome[i].fd=-1;
-        for(unsigned j=0;j<4;++j)ctx->chromeSpan[i][j].fd=-1;}
+    for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){ctx->client[i].fd=-1;ctx->chrome[i].fd=-1;}
 }
 
 static void context_close(int drm,struct RenderContext *ctx){
@@ -301,9 +413,9 @@ static void context_close(int drm,struct RenderContext *ctx){
     if(!ctx->scanoutCount && ctx->output>=0)close(ctx->output); /* ring images are process-wide */
     for(unsigned i=0;i<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++i)source_close(drm,&ctx->overlay[i]);
     source_close(drm,&ctx->cursor);
+    for(unsigned w=0;w<DESKTOP_SHADOW_WINDOWS;++w)for(unsigned k=0;k<DESKTOP_SHADOW_PIECES;++k)source_close(drm,&ctx->shadow[w][k]);
     source_close(drm,&ctx->background);
-    for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){source_close(drm,&ctx->chrome[i]);source_close(drm,&ctx->client[i]);
-        for(unsigned j=0;j<4;++j)source_close(drm,&ctx->chromeSpan[i][j]);}
+    for(unsigned i=0;i<BROOK_DESKTOP_LAYER_LIMIT;++i){source_close(drm,&ctx->chrome[i]);source_close(drm,&ctx->client[i]);}
     context_init(ctx);
 }
 static int context_prepare(int drm,struct RenderContext *ctx,uint32_t width,uint32_t height,size_t words){
@@ -386,8 +498,10 @@ static uint64_t monotonic_ns(void);
  * generation. Waits in the kernel for completion where supported. */
 /* bands/opaque/keys: in, the held capture whose pixels are in output (an
  * unchanged band is not reread); out, the new capture. */
+static int g_overlayRecords=1;static unsigned long long g_overlayRecordCaptures;
 static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t height,
-                           struct BrookDesktopOverlayBands *bands,uint32_t *opaque,uint64_t *keys,uint64_t *generation){
+                           struct BrookDesktopOverlayBands *bands,uint32_t *opaque,uint64_t *keys,uint64_t *generation,
+                           struct BrookDesktopOverlaySurfaces *records){
     const struct BrookDesktopOverlayBands held=*bands;uint64_t heldKeys[BROOK_DESKTOP_OVERLAY_MAX_BANDS];
     memcpy(heldKeys,keys,sizeof(heldKeys));memset(keys,0,sizeof(heldKeys));*opaque=0;
     uint64_t start=monotonic_ns(),ready=0,pollEnd=0;unsigned polls=0;*generation=0;
@@ -436,6 +550,13 @@ static int capture_overlay(int drm,struct Source *output,uint32_t width,uint32_t
         if(desktop_overlay_copy_band(token,i,output[i].map,width,height,b))goto done;
     }
     *opaque=newOpaque;memcpy(keys,newKeys,sizeof(newKeys));
+    memset(records,0,sizeof(*records));
+    if(g_overlayRecords){
+        struct BrookDesktopOverlaySurfaces reply;memset(&reply,0,sizeof(reply));
+        if(!syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_SURFACES,token,&reply,sizeof(reply),0,0)){
+            if(reply.count<=BROOK_DESKTOP_OVERLAY_MAX_SURFACES){*records=reply;++g_overlayRecordCaptures;}
+        }else if(errno==EINVAL)g_overlayRecords=0;
+    }
     if(blocking && g_overlayTracked==1)*generation=overlayInfo.generation;
     result=0;
 done: (void)syscall(BROOK_SYS_DESKTOP_OVERLAY,3,token,0,0,0,0);
@@ -474,16 +595,40 @@ static int overlay_adopt(int drm,struct RenderContext *ctx,uint64_t generation,u
         }
         ctx->overlayBands=*bands;ctx->overlayGeneration=generation;ctx->overlayWidth=width;ctx->overlayHeight=height;
         ctx->overlayOpaque=peer->overlayOpaque;memcpy(ctx->overlayKeys,peer->overlayKeys,sizeof(ctx->overlayKeys));
+        ctx->overlaySurfaces=peer->overlaySurfaces;
         ++g_stats.pipeline.overlayAdopted;return 1;
     }
     return 0;
 }
+/* App-driven cadence: a changed overlay is recaptured at most every
+ * DESKTOP_APP_OVERLAY_CAPTURE_NS (desktop_app_overlay_capture_due). Until
+ * then the frame uses the newest complete capture of this output size that
+ * any context holds (copied in when a peer's is newer, so pipelined
+ * contexts never alternate between two captures). 1: reuse, 0: capture. */
+static uint64_t g_lastOverlayCaptureNs;
+static int overlay_capture_deferred(int drm,struct RenderContext *ctx,uint32_t width,uint32_t height){
+    const struct RenderContext *best=ctx->overlayGeneration && ctx->overlayWidth==width && ctx->overlayHeight==height?ctx:NULL;
+    for(unsigned k=0;k<g_contextCount;++k){const struct RenderContext *peer=&g_contexts[k];
+        if(peer==ctx || !peer->overlayGeneration || peer->overlayWidth!=width || peer->overlayHeight!=height)continue;
+        if(!best || peer->overlayGeneration>best->overlayGeneration)best=peer;}
+    if(!desktop_app_overlay_capture_due(g_app.app && g_app.dominant,best!=NULL,g_lastOverlayCaptureNs,monotonic_ns(),
+                                        DESKTOP_APP_OVERLAY_CAPTURE_NS)){
+        if(best!=ctx && !overlay_adopt(drm,ctx,best->overlayGeneration,width,height))return 0;
+        ++g_app.overlayCaptureSkips;return 1;
+    }
+    return 0;
+}
 /* Pointer layer state; refreshes the context's 64x64 image on a new serial. */
-static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state){
+static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverlayCursorState *state,uint64_t *epoch){
+    *epoch=0;
     *state=(struct DesktopOverlayCursorState){0};
     if(g_overlayTracked!=1)return 0;
     const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
-    if(syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0))return -1;
+    long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V2);
+    if(result<0 && errno==EINVAL)
+        result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0);
+    if(result<0)return -1;
+    *epoch=(uint64_t)result;
     const struct BrookDesktopOverlayCursor *c=&g_cursorInfo;
     if(!c->visible || !c->width || !c->height || c->width>BROOK_DESKTOP_CURSOR_MAX ||
        c->height>BROOK_DESKTOP_CURSOR_MAX || c->stride!=BROOK_DESKTOP_CURSOR_MAX)return 0;
@@ -493,6 +638,9 @@ static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverla
     }
     *state=(struct DesktopOverlayCursorState){1,c->width,c->height,c->x,c->y,c->serial};
     return 0;
+}
+static void cursor_presented(uint64_t epoch){
+    if(epoch)(void)syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED,0,0,0,epoch,0);
 }
 static int push(uint32_t *scene,unsigned *count,struct BrookVkExternalSource *sources,
                 const struct Source *source,const struct BrookVkSceneLayer *layer){
@@ -584,11 +732,22 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     uint64_t traceReceived=0,traceIncarnation=0,traceCommit=0,traceSubmitStart=0;uint32_t traceWindow=0;
     uint32_t scene[SCENE_HEADER]={0};long ticket=-1;int result=-1,attemptPartial=0,savedErrno=0,presentFailed=0;unsigned frameDirect=0;const char *stage="query";
     uint64_t statsSubmitStart=0;
+    struct DesktopGpuOffer *layerOffer[BROOK_DESKTOP_LAYER_LIMIT]={0};
+    g_appWakeNs=0;
     if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_LAYERS_QUERY,&layers,sizeof(layers),0,0,0) ||
        layers.count>BROOK_DESKTOP_LAYER_LIMIT ||
        syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_BACKDROP_QUERY,&backdrop,sizeof(backdrop),0,0,0))goto done;
     uint32_t width=backdrop.layers[0].width,height=backdrop.layers[0].height;
     if(!width || !height || width>4096 || height>2160 || (uint64_t)width*height*4>BROOK_GPU_OUTPUT_MAX_BYTES)goto done;
+    /* Surface records (layers ABI v2): EINVAL from an older kernel turns
+     * them off for good; any other failure leaves this frame without. */
+    g_frameSurfaces.count=0;
+    if(g_surfaceRecords){
+        static struct BrookDesktopSurfaces reply;memset(&reply,0,sizeof(reply));reply.version=BROOK_DESKTOP_SURFACES_VERSION;
+        if(!syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_SURFACES_QUERY,&reply,sizeof(reply),0,0,0)){
+            desktop_surface_set_from(&g_frameSurfaces,&reply);++g_surfaceStats.queries;}
+        else if(errno==EINVAL)g_surfaceRecords=0;
+    }
     const size_t words=SCENE_HEADER;
     if(context_prepare(drm,ctx,width,height,words))goto done;
     if(traceEnabled)traceQuery=monotonic_ns();
@@ -597,6 +756,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Output rectangles a scene layer leaves unchanged (chrome interiors). */
     struct QuadRect holes[BROOK_VK_MAX_LAYERS];memset(holes,0,sizeof(holes));
     scene[0]=width;scene[1]=height;
+    const int sharedOk=pending && ctx->quad && !getenv("BROOK_RENDER_TEST_BLOCKED_FENCE") && monotonic_ns()>=g_sharedLayersHoldNs;
+    int sharedUsed=0;unsigned shadowWindows=0;
     for(unsigned i=0;i<layers.count;++i){
         if(getenv("BROOK_RENDER_SELECTIVE_CAPTURE")){
             struct BrookVkSceneLayer candidate;
@@ -666,8 +827,29 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(!desktop_content_layer(l,width,height,&content))goto done;
         desktop_damage_add(&footprint,(struct DesktopDamageRect){
             content.x,content.y,(int64_t)content.x+content.width,(int64_t)content.y+content.height},width,height);
+        /* The record's shadow, beneath the window (top ChromeShadowWindowLimit
+         * windows, as virgl, and only when the layer budget allows). */
+        const struct BrookDesktopSurface *surface=desktop_surface_find(&g_frameSurfaces,l->window,l->incarnation);
+        struct DesktopDamageRect shadowBounds={0,0,0,0};int shadowShown=0;
+        if(desktop_surface_has_shadow(surface)){
+            struct BrookVkSceneLayer pieces[DESKTOP_SHADOW_PIECES];
+            const unsigned n=shadowWindows<DESKTOP_SHADOW_WINDOWS && i+DESKTOP_SHADOW_WINDOWS>=layers.count?
+                desktop_surface_shadow_layers(surface,width,height,pieces):0;
+            /* Headroom of 4 for layered GPU offers beyond the 2-per-window reserve. */
+            if(n && count+n+2*(layers.count-i)+4+BROOK_DESKTOP_OVERLAY_MAX_BANDS+1<=BROOK_VK_MAX_LAYERS){
+                for(unsigned k=0;k<n;++k){struct Source *piece=&ctx->shadow[shadowWindows][k];
+                    if(source_ensure(drm,BROOK_CHROME_SHADOW_SIZE*BROOK_CHROME_SHADOW_SIZE*4,piece))goto done;
+                    if(ctx->shadowSerial[shadowWindows][k]!=piece->serial){desktop_shadow_source(piece->map);ctx->shadowSerial[shadowWindows][k]=piece->serial;}
+                    if(push(scene,&count,sources,piece,&pieces[k]))goto done;}
+                ++shadowWindows;
+                (void)desktop_surface_shadow_bounds(surface,&shadowBounds);shadowShown=1;
+                desktop_damage_add(&footprint,shadowBounds,width,height);
+                ++g_surfaceStats.shadows;g_surfaceStats.shadowLayers+=n;
+            }else if(n)++g_surfaceStats.shadowSkips;
+        }
         struct DesktopGpuOffer *direct=desktop_gpu_channel_select(&g_gpuChannel,l,width,height,&content,frame);
         if(direct)desktop_note_client_frame(l->window,l->incarnation,direct->packet.identity.commit);
+        layerOffer[i]=direct;
         if(direct && getenv("BROOK_RENDER_SOURCE_GEOMETRY")){
             static unsigned samples;
             if(samples++<16)fprintf(stderr,"DESKTOP_SOURCE_GEOMETRY window=%u incarnation=%llu commit=%llu source=%ux%u destination=%ux%u fourcc=%08x offset_words=%u stride_words=%u size_words=%llu\n",
@@ -704,6 +886,9 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         struct DesktopTrackWindow *trackWindow=&track->windows[i];
         *trackWindow=(struct DesktopTrackWindow){.window=l->window,.incarnation=l->incarnation,.direct=direct!=NULL,
             .commit=direct?direct->packet.identity.commit:0};
+        if(shadowShown){trackWindow->shadowAlpha=surface->shadowAlpha;trackWindow->shadowX=(int32_t)shadowBounds.left;
+            trackWindow->shadowY=(int32_t)shadowBounds.top;trackWindow->shadowWidth=(uint32_t)(shadowBounds.right-shadowBounds.left);
+            trackWindow->shadowHeight=(uint32_t)(shadowBounds.bottom-shadowBounds.top);}
         memcpy(trackWindow->layer,&content,sizeof(content));
         if(trackOk && !direct){
             struct DesktopClientHeld *held=&ctx->clientHeld[i];
@@ -740,13 +925,32 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
                 c->pixels=(uintptr_t)chrome[i].map;c->capacity=chrome[i].size;
             }
             decor.reserved=0;
-            long keyedOp=g_chromeKeep?BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED:BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
-            if(syscall(BROOK_SYS_DESKTOP_LAYERS,keyedOp,&decor,sizeof(decor),0,0,0)){
+            /* Span-only capture writes only the frame strips; zero the client
+             * interior of this buffer once per allocation and geometry, so
+             * a whole-layer fallback never samples stale pixels. */
+            const int spanCapture=g_chromeKeep && g_chromeSpanCapture && c->bytes;
+            if(spanCapture){const struct DesktopTrackHole interior=desktop_track_chrome_hole(l,c);
+                struct DesktopTrackHole *zeroed=&ctx->chromeInterior[i];
+                if(ctx->chromeInteriorSerial[i]!=chrome[i].serial || memcmp(zeroed,&interior,sizeof(interior))){
+                    for(uint32_t row=0;row<interior.height;++row)
+                        memset((uint32_t*)chrome[i].map+(uint64_t)(interior.y+row)*c->width+interior.x,0,(size_t)interior.width*4);
+                    *zeroed=interior;ctx->chromeInteriorSerial[i]=chrome[i].serial;++g_surfaceStats.interiorClears;}}
+            long keyedOp=spanCapture?BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS:
+                g_chromeKeep?BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED:BROOK_DESKTOP_CHROME_TRACKED_CAPTURE;
+            const struct BrookDesktopLayers decorRequest=decor;
+            long captured=syscall(BROOK_SYS_DESKTOP_LAYERS,keyedOp,&decor,sizeof(decor),0,0,0);
+            if(captured && keyedOp==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS && errno==EINVAL){
+                /* Older kernel: no span capture. Keyed full capture for good. */
+                g_chromeSpanCapture=0;decor=decorRequest;keyedOp=BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED;
+                captured=syscall(BROOK_SYS_DESKTOP_LAYERS,keyedOp,&decor,sizeof(decor),0,0,0);
+            }
+            if(captured){
                 /* Older kernel: no keyed chrome. Fall back for good. */
                 if(keyedOp!=BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || errno!=EINVAL)goto done;
                 g_chromeKeep=0;decor.reserved=0;
                 if(syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_CHROME_TRACKED_CAPTURE,&decor,sizeof(decor),0,0,0))goto done;
             }
+            if(keyedOp==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS && c->bytes)++g_surfaceStats.spanCaptures;
             if(c->bytes){++g_chromeStats.captures;g_chromeStats.bytesCopied+=c->bytes;}
             if(g_chromeKeep && c->bytes)desktop_chrome_hold(held,&decor,chrome[i].serial);
         }
@@ -760,21 +964,26 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             struct BrookVkSceneLayer layer={0,c->stride,c->width,c->height,0,0,c->width,c->height,
                 c->clientX,c->clientY,c->width,c->height,0,0,width,height,opacity|BROOK_VK_STRAIGHT_ALPHA};
             struct DesktopChromeSpan spans[4];
-            unsigned n=getenv("BROOK_RENDER_CHROME_SPANS")?desktop_chrome_spans(l,c,spans):0;
-            /* Reserve the worst case for later clients/chrome and overlays;
+            unsigned n=g_chromeSpans && sharedOk?desktop_chrome_spans(l,c,spans):0;
+            /* The frame strips, sampled in place from the chrome surface (no
+             * copy); an opaque frame's strips replace what lies beneath.
+             * Reserve the worst case for later clients/chrome and overlays;
              * otherwise retain the existing full-chrome path. */
             if(n && count+n+2*(layers.count-i-1)+BROOK_DESKTOP_OVERLAY_MAX_BANDS+1<=BROOK_VK_MAX_LAYERS){
+                const uint32_t flags=desktop_surface_frame_opaque(surface,opacity)?BROOK_VK_OPAQUE_SOURCE:0u;
                 for(unsigned j=0;j<n;++j){const struct DesktopChromeSpan *s=&spans[j];
-                    const uint64_t bytes=(uint64_t)s->width*s->height*4;
-                    struct Source *part=&ctx->chromeSpan[i][j];if(source_ensure(drm,bytes,part))goto done;
-                    if(!desktop_chrome_copy_span(chrome[i].map,c->stride,c->width,c->height,s,part->map,part->size/4))goto done;
-                    struct BrookVkSceneLayer span={0,s->width,s->width,s->height,0,0,s->width,s->height,
+                    struct BrookVkSceneLayer span={0,c->stride,c->width,c->height,s->x,s->y,s->width,s->height,
                         (int32_t)((int64_t)c->clientX+s->x),(int32_t)((int64_t)c->clientY+s->y),s->width,s->height,
-                        0,0,width,height,opacity|BROOK_VK_STRAIGHT_ALPHA};
-                    if(push(scene,&count,sources,part,&span))goto done;
-                    chromeBytes+=part->size;
+                        0,0,width,height,opacity|BROOK_VK_STRAIGHT_ALPHA|flags};
+                    if(push(scene,&count,sources,&chrome[i],&span))goto done;
+                    ++g_surfaceStats.spanLayers;if(flags)++g_surfaceStats.opaqueSpans;
                 }
+                sharedUsed=1;
+                chromeBytes+=chrome[i].size;
             }else{
+                /* A whole caption block in the opaque material replaces the client's title area beneath it. */
+                if(surface && surface->kind==BROOK_DESKTOP_SURFACE_CAPTION_BLOCK && desktop_surface_frame_opaque(surface,opacity)){
+                    layer.opacity|=BROOK_VK_OPAQUE_SOURCE;++g_surfaceStats.opaqueSpans;}
                 if(g_chromeHoles && hole.width && hole.height && count<BROOK_VK_MAX_LAYERS)holes[count]=(struct QuadRect){
                     (int32_t)((int64_t)c->clientX+hole.x),(int32_t)((int64_t)c->clientY+hole.y),
                     (int32_t)((int64_t)c->clientX+hole.x+hole.width),(int32_t)((int64_t)c->clientY+hole.y+hole.height)};
@@ -791,16 +1000,19 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Recapture only when the kernel's overlay content generation changed. */
     const uint64_t overlayGeneration=overlay_generation();
     if(!desktop_overlay_cache_valid(ctx->overlayGeneration,ctx->overlayWidth,ctx->overlayHeight,overlayGeneration,width,height) &&
-       !overlay_adopt(drm,ctx,overlayGeneration,width,height)){
-        uint64_t captured=0;ctx->overlayGeneration=0;
-        if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&ctx->overlayOpaque,ctx->overlayKeys,&captured))goto done;
+       !overlay_adopt(drm,ctx,overlayGeneration,width,height) &&
+       !overlay_capture_deferred(drm,ctx,width,height)){
+        uint64_t captured=0;ctx->overlayGeneration=0;g_lastOverlayCaptureNs=monotonic_ns();
+        if(capture_overlay(drm,overlay,width,height,&ctx->overlayBands,&ctx->overlayOpaque,ctx->overlayKeys,&captured,
+                           &ctx->overlaySurfaces))goto done;
         ctx->overlayGeneration=captured;ctx->overlayWidth=width;ctx->overlayHeight=height;
     }
     const struct BrookDesktopOverlayBands bands=ctx->overlayBands;
     struct DesktopOverlayFrameState frameOverlay={1,width,height,ctx->overlayGeneration,bands,{0},ctx->overlayOpaque,{0}};
     memcpy(frameOverlay.keys,ctx->overlayKeys,sizeof(frameOverlay.keys));
     stage="overlay_cursor";
-    if(overlay_cursor(drm,ctx,&frameOverlay.cursor))goto done;
+    uint64_t cursorEpoch=0;
+    if(overlay_cursor(drm,ctx,&frameOverlay.cursor,&cursorEpoch))goto done;
     timing[3]=monotonic_ns();
     for(uint32_t i=0;i<bands.count;++i){const struct BrookDesktopOverlayBand *b=&bands.bands[i];
         struct BrookVkSceneLayer layer={0,b->width,b->width,b->height,0,0,b->width,b->height,
@@ -821,7 +1033,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Change-based damage against the displayed frame, when that frame is
      * known and no other frame can present first; pipelined, against the
      * latest submitted frame (its in-flight regions are carried below). */
-    int tracked=0;
+    int tracked=0,pointerOnly=0;
     const int baselineOk=ctx->damage.display==identity.display && ctx->damage.backdrop==identity.generation &&
         ctx->damage.width==width && ctx->damage.height==height;
     if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
@@ -831,6 +1043,10 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             const uint32_t sceneChanges=changes.count;
             desktop_overlay_damage(overlayBase,&frameOverlay,&changes);
             damage=changes;tracked=1;
+            /* Pointer-only: no scene change, the same overlay capture, and
+             * only the pointer moved or changed (stats "pointer_only"). */
+            pointerOnly=!sceneChanges && changes.count && overlayBase->generation==frameOverlay.generation &&
+                !desktop_overlay_cursor_equal(&overlayBase->cursor,&frameOverlay.cursor);
             /* The kernel overlay carries the compositor cadence graph, which
              * changes with every present: a frame whose only change is the
              * overlay would cause the next one forever. Present such frames
@@ -847,6 +1063,39 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     /* Nothing new relative to an in-flight frame: it will present on its
      * own and keeps the lease, so stay idle. */
     if(tracked && !damage.count && pipe && pipe->carry){++g_stats.idleSkips;result=2;stage="idle";goto done;}
+    /* App-driven cadence: while a focused window covers most of the output,
+     * damage it did not cause (pointer, overlay, other windows, popups)
+     * waits for its next commit, at most the deferral (desktop_app_present.h). */
+    struct DesktopFocusInfo focus;focus_query(&focus);
+    enum DesktopAppReason appReason=DESKTOP_APP_NO_FOCUS_INFO;
+    const int dominant=desktop_app_dominant(layers.layers,layers.count,&focus,width,height,DESKTOP_APP_THRESHOLD_PERCENT,&appReason);
+    g_app.dominant=dominant>=0?layers.layers[dominant].window:0;
+    if(!damage.count)desktop_app_cadence_idle(&g_appCadence);
+    else {
+        ++g_app.dominance[appReason];
+        if(g_app.app && tracked){
+            struct DesktopAppFrame af={.dominant=dominant>=0,.window=g_app.dominant,.now=monotonic_ns(),.deferNs=g_app.deferNs};
+            if(dominant>=0){const struct BrookDesktopLayer *dl=&layers.layers[dominant];
+                af.incarnation=dl->incarnation;af.appChanged=desktop_app_window_changed(trackBase,&track->windows[dominant]);
+                /* A shell popup open, or any overlay band over the window
+                 * (launcher, tooltip, toast, boot summary): it must animate
+                 * at the display rate, not the app's. */
+                struct DesktopDamageRect client;(void)desktop_app_client_area(dl,width,height,&client);
+                af.shellOpen=focus.shell!=0;
+                for(uint32_t b=0;!af.shellOpen && b<bands.count && b<BROOK_DESKTOP_OVERLAY_MAX_BANDS;++b){const struct BrookDesktopOverlayBand *ob=&bands.bands[b];
+                    af.shellOpen=ob->width && ob->height && ob->x<client.right && client.left<(int64_t)ob->x+ob->width &&
+                        ob->y<client.bottom && client.top<(int64_t)ob->y+ob->height;}
+                af.windowAbove=desktop_app_window_above(layers.layers,layers.count,dominant,width,height);
+                /* Without the pointer position (version 1 kernel) assume it is
+                 * outside: never defer on a guess. */
+                af.pointerOutside=!focus.hasPointer || !desktop_app_point_inside(dl,width,height,focus.pointerX,focus.pointerY);
+            }
+            uint64_t wake=0;
+            const enum DesktopAppAction action=desktop_app_cadence(&g_appCadence,&af,&wake);
+            ++g_app.actions[action];
+            if(action==DESKTOP_APP_DEFER){g_appWakeNs=wake;result=2;stage="idle";goto done;}
+        }
+    }
     if(tracked && !damage.count){
         const uint64_t now=monotonic_ns();
         if(!g_neverIdle && g_lastPresentNs && now>=g_lastPresentNs && now-g_lastPresentNs<DESKTOP_KEEPALIVE_NS){
@@ -988,6 +1237,8 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         }else ++g_quadFallback;
         if(!quadUsed)for(unsigned i=0;i<layers.count;++i)frameSources[i].omitted=0;
     }
+    if(!quadUsed && sharedUsed){
+        g_sharedLayersHoldNs=monotonic_ns()+1000000000ull;++g_sharedLayerFallbacks;stage="shared_fallback";goto done;}
     if(!quadUsed){
         /* Only the quad pass samples tiled sources. Retire such offers to the
          * provider's detiled CPU source and redraw next frame. */
@@ -1154,12 +1405,19 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
             .nextReport=now && now<=UINT64_MAX-30000000000ull?now+30000000000ull:0,
             .skippedBytes=skippedBytes,.width=width,.height=height,.visible=layers.count,.skippedLayers=skipped,.direct=frameDirect,
             .partial=attemptPartial,.graphics=graphicsUsed,.quad=quadUsed,.regions=regionBatch,.ringImage=ringImage+1,
-            .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,
+            .kernelRegions=kernelRegions,.hasKernelRegions=hasKernelRegions,.cursorEpoch=cursorEpoch,
             .drawPixels=quadUsed?plan_draw_pixels(ctx->plan):0,.drawPartial=ringImage>=0?ringDrawPartial:attemptPartial,
             .statsLayers=traceLayers,.statsDraws=statsDraws,.statsShaded=statsShaded,.statsDamage=statsDamage,
             .damage={identity.display,identity.generation,width,height,footprint},.overlay=frameOverlay,
             .carryExcess=attemptPartial && desktop_pipeline_carry_excess(ownPixels,regionPixels,desktop_pipeline_carry_slack(g_carrySlack,width,height))};
         memcpy(pending->sources,frameSources,sizeof(frameSources));
+        /* The dominant app's frame is on its way: release its frame
+         * callbacks now rather than after the OS present. */
+        if(g_app.app && dominant>=0 && frameSources[dominant].commit &&
+           desktop_gpu_channel_notify_early(&g_gpuChannel,frame,layers.layers[dominant].window))++g_app.earlyNotifies;
+        if(pointerOnly){++g_app.pointerOnly;if(dominant>=0)++g_app.pointerOnlyDriven;}
+        direct_scanout_evaluate(dominant,&layers,track,dominant>=0?layerOffer[dominant]:NULL,dominant>=0 && frameSources[dominant].commit,
+            &frameOverlay,ctx->scanoutCount && g_scanoutActive,width,height);
         return 1;
     }
     if(status==BROOK_VK_UNCERTAIN){
@@ -1216,6 +1474,7 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
         if(hasKernelRegions)kernelRegions.ticket=(uint64_t)ticket;
         if(syscall(BROOK_SYS_GPU_HANDOFF_CTL,BROOK_GPU_HANDOFF_PRESENT_REGIONS,hasKernelRegions?&kernelRegions:&regionBatch,0,0,0,0)){presentFailed=1;goto done;}
     }else if(present_full((uint64_t)ticket,width,height)){presentFailed=1;goto done;}
+    if(ctx->scanoutCount)cursor_presented(cursorEpoch);
     *presentedNs=monotonic_ns();ctx->lastPresentNs=*presentedNs;timing[5]=*presentedNs;ticket=-1;*visible=layers.count;result=0;
     desktop_stats_presented(&g_stats,&(struct DesktopStatsFrame){frameSources,layers.count,frameDirect,attemptPartial,graphicsUsed,
         *presentedNs,timing[0],statsSubmitStart,timing[4],0,0,graphicsUsed?DESKTOP_STATS_PATH_GRAPHICS:DESKTOP_STATS_PATH_COMPUTE,
@@ -1376,6 +1635,7 @@ static int retire_async_frame(struct RenderContext *ctx,struct PendingDesktopFra
     }
     int savedErrno=errno;
     if(!result){
+        if(p->ringImage)cursor_presented(p->cursorEpoch);
         *presented=monotonic_ns();ctx->lastPresentNs=*presented;ctx->lastPartial=p->partial;
         desktop_async_damage_retire(displayedDamage,p->damage,p->partial,1);
         g_lastPresentNs=*presented;
@@ -1459,19 +1719,25 @@ static void stats_publish(uint64_t now){
      * closing brace. */
     if(length){
         size_t end=length;while(end && g_statsJson[end-1]!='}')--end;
-        if(end){char tail[1024];
+        if(end){char tail[2048];
             const int n=snprintf(tail,sizeof(tail),",\"scanout\":{\"images\":%u,\"picks\":%llu,\"waits\":%llu,\"starved\":%llu,"
                 "\"full_draws\":%llu,\"partial_draws\":%llu,\"repair_pixels\":%llu},\"overlay_only_skips\":%llu,\"overlay_bands_kept\":%llu,"
-                "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu},"
+                "\"chrome\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,"
+                "\"spans\":%d,\"span_capture\":%d,\"span_captures\":%llu,\"span_layers\":%llu,\"opaque_spans\":%llu,\"interior_clears\":%llu},"
+                "\"surfaces\":{\"records\":%d,\"queries\":%llu,\"shadows\":%llu,\"shadow_layers\":%llu,\"shadow_skips\":%llu,"
+                "\"overlay_records\":%d,\"overlay_record_captures\":%llu,\"shared_fallbacks\":%llu},"
                 "\"client\":{\"keep\":%d,\"keeps\":%llu,\"keep_misses\":%llu,\"captures\":%llu,\"bytes_copied\":%llu,\"bytes_kept\":%llu,\"band_reuses\":%llu}}\n",g_ring.count,
                 (unsigned long long)g_scanoutPicks,(unsigned long long)g_scanoutWaits,(unsigned long long)g_scanoutStarved,
                 (unsigned long long)g_scanoutFullDraws,(unsigned long long)g_scanoutPartialDraws,(unsigned long long)g_scanoutRepairPixels,
                 (unsigned long long)g_overlayOnlySkips,(unsigned long long)g_overlayBandsKept,g_chromeKeep,g_chromeStats.keeps,g_chromeStats.keepMisses,
-                g_chromeStats.captures,g_chromeStats.bytesCopied,g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
+                g_chromeStats.captures,g_chromeStats.bytesCopied,
+                g_chromeSpans,g_chromeSpanCapture,g_surfaceStats.spanCaptures,g_surfaceStats.spanLayers,g_surfaceStats.opaqueSpans,
+                g_surfaceStats.interiorClears,g_surfaceRecords,g_surfaceStats.queries,g_surfaceStats.shadows,g_surfaceStats.shadowLayers,
+                g_surfaceStats.shadowSkips,g_overlayRecords,g_overlayRecordCaptures,g_sharedLayerFallbacks,g_clientKeep,g_clientStats.keeps,g_clientStats.keepMisses,
                 g_clientStats.captures,g_clientStats.bytesCopied,g_clientStats.bytesKept,g_clientStats.bandReuses);
             if(n>0 && end-1+(size_t)n<sizeof(g_statsJson)){memcpy(g_statsJson+end-1,tail,(size_t)n);length=end-1+(size_t)n;}
             /* "timeline":[[start,submit,fence,present_call,presented (us), image, partial, draw_pixels, commit],...] */
-            char rows[DESKTOP_TIMELINE*120+640];size_t used=0;
+            char rows[DESKTOP_TIMELINE*120+640+2048];size_t used=0;
             used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"timeline\":[");
             const uint64_t first=g_timelineCount>DESKTOP_TIMELINE?g_timelineCount-DESKTOP_TIMELINE:0;
             for(uint64_t k=first;k<g_timelineCount && used<sizeof(rows)-640;++k){const struct DesktopTimelineRow *t=&g_timeline[k%DESKTOP_TIMELINE];
@@ -1483,7 +1749,28 @@ static void stats_publish(uint64_t now){
             for(unsigned r=0;r<DESKTOP_GPU_SELECT_REASONS;++r)
                 used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",desktop_gpu_select_names[r],
                     (unsigned long long)g_desktopGpuSelect[r]);
-            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}\n");
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}");
+            /* "app_present": mode, deferral, the dominant window, per-frame
+             * dominance reasons (frames with damage, deferred re-evaluations
+             * included), cadence actions; "direct_scanout": eligibility of
+             * presented frames, by first blocker. */
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,",\"app_present\":{\"mode\":\"%s\",\"focus_query\":%d,\"defer_us\":%llu,"
+                "\"dominant\":%u,\"early_notifies\":%llu,\"overlay_capture_skips\":%llu,\"pointer_only\":%llu,"
+                "\"pointer_only_driven\":%llu,\"dominance\":{",g_app.app?"on":"off",g_focusSupported,
+                (unsigned long long)(g_app.deferNs/1000ull),g_app.dominant,(unsigned long long)g_app.earlyNotifies,
+                (unsigned long long)g_app.overlayCaptureSkips,(unsigned long long)g_app.pointerOnly,(unsigned long long)g_app.pointerOnlyDriven);
+            for(unsigned r=0;r<DESKTOP_APP_REASONS;++r)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r?",":"",
+                desktop_app_reason_names[r],(unsigned long long)g_app.dominance[r]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"},\"actions\":{");
+            for(unsigned a=0;a<DESKTOP_APP_ACTIONS;++a)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",a?",":"",
+                desktop_app_action_names[a],(unsigned long long)g_app.actions[a]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}},\"direct_scanout\":{\"mode\":\"%s\",\"evaluated\":%llu,\"eligible\":%llu,"
+                "\"frames\":%llu,\"enters\":%llu,\"exits\":%llu,\"last\":\"%s\",\"fallback\":{",g_directModeNames[g_app.direct],
+                (unsigned long long)g_direct.evaluated,(unsigned long long)g_direct.eligible,(unsigned long long)g_direct.frames,
+                (unsigned long long)g_direct.enters,(unsigned long long)g_direct.exits,desktop_direct_reason_names[g_direct.last]);
+            for(unsigned r=1;r<DESKTOP_DIRECT_REASONS;++r)used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"%s\"%s\":%llu",r>1?",":"",
+                desktop_direct_reason_names[r],(unsigned long long)g_direct.reasons[r]);
+            used+=(size_t)snprintf(rows+used,sizeof(rows)-used,"}}}\n");
             /* replace the final "}\n" of the spliced block with the timeline */
             if(length>=2 && g_statsJson[length-2]=='}' && length-2+used<sizeof(g_statsJson)){
                 memcpy(g_statsJson+length-2,rows,used);length=length-2+used;}
@@ -1627,7 +1914,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
                  * even when nothing is in flight, so a present still
                  * retiring in the kernel cannot make this frame full-only. */
                 int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],1,lastPresentedTicket,!before,&base);
-                if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
+                if(result==2){++idlePolls;idleUntil=idle_until();desktop_retry_success(&retry);break;}
                 if(result==1){++active;if(active>maxActive)maxActive=active;desktop_stats_in_flight(&g_stats,active);
                     failureStart=0;desktop_retry_success(&retry);progress=1;break;}
                 const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
@@ -1644,7 +1931,7 @@ static int run_buffered(int drm,unsigned limit,int crash,unsigned depth){
             if(overlapPartial && active && !overlapSafe)break;
             const int partial=getenv("BROOK_RENDER_ASYNC_PARTIAL")!=NULL && (!active || overlapSafe);
             int result=render_frame(drm,&ctx[i],&visible,&presented,&pending[i],partial,overlapSafe?lastPresentedTicket:0,!active,NULL);
-            if(result==2){++idlePolls;idleUntil=monotonic_ns()+g_idlePollNs;desktop_retry_success(&retry);break;}
+            if(result==2){++idlePolls;idleUntil=idle_until();desktop_retry_success(&retry);break;}
             if(result==1){++active;if(active>maxActive)maxActive=active;desktop_stats_in_flight(&g_stats,active);
                 failureStart=0;desktop_retry_success(&retry);progress=1;break;}
             else if(result<0){const int failure=errno;const uint64_t now=monotonic_ns();++retries;if(!failureStart)failureStart=now;
@@ -1755,11 +2042,14 @@ int main(int argc,char **argv){
     g_carrySlack=getenv("BROOK_RENDER_CARRY_SLACK");
     g_chromeHoles=!getenv("BROOK_RENDER_CHROME_FULL");
     {const char *keep=getenv("BROOK_RENDER_CHROME_KEEP");g_chromeKeep=!(keep && keep[0]=='0');}
+    {const char *spans=getenv("BROOK_RENDER_CHROME_SPANS");g_chromeSpans=!(spans && spans[0]=='0');}
+    {const char *records=getenv("BROOK_RENDER_SURFACES");g_surfaceRecords=!(records && records[0]=='0');}
     {const char *keep=getenv("BROOK_RENDER_CLIENT_KEEP");g_clientKeep=!(keep && keep[0]=='0');}
     g_trackDamage=!getenv("BROOK_RENDER_FOOTPRINT_DAMAGE");
     const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");
     if(idlePoll){char *end=NULL;unsigned long ms=strtoul(idlePoll,&end,10);if(end && !*end && ms && ms<=100)g_idlePollNs=ms*1000000ull;}
     g_trackDisplayed=calloc(1,sizeof(*g_trackDisplayed));
+    app_present_env();
     g_neverIdle=limit!=0 && !getenv("BROOK_RENDER_ALLOW_IDLE");
     if(depth){
         struct sigaction stop={0};stop.sa_handler=async_stop_signal;sigemptyset(&stop.sa_mask);

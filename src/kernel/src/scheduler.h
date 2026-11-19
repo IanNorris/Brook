@@ -52,6 +52,12 @@ uint64_t SchedulerContextSwitchGeneration(unsigned cpu);
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();
 
+// Most recent context switch on `cpu`: the process switched away from and
+// how long (TSC ticks) it had held the CPU since the previous switch. Read
+// on the same CPU right after being switched in, it names who ran meanwhile.
+struct SchedulerSwitchInfo { uint64_t sequence = 0, fromRanTsc = 0; uint32_t fromPid = 0; bool fromKernel = false, fromIdle = false; };
+SchedulerSwitchInfo SchedulerLastSwitch(uint32_t cpu);
+
 // True once the BSP has dispatched its first process; blocking or yielding
 // before then must not be attempted by drivers that also run during boot.
 bool SchedulerIsRunning();
@@ -191,6 +197,15 @@ struct ProcessSnapshot {
     uint64_t sysTicks;
     char exePath[256];
     char cwd[256];
+    // Syscall/wait diagnostics (/proc/<pid>/syscall, wchan, `proc blocked`).
+    bool kernelThread;
+    bool blockedOnRwLock;
+    uint64_t syscallNr;
+    uint64_t syscallArgs[6];
+    uint64_t syscallSp, syscallPc;
+    uint64_t blockedSinceMs;
+    uint64_t wakeupTick;
+    uint64_t blockSites[ProcWaitSiteDepth];
 };
 
 // Take a snapshot of all processes.  Fills `out` with up to `maxCount` entries.
@@ -219,6 +234,10 @@ bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out);
 bool SchedulerSnapshotTask(uint16_t tgid, uint64_t groupIncarnation,
                            uint16_t tid, uint32_t minTid, ProcessSnapshot* out);
 uint32_t SchedulerCountTasks(uint16_t tgid, uint64_t groupIncarnation);
+
+// Read-only thread-group snapshots and a retained matching address space.
+AddressSpaceState* SchedulerCoreDumpThreads(uint16_t pid,CoreThreadNote*,uint32_t capacity,
+                                             CoreProcessNote&,CoreDumpResult&);
 
 // Return the PID of the Nth active process (0-indexed). Returns false if out of range.
 bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid);

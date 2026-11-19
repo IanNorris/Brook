@@ -3,6 +3,8 @@
 // Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
+#include "core_autodump.h"
+#include "process_user_namespace.h"
 #include "memory/physical_memory.h"
 #include "tsc_clock.h"
 #include "user_copy.h"
@@ -63,9 +65,39 @@ static rlimit64 ReportedResourceLimit(uint64_t resource)
     return {RLIM_INFINITY, RLIM_INFINITY};
 }
 
+static int64_t CoreResourceLimit(uint64_t pid,uint64_t newlimitAddr,uint64_t oldlimitAddr)
+{
+    if(pid>65535)return -ESRCH;
+    CoreResourceLimits requested{},previous{};
+    if(newlimitAddr && !CopyFromUser(&requested,newlimitAddr,sizeof(requested)))return -EFAULT;
+    auto* caller=ProcessCurrent();
+    if(!caller)return -ESRCH;
+    const bool privileged=ProcessCapable(caller,nullptr,24); // CAP_SYS_RESOURCE in initial namespace
+    const int result=SchedulerCoreResourceLimit(caller,static_cast<uint16_t>(pid),
+                                                newlimitAddr?&requested:nullptr,previous,privileged);
+    if(result)return result;
+    if(oldlimitAddr && !CopyToUser(oldlimitAddr,&previous,sizeof(previous)))return -EFAULT;
+    return 0;
+}
+
+int64_t sys_setrlimit(uint64_t resource,uint64_t newlimitAddr,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    if(resource!=4)return -38;
+    if(!newlimitAddr)return -EFAULT;
+    return CoreResourceLimit(0,newlimitAddr,0);
+}
+
+int64_t sys_brook_core_dump(uint64_t pid,uint64_t flags,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    if(!pid || pid>65535 || flags)return -EINVAL;
+    if(!ProcessCapable(ProcessCurrent(),nullptr,19))return -EPERM; // CAP_SYS_PTRACE in initial namespace
+    return SchedulerCoreAutoQueue(static_cast<uint16_t>(pid));
+}
+
 int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
                         uint64_t oldlimitAddr, uint64_t, uint64_t)
 {
+    if(resource==4)return CoreResourceLimit(pid,newlimitAddr,oldlimitAddr);
     (void)pid; (void)newlimitAddr;
 
     if (oldlimitAddr)
@@ -237,6 +269,7 @@ int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
 int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                        uint64_t, uint64_t, uint64_t)
 {
+    if(resource==4)return rlimAddr?CoreResourceLimit(0,0,rlimAddr):-EFAULT;
     const rlimit64 limit = ReportedResourceLimit(resource);
     return CopyToUser(rlimAddr, &limit, sizeof(limit)) ? 0 : -EFAULT;
 }

@@ -22,8 +22,8 @@ class BdwGgttExtentBind {
         }
         return true;
     }
-    template<class Io> bool Restore(Io& io,bool requireInstalled,bool toInvalid=false) {
-        if(owner_!=static_cast<const void*>(&io) || !io.validateLease(lease_) ||
+    template<class Io> bool Restore(Io& io,bool requireInstalled,bool toInvalid=false,const void* identity=nullptr) {
+        if(owner_!=(identity?identity:static_cast<const void*>(&io)) || !io.validateLease(lease_) ||
            (scratchDma_ && !io.validateTakeover(lease_,scratchDma_)) || !io.quiescent() || !io.invalidate()){
             state_=BdwGgttExtentState::Quarantined;return false;
         }
@@ -54,16 +54,16 @@ public:
         state_=BdwGgttExtentState::Fresh;lease_={};owner_=nullptr;touched_=0;expected_=nullptr;scratchDma_=0;return true;
     }
 private:
-    template<class Io> bool BindImpl(const BdwGgttExtentLease& l,Io& io,const uint64_t* expected,uint64_t scratch){
+    template<class Io> bool BindImpl(const BdwGgttExtentLease& l,Io& io,const uint64_t* expected,uint64_t scratch,const void* identity=nullptr){
         if(state_!=BdwGgttExtentState::Fresh || !Geometry(l))return false;
         state_=BdwGgttExtentState::Working;
         if(!io.validateLease(l) || (scratch && !io.validateTakeover(l,scratch)) || !io.quiescent()){state_=BdwGgttExtentState::Fresh;return false;}
         for(uint32_t i=0;i<l.reservation.count;++i){uint64_t value=~uint64_t{0};
             if(!io.read(l.reservation.first+i,value) || value!=(expected?expected[i]:0)){state_=BdwGgttExtentState::Fresh;return false;}
         }
-        lease_=l;owner_=static_cast<const void*>(&io);expected_=expected;scratchDma_=scratch;
+        lease_=l;owner_=identity?identity:static_cast<const void*>(&io);expected_=expected;scratchDma_=scratch;
         for(uint32_t i=0;i<l.reservation.count;++i){touched_=i+1;
-            if(!io.write(l.reservation.first+i,l.dma[i]|1ull)){(void)Restore(io,false);return false;}
+            if(!io.write(l.reservation.first+i,l.dma[i]|1ull)){(void)Restore(io,false,false,identity);return false;}
         }
         if(!io.invalidate()){state_=BdwGgttExtentState::Quarantined;return false;}
         for(uint32_t i=0;i<l.reservation.count;++i){uint64_t value=0;
@@ -77,11 +77,19 @@ public:
     // the entire range. The owner must exclude all old users and retain the
     // scratch page across warm boots until its mappings are retired.
     template<class Io> bool BindTakenOver(const BdwGgttExtentLease& l,Io& io,const uint64_t* expected,uint64_t scratch){
+        return BindTakeover(l,io,expected,scratch,nullptr);
+    }
+    template<class Io> bool BindReversible(const BdwGgttExtentLease& l,Io& io,const uint64_t* expected,uint64_t scratch){
+        return BindTakeover(l,io,expected,scratch,this);
+    }
+private:
+    template<class Io> bool BindTakeover(const BdwGgttExtentLease& l,Io& io,const uint64_t* expected,uint64_t scratch,const void* identity){
         if(!expected || !Geometry(l) || !scratch || (scratch&4095) || scratch>=(uint64_t{1}<<39) ||
            (scratch>=0xdd000000ull && scratch<0xdf800000ull))return false;
         for(uint32_t i=0;i<l.reservation.count;++i)if(l.dma[i]==scratch)return false;
-        return BindImpl(l,io,expected,scratch);
+        return BindImpl(l,io,expected,scratch,identity);
     }
+public:
     template<class Io> bool Retire(Io& io){
         if(state_!=BdwGgttExtentState::Bound)return false;
         state_=BdwGgttExtentState::Working;return Restore(io,true);
@@ -89,9 +97,14 @@ public:
     // A fully bound takeover can instead invalidate every installed entry.
     // This removes scratch references after a clean retirement; it cannot
     // handle a reset or panic which occurs before the transaction completes.
-    template<class Io> bool RetireToInvalid(Io& io){
+    template<class Io> bool RetireToInvalid(Io& io){return RetireInvalid(io,nullptr);}
+    // The production worker reconstructs an audited MMIO view per critical
+    // section. Its persistent extent transaction identifies that same owner.
+    template<class Io> bool RetireReversible(Io& io){return RetireInvalid(io,this);}
+private:
+    template<class Io> bool RetireInvalid(Io& io,const void* identity){
         if(state_!=BdwGgttExtentState::Bound || !scratchDma_)return false;
-        state_=BdwGgttExtentState::Working;return Restore(io,true,true);
+        state_=BdwGgttExtentState::Working;return Restore(io,true,true,identity);
     }
 };
 }

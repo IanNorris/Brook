@@ -40,7 +40,9 @@ VirtualAddress VmmAllocPages(uint64_t,uint64_t,MemTag,uint16_t) { return Virtual
 void VmmFreePages(VirtualAddress,uint64_t) { std::abort(); }
 uint32_t WmDesktopHeight(uint32_t h) { return h-1; }
 bool WmTaskbarHidden() { return false; }
+extern unsigned taskbarDraws;
 void WmRenderTaskbar(uint32_t* p,uint32_t stride,uint32_t w,uint32_t h,uint64_t,int32_t,int32_t) {
+    ++taskbarDraws;
     for(uint32_t x=0;x<w;++x)p[(h-1)*stride+x]=0x00123456;
 }
 bool launcherVisible=true;
@@ -63,6 +65,14 @@ void WmVolumePopupGetRect(uint32_t,uint32_t,int32_t* x,int32_t* y,uint32_t* w,ui
 void WmVolumePopupRender(uint32_t* p,uint32_t stride,uint32_t,uint32_t,int32_t,int32_t){for(unsigned y=1;y<3;++y)for(unsigned x=4;x<6;++x)p[y*stride+x]=0x00777777;}
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*){return false;}
 void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t){std::abort();}
+// Content keys (window.cpp builds and hashes the display lists): constant
+// per kind here, so only appearing, leaving or moving surfaces change them.
+uint64_t shellKeyBump=0;unsigned taskbarDraws=0;
+BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& s,uint64_t key){
+    BrookDesktopSurface r{};r.kind=uint32_t(s.kind)+3;r.key=key;r.x=s.x;r.y=s.y;r.width=s.w;r.height=s.h;
+    r.flags=BROOK_DESKTOP_SURFACE_OPAQUE;r.opacity=255;return r;}
+uint64_t WmShellSurfaceKey(const WmShellSurface& s,uint32_t,uint32_t,uint64_t,int32_t,int32_t){
+    return 0x100+uint64_t(s.kind)+(s.kind==WmShellSurfaceKind::Taskbar?shellKeyBump:0);}
 extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::calloc(1,bytes); }
 extern "C" void kfree(void* p) { std::free(p); }
 void MappingBackingRef(MappingBacking*) { ++leases; }
@@ -390,20 +400,21 @@ int main() {
         overlayPixels[0]=0;CHECK(CompositorReleaseDebugFrame(overlay.token,77));
         // Change detection: while subscribed and unleased, content changes
         // update the generation without a capture request.
+        // Keys only: nothing is rasterised into the shared buffer.
         launcherVisible=true;const uint64_t now=ApicTickCount();(void)CompositorOverlayGeneration();
-        CheckDesktopOverlay(now+1,0,0);CHECK(CompositorOverlayGeneration()==g0+2 && overlayPixels[9]==0xff654321);
+        CheckDesktopOverlay(now+1,0,0);CHECK(CompositorOverlayGeneration()==g0+2 && overlayPixels[9]==0);
         launcherVisible=false;CheckDesktopOverlay(now+2,0,0); // same input, too soon: not rechecked
         CHECK(CompositorOverlayGeneration()==g0+2);
         CheckDesktopOverlay(now+2,1,0);CHECK(CompositorOverlayGeneration()==g0+3); // pointer moved (hover)
         launcherVisible=true;CheckDesktopOverlay(now+2+OVERLAY_RECHECK_MS,1,0);CHECK(CompositorOverlayGeneration()==g0+4); // periodic
-        // The volume popup takes the launcher's rectangle slot and is hashed.
+        // The volume popup takes the launcher's rectangle slot and is keyed.
         launcherVisible=false;volumeVisible=true;CheckDesktopOverlay(now+3+2*OVERLAY_RECHECK_MS,1,0);
-        CHECK(CompositorOverlayGeneration()==g0+5 && overlayPixels[1*8+4]==0xff777777 && overlayPixels[9]==0);
+        CHECK(CompositorOverlayGeneration()==g0+5 && overlayPixels[1*8+4]==0 && overlayPixels[9]==0);
         launcherVisible=true;volumeVisible=false;CheckDesktopOverlay(now+3+3*OVERLAY_RECHECK_MS,1,0);
         CHECK(CompositorOverlayGeneration()==g0+6 && overlayPixels[1*8+4]==0);
-        // A held lease blocks detection; it resumes once released.
+        // Detection never touches the buffer, so it continues under a lease.
         launcherVisible=false;overlay=CompositorRequestDebugFrame(77,true,false);
-        CheckDesktopOverlay(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+6);
+        CheckDesktopOverlay(now+500,2,0);CHECK(CompositorOverlayGeneration()==g0+7);
         // Op-7 wait: blocks without locks, woken by completion.
         waiterProc=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(waiterProc);
         DebugFrameSnapshot waited{};captureOnBlock=true;blockCalls=0;
@@ -418,6 +429,27 @@ int main() {
         CHECK(CompositorReleaseDebugFrame(overlay.token,77));
         std::free(waiterProc);waiterProc=nullptr;launcherVisible=true;
         CHECK(g_debugFrameCleanAddress==g_debugFrameBuffer.raw());
+        // Per-surface keys: an unchanged taskbar is kept (not rasterised),
+        // a changed one is redrawn while the launcher is kept.
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(700,9,9,false);
+        CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+        const unsigned draws=taskbarDraws;overlayPixels[9]=0x11111111; // marker inside the launcher
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(701,9,9,false);
+        CHECK(taskbarDraws==draws && overlayPixels[9]==0x11111111);
+        DesktopOverlayBands first{};CHECK(!CompositorOverlayBands(overlay.token,77,first));
+        CHECK(CompositorReleaseDebugFrame(overlay.token,77));
+        ++shellKeyBump;
+        overlay=CompositorRequestDebugFrame(77,true,false);CaptureDesktopOverlay(702,9,9,false);
+        CHECK(taskbarDraws==draws+1 && overlayPixels[9]==0x11111111 && overlayPixels[47]==0xff123456);
+        DesktopOverlayBands second{};CHECK(!CompositorOverlayBands(overlay.token,77,second));
+        CHECK(first.count==2 && second.count==2);
+        {BrookDesktopOverlaySurfaces records{};CHECK(CompositorOverlaySurfaces(overlay.token,78,records)==-116);
+         CHECK(!CompositorOverlaySurfaces(overlay.token,77,records) && records.count==2 &&
+               records.surfaces[0].kind==3 && records.surfaces[0].y==5 && records.surfaces[1].kind==4 && records.surfaces[1].key);}
+        for(unsigned i=0;i<2;++i){const bool taskbar=first.bands[i].y==5;
+            CHECK(taskbar?first.keys[i]!=second.keys[i]:first.keys[i]==second.keys[i]);}
+        CHECK(CompositorReleaseDebugFrame(overlay.token,77));overlayPixels[9]=0xff654321;
+        g_debugFrameCleanAddress=0;
     }
     g_debugFramePages=0;g_debugFrameBuffer=VirtualAddress{};
     auto fail=[](void*,uint64_t,void*,uint64_t){return false;};

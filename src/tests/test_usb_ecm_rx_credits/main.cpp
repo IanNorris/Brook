@@ -3,58 +3,67 @@
 #include <cstdint>
 #include <initializer_list>
 
-int main() {
-    UsbEcmRxCredits c{};
-    for (unsigned i=0;i<8;++i) {
-        assert(c.CanArm(i,8,24));
-        c.Arm(i,0x1000+i*16);
+int main()
+{
+    constexpr unsigned Depth=UsbEcmRxCredits::Slots;
+    constexpr unsigned Capacity=UsbEcmRxCredits::Capacity;
+    constexpr unsigned UsableTrbs=UsbEcmRxCredits::RingEntries-1;
+    constexpr uint64_t Base=0x1000;
+    UsbEcmRxCredits credits{};
+    credits.ringBase=Base;
+    for(unsigned i=0;i<Depth;++i){
+        assert(credits.CanArm(i,Depth,Capacity-Depth));
+        credits.Arm(i,Base+i*16);
     }
-    assert(c.outstanding==8);
-    assert(!c.CanArm(0,8,24));
-    assert(c.Find(0xdead)==-1);
-    for (unsigned error : {0u, 2u, 3u, 4u, 6u, 255u}) {
-        assert(c.CompletedSlot(0x1000,error,0)==-1);
-        assert(c.outstanding==8); // every outstanding DMA reservation stays pinned
+    assert(credits.outstanding==Depth);
+    for(unsigned error:{0u,2u,3u,4u,6u,255u}){
+        assert(credits.CompletedSlot(Base,error,0)==-1);
+        assert(credits.outstanding==Depth);
     }
-    assert(c.CompletedSlot(0x1000,1,2049)==-1);
-    assert(c.CompletedSlot(0xdead,1,0)==-1);
-    assert(c.CompletedSlot(0x1000,1,0)==0);
-    assert(c.CompletedSlot(0x1000,13,2048)==0);
-    for (unsigned i=0;i<8;++i) {
-        int slot=c.Find(0x1000+i*16);
-        assert(slot==static_cast<int>(i));
-        c.Complete(static_cast<unsigned>(slot));
-        assert(c.Find(0x1000+i*16)==-1); // duplicate completion rejected
-        assert(!c.CanArm(i,8,25+i)); // completed frame consumed the credit
+    assert(credits.CompletedSlot(Base,1,UsbEcmRxCredits::BufferBytes+1)==-1);
+    assert(credits.CompletedSlot(Base-16,1,0)==-1);
+    assert(credits.CompletedSlot(Base+1,1,0)==-1);
+    assert(credits.CompletedSlot(Base+UsableTrbs*16,1,0)==-1);
+    assert(credits.CompletedSlot(Base,13,UsbEcmRxCredits::BufferBytes)==0);
+    for(unsigned i=0;i<Depth;++i){
+        const auto token=Base+i*16;
+        assert(credits.CompletedSlot(token,1,0)==static_cast<int>(i));
+        credits.Complete(i);
+        assert(credits.Find(token)==-1);
+        assert(!credits.CanArm(i,Depth,Capacity-Depth+i+1));
     }
-    assert(c.outstanding==0);
-    assert(!c.CanArm(0,8,32));
-    assert(c.CanArm(0,8,31));
-    c.Arm(0,0xabcd);
-    auto empty=c.CompletedSlot(0xabcd,13,2048);
-    assert(empty==0);c.Complete(static_cast<unsigned>(empty));
-    assert(c.CanArm(0,8,31)); // zero-byte completion returns its credit
-    assert(!c.CanArm(1,1,0));
-    assert(!c.CanArm(0,9,0));
-    assert(!c.CanArm(0,8,33));
+    assert(credits.outstanding==0);
+    assert(!credits.CanArm(0,Depth,Capacity));
+    assert(credits.CanArm(0,Depth,Capacity-1));
+    assert(!credits.CanArm(1,1,0));
+    assert(!credits.CanArm(0,Depth+1,0));
 
     UsbEcmRxPressure pressure{};
-    pressure.Observe(8,8,24);assert(!pressure.blocked && pressure.entries==0);
-    pressure.Observe(8,7,25);assert(pressure.blocked && pressure.entries==1 && !pressure.zero);
-    pressure.Observe(8,7,25);assert(pressure.entries==1);
-    pressure.Observe(8,0,32);assert(pressure.zero && pressure.zeroEntries==1);
-    pressure.Observe(8,1,31);assert(!pressure.zero && pressure.entries==1);
-    pressure.Observe(8,8,20);assert(!pressure.blocked);
-    pressure.Observe(8,0,32);assert(pressure.entries==2 && pressure.zeroEntries==2);
+    pressure.Observe(Depth,Depth,Capacity-Depth);
+    assert(!pressure.blocked && pressure.entries==0);
+    pressure.Observe(Depth,Depth-1,Capacity-Depth+1);
+    assert(pressure.blocked && pressure.entries==1 && !pressure.zero);
+    pressure.Observe(Depth,0,Capacity);
+    assert(pressure.zero && pressure.zeroEntries==1);
+    pressure.Observe(Depth,1,Capacity-1);
+    assert(!pressure.zero && pressure.entries==1);
+    pressure.Observe(Depth,Depth,0);
+    assert(!pressure.blocked);
+    pressure.Observe(Depth,0,Capacity);
+    assert(pressure.entries==2 && pressure.zeroEntries==2);
 
-    // Reuse slots through many token-ring laps; stale tokens cannot complete
-    // a live buffer while it has a different token.
-    for (unsigned lap=0;lap<1024;++lap) {
-        auto token=uint64_t(0x1000)+(lap%255)*16;
-        assert(c.CanArm(0,8,0)); c.Arm(0,token);
-        assert(c.Find(token)==0);
-        if (lap) assert(c.Find(uint64_t(0x1000)+((lap-1)%255)*16)==-1);
-        c.Complete(0);
+    // Keep a full flight live through several transfer-ring wraps. Reuse
+    // each completed DMA slot with a different ownership token.
+    for(unsigned n=0;n<Depth;++n)credits.Arm(n,Base+n*16);
+    for(unsigned n=0;n<4096;++n){
+        const unsigned slot=n%Depth;
+        const auto token=Base+(n%UsableTrbs)*16;
+        const auto next=Base+((n+Depth)%UsableTrbs)*16;
+        assert(credits.CompletedSlot(token,13,UsbEcmRxCredits::BufferBytes)==static_cast<int>(slot));
+        credits.Complete(slot);
+        assert(credits.Find(token)==-1 && credits.Find(next)==-1);
+        assert(credits.CanArm(slot,Depth,0));
+        credits.Arm(slot,next);
+        assert(credits.outstanding==Depth && credits.Find(token)==-1);
     }
-    return 0;
 }

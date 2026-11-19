@@ -1,3 +1,4 @@
+#include "core_autodump.h"
 #include "signal_defaults.h"
 #include "signal_restart.h"
 #include "syscall_timing.h"
@@ -634,7 +635,14 @@ static uint64_t SetupUserStack(Process* proc,
         pushU64(0); // padding to maintain 16-byte alignment
 
     uint32_t auxEntries=0;
-    auto pushAux=[&](uint64_t type,uint64_t value){pushU64(value);pushU64(type);++auxEntries;};
+    uint64_t aux[AddressSpaceState::SavedAuxvWords]{};
+    auto pushAux=[&](uint64_t type,uint64_t value){
+        pushU64(value);pushU64(type);
+        if(auxEntries<sizeof(aux)/(2*sizeof(*aux))){
+            aux[2*auxEntries]=type;aux[2*auxEntries+1]=value;
+        }
+        ++auxEntries;
+    };
     // 5. Push auxiliary vectors (in reverse order, so first entry is at lowest address)
     pushAux(AT_NULL, 0);                               // AT_NULL
     if (vdsoBase) { pushAux(33, vdsoBase); }            // AT_SYSINFO_EHDR
@@ -672,7 +680,17 @@ static uint64_t SetupUserStack(Process* proc,
     // 8. Push argc
     pushU64(static_cast<uint64_t>(argc));
 
-    return stackValid && sp>=proc->stackBase ? sp : 0;
+    if(!stackValid || sp<proc->stackBase || 2*auxEntries>AddressSpaceState::SavedAuxvWords)return 0;
+    auto* space=proc->addressSpace;
+    KMutexLock(&space->mutation);
+    for(uint32_t i=0;i<auxEntries;++i){
+        const uint32_t source=2*(auxEntries-i-1);
+        space->savedAuxv[2*i]=aux[source];
+        space->savedAuxv[2*i+1]=aux[source+1];
+    }
+    space->savedAuxvWords=2*auxEntries;
+    KMutexUnlock(&space->mutation);
+    return sp;
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +809,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->pgid = proc->pid;
     proc->sid = proc->pid;
     proc->tgid = proc->pid;         // Process is its own thread group leader
+    proc->coreLimits={};
     proc->threadLeader = proc;
     proc->state = ProcessState::Ready;
     proc->runningOnCpu = -1;
@@ -1224,6 +1243,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->pgid = parent->pgid;      // Inherit process group from parent
     child->sid = parent->sid;         // Inherit session from parent
     child->tgid = child->pid;         // Fork creates a new thread group
+    child->coreLimits={};
+    (void)SchedulerCoreResourceLimit(parent,0,nullptr,child->coreLimits,false);
     child->threadLeader = child;
     child->isThread = false;
     child->clearChildTid = 0;
@@ -1931,10 +1952,11 @@ static void FinishIrqSignalProbe(Process* proc) {
 // dispositions remain on their existing paths while this probe is validated.
 extern "C" void IrqSignalProbe(void* raw, FxsaveArea* entryFp,unsigned source) {
     using namespace brook;
-    if(!irqSignalProbeMode || (irqSignalProbeMode==2 && source!=1))return;
     auto& frame=*static_cast<IrqSignalFrame*>(raw);
     if((frame.cs&3)!=3)return;
     Process* proc=ProcessCurrent();if(!proc || proc->isKernelThread)return;
+    CoreDumpCaptureIrq(proc,frame);
+    if(!irqSignalProbeMode || (irqSignalProbeMode==2 && source!=1))return;
     uint64_t pending=(ProcessPendingSignals(proc)|PosixTimerPending(proc))&~proc->sigMask;
     if(!pending)return;
     int signum=0;KernelSigaction action{};

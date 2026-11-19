@@ -17,7 +17,17 @@ namespace brook {
 // `gpu clock` command; each trip is counted and logged once.
 constexpr uint32_t BdwClockBinMhz=50;
 constexpr uint32_t BdwClockDefaultMhz=500;
+// Boot request on AC (Ian, 18 Nov): 600 MHz held 69-75 C at ~10 W in Stardew
+// fullscreen with no trips, 27-29 -> 39 displayed fps; 700 MHz reached 98 C.
+// The trip and no-caps fallbacks stay at BdwClockDefaultMhz.
+constexpr uint32_t BdwClockBootMhz=600;
 constexpr int32_t BdwClockDefaultLimitC=90;
+// Hysteresis: a trip falls back to BdwClockDefaultMhz and recovers once every
+// sample has been at or below limit-BdwClockRecoverMarginC for
+// BdwClockRecoverMs (gen 439: a brief 96 C spike latched Stardew at 500 MHz
+// for the rest of the boot, 39 -> 29 fps). PROCHOT (TjMax 105) still backstops.
+constexpr int32_t BdwClockRecoverMarginC=15;
+constexpr uint64_t BdwClockRecoverMs=5000;
 
 struct BdwClockCaps { uint32_t rpn=0,rp1=0,rp0=0; bool valid=false; };
 inline BdwClockCaps BdwClockDecodeCaps(uint32_t caps){
@@ -53,10 +63,11 @@ inline uint64_t BdwClockEnergyDeltaUj(uint32_t before,uint32_t after,uint64_t po
 }
 
 struct BdwClockState {
-    uint32_t requestedMhz=BdwClockDefaultMhz;
+    uint32_t requestedMhz=BdwClockBootMhz;
     int32_t limitC=BdwClockDefaultLimitC;
-    uint32_t tripped=0;          // latched thermal fallback
-    uint64_t trips=0,samples=0;
+    uint32_t tripped=0;          // thermal fallback active
+    uint64_t trips=0,recoveries=0,samples=0;
+    uint64_t coolSinceMs=0;      // first sample of the current cool run while tripped (0 = none)
     int32_t lastTempC=-1,maxTempC=-1;
     uint32_t lastCaps=0;         // last caps register read inside a render job
     uint32_t lastRequestedBin=0; // bin the worker asked for on its last job
@@ -71,15 +82,22 @@ inline uint32_t BdwClockEffectiveBin(const BdwClockState& s){
     if(!caps.valid)return BdwClockDefaultMhz/BdwClockBinMhz;
     return BdwClockClampBin(mhz,caps);
 }
-// Apply a thermal sample; returns true if this sample newly tripped the guard.
-inline bool BdwClockNoteTemp(BdwClockState& s,int32_t tempC){
+// Apply a thermal sample taken at nowMs. Returns +1 if it newly tripped the
+// guard, -1 if it ended a trip (cool for BdwClockRecoverMs), 0 otherwise.
+// Invalid samples (tempC<0) change nothing.
+inline int BdwClockNoteTemp(BdwClockState& s,int32_t tempC,uint64_t nowMs){
     s.samples++;s.lastTempC=tempC;
     if(tempC>s.maxTempC)s.maxTempC=tempC;
-    if(tempC>=0 && tempC>=s.limitC && !s.tripped){s.tripped=1;s.trips++;return true;}
-    return false;
+    if(tempC<0)return 0;
+    if(tempC>=s.limitC){s.coolSinceMs=0;if(!s.tripped){s.tripped=1;s.trips++;return 1;}return 0;}
+    if(!s.tripped)return 0;
+    if(tempC>s.limitC-BdwClockRecoverMarginC){s.coolSinceMs=0;return 0;}
+    if(!s.coolSinceMs){s.coolSinceMs=nowMs?nowMs:1;return 0;}
+    if(nowMs-s.coolSinceMs<BdwClockRecoverMs)return 0;
+    s.tripped=0;s.coolSinceMs=0;s.recoveries++;return -1;
 }
 // `gpu clock <MHz>`: set the request (clears a latched thermal trip).
 inline void BdwClockSetMhz(BdwClockState& s,uint32_t mhz){
-    s.requestedMhz=mhz<BdwClockBinMhz?BdwClockDefaultMhz:mhz;s.tripped=0;
+    s.requestedMhz=mhz<BdwClockBinMhz?BdwClockDefaultMhz:mhz;s.tripped=0;s.coolSinceMs=0;
 }
 }

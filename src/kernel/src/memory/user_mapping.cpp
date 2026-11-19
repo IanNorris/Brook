@@ -117,6 +117,8 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         destination->programBreakLow=source->programBreakLow;
         destination->programBreakHigh=source->programBreakHigh;
         destination->mmapNext=source->mmapNext;
+        memcpy(destination->savedAuxv,source->savedAuxv,sizeof(source->savedAuxv));
+        destination->savedAuxvWords=source->savedAuxvWords;
         destination->argumentStart=source->argumentStart;
         destination->argumentEnd=source->argumentEnd;
         destination->membarrierPrivateRegistered=__atomic_load_n(
@@ -125,6 +127,19 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         operation.Unlock();
         return copied;
     }
+}
+bool UserMappingReadResidentPage(AddressSpaceState* space,uint64_t address,uint64_t identity,void* out) {
+    if(!space || space->kernel || !out || (address&4095))return false;
+    KMutexLock(&space->mutation);
+    const auto* range=MappingRangeFind(space->ranges,address);
+    const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+    const bool valid=range && range->identity==identity && (range->protection&1) &&
+        range->kind!=MappingKind::Device && (leaf&(VMM_PRESENT|VMM_USER))==(VMM_PRESENT|VMM_USER);
+    // The mapping lock stabilizes the leaf and its RAM lifetime throughout
+    // the copy, including against COW replacement. No fault-in or foreign CR3.
+    if(valid)memcpy(out,reinterpret_cast<const void*>(PhysToVirt(VmmLeafPhysical(leaf)).raw()),4096);
+    KMutexUnlock(&space->mutation);
+    return valid;
 }
 uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void* buffer,uint32_t capacity) {
     if (!space || space->kernel || !buffer || !capacity) return 0;

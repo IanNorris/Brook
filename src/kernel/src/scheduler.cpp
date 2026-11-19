@@ -1,3 +1,4 @@
+#include "core_autodump.h"
 #include "process_fs.h"
 #include "user_copy.h"
 #include "scheduler.h"
@@ -298,6 +299,9 @@ struct PerCpuSchedState {
     Process*         pendingRetire;    // Owns a ProcessRef until post-switch retirement
     volatile uint64_t busyTicks;      // ticks spent running non-idle processes
     volatile uint64_t idleTicks;      // ticks spent in idle process
+    // Last context switch on this CPU (diagnostics; SchedulerLastSwitch).
+    uint64_t switchSeq, lastDispatchTsc, lastFromRanTsc;
+    uint32_t lastFromPid; bool lastFromKernel, lastFromIdle;
 };
 
 static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
@@ -1987,6 +1991,15 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         SchedLockRelease(g_readyLock, runtimeFlags);
     }
     g_perCpu[cpu].currentProcess = newProc;
+    {   // Who held this CPU until now, and for how long (one TSC read).
+        auto& s = g_perCpu[cpu];
+        uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        const uint64_t now = (uint64_t(hi) << 32) | lo;
+        s.lastFromRanTsc = s.lastDispatchTsc && now > s.lastDispatchTsc ? now - s.lastDispatchTsc : 0;
+        s.lastFromPid = oldProc->pid; s.lastFromKernel = oldProc->isKernelThread;
+        s.lastFromIdle = oldProc == s.idleProcess; s.lastDispatchTsc = now;
+        __atomic_store_n(&s.switchSeq, s.switchSeq + 1, __ATOMIC_RELEASE);
+    }
     if (g_perCpu[cpu].cpuEnv) {
         g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
@@ -2506,6 +2519,17 @@ void SchedulerYield()
     }
     // DoSwitch claims next + releases g_readyLock (raw) before context_switch.
     DoSwitch(old, next, requeue, /* holdingReadyLock */ true);
+}
+
+SchedulerSwitchInfo SchedulerLastSwitch(uint32_t cpu)
+{
+    SchedulerSwitchInfo info{};
+    if (cpu >= SCHED_MAX_CPUS) return info;
+    const auto& s = g_perCpu[cpu];
+    info.sequence = __atomic_load_n(&s.switchSeq, __ATOMIC_ACQUIRE);
+    info.fromPid = s.lastFromPid; info.fromKernel = s.lastFromKernel; info.fromIdle = s.lastFromIdle;
+    info.fromRanTsc = s.lastFromRanTsc;
+    return info;
 }
 
 bool SchedulerIsRunning()
@@ -3077,6 +3101,8 @@ void SchedulerFreePid(uint16_t pid)
 }
 
 static bool RequestFatalSignalImpl(Process*,int,AddressSpaceState*,uint64_t);
+static int QueueCoreDumpLocked(const Process*,int);
+static Process* CoreGroupLeaderLocked(const Process*);
 #include "scheduler_oom.inc"
 #include "scheduler_fatal.inc"
 
@@ -3094,6 +3120,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
     uint32_t count = 0;
 
     uint64_t alf = SchedLockAcquire(g_allProcLock);
+    if(caller && caller->tgid==tgid && terminationSignal && CoreAutoSignal(terminationSignal))
+        (void)QueueCoreDumpLocked(caller,terminationSignal);
     // BRO-173: latch the whole group as exiting BEFORE snapshotting members,
     // under g_allProcLock — the same lock ProcessCreateThread/SchedulerAddProcess
     // take to publish a new thread.  This serializes group-exit vs thread birth:
@@ -3536,6 +3564,115 @@ static uint16_t SnapshotTgid(const Process* p) { return p->tgid ? p->tgid : p->p
 static uint64_t SnapshotGroup(const Process* p)
 { return p->isThread ? p->leaderIncarnation : p->incarnation; }
 
+// Registry lock protects generation membership and the address-space pin.
+static const Process* FindCoreTaskLocked(uint16_t pid)
+{
+    for(uint32_t i=0;i<g_processCount;++i){
+        const auto* p=g_allProcesses[i];
+        if(p && p->pid==pid && p->state!=ProcessState::Terminated && p->addressSpace && !p->addressSpace->kernel)
+            return p;
+    }
+    return nullptr;
+}
+
+static Process* CoreGroupLeaderLocked(const Process* target)
+{
+    const uint16_t group=SnapshotTgid(target);
+    const uint64_t generation=SnapshotGroup(target);
+    for(uint32_t i=0;i<g_processCount;++i){
+        auto* p=g_allProcesses[i];
+        if(p && p->pid==group && SnapshotGroup(p)==generation)return p;
+    }
+    return nullptr;
+}
+
+static AddressSpaceState* CaptureCoreLocked(const Process* target,const Process* leader,
+                                             CoreThreadNote* notes,uint32_t capacity,
+                                             CoreProcessNote& info,CoreDumpResult& result,int signal)
+{
+    auto* space=target->addressSpace;
+    const uint16_t group=SnapshotTgid(target);
+    const uint64_t generation=SnapshotGroup(target);
+    if(!leader)leader=target;
+    const auto add=[&](const Process* p,int currentSignal){
+        if(result.threads>=capacity)return;
+        auto& note=notes[result.threads++];
+        note={};note.pid=p->pid;note.ppid=p->parentPid;note.pgrp=p->pgid;note.sid=p->sid;
+        note.signal[0]=currentSignal;note.currentSignal=static_cast<int16_t>(currentSignal);
+        if(!CoreDumpReadRegisters(p,space->identity,note.registers))++result.missingRegisters;
+    };
+    add(target,signal);
+    for(uint32_t i=0;i<g_processCount && result.threads<capacity;++i){
+        const auto* p=g_allProcesses[i];
+        if(!p || p==target || p->state==ProcessState::Terminated || SnapshotTgid(p)!=group ||
+           SnapshotGroup(p)!=generation || p->addressSpace!=space)continue;
+        add(p,0);
+    }
+    info.stateName='R';info.uid=leader->uid;info.gid=leader->gid;
+    info.pid=group;info.ppid=leader->parentPid;info.pgrp=leader->pgid;info.sid=leader->sid;
+    for(uint32_t i=0;i+1<sizeof(info.name) && leader->name[i];++i)info.name[i]=leader->name[i];
+    for(uint32_t i=0;i+1<sizeof(result.executable) && leader->exePath[i];++i)result.executable[i]=leader->exePath[i];
+    AddressSpaceRef(space);
+    return space;
+}
+
+AddressSpaceState* SchedulerCoreDumpThreads(uint16_t pid,CoreThreadNote* notes,uint32_t capacity,
+                                             CoreProcessNote& info,CoreDumpResult& result)
+{
+    const auto lock=SchedLockAcquire(g_allProcLock);
+    const auto* target=FindCoreTaskLocked(pid);
+    auto* space=target?CaptureCoreLocked(target,CoreGroupLeaderLocked(target),notes,capacity,info,result,0):nullptr;
+    SchedLockRelease(g_allProcLock,lock);
+    return space;
+}
+
+static int QueueCoreDumpLocked(const Process* target,int signal)
+{
+    if(!target || target->isKernelThread || !target->addressSpace || target->addressSpace->kernel ||
+       target->state==ProcessState::Terminated || target->tgidExiting)return -3;
+    const auto* leader=CoreGroupLeaderLocked(target);
+    if(!leader)leader=target;
+    CoreAutoJob* job=CoreAutoClaim(target,leader,signal);
+    if(!job)return -11;
+    auto& snapshot=job->snapshot;
+    snapshot.space=CaptureCoreLocked(target,leader,snapshot.threads,snapshot.capacity,snapshot.info,
+                                     snapshot.result,signal);
+    CoreAutoCommit(job);
+    return 0;
+}
+
+int SchedulerCoreAutoQueue(uint16_t pid)
+{
+    const auto lock=SchedLockAcquire(g_allProcLock);
+    const int result=QueueCoreDumpLocked(FindCoreTaskLocked(pid),0);
+    SchedLockRelease(g_allProcLock,lock);
+    return result;
+}
+
+int SchedulerCoreResourceLimit(Process* caller,uint16_t pid,const CoreResourceLimits* replace,
+                               CoreResourceLimits& previous,bool privileged)
+{
+    const auto lock=SchedLockAcquire(g_allProcLock);
+    const auto* target=pid?FindCoreTaskLocked(pid):caller;
+    Process* leader=target?CoreGroupLeaderLocked(target):nullptr;
+    int result=-3;
+    if(leader){
+        const bool sameGroup=SnapshotTgid(caller)==SnapshotTgid(target) && SnapshotGroup(caller)==SnapshotGroup(target);
+        if(!sameGroup && !privileged)result=-1;
+        else {
+            previous=leader->coreLimits;
+            result=0;
+            if(replace){
+                if(replace->soft>replace->hard)result=-22;
+                else if(!privileged && replace->hard>previous.hard)result=-1;
+                else leader->coreLimits=*replace;
+            }
+        }
+    }
+    SchedLockRelease(g_allProcLock,lock);
+    return result;
+}
+
 static uint32_t CountTasksLocked(uint16_t tgid, uint64_t generation)
 {
     uint32_t count = 0;
@@ -3566,6 +3703,16 @@ static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
     j = 0;
     for (; j + 1 < sizeof(out->exePath) && p->exePath[j]; ++j) out->exePath[j] = p->exePath[j];
     ProcessFsReadDisplay(p,out->cwd,sizeof(out->cwd));
+    out->kernelThread = p->isKernelThread;
+    out->blockedOnRwLock = p->blockedOnRwLock != nullptr;
+    out->syscallNr = p->currentSyscallNum;
+    out->syscallArgs[0] = p->syscallUserRdi; out->syscallArgs[1] = p->syscallUserRsi;
+    out->syscallArgs[2] = p->syscallUserRdx; out->syscallArgs[3] = p->syscallUserR10;
+    out->syscallArgs[4] = p->syscallUserR8;  out->syscallArgs[5] = p->syscallUserR9;
+    out->syscallSp = p->syscallUserRsp; out->syscallPc = p->syscallUserRip;
+    out->blockedSinceMs = __atomic_load_n(&p->blockedSinceMs, __ATOMIC_RELAXED);
+    out->wakeupTick = p->wakeupTick;
+    for (uint32_t i = 0; i < ProcWaitSiteDepth; ++i) out->blockSites[i] = p->blockSites[i];
 }
 
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)

@@ -966,10 +966,11 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
             return nullptr;
         }
     }
-    if (vn && vn->type==VnodeType::Dir) {
+    if (vn && (vn->type==VnodeType::Dir || vn->type==VnodeType::File) && !vn->directoryPath) {
         const uint32_t length=StrLen(resolved);
         vn->directoryPath=static_cast<char*>(kmalloc(length+1));
         if(!vn->directoryPath) {
+            if(vn->type==VnodeType::File)return vn; // diagnostic name only
             if(error)*error=-12;
             VfsClose(vn);return nullptr;
         }

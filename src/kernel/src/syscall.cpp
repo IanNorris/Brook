@@ -1,3 +1,5 @@
+#include "brook_core_dump.h"
+#include "gdt.h"
 #include "../../shared/brook_pointer.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
@@ -98,6 +100,11 @@ extern "C" void SyscallSnapshotCurrentC()
     proc->syscallUserR9 = userR9;
     proc->syscallUserR10 = userR10;
     proc->currentSyscallNum = syscallNum;
+    brook::CoreDumpPublishRegisters(proc,{
+        userR15,userR14,userR13,userR12,userRbp,userRbx,userRflags,userR10,userR9,userR8,
+        syscallNum,userRip,userRdx,userRsi,userRdi,syscallNum,userRip,GDT_USER_CODE,userRflags,
+        userRsp,GDT_USER_DATA,proc->fsBase,proc->savedCtx.gsBase,0,0,0,0
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +407,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_READLINK]        = sys_readlink;
     g_syscallTable[SYS_UMASK]           = sys_umask;
     g_syscallTable[SYS_GETRLIMIT]       = sys_getrlimit;
+    g_syscallTable[SYS_SETRLIMIT]       = sys_setrlimit;
     g_syscallTable[SYS_GETRUSAGE]       = sys_getrusage;
     g_syscallTable[SYS_SYSINFO]         = sys_sysinfo;
     g_syscallTable[SYS_TIMES]           = sys_times;
@@ -589,6 +597,7 @@ void SyscallTableInit()
     g_syscallTable[BROOK_SYS_DESKTOP_OVERLAY] = sys_brook_desktop_overlay;
     g_syscallTable[BROOK_SYS_AHCI_EXPORT] = sys_brook_ahci_export;
     g_syscallTable[BROOK_SYS_SYSTEM_MESSAGE] = sys_brook_system_message;
+    g_syscallTable[BROOK_SYS_CORE_DUMP] = sys_brook_core_dump;
     g_syscallTable[0xB40]                = sys_brook_pageable_memory;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
     g_syscallTable[BROOK_SYS_WM_TASKBAR_METRICS] = sys_brook_wm_taskbar_metrics;

@@ -1914,41 +1914,68 @@ int main() {
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED)==held+1);
     assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED)==overlaps+1);
     SockClose(i);
-    i=create();setupTcp(i);auto fullBefore=__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED);
-    {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
-     struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
-     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT+1;++n){packet.tcp.seqNum=htonl(21+n*2);HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}}
-    assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED)==fullBefore+1);
-    SockClose(i);
-    // Future segments must reassemble in order even when inserted backwards
-    // across sequence wrap, and leave no retained accounting behind.
-    i=create();setupTcp(i);g_sockets[i].tcpRcvNxt=0xffffffe0u;
-    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
-     struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
-     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     for(unsigned n=Socket::TCP_OOO_SLOT_COUNT;n>0;--n){packet.tcp.seqNum=htonl(0xffffffe0u+n);packet.byte=static_cast<uint8_t>(n);HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);}
-     assert(g_sockets[i].tcpOooBytes==Socket::TCP_OOO_SLOT_COUNT);
-     packet.tcp.seqNum=htonl(0xffffffe0u);packet.byte=0;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);}
-    {uint8_t data[Socket::TCP_OOO_SLOT_COUNT+1]{};assert(SockRecv(i,data,sizeof(data),true)==sizeof(data));
-     for(unsigned n=0;n<sizeof(data);++n)assert(data[n]==n);}
-    assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].tcpRcvNxt==0xffffffe0u+Socket::TCP_OOO_SLOT_COUNT+1);
-    for(const auto& slot:g_sockets[i].tcpOooSlots)assert(!slot.used);
-    SockClose(i);
-    // Exercise the byte budget and copying with full-sized retained packets.
+    // Sparse future segments use sequence positions, without a slot cap.
     i=create();setupTcp(i);
-    {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
-     struct {TcpHeader tcp;uint8_t bytes[Socket::TCP_OOO_SLOT_SIZE];} packet{};
-     packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);packet.tcp.ackNum=htonl(10);
-     packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-     for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT;++n){packet.tcp.seqNum=htonl(21+n*Socket::TCP_OOO_SLOT_SIZE);
-       for(auto& b:packet.bytes)b=static_cast<uint8_t>(n);HandleTcp(&ip,&packet,sizeof(packet));}
-     assert(g_sockets[i].tcpOooBytes==Socket::TCP_OOO_SLOT_COUNT*Socket::TCP_OOO_SLOT_SIZE);
-     packet.tcp.seqNum=htonl(20);packet.bytes[0]=255;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);}
-    {uint8_t data[Socket::TCP_OOO_SLOT_SIZE];uint8_t prefix;
-     assert(SockRecv(i,&prefix,1,true)==1 && prefix==255);
-     for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT;++n){assert(SockRecv(i,data,sizeof(data),true)==sizeof(data));for(auto b:data)assert(b==n);}}
-    assert(g_sockets[i].tcpOooBytes==0);SockClose(i);
+    {
+        auto& socket=g_sockets[i];
+        constexpr unsigned flights=2048;
+        const uint8_t byte=42;
+        for(unsigned n=0;n<flights;++n)assert(TcpStoreOoo(socket,21+2*n,&byte,1,100));
+        assert(socket.tcpOooBytes==flights);
+        assert(TcpReceiveFree(socket)==Socket::RX_BUF_SIZE);
+        assert(!TcpStoreOoo(socket,20+Socket::RX_BUF_SIZE,&byte,1,100));
+        TcpReapOoo(socket,30100);
+        assert(socket.tcpOooBytes==0);
+    }
+    SockClose(i);
+    // Reassemble a full advertised window backwards across both TCP
+    // sequence wrap and receive-buffer wrap, without copying retained bytes.
+    i=create();setupTcp(i);
+    {
+        auto& socket=g_sockets[i];
+        constexpr uint32_t sequence=0xffffffe0u;
+        socket.tcpRcvNxt=sequence;
+        socket.rxHead=socket.rxTail=Socket::RX_BUF_SIZE-31;
+        Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
+        struct {TcpHeader tcp;uint8_t bytes[1460];} packet{};
+        packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+        packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
+        packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+        for(uint32_t end=Socket::RX_BUF_SIZE;end>1;){
+            const uint32_t start=end>sizeof(packet.bytes)+1 ? end-sizeof(packet.bytes) : 1;
+            packet.tcp.seqNum=htonl(sequence+start);
+            for(uint32_t n=start;n<end;++n)packet.bytes[n-start]=static_cast<uint8_t>(n);
+            HandleTcp(&ip,&packet,sizeof(TcpHeader)+end-start);
+            end=start;
+        }
+        assert(socket.tcpOooBytes==Socket::RX_BUF_SIZE-1 && socket.rxCount==0);
+        packet.tcp.seqNum=htonl(sequence);packet.bytes[0]=0;
+        HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);
+        assert(socket.tcpOooBytes==0 && socket.tcpRcvNxt==sequence+Socket::RX_BUF_SIZE);
+        uint8_t data[4096];
+        for(uint32_t base=0;base<Socket::RX_BUF_SIZE;base+=sizeof(data)){
+            assert(SockRecv(i,data,sizeof(data),true)==sizeof(data));
+            for(uint32_t n=0;n<sizeof(data);++n)assert(data[n]==static_cast<uint8_t>(base+n));
+        }
+    }
+    SockClose(i);
+    // Overlapping future data fills its novel suffix and preserves the
+    // first arrival in the shared bytes.
+    i=create();setupTcp(i);
+    {
+        auto& socket=g_sockets[i];
+        const uint8_t first[]={2,3,4}, second[]={99,5,6}, prefix[]={0,1};
+        assert(TcpStoreOoo(socket,22,first,sizeof(first),100));
+        assert(TcpStoreOoo(socket,24,second,sizeof(second),100));
+        assert(socket.tcpOooBytes==5);
+        TcpEnqueueData(socket,prefix,sizeof(prefix));
+        socket.tcpRcvNxt+=sizeof(prefix);
+        assert(TcpDrainOoo(socket));
+        uint8_t output[7];
+        assert(SockRecv(i,output,sizeof(output),true)==sizeof(output));
+        for(uint32_t n=0;n<sizeof(output);++n)assert(output[n]==n);
+    }
+    SockClose(i);
     // A retransmission that covers retained future bytes must retire those
     // entries without delivering them twice.
     i=create();setupTcp(i);
@@ -1958,7 +1985,7 @@ int main() {
      packet.tcp.seqNum=htonl(22);packet.bytes[0]=2;HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);
      packet.tcp.seqNum=htonl(20);for(unsigned n=0;n<4;++n)packet.bytes[n]=n;HandleTcp(&ip,&packet,sizeof(TcpHeader)+4);}
     {uint8_t data[4]{};assert(SockRecv(i,data,sizeof(data),true)==4);for(unsigned n=0;n<4;++n)assert(data[n]==n);}
-    assert(g_sockets[i].tcpOooBytes==0);for(const auto& slot:g_sockets[i].tcpOooSlots)assert(!slot.used);
+    assert(g_sockets[i].tcpOooBytes==0);
     SockClose(i);
     // A partially covered retained segment contributes only its new suffix.
     i=create();setupTcp(i);
@@ -1975,7 +2002,7 @@ int main() {
      struct {TcpHeader tcp;uint8_t bytes[2];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
      packet.tcp.seqNum=htonl(22);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);
-     assert(g_sockets[i].tcpOooBytes==2 && TcpReceiveFree(g_sockets[i])==2);
+     assert(g_sockets[i].tcpOooBytes==2 && TcpReceiveFree(g_sockets[i])==4);
      packet.tcp.seqNum=htonl(20);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);}
     assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].rxCount==Socket::RX_BUF_SIZE && g_sockets[i].tcpRcvNxt==24);
     SockClose(i);
@@ -2076,6 +2103,28 @@ int main() {
         static uint8_t dns[512];const auto fullBefore=g_netCounters.udpRxFull;
         for(unsigned n=0;n<2000;++n)SockDeliverUdp(2,53,1,5353,dns,sizeof(dns));
         assert(g_netCounters.udpRxFull-fullBefore==2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)));
+        // Drain: every queued datagram comes back whole, then EAGAIN.
+        {const unsigned queued=Socket::RX_BUF_SIZE/(10+sizeof(dns));uint8_t out[600];SockAddrIn from{};
+         for(unsigned n=0;n<queued;++n)assert(SockRecvFrom(u,out,sizeof(out),&from)==int(sizeof(dns)) && from.sin_port==htons(53));
+         assert(SockRecvFrom(u,out,sizeof(out),&from)==-11 && g_sockets[u].rxCount==0);}
+        // Gen 441: delivery appends under s.lock while a reader dequeues. A
+        // lost rxCount update used to misframe the ring. Stress both sides.
+        {const auto corruptBefore=g_netCounters.udpRxCorrupt;std::atomic<bool> stop{false};std::atomic<unsigned> sent{0};
+         std::thread producer([&]{uint8_t d[1400];for(unsigned n=0;n<40000;++n){const unsigned len=1+(n*37)%1400;
+             for(unsigned i=0;i<len;++i)d[i]=uint8_t(n+i);d[0]=uint8_t(n);SockDeliverUdp(2,443,1,5353,d,len);sent=n+1;}stop=true;});
+         unsigned got=0;uint8_t out[1500];SockAddrIn from{};
+         for(;;){const int r=SockRecvFrom(u,out,sizeof(out),&from);
+             if(r==-11){if(stop.load() && g_sockets[u].rxCount==0)break;continue;}
+             assert(r>=1 && r<=1400 && from.sin_port==htons(443));
+             for(int i=1;i<r;++i)assert(out[i]==uint8_t(out[0]+i)); // payload intact and framed
+             ++got;}
+         producer.join();
+         assert(g_netCounters.udpRxCorrupt==corruptBefore && got==sent.load()-(g_netCounters.udpRxFull-fullBefore-(2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)))));}
+        // An inconsistent length resets the ring instead of spinning.
+        {uint8_t one=7;SockDeliverUdp(2,53,1,5353,&one,1);auto& q=g_sockets[u];
+         q.rxBuf[q.rxTail]=0xff;q.rxBuf[(q.rxTail+1)%Socket::RX_BUF_SIZE]=0xff; // length 0xffff+ > rxCount
+         const auto corrupt=g_netCounters.udpRxCorrupt;uint8_t out[16];
+         assert(SockRecvFrom(u,out,sizeof(out),nullptr)==-11 && q.rxCount==0 && g_netCounters.udpRxCorrupt==corrupt+1);}
         int l=create();g_sockets[l].listening=true;g_sockets[l].listenBacklog=2;
         g_sockets[l].localPort=htons(1234);g_sockets[l].tcpState=TcpState::Listen;
         auto syn=[&](uint16_t port){Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;TcpHeader t{};

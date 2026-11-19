@@ -16,4 +16,17 @@ template<class Owner> bool BdwFirstGpuPoll(Owner& owner,bool& first) {
     if(first){first=false;return owner.immediatePollAllowed();}
     return owner.pollContinue();
 }
+// Deadline grace (gen 440): a starved poll can pass the deadline after the
+// GPU finished. When the normal poll ends and the owner says the stop was a
+// deadline (not a failed yield or lost ownership), allow exactly one more
+// check under the still-held ownership; it never yields or extends the wait.
+struct BdwDeadlineGrace {
+    bool used=false;
+    // eligible() is evaluated after the poll that ended the wait.
+    template<class Owner,class Eligible> bool Continue(Owner& owner,bool& first,Eligible eligible){
+        if(BdwFirstGpuPoll(owner,first))return true;
+        if(used || !eligible())return false;
+        used=true;return true;
+    }
+};
 }

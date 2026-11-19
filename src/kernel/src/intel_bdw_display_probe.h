@@ -1,5 +1,6 @@
 #pragma once
 #include "intel_bdw_gtt_probe.h"
+#include "intel_bdw_cursor.h"
 namespace brook {
 // Raw point-in-time display register evidence only. A powered-down display
 // domain may read as zero, and firmware may change it later: neither this
@@ -25,13 +26,28 @@ inline bool BdwDisplayUsesGop(const BdwDisplaySnapshot& display) {
 // registers limits the checked set (the per-job check historically ignores
 // the trailing primary tile offset of pipes B and C).
 template<class Accept> bool BdwDisplayCompatible(const BdwDisplaySnapshot& display,Accept accept,
-                                                 unsigned registers=BdwDisplaySnapshot::RegisterCount) {
+                                                 unsigned registers=BdwDisplaySnapshot::RegisterCount,
+                                                 bool (*cursorBaseOwned)(uint32_t)=nullptr,
+                                                 bool (*clientLayout)(uint32_t,uint32_t&,uint32_t&)=nullptr) {
     const auto& primary=display.regs[0];
     if(registers<4 || registers>BdwDisplaySnapshot::RegisterCount)return false;
-    if(primary[0]!=0x98000000u || primary[1]!=12800 || !accept(primary[2]) || !accept(primary[3]))return false;
+    uint32_t primaryControl=0x98000000u,stride=12800;
+    if(clientLayout)(void)clientLayout(primary[2],primaryControl,stride);
+    if(primary[0]!=primaryControl || primary[1]!=stride || !accept(primary[2]) || !accept(primary[3]))return false;
     for(unsigned pipe=0;pipe<3;++pipe)
-        for(unsigned reg=pipe?0:4;reg<registers;++reg)
-            if(display.regs[pipe][reg])return false;
+        for(unsigned reg=pipe?0:4;reg<registers;++reg){
+            if(!pipe && reg==7 && registers>=10 && cursorBaseOwned){
+                const uint32_t control=primary[7];
+                const uint32_t base=primary[8] & BdwCursorRegs::AddressMask;
+                const uint32_t live=primary[9] & BdwCursorRegs::AddressMask;
+                // Arm and disable take effect at vblank. Both kernel-owned
+                // bases may still be fetched during the transition.
+                if((control!=0 && control!=BdwCursorRegs::Argb64) ||
+                   (control && !base) || (base && !cursorBaseOwned(base)) ||
+                   (live && !cursorBaseOwned(live)))return false;
+                reg=9;
+            }else if(display.regs[pipe][reg])return false;
+        }
     return true;
 }
 

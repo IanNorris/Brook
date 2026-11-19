@@ -1,3 +1,4 @@
+#include "intel_bdw_scanout_target.h"
 // syscall_brook_desktop.cpp -- Brook desktop syscalls: layer capture, scene graph, debug frame, overlay.
 //
 // Split from syscall.cpp (see docs/agent/syscall-split-plan.md).
@@ -7,6 +8,7 @@
 
 #include "syscall.h"
 #include "desktop_layers_export.h"
+#include "desktop_present_policy.h"
 #include "intel_bdw_scanout.h"
 #include "memory/user_mapping.h"
 #include "compositor.h"
@@ -22,6 +24,7 @@ namespace brook {
 
 WmChromeCaptureStats g_chromeCaptureStats{}; // window.h / wm_chrome_key.h
 DesktopCaptureCounters g_desktopCaptureStats{}; // desktop_layers_export.h
+uint32_t g_desktopPresentPolicy=BROOK_DESKTOP_POLICY_APP_CADENCE|BROOK_DESKTOP_POLICY_DIRECT_SHADOW,g_desktopPresentDeferUs=0; // desktop_present_policy.h
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
 static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,uint64_t size)
 {
@@ -30,7 +33,9 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
     if(!wire || !snapshot){kfree(wire);kfree(snapshot);return -ENOMEM;}
     int64_t result=-EFAULT;
     const bool keep=op==BROOK_DESKTOP_CHROME_TRACKED_KEEP;
-    const bool keyed=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED;
+    // Spans (stage 1.4): keyed, writing only the frame strips.
+    const bool spans=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS;
+    const bool keyed=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || spans;
     if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
         const uint64_t heldKey=wire->reserved;
         if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || (keep?!heldKey:wire->reserved!=0) || !wire->layers[0].window)result=-EINVAL;
@@ -75,13 +80,28 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
                     else {
                         brook::WmDesktopChrome current{};
                         int32_t mouseX=0,mouseY=0;MouseGetPosition(&mouseX,&mouseY);
-                        result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked);
+                        result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked,spans);
                         if(!result && (current.x!=chrome.x || current.y!=chrome.y || current.width!=chrome.width || current.height!=chrome.height))result=-EAGAIN;
-                        if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
+                        uint64_t copied=bytes;
+                        const uint32_t ix=current.interiorX,iy=current.interiorY,iw=current.interiorW,ih=current.interiorH;
+                        if(!result && spans && iw && ih){
+                            // Only the strips: the interior of pixels is not
+                            // initialised and must never reach the caller.
+                            const uint64_t row=uint64_t(chrome.width)*4;copied=0;
+                            auto copy=[&](uint64_t offset,uint64_t n){
+                                if(!n)return true;copied+=n;
+                                return CopyToUser(layer.pixels+offset,reinterpret_cast<uint8_t*>(pixels)+offset,n);
+                            };
+                            bool ok=copy(0,row*iy) && copy(row*(iy+ih),row*(chrome.height-iy-ih));
+                            for(uint32_t y=iy;ok && y<iy+ih;++y)
+                                ok=copy(row*y,uint64_t(ix)*4) && copy(row*y+uint64_t(ix+iw)*4,uint64_t(chrome.width-ix-iw)*4);
+                            if(!ok)result=-EFAULT;
+                        }else if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
                         if(!result){
                             renderedKey=current.key;
                             __atomic_add_fetch(&brook::g_chromeCaptureStats.captures,1,__ATOMIC_RELAXED);
-                            __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesCopied,bytes,__ATOMIC_RELAXED);
+                            __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesCopied,copied,__ATOMIC_RELAXED);
+                            if(copied<bytes)__atomic_add_fetch(&brook::g_chromeCaptureStats.bytesKept,bytes-copied,__ATOMIC_RELAXED);
                         }
                         if(!result && !(tracked?brook::WmDesktopLayersCaptureCurrent(*snapshot):brook::WmDesktopLayersCurrent(*snapshot)))result=-EAGAIN;
                     }
@@ -155,12 +175,41 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
+    if(op==BROOK_DESKTOP_FOCUS_QUERY){
+        if((size!=sizeof(BrookDesktopFocus) && size!=BROOK_DESKTOP_FOCUS_V1_SIZE) || a || b || c || !address ||
+           address>~uint64_t{0}-size)return -EINVAL;
+        BrookDesktopFocus focus{};
+        focus.version=size==sizeof(BrookDesktopFocus)?BROOK_DESKTOP_FOCUS_VERSION_POINTER:BROOK_DESKTOP_FOCUS_VERSION;
+        (void)brook::WmSnapshotFocus(&focus.window,&focus.incarnation,&focus.state);
+        focus.policy=brook::DesktopPresentPolicy();focus.deferUs=brook::DesktopPresentDeferUs();
+        if(size==sizeof(BrookDesktopFocus)){
+            MouseGetPosition(&focus.pointerX,&focus.pointerY);
+            focus.shell=(brook::WmLauncherVisible()?BROOK_DESKTOP_SHELL_LAUNCHER:0u)|(brook::WmVolumePopupVisible()?BROOK_DESKTOP_SHELL_VOLUME:0u);
+        }
+        return CopyToUser(address,&focus,size)?0:-EFAULT;
+    }
     if(op==BROOK_DESKTOP_CLIENT_FRAME){
         if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
         brook::WmNoteClientFrame(b,c);return 0;
     }
+    if(op==BROOK_DESKTOP_SURFACES_QUERY){
+        if(size!=sizeof(BrookDesktopSurfaces) || a || b || c || !address || address>~uint64_t{0}-size)return -EINVAL;
+        auto* wire=static_cast<BrookDesktopSurfaces*>(kmalloc(sizeof(BrookDesktopSurfaces)));
+        if(!wire)return -ENOMEM;
+        int64_t result=-EFAULT;
+        if(CopyFromUser(wire,address,sizeof(*wire))){
+            if(wire->version!=BROOK_DESKTOP_SURFACES_VERSION || wire->reserved)result=-EINVAL;
+            else {
+                const uint32_t version=wire->version;__builtin_memset(wire,0,sizeof(*wire));wire->version=version;
+                wire->count=brook::WmDesktopSurfaceRecords(wire->surfaces,BROOK_DESKTOP_LAYER_LIMIT);
+                result=CopyToUser(address,wire,sizeof(*wire))?0:-EFAULT;
+            }
+        }
+        kfree(wire);return result;
+    }
     if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE ||
-        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP) &&
+        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP ||
+        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
     if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
@@ -413,7 +462,9 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
     auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
-    if(reserved || token>0xffffffffULL)return -EINVAL;
+    if(token>0xffffffffULL || (reserved &&
+       (op!=BROOK_DESKTOP_OVERLAY_CURSOR ||
+        (reserved!=BROOK_DESKTOP_CURSOR_PLANE_V1 && reserved!=BROOK_DESKTOP_CURSOR_PLANE_V2))))return -EINVAL;
     const uint64_t owner=proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation;
     if(op==0){
         if(token || destination || length || (offset & ~uint64_t(BROOK_DESKTOP_OVERLAY_NO_CURSOR)))return -EINVAL;
@@ -459,6 +510,12 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         }
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
+    if(op==BROOK_DESKTOP_OVERLAY_SURFACES){
+        if(offset || length!=sizeof(BrookDesktopOverlaySurfaces))return -EINVAL;
+        BrookDesktopOverlaySurfaces info{};const int result=CompositorOverlaySurfaces(uint32_t(token),owner,info);
+        if(result)return result;
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
     if(op==BROOK_DESKTOP_OVERLAY_GENERATION){
         if(token || destination || length || offset)return -EINVAL;
         return int64_t(CompositorOverlayGeneration()&0x7fffffffffffffffULL);
@@ -473,14 +530,22 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
         info.generation=frame.state==DebugFrameState::Ready?frame.overlayGeneration:0;
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
+    if(op==BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED){
+        if(token || destination || length || !offset)return -EINVAL;
+        brook::BdwCursorRendererPresented(owner,offset);
+        return 0;
+    }
     if(op==BROOK_DESKTOP_OVERLAY_CURSOR){
         if(token || length!=sizeof(BrookDesktopOverlayCursor))return -EINVAL;
         auto* cursor=static_cast<BrookDesktopOverlayCursor*>(kmalloc(sizeof(BrookDesktopOverlayCursor)));
         if(!cursor)return -ENOMEM;
         CompositorOverlayCursor(*cursor,offset);
+        bool suppress=false;
+        const uint64_t epoch=brook::BdwCursorRendererQuery(owner,reserved==BROOK_DESKTOP_CURSOR_PLANE_V2,suppress);
+        if(suppress)cursor->visible=0;
         const uint64_t bytes=cursor->serial==offset?offsetof(BrookDesktopOverlayCursor,pixels):sizeof(*cursor);
         const bool copied=CopyToUser(destination,cursor,bytes);
-        kfree(cursor);return copied?0:-EFAULT;
+        kfree(cursor);return copied?int64_t(epoch):-EFAULT;
     }
     if(op==BROOK_DESKTOP_OVERLAY_READ_BAND){
         DesktopOverlayBands bands{};int result=CompositorOverlayBands(uint32_t(token),owner,bands);

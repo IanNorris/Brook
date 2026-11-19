@@ -145,6 +145,39 @@ def main():
         print(f'  last frame: path={last["path"]} direct={last["direct"]} partial={last["partial"]} '
               f'layers={last["layers_drawn"]} draws={last["draws"]} shaded={last["pixels_shaded"]} '
               f'damage={last["damage_pixels"]} submit->fence={last["cpu_submit_to_fence_ns"] / 1e6:.2f}ms')
+    if 'app_present' in after:
+        a_after, a_before = after['app_present'], (before or {}).get('app_present')
+        def sub(group):
+            old = (a_before or {}).get(group, {})
+            return {k: v - old.get(k, 0) for k, v in a_after[group].items()}
+        actions, dominance = sub('actions'), sub('dominance')
+        early = a_after['early_notifies'] - (a_before or {}).get('early_notifies', 0)
+        print(f'\napp-driven cadence: mode={a_after["mode"]} focus_query={a_after["focus_query"]} '
+              f'defer={a_after["defer_us"] / 1000:.1f}ms dominant_window={a_after["dominant"] or "-"} '
+              f'early_frame_notifies {early / seconds:.2f}/s ({early})')
+        if 'overlay_capture_skips' in a_after:
+            skips = a_after['overlay_capture_skips'] - (a_before or {}).get('overlay_capture_skips', 0)
+            print(f'  overlay captures reused (app-driven limit) {skips / seconds:.2f}/s ({skips})')
+        if 'pointer_only' in a_after:
+            po = a_after['pointer_only'] - (a_before or {}).get('pointer_only', 0)
+            pd = a_after['pointer_only_driven'] - (a_before or {}).get('pointer_only_driven', 0)
+            print(f'  pointer-only frames submitted {po / seconds:.2f}/s ({po}), of which with a dominant window {pd}')
+        print('  actions/s   ' + '  '.join(f'{k} {v / seconds:.2f} ({v})' for k, v in actions.items()))
+        total = sum(dominance.values())
+        print('  dominance   ' + '  '.join(f'{k} {100 * v / total:.0f}%' for k, v in dominance.items() if v) if total
+              else '  dominance   (no frames with damage)')
+    if 'direct_scanout' in after:
+        d_after, d_before = after['direct_scanout'], (before or {}).get('direct_scanout') or {}
+        def d(key):
+            return d_after[key] - d_before.get(key, 0)
+        evaluated = d('evaluated')
+        share = f' ({100 * d("eligible") / evaluated:.0f}% of presented frames)' if evaluated else ''
+        print(f'direct scanout: mode={d_after["mode"]} evaluated {evaluated} eligible {d("eligible")}{share} '
+              f'scanned_out {d("frames")} enters {d("enters")} exits {d("exits")} last={d_after["last"]}')
+        old = d_before.get('fallback', {})
+        fallback = {k: v - old.get(k, 0) for k, v in d_after['fallback'].items()}
+        if any(fallback.values()):
+            print('  fallback    ' + '  '.join(f'{k} {v}' for k, v in sorted(fallback.items(), key=lambda kv: -kv[1]) if v))
     evictions = after['window_evictions'] - (before['window_evictions'] if before else 0)
     print(f'  window table evictions {evictions}  publish_failures {after["publish_failures"]}')
     return 0

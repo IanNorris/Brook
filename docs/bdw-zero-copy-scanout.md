@@ -291,3 +291,103 @@ Build: `nix-shell --run 'python3 scripts/build_dell_image.py --payload-id dell-z
 6. **Panic restore:** as in M3 stage 6, on a zero-copy-active boot.
 
 **Rollback:** `gpu zerocopy off` (live), a reboot (gates reset), or promoting the previous slot.
+
+## Pipe A cursor plane
+
+The Dell build with zero-copy scanout can opt in with `gpu cursor on`.
+`gpu cursor off` restores the compositor cursor. The feature is off at boot.
+It needs an active pipe A scanout ring, a current presentation lease, and a
+renderer that negotiates cursor-plane version 2 on the overlay cursor query.
+The query offers an epoch and suppresses the software layer. The renderer
+acknowledges its successful zero-copy present with that epoch. Brook waits for
+that cursor-free primary image or a later image in the same epoch to latch
+before arming the cursor. Older query formats use software composition.
+
+The BSP submission worker binds two 64×64 ARGB8888 images into persistent
+GGTT extents. Both allocations are aligned to 256 KiB for Brook’s checked
+extent binder, which also satisfies the stricter VT-d alignment case, and
+have safe trailing mappings. Before arming a changed image, Brook
+premultiplies alpha and flushes its CPU writes. The other image is reused only
+after a subsequent vblank and observation of the new live address. Shape
+changes and fully transparent cursors retain ownership of the plane. Cursor
+control, base, position and live registers are at `0x70080`, `0x70084`,
+`0x70088` and `0x700ac`. Motion changes position and rewrites the same base
+to arm the update. The write ordering follows the
+[Linux i915 cursor code](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_cursor.c).
+
+GOP takeover, lease loss and runtime off disable the cursor plane. The
+renderer and compositor resume drawing their pointers after disabled
+register readback and two vblanks. Failed hardware transitions count as
+fallbacks. The cursor mappings remain pinned for the boot.
+
+On the Dell, use the zero-copy desktop path, enable the cursor, and check
+`gpu cursor status`. Expect a bound plane followed by an active plane. Sweep
+across a fullscreen client that hides its cursor and over desktop or launcher
+chrome. Expect the cursor to hide and reappear without double images or
+fallbacks. Move the pointer through the screen edges and check that positions
+increase while the cursor image remains stable. Turn the feature off and
+restart the renderer to check the handoff back to software. The fake MMIO
+test checks rapid alternating images and both handoff directions. QEMU checks
+the image boot path. Actual cursor scanout requires a Dell test.
+
+## Client primary-plane scanout
+
+The boot policy remains `desktop present direct shadow`. Only
+`desktop present direct on` admits a client scanout request, and it requires
+an active zero-copy ring and the current compositor presentation lease.
+The first version accepts exactly the Dell panel size, XRGB8888, a zero
+source offset, and a focused, visible window whose client area covers the
+panel without chrome. The provider socket must match the window creation
+identity. A visible pointer needs an active hardware cursor. Linear pitch
+must be 64-byte aligned, X-tiled pitch 512-byte aligned, and the kernel
+checks the buffer size and Intel tiling metadata. Broadwell uses the
+combined DSPOFFSET register and supports linear and X-tiled primary
+surfaces. See [Linux i915 primary plane programming](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/i9xx_plane.c).
+
+The BSP submission worker holds an exclusive buffer transition from
+admission through latch-away. The RCS ring flushes render and data caches
+before the completion breadcrumb. The worker flushes the coherent LLC
+before arming the non-snooping display. This first version deliberately
+uses a full buffer flush. Its cost and live panel correctness need Dell
+measurements. Three cached GGTT bindings retain references and have
+guard PTEs. Eviction checks the old mapping, clears the PTEs, and
+invalidates the extent after the buffer has left the display. Uncertain
+bindings stay pinned. The per-job display check admits only the published
+client address and layout or a known kernel surface.
+
+The capability `BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT` advertises ABI
+version 1 of the client operations in `src/shared/gpu_output_abi.h`.
+Each operation uses `BROOK_SYS_GPU_HANDOFF_CTL` with the unused syscall
+arguments set to zero.
+
+| Operation | Renderer contract |
+| --- | --- |
+| `CLIENT_SCANOUT_PRESENT` | Pass the version, authenticated provider socket, window creation identity, PRIME fd, exact layout, and a nonzero offer cookie. Wait for the producer fence first. Return 0 queues the request. A negative result leaves the offer with the renderer and permits the normal composited path. |
+| `CLIENT_SCANOUT_STATUS` | Query a separate versioned status structure. Front, armed, and queued are kernel buffer identities. The last asynchronous error includes the input offer cookie. Retain an accepted offer while its identity appears in any of the three fields. An uncertain state keeps all held offers. |
+| `CLIENT_SCANOUT_LEAVE` | Cancel an unarmed request and return to the last known kernel desktop image. Wait for status to clear before releasing held offers or sampling the prior front, then repaint the composited scene in full. |
+
+The kernel tracks only one armed flip. An additional proposal can be
+retried after the current latch. A normal fallback restores the last
+kernel image. Software takeover and panic restore the linear GOP layout.
+A pending client flip remains held until a later vblank confirms the
+restore target, including when the target was already in the live register.
+
+The kernel-only pair boots with the existing renderer. Once the renderer
+wiring lands, run the following checks on the Dell.
+
+1. Boot with the shadow default. Run an opaque fullscreen client and confirm
+   the existing compositor still presents while client present and latch
+   counters stay at zero.
+2. Enable direct scanout on a zero-copy desktop. Exercise separately
+   confirmed linear and X-tiled offers, with a hidden or hardware cursor.
+   Expect the ABI's `presents` and `latched` counters to advance and
+   the front identity to match the actual provider buffer. Check visual
+   geometry, row alignment, and changing content at each layout.
+3. Trigger a popup, resize, mode-off, or lease expiry while a client flip
+   is pending. Expect `restores` to advance on the known surface's
+   latch, with holds persisting until the front and armed identities
+   clear. Verify the desktop gets a full repaint and the provider receives
+   SAFE only after that latch.
+4. Compare compositor work, frame pacing, and cache-flush cost against
+   shadow mode over the same fullscreen scene. Verify the panic return to
+   GOP from an X-tiled front on a separately authorized test.

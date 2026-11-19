@@ -80,7 +80,8 @@ static struct {
     int intel;struct FakeTicket tickets[TICKETS];
     uint64_t lastPresented;unsigned outstanding,maxOutstanding,overlapReserves,fullOnlyReserves,dependentReserves,staleReserves;
     unsigned fulls,rejected;
-    unsigned chromeKeeps,chromeKeepMisses,chromeCaptures;
+    unsigned chromeKeeps,chromeKeepMisses,chromeCaptures,chromeSpanCaptures,surfaceQueries;
+    int oldSurfaces; /* HOST_E2E_OLD_KERNEL_NO_SURFACES: layers ops 16/17 refused */
     unsigned clientKeeps,clientKeepMisses,clientCaptures,noClientKeep;unsigned long long clientBytes;
     struct {long ticket;int state,full;struct BrookGpuPresentRegions regions;struct BrookGpuPresentFrame frame;uint64_t readyNs;long result;} queue;
     unsigned queued;uint64_t presentDelayNs;
@@ -120,11 +121,27 @@ static struct FakeWindow *window_by_id(uint32_t id){
     for(unsigned i=0;i<K.count;++i)if(K.win[K.order[i]].window==id)return &K.win[K.order[i]];
     return NULL;
 }
+/* The kernel's surface record of a fake window (layers op 16): an opaque
+ * frame with a window shadow, inactive alpha on even window ids. */
+static struct BrookDesktopSurface fake_surface(const struct FakeWindow *w){
+    struct BrookDesktopSurface s;memset(&s,0,sizeof(s));
+    s.kind=BROOK_DESKTOP_SURFACE_FRAME;s.window=w->window;s.incarnation=w->incarnation;s.key=1;
+    s.x=w->x-2;s.y=w->y-10;s.width=w->chromeW;s.height=w->chromeH;
+    s.clientX=w->x;s.clientY=w->y;s.clientWidth=w->w;s.clientHeight=w->h;
+    s.material=BROOK_DESKTOP_MATERIAL_OPAQUE;s.opacity=w->opacity;s.flags=BROOK_DESKTOP_SURFACE_OPAQUE;
+    s.shadow=BROOK_DESKTOP_SHADOW_WINDOW;s.shadowAlpha=(w->window&1)?255:180;s.shadowSpread=6;s.shadowCorner=10;
+    return s;
+}
+static uint32_t g_shadowSource[64*64];
 static void reference(void){
-    uint32_t scene[BROOK_VK_SCENE_HEADER+16*BROOK_VK_LAYER_WORDS]={FW,FH,0,0};const uint32_t *src[16];unsigned n=0;
+    uint32_t scene[BROOK_VK_SCENE_HEADER+64*BROOK_VK_LAYER_WORDS]={FW,FH,0,0};const uint32_t *src[64];unsigned n=0;
+    desktop_shadow_source(g_shadowSource);
 #define LAYER(p,...) do{const struct BrookVkSceneLayer l={__VA_ARGS__};memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&l,sizeof(l));src[n++]=(p);}while(0)
     LAYER(K.backdrop,0,FW,FW,FH,0,0,FW,FH,0,0,FW,FH,0,0,FW,FH,255);
     for(unsigned i=0;i<K.count;++i){const struct FakeWindow *w=&K.win[K.order[i]];
+        if(!K.oldSurfaces){const struct BrookDesktopSurface record=fake_surface(w);struct BrookVkSceneLayer pieces[8];
+            const unsigned count=desktop_surface_shadow_layers(&record,FW,FH,pieces);
+            for(unsigned k=0;k<count;++k){memcpy(scene+BROOK_VK_SCENE_HEADER+n*BROOK_VK_LAYER_WORDS,&pieces[k],sizeof(pieces[k]));src[n++]=g_shadowSource;}}
         if(w->window<=MAXW && K.offer[w->window].visible && K.gameScaled && w->window==2){
             /* HOST_E2E_GAME_SCALED: a half-size buffer drawn 2x (one-layer
              * version 3 offer), clipped to the client rectangle. */
@@ -364,6 +381,15 @@ static void dma_sync(int fd,uint64_t flags){struct dma_buf_sync_wire s={flags};(
 static struct FakeTicket *ticket_find(long ticket){for(unsigned i=0;i<TICKETS;++i)if(ticket>0 && K.tickets[i].ticket==ticket)return &K.tickets[i];return NULL;}
 
 static long layers_call(long op,struct BrookDesktopLayers *L,long a,long b){
+    if(op==BROOK_DESKTOP_SURFACES_QUERY){
+        if(K.oldSurfaces)return errno=EINVAL,-1;
+        struct BrookDesktopSurfaces *S=(struct BrookDesktopSurfaces*)(void*)L;
+        if(S->version!=BROOK_DESKTOP_SURFACES_VERSION)return errno=EINVAL,-1;
+        S->count=0;S->reserved=0;++K.surfaceQueries;
+        for(unsigned i=0;i<K.count;++i)S->surfaces[S->count++]=fake_surface(&K.win[K.order[i]]);
+        return 0;
+    }
+    if(op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS && K.oldSurfaces)return errno=EINVAL,-1;
     if(op==BROOK_DESKTOP_LAYERS_QUERY){
         advance();L->count=K.count;
         for(unsigned i=0;i<K.count;++i){const struct FakeWindow *w=&K.win[K.order[i]];
@@ -400,7 +426,8 @@ static long layers_call(long op,struct BrookDesktopLayers *L,long a,long b){
         return 0;
     }
     if(op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE ||
-       op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP){
+       op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP ||
+       op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS){
         const struct FakeWindow *w=window_by_id(L->layers[0].window);if(!w)return errno=ENOENT,-1;
         const uint64_t bytes=(uint64_t)w->chromeW*w->chromeH*4;
         /* Content key: exactly the pixels a capture would write. */
@@ -417,10 +444,21 @@ static long layers_call(long op,struct BrookDesktopLayers *L,long a,long b){
             if(op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED){
                 if(!L->layers[0].pixels || L->layers[0].capacity<bytes)return errno=EINVAL,-1;
                 memcpy((void*)(uintptr_t)L->layers[0].pixels,w->chrome,bytes);++K.chromeCaptures;}
+            if(op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS){
+                /* The frame strips only, as the kernel: the interior keeps
+                 * whatever the renderer's buffer held (after a resize, old
+                 * frame pixels), so the renderer must never show it. */
+                if(!L->layers[0].pixels || L->layers[0].capacity<bytes)return errno=EINVAL,-1;
+                uint32_t *out=(uint32_t*)(uintptr_t)L->layers[0].pixels;
+                for(uint32_t y=0;y<w->chromeH;++y)for(uint32_t x=0;x<w->chromeW;++x){
+                    const int interior=x>=2 && x<2+w->w && y>=10 && y<10+w->h;
+                    if(!interior)out[y*w->chromeW+x]=w->chrome[y*w->chromeW+x];}
+                ++K.chromeCaptures;++K.chromeSpanCaptures;}
         }
         L->count=1;L->layers[0]=(struct BrookDesktopLayer){L->layers[0].pixels,L->layers[0].capacity,w->incarnation,w->generation,bytes,
             w->window,w->chromeW,w->chromeH,w->chromeW,w->chromeW,w->chromeH,w->x-2,w->y-10,1,0};
-        L->reserved=(op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP)?key:0;
+        L->reserved=(op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP ||
+                     op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS)?key:0;
         return 0;
     }
     return errno=ENOSYS,-1;
@@ -578,6 +616,7 @@ int main(int argc,char **argv){
     K.lateClose=getenv("HOST_E2E_LATE_CLOSE")!=NULL;K.game=getenv("HOST_E2E_GAME")!=NULL;
     K.gameScaled=K.game && getenv("HOST_E2E_GAME_SCALED")!=NULL;
     K.noClientKeep=getenv("HOST_E2E_OLD_KERNEL_NO_CLIENT_KEEP")!=NULL;
+    K.oldSurfaces=getenv("HOST_E2E_OLD_KERNEL_NO_SURFACES")!=NULL;
     K.peer=-1;K.direct=getenv("HOST_E2E_DIRECT") && strcmp(getenv("HOST_E2E_DIRECT"),"0");
     K.layers=K.direct && getenv("HOST_E2E_LAYERS") && strcmp(getenv("HOST_E2E_LAYERS"),"0");
     if(K.direct){snprintf(K.socketPath,sizeof(K.socketPath),"/tmp/brook-host-e2e-%d.sock",(int)getpid());
@@ -624,7 +663,11 @@ int main(int argc,char **argv){
             shown=g_stats.windows[i].displayed;
         printf("HOST_E2E_LATE_WINDOW gpu_displayed=%llu\n",(unsigned long long)shown);
         if(shown<5)++bad;}
-    printf("HOST_E2E_CHROME keeps=%u keep_misses=%u captures=%u\n",K.chromeKeeps,K.chromeKeepMisses,K.chromeCaptures);
+    printf("HOST_E2E_CHROME keeps=%u keep_misses=%u captures=%u span_captures=%u surface_queries=%u shadows=%llu opaque_spans=%llu\n",
+        K.chromeKeeps,K.chromeKeepMisses,K.chromeCaptures,K.chromeSpanCaptures,K.surfaceQueries,g_surfaceStats.shadows,g_surfaceStats.opaqueSpans);
+    /* Records on: shadows drawn, spans captured and opaque; refused (old kernel): none of it. */
+    if(!K.oldSurfaces && (!K.chromeSpanCaptures || !g_surfaceStats.shadows || (g_quadSubmitted && g_chromeSpans && !g_surfaceStats.opaqueSpans)))++bad;
+    if(K.oldSurfaces && (K.chromeSpanCaptures || g_surfaceStats.shadows || g_surfaceStats.opaqueSpans || g_surfaceRecords))++bad;
     printf("HOST_E2E_CLIENT keeps=%u keep_misses=%u captures=%u bytes_copied=%llu\n",K.clientKeeps,K.clientKeepMisses,K.clientCaptures,K.clientBytes);
     /* Unchanged CPU windows are kept; published changes (steps 3 and the
      * random pixel edits) force refused keeps. */

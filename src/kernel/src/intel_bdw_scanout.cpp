@@ -132,7 +132,7 @@ bool BdwObserveDisplayAccepted(BdwDisplaySnapshot& out,unsigned registers) {
     for(unsigned i=0;i<attempts;++i){
         BdwDisplaySnapshot display{};
         if(!BdwObserveDisplayLive(display))continue;
-        if(!BdwDisplayCompatible(display,[](uint32_t surface){return BdwScanoutSurfaceAccepted(surface);},registers))return false;
+        if(!BdwDisplayCompatible(display,BdwScanoutSurfaceAccepted,registers,BdwCursorBaseOwned,BdwClientScanoutSurface))continue;
         out=display;return true;
     }
     return false;
@@ -1285,6 +1285,7 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
        !(PciConfigRead16(entry.device.bus,entry.device.dev,entry.device.fn,4)&4))return {false,true};
     static uint32_t nonce=0x42525000;
     if(nonce==~uint32_t{0})return {false,true};
+    const uint64_t hangPrepareTsc=BdwHangTsc(); // hang breadcrumb time base
     ohStep(BdwOhEntry);
     auto* memory=static_cast<uint32_t*>(kmalloc(20*4096));if(!memory)return {false,true};
     auto& context=*reinterpret_cast<uint32_t (*)[20*1024]>(memory);
@@ -1387,6 +1388,9 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     // entry evidence, engines not yet idle, GT init NotStarted). The job is
     // still Prepared and armed, so rerun it a bounded number of times after a
     // tick; only genuine device uncertainty reaches the panic below.
+    // Hang diagnostics: capture before the engine reset if this run fails
+    // (or always, once, after "gpu hang reference arm").
+    run.hangCapture=BdwHangScratchCapture();run.hangCaptureAlways=BdwHangTakeReferenceRequest();
     const BdwRenderRunResult request=run;
     BdwRenderAttemptView attemptView{};
     BdwRenderAttemptClass attemptClass=BdwRenderAttemptClass::Ran;
@@ -1441,7 +1445,8 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     const bool ok=t.contextSaved && t.resetComplete && t.patRestored && !t.uncertain && run.ggttCleared &&
         !run.pollYieldFailed && out.sequence.workComplete && out.clearDelivered && out.sequence.released &&
         LiveGpuMatches(entry) && PowerD0(entry.device);
-    if(ok && run.completionEndTicks>run.completionStartTicks)
+    // A deadline-grace completion (starved poll) is not a completion-time sample.
+    if(ok && !run.diag.grace && run.completionEndTicks>run.completionStartTicks)
         completionPredictor.Record(predictionKey,run.completionEndTicks-run.completionStartTicks);
     // gen 400: the job ran but its completion was not observed cleanly (for
     // example an unexpected context-status event). If the engine reset was
@@ -1454,6 +1459,13 @@ static BdwSubmissionOutcome ExecuteRetainedWorker(BdwExecSnapshot* snapshot,bool
     failure.pollYieldFailed=run.pollYieldFailed;failure.clearDelivered=out.clearDelivered;failure.released=out.sequence.released;
     failure.liveGpu=!ok && LiveGpuMatches(entry) && PowerD0(entry.device);
     const bool recoveredFailure=BdwRenderFailureRecoverable(failure);
+    {BdwHangJobInfo hang{};hang.pid=originPid;hang.ctx=originContext;
+        hang.objects=BdwExecSnapshotObjectCount(snapshot);hang.pages=BdwExecSnapshotPageCount(snapshot);
+        hang.batch=BdwExecSnapshotBatchAddress(snapshot);hang.batchLen=BdwExecSnapshotBatchLength(snapshot);
+        hang.nonce=nonce;hang.prepareTsc=hangPrepareTsc;hang.khz=tsc.khz;
+        if(run.diag.captured){const auto current=BdwExecSnapshotCurrentBatchSample(snapshot);hang.batchBytes=current.bytes;
+            for(unsigned i=0;i<8;++i)hang.batch8[i]=current.words[i];}
+        BdwHangNoteRenderJob(hang,run,ok,recoveredFailure);}
     if(recoveredFailure){
         static uint32_t recovered=0;const uint32_t n=++recovered;
         // hw_logs keeps 160 columns per line: split the record.

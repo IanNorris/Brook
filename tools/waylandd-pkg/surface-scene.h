@@ -142,7 +142,7 @@ static int surface_tree_commit(struct brook_surface *s,struct brook_image *image
         if(view->opaque)++g_opaque_views;
     }
     struct brook_frame_callback *frame;
-    uint32_t now=g_trace_frames?g_now_ms():0;
+    uint32_t now=g_now_ms();
     wl_list_for_each(frame,&s->pending_frames,link) {
         frame->commit=s->tree.sequence+1;frame->committed_ms=now;
     }

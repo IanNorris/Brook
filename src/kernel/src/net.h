@@ -339,18 +339,12 @@ struct Socket {
     uint32_t  rxTail;
     uint32_t  rxCount;     // bytes available
 
-    // Keep a bounded burst of future packets while a missing segment is
-    // retransmitted. This remains well below the receive buffer budget.
-    static constexpr uint32_t TCP_OOO_SLOT_COUNT = 64;
-    static constexpr uint32_t TCP_OOO_SLOT_SIZE = ETH_MTU;
-    struct TcpOooSlot {
-        uint32_t seq;
-        uint16_t len;
-        uint64_t tick;
-        bool     used;
-    };
-    uint8_t*   tcpOooBuf;
-    TcpOooSlot tcpOooSlots[TCP_OOO_SLOT_COUNT];
+    // One bit per byte of the TCP receive ring marks future data. Each
+    // ring position is fixed relative to rxHead/RCV.NXT while the gap is
+    // outstanding. Readable bytes have no bits set and remain FIFO.
+    static constexpr uint32_t TCP_OOO_WORDS = RX_BUF_SIZE / 64;
+    uint64_t*  tcpOooMap;
+    uint64_t   tcpOooSince;
     uint32_t   tcpOooBytes; // future bytes held, not yet visible to recv()
 
     // For recvfrom: store source address of last received packet

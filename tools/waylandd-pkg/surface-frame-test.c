@@ -33,6 +33,14 @@ int main(void) {
     assert(wl_list_length(&surface.committed_frames)==1);
     assert(wl_event_loop_dispatch(loop,32)==0);
     assert(wl_list_length(&surface.committed_frames)==1);
+    {   /* Status diagnostics name the withheld callback and its image. */
+        char *json=NULL;size_t length=0;FILE *f=open_memstream(&json,&length);assert(f);
+        surface_status_json(f,&surface,g_now_ms());fclose(f);
+        assert(strstr(json,"\"frames\":{\"pending\":0,\"waiting\":0,\"committed\":1,"));
+        assert(strstr(json,"\"state\":\"image_pending\""));
+        assert(strstr(json,"\"current_image\":{\"size\":[1,1],\"view\":[1,1],\"pending_cpu\":1,"));
+        free(json);
+    }
     pending->pending_cpu=0;assert(surface_repaint(&surface));assert(vfb==pixel);
     assert(wl_event_loop_dispatch(loop,32)==0);assert(wl_list_empty(&surface.committed_frames));
     wl_display_flush_clients(display);uint32_t pending_wire[32];
@@ -223,6 +231,14 @@ int main(void) {
     xdg_surface_set_window_geometry(client,surface.xdg_surface,0,0,800,600); // valid smaller accepted size
     assert(surface.toplevel_resizing);surface_commit(client,surface.resource);
     assert(!surface.toplevel_resizing && !surface.configure_size_pending && surface.next_configure_serial!=finalResize);
+    {   /* The configure handshake: newest sent serial vs the client's newest ack. */
+        char *json=NULL;size_t length=0;FILE *f=open_memstream(&json,&length);assert(f);
+        surface_status_json(f,&surface,g_now_ms());fclose(f);
+        char expect[96];
+        snprintf(expect,sizeof(expect),"\"configure\":{\"sent\":%u,\"acked\":%u,",surface.next_configure_serial,finalResize);
+        assert(strstr(json,expect));assert(strstr(json,"\"size_pending\":0,"));
+        free(json);
+    }
     wl_display_flush_clients(display);keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);
     unsigned resizeConfigs=0;
     const unsigned expectedW[]={900,900,960,800},expectedH[]={700,700,720,600};

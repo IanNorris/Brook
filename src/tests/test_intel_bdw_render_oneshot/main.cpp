@@ -97,6 +97,26 @@ struct DeviceOwner {
         __atomic_store_n(reinterpret_cast<uint32_t*>(pages[24].cpu+0x7c),1u,__ATOMIC_RELAXED);return true;}
     void relax(){}bool acknowledgeCsb(unsigned){++acks;return true;}bool retirementContinue(){return held;}
 };
+// gen 440: the GPU finishes while the worker's poll is starved past the
+// deadline. The owner's normal poll stops at `limit`; the job "completes"
+// during that last (starved) yield. BdwDeadlineGrace allows one more check.
+struct GraceOwner : DeviceOwner {
+    unsigned polls=0,limit=3,graceChecks=0;bool completes=true,eligible=true,deadline=false;
+    bool firstCompletion=true,firstRetirement=true;BdwDeadlineGrace completionGrace{},retirementGrace{};
+    explicit GraceOwner(uint32_t* e):DeviceOwner{e}{}
+    void complete(){
+        __atomic_store_n(reinterpret_cast<uint32_t*>(pages[25].cpu),nonce,__ATOMIC_RELAXED);
+        __atomic_store_n(reinterpret_cast<uint64_t*>(pages[24].cpu+0x40),uint64_t{1},__ATOMIC_RELAXED);
+        __atomic_store_n(reinterpret_cast<uint64_t*>(pages[24].cpu+0x48),(uint64_t(contextId)<<32)|0x18,__ATOMIC_RELAXED);
+        __atomic_store_n(reinterpret_cast<uint32_t*>(pages[24].cpu+0x7c),1u,__ATOMIC_RELAXED);
+    }
+    bool immediatePollAllowed(){return !deadline && polls<limit;}
+    bool pollContinue(){if(deadline)return false;if(++polls<limit)return true;if(completes)complete();deadline=true;return false;}
+    bool completionContinue(){const bool used=completionGrace.used;const bool more=completionGrace.Continue(*this,firstCompletion,[this]{return eligible && deadline;});
+        if(more && completionGrace.used && !used)++graceChecks;return more;}
+    bool retirementContinue(){const bool used=retirementGrace.used;const bool more=retirementGrace.Continue(*this,firstRetirement,[this]{return eligible && deadline;});
+        if(more && retirementGrace.used && !used)++graceChecks;return more;}
+};
 static uint32_t word(const BdwOwnedPage& p,unsigned i){const auto* b=p.cpu+4*i;return uint32_t(b[0])|(uint32_t(b[1])<<8)|(uint32_t(b[2])<<16)|(uint32_t(b[3])<<24);}
 int main(){
     {struct PollOwner {unsigned immediate=0,yields=0;bool allowed=true;
@@ -249,4 +269,25 @@ int main(){
      assert(shot.ExecuteTakenOver(a,b,0x800000));assert(shot.PollContextSwitch(b)==BdwCsbPoll::Complete);
      assert(shot.CopyRetiredContext(b,captured) && captured[4096]==0x47505531);
      assert(owner.resets==1 && owner.restores==1 && owner.acks==2 && b.portWriteAttempts()==4);}
+    // Deadline grace: a late completion is accepted with exactly one extra
+    // breadcrumb check and one extra context-status check.
+    {Allocator a;uint64_t ptes[512]{};uint32_t flush=0,engine[1024]{};GraceOwner owner{engine};
+     BdwRenderDeviceBackend<GraceOwner> b(owner,ptes,&flush,engine,65536,42,0x800000);BdwRenderOneShot shot;
+     assert(shot.Prepare(a,65536,42,99,staging));
+     assert(shot.ExecuteTakenOver(a,b,0x800000));
+     assert(owner.deadline && owner.graceChecks==1 && owner.polls==3);
+     auto state=BdwCsbPoll::Pending;
+     while(b.retirementContinue()){state=shot.PollContextSwitch(b);if(state!=BdwCsbPoll::Pending)break;}
+     assert(state==BdwCsbPoll::Complete && owner.graceChecks==2 && !b.retirementContinue());}
+    // The job never completes: still fails, after only the one grace check.
+    {Allocator a;uint64_t ptes[512]{};uint32_t flush=0,engine[1024]{};GraceOwner owner{engine};owner.completes=false;
+     BdwRenderDeviceBackend<GraceOwner> b(owner,ptes,&flush,engine,65536,42,0x800000);BdwRenderOneShot shot;
+     assert(shot.Prepare(a,65536,42,99,staging));assert(!shot.ExecuteTakenOver(a,b,0x800000));
+     assert(shot.LastSubmitSite()==10 && owner.graceChecks==1 && shot.State()==BdwOneShotState::Quarantined);
+     uint32_t seen=0,polls=0;b.completionDiag(seen,polls);assert(seen==0 && polls==4);}
+    // Not eligible (e.g. a failed yield): no grace, the old failure.
+    {Allocator a;uint64_t ptes[512]{};uint32_t flush=0,engine[1024]{};GraceOwner owner{engine};owner.eligible=false;
+     BdwRenderDeviceBackend<GraceOwner> b(owner,ptes,&flush,engine,65536,42,0x800000);BdwRenderOneShot shot;
+     assert(shot.Prepare(a,65536,42,99,staging));assert(!shot.ExecuteTakenOver(a,b,0x800000));
+     assert(shot.LastSubmitSite()==10 && owner.graceChecks==0);}
 }
