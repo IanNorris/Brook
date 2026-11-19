@@ -257,8 +257,27 @@ static void test_machine(void){
     assert(desktop_direct_release(&m,&k,out,2)==2 && m.held==DESKTOP_DIRECT_HOLDS-2);
     assert(desktop_direct_release(&m,&k,out,6)==3 && m.held==1 && m.holds[0].buffer==0x105);
 }
+static void test_overlay_capture(void){
+    const uint64_t n=DESKTOP_APP_OVERLAY_CAPTURE_NS;
+    /* No app driving: every changed overlay is captured, as before. */
+    assert(desktop_app_overlay_capture_due(0,1,100*MS,101*MS,n));
+    /* App driving: at most one capture per interval while one is held. */
+    assert(!desktop_app_overlay_capture_due(1,1,100*MS,101*MS,n));
+    assert(!desktop_app_overlay_capture_due(1,1,100*MS,100*MS+n-1,n));
+    assert(desktop_app_overlay_capture_due(1,1,100*MS,100*MS+n,n));
+    /* No usable capture (first frame, size change) or no history: capture. */
+    assert(desktop_app_overlay_capture_due(1,0,100*MS,101*MS,n));
+    assert(desktop_app_overlay_capture_due(1,1,0,101*MS,n));
+    assert(desktop_app_overlay_capture_due(1,1,200*MS,101*MS,n)); /* clock went back */
+    /* Gen 441 shape: launcher open over a 34 fps game whose overlay changes
+     * every frame. One second of app frames now captures at most 10 times
+     * (the cadence-off run measured 8.3/s; cadence on had 17.5/s). */
+    uint64_t last=0;unsigned captures=0;
+    for(uint64_t t=1*MS;t<1000*MS;t+=29*MS)if(desktop_app_overlay_capture_due(1,captures>0,last,t,n)){++captures;last=t;}
+    assert(captures>=9 && captures<=10);
+}
 int main(void){
-    test_dominance();test_changed();test_cadence();test_geometry();test_buffer();test_scene();test_machine();
+    test_dominance();test_changed();test_cadence();test_geometry();test_overlay_capture();test_buffer();test_scene();test_machine();
     printf("desktop_app_present_test: ok\n");
     return 0;
 }

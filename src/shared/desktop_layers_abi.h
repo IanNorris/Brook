@@ -63,7 +63,8 @@
 // commit once for the focused window.
 #define BROOK_DESKTOP_CLIENT_FRAME 14
 // Focused window and the app-driven present policy (kernel debug commands
-// "desktop present ..."; RAM only, off at boot). address = struct
+// "desktop present ..."; RAM only; boot default: app cadence on, direct
+// scanout shadow). address = struct
 // BrookDesktopFocus, size = its size, a = b = c = 0. window 0: nothing
 // focused. state holds BROOK_WINDOW_STATE_* bits (wm_window_state.h). Older
 // kernels return EINVAL; the renderer then keeps its own cadence.
