@@ -349,12 +349,12 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         Check(prefix + (hover ? "taskbar-hover" : "taskbar"), list, s, 0, layout.y, screenW, screenH - layout.y);
     }
     // The Dell's logical width (3200 at 200%): every diagnostic on, and the
-    // default set (CPU, MEM, temperature), with a dirty build label.
+    // default set (CPU, MEM, temperature), with a payload build label.
     for (const bool all : {true, false}) {
         const uint32_t wideW = 1600 * m.percent / 100;
         const uint32_t set = all ? 127u : (1u << 0 | 1u << 1 | 1u << 6);
         const ChromeTaskbarLayout wide = ChromeTaskbarLayoutFor(s, wideW, screenH, "14:05 19 Nov 2026", false, set, ids, 3, 0,
-                                                                "Brook 6c18bafd+2971b71e", false, labels);
+                                                                "dell-int51-20261119", false, labels);
         ChromeTaskbarModel wm = tb;
         wm.layout = &wide;
         wm.agentShown = false;

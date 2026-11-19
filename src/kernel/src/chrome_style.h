@@ -12,6 +12,16 @@
 
 namespace brook {
 
+// Taskbar spacing tokens (logical px at 100%; Ian, 19 November: the
+// diagnostics were far too wide). One gap between adjacent tray widgets and
+// diagnostics, and one inner pad for chips and labels.
+struct ChromeTaskbarSpacing {
+    static constexpr int Gap = 8;       // between diagnostics, chips and the tray
+    static constexpr int Pad = 4;       // inside a chip; around the clock and build label
+    static constexpr int RowGap = 2;    // between the two stacked rows of a diagnostic
+    static constexpr int GraphBars = 12; // compact cadence graphs (3 px a bar)
+};
+
 struct ChromeStyle {
     const BrookThemePalette* palette;
     const DesktopMetrics* metrics;
