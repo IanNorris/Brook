@@ -2465,14 +2465,15 @@ static void XhciEcmPoll(NetIf* nif){
         IrqSpinLockRelease(&g_eventRingLock,saved);
         return;
     }
-    // Return a batch of credits before entering the network stack. A bounded
-    // burst lets the poller service timers and other interfaces under load.
-    constexpr unsigned Batch=8, MaxBurst=64;
+    // Return one batch of credits before entering the network stack. Yield
+    // dispatch after the batch so the next poll retires USB OUT completions
+    // before this FIFO can fill all transmit slots with TCP acknowledgments.
+    constexpr unsigned Batch=8;
     struct Frame {uint8_t data[1514];uint16_t length;};
     Frame frames[Batch];
-    for(unsigned n=0;n<MaxBurst;n+=Batch){
+    unsigned count=0;
+    {
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-        unsigned count=0;
         while(count<Batch && net.head!=net.tail){
             const auto index=net.head%ECM_RX_PACKETS;
             auto& frame=frames[count++];
@@ -2482,9 +2483,8 @@ static void XhciEcmPoll(NetIf* nif){
         }
         if(count)XhciEcmReceiveArm(net);
         IrqSpinLockRelease(&g_eventRingLock,saved);
-        if(!count)break;
-        for(unsigned i=0;i<count;++i)NetReceive(nif,frames[i].data,frames[i].length);
     }
+    for(unsigned i=0;i<count;++i)NetReceive(nif,frames[i].data,frames[i].length);
     if(early){
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
         net.earlyDispatch=false;

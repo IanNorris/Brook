@@ -685,15 +685,16 @@ frames consume the flight faster. The configured depth fits half the existing
 transfer ring and uses 256 KiB of receive DMA storage. Completion publishes
 the returned buffer immediately when a credit is free. The ordered dispatcher
 returns credits in batches of eight and hands queued work back to the
-existing poller after a bounded burst. A controller error retains DMA
+existing poller after each batch. This lets the next poll retire USB OUT
+completions before it dispatches more frames that can generate TCP ACKs. A controller error retains DMA
 ownership as before.
 
 TCP now retains future bytes in their final positions in the 512 KiB receive
 ring. A 64 KiB bitmap records their presence, merges retransmitted overlaps,
 and keeps the advertised right edge stable as reordered frames arrive.
 The legacy `ooo_full` and `ooo_oversize` counters report zero because the
-store no longer has fixed-size packet slots. `ooo_capacity` records bytes
-beyond the available sequence span. See [RFC 9293, section 3.8.6](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.6)
+store no longer has fixed-size packet slots. `ooo_capacity` counts segments
+that extend beyond the available sequence span. See [RFC 9293, section 3.8.6](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.6)
 for the receive-window behavior.
 
 For a matched Dell speed test, capture `bridge network` immediately before
