@@ -599,6 +599,7 @@ bool WmRouteCapturedPointer(const InputEvent& event) {
     if(event.sequence<=g_pointerCaptureSequence)return true;
     Window* w=&g_windows[g_pointerCaptureIndex];
     if(event.type==InputEventType::MouseMove)return true; // absolute tablet has no raw motion
+    if(event.type==InputEventType::MouseScroll && !InputHasScrollTicks(event))return true;
     const bool queued=event.type==InputEventType::MouseRelativeMove
         ?PushRelativeLocked(w,event,g_pointerCaptureToken)
         :WmInputPush(w,event,g_pointerLocalX,g_pointerLocalY,g_pointerCaptureToken);
@@ -947,6 +948,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
     w.pointerEngageSerial = 0;
     w.pointerDisengaged = false;
+    w.fineScroll = false;
     w.publicationGeneration=w.publishedGeneration=1;
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
@@ -2698,7 +2700,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientH,
                                                const char* title,
                                                bool focusable,
-                                               bool nativeClient)
+                                               bool nativeClient,
+                                               bool fineScroll)
 {
     WmCreateWindowResult res = {};
     VfbGuard guard;
@@ -2718,6 +2721,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     if (idx < 0) return res;
 
     Window& w = g_windows[idx];
+
+    w.fineScroll = fineScroll;
 
     // Allocate the VFB pages kernel-side.
     // Shared display-server windows must prove their client separately.
@@ -3388,6 +3393,16 @@ bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
     slot.x         = localX;
     slot.y         = localY;
     slot.reserved  = captureToken;
+    if (ev.type == InputEventType::MouseScroll && win->fineScroll && !captureToken) {
+        const auto clampV120 = [](int32_t value) {
+            return static_cast<int16_t>(value < (-32768) ? (-32768) :
+                                        value > 32767 ? 32767 : value);
+        };
+        slot.modifiers |= BROOK_WM_SCROLL_FINE | ev.scrollFlags;
+        slot.x = clampV120(ev.deltaY ? ev.deltaY : int32_t(static_cast<int8_t>(ev.scanCode)) * 120);
+        slot.y = clampV120(ev.deltaX ? ev.deltaX : int32_t(static_cast<int8_t>(ev.ascii)) * 120);
+        slot.reserved = uint32_t(uint16_t(localX)) | (uint32_t(uint16_t(localY)) << 16);
+    }
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
     return true;
 }

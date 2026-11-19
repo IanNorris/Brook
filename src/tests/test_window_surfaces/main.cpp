@@ -198,6 +198,30 @@ int main() {
     // its dimensions; restore must clear it without changing the event ABI.
     Window::WmInputEvent discarded[256]{},event{};
     WmInputPop(&window,discarded,256);
+    // WM_POP_INPUT uses two signed v120 fields at offsets 4 and 6,
+    // while the size and legacy coordinate/capture fields stay stable.
+    InputEvent scroll{};
+    scroll.type=InputEventType::MouseScroll;
+    scroll.modifiers=1;
+    scroll.deltaY=-37;
+    scroll.deltaX=83;
+    scroll.scrollFlags=BROOK_WM_SCROLL_FINGER;
+    CHECK(WmInputPush(&window,scroll,451,129));
+    CHECK(WmInputPop(&window,&event,1)==1 && event.x==451 && event.y==129);
+    CHECK(event.modifiers==1 && !event.reserved);
+    window.fineScroll=true;
+    CHECK(WmInputPush(&window,scroll,451,129));
+    CHECK(WmInputPop(&window,&event,1)==1);
+    const uint8_t expected[]={5,0,0,0x61,0xdb,0xff,83,0,0xc3,1,129,0};
+    CHECK(sizeof(event)==sizeof(expected) && !__builtin_memcmp(&event,expected,sizeof(expected)));
+    scroll.scrollFlags=0;
+    scroll.deltaX=scroll.deltaY=0;
+    scroll.scanCode=static_cast<uint8_t>(-2);
+    scroll.ascii=1;
+    CHECK(WmInputPush(&window,scroll,451,129));
+    CHECK(WmInputPop(&window,&event,1)==1 && event.x==-240 && event.y==120);
+    CHECK(event.modifiers==(1 | BROOK_WM_SCROLL_FINE));
+    window.fineScroll=false;
     window.state=WindowState::Maximized;
     CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,1280,720));
     CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);

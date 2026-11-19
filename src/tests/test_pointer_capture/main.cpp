@@ -80,6 +80,23 @@ int main() {
     CHECK(x==1000000 && y==-999999); // No int16 wrapping or last-position overwrite.
     event.type=InputEventType::MouseMove;event.sequence=++sequence;
     CHECK(WmRouteCapturedPointer(event) && !WmInputPop(w,queue,256)); // Absolute motion suppressed.
+    w->fineScroll=true;
+    InputEvent scroll{};
+    scroll.type=InputEventType::MouseScroll;
+    scroll.scrollFlags=BROOK_WM_SCROLL_FINGER;
+    scroll.deltaY=42;
+    scroll.sequence=++sequence;
+    CHECK(WmRouteCapturedPointer(scroll) && !WmInputPop(w,queue,256));
+    scroll.scrollFlags|=BROOK_WM_SCROLL_END;
+    scroll.deltaY=0;
+    scroll.sequence=++sequence;
+    CHECK(WmRouteCapturedPointer(scroll) && !WmInputPop(w,queue,256));
+    scroll.scrollFlags=BROOK_WM_SCROLL_FINGER;
+    scroll.scanCode=1;
+    scroll.deltaY=42;
+    scroll.sequence=++sequence;
+    CHECK(WmRouteCapturedPointer(scroll) && WmInputPop(w,queue,256)==1);
+    CHECK(queue[0].scanCode==1 && queue[0].modifiers==0 && queue[0].reserved==lease);
     // Already-published capture-era events must not hit the next window;
     // a button held across revocation remains quarantined through physical up.
     InputEvent queuedMove{};queuedMove.type=InputEventType::MouseRelativeMove;

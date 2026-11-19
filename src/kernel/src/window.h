@@ -217,6 +217,7 @@ struct Window
 
     // Only compositor-owned copies are published for hardware GL. No raw
     // source resource is retained here after WM_PRESENT_GRES returns.
+    bool fineScroll;
     bool externalCaptured;
     uint32_t externalW,externalH;
     uint64_t publicationGeneration,publishedGeneration;
@@ -234,9 +235,9 @@ struct Window
         uint8_t  scanCode;
         uint8_t  ascii;
         uint8_t  modifiers;
-        int16_t  x;          // client-local pixel (mouse events)
-        int16_t  y;
-        uint32_t reserved;
+        int16_t  x;          // client-local pixel, or vertical v120 for fine scroll
+        int16_t  y;          // client-local pixel, or horizontal v120 for fine scroll
+        uint32_t reserved;   // fine scroll pointer position, capture token or WM event flags
     };
     WmInputEvent inputQueue[WM_INPUT_QUEUE];
     volatile uint32_t inputHead;
@@ -556,7 +557,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientH,
                                                const char* title,
                                                bool focusable = true,
-                                               bool nativeClient = false);
+                                               bool nativeClient = false,
+                                               bool fineScroll = false);
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);

@@ -184,6 +184,7 @@ struct SynapticsOutput {
     int32_t scrollX = 0;          // wheel ticks, positive = right
     int32_t scrollY120 = 0, scrollX120 = 0; // the same motion in 1/120 ticks (smooth scrolling)
     uint8_t buttons = 0;          // bit0 left, bit1 right
+    bool scrollEnded = false;
 };
 
 // One-finger motion, two-finger scroll, clickpad buttons (software button
@@ -208,11 +209,12 @@ public:
 
     // Forget all contact state (used on packet resync): the next packets must
     // re-establish a stable touch before any motion or scroll.
-    void Reset() {
+    bool Reset() {
         ++resets;
         lastFingers_ = 0; haveAnchor_ = false; haveAgm_ = false; stable_ = 0;
         fracX_ = fracY_ = scrollAccX_ = scrollAccY_ = 0; fine120X_ = fine120Y_ = 0; lastZ_ = 0;
         haveContact_ = false; contactRaw_ = 0;
+        return EndScroll();
     }
 
     SynapticsOutput Feed(const SynapticsPacket& p) {
@@ -248,6 +250,7 @@ public:
         buttons_ = uint8_t((click ? clickButton_ : 0) | (p.right ? 2 : 0));
         o.buttons = buttons_;
         if (fingers < 2) haveAgm_ = false;
+        if (fingers != 2 || clickDown_ || Dragging()) o.scrollEnded = EndScroll();
 
         if (fingers == 0 && lastFingers_ != 0) ++resets;  // lift-off clears everything below
         if (fingers != lastFingers_) {           // re-anchor on any count change
@@ -299,6 +302,7 @@ public:
             o.scrollX = Ticks(scrollAccX_, sx);
             o.scrollY120 = Fine120(fine120Y_, sy);
             o.scrollX120 = Fine120(fine120X_, sx);
+            scrolling_ |= o.scrollY120 != 0 || o.scrollX120 != 0;
             if ((o.scrollY || o.scrollX) && (p.z < 2 * cfg_.touchZ || prevZ < 2 * cfg_.touchZ))
                 scrollTicksLowZ += unsigned(Abs(o.scrollY) + Abs(o.scrollX));
         }
@@ -329,6 +333,12 @@ public:
     }
 
 private:
+    bool EndScroll() {
+        const bool ended = scrolling_;
+        scrolling_ = false;
+        return ended;
+    }
+
     static int32_t Abs(int32_t v) { return v < 0 ? -v : v; }
     bool InStrip(int32_t y) const { return y < cfg_.buttonTopY; }
     bool InRight(int32_t x, int32_t y) const { return InStrip(y) && x >= cfg_.buttonSplitX; }
@@ -407,6 +417,7 @@ private:
     SynapticsGestureConfig cfg_;
     int lastFingers_ = 0;
     bool haveAnchor_ = false;
+    bool scrolling_ = false;
     int32_t ax_ = 0, ay_ = 0, fracX_ = 0, fracY_ = 0, scrollAccX_ = 0, scrollAccY_ = 0;
     int32_t fine120X_ = 0, fine120Y_ = 0;
     bool clickDown_ = false, clickTwoFinger_ = false;

@@ -1097,6 +1097,9 @@ static const struct wl_keyboard_listener kb_lis = {
 /* --- Pointer input --- */
 
 static double g_ptr_x = 0, g_ptr_y = 0;
+static uint32_t g_scroll_source = WL_POINTER_AXIS_SOURCE_WHEEL;
+static int64_t g_scroll_delta, g_scroll_remainder;
+static int g_scroll_stopped;
 
 static void on_ptr_enter(void *d, struct wl_pointer *p, uint32_t s,
                            struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y) {
@@ -1107,6 +1110,7 @@ static void on_ptr_enter(void *d, struct wl_pointer *p, uint32_t s,
 static void on_ptr_leave(void *d, struct wl_pointer *p, uint32_t s,
                            struct wl_surface *sf) {
     (void)d; (void)p; (void)s; (void)sf;
+    g_scroll_remainder = 0;
 }
 static void on_ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
                             wl_fixed_t x, wl_fixed_t y) {
@@ -1222,14 +1226,8 @@ static void on_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         }
     }
 }
-static void on_ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
-                          uint32_t axis, wl_fixed_t value) {
-    (void)d; (void)p; (void)t;
-    if (axis != 0) return; /* only vertical scroll */
-    int delta = wl_fixed_to_int(value);
-    if (delta == 0) delta = (value > 0) ? 1 : -1;
-    int scroll_lines = delta > 0 ? 3 : -3;
-
+static void scroll_rows(int scroll_lines) {
+    if (!scroll_lines) return;
     int mx = (int)g_ptr_x;
     int pane_top = PANES_TOP;
 
@@ -1252,12 +1250,41 @@ static void on_ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
         g_needs_redraw = 1;
     }
 }
-static void on_ptr_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
+static void on_ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
+                        uint32_t axis, wl_fixed_t value) {
+    (void)d; (void)t;
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || !value) return;
+    if (wl_pointer_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+        g_scroll_delta += value;
+    else
+        scroll_rows(value > 0 ? 3 : -3);
+}
+static void on_ptr_frame(void *d, struct wl_pointer *p) {
+    (void)d; (void)p;
+    if (g_scroll_delta) {
+        if (g_scroll_source == WL_POINTER_AXIS_SOURCE_FINGER) {
+            /* Three rows per ten Wayland pixels, with sub-row motion carried. */
+            const int32_t units = 10 * 256;
+            const int64_t total = g_scroll_remainder + g_scroll_delta * 3;
+            scroll_rows((int)(total / units));
+            g_scroll_remainder = total % units;
+        } else {
+            scroll_rows(g_scroll_delta > 0 ? 3 : -3);
+            g_scroll_remainder = 0;
+        }
+    }
+    if (g_scroll_stopped) g_scroll_remainder = 0;
+    g_scroll_delta = 0;
+    g_scroll_stopped = 0;
+    g_scroll_source = WL_POINTER_AXIS_SOURCE_WHEEL;
+}
 static void on_ptr_axis_source(void *d, struct wl_pointer *p, uint32_t s) {
-    (void)d; (void)p; (void)s;
+    (void)d; (void)p;
+    g_scroll_source = s;
 }
 static void on_ptr_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) {
-    (void)d; (void)p; (void)t; (void)a;
+    (void)d; (void)p; (void)t;
+    if (a == WL_POINTER_AXIS_VERTICAL_SCROLL) g_scroll_stopped = 1;
 }
 static void on_ptr_axis_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) {
     (void)d; (void)p; (void)a; (void)v;
