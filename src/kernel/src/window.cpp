@@ -106,7 +106,7 @@ static void FocusWindowLocked(int idx);
 
 // Clearwater (refactor stages 2.2 and 2.3): the saved selection (theme,
 // mode, hue). Writers hold g_vfbLock and bump the chrome epoch.
-static uint32_t g_themeSelection = BROOK_THEME_SELECTION_DEFAULT;
+static uint64_t g_themeSelection = BROOK_THEME_SELECTION_DEFAULT;
 // Protected by g_vfbLock. Never reuse an epoch after counter exhaustion.
 static uint64_t g_chromeSettingsEpoch=1;
 // Writers hold g_vfbLock; lock-free readers use this as a sequence counter.
@@ -132,29 +132,32 @@ bool WmSetTaskbarMetrics(uint32_t value){
     CompositorMarkDirty();CompositorWake();return true;
 }
 static bool g_backendBlur=false;
-uint32_t WmGetThemeSelection(){return __atomic_load_n(&g_themeSelection,__ATOMIC_ACQUIRE);}
+static SpinLock g_customThemeLock;
+static BrookHueTokens g_customThemeTokens;
+static WmPalette g_customThemePalettes[2][2];  // [dark chrome][glass]
+
+uint64_t WmGetThemeSelection(){return __atomic_load_n(&g_themeSelection,__ATOMIC_ACQUIRE);}
 bool WmBackendBlur(){return __atomic_load_n(&g_backendBlur,__ATOMIC_ACQUIRE);}
 // The theme in use: the selection resolved against the backend's backdrop
 // blur (Glass, or its Opaque stand-in).
 uint32_t WmResolvedTheme(){
-    const uint32_t s=WmGetThemeSelection();
-    return brook_theme_resolve(brook_selection_theme(s),brook_selection_mode(s),WmBackendBlur());
+    const uint64_t s=WmGetThemeSelection();
+    return brook_theme_resolve(brook_selection_theme(s),WmBackendBlur());
 }
 // The appearance word keeps opacity and blur; its dark and performance bits
 // are views of the selection, for older Settings and GTK apps: dark = the app
 // content in use is dark (Mixed is light), performance = an Opaque theme is
 // selected.
-static uint32_t AppearanceViewBits(uint32_t selection,bool blur){
+static uint32_t AppearanceViewBits(uint64_t selection){
     const unsigned theme=brook_selection_theme(selection),mode=brook_selection_mode(selection);
-    const unsigned resolved=brook_theme_resolve(theme,mode,blur);
-    return (brook_theme_content_dark(resolved,mode)?BROOK_APPEARANCE_DARK:0u)|
+    return (brook_theme_content_dark(mode)?BROOK_APPEARANCE_DARK:0u)|
            (theme!=BROOK_THEME_GLASS?BROOK_APPEARANCE_PERFORMANCE:0u);
 }
 uint32_t WmGetAppearance(){
     const uint32_t stored=__atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE)&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
-    return stored|AppearanceViewBits(WmGetThemeSelection(),WmBackendBlur());
+    return stored|AppearanceViewBits(WmGetThemeSelection());
 }
-static void PublishThemeSelectionLocked(uint32_t selection){
+static void PublishThemeSelectionLocked(uint64_t selection){
     if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
     __atomic_store_n(&g_themeSelection,selection,__ATOMIC_RELEASE);
 }
@@ -165,32 +168,51 @@ bool WmSetAppearance(uint32_t value){
         if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
         // Dark and performance bits that disagree with the selection are an
         // older Settings speaking: read them as aliases, as settings.ini's.
-        const uint32_t selection=WmGetThemeSelection();
-        const uint32_t view=AppearanceViewBits(selection,WmBackendBlur());
+        const uint64_t selection=WmGetThemeSelection();
+        const uint32_t view=AppearanceViewBits(selection);
         const uint32_t asked=value&(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE);
         if(asked!=view){
             const bool dark=value&BROOK_APPEARANCE_DARK;
-            unsigned theme=BROOK_THEME_GLASS,mode=brook_selection_mode(selection);
-            if(value&BROOK_APPEARANCE_PERFORMANCE)theme=dark?BROOK_THEME_OPAQUE_DARK:BROOK_THEME_OPAQUE_LIGHT;
-            if(theme!=BROOK_THEME_GLASS || brook_theme_content_dark(brook_theme_resolve(theme,mode,WmBackendBlur()),mode)!=dark)
-                mode=dark?BROOK_MODE_DARK:BROOK_MODE_LIGHT;
-            PublishThemeSelectionLocked(BROOK_THEME_SELECTION(theme,mode,brook_selection_hue(selection)));
+            const unsigned theme=value&BROOK_APPEARANCE_PERFORMANCE?BROOK_THEME_OPAQUE:BROOK_THEME_GLASS;
+            unsigned mode=brook_selection_mode(selection);
+            if(brook_theme_content_dark(mode)!=dark)mode=dark?BROOK_MODE_DARK:BROOK_MODE_LIGHT;
+            PublishThemeSelectionLocked(brook_selection_make(theme,mode,brook_selection_hue(selection),
+                                                             brook_selection_rgb(selection)));
         }
         __atomic_store_n(&g_appearance,value&~uint32_t(BROOK_APPEARANCE_DARK|BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_RELEASE);
     }
     CompositorMarkDirty();CompositorWake();return true;
 }
-bool WmSetThemeSelection(uint32_t selection){
+static void BuildThemePalettes(const BrookHueTokens& tokens,WmPalette (&palettes)[2][2]){
+    for(unsigned dark=0;dark<2;++dark)for(unsigned glass=0;glass<2;++glass)
+        brook_theme_build_palette(&tokens,glass?BROOK_THEME_GLASS:BROOK_THEME_OPAQUE,
+                                  int(dark),&palettes[dark][glass]);
+}
+bool WmSetThemeSelection(uint64_t selection){
     if(!brook_selection_valid(selection))return false;
-    {VfbGuard guard;PublishThemeSelectionLocked(selection);}
+    if(brook_selection_hue(selection)==BROOK_HUE_CUSTOM){
+        BrookHueTokens tokens;
+        WmPalette palettes[2][2];
+        brook_hue_derive_selection(selection,&tokens);
+        BuildThemePalettes(tokens,palettes);
+        VfbGuard guard;
+        SpinLockAcquire(&g_customThemeLock);
+        g_customThemeTokens=tokens;
+        for(unsigned dark=0;dark<2;++dark)for(unsigned glass=0;glass<2;++glass)
+            g_customThemePalettes[dark][glass]=palettes[dark][glass];
+        PublishThemeSelectionLocked(selection);
+        SpinLockRelease(&g_customThemeLock);
+    }else{
+        VfbGuard guard;
+        PublishThemeSelectionLocked(selection);
+    }
     CompositorMarkDirty();CompositorWake();return true;
 }
-// Debug "gpu glass on|off": Glass, or the Opaque theme for the mode.
+// Debug "gpu glass on|off" changes the material and preserves the mode.
 void WmSetPerformanceMode(bool enabled){
-    const uint32_t s=WmGetThemeSelection();
-    const unsigned mode=brook_selection_mode(s);
-    const unsigned theme=!enabled?BROOK_THEME_GLASS:mode==BROOK_MODE_LIGHT?BROOK_THEME_OPAQUE_LIGHT:BROOK_THEME_OPAQUE_DARK;
-    WmSetThemeSelection(BROOK_THEME_SELECTION(theme,mode,brook_selection_hue(s)));
+    const uint64_t s=WmGetThemeSelection();
+    WmSetThemeSelection(brook_selection_make(enabled?BROOK_THEME_OPAQUE:BROOK_THEME_GLASS,
+                                              brook_selection_mode(s),brook_selection_hue(s),brook_selection_rgb(s)));
 }
 // Stage 1.5: the backend's backdrop-blur capability, set by the compositor at
 // each frame boundary. A change re-resolves the theme (Glass or its Opaque
@@ -226,33 +248,45 @@ static void EnsureThemeTables(){
     if(!g_themeTablesReady){
         for(unsigned hue=0;hue<BROOK_HUE_COUNT;++hue){
             brook_hue_derive(hue,&g_hueTokens[hue]);
-            for(unsigned dark=0;dark<2;++dark)for(unsigned glass=0;glass<2;++glass)
-                brook_theme_build_palette(&g_hueTokens[hue],glass?BROOK_THEME_GLASS:
-                                          dark?BROOK_THEME_OPAQUE_DARK:BROOK_THEME_OPAQUE_LIGHT,
-                                          int(dark),&g_themePalettes[hue][dark][glass]);
+            BuildThemePalettes(g_hueTokens[hue],g_themePalettes[hue]);
         }
         __atomic_store_n(&g_themeTablesReady,true,__ATOMIC_RELEASE);
     }
     SpinLockRelease(&g_themeTablesLock);
 }
-const BrookHueTokens& WmHueTokens(){
-    EnsureThemeTables();
-    const uint32_t hue=brook_selection_hue(WmGetThemeSelection());
-    return g_hueTokens[hue<BROOK_HUE_COUNT?hue:0];
+// The chrome epoch covers changes in the custom RGB bits.
+uint32_t WmGetTheme() {
+    const uint64_t selection=WmGetThemeSelection();
+    return uint32_t(selection & 0x1fffu) | brook_theme_resolve(brook_selection_theme(selection),WmBackendBlur()) << 16;
 }
-// Changes with the selection and with what it resolves to (chrome keys).
-uint32_t WmGetTheme() { return WmGetThemeSelection() | WmResolvedTheme() << 16; }
-const WmPalette& WmCurrentPalette() {
+
+WmPalette WmCurrentPalette() {
     EnsureThemeTables();
-    const uint32_t s=WmGetThemeSelection();
-    const unsigned resolved=WmResolvedTheme(),hue=brook_selection_hue(s);
-    const unsigned dark=brook_theme_chrome_dark(resolved,brook_selection_mode(s))?1:0;
-    return g_themePalettes[hue<BROOK_HUE_COUNT?hue:0][dark][resolved==BROOK_THEME_GLASS?1:0];
+    const uint64_t initial=WmGetThemeSelection();
+    const bool custom=brook_selection_hue(initial)==BROOK_HUE_CUSTOM;
+    if(custom)SpinLockAcquire(&g_customThemeLock);
+    const uint64_t s=custom?WmGetThemeSelection():initial;
+    const unsigned mode=brook_selection_mode(s),hue=brook_selection_hue(s);
+    const unsigned resolved=brook_theme_resolve(brook_selection_theme(s),WmBackendBlur());
+    const unsigned dark=brook_theme_chrome_dark(mode)?1:0,glass=resolved==BROOK_THEME_GLASS?1:0;
+    const WmPalette result=hue==BROOK_HUE_CUSTOM?g_customThemePalettes[dark][glass]:g_themePalettes[hue][dark][glass];
+    if(custom)SpinLockRelease(&g_customThemeLock);
+    return result;
+}
+static BrookContentTokens CurrentContent(){
+    EnsureThemeTables();
+    const uint64_t initial=WmGetThemeSelection();
+    const bool custom=brook_selection_hue(initial)==BROOK_HUE_CUSTOM;
+    if(custom)SpinLockAcquire(&g_customThemeLock);
+    const uint64_t s=custom?WmGetThemeSelection():initial;
+    const unsigned mode=brook_selection_mode(s),hue=brook_selection_hue(s);
+    const unsigned dark=brook_theme_content_dark(mode)?1:0;
+    const BrookContentTokens result=(hue==BROOK_HUE_CUSTOM?g_customThemeTokens:g_hueTokens[hue]).content[dark];
+    if(custom)SpinLockRelease(&g_customThemeLock);
+    return result;
 }
 uint32_t WmContentColour(unsigned index){
-    const uint32_t s=WmGetThemeSelection();
-    const unsigned mode=brook_selection_mode(s);
-    const BrookContentTokens& c=WmHueTokens().content[brook_theme_content_dark(WmResolvedTheme(),mode)?1:0];
+    const BrookContentTokens c=CurrentContent();
     switch(index){
     case BROOK_CONTENT_BACKGROUND: return c.background;
     case BROOK_CONTENT_INK: return c.ink;
@@ -271,7 +305,7 @@ uint32_t WmContentColour(unsigned index){
 bool WmSetTheme(uint32_t legacyPalette)
 {
     if (legacyPalette >= BROOK_LEGACY_PALETTE_COUNT) return false;
-    const uint32_t s=WmGetThemeSelection();
+    const uint64_t s=WmGetThemeSelection();
     return WmSetThemeSelection(BROOK_THEME_SELECTION(brook_selection_theme(s),brook_selection_mode(s),
                                                      brook_legacy_palette_hue(legacyPalette)));
 }
@@ -358,15 +392,15 @@ static void WmRestoreTheme()
             }
         }
     }
-    uint32_t selection=brook_theme_settings_selection(&themeSettings);
+    uint64_t selection=brook_theme_settings_selection(&themeSettings);
     char glass[8]{};
     if(FwCfgReadFile("opt/glass",glass,sizeof(glass)-1)) {
-        // QEMU's glass switch: Glass, or the Opaque theme for the mode.
+        // QEMU's Glass switch leaves mode and accent intact.
         const unsigned mode=brook_selection_mode(selection),hue=brook_selection_hue(selection);
         if(glass[0]=='0'||(glass[0]=='o'&&glass[1]=='f'))
-            selection=BROOK_THEME_SELECTION(mode==BROOK_MODE_LIGHT?BROOK_THEME_OPAQUE_LIGHT:BROOK_THEME_OPAQUE_DARK,mode,hue);
+            selection=brook_selection_make(BROOK_THEME_OPAQUE,mode,hue,brook_selection_rgb(selection));
         else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))
-            selection=BROOK_THEME_SELECTION(BROOK_THEME_GLASS,mode,hue);
+            selection=brook_selection_make(BROOK_THEME_GLASS,mode,hue,brook_selection_rgb(selection));
     }
     WmSetThemeSelection(selection);
     SerialPrintf("WM: theme %s mode %s accent %s\n",brook_theme_key(brook_selection_theme(selection)),
@@ -1841,8 +1875,7 @@ static uint64_t g_materialRebuilds=0;
 // scale change, which also changes every chrome key, so a capture that read
 // it mid-rebuild is discarded as stale.
 static SpinLock g_chromeMaterialLock;
-const ChromeMaterialCache& WmChromeMaterial(){
-    const auto& p=WmCurrentPalette();
+static const ChromeMaterialCache& WmChromeMaterial(const WmPalette& p){
     SpinLockAcquire(&g_chromeMaterialLock);
     if(g_chromeMaterial.Ensure(p.titleActive,p.titleInactive,CompositorMaterialOpacity(),
                               WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(8),WmMetric(WM_BORDER_WIDTH),
@@ -1851,14 +1884,16 @@ const ChromeMaterialCache& WmChromeMaterial(){
     SpinLockRelease(&g_chromeMaterialLock);
     return g_chromeMaterial;
 }
+const ChromeMaterialCache& WmChromeMaterial(){return WmChromeMaterial(WmCurrentPalette());}
 uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
 
 // The builders' view of the WM's theme, scale, font and material state.
 ChromeStyle WmChromeStyle()
 {
     const bool glass = CompositorGlassActive();
-    return {&WmCurrentPalette(), &WmDesktopMetrics(), &WmChromeFonts(), glass, CompositorMaterialOpacity(),
-            glass ? &WmChromeMaterial() : nullptr};
+    const WmPalette palette=WmCurrentPalette();
+    return {palette, &WmDesktopMetrics(), &WmChromeFonts(), glass, CompositorMaterialOpacity(),
+            glass ? &WmChromeMaterial(palette) : nullptr};
 }
 // Shell surfaces are built and executed on the compositor thread only; they
 // share this list storage (too large for the stack).
