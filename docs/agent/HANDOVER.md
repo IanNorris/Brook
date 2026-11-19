@@ -95,6 +95,13 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Clearwater launcher and taskbar (Ian, 19 Nov):** Claude agent on `work/launcher` (from int51).
+- **Launcher:** freestanding model and builder for stage 3; search, Pinned, Recent, All apps, keyboard navigation, pin/unpin; Glass and Opaque.
+- **Launcher footer:** no keyboard hints and no Organise button.
+- **Taskbar:** condensed — too wide with all diagnostics on and too much padding.
+- **Codex** was told to keep its stage 3 launcher move mechanical.
+- **Dell capture:** `hw_transfer action=frame` works but returns the kernel's CPU backbuffer (Opaque stand-in), not the GPU-presented scanout. Claude agent `work/hw-capture` fixes it and adds window capture.
+
 **19 Nov evening: Dell on gen 454 = `work/integration51` 6c18bafd** (int50 + `work/glass-stale`: lighter blur levels, renderer's own present keeps blur; session `7400bb3e38f64a26a2834571c6e5e89d`).
 - **Lighter blur:** Ian says Light "looks great".
 - **Glass→opaque glitch persists:** backend_blur_changes 29. Likely a lease lapse during direct-scanout/stale streaks. The agent was re-briefed on `work/glass-stale` to add per-branch reason counters and fix.
