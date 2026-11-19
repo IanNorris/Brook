@@ -397,7 +397,7 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
 // Preserve any newer pending ACK and its earlier timer.
 static uint64_t g_tcpAckSubmissionFailures=0;
 struct TcpReceiveDiagnostics {
-    uint64_t oooArrivals,oooStored,oooOverlap,oooCapacity,oooOversize,oooFull,clippedSegments;
+    uint64_t oooArrivals,oooStored,oooOverlap,oooCapacity,clippedSegments;
 };
 static TcpReceiveDiagnostics g_tcpReceiveDiagnostics{};
 static void TcpRequeueFailedAck(Socket& s)
@@ -2184,11 +2184,13 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
         socket.identity = {g_socketInodes.allocate(), uid, gid};
         socket.ownerPid = pid;
         socket.rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
-        if (socket.rxBuf && type == SOCK_STREAM)
-            socket.tcpOooBuf = static_cast<uint8_t*>(kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
-        if (!socket.identity.inode || !socket.rxBuf || (type == SOCK_STREAM && !socket.tcpOooBuf)) {
+        if (socket.rxBuf && type == SOCK_STREAM) {
+            socket.tcpOooMap = static_cast<uint64_t*>(kmalloc(Socket::TCP_OOO_WORDS * sizeof(uint64_t)));
+            if(socket.tcpOooMap)memset(socket.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+        }
+        if (!socket.identity.inode || !socket.rxBuf || (type == SOCK_STREAM && !socket.tcpOooMap)) {
             if (socket.rxBuf) kfree(socket.rxBuf);
-            if (socket.tcpOooBuf) kfree(socket.tcpOooBuf);
+            if (socket.tcpOooMap) kfree(socket.tcpOooMap);
             flags = IrqSpinLockAcquire(&g_socketRegistryLock);
             ResetSocketPayload(socket);
             g_sockReserved[i] = false;
@@ -2471,7 +2473,7 @@ static void SockFinalize(int sockIdx)
     SpinLockAcquire(&s.lock);
     SetSocketWaiterLocked(s, nullptr);
     SpinLockRelease(&s.lock);
-    if (s.tcpOooBuf) kfree(s.tcpOooBuf);
+    if (s.tcpOooMap) kfree(s.tcpOooMap);
     if (s.rxBuf) kfree(s.rxBuf);
     ResetSocketPayload(s);
     flags = IrqSpinLockAcquire(&g_socketRegistryLock);
@@ -2834,154 +2836,124 @@ static bool TcpSeqAfter(uint32_t a, uint32_t b)
 
 static uint32_t TcpReceiveFree(const Socket& s)
 {
-    uint32_t used = s.rxCount + s.tcpOooBytes;
-    return used >= Socket::RX_BUF_SIZE ? 0 : Socket::RX_BUF_SIZE - used;
+    // The window is a sequence span, not a count of unallocated bytes.
+    // Future bytes already occupy positions within that span. Subtracting
+    // them again moves its right edge backwards after every reordered packet.
+    return s.rxCount<Socket::RX_BUF_SIZE ? Socket::RX_BUF_SIZE-s.rxCount : 0;
 }
 
-static void TcpReapOoo(Socket& s, uint64_t now)
+static void TcpReapOoo(Socket& s,uint64_t now)
 {
     static constexpr uint64_t TCP_OOO_REAP_MS = 30000;
-    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-        auto& slot = s.tcpOooSlots[i];
-        if (!slot.used || !TcpTimerElapsed(now, slot.tick, TCP_OOO_REAP_MS))
-            continue;
+    if(!s.tcpOooBytes || !TcpTimerElapsed(now,s.tcpOooSince,TCP_OOO_REAP_MS))return;
+    memset(s.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+    s.tcpOooBytes=0;
+}
 
-        if (s.tcpOooBytes >= slot.len)
-            s.tcpOooBytes -= slot.len;
-        else
-            s.tcpOooBytes = 0;
-        slot.used = false;
-        slot.len = 0;
+static uint64_t TcpOooMask(uint32_t count)
+{
+    return count==64 ? ~uint64_t{0} : (uint64_t{1}<<count)-1;
+}
+
+// The start and length are always within the same receive window. Traverse
+// ring words rather than packet descriptors, including across ring wrap.
+template<class Apply> static void TcpVisitOooWords(uint32_t position,uint32_t length,Apply&& apply)
+{
+    uint32_t consumed=0;
+    while(consumed<length){
+        const uint32_t bit=position%64;
+        uint32_t count=64-bit;
+        if(count>length-consumed)count=length-consumed;
+        apply(position,bit,count,consumed);
+        position=(position+count)%Socket::RX_BUF_SIZE;
+        consumed+=count;
     }
 }
 
-static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
-                        uint32_t len, uint64_t now)
+static void TcpClearOoo(Socket& s,uint32_t position,uint32_t length)
 {
-    if (!s.tcpOooBuf || !data || len == 0)
-        return false;
+    if(!s.tcpOooBytes)return;
+    TcpVisitOooWords(position,length,[&](uint32_t byte,uint32_t bit,uint32_t count,uint32_t){
+        const uint64_t mask=TcpOooMask(count)<<bit;
+        auto& word=s.tcpOooMap[byte/64];
+        // Clang lowers 64-bit popcount to a runtime helper on builds
+        // without POPCNT, so count full words and scan only partial words.
+        uint64_t occupied=word&mask;
+        if(occupied==mask)s.tcpOooBytes-=count;
+        else while(occupied){occupied&=occupied-1;--s.tcpOooBytes;}
+        word&=~mask;
+    });
+}
 
-    uint32_t end = seq + len;
-    if (!TcpSeqAfter(end, s.tcpRcvNxt))
-        return false;
-
-    if (TcpSeqBefore(seq, s.tcpRcvNxt)) {
-        uint32_t trim = s.tcpRcvNxt - seq;
-        data += trim;
-        len -= trim;
-        seq = s.tcpRcvNxt;
-        end = seq + len;
-    }
-    if (len == 0)
-        return false;
-    if (len > Socket::TCP_OOO_SLOT_SIZE) {
-        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOversize,1,__ATOMIC_RELAXED);
-        s.oooDropCount++;
-        if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-            SerialPrintf("tcp: OOO TOOLARGE pid=%u seq=%u len=%u drop=%u\n",
-                         s.ownerPid, seq, len, s.oooDropCount);
-        return false;
-    }
-
-    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-        const auto& slot = s.tcpOooSlots[i];
-        if (!slot.used)
-            continue;
-        uint32_t slotEnd = slot.seq + slot.len;
-        bool disjoint = !TcpSeqBefore(seq, slotEnd) || !TcpSeqBefore(slot.seq, end);
-        if (!disjoint) {
-            __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOverlap,1,__ATOMIC_RELAXED);
-            s.oooDropCount++;
-            if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-                SerialPrintf("tcp: OOO OVERLAP pid=%u seq=%u len=%u slotSeq=%u slotLen=%u drop=%u\n",
-                             s.ownerPid, seq, len, slot.seq, slot.len, s.oooDropCount);
-            return false;
-        }
-    }
-
-    if (len > TcpReceiveFree(s)) {
+static bool TcpStoreOoo(Socket& s,uint32_t seq,const uint8_t* data,uint32_t len,uint64_t now)
+{
+    if(!s.tcpOooMap || !data || !len)return false;
+    const uint32_t distance=seq-s.tcpRcvNxt;
+    const uint32_t window=TcpReceiveFree(s);
+    if(distance>=window){
         __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
-        s.oooDropCount++;
-        if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-            SerialPrintf("tcp: OOO CAPACITY pid=%u seq=%u len=%u free=%u drop=%u bytes=%u\n",
-                         s.ownerPid, seq, len, TcpReceiveFree(s),
-                         s.oooDropCount, s.tcpOooBytes);
+        ++s.oooDropCount;
         return false;
     }
-
-    for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-        auto& slot = s.tcpOooSlots[i];
-        if (slot.used)
-            continue;
-
-        memcpy(s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE, data, len);
-        slot.seq = seq;
-        slot.len = static_cast<uint16_t>(len);
-        slot.tick = now;
-        slot.used = true;
-        s.tcpOooBytes += len;
-        s.oooHeldCount++;
-        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooStored,1,__ATOMIC_RELAXED);
-        if (s.oooHeldCount <= 5 || (s.oooHeldCount % 50) == 0) {
-            int32_t gap = static_cast<int32_t>(seq - s.tcpRcvNxt);
-            SerialPrintf("tcp: OOO HELD pid=%u seq=%u rcvNxt=%u gap=%d len=%u held=%u bytes=%u\n",
-                         s.ownerPid, seq, s.tcpRcvNxt, gap, len,
-                         s.oooHeldCount, s.tcpOooBytes);
-        }
-        return true;
+    if(len>window-distance){
+        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
+        len=window-distance;
     }
-
-    __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooFull,1,__ATOMIC_RELAXED);
-    s.oooDropCount++;
-    if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
-        SerialPrintf("tcp: OOO FULL pid=%u seq=%u rcvNxt=%u len=%u drop=%u bytes=%u\n",
-                     s.ownerPid, seq, s.tcpRcvNxt, len, s.oooDropCount, s.tcpOooBytes);
-    return false;
+    uint32_t added=0;
+    TcpVisitOooWords((s.rxHead+distance)%Socket::RX_BUF_SIZE,len,
+        [&](uint32_t position,uint32_t bit,uint32_t count,uint32_t consumed){
+            const uint64_t mask=TcpOooMask(count)<<bit;
+            auto& word=s.tcpOooMap[position/64];
+            const uint64_t occupied=word&mask;
+            if(!occupied){
+                memcpy(s.rxBuf+position,data+consumed,count);
+                added+=count;
+            }else if(occupied!=mask){
+                uint64_t missing=(mask&~occupied)>>bit;
+                while(missing){
+                    const unsigned index=__builtin_ctzll(missing);
+                    s.rxBuf[position+index]=data[consumed+index];
+                    missing&=missing-1;
+                    ++added;
+                }
+            }
+            word|=mask;
+        });
+    if(added<len)__atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOverlap,1,__ATOMIC_RELAXED);
+    if(!added)return false;
+    if(!s.tcpOooBytes)s.tcpOooSince=now;
+    s.tcpOooBytes+=added;
+    ++s.oooHeldCount;
+    __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooStored,1,__ATOMIC_RELAXED);
+    return true;
 }
 
 static bool TcpDrainOoo(Socket& s)
 {
-    bool drained = false;
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
-            auto& slot = s.tcpOooSlots[i];
-            if (!slot.used)
-                continue;
-
-            uint32_t end = slot.seq + slot.len;
-            // A retransmission may already have supplied the entire slot.
-            // Release its accounting immediately instead of retaining it
-            // until the OOO reap timeout.
-            if (!TcpSeqAfter(end, s.tcpRcvNxt)) {
-                s.tcpOooBytes = s.tcpOooBytes >= slot.len ? s.tcpOooBytes - slot.len : 0;
-                slot.used = false;
-                slot.len = 0;
-                continue;
-            }
-            if (TcpSeqAfter(slot.seq, s.tcpRcvNxt))
-                continue;
-
-            uint32_t offset = s.tcpRcvNxt - slot.seq;
-            uint32_t len = slot.len - offset;
-            const uint8_t* data = s.tcpOooBuf + i * Socket::TCP_OOO_SLOT_SIZE + offset;
-            if (s.tcpOooBytes >= slot.len)
-                s.tcpOooBytes -= slot.len;
-            else
-                s.tcpOooBytes = 0;
-            slot.used = false;
-            slot.len = 0;
-
-            TcpEnqueueData(s, data, len);
-            s.tcpRcvNxt += len;
-            s.oooDrainCount++;
-            drained = true;
-            progress = true;
-            break;
-        }
+    // FIN consumes sequence space without moving the ring write index.
+    // Discard any pre-FIN speculative data beyond that end of stream.
+    if(s.tcpFinRecv || s.tcpRstRecv){
+        if(s.tcpOooBytes)memset(s.tcpOooMap,0,Socket::TCP_OOO_WORDS*sizeof(uint64_t));
+        s.tcpOooBytes=0;
+        return false;
     }
-    return drained;
+    uint32_t drained=0;
+    while(s.tcpOooBytes){
+        const unsigned bit=s.rxHead%64;
+        auto& word=s.tcpOooMap[s.rxHead/64];
+        const uint64_t pending=word>>bit;
+        if(!(pending&1))break;
+        const uint64_t missing=(~pending)&TcpOooMask(64-bit);
+        const unsigned count=missing ? __builtin_ctzll(missing) : 64-bit;
+        word&=~(TcpOooMask(count)<<bit);
+        s.rxHead=(s.rxHead+count)%Socket::RX_BUF_SIZE;
+        s.tcpOooBytes-=count;
+        drained+=count;
+    }
+    s.rxCount+=drained;
+    s.tcpRcvNxt+=drained;
+    if(drained)++s.oooDrainCount;
+    return drained!=0;
 }
 
 static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
@@ -3066,12 +3038,13 @@ static void TcpEnqueueData(Socket& s, const void* data, uint32_t len)
     uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
     if (len > avail) len = avail;
 
-    const uint8_t* d = static_cast<const uint8_t*>(data);
-    for (uint32_t i = 0; i < len; i++) {
-        s.rxBuf[s.rxHead] = d[i];
-        s.rxHead = (s.rxHead + 1) % Socket::RX_BUF_SIZE;
-    }
-    __asm__ volatile("mfence" ::: "memory");
+    TcpClearOoo(s,s.rxHead,len);
+    const auto* bytes=static_cast<const uint8_t*>(data);
+    const uint32_t tail=Socket::RX_BUF_SIZE-s.rxHead;
+    const uint32_t first=len<tail?len:tail;
+    memcpy(s.rxBuf+s.rxHead,bytes,first);
+    if(len>first)memcpy(s.rxBuf,bytes+first,len-first);
+    s.rxHead=(s.rxHead+len)%Socket::RX_BUF_SIZE;
     s.rxCount += len;
     // Caller (HandleTcp) wakes pollWaiter after releasing the lock.
 }
@@ -5434,8 +5407,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("ooo_stored",__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_overlap",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED));
         r.text(",");r.field("ooo_capacity",__atomic_load_n(&g_tcpReceiveDiagnostics.oooCapacity,__ATOMIC_RELAXED));
-        r.text(",");r.field("ooo_oversize",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOversize,__ATOMIC_RELAXED));
-        r.text(",");r.field("ooo_full",__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED));
+        // Legacy fixed-slot diagnostics. The bitmap has no slot length
+        // or slot count limit. Out-of-window data is ooo_capacity.
+        r.text(",");r.field("ooo_oversize",0);
+        r.text(",");r.field("ooo_full",0);
         r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));r.text("}");
         r.text("}\n");r.send();return;
     }

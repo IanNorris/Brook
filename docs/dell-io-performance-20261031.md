@@ -670,3 +670,38 @@ complements the separate test of a later fault after an acknowledged MSS.
 The comparison uses `tcp_send_chunks.c` with `4096 writev 4` or
 `4096 sendmsg 4`; its existing single-send mode remains available. The host
 loopback smoke check also passed all three modes with matching hashes.
+
+## November 19 receive follow-up
+
+Generation 442 downloaded at 42.6 Mbps and uploaded at 77.2 Mbps in a Dell
+browser speed test. The ECM driver counted 102 entries with no outstanding IN
+TDs. TCP recorded 25,624 failures to find a free out-of-order slot.
+
+The existing `/etc/usb-net-rx8` marker now selects a receive flight of 128 IN
+TDs. At 1 Gb/s, that covers about 1.57 ms of full-sized Ethernet frames,
+including ordinary Ethernet framing overhead. Another 128 frame credits give
+the FIFO the same amount of slack while the flight remains posted. Small
+frames consume the flight faster. The configured depth fits half the existing
+transfer ring and uses 256 KiB of receive DMA storage. Completion publishes
+the returned buffer immediately when a credit is free. The ordered dispatcher
+returns credits in batches of eight and hands queued work back to the
+existing poller after a bounded burst. A controller error retains DMA
+ownership as before.
+
+TCP now retains future bytes in their final positions in the 512 KiB receive
+ring. A 64 KiB bitmap records their presence, merges retransmitted overlaps,
+and keeps the advertised right edge stable as reordered frames arrive.
+The legacy `ooo_full` and `ooo_oversize` counters report zero because the
+store no longer has fixed-size packet slots. `ooo_capacity` records bytes
+beyond the available sequence span. See [RFC 9293, section 3.8.6](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.6)
+for the receive-window behavior.
+
+For a matched Dell speed test, capture `bridge network` immediately before
+and after each download. Check `rx_depth=128`, an armed receive flight during
+traffic, fewer `rx_zero_outstanding_entries` and `rx_backpressure_entries`,
+and a flat `rx_dropped` counter. Compare `rx_dispatch_busy` with queue
+high-water because the counter now excludes contention when the FIFO is empty.
+Check for a flat `ooo_full` counter and record `ooo_arrivals`, `ooo_stored`,
+`ooo_overlap` and `ooo_capacity` alongside the download rate. Keep the host,
+browser, test server and link fixed. CDC-NCM needs an adapter-supported NCM
+interface and an additional transfer format, so this change stays with ECM.

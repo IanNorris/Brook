@@ -5,11 +5,15 @@ Run inside nix-shell after building the kernel. Only disposable images are
 opened; no physical USB, host desktop or audio is used. The workload only contacts localhost services;
 the guest may also perform its ordinary boot-time DNS probe.
 """
-import argparse,hashlib,json,os,shutil,socket,struct,subprocess,tempfile,threading,time
+import argparse,hashlib,json,os,re,shutil,socket,struct,subprocess,tempfile,threading,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',required=True,type=Path)
-ap.add_argument('--rx-depth8',action='store_true',help='Exercise the opt-in eight-request ECM receive path')
+ap.add_argument('--rx-depth8',action='store_true',help='Enable the historical Dell marker for deep ECM receive')
+ap.add_argument('--expected-rx-depth',type=int,choices=(1,8,128),help='Override depth assertion for a baseline image')
+ap.add_argument('--rx-throughput-mib',type=int,choices=range(65),default=0,metavar='0..64',
+                help='Verify a one-way host-to-guest TCP stream and record its throughput')
+ap.add_argument('--build',type=Path,default=ROOT/'build/release',help='Use this matching kernel, modules and UEFI loader')
 ap.add_argument('--tx-depth16',action='store_true',help='Exercise the opt-in sixteen-frame ECM transmit path')
 ap.add_argument('--tcp-window16',action='store_true',help='Exercise the opt-in 16 KiB TCP receive-window cap')
 ap.add_argument('--tcp-flight2',action='store_true',help='Exercise and capture the experimental two-packet TCP send flight')
@@ -35,6 +39,7 @@ ap.add_argument('--small-write-benchmark',action='store_true',help='Measure a 1 
 ap.add_argument('--async-pool-test',action='store_true',help='Exercise poll/epoll while the async TCP worker pool is saturated')
 ap.add_argument('--async-blocked-close',action='store_true',help='Exercise close while an async writer is blocked by backpressure')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
+expected_rx_depth=args.expected_rx_depth or (128 if args.rx_depth8 else 1)
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
 if args.tcp_async_neighbor and (not args.arp_async_probe or not any((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight,args.tcp_adaptive_flight16))):ap.error('--tcp-async-neighbor requires --arp-async-probe and a TCP flight mode')
 if args.tcp_try_transmit and not args.tcp_async_neighbor:ap.error('--tcp-try-transmit requires --tcp-async-neighbor')
@@ -68,6 +73,10 @@ def echo_tcp():
     if not b:raise RuntimeError('Incomplete guest upload')
     started=time.monotonic_ns();b+=exact(s,32768-len(b));tcp_tail_receive_ns.append(time.monotonic_ns()-started)
     assert b==bytes((i*13+p*7)%251 for i in range(32768));s.sendall(b)
+   if args.rx_throughput_mib:
+    assert exact(s,1)==b'B'
+    block=bytes((i*17+3)%251 for i in range(32768))
+    for _ in range(args.rx_throughput_mib*32):s.sendall(block)
    if args.small_write_benchmark:
     b=s.recv(1024)
     if not b:raise RuntimeError('Incomplete small-write upload')
@@ -96,9 +105,9 @@ def echo_udp():
 threads=[threading.Thread(target=f,daemon=True) for f in [echo_tcp,echo_udp]]
 for thread in threads:thread.start()
 run(os.environ['MUSL_CC'],'-static','-pthread','-O2','-Wall','-Wextra','-Werror',ROOT/'src/tests/test_usb_ecm_guest/main.c','-o',base/'ECMTEST.ELF')
-run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600')
+run('python3',ROOT/'scripts/make_uefi_probe.py','--output',out,'--build',args.build,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600')
 initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BOOT/ECMTEST.ELF')
-rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}{" async" if args.tcp_async_send else ""}{" bench-small" if args.small_write_benchmark else ""}{" pool-test" if args.async_pool_test else ""}{" blocked-close" if args.async_blocked_close else ""}\n')
+rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}{" concurrency" if args.send_concurrency else ""}{" close-race" if args.send_close_race else ""}{" user-copy" if args.send_user_copy else ""}{" async" if args.tcp_async_send else ""}{" bench-small" if args.small_write_benchmark else ""}{" pool-test" if args.async_pool_test else ""}{" blocked-close" if args.async_blocked_close else ""}{f" rx-mib={args.rx_throughput_mib}" if args.rx_throughput_mib else ""}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
 if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
@@ -223,7 +232,7 @@ try:
    if args.tcp_try_transmit:assert 'TCP try-transmit experiment enabled' in serial,serial[-2500:]
    if args.tcp_queue_stage:assert 'TCP queue staging experiment enabled' in serial,serial[-2500:]
    if args.tcp_async_send:assert 'bounded asynchronous TCP sender enabled' in serial,serial[-2500:]
-   assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
+   assert f'rx_depth={expected_rx_depth}' in serial, 'Unexpected ECM receive depth'
    assert f'tx_depth={16 if args.tx_depth16 else 8}' in serial, 'Unexpected ECM transmit depth'
    break
   time.sleep(.05)
@@ -257,10 +266,10 @@ try:
   assert report['tcp_ack_submit_failures']>=0,report
   assert report['single_interface_generation']>=3,report
   assert report['tcp_recv_window_cap_bytes']==(16384 if args.tcp_window16 else 0),report
-  assert stats['rx_depth']==(8 if args.rx_depth8 else 1),stats
+  assert stats['rx_depth']==expected_rx_depth,stats
   assert stats['tx_depth']==(16 if args.tx_depth16 else 8),stats
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
-  assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
+  assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=256,stats
   (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')
   if args.arp_async_probe:
    deadline=time.monotonic()+5;probe=None
@@ -405,7 +414,12 @@ try:
   for flow,flags,window in windows:
    pair=scales.get(flow,{});shift=pair.get('guest') if pair.get('guest') is not None and pair.get('peer') is not None else 0
    assert (window if flags&2 else window<<shift)<=16384,(flow,flags,window,shift)
- result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,tcp_adaptive_flight16=args.tcp_adaptive_flight16,tcp_async_send=args.tcp_async_send,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
+ rx_benchmark=None
+ if args.rx_throughput_mib:
+  match=re.search(r'ECM_RX_BENCH bytes=(\d+) ns=(\d+)',serial)
+  assert match and int(match[1])==args.rx_throughput_mib*1024**2 and int(match[2])>0
+  rx_benchmark=dict(bytes=int(match[1]),elapsed_ns=int(match[2]),mbps=int(match[1])*8000/int(match[2]))
+ result=dict(passed=True,rx_benchmark=rx_benchmark,rx_depth=expected_rx_depth,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,tcp_adaptive_flight16=args.tcp_adaptive_flight16,tcp_async_send=args.tcp_async_send,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
   dropped_tcp_packet=bool(args.drop_tcp_packet),idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True,
   tcp_tail_receive_ns=tcp_tail_receive_ns,small_write_receive_ns=small_write_receive_ns)
  (base/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('USB_ECM_ACCEPTANCE_PASS',flush=True)

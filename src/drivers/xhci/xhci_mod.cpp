@@ -976,6 +976,9 @@ struct XhciDevice {
 
 static constexpr unsigned ECM_RX_PACKETS=UsbEcmRxCredits::Capacity;
 static constexpr unsigned ECM_RX_SLOTS=UsbEcmRxCredits::Slots;
+static constexpr unsigned ECM_RX_BYTES=UsbEcmRxCredits::BufferBytes;
+static_assert(ECM_RX_SLOTS < XFER_RING_SIZE-1 && XFER_RING_SIZE==UsbEcmRxCredits::RingEntries);
+static_assert(sizeof(Trb)==16);
 static constexpr unsigned ECM_TX_SLOTS=UsbEcmTxSlots::Capacity;
 static_assert(ECM_TX_SLOTS*2 < XFER_RING_SIZE-1, "ECM frames and ZLPs must fit the transfer ring");
 struct UsbEcmState {
@@ -2074,6 +2077,10 @@ static void XhciPollDrainEvents()
         const Trb event=source;
         if(++ctrl.evtDequeue==EVT_RING_SIZE){ctrl.evtDequeue=0;ctrl.evtCycle=!ctrl.evtCycle;}
         ++processed;
+        // A deep receive flight keeps the device producing completions as
+        // we drain. Return event entries before it can fill the whole ring.
+        if((processed&31u)==0)
+            xhci_write64(ctrl.rtBase,XHCI_RT_ERDP,ctrl.evtRingPhys+ctrl.evtDequeue*sizeof(Trb));
         const uint32_t type=event.control&TRB_TYPE_MASK;
         if(type!=TRB_TYPE_TRANSFER_EVENT && type!=TRB_TYPE_CMD_COMPLETION)continue;
         bool handled=false;
@@ -2284,20 +2291,31 @@ static uint64_t XhciEcmTrb(XhciDevice& dev,bool input,uint64_t physical,uint32_t
 // reserves one software-queue slot, so simultaneous completions cannot
 // overrun the consumer. Publish each TD only after recording its ownership:
 // the controller may already be running from an earlier doorbell.
-static void XhciEcmReceiveArm(UsbEcmState& net){
-    if(net.failed || net.controller->completionFailed)return;
-    for(unsigned i=0;i<net.rxDepth;++i){
-        if(!net.rxCredits.CanArm(i,net.rxDepth,net.tail-net.head))continue;
-        const auto token=XhciEcmTrb(*net.device,true,net.rxPhysical+i*2048,2048,false,false);
-        net.rxCredits.Arm(i,token);
-        auto& head=net.device->bulkInRing[(token-net.device->bulkInRingPhys)/sizeof(Trb)];
-        __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
+static bool XhciEcmArmSlot(UsbEcmState& net,unsigned slot)
+{
+    if(!net.rxCredits.CanArm(slot,net.rxDepth,net.tail-net.head))return false;
+    const auto token=XhciEcmTrb(*net.device,true,net.rxPhysical+slot*ECM_RX_BYTES,ECM_RX_BYTES,false,false);
+    net.rxCredits.Arm(slot,token);
+    auto& head=net.device->bulkInRing[(token-net.device->bulkInRingPhys)/sizeof(Trb)];
+    __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
+    return true;
+}
+static void XhciEcmRingReceive(UsbEcmState& net,bool armed)
+{
+    if(armed){
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         XhciRingDoorbell(*net.controller,net.device->slotId,net.device->bulkInDci);
     }
-    // Count transitions, not polls. A full software queue can consume all
-    // receive credits without recording a dropped completed USB frame.
     net.rxPressure.Observe(net.rxDepth,net.rxCredits.outstanding,net.tail-net.head);
+}
+static void XhciEcmReceiveArm(UsbEcmState& net)
+{
+    if(net.failed || net.controller->completionFailed)return;
+    bool armed=false;
+    for(unsigned i=0;i<net.rxDepth && net.rxCredits.outstanding<net.rxDepth &&
+                     net.tail-net.head+net.rxCredits.outstanding<ECM_RX_PACKETS;++i)
+        armed|=XhciEcmArmSlot(net,i);
+    XhciEcmRingReceive(net,armed);
 }
 static void XhciEcmNotificationArm(UsbEcmState& net){
     auto& dev=*net.device;
@@ -2335,15 +2353,16 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
         const int rxSlot=net.rxCredits.CompletedSlot(event.param,cc,residue);
         if(rxSlot<0){fail();return true;}
         net.rxCredits.Complete(static_cast<unsigned>(rxSlot));
-        const unsigned bytes=2048-residue;
+        const unsigned bytes=ECM_RX_BYTES-residue;
         if(bytes>=14 && bytes<=1514){
-            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx+rxSlot*2048,bytes);net.lengths[index]=bytes;++net.tail;++net.received;
+            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx+rxSlot*ECM_RX_BYTES,bytes);net.lengths[index]=bytes;++net.tail;++net.received;
                 const auto queued=net.tail-net.head;if(queued>net.queueHighWater)net.queueHighWater=queued;}
             else ++net.dropped;
         }else if(bytes)++net.dropped;
-        // A full software queue backpressures USB instead of discarding a
-        // completed packet. The poll consumer rearms after making space.
-        XhciEcmReceiveArm(net);
+        // Immediately rearm the returned DMA buffer when another queue
+        // credit is available. The consumer refills after queue pressure.
+        XhciEcmRingReceive(net,!net.controller->completionFailed &&
+                          XhciEcmArmSlot(net,static_cast<unsigned>(rxSlot)));
         return true;
     }
     if(dci==dev.bulkOutDci){
@@ -2427,40 +2446,69 @@ static void XhciEcmPoll(NetIf* nif){
                 index,length,words[0],words[1],words[2],words[3]);
         }
     }
-    // Only one poller may hand frames to the network stack at once. Reentrant
-    // polls can still drain events, but must not reorder frame delivery.
-    // The try-lock also defers process termination until unlock, so a killed
-    // caller cannot strand delivery. Recursive polls do not block.
+    // Only one poller delivers the FIFO, since receive processing can
+    // recurse into networking, transmit and polling. USB completion and
+    // rearming always proceed independently under the controller lock.
     const bool early=NetEarlyBootPolling();
+    {
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        if(net.head==net.tail || (early && net.earlyDispatch)){
+            IrqSpinLockRelease(&g_eventRingLock,saved);
+            return;
+        }
+        if(early)net.earlyDispatch=true;
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+    }
+    if(!early && !KMutexTryLock(&net.dispatchLock)){
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        if(net.head!=net.tail)++net.rxDispatchBusy;
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+        return;
+    }
+    // Return a batch of credits before entering the network stack. A bounded
+    // burst lets the poller service timers and other interfaces under load.
+    constexpr unsigned Batch=8, MaxBurst=64;
+    struct Frame {uint8_t data[1514];uint16_t length;};
+    Frame frames[Batch];
+    for(unsigned n=0;n<MaxBurst;n+=Batch){
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        unsigned count=0;
+        while(count<Batch && net.head!=net.tail){
+            const auto index=net.head%ECM_RX_PACKETS;
+            auto& frame=frames[count++];
+            frame.length=net.lengths[index];
+            memcpy(frame.data,net.packets[index],frame.length);
+            ++net.head;
+        }
+        if(count)XhciEcmReceiveArm(net);
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+        if(!count)break;
+        for(unsigned i=0;i<count;++i)NetReceive(nif,frames[i].data,frames[i].length);
+    }
     if(early){
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-        if(net.earlyDispatch){IrqSpinLockRelease(&g_eventRingLock,saved);return;}
-        net.earlyDispatch=true;IrqSpinLockRelease(&g_eventRingLock,saved);
-    }else if(!KMutexTryLock(&net.dispatchLock)){
-        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);++net.rxDispatchBusy;IrqSpinLockRelease(&g_eventRingLock,saved);return;
-    }
-    for(unsigned n=0;n<8;++n){
-        uint8_t frame[1514];unsigned bytes=0;
-        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-        if(net.head!=net.tail){const auto index=net.head%ECM_RX_PACKETS;bytes=net.lengths[index];memcpy(frame,net.packets[index],bytes);++net.head;}
-        XhciEcmReceiveArm(net);
+        net.earlyDispatch=false;
         IrqSpinLockRelease(&g_eventRingLock,saved);
-        if(!bytes)break;
-        // Receive can immediately transmit an ACK. No USB lock is held here.
-        NetReceive(nif,frame,bytes);
+    }else{
+        KMutexUnlock(&net.dispatchLock);
+        // Recheck after releasing ownership. An IRQ arriving after this
+        // observation already wakes net_poll itself.
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        const bool queued=net.head!=net.tail;
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+        if(queued)NetWakePollThread();
     }
-    if(early){const auto saved=IrqSpinLockAcquire(&g_eventRingLock);net.earlyDispatch=false;IrqSpinLockRelease(&g_eventRingLock,saved);}
-    else KMutexUnlock(&net.dispatchLock);
 }
 static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     if(Vnode* marker=VfsOpen("/etc/usb-net-probe",0)){VfsClose(marker);g_networkProbe=true;}
     auto* net=static_cast<UsbEcmState*>(kmalloc(sizeof(UsbEcmState)));if(!net)return false;
     memset(net,0,sizeof(*net));net->controller=&ctrl;net->device=&dev;
     net->rxDepth=1;
+    // Keep the on-disk opt-in used by the Dell image and older installations.
     if(Vnode* marker=VfsOpen("/etc/usb-net-rx8",0)){VfsClose(marker);net->rxDepth=ECM_RX_SLOTS;}
     net->txDepth=8;
     if(Vnode* marker=VfsOpen("/etc/usb-net-tx16",0)){VfsClose(marker);net->txDepth=ECM_TX_SLOTS;}
-    net->rx=static_cast<uint8_t*>(AllocDmaBuffer(4,net->rxPhysical));
+    net->rx=static_cast<uint8_t*>(AllocDmaBuffer((net->rxDepth*ECM_RX_BYTES+4095)/4096,net->rxPhysical));
     net->tx=static_cast<uint8_t*>(AllocDmaBuffer((net->txDepth+1)/2,net->txPhysical));
     net->notification=static_cast<uint8_t*>(AllocDmaBuffer(1,net->notificationPhysical));
     uint64_t physical=0;auto* scratch=static_cast<uint8_t*>(AllocDmaBuffer(1,physical));
@@ -2484,6 +2532,7 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
     if(!XhciControlTransfer(ctrl,dev,request,nullptr,0,0,0))return false;
     net->interface.driverPriv=net;net->interface.transmit=XhciEcmTransmit;net->interface.tryTransmit=XhciEcmTryTransmit;net->interface.poll=XhciEcmPoll;net->interface.snapshot=XhciEcmSnapshot;
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    net->rxCredits.ringBase=dev.bulkInRingPhys;
     dev.network=net;XhciEcmReceiveArm(*net);XhciEcmNotificationArm(*net);
     IrqSpinLockRelease(&g_eventRingLock,saved);
     NetRegisterIf(&net->interface);
