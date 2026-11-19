@@ -95,6 +95,16 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**GTK4 performance (19 Nov, gen 453), Nautilus scroll stutter:**
+- **Not thermal:** GPU at 600 MHz with no trips; CPU 2.8 GHz.
+- **Not waylandd or the compositor:** compositor ~13 ms per frame with spare time; GTK main thread at ~11% CPU.
+- **Default path:** `brook-run` sets `LIBGL_ALWAYS_SOFTWARE=1`, so GTK4's GL renderer runs on **llvmpipe**. The fishbox dump shows the main thread in llvmpipe JIT code plus five lp_rast worker threads. Fishbox gives 21 fps. Cairo, also CPU-only, gives the same.
+- **`GSK_RENDERER=vulkan` (hasvk):** 13 fps alongside the llvmpipe instance, 22 fps alone. The main thread spends ~2/3 of its time in `gpu-wait` (IntelRenderIoctl → RetireWait).
+- **Next:** find out why GPU waits are long. Is the GTK Vulkan GPU work itself slow on the HD 5500, or does the wait/retire wake up late? Possibly the stock-Mesa syncobj-wait item. `gpu submission timing watch PID` recorded 0 submissions for the fishbox pid; check what owner ID it expects. Also try GTK's `ngl` renderer on hardware GL (iris/crocus without `LIBGL_ALWAYS_SOFTWARE`) for GTK4 apps.
+- Ian saw app frame times alternate between ~69 ms and ~350 ms phases.
+- **Glass dropouts every ~10 s while scrolling:** presents rejected as ESTALE; Claude agent `work/glass-stale` investigating.
+- **Lighter blur levels:** 80a04744 on `work/glass-blur` (Light 8 px, Moderate 16, Heavy 32); not deployed yet.
+
 **19 Nov afternoon: Dell on gen 453 = `work/integration50` 59383819** (int49 + `work/glass-blur`: 19ca75f9 mip-chain dual-Kawase blur + 6a4eaa00 waylandd popup-reposition order; session `5f4dbd8735cf432abd43e0dc712ba021`). Blur marker present; Glass active. GPU healthy, zero-copy on, HDA OK.
 - **Idle-desktop blur cost on the HD 5500:** 0.79 ms per atlas rebuild frame (3 in 97 frames); glass draw 0.68 ms per frame.
 - **Deploy note:** the graceful restart blocked on the frozen Nautilus window. Recovery: `hw_power cancel`, kill the pid, a new `restart` request, `commit` at ready, `hw_attach`, then the `HWSTATUS` payload check. Fix idea: power-close should offer to kill unresponsive windows.
