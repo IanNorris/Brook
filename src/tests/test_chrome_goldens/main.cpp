@@ -16,7 +16,8 @@
 #include <vector>
 #include <sys/stat.h>
 #include "chrome_frame.h"
-#include "chrome_shell.h"
+#include "chrome_shell_model.h"
+#include "chrome_shell_wire.h"
 #include "png.h"
 
 using namespace brook;
@@ -202,6 +203,39 @@ void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) 
 DesktopIntervals<> compositorCadence;
 const uint64_t now = 100000;
 
+// Use different storage for the received snapshot so all borrowed list assets
+// must be rebound locally, as in the shell process.
+void CheckShellWire(const ChromeDisplayList& list) {
+    static ShellWireList wire;
+    static ChromeCmd replay[ShellCommandLimit];
+    if (!PackShellList(list, wire)) std::abort();
+    for (uint32_t i = 0; i < wire.count; ++i)
+        if (!DecodeShellCommand(wire.commands[i], wire.text, wire.textBytes,
+                                wire.assets, wire.assetWords, replay[i])) std::abort();
+    const ChromeDisplayList decoded(replay, wire.count, wire.text, wire.textBytes, wire.count, wire.textBytes);
+    if (ChromeListKey(decoded, 1) != ChromeListKey(list, 1)) std::abort();
+
+    ChromeCmd rejected{};
+    const ShellWireCommand invalidText{ChromeOp::Text, 0, 0, 0, 0, 0, wire.textBytes, 0, 0, {}, 0};
+    const ShellWireCommand invalidIcon{ChromeOp::Icon, 0, 0, 24, 24, 0, 255, 0, 0, {}, wire.assetWords};
+    if (DecodeShellCommand(invalidText, wire.text, wire.textBytes, wire.assets, wire.assetWords, rejected) ||
+        DecodeShellCommand(invalidIcon, wire.text, wire.textBytes, wire.assets, wire.assetWords, rejected)) std::abort();
+}
+
+void RenderSnapshot(const ChromeShellModel& model, const ChromeStyle& style, ChromeDisplayList& list) {
+    static ChromeShellModel received;
+    static ChromeMaterialCache material;
+    std::memcpy(&received, &model, sizeof(model));
+    const ChromeShellConfig config{style.P(), *style.metrics, style.materialOpacity, style.glass};
+    BuildShellModel(received, config.Style(*style.fonts, material), list);
+    CheckShellWire(list);
+}
+
+void SetTestIcon(ChromeShellIcon& icon) {
+    icon.present = true;
+    std::memcpy(icon.pixels, testIcon, sizeof(icon.pixels));
+}
+
 void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const bool glass = theme == 0 || theme == 3;
     const ChromeStyle s = StyleFor(theme, m, glass);
@@ -215,85 +249,87 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
     const char* const labels[] = {"Terminal", "Files", "Settings", nullptr, nullptr};
     const ChromeTaskbarLayout layout = ChromeTaskbarLayoutFor(s, screenW, screenH, "14:05 19 Nov 2026", true, metrics, ids, 5, 0,
                                                               "dev  6785ca29  debug", false, labels);
-    const ChromeTaskbarButton buttons[] = {
-        {testIcon, "Terminal", true, false, false, false},
-        {nullptr, "Files", false, true, false, false},
-        {testIcon, "Settings", false, false, false, false},
-        {testIcon, "Starting: Quake II", false, false, true, true},
-        {nullptr, "Launch failed: Chromium", false, false, true, false},
-    };
-    ChromeTaskbarModel tb{};
-    tb.layout = &layout;
-    tb.buttons = buttons;
-    tb.appsIcon = testIcon;
-    tb.terminalIcon = nullptr;
-    tb.networkConnected = true;
-    tb.volumeControl = 60;
-    tb.volumeAvailable = true;
-    tb.agentShown = true;
-    tb.agentStale = true;
-    tb.telemetry.stats = {now, 12300000, 400000, 0, 0, 42, 73};
-    tb.telemetry.compositor = &compositorCadence;
-    tb.uptimeMs = now + 300; // the cadence samples are recent; ring step 3
+    static ChromeShellModel model;
+    model = {};
+    model.kind = ChromeShellKind::Taskbar;
+    model.taskbar = layout;
+    model.entries[0] = {"Terminal", true, false, false, false};
+    model.entries[1] = {"Files", false, true, false, false};
+    model.entries[2] = {"Settings", false, false, false, false};
+    model.entries[3] = {"", false, false, true, true};
+    model.entries[4] = {"", false, false, true, false};
+    for (uint32_t i : {0u, 2u, 3u, ChromeShellModel::AppsIcon}) SetTestIcon(model.icons[i]);
+    model.networkConnected = true;
+    model.volumeControl = 60;
+    model.volumeAvailable = true;
+    model.agentShown = true;
+    model.agentStale = true;
+    model.telemetry.stats = {now, 12300000, 400000, 0, 0, 42, 73};
+    model.telemetry.hasCompositor = true;
+    model.telemetry.compositor = compositorCadence;
+    model.uptimeMs = now + 300; // the cadence samples are recent, ring step 3
     for (int hover = 0; hover < 2; ++hover) {
         const DesktopRect& target = layout.buttons[1];
-        tb.mouseX = hover ? target.x + 2 : -1;
-        tb.mouseY = hover ? target.y + 2 : -1;
-        tb.launcherOpen = hover;
+        model.mouseX = hover ? target.x + 2 : -1;
+        model.mouseY = hover ? target.y + 2 : -1;
+        model.launcherOpen = hover;
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildTaskbar(tb, s, list);
+        RenderSnapshot(model, s, list);
         Check(prefix + (hover ? "taskbar-hover" : "taskbar"), list, s, 0, layout.y, screenW, screenH - layout.y);
     }
+
     // The compact HUD and the temperature target, without the diagnostics.
+    const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, "09:41 15 Nov 2026", false,
+                                                                  1u << 6, ids, 3, 2, "Brook 3a4b909e", true, labels);
     {
-        const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, "09:41 15 Nov 2026", false, 1u << 6,
-                                                                     ids, 3, 2, "Brook 3a4b909e", true, labels);
-        ChromeTaskbarModel hm = tb;
-        hm.layout = &hudLayout;
-        hm.agentShown = false;
-        hm.mouseX = hm.mouseY = -1;
-        hm.launcherOpen = false;
-        hm.telemetry.thermal = true; hm.telemetry.tjmax = 100; hm.telemetry.latest.pkgC = 57;
+        model.taskbar = hudLayout;
+        model.agentShown = false;
+        model.mouseX = model.mouseY = -1;
+        model.launcherOpen = false;
+        model.telemetry.thermal = true;
+        model.telemetry.tjmax = 100;
+        model.telemetry.latest.pkgC = 57;
+        model.compactTelemetry = model.telemetry;
+        model.hudTick = now + 300;
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildTaskbar(hm, s, list);
-        ChromeBuildCompactHud({hudLayout.hud, hm.telemetry, now + 300}, s, list);
+        RenderSnapshot(model, s, list);
         Check(prefix + "taskbar-hud", list, s, 0, hudLayout.y, screenW, screenH - hudLayout.y);
     }
 
     // Launcher: ten apps, the third hovered; then the restart prompt.
-    const ChromeLauncherItem items[] = {
-        {"Terminal", testIcon}, {"Files", nullptr}, {"Settings", testIcon}, {"Chromium", testIcon},
-        {"Quake II", nullptr}, {"Stardew Valley", testIcon}, {"Text Editor", testIcon}, {"Gallery", nullptr},
-        {"Kernel Console", testIcon}, {"Steam", testIcon},
-    };
+    model = {};
+    model.kind = ChromeShellKind::Launcher;
+    const char* const titles[] = {"Terminal", "Files", "Settings", "Chromium", "Quake II", "Stardew Valley",
+                                  "Text Editor", "Gallery", "Kernel Console", "Steam"};
+    model.launcherCount = sizeof(titles) / sizeof(titles[0]);
+    model.launcher = ChromeLauncherLayoutFor(s, screenW, screenH, model.launcherCount);
+    for (uint32_t i = 0; i < model.launcherCount; ++i) std::strcpy(model.entries[i].label, titles[i]);
+    for (uint32_t i : {0u, 2u, 3u, 5u, 6u, 8u, 9u}) SetTestIcon(model.icons[i]);
+    const DesktopRect hovered = ChromeLauncherItemRect(s, model.launcher, 2);
+    model.mouseX = hovered.x + 3;
+    model.mouseY = hovered.y + 3;
+    model.promptRestart = model.confirmFocused = true;
     for (int prompt = 0; prompt < 2; ++prompt) {
-        ChromeLauncherModel lm{};
-        lm.layout = ChromeLauncherLayoutFor(s, screenW, screenH, 10);
-        lm.header = prompt ? "Restart? Open apps will be asked to close" : "Applications";
-        lm.items = items;
-        lm.count = 10;
-        lm.prompt = prompt;
-        lm.promptRestart = true;
-        lm.confirmFocused = true;
-        const DesktopRect hovered = ChromeLauncherItemRect(s, lm.layout, 2);
-        lm.mouseX = hovered.x + 3;
-        lm.mouseY = hovered.y + 3;
+        model.prompt = prompt;
+        std::strcpy(model.text, prompt ? "Restart? Open apps will be asked to close" : "Applications");
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildLauncher(lm, s, list);
-        Check(prefix + (prompt ? "launcher-prompt" : "launcher"), list, s, lm.layout.x, lm.layout.y,
-              lm.layout.w, lm.layout.h);
+        RenderSnapshot(model, s, list);
+        Check(prefix + (prompt ? "launcher-prompt" : "launcher"), list, s, model.launcher.x, model.launcher.y,
+              model.launcher.w, model.launcher.h);
     }
 
     // Volume popup over the tray icon, mute button hovered.
     {
-        ChromeVolumePopupModel vm{};
+        model = {};
+        model.kind = ChromeShellKind::VolumePopup;
+        auto& vm = model.volume;
         vm.layout = TaskbarVolumePopup(m, layout.volume, layout.y, screenW, ChromeVolumeValueWidth(s));
         vm.control = 60;
         vm.available = true;
         vm.mouseX = vm.layout.mute.x + 1;
         vm.mouseY = vm.layout.mute.y + 1;
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildVolumePopup(vm, s, list);
+        RenderSnapshot(model, s, list);
         const DesktopRect& p = vm.layout.panel;
         Check(prefix + "volume-popup", list, s, p.x, p.y, p.w, p.h);
     }
@@ -305,42 +341,70 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
                                                   ChromeTooltipHeight(s, false), layout.y,
                                                   static_cast<int>(s.M(8)), screenW, static_cast<int>(s.M(4)));
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildTooltip({box, text}, s, list);
+        model = {};
+        model.kind = ChromeShellKind::Tooltip;
+        model.rect = box;
+        std::strcpy(model.text, text);
+        RenderSnapshot(model, s, list);
         Check(prefix + "tooltip", list, s, box.x, box.y, box.w, box.h);
     }
 
     // Boot toast: the total, the four phases and three meta lines.
     {
         const int margin = s.M(16), w = s.M(360), h = ChromeBootSummaryHeight(s, true, true, 3);
-        ChromeBootSummaryModel bm{{static_cast<int>(screenW) - w - margin, margin, w, h}, "8.12 s", "from power-on",
-                                  {"8 cores " BROOK_CHROME_DOT " 7712 MiB available",
-                                   "Software composition " BROOK_CHROME_DOT " Opaque", "Brook 3a4b909e+29117654"}};
+        model = {};
+        model.kind = ChromeShellKind::BootSummary;
+        model.rect = {static_cast<int>(screenW) - w - margin, margin, w, h};
+        auto& boot = model.boot;
+        std::strcpy(boot.total, "8.12 s");
+        std::strcpy(boot.totalNote, "from power-on");
+        std::strcpy(boot.meta[0], "8 cores " BROOK_CHROME_DOT " 7712 MiB available");
+        std::strcpy(boot.meta[1], "Software composition " BROOK_CHROME_DOT " Opaque");
+        std::strcpy(boot.meta[2], "Brook 3a4b909e+29117654");
         static const char* const names[] = {"Firmware", "Menu", "Loader", "Kernel"};
         static const char* const values[] = {"3.41 s", "0.52 s", "0.61 s", "3.58 s"};
         const uint64_t ms[] = {3410, 520, 610, 3580};
-        for (unsigned i = 0; i < 4; ++i) { bm.phaseMs[i] = ms[i]; bm.phaseNames[i] = names[i]; bm.phaseValues[i] = values[i]; }
+        for (unsigned i = 0; i < 4; ++i) {
+            boot.phaseMs[i] = ms[i];
+            std::strcpy(boot.phaseNames[i], names[i]);
+            std::strcpy(boot.phaseValues[i], values[i]);
+        }
         ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildBootSummary(bm, s, list);
-        Check(prefix + "boot-summary", list, s, bm.rect.x, bm.rect.y, w, h);
+        RenderSnapshot(model, s, list);
+        Check(prefix + "boot-summary", list, s, model.rect.x, model.rect.y, w, h);
     }
 
     // Tray flyouts with live content, and the HUD panel with a thermal graph.
-    ChromeTelemetryModel telemetry = tb.telemetry;
-    static ThermalSample points[60];
-    for (unsigned i = 0; i < 60; ++i) { points[i].pkgC = static_cast<int16_t>(52 + (i * 7) % 6); points[i].pkgMw = 6200; }
-    telemetry.tjmax = 100; telemetry.thermal = true; telemetry.rapl = true;
-    telemetry.points = points; telemetry.pointCount = 60; telemetry.latest = points[59];
-    telemetry.app = &compositorCadence;
-    for (const bool network : {true, false}) {
-        const DesktopRect flyout{0, 0, int(s.M(304)), ChromeTrayFlyoutHeight(s, network, true)};
-        ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildTrayFlyout({flyout, network, true, "192.168.1.35", telemetry}, s, list);
-        Check(prefix + (network ? "network-flyout" : "temperature-flyout"), list, s,
-              flyout.x, flyout.y, flyout.w, flyout.h);
+    model = {};
+    model.kind = ChromeShellKind::TrayFlyout;
+    auto& telemetry = model.telemetry;
+    telemetry.hasApp = telemetry.hasCompositor = true;
+    telemetry.app = telemetry.compositor = compositorCadence;
+    telemetry.tjmax = 100;
+    telemetry.thermal = telemetry.rapl = true;
+    telemetry.pointCount = 60;
+    for (unsigned i = 0; i < telemetry.pointCount; ++i) {
+        auto& point = telemetry.points[i];
+        point.pkgC = static_cast<int16_t>(52 + (i * 7) % 6);
+        point.pkgMw = 6200;
     }
+    telemetry.latest = telemetry.points[telemetry.pointCount - 1];
+    model.networkConnected = true;
+    std::strcpy(model.text, "192.168.1.35");
+    for (const bool network : {true, false}) {
+        model.network = network;
+        const DesktopRect flyout{0, 0, int(s.M(304)), ChromeTrayFlyoutHeight(s, network, true)};
+        model.rect = flyout;
+        ChromeDisplayList list = ChromeListOn(storage);
+        RenderSnapshot(model, s, list);
+        Check(prefix + (network ? "network-flyout" : "temperature-flyout"), list, s, flyout.x, flyout.y, flyout.w, flyout.h);
+    }
+    model.kind = ChromeShellKind::PerformanceHud;
     const DesktopRect hud{0, 0, int(s.M(348)), ChromePerformanceHudHeight(s, true)};
+    model.rect = hud;
+    model.hudTick = now + 300;
     ChromeDisplayList list = ChromeListOn(storage);
-    ChromeBuildPerformanceHud({hud, telemetry, now + 300}, s, list);
+    RenderSnapshot(model, s, list);
     Check(prefix + "hud", list, s, hud.x, hud.y, hud.w, hud.h);
 }
 

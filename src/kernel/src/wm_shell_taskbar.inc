@@ -287,23 +287,19 @@ bool WmVolumeToggleMuteAt(int32_t mx, int32_t my, uint32_t screenW, uint32_t scr
     return true;
 }
 
-// Shell painters build their list, then either execute it (key == nullptr)
-// or return its content key seeded with keySeed (WmShellSurfaceKey).
-static void WmVolumePopupSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                                 int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
+static void WmCaptureVolumePopup(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY,
+                                 ChromeShellModel& snapshot)
 {
-    if (!g_volumePopupOpen || (!pixels && !key)) return;
-    const ChromeVolumePopupModel model{WmVolumePopupLayout(screenW, screenH), g_volumeControl, g_volumeAvailable,
-                                       g_volumeDragging, mouseX, mouseY};
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildVolumePopup(model, WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmChromeFonts());
-}
-void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mouseX, int32_t mouseY)
-{
-    WmVolumePopupSurface(pixels, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
+    if (!g_volumePopupOpen) return;
+    snapshot.kind = ChromeShellKind::VolumePopup;
+    snapshot.volume.layout = WmVolumePopupLayout(screenW, screenH);
+    snapshot.volume.control = g_volumeControl;
+    snapshot.volume.available = g_volumeAvailable;
+    snapshot.volume.dragging = g_volumeDragging;
+    const auto& mute = snapshot.volume.layout.mute;
+    const bool hovered = mute.contains(mouseX, mouseY);
+    snapshot.volume.mouseX = hovered ? mute.x : -1;
+    snapshot.volume.mouseY = hovered ? mute.y : -1;
 }
 
 enum class WmTrayFlyout : uint8_t { None, Network, Temperature };
@@ -425,116 +421,122 @@ static ChromePerformanceHudModel WmHudModel(DesktopRect rect)
     return model;
 }
 
-static void WmTrayFlyoutSurface(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
-                               uint64_t seed, uint64_t* key)
+static void WmCaptureTrayFlyout(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot)
 {
     const auto rect = WmTrayFlyoutLayout(sw, sh);
     if (rect.w <= 0) return;
     const bool network = g_trayFlyout == WmTrayFlyout::Network;
     const uint32_t address = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE);
-    char text[48]{};
     if (network && address) {
-        BootText label(text, sizeof(text));
+        BootText label(snapshot.text, sizeof(snapshot.text));
         const auto* bytes = reinterpret_cast<const uint8_t*>(&address);
         for (unsigned i = 0; i < 4; ++i) {
             if (i) label.Add(".");
             label.Number(bytes[i]);
         }
     }
-    const ChromeTrayFlyoutModel model{rect, network, address != 0, text, WmTelemetryModel(false, !network)};
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildTrayFlyout(model, WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, seed);
-    else ChromeExecute(list, {pixels, stride, sw, sh}, WmChromeFonts());
+    snapshot.kind = ChromeShellKind::TrayFlyout;
+    snapshot.rect = rect;
+    snapshot.network = network;
+    snapshot.networkConnected = address != 0;
+    const auto source = WmTelemetryModel(false, !network);
+    if (!network) WmCaptureThermal(snapshot.telemetry, source, true);
+    else if (snapshot.networkConnected) {
+        snapshot.telemetry.stats.downBytesPerSecond = WmShellRate(source.stats.downBytesPerSecond);
+        snapshot.telemetry.stats.upBytesPerSecond = WmShellRate(source.stats.upBytesPerSecond);
+    }
 }
 
-static void WmPerformanceHudSurface(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh,
-                                    uint64_t seed, uint64_t* key)
+static void WmCapturePerformanceHud(uint32_t sw, uint32_t sh, ChromeShellModel& snapshot)
 {
     const auto rect = WmPerformanceHudLayout(sw, sh);
     if (rect.w <= 0) return;
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildPerformanceHud(WmHudModel(rect), WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, seed);
-    else ChromeExecute(list, {pixels, stride, sw, sh}, WmChromeFonts());
+    const auto model = WmHudModel(rect);
+    snapshot.kind = ChromeShellKind::PerformanceHud;
+    snapshot.rect = model.rect;
+    snapshot.hudTick = ShellCadenceTick;
+    WmCaptureHudCadence(snapshot.telemetry, model);
+    WmCaptureThermal(snapshot.telemetry, model.telemetry, true);
 }
 
-void WmRenderTrayFlyout(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh)
+static void WmCaptureTaskbar(uint32_t screenW, uint32_t screenH, uint64_t uptimeMs,
+                             int32_t mouseX, int32_t mouseY, ChromeShellModel& snapshot)
 {
-    WmTrayFlyoutSurface(pixels, stride, sw, sh, 0, nullptr);
-}
-
-void WmRenderPerformanceHud(uint32_t* pixels, uint32_t stride, uint32_t sw, uint32_t sh)
-{
-    WmPerformanceHudSurface(pixels, stride, sw, sh, 0, nullptr);
-}
-
-// Taskbar model: per-button icons and hover labels, tray state and the
-// telemetry snapshot. Launch entries copy their icon (owned by the launch
-// table under g_launchLock) into launchIcons.
-static uint32_t g_taskbarLaunchIcons[LaunchFeedbackTable::Capacity][LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
-static ChromeTaskbarButton g_taskbarButtons[ChromeTaskbarButtonLimit];
-static TaskbarLayout g_taskbarLayout;
-
-static void WmTaskbarSurface(uint32_t* backBuffer, uint32_t stride,
-                             uint32_t screenW, uint32_t screenH,
-                             uint64_t uptimeMs, int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
-{
-    if (!g_wmActive || (!backBuffer && !key)) return;
+    if (!g_wmActive) return;
     LauncherReadGuard icons;
-    TaskbarLayout& l = g_taskbarLayout;
-    l = GetTaskbarLayout(screenW, screenH);
-    for (int i = 0; i < l.count; ++i)
-    {
-        ChromeTaskbarButton& b = g_taskbarButtons[i];
-        b = {};
-        if (l.indices[i] <= -10) {
-            const unsigned slot = static_cast<unsigned>(-10 - l.indices[i]);
-            LaunchFeedback e;
-            bool hasIcon;
+    snapshot.kind = ChromeShellKind::Taskbar;
+    snapshot.taskbar = GetTaskbarLayout(screenW, screenH);
+    auto& layout = snapshot.taskbar;
+    bool busy = false;
+    for (int i = 0; i < layout.count; ++i) {
+        const int index = layout.indices[i];
+        layout.indices[i] = 0; // only the WM hit test needs these identities
+        auto& entry = snapshot.entries[i];
+        auto& icon = snapshot.icons[i];
+        if (index <= -10) {
+            const auto slot = static_cast<unsigned>(-10 - index);
             SpinLockAcquire(&g_launchLock);
-            e = g_launches.entries[slot];
-            hasIcon = g_launchRequests[slot].hasIcon;
-            if (hasIcon) memcpy(g_taskbarLaunchIcons[slot], g_launchRequests[slot].icon, sizeof(g_taskbarLaunchIcons[slot]));
+            entry.busy = g_launches.entries[slot].busy();
+            if (g_launchRequests[slot].hasIcon) WmCaptureShellIcon(icon, g_launchRequests[slot].icon);
             SpinLockRelease(&g_launchLock);
-            b.launch = true;
-            b.busy = e.busy();
-            b.icon = hasIcon ? g_taskbarLaunchIcons[slot] : icons.get().applicationIcon;
+            entry.launch = true;
+            busy |= entry.busy;
+            if (!icon.present) WmCaptureShellIcon(icon, icons.get().applicationIcon);
             continue;
         }
-        const Window& w = g_windows[l.indices[i]];
-        b.active = w.focused && !w.minimized;
-        b.minimized = w.minimized;
-        b.icon = WindowIcon(w, icons.get());
-        b.hoverTitle = w.title;
+        const Window& window = g_windows[index];
+        entry.active = window.focused && !window.minimized;
+        entry.minimized = window.minimized;
+        if (layout.buttons[i].w >= int(WmMetric(ChromeShellMetrics::TaskbarLabelMin)))
+            WmStrCopy(entry.label, window.title, sizeof(entry.label));
+        WmCaptureShellIcon(icon, WindowIcon(window, icons.get()));
     }
-    ChromeTaskbarModel model{};
-    model.layout = &l;
-    model.buttons = g_taskbarButtons;
-    model.launcherOpen = g_launcherOpen;
-    model.appsIcon = icons.get().appsIcon;
-    model.terminalIcon = icons.get().terminalIcon;
-    model.networkConnected = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
-    model.volumeControl = g_volumeControl;
-    model.volumeAvailable = g_volumeAvailable;
-    const uint8_t agent = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
-    model.agentShown = agent != 0;
-    model.agentStale = agent == static_cast<uint8_t>(BridgePresenceState::Stale);
-    model.telemetry = WmTelemetryModel(l.metrics[5].w != 0, l.metrics[6].w != 0);
-    model.uptimeMs = uptimeMs;
-    model.mouseX = mouseX; model.mouseY = mouseY;
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    const auto style = WmChromeStyle();
-    ChromeBuildTaskbar(model, style, list);
-    if (l.hud.w > 0) ChromeBuildCompactHud(WmHudModel(l.hud), style, list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmChromeFonts());
-}
-void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
-                     uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
-{
-    WmTaskbarSurface(backBuffer, stride, screenW, screenH, uptimeMs, mouseX, mouseY, 0, nullptr);
+    layout.nextIndex = 0;
+    snapshot.launcherOpen = g_launcherOpen;
+    if (layout.network.w > 0)
+        snapshot.networkConnected = __atomic_load_n(&g_netIndicatorAddress, __ATOMIC_ACQUIRE) != 0;
+    if (layout.volume.w > 0) {
+        snapshot.volumeControl = g_volumeControl;
+        snapshot.volumeAvailable = g_volumeAvailable;
+    }
+    if (layout.agent.w > 0) {
+        const uint8_t agent = __atomic_load_n(&g_agentIndicatorState, __ATOMIC_ACQUIRE);
+        snapshot.agentShown = agent != 0;
+        snapshot.agentStale = agent == static_cast<uint8_t>(BridgePresenceState::Stale);
+    }
+    snapshot.uptimeMs = ShellCadenceTick + (busy ? (uptimeMs / 100 % 8) * 100 : 0);
+    const DesktopRect bounds{0, layout.y, layout.screenW, layout.screenH - layout.y};
+    const bool hovered = bounds.contains(mouseX, mouseY);
+    snapshot.mouseX = hovered ? mouseX : -1;
+    snapshot.mouseY = hovered ? mouseY : -1;
+    WmCaptureShellIcon(snapshot.icons[ChromeShellModel::AppsIcon], icons.get().appsIcon);
+    WmCaptureShellIcon(snapshot.icons[ChromeShellModel::TerminalIcon], icons.get().terminalIcon);
+    const bool comp = layout.metrics[4].w != 0, app = layout.metrics[5].w != 0;
+    const auto source = WmTelemetryModel(app, layout.metrics[6].w != 0, false);
+    auto& telemetry = snapshot.telemetry;
+    if (layout.metrics[0].w > 0) telemetry.stats.cpuPercent = source.stats.cpuPercent;
+    if (layout.metrics[1].w > 0) telemetry.stats.memoryPercent = source.stats.memoryPercent;
+    if (layout.metrics[2].w > 0) {
+        telemetry.stats.readBytesPerSecond = WmShellRate(source.stats.readBytesPerSecond);
+        telemetry.stats.writeBytesPerSecond = WmShellRate(source.stats.writeBytesPerSecond);
+    }
+    if (layout.metrics[3].w > 0) {
+        telemetry.stats.downBytesPerSecond = WmShellRate(source.stats.downBytesPerSecond);
+        telemetry.stats.upBytesPerSecond = WmShellRate(source.stats.upBytesPerSecond);
+    }
+    if (comp) {
+        telemetry.hasCompositor = true;
+        WmCaptureCadence(telemetry.compositor, *source.compositor, uptimeMs);
+    }
+    if (app) {
+        telemetry.hasApp = true;
+        WmCaptureCadence(telemetry.app, *source.app, uptimeMs, true);
+    }
+    WmCaptureThermal(telemetry, source, false);
+    if (layout.hud.w > 0) {
+        snapshot.hudTick = ShellCadenceTick;
+        WmCaptureHudCadence(snapshot.compactTelemetry, WmHudModel(layout.hud));
+    }
 }
 
 // Tooltips float above the taskbar, centred on the hovered control. The
@@ -625,22 +627,17 @@ bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     return true;
 }
 
-static void WmTrayTooltipSurface(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                                 int32_t mx, int32_t my, uint64_t keySeed, uint64_t* key)
+static void WmCaptureTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
+                             ChromeShellModel& snapshot)
 {
     char text[48]{};
     const char* detail = nullptr;
-    DesktopRect p{};
-    if ((!pixels && !key) || !WmTrayTooltip(screenW, screenH, mx, my, text, detail, p)) return;
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildTooltip({p, text, detail}, WmChromeStyle(), list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {pixels, stride, screenW, screenH}, WmChromeFonts());
-}
-void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mx, int32_t my)
-{
-    WmTrayTooltipSurface(pixels, stride, screenW, screenH, mx, my, 0, nullptr);
+    DesktopRect box{};
+    if (!WmTrayTooltip(screenW, screenH, mx, my, text, detail, box)) return;
+    snapshot.kind = ChromeShellKind::Tooltip;
+    snapshot.rect = box;
+    WmStrCopy(snapshot.text, text, sizeof(snapshot.text));
+    if (detail) WmStrCopy(snapshot.detail, detail, sizeof(snapshot.detail));
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

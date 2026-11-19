@@ -1,7 +1,7 @@
 // Launcher popup: state snapshot, layout, scrolling and hit test. The
 // layout and display list builder are freestanding (chrome_shell.cpp); this
 // part of window.cpp's translation unit (it shares the launcher catalog and
-// state) snapshots the model and executes the list. Include only from
+// state) snapshots the model. Include only from
 // window.cpp.
 
 using LauncherLayout = ChromeLauncherLayout;
@@ -60,54 +60,45 @@ void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
     LauncherGetRect(screenW, screenH, outX, outY, outW, outH, guard.get());
 }
 
-static void WmLauncherSurface(uint32_t* backBuffer, uint32_t stride,
-                              uint32_t screenW, uint32_t screenH,
-                              int32_t mouseX, int32_t mouseY, uint64_t keySeed, uint64_t* key)
+static void WmCaptureLauncher(uint32_t screenW, uint32_t screenH, int32_t mouseX, int32_t mouseY,
+                              ChromeShellModel& snapshot)
 {
+    if (!g_launcherOpen) return;
     LauncherReadGuard guard;
     const auto& launcher = guard.get();
-    if (!g_launcherOpen || (!backBuffer && !key)) return;
 
-    // Compositor thread only: the shell surfaces share one list storage.
-    static ChromeLauncherItem items[ChromeShellMetrics::LauncherMaxRows * ChromeShellMetrics::LauncherMaxCols];
-    const ChromeStyle style = WmChromeStyle();
-    ChromeLauncherModel model{};
-    model.layout = GetLauncherLayout(screenW, screenH, launcher);
-    const bool shutdownActive = LauncherShutdownActive();
-    model.header = g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" :
-        g_launcherPower.prompt() && !shutdownActive ?
-            (g_launcherPower.pending() == LauncherPowerAction::Restart ?
-                 "Restart? Open apps will be asked to close" : "Shut down? Open apps will be asked to close") :
+    snapshot.kind = ChromeShellKind::Launcher;
+    snapshot.launcher = GetLauncherLayout(screenW, screenH, launcher);
+    snapshot.shutdownActive = LauncherShutdownActive();
+    snapshot.prompt = g_launcherPower.prompt();
+    snapshot.promptRestart = g_launcherPower.pending() == LauncherPowerAction::Restart;
+    snapshot.confirmFocused = g_launcherPower.confirmFocused();
+    const char* header = g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" :
+        snapshot.prompt && !snapshot.shutdownActive ?
+            (snapshot.promptRestart ? "Restart? Open apps will be asked to close" :
+                                      "Shut down? Open apps will be asked to close") :
         ShutdownDesktopStatus();
+    WmStrCopy(snapshot.text, header, sizeof(snapshot.text));
+
     uint32_t totalValid = 0;
-    for (uint32_t i = 0; i < launcher.count; i++)
-    {
-        if (!launcher.items[i].valid) continue;
-        // Items before the scroll offset are skipped; the page holds capacity.
-        if (totalValid >= g_launcherScroll && model.count < model.layout.capacity &&
-            model.count < sizeof(items) / sizeof(items[0]))
-            items[model.count++] = {launcher.items[i].title,
-                                    launcher.items[i].iconPixels ? launcher.items[i].iconPixels : launcher.applicationIcon};
-        totalValid++;
+    for (uint32_t i = 0; i < launcher.count; ++i) {
+        const auto& item = launcher.items[i];
+        if (!item.valid) continue;
+        if (totalValid >= g_launcherScroll && snapshot.launcherCount < snapshot.launcher.capacity &&
+            snapshot.launcherCount < ChromeShellModel::LauncherLimit) {
+            const uint32_t slot = snapshot.launcherCount++;
+            WmStrCopy(snapshot.entries[slot].label, item.title, sizeof(snapshot.entries[slot].label));
+            WmCaptureShellIcon(snapshot.icons[slot], item.iconPixels ? item.iconPixels : launcher.applicationIcon);
+        }
+        ++totalValid;
     }
-    model.items = items;
-    model.scrollUp = g_launcherScroll > 0;
-    model.scrollDown = g_launcherScroll + model.layout.capacity < totalValid;
-    model.shutdownActive = shutdownActive;
-    model.prompt = g_launcherPower.prompt();
-    model.promptRestart = g_launcherPower.pending() == LauncherPowerAction::Restart;
-    model.confirmFocused = g_launcherPower.confirmFocused();
-    model.mouseX = mouseX; model.mouseY = mouseY;
-    ChromeDisplayList list = ChromeListOn(g_shellListStorage);
-    ChromeBuildLauncher(model, style, list);
-    if (key) *key = ChromeListKey(list, keySeed);
-    else ChromeExecute(list, {backBuffer, stride, screenW, screenH}, WmChromeFonts());
-}
-void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH,
-                      int32_t mouseX, int32_t mouseY)
-{
-    WmLauncherSurface(backBuffer, stride, screenW, screenH, mouseX, mouseY, 0, nullptr);
+    snapshot.scrollUp = g_launcherScroll > 0;
+    snapshot.scrollDown = g_launcherScroll + snapshot.launcher.capacity < totalValid;
+    const auto& layout = snapshot.launcher;
+    const DesktopRect bounds{layout.x, layout.y, int(layout.w), int(layout.h)};
+    const bool hovered = bounds.contains(mouseX, mouseY);
+    snapshot.mouseX = hovered ? mouseX : -1;
+    snapshot.mouseY = hovered ? mouseY : -1;
 }
 
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

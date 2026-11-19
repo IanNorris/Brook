@@ -44,6 +44,7 @@
 #include "chrome_shell.h"
 #include "chrome_surface.h"
 #include "desktop_shell_surfaces.h"
+#include "chrome_shell_model.h"
 #include "input.h"
 #include "mouse.h"
 #include "serial.h"
@@ -1835,9 +1836,17 @@ ChromeStyle WmChromeStyle()
     return {&WmCurrentPalette(), &WmDesktopMetrics(), &WmChromeFonts(), glass, CompositorMaterialOpacity(),
             glass ? &WmChromeMaterial() : nullptr};
 }
-// Shell surfaces are built and executed on the compositor thread only; they
-// share this list storage (too large for the stack).
-static ChromeShellStorage g_shellListStorage;
+ChromeShellConfig WmCaptureShellConfig()
+{
+    return {WmCurrentPalette(), WmDesktopMetrics(), CompositorMaterialOpacity(), CompositorGlassActive()};
+}
+
+static void WmCaptureShellIcon(ChromeShellIcon& out, const uint32_t* icon)
+{
+    if (!icon) return;
+    memcpy(out.pixels, icon, sizeof(out.pixels));
+    out.present = true;
+}
 
 // The frame is the window's part table drawn through its display list
 // (chrome_frame.cpp); the executor writes the same pixels the painter did.
@@ -2425,34 +2434,22 @@ bool WmLauncherVisible()
 
 #include "wm_shell_launcher.inc"
 
-// Content key of one shell surface as it would render now (stage 1.4): its
-// display list hashed with what the list does not carry. Compositor thread
-// only (shares the shell list storage). 0: the surface draws nothing.
-uint64_t WmShellSurfaceKey(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
-                           uint64_t uptimeMs, int32_t mx, int32_t my)
+bool WmCaptureShellModel(const WmShellSurface& s, uint32_t screenW, uint32_t screenH,
+                         uint64_t uptimeMs, int32_t mx, int32_t my, ChromeShellModel& model)
 {
-    const ChromeFontSet& fonts = WmChromeFonts();
-    constexpr uint64_t prime = 0x100000001b3ull;
-    uint64_t seed = 0x6b65792d7368656cull;
-    auto word = [&](uint64_t v) { seed = (seed ^ v) * prime; };
-    word(uint64_t(s.kind) << 32 | uint32_t(s.material));
-    word(uint64_t(uint32_t(s.x)) << 32 | uint32_t(s.y));
-    word(uint64_t(s.w) << 32 | s.h);
-    word(uint64_t(screenW) << 32 | screenH);
-    word(reinterpret_cast<uintptr_t>(&fonts));
-    word(uint64_t(uint32_t(fonts[ChromeFont::Body].lineHeight)) << 32 | uint32_t(fonts[ChromeFont::Body].glyphCount));
-    word(uint64_t(CompositorGlassActive()) << 32 | CompositorMaterialOpacity());
-    uint64_t key = 0;
+    // Initialize all bytes, including padding and unused icon slots.
+    memset(static_cast<void*>(&model), 0, sizeof(model));
+    model.kind = ChromeShellKind::None;
     switch (s.kind) {
-    case WmShellSurfaceKind::Taskbar: WmTaskbarSurface(nullptr, 0, screenW, screenH, uptimeMs, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::Launcher: WmLauncherSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::VolumePopup: WmVolumePopupSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::TrayTooltip: WmTrayTooltipSurface(nullptr, 0, screenW, screenH, mx, my, seed, &key); break;
-    case WmShellSurfaceKind::TrayFlyout: WmTrayFlyoutSurface(nullptr, 0, screenW, screenH, seed, &key); break;
-    case WmShellSurfaceKind::PerformanceHud: WmPerformanceHudSurface(nullptr, 0, screenW, screenH, seed, &key); break;
-    case WmShellSurfaceKind::BootSummary: WmBootSummarySurface(nullptr, 0, screenW, screenH, seed, &key); break;
+    case WmShellSurfaceKind::Taskbar: WmCaptureTaskbar(screenW, screenH, uptimeMs, mx, my, model); break;
+    case WmShellSurfaceKind::Launcher: WmCaptureLauncher(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::VolumePopup: WmCaptureVolumePopup(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::TrayTooltip: WmCaptureTooltip(screenW, screenH, mx, my, model); break;
+    case WmShellSurfaceKind::TrayFlyout: WmCaptureTrayFlyout(screenW, screenH, model); break;
+    case WmShellSurfaceKind::PerformanceHud: WmCapturePerformanceHud(screenW, screenH, model); break;
+    case WmShellSurfaceKind::BootSummary: WmCaptureBootSummary(screenW, screenH, model); break;
     }
-    return key;
+    return model.kind != ChromeShellKind::None;
 }
 
 static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tracked,

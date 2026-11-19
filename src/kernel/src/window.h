@@ -145,7 +145,6 @@ using WmRect = DesktopRect;
 // Even nonzero values identify a stable badge style; odd means an update is in progress.
 uint64_t WmBackdropStyleVersion();
 bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*);
-void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t);
 static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
 static constexpr int WM_BTN_RIGHT_PAD = 0;
 
@@ -486,17 +485,13 @@ bool WmTrayFlyoutVisible();
 bool WmTrayFlyoutPress(int32_t mx, int32_t my, uint32_t width, uint32_t height);
 void WmTrayFlyoutClose();
 bool WmTrayFlyoutRect(uint32_t width, uint32_t height, int32_t*, int32_t*, uint32_t*, uint32_t*);
-void WmRenderTrayFlyout(uint32_t*, uint32_t stride, uint32_t width, uint32_t height);
 void WmCyclePerformanceHud();
 bool WmPerformanceHudRect(uint32_t width, uint32_t height, int32_t*, int32_t*, uint32_t*, uint32_t*);
-void WmRenderPerformanceHud(uint32_t*, uint32_t stride, uint32_t width, uint32_t height);
 
 bool WmVolumePopupVisible();
 void WmVolumePopupClose();
 void WmVolumePopupGetRect(uint32_t screenW, uint32_t screenH,
                           int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH);
-void WmVolumePopupRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mouseX, int32_t mouseY);
 bool WmVolumeLeftPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 bool WmVolumeDragActive();
 void WmVolumeDrag(int32_t mx, bool held, uint32_t screenW, uint32_t screenH);
@@ -507,13 +502,8 @@ void WmLauncherClose();
 // false when none is shown. Occupies the launcher/popup overlay slot.
 bool WmTrayTooltipGetRect(uint32_t screenW, uint32_t screenH, int32_t mx, int32_t my,
                           int32_t* outX, int32_t* outY, uint32_t* outW, uint32_t* outH);
-void WmTrayTooltipRender(uint32_t* pixels, uint32_t stride, uint32_t screenW, uint32_t screenH,
-                         int32_t mx, int32_t my);
 
 // Render the taskbar (bottom of screen) with window buttons and clock.
-void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
-                     uint32_t screenW, uint32_t screenH,
-                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY);
 
 // Hit-test the taskbar. Returns the window index if a button was clicked, -1 otherwise.
 void WmLaunchFeedbackPoll();
@@ -723,9 +713,6 @@ bool WmLauncherVisible();
 void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH);
 
 // Render the launcher popup over the desktop.
-void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
-                      uint32_t screenW, uint32_t screenH,
-                      int32_t mouseX, int32_t mouseY);
 
 // Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
