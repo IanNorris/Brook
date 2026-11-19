@@ -21,6 +21,7 @@ void CoreAutoSetMode(CoreAutoMode);
 struct CoreAutoFailure {
     const char* stage=nullptr;
     uint32_t pid=0,error=0;
+    CoreDumpDiscarded discarded{};
 };
 struct CoreAutoStats {
     CoreAutoMode mode;
