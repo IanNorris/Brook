@@ -608,7 +608,8 @@ int64_t sys_brook_wm_set_cursor_visible(uint64_t visible, uint64_t,
 // `owner` is BROOK_CURSOR_OWNER_TAG | wmId of the caller's window the cursor
 // was set for; the image is then shown only over that window's client area.
 // Without the tag (older providers pass whatever is in the register) the
-// image is owned by the window hovered now.
+// image is owned by the window hovered now, if that window is the caller's;
+// otherwise it has no owner and is never shown.
 static constexpr uint64_t kCursorOwnerTag = 0xC5C50000ull << 32;
 int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
                                        uint64_t h, uint64_t hotX,
@@ -653,7 +654,7 @@ int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         }
         KMutexUnlock(&proc->addressSpace->mutation);
     }
-    uint64_t owner = brook::WmPointerHoverIdentity();
+    uint64_t owner = brook::WmPointerHoverIdentityOf(proc);
     if ((ownerArg & ~0xFFFFull) == kCursorOwnerTag) {
         // A tagged wmId that is not the caller's (closed meanwhile) keeps the
         // image unowned rather than attaching it to an unrelated window.

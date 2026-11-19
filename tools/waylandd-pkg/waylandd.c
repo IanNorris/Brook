@@ -999,6 +999,9 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
 static void surface_cursor_commit(struct brook_surface *s) {
     struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
     if (!view || !view->image->pixels) return;
+    /* No owning window: set without pointer focus (see pointer_set_cursor).
+     * Uploading it unowned would show it over other windows and the shell. */
+    if (!s->cursor_owner_wm) return;
     const struct brook_geometry *g=&view->geometry;
     const struct brook_image *image=view->image;
     uint32_t scale=surface_output_scale(s);
@@ -1844,6 +1847,23 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)serial;
     struct brook_seat_client *sc = seat_for_resource(r);
     if (!sc) return;
+    /* Only the client with pointer focus may set the cursor. Xwayland moves
+     * its sprite to the root window on wl_pointer.leave (sent on the kernel's
+     * POINTER_LEFT since a243a68c) and sets the root "X" cursor; uploaded
+     * without an owner it showed over the desktop, taskbar and kernel
+     * windows. The surface still takes the cursor role, but uploads nothing
+     * until a set_cursor with focus gives it an owner. */
+    if (!sc->entered_surface) {
+        struct brook_surface *cs = surface ? wl_resource_get_user_data(surface) : NULL;
+        if (cs) {
+            if (cs->role && cs->role!=3) {
+                wl_resource_post_error(r,WL_POINTER_ERROR_ROLE,"surface already has a role");return;
+            }
+            cs->role=3;cs->is_cursor=1;cs->cursor_owner_wm=0;
+            cs->cursor_hot_x=hx;cs->cursor_hot_y=hy;
+        }
+        return;
+    }
     sc->cursor_visible = surface != NULL;
     seat_apply_cursor_visibility(sc);
 
