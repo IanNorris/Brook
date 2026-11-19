@@ -44,6 +44,9 @@ struct AddressSpaceState {
     bool published;
     uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
     MappingRangeTable ranges; // authoritative mapping extents, permissions and ownership
+    static constexpr uint32_t SavedAuxvWords=48;
+    uint64_t savedAuxv[SavedAuxvWords];
+    uint32_t savedAuxvWords;
     uint64_t argumentStart, argumentEnd; // live, contiguous exec argument strings; mutation protects reads
     // Irreversible for this AS identity. Registry guard serializes publication
     // of every user sharing task with OOM selection, including non-thread clones.

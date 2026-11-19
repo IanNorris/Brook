@@ -226,6 +226,10 @@ bool SchedulerSnapshotTask(uint16_t tgid, uint64_t groupIncarnation,
                            uint16_t tid, uint32_t minTid, ProcessSnapshot* out);
 uint32_t SchedulerCountTasks(uint16_t tgid, uint64_t groupIncarnation);
 
+// Read-only thread-group snapshots and a retained matching address space.
+AddressSpaceState* SchedulerCoreDumpThreads(uint16_t pid,CoreThreadNote*,uint32_t capacity,
+                                             CoreProcessNote&,CoreDumpResult&);
+
 // Return the PID of the Nth active process (0-indexed). Returns false if out of range.
 bool SchedulerGetPidByIndex(uint32_t index, uint16_t* outPid);
 

@@ -81,7 +81,7 @@ struct Vnode {
     void*           priv;     // filesystem-private state (e.g. FIL* or DIR*)
     uint32_t        refCount; // reference count for fork/dup sharing
     uint64_t        cacheId;  // global file identity for page cache; 0 disables caching (not st_ino)
-    char*           directoryPath = nullptr; // owned canonical opening path; immutable until final close
+    char*           directoryPath = nullptr; // owned opening path, immutable until final close
     // Opaque retained initial-namespace mount instance. Set by VFS dispatch,
     // not by a backend. Its hold prevents unmount/reuse until final close.
     void*           mountOwner = nullptr;

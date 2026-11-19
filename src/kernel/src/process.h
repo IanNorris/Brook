@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core_dump.h"
 #include <stdint.h>
 #include "memory/address.h"
 #include "memory/address_space.h"
@@ -497,6 +498,7 @@ struct Process
     bool     inSignalHandler;   // Legacy diagnostic hint, not delivery authority
     bool     inSignalHandlerOnAltStack; // Legacy hint; use actual user RSP instead
     bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals
+    CoreRegisterSample coreRegisters;
     uint64_t currentSyscallNum;  // Syscall number (RAX) saved per-process for SA_RESTART
 
     // Fork child state: when true, the trampoline enters user mode at

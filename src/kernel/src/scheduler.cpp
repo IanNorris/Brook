@@ -3559,6 +3559,40 @@ static uint16_t SnapshotTgid(const Process* p) { return p->tgid ? p->tgid : p->p
 static uint64_t SnapshotGroup(const Process* p)
 { return p->isThread ? p->leaderIncarnation : p->incarnation; }
 
+AddressSpaceState* SchedulerCoreDumpThreads(uint16_t pid,CoreThreadNote* notes,uint32_t capacity,
+                                             CoreProcessNote& info,CoreDumpResult& result)
+{
+    const auto lock=SchedLockAcquire(g_allProcLock);
+    const Process* target=nullptr;
+    for(uint32_t i=0;i<g_processCount;++i){
+        const auto* p=g_allProcesses[i];
+        if(p && p->pid==pid && p->state!=ProcessState::Terminated && p->addressSpace && !p->addressSpace->kernel){
+            target=p;break;
+        }
+    }
+    if(!target){SchedLockRelease(g_allProcLock,lock);return nullptr;}
+    auto* space=target->addressSpace;
+    const uint16_t group=SnapshotTgid(target);
+    const uint64_t generation=SnapshotGroup(target);
+    const Process* leader=target;
+    for(uint32_t i=0;i<g_processCount && result.threads<capacity;++i){
+        const auto* p=g_allProcesses[i];
+        if(!p || p->state==ProcessState::Terminated || SnapshotTgid(p)!=group ||
+           SnapshotGroup(p)!=generation || p->addressSpace!=space)continue;
+        if(p->pid==group)leader=p;
+        auto& note=notes[result.threads++];
+        note={};note.pid=p->pid;note.ppid=p->parentPid;note.pgrp=p->pgid;note.sid=p->sid;
+        if(!CoreDumpReadRegisters(p,space->identity,note.registers))++result.missingRegisters;
+    }
+    info.stateName='R';info.uid=leader->uid;info.gid=leader->gid;
+    info.pid=group;info.ppid=leader->parentPid;info.pgrp=leader->pgid;info.sid=leader->sid;
+    for(uint32_t i=0;i+1<sizeof(info.name) && leader->name[i];++i)info.name[i]=leader->name[i];
+    for(uint32_t i=0;i+1<sizeof(result.executable) && leader->exePath[i];++i)result.executable[i]=leader->exePath[i];
+    AddressSpaceRef(space);
+    SchedLockRelease(g_allProcLock,lock);
+    return space;
+}
+
 static uint32_t CountTasksLocked(uint16_t tgid, uint64_t generation)
 {
     uint32_t count = 0;

@@ -1,3 +1,4 @@
+#include "core_dump.h"
 #include "desktop_layers_export.h"
 #include "intel_bdw_worker_overhead.h"
 #include "native_tsc_observe.h"
@@ -5625,6 +5626,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  (levels: error warn info debug trace)\n"
             "\n"
             "Profiler:\n"
+            "  proc dump PID /path [--full] - write a live ELF core\n"
             "  prof start [ms]  - start profiler (ms=0 or omitted: indefinite)\n"
             "  prof stop        - stop profiler + flush\n"
             "  prof status      - profiler status\n"
@@ -5687,6 +5689,38 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     // -----------------------------------------------------------------------
     // procs — process list
     // -----------------------------------------------------------------------
+    else if(StrStartsWith(cmd,"proc dump ")){
+        const char* argument=cmd+sizeof("proc dump ")-1;
+        uint32_t pid=0;
+        while(*argument>='0' && *argument<='9' && pid<=65535)pid=pid*10+uint32_t(*argument++-'0');
+        if(!pid || pid>65535 || *argument!=' '){
+            DebugChannelSend("{\"error\":\"usage: proc dump PID /absolute/path [--full]\"}\n");return;
+        }
+        while(*argument==' ')++argument;
+        char path[1024];
+        uint32_t length=0;
+        while(*argument && *argument!=' ' && length+1<sizeof(path))path[length++]=*argument++;
+        path[length]=0;
+        while(*argument==' ')++argument;
+        const bool full=NetStrEq(argument,"--full");
+        if(path[0]!='/' || path[1]==0 || (*argument && !full)){
+            DebugChannelSend("{\"error\":\"usage: proc dump PID /absolute/path [--full]\"}\n");return;
+        }
+        CoreDumpResult dump{};
+        const int result=CoreDumpProcess(uint16_t(pid),path,full,dump);
+        BridgeReply reply;
+        if(result){
+            reply.text("{\"error\":\"core dump failed\",");reply.field("errno",uint64_t(-result));
+        }else{
+            reply.text("{");reply.field("threads",dump.threads);
+            reply.text(",");reply.field("missing_registers",dump.missingRegisters);
+            reply.text(",");reply.field("mappings",dump.mappings);
+            reply.text(",");reply.field("bytes",dump.bytes);
+            reply.text(",");reply.field("holes",dump.holes);
+            reply.text(",\"exe\":");reply.quoted(dump.executable);
+        }
+        reply.text(",");reply.field("duration_ms",dump.durationMs);reply.text("}\n");reply.send();
+    }
     else if (NetStrEq(cmd, "procs")) {
         extern uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
