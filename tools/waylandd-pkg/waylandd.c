@@ -476,6 +476,10 @@ struct brook_surface {
     /* Frame pacing (status "pacing"): last buffer commit and last frame
      * callback sent, in microseconds. */
     uint64_t pace_commit_us,pace_callback_us;
+    /* Status diagnostics ("surfaces" in the status file): the newest serial
+     * the client acknowledged, and when it acked, was last configured and
+     * last committed (with and without a buffer), in g_now_ms(). */
+    uint32_t last_ack_serial,last_ack_ms,configure_ms,commit_ms,buffer_commit_ms;
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -665,10 +669,8 @@ static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t i
     callback->resource = wl_resource_create(c, &wl_callback_interface, 1, id);
     if (!callback->resource) { free(callback); wl_client_post_no_memory(c); return; }
     callback->surface = surface;
-    if (g_trace_frames) {
-        callback->requested_ms = g_now_ms();
-        ++surface->trace_requests;
-    }
+    callback->requested_ms = g_now_ms();
+    if (g_trace_frames) ++surface->trace_requests;
     wl_list_insert(surface->pending_frames.prev, &callback->link);
     wl_resource_set_implementation(callback->resource, NULL, callback, frame_callback_destroy);
 }
@@ -753,6 +755,68 @@ static int frame_clock_tick(void *unused) {
     wl_event_source_timer_update(g_frame_timer, 16);
     return 0;
 }
+/* Why a surface's committed frame callbacks are not being sent: the same
+ * decision frame_clock_tick makes, named for the status file. */
+static const char *surface_callback_state(struct brook_surface *surface,uint32_t now){
+    if(!wl_list_empty(&surface->waiting_frames) && wl_list_empty(&surface->committed_frames))return "unapplied_commit";
+    if(wl_list_empty(&surface->committed_frames))return wl_list_empty(&surface->pending_frames)?"none":"uncommitted";
+    struct brook_surface *root=surface;
+    while(root->subsurface_parent)root=root->subsurface_parent;
+    if(!root->wm_id && !surface->is_cursor)return "no_window";
+    struct brook_draw draws[64];unsigned n=0;
+    if(!surface_layers(root,draws,&n))return "layers";
+    for(unsigned i=0;i<n;++i){const struct brook_image *image=draws[i].view->image;
+        if(root_callbacks_due(root,image,now))continue;
+        return image->offer_state==1?"presented":image->group_refs?"group":"image_pending";}
+    return "due";
+}
+static uint32_t frame_list_oldest(const struct wl_list *list,uint32_t now,uint32_t oldest){
+    const struct brook_frame_callback *callback;
+    wl_list_for_each(callback,list,link)if(callback->requested_ms && now-callback->requested_ms>oldest)oldest=now-callback->requested_ms;
+    return oldest;
+}
+static void buffer_size(const struct brook_buffer *buffer,int32_t *w,int32_t *h){
+    *w=*h=0;if(!buffer)return;
+    if(buffer->dmabuf){*w=buffer->dmabuf->width;*h=buffer->dmabuf->height;}
+    else if(buffer->shm){*w=wl_shm_buffer_get_width(buffer->shm);*h=wl_shm_buffer_get_height(buffer->shm);}
+}
+/* One "surfaces" entry: frame callbacks, configure handshake, buffers and
+ * what the callbacks wait for (Chromium freeze diagnosis, gen 442). */
+static void surface_status_json(FILE *f,struct brook_surface *s,uint32_t now){
+    struct brook_surface *root=s;while(root->subsurface_parent)root=root->subsurface_parent;
+    const int pending=wl_list_length(&s->pending_frames),waiting=wl_list_length(&s->waiting_frames),
+        committed=wl_list_length(&s->committed_frames);
+    uint32_t oldest=frame_list_oldest(&s->pending_frames,now,0);
+    oldest=frame_list_oldest(&s->waiting_frames,now,oldest);oldest=frame_list_oldest(&s->committed_frames,now,oldest);
+    pid_t pid=0;uid_t uid;gid_t gid;
+    if(s->resource)wl_client_get_credentials(wl_resource_get_client(s->resource),&pid,&uid,&gid);
+    fprintf(f,"{\"object\":%u,\"client_pid\":%d,\"role\":%d,\"wm\":%u,\"root_wm\":%u,\"cursor\":%d,",
+        s->resource?wl_resource_get_id(s->resource):0,(int)pid,s->role,s->wm_id,root->wm_id,s->is_cursor);
+    fprintf(f,"\"frames\":{\"pending\":%d,\"waiting\":%d,\"committed\":%d,\"oldest_ms\":%u,\"state\":\"%s\"},",
+        pending,waiting,committed,oldest,surface_callback_state(s,now));
+    fprintf(f,"\"configure\":{\"sent\":%u,\"acked\":%u,\"sent_ms_ago\":%u,\"acked_ms_ago\":%u,\"size\":[%d,%d],"
+        "\"size_pending\":%d,\"size_serial\":%u,\"size_acked\":%d,\"maximized\":%d,\"fullscreen\":%d,\"resizing\":%d},",
+        s->next_configure_serial,s->last_ack_serial,s->configure_ms?now-s->configure_ms:0,s->last_ack_ms?now-s->last_ack_ms:0,
+        s->configure_width,s->configure_height,s->configure_size_pending,s->configure_size_serial,s->configure_size_acked,
+        s->toplevel_maximized,s->toplevel_fullscreen,s->toplevel_resizing);
+    int32_t pw=0,ph=0;if(s->pending_attach)buffer_size(s->pending_buffer,&pw,&ph);
+    fprintf(f,"\"pending_buffer\":[%d,%d],\"commit_ms_ago\":%u,\"buffer_commit_ms_ago\":%u,",pw,ph,
+        s->commit_ms?now-s->commit_ms:0,s->buffer_commit_ms?now-s->buffer_commit_ms:0);
+    const struct brook_view *current=s->tree.current?s->tree.current->value:NULL;
+    const struct brook_view *latest=s->tree.latest?s->tree.latest->value:NULL;
+    fprintf(f,"\"tree\":{\"sequence\":%llu,\"current\":%llu,\"latest\":%llu,\"sync\":%d},",(unsigned long long)s->tree.sequence,
+        (unsigned long long)(s->tree.current?s->tree.current->commit:0),(unsigned long long)(s->tree.latest?s->tree.latest->commit:0),s->tree.sync);
+    for(int k=0;k<2;++k){const struct brook_view *view=k?latest:current;
+        fprintf(f,"\"%s\":",k?"latest_image":"current_image");
+        if(!view || !view->image){fprintf(f,"null,");continue;}
+        const struct brook_image *im=view->image;const struct brook_buffer *src=im->source;
+        int32_t bw=0,bh=0;buffer_size(src,&bw,&bh);
+        fprintf(f,"{\"size\":[%u,%u],\"view\":[%d,%d],\"pending_cpu\":%d,\"offer_state\":%d,\"gpu_presented\":%d,\"group_refs\":%u,"
+            "\"offer_ms_ago\":%u,\"queued_ms_ago\":%u,\"buffer\":[%d,%d],\"buffer_uses\":%u,\"buffer_alive\":%d},",
+            im->width,im->height,(int)view->geometry.w,(int)view->geometry.h,im->pending_cpu,im->offer_state,im->gpu_presented,im->group_refs,
+            im->offer_ms?now-im->offer_ms:0,im->queued_ms?now-im->queued_ms:0,bw,bh,src?src->uses:0,src && src->resource?1:0);}
+    fprintf(f,"\"viewport\":%d}",s->viewport!=NULL);
+}
 static void trace_frames_report(uint32_t now) {
     if (!g_trace_frames || now - g_trace_last_report < 1000) return;
     g_trace_last_report = now;
@@ -826,7 +890,7 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
         *state=values[i];
     }
     xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);wl_array_release(&states);
-    s->next_configure_serial=next_serial();
+    s->next_configure_serial=next_serial();s->configure_ms=g_now_ms();
     if(s->configure_size_pending) {s->configure_size_serial=s->next_configure_serial;s->configure_size_acked=0;}
     xdg_surface_send_configure(s->xdg_surface,s->next_configure_serial);return 1;
 }
@@ -844,6 +908,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     if (!xwayland_surface_commit(s)) return;
     if (s->role==4) xwayland_pair_surfaces();
     if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
+    s->commit_ms=g_now_ms();if(s->pending_attach && s->pending_buffer)s->buffer_commit_ms=s->commit_ms;
     if (s->window_geometry_pending) {
         s->window_geometry_w=s->pending_geometry_w;s->window_geometry_h=s->pending_geometry_h;s->window_geometry_pending=0;
         s->window_geometry_x=s->pending_geometry_x;s->window_geometry_y=s->pending_geometry_y;
@@ -876,7 +941,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         const int32_t height=toplevel_initial_axis(600,s->size_hints.min_h,s->size_hints.max_h,cap_h);
         xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);
         wl_array_release(&states);
-        uint32_t serial = s->next_configure_serial = next_serial();
+        uint32_t serial = s->next_configure_serial = next_serial();s->configure_ms=g_now_ms();
         xdg_surface_send_configure(s->xdg_surface, serial);
         fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (%dx%d)\n", serial,width,height);
         return;
@@ -886,7 +951,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         int32_t pw = s->popup_w > 0 ? s->popup_w : 200;
         int32_t ph = s->popup_h > 0 ? s->popup_h : 100;
         xdg_popup_send_configure(s->xdg_popup, s->popup_x, s->popup_y, pw, ph);
-        uint32_t serial = s->next_configure_serial = next_serial();
+        uint32_t serial = s->next_configure_serial = next_serial();s->configure_ms=g_now_ms();
         xdg_surface_send_configure(s->xdg_surface, serial);
         fprintf(stderr, "[waylandd] xdg popup initial configure sent serial=%u %dx%d\n",
                 serial, pw, ph);
@@ -1313,7 +1378,7 @@ static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
         xdg_popup_send_configure(r, s->popup_x, s->popup_y,
                                  s->popup_w, s->popup_h);
         if (s->xdg_surface) {
-            uint32_t serial = s->next_configure_serial = next_serial();
+            uint32_t serial = s->next_configure_serial = next_serial();s->configure_ms=g_now_ms();
             xdg_surface_send_configure(s->xdg_surface, serial);
         }
         popup_apply_position(s);
@@ -1373,6 +1438,7 @@ static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
     s->xdg_acked = 1;
+    s->last_ack_serial=serial;s->last_ack_ms=g_now_ms();
     if (s->configure_size_pending && serial==s->configure_size_serial) s->configure_size_acked=1;
     fprintf(stderr, "[waylandd] xdg_surface.ack_configure serial=%u\n", serial);
 }
@@ -4110,6 +4176,12 @@ static void waylandd_status_write(const char *display){
             "\"src24_8\":[%u,%u],\"fmt\":%u,\"opaque\":%d,\"offer\":%d}",k?",":"",w->l[k].kind,w->l[k].w,w->l[k].h,w->l[k].dw,w->l[k].dh,
             (long long)w->l[k].x,(long long)w->l[k].y,w->l[k].sw,w->l[k].sh,w->l[k].fmt,w->l[k].opaque,w->l[k].offer);
         fprintf(f,"]}");}
+    fprintf(f,"],\"surfaces\":[");
+    first=1;unsigned listed=0;
+    for(struct brook_surface *x=g_surfaces;x && listed<32;x=x->next){
+        if(!x->wm_id && !x->xdg_toplevel && !x->subsurface_parent && x->role!=4)continue;
+        if(!first)fputc(',',f);
+        first=0;++listed;surface_status_json(f,x,now);}
     fprintf(f,"]}\n");
     if(fclose(f)==0)rename(tmp,path);else unlink(tmp);
 }
