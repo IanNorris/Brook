@@ -788,6 +788,11 @@ taskbar-hover probe times out on both builds, the frame is still compared):
   these frames were read from a VNC socket on the same QEMU
   (`vncgrab.py`, raw RFB).
 
+**Dell pair:** `build/dell/pair-cw1b` (payload `dell-cw1b-20261119`, scanout
+flip, persistent scanout map, zero-copy scanout and video engine on; clean
+tree at `f07dad86`; kernel `1c43a2d4…`). `check_dell_image_qemu.py
+--attempts 4`: PASS. Nothing has run on the Dell.
+
 Evidence (not committed): `build/cw1b-evidence/` in the worktree.
 
 ### Dell measurement plan (stage 1.4)
