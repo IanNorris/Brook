@@ -926,6 +926,7 @@ bool CompositorGlassActive(){
 static uint64_t g_rendererCapsOwner=0;
 static uint32_t g_rendererCaps=0;
 static bool g_backendBlurLatched=false;
+static uint64_t g_backendBlurChanges=0; // latch transitions (gpu glass status)
 uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps){
     if(!owner)return 0;
     caps&=BROOK_DESKTOP_CAP_KNOWN;
@@ -936,18 +937,25 @@ uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps){
 // Which compositor shows the desktop decides backdrop blur: a renderer
 // holding the present lease reports it (op 18); otherwise the kernel GPU
 // path (virgl) has it when its driver can blur; the CPU path never does.
-// Lease expiry, release, renderer exit and a GOP writer all change it.
+// Lease expiry, release, renderer exit and a foreign GOP writer change it.
+// The lease holder's own present (g_gopWriter held across the BCS copy or
+// flip, several milliseconds per frame) does not: it is writing the frame
+// it rendered with blur. Treating it as a loss made a compositor loop that
+// ran mid-present flip the theme to the Opaque stand-in and back (each flip
+// a chrome epoch, so every in-flight present failed ESTALE).
 static bool CompositorBackendBlur(uint64_t now){
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
-        if(g_gopWriter)return false;
-        if(g_presentLease.Active(now))
+        const bool leased=g_presentLease.Active(now);
+        if(g_gopWriter && (!leased || g_gopWriterRevoked || g_gopWriterOwner!=g_presentLease.owner))return false;
+        if(leased)
             return g_rendererCapsOwner==g_presentLease.owner && (g_rendererCaps&BROOK_DESKTOP_CAP_BACKDROP_BLUR);
     }
     const auto* gpu=GpuCompositorGet();
     return CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
 }
 bool CompositorBackendBlurActive(){return __atomic_load_n(&g_backendBlurLatched,__ATOMIC_ACQUIRE);}
+uint64_t CompositorBackendBlurChanges(){return __atomic_load_n(&g_backendBlurChanges,__ATOMIC_RELAXED);}
 
 void CompositorInit()
 {
@@ -4052,6 +4060,8 @@ static void CompositorLoop()
     // capability changed (renderer start or exit, lease loss, GPU fault).
     {
         const bool blur=CompositorBackendBlur(ApicTickCount());
+        if(blur!=__atomic_load_n(&g_backendBlurLatched,__ATOMIC_ACQUIRE))
+            __atomic_add_fetch(&g_backendBlurChanges,1,__ATOMIC_RELAXED);
         __atomic_store_n(&g_backendBlurLatched,blur,__ATOMIC_RELEASE);
         WmSetBackendBlur(blur);
     }

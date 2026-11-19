@@ -526,7 +526,19 @@ int main() {
         CHECK(!CompositorBackendBlur(t)); // reported by a process that does not hold the lease
         CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);CHECK(CompositorBackendBlur(t));
         CHECK(!CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS)); // lapsed: the CPU path shows the desktop
-        g_gopWriter=7;CHECK(!CompositorBackendBlur(t));g_gopWriter=0;CHECK(CompositorBackendBlur(t));
+        g_gopWriter=7;g_gopWriterOwner=0;CHECK(!CompositorBackendBlur(t));g_gopWriter=0;CHECK(CompositorBackendBlur(t));
+        // The lease holder's own present in flight (held across the BCS copy
+        // or flip) keeps blur: a compositor loop that runs mid-present must
+        // not flip the theme to the Opaque stand-in (Dell dropouts, 19 Nov).
+        // Any other writer, a revoked one or a lapsed lease still drops it.
+        g_gopWriter=7;g_gopWriterOwner=42;g_gopWriterRevoked=false;CHECK(CompositorBackendBlur(t));
+        CHECK(CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS-1));
+        CHECK(!CompositorBackendBlur(t+COMPOSITOR_PRESENT_LEASE_MS));
+        g_gopWriterRevoked=true;CHECK(!CompositorBackendBlur(t));g_gopWriterRevoked=false;
+        g_gopWriterOwner=43;CHECK(!CompositorBackendBlur(t));
+        CompositorSetRendererCapabilities(42,0);g_gopWriterOwner=42;CHECK(!CompositorBackendBlur(t));
+        CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);CHECK(CompositorBackendBlur(t));
+        g_gopWriter=0;g_gopWriterOwner=0;CHECK(CompositorBackendBlur(t));
         CompositorReleasePresentLease(42); // detach or exit drops the report
         CHECK(g_presentLease.Acquire(42,t,COMPOSITOR_PRESENT_LEASE_MS));CHECK(!CompositorBackendBlur(t));
         CompositorSetRendererCapabilities(42,BROOK_DESKTOP_CAP_BACKDROP_BLUR);
