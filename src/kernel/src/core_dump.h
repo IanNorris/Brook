@@ -5,6 +5,8 @@
 namespace brook {
 struct Process;
 struct IrqSignalFrame;
+struct AddressSpaceState;
+struct VfsPath;
 
 // Linux x86-64 NT_PRSTATUS register order.
 struct CoreRegisters {
@@ -45,8 +47,26 @@ struct CoreDumpResult {
     const char* stage="snapshot";
 };
 
+struct CoreDumpSnapshot {
+    AddressSpaceState* space=nullptr; // borrowed from the snapshot owner's pin
+    CoreThreadNote* threads=nullptr;
+    uint32_t capacity=0;
+    CoreProcessNote info{};
+    CoreDumpResult result{};
+};
+
+struct CoreDumpDestination {
+    const VfsPath* root=nullptr;
+    const VfsPath* directory=nullptr;
+    uint64_t byteLimit=0;
+    bool (*expired)(void*)=nullptr;
+    int (*reserve)(void*,uint64_t)=nullptr;
+    void* context=nullptr;
+};
+
 void CoreDumpPublishRegisters(Process*,const CoreRegisters&);
 void CoreDumpCaptureIrq(Process*,const IrqSignalFrame&);
 bool CoreDumpReadRegisters(const Process*,uint64_t addressSpace,CoreRegisters&);
+int CoreDumpWriteSnapshot(CoreDumpSnapshot&,const char* path,bool full,const CoreDumpDestination&);
 int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult&);
 }

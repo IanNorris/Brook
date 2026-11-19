@@ -1,3 +1,4 @@
+#include "core_autodump.h"
 #include "lastlog.h"
 #include "desktop_identity.h"
 namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart(); }
@@ -1125,6 +1126,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // barrier, closing the freed-while-mapped cross-domain reuse window.
         brook::PmmStartDrainThread();
         brook::ProcessStartCleanupWorker();
+#if !defined(BROOK_SSD_GUARD_CHECK) || defined(BROOK_SSD_GUARDED_DESKTOP)
+        brook::CoreAutoStart();
+#endif
         brook::PageableMemoryStartReserveWorker();
         brook::FilePageCacheStartReclaimWorker();
         brook::FileObjectStartWriteback();
