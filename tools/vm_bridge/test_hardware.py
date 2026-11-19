@@ -200,6 +200,27 @@ class HardwareTests(unittest.TestCase):
         for cursor,limit in [(True,64),(-1,64),(0,65)]:
             with self.assertRaises(ValueError):self.hardware.logs(session,cursor,limit)
         self.assertEqual(len(self.endpoint.commands),count)
+    def test_frame_window_options_validated_before_connection(self):
+        session=self.attach();count=len(self.endpoint.commands)
+        ref={'window_id':1,'incarnation':'5','session_generation':'g','guest_boot_id':'a'*32}
+        for kwargs in [{'action':'put','cursor':True},{'action':'frame','window_area':'buffer'},
+                       {'action':'frame','window_area':'nope','window':ref},{'action':'frame','cursor':1},
+                       {'action':'frame','window':{'window_id':1}}]:
+            with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):
+                self.hardware.transfer(session,'c'*32,key_file='k',output=self.tmp.name+'/o',**kwargs)
+        self.assertEqual(len(self.endpoint.commands),count)
+    def test_window_rectangles_from_snapshot(self):
+        from window_crop import find_window,window_rect
+        row={'window_id':2,'incarnation':'9','x':100,'y':50,'width':800,'height':600,'outer_width':804,'outer_height':640,
+             'visible':True,'minimized':False}
+        listing={'generation':'g','guest_boot_id':'a'*32,'windows':[row]}
+        ref={'window_id':2,'incarnation':'9','session_generation':'g','guest_boot_id':'a'*32}
+        self.assertIs(find_window(listing,ref),row)
+        self.assertEqual(window_rect(row,'frame'),(100,50,804,640))
+        self.assertEqual(window_rect(row,'client'),(102,88,800,600))
+        for bad in [{**ref,'incarnation':'8'},{**ref,'guest_boot_id':'b'*32},{**ref,'session_generation':'h'}]:
+            with self.subTest(bad=bad),self.assertRaises(ValueError):find_window(listing,bad)
+        with self.assertRaises(ValueError):window_rect({**row,'minimized':True},'frame')
     def test_existing_job_boot_envelope_is_not_expanded(self):
         session=self.attach();data=self.hardware.load_session(session);command='bridge job put '+'a'*32+' 0 '+'00'*64+' '+data['guest_boot_id']
         self.assertEqual(self.hardware.guarded(data,command),command)

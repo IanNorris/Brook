@@ -128,4 +128,35 @@ class Tests(unittest.TestCase):
         with patch('hardware_bulk_workflow.download',self.frame_download):
             r=BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame',keep_raw=True)
         self.assertTrue(Path(r['transfer']['raw_artifact_path']).is_file())
+    def provenance_download(self,host,port,key,boot,tx,path,action):
+        reply=self.frame_download(host,port,key,boot,tx,path,action)
+        reply['payload'].update(info_version=4,source_kind=5,plane=3,plane_surface=0x1c40000,info_flags=1,copy_us=9000)
+        return reply
+    def test_frame_options_reach_helper_argv_and_provenance_is_named(self):
+        with patch('hardware_bulk_workflow.download',self.provenance_download):
+            r=BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame',request_id='c'*32,
+                frame_options={'flags':3,'window_id':4,'incarnation':77})
+        self.assertEqual(self.bridge.launches[0][1][-1],'o:3:4:77')
+        frame=r['frame'];self.assertEqual((frame['source'],frame['scanout']),('gpu-present','zero-copy'))
+        self.assertTrue(frame['cursor_composited']);self.assertEqual(frame['scanout_surface'],'0x1c40000')
+    def test_old_helper_payload_reports_no_provenance(self):
+        with patch('hardware_bulk_workflow.download',self.frame_download):
+            r=BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame')
+        self.assertIsNone(r['frame']['source']);self.assertEqual(len(self.bridge.launches[0][1]),4)
+    def test_invalid_frame_options_prevent_launch(self):
+        for options in ({'flags':2},{'flags':1,'window_id':3,'incarnation':1},{'flags':8},{'flags':2,'window_id':300,'incarnation':1}):
+            with self.subTest(options=options),self.assertRaises(ValueError):
+                BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame',frame_options=options)
+        with self.assertRaises(ValueError):
+            BulkRun(self.bridge,self.root/'put').execute('session',self.key,'put',self.source,frame_options={'flags':1})
+        self.assertEqual(self.bridge.launches,[])
+    def test_window_crop_is_clipped_and_full_frame_kept(self):
+        with patch('hardware_bulk_workflow.download',self.frame_download):
+            r=BulkRun(self.bridge,self.root/'frame').execute('session',self.key,'frame',crop=(1,-5,10,10))
+        self.assertEqual(r['crop'],{'x':1,'y':0,'width':1,'height':1})
+        self.assertTrue(r['artifact_path'].endswith('window.png'));self.assertTrue(Path(r['full_artifact_path']).is_file())
+        png=Path(r['artifact_path']).read_bytes();self.assertEqual(png[16:24],(1).to_bytes(4,'big')+(1).to_bytes(4,'big'))
+        self.bridge=Bridge()
+        with patch('hardware_bulk_workflow.download',self.frame_download),self.assertRaisesRegex(ValueError,'off screen'):
+            BulkRun(self.bridge,self.root/'frame2').execute('session',self.key,'frame',crop=(5,5,3,3))
 if __name__=='__main__':unittest.main()

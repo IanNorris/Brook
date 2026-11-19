@@ -10,6 +10,7 @@
 // gates are debug-channel commands and live only in RAM). See
 // docs/bdw-page-flip.md for the evidence, the state machine and the plan.
 #include "intel_bdw_scanout_target.h"
+#include "intel_bdw_scanout_capture.h"
 #include "string.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_scanout.h"
@@ -1702,50 +1703,14 @@ BdwScanoutCaptureKind BdwScanoutCaptureLive(uint32_t* destination,uint32_t width
             return source.plane==BROOK_DEBUG_FRAME_PLANE_UNKNOWN?BdwScanoutCaptureKind::Unsupported:BdwScanoutCaptureKind::Busy;
         }
     }
-    // DSPACNTR bits 29:26: 0110 XRGB8888 (B,G,R,X bytes), 1110 XBGR8888.
-    const uint32_t format=(control>>26)&15u;
-    const bool tiled=(control&BdwFlipRegs::TiledBit)!=0;
-    const uint32_t rowBytes=width*4;
-    uint32_t pages=0;bool valid=(control&BdwFlipRegs::EnableBit) && (format==6 || format==14) && !offset &&
-        stride>=rowBytes && stride<=32768 && !(stride%64) && (!tiled || !(stride%512));
-    if(valid){
-        pages=tiled?((height+7)/8)*(stride/512):uint32_t((uint64_t(height-1)*stride+rowBytes+4095)/4096);
-        valid=pages<=source.pages;
-    }
+    BdwCaptureLayout layout{};
+    bool valid=BdwCaptureLayoutFrom(control,stride,offset,width,height,layout) && layout.pages<=source.pages;
     if(valid){
         const uint64_t start=Rdtsc();
-        CaptureFlushPages(source,pages);
-        if(tiled){
-            // Gen8 X tile: 4 KiB = 8 rows of 512 bytes, row-major tiles; no
-            // CPU-visible bit-6 swizzle on Broadwell.
-            const uint32_t tilesPerRow=stride/512;
-            for(uint32_t ty=0;valid && ty*8<height;++ty)
-                for(uint32_t tx=0;tx<tilesPerRow && tx*128<width;++tx){
-                    const uint8_t* tile=CapturePage(source,ty*tilesPerRow+tx);
-                    if(!tile){valid=false;break;}
-                    const uint32_t n=width-tx*128<128?width-tx*128:128;
-                    for(uint32_t k=0;k<8 && ty*8+k<height;++k)
-                        memcpy(destination+uint64_t(ty*8+k)*width+tx*128,tile+k*512,n*4);
-                }
-            info.flags|=BROOK_DEBUG_FRAME_INFO_DETILED;
-        }else{
-            for(uint32_t y=0;valid && y<height;++y){
-                uint64_t at=uint64_t(y)*stride;uint32_t left=rowBytes;
-                auto* out=reinterpret_cast<uint8_t*>(destination+uint64_t(y)*width);
-                while(left){
-                    const uint8_t* page=CapturePage(source,uint32_t(at>>12));
-                    if(!page){valid=false;break;}
-                    const uint32_t in=uint32_t(at&4095),n=left<4096-in?left:4096-in;
-                    memcpy(out,page+in,n);out+=n;at+=n;left-=n;
-                }
-            }
-        }
-        if(valid && format==14){
-            for(uint64_t i=0,n=uint64_t(width)*height;i<n;++i){
-                const uint32_t p=destination[i];destination[i]=(p&0xff00ff00u)|((p>>16)&0xffu)|((p&0xffu)<<16);
-            }
-            info.flags|=BROOK_DEBUG_FRAME_INFO_SWAPPED_RB;
-        }
+        CaptureFlushPages(source,layout.pages);
+        valid=BdwCaptureCopy(destination,layout,[&](uint32_t page){return static_cast<const uint8_t*>(CapturePage(source,page));});
+        if(layout.tiled)info.flags|=BROOK_DEBUG_FRAME_INFO_DETILED;
+        if(layout.swapRb)info.flags|=BROOK_DEBUG_FRAME_INFO_SWAPPED_RB;
         info.copyUs=tscKhz?uint32_t((Rdtsc()-start)*1000/tscKhz):0;
     }
     bool held=false;
@@ -1783,23 +1748,12 @@ bool BdwScanoutCaptureCursor(uint32_t* destination,uint32_t width,uint32_t heigh
                     memcpy(pixels+row*64,reinterpret_cast<const uint32_t*>(cursorBacking[slot].pixels[row/16].cpu)+(row%16)*64,64*4);
                 visible=true;
             }
-            // CURPOS: sign-magnitude, X in bits 15:0, Y in bits 31:16.
-            x=int32_t(position&0x7fffu);if(position&0x8000u)x=-x;
-            y=int32_t((position>>16)&0x7fffu);if(position&0x80000000u)y=-y;
+            BdwCaptureCursorPosition(position,x,y);
         }
         IrqSpinLockRelease(&lock,f);
         if(!visible)return false;
     }
-    for(int32_t row=0;row<64;++row){
-        const int32_t dy=y+row;if(dy<0 || dy>=int32_t(height))continue;
-        for(int32_t col=0;col<64;++col){
-            const int32_t dx=x+col;if(dx<0 || dx>=int32_t(width))continue;
-            const uint32_t s=pixels[row*64+col],a=s>>24;if(!a)continue;
-            uint32_t& d=destination[uint64_t(dy)*width+uint32_t(dx)];
-            auto mix=[&](unsigned shift){const uint32_t v=((s>>shift)&255u)+(((d>>shift)&255u)*(255u-a)+127)/255;return (v>255?255:v)<<shift;};
-            d=0xff000000u|mix(16)|mix(8)|mix(0);
-        }
-    }
+    BdwCaptureCursorComposite(destination,width,height,pixels,x,y);
     return true;
 #else
     (void)destination;(void)width;(void)height;return false;
