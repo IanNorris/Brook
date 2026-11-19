@@ -43,6 +43,8 @@ struct DesktopTrackWindow {
 struct DesktopTrackState {
     uint32_t valid,width,height,count;
     uint64_t display,backdrop;
+    uint64_t glassKey;
+    struct DesktopDamageSet glassDamage;
     struct DesktopTrackWindow windows[BROOK_DESKTOP_LAYER_LIMIT];
 };
 
