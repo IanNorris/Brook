@@ -95,6 +95,17 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**19 Nov midday: gen 444 = `work/integration40` 1acf253f (payload `dell-int40-20261119`, session `7a1747fa20dd4cdd9413a8381cfedbf4`).**
+- **What int40 adds:** int38 (cursor fix, manual proc dump, Settings slider wheel fix) + `work/net-rx` + proc autodump + Clearwater 1.3–1.4 (`work/clearwater-s1b`) + `work/chromium-freeze` (procfs syscall/wchan, `proc blocked`, waylandd surface diagnostics, kmutex wake-latch hardening) + `work/build-speed` (stress ctest label, audit cache).
+- **Speedtest (Ian):** **911 down / 77 up** on 900/100 (gen 442: 42.6 / 77.2).
+  - rx_depth 128, 14 empty-queue entries, 0 drops.
+  - OOO 132k arrivals, all stored (`ooo_full` 0).
+  - Upload is now TX-bound: `tx_busy` rose to 897 during the upload phase; `tx_depth` is 16.
+  - Evidence: `display-perf/build/dell/speedtest-444-net.json`.
+- **Launcher over fullscreen Q2 with the pointer moving:** 37.9 displayed fps, p99 49.6 ms, prepare 2.0 ms, overlay capture wait 6.2 ms, 1,353 capture reuses. Gen 441 gave 22.2 fps, p99 458 ms, prepare 13.3 ms, capture wait 14.2 ms. Ian: "much smoother". Still to explain: ~5 stale presents/s.
+- **Hardware cursor on gen 444:** invisible. It stayed bound but never active, with 0 images and 0 positions, while the renderer had already dropped its software cursor. Off for now; Codex is fixing it.
+- **Build cycle with stress skipped:** build 83 s, ctest 19 s, pair 34 s, QEMU 22 s. Run stress only for memory/scheduler/sync/fd changes (Ian).
+
 **19 Nov morning: resume here (supersedes "19 Nov early").**
 - **The Dell is on gen 443:** `work/integration37` 7250125e, payload `dell-int37-20261119`, session `e791539677cc46fcabebc9316b7d13a4`.
   - Chain: int34 → int35 (+app-present: shell/popup cadence rules, 33 ms defer, overlay capture rate limit, cadence ON at boot) → int36 (+`work/udp-rx-lock` a02725a9) → int37 (+Codex `work/display-planes` 04685a0a).
