@@ -63,6 +63,9 @@ The archived approvals to merge, delete branches, wipe an old SSD installation, 
 
 ## File manager: Nautilus is the base, as Brook "Files" (Ian, 19 Nov)
 
+- Nautilus is the default file manager: Super+E, the launcher Files entry/pin, and inode/directory all open it. The old brook-files app is deleted (Codex work/files-nautilus).
+- Order agreed 19 Nov: stage 3 deploy → system tray + notifications (Codex work/shell-tray; Steam minimises to tray) → GTK app theming/glass (gtk.css from Brook tokens + compositor blur). In parallel, Claude does GTK4 hardware GL (iris) on the Dell.
+
 - Nautilus (GTK4/libadwaita) is Brook's file manager; it fits the Clearwater look better than Dolphin once its window buttons are fixed.
 - The UI doesn't need to say "Nautilus" (like other distros, it shows as Files), but the About dialog stays untouched: no changes to credits, authors, licence text or links.
 - Brook's changes to it live in a separate repository under Nautilus's own licence (GPL-3.0-or-later; confirm against the packaged source's COPYING), not in the Brook repo. The Brook image builds from that repo.
