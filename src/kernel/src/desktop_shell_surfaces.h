@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "window.h"
+#include "../../shared/desktop_layers_abi.h"
 
 namespace brook {
 // Shell surfaces: the one list of desktop overlay surfaces (taskbar, the
@@ -53,6 +54,10 @@ inline uint32_t WmShellSurfaces(uint32_t screenW, uint32_t screenH, int32_t mx, 
 // thread only). 0: the surface draws nothing.
 uint64_t WmShellSurfaceKey(const WmShellSurface& surface, uint32_t screenW, uint32_t screenH,
                            uint64_t uptimeMs, int32_t mx, int32_t my);
+
+// The surface's record (layers ABI v2): material, opacity, radii, shadow
+// and the given content key (window.cpp).
+BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface, uint64_t key);
 
 // Rasterise one surface with the WM's CPU painters into a full-screen buffer.
 inline void WmRenderShellSurface(const WmShellSurface& surface, uint32_t* pixels, uint32_t stride,

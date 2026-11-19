@@ -42,6 +42,7 @@
 #include "chrome_layout.h"
 #include "chrome_frame.h"
 #include "chrome_shell.h"
+#include "chrome_surface.h"
 #include "desktop_shell_surfaces.h"
 #include "input.h"
 #include "mouse.h"
@@ -2811,7 +2812,13 @@ int64_t WmDesktopLayersUseIfBothPresentable(const WmDesktopLayers& base,const Wm
     if(!DesktopLayersPresentableLocked(base) || !DesktopLayersPresentableLocked(next))return -116;
     return use(context);
 }
+struct DesktopChromeEpochs {uint32_t theme,appearance,scale;uint64_t settings,launcher;};
+static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const Window& origin0,int32_t mouseX,int32_t mouseY);
 static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Window& origin0,int32_t mouseX,int32_t mouseY) {
+    return DesktopChromeKeyLocked(DesktopChromeEpochs{uint32_t(layers.theme),uint32_t(layers.appearance),uint32_t(layers.scale),
+        layers.settingsGeneration,layers.launcherGeneration},origin0,mouseX,mouseY);
+}
+static uint64_t DesktopChromeKeyLocked(const DesktopChromeEpochs& layers,const Window& origin0,int32_t mouseX,int32_t mouseY) {
     // origin0 has x=y=0, exactly as RenderWindowChrome sees it in a capture.
     int32_t hover=-1;
     const ChromeLayout layout=WindowChromeLayout(origin0);
@@ -2832,14 +2839,73 @@ static uint64_t DesktopChromeKeyLocked(const WmDesktopLayers& layers,const Windo
         (1ull<<63)|(uint64_t(origin0.captionHeight)<<32)|(uint64_t(origin0.captionInsetTop)<<16)|origin0.captionInsetRight : 0;
     in.captionStyle=origin0.noChrome && origin0.captionOverlay ? origin0.captionStyle : 0;
     in.hoverButton=hover;
-    in.theme=static_cast<uint32_t>(layers.theme);in.appearance=static_cast<uint32_t>(layers.appearance);
-    in.scale=static_cast<uint32_t>(layers.scale);
-    in.settingsEpoch=layers.settingsGeneration;in.launcherEpoch=layers.launcherGeneration;
+    in.theme=layers.theme;in.appearance=layers.appearance;in.scale=layers.scale;
+    in.settingsEpoch=layers.settings;in.launcherEpoch=layers.launcher;
     return WmChromeKey(in);
+}
+// Surface records (stage 1.3): what the active backend resolved for chrome.
+ChromeSurfaceEffects WmChromeSurfaceEffects() {
+    ChromeSurfaceEffects e{};
+    e.glass=CompositorGlassActive();e.blur=CompositorMaterialBlur();
+    e.shadowSpread=WmMetric(16);e.shadowCorner=WmMetric(24);e.shellRadius=e.glass?WmMetric(4):0;
+    if(e.glass){const auto& material=WmChromeMaterial();e.topRadius=material.top.radius;e.bottomRadius=material.bottom.radius;}
+    return e;
+}
+// One window's chrome record; the key is the keyed chrome capture's key for
+// the pointer at (mouseX, mouseY). False: the window draws no chrome.
+static bool WindowSurfaceLocked(const Window& w,const DesktopChromeEpochs& epochs,const ChromeSurfaceEffects& effects,
+                                int32_t mouseX,int32_t mouseY,BrookDesktopSurface& out) {
+    if(!w.proc || !w.visible || w.minimized || !w.wmId || !w.creationIdentity)return false;
+    if(w.noChrome && !w.captionOverlay)return false;
+    const WmRect block=w.noChrome?WmCaptionOverlayRect(w):WmRect{w.x,w.y,int(w.outerWidth()),int(w.outerHeight())};
+    if(block.w<=0 || block.h<=0)return false;
+    Window origin0=w;origin0.x=0;origin0.y=0;
+    auto rel=[](int32_t value,int16_t origin){
+        const int64_t n=int64_t(value)-origin;
+        return n<(-2147483647ll-1)?int32_t(-2147483647-1):n>2147483647ll?int32_t(2147483647):int32_t(n);
+    };
+    ChromeFrameSurfaceModel m{};
+    m.window=w.wmId;m.incarnation=w.creationIdentity;
+    m.key=DesktopChromeKeyLocked(epochs,origin0,rel(mouseX,w.x),rel(mouseY,w.y));
+    m.clientDecorated=w.noChrome;m.maximised=w.state==WindowState::Maximized;m.focused=w.focused;
+    m.outer=block;m.client={w.clientX(),w.clientY(),int(w.clientW),int(w.clientH)};
+    m.captionRadius=(w.captionStyle&DesktopCaptionStyleValid)?DesktopCaptionStyleRadius(w.captionStyle):0;
+    m.opacity=w.opacity;
+    out=ChromeFrameSurface(m,effects);return true;
+}
+uint32_t WmDesktopSurfaceRecords(BrookDesktopSurface* out,uint32_t max) {
+    if(!out || !g_wmActive)return 0;
+    const ChromeSurfaceEffects effects=WmChromeSurfaceEffects();
+    int32_t mouseX=0,mouseY=0;MouseGetPosition(&mouseX,&mouseY);
+    VfbGuard guard;
+    DesktopChromeEpochs epochs{uint32_t(WmGetTheme()),uint32_t(WmGetAppearance()),uint32_t(WmGetAppliedScale()),g_chromeSettingsEpoch,0};
+    SpinLockAcquire(&g_launcherLock);epochs.launcher=g_launcherSnapshotEpoch;SpinLockRelease(&g_launcherLock);
+    int sorted[WM_MAX_WINDOWS];const uint32_t count=WmGetZOrder(sorted,WM_MAX_WINDOWS);
+    uint32_t n=0;
+    for(uint32_t i=0;i<count && n<max;++i)
+        if(WindowSurfaceLocked(g_windows[sorted[i]],epochs,effects,mouseX,mouseY,out[n]))++n;
+    return n;
+}
+bool WmWindowSurfaceRecord(const Window& w,BrookDesktopSurface* out) {
+    if(!out)return false;
+    const DesktopChromeEpochs epochs{uint32_t(WmGetTheme()),uint32_t(WmGetAppearance()),uint32_t(WmGetAppliedScale()),g_chromeSettingsEpoch,0};
+    return WindowSurfaceLocked(w,epochs,WmChromeSurfaceEffects(),-1,-1,*out);
+}
+BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& surface,uint64_t key) {
+    uint32_t kind=BROOK_DESKTOP_SURFACE_TASKBAR;
+    switch(surface.kind){
+    case WmShellSurfaceKind::Taskbar: kind=BROOK_DESKTOP_SURFACE_TASKBAR;break;
+    case WmShellSurfaceKind::Launcher: kind=BROOK_DESKTOP_SURFACE_LAUNCHER;break;
+    case WmShellSurfaceKind::VolumePopup: kind=BROOK_DESKTOP_SURFACE_VOLUME_POPUP;break;
+    case WmShellSurfaceKind::TrayTooltip: kind=BROOK_DESKTOP_SURFACE_TOOLTIP;break;
+    case WmShellSurfaceKind::BootSummary: kind=BROOK_DESKTOP_SURFACE_BOOT_SUMMARY;break;
+    }
+    return ChromeShellSurfaceRecord(kind,{surface.x,surface.y,int(surface.w),int(surface.h)},surface.material,key,
+                                    CompositorShellMaterialOpacity(),WmChromeSurfaceEffects());
 }
 int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                                WmDesktopChrome* info,uint32_t* pixels,uint64_t capacity,
-                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges) {
+                               int32_t mouseX,int32_t mouseY,bool tolerateVisualChanges,bool spansOnly) {
     if(!info || index>=layers.count || layers.count>WM_MAX_WINDOWS)return -22;
     Window local{};uint32_t width=0,height=0;int16_t originX=0,originY=0;
     {
@@ -2848,11 +2914,11 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         if(!g_wmActive || CompositorGlassActive())return -95;
         int sorted[WM_MAX_WINDOWS];if(WmGetZOrder(sorted,WM_MAX_WINDOWS)!=layers.count)return -116;
         const Window& source=g_windows[sorted[index]];
-        if(source.noChrome && !source.captionOverlay){*info={source.x,source.y,0,0,0};return 0;}
+        if(source.noChrome && !source.captionOverlay){*info={source.x,source.y,0,0,0,0,0,0,0};return 0;}
         // Overlaid captions: a surface covering only the button block, placed
         // over the client (renderers draw chrome after the client).
         const WmRect block=source.noChrome?WmCaptionOverlayRect(source):WmRect{source.x,source.y,0,0};
-        if(source.noChrome && (block.w<=0 || block.h<=0)){*info={source.x,source.y,0,0,0};return 0;}
+        if(source.noChrome && (block.w<=0 || block.h<=0)){*info={source.x,source.y,0,0,0,0,0,0,0};return 0;}
         width=source.noChrome?uint32_t(block.w):source.outerWidth();
         height=source.noChrome?uint32_t(block.h):source.outerHeight();
         if(!width || !height || uint64_t(width)*height>64ull*1024*1024/4)return -7;
@@ -2864,7 +2930,15 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
                 return n<(-2147483647ll-1)?int32_t(-2147483647-1):n>2147483647ll?int32_t(2147483647):int32_t(n);
             };
             *info={source.noChrome?block.x:source.x,source.noChrome?block.y:source.y,width,height,
-                DesktopChromeKeyLocked(layers,origin0,noMouseKey?-1:rel(mouseX,source.x),noMouseKey?-1:rel(mouseY,source.y))};
+                DesktopChromeKeyLocked(layers,origin0,noMouseKey?-1:rel(mouseX,source.x),noMouseKey?-1:rel(mouseY,source.y)),0,0,0,0};
+            if(!source.noChrome){
+                // Interior clipped to the surface (always inside it for a frame).
+                const int64_t ix=int64_t(origin0.clientX()),iy=int64_t(origin0.clientY());
+                const int64_t ir=ix+source.clientW,ib=iy+source.clientH;
+                auto clip=[](int64_t v,uint32_t limit){return uint32_t(v<0?0:v>int64_t(limit)?int64_t(limit):v);};
+                info->interiorX=clip(ix,width);info->interiorY=clip(iy,height);
+                info->interiorW=clip(ir,width)-info->interiorX;info->interiorH=clip(ib,height)-info->interiorY;
+            }
         }
         if(!pixels)return 0;
         if(capacity<uint64_t(width)*height*4)return -22;
@@ -2872,7 +2946,17 @@ int64_t WmDesktopChromeCapture(const WmDesktopLayers& layers,uint32_t index,
         ProcessRef(local.proc);
     }
     const uint64_t bytes=uint64_t(width)*height*4;
-    __builtin_memset(pixels,0,bytes);
+    const uint32_t ix=info->interiorX,iy=info->interiorY,iw=info->interiorW,ih=info->interiorH;
+    if(spansOnly && !local.noChrome && iw && ih){
+        // Frame strips only: top and bottom rows whole, left and right columns
+        // beside the interior. The interior is neither cleared nor drawn.
+        __builtin_memset(pixels,0,uint64_t(width)*iy*4);
+        __builtin_memset(pixels+uint64_t(iy+ih)*width,0,uint64_t(width)*(height-iy-ih)*4);
+        for(uint32_t row=iy;row<iy+ih;++row){
+            __builtin_memset(pixels+uint64_t(row)*width,0,uint64_t(ix)*4);
+            __builtin_memset(pixels+uint64_t(row)*width+ix+iw,0,uint64_t(width-ix-iw)*4);
+        }
+    }else __builtin_memset(pixels,0,bytes);
     if(local.noChrome){
         // Render the window so its button block lands at the surface origin.
         local.x=int16_t(local.x-originX);local.y=int16_t(local.y-originY);

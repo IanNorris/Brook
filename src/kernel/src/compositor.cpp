@@ -33,6 +33,7 @@
 #include "window.h"
 #include "desktop_shell_surfaces.h"
 #include "desktop_overlay_surfaces.h"
+#include "chrome_surface.h"
 #include "debug_ui.h"
 #include "shutdown.h"
 #include "terminal.h"
@@ -391,6 +392,7 @@ static uint64_t g_debugFrameOwner;
 static bool g_debugFrameOverlay=false;
 static bool g_debugFrameOverlayCursor=true;
 static DesktopOverlayBands g_debugOverlayBands{};
+static BrookDesktopOverlaySurfaces g_debugOverlaySurfaces{};
 static VirtualAddress g_debugFrameBuffer{};
 static uint64_t g_debugFramePages;
 // One blocked op-7 waiter (referenced), woken when its capture leaves Pending.
@@ -434,7 +436,7 @@ DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner,bool overlay,bool 
     if (g_debugFrameNextToken==0xffffffffU) {
         DebugFrameSnapshot failed{};failed.state=DebugFrameState::Failed;return failed;
     }
-    g_debugFrame={};g_debugOverlayBands={};g_debugFrame.token=++g_debugFrameNextToken;
+    g_debugFrame={};g_debugOverlayBands={};g_debugOverlaySurfaces={};g_debugFrame.token=++g_debugFrameNextToken;
     g_debugFrameOwner=owner;
     g_debugFrameOverlay=overlay;g_debugFrameOverlayCursor=overlayCursor;
     g_debugFrame.state=DebugFrameState::Pending;
@@ -459,6 +461,14 @@ int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& ba
     if(!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner)return -116;
     if(!g_debugFrameOverlay || g_debugFrame.state!=DebugFrameState::Ready)return -11;
     bands=g_debugOverlayBands;return 0;
+}
+
+int CompositorOverlaySurfaces(uint32_t token,uint64_t owner,BrookDesktopOverlaySurfaces& surfaces)
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);ExpireDebugFrameLocked();
+    if(!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner)return -116;
+    if(!g_debugFrameOverlay || g_debugFrame.state!=DebugFrameState::Ready)return -11;
+    surfaces=g_debugOverlaySurfaces;return 0;
 }
 
 int CompositorWaitDebugFrame(uint32_t token,uint64_t owner,uint32_t timeoutMs,DebugFrameSnapshot& out)
@@ -897,6 +907,9 @@ void CompositorSetGlassEnabled(bool enabled){
 }
 uint32_t CompositorMaterialOpacity(){return brook_appearance_opacity(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE))*255/100;}
 uint32_t CompositorMaterialBlur(){return brook_appearance_blur_strength(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE));}
+uint32_t CompositorShellMaterialOpacity(){
+    return (__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE)?255:g_overlayOpacity;
+}
 bool CompositorGlassActive(){
     const auto* gpu=GpuCompositorGet();
     return !(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE) && CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
@@ -1937,8 +1950,10 @@ static void OverlayNoteSignature(const DesktopOverlaySurfaceSlot* slots,uint32_t
 // whatever shares pixels with them), then fold their keys into the content
 // generation. Returns the rectangle count; keys[i] is rects[i]'s key.
 static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t now,
-                                     int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects,uint64_t* keys)
+                                     int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects,uint64_t* keys,
+                                     BrookDesktopOverlaySurfaces* records=nullptr)
 {
+    if(records)*records={};
     // At most three shell surfaces, so the four-rectangle budget (plus the
     // optional cursor appended by CaptureDesktopOverlay) holds.
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
@@ -1961,6 +1976,7 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
             ++g_idleStats.overlaySurfaceDraws;
         }else ++g_idleStats.overlaySurfaceKeeps;
         rects[i]={s.x,s.y,s.w,s.h};keys[i]=slots[i].key;
+        if(records && i<BROOK_DESKTOP_OVERLAY_MAX_SURFACES)records->surfaces[records->count++]=WmShellSurfaceRecord(s,slots[i].key);
     }
     DesktopOverlayCommitSurfaces(g_overlaySurfaceCache,slots,count);
     ++g_idleStats.overlayRenders;
@@ -2054,7 +2070,7 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
     DesktopOverlayRect rects[4]{};uint64_t keys[4]{};
-    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects,keys);
+    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects,keys,&g_debugOverlaySurfaces);
     // RenderDesktopOverlay sets alpha 255 across every surface rectangle it
     // returns (the overlay is never captured under glass), so each is opaque;
     // a composited pointer rectangle appended below is not.
@@ -3514,16 +3530,24 @@ static void EnsureShadowTexture(const GpuCompositorOps* gpu) {
         if(g_shadowTex)gpu->UpdateTexture(g_shadowTex,0,0,64,64);
     }
 }
-static void GpuComposeShadow(const GpuCompositorOps* gpu,const Window* w) {
-    if(!g_shadowTex || w->noChrome || w->state==WindowState::Maximized)return;
-    const int pad=WmMetric(16),corner=WmMetric(24);
-    const int left=w->x-pad,top=w->y-pad,width=w->outerWidth()+2*pad,height=w->outerHeight()+2*pad;
-    if(width<corner*2 || height<corner*2)return;
-    const int dx[]={left,left+corner,left+width-corner},dy[]={top,top+corner,top+height-corner};
-    const int dw[]={corner,width-2*corner,corner},dh[]={corner,height-2*corner,corner};
-    const unsigned source[]={0,24,40},span[]={24,16,24};
-    for(unsigned y=0;y<3;++y)for(unsigned x=0;x<3;++x)if(x!=1||y!=1)
-        GpuComposeLayer(gpu,g_shadowTex,source[x],source[y],span[x],span[y],dx[x],dy[y],dw[x],dh[y],true,w->focused?255:180);
+// A window's surface record (stage 1.3): virgl takes the shadow class and
+// glass radii from it rather than deriving its own geometry.
+static BrookDesktopSurface GpuWindowSurface(const Window* w,const ChromeSurfaceEffects& effects) {
+    ChromeFrameSurfaceModel m{};
+    m.clientDecorated=w->noChrome;m.maximised=w->state==WindowState::Maximized;m.focused=w->focused;
+    m.outer={w->x,w->y,int(w->outerWidth()),int(w->outerHeight())};
+    m.client={w->clientX(),w->clientY(),int(w->clientW),int(w->clientH)};
+    m.opacity=w->opacity;
+    return ChromeFrameSurface(m,effects);
+}
+static void GpuComposeShadow(const GpuCompositorOps* gpu,const BrookDesktopSurface& surface) {
+    if(!g_shadowTex || surface.shadow!=BROOK_DESKTOP_SHADOW_WINDOW)return;
+    for(unsigned piece=0;piece<8;++piece){
+        BrookChromeShadowPiece p{};
+        if(!brook_chrome_shadow_piece(surface.x,surface.y,surface.width,surface.height,surface.shadowSpread,
+                                      surface.shadowCorner,piece,&p))continue;
+        GpuComposeLayer(gpu,g_shadowTex,p.sx,p.sy,p.sw,p.sh,p.dx,p.dy,p.dw,p.dh,true,surface.shadowAlpha);
+    }
 }
 
 // Compose the chrome layer's decoration rects for one window at its opacity.
@@ -3565,10 +3589,11 @@ static void GpuComposeRectBlur(const GpuCompositorOps* gpu, int x, int y, int wd
                   (uint32_t)x, (uint32_t)y, (uint32_t)wd, (uint32_t)hd, 255, false);
 }
 
-static void GpuComposeTitleBlur(const GpuCompositorOps* gpu,const Window* w) {
+static void GpuComposeTitleBlur(const GpuCompositorOps* gpu,const Window* w,const BrookDesktopSurface& surface) {
     const int height=w->clientY()-w->y,width=w->outerWidth();
     const auto& mask=WmChromeMaterial().top;
-    const unsigned radius=w->state==WindowState::Maximized||width<int(mask.radius*2)?0:mask.radius;
+    // The record's top radius is the material mask's (0 when maximised).
+    const unsigned radius=width<int(surface.radii[0]*2)?0:surface.radii[0];
     if(!radius){GpuComposeRectBlur(gpu,w->x,w->y,width,height);return;}
     // At most five corner bands plus the body: retain the existing GPU quad
     // budget. Conservative insets leave a sharp rim, never an opaque halo
@@ -3843,16 +3868,20 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // glass windows (BRO-185).
     // Bound rounded backdrops and cached shadow patches within the quad budget;
     // lower windows use opaque title bars rather than sampling a stale backdrop.
+    const ChromeSurfaceEffects effects=WmChromeSurfaceEffects();
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
         Window* w = WmGetWindow(idx);
         if (!w || !w->visible || w->minimized) continue;
         uint32_t op = effOpacity(w);
-        if(CompositorGlassActive() && i+ChromeShadowWindowLimit>=wcount)GpuComposeShadow(gpu,w);
-        if(CompositorGlassActive() && CompositorMaterialBlur()>0 && i+ChromeGlassWindowLimit>=wcount && !isGlass(w) && !w->noChrome) {
+        const BrookDesktopSurface surface=GpuWindowSurface(w,effects);
+        // Shadows on the top ChromeShadowWindowLimit windows (quad budget).
+        if(i+ChromeShadowWindowLimit>=wcount)GpuComposeShadow(gpu,surface);
+        if(surface.material==BROOK_DESKTOP_MATERIAL_GLASS && surface.kind==BROOK_DESKTOP_SURFACE_FRAME &&
+           CompositorMaterialBlur()>0 && i+ChromeGlassWindowLimit>=wcount && !isGlass(w)) {
             gpu->BlurBarrier(CompositorMaterialBlur());
-            GpuComposeTitleBlur(gpu,w);
+            GpuComposeTitleBlur(gpu,w,surface);
         }
         if (isGlass(w) && i+ChromeGlassWindowLimit>=wcount)
         {
@@ -3878,7 +3907,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         if(CompositorGlassActive() && CompositorMaterialBlur()>0) {
             gpu->BlurBarrier(CompositorMaterialBlur());
             for (uint32_t i = 0; i < count; ++i)
-                if (surfaces[i].material)
+                if (WmShellSurfaceRecord(surfaces[i],0).material==BROOK_DESKTOP_MATERIAL_GLASS)
                     GpuComposeRectBlur(gpu, surfaces[i].x, surfaces[i].y, (int)surfaces[i].w, (int)surfaces[i].h);
         }
         for (uint32_t i = 0; i < count; ++i)

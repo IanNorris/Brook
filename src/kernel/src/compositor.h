@@ -1,6 +1,7 @@
 #pragma once
 #include "desktop_overlay_regions.h"
 #include "../../shared/brook_debug_frame.h"
+#include "../../shared/desktop_layers_abi.h"
 
 #include <stdint.h>
 
@@ -32,6 +33,8 @@ bool CompositorGlassActive();
 bool CompositorGlassRequested();
 uint32_t CompositorMaterialOpacity();
 uint32_t CompositorMaterialBlur();
+// Opacity of material shell surfaces (taskbar, launcher, popups) under glass.
+uint32_t CompositorShellMaterialOpacity();
 void CompositorSetGlassEnabled(bool enabled);
 struct CompositorUploadStats { uint64_t calls[4],bytes[4]; };
 CompositorUploadStats CompositorReadUploads();
@@ -74,6 +77,8 @@ uint64_t CompositorOverlayGeneration();
 void CompositorOverlayCursor(struct ::BrookDesktopOverlayCursor& out,uint64_t knownSerial);
 DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner=0);
 int CompositorOverlayBands(uint32_t token,uint64_t owner,DesktopOverlayBands& bands);
+// Shell surface records of the same capture lease (overlay op 10).
+int CompositorOverlaySurfaces(uint32_t token,uint64_t owner,BrookDesktopOverlaySurfaces& surfaces);
 bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner=0);
 // Destination must be kernel memory. Copies under the lease lock; callers
 // must copy to userspace only after this returns and releases that lock.

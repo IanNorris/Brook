@@ -32,7 +32,9 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
     if(!wire || !snapshot){kfree(wire);kfree(snapshot);return -ENOMEM;}
     int64_t result=-EFAULT;
     const bool keep=op==BROOK_DESKTOP_CHROME_TRACKED_KEEP;
-    const bool keyed=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED;
+    // Spans (stage 1.4): keyed, writing only the frame strips.
+    const bool spans=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS;
+    const bool keyed=op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || spans;
     if(CopyFromUser(wire,address,sizeof(*wire)) && UserBufferWritable(address,sizeof(*wire))){
         const uint64_t heldKey=wire->reserved;
         if(wire->version!=BROOK_DESKTOP_LAYERS_VERSION || (keep?!heldKey:wire->reserved!=0) || !wire->layers[0].window)result=-EINVAL;
@@ -77,13 +79,28 @@ static int64_t CaptureDesktopChrome(uint64_t owner,uint64_t op,uint64_t address,
                     else {
                         brook::WmDesktopChrome current{};
                         int32_t mouseX=0,mouseY=0;MouseGetPosition(&mouseX,&mouseY);
-                        result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked);
+                        result=brook::WmDesktopChromeCapture(*snapshot,index,&current,pixels,bytes,mouseX,mouseY,tracked,spans);
                         if(!result && (current.x!=chrome.x || current.y!=chrome.y || current.width!=chrome.width || current.height!=chrome.height))result=-EAGAIN;
-                        if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
+                        uint64_t copied=bytes;
+                        const uint32_t ix=current.interiorX,iy=current.interiorY,iw=current.interiorW,ih=current.interiorH;
+                        if(!result && spans && iw && ih){
+                            // Only the strips: the interior of pixels is not
+                            // initialised and must never reach the caller.
+                            const uint64_t row=uint64_t(chrome.width)*4;copied=0;
+                            auto copy=[&](uint64_t offset,uint64_t n){
+                                if(!n)return true;copied+=n;
+                                return CopyToUser(layer.pixels+offset,reinterpret_cast<uint8_t*>(pixels)+offset,n);
+                            };
+                            bool ok=copy(0,row*iy) && copy(row*(iy+ih),row*(chrome.height-iy-ih));
+                            for(uint32_t y=iy;ok && y<iy+ih;++y)
+                                ok=copy(row*y,uint64_t(ix)*4) && copy(row*y+uint64_t(ix+iw)*4,uint64_t(chrome.width-ix-iw)*4);
+                            if(!ok)result=-EFAULT;
+                        }else if(!result && !CopyToUser(layer.pixels,pixels,bytes))result=-EFAULT;
                         if(!result){
                             renderedKey=current.key;
                             __atomic_add_fetch(&brook::g_chromeCaptureStats.captures,1,__ATOMIC_RELAXED);
-                            __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesCopied,bytes,__ATOMIC_RELAXED);
+                            __atomic_add_fetch(&brook::g_chromeCaptureStats.bytesCopied,copied,__ATOMIC_RELAXED);
+                            if(copied<bytes)__atomic_add_fetch(&brook::g_chromeCaptureStats.bytesKept,bytes-copied,__ATOMIC_RELAXED);
                         }
                         if(!result && !(tracked?brook::WmDesktopLayersCaptureCurrent(*snapshot):brook::WmDesktopLayersCurrent(*snapshot)))result=-EAGAIN;
                     }
@@ -174,8 +191,24 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
         if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;
         brook::WmNoteClientFrame(b,c);return 0;
     }
+    if(op==BROOK_DESKTOP_SURFACES_QUERY){
+        if(size!=sizeof(BrookDesktopSurfaces) || a || b || c || !address || address>~uint64_t{0}-size)return -EINVAL;
+        auto* wire=static_cast<BrookDesktopSurfaces*>(kmalloc(sizeof(BrookDesktopSurfaces)));
+        if(!wire)return -ENOMEM;
+        int64_t result=-EFAULT;
+        if(CopyFromUser(wire,address,sizeof(*wire))){
+            if(wire->version!=BROOK_DESKTOP_SURFACES_VERSION || wire->reserved)result=-EINVAL;
+            else {
+                const uint32_t version=wire->version;__builtin_memset(wire,0,sizeof(*wire));wire->version=version;
+                wire->count=brook::WmDesktopSurfaceRecords(wire->surfaces,BROOK_DESKTOP_LAYER_LIMIT);
+                result=CopyToUser(address,wire,sizeof(*wire))?0:-EFAULT;
+            }
+        }
+        kfree(wire);return result;
+    }
     if((op==BROOK_DESKTOP_CHROME_QUERY || op==BROOK_DESKTOP_CHROME_CAPTURE || op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE ||
-        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP) &&
+        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_KEYED || op==BROOK_DESKTOP_CHROME_TRACKED_KEEP ||
+        op==BROOK_DESKTOP_CHROME_TRACKED_CAPTURE_SPANS) &&
        size==sizeof(BrookDesktopLayers) && !a && !b && !c && address<=~uint64_t{0}-size)
         return CaptureDesktopChrome(proc->leaderIncarnation?proc->leaderIncarnation:proc->incarnation,op,address,size);
     if((op==BROOK_DESKTOP_BACKDROP_QUERY || op==BROOK_DESKTOP_BACKDROP_CAPTURE ||
@@ -472,6 +505,12 @@ int64_t sys_brook_desktop_overlay(uint64_t op,uint64_t token,uint64_t destinatio
             info.bands.bands[i]={bands.bands[i].x,bands.bands[i].y,bands.bands[i].width,bands.bands[i].height};
             info.keys[i]=bands.keys[i];
         }
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==BROOK_DESKTOP_OVERLAY_SURFACES){
+        if(offset || length!=sizeof(BrookDesktopOverlaySurfaces))return -EINVAL;
+        BrookDesktopOverlaySurfaces info{};const int result=CompositorOverlaySurfaces(uint32_t(token),owner,info);
+        if(result)return result;
         return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
     }
     if(op==BROOK_DESKTOP_OVERLAY_GENERATION){

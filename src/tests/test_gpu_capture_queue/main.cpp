@@ -68,6 +68,9 @@ void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t){std::abort();}
 // Content keys (window.cpp builds and hashes the display lists): constant
 // per kind here, so only appearing, leaving or moving surfaces change them.
 uint64_t shellKeyBump=0;unsigned taskbarDraws=0;
+BrookDesktopSurface WmShellSurfaceRecord(const WmShellSurface& s,uint64_t key){
+    BrookDesktopSurface r{};r.kind=uint32_t(s.kind)+3;r.key=key;r.x=s.x;r.y=s.y;r.width=s.w;r.height=s.h;
+    r.flags=BROOK_DESKTOP_SURFACE_OPAQUE;r.opacity=255;return r;}
 uint64_t WmShellSurfaceKey(const WmShellSurface& s,uint32_t,uint32_t,uint64_t,int32_t,int32_t){
     return 0x100+uint64_t(s.kind)+(s.kind==WmShellSurfaceKind::Taskbar?shellKeyBump:0);}
 extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::calloc(1,bytes); }
@@ -440,6 +443,9 @@ int main() {
         CHECK(taskbarDraws==draws+1 && overlayPixels[9]==0x11111111 && overlayPixels[47]==0xff123456);
         DesktopOverlayBands second{};CHECK(!CompositorOverlayBands(overlay.token,77,second));
         CHECK(first.count==2 && second.count==2);
+        {BrookDesktopOverlaySurfaces records{};CHECK(CompositorOverlaySurfaces(overlay.token,78,records)==-116);
+         CHECK(!CompositorOverlaySurfaces(overlay.token,77,records) && records.count==2 &&
+               records.surfaces[0].kind==3 && records.surfaces[0].y==5 && records.surfaces[1].kind==4 && records.surfaces[1].key);}
         for(unsigned i=0;i<2;++i){const bool taskbar=first.bands[i].y==5;
             CHECK(taskbar?first.keys[i]!=second.keys[i]:first.keys[i]==second.keys[i]);}
         CHECK(CompositorReleaseDebugFrame(overlay.token,77));overlayPixels[9]=0xff654321;
