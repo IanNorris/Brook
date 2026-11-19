@@ -1372,6 +1372,12 @@ static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
     struct brook_surface *s = wl_resource_get_user_data(r);
     struct brook_positioner *p = positioner ?
         wl_resource_get_user_data(positioner) : NULL;
+    /* xdg-shell: repositioned is sent first in the configuration sequence,
+     * then xdg_popup.configure, then xdg_surface.configure. GTK4 reuses its
+     * tooltip popup via reposition and ignores a configure that arrives before
+     * repositioned, then blocks in gdk_wayland_surface_present_popup waiting
+     * for one (Nautilus froze on the first tooltip after a move). */
+    xdg_popup_send_repositioned(r, token);
     if (s) {
         positioner_compute_geometry(p, &s->popup_x, &s->popup_y,
                                     &s->popup_w, &s->popup_h);
@@ -1383,7 +1389,6 @@ static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
         }
         popup_apply_position(s);
     }
-    xdg_popup_send_repositioned(r, token);
 }
 static const struct xdg_popup_interface xdg_popup_impl = {
     .destroy    = xdg_popup_destroy_req,
