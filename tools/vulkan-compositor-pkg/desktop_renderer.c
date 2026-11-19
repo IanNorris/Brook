@@ -624,7 +624,7 @@ static int overlay_cursor(int drm,struct RenderContext *ctx,struct DesktopOverla
     *state=(struct DesktopOverlayCursorState){0};
     if(g_overlayTracked!=1)return 0;
     const uint64_t known=ctx->cursor.handle?ctx->cursorSerial:0;
-    long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V2);
+    long result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,BROOK_DESKTOP_CURSOR_PLANE_V3);
     if(result<0 && errno==EINVAL)
         result=syscall(BROOK_SYS_DESKTOP_OVERLAY,BROOK_DESKTOP_OVERLAY_CURSOR,0,&g_cursorInfo,sizeof(g_cursorInfo),known,0);
     if(result<0)return -1;
@@ -1029,14 +1029,18 @@ static int render_frame(int drm,struct RenderContext *ctx,uint32_t *visible,uint
     }
     desktop_overlay_damage(overlayBase,&frameOverlay,&footprint);
     scene[2]=count;
-    struct DesktopDamageSet damage=desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
+    /* A cursor handoff needs a clean scanout image even if cached damage
+     * says the desktop was idle or the previous cursor was hidden. */
+    const int cursorHandoff=cursorEpoch && ctx->scanoutCount;
+    struct DesktopDamageSet damage=cursorHandoff?(struct DesktopDamageSet){1,{{0,0,width,height}}}:
+        desktop_damage_current(ctx->damage,identity.display,identity.generation,width,height,footprint);
     /* Change-based damage against the displayed frame, when that frame is
      * known and no other frame can present first; pipelined, against the
      * latest submitted frame (its in-flight regions are carried below). */
     int tracked=0,pointerOnly=0;
     const int baselineOk=ctx->damage.display==identity.display && ctx->damage.backdrop==identity.generation &&
         ctx->damage.width==width && ctx->damage.height==height;
-    if((pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
+    if(!cursorHandoff && (pipe || (quiescent && !baselineTicket)) && track->valid && trackBase && baselineOk){
         struct DesktopDamageSet changes={0};
         if(desktop_track_diff(trackBase,track,&changes)){
             desktop_overlay_clip_opaque(overlayBase,&frameOverlay,&changes);

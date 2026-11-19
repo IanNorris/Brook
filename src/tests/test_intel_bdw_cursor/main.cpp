@@ -1,9 +1,12 @@
 #include "../../kernel/src/intel_bdw_cursor.h"
+#include "../../shared/brook_debug_frame.h"
 
 #include <cassert>
 #include <vector>
 
 using namespace brook;
+
+static_assert(int(BROOK_DESKTOP_OVERLAY_SURFACES) != int(BROOK_DESKTOP_OVERLAY_CURSOR_PRESENTED));
 
 struct Mmio {
     std::vector<uint32_t> writes;
@@ -28,8 +31,71 @@ struct Mmio {
     }
 };
 
+static void enableWithBuiltInArrow(bool move)
+{
+    Mmio regs;
+    BdwCursorPlane plane;
+    BdwCursorHandoff handoff;
+    const int32_t x=120,y=80;
+    assert(handoff.prepare(20) && handoff.probing());
+    assert(!handoff.offer(7,20,false) && !handoff.suppress(false));
+    // The initial surface is transparent: keep compositing the arrow until
+    // hardware proves it can latch. No position or image event is needed.
+    assert(plane.update(regs,0x2000,1,0,0));
+    assert(!handoff.offer(7,21,plane.active()) && !handoff.suppress(false));
+    regs.vblank();
+    assert(plane.poll(regs,2) && plane.active() && !handoff.owned());
+    const uint64_t epoch=handoff.offer(7,37,plane.active());
+    assert(epoch && handoff.suppress(false) && handoff.awaitingPresent());
+    assert(!handoff.presented(epoch,7) && !handoff.mayEnable(8));
+    assert(handoff.presented(epoch,8));
+    assert(!handoff.mayEnable(7) && handoff.mayEnable(8));
+    // The primary is now clear. Arm the unchanged built-in arrow.
+    handoff.arm(52);
+    assert(plane.update(regs,0x6000,3,x,y) && !plane.ready() && !handoff.owned());
+    regs.vblank();
+    assert(plane.poll(regs,4) && plane.ready() && plane.active());
+    handoff.latched();
+    assert(handoff.owned() && handoff.suppress(true));
+    uint32_t expected=0;
+    assert(BdwCursorPosition(x,y,expected) && plane.position()==expected);
+    if(move){
+        regs.writes.clear();
+        assert(plane.update(regs,0x6000,4,x+2,y+1));
+        assert((regs.writes==std::vector<uint32_t>{BdwCursorRegs::Position,BdwCursorRegs::Base}));
+        assert(BdwCursorPosition(x+2,y+1,expected) && plane.position()==expected);
+    }
+}
+
+static void startupTimeouts()
+{
+    Mmio regs;
+    BdwCursorPlane plane;
+    BdwCursorHandoff handoff;
+    assert(handoff.prepare(100) && !handoff.suppress(false));
+    assert(plane.update(regs,0x2000,1,0,0));
+    assert(!handoff.offer(10,349,false) && !handoff.expired(349));
+    assert(handoff.expired(350) && !handoff.suppress(false));
+    handoff.cancel();
+    plane.disable(regs,1);
+    assert(!handoff.suppress(false)); // probe never had visible pixels
+    assert(plane.poll(regs,3) && !plane.blocksSoftware());
+
+    assert(handoff.prepare(400) && plane.update(regs,0x2000,5,0,0));
+    regs.vblank();
+    assert(plane.poll(regs,6));
+    assert(handoff.offer(10,420,plane.active()) && handoff.awaitingPresent());
+    assert(!handoff.expired(669) && handoff.expired(670)); // missing clean-frame ack
+    handoff.cancel();
+    plane.disable(regs,6);
+    assert(!handoff.suppress(false));
+}
+
 int main()
 {
+    enableWithBuiltInArrow(false);
+    enableWithBuiltInArrow(true);
+    startupTimeouts();
     uint32_t position = 0;
     assert(BdwCursorPosition(-4, -9, position) && position == 0x80098004);
     assert(BdwCursorPosition(3199, 1799, position) && position == 0x07070c7f);
@@ -50,12 +116,15 @@ int main()
     assert((regs.writes == std::vector<uint32_t>{0x70088, 0x70084}));
 
     BdwCursorHandoff handoff;
-    const uint64_t first=handoff.offer(70);
+    assert(handoff.prepare(0));
+    const uint64_t first=handoff.offer(70,0,true);
     handoff.presented(first,70);
     assert(!handoff.mayEnable(70));
     handoff.presented(first,72);
     assert(!handoff.mayEnable(71) && handoff.mayEnable(72));
-    assert(handoff.offer(75)==first && handoff.mayEnable(72));
+    assert(handoff.offer(75,0,true)==first && handoff.mayEnable(72));
+    handoff.arm(0);
+    handoff.latched();
 
     // Alternate image buffers at every vblank. Each one is kept out of the
     // software layer even while the next hardware image is still pending.
@@ -67,7 +136,7 @@ int main()
     for(uint32_t frame=12;frame<1012;++frame){
         pixels[0]=(frame&1)?0xff010203:0x00010203;
         assert(BdwCursorHasAlpha(pixels,1,1)==bool(frame&1));
-        const bool rendererHasCursor=!(handoff.epoch() || plane.blocksSoftware());
+        const bool rendererHasCursor=!handoff.suppress(plane.blocksSoftware());
         if(!plane.update(regs,(frame&1)?0x2000:0x6000,frame,0,0)){
             ++fallbacks;plane.disable(regs,frame);
         }
@@ -91,7 +160,8 @@ int main()
     assert(plane.poll(regs,1013) && plane.blocksSoftware());
     regs.vblank();
     assert(plane.poll(regs,1014) && !plane.blocksSoftware() && !regs.liveControl);
-    const auto second=handoff.offer(0);
+    assert(handoff.prepare(1));
+    const auto second=handoff.offer(0,1,true);
     assert(second!=first);
     handoff.presented(first,73);
     assert(!handoff.mayEnable(73));
