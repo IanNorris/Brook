@@ -60,6 +60,12 @@ static int CompactHudWidth(const ChromeStyle& s)
            Px(s, 4) + s.TextWidth("ms", CF::Small);
 }
 
+// The CPU and MEM bar: wide enough for "100%" inside it, at every scale.
+static int ChromeLoadBarWidth(const ChromeStyle& s)
+{
+    return s.TextWidth("100%", CF::Small) + 2 * Px(s, ChromeTaskbarSpacing::Pad);
+}
+
 ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH,
                                            const char* clockText, bool agent, uint32_t enabledMetrics,
                                            const int* ids, int total, int focused, const char* buildText,
@@ -108,15 +114,20 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
         right -= gap;
         return true;
     };
-    // Clock: 12 px left and 8 px right of the wider of its two lines.
+    using SP = ChromeTaskbarSpacing;
+    const int gap = Px(s, SP::Gap), pad = Px(s, SP::Pad), trayTarget = Px(s, 44);
+    // Clock: the wider of its two lines with the pad either side (a 44 px
+    // target at least).
     if (l.clockText[0]) {
         const int time = s.TextWidth(l.clockText, CF::Label), date = s.TextWidth(l.clockDate, CF::Small);
-        reserve(l.clock, Px(s, 12) + (time > date ? time : date) + Px(s, 8));
+        const int width = 2 * pad + (time > date ? time : date);
+        reserve(l.clock, width > trayTarget ? width : trayTarget);
     }
     // Tray, as the prototype orders it: network, volume, temperature.
-    const int trayTarget = Px(s, 44);
-    if (enabledMetrics & (1u << 6))
-        reserve(l.metrics[6], 2 * Px(s, 12) + Px(s, 16) + Px(s, 6) + s.TextWidth("100" BROOK_CHROME_DEGREE, CF::Label));
+    if (enabledMetrics & (1u << 6)) {
+        const int width = 2 * pad + Px(s, 16) + Px(s, 4) + s.TextWidth("100" BROOK_CHROME_DEGREE, CF::Label);
+        reserve(l.metrics[6], width > trayTarget ? width : trayTarget);
+    }
     reserve(l.volume, trayTarget);
     reserve(l.network, trayTarget);
     // Leftmost fixed icon, so its appearance never moves the tray targets.
@@ -127,42 +138,60 @@ ChromeTaskbarLayout ChromeTaskbarLayoutFor(const ChromeStyle& s, uint32_t screen
             l.separators[1] = {separator.x + sepGap, by + (bh - sepH) / 2, 1, sepH};
     }
     if (buildText && *buildText) {
-        // Choose the complete build ID before adding the product name. A
-        // dirty build can fall back to its complete base hash on tight trays.
-        const char prefix[] = "Brook ";
-        unsigned name = 0;
-        while (prefix[name] && buildText[name] == prefix[name]) ++name;
-        if (prefix[name]) name = 0;
-        const char* id = buildText + name;
-        unsigned length = 0, base = 0;
-        while (id[length] && (!name || id[length] != ' ')) {
-            if (id[length] == '+' && !base) base = length;
-            ++length;
-        }
-        auto reserveBuild = [&](unsigned start, unsigned count) {
-            if (!count || count >= sizeof(l.buildText)) return false;
+        // The build or payload name (e.g. "dell-int51-20261119"), in the
+        // small monospace face; on a tight tray without its trailing
+        // "-YYYYMMDD" date, then without a "+dirty" suffix. The tooltip has
+        // the full detail.
+        unsigned length = 0;
+        while (buildText[length] && length + 1 < sizeof(l.buildText)) ++length;
+        auto reserveBuild = [&](unsigned count) {
+            if (!count) return false;
             char text[sizeof(l.buildText)];
-            for (unsigned i = 0; i < count; ++i) text[i] = buildText[start + i];
+            for (unsigned i = 0; i < count; ++i) text[i] = buildText[i];
             text[count] = 0;
-            const int width = s.TextWidth(text, CF::Mono) + 2 * Px(s, 8);
-            if (width > Px(s, 188) || !reserve(l.build, width)) return false;
+            const int width = s.TextWidth(text, CF::Mono) + 2 * pad;
+            if (width > Px(s, 188) || !reserve(l.build, width, gap)) return false;
             CopyText(l.buildText, text, sizeof(l.buildText));
             return true;
         };
-        if (!reserveBuild(0, name + length) && !reserveBuild(name, length) && base) {
-            if (!reserveBuild(0, name + base)) reserveBuild(name, base);
+        unsigned dated = length, plus = 0;
+        if (length > 9 && buildText[length - 9] == '-') {
+            bool digits = true;
+            for (unsigned i = length - 8; i < length; ++i) digits &= buildText[i] >= '0' && buildText[i] <= '9';
+            if (digits) dated = length - 9;
         }
+        for (unsigned i = 0; i < length && !plus; ++i) if (buildText[i] == '+') plus = i;
+        if (!reserveBuild(length) && !(dated != length && reserveBuild(dated))) reserveBuild(plus);
     }
     if (compactHud) reserve(l.hud, CompactHudWidth(s));
-    // CPU and MEM are one-line chips; the rates and cadence keep two lines.
-    const int widths[] = {92, 92, 84, 84, 176, 176};
-    for (int i = 5; i >= 0; --i) if (enabledMetrics & (1u << i)) {
-        // 12 px clear of whatever is to the right.
+    // Diagnostics, right to left: APP and COMP (label and graph over p95),
+    // disk R/W, then CPU over MEM in one chip. Each is sized to its widest
+    // value; network rates live in the network flyout, not here.
+    const int row = s.Line(CF::Small) + Px(s, SP::RowGap), pairTop = by + (bh - 2 * row) / 2;
+    const int cadence = [&] {
+        const int top = s.TextWidth("COMP", CF::Small) + pad + SP::GraphBars * Px(s, 3);
+        const int bottom = s.TextWidth("p95 999 ms", CF::Small);
+        return top > bottom ? top : bottom;
+    }();
+    const int disk = s.TextWidth("W 999.9M", CF::Small);
+    const int load = s.TextWidth("MEM", CF::Small) + pad + ChromeLoadBarWidth(s);
+    auto metric = [&](int index, int width) {
         const int before = right;
-        right -= Px(s, 12);
-        if (!reserve(l.metrics[i], Px(s, widths[i]))) { right = before; continue; }
-        l.metrics[i].y = l.y + Px(s, 2);
-        l.metrics[i].h = height - 2 * Px(s, 2);
+        right -= gap;
+        if (!reserve(l.metrics[index], width)) { right = before; return false; }
+        l.metrics[index].y = l.y + Px(s, 2);
+        l.metrics[index].h = height - 2 * Px(s, 2);
+        return true;
+    };
+    if (enabledMetrics & (1u << 5)) metric(5, cadence);
+    if (enabledMetrics & (1u << 4)) metric(4, cadence);
+    if (enabledMetrics & (1u << 2)) metric(2, disk);
+    const bool cpu = enabledMetrics & 1u, mem = enabledMetrics & 2u;
+    if ((cpu || mem) && metric(cpu ? 0 : 1, load) && cpu && mem) {
+        // Stacked: CPU's row over MEM's, one chip wide.
+        DesktopRect& top = l.metrics[0];
+        l.metrics[1] = {top.x, pairTop + row, top.w, row};
+        top = {top.x, pairTop, top.w, row};
     }
     if (total > static_cast<int>(ChromeTaskbarButtonLimit)) total = ChromeTaskbarButtonLimit;
     int available = right - x;
@@ -330,59 +359,69 @@ static bool CadenceLatest(const DesktopIntervals<>& history, uint64_t tick, char
     return true;
 }
 
-// Taskbar diagnostics (Settings > Taskbar): CPU and MEM as one-line chips
-// (caption label, 6 px meter, value), disk and network rates as two caption
-// lines, and the cadence histories as label, graph and percentiles.
+// Taskbar diagnostics (Settings > Taskbar), condensed (Ian, 19 November):
+// CPU over MEM as label and a bar with the percentage inside it, disk R/W as
+// two short rates, and the cadence histories as label and graph over p95.
+// Network rates are in the network flyout.
 static void DesktopMetric(ChromeDisplayList& dl, const ChromeStyle& s, const ChromeTelemetryModel& t,
                           const DesktopRect& r, unsigned kind, uint64_t now)
 {
     if (r.w <= 0) return;
+    using SP = ChromeTaskbarSpacing;
     const auto& p = s.P(); const int line = s.Line(CF::Small);
-    const int top = r.y + (r.h - 2 * line) / 2, bottom = top + line;
+    const int row = line + Px(s, SP::RowGap);
+    const int top = r.y + (r.h - 2 * row) / 2 + Px(s, SP::RowGap) / 2, bottom = top + row;
     auto text = [&](int x, int y, const char* v, uint32_t color) { dl.Text(CF::Small, x, y, v, color, r.x + r.w - x); };
     if (kind < 2) {
         unsigned percent = kind ? t.stats.memoryPercent : t.stats.cpuPercent; if (percent > 100) percent = 100;
         const uint32_t color = percent >= 90 ? p.hot : percent >= 70 ? p.warm : p.ok;
-        const char* label = kind ? "MEM" : "CPU";
-        const int labelW = s.TextWidth("MEM", CF::Small);
-        dl.Text(CF::Small, r.x, r.y + (r.h - line) / 2, label, p.mutedText);
-        const int meterX = r.x + labelW + Px(s, 6), meterW = Px(s, 28), meterH = Px(s, 6);
-        const int meterY = r.y + (r.h - meterH) / 2;
-        dl.MaterialRect({meterX, meterY, meterW, meterH}, WellColor(s, p.taskbar), Px(s, 3));
-        const int fill = meterW * static_cast<int>(percent) / 100;
-        if (fill > 0) dl.MaterialRect({meterX, meterY, fill < meterH ? meterH : fill, meterH}, color | 0xff000000u, Px(s, 3));
+        const int y = r.y + (r.h - line) / 2;
+        dl.Text(CF::Small, r.x, y, kind ? "MEM" : "CPU", p.mutedText);
+        // The bar, its fill and the value inside it: an ink that contrasts
+        // with the fill over the fill, the tray ink over the well, each clipped to its part so the digits
+        // read over both in every theme.
+        const int barW = ChromeLoadBarWidth(s), barH = line, barX = r.x + r.w - barW, barY = y;
+        dl.MaterialRect({barX, barY, barW, barH}, WellColor(s, p.taskbar), Px(s, 3));
+        const int fill = barW * static_cast<int>(percent) / 100;
+        if (fill > 0) dl.MaterialRect({barX, barY, fill < Px(s, 6) ? Px(s, 6) : fill, barH}, color | 0xff000000u, Px(s, 3));
         char value[12]; DesktopNumber(value, percent);
         unsigned n = 0; while (value[n]) ++n; value[n] = '%'; value[n + 1] = 0;
-        TextRight(dl, s, CF::Label, r.x + r.w, r.y + (r.h - s.Line(CF::Label)) / 2, value, p.taskText);
+        const int vx = barX + (barW - s.TextWidth(value, CF::Small)) / 2;
+        const DesktopRect filled{barX, barY, fill, barH}, empty{barX + fill, barY, barW - fill, barH};
+        // Light theme levels are dark fills, dark theme levels light ones.
+        const unsigned luma = (((color >> 16) & 255) * 3 + ((color >> 8) & 255) * 6 + (color & 255)) / 10;
+        if (filled.w > 0) dl.Text(vx, barY, value, luma > 128 ? 0x0b1a2bu : 0xffffffu, 0, &filled, CF::Small);
+        if (empty.w > 0) dl.Text(vx, barY, value, p.taskText, 0, &empty, CF::Small);
         return;
     }
-    if (kind < 4) {
-        char first[20], second[20], number[12]; const bool net = kind == 3;
-        CopyText(first, net ? "D " : "R ", sizeof(first));
-        DesktopRate(number, net ? t.stats.downBytesPerSecond : t.stats.readBytesPerSecond);
+    if (kind == 2) {
+        char first[20], second[20], number[12];
+        CopyText(first, "R ", sizeof(first));
+        DesktopRate(number, t.stats.readBytesPerSecond);
         CopyText(first + 2, number, sizeof(first) - 2);
-        unsigned n = 0; while (first[n]) ++n; CopyText(first + n, " MB/s", sizeof(first) - n);
-        CopyText(second, net ? "U " : "W ", sizeof(second));
-        DesktopRate(number, net ? t.stats.upBytesPerSecond : t.stats.writeBytesPerSecond);
+        unsigned n = 0; while (first[n]) ++n; CopyText(first + n, "M", sizeof(first) - n);
+        CopyText(second, "W ", sizeof(second));
+        DesktopRate(number, t.stats.writeBytesPerSecond);
         CopyText(second + 2, number, sizeof(second) - 2);
-        n = 0; while (second[n]) ++n; CopyText(second + n, " MB/s", sizeof(second) - n);
+        n = 0; while (second[n]) ++n; CopyText(second + n, "M", sizeof(second) - n);
         text(r.x, top, first, p.secondaryText); text(r.x, bottom, second, p.secondaryText); return;
     }
-    if (kind > 5) return;
+    if (kind != 4 && kind != 5) return;
     const DesktopIntervals<>* source = kind == 4 ? t.compositor : t.app;
     if (!source) return;
     const auto& history = *source;
     const auto summary = history.Read(now);
     text(r.x, top, kind == 4 ? "COMP" : "APP", p.mutedText);
-    const int graphX = r.x + s.TextWidth("COMP", CF::Small) + Px(s, 6);
-    CadenceBars(dl, s, {graphX, top + Px(s, 1), r.x + r.w - graphX, line - Px(s, 2)}, history, now, 100, p.accent);
+    const int graphW = SP::GraphBars * Px(s, 3), graphX = r.x + r.w - graphW;
+    CadenceBars(dl, s, {graphX, top + Px(s, 1), graphW, line - Px(s, 2)}, history, now, 100, p.accent);
     if (!summary.count || (kind == 5 && (!history.last || now - history.last > 2000))) {
-        text(r.x, bottom, "idle / no frames", p.mutedText); return;
+        text(r.x, bottom, "idle", p.mutedText); return;
     }
-    char value[64]{}; unsigned used = 0;
-    auto append = [&](const char* v) { while (*v && used + 1 < sizeof(value)) value[used++] = *v++; value[used] = 0; };
-    char n[12]; append("p80 "); DesktopNumber(n, summary.p80); append(n); append("  p95 "); DesktopNumber(n, summary.p95);
-    append(n); append("  max "); DesktopNumber(n, summary.max); append(n); append(" ms");
+    char value[32]{}, number[12];
+    CopyText(value, "p95 ", sizeof(value));
+    DesktopNumber(number, summary.p95 > 999 ? 999 : summary.p95);
+    unsigned n = 0; while (value[n]) ++n; CopyText(value + n, number, sizeof(value) - n);
+    n = 0; while (value[n]) ++n; CopyText(value + n, " ms", sizeof(value) - n);
     text(r.x, bottom, value, p.secondaryText);
 }
 
@@ -465,11 +504,12 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
             dl.Glyph(ChromeGlyph::ChevronRight, l.next.x + (l.next.w - size) / 2, l.next.y + (l.next.h - size) / 2, p.taskText);
     }
     if (l.build.w > 0)
-        dl.Text(CF::Mono, l.build.x + Px(s, 8), l.build.y + (l.build.h - s.Line(CF::Mono)) / 2, l.buildText,
-                p.badgeText, l.build.w - Px(s, 8));
+        dl.Text(CF::Mono, l.build.x + Px(s, ChromeTaskbarSpacing::Pad), l.build.y + (l.build.h - s.Line(CF::Mono)) / 2,
+                l.buildText, p.badgeText, l.build.w - Px(s, ChromeTaskbarSpacing::Pad));
     if (l.clock.w > 0) {
-        // Time over date, right-aligned 8 px from the target's edge.
-        const int timeH = s.Line(CF::Label), dateH = s.Line(CF::Small), right = l.clock.x + l.clock.w - Px(s, 8);
+        // Time over date, right-aligned a pad from the target's edge.
+        const int timeH = s.Line(CF::Label), dateH = s.Line(CF::Small);
+        const int right = l.clock.x + l.clock.w - Px(s, ChromeTaskbarSpacing::Pad);
         const bool twoLines = l.clockDate[0] && l.clock.h >= timeH + dateH;
         const int top = l.clock.y + (l.clock.h - (twoLines ? timeH + dateH : timeH)) / 2;
         TextRight(dl, s, CF::Label, right, top, l.clockText, p.text);
@@ -486,10 +526,10 @@ void ChromeBuildTaskbar(const ChromeTaskbarModel& m, const ChromeStyle& s, Chrom
         char value[16] = "n/a";
         if (live) ThermalText(value, t.latest.pkgC, false);
         const uint32_t ink = live ? ThermalInk(s, t.latest.pkgC, t.tjmax, p.secondaryText) : p.mutedText;
-        const int glyph = Px(s, 16), width = glyph + Px(s, 6) + s.TextWidth(value, CF::Label);
+        const int glyph = Px(s, 16), space = Px(s, 4), width = glyph + space + s.TextWidth(value, CF::Label);
         const int x = r.x + (r.w - width) / 2;
         dl.Glyph(ChromeGlyph::Temperature, x, r.y + (r.h - glyph) / 2, ink);
-        dl.Text(CF::Label, x + glyph + Px(s, 6), labelY, value, ink, r.x + r.w - x - glyph - Px(s, 6));
+        dl.Text(CF::Label, x + glyph + space, labelY, value, ink, r.x + r.w - x - glyph - space);
     }
     NetworkIndicator(dl, s, l.network, m.networkConnected);
     if (l.volume.w > 0) {
@@ -630,169 +670,6 @@ void ChromeBuildTooltip(const ChromeTooltipModel& m, const ChromeStyle& s, Chrom
     ChromeMaterialString(dl, s, p.x + pad, y, m.text, s.P().text, width, CF::Label);
     if (m.detail)
         ChromeMaterialString(dl, s, p.x + pad, y + line, m.detail, s.P().secondaryText, width, CF::Label);
-}
-
-// ---------------------------------------------------------------------------
-// Launcher
-// ---------------------------------------------------------------------------
-
-static constexpr const char* LauncherPowerLabels[] = {"Restart", "Shut down", "Cancel"};
-static constexpr const char* LauncherConfirmLabels[] = {"Restart now", "Shut down now"};
-
-LauncherPowerMetrics ChromeLauncherPowerMetrics(const ChromeStyle& s)
-{
-    int label = 0, confirm = 0;
-    for (const char* text : LauncherPowerLabels) { const int w = s.TextWidth(text, CF::Label); if (w > label) label = w; }
-    for (const char* text : LauncherConfirmLabels) { const int w = s.TextWidth(text, CF::Label); if (w > confirm) confirm = w; }
-    // 12 px labels with 14 px padding; the idle buttons lead with a 16 px icon.
-    const int inner = 2 * Px(s, 14), icon = Px(s, 16) + Px(s, 6);
-    return {Px(s, SM::LauncherItemHeight), Px(s, SM::LauncherPadding), Px(s, 6), Px(s, 28), Px(s, 12),
-            label + icon + inner, confirm + inner};
-}
-
-ChromeLauncherLayout ChromeLauncherLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH, uint32_t total)
-{
-    const uint32_t desktopH = screenH > s.M(DesktopMetrics::TaskbarBase) ? screenH - s.M(DesktopMetrics::TaskbarBase) : 0;
-    ChromeLauncherLayout l = {};
-    // 8 px from the screen edge and from the taskbar (DESIGN.md "Geometry").
-    const uint32_t margin = s.M(SM::PanelMargin);
-    l.x = screenW > 2 * margin ? margin : 0;
-    const uint32_t availableW = screenW > 2 * margin ? screenW - 2 * margin : screenW;
-    const uint32_t availableH = desktopH > 2 * margin ? desktopH - 2 * margin : desktopH;
-    const LauncherPowerMetrics power = ChromeLauncherPowerMetrics(s);
-    const uint32_t fixedH = s.M(SM::LauncherItemHeight) + 2 * s.M(SM::LauncherPadding) +
-                            static_cast<uint32_t>(LauncherPowerFooterHeight(power));
-    l.rows = availableH > fixedH ? (availableH - fixedH) / (s.M(SM::LauncherItemHeight) + s.M(2)) : 0;
-    if (l.rows > SM::LauncherMaxRows) l.rows = SM::LauncherMaxRows;
-    l.cols = l.rows ? (total + l.rows - 1) / l.rows : 1;
-    if (!l.cols) l.cols = 1;
-    if (l.cols > SM::LauncherMaxCols) l.cols = SM::LauncherMaxCols;
-    uint32_t fitCols = availableW > 2 * s.M(SM::LauncherPadding) ?
-        (availableW - 2 * s.M(SM::LauncherPadding)) / (s.M(SM::LauncherItemWidth) + s.M(4)) : 0;
-    if (!fitCols) fitCols = 1;
-    if (l.cols > fitCols) l.cols = fitCols;
-    l.itemW = availableW > 2 * s.M(SM::LauncherPadding) + s.M(4) ?
-        (availableW - 2 * s.M(SM::LauncherPadding)) / l.cols - s.M(4) : 0;
-    if (l.itemW > s.M(SM::LauncherItemWidth)) l.itemW = s.M(SM::LauncherItemWidth);
-    uint32_t neededRows = (total + l.cols - 1) / l.cols;
-    if (l.rows > neededRows) l.rows = neededRows;
-    l.capacity = l.rows * l.cols;
-    l.w = l.cols * (l.itemW + s.M(4)) + 2 * s.M(SM::LauncherPadding);
-    const uint32_t footerW = static_cast<uint32_t>(LauncherPowerMinimumWidth(power));
-    if (l.w < footerW) l.w = footerW; // the power prompt never clips its confirm button
-    if (l.w > availableW) l.w = availableW;
-    l.h = fixedH + l.rows * (s.M(SM::LauncherItemHeight) + s.M(2));
-    if (l.h > availableH) l.h = availableH;
-    l.y = static_cast<int>(desktopH) - static_cast<int>(l.h) - static_cast<int>(desktopH > 2 * margin ? margin : 0);
-    if (l.y < 0) l.y = 0;
-    return l;
-}
-
-DesktopRect ChromeLauncherItemRect(const ChromeStyle& s, const ChromeLauncherLayout& l, uint32_t slot)
-{
-    return {l.x + static_cast<int>(s.M(SM::LauncherPadding) + (slot % l.cols) * (l.itemW + s.M(4))),
-            l.y + static_cast<int>(s.M(SM::LauncherPadding) + s.M(SM::LauncherItemHeight) +
-                                   (slot / l.cols) * (s.M(SM::LauncherItemHeight) + s.M(2))),
-            static_cast<int>(l.itemW), static_cast<int>(s.M(SM::LauncherItemHeight))};
-}
-
-
-static void PowerButton(ChromeDisplayList& dl, const ChromeStyle& s, const DesktopRect& r, const char* label,
-                        uint32_t bg, uint32_t fg, bool focused, bool icon = false, ChromeGlyph glyph = ChromeGlyph::Power)
-{
-    if (r.w <= 0 || r.h <= 0) return;
-    const int inset = Px(s, 4);
-    const DesktopRect face{r.x, r.y + inset, r.w, r.h - 2 * inset};
-    if (focused) {
-        const int ring = Px(s, 2);
-        dl.MaterialRect({face.x - ring, face.y - ring, face.w + 2 * ring, face.h + 2 * ring},
-                        s.MaterialColor(s.P().accent), Px(s, 6) + ring);
-    }
-    ChromeMaterialRect(dl, s, face, bg);
-    const int size = Px(s, 16), lead = icon ? size + Px(s, 6) : 0;
-    const int textW = s.TextWidth(label, CF::Label) + lead;
-    const int x = r.x + (textW < r.w ? (r.w - textW) / 2 : 0);
-    if (icon && r.w >= textW) dl.Glyph(glyph, x, r.y + (r.h - size) / 2, fg);
-    ChromeMaterialString(dl, s, x + (r.w >= textW ? lead : 0), r.y + (r.h - s.Line(CF::Label)) / 2, label, fg, r.w,
-                         CF::Label);
-}
-
-static void PowerFooter(ChromeDisplayList& dl, const ChromeStyle& s, const ChromeLauncherModel& m)
-{
-    const LauncherPowerLayout f = ChromeLauncherPowerLayout(s, m.layout);
-    if (f.footer.w <= 0) return;
-    const auto& pal = s.P();
-    dl.Fill(f.separator.x, f.separator.y, f.separator.w, f.separator.h, pal.launcherBorder);
-    const auto face = [&](const DesktopRect& r) { return r.contains(m.mouseX, m.mouseY) ? pal.taskHover : pal.taskButton; };
-    if (m.shutdownActive) {
-        PowerButton(dl, s, f.cluster, "Cancel shutdown", face(f.cluster), pal.text, false);
-        return;
-    }
-    if (m.prompt) {
-        // Destructive confirm: the close-button red, apart from the cluster.
-        const uint32_t confirmBg = f.confirm.contains(m.mouseX, m.mouseY) ?
-            ChromeBlendColor(pal.closeHover, pal.text, 200) : pal.closeHover;
-        PowerButton(dl, s, f.confirm, LauncherConfirmLabels[m.promptRestart ? 0 : 1], confirmBg, pal.closeText,
-                    m.confirmFocused);
-        PowerButton(dl, s, f.dismiss, LauncherPowerLabels[2], face(f.dismiss), pal.text, !m.confirmFocused);
-        return;
-    }
-    PowerButton(dl, s, f.restart, LauncherPowerLabels[0], face(f.restart), pal.text, false, true, ChromeGlyph::Restart);
-    PowerButton(dl, s, f.shutdown, LauncherPowerLabels[1], face(f.shutdown), pal.text, false, true, ChromeGlyph::Power);
-}
-
-void ChromeBuildLauncher(const ChromeLauncherModel& m, const ChromeStyle& s, ChromeDisplayList& dl)
-{
-    const auto& pal = s.P();
-    const ChromeLauncherLayout& layout = m.layout;
-    const int32_t px = layout.x, py = layout.y;
-    const uint32_t pw = layout.w, ph = layout.h;
-
-    PanelFrame(dl, s, {px, py, static_cast<int>(pw), static_cast<int>(ph)});
-
-    const int rowH = Px(s, SM::LauncherItemHeight), pad = Px(s, SM::LauncherPadding);
-
-    // Extremely small surfaces cannot fit even the header.
-    if (static_cast<int>(ph) < rowH + 2 * pad || static_cast<int>(pw) < 2 * pad + 1) return;
-
-    // Header: status or prompt
-    int32_t iy = py + pad;
-    if (pw > s.M(56) && m.header)
-        ChromeMaterialString(dl, s, px + pad + Px(s, 8), iy + (rowH - s.Line(CF::Label)) / 2, m.header,
-                             pal.secondaryText, static_cast<int>(pw) - Px(s, 56), CF::Label);
-    iy += rowH;
-
-    // Separator line below header
-    dl.Fill(px + pad, iy - 1, static_cast<int>(pw) - 2 * pad, 1, pal.launcherBorder);
-
-    // Power controls: always available, in their own footer below a separator.
-    PowerFooter(dl, s, m);
-
-    const int icon = Px(s, SM::LauncherIconSize);
-    for (uint32_t slot = 0; slot < m.count && slot < layout.capacity; ++slot)
-    {
-        const ChromeLauncherItem& entry = m.items[slot];
-        const DesktopRect item = ChromeLauncherItemRect(s, layout, slot);
-        const bool hovered = item.contains(m.mouseX, m.mouseY);
-        if (hovered) ChromeMaterialRect(dl, s, item, pal.itemHover);
-
-        const int iconX = item.x + Px(s, 8);
-        if (static_cast<int>(layout.itemW) >= icon + Px(s, 12))
-            ChromeIcon(dl, s, iconX, item.y + (rowH - icon) / 2, icon, entry.icon);
-
-        // Title text (offset to right of icon)
-        const int textX = iconX + icon + Px(s, 10);
-        const int maxTextW = item.x + static_cast<int>(layout.itemW) - textX - Px(s, 8);
-        if (maxTextW > 0) ChromeMaterialString(dl, s, textX, item.y + (rowH - s.Line()) / 2, entry.title,
-                                               hovered ? pal.text : pal.taskText, maxTextW);
-    }
-
-    // Wheel-scroll hints live in the header, clear of application labels.
-    const int hint = Px(s, 16), hintY = py + pad + (rowH - hint) / 2;
-    if (pw >= s.M(64) && m.scrollUp)
-        dl.Glyph(ChromeGlyph::ChevronUp, px + static_cast<int>(pw) - pad - 2 * hint - Px(s, 8), hintY, pal.secondaryText);
-    if (pw >= s.M(64) && m.scrollDown)
-        dl.Glyph(ChromeGlyph::ChevronDown, px + static_cast<int>(pw) - pad - hint - Px(s, 4), hintY, pal.secondaryText);
 }
 
 // ---------------------------------------------------------------------------

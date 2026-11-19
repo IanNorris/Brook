@@ -8,7 +8,6 @@
 #include "desktop_telemetry.h"
 #include "thermal_sampler.h"
 #include "taskbar_volume.h"
-#include "launcher_power.h"
 
 namespace brook {
 
@@ -23,8 +22,7 @@ struct ChromeShellMetrics {
     static constexpr uint32_t TaskbarMaxButtonWidth = 188, TaskbarLauncherWidth = 56, TaskbarPillInsetX = 2, TaskbarPillInsetY = 5;
     static constexpr uint32_t TaskbarIcon = 20, TaskbarButtonPad = 12, TaskbarLabelGap = 8, TaskbarLabelMin = 72;
     static constexpr uint32_t PanelMargin = 8; // shell panels: from the screen edge and the taskbar
-    static constexpr uint32_t LauncherIconSize = 24, LauncherIconMargin = 8, LauncherItemHeight = 40;
-    static constexpr uint32_t LauncherItemWidth = 230, LauncherPadding = 8, LauncherMaxRows = 14, LauncherMaxCols = 3;
+    static constexpr uint32_t LauncherIconSize = 24; // icon sources (24x24 ARGB); the launcher is chrome_launcher.h
 };
 
 inline void DesktopNumber(char* out, unsigned value) {
@@ -136,37 +134,7 @@ inline int ChromeTooltipHeight(const ChromeStyle& s, bool detail) {
 inline int ChromeVolumeValueWidth(const ChromeStyle& s) { return s.TextWidth("100%", ChromeFont::Label); }
 void ChromeBuildTooltip(const ChromeTooltipModel& model, const ChromeStyle& style, ChromeDisplayList& out);
 
-// ---------------------------------------------------------------------------
-// Launcher
-// ---------------------------------------------------------------------------
-
-struct ChromeLauncherLayout {
-    int x, y;
-    uint32_t w, h, cols, rows, itemW, capacity;
-};
-// total: valid launcher items.
-ChromeLauncherLayout ChromeLauncherLayoutFor(const ChromeStyle& s, uint32_t screenW, uint32_t screenH, uint32_t total);
-DesktopRect ChromeLauncherItemRect(const ChromeStyle& s, const ChromeLauncherLayout& l, uint32_t slot);
-LauncherPowerMetrics ChromeLauncherPowerMetrics(const ChromeStyle& s);
-inline LauncherPowerLayout ChromeLauncherPowerLayout(const ChromeStyle& s, const ChromeLauncherLayout& l) {
-    return LauncherPowerFooter({l.x, l.y, static_cast<int>(l.w), static_cast<int>(l.h)}, ChromeLauncherPowerMetrics(s));
-}
-
-struct ChromeLauncherItem {
-    const char* title;
-    const uint32_t* icon; // borrowed; null: missing glyph
-};
-struct ChromeLauncherModel {
-    ChromeLauncherLayout layout;
-    const char* header;
-    const ChromeLauncherItem* items; // the visible items, in slot order
-    uint32_t count;
-    bool scrollUp, scrollDown;       // hints: items above / below the page
-    bool shutdownActive;             // the footer offers only "Cancel shutdown"
-    bool prompt, promptRestart, confirmFocused;
-    int32_t mouseX, mouseY;
-};
-void ChromeBuildLauncher(const ChromeLauncherModel& model, const ChromeStyle& style, ChromeDisplayList& out);
+// The launcher is chrome_launcher.h.
 
 // ---------------------------------------------------------------------------
 // Boot summary

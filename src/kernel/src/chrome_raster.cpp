@@ -34,9 +34,17 @@ static inline void ChromePutPixel(const ChromeTarget& t, int x, int y, uint32_t 
 
 void ChromeFillRect(const ChromeTarget& t, int x0, int y0, int w, int h, uint32_t color)
 {
-    for (int y = y0; y < y0 + h; ++y)
-        for (int x = x0; x < x0 + w; ++x)
-            ChromePutPixel(t, x, y, color);
+    // Clip once, then store whole rows (the same pixels as a per-pixel
+    // bounds-checked loop, several times faster for panel-sized fills).
+    int left = x0 - t.originX, top = y0 - t.originY, right = left + w, bottom = top + h;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > static_cast<int>(t.width)) right = static_cast<int>(t.width);
+    if (bottom > static_cast<int>(t.height)) bottom = static_cast<int>(t.height);
+    for (int y = top; y < bottom; ++y) {
+        uint32_t* row = t.pixels + static_cast<uint64_t>(y) * t.stride;
+        for (int x = left; x < right; ++x) row[x] = color;
+    }
 }
 
 int ChromeRenderGlyph(const ChromeTarget& t, const FontAtlas& fa, int penX, int penY, int code,

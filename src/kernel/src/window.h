@@ -699,6 +699,8 @@ struct LauncherItem {
     char appId[128];       // desktop basename without .desktop (optional manifest field)
     char executable[64];  // executable basename for native/older manifest matching
     char scriptPath[128];  // e.g. "/boot/SHORTCUTS/QUAKE.RC" or exec command
+    char description[64];  // shortcut "# desc:" (launcher row subtitle); may be empty
+    char category[16];     // declared default launcher category ID ("# category:", or from Categories=)
     uint32_t iconColor;    // Icon background color (0 = auto from title)
     uint32_t* iconPixels;  // Raw ARGB icon data (24x24), or nullptr for generic application icon
     bool valid;
@@ -735,6 +737,10 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 
 // Hit-test the launcher popup. Returns item index (0..N) or -1 if miss.
 int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
+// Pointer press (secondary: right button) while the launcher is open; false
+// when outside the panel. Keys while it is open (scan, translated ASCII, mods).
+bool WmLauncherPress(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH, bool secondary);
+void WmLauncherKey(uint8_t scan, char ascii, uint8_t modifiers);
 
 // Get the launcher popup panel geometry (screen-space rect). Lets the GPU
 // compositor mark its pixels opaque / compose it as a translucent overlay.

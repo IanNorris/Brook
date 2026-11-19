@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include "chrome_frame.h"
 #include "chrome_shell.h"
+#include "chrome_launcher.h"
 #include "png.h"
 
 using namespace brook;
@@ -197,6 +198,109 @@ void Frames(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) 
     }
 }
 
+// --- Launcher ------------------------------------------------------------------
+
+// The prototype's sample catalog, filed by the default categories; a few
+// apps have no icon (the neutral missing-icon glyph) or no description.
+LauncherApp LauncherSample(const char* key, const char* name, const char* desc, const char* hint) {
+    LauncherApp a{};
+    std::snprintf(a.key, sizeof(a.key), "%s", key);
+    std::snprintf(a.name, sizeof(a.name), "%s", name);
+    std::snprintf(a.desc, sizeof(a.desc), "%s", desc);
+    std::snprintf(a.hint, sizeof(a.hint), "%s", hint);
+    return a;
+}
+const LauncherApp launcherApps[] = {
+    LauncherSample("brook-files", "Files", "Browse files and directories", "system"),
+    LauncherSample("terminal", "Terminal", "Command line shell", "system"),
+    LauncherSample("brook-settings", "Settings", "Appearance and taskbar", "system"),
+    LauncherSample("kconsole", "Kernel Console", "Read-only kernel log", "system"),
+    LauncherSample("gallery", "App Gallery", "Find and install applications", "system"),
+    LauncherSample("firefox", "Firefox", "Web browser", "internet"),
+    LauncherSample("ladybird", "Ladybird", "Ladybird browser", "internet"),
+    LauncherSample("netsurf", "NetSurf", "Lightweight web browser", "internet"),
+    LauncherSample("player", "Video Player", "Brook video player", "media"),
+    LauncherSample("vlc", "VLC media player", "Plays most media files", "media"),
+    LauncherSample("edit", "Text Editor", "Open, edit, save", "office"),
+    LauncherSample("mousepad", "Mousepad", "", "office"),
+    LauncherSample("calc", "Calculator", "Brook native calculator", "office"),
+    LauncherSample("gimp", "GIMP", "Image manipulation", "graphics"),
+    LauncherSample("doom", "DOOM", "The classic", "games"),
+    LauncherSample("quake", "Quake", "id Software, 1996", "games"),
+    LauncherSample("quake2", "Quake II", "id Software, 1997", "games"),
+    LauncherSample("flower", "Flower Demo", "Weston animated flower", "demos"),
+    LauncherSample("htop", "htop", "Process viewer", ""),
+};
+constexpr uint32_t launcherAppCount = sizeof(launcherApps) / sizeof(launcherApps[0]);
+
+void Launcher(const std::string& prefix, const ChromeStyle& s, uint32_t screenW, uint32_t screenH) {
+    static LauncherModel model;
+    static ChromeLauncherFrame frame;
+    static ChromeShellStorage storage;
+    const uint32_t* icons[launcherAppCount];
+    for (uint32_t i = 0; i < launcherAppCount; ++i) icons[i] = i % 5 == 3 ? nullptr : testIcon;
+    struct Scene { const char* name; void (*stage)(LauncherModel&, const ChromeLauncherFrame&, ChromeLauncherChrome&); };
+    auto rowOf = [](const ChromeLauncherFrame& f, int app) {
+        for (uint32_t i = 0; i < f.targetCount; ++i)
+            if (f.targets[i].target.kind == LauncherTargetKind::Row && f.targets[i].target.index == app) return f.targets[i].rect;
+        return DesktopRect{};
+    };
+    (void)rowOf;
+    static const Scene scenes[] = {
+        // Opened: empty search, pinned tiles, All apps.
+        {"launcher", [](LauncherModel&, const ChromeLauncherFrame&, ChromeLauncherChrome&) {}},
+        // Typed "ga": the Games category chip and ranked results with category chips.
+        {"launcher-search", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            m.Key(LauncherKey::Char, 'g'); m.Key(LauncherKey::Char, 'a'); }},
+        // Nothing matches.
+        {"launcher-nomatch", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            for (const char* q = "zork"; *q; ++q) m.Key(LauncherKey::Char, *q); }},
+        // The pointer on Ladybird.
+        {"launcher-hover", [](LauncherModel& m, const ChromeLauncherFrame& f, ChromeLauncherChrome& c) {
+            for (uint32_t i = 0; i < f.targetCount; ++i)
+                if (f.targets[i].target.kind == LauncherTargetKind::Row && f.targets[i].target.index == m.FindApp("ladybird")) {
+                    c.mouseX = f.targets[i].rect.x + 5; c.mouseY = f.targets[i].rect.y + 5;
+                } }},
+        // Keyboard: four Downs in the list, and Recent on top.
+        {"launcher-keyboard", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            m.NoteLaunch(m.FindApp("quake2")); m.NoteLaunch(m.FindApp("edit"));
+            m.SetTop(LauncherTop::Recent);
+            for (int i = 0; i < 4; ++i) m.Key(LauncherKey::Down); }},
+        // Right-clicked Ladybird: the Pin to top / Uninstall menu.
+        {"launcher-menu", [](LauncherModel& m, const ChromeLauncherFrame& f, ChromeLauncherChrome& c) {
+            for (uint32_t i = 0; i < f.targetCount; ++i)
+                if (f.targets[i].target.kind == LauncherTargetKind::Row && f.targets[i].target.index == m.FindApp("ladybird")) {
+                    const DesktopRect r = f.targets[i].rect;
+                    m.Press(f.targets[i].target, true, r.x + r.w * 45 / 100, r.y + r.h * 6 / 10);
+                    c.mouseX = f.targets[i].rect.x + 5; c.mouseY = f.targets[i].rect.y + 5;
+                } }},
+        // A category view, scrolled, with nothing pinned.
+        {"launcher-category", [](LauncherModel& m, const ChromeLauncherFrame&, ChromeLauncherChrome&) {
+            for (const char* key : {"brook-files", "terminal", "brook-settings", "firefox", "quake"}) m.TogglePin(m.FindApp(key));
+            m.Press({LauncherTargetKind::Rail, 0}, false, 0, 0); m.ScrollBy(3); }},
+        // The restart confirmation in the footer.
+        {"launcher-prompt", [](LauncherModel&, const ChromeLauncherFrame&, ChromeLauncherChrome& c) {
+            c.prompt = c.promptRestart = c.confirmFocused = true; }},
+    };
+    for (const Scene& scene : scenes) {
+        model.Init();
+        model.SetCatalog(launcherApps, launcherAppCount);
+        model.Open();
+        ChromeLauncherChrome chrome{icons, launcherAppCount, "brook", "dell-int51-20261119", nullptr, false, false, false, false, -1, -1};
+        ChromeLauncherFrameFor(model, chrome, s, screenW, screenH, frame);
+        model.SetViewport(frame.viewport);
+        ChromeLauncherFrameFor(model, chrome, s, screenW, screenH, frame);
+        scene.stage(model, frame, chrome);
+        ChromeLauncherFrameFor(model, chrome, s, screenW, screenH, frame);
+        model.SetViewport(frame.viewport);
+        ChromeLauncherFrameFor(model, chrome, s, screenW, screenH, frame);
+        ChromeDisplayList list = ChromeListOn(storage);
+        ChromeBuildLauncher(model, chrome, frame, s, list);
+        const DesktopRect& p = frame.panel;
+        Check(prefix + scene.name, list, s, p.x, p.y, p.w, p.h);
+    }
+}
+
 // --- Shell surfaces -----------------------------------------------------------
 
 DesktopIntervals<> compositorCadence;
@@ -244,6 +348,26 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         ChromeBuildTaskbar(tb, s, list);
         Check(prefix + (hover ? "taskbar-hover" : "taskbar"), list, s, 0, layout.y, screenW, screenH - layout.y);
     }
+    // The Dell's logical width (3200 at 200%): every diagnostic on, and the
+    // default set (CPU, MEM, temperature), with a payload build label.
+    for (const bool all : {true, false}) {
+        const uint32_t wideW = 1600 * m.percent / 100;
+        const uint32_t set = all ? 127u : (1u << 0 | 1u << 1 | 1u << 6);
+        const ChromeTaskbarLayout wide = ChromeTaskbarLayoutFor(s, wideW, screenH, "14:05 19 Nov 2026", false, set, ids, 3, 0,
+                                                                "dell-int51-20261119", false, labels);
+        ChromeTaskbarModel wm = tb;
+        wm.layout = &wide;
+        wm.agentShown = false;
+        wm.mouseX = wm.mouseY = -1;
+        wm.launcherOpen = false;
+        wm.telemetry.app = &compositorCadence;
+        wm.telemetry.stats.downBytesPerSecond = 2400000;
+        wm.telemetry.stats.upBytesPerSecond = 150000;
+        wm.telemetry.thermal = true; wm.telemetry.tjmax = 100; wm.telemetry.latest.pkgC = 57;
+        ChromeDisplayList list = ChromeListOn(storage);
+        ChromeBuildTaskbar(wm, s, list);
+        Check(prefix + (all ? "taskbar-diagnostics" : "taskbar-default"), list, s, 0, wide.y, wideW, screenH - wide.y);
+    }
     // The compact HUD and the temperature target, without the diagnostics.
     {
         const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, "09:41 15 Nov 2026", false, 1u << 6,
@@ -260,29 +384,7 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         Check(prefix + "taskbar-hud", list, s, 0, hudLayout.y, screenW, screenH - hudLayout.y);
     }
 
-    // Launcher: ten apps, the third hovered; then the restart prompt.
-    const ChromeLauncherItem items[] = {
-        {"Terminal", testIcon}, {"Files", nullptr}, {"Settings", testIcon}, {"Chromium", testIcon},
-        {"Quake II", nullptr}, {"Stardew Valley", testIcon}, {"Text Editor", testIcon}, {"Gallery", nullptr},
-        {"Kernel Console", testIcon}, {"Steam", testIcon},
-    };
-    for (int prompt = 0; prompt < 2; ++prompt) {
-        ChromeLauncherModel lm{};
-        lm.layout = ChromeLauncherLayoutFor(s, screenW, screenH, 10);
-        lm.header = prompt ? "Restart? Open apps will be asked to close" : "Applications";
-        lm.items = items;
-        lm.count = 10;
-        lm.prompt = prompt;
-        lm.promptRestart = true;
-        lm.confirmFocused = true;
-        const DesktopRect hovered = ChromeLauncherItemRect(s, lm.layout, 2);
-        lm.mouseX = hovered.x + 3;
-        lm.mouseY = hovered.y + 3;
-        ChromeDisplayList list = ChromeListOn(storage);
-        ChromeBuildLauncher(lm, s, list);
-        Check(prefix + (prompt ? "launcher-prompt" : "launcher"), list, s, lm.layout.x, lm.layout.y,
-              lm.layout.w, lm.layout.h);
-    }
+    Launcher(prefix, s, screenW, screenH);
 
     // Volume popup over the tray icon, mute button hovered.
     {

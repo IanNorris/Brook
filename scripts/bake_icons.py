@@ -42,6 +42,22 @@ ICONS = [
     ('chevron-right', '<path d="m6 4 4 4-4 4"/>'),
     ('chevron-up', '<path d="m4 10 4-4 4 4"/>'),
     ('chevron-down', '<path d="m4 6 4 4 4-4"/>'),
+    # Launcher (DESIGN.md "Launcher organisation"): search, the rail and the
+    # category icons, the app menu.
+    ('search', '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>'),
+    ('grid', '<rect x="3" y="3" width="4" height="4" rx="1"/><rect x="9" y="3" width="4" height="4" rx="1"/>'
+             '<rect x="3" y="9" width="4" height="4" rx="1"/><rect x="9" y="9" width="4" height="4" rx="1"/>'),
+    ('inbox', '<path d="m2.5 9 1.800-5h7.400l1.800 5v3.500h-11zm0 0h3.200l.8 1.500h3l.8-1.500h3.200"/>'),
+    ('pin', '<path d="M6 2.500h4l-.5 4 2 2.500h-7l2-2.500zM8 9v4.500"/>'),
+    ('trash', '<path d="M3.500 4.500h9m-6 0V3h3v1.500m-5 0 .6 8.500h5.800l.6-8.500"/>'),
+    ('folder', '<path d="M2.5 4.5a1 1 0 0 1 1-1h2.8l1.2 1.5h5a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/>'),
+    ('sliders', '<path d="M2.5 5h4m3.2 0h3.8M2.5 11h3.8m3.2 0h4"/><circle cx="8.1" cy="5" r="1.6"/><circle cx="7.9" cy="11" r="1.6"/>'),
+    ('globe', '<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11M8 2.5c-2.2 2-2.2 9 0 11m0-11c2.2 2 2.2 9 0 11"/>'),
+    ('play', '<path d="M5.5 3.5v9l7-4.5z"/>'),
+    ('doc', '<path d="M4.5 2.5h7v11h-7zM6.5 5.5h3m-3 2.5h3m-3 2.5h2"/>'),
+    ('brush', '<path d="m10.5 2.5 3 3-7 7H3.5v-3z"/>'),
+    ('pad', '<rect x="2" y="5" width="12" height="7" rx="3"/><path d="M5 8.5h2M6 7.5v2m4.8-1h.1"/>'),
+    ('spark', '<path d="M8 2.5v3m0 5v3M2.5 8h3m5 0h3"/>'),
 ]
 COLUMNS = 8
 PAD = 1

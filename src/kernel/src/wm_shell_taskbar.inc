@@ -24,10 +24,15 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
 {
     char clockText[32];
     RtcFormatTaskbar(clockText, RtcNow(), false);
+    // Build label: the payload name (e.g. "dell-int51-20261119") when the
+    // boot has one, else the short commit. The tooltip has the detail.
     char buildText[48]{};
     if (g_buildChip) {
-        WmStrCopy(buildText, "Brook ", sizeof(buildText));
-        WmStrCopy(buildText + 6, BuildGitHash(), sizeof(buildText) - 6);
+        if (g_buildPayloadId[0]) WmStrCopy(buildText, g_buildPayloadId, sizeof(buildText));
+        else {
+            WmStrCopy(buildText, BuildGitHash(), sizeof(buildText));
+            for (char* p = buildText; *p; ++p) if (*p == '+') { *p = 0; break; }
+        }
     }
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
     const char* labels[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
@@ -600,9 +605,14 @@ static bool WmTrayTooltip(uint32_t screenW, uint32_t screenH, int32_t mx, int32_
     }
     if (!anchor && l.build.contains(mx, my)) {
         anchor = &l.build;
-        WmStrCopy(text, "Brook ", sizeof(text));
-        WmStrCopy(text + 6, BuildGitHash(), sizeof(text) - 6);
-        if (g_buildPayloadId[0]) detail = g_buildPayloadId;
+        // Payload (or "Brook build"), then commit with any dirty suffix and the build date.
+        static char buildDetail[64];
+        WmStrCopy(text, g_buildPayloadId[0] ? g_buildPayloadId : "Brook build", sizeof(text));
+        WmStrCopy(buildDetail, BuildGitHash(), sizeof(buildDetail));
+        const size_t used = strlen(buildDetail);
+        WmStrCopy(buildDetail + used, "  built ", sizeof(buildDetail) - used);
+        WmStrCopy(buildDetail + strlen(buildDetail), BuildDate(), sizeof(buildDetail) - strlen(buildDetail));
+        detail = buildDetail;
     }
     if (!anchor) return false;
     const ChromeStyle style = WmChromeStyle();

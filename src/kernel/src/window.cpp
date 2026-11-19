@@ -42,6 +42,9 @@
 #include "chrome_layout.h"
 #include "chrome_frame.h"
 #include "chrome_shell.h"
+#include "chrome_launcher.h"
+#include "launcher_model.h"
+#include "desktop_identity.h"
 #include "chrome_surface.h"
 #include "desktop_shell_surfaces.h"
 #include "input.h"
@@ -628,10 +631,15 @@ static bool g_launcherWorkerStarted = false;
 static bool g_launcherLoaded = false;
 static bool g_launcherOpen = false;
 static int g_launcherError = 0;
-static uint32_t g_launcherScroll = 0;
 // Power buttons arm a confirmation; only the separate confirm button acts.
 static LauncherPowerGuard g_launcherPower;
 static void LauncherStartWorker();
+// The Clearwater launcher's model (wm_shell_launcher.inc): catalog, layout
+// and the open launcher's state. Init() runs in WmLauncherLoad.
+static LauncherModel g_launcherModel;
+static void LauncherLoadLayout();
+static void LauncherSaveLayout();
+static void LauncherPowerRun(LauncherPowerCommand command);
 
 // Requests own all metadata/icon pixels, never launcher snapshot pointers.
 struct LauncherRequest {
@@ -766,7 +774,6 @@ bool WmLauncherApplyPending()
     const uint32_t count = g_launcherActive->count;
     const uint32_t generation = g_launcherActive->generation;
     SpinLockRelease(&g_launcherLock);
-    g_launcherScroll = 0;
     SerialPrintf("WM: launcher published generation=%u items=%u\n", generation, count);
     return true;
 }
@@ -1610,7 +1617,7 @@ bool WmApplyScalePending()
     __atomic_store_n(&g_desktopMetrics,next,__ATOMIC_RELEASE);
     EndBackdropStyleChange();
     if(g_chromeSettingsEpoch)++g_chromeSettingsEpoch;
-    g_launcherScroll=0;
+
     CompositorMarkDirty();
     SerialPrintf("WM: desktop scale applied %u%%\n",next->percent);
     return true;
@@ -1969,6 +1976,8 @@ static bool ParseShortcutMetadata(const char* path, LauncherItem& item)
         {"title:", item.title, sizeof(item.title)},
         {"app_id:", item.appId, sizeof(item.appId)},
         {"executable:", item.executable, sizeof(item.executable)},
+        {"desc:", item.description, sizeof(item.description)},
+        {"category:", item.category, sizeof(item.category)},
     };
     for (char* line = buf; *line;)
     {
@@ -2205,6 +2214,10 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
             WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             WmStrCopy(item->executable, executable, sizeof(item->executable));
             WmStrCopy(item->appId, count >= 5 ? fields[4] : "", sizeof(item->appId));
+            // A desktop file's Categories= replaces a same-title shortcut's
+            // declared category only when it maps to one.
+            if (count >= 4 && *LauncherModel::HintFromDesktopCategories(fields[3]))
+                WmStrCopy(item->category, LauncherModel::HintFromDesktopCategories(fields[3]), sizeof(item->category));
             kfree(item->iconPixels);item->iconPixels = nullptr;
             if (count >= 3) item->iconPixels = LoadIconFile(fields[2]);
             if (!item->iconPixels) LauncherLoadIcon(item);
@@ -2380,6 +2393,7 @@ static void LauncherWorker(void*)
         }
         // One worker, coalesced requests, no busy waiting or retained rebuild
         // list. A slow reader delays reclamation and subsequent builds.
+        LauncherSaveLayout();
         SchedulerSleepMs(250);
     }
 }
@@ -2401,6 +2415,7 @@ static void LauncherStartWorker()
 void WmLauncherLoad()
 {
     if (g_launcherLoaded) return;
+    LauncherLoadLayout();
     const uint32_t generation = __atomic_load_n(&g_launcherRequested, __ATOMIC_ACQUIRE);
     LauncherSnapshot* snapshot = BuildLauncherSnapshot(generation);
     if (snapshot)
@@ -2431,7 +2446,7 @@ void WmLauncherToggle()
         WmVolumePopupClose();
         WmTrayFlyoutClose();
         g_launcherError = 0;
-        g_launcherScroll = 0;
+        g_launcherModel.Open();
         WmRequestLauncherRefresh(); // also catches installs/removals outside the installer
     }
 }
