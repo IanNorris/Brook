@@ -1235,3 +1235,92 @@ launcher:
   tiles and footer buttons are 44 or more.
 - Members within a default category are alphabetical (the prototype uses
   its catalogue order).
+
+### Taskbar condensing (Ian, 19 November)
+
+Same branch, same builder file (`chrome_shell.cpp`), so done here:
+
+- Spacing tokens `ChromeTaskbarSpacing` (`chrome_style.h`): Gap 8 between
+  diagnostics and tray widgets, Pad 4 inside chips and around the clock and
+  build label, RowGap 2 between stacked rows, 12-bar compact graphs.
+- CPU over MEM in one two-row chip: label, then a bar with the percentage
+  inside it (wide enough for "100%" at every scale). The digits are drawn
+  twice, clipped to the fill (in an ink chosen by the fill's lightness) and
+  to the well (tray ink), so they read in Glass and both Opaque themes.
+- Network rates are no longer drawn on the taskbar; the network flyout
+  already has live Download and Upload rows (its key changes with the 1 Hz
+  sample). No activity hint on the icon. Disk R/W stays, as two short
+  rates ("R 12.3M").
+- COMP and APP: label and graph on the first row, p95 on the second; the
+  other percentiles stay in the HUD panel.
+- Build label: the payload name (`HardwarePayloadIdRead`, as HWSTATUS
+  prints it), without its trailing `-YYYYMMDD` when space is tight, else
+  the short commit; no "Brook". Its tooltip: the payload (or "Brook
+  build"), then the commit with any dirty suffix and the build date.
+- Width of everything right of the window buttons at the Dell's 1600
+  logical px: every diagnostic on, 1175 to 644 logical px; the default set
+  (CPU, MEM, temperature), 607 to 420. Targets stay 48 high; clock and
+  temperature are at least 44 wide.
+
+### Evidence
+
+Not committed; under `build/launcher-evidence/` in the worktree.
+
+- Headless QEMU, QMP input, no NIC or audio; `gpu=gl` (virgl, blur
+  available) for Glass, `gpu=software` for the Opaque themes; 1920x1080 at
+  100, 150 and 200% (at 200% the panel is clamped to the 476 logical px
+  above the taskbar). The QEMU boot disk has no app store, so the scenes
+  use evidence-only copies of `data/shortcuts` (real titles, descriptions
+  and categories, `Requires: builtin`).
+- Scenes per run (`final/<theme>-<scale>/`): open, search "qu", no match,
+  keyboard selection, Tab to the tiles, rail, hover, right-click menu, Pin
+  or Unpin from it, the Restart prompt, and reopen after the save;
+  `launcher.ini` is read back from the data disk after each run.
+- Sheets in `compare/`: `launcher-compare.png` (prototype | Glass | Opaque
+  Light | Opaque Dark: open, search, menu), `launcher-<theme>.png`,
+  `launcher-scales-<theme>.png`, `launcher-scenes-glass-100.png`,
+  `taskbar-diagnostics.png` and `taskbar-default.png` (goldens before and
+  after, every theme and scale).
+- Latency (QMP event to changed pixels, screendump polling, Opaque Dark
+  100%): opening 56-58 ms against 55-57 ms for the old launcher; one typed
+  key to the query on screen 52-54 ms. Glass runs grab over VNC (1.5-2 s
+  a frame), so their numbers measure the grab, and match the old
+  launcher's.
+
+### Tests
+
+- `test_launcher_model` (new): defaults, ranking, navigation, pin and
+  unpin, recent ordering, reorder, persistence round trip and bad files.
+- `test_global_shortcuts`: the open launcher takes keys (repeats act,
+  modifiers pass, Alt+Tab/Alt+P stay global).
+- Goldens: 308 images (was 220 at the review, 242 with the two new taskbar
+  scenes). New: `launcher-search`, `-nomatch`, `-hover`, `-keyboard`,
+  `-menu`, `-category` (66), `taskbar-diagnostics` and `taskbar-default`
+  (22). Changed on purpose: `launcher` and `launcher-prompt` (22), and
+  `taskbar`, `taskbar-hover`, `taskbar-hud` (33) with the condensing.
+- Host suite: 384 pass (`-LE stress`). Compositor package builds.
+
+### Dell pair
+
+`build/dell/pair-launcher` (payload `dell-launcher-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `584dc701`, after which only this document changed; kernel
+`0030240f…`). `check_dell_image_qemu.py --attempts 4`: PASS on the first
+attempt. Nothing has run on the Dell.
+
+**Check by hand on the Dell (200%):**
+
+- Super (or the B) opens the launcher; type at once ("te", "games"): the
+  query shows in the field, results are ranked with category chips, Enter
+  opens the first. Backspace and Esc (clears, then closes) behave.
+- ↑ ↓ through the list (the selection scrolls into view), Tab to the
+  Pinned tiles (← →) and the rail (↑ ↓ switches the view), Alt+↑ ↓ moves an
+  app between categories.
+- Right-click an app or tile: Pin or Unpin; Uninstall is greyed. Pins and
+  Recent survive a reboot (`~/.config/brook/launcher.ini`).
+- Restart and Shut down still ask first; Cancel and Esc dismiss.
+- Glass: blurred, rounded panel; Opaque Light and Dark: solid and square.
+- Taskbar with every diagnostic on: CPU over MEM with the value inside the
+  bar, short disk rates, COMP and APP with p95, the payload name as the
+  build label (hover for commit and date), and the network rates in the
+  network flyout.
