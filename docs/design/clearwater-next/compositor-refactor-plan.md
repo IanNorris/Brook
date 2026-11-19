@@ -1096,6 +1096,14 @@ the connected states are in the goldens).
   branch does not touch it.
 - Compositor package: builds with its tests (its sources are unchanged).
 
+### Dell pair
+
+`build/dell/pair-cwreview` (payload `dell-cwreview-20261119`; scanout flip,
+persistent scanout map, zero-copy scanout and video engine on; clean tree
+at `72d40bbe`, after which only this section changed; kernel
+`6850a292…`). `check_dell_image_qemu.py --attempts 4`: PASS on the first
+attempt. Nothing has run on the Dell.
+
 **Check by hand on the Dell (200%):**
 
 - Text is smaller than before (titles 26 px, task labels 24, captions 22
