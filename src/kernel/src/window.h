@@ -105,14 +105,31 @@ static constexpr uint32_t WM_BTN_ICON_SIZE     = 10;  // size of max/min button 
 static constexpr uint32_t WM_BTN_ICON_PAD_BOT  = 6;   // minimize icon bottom offset
 
 using WmPalette = BrookThemePalette;
+// The painters' palette for the theme in use (selection resolved against the
+// backend), and the hue's full token set (app content colours and more).
 const WmPalette& WmCurrentPalette();
-bool WmSetTheme(uint32_t theme);
+const BrookHueTokens& WmHueTokens();
+// 0xB02 op 1: a legacy palette id (0..2) chooses its hue.
+bool WmSetTheme(uint32_t legacyPalette);
+// A key that changes with the selection and with what it resolves to.
 uint32_t WmGetTheme();
+// Clearwater selection word (brook_theme.h: theme, mode, hue) and the theme
+// in use (Glass, or its Opaque stand-in without backdrop blur).
+uint32_t WmGetThemeSelection();
+bool WmSetThemeSelection(uint32_t selection);
+uint32_t WmResolvedTheme();
+// One app content colour (BROOK_CONTENT_*) of the theme in use.
+uint32_t WmContentColour(unsigned index);
 uint32_t WmGetAppearance();
 bool WmSetAppearance(uint32_t value);
 uint32_t WmGetTaskbarMetrics();
 bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
+// Stage 1.5: the compositor reports the active backend's backdrop-blur
+// capability at each frame boundary; the theme resolves against it.
+void WmSetBackendBlur(bool blur);
+bool WmBackendBlur();
+uint32_t WmResolvedAppearance();
 void WmObserveDesktopTick(uint64_t now);
 // Latest taskbar sample (CPU, memory, disk and network rates), for diagnostics.
 struct DesktopTelemetry;
@@ -135,9 +152,9 @@ static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
 static constexpr int WM_BTN_RIGHT_PAD = 0;
 
 // Taskbar layout constants
-static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 44; // icon button width
-static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 32;
-static constexpr uint32_t WM_TASKBAR_PADDING    = 4;
+static constexpr uint32_t WM_TASKBAR_BTN_WIDTH  = 48; // icon button target width
+static constexpr uint32_t WM_TASKBAR_BTN_HEIGHT = 48; // targets are the taskbar's full height
+static constexpr uint32_t WM_TASKBAR_PADDING    = 0;  // targets abut; the pills are inset
 static constexpr uint32_t WM_TASKBAR_TEXT_PAD_X = 6;   // text offset within button
 
 enum class WindowState : uint8_t

@@ -651,7 +651,8 @@ static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static bool      g_gpuDrawReady   = false;   // GL DRAW pipeline available (set in CompositorInit)
 static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for all windows (0 = off)
 static uint32_t  g_gpuTestBlur    = 0;       // BROOK_GPU_BLUR: demo blur radius for all windows (0 = off)
-static uint32_t g_materialFrame = BROOK_APPEARANCE_DEFAULT;
+// Resolved at each frame boundary (WmResolvedAppearance); opaque until then.
+static uint32_t g_materialFrame = BROOK_APPEARANCE_DEFAULT | BROOK_APPEARANCE_PERFORMANCE;
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
 static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
@@ -910,10 +911,41 @@ uint32_t CompositorMaterialBlur(){return brook_appearance_blur_strength(__atomic
 uint32_t CompositorShellMaterialOpacity(){
     return (__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE)?255:g_overlayOpacity;
 }
+// Stage 1.5: the material is resolved before any backend sees it. The WM
+// resolves the theme against the active backend's backdrop-blur capability
+// (WmSetBackendBlur, below); the frame-boundary latch g_materialFrame holds
+// the result, with BROOK_APPEARANCE_PERFORMANCE set whenever the resolved
+// theme is opaque (an Opaque theme, or Glass's Opaque stand-in).
 bool CompositorGlassActive(){
-    const auto* gpu=GpuCompositorGet();
-    return !(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE) && CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
+    return !(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE);
 }
+// Renderer capabilities (layers op 18). Guarded by g_scanoutMappingLock, as
+// the present lease they apply to.
+static uint64_t g_rendererCapsOwner=0;
+static uint32_t g_rendererCaps=0;
+static bool g_backendBlurLatched=false;
+uint32_t CompositorSetRendererCapabilities(uint64_t owner,uint32_t caps){
+    if(!owner)return 0;
+    caps&=BROOK_DESKTOP_CAP_KNOWN;
+    {CompositorMutexGuard geometry(&g_scanoutMappingLock);g_rendererCapsOwner=caps?owner:0;g_rendererCaps=caps;}
+    CompositorWake();
+    return caps;
+}
+// Which compositor shows the desktop decides backdrop blur: a renderer
+// holding the present lease reports it (op 18); otherwise the kernel GPU
+// path (virgl) has it when its driver can blur; the CPU path never does.
+// Lease expiry, release, renderer exit and a GOP writer all change it.
+static bool CompositorBackendBlur(uint64_t now){
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        if(g_gopWriter)return false;
+        if(g_presentLease.Active(now))
+            return g_rendererCapsOwner==g_presentLease.owner && (g_rendererCaps&BROOK_DESKTOP_CAP_BACKDROP_BLUR);
+    }
+    const auto* gpu=GpuCompositorGet();
+    return CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
+}
+bool CompositorBackendBlurActive(){return __atomic_load_n(&g_backendBlurLatched,__ATOMIC_ACQUIRE);}
 
 void CompositorInit()
 {
@@ -1784,58 +1816,11 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
                               {ox, oy, ow, oh}, {cx, cy, cw, ch});
         return;
     }
-    auto setAlpha = [](int x, int y, int rw, int rh, uint32_t a,bool preserve=false) {
-        if (rw <= 0 || rh <= 0) return;
-        if (x < 0) { rw += x; x = 0; }
-        if (y < 0) { rh += y; y = 0; }
-        if (x + rw > (int)g_physFbWidth)  rw = (int)g_physFbWidth  - x;
-        if (y + rh > (int)g_physFbHeight) rh = (int)g_physFbHeight - y;
-        uint32_t aShift = a << 24;
-        for (int yy = y; yy < y + rh; ++yy)
-        {
-            uint32_t* row = g_chromeBuffer + (uint32_t)yy * g_backBufStride;
-            for (int xx = x; xx < x + rw; ++xx) if(!preserve || !(row[xx]>>24))row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
-        }
-    };
-    // Top strip = solid top border (WmMetric(WM_BORDER_WIDTH) rows) + glassy titlebar.
-    int topBorderH = (int)WmMetric(WM_BORDER_WIDTH);
-    int titleBarH  = (cy - oy) - topBorderH;          // == WmMetric(WM_TITLE_BAR_HEIGHT)
-    // Glass: keep painted alpha, give the rest of the titlebar the material
-    // alpha and the frame full alpha, then make title text and the accent
-    // stroke opaque again (they are painted without alpha).
-    setAlpha(ox, oy, ow, topBorderH, 0xFF,true);
-    setAlpha(ox, oy + topBorderH, ow, titleBarH, CompositorMaterialOpacity(),true); // titlebar (glass)
-    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF,true);
-    setAlpha(ox, cy, cx - ox, ch, 0xFF,true);
-    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF,true);
-    {
-        const uint32_t fg=w.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText;
-        const uint32_t accent=WmCurrentPalette().accent&0xffffff;
-        for(int y=oy+topBorderH;y<cy;++y)for(int x=ox;x<ox+ow;++x) {
-            if(x<0||y<0||x>=int(g_physFbWidth)||y>=int(g_physFbHeight))continue;
-            auto& pixel=g_chromeBuffer[uint64_t(y)*g_backBufStride+x];
-            const uint32_t rgb=pixel&0xffffff;
-            if(rgb==fg||rgb==accent)pixel|=0xff000000;
-        }
-    }
-    if(w.state!=WindowState::Maximized && !w.blurRadius) {
-        const auto& material=WmChromeMaterial();
-        if(ow>=int(material.top.radius*2)&&oh>=int(material.top.radius*2))
-        for(unsigned corner=0;corner<4;++corner){
-            // Client textures remain rectangular. Bottom masks stop within
-            // the owned border rather than pretending to clip client pixels.
-            const auto& mask=corner<2?material.top:material.bottom;
-            for(unsigned row=0;row<mask.radius;++row)for(unsigned col=0;col<mask.radius;++col){
-                const int y=corner<2?oy+int(row):oy+oh-1-int(row);
-                const int x=(corner&1)?ox+ow-1-int(col):ox+int(col);
-                if(x<0||y<0||x>=int(g_physFbWidth)||y>=int(g_physFbHeight))continue;
-                auto& pixel=g_chromeBuffer[uint64_t(y)*g_backBufStride+x];
-                const uint32_t rim=material.rims[w.focused][corner<2?(row<mask.radius/2?0:1):2];
-                pixel=ChromeMaskedRim(pixel,mask.coverage[row][col],mask.inner[row][col],rim);
-            }
-        }
-    }
-
+    const bool rounded=w.state!=WindowState::Maximized && !w.blurRadius;
+    ChromeMarkFrameGlass(g_chromeBuffer,g_backBufStride,g_physFbWidth,g_physFbHeight,{ox,oy,ow,oh},{cx,cy,cw,ch},
+                         WmMetric(WM_BORDER_WIDTH),CompositorMaterialOpacity(),
+                         w.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText,WmCurrentPalette().accent,
+                         rounded?&WmChromeMaterial():nullptr,w.focused);
 }
 
 // GPU DRAW overlay layer (taskbar + launcher): lazily allocate the full-screen
@@ -1951,8 +1936,13 @@ static void OverlayNoteSignature(const DesktopOverlaySurfaceSlot* slots,uint32_t
 // generation. Returns the rectangle count; keys[i] is rects[i]'s key.
 static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t height,uint64_t now,
                                      int32_t mouseX,int32_t mouseY,DesktopOverlayRect* rects,uint64_t* keys,
-                                     BrookDesktopOverlaySurfaces* records=nullptr)
+                                     BrookDesktopOverlaySurfaces* records=nullptr,uint32_t* opaqueMask=nullptr)
 {
+    if(opaqueMask)*opaqueMask=0;
+    // Glass resolves here only for a renderer that reported backdrop blur:
+    // material surfaces then keep their painted alpha and take the material
+    // alpha elsewhere, as virgl's overlay layer (OverlaySetAlphaRect).
+    const bool glass=CompositorGlassActive();
     if(records)*records={};
     // At most three shell surfaces, so the four-rectangle budget (plus the
     // optional cursor appended by CaptureDesktopOverlay) holds.
@@ -1971,10 +1961,14 @@ static uint32_t RenderDesktopOverlay(uint32_t* pixels,uint32_t width,uint32_t he
     };
     for(uint32_t i=0;i<count;++i){
         const auto& s=surfaces[i];
+        const bool translucent=glass && s.material;
         if(plan.draw>>i&1u){
-            WmRenderShellSurface(s,pixels,width,width,height,now,mouseX,mouseY);opaque(s.x,s.y,s.w,s.h);
+            WmRenderShellSurface(s,pixels,width,width,height,now,mouseX,mouseY);
+            if(translucent)ChromeFillAlpha(pixels,width,width,height,{s.x,s.y,s.w,s.h},CompositorMaterialOpacity());
+            else opaque(s.x,s.y,s.w,s.h);
             ++g_idleStats.overlaySurfaceDraws;
         }else ++g_idleStats.overlaySurfaceKeeps;
+        if(opaqueMask && !translucent)*opaqueMask|=1u<<i;
         rects[i]={s.x,s.y,s.w,s.h};keys[i]=slots[i].key;
         if(records && i<BROOK_DESKTOP_OVERLAY_MAX_SURFACES)records->surfaces[records->count++]=WmShellSurfaceRecord(s,slots[i].key);
     }
@@ -2007,7 +2001,7 @@ static void CheckDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY)
     if(g_overlayChecked && !inputChanged && mouseX==g_overlayCheckX && mouseY==g_overlayCheckY &&
        now>=g_overlayCheckTick && now-g_overlayCheckTick<OVERLAY_RECHECK_MS)return;
     const uint32_t width=g_physFbWidth,height=g_physFbHeight;
-    if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
+    if(!g_physFb || !width || !height || width>4096 || height>2160)return;
     WmShellSurface surfaces[WM_SHELL_SURFACE_LIMIT];
     DesktopOverlaySurfaceSlot slots[DESKTOP_OVERLAY_SURFACE_LIMIT]{};
     const uint32_t count=OverlaySurfaceSlots(width,height,now,mouseX,mouseY,surfaces,slots);
@@ -2067,14 +2061,14 @@ static void CaptureDesktopOverlay(uint64_t now,int32_t mouseX,int32_t mouseY,boo
     [&]{
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     const uint32_t width=g_physFbWidth,height=g_physFbHeight;
-    if(!g_physFb || !width || !height || width>4096 || height>2160 || CompositorGlassActive())return;
+    if(!g_physFb || !width || !height || width>4096 || height>2160)return;
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
     DesktopOverlayRect rects[4]{};uint64_t keys[4]{};
-    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects,keys,&g_debugOverlaySurfaces);
-    // RenderDesktopOverlay sets alpha 255 across every surface rectangle it
-    // returns (the overlay is never captured under glass), so each is opaque;
-    // a composited pointer rectangle appended below is not.
-    const uint32_t opaqueRects=(1u<<rectCount)-1u;
+    // RenderDesktopOverlay sets alpha 255 across every opaque surface
+    // rectangle it returns; glass surfaces (only for a renderer that can
+    // blur) and a composited pointer rectangle appended below are not.
+    uint32_t opaqueRects=0;
+    uint32_t rectCount=RenderDesktopOverlay(pixels,width,height,now,mouseX,mouseY,rects,keys,&g_debugOverlaySurfaces,&opaqueRects);
     g_overlayChecked=true;g_overlayCheckTick=now;g_overlayCheckInput=InputLatestSequence();
     g_overlayCheckX=mouseX;g_overlayCheckY=mouseY;
     if(cursorVisible && g_debugFrameOverlayCursor){
@@ -4051,8 +4045,15 @@ static void CompositorLoop()
     CompositorExpirePresentLease();
     ++g_idleStats.loops;
     g_backBufferOverlayOmitted=false;
-    // Apply material changes at a frame boundary so chrome and GPU backdrops agree.
-    const auto material=WmGetAppearance();
+    // Apply material changes at a frame boundary so chrome and GPU backdrops
+    // agree. The theme is re-resolved first if the backend's backdrop-blur
+    // capability changed (renderer start or exit, lease loss, GPU fault).
+    {
+        const bool blur=CompositorBackendBlur(ApicTickCount());
+        __atomic_store_n(&g_backendBlurLatched,blur,__ATOMIC_RELEASE);
+        WmSetBackendBlur(blur);
+    }
+    const auto material=WmResolvedAppearance();
     if(material!=__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)){
         __atomic_store_n(&g_materialFrame,material,__ATOMIC_RELEASE);CompositorMarkDirty();
     }
@@ -4663,7 +4664,8 @@ void CompositorReleasePresentLease(uint64_t owner)
     bool released;
     {CompositorMutexGuard geometry(&g_scanoutMappingLock);
      if(owner && g_gopWriterOwner==owner)g_gopWriterRevoked=true;
-     released=g_presentLease.Release(owner);}
+     released=g_presentLease.Release(owner);
+     if(owner && g_rendererCapsOwner==owner){g_rendererCapsOwner=0;g_rendererCaps=0;}}
     if(released){CompositorMarkDirty();CompositorWake();}
 }
 

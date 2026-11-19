@@ -14,9 +14,13 @@
 namespace brook {
 
 // Logical sizes at 100% (window.h's WM_TASKBAR_* and the launcher's
-// LAUNCHER_* are these values).
+// LAUNCHER_* are these values). Taskbar targets (stage 2.1, DESIGN.md
+// "Sizes"): the full 48 px height and abutting, the launcher button 56 wide,
+// window buttons 48; each draws a visual pill inset 5 top and bottom and 2
+// each side (38 high), so a click anywhere in the column hits it.
 struct ChromeShellMetrics {
-    static constexpr uint32_t TaskbarButtonWidth = 44, TaskbarButtonHeight = 32, TaskbarPadding = 4;
+    static constexpr uint32_t TaskbarButtonWidth = 48, TaskbarButtonHeight = 48, TaskbarPadding = 0;
+    static constexpr uint32_t TaskbarLauncherWidth = 56, TaskbarPillInsetX = 2, TaskbarPillInsetY = 5;
     static constexpr uint32_t LauncherIconSize = 24, LauncherIconMargin = 8, LauncherItemHeight = 40;
     static constexpr uint32_t LauncherItemWidth = 230, LauncherPadding = 6, LauncherMaxRows = 14, LauncherMaxCols = 3;
 };

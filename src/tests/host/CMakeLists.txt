@@ -744,6 +744,7 @@ target_compile_options(test_wayland_provider PRIVATE "-iquote${BROOK_ROOT}/src/k
 
 add_host_test(test_taskbar_volume)
 add_host_test(test_chrome_alpha)
+add_host_test(test_brook_theme)
 add_host_test(test_chrome_layout)
 target_compile_options(test_chrome_layout PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_chrome_surface)

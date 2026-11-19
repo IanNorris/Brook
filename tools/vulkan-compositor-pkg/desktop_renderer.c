@@ -151,6 +151,14 @@ static int g_chromeKeep=1;
  * frame spans that occlude. BROOK_RENDER_CHROME_SPANS=0 draws whole chrome
  * layers; BROOK_RENDER_SURFACES=0 ignores records (no shadows, no opaque). */
 static int g_surfaceRecords=1,g_chromeSpans=1,g_chromeSpanCapture=1;
+/* Stage 1.5: renderer capabilities, reported with layers op 18 after attach.
+ * The kernel resolves the Glass theme only while a lease holder reports
+ * BROOK_DESKTOP_CAP_BACKDROP_BLUR; otherwise every surface record is opaque
+ * (Glass's Opaque stand-in). This renderer has no blur pass yet, so it
+ * reports none. The blur pass (refactor stage 2.4) adds the bit in
+ * renderer_capabilities() once it can blur beneath MATERIAL_GLASS records. */
+static uint32_t g_rendererCapsAccepted;
+static uint32_t renderer_capabilities(void){return 0u;}
 static struct DesktopSurfaceSet g_frameSurfaces;
 /* In-place spans make several layers sample one chrome buffer, which only
  * the quad pass accepts (the compute and graphics paths reject aliased
@@ -2257,6 +2265,12 @@ int main(int argc,char **argv){
     {const char *keep=getenv("BROOK_RENDER_CHROME_KEEP");g_chromeKeep=!(keep && keep[0]=='0');}
     {const char *spans=getenv("BROOK_RENDER_CHROME_SPANS");g_chromeSpans=!(spans && spans[0]=='0');}
     {const char *records=getenv("BROOK_RENDER_SURFACES");g_surfaceRecords=!(records && records[0]=='0');}
+    {const uint32_t requested=renderer_capabilities();
+     const long accepted=syscall(BROOK_SYS_DESKTOP_LAYERS,BROOK_DESKTOP_RENDERER_CAPS,0,0,BROOK_DESKTOP_CAPS_VERSION,requested,0);
+     const int older=accepted<0 && errno==EINVAL;
+     g_rendererCapsAccepted=accepted>0?(uint32_t)accepted&requested:0u;
+     fprintf(stderr,"DESKTOP_RENDERER_CAPS requested=%#x accepted=%#x%s\n",requested,g_rendererCapsAccepted,
+             older?" kernel_without_caps":"");}
     {const char *keep=getenv("BROOK_RENDER_CLIENT_KEEP");g_clientKeep=!(keep && keep[0]=='0');}
     g_trackDamage=!getenv("BROOK_RENDER_FOOTPRINT_DAMAGE");
     const char *idlePoll=getenv("BROOK_RENDER_IDLE_POLL_MS");

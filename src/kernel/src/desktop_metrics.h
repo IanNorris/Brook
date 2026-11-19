@@ -12,11 +12,13 @@ struct DesktopMetrics {
                        : -static_cast<int>((-static_cast<int64_t>(base)*percent+50)/100);
     }
     // The one source of the frame and taskbar metrics, in logical pixels at
-    // 100%. window.h's WM_* constants are defined from these.
+    // 100%. window.h's WM_* constants are defined from these. Clearwater
+    // (DESIGN.md "Sizes", refactor stage 2.1): title bar 40 with 48x40
+    // caption targets, taskbar 48 with full-height targets.
     static constexpr int BorderBase = 2;
-    static constexpr int TitleBase = 36;
-    static constexpr int CaptionButtonBase = 46;
-    static constexpr int TaskbarBase = 44;
+    static constexpr int TitleBase = 40;
+    static constexpr int CaptionButtonBase = 48;
+    static constexpr int TaskbarBase = 48;
     static constexpr int IconBase = 24;
     static constexpr int FontBase = 16;
     constexpr int border() const { return pixels(BorderBase); }

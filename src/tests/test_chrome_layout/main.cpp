@@ -62,7 +62,7 @@ void Run(const char* scene, const DesktopMetrics& m, const ChromeLayout& l, cons
 struct Spec {
     int border, title, button, margin, corner, band, square;
     explicit Spec(const DesktopMetrics& m)
-        : border(m.pixels(2)), title(m.pixels(36)), button(m.pixels(46)), margin(m.pixels(6)),
+        : border(m.pixels(2)), title(m.pixels(40)), button(m.pixels(48)), margin(m.pixels(6)),
           corner(m.pixels(16)), band(m.pixels(2)), square(m.pixels(8)) {}
 };
 
