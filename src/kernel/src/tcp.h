@@ -12,13 +12,12 @@
 
 namespace brook {
 
-// Passive opens advertise MSS but do not negotiate window scaling until they
-// can parse the peer's scaling offer.
+// SYN-ACK echoes the scaling option only when the peer offered it.
 inline uint32_t TcpWriteSynOptions(uint8_t flags, uint8_t windowScale, uint8_t* out)
 {
     if (!(flags & TCP_SYN)) return 0;
     out[0] = 2; out[1] = 4; out[2] = 1460 >> 8; out[3] = 1460 & 0xff;
-    if (flags & TCP_ACK) return 4;
+    if ((flags & TCP_ACK) && !windowScale) return 4;
     out[4] = 1; out[5] = 3; out[6] = 3; out[7] = windowScale;
     return 8;
 }
@@ -53,8 +52,8 @@ inline uint16_t TcpAdvertisedWindow(uint32_t freeBytes, uint8_t scale, uint8_t f
     return static_cast<uint16_t>(window > 65535u ? 65535u : window);
 }
 
-// Call only for an accepted active-open SYN-ACK while holding the socket lock.
-inline void TcpAcceptActiveSynOptions(Socket& socket, const uint8_t* options, uint32_t length)
+// Call for an accepted handshake SYN or SYN-ACK under the socket lock.
+inline void TcpAcceptSynOptions(Socket& socket, const uint8_t* options, uint32_t length)
 {
     socket.tcpPeerMss = TcpPeerMss(options, length);
     socket.tcpSndWndScale = 0;

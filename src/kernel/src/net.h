@@ -327,25 +327,30 @@ struct Socket {
     bool      bound;
     bool      connected;
     bool      nonblock;    // SOCK_NONBLOCK — connect returns EINPROGRESS, recv returns EAGAIN
-    // Receive buffer (ring buffer for incoming data).
-    // 512 KB gives enough headroom for multi-MB NAR downloads: curl does TLS
-    // crypto + pipes to xz while the server sends at line rate, so the kernel
-    // buffer needs to absorb a burst without triggering zero-window flow-control
-    // on every other segment (which would require many round-trips and risks
-    // the server's RTO firing and RST'ing the connection).
-    static constexpr uint32_t RX_BUF_SIZE = 524288; // 512 KB
+    // Power-of-two backing storage, with an independently configurable limit.
+    static constexpr uint32_t RX_DEFAULT = 128 * 1024;
+    static constexpr uint32_t RX_MIN = 2304;
+    static constexpr uint32_t RX_MAX = 8 * 1024 * 1024;
+    static constexpr uint8_t RX_WINDOW_SCALE = 7;
     uint8_t*  rxBuf;
+    uint32_t  rxCapacity;
+    uint32_t  rxLimit;
     uint32_t  rxHead;
     uint32_t  rxTail;
     uint32_t  rxCount;     // bytes available
+    bool      rxUserLimit;
 
-    // One bit per byte of the TCP receive ring marks future data. Each
-    // ring position is fixed relative to rxHead/RCV.NXT while the gap is
-    // outstanding. Readable bytes have no bits set and remain FIFO.
-    static constexpr uint32_t TCP_OOO_WORDS = RX_BUF_SIZE / 64;
+    // A byte per eight ring positions marks future TCP data relative to RCV.NXT.
     uint64_t*  tcpOooMap;
     uint64_t   tcpOooSince;
     uint32_t   tcpOooBytes; // future bytes held, not yet visible to recv()
+    uint32_t   tcpRxRightEdge;
+    uint16_t   tcpRxSynGrant;
+    bool       tcpRxRightEdgeValid;
+    uint64_t   tcpRxSynTick;
+    uint32_t   tcpRxRtt;
+    uint64_t   tcpRxDrainStart;
+    uint32_t   tcpRxDrained;
 
     // For recvfrom: store source address of last received packet
     uint32_t  lastSrcIp;
@@ -430,6 +435,8 @@ int  SockSendUserVector(int sockIdx, const TcpSendVector* vectors, unsigned coun
 // only after return.
 int  SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait = false);
 bool SockIsStream(int sockIdx);  // returns true for SOCK_STREAM (TCP)
+int  SockSetReceiveBuffer(int sockIdx, int32_t requested);
+int  SockGetReceiveBuffer(int sockIdx);
 int  SockGetType(int sockIdx);  // returns SOCK_STREAM(1) or SOCK_DGRAM(2)
 int  SockGetProtocol(int sockIdx); // immutable creation protocol, or -1 for invalid slot
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);

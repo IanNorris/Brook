@@ -1813,7 +1813,7 @@ int main() {
     // Draining a nearly full receive buffer must succeed even when its window
     // update is rejected; maintenance retries the current window afterward.
     i=create();setupTcp(i);ticks=400;rejectPureAcks=1;acceptedPureAcks=0;
-    g_sockets[i].rxCount=Socket::RX_BUF_SIZE-100;g_sockets[i].rxTail=0;
+    g_sockets[i].rxCount=Socket::RX_DEFAULT-100;g_sockets[i].rxTail=0;
     uint8_t received[2048]{};assert(SockRecv(i,received,sizeof(received),true)==sizeof(received));
     assert(g_sockets[i].tcpUnackedSegs==1 && acceptedPureAcks==0);
     const auto reopened=TcpAdvertisedWindow(TcpReceiveFree(g_sockets[i]),g_sockets[i].tcpRcvWndScale,0);
@@ -1822,7 +1822,7 @@ int main() {
     // The unlocked window-update tail pins its incarnation while close is
     // pending; no receive storage is reclaimed before that tail returns.
     i=create();setupTcp(i);ticks=500;rejectPureAcks=1;pauseOnlyPureAck=true;pauseTransmit=true;transmitting=false;releaseTransmit=false;
-    g_sockets[i].rxCount=Socket::RX_BUF_SIZE-100;g_sockets[i].rxTail=0;
+    g_sockets[i].rxCount=Socket::RX_DEFAULT-100;g_sockets[i].rxTail=0;
     before=frees;std::thread reader([&]{uint8_t bytes[2048];assert(SockRecv(i,bytes,sizeof(bytes),true)==sizeof(bytes));});
     await([]{return transmitting.load();});closed=false;
     std::thread closeDuringWindow([&]{SockClose(i);closed=true;});
@@ -1882,7 +1882,7 @@ int main() {
     SockClose(i);
     // A zero receive window permits an empty ACK at RCV.NXT, but not a
     // payload-bearing update, even when the ACK number itself is valid.
-    i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_BUF_SIZE;
+    i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_DEFAULT;
     deliverControl(i,20,10,TCP_ACK,200);assert(g_sockets[i].tcpSndWnd==200);
     auto clippedBefore=__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED);
     {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
@@ -1922,8 +1922,8 @@ int main() {
         const uint8_t byte=42;
         for(unsigned n=0;n<flights;++n)assert(TcpStoreOoo(socket,21+2*n,&byte,1,100));
         assert(socket.tcpOooBytes==flights);
-        assert(TcpReceiveFree(socket)==Socket::RX_BUF_SIZE);
-        assert(!TcpStoreOoo(socket,20+Socket::RX_BUF_SIZE,&byte,1,100));
+        assert(TcpReceiveFree(socket)==Socket::RX_DEFAULT);
+        assert(!TcpStoreOoo(socket,20+Socket::RX_DEFAULT,&byte,1,100));
         TcpReapOoo(socket,30100);
         assert(socket.tcpOooBytes==0);
     }
@@ -1935,25 +1935,25 @@ int main() {
         auto& socket=g_sockets[i];
         constexpr uint32_t sequence=0xffffffe0u;
         socket.tcpRcvNxt=sequence;
-        socket.rxHead=socket.rxTail=Socket::RX_BUF_SIZE-31;
+        socket.rxHead=socket.rxTail=Socket::RX_DEFAULT-31;
         Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
         struct {TcpHeader tcp;uint8_t bytes[1460];} packet{};
         packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
         packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
         packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
-        for(uint32_t end=Socket::RX_BUF_SIZE;end>1;){
+        for(uint32_t end=Socket::RX_DEFAULT;end>1;){
             const uint32_t start=end>sizeof(packet.bytes)+1 ? end-sizeof(packet.bytes) : 1;
             packet.tcp.seqNum=htonl(sequence+start);
             for(uint32_t n=start;n<end;++n)packet.bytes[n-start]=static_cast<uint8_t>(n);
             HandleTcp(&ip,&packet,sizeof(TcpHeader)+end-start);
             end=start;
         }
-        assert(socket.tcpOooBytes==Socket::RX_BUF_SIZE-1 && socket.rxCount==0);
+        assert(socket.tcpOooBytes==Socket::RX_DEFAULT-1 && socket.rxCount==0);
         packet.tcp.seqNum=htonl(sequence);packet.bytes[0]=0;
         HandleTcp(&ip,&packet,sizeof(TcpHeader)+1);
-        assert(socket.tcpOooBytes==0 && socket.tcpRcvNxt==sequence+Socket::RX_BUF_SIZE);
+        assert(socket.tcpOooBytes==0 && socket.tcpRcvNxt==sequence+Socket::RX_DEFAULT);
         uint8_t data[4096];
-        for(uint32_t base=0;base<Socket::RX_BUF_SIZE;base+=sizeof(data)){
+        for(uint32_t base=0;base<Socket::RX_DEFAULT;base+=sizeof(data)){
             assert(SockRecv(i,data,sizeof(data),true)==sizeof(data));
             for(uint32_t n=0;n<sizeof(data);++n)assert(data[n]==static_cast<uint8_t>(base+n));
         }
@@ -1997,14 +1997,14 @@ int main() {
     {uint8_t data[5]{};assert(SockRecv(i,data,sizeof(data),true)==5);for(unsigned n=0;n<5;++n)assert(data[n]==n);}
     assert(g_sockets[i].tcpOooBytes==0);SockClose(i);
     // Retained data shares the RX budget, leaving room for a missing prefix.
-    i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_BUF_SIZE-4;
+    i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_DEFAULT-4;
     {Ipv4Header ip{};ip.srcIp=2;ip.dstIp=1;
      struct {TcpHeader tcp;uint8_t bytes[2];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
      packet.tcp.seqNum=htonl(22);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);
      assert(g_sockets[i].tcpOooBytes==2 && TcpReceiveFree(g_sockets[i])==4);
      packet.tcp.seqNum=htonl(20);HandleTcp(&ip,&packet,sizeof(TcpHeader)+2);}
-    assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].rxCount==Socket::RX_BUF_SIZE && g_sockets[i].tcpRcvNxt==24);
+    assert(g_sockets[i].tcpOooBytes==0 && g_sockets[i].rxCount==Socket::RX_DEFAULT && g_sockets[i].tcpRcvNxt==24);
     SockClose(i);
     // Neighbor resolution from receive processing (Dell 2026-11-16). The
     // bridge host's replies arrived, but the SYN-ACK was resolved by net_poll,
@@ -2096,15 +2096,91 @@ int main() {
         currentProcess=previous;g_netPollThread=nullptr;g_arpTable.Flush();
         g_netIfs[0]=nullptr;g_netIfCount=0;g_netIf=nullptr;
     }
+    // A fast stream doubles its backing ring on application drain. Preserve
+    // wrapped future bytes and their bitmap while the reader makes room.
+    i=create();setupTcp(i);
+    {
+        auto& s=g_sockets[i];
+        s.tcpRcvWndScale=Socket::RX_WINDOW_SCALE;
+        s.tcpRxRtt=100;
+        constexpr uint32_t drain=Socket::RX_DEFAULT*3/4;
+        s.rxHead=s.rxTail=s.rxCapacity-drain-2;
+        auto* data=static_cast<uint8_t*>(std::malloc(drain));
+        auto* read=static_cast<uint8_t*>(std::malloc(drain));
+        assert(data && read);
+        for (uint32_t n=0;n<drain;++n)data[n]=static_cast<uint8_t>(n);
+        TcpEnqueueData(s,data,drain);
+        const uint8_t future[]={4,5,6,7};
+        assert(TcpStoreOoo(s,s.tcpRcvNxt+1,future,sizeof(future),100));
+        assert(SockRecv(i,read,drain,true)==int(drain) && !memcmp(data,read,drain));
+        assert(s.rxCapacity==2*Socket::RX_DEFAULT && SockGetReceiveBuffer(i)==int(s.rxCapacity));
+        assert(s.tcpOooBytes==sizeof(future));
+        const uint8_t missing=3;
+        TcpEnqueueData(s,&missing,1);
+        ++s.tcpRcvNxt;
+        assert(TcpDrainOoo(s) && SockRecv(i,read,5,true)==5);
+        assert(read[0]==missing && !memcmp(read+1,future,sizeof(future)));
+        const auto snap=CaptureTcpTxLocked(s);
+        assert((uint32_t(snap.window)<<snap.windowScale)==s.rxLimit && snap.synWindow==65535);
+        assert(SockSetReceiveBuffer(i,4096)==0 && SockGetReceiveBuffer(i)==8192);
+        assert(TcpReceiveFree(s)==2*Socket::RX_DEFAULT); // bytes already promised
+        s.tcpRcvNxt=s.tcpRxRightEdge;
+        assert(TcpReceiveFree(s)==8192);
+        assert(!TcpReceiveGrowthLocked(s,8192,101)); // manual option locks autotuning
+        std::free(read);std::free(data);
+    }
+    SockClose(i);
+    i=create();setupTcp(i);
+    {
+        auto& s=g_sockets[i];
+        s.tcpRcvWndScale=Socket::RX_WINDOW_SCALE;s.tcpRxRtt=100;
+        assert(!TcpReceiveGrowthLocked(s,Socket::RX_DEFAULT/2,10));
+        assert(!TcpReceiveGrowthLocked(s,Socket::RX_DEFAULT/2,211)); // slow drain
+        failAllocation=1;
+        const auto charged=g_socketRxBytes;
+        assert(SockSetReceiveBuffer(i,Socket::RX_MAX)==-105);
+        failAllocation=-1;
+        assert(g_socketRxBytes==charged && s.rxLimit==Socket::RX_DEFAULT && !s.rxUserLimit);
+        g_socketRxBytes=SocketRxBudget;
+        assert(SockSetReceiveBuffer(i,Socket::RX_MAX)==-105);
+        g_socketRxBytes=charged;
+        assert(SockSetReceiveBuffer(i,-1)==0 && SockGetReceiveBuffer(i)==int(Socket::RX_MAX));
+        assert(SockSetReceiveBuffer(i,0)==0 && SockGetReceiveBuffer(i)==int(Socket::RX_MIN));
+    }
+    SockClose(i);
+    {
+        const int u=create(SOCK_DGRAM);
+        auto& s=g_sockets[u];
+        s.bound=true;s.localPort=htons(5353);s.rxTail=s.rxHead=s.rxCapacity-5;
+        uint8_t bytes[512]{};
+        auto send=[&](uint32_t n) {
+            bytes[0]=static_cast<uint8_t>(n);
+            SockDeliverUdp(2,53,1,5353,bytes,sizeof(bytes));
+        };
+        const auto drops=g_netCounters.udpRxFull;
+        for (uint32_t n=0;n<100;++n)send(n);
+        assert(SockSetReceiveBuffer(u,300001)==0 && SockGetReceiveBuffer(u)==600002);
+        for (uint32_t n=100;n<1000;++n)send(n);
+        assert(g_netCounters.udpRxFull==drops);
+        assert(SockSetReceiveBuffer(u,4096)==0);
+        send(1000);
+        assert(g_netCounters.udpRxFull==drops+1);
+        for (uint32_t n=0;n<1000;++n) {
+            assert(SockRecvFrom(u,bytes,sizeof(bytes),nullptr)==int(sizeof(bytes)));
+            assert(bytes[0]==static_cast<uint8_t>(n));
+        }
+        assert(SockRecvFrom(u,bytes,sizeof(bytes),nullptr)==-11);
+        SockClose(u);
+    }
     // An application that stops reading costs one counter per datagram, and
     // stale half-open children cannot lock the debug listener (backlog 2).
     {
         int u=create(SOCK_DGRAM);g_sockets[u].bound=true;g_sockets[u].localPort=htons(5353);
         static uint8_t dns[512];const auto fullBefore=g_netCounters.udpRxFull;
         for(unsigned n=0;n<2000;++n)SockDeliverUdp(2,53,1,5353,dns,sizeof(dns));
-        assert(g_netCounters.udpRxFull-fullBefore==2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)));
+        assert(g_netCounters.udpRxFull-fullBefore==2000-Socket::RX_DEFAULT/(10+sizeof(dns)));
         // Drain: every queued datagram comes back whole, then EAGAIN.
-        {const unsigned queued=Socket::RX_BUF_SIZE/(10+sizeof(dns));uint8_t out[600];SockAddrIn from{};
+        {const unsigned queued=Socket::RX_DEFAULT/(10+sizeof(dns));uint8_t out[600];SockAddrIn from{};
          for(unsigned n=0;n<queued;++n)assert(SockRecvFrom(u,out,sizeof(out),&from)==int(sizeof(dns)) && from.sin_port==htons(53));
          assert(SockRecvFrom(u,out,sizeof(out),&from)==-11 && g_sockets[u].rxCount==0);}
         // Gen 441: delivery appends under s.lock while a reader dequeues. A
@@ -2119,10 +2195,10 @@ int main() {
              for(int i=1;i<r;++i)assert(out[i]==uint8_t(out[0]+i)); // payload intact and framed
              ++got;}
          producer.join();
-         assert(g_netCounters.udpRxCorrupt==corruptBefore && got==sent.load()-(g_netCounters.udpRxFull-fullBefore-(2000-Socket::RX_BUF_SIZE/(10+sizeof(dns)))));}
+         assert(g_netCounters.udpRxCorrupt==corruptBefore && got==sent.load()-(g_netCounters.udpRxFull-fullBefore-(2000-Socket::RX_DEFAULT/(10+sizeof(dns)))));}
         // An inconsistent length resets the ring instead of spinning.
         {uint8_t one=7;SockDeliverUdp(2,53,1,5353,&one,1);auto& q=g_sockets[u];
-         q.rxBuf[q.rxTail]=0xff;q.rxBuf[(q.rxTail+1)%Socket::RX_BUF_SIZE]=0xff; // length 0xffff+ > rxCount
+         q.rxBuf[q.rxTail]=0xff;q.rxBuf[(q.rxTail+1)%Socket::RX_DEFAULT]=0xff; // length 0xffff+ > rxCount
          const auto corrupt=g_netCounters.udpRxCorrupt;uint8_t out[16];
          assert(SockRecvFrom(u,out,sizeof(out),nullptr)==-11 && q.rxCount==0 && g_netCounters.udpRxCorrupt==corrupt+1);}
         int l=create();g_sockets[l].listening=true;g_sockets[l].listenBacklog=2;
@@ -2139,6 +2215,6 @@ int main() {
         assert(g_sockets[g_sockets[l].acceptQueue[1]].remotePort==htons(40002));
         SockClose(l);SockClose(u);
     }
-    assert(allocations == frees);
+    assert(allocations == frees && g_socketRxBytes == 0);
     std::puts("socket lifetime: PASS");
 }
