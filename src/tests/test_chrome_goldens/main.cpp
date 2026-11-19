@@ -244,6 +244,26 @@ void Shell(const std::string& prefix, uint32_t theme, const DesktopMetrics& m) {
         ChromeBuildTaskbar(tb, s, list);
         Check(prefix + (hover ? "taskbar-hover" : "taskbar"), list, s, 0, layout.y, screenW, screenH - layout.y);
     }
+    // The Dell's logical width (3200 at 200%): every diagnostic on, and the
+    // default set (CPU, MEM, temperature), with a dirty build label.
+    for (const bool all : {true, false}) {
+        const uint32_t wideW = 1600 * m.percent / 100;
+        const uint32_t set = all ? 127u : (1u << 0 | 1u << 1 | 1u << 6);
+        const ChromeTaskbarLayout wide = ChromeTaskbarLayoutFor(s, wideW, screenH, "14:05 19 Nov 2026", false, set, ids, 3, 0,
+                                                                "Brook 6c18bafd+2971b71e", false, labels);
+        ChromeTaskbarModel wm = tb;
+        wm.layout = &wide;
+        wm.agentShown = false;
+        wm.mouseX = wm.mouseY = -1;
+        wm.launcherOpen = false;
+        wm.telemetry.app = &compositorCadence;
+        wm.telemetry.stats.downBytesPerSecond = 2400000;
+        wm.telemetry.stats.upBytesPerSecond = 150000;
+        wm.telemetry.thermal = true; wm.telemetry.tjmax = 100; wm.telemetry.latest.pkgC = 57;
+        ChromeDisplayList list = ChromeListOn(storage);
+        ChromeBuildTaskbar(wm, s, list);
+        Check(prefix + (all ? "taskbar-diagnostics" : "taskbar-default"), list, s, 0, wide.y, wideW, screenH - wide.y);
+    }
     // The compact HUD and the temperature target, without the diagnostics.
     {
         const ChromeTaskbarLayout hudLayout = ChromeTaskbarLayoutFor(s, screenW, screenH, "09:41 15 Nov 2026", false, 1u << 6,
