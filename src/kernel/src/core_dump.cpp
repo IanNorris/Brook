@@ -8,6 +8,7 @@
 #include "scheduler.h"
 #include "signal_context.h"
 #include "vfs.h"
+#include "vfs_path.h"
 
 extern "C" void* memcpy(void*,const void*,unsigned long);
 
@@ -199,15 +200,20 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
         finalBytes+=programs.ptr[i].fileSize;
     }
 
+    struct RootPin {VfsPath path{};~RootPin(){VfsPathRelease(path);} } root;
+    result.stage="root";
+    if(int error=VfsPathRoot(&root.path))return error;
     constexpr char transferRoot[]="/data/.brook-transfer";
     uint32_t match=0;
     while(transferRoot[match] && path[match]==transferRoot[match])++match;
     if(!transferRoot[match] && path[match]=='/'){
-        const int directory=VfsMkdir(transferRoot,0700);
+        result.stage="transfer-directory";
+        const int directory=VfsMkdirAt(root.path,root.path,transferRoot,0700,0);
         if(directory && directory!=-17)return directory;
     }
     int openError=0;
-    auto* node=VfsOpenModeChecked(path,VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL,0600,&openError);
+    result.stage="open";
+    auto* node=VfsOpenAt(root.path,root.path,path,VFS_O_WRITE|VFS_O_CREATE|VFS_O_EXCL,0600,0,&openError);
     if(!node)return openError?openError:-5;
     Writer out{node};
     const auto emit=[&]{
@@ -244,8 +250,13 @@ int CoreDumpProcess(uint16_t pid,const char* path,bool full,CoreDumpResult& resu
         }
         return true;
     };
-    int status=emit()?VfsTruncate(node,finalBytes):out.error;
-    if(!status)status=VfsSync(node);
+    result.stage="write";
+    int status=out.error;
+    if(emit()){
+        result.stage="size";
+        status=VfsTruncate(node,finalBytes);
+    }else status=out.error;
+    if(!status){result.stage="sync";status=VfsSync(node);}
     VfsClose(node);
     if(status)return status; // an exclusive output may be incomplete on I/O failure
     result.bytes=finalBytes;

@@ -5711,6 +5711,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply reply;
         if(result){
             reply.text("{\"error\":\"core dump failed\",");reply.field("errno",uint64_t(-result));
+            reply.text(",\"stage\":");reply.quoted(dump.stage);
         }else{
             reply.text("{");reply.field("threads",dump.threads);
             reply.text(",");reply.field("missing_registers",dump.missingRegisters);
