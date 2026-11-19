@@ -4,6 +4,19 @@ Current state and immediate goal. Keep this short and current: replace stale lin
 
 _Last updated: 15 November 2026 (evening), by a Claude Code session (Ian review follow-up)._
 
+
+## Wayland latency diagnostics (19 November 2026)
+
+- `work/wayland-latency` at `ee769aec` adds per-connection and per-toplevel
+  callback timings, client turnaround and input delivery to the existing
+  waylandd status JSON. Touch `/tmp/brook-waylandd-stats-reset` as the server
+  user to start a new `stats_epoch`. WM_POP_INPUT supplies no timestamp.
+- The pair is `/data/Programming/Brook/wayland-latency/build/dell/pair-wlstats`
+  (`dell-wlstats-20261119`). Guarded QEMU passed on attempt 1. The Dell has
+  yet to run this diagnostic. Release and all non-stress host tests passed
+  after two parallel timeouts passed on an isolated rerun.
+- Host status publication and reset evidence is in `build/wlstats-evidence`.
+
 ## Workspace
 
 - **Root:** `/data/Programming/Brook/`. `main/` is a fresh GitHub clone kept on `main`. Each agent or task gets its own worktree, `git worktree add ../<task> -b <branch>`, with its own `build/`. Never share a build directory or drive the Dell from two agents at once.
