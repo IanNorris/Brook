@@ -2161,9 +2161,15 @@ static void CompositorLoopWM()
     // not scanned out, so the periodic forced CPU repaint and CPU-path overlay
     // drawing are skipped. Expiry or release forces a full repaint first.
     bool rendererLeased=false;
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+    uint64_t cursorLeaseOwner=0;
+#endif
     if(!CompositorGpuActive()){
         CompositorMutexGuard lease(&g_scanoutMappingLock);
         rendererLeased=g_presentLease.Active(now) || g_gopWriter;
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+        if(g_presentLease.Active(now) && !g_gopWriter)cursorLeaseOwner=g_presentLease.owner;
+#endif
     }
     if(rendererLeased)++g_idleStats.leaseActiveLoops;
     g_backBufferOverlayOmitted=rendererLeased;
@@ -2475,6 +2481,11 @@ static void CompositorLoopWM()
     const bool overlayCursor=MouseIsAvailable() && !WmPointerCaptureActive() &&
         __atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)!=0;
     PublishOverlayCursor(now,overlayCursor);
+#if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
+    BdwCursorUpdate(cursorLeaseOwner,overlayCursor,chromeMx-g_cursorFrame.hotX,
+        chromeMy-g_cursorFrame.hotY,g_cursorFrame.pixels,g_cursorFrame.width,
+        g_cursorFrame.height,g_overlayCursorSerial);
+#endif
     CaptureDesktopOverlay(now,chromeMx,chromeMy,overlayCursor);
     CheckDesktopOverlay(now,chromeMx,chromeMy);
 }

@@ -6,6 +6,25 @@
 #include "intel_bdw_zero_copy.h"
 
 namespace brook {
+struct BdwCursorStatus {
+    bool requested=false, bound=false, active=false;
+    uint64_t images=0, positions=0, fallbacks=0;
+};
+bool BdwCursorRequest(bool enable);
+BdwCursorStatus BdwCursorReadStatus();
+bool BdwCursorRendererQuery(uint64_t owner);
+// Published only after both boot-lifetime cursor buffers are bound. The
+// display safety check reads these without taking the scanout lock.
+inline uint32_t g_bdwCursorBases[2]{};
+inline bool BdwCursorBaseOwned(uint32_t base){
+    if(!base)return false;
+    for(const auto& owned:g_bdwCursorBases)
+        if(__atomic_load_n(&owned,__ATOMIC_ACQUIRE)==base)return true;
+    return false;
+}
+void BdwCursorUpdate(uint64_t leaseOwner,bool visible,int32_t x,int32_t y,
+                     const uint32_t* pixels,uint32_t width,uint32_t height,uint64_t serial);
+
 struct CompositorPresentRegion;
 // Display surfaces Brook may legitimately leave on primary plane A. The GOP
 // surface (GGTT offset 0) is always accepted; kernel flip buffers are added

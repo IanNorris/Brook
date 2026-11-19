@@ -111,4 +111,22 @@ int main(){
         assert(!BdwDisplayUsesGop(observed));
         observed.regs[0][i]=0;
     }
+    const auto primary=[](uint32_t base){return base==0;};
+    const auto cursor=[](uint32_t base){return base==0x40000 || base==0x80000;};
+    observed.regs[0][7]=BdwCursorRegs::Argb64;
+    observed.regs[0][8]=0x80000;
+    observed.regs[0][9]=0x40000;
+    assert(!BdwDisplayUsesGop(observed));
+    assert(!BdwDisplayCompatible(observed,primary));
+    assert(BdwDisplayCompatible(observed,primary,10,cursor));
+    observed.regs[0][9]=0xc0000;
+    assert(!BdwDisplayCompatible(observed,primary,10,cursor));
+    observed.regs[0][9]=0x40000;
+    observed.regs[0][8]=0;
+    assert(!BdwDisplayCompatible(observed,primary,10,cursor));
+    observed.regs[0][7]=0;
+    assert(BdwDisplayCompatible(observed,primary,10,cursor));
+    observed.regs[1][9]=0x40000;
+    assert(!BdwDisplayCompatible(observed,primary,10,cursor));
+
 }

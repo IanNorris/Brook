@@ -78,6 +78,8 @@ struct BrookDesktopOverlayInfo {
     struct BrookDebugFrameInfo frame;
     uint64_t generation;
 };
+/* Final syscall argument for op 8. Older kernels reject it with EINVAL. */
+#define BROOK_DESKTOP_CURSOR_PLANE_V1 1
 struct BrookDesktopOverlayCursor {
     uint32_t visible,width,height,stride;
     int32_t x,y;

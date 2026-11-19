@@ -6822,6 +6822,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         DebugChannelSend("{\"error\":\"guarded Dell kernel required\"}\n");
 #endif
     }
+    else if(StrStartsWith(cmd,"gpu cursor ")) {
+        const bool on=NetStrEq(cmd,"gpu cursor on"),off=NetStrEq(cmd,"gpu cursor off");
+        if(!on && !off && !NetStrEq(cmd,"gpu cursor status")){
+            DebugChannelSend("{\"error\":\"expected gpu cursor on|off|status\"}\n");
+        }else{
+            const bool ok=(!on && !off) || BdwCursorRequest(on);
+            const auto cursor=BdwCursorReadStatus();
+            BridgeReply r;
+            r.text("{\"ok\":");r.text(ok?"true":"false");
+            r.text(",\"requested\":");r.text(cursor.requested?"true":"false");
+            r.text(",\"bound\":");r.text(cursor.bound?"true":"false");
+            r.text(",\"active\":");r.text(cursor.active?"true":"false");
+            r.text(",");r.field("images",cursor.images);
+            r.text(",");r.field("positions",cursor.positions);
+            r.text(",");r.field("fallbacks",cursor.fallbacks);
+            r.text("}\n");r.send();
+        }
+    }
     else if(StrStartsWith(cmd,"gpu flip ") || StrStartsWith(cmd,"gpu scanout map ")) {
 #if defined(BROOK_SSD_AUTO_RECOVERY)
         // Runtime gates for the Broadwell scanout targets. They live in RAM
