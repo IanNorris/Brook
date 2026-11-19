@@ -13,7 +13,7 @@ static struct BrookDesktopLayer layer(uint32_t window,uint64_t incarnation,int32
     return l;
 }
 static struct DesktopFocusInfo visible(uint32_t window,uint64_t incarnation){
-    return (struct DesktopFocusInfo){1,window,BROOK_WINDOW_STATE_VISIBLE|BROOK_WINDOW_STATE_FOCUSED,incarnation};
+    return (struct DesktopFocusInfo){.valid=1,.window=window,.state=BROOK_WINDOW_STATE_VISIBLE|BROOK_WINDOW_STATE_FOCUSED,.incarnation=incarnation};
 }
 static void test_dominance(void){
     enum DesktopAppReason r;
@@ -21,7 +21,7 @@ static void test_dominance(void){
     struct DesktopFocusInfo f=visible(1,10);
     /* No focus query (older kernel), or nothing focused. */
     assert(desktop_app_dominant(l,1,NULL,W,H,60,&r)==-1 && r==DESKTOP_APP_NO_FOCUS_INFO);
-    struct DesktopFocusInfo none={1,0,0,0};
+    struct DesktopFocusInfo none={.valid=1};
     assert(desktop_app_dominant(l,1,&none,W,H,60,&r)==-1 && r==DESKTOP_APP_NO_FOCUS);
     /* Fullscreen focused window drives. */
     assert(desktop_app_dominant(l,1,&f,W,H,60,&r)==0 && r==DESKTOP_APP_DRIVEN);
@@ -68,32 +68,84 @@ static void test_changed(void){
     now=(struct DesktopTrackWindow){.window=3,.incarnation=1};assert(desktop_app_window_changed(&base,&now)); /* new window */
     base.valid=0;now=base.windows[0];assert(desktop_app_window_changed(&base,&now)); /* no baseline */
 }
+static enum DesktopAppAction step(struct DesktopAppCadence *c,struct DesktopAppFrame f,uint64_t *wake){
+    return desktop_app_cadence(c,&f,wake);
+}
+#define MS 1000000ull
 static void test_cadence(void){
     struct DesktopAppCadence c={0};uint64_t wake=0;const uint64_t d=DESKTOP_APP_DEFER_NS;
+    const struct DesktopAppFrame app={.dominant=1,.window=1,.incarnation=10,.deferNs=d};
+    struct DesktopAppFrame f=app;
     /* No dominant window: the desktop's own cadence. */
-    assert(desktop_app_cadence(&c,0,0,0,0,1000,d,&wake)==DESKTOP_APP_FREE && !wake);
+    f.dominant=0;f.now=1*MS;assert(step(&c,f,&wake)==DESKTOP_APP_FREE && !wake);
     /* A window becomes dominant: present at once. */
-    assert(desktop_app_cadence(&c,1,1,10,0,1000,d,&wake)==DESKTOP_APP_TRANSITION);
-    /* App commit: present. */
-    assert(desktop_app_cadence(&c,1,1,10,1,2000,d,&wake)==DESKTOP_APP_PRESENT);
-    /* Pointer move between commits: deferred until the deadline... */
-    assert(desktop_app_cadence(&c,1,1,10,0,3000,d,&wake)==DESKTOP_APP_DEFER && wake==3000+d);
-    assert(desktop_app_cadence(&c,1,1,10,0,3000+d/2,d,&wake)==DESKTOP_APP_DEFER && wake==3000+d);
-    /* ...and rides the next app commit when it comes first. */
-    assert(desktop_app_cadence(&c,1,1,10,1,3000+d/2+1,d,&wake)==DESKTOP_APP_PRESENT && !c.foreignSinceNs);
-    /* A stalled app: the deadline presents the pointer. */
-    assert(desktop_app_cadence(&c,1,1,10,0,10000000,d,&wake)==DESKTOP_APP_DEFER);
-    assert(desktop_app_cadence(&c,1,1,10,0,10000000+d,d,&wake)==DESKTOP_APP_DEADLINE && !c.foreignSinceNs);
-    /* A frame without damage clears the wait. */
-    assert(desktop_app_cadence(&c,1,1,10,0,40000000,d,&wake)==DESKTOP_APP_DEFER);
+    f=app;f.now=2*MS;assert(step(&c,f,&wake)==DESKTOP_APP_TRANSITION);
+    /* Pointer damage before any commit history: the app may be paused, so
+     * never wait on it. */
+    f.now=3*MS;assert(step(&c,f,&wake)==DESKTOP_APP_STALLED && !wake);
+    /* A steady 60 fps app (commits every 16 ms). */
+    for(uint64_t t=10;t<=106;t+=16){f.appChanged=1;f.now=t*MS;assert(step(&c,f,&wake)==DESKTOP_APP_PRESENT);}
+    assert(c.intervalNs==16*MS && c.lastAppNs==106*MS);
+    f.appChanged=0;
+    /* Pointer move 4 ms after a commit: the next is due in 12 ms, so it
+     * waits for it (plus slack), well under one refresh... */
+    f.now=110*MS;assert(step(&c,f,&wake)==DESKTOP_APP_DEFER && wake==(106+16)*MS+DESKTOP_APP_COMMIT_SLACK_NS);
+    /* ...and rides it. */
+    f.appChanged=1;f.now=122*MS;assert(step(&c,f,&wake)==DESKTOP_APP_PRESENT && !c.foreignSinceNs);f.appChanged=0;
+    /* The commit is late: the wake time passes and the damage presents. */
+    f.now=124*MS;assert(step(&c,f,&wake)==DESKTOP_APP_DEFER && wake==140*MS);
+    f.now=140*MS;assert(step(&c,f,&wake)==DESKTOP_APP_DEADLINE);
+    /* Paused game: no commit for more than an interval -> at once. */
+    f.now=150*MS;assert(step(&c,f,&wake)==DESKTOP_APP_STALLED && !wake);
+    f.now=400*MS;assert(step(&c,f,&wake)==DESKTOP_APP_STALLED);
+    /* A frame without damage clears any wait. */
+    f.appChanged=1;f.now=401*MS;assert(step(&c,f,&wake)==DESKTOP_APP_PRESENT);
+    assert(c.intervalNs==16*MS); /* the 295 ms pause is not a frame interval */
+    f.appChanged=0;f.now=405*MS;assert(step(&c,f,&wake)==DESKTOP_APP_DEFER);
     desktop_app_cadence_idle(&c);assert(!c.foreignSinceNs);
-    /* Focus loss with damage waiting: presented at once, not deferred. */
-    assert(desktop_app_cadence(&c,1,1,10,0,50000000,d,&wake)==DESKTOP_APP_DEFER);
-    assert(desktop_app_cadence(&c,0,0,0,0,50000001,d,&wake)==DESKTOP_APP_FREE && !c.window);
-    /* Another window takes over (alt-tab between two fullscreen apps). */
-    assert(desktop_app_cadence(&c,1,1,10,0,60000000,d,&wake)==DESKTOP_APP_TRANSITION);
-    assert(desktop_app_cadence(&c,1,3,30,0,60000001,d,&wake)==DESKTOP_APP_TRANSITION);
-    assert(desktop_app_cadence(&c,1,1,11,0,60000002,d,&wake)==DESKTOP_APP_TRANSITION); /* reused slot */
+    /* Gen 440 (Quake at 34 fps, commits every 29 ms): a pointer move early
+     * in the frame is not deferred (the commit is more than a refresh
+     * away); late in the frame it rides the commit. */
+    /* Default limit (33 ms, two refreshes): even an early move rides the next
+     * 29 ms frame. */
+    {struct DesktopAppCadence q={0};struct DesktopAppFrame g=app;g.now=1*MS;assert(step(&q,g,&wake)==DESKTOP_APP_TRANSITION);
+     g.appChanged=1;for(uint64_t t=10;t<=126;t+=29){g.now=t*MS;assert(step(&q,g,&wake)==DESKTOP_APP_PRESENT);}
+     g.appChanged=0;g.now=130*MS;assert(d==33*MS && step(&q,g,&wake)==DESKTOP_APP_DEFER && wake==(126+29)*MS+DESKTOP_APP_COMMIT_SLACK_NS);}
+    /* With `desktop present defer 16`: */
+    {struct DesktopAppCadence q={0};struct DesktopAppFrame g=app;g.deferNs=16*MS;g.now=1*MS;assert(step(&q,g,&wake)==DESKTOP_APP_TRANSITION);
+     g.appChanged=1;for(uint64_t t=10;t<=126;t+=29){g.now=t*MS;assert(step(&q,g,&wake)==DESKTOP_APP_PRESENT);}
+     assert(q.intervalNs==29*MS);g.appChanged=0;
+     g.now=130*MS;assert(step(&q,g,&wake)==DESKTOP_APP_NOT_DUE && !wake);
+     g.now=145*MS;assert(step(&q,g,&wake)==DESKTOP_APP_DEFER && wake<=145*MS+16*MS && wake==(126+29)*MS+DESKTOP_APP_COMMIT_SLACK_NS);
+     /* Launcher open over the game (the gen 440 stutter): never deferred. */
+     g.shellOpen=1;g.now=146*MS;assert(step(&q,g,&wake)==DESKTOP_APP_SHELL && !wake && !q.foreignSinceNs);g.shellOpen=0;
+     /* A menu or popup over the game. */
+     g.windowAbove=1;assert(step(&q,g,&wake)==DESKTOP_APP_ABOVE);g.windowAbove=0;
+     /* Pointer outside the game's client area (over chrome or another window). */
+     g.pointerOutside=1;assert(step(&q,g,&wake)==DESKTOP_APP_POINTER_OUTSIDE);g.pointerOutside=0;
+     /* Shell wins over every other reason; an app commit still presents as app. */
+     g.shellOpen=g.windowAbove=g.pointerOutside=1;assert(step(&q,g,&wake)==DESKTOP_APP_SHELL);
+     g.appChanged=1;g.now=155*MS;assert(step(&q,g,&wake)==DESKTOP_APP_PRESENT);}
+    /* Focus loss with damage waiting: presented at once, state cleared. */
+    f.now=406*MS;assert(step(&c,f,&wake)==DESKTOP_APP_DEFER);
+    f.dominant=0;f.now=407*MS;assert(step(&c,f,&wake)==DESKTOP_APP_FREE && !c.window && !c.intervalNs);
+    /* Another window takes over (alt-tab), or the slot is reused. */
+    f=app;f.now=500*MS;assert(step(&c,f,&wake)==DESKTOP_APP_TRANSITION);
+    f.window=3;f.incarnation=30;assert(step(&c,f,&wake)==DESKTOP_APP_TRANSITION);
+    f.window=1;f.incarnation=11;assert(step(&c,f,&wake)==DESKTOP_APP_TRANSITION && !c.intervalNs);
+    for(unsigned a=0;a<DESKTOP_APP_ACTIONS;++a)assert(desktop_app_action_names[a] && *desktop_app_action_names[a]);
+}
+static void test_geometry(void){
+    struct BrookDesktopLayer l[3]={layer(1,10,0,0,W,H-96),layer(2,20,1000,800,400,300),layer(3,30,W+5,0,200,200)};
+    assert(desktop_app_point_inside(&l[0],W,H,0,0) && desktop_app_point_inside(&l[0],W,H,W-1,H-97));
+    assert(!desktop_app_point_inside(&l[0],W,H,10,H-50));  /* over the taskbar */
+    assert(!desktop_app_point_inside(&l[0],W,H,-1,10) && !desktop_app_point_inside(&l[0],W,H,W,10));
+    assert(desktop_app_window_above(l,2,0,W,H));            /* popup over it */
+    assert(!desktop_app_window_above(l,1,0,W,H));
+    {struct BrookDesktopLayer m[2]={l[0],l[2]};assert(!desktop_app_window_above(m,2,0,W,H));} /* off screen */
+    {struct BrookDesktopLayer m[2]={l[1],l[0]};assert(!desktop_app_window_above(m,2,1,W,H));} /* below it */
+    {struct BrookDesktopLayer m[2]={l[0],layer(2,20,0,H-96,400,96)};assert(!desktop_app_window_above(m,2,0,W,H));} /* beside it */
+    assert(!desktop_app_window_above(l,2,-1,W,H));
 }
 static struct DesktopDirectBuffer xrgb(uint32_t strideBytes,uint32_t flags){
     const uint32_t rows=(flags&BROOK_GPU_WINDOW_LAYER_TILED_X)?(H+7u)&~7u:H;
@@ -206,7 +258,7 @@ static void test_machine(void){
     assert(desktop_direct_release(&m,&k,out,6)==3 && m.held==1 && m.holds[0].buffer==0x105);
 }
 int main(void){
-    test_dominance();test_changed();test_cadence();test_buffer();test_scene();test_machine();
+    test_dominance();test_changed();test_cadence();test_geometry();test_buffer();test_scene();test_machine();
     printf("desktop_app_present_test: ok\n");
     return 0;
 }

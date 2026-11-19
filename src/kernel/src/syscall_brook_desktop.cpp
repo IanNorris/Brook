@@ -158,11 +158,17 @@ int64_t sys_brook_desktop_layers(uint64_t op,uint64_t address,uint64_t size,uint
     KernelOperationGuard operation(proc);
     if(!brook::BdwRenderExperimentEnabled())return -ENODEV;
     if(op==BROOK_DESKTOP_FOCUS_QUERY){
-        if(size!=sizeof(BrookDesktopFocus) || a || b || c || !address || address>~uint64_t{0}-size)return -EINVAL;
-        BrookDesktopFocus focus{};focus.version=BROOK_DESKTOP_FOCUS_VERSION;
+        if((size!=sizeof(BrookDesktopFocus) && size!=BROOK_DESKTOP_FOCUS_V1_SIZE) || a || b || c || !address ||
+           address>~uint64_t{0}-size)return -EINVAL;
+        BrookDesktopFocus focus{};
+        focus.version=size==sizeof(BrookDesktopFocus)?BROOK_DESKTOP_FOCUS_VERSION_POINTER:BROOK_DESKTOP_FOCUS_VERSION;
         (void)brook::WmSnapshotFocus(&focus.window,&focus.incarnation,&focus.state);
         focus.policy=brook::DesktopPresentPolicy();focus.deferUs=brook::DesktopPresentDeferUs();
-        return CopyToUser(address,&focus,sizeof(focus))?0:-EFAULT;
+        if(size==sizeof(BrookDesktopFocus)){
+            MouseGetPosition(&focus.pointerX,&focus.pointerY);
+            focus.shell=(brook::WmLauncherVisible()?BROOK_DESKTOP_SHELL_LAUNCHER:0u)|(brook::WmVolumePopupVisible()?BROOK_DESKTOP_SHELL_VOLUME:0u);
+        }
+        return CopyToUser(address,&focus,size)?0:-EFAULT;
     }
     if(op==BROOK_DESKTOP_CLIENT_FRAME){
         if(address || size || !a || a>BROOK_DESKTOP_LAYER_LIMIT || !b || !c)return -EINVAL;

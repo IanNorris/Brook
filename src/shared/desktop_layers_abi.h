@@ -76,14 +76,25 @@
 // Scan an eligible fullscreen client buffer out directly (needs a kernel
 // with BROOK_GPU_PRESENT_CAP_CLIENT_SCANOUT; otherwise counted as a fallback).
 #define BROOK_DESKTOP_POLICY_DIRECT_ON 4u
+// Shell popups open (BrookDesktopFocus.shell, version 2). Tooltips, the
+// boot summary and anything else the overlay draws show as overlay bands.
+#define BROOK_DESKTOP_SHELL_LAUNCHER 1u
+#define BROOK_DESKTOP_SHELL_VOLUME 2u
+// Version 2 (48 bytes) adds shell and the pointer position; a kernel also
+// accepts the 32-byte version 1 request and fills only its fields.
+#define BROOK_DESKTOP_FOCUS_VERSION_POINTER 2
 struct BrookDesktopFocus {
     uint32_t version,window;
     uint64_t incarnation;
     uint32_t state,policy;
     // Longest delay (us) for a present that carries only non-app damage
     // (pointer, overlay, other windows); 0 = the renderer default.
-    uint32_t deferUs,reserved;
+    uint32_t deferUs;
+    uint32_t shell;          // BROOK_DESKTOP_SHELL_* (version 2; 0 in version 1)
+    int32_t pointerX,pointerY; // desktop pixels (version 2)
+    uint32_t reserved[2];
 };
+#define BROOK_DESKTOP_FOCUS_V1_SIZE 32
 #define BROOK_DESKTOP_LAYER_LEGACY_OPAQUE 1u
 // Omitted means 255; older renderers reject these new flag bits safely.
 #define BROOK_DESKTOP_LAYER_HAS_OPACITY 2u
@@ -104,8 +115,8 @@ struct BrookDesktopLayers {
 };
 #ifdef __cplusplus
 static_assert(sizeof(BrookDesktopLayer)==80 && sizeof(BrookDesktopLayers)==2576,"desktop layer ABI layout");
-static_assert(sizeof(BrookDesktopFocus)==32,"desktop focus ABI layout");
+static_assert(sizeof(BrookDesktopFocus)==48,"desktop focus ABI layout");
 #else
 _Static_assert(sizeof(struct BrookDesktopLayer)==80 && sizeof(struct BrookDesktopLayers)==2576,"desktop layer ABI layout");
-_Static_assert(sizeof(struct BrookDesktopFocus)==32,"desktop focus ABI layout");
+_Static_assert(sizeof(struct BrookDesktopFocus)==48,"desktop focus ABI layout");
 #endif
