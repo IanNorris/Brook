@@ -95,6 +95,8 @@ _Last updated: 19 November 2026 (early), by a Claude Code session; see "19 Nov e
 - **First real-time Quake numbers:** displayed mean 49.7 ms (8 buffers) and 43.0 ms (2 buffers), i.e. ~20 and ~23 displayed fps; swaps 70.8 and 36.7/s.
 - **All earlier fps figures were inflated by the LAPIC-tick clock.** Use these as the baseline.
 
+**Clearwater stage 3 (Ian approved, 19 Nov):** sent to Codex as `work/clearwater-s3`, based on int49. User-mode shell process for the taskbar, launcher, toasts and HUD; pixel-identical; fallback taskbar plus restart. File manager: Nautilus (see DECISIONS). It needs the GTK4 smoke test first.
+
 **19 Nov: Dell on gen 451 = `work/integration49` 095ae70e** (int48 + the supervisor blur marker; session `3fee9d88a60c4cd6b5c8c05260c9de3d`).
 - **Glass is live.** Blur is enabled by the persistent marker `/nix/var/brook/render-blur`; delete it and reboot to turn blur off. `/etc` is rebuilt from the initrd at every boot.
 - **Ian's verdict:** a little stuttery while dragging (touchpad possibly a factor). The blur is low quality over text and shimmers.
